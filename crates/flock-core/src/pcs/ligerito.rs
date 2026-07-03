@@ -1685,7 +1685,7 @@ fn next_s(s: F128, s_at_root: F128) -> F128 {
 
 /// `sks_vks[k] = s_k(v_k)` for `k = 0..=log_n`. Length `log_n + 1`.
 /// Only depends on `log_n`, so callers cache.
-pub(crate) fn eval_sk_at_vks(log_n: usize) -> Vec<F128> {
+pub fn eval_sk_at_vks(log_n: usize) -> Vec<F128> {
     let mut sks_vks = vec![F128::ZERO; log_n + 1];
     sks_vks[0] = F128::ONE;
     if log_n == 0 {
@@ -1927,7 +1927,7 @@ pub(crate) fn induce_sumcheck_evaluate_at_residual(
 /// Parallel: each thread takes a chunk of queries, builds a partial basis_poly
 /// accumulator + partial enforced_sum, then we reduce. The per-query work
 /// (eq-dot + LCH novel-basis expansion) is independent of other queries.
-pub(crate) fn induce_sumcheck_poly(
+pub fn induce_sumcheck_poly(
     log_msg_cols: usize,
     sks_vks: &[F128],
     opened_rows: &[Vec<F128>],
@@ -2077,7 +2077,7 @@ fn transpose_forward_ntt(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize)
 /// `Fᵀ`-based fast path for [`induce_sumcheck_poly`]: scatter per-query weights
 /// into the codeword domain, apply `Fᵀ`, keep the low `2^log_msg_cols` outputs.
 /// Byte-identical output to [`induce_sumcheck_poly`].
-pub(crate) fn induce_sumcheck_poly_via_ntt(
+pub fn induce_sumcheck_poly_via_ntt(
     log_msg_cols: usize,
     log_inv_rate: usize,
     opened_rows: &[Vec<F128>],
@@ -2295,7 +2295,7 @@ fn transpose_forward_ntt_sparse(
 /// `mat` is row-major: `mat[pos * num_interleaved + lane]` for
 /// `pos ∈ [0, block_len)`, `lane ∈ [0, num_interleaved)`. Each row
 /// (one `pos` across all lanes) is one Merkle leaf.
-pub(crate) struct LigeroWitness {
+pub struct LigeroWitness {
     pub mat: Vec<F128>,
     pub tree: Vec<Hash>,
     pub block_len: usize,
@@ -2341,7 +2341,7 @@ impl LigeroWitness {
 /// The first `log_num_interleaved` LSB variables of the multilinear poly are the
 /// lane indices, so `partial_eval_lsb(poly, lane_challenges)` produces the
 /// next-level poly directly. This composes cleanly with sumcheck folds.
-pub(crate) fn ligero_commit(
+pub fn ligero_commit(
     poly: &[F128],
     log_msg_cols: usize,
     log_num_interleaved: usize,

@@ -21,7 +21,7 @@ fold into `clmad`'s free `^ c` operand. See `f128.cuh`.
 | `f128.cuh` | `F128`, `clmad` wrappers, `ghash_reduce`, and four multiplies: `binius`, `schoolbook` (both clmad-fused), `software` (shift-XOR baseline), plus deferred `mul_unreduced`. |
 | `test_f128.cu` | Loads `vectors.bin` and checks every device variant **bit-for-bit vs flare** + mutual agreement. |
 | `bench_f128.cu` | Latency / throughput / GHASH-GCM benchmarks (mirrors `benches/field.rs`). |
-| `../src/bin/dump_ghash_vectors.rs` | Emits `vectors.bin` from the real `flare::field::F128`. |
+| `../crates/flock-prover/src/bin/dump_ghash_vectors.rs` | Emits `vectors.bin` from the real `flock::field::F128`. |
 
 ## Requirements
 
