@@ -70,6 +70,39 @@ test_blake3_witness: test_blake3_witness.cu blake3_witness.cuh
 bench_blake3_witness: bench_blake3_witness.cu blake3_witness.cuh
 	$(NVCC) $(NVCCFLAGS) bench_blake3_witness.cu -o $@
 
+# Zerocheck round-1 (univariate-skip URM message) — round1_ab/round1_c
+# bit-for-bit vs the real optimized prove_packed round-1.
+test_zerocheck_round1: test_zerocheck_round1.cu zerocheck_round1.cuh phi8_table.cuh ntt_host.hpp f128.cuh
+	$(NVCC) $(NVCCFLAGS) test_zerocheck_round1.cu -o $@
+
+# Throughput for the zerocheck round-1 kernel (random inputs, no oracle).
+bench_zerocheck_round1: bench_zerocheck_round1.cu zerocheck_round1.cuh phi8_table.cuh f128.cuh
+	$(NVCC) $(NVCCFLAGS) bench_zerocheck_round1.cu -o $@
+
+# CPU-structured round-1 (shift-reduce + convert-table). Host ref + GPU oracle + bench.
+test_zc_round1_cpustyle: test_zc_round1_cpustyle.cu phi8_table.cuh ntt_host.hpp f128.cuh
+	$(NVCC) $(NVCCFLAGS) test_zc_round1_cpustyle.cu -o $@
+test_zc_challenger: test_zc_challenger.cu zc_challenger_device.cuh challenger.hpp sha256.cuh f128.cuh
+	$(NVCC) $(NVCCFLAGS) test_zc_challenger.cu -o $@
+test_zc_cpustyle_gpu: test_zc_cpustyle_gpu.cu zerocheck_round1_cpustyle.cuh zerocheck_round1.cuh phi8_table.cuh ntt_host.hpp f128.cuh
+	$(NVCC) $(NVCCFLAGS) test_zc_cpustyle_gpu.cu -o $@
+bench_zc_cpustyle: bench_zc_cpustyle.cu zerocheck_round1_cpustyle.cuh zerocheck_round1.cuh phi8_table.cuh f128.cuh
+	$(NVCC) $(NVCCFLAGS) bench_zc_cpustyle.cu -o $@
+
+# Zerocheck multilinear sumcheck tail (eq-weighted deg-2 message + fold) —
+# bit-for-bit vs round_pair_naive + fold_in_place_pair.
+test_zerocheck_tail: test_zerocheck_tail.cu zerocheck_tail.cuh sumcheck_ab.cuh ntt_host.hpp f128.cuh
+	$(NVCC) $(NVCCFLAGS) test_zerocheck_tail.cu -o $@
+
+# Zerocheck round-2 (fold-at-z via UniSkipFoldTable + first mlv message) —
+# bit-for-bit vs uni_skip_fold_and_round_pair_optimized_packed.
+test_zerocheck_round2: test_zerocheck_round2.cu zerocheck_round2.cuh zerocheck_tail.cuh sumcheck_ab.cuh ntt_host.hpp f128.cuh
+	$(NVCC) $(NVCCFLAGS) test_zerocheck_round2.cu -o $@
+
+# Full zerocheck prove_packed orchestration — end-to-end transcript bit-for-bit.
+test_zerocheck_full: test_zerocheck_full.cu zerocheck_round1.cuh zerocheck_round1_cpustyle.cuh zc_challenger_device.cuh sha256.cuh zerocheck_round2.cuh zerocheck_tail.cuh sumcheck_ab.cuh challenger.hpp phi8_table.cuh ntt_host.hpp f128.cuh
+	$(NVCC) $(NVCCFLAGS) test_zerocheck_full.cu -o $@
+
 # Induced basis builder (PCS open / Ligerito, step 4) — basis_poly + enforced_sum
 # bit-for-bit vs the real ligerito::induce_sumcheck_poly oracle.
 test_induce: test_induce.cu induce_sumcheck.cuh ntt_host.hpp f128.cuh
@@ -155,6 +188,47 @@ blake3_witness_vectors:
 # Build + run the BLAKE3 witness oracle check end-to-end.
 blake3_witness: test_blake3_witness blake3_witness_vectors
 	./test_blake3_witness blake3_witness_vectors.bin
+
+# Dump the REAL BLAKE3 R1CS lincheck CSC matrices for bench_ligerito's lincheck phase.
+blake3_lincheck_matrices:
+	cd .. && cargo run --release --quiet --bin dump_blake3_lincheck_matrices -- cuda-ghash/blake3_lincheck_matrices.bin
+
+# Regenerate the zerocheck round-1 oracle (ZCR1): a/b/c + r + M + golden round1.
+# Override:  make zerocheck_round1_vectors ZC_ARGS="20 14 8000"  (m k_log useful_bits)
+ZC_ARGS ?= 15
+zerocheck_round1_vectors:
+	cd .. && cargo run --release --quiet --bin dump_zerocheck_round1_vectors -- cuda-ghash/zerocheck_round1_vectors.bin $(ZC_ARGS)
+
+# Build + run the zerocheck round-1 oracle check end-to-end.
+zerocheck_round1: test_zerocheck_round1 zerocheck_round1_vectors
+	./test_zerocheck_round1 zerocheck_round1_vectors.bin
+
+# Regenerate the zerocheck sumcheck-tail oracle (ZTAL). Override:  make ztail_vectors ZTAIL_ARGS="20"
+ZTAIL_ARGS ?= 16
+ztail_vectors:
+	cd .. && cargo run --release --quiet --bin dump_zerocheck_tail_vectors -- cuda-ghash/zerocheck_tail_vectors.bin $(ZTAIL_ARGS)
+
+# Build + run the zerocheck sumcheck-tail oracle check end-to-end.
+zerocheck_tail: test_zerocheck_tail ztail_vectors
+	./test_zerocheck_tail zerocheck_tail_vectors.bin
+
+# Regenerate the zerocheck round-2 oracle (ZR2). Override:  make zr2_vectors ZR2_ARGS="20"
+ZR2_ARGS ?= 15
+zr2_vectors:
+	cd .. && cargo run --release --quiet --bin dump_zerocheck_round2_vectors -- cuda-ghash/zerocheck_round2_vectors.bin $(ZR2_ARGS)
+
+# Build + run the zerocheck round-2 oracle check end-to-end.
+zerocheck_round2: test_zerocheck_round2 zr2_vectors
+	./test_zerocheck_round2 zerocheck_round2_vectors.bin
+
+# Regenerate the full zerocheck transcript oracle (ZCFV). Override:  make zcfull_vectors ZCFULL_ARGS="20"
+ZCFULL_ARGS ?= 15
+zcfull_vectors:
+	cd .. && cargo run --release --quiet --bin dump_zerocheck_full_vectors -- cuda-ghash/zerocheck_full_vectors.bin $(ZCFULL_ARGS)
+
+# Build + run the full zerocheck orchestration check end-to-end.
+zerocheck_full: test_zerocheck_full zcfull_vectors
+	./test_zerocheck_full zerocheck_full_vectors.bin
 
 # Regenerate the induce oracle (INDC) from the real ligerito::induce_sumcheck_poly.
 # Override:  make induce_vectors INDUCE_ARGS="14 3 16"   (log_msg_cols v_len n_queries)
@@ -244,6 +318,12 @@ ligerito_l0_vectors:
 	cd .. && cargo run --release --quiet --bin dump_ligerito_l0_vectors -- cuda-ghash/ligerito_l0_vectors.bin $(L0_ARGS)
 ligerito_l0: test_ligerito_l0 ligerito_l0_vectors
 	./test_ligerito_l0 ligerito_l0_vectors.bin
+
+# Full Ligerito open prover benchmark (prove-only, no oracle).
+bench_keccak3_gpu: bench_keccak3_gpu.cu keccak3_witness.cuh zerocheck_round1_cpustyle.cuh zerocheck_round1.cuh ntt_f128.cuh merkle.cuh merkle_open.hpp induce_sumcheck.cuh introduce_glue.cuh sumcheck_ab.cuh challenger.hpp f128.cuh
+	$(NVCC) $(NVCCFLAGS) bench_keccak3_gpu.cu -o $@
+bench_ligerito: bench_ligerito.cu zerocheck_round1_cpustyle.cuh zerocheck_round1.cuh zerocheck_round2.cuh zerocheck_tail.cuh zc_challenger_device.cuh sha256.cuh ntt_f128.cuh merkle.cuh merkle_open.hpp induce_sumcheck.cuh introduce_glue.cuh sumcheck_ab.cuh lincheck.cuh blake3_witness.cuh challenger.hpp f128.cuh
+	$(NVCC) $(NVCCFLAGS) bench_ligerito.cu -o $@
 
 # Transpose-NTT induce (GPU fast path) — basis bit-for-bit vs induce_sumcheck_poly_via_ntt.
 test_transpose_induce: test_transpose_induce.cu ntt_transpose.cuh induce_sumcheck.cuh ntt_host.hpp f128.cuh
