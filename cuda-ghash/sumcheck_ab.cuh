@@ -51,13 +51,23 @@ __global__ void sumcheck_msg_partial(const F128* __restrict__ A,
     if (x == 0) { p0[blockIdx.x] = s0[0]; p2[blockIdx.x] = s2[0]; }
 }
 
-// Combine block partials → u_0, u_2.
+// Combine block partials → u_0, u_2. One 256-thread block: the single-thread
+// loop this replaces cost ~200 us at 2048 blocks — same order as the partial
+// kernel itself. XOR order is irrelevant → bit-identical.
 __global__ void sumcheck_msg_combine(const F128* p0, const F128* p2, int blocks,
                                      F128* u0, F128* u2) {
+    __shared__ F128 s0[SMC_TPB];
+    __shared__ F128 s2[SMC_TPB];
     F128 a0{0, 0}, a2{0, 0};
-    for (int b = 0; b < blocks; b++) { a0 = f128_add(a0, p0[b]); a2 = f128_add(a2, p2[b]); }
-    *u0 = a0;
-    *u2 = a2;
+    for (int b = threadIdx.x; b < blocks; b += blockDim.x) { a0 = f128_add(a0, p0[b]); a2 = f128_add(a2, p2[b]); }
+    int x = threadIdx.x;
+    s0[x] = a0; s2[x] = a2;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (x < s) { s0[x] = f128_add(s0[x], s0[x + s]); s2[x] = f128_add(s2[x], s2[x + s]); }
+        __syncthreads();
+    }
+    if (x == 0) { *u0 = s0[0]; *u2 = s2[0]; }
 }
 
 // Fold a,b by r (adjacent pairing), ping-pong: out[j] from in[2j],in[2j+1].
@@ -125,7 +135,7 @@ inline void launch_sumcheck_msg(const F128* dA, const F128* dB, long long half,
                                 F128* d_p0, F128* d_p2, F128* d_u0, F128* d_u2) {
     int blocks = sumcheck_blocks(half);
     sumcheck_msg_partial<<<blocks, SMC_TPB>>>(dA, dB, half, d_p0, d_p2);
-    sumcheck_msg_combine<<<1, 1>>>(d_p0, d_p2, blocks, d_u0, d_u2);
+    sumcheck_msg_combine<<<1, SMC_TPB>>>(d_p0, d_p2, blocks, d_u0, d_u2);
 }
 
 inline void launch_sumcheck_fold(const F128* dA, const F128* dB, F128* dAo, F128* dBo,
@@ -148,5 +158,5 @@ inline void launch_sumcheck_fold_msg(const F128* dA, const F128* dB, F128* dAo, 
     long long out_pairs = half >> 1;
     int blocks = sumcheck_blocks(out_pairs);
     sumcheck_fold_msg_partial<<<blocks, SMC_TPB>>>(dA, dB, dAo, dBo, out_pairs, r, d_p0, d_p2);
-    sumcheck_msg_combine<<<1, 1>>>(d_p0, d_p2, blocks, d_u0, d_u2);
+    sumcheck_msg_combine<<<1, SMC_TPB>>>(d_p0, d_p2, blocks, d_u0, d_u2);
 }

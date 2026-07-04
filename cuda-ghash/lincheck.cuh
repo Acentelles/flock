@@ -288,11 +288,21 @@ __global__ void lincheck_msg_partial(const F128* __restrict__ C, const F128* __r
     if (x == 0) { p1[blockIdx.x] = s1[0]; pinf[blockIdx.x] = sinf[0]; }
 }
 
+// One 256-thread block (was a single-thread loop, ~200 us at 2048 blocks; bit-identical).
 __global__ void lincheck_msg_combine(const F128* p1, const F128* pinf, int blocks,
                                      F128* e1_out, F128* einf_out) {
+    __shared__ F128 s1[LC_TPB];
+    __shared__ F128 sinf[LC_TPB];
     F128 a1{0, 0}, ainf{0, 0};
-    for (int b = 0; b < blocks; b++) { a1 = f128_add(a1, p1[b]); ainf = f128_add(ainf, pinf[b]); }
-    *e1_out = a1; *einf_out = ainf;
+    for (int b = threadIdx.x; b < blocks; b += blockDim.x) { a1 = f128_add(a1, p1[b]); ainf = f128_add(ainf, pinf[b]); }
+    int x = threadIdx.x;
+    s1[x] = a1; sinf[x] = ainf;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (x < s) { s1[x] = f128_add(s1[x], s1[x + s]); sinf[x] = f128_add(sinf[x], sinf[x + s]); }
+        __syncthreads();
+    }
+    if (x == 0) { *e1_out = s1[0]; *einf_out = sinf[0]; }
 }
 
 // Fold one table at r over the top-bit split: Vo[i] = V[i] + r·(V[i+half]+V[i]).
@@ -330,7 +340,7 @@ inline void launch_lincheck_msg(const F128* dC, const F128* dZ, long long half,
                                 F128* d_p1, F128* d_pinf, F128* d_e1, F128* d_einf) {
     int blocks = lincheck_blocks(half);
     lincheck_msg_partial<<<blocks, LC_TPB>>>(dC, dZ, half, d_p1, d_pinf);
-    lincheck_msg_combine<<<1, 1>>>(d_p1, d_pinf, blocks, d_e1, d_einf);
+    lincheck_msg_combine<<<1, LC_TPB>>>(d_p1, d_pinf, blocks, d_e1, d_einf);
 }
 
 inline void launch_lincheck_fold(const F128* dV, F128* dVo, long long half, F128 r) {

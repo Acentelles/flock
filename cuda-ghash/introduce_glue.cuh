@@ -46,13 +46,23 @@ __global__ void msg_eval_partial(const F128* __restrict__ F, const F128* __restr
     if (x == 0) { p0[blockIdx.x] = s0[0]; p2[blockIdx.x] = s2[0]; podd[blockIdx.x] = sodd[0]; }
 }
 
+// One 256-thread block (was a single-thread loop, ~200 us at 2048 blocks; bit-identical).
 __global__ void msg_eval_combine(const F128* p0, const F128* p2, const F128* podd, int blocks,
                                  F128* u0, F128* u2, F128* h_new) {
+    __shared__ F128 s0[IGL_TPB], s2[IGL_TPB], sodd[IGL_TPB];
     F128 a0{0, 0}, a2{0, 0}, aodd{0, 0};
-    for (int b = 0; b < blocks; b++) { a0 = f128_add(a0, p0[b]); a2 = f128_add(a2, p2[b]); aodd = f128_add(aodd, podd[b]); }
-    *u0 = a0;
-    *u2 = a2;
-    *h_new = f128_add(a0, aodd);   // Σ f0·b0 + Σ f1·b1 = Σ (f0·b0 + f1·b1)
+    for (int b = threadIdx.x; b < blocks; b += blockDim.x) {
+        a0 = f128_add(a0, p0[b]); a2 = f128_add(a2, p2[b]); aodd = f128_add(aodd, podd[b]);
+    }
+    int x = threadIdx.x;
+    s0[x] = a0; s2[x] = a2; sodd[x] = aodd;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (x < s) { s0[x] = f128_add(s0[x], s0[x + s]); s2[x] = f128_add(s2[x], s2[x + s]);
+                     sodd[x] = f128_add(sodd[x], sodd[x + s]); }
+        __syncthreads();
+    }
+    if (x == 0) { *u0 = s0[0]; *u2 = s2[0]; *h_new = f128_add(s0[0], sodd[0]); }   // Σ f0·b0 + Σ f1·b1
 }
 
 // glue: combined_basis[j] ^= β · b_new[j]  (in place).
@@ -75,7 +85,7 @@ inline void launch_msg_eval(const F128* dF, const F128* dB, long long half,
                             F128* d_u0, F128* d_u2, F128* d_hnew) {
     int blocks = igl_blocks(half);
     msg_eval_partial<<<blocks, IGL_TPB>>>(dF, dB, half, d_p0, d_p2, d_podd);
-    msg_eval_combine<<<1, 1>>>(d_p0, d_p2, d_podd, blocks, d_u0, d_u2, d_hnew);
+    msg_eval_combine<<<1, IGL_TPB>>>(d_p0, d_p2, d_podd, blocks, d_u0, d_u2, d_hnew);
 }
 
 inline void launch_glue(F128* d_cb, const F128* d_bnew, F128 beta, long long n, int tpb = IGL_TPB) {
