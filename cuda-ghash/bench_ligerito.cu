@@ -102,18 +102,40 @@ static std::map<void*, size_t> g_pool_size;
 static void* pool_alloc(size_t bytes) {
     auto& v = g_pool_free[bytes];
     if (!v.empty()) { void* p = v.back(); v.pop_back(); return p; }
-    void* p; CK(cudaMalloc(&p, bytes)); g_pool_size[p] = bytes; return p;
+    void* p;
+    if (cudaMalloc(&p, bytes) != cudaSuccess) {
+        // Pool keeps every retired size alive; at m>=34 that accumulation can
+        // exceed VRAM. Drop all idle buffers and retry once.
+        cudaGetLastError();
+        for (auto& [sz, vec] : g_pool_free)
+            for (void* q : vec) { CK(cudaFree(q)); g_pool_size.erase(q); }
+        g_pool_free.clear();
+        if (cudaMalloc(&p, bytes) != cudaSuccess) {
+            size_t freeb = 0, totb = 0; cudaMemGetInfo(&freeb, &totb);
+            size_t live = 0; for (auto& [q, sz] : g_pool_size) live += sz;
+            printf("pool_alloc OOM: want %.2f GiB, device free %.2f/%.2f GiB, pool live %.2f GiB in %zu bufs\n",
+                   bytes / 1073741824.0, freeb / 1073741824.0, totb / 1073741824.0,
+                   live / 1073741824.0, g_pool_size.size());
+            for (auto& [q, sz] : g_pool_size)
+                printf("  live buf %.3f GiB\n", sz / 1073741824.0);
+            exit(1);
+        }
+    }
+    g_pool_size[p] = bytes; return p;
 }
 static void pool_release(void* p) { if (p) g_pool_free[g_pool_size.at(p)].push_back(p); }
 
 // device ligero_commit; returns root (host), leaves codeword+tree on device.
 static void commit_dev(const F128* d_src, int msg_log, int log_msg_cols, int log_ni, int log_inv_rate,
-                       F128*& d_cw, uint8_t*& d_tree, long long& block_len, int& num_ntts, uint8_t root[32]) {
+                       F128*& d_cw, uint8_t*& d_tree, long long& block_len, int& num_ntts, uint8_t root[32],
+                       bool detail = false) {
     int k_code = log_msg_cols + log_inv_rate; num_ntts = 1 << log_ni; block_len = 1LL << k_code;
     long long cw_len = block_len * num_ntts, msg_len = 1LL << msg_log;
     F128* d_tw; const TwiddleTable& tt = cached_tt(k_code, d_tw);
     d_cw = (F128*)pool_alloc(cw_len*sizeof(F128));
     d_tree = (uint8_t*)pool_alloc((size_t)(2*block_len-1)*32);
+    cudaEvent_t e0, e1, e2; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1)); CK(cudaEventCreate(&e2));
+    cudaEventRecord(e0);
     // Rate-extend fusion: the pre-NTT codeword is cw[e]=msg[e & (msg_len-1)], so
     // when the first NTT pass is a topK chunk it reads the message directly —
     // no replicate_fill pass, and pass-1 reads msg_len instead of cw_len elems.
@@ -123,8 +145,17 @@ static void commit_dev(const F128* d_src, int msg_log, int log_msg_cols, int log
         int tpb=256; replicate_fill<<<(unsigned)((cw_len+tpb-1)/tpb),tpb>>>(d_src,d_cw,cw_len,msg_len);
         launch_ntt(d_cw,d_tw,tt,log_inv_rate,k_code,num_ntts);
     }
+    cudaEventRecord(e1);
     launch_merkle((const uint8_t*)d_cw,d_tree,block_len,num_ntts*16,256,4);   // kway=4 ILP
+    cudaEventRecord(e2);
     CK(cudaDeviceSynchronize());
+    static int l0_seen = 0;
+    if (detail && ++l0_seen == 2) {   // first post-warmup l0 call
+        float t_ntt, t_mk; cudaEventElapsedTime(&t_ntt, e0, e1); cudaEventElapsedTime(&t_mk, e1, e2);
+        printf("  [l0-detail] ntt(fused rate-extend, 2^%d x %d lanes) %.3f | merkle(2^%d leaves x %d B) %.3f ms\n",
+               k_code, num_ntts, t_ntt, k_code, num_ntts*16, t_mk);
+    }
+    CK(cudaEventDestroy(e0)); CK(cudaEventDestroy(e1)); CK(cudaEventDestroy(e2));
     CK(cudaMemcpy(root, d_tree+(size_t)(2*block_len-2)*32, 32, cudaMemcpyDeviceToHost));
 }
 static void msg(const F128*A,const F128*B,long long len,F128*p0,F128*p2,F128*du0,F128*du2,F128&u0,F128&u2){
@@ -510,7 +541,7 @@ static double prove(int log_n,int initial_k,int log_inv_rate_0,int num_queries_0
     // witness (df, before any fold), before timing starts, excluded from the open.
     F128 *d_prev_cw; uint8_t *d_tree0; long long l0bl; int l0lanes; uint8_t l0root[32];
     auto t_l0c = Clock::now();
-    commit_dev(df, log_n, log_n-initial_k, initial_k, log_inv_rate_0, d_prev_cw,d_tree0,l0bl,l0lanes,l0root);
+    commit_dev(df, log_n, log_n-initial_k, initial_k, log_inv_rate_0, d_prev_cw,d_tree0,l0bl,l0lanes,l0root, true);
     CK(cudaDeviceSynchronize()); ph.l0commit += ms_since(t_l0c);
     uint8_t* d_prev_tree = d_tree0;
     long long prev_bl=l0bl; int prev_ni=l0lanes;
