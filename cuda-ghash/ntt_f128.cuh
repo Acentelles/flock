@@ -237,7 +237,8 @@ __global__ void ntt_deep_smem_kernel(F128* data, const F128* d_tw,
 // inner-most. smem index = pos_in_tile*lb + lin (lin = lane within this block).
 template <int K>
 __global__ void ntt_smem_topK_kernel(F128* data, const F128* d_tw,
-                                     int L, int log_d, int num_ntts, int lb) {
+                                     int L, int log_d, int num_ntts, int lb,
+                                     const F128* src, long long smask) {
     extern __shared__ F128 sm[];
     const int TILE       = 1 << K;
     const int NTW        = TILE - 1;          // distinct twiddles across the K layers
@@ -254,10 +255,16 @@ __global__ void ntt_smem_topK_kernel(F128* data, const F128* d_tw,
     long long tcount     = (long long)TILE * lb;
     F128* twid           = sm + tcount;       // NTW twiddles parked after the data tile
 
-    // Coalesced load: smem[i*lb+lin] <- data[gbase + i*stride + lin] (lin = lane).
+    // Coalesced load: smem[i*lb+lin] <- src[(gbase + i*stride + lin) & smask].
+    // src/smask default to (data, -1) — identity. The rate-extend fusion passes
+    // src = the pre-replication MESSAGE with smask = msg_elems-1: the codeword
+    // before the NTT is cw[e] = msg[e mod msg_elems] (replicate_fill), so the
+    // first pass can read the message directly (half the bytes) and the fill
+    // pass disappears. Stores always go to data; src is a different buffer
+    // there, and in the identity case all loads precede all stores per tile.
     for (long long e = threadIdx.x; e < tcount; e += blockDim.x) {
         long long i = e / lb, lin = e - i * lb;
-        sm[e] = data[gbase + i * stride + lin];
+        sm[e] = src[(gbase + i * stride + lin) & smask];
     }
     // Precompute the NTW distinct twiddles ONCE (was: dev_twiddle re-expanded per
     // butterfly — an O(layer) XOR loop recomputed across all strj*lb butterflies
@@ -305,7 +312,8 @@ __global__ void ntt_smem_topK_kernel(F128* data, const F128* d_tw,
 // split of [from,to) with to <= log_d).
 template <int K>
 inline void launch_topK_chunk(F128* d_data, const F128* d_tw, int layer, int log_d,
-                              int num_ntts, int tpb) {
+                              int num_ntts, int tpb,
+                              const F128* src = nullptr, long long smask = -1) {
     const size_t TOPK_SMEM_CAP = 32 * 1024;
     int lb = num_ntts;
     while ((size_t)(1LL << K) * (size_t)lb * sizeof(F128) > TOPK_SMEM_CAP && lb > 1)
@@ -314,7 +322,8 @@ inline void launch_topK_chunk(F128* d_data, const F128* d_tw, int layer, int log
     cudaFuncSetAttribute(ntt_smem_topK_kernel<K>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
     long long tiles = (1LL << (log_d - K)) * (long long)(num_ntts / lb);
-    ntt_smem_topK_kernel<K><<<(unsigned)tiles, tpb, smem>>>(d_data, d_tw, layer, log_d, num_ntts, lb);
+    ntt_smem_topK_kernel<K><<<(unsigned)tiles, tpb, smem>>>(d_data, d_tw, layer, log_d, num_ntts, lb,
+                                                            src ? src : d_data, smask);
 }
 
 // Fused launches for layers [from, to). Each full-buffer pass costs one DRAM
@@ -324,7 +333,8 @@ inline void launch_topK_chunk(F128* d_data, const F128* d_tw, int layer, int log
 // 7+6+6 (3 passes) instead of 6+6+6+1 (4 passes). Chunks of 4/2/1 fall back to
 // the register-fused / single-layer kernels (cheaper than a smem tile at small K).
 inline void launch_top_fused(F128* d_data, const F128* d_tw, const TwiddleTable& tt,
-                             int from, int to, int log_d, int num_ntts, int tpb) {
+                             int from, int to, int log_d, int num_ntts, int tpb,
+                             const F128* src0 = nullptr, long long smask0 = -1) {
     int total = to - from;
     if (total <= 0) return;
     const int KMAX = 7;
@@ -333,12 +343,16 @@ inline void launch_top_fused(F128* d_data, const F128* d_tw, const TwiddleTable&
     int layer = from;
     for (int p = 0; p < npass; p++) {
         int c = base + (p < extra ? 1 : 0);     // this chunk's layer count
+        // Rate-extend fusion: pass 0 may read from src0 (the pre-replication
+        // message) via smask0 — topK chunks only (see ntt_can_fuse_src).
+        const F128* src = (p == 0) ? src0 : nullptr;
+        long long smask = (p == 0) ? smask0 : -1;
         long long total_bf, blocks;
         switch (c) {
-            case 7: launch_topK_chunk<7>(d_data, d_tw, layer, log_d, num_ntts, tpb); break;
-            case 6: launch_topK_chunk<6>(d_data, d_tw, layer, log_d, num_ntts, tpb); break;
-            case 5: launch_topK_chunk<5>(d_data, d_tw, layer, log_d, num_ntts, tpb); break;
-            case 3: launch_topK_chunk<3>(d_data, d_tw, layer, log_d, num_ntts, tpb); break;
+            case 7: launch_topK_chunk<7>(d_data, d_tw, layer, log_d, num_ntts, tpb, src, smask); break;
+            case 6: launch_topK_chunk<6>(d_data, d_tw, layer, log_d, num_ntts, tpb, src, smask); break;
+            case 5: launch_topK_chunk<5>(d_data, d_tw, layer, log_d, num_ntts, tpb, src, smask); break;
+            case 3: launch_topK_chunk<3>(d_data, d_tw, layer, log_d, num_ntts, tpb, src, smask); break;
             case 4:
                 total_bf = (1LL << layer) * (1LL << (log_d - layer - 4)) * (long long)num_ntts;
                 blocks = (total_bf + tpb - 1) / tpb;
@@ -370,9 +384,19 @@ inline void launch_top_fused(F128* d_data, const F128* d_tw, const TwiddleTable&
 // for reference: the deep layers have small strides and are already L2-resident
 // under pure fusion, so explicit tiling just costs occupancy + barriers. Caller
 // syncs. `d_tw`/`tt` come from build_twiddle_table (uploaded to device).
+// True when the first fused pass is a smem-topK chunk (layer counts 3,5,6,7 of
+// a balanced split — everything except totals 1/2/4, which use the register
+// kernels without the src/smask load hook). Callers that want the rate-extend
+// fusion (skip replicate_fill, first pass reads the message) must check this
+// and fall back to replicate_fill + plain launch_ntt when false.
+inline bool ntt_can_fuse_src(int total_layers) {
+    return total_layers > 0 && total_layers != 1 && total_layers != 2 && total_layers != 4;
+}
+
 inline void launch_ntt(F128* d_data, const F128* d_tw, const TwiddleTable& tt,
                        int log_inv_rate, int k_code, int num_ntts,
-                       int tpb = 256, bool deep_smem = false) {
+                       int tpb = 256, bool deep_smem = false,
+                       const F128* src0 = nullptr, long long smask0 = -1) {
     int log_d = k_code;
     int total_layers = k_code - log_inv_rate;
     if (total_layers <= 0) return;
@@ -388,12 +412,12 @@ inline void launch_ntt(F128* d_data, const F128* d_tw, const TwiddleTable& tt,
         }
     }
     if (dt < 1) {  // no useful tile — pure fused path
-        launch_top_fused(d_data, d_tw, tt, log_inv_rate, k_code, log_d, num_ntts, tpb);
+        launch_top_fused(d_data, d_tw, tt, log_inv_rate, k_code, log_d, num_ntts, tpb, src0, smask0);
         return;
     }
 
     int top_layers = k_code - dt;                       // deep stage = [top_layers, k_code)
-    launch_top_fused(d_data, d_tw, tt, log_inv_rate, top_layers, log_d, num_ntts, tpb);
+    launch_top_fused(d_data, d_tw, tt, log_inv_rate, top_layers, log_d, num_ntts, tpb, src0, smask0);
 
     size_t smem = (size_t)(1LL << dt) * num_ntts * sizeof(F128);
     cudaFuncSetAttribute(ntt_deep_smem_kernel,

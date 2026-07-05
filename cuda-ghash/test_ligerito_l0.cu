@@ -60,10 +60,16 @@ static void ligero_commit_dev(const F128* d_src, int msg_log, int log_msg_cols, 
     CK(cudaMalloc(&d_tw, tt.data.size() * sizeof(F128)));
     CK(cudaMemcpy(d_tw, tt.data.data(), tt.data.size() * sizeof(F128), cudaMemcpyHostToDevice));
     CK(cudaMalloc(&d_tree, (size_t)(2 * block_len - 1) * 32));
-    int tpb = 256;
-    replicate_fill<<<(unsigned)((cw_len + tpb - 1) / tpb), tpb>>>(d_src, d_cw, cw_len, msg_len);
+    // Rate-extend fusion (same as bench_ligerito::commit_dev): first topK pass
+    // reads the message directly instead of a replicate_fill'd codeword.
+    if (ntt_can_fuse_src(k_code - log_inv_rate)) {
+        launch_ntt(d_cw, d_tw, tt, log_inv_rate, k_code, num_ntts, 256, false, d_src, msg_len - 1);
+    } else {
+        int tpb = 256;
+        replicate_fill<<<(unsigned)((cw_len + tpb - 1) / tpb), tpb>>>(d_src, d_cw, cw_len, msg_len);
+        launch_ntt(d_cw, d_tw, tt, log_inv_rate, k_code, num_ntts);
+    }
     CK(cudaGetLastError());
-    launch_ntt(d_cw, d_tw, tt, log_inv_rate, k_code, num_ntts);
     launch_merkle((const uint8_t*)d_cw, d_tree, block_len, num_ntts * 16);
     CK(cudaDeviceSynchronize());
     CK(cudaMemcpy(out_root, d_tree + (size_t)(2 * block_len - 2) * 32, 32, cudaMemcpyDeviceToHost));

@@ -93,16 +93,36 @@ static const TwiddleTable& cached_tt(int k_code, F128*& d_tw) {
     return g_tt[k_code];
 }
 
+// Device buffer pool: the big commit/zerocheck buffers are allocated inside the
+// timed phases and freed each prove — at m=33 a single 2 GB cudaMalloc costs
+// ~ms, several per prove. Recycle by byte-size across proves (the real prover
+// keeps a persistent arena, like the CPU side's scratch::take_f128).
+static std::map<size_t, std::vector<void*>> g_pool_free;
+static std::map<void*, size_t> g_pool_size;
+static void* pool_alloc(size_t bytes) {
+    auto& v = g_pool_free[bytes];
+    if (!v.empty()) { void* p = v.back(); v.pop_back(); return p; }
+    void* p; CK(cudaMalloc(&p, bytes)); g_pool_size[p] = bytes; return p;
+}
+static void pool_release(void* p) { if (p) g_pool_free[g_pool_size.at(p)].push_back(p); }
+
 // device ligero_commit; returns root (host), leaves codeword+tree on device.
 static void commit_dev(const F128* d_src, int msg_log, int log_msg_cols, int log_ni, int log_inv_rate,
                        F128*& d_cw, uint8_t*& d_tree, long long& block_len, int& num_ntts, uint8_t root[32]) {
     int k_code = log_msg_cols + log_inv_rate; num_ntts = 1 << log_ni; block_len = 1LL << k_code;
     long long cw_len = block_len * num_ntts, msg_len = 1LL << msg_log;
     F128* d_tw; const TwiddleTable& tt = cached_tt(k_code, d_tw);
-    CK(cudaMalloc(&d_cw, cw_len*sizeof(F128)));
-    CK(cudaMalloc(&d_tree, (size_t)(2*block_len-1)*32));
-    int tpb=256; replicate_fill<<<(unsigned)((cw_len+tpb-1)/tpb),tpb>>>(d_src,d_cw,cw_len,msg_len);
-    launch_ntt(d_cw,d_tw,tt,log_inv_rate,k_code,num_ntts);
+    d_cw = (F128*)pool_alloc(cw_len*sizeof(F128));
+    d_tree = (uint8_t*)pool_alloc((size_t)(2*block_len-1)*32);
+    // Rate-extend fusion: the pre-NTT codeword is cw[e]=msg[e & (msg_len-1)], so
+    // when the first NTT pass is a topK chunk it reads the message directly —
+    // no replicate_fill pass, and pass-1 reads msg_len instead of cw_len elems.
+    if (ntt_can_fuse_src(k_code - log_inv_rate)) {
+        launch_ntt(d_cw,d_tw,tt,log_inv_rate,k_code,num_ntts,256,false,d_src,msg_len-1);
+    } else {
+        int tpb=256; replicate_fill<<<(unsigned)((cw_len+tpb-1)/tpb),tpb>>>(d_src,d_cw,cw_len,msg_len);
+        launch_ntt(d_cw,d_tw,tt,log_inv_rate,k_code,num_ntts);
+    }
     launch_merkle((const uint8_t*)d_cw,d_tree,block_len,num_ntts*16,256,4);   // kway=4 ILP
     CK(cudaDeviceSynchronize());
     CK(cudaMemcpy(root, d_tree+(size_t)(2*block_len-2)*32, 32, cudaMemcpyDeviceToHost));
@@ -136,11 +156,11 @@ static void zerocheck_phase(F128* da, F128* db, F128* dc, int m, FsChallenger& c
     }
 
     F128 *d_eq, *d_r1ab, *d_r1c, *d_ft, *d_am, *d_bm, *d_amn, *d_bmn, *d_p1, *d_pinf, *d_m1, *d_minf;
-    CK(cudaMalloc(&d_eq, rows * sizeof(F128)));
+    d_eq = (F128*)pool_alloc(rows * sizeof(F128));
     CK(cudaMalloc(&d_r1ab, 64 * sizeof(F128))); CK(cudaMalloc(&d_r1c, 64 * sizeof(F128)));
     CK(cudaMalloc(&d_ft, 8 * 256 * sizeof(F128)));
-    CK(cudaMalloc(&d_am, rows * sizeof(F128))); CK(cudaMalloc(&d_bm, rows * sizeof(F128)));
-    CK(cudaMalloc(&d_amn, rows * sizeof(F128))); CK(cudaMalloc(&d_bmn, rows * sizeof(F128)));
+    d_am = (F128*)pool_alloc(rows * sizeof(F128)); d_bm = (F128*)pool_alloc(rows * sizeof(F128));
+    d_amn = (F128*)pool_alloc(rows * sizeof(F128)); d_bmn = (F128*)pool_alloc(rows * sizeof(F128));
     CK(cudaMalloc(&d_p1, ZT_MAX_BLOCKS * sizeof(F128))); CK(cudaMalloc(&d_pinf, ZT_MAX_BLOCKS * sizeof(F128)));
     CK(cudaMalloc(&d_m1, sizeof(F128))); CK(cudaMalloc(&d_minf, sizeof(F128)));
     ZcSha* d_state; F128 *d_rho, *d_rhos, *d_eqlo, *d_eqhi;
@@ -319,8 +339,8 @@ static void zerocheck_phase(F128* da, F128* db, F128* dc, int m, FsChallenger& c
     x_inner_rest.assign(mlv_rhos.begin(), mlv_rhos.begin() + inner_rest_len);
     x_outer.assign(mlv_rhos.begin() + inner_rest_len, mlv_rhos.end());
 
-    cudaFree(d_eq); cudaFree(d_r1ab); cudaFree(d_r1c); cudaFree(d_ft);
-    cudaFree(d_am); cudaFree(d_bm); cudaFree(d_amn); cudaFree(d_bmn);
+    pool_release(d_eq); cudaFree(d_r1ab); cudaFree(d_r1c); cudaFree(d_ft);
+    pool_release(d_am); pool_release(d_bm); pool_release(d_amn); pool_release(d_bmn);
     cudaFree(d_p1); cudaFree(d_pinf); cudaFree(d_m1); cudaFree(d_minf);
     cudaFree(d_eqlo); cudaFree(d_eqhi);
     cudaFree(d_state); cudaFree(d_rho); cudaFree(d_rhos); cudaFree(d_scales);
@@ -616,13 +636,14 @@ static double prove(int log_n,int initial_k,int log_inv_rate_0,int num_queries_0
             ph.commit += ms_since(t);   // keep dcwn + dtn on device
             t=Clock::now(); ood_loop(ood_rec,nn); ph.ood += ms_since(t);
             query_open_induce(nn,rec_queries[lvl],d_prev_cw,d_prev_tree,prev_bl,prev_ni,lvl_rs);
-            cudaFree(d_prev_cw); cudaFree(d_prev_tree); d_prev_cw=dcwn; d_prev_tree=dtn; prev_bl=bln; prev_ni=ln;
+            pool_release(d_prev_cw); pool_release(d_prev_tree); d_prev_cw=dcwn; d_prev_tree=dtn; prev_bl=bln; prev_ni=ln;
         }
     }
-    cudaFree(d_prev_cw); cudaFree(d_prev_tree);
+    pool_release(d_prev_cw); pool_release(d_prev_tree);
     CK(cudaDeviceSynchronize());
     double total = std::chrono::duration<double,std::milli>(Clock::now()-t_all).count();
-    cudaFree(d_l0_cw); cudaFree(d_l0_tree);   // borrowed input — released outside the timed open
+    pool_release(d_l0_cw); pool_release(d_l0_tree);   // borrowed input — released outside the timed open
+    pool_release(d_cw1); pool_release(d_tree1);       // (was leaked)
     if (d_a) cudaFree(d_a); if (d_b) cudaFree(d_b); if (d_zlin) cudaFree(d_zlin);
     cudaFree(df);cudaFree(dcb);cudaFree(df2);cudaFree(dcb2);
     cudaFree(p0);cudaFree(p2);cudaFree(du0);cudaFree(du2);
