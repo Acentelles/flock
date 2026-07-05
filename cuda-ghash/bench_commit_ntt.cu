@@ -50,6 +50,7 @@ static void run_one(int m, int log_inv_rate, int log_batch_size, int iters) {
     CK(cudaMemcpy(d_tw, tt.data.data(), tt.data.size() * sizeof(F128), cudaMemcpyHostToDevice));
 
     int tpb = 256;
+    if (const char* e = getenv("NTT_TPB")) tpb = atoi(e);
     long long fill_blocks = (codeword_len + tpb - 1) / tpb;
     fill_kernel<<<(unsigned)fill_blocks, tpb>>>(d_data, codeword_len);
     CK(cudaGetLastError());

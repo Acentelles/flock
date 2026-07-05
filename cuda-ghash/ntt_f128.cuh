@@ -235,23 +235,30 @@ __global__ void ntt_deep_smem_kernel(F128* data, const F128* d_tw,
 // axis — they don't affect the twiddle — so this is a pure partitioning, no math
 // change. blockIdx.x enumerates (pos_tile, lane_tile): n_lane_tiles = num_ntts/lb
 // inner-most. smem index = pos_in_tile*lb + lin (lin = lane within this block).
+// All divisors here (lb, seg, n_lane_tiles) are powers of two but runtime
+// values — written as `/` and `%` they compile to 64-bit software division,
+// which runs on the (1/64-rate) FP64 pipe and was the measured top bottleneck
+// (70% FP64-pipe SOL). log_lb replaces them with shifts/masks.
 template <int K>
 __global__ void ntt_smem_topK_kernel(F128* data, const F128* d_tw,
-                                     int L, int log_d, int num_ntts, int lb,
+                                     int L, int log_d, int num_ntts, int log_lb,
                                      const F128* src, long long smask) {
     extern __shared__ F128 sm[];
     const int TILE       = 1 << K;
     const int NTW        = TILE - 1;          // distinct twiddles across the K layers
-    long long seg        = 1LL << (log_d - L - K);
+    const int lb         = 1 << log_lb;
+    const int lbm        = lb - 1;
+    int log_seg          = log_d - L - K;
     long long block_size = 1LL << (log_d - L);
-    int n_lane_tiles     = num_ntts / lb;
-    long long pos_tile   = (long long)blockIdx.x / n_lane_tiles;
-    long long lane_tile  = (long long)blockIdx.x % n_lane_tiles;
-    long long r          = pos_tile % seg;
-    long long block      = pos_tile / seg;
+    int log_nlt          = 0;                 // log2(num_ntts / lb)
+    while ((lb << log_nlt) < num_ntts) log_nlt++;
+    long long pos_tile   = (long long)blockIdx.x >> log_nlt;
+    long long lane_tile  = (long long)blockIdx.x & ((1 << log_nlt) - 1);
+    long long r          = pos_tile & ((1LL << log_seg) - 1);
+    long long block      = pos_tile >> log_seg;
     long long lane_base  = lane_tile * (long long)lb;
     long long gbase      = block * block_size * (long long)num_ntts + r * (long long)num_ntts + lane_base;
-    long long stride     = seg * (long long)num_ntts;
+    long long stride     = (long long)num_ntts << log_seg;
     long long tcount     = (long long)TILE * lb;
     F128* twid           = sm + tcount;       // NTW twiddles parked after the data tile
 
@@ -263,7 +270,7 @@ __global__ void ntt_smem_topK_kernel(F128* data, const F128* d_tw,
     // pass disappears. Stores always go to data; src is a different buffer
     // there, and in the identity case all loads precede all stores per tile.
     for (long long e = threadIdx.x; e < tcount; e += blockDim.x) {
-        long long i = e / lb, lin = e - i * lb;
+        long long i = e >> log_lb, lin = e & lbm;
         sm[e] = src[(gbase + i * stride + lin) & smask];
     }
     // Precompute the NTW distinct twiddles ONCE (was: dev_twiddle re-expanded per
@@ -284,8 +291,8 @@ __global__ void ntt_smem_topK_kernel(F128* data, const F128* d_tw,
         int strj  = 1 << (K - 1 - j);
         int twoff = (1 << j) - 1;                         // twid base for this layer
         for (long long q = threadIdx.x; q < bpl; q += blockDim.x) {
-            long long lin  = q % lb;
-            long long bi   = q / lb;                   // 0..TILE/2-1
+            long long lin  = q & lbm;
+            long long bi   = q >> log_lb;              // 0..TILE/2-1
             long long sub  = bi / strj;
             long long p    = bi - sub * strj;
             long long ubase= sub * (strj << 1) + p;
@@ -301,7 +308,7 @@ __global__ void ntt_smem_topK_kernel(F128* data, const F128* d_tw,
     }
 
     for (long long e = threadIdx.x; e < tcount; e += blockDim.x) {
-        long long i = e / lb, lin = e - i * lb;
+        long long i = e >> log_lb, lin = e & lbm;
         data[gbase + i * stride + lin] = sm[e];
     }
 }
@@ -314,15 +321,19 @@ template <int K>
 inline void launch_topK_chunk(F128* d_data, const F128* d_tw, int layer, int log_d,
                               int num_ntts, int tpb,
                               const F128* src = nullptr, long long smask = -1) {
-    const size_t TOPK_SMEM_CAP = 32 * 1024;
-    int lb = num_ntts;
-    while ((size_t)(1LL << K) * (size_t)lb * sizeof(F128) > TOPK_SMEM_CAP && lb > 1)
-        lb >>= 1;
+    static size_t TOPK_SMEM_CAP = [] {
+        const char* e = getenv("NTT_SMEM_KB"); return (size_t)(e ? atoi(e) : 32) * 1024;
+    }();
+    int lb = num_ntts, log_lb = 0;
+    while ((1 << log_lb) < num_ntts) log_lb++;
+    while ((size_t)(1LL << K) * (size_t)lb * sizeof(F128) > TOPK_SMEM_CAP && lb > 1) {
+        lb >>= 1; log_lb--;
+    }
     size_t smem = ((size_t)(1LL << K) * (size_t)lb + ((1u << K) - 1)) * sizeof(F128);
     cudaFuncSetAttribute(ntt_smem_topK_kernel<K>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
     long long tiles = (1LL << (log_d - K)) * (long long)(num_ntts / lb);
-    ntt_smem_topK_kernel<K><<<(unsigned)tiles, tpb, smem>>>(d_data, d_tw, layer, log_d, num_ntts, lb,
+    ntt_smem_topK_kernel<K><<<(unsigned)tiles, tpb, smem>>>(d_data, d_tw, layer, log_d, num_ntts, log_lb,
                                                             src ? src : d_data, smask);
 }
 
@@ -337,7 +348,7 @@ inline void launch_top_fused(F128* d_data, const F128* d_tw, const TwiddleTable&
                              const F128* src0 = nullptr, long long smask0 = -1) {
     int total = to - from;
     if (total <= 0) return;
-    const int KMAX = 7;
+    static int KMAX = [] { const char* e = getenv("NTT_KMAX"); return e ? atoi(e) : 7; }();
     int npass = (total + KMAX - 1) / KMAX;
     int base = total / npass, extra = total % npass;
     int layer = from;
@@ -349,6 +360,9 @@ inline void launch_top_fused(F128* d_data, const F128* d_tw, const TwiddleTable&
         long long smask = (p == 0) ? smask0 : -1;
         long long total_bf, blocks;
         switch (c) {
+            case 10: launch_topK_chunk<10>(d_data, d_tw, layer, log_d, num_ntts, tpb, src, smask); break;
+            case 9: launch_topK_chunk<9>(d_data, d_tw, layer, log_d, num_ntts, tpb, src, smask); break;
+            case 8: launch_topK_chunk<8>(d_data, d_tw, layer, log_d, num_ntts, tpb, src, smask); break;
             case 7: launch_topK_chunk<7>(d_data, d_tw, layer, log_d, num_ntts, tpb, src, smask); break;
             case 6: launch_topK_chunk<6>(d_data, d_tw, layer, log_d, num_ntts, tpb, src, smask); break;
             case 5: launch_topK_chunk<5>(d_data, d_tw, layer, log_d, num_ntts, tpb, src, smask); break;
