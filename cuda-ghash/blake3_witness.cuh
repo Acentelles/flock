@@ -67,6 +67,22 @@ __device__ __constant__ int B3_G_MSG_IDX[8][2] = {
 __device__ __constant__ int B3_MSG_PERM[16] = {
     2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8};
 
+// B3_MSG_PERM composed r times — the message schedule as used in round r.
+// Precomposed so the trace builder needs no runtime perm[]/next[] arrays:
+// `perm[B3_MSG_PERM[i]]` forced those (and the m[] they index) into LOCAL
+// memory (ptxas: 128 B stack), and the resulting per-G local loads were 45 GB
+// of L2 traffic per witness build — the kernel's measured bottleneck (L2 94%,
+// DRAM 40%). Generated from B3_MSG_PERM: PERM_R[0]=id, PERM_R[r][i]=PERM_R[r-1][MSG_PERM[i]].
+__device__ __constant__ int B3_PERM_R[B3_N_ROUNDS][16] = {
+    {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+    {2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8},
+    {3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1},
+    {10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6},
+    {12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4},
+    {9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7},
+    {11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13},
+};
+
 // ---- bit-packing primitives (verbatim from common.rs) ---------------------
 __device__ __forceinline__ void b3_or_bit_at(b3u64* buf, int bit) {
     buf[bit >> 6] |= 1ull << (bit & 63);
@@ -228,8 +244,10 @@ __device__ __forceinline__ void b3_rec_flush_atomic(const b3u64 rec[4], b3u64* b
     }
     atomicOr((unsigned long long*)&buf[bi + 4], spill);
 }
+// `m` MUST point to shared (or otherwise cheaply dynamically-indexable) memory:
+// the message schedule indexes it with runtime values from B3_PERM_R.
 __device__ void b3_build_trace_par(b3u64* buf, uint32_t* st, int which, int gsub, bool work,
-                                   const uint32_t cv[8], const uint32_t m[16],
+                                   const uint32_t cv[8], const uint32_t* __restrict__ m,
                                    uint32_t counter_lo, uint32_t counter_hi,
                                    uint32_t block_len, uint32_t flags) {
 #define LINVAL(v) ((which == 2) ? 0xFFFFFFFFu : (uint32_t)(v))
@@ -249,10 +267,6 @@ __device__ void b3_build_trace_par(b3u64* buf, uint32_t* st, int which, int gsub
     }
     __syncwarp();
 
-    int perm[16];
-#pragma unroll
-    for (int i = 0; i < 16; i++) perm[i] = i;
-
     for (int r = 0; r < B3_N_ROUNDS; r++) {
         for (int phase = 0; phase < 2; phase++) {
             if (work) {
@@ -260,8 +274,8 @@ __device__ void b3_build_trace_par(b3u64* buf, uint32_t* st, int which, int gsub
                 int g = r * B3_N_G_PER_ROUND + gi;
                 int la = B3_G_LANES[gi][0], lb = B3_G_LANES[gi][1];
                 int lc = B3_G_LANES[gi][2], ld = B3_G_LANES[gi][3];
-                uint32_t mx = m[perm[B3_G_MSG_IDX[gi][0]]];
-                uint32_t my = m[perm[B3_G_MSG_IDX[gi][1]]];
+                uint32_t mx = m[B3_PERM_R[r][B3_G_MSG_IDX[gi][0]]];
+                uint32_t my = m[B3_PERM_R[r][B3_G_MSG_IDX[gi][1]]];
                 uint32_t a_val = st[la], b_val = st[lb], c_val = st[lc], d_val = st[ld];
 
                 b3u64 rec[4] = {0, 0, 0, 0};
@@ -292,11 +306,6 @@ __device__ void b3_build_trace_par(b3u64* buf, uint32_t* st, int which, int gsub
             }
             __syncwarp();
         }
-        int next[16];
-#pragma unroll
-        for (int i = 0; i < 16; i++) next[i] = perm[B3_MSG_PERM[i]];
-#pragma unroll
-        for (int i = 0; i < 16; i++) perm[i] = next[i];
     }
 
     if (work && gsub == 0) {
@@ -323,7 +332,7 @@ __device__ void b3_build_trace_par(b3u64* buf, uint32_t* st, int which, int gsub
 // Padding blocks (n_blocks <= blk < n_total) get the ZERO-input Compression
 // trace — what the Rust generator emits for them (b = all-ones linear rows).
 #ifndef B3_WIT_WARPS
-#define B3_WIT_WARPS 4
+#define B3_WIT_WARPS 2
 #endif
 __global__ void blake3_witness_blocks(const uint32_t* __restrict__ cv_all,
                                       const uint32_t* __restrict__ m_all,
@@ -335,6 +344,7 @@ __global__ void blake3_witness_blocks(const uint32_t* __restrict__ cv_all,
                                       b3u64* __restrict__ b) {
     __shared__ b3u64 sbuf[B3_WIT_WARPS][3][B3_U64_PER_BLOCK + 1];   // +1: bank stagger
     __shared__ uint32_t sstate[B3_WIT_WARPS][3][16];
+    __shared__ uint32_t smsg[B3_WIT_WARPS][17];    // per-warp message words (+1 stagger)
     int wid = threadIdx.x >> 5, lane = threadIdx.x & 31;
     long long blk = (long long)blockIdx.x * B3_WIT_WARPS + wid;
     if (blk >= n_total) return;                    // warp-uniform exit
@@ -343,13 +353,15 @@ __global__ void blake3_witness_blocks(const uint32_t* __restrict__ cv_all,
     // 12 builder lanes: which = lane>>2 (slice), gsub = lane&3 (G within phase).
     bool work = lane < 12;
     int which_l = work ? (lane >> 2) : 0, gsub = lane & 3;
-    uint32_t cv[8] = {0}, m[16] = {0};
+    uint32_t cv[8] = {0};
     b3u64 counter = 0; uint32_t block_len = 0, flags = 0;
+    // Message words live in SHARED, one copy per warp: the schedule indexes them
+    // with runtime values, and a per-lane register array would be demoted to
+    // local memory (see B3_PERM_R comment — that cost 45 GB of L2 per build).
+    if (lane < 16) smsg[wid][lane] = active ? m_all[blk * 16 + lane] : 0;
     if (active && work) {
 #pragma unroll
         for (int w = 0; w < 8; w++) cv[w] = cv_all[blk * 8 + w];
-#pragma unroll
-        for (int i = 0; i < 16; i++) m[i] = m_all[blk * 16 + i];
         counter = ctr_all[blk];
         block_len = blen_all[blk];
         flags = flags_all[blk];
@@ -361,7 +373,7 @@ __global__ void blake3_witness_blocks(const uint32_t* __restrict__ cv_all,
         for (int j = lane; j < B3_U64_PER_BLOCK; j += 32) sbuf[wid][w2][j] = 0;
     __syncwarp();
     b3_build_trace_par(sbuf[wid][which_l], sstate[wid][which_l], which_l, gsub, work,
-                       cv, m, counter_lo, counter_hi, block_len, flags);
+                       cv, smsg[wid], counter_lo, counter_hi, block_len, flags);
     b3u64* gout[3] = {z, a, b};
     for (int which = 0; which < 3; which++) {
         b3u64* gw = gout[which] + blk * B3_U64_PER_BLOCK;
@@ -387,25 +399,26 @@ __device__ __forceinline__ b3u64 b3_transpose8(b3u64 x) {
 __global__ void blake3_lincheck_transpose(const b3u64* __restrict__ z, long long n_total,
                                           uint8_t* __restrict__ z_lincheck) {
     long long total = (n_total / 8) * (long long)B3_U64_PER_BLOCK;
-    long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= total) return;
-    long long g = tid / B3_U64_PER_BLOCK;
-    int i = (int)(tid - g * B3_U64_PER_BLOCK);
+    long long stride = (long long)gridDim.x * blockDim.x;   // grid-stride: cappable grid
+    for (long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x; tid < total; tid += stride) {
+        long long g = tid / B3_U64_PER_BLOCK;
+        int i = (int)(tid - g * B3_U64_PER_BLOCK);
 
-    b3u64 lanes[8];
+        b3u64 lanes[8];
 #pragma unroll
-    for (int lane = 0; lane < 8; lane++)
-        lanes[lane] = z[(8 * g + lane) * (long long)B3_U64_PER_BLOCK + i];
+        for (int lane = 0; lane < 8; lane++)
+            lanes[lane] = z[(8 * g + lane) * (long long)B3_U64_PER_BLOCK + i];
 
-    b3u64* dst = (b3u64*)(z_lincheck + g * (long long)B3_K + (long long)i * 64);
+        b3u64* dst = (b3u64*)(z_lincheck + g * (long long)B3_K + (long long)i * 64);
 #pragma unroll
-    for (int b_chunk = 0; b_chunk < 8; b_chunk++) {
-        // src byte r = byte b_chunk of lanes[r].
-        b3u64 src = 0;
+        for (int b_chunk = 0; b_chunk < 8; b_chunk++) {
+            // src byte r = byte b_chunk of lanes[r].
+            b3u64 src = 0;
 #pragma unroll
-        for (int r = 0; r < 8; r++)
-            src |= ((lanes[r] >> (8 * b_chunk)) & 0xFFull) << (8 * r);
-        dst[b_chunk] = b3_transpose8(src);  // LE: byte t → out[b_chunk*8 + t]
+            for (int r = 0; r < 8; r++)
+                src |= ((lanes[r] >> (8 * b_chunk)) & 0xFFull) << (8 * r);
+            dst[b_chunk] = b3_transpose8(src);  // LE: byte t → out[b_chunk*8 + t]
+        }
     }
 }
 
@@ -424,8 +437,10 @@ inline void launch_blake3_witness_blocks(const uint32_t* cv, const uint32_t* m,
 }
 
 inline void launch_blake3_lincheck_transpose(const b3u64* z, long long n_total,
-                                             uint8_t* z_lincheck) {
+                                             uint8_t* z_lincheck,
+                                             cudaStream_t stream = 0, long long max_blocks = 0) {
     long long total = (n_total / 8) * (long long)B3_U64_PER_BLOCK;
     long long blocks = (total + 255) / 256;
-    blake3_lincheck_transpose<<<(unsigned)blocks, 256>>>(z, n_total, z_lincheck);
+    if (max_blocks > 0 && blocks > max_blocks) blocks = max_blocks;   // thin co-run grid
+    blake3_lincheck_transpose<<<(unsigned)blocks, 256, 0, stream>>>(z, n_total, z_lincheck);
 }

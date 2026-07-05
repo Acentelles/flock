@@ -395,7 +395,7 @@ __global__ void fill_compressions(uint32_t* cv, uint32_t* m, b3u64* ctr, uint32_
 // future zerocheck) and the lincheck stripe-packed z (d_zlin), all on-device —
 // the only H2D in the full prover would be the Compression inputs themselves.
 // n_blocks_log = log_n - 7 (K_LOG=14), fully populated so no padding/memset.
-static void witness_phase(F128* df, F128* da, F128* db, uint8_t* d_zlin, int log_n, Phase& ph) {
+static void witness_phase(F128* df, F128* da, F128* db, int log_n, Phase& ph) {
     int n_blocks_log = log_n - 7;
     long long n_total = 1LL << n_blocks_log;
     int n_blocks = (int)n_total;
@@ -408,7 +408,9 @@ static void witness_phase(F128* df, F128* da, F128* db, uint8_t* d_zlin, int log
     auto t = Clock::now();
     launch_blake3_witness_blocks(d_cv, d_m, d_ctr, d_blen, d_flags, n_blocks, n_total,
                                  (b3u64*)df, (b3u64*)da, (b3u64*)db);
-    launch_blake3_lincheck_transpose((b3u64*)df, n_total, d_zlin);
+    // The lincheck stripe transpose is NOT here: it depends only on the final z
+    // (df) and is consumed only by lincheck, so prove() runs it on the side
+    // stream under the l0 commit (thin grid), off the critical path.
     ph.witness += ms_since(t);
     cudaFree(d_cv); cudaFree(d_m); cudaFree(d_blen); cudaFree(d_flags); cudaFree(d_ctr);
 }
@@ -533,7 +535,7 @@ static double prove(int log_n,int initial_k,int log_inv_rate_0,int num_queries_0
     if (do_witness) {
         CK(cudaMalloc(&d_a,len*sizeof(F128))); CK(cudaMalloc(&d_b,len*sizeof(F128)));
         CK(cudaMalloc(&d_zlin,(size_t)len*16));   // 2^m/8 bytes = len*16
-        witness_phase(df, d_a, d_b, d_zlin, log_n, ph);
+        witness_phase(df, d_a, d_b, log_n, ph);
         // a/b stay resident — consumed by zerocheck below, then freed before the open.
     }
 
@@ -550,7 +552,11 @@ static double prove(int log_n,int initial_k,int log_inv_rate_0,int num_queries_0
     // the commit's DRAM headroom instead. Results wait in du0/du2.
     static cudaStream_t s_pre = nullptr;
     if (!s_pre) CK(cudaStreamCreateWithFlags(&s_pre, cudaStreamNonBlocking));
-    static int pre_cap = [] { const char* e = getenv("PRE_CAP"); return e ? atoi(e) : 48; }();
+    static int pre_cap = [] { const char* e = getenv("PRE_CAP"); return e ? atoi(e) : 24; }();
+    // Lincheck stripe transpose first (consumed earliest, by lincheck): reads only
+    // the final z (df), so it trickles under the commit exactly like the message.
+    if (do_witness)
+        launch_blake3_lincheck_transpose((const b3u64*)df, 1LL << (log_n - 7), d_zlin, s_pre, pre_cap);
     { int pblocks = sumcheck_blocks(len/2) < pre_cap ? sumcheck_blocks(len/2) : pre_cap;
       sumcheck_msg_partial<<<pblocks, SMC_TPB, 0, s_pre>>>(df, dcb, len/2, p0, p2);
       sumcheck_msg_combine<<<1, SMC_TPB, 0, s_pre>>>(p0, p2, pblocks, du0, du2); }
