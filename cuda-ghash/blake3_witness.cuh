@@ -26,6 +26,9 @@ typedef unsigned long long b3u64;
 #define B3_WORD_BITS 32
 #define B3_CARRY_BITS 31                // WORD_BITS - 1
 #define B3_ADDS_PER_G 6
+#ifndef B3_TPB
+#define B3_TPB 128
+#endif
 #define B3_G_STRIDE 250                 // 6*31 + 2*32
 
 // layout bases
@@ -125,17 +128,24 @@ __global__ void blake3_witness_blocks(const uint32_t* __restrict__ cv_all,
                                       b3u64* __restrict__ z, b3u64* __restrict__ a,
                                       b3u64* __restrict__ b) {
     long long blk = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (blk >= n_total) return;
-    if (blk >= n_blocks) return;  // padding: slices already zero
+    // No early return: the whole warp stays alive for the cooperative coalesced
+    // copyout. Padding blocks (n_blocks <= blk < n_total) build the trace of a
+    // ZERO-input Compression — that is what the Rust generator emits for them
+    // (b gets the all-ones linear rows etc.), NOT zeroed slices; the old
+    // early-return kernel diverged from the oracle there.
+    bool active = (blk < n_blocks);
 
-    uint32_t cv[8], m[16];
+    uint32_t cv[8] = {0}, m[16] = {0};
+    b3u64 counter = 0; uint32_t block_len = 0, flags = 0;
+    if (active) {
 #pragma unroll
-    for (int w = 0; w < 8; w++) cv[w] = cv_all[blk * 8 + w];
+        for (int w = 0; w < 8; w++) cv[w] = cv_all[blk * 8 + w];
 #pragma unroll
-    for (int i = 0; i < 16; i++) m[i] = m_all[blk * 16 + i];
-    b3u64 counter = ctr_all[blk];
-    uint32_t block_len = blen_all[blk];
-    uint32_t flags = flags_all[blk];
+        for (int i = 0; i < 16; i++) m[i] = m_all[blk * 16 + i];
+        counter = ctr_all[blk];
+        block_len = blen_all[blk];
+        flags = flags_all[blk];
+    }
     uint32_t counter_lo = (uint32_t)counter;
     uint32_t counter_hi = (uint32_t)(counter >> 32);
 
@@ -232,10 +242,30 @@ __global__ void blake3_witness_blocks(const uint32_t* __restrict__ cv_all,
 
         // Write out as 16-byte stores (STG.128); block-major is uncoalesced
         // (2KB-strided per thread), so halving the store count is the lever.
-        ulonglong2* gd = (ulonglong2*)(gout[which] + blk * B3_U64_PER_BLOCK);
-        const ulonglong2* ld = (const ulonglong2*)buf;
-#pragma unroll 8
-        for (int j = 0; j < B3_U64_PER_BLOCK / 2; j++) gd[j] = ld[j];
+        // COALESCED copyout via a shared transpose tile. The old per-thread
+        // ulonglong2 loop had each lane streaming its own 2 KB slice — a warp's
+        // stores land 2 KB apart, so every 32 B sector carried 16 useful bytes
+        // and the kernel moved ~17 GB for a 3 GB output (ncu: DRAM 66%, compute
+        // 3%). Staging 32-u64 chunks through shared and storing one BLOCK's row
+        // per iteration makes every store warp-contiguous.
+        {
+            __shared__ b3u64 stile[B3_TPB / 32][32][33];   // +1 pad: bank spread
+            int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+            long long wbase = blk - lane;                      // warp's first block
+            b3u64* gw = gout[which];
+            for (int k = 0; k < B3_U64_PER_BLOCK / 32; k++) {  // 8 chunks of 32 u64
+#pragma unroll
+                for (int j = 0; j < 32; j++) stile[wid][lane][j] = buf[k * 32 + j];
+                __syncwarp();
+#pragma unroll 4
+                for (int src = 0; src < 32; src++) {
+                    long long b_ = wbase + src;
+                    if (b_ < n_total)
+                        gw[b_ * B3_U64_PER_BLOCK + (long long)k * 32 + lane] = stile[wid][src][lane];
+                }
+                __syncwarp();
+            }
+        }
     }
 #undef LINVAL
 }
