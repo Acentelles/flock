@@ -160,7 +160,7 @@ static void commit_dev(const F128* d_src, int msg_log, int log_msg_cols, int log
 }
 static void msg(const F128*A,const F128*B,long long len,F128*p0,F128*p2,F128*du0,F128*du2,F128&u0,F128&u2){
     launch_sumcheck_msg(A,B,len/2,p0,p2,du0,du2);
-    CK(cudaMemcpy(&u0,du0,sizeof(F128),cudaMemcpyDeviceToHost)); CK(cudaMemcpy(&u2,du2,sizeof(F128),cudaMemcpyDeviceToHost));
+    F128 u[2]; CK(cudaMemcpy(u,du0,2*sizeof(F128),cudaMemcpyDeviceToHost)); u0=u[0]; u2=u[1];   // du2 = du0+1
 }
 
 struct Phase { double commit=0, fold=0, ood=0, open=0, induce=0, intro=0, lincheck=0, witness=0, zerocheck=0, l0commit=0; };
@@ -520,7 +520,8 @@ static double prove(int log_n,int initial_k,int log_inv_rate_0,int num_queries_0
     // (df, dcb) — no separate d_f/d_b1 (saves 2 full-size buffers, matters at m≥34).
     F128 *df,*dcb,*df2,*dcb2,*du0,*du2,*p0,*p2;
     CK(cudaMalloc(&df,len*sizeof(F128)));CK(cudaMalloc(&dcb,len*sizeof(F128)));CK(cudaMalloc(&df2,len*sizeof(F128)));CK(cudaMalloc(&dcb2,len*sizeof(F128)));
-    CK(cudaMalloc(&p0,SMC_MAX_BLOCKS*sizeof(F128)));CK(cudaMalloc(&p2,SMC_MAX_BLOCKS*sizeof(F128)));CK(cudaMalloc(&du0,sizeof(F128)));CK(cudaMalloc(&du2,sizeof(F128)));
+    CK(cudaMalloc(&p0,SMC_MAX_BLOCKS*sizeof(F128)));CK(cudaMalloc(&p2,SMC_MAX_BLOCKS*sizeof(F128)));
+    CK(cudaMalloc(&du0,2*sizeof(F128))); du2 = du0 + 1;   // adjacent: one 32 B D2H per round
     { int tpb=256; fill2<<<(unsigned)((len+tpb-1)/tpb),tpb>>>(df,dcb,len); CK(cudaDeviceSynchronize()); }
 
     // ---- GPU witness generation (S4): produce the REAL witness z into `df`
@@ -540,6 +541,19 @@ static double prove(int log_n,int initial_k,int log_inv_rate_0,int num_queries_0
     // open receives l0_codeword + l0_tree as borrowed inputs. Committed from the
     // witness (df, before any fold), before timing starts, excluded from the open.
     F128 *d_prev_cw; uint8_t *d_tree0; long long l0bl; int l0lanes; uint8_t l0root[32];
+    // Precompute the open's FIRST sumcheck message on a non-blocking side stream,
+    // overlapped with the l0 commit: the message depends only on (df, dcb) — both
+    // final here — so Fiat-Shamir only constrains when it is OBSERVED (open start),
+    // not when it is computed. The grid is capped WELL below machine fill: fat
+    // co-runs serialize (full-grid msg owned every SM; zerocheck round-1's 128-reg
+    // kernel owns the register file) — a thin grid-strided kernel trickles through
+    // the commit's DRAM headroom instead. Results wait in du0/du2.
+    static cudaStream_t s_pre = nullptr;
+    if (!s_pre) CK(cudaStreamCreateWithFlags(&s_pre, cudaStreamNonBlocking));
+    static int pre_cap = [] { const char* e = getenv("PRE_CAP"); return e ? atoi(e) : 48; }();
+    { int pblocks = sumcheck_blocks(len/2) < pre_cap ? sumcheck_blocks(len/2) : pre_cap;
+      sumcheck_msg_partial<<<pblocks, SMC_TPB, 0, s_pre>>>(df, dcb, len/2, p0, p2);
+      sumcheck_msg_combine<<<1, SMC_TPB, 0, s_pre>>>(p0, p2, pblocks, du0, du2); }
     auto t_l0c = Clock::now();
     commit_dev(df, log_n, log_n-initial_k, initial_k, log_inv_rate_0, d_prev_cw,d_tree0,l0bl,l0lanes,l0root, true);
     CK(cudaDeviceSynchronize()); ph.l0commit += ms_since(t_l0c);
@@ -569,12 +583,16 @@ static double prove(int log_n,int initial_k,int log_inv_rate_0,int num_queries_0
 
     F128 *cf=df,*ccb=dcb,*nf=df2,*ncb=dcb2; long long slen=len;
     F128 u0,u2;
-    auto t=Clock::now(); msg(cf,ccb,slen,p0,p2,du0,du2,u0,u2); ch.observe_f128(to_ch(u0));ch.observe_f128(to_ch(u2));
+    // First message was precomputed on s_pre during the l0 commit (df/dcb unchanged
+    // since); the phase syncs since then guarantee it is complete. Just fetch it.
+    auto t=Clock::now();
+    { F128 u[2]; CK(cudaMemcpy(u,du0,2*sizeof(F128),cudaMemcpyDeviceToHost)); u0=u[0]; u2=u[1]; }
+    ch.observe_f128(to_ch(u0));ch.observe_f128(to_ch(u2));
     std::vector<F128> r_lane;
     for(int k=0;k<initial_k;k++){ ChF128 rc=ch.sample_f128(); F128 rr{rc.lo,rc.hi};
         long long half=slen/2; launch_sumcheck_fold_msg(cf,ccb,nf,ncb,half,rr,p0,p2,du0,du2); // fused fold + next msg (1 pass)
         {F128*z;z=cf;cf=nf;nf=z;z=ccb;ccb=ncb;ncb=z;} slen=half;
-        CK(cudaMemcpy(&u0,du0,sizeof(F128),cudaMemcpyDeviceToHost));CK(cudaMemcpy(&u2,du2,sizeof(F128),cudaMemcpyDeviceToHost));
+        { F128 u[2]; CK(cudaMemcpy(u,du0,2*sizeof(F128),cudaMemcpyDeviceToHost)); u0=u[0]; u2=u[1]; }
         ch.observe_f128(to_ch(u0));ch.observe_f128(to_ch(u2)); r_lane.push_back(rr); }
     ph.fold += ms_since(t);
 
@@ -653,7 +671,7 @@ static double prove(int log_n,int initial_k,int log_inv_rate_0,int num_queries_0
         for(int k=0;k<k_rec;k++){ ChF128 rc=ch.sample_f128(); F128 rr{rc.lo,rc.hi};
             long long half=slen/2; launch_sumcheck_fold_msg(cf,ccb,nf,ncb,half,rr,p0,p2,du0,du2); // fused fold + next msg (1 pass)
             {F128*z;z=cf;cf=nf;nf=z;z=ccb;ccb=ncb;ncb=z;} slen=half;
-            CK(cudaMemcpy(&u0,du0,sizeof(F128),cudaMemcpyDeviceToHost));CK(cudaMemcpy(&u2,du2,sizeof(F128),cudaMemcpyDeviceToHost));
+            { F128 u[2]; CK(cudaMemcpy(u,du0,2*sizeof(F128),cudaMemcpyDeviceToHost)); u0=u[0]; u2=u[1]; }
             ch.observe_f128(to_ch(u0));ch.observe_f128(to_ch(u2)); lvl_rs.push_back(rr);}
         ph.fold += ms_since(t);
         if(lvl==r-1){ std::vector<F128> yr(slen); CK(cudaMemcpy(yr.data(),cf,(size_t)slen*sizeof(F128),cudaMemcpyDeviceToHost));
@@ -677,7 +695,7 @@ static double prove(int log_n,int initial_k,int log_inv_rate_0,int num_queries_0
     pool_release(d_cw1); pool_release(d_tree1);       // (was leaked)
     if (d_a) cudaFree(d_a); if (d_b) cudaFree(d_b); if (d_zlin) cudaFree(d_zlin);
     cudaFree(df);cudaFree(dcb);cudaFree(df2);cudaFree(dcb2);
-    cudaFree(p0);cudaFree(p2);cudaFree(du0);cudaFree(du2);
+    cudaFree(p0);cudaFree(p2);cudaFree(du0);
     cudaFree(d_bnew);cudaFree(ep0);cudaFree(ep2);cudaFree(epodd);cudaFree(eu0);cudaFree(eu2);cudaFree(ehnew);
     return total;
 }
