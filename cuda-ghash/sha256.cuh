@@ -89,6 +89,33 @@ __device__ __forceinline__ void sha256(const uint8_t* msg, uint32_t len, uint8_t
     }
 }
 
+// Compress one block given as 16 already-big-endian u32 words (clobbers w).
+// Sliding 16-word schedule — 16 registers instead of sha256_compress's w[64].
+__device__ __forceinline__ void sha256_compress_words(uint32_t h[8], uint32_t w[16]) {
+    uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+#pragma unroll
+    for (int i = 0; i < 64; i++) {
+        uint32_t wi;
+        if (i < 16) {
+            wi = w[i];
+        } else {
+            uint32_t w1  = w[(i + 1) & 15];
+            uint32_t w14 = w[(i + 14) & 15];
+            uint32_t s0 = rotr32(w1, 7) ^ rotr32(w1, 18) ^ (w1 >> 3);
+            uint32_t s1 = rotr32(w14, 17) ^ rotr32(w14, 19) ^ (w14 >> 10);
+            w[i & 15] = w[i & 15] + s0 + w[(i + 9) & 15] + s1;
+            wi = w[i & 15];
+        }
+        uint32_t S1 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25);
+        uint32_t ch = (e & f) ^ (~e & g);
+        uint32_t t1 = hh + S1 + ch + SHA256_K[i] + wi;
+        uint32_t S0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22);
+        uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+        hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + S0 + maj;
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+}
+
 // ---------------------------------------------------------------------------
 // K-way interleaved SHA-256: one thread hashes K independent equal-length
 // inputs, running the K compression chains together for ILP. Mirrors the CPU's

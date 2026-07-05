@@ -41,6 +41,73 @@ __global__ void merkle_leaf_kernel_kway(const uint8_t* data, uint8_t* tree,
     }
 }
 
+// Warp-staged leaf hashing (leaf_size % 128 == 0). The naive kernels above are
+// L1-pipe-bound, not SHA-bound (measured 85% L1/TEX vs 26% SM at m=33): each
+// thread walks its own leaf with byte loads, so every load is a separate
+// uncoalesced sector. Here a warp owns 32 consecutive leaves and alternates:
+//   stage  — the warp loads a 128-byte chunk of each of its 32 leaves as
+//            uint4s (8 per chunk; lanes cover 4 chunks per iteration, fully
+//            coalesced within each 128 B segment) into shared memory, padded
+//            to a 33-word leaf stride so bank(l,w) = (l+w)%32 — conflict-free
+//            both on the strided store and on the per-lane hash reads;
+//   hash   — lane l compresses the two 64-byte blocks of ITS leaf's chunk
+//            straight from shared (BE byte-swap on the register read).
+// The trailing padding block (0x80 ... bitlen) is a constant — computed in
+// registers, no staging. Digest layout matches sha256() bit-for-bit.
+__global__ void merkle_leaf_kernel_staged(const uint8_t* __restrict__ data, uint8_t* tree,
+                                          long long num_leaves, int leaf_size) {
+    extern __shared__ uint32_t sw[];                  // 32*33 words per warp
+    int wid = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    uint32_t* s = sw + wid * (32 * 33);
+    long long warp0 = ((long long)blockIdx.x * (blockDim.x >> 5) + wid) * 32;
+    if (warp0 >= num_leaves) return;
+    long long myleaf = warp0 + lane;
+
+    uint32_t h[8] = {0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+                     0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u};
+    int nchunks = leaf_size >> 7;
+    for (int c = 0; c < nchunks; c++) {
+#pragma unroll
+        for (int it = 0; it < 8; it++) {
+            int idx   = it * 32 + lane;               // 0..255: uint4s of this stage
+            int piece = idx >> 3, off = idx & 7;      // leaf-chunk, uint4 within it
+            long long leaf = warp0 + piece;
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (leaf < num_leaves)
+                v = *(const uint4*)(data + leaf * (long long)leaf_size + (long long)c * 128 + off * 16);
+            uint32_t* d = s + piece * 33 + off * 4;
+            d[0] = v.x; d[1] = v.y; d[2] = v.z; d[3] = v.w;
+        }
+        __syncwarp();
+        if (myleaf < num_leaves) {
+#pragma unroll
+            for (int b = 0; b < 2; b++) {
+                uint32_t w[16];
+#pragma unroll
+                for (int j = 0; j < 16; j++)
+                    w[j] = __byte_perm(s[lane * 33 + b * 16 + j], 0, 0x0123);
+                sha256_compress_words(h, w);
+            }
+        }
+        __syncwarp();
+    }
+    if (myleaf >= num_leaves) return;
+
+    uint32_t w[16];                                   // constant padding block
+    w[0] = 0x80000000u;
+#pragma unroll
+    for (int j = 1; j < 14; j++) w[j] = 0;
+    uint64_t bitlen = (uint64_t)leaf_size * 8;
+    w[14] = (uint32_t)(bitlen >> 32); w[15] = (uint32_t)bitlen;
+    sha256_compress_words(h, w);
+
+    uint4* o = (uint4*)(tree + myleaf * 32);
+    o[0] = make_uint4(__byte_perm(h[0], 0, 0x0123), __byte_perm(h[1], 0, 0x0123),
+                      __byte_perm(h[2], 0, 0x0123), __byte_perm(h[3], 0, 0x0123));
+    o[1] = make_uint4(__byte_perm(h[4], 0, 0x0123), __byte_perm(h[5], 0, 0x0123),
+                      __byte_perm(h[6], 0, 0x0123), __byte_perm(h[7], 0, 0x0123));
+}
+
 // One thread per parent: hash the 64-byte child pair into the parent node.
 // read_start/write_start are node indices into the flat tree.
 __global__ void merkle_level_kernel(uint8_t* tree, long long read_start,
@@ -58,7 +125,13 @@ __global__ void merkle_level_kernel(uint8_t* tree, long long read_start,
 // for ILP. kway=1 is the simple one-thread-per-leaf path.
 inline void launch_merkle(const uint8_t* d_data, uint8_t* d_tree,
                           long long num_leaves, int leaf_size, int tpb = 256, int kway = 1) {
-    if (kway == 2) {
+    if (leaf_size % 128 == 0) {                        // warp-staged path (fastest)
+        int wpb = tpb >> 5;
+        long long warps  = (num_leaves + 31) / 32;
+        long long blocks = (warps + wpb - 1) / wpb;
+        size_t smem = (size_t)wpb * 32 * 33 * sizeof(uint32_t);
+        merkle_leaf_kernel_staged<<<(unsigned)blocks, tpb, smem>>>(d_data, d_tree, num_leaves, leaf_size);
+    } else if (kway == 2) {
         long long groups = (num_leaves + 1) / 2;
         long long b = (groups + tpb - 1) / tpb;
         merkle_leaf_kernel_kway<2><<<(unsigned)b, tpb>>>(d_data, d_tree, num_leaves, leaf_size);
