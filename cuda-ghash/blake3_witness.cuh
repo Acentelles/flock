@@ -116,53 +116,17 @@ __device__ __forceinline__ void b3_rec_flush(const b3u64 rec[4], b3u64* buf, int
     buf[bi + 4] |= spill;
 }
 
-// ---- per-block witness builder -------------------------------------------
-// One thread per block. z/a/b slices must be pre-zeroed (cudaMemset). Padding
-// blocks (blk >= n_blocks) leave their slices zero.
-__global__ void blake3_witness_blocks(const uint32_t* __restrict__ cv_all,
-                                      const uint32_t* __restrict__ m_all,
-                                      const b3u64* __restrict__ ctr_all,
-                                      const uint32_t* __restrict__ blen_all,
-                                      const uint32_t* __restrict__ flags_all,
-                                      int n_blocks, long long n_total,
-                                      b3u64* __restrict__ z, b3u64* __restrict__ a,
-                                      b3u64* __restrict__ b) {
-    long long blk = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    // No early return: the whole warp stays alive for the cooperative coalesced
-    // copyout. Padding blocks (n_blocks <= blk < n_total) build the trace of a
-    // ZERO-input Compression — that is what the Rust generator emits for them
-    // (b gets the all-ones linear rows etc.), NOT zeroed slices; the old
-    // early-return kernel diverged from the oracle there.
-    bool active = (blk < n_blocks);
-
-    uint32_t cv[8] = {0}, m[16] = {0};
-    b3u64 counter = 0; uint32_t block_len = 0, flags = 0;
-    if (active) {
-#pragma unroll
-        for (int w = 0; w < 8; w++) cv[w] = cv_all[blk * 8 + w];
-#pragma unroll
-        for (int i = 0; i < 16; i++) m[i] = m_all[blk * 16 + i];
-        counter = ctr_all[blk];
-        block_len = blen_all[blk];
-        flags = flags_all[blk];
-    }
-    uint32_t counter_lo = (uint32_t)counter;
-    uint32_t counter_hi = (uint32_t)(counter >> 32);
-
-    // Three-pass build: one 2KB local buffer at a time (which = 0:z, 1:a, 2:b),
-    // re-running the cheap BLAKE3 trace each pass. A single 6KB z+a+b footprint
-    // is memory-latency-bound (it thrashes L1 across resident warps); a 2KB hot
-    // buffer fits far better, and the recomputed trace is pure ALU work that runs
-    // ~200x under compute peak (i.e. hidden behind the memory latency).
-    //   z ← carry/word, a ← left/word, b ← right/0xFFFFFFFF.  Linear "= word"
-    //   rows put `word` in z & a and all-ones in b → LINVAL.
+// ---- per-block trace builder ----------------------------------------------
+// Builds one `which` slice (0:z, 1:a, 2:b) of one block's trace into `buf`
+// (256 u64, caller-zeroed; shared or local).  z ← carry/word, a ← left/word,
+// b ← right/0xFFFFFFFF; linear "= word" rows put `word` in z & a and all-ones
+// in b → LINVAL.
 #define LINVAL(v) ((which == 2) ? 0xFFFFFFFFu : (uint32_t)(v))
-    b3u64* gout[3] = {z, a, b};
-    for (int which = 0; which < 3; which++) {
-        b3u64 buf[B3_U64_PER_BLOCK];
-#pragma unroll 8
-        for (int j = 0; j < B3_U64_PER_BLOCK; j++) buf[j] = 0;
-
+__device__ void b3_build_trace(b3u64* buf, int which,
+                               const uint32_t cv[8], const uint32_t m[16],
+                               uint32_t counter_lo, uint32_t counter_hi,
+                               uint32_t block_len, uint32_t flags) {
+    {
         b3_or_bit_at(buf, B3_Z_CONST_POS);  // z[0]=1 in all three
 #pragma unroll
         for (int w = 0; w < 8; w++) b3_or_u32_at_bit(buf, B3_CV_BASE + 32 * w, LINVAL(cv[w]));
@@ -240,34 +204,170 @@ __global__ void blake3_witness_blocks(const uint32_t* __restrict__ cv_all,
             b3_or_u32_at_bit(buf, B3_OUT_HI_BASE + 32 * w, LINVAL(hi));
         }
 
-        // Write out as 16-byte stores (STG.128); block-major is uncoalesced
-        // (2KB-strided per thread), so halving the store count is the lever.
-        // COALESCED copyout via a shared transpose tile. The old per-thread
-        // ulonglong2 loop had each lane streaming its own 2 KB slice — a warp's
-        // stores land 2 KB apart, so every 32 B sector carried 16 useful bytes
-        // and the kernel moved ~17 GB for a 3 GB output (ncu: DRAM 66%, compute
-        // 3%). Staging 32-u64 chunks through shared and storing one BLOCK's row
-        // per iteration makes every store warp-contiguous.
-        {
-            __shared__ b3u64 stile[B3_TPB / 32][32][33];   // +1 pad: bank spread
-            int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
-            long long wbase = blk - lane;                      // warp's first block
-            b3u64* gw = gout[which];
-            for (int k = 0; k < B3_U64_PER_BLOCK / 32; k++) {  // 8 chunks of 32 u64
+    }
+}
+#undef LINVAL
+
+// ---- lane-parallel trace builder -------------------------------------------
+// 12 lanes build one block's three slices concurrently: which = lane>>2 picks
+// the slice (z/a/b), gsub = lane&3 picks one of the 4 independent G-functions
+// per phase (BLAKE3 rounds = 4 column Gs then 4 diagonal Gs; each phase's Gs
+// touch disjoint state quadruples, so they run in parallel with a warp sync
+// between phases). Adjacent Gs' 250-bit trace records share boundary words, so
+// record flushes use shared-memory atomicOr; OR accumulation of disjoint bits
+// commutes, so the result is bit-identical to the serial builder. `st` is the
+// per-which shared state[16]; ALL 32 lanes must call (uniform __syncwarp),
+// non-working lanes pass work=false.
+__device__ __forceinline__ void b3_rec_flush_atomic(const b3u64 rec[4], b3u64* buf, int base) {
+    int bi = base >> 6, s = base & 63;
+    b3u64 spill = 0;
 #pragma unroll
-                for (int j = 0; j < 32; j++) stile[wid][lane][j] = buf[k * 32 + j];
-                __syncwarp();
-#pragma unroll 4
-                for (int src = 0; src < 32; src++) {
-                    long long b_ = wbase + src;
-                    if (b_ < n_total)
-                        gw[b_ * B3_U64_PER_BLOCK + (long long)k * 32 + lane] = stile[wid][src][lane];
-                }
-                __syncwarp();
+    for (int j = 0; j < 4; j++) {
+        atomicOr((unsigned long long*)&buf[bi + j], (rec[j] << s) | spill);
+        spill = (rec[j] >> 1) >> (63 - s);
+    }
+    atomicOr((unsigned long long*)&buf[bi + 4], spill);
+}
+__device__ void b3_build_trace_par(b3u64* buf, uint32_t* st, int which, int gsub, bool work,
+                                   const uint32_t cv[8], const uint32_t m[16],
+                                   uint32_t counter_lo, uint32_t counter_hi,
+                                   uint32_t block_len, uint32_t flags) {
+#define LINVAL(v) ((which == 2) ? 0xFFFFFFFFu : (uint32_t)(v))
+    if (work && gsub == 0) {
+        b3_or_bit_at(buf, B3_Z_CONST_POS);
+#pragma unroll
+        for (int w = 0; w < 8; w++) b3_or_u32_at_bit(buf, B3_CV_BASE + 32 * w, LINVAL(cv[w]));
+#pragma unroll
+        for (int i = 0; i < 16; i++) b3_or_u32_at_bit(buf, B3_M_BASE + 32 * i, LINVAL(m[i]));
+        b3_or_u32_at_bit(buf, B3_T_LO_BASE, LINVAL(counter_lo));
+        b3_or_u32_at_bit(buf, B3_T_HI_BASE, LINVAL(counter_hi));
+        b3_or_u32_at_bit(buf, B3_BLEN_BASE, LINVAL(block_len));
+        b3_or_u32_at_bit(buf, B3_FLAGS_BASE, LINVAL(flags));
+#pragma unroll
+        for (int w = 0; w < 8; w++) { st[w] = cv[w]; st[8 + w] = B3_IV[w]; }
+        st[12] = counter_lo; st[13] = counter_hi; st[14] = block_len; st[15] = flags;
+    }
+    __syncwarp();
+
+    int perm[16];
+#pragma unroll
+    for (int i = 0; i < 16; i++) perm[i] = i;
+
+    for (int r = 0; r < B3_N_ROUNDS; r++) {
+        for (int phase = 0; phase < 2; phase++) {
+            if (work) {
+                int gi = phase * 4 + gsub;
+                int g = r * B3_N_G_PER_ROUND + gi;
+                int la = B3_G_LANES[gi][0], lb = B3_G_LANES[gi][1];
+                int lc = B3_G_LANES[gi][2], ld = B3_G_LANES[gi][3];
+                uint32_t mx = m[perm[B3_G_MSG_IDX[gi][0]]];
+                uint32_t my = m[perm[B3_G_MSG_IDX[gi][1]]];
+                uint32_t a_val = st[la], b_val = st[lb], c_val = st[lc], d_val = st[ld];
+
+                b3u64 rec[4] = {0, 0, 0, 0};
+                uint32_t L, R, C;
+#define SEL ((which == 0) ? C : (which == 1) ? L : R)
+                uint32_t tmp_0 = b3_add_carry(a_val, b_val, &L, &R, &C);
+                b3_rec_push(rec, B3_REC_C0, SEL);
+                uint32_t a_1 = b3_add_carry(tmp_0, mx, &L, &R, &C);
+                b3_rec_push(rec, B3_REC_C1, SEL);
+                uint32_t d_1 = b3_rotr(d_val ^ a_1, 16);
+                uint32_t c_1 = b3_add_carry(c_val, d_1, &L, &R, &C);
+                b3_rec_push(rec, B3_REC_C2, SEL);
+                uint32_t b_1 = b3_rotr(b_val ^ c_1, 12);
+                uint32_t tmp_1 = b3_add_carry(a_1, b_1, &L, &R, &C);
+                b3_rec_push(rec, B3_REC_C3, SEL);
+                uint32_t a_2 = b3_add_carry(tmp_1, my, &L, &R, &C);
+                b3_rec_push(rec, B3_REC_C4, SEL);
+                uint32_t d_2 = b3_rotr(d_1 ^ a_2, 8);
+                uint32_t c_2 = b3_add_carry(c_1, d_2, &L, &R, &C);
+                b3_rec_push(rec, B3_REC_C5, SEL);
+                uint32_t b_new = b3_rotr(b_1 ^ c_2, 7);
+                uint32_t d_new = d_2;
+                b3_rec_push(rec, B3_REC_LIN0, LINVAL(b_new));
+                b3_rec_push(rec, B3_REC_LIN1, LINVAL(d_new));
+#undef SEL
+                b3_rec_flush_atomic(rec, buf, B3_GS_BASE + B3_G_STRIDE * g);
+                st[la] = a_2; st[lb] = b_new; st[lc] = c_2; st[ld] = d_new;
             }
+            __syncwarp();
+        }
+        int next[16];
+#pragma unroll
+        for (int i = 0; i < 16; i++) next[i] = perm[B3_MSG_PERM[i]];
+#pragma unroll
+        for (int i = 0; i < 16; i++) perm[i] = next[i];
+    }
+
+    if (work && gsub == 0) {
+#pragma unroll
+        for (int w = 0; w < 8; w++) {
+            uint32_t lo = st[w] ^ st[w + 8];
+            uint32_t hi = st[w + 8] ^ cv[w];
+            b3_or_u32_at_bit(buf, B3_OUT_LO_BASE + 32 * w, LINVAL(lo));
+            b3_or_u32_at_bit(buf, B3_OUT_HI_BASE + 32 * w, LINVAL(hi));
         }
     }
+    __syncwarp();
 #undef LINVAL
+}
+
+// ---- warp-per-block witness kernel -----------------------------------------
+// One WARP per BLAKE3 block: lane 0 builds each `which` trace into a SHARED
+// 2 KB buffer (the old thread-per-block kernel built it in a per-thread LOCAL
+// buffer — ~1.5 MB of hot state per SM, thrashing L1 and spilling ~9 GB to
+// DRAM at m=33), then all 32 lanes copy it out warp-coalesced. The build is
+// single-lane serial, but it is pure ALU (the old kernel ran at 3% compute):
+// with B3_WIT_WARPS warps per block and a dozen blocks resident per SM there
+// are plenty of single-lane builders in flight to keep the schedulers fed.
+// Padding blocks (n_blocks <= blk < n_total) get the ZERO-input Compression
+// trace — what the Rust generator emits for them (b = all-ones linear rows).
+#ifndef B3_WIT_WARPS
+#define B3_WIT_WARPS 4
+#endif
+__global__ void blake3_witness_blocks(const uint32_t* __restrict__ cv_all,
+                                      const uint32_t* __restrict__ m_all,
+                                      const b3u64* __restrict__ ctr_all,
+                                      const uint32_t* __restrict__ blen_all,
+                                      const uint32_t* __restrict__ flags_all,
+                                      int n_blocks, long long n_total,
+                                      b3u64* __restrict__ z, b3u64* __restrict__ a,
+                                      b3u64* __restrict__ b) {
+    __shared__ b3u64 sbuf[B3_WIT_WARPS][3][B3_U64_PER_BLOCK + 1];   // +1: bank stagger
+    __shared__ uint32_t sstate[B3_WIT_WARPS][3][16];
+    int wid = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    long long blk = (long long)blockIdx.x * B3_WIT_WARPS + wid;
+    if (blk >= n_total) return;                    // warp-uniform exit
+    bool active = (blk < n_blocks);
+
+    // 12 builder lanes: which = lane>>2 (slice), gsub = lane&3 (G within phase).
+    bool work = lane < 12;
+    int which_l = work ? (lane >> 2) : 0, gsub = lane & 3;
+    uint32_t cv[8] = {0}, m[16] = {0};
+    b3u64 counter = 0; uint32_t block_len = 0, flags = 0;
+    if (active && work) {
+#pragma unroll
+        for (int w = 0; w < 8; w++) cv[w] = cv_all[blk * 8 + w];
+#pragma unroll
+        for (int i = 0; i < 16; i++) m[i] = m_all[blk * 16 + i];
+        counter = ctr_all[blk];
+        block_len = blen_all[blk];
+        flags = flags_all[blk];
+    }
+    uint32_t counter_lo = (uint32_t)counter;
+    uint32_t counter_hi = (uint32_t)(counter >> 32);
+
+    for (int w2 = 0; w2 < 3; w2++)
+        for (int j = lane; j < B3_U64_PER_BLOCK; j += 32) sbuf[wid][w2][j] = 0;
+    __syncwarp();
+    b3_build_trace_par(sbuf[wid][which_l], sstate[wid][which_l], which_l, gsub, work,
+                       cv, m, counter_lo, counter_hi, block_len, flags);
+    b3u64* gout[3] = {z, a, b};
+    for (int which = 0; which < 3; which++) {
+        b3u64* gw = gout[which] + blk * B3_U64_PER_BLOCK;
+#pragma unroll 4
+        for (int j = lane; j < B3_U64_PER_BLOCK; j += 32) gw[j] = sbuf[wid][which][j];
+    }
 }
 
 // 8x8 bit-matrix transpose of a u64 (byte r = row r, bit t = col t): output
@@ -318,9 +418,9 @@ inline void launch_blake3_witness_blocks(const uint32_t* cv, const uint32_t* m,
                                          const b3u64* ctr, const uint32_t* blen,
                                          const uint32_t* flags, int n_blocks,
                                          long long n_total, b3u64* z, b3u64* a, b3u64* b) {
-    long long blocks = (n_total + B3_TPB - 1) / B3_TPB;
-    blake3_witness_blocks<<<(unsigned)blocks, B3_TPB>>>(cv, m, ctr, blen, flags,
-                                                        n_blocks, n_total, z, a, b);
+    long long blocks = (n_total + B3_WIT_WARPS - 1) / B3_WIT_WARPS;
+    blake3_witness_blocks<<<(unsigned)blocks, 32 * B3_WIT_WARPS>>>(cv, m, ctr, blen, flags,
+                                                                   n_blocks, n_total, z, a, b);
 }
 
 inline void launch_blake3_lincheck_transpose(const b3u64* z, long long n_total,
