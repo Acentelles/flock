@@ -19,61 +19,35 @@ degree-2 sumcheck fold — and that fold primitive is what zerocheck will reuse
 afterward. The architectural payoff: commit→open share the codeword on-device,
 paying PCIe for neither.
 
-## ⚠️ Backend correction — BaseFold vs Ligerito
+## Backend note — Ligerito only
 
-The tree has **two PCS backends**. The prover (`prove_fast`, the measured 27%
-open phase) uses the **Ligerito** one:
-- `pcs::open_batch_mixed` → `basefold::prove` — BaseFold (twiddle-FRI `fold_pair`
-  + row-batch lane collapse).
-- `pcs::open_batch_mixed_ligerito` → **`ligerito::recursive_prover_with_basis`**
-  (`pcs.rs:376`) — Ligerito: recursive ladder, induced-basis sumcheck. ← TARGET.
+The repo's PCS backend is **Ligerito**: `pcs::open_batch_mixed_ligerito` →
+`ligerito::recursive_prover_with_basis` — recursive ladder, induced-basis
+sumcheck. (A legacy BaseFold backend existed when this port began; it was
+removed from the Rust tree in #9, and the GPU-side FRI-fold / row-batch-fold
+kernels that mirrored it — the original steps 1–2 — were dropped with it.)
 
-`ligerito.rs` contains **no `fold_pair`/`fri_fold`/`row_batch`** — those are
-BaseFold-only. Ligerito replaces FRI's repeated folding with fresh per-level
-commits + an induced-basis sumcheck. So **steps 1–2 below are BaseFold-backend**
-(bit-exact, but off the Ligerito path — kept as a validated BaseFold port). The
-shared, on-path primitive is the **sumcheck fold+message** (step 3): Ligerito's
-`fold_and_msg_lsb` is `nf[j] = f[2j]·(1+r) + f[2j+1]·r` — algebraically identical
-to the step-3 kernel, now **re-validated against the real `SumcheckProver`**
+The core on-path primitive is the **sumcheck fold+message** (step 3):
+Ligerito's `fold_and_msg_lsb` is `nf[j] = f[2j]·(1+r) + f[2j+1]·r`, and the
+kernel is **validated against the real `SumcheckProver`**
 (`dump_ligerito_sumcheck_vectors.rs` → `test_sumcheck_ab`, bit-exact to L=20).
 
 Ligerito-specific compute still to port: `induce_sumcheck_poly` (induced basis
 from opened rows), `introduce_new`/`glue` (α-batched basis), per-level NTT+Merkle
 commit (✅ have it from the commit port), query openings, recursive orchestration.
 
-## Scope — BaseFold-backend folds (steps 1–2, off the Ligerito path)
-
-Source: `src/pcs/basefold.rs`. Degree-2 sumcheck: round message is `u_0 = u(0)`,
-`u_2 = u(∞)` (`basefold.rs:113`), middle coeff from the running claim.
-
-1. **FRI `fold_pair` kernel** (`basefold.rs:192`): the `log_dim` FRI rounds. Per
-   round, one thread per output position forms the degree-2 round-message
-   contribution (`u_0`, `u_2`) via a reduce-tree, then folds position pairs with
-   challenge `r` (`fold_pair(twiddle, u_in, v_in, r)`). Table halves each round.
-   The hot loop. One GF(2^128) mul per pair, Karatsuba from
-   `f128.cuh`; twiddles from `ntt_host.hpp`.
-2. **Row-batch fold kernel** (`basefold.rs:203`): the first `log_batch_size`
-   rounds collapse each position's `2^log_batch_size` lanes to one value using
-   the lane challenges, reading the codeword once. Feeds kernel 1.
-
-Re-encode (NTT) + Merkle per epoch are already ported.
-
 ## Validation discipline (mirror `test_commit_ntt`)
 
-- Rust oracle dumper (sibling to `src/bin/dump_ghash_vectors.rs`): run the CPU
-  basefold rounds on a fixed codeword; emit input codeword, per-round challenges,
-  per-round messages (`u_0,u_2`), and the folded buffer after each round.
-- `test_open_fold.cu`: load the dump, run device kernels round-by-round, assert
-  **bit-for-bit** on both round messages and the folded buffer every round.
-- `bench_open_fold.cu`: throughput at m=33–35 (GMul/s, GB/s); promotes
-  `bench_full_sumcheck.cu` to a kernel on the real codeword layout.
+- Rust oracle dumper (sibling to `src/bin/dump_ghash_vectors.rs`): run the real
+  CPU rounds on fixed inputs; emit inputs, per-round challenges, per-round
+  messages (`u_0,u_2`), and the folded buffer after each round.
+- Per-kernel `test_*.cu`: load the dump, run device kernels round-by-round,
+  assert **bit-for-bit** on both round messages and the folded buffer every round.
 
 ## Sequencing
 
-1. ✅ **FRI `fold_pair` kernel** — `fri_fold.cuh` / `test_open_fold.cu` /
-   `bench_open_fold.cu` / `dump_fold_vectors.rs`. Bit-exact to k_code=22.
-2. ✅ **Row-batch fold kernel** — `row_batch_fold.cuh` / `test_rowbatch_fold.cu`
-   / `dump_rowbatch_vectors.rs`. Bit-exact (32-lane and 8-lane).
+1. ~~FRI `fold_pair` kernel~~ — removed with the BaseFold backend (#9).
+2. ~~Row-batch fold kernel~~ — removed with the BaseFold backend (#9).
 3. ✅ **Sumcheck fold+message `{u_0,u_2}`** — `sumcheck_ab.cuh` /
    `test_sumcheck_ab.cu`. Reduce-per-term message + adjacent-pair (LSB) fold,
    bit-exact to L=22. **Re-validated against the real Ligerito `SumcheckProver`**
@@ -168,13 +142,8 @@ Re-encode (NTT) + Merkle per epoch are already ported.
 7. Fuse with commit: codeword/f resident commit→open; measure the **fused**
    number (the only trusted one).
 
-(Steps 1–2 — FRI `fold_pair` / row-batch fold — are the BaseFold backend,
-bit-exact but off the Ligerito path; retained as a validated BaseFold port.)
-
 ## Verification
 
-- `test_open_fold` passes bit-for-bit at every round (primary gate).
-- `bench_open_fold` bandwidth-bound at m=33–35, like the NTT.
 - End-state: fused commit→open device time beats the 14.7+19.5 ms CPU sum, with
   the codeword never leaving VRAM.
 
@@ -200,7 +169,7 @@ the phase mix differs from m=29 (folds dominate, not induce).
 
 - **Witness-buffer elision**: fill the sumcheck state (df,dcb) directly, commit L0
   from it — no separate d_f/d_b1. Needed to fit m=35 in 32 GB (peak ~24 GB).
-- **Fused fold+message** (`sumcheck_fold_msg_partial`, basefold's fold_and_msg_lsb):
+- **Fused fold+message** (`sumcheck_fold_msg_partial`, ligerito's `fold_and_msg_lsb`):
   compute round k+1's {u_0,u_2} during round k's fold pass — f/cb read once/round,
   not twice. **Byte-for-bit re-validated** via test_ligerito_l0 (every fold msg +
   folded head). m=35 fold 29.1 → 24.5 ms (the per-round message passes; the

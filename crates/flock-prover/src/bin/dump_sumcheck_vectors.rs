@@ -1,17 +1,17 @@
-//! Dump an a·b multilinear sumcheck oracle (the BaseFold/Ligerito sumcheck:
+//! Dump an a·b multilinear sumcheck oracle (the PCS-open sumcheck:
 //! per-round message `(u_0, u_2)` + folded a,b) from the *real* `flock` field,
 //! so the CUDA port (`cuda-ghash/test_sumcheck_ab.cu`) can be checked
 //! bit-for-bit against it.
 //!
 //! Step 3 of the GPU `pcs::open` (Ligerito) port (`cuda-ghash/GPU_OPEN_PLAN.md`):
-//! the degree-2 sumcheck of `S = Σ_x a(x)·b(x)` that basefold runs in lockstep
-//! with the codeword folds (`src/pcs/basefold.rs:476` prime + `:518` fused
-//! round). Each round, over the CURRENT a,b (adjacent pairing `(a[2j],a[2j+1])`,
-//! matching basefold), the message is the {0, ∞} pair:
+//! the degree-2 sumcheck of `S = Σ_x a(x)·b(x)` the Ligerito prover runs (the
+//! `fold_and_msg_lsb` message/fold convention in `src/pcs/ligerito.rs`). Each
+//! round, over the CURRENT a,b (adjacent pairing `(a[2j],a[2j+1])`, matching
+//! the CPU prover), the message is the {0, ∞} pair:
 //!   u_0 = Σ_j a[2j]·b[2j]                        (= u(0))
 //!   u_2 = Σ_j (a[2j]+a[2j+1])·(b[2j]+b[2j+1])    (= u(∞), leading coeff)
 //! then fold by the round challenge r: a'[j] = a[2j] + r·(a[2j]+a[2j+1]) (and b).
-//! The verifier recovers the middle coeff from the running claim (basefold:509),
+//! The verifier recovers the middle coeff from the running claim,
 //! so the prover only sends (u_0, u_2) — see [`RoundMessage`].
 //!
 //! Output: little-endian binary to argv[1] (default sumcheck_vectors.bin):

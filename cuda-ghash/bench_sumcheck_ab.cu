@@ -2,14 +2,14 @@
 // Ligerito, step 3; GPU_OPEN_PLAN.md). No oracle — correctness is validated by
 // test_sumcheck_ab; here we only time. a,b are generated on-device.
 //
-// What's timed: the full L-round sumcheck cascade basefold runs over the
+// What's timed: the full L-round sumcheck cascade the CPU prover runs over the
 // message-length vectors — per round a reduce-per-term message reduction
 // ({u_0,u_2}) plus an adjacent-pair fold of a,b, halving each round. Challenges
 // are precomputed (the real prover derives them host-side from each message via
 // Fiat-Shamir — a small serial cost layered on top, not timed here).
 //
 // Size: a,b have length 2^L with L = log_msg_len = m - LOG_PACKING(7), matching
-// bench_commit_ntt / bench_open_fold so m lines up across benches.
+// bench_commit_ntt so m lines up across benches.
 //
 // Per round: message = 2 muls/pair; fold = 2 full muls/pair.
 //

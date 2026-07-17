@@ -32,19 +32,7 @@ test_commit_ntt: test_commit_ntt.cu ntt_f128.cuh ntt_host.hpp f128.cuh
 bench_commit_ntt: bench_commit_ntt.cu ntt_f128.cuh ntt_host.hpp f128.cuh
 	$(NVCC) $(NVCCFLAGS) bench_commit_ntt.cu -o $@
 
-# FRI fold (PCS open / Ligerito, step 1) — folded codeword bit-for-bit vs the flock oracle.
-test_open_fold: test_open_fold.cu fri_fold.cuh ntt_host.hpp f128.cuh
-	$(NVCC) $(NVCCFLAGS) test_open_fold.cu -o $@
-
-# Throughput for the FRI fold cascade (on-device codeword, no oracle).
-bench_open_fold: bench_open_fold.cu fri_fold.cuh ntt_host.hpp f128.cuh
-	$(NVCC) $(NVCCFLAGS) bench_open_fold.cu -o $@
-
-# Row-batch fold (PCS open / Ligerito, step 2) — collapsed lanes bit-for-bit vs the flock oracle.
-test_rowbatch_fold: test_rowbatch_fold.cu row_batch_fold.cuh ntt_host.hpp f128.cuh
-	$(NVCC) $(NVCCFLAGS) test_rowbatch_fold.cu -o $@
-
-# a·b sumcheck (PCS open / Ligerito, step 3) — round messages + folds bit-for-bit vs the flock oracle.
+# a·b sumcheck (PCS open / Ligerito) — round messages + folds bit-for-bit vs the flock oracle.
 test_sumcheck_ab: test_sumcheck_ab.cu sumcheck_ab.cuh f128.cuh
 	$(NVCC) $(NVCCFLAGS) test_sumcheck_ab.cu -o $@
 
@@ -130,26 +118,6 @@ commit_vectors:
 # Build + run the NTT oracle check end-to-end.
 commit_ntt: test_commit_ntt commit_vectors
 	./test_commit_ntt commit_vectors.bin
-
-# Regenerate the FRI-fold oracle (FOLD): initial codeword + per-round folds.
-# Override sizes:  make fold_vectors FOLD_ARGS="22 1"   (k_code log_inv_rate)
-FOLD_ARGS ?= 12 1
-fold_vectors:
-	cd .. && cargo run --release --quiet --bin dump_fold_vectors -- cuda-ghash/fold_vectors.bin $(FOLD_ARGS)
-
-# Build + run the FRI-fold oracle check end-to-end.
-open_fold: test_open_fold fold_vectors
-	./test_open_fold fold_vectors.bin
-
-# Regenerate the row-batch fold oracle (RBF1): codeword + lane challenges + collapse.
-# Override sizes:  make rowbatch_vectors RBF_ARGS="18 5"   (k_code log_batch_size)
-RBF_ARGS ?= 12 5
-rowbatch_vectors:
-	cd .. && cargo run --release --quiet --bin dump_rowbatch_vectors -- cuda-ghash/rowbatch_vectors.bin $(RBF_ARGS)
-
-# Build + run the row-batch fold oracle check end-to-end.
-rowbatch_fold: test_rowbatch_fold rowbatch_vectors
-	./test_rowbatch_fold rowbatch_vectors.bin
 
 # Regenerate the a·b sumcheck oracle (SMC1): a,b + per-round messages + final.
 # Override size:  make sumcheck_vectors SMC_ARGS="22"   (log_len)

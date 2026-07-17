@@ -2,7 +2,8 @@
 // GPU pcs::open / Ligerito port, GPU_OPEN_PLAN.md) against the flock CPU oracle
 // dumped by `src/bin/dump_sumcheck_vectors.rs` (SMC1 format).
 //
-// Pipeline (mirrors src/pcs/basefold.rs's a·b sumcheck): per round, over the
+// Pipeline (mirrors the CPU a·b sumcheck — `ligerito.rs`'s `fold_and_msg_lsb`
+// message/fold convention): per round, over the
 // current a,b, compute the {0,∞} message (u_0, u_2) via deferred reduction and
 // compare to the oracle; then fold a,b by the oracle's challenge r_k. After L
 // rounds, compare the length-1 final_a / final_b. Both the per-round messages

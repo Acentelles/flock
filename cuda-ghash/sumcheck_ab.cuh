@@ -1,20 +1,21 @@
 // a·b multilinear sumcheck kernels — step 3 of the GPU pcs::open (Ligerito)
 // port (GPU_OPEN_PLAN.md). The degree-2 sumcheck of S = Σ_x a(x)·b(x) that
-// basefold runs alongside the codeword folds (src/pcs/basefold.rs:476/:518).
+// the Ligerito prover runs over `(f, combined_basis)`
+// (`src/pcs/ligerito.rs`'s `SumcheckProver` / `fold_and_msg_lsb`).
 //
 // Per round, over the CURRENT a,b with ADJACENT pairing (a[2j], a[2j+1]) —
-// matching basefold (NOT the strided (i, i+half) layout in bench_full_sumcheck):
+// matching the CPU prover (NOT the strided (i, i+half) layout in bench_full_sumcheck):
 //   message:  u_0 = Σ_j a[2j]·b[2j]                     (= u(0))
 //             u_2 = Σ_j (a[2j]+a[2j+1])·(b[2j]+b[2j+1]) (= u(∞), leading coeff)
 //   fold:     a'[j] = a[2j] + r·(a[2j]+a[2j+1])  (and b)
 // The middle coeff is recovered by the verifier from the running claim, so only
-// {u_0, u_2} are produced (basefold's RoundMessage).
+// {u_0, u_2} are produced (the CPU `SumcheckMessage`).
 //
 // The message is a global reduction: reduce-per-term (F128 accumulate). Deferred
 // reduction (F256, reduce once) was measured a wash-to-slight-loss on this GPU
 // and doubles the reduction-tree's shared memory, so plain F128 is used. Two-pass
 // per round (message reduce, then fold) for correctness-first clarity; fusing the next
-// round's message into the fold (as basefold does) is the later optimization.
+// round's message into the fold (as `fold_and_msg_lsb` does) is the later optimization.
 #pragma once
 #include "f128.cuh"
 
@@ -82,7 +83,7 @@ __global__ void sumcheck_fold(const F128* __restrict__ A, const F128* __restrict
     Bo[j] = f128_add(b0, ghash_mul_karatsuba(r, f128_add(b0, b1)));
 }
 
-// FUSED fold + next-round message (basefold's fold_and_msg_lsb). One pass over
+// FUSED fold + next-round message (ligerito's fold_and_msg_lsb). One pass over
 // (A,B): fold by r into (Ao,Bo), AND accumulate the message of the FOLDED arrays
 // (= the next round's {u_0,u_2}) — so A,B are read once per round instead of
 // twice (separate message pass eliminated). Each thread handles one output PAIR
