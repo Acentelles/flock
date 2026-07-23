@@ -726,3 +726,217 @@ fn mixed_low_utilization_smoke() {
          may have regressed"
     );
 }
+
+/// M6 — the m = 30-scale MIXED throughput measurement (Phase-1 gate at
+/// production scale, the mixed-union analogue of `jagged_throughput`'s
+/// BLAKE3 m = 30 sweep). ν = 14 puts the union at M = 30; at FULL
+/// utilization (16384, 16384) the count-proportional dense stack —
+/// (246 + 121)·2^14 = 6 012 928 words — rounds back up to the full 2^23-word
+/// padded commit, i.e. `dense_m = 30` (the embedded m30 Ligerito config; the
+/// count-proportional shrink only bites below full utilization). The two
+/// single-type baselines run BLAKE3 (16384 blocks, m = 28) and SHA-256
+/// (16384 compressions, m = 29) through the SAME jagged path at their
+/// natural sizes. Warm-up + best-of-2 per path; the timed region is prove
+/// INCLUDING witness generation, matching `jagged_throughput`'s accounting.
+/// Big buffers are dropped between the three measurements — this is a
+/// ~2 GB-scale run. Informational: prints the mixed headline, the singles
+/// sum and mixed/sum ratio, per-type and combined invocations/sec for the
+/// mixed proof, verify time, proof size, and committed-vs-padded words. No
+/// timing assertions. Run with `cargo test --release -p flock-prover --test
+/// union_mixed -- --ignored --nocapture mixed_m30_throughput`.
+#[test]
+#[ignore] // Heavy (M = 30, ~2 GB) + informational — run explicitly with --ignored --nocapture
+fn mixed_m30_throughput() {
+    use std::time::Instant;
+
+    const ITERS: usize = 2; // timed runs after one warm-up; best reported
+    let nu = 14usize; // M = 30; full utilization = 16384 invocations per type
+    let n_per_type = 1usize << nu;
+    let mut rng = Rng::new(0x30_31_2B_B3);
+    let blake3_inputs = random_blake3_inputs(&mut rng, n_per_type);
+    let sha2_inputs = random_sha2_inputs(&mut rng, n_per_type);
+
+    // ---- Single-type BLAKE3 baseline through the jagged path (m = 28).
+    // One untimed warm-up (hot scratch pool), then best-of-ITERS timed. The
+    // setup and its buffers drop at the end of the block.
+    let (b3_ms, b3_m) = {
+        let setup = blake3::Blake3Setup::new_batch_major(n_per_type);
+        assert_eq!(setup.n_blocks_log(), nu);
+        let circuit = setup.r1cs.csc_lincheck_circuit();
+        {
+            let (z, a, b, stripe) = blake3::generate_witness_batch_major(&blake3_inputs, nu);
+            let mut ch = FsChallenger::new(DOMAIN);
+            let _ = prover::prove_fast_ligerito_jagged_from_witness(
+                &setup.r1cs,
+                &setup.pcs_params,
+                z,
+                a,
+                b,
+                stripe,
+                circuit,
+                None,
+                &mut ch,
+            );
+        }
+        let mut best = f64::INFINITY;
+        for _ in 0..ITERS {
+            let mut ch = FsChallenger::new(DOMAIN);
+            let t = Instant::now();
+            let (z, a, b, stripe) = blake3::generate_witness_batch_major(&blake3_inputs, nu);
+            let _ = prover::prove_fast_ligerito_jagged_from_witness(
+                &setup.r1cs,
+                &setup.pcs_params,
+                z,
+                a,
+                b,
+                stripe,
+                circuit,
+                None,
+                &mut ch,
+            );
+            best = best.min(t.elapsed().as_secs_f64() * 1e3);
+        }
+        (best, setup.m())
+    };
+
+    // ---- Single-type SHA-256 baseline through the jagged path (m = 29).
+    let (s2_ms, s2_m) = {
+        let setup = sha2::Sha256HybridSetup::new_batch_major(n_per_type);
+        assert_eq!(setup.n_blocks_log(), nu);
+        let circuit = setup.r1cs.csc_lincheck_circuit();
+        {
+            let (z, a, b, stripe) = sha2::generate_witness_batch_major(&sha2_inputs, nu);
+            let mut ch = FsChallenger::new(DOMAIN);
+            let _ = prover::prove_fast_ligerito_jagged_from_witness(
+                &setup.r1cs,
+                &setup.pcs_params,
+                z,
+                a,
+                b,
+                stripe,
+                circuit,
+                None,
+                &mut ch,
+            );
+        }
+        let mut best = f64::INFINITY;
+        for _ in 0..ITERS {
+            let mut ch = FsChallenger::new(DOMAIN);
+            let t = Instant::now();
+            let (z, a, b, stripe) = sha2::generate_witness_batch_major(&sha2_inputs, nu);
+            let _ = prover::prove_fast_ligerito_jagged_from_witness(
+                &setup.r1cs,
+                &setup.pcs_params,
+                z,
+                a,
+                b,
+                stripe,
+                circuit,
+                None,
+                &mut ch,
+            );
+            best = best.min(t.elapsed().as_secs_f64() * 1e3);
+        }
+        (best, setup.m())
+    };
+
+    // ---- The mixed union at the same per-type sizes (M = 30). The proof,
+    // commitment, and claim from the last timed run survive the block for
+    // verification and size reporting; the witness buffers are consumed each
+    // iteration and drop inside prove.
+    let (registry, sha2_r1cs, blake3_r1cs) = mixed_registry(nu);
+    assert_eq!(registry.m_total(), 30);
+    let union = UnionInstance::new(&registry, vec![n_per_type, n_per_type]);
+    let pcs_params = union_pcs_params(&union);
+    // Full utilization: the dense stack rounds back to the padded commit, so
+    // dense_m lands on the embedded m30 Ligerito config.
+    assert_eq!(union.dense_words(), (246 + 121) << nu);
+    assert_eq!(union.dense_m(), 30);
+    assert_eq!(union.committed_words(), union.packed_len());
+    assert_eq!(pcs_params.m, 30);
+    flock_core::scratch::prewarm_prover(registry.m_total());
+    let s2_mix_circuit = sha2_r1cs.csc_lincheck_circuit();
+    let b3_mix_circuit = blake3_r1cs.csc_lincheck_circuit();
+    {
+        let slots = vec![
+            UnionSlotProverInput::new(
+                sha2::generate_witness_batch_major(&sha2_inputs, nu),
+                s2_mix_circuit,
+            ),
+            UnionSlotProverInput::new(
+                blake3::generate_witness_batch_major(&blake3_inputs, nu),
+                b3_mix_circuit,
+            ),
+        ];
+        let mut ch = FsChallenger::new(DOMAIN);
+        let _ = prover::prove_fast_ligerito_jagged_union(&union, &pcs_params, slots, &mut ch);
+    }
+    let mut mixed_ms = f64::INFINITY;
+    let mut mixed_out = None;
+    for _ in 0..ITERS {
+        let slots = vec![
+            UnionSlotProverInput::new(
+                sha2::generate_witness_batch_major(&sha2_inputs, nu),
+                s2_mix_circuit,
+            ),
+            UnionSlotProverInput::new(
+                blake3::generate_witness_batch_major(&blake3_inputs, nu),
+                b3_mix_circuit,
+            ),
+        ];
+        let mut ch = FsChallenger::new(DOMAIN);
+        let t = Instant::now();
+        let out = prover::prove_fast_ligerito_jagged_union(&union, &pcs_params, slots, &mut ch);
+        mixed_ms = mixed_ms.min(t.elapsed().as_secs_f64() * 1e3);
+        mixed_out = Some(out);
+    }
+    let (proof, commitment, claim) = mixed_out.unwrap();
+
+    // ---- Verify (circuits in slot order: SHA-256 then BLAKE3).
+    let circuits: [&dyn LincheckCircuit; 2] = [s2_mix_circuit, b3_mix_circuit];
+    let t = Instant::now();
+    let mut ch_v = FsChallenger::new(DOMAIN);
+    let claim_v = verifier::verify_ligerito_jagged_union(
+        &union,
+        &circuits,
+        &commitment,
+        &proof,
+        &pcs_params,
+        &mut ch_v,
+    )
+    .unwrap_or_else(|e| panic!("mixed m=30 verifier rejected honest proof: {e:?}"));
+    let verify_ms = t.elapsed().as_secs_f64() * 1e3;
+    assert_eq!(claim_v, claim);
+    let proof_bytes = bincode::serialize(&proof).unwrap().len();
+
+    // ---- Report.
+    let singles = b3_ms + s2_ms;
+    let mixed_s = mixed_ms / 1e3;
+    let per_type_hps = n_per_type as f64 / mixed_s;
+    let combined_hps = (2 * n_per_type) as f64 / mixed_s;
+    println!(
+        "mixed m=30 throughput, {n_per_type} invocations per type (full util), \
+         best-of-{ITERS} (prove incl. witgen):"
+    );
+    println!("  blake3-only jagged (m = {b3_m}): {b3_ms:.0} ms");
+    println!("  sha2-only jagged   (m = {s2_m}): {s2_ms:.0} ms");
+    println!(
+        "  mixed union        (M = {}): {mixed_ms:.0} ms   <-- headline",
+        registry.m_total()
+    );
+    println!(
+        "  singles sum {singles:.0} ms; mixed / sum = {:.2}",
+        mixed_ms / singles
+    );
+    println!(
+        "  mixed invocations/sec: blake3 {per_type_hps:.0}, sha2 {per_type_hps:.0}, \
+         combined {combined_hps:.0}"
+    );
+    println!("  verify: {verify_ms:.1} ms");
+    println!("  proof size: {proof_bytes} B");
+    println!(
+        "  committed 2^{} words vs padded 2^{} words",
+        union.committed_words().trailing_zeros(),
+        union.packed_len().trailing_zeros()
+    );
+}
