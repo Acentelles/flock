@@ -1636,19 +1636,30 @@ fn two_blake3_phase_breakdown() {
     // witgen column = per-hash generation (`gen`) + union assembly/compaction
     // (`pt.witness_s`, the "assemble" sub-cost, zero on the direct path). The
     // "assemble" sub-column isolates the union-specific dense-stack compaction.
-    println!("PROVE (ms):   [witgen = gen + assemble]");
+    println!("PROVE (ms):   [witgen = gen + assemble; assemble = scatter + compact]");
     println!(
-        "  {:<22} {:>8} {:>9} {:>8} {:>10} {:>9} {:>8} {:>9}",
-        "row", "witgen", "(assemble)", "commit", "zerocheck", "lincheck", "open", "total"
+        "  {:<22} {:>8} {:>9} {:>8} {:>8} {:>8} {:>10} {:>9} {:>8} {:>9}",
+        "row",
+        "witgen",
+        "(assemble",
+        "scatter",
+        "compact)",
+        "commit",
+        "zerocheck",
+        "lincheck",
+        "open",
+        "total"
     );
     let prove_row = |label: &str, gen_s: f64, p: &ProvePhaseTimings| {
         let witgen = gen_s + p.witness_s;
         let total = gen_s + p_total(p);
         println!(
-            "  {:<22} {:>8.1} {:>9.1} {:>8.1} {:>10.1} {:>9.1} {:>8.1} {:>9.1}",
+            "  {:<22} {:>8.1} {:>9.1} {:>8.1} {:>8.1} {:>8.1} {:>10.1} {:>9.1} {:>8.1} {:>9.1}",
             label,
             ms(witgen),
             ms(p.witness_s),
+            ms(p.witness_scatter_s),
+            ms(p.witness_compact_s),
             ms(p.commit_s),
             ms(p.zerocheck_s),
             ms(p.lincheck_s),

@@ -246,7 +246,13 @@ impl<'r> UnionInstance<'r> {
     /// `f̂(ρ)` were all zero). Honest witnesses satisfy this by
     /// construction — the partial batch-major drivers zero dummy rows (pin
     /// included), and useless columns/gaps are never written.
+    ///
+    /// The gather is parallel over the used chunk-columns (disjoint
+    /// destination runs of `n_t` words, disjoint sources), which is what the
+    /// copy costs at scale: it is pure memory traffic, ~127 MB at `M = 30`.
     pub fn compact_witness(&self, z_padded: &[F128]) -> Vec<F128> {
+        use rayon::prelude::*;
+
         assert_eq!(z_padded.len(), self.packed_len(), "padded buffer length");
         debug_assert!(
             self.dropped_words_are_zero(z_padded),
@@ -255,6 +261,9 @@ impl<'r> UnionInstance<'r> {
         );
         let nu = self.n_log();
         let mut q = vec![F128::ZERO; self.committed_words()];
+        // Hand each slot its (contiguous, disjoint) destination run, then
+        // fill that run's per-column chunks in parallel.
+        let mut rest: &mut [F128] = &mut q;
         let mut cursor = 0usize;
         for ((ty, slot), &n_t) in self
             .registry()
@@ -263,12 +272,18 @@ impl<'r> UnionInstance<'r> {
             .zip(self.registry().slots())
             .zip(self.counts())
         {
-            let start = slot.offset >> 7;
-            for c in 0..self.used_cols(ty) {
-                let col = start + (c << nu);
-                q[cursor..cursor + n_t].copy_from_slice(&z_padded[col..col + n_t]);
-                cursor += n_t;
+            let used_cols = self.used_cols(ty);
+            let (dst, tail) = rest.split_at_mut(used_cols * n_t);
+            rest = tail;
+            cursor += used_cols * n_t;
+            if n_t == 0 {
+                continue; // an empty slot contributes no chunk (and `par_chunks_mut(0)` panics)
             }
+            let start = slot.offset >> 7;
+            dst.par_chunks_mut(n_t).enumerate().for_each(|(c, out)| {
+                let col = start + (c << nu);
+                out.copy_from_slice(&z_padded[col..col + n_t]);
+            });
         }
         debug_assert_eq!(cursor, self.dense_words());
         q
@@ -500,6 +515,11 @@ impl<'r> UnionInstance<'r> {
     /// the zero-initialized union buffers already hold those words'
     /// values and the result is byte-identical to the full-slot copy.
     /// Full-utilization slots keep the one-memcpy path.
+    ///
+    /// The three buffers are scattered concurrently and each slot's copy is
+    /// itself chunk-parallel — like [`Self::compact_witness`] this is pure
+    /// memory traffic (3 × 134 MB at `M = 30`), so it scales with cores
+    /// until it hits memory bandwidth.
     fn scatter_witnesses(
         &self,
         slot_witnesses: Vec<SlotWitness>,
@@ -509,35 +529,76 @@ impl<'r> UnionInstance<'r> {
         let mut z = vec![F128::ZERO; len];
         let mut a = vec![F128::ZERO; len];
         let mut b = vec![F128::ZERO; len];
+        let ws = &slot_witnesses;
+        // The witness contract, checked once per slot for all three buffers
+        // (the per-buffer scatters below rely on it for their partial copies).
+        debug_assert!(
+            self.registry()
+                .types()
+                .iter()
+                .zip(ws)
+                .zip(self.counts())
+                .all(|((ty, w), &n_t)| n_t == 1usize << nu
+                    || slot_buffer_zero_off_support(w, self.used_cols(ty), nu, n_t)),
+            "slot buffers must be zero on dummy rows and useless columns \
+             (the union witness contract)"
+        );
+        rayon::join(
+            || self.scatter_one(&mut z, ws, |w| &w.z_packed),
+            || {
+                rayon::join(
+                    || self.scatter_one(&mut a, ws, |w| &w.a_packed),
+                    || self.scatter_one(&mut b, ws, |w| &w.b_packed),
+                )
+            },
+        );
+        (z, a, b)
+    }
+
+    /// One buffer's worth of [`Self::scatter_witnesses`]: place every slot's
+    /// `pick`ed source at its aligned word offset in `dst`.
+    fn scatter_one(
+        &self,
+        dst: &mut [F128],
+        slot_witnesses: &[SlotWitness],
+        pick: impl Fn(&SlotWitness) -> &[F128] + Sync,
+    ) {
+        use rayon::prelude::*;
+
+        let nu = self.n_log();
         for (((ty, slot), w), &n_t) in self
             .registry()
             .types()
             .iter()
             .zip(self.registry().slots())
-            .zip(&slot_witnesses)
+            .zip(slot_witnesses)
             .zip(self.counts())
         {
             let start = slot.offset >> 7;
             let words = 1usize << (slot.m_slot - 7);
+            let src = pick(w);
+            let out = &mut dst[start..start + words];
             if n_t == 1usize << nu {
-                z[start..start + words].copy_from_slice(&w.z_packed);
-                a[start..start + words].copy_from_slice(&w.a_packed);
-                b[start..start + words].copy_from_slice(&w.b_packed);
+                // Whole-slot memcpy, split into cache-sized chunks.
+                const CHUNK: usize = 1 << 12; // 64 KiB of F128
+                out.par_chunks_mut(CHUNK)
+                    .zip(src.par_chunks(CHUNK))
+                    .for_each(|(o, s)| o.copy_from_slice(s));
             } else {
-                debug_assert!(
-                    slot_buffer_zero_off_support(w, self.used_cols(ty), nu, n_t),
-                    "slot buffers must be zero on dummy rows and useless columns \
-                     (the union witness contract)"
-                );
-                for c in 0..self.used_cols(ty) {
-                    let col = c << nu;
-                    z[start + col..start + col + n_t].copy_from_slice(&w.z_packed[col..col + n_t]);
-                    a[start + col..start + col + n_t].copy_from_slice(&w.a_packed[col..col + n_t]);
-                    b[start + col..start + col + n_t].copy_from_slice(&w.b_packed[col..col + n_t]);
+                if n_t == 0 {
+                    continue;
                 }
+                // One chunk per chunk-column; only the declared `n_t`-row
+                // prefix is copied (the rest is zero on both sides).
+                out.par_chunks_mut(1usize << nu)
+                    .take(self.used_cols(ty))
+                    .enumerate()
+                    .for_each(|(c, o)| {
+                        let col = c << nu;
+                        o[..n_t].copy_from_slice(&src[col..col + n_t]);
+                    });
             }
         }
-        (z, a, b)
     }
 }
 

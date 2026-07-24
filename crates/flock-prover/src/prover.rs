@@ -849,6 +849,12 @@ pub struct ProvePhaseTimings {
     pub lincheck_s: f64,
     /// The real Ligerito recursive PCS open (`open_claims_…_ligerito`).
     pub open_s: f64,
+    /// SUB-phase of `witness_s` (union paths only): the padded-buffer
+    /// scatter (`UnionInstance::assemble_witness`). Do not add to the total.
+    pub witness_scatter_s: f64,
+    /// SUB-phase of `witness_s` (union paths only): the dense-stack gather
+    /// (`UnionInstance::compact_witness`). Do not add to the total.
+    pub witness_compact_s: f64,
 }
 
 /// [`prove_fast_ligerito_from_witness`] with per-phase timers. Inlines the same
@@ -1031,11 +1037,14 @@ pub fn prove_fast_ligerito_jagged_union_timed<Ch: Challenger>(
         linchecks.push((slot.z_lincheck, slot.lincheck_circuit));
     }
     let (z_packed, a_packed_f128, b_packed_f128) = union.assemble_witness(witnesses);
+    t.witness_scatter_s = t0.elapsed().as_secs_f64();
+    let t1 = Instant::now();
     let dense_q: Option<Vec<F128>> = if union.compaction_is_identity() {
         None
     } else {
         Some(union.compact_witness(&z_packed))
     };
+    t.witness_compact_s = t1.elapsed().as_secs_f64();
     t.witness_s = t0.elapsed().as_secs_f64();
 
     // --- PCS commit ---
