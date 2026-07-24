@@ -206,6 +206,28 @@ impl<'r> UnionInstance<'r> {
         self.committed_words().trailing_zeros() as usize + 7
     }
 
+    /// The integer-lane count for this instance's commit, or `None` when the
+    /// dense stack fills every lane (the power-of-two case — keep today's
+    /// commit, byte-identically).
+    ///
+    /// [`Self::committed_words`] rounds the dense stack UP to a power of two,
+    /// and that rounding tax is committed: the zero tail is RS-encoded and
+    /// Merkle-hashed like real data (28% of the stack for a full-utilization
+    /// SHA-256 + BLAKE3 mix at `M = 30`). Under the high-bit-lane labelling —
+    /// lane `l` owns the contiguous block `q[l·2^log_dim .. (l+1)·2^log_dim)`
+    /// — that tail is WHOLE zero lanes, so committing only the first
+    /// `t = ceil(dense_words / 2^log_dim)` of them drops the encode + hash of
+    /// the rest. See [`crate::pcs::commit_lane_major`] for the layout and
+    /// `pcs::open_batch_jagged_ligerito` for how the opening follows (the
+    /// relabelling is a rotation of the index variables, so the jagged
+    /// weight/assist machinery is untouched — only its evaluation point
+    /// rotates).
+    pub fn commit_lanes(&self, log_batch_size: usize) -> Option<usize> {
+        let log_dim = self.dense_m() - 7 - log_batch_size;
+        let t = crate::pcs::dense_lanes(self.dense_words(), log_batch_size, log_dim);
+        (t < 1usize << log_batch_size).then_some(t)
+    }
+
     /// Whether the compaction map is the identity: every slot is at FULL
     /// utilization (`n_t = 2^nu`, so no dummy row is truncated away), every
     /// used chunk-column's stacked offset equals its padded offset (no

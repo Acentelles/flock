@@ -169,7 +169,8 @@ impl MixedSetup {
             log_inv_rate: profile.log_inv_rate(),
             log_batch_size: 6,
             profile,
-            num_lanes: None,
+            // Integer-lane commit — see `UnionInstance::commit_lanes`.
+            num_lanes: union.commit_lanes(6),
         }
     }
 

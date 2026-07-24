@@ -381,6 +381,21 @@ fn verify_union_with_binding<Ch: Challenger>(
         union.dense_m(),
         "PcsParams.m must equal the union's dense_m (committed stack size)"
     );
+    // The proof carries `commitment.params`, and the opening reads its
+    // `num_ntts()` for the L0 leaf width and the lane-grid rotation — but the
+    // transcript binds only the commitment ROOT, so those params are
+    // ATTACKER-CONTROLLED. The honest lane count is count-derived
+    // (`UnionInstance::commit_lanes`, like `dense_m`), so require the
+    // commitment to carry exactly it; a mismatch is a rejection, not a panic.
+    if commitment.params.m != pcs_params.m
+        || commitment.params.log_batch_size != pcs_params.log_batch_size
+        || commitment.params.log_inv_rate != pcs_params.log_inv_rate
+        || commitment.params.num_ntts() != pcs_params.num_ntts()
+    {
+        return Err(VerifyError::PcsJagged(
+            crate::pcs::VerifyErrorJagged::Ligerito,
+        ));
+    }
     // Verification is single-threaded; run the PIOP replay on the dedicated
     // 1-thread pool (verify_claims_jagged_ligerito installs it itself).
     let (ab, c) = verifier_pool().install(|| -> Result<(ZClaim, ZClaim), VerifyError> {

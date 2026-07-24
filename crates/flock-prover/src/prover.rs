@@ -667,9 +667,20 @@ fn prove_union_with_binding<Ch: Challenger>(
     } else {
         Some(union.compact_witness(&z_packed))
     };
+    // Integer-lane commit: when the dense stack leaves whole high-bit lanes
+    // empty (`UnionInstance::commit_lanes`), encode + hash only the real ones.
+    // Identity compaction always fills every lane, so `dense_q = None` implies
+    // `num_lanes = None` and today's commit, byte-identically.
     let (commitment, prover_data) = match &dense_q {
+        Some(q) if pcs_params.num_lanes.is_some() => pcs::commit_lane_major(q, pcs_params),
         Some(q) => pcs::commit(q, pcs_params),
-        None => pcs::commit(&z_packed, pcs_params),
+        None => {
+            assert!(
+                pcs_params.num_lanes.is_none(),
+                "identity compaction fills every lane; num_lanes must be None"
+            );
+            pcs::commit(&z_packed, pcs_params)
+        }
     };
     match binding {
         UnionProveBinding::Mixed => union.bind_statement(challenger, &commitment),
@@ -1159,6 +1170,7 @@ pub fn prove_fast_ligerito_jagged_union_timed<Ch: Challenger>(
     // --- PCS commit ---
     let t0 = Instant::now();
     let (commitment, prover_data) = match &dense_q {
+        Some(q) if pcs_params.num_lanes.is_some() => pcs::commit_lane_major(q, pcs_params),
         Some(q) => pcs::commit(q, pcs_params),
         None => pcs::commit(&z_packed, pcs_params),
     };

@@ -27,7 +27,8 @@ pub mod ring_switch;
 pub mod tensor_algebra;
 
 pub use commit::{
-    Commitment, PcsParams, ProverData, commit, commit_into, prefault_codeword_during,
+    Commitment, PcsParams, ProverData, commit, commit_into, commit_lane_major, dense_lanes,
+    prefault_codeword_during,
 };
 pub use pack::{LOG_PACKING, pack_witness, unpack_witness};
 pub use ring_switch::{RingSwitchProof, SparseEqTensor};
@@ -770,6 +771,7 @@ pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
         log_n,
         target_combined,
         &commitment.root,
+        1usize << lig_config.initial_k,
         eval_b_residual,
         challenger,
     );
@@ -834,6 +836,23 @@ pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
 /// padded buffer is zero on every dropped word. When `None`, `q` is
 /// `packed_witness` itself (the single-table paths and full-utilization
 /// single-slot unions, whose compaction map is the identity).
+/// Map a point over the LANE-GRID variables to the corresponding point over
+/// the dense-stack variables, for a high-bit-lane commit.
+///
+/// The grid is `q_grid[p·2^k + l] = q[l·D + p]` (`k = initial_k`), i.e.
+/// `q_grid`'s low `k` variables are the lane bits that live at the TOP of
+/// `q`'s index. As multilinears that is a pure cyclic rotation of the variable
+/// vector, so `q̂_grid(x) = q̂(x_k, …, x_{m−1}, x_0, …, x_{k−1})` — rotate the
+/// evaluation point left by `k`. Applies verbatim to `Ŵ_ρ`, which is rotated
+/// alongside `q`, and hence to the jagged assist and `b_tilde` points.
+fn rotate_lane_point(point: &[F128], k: usize) -> Vec<F128> {
+    debug_assert!(k <= point.len());
+    let mut out = Vec::with_capacity(point.len());
+    out.extend_from_slice(&point[k..]);
+    out.extend_from_slice(&point[..k]);
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn open_batch_jagged_ligerito<Ch: Challenger>(
     packed_witness: Vec<F128>,
@@ -1041,6 +1060,39 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
         );
     }
 
+    // ---- High-bit lanes (integer-lane commit): when the commitment encoded
+    // only `t < 2^initial_k` lanes, its lane index is the HIGH `initial_k`
+    // bits of the dense index, so `q`'s contiguous zero tail is whole zero
+    // lanes. Ligerito's lane index is by construction the LOW `initial_k`
+    // bits, so hand it the rotated pair — `q_grid[p·2^k + l] = q[l·D + p]`,
+    // and the same rotation on `W_ρ`. The rotation is a permutation of the
+    // multilinear VARIABLES, so the inner product (and hence `f_eval`) is
+    // unchanged and every downstream MLE follows by rotating its evaluation
+    // point (`rotate_lane_point` below). Only the LSB pairing of the round-0
+    // prime differs, so it is recomputed on the rotated pair.
+    let l0_num_lanes = commitment.params.num_ntts();
+    let lane_grid = l0_num_lanes < 1usize << lig_config.initial_k;
+    let (q, w_rho, round0) = if lane_grid {
+        let t = std::time::Instant::now();
+        // Recycle each source as soon as it is consumed, so the second
+        // transpose reuses the first's buffer instead of faulting in a fresh
+        // 134 MB allocation at M = 30.
+        let qg = commit::lane_grid_from_lane_major(&q, lig_config.initial_k);
+        crate::scratch::give_f128(q);
+        let wg = commit::lane_grid_from_lane_major(&w_rho, lig_config.initial_k);
+        crate::scratch::give_f128(w_rho);
+        let round0 = jagged::round0_prime_permuted(&qg, &wg, claim_v);
+        if trace {
+            eprintln!(
+                "  [open_jagged] lane-grid transpose (q, W_rho) + round0: {:6.2} ms",
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        (qg, wg, round0)
+    } else {
+        (q, w_rho, round0)
+    };
+
     // ---- Fused Ligerito: open q against W_ρ with target f_eval, reusing the
     // commit-time codeword/tree as L0. The fused entry also returns the fold
     // challenges `ris` and mirrors the succinct verifier's trailing samples so
@@ -1053,6 +1105,7 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
         f_eval,
         &prover_data.codeword,
         &prover_data.merkle_tree,
+        l0_num_lanes,
         round0,
         challenger,
     );
@@ -1072,8 +1125,25 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
     let yr_log_n = dense_log - ris.len();
     // Batched shared-prefix evaluation — value-identical to per-y `f_hat_t`
     // calls (see `f_hat_t_batch_y`), ~3–4× cheaper.
-    let b_tilde: Vec<F128> =
-        jagged::f_hat_t_batch_y(&params, &rho[..n_log], &rho[n_log..], &ris, yr_log_n);
+    //
+    // Under the lane grid the fold challenges bind the ROTATED variables, so
+    // the jagged point is `rotate_lane_point(ris ‖ bits(y))`, which puts the
+    // varying `bits(y)` block in the MIDDLE — `f_hat_t_batch_y_split` is the
+    // same batched evaluator with a fixed high block after it.
+    let b_tilde: Vec<F128> = if lane_grid {
+        // `rotate_lane_point(ris ‖ bits(y))` = `ris[k..] ‖ bits(y) ‖ ris[..k]`.
+        let k = lig_config.initial_k;
+        jagged::f_hat_t_batch_y_split(
+            &params,
+            &rho[..n_log],
+            &rho[n_log..],
+            &ris[k..],
+            yr_log_n,
+            &ris[..k],
+        )
+    } else {
+        jagged::f_hat_t_batch_y(&params, &rho[..n_log], &rho[n_log..], &ris, yr_log_n)
+    };
     for &v in &b_tilde {
         challenger.observe_f128(v);
     }
@@ -1087,6 +1157,9 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
     let r_extra = challenger.sample_f128_vec(yr_log_n);
     let mut z_index = ris;
     z_index.extend_from_slice(&r_extra);
+    if lane_grid {
+        z_index = rotate_lane_point(&z_index, lig_config.initial_k);
+    }
     let jagged_assist =
         jagged::prove_assist(&params, &rho[..n_log], &rho[n_log..], &z_index, challenger);
     if trace {
@@ -1246,6 +1319,7 @@ pub fn verify_opening_batch_jagged_ligerito<Ch: Challenger>(
         dense_log,
         proof.f_eval,
         &commitment.root,
+        commitment.params.num_ntts(),
         eval_b_residual,
         challenger,
     );
@@ -1271,6 +1345,12 @@ pub fn verify_opening_batch_jagged_ligerito<Ch: Challenger>(
     let b_tilde_at_r_extra = ligerito::partial_eval_lsb(&proof.b_tilde, &r_extra)[0];
     let mut z_index = ris;
     z_index.extend_from_slice(&r_extra);
+    // High-bit lanes: Ligerito folded the ROTATED variables, so its residual
+    // point addresses the lane grid — rotate back to the dense-stack variable
+    // order the jagged weight is defined over (prover mirror).
+    if commitment.params.num_ntts() < 1usize << lig_config.initial_k {
+        z_index = rotate_lane_point(&z_index, lig_config.initial_k);
+    }
     let beta = jagged::verify_assist(
         &params,
         &rho[..n_log],

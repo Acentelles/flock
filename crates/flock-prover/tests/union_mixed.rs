@@ -111,7 +111,9 @@ fn union_pcs_params(union: &UnionInstance<'_>) -> PcsParams {
         log_inv_rate: 1,
         log_batch_size: 6,
         profile: LigeritoProfile::Fast,
-        num_lanes: None,
+        // Integer-lane commit: skip the encode + hash of the whole zero lanes
+        // the power-of-two rounding of the dense stack leaves behind.
+        num_lanes: union.commit_lanes(6),
     }
 }
 
@@ -187,7 +189,13 @@ fn mixed_blake3_sha256_roundtrip_and_tamper() {
         z_union[..q.len()],
         "compaction must move the second slot's columns"
     );
-    let (comm_direct, _prover_data) = flock_core::pcs::commit(&q, &pcs_params);
+    // Mirrors the prover's dispatch: the integer-lane commit encodes only the
+    // dense stack's nonzero high-bit lanes (`UnionInstance::commit_lanes`).
+    let (comm_direct, _prover_data) = if pcs_params.num_lanes.is_some() {
+        flock_core::pcs::commit_lane_major(&q, &pcs_params)
+    } else {
+        flock_core::pcs::commit(&q, &pcs_params)
+    };
     assert_eq!(
         commitment.root, comm_direct.root,
         "commitment root must equal a direct commit of the compacted union stack"
@@ -248,6 +256,40 @@ fn mixed_blake3_sha256_roundtrip_and_tamper() {
             verify(&union_bad, &proof).is_err(),
             "tampered registry must reject"
         );
+    }
+
+    // ---- Tamper: the commitment's `num_lanes`. The integer-lane commit puts
+    // an attacker-controlled field on the verifier's path — `num_ntts()` sets
+    // the L0 leaf width AND selects the lane-grid rotation — while the
+    // transcript binds only the commitment ROOT. The honest value is
+    // count-derived (`UnionInstance::commit_lanes`), so the verifier requires
+    // the commitment to carry exactly it. Both directions must reject.
+    {
+        assert!(
+            pcs_params.num_lanes.is_some(),
+            "this shape must exercise the integer-lane commit"
+        );
+        for bad_lanes in [
+            Some(pcs_params.num_ntts() - 1),
+            Some(pcs_params.num_ntts() + 1),
+            None, // "no integer-lane commit at all"
+        ] {
+            let mut bad_comm = commitment.clone();
+            bad_comm.params.num_lanes = bad_lanes;
+            let mut ch_v = FsChallenger::new(DOMAIN);
+            assert!(
+                verifier::verify_ligerito_jagged_union(
+                    &union,
+                    &circuits,
+                    &bad_comm,
+                    &proof,
+                    &pcs_params,
+                    &mut ch_v,
+                )
+                .is_err(),
+                "tampered num_lanes ({bad_lanes:?}) must reject"
+            );
+        }
     }
 
     // ---- Tamper: PIOP (a lincheck round message) — rejects through the

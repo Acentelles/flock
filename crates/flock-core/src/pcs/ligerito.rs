@@ -1733,6 +1733,10 @@ pub(crate) fn induce_sumcheck_enforced_sum(
 ) -> F128 {
     assert_eq!(opened_rows.len(), queries.len());
     let eq = build_eq_table(v_challenges);
+    // Rows may be NARROWER than the lane-fold weights under a high-bit-lane
+    // commit (lanes past `t` are definitionally zero and never committed);
+    // the `zip` below truncates, which is exactly the zero-fill.
+    debug_assert!(opened_rows.iter().all(|r| r.len() <= eq.len()));
     let n_queries = queries.len();
     let alpha_weights: Vec<F128> = if n_queries == 0 {
         Vec::new()
@@ -1741,7 +1745,6 @@ pub(crate) fn induce_sumcheck_enforced_sum(
     };
     let mut sum = F128::ZERO;
     for (i, row) in opened_rows.iter().enumerate() {
-        debug_assert_eq!(row.len(), eq.len());
         let dot: F128 = row
             .iter()
             .zip(eq.iter())
@@ -1900,15 +1903,10 @@ pub(crate) fn induce_sumcheck_poly(
     let n = 1usize << log_msg_cols;
     let n_queries = queries.len();
     assert_eq!(opened_rows.len(), n_queries);
-    debug_assert_eq!(
-        v_challenges.len(),
-        opened_rows
-            .first()
-            .map(|r| r.len().trailing_zeros() as usize)
-            .unwrap_or(0)
-    );
-
     let eq = build_eq_table(v_challenges); // length 2^v_challenges.len() = num_interleaved
+    // Rows may be narrower than `eq` under a high-bit-lane commit — see
+    // `induce_sumcheck_enforced_sum`.
+    debug_assert!(opened_rows.iter().all(|r| r.len() <= eq.len()));
 
     // Per-query weights are the eq-tensor coefficients `eq(α, i_bin)` for
     // `i ∈ {0,1}^{⌈log₂ n_queries⌉}` (LSB-first), truncated to the first
@@ -2970,6 +2968,7 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
         target,
         l0_codeword,
         l0_tree,
+        1usize << config.initial_k,
         None,
         challenger,
     )
@@ -2999,6 +2998,7 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
         target,
         l0_codeword,
         l0_tree,
+        1usize << config.initial_k,
         Some(SumcheckMessage {
             u_0: round0_uv.0,
             u_2: round0_uv.1,
@@ -3031,6 +3031,7 @@ pub(crate) fn recursive_prover_with_basis_precomputed_round0_fused<Ch: Challenge
     target: F128,
     l0_codeword: &[F128],
     l0_tree: &[Hash],
+    l0_num_lanes: usize,
     round0_uv: (F128, F128),
     challenger: &mut Ch,
 ) -> (LigeritoProof, Vec<F128>) {
@@ -3041,6 +3042,7 @@ pub(crate) fn recursive_prover_with_basis_precomputed_round0_fused<Ch: Challenge
         target,
         l0_codeword,
         l0_tree,
+        l0_num_lanes,
         Some(SumcheckMessage {
             u_0: round0_uv.0,
             u_2: round0_uv.1,
@@ -3071,6 +3073,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     target: F128,
     l0_codeword: &[F128],
     l0_tree: &[Hash],
+    l0_num_lanes: usize,
     first_msg: Option<SumcheckMessage>,
     challenger: &mut Ch,
 ) -> (LigeritoProof, Vec<F128>) {
@@ -3087,7 +3090,14 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let log_inv_rate_0 = config.log_inv_rates[0];
     let log_msg_cols_0 = log_n - initial_k;
     let block_len_0 = 1usize << (log_msg_cols_0 + log_inv_rate_0);
-    let num_interleaved_0 = 1usize << initial_k;
+    // L0 lane count: `2^initial_k` on the power-of-two path, or the integer
+    // `t < 2^initial_k` of a high-bit-lane commit whose top lanes are
+    // definitionally zero and therefore never encoded (see
+    // `pcs::commit::commit_lane_grid`). The POLYNOMIAL still has `2^initial_k`
+    // lanes — `initial_k` lane folds, `2^initial_k`-wide eq weights — only the
+    // committed rows are narrower.
+    let num_interleaved_0 = l0_num_lanes;
+    assert!(num_interleaved_0 >= 1 && num_interleaved_0 <= 1usize << initial_k);
     assert_eq!(l0_codeword.len(), block_len_0 * num_interleaved_0);
     assert_eq!(l0_tree.len(), 2 * block_len_0 - 1);
 
@@ -3477,6 +3487,7 @@ pub fn recursive_verifier_with_basis_succinct<Ch, F>(
     log_n: usize,
     target: F128,
     expected_initial_root: &Hash,
+    l0_num_lanes: usize,
     eval_b_residual: F,
     challenger: &mut Ch,
 ) -> bool
@@ -3512,7 +3523,15 @@ where
     let log_inv_rate_0 = config.log_inv_rates[0];
     let log_msg_cols_0 = log_n - initial_k;
     let block_len_0 = 1usize << (log_msg_cols_0 + log_inv_rate_0);
-    let num_interleaved_0 = 1usize << initial_k;
+    // Opened L0 rows are `l0_num_lanes` wide — `2^initial_k` on the
+    // power-of-two path, the integer `t` under a high-bit-lane commit whose
+    // top lanes are definitionally zero. The lane-fold weights stay
+    // `2^initial_k`-wide; the shorter rows zero-pad against them (the dot
+    // products below zip, which IS the zero-fill).
+    let num_interleaved_0 = l0_num_lanes;
+    if num_interleaved_0 == 0 || num_interleaved_0 > 1usize << initial_k {
+        return false;
+    }
 
     let mut t_r = target;
     let mut tx_idx = 0usize;
@@ -6687,6 +6706,7 @@ mod tests {
             log_n,
             target,
             &initial_root,
+            1usize << v_cfg.initial_k,
             eval_b_residual,
             &mut v_ch2,
         );
@@ -6820,6 +6840,7 @@ mod tests {
                 log_n,
                 target,
                 &initial_root,
+                1usize << v_cfg.initial_k,
                 &eval_b_residual,
                 &mut ch,
             )

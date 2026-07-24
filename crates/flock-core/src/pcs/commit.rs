@@ -223,6 +223,128 @@ pub fn commit_into(
     finalize_commit(codeword, params)
 }
 
+// ---------------------------------------------------------------------------
+// High-bit lanes: the layout that makes the integer-lane commit reachable.
+//
+// The zero padding of a committed stack `q` is a contiguous TAIL (`q` holds
+// `dense_words` real words inside a power-of-two array). Ligerito's lane index
+// is by construction the LOW `log_batch_size` bits of the message index
+// (`ligero_commit`: "the first log_num_interleaved LSB variables ARE the lane
+// indices"), so under that labelling the zero tail SMEARS across every lane
+// and no lane is wholly zero — there is nothing to drop.
+//
+// Relabel the lane as the HIGH `log_batch_size` bits instead — lane `l` owns
+// the contiguous logical block `q[l·D .. (l+1)·D)`, `D = 2^log_dim` — and the
+// tail becomes WHOLE zero lanes `l ≥ t = ceil(dense_words / D)`, which the
+// commit simply does not encode or hash. Crucially the relabelling is a
+// **variable rotation** of the index bits, so every multilinear extension
+// downstream (the jagged weight `f̂_t`, the assist, `b_tilde`) survives it by
+// permuting its evaluation point — unlike a tight stride-`t` packing, whose
+// `e = t·p + l` is not multilinear in the index bits at all.
+//
+// [`lane_grid_from_lane_major`] converts the lane-major dense stack into the
+// LSB-lane "grid" array Ligerito folds; [`commit_lane_grid`] encodes it while
+// dropping the zero lanes. See `pcs::open_batch_jagged_ligerito`.
+// ---------------------------------------------------------------------------
+
+/// Number of nonzero high-bit lanes of a dense stack: `ceil(dense_words / D)`
+/// with `D = 2^log_dim`. Lanes `[t, 2^log_batch_size)` are wholly zero and are
+/// not committed. Returns `2^log_batch_size` when the stack is full (the
+/// power-of-two case — callers should then keep `num_lanes = None` so the
+/// commit stays byte-identical to today's).
+pub fn dense_lanes(dense_words: usize, log_batch_size: usize, log_dim: usize) -> usize {
+    dense_words
+        .div_ceil(1usize << log_dim)
+        .clamp(1, 1usize << log_batch_size)
+}
+
+/// Transpose the lane-major dense stack `q` (lane `l` = the contiguous block
+/// `q[l·D .. (l+1)·D)`) into the LSB-lane grid `g[p·2^log_batch_size + l] =
+/// q[l·D + p]` that Ligerito folds — i.e. rotate the index bits so the high
+/// `log_batch_size` lane bits become the low ones.
+///
+/// Cache-blocked over position tiles (one tile is `TILE · 2^log_batch_size`
+/// words, which stays in L2), so it runs at near-memcpy speed despite the
+/// strided writes.
+pub fn lane_grid_from_lane_major(q: &[F128], log_batch_size: usize) -> Vec<F128> {
+    use rayon::prelude::*;
+
+    let lanes = 1usize << log_batch_size;
+    assert!(q.len().is_multiple_of(lanes), "dense stack must fill lanes");
+    let d = q.len() >> log_batch_size;
+    let mut grid = crate::scratch::take_f128(q.len());
+    const TILE: usize = 64; // positions per tile
+    grid.par_chunks_mut(TILE * lanes)
+        .enumerate()
+        .for_each(|(tile, out)| {
+            let p0 = tile * TILE;
+            let n = TILE.min(d - p0);
+            for lane in 0..lanes {
+                let src = &q[lane * d + p0..lane * d + p0 + n];
+                for (p, &v) in src.iter().enumerate() {
+                    out[p * lanes + lane] = v;
+                }
+            }
+        });
+    grid
+}
+
+/// [`commit`] for a LANE-MAJOR message: `q` is the full `2^log_msg_len`-word
+/// dense stack, lane `l` being its contiguous block `q[l·D .. (l+1)·D)`.
+/// Lanes `[t, 2^log_batch_size)` — the stack's zero tail, `t =
+/// params.num_ntts()` — must be identically zero and are neither encoded nor
+/// hashed.
+///
+/// Equivalent to `commit(&extract, params)` on the compacted interleaved
+/// message `extract[p·t + l] = q[l·D + p]`, but the transpose happens inside
+/// the codeword fill, so it costs no extra pass and no intermediate buffer.
+pub fn commit_lane_major(q: &[F128], params: &PcsParams) -> (Commitment, ProverData) {
+    params.validate();
+    let lanes = 1usize << params.log_batch_size;
+    let t = params.num_ntts();
+    assert_eq!(
+        q.len(),
+        1usize << params.log_msg_len(),
+        "lane-major message must be the full padded stack"
+    );
+    let d = q.len() >> params.log_batch_size;
+    debug_assert!(
+        q[t * d..].iter().all(|w| w.is_zero()),
+        "lanes >= num_lanes must be identically zero"
+    );
+    let _ = lanes;
+    let codeword_len = params.n_positions() * t;
+    let mut codeword = crate::scratch::take_f128(codeword_len);
+    replicate_lane_major_fill(&mut codeword, q, t, d);
+    finalize_commit(codeword, params)
+}
+
+/// [`replicate_message_fill`] for a lane-major message: fill `codeword` with
+/// `2^r` replicas of the transposed `t`-lane extract, `msg[p·t + l] =
+/// q[l·D + p]`. Cache-blocked over position tiles (see
+/// [`lane_grid_from_lane_major`]).
+fn replicate_lane_major_fill(codeword: &mut [F128], q: &[F128], t: usize, d: usize) {
+    use rayon::prelude::*;
+
+    let msg_len = t * d;
+    debug_assert!(codeword.len().is_multiple_of(msg_len));
+    const TILE: usize = 64; // positions per tile
+    codeword.par_chunks_mut(msg_len).for_each(|rep| {
+        rep.par_chunks_mut(TILE * t)
+            .enumerate()
+            .for_each(|(tile, out)| {
+                let p0 = tile * TILE;
+                let n = TILE.min(d - p0);
+                for lane in 0..t {
+                    let src = &q[lane * d + p0..lane * d + p0 + n];
+                    for (p, &v) in src.iter().enumerate() {
+                        out[p * t + lane] = v;
+                    }
+                }
+            });
+    });
+}
+
 /// Fill `codeword` with `2^r` replicas of `msg` (`r = log2(codeword.len() /
 /// msg.len())`) — the exact state after the first `r` forward-NTT layers on
 /// the zero-padded coefficient vector `[msg, 0, …, 0]`. Pair with
@@ -563,6 +685,71 @@ mod tests {
                     .last()
                     .unwrap();
                 assert_eq!(root, _c_t.root, "root must be over t-wide leaves");
+            }
+        }
+    }
+
+    /// High-bit lanes (Oracle 3): the lane-grid commit of a lane-major dense
+    /// stack `q` — whose real data is the contiguous prefix `q[..dense]`, so
+    /// lanes `≥ t` are wholly zero — is byte-identical to the plain `t`-lane
+    /// commit of the compacted message. I.e. `commit_lane_grid` really is
+    /// "encode the `t` real lanes and nothing else", and the transpose
+    /// `lane_grid_from_lane_major` is its inverse-consistent partner.
+    ///
+    /// Also pins the two structural facts the whole scheme rests on: the
+    /// transpose is a pure index-bit rotation (`g[p·L + l] = q[l·D + p]`), and
+    /// a CONTIGUOUS zero tail of `q` becomes WHOLE zero lanes of `g` — which
+    /// is exactly what today's LSB-lane labelling fails to give.
+    #[test]
+    fn lane_grid_commit_matches_compacted_message() {
+        for (m, log_inv_rate, log_batch_size) in [(12, 1, 3), (14, 2, 3), (15, 1, 4)] {
+            let lanes = 1usize << log_batch_size;
+            let log_dim = (m - LOG_PACKING) - log_batch_size;
+            let d = 1usize << log_dim;
+            // A dense stack that leaves the top few lanes empty.
+            for spare in [1usize, 2, lanes / 2] {
+                let t = lanes - spare;
+                let dense = (t - 1) * d + d / 3; // real prefix, mid-lane end
+                let mut q = vec![F128::ZERO; lanes * d];
+                for (i, w) in q[..dense].iter_mut().enumerate() {
+                    *w = F128 {
+                        lo: i as u64 + 1,
+                        hi: 0xA5,
+                    };
+                }
+                assert_eq!(dense_lanes(dense, log_batch_size, log_dim), t);
+
+                let grid = lane_grid_from_lane_major(&q, log_batch_size);
+                // The rotation, and the whole-zero-lane property.
+                for lane in 0..lanes {
+                    for p in 0..d {
+                        assert_eq!(grid[p * lanes + lane], q[lane * d + p]);
+                    }
+                }
+                for chunk in grid.chunks(lanes) {
+                    assert!(
+                        chunk[t..].iter().all(|w| w.is_zero()),
+                        "lanes >= t must be wholly zero"
+                    );
+                }
+
+                let params = PcsParams {
+                    m,
+                    log_inv_rate,
+                    log_batch_size,
+                    profile: Default::default(),
+                    num_lanes: Some(t),
+                };
+                // Reference: the plain t-lane commit of the compacted message.
+                let mut extract = vec![F128::ZERO; t * d];
+                for p in 0..d {
+                    extract[p * t..(p + 1) * t].copy_from_slice(&grid[p * lanes..p * lanes + t]);
+                }
+                let (c_ref, pd_ref) = commit(&extract, &params);
+                let (c_grid, pd_grid) = commit_lane_major(&q, &params);
+                assert_eq!(c_ref.root, c_grid.root, "root diverged (m={m}, t={t})");
+                assert_eq!(pd_ref.codeword, pd_grid.codeword, "codeword diverged");
+                assert_eq!(pd_ref.merkle_tree, pd_grid.merkle_tree, "tree diverged");
             }
         }
     }

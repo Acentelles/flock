@@ -115,22 +115,22 @@ fn m6_mixed_union_proof_bytes_pinned() {
         (
             "mixed-nu10-1024-1024",
             [1024, 1024],
-            "69690ac566159a2217c7437da70b9771299bd05642bbf68b45d2caa6a11c3fb2",
+            "67f4d77e8f501caaa859db1f2a7ace87fa50af0e93b296f9f59d1f1e1fe28e67",
         ),
         (
             "mixed-nu10-50-37",
             [50, 37],
-            "b4b19636d893b503f7ef0486efdae858003726812276f15274def1225ef0cef3",
+            "1172fa9f14fa8a1eedf8edc9636240f5067a26e3eacd774300a8550dea1d7d86",
         ),
         (
             "mixed-nu10-8-8",
             [8, 8],
-            "bb29869a1a0dffc462c0b0c41e431c77c6bac8b7eaac4f469a41082f785451f5",
+            "a82bf3c36d9751b2d622fdde8b5201c74a76bb6f2c13c448911acb03635a9450",
         ),
         (
             "mixed-nu10-0-64",
             [0, 64],
-            "de34973bb7f04939dca829c1979d9451596df9295700b9ed2277979f8a8e9cf1",
+            "00fd1afa4028dd60972ded5e85d863e96eeecf7861a630d2dfedf33d4287a88f",
         ),
     ];
 
@@ -155,7 +155,14 @@ fn m6_mixed_union_proof_bytes_pinned() {
             log_inv_rate: 1,
             log_batch_size: 6,
             profile: flock_core::pcs::ligerito::LigeritoProfile::Fast,
-            num_lanes: None,
+            // The shipped union configuration: the integer-lane commit skips
+            // the whole zero lanes the power-of-two rounding of the dense
+            // stack leaves behind (`UnionInstance::commit_lanes`). Pinning it
+            // here keeps the fixtures a regression test for what actually
+            // ships. The single-type anchors below stay on the power-of-two
+            // path (identity compaction fills every lane), so they pin that
+            // it is untouched.
+            num_lanes: union.commit_lanes(6),
         };
         // Per-fixture seed so each count vector has its own witness stream.
         let mut rng = Rng::new(0x4D36_0000 ^ ((n_sha2 as u64) << 16) ^ n_blake3 as u64);

@@ -375,6 +375,17 @@ fn generate_f_and_claim(
 /// are bit-identical to a separate `Σ q_0·W_0` pass. Feeds the fused
 /// jagged→Ligerito opening (`pcs::open_batch_jagged_ligerito`), which
 /// discharges `⟨q, W⟩ = v` directly in Ligerito with `W` as the basis.
+/// Round-0 sumcheck prime `(u_0, u_2)` of `Σ_e q(e)·W(e)` for a `(q, W)` pair
+/// already permuted into Ligerito's lane-grid order (high-bit lanes — see
+/// `pcs::commit::lane_grid_from_lane_major`). The claim `v` is
+/// permutation-invariant; only the LSB pairing the prime is taken over
+/// changes, so [`weight_table_claim_and_round0`]'s fused prime does not carry
+/// over and is recomputed here from the permuted pair.
+pub(crate) fn round0_prime_permuted(q: &[F128], w: &[F128], v: F128) -> (F128, F128) {
+    let (g_one, g_inf) = round_msg_par(q, w);
+    (v + g_one, g_inf)
+}
+
 pub(crate) fn weight_table_claim_and_round0(
     params: &JaggedParams,
     q: &[F128],
@@ -1062,7 +1073,7 @@ fn fold_and_round_fused(a: &mut Vec<F128>, b: &mut Vec<F128>, r: F128) -> (F128,
 /// `scaling_diag`. No longer on the production path (round 1's message is
 /// fused into [`generate_f_and_claim`]); retained for the runtime benchmarks.
 #[allow(dead_code)]
-fn round_msg_par(a: &[F128], b: &[F128]) -> (F128, F128) {
+pub(crate) fn round_msg_par(a: &[F128], b: &[F128]) -> (F128, F128) {
     use rayon::prelude::*;
     const C: usize = 1 << 14;
     a.par_chunks(C)
@@ -1172,27 +1183,55 @@ pub(crate) fn f_hat_t_batch_y(
     ris: &[F128],
     yr_log_n: usize,
 ) -> Vec<F128> {
+    f_hat_t_batch_y_split(params, z_row, z_col, ris, yr_log_n, &[])
+}
+
+/// [`f_hat_t_batch_y`] with the varying `y` block in the MIDDLE: the point is
+/// `low ‖ bits(y) ‖ high` rather than `ris ‖ bits(y)`.
+///
+/// Needed by the high-bit-lane opening, where Ligerito folds a rotation of the
+/// dense-stack variables (`pcs::rotate_lane_point`): the rotation carries the
+/// residual's trailing `y` block into the middle and the lane challenges up to
+/// the top. The layers ABOVE the `y` block are then fixed but processed AFTER
+/// it, so they cannot join the shared forward prefix — instead they fold, once
+/// per column, into a single 4-vector by a BACKWARD pass (the composite of
+/// those layers is linear, and only its `STATE_SUCCESS` row is read), turning
+/// each per-`y` column step from `high.len() + 1` transitions into one
+/// 4-term dot product.
+///
+/// `low.len() + yr_log_n + high.len() == m`. With `high` empty this is exactly
+/// [`f_hat_t_batch_y`] — the backward pass then covers only the past-the-end
+/// layer `m`, whose coordinate is pinned to zero.
+pub(crate) fn f_hat_t_batch_y_split(
+    params: &JaggedParams,
+    z_row: &[F128],
+    z_col: &[F128],
+    low: &[F128],
+    yr_log_n: usize,
+    high: &[F128],
+) -> Vec<F128> {
     use rayon::prelude::*;
     let m = params.m;
-    let shared_len = ris.len();
-    debug_assert_eq!(shared_len + yr_log_n, m);
+    let lo = low.len();
+    let hi_start = lo + yr_log_n;
+    debug_assert_eq!(hi_start + high.len(), m);
     let cols = assist_columns(params, z_col);
     let sparse = assist_sparse_transitions();
 
-    // Per-layer eq4 tables over `(z_row bit, z_index bit)`. Layers below
-    // `shared_len` read `ris`; layers `shared_len..m` read a boolean `y` bit
-    // (one table per bit value); layer `m` is past `z_index`, so its
-    // coordinate is pinned to zero (`point_bit`).
+    // Per-layer eq4 tables over `(z_row bit, z_index bit)`. Layers `0..lo`
+    // read `low`; layers `lo..hi_start` read a boolean `y` bit (one table per
+    // bit value); layers `hi_start..m` read `high`; layer `m` is past
+    // `z_index`, so its coordinate is pinned to zero (`point_bit`).
     let eq4_at = |layer: usize, index_coord: F128| -> [F128; 4] {
         let t = build_eq_table(&[point_bit(z_row, layer), index_coord]);
         [t[0], t[1], t[2], t[3]]
     };
-    let eq4_shared: Vec<[F128; 4]> = (0..shared_len).map(|l| eq4_at(l, ris[l])).collect();
-    let eq4_y: Vec<[[F128; 4]; 2]> = (shared_len..=m)
-        .map(|l| {
-            let bit1 = if l < m { F128::ONE } else { F128::ZERO };
-            [eq4_at(l, F128::ZERO), eq4_at(l, bit1)]
-        })
+    let eq4_low: Vec<[F128; 4]> = (0..lo).map(|l| eq4_at(l, low[l])).collect();
+    let eq4_y: Vec<[[F128; 4]; 2]> = (lo..hi_start)
+        .map(|l| [eq4_at(l, F128::ZERO), eq4_at(l, F128::ONE)])
+        .collect();
+    let eq4_high: Vec<[F128; 4]> = (hi_start..=m)
+        .map(|l| eq4_at(l, high.get(l - hi_start).copied().unwrap_or(F128::ZERO)))
         .collect();
 
     let step = |v: &[F128; 4], eq4: &[F128; 4], cd: usize| -> [F128; 4] {
@@ -1209,32 +1248,44 @@ pub(crate) fn f_hat_t_batch_y(
         ((t_c >> layer) & 1) as usize + 2 * ((t_next >> layer) & 1) as usize
     };
 
-    // Forward shared-prefix pass, once per (merged) column.
-    let prefixes: Vec<[F128; 4]> = cols
+    // Per (merged) column: the forward shared-prefix state, and the backward
+    // fold of the fixed high layers (`dot4(suffix, v)` = what reading
+    // `STATE_SUCCESS` after them would give).
+    let ends: Vec<([F128; 4], [F128; 4])> = cols
         .par_iter()
         .map(|&(_, t_c, t_next)| {
             let mut v = [F128::ZERO; 4];
             v[STATE_INITIAL] = F128::ONE;
-            for (layer, eq4) in eq4_shared.iter().enumerate() {
+            for (layer, eq4) in eq4_low.iter().enumerate() {
                 v = step(&v, eq4, cd_at(t_c, t_next, layer));
             }
-            v
+            let mut e = [F128::ZERO; 4];
+            e[STATE_SUCCESS] = F128::ONE;
+            for (j, eq4) in eq4_high.iter().enumerate().rev() {
+                let cd = cd_at(t_c, t_next, hi_start + j);
+                let mut prev = [F128::ZERO; 4];
+                for (s, slot) in prev.iter_mut().enumerate() {
+                    let (i0, o0) = sparse[cd][s][0];
+                    let (i1, o1) = sparse[cd][s][1];
+                    *slot = eq4[i0] * e[o0] + eq4[i1] * e[o1];
+                }
+                e = prev;
+            }
+            (v, e)
         })
         .collect();
 
-    // Per-y suffix layers + eq_col-weighted assembly.
+    // Per-y middle layers + eq_col-weighted assembly.
     (0..1usize << yr_log_n)
         .into_par_iter()
         .map(|y| {
             let mut acc = F128::ZERO;
-            for (&(w, t_c, t_next), prefix) in cols.iter().zip(&prefixes) {
+            for (&(w, t_c, t_next), (prefix, suffix)) in cols.iter().zip(&ends) {
                 let mut v = *prefix;
                 for (j, eq4s) in eq4_y.iter().enumerate() {
-                    let layer = shared_len + j;
-                    let bit = if layer < m { (y >> j) & 1 } else { 0 };
-                    v = step(&v, &eq4s[bit], cd_at(t_c, t_next, layer));
+                    v = step(&v, &eq4s[(y >> j) & 1], cd_at(t_c, t_next, lo + j));
                 }
-                acc += w * v[STATE_SUCCESS];
+                acc += w * dot4(suffix, &v);
             }
             acc
         })
@@ -1402,6 +1453,36 @@ mod tests {
     /// heights include zero-height runs (merged-column sharing) and shapes
     /// whose cumulative sums reach `2^m` (bit `m` of `t` set), across several
     /// `ris`-length splits including the degenerate `yr = 0` and `yr = m`.
+    ///
+    /// The middle-block variant matches per-`y` `f_hat_t` at the split point
+    /// `low ‖ bits(y) ‖ high` — the shape the high-bit-lane opening's variable
+    /// rotation produces. Covers every split of the fixed coordinates between
+    /// the low prefix and the high suffix, including the degenerate ends
+    /// (`high` empty = the plain batched evaluator, `low` empty).
+    #[test]
+    fn f_hat_t_batch_y_split_matches_per_y() {
+        let mut ch = RandomChallenger::new(0x5B_11_7000);
+        for &(n, k, m) in &[(3usize, 2usize, 5usize), (4, 3, 7)] {
+            let (params, _q) = random_instance(&mut ch, n, k, m);
+            let z_row = sample_vec(&mut ch, n);
+            let z_col = sample_vec(&mut ch, k);
+            for yr in 0..=m.min(3) {
+                let fixed = sample_vec(&mut ch, m - yr);
+                for lo in 0..=fixed.len() {
+                    let (low, high) = fixed.split_at(lo);
+                    let got = f_hat_t_batch_y_split(&params, &z_row, &z_col, low, yr, high);
+                    for (y, &g) in got.iter().enumerate() {
+                        let mut z_index = low.to_vec();
+                        z_index.extend((0..yr).map(|j| int_bit(y as u64, j)));
+                        z_index.extend_from_slice(high);
+                        let want = f_hat_t(&params, &z_row, &z_col, &z_index);
+                        assert_eq!(g, want, "split mismatch m={m} yr={yr} lo={lo} y={y}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn f_hat_t_batch_y_matches_per_y() {
         let mut ch = RandomChallenger::new(0xB71D_E001);
