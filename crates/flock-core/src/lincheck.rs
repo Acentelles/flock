@@ -777,12 +777,23 @@ fn partial_fold_packed_z_best(
 }
 
 /// Row-aware dispatch over the declared count (M6, support-proportional):
-/// when the declared rows fill at most half the outer capacity, fold only
-/// their stripe prefix ([`partial_fold_packed_z_rows_padded`] — cost
-/// proportional to the count); otherwise the dense best-kernel dispatch (the
-/// possible saving is under 2× there, and the dense NEON kernels win per
-/// byte). Byte-identical either way on honest witnesses whose dummy rows
-/// are zero.
+/// ANY partial count folds only its stripe prefix
+/// ([`partial_fold_packed_z_rows_padded`] — cost proportional to the count);
+/// a full count takes the dense best-kernel dispatch. Byte-identical either
+/// way on honest witnesses whose dummy rows are zero.
+///
+/// This gate used to require the count to fill at most HALF the capacity, on
+/// the reasoning that "the dense NEON kernels win per byte" so a sub-2×
+/// saving would not pay. Measured (BLAKE3 m=30, ν=16, lincheck phase, A/B
+/// alternated in-process): the row-prefix fold is faster at EVERY
+/// utilization tested — 73% 8.19→5.87 ms, 79% 8.03→6.68, 89% 7.97→7.14, even
+/// 100% 8.53→7.86, where it folds exactly the same bytes. So the per-byte
+/// premise did not hold at this shape; `n_log = 16` sits right on the dense
+/// path's oblock/iblock crossover, whose own comment notes oblock can be
+/// ~1.7× slower on smaller folds. Full utilization is left on the dense path
+/// regardless — it is the byte-identity anchor configuration, its margin here
+/// was the smallest measured, and one shape is thin evidence for changing the
+/// calibrated kernel selection.
 fn partial_fold_packed_z_rows_best(
     z_packed: &[u8],
     m: usize,
@@ -792,7 +803,7 @@ fn partial_fold_packed_z_rows_best(
     n_rows: usize,
 ) -> Vec<F128> {
     let n_outer = 1usize << (m - k_log);
-    if n_rows.div_ceil(8) * 8 * 2 <= n_outer {
+    if n_rows < n_outer {
         partial_fold_packed_z_rows_padded(z_packed, m, k_log, useful_bits, eq_outer, n_rows)
     } else {
         partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, eq_outer)
