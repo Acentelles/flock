@@ -150,6 +150,10 @@ name = "ntt_butterfly_probe"
 harness = false
 
 [[bench]]
+name = "ntt_layout_probe"
+harness = false
+
+[[bench]]
 name = "merkle_probe"
 harness = false
 
