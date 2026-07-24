@@ -1071,26 +1071,24 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
     // point (`rotate_lane_point` below). Only the LSB pairing of the round-0
     // prime differs, so it is recomputed on the rotated pair.
     let l0_num_lanes = commitment.params.num_ntts();
-    let lane_grid = l0_num_lanes < 1usize << lig_config.initial_k;
-    let (q, w_rho, round0) = if lane_grid {
+    let lane_major = l0_num_lanes < 1usize << lig_config.initial_k;
+    let round0 = if lane_major {
+        // L0 binds the lane variable by folding BLOCKS of `2^log_dim`
+        // (`ligerito::fold_and_msg_blocked`), so the round-0 prime is taken
+        // over that pairing. Nothing is permuted: the rotation is pure
+        // addressing, so `q` and `W_ρ` are handed over as they are.
         let t = std::time::Instant::now();
-        // Recycle each source as soon as it is consumed, so the second
-        // transpose reuses the first's buffer instead of faulting in a fresh
-        // 134 MB allocation at M = 30.
-        let qg = commit::lane_grid_from_lane_major(&q, lig_config.initial_k);
-        crate::scratch::give_f128(q);
-        let wg = commit::lane_grid_from_lane_major(&w_rho, lig_config.initial_k);
-        crate::scratch::give_f128(w_rho);
-        let round0 = jagged::round0_prime_permuted(&qg, &wg, claim_v);
+        let d = q.len() >> lig_config.initial_k;
+        let round0 = jagged::round0_prime_blocked(&q, &w_rho, claim_v, d);
         if trace {
             eprintln!(
-                "  [open_jagged] lane-grid transpose (q, W_rho) + round0: {:6.2} ms",
+                "  [open_jagged] blocked round-0 prime: {:6.2} ms",
                 t.elapsed().as_secs_f64() * 1e3
             );
         }
-        (qg, wg, round0)
+        round0
     } else {
-        (q, w_rho, round0)
+        round0
     };
 
     // ---- Fused Ligerito: open q against W_ρ with target f_eval, reusing the
@@ -1106,6 +1104,7 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
         &prover_data.codeword,
         &prover_data.merkle_tree,
         l0_num_lanes,
+        lane_major,
         round0,
         challenger,
     );
@@ -1130,7 +1129,7 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
     // the jagged point is `rotate_lane_point(ris ‖ bits(y))`, which puts the
     // varying `bits(y)` block in the MIDDLE — `f_hat_t_batch_y_split` is the
     // same batched evaluator with a fixed high block after it.
-    let b_tilde: Vec<F128> = if lane_grid {
+    let b_tilde: Vec<F128> = if lane_major {
         // `rotate_lane_point(ris ‖ bits(y))` = `ris[k..] ‖ bits(y) ‖ ris[..k]`.
         let k = lig_config.initial_k;
         jagged::f_hat_t_batch_y_split(
@@ -1157,7 +1156,7 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
     let r_extra = challenger.sample_f128_vec(yr_log_n);
     let mut z_index = ris;
     z_index.extend_from_slice(&r_extra);
-    if lane_grid {
+    if lane_major {
         z_index = rotate_lane_point(&z_index, lig_config.initial_k);
     }
     let jagged_assist =

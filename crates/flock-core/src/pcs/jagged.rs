@@ -375,14 +375,35 @@ fn generate_f_and_claim(
 /// are bit-identical to a separate `Σ q_0·W_0` pass. Feeds the fused
 /// jagged→Ligerito opening (`pcs::open_batch_jagged_ligerito`), which
 /// discharges `⟨q, W⟩ = v` directly in Ligerito with `W` as the basis.
-/// Round-0 sumcheck prime `(u_0, u_2)` of `Σ_e q(e)·W(e)` for a `(q, W)` pair
-/// already permuted into Ligerito's lane-grid order (high-bit lanes — see
-/// `pcs::commit::lane_grid_from_lane_major`). The claim `v` is
-/// permutation-invariant; only the LSB pairing the prime is taken over
-/// changes, so [`weight_table_claim_and_round0`]'s fused prime does not carry
-/// over and is recomputed here from the permuted pair.
-pub(crate) fn round0_prime_permuted(q: &[F128], w: &[F128], v: F128) -> (F128, F128) {
-    let (g_one, g_inf) = round_msg_par(q, w);
+/// Round-0 sumcheck prime `(u_0, u_2)` of `Σ_e q(e)·W(e)` under the BLOCKED
+/// pairing of block size `d` — output block `c` pairs input blocks `2c` and
+/// `2c+1` — which is what L0 binds when the committed stack is lane-major
+/// (high-bit lanes; see `ligerito::fold_and_msg_blocked`).
+///
+/// The claim `v` is pairing-invariant, so only the message changes:
+/// [`weight_table_claim_and_round0`]'s fused prime is taken over the element
+/// pairing and does not carry over.
+pub(crate) fn round0_prime_blocked(q: &[F128], w: &[F128], v: F128, d: usize) -> (F128, F128) {
+    use rayon::prelude::*;
+    if d == 1 {
+        let (g_one, g_inf) = round_msg_par(q, w);
+        return (v + g_one, g_inf);
+    }
+    let (g_one, g_inf) = q
+        .par_chunks(2 * d)
+        .zip(w.par_chunks(2 * d))
+        .map(|(qc, wc)| {
+            let (q0, q1) = qc.split_at(d);
+            let (w0, w1) = wc.split_at(d);
+            let mut g1 = F128::ZERO;
+            let mut gi = F128::ZERO;
+            for i in 0..d {
+                g1 += q1[i] * w1[i];
+                gi += (q0[i] + q1[i]) * (w0[i] + w1[i]);
+            }
+            (g1, gi)
+        })
+        .reduce(|| (F128::ZERO, F128::ZERO), |(a, b), (c, e)| (a + c, b + e));
     (v + g_one, g_inf)
 }
 

@@ -2624,6 +2624,123 @@ fn fold_and_msg_lsb(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>, S
     (nf, nb, SumcheckMessage { u_0, u_2 })
 }
 
+/// Fused **blocked** fold + next-round message: view `f`/`b` as blocks of `d`
+/// and bind the LOW bit of the BLOCK index, so output block `c` combines input
+/// blocks `2c` and `2c+1`:
+///
+/// ```text
+///   out[c·d + p] = a[2c·d + p] + r·(a[(2c+1)·d + p] + a[2c·d + p])
+/// ```
+///
+/// `d = 1` is exactly [`fold_and_msg_lsb`] (and delegates to it, keeping the
+/// tuned interleaved kernel on the power-of-two path).
+///
+/// **Why:** under the high-bit-lane commit the dense stack is LANE-MAJOR —
+/// lane `l` is the contiguous block `q[l·D .. (l+1)·D)` — so the lane variable
+/// Ligerito must bind first sits in the HIGH index bits, not the low ones.
+/// Folding at block granularity `d = D` binds exactly those bits, in the same
+/// order and with the same eq weights as folding the rotated array
+/// element-wise would. That makes the rotation a matter of ADDRESSING rather
+/// than DATA: no `2^m`-word transpose of `q` and `W_ρ` (2 × 134 MB of traffic
+/// plus two big allocations at `M = 30`), and the emitted proof is
+/// byte-identical either way — see `pcs::open_batch_jagged_ligerito`.
+fn fold_and_msg_blocked(
+    f: &[F128],
+    b: &[F128],
+    r: F128,
+    d: usize,
+) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
+    use rayon::prelude::*;
+
+    if d == 1 {
+        return fold_and_msg_lsb(f, b, r);
+    }
+    let n = f.len();
+    debug_assert!(n.is_power_of_two() && n >= 2 * d);
+    debug_assert_eq!(b.len(), n);
+    let half = n / 2;
+    let blocks_out = half / d;
+
+    // Combine one aligned run: `out = lo + r·(hi + lo)`.
+    let combine = |out: &mut [F128], lo: &[F128], hi: &[F128]| {
+        for ((o, &l), &h) in out.iter_mut().zip(lo).zip(hi) {
+            *o = l + r * (h + l);
+        }
+    };
+
+    let mut nf = crate::scratch::take_f128(half);
+    let mut nb = crate::scratch::take_f128(half);
+
+    if blocks_out == 1 {
+        // Last blocked round: one output block, so the NEXT round pairs
+        // elements — fold, then take the ordinary LSB message over the result.
+        const CH: usize = 2048;
+        nf.par_chunks_mut(CH)
+            .zip(nb.par_chunks_mut(CH))
+            .enumerate()
+            .for_each(|(ci, (fc, bc))| {
+                let o = ci * CH;
+                let len = fc.len();
+                combine(fc, &f[o..o + len], &f[d + o..d + o + len]);
+                combine(bc, &b[o..o + len], &b[d + o..d + o + len]);
+            });
+        let msg = round_msg_lsb(&nf, &nb);
+        return (nf, nb, msg);
+    }
+
+    // Each task owns one PAIR of output blocks — the unit the next round's
+    // message pairs over — so fold and message fuse into a single pass. The
+    // inner nesting keeps the parallelism fine-grained even in late rounds,
+    // where there are few block pairs but each is still large.
+    const CH: usize = 2048;
+    let (u_0, u_2) = nf
+        .par_chunks_mut(2 * d)
+        .zip(nb.par_chunks_mut(2 * d))
+        .enumerate()
+        .map(|(q, (nfc, nbc))| {
+            let (nf0, nf1) = nfc.split_at_mut(d);
+            let (nb0, nb1) = nbc.split_at_mut(d);
+            let base = 4 * q * d;
+            nf0.par_chunks_mut(CH)
+                .zip(nf1.par_chunks_mut(CH))
+                .zip(nb0.par_chunks_mut(CH))
+                .zip(nb1.par_chunks_mut(CH))
+                .enumerate()
+                .map(|(ci, (((f0, f1), b0), b1))| {
+                    let o = ci * CH;
+                    let len = f0.len();
+                    combine(f0, &f[base + o..base + o + len], &f[base + d + o..][..len]);
+                    combine(
+                        f1,
+                        &f[base + 2 * d + o..][..len],
+                        &f[base + 3 * d + o..][..len],
+                    );
+                    combine(b0, &b[base + o..base + o + len], &b[base + d + o..][..len]);
+                    combine(
+                        b1,
+                        &b[base + 2 * d + o..][..len],
+                        &b[base + 3 * d + o..][..len],
+                    );
+                    let mut u0 = F128::ZERO;
+                    let mut u2 = F128::ZERO;
+                    for i in 0..len {
+                        u0 += f0[i] * b0[i];
+                        u2 += (f0[i] + f1[i]) * (b0[i] + b1[i]);
+                    }
+                    (u0, u2)
+                })
+                .reduce(
+                    || (F128::ZERO, F128::ZERO),
+                    |(a0, a2), (c0, c2)| (a0 + c0, a2 + c2),
+                )
+        })
+        .reduce(
+            || (F128::ZERO, F128::ZERO),
+            |(a0, a2), (c0, c2)| (a0 + c0, a2 + c2),
+        );
+    (nf, nb, SumcheckMessage { u_0, u_2 })
+}
+
 pub struct SumcheckProver {
     f: Vec<F128>,
     /// Single combined basis poly. After every `glue(β)`, the introduced
@@ -2675,10 +2792,17 @@ impl SumcheckProver {
     }
 
     pub fn fold(&mut self, r: F128) -> SumcheckMessage {
+        self.fold_blocked(r, 1)
+    }
+
+    /// [`Self::fold`] binding the low bit of the BLOCK index for block size
+    /// `d` (`d = 1` is [`Self::fold`] itself) — see [`fold_and_msg_blocked`].
+    /// Used for L0's lane folds under a lane-major (high-bit-lane) witness.
+    pub fn fold_blocked(&mut self, r: F128, d: usize) -> SumcheckMessage {
         // Fused: fold f and combined_basis at r AND build the next-round
         // message in one parallel pass (was three passes). See
         // [`fold_and_msg_lsb`].
-        let (nf, nb, msg) = fold_and_msg_lsb(&self.f, &self.combined_basis, r);
+        let (nf, nb, msg) = fold_and_msg_blocked(&self.f, &self.combined_basis, r, d);
         // On x86_64, recycle the just-consumed buffers into the scratch pool
         // (same ownership as the Drop impl) so the next round's
         // `fold_and_msg_lsb` takes resident pages. aarch64 measured slower with
@@ -2969,6 +3093,7 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
         l0_codeword,
         l0_tree,
         1usize << config.initial_k,
+        false,
         None,
         challenger,
     )
@@ -2999,6 +3124,7 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
         l0_codeword,
         l0_tree,
         1usize << config.initial_k,
+        false,
         Some(SumcheckMessage {
             u_0: round0_uv.0,
             u_2: round0_uv.1,
@@ -3032,6 +3158,7 @@ pub(crate) fn recursive_prover_with_basis_precomputed_round0_fused<Ch: Challenge
     l0_codeword: &[F128],
     l0_tree: &[Hash],
     l0_num_lanes: usize,
+    l0_lane_major: bool,
     round0_uv: (F128, F128),
     challenger: &mut Ch,
 ) -> (LigeritoProof, Vec<F128>) {
@@ -3043,6 +3170,7 @@ pub(crate) fn recursive_prover_with_basis_precomputed_round0_fused<Ch: Challenge
         l0_codeword,
         l0_tree,
         l0_num_lanes,
+        l0_lane_major,
         Some(SumcheckMessage {
             u_0: round0_uv.0,
             u_2: round0_uv.1,
@@ -3074,6 +3202,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     l0_codeword: &[F128],
     l0_tree: &[Hash],
     l0_num_lanes: usize,
+    l0_lane_major: bool,
     first_msg: Option<SumcheckMessage>,
     challenger: &mut Ch,
 ) -> (LigeritoProof, Vec<F128>) {
@@ -3099,6 +3228,15 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let num_interleaved_0 = l0_num_lanes;
     assert!(num_interleaved_0 >= 1 && num_interleaved_0 <= 1usize << initial_k);
     assert_eq!(l0_codeword.len(), block_len_0 * num_interleaved_0);
+    // Lane-major witness (high-bit lanes): the lane variable lives in the HIGH
+    // index bits, so L0's lane folds bind the low bit of the BLOCK index at
+    // block size `2^log_msg_cols_0` instead of pairing adjacent elements. Same
+    // challenges, same messages, no transpose — see `fold_and_msg_blocked`.
+    let l0_fold_block = if l0_lane_major {
+        1usize << log_msg_cols_0
+    } else {
+        1
+    };
     assert_eq!(l0_tree.len(), 2 * block_len_0 - 1);
 
     let trace = std::env::var("LIG_PROVE_TRACE").is_ok();
@@ -3165,7 +3303,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             fold_grinding_nonces.push(challenger.grind_pow(bits));
         }
         let r = challenger.sample_f128();
-        let msg = sc_prover.fold(r);
+        let msg = sc_prover.fold_blocked(r, l0_fold_block);
         challenger.observe_f128(msg.u_0);
         challenger.observe_f128(msg.u_2);
         r_lane_fold.push(r);
