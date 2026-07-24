@@ -941,3 +941,379 @@ fn mixed_m30_throughput() {
         union.packed_len().trailing_zeros()
     );
 }
+
+/// CONTROL — the pure cost of the multitable MACHINERY on IDENTICAL work.
+///
+/// Fix total invocations `2N = 2^16 = 65536`. A single DIRECT BLAKE3 proof of
+/// all `2N` compressions (m = 30, the "before multitable" path) is the
+/// baseline; a UNION proof of two BLAKE3 tables at `N = 32768` each (M = 30)
+/// proves the SAME total computation through the union structure — jagged
+/// commit + fused transport + multi-slot union zerocheck/lincheck. Same work
+/// on both sides, so the union/direct ratio is purely the machinery overhead,
+/// with none of the confounds of `mixed_m30_throughput` (which compares a
+/// mixed proof against the SUM of two DIFFERENT single-type proofs). Two more
+/// rows separate the pieces of that overhead:
+///   1. DIRECT BLAKE3, 2N = 65536 blocks (m = 30) — baseline
+///      (`prove_fast_ligerito_from_witness` / `verify_ligerito`).
+///   2. UNION, two BLAKE3 tables, N = 32768 each (nu = 15, M = 30) — the
+///      multitable version of the identical 2N work (two slots).
+///   3. UNION, single BLAKE3 table, 2N = 65536 (nu = 16, M = 30) — one table
+///      through the union path: isolates "union machinery" from "two slots".
+///   4. JAGGED, single BLAKE3, 2N = 65536 (m = 30) — the Phase-1 single-table
+///      jagged path (`prove_fast_ligerito_jagged_from_witness`), on the same
+///      axis.
+///
+/// All four commit the same 2^23-word domain (asserted/reported below), so
+/// prove/proof/verify are directly comparable. Warm-up + best-of-2 per row;
+/// the timed region is prove INCLUDING witness generation, matching
+/// `jagged_throughput`'s accounting. Big buffers drop between rows (~2 GB
+/// scale). Informational — no timing assertions. Run with `cargo test
+/// --release -p flock-prover --test union_mixed -- --ignored --nocapture
+/// two_blake3_tables_vs_direct`.
+#[test]
+#[ignore] // Heavy (m = 30, ~2 GB) + informational — run explicitly with --ignored --nocapture
+fn two_blake3_tables_vs_direct() {
+    use std::time::Instant;
+
+    const ITERS: usize = 2; // timed runs after one warm-up; best reported
+    let n_total = 1usize << 16; // 2N = 65536 total BLAKE3 compressions
+
+    // Shared inputs: 65536 BLAKE3 compressions. The two-table row proves the
+    // two halves (32768 + 32768); every single-table row proves all 65536 —
+    // identical total computation across all four rows.
+    let mut rng = Rng::new(0x2B_1A_B3_2B);
+    let blake3_inputs = random_blake3_inputs(&mut rng, n_total);
+
+    // ---- (1) DIRECT BLAKE3, 2N blocks (m = 30). The pre-multitable baseline.
+    let (direct_ms, direct_bytes, direct_verify_ms, direct_committed) = {
+        let setup = blake3::Blake3Setup::new_batch_major(n_total);
+        assert_eq!(setup.m(), 30, "2N = 65536 blocks must land on m = 30");
+        let circuit = setup.r1cs.csc_lincheck_circuit();
+        // Untimed warm-up (hot scratch pool).
+        {
+            let (z, a, b, stripe) =
+                blake3::generate_witness_batch_major(&blake3_inputs, setup.n_blocks_log());
+            let mut ch = FsChallenger::new(DOMAIN);
+            let _ = prover::prove_fast_ligerito_from_witness(
+                &setup.r1cs,
+                &setup.pcs_params,
+                z,
+                a,
+                b,
+                stripe,
+                circuit,
+                None,
+                &mut ch,
+            );
+        }
+        let mut best = f64::INFINITY;
+        let mut out = None;
+        for _ in 0..ITERS {
+            let mut ch = FsChallenger::new(DOMAIN);
+            let t = Instant::now();
+            let (z, a, b, stripe) =
+                blake3::generate_witness_batch_major(&blake3_inputs, setup.n_blocks_log());
+            let o = prover::prove_fast_ligerito_from_witness(
+                &setup.r1cs,
+                &setup.pcs_params,
+                z,
+                a,
+                b,
+                stripe,
+                circuit,
+                None,
+                &mut ch,
+            );
+            best = best.min(t.elapsed().as_secs_f64() * 1e3);
+            out = Some(o);
+        }
+        let (proof, comm, _) = out.unwrap();
+        let bytes = bincode::serialize(&proof).unwrap().len();
+        let t = Instant::now();
+        let mut ch = FsChallenger::new(DOMAIN);
+        verifier::verify_ligerito(
+            &setup.r1cs,
+            &comm,
+            &proof,
+            circuit,
+            &setup.pcs_params,
+            &mut ch,
+        )
+        .expect("direct verify rejected honest proof");
+        let v_ms = t.elapsed().as_secs_f64() * 1e3;
+        (best, bytes, v_ms, 1usize << (setup.m() - 7))
+    };
+
+    // ---- (2) UNION, two BLAKE3 tables, N = 32768 each (nu = 15, M = 30).
+    // The multitable version of the identical 2N work — two slots.
+    let (u2_ms, u2_bytes, u2_verify_ms, u2_committed) = {
+        let nu = 15usize;
+        let n_per = 1usize << nu; // 32768 per table (full utilization)
+        let b3_r1cs = blake3::build_block_r1cs(nu);
+        // Two IDENTICAL BLAKE3 types. The registry sort is stable and does NOT
+        // dedup, so two equal types yield two slots (asserted below).
+        let registry = Registry::new(
+            vec![
+                TableType::from_block_r1cs(&b3_r1cs),
+                TableType::from_block_r1cs(&b3_r1cs),
+            ],
+            nu,
+        );
+        assert_eq!(
+            registry.num_types(),
+            2,
+            "two identical BLAKE3 types must yield two slots (no dedup)"
+        );
+        assert_eq!(registry.m_total(), 30, "two nu=15 BLAKE3 slots => M = 30");
+        let union = UnionInstance::new(&registry, vec![n_per, n_per]);
+        let pcs_params = union_pcs_params(&union);
+        // Full utilization: the dense stack rounds back to the padded 2^23-word
+        // commit, so dense_m lands on the embedded m30 Ligerito config.
+        assert_eq!(union.dense_words(), (121 + 121) << nu);
+        assert_eq!(union.dense_m(), 30);
+        assert_eq!(pcs_params.m, 30);
+        let circuit = b3_r1cs.csc_lincheck_circuit();
+        flock_core::scratch::prewarm_prover(registry.m_total());
+        let (lo, hi) = blake3_inputs.split_at(n_per);
+        // Untimed warm-up.
+        {
+            let slots = vec![
+                UnionSlotProverInput::new(blake3::generate_witness_batch_major(lo, nu), circuit),
+                UnionSlotProverInput::new(blake3::generate_witness_batch_major(hi, nu), circuit),
+            ];
+            let mut ch = FsChallenger::new(DOMAIN);
+            let _ = prover::prove_fast_ligerito_jagged_union(&union, &pcs_params, slots, &mut ch);
+        }
+        let mut best = f64::INFINITY;
+        let mut out = None;
+        for _ in 0..ITERS {
+            let slots = vec![
+                UnionSlotProverInput::new(blake3::generate_witness_batch_major(lo, nu), circuit),
+                UnionSlotProverInput::new(blake3::generate_witness_batch_major(hi, nu), circuit),
+            ];
+            let mut ch = FsChallenger::new(DOMAIN);
+            let t = Instant::now();
+            let o = prover::prove_fast_ligerito_jagged_union(&union, &pcs_params, slots, &mut ch);
+            best = best.min(t.elapsed().as_secs_f64() * 1e3);
+            out = Some(o);
+        }
+        let (proof, comm, _) = out.unwrap();
+        let bytes = bincode::serialize(&proof).unwrap().len();
+        let circuits: [&dyn LincheckCircuit; 2] = [circuit, circuit];
+        let t = Instant::now();
+        let mut ch = FsChallenger::new(DOMAIN);
+        verifier::verify_ligerito_jagged_union(
+            &union,
+            &circuits,
+            &comm,
+            &proof,
+            &pcs_params,
+            &mut ch,
+        )
+        .expect("union two-table verify rejected honest proof");
+        let v_ms = t.elapsed().as_secs_f64() * 1e3;
+        (best, bytes, v_ms, union.committed_words())
+    };
+
+    // ---- (3) UNION, single BLAKE3 table, 2N = 65536 (nu = 16, M = 30).
+    // One table through the union path — separates "union machinery" from
+    // "two slots specifically."
+    let (u1_ms, u1_bytes, u1_verify_ms, u1_committed) = {
+        let nu = 16usize;
+        let b3_r1cs = blake3::build_block_r1cs(nu);
+        let registry = Registry::new(vec![TableType::from_block_r1cs(&b3_r1cs)], nu);
+        assert_eq!(registry.m_total(), 30, "one nu=16 BLAKE3 slot => M = 30");
+        let union = UnionInstance::new(&registry, vec![n_total]);
+        let pcs_params = union_pcs_params(&union);
+        assert_eq!(union.dense_m(), 30);
+        assert_eq!(pcs_params.m, 30);
+        let circuit = b3_r1cs.csc_lincheck_circuit();
+        flock_core::scratch::prewarm_prover(registry.m_total());
+        // Untimed warm-up.
+        {
+            let slots = vec![UnionSlotProverInput::new(
+                blake3::generate_witness_batch_major(&blake3_inputs, nu),
+                circuit,
+            )];
+            let mut ch = FsChallenger::new(DOMAIN);
+            let _ = prover::prove_fast_ligerito_jagged_union(&union, &pcs_params, slots, &mut ch);
+        }
+        let mut best = f64::INFINITY;
+        let mut out = None;
+        for _ in 0..ITERS {
+            let slots = vec![UnionSlotProverInput::new(
+                blake3::generate_witness_batch_major(&blake3_inputs, nu),
+                circuit,
+            )];
+            let mut ch = FsChallenger::new(DOMAIN);
+            let t = Instant::now();
+            let o = prover::prove_fast_ligerito_jagged_union(&union, &pcs_params, slots, &mut ch);
+            best = best.min(t.elapsed().as_secs_f64() * 1e3);
+            out = Some(o);
+        }
+        let (proof, comm, _) = out.unwrap();
+        let bytes = bincode::serialize(&proof).unwrap().len();
+        let circuits: [&dyn LincheckCircuit; 1] = [circuit];
+        let t = Instant::now();
+        let mut ch = FsChallenger::new(DOMAIN);
+        verifier::verify_ligerito_jagged_union(
+            &union,
+            &circuits,
+            &comm,
+            &proof,
+            &pcs_params,
+            &mut ch,
+        )
+        .expect("union single-table verify rejected honest proof");
+        let v_ms = t.elapsed().as_secs_f64() * 1e3;
+        (best, bytes, v_ms, union.committed_words())
+    };
+
+    // ---- (4) JAGGED, single BLAKE3, 2N = 65536 (m = 30). The Phase-1
+    // single-table jagged path, on the same axis.
+    let (jag_ms, jag_bytes, jag_verify_ms, jag_committed) = {
+        let setup = blake3::Blake3Setup::new_batch_major(n_total);
+        let circuit = setup.r1cs.csc_lincheck_circuit();
+        // Untimed warm-up.
+        {
+            let (z, a, b, stripe) =
+                blake3::generate_witness_batch_major(&blake3_inputs, setup.n_blocks_log());
+            let mut ch = FsChallenger::new(DOMAIN);
+            let _ = prover::prove_fast_ligerito_jagged_from_witness(
+                &setup.r1cs,
+                &setup.pcs_params,
+                z,
+                a,
+                b,
+                stripe,
+                circuit,
+                None,
+                &mut ch,
+            );
+        }
+        let mut best = f64::INFINITY;
+        let mut out = None;
+        for _ in 0..ITERS {
+            let mut ch = FsChallenger::new(DOMAIN);
+            let t = Instant::now();
+            let (z, a, b, stripe) =
+                blake3::generate_witness_batch_major(&blake3_inputs, setup.n_blocks_log());
+            let o = prover::prove_fast_ligerito_jagged_from_witness(
+                &setup.r1cs,
+                &setup.pcs_params,
+                z,
+                a,
+                b,
+                stripe,
+                circuit,
+                None,
+                &mut ch,
+            );
+            best = best.min(t.elapsed().as_secs_f64() * 1e3);
+            out = Some(o);
+        }
+        let (proof, comm, _) = out.unwrap();
+        let bytes = bincode::serialize(&proof).unwrap().len();
+        let t = Instant::now();
+        let mut ch = FsChallenger::new(DOMAIN);
+        verifier::verify_ligerito_jagged(
+            &setup.r1cs,
+            &comm,
+            &proof,
+            circuit,
+            &setup.pcs_params,
+            &mut ch,
+        )
+        .expect("jagged verify rejected honest proof");
+        let v_ms = t.elapsed().as_secs_f64() * 1e3;
+        (best, bytes, v_ms, 1usize << (setup.m() - 7))
+    };
+
+    // ---- Report.
+    let committed_all_equal = direct_committed == u2_committed
+        && u2_committed == u1_committed
+        && u1_committed == jag_committed;
+    println!(
+        "\ntwo-blake3-table control: 2N = {n_total} total invocations, \
+         best-of-{ITERS} (prove incl. witgen)\n"
+    );
+    println!(
+        "  {:<40} {:>10} {:>12} {:>11} {:>16}",
+        "row", "prove ms", "proof B", "verify ms", "committed words"
+    );
+    let print_row = |label: &str, ms: f64, bytes: usize, v_ms: f64, committed: usize| {
+        println!(
+            "  {:<40} {:>10.0} {:>12} {:>11.1} {:>10} (2^{})",
+            label,
+            ms,
+            bytes,
+            v_ms,
+            committed,
+            committed.trailing_zeros()
+        );
+    };
+    print_row(
+        "(1) DIRECT blake3 2N (m=30, baseline)",
+        direct_ms,
+        direct_bytes,
+        direct_verify_ms,
+        direct_committed,
+    );
+    print_row(
+        "(2) UNION two blake3 tables N+N (M=30)",
+        u2_ms,
+        u2_bytes,
+        u2_verify_ms,
+        u2_committed,
+    );
+    print_row(
+        "(3) UNION single blake3 2N (M=30)",
+        u1_ms,
+        u1_bytes,
+        u1_verify_ms,
+        u1_committed,
+    );
+    print_row(
+        "(4) JAGGED single blake3 2N (m=30)",
+        jag_ms,
+        jag_bytes,
+        jag_verify_ms,
+        jag_committed,
+    );
+
+    println!(
+        "\n  committed sizes {} across all four rows{}",
+        if committed_all_equal {
+            "MATCH (2^23 words)"
+        } else {
+            "DIFFER"
+        },
+        if committed_all_equal {
+            " — prove/proof/verify are directly comparable"
+        } else {
+            " — ratios below span DIFFERENT committed domains, interpret with care"
+        }
+    );
+
+    // ---- Ratios vs the direct baseline (#1): the machinery overhead for
+    // identical work.
+    println!("\n  RATIOS vs (1) DIRECT baseline — machinery overhead on identical work:");
+    println!(
+        "    prove : (2)/(1) = {:.2}   (3)/(1) = {:.2}   (4)/(1) = {:.2}",
+        u2_ms / direct_ms,
+        u1_ms / direct_ms,
+        jag_ms / direct_ms
+    );
+    println!(
+        "    proof : (2)/(1) = {:.2}   (3)/(1) = {:.2}   (4)/(1) = {:.2}",
+        u2_bytes as f64 / direct_bytes as f64,
+        u1_bytes as f64 / direct_bytes as f64,
+        jag_bytes as f64 / direct_bytes as f64
+    );
+    println!(
+        "    verify: (2)/(1) = {:.2}   (3)/(1) = {:.2}   (4)/(1) = {:.2}",
+        u2_verify_ms / direct_verify_ms,
+        u1_verify_ms / direct_verify_ms,
+        jag_verify_ms / direct_verify_ms
+    );
+}
