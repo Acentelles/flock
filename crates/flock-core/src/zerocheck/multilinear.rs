@@ -456,13 +456,25 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
     mlv_challenges: &[F128],
     padding: &PaddingSpec,
 ) -> (Vec<F128>, Vec<F128>, F128, F128) {
-    use rayon::prelude::*;
-
-    // Multi-run specs have no periodic per-block skip pattern; route them to
-    // the general run-list path. The single-run fast path below is
-    // byte-identical to the pre-run-list kernel.
-    let Some(run) = padding.as_single_run() else {
-        return uni_skip_fold_and_round_pair_runs(
+    match padding.as_single_run() {
+        // Single run: the block structure is periodic, so a pair is dead iff
+        // its WITHIN-BLOCK index is past the useful prefix.
+        Some(run) => {
+            let (mask, useful_pairs_inclusive) = round2_pair_skip(&run, k_skip);
+            fold_and_round_pair_kernel(
+                a_packed,
+                b_packed,
+                m,
+                k_skip,
+                table,
+                mlv_challenges,
+                move |pair| (pair & mask) >= useful_pairs_inclusive,
+                true,
+            )
+        }
+        // Multi-run (the multi-table slot schedule): no periodic pattern, so
+        // the predicate comes from a precomputed per-pair table instead.
+        None => uni_skip_fold_and_round_pair_runs(
             a_packed,
             b_packed,
             m,
@@ -471,8 +483,55 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
             mlv_challenges,
             padding,
             true,
-        );
-    };
+        ),
+    }
+}
+
+/// Zero a dead pair's four output slots. The fold buffers are allocated
+/// uninit, so every slot not folded into must be written — unless the caller
+/// reads only the useful intervals (`write_dead = false`).
+#[inline(always)]
+fn kill_pair(a: &mut [F128], b: &mut [F128], x0l: usize, x1l: usize, write_dead: bool) {
+    if write_dead {
+        for idx in [x0l, x1l] {
+            a[idx] = F128::ZERO;
+            b[idx] = F128::ZERO;
+        }
+    }
+}
+
+/// The round-2 fused fold + message kernel, shared by BOTH padding regimes.
+///
+/// `is_dead(pair)` decides, for a GLOBAL post-URM pair index, whether that
+/// pair's window is entirely padding — the only thing the single-run and
+/// run-list paths ever disagreed about. Everything else (the per-row fold, the
+/// eq weighting, the parallel-over-`x_hi` structure, the accumulator
+/// reduction) is common, so the arch-specific SIMD row folds live here ONCE
+/// and both regimes get them.
+///
+/// They used to be two copies, and the run-list copy never received the
+/// NEON / AVX-512 row folds — it ran `UniSkipFoldTable::fold_one_row` scalar.
+/// At `M = 30` that cost every multi-run zerocheck ~4.6 ms in this round
+/// (11.2 vs 6.6 ms) for bit-identical output, which is most of the multi-table
+/// zerocheck's overhead over the single-table path.
+///
+/// `write_dead`: when true, dead pairs are zero-filled so the whole output is
+/// valid; when false (the M6 sparse-tail prover) they are left untouched and
+/// the caller reads only the useful intervals.
+fn fold_and_round_pair_kernel<D>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    is_dead: D,
+    write_dead: bool,
+) -> (Vec<F128>, Vec<F128>, F128, F128)
+where
+    D: Fn(usize) -> bool + Sync,
+{
+    use rayon::prelude::*;
 
     assert_eq!(
         k_skip, 6,
@@ -500,7 +559,6 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
     let chunk_size = 2 * lo_size;
     let eq_hi = &eq.hi;
     let eq_lo = &eq.lo;
-    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(&run, k_skip);
 
     // Parallel: each worker writes one disjoint chunk of a_folded/b_folded
     // and returns its (sum1, sum_inf) contribution. Reduce by F128 XOR.
@@ -523,13 +581,10 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
                 for x_lo in 0..lo_size {
                     let x0l = 2 * x_lo;
                     let x1l = x0l + 1;
-                    if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
+                    if is_dead(pair_idx_base + x_lo) {
                         // Padding hole: write zero (a_folded/b_folded were alloc'd
                         // uninit, so we have to write every slot we don't fold into).
-                        a_chunk[x0l] = F128::ZERO;
-                        a_chunk[x1l] = F128::ZERO;
-                        b_chunk[x0l] = F128::ZERO;
-                        b_chunk[x1l] = F128::ZERO;
+                        kill_pair(a_chunk, b_chunk, x0l, x1l, write_dead);
                         continue;
                     }
                     let x0g = base + 2 * x_lo;
@@ -576,11 +631,8 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
                         let pair = x_lo + lane;
                         let x0l = 2 * pair;
                         let x1l = x0l + 1;
-                        if ((pair_idx_base + pair) & pair_in_block_mask) >= useful_pairs_inclusive {
-                            a_chunk[x0l] = F128::ZERO;
-                            a_chunk[x1l] = F128::ZERO;
-                            b_chunk[x0l] = F128::ZERO;
-                            b_chunk[x1l] = F128::ZERO;
+                        if is_dead(pair_idx_base + pair) {
+                            kill_pair(a_chunk, b_chunk, x0l, x1l, write_dead);
                             continue;
                         }
 
@@ -618,11 +670,8 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
                 while x_lo < lo_size {
                     let x0l = 2 * x_lo;
                     let x1l = x0l + 1;
-                    if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
-                        a_chunk[x0l] = F128::ZERO;
-                        a_chunk[x1l] = F128::ZERO;
-                        b_chunk[x0l] = F128::ZERO;
-                        b_chunk[x1l] = F128::ZERO;
+                    if is_dead(pair_idx_base + x_lo) {
+                        kill_pair(a_chunk, b_chunk, x0l, x1l, write_dead);
                         x_lo += 1;
                         continue;
                     }
@@ -662,12 +711,9 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
                 for x_lo in 0..lo_size {
                     let x0l = 2 * x_lo;
                     let x1l = x0l + 1;
-                    if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
+                    if is_dead(pair_idx_base + x_lo) {
                         // See aarch64 branch above for why this zero write is needed.
-                        a_chunk[x0l] = F128::ZERO;
-                        a_chunk[x1l] = F128::ZERO;
-                        b_chunk[x0l] = F128::ZERO;
-                        b_chunk[x1l] = F128::ZERO;
+                        kill_pair(a_chunk, b_chunk, x0l, x1l, write_dead);
                         continue;
                     }
                     let x0g = base + 2 * x_lo;
@@ -728,93 +774,32 @@ fn uni_skip_fold_and_round_pair_runs(
     padding: &PaddingSpec,
     write_dead: bool,
 ) -> (Vec<F128>, Vec<F128>, F128, F128) {
-    use rayon::prelude::*;
-
-    assert_eq!(
-        k_skip, 6,
-        "optimized fold-and-round_pair variant is k_skip=6 only"
-    );
-    assert_eq!(table.n_chunks, 8);
-    let n_chunks = table.n_chunks;
-    let n_out = 1usize << (m - k_skip);
-    assert_eq!(a_packed.len(), n_out * n_chunks);
-    assert_eq!(b_packed.len(), n_out * n_chunks);
-    assert_eq!(mlv_challenges.len(), m - k_skip);
     assert!(
         padding.covered_bits() <= 1usize << m,
         "PaddingSpec covers {} bits but the domain has only 2^{m}",
         padding.covered_bits()
     );
 
-    // Per-pair skip table from the run-list's useful intervals.
+    // Per-pair skip table from the run-list's useful intervals. A pair
+    // (post-URM chunks `2k`, `2k+1`) covers witness bits
+    // `[k·2^(k_skip+1), (k+1)·2^(k_skip+1))`.
     let pair_bits = 1usize << (k_skip + 1);
+    let n_out = 1usize << (m - k_skip);
     let mut pair_useful = vec![false; n_out / 2];
     for (start, end) in padding.useful_intervals() {
         pair_useful[start / pair_bits..(end - 1) / pair_bits + 1].fill(true);
     }
 
-    // See the optimized kernel for the uninit-alloc contract: every slot is
-    // either folded into or explicitly written F128::ZERO below.
-    let mut a_folded: Vec<F128> = crate::scratch::take_f128(n_out);
-    let mut b_folded: Vec<F128> = crate::scratch::take_f128(n_out);
-
-    let eq = SplitEqGhash::new(&mlv_challenges[1..]);
-    let lo_size = 1usize << eq.n_lo;
-    let hi_size = 1usize << eq.n_hi;
-    assert_eq!(lo_size * hi_size * 2, n_out);
-
-    let chunk_size = 2 * lo_size;
-    let eq_hi = &eq.hi;
-    let eq_lo = &eq.lo;
-
-    let (sum1, sum_inf) = a_folded
-        .par_chunks_mut(chunk_size)
-        .zip(b_folded.par_chunks_mut(chunk_size))
-        .enumerate()
-        .map(|(x_hi, (a_chunk, b_chunk))| {
-            let mut p1_acc = F256Unreduced::ZERO;
-            let mut pinf_acc = F256Unreduced::ZERO;
-            let pair_idx_base = x_hi * lo_size;
-            let base = x_hi * chunk_size;
-            for x_lo in 0..lo_size {
-                let x0l = 2 * x_lo;
-                let x1l = x0l + 1;
-                if !pair_useful[pair_idx_base + x_lo] {
-                    // Padding/gap hole: write zero (uninit alloc, see above),
-                    // unless the caller reads only the useful intervals.
-                    if write_dead {
-                        a_chunk[x0l] = F128::ZERO;
-                        a_chunk[x1l] = F128::ZERO;
-                        b_chunk[x0l] = F128::ZERO;
-                        b_chunk[x1l] = F128::ZERO;
-                    }
-                    continue;
-                }
-                let x0g = base + 2 * x_lo;
-                let x1g = x0g + 1;
-                let a0 = table.fold_one_row(&a_packed[x0g * n_chunks..(x0g + 1) * n_chunks]);
-                let b0 = table.fold_one_row(&b_packed[x0g * n_chunks..(x0g + 1) * n_chunks]);
-                let a1 = table.fold_one_row(&a_packed[x1g * n_chunks..(x1g + 1) * n_chunks]);
-                let b1 = table.fold_one_row(&b_packed[x1g * n_chunks..(x1g + 1) * n_chunks]);
-                a_chunk[x0l] = a0;
-                a_chunk[x1l] = a1;
-                b_chunk[x0l] = b0;
-                b_chunk[x1l] = b1;
-                let eq_l = eq_lo[x_lo];
-                let g1 = a1 * b1;
-                p1_acc ^= eq_l.mul_unreduced(g1);
-                let g_inf = (a0 + a1) * (b0 + b1);
-                pinf_acc ^= eq_l.mul_unreduced(g_inf);
-            }
-            let eq_h = eq_hi[x_hi];
-            (eq_h * p1_acc.reduce(), eq_h * pinf_acc.reduce())
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
-        );
-
-    (a_folded, b_folded, mlv_challenges[0] * sum1, sum_inf)
+    fold_and_round_pair_kernel(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        table,
+        mlv_challenges,
+        |pair| !pair_useful[pair],
+        write_dead,
+    )
 }
 
 /// [`uni_skip_fold_and_round_pair_optimized_packed_padded`]'s multi-run path
