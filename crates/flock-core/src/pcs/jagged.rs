@@ -355,6 +355,13 @@ fn fill_weight_range(
     eq_row: &[F128],
     eq_col: &[F128],
 ) {
+    if g0 >= area {
+        // Wholly past the jagged area — bulk zero instead of an eq product
+        // (and a column-cursor step) per element. Under the lane-major
+        // commit this is the stack's zero tail, i.e. whole lanes.
+        out.fill(F128::ZERO);
+        return;
+    }
     let mut col = prefix
         .partition_point(|&t| t <= g0 as u64)
         .saturating_sub(1);

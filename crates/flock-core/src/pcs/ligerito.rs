@@ -2649,6 +2649,7 @@ fn fold_and_msg_blocked(
     b: &[F128],
     r: F128,
     d: usize,
+    live_in: usize,
 ) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
     use rayon::prelude::*;
 
@@ -2660,13 +2661,42 @@ fn fold_and_msg_blocked(
     debug_assert_eq!(b.len(), n);
     let half = n / 2;
     let blocks_out = half / d;
+    // Live blocks are always a PREFIX, so the live count simply halves
+    // (rounded up) each round. Output block `c` reads input blocks `2c` and
+    // `2c+1`: `2c` is live whenever `c < live_out`, and `2c+1` is live unless
+    // `c` is the last live block of an odd-sized prefix.
+    let live_in = live_in.min(2 * blocks_out).max(1);
+    let live_out = live_in.div_ceil(2).min(blocks_out);
+    let one_plus_r = F128::ONE + r;
 
-    // Combine one aligned run: `out = lo + r·(hi + lo)`.
-    let combine = |out: &mut [F128], lo: &[F128], hi: &[F128]| {
-        for ((o, &l), &h) in out.iter_mut().zip(lo).zip(hi) {
-            *o = l + r * (h + l);
+    // Combine one aligned run: `out = lo + r·(hi + lo)`, with a DEAD `hi`
+    // read as zero (`out = lo·(1+r)`) rather than touched — dead blocks are
+    // never written, so their contents are stale, not zero.
+    let combine = |out: &mut [F128], lo: &[F128], hi: Option<&[F128]>| match hi {
+        Some(hi) => {
+            for ((o, &l), &h) in out.iter_mut().zip(lo).zip(hi) {
+                *o = l + r * (h + l);
+            }
+        }
+        None => {
+            for (o, &l) in out.iter_mut().zip(lo) {
+                *o = l * one_plus_r;
+            }
         }
     };
+    // Source runs for output block `c`, offset `o`, length `len`.
+    fn src(
+        v: &[F128],
+        d: usize,
+        live_in: usize,
+        c: usize,
+        o: usize,
+        len: usize,
+    ) -> (&[F128], Option<&[F128]>) {
+        let lo = &v[2 * c * d + o..2 * c * d + o + len];
+        let hi = (2 * c + 1 < live_in).then(|| &v[(2 * c + 1) * d + o..(2 * c + 1) * d + o + len]);
+        (lo, hi)
+    }
 
     let mut nf = crate::scratch::take_f128(half);
     let mut nb = crate::scratch::take_f128(half);
@@ -2681,8 +2711,10 @@ fn fold_and_msg_blocked(
             .for_each(|(ci, (fc, bc))| {
                 let o = ci * CH;
                 let len = fc.len();
-                combine(fc, &f[o..o + len], &f[d + o..d + o + len]);
-                combine(bc, &b[o..o + len], &b[d + o..d + o + len]);
+                let (flo, fhi) = src(f, d, live_in, 0, o, len);
+                let (blo, bhi) = src(b, d, live_in, 0, o, len);
+                combine(fc, flo, fhi);
+                combine(bc, blo, bhi);
             });
         let msg = round_msg_lsb(&nf, &nb);
         return (nf, nb, msg);
@@ -2692,15 +2724,26 @@ fn fold_and_msg_blocked(
     // message pairs over — so fold and message fuse into a single pass. The
     // inner nesting keeps the parallelism fine-grained even in late rounds,
     // where there are few block pairs but each is still large.
+    //
+    // Tasks past the live prefix are skipped ENTIRELY: their inputs are zero,
+    // so their outputs and message terms are zero, and the next round knows
+    // not to read them. That is the payoff of the high-bit-lane layout — the
+    // committed stack's zero tail is whole lanes, so `2^initial_k − t` of the
+    // L0 fold's blocks are known-zero up front (~36% of this round's work at
+    // t = 37 of 64). The final round leaves `live_out == 1`, so nothing dead
+    // survives into the L1 witness.
     const CH: usize = 2048;
+    let live_tasks = live_out.div_ceil(2);
     let (u_0, u_2) = nf
         .par_chunks_mut(2 * d)
         .zip(nb.par_chunks_mut(2 * d))
         .enumerate()
+        .take(live_tasks)
         .map(|(q, (nfc, nbc))| {
             let (nf0, nf1) = nfc.split_at_mut(d);
             let (nb0, nb1) = nbc.split_at_mut(d);
-            let base = 4 * q * d;
+            // Output blocks 2q (always live here) and 2q+1 (may be past it).
+            let odd_live = 2 * q + 1 < live_out;
             nf0.par_chunks_mut(CH)
                 .zip(nf1.par_chunks_mut(CH))
                 .zip(nb0.par_chunks_mut(CH))
@@ -2709,23 +2752,29 @@ fn fold_and_msg_blocked(
                 .map(|(ci, (((f0, f1), b0), b1))| {
                     let o = ci * CH;
                     let len = f0.len();
-                    combine(f0, &f[base + o..base + o + len], &f[base + d + o..][..len]);
-                    combine(
-                        f1,
-                        &f[base + 2 * d + o..][..len],
-                        &f[base + 3 * d + o..][..len],
-                    );
-                    combine(b0, &b[base + o..base + o + len], &b[base + d + o..][..len]);
-                    combine(
-                        b1,
-                        &b[base + 2 * d + o..][..len],
-                        &b[base + 3 * d + o..][..len],
-                    );
+                    let (flo, fhi) = src(f, d, live_in, 2 * q, o, len);
+                    let (blo, bhi) = src(b, d, live_in, 2 * q, o, len);
+                    combine(f0, flo, fhi);
+                    combine(b0, blo, bhi);
                     let mut u0 = F128::ZERO;
                     let mut u2 = F128::ZERO;
-                    for i in 0..len {
-                        u0 += f0[i] * b0[i];
-                        u2 += (f0[i] + f1[i]) * (b0[i] + b1[i]);
+                    if odd_live {
+                        let (flo, fhi) = src(f, d, live_in, 2 * q + 1, o, len);
+                        let (blo, bhi) = src(b, d, live_in, 2 * q + 1, o, len);
+                        combine(f1, flo, fhi);
+                        combine(b1, blo, bhi);
+                        for i in 0..len {
+                            u0 += f0[i] * b0[i];
+                            u2 += (f0[i] + f1[i]) * (b0[i] + b1[i]);
+                        }
+                    } else {
+                        // Odd output block is dead => reads as zero in the
+                        // next round's message: u2 term collapses to u0's.
+                        for i in 0..len {
+                            let t = f0[i] * b0[i];
+                            u0 += t;
+                            u2 += t;
+                        }
                     }
                     (u0, u2)
                 })
@@ -2792,17 +2841,18 @@ impl SumcheckProver {
     }
 
     pub fn fold(&mut self, r: F128) -> SumcheckMessage {
-        self.fold_blocked(r, 1)
+        self.fold_blocked(r, 1, usize::MAX)
     }
 
     /// [`Self::fold`] binding the low bit of the BLOCK index for block size
     /// `d` (`d = 1` is [`Self::fold`] itself) — see [`fold_and_msg_blocked`].
     /// Used for L0's lane folds under a lane-major (high-bit-lane) witness.
-    pub fn fold_blocked(&mut self, r: F128, d: usize) -> SumcheckMessage {
+    /// `live_in` is how many leading blocks are not known-zero.
+    pub fn fold_blocked(&mut self, r: F128, d: usize, live_in: usize) -> SumcheckMessage {
         // Fused: fold f and combined_basis at r AND build the next-round
         // message in one parallel pass (was three passes). See
         // [`fold_and_msg_lsb`].
-        let (nf, nb, msg) = fold_and_msg_blocked(&self.f, &self.combined_basis, r, d);
+        let (nf, nb, msg) = fold_and_msg_blocked(&self.f, &self.combined_basis, r, d, live_in);
         // On x86_64, recycle the just-consumed buffers into the scratch pool
         // (same ownership as the Drop impl) so the next round's
         // `fold_and_msg_lsb` takes resident pages. aarch64 measured slower with
@@ -3237,6 +3287,15 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     } else {
         1
     };
+    // Known-zero lanes: under the lane-major layout the committed stack's
+    // zero tail is whole lanes `[t, 2^initial_k)`, so the L0 folds can skip
+    // them outright. Halves (rounded up) each round; the prefix reaches 1 by
+    // the last, so nothing dead reaches L1.
+    let mut l0_live_blocks = if l0_lane_major {
+        l0_num_lanes
+    } else {
+        usize::MAX
+    };
     assert_eq!(l0_tree.len(), 2 * block_len_0 - 1);
 
     let trace = std::env::var("LIG_PROVE_TRACE").is_ok();
@@ -3303,7 +3362,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             fold_grinding_nonces.push(challenger.grind_pow(bits));
         }
         let r = challenger.sample_f128();
-        let msg = sc_prover.fold_blocked(r, l0_fold_block);
+        let msg = sc_prover.fold_blocked(r, l0_fold_block, l0_live_blocks);
+        l0_live_blocks = l0_live_blocks.div_ceil(2);
         challenger.observe_f128(msg.u_0);
         challenger.observe_f128(msg.u_2);
         r_lane_fold.push(r);
