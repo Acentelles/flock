@@ -282,7 +282,17 @@ impl<'r> UnionInstance<'r> {
              (dummy rows, useless columns, gaps)"
         );
         let nu = self.n_log();
-        let mut q = vec![F128::ZERO; self.committed_words()];
+        // POOLED, not `vec![F128::ZERO; …]`. A fresh 134 MB zeroed Vec at
+        // M = 30 costs ~3.0 ms to allocate and write versus ~0.6 ms for an
+        // already-resident buffer — it pays a real memset AND a soft page
+        // fault per page on first touch, which was ~2.4 ms of this gather's
+        // ~3.1 ms. The loop below writes `[0, dense_words)` exactly, so only
+        // the power-of-two pad tail needs zeroing.
+        let dense = self.dense_words();
+        let mut q = crate::scratch::take_f128(self.committed_words());
+        q[dense..]
+            .par_chunks_mut(1 << 16)
+            .for_each(|c| c.fill(F128::ZERO));
         // Hand each slot its (contiguous, disjoint) destination run, then
         // fill that run's per-column chunks in parallel.
         let mut rest: &mut [F128] = &mut q;
@@ -534,6 +544,16 @@ impl<'r> UnionInstance<'r> {
         (z, a, b)
     }
 
+    /// A fully zeroed padded union buffer from the scratch pool — resident
+    /// pages, parallel memset, no allocation tax.
+    fn take_zeroed_buffer(&self) -> Vec<F128> {
+        use rayon::prelude::*;
+
+        let mut buf = crate::scratch::take_f128(self.packed_len());
+        buf.par_chunks_mut(1 << 16).for_each(|c| c.fill(F128::ZERO));
+        buf
+    }
+
     /// Zero the words of a padded union buffer that no slot owns (the
     /// inter-slot and trailing gaps) — everything else is written by the
     /// drivers. A registry whose slots tile the address space exactly has
@@ -648,10 +668,16 @@ impl<'r> UnionInstance<'r> {
         slot_witnesses: Vec<SlotWitness>,
     ) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
         let nu = self.n_log();
-        let len = self.packed_len();
-        let mut z = vec![F128::ZERO; len];
-        let mut a = vec![F128::ZERO; len];
-        let mut b = vec![F128::ZERO; len];
+        // Pooled + parallel zero-fill rather than `vec![F128::ZERO; len]` —
+        // see `compact_witness` for the measured allocation tax. Partial-
+        // utilization slots only copy their declared prefixes, so unlike
+        // `take_witness_buffers` these must be zeroed in full, not just on
+        // the gaps.
+        let (mut z, mut a, mut b) = (
+            self.take_zeroed_buffer(),
+            self.take_zeroed_buffer(),
+            self.take_zeroed_buffer(),
+        );
         let ws = &slot_witnesses;
         // The witness contract, checked once per slot for all three buffers
         // (the per-buffer scatters below rely on it for their partial copies).
