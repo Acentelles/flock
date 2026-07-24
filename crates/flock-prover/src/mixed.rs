@@ -191,13 +191,16 @@ impl MixedSetup {
         };
         let union = self.union(counts);
         let pcs_params = self.pcs_params(counts, profile);
+        // In-place generation: each driver writes its slot's block of the
+        // padded union buffers directly — same buffers as the prebuilt +
+        // scatter form, without the copy.
         let slots = vec![
-            UnionSlotProverInput::new(
-                sha2::generate_witness_batch_major_partial(sha2_inputs, nu),
+            UnionSlotProverInput::in_place(
+                |dst| sha2::generate_witness_batch_major_partial_into(sha2_inputs, nu, dst),
                 self.sha2_r1cs.csc_lincheck_circuit(),
             ),
-            UnionSlotProverInput::new(
-                blake3::generate_witness_batch_major_partial(blake3_inputs, nu),
+            UnionSlotProverInput::in_place(
+                |dst| blake3::generate_witness_batch_major_partial_into(blake3_inputs, nu, dst),
                 self.blake3_r1cs.csc_lincheck_circuit(),
             ),
         ];

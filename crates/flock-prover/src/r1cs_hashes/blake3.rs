@@ -1748,6 +1748,43 @@ pub fn generate_witness_batch_major_partial(
     )
 }
 
+/// [`generate_witness_batch_major`] writing into a union slot's destination
+/// block instead of fresh buffers — the copy-free union assembly path (see
+/// [`flock_core::union::SlotWitnessDest`]). Returns the lincheck stripe.
+pub fn generate_witness_batch_major_into(
+    blocks: &[Compression],
+    n_blocks_log: usize,
+    dst: flock_core::union::SlotWitnessDest<'_>,
+) -> Vec<u8> {
+    let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
+    super::common::drive_witness_batch_major_into(
+        blocks,
+        &padding,
+        n_blocks_log,
+        K_LOG,
+        USEFUL_BITS,
+        dst,
+        build_group_batch_major,
+    )
+}
+
+/// [`generate_witness_batch_major_partial`] writing into a union slot's
+/// destination block — the copy-free union assembly path for dynamic counts.
+pub fn generate_witness_batch_major_partial_into(
+    blocks: &[Compression],
+    n_blocks_log: usize,
+    dst: flock_core::union::SlotWitnessDest<'_>,
+) -> Vec<u8> {
+    super::common::drive_witness_batch_major_partial_into(
+        blocks,
+        n_blocks_log,
+        K_LOG,
+        USEFUL_BITS,
+        dst,
+        build_group_batch_major,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

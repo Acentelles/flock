@@ -728,6 +728,88 @@ fn mixed_low_utilization_smoke() {
     );
 }
 
+/// In-place witness generation is BYTE-IDENTICAL to prebuilt + scatter.
+///
+/// [`UnionSlotProverInput::in_place`] hands each driver the slot's aligned
+/// block of the padded union buffers instead of letting it allocate its own
+/// — sound because a slot's BatchMajor word index `(c << nu) + row` plus
+/// `o_t >> 7` IS its union word index, so a slot's local layout is literally
+/// a contiguous union sub-block. Nothing about the witness VALUES changes,
+/// so the whole proof (commitment root + every sub-proof) must match bit for
+/// bit. The oracle for the copy-free assembly path; covers full utilization,
+/// non-power-of-two partial counts, and a zero count (whose slot block is
+/// then all dummy rows).
+#[test]
+fn in_place_generation_matches_prebuilt_byte_identical() {
+    let nu = 6usize; // M = 22, the smallest embedded Ligerito config
+    let (registry, sha2_r1cs, blake3_r1cs) = mixed_registry(nu);
+    let sha2_circuit = sha2_r1cs.csc_lincheck_circuit();
+    let blake3_circuit = blake3_r1cs.csc_lincheck_circuit();
+    let circuits: [&dyn LincheckCircuit; 2] = [sha2_circuit, blake3_circuit];
+    let mut rng = Rng::new(0x_1A_CE_2B_B3);
+
+    for counts in [[64usize, 64], [50, 37], [0, 64]] {
+        let union = UnionInstance::new(&registry, counts.to_vec());
+        let pcs_params = union_pcs_params(&union);
+        let sha2_inputs = random_sha2_inputs(&mut rng, counts[0]);
+        let blake3_inputs = random_blake3_inputs(&mut rng, counts[1]);
+
+        let prove = |slots: Vec<UnionSlotProverInput<'_>>| {
+            let mut ch = FsChallenger::new(DOMAIN);
+            let (proof, commitment, _claim) =
+                prover::prove_fast_ligerito_jagged_union(&union, &pcs_params, slots, &mut ch);
+            (
+                bincode::serialize(&proof).expect("proof serializes"),
+                commitment,
+            )
+        };
+
+        let (prebuilt_bytes, prebuilt_comm) = prove(vec![
+            UnionSlotProverInput::new(
+                sha2::generate_witness_batch_major_partial(&sha2_inputs, nu),
+                sha2_circuit,
+            ),
+            UnionSlotProverInput::new(
+                blake3::generate_witness_batch_major_partial(&blake3_inputs, nu),
+                blake3_circuit,
+            ),
+        ]);
+        let (in_place_bytes, in_place_comm) = prove(vec![
+            UnionSlotProverInput::in_place(
+                |dst| sha2::generate_witness_batch_major_partial_into(&sha2_inputs, nu, dst),
+                sha2_circuit,
+            ),
+            UnionSlotProverInput::in_place(
+                |dst| blake3::generate_witness_batch_major_partial_into(&blake3_inputs, nu, dst),
+                blake3_circuit,
+            ),
+        ]);
+
+        assert_eq!(
+            prebuilt_comm.root, in_place_comm.root,
+            "commitment root differs at counts {counts:?}"
+        );
+        assert_eq!(
+            prebuilt_bytes, in_place_bytes,
+            "proof bytes differ at counts {counts:?}"
+        );
+
+        // ...and the in-place proof really verifies (not just "same bytes").
+        let mut ch = FsChallenger::new(DOMAIN);
+        let proof: R1csProofJaggedLigerito =
+            bincode::deserialize(&in_place_bytes).expect("proof deserializes");
+        verifier::verify_ligerito_jagged_union(
+            &union,
+            &circuits,
+            &in_place_comm,
+            &proof,
+            &pcs_params,
+            &mut ch,
+        )
+        .unwrap_or_else(|e| panic!("in-place proof rejected at counts {counts:?}: {e:?}"));
+    }
+}
+
 /// M6 — the m = 30-scale MIXED throughput measurement (Phase-1 gate at
 /// production scale, the mixed-union analogue of `jagged_throughput`'s
 /// BLAKE3 m = 30 sweep). ν = 14 puts the union at M = 30; at FULL
@@ -1499,7 +1581,7 @@ fn two_blake3_phase_breakdown() {
     };
 
     // ---- (3) UNION two blake3 tables N + N (nu = 15, M = 30) ----
-    let (u2_gen, u2_pt, u2_vt, blake3_nnz) = {
+    let (u2_gen, u2_pt, u2_vt, blake3_nnz, u2ip_pt) = {
         let nu = 15usize;
         let n_per = 1usize << nu;
         let b3_r1cs = blake3::build_block_r1cs(nu);
@@ -1569,7 +1651,49 @@ fn two_blake3_phase_breakdown() {
                 best_vt = vt;
             }
         }
-        (best_gen, best_pt, best_vt, blake3_nnz)
+        // ---- (3b) SAME instance through the COPY-FREE assembly path: each
+        // driver generates straight into its block of the padded union
+        // buffers, so there is no scatter and `gen` moves inside `place`.
+        // Byte-identity is pinned by
+        // `in_place_generation_matches_prebuilt_byte_identical`.
+        let mut ip_pt = ProvePhaseTimings::default();
+        let mut ip_best = f64::INFINITY;
+        {
+            let in_place_slots = || {
+                vec![
+                    UnionSlotProverInput::in_place(
+                        |dst| blake3::generate_witness_batch_major_into(lo, nu, dst),
+                        circuit,
+                    ),
+                    UnionSlotProverInput::in_place(
+                        |dst| blake3::generate_witness_batch_major_into(hi, nu, dst),
+                        circuit,
+                    ),
+                ]
+            };
+            let mut ch = FsChallenger::new(DOMAIN);
+            let _ = prover::prove_fast_ligerito_jagged_union(
+                &union,
+                &pcs_params,
+                in_place_slots(),
+                &mut ch,
+            );
+            for _ in 0..ITERS {
+                let mut ch = FsChallenger::new(DOMAIN);
+                let (_proof, _comm, _claim, pt) = prover::prove_fast_ligerito_jagged_union_timed(
+                    &union,
+                    &pcs_params,
+                    in_place_slots(),
+                    &mut ch,
+                );
+                if p_total(&pt) < ip_best {
+                    ip_best = p_total(&pt);
+                    ip_pt = pt;
+                }
+            }
+        }
+
+        (best_gen, best_pt, best_vt, blake3_nnz, ip_pt)
     };
 
     // ---- (4) MIXED sha2 + blake3 (nu = 14, M = 30) — proved only to obtain
@@ -1636,13 +1760,16 @@ fn two_blake3_phase_breakdown() {
     // witgen column = per-hash generation (`gen`) + union assembly/compaction
     // (`pt.witness_s`, the "assemble" sub-cost, zero on the direct path). The
     // "assemble" sub-column isolates the union-specific dense-stack compaction.
-    println!("PROVE (ms):   [witgen = gen + assemble; assemble = scatter + compact]");
+    println!(
+        "PROVE (ms):   [witgen = gen + assemble; assemble = place + compact; \
+         in-place rows generate INSIDE place, so their gen is 0]"
+    );
     println!(
         "  {:<22} {:>8} {:>9} {:>8} {:>8} {:>8} {:>10} {:>9} {:>8} {:>9}",
         "row",
         "witgen",
         "(assemble",
-        "scatter",
+        "place",
         "compact)",
         "commit",
         "zerocheck",
@@ -1658,7 +1785,7 @@ fn two_blake3_phase_breakdown() {
             label,
             ms(witgen),
             ms(p.witness_s),
-            ms(p.witness_scatter_s),
+            ms(p.witness_place_s),
             ms(p.witness_compact_s),
             ms(p.commit_s),
             ms(p.zerocheck_s),
@@ -1670,6 +1797,9 @@ fn two_blake3_phase_breakdown() {
     prove_row("direct", direct_gen, &direct_pt);
     prove_row("union-single", u1_gen, &u1_pt);
     prove_row("union-two", u2_gen, &u2_pt);
+    // Copy-free assembly: `gen` is 0 because generation happens INSIDE
+    // `place` (the drivers write the union buffers directly).
+    prove_row("union-two/in-place", 0.0, &u2ip_pt);
 
     println!("\nVERIFY (ms):");
     println!(

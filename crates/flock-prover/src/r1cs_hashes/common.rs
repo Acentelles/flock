@@ -7,6 +7,7 @@ use std::sync::OnceLock;
 use flock_core::bits::transpose_8_u64s_to_64_bytes;
 use flock_core::field::F128;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
+use flock_core::union::SlotWitnessDest;
 
 /// OR the low 32 bits of `val` into `buf` starting at bit-offset `bit_off`.
 /// Handles u64 straddling when `bit_off % 64 > 32`.
@@ -508,6 +509,10 @@ pub(crate) fn add_carry_parts_v(
 ///
 /// Returns `(z, a, b, stripe)`; z/a/b come from the scratch pool with the
 /// padding suffix zeroed (the producers fully write the useful prefix).
+///
+/// Thin allocating wrapper over [`drive_witness_batch_major_into`] — the
+/// union path calls that directly with a destination inside the padded union
+/// buffers, which is what makes its assembly copy-free.
 pub(crate) fn drive_witness_batch_major<S: Sync, F>(
     inputs: &[S],
     padding: &S,
@@ -516,6 +521,46 @@ pub(crate) fn drive_witness_batch_major<S: Sync, F>(
     useful_bits: usize,
     per_group: F,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
+where
+    F: Fn([&S; BM_V], &mut [BmRow], &mut [BmRow], &mut [BmRow]) + Sync + Send,
+{
+    let total_f128 = 1usize << (n_blocks_log + k_log - 7);
+    let mut z = flock_core::scratch::take_f128(total_f128);
+    let mut a = flock_core::scratch::take_f128(total_f128);
+    let mut b = flock_core::scratch::take_f128(total_f128);
+    let stripe = drive_witness_batch_major_into(
+        inputs,
+        padding,
+        n_blocks_log,
+        k_log,
+        useful_bits,
+        SlotWitnessDest {
+            z: &mut z,
+            a: &mut a,
+            b: &mut b,
+        },
+        per_group,
+    );
+    (z, a, b, stripe)
+}
+
+/// [`drive_witness_batch_major`] writing into a caller-supplied destination —
+/// the slot's `2^{m_t−7}`-word block of the padded union buffers
+/// ([`flock_core::union::UnionInstance::slot_dests`]) — instead of its own
+/// allocations. Returns the lincheck stripe (the drivers' fourth output).
+///
+/// The destination may be dirty on entry: every word is written here (the
+/// producers cover the useful chunk-column prefix, the suffix is zeroed
+/// below), which is what [`SlotWitnessDest`]'s contract promises.
+pub(crate) fn drive_witness_batch_major_into<S: Sync, F>(
+    inputs: &[S],
+    padding: &S,
+    n_blocks_log: usize,
+    k_log: usize,
+    useful_bits: usize,
+    dst: SlotWitnessDest<'_>,
+    per_group: F,
+) -> Vec<u8>
 where
     F: Fn([&S; BM_V], &mut [BmRow], &mut [BmRow], &mut [BmRow]) + Sync + Send,
 {
@@ -529,14 +574,15 @@ where
     let useful_words = useful_bits.div_ceil(64);
     let total_f128 = n_total * (u64_per_block / 2);
 
-    let mut z = flock_core::scratch::take_f128(total_f128);
-    let mut a = flock_core::scratch::take_f128(total_f128);
-    let mut b = flock_core::scratch::take_f128(total_f128);
+    let SlotWitnessDest { z, a, b } = dst;
+    for buf in [&*z, &*a, &*b] {
+        assert_eq!(buf.len(), total_f128, "witness destination length");
+    }
     let stripe = vec![0u8; n_total * u64_per_block * 8];
     // Zero the padding suffix (contiguous chunk-columns >= useful_chunks);
     // the producers fully rewrite the useful prefix every call.
     let tail = useful_chunks << n_blocks_log;
-    for buf in [&mut z, &mut a, &mut b] {
+    for buf in [&mut *z, &mut *a, &mut *b] {
         buf[tail..]
             .par_chunks_mut(1 << 16)
             .for_each(|c| c.fill(F128::ZERO));
@@ -576,7 +622,7 @@ where
         },
     );
 
-    (z, a, b, stripe)
+    stripe
 }
 
 /// Partial-count variant of [`drive_witness_batch_major`] for the union's
@@ -598,6 +644,9 @@ where
 /// pool, so the dummy region must be written — it is committed at capacity
 /// height by the dense-stack transport and read by the kernels' dense
 /// paths).
+///
+/// Thin allocating wrapper over [`drive_witness_batch_major_partial_into`] —
+/// see [`drive_witness_batch_major`] for the same split.
 pub(crate) fn drive_witness_batch_major_partial<S: Sync, F>(
     inputs: &[S],
     n_blocks_log: usize,
@@ -605,6 +654,39 @@ pub(crate) fn drive_witness_batch_major_partial<S: Sync, F>(
     useful_bits: usize,
     per_group: F,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
+where
+    F: Fn([&S; BM_V], &mut [BmRow], &mut [BmRow], &mut [BmRow]) + Sync + Send,
+{
+    let total_f128 = 1usize << (n_blocks_log + k_log - 7);
+    let mut z = flock_core::scratch::take_f128(total_f128);
+    let mut a = flock_core::scratch::take_f128(total_f128);
+    let mut b = flock_core::scratch::take_f128(total_f128);
+    let stripe = drive_witness_batch_major_partial_into(
+        inputs,
+        n_blocks_log,
+        k_log,
+        useful_bits,
+        SlotWitnessDest {
+            z: &mut z,
+            a: &mut a,
+            b: &mut b,
+        },
+        per_group,
+    );
+    (z, a, b, stripe)
+}
+
+/// [`drive_witness_batch_major_partial`] writing into a caller-supplied
+/// destination — the union counterpart, see
+/// [`drive_witness_batch_major_into`].
+pub(crate) fn drive_witness_batch_major_partial_into<S: Sync, F>(
+    inputs: &[S],
+    n_blocks_log: usize,
+    k_log: usize,
+    useful_bits: usize,
+    dst: SlotWitnessDest<'_>,
+    per_group: F,
+) -> Vec<u8>
 where
     F: Fn([&S; BM_V], &mut [BmRow], &mut [BmRow], &mut [BmRow]) + Sync + Send,
 {
@@ -619,15 +701,16 @@ where
     let useful_words = useful_bits.div_ceil(64);
     let total_f128 = n_total * (u64_per_block / 2);
 
-    let mut z = flock_core::scratch::take_f128(total_f128);
-    let mut a = flock_core::scratch::take_f128(total_f128);
-    let mut b = flock_core::scratch::take_f128(total_f128);
+    let SlotWitnessDest { z, a, b } = dst;
+    for buf in [&*z, &*a, &*b] {
+        assert_eq!(buf.len(), total_f128, "witness destination length");
+    }
     let stripe = vec![0u8; n_total * u64_per_block * 8];
     // Zero the padding suffix (contiguous chunk-columns >= useful_chunks);
     // the loop below fully writes the useful prefix — declared rows from the
     // builders, dummy rows as zero flushes.
     let tail = useful_chunks << n_blocks_log;
-    for buf in [&mut z, &mut a, &mut b] {
+    for buf in [&mut *z, &mut *a, &mut *b] {
         buf[tail..]
             .par_chunks_mut(1 << 16)
             .for_each(|c| c.fill(F128::ZERO));
@@ -684,5 +767,5 @@ where
         },
     );
 
-    (z, a, b, stripe)
+    stripe
 }

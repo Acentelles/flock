@@ -472,10 +472,111 @@ impl<'r> UnionInstance<'r> {
         crate::proof::bind_statement(challenger, slot_r1cs, commitment);
     }
 
+    // -----------------------------------------------------------------------
+    // In-place witness generation (no scatter). A slot's BatchMajor word
+    // index `(c << nu) + row` plus `o_t >> 7` IS its union word index — the
+    // uniform-capacity convention makes `nu` the slot's own `n_log`, so a
+    // slot's local layout is literally a contiguous, aligned sub-block of
+    // the union buffer (which is why `scatter_witnesses`' full-utilization
+    // path is a single memcpy). Handing each witness driver that sub-block
+    // as its destination therefore produces the SAME padded buffer with no
+    // copy at all — 3 × 134 MB of memory traffic saved at `M = 30`.
+    // -----------------------------------------------------------------------
+
+    /// Word range of slot `t`'s aligned block in the padded union buffers.
+    pub fn slot_word_range(&self, t: usize) -> core::ops::Range<usize> {
+        let slot = &self.registry().slots()[t];
+        let start = slot.offset >> 7;
+        start..start + (1usize << (slot.m_slot - 7))
+    }
+
+    /// The three padded union witness buffers, ready for in-place generation:
+    /// pooled (already-resident) allocations whose inter-slot and trailing
+    /// GAPS are zeroed. The slot blocks are left dirty on purpose — every
+    /// witness driver fully writes its block (the producers cover the useful
+    /// chunk-column prefix, the useless-column tail and any dummy rows are
+    /// written as zeros), so after [`Self::slot_dests`] + generation the
+    /// buffers hold exactly what [`Self::assemble_witness`] would have
+    /// scattered.
+    pub fn take_witness_buffers(&self) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+        let len = self.packed_len();
+        let mut bufs = [
+            crate::scratch::take_f128(len),
+            crate::scratch::take_f128(len),
+            crate::scratch::take_f128(len),
+        ];
+        for buf in &mut bufs {
+            self.zero_gaps(buf);
+        }
+        let [z, a, b] = bufs;
+        (z, a, b)
+    }
+
+    /// Zero the words of a padded union buffer that no slot owns (the
+    /// inter-slot and trailing gaps) — everything else is written by the
+    /// drivers. A registry whose slots tile the address space exactly has
+    /// no gaps and this does nothing.
+    fn zero_gaps(&self, buf: &mut [F128]) {
+        use rayon::prelude::*;
+
+        debug_assert_eq!(buf.len(), self.packed_len());
+        let mut cursor = 0usize;
+        for t in 0..self.registry().num_types() {
+            let range = self.slot_word_range(t);
+            buf[cursor..range.start]
+                .par_chunks_mut(1 << 16)
+                .for_each(|c| c.fill(F128::ZERO));
+            cursor = range.end;
+        }
+        buf[cursor..]
+            .par_chunks_mut(1 << 16)
+            .for_each(|c| c.fill(F128::ZERO));
+    }
+
+    /// Split the three padded union buffers into one [`SlotWitnessDest`] per
+    /// slot, in slot order — the destinations the witness drivers write.
+    /// Slot blocks are disjoint and offset-ascending, so the views carve the
+    /// buffers without overlapping; the gaps between them are skipped (left
+    /// as [`Self::take_witness_buffers`] zeroed them).
+    pub fn slot_dests<'d>(
+        &self,
+        z: &'d mut [F128],
+        a: &'d mut [F128],
+        b: &'d mut [F128],
+    ) -> Vec<SlotWitnessDest<'d>> {
+        for buf in [&*z, &*a, &*b] {
+            assert_eq!(buf.len(), self.packed_len(), "padded buffer length");
+        }
+        /// Carve `words` off `rest` after skipping `skip`, keeping the
+        /// caller's lifetime (`mem::take` hands the borrow over wholesale).
+        fn carve<'d>(rest: &mut &'d mut [F128], skip: usize, words: usize) -> &'d mut [F128] {
+            let (head, tail) = core::mem::take(rest).split_at_mut(skip + words);
+            *rest = tail;
+            &mut head[skip..]
+        }
+        let (mut zr, mut ar, mut br) = (z, a, b);
+        let mut cursor = 0usize;
+        let mut dests = Vec::with_capacity(self.registry().num_types());
+        for t in 0..self.registry().num_types() {
+            let range = self.slot_word_range(t);
+            let (skip, words) = (range.start - cursor, range.end - range.start);
+            dests.push(SlotWitnessDest {
+                z: carve(&mut zr, skip, words),
+                a: carve(&mut ar, skip, words),
+                b: carve(&mut br, skip, words),
+            });
+            cursor = range.end;
+        }
+        dests
+    }
+
     /// Assemble the union witness from per-slot packed buffers: place each
     /// slot's `(z, a, b)` at its aligned word offset `o_t >> 7` in
     /// union-sized buffers (dummy regions and the gap stay zero). One bundle
     /// per registry type, in slot order.
+    ///
+    /// Prefer [`Self::take_witness_buffers`] + [`Self::slot_dests`] on the
+    /// hot path: generating in place skips this copy entirely.
     ///
     /// A single-slot registry (whose slot spans the whole address space) is
     /// a zero-copy passthrough — the returned buffers ARE the slot's,
@@ -628,6 +729,22 @@ pub struct SlotWitness {
     pub z_packed: Vec<F128>,
     pub a_packed: Vec<F128>,
     pub b_packed: Vec<F128>,
+}
+
+/// A per-slot destination view into the padded union witness buffers: the
+/// slot's aligned `2^{m_t−7}`-word block of each of `z`, `a`, `b`, handed
+/// out by [`UnionInstance::slot_dests`]. A witness driver writes these in
+/// place instead of allocating its own [`SlotWitness`] buffers, which makes
+/// the union assembly copy-free (see the module comment there).
+///
+/// **Contract:** the driver must write EVERY word of all three views —
+/// declared rows from the producers, dummy rows and useless chunk-columns as
+/// zeros. The views come from the recycled scratch pool and start out
+/// holding stale data, exactly as the drivers' own pooled buffers do.
+pub struct SlotWitnessDest<'d> {
+    pub z: &'d mut [F128],
+    pub a: &'d mut [F128],
+    pub b: &'d mut [F128],
 }
 
 #[cfg(test)]
@@ -999,6 +1116,50 @@ mod tests {
             *w = F128::ZERO;
         }
         assert_eq!(union1.compact_witness(&z1), z1);
+    }
+
+    /// In-place generation reproduces the scatter EXACTLY: gaps zeroed, each
+    /// slot's destination view carved at its aligned block. Buffers start
+    /// POISONED (as the recycled scratch pool hands them out), so any word
+    /// neither zeroed as a gap nor written by a "driver" would show up.
+    #[test]
+    fn slot_dests_reproduce_the_scatter() {
+        let reg = Registry::new(vec![ty(10, 700), ty(9, 300)], 3);
+        let union = UnionInstance::new(&reg, vec![8, 8]);
+        assert_eq!(union.packed_len(), 128);
+        // Slot A: words 0..64; slot B: 64..96; gap: 96..128.
+        assert_eq!(union.slot_word_range(0), 0..64);
+        assert_eq!(union.slot_word_range(1), 64..96);
+
+        let mut rng = Rng::new(0x51_07_DE_57);
+        let slot = |n: usize, rng: &mut Rng| SlotWitness {
+            z_packed: rng.f128_vec(n),
+            a_packed: rng.f128_vec(n),
+            b_packed: rng.f128_vec(n),
+        };
+        let (slot_a, slot_b) = (slot(64, &mut rng), slot(32, &mut rng));
+
+        let (rz, ra, rb) = union.assemble_witness(vec![slot_a.clone(), slot_b.clone()]);
+
+        let poison = F128 {
+            lo: 0xDEAD_BEEF_DEAD_BEEF,
+            hi: 0xDEAD_BEEF_DEAD_BEEF,
+        };
+        let (mut z, mut a, mut b) = (vec![poison; 128], vec![poison; 128], vec![poison; 128]);
+        for buf in [&mut z, &mut a, &mut b] {
+            union.zero_gaps(buf);
+        }
+        for (d, w) in union
+            .slot_dests(&mut z, &mut a, &mut b)
+            .into_iter()
+            .zip([&slot_a, &slot_b])
+        {
+            // What an in-place driver does: fully write its own block.
+            d.z.copy_from_slice(&w.z_packed);
+            d.a.copy_from_slice(&w.a_packed);
+            d.b.copy_from_slice(&w.b_packed);
+        }
+        assert_eq!((z, a, b), (rz, ra, rb), "in-place must match the scatter");
     }
 
     /// Single-slot witness assembly is a zero-copy passthrough: the returned

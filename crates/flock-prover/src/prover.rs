@@ -387,37 +387,138 @@ pub fn prove_fast_ligerito_jagged_from_witness<Ch: Challenger>(
     (proof, commitment, claim)
 }
 
-/// One slot's prover inputs for the union prove entry: the packed witness
-/// bundle plus the slot's lincheck stripe and circuit. One per registry
+/// One slot's prover inputs for the union prove entry: where the slot's
+/// packed witness comes from, plus its lincheck circuit. One per registry
 /// type, in slot order.
 pub struct UnionSlotProverInput<'a> {
-    /// The slot's `(z, a, b)` packed buffers (see
-    /// [`flock_core::union::SlotWitness`]).
-    pub witness: flock_core::union::SlotWitness,
-    /// The slot's lincheck stripe copy of `z` (the drivers' fourth output).
-    pub z_lincheck: Vec<u8>,
+    source: UnionSlotWitnessSource<'a>,
     /// The slot's lincheck circuit (e.g. `BlockR1cs::csc_lincheck_circuit`).
     pub lincheck_circuit: &'a dyn lincheck::LincheckCircuit,
+}
+
+/// How a slot's packed witness reaches the padded union buffers.
+enum UnionSlotWitnessSource<'a> {
+    /// Already generated into the slot's own buffers — the union assembly
+    /// COPIES them to the slot's aligned block.
+    Prebuilt {
+        witness: flock_core::union::SlotWitness,
+        z_lincheck: Vec<u8>,
+    },
+    /// Generated in place: the closure is handed the slot's block of the
+    /// union buffers and writes it directly, returning the lincheck stripe.
+    /// No copy — see [`flock_core::union::SlotWitnessDest`].
+    InPlace(Box<dyn FnOnce(flock_core::union::SlotWitnessDest<'_>) -> Vec<u8> + Send + 'a>),
 }
 
 impl<'a> UnionSlotProverInput<'a> {
     /// Wrap one slot's driver output — the `(z, a, b, stripe)` tuple of the
     /// existing batch-major witness generators (e.g.
     /// `blake3::generate_witness_batch_major`) — plus its lincheck circuit.
+    ///
+    /// The witness is copied into the union buffers. Prefer
+    /// [`Self::in_place`] on the hot path: at `M = 30` the scatter this
+    /// incurs is ~10 ms of pure memory traffic.
     pub fn new(
         (z_packed, a_packed, b_packed, z_lincheck): (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>),
         lincheck_circuit: &'a dyn lincheck::LincheckCircuit,
     ) -> Self {
         Self {
-            witness: flock_core::union::SlotWitness {
-                z_packed,
-                a_packed,
-                b_packed,
+            source: UnionSlotWitnessSource::Prebuilt {
+                witness: flock_core::union::SlotWitness {
+                    z_packed,
+                    a_packed,
+                    b_packed,
+                },
+                z_lincheck,
             },
-            z_lincheck,
             lincheck_circuit,
         }
     }
+
+    /// Generate this slot's witness DIRECTLY into the union buffers — the
+    /// copy-free assembly path. `generate` receives the slot's aligned
+    /// `2^{m_t−7}`-word block of `z`, `a`, `b` and must write every word of
+    /// it (the `*_into` drivers do), returning the lincheck stripe:
+    ///
+    /// ```ignore
+    /// UnionSlotProverInput::in_place(
+    ///     |dst| blake3::generate_witness_batch_major_partial_into(blocks, nu, dst),
+    ///     circuit,
+    /// )
+    /// ```
+    ///
+    /// Produces the same padded buffers as [`Self::new`] on the same witness
+    /// — a slot's BatchMajor layout IS its aligned union sub-block — so the
+    /// proof is byte-identical, only the copy is gone.
+    pub fn in_place(
+        generate: impl FnOnce(flock_core::union::SlotWitnessDest<'_>) -> Vec<u8> + Send + 'a,
+        lincheck_circuit: &'a dyn lincheck::LincheckCircuit,
+    ) -> Self {
+        Self {
+            source: UnionSlotWitnessSource::InPlace(Box::new(generate)),
+            lincheck_circuit,
+        }
+    }
+}
+
+/// Build the padded union witness buffers from the per-slot sources,
+/// returning them with each slot's lincheck stripe (in slot order).
+///
+/// All-prebuilt input takes the existing [`flock_core::union::UnionInstance::
+/// assemble_witness`] path (single-slot passthrough included). Otherwise the
+/// buffers are allocated once and each slot is materialized into its own
+/// aligned block — generated there directly for in-place slots, copied there
+/// for prebuilt ones. Either way the result is the same padded buffer.
+fn build_union_witness(
+    union: &flock_core::union::UnionInstance<'_>,
+    sources: Vec<UnionSlotWitnessSource<'_>>,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<Vec<u8>>) {
+    assert_eq!(
+        sources.len(),
+        union.registry().num_types(),
+        "need one prover input per registry type"
+    );
+    if sources
+        .iter()
+        .all(|s| matches!(s, UnionSlotWitnessSource::Prebuilt { .. }))
+    {
+        let mut witnesses = Vec::with_capacity(sources.len());
+        let mut stripes = Vec::with_capacity(sources.len());
+        for s in sources {
+            match s {
+                UnionSlotWitnessSource::Prebuilt {
+                    witness,
+                    z_lincheck,
+                } => {
+                    witnesses.push(witness);
+                    stripes.push(z_lincheck);
+                }
+                UnionSlotWitnessSource::InPlace(_) => unreachable!("checked above"),
+            }
+        }
+        let (z, a, b) = union.assemble_witness(witnesses);
+        return (z, a, b, stripes);
+    }
+
+    let (mut z, mut a, mut b) = union.take_witness_buffers();
+    let stripes = union
+        .slot_dests(&mut z, &mut a, &mut b)
+        .into_iter()
+        .zip(sources)
+        .map(|(dst, source)| match source {
+            UnionSlotWitnessSource::InPlace(generate) => generate(dst),
+            UnionSlotWitnessSource::Prebuilt {
+                witness,
+                z_lincheck,
+            } => {
+                dst.z.copy_from_slice(&witness.z_packed);
+                dst.a.copy_from_slice(&witness.a_packed);
+                dst.b.copy_from_slice(&witness.b_packed);
+                z_lincheck
+            }
+        })
+        .collect();
+    (z, a, b, stripes)
 }
 
 /// Statement-binding selector for the union prove path. Private: the two
@@ -542,15 +643,18 @@ fn prove_union_with_binding<Ch: Challenger>(
         pcs::ligerito::prover_config_for(log_n, pcs_params.log_batch_size, pcs_params.profile)
             .expect("Ligerito default config; bump m for tiny instances");
 
-    // Union witness assembly (single slot: zero-copy passthrough), keeping
-    // the per-slot lincheck inputs aside.
-    let mut witnesses = Vec::with_capacity(slots.len());
-    let mut linchecks = Vec::with_capacity(slots.len());
+    // Union witness assembly: in-place slots generate straight into the
+    // union buffers, prebuilt ones are copied (single slot: zero-copy
+    // passthrough). The per-slot lincheck stripes come back alongside.
+    let mut sources = Vec::with_capacity(slots.len());
+    let mut circuits = Vec::with_capacity(slots.len());
     for slot in slots {
-        witnesses.push(slot.witness);
-        linchecks.push((slot.z_lincheck, slot.lincheck_circuit));
+        sources.push(slot.source);
+        circuits.push(slot.lincheck_circuit);
     }
-    let (z_packed, a_packed_f128, b_packed_f128) = union.assemble_witness(witnesses);
+    let (z_packed, a_packed_f128, b_packed_f128, stripes) = build_union_witness(union, sources);
+    let linchecks: Vec<(Vec<u8>, &dyn lincheck::LincheckCircuit)> =
+        stripes.into_iter().zip(circuits).collect();
 
     // True dense-stack commit (height-n_t stacking): commit the compacted
     // stack q — the declared n_t-row prefix of every used chunk-column;
@@ -849,9 +953,12 @@ pub struct ProvePhaseTimings {
     pub lincheck_s: f64,
     /// The real Ligerito recursive PCS open (`open_claims_…_ligerito`).
     pub open_s: f64,
-    /// SUB-phase of `witness_s` (union paths only): the padded-buffer
-    /// scatter (`UnionInstance::assemble_witness`). Do not add to the total.
-    pub witness_scatter_s: f64,
+    /// SUB-phase of `witness_s` (union paths only): building the padded
+    /// union buffers — the scatter (`UnionInstance::assemble_witness`) for
+    /// prebuilt slots, or the drivers' in-place generation for
+    /// [`UnionSlotProverInput::in_place`] ones (where it therefore ALSO
+    /// covers witness generation). Do not add to the total.
+    pub witness_place_s: f64,
     /// SUB-phase of `witness_s` (union paths only): the dense-stack gather
     /// (`UnionInstance::compact_witness`). Do not add to the total.
     pub witness_compact_s: f64,
@@ -1030,14 +1137,16 @@ pub fn prove_fast_ligerito_jagged_union_timed<Ch: Challenger>(
 
     // --- witness assembly + dense-stack compaction ---
     let t0 = Instant::now();
-    let mut witnesses = Vec::with_capacity(slots.len());
-    let mut linchecks = Vec::with_capacity(slots.len());
+    let mut sources = Vec::with_capacity(slots.len());
+    let mut circuits = Vec::with_capacity(slots.len());
     for slot in slots {
-        witnesses.push(slot.witness);
-        linchecks.push((slot.z_lincheck, slot.lincheck_circuit));
+        sources.push(slot.source);
+        circuits.push(slot.lincheck_circuit);
     }
-    let (z_packed, a_packed_f128, b_packed_f128) = union.assemble_witness(witnesses);
-    t.witness_scatter_s = t0.elapsed().as_secs_f64();
+    let (z_packed, a_packed_f128, b_packed_f128, stripes) = build_union_witness(union, sources);
+    let linchecks: Vec<(Vec<u8>, &dyn lincheck::LincheckCircuit)> =
+        stripes.into_iter().zip(circuits).collect();
+    t.witness_place_s = t0.elapsed().as_secs_f64();
     let t1 = Instant::now();
     let dense_q: Option<Vec<F128>> = if union.compaction_is_identity() {
         None
