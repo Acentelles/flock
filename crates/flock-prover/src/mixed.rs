@@ -169,6 +169,7 @@ impl MixedSetup {
             log_inv_rate: profile.log_inv_rate(),
             log_batch_size: 6,
             profile,
+            num_lanes: None,
         }
     }
 

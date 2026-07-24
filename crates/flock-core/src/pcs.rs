@@ -1355,6 +1355,7 @@ mod tests {
             log_inv_rate: 1,
             log_batch_size: initial_k,
             profile: Default::default(),
+            num_lanes: None,
         };
         let z_packed = pack_witness(&z, m);
         let (commitment, prover_data) = commit(&z_packed, &params);
@@ -1454,6 +1455,7 @@ mod tests {
             log_inv_rate: 1,
             log_batch_size: initial_k,
             profile: Default::default(),
+            num_lanes: None,
         };
         let z_packed = pack_witness(&z, m);
         let (commitment, prover_data) = commit(&z_packed, &params);
@@ -1622,6 +1624,7 @@ mod tests {
             log_inv_rate: 1,
             log_batch_size: initial_k,
             profile: Default::default(),
+            num_lanes: None,
         };
         let z_packed = pack_witness(&z, m_virtual);
         // The dense stack: used columns are the contiguous word prefix, so

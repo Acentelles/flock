@@ -163,8 +163,9 @@ impl AdditiveNttF128 {
     /// (same `self.twiddle(layer, block)` is applied to every lane at the
     /// corresponding butterfly).
     ///
-    /// `num_ntts` must be a positive power of 2. `data.len()` must equal
-    /// `(1 << log_d) * num_ntts` for some `log_d ≤ log_domain_size()`.
+    /// `num_ntts` must be a positive integer (need NOT be a power of two — the
+    /// integer-lane commit path passes an arbitrary `t`). `data.len()` must
+    /// equal `(1 << log_d) * num_ntts` for some `log_d ≤ log_domain_size()`.
     ///
     /// This produces the SAME RS code per lane as `forward_transform`, with
     /// FRI-compatible twiddles. The SoA layout is what makes each Merkle leaf
@@ -189,7 +190,12 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         start_layer: usize,
     ) {
-        assert!(num_ntts.is_power_of_two() && num_ntts > 0);
+        // `num_ntts` may be any positive integer (integer-lane commit): the
+        // per-lane butterfly kernels iterate over the lane stride, and the
+        // SIMD kernels handle the `num_ntts % SIMD_WIDTH` tail lanes with the
+        // portable path. Only `n_total / num_ntts` (the per-lane length) must
+        // be a power of two.
+        assert!(num_ntts > 0);
         let n_total = data.len();
         assert_eq!(n_total % num_ntts, 0);
         let log_d = log2_pow2(n_total / num_ntts);
@@ -292,7 +298,13 @@ impl AdditiveNttF128 {
         // num_ntts=32: 2^12 positions. (Without this scaling, sub-groups at
         // num_ntts=32 would be 64 MB and overflow L2 cache.)
         const TARGET_SUBGROUP_LOG_BYTES: usize = 21;
-        let log_bytes_per_position = 4 + log2_pow2(num_ntts);
+        // `num_ntts` need not be a power of two (integer-lane commit). Round the
+        // lane count UP to a power of two for the cache-blocking heuristic so an
+        // integer `t` blocks exactly like the padded `2^ceil(log2 t)` (measured:
+        // this recovers the full per-lane efficiency — a floor-log2 here left
+        // t=46 with oversized 3 MB sub-groups and ~15% slower than ideal). Only
+        // affects the sub-group SIZE (a tuning knob), never correctness.
+        let log_bytes_per_position = 4 + ceil_log2(num_ntts);
         let target_log_positions = TARGET_SUBGROUP_LOG_BYTES.saturating_sub(log_bytes_per_position);
         let cache_n_top = log_d.saturating_sub(target_log_positions);
 
@@ -860,6 +872,16 @@ fn log2_pow2(n: usize) -> usize {
     n.trailing_zeros() as usize
 }
 
+/// Ceil of `log2(n)` for any `n ≥ 1` (`ceil_log2(1) = 0`). Used only by the
+/// cache-blocking heuristic for the interleaved transform, where `num_ntts`
+/// may be a non-power-of-two integer lane count — rounding up makes an integer
+/// `t` block exactly like the padded `2^ceil(log2 t)` power-of-two width.
+#[inline]
+fn ceil_log2(n: usize) -> usize {
+    debug_assert!(n >= 1);
+    n.next_power_of_two().trailing_zeros() as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1040,6 +1062,59 @@ mod tests {
                     v_par, v_scalar,
                     "interleaved parallel mismatch at log_d={log_d}, num_ntts={num_ntts}"
                 );
+            }
+        }
+    }
+
+    /// Oracle 2 (integer-lane encode correctness): the `t`-lane interleaved
+    /// encode of a dense buffer `D` (SoA stride `t`) is byte-identical, per
+    /// real lane, to the `2^k`-lane encode of the SAME data zero-padded in the
+    /// lane dimension (SoA stride `2^k`, top lanes zero). Covers the scalar and
+    /// the parallel/SIMD paths, and several non-power-of-two `t`.
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq")
+    ))]
+    #[test]
+    fn interleaved_integer_lanes_match_padded() {
+        let mut rng = Rng::new(0x1A6E_2026);
+        for log_d in [4usize, 8, 12, 14] {
+            let positions = 1usize << log_d;
+            for &t in &[1usize, 3, 5, 7, 13, 46, 63] {
+                let padded_lanes = t.next_power_of_two();
+                let ntt = AdditiveNttF128::standard(log_d);
+
+                // Dense t-lane buffer D[pos*t + lane].
+                let dense = rand_vec(&mut rng, positions * t);
+                // Zero-pad the lane dimension to `padded_lanes`.
+                let mut padded = vec![F128::ZERO; positions * padded_lanes];
+                for pos in 0..positions {
+                    for lane in 0..t {
+                        padded[pos * padded_lanes + lane] = dense[pos * t + lane];
+                    }
+                }
+
+                // Encode both (parallel path — exercises the SIMD tail-lane
+                // handling for non-power-of-two t).
+                let mut enc_t = dense.clone();
+                ntt.forward_transform_interleaved_parallel(&mut enc_t, t);
+                let mut enc_padded = padded.clone();
+                ntt.forward_transform_interleaved_parallel(&mut enc_padded, padded_lanes);
+
+                for pos in 0..positions {
+                    for lane in 0..t {
+                        assert_eq!(
+                            enc_t[pos * t + lane],
+                            enc_padded[pos * padded_lanes + lane],
+                            "lane {lane} pos {pos} diverged (log_d={log_d}, t={t})"
+                        );
+                    }
+                }
+
+                // The scalar path must agree with the parallel one too.
+                let mut enc_t_scalar = dense.clone();
+                ntt.forward_transform_interleaved_scalar(&mut enc_t_scalar, t);
+                assert_eq!(enc_t_scalar, enc_t, "scalar vs parallel (t={t})");
             }
         }
     }

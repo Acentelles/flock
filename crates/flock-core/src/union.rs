@@ -1083,6 +1083,7 @@ mod tests {
                 log_inv_rate: 1,
                 log_batch_size: 6,
                 profile: Default::default(),
+                num_lanes: None,
             },
         };
         let sample = |union: &UnionInstance<'_>, root: u8| {

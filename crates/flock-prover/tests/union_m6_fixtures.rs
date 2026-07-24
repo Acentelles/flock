@@ -155,6 +155,7 @@ fn m6_mixed_union_proof_bytes_pinned() {
             log_inv_rate: 1,
             log_batch_size: 6,
             profile: flock_core::pcs::ligerito::LigeritoProfile::Fast,
+            num_lanes: None,
         };
         // Per-fixture seed so each count vector has its own witness stream.
         let mut rng = Rng::new(0x4D36_0000 ^ ((n_sha2 as u64) << 16) ^ n_blake3 as u64);

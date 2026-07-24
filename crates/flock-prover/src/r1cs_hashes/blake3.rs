@@ -1333,6 +1333,7 @@ impl Blake3Setup {
             log_inv_rate,
             log_batch_size: 6,
             profile,
+            num_lanes: None,
         };
         Self {
             n_blocks,

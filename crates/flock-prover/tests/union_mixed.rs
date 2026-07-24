@@ -111,6 +111,7 @@ fn union_pcs_params(union: &UnionInstance<'_>) -> PcsParams {
         log_inv_rate: 1,
         log_batch_size: 6,
         profile: LigeritoProfile::Fast,
+        num_lanes: None,
     }
 }
 
