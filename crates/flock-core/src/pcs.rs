@@ -1047,8 +1047,26 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
         q[params.area() as usize..].iter().all(|&w| w == F128::ZERO),
         "committed stack must be zero past the jagged area"
     );
-    let (w_rho, claim_v, round0) =
-        jagged::weight_table_claim_and_round0(&params, &q, &rho[..n_log], &rho[n_log..]);
+    // ---- High-bit lanes (integer-lane commit): when the commitment encoded
+    // only `t < 2^initial_k` lanes, its lane index is the HIGH `initial_k`
+    // bits of the dense index, so `q`'s contiguous zero tail is whole zero
+    // lanes. L0 then binds the lane variable by folding BLOCKS of `2^log_dim`
+    // (`ligerito::fold_and_msg_blocked`) rather than adjacent elements —
+    // pure ADDRESSING, so `q` and `W_ρ` are handed over as they are; only the
+    // round-0 prime's pairing changes, and it stays fused into this build.
+    let l0_num_lanes = commitment.params.num_ntts();
+    let lane_major = l0_num_lanes < 1usize << lig_config.initial_k;
+    let (w_rho, claim_v, round0) = if lane_major {
+        jagged::weight_table_claim_and_round0_blocked(
+            &params,
+            &q,
+            &rho[..n_log],
+            &rho[n_log..],
+            q.len() >> lig_config.initial_k,
+        )
+    } else {
+        jagged::weight_table_claim_and_round0(&params, &q, &rho[..n_log], &rho[n_log..])
+    };
     debug_assert_eq!(
         claim_v, f_eval,
         "⟨q, W_ρ⟩ must equal the virtual-opening output (witness zero past area)"
@@ -1059,37 +1077,6 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
             t.elapsed().as_secs_f64() * 1e3
         );
     }
-
-    // ---- High-bit lanes (integer-lane commit): when the commitment encoded
-    // only `t < 2^initial_k` lanes, its lane index is the HIGH `initial_k`
-    // bits of the dense index, so `q`'s contiguous zero tail is whole zero
-    // lanes. Ligerito's lane index is by construction the LOW `initial_k`
-    // bits, so hand it the rotated pair — `q_grid[p·2^k + l] = q[l·D + p]`,
-    // and the same rotation on `W_ρ`. The rotation is a permutation of the
-    // multilinear VARIABLES, so the inner product (and hence `f_eval`) is
-    // unchanged and every downstream MLE follows by rotating its evaluation
-    // point (`rotate_lane_point` below). Only the LSB pairing of the round-0
-    // prime differs, so it is recomputed on the rotated pair.
-    let l0_num_lanes = commitment.params.num_ntts();
-    let lane_major = l0_num_lanes < 1usize << lig_config.initial_k;
-    let round0 = if lane_major {
-        // L0 binds the lane variable by folding BLOCKS of `2^log_dim`
-        // (`ligerito::fold_and_msg_blocked`), so the round-0 prime is taken
-        // over that pairing. Nothing is permuted: the rotation is pure
-        // addressing, so `q` and `W_ρ` are handed over as they are.
-        let t = std::time::Instant::now();
-        let d = q.len() >> lig_config.initial_k;
-        let round0 = jagged::round0_prime_blocked(&q, &w_rho, claim_v, d);
-        if trace {
-            eprintln!(
-                "  [open_jagged] blocked round-0 prime: {:6.2} ms",
-                t.elapsed().as_secs_f64() * 1e3
-            );
-        }
-        round0
-    } else {
-        round0
-    };
 
     // ---- Fused Ligerito: open q against W_ρ with target f_eval, reusing the
     // commit-time codeword/tree as L0. The fused entry also returns the fold

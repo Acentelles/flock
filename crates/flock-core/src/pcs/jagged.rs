@@ -322,40 +322,115 @@ fn generate_f_and_claim(
         .map(|(ci, b_chunk)| {
             let g0 = ci * CHUNK;
             let q_chunk = &q[g0..g0 + b_chunk.len()];
-            // Column containing g0 (== num_columns sentinel once g0 ≥ area).
-            let mut col = prefix
-                .partition_point(|&t| t <= g0 as u64)
-                .saturating_sub(1);
+            fill_weight_range(b_chunk, g0, area, prefix, &eq_row, &eq_col);
             let mut acc = F128::ZERO;
             let mut m_one = F128::ZERO;
             let mut m_inf = F128::ZERO;
-            let mut i = g0;
-            for (bp, qp) in b_chunk.chunks_exact_mut(2).zip(q_chunk.chunks_exact(2)) {
-                let b0 = if i >= area {
-                    F128::ZERO
-                } else {
-                    while (i as u64) >= prefix[col + 1] {
-                        col += 1;
-                    }
-                    eq_row[i - prefix[col] as usize] * eq_col[col]
-                };
-                let b1 = if i + 1 >= area {
-                    F128::ZERO
-                } else {
-                    while ((i + 1) as u64) >= prefix[col + 1] {
-                        col += 1;
-                    }
-                    eq_row[i + 1 - prefix[col] as usize] * eq_col[col]
-                };
-                bp[0] = b0;
-                bp[1] = b1;
-                let t = qp[1] * b1;
-                acc += qp[0] * b0 + t;
+            for (bp, qp) in b_chunk.chunks_exact(2).zip(q_chunk.chunks_exact(2)) {
+                let t = qp[1] * bp[1];
+                acc += qp[0] * bp[0] + t;
                 m_one += t;
-                m_inf += (qp[0] + qp[1]) * (b0 + b1);
-                i += 2;
+                m_inf += (qp[0] + qp[1]) * (bp[0] + bp[1]);
             }
             (acc, m_one, m_inf)
+        })
+        .reduce(
+            || (F128::ZERO, F128::ZERO, F128::ZERO),
+            |(a, b1, c), (d, e, f)| (a + d, b1 + e, c + f),
+        );
+    (b, v, g_one, g_inf)
+}
+
+/// Fill `out` with the jagged weight `W[e] = eq(row_t(e), z_row)·eq(col_t(e),
+/// z_col)` for `e ∈ [g0, g0 + out.len())`, zero past `area` — the single
+/// source of truth for the weight formula, shared by the element-paired and
+/// block-paired drivers. One binary search per range, then an advancing
+/// column cursor.
+#[inline]
+fn fill_weight_range(
+    out: &mut [F128],
+    g0: usize,
+    area: usize,
+    prefix: &[u64],
+    eq_row: &[F128],
+    eq_col: &[F128],
+) {
+    let mut col = prefix
+        .partition_point(|&t| t <= g0 as u64)
+        .saturating_sub(1);
+    for (k, slot) in out.iter_mut().enumerate() {
+        let i = g0 + k;
+        *slot = if i >= area {
+            F128::ZERO
+        } else {
+            while (i as u64) >= prefix[col + 1] {
+                col += 1;
+            }
+            eq_row[i - prefix[col] as usize] * eq_col[col]
+        };
+    }
+}
+
+/// [`generate_f_and_claim`] whose round-0 message is taken over the BLOCK
+/// pairing of block size `d` — output block `c` pairs input blocks `2c` and
+/// `2c+1` — which is what L0 binds when the committed stack is lane-major
+/// (`ligerito::fold_and_msg_blocked`).
+///
+/// `d` exceeds the element-paired driver's chunk at production sizes
+/// (`2^17` vs `2^16` at `M = 30`), so a chunk can never hold both partners.
+/// Each task therefore owns a sub-range of one block PAIR — the two halves
+/// carved by `split_at_mut` — which keeps the prime fused into the weight
+/// build instead of costing a second 268 MB pass over `(q, W)`.
+fn generate_f_and_claim_blocked(
+    params: &JaggedParams,
+    q: &[F128],
+    z_row: &[F128],
+    z_col: &[F128],
+    d: usize,
+) -> (Vec<F128>, F128, F128, F128) {
+    use rayon::prelude::*;
+    let len = 1usize << params.m;
+    assert!(d >= 1 && d <= len / 2 && d.is_power_of_two());
+    let area = params.area() as usize;
+    let eq_row = build_eq_table(z_row);
+    let eq_col = build_eq_table(z_col);
+    let prefix = &params.col_prefix_sums;
+    let mut b = crate::alloc_uninit_f128_vec(len);
+
+    // Sub-range within a block pair; keeps the task count high when there are
+    // few pairs (32 pairs × 8 sub-ranges at M = 30).
+    const SUB: usize = 1 << 14;
+    let (v, g_one, g_inf) = b
+        .par_chunks_mut(2 * d)
+        .enumerate()
+        .map(|(c, b_pair)| {
+            let (lo, hi) = b_pair.split_at_mut(d);
+            let base = 2 * c * d;
+            lo.par_chunks_mut(SUB)
+                .zip(hi.par_chunks_mut(SUB))
+                .enumerate()
+                .map(|(si, (lo_c, hi_c))| {
+                    let o = si * SUB;
+                    let n = lo_c.len();
+                    fill_weight_range(lo_c, base + o, area, prefix, &eq_row, &eq_col);
+                    fill_weight_range(hi_c, base + d + o, area, prefix, &eq_row, &eq_col);
+                    let q_lo = &q[base + o..base + o + n];
+                    let q_hi = &q[base + d + o..base + d + o + n];
+                    let mut acc = F128::ZERO;
+                    let mut m_one = F128::ZERO;
+                    let mut m_inf = F128::ZERO;
+                    for i in 0..n {
+                        let t = q_hi[i] * hi_c[i];
+                        acc += q_lo[i] * lo_c[i] + t;
+                        m_one += t;
+                        m_inf += (q_lo[i] + q_hi[i]) * (lo_c[i] + hi_c[i]);
+                    }
+                    (acc, m_one, m_inf)
+                })
+                .reduce(
+                    || (F128::ZERO, F128::ZERO, F128::ZERO),
+                    |(a, b1, c), (d, e, f)| (a + d, b1 + e, c + f),
+                )
         })
         .reduce(
             || (F128::ZERO, F128::ZERO, F128::ZERO),
@@ -375,36 +450,20 @@ fn generate_f_and_claim(
 /// are bit-identical to a separate `Σ q_0·W_0` pass. Feeds the fused
 /// jagged→Ligerito opening (`pcs::open_batch_jagged_ligerito`), which
 /// discharges `⟨q, W⟩ = v` directly in Ligerito with `W` as the basis.
-/// Round-0 sumcheck prime `(u_0, u_2)` of `Σ_e q(e)·W(e)` under the BLOCKED
-/// pairing of block size `d` — output block `c` pairs input blocks `2c` and
-/// `2c+1` — which is what L0 binds when the committed stack is lane-major
-/// (high-bit lanes; see `ligerito::fold_and_msg_blocked`).
-///
-/// The claim `v` is pairing-invariant, so only the message changes:
-/// [`weight_table_claim_and_round0`]'s fused prime is taken over the element
-/// pairing and does not carry over.
-pub(crate) fn round0_prime_blocked(q: &[F128], w: &[F128], v: F128, d: usize) -> (F128, F128) {
-    use rayon::prelude::*;
-    if d == 1 {
-        let (g_one, g_inf) = round_msg_par(q, w);
-        return (v + g_one, g_inf);
-    }
-    let (g_one, g_inf) = q
-        .par_chunks(2 * d)
-        .zip(w.par_chunks(2 * d))
-        .map(|(qc, wc)| {
-            let (q0, q1) = qc.split_at(d);
-            let (w0, w1) = wc.split_at(d);
-            let mut g1 = F128::ZERO;
-            let mut gi = F128::ZERO;
-            for i in 0..d {
-                g1 += q1[i] * w1[i];
-                gi += (q0[i] + q1[i]) * (w0[i] + w1[i]);
-            }
-            (g1, gi)
-        })
-        .reduce(|| (F128::ZERO, F128::ZERO), |(a, b), (c, e)| (a + c, b + e));
-    (v + g_one, g_inf)
+/// [`weight_table_claim_and_round0`] with the round-0 prime taken over the
+/// BLOCKED pairing of block size `d` — what L0 binds when the committed stack
+/// is lane-major (high-bit lanes; see `ligerito::fold_and_msg_blocked`). The
+/// claim `v` is pairing-invariant; only the message differs, and it stays
+/// FUSED into the weight-table build.
+pub(crate) fn weight_table_claim_and_round0_blocked(
+    params: &JaggedParams,
+    q: &[F128],
+    z_row: &[F128],
+    z_col: &[F128],
+    d: usize,
+) -> (Vec<F128>, F128, (F128, F128)) {
+    let (w, v, g_one, g_inf) = generate_f_and_claim_blocked(params, q, z_row, z_col, d);
+    (w, v, (v + g_one, g_inf))
 }
 
 pub(crate) fn weight_table_claim_and_round0(
