@@ -1317,3 +1317,434 @@ fn two_blake3_tables_vs_direct() {
         jag_verify_ms / direct_verify_ms
     );
 }
+
+/// PER-PHASE breakdown of the two-blake3-table control — WHERE the union
+/// machinery overhead lives, phase by phase. Same three single-table-domain
+/// rows as [`two_blake3_tables_vs_direct`] (all commit the SAME 2^23-word
+/// domain at 2N = 65536 total BLAKE3 invocations, M/m = 30), run through the
+/// per-phase timed entries:
+///   * DIRECT      — `prove_fast_ligerito_timed` / `verify_ligerito_timed`
+///   * UNION-single— one BLAKE3 slot, 2N (nu = 16)
+///   * UNION-two   — two BLAKE3 slots, N + N (nu = 15)
+/// plus a 4th MIXED (SHA-256 + BLAKE3, nu = 14) row proved ONLY to obtain its
+/// verify comb breakdown, reconciling the earlier "mixed ~12 ms vs two-blake3
+/// ~20 ms verify" discrepancy (both 2-slot M30) against the per-type comb
+/// (`fold_alpha_batched`, O(nnz)) cost — BLAKE3 (κ = 14) has far more matrix
+/// nonzeros than SHA-256 (κ = 15), so a blake3+blake3 verify replays ~2× the
+/// nnz of a sha2+blake3 verify.
+///
+/// PROVE phases: witgen (per-hash generation + union assembly/compaction) |
+/// commit | zerocheck | lincheck | open. VERIFY phases: zerocheck-verify |
+/// lincheck-verify (with the per-type comb sub-cost, i.e. the multi-slot
+/// circuit replay) | opening-verify. Warm-up + best-of-2 (min total) per
+/// row. Informational — no assertions. Run with `cargo test --release -p
+/// flock-prover --test union_mixed -- --ignored --nocapture
+/// two_blake3_phase_breakdown`.
+#[test]
+#[ignore] // Heavy (m = 30, ~2 GB) + informational — run explicitly with --ignored --nocapture
+fn two_blake3_phase_breakdown() {
+    use flock_prover::prover::ProvePhaseTimings;
+    use flock_prover::verifier::VerifyPhaseTimings;
+    use std::time::Instant;
+
+    const ITERS: usize = 2; // timed runs after one warm-up; best (min total) reported
+    let n_total = 1usize << 16; // 2N = 65536 total BLAKE3 compressions
+
+    let mut rng = Rng::new(0x2B_1A_B3_2B);
+    let blake3_inputs = random_blake3_inputs(&mut rng, n_total);
+
+    let p_total =
+        |p: &ProvePhaseTimings| p.witness_s + p.commit_s + p.zerocheck_s + p.lincheck_s + p.open_s;
+    // lincheck_comb_s is a SUB-phase of lincheck_s — do not add it to the total.
+    let v_total = |v: &VerifyPhaseTimings| v.zerocheck_s + v.lincheck_s + v.open_s;
+
+    // ---- (1) DIRECT blake3 2N (m = 30) ----
+    let (direct_gen, direct_pt, direct_vt) = {
+        let setup = blake3::Blake3Setup::new_batch_major(n_total);
+        assert_eq!(setup.m(), 30, "2N = 65536 blocks must land on m = 30");
+        let circuit = setup.r1cs.csc_lincheck_circuit();
+        // Warm-up.
+        {
+            let (z, a, b, stripe) =
+                blake3::generate_witness_batch_major(&blake3_inputs, setup.n_blocks_log());
+            let mut ch = FsChallenger::new(DOMAIN);
+            let _ = prover::prove_fast_ligerito_timed(
+                &setup.r1cs,
+                &setup.pcs_params,
+                z,
+                a,
+                b,
+                stripe,
+                circuit,
+                None,
+                &mut ch,
+            );
+        }
+        let mut best_pt = ProvePhaseTimings::default();
+        let mut best_gen = 0.0f64;
+        let mut best = f64::INFINITY;
+        let mut out = None;
+        for _ in 0..ITERS {
+            let tg = Instant::now();
+            let (z, a, b, stripe) =
+                blake3::generate_witness_batch_major(&blake3_inputs, setup.n_blocks_log());
+            let wit = tg.elapsed().as_secs_f64();
+            let mut ch = FsChallenger::new(DOMAIN);
+            let (proof, comm, _claim, pt) = prover::prove_fast_ligerito_timed(
+                &setup.r1cs,
+                &setup.pcs_params,
+                z,
+                a,
+                b,
+                stripe,
+                circuit,
+                None,
+                &mut ch,
+            );
+            // `pt.witness_s` is the union assembly/compaction; `wit` is the
+            // per-hash witness generation. Total prove = wit + all pt phases.
+            let total = wit + p_total(&pt);
+            if total < best {
+                best = total;
+                best_pt = pt;
+                best_gen = wit;
+            }
+            out = Some((proof, comm));
+        }
+        let (proof, comm) = out.unwrap();
+        let mut best_vt = VerifyPhaseTimings::default();
+        let mut bestv = f64::INFINITY;
+        for _ in 0..ITERS {
+            let mut ch = FsChallenger::new(DOMAIN);
+            let (_claim, vt) = verifier::verify_ligerito_timed(
+                &setup.r1cs,
+                &comm,
+                &proof,
+                circuit,
+                &setup.pcs_params,
+                &mut ch,
+            )
+            .expect("direct verify rejected honest proof");
+            if v_total(&vt) < bestv {
+                bestv = v_total(&vt);
+                best_vt = vt;
+            }
+        }
+        (best_gen, best_pt, best_vt)
+    };
+
+    // ---- (2) UNION single blake3 2N (nu = 16, M = 30) ----
+    let (u1_gen, u1_pt, u1_vt) = {
+        let nu = 16usize;
+        let b3_r1cs = blake3::build_block_r1cs(nu);
+        let registry = Registry::new(vec![TableType::from_block_r1cs(&b3_r1cs)], nu);
+        assert_eq!(registry.m_total(), 30);
+        let union = UnionInstance::new(&registry, vec![n_total]);
+        let pcs_params = union_pcs_params(&union);
+        assert_eq!(pcs_params.m, 30);
+        let circuit = b3_r1cs.csc_lincheck_circuit();
+        flock_core::scratch::prewarm_prover(registry.m_total());
+        // Warm-up.
+        {
+            let slots = vec![UnionSlotProverInput::new(
+                blake3::generate_witness_batch_major(&blake3_inputs, nu),
+                circuit,
+            )];
+            let mut ch = FsChallenger::new(DOMAIN);
+            let _ = prover::prove_fast_ligerito_jagged_union(&union, &pcs_params, slots, &mut ch);
+        }
+        let mut best_pt = ProvePhaseTimings::default();
+        let mut best_gen = 0.0f64;
+        let mut best = f64::INFINITY;
+        let mut out = None;
+        for _ in 0..ITERS {
+            let tg = Instant::now();
+            let slots = vec![UnionSlotProverInput::new(
+                blake3::generate_witness_batch_major(&blake3_inputs, nu),
+                circuit,
+            )];
+            let wit = tg.elapsed().as_secs_f64();
+            let mut ch = FsChallenger::new(DOMAIN);
+            let (proof, comm, _claim, pt) =
+                prover::prove_fast_ligerito_jagged_union_timed(&union, &pcs_params, slots, &mut ch);
+            let total = wit + p_total(&pt);
+            if total < best {
+                best = total;
+                best_pt = pt;
+                best_gen = wit;
+            }
+            out = Some((proof, comm));
+        }
+        let (proof, comm) = out.unwrap();
+        let circuits: [&dyn LincheckCircuit; 1] = [circuit];
+        let mut best_vt = VerifyPhaseTimings::default();
+        let mut bestv = f64::INFINITY;
+        for _ in 0..ITERS {
+            let mut ch = FsChallenger::new(DOMAIN);
+            let (_claim, vt) = verifier::verify_ligerito_jagged_union_timed(
+                &union,
+                &circuits,
+                &comm,
+                &proof,
+                &pcs_params,
+                &mut ch,
+            )
+            .expect("union single verify rejected honest proof");
+            if v_total(&vt) < bestv {
+                bestv = v_total(&vt);
+                best_vt = vt;
+            }
+        }
+        (best_gen, best_pt, best_vt)
+    };
+
+    // ---- (3) UNION two blake3 tables N + N (nu = 15, M = 30) ----
+    let (u2_gen, u2_pt, u2_vt, blake3_nnz) = {
+        let nu = 15usize;
+        let n_per = 1usize << nu;
+        let b3_r1cs = blake3::build_block_r1cs(nu);
+        let registry = Registry::new(
+            vec![
+                TableType::from_block_r1cs(&b3_r1cs),
+                TableType::from_block_r1cs(&b3_r1cs),
+            ],
+            nu,
+        );
+        assert_eq!(registry.m_total(), 30);
+        let union = UnionInstance::new(&registry, vec![n_per, n_per]);
+        let pcs_params = union_pcs_params(&union);
+        assert_eq!(pcs_params.m, 30);
+        let circuit = b3_r1cs.csc_lincheck_circuit();
+        let blake3_nnz = format!("{circuit:?}");
+        flock_core::scratch::prewarm_prover(registry.m_total());
+        let (lo, hi) = blake3_inputs.split_at(n_per);
+        // Warm-up.
+        {
+            let slots = vec![
+                UnionSlotProverInput::new(blake3::generate_witness_batch_major(lo, nu), circuit),
+                UnionSlotProverInput::new(blake3::generate_witness_batch_major(hi, nu), circuit),
+            ];
+            let mut ch = FsChallenger::new(DOMAIN);
+            let _ = prover::prove_fast_ligerito_jagged_union(&union, &pcs_params, slots, &mut ch);
+        }
+        let mut best_pt = ProvePhaseTimings::default();
+        let mut best_gen = 0.0f64;
+        let mut best = f64::INFINITY;
+        let mut out = None;
+        for _ in 0..ITERS {
+            let tg = Instant::now();
+            let slots = vec![
+                UnionSlotProverInput::new(blake3::generate_witness_batch_major(lo, nu), circuit),
+                UnionSlotProverInput::new(blake3::generate_witness_batch_major(hi, nu), circuit),
+            ];
+            let wit = tg.elapsed().as_secs_f64();
+            let mut ch = FsChallenger::new(DOMAIN);
+            let (proof, comm, _claim, pt) =
+                prover::prove_fast_ligerito_jagged_union_timed(&union, &pcs_params, slots, &mut ch);
+            let total = wit + p_total(&pt);
+            if total < best {
+                best = total;
+                best_pt = pt;
+                best_gen = wit;
+            }
+            out = Some((proof, comm));
+        }
+        let (proof, comm) = out.unwrap();
+        let circuits: [&dyn LincheckCircuit; 2] = [circuit, circuit];
+        let mut best_vt = VerifyPhaseTimings::default();
+        let mut bestv = f64::INFINITY;
+        for _ in 0..ITERS {
+            let mut ch = FsChallenger::new(DOMAIN);
+            let (_claim, vt) = verifier::verify_ligerito_jagged_union_timed(
+                &union,
+                &circuits,
+                &comm,
+                &proof,
+                &pcs_params,
+                &mut ch,
+            )
+            .expect("union two-table verify rejected honest proof");
+            if v_total(&vt) < bestv {
+                bestv = v_total(&vt);
+                best_vt = vt;
+            }
+        }
+        (best_gen, best_pt, best_vt, blake3_nnz)
+    };
+
+    // ---- (4) MIXED sha2 + blake3 (nu = 14, M = 30) — proved only to obtain
+    // its verify comb breakdown, for the two-blake3-vs-mixed reconciliation.
+    let (mix_vt, sha2_nnz, blake3_nnz_mix) = {
+        let nu = 14usize;
+        let n_per = 1usize << nu; // 16384 per type
+        let (registry, sha2_r1cs, blake3_r1cs) = mixed_registry(nu);
+        assert_eq!(registry.m_total(), 30);
+        let union = UnionInstance::new(&registry, vec![n_per, n_per]);
+        let pcs_params = union_pcs_params(&union);
+        assert_eq!(pcs_params.m, 30);
+        let s2_circuit = sha2_r1cs.csc_lincheck_circuit();
+        let b3_circuit = blake3_r1cs.csc_lincheck_circuit();
+        let sha2_nnz = format!("{s2_circuit:?}");
+        let blake3_nnz_mix = format!("{b3_circuit:?}");
+        flock_core::scratch::prewarm_prover(registry.m_total());
+        let sha2_inputs = random_sha2_inputs(&mut rng, n_per);
+        let blake3_in = random_blake3_inputs(&mut rng, n_per);
+        // Single prove (slot order: SHA-256 then BLAKE3) — no timing needed.
+        let (proof, comm, _claim) = {
+            let slots = vec![
+                UnionSlotProverInput::new(
+                    sha2::generate_witness_batch_major(&sha2_inputs, nu),
+                    s2_circuit,
+                ),
+                UnionSlotProverInput::new(
+                    blake3::generate_witness_batch_major(&blake3_in, nu),
+                    b3_circuit,
+                ),
+            ];
+            let mut ch = FsChallenger::new(DOMAIN);
+            prover::prove_fast_ligerito_jagged_union(&union, &pcs_params, slots, &mut ch)
+        };
+        let circuits: [&dyn LincheckCircuit; 2] = [s2_circuit, b3_circuit];
+        let mut best_vt = VerifyPhaseTimings::default();
+        let mut bestv = f64::INFINITY;
+        for _ in 0..ITERS {
+            let mut ch = FsChallenger::new(DOMAIN);
+            let (_claim, vt) = verifier::verify_ligerito_jagged_union_timed(
+                &union,
+                &circuits,
+                &comm,
+                &proof,
+                &pcs_params,
+                &mut ch,
+            )
+            .expect("mixed verify rejected honest proof");
+            if v_total(&vt) < bestv {
+                bestv = v_total(&vt);
+                best_vt = vt;
+            }
+        }
+        (best_vt, sha2_nnz, blake3_nnz_mix)
+    };
+
+    // ---- Report. ----
+    let ms = |s: f64| s * 1e3;
+    println!(
+        "\ntwo-blake3 PHASE breakdown: 2N = {n_total} total invocations (all M/m = 30, \
+         2^23-word commit), best-of-{ITERS}\n"
+    );
+
+    // witgen column = per-hash generation (`gen`) + union assembly/compaction
+    // (`pt.witness_s`, the "assemble" sub-cost, zero on the direct path). The
+    // "assemble" sub-column isolates the union-specific dense-stack compaction.
+    println!("PROVE (ms):   [witgen = gen + assemble]");
+    println!(
+        "  {:<22} {:>8} {:>9} {:>8} {:>10} {:>9} {:>8} {:>9}",
+        "row", "witgen", "(assemble)", "commit", "zerocheck", "lincheck", "open", "total"
+    );
+    let prove_row = |label: &str, gen_s: f64, p: &ProvePhaseTimings| {
+        let witgen = gen_s + p.witness_s;
+        let total = gen_s + p_total(p);
+        println!(
+            "  {:<22} {:>8.1} {:>9.1} {:>8.1} {:>10.1} {:>9.1} {:>8.1} {:>9.1}",
+            label,
+            ms(witgen),
+            ms(p.witness_s),
+            ms(p.commit_s),
+            ms(p.zerocheck_s),
+            ms(p.lincheck_s),
+            ms(p.open_s),
+            ms(total),
+        );
+    };
+    prove_row("direct", direct_gen, &direct_pt);
+    prove_row("union-single", u1_gen, &u1_pt);
+    prove_row("union-two", u2_gen, &u2_pt);
+
+    println!("\nVERIFY (ms):");
+    println!(
+        "  {:<22} {:>10} {:>10} {:>12} {:>8} {:>8}",
+        "row", "zerocheck", "lincheck", "(comb sub)", "open", "total"
+    );
+    let verify_row = |label: &str, v: &VerifyPhaseTimings| {
+        println!(
+            "  {:<22} {:>10.2} {:>10.2} {:>12.2} {:>8.2} {:>8.2}",
+            label,
+            ms(v.zerocheck_s),
+            ms(v.lincheck_s),
+            ms(v.lincheck_comb_s),
+            ms(v.open_s),
+            ms(v_total(v)),
+        );
+    };
+    verify_row("direct", &direct_vt);
+    verify_row("union-single", &u1_vt);
+    verify_row("union-two", &u2_vt);
+    verify_row("mixed(sha2+blake3)", &mix_vt);
+
+    // ---- Attribution. ----
+    let u1_tot = u1_gen + p_total(&u1_pt);
+    let u2_tot = u2_gen + p_total(&u2_pt);
+    println!("\nPROVE union-single -> union-two delta (the ~+17% two-slot cost):");
+    let dgen = ms(u2_gen - u1_gen);
+    let dasm = ms(u2_pt.witness_s - u1_pt.witness_s);
+    let dcom = ms(u2_pt.commit_s - u1_pt.commit_s);
+    let dzc = ms(u2_pt.zerocheck_s - u1_pt.zerocheck_s);
+    let dlc = ms(u2_pt.lincheck_s - u1_pt.lincheck_s);
+    let dop = ms(u2_pt.open_s - u1_pt.open_s);
+    let dtot = ms(u2_tot - u1_tot);
+    println!(
+        "  gen {dgen:+.1}  assemble {dasm:+.1}  commit {dcom:+.1}  zerocheck {dzc:+.1}  \
+         lincheck {dlc:+.1}  open {dop:+.1}  => total {dtot:+.1} ms  \
+         ({:.0}% of union-single)",
+        100.0 * (u2_tot / u1_tot - 1.0)
+    );
+
+    println!("\nVERIFY union-single -> union-two delta (the ~2x):");
+    println!(
+        "  union-single total {:.2} ms -> union-two total {:.2} ms  (x{:.2})",
+        ms(v_total(&u1_vt)),
+        ms(v_total(&u2_vt)),
+        v_total(&u2_vt) / v_total(&u1_vt)
+    );
+    println!(
+        "  lincheck-verify {:.2} -> {:.2} ms (x{:.2}); of which comb {:.2} -> {:.2} ms (x{:.2})",
+        ms(u1_vt.lincheck_s),
+        ms(u2_vt.lincheck_s),
+        u2_vt.lincheck_s / u1_vt.lincheck_s,
+        ms(u1_vt.lincheck_comb_s),
+        ms(u2_vt.lincheck_comb_s),
+        u2_vt.lincheck_comb_s / u1_vt.lincheck_comb_s.max(1e-12),
+    );
+    println!(
+        "  per-slot blake3 comb (union-two comb / 2): {:.2} ms; \
+         zerocheck-verify {:.2} -> {:.2} ms; opening-verify {:.2} -> {:.2} ms",
+        ms(u2_vt.lincheck_comb_s / 2.0),
+        ms(u1_vt.zerocheck_s),
+        ms(u2_vt.zerocheck_s),
+        ms(u1_vt.open_s),
+        ms(u2_vt.open_s),
+    );
+
+    println!("\nRECONCILIATION — mixed(sha2+blake3) vs two-blake3 verify (both 2-slot M30):");
+    println!(
+        "  two-blake3   lincheck-comb {:.2} ms (2x blake3), total verify {:.2} ms",
+        ms(u2_vt.lincheck_comb_s),
+        ms(v_total(&u2_vt))
+    );
+    println!(
+        "  mixed        lincheck-comb {:.2} ms (sha2 + blake3), total verify {:.2} ms",
+        ms(mix_vt.lincheck_comb_s),
+        ms(v_total(&mix_vt))
+    );
+    let blake3_comb = u2_vt.lincheck_comb_s / 2.0;
+    let sha2_comb = (mix_vt.lincheck_comb_s - blake3_comb).max(0.0);
+    println!(
+        "  => per-slot comb: blake3 ~{:.2} ms, sha2 ~{:.2} ms (sha2 = mixed_comb - blake3_comb)",
+        ms(blake3_comb),
+        ms(sha2_comb)
+    );
+    println!("  circuit nnz (fold_alpha_batched is O(nnz)):");
+    println!("    blake3 (kappa=14): {blake3_nnz}");
+    println!("    blake3 (kappa=14): {blake3_nnz_mix}");
+    println!("    sha2   (kappa=15): {sha2_nnz}");
+}

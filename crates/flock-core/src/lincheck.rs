@@ -128,7 +128,7 @@ mod union;
 
 pub use union::{
     UnionLincheckSlot, eq_prefix_sum, eq_prefix_weight, prove_union_capture_z_vec,
-    union_comb_partial, verify_union,
+    union_comb_partial, verify_union, verify_union_timed,
 };
 
 #[cfg(target_arch = "x86_64")]

@@ -490,6 +490,154 @@ pub fn verify_union<Ch: Challenger>(
     })
 }
 
+/// [`verify_union`] with the per-type comb-construction phase timed
+/// separately — benchmark-only. Returns the same [`LincheckClaim`] plus the
+/// wall-clock seconds spent in step 2 (the α-batched
+/// [`LincheckCircuit::fold_alpha_batched`] over EVERY slot, the
+/// `O(Σ_t nnz_t)` per-slot cost the multi-slot verify replays) — the
+/// dominant term of the union lincheck verify. The cheap sumcheck round
+/// replay + closed-form collapse are the remainder (`lincheck_total −
+/// comb_s`). Kept in lockstep with [`verify_union`]; does not disturb the
+/// production verify path.
+pub fn verify_union_timed<Ch: Challenger>(
+    union: &UnionInstance<'_>,
+    circuits: &[&dyn LincheckCircuit],
+    x_ab: &QuirkyPoint,
+    v_a: F128,
+    v_b: F128,
+    proof: &LincheckProof,
+    challenger: &mut Ch,
+) -> Result<(LincheckClaim, f64), VerifyError> {
+    use std::time::Instant;
+    let registry = union.registry();
+    let k_skip = K_SKIP;
+    let nu = union.n_log();
+    let col_vars = union.m_total() - nu;
+    let inner_rest_len = col_vars - k_skip;
+    let n_skip = 1usize << k_skip;
+
+    assert_eq!(
+        circuits.len(),
+        registry.num_types(),
+        "one circuit per registry type"
+    );
+    for (ty, circuit) in registry.types().iter().zip(circuits) {
+        let k = 1usize << ty.k_log;
+        if circuit.n_cols() != k {
+            return Err(VerifyError::BadMatrixShape {
+                which: "circuit",
+                expected: k,
+                got_rows: k,
+                got_cols: circuit.n_cols(),
+            });
+        }
+        assert_eq!(
+            circuit.const_pin_col(),
+            ty.const_pin,
+            "circuit const_pin must match the registry type"
+        );
+    }
+    if x_ab.x_inner_rest.len() != inner_rest_len {
+        return Err(VerifyError::BadInnerRestLength {
+            which: "x_ab",
+            expected: inner_rest_len,
+            got: x_ab.x_inner_rest.len(),
+        });
+    }
+    if x_ab.x_outer.len() != nu {
+        return Err(VerifyError::BadOuterLength {
+            which: "x_ab",
+            expected: nu,
+            got: x_ab.x_outer.len(),
+        });
+    }
+    if proof.rounds.len() != inner_rest_len {
+        return Err(VerifyError::BadVectorLength {
+            which: "rounds",
+            expected: inner_rest_len,
+            got: proof.rounds.len(),
+        });
+    }
+    if proof.z_partial.len() != n_skip {
+        return Err(VerifyError::BadVectorLength {
+            which: "z_partial",
+            expected: n_skip,
+            got: proof.z_partial.len(),
+        });
+    }
+
+    challenger.observe_label(b"flock-lincheck-v0");
+    let alpha = challenger.sample_f128();
+
+    // --- per-type comb construction (the O(Σ_t nnz_t) fold_alpha_batched) ---
+    let t0 = Instant::now();
+    let mut combs: Vec<Vec<F128>> = registry
+        .types()
+        .iter()
+        .zip(registry.slots())
+        .zip(circuits)
+        .map(|((ty, slot), circuit)| {
+            let inner = ty.k_log - k_skip;
+            let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest[..inner], k_skip);
+            let mut comb = circuit.fold_alpha_batched(alpha, &eq_inner);
+            if slot.prefix_bits > 0 {
+                let w_t = eq_prefix_weight(&x_ab.x_inner_rest[inner..], slot.prefix);
+                for v in &mut comb {
+                    *v *= w_t;
+                }
+            }
+            comb
+        })
+        .collect();
+    let comb_s = t0.elapsed().as_secs_f64();
+
+    let mut target = alpha * v_a + v_b;
+    for ((circuit, comb), &n_t) in circuits.iter().zip(&mut combs).zip(union.counts()) {
+        if let Some(col) = circuit.const_pin_col() {
+            let beta = challenger.sample_f128();
+            comb[col] += beta;
+            target += beta * eq_prefix_sum(&x_ab.x_outer, n_t);
+        }
+    }
+
+    let mut running = target;
+    let mut r_rounds = Vec::with_capacity(inner_rest_len);
+    for &(e1, einf) in &proof.rounds {
+        challenger.observe_f128(e1);
+        challenger.observe_f128(einf);
+        let r = challenger.sample_f128();
+        let e0 = running + e1;
+        let c1 = e0 + e1 + einf;
+        running = einf * r * r + c1 * r + e0;
+        r_rounds.push(r);
+    }
+
+    challenger.observe_f128_slice(&proof.z_partial);
+
+    let mut rr = r_rounds;
+    rr.reverse();
+    let comb_partial = union_comb_partial(registry, &combs, &rr, k_skip);
+    let final_sum = inner_product(&comb_partial, &proof.z_partial);
+    if running != final_sum {
+        return Err(VerifyError::ConsistencyFailed {
+            which: "sumcheck-final",
+        });
+    }
+
+    let r_inner_skip = challenger.sample_f128();
+    let lambda = lagrange_weights_naive(k_skip, r_inner_skip);
+    let w = inner_product(&lambda, &proof.z_partial);
+
+    Ok((
+        LincheckClaim {
+            r_inner_skip,
+            r_inner_rest: rr,
+            w,
+        },
+        comb_s,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

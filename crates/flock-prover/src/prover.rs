@@ -974,3 +974,169 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
     let claim = R1csClaim { ab, c };
     (proof, commitment, claim, t)
 }
+
+/// [`prove_fast_ligerito_jagged_union`] with per-phase timers — the union
+/// counterpart of [`prove_fast_ligerito_timed`]. Inlines the same calls in
+/// the same order as `prove_union_with_binding` under the `Mixed` binding
+/// (the protocol `flock-mixed-v1` binding), wrapping each phase in an
+/// `Instant`, so the returned [`ProvePhaseTimings`] decompose the real union
+/// prover phase by phase:
+///   * `witness_s`  — union witness assembly (`assemble_witness`) + the
+///     dense-stack compaction (`compact_witness`);
+///   * `commit_s`   — the PCS commit of the dense stack `q`;
+///   * `zerocheck_s`— the union zerocheck over the M-variable address space;
+///   * `lincheck_s` — the union-column lincheck (one circuit per slot) plus
+///     the small post-lincheck base-claim / `s_hat_v` setup;
+///   * `open_s`     — the jagged-transport batched PCS open.
+///
+/// Kept in lockstep with `prove_fast_ligerito_jagged_union`; benchmark-only.
+/// Does not disturb the production path.
+pub fn prove_fast_ligerito_jagged_union_timed<Ch: Challenger>(
+    union: &flock_core::union::UnionInstance<'_>,
+    pcs_params: &PcsParams,
+    slots: Vec<UnionSlotProverInput<'_>>,
+    challenger: &mut Ch,
+) -> (
+    R1csProofJaggedLigerito,
+    Commitment,
+    R1csClaim,
+    ProvePhaseTimings,
+) {
+    use std::time::Instant;
+    let mut t = ProvePhaseTimings::default();
+
+    let m = union.m_total();
+    assert_eq!(
+        pcs_params.m,
+        union.dense_m(),
+        "PcsParams.m must equal the union's dense_m (committed stack size)"
+    );
+    assert_eq!(
+        slots.len(),
+        union.registry().num_types(),
+        "need one prover input per registry type"
+    );
+
+    let log_n = union.dense_m() - pcs::LOG_PACKING;
+    let lig_config =
+        pcs::ligerito::prover_config_for(log_n, pcs_params.log_batch_size, pcs_params.profile)
+            .expect("Ligerito default config; bump m for tiny instances");
+
+    // --- witness assembly + dense-stack compaction ---
+    let t0 = Instant::now();
+    let mut witnesses = Vec::with_capacity(slots.len());
+    let mut linchecks = Vec::with_capacity(slots.len());
+    for slot in slots {
+        witnesses.push(slot.witness);
+        linchecks.push((slot.z_lincheck, slot.lincheck_circuit));
+    }
+    let (z_packed, a_packed_f128, b_packed_f128) = union.assemble_witness(witnesses);
+    let dense_q: Option<Vec<F128>> = if union.compaction_is_identity() {
+        None
+    } else {
+        Some(union.compact_witness(&z_packed))
+    };
+    t.witness_s = t0.elapsed().as_secs_f64();
+
+    // --- PCS commit ---
+    let t0 = Instant::now();
+    let (commitment, prover_data) = match &dense_q {
+        Some(q) => pcs::commit(q, pcs_params),
+        None => pcs::commit(&z_packed, pcs_params),
+    };
+    t.commit_s = t0.elapsed().as_secs_f64();
+    union.bind_statement(challenger, &commitment);
+
+    let padding = union.padding_spec();
+
+    // --- union zerocheck ---
+    let t0 = Instant::now();
+    let (zc_proof, zc_claim, s_hat_v_c) = {
+        let a_packed: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                a_packed_f128.as_ptr() as *const u8,
+                a_packed_f128.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        let b_packed: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                b_packed_f128.as_ptr() as *const u8,
+                b_packed_f128.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        let c_packed: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                z_packed.as_ptr() as *const u8,
+                z_packed.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        zerocheck::prove_packed_padded_capture_s_hat_v_c(
+            a_packed, b_packed, c_packed, m, &padding, challenger,
+        )
+    };
+    t.zerocheck_s = t0.elapsed().as_secs_f64();
+    flock_core::scratch::give_f128(a_packed_f128);
+    flock_core::scratch::give_f128(b_packed_f128);
+
+    let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
+
+    // --- union-column lincheck + base-claim / s_hat_v setup ---
+    let t0 = Instant::now();
+    let (lc_proof, lc_claim, z_vec_pre) = {
+        let lc_slots: Vec<lincheck::UnionLincheckSlot<'_>> = linchecks
+            .iter()
+            .map(|(stripe, circuit)| lincheck::UnionLincheckSlot {
+                z_lincheck: stripe,
+                circuit: *circuit,
+            })
+            .collect();
+        lincheck::prove_union_capture_z_vec(union, &lc_slots, &x_ab, challenger)
+    };
+    drop(linchecks);
+
+    let ab = ZClaim {
+        point: union.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
+        value: lc_claim.w,
+    };
+    let c = ZClaim {
+        point: union.c_claim_point(zc_claim.z, &zc_claim.r_rest),
+        value: zc_claim.c_eval,
+    };
+    let s_hat_v_ab = if m - union.n_log() >= pcs::LOG_PACKING {
+        Some(pcs::ring_switch::s_hat_v_from_z_vec(
+            &z_vec_pre,
+            &lc_claim.r_inner_rest[1..],
+        ))
+    } else {
+        None
+    };
+    t.lincheck_s = t0.elapsed().as_secs_f64();
+
+    // --- jagged-transport batched PCS open ---
+    let heights = union.jagged_heights();
+    let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
+    let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
+    let t0 = Instant::now();
+    let pcs_open = open_claims_with_precomputed_jagged_ligerito(
+        z_packed,
+        dense_q,
+        &prover_data,
+        &commitment,
+        &[ab.clone(), c.clone()],
+        &[pre_ab, pre_c],
+        &padding,
+        &heights,
+        union.n_log(),
+        &lig_config,
+        challenger,
+    );
+    t.open_s = t0.elapsed().as_secs_f64();
+
+    let proof = R1csProofJaggedLigerito {
+        zerocheck: zc_proof,
+        lincheck: lc_proof,
+        pcs_open,
+    };
+    let claim = R1csClaim { ab, c };
+    (proof, commitment, claim, t)
+}
