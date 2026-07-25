@@ -578,7 +578,14 @@ where
     for buf in [&*z, &*a, &*b] {
         assert_eq!(buf.len(), total_f128, "witness destination length");
     }
-    let stripe = vec![0u8; n_total * u64_per_block * 8];
+    // Pooled (resident) stripe: `stripe_from_rows` writes rows
+    // `[0, useful_words)` of every group — including fully-dummy groups, which
+    // flush zeros — so only each group's TAIL rows need clearing, a few percent
+    // of the buffer instead of faulting in all of it.
+    let mut stripe = flock_core::scratch::take_u8(n_total * u64_per_block * 8);
+    stripe
+        .par_chunks_mut(u64_per_block * 64)
+        .for_each(|g| g[useful_words * 64..].fill(0));
     // Zero the padding suffix (contiguous chunk-columns >= useful_chunks);
     // the producers fully rewrite the useful prefix every call.
     let tail = useful_chunks << n_blocks_log;
@@ -705,7 +712,14 @@ where
     for buf in [&*z, &*a, &*b] {
         assert_eq!(buf.len(), total_f128, "witness destination length");
     }
-    let stripe = vec![0u8; n_total * u64_per_block * 8];
+    // Pooled (resident) stripe: `stripe_from_rows` writes rows
+    // `[0, useful_words)` of every group — including fully-dummy groups, which
+    // flush zeros — so only each group's TAIL rows need clearing, a few percent
+    // of the buffer instead of faulting in all of it.
+    let mut stripe = flock_core::scratch::take_u8(n_total * u64_per_block * 8);
+    stripe
+        .par_chunks_mut(u64_per_block * 64)
+        .for_each(|g| g[useful_words * 64..].fill(0));
     // Zero the padding suffix (contiguous chunk-columns >= useful_chunks);
     // the loop below fully writes the useful prefix — declared rows from the
     // builders, dummy rows as zero flushes.

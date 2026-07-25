@@ -736,7 +736,11 @@ fn prove_union_with_binding<Ch: Challenger>(
             .collect();
         lincheck::prove_union_capture_z_vec(union, &lc_slots, &x_ab, challenger)
     };
-    drop(linchecks);
+    // Recycle the stripes (as large as the witness itself) rather than
+    // unmapping them — the drivers take them from the same pool.
+    for (stripe, _) in linchecks {
+        flock_core::scratch::give_u8(stripe);
+    }
 
     let ab = ZClaim {
         point: union.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
@@ -913,7 +917,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     );
     // The lincheck stripe copy of z is dead from here on; free it before the
     // PCS open (2^(m-3) bytes — 64 MB at m = 29).
-    drop(z_packed_lincheck);
+    flock_core::scratch::give_u8(z_packed_lincheck);
 
     let ab = ZClaim {
         point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
@@ -1054,7 +1058,7 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
         &x_ab,
         challenger,
     );
-    drop(z_packed_lincheck);
+    flock_core::scratch::give_u8(z_packed_lincheck);
     let ab = ZClaim {
         point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
         value: lc_claim.w,
@@ -1222,7 +1226,11 @@ pub fn prove_fast_ligerito_jagged_union_timed<Ch: Challenger>(
             .collect();
         lincheck::prove_union_capture_z_vec(union, &lc_slots, &x_ab, challenger)
     };
-    drop(linchecks);
+    // Recycle the stripes (as large as the witness itself) rather than
+    // unmapping them — the drivers take them from the same pool.
+    for (stripe, _) in linchecks {
+        flock_core::scratch::give_u8(stripe);
+    }
 
     let ab = ZClaim {
         point: union.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),

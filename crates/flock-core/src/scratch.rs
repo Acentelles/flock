@@ -92,6 +92,69 @@ pub fn give_f128(v: Vec<F128>) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Byte pool, for the lincheck stripe.
+//
+// The stripe is the drivers' fourth output and is as large as the packed
+// witness itself (134 MB at m = 30). `vec![0u8; n]` gets zero pages from the
+// OS cheaply, but every page still soft-faults on first touch during the
+// transpose — measured at ~0.8 ms per 134 MB, paid on every prove. Recycling
+// resident buffers removes that; callers zero only the region they do not
+// write (the stripe's per-group tail rows), which is a few percent.
+// ---------------------------------------------------------------------------
+
+static U8_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+/// Max byte buffers retained. One stripe per slot in flight, plus headroom.
+const MAX_POOLED_U8: usize = 4;
+
+/// Take a length-`n` byte vector, preferring a pooled buffer (smallest
+/// capacity ≥ `n`); falls back to a fresh zeroed allocation.
+///
+/// Contents are UNSPECIFIED when a pooled buffer is returned — stale bytes
+/// from a previous use. The caller MUST write or explicitly zero every byte it
+/// later reads (same contract as [`take_f128`]).
+pub fn take_u8(n: usize) -> Vec<u8> {
+    let mut pool = U8_POOL.lock().unwrap();
+    let mut best: Option<usize> = None;
+    for (i, v) in pool.iter().enumerate() {
+        if v.capacity() >= n && best.is_none_or(|b| v.capacity() < pool[b].capacity()) {
+            best = Some(i);
+        }
+    }
+    if let Some(i) = best {
+        let mut v = pool.swap_remove(i);
+        drop(pool);
+        v.clear();
+        // SAFETY: capacity ≥ n checked above; u8 has no Drop and every bit
+        // pattern is valid, so exposing stale bytes is sound to hold — the
+        // caller upholds write-or-zero-before-read per this contract.
+        unsafe { v.set_len(n) };
+        return v;
+    }
+    drop(pool);
+    vec![0u8; n]
+}
+
+/// Return a byte buffer for reuse. Smallest-capacity eviction, as
+/// [`give_f128`].
+pub fn give_u8(v: Vec<u8>) {
+    if v.capacity() == 0 {
+        return;
+    }
+    let mut pool = U8_POOL.lock().unwrap();
+    pool.push(v);
+    if pool.len() > MAX_POOLED_U8 {
+        let smallest = pool
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, v)| v.capacity())
+            .map(|(i, _)| i)
+            .expect("pool non-empty");
+        pool.swap_remove(smallest);
+    }
+}
+
 /// Pre-warm the pool for proves at witness size `2^m`: allocate and
 /// first-touch the full prove-cycle buffer set once, in parallel, then park
 /// it in the pool. Called from the per-hash Setup constructors, this moves
@@ -136,6 +199,7 @@ pub fn prewarm_prover(m: usize) {
 /// Release every pooled buffer back to the OS.
 pub fn clear() {
     POOL.lock().unwrap().clear();
+    U8_POOL.lock().unwrap().clear();
 }
 
 #[cfg(test)]
