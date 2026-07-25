@@ -77,7 +77,7 @@
 //! does not exist in `F128`).
 
 use crate::challenger::Challenger;
-use crate::field::F128;
+use crate::field::{F128, F256Unreduced};
 use crate::lincheck::build_eq_table;
 use serde::{Deserialize, Serialize};
 
@@ -457,6 +457,129 @@ fn generate_f_and_claim_blocked(
 /// are bit-identical to a separate `Σ q_0·W_0` pass. Feeds the fused
 /// jagged→Ligerito opening (`pcs::open_batch_jagged_ligerito`), which
 /// discharges `⟨q, W⟩ = v` directly in Ligerito with `W` as the basis.
+/// The jagged weight in FACTORED form. `W[e] = eq_row[e − prefix[col(e)]] ·
+/// eq_col[col(e)]`, zero past `area` — it never has to exist as a `2^m` array.
+/// Consumers fill a small, L1-resident window on demand
+/// ([`Self::fill`]) instead of streaming 134 MB from DRAM at `m = 30`.
+///
+/// Works for ARBITRARY column heights: `col(e)` comes from a cursor walk over
+/// `col_prefix_sums`, so nothing here assumes uniform or power-of-two heights.
+// Consumed only by the equivalence test until the opening path is switched
+// over; see `claim_and_round0_jit`.
+#[allow(dead_code)]
+pub(crate) struct JaggedWeight<'a> {
+    eq_row: Vec<F128>,
+    eq_col: Vec<F128>,
+    prefix: &'a [u64],
+    area: usize,
+}
+
+#[allow(dead_code)]
+impl<'a> JaggedWeight<'a> {
+    pub(crate) fn new(params: &'a JaggedParams, z_row: &[F128], z_col: &[F128]) -> Self {
+        assert_eq!(z_row.len(), params.n);
+        assert_eq!(z_col.len(), params.k);
+        Self {
+            eq_row: build_eq_table(z_row),
+            eq_col: build_eq_table(z_col),
+            prefix: &params.col_prefix_sums,
+            area: params.area() as usize,
+        }
+    }
+
+    /// Fill `out` with `W[g0 .. g0 + out.len())`.
+    #[inline]
+    pub(crate) fn fill(&self, out: &mut [F128], g0: usize) {
+        fill_weight_range(out, g0, self.area, self.prefix, &self.eq_row, &self.eq_col);
+    }
+}
+
+/// [`weight_table_claim_and_round0_blocked`] WITHOUT materializing `W`: the
+/// claim `v` and the round-0 message are accumulated against a just-in-time
+/// window of the factored weight, so the `2^m` basis array is never written.
+/// `d = 1` is the element pairing, `d > 1` the blocked (lane-major) one.
+///
+/// Value-identical to the materializing pair by construction — the same terms
+/// in the same per-chunk order.
+#[allow(dead_code)]
+pub(crate) fn claim_and_round0_jit(
+    w: &JaggedWeight<'_>,
+    q: &[F128],
+    d: usize,
+) -> (F128, (F128, F128)) {
+    use rayon::prelude::*;
+
+    let len = q.len();
+    assert!(d >= 1 && d <= len / 2 && d.is_power_of_two());
+    // Window kept small enough to stay in L1 alongside the two source runs.
+    const CH: usize = 1 << 11;
+    let (v, g_one, g_inf) = if d == 1 {
+        // Element pairing: one contiguous window per chunk.
+        q.par_chunks(2 * CH)
+            .enumerate()
+            .map(|(ci, qc)| {
+                let g0 = ci * 2 * CH;
+                let mut wb = [F128::ZERO; 2 * CH];
+                let wb = &mut wb[..qc.len()];
+                w.fill(wb, g0);
+                let mut acc = F256Unreduced::ZERO;
+                let mut m_one = F256Unreduced::ZERO;
+                let mut m_inf = F256Unreduced::ZERO;
+                for (bp, qp) in wb.chunks_exact(2).zip(qc.chunks_exact(2)) {
+                    let t = qp[1].mul_unreduced(bp[1]);
+                    acc ^= qp[0].mul_unreduced(bp[0]) ^ t;
+                    m_one ^= t;
+                    m_inf ^= (qp[0] + qp[1]).mul_unreduced(bp[0] + bp[1]);
+                }
+                (acc.reduce(), m_one.reduce(), m_inf.reduce())
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO, F128::ZERO),
+                |(a, b, c), (x, y, z)| (a + x, b + y, c + z),
+            )
+    } else {
+        // Blocked pairing: two windows `d` apart, one per half of the pair.
+        let pairs = len / (2 * d);
+        (0..pairs)
+            .into_par_iter()
+            .map(|c| {
+                let base = 2 * c * d;
+                (0..d.div_ceil(CH))
+                    .into_par_iter()
+                    .map(|si| {
+                        let o = si * CH;
+                        let n = CH.min(d - o);
+                        let mut lo = [F128::ZERO; CH];
+                        let mut hi = [F128::ZERO; CH];
+                        let (lo, hi) = (&mut lo[..n], &mut hi[..n]);
+                        w.fill(lo, base + o);
+                        w.fill(hi, base + d + o);
+                        let q_lo = &q[base + o..base + o + n];
+                        let q_hi = &q[base + d + o..base + d + o + n];
+                        let mut acc = F256Unreduced::ZERO;
+                        let mut m_one = F256Unreduced::ZERO;
+                        let mut m_inf = F256Unreduced::ZERO;
+                        for i in 0..n {
+                            let t = q_hi[i].mul_unreduced(hi[i]);
+                            acc ^= q_lo[i].mul_unreduced(lo[i]) ^ t;
+                            m_one ^= t;
+                            m_inf ^= (q_lo[i] + q_hi[i]).mul_unreduced(lo[i] + hi[i]);
+                        }
+                        (acc.reduce(), m_one.reduce(), m_inf.reduce())
+                    })
+                    .reduce(
+                        || (F128::ZERO, F128::ZERO, F128::ZERO),
+                        |(a, b, c), (x, y, z)| (a + x, b + y, c + z),
+                    )
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO, F128::ZERO),
+                |(a, b, c), (x, y, z)| (a + x, b + y, c + z),
+            )
+    };
+    (v, (v + g_one, g_inf))
+}
+
 /// [`weight_table_claim_and_round0`] with the round-0 prime taken over the
 /// BLOCKED pairing of block size `d` — what L0 binds when the committed stack
 /// is lane-major (high-bit lanes; see `ligerito::fold_and_msg_blocked`). The
@@ -1541,6 +1664,45 @@ mod tests {
     /// whose cumulative sums reach `2^m` (bit `m` of `t` set), across several
     /// `ris`-length splits including the degenerate `yr = 0` and `yr = m`.
     ///
+    /// The just-in-time weight reproduces the MATERIALIZING path exactly —
+    /// same claim, same round-0 message — for both pairings and for shapes
+    /// with NON-uniform, non-power-of-two column heights (which is the whole
+    /// point: the factoring `W[e] = eq_row[row] · eq_col[col]` holds for any
+    /// heights, since `col(e)` comes from a cursor over the prefix sums).
+    #[test]
+    fn jit_weight_matches_materialized_claim_and_round0() {
+        let mut ch = RandomChallenger::new(0x11_7C_0DE);
+        for &(n, k, m) in &[(4usize, 3usize, 7usize), (5, 3, 9), (3, 4, 8)] {
+            for _ in 0..3 {
+                let (params, q) = random_instance(&mut ch, n, k, m);
+                let z_row = sample_vec(&mut ch, n);
+                let z_col = sample_vec(&mut ch, k);
+                let jit = JaggedWeight::new(&params, &z_row, &z_col);
+                // element pairing
+                let (_w, v, r0) = weight_table_claim_and_round0(&params, &q, &z_row, &z_col);
+                assert_eq!(
+                    (v, r0),
+                    claim_and_round0_jit(&jit, &q, 1),
+                    "element pairing (n={n} k={k} m={m})"
+                );
+                // blocked pairing, every legal block size
+                for log_d in 1..m {
+                    let d = 1usize << log_d;
+                    if q.len() / (2 * d) == 0 {
+                        continue;
+                    }
+                    let (_w, v, r0) =
+                        weight_table_claim_and_round0_blocked(&params, &q, &z_row, &z_col, d);
+                    assert_eq!(
+                        (v, r0),
+                        claim_and_round0_jit(&jit, &q, d),
+                        "blocked d={d} (n={n} k={k} m={m})"
+                    );
+                }
+            }
+        }
+    }
+
     /// The middle-block variant matches per-`y` `f_hat_t` at the split point
     /// `low ‖ bits(y) ‖ high` — the shape the high-bit-lane opening's variable
     /// rotation produces. Covers every split of the fixed coordinates between
