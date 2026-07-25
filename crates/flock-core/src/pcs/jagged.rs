@@ -362,20 +362,34 @@ fn fill_weight_range(
         out.fill(F128::ZERO);
         return;
     }
+    // Walk COLUMN SEGMENTS, not elements: within a column `eq_col` is constant
+    // and the row index runs contiguously, so a segment is a run of `eq_row`
+    // scaled by one hoisted constant — the `i >= area` test and the column
+    // cursor leave the inner loop entirely. This is what makes the
+    // just-in-time basis ([`JaggedWeight`]) competitive: it is called twice per
+    // element position across the round-0 message and fold, so per-element
+    // branching there costs double.
     let mut col = prefix
         .partition_point(|&t| t <= g0 as u64)
         .saturating_sub(1);
-    for (k, slot) in out.iter_mut().enumerate() {
-        let i = g0 + k;
-        *slot = if i >= area {
-            F128::ZERO
-        } else {
-            while (i as u64) >= prefix[col + 1] {
-                col += 1;
-            }
-            eq_row[i - prefix[col] as usize] * eq_col[col]
-        };
+    let end = (g0 + out.len()).min(area);
+    let mut i = g0;
+    let mut pos = 0usize;
+    while i < end {
+        while (i as u64) >= prefix[col + 1] {
+            col += 1;
+        }
+        let seg_end = (prefix[col + 1] as usize).min(end);
+        let row0 = i - prefix[col] as usize;
+        let ec = eq_col[col];
+        let n = seg_end - i;
+        for (k, slot) in out[pos..pos + n].iter_mut().enumerate() {
+            *slot = eq_row[row0 + k] * ec;
+        }
+        pos += n;
+        i = seg_end;
     }
+    out[pos..].fill(F128::ZERO);
 }
 
 /// [`generate_f_and_claim`] whose round-0 message is taken over the BLOCK
@@ -388,6 +402,7 @@ fn fill_weight_range(
 /// Each task therefore owns a sub-range of one block PAIR — the two halves
 /// carved by `split_at_mut` — which keeps the prime fused into the weight
 /// build instead of costing a second 268 MB pass over `(q, W)`.
+#[cfg(test)]
 fn generate_f_and_claim_blocked(
     params: &JaggedParams,
     q: &[F128],
@@ -464,9 +479,6 @@ fn generate_f_and_claim_blocked(
 ///
 /// Works for ARBITRARY column heights: `col(e)` comes from a cursor walk over
 /// `col_prefix_sums`, so nothing here assumes uniform or power-of-two heights.
-// Consumed only by the equivalence test until the opening path is switched
-// over; see `claim_and_round0_jit`.
-#[allow(dead_code)]
 pub(crate) struct JaggedWeight<'a> {
     eq_row: Vec<F128>,
     eq_col: Vec<F128>,
@@ -474,7 +486,6 @@ pub(crate) struct JaggedWeight<'a> {
     area: usize,
 }
 
-#[allow(dead_code)]
 impl<'a> JaggedWeight<'a> {
     pub(crate) fn new(params: &'a JaggedParams, z_row: &[F128], z_col: &[F128]) -> Self {
         assert_eq!(z_row.len(), params.n);
@@ -501,7 +512,6 @@ impl<'a> JaggedWeight<'a> {
 ///
 /// Value-identical to the materializing pair by construction — the same terms
 /// in the same per-chunk order.
-#[allow(dead_code)]
 pub(crate) fn claim_and_round0_jit(
     w: &JaggedWeight<'_>,
     q: &[F128],
@@ -517,22 +527,24 @@ pub(crate) fn claim_and_round0_jit(
         // Element pairing: one contiguous window per chunk.
         q.par_chunks(2 * CH)
             .enumerate()
-            .map(|(ci, qc)| {
-                let g0 = ci * 2 * CH;
-                let mut wb = [F128::ZERO; 2 * CH];
-                let wb = &mut wb[..qc.len()];
-                w.fill(wb, g0);
-                let mut acc = F256Unreduced::ZERO;
-                let mut m_one = F256Unreduced::ZERO;
-                let mut m_inf = F256Unreduced::ZERO;
-                for (bp, qp) in wb.chunks_exact(2).zip(qc.chunks_exact(2)) {
-                    let t = qp[1].mul_unreduced(bp[1]);
-                    acc ^= qp[0].mul_unreduced(bp[0]) ^ t;
-                    m_one ^= t;
-                    m_inf ^= (qp[0] + qp[1]).mul_unreduced(bp[0] + bp[1]);
-                }
-                (acc.reduce(), m_one.reduce(), m_inf.reduce())
-            })
+            .map_init(
+                || vec![F128::ZERO; 2 * CH],
+                |buf, (ci, qc)| {
+                    let g0 = ci * 2 * CH;
+                    let wb = &mut buf[..qc.len()];
+                    w.fill(wb, g0);
+                    let mut acc = F256Unreduced::ZERO;
+                    let mut m_one = F256Unreduced::ZERO;
+                    let mut m_inf = F256Unreduced::ZERO;
+                    for (bp, qp) in wb.chunks_exact(2).zip(qc.chunks_exact(2)) {
+                        let t = qp[1].mul_unreduced(bp[1]);
+                        acc ^= qp[0].mul_unreduced(bp[0]) ^ t;
+                        m_one ^= t;
+                        m_inf ^= (qp[0] + qp[1]).mul_unreduced(bp[0] + bp[1]);
+                    }
+                    (acc.reduce(), m_one.reduce(), m_inf.reduce())
+                },
+            )
             .reduce(
                 || (F128::ZERO, F128::ZERO, F128::ZERO),
                 |(a, b, c), (x, y, z)| (a + x, b + y, c + z),
@@ -546,27 +558,31 @@ pub(crate) fn claim_and_round0_jit(
                 let base = 2 * c * d;
                 (0..d.div_ceil(CH))
                     .into_par_iter()
-                    .map(|si| {
-                        let o = si * CH;
-                        let n = CH.min(d - o);
-                        let mut lo = [F128::ZERO; CH];
-                        let mut hi = [F128::ZERO; CH];
-                        let (lo, hi) = (&mut lo[..n], &mut hi[..n]);
-                        w.fill(lo, base + o);
-                        w.fill(hi, base + d + o);
-                        let q_lo = &q[base + o..base + o + n];
-                        let q_hi = &q[base + d + o..base + d + o + n];
-                        let mut acc = F256Unreduced::ZERO;
-                        let mut m_one = F256Unreduced::ZERO;
-                        let mut m_inf = F256Unreduced::ZERO;
-                        for i in 0..n {
-                            let t = q_hi[i].mul_unreduced(hi[i]);
-                            acc ^= q_lo[i].mul_unreduced(lo[i]) ^ t;
-                            m_one ^= t;
-                            m_inf ^= (q_lo[i] + q_hi[i]).mul_unreduced(lo[i] + hi[i]);
-                        }
-                        (acc.reduce(), m_one.reduce(), m_inf.reduce())
-                    })
+                    // Scratch allocated ONCE per worker: a fresh
+                    // `[F128::ZERO; CH]` per window would zero 32 KB for every
+                    // 32 KB of useful fill — 2x the writes.
+                    .map_init(
+                        || (vec![F128::ZERO; CH], vec![F128::ZERO; CH]),
+                        |(lo_buf, hi_buf), si| {
+                            let o = si * CH;
+                            let n = CH.min(d - o);
+                            let (lo, hi) = (&mut lo_buf[..n], &mut hi_buf[..n]);
+                            w.fill(lo, base + o);
+                            w.fill(hi, base + d + o);
+                            let q_lo = &q[base + o..base + o + n];
+                            let q_hi = &q[base + d + o..base + d + o + n];
+                            let mut acc = F256Unreduced::ZERO;
+                            let mut m_one = F256Unreduced::ZERO;
+                            let mut m_inf = F256Unreduced::ZERO;
+                            for i in 0..n {
+                                let t = q_hi[i].mul_unreduced(hi[i]);
+                                acc ^= q_lo[i].mul_unreduced(lo[i]) ^ t;
+                                m_one ^= t;
+                                m_inf ^= (q_lo[i] + q_hi[i]).mul_unreduced(lo[i] + hi[i]);
+                            }
+                            (acc.reduce(), m_one.reduce(), m_inf.reduce())
+                        },
+                    )
                     .reduce(
                         || (F128::ZERO, F128::ZERO, F128::ZERO),
                         |(a, b, c), (x, y, z)| (a + x, b + y, c + z),
@@ -580,11 +596,16 @@ pub(crate) fn claim_and_round0_jit(
     (v, (v + g_one, g_inf))
 }
 
+/// Materializing counterpart of [`claim_and_round0_jit`], retained as its
+/// DIFFERENTIAL ORACLE only — the opening path builds the basis just-in-time,
+/// so nothing in the library calls this.
+///
 /// [`weight_table_claim_and_round0`] with the round-0 prime taken over the
 /// BLOCKED pairing of block size `d` — what L0 binds when the committed stack
 /// is lane-major (high-bit lanes; see `ligerito::fold_and_msg_blocked`). The
 /// claim `v` is pairing-invariant; only the message differs, and it stays
 /// FUSED into the weight-table build.
+#[cfg(test)]
 pub(crate) fn weight_table_claim_and_round0_blocked(
     params: &JaggedParams,
     q: &[F128],

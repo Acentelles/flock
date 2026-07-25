@@ -30,7 +30,7 @@
 //!    c. Else: commit f^{i+2}, open f^{i+1}, induce next basis, glue.
 
 use crate::challenger::Challenger;
-use crate::field::F128;
+use crate::field::{F128, F256Unreduced};
 use crate::lincheck::build_eq_table;
 use crate::merkle::{self, Hash};
 use crate::ntt::additive_ntt_f128::AdditiveNttF128;
@@ -2790,6 +2790,129 @@ fn fold_and_msg_blocked(
     (nf, nb, SumcheckMessage { u_0, u_2 })
 }
 
+/// Fills a window of the basis: `out = b[g0 .. g0 + out.len()]`. Lets L0
+/// source its basis from a compact factored form
+/// (`jagged::JaggedWeight`) instead of a materialized `2^m` array.
+pub type BasisWindowFn<'a> = &'a (dyn Fn(&mut [F128], usize) + Sync);
+
+/// [`fold_and_msg_blocked`] with the basis supplied JUST-IN-TIME. Identical
+/// arithmetic and identical output; the only difference is that each task
+/// fills two small L1-resident windows of `b` rather than streaming them from
+/// a `2^m` array — which at `m = 30` removes both the 134 MB materialization
+/// and the 134 MB read of it, and measures FASTER than the read (see
+/// `tests/jit_fold.rs`).
+///
+/// Blocked pairing only (`d > 1`): that is the lane-major L0 fold, the one on
+/// the integer-lane opening path. The power-of-two path keeps the materialized
+/// kernel, so its byte-identity anchors are untouched.
+#[allow(clippy::too_many_arguments)]
+fn fold_and_msg_blocked_jit(
+    f: &[F128],
+    fill: BasisWindowFn<'_>,
+    r: F128,
+    d: usize,
+    live_in: usize,
+) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
+    use rayon::prelude::*;
+
+    let n = f.len();
+    debug_assert!(d > 1 && n.is_power_of_two() && n >= 2 * d);
+    let half = n / 2;
+    let blocks_out = half / d;
+    let live_in = live_in.min(2 * blocks_out).max(1);
+    let live_out = live_in.div_ceil(2).min(blocks_out);
+    let one_plus_r = F128::ONE + r;
+
+    let mut nf = crate::scratch::take_f128(half);
+    let mut nb = crate::scratch::take_f128(half);
+    const CH: usize = 1 << 11;
+
+    // Combine one aligned run with an optionally-dead `hi`.
+    let comb = |out: &mut [F128], lo: &[F128], hi: Option<&[F128]>| match hi {
+        Some(hi) => {
+            for ((o, &l), &h) in out.iter_mut().zip(lo).zip(hi) {
+                *o = l + r * (h + l);
+            }
+        }
+        None => {
+            for (o, &l) in out.iter_mut().zip(lo) {
+                *o = l * one_plus_r;
+            }
+        }
+    };
+
+    let live_tasks = live_out.div_ceil(2);
+    let (u_0, u_2) = nf
+        .par_chunks_mut(2 * d)
+        .zip(nb.par_chunks_mut(2 * d))
+        .enumerate()
+        .take(live_tasks)
+        .map(|(qq, (nfc, nbc))| {
+            let (nf0, nf1) = nfc.split_at_mut(d);
+            let (nb0, nb1) = nbc.split_at_mut(d);
+            let odd_live = 2 * qq + 1 < live_out;
+            nf0.par_chunks_mut(CH)
+                .zip(nf1.par_chunks_mut(CH))
+                .zip(nb0.par_chunks_mut(CH))
+                .zip(nb1.par_chunks_mut(CH))
+                .enumerate()
+                // Scratch once per worker, not once per window.
+                .map_init(
+                    || (vec![F128::ZERO; CH], vec![F128::ZERO; CH]),
+                    |(wlo, whi), (ci, (((f0, f1), b0), b1))| {
+                        let o = ci * CH;
+                        let len = f0.len();
+                        let src_of = |c: usize| 2 * c * d + o;
+                        let mut u0 = F256Unreduced::ZERO;
+                        let mut u2 = F256Unreduced::ZERO;
+                        let one_side = |c: usize,
+                                        fo: &mut [F128],
+                                        bo: &mut [F128],
+                                        wlo: &mut [F128],
+                                        whi: &mut [F128]| {
+                            let g_lo = src_of(c);
+                            let hi_live = 2 * c + 1 < live_in;
+                            fill(&mut wlo[..len], g_lo);
+                            let fs = &f[g_lo..g_lo + len];
+                            if hi_live {
+                                let g_hi = g_lo + d;
+                                fill(&mut whi[..len], g_hi);
+                                comb(fo, fs, Some(&f[g_hi..g_hi + len]));
+                                comb(bo, &wlo[..len], Some(&whi[..len]));
+                            } else {
+                                comb(fo, fs, None);
+                                comb(bo, &wlo[..len], None);
+                            }
+                        };
+                        one_side(2 * qq, f0, b0, wlo, whi);
+                        if odd_live {
+                            one_side(2 * qq + 1, f1, b1, wlo, whi);
+                            for i in 0..len {
+                                u0 ^= f0[i].mul_unreduced(b0[i]);
+                                u2 ^= (f0[i] + f1[i]).mul_unreduced(b0[i] + b1[i]);
+                            }
+                        } else {
+                            for i in 0..len {
+                                let t = f0[i].mul_unreduced(b0[i]);
+                                u0 ^= t;
+                                u2 ^= t;
+                            }
+                        }
+                        (u0.reduce(), u2.reduce())
+                    },
+                )
+                .reduce(
+                    || (F128::ZERO, F128::ZERO),
+                    |(a0, a2), (c0, c2)| (a0 + c0, a2 + c2),
+                )
+        })
+        .reduce(
+            || (F128::ZERO, F128::ZERO),
+            |(a0, a2), (c0, c2)| (a0 + c0, a2 + c2),
+        );
+    (nf, nb, SumcheckMessage { u_0, u_2 })
+}
+
 pub struct SumcheckProver {
     f: Vec<F128>,
     /// Single combined basis poly. After every `glue(β)`, the introduced
@@ -2838,6 +2961,43 @@ impl SumcheckProver {
         };
         inst.transcript.push(first_msg);
         (inst, first_msg)
+    }
+
+    /// Like [`Self::new_with_first_msg`] but with NO materialized basis: the
+    /// first fold sources it just-in-time ([`Self::fold_blocked_jit`]), after
+    /// which `combined_basis` holds the (half-size) folded basis and every
+    /// later round proceeds normally.
+    pub fn new_jit(f: Vec<F128>, h1: F128, first_msg: SumcheckMessage) -> (Self, SumcheckMessage) {
+        let mut inst = Self {
+            f,
+            combined_basis: Vec::new(),
+            t_r: h1,
+            transcript: Vec::new(),
+            pending_glue: None,
+        };
+        inst.transcript.push(first_msg);
+        (inst, first_msg)
+    }
+
+    /// [`Self::fold_blocked`] with the basis filled on demand rather than read
+    /// from a materialized array. Only valid as the FIRST fold (the basis is
+    /// materialized from here on).
+    pub fn fold_blocked_jit(
+        &mut self,
+        r: F128,
+        d: usize,
+        live_in: usize,
+        fill: BasisWindowFn<'_>,
+    ) -> SumcheckMessage {
+        debug_assert!(
+            self.combined_basis.is_empty(),
+            "the JIT basis is only available for the first fold"
+        );
+        let (nf, nb, msg) = fold_and_msg_blocked_jit(&self.f, fill, r, d, live_in);
+        self.f = nf;
+        self.combined_basis = nb;
+        self.transcript.push(msg);
+        msg
     }
 
     pub fn fold(&mut self, r: F128) -> SumcheckMessage {
@@ -3145,6 +3305,7 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
         1usize << config.initial_k,
         false,
         None,
+        None,
         challenger,
     )
     .0
@@ -3175,6 +3336,7 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
         l0_tree,
         1usize << config.initial_k,
         false,
+        None,
         Some(SumcheckMessage {
             u_0: round0_uv.0,
             u_2: round0_uv.1,
@@ -3209,6 +3371,7 @@ pub(crate) fn recursive_prover_with_basis_precomputed_round0_fused<Ch: Challenge
     l0_tree: &[Hash],
     l0_num_lanes: usize,
     l0_lane_major: bool,
+    l0_jit_basis: Option<BasisWindowFn<'_>>,
     round0_uv: (F128, F128),
     challenger: &mut Ch,
 ) -> (LigeritoProof, Vec<F128>) {
@@ -3221,6 +3384,7 @@ pub(crate) fn recursive_prover_with_basis_precomputed_round0_fused<Ch: Challenge
         l0_tree,
         l0_num_lanes,
         l0_lane_major,
+        l0_jit_basis,
         Some(SumcheckMessage {
             u_0: round0_uv.0,
             u_2: round0_uv.1,
@@ -3253,6 +3417,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     l0_tree: &[Hash],
     l0_num_lanes: usize,
     l0_lane_major: bool,
+    l0_jit_basis: Option<BasisWindowFn<'_>>,
     first_msg: Option<SumcheckMessage>,
     challenger: &mut Ch,
 ) -> (LigeritoProof, Vec<F128>) {
@@ -3261,7 +3426,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let initial_k = config.initial_k;
 
     assert_eq!(packed_witness.len(), 1usize << log_n);
-    assert_eq!(b_initial.len(), 1usize << log_n);
+    // A JIT basis has no array; it is filled per window during the first fold.
+    assert!(b_initial.len() == 1usize << log_n || (l0_jit_basis.is_some() && b_initial.is_empty()));
     assert_eq!(config.recursive_ks.len(), r);
     assert_eq!(config.log_inv_rates.len(), r + 1);
     assert!(r >= 1);
@@ -3339,10 +3505,19 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let ood_count = |lvl: usize| -> usize { config.ood_samples.get(lvl).copied().unwrap_or(0) };
 
     let _t = std::time::Instant::now();
-    let (mut sc_prover, start_msg) = match first_msg {
-        Some(msg) => SumcheckProver::new_with_first_msg(packed_witness, b_initial, target, msg),
-        None => SumcheckProver::new(packed_witness, b_initial, target),
+    let (mut sc_prover, start_msg) = match (first_msg, l0_jit_basis) {
+        // JIT basis: no `2^log_n` array exists; the first fold builds the
+        // half-size folded basis directly from the factored form.
+        (Some(msg), Some(_)) => {
+            debug_assert!(b_initial.is_empty());
+            SumcheckProver::new_jit(packed_witness, target, msg)
+        }
+        (Some(msg), None) => {
+            SumcheckProver::new_with_first_msg(packed_witness, b_initial, target, msg)
+        }
+        (None, _) => SumcheckProver::new(packed_witness, b_initial, target),
     };
+    let mut jit = l0_jit_basis;
     challenger.observe_f128(start_msg.u_0);
     challenger.observe_f128(start_msg.u_2);
 
@@ -3362,7 +3537,10 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             fold_grinding_nonces.push(challenger.grind_pow(bits));
         }
         let r = challenger.sample_f128();
-        let msg = sc_prover.fold_blocked(r, l0_fold_block, l0_live_blocks);
+        let msg = match jit.take() {
+            Some(fill) => sc_prover.fold_blocked_jit(r, l0_fold_block, l0_live_blocks, fill),
+            None => sc_prover.fold_blocked(r, l0_fold_block, l0_live_blocks),
+        };
         l0_live_blocks = l0_live_blocks.div_ceil(2);
         challenger.observe_f128(msg.u_0);
         challenger.observe_f128(msg.u_2);

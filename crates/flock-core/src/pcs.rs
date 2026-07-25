@@ -1056,16 +1056,21 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
     // round-0 prime's pairing changes, and it stays fused into this build.
     let l0_num_lanes = commitment.params.num_ntts();
     let lane_major = l0_num_lanes < 1usize << lig_config.initial_k;
-    let (w_rho, claim_v, round0) = if lane_major {
-        jagged::weight_table_claim_and_round0_blocked(
-            &params,
-            &q,
-            &rho[..n_log],
-            &rho[n_log..],
-            q.len() >> lig_config.initial_k,
-        )
-    } else {
-        jagged::weight_table_claim_and_round0(&params, &q, &rho[..n_log], &rho[n_log..])
+    // JIT basis on the lane-major path: the jagged weight FACTORS as
+    // `eq_row[row(e)] · eq_col[col(e)]`, so instead of materializing it over
+    // the whole `2^dense_log` domain (134 MB at m = 30) and streaming it back
+    // in the fold, keep the two small eq tables and fill L1-resident windows
+    // on demand. Measured faster than even the read of a materialized table
+    // (`tests/jit_fold.rs`), and it takes 134 MB off peak. The power-of-two
+    // path keeps the materialized basis, so its anchors are untouched.
+    let jit_weight =
+        lane_major.then(|| jagged::JaggedWeight::new(&params, &rho[..n_log], &rho[n_log..]));
+    let (w_rho, claim_v, round0) = match &jit_weight {
+        Some(jw) => {
+            let (v, r0) = jagged::claim_and_round0_jit(jw, &q, q.len() >> lig_config.initial_k);
+            (Vec::new(), v, r0)
+        }
+        None => jagged::weight_table_claim_and_round0(&params, &q, &rho[..n_log], &rho[n_log..]),
     };
     debug_assert_eq!(
         claim_v, f_eval,
@@ -1077,6 +1082,10 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
             t.elapsed().as_secs_f64() * 1e3
         );
     }
+
+    let fill_basis: Option<Box<dyn Fn(&mut [F128], usize) + Sync + '_>> = jit_weight
+        .as_ref()
+        .map(|jw| Box::new(move |out: &mut [F128], g0: usize| jw.fill(out, g0)) as Box<_>);
 
     // ---- Fused Ligerito: open q against W_ρ with target f_eval, reusing the
     // commit-time codeword/tree as L0. The fused entry also returns the fold
@@ -1092,6 +1101,9 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
         &prover_data.merkle_tree,
         l0_num_lanes,
         lane_major,
+        fill_basis
+            .as_ref()
+            .map(|f| f as ligerito::BasisWindowFn<'_>),
         round0,
         challenger,
     );
