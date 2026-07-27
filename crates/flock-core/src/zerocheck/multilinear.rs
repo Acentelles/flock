@@ -470,6 +470,7 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
                 mlv_challenges,
                 move |pair| (pair & mask) >= useful_pairs_inclusive,
                 true,
+                None,
             )
         }
         // Multi-run (the multi-table slot schedule): no periodic pattern, so
@@ -527,6 +528,7 @@ fn fold_and_round_pair_kernel<D>(
     mlv_challenges: &[F128],
     is_dead: D,
     write_dead: bool,
+    live_pairs: Option<&[(usize, usize)]>,
 ) -> (Vec<F128>, Vec<F128>, F128, F128)
 where
     D: Fn(usize) -> bool + Sync,
@@ -543,6 +545,11 @@ where
     assert_eq!(a_packed.len(), n_out * n_chunks);
     assert_eq!(b_packed.len(), n_out * n_chunks);
     assert_eq!(mlv_challenges.len(), m - k_skip);
+    assert!(
+        live_pairs.is_none() || !write_dead,
+        "chunk skipping leaves dead chunks unwritten — write_dead callers \
+         must not pass live_pairs"
+    );
 
     // Uninit alloc — the parallel loop below writes every slot (dense path)
     // or explicitly writes F128::ZERO at padding holes (padded path).
@@ -560,6 +567,21 @@ where
     let eq_hi = &eq.hi;
     let eq_lo = &eq.lo;
 
+    // Chunk-level liveness from the pair-interval list (M6 sparse round 2):
+    // a chunk with no live pair contributes zero to the message and — with
+    // `write_dead = false` — needs no writes either, so the whole per-pair
+    // `is_dead` scan is skipped. At 6.25% utilization the scan otherwise
+    // visits 16x more pairs than are live.
+    let chunk_live: Option<Vec<bool>> = live_pairs.map(|iv| {
+        let mut cl = vec![false; hi_size];
+        for &(s, e) in iv {
+            for c in cl.iter_mut().take((e - 1) / lo_size + 1).skip(s / lo_size) {
+                *c = true;
+            }
+        }
+        cl
+    });
+
     // Parallel: each worker writes one disjoint chunk of a_folded/b_folded
     // and returns its (sum1, sum_inf) contribution. Reduce by F128 XOR.
     let (sum1, sum_inf) = a_folded
@@ -567,6 +589,11 @@ where
         .zip(b_folded.par_chunks_mut(chunk_size))
         .enumerate()
         .map(|(x_hi, (a_chunk, b_chunk))| {
+            if let Some(cl) = &chunk_live
+                && !cl[x_hi]
+            {
+                return (F128::ZERO, F128::ZERO);
+            }
             let mut p1_acc = F256Unreduced::ZERO;
             let mut pinf_acc = F256Unreduced::ZERO;
             let pair_idx_base = x_hi * lo_size;
@@ -786,8 +813,11 @@ fn uni_skip_fold_and_round_pair_runs(
     let pair_bits = 1usize << (k_skip + 1);
     let n_out = 1usize << (m - k_skip);
     let mut pair_useful = vec![false; n_out / 2];
+    let mut pair_intervals: Vec<(usize, usize)> = Vec::new();
     for (start, end) in padding.useful_intervals() {
-        pair_useful[start / pair_bits..(end - 1) / pair_bits + 1].fill(true);
+        let (ps, pe) = (start / pair_bits, (end - 1) / pair_bits + 1);
+        pair_useful[ps..pe].fill(true);
+        pair_intervals.push((ps, pe));
     }
 
     fold_and_round_pair_kernel(
@@ -799,6 +829,9 @@ fn uni_skip_fold_and_round_pair_runs(
         mlv_challenges,
         |pair| !pair_useful[pair],
         write_dead,
+        // Sparse mode (no dead writes): hand the kernel the live pair
+        // intervals so wholly-dead chunks are skipped instead of scanned.
+        (!write_dead).then_some(pair_intervals.as_slice()),
     )
 }
 
