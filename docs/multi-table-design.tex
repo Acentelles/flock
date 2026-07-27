@@ -994,11 +994,22 @@ the committed stack, so the type converter's sum restricts exactly:
   W[d] \;=\; \sum_i (\gamma_i \Phi_i)\bigl(\eq_{\mathrm{row},i}[\mathrm{row}(d)]
   \cdot \eq_{\mathrm{col},i}[\mathrm{col}(d)]\bigr),
 \]
-with $(\mathrm{row}, \mathrm{col})$ the jagged unrank. Running the
+with $(\mathrm{row}, \mathrm{col})$ the jagged unrank, and
+$W[d] := 0$ for $d \ge \mathrm{area}$ --- the sumcheck runs over the
+full dense cube, so the weight must be defined on the power-of-two
+tail; zero is the right extension on both sides ($q$'s committed tail
+is zero, asserted, so the summand vanishes there either way, and the
+assist's branching program computes exactly this zero-extension via
+its comparison state, so the verifier's $\widehat W(\rho)$ agrees with
+the prover's table by construction). Running the
 virtual-opening sumcheck over the \emph{dense} domain with weight $W$
 merges the two reductions of this section into one: it is
 simultaneously ring-switching's sumcheck and the dense/virtual
-translation. Prover cost becomes count-proportional --- the existing
+translation. Scope: this replaces the \emph{union} path's transport
+($K = 2$ ring-switch claims, no packed-direct claims); single-type
+statements keep the current machinery, and the proof struct changes
+(the $\tilde b$/spot-check fields go, the scalar $V$ and the assist
+rounds arrive) --- a wire-format bump for the Mixed flavor. Prover cost becomes count-proportional --- the existing
 just-in-time factored-weight machinery (the \code{col\_prefix\_sums}
 cursor walk) with a $\Phi$ applied per element, roughly $6$\,ms at this
 workload \emph{at any tier}. The sumcheck's output is a plain dense
