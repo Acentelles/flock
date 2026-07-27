@@ -1211,42 +1211,96 @@ pub fn fold_and_round_pair_sparse_into(
     let live_out = shrink_intervals(live_in);
     let pair_cover = shrink_intervals(&live_out);
 
-    // Zero-substituting source reads: `cur` walks `live_in` monotonically as
-    // the read position `y` ascends (all reads below are in ascending order).
-    let mut cur = 0usize;
-    let read2 = |cur: &mut usize, y: usize| -> (F128, F128) {
-        while *cur < live_in.len() && live_in[*cur].1 <= y {
-            *cur += 1;
-        }
-        if *cur < live_in.len() && live_in[*cur].0 <= y {
-            (a[y], b[y])
-        } else {
-            (F128::ZERO, F128::ZERO)
-        }
-    };
-
-    let mut sum1 = F128::ZERO;
-    let mut sum_inf = F128::ZERO;
+    // The pair cover split into bounded tasks, each with its own disjoint
+    // output slices — parallel like the dense kernel, instead of one scalar
+    // walk (measured ~3x per element at low utilization: no cores, no
+    // hoisted eq_hi, one reduced multiply per term). Within a task the
+    // per-hi-run products accumulate UNREDUCED and reduce once, and eq_hi
+    // multiplies the run total — pure reassociation of exact field algebra
+    // (reduction commutes with XOR), so the message stays byte-identical to
+    // the scalar loop and to the dense kernel.
+    const CHUNK: usize = 1 << 12;
+    let mut tasks: Vec<(usize, usize)> = Vec::new();
     for &(ps, pe) in &pair_cover {
-        for t in ps..pe {
-            let y = 4 * t;
-            let (a00, b00) = read2(&mut cur, y);
-            let (a01, b01) = read2(&mut cur, y + 1);
-            let (a10, b10) = read2(&mut cur, y + 2);
-            let (a11, b11) = read2(&mut cur, y + 3);
-            let a0 = a00 + r_fold * (a01 + a00);
-            let a1 = a10 + r_fold * (a11 + a10);
-            let b0 = b00 + r_fold * (b01 + b00);
-            let b1 = b10 + r_fold * (b11 + b10);
-            a_out[2 * t] = a0;
-            a_out[2 * t + 1] = a1;
-            b_out[2 * t] = b0;
-            b_out[2 * t + 1] = b1;
-            let eq_k = eq.lo[t & lo_mask] * eq.hi[t >> eq.n_lo];
-            sum1 += eq_k * (a1 * b1);
-            sum_inf += eq_k * ((a0 + a1) * (b0 + b1));
+        let mut s = ps;
+        while s < pe {
+            let e = (s + CHUNK).min(pe);
+            tasks.push((s, e));
+            s = e;
         }
     }
+    let mut work: Vec<((usize, usize), &mut [F128], &mut [F128])> = Vec::with_capacity(tasks.len());
+    {
+        let mut a_rem: &mut [F128] = &mut a_out[..half];
+        let mut b_rem: &mut [F128] = &mut b_out[..half];
+        let mut off = 0usize;
+        for &(ps, pe) in &tasks {
+            let (_, rest) = std::mem::take(&mut a_rem).split_at_mut(2 * ps - off);
+            let (a_task, rest) = rest.split_at_mut(2 * (pe - ps));
+            a_rem = rest;
+            let (_, rest) = std::mem::take(&mut b_rem).split_at_mut(2 * ps - off);
+            let (b_task, rest) = rest.split_at_mut(2 * (pe - ps));
+            b_rem = rest;
+            off = 2 * pe;
+            work.push(((ps, pe), a_task, b_task));
+        }
+    }
+
+    use rayon::prelude::*;
+    let (sum1, sum_inf) = work
+        .into_par_iter()
+        .map(|((ps, pe), a_task, b_task)| {
+            // Zero-substituting source reads: a task-local cursor walks
+            // `live_in` monotonically as the read position `y` ascends
+            // (reads within a task are ascending), seeded by binary search.
+            let mut cur = live_in.partition_point(|&(_, e)| e <= 4 * ps);
+            let read2 = |cur: &mut usize, y: usize| -> (F128, F128) {
+                while *cur < live_in.len() && live_in[*cur].1 <= y {
+                    *cur += 1;
+                }
+                if *cur < live_in.len() && live_in[*cur].0 <= y {
+                    (a[y], b[y])
+                } else {
+                    (F128::ZERO, F128::ZERO)
+                }
+            };
+            let mut s1 = F128::ZERO;
+            let mut s_inf = F128::ZERO;
+            let mut t = ps;
+            while t < pe {
+                let run_end = (((t >> eq.n_lo) + 1) << eq.n_lo).min(pe);
+                let mut p1 = F256Unreduced::ZERO;
+                let mut p_inf = F256Unreduced::ZERO;
+                for tt in t..run_end {
+                    let y = 4 * tt;
+                    let (a00, b00) = read2(&mut cur, y);
+                    let (a01, b01) = read2(&mut cur, y + 1);
+                    let (a10, b10) = read2(&mut cur, y + 2);
+                    let (a11, b11) = read2(&mut cur, y + 3);
+                    let a0 = a00 + r_fold * (a01 + a00);
+                    let a1 = a10 + r_fold * (a11 + a10);
+                    let b0 = b00 + r_fold * (b01 + b00);
+                    let b1 = b10 + r_fold * (b11 + b10);
+                    let o = 2 * (tt - ps);
+                    a_task[o] = a0;
+                    a_task[o + 1] = a1;
+                    b_task[o] = b0;
+                    b_task[o + 1] = b1;
+                    let eq_l = eq.lo[tt & lo_mask];
+                    p1 ^= eq_l.mul_unreduced(a1 * b1);
+                    p_inf ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+                }
+                let eq_h = eq.hi[t >> eq.n_lo];
+                s1 += eq_h * p1.reduce();
+                s_inf += eq_h * p_inf.reduce();
+                t = run_end;
+            }
+            (s1, s_inf)
+        })
+        .reduce(
+            || (F128::ZERO, F128::ZERO),
+            |(x1, xi), (y1, yi)| (x1 + y1, xi + yi),
+        );
     (r_next[0] * sum1, sum_inf, live_out)
 }
 
