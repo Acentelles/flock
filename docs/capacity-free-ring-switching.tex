@@ -9,7 +9,6 @@
 \newcommand{\F}{\mathbb{F}}
 \newcommand{\Ftwo}{\F_2}
 \newcommand{\eq}{\mathsf{eq}}
-\newcommand{\area}{\mathsf{area}}
 \newcommand{\rowof}{\mathrm{row}}
 \newcommand{\colof}{\mathrm{col}}
 \newcommand{\fjag}{\hat f_{\mathrm{jag}}}
@@ -66,17 +65,18 @@ $\hat b$ anywhere in polylogarithmic time.
 
 \paragraph{Jagged commitments.} A jagged layout over $2^{n}$ rows
 $\times$ $2^{k}$ columns assigns column $y$ a public height $h_y$, with
-prefix sums $T_y$ and $\area = T_{2^k}$. The commitment binds the dense
-stack $q \in \F^{2^m}$ ($2^m \ge \area$, zero past $\area$); for
-$d < \area$, $\colof(d)$ is the unique $y$ with $T_y \le d < T_{y+1}$
-and $\rowof(d) = d - T_{\colof(d)}$. The witness of \eqref{eq:rs} is
+prefix sums $T_y$; we assume $\sum_y h_y = 2^m$ (append a final
+zero-filled padding column otherwise --- no loss of generality, and it
+frees the exposition of tail cases). The commitment binds the dense
+stack $q \in \F^{2^m}$; $\colof(d)$ is the unique $y$ with
+$T_y \le d < T_{y+1}$ and $\rowof(d) = d - T_{\colof(d)}$. The witness of \eqref{eq:rs} is
 the embedding of $q$ into the virtual word domain
 ($\ell = n + k$, $e = \rowof + 2^n\colof$), zero elsewhere. The jagged
 multilinear
 \[
   \fjag(z_{\mathrm r}, z_{\mathrm c}, z_{\mathrm i})
   \;=\;
-  \sum_{d=0}^{\area - 1}
+  \sum_{d \in \{0,1\}^m}
     \eq(z_{\mathrm i}, d)\,
     \eq(z_{\mathrm r}, \rowof(d))\,
     \eq(z_{\mathrm c}, \colof(d))
@@ -92,7 +92,8 @@ sumcheck over the \emph{virtual} domain, and the resulting evaluation
 claim is transported to the dense commitment by a separate jagged
 argument. The virtual-domain sumcheck costs the prover
 $\Theta(2^{\ell})$ evaluations of $\Phi$ and the dense fold chain of
-$b$, independently of $\area$ --- the object of this note is to remove
+$b$, independently of the committed size $2^m$ --- the object of this
+note is to remove
 that cost.
 
 \section{The merged reduction}\label{sec:merged}
@@ -108,18 +109,16 @@ factors over any coordinate partition). Define
 $W : \{0,1\}^m \to \F$ by
 \[
   W[d] = \sum_i \Phi_i\bigl(\eq(z_{i,\mathrm r}, \rowof(d))\cdot
-                            \eq(z_{i,\mathrm c}, \colof(d))\bigr)
-  \ \ (d < \area),
-  \qquad W[d] = 0 \ \ (d \ge \area).
+                            \eq(z_{i,\mathrm c}, \colof(d))\bigr).
 \]
 Then $\sum_{e} f(e)\, b(e) = \sum_{d} q[d]\, W[d]$.
 \end{lemma}
 
 \begin{proof}
-Termwise: off-stack words vanish with $f$; in-stack words correspond
-bijectively to $d < \area$, where
+Termwise: off-stack words vanish with $f$, and dense indices correspond
+bijectively to in-stack words, where
 $\eq(z, e) = \eq(z_{\mathrm r}, \rowof(d))\,\eq(z_{\mathrm c},
-\colof(d))$; the tail $d \ge \area$ vanishes with $q$ (and with $W$).
+\colof(d))$.
 \end{proof}
 
 The \emph{merged sumcheck} is the product sumcheck for
@@ -147,7 +146,7 @@ For Boolean $\beta$ and any $z \in \F$,
 $\eq(z, \beta)^{2^j} = \eq(z^{2^j}, \beta)$. Consequently, for every
 $j$,
 \[
-  \sum_{d=0}^{\area-1} \eq(\rho, d)\,
+  \sum_{d \in \{0,1\}^m} \eq(\rho, d)\,
   \bigl(\eq(z_{\mathrm r}, \rowof(d))\,\eq(z_{\mathrm c}, \colof(d))\bigr)^{2^j}
   \;=\;
   \fjag\bigl(z_{\mathrm r}^{2^j}, z_{\mathrm c}^{2^j}, \rho\bigr).
