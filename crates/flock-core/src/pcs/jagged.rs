@@ -1739,6 +1739,56 @@ mod tests {
         (params, q)
     }
 
+    /// The Frobenius-twist identity behind the merged-reduction design
+    /// sketch (design doc §"Capacity-free ring-switching"): for every j,
+    /// `Σ_e eq(ρ,e) · (eq_row[row(e)]·eq_col[col(e)])^(2^j)`
+    /// `  = f̂_t(z_row^(2^j), z_col^(2^j), ρ)`
+    /// — Frobenius is a field automorphism and commutes with the eq-product
+    /// structure at Boolean selectors (`eq(z,b)^(2^j) = eq(z^(2^j), b)`), so
+    /// each Frobenius power of the jagged weight IS the ordinary jagged MLE
+    /// at Frobenius-powered z-points, with the α-side point ρ untouched.
+    /// Combined with the linearized-polynomial form of any F₂-linear map
+    /// (`Φ(x) = Σ_j c_j·x^(2^j)`), the Φ-twisted weight evaluation is an
+    /// F-combination of 128 ordinary assist statements. Random heights,
+    /// non-power-of-two, zero columns included.
+    #[test]
+    fn frobenius_twist_matches_assist_object() {
+        let frob = |x: F128, j: usize| -> F128 {
+            let mut y = x;
+            for _ in 0..j {
+                y = y * y;
+            }
+            y
+        };
+        let mut ch = RandomChallenger::new(0xF20B_E415);
+        for &(n, k, m) in &[(3usize, 2usize, 5usize), (4, 3, 7), (2, 4, 6)] {
+            for _ in 0..4 {
+                let (params, _q) = random_instance(&mut ch, n, k, m);
+                let z_row = sample_vec(&mut ch, n);
+                let z_col = sample_vec(&mut ch, k);
+                let rho = sample_vec(&mut ch, m);
+                let eq_row = build_eq_table(&z_row);
+                let eq_col = build_eq_table(&z_col);
+                let eq_idx = build_eq_table(&rho);
+                for j in [0usize, 1, 2, 7, 40] {
+                    // LHS: the j-th Frobenius power of the twisted weight,
+                    // summed directly over the dense domain.
+                    let mut lhs = F128::ZERO;
+                    for e in 0..params.area() {
+                        let (row, col) = params.unrank(e);
+                        lhs += eq_idx[e as usize] * frob(eq_row[row] * eq_col[col], j);
+                    }
+                    // RHS: the ordinary jagged MLE at Frobenius-powered
+                    // z-points, ρ untouched.
+                    let zr: Vec<F128> = z_row.iter().map(|&z| frob(z, j)).collect();
+                    let zc: Vec<F128> = z_col.iter().map(|&z| frob(z, j)).collect();
+                    let rhs = f_hat_t_bruteforce(&params, &zr, &zc, &rho);
+                    assert_eq!(lhs, rhs, "n={n} k={k} m={m} j={j}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn f_hat_t_matches_bruteforce() {
         let mut ch = RandomChallenger::new(0x1A66_ED12);

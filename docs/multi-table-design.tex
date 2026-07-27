@@ -1048,54 +1048,70 @@ $\F$-linearly. The tensor form is $\F$-linear in the $\alpha$ slot ---
 $B((M_x \otimes I)\,T) = x\,B(T)$ --- so $\rho$-side variables bind
 fine; but the row-side factors (and the boundary bits that steer the
 subtraction carry) live in the $\beta$ slot, where
-$B((I \otimes M_x)\,T) \ne x\,B(T)$. Three options, in current order of
-preference:
-\begin{enumerate}[nosep]
-  \item \textbf{The fat verifier (leading).} Do not delegate: the
-        verifier evaluates $\widehat W(\rho)$ itself by the per-column
-        tensor DP --- \emph{no new argument, no new proof bytes, no new
-        soundness surface}. Estimated cost: per column and layer, two
-        surviving transitions on a $128$-vector-of-$\F$ state
-        ($\approx 256$ multiplies for the $\alpha$ slot; the
-        $\beta$-side maps are $\F_2$-matrices, applicable by byte
-        tables as in ring-switching's own fold) --- order $10^7$
-        multiplies $\approx$ a few ms, once per proof, count- and
-        capacity-independent but \textbf{linear in the registry's
-        column count with a heavy constant} ($\approx 25$K multiplies
-        per column, vs.\ $\approx 50$ on the assist path): viable at
-        today's $\approx 370$ columns, marginal at $\approx 1000$, not
-        viable at a many-type registry. This is the comb's scaling
-        family (\S\ref{sec:open}) with a $\approx 500\times$ constant
-        --- and, unlike the comb, with \emph{no preprocessing escape}:
-        the base-block MLEs are registry-static and committable once,
-        but \code{col\_prefix\_sums} is per-proof (count-derived under
-        height-$n_t$ stacking), so nothing about the twisted weight can
-        be committed at registry time. At registry scale, option 2
-        stops being optional. Verification goes
-        $\approx 11 \to 13$--$16$\,ms at today's registry; comb
-        delegation, already the queued answer if verify time matters,
-        would more than offset it.
-  \item \textbf{A structured assist.} Exploit the Kronecker form of the
-        transitions plus $\alpha$-slot binding to keep a sumcheck over
-        some of the variables and handle the $\beta$-slot ones another
-        way. Open; would need its own soundness write-up (the genre of
-        the rejected yr-weighted assist).
-  \item \textbf{Recursive ring-switching.} The $\beta$-slot obstruction
-        is bit-structure-versus-field-multiplication --- the exact
-        mismatch ring-switching itself resolves --- over a domain of
-        only $2(m{+}1)$ bits. Speculative.
-\end{enumerate}
+$B((I \otimes M_x)\,T) \ne x\,B(T)$.
+
+\paragraph{The resolution: Frobenius decomposition.} The obstruction
+dissolves under a change of basis for $\Phi$ itself. Over
+$\F_{2^{128}}$ every $\F_2$-linear map is uniquely a \emph{linearized
+polynomial} $\Phi(x) = \sum_{j=0}^{127} c_j\,x^{2^j}$, and Frobenius
+$x \mapsto x^{2^j}$ is a field \emph{automorphism}: it commutes with
+products, and at a Boolean selector
+$\eq(z, b)^{2^j} = \eq(z^{2^j}, b)$. Applied per term of the twisted
+sum, $\beta(e)^{2^j}$ is the \emph{same} eq-product structure at
+Frobenius-powered points, so
+\[
+  \widehat W(\rho) \;=\; \sum_{j=0}^{127} c_j\;
+    \hat f_t\bigl(z_{\mathrm{row}}^{2^j},\, z_{\mathrm{col}}^{2^j},\,
+    \rho\bigr)
+\]
+--- an $\F$-combination of $128$ \emph{ordinary, untwisted} assist
+statements, with $\rho$ untouched (it lives in the $\alpha$ slot,
+outside $\Phi$). The $\beta$-slot problem never arises: no
+$\Phi$-interior variable is ever bound, because $\Phi$ is decomposed
+into automorphisms that pass \emph{through} the product structure. The
+load-bearing identity is verified numerically against the brute-force
+jagged MLE (\code{frobenius\_twist\_matches\_assist\_object}: random
+non-power-of-two heights, zero columns, Frobenius powers including
+$j = 40$).
+
+The delegation is therefore the \emph{existing} assist, $128$-way
+batched (times the claim count): one sumcheck over the same $2(m{+}1)$
+boundary-bit variables for $\sum_j \gamma_j\, W_j(c,d)\,\hat g_j(c,d)$,
+proof size unchanged ($\approx 1.7$\,KB --- rounds $=$ variables,
+independent of the batch width). Estimated costs: the verifier derives
+the $c_j$ once per proof from $\Phi$'s byte table via a registry-static
+Moore-matrix inverse ($128^2$ multiplies), and evaluates the $128$
+per-$j$ weights by Frobenius chains --- the boundary factor is
+$j$-independent and computed once, and
+$\eq(z_{\mathrm{col}}^{2^j}, y) = \eq(z_{\mathrm{col}}, y)^{2^j}$ is
+one squaring per column per $j$ --- so the verifier stays
+\textbf{column-linear at $\approx 300$ operations per column}
+($\approx 6\times$ today's assist path): it scales to registries of
+thousands of columns, answering the scaling objection that killed the
+fat verifier at registry scale. Prover: $\approx 128\times$ today's
+(tiny) assist --- a few ms, with Frobenius-sharing available at the
+Boolean stage (the suffix rows satisfy
+$S^{(j)} = \mathrm{Frob}^j(S^{(0)})$). Still to be done before
+building: the batched-sumcheck bookkeeping and a soundness write-up
+(standard genre --- $\gamma$-batching over the existing assist
+argument), and the $c_j$-extraction detail. The \emph{fat verifier} ---
+evaluating the twisted object directly by the per-column tensor DP, no
+new argument at all --- survives as a fallback for small registries
+($\approx 25$K multiplies per column: fine at today's $\approx 370$,
+not at thousands; and unlike the comb there is no preprocessing escape,
+since \code{col\_prefix\_sums} is per-proof).
 
 \paragraph{What it buys, per tier (estimates against the measured
 baseline).} Prover: the ring-switch machinery's $12.3 / 23.0 /
 44.7$\,ms collapses to $\approx 6$--$7$\,ms flat --- the $4\times$-tier
 total ratio drops from $\approx 1.35$ to $\approx 1.13$, and the
 $256$--$512$\,MB $b_{\mathrm{combined}}$ transient disappears. Proof:
-slightly smaller (the $\tilde b$ vector and spot-check go). Verifier:
-$+2$--$5$\,ms under option 1. The decision gate is exactly that
-verifier trade --- and whether the tensor-BP construction and the
-$\alpha$/$\beta$-slot analysis survive contact with the implementation,
-which is the first thing to check before building anything.
+slightly smaller (the $\tilde b$ vector and spot-check go, one batched
+assist arrives). Verifier: $\lesssim 1$\,ms under the
+Frobenius-batched assist. The core identity is now
+test-verified; what remains before building is engineering-scale ---
+the batched assist protocol and its (standard-genre) soundness
+write-up --- rather than an open question.
 
 % ===========================================================================
 \section{Statement, transcript, wire format}\label{sec:statement}
@@ -1379,8 +1395,11 @@ registry growth or verify latency demands it.
         remaining capacity-proportional prover cost is ring-switching's
         padded-domain $\Phi$-pass; \S\ref{sec:merged} sketches the
         merged jagged/ring-switch reduction that would make it
-        count-proportional, with the $\Phi$-twisted weight evaluation
-        as the single open design question.
+        count-proportional. The formerly open $\Phi$-twisted weight
+        evaluation is resolved in principle by the Frobenius
+        decomposition (a $128$-way batched ordinary assist; core
+        identity test-verified); the remaining work is the batched
+        assist protocol and its soundness write-up.
   \item \textbf{The lookup/bus layer (the designated follow-on).} All
         dataflow --- table-to-table communication \emph{and} binding
         hashed values to the public statement --- is to be provided by a
