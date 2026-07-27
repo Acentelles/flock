@@ -58,10 +58,16 @@ to an inner-product claim over the $2^{\ell}$-word packed domain,
 where $f$ is the packed witness, $z \in \F^{\ell}$ is the claim's
 word-level point, and $\Phi : \F \to \F$ is an $\Ftwo$-linear map
 determined by the claim's in-word structure and fresh verifier
-randomness (batching scalars absorbed; several claims sum into one
-pair $(b, t)$). $\Phi$ does not commute with field multiplication, so
-$b$ factors as no eq tensor; the verifier can nevertheless evaluate
-$\hat b$ anywhere in polylogarithmic time.
+randomness. Several incoming claims, indexed $i = 1, \dots, K$, are
+batched additively: claim $i$ contributes
+$b_i(e) = \Phi_i(\eq(z_i, e))$ with its batching scalar absorbed into
+$\Phi_i$ (a scalar multiple of an $\Ftwo$-linear map is again
+$\Ftwo$-linear), and the combined statement \eqref{eq:rs} has
+$b = \sum_i b_i$, $t = \sum_i t_i$. (In our instantiation $K = 2$: the
+two evaluation claims a PIOP leaves on the committed witness.) $\Phi$
+does not commute with field multiplication, so $b$ factors as no eq
+tensor; the verifier can nevertheless evaluate $\hat b$ anywhere in
+polylogarithmic time.
 
 \paragraph{Jagged commitments.} A jagged layout over $2^{n}$ rows
 $\times$ $2^{k}$ columns assigns column $y$ a public height $h_y$, with
@@ -105,8 +111,8 @@ $z_{\mathrm r} = z[0{:}n]$ pairs with the row bits and
 $z_{\mathrm c} = z[n{:}n{+}k]$ with the column bits, so that
 $\eq(z, e) = \eq(z_{\mathrm r}, \rowof(d))\,\eq(z_{\mathrm c},
 \colof(d))$ at the in-stack address $e$ of dense index $d$ ($\eq$
-factors over any coordinate partition). Define
-$W : \{0,1\}^m \to \F$ by
+factors over any coordinate partition). With $i$ ranging over the
+batched claims of \eqref{eq:rs}, define $W : \{0,1\}^m \to \F$ by
 \[
   W[d] = \sum_i \Phi_i\bigl(\eq(z_{i,\mathrm r}, \rowof(d))\cdot
                             \eq(z_{i,\mathrm c}, \colof(d))\bigr).
