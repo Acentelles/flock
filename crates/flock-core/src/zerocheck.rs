@@ -45,9 +45,12 @@ pub const K_SKIP: usize = 6;
 /// kernels engage while `live · SPARSE_TAIL_GATE ≤ n`. Set to 16 when the
 /// sparse tail was a sequential scalar walk; after its parallelization
 /// (dense-kernel structure) the crossover moved — measured on the capacity
-/// sweep at 25% utilization, the sparse path beats the dense fold well
-/// before 1/16, so the gate now engages at quarter utilization.
-pub const SPARSE_TAIL_GATE: usize = 4;
+/// sweeps at both the small and the real-m30 load, the sparse path runs at
+/// per-element parity with the dense fold (25% utilization matches the
+/// full-utilization zerocheck), so the gate engages at half utilization.
+/// Full utilization itself stays dense (live · 2 > n): it is the anchor
+/// configuration and the dense kernels are the calibrated choice there.
+pub const SPARSE_TAIL_GATE: usize = 2;
 
 /// One run of identically-shaped blocks inside a [`PaddingSpec`] run-list.
 ///
