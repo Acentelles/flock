@@ -99,7 +99,12 @@ that cost.
 
 \begin{lemma}[restriction]\label{lem:restriction}
 Let $f$ be the embedding of $q$ and split each claim's word-level point
-$z = (z_{\mathrm r}, z_{\mathrm c})$ at the row/column boundary. Define
+$z \in \F^{\ell}$ at the row/column boundary of the virtual addressing:
+$z_{\mathrm r} = z[0{:}n]$ pairs with the row bits and
+$z_{\mathrm c} = z[n{:}n{+}k]$ with the column bits, so that
+$\eq(z, e) = \eq(z_{\mathrm r}, \rowof(d))\,\eq(z_{\mathrm c},
+\colof(d))$ at the in-stack address $e$ of dense index $d$ ($\eq$
+factors over any coordinate partition). Define
 $W : \{0,1\}^m \to \F$ by
 \[
   W[d] = \sum_i \Phi_i\bigl(\eq(z_{i,\mathrm r}, \rowof(d))\cdot
