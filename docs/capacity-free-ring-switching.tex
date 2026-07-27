@@ -58,16 +58,10 @@ to an inner-product claim over the $2^{\ell}$-word packed domain,
 where $f$ is the packed witness, $z \in \F^{\ell}$ is the claim's
 word-level point, and $\Phi : \F \to \F$ is an $\Ftwo$-linear map
 determined by the claim's in-word structure and fresh verifier
-randomness. Several incoming claims, indexed $i = 1, \dots, K$, are
-batched additively: claim $i$ contributes
-$b_i(e) = \Phi_i(\eq(z_i, e))$ with its batching scalar absorbed into
-$\Phi_i$ (a scalar multiple of an $\Ftwo$-linear map is again
-$\Ftwo$-linear), and the combined statement \eqref{eq:rs} has
-$b = \sum_i b_i$, $t = \sum_i t_i$. (In our instantiation $K = 2$: the
-two evaluation claims a PIOP leaves on the committed witness.) $\Phi$
-does not commute with field multiplication, so $b$ factors as no eq
-tensor; the verifier can nevertheless evaluate $\hat b$ anywhere in
-polylogarithmic time.
+randomness. We treat a single claim throughout;
+Remark~\ref{rem:multi} handles several. $\Phi$ does not commute with
+field multiplication, so $b$ factors as no eq tensor; the verifier can
+nevertheless evaluate $\hat b$ anywhere in polylogarithmic time.
 
 \paragraph{Jagged commitments.} A jagged layout over $2^{n}$ rows
 $\times$ $2^{k}$ columns assigns column $y$ a public height $h_y$, with
@@ -105,17 +99,17 @@ that cost.
 \section{The merged reduction}\label{sec:merged}
 
 \begin{lemma}[restriction]\label{lem:restriction}
-Let $f$ be the embedding of $q$ and split each claim's word-level point
+Let $f$ be the embedding of $q$ and split the claim's word-level point
 $z \in \F^{\ell}$ at the row/column boundary of the virtual addressing:
 $z_{\mathrm r} = z[0{:}n]$ pairs with the row bits and
 $z_{\mathrm c} = z[n{:}n{+}k]$ with the column bits, so that
 $\eq(z, e) = \eq(z_{\mathrm r}, \rowof(d))\,\eq(z_{\mathrm c},
 \colof(d))$ at the in-stack address $e$ of dense index $d$ ($\eq$
-factors over any coordinate partition). With $i$ ranging over the
-batched claims of \eqref{eq:rs}, define $W : \{0,1\}^m \to \F$ by
+factors over any coordinate partition). Define
+$W : \{0,1\}^m \to \F$ by
 \[
-  W[d] = \sum_i \Phi_i\bigl(\eq(z_{i,\mathrm r}, \rowof(d))\cdot
-                            \eq(z_{i,\mathrm c}, \colof(d))\bigr).
+  W[d] = \Phi\bigl(\eq(z_{\mathrm r}, \rowof(d))\cdot
+                   \eq(z_{\mathrm c}, \colof(d))\bigr).
 \]
 Then $\sum_{e} f(e)\, b(e) = \sum_{d} q[d]\, W[d]$.
 \end{lemma}
@@ -129,9 +123,8 @@ $\eq(z, e) = \eq(z_{\mathrm r}, \rowof(d))\,\eq(z_{\mathrm c},
 
 The \emph{merged sumcheck} is the product sumcheck for
 $\sum_d q[d]\,W[d] = t$ over the dense cube: $m$ rounds, prover cost
-one $\Phi$-evaluation per \emph{dense} word per claim (a
-count-proportional pass, fused with the first round message) plus
-standard folds. It is simultaneously ring switching's sumcheck and the
+one $\Phi$-evaluation per \emph{dense} word (a count-proportional
+pass, fused with the first round message) plus standard folds. It is simultaneously ring switching's sumcheck and the
 dense/virtual transport: its output claim
 $c^* = \hat q(\rho)\,\widehat W(\rho)$ needs only an \emph{ordinary}
 eq-basis opening of the commitment for $\hat q(\rho)$ --- the
@@ -169,12 +162,12 @@ at the powered points.
 \end{proof}
 
 \begin{theorem}\label{thm:main}
-With $\Phi_i(x) = \sum_j c_{i,j}\, x^{2^j}$,
+With $\Phi(x) = \sum_j c_j\, x^{2^j}$,
 \[
   \widehat W(\rho)
   \;=\;
-  \sum_i \sum_{j=0}^{127} c_{i,j}\;
-  \fjag\bigl(z_{i,\mathrm r}^{2^j},\, z_{i,\mathrm c}^{2^j},\, \rho\bigr).
+  \sum_{j=0}^{127} c_j\;
+  \fjag\bigl(z_{\mathrm r}^{2^j},\, z_{\mathrm c}^{2^j},\, \rho\bigr).
 \]
 \end{theorem}
 
@@ -183,31 +176,31 @@ Apply the linearized form per term of $\widehat W(\rho) = \sum_d
 \eq(\rho,d) W[d]$ and Lemma~\ref{lem:transport} per power.
 \end{proof}
 
-The twisted evaluation is thus a known $\F$-combination of $128K$
-\emph{ordinary} assist statements ($K$ = claim count), differing from
-the implemented ones only in their points. The obstruction never
+The twisted evaluation is thus a known $\F$-combination of $128$
+\emph{ordinary} assist statements, differing from the implemented ones
+only in their points. The obstruction never
 arises: $\Phi$ is decomposed into automorphisms that pass through the
 product structure, so no $\Phi$-interior variable is ever bound.
 
 \begin{remark}[coefficients]\label{rem:moore}
-The $c_{i,j}$ are deterministic transcript functions: evaluating
-$\Phi_i$ on the bit basis gives a linear system whose Moore matrix
+The $c_j$ are deterministic transcript functions: evaluating $\Phi$
+on the bit basis gives a linear system whose Moore matrix
 $M[t][j] = e_t^{2^j}$ is universal and precomputed once; per proof,
-$128$ evaluations of $\Phi_i$ plus a $128^2$-multiply matvec per claim.
+$128$ evaluations of $\Phi$ plus one $128^2$-multiply matvec.
 \end{remark}
 
 \section{The batched assist}\label{sec:protocol}
 
-The $128K$ statements share the boundary-bit domain and batch into
+The $128$ statements share the boundary-bit domain and batch into
 \emph{one} sumcheck: the prover sends $V$ (claimed
 $\widehat W(\rho)$) and both parties run the $2(m{+}1)$-round sumcheck
 for
 \[
   \sum_{(u,v)} H(u,v) = V,
   \qquad
-  H(u,v) = \sum_{i,j} c_{i,j}\; U_{i,j}(u,v)\; \hat g_{i,j}(u,v),
+  H(u,v) = \sum_{j} c_{j}\; U_{j}(u,v)\; \hat g_{j}(u,v),
 \]
-with $U_{i,j}, \hat g_{i,j}$ the assist's boundary weight and
+with $U_{j}, \hat g_{j}$ the assist's boundary weight and
 branching-program value at the powered points. Two observations:
 
 \begin{itemize}[nosep]
@@ -218,11 +211,11 @@ branching-program value at the powered points. Two observations:
   independent of the batch width.
 \item \emph{Frobenius chains.} At the final point $\sigma$ the verifier
   evaluates $H(\sigma)$ itself: the boundary factor is
-  $(i,j)$-independent and computed once, and
+  $j$-independent and computed once, and
   $\eq(z_{\mathrm c}^{2^j}, y) = \eq(z_{\mathrm c}, y)^{2^j}$ is one
   squaring per column per $j$ --- the verifier stays column-linear at
   a small constant ($\approx 6\times$ the untwisted assist path), plus
-  $128K$ width-$4$ program evaluations of $O(m)$ each and the Moore
+  $128$ width-$4$ program evaluations of $O(m)$ each and the Moore
   extraction of Remark~\ref{rem:moore}.
 \end{itemize}
 
@@ -234,8 +227,8 @@ $c^* = \hat q(\rho)\cdot V$, with $\hat q(\rho)$ discharged by the
 ordinary eq-basis opening.
 
 \begin{theorem}[soundness, sketch]\label{thm:soundness}
-Against the committed $q$: if the $\gamma$-combined ring-switching
-statement is false for the embedding of $q$, the verifier accepts with
+Against the committed $q$: if the ring-switching statement is false
+for the embedding of $q$, the verifier accepts with
 probability at most
 $(2m + 4(m{+}1))/|\F| + \varepsilon_{\mathrm{open}}$.
 \end{theorem}
@@ -247,9 +240,22 @@ soundness catches the merged rounds unless the final relation is false
 for the honest $\widehat W(\rho)$; the opening binds $\hat q(\rho)$,
 and the assist sumcheck binds $V$ to the honest $\widehat W(\rho)$ ---
 by Theorem~\ref{thm:main}, $H$'s true sum is $\widehat W(\rho)$, all
-of $c_{i,j}, U_{i,j}, \hat g_{i,j}$ being transcript-determined
-objects the verifier evaluates itself. Union-bound the two sumchecks.
+of $c_{j}, U_{j}, \hat g_{j}$ being transcript-determined objects the
+verifier evaluates itself. Union-bound the two sumchecks.
 \end{proof}
+
+\begin{remark}[multiple claims]\label{rem:multi}
+$K$ ring-switched claims, each with its own point $z_i$ and fold map
+$\Phi_i$, batch additively with scalars absorbed into the $\Phi_i$ (a
+scalar multiple of an $\Ftwo$-linear map is again $\Ftwo$-linear):
+$b = \sum_i \Phi_i(\eq(z_i, \cdot))$, $t = \sum_i t_i$. Everything
+above extends coordinate-wise: $W$ and Theorem~\ref{thm:main} gain a
+sum over $i$, the assist's summand becomes
+$\sum_{i,j} c_{i,j}\, U_{i,j}\, \hat g_{i,j}$ --- still one sumcheck
+of the same length --- and the Moore extraction runs once per claim.
+Our instantiation has $K = 2$ (the two evaluation claims a PIOP leaves
+on the committed witness), hence $256$ statements in one sumcheck.
+\end{remark}
 
 \section{Implementation}\label{sec:eval}
 
@@ -266,7 +272,7 @@ ring-switching stage measures $12.3 / 23.0 / 44.7$\,ms at
 $100\%/50\%/25\%$ utilization --- linear in the virtual domain ---
 while the merged pipeline's corresponding stages
 ($\Phi$-pass ${\approx}4$\,ms, merged sumcheck ${\approx}4$\,ms,
-batched assist ${\approx}7$\,ms) are tier-independent: prove-time
+batched assist ${\approx}7$\,ms at $K = 2$) are tier-independent: prove-time
 growth from the right-sized to the $4\times$ tier is $+14$\,ms versus
 $+41$\,ms, with right-sized totals at parity and the standard
 pipeline's multi-hundred-MB weight transient eliminated. Verifier
