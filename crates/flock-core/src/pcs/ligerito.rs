@@ -3304,6 +3304,7 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
         l0_tree,
         1usize << config.initial_k,
         false,
+        usize::MAX,
         None,
         None,
         challenger,
@@ -3336,6 +3337,48 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
         l0_tree,
         1usize << config.initial_k,
         false,
+        usize::MAX,
+        None,
+        Some(SumcheckMessage {
+            u_0: round0_uv.0,
+            u_2: round0_uv.1,
+        }),
+        challenger,
+    )
+    .0
+}
+
+/// Lane-aware variant of [`recursive_prover_with_basis_precomputed_round0`]
+/// for the merged transport's inner open: the commitment may be lane-major
+/// (integer lanes, high-bit blocks), the basis is MATERIALIZED, and — unlike
+/// the jagged fused entry — the live-block skip is DISABLED
+/// (`l0_live_blocks = full`): the eq basis is nonzero on the zero-padding
+/// lanes, so the b-side must be folded honestly there (the f-side terms are
+/// zero regardless, since q's dead lanes are zero). No trailing verifier
+/// mirror: the transcript ends at the opening on this path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn recursive_prover_with_basis_precomputed_round0_lanes<Ch: Challenger>(
+    config: &ProverConfig,
+    packed_witness: Vec<F128>,
+    b_initial: Vec<F128>,
+    target: F128,
+    l0_codeword: &[F128],
+    l0_tree: &[Hash],
+    l0_num_lanes: usize,
+    l0_lane_major: bool,
+    round0_uv: (F128, F128),
+    challenger: &mut Ch,
+) -> LigeritoProof {
+    recursive_prover_with_basis_impl(
+        config,
+        packed_witness,
+        b_initial,
+        target,
+        l0_codeword,
+        l0_tree,
+        l0_num_lanes,
+        l0_lane_major,
+        usize::MAX,
         None,
         Some(SumcheckMessage {
             u_0: round0_uv.0,
@@ -3384,6 +3427,11 @@ pub(crate) fn recursive_prover_with_basis_precomputed_round0_fused<Ch: Challenge
         l0_tree,
         l0_num_lanes,
         l0_lane_major,
+        if l0_lane_major {
+            l0_num_lanes
+        } else {
+            usize::MAX
+        },
         l0_jit_basis,
         Some(SumcheckMessage {
             u_0: round0_uv.0,
@@ -3417,6 +3465,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     l0_tree: &[Hash],
     l0_num_lanes: usize,
     l0_lane_major: bool,
+    l0_live_blocks_in: usize,
     l0_jit_basis: Option<BasisWindowFn<'_>>,
     first_msg: Option<SumcheckMessage>,
     challenger: &mut Ch,
@@ -3457,11 +3506,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     // zero tail is whole lanes `[t, 2^initial_k)`, so the L0 folds can skip
     // them outright. Halves (rounded up) each round; the prefix reaches 1 by
     // the last, so nothing dead reaches L1.
-    let mut l0_live_blocks = if l0_lane_major {
-        l0_num_lanes
-    } else {
-        usize::MAX
-    };
+    let mut l0_live_blocks = l0_live_blocks_in;
     assert_eq!(l0_tree.len(), 2 * block_len_0 - 1);
 
     let trace = std::env::var("LIG_PROVE_TRACE").is_ok();

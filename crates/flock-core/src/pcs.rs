@@ -181,6 +181,26 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
         lig_config.log_inv_rates[0], commitment.params.log_inv_rate,
     );
 
+    // Integer-lane (lane-major) commitments are supported ONLY in the
+    // merged transport's inner-open configuration (no RS claims, one
+    // EqPoint claim): the eq basis folds honestly over the zero-padding
+    // lanes (live-block skip disabled) and the round-0 prime pairs blocks.
+    let l0_num_lanes = commitment.params.num_ntts();
+    let lane_major = l0_num_lanes < 1usize << lig_config.initial_k;
+    let log_n = commitment.params.m - LOG_PACKING;
+    if lane_major {
+        assert!(
+            x_outers.is_empty()
+                && packed_direct.len() == 1
+                && matches!(packed_direct[0].eq_ind, DirectEqInd::EqPoint(_)),
+            "lane-major mixed open: only the merged inner-open configuration is supported"
+        );
+    }
+    let round0_block = if lane_major {
+        1usize << (log_n - lig_config.initial_k)
+    } else {
+        1
+    };
     let combined = compute_combined_basis_and_target(
         &packed_witness,
         x_outers,
@@ -189,18 +209,21 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
         padding,
         None,
         false,
+        round0_block,
         challenger,
         trace,
     );
 
     let t = std::time::Instant::now();
-    let ligerito_proof = ligerito::recursive_prover_with_basis_precomputed_round0(
+    let ligerito_proof = ligerito::recursive_prover_with_basis_precomputed_round0_lanes(
         lig_config,
         packed_witness,
         combined.b_combined,
         combined.target_combined,
         &prover_data.codeword,
         &prover_data.merkle_tree,
+        l0_num_lanes,
+        lane_major,
         combined.round0_prime,
         challenger,
     );
@@ -280,6 +303,12 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     padding: &PaddingSpec,
     live_pairs: Option<&[(usize, usize)]>,
     stream_b: bool,
+    // Round-0 pairing block for the EqPoint special path: 1 = adjacent
+    // elements (pow2 lanes); 2^(log_n − initial_k) under a lane-major
+    // commitment, whose L0 fold pairs BLOCKS. Other paths must pass 1
+    // (their primes are adjacent-paired; the jagged path re-derives its
+    // blocked prime downstream).
+    eqpoint_round0_block: usize,
     challenger: &mut Ch,
     trace: bool,
 ) -> CombinedClaim {
@@ -393,7 +422,8 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     {
         assert_eq!(1usize << point.len(), l, "EqPoint length mismatch");
         let b_combined = ring_switch::build_eq_scaled_parallel(point, gammas_pd[0]);
-        let (round0_u0, round0_u2) = {
+        let blk = eqpoint_round0_block;
+        let (round0_u0, round0_u2) = if blk == 1 {
             const C: usize = 1 << 13;
             packed_witness
                 .par_chunks(C)
@@ -411,6 +441,30 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                         b += (qp[0] + qp[1]) * (wp[0] + wp[1]);
                     }
                     (a, b)
+                })
+                .reduce(
+                    || (F128::ZERO, F128::ZERO),
+                    |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+                )
+        } else {
+            // Lane-major round-0: the L0 fold pairs BLOCKS of `blk`
+            // elements (lane 2j with lane 2j+1), so the prime pairs
+            // element t of block 2j with element t of block 2j+1.
+            assert!(blk.is_power_of_two() && l.is_multiple_of(2 * blk));
+            (0..l / (2 * blk))
+                .into_par_iter()
+                .map(|j| {
+                    let b0 = 2 * j * blk;
+                    let b1 = b0 + blk;
+                    let mut u0 = F128::ZERO;
+                    let mut u2 = F128::ZERO;
+                    for t in 0..blk {
+                        let (q0, q1) = (packed_witness[b0 + t], packed_witness[b1 + t]);
+                        let (w0, w1) = (b_combined[b0 + t], b_combined[b1 + t]);
+                        u0 += q0 * w0;
+                        u2 += (q0 + q1) * (w0 + w1);
+                    }
+                    (u0, u2)
                 })
                 .reduce(
                     || (F128::ZERO, F128::ZERO),
@@ -818,6 +872,16 @@ pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
     assert_eq!(x_outers.len(), n_rs);
     assert_eq!(proof.ring_switches.len(), n_rs);
     assert!(n_rs + n_pd > 0);
+    // Lane-major (integer-lane) commitments: supported only for the merged
+    // inner-open configuration (packed-direct claims only). The RS claims'
+    // residual machinery has no rotated-point path; reject rather than
+    // mis-evaluate. (The claim shapes are statement-derived, so this is an
+    // assert, not an attacker-reachable rejection.)
+    let lane_major = commitment.params.num_ntts() < 1usize << lig_config.initial_k;
+    assert!(
+        !lane_major || n_rs == 0,
+        "lane-major mixed verify: packed-direct claims only"
+    );
 
     challenger.observe_label(b"flock-pcs-open-batch-v0");
 
@@ -876,10 +940,23 @@ pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
             .collect();
 
         // ---- PD claim prefix scalars ----
-        // eq(pd.point, point) factors over coordinates; precompute the prefix product.
-        let pd_prefix_scalars: Vec<F128> = packed_direct
+        // eq(pd.point, point) factors over coordinates; precompute the prefix
+        // product. Under a lane-major commitment the fold challenges bind the
+        // ROTATED variable order (lane vars — the high dense vars — first),
+        // so pair them against the correspondingly rotated claim point.
+        let pd_points_rot: Vec<Vec<F128>> = packed_direct
             .iter()
-            .map(|pd| eq_eval(&pd.point[..prefix_len], ris))
+            .map(|pd| {
+                if lane_major {
+                    rotate_lane_point(pd.point, pd.point.len() - lig_config.initial_k)
+                } else {
+                    pd.point.to_vec()
+                }
+            })
+            .collect();
+        let pd_prefix_scalars: Vec<F128> = pd_points_rot
+            .iter()
+            .map(|pt| eq_eval(&pt[..prefix_len], ris))
             .collect();
 
         // ---- Per-y assembly (parallel over yr positions; each y is independent).
@@ -907,7 +984,7 @@ pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
                             &out.eq_r_dprime,
                         );
                 }
-                for ((pd, g), prefix_scalar) in packed_direct
+                for ((pt, g), prefix_scalar) in pd_points_rot
                     .iter()
                     .zip(gammas_pd.iter())
                     .zip(pd_prefix_scalars.iter())
@@ -915,7 +992,7 @@ pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
                     sum += *g
                         * *prefix_scalar
                         * crate::zerocheck::multilinear::eq_eval_binary_x(
-                            &pd.point[prefix_len..],
+                            &pt[prefix_len..],
                             y_bits,
                         );
                 }
@@ -932,7 +1009,7 @@ pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
         log_n,
         target_combined,
         &commitment.root,
-        1usize << lig_config.initial_k,
+        commitment.params.num_ntts(),
         eval_b_residual,
         challenger,
     );
@@ -1070,6 +1147,7 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
         padding,
         live_pairs.as_deref(),
         true,
+        1,
         challenger,
         trace,
     );
@@ -1604,11 +1682,6 @@ pub fn open_batch_merged<Ch: Challenger>(
     lig_config: &ligerito::ProverConfig,
     challenger: &mut Ch,
 ) -> MergedOpenProof {
-    use rayon::prelude::*;
-    assert!(
-        commitment.params.num_lanes.is_none(),
-        "merged open: integer-lane commitments not yet supported (prototype)"
-    );
     let trace = std::env::var("PCS_TRACE").is_ok();
     let t_total = std::time::Instant::now();
     challenger.observe_label(b"flock-merged-open-v0");
@@ -1655,10 +1728,10 @@ pub fn open_batch_merged<Ch: Challenger>(
     // The twisted weight over the dense cube (count-proportional Φ-pass;
     // zero tail past the jagged area).
     let t = std::time::Instant::now();
-    let w = jagged::build_merged_weight(&params, &claim_data);
+    let (w, (u0, u2)) = jagged::build_merged_weight_and_prime(&params, &claim_data, &q);
     if trace {
         eprintln!(
-            "  [open_merged] W build (2^{} words): {:6.2} ms",
+            "  [open_merged] W build + round-0 prime (2^{} words): {:6.2} ms",
             dense_log,
             t.elapsed().as_secs_f64() * 1e3
         );
@@ -1667,29 +1740,6 @@ pub fn open_batch_merged<Ch: Challenger>(
     // ---- Merged sumcheck: Σ_d q[d]·W[d] = target, dense_log rounds, same
     // message/fold conventions as the virtual-opening sumcheck.
     let t = std::time::Instant::now();
-    let (u0, u2) = {
-        const C: usize = 1 << 13;
-        q.par_chunks(C)
-            .zip(w.par_chunks(C))
-            .map(|(qc, wc)| {
-                let mut a = F128::ZERO;
-                let mut b = F128::ZERO;
-                for (qp, wp) in qc
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .zip(wc.as_chunks::<2>().0.iter())
-                {
-                    a += qp[0] * wp[0];
-                    b += (qp[0] + qp[1]) * (wp[0] + wp[1]);
-                }
-                (a, b)
-            })
-            .reduce(
-                || (F128::ZERO, F128::ZERO),
-                |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
-            )
-    };
     let (mut g_one, mut g_inf) = (target + u0, u2);
     let mut merged_rounds = Vec::with_capacity(dense_log);
     let mut rho = Vec::with_capacity(dense_log);

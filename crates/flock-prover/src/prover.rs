@@ -633,10 +633,6 @@ pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
         union.dense_m(),
         "PcsParams.m must equal the union's dense_m (committed stack size)"
     );
-    assert!(
-        pcs_params.num_lanes.is_none(),
-        "merged prototype: pow2-lane commitments only"
-    );
     assert_eq!(
         slots.len(),
         union.registry().num_types(),
@@ -665,7 +661,11 @@ pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
     } else {
         union.compact_witness(&z_packed)
     };
-    let (commitment, prover_data) = pcs::commit(&q, pcs_params);
+    let (commitment, prover_data) = if pcs_params.num_lanes.is_some() {
+        pcs::commit_lane_major(&q, pcs_params)
+    } else {
+        pcs::commit(&q, pcs_params)
+    };
     union.bind_statement(challenger, &commitment);
 
     let padding = union.padding_spec();

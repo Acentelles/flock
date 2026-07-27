@@ -380,12 +380,13 @@ pub fn verify_ligerito_jagged_union_merged<Ch: Challenger>(
         "PcsParams.m must equal the union's dense_m (committed stack size)"
     );
     // Same params-equality rejection as the jagged path (the transcript
-    // binds only the root), plus the prototype's pow2-lane restriction.
+    // binds only the root; the opening reads the leaf width / lane count
+    // from the commitment's params, so they must equal the count-derived
+    // ones).
     if commitment.params.m != pcs_params.m
         || commitment.params.log_batch_size != pcs_params.log_batch_size
         || commitment.params.log_inv_rate != pcs_params.log_inv_rate
-        || commitment.params.num_lanes.is_some()
-        || pcs_params.num_lanes.is_some()
+        || commitment.params.num_ntts() != pcs_params.num_ntts()
     {
         return Err(VerifyError::PcsJagged(
             crate::pcs::VerifyErrorJagged::Ligerito,

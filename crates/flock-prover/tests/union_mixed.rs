@@ -1033,10 +1033,12 @@ fn merged_transport_roundtrip_and_tamper() {
     let circuits: [&dyn LincheckCircuit; 2] = [s2_circuit, b3_circuit];
     let mut rng = Rng::new(0x_4E_26_ED_11);
 
-    for counts in [[64usize, 64], [50, 37]] {
+    for (counts, integer_lanes) in [([64usize, 64], true), ([64, 64], false), ([50, 37], true)] {
         let union = UnionInstance::new(&registry, counts.to_vec());
         let mut pcs_params = union_pcs_params(&union);
-        pcs_params.num_lanes = None; // merged prototype: pow2 lanes only
+        if !integer_lanes {
+            pcs_params.num_lanes = None; // pow2-lane coverage
+        }
         let sha2_inputs = random_sha2_inputs(&mut rng, counts[0]);
         let blake3_inputs = random_blake3_inputs(&mut rng, counts[1]);
         let slots = vec![

@@ -1206,10 +1206,11 @@ pub fn verify_assist<C: Challenger>(
 /// assist's branching program computes exactly this extension via its
 /// comparison state, so prover table and verifier evaluation agree by
 /// construction). `claims` = `(z_row, z_col, γ-baked fold table)` views.
-pub(crate) fn build_merged_weight(
+pub(crate) fn build_merged_weight_and_prime(
     params: &JaggedParams,
     claims: &[(&[F128], &[F128], &[F128])],
-) -> Vec<F128> {
+    q: &[F128],
+) -> (Vec<F128>, (F128, F128)) {
     use rayon::prelude::*;
     let area = params.area() as usize;
     let n_total = 1usize << params.m;
@@ -1217,52 +1218,76 @@ pub(crate) fn build_merged_weight(
         .iter()
         .map(|&(zr, zc, t)| (build_eq_table(zr), build_eq_table(zc), t))
         .collect();
+    assert_eq!(q.len(), n_total);
     let mut w = crate::scratch::take_f128(n_total);
     // Segmented fill (the JaggedWeight lesson): per chunk, ONE cursor into
     // `col_prefix_sums`, then per column segment a claim-OUTER sweep — the
     // column factor hoisted, rows read sequentially, and one claim's 64 KB
     // fold table hot per sweep. The per-element unrank variant measured
     // ~2.5x slower at M = 30.
+    // The merged sumcheck's round-0 prime `(u0, u2)` is fused into the same
+    // pass (CHUNK is even, so element pairs never straddle chunks); the
+    // dead tail past the area contributes zero on both sides.
     const CHUNK: usize = 1 << 14;
     let ps = &params.col_prefix_sums;
-    w.par_chunks_mut(CHUNK).enumerate().for_each(|(ci, out)| {
-        let base = (ci * CHUNK) as u64;
-        let end = base + out.len() as u64;
-        if base >= area as u64 {
-            out.fill(F128::ZERO);
-            return;
-        }
-        let live_end = end.min(area as u64);
-        // Zero the dead tail of this chunk (past the jagged area).
-        out[(live_end - base) as usize..].fill(F128::ZERO);
-        let mut first_claim = true;
-        for (eq_r, eq_c, tab) in tabs.iter() {
-            let mut col = ps.partition_point(|&t| t <= base) - 1;
-            let mut e = base;
-            while e < live_end {
-                while ps[col + 1] <= e {
-                    col += 1;
-                }
-                let seg_end = ps[col + 1].min(live_end);
-                let c_hoist = eq_c[col];
-                let row0 = (e - ps[col]) as usize;
-                let dst = &mut out[(e - base) as usize..(seg_end - base) as usize];
-                let rows = &eq_r[row0..row0 + dst.len()];
-                if first_claim {
-                    for (slot, &r) in dst.iter_mut().zip(rows) {
-                        *slot = crate::pcs::ring_switch::fold_one_slot(r * c_hoist, tab);
-                    }
-                } else {
-                    for (slot, &r) in dst.iter_mut().zip(rows) {
-                        *slot += crate::pcs::ring_switch::fold_one_slot(r * c_hoist, tab);
-                    }
-                }
-                e = seg_end;
+    let prime = w
+        .par_chunks_mut(CHUNK)
+        .enumerate()
+        .map(|(ci, out)| {
+            let base = (ci * CHUNK) as u64;
+            let end = base + out.len() as u64;
+            if base >= area as u64 {
+                out.fill(F128::ZERO);
+                return (F128::ZERO, F128::ZERO);
             }
-            first_claim = false;
-        }
-    });
-    w
+            let live_end = end.min(area as u64);
+            // Zero the dead tail of this chunk (past the jagged area).
+            out[(live_end - base) as usize..].fill(F128::ZERO);
+            let mut first_claim = true;
+            for (eq_r, eq_c, tab) in tabs.iter() {
+                let mut col = ps.partition_point(|&t| t <= base) - 1;
+                let mut e = base;
+                while e < live_end {
+                    while ps[col + 1] <= e {
+                        col += 1;
+                    }
+                    let seg_end = ps[col + 1].min(live_end);
+                    let c_hoist = eq_c[col];
+                    let row0 = (e - ps[col]) as usize;
+                    let dst = &mut out[(e - base) as usize..(seg_end - base) as usize];
+                    let rows = &eq_r[row0..row0 + dst.len()];
+                    if first_claim {
+                        for (slot, &r) in dst.iter_mut().zip(rows) {
+                            *slot = crate::pcs::ring_switch::fold_one_slot(r * c_hoist, tab);
+                        }
+                    } else {
+                        for (slot, &r) in dst.iter_mut().zip(rows) {
+                            *slot += crate::pcs::ring_switch::fold_one_slot(r * c_hoist, tab);
+                        }
+                    }
+                    e = seg_end;
+                }
+                first_claim = false;
+            }
+            let qc = &q[base as usize..end as usize];
+            let mut u0 = F128::ZERO;
+            let mut u2 = F128::ZERO;
+            for (qp, wp) in qc
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .zip(out.as_chunks::<2>().0.iter())
+            {
+                u0 += qp[0] * wp[0];
+                u2 += (qp[0] + qp[1]) * (wp[0] + wp[1]);
+            }
+            (u0, u2)
+        })
+        .reduce(
+            || (F128::ZERO, F128::ZERO),
+            |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+        );
+    (w, prime)
 }
 
 /// One ring-switch claim's inputs to the Frobenius assist: the word-level
@@ -1355,6 +1380,55 @@ fn frobenius_statements(
         .collect()
 }
 
+/// One statement's per-layer pass: fold the previous layer's challenges
+/// into the running column weights, bucket against the suffix row, and form
+/// the statement's u-vectors from its prefix row. Shared by the chunked
+/// round dispatch of [`prove_frobenius_assist`].
+fn frobenius_layer_pass(
+    st: &mut FrobeniusStatement,
+    layer: usize,
+    prev_ch: Option<(F128, F128)>,
+    sparse: &[[[(usize, usize); 2]; 4]; 4],
+) -> ([[F128; 4]; 4], [[F128; 4]; 4]) {
+    let n_cols = st.cols.len();
+    let row = &st.sfx[(layer + 1) * n_cols..(layer + 2) * n_cols];
+    let mut buckets = [[F128::ZERO; 4]; 4];
+    for ((w_e, &(_, t_c, t_next)), s) in st.we.iter_mut().zip(&st.cols).zip(row) {
+        if let Some((rc, rd)) = prev_ch {
+            let pl = layer - 1;
+            let ec = if (t_c >> pl) & 1 == 1 {
+                rc
+            } else {
+                F128::ONE + rc
+            };
+            let ed = if (t_next >> pl) & 1 == 1 {
+                rd
+            } else {
+                F128::ONE + rd
+            };
+            *w_e *= ec * ed;
+        }
+        let cd = ((t_c >> layer) & 1) as usize + 2 * ((t_next >> layer) & 1) as usize;
+        let v = *w_e;
+        let bk = &mut buckets[cd];
+        bk[0] += v * s[0];
+        bk[1] += v * s[1];
+        bk[2] += v * s[2];
+        bk[3] += v * s[3];
+    }
+    let eq4 = &st.eq4s[layer];
+    let mut u = [[F128::ZERO; 4]; 4];
+    for (cd, uv) in u.iter_mut().enumerate() {
+        for (s, &bs) in st.prefix_row.iter().enumerate() {
+            let (i0, o0) = sparse[cd][s][0];
+            let (i1, o1) = sparse[cd][s][1];
+            uv[o0] += bs * eq4[i0];
+            uv[o1] += bs * eq4[i1];
+        }
+    }
+    (u, buckets)
+}
+
 /// Prover for the batched Frobenius assist. Same per-statement algebra as
 /// [`prove_assist`] (Lemma 4.6 streaming), with the round messages summed
 /// across statements — the sumcheck runs on the combined summand
@@ -1402,48 +1476,19 @@ pub fn prove_frobenius_assist<C: Challenger>(
         // Per-statement column pass: fold the previous layer's challenges
         // into the running weights and bucket against the suffix row; then
         // the statement's u-vectors from its prefix row. Messages sum.
-        let per: Vec<([[F128; 4]; 4], [[F128; 4]; 4])> = sts
-            .par_iter_mut()
-            .map(|st| {
-                let n_cols = st.cols.len();
-                let row = &st.sfx[(layer + 1) * n_cols..(layer + 2) * n_cols];
-                let mut buckets = [[F128::ZERO; 4]; 4];
-                for ((w_e, &(_, t_c, t_next)), s) in st.we.iter_mut().zip(&st.cols).zip(row) {
-                    if let Some((rc, rd)) = prev_ch {
-                        let pl = layer - 1;
-                        let ec = if (t_c >> pl) & 1 == 1 {
-                            rc
-                        } else {
-                            F128::ONE + rc
-                        };
-                        let ed = if (t_next >> pl) & 1 == 1 {
-                            rd
-                        } else {
-                            F128::ONE + rd
-                        };
-                        *w_e *= ec * ed;
-                    }
-                    let cd = ((t_c >> layer) & 1) as usize + 2 * ((t_next >> layer) & 1) as usize;
-                    let v = *w_e;
-                    let bk = &mut buckets[cd];
-                    bk[0] += v * s[0];
-                    bk[1] += v * s[1];
-                    bk[2] += v * s[2];
-                    bk[3] += v * s[3];
+        // Chunked dispatch: the per-statement work is ~a few thousand
+        // multiplies, so per-statement rayon tasks are overhead-bound at
+        // 128K statements x 2(m+1) rounds. 8 statements per task keeps
+        // ~32 tasks per round.
+        let mut per: Vec<([[F128; 4]; 4], [[F128; 4]; 4])> =
+            vec![([[F128::ZERO; 4]; 4], [[F128::ZERO; 4]; 4]); sts.len()];
+        sts.par_chunks_mut(8)
+            .zip(per.par_chunks_mut(8))
+            .for_each(|(stc, oc)| {
+                for (st, o) in stc.iter_mut().zip(oc.iter_mut()) {
+                    *o = frobenius_layer_pass(st, layer, prev_ch, &sparse);
                 }
-                let eq4 = &st.eq4s[layer];
-                let mut u = [[F128::ZERO; 4]; 4];
-                for (cd, uv) in u.iter_mut().enumerate() {
-                    for (s, &bs) in st.prefix_row.iter().enumerate() {
-                        let (i0, o0) = sparse[cd][s][0];
-                        let (i1, o1) = sparse[cd][s][1];
-                        uv[o0] += bs * eq4[i0];
-                        uv[o1] += bs * eq4[i1];
-                    }
-                }
-                (u, buckets)
-            })
-            .collect();
+            });
 
         // c-round message, summed across statements.
         let mut g_one = F128::ZERO;
