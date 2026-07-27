@@ -1542,7 +1542,6 @@ pub(crate) fn fold_and_round_sparse(
     bo: &mut [F128],
     live_in: &[(usize, usize)],
 ) -> (F128, F128, Vec<(usize, usize)>) {
-    use crate::zerocheck::multilinear::shrink_intervals;
     use rayon::prelude::*;
     debug_assert_eq!(a.len(), 2 * ao.len());
     debug_assert!(a.len() >= 4);
@@ -1559,6 +1558,84 @@ pub(crate) fn fold_and_round_sparse(
             }
         });
 
+    sparse_f_fold_and_message(a, r, ao, bo, live_in)
+}
+
+/// [`fold_and_round_sparse`] with the b-side input in CLOSED FORM: the
+/// γ-combined basis is evaluated from the per-claim `DeferredDense`
+/// ingredients (`defs` = `(eq_lo, eq_hi, table)` views, shared split) and
+/// this round's fold writes the (half-size) folded basis directly into `bo`
+/// — the full-domain array never exists (streaming b, round 0 of the
+/// virtual-opening sumcheck on the sparse-gated union path). The b-loop
+/// mirrors the combine fast path's structure exactly — one `eq_hi` block per
+/// task, claim-OUTER so one claim's 64 KB byte table stays hot per sweep,
+/// `e_hi` hoisted, `eq_lo` swept sequentially — a per-element/claim-inner
+/// formulation measured ~2.5x slower. Arithmetic is identical to
+/// [`fold_and_round_sparse`] over the materialized basis, so the round
+/// message is byte-identical.
+pub(crate) fn fold_and_round_sparse_bjit(
+    a: &[F128],
+    r: F128,
+    ao: &mut [F128],
+    bo: &mut [F128],
+    live_in: &[(usize, usize)],
+    defs: &[(&[F128], &[F128], &[F128])],
+) -> (F128, F128, Vec<(usize, usize)>) {
+    use crate::pcs::ring_switch::fold_one_slot;
+    use rayon::prelude::*;
+    debug_assert_eq!(a.len(), 2 * ao.len());
+    debug_assert_eq!(ao.len(), bo.len());
+    debug_assert!(a.len() >= 4);
+    debug_assert!(live_in.last().is_none_or(|&(_, e)| e <= a.len()));
+    debug_assert!(!defs.is_empty());
+    let blk = defs[0].0.len();
+    debug_assert!(defs.iter().all(|d| d.0.len() == blk), "shared eq split");
+    debug_assert!(blk >= 2 && blk.is_multiple_of(2));
+    debug_assert!(bo.len().is_multiple_of(blk / 2));
+
+    // One task per input eq_hi block (blk inputs -> blk/2 outputs); `tmp`
+    // holds the block's raw basis values, reused per worker (a fresh zeroed
+    // vec per block would double the writes).
+    bo.par_chunks_mut(blk / 2).enumerate().for_each_init(
+        || vec![F128::ZERO; blk],
+        |tmp, (hi, ob)| {
+            for (ci, &(eq_lo, eq_hi, table)) in defs.iter().enumerate() {
+                let e_hi = eq_hi[hi];
+                if ci == 0 {
+                    for (slot, &lo) in tmp.iter_mut().zip(eq_lo.iter()) {
+                        *slot = fold_one_slot(lo * e_hi, table);
+                    }
+                } else {
+                    for (slot, &lo) in tmp.iter_mut().zip(eq_lo.iter()) {
+                        *slot += fold_one_slot(lo * e_hi, table);
+                    }
+                }
+            }
+            for (op, bq) in ob.iter_mut().zip(tmp.as_chunks::<2>().0.iter()) {
+                *op = bq[0] + r * (bq[1] + bq[0]);
+            }
+        },
+    );
+
+    sparse_f_fold_and_message(a, r, ao, bo, live_in)
+}
+
+/// The shared f-side fold + round message of one sparse virtual-open round.
+/// `bo` must already hold this round's folded b (from either b-side driver
+/// above — one source of truth so the two cannot drift). The witness side is
+/// zero outside `live_in` on an honest padded buffer, so the fold and the
+/// message touch only the live pair cover, with zero-substituted reads so
+/// dead scratch is never read. Message values equal the dense kernel's
+/// exactly: every skipped term carries a zero witness factor, and field ops
+/// are exact.
+fn sparse_f_fold_and_message(
+    a: &[F128],
+    r: F128,
+    ao: &mut [F128],
+    bo: &[F128],
+    live_in: &[(usize, usize)],
+) -> (F128, F128, Vec<(usize, usize)>) {
+    use crate::zerocheck::multilinear::shrink_intervals;
     let live_out = shrink_intervals(live_in);
     let pair_cover = shrink_intervals(&live_out);
 

@@ -182,6 +182,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
         packed_direct,
         padding,
         None,
+        false,
         challenger,
         trace,
     );
@@ -217,11 +218,29 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
 /// What ring_switch + claim-combination produces, fed to the Ligerito backend.
 struct CombinedClaim {
     ring_switches: Vec<RingSwitchProof>,
+    /// The materialized γ-combined basis — EMPTY when `deferred` is `Some`
+    /// (the streaming path never writes the full-domain array).
     b_combined: Vec<F128>,
     target_combined: F128,
     /// Round-0 sumcheck `(u_0, u_2)` prime over `packed_witness · b_combined`,
     /// consumed by `recursive_prover_with_basis_precomputed_round0`.
     round0_prime: (F128, F128),
+    /// Streaming (never-materialize) sources for `b_combined`: per RS claim,
+    /// the DeferredDense fold ingredients, so that
+    /// `B[e] = Σ_claims deferred_dense_value(eq_lo, eq_hi, table, log_b, e)`.
+    /// `Some` only on the sparse-gated union path; the round-0 fold then
+    /// produces the (half-size) folded basis directly from this closed form,
+    /// and the full-domain `b_combined` never exists.
+    deferred: Option<Vec<DeferredB>>,
+}
+
+/// One RS claim's `b_combined` contribution in closed form (the
+/// `RsEqInd::DeferredDense` ingredients, moved out of the ring-switch
+/// output). Kept only until the virtual-opening sumcheck's round-0 fold.
+struct DeferredB {
+    eq_lo: Vec<F128>,
+    eq_hi: Vec<F128>,
+    table: Vec<F128>,
 }
 
 /// Runs ring_switch over RS claims, observes packed-direct claim values +
@@ -234,9 +253,18 @@ struct CombinedClaim {
 /// interval list of witness-word PAIRS whose words are not all declared
 /// zero — the round-0 prime is then summed over those pairs only (the
 /// skipped pairs have `a0 = a1 = 0`, so their terms are exactly zero).
-/// `b_combined` itself is still fully materialized: the virtual-opening /
-/// Ligerito b-side folds are dense by nature. Pass `None` for dense
-/// witnesses (identical to the pre-M6 behavior).
+///
+/// With `stream_b` (union path, sparse-gated): `b_combined` is NOT
+/// materialized at all. The round-0 prime is computed from the per-claim
+/// closed form (`deferred_dense_value`) over the live pairs only, and the
+/// closed-form ingredients ride out in `CombinedClaim::deferred` so the
+/// virtual-opening sumcheck's round-0 fold can produce the (half-size)
+/// folded basis directly — the full-domain array never exists. Engages only
+/// when every RS claim is `DeferredDense`, there are no packed-direct
+/// claims, and `live_pairs` is present; otherwise (and always with
+/// `stream_b = false`) `b_combined` is fully materialized exactly as
+/// before. Pass `live_pairs = None` for dense witnesses (identical to the
+/// pre-M6 behavior).
 #[allow(clippy::too_many_arguments)]
 fn compute_combined_basis_and_target<Ch: Challenger>(
     packed_witness: &[F128],
@@ -245,6 +273,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     packed_direct: &[PackedDirectClaim],
     padding: &PaddingSpec,
     live_pairs: Option<&[(usize, usize)]>,
+    stream_b: bool,
     challenger: &mut Ch,
     trace: bool,
 ) -> CombinedClaim {
@@ -348,10 +377,6 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         })
         .collect();
 
-    // ---- Build b_combined (γ-weighted sum of all rs_eq_ind + eq_ind) and the
-    //      round-0 prime (u_0, u_2 over packed_witness · b_combined).
-    let mut b_combined: Vec<F128> = crate::scratch::take_f128(l);
-
     // Fast path (compression-proof open: claims ab, c; also chain/merkle): every
     // RS claim is a fused DeferredDense fold and no DENSE packed-direct claim
     // needs the per-element combine. Fold all claims block-by-block straight into
@@ -368,7 +393,59 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     let use_fast =
         !rs_deferred.is_empty() && rs_deferred.len() == rs_results.len() && pd_dense.is_empty();
 
-    let (mut round0_u0, mut round0_u2) = if use_fast {
+    // Streaming: don't materialize b_combined at all. Sound only when every
+    // claim has a closed form (all DeferredDense, no packed-direct — the
+    // scatter-adds below would have nothing to land on) and worthwhile only
+    // on sparse supports: on dense ones the closed form would be evaluated
+    // twice (prime here, fold at round 0), where materializing pays it once.
+    let stream = stream_b && use_fast && packed_direct.is_empty() && live_pairs.is_some();
+
+    // ---- Build b_combined (γ-weighted sum of all rs_eq_ind + eq_ind) and the
+    //      round-0 prime (u_0, u_2 over packed_witness · b_combined) — or,
+    //      when streaming, the prime alone from the closed form.
+    let mut b_combined: Vec<F128> = if stream {
+        Vec::new()
+    } else {
+        crate::scratch::take_f128(l)
+    };
+
+    let (mut round0_u0, mut round0_u2) = if stream {
+        // Closed-form round-0 prime over the live pairs only. Value-identical
+        // to the fast path below: dead pairs have `a0 = a1 = 0`, so their
+        // terms are exactly zero, and per live index the same per-claim
+        // `fold_one_slot` values are summed (F128 addition is exact).
+        let defs = &rs_deferred;
+        live_pairs
+            .expect("stream implies live_pairs")
+            .par_iter()
+            .map(|&(ps, pe)| {
+                let mut u0 = F128::ZERO;
+                let mut u2 = F128::ZERO;
+                for t in ps..pe {
+                    let mut s0 = F128::ZERO;
+                    let mut s1 = F128::ZERO;
+                    for &(eq_lo, eq_hi, table, log_b) in defs.iter() {
+                        s0 += ring_switch::deferred_dense_value(eq_lo, eq_hi, table, log_b, 2 * t);
+                        s1 += ring_switch::deferred_dense_value(
+                            eq_lo,
+                            eq_hi,
+                            table,
+                            log_b,
+                            2 * t + 1,
+                        );
+                    }
+                    let a0 = packed_witness[2 * t];
+                    let a1 = packed_witness[2 * t + 1];
+                    u0 += a0 * s0;
+                    u2 += (a0 + a1) * (s0 + s1);
+                }
+                (u0, u2)
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+            )
+    } else if use_fast {
         let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
         debug_assert!(b >= 2 && b.is_multiple_of(2));
         debug_assert!(rs_deferred.iter().all(|d| d.0.len() == b));
@@ -517,20 +594,40 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         );
     }
 
-    CombinedClaim {
-        ring_switches: rs_results
-            .into_iter()
-            .map(|(p, o)| {
+    let mut deferred_out: Option<Vec<DeferredB>> = stream.then(Vec::new);
+    let ring_switches = rs_results
+        .into_iter()
+        .map(|(p, o)| {
+            match o.rs_eq_ind {
                 // The per-claim rs_eq_ind (L F128s) dies here — recycle it.
-                if let ring_switch::RsEqInd::Dense(v) = o.rs_eq_ind {
-                    crate::scratch::give_f128(v);
+                ring_switch::RsEqInd::Dense(v) => crate::scratch::give_f128(v),
+                // Streaming: carry the closed-form ingredients out for the
+                // virtual-opening sumcheck's round-0 fold (claim order
+                // preserved; the sums are exact either way).
+                ring_switch::RsEqInd::DeferredDense {
+                    eq_lo,
+                    eq_hi,
+                    table,
+                } => {
+                    if let Some(d) = deferred_out.as_mut() {
+                        d.push(DeferredB {
+                            eq_lo,
+                            eq_hi,
+                            table,
+                        });
+                    }
                 }
-                p
-            })
-            .collect(),
+                _ => {}
+            }
+            p
+        })
+        .collect();
+    CombinedClaim {
+        ring_switches,
         b_combined,
         target_combined,
         round0_prime: (round0_u0, round0_u2),
+        deferred: deferred_out,
     }
 }
 
@@ -908,6 +1005,7 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
         packed_direct,
         padding,
         live_pairs.as_deref(),
+        true,
         challenger,
         trace,
     );
@@ -924,6 +1022,9 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
     let t = std::time::Instant::now();
     challenger.observe_label(b"flock-virtual-open-v0");
     let b0 = combined.b_combined;
+    // Streaming b: `b0` is EMPTY and the closed-form ingredients ride here —
+    // round 0 folds the basis into existence at half size and drops them.
+    let mut deferred = combined.deferred;
     let (u0, u2) = combined.round0_prime;
     let (mut g_one, mut g_inf) = (combined.target_combined + u0, u2);
     let mut virtual_open_rounds = Vec::with_capacity(log_l);
@@ -968,15 +1069,41 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
         } else {
             (&a, &bb)
         };
+        // Streaming b exists only when the gate guarantees a sparse round 0
+        // (`live_words` requires words·8 ≤ l), so the dense branches below
+        // never see an empty `b0`.
+        debug_assert!(
+            round > 0 || deferred.is_none() || use_sparse,
+            "streaming b requires a sparse round 0"
+        );
         if use_sparse {
-            let (g1, gi, live_out) = jagged::fold_and_round_sparse(
-                &a_src[..cur],
-                &b_src[..cur],
-                r,
-                &mut sa[..half],
-                &mut sb[..half],
-                live.as_ref().expect("use_sparse implies live"),
-            );
+            let lv = live.as_ref().expect("use_sparse implies live");
+            let (g1, gi, live_out) = if let (0, Some(defs)) = (round, deferred.as_ref()) {
+                // The γ-combined basis was never materialized: evaluate it
+                // from the per-claim closed form and fold directly to half
+                // size — value-identical to folding a materialized `b0`.
+                let views: Vec<(&[F128], &[F128], &[F128])> = defs
+                    .iter()
+                    .map(|d| (d.eq_lo.as_slice(), d.eq_hi.as_slice(), d.table.as_slice()))
+                    .collect();
+                jagged::fold_and_round_sparse_bjit(
+                    &a_src[..cur],
+                    r,
+                    &mut sa[..half],
+                    &mut sb[..half],
+                    lv,
+                    &views,
+                )
+            } else {
+                jagged::fold_and_round_sparse(
+                    &a_src[..cur],
+                    &b_src[..cur],
+                    r,
+                    &mut sa[..half],
+                    &mut sb[..half],
+                    lv,
+                )
+            };
             (g_one, g_inf) = (g1, gi);
             live = Some(live_out);
             sparse_dirty = true;
@@ -1000,10 +1127,16 @@ pub fn open_batch_jagged_ligerito<Ch: Challenger>(
         std::mem::swap(&mut a, &mut sa);
         std::mem::swap(&mut bb, &mut sb);
         cur = half;
+        // The closed-form ingredients are consumed by round 0's fold.
+        if round == 0 {
+            deferred = None;
+        }
     }
     let f_eval = if log_l == 0 { packed_witness[0] } else { a[0] };
     challenger.observe_f128(f_eval);
-    crate::scratch::give_f128(b0);
+    if !b0.is_empty() {
+        crate::scratch::give_f128(b0);
+    }
     crate::scratch::give_f128(sa);
     crate::scratch::give_f128(sb);
     crate::scratch::give_f128(a);
