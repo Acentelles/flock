@@ -29,7 +29,7 @@
 \newtheorem{definition}{Definition}
 
 \title{Multi-Table Proving in Flock:\\ One Proof for Heterogeneous Hash Batches\\[0.6ex]
-\large Design document --- working draft v0.5}
+\large Design document --- working draft v0.6}
 \author{Flock}
 \date{July 27, 2026}
 
@@ -964,6 +964,128 @@ harness for the union PIOP before and after the jagged layer lands, and
 --- the PIOP is identical under both transports.
 \end{remark}
 
+\subsection{Capacity-free ring-switching: a merged reduction (design
+sketch)}\label{sec:merged}
+
+Everything in this subsection is a \emph{design sketch} --- analyzed but
+unimplemented, with the load-bearing algebra stated so it can be checked,
+not yet checked against the implementation.
+
+\paragraph{The padded-domain floor, measured.} Ring-switching is the one
+pipeline stage that still sees the capacity: its weight and its sumcheck
+live in padded coordinates, so the prover pays one $\Phi$-evaluation
+(the $16{\cdot}256$-byte-table fold) per \emph{padded} word per claim,
+plus the $b$-side fold chain. On the real $M = 30$ mixed workload
+($16384 + 16384$) proved on capacity tiers $\nu = 14/15/16$ (100\%,
+50\%, 25\% utilization), the combine $+$ virtual-opening sumcheck
+measure $12.3 / 23.0 / 44.7$\,ms --- linear in $2^{M-7}$ --- while
+every stage downstream of the type converter is flat (fused Ligerito
+$\approx 17$--$18$\,ms, $\tilde b$/assist $\approx 1.5$\,ms at every
+tier). At deployment scale this floor \emph{is} the capacity tax; the
+support-proportional schemes of \S\ref{sec:commit} can reach the floor
+(never below it), because the late round messages provably depend on
+every entry of the weight.
+
+\paragraph{The merged reduction.} The witness is identically zero off
+the committed stack, so the type converter's sum restricts exactly:
+\[
+  \sum_{x} f(x)\, b(x) \;=\; \sum_{d} q[d]\; W[d],
+  \qquad
+  W[d] \;=\; \sum_i (\gamma_i \Phi_i)\bigl(\eq_{\mathrm{row},i}[\mathrm{row}(d)]
+  \cdot \eq_{\mathrm{col},i}[\mathrm{col}(d)]\bigr),
+\]
+with $(\mathrm{row}, \mathrm{col})$ the jagged unrank. Running the
+virtual-opening sumcheck over the \emph{dense} domain with weight $W$
+merges the two reductions of this section into one: it is
+simultaneously ring-switching's sumcheck and the dense/virtual
+translation. Prover cost becomes count-proportional --- the existing
+just-in-time factored-weight machinery (the \code{col\_prefix\_sums}
+cursor walk) with a $\Phi$ applied per element, roughly $6$\,ms at this
+workload \emph{at any tier}. The sumcheck's output is a plain dense
+evaluation $\hat q(\rho)$, so Ligerito reverts to an ordinary
+$\eq$-basis opening --- the fused $W_\rho$ basis, the $\tilde b$
+vector, and the send-and-spot-check reduction all retire.
+
+\paragraph{The one new obligation, and why existing tools fail.} The
+verifier must evaluate $\widehat W(\rho)$ --- the MLE over dense
+coordinates of the $\Phi$-\emph{twisted} jagged weight. Untwisted, this
+is exactly the assist's object $\hat f_t$; twisted, every existing tool
+breaks on the same fact: $\Phi$ is $\F_2$-linear but
+$\Phi(c\,x) \ne c\,\Phi(x)$, so it passes through neither the branching
+program's multiplicative transitions, nor bit-decomposition (bit-slices
+of field products are not multilinear), nor send-and-spot-check
+(checking the sent value needs an independent oracle for the same
+twisted object).
+
+\paragraph{The bilinear-tensor branching program.} The twist does
+untangle, at the price of state width. Write each term as
+$\alpha(e)\cdot\Phi(\beta(e))$ with $\alpha = \eq(\rho, e)$ carrying
+every $\F$-side weight and $\beta$ the row/column product inside
+$\Phi$. The map $(\alpha, \beta) \mapsto \alpha\,\Phi(\beta)$ is
+$\F_2$-bilinear, so
+\[
+  \widehat W(\rho) \;=\; B\Bigl(\;\sum_e \alpha(e) \otimes \beta(e)\Bigr),
+  \qquad B(a \otimes b) := a\cdot\Phi(b),
+\]
+and the tensor $T = \sum_e \alpha \otimes \beta \in
+\F \otimes_{\F_2} \F$ evolves under a \emph{read-once linear} branching
+program: each index bit contributes the transparent Kronecker map
+$M_{u(0)} {\otimes} M_{v(0)} + M_{u(1)} {\otimes} M_{v(1)}$
+(multiplication by a constant is $\F_2$-linear), and the jagged
+comparison/carry structure composes with it exactly as in the existing
+width-$4$ program --- the state is (carry, comparison) $\otimes$ a
+$128 \times 128$ bit matrix, and $\Phi$ is applied \textbf{once, to the
+final state, outside every multiplication}.
+
+\paragraph{Delegation analysis.} The implemented assist delegates
+$\hat f_t$ by a sumcheck over the $2(m{+}1)$ column-\emph{boundary}
+bits, against a width-$4$ program whose proof size is
+width-independent (rounds $=$ variables) while prover cost and the
+verifier's final DP scale linearly with width. It does \emph{not}
+extend to the twisted object, for a reason worth recording precisely: a
+sumcheck can only bind a variable that enters the summand
+$\F$-linearly. The tensor form is $\F$-linear in the $\alpha$ slot ---
+$B((M_x \otimes I)\,T) = x\,B(T)$ --- so $\rho$-side variables bind
+fine; but the row-side factors (and the boundary bits that steer the
+subtraction carry) live in the $\beta$ slot, where
+$B((I \otimes M_x)\,T) \ne x\,B(T)$. Three options, in current order of
+preference:
+\begin{enumerate}[nosep]
+  \item \textbf{The fat verifier (leading).} Do not delegate: the
+        verifier evaluates $\widehat W(\rho)$ itself by the per-column
+        tensor DP --- \emph{no new argument, no new proof bytes, no new
+        soundness surface}. Estimated cost: per column and layer, two
+        surviving transitions on a $128$-vector-of-$\F$ state
+        ($\approx 256$ multiplies for the $\alpha$ slot; the
+        $\beta$-side maps are $\F_2$-matrices, applicable by byte
+        tables as in ring-switching's own fold) --- order $10^7$
+        multiplies $\approx$ a few ms, once per proof,
+        count- \emph{and} capacity-independent. Verification goes
+        $\approx 11 \to 13$--$16$\,ms; comb delegation
+        (\S\ref{sec:open}), already the queued answer if verify time
+        matters, would more than offset it.
+  \item \textbf{A structured assist.} Exploit the Kronecker form of the
+        transitions plus $\alpha$-slot binding to keep a sumcheck over
+        some of the variables and handle the $\beta$-slot ones another
+        way. Open; would need its own soundness write-up (the genre of
+        the rejected yr-weighted assist).
+  \item \textbf{Recursive ring-switching.} The $\beta$-slot obstruction
+        is bit-structure-versus-field-multiplication --- the exact
+        mismatch ring-switching itself resolves --- over a domain of
+        only $2(m{+}1)$ bits. Speculative.
+\end{enumerate}
+
+\paragraph{What it buys, per tier (estimates against the measured
+baseline).} Prover: the ring-switch machinery's $12.3 / 23.0 /
+44.7$\,ms collapses to $\approx 6$--$7$\,ms flat --- the $4\times$-tier
+total ratio drops from $\approx 1.35$ to $\approx 1.13$, and the
+$256$--$512$\,MB $b_{\mathrm{combined}}$ transient disappears. Proof:
+slightly smaller (the $\tilde b$ vector and spot-check go). Verifier:
+$+2$--$5$\,ms under option 1. The decision gate is exactly that
+verifier trade --- and whether the tensor-BP construction and the
+$\alpha$/$\beta$-slot analysis survive contact with the implementation,
+which is the first thing to check before building anything.
+
 % ===========================================================================
 \section{Statement, transcript, wire format}\label{sec:statement}
 
@@ -1238,7 +1360,16 @@ registry growth or verify latency demands it.
         lincheck's verify cost, not a multi-table artifact; a
         multi-slot registry multiplies it by the number of
         \emph{distinct} circuits. Delegation is explicitly deferred
-        until registry growth or verify latency demands it.
+        until registry growth or verify latency demands it --- and it
+        pairs naturally with the merged reduction of \S\ref{sec:merged},
+        whose leading variant spends verifier time to delete the
+        prover's padded-domain floor.
+  \item \textbf{The padded-domain floor / merged reduction.} The one
+        remaining capacity-proportional prover cost is ring-switching's
+        padded-domain $\Phi$-pass; \S\ref{sec:merged} sketches the
+        merged jagged/ring-switch reduction that would make it
+        count-proportional, with the $\Phi$-twisted weight evaluation
+        as the single open design question.
   \item \textbf{The lookup/bus layer (the designated follow-on).} All
         dataflow --- table-to-table communication \emph{and} binding
         hashed values to the public statement --- is to be provided by a
