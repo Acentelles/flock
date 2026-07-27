@@ -830,17 +830,34 @@ fn mixed_low_utilization_smoke() {
 #[ignore] // Heavy + informational — run explicitly with --ignored --nocapture
 fn capacity_sweep_fixed_workload() {
     let _quiet = timing_lock();
+    // 100% → 6.25% utilization, M = 26 → 30.
+    run_capacity_sweep([1024, 1024], &[10, 12, 14]);
+}
+
+/// [`capacity_sweep_fixed_workload`] at the REAL m30 mixed load: the
+/// full-utilization M = 30 benchmark workload (16384 + 16384, the mixed
+/// throughput scale) proved on ever-larger capacity tiers — the deployment
+/// question "what does a generous tier cost the workload it was provisioned
+/// for" at production size. ν = 15 is also the 50%-utilization point the
+/// SPARSE_TAIL_GATE retune left unmeasured (it sits in the dense band at
+/// gate = 4).
+#[test]
+#[ignore] // Heavy + informational — run explicitly with --ignored --nocapture
+fn capacity_sweep_m30_load() {
+    let _quiet = timing_lock();
+    // 100% → 25% utilization, M = 30 → 32.
+    run_capacity_sweep([16384, 16384], &[14, 15, 16]);
+}
+
+fn run_capacity_sweep(counts: [usize; 2], nus: &[usize]) {
     use std::time::Instant;
 
-    const COUNTS: [usize; 2] = [1024, 1024]; // (sha2, blake3) — the fixed workload
-    const NUS: [usize; 3] = [10, 12, 14]; // 100% → 6.25% utilization, M = 26 → 30
-
-    let cfgs: Vec<_> = NUS.iter().map(|&nu| mixed_registry(nu)).collect();
+    let cfgs: Vec<_> = nus.iter().map(|&nu| mixed_registry(nu)).collect();
     flock_core::scratch::prewarm_prover(cfgs.last().unwrap().0.m_total());
 
     let mut rng = Rng::new(0xCA9A_C17F_5EED);
-    let sha2_inputs = random_sha2_inputs(&mut rng, COUNTS[0]);
-    let blake3_inputs = random_blake3_inputs(&mut rng, COUNTS[1]);
+    let sha2_inputs = random_sha2_inputs(&mut rng, counts[0]);
+    let blake3_inputs = random_blake3_inputs(&mut rng, counts[1]);
 
     // The committed stack is count-derived, never capacity-derived: dense
     // size, committed size, and lane count must be identical across the
@@ -848,7 +865,7 @@ fn capacity_sweep_fixed_workload() {
     {
         let unions: Vec<_> = cfgs
             .iter()
-            .map(|(reg, ..)| UnionInstance::new(reg, COUNTS.to_vec()))
+            .map(|(reg, ..)| UnionInstance::new(reg, counts.to_vec()))
             .collect();
         for u in &unions[1..] {
             assert_eq!(
@@ -870,21 +887,21 @@ fn capacity_sweep_fixed_workload() {
     const OPEN: usize = 4;
     const PROVE: usize = 5;
     const VERIFY: usize = 6;
-    let mut mins = [[f64::INFINITY; 7]; NUS.len()];
+    let mut mins = vec![[f64::INFINITY; 7]; nus.len()];
 
     const PASSES: usize = 4; // pass 0 is an untimed warm-up
     for pass in 0..PASSES {
         let order: Vec<usize> = if pass % 2 == 0 {
-            (0..NUS.len()).collect()
+            (0..nus.len()).collect()
         } else {
-            (0..NUS.len()).rev().collect()
+            (0..nus.len()).rev().collect()
         };
         for &i in &order {
             let (registry, sha2_r1cs, blake3_r1cs) = &cfgs[i];
-            let nu = NUS[i];
+            let nu = nus[i];
             let s2_circuit = sha2_r1cs.csc_lincheck_circuit();
             let b3_circuit = blake3_r1cs.csc_lincheck_circuit();
-            let union = UnionInstance::new(registry, COUNTS.to_vec());
+            let union = UnionInstance::new(registry, counts.to_vec());
             let pcs_params = union_pcs_params(&union);
 
             let slots = vec![
@@ -938,9 +955,9 @@ fn capacity_sweep_fixed_workload() {
         }
     }
 
-    let committed = UnionInstance::new(&cfgs[0].0, COUNTS.to_vec()).committed_words();
+    let committed = UnionInstance::new(&cfgs[0].0, counts.to_vec()).committed_words();
     println!(
-        "capacity sweep, fixed counts (sha2, blake3) = {COUNTS:?}, committed {committed} words \
+        "capacity sweep, fixed counts (sha2, blake3) = {counts:?}, committed {committed} words \
          at every capacity (min of {} alternated passes, ms):",
         PASSES - 1
     );
@@ -948,13 +965,13 @@ fn capacity_sweep_fixed_workload() {
         "  {:>3} {:>3} {:>6} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
         "nu", "M", "util%", "wit", "commit", "zc", "lc", "open", "prove", "verify"
     );
-    for (i, &nu) in NUS.iter().enumerate() {
+    for (i, &nu) in nus.iter().enumerate() {
         let m = &mins[i];
         println!(
             "  {:>3} {:>3} {:>6.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2}",
             nu,
             cfgs[i].0.m_total(),
-            100.0 * COUNTS[0] as f64 / (1u64 << nu) as f64,
+            100.0 * counts[0] as f64 / (1u64 << nu) as f64,
             m[WIT],
             m[COMMIT],
             m[ZC],
@@ -971,7 +988,7 @@ fn capacity_sweep_fixed_workload() {
     // opening and the capacity-sized buffers are deliberately unasserted —
     // the b-side of the virtual-opening sumcheck is known
     // capacity-proportional (dense on the padded packed domain).
-    let (lo, hi) = (&mins[0], &mins[NUS.len() - 1]);
+    let (lo, hi) = (&mins[0], &mins[nus.len() - 1]);
     let piop_lo = lo[ZC] + lo[LC];
     let piop_hi = hi[ZC] + hi[LC];
     // Post gate-retune + parallel sparse tail, the measured ratio at 16x
