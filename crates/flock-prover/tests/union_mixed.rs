@@ -1097,6 +1097,46 @@ fn merged_transport_roundtrip_and_tamper() {
         let mut bad = proof.clone();
         bad.zerocheck.round1_ab[0] += F128::ONE;
         reject(&bad, "zerocheck round 1");
+
+        // Params-vs-root binding: the transcript binds only the commitment
+        // ROOT, but the opening reads the leaf width / lane count from
+        // `commitment.params`, which rides the proof attacker-controlled —
+        // the verifier must reject a commitment whose params differ from
+        // the count-derived ones (same soundness surface the jagged path
+        // tamper-tests).
+        let mut bad_commitment = commitment.clone();
+        bad_commitment.params.num_lanes = match commitment.params.num_lanes {
+            Some(_) => None,
+            None => Some((1usize << commitment.params.log_batch_size) - 1),
+        };
+        let mut ch_v = FsChallenger::new(DOMAIN);
+        assert!(
+            verifier::verify_ligerito_jagged_union_merged(
+                &union,
+                &circuits,
+                &bad_commitment,
+                &proof,
+                &pcs_params,
+                &mut ch_v,
+            )
+            .is_err(),
+            "tampered commitment params (num_lanes) must be rejected at counts {counts:?}"
+        );
+        let mut bad_commitment = commitment.clone();
+        bad_commitment.params.log_inv_rate += 1;
+        let mut ch_v = FsChallenger::new(DOMAIN);
+        assert!(
+            verifier::verify_ligerito_jagged_union_merged(
+                &union,
+                &circuits,
+                &bad_commitment,
+                &proof,
+                &pcs_params,
+                &mut ch_v,
+            )
+            .is_err(),
+            "tampered commitment params (log_inv_rate) must be rejected at counts {counts:?}"
+        );
     }
 }
 
