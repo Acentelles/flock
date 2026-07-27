@@ -29,9 +29,9 @@
 \newtheorem{definition}{Definition}
 
 \title{Multi-Table Proving in Flock:\\ One Proof for Heterogeneous Hash Batches\\[0.6ex]
-\large Design document --- working draft v0.4}
+\large Design document --- working draft v0.5}
 \author{Flock}
-\date{July 23, 2026}
+\date{July 27, 2026}
 
 \begin{document}
 \maketitle
@@ -786,11 +786,32 @@ $\langle f, b\rangle$ without an explicit sumcheck) and which the jagged
 path un-fuses, because Ligerito now lives on the far side of the
 dense/virtual index translation and only eq-shaped claims cross that
 translation cheaply. The prover's sumcheck folds are support-proportional
-under the declared-work discipline (still an open follow-up --- the
-implementation folds dense buffers, which at full utilization \emph{is}
-the support), while the verifier's costs --- the static round count and
-one polylog $\hat b(\rho)$ evaluation --- are oblivious to the sparsity
-pattern.
+under the declared-work discipline (implemented: on sparse supports the
+$f$-side folds and the round messages touch only the live word
+intervals), with one structural asymmetry worth recording: the $b$-side
+folds are irreducibly \emph{dense}, for two stacked reasons. No product
+structure survives ring-switching's per-word bit surgery, so folded
+$b$-values cannot be produced on demand from small tables; and
+support-\emph{skipping} fails as well: the late rounds consume folded
+$b$ wherever folded $f$ is nonzero, and $f$'s support coarsens to the
+\emph{full} domain as the folds merge dummy rows into live blocks ---
+so, by backward induction (each round's folded array is the next
+round's input), every entry of every round's $b$-array is load-bearing.
+Skipping is sound only for a factor whose honest dead-region values are
+\emph{zero} at every fold depth --- the $f$-side --- because zero is
+the one value that need not be computed. What \emph{is} implemented
+(sparse-gated): the full-domain $b$-array is never materialized ---
+computing values on demand stores nothing, so nothing can go stale.
+The round-0 message needs $b$ only at live pairs (dead pairs carry zero
+witness factors) and is computed from the per-claim closed form there;
+the round-0 fold then produces the half-size folded array directly from
+the same closed form, so the $b$-side chain starts at half size and the
+full-domain array never exists. The floor this leaves is intrinsic ---
+one closed-form evaluation per padded word, since the late messages
+depend on all of $b$ --- so the residual padded-domain cost is
+compute, not memory. The verifier's costs --- the
+static round count and one polylog $\hat b(\rho)$ evaluation --- are
+oblivious to the sparsity pattern either way.
 
 \paragraph{Reduction 2: the jagged transport.} Stack only the
 \emph{declared} rows of the \emph{used} chunk-columns of all tables
@@ -803,11 +824,16 @@ integer in $[0, 2^{\nu}]$; non-power-of-two counts are native --- so the
 un-padded dense size is the count-proportional
 $\sum_t n_t\,\lceil u_t/128\rceil$ packed words (stacking granularity is
 the $128$-variable chunk-column; the sub-chunk remainder is negligible).
-The committed size is this rounded up to a power of two,
-\textbf{floored} at the smallest embedded Ligerito security
-configuration ($m22$: $2^{15}$ packed words --- configurations are
-derived and embedded per committed size) and capped at the union's own
-padded size, so the dense domain never exceeds the virtual one. The
+The \emph{dense domain} --- the variable count of $\hat q$, hence the
+round structure and the security configuration --- is this rounded up
+to a power of two, \textbf{floored} at the smallest embedded Ligerito
+security configuration ($m22$: $2^{15}$ packed words --- configurations
+are derived and embedded per committed size) and capped at the union's
+own padded size, so the dense domain never exceeds the virtual one. The
+\emph{committed data}, by contrast, is no longer rounded: only an
+integer number $L$ of Ligerito lanes covering the dense stack is
+encoded and hashed, so the physical padding is below one lane (the
+integer-lane commitment, below). The
 jagged heights are therefore \textbf{per-proof} --- $n_t$ on slot $t$'s
 used columns, $0$ elsewhere --- derived by prover and verifier alike
 from the \emph{public} counts, never from the bundle; a wrong declared
@@ -835,6 +861,15 @@ fused-opening identity $\ip{q}{W_\rho} = \hat f(\rho)$ intact (the
 deleted terms of $\hat f(\rho)$ were all zero) --- Ligerito, itself an
 inner-product argument, proves $\langle q, W_\rho\rangle = v_\rho$
 directly with $W_\rho$ as its basis; no separate jagged sumcheck runs.
+The factorization of $W_\rho$ is also how the prover \emph{sources} the
+basis: $\eq(\rho[0{:}\nu], \mathrm{row}(e))$ and
+$\eq(\rho[\nu{:}], \mathrm{col}(e))$ are two small $\eq$ tables plus a
+column-cursor walk over \code{col\_prefix\_sums} --- valid at arbitrary
+per-column heights --- so the $2^{M_{\mathrm{dense}}}$-word basis
+vector is never materialized. The fused claim/round-0 pass and the
+first fold fill cache-resident windows on demand; only the half-size
+\emph{folded} basis that the first fold emits ever exists as an array,
+and the later rounds consume it exactly as before.
 The verifier's one remaining obligation is the basis MLE at Ligerito's
 final points: the recursion ends not at a point but at a prover vector
 $yr$ of length $2^{yr\_log\_n}$, requiring
@@ -852,21 +887,64 @@ $yr\_log\_n/|\F|$. \code{col\_prefix\_sums}, derived \emph{per proof}
 from the public counts (the jagged heights are count-dependent under
 height-$n_t$ stacking), encodes the layout inside the branching-program
 evaluator $\hat f_t$.
-The sizing fact, sharpened by implementation: above the $m22$ config
-floor the committed size is \textbf{count-proportional} --- the
-power-of-two rounding costs at most $2\times$, and the floor binds only
-when the dense area falls below $2^{15}$ packed words. (The
-capacity-height column-dense rounding effect of the previous draft ---
-column-dense registries like BLAKE3$+$SHA-256, at $121$ of $128$ and
-$246$ of $256$ chunk-columns, rounding straight back to the padded power
-of two --- survives only at full utilization, where the dense area is
-the used-column capacity area.)
+The sizing fact, sharpened twice by implementation: above the $m22$
+config floor the committed size is \textbf{count-proportional up to
+less than one lane of padding}. The power-of-two rounding tax of the
+previous draft (at most $2\times$; measured $28\%$ for a
+full-utilization BLAKE3$+$SHA-256 mix at $M = 30$) is gone with the
+integer-lane commitment below, and with it the column-dense rounding
+effect (column-dense registries like BLAKE3$+$SHA-256, at $121$ of
+$128$ and $246$ of $256$ chunk-columns, rounding straight back to the
+padded power of two at full utilization). The floor binds only when the
+dense area falls below $2^{15}$ packed words.
 
 One consequence worth recording: under height-$n_t$ stacking the jagged
 verifier's branching-program layout data (heights,
 \code{col\_prefix\_sums}) is per-proof, derived from the public counts
 --- which is where the assist delegation, already in place, earns its
 keep a second time.
+
+\paragraph{The integer-lane commitment (``integer commit, power-of-two
+open'').} Ligerito's codeword is an \emph{interleaved} Reed--Solomon
+encoding: the message is split into lanes of a fixed power-of-two
+length $D$ ($2^{17}$ words at $M = 30$), one NTT per lane, and a Merkle
+leaf holds one position of every lane. The lane count is where the
+power-of-two rounding tax lived: rounding the dense stack up to
+$2^{k}$ lanes RS-encoded and Merkle-hashed the padding like real data
+($28\%$ of the committed stack for the full-utilization
+BLAKE3$+$SHA-256 mix at $M = 30$; $34\%$ on the CLI's $\nu = 7$ tier).
+The shipped scheme instead commits an \emph{arbitrary integer}
+$L = \lceil N_{\mathrm{com}} / D \rceil$ of lanes --- padding below one
+lane --- while the \emph{opening} keeps every power-of-two structure:
+the fold still runs over the $2^{k}$-lane grid
+($k = \lceil \log_2 L \rceil$), with lanes $[L, 2^{k})$
+\emph{definitionally zero} --- the prover skips them, and the verifier
+zero-fills each opened $L$-wide leaf before the consistency check ---
+so the fold rounds, the lane $\eq$-tensor, $W_\rho$, $\tilde b$, and
+the assist are all structurally unchanged (in particular the fused
+transport survives). Two choices are load-bearing. \emph{High-bit
+lanes}: lane $\ell$ is the contiguous block
+$q[\ell D, (\ell{+}1) D)$, not the usual bit-strided interleaving ---
+the dense stack's zero tail is then \emph{whole} zero lanes, and the
+relabelling is a rotation of the index variables, which every
+multilinear downstream survives by rotating its evaluation point. (With
+strided lanes and integer $L$, the lane index $e \bmod L$ is not a bit
+field, and a div/mod-$L$ would enter the jagged branching program,
+blowing its one-bit carry up to $\approx 2L$ states.) \emph{Addressing,
+not data}: the lane variables sit in the \emph{high} index bits, so
+Ligerito's lane-binding rounds pair adjacent \emph{blocks} of $D$ words
+instead of adjacent elements --- the same challenges, order, and $\eq$
+weights, applied at block granularity --- and neither $q$ nor the basis
+is ever permuted; the fast interleaved NTT kernel is kept verbatim. One
+soundness point: the transcript binds only the commitment \emph{root},
+while the opening reads the leaf width and lane count from the
+commitment's parameters, which therefore ride the proof
+attacker-controlled --- the union verifier requires them to equal the
+count-derived parameters (a rejection, not a panic). When the stack
+fills every lane ($L = 2^{k}$ --- in particular the
+identity-compaction single-slot path) the scheme is byte-identical to
+the power-of-two commit, which is what keeps the single-type anchors
+green.
 
 \begin{remark}[The direct-commitment harness]\label{rem:harness}
 At full utilization ($n_t = 2^{\nu_t^{\max}}$ for all $t$) the union buffer
@@ -947,8 +1025,9 @@ single-hash chain statements keep their own flavor and path, untouched.
 Let $N_{\mathrm{decl}} = \sum_t n_t k_t$ (declared area),
 $N_{\mathrm{com}} = \sum_t n_t \lceil u_t/128\rceil$ packed words (the
 count-proportional dense size under height-$n_t$ stacking, committed
-after rounding up to a power of two and flooring at the $m22$ config,
-\S\ref{sec:commit}), $T$ = types.
+as an integer number of Ligerito lanes --- physical padding below one
+lane --- with the opening's power-of-two domain floored at the $m22$
+config, \S\ref{sec:commit}), $T$ = types.
 
 \begin{center}
 \begin{tabular}{@{}ll@{}}
@@ -961,7 +1040,7 @@ Zerocheck prover & $O(N_{\mathrm{decl}})$; static $M$ rounds; skip intact \\
 Lincheck prover & $O(N_{\mathrm{decl}})$ folds $+$ $(M{-}\nu)$-round union-column SC \\
 Ring-switch folds & $O(N_{\mathrm{decl}})$ (fused into the zerocheck/lincheck passes) \\
 Virtual-opening SC prover & $O(\text{support})$, $(M{-}7)$-round product SC \\
-Jagged transport (fused into Ligerito) & $\tilde O(N_{\mathrm{com}})$ ($W_\rho$ basis $+$ $\tilde b$/assist) \\
+Jagged transport (fused into Ligerito) & $\tilde O(N_{\mathrm{com}})$ (factored $W_\rho$ basis, just-in-time, $+$ $\tilde b$/assist) \\
 Opening & one batched Ligerito open \\
 \midrule
 Verifier rounds & $M + K$ registry-static; transport rounds sized by the per-proof $N_{\mathrm{com}}$ \\
@@ -978,10 +1057,10 @@ the same workload; capacity costs only $M - \log_2 N_{\mathrm{decl}}$
 extra sumcheck rounds, and mixing costs $O(T)$ scalars plus the (new, but
 size-independent-per-invocation) jagged transport. The commit pays for
 the declared rows of the used columns --- count-proportional above the
-$m22$ config floor under height-$n_t$ stacking (\S\ref{sec:commit}),
-with the power-of-two rounding costing at most $2\times$; the
-column-dense rounding effect (the useful-column ratio returned by the
-rounding) survives only at full utilization.
+$m22$ config floor under height-$n_t$ stacking, with physical padding
+below one Ligerito lane under the integer-lane commitment
+(\S\ref{sec:commit}); the former power-of-two rounding tax, and the
+column-dense effect it produced at full utilization, are gone.
 
 % ===========================================================================
 \section{Roadmap}\label{sec:roadmap}
@@ -1038,28 +1117,65 @@ the roadmap prescribes: every step landed behind a single-slot
 byte-identity differential against the direct path (the whole proof
 bundle asserted byte-identical, not merely accepted), with brute-force
 MLE cross-checks for the $T = 2$ lincheck; the direct-commitment harness
-(Remark~\ref{rem:harness}) remains a live regression anchor. Height-$n_t$
-stacking (M5) has since landed, making the committed size
+(Remark~\ref{rem:harness}) remains a live regression anchor, and the
+optimization work below additionally landed behind SHA-256-pinned
+proof-byte fixtures at four count vectors (full, partial,
+non-power-of-two, and zero counts) --- a permanent regression anchor
+for the mixed path. Height-$n_t$
+stacking (M5) made the committed size
 count-proportional (\S\ref{sec:commit}) with the area numbers of the
 Phase 2 gate above: BLAKE3$+$SHA-256 at $\nu = 7$, counts $(32, 32)$,
 commits $2^{15}$ words against capacity-height's $2^{16}$, and $16\times$
-fewer at $\nu = 10$ low utilization.
+fewer at $\nu = 10$ low utilization. Since draft v0.4:
+
+\begin{itemize}[nosep]
+  \item \emph{Declared-work prover passes}
+        (item~\ref{item:folding} delivered): the zerocheck tail rounds,
+        the union lincheck row folds (count-proportional at every
+        partial count), and the virtual-opening $f$-side folds are
+        support-proportional; $\tilde b$ is one batched shared-prefix
+        branching-program evaluation; and the run-list zerocheck path
+        shares one kernel with the single-run path (a missed-SIMD gap
+        measured at $+13\%$ zerocheck on identical data, now
+        $+0.5\%$). At $\nu = 10$ counts $(8, 8)$ the prove dropped
+        $\approx 1.34\times$ (single-shot wall $\approx 1.5\times$);
+        full utilization is unchanged or slightly better. The residual
+        low-utilization floor is count-independent by nature: per-type
+        comb builds ($O(\nnz)$, registry-static), the $m22$-floor
+        commit/opening, and the dense $b$-side (\S\ref{sec:commit}).
+  \item The \emph{integer-lane commitment} (\S\ref{sec:commit}): at
+        $M = 30$ full-utilization BLAKE3$+$SHA-256 the commit encodes
+        $46$ of the former $64$ lanes (NTT $22.6 \to 15.5$\,ms, Merkle
+        $8.9 \to 6.7$\,ms) and the proof shrinks $16\%$
+        ($400\,768 \to 336\,288$ bytes); the CLI's
+        \code{blake3=100,sha2=37} proof shrinks $28\%$
+        ($274 \to 198$\,KB). With the lane binding done by addressing
+        rather than data movement, prove is $\approx 6\%$ \emph{faster}
+        than the power-of-two-commit baseline, on top of the size win.
+  \item The \emph{just-in-time factored basis} (\S\ref{sec:commit}):
+        the fused opening no longer materializes $W_\rho$ ($134$\,MB at
+        $M = 30$) --- the fused open dropped $16.0 \to 14.4$\,ms and
+        peak memory by the full $134$\,MB.
+\end{itemize}
 
 Measured at $m = 30$ BLAKE3 on Apple silicon: the direct path proves at
-roughly $600$--$620$k compressions/s; the jagged/union pipeline runs at
-$\approx 92$--$94\%$ of direct --- a $\approx 9$\,ms structural transport
-cost (virtual-opening sumcheck $\approx 3.9$, $W_\rho$ basis
-$\approx 2.0$, $\tilde b$ $+$ assist $\approx 2.7$) --- with verification
-at parity ($\approx 10.5$\,ms) and proof size $+0.7\%$. Mixed proofs cost
-$\approx 1.02\times$ the sum of the corresponding single-type proofs; the
-CLI's mixed proof of \code{blake3=100,sha2=37} is $\approx 274$\,KB,
-proving and verifying in $\approx 0.3$\,s each.
+$\approx 600$k compressions/s ($\approx 108$\,ms); the union pipeline
+runs at $\approx 96\%$ of direct, the remaining structural cost being
+essentially the virtual-opening sumcheck ($\approx 3.8$\,ms --- it can
+never fuse, \S\ref{sec:commit}). A mixed BLAKE3$+$SHA-256 proof at the
+same scale costs $\approx 1.1\times$ the sum of the corresponding
+single-type proofs ($\approx 300$k invocations/s) at $336$\,KB; the
+CLI's mixed proof of \code{blake3=100,sha2=37} is $\approx 198$\,KB,
+proving and verifying in $\approx 0.3$\,s each. Verification is
+$\approx 11$\,ms, of which $\approx 83\%$ is the per-type comb builds
+--- a cost the direct path pays too, fused into its sumcheck replay
+(item~\ref{item:manytypes}).
 
-Open follow-ups, in the order they are likely to matter:
-support-proportional lincheck/ring-switch folds plus the ring-switch
-\code{ChunkPadding} multi-run (\S\ref{sec:open}); a Keccak batch-major
-driver (the registry machinery accepts the type; only the driver is
-missing); and the lookup/bus layer (\S\ref{sec:open}).
+Open follow-ups, in the order they are likely to matter: a Keccak
+batch-major driver (the registry machinery accepts the type; only the
+driver is missing); the lookup/bus layer (\S\ref{sec:open}); and comb
+delegation (item~\ref{item:manytypes}), explicitly deferred until
+registry growth or verify latency demands it.
 
 % ===========================================================================
 \section{Open questions}\label{sec:open}
@@ -1076,17 +1192,21 @@ missing); and the lookup/bus layer (\S\ref{sec:open}).
         public counts, floored at the smallest embedded configuration
         ($m22$, \S\ref{sec:commit}). The virtual-opening
         sumcheck's domain label (\code{flock-virtual-open-v0}) and
-        transcript position are pinned. Still open: the ring-switch
-        \code{ChunkPadding} multi-run fallback (currently no-skip,
-        correct but unoptimized), generalized alongside the folding item
-        below.
+        transcript position are pinned. The last residue --- the
+        ring-switch \code{ChunkPadding} multi-run fallback --- turned
+        out to be moot on the union path: the union prover hands the
+        opening \emph{precomputed} slice-folds $\hat s_v$, captured
+        during its own PIOP passes, so the ring-switch fold the
+        fallback guards never runs there. Nothing in this item remains
+        open.
   \item \textbf{Capacity sizing.} How many tiers, and how large? Each
         doubling of capacity costs one static sumcheck round and slightly
         larger bookkeeping tables; exceeding capacity forces a proof
         split. Leaning: a single generous uniform-capacity tier
         (\S\ref{sec:model}), adding tiers only on demonstrated demand;
         confirm against a workload model at Phase 2.
-  \item \textbf{Folding over empty capacity --- an implementation
+  \item \label{item:folding}\textbf{Folding over empty capacity --- an
+        implementation
         pattern, not a hot loop.} The union fold factorizes per slot:
         binding variables low to high, slot $t$ folds its own dense,
         declared data for its first $m_t$ rounds (today's kernels,
@@ -1099,16 +1219,26 @@ missing); and the lookup/bus layer (\S\ref{sec:open}).
         sparse iteration inside any hot loop. The same discipline covers
         the ring-switching folds (\S\ref{sec:commit}): the fused
         $\hat s_v$ capture and the per-slot claim folds must skip dummy
-        rows via the same run-lists. Residual work: the round-polynomial
-        accounting at slot-collapse boundaries, and an adversarial
-        benchmark at low utilization.
-  \item \textbf{Many types.} Verifier matrix work is linear in registry
+        rows via the same run-lists. \emph{Delivered}: implemented
+        end-to-end behind proof-byte fixtures, with the adversarial
+        low-utilization benchmark in place (Implementation status,
+        \S\ref{sec:roadmap}); the one structural exception is the
+        $b$-side of the virtual-opening sumcheck, which is irreducibly
+        dense (\S\ref{sec:commit}).
+  \item \label{item:manytypes}\textbf{Many types.} Verifier matrix work
+        is linear in registry
         size ($\sum_t \nnz$). If the registry grows past a handful of
         types, the clean fix is Spartan-style preprocessing: commit each
         base block's MLE once at registry-definition time and replace the
         verifier's comb evaluation with one PCS opening per type;
-        assist-style delegation is the lighter-weight alternative. Not
-        needed initially.
+        assist-style delegation is the lighter-weight alternative. Now
+        measured: the comb evaluation is $\approx 83\%$ of the
+        $\approx 11$\,ms verify at $m = 30$. The direct path pays the
+        same cost, fused into its sumcheck replay --- this is the
+        lincheck's verify cost, not a multi-table artifact; a
+        multi-slot registry multiplies it by the number of
+        \emph{distinct} circuits. Delegation is explicitly deferred
+        until registry growth or verify latency demands it.
   \item \textbf{The lookup/bus layer (the designated follow-on).} All
         dataflow --- table-to-table communication \emph{and} binding
         hashed values to the public statement --- is to be provided by a
