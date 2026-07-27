@@ -50,6 +50,16 @@ impl Rng {
 
 const DOMAIN: &[u8] = b"flock-mixed-e2e-v0";
 
+/// Serialize the TIMING tests against each other: `--ignored` runs the heavy
+/// provers concurrently on the shared rayon pool, which inflates every
+/// wall-clock reading (a single-shot arm measured 3x its quiet value) and
+/// occasionally trips the loose timing gates. Correctness tests stay
+/// parallel; only tests that assert or print wall times take this lock.
+fn timing_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn random_blake3_inputs(rng: &mut Rng, n: usize) -> Vec<blake3::Compression> {
     (0..n)
         .map(|_| {
@@ -573,6 +583,7 @@ fn blake3_single_type_roundtrip_under_mixed_binding() {
 #[test]
 #[ignore] // Heavy + informational — run explicitly with --ignored --nocapture
 fn mixed_throughput_smoke() {
+    let _quiet = timing_lock();
     use std::time::Instant;
 
     // ν = 10: 1024 invocations per type; mixed M = 26, singles at m = 24
@@ -689,6 +700,7 @@ fn mixed_throughput_smoke() {
 #[test]
 #[ignore] // Heavy + informational — run explicitly with --ignored --nocapture
 fn mixed_low_utilization_smoke() {
+    let _quiet = timing_lock();
     use std::time::Instant;
 
     let nu = 10usize;
@@ -705,9 +717,12 @@ fn mixed_low_utilization_smoke() {
         let pcs_params = union_pcs_params(&union);
         let sha2_inputs = random_sha2_inputs(&mut rng, n_sha2);
         let blake3_inputs = random_blake3_inputs(&mut rng, n_blake3);
-        // One untimed warm-up (hot scratch pool), then one timed run.
-        let mut prove_ms = 0.0;
-        for timed in [false, true] {
+        // One untimed warm-up (hot scratch pool), then timed runs — MIN of
+        // three: the ignored tests in this binary run concurrently (the
+        // capacity sweep is a heavy neighbor), so a single-shot wall time
+        // occasionally inflates past the loose gate below.
+        let mut prove_ms = f64::INFINITY;
+        for timed in [false, true, true, true] {
             let slots = vec![
                 UnionSlotProverInput::new(
                     sha2::generate_witness_batch_major_partial(&sha2_inputs, nu),
@@ -723,7 +738,7 @@ fn mixed_low_utilization_smoke() {
             let (proof, commitment, claim) =
                 prover::prove_fast_ligerito_jagged_union(&union, &pcs_params, slots, &mut ch);
             if timed {
-                prove_ms = t.elapsed().as_secs_f64() * 1e3;
+                prove_ms = prove_ms.min(t.elapsed().as_secs_f64() * 1e3);
                 // Roundtrip while we're here.
                 let circuits: [&dyn LincheckCircuit; 2] = [s2_circuit, b3_circuit];
                 let mut ch_v = FsChallenger::new(DOMAIN);
@@ -783,20 +798,28 @@ fn mixed_low_utilization_smoke() {
 ///     sweep (asserted exactly, before any timing);
 ///   * zerocheck + lincheck prover work is declared-area-proportional —
 ///     capacity enters only as extra sumcheck rounds with O(T) scalar
-///     tails (asserted loosely). One measured qualification: the
-///     zerocheck's sparse tail engages only at `live·16 ≤ n`
-///     (zerocheck.rs), so utilizations in the (6.25%, 100%) band pay a
-///     capacity-proportional DENSE tail — measured as a one-time step
-///     between the 100% and 25% rows (then flat to 6.25%), bounded by the
-///     tail's share of the zerocheck;
+///     tails (asserted loosely). Qualification: the zerocheck's
+///     support-proportional kernels engage at `live·SPARSE_TAIL_GATE ≤ n`
+///     (zerocheck.rs; 4 as of the parallel sparse tail, so the 25% row
+///     runs sparse and matches the 100% baseline), so utilizations in the
+///     (1/SPARSE_TAIL_GATE, 100%) band still pay a capacity-proportional
+///     DENSE tail, bounded by the tail's share of the zerocheck;
 ///   * verify is flat: comb builds are registry-static and the round count
 ///     grows only by M − 26 (asserted loosely);
 ///   * the KNOWN capacity-proportional residue sits in the opening: the
 ///     γ-combined ring-switch weight `b_combined` lives on the padded
-///     packed domain (2^{M−7} words) and its b-side fold chain is
-///     irreducibly dense (doc §"The commitment layer"), and the witness
-///     buffers are capacity-sized (padded addressing, materialized). These
-///     are printed, not asserted — the point of the table is to see them.
+///     packed domain (2^{M−7} words) — its full-domain phi-pass is the
+///     protocol's floor (doc §"The commitment layer") — and the union
+///     witness buffers are capacity-sized (padded addressing,
+///     materialized). These are printed, not asserted — the point of the
+///     table is to see them.
+///
+/// Witness generation goes through [`UnionSlotProverInput::in_place`] —
+/// the PRODUCTION path (`MixedSetup::prove`), where drivers write straight
+/// into the padded union buffers; the prebuilt path would add per-slot
+/// capacity-sized staging buffers plus a scatter that production never
+/// pays. The `wit` column is the prover's `witness_s` (in-place generation
+/// + dense-stack compaction).
 ///
 /// Timing discipline (this box heats itself into misleading sweeps): one
 /// process, one untimed warm-up pass, then timed passes with the config
@@ -806,6 +829,7 @@ fn mixed_low_utilization_smoke() {
 #[test]
 #[ignore] // Heavy + informational — run explicitly with --ignored --nocapture
 fn capacity_sweep_fixed_workload() {
+    let _quiet = timing_lock();
     use std::time::Instant;
 
     const COUNTS: [usize; 2] = [1024, 1024]; // (sha2, blake3) — the fixed workload
@@ -837,17 +861,16 @@ fn capacity_sweep_fixed_workload() {
         }
     }
 
-    // Per-config minima: [gen, assemble, commit, zerocheck, lincheck, open,
-    // prove total, verify].
-    const GEN: usize = 0;
-    const ASM: usize = 1;
-    const COMMIT: usize = 2;
-    const ZC: usize = 3;
-    const LC: usize = 4;
-    const OPEN: usize = 5;
-    const PROVE: usize = 6;
-    const VERIFY: usize = 7;
-    let mut mins = [[f64::INFINITY; 8]; NUS.len()];
+    // Per-config minima: [witness (in-place gen + compaction), commit,
+    // zerocheck, lincheck, open, prove total, verify].
+    const WIT: usize = 0;
+    const COMMIT: usize = 1;
+    const ZC: usize = 2;
+    const LC: usize = 3;
+    const OPEN: usize = 4;
+    const PROVE: usize = 5;
+    const VERIFY: usize = 6;
+    let mut mins = [[f64::INFINITY; 7]; NUS.len()];
 
     const PASSES: usize = 4; // pass 0 is an untimed warm-up
     for pass in 0..PASSES {
@@ -864,18 +887,18 @@ fn capacity_sweep_fixed_workload() {
             let union = UnionInstance::new(registry, COUNTS.to_vec());
             let pcs_params = union_pcs_params(&union);
 
-            let t = Instant::now();
             let slots = vec![
-                UnionSlotProverInput::new(
-                    sha2::generate_witness_batch_major_partial(&sha2_inputs, nu),
+                UnionSlotProverInput::in_place(
+                    |dst| sha2::generate_witness_batch_major_partial_into(&sha2_inputs, nu, dst),
                     s2_circuit,
                 ),
-                UnionSlotProverInput::new(
-                    blake3::generate_witness_batch_major_partial(&blake3_inputs, nu),
+                UnionSlotProverInput::in_place(
+                    |dst| {
+                        blake3::generate_witness_batch_major_partial_into(&blake3_inputs, nu, dst)
+                    },
                     b3_circuit,
                 ),
             ];
-            let gen_ms = t.elapsed().as_secs_f64() * 1e3;
 
             let mut ch = FsChallenger::new(DOMAIN);
             let t = Instant::now();
@@ -901,8 +924,7 @@ fn capacity_sweep_fixed_workload() {
             if pass > 0 {
                 let row = &mut mins[i];
                 for (slot, val) in [
-                    (GEN, gen_ms),
-                    (ASM, pt.witness_s * 1e3),
+                    (WIT, pt.witness_s * 1e3),
                     (COMMIT, pt.commit_s * 1e3),
                     (ZC, pt.zerocheck_s * 1e3),
                     (LC, pt.lincheck_s * 1e3),
@@ -923,18 +945,17 @@ fn capacity_sweep_fixed_workload() {
         PASSES - 1
     );
     println!(
-        "  {:>3} {:>3} {:>6} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
-        "nu", "M", "util%", "gen", "asm", "commit", "zc", "lc", "open", "prove", "verify"
+        "  {:>3} {:>3} {:>6} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
+        "nu", "M", "util%", "wit", "commit", "zc", "lc", "open", "prove", "verify"
     );
     for (i, &nu) in NUS.iter().enumerate() {
         let m = &mins[i];
         println!(
-            "  {:>3} {:>3} {:>6.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2}",
+            "  {:>3} {:>3} {:>6.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2}",
             nu,
             cfgs[i].0.m_total(),
             100.0 * COUNTS[0] as f64 / (1u64 << nu) as f64,
-            m[GEN],
-            m[ASM],
+            m[WIT],
             m[COMMIT],
             m[ZC],
             m[LC],
@@ -953,13 +974,12 @@ fn capacity_sweep_fixed_workload() {
     let (lo, hi) = (&mins[0], &mins[NUS.len() - 1]);
     let piop_lo = lo[ZC] + lo[LC];
     let piop_hi = hi[ZC] + hi[LC];
-    // 2.0x, not 1.5x: the mid-band dense zerocheck tail (doc comment above)
-    // legitimately adds a capacity-proportional step between the 100% and
-    // 25% rows; measured ~1.6x total at 16x capacity. The bound guards
-    // against the tail going capacity-proportional at LOW utilization too
-    // (i.e. the sparse-tail gate regressing).
+    // Post gate-retune + parallel sparse tail, the measured ratio at 16x
+    // capacity is ~1.3x (round-count growth + capacity-sized buffer
+    // bookkeeping); 1.6x guards against the sparse paths or their gate
+    // regressing without tripping on wall-clock noise.
     assert!(
-        piop_hi < 2.0 * piop_lo + 0.5,
+        piop_hi < 1.6 * piop_lo + 0.5,
         "zerocheck + lincheck must stay near declared-work-proportional: \
          {piop_lo:.2} ms at full utilization vs {piop_hi:.2} ms at 16x capacity"
     );
@@ -1080,6 +1100,7 @@ fn in_place_generation_matches_prebuilt_byte_identical() {
 #[test]
 #[ignore] // Heavy (M = 30, ~2 GB) + informational — run explicitly with --ignored --nocapture
 fn mixed_m30_throughput() {
+    let _quiet = timing_lock();
     use std::time::Instant;
 
     const ITERS: usize = 2; // timed runs after one warm-up; best reported
@@ -1305,6 +1326,7 @@ fn mixed_m30_throughput() {
 #[test]
 #[ignore] // Heavy (m = 30, ~2 GB) + informational — run explicitly with --ignored --nocapture
 fn two_blake3_tables_vs_direct() {
+    let _quiet = timing_lock();
     use std::time::Instant;
 
     const ITERS: usize = 2; // timed runs after one warm-up; best reported
@@ -1675,6 +1697,7 @@ fn two_blake3_tables_vs_direct() {
 #[test]
 #[ignore] // Heavy (m = 30, ~2 GB) + informational — run explicitly with --ignored --nocapture
 fn two_blake3_phase_breakdown() {
+    let _quiet = timing_lock();
     use flock_prover::prover::ProvePhaseTimings;
     use flock_prover::verifier::VerifyPhaseTimings;
     use std::time::Instant;
