@@ -1059,11 +1059,22 @@ preference:
         ($\approx 256$ multiplies for the $\alpha$ slot; the
         $\beta$-side maps are $\F_2$-matrices, applicable by byte
         tables as in ring-switching's own fold) --- order $10^7$
-        multiplies $\approx$ a few ms, once per proof,
-        count- \emph{and} capacity-independent. Verification goes
-        $\approx 11 \to 13$--$16$\,ms; comb delegation
-        (\S\ref{sec:open}), already the queued answer if verify time
-        matters, would more than offset it.
+        multiplies $\approx$ a few ms, once per proof, count- and
+        capacity-independent but \textbf{linear in the registry's
+        column count with a heavy constant} ($\approx 25$K multiplies
+        per column, vs.\ $\approx 50$ on the assist path): viable at
+        today's $\approx 370$ columns, marginal at $\approx 1000$, not
+        viable at a many-type registry. This is the comb's scaling
+        family (\S\ref{sec:open}) with a $\approx 500\times$ constant
+        --- and, unlike the comb, with \emph{no preprocessing escape}:
+        the base-block MLEs are registry-static and committable once,
+        but \code{col\_prefix\_sums} is per-proof (count-derived under
+        height-$n_t$ stacking), so nothing about the twisted weight can
+        be committed at registry time. At registry scale, option 2
+        stops being optional. Verification goes
+        $\approx 11 \to 13$--$16$\,ms at today's registry; comb
+        delegation, already the queued answer if verify time matters,
+        would more than offset it.
   \item \textbf{A structured assist.} Exploit the Kronecker form of the
         transitions plus $\alpha$-slot binding to keep a sumcheck over
         some of the variables and handle the $\beta$-slot ones another
