@@ -117,9 +117,20 @@ Then $\sum_{e} f(e)\, b(e) = \sum_{d} q[d]\, W[d]$.
 \end{lemma}
 
 \begin{proof}
-Termwise: off-stack words vanish with $f$; dense indices correspond
-bijectively to in-stack words, where the claim's weight factors into
-the row and column eq factors as in \S\ref{sec:setting}.
+The map $d \mapsto e(d) := \rowof(d) + 2^n \colof(d)$ is a bijection
+from $\{0,1\}^m$ onto the in-stack addresses, with $f(e(d)) = q[d]$ and
+$f = 0$ at every other address. Hence
+\[
+  \sum_{e} f(e)\, b(e)
+  \;=\; \sum_{d} q[d]\; b\bigl(e(d)\bigr)
+  \;=\; \sum_{d} q[d]\;
+        \Phi\bigl(\eq(z_{\mathrm r}, \rowof(d))\,
+                  \eq(z_{\mathrm c}, \colof(d))\bigr)
+  \;=\; \sum_{d} q[d]\, W[d],
+\]
+the middle step by the factorization
+$\eq(z, e(d)) = \eq(z_{\mathrm r}, \rowof(d))\,
+\eq(z_{\mathrm c}, \colof(d))$ of \S\ref{sec:setting}.
 \end{proof}
 
 The \emph{merged sumcheck} is the product sumcheck for
