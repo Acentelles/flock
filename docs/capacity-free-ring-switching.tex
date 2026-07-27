@@ -71,7 +71,14 @@ frees the exposition of tail cases). The commitment binds the dense
 stack $q \in \F^{2^m}$; $\colof(d)$ is the unique $y$ with
 $T_y \le d < T_{y+1}$ and $\rowof(d) = d - T_{\colof(d)}$. The witness of \eqref{eq:rs} is
 the embedding of $q$ into the virtual word domain
-($\ell = n + k$, $e = \rowof + 2^n\colof$), zero elsewhere. The jagged
+($\ell = n + k$, $e = \rowof + 2^n\colof$), zero elsewhere.
+Accordingly we write the claim's point as
+$z = (z_{\mathrm r}, z_{\mathrm c})$ with $z_{\mathrm r} \in \F^{n}$
+and $z_{\mathrm c} \in \F^{k}$; since $\eq$ factors over any
+coordinate partition,
+$\eq(z, e) = \eq(z_{\mathrm r}, \rowof(d))\,
+\eq(z_{\mathrm c}, \colof(d))$ at the in-stack address $e$ of dense
+index $d$. The jagged
 multilinear
 \[
   \fjag(z_{\mathrm r}, z_{\mathrm c}, \rho)
@@ -99,13 +106,8 @@ that cost.
 \section{The merged reduction}\label{sec:merged}
 
 \begin{lemma}[restriction]\label{lem:restriction}
-Let $f$ be the embedding of $q$ and split the claim's word-level point
-$z \in \F^{\ell}$ at the row/column boundary of the virtual addressing:
-$z_{\mathrm r} = z[0{:}n]$ pairs with the row bits and
-$z_{\mathrm c} = z[n{:}n{+}k]$ with the column bits, so that
-$\eq(z, e) = \eq(z_{\mathrm r}, \rowof(d))\,\eq(z_{\mathrm c},
-\colof(d))$ at the in-stack address $e$ of dense index $d$ ($\eq$
-factors over any coordinate partition). Define
+Let $f$ be the embedding of $q$, with $z_{\mathrm r} \in \F^{n}$ and
+$z_{\mathrm c} \in \F^{k}$ the claim's row and column points. Define
 $W : \{0,1\}^m \to \F$ by
 \[
   W[d] = \Phi\bigl(\eq(z_{\mathrm r}, \rowof(d))\cdot
@@ -115,10 +117,9 @@ Then $\sum_{e} f(e)\, b(e) = \sum_{d} q[d]\, W[d]$.
 \end{lemma}
 
 \begin{proof}
-Termwise: off-stack words vanish with $f$, and dense indices correspond
-bijectively to in-stack words, where
-$\eq(z, e) = \eq(z_{\mathrm r}, \rowof(d))\,\eq(z_{\mathrm c},
-\colof(d))$.
+Termwise: off-stack words vanish with $f$; dense indices correspond
+bijectively to in-stack words, where the claim's weight factors into
+the row and column eq factors as in \S\ref{sec:setting}.
 \end{proof}
 
 The \emph{merged sumcheck} is the product sumcheck for
