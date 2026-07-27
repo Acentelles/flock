@@ -20,6 +20,7 @@
 //! byte-identity differentials against the direct jagged path live in
 //! `tests/union_roundtrip.rs` on the harness binding.
 
+use flock_core::field::F128;
 use flock_core::lincheck::LincheckCircuit;
 use flock_core::pcs::ligerito::LigeritoProfile;
 use flock_core::pcs::{PcsParams, VerifyErrorJagged};
@@ -1012,6 +1013,198 @@ fn run_capacity_sweep(counts: [usize; 2], nus: &[usize]) {
         "verify must be flat across capacity: {:.2} ms vs {:.2} ms",
         lo[VERIFY],
         hi[VERIFY]
+    );
+}
+
+/// The MERGED jagged/ring-switch transport (design doc §"Capacity-free
+/// ring-switching") proves and verifies end to end on real mixed
+/// instances — full utilization and non-power-of-two partial counts — and
+/// rejects tampering with the transport's new pieces (the merged sumcheck
+/// rounds, the claimed q̂(ρ), the Frobenius assist's V) as well as the
+/// PIOP. Prototype path: pow2-lane commitments, side by side with the
+/// jagged transport (which stays the shipped default).
+#[test]
+#[ignore] // Heavier — run with `cargo test -p flock-prover --test union_mixed -- --ignored`
+fn merged_transport_roundtrip_and_tamper() {
+    let nu = 6usize;
+    let (registry, sha2_r1cs, blake3_r1cs) = mixed_registry(nu);
+    let s2_circuit = sha2_r1cs.csc_lincheck_circuit();
+    let b3_circuit = blake3_r1cs.csc_lincheck_circuit();
+    let circuits: [&dyn LincheckCircuit; 2] = [s2_circuit, b3_circuit];
+    let mut rng = Rng::new(0x_4E_26_ED_11);
+
+    for counts in [[64usize, 64], [50, 37]] {
+        let union = UnionInstance::new(&registry, counts.to_vec());
+        let mut pcs_params = union_pcs_params(&union);
+        pcs_params.num_lanes = None; // merged prototype: pow2 lanes only
+        let sha2_inputs = random_sha2_inputs(&mut rng, counts[0]);
+        let blake3_inputs = random_blake3_inputs(&mut rng, counts[1]);
+        let slots = vec![
+            UnionSlotProverInput::new(
+                sha2::generate_witness_batch_major_partial(&sha2_inputs, nu),
+                s2_circuit,
+            ),
+            UnionSlotProverInput::new(
+                blake3::generate_witness_batch_major_partial(&blake3_inputs, nu),
+                b3_circuit,
+            ),
+        ];
+        let mut ch = FsChallenger::new(DOMAIN);
+        let (proof, commitment, claim) =
+            prover::prove_fast_ligerito_jagged_union_merged(&union, &pcs_params, slots, &mut ch);
+        let mut ch_v = FsChallenger::new(DOMAIN);
+        let claim_v = verifier::verify_ligerito_jagged_union_merged(
+            &union,
+            &circuits,
+            &commitment,
+            &proof,
+            &pcs_params,
+            &mut ch_v,
+        )
+        .unwrap_or_else(|e| panic!("merged transport rejected honest proof {counts:?}: {e:?}"));
+        assert_eq!(claim_v, claim);
+
+        // Tamper matrix over the transport's new pieces + one PIOP field.
+        let reject = |p: &flock_core::proof::R1csProofMergedLigerito, what: &str| {
+            let mut ch_v = FsChallenger::new(DOMAIN);
+            assert!(
+                verifier::verify_ligerito_jagged_union_merged(
+                    &union,
+                    &circuits,
+                    &commitment,
+                    p,
+                    &pcs_params,
+                    &mut ch_v,
+                )
+                .is_err(),
+                "tampered proof ({what}) must be rejected at counts {counts:?}"
+            );
+        };
+        let mut bad = proof.clone();
+        bad.pcs_open.q_eval += F128::ONE;
+        reject(&bad, "q_eval");
+        let mut bad = proof.clone();
+        bad.pcs_open.merged_rounds[3].0 += F128::ONE;
+        reject(&bad, "merged sumcheck round");
+        let mut bad = proof.clone();
+        bad.pcs_open.frobenius.v += F128::ONE;
+        reject(&bad, "frobenius V");
+        let mut bad = proof.clone();
+        bad.pcs_open.frobenius.rounds[5].1 += F128::ONE;
+        reject(&bad, "frobenius round");
+        let mut bad = proof.clone();
+        bad.zerocheck.round1_ab[0] += F128::ONE;
+        reject(&bad, "zerocheck round 1");
+    }
+}
+
+/// Merged-vs-jagged transport A/B at the real m30 load, across capacity
+/// tiers — the merged reduction's design claim is CAPACITY-FREE transport
+/// (the Φ-pass runs on the dense domain), so its prove time should be
+/// near-flat from ν = 14 to ν = 16 where the jagged path's open grows
+/// with 2^(M−7). Informational (printed, one loose assertion); arms
+/// alternated in-process per this box's timing rules. NOTE the arms are
+/// not byte-comparable: jagged runs the SHIPPED config (integer lanes),
+/// merged the prototype (pow2 lanes).
+#[test]
+#[ignore] // Heavy + informational — run explicitly with --ignored --nocapture
+fn merged_transport_m30_probe() {
+    let _quiet = timing_lock();
+    use std::time::Instant;
+    const COUNTS: [usize; 2] = [16384, 16384];
+    const NUS: [usize; 2] = [14, 16];
+
+    let cfgs: Vec<_> = NUS.iter().map(|&nu| mixed_registry(nu)).collect();
+    flock_core::scratch::prewarm_prover(cfgs.last().unwrap().0.m_total());
+    let mut rng = Rng::new(0x_4E_26_ED_30);
+    let sha2_inputs = random_sha2_inputs(&mut rng, COUNTS[0]);
+    let blake3_inputs = random_blake3_inputs(&mut rng, COUNTS[1]);
+
+    let mut mins = [[f64::INFINITY; 2]; NUS.len()]; // [jagged, merged]
+    for pass in 0..3 {
+        for (i, &nu) in NUS.iter().enumerate() {
+            let (registry, sha2_r1cs, blake3_r1cs) = &cfgs[i];
+            let s2_circuit = sha2_r1cs.csc_lincheck_circuit();
+            let b3_circuit = blake3_r1cs.csc_lincheck_circuit();
+            let circuits: [&dyn LincheckCircuit; 2] = [s2_circuit, b3_circuit];
+            let union = UnionInstance::new(registry, COUNTS.to_vec());
+            for arm in 0..2 {
+                let slots = vec![
+                    UnionSlotProverInput::in_place(
+                        |dst| {
+                            sha2::generate_witness_batch_major_partial_into(&sha2_inputs, nu, dst)
+                        },
+                        s2_circuit,
+                    ),
+                    UnionSlotProverInput::in_place(
+                        |dst| {
+                            blake3::generate_witness_batch_major_partial_into(
+                                &blake3_inputs,
+                                nu,
+                                dst,
+                            )
+                        },
+                        b3_circuit,
+                    ),
+                ];
+                let mut ch = FsChallenger::new(DOMAIN);
+                let t = Instant::now();
+                if arm == 0 {
+                    let pcs_params = union_pcs_params(&union);
+                    let (_p, _c, _cl) = prover::prove_fast_ligerito_jagged_union(
+                        &union,
+                        &pcs_params,
+                        slots,
+                        &mut ch,
+                    );
+                } else {
+                    let mut pcs_params = union_pcs_params(&union);
+                    pcs_params.num_lanes = None;
+                    let (proof, commitment, claim) =
+                        prover::prove_fast_ligerito_jagged_union_merged(
+                            &union,
+                            &pcs_params,
+                            slots,
+                            &mut ch,
+                        );
+                    if pass == 0 {
+                        let mut ch_v = FsChallenger::new(DOMAIN);
+                        let claim_v = verifier::verify_ligerito_jagged_union_merged(
+                            &union,
+                            &circuits,
+                            &commitment,
+                            &proof,
+                            &pcs_params,
+                            &mut ch_v,
+                        )
+                        .expect("merged m30 proof verifies");
+                        assert_eq!(claim_v, claim);
+                    }
+                }
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                if pass > 0 {
+                    mins[i][arm] = mins[i][arm].min(ms);
+                }
+            }
+        }
+    }
+    println!("merged-vs-jagged m30 probe, counts {COUNTS:?} (min of 2, ms, prove incl. witgen):");
+    for (i, &nu) in NUS.iter().enumerate() {
+        println!(
+            "  nu = {nu} (M = {}): jagged {:.1}  merged {:.1}",
+            cfgs[i].0.m_total(),
+            mins[i][0],
+            mins[i][1]
+        );
+    }
+    // The design claim, loosely: the merged transport's capacity growth from
+    // 1x to 4x over-capacity must be well under the jagged path's.
+    let jagged_growth = mins[1][0] - mins[0][0];
+    let merged_growth = mins[1][1] - mins[0][1];
+    assert!(
+        merged_growth < 0.6 * jagged_growth + 5.0,
+        "merged transport must be near-capacity-free: jagged grows \
+         {jagged_growth:.1} ms from nu=14 to nu=16, merged grows {merged_growth:.1} ms"
     );
 }
 

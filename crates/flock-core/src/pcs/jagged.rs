@@ -1186,6 +1186,332 @@ pub fn verify_assist<C: Challenger>(
     (claim == w * g).then_some(proof.beta)
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// The batched Frobenius assist (design doc §"The batched Frobenius assist,
+// in detail"): proves the Φ-twisted jagged weight evaluation
+//   V = Ŵ(ρ) = Σ_i Σ_j c_{i,j} · f̂_t(z_row_i^(2^j), z_col_i^(2^j), ρ)
+// — an F-combination of ordinary assist statements at Frobenius-powered
+// points (Frobenius commutes with the eq-product structure at Boolean
+// selectors; c_{i,j} = the linearized-polynomial coefficients of the
+// claims' γ-baked fold maps, `ring_switch::linearized_coefficients`) — by
+// ONE sumcheck over the 2(m+1) boundary-bit variables with DETERMINISTIC
+// weights (the c_{i,j} are transcript-determined; only the combined scalar
+// is used, so plain sumcheck soundness on the combined summand suffices).
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Materialize the merged reduction's twisted weight over the dense cube:
+/// `W[d] = Σ_i fold_one_slot(eq_row_i[row(d)]·eq_col_i[col(d)], table_i)`
+/// for `d < area`, ZERO on the power-of-two tail — the definitional
+/// zero-extension (`q`'s committed tail is zero, and the Frobenius
+/// assist's branching program computes exactly this extension via its
+/// comparison state, so prover table and verifier evaluation agree by
+/// construction). `claims` = `(z_row, z_col, γ-baked fold table)` views.
+pub(crate) fn build_merged_weight(
+    params: &JaggedParams,
+    claims: &[(&[F128], &[F128], &[F128])],
+) -> Vec<F128> {
+    use rayon::prelude::*;
+    let area = params.area() as usize;
+    let n_total = 1usize << params.m;
+    let tabs: Vec<(Vec<F128>, Vec<F128>, &[F128])> = claims
+        .iter()
+        .map(|&(zr, zc, t)| (build_eq_table(zr), build_eq_table(zc), t))
+        .collect();
+    let mut w = crate::scratch::take_f128(n_total);
+    const CHUNK: usize = 1 << 14;
+    w.par_chunks_mut(CHUNK).enumerate().for_each(|(ci, out)| {
+        let base = ci * CHUNK;
+        for (o, slot) in out.iter_mut().enumerate() {
+            let e = base + o;
+            *slot = if e < area {
+                let (row, col) = params.unrank(e as u64);
+                let mut acc = F128::ZERO;
+                for (eq_r, eq_c, t) in &tabs {
+                    acc += crate::pcs::ring_switch::fold_one_slot(eq_r[row] * eq_c[col], t);
+                }
+                acc
+            } else {
+                F128::ZERO
+            };
+        }
+    });
+    w
+}
+
+/// One ring-switch claim's inputs to the Frobenius assist: the word-level
+/// row/column point split and the 128 linearized coefficients (γ-baked) of
+/// its fold map.
+pub struct FrobeniusClaim<'a> {
+    pub z_row: &'a [F128],
+    pub z_col: &'a [F128],
+    pub coeffs: &'a [F128],
+}
+
+/// Transcript of the batched Frobenius assist. `v` is the claimed twisted
+/// evaluation (observed before the rounds); each of the `2(m+1)` rounds
+/// sends the degree-2 message `(G(1), G(∞))`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrobeniusAssistProof {
+    pub v: F128,
+    pub rounds: Vec<(F128, F128)>,
+}
+
+/// Per-statement prover state: one (claim, Frobenius power) pair, with the
+/// coefficient pre-scaled into the column weights.
+struct FrobeniusStatement {
+    cols: Vec<(F128, u64, u64)>,
+    eq4s: Vec<[F128; 4]>,
+    sfx: Vec<[F128; 4]>,
+    we: Vec<F128>,
+    prefix_row: [F128; 4],
+}
+
+/// Build the `128·K` statements: for claim `i` and Frobenius power `j`, the
+/// assist objects at coordinate-wise `2^j`-powered `(z_row, z_col)` with
+/// column weights scaled by `c_{i,j}`. Statements with `c_{i,j} = 0` are
+/// skipped (their contribution is identically zero).
+fn frobenius_statements(
+    params: &JaggedParams,
+    claims: &[FrobeniusClaim<'_>],
+    rho: &[F128],
+    with_sfx: bool,
+) -> Vec<FrobeniusStatement> {
+    use rayon::prelude::*;
+    let m = params.m;
+    let sparse = assist_sparse_transitions();
+    let mut specs: Vec<(Vec<F128>, Vec<F128>, F128)> = Vec::new();
+    for claim in claims {
+        assert_eq!(claim.coeffs.len(), 128);
+        let mut zr = claim.z_row.to_vec();
+        let mut zc = claim.z_col.to_vec();
+        for &c in claim.coeffs.iter() {
+            if !c.is_zero() {
+                specs.push((zr.clone(), zc.clone(), c));
+            }
+            for x in zr.iter_mut() {
+                *x = *x * *x;
+            }
+            for x in zc.iter_mut() {
+                *x = *x * *x;
+            }
+        }
+    }
+    specs
+        .into_par_iter()
+        .map(|(zr, zc, c)| {
+            let mut cols = assist_columns(params, &zc);
+            for (w, _, _) in cols.iter_mut() {
+                *w *= c;
+            }
+            let eq4s: Vec<[F128; 4]> = (0..=m)
+                .map(|layer| {
+                    let t = build_eq_table(&[point_bit(&zr, layer), point_bit(rho, layer)]);
+                    [t[0], t[1], t[2], t[3]]
+                })
+                .collect();
+            let sfx = if with_sfx {
+                assist_suffix_rows(&cols, &eq4s, &sparse, m)
+            } else {
+                Vec::new()
+            };
+            let we: Vec<F128> = cols.iter().map(|&(w, _, _)| w).collect();
+            let mut prefix_row = [F128::ZERO; 4];
+            prefix_row[STATE_INITIAL] = F128::ONE;
+            FrobeniusStatement {
+                cols,
+                eq4s,
+                sfx,
+                we,
+                prefix_row,
+            }
+        })
+        .collect()
+}
+
+/// Prover for the batched Frobenius assist. Same per-statement algebra as
+/// [`prove_assist`] (Lemma 4.6 streaming), with the round messages summed
+/// across statements — the sumcheck runs on the combined summand
+/// `H(u,v) = Σ_stmt U_stmt(u,v)·ĝ_stmt(u,v)` (coefficients pre-scaled into
+/// the `U` weights).
+pub fn prove_frobenius_assist<C: Challenger>(
+    params: &JaggedParams,
+    claims: &[FrobeniusClaim<'_>],
+    rho: &[F128],
+    challenger: &mut C,
+) -> FrobeniusAssistProof {
+    use rayon::prelude::*;
+    let m = params.m;
+    assert_eq!(rho.len(), m);
+    let sparse = assist_sparse_transitions();
+    let mut sts = frobenius_statements(params, claims, rho, true);
+
+    let v = sts
+        .par_iter()
+        .map(|st| {
+            st.cols
+                .iter()
+                .zip(&st.sfx[..st.cols.len()])
+                .map(|(&(w, _, _), s)| w * s[STATE_INITIAL])
+                .fold(F128::ZERO, |a, x| a + x)
+        })
+        .reduce(|| F128::ZERO, |a, b| a + b);
+
+    challenger.observe_label(b"flock-frobenius-assist-v0");
+    challenger.observe_f128(v);
+
+    let mut prev_ch: Option<(F128, F128)> = None;
+    let mut rounds = Vec::with_capacity(2 * (m + 1));
+    for layer in 0..=m {
+        // Per-statement column pass: fold the previous layer's challenges
+        // into the running weights and bucket against the suffix row; then
+        // the statement's u-vectors from its prefix row. Messages sum.
+        let per: Vec<([[F128; 4]; 4], [[F128; 4]; 4])> = sts
+            .par_iter_mut()
+            .map(|st| {
+                let n_cols = st.cols.len();
+                let row = &st.sfx[(layer + 1) * n_cols..(layer + 2) * n_cols];
+                let mut buckets = [[F128::ZERO; 4]; 4];
+                for ((w_e, &(_, t_c, t_next)), s) in st.we.iter_mut().zip(&st.cols).zip(row) {
+                    if let Some((rc, rd)) = prev_ch {
+                        let pl = layer - 1;
+                        let ec = if (t_c >> pl) & 1 == 1 {
+                            rc
+                        } else {
+                            F128::ONE + rc
+                        };
+                        let ed = if (t_next >> pl) & 1 == 1 {
+                            rd
+                        } else {
+                            F128::ONE + rd
+                        };
+                        *w_e *= ec * ed;
+                    }
+                    let cd = ((t_c >> layer) & 1) as usize + 2 * ((t_next >> layer) & 1) as usize;
+                    let v = *w_e;
+                    let bk = &mut buckets[cd];
+                    bk[0] += v * s[0];
+                    bk[1] += v * s[1];
+                    bk[2] += v * s[2];
+                    bk[3] += v * s[3];
+                }
+                let eq4 = &st.eq4s[layer];
+                let mut u = [[F128::ZERO; 4]; 4];
+                for (cd, uv) in u.iter_mut().enumerate() {
+                    for (s, &bs) in st.prefix_row.iter().enumerate() {
+                        let (i0, o0) = sparse[cd][s][0];
+                        let (i1, o1) = sparse[cd][s][1];
+                        uv[o0] += bs * eq4[i0];
+                        uv[o1] += bs * eq4[i1];
+                    }
+                }
+                (u, buckets)
+            })
+            .collect();
+
+        // c-round message, summed across statements.
+        let mut g_one = F128::ZERO;
+        let mut g_inf = F128::ZERO;
+        for (u, buckets) in &per {
+            g_one += dot4(&u[1], &buckets[1]) + dot4(&u[3], &buckets[3]);
+            g_inf += dot4(&add4(&u[0], &u[1]), &add4(&buckets[0], &buckets[1]))
+                + dot4(&add4(&u[2], &u[3]), &add4(&buckets[2], &buckets[3]));
+        }
+        challenger.observe_f128(g_one);
+        challenger.observe_f128(g_inf);
+        let rc = challenger.sample_f128();
+        rounds.push((g_one, g_inf));
+
+        // d-round from the same buckets, folded at rc.
+        let rc1 = F128::ONE + rc;
+        let mut g_one = F128::ZERO;
+        let mut g_inf = F128::ZERO;
+        let mut folded: Vec<([F128; 4], [F128; 4])> = Vec::with_capacity(per.len());
+        for (u, buckets) in &per {
+            let ud0 = comb4(rc1, &u[0], rc, &u[1]);
+            let ud1 = comb4(rc1, &u[2], rc, &u[3]);
+            let d0 = comb4(rc1, &buckets[0], rc, &buckets[1]);
+            let d1 = comb4(rc1, &buckets[2], rc, &buckets[3]);
+            g_one += dot4(&ud1, &d1);
+            g_inf += dot4(&add4(&ud0, &ud1), &add4(&d0, &d1));
+            folded.push((ud0, ud1));
+        }
+        challenger.observe_f128(g_one);
+        challenger.observe_f128(g_inf);
+        let rd = challenger.sample_f128();
+        rounds.push((g_one, g_inf));
+
+        for (st, (ud0, ud1)) in sts.iter_mut().zip(&folded) {
+            st.prefix_row = comb4(F128::ONE + rd, ud0, rd, ud1);
+        }
+        prev_ch = Some((rc, rd));
+    }
+
+    FrobeniusAssistProof { v, rounds }
+}
+
+/// Verifier for the batched Frobenius assist: replays the rounds against
+/// `proof.v` and checks the final relation
+/// `claim == Σ_stmt U_stmt(σ)·ĝ_stmt(σ)`. On success returns the verified
+/// twisted evaluation `V = Ŵ(ρ)`.
+pub fn verify_frobenius_assist<C: Challenger>(
+    params: &JaggedParams,
+    claims: &[FrobeniusClaim<'_>],
+    rho: &[F128],
+    proof: &FrobeniusAssistProof,
+    challenger: &mut C,
+) -> Option<F128> {
+    use rayon::prelude::*;
+    let m = params.m;
+    if proof.rounds.len() != 2 * (m + 1) {
+        return None;
+    }
+    challenger.observe_label(b"flock-frobenius-assist-v0");
+    challenger.observe_f128(proof.v);
+
+    let mut claim = proof.v;
+    let mut sigma = Vec::with_capacity(2 * (m + 1));
+    for &(g_one, g_inf) in &proof.rounds {
+        challenger.observe_f128(g_one);
+        challenger.observe_f128(g_inf);
+        let r = challenger.sample_f128();
+        claim = fold_round_claim(claim, g_one, g_inf, r);
+        sigma.push(r);
+    }
+
+    let sts = frobenius_statements(params, claims, rho, false);
+    let expect = sts
+        .par_iter()
+        .map(|st| {
+            let w = assist_w_at(&st.cols, &sigma, m);
+            let mut g = [F128::ZERO; 4];
+            g[STATE_SUCCESS] = F128::ONE;
+            let sparse = assist_sparse_transitions();
+            for layer in (0..=m).rev() {
+                let eq4 = &st.eq4s[layer];
+                let rc = sigma[2 * layer];
+                let rd = sigma[2 * layer + 1];
+                let e = [
+                    (F128::ONE + rc) * (F128::ONE + rd),
+                    rc * (F128::ONE + rd),
+                    (F128::ONE + rc) * rd,
+                    rc * rd,
+                ];
+                let mut prev = [F128::ZERO; 4];
+                for (cd, &ecd) in e.iter().enumerate() {
+                    for (s, slot) in prev.iter_mut().enumerate() {
+                        let (i0, o0) = sparse[cd][s][0];
+                        let (i1, o1) = sparse[cd][s][1];
+                        *slot += ecd * (eq4[i0] * g[o0] + eq4[i1] * g[o1]);
+                    }
+                }
+                g = prev;
+            }
+            w * g[STATE_INITIAL]
+        })
+        .reduce(|| F128::ZERO, |a, b| a + b);
+    (claim == expect).then_some(proof.v)
+}
+
 /// [`prove`] followed by the assist sub-protocol at the sumcheck's final point.
 /// Companion of [`verify_with_assist`].
 pub fn prove_with_assist<C: Challenger>(
@@ -1737,6 +2063,73 @@ mod tests {
             *qi = ch.sample_f128();
         }
         (params, q)
+    }
+
+    /// The batched Frobenius assist proves exactly the Φ-twisted weight
+    /// evaluation: the prover's `V` equals the brute-force
+    /// `Σ_e eq(ρ,e)·Σ_i Φ_i(eq_row·eq_col)`, the verifier accepts and
+    /// returns it, and tampering with a round message or the claimed `V`
+    /// is rejected. Real subset-sum fold tables; two claims; random
+    /// non-power-of-two heights.
+    #[test]
+    fn frobenius_assist_roundtrip_and_tamper() {
+        use crate::pcs::ring_switch;
+        let mut ch = RandomChallenger::new(0xF12B_A551);
+        for &(n, k, m) in &[(3usize, 2usize, 5usize), (4, 3, 7)] {
+            let (params, _q) = random_instance(&mut ch, n, k, m);
+            let claims_data: Vec<(Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>)> = (0..2)
+                .map(|_| {
+                    let zr = sample_vec(&mut ch, n);
+                    let zc = sample_vec(&mut ch, k);
+                    let eq_r: Vec<F128> = (0..128).map(|_| ch.sample_f128()).collect();
+                    let table = ring_switch::build_fold_byte_table(&eq_r);
+                    let coeffs = ring_switch::linearized_coefficients(&table);
+                    (zr, zc, table, coeffs)
+                })
+                .collect();
+            let rho = sample_vec(&mut ch, m);
+            let eq_idx = build_eq_table(&rho);
+            let mut v_expect = F128::ZERO;
+            for cd in &claims_data {
+                let eq_row = build_eq_table(&cd.0);
+                let eq_col = build_eq_table(&cd.1);
+                for e in 0..params.area() {
+                    let (row, col) = params.unrank(e);
+                    v_expect += eq_idx[e as usize]
+                        * ring_switch::fold_one_slot(eq_row[row] * eq_col[col], &cd.2);
+                }
+            }
+            let fclaims: Vec<FrobeniusClaim<'_>> = claims_data
+                .iter()
+                .map(|c| FrobeniusClaim {
+                    z_row: &c.0,
+                    z_col: &c.1,
+                    coeffs: &c.3,
+                })
+                .collect();
+            let mut chp = FsChallenger::new(b"frobenius-assist-test");
+            let proof = prove_frobenius_assist(&params, &fclaims, &rho, &mut chp);
+            assert_eq!(proof.v, v_expect, "V must equal the twisted evaluation");
+            let mut chv = FsChallenger::new(b"frobenius-assist-test");
+            assert_eq!(
+                verify_frobenius_assist(&params, &fclaims, &rho, &proof, &mut chv),
+                Some(v_expect)
+            );
+            let mut bad = proof.clone();
+            bad.rounds[1].0 += F128::ONE;
+            let mut chv = FsChallenger::new(b"frobenius-assist-test");
+            assert_eq!(
+                verify_frobenius_assist(&params, &fclaims, &rho, &bad, &mut chv),
+                None
+            );
+            let mut bad = proof.clone();
+            bad.v += F128::ONE;
+            let mut chv = FsChallenger::new(b"frobenius-assist-test");
+            assert_eq!(
+                verify_frobenius_assist(&params, &fclaims, &rho, &bad, &mut chv),
+                None
+            );
+        }
     }
 
     /// The Frobenius-twist identity behind the merged-reduction design

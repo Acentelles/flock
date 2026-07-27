@@ -362,6 +362,102 @@ pub fn verify_ligerito_jagged_union_harness<Ch: Challenger>(
 
 /// Shared body of the two union verify entries; `binding` selects the
 /// statement binding, everything else is identical.
+/// The MERGED-transport union verifier — PROTOTYPE, kept in lockstep with
+/// [`verify_union_with_binding`] (identical binding + PIOP replay; only the
+/// PCS verification differs: `pcs::verify_batch_merged`). Mixed binding
+/// only; pow2-lane commitments only.
+pub fn verify_ligerito_jagged_union_merged<Ch: Challenger>(
+    union: &crate::union::UnionInstance<'_>,
+    circuits: &[&dyn lincheck::LincheckCircuit],
+    commitment: &Commitment,
+    proof: &crate::proof::R1csProofMergedLigerito,
+    pcs_params: &crate::pcs::PcsParams,
+    challenger: &mut Ch,
+) -> Result<R1csClaim, VerifyError> {
+    assert_eq!(
+        pcs_params.m,
+        union.dense_m(),
+        "PcsParams.m must equal the union's dense_m (committed stack size)"
+    );
+    // Same params-equality rejection as the jagged path (the transcript
+    // binds only the root), plus the prototype's pow2-lane restriction.
+    if commitment.params.m != pcs_params.m
+        || commitment.params.log_batch_size != pcs_params.log_batch_size
+        || commitment.params.log_inv_rate != pcs_params.log_inv_rate
+        || commitment.params.num_lanes.is_some()
+        || pcs_params.num_lanes.is_some()
+    {
+        return Err(VerifyError::PcsJagged(
+            crate::pcs::VerifyErrorJagged::Ligerito,
+        ));
+    }
+    let (ab, c) = verifier_pool().install(|| -> Result<(ZClaim, ZClaim), VerifyError> {
+        union.bind_statement(challenger, commitment);
+        let zc_claim = zerocheck::verify(union.m_total(), &proof.zerocheck, challenger)
+            .map_err(VerifyError::Zerocheck)?;
+        let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
+        let lc_claim = lincheck::verify_union(
+            union,
+            circuits,
+            &x_ab,
+            zc_claim.a_eval,
+            zc_claim.b_eval,
+            &proof.lincheck,
+            challenger,
+        )
+        .map_err(VerifyError::Lincheck)?;
+        let ab = ZClaim {
+            point: union.ab_claim_point(
+                lc_claim.r_inner_skip,
+                &lc_claim.r_inner_rest,
+                &x_ab.x_outer,
+            ),
+            value: lc_claim.w,
+        };
+        let c = ZClaim {
+            point: union.c_claim_point(zc_claim.z, &zc_claim.r_rest),
+            value: zc_claim.c_eval,
+        };
+        Ok((ab, c))
+    })?;
+    let heights = union.jagged_heights();
+    let claims = [ab.clone(), c.clone()];
+    verifier_pool()
+        .install(|| {
+            let z_skips: Vec<F128> = claims.iter().map(|cl| cl.point.z_skip).collect();
+            let values: Vec<F128> = claims.iter().map(|cl| cl.value).collect();
+            let x_fulls: Vec<Vec<F128>> = claims
+                .iter()
+                .map(|cl| {
+                    let mut v = cl.point.x_inner_rest.clone();
+                    v.extend_from_slice(&cl.point.x_outer);
+                    v
+                })
+                .collect();
+            let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
+            let log_n = pcs_params.m - pcs::LOG_PACKING;
+            let lig_v_config = crate::pcs::ligerito::verifier_config_for(
+                log_n,
+                pcs_params.log_batch_size,
+                pcs_params.profile,
+            )
+            .expect("Ligerito default verifier config");
+            pcs::verify_batch_merged(
+                commitment,
+                &values,
+                &z_skips,
+                &x_refs,
+                &heights,
+                union.n_log(),
+                &proof.pcs_open,
+                &lig_v_config,
+                challenger,
+            )
+        })
+        .map_err(VerifyError::PcsJagged)?;
+    Ok(R1csClaim { ab, c })
+}
+
 fn verify_union_with_binding<Ch: Challenger>(
     union: &crate::union::UnionInstance<'_>,
     binding: UnionVerifyBinding<'_>,

@@ -33,6 +33,17 @@ pub struct R1csProofJaggedLigerito {
     pub pcs_open: pcs::BatchOpeningProofJaggedLigerito,
 }
 
+/// [`R1csProofJaggedLigerito`] with the MERGED jagged/ring-switch opening
+/// (design doc §"Capacity-free ring-switching") — the PIOP sub-proofs are
+/// identical; only the transport differs. Prototype, side by side with the
+/// jagged path; not in any wire format.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct R1csProofMergedLigerito {
+    pub zerocheck: zerocheck::ZerocheckProof,
+    pub lincheck: lincheck::LincheckProof,
+    pub pcs_open: pcs::MergedOpenProof,
+}
+
 /// A claim of the form `ẑ(point) = value` for the witness `z`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ZClaim {

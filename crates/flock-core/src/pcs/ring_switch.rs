@@ -1571,7 +1571,7 @@ const FOLD_TABLE_SIZE: usize = 256;
 /// Build the 16×256 byte-lookup table the fold indexes: `table[k·256 + v]` =
 /// `Σ_{bit b set in v} eq_r_dprime[k·8 + b]`. For the ring-switch fold,
 /// `eq_r_dprime` already has γ_k baked in, so the table carries γ too.
-fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
+pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
     assert_eq!(eq_r_dprime.len(), 1 << LOG_PACKING);
     let mut tables = vec![F128::ZERO; FOLD_N_BYTES * FOLD_TABLE_SIZE];
     for byte_idx in 0..FOLD_N_BYTES {
@@ -1667,6 +1667,90 @@ pub(crate) fn deferred_dense_value(
 // claimed at the sumcheck's `mlv_challenges`, precisely so c needs no
 // per-round folding in the zerocheck. Undoing that costs more than the scan
 // saves.
+
+/// The bit-basis element with bit `t` set.
+#[inline]
+fn bit_basis(t: usize) -> F128 {
+    if t < 64 {
+        F128::new(1u64 << t, 0)
+    } else {
+        F128::new(0, 1u64 << (t - 64))
+    }
+}
+
+/// Inverse of the Moore matrix `M[t][j] = e_t^(2^j)` of the bit basis —
+/// universal (proof- and registry-independent), computed once per process by
+/// Gauss–Jordan over `F` (~2·128³ multiplies). Row-major, `inv[j·128 + t]`.
+fn moore_inverse() -> &'static [F128] {
+    use std::sync::OnceLock;
+    static MINV: OnceLock<Vec<F128>> = OnceLock::new();
+    MINV.get_or_init(|| {
+        const N: usize = 128;
+        let mut m = vec![F128::ZERO; N * N];
+        for t in 0..N {
+            let mut x = bit_basis(t);
+            for j in 0..N {
+                m[t * N + j] = x;
+                x = x * x;
+            }
+        }
+        let mut inv = vec![F128::ZERO; N * N];
+        for i in 0..N {
+            inv[i * N + i] = F128::ONE;
+        }
+        for col in 0..N {
+            let piv = (col..N)
+                .find(|&r| !m[r * N + col].is_zero())
+                .expect("Moore matrix of a basis is invertible");
+            if piv != col {
+                for k in 0..N {
+                    m.swap(col * N + k, piv * N + k);
+                    inv.swap(col * N + k, piv * N + k);
+                }
+            }
+            let p = m[col * N + col].inv();
+            for k in 0..N {
+                m[col * N + k] *= p;
+                inv[col * N + k] *= p;
+            }
+            for r in 0..N {
+                if r != col && !m[r * N + col].is_zero() {
+                    let f = m[r * N + col];
+                    for k in 0..N {
+                        let (a, b) = (m[col * N + k], inv[col * N + k]);
+                        m[r * N + k] += f * a;
+                        inv[r * N + k] += f * b;
+                    }
+                }
+            }
+        }
+        inv
+    })
+}
+
+/// The 128 linearized-polynomial coefficients of the fold table's
+/// $\F_2$-linear map: `fold_one_slot(x, tables) = Σ_j coeffs[j]·x^(2^j)`
+/// for every `x`. (Over `F_{2^128}` every F₂-linear map has this form
+/// uniquely; the coefficients are recovered from the map's values on the
+/// bit basis via the precomputed inverse Moore matrix.) Used by the merged
+/// jagged/ring-switch reduction (design doc §"Capacity-free
+/// ring-switching") to express the Φ-twisted weight evaluation as a
+/// combination of ordinary assist statements at Frobenius-powered points.
+pub(crate) fn linearized_coefficients(tables: &[F128]) -> Vec<F128> {
+    let minv = moore_inverse();
+    let phi: Vec<F128> = (0..128)
+        .map(|t| fold_one_slot(bit_basis(t), tables))
+        .collect();
+    (0..128)
+        .map(|j| {
+            let mut acc = F128::ZERO;
+            for (t, &p) in phi.iter().enumerate() {
+                acc += minv[j * 128 + t] * p;
+            }
+            acc
+        })
+        .collect()
+}
 
 pub fn fold_b128_elems_split(eq_lo: &[F128], eq_hi: &[F128], eq_r_dprime: &[F128]) -> Vec<F128> {
     let tables = build_fold_byte_table(eq_r_dprime);
@@ -3186,6 +3270,29 @@ mod tests {
                     dense, padded,
                     "4-wide mismatch: m={m}, k_log={k_log}, useful={useful_bits}"
                 );
+            }
+        }
+    }
+
+    /// `linearized_coefficients` is exact: `Σ_j c_j·x^(2^j)` reproduces
+    /// `fold_one_slot(x, tables)` bit-for-bit on random inputs, for tables
+    /// with the real subset-sum structure.
+    #[test]
+    fn linearized_coefficients_reconstruct_fold() {
+        let mut ch = crate::challenger::RandomChallenger::new(0x11EA_A12E);
+        for _ in 0..3 {
+            let eq_r: Vec<F128> = (0..1 << LOG_PACKING).map(|_| ch.sample_f128()).collect();
+            let tables = build_fold_byte_table(&eq_r);
+            let c = linearized_coefficients(&tables);
+            for _ in 0..8 {
+                let x = ch.sample_f128();
+                let mut acc = F128::ZERO;
+                let mut xp = x;
+                for &cj in &c {
+                    acc += cj * xp;
+                    xp = xp * xp;
+                }
+                assert_eq!(acc, fold_one_slot(x, &tables));
             }
         }
     }

@@ -611,6 +611,154 @@ pub fn prove_fast_ligerito_jagged_union_harness<Ch: Challenger>(
 
 /// Shared body of the two union prove entries; `binding` selects the
 /// statement binding, everything else is identical.
+/// The MERGED-transport union prover (design doc §"Capacity-free
+/// ring-switching") — PROTOTYPE, side by side with the jagged path and
+/// kept in lockstep with [`prove_union_with_binding`]: identical witness
+/// assembly, commit (pow2 lanes only — the merged open does not yet
+/// support integer-lane commitments), Mixed binding, zerocheck, and
+/// lincheck; only the PCS open differs (`pcs::open_batch_merged`).
+pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
+    union: &flock_core::union::UnionInstance<'_>,
+    pcs_params: &PcsParams,
+    slots: Vec<UnionSlotProverInput<'_>>,
+    challenger: &mut Ch,
+) -> (
+    flock_core::proof::R1csProofMergedLigerito,
+    Commitment,
+    R1csClaim,
+) {
+    let m = union.m_total();
+    assert_eq!(
+        pcs_params.m,
+        union.dense_m(),
+        "PcsParams.m must equal the union's dense_m (committed stack size)"
+    );
+    assert!(
+        pcs_params.num_lanes.is_none(),
+        "merged prototype: pow2-lane commitments only"
+    );
+    assert_eq!(
+        slots.len(),
+        union.registry().num_types(),
+        "need one prover input per registry type"
+    );
+    let log_n = union.dense_m() - pcs::LOG_PACKING;
+    let lig_config =
+        pcs::ligerito::prover_config_for(log_n, pcs_params.log_batch_size, pcs_params.profile)
+            .expect("Ligerito default config; bump m for tiny instances");
+
+    let mut sources = Vec::with_capacity(slots.len());
+    let mut circuits = Vec::with_capacity(slots.len());
+    for slot in slots {
+        sources.push(slot.source);
+        circuits.push(slot.lincheck_circuit);
+    }
+    let (z_packed, a_packed_f128, b_packed_f128, stripes) = build_union_witness(union, sources);
+    let linchecks: Vec<(Vec<u8>, &dyn lincheck::LincheckCircuit)> =
+        stripes.into_iter().zip(circuits).collect();
+
+    // The dense stack, OWNED (the merged open consumes it for the inner
+    // eq-basis opening). Identity compaction copies — a prototype cost only
+    // (single-slot full-utilization registries).
+    let q: Vec<F128> = if union.compaction_is_identity() {
+        z_packed.clone()
+    } else {
+        union.compact_witness(&z_packed)
+    };
+    let (commitment, prover_data) = pcs::commit(&q, pcs_params);
+    union.bind_statement(challenger, &commitment);
+
+    let padding = union.padding_spec();
+    let (zc_proof, zc_claim, s_hat_v_c) = {
+        let a_packed: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                a_packed_f128.as_ptr() as *const u8,
+                a_packed_f128.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        let b_packed: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                b_packed_f128.as_ptr() as *const u8,
+                b_packed_f128.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        let c_packed: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                z_packed.as_ptr() as *const u8,
+                z_packed.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        zerocheck::prove_packed_padded_capture_s_hat_v_c(
+            a_packed, b_packed, c_packed, m, &padding, challenger,
+        )
+    };
+    flock_core::scratch::give_f128(a_packed_f128);
+    flock_core::scratch::give_f128(b_packed_f128);
+
+    let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
+    let (lc_proof, lc_claim, z_vec_pre) = {
+        let lc_slots: Vec<lincheck::UnionLincheckSlot<'_>> = linchecks
+            .iter()
+            .map(|(stripe, circuit)| lincheck::UnionLincheckSlot {
+                z_lincheck: stripe,
+                circuit: *circuit,
+            })
+            .collect();
+        lincheck::prove_union_capture_z_vec(union, &lc_slots, &x_ab, challenger)
+    };
+    for (stripe, _) in linchecks {
+        flock_core::scratch::give_u8(stripe);
+    }
+
+    let ab = ZClaim {
+        point: union.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
+        value: lc_claim.w,
+    };
+    let c = ZClaim {
+        point: union.c_claim_point(zc_claim.z, &zc_claim.r_rest),
+        value: zc_claim.c_eval,
+    };
+    let s_hat_v_ab = if m - union.n_log() >= pcs::LOG_PACKING {
+        Some(pcs::ring_switch::s_hat_v_from_z_vec(
+            &z_vec_pre,
+            &lc_claim.r_inner_rest[1..],
+        ))
+    } else {
+        None
+    };
+
+    let heights = union.jagged_heights();
+    let x_fulls: Vec<Vec<F128>> = [&ab, &c]
+        .iter()
+        .map(|cl| quirky_x_outer_full(&cl.point))
+        .collect();
+    let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
+    let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
+    let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
+    let pcs_open = pcs::open_batch_merged(
+        q,
+        &z_packed,
+        &prover_data,
+        &commitment,
+        &x_refs,
+        &[pre_ab, pre_c],
+        &padding,
+        &heights,
+        union.n_log(),
+        &lig_config,
+        challenger,
+    );
+    flock_core::scratch::give_f128(z_packed);
+
+    let proof = flock_core::proof::R1csProofMergedLigerito {
+        zerocheck: zc_proof,
+        lincheck: lc_proof,
+        pcs_open,
+    };
+    let claim = R1csClaim { ab, c };
+    (proof, commitment, claim)
+}
+
 fn prove_union_with_binding<Ch: Challenger>(
     union: &flock_core::union::UnionInstance<'_>,
     binding: UnionProveBinding<'_>,

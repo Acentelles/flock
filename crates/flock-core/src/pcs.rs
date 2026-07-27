@@ -1497,6 +1497,318 @@ pub fn verify_opening_batch_jagged_ligerito<Ch: Challenger>(
     Ok(())
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// The MERGED jagged/ring-switch opening (design doc §"Capacity-free
+// ring-switching: a merged reduction"). PROTOTYPE, side by side with the
+// jagged path: ONE sumcheck over the DENSE domain replaces the
+// padded-domain virtual-opening sumcheck AND the jagged transport — the
+// weight `W[d] = Σ_i Φ_i(eq_row·eq_col at the unrank of d)` is
+// simultaneously the ring-switch weight and the dense/virtual translation,
+// so the prover's Φ-pass is count-proportional (capacity-free). The
+// verifier's twisted-weight evaluation `Ŵ(ρ)` is discharged by the batched
+// Frobenius assist, and `q̂(ρ)` by an ordinary eq-basis Ligerito opening
+// (a packed-direct claim on the existing mixed path) — the fused `W_ρ`
+// basis, `b_tilde`, and send-and-spot-check machinery are not used.
+// Integer-lane commitments are not yet supported here (pow2 lanes only).
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Proof of the merged opening. `merged_rounds` are the dense-domain
+/// sumcheck's `(G(1), G(∞))` messages (`m_dense − 7` rounds, LSB first);
+/// `q_eval = q̂(ρ)`; the Frobenius assist carries and proves the twisted
+/// evaluation `V = Ŵ(ρ)`; `inner` is the eq-basis Ligerito opening of
+/// `q̂(ρ)`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergedOpenProof {
+    pub ring_switches: Vec<RingSwitchProof>,
+    pub merged_rounds: Vec<(F128, F128)>,
+    pub q_eval: F128,
+    pub frobenius: jagged::FrobeniusAssistProof,
+    pub inner: BatchOpeningProofLigerito,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn open_batch_merged<Ch: Challenger>(
+    q: Vec<F128>,
+    padded_witness: &[F128],
+    prover_data: &ProverData,
+    commitment: &Commitment,
+    x_outers: &[&[F128]],
+    precomputed_s_hat_v: &[Option<&[F128]>],
+    padding: &PaddingSpec,
+    heights: &[u64],
+    n_log: usize,
+    lig_config: &ligerito::ProverConfig,
+    challenger: &mut Ch,
+) -> MergedOpenProof {
+    use rayon::prelude::*;
+    assert!(
+        commitment.params.num_lanes.is_none(),
+        "merged open: integer-lane commitments not yet supported (prototype)"
+    );
+    challenger.observe_label(b"flock-merged-open-v0");
+    let (rs_results, gammas_rs) = ring_switch::prove_batched_padded_with_precomputed(
+        padded_witness,
+        x_outers,
+        precomputed_s_hat_v,
+        padding,
+        challenger,
+    );
+    let mut target = F128::ZERO;
+    for ((_, o), g) in rs_results.iter().zip(&gammas_rs) {
+        target += *g * o.sumcheck_claim;
+    }
+
+    let dense_log = commitment.params.m - LOG_PACKING;
+    assert_eq!(
+        q.len(),
+        1usize << dense_log,
+        "q must be the committed stack"
+    );
+    let params = jagged::JaggedParams::from_heights(heights, n_log, dense_log);
+    let k_cols = params.k;
+    let claim_data: Vec<(&[F128], &[F128], &[F128])> = rs_results
+        .iter()
+        .zip(x_outers.iter())
+        .map(|((_, o), x)| {
+            assert_eq!(x.len(), 1 + n_log + k_cols, "point/row/col split mismatch");
+            let table = match &o.rs_eq_ind {
+                ring_switch::RsEqInd::DeferredDense { table, .. } => table.as_slice(),
+                _ => panic!("merged open requires DeferredDense ring-switch claims"),
+            };
+            (&x[1..1 + n_log], &x[1 + n_log..], table)
+        })
+        .collect();
+
+    // The twisted weight over the dense cube (count-proportional Φ-pass;
+    // zero tail past the jagged area).
+    let w = jagged::build_merged_weight(&params, &claim_data);
+
+    // ---- Merged sumcheck: Σ_d q[d]·W[d] = target, dense_log rounds, same
+    // message/fold conventions as the virtual-opening sumcheck.
+    let (u0, u2) = {
+        const C: usize = 1 << 13;
+        q.par_chunks(C)
+            .zip(w.par_chunks(C))
+            .map(|(qc, wc)| {
+                let mut a = F128::ZERO;
+                let mut b = F128::ZERO;
+                for (qp, wp) in qc
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .zip(wc.as_chunks::<2>().0.iter())
+                {
+                    a += qp[0] * wp[0];
+                    b += (qp[0] + qp[1]) * (wp[0] + wp[1]);
+                }
+                (a, b)
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+            )
+    };
+    let (mut g_one, mut g_inf) = (target + u0, u2);
+    let mut merged_rounds = Vec::with_capacity(dense_log);
+    let mut rho = Vec::with_capacity(dense_log);
+    let l = q.len();
+    let mut sa = crate::scratch::take_f128(l / 2);
+    let mut sb = crate::scratch::take_f128(l / 2);
+    let mut a = crate::scratch::take_f128(l / 4);
+    let mut bb = crate::scratch::take_f128(l / 4);
+    let mut cur = l;
+    for round in 0..dense_log {
+        let half = cur / 2;
+        challenger.observe_f128(g_one);
+        challenger.observe_f128(g_inf);
+        let r = challenger.sample_f128();
+        merged_rounds.push((g_one, g_inf));
+        rho.push(r);
+        let (a_src, b_src): (&[F128], &[F128]) = if round == 0 {
+            (q.as_slice(), w.as_slice())
+        } else {
+            (&a, &bb)
+        };
+        if cur > 2 {
+            (g_one, g_inf) = jagged::fold_and_round_oop_par(
+                &a_src[..cur],
+                &b_src[..cur],
+                r,
+                &mut sa[..half],
+                &mut sb[..half],
+            );
+        } else {
+            jagged::fold_oop_par(
+                &a_src[..cur],
+                &b_src[..cur],
+                r,
+                &mut sa[..half],
+                &mut sb[..half],
+            );
+        }
+        std::mem::swap(&mut a, &mut sa);
+        std::mem::swap(&mut bb, &mut sb);
+        cur = half;
+    }
+    let q_eval = if dense_log == 0 { q[0] } else { a[0] };
+    let w_eval = if dense_log == 0 { w[0] } else { bb[0] };
+    crate::scratch::give_f128(w);
+    crate::scratch::give_f128(sa);
+    crate::scratch::give_f128(sb);
+    crate::scratch::give_f128(a);
+    crate::scratch::give_f128(bb);
+
+    // ---- Frobenius assist: proves V = Ŵ(ρ).
+    let coeffs: Vec<Vec<F128>> = claim_data
+        .iter()
+        .map(|&(_, _, t)| ring_switch::linearized_coefficients(t))
+        .collect();
+    let fclaims: Vec<jagged::FrobeniusClaim<'_>> = claim_data
+        .iter()
+        .zip(&coeffs)
+        .map(|(&(zr, zc, _), c)| jagged::FrobeniusClaim {
+            z_row: zr,
+            z_col: zc,
+            coeffs: c,
+        })
+        .collect();
+    let frobenius = jagged::prove_frobenius_assist(&params, &fclaims, &rho, challenger);
+    debug_assert_eq!(
+        frobenius.v, w_eval,
+        "assist V must equal the folded weight MLE"
+    );
+    let _ = w_eval;
+
+    // ---- eq-basis Ligerito opening of q̂(ρ): one packed-direct claim on
+    // the existing mixed path (whose verifier evaluates eq residuals in
+    // closed form — no b_tilde machinery).
+    let pd = PackedDirectClaim {
+        point: rho.clone(),
+        value: q_eval,
+        eq_ind: DirectEqInd::Dense(crate::lincheck::build_eq_table(&rho)),
+    };
+    let inner = open_batch_mixed_ligerito_with_precomputed_s_hat_v(
+        q,
+        prover_data,
+        commitment,
+        &[],
+        &[],
+        &[pd],
+        &PaddingSpec::dense(commitment.params.m),
+        lig_config,
+        challenger,
+    );
+
+    drop(fclaims);
+    drop(claim_data);
+    MergedOpenProof {
+        ring_switches: rs_results.into_iter().map(|(p, _)| p).collect(),
+        merged_rounds,
+        q_eval,
+        frobenius,
+        inner,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn verify_batch_merged<Ch: Challenger>(
+    commitment: &Commitment,
+    claims: &[F128],
+    z_skips: &[F128],
+    x_outers: &[&[F128]],
+    heights: &[u64],
+    n_log: usize,
+    proof: &MergedOpenProof,
+    lig_config: &ligerito::VerifierConfig,
+    challenger: &mut Ch,
+) -> Result<(), VerifyErrorJagged> {
+    let n_rs = claims.len();
+    assert_eq!(z_skips.len(), n_rs);
+    assert_eq!(x_outers.len(), n_rs);
+    if proof.ring_switches.len() != n_rs {
+        return Err(VerifyErrorJagged::Jagged);
+    }
+    challenger.observe_label(b"flock-merged-open-v0");
+    let mut rs_outputs = Vec::with_capacity(n_rs);
+    for i in 0..n_rs {
+        let out = ring_switch::verify_succinct(
+            claims[i],
+            z_skips[i],
+            x_outers[i],
+            &proof.ring_switches[i],
+            challenger,
+        )
+        .map_err(VerifyErrorJagged::RingSwitch)?;
+        rs_outputs.push(out);
+    }
+    let gammas: Vec<F128> = (0..n_rs).map(|_| challenger.sample_f128()).collect();
+    let mut target = F128::ZERO;
+    for (out, g) in rs_outputs.iter().zip(&gammas) {
+        target += *g * out.sumcheck_claim;
+    }
+
+    let dense_log = commitment.params.m - LOG_PACKING;
+    if proof.merged_rounds.len() != dense_log {
+        return Err(VerifyErrorJagged::VirtualOpen);
+    }
+    let mut running = target;
+    let mut rho = Vec::with_capacity(dense_log);
+    for &(g_one, g_inf) in &proof.merged_rounds {
+        challenger.observe_f128(g_one);
+        challenger.observe_f128(g_inf);
+        let r = challenger.sample_f128();
+        running = jagged::fold_round_claim(running, g_one, g_inf, r);
+        rho.push(r);
+    }
+
+    let params = jagged::JaggedParams::from_heights(heights, n_log, dense_log);
+    let k_cols = params.k;
+    // The claims' c_{i,j}: derived from the transcript (γ-scaled r''-eq
+    // tensors → fold byte tables → linearized coefficients).
+    let coeffs: Vec<Vec<F128>> = rs_outputs
+        .iter()
+        .zip(&gammas)
+        .map(|(o, g)| {
+            let scaled: Vec<F128> = o.eq_r_dprime.iter().map(|x| *g * *x).collect();
+            ring_switch::linearized_coefficients(&ring_switch::build_fold_byte_table(&scaled))
+        })
+        .collect();
+    let fclaims: Vec<jagged::FrobeniusClaim<'_>> = x_outers
+        .iter()
+        .zip(&coeffs)
+        .map(|(x, c)| {
+            assert_eq!(x.len(), 1 + n_log + k_cols, "point/row/col split mismatch");
+            jagged::FrobeniusClaim {
+                z_row: &x[1..1 + n_log],
+                z_col: &x[1 + n_log..],
+                coeffs: c,
+            }
+        })
+        .collect();
+    let v = jagged::verify_frobenius_assist(&params, &fclaims, &rho, &proof.frobenius, challenger)
+        .ok_or(VerifyErrorJagged::Jagged)?;
+    if running != proof.q_eval * v {
+        return Err(VerifyErrorJagged::VirtualOpen);
+    }
+
+    let pd = PackedDirectClaimRef {
+        point: &rho,
+        value: proof.q_eval,
+    };
+    verify_opening_batch_ligerito_mixed(
+        commitment,
+        &[],
+        &[],
+        &[],
+        &[pd],
+        &proof.inner,
+        lig_config,
+        challenger,
+    )
+    .map_err(|_| VerifyErrorJagged::Ligerito)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
