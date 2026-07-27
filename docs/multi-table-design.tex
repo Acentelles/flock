@@ -1089,29 +1089,128 @@ one squaring per column per $j$ --- so the verifier stays
 ($\approx 6\times$ today's assist path): it scales to registries of
 thousands of columns, answering the scaling objection that killed the
 fat verifier at registry scale. Prover: $\approx 128\times$ today's
-(tiny) assist --- a few ms, with Frobenius-sharing available at the
-Boolean stage (the suffix rows satisfy
-$S^{(j)} = \mathrm{Frob}^j(S^{(0)})$). Still to be done before
-building: the batched-sumcheck bookkeeping and a soundness write-up
-(standard genre --- $\gamma$-batching over the existing assist
-argument), and the $c_j$-extraction detail. The \emph{fat verifier} ---
+(tiny) assist per claim --- a few ms parallel; the per-statement passes
+are independent (an earlier draft claimed the suffix rows are global
+Frobenius powers of the $j = 0$ rows --- false: they entangle the
+\emph{unpowered} $\rho$-side factors with the powered $z$-side ones ---
+only the layer tables come from squaring chains). The protocol and
+soundness details follow. The \emph{fat verifier} ---
 evaluating the twisted object directly by the per-column tensor DP, no
 new argument at all --- survives as a fallback for small registries
 ($\approx 25$K multiplies per column: fine at today's $\approx 370$,
 not at thousands; and unlike the comb there is no preprocessing escape,
 since \code{col\_prefix\_sums} is per-proof).
 
-\paragraph{What it buys, per tier (estimates against the measured
-baseline).} Prover: the ring-switch machinery's $12.3 / 23.0 /
-44.7$\,ms collapses to $\approx 6$--$7$\,ms flat --- the $4\times$-tier
-total ratio drops from $\approx 1.35$ to $\approx 1.13$, and the
-$256$--$512$\,MB $b_{\mathrm{combined}}$ transient disappears. Proof:
-slightly smaller (the $\tilde b$ vector and spot-check go, one batched
-assist arrives). Verifier: $\lesssim 1$\,ms under the
-Frobenius-batched assist. The core identity is now
-test-verified; what remains before building is engineering-scale ---
-the batched assist protocol and its (standard-genre) soundness
-write-up --- rather than an open question.
+\paragraph{What it buys, per tier (honest estimates against the
+measured baseline).} Prover: the merged pipeline (dense-domain
+sumcheck folds $\approx 3$--$4$\,ms $+$ count-proportional $\Phi$-pass
+$\approx 4$--$5$\,ms $+$ Frobenius assist $\approx 2$--$4$\,ms)
+replaces the current $12.3 / 23.0 / 44.7$\,ms $+$
+$\tilde b$/assist at $\approx 9$--$12$\,ms \textbf{flat}: roughly
+break-even at full utilization, $\approx -13$\,ms at the $2\times$
+tier, $\approx -35$\,ms at $4\times$ --- the $4\times$-tier total
+ratio drops from $\approx 1.35$ to $\approx 1.1$ --- and the
+$256$--$512$\,MB $b_{\mathrm{combined}}$ transient disappears at every
+tier. Proof: slightly smaller (the $\tilde b$ vector and spot-check
+go, one batched assist arrives at unchanged size). Verifier:
+$\lesssim 1$\,ms added. The core identity is test-verified; the
+remaining gap to buildable is the protocol below plus its soundness
+write-up.
+
+\subsubsection*{The batched Frobenius assist, in detail}
+
+\emph{Notation.} Claims $i = 1..K$ (the union path has $K = 2$: the
+$\alpha$-batched AB claim and the C claim), each with word-level point
+$z_i = (z_i^{\mathrm{r}}, z_i^{\mathrm{c}})$ (rows low, columns high)
+and $\F_2$-linear fold map $\gamma_i\Phi_i$ ($\gamma$ baked). For
+$j = 0..127$ write $z^{(j)}$ for the coordinate-wise $2^j$-th power.
+$T_0 \le T_1 \le \cdots$ are the per-proof column prefix sums
+(\code{col\_prefix\_sums}); the assist's summation variables are the
+boundary-pair bit strings $(u, v)$, $|u| = |v| = m{+}1$;
+$U_{i,j}(u,v) = \sum_y \eq(z_i^{\mathrm{c},(j)}, y)\,
+\eq(\mathrm{bits}(T_{y-1}), u)\,\eq(\mathrm{bits}(T_y), v)$ is the
+boundary-indicator weight and $\hat g_{i,j}(u,v)$ the width-$4$
+branching-program value with layer tables from
+$(z_i^{\mathrm{r},(j)}, \rho)$ --- both exactly the implemented assist
+objects at powered points.
+
+\emph{Lemma 1 (linearized form).} Every $\F_2$-linear
+$L : \F_{2^{128}} \to \F_{2^{128}}$ is uniquely
+$L(x) = \sum_{j=0}^{127} c_j\,x^{2^j}$. The $c_j$ are recovered from
+$L$'s values on the bit basis by one multiplication with the inverse
+Moore matrix of that basis --- the matrix is universal (registry- and
+proof-independent, precomputed once); per proof this costs $128$
+evaluations of $L$ (byte-table applications) plus a $128^2$-multiply
+matvec per claim.
+
+\emph{Lemma 2 (Frobenius transport).} For Boolean $b$,
+$\eq(z, b)^{2^j} = \eq(z^{2^j}, b)$ (squaring is additive in
+characteristic $2$ and fixes $\F_2$), and Frobenius is a ring
+automorphism, so it distributes over the eq-products; hence for every
+$j$,
+$\sum_e \eq(\rho, e)\,\beta(e)^{2^j} =
+ \hat f_t(z^{\mathrm{r},(j)}, z^{\mathrm{c},(j)}, \rho)$
+with $\rho$ untouched. (Pinned numerically by
+\code{frobenius\_twist\_matches\_assist\_object}.)
+
+\emph{Lemma 3 (restriction).} Define $f := \mathrm{embed}(q)$ (zero
+off-stack --- the same definitional move the current fused transport
+makes). Then $\sum_e f(e)\,b_{\mathrm{combined}}(e) =
+\sum_d q[d]\,W[d]$ term-by-term: off-stack terms vanish with $f$, and
+in-stack terms match under the unrank bijection. The merged sumcheck
+therefore proves the ring-switch statement for the committed $q$'s
+embedding, exactly as today's transport does.
+
+\emph{Protocol.} After ring-switching ($\hat s_v$, $\gamma$-batching,
+targets --- unchanged): (1) the \textbf{merged sumcheck}, $m_d$ rounds
+over the dense domain for $\sum_d q[d]\,W[d] =
+\mathrm{target}_{\mathrm{combined}}$, ending at point $\rho$ with
+running claim $c^\ast$; (2) the prover sends $V$, claimed to be
+$\widehat W(\rho)$; (3) the \textbf{combined assist sumcheck},
+$2(m{+}1)$ rounds for
+\[
+  \textstyle\sum_{(u,v)} H(u,v) = V,
+  \qquad
+  H(u,v) := \sum_{i,j} c_{i,j}\; U_{i,j}(u,v)\;\hat g_{i,j}(u,v),
+\]
+with \textbf{deterministic weights}: the $c_{i,j}$ are
+transcript-determined (Lemma 1 applied to $\gamma_i\Phi_i$), so no
+fresh batching randomness is needed --- only the combined scalar $V$
+is ever used, and plain sumcheck soundness on the single summand $H$
+suffices. $H$ has degree $\le 2$ per variable, so rounds and proof
+size match today's assist. (4) At the assist's final point $\sigma$
+the verifier computes $H(\sigma)$ itself: the boundary factor
+$E_y(\sigma)$ once ($(i,j)$-independent), the base column weights
+$\eq(z_i^{\mathrm{c}}, y)$ once per claim, then one squaring per
+column per $j$ (Frobenius chains), and $K \cdot 128$ width-$4$ DPs of
+$O(m)$ each. (5) The verifier checks the merged sumcheck's final
+relation $c^\ast = \hat q(\rho) \cdot V$, with $\hat q(\rho)$
+discharged by the ordinary $\eq$-basis Ligerito opening ---
+the fused $W_\rho$ basis, $\tilde b$, and send-and-spot-check retire.
+
+\emph{Soundness.} Two plain sumchecks (errors
+$2 m_d / |\F|$ and $4(m{+}1)/|\F|$), the PCS opening, and Lemmas 1--3;
+the $c_{i,j}$ and $U, \hat g$ shapes are deterministic functions of
+the transcript, so no new random-oracle surface. The write-up
+obligation remaining is mechanical: transcript labels and order, and
+the composition statement with ring-switching's existing argument.
+
+\emph{Costs.} Verifier: $\approx 2(m{+}1)$ extra rounds to replay,
+$E_y$ pass $O(\mathrm{cols} \cdot m)$, Frobenius chains
+$O(\mathrm{cols} \cdot 128 \cdot K)$, DPs $O(128 K m)$, Moore matvec
+$O(128^2 K)$ --- order $10^5$ operations at today's registry,
+column-linear with constant $\approx 600$ at $K = 2$. Prover: the
+$K \cdot 128$ statements' suffix rows and round passes are independent
+($\approx 50$M multiplies at today's shapes, $2$--$4$\,ms parallel);
+layer tables for all $j$ come from squaring chains. Proof:
+$\approx 1.7$\,KB (unchanged rounds) plus the scalar $V$.
+
+\emph{Implementation notes.} Zero-height columns collapse in
+\code{assist\_columns} as today; the per-proof $T$ enters only through
+$E_y$ and the DP transitions, unchanged; the $\Phi_i$ tables are the
+existing \code{build\_fold\_byte\_table} outputs, consumed here only
+through Lemma 1; at $K$ claims the statement count is $128K$, still
+one sumcheck.
 
 % ===========================================================================
 \section{Statement, transcript, wire format}\label{sec:statement}
