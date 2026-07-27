@@ -41,6 +41,14 @@ use univariate_skip_optimized::{
 /// vectors of F128.
 pub const K_SKIP: usize = 6;
 
+/// Sparse-support gate for round 2 and the tail: the support-proportional
+/// kernels engage while `live · SPARSE_TAIL_GATE ≤ n`. Set to 16 when the
+/// sparse tail was a sequential scalar walk; after its parallelization
+/// (dense-kernel structure) the crossover moved — measured on the capacity
+/// sweep at 25% utilization, the sparse path beats the dense fold well
+/// before 1/16, so the gate now engages at quarter utilization.
+pub const SPARSE_TAIL_GATE: usize = 4;
+
 /// One run of identically-shaped blocks inside a [`PaddingSpec`] run-list.
 ///
 /// A run is `n_blocks` consecutive blocks of `2^k_log` bits each; inside each
@@ -460,7 +468,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     let sparse_from_round2 = live.as_ref().is_some_and(|list| {
         let live_elems: usize = list.iter().map(|&(s, e)| e - s).sum();
         let n_out = 1usize << n_mlv;
-        n_out >= 8 && live_elems * 16 <= n_out
+        n_out >= 8 && live_elems * SPARSE_TAIL_GATE <= n_out
     });
     let (mut a_mlv, mut b_mlv, msg_1, msg_inf) = if sparse_from_round2 {
         multilinear::uni_skip_fold_and_round_pair_runs_sparse(
@@ -539,7 +547,7 @@ fn prove_packed_padded_inner<C: Challenger>(
 
         let use_sparse = live.as_ref().is_some_and(|list| {
             let live_elems: usize = list.iter().map(|&(s, e)| e - s).sum();
-            a_mlv.len() >= 8 && live_elems * 16 <= a_mlv.len()
+            a_mlv.len() >= 8 && live_elems * SPARSE_TAIL_GATE <= a_mlv.len()
         });
         if !use_sparse
             && let Some(list) = live.take()
