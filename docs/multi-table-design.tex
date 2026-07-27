@@ -967,9 +967,15 @@ harness for the union PIOP before and after the jagged layer lands, and
 \subsection{Capacity-free ring-switching: a merged reduction (design
 sketch)}\label{sec:merged}
 
-Everything in this subsection is a \emph{design sketch} --- analyzed but
-unimplemented, with the load-bearing algebra stated so it can be checked,
-not yet checked against the implementation.
+Status: \textbf{prototype implemented}, side by side with the shipped
+jagged transport (no default switch, no wire change; the shipped path is
+byte-untouched and its fixtures pass unchanged). The load-bearing
+algebra is test-pinned (the Frobenius identity, the linearized-%
+coefficient extraction, the batched assist against the brute-force
+twisted evaluation), and the full pipeline round-trips with a tamper
+matrix on real mixed instances; measured results are folded into the
+cost paragraphs below. Adoption --- the polish list, integer-lane
+support, and the wire/fixture switchover --- is gated on design review.
 
 \paragraph{The padded-domain floor, measured.} Ring-switching is the one
 pipeline stage that still sees the capacity: its weight and its sumcheck
@@ -1112,21 +1118,27 @@ new argument at all --- survives as a fallback for small registries
 not at thousands; and unlike the comb there is no preprocessing escape,
 since \code{col\_prefix\_sums} is per-proof).
 
-\paragraph{What it buys, per tier (honest estimates against the
-measured baseline).} Prover: the merged pipeline (dense-domain
-sumcheck folds $\approx 3$--$4$\,ms $+$ count-proportional $\Phi$-pass
-$\approx 4$--$5$\,ms $+$ Frobenius assist $\approx 2$--$4$\,ms)
-replaces the current $12.3 / 23.0 / 44.7$\,ms $+$
-$\tilde b$/assist at $\approx 9$--$12$\,ms \textbf{flat}: roughly
-break-even at full utilization, $\approx -13$\,ms at the $2\times$
-tier, $\approx -35$\,ms at $4\times$ --- the $4\times$-tier total
-ratio drops from $\approx 1.35$ to $\approx 1.1$ --- and the
-$256$--$512$\,MB $b_{\mathrm{combined}}$ transient disappears at every
-tier. Proof: slightly smaller (the $\tilde b$ vector and spot-check
-go, one batched assist arrives at unchanged size). Verifier:
-$\lesssim 1$\,ms added. The core identity is test-verified; the
-remaining gap to buildable is the protocol below plus its soundness
-write-up.
+\paragraph{What it buys, per tier --- measured (prototype) and
+estimated (after polish).} The design's central claim is now
+\textbf{measured}: on the m30 load, the prototype's prove-time growth
+from the right-sized tier to $4\times$ over-capacity is
+$+14.1$\,ms, against the jagged path's $+40.7$\,ms --- the merged
+transport is near-capacity-free, and the $256$--$512$\,MB
+$b_{\mathrm{combined}}$ transient is gone at every tier. The
+prototype's \emph{constant} is unoptimized: $+34$\,ms over the shipped
+path at the right-sized tier, fully attributed to the polish list ---
+the pow2-only commit ($\approx 7$\,ms vs.\ integer lanes; needs the
+lane-major eq-basis open), the per-element-unrank weight build (needs
+the segmented-cursor treatment), the single eq claim riding the mixed
+path's \emph{materializing} combine (fusable --- the eq basis
+factors), and the untuned $128K$-statement assist prover (including
+its $\approx 150$\,MB suffix-row footprint). With those, the
+estimate stands at $\approx 9$--$12$\,ms flat: roughly break-even at
+full utilization, $\approx -13$\,ms at $2\times$, $\approx -35$\,ms
+at $4\times$. Proof: slightly smaller (the $\tilde b$ vector and
+spot-check go, one batched assist arrives at unchanged size).
+Verifier: $\lesssim 1$\,ms added (measured within noise at test
+scale).
 
 \subsubsection*{The batched Frobenius assist, in detail}
 
@@ -1430,10 +1442,20 @@ $\approx 11$\,ms, of which $\approx 83\%$ is the per-type comb builds
 --- a cost the direct path pays too, fused into its sumcheck replay
 (item~\ref{item:manytypes}).
 
+The merged jagged/ring-switch transport of \S\ref{sec:merged} is
+implemented as a side-by-side \textbf{prototype}
+(\code{open\_batch\_merged}, the Frobenius assist, the
+\code{\_merged} union prove/verify pair): end-to-end roundtrip and
+tamper matrix on real mixed instances, capacity-freedom measured at
+the m30 load ($+14.1$ vs $+40.7$\,ms growth to the $4\times$ tier);
+its unoptimized constant and the adoption gate are recorded in
+\S\ref{sec:merged}.
+
 Open follow-ups, in the order they are likely to matter: a Keccak
 batch-major driver (the registry machinery accepts the type; only the
-driver is missing); the lookup/bus layer (\S\ref{sec:open}); and comb
-delegation (item~\ref{item:manytypes}), explicitly deferred until
+driver is missing); the lookup/bus layer (\S\ref{sec:open}); the
+merged-transport polish + adoption decision (\S\ref{sec:merged}); and
+comb delegation (item~\ref{item:manytypes}), explicitly deferred until
 registry growth or verify latency demands it.
 
 % ===========================================================================
