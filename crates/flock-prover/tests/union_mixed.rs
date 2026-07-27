@@ -770,6 +770,214 @@ fn mixed_low_utilization_smoke() {
     );
 }
 
+/// Capacity is address space, not work — measured directly: FIX the
+/// workload, GROW the capacity.
+///
+/// The dual of `mixed_low_utilization_smoke` (which fixes the capacity and
+/// shrinks the counts): here the counts stay (1024, 1024) while the uniform
+/// row capacity sweeps ν = 10 → 12 → 14, i.e. 100% → 6.25% utilization and
+/// M = 26 → 30 — a 16x larger virtual address space for the identical
+/// workload. The design's cost accounting (doc §"Cost accounting") predicts:
+///
+///   * the committed stack is count-derived, hence IDENTICAL across the
+///     sweep (asserted exactly, before any timing);
+///   * zerocheck + lincheck prover work is declared-area-proportional —
+///     capacity enters only as extra sumcheck rounds with O(T) scalar
+///     tails (asserted loosely). One measured qualification: the
+///     zerocheck's sparse tail engages only at `live·16 ≤ n`
+///     (zerocheck.rs), so utilizations in the (6.25%, 100%) band pay a
+///     capacity-proportional DENSE tail — measured as a one-time step
+///     between the 100% and 25% rows (then flat to 6.25%), bounded by the
+///     tail's share of the zerocheck;
+///   * verify is flat: comb builds are registry-static and the round count
+///     grows only by M − 26 (asserted loosely);
+///   * the KNOWN capacity-proportional residue sits in the opening: the
+///     γ-combined ring-switch weight `b_combined` lives on the padded
+///     packed domain (2^{M−7} words) and its b-side fold chain is
+///     irreducibly dense (doc §"The commitment layer"), and the witness
+///     buffers are capacity-sized (padded addressing, materialized). These
+///     are printed, not asserted — the point of the table is to see them.
+///
+/// Timing discipline (this box heats itself into misleading sweeps): one
+/// process, one untimed warm-up pass, then timed passes with the config
+/// order ALTERNATED, min per (config, phase). Run with `cargo test
+/// --release -p flock-prover --test union_mixed -- --ignored --nocapture
+/// capacity_sweep_fixed_workload`.
+#[test]
+#[ignore] // Heavy + informational — run explicitly with --ignored --nocapture
+fn capacity_sweep_fixed_workload() {
+    use std::time::Instant;
+
+    const COUNTS: [usize; 2] = [1024, 1024]; // (sha2, blake3) — the fixed workload
+    const NUS: [usize; 3] = [10, 12, 14]; // 100% → 6.25% utilization, M = 26 → 30
+
+    let cfgs: Vec<_> = NUS.iter().map(|&nu| mixed_registry(nu)).collect();
+    flock_core::scratch::prewarm_prover(cfgs.last().unwrap().0.m_total());
+
+    let mut rng = Rng::new(0xCA9A_C17F_5EED);
+    let sha2_inputs = random_sha2_inputs(&mut rng, COUNTS[0]);
+    let blake3_inputs = random_blake3_inputs(&mut rng, COUNTS[1]);
+
+    // The committed stack is count-derived, never capacity-derived: dense
+    // size, committed size, and lane count must be identical across the
+    // sweep. Exact, so asserted before any timing.
+    {
+        let unions: Vec<_> = cfgs
+            .iter()
+            .map(|(reg, ..)| UnionInstance::new(reg, COUNTS.to_vec()))
+            .collect();
+        for u in &unions[1..] {
+            assert_eq!(
+                u.dense_words(),
+                unions[0].dense_words(),
+                "dense stack must not depend on capacity"
+            );
+            assert_eq!(u.committed_words(), unions[0].committed_words());
+            assert_eq!(u.commit_lanes(6), unions[0].commit_lanes(6));
+        }
+    }
+
+    // Per-config minima: [gen, assemble, commit, zerocheck, lincheck, open,
+    // prove total, verify].
+    const GEN: usize = 0;
+    const ASM: usize = 1;
+    const COMMIT: usize = 2;
+    const ZC: usize = 3;
+    const LC: usize = 4;
+    const OPEN: usize = 5;
+    const PROVE: usize = 6;
+    const VERIFY: usize = 7;
+    let mut mins = [[f64::INFINITY; 8]; NUS.len()];
+
+    const PASSES: usize = 4; // pass 0 is an untimed warm-up
+    for pass in 0..PASSES {
+        let order: Vec<usize> = if pass % 2 == 0 {
+            (0..NUS.len()).collect()
+        } else {
+            (0..NUS.len()).rev().collect()
+        };
+        for &i in &order {
+            let (registry, sha2_r1cs, blake3_r1cs) = &cfgs[i];
+            let nu = NUS[i];
+            let s2_circuit = sha2_r1cs.csc_lincheck_circuit();
+            let b3_circuit = blake3_r1cs.csc_lincheck_circuit();
+            let union = UnionInstance::new(registry, COUNTS.to_vec());
+            let pcs_params = union_pcs_params(&union);
+
+            let t = Instant::now();
+            let slots = vec![
+                UnionSlotProverInput::new(
+                    sha2::generate_witness_batch_major_partial(&sha2_inputs, nu),
+                    s2_circuit,
+                ),
+                UnionSlotProverInput::new(
+                    blake3::generate_witness_batch_major_partial(&blake3_inputs, nu),
+                    b3_circuit,
+                ),
+            ];
+            let gen_ms = t.elapsed().as_secs_f64() * 1e3;
+
+            let mut ch = FsChallenger::new(DOMAIN);
+            let t = Instant::now();
+            let (proof, commitment, claim, pt) =
+                prover::prove_fast_ligerito_jagged_union_timed(&union, &pcs_params, slots, &mut ch);
+            let prove_ms = t.elapsed().as_secs_f64() * 1e3;
+
+            let circuits: [&dyn LincheckCircuit; 2] = [s2_circuit, b3_circuit];
+            let mut ch_v = FsChallenger::new(DOMAIN);
+            let t = Instant::now();
+            let claim_v = verifier::verify_ligerito_jagged_union(
+                &union,
+                &circuits,
+                &commitment,
+                &proof,
+                &pcs_params,
+                &mut ch_v,
+            )
+            .unwrap_or_else(|e| panic!("capacity sweep: verifier rejected at nu = {nu}: {e:?}"));
+            let verify_ms = t.elapsed().as_secs_f64() * 1e3;
+            assert_eq!(claim_v, claim);
+
+            if pass > 0 {
+                let row = &mut mins[i];
+                for (slot, val) in [
+                    (GEN, gen_ms),
+                    (ASM, pt.witness_s * 1e3),
+                    (COMMIT, pt.commit_s * 1e3),
+                    (ZC, pt.zerocheck_s * 1e3),
+                    (LC, pt.lincheck_s * 1e3),
+                    (OPEN, pt.open_s * 1e3),
+                    (PROVE, prove_ms),
+                    (VERIFY, verify_ms),
+                ] {
+                    row[slot] = row[slot].min(val);
+                }
+            }
+        }
+    }
+
+    let committed = UnionInstance::new(&cfgs[0].0, COUNTS.to_vec()).committed_words();
+    println!(
+        "capacity sweep, fixed counts (sha2, blake3) = {COUNTS:?}, committed {committed} words \
+         at every capacity (min of {} alternated passes, ms):",
+        PASSES - 1
+    );
+    println!(
+        "  {:>3} {:>3} {:>6} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
+        "nu", "M", "util%", "gen", "asm", "commit", "zc", "lc", "open", "prove", "verify"
+    );
+    for (i, &nu) in NUS.iter().enumerate() {
+        let m = &mins[i];
+        println!(
+            "  {:>3} {:>3} {:>6.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2}",
+            nu,
+            cfgs[i].0.m_total(),
+            100.0 * COUNTS[0] as f64 / (1u64 << nu) as f64,
+            m[GEN],
+            m[ASM],
+            m[COMMIT],
+            m[ZC],
+            m[LC],
+            m[OPEN],
+            m[PROVE],
+            m[VERIFY]
+        );
+    }
+
+    // The declared-work assertions, LOOSE (wall clock; precise numbers live
+    // in the table): across a 16x capacity growth the PIOP prover phases,
+    // the commit (identical stack), and verify must stay near-flat. The
+    // opening and the capacity-sized buffers are deliberately unasserted —
+    // the b-side of the virtual-opening sumcheck is known
+    // capacity-proportional (dense on the padded packed domain).
+    let (lo, hi) = (&mins[0], &mins[NUS.len() - 1]);
+    let piop_lo = lo[ZC] + lo[LC];
+    let piop_hi = hi[ZC] + hi[LC];
+    // 2.0x, not 1.5x: the mid-band dense zerocheck tail (doc comment above)
+    // legitimately adds a capacity-proportional step between the 100% and
+    // 25% rows; measured ~1.6x total at 16x capacity. The bound guards
+    // against the tail going capacity-proportional at LOW utilization too
+    // (i.e. the sparse-tail gate regressing).
+    assert!(
+        piop_hi < 2.0 * piop_lo + 0.5,
+        "zerocheck + lincheck must stay near declared-work-proportional: \
+         {piop_lo:.2} ms at full utilization vs {piop_hi:.2} ms at 16x capacity"
+    );
+    assert!(
+        hi[COMMIT] < 1.5 * lo[COMMIT] + 0.5,
+        "commit must depend on the counts only (identical committed stack): \
+         {:.2} ms vs {:.2} ms",
+        lo[COMMIT],
+        hi[COMMIT]
+    );
+    assert!(
+        hi[VERIFY] < 1.5 * lo[VERIFY] + 1.0,
+        "verify must be flat across capacity: {:.2} ms vs {:.2} ms",
+        lo[VERIFY],
+        hi[VERIFY]
+    );
+}
+
 /// In-place witness generation is BYTE-IDENTICAL to prebuilt + scatter.
 ///
 /// [`UnionSlotProverInput::in_place`] hands each driver the slot's aligned
