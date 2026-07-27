@@ -1,691 +1,286 @@
 \documentclass[11pt]{article}
 
-\usepackage[margin=1.15in]{geometry}
+\usepackage[margin=1.2in]{geometry}
 \usepackage{amsmath,amssymb,amsthm}
-\usepackage{booktabs}
 \usepackage{enumitem}
-\usepackage{xspace}
 \usepackage{xcolor}
 \usepackage[colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
 
-% ---------------------------------------------------------------------------
 \newcommand{\F}{\mathbb{F}}
 \newcommand{\Ftwo}{\F_2}
-\newcommand{\Fbig}{\F_{2^{128}}}
 \newcommand{\eq}{\mathsf{eq}}
-\newcommand{\code}[1]{\texttt{#1}}
 \newcommand{\area}{\mathsf{area}}
-\newcommand{\Frob}{\mathrm{Frob}}
 \newcommand{\rowof}{\mathrm{row}}
 \newcommand{\colof}{\mathrm{col}}
+\newcommand{\fjag}{\hat f_{\mathrm{jag}}}
 
 \newtheorem{theorem}{Theorem}
 \newtheorem{lemma}[theorem]{Lemma}
-\newtheorem{proposition}[theorem]{Proposition}
-\newtheorem{corollary}[theorem]{Corollary}
-\theoremstyle{definition}
-\newtheorem{definition}[theorem]{Definition}
-\theoremstyle{remark}
 \newtheorem{remark}[theorem]{Remark}
 
 \title{Capacity-Free Ring Switching for Jagged\\ Polynomial Commitments}
-\author{DRAFT --- for internal review; author list and references to be settled}
+\author{DRAFT --- author list and references to be settled}
 \date{July 27, 2026}
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
-Small-field SNARKs commit to $\Ftwo$-valued witnesses packed into an
-extension field, and discharge bit-level evaluation claims against the
-packed commitment by \emph{ring switching}. Sparse and dynamically-shaped
-workloads are served by \emph{jagged} (stacked-column) commitments, which
-commit only the declared data of a large virtual address space. Composing
-the two creates a cost anomaly: ring switching's weight, and the sumcheck
-that discharges it, live in the \emph{virtual} (capacity-padded)
-coordinates, so the prover pays one $\Ftwo$-linear table-fold evaluation
-per \emph{virtual} word --- a cost proportional to provisioned capacity
-rather than committed data. We first show this floor is inherent to the
-standard pipeline: a backward-closure argument proves every entry of the
-ring-switching weight is load-bearing, so no support-skipping scheme can
-beat it. We then remove the floor by \emph{merging} the two reductions:
-one sumcheck over the dense domain, whose weight is the jagged transport
-weight composed with the ring-switching fold map $\Phi$ --- making the
-prover's pass count-proportional. The verifier's new obligation, a
-succinct evaluation of this \emph{$\Phi$-twisted} jagged multilinear, is
-resolved by a change of basis for $\Phi$ itself: every $\Ftwo$-linear map
-on $\Fbig$ is a linearized polynomial $\sum_j c_j x^{2^j}$, and Frobenius
-commutes with the eq-product structure at Boolean points, so the twisted
-evaluation is a known linear combination of $128$ \emph{ordinary} jagged
-evaluations at Frobenius-powered points --- delegated by one batched
-sumcheck of the existing ``assist'' form, with deterministic weights and
-no new batching randomness. A prototype in the Flock proof system
-validates the construction end to end: transport cost becomes
-near-capacity-free (prove-time growth $+14$\,ms versus $+41$\,ms for the
-baseline from a right-sized tier to $4\times$ over-capacity at a
-production-scale workload), at parity with the shipped transport at the
-right-sized tier.
+When ring switching \cite{dp-ringswitch} is composed with a jagged
+(stacked-column) commitment \cite{jagged}, its weight and sumcheck live
+on the \emph{virtual} (capacity-padded) domain, so the prover pays one
+fold-map evaluation per virtual word --- proportional to provisioned
+capacity, not committed data. We merge the two reductions into one
+sumcheck over the dense domain, making this cost count-proportional.
+The verifier's resulting obligation --- a succinct evaluation of the
+jagged multilinear \emph{twisted} by the $\Ftwo$-linear fold map $\Phi$
+--- is discharged by writing $\Phi$ as a linearized polynomial
+$\sum_j c_j x^{2^j}$: since Frobenius commutes with the eq-product
+structure at Boolean points, the twisted evaluation equals a known
+combination of $128$ \emph{ordinary} jagged evaluations at
+Frobenius-powered points, delegated by a single batched sumcheck of the
+existing assist form with deterministic weights.
 \end{abstract}
 
-\section{Introduction}
+\section{Setting}\label{sec:setting}
 
-Proof systems over small fields commit to witnesses whose entries are
-bits, packed $128$ per word into an extension field
-$\F = \Fbig$~\cite{binius,dp-ringswitch}. The arithmetization speaks about
-the \emph{bit-level} multilinear $\hat z$; the commitment binds the
-\emph{packed} multilinear $\hat f$. \emph{Ring switching}
-\cite{dp-ringswitch} bridges the two: it reduces a bit-level evaluation
-claim to an inner-product claim $\langle f, b\rangle = t$ against a
-transparent weight $b$, where per word
-\begin{equation}\label{eq:rsweight}
-  b[e] \;=\; \Phi\bigl(\eq(z, e)\bigr),
-\end{equation}
-$z$ is the claim's word-level point and $\Phi : \F \to \F$ is an
-$\Ftwo$-linear ``fold'' map assembled from the claim's in-word structure
-and fresh verifier randomness. Crucially, $b$ does \emph{not} factor as
-the eq tensor of any point: $\Phi$'s per-entry bit surgery does not
-commute with field multiplication.
+$\F = \F_{2^{128}}$; $\eq(\tau, x) = \prod_i (\tau_i x_i +
+(1{-}\tau_i)(1{-}x_i))$; hats denote multilinear extensions; $z^{2^j}$
+is the coordinate-wise Frobenius power of a point $z$.
 
-Independently, systems serving heterogeneous or dynamically-sized
-workloads commit \emph{jaggedly}~\cite{jagged}: the committed object is a
-dense stack $q$ of the declared columns' declared rows, while the
-arithmetization addresses a large \emph{virtual} space --- a
-capacity-sized grid in which undeclared rows, unused columns, and
-alignment gaps exist only as zeros. A transport argument carries claims
-across the dense/virtual translation; because the translation's
-branching-program machinery consumes eq-shaped (tensor-factoring) claims,
-the natural pipeline runs ring switching \emph{first}, on the virtual
-domain, and transports a single plain evaluation:
-\[
-  \text{bit claims}
-  \;\xrightarrow{\ \text{ring switch}\ }\;
-  \langle f, b\rangle \text{ on the \emph{virtual} word domain}
-  \;\xrightarrow{\ \text{sumcheck}\ }\;
-  \hat f(\rho)
-  \;\xrightarrow{\ \text{jagged transport}\ }\;
-  \langle q, W_\rho\rangle .
-\]
-
-\paragraph{The capacity tax.} This composition has a cost anomaly. Let
-$2^\ell$ be the virtual word domain (provisioned capacity) and
-$N \le 2^\ell$ the committed size. Every stage of a well-engineered
-pipeline can be made count-proportional --- witness generation, the PIOP's
-sumchecks, the commitment itself, the transport --- \emph{except} the
-ring-switching stage: its weight \eqref{eq:rsweight} is supported on the
-whole virtual domain, and the sumcheck discharging
-$\langle f, b\rangle$ runs there. The prover pays $\Theta(2^\ell)$
-evaluations of $\Phi$ (in practice, a $16{\times}256$-entry byte-table
-fold per word per claim) plus the dense fold chain of $b$ --- regardless
-of $N$. In our measurements on a production-scale workload
-(\S\ref{sec:eval}), this stage is by a wide margin the dominant cost of
-provisioning capacity headroom: at $4\times$ over-capacity it accounts
-for $+32$\,ms of a $+40$\,ms total prove-time growth.
-
-One might hope to make the stage support-proportional, as the other
-stages are. Our first result is negative: within the standard pipeline
-the floor is inherent.
-
-\begin{proposition}[informal; see \S\ref{sec:floor}]
-In the sumcheck for $\langle f, b\rangle$ over the virtual domain, every
-entry of every round's folded $b$-array is consumed by a later round
-message on any witness whose folded support eventually covers the domain
-(which holds for every non-degenerate jagged layout). Consequently any
-prover strategy evaluates the weight on the full virtual domain:
-$\Omega(2^\ell)$ evaluations of $\Phi$.
-\end{proposition}
-
-\paragraph{This work.} We remove the floor by \emph{merging} the two
-reductions. Since $f$ vanishes off the committed stack, the type
-converter's sum restricts exactly to the dense domain:
-\[
-  \sum_{x \in \{0,1\}^\ell} f(x)\, b(x)
-  \;=\;
-  \sum_{d \in \{0,1\}^{m}} q[d]\; W[d],
+\paragraph{Ring switching.} A bit-level claim on an $\Ftwo$-valued
+witness, packed $128$ bits per $\F$-word, is reduced by ring switching
+to an inner-product claim over the $2^{\ell}$-word packed domain,
+\begin{equation}\label{eq:rs}
+  \textstyle\sum_{e \in \{0,1\}^{\ell}} f(e)\, b(e) = t,
   \qquad
-  W[d] \;=\; \Phi\bigl(\eq(z_{\mathrm r}, \rowof(d)) \cdot
-                        \eq(z_{\mathrm c}, \colof(d))\bigr),
-\]
-where $2^m \approx N$ is the dense domain and
-$(\rowof, \colof)$ is the jagged unrank. One sumcheck over the dense
-domain is then \emph{simultaneously} ring switching's sumcheck and the
-dense/virtual translation; the prover's $\Phi$-pass becomes
-count-proportional, and the downstream opening degenerates to an ordinary
-eq-basis opening of $\hat q(\rho)$ --- retiring the transport's
-special-purpose machinery (in our implementation: the fused transport
-basis, a prover-sent evaluation vector, and its spot-check binding).
+  b(e) = \Phi\bigl(\eq(z, e)\bigr),
+\end{equation}
+where $f$ is the packed witness, $z \in \F^{\ell}$ is the claim's
+word-level point, and $\Phi : \F \to \F$ is an $\Ftwo$-linear map
+determined by the claim's in-word structure and fresh verifier
+randomness (batching scalars absorbed; several claims sum into one
+pair $(b, t)$). $\Phi$ does not commute with field multiplication, so
+$b$ factors as no eq tensor; the verifier can nevertheless evaluate
+$\hat b$ anywhere in polylogarithmic time.
 
-The new problem is the verifier's: at the sumcheck's final point $\rho$
-it must evaluate $\widehat W(\rho)$, the multilinear extension over
-\emph{dense} coordinates of the \emph{$\Phi$-twisted} jagged weight.
-Untwisted ($\Phi = \mathrm{id}$), this is precisely the object that
-jagged transports already delegate succinctly (the ``assist'': a
-sumcheck against a width-$4$ read-once branching program over the
-column-boundary bits \cite{jagged}). Twisted, every standard tool fails,
-and for one root cause: $\Phi$ is $\Ftwo$-linear but not $\F$-linear
-($\Phi(cx) \ne c\,\Phi(x)$), so it passes through neither the branching
-program's multiplicative transitions nor a sumcheck's variable bindings.
-
-Our main technical contribution resolves this by a change of basis for
-$\Phi$ itself:
-
-\begin{theorem}[informal; Theorem~\ref{thm:frobenius}]
-Write $\Phi(x) = \sum_{j=0}^{127} c_j\, x^{2^j}$ (the linearized-polynomial
-form of an $\Ftwo$-linear map on $\Fbig$). Then
+\paragraph{Jagged commitments.} A jagged layout over $2^{n}$ rows
+$\times$ $2^{k}$ columns assigns column $y$ a public height $h_y$, with
+prefix sums $T_y$ and $\area = T_{2^k}$. The commitment binds the dense
+stack $q \in \F^{2^m}$ ($2^m \ge \area$, zero past $\area$); for
+$d < \area$, $\colof(d)$ is the unique $y$ with $T_y \le d < T_{y+1}$
+and $\rowof(d) = d - T_{\colof(d)}$. The witness of \eqref{eq:rs} is
+the embedding of $q$ into the virtual word domain
+($\ell = n + k$, $e = \rowof + 2^n\colof$), zero elsewhere. The jagged
+multilinear
 \[
-  \widehat W(\rho)
+  \fjag(z_{\mathrm r}, z_{\mathrm c}, z_{\mathrm i})
   \;=\;
-  \sum_{j=0}^{127} c_j\;
-  \hat f_{\mathrm{jag}}\bigl(z_{\mathrm r}^{2^j},\;
-                             z_{\mathrm c}^{2^j},\; \rho\bigr),
-\]
-where $\hat f_{\mathrm{jag}}$ is the ordinary (untwisted) jagged
-multilinear and $z^{2^j}$ denotes the coordinate-wise Frobenius power.
-The point $\rho$ is not powered.
-\end{theorem}
-
-The proof is two lines once set up: Frobenius is a field automorphism,
-and at a Boolean selector $\eq(z, \beta)^{2^j} = \eq(z^{2^j}, \beta)$, so
-each Frobenius power of the twisted weight \emph{is} the untwisted weight
-at powered points. The twisted evaluation is therefore a known
-$\F$-linear combination of $128$ ordinary assist statements, and the
-$c_j$ are computable by both parties from the transcript via a universal
-precomputed inverse Moore matrix. The $128K$ statements ($K$ = number of
-ring-switched claims; $K = 2$ in our system) batch into \emph{one}
-sumcheck of the existing assist form with \textbf{deterministic} weights:
-since only the combined scalar is ever used, no fresh batching randomness
-is required, and plain sumcheck soundness on the combined summand
-suffices. Proof size is unchanged (rounds $=$ variables, independent of
-the batch width); the verifier's work stays linear in the layout's
-column count with a small constant ($\approx 300$ operations per column
---- Frobenius powers of the column weights are successive squarings).
-
-\paragraph{Secondary results.} Along the way we record: (i) the
-backward-closure argument behind the floor (\S\ref{sec:floor}); (ii) a
-\emph{bilinear-tensor branching program} showing the twisted object is
-computable by a read-once linear program over the state
-$(\text{carry},\text{comparison}) \otimes (\F \otimes_{\Ftwo} \F)$, with
-$\Phi$ applied once, outside all multiplications --- yielding a
-delegation-free ``fat verifier'' alternative whose cost is
-$\approx 25$K multiplications per column (viable for small layouts
-only); and (iii) a \emph{bindability lemma} explaining precisely why
-that tensor program cannot be sumcheck-delegated directly (the pairing
-$B(a \otimes b) = a\,\Phi(b)$ is $\F$-linear in its first slot only), which
-is what makes the Frobenius route necessary and, we believe,
-canonical.
-
-\paragraph{Implementation.} We implemented the merged reduction in the
-Flock proof system (multi-hash batch proving over $\Fbig$ with a jagged
-Ligerito-based commitment), side by side with the shipped pipeline. The
-core identity, the coefficient extraction, and the batched assist are
-each pinned by exact tests against brute-force oracles; the full
-pipeline round-trips with a tamper matrix on real mixed instances. At a
-production-scale workload ($2 \times 16384$ hash compressions,
-$2^{30}$-bit virtual domain at the right-sized tier), transport-cost
-growth from the right-sized tier to $4\times$ over-capacity is
-$+14$\,ms merged versus $+41$\,ms baseline, with right-sized prove time
-at parity (\S\ref{sec:eval}).
-
-\section{Preliminaries}\label{sec:prelim}
-
-\paragraph{Notation.} $\F = \Fbig$; witnesses are $\Ftwo$-valued. For
-$\tau, x \in \F^m$, $\eq(\tau, x) = \prod_i (\tau_i x_i +
-(1-\tau_i)(1-x_i))$; for a vector $v \in \F^{2^m}$, $\hat v$ is its
-multilinear extension (MLE); index bits are little-endian. For
-$z \in \F^n$ we write $z^{2^j}$ for the coordinate-wise $2^j$-th power.
-All sumchecks are standard \cite{sumcheck}; a degree-$2$ round sends
-$(G(1), G(\infty))$ with $G(0)$ reconstructed from the running claim.
-
-\paragraph{Ring switching.} We use ring switching as a black box with
-the following interface (cf.~\cite{dp-ringswitch} and the deployed
-variant in Flock). A bit-level claim $\hat z(\zeta) = v$ over a
-$2^{7+\ell}$-point bit domain is reduced, using a prover message (the
-$128$-element slice fold $\hat s_v$) and fresh verifier randomness
-$r'' \in \F^{7}$, to an inner-product claim
-$\langle f, b \rangle = t$ over the $2^\ell$-word packed domain, with
-$b[e] = \Phi(\eq(z, e))$ as in \eqref{eq:rsweight}: $z \in \F^{\ell}$ is
-the word-level part of $\zeta$, and $\Phi$ is the $\Ftwo$-linear map
-$x \mapsto \sum_{i : \mathrm{bit}_i(x) = 1} w_i$ for transparent weights
-$w \in \F^{128}$ derived from $r''$ (with the claim's batching scalar
-$\gamma$ absorbed). Multiple claims $\gamma$-combine into a single pair
-$(b_{\mathrm{comb}}, t_{\mathrm{comb}})$ with
-$b_{\mathrm{comb}} = \sum_i \Phi_i(\eq(z_i, \cdot))$. The verifier can
-evaluate $\hat b_{\mathrm{comb}}$ at any point in polylogarithmic time
-(the standard tensor-algebra closed form); it is the \emph{prover-side}
-bulk handling of $b$ that concerns us.
-
-\paragraph{Jagged layouts.} A jagged layout over a virtual grid of
-$2^{n}$ rows $\times$ $2^{k}$ columns assigns each column $y$ a height
-$h_y \in [0, 2^n]$, with prefix sums $T_y = \sum_{y' < y} h_{y'}$ and
-$\area = T_{2^k}$. The committed object is the dense stack
-$q \in \F^{2^m}$, $2^m \ge \area$, with $q[d]$ for
-$d < \area$ holding the entry at $(\rowof(d), \colof(d))$ ---
-$\colof(d)$ the unique $y$ with $T_y \le d < T_{y+1}$ and
-$\rowof(d) = d - T_{\colof(d)}$ --- and $q[d] = 0$ for $d \ge \area$.
-The virtual word domain has $2^{\ell}$ points, $\ell = n + k$, with word
-address $e = \rowof + 2^n \colof$; the embedding
-$f = \mathrm{embed}(q)$ places $q$'s entries at their virtual addresses
-and is zero elsewhere (heights, hence the layout, are public). The
-\emph{jagged multilinear}
-\[
-  \hat f_{\mathrm{jag}}(z_{\mathrm r}, z_{\mathrm c}, z_{\mathrm i})
-  \;=\;
-  \sum_{d = 0}^{\area - 1}
-    \eq(z_{\mathrm i}, d)\;
-    \eq(z_{\mathrm r}, \rowof(d))\;
+  \sum_{d=0}^{\area - 1}
+    \eq(z_{\mathrm i}, d)\,
+    \eq(z_{\mathrm r}, \rowof(d))\,
     \eq(z_{\mathrm c}, \colof(d))
 \]
-is the transport's central object; the \emph{assist}~\cite{jagged}
-delegates its evaluation by a sumcheck over the $2(m{+}1)$ bits of the
-column-boundary pairs $(T_{y-1}, T_y)$, against a width-$4$ read-once
-branching program (states: a comparison flag and a subtraction borrow)
-whose per-layer transitions carry eq factors of
-$(z_{\mathrm r}, z_{\mathrm i})$; the boundary-indicator weight
-$U(u,v) = \sum_y \eq(z_{\mathrm c}, y)\,\eq(\mathrm{bits}(T_{y-1}), u)\,
-\eq(\mathrm{bits}(T_y), v)$ is transparent, and the verifier's
-end-of-sumcheck work is $O(\mathrm{cols} \cdot m)$ multiplications plus
-one $O(m)$ branching-program evaluation. Proof size: $2(m{+}1)$
-degree-$2$ rounds.
+admits a succinct delegated evaluation (the \emph{assist}
+\cite{jagged}): a sumcheck over the $2(m{+}1)$ bits of the boundary
+pairs $(T_{y-1}, T_y)$ against a width-$4$ read-once branching program,
+with a transparent boundary-indicator weight; verifier cost
+$O(\mathrm{cols}\cdot m)$, proof size $2(m{+}1)$ degree-$2$ rounds.
 
-\paragraph{The baseline pipeline.} Ring switching first, jagged second:
-the $\gamma$-combined inner product is discharged by a product sumcheck
-over the \emph{virtual} domain (``the type converter''), whose output
-$\hat f(\rho_{\mathrm{virt}})$ the jagged transport then carries to the
-dense commitment, in our system fused into the Ligerito
-opening~\cite{ligero,ligerito} with the jagged weight as the opening
-basis. The ordering is forced: the transport's branching-program
-machinery consumes claims whose weights factor as eq tensors, and $b$
-does not factor.
-
-\section{The padded-domain floor}\label{sec:floor}
-
-Fix the baseline type converter: a product sumcheck for
-$\sum_{x} f(x)\, b_{\mathrm{comb}}(x) = t_{\mathrm{comb}}$ over
-$x \in \{0,1\}^{\ell}$, binding one variable per round; write $f_r, b_r$
-for the arrays after $r$ rounds ($f_0 = f$, $b_0 = b_{\mathrm{comb}}$).
-The witness side is sparse ($f = 0$ off the embedded stack) and standard
-support-proportional techniques make the $f$-side folds and messages
-touch only live intervals. The question is whether the $b$-side can be
-made support-proportional too. Two natural strategies fail for
-instructive reasons; the second gives the floor.
-
-\emph{Factorization} (fold-free evaluation): if $b$ factored as an eq
-tensor, folds would be point-bindings. It does not: $\Phi$'s bit
-decomposition does not commute with field multiplication, and (a fact we
-use positively in \S\ref{sec:frobenius}) $b$'s folded arrays have no
-factored form because a fold's Lagrange weights multiply outside
-$\Phi$.
-
-\emph{Support-skipping} (compute folded $b$ only where folded $f$ is
-live): sound at any single round --- a round message weights $b_r$ by
-$f_r$, so dead entries multiply zeros --- but not across rounds.
-
-\begin{proposition}[backward closure]\label{prop:closure}
-For $r < \ell$ let $L_r \subseteq \{0,1\}^{\ell - r}$ be the positions
-where $f_r$ is not identically forced to zero (the folded support), and
-let $D_r$ be the set of positions at which round $r{+}1$'s message or any
-later round consumes $b_r$. If $L_{r^*} = \{0,1\}^{\ell - r^*}$ for some
-$r^*$ (the folded support covers the domain), then $D_r$ is the full
-domain for every $r < r^*$.
-\end{proposition}
-
-\begin{proof}[Proof sketch]
-$D_r \supseteq \mathrm{expand}(D_{r+1}) \cup \mathrm{pairs}(L_{r+1})$:
-round $r{+}1$'s message consumes $b_{r+1}$ on the pair-closure of
-$L_{r+1}$, and each consumed $b_{r+1}$ entry is a combination of its two
-$b_r$ children. At $r^*$, $D_{r^*}$ is the full (small) domain; expansion
-of a full domain is full; induct downward.
-\end{proof}
-
-The hypothesis holds in every non-degenerate jagged instance: folding
-merges each dummy region into a live block once the fold radix exceeds
-the region's extent, so the folded support of any $f$ with at least one
-live entry per used column covers the domain after
-$\approx \log_2(\text{row capacity})$ rounds. Hence every entry of
-$b_0$ influences some consumed value, and any prover strategy performs
-$\Omega(2^{\ell})$ evaluations of $\Phi$: lazily generating $b$ on the
-live support and \emph{backfilling} folded entries on demand is sound
-and achieves the floor exactly (each virtual word's $\Phi$-value is
-computed exactly once, eagerly or under a backfill), but cannot go below
-it. Capacity-freedom requires leaving the virtual domain.
+In the standard pipeline, \eqref{eq:rs} is discharged by a product
+sumcheck over the \emph{virtual} domain, and the resulting evaluation
+claim is transported to the dense commitment by a separate jagged
+argument. The virtual-domain sumcheck costs the prover
+$\Theta(2^{\ell})$ evaluations of $\Phi$ and the dense fold chain of
+$b$, independently of $\area$ --- the object of this note is to remove
+that cost.
 
 \section{The merged reduction}\label{sec:merged}
 
 \begin{lemma}[restriction]\label{lem:restriction}
-Let $f = \mathrm{embed}(q)$ and, for each ring-switched claim $i$, let
-$z_i = (z_{i,\mathrm r}, z_{i,\mathrm c})$ be the word-level point split
-at the row/column boundary of the virtual addressing. Define
-$W : \{0,1\}^{m} \to \F$ by
+Let $f$ be the embedding of $q$ and split each claim's word-level point
+$z = (z_{\mathrm r}, z_{\mathrm c})$ at the row/column boundary. Define
+$W : \{0,1\}^m \to \F$ by
 \[
-  W[d] \;=\; \sum_i \Phi_i\bigl(
-     \eq(z_{i,\mathrm r}, \rowof(d)) \cdot
-     \eq(z_{i,\mathrm c}, \colof(d))\bigr)
-  \quad (d < \area),
-  \qquad W[d] \;=\; 0 \quad (d \ge \area).
+  W[d] = \sum_i \Phi_i\bigl(\eq(z_{i,\mathrm r}, \rowof(d))\cdot
+                            \eq(z_{i,\mathrm c}, \colof(d))\bigr)
+  \ \ (d < \area),
+  \qquad W[d] = 0 \ \ (d \ge \area).
 \]
-Then
-$\sum_{x \in \{0,1\}^{\ell}} f(x)\, b_{\mathrm{comb}}(x)
- = \sum_{d \in \{0,1\}^{m}} q[d]\, W[d]$.
+Then $\sum_{e} f(e)\, b(e) = \sum_{d} q[d]\, W[d]$.
 \end{lemma}
 
 \begin{proof}
-Termwise. Off-stack virtual words contribute zero on the left ($f = 0$);
-in-stack words correspond bijectively to $d < \area$ with
-$\eq(z_i, e) = \eq(z_{i,\mathrm r}, \rowof(d))\,
-\eq(z_{i,\mathrm c}, \colof(d))$ (the virtual address is the
-concatenation of row and column indices); the dense tail $d \ge \area$
-contributes zero on the right ($q$'s committed tail is zero, and $W$'s
-zero-extension makes the term vanish regardless).
+Termwise: off-stack words vanish with $f$; in-stack words correspond
+bijectively to $d < \area$, where
+$\eq(z, e) = \eq(z_{\mathrm r}, \rowof(d))\,\eq(z_{\mathrm c},
+\colof(d))$; the tail $d \ge \area$ vanishes with $q$ (and with $W$).
 \end{proof}
 
 The \emph{merged sumcheck} is the product sumcheck for
-$\sum_d q[d]\, W[d] = t_{\mathrm{comb}}$ over the \emph{dense} cube
-$\{0,1\}^m$. The prover materializes $W$ in one count-proportional pass
---- the layout cursor walk with one $\Phi$ table-fold per dense word per
-claim --- and runs $m$ standard rounds; the zero-extension is exactly
-what the assist's branching program computes past the area (its
-comparison state rejects), so prover table and verifier evaluation agree
-by construction. The output is a claim
-$c^* = \hat q(\rho) \cdot \widehat W(\rho)$ at the final point $\rho$:
-$\hat q(\rho)$ is discharged by an \emph{ordinary eq-basis} opening of
-the commitment (the special-purpose transport basis and its binding
-machinery retire), and $\widehat W(\rho)$ is the verifier's one new
-obligation.
+$\sum_d q[d]\,W[d] = t$ over the dense cube: $m$ rounds, prover cost
+one $\Phi$-evaluation per \emph{dense} word per claim (a
+count-proportional pass, fused with the first round message) plus
+standard folds. It is simultaneously ring switching's sumcheck and the
+dense/virtual transport: its output claim
+$c^* = \hat q(\rho)\,\widehat W(\rho)$ needs only an \emph{ordinary}
+eq-basis opening of the commitment for $\hat q(\rho)$ --- the
+special-purpose transport machinery retires --- and one new verifier
+obligation: $\widehat W(\rho)$, the MLE over dense coordinates of the
+\emph{$\Phi$-twisted} jagged weight. Untwisted, this is exactly the
+assist's object; twisted, the assist does not apply, because a sumcheck
+can only bind variables entering the summand $\F$-linearly and
+$\Phi(cx) \ne c\,\Phi(x)$.
 
-\begin{remark}
-Soundness composes exactly as in the baseline: the commitment binds $q$;
-the definitional object of all upstream claims is
-$\mathrm{unpack}(\mathrm{embed}(q))$, as it already is in the baseline's
-fused transport; the merged sumcheck plus the opening prove
-$\langle q, W\rangle = t_{\mathrm{comb}}$ for the committed $q$, which by
-Lemma~\ref{lem:restriction} is the ring-switching statement for
-$\mathrm{embed}(q)$. Two plain sumchecks and one opening; no new
-random-oracle surface (\S\ref{sec:protocol}).
-\end{remark}
+\section{The Frobenius decomposition}\label{sec:frobenius}
 
-\section{Evaluating the twisted weight}\label{sec:frobenius}
+Every $\Ftwo$-linear $L : \F \to \F$ is uniquely a linearized
+polynomial $L(x) = \sum_{j=0}^{127} c_j\, x^{2^j}$ \cite{ore,lidl}.
 
-The verifier must evaluate
-$\widehat W(\rho) = \sum_{d} \eq(\rho, d)\, W[d]$ succinctly.
-
-\subsection{Why existing tools fail, and a structural detour}
-
-Write each term as $\alpha(d) \cdot \Phi(\beta(d))$ with
-$\alpha(d) = \eq(\rho, d)$ (all $\F$-side weights) and $\beta(d)$ the
-row/column eq product inside $\Phi$ (we suppress the claim index; sums
-over claims are implicit). The assist's branching program computes
-$\sum \alpha \beta$ by multiplicative per-layer transitions; $\Phi$
-passes through none of them. Bit-decomposing $\Phi$ fails because bit
-slices of field products are not multilinear. A prover-sent value cannot
-be spot-checked without an independent oracle for the same twisted
-object.
-
-The twist does linearize at the price of state width. The pairing
-$B(a \otimes b) := a \cdot \Phi(b)$ is $\Ftwo$-bilinear, so
-$\widehat W(\rho) = B\bigl(\sum_d \alpha(d) \otimes \beta(d)\bigr)$, and
-the tensor $T = \sum_d \alpha \otimes \beta \in \F \otimes_{\Ftwo} \F$
-evolves under a \emph{read-once linear} branching program: each index
-bit contributes the transparent Kronecker map
-$M_{u(0)} \otimes M_{v(0)} + M_{u(1)} \otimes M_{v(1)}$
-(multiplication-by-constant maps are $\Ftwo$-linear), composed with the
-jagged carry/comparison structure; $\Phi$ is applied once, to the final
-state, outside every multiplication. Evaluated directly, per column and
-layer the transitions cost a few hundred multiplications --- a
-``fat verifier'' at $\approx 25$K multiplications per column, viable for
-small layouts, with no new argument at all. But it does not delegate:
-
-\begin{lemma}[bindability]\label{lem:bindability}
-$B\bigl((M_x \otimes I)\, T\bigr) = x \cdot B(T)$ for all $x \in \F$,
-whereas $x \mapsto B\bigl((I \otimes M_x)\, T\bigr)$ is not in general
-$\F$-linear. Consequently a sumcheck can bind a variable of the tensor
-program only if the variable's factors act on the $\alpha$ slot; the
-row-side factors and the boundary bits act on the $\beta$ slot, so the
-assist's boundary-bit sumcheck does not extend to the tensor program.
-\end{lemma}
-
-\begin{proof}
-$B((M_x \otimes I)(a \otimes b)) = (xa)\Phi(b) = x\,B(a \otimes b)$ and
-extend linearly. For the second claim take $T = a \otimes b$ with
-$\Phi(xb) \ne x\,\Phi(b)$.
-\end{proof}
-
-\subsection{The Frobenius decomposition}
-
-The resolution changes basis for $\Phi$ rather than fighting the
-program structure. Recall two classical facts about
-$\F = \F_{2^{128}}$: the Frobenius maps $x \mapsto x^{2^j}$ are field
-automorphisms fixing $\Ftwo$, and every $\Ftwo$-linear
-$L : \F \to \F$ is uniquely a \emph{linearized polynomial}
-$L(x) = \sum_{j=0}^{127} c_j\, x^{2^j}$ \cite{ore,lidl}.
-
-\begin{lemma}[Frobenius transport]\label{lem:transport}
-For Boolean $\beta \in \{0,1\}$ and any $z \in \F$:
-$\eq(z, \beta)^{2^j} = \eq(z^{2^j}, \beta)$. Consequently, for Boolean
-selector vectors and any $j$,
+\begin{lemma}\label{lem:transport}
+For Boolean $\beta$ and any $z \in \F$,
+$\eq(z, \beta)^{2^j} = \eq(z^{2^j}, \beta)$. Consequently, for every
+$j$,
 \[
-  \sum_{d} \eq(\rho, d)\;\beta(d)^{2^j}
+  \sum_{d=0}^{\area-1} \eq(\rho, d)\,
+  \bigl(\eq(z_{\mathrm r}, \rowof(d))\,\eq(z_{\mathrm c}, \colof(d))\bigr)^{2^j}
   \;=\;
-  \hat f_{\mathrm{jag}}\bigl(z_{\mathrm r}^{2^j},\,
-                             z_{\mathrm c}^{2^j},\, \rho\bigr).
+  \fjag\bigl(z_{\mathrm r}^{2^j}, z_{\mathrm c}^{2^j}, \rho\bigr).
 \]
 \end{lemma}
 
 \begin{proof}
-$\eq(z, \beta) \in \{z,\, 1+z\}$ and $(1+z)^{2^j} = 1 + z^{2^j}$ in
-characteristic $2$; Frobenius is an automorphism, so it distributes over
-the products forming $\beta(d)$, powering each $z$-coordinate and fixing
-the Boolean selectors; the $\F$-linear combination with the
-\emph{unpowered} weights $\eq(\rho, d)$ is then the definition of
-$\hat f_{\mathrm{jag}}$ at the powered points. (The carry/comparison
-structure of $\rowof(d) = d - T_{\colof(d)}$ selects \emph{which}
-Boolean factors appear and is untouched by the powering.)
+$\eq(z,\beta) \in \{z, 1{+}z\}$ and $(1{+}z)^{2^j} = 1 + z^{2^j}$ in
+characteristic $2$. Frobenius is a field automorphism, so it
+distributes over the eq products, powering the $z$-coordinates and
+fixing the Boolean selectors; the outer combination with the
+\emph{unpowered} weights $\eq(\rho, d)$ is the definition of $\fjag$
+at the powered points.
 \end{proof}
 
-\begin{theorem}[twisted evaluation]\label{thm:frobenius}
-Let $\Phi_i(x) = \sum_{j=0}^{127} c_{i,j}\, x^{2^j}$. Then
+\begin{theorem}\label{thm:main}
+With $\Phi_i(x) = \sum_j c_{i,j}\, x^{2^j}$,
 \[
   \widehat W(\rho)
   \;=\;
-  \sum_{i} \sum_{j=0}^{127} c_{i,j}\;
-  \hat f_{\mathrm{jag}}\bigl(z_{i,\mathrm r}^{2^j},\,
-                             z_{i,\mathrm c}^{2^j},\, \rho\bigr).
+  \sum_i \sum_{j=0}^{127} c_{i,j}\;
+  \fjag\bigl(z_{i,\mathrm r}^{2^j},\, z_{i,\mathrm c}^{2^j},\, \rho\bigr).
 \]
 \end{theorem}
 
 \begin{proof}
-Apply the linearized form per term and Lemma~\ref{lem:transport} per
-power; sums commute.
+Apply the linearized form per term of $\widehat W(\rho) = \sum_d
+\eq(\rho,d) W[d]$ and Lemma~\ref{lem:transport} per power.
 \end{proof}
 
-No $\Phi$-interior variable is ever bound: $\Phi$ has been decomposed
-into automorphisms that pass \emph{through} the product structure, so
-Lemma~\ref{lem:bindability}'s obstruction never arises. The twisted
-evaluation is an explicit $\F$-combination of $128K$ \emph{ordinary}
-assist statements, differing from the implemented ones only in their
-(Frobenius-powered) points.
+The twisted evaluation is thus a known $\F$-combination of $128K$
+\emph{ordinary} assist statements ($K$ = claim count), differing from
+the implemented ones only in their points. The obstruction never
+arises: $\Phi$ is decomposed into automorphisms that pass through the
+product structure, so no $\Phi$-interior variable is ever bound.
 
-\begin{remark}[coefficient extraction]\label{rem:moore}
-$c_{i,j}$ is a deterministic function of transcript values: evaluating
-$\Phi_i$ on the bit basis $(e_t)$ gives the linear system
-$\Phi_i(e_t) = \sum_j c_{i,j}\, e_t^{2^j}$, whose Moore matrix
-$M[t][j] = e_t^{2^j}$ is invertible and \emph{universal} --- computed
-and inverted once, ever. Per proof: $128$ byte-table evaluations of
-$\Phi_i$ plus one $128^2$-multiplication matrix--vector product per
-claim.
+\begin{remark}[coefficients]\label{rem:moore}
+The $c_{i,j}$ are deterministic transcript functions: evaluating
+$\Phi_i$ on the bit basis gives a linear system whose Moore matrix
+$M[t][j] = e_t^{2^j}$ is universal and precomputed once; per proof,
+$128$ evaluations of $\Phi_i$ plus a $128^2$-multiply matvec per claim.
 \end{remark}
 
-\section{The batched Frobenius assist, and the full protocol}
-\label{sec:protocol}
+\section{The batched assist}\label{sec:protocol}
 
-\paragraph{The batched assist.} The $128K$ statements share the
-boundary-bit domain, so they combine into \emph{one} sumcheck for
+The $128K$ statements share the boundary-bit domain and batch into
+\emph{one} sumcheck: the prover sends $V$ (claimed
+$\widehat W(\rho)$) and both parties run the $2(m{+}1)$-round sumcheck
+for
 \[
-  \sum_{(u,v) \in \{0,1\}^{2(m+1)}} H(u,v) \;=\; V,
+  \sum_{(u,v)} H(u,v) = V,
   \qquad
-  H(u,v) \;=\; \sum_{i,j} c_{i,j}\; U_{i,j}(u,v)\; \hat g_{i,j}(u,v),
+  H(u,v) = \sum_{i,j} c_{i,j}\; U_{i,j}(u,v)\; \hat g_{i,j}(u,v),
 \]
-where $U_{i,j}$ and $\hat g_{i,j}$ are the assist's boundary weight and
-branching-program value at the powered points, and $V$ is the prover's
-claimed $\widehat W(\rho)$. Two observations keep this cheap:
+with $U_{i,j}, \hat g_{i,j}$ the assist's boundary weight and
+branching-program value at the powered points. Two observations:
 
-\emph{Deterministic weights.} Only the combined scalar $V$ is ever used
-downstream, so the $c_{i,j}$ weights need no fresh batching randomness:
-plain sumcheck soundness on the single summand $H$ (degree $\le 2$ per
-variable) suffices, and the round count --- hence proof size,
-$\approx 1.7$\,KB --- is independent of the batch width.
+\begin{itemize}[nosep]
+\item \emph{Deterministic weights.} Only the combined scalar $V$ is
+  used downstream, so no batching randomness is needed: $H$ has degree
+  $\le 2$ per variable and plain sumcheck soundness on $H$ suffices.
+  Proof size is that of a single assist ($2(m{+}1)$ rounds),
+  independent of the batch width.
+\item \emph{Frobenius chains.} At the final point $\sigma$ the verifier
+  evaluates $H(\sigma)$ itself: the boundary factor is
+  $(i,j)$-independent and computed once, and
+  $\eq(z_{\mathrm c}^{2^j}, y) = \eq(z_{\mathrm c}, y)^{2^j}$ is one
+  squaring per column per $j$ --- the verifier stays column-linear at
+  a small constant ($\approx 6\times$ the untwisted assist path), plus
+  $128K$ width-$4$ program evaluations of $O(m)$ each and the Moore
+  extraction of Remark~\ref{rem:moore}.
+\end{itemize}
 
-\emph{Frobenius chains.} At the final point $\sigma$ the verifier
-evaluates $H(\sigma)$ itself. The boundary factor
-$E_y(\sigma) = \eq(\mathrm{bits}(T_{y-1}), \sigma_u)\,
-\eq(\mathrm{bits}(T_y), \sigma_v)$ is $(i,j)$-independent and computed
-once; the per-$j$ column weights obey
-$\eq(z_{\mathrm c}^{2^j}, y) = \eq(z_{\mathrm c}, y)^{2^j}$ --- one
-squaring per column per $j$ --- so the verifier's total stays
-\emph{column-linear with constant $\approx 300$} operations per column
-($\approx 6\times$ the untwisted assist path), scaling to layouts of
-thousands of columns; plus $128K$ width-$4$ branching-program
-evaluations of $O(m)$ each and the Moore extraction of
-Remark~\ref{rem:moore}.
-
-\paragraph{Protocol.} After ring switching (unchanged: $\hat s_v$
-messages, $r''$ challenges, $\gamma$-batching, targets):
-\begin{enumerate}[nosep]
-  \item \textbf{Merged sumcheck} ($m$ rounds) for
-        $\sum_d q[d]\,W[d] = t_{\mathrm{comb}}$, ending at $\rho$ with
-        running claim $c^*$.
-  \item Prover sends $V$, claimed to be $\widehat W(\rho)$.
-  \item \textbf{Batched Frobenius assist} ($2(m{+}1)$ rounds) for
-        $\sum H = V$; at its final point the verifier computes
-        $H(\sigma)$ as above.
-  \item Verifier checks $c^* = \hat q(\rho) \cdot V$, with
-        $\hat q(\rho)$ discharged by an ordinary eq-basis opening of the
-        commitment (for our Ligerito instantiation: the standard opening,
-        whose end-of-recursion basis evaluations are closed-form eq
-        evaluations --- the fused transport basis, the prover-sent
-        evaluation vector, and its spot-check reduction all retire).
-\end{enumerate}
+\paragraph{Protocol.} After ring switching (unchanged): (1) the merged
+sumcheck ($m$ rounds) ending at $\rho$ with running claim $c^*$;
+(2) the prover sends $V$; (3) the batched assist ($2(m{+}1)$ rounds)
+for $\sum H = V$; (4) the verifier checks
+$c^* = \hat q(\rho)\cdot V$, with $\hat q(\rho)$ discharged by the
+ordinary eq-basis opening.
 
 \begin{theorem}[soundness, sketch]\label{thm:soundness}
-Against the committed $q$, if any upstream bit-level claim is false for
-$\mathrm{unpack}(\mathrm{embed}(q))$, the verifier accepts with
+Against the committed $q$: if the $\gamma$-combined ring-switching
+statement is false for the embedding of $q$, the verifier accepts with
 probability at most
-$\varepsilon_{\mathrm{rs}} + (2m + 4(m{+}1))/|\F| +
-\varepsilon_{\mathrm{open}}$, where $\varepsilon_{\mathrm{rs}}$ and
-$\varepsilon_{\mathrm{open}}$ are the ring-switching and opening errors
-of the underlying components.
+$(2m + 4(m{+}1))/|\F| + \varepsilon_{\mathrm{open}}$.
 \end{theorem}
 
 \begin{proof}[Proof sketch]
 By Lemma~\ref{lem:restriction} the merged statement equals the
-$\gamma$-batched ring-switching statement for $\mathrm{embed}(q)$. If it
-is false, then by sumcheck soundness either some round of the merged
-sumcheck is caught, or the final relation
-$c^* = \hat q(\rho)\, \widehat W(\rho)$ is false for the honest
-$\widehat W(\rho)$; the opening binds $\hat q(\rho)$, and the assist
-sumcheck binds $V$ to the honest $\widehat W(\rho)$
-(Theorem~\ref{thm:frobenius} makes $H$'s honest sum equal
-$\widehat W(\rho)$, the $c_{i,j}$, $U_{i,j}$, and $\hat g_{i,j}$ being
-deterministic transcript functions the verifier evaluates itself).
-Union-bound the two sumchecks' errors.
+ring-switching statement for the embedding. If it is false, sumcheck
+soundness catches the merged rounds unless the final relation is false
+for the honest $\widehat W(\rho)$; the opening binds $\hat q(\rho)$,
+and the assist sumcheck binds $V$ to the honest $\widehat W(\rho)$ ---
+by Theorem~\ref{thm:main}, $H$'s true sum is $\widehat W(\rho)$, all
+of $c_{i,j}, U_{i,j}, \hat g_{i,j}$ being transcript-determined
+objects the verifier evaluates itself. Union-bound the two sumchecks.
 \end{proof}
 
-\section{Implementation and evaluation}\label{sec:eval}
+\section{Implementation}\label{sec:eval}
 
-We implemented the construction in Flock, a batch-hash proof system over
-$\Fbig$ committing with a jagged, integer-lane Ligerito scheme, as a
-side-by-side alternative to the shipped transport (which remains
-byte-identical; its pinned-proof fixtures pass unchanged). Every layer is
-oracle-tested: the Frobenius identity against a brute-force jagged MLE
-(random non-power-of-two heights, zero columns, powers through
-$j = 40$); the coefficient extraction against direct evaluation; the
-batched assist prover against the brute-force twisted evaluation, with
-round- and value-tamper rejection; and the full pipeline (merged
-sumcheck, assist, eq-basis opening, integer-lane and power-of-two
-commitments) as an end-to-end roundtrip with a five-way tamper matrix on
-real mixed instances.
+The construction is implemented in the Flock proof system (batch-hash
+proving over $\F_{2^{128}}$, jagged integer-lane Ligerito commitment
+\cite{ligero,ligerito}), side by side with the standard pipeline.
+Theorem~\ref{thm:main}, the coefficient extraction, and the batched
+assist are each pinned by exact tests against brute-force oracles
+(random non-power-of-two heights, zero-height columns, powers through
+$j = 40$); the full pipeline round-trips with a tamper matrix on real
+mixed instances. At a production-scale workload ($2^{30}$-bit virtual
+domain at the right-sized capacity tier), the standard pipeline's
+ring-switching stage measures $12.3 / 23.0 / 44.7$\,ms at
+$100\%/50\%/25\%$ utilization --- linear in the virtual domain ---
+while the merged pipeline's corresponding stages
+($\Phi$-pass ${\approx}4$\,ms, merged sumcheck ${\approx}4$\,ms,
+batched assist ${\approx}7$\,ms) are tier-independent: prove-time
+growth from the right-sized to the $4\times$ tier is $+14$\,ms versus
+$+41$\,ms, with right-sized totals at parity and the standard
+pipeline's multi-hundred-MB weight transient eliminated. Verifier
+overhead is below $1$\,ms at the deployed layout.
 
-\paragraph{Measured.} Workload: $16384$ SHA-256 $+$ $16384$ BLAKE3
-compressions (the system's production benchmark scale), proved on
-capacity tiers $\nu = 14/15/16$ ($100\%/50\%/25\%$ utilization; virtual
-domain $2^{30}$--$2^{32}$ bits), Apple silicon, best-of-passes with arms
-alternated in-process. Baseline pipeline: the ring-switching stage
-(weight construction $+$ type converter) measures
-$12.3 / 23.0 / 44.7$\,ms across the tiers --- linear in the virtual
-domain --- while every other stage is flat; total prove
-$\approx 112 \to 152$\,ms. Merged pipeline: the corresponding stages
-(count-proportional $\Phi$-pass fused with the round-$0$ message
-$\approx 4$\,ms, merged sumcheck $\approx 4$\,ms, batched assist
-$\approx 7$\,ms) are tier-independent; measured prove-time growth from
-the right-sized to the $4\times$ tier is $+14$\,ms versus the baseline's
-$+41$\,ms, and in a same-run comparison at the right-sized tier the
-merged pipeline matched the shipped one ($124.9$ vs.\ $130.9$\,ms on
-equally-warmed arms; cold-machine baselines put the two within
-$\approx 5$--$10$\,ms, the residual being the assist's fixed cost).
-Verifier overhead is under a millisecond at the deployed layout
-($\approx 370$ columns); the $256$--$512$\,MB transient that the
-baseline materializes for the ring-switching weight at over-capacity
-tiers does not exist in the merged pipeline.
-
-\section{Discussion}\label{sec:discussion}
-
-\paragraph{When to prefer which pipeline.} At full utilization the dense
-and virtual domains nearly coincide and the merged pipeline's advantage
-vanishes (it pays the assist's fixed cost against the baseline's near-free
-transport residuals): parity is the structural ceiling there. The
-construction's value is that provisioned headroom becomes free ---
-relevant whenever one capacity tier must serve varying workloads.
-
-\paragraph{Scaling in columns.} The batched assist keeps the verifier
-column-linear at a small constant, so the construction scales to
-many-column layouts where the fat-verifier alternative
-(\S\ref{sec:frobenius}) does not. Note that no registry-time
-preprocessing shortcut exists here: the layout's prefix sums are
-per-proof (count-derived), unlike, e.g., circuit matrices whose MLEs can
-be committed once.
-
-\paragraph{Generality.} The technique needs only: (i) an $\Ftwo$-linear
-per-word fold map (any ring-switching-style bit-to-word bridge); (ii) a
-weight whose untwisted form has a succinct delegated evaluation with
-transparent per-layer structure (any assist-style branching-program
-object); and (iii) a field with cheap Frobenius. It should therefore
-apply to other small-field systems composing packing with
-shape-flexible commitments, e.g.\ tower-field constructions where
-Frobenius is likewise inexpensive. The pattern --- decompose an
-$\Ftwo$-linear obstruction into linearized-polynomial form and transport
-each Frobenius power through the Boolean product structure --- may be of
-independent use; it is, in effect, a change of basis that converts a
-non-multiplicative twist into a batch of point translations.
-
-\paragraph{Open items.} The soundness argument here is a sketch
-(Theorem~\ref{thm:soundness}); a full write-up should fix the transcript
-schedule and compose with the underlying components' extractability
-statements. The assist prover's constant ($128K$ small statements) has
-known slack. Finally, the deterministic-weight batching deserves a
-careful statement in its own right: it replaces a random linear
-combination with transcript-determined weights, which is sound here
-because only the combined value is consumed, but the boundary of that
-argument is worth delineating.
+\begin{remark}
+The technique needs only an $\Ftwo$-linear per-word fold map, an
+untwisted weight with a transparent-layer delegated evaluation, and
+cheap Frobenius; it should transfer to other small-field systems
+composing packing with shape-flexible commitments. Open for the full
+version: the complete soundness composition (transcript schedule,
+extractability of the underlying components) and a precise statement
+of the deterministic-weight batching boundary.
+\end{remark}
 
 \begin{thebibliography}{9}\small
-
-\bibitem{sumcheck}
-C.~Lund, L.~Fortnow, H.~Karloff, N.~Nisan.
-\emph{Algebraic methods for interactive proof systems}. J.~ACM, 1992.
-
-\bibitem{binius}
-B.~Diamond, J.~Posen.
-\emph{Succinct arguments over towers of binary fields}.
-ePrint 2023/1784.
 
 \bibitem{dp-ringswitch}
 B.~Diamond, J.~Posen.
 \emph{Polylogarithmic proofs for multilinears over binary towers}.
-ePrint 2024/504. [TODO: confirm citation for the ring-switching
-reduction as deployed.]
+ePrint 2024/504. [TODO: confirm.]
 
 \bibitem{jagged}
-[TODO: the jagged polynomial commitment / assist reference --- the
-SP1-Hypercube-lineage write-up whose \S5 defines the assist delegation
-of $\hat f_{\mathrm{jag}}$.]
+[TODO: the jagged polynomial commitment / assist reference.]
 
 \bibitem{ligero}
 S.~Ames, C.~Hazay, Y.~Ishai, M.~Venkitasubramaniam.
@@ -693,17 +288,13 @@ S.~Ames, C.~Hazay, Y.~Ishai, M.~Venkitasubramaniam.
 CCS 2017.
 
 \bibitem{ligerito}
-A.~Novakovi\'c, G.~Angeris.
-\emph{Ligerito}. [TODO: confirm venue/eprint.]
+A.~Novakovi\'c, G.~Angeris. \emph{Ligerito}. [TODO: confirm venue.]
 
 \bibitem{ore}
-O.~Ore. \emph{On a special class of polynomials}.
-Trans.\ AMS, 1933.
+O.~Ore. \emph{On a special class of polynomials}. Trans.\ AMS, 1933.
 
 \bibitem{lidl}
-R.~Lidl, H.~Niederreiter. \emph{Finite Fields}.
-Cambridge University Press, 1997. (Linearized polynomials, Moore
-matrices: Ch.~3.)
+R.~Lidl, H.~Niederreiter. \emph{Finite Fields}. CUP, 1997.
 
 \end{thebibliography}
 
