@@ -1657,6 +1657,17 @@ pub(crate) fn deferred_dense_value(
     fold_one_slot(eq_lo[j & mask] * eq_hi[j >> log_b], table)
 }
 
+// NOTE (2026-07-27, investigated and REJECTED — do not resurrect without a
+// protocol change): a "merged Φ-table scan" — composing the claims' fold
+// maps `h ↦ (γΦ)(e_hi·h)` into one byte table per block and scanning with a
+// single `fold_one_slot` per word — is exact F₂-linear algebra and would
+// ~halve the combine's per-word work, BUT it requires the dense claims to
+// SHARE their `eq_lo` factor, and the AB and C claims never do: `extract_c`
+// deliberately claims C at the original eq point `r_rest` (τ) while AB is
+// claimed at the sumcheck's `mlv_challenges`, precisely so c needs no
+// per-round folding in the zerocheck. Undoing that costs more than the scan
+// saves.
+
 pub fn fold_b128_elems_split(eq_lo: &[F128], eq_hi: &[F128], eq_r_dprime: &[F128]) -> Vec<F128> {
     let tables = build_fold_byte_table(eq_r_dprime);
     fold_b128_from_table(eq_lo, eq_hi, &tables)
