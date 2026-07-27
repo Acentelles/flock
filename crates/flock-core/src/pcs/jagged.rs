@@ -1218,21 +1218,48 @@ pub(crate) fn build_merged_weight(
         .map(|&(zr, zc, t)| (build_eq_table(zr), build_eq_table(zc), t))
         .collect();
     let mut w = crate::scratch::take_f128(n_total);
+    // Segmented fill (the JaggedWeight lesson): per chunk, ONE cursor into
+    // `col_prefix_sums`, then per column segment a claim-OUTER sweep — the
+    // column factor hoisted, rows read sequentially, and one claim's 64 KB
+    // fold table hot per sweep. The per-element unrank variant measured
+    // ~2.5x slower at M = 30.
     const CHUNK: usize = 1 << 14;
+    let ps = &params.col_prefix_sums;
     w.par_chunks_mut(CHUNK).enumerate().for_each(|(ci, out)| {
-        let base = ci * CHUNK;
-        for (o, slot) in out.iter_mut().enumerate() {
-            let e = base + o;
-            *slot = if e < area {
-                let (row, col) = params.unrank(e as u64);
-                let mut acc = F128::ZERO;
-                for (eq_r, eq_c, t) in &tabs {
-                    acc += crate::pcs::ring_switch::fold_one_slot(eq_r[row] * eq_c[col], t);
+        let base = (ci * CHUNK) as u64;
+        let end = base + out.len() as u64;
+        if base >= area as u64 {
+            out.fill(F128::ZERO);
+            return;
+        }
+        let live_end = end.min(area as u64);
+        // Zero the dead tail of this chunk (past the jagged area).
+        out[(live_end - base) as usize..].fill(F128::ZERO);
+        let mut first_claim = true;
+        for (eq_r, eq_c, tab) in tabs.iter() {
+            let mut col = ps.partition_point(|&t| t <= base) - 1;
+            let mut e = base;
+            while e < live_end {
+                while ps[col + 1] <= e {
+                    col += 1;
                 }
-                acc
-            } else {
-                F128::ZERO
-            };
+                let seg_end = ps[col + 1].min(live_end);
+                let c_hoist = eq_c[col];
+                let row0 = (e - ps[col]) as usize;
+                let dst = &mut out[(e - base) as usize..(seg_end - base) as usize];
+                let rows = &eq_r[row0..row0 + dst.len()];
+                if first_claim {
+                    for (slot, &r) in dst.iter_mut().zip(rows) {
+                        *slot = crate::pcs::ring_switch::fold_one_slot(r * c_hoist, tab);
+                    }
+                } else {
+                    for (slot, &r) in dst.iter_mut().zip(rows) {
+                        *slot += crate::pcs::ring_switch::fold_one_slot(r * c_hoist, tab);
+                    }
+                }
+                e = seg_end;
+            }
+            first_claim = false;
         }
     });
     w
@@ -1342,8 +1369,18 @@ pub fn prove_frobenius_assist<C: Challenger>(
     use rayon::prelude::*;
     let m = params.m;
     assert_eq!(rho.len(), m);
+    let trace = std::env::var("PCS_TRACE").is_ok();
+    let t = std::time::Instant::now();
     let sparse = assist_sparse_transitions();
     let mut sts = frobenius_statements(params, claims, rho, true);
+    if trace {
+        eprintln!(
+            "    [frobenius] statements + suffix rows (x{}): {:6.2} ms",
+            sts.len(),
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    let t = std::time::Instant::now();
 
     let v = sts
         .par_iter()
@@ -1446,6 +1483,12 @@ pub fn prove_frobenius_assist<C: Challenger>(
         prev_ch = Some((rc, rd));
     }
 
+    if trace {
+        eprintln!(
+            "    [frobenius] v + rounds: {:6.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
     FrobeniusAssistProof { v, rounds }
 }
 

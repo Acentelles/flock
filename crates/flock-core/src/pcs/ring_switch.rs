@@ -291,6 +291,14 @@ pub fn fold_1b_rows_multi_padded(
 /// rayon's per-task overhead dominates; we keep them sequential and only
 /// switch to parallel above a threshold.
 pub(crate) fn build_eq_parallel(r: &[F128]) -> Vec<F128> {
+    build_eq_scaled_parallel(r, F128::ONE)
+}
+
+/// [`build_eq_parallel`] with the tensor seeded at `seed`: returns
+/// `seed·eq(r, ·)` in one build — no separate scaling pass. Used by the
+/// merged transport's inner open to materialize `γ·eq(ρ, ·)` directly as
+/// `b_combined`.
+pub(crate) fn build_eq_scaled_parallel(r: &[F128], seed: F128) -> Vec<F128> {
     use rayon::prelude::*;
     let n = r.len();
     // Uninit alloc — at iter `i`, the loop reads from t[..2^i] (always written
@@ -298,7 +306,7 @@ pub(crate) fn build_eq_parallel(r: &[F128]) -> Vec<F128> {
     // (purely written, never read first). So every slot is written before any
     // read; uninit is safe.
     let mut t = crate::alloc_uninit_f128_vec(1usize << n);
-    t[0] = F128::ONE;
+    t[0] = seed;
     // Threshold below which rayon dispatch overhead beats the parallel work.
     const PAR_THRESHOLD: usize = 1 << 12;
     for i in 0..n {

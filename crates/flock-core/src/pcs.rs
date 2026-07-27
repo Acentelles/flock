@@ -109,6 +109,12 @@ pub enum VerifyErrorJagged {
 pub enum DirectEqInd {
     /// Fully-materialized `eq_ind(point)` of length `2^L`.
     Dense(Vec<F128>),
+    /// Deferred eq tensor: only the point rides in; the combine
+    /// materializes `γ·eq(point)` directly as `b_combined` with a seeded
+    /// build (no separate eq buffer, no re-scale pass). Currently consumed
+    /// only by the merged transport's inner open (a single such claim, no
+    /// RS claims); transcript-identical to `Dense` of the same point.
+    EqPoint(Vec<F128>),
     /// Sparse representation — non-zero entries at scattered indices.
     /// Built from a claim point with one or more exactly-zero coords via
     /// [`ring_switch::build_eq_sparse`].
@@ -376,6 +382,64 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             _ => None,
         })
         .collect();
+
+    // Merged-transport inner open: no RS claims, exactly one EqPoint claim.
+    // Build `b_combined = γ·eq(point)` seeded (one pass, no eq buffer) and
+    // fuse the round-0 prime. Transcript-identical to the Dense variant of
+    // the same point (the eq_ind representation is prover-side only).
+    if rs_results.is_empty()
+        && packed_direct.len() == 1
+        && let DirectEqInd::EqPoint(point) = &packed_direct[0].eq_ind
+    {
+        assert_eq!(1usize << point.len(), l, "EqPoint length mismatch");
+        let b_combined = ring_switch::build_eq_scaled_parallel(point, gammas_pd[0]);
+        let (round0_u0, round0_u2) = {
+            const C: usize = 1 << 13;
+            packed_witness
+                .par_chunks(C)
+                .zip(b_combined.par_chunks(C))
+                .map(|(qc, wc)| {
+                    let mut a = F128::ZERO;
+                    let mut b = F128::ZERO;
+                    for (qp, wp) in qc
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .zip(wc.as_chunks::<2>().0.iter())
+                    {
+                        a += qp[0] * wp[0];
+                        b += (qp[0] + qp[1]) * (wp[0] + wp[1]);
+                    }
+                    (a, b)
+                })
+                .reduce(
+                    || (F128::ZERO, F128::ZERO),
+                    |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+                )
+        };
+        if trace {
+            eprintln!(
+                "  [open_batch] combine (seeded EqPoint, L={l}): {:6.2} ms",
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        return CombinedClaim {
+            ring_switches: Vec::new(),
+            b_combined,
+            target_combined,
+            round0_prime: (round0_u0, round0_u2),
+            deferred: None,
+        };
+    }
+
+    // Past the special path, EqPoint must not appear — the loops below
+    // would silently drop its contribution.
+    assert!(
+        packed_direct
+            .iter()
+            .all(|pd| !matches!(pd.eq_ind, DirectEqInd::EqPoint(_))),
+        "EqPoint claims are only supported alone, with no RS claims"
+    );
 
     // Fast path (compression-proof open: claims ab, c; also chain/merkle): every
     // RS claim is a fused DeferredDense fold and no DENSE packed-direct claim
@@ -1545,7 +1609,10 @@ pub fn open_batch_merged<Ch: Challenger>(
         commitment.params.num_lanes.is_none(),
         "merged open: integer-lane commitments not yet supported (prototype)"
     );
+    let trace = std::env::var("PCS_TRACE").is_ok();
+    let t_total = std::time::Instant::now();
     challenger.observe_label(b"flock-merged-open-v0");
+    let t = std::time::Instant::now();
     let (rs_results, gammas_rs) = ring_switch::prove_batched_padded_with_precomputed(
         padded_witness,
         x_outers,
@@ -1553,6 +1620,12 @@ pub fn open_batch_merged<Ch: Challenger>(
         padding,
         challenger,
     );
+    if trace {
+        eprintln!(
+            "  [open_merged] ring_switch: {:6.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
     let mut target = F128::ZERO;
     for ((_, o), g) in rs_results.iter().zip(&gammas_rs) {
         target += *g * o.sumcheck_claim;
@@ -1581,10 +1654,19 @@ pub fn open_batch_merged<Ch: Challenger>(
 
     // The twisted weight over the dense cube (count-proportional Φ-pass;
     // zero tail past the jagged area).
+    let t = std::time::Instant::now();
     let w = jagged::build_merged_weight(&params, &claim_data);
+    if trace {
+        eprintln!(
+            "  [open_merged] W build (2^{} words): {:6.2} ms",
+            dense_log,
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
 
     // ---- Merged sumcheck: Σ_d q[d]·W[d] = target, dense_log rounds, same
     // message/fold conventions as the virtual-opening sumcheck.
+    let t = std::time::Instant::now();
     let (u0, u2) = {
         const C: usize = 1 << 13;
         q.par_chunks(C)
@@ -1652,6 +1734,12 @@ pub fn open_batch_merged<Ch: Challenger>(
     }
     let q_eval = if dense_log == 0 { q[0] } else { a[0] };
     let w_eval = if dense_log == 0 { w[0] } else { bb[0] };
+    if trace {
+        eprintln!(
+            "  [open_merged] merged sumcheck ({dense_log} rounds): {:6.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
     crate::scratch::give_f128(w);
     crate::scratch::give_f128(sa);
     crate::scratch::give_f128(sb);
@@ -1659,9 +1747,10 @@ pub fn open_batch_merged<Ch: Challenger>(
     crate::scratch::give_f128(bb);
 
     // ---- Frobenius assist: proves V = Ŵ(ρ).
+    let t = std::time::Instant::now();
     let coeffs: Vec<Vec<F128>> = claim_data
         .iter()
-        .map(|&(_, _, t)| ring_switch::linearized_coefficients(t))
+        .map(|&(_, _, tab)| ring_switch::linearized_coefficients(tab))
         .collect();
     let fclaims: Vec<jagged::FrobeniusClaim<'_>> = claim_data
         .iter()
@@ -1673,6 +1762,12 @@ pub fn open_batch_merged<Ch: Challenger>(
         })
         .collect();
     let frobenius = jagged::prove_frobenius_assist(&params, &fclaims, &rho, challenger);
+    if trace {
+        eprintln!(
+            "  [open_merged] coeffs + frobenius assist: {:6.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
     debug_assert_eq!(
         frobenius.v, w_eval,
         "assist V must equal the folded weight MLE"
@@ -1685,8 +1780,9 @@ pub fn open_batch_merged<Ch: Challenger>(
     let pd = PackedDirectClaim {
         point: rho.clone(),
         value: q_eval,
-        eq_ind: DirectEqInd::Dense(crate::lincheck::build_eq_table(&rho)),
+        eq_ind: DirectEqInd::EqPoint(rho.clone()),
     };
+    let t = std::time::Instant::now();
     let inner = open_batch_mixed_ligerito_with_precomputed_s_hat_v(
         q,
         prover_data,
@@ -1699,6 +1795,16 @@ pub fn open_batch_merged<Ch: Challenger>(
         challenger,
     );
 
+    if trace {
+        eprintln!(
+            "  [open_merged] inner eq-basis open: {:6.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+        eprintln!(
+            "  [open_merged] TOTAL: {:6.2} ms",
+            t_total.elapsed().as_secs_f64() * 1e3
+        );
+    }
     drop(fclaims);
     drop(claim_data);
     MergedOpenProof {
