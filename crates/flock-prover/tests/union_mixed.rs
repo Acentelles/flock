@@ -1318,7 +1318,7 @@ fn merged_padding_unread_poison_pool() {
     let (registry, sha2_r1cs, blake3_r1cs) = mixed_registry(7);
     let s2_circuit = sha2_r1cs.csc_lincheck_circuit();
     let b3_circuit = blake3_r1cs.csc_lincheck_circuit();
-    for counts in [[50usize, 37], [8, 0]] {
+    for counts in [[50usize, 37], [8, 0], [128, 128], [128, 37]] {
         let union = UnionInstance::new(&registry, counts.to_vec());
         let pcs_params = union_pcs_params(&union);
         let mut rng = Rng::new(0x_D1_47_00 ^ counts[0] as u64);
