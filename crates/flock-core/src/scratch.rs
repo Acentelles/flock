@@ -52,21 +52,52 @@ pub fn take_f128(n: usize) -> Vec<F128> {
 /// supply an already-resident buffer).
 pub(crate) fn try_take_f128(n: usize) -> Option<Vec<F128>> {
     let mut pool = POOL.lock().unwrap();
+    // Prefer a buffer within a 4x capacity window; fall back to any fitting
+    // buffer. Per-take this is never worse than smallest-fitting alone: the
+    // fallback IS the old policy. Measured (attribution probe, controlled
+    // pairs): far-oversized idle buffers served small dense-domain requests
+    // several times slower than right-class cycling ones (the nu14 combine
+    // and nu18 Ligerito anomalies), while large requests still want the
+    // oversized-but-resident fallback over a fresh allocation.
     let mut best: Option<usize> = None;
+    let mut best_windowed: Option<usize> = None;
     for (i, v) in pool.iter().enumerate() {
-        if v.capacity() >= n && best.is_none_or(|b| v.capacity() < pool[b].capacity()) {
+        if v.capacity() < n {
+            continue;
+        }
+        if best.is_none_or(|b| v.capacity() < pool[b].capacity()) {
             best = Some(i);
         }
+        if v.capacity() < 4 * n.max(1)
+            && best_windowed.is_none_or(|b| v.capacity() < pool[b].capacity())
+        {
+            best_windowed = Some(i);
+        }
     }
+    let best = best_windowed.or(best);
     if let Some(i) = best {
         let mut v = pool.swap_remove(i);
         drop(pool);
+        if std::env::var_os("FLOCK_POOL_TRACE").is_some() {
+            eprintln!(
+                "      [pool] take_f128 n=2^{:.1} cap=2^{:.1} ({}x)",
+                (n as f64).log2(),
+                (v.capacity() as f64).log2(),
+                v.capacity() / n.max(1),
+            );
+        }
         v.clear();
         // SAFETY: capacity ≥ n was checked above; F128: Copy (no Drop), so
         // exposing uninit/stale elements is sound to *hold* — the caller
         // upholds write-before-read per this function's contract.
         unsafe { v.set_len(n) };
         return Some(v);
+    }
+    if std::env::var_os("FLOCK_POOL_TRACE").is_some() {
+        eprintln!(
+            "      [pool] take_f128 n=2^{:.1} MISS (fresh)",
+            (n as f64).log2()
+        );
     }
     None
 }
@@ -82,13 +113,26 @@ pub fn give_f128(v: Vec<F128>) {
     let mut pool = POOL.lock().unwrap();
     pool.push(v);
     if pool.len() > MAX_POOLED {
-        let smallest = pool
+        // Evict from the most-populated log2 size class (tie: the smallest
+        // buffer in it). Always-evict-smallest let a prewarmed set of large
+        // buffers permanently starve the actively-cycling smaller class —
+        // every give of the hot size evicted the buffer just given.
+        let class_of = |c: usize| usize::BITS - c.leading_zeros();
+        let mut counts = [0u32; 65];
+        for b in pool.iter() {
+            counts[class_of(b.capacity()) as usize] += 1;
+        }
+        let crowded = (0..counts.len())
+            .max_by_key(|&k| counts[k])
+            .expect("non-empty");
+        let victim = pool
             .iter()
             .enumerate()
-            .min_by_key(|(_, v)| v.capacity())
+            .filter(|(_, b)| class_of(b.capacity()) as usize == crowded)
+            .min_by_key(|(_, b)| b.capacity())
             .map(|(i, _)| i)
-            .expect("pool non-empty");
-        pool.swap_remove(smallest);
+            .expect("crowded class non-empty");
+        pool.swap_remove(victim);
     }
 }
 
