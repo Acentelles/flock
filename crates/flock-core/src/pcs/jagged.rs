@@ -1420,6 +1420,67 @@ fn frobenius_layer_pass(
     (u, buckets)
 }
 
+/// [`frobenius_layer_pass`] parallelized WITHIN the statement — column
+/// chunks with per-chunk bucket partials, XOR-reduced (value-identical
+/// reassociation). Used when the statement count is too small for the
+/// statement-chunked dispatch to occupy the pool (e.g. the multipoint
+/// protocol's K-statement anchor).
+fn frobenius_layer_pass_par(
+    st: &mut FrobeniusStatement,
+    layer: usize,
+    ch4: Option<&[F128; 4]>,
+    sparse: &[[[(usize, usize); 2]; 4]; 4],
+) -> ([[F128; 4]; 4], [[F128; 4]; 4]) {
+    use rayon::prelude::*;
+    let n_cols = st.cols.len();
+    let row = &st.sfx[(layer + 1) * n_cols..(layer + 2) * n_cols];
+    let buckets = st
+        .we
+        .par_chunks_mut(ASSIST_CHUNK)
+        .zip(st.cols.par_chunks(ASSIST_CHUNK))
+        .zip(row.par_chunks(ASSIST_CHUNK))
+        .map(|((wc, cc), rc)| {
+            let mut b = [[F128::ZERO; 4]; 4];
+            for ((w_e, &(_, t_c, t_next)), s) in wc.iter_mut().zip(cc).zip(rc) {
+                if let Some(ch4) = ch4 {
+                    let pl = layer - 1;
+                    let prev = ((t_c >> pl) & 1) as usize + 2 * ((t_next >> pl) & 1) as usize;
+                    *w_e *= ch4[prev];
+                }
+                let cd = ((t_c >> layer) & 1) as usize + 2 * ((t_next >> layer) & 1) as usize;
+                let v = *w_e;
+                let bk = &mut b[cd];
+                bk[0] += v * s[0];
+                bk[1] += v * s[1];
+                bk[2] += v * s[2];
+                bk[3] += v * s[3];
+            }
+            b
+        })
+        .reduce(
+            || [[F128::ZERO; 4]; 4],
+            |mut a, b| {
+                for (ar, br) in a.iter_mut().zip(&b) {
+                    for (x, y) in ar.iter_mut().zip(br) {
+                        *x += *y;
+                    }
+                }
+                a
+            },
+        );
+    let eq4 = &st.eq4s[layer];
+    let mut u = [[F128::ZERO; 4]; 4];
+    for (cd, uv) in u.iter_mut().enumerate() {
+        for (s, &bs) in st.prefix_row.iter().enumerate() {
+            let (i0, o0) = sparse[cd][s][0];
+            let (i1, o1) = sparse[cd][s][1];
+            uv[o0] += bs * eq4[i0];
+            uv[o1] += bs * eq4[i1];
+        }
+    }
+    (u, buckets)
+}
+
 /// Prover for the batched Frobenius assist. Same per-statement algebra as
 /// [`prove_assist`] (Lemma 4.6 streaming), with the round messages summed
 /// across statements — the sumcheck runs on the combined summand
@@ -1474,13 +1535,26 @@ pub fn prove_frobenius_assist<C: Challenger>(
         let mut per: Vec<([[F128; 4]; 4], [[F128; 4]; 4])> =
             vec![([[F128::ZERO; 4]; 4], [[F128::ZERO; 4]; 4]); sts.len()];
         let c4 = ch4.as_ref();
-        sts.par_chunks_mut(8)
-            .zip(per.par_chunks_mut(8))
-            .for_each(|(stc, oc)| {
-                for (st, o) in stc.iter_mut().zip(oc.iter_mut()) {
-                    *o = frobenius_layer_pass(st, layer, c4, &sparse);
-                }
-            });
+        let inner_par = sts.len() < 16
+            && sts
+                .first()
+                .is_some_and(|st| st.cols.len() >= 4 * ASSIST_CHUNK);
+        if inner_par {
+            // Few statements over many columns (the multipoint anchor's K):
+            // parallelize WITHIN each statement — same values,
+            // XOR-reassociated.
+            for (st, o) in sts.iter_mut().zip(per.iter_mut()) {
+                *o = frobenius_layer_pass_par(st, layer, c4, &sparse);
+            }
+        } else {
+            sts.par_chunks_mut(8)
+                .zip(per.par_chunks_mut(8))
+                .for_each(|(stc, oc)| {
+                    for (st, o) in stc.iter_mut().zip(oc.iter_mut()) {
+                        *o = frobenius_layer_pass(st, layer, c4, &sparse);
+                    }
+                });
+        }
 
         // c-round message, summed across statements.
         let mut g_one = F128::ZERO;
@@ -1563,10 +1637,25 @@ pub fn verify_frobenius_assist<C: Challenger>(
     }
 
     let sts = frobenius_statements(params, claims, rho, false);
+    // With few statements (the multipoint anchor's K), the statement-level
+    // parallelism below can't occupy the pool; parallelize the per-column
+    // `W(σ)` walk inside each statement instead (XOR-reassociated sums —
+    // value-identical).
+    let few_statements = sts.len() < 16;
+    let w_at = |cols: &[(F128, u64, u64)], sigma: &[F128]| -> F128 {
+        const PAR_CHUNK: usize = 1 << 10;
+        if !few_statements || cols.len() < 2 * PAR_CHUNK {
+            assist_w_at(cols, sigma, m)
+        } else {
+            cols.par_chunks(PAR_CHUNK)
+                .map(|cc| assist_w_at(cc, sigma, m))
+                .reduce(|| F128::ZERO, |a, b| a + b)
+        }
+    };
     let expect = sts
         .par_iter()
         .map(|st| {
-            let w = assist_w_at(&st.cols, &sigma, m);
+            let w = w_at(&st.cols, &sigma);
             let mut g = [F128::ZERO; 4];
             g[STATE_SUCCESS] = F128::ONE;
             let sparse = assist_sparse_transitions();
