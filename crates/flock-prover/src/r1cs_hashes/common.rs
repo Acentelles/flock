@@ -538,6 +538,7 @@ where
             z: &mut z,
             a: &mut a,
             b: &mut b,
+            pre_zeroed: false,
         },
         per_group,
     );
@@ -574,7 +575,12 @@ where
     let useful_words = useful_bits.div_ceil(64);
     let total_f128 = n_total * (u64_per_block / 2);
 
-    let SlotWitnessDest { z, a, b } = dst;
+    let SlotWitnessDest {
+        z,
+        a,
+        b,
+        pre_zeroed: _,
+    } = dst;
     for buf in [&*z, &*a, &*b] {
         assert_eq!(buf.len(), total_f128, "witness destination length");
     }
@@ -677,6 +683,7 @@ where
             z: &mut z,
             a: &mut a,
             b: &mut b,
+            pre_zeroed: false,
         },
         per_group,
     );
@@ -708,26 +715,40 @@ where
     let useful_words = useful_bits.div_ceil(64);
     let total_f128 = n_total * (u64_per_block / 2);
 
-    let SlotWitnessDest { z, a, b } = dst;
+    let SlotWitnessDest {
+        z,
+        a,
+        b,
+        pre_zeroed,
+    } = dst;
     for buf in [&*z, &*a, &*b] {
         assert_eq!(buf.len(), total_f128, "witness destination length");
     }
-    // Pooled (resident) stripe: `stripe_from_rows` writes rows
-    // `[0, useful_words)` of every group — including fully-dummy groups, which
-    // flush zeros — so only each group's TAIL rows need clearing, a few percent
-    // of the buffer instead of faulting in all of it.
-    let mut stripe = flock_core::scratch::take_u8(n_total * u64_per_block * 8);
-    stripe
-        .par_chunks_mut(u64_per_block * 64)
-        .for_each(|g| g[useful_words * 64..].fill(0));
-    // Zero the padding suffix (contiguous chunk-columns >= useful_chunks);
-    // the loop below fully writes the useful prefix — declared rows from the
-    // builders, dummy rows as zero flushes.
-    let tail = useful_chunks << n_blocks_log;
-    for buf in [&mut *z, &mut *a, &mut *b] {
-        buf[tail..]
-            .par_chunks_mut(1 << 16)
-            .for_each(|c| c.fill(F128::ZERO));
+    // A pre-zeroed destination gets a FRESH lazily-zeroed stripe and skips
+    // every zero-valued write: dummy groups, the padding suffix, and the
+    // stripe tails all stay untouched zero pages. Otherwise: pooled
+    // (resident) stripe — `stripe_from_rows` writes rows
+    // `[0, useful_words)` of every group — including fully-dummy groups,
+    // which flush zeros — so only each group's TAIL rows need clearing, a
+    // few percent of the buffer instead of faulting in all of it.
+    let mut stripe = if pre_zeroed {
+        vec![0u8; n_total * u64_per_block * 8]
+    } else {
+        flock_core::scratch::take_u8(n_total * u64_per_block * 8)
+    };
+    if !pre_zeroed {
+        stripe
+            .par_chunks_mut(u64_per_block * 64)
+            .for_each(|g| g[useful_words * 64..].fill(0));
+        // Zero the padding suffix (contiguous chunk-columns >=
+        // useful_chunks); the group loop fully writes the useful prefix —
+        // declared rows from the builders, dummy rows as zero flushes.
+        let tail = useful_chunks << n_blocks_log;
+        for buf in [&mut *z, &mut *a, &mut *b] {
+            buf[tail..]
+                .par_chunks_mut(1 << 16)
+                .for_each(|c| c.fill(F128::ZERO));
+        }
     }
 
     let (zp, ap, bp) = (
@@ -738,7 +759,15 @@ where
     let sp = SendPtr(stripe.as_ptr() as *mut u64);
     let inputs_ref = inputs;
 
-    (0..n_total / BM_V).into_par_iter().for_each_init(
+    // Pre-zeroed destinations skip all-dummy groups outright (their region
+    // is already zero); the trailing partial group still zero-flushes its
+    // dead lanes.
+    let n_groups = if pre_zeroed {
+        n_declared.div_ceil(BM_V)
+    } else {
+        n_total / BM_V
+    };
+    (0..n_groups).into_par_iter().for_each_init(
         || {
             (
                 vec![[0u64; BM_V]; u64_per_block],

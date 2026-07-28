@@ -102,6 +102,29 @@ pub(crate) fn alloc_uninit_f128_vec(n: usize) -> Vec<crate::field::F128> {
     alloc_uninit_vec::<crate::field::F128>(n)
 }
 
+/// A length-`n` all-zero vector from `alloc_zeroed` — LAZY zero pages from
+/// the OS for large allocations, so untouched regions cost nothing.
+/// (`vec![T::ZERO; n]` does NOT get this for custom structs: the zero-value
+/// specialization only fires for built-in types, so it eagerly memsets.)
+pub(crate) fn alloc_zeroed_vec<T: Copy>(n: usize) -> Vec<T> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let layout = std::alloc::Layout::array::<T>(n).expect("allocation size overflows");
+    // SAFETY:
+    // - `alloc_zeroed` returns `n * size_of::<T>()` zeroed bytes with the
+    //   layout's alignment (or null, handled below).
+    // - T: Copy (no Drop) and the all-zero bit pattern must be a valid T —
+    //   true for the plain-old-data field/word types this crate uses it for.
+    unsafe {
+        let ptr = std::alloc::alloc_zeroed(layout) as *mut T;
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        Vec::from_raw_parts(ptr, n, n)
+    }
+}
+
 /// Cached [`perf_core_count`]. The uncached version may spawn `sysctl`; this
 /// memoizes it so hot paths can cheaply ask "is the current rayon pool the
 /// homogeneous P-core pool?" (i.e. `current_num_threads() <= this`).

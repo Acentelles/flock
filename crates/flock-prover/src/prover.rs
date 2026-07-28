@@ -472,7 +472,7 @@ impl<'a> UnionSlotProverInput<'a> {
 fn build_union_witness(
     union: &flock_core::union::UnionInstance<'_>,
     sources: Vec<UnionSlotWitnessSource<'_>>,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<Vec<u8>>) {
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<Vec<u8>>, bool) {
     assert_eq!(
         sources.len(),
         union.registry().num_types(),
@@ -497,12 +497,12 @@ fn build_union_witness(
             }
         }
         let (z, a, b) = union.assemble_witness(witnesses);
-        return (z, a, b, stripes);
+        return (z, a, b, stripes, false);
     }
 
-    let (mut z, mut a, mut b) = union.take_witness_buffers();
+    let (mut z, mut a, mut b, pre_zeroed) = union.take_witness_buffers();
     let stripes = union
-        .slot_dests(&mut z, &mut a, &mut b)
+        .slot_dests(&mut z, &mut a, &mut b, pre_zeroed)
         .into_iter()
         .zip(sources)
         .map(|(dst, source)| match source {
@@ -518,7 +518,7 @@ fn build_union_witness(
             }
         })
         .collect();
-    (z, a, b, stripes)
+    (z, a, b, stripes, pre_zeroed)
 }
 
 /// Statement-binding selector for the union prove path. Private: the two
@@ -656,7 +656,8 @@ pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
         circuits.push(slot.lincheck_circuit);
     }
     let t = std::time::Instant::now();
-    let (z_packed, a_packed_f128, b_packed_f128, stripes) = build_union_witness(union, sources);
+    let (z_packed, a_packed_f128, b_packed_f128, stripes, pre_zeroed) =
+        build_union_witness(union, sources);
     let linchecks: Vec<(Vec<u8>, &dyn lincheck::LincheckCircuit)> =
         stripes.into_iter().zip(circuits).collect();
     if trace {
@@ -729,8 +730,10 @@ pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
         }
         out
     };
-    flock_core::scratch::give_f128(a_packed_f128);
-    flock_core::scratch::give_f128(b_packed_f128);
+    if !pre_zeroed {
+        flock_core::scratch::give_f128(a_packed_f128);
+        flock_core::scratch::give_f128(b_packed_f128);
+    }
 
     let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
     let t = std::time::Instant::now();
@@ -745,7 +748,9 @@ pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
         lincheck::prove_union_capture_z_vec(union, &lc_slots, &x_ab, challenger)
     };
     for (stripe, _) in linchecks {
-        flock_core::scratch::give_u8(stripe);
+        if !pre_zeroed {
+            flock_core::scratch::give_u8(stripe);
+        }
     }
     if trace {
         eprintln!(
@@ -792,7 +797,9 @@ pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
         &lig_config,
         challenger,
     );
-    flock_core::scratch::give_f128(z_packed);
+    if !pre_zeroed {
+        flock_core::scratch::give_f128(z_packed);
+    }
 
     let proof = flock_core::proof::R1csProofMergedLigerito {
         zerocheck: zc_proof,
@@ -846,7 +853,8 @@ fn prove_union_with_binding<Ch: Challenger>(
         sources.push(slot.source);
         circuits.push(slot.lincheck_circuit);
     }
-    let (z_packed, a_packed_f128, b_packed_f128, stripes) = build_union_witness(union, sources);
+    let (z_packed, a_packed_f128, b_packed_f128, stripes, pre_zeroed) =
+        build_union_witness(union, sources);
     let linchecks: Vec<(Vec<u8>, &dyn lincheck::LincheckCircuit)> =
         stripes.into_iter().zip(circuits).collect();
 
@@ -911,8 +919,10 @@ fn prove_union_with_binding<Ch: Challenger>(
         )
     };
     // a/b are consumed; recycle the buffers as in `prove_fast_core`.
-    flock_core::scratch::give_f128(a_packed_f128);
-    flock_core::scratch::give_f128(b_packed_f128);
+    if !pre_zeroed {
+        flock_core::scratch::give_f128(a_packed_f128);
+        flock_core::scratch::give_f128(b_packed_f128);
+    }
 
     let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
 
@@ -933,7 +943,9 @@ fn prove_union_with_binding<Ch: Challenger>(
     // Recycle the stripes (as large as the witness itself) rather than
     // unmapping them — the drivers take them from the same pool.
     for (stripe, _) in linchecks {
-        flock_core::scratch::give_u8(stripe);
+        if !pre_zeroed {
+            flock_core::scratch::give_u8(stripe);
+        }
     }
 
     let ab = ZClaim {
@@ -1351,7 +1363,8 @@ pub fn prove_fast_ligerito_jagged_union_timed<Ch: Challenger>(
         sources.push(slot.source);
         circuits.push(slot.lincheck_circuit);
     }
-    let (z_packed, a_packed_f128, b_packed_f128, stripes) = build_union_witness(union, sources);
+    let (z_packed, a_packed_f128, b_packed_f128, stripes, pre_zeroed) =
+        build_union_witness(union, sources);
     let linchecks: Vec<(Vec<u8>, &dyn lincheck::LincheckCircuit)> =
         stripes.into_iter().zip(circuits).collect();
     t.witness_place_s = t0.elapsed().as_secs_f64();
@@ -1403,8 +1416,10 @@ pub fn prove_fast_ligerito_jagged_union_timed<Ch: Challenger>(
         )
     };
     t.zerocheck_s = t0.elapsed().as_secs_f64();
-    flock_core::scratch::give_f128(a_packed_f128);
-    flock_core::scratch::give_f128(b_packed_f128);
+    if !pre_zeroed {
+        flock_core::scratch::give_f128(a_packed_f128);
+        flock_core::scratch::give_f128(b_packed_f128);
+    }
 
     let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
 
@@ -1423,7 +1438,9 @@ pub fn prove_fast_ligerito_jagged_union_timed<Ch: Challenger>(
     // Recycle the stripes (as large as the witness itself) rather than
     // unmapping them — the drivers take them from the same pool.
     for (stripe, _) in linchecks {
-        flock_core::scratch::give_u8(stripe);
+        if !pre_zeroed {
+            flock_core::scratch::give_u8(stripe);
+        }
     }
 
     let ab = ZClaim {

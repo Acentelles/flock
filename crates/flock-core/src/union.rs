@@ -530,8 +530,25 @@ impl<'r> UnionInstance<'r> {
     /// written as zeros), so after [`Self::slot_dests`] + generation the
     /// buffers hold exactly what [`Self::assemble_witness`] would have
     /// scattered.
-    pub fn take_witness_buffers(&self) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+    /// The returned flag is `pre_zeroed`: when padding dominates (capacity
+    /// at least twice the declared dense area), the buffers are FRESH
+    /// lazily-zeroed allocations — untouched padding pages cost nothing —
+    /// and the drivers skip every dummy-region write. Pooled (dirty)
+    /// buffers would instead force a memset of the whole padding, which at
+    /// deep over-capacity dwarfs the prove itself. Callers must NOT return
+    /// `pre_zeroed` buffers to the scratch pool: they would come back
+    /// dirty (re-imposing the memset) and crowd the pool with
+    /// capacity-sized allocations.
+    pub fn take_witness_buffers(&self) -> (Vec<F128>, Vec<F128>, Vec<F128>, bool) {
         let len = self.packed_len();
+        if self.dense_words() * 2 <= len {
+            return (
+                crate::alloc_zeroed_vec(len),
+                crate::alloc_zeroed_vec(len),
+                crate::alloc_zeroed_vec(len),
+                true,
+            );
+        }
         let mut bufs = [
             crate::scratch::take_f128(len),
             crate::scratch::take_f128(len),
@@ -541,7 +558,7 @@ impl<'r> UnionInstance<'r> {
             self.zero_gaps(buf);
         }
         let [z, a, b] = bufs;
-        (z, a, b)
+        (z, a, b, false)
     }
 
     /// A fully zeroed padded union buffer from the scratch pool — resident
@@ -585,6 +602,7 @@ impl<'r> UnionInstance<'r> {
         z: &'d mut [F128],
         a: &'d mut [F128],
         b: &'d mut [F128],
+        pre_zeroed: bool,
     ) -> Vec<SlotWitnessDest<'d>> {
         for buf in [&*z, &*a, &*b] {
             assert_eq!(buf.len(), self.packed_len(), "padded buffer length");
@@ -606,6 +624,7 @@ impl<'r> UnionInstance<'r> {
                 z: carve(&mut zr, skip, words),
                 a: carve(&mut ar, skip, words),
                 b: carve(&mut br, skip, words),
+                pre_zeroed,
             });
             cursor = range.end;
         }
@@ -793,6 +812,11 @@ pub struct SlotWitnessDest<'d> {
     pub z: &'d mut [F128],
     pub a: &'d mut [F128],
     pub b: &'d mut [F128],
+    /// The destination (and the driver's stripe sourcing) is guaranteed
+    /// all-zero on entry: the driver may skip every write whose value is
+    /// zero (dummy groups, padding suffix, stripe tails). See
+    /// [`UnionInstance::take_witness_buffers`].
+    pub pre_zeroed: bool,
 }
 
 #[cfg(test)]
@@ -1198,7 +1222,7 @@ mod tests {
             union.zero_gaps(buf);
         }
         for (d, w) in union
-            .slot_dests(&mut z, &mut a, &mut b)
+            .slot_dests(&mut z, &mut a, &mut b, false)
             .into_iter()
             .zip([&slot_a, &slot_b])
         {
