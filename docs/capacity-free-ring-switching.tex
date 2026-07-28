@@ -302,6 +302,96 @@ Our instantiation has $K = 2$ (the two evaluation claims a PIOP leaves
 on the committed witness), hence $256$ statements in one sumcheck.
 \end{remark}
 
+\section{Scaling in the number of columns: a multipoint
+protocol}\label{sec:multipoint}
+
+The batched assist walks the boundary program once per statement:
+prover time $O(128\,K \cdot \mathrm{cols} \cdot m)$ and, for the
+round streaming, suffix state of the same size. At hundreds of columns
+this is a few milliseconds; a registry with tens of thousands of
+columns pays hundreds of milliseconds and gigabytes. The
+$128\times$ factor is \emph{not} inherent to the verifier's goal: by
+Remark~\ref{rem:dual} the statements are evaluations of the single
+untwisted $\fjag$, and only their $c$-combination $V$ is consumed. The
+missing piece is an asymmetry:
+
+\begin{lemma}\label{lem:twisted-eq}
+Fix $\rho$ and weights $\gamma_j \in \F$, and let
+$g : \{0,1\}^m \to \F$, $g_d = \sum_j \gamma_j\,
+\eq(\rho, d)^{2^{-j}}$. Then for every $x \in \F^m$,
+\[
+  \hat g(x)
+  \;=\;
+  \sum_j \gamma_j \prod_{i=1}^{m}
+  \Bigl(x_i\,\rho_i^{2^{-j}} + (1{-}x_i)\bigl(1{-}\rho_i^{2^{-j}}\bigr)\Bigr).
+\]
+\end{lemma}
+
+\begin{proof}
+$\eq(\rho,d)^{2^{-j}} = \eq(\rho^{2^{-j}}, d)$ at Boolean $d$
+(Lemma~\ref{lem:transport} in the $\rho$-slot, inverted), and
+$\sum_{d} \eq(x,d)\,\eq(y,d) = \prod_i (x_i y_i +
+(1{-}x_i)(1{-}y_i))$ coordinate-wise.
+\end{proof}
+
+The twisted \emph{jagged} weight has no such closed form --- that is
+the whole subject of this note --- but the twisted \emph{eq} vector
+collapses. This yields a protocol whose only per-column proof work is
+one untwisted assist. For clarity take $K = 1$ and all $c_j \ne 0$;
+write $a_d = \eq(z_{\mathrm r}, \rowof(d))\,\eq(z_{\mathrm c},
+\colof(d))$ for the untwisted weight vector.
+
+\begin{enumerate}[nosep]
+\item The prover sends $A_j := \fjag(z_{\mathrm r}, z_{\mathrm c},
+  \rho^{2^{-j}})$ for $j = 0, \dots, 127$. The verifier computes
+  $V = \sum_j c_j A_j^{2^j}$ (Remark~\ref{rem:dual}) and uses it as
+  $\widehat W(\rho)$ in the product check.
+\item The verifier sends $\gamma$; both parties form the claim
+  $\sum_d a_d\, g_d = \sum_j \gamma^j A_j$ with
+  $g_d = \sum_j \gamma^j \eq(\rho,d)^{2^{-j}}$. The map $x \mapsto
+  \sum_j \gamma^j x^{2^{-j}}$ is $\Ftwo$-linear, so the prover
+  materializes $g$ in one byte-table pass over the dense domain; $a$
+  is one further dense pass (no fold map at all).
+\item One ordinary $m$-round product sumcheck for this claim, ending
+  at $\rho''$ with running claim $\hat a(\rho'')\,\hat g(\rho'')$.
+\item The verifier evaluates $\hat g(\rho'')$ by
+  Lemma~\ref{lem:twisted-eq} ($O(128\,m)$ multiplies) and discharges
+  $\hat a(\rho'') = \fjag(z_{\mathrm r}, z_{\mathrm c}, \rho'')$ with
+  \emph{one} untwisted assist.
+\end{enumerate}
+
+Soundness composes from standard pieces: $\gamma$ arrives after the
+$A_j$, so a false value falsifies the $\gamma$-combination except with
+probability $127/|\F|$ (a nonzero polynomial in $\gamma$); the
+sumcheck then binds the combination to the honest $\hat a$, anchored
+by the assist at $\rho''$ --- $a$ itself is never committed, the
+assist playing the virtual-opening role. $K$ claims run in the same
+sumcheck: with value weights $\gamma^{128 i + j}$, the per-claim
+weight vectors coincide up to the scalar $\gamma^{128 i}$, so the
+combined summand is $(\sum_i \gamma^{128 i} a_{i,d})\cdot g_d$ ---
+still one product of two dense vectors --- and the anchor is one
+$K$-statement untwisted assist with deterministic weights
+$\gamma^{128 i}$ (sound as in \S\ref{sec:protocol}: only the combined
+scalar is consumed).
+
+Prover cost: two dense passes, one $m$-round sumcheck, one untwisted
+assist, plus \emph{computing} the $128 K$ values --- a pure
+computation with no protocol coupling, $O(128\,K \cdot \mathrm{cols}
+\cdot m)$ naively and open to per-column incremental evaluation along
+the boundary stride. The suffix-state footprint of the batched assist
+disappears entirely. At small column counts the batched assist of
+\S\ref{sec:protocol} remains cheaper (the dense passes dominate);
+the crossover is on the order of a thousand columns, past which this
+protocol's proof work is column-independent except for the single
+assist. A prototype confirms the shape ($m = 23$, $K = 2$, Apple
+silicon; exact-value tests against the brute-force twisted weight):
+the proof machinery holds flat at ${\approx}18$--$28$\,ms across
+$368 / 4096 / 32768$ columns (dense passes $+$ sumcheck $+$ anchor,
+unoptimized relative to the production fold kernels), while computing
+the sent values measures $2.5 / 15 / 142$\,ms --- now the sole
+column-linear term. The batched assist measures $5.5$\,ms at $368$
+columns and is memory-infeasible past a few thousand.
+
 \section{Implementation}\label{sec:eval}
 
 The construction is implemented in the Flock proof system (batch-hash

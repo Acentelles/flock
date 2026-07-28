@@ -1634,6 +1634,483 @@ pub fn verify_with_assist<C: Challenger>(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Multipoint twisted evaluation — PROTOTYPE (research note §"Scaling in the
+// number of columns"). Replaces the batched Frobenius assist's 128·K
+// boundary-DP statements with: the prover SENDS the 128·K dual-form values
+// A_{i,j} = f̂_jag(z_i, ρ^{2^-j}) (Remark "dual form"), the verifier
+// recombines V = Σ c_{i,j}·A_{i,j}^{2^j} itself, and the values are bound by
+// ONE γ-batched product sumcheck over the dense domain against the twisted-eq
+// weight g_d = Σ_j γ^j·eq(ρ,d)^{2^-j} — whose MLE the verifier evaluates in
+// closed form (twisted EQ collapses by the tensor identity; twisted JAGGED
+// does not) — anchored by ONE untwisted assist at the endpoint. Per-column
+// proof work drops 128K× → 1×; the suffix-state footprint disappears; what
+// remains column-linear is only COMPUTING the sent values (a pure
+// computation, no protocol coupling).
+// ---------------------------------------------------------------------------
+
+/// Images of the `F₂`-basis under square root (`x ↦ x^{2^127}`, the inverse
+/// Frobenius) — square root is `F₂`-linear, so this table defines the map.
+fn sqrt_basis() -> &'static [F128; 128] {
+    static T: std::sync::OnceLock<[F128; 128]> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mut t = [F128::ZERO; 128];
+        for (b, slot) in t.iter_mut().enumerate() {
+            let mut x = if b < 64 {
+                F128::new(1u64 << b, 0)
+            } else {
+                F128::new(0, 1u64 << (b - 64))
+            };
+            for _ in 0..127 {
+                x = x * x;
+            }
+            *slot = x;
+        }
+        t
+    })
+}
+
+/// `x^{2^{-1}}` via the basis-image table.
+fn frob_inv(x: F128) -> F128 {
+    let t = sqrt_basis();
+    let mut acc = F128::ZERO;
+    let mut lo = x.lo;
+    while lo != 0 {
+        acc += t[lo.trailing_zeros() as usize];
+        lo &= lo - 1;
+    }
+    let mut hi = x.hi;
+    while hi != 0 {
+        acc += t[64 + hi.trailing_zeros() as usize];
+        hi &= hi - 1;
+    }
+    acc
+}
+
+/// `ρ^{2^{-j}}` for `j = 0..128`: coordinate-wise inverse-Frobenius chains.
+fn rho_inverse_powers(rho: &[F128]) -> Vec<Vec<F128>> {
+    let mut out: Vec<Vec<F128>> = Vec::with_capacity(128);
+    out.push(rho.to_vec());
+    for j in 1..128 {
+        let prev: Vec<F128> = out[j - 1].iter().map(|&x| frob_inv(x)).collect();
+        out.push(prev);
+    }
+    out
+}
+
+/// Basis images of `x ↦ x^{2^{-j}}` for every `j` (level 0 = identity).
+fn inv_frob_basis() -> &'static Vec<[F128; 128]> {
+    static T: std::sync::OnceLock<Vec<[F128; 128]>> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mut levels: Vec<[F128; 128]> = Vec::with_capacity(128);
+        let mut cur = [F128::ZERO; 128];
+        for (b, slot) in cur.iter_mut().enumerate() {
+            *slot = if b < 64 {
+                F128::new(1u64 << b, 0)
+            } else {
+                F128::new(0, 1u64 << (b - 64))
+            };
+        }
+        levels.push(cur);
+        for j in 1..128 {
+            let mut nxt = [F128::ZERO; 128];
+            for b in 0..128 {
+                nxt[b] = frob_inv(levels[j - 1][b]);
+            }
+            levels.push(nxt);
+        }
+        levels
+    })
+}
+
+/// 16 byte-tables applying an `F₂`-linear map given its basis images (the
+/// `fold_one_slot` pattern: 16 lookups + XORs per word).
+fn linear_byte_tables(images: &[F128; 128]) -> Vec<[F128; 256]> {
+    let mut tables = vec![[F128::ZERO; 256]; 16];
+    for (k, table) in tables.iter_mut().enumerate() {
+        for v in 1usize..256 {
+            let low = v & v.wrapping_neg();
+            table[v] = table[v ^ low] + images[8 * k + low.trailing_zeros() as usize];
+        }
+    }
+    tables
+}
+
+#[inline]
+fn apply_linear_tables(tables: &[[F128; 256]], x: F128) -> F128 {
+    let mut acc = F128::ZERO;
+    for k in 0..8 {
+        acc += tables[k][((x.lo >> (8 * k)) & 0xFF) as usize];
+        acc += tables[8 + k][((x.hi >> (8 * k)) & 0xFF) as usize];
+    }
+    acc
+}
+
+/// All columns' full BP values `ĝ(y)` at `(z_row, z_index)`: the suffix DP of
+/// [`assist_suffix_rows`] with a two-row rolling window — same 8 multiplies
+/// per column per layer, NO per-layer storage (only the final row survives).
+fn assist_g_values(
+    cols: &[(F128, u64, u64)],
+    eq4s: &[[F128; 4]],
+    sparse: &[[[(usize, usize); 2]; 4]; 4],
+    m: usize,
+) -> Vec<F128> {
+    let n_cols = cols.len();
+    let mut cur = vec![[F128::ZERO; 4]; n_cols];
+    for v in cur.iter_mut() {
+        v[STATE_SUCCESS] = F128::ONE;
+    }
+    let mut next = vec![[F128::ZERO; 4]; n_cols];
+    for layer in (0..=m).rev() {
+        let eq4 = &eq4s[layer];
+        for ((dv, sv), &(_, t_c, t_next)) in next.iter_mut().zip(&cur).zip(cols) {
+            let cd = ((t_c >> layer) & 1) as usize + 2 * ((t_next >> layer) & 1) as usize;
+            let rows_cd = &sparse[cd];
+            for (s, slot) in dv.iter_mut().enumerate() {
+                let (i0, o0) = rows_cd[s][0];
+                let (i1, o1) = rows_cd[s][1];
+                *slot = eq4[i0] * sv[o0] + eq4[i1] * sv[o1];
+            }
+        }
+        std::mem::swap(&mut cur, &mut next);
+    }
+    cur.iter().map(|v| v[STATE_INITIAL]).collect()
+}
+
+/// The 128 dual-form values per claim: `A_j = f̂_jag(z_r, z_c, ρ^{2^{-j}})` —
+/// z-points UNpowered (the dual form), so the column weights are shared
+/// across `j`; only the ρ-slot of the transition weights varies. Pure
+/// computation (no transcript interaction) — parallel over `j`.
+fn multipoint_values(
+    params: &JaggedParams,
+    claims: &[FrobeniusClaim<'_>],
+    rho_pows: &[Vec<F128>],
+) -> Vec<Vec<F128>> {
+    use rayon::prelude::*;
+    let m = params.m;
+    let sparse = assist_sparse_transitions();
+    claims
+        .iter()
+        .map(|claim| {
+            let cols = assist_columns(params, claim.z_col);
+            (0..128usize)
+                .into_par_iter()
+                .map(|j| {
+                    let rj = &rho_pows[j];
+                    let eq4s: Vec<[F128; 4]> = (0..=m)
+                        .map(|layer| {
+                            let t = build_eq_table(&[
+                                point_bit(claim.z_row, layer),
+                                point_bit(rj, layer),
+                            ]);
+                            [t[0], t[1], t[2], t[3]]
+                        })
+                        .collect();
+                    let g = assist_g_values(&cols, &eq4s, &sparse, m);
+                    cols.iter()
+                        .zip(&g)
+                        .map(|(&(w, _, _), &gv)| w * gv)
+                        .fold(F128::ZERO, |a, x| a + x)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// The γ-combined untwisted weight vector `ā_d = Σ_i γ^{128 i}·
+/// eq(z_{i,r}, row(d))·eq(z_{i,c}, col(d))`, zero past the area — segmented
+/// parallel fill from the prefix sums.
+fn build_combined_weight(
+    params: &JaggedParams,
+    claims: &[FrobeniusClaim<'_>],
+    gpow: &[F128],
+) -> Vec<F128> {
+    use rayon::prelude::*;
+    let mut a = vec![F128::ZERO; 1usize << params.m];
+    let pfx = &params.col_prefix_sums;
+    let n_cols = pfx.len() - 1;
+    for (i, claim) in claims.iter().enumerate() {
+        let scale = gpow[128 * i];
+        let eq_r = build_eq_table(claim.z_row);
+        let eq_c = build_eq_table(claim.z_col);
+        const CH: usize = 1 << 14;
+        a.par_chunks_mut(CH).enumerate().for_each(|(ci, chunk)| {
+            let start = (ci * CH) as u64;
+            let end = start + chunk.len() as u64;
+            let mut y = pfx.partition_point(|&t| t <= start).saturating_sub(1);
+            let mut d = start;
+            while d < end && y < n_cols {
+                let (t_c, t_next) = (pfx[y], pfx[y + 1]);
+                if t_next <= d {
+                    y += 1;
+                    continue;
+                }
+                let w = scale * eq_c[y];
+                let stop = end.min(t_next);
+                for dd in d..stop {
+                    chunk[(dd - start) as usize] += w * eq_r[(dd - t_c) as usize];
+                }
+                d = stop;
+            }
+        });
+    }
+    a
+}
+
+/// Transcript of the multipoint twisted evaluation: the `128·K` dual-form
+/// values, the `m` dense-domain product-sumcheck rounds, and the endpoint's
+/// untwisted anchor assist.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MultipointTwistedProof {
+    pub values: Vec<Vec<F128>>,
+    pub rounds: Vec<(F128, F128)>,
+    pub anchor: FrobeniusAssistProof,
+}
+
+/// Prover for the multipoint twisted evaluation. Same statement as
+/// [`prove_frobenius_assist`] (the claims' `coeffs` define each `Φ_i`); the
+/// verifier's [`verify_multipoint_twisted`] returns the verified
+/// `V = Σ_{i,j} c_{i,j}·A_{i,j}^{2^j} = Ŵ(ρ)`.
+pub fn prove_multipoint_twisted<C: Challenger>(
+    params: &JaggedParams,
+    claims: &[FrobeniusClaim<'_>],
+    rho: &[F128],
+    challenger: &mut C,
+) -> MultipointTwistedProof {
+    use rayon::prelude::*;
+    let m = params.m;
+    assert_eq!(rho.len(), m);
+    for claim in claims {
+        assert_eq!(claim.coeffs.len(), 128);
+    }
+    let trace = std::env::var("PCS_TRACE").is_ok();
+
+    let t = std::time::Instant::now();
+    let rho_pows = rho_inverse_powers(rho);
+    let values = multipoint_values(params, claims, &rho_pows);
+    if trace {
+        eprintln!(
+            "    [multipoint] {} values (compute): {:6.2} ms",
+            128 * claims.len(),
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
+    challenger.observe_label(b"flock-multipoint-twisted-v0");
+    for vs in &values {
+        for &v in vs {
+            challenger.observe_f128(v);
+        }
+    }
+    let gamma = challenger.sample_f128();
+    let mut gpow = Vec::with_capacity(128 * claims.len());
+    let mut p = F128::ONE;
+    for _ in 0..128 * claims.len() {
+        gpow.push(p);
+        p *= gamma;
+    }
+
+    // The two dense vectors: g = L_γ(eq(ρ,·)) via one byte-table pass, and
+    // the γ-combined untwisted weight ā.
+    let t = std::time::Instant::now();
+    let eq_rho = super::ring_switch::build_eq_parallel(rho);
+    let basis = inv_frob_basis();
+    let mut images = [F128::ZERO; 128];
+    for j in 0..128 {
+        for (b, img) in images.iter_mut().enumerate() {
+            *img += gpow[j] * basis[j][b];
+        }
+    }
+    let tables = linear_byte_tables(&images);
+    let g_vec: Vec<F128> = eq_rho
+        .par_iter()
+        .map(|&e| apply_linear_tables(&tables, e))
+        .collect();
+    drop(eq_rho);
+    let a_vec = build_combined_weight(params, claims, &gpow);
+    if trace {
+        eprintln!(
+            "    [multipoint] g + a dense passes (2^{m}): {:6.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
+    // The m-round product sumcheck for Σ_d ā_d·g_d, low bit first.
+    let t = std::time::Instant::now();
+    let mut av = a_vec;
+    let mut gv = g_vec;
+    let mut rounds = Vec::with_capacity(m);
+    let mut point = Vec::with_capacity(m);
+    for _ in 0..m {
+        const CH: usize = 1 << 13;
+        let (g_one, g_inf) = av
+            .par_chunks(2 * CH)
+            .zip(gv.par_chunks(2 * CH))
+            .map(|(ac, gc)| {
+                let mut p1 = F128::ZERO;
+                let mut pi = F128::ZERO;
+                for (ap, gp) in ac.chunks_exact(2).zip(gc.chunks_exact(2)) {
+                    p1 += ap[1] * gp[1];
+                    pi += (ap[0] + ap[1]) * (gp[0] + gp[1]);
+                }
+                (p1, pi)
+            })
+            .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1));
+        challenger.observe_f128(g_one);
+        challenger.observe_f128(g_inf);
+        let r = challenger.sample_f128();
+        rounds.push((g_one, g_inf));
+        point.push(r);
+        av = av
+            .par_chunks(2)
+            .with_min_len(1 << 12)
+            .map(|p| p[0] + r * (p[0] + p[1]))
+            .collect();
+        gv = gv
+            .par_chunks(2)
+            .with_min_len(1 << 12)
+            .map(|p| p[0] + r * (p[0] + p[1]))
+            .collect();
+    }
+    if trace {
+        eprintln!(
+            "    [multipoint] product sumcheck ({m} rounds): {:6.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
+    // Anchor: ONE untwisted batched assist for ā̂(ρ'') = Σ_i γ^{128 i}·
+    // f̂_jag(z_i, ρ'') — identity-twist claims with deterministic weights.
+    let t = std::time::Instant::now();
+    let anchor_coeffs: Vec<Vec<F128>> = (0..claims.len())
+        .map(|i| {
+            let mut c = vec![F128::ZERO; 128];
+            c[0] = gpow[128 * i];
+            c
+        })
+        .collect();
+    let anchor_claims: Vec<FrobeniusClaim<'_>> = claims
+        .iter()
+        .zip(&anchor_coeffs)
+        .map(|(cl, co)| FrobeniusClaim {
+            z_row: cl.z_row,
+            z_col: cl.z_col,
+            coeffs: co,
+        })
+        .collect();
+    let anchor = prove_frobenius_assist(params, &anchor_claims, &point, challenger);
+    if trace {
+        eprintln!(
+            "    [multipoint] anchor assist (x{}): {:6.2} ms",
+            claims.len(),
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    MultipointTwistedProof {
+        values,
+        rounds,
+        anchor,
+    }
+}
+
+/// Verifier for the multipoint twisted evaluation. On success returns the
+/// verified `V = Σ_{i,j} c_{i,j}·A_{i,j}^{2^j} = Ŵ(ρ)`.
+pub fn verify_multipoint_twisted<C: Challenger>(
+    params: &JaggedParams,
+    claims: &[FrobeniusClaim<'_>],
+    rho: &[F128],
+    proof: &MultipointTwistedProof,
+    challenger: &mut C,
+) -> Option<F128> {
+    let m = params.m;
+    if proof.values.len() != claims.len() || proof.rounds.len() != m {
+        return None;
+    }
+    if proof.values.iter().any(|vs| vs.len() != 128) {
+        return None;
+    }
+    challenger.observe_label(b"flock-multipoint-twisted-v0");
+    for vs in &proof.values {
+        for &v in vs {
+            challenger.observe_f128(v);
+        }
+    }
+    let gamma = challenger.sample_f128();
+    let mut gpow = Vec::with_capacity(128 * claims.len());
+    let mut p = F128::ONE;
+    for _ in 0..128 * claims.len() {
+        gpow.push(p);
+        p *= gamma;
+    }
+
+    // Sumcheck target from the claimed values; replay the rounds.
+    let mut running = F128::ZERO;
+    for (i, vs) in proof.values.iter().enumerate() {
+        for (j, &v) in vs.iter().enumerate() {
+            running += gpow[128 * i + j] * v;
+        }
+    }
+    let mut point = Vec::with_capacity(m);
+    for &(g_one, g_inf) in &proof.rounds {
+        challenger.observe_f128(g_one);
+        challenger.observe_f128(g_inf);
+        let r = challenger.sample_f128();
+        running = fold_round_claim(running, g_one, g_inf, r);
+        point.push(r);
+    }
+
+    // ĝ(ρ'') in closed form (Lemma "twisted eq"): Σ_j γ^j Π_i (x_i·ρ_{j,i} +
+    // (1+x_i)(1+ρ_{j,i})).
+    let rho_pows = rho_inverse_powers(rho);
+    let mut g_at = F128::ZERO;
+    for (j, rj) in rho_pows.iter().enumerate() {
+        let mut prod = gpow[j];
+        for (i, &x) in point.iter().enumerate() {
+            let y = rj[i];
+            prod *= x * y + (F128::ONE + x) * (F128::ONE + y);
+        }
+        g_at += prod;
+    }
+
+    // Anchor assist binds ā̂(ρ'').
+    let anchor_coeffs: Vec<Vec<F128>> = (0..claims.len())
+        .map(|i| {
+            let mut c = vec![F128::ZERO; 128];
+            c[0] = gpow[128 * i];
+            c
+        })
+        .collect();
+    let anchor_claims: Vec<FrobeniusClaim<'_>> = claims
+        .iter()
+        .zip(&anchor_coeffs)
+        .map(|(cl, co)| FrobeniusClaim {
+            z_row: cl.z_row,
+            z_col: cl.z_col,
+            coeffs: co,
+        })
+        .collect();
+    let a_at = verify_frobenius_assist(params, &anchor_claims, &point, &proof.anchor, challenger)?;
+    if running != a_at * g_at {
+        return None;
+    }
+
+    // Recombine the verified values: V = Σ_{i,j} c_{i,j}·A_{i,j}^{2^j}.
+    let mut total = F128::ZERO;
+    for (claim, vs) in claims.iter().zip(&proof.values) {
+        for (j, (&c, &v)) in claim.coeffs.iter().zip(vs).enumerate() {
+            if c.is_zero() {
+                continue;
+            }
+            let mut x = v;
+            for _ in 0..j {
+                x = x * x;
+            }
+            total += c * x;
+        }
+    }
+    Some(total)
+}
+
 /// Reduce the running sumcheck claim through one round. The degree-2 round
 /// polynomial `G` is given by `G(1) = g_one`, leading coeff `G(∞) = g_inf`, and
 /// `G(0) = claim + G(1)` (since `claim = G(0) + G(1)`). Returns `G(r)`.
@@ -2308,6 +2785,148 @@ mod tests {
             std::hint::black_box(proof);
         }
         println!("frobenius assist prove (256 stmts, 368 cols, m = 23): {best:.2} ms (min of 12)");
+    }
+
+    /// The multipoint twisted evaluation returns the brute-force twisted
+    /// weight Ŵ(ρ) — across jagged shapes, two claims, zero coefficients —
+    /// and rejects a tampered value.
+    #[test]
+    fn multipoint_twisted_matches_bruteforce() {
+        let mut ch = RandomChallenger::new(0x4D50_7715);
+        for &(n, k, m) in &[(3usize, 2usize, 5usize), (4, 3, 7), (2, 4, 6)] {
+            for rep in 0..3 {
+                let (params, _q) = random_instance(&mut ch, n, k, m);
+                let z1r = sample_vec(&mut ch, n);
+                let z1c = sample_vec(&mut ch, k);
+                let z2r = sample_vec(&mut ch, n);
+                let z2c = sample_vec(&mut ch, k);
+                let mut c1 = sample_vec(&mut ch, 128);
+                let mut c2 = sample_vec(&mut ch, 128);
+                c1[7] = F128::ZERO; // zero coefficients are skipped
+                c2[100] = F128::ZERO;
+                let rho = sample_vec(&mut ch, m);
+                let claims = [
+                    FrobeniusClaim {
+                        z_row: &z1r,
+                        z_col: &z1c,
+                        coeffs: &c1,
+                    },
+                    FrobeniusClaim {
+                        z_row: &z2r,
+                        z_col: &z2c,
+                        coeffs: &c2,
+                    },
+                ];
+                let mut chp = FsChallenger::new(b"multipoint-test");
+                let proof = prove_multipoint_twisted(&params, &claims, &rho, &mut chp);
+                let mut chv = FsChallenger::new(b"multipoint-test");
+                let v = verify_multipoint_twisted(&params, &claims, &rho, &proof, &mut chv)
+                    .expect("honest multipoint proof verifies");
+
+                // Brute force: Ŵ(ρ) = Σ_d eq(ρ,d)·Σ_i Φ_i(a_{i,d}).
+                let eq_idx = build_eq_table(&rho);
+                let sides = [
+                    (build_eq_table(&z1r), build_eq_table(&z1c), &c1),
+                    (build_eq_table(&z2r), build_eq_table(&z2c), &c2),
+                ];
+                let mut expect = F128::ZERO;
+                for e in 0..params.area() {
+                    let (row, col) = params.unrank(e);
+                    for (eq_r, eq_c, cs) in &sides {
+                        let mut x = eq_r[row] * eq_c[col];
+                        for &cj in cs.iter() {
+                            if !cj.is_zero() {
+                                expect += eq_idx[e as usize] * cj * x;
+                            }
+                            x = x * x;
+                        }
+                    }
+                }
+                assert_eq!(v, expect, "n={n} k={k} m={m} rep={rep}");
+
+                // Tamper: a perturbed value must be rejected.
+                let mut bad = proof.clone();
+                bad.values[0][3] += F128::ONE;
+                let mut chb = FsChallenger::new(b"multipoint-test");
+                assert!(
+                    verify_multipoint_twisted(&params, &claims, &rho, &bad, &mut chb).is_none(),
+                    "tampered value accepted (n={n} k={k} m={m})"
+                );
+            }
+        }
+    }
+
+    /// Multipoint twisted evaluation across column counts at m = 23, against
+    /// the batched Frobenius assist where the latter fits in memory (its
+    /// suffix state at 4K+ columns is gigabytes). Informational.
+    #[test]
+    #[ignore] // Timing probe — run explicitly with --ignored --nocapture
+    fn multipoint_twisted_bench() {
+        let mut ch = RandomChallenger::new(0x4D50_BE7C);
+        let m = 23usize;
+        for &(n, k, cols, run_assist) in &[
+            (14usize, 9usize, 368usize, true),
+            (11, 12, 4096, false),
+            (8, 15, 32768, false),
+        ] {
+            let mut heights = vec![0u64; 1 << k];
+            for h in heights.iter_mut().take(cols) {
+                *h = 1 << n;
+            }
+            let params = JaggedParams::from_heights(&heights, n, m);
+            let z1r = sample_vec(&mut ch, n);
+            let z1c = sample_vec(&mut ch, k);
+            let z2r = sample_vec(&mut ch, n);
+            let z2c = sample_vec(&mut ch, k);
+            let c1 = sample_vec(&mut ch, 128);
+            let c2 = sample_vec(&mut ch, 128);
+            let rho = sample_vec(&mut ch, m);
+            let claims = [
+                FrobeniusClaim {
+                    z_row: &z1r,
+                    z_col: &z1c,
+                    coeffs: &c1,
+                },
+                FrobeniusClaim {
+                    z_row: &z2r,
+                    z_col: &z2c,
+                    coeffs: &c2,
+                },
+            ];
+            let mut best = f64::INFINITY;
+            let mut kept = None;
+            for _ in 0..3 {
+                let mut fs = FsChallenger::new(b"multipoint-bench");
+                let t = std::time::Instant::now();
+                let proof = prove_multipoint_twisted(&params, &claims, &rho, &mut fs);
+                best = best.min(t.elapsed().as_secs_f64() * 1e3);
+                kept = Some(proof);
+            }
+            let proof = kept.unwrap();
+            let t = std::time::Instant::now();
+            let mut fv = FsChallenger::new(b"multipoint-bench");
+            let v = verify_multipoint_twisted(&params, &claims, &rho, &proof, &mut fv)
+                .expect("bench proof verifies");
+            let verify_ms = t.elapsed().as_secs_f64() * 1e3;
+            std::hint::black_box(v);
+            let assist = if run_assist {
+                let mut best_a = f64::INFINITY;
+                for _ in 0..3 {
+                    let mut fa = FsChallenger::new(b"assist-bench");
+                    let t = std::time::Instant::now();
+                    let p = prove_frobenius_assist(&params, &claims, &rho, &mut fa);
+                    best_a = best_a.min(t.elapsed().as_secs_f64() * 1e3);
+                    std::hint::black_box(p);
+                }
+                format!("{best_a:6.2} ms")
+            } else {
+                "skipped (suffix state in the GBs)".to_string()
+            };
+            println!(
+                "cols = {cols:>6}: multipoint prove {best:7.2} ms  verify {verify_ms:6.2} ms;  \
+                 batched assist prove {assist}"
+            );
+        }
     }
 
     #[test]
