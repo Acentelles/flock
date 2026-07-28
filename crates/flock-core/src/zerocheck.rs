@@ -1516,6 +1516,154 @@ mod tests {
         verify(m, &proof_padded, &mut ch_verify).expect("sparse multi-run proof must verify");
     }
 
+    /// The support-proportional dispatch is byte-identical to the dense
+    /// prover on FRAGMENTED slot schedules — the shapes that separate "tasks
+    /// derived from the live intervals" from "tasks derived from the domain".
+    /// Each case targets one way the interval-derived dispatch could differ
+    /// from a whole-domain scan:
+    ///
+    /// - *fragmented*: many small intervals separated by dead gaps, so tasks
+    ///   coalesce several pieces and their output spans cover gaps that must
+    ///   stay unwritten.
+    /// - *unaligned*: `useful_bits_per_block` is not a multiple of the pair
+    ///   window (2^(k_skip+1)), so consecutive intervals round to pair
+    ///   intervals that TOUCH — they must merge, or the shared boundary pair
+    ///   is folded (and accumulated into the message) twice.
+    /// - *wide*: live pairs exceed one task's budget in both round 2 and the
+    ///   tail, exercising the multi-task output carve and the message
+    ///   regrouping across tasks.
+    #[test]
+    fn prove_sparse_fragmented_multi_run_matches_dense() {
+        let cases: [(&str, usize, PaddingSpec); 3] = [
+            (
+                "fragmented",
+                16,
+                PaddingSpec::from_runs(
+                    (0..8)
+                        .flat_map(|_| {
+                            [
+                                PaddingRun {
+                                    k_log: 9,
+                                    useful_bits_per_block: 128,
+                                    n_blocks: 6,
+                                },
+                                PaddingRun {
+                                    k_log: 9,
+                                    useful_bits_per_block: 0,
+                                    n_blocks: 2,
+                                },
+                            ]
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "unaligned",
+                16,
+                PaddingSpec::from_runs(vec![
+                    PaddingRun {
+                        k_log: 10,
+                        useful_bits_per_block: 200,
+                        n_blocks: 20,
+                    },
+                    PaddingRun {
+                        k_log: 8,
+                        useful_bits_per_block: 129,
+                        n_blocks: 40,
+                    },
+                ]),
+            ),
+            (
+                "wide",
+                24,
+                PaddingSpec::from_runs(vec![
+                    PaddingRun {
+                        k_log: 12,
+                        useful_bits_per_block: 3000,
+                        n_blocks: 2048,
+                    },
+                    PaddingRun {
+                        k_log: 12,
+                        useful_bits_per_block: 0,
+                        n_blocks: 512,
+                    },
+                    PaddingRun {
+                        k_log: 11,
+                        useful_bits_per_block: 1500,
+                        n_blocks: 2048,
+                    },
+                ]),
+            ),
+        ];
+
+        for (name, m, padding) in cases {
+            assert!(
+                padding.as_single_run().is_none(),
+                "{name}: must exercise multi-run"
+            );
+            let live = padding.useful_block_intervals(K_SKIP);
+            let live_elems: usize = live.iter().map(|&(s, e)| e - s).sum();
+            assert!(
+                live.len() > 4 && live_elems <= 1usize << (m - K_SKIP),
+                "{name}: must be fragmented and drive the sparse path \
+                 ({} intervals, {live_elems} live)",
+                live.len(),
+            );
+            if name == "wide" {
+                // Keep this case doing its job: it only covers the multi-task
+                // carve while its live work exceeds one task's budget
+                // (`LIVE_PAIRS_PER_TASK` in multilinear.rs, 2^16 pairs).
+                let live_pairs: usize = padding
+                    .useful_block_intervals(K_SKIP + 1)
+                    .iter()
+                    .map(|&(s, e)| e - s)
+                    .sum();
+                assert!(
+                    live_pairs > 1 << 16,
+                    "{name}: {live_pairs} live pairs no longer forces a \
+                     multi-task round-2 dispatch"
+                );
+            }
+
+            let mut rng = Rng::new(0x_5B10_2C4E ^ m as u64);
+            let mut a = rng.bits(1 << m);
+            let mut b = rng.bits(1 << m);
+            zero_outside_useful(&padding, &mut a);
+            zero_outside_useful(&padding, &mut b);
+            let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
+            let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+
+            let mut ch_dense = FsChallenger::new(b"flock-test-v0");
+            let (proof_dense, claim_dense, s_hat_v_dense) = prove_packed_padded_capture_s_hat_v_c(
+                &a_p,
+                &b_p,
+                &c_p,
+                m,
+                &PaddingSpec::dense(m),
+                &mut ch_dense,
+            );
+
+            let mut ch_padded = FsChallenger::new(b"flock-test-v0");
+            let (proof_padded, claim_padded, s_hat_v_padded) =
+                prove_packed_padded_capture_s_hat_v_c(
+                    &a_p,
+                    &b_p,
+                    &c_p,
+                    m,
+                    &padding,
+                    &mut ch_padded,
+                );
+
+            assert_eq!(proof_dense, proof_padded, "{name}: proof mismatch");
+            assert_eq!(claim_dense, claim_padded, "{name}: claim mismatch");
+            assert_eq!(s_hat_v_dense, s_hat_v_padded, "{name}: s_hat_v_c mismatch");
+
+            let mut ch_verify = FsChallenger::new(b"flock-test-v0");
+            verify(m, &proof_padded, &mut ch_verify)
+                .unwrap_or_else(|e| panic!("{name}: proof must verify: {e:?}"));
+        }
+    }
+
     /// Determinism: same witness + same challenger seed → same proof.
     #[test]
     fn prove_deterministic() {

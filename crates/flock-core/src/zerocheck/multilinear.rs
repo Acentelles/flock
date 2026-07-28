@@ -488,6 +488,51 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
     }
 }
 
+/// Cut a canonical live-interval list into rayon tasks of roughly `target`
+/// LIVE elements each — long intervals split, short ones coalesced across the
+/// dead gaps between them. Returns the re-cut piece list together with the
+/// index ranges into it that each task owns.
+///
+/// This is what keeps the sparse kernels' task count proportional to the
+/// declared support rather than to the padded domain. Both failure modes are
+/// real and were measured on the capacity sweep (counts fixed, `ν` 14 → 18):
+/// one task per interval gives 367 near-empty tasks per round once the slot
+/// schedule fragments (the coalescing fixes that), while a uniform cut of the
+/// output domain scans 16x more pairs than are live (the splitting bound
+/// keeps a task's *live* work uniform instead).
+///
+/// A task's pieces are contiguous in index but not in address: its output
+/// range spans the gaps it skips, and it simply never writes them, which is
+/// exactly the sparse contract (dead output is left untouched).
+fn balanced_interval_tasks(
+    live: &[(usize, usize)],
+    target: usize,
+) -> (Vec<(usize, usize)>, Vec<std::ops::Range<usize>>) {
+    debug_assert!(target > 0);
+    let mut pieces: Vec<(usize, usize)> = Vec::with_capacity(live.len());
+    for &(s, e) in live {
+        let mut c = s;
+        while c < e {
+            let next = (c + target).min(e);
+            pieces.push((c, next));
+            c = next;
+        }
+    }
+    let mut tasks: Vec<std::ops::Range<usize>> = Vec::new();
+    let (mut start, mut acc) = (0usize, 0usize);
+    for (i, &(s, e)) in pieces.iter().enumerate() {
+        acc += e - s;
+        if acc >= target {
+            tasks.push(start..i + 1);
+            (start, acc) = (i + 1, 0);
+        }
+    }
+    if start < pieces.len() {
+        tasks.push(start..pieces.len());
+    }
+    (pieces, tasks)
+}
+
 /// Zero a dead pair's four output slots. The fold buffers are allocated
 /// uninit, so every slot not folded into must be written — unless the caller
 /// reads only the useful intervals (`write_dead = false`).
@@ -499,6 +544,208 @@ fn kill_pair(a: &mut [F128], b: &mut [F128], x0l: usize, x1l: usize, write_dead:
             b[idx] = F128::ZERO;
         }
     }
+}
+
+/// Round-2's inner loop: fold the pairs `[ps, pe)` — which must all share one
+/// `x_hi` block, so one hoisted `eq_hi` factor covers the run — and return the
+/// run's UNREDUCED message accumulators.
+///
+/// Pair `p` reads post-URM rows `2p`, `2p+1` of the packed witness and writes
+/// its two folded values to `a_out[2·(p − out_base)]` and the slot after it;
+/// `out_base` is the pair index the caller's output slice starts at. Dead
+/// pairs (`is_dead`) fold to zero and are skipped, zero-filled only when
+/// `write_dead`.
+///
+/// Both round-2 dispatches — the dense one over output chunks and the
+/// support-proportional one over live intervals — call THIS body, so the
+/// arch-specific row folds exist once. That is deliberate: the run-list path
+/// was once a second copy of this loop and silently missed the NEON/AVX-512
+/// folds for as long as it had no production caller (~4.6 ms at m = 30).
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn fold_pair_run<D>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    table: &UniSkipFoldTable,
+    eq_lo: &[F128],
+    lo_size: usize,
+    is_dead: &D,
+    write_dead: bool,
+    ps: usize,
+    pe: usize,
+    out_base: usize,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+) -> (F256Unreduced, F256Unreduced)
+where
+    D: Fn(usize) -> bool + Sync,
+{
+    let lo_mask = lo_size - 1;
+    let mut p1_acc = F256Unreduced::ZERO;
+    let mut pinf_acc = F256Unreduced::ZERO;
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let table_ptr = table.data.as_ptr() as *const u8;
+        let a_pkt_ptr = a_packed.as_ptr();
+        let b_pkt_ptr = b_packed.as_ptr();
+
+        for pair in ps..pe {
+            let x0l = 2 * (pair - out_base);
+            let x1l = x0l + 1;
+            if is_dead(pair) {
+                // Padding hole: write zero (a_folded/b_folded were alloc'd
+                // uninit, so we have to write every slot we don't fold into).
+                kill_pair(a_out, b_out, x0l, x1l, write_dead);
+                continue;
+            }
+            let x0g = 2 * pair;
+            let x1g = x0g + 1;
+
+            let a0 = fold_one_row_neon_unchecked_8(table_ptr, a_pkt_ptr.add(x0g * 8));
+            let b0 = fold_one_row_neon_unchecked_8(table_ptr, b_pkt_ptr.add(x0g * 8));
+            let a1 = fold_one_row_neon_unchecked_8(table_ptr, a_pkt_ptr.add(x1g * 8));
+            let b1 = fold_one_row_neon_unchecked_8(table_ptr, b_pkt_ptr.add(x1g * 8));
+
+            a_out[x0l] = a0;
+            a_out[x1l] = a1;
+            b_out[x0l] = b0;
+            b_out[x1l] = b1;
+
+            let eq_l = eq_lo[pair & lo_mask];
+            let g1 = a1 * b1;
+            p1_acc ^= eq_l.mul_unreduced(g1);
+            let g_inf = (a0 + a1) * (b0 + b1);
+            pinf_acc ^= eq_l.mul_unreduced(g_inf);
+        }
+    }
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    unsafe {
+        let table_ptr = table.data.as_ptr();
+        let a_pkt_ptr = a_packed.as_ptr();
+        let b_pkt_ptr = b_packed.as_ptr();
+        let mut p1_wide = WideGhashX4::zero();
+        let mut pinf_wide = WideGhashX4::zero();
+        let mut pair = ps;
+
+        while pair + 4 <= pe {
+            let mut a0 = [F128::ZERO; 4];
+            let mut a1 = [F128::ZERO; 4];
+            let mut b0 = [F128::ZERO; 4];
+            let mut b1 = [F128::ZERO; 4];
+
+            for lane in 0..4 {
+                let p = pair + lane;
+                let x0l = 2 * (p - out_base);
+                let x1l = x0l + 1;
+                if is_dead(p) {
+                    kill_pair(a_out, b_out, x0l, x1l, write_dead);
+                    continue;
+                }
+
+                let x0g = 2 * p;
+                let x1g = x0g + 1;
+                let folded = fold_round2_pair_x86_unchecked_8(
+                    table_ptr,
+                    a_pkt_ptr.add(x0g * 8),
+                    a_pkt_ptr.add(x1g * 8),
+                    b_pkt_ptr.add(x0g * 8),
+                    b_pkt_ptr.add(x1g * 8),
+                );
+                [a0[lane], a1[lane], b0[lane], b1[lane]] = folded;
+                a_out[x0l] = a0[lane];
+                a_out[x1l] = a1[lane];
+                b_out[x0l] = b0[lane];
+                b_out[x1l] = b1[lane];
+            }
+
+            let a1x4 = f128x4_loadu(a1.as_ptr());
+            let b1x4 = f128x4_loadu(b1.as_ptr());
+            let a_sum_x4 = f128x4_set(a0[0] + a1[0], a0[1] + a1[1], a0[2] + a1[2], a0[3] + a1[3]);
+            let b_sum_x4 = f128x4_set(b0[0] + b1[0], b0[1] + b1[1], b0[2] + b1[2], b0[3] + b1[3]);
+            let g1x4 = ghash_mul_x4(a1x4, b1x4);
+            let g_inf_x4 = ghash_mul_x4(a_sum_x4, b_sum_x4);
+            // The run never crosses an x_hi boundary, so these 4 eq weights
+            // are in bounds whenever 4 pairs remain.
+            let eqx4 = f128x4_loadu(eq_lo[pair & lo_mask..].as_ptr());
+            p1_wide.mul_acc(eqx4, g1x4);
+            pinf_wide.mul_acc(eqx4, g_inf_x4);
+            pair += 4;
+        }
+
+        // Small instances (and short live runs) can leave a 1- to 3-pair tail.
+        while pair < pe {
+            let x0l = 2 * (pair - out_base);
+            let x1l = x0l + 1;
+            if is_dead(pair) {
+                kill_pair(a_out, b_out, x0l, x1l, write_dead);
+                pair += 1;
+                continue;
+            }
+
+            let x0g = 2 * pair;
+            let x1g = x0g + 1;
+            let [a0, a1, b0, b1] = fold_round2_pair_x86_unchecked_8(
+                table_ptr,
+                a_pkt_ptr.add(x0g * 8),
+                a_pkt_ptr.add(x1g * 8),
+                b_pkt_ptr.add(x0g * 8),
+                b_pkt_ptr.add(x1g * 8),
+            );
+            a_out[x0l] = a0;
+            a_out[x1l] = a1;
+            b_out[x0l] = b0;
+            b_out[x1l] = b1;
+            let eq_l = eq_lo[pair & lo_mask];
+            p1_acc ^= eq_l.mul_unreduced(a1 * b1);
+            pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+            pair += 1;
+        }
+
+        p1_acc ^= p1_wide.fold();
+        pinf_acc ^= pinf_wide.fold();
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )
+    )))]
+    {
+        let n_chunks = table.n_chunks;
+        for pair in ps..pe {
+            let x0l = 2 * (pair - out_base);
+            let x1l = x0l + 1;
+            if is_dead(pair) {
+                // See aarch64 branch above for why this zero write is needed.
+                kill_pair(a_out, b_out, x0l, x1l, write_dead);
+                continue;
+            }
+            let x0g = 2 * pair;
+            let x1g = x0g + 1;
+            let a0 = table.fold_one_row(&a_packed[x0g * n_chunks..(x0g + 1) * n_chunks]);
+            let b0 = table.fold_one_row(&b_packed[x0g * n_chunks..(x0g + 1) * n_chunks]);
+            let a1 = table.fold_one_row(&a_packed[x1g * n_chunks..(x1g + 1) * n_chunks]);
+            let b1 = table.fold_one_row(&b_packed[x1g * n_chunks..(x1g + 1) * n_chunks]);
+            a_out[x0l] = a0;
+            a_out[x1l] = a1;
+            b_out[x0l] = b0;
+            b_out[x1l] = b1;
+            let eq_l = eq_lo[pair & lo_mask];
+            let g1 = a1 * b1;
+            p1_acc ^= eq_l.mul_unreduced(g1);
+            let g_inf = (a0 + a1) * (b0 + b1);
+            pinf_acc ^= eq_l.mul_unreduced(g_inf);
+        }
+    }
+
+    (p1_acc, pinf_acc)
 }
 
 /// The round-2 fused fold + message kernel, shared by BOTH padding regimes.
@@ -567,199 +814,103 @@ where
     let eq_hi = &eq.hi;
     let eq_lo = &eq.lo;
 
-    // Chunk-level liveness from the pair-interval list (M6 sparse round 2):
-    // a chunk with no live pair contributes zero to the message and — with
-    // `write_dead = false` — needs no writes either, so the whole per-pair
-    // `is_dead` scan is skipped. At 6.25% utilization the scan otherwise
-    // visits 16x more pairs than are live.
-    let chunk_live: Option<Vec<bool>> = live_pairs.map(|iv| {
-        let mut cl = vec![false; hi_size];
-        for &(s, e) in iv {
-            for c in cl.iter_mut().take((e - 1) / lo_size + 1).skip(s / lo_size) {
-                *c = true;
+    // Support-proportional dispatch (M6 run-list sparse round 2): tasks come
+    // from the live pair-interval list, so both the task count and the work
+    // per task follow the DECLARED SUPPORT. The previous chunk-level skip
+    // still walked every pair of every partially-live chunk: at the m30 load
+    // that is 6.1M pair tests at ν = 14 but 97.5M at ν = 18 (91.5M of them
+    // dead) against an unchanged 6.0M live pairs, plus a `2^(m−k_skip−1)`-bool
+    // liveness table (8 MB → 128 MB) to allocate, fill and stream. Both are
+    // gone here: a task walks only live pairs, and `is_dead` is never
+    // consulted (the interval list IS the live set).
+    //
+    // Value-identical to the dense dispatch: the message is a sum of terms
+    // that each carry an `a·b` factor of zero off the support, and regrouping
+    // the XOR accumulation is exact (`reduce` is XOR-linear, so reducing a
+    // hi-run in pieces and adding equals adding then reducing).
+    if let Some(iv) = live_pairs {
+        // ~2^16 live pairs per task: matches the live work the dense
+        // dispatch gives one chunk at the anchor shape, so per-task fold
+        // cost and thread count stay in the measured-good regime.
+        const LIVE_PAIRS_PER_TASK: usize = 1 << 16;
+        let (pieces, tasks) = balanced_interval_tasks(iv, LIVE_PAIRS_PER_TASK);
+
+        // Each task owns the output span of its pieces — disjoint and in
+        // address order, so the buffers carve by successive `split_at_mut`.
+        let mut work: Vec<(&[(usize, usize)], &mut [F128], &mut [F128])> =
+            Vec::with_capacity(tasks.len());
+        {
+            let (mut a_rem, mut b_rem): (&mut [F128], &mut [F128]) =
+                (&mut a_folded[..], &mut b_folded[..]);
+            let mut off = 0usize;
+            for t in &tasks {
+                let (s, e) = (pieces[t.start].0, pieces[t.end - 1].1);
+                let (_, rest) = std::mem::take(&mut a_rem).split_at_mut(2 * s - off);
+                let (a_task, rest) = rest.split_at_mut(2 * (e - s));
+                a_rem = rest;
+                let (_, rest) = std::mem::take(&mut b_rem).split_at_mut(2 * s - off);
+                let (b_task, rest) = rest.split_at_mut(2 * (e - s));
+                b_rem = rest;
+                off = 2 * e;
+                work.push((&pieces[t.clone()], a_task, b_task));
             }
         }
-        cl
-    });
 
-    // Parallel: each worker writes one disjoint chunk of a_folded/b_folded
-    // and returns its (sum1, sum_inf) contribution. Reduce by F128 XOR.
+        let (sum1, sum_inf) = work
+            .into_par_iter()
+            .map(|(task_pieces, a_task, b_task)| {
+                let out_base = task_pieces[0].0;
+                let (mut s1, mut s_inf) = (F128::ZERO, F128::ZERO);
+                for &(ps, pe) in task_pieces {
+                    // Split at hi-block boundaries: one `eq_hi` factor per run,
+                    // hoisted out of the inner loop exactly as in the dense
+                    // dispatch.
+                    let mut t = ps;
+                    while t < pe {
+                        let run_end = (((t >> eq.n_lo) + 1) << eq.n_lo).min(pe);
+                        let (p1, pinf) = fold_pair_run(
+                            a_packed, b_packed, table, eq_lo, lo_size, &is_dead, write_dead, t,
+                            run_end, out_base, a_task, b_task,
+                        );
+                        let eq_h = eq_hi[t >> eq.n_lo];
+                        s1 += eq_h * p1.reduce();
+                        s_inf += eq_h * pinf.reduce();
+                        t = run_end;
+                    }
+                }
+                (s1, s_inf)
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
+            );
+
+        return (a_folded, b_folded, mlv_challenges[0] * sum1, sum_inf);
+    }
+
+    // Dense dispatch: each worker writes one disjoint chunk of
+    // a_folded/b_folded and returns its (sum1, sum_inf) contribution.
+    // Reduce by F128 XOR.
     let (sum1, sum_inf) = a_folded
         .par_chunks_mut(chunk_size)
         .zip(b_folded.par_chunks_mut(chunk_size))
         .enumerate()
         .map(|(x_hi, (a_chunk, b_chunk))| {
-            if let Some(cl) = &chunk_live
-                && !cl[x_hi]
-            {
-                return (F128::ZERO, F128::ZERO);
-            }
-            let mut p1_acc = F256Unreduced::ZERO;
-            let mut pinf_acc = F256Unreduced::ZERO;
             let pair_idx_base = x_hi * lo_size;
-
-            #[cfg(target_arch = "aarch64")]
-            unsafe {
-                let table_ptr = table.data.as_ptr() as *const u8;
-                let a_pkt_ptr = a_packed.as_ptr();
-                let b_pkt_ptr = b_packed.as_ptr();
-                let base = x_hi * chunk_size;
-
-                for x_lo in 0..lo_size {
-                    let x0l = 2 * x_lo;
-                    let x1l = x0l + 1;
-                    if is_dead(pair_idx_base + x_lo) {
-                        // Padding hole: write zero (a_folded/b_folded were alloc'd
-                        // uninit, so we have to write every slot we don't fold into).
-                        kill_pair(a_chunk, b_chunk, x0l, x1l, write_dead);
-                        continue;
-                    }
-                    let x0g = base + 2 * x_lo;
-                    let x1g = x0g + 1;
-
-                    let a0 = fold_one_row_neon_unchecked_8(table_ptr, a_pkt_ptr.add(x0g * 8));
-                    let b0 = fold_one_row_neon_unchecked_8(table_ptr, b_pkt_ptr.add(x0g * 8));
-                    let a1 = fold_one_row_neon_unchecked_8(table_ptr, a_pkt_ptr.add(x1g * 8));
-                    let b1 = fold_one_row_neon_unchecked_8(table_ptr, b_pkt_ptr.add(x1g * 8));
-
-                    a_chunk[x0l] = a0;
-                    a_chunk[x1l] = a1;
-                    b_chunk[x0l] = b0;
-                    b_chunk[x1l] = b1;
-
-                    let eq_l = eq_lo[x_lo];
-                    let g1 = a1 * b1;
-                    p1_acc ^= eq_l.mul_unreduced(g1);
-                    let g_inf = (a0 + a1) * (b0 + b1);
-                    pinf_acc ^= eq_l.mul_unreduced(g_inf);
-                }
-            }
-            #[cfg(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            ))]
-            unsafe {
-                let table_ptr = table.data.as_ptr();
-                let a_pkt_ptr = a_packed.as_ptr();
-                let b_pkt_ptr = b_packed.as_ptr();
-                let base = x_hi * chunk_size;
-                let mut p1_wide = WideGhashX4::zero();
-                let mut pinf_wide = WideGhashX4::zero();
-                let mut x_lo = 0;
-
-                while x_lo + 4 <= lo_size {
-                    let mut a0 = [F128::ZERO; 4];
-                    let mut a1 = [F128::ZERO; 4];
-                    let mut b0 = [F128::ZERO; 4];
-                    let mut b1 = [F128::ZERO; 4];
-
-                    for lane in 0..4 {
-                        let pair = x_lo + lane;
-                        let x0l = 2 * pair;
-                        let x1l = x0l + 1;
-                        if is_dead(pair_idx_base + pair) {
-                            kill_pair(a_chunk, b_chunk, x0l, x1l, write_dead);
-                            continue;
-                        }
-
-                        let x0g = base + x0l;
-                        let x1g = x0g + 1;
-                        let folded = fold_round2_pair_x86_unchecked_8(
-                            table_ptr,
-                            a_pkt_ptr.add(x0g * 8),
-                            a_pkt_ptr.add(x1g * 8),
-                            b_pkt_ptr.add(x0g * 8),
-                            b_pkt_ptr.add(x1g * 8),
-                        );
-                        [a0[lane], a1[lane], b0[lane], b1[lane]] = folded;
-                        a_chunk[x0l] = a0[lane];
-                        a_chunk[x1l] = a1[lane];
-                        b_chunk[x0l] = b0[lane];
-                        b_chunk[x1l] = b1[lane];
-                    }
-
-                    let a1x4 = f128x4_loadu(a1.as_ptr());
-                    let b1x4 = f128x4_loadu(b1.as_ptr());
-                    let a_sum_x4 =
-                        f128x4_set(a0[0] + a1[0], a0[1] + a1[1], a0[2] + a1[2], a0[3] + a1[3]);
-                    let b_sum_x4 =
-                        f128x4_set(b0[0] + b1[0], b0[1] + b1[1], b0[2] + b1[2], b0[3] + b1[3]);
-                    let g1x4 = ghash_mul_x4(a1x4, b1x4);
-                    let g_inf_x4 = ghash_mul_x4(a_sum_x4, b_sum_x4);
-                    let eqx4 = f128x4_loadu(eq_lo[x_lo..].as_ptr());
-                    p1_wide.mul_acc(eqx4, g1x4);
-                    pinf_wide.mul_acc(eqx4, g_inf_x4);
-                    x_lo += 4;
-                }
-
-                // Small instances can leave a 1- or 2-pair tail.
-                while x_lo < lo_size {
-                    let x0l = 2 * x_lo;
-                    let x1l = x0l + 1;
-                    if is_dead(pair_idx_base + x_lo) {
-                        kill_pair(a_chunk, b_chunk, x0l, x1l, write_dead);
-                        x_lo += 1;
-                        continue;
-                    }
-
-                    let x0g = base + x0l;
-                    let x1g = x0g + 1;
-                    let [a0, a1, b0, b1] = fold_round2_pair_x86_unchecked_8(
-                        table_ptr,
-                        a_pkt_ptr.add(x0g * 8),
-                        a_pkt_ptr.add(x1g * 8),
-                        b_pkt_ptr.add(x0g * 8),
-                        b_pkt_ptr.add(x1g * 8),
-                    );
-                    a_chunk[x0l] = a0;
-                    a_chunk[x1l] = a1;
-                    b_chunk[x0l] = b0;
-                    b_chunk[x1l] = b1;
-                    let eq_l = eq_lo[x_lo];
-                    p1_acc ^= eq_l.mul_unreduced(a1 * b1);
-                    pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
-                    x_lo += 1;
-                }
-
-                p1_acc ^= p1_wide.fold();
-                pinf_acc ^= pinf_wide.fold();
-            }
-            #[cfg(not(any(
-                target_arch = "aarch64",
-                all(
-                    target_arch = "x86_64",
-                    target_feature = "avx512f",
-                    target_feature = "vpclmulqdq"
-                )
-            )))]
-            {
-                let base = x_hi * chunk_size;
-                for x_lo in 0..lo_size {
-                    let x0l = 2 * x_lo;
-                    let x1l = x0l + 1;
-                    if is_dead(pair_idx_base + x_lo) {
-                        // See aarch64 branch above for why this zero write is needed.
-                        kill_pair(a_chunk, b_chunk, x0l, x1l, write_dead);
-                        continue;
-                    }
-                    let x0g = base + 2 * x_lo;
-                    let x1g = x0g + 1;
-                    let a0 = table.fold_one_row(&a_packed[x0g * n_chunks..(x0g + 1) * n_chunks]);
-                    let b0 = table.fold_one_row(&b_packed[x0g * n_chunks..(x0g + 1) * n_chunks]);
-                    let a1 = table.fold_one_row(&a_packed[x1g * n_chunks..(x1g + 1) * n_chunks]);
-                    let b1 = table.fold_one_row(&b_packed[x1g * n_chunks..(x1g + 1) * n_chunks]);
-                    a_chunk[x0l] = a0;
-                    a_chunk[x1l] = a1;
-                    b_chunk[x0l] = b0;
-                    b_chunk[x1l] = b1;
-                    let eq_l = eq_lo[x_lo];
-                    let g1 = a1 * b1;
-                    p1_acc ^= eq_l.mul_unreduced(g1);
-                    let g_inf = (a0 + a1) * (b0 + b1);
-                    pinf_acc ^= eq_l.mul_unreduced(g_inf);
-                }
-            }
+            let (p1_acc, pinf_acc) = fold_pair_run(
+                a_packed,
+                b_packed,
+                table,
+                eq_lo,
+                lo_size,
+                &is_dead,
+                write_dead,
+                pair_idx_base,
+                pair_idx_base + lo_size,
+                pair_idx_base,
+                a_chunk,
+                b_chunk,
+            );
 
             let p1 = p1_acc.reduce();
             let pinf = pinf_acc.reduce();
@@ -807,17 +958,37 @@ fn uni_skip_fold_and_round_pair_runs(
         padding.covered_bits()
     );
 
-    // Per-pair skip table from the run-list's useful intervals. A pair
-    // (post-URM chunks `2k`, `2k+1`) covers witness bits
-    // `[k·2^(k_skip+1), (k+1)·2^(k_skip+1))`.
+    // Sparse mode (no dead writes): the canonical live-pair interval list IS
+    // the skip predicate — the kernel visits live pairs only, so no per-pair
+    // table is built and `is_dead` is never consulted. A pair (post-URM
+    // chunks `2k`, `2k+1`) covers witness bits
+    // `[k·2^(k_skip+1), (k+1)·2^(k_skip+1))`, which is exactly
+    // `useful_block_intervals` at block size `2^(k_skip+1)` (merged, so
+    // intervals that share a boundary pair are never processed twice).
+    if !write_dead {
+        let pair_intervals = padding.useful_block_intervals(k_skip + 1);
+        return fold_and_round_pair_kernel(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            table,
+            mlv_challenges,
+            |_| false,
+            false,
+            Some(&pair_intervals),
+        );
+    }
+
+    // Dense mode: every output slot must be written, so the dispatch stays
+    // over the whole domain and the predicate comes from a precomputed
+    // per-pair table.
     let pair_bits = 1usize << (k_skip + 1);
     let n_out = 1usize << (m - k_skip);
     let mut pair_useful = vec![false; n_out / 2];
-    let mut pair_intervals: Vec<(usize, usize)> = Vec::new();
     for (start, end) in padding.useful_intervals() {
         let (ps, pe) = (start / pair_bits, (end - 1) / pair_bits + 1);
         pair_useful[ps..pe].fill(true);
-        pair_intervals.push((ps, pe));
     }
 
     fold_and_round_pair_kernel(
@@ -829,9 +1000,7 @@ fn uni_skip_fold_and_round_pair_runs(
         mlv_challenges,
         |pair| !pair_useful[pair],
         write_dead,
-        // Sparse mode (no dead writes): hand the kernel the live pair
-        // intervals so wholly-dead chunks are skipped instead of scanned.
-        (!write_dead).then_some(pair_intervals.as_slice()),
+        None,
     )
 }
 
@@ -1244,30 +1413,29 @@ pub fn fold_and_round_pair_sparse_into(
     let live_out = shrink_intervals(live_in);
     let pair_cover = shrink_intervals(&live_out);
 
-    // The pair cover split into bounded tasks, each with its own disjoint
-    // output slices — parallel like the dense kernel, instead of one scalar
-    // walk (measured ~3x per element at low utilization: no cores, no
-    // hoisted eq_hi, one reduced multiply per term). Within a task the
-    // per-hi-run products accumulate UNREDUCED and reduce once, and eq_hi
-    // multiplies the run total — pure reassociation of exact field algebra
-    // (reduction commutes with XOR), so the message stays byte-identical to
-    // the scalar loop and to the dense kernel.
+    // The pair cover split into tasks of roughly equal LIVE work, each with
+    // its own disjoint output slices — parallel like the dense kernel,
+    // instead of one scalar walk (measured ~3x per element at low
+    // utilization: no cores, no hoisted eq_hi, one reduced multiply per
+    // term). Tasks are cut from the interval list, so their count follows the
+    // live support and not the domain: a fragmented slot schedule (367
+    // intervals at 6.25% utilization, against 2 at full) would otherwise
+    // spawn one near-empty task per interval per round — 6.6K tasks over the
+    // tail against 1.5K for the same live volume when unfragmented.
+    // Within a task the per-hi-run products accumulate UNREDUCED and reduce
+    // once, and eq_hi multiplies the run total — pure reassociation of exact
+    // field algebra (reduction commutes with XOR), so the message stays
+    // byte-identical to the scalar loop and to the dense kernel.
     const CHUNK: usize = 1 << 12;
-    let mut tasks: Vec<(usize, usize)> = Vec::new();
-    for &(ps, pe) in &pair_cover {
-        let mut s = ps;
-        while s < pe {
-            let e = (s + CHUNK).min(pe);
-            tasks.push((s, e));
-            s = e;
-        }
-    }
-    let mut work: Vec<((usize, usize), &mut [F128], &mut [F128])> = Vec::with_capacity(tasks.len());
+    let (pieces, tasks) = balanced_interval_tasks(&pair_cover, CHUNK);
+    let mut work: Vec<(&[(usize, usize)], &mut [F128], &mut [F128])> =
+        Vec::with_capacity(tasks.len());
     {
         let mut a_rem: &mut [F128] = &mut a_out[..half];
         let mut b_rem: &mut [F128] = &mut b_out[..half];
         let mut off = 0usize;
-        for &(ps, pe) in &tasks {
+        for t in &tasks {
+            let (ps, pe) = (pieces[t.start].0, pieces[t.end - 1].1);
             let (_, rest) = std::mem::take(&mut a_rem).split_at_mut(2 * ps - off);
             let (a_task, rest) = rest.split_at_mut(2 * (pe - ps));
             a_rem = rest;
@@ -1275,14 +1443,15 @@ pub fn fold_and_round_pair_sparse_into(
             let (b_task, rest) = rest.split_at_mut(2 * (pe - ps));
             b_rem = rest;
             off = 2 * pe;
-            work.push(((ps, pe), a_task, b_task));
+            work.push((&pieces[t.clone()], a_task, b_task));
         }
     }
 
     use rayon::prelude::*;
     let (sum1, sum_inf) = work
         .into_par_iter()
-        .map(|((ps, pe), a_task, b_task)| {
+        .map(|(task_pieces, a_task, b_task)| {
+            let ps = task_pieces[0].0;
             // Zero-substituting source reads: a task-local cursor walks
             // `live_in` monotonically as the read position `y` ascends
             // (reads within a task are ascending), seeded by binary search.
@@ -1299,34 +1468,38 @@ pub fn fold_and_round_pair_sparse_into(
             };
             let mut s1 = F128::ZERO;
             let mut s_inf = F128::ZERO;
-            let mut t = ps;
-            while t < pe {
-                let run_end = (((t >> eq.n_lo) + 1) << eq.n_lo).min(pe);
-                let mut p1 = F256Unreduced::ZERO;
-                let mut p_inf = F256Unreduced::ZERO;
-                for tt in t..run_end {
-                    let y = 4 * tt;
-                    let (a00, b00) = read2(&mut cur, y);
-                    let (a01, b01) = read2(&mut cur, y + 1);
-                    let (a10, b10) = read2(&mut cur, y + 2);
-                    let (a11, b11) = read2(&mut cur, y + 3);
-                    let a0 = a00 + r_fold * (a01 + a00);
-                    let a1 = a10 + r_fold * (a11 + a10);
-                    let b0 = b00 + r_fold * (b01 + b00);
-                    let b1 = b10 + r_fold * (b11 + b10);
-                    let o = 2 * (tt - ps);
-                    a_task[o] = a0;
-                    a_task[o + 1] = a1;
-                    b_task[o] = b0;
-                    b_task[o + 1] = b1;
-                    let eq_l = eq.lo[tt & lo_mask];
-                    p1 ^= eq_l.mul_unreduced(a1 * b1);
-                    p_inf ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+            // A task may cover several live pieces; the dead gaps between
+            // them fall inside its output span and are simply never written.
+            for &(piece_s, piece_e) in task_pieces {
+                let mut t = piece_s;
+                while t < piece_e {
+                    let run_end = (((t >> eq.n_lo) + 1) << eq.n_lo).min(piece_e);
+                    let mut p1 = F256Unreduced::ZERO;
+                    let mut p_inf = F256Unreduced::ZERO;
+                    for tt in t..run_end {
+                        let y = 4 * tt;
+                        let (a00, b00) = read2(&mut cur, y);
+                        let (a01, b01) = read2(&mut cur, y + 1);
+                        let (a10, b10) = read2(&mut cur, y + 2);
+                        let (a11, b11) = read2(&mut cur, y + 3);
+                        let a0 = a00 + r_fold * (a01 + a00);
+                        let a1 = a10 + r_fold * (a11 + a10);
+                        let b0 = b00 + r_fold * (b01 + b00);
+                        let b1 = b10 + r_fold * (b11 + b10);
+                        let o = 2 * (tt - ps);
+                        a_task[o] = a0;
+                        a_task[o + 1] = a1;
+                        b_task[o] = b0;
+                        b_task[o + 1] = b1;
+                        let eq_l = eq.lo[tt & lo_mask];
+                        p1 ^= eq_l.mul_unreduced(a1 * b1);
+                        p_inf ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+                    }
+                    let eq_h = eq.hi[t >> eq.n_lo];
+                    s1 += eq_h * p1.reduce();
+                    s_inf += eq_h * p_inf.reduce();
+                    t = run_end;
                 }
-                let eq_h = eq.hi[t >> eq.n_lo];
-                s1 += eq_h * p1.reduce();
-                s_inf += eq_h * p_inf.reduce();
-                t = run_end;
             }
             (s1, s_inf)
         })
@@ -1436,6 +1609,55 @@ pub fn uni_skip_fold_and_round_pair_optimized(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The task cut is a faithful partition of the live set: pieces
+    /// concatenate back to the input intervals (no element added, dropped or
+    /// visited twice — a duplicate would double-count that pair into the
+    /// message), tasks tile the piece list in order, and no task exceeds the
+    /// target while only the last may fall short of it.
+    #[test]
+    fn balanced_interval_tasks_partitions_the_live_set() {
+        let target = 8usize;
+        let cases: Vec<Vec<(usize, usize)>> = vec![
+            vec![],
+            vec![(0, 1)],
+            vec![(0, 100)],                                // one long interval: split
+            vec![(3, 4), (9, 10), (11, 12), (40, 41)],     // fragments: coalesced
+            vec![(0, 8), (8, 16)],                         // exactly on target
+            (0..40).map(|i| (5 * i, 5 * i + 2)).collect(), // many tiny fragments
+            vec![(1, 2), (4, 30), (31, 33), (60, 100)],    // mixed
+        ];
+        for live in cases {
+            let (pieces, tasks) = balanced_interval_tasks(&live, target);
+
+            let flat: Vec<usize> = pieces.iter().flat_map(|&(s, e)| s..e).collect();
+            let expect: Vec<usize> = live.iter().flat_map(|&(s, e)| s..e).collect();
+            assert_eq!(
+                flat, expect,
+                "pieces must re-flatten to the live set: {live:?}"
+            );
+
+            // Tasks tile the pieces contiguously, in order, without overlap.
+            let mut next = 0usize;
+            for t in &tasks {
+                assert_eq!(t.start, next, "task ranges must be contiguous: {live:?}");
+                assert!(t.end > t.start, "empty task: {live:?}");
+                next = t.end;
+            }
+            assert_eq!(next, pieces.len(), "tasks must cover every piece: {live:?}");
+
+            for (i, t) in tasks.iter().enumerate() {
+                let work: usize = pieces[t.clone()].iter().map(|&(s, e)| e - s).sum();
+                assert!(
+                    work >= target || i == tasks.len() - 1,
+                    "only the last task may be under target: {live:?}"
+                );
+                // Grouping stops the moment the target is met, and every
+                // piece is at most `target` long, so a task is bounded by 2x.
+                assert!(work < 2 * target, "task work {work} unbounded: {live:?}");
+            }
+        }
+    }
 
     struct Rng(u64);
     impl Rng {

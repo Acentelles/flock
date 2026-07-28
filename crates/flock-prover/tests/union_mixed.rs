@@ -1259,14 +1259,30 @@ fn merged_capacity_attribution() {
     let _quiet = timing_lock();
     use std::time::Instant;
     const COUNTS: [usize; 2] = [16384, 16384];
-    const NUS: [usize; 5] = [14, 15, 16, 17, 18];
+    // Tier list, overridable so a tier can be measured in ISOLATION
+    // (`FLOCK_PROBE_NUS=18`). Required above nu = 16: the later tiers touch
+    // GBs, and both the heat and the mid-run pool prewarms they leave behind
+    // read back as several ms on whatever runs after them in the same
+    // process. Citable per-tier numbers come from separate invocations.
+    let nus: Vec<usize> = match std::env::var("FLOCK_PROBE_NUS") {
+        Ok(s) => s
+            .split(',')
+            .map(|t| {
+                t.trim()
+                    .parse()
+                    .expect("FLOCK_PROBE_NUS: comma-separated nu")
+            })
+            .collect(),
+        Err(_) => vec![14, 15, 16, 17, 18],
+    };
+    let nus = nus.as_slice();
 
-    let cfgs: Vec<_> = NUS.iter().map(|&nu| mixed_registry(nu)).collect();
+    let cfgs: Vec<_> = nus.iter().map(|&nu| mixed_registry(nu)).collect();
     let mut rng = Rng::new(0x_4E_26_ED_31);
     let sha2_inputs = random_sha2_inputs(&mut rng, COUNTS[0]);
     let blake3_inputs = random_blake3_inputs(&mut rng, COUNTS[1]);
 
-    for (i, &nu) in NUS.iter().enumerate() {
+    for (i, &nu) in nus.iter().enumerate() {
         let (registry, sha2_r1cs, blake3_r1cs) = &cfgs[i];
         // Prewarm per tier — the production shape (Setup constructors
         // prewarm their own size). One largest-tier prewarm up front left
