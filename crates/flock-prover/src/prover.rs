@@ -648,30 +648,54 @@ pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
         pcs::ligerito::prover_config_for(log_n, pcs_params.log_batch_size, pcs_params.profile)
             .expect("Ligerito default config; bump m for tiny instances");
 
+    let trace = std::env::var("PCS_TRACE").is_ok();
     let mut sources = Vec::with_capacity(slots.len());
     let mut circuits = Vec::with_capacity(slots.len());
     for slot in slots {
         sources.push(slot.source);
         circuits.push(slot.lincheck_circuit);
     }
+    let t = std::time::Instant::now();
     let (z_packed, a_packed_f128, b_packed_f128, stripes) = build_union_witness(union, sources);
     let linchecks: Vec<(Vec<u8>, &dyn lincheck::LincheckCircuit)> =
         stripes.into_iter().zip(circuits).collect();
+    if trace {
+        eprintln!(
+            "  [prove_merged] witgen (padded 2^{}): {:7.2} ms",
+            m - 7,
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
 
     // The dense stack, OWNED (the merged open consumes it for the inner
     // eq-basis opening). Identity compaction copies — a prototype cost only
     // (single-slot full-utilization registries).
+    let t = std::time::Instant::now();
     let q: Vec<F128> = if union.compaction_is_identity() {
         z_packed.clone()
     } else {
         union.compact_witness(&z_packed)
     };
+    if trace {
+        eprintln!(
+            "  [prove_merged] compact q (2^{} dense): {:7.2} ms",
+            union.dense_m() - 7,
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    let t = std::time::Instant::now();
     let (commitment, prover_data) = if pcs_params.num_lanes.is_some() {
         pcs::commit_lane_major(&q, pcs_params)
     } else {
         pcs::commit(&q, pcs_params)
     };
     union.bind_statement(challenger, &commitment);
+    if trace {
+        eprintln!(
+            "  [prove_merged] commit: {:7.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
 
     let padding = union.padding_spec();
     let (zc_proof, zc_claim, s_hat_v_c) = {
@@ -693,14 +717,23 @@ pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
                 z_packed.len() * core::mem::size_of::<F128>(),
             )
         };
-        zerocheck::prove_packed_padded_capture_s_hat_v_c(
+        let t = std::time::Instant::now();
+        let out = zerocheck::prove_packed_padded_capture_s_hat_v_c(
             a_packed, b_packed, c_packed, m, &padding, challenger,
-        )
+        );
+        if trace {
+            eprintln!(
+                "  [prove_merged] zerocheck + s_hat_v_c: {:7.2} ms",
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        out
     };
     flock_core::scratch::give_f128(a_packed_f128);
     flock_core::scratch::give_f128(b_packed_f128);
 
     let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
+    let t = std::time::Instant::now();
     let (lc_proof, lc_claim, z_vec_pre) = {
         let lc_slots: Vec<lincheck::UnionLincheckSlot<'_>> = linchecks
             .iter()
@@ -713,6 +746,12 @@ pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
     };
     for (stripe, _) in linchecks {
         flock_core::scratch::give_u8(stripe);
+    }
+    if trace {
+        eprintln!(
+            "  [prove_merged] lincheck: {:7.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
     }
 
     let ab = ZClaim {

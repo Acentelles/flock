@@ -1249,6 +1249,64 @@ fn merged_transport_m30_probe() {
     );
 }
 
+/// MERGED-ONLY capacity attribution at the m30 load: one tier per entry,
+/// cold-first ordering, warm-up + best-of-2 — with `PCS_TRACE=1` the merged
+/// prover's per-phase timers attribute where capacity is spent. Built to
+/// chase the nu = 18 anomaly (total grows while the open stays flat).
+#[test]
+#[ignore] // Heavy + informational — run explicitly with --ignored --nocapture
+fn merged_capacity_attribution() {
+    let _quiet = timing_lock();
+    use std::time::Instant;
+    const COUNTS: [usize; 2] = [16384, 16384];
+    const NUS: [usize; 2] = [14, 18];
+
+    let cfgs: Vec<_> = NUS.iter().map(|&nu| mixed_registry(nu)).collect();
+    flock_core::scratch::prewarm_prover(cfgs.last().unwrap().0.m_total());
+    let mut rng = Rng::new(0x_4E_26_ED_31);
+    let sha2_inputs = random_sha2_inputs(&mut rng, COUNTS[0]);
+    let blake3_inputs = random_blake3_inputs(&mut rng, COUNTS[1]);
+
+    for (i, &nu) in NUS.iter().enumerate() {
+        let (registry, sha2_r1cs, blake3_r1cs) = &cfgs[i];
+        let s2_circuit = sha2_r1cs.csc_lincheck_circuit();
+        let b3_circuit = blake3_r1cs.csc_lincheck_circuit();
+        let union = UnionInstance::new(registry, COUNTS.to_vec());
+        let pcs_params = union_pcs_params(&union);
+        let mut best = f64::INFINITY;
+        for pass in 0..3 {
+            let slots = vec![
+                UnionSlotProverInput::in_place(
+                    |dst| sha2::generate_witness_batch_major_partial_into(&sha2_inputs, nu, dst),
+                    s2_circuit,
+                ),
+                UnionSlotProverInput::in_place(
+                    |dst| {
+                        blake3::generate_witness_batch_major_partial_into(&blake3_inputs, nu, dst)
+                    },
+                    b3_circuit,
+                ),
+            ];
+            let mut ch = FsChallenger::new(DOMAIN);
+            let t = Instant::now();
+            let (_p, _c, _cl) = prover::prove_fast_ligerito_jagged_union_merged(
+                &union,
+                &pcs_params,
+                slots,
+                &mut ch,
+            );
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            if pass > 0 {
+                best = best.min(ms);
+            }
+        }
+        println!(
+            "merged nu = {nu} (M = {}): {best:.1} ms (best of 2)",
+            union.m_total()
+        );
+    }
+}
+
 /// In-place witness generation is BYTE-IDENTICAL to prebuilt + scatter.
 ///
 /// [`UnionSlotProverInput::in_place`] hands each driver the slot's aligned
