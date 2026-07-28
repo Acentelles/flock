@@ -385,12 +385,16 @@ the crossover is on the order of a thousand columns, past which this
 protocol's proof work is column-independent except for the single
 assist. A prototype confirms the shape ($m = 23$, $K = 2$, Apple
 silicon; exact-value tests against the brute-force twisted weight):
-the proof machinery holds flat at ${\approx}18$--$28$\,ms across
-$368 / 4096 / 32768$ columns (dense passes $+$ sumcheck $+$ anchor,
-unoptimized relative to the production fold kernels), while computing
-the sent values measures $2.5 / 15 / 142$\,ms --- now the sole
-column-linear term. The batched assist measures $5.5$\,ms at $368$
-columns and is memory-infeasible past a few thousand.
+prove totals $17 / 29 / 95$\,ms across $368 / 4096 / 32768$ columns,
+of which the dense passes and sumcheck hold flat at
+${\approx}15$\,ms, the single anchor assist is $0.4 / 1.7 / 10$\,ms,
+and computing the sent values --- evaluated incrementally along the
+boundary stride (each column recomputes its suffix program only from
+the highest changed boundary bit down, amortized $O(\log
+\mathrm{stride})$ layers instead of $m{+}1$) --- is
+$1.7 / 11 / 68$\,ms. Verification measures $0.4 / 1.0 / 5.7$\,ms. The
+batched assist measures $5.5$\,ms at $368$ columns and is
+memory-infeasible past a few thousand.
 
 \section{Implementation}\label{sec:eval}
 

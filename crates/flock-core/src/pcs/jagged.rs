@@ -1746,35 +1746,53 @@ fn apply_linear_tables(tables: &[[F128; 256]], x: F128) -> F128 {
     acc
 }
 
-/// All columns' full BP values `ĝ(y)` at `(z_row, z_index)`: the suffix DP of
-/// [`assist_suffix_rows`] with a two-row rolling window — same 8 multiplies
-/// per column per layer, NO per-layer storage (only the final row survives).
+/// All columns' full BP values `ĝ(y)` at `(z_row, z_index)` — the suffix DP
+/// of [`assist_suffix_rows`], INCREMENTAL across columns: `S[ℓ]` depends
+/// only on boundary bits `≥ ℓ`, and consecutive prefix sums share their
+/// high bits, so each column recomputes layers only from its highest
+/// changed bit down. Value-identical to the full per-column DP (unchanged
+/// layers ARE the stored values; recomputed layers do the identical
+/// arithmetic). Amortized `O(log stride)` layers per column instead of
+/// `m + 1`.
 fn assist_g_values(
     cols: &[(F128, u64, u64)],
     eq4s: &[[F128; 4]],
     sparse: &[[[(usize, usize); 2]; 4]; 4],
     m: usize,
 ) -> Vec<F128> {
-    let n_cols = cols.len();
-    let mut cur = vec![[F128::ZERO; 4]; n_cols];
-    for v in cur.iter_mut() {
-        v[STATE_SUCCESS] = F128::ONE;
-    }
-    let mut next = vec![[F128::ZERO; 4]; n_cols];
-    for layer in (0..=m).rev() {
-        let eq4 = &eq4s[layer];
-        for ((dv, sv), &(_, t_c, t_next)) in next.iter_mut().zip(&cur).zip(cols) {
+    let mut sfx = vec![[F128::ZERO; 4]; m + 2];
+    sfx[m + 1][STATE_SUCCESS] = F128::ONE;
+    let mut out = Vec::with_capacity(cols.len());
+    let mut prev: Option<(u64, u64)> = None;
+    for &(_, t_c, t_next) in cols {
+        let top = match prev {
+            None => m,
+            Some((pc, pd)) => {
+                let diff = (t_c ^ pc) | (t_next ^ pd);
+                if diff == 0 {
+                    out.push(sfx[0][STATE_INITIAL]);
+                    continue;
+                }
+                (63 - diff.leading_zeros() as usize).min(m)
+            }
+        };
+        for layer in (0..=top).rev() {
             let cd = ((t_c >> layer) & 1) as usize + 2 * ((t_next >> layer) & 1) as usize;
             let rows_cd = &sparse[cd];
-            for (s, slot) in dv.iter_mut().enumerate() {
+            let eq4 = &eq4s[layer];
+            let (lo, hi) = sfx.split_at_mut(layer + 1);
+            let dst = &mut lo[layer];
+            let src = &hi[0];
+            for (s, slot) in dst.iter_mut().enumerate() {
                 let (i0, o0) = rows_cd[s][0];
                 let (i1, o1) = rows_cd[s][1];
-                *slot = eq4[i0] * sv[o0] + eq4[i1] * sv[o1];
+                *slot = eq4[i0] * src[o0] + eq4[i1] * src[o1];
             }
         }
-        std::mem::swap(&mut cur, &mut next);
+        out.push(sfx[0][STATE_INITIAL]);
+        prev = Some((t_c, t_next));
     }
-    cur.iter().map(|v| v[STATE_INITIAL]).collect()
+    out
 }
 
 /// The 128 dual-form values per claim: `A_j = f̂_jag(z_r, z_c, ρ^{2^{-j}})` —
@@ -1820,41 +1838,66 @@ fn multipoint_values(
 /// The γ-combined untwisted weight vector `ā_d = Σ_i γ^{128 i}·
 /// eq(z_{i,r}, row(d))·eq(z_{i,c}, col(d))`, zero past the area — segmented
 /// parallel fill from the prefix sums.
-fn build_combined_weight(
+/// Build the γ-combined weight ā AND the round-0 message of `Σ ā·g` in one
+/// traversal: each output chunk is filled (all claims — the chunk stays
+/// cache-resident across the per-claim cursor walks) and immediately paired
+/// against the matching `g` chunk for the message partial sums.
+fn build_combined_weight_and_msg(
     params: &JaggedParams,
     claims: &[FrobeniusClaim<'_>],
     gpow: &[F128],
-) -> Vec<F128> {
+    g: &[F128],
+) -> (Vec<F128>, (F128, F128)) {
     use rayon::prelude::*;
     let mut a = vec![F128::ZERO; 1usize << params.m];
     let pfx = &params.col_prefix_sums;
     let n_cols = pfx.len() - 1;
-    for (i, claim) in claims.iter().enumerate() {
-        let scale = gpow[128 * i];
-        let eq_r = build_eq_table(claim.z_row);
-        let eq_c = build_eq_table(claim.z_col);
-        const CH: usize = 1 << 14;
-        a.par_chunks_mut(CH).enumerate().for_each(|(ci, chunk)| {
+    let sides: Vec<(F128, Vec<F128>, Vec<F128>)> = claims
+        .iter()
+        .enumerate()
+        .map(|(i, claim)| {
+            (
+                gpow[128 * i],
+                build_eq_table(claim.z_row),
+                build_eq_table(claim.z_col),
+            )
+        })
+        .collect();
+    const CH: usize = 1 << 14;
+    let msg = a
+        .par_chunks_mut(CH)
+        .zip(g.par_chunks(CH))
+        .enumerate()
+        .map(|(ci, (chunk, gc))| {
             let start = (ci * CH) as u64;
             let end = start + chunk.len() as u64;
-            let mut y = pfx.partition_point(|&t| t <= start).saturating_sub(1);
-            let mut d = start;
-            while d < end && y < n_cols {
-                let (t_c, t_next) = (pfx[y], pfx[y + 1]);
-                if t_next <= d {
-                    y += 1;
-                    continue;
+            for (scale, eq_r, eq_c) in &sides {
+                let mut y = pfx.partition_point(|&t| t <= start).saturating_sub(1);
+                let mut d = start;
+                while d < end && y < n_cols {
+                    let (t_c, t_next) = (pfx[y], pfx[y + 1]);
+                    if t_next <= d {
+                        y += 1;
+                        continue;
+                    }
+                    let w = *scale * eq_c[y];
+                    let stop = end.min(t_next);
+                    for dd in d..stop {
+                        chunk[(dd - start) as usize] += w * eq_r[(dd - t_c) as usize];
+                    }
+                    d = stop;
                 }
-                let w = scale * eq_c[y];
-                let stop = end.min(t_next);
-                for dd in d..stop {
-                    chunk[(dd - start) as usize] += w * eq_r[(dd - t_c) as usize];
-                }
-                d = stop;
             }
-        });
-    }
-    a
+            let mut p1 = F128::ZERO;
+            let mut pi = F128::ZERO;
+            for (ap, gp) in chunk.chunks_exact(2).zip(gc.chunks_exact(2)) {
+                p1 += ap[1] * gp[1];
+                pi += (ap[0] + ap[1]) * (gp[0] + gp[1]);
+            }
+            (p1, pi)
+        })
+        .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1));
+    (a, msg)
 }
 
 /// Transcript of the multipoint twisted evaluation: the `128·K` dual-form
@@ -1922,55 +1965,47 @@ pub fn prove_multipoint_twisted<C: Challenger>(
         }
     }
     let tables = linear_byte_tables(&images);
-    let g_vec: Vec<F128> = eq_rho
-        .par_iter()
-        .map(|&e| apply_linear_tables(&tables, e))
-        .collect();
-    drop(eq_rho);
-    let a_vec = build_combined_weight(params, claims, &gpow);
+    let mut gv = eq_rho;
+    gv.par_iter_mut()
+        .for_each(|e| *e = apply_linear_tables(&tables, *e));
+    let (mut av, msg0) = build_combined_weight_and_msg(params, claims, &gpow, &gv);
     if trace {
         eprintln!(
-            "    [multipoint] g + a dense passes (2^{m}): {:6.2} ms",
+            "    [multipoint] g + a dense passes (2^{m}, round-0 fused): {:6.2} ms",
             t.elapsed().as_secs_f64() * 1e3
         );
     }
 
-    // The m-round product sumcheck for Σ_d ā_d·g_d, low bit first.
+    // The m-round product sumcheck for Σ_d ā_d·g_d, low bit first: round-0
+    // message from the full vectors, later messages fused into the fold
+    // ([`fold_and_round_oop_par`], ping-pong scratch halves). The final fold
+    // never runs — nothing reads the folded scalars; the anchor assist
+    // reproves the endpoint.
     let t = std::time::Instant::now();
-    let mut av = a_vec;
-    let mut gv = g_vec;
+    let mut sa = vec![F128::ZERO; av.len() / 2];
+    let mut sg = vec![F128::ZERO; gv.len() / 2];
     let mut rounds = Vec::with_capacity(m);
     let mut point = Vec::with_capacity(m);
-    for _ in 0..m {
-        const CH: usize = 1 << 13;
-        let (g_one, g_inf) = av
-            .par_chunks(2 * CH)
-            .zip(gv.par_chunks(2 * CH))
-            .map(|(ac, gc)| {
-                let mut p1 = F128::ZERO;
-                let mut pi = F128::ZERO;
-                for (ap, gp) in ac.chunks_exact(2).zip(gc.chunks_exact(2)) {
-                    p1 += ap[1] * gp[1];
-                    pi += (ap[0] + ap[1]) * (gp[0] + gp[1]);
-                }
-                (p1, pi)
-            })
-            .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1));
+    let (mut g_one, mut g_inf) = msg0;
+    let mut cur = av.len();
+    let mut flip = false;
+    for i in 0..m {
         challenger.observe_f128(g_one);
         challenger.observe_f128(g_inf);
         let r = challenger.sample_f128();
         rounds.push((g_one, g_inf));
         point.push(r);
-        av = av
-            .par_chunks(2)
-            .with_min_len(1 << 12)
-            .map(|p| p[0] + r * (p[0] + p[1]))
-            .collect();
-        gv = gv
-            .par_chunks(2)
-            .with_min_len(1 << 12)
-            .map(|p| p[0] + r * (p[0] + p[1]))
-            .collect();
+        if i + 1 == m {
+            break;
+        }
+        let half = cur / 2;
+        (g_one, g_inf) = if flip {
+            fold_and_round_oop_par(&sa[..cur], &sg[..cur], r, &mut av[..half], &mut gv[..half])
+        } else {
+            fold_and_round_oop_par(&av[..cur], &gv[..cur], r, &mut sa[..half], &mut sg[..half])
+        };
+        flip = !flip;
+        cur = half;
     }
     if trace {
         eprintln!(
