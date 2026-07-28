@@ -1746,14 +1746,24 @@ fn apply_linear_tables(tables: &[[F128; 256]], x: F128) -> F128 {
     acc
 }
 
-/// All columns' full BP values `ĝ(y)` at `(z_row, z_index)` — the suffix DP
-/// of [`assist_suffix_rows`], INCREMENTAL across columns: `S[ℓ]` depends
-/// only on boundary bits `≥ ℓ`, and consecutive prefix sums share their
-/// high bits, so each column recomputes layers only from its highest
-/// changed bit down. Value-identical to the full per-column DP (unchanged
-/// layers ARE the stored values; recomputed layers do the identical
-/// arithmetic). Amortized `O(log stride)` layers per column instead of
-/// `m + 1`.
+/// All columns' full BP values `ĝ(y)` at `(z_row, z_index)`, exploiting two
+/// layers of structure:
+///
+/// - INCREMENTAL suffix DP: `S[ℓ]` depends only on boundary bits `≥ ℓ`, and
+///   consecutive prefix sums share their high bits, so a column recomputes
+///   only from its highest changed bit down — amortized `O(log stride)`
+///   layers instead of `m + 1`.
+/// - STRIDED low tables: the value is the matrix product
+///   `e_I·M_0⋯M_m·e_S`, splittable at any layer `ℓ` into
+///   `(low row-vector)·S[ℓ]`. Within a run of equal heights `h` (any
+///   integer), the pair's low-`ℓ` bits are a function of `t_c mod 2^ℓ`
+///   alone, so ONE table of `2^ℓ` row-vectors (doubling build,
+///   `16·2^ℓ` multiplies) serves the whole run; with `ℓ ≈ log h + 2` the
+///   suffix side changes rarely, and each column costs one 4-multiply dot.
+///
+/// Per run the cheaper of the two is chosen. Values are exactly those of
+/// the full per-column DP — unchanged layers ARE the stored values, and the
+/// table split is a reassociation of the same field product.
 fn assist_g_values(
     cols: &[(F128, u64, u64)],
     eq4s: &[[F128; 4]],
@@ -1764,19 +1774,15 @@ fn assist_g_values(
     sfx[m + 1][STATE_SUCCESS] = F128::ONE;
     let mut out = Vec::with_capacity(cols.len());
     let mut prev: Option<(u64, u64)> = None;
-    for &(_, t_c, t_next) in cols {
-        let top = match prev {
-            None => m,
-            Some((pc, pd)) => {
-                let diff = (t_c ^ pc) | (t_next ^ pd);
-                if diff == 0 {
-                    out.push(sfx[0][STATE_INITIAL]);
-                    continue;
-                }
-                (63 - diff.leading_zeros() as usize).min(m)
-            }
-        };
-        for layer in (0..=top).rev() {
+    // sfx[ℓ] is valid (w.r.t. `prev`) for ℓ ≥ valid_floor.
+    let mut valid_floor = m + 1;
+
+    // Recompute sfx layers [floor, start] descending for the pair
+    // (t_c, t_next); sfx[start + 1] must be valid.
+    let refresh = |sfx: &mut Vec<[F128; 4]>, t_c: u64, t_next: u64, start: usize, floor: usize| {
+        let mut layer = start + 1;
+        while layer > floor {
+            layer -= 1;
             let cd = ((t_c >> layer) & 1) as usize + 2 * ((t_next >> layer) & 1) as usize;
             let rows_cd = &sparse[cd];
             let eq4 = &eq4s[layer];
@@ -1789,8 +1795,109 @@ fn assist_g_values(
                 *slot = eq4[i0] * src[o0] + eq4[i1] * src[o1];
             }
         }
-        out.push(sfx[0][STATE_INITIAL]);
-        prev = Some((t_c, t_next));
+    };
+    // Recompute start: highest changed bit vs `prev`, raised to cover any
+    // stale layers between the target floor and the current valid floor.
+    let start_for =
+        |prev: Option<(u64, u64)>, t_c: u64, t_next: u64, valid_floor: usize, floor: usize| {
+            let top = match prev {
+                None => m,
+                Some((pc, pd)) => {
+                    let diff = (t_c ^ pc) | (t_next ^ pd);
+                    if diff == 0 {
+                        0usize
+                    } else {
+                        (63 - diff.leading_zeros() as usize).min(m)
+                    }
+                }
+            };
+            let stale_top = if valid_floor > floor {
+                valid_floor - 1
+            } else {
+                0
+            };
+            top.max(stale_top)
+        };
+
+    let mut i = 0;
+    while i < cols.len() {
+        // Maximal run of equal stride starting here (prefix sums are
+        // contiguous by construction, so equal height IS the run condition).
+        let h = cols[i].2 - cols[i].1;
+        let mut end = i + 1;
+        while end < cols.len() && cols[end].2 - cols[end].1 == h {
+            end += 1;
+        }
+        let k = end - i;
+
+        // Split layer for the low table, and the adaptive choice: table
+        // build 16·2^l + ~6 multiplies/col vs ~8·(l+1) multiplies/col
+        // incremental.
+        let l = if h == 0 {
+            0
+        } else {
+            (64 - h.leading_zeros() as usize + 2).min(m + 1)
+        };
+        let table_cost = 16u128 * (1u128 << l) + 6 * (k as u128);
+        let inc_cost = 8 * (k as u128) * (l as u128 + 1);
+        let use_table = h > 0 && l <= m && table_cost < inc_cost;
+
+        if use_table {
+            // Doubling build of the low row-vectors over l bits: bit ℓ of
+            // the pair is (v_ℓ, bit ℓ of v + h) — both functions of
+            // v = t_c mod 2^l.
+            let mut table: Vec<[F128; 4]> = Vec::with_capacity(1 << l);
+            let mut seed = [F128::ZERO; 4];
+            seed[STATE_INITIAL] = F128::ONE;
+            table.push(seed);
+            for layer in 0..l {
+                let mut next_t: Vec<[F128; 4]> = vec![[F128::ZERO; 4]; 1 << (layer + 1)];
+                let eq4 = &eq4s[layer];
+                for (v, dst) in next_t.iter_mut().enumerate() {
+                    let src = &table[v & ((1 << layer) - 1)];
+                    let c_bit = (v >> layer) & 1;
+                    let d_bit = ((v as u64 + h) >> layer) & 1;
+                    let cd = c_bit + 2 * d_bit as usize;
+                    let rows_cd = &sparse[cd];
+                    for (s, &sv) in src.iter().enumerate() {
+                        let (i0, o0) = rows_cd[s][0];
+                        let (i1, o1) = rows_cd[s][1];
+                        dst[o0] += sv * eq4[i0];
+                        dst[o1] += sv * eq4[i1];
+                    }
+                }
+                table = next_t;
+            }
+            let mask = (1u64 << l) - 1;
+            for &(_, t_c, t_next) in &cols[i..end] {
+                let start = start_for(prev, t_c, t_next, valid_floor, l);
+                if start >= l {
+                    refresh(&mut sfx, t_c, t_next, start, l);
+                    valid_floor = l;
+                } else {
+                    // No refresh: layers touched by the (low) changed bits
+                    // become stale; everything above stays valid.
+                    valid_floor = valid_floor.max(start + 1);
+                }
+                prev = Some((t_c, t_next));
+                let row = &table[(t_c & mask) as usize];
+                let s_l = &sfx[l];
+                out.push(dot4(row, s_l));
+            }
+        } else {
+            for &(_, t_c, t_next) in &cols[i..end] {
+                if prev == Some((t_c, t_next)) && valid_floor == 0 {
+                    out.push(sfx[0][STATE_INITIAL]);
+                    continue;
+                }
+                let start = start_for(prev, t_c, t_next, valid_floor, 0);
+                refresh(&mut sfx, t_c, t_next, start, 0);
+                valid_floor = 0;
+                prev = Some((t_c, t_next));
+                out.push(sfx[0][STATE_INITIAL]);
+            }
+        }
+        i = end;
     }
     out
 }
@@ -2822,8 +2929,71 @@ mod tests {
         println!("frobenius assist prove (256 stmts, 368 cols, m = 23): {best:.2} ms (min of 12)");
     }
 
+    /// Shared oracle body: prove + verify a two-claim multipoint twisted
+    /// evaluation on `params`, compare against the brute-force twisted
+    /// weight Ŵ(ρ), and reject a tampered value.
+    fn check_multipoint(params: &JaggedParams, ch: &mut RandomChallenger, label: &str) {
+        let (n, k, m) = (params.n, params.k, params.m);
+        let z1r = sample_vec(ch, n);
+        let z1c = sample_vec(ch, k);
+        let z2r = sample_vec(ch, n);
+        let z2c = sample_vec(ch, k);
+        let mut c1 = sample_vec(ch, 128);
+        let mut c2 = sample_vec(ch, 128);
+        c1[7] = F128::ZERO; // zero coefficients are skipped
+        c2[100] = F128::ZERO;
+        let rho = sample_vec(ch, m);
+        let claims = [
+            FrobeniusClaim {
+                z_row: &z1r,
+                z_col: &z1c,
+                coeffs: &c1,
+            },
+            FrobeniusClaim {
+                z_row: &z2r,
+                z_col: &z2c,
+                coeffs: &c2,
+            },
+        ];
+        let mut chp = FsChallenger::new(b"multipoint-test");
+        let proof = prove_multipoint_twisted(params, &claims, &rho, &mut chp);
+        let mut chv = FsChallenger::new(b"multipoint-test");
+        let v = verify_multipoint_twisted(params, &claims, &rho, &proof, &mut chv)
+            .expect("honest multipoint proof verifies");
+
+        // Brute force: Ŵ(ρ) = Σ_d eq(ρ,d)·Σ_i Φ_i(a_{i,d}).
+        let eq_idx = build_eq_table(&rho);
+        let sides = [
+            (build_eq_table(&z1r), build_eq_table(&z1c), &c1),
+            (build_eq_table(&z2r), build_eq_table(&z2c), &c2),
+        ];
+        let mut expect = F128::ZERO;
+        for e in 0..params.area() {
+            let (row, col) = params.unrank(e);
+            for (eq_r, eq_c, cs) in &sides {
+                let mut x = eq_r[row] * eq_c[col];
+                for &cj in cs.iter() {
+                    if !cj.is_zero() {
+                        expect += eq_idx[e as usize] * cj * x;
+                    }
+                    x = x * x;
+                }
+            }
+        }
+        assert_eq!(v, expect, "{label}");
+
+        // Tamper: a perturbed value must be rejected.
+        let mut bad = proof.clone();
+        bad.values[0][3] += F128::ONE;
+        let mut chb = FsChallenger::new(b"multipoint-test");
+        assert!(
+            verify_multipoint_twisted(params, &claims, &rho, &bad, &mut chb).is_none(),
+            "tampered value accepted ({label})"
+        );
+    }
+
     /// The multipoint twisted evaluation returns the brute-force twisted
-    /// weight Ŵ(ρ) — across jagged shapes, two claims, zero coefficients —
+    /// weight Ŵ(ρ) — random jagged shapes, two claims, zero coefficients —
     /// and rejects a tampered value.
     #[test]
     fn multipoint_twisted_matches_bruteforce() {
@@ -2831,64 +3001,41 @@ mod tests {
         for &(n, k, m) in &[(3usize, 2usize, 5usize), (4, 3, 7), (2, 4, 6)] {
             for rep in 0..3 {
                 let (params, _q) = random_instance(&mut ch, n, k, m);
-                let z1r = sample_vec(&mut ch, n);
-                let z1c = sample_vec(&mut ch, k);
-                let z2r = sample_vec(&mut ch, n);
-                let z2c = sample_vec(&mut ch, k);
-                let mut c1 = sample_vec(&mut ch, 128);
-                let mut c2 = sample_vec(&mut ch, 128);
-                c1[7] = F128::ZERO; // zero coefficients are skipped
-                c2[100] = F128::ZERO;
-                let rho = sample_vec(&mut ch, m);
-                let claims = [
-                    FrobeniusClaim {
-                        z_row: &z1r,
-                        z_col: &z1c,
-                        coeffs: &c1,
-                    },
-                    FrobeniusClaim {
-                        z_row: &z2r,
-                        z_col: &z2c,
-                        coeffs: &c2,
-                    },
-                ];
-                let mut chp = FsChallenger::new(b"multipoint-test");
-                let proof = prove_multipoint_twisted(&params, &claims, &rho, &mut chp);
-                let mut chv = FsChallenger::new(b"multipoint-test");
-                let v = verify_multipoint_twisted(&params, &claims, &rho, &proof, &mut chv)
-                    .expect("honest multipoint proof verifies");
-
-                // Brute force: Ŵ(ρ) = Σ_d eq(ρ,d)·Σ_i Φ_i(a_{i,d}).
-                let eq_idx = build_eq_table(&rho);
-                let sides = [
-                    (build_eq_table(&z1r), build_eq_table(&z1c), &c1),
-                    (build_eq_table(&z2r), build_eq_table(&z2c), &c2),
-                ];
-                let mut expect = F128::ZERO;
-                for e in 0..params.area() {
-                    let (row, col) = params.unrank(e);
-                    for (eq_r, eq_c, cs) in &sides {
-                        let mut x = eq_r[row] * eq_c[col];
-                        for &cj in cs.iter() {
-                            if !cj.is_zero() {
-                                expect += eq_idx[e as usize] * cj * x;
-                            }
-                            x = x * x;
-                        }
-                    }
-                }
-                assert_eq!(v, expect, "n={n} k={k} m={m} rep={rep}");
-
-                // Tamper: a perturbed value must be rejected.
-                let mut bad = proof.clone();
-                bad.values[0][3] += F128::ONE;
-                let mut chb = FsChallenger::new(b"multipoint-test");
-                assert!(
-                    verify_multipoint_twisted(&params, &claims, &rho, &bad, &mut chb).is_none(),
-                    "tampered value accepted (n={n} k={k} m={m})"
-                );
+                check_multipoint(&params, &mut ch, &format!("n={n} k={k} m={m} rep={rep}"));
             }
         }
+    }
+
+    /// Strided shapes — long runs of equal NON-power-of-two heights, the
+    /// low-table path of [`assist_g_values`] — plus run boundaries, zero
+    /// heights, and a power-of-two run, all against the same brute force.
+    #[test]
+    fn multipoint_twisted_strided_matches_bruteforce() {
+        let mut ch = RandomChallenger::new(0x4D50_57F1);
+        // 24 columns of height 13, 10 of height 5, one zero column, the
+        // rest empty (n = 4, m = 9: area 362 < 512).
+        let mut heights = vec![0u64; 64];
+        for h in heights.iter_mut().take(24) {
+            *h = 13;
+        }
+        for h in heights[24..34].iter_mut() {
+            *h = 5;
+        }
+        let params = JaggedParams::from_heights(&heights, 4, 9);
+        check_multipoint(&params, &mut ch, "strided 24x13 + 10x5");
+
+        // A long odd-stride run: 60 columns of height 6 (n = 3, m = 9).
+        let mut heights = vec![0u64; 64];
+        for h in heights.iter_mut().take(60) {
+            *h = 6;
+        }
+        let params = JaggedParams::from_heights(&heights, 3, 9);
+        check_multipoint(&params, &mut ch, "strided 60x6");
+
+        // Power-of-two run at full utilization (n = 3, m = 9: 64·8 = 512).
+        let heights = vec![8u64; 64];
+        let params = JaggedParams::from_heights(&heights, 3, 9);
+        check_multipoint(&params, &mut ch, "strided 64x8 full");
     }
 
     /// Multipoint twisted evaluation across column counts at m = 23, against
@@ -2899,14 +3046,16 @@ mod tests {
     fn multipoint_twisted_bench() {
         let mut ch = RandomChallenger::new(0x4D50_BE7C);
         let m = 23usize;
-        for &(n, k, cols, run_assist) in &[
-            (14usize, 9usize, 368usize, true),
-            (11, 12, 4096, false),
-            (8, 15, 32768, false),
+        for &(n, k, cols, height, run_assist) in &[
+            (14usize, 9usize, 368usize, 1u64 << 14, true),
+            (11, 12, 4096, 1 << 11, false),
+            (8, 15, 32768, 1 << 8, false),
+            // Non-power-of-two stride: the low-table path on an odd-ish run.
+            (9, 15, 27962, 300, false),
         ] {
             let mut heights = vec![0u64; 1 << k];
             for h in heights.iter_mut().take(cols) {
-                *h = 1 << n;
+                *h = height;
             }
             let params = JaggedParams::from_heights(&heights, n, m);
             let z1r = sample_vec(&mut ch, n);
