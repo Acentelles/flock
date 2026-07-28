@@ -1387,26 +1387,17 @@ fn frobenius_statements(
 fn frobenius_layer_pass(
     st: &mut FrobeniusStatement,
     layer: usize,
-    prev_ch: Option<(F128, F128)>,
+    ch4: Option<&[F128; 4]>,
     sparse: &[[[(usize, usize); 2]; 4]; 4],
 ) -> ([[F128; 4]; 4], [[F128; 4]; 4]) {
     let n_cols = st.cols.len();
     let row = &st.sfx[(layer + 1) * n_cols..(layer + 2) * n_cols];
     let mut buckets = [[F128::ZERO; 4]; 4];
     for ((w_e, &(_, t_c, t_next)), s) in st.we.iter_mut().zip(&st.cols).zip(row) {
-        if let Some((rc, rd)) = prev_ch {
+        if let Some(ch4) = ch4 {
             let pl = layer - 1;
-            let ec = if (t_c >> pl) & 1 == 1 {
-                rc
-            } else {
-                F128::ONE + rc
-            };
-            let ed = if (t_next >> pl) & 1 == 1 {
-                rd
-            } else {
-                F128::ONE + rd
-            };
-            *w_e *= ec * ed;
+            let prev = ((t_c >> pl) & 1) as usize + 2 * ((t_next >> pl) & 1) as usize;
+            *w_e *= ch4[prev];
         }
         let cd = ((t_c >> layer) & 1) as usize + 2 * ((t_next >> layer) & 1) as usize;
         let v = *w_e;
@@ -1470,7 +1461,7 @@ pub fn prove_frobenius_assist<C: Challenger>(
     challenger.observe_label(b"flock-frobenius-assist-v0");
     challenger.observe_f128(v);
 
-    let mut prev_ch: Option<(F128, F128)> = None;
+    let mut ch4: Option<[F128; 4]> = None;
     let mut rounds = Vec::with_capacity(2 * (m + 1));
     for layer in 0..=m {
         // Per-statement column pass: fold the previous layer's challenges
@@ -1482,11 +1473,12 @@ pub fn prove_frobenius_assist<C: Challenger>(
         // ~32 tasks per round.
         let mut per: Vec<([[F128; 4]; 4], [[F128; 4]; 4])> =
             vec![([[F128::ZERO; 4]; 4], [[F128::ZERO; 4]; 4]); sts.len()];
+        let c4 = ch4.as_ref();
         sts.par_chunks_mut(8)
             .zip(per.par_chunks_mut(8))
             .for_each(|(stc, oc)| {
                 for (st, o) in stc.iter_mut().zip(oc.iter_mut()) {
-                    *o = frobenius_layer_pass(st, layer, prev_ch, &sparse);
+                    *o = frobenius_layer_pass(st, layer, c4, &sparse);
                 }
             });
 
@@ -1522,10 +1514,14 @@ pub fn prove_frobenius_assist<C: Challenger>(
         let rd = challenger.sample_f128();
         rounds.push((g_one, g_inf));
 
+        let rd1 = F128::ONE + rd;
         for (st, (ud0, ud1)) in sts.iter_mut().zip(&folded) {
-            st.prefix_row = comb4(F128::ONE + rd, ud0, rd, ud1);
+            st.prefix_row = comb4(rd1, ud0, rd, ud1);
         }
-        prev_ch = Some((rc, rd));
+        // The next layer folds `ec·ed` per column; precompute the four
+        // quadrant products once (multiplication associativity — value-
+        // identical to the two-multiply form).
+        ch4 = Some([rc1 * rd1, rc * rd1, rc1 * rd, rc * rd]);
     }
 
     if trace {
@@ -2268,6 +2264,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Timing probe for the batched Frobenius assist prover at the m30
+    /// merged shape: n = 14, k = 9 (368 live columns at full height),
+    /// m = 23, two claims × 128 coefficients = 256 statements.
+    /// Informational — prints the min-of-N prove time.
+    #[test]
+    #[ignore] // Timing probe — run explicitly with --ignored --nocapture
+    fn frobenius_assist_bench() {
+        let mut ch = RandomChallenger::new(0xBE4C_0011);
+        let (n, k, m) = (14usize, 9usize, 23usize);
+        let mut heights = vec![0u64; 1 << k];
+        for h in heights.iter_mut().take(368) {
+            *h = 1 << n;
+        }
+        let params = JaggedParams::from_heights(&heights, n, m);
+        let z_row_a = sample_vec(&mut ch, n);
+        let z_col_a = sample_vec(&mut ch, k);
+        let coeffs_a = sample_vec(&mut ch, 128);
+        let z_row_b = sample_vec(&mut ch, n);
+        let z_col_b = sample_vec(&mut ch, k);
+        let coeffs_b = sample_vec(&mut ch, 128);
+        let claims = [
+            FrobeniusClaim {
+                z_row: &z_row_a,
+                z_col: &z_col_a,
+                coeffs: &coeffs_a,
+            },
+            FrobeniusClaim {
+                z_row: &z_row_b,
+                z_col: &z_col_b,
+                coeffs: &coeffs_b,
+            },
+        ];
+        let rho = sample_vec(&mut ch, m);
+        let mut best = f64::INFINITY;
+        for _ in 0..12 {
+            let mut fs = FsChallenger::new(b"frobenius-assist-bench");
+            let t = std::time::Instant::now();
+            let proof = prove_frobenius_assist(&params, &claims, &rho, &mut fs);
+            best = best.min(t.elapsed().as_secs_f64() * 1e3);
+            std::hint::black_box(proof);
+        }
+        println!("frobenius assist prove (256 stmts, 368 cols, m = 23): {best:.2} ms (min of 12)");
     }
 
     #[test]
