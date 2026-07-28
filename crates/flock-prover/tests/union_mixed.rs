@@ -1259,7 +1259,7 @@ fn merged_capacity_attribution() {
     let _quiet = timing_lock();
     use std::time::Instant;
     const COUNTS: [usize; 2] = [16384, 16384];
-    const NUS: [usize; 2] = [14, 18];
+    const NUS: [usize; 5] = [14, 15, 16, 17, 18];
 
     let cfgs: Vec<_> = NUS.iter().map(|&nu| mixed_registry(nu)).collect();
     flock_core::scratch::prewarm_prover(cfgs.last().unwrap().0.m_total());
