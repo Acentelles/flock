@@ -411,7 +411,14 @@ $0.4 / 1.7 / 7$\,ms (column-parallelized past ${\sim}2^{14}$ columns;
 the largest remaining column-linear term, and the run tabulation
 applies to it in principle). Verification measures
 $0.3 / 0.6 / 1.7$\,ms. The batched assist measures $5.5$\,ms at $368$
-columns and is memory-infeasible past a few thousand.
+columns and is memory-infeasible past a few thousand. A fused variant
+shares its dense context with the surrounding merged opening ---
+$\eq(\rho,\cdot)$ with the final opening's combine, the per-claim
+untwisted weights with a restructured $W$ build ($W$ is their
+coordinate-wise $\Phi$-image), and warm sumcheck scratch --- producing
+byte-identical proofs at a marginal cost of $12 / 18 / 26$\,ms; net of
+the restructure's own cost the integrated opening saves
+${\approx}5$--$8$\,ms over composing the standalone parts.
 
 \section{Implementation}\label{sec:eval}
 

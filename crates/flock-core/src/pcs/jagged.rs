@@ -2247,6 +2247,224 @@ pub fn prove_multipoint_twisted<C: Challenger>(
     }
 }
 
+/// Reusable buffers for [`prove_multipoint_twisted_fused`] — sized once
+/// (`2·2^m + 2·2^{m-1}` words), warm across proofs.
+pub struct MultipointScratch {
+    a: Vec<F128>,
+    g: Vec<F128>,
+    sa: Vec<F128>,
+    sg: Vec<F128>,
+}
+
+impl MultipointScratch {
+    pub fn new(m: usize) -> Self {
+        Self {
+            a: vec![F128::ZERO; 1 << m],
+            g: vec![F128::ZERO; 1 << m],
+            sa: vec![F128::ZERO; 1 << (m - 1)],
+            sg: vec![F128::ZERO; 1 << (m - 1)],
+        }
+    }
+}
+
+/// One claim's untwisted weight vector `a_d = eq(z_r, row(d))·eq(z_c,
+/// col(d))`, zero past the area — the intermediate a restructured merged
+/// `W` build yields for free (`W` is its coordinate-wise `Φ`-image).
+pub fn build_claim_weight(params: &JaggedParams, z_row: &[F128], z_col: &[F128]) -> Vec<F128> {
+    use rayon::prelude::*;
+    let mut a = vec![F128::ZERO; 1usize << params.m];
+    let pfx = &params.col_prefix_sums;
+    let n_cols = pfx.len() - 1;
+    let eq_r = build_eq_table(z_row);
+    let eq_c = build_eq_table(z_col);
+    const CH: usize = 1 << 14;
+    a.par_chunks_mut(CH).enumerate().for_each(|(ci, chunk)| {
+        let start = (ci * CH) as u64;
+        let end = start + chunk.len() as u64;
+        let mut y = pfx.partition_point(|&t| t <= start).saturating_sub(1);
+        let mut d = start;
+        while d < end && y < n_cols {
+            let (t_c, t_next) = (pfx[y], pfx[y + 1]);
+            if t_next <= d {
+                y += 1;
+                continue;
+            }
+            let w = eq_c[y];
+            let stop = end.min(t_next);
+            for dd in d..stop {
+                chunk[(dd - start) as usize] = w * eq_r[(dd - t_c) as usize];
+            }
+            d = stop;
+        }
+    });
+    a
+}
+
+/// [`prove_multipoint_twisted`] FUSED into a merged-open context: the
+/// caller supplies `eq(ρ,·)` (shared with the inner open's combine — left
+/// untouched), the per-claim untwisted weight vectors (see
+/// [`build_claim_weight`]), and warm scratch. One dense traversal writes
+/// `g` and the γ-combined `ā` and accumulates the round-0 message; the
+/// rounds ping-pong inside the scratch. The proof is BYTE-IDENTICAL to the
+/// standalone prover's (pure reassociation of the same field values), so
+/// [`verify_multipoint_twisted`] verifies it unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_multipoint_twisted_fused<C: Challenger>(
+    params: &JaggedParams,
+    claims: &[FrobeniusClaim<'_>],
+    rho: &[F128],
+    eq_rho: &[F128],
+    a_claims: &[Vec<F128>],
+    scratch: &mut MultipointScratch,
+    challenger: &mut C,
+) -> MultipointTwistedProof {
+    use rayon::prelude::*;
+    let m = params.m;
+    assert_eq!(rho.len(), m);
+    assert_eq!(eq_rho.len(), 1usize << m);
+    assert_eq!(a_claims.len(), claims.len());
+    for (claim, a) in claims.iter().zip(a_claims) {
+        assert_eq!(claim.coeffs.len(), 128);
+        assert_eq!(a.len(), 1usize << m);
+    }
+    let trace = std::env::var("PCS_TRACE").is_ok();
+
+    let t = std::time::Instant::now();
+    let rho_pows = rho_inverse_powers(rho);
+    let values = multipoint_values(params, claims, &rho_pows);
+    if trace {
+        eprintln!(
+            "    [multipoint] {} values (compute): {:6.2} ms",
+            128 * claims.len(),
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
+    challenger.observe_label(b"flock-multipoint-twisted-v0");
+    for vs in &values {
+        for &v in vs {
+            challenger.observe_f128(v);
+        }
+    }
+    let gamma = challenger.sample_f128();
+    let mut gpow = Vec::with_capacity(128 * claims.len());
+    let mut p = F128::ONE;
+    for _ in 0..128 * claims.len() {
+        gpow.push(p);
+        p *= gamma;
+    }
+
+    // ONE dense traversal: g = L_γ(eq(ρ,·)) into scratch, ā = Σ_i
+    // γ^{128 i}·a_i into scratch, round-0 message partials on the way out.
+    let t = std::time::Instant::now();
+    let basis = inv_frob_basis();
+    let mut images = [F128::ZERO; 128];
+    for j in 0..128 {
+        for (b, img) in images.iter_mut().enumerate() {
+            *img += gpow[j] * basis[j][b];
+        }
+    }
+    let tables = linear_byte_tables(&images);
+    const CH: usize = 1 << 14;
+    let n_claims = claims.len();
+    let (mut g_one, mut g_inf) = scratch
+        .a
+        .par_chunks_mut(CH)
+        .zip(scratch.g.par_chunks_mut(CH))
+        .zip(eq_rho.par_chunks(CH))
+        .enumerate()
+        .map(|(ci, ((ac, gc), ec))| {
+            let start = ci * CH;
+            for (k, (av, gv)) in ac.iter_mut().zip(gc.iter_mut()).enumerate() {
+                *gv = apply_linear_tables(&tables, ec[k]);
+                let mut s = a_claims[0][start + k];
+                for i in 1..n_claims {
+                    s += gpow[128 * i] * a_claims[i][start + k];
+                }
+                *av = s;
+            }
+            let mut p1 = F128::ZERO;
+            let mut pi = F128::ZERO;
+            for (ap, gp) in ac.chunks_exact(2).zip(gc.chunks_exact(2)) {
+                p1 += ap[1] * gp[1];
+                pi += (ap[0] + ap[1]) * (gp[0] + gp[1]);
+            }
+            (p1, pi)
+        })
+        .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1));
+    if trace {
+        eprintln!(
+            "    [multipoint] fused g + ā + round-0 (2^{m}): {:6.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
+    let t = std::time::Instant::now();
+    let mut rounds = Vec::with_capacity(m);
+    let mut point = Vec::with_capacity(m);
+    let mut cur = 1usize << m;
+    let (mut src_a, mut src_g): (&mut [F128], &mut [F128]) = (&mut scratch.a, &mut scratch.g);
+    let (mut dst_a, mut dst_g): (&mut [F128], &mut [F128]) = (&mut scratch.sa, &mut scratch.sg);
+    for i in 0..m {
+        challenger.observe_f128(g_one);
+        challenger.observe_f128(g_inf);
+        let r = challenger.sample_f128();
+        rounds.push((g_one, g_inf));
+        point.push(r);
+        if i + 1 == m {
+            break;
+        }
+        let half = cur / 2;
+        (g_one, g_inf) = fold_and_round_oop_par(
+            &src_a[..cur],
+            &src_g[..cur],
+            r,
+            &mut dst_a[..half],
+            &mut dst_g[..half],
+        );
+        std::mem::swap(&mut src_a, &mut dst_a);
+        std::mem::swap(&mut src_g, &mut dst_g);
+        cur = half;
+    }
+    if trace {
+        eprintln!(
+            "    [multipoint] product sumcheck ({m} rounds): {:6.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
+    let t = std::time::Instant::now();
+    let anchor_coeffs: Vec<Vec<F128>> = (0..claims.len())
+        .map(|i| {
+            let mut c = vec![F128::ZERO; 128];
+            c[0] = gpow[128 * i];
+            c
+        })
+        .collect();
+    let anchor_claims: Vec<FrobeniusClaim<'_>> = claims
+        .iter()
+        .zip(&anchor_coeffs)
+        .map(|(cl, co)| FrobeniusClaim {
+            z_row: cl.z_row,
+            z_col: cl.z_col,
+            coeffs: co,
+        })
+        .collect();
+    let anchor = prove_frobenius_assist(params, &anchor_claims, &point, challenger);
+    if trace {
+        eprintln!(
+            "    [multipoint] anchor assist (x{}): {:6.2} ms",
+            claims.len(),
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    MultipointTwistedProof {
+        values,
+        rounds,
+        anchor,
+    }
+}
+
 /// Verifier for the multipoint twisted evaluation. On success returns the
 /// verified `V = Σ_{i,j} c_{i,j}·A_{i,j}^{2^j} = Ŵ(ρ)`.
 pub fn verify_multipoint_twisted<C: Challenger>(
@@ -3130,6 +3348,70 @@ mod tests {
         check_multipoint(&params, &mut ch, "strided 64x8 full");
     }
 
+    /// The FUSED multipoint prover produces a proof byte-identical to the
+    /// standalone one (given the context it would inherit from a
+    /// restructured merged open), and it verifies.
+    #[test]
+    fn multipoint_fused_matches_standalone() {
+        let mut ch = RandomChallenger::new(0x4D50_F0BE);
+        let (rand_params, _q) = random_instance(&mut ch, 4, 3, 7);
+        let mut heights = vec![0u64; 64];
+        for h in heights.iter_mut().take(24) {
+            *h = 13;
+        }
+        for h in heights[24..34].iter_mut() {
+            *h = 5;
+        }
+        let strided_params = JaggedParams::from_heights(&heights, 4, 9);
+        for params in [&rand_params, &strided_params] {
+            let (n, k, m) = (params.n, params.k, params.m);
+            let z1r = sample_vec(&mut ch, n);
+            let z1c = sample_vec(&mut ch, k);
+            let z2r = sample_vec(&mut ch, n);
+            let z2c = sample_vec(&mut ch, k);
+            let c1 = sample_vec(&mut ch, 128);
+            let c2 = sample_vec(&mut ch, 128);
+            let rho = sample_vec(&mut ch, m);
+            let claims = [
+                FrobeniusClaim {
+                    z_row: &z1r,
+                    z_col: &z1c,
+                    coeffs: &c1,
+                },
+                FrobeniusClaim {
+                    z_row: &z2r,
+                    z_col: &z2c,
+                    coeffs: &c2,
+                },
+            ];
+            let mut chp = FsChallenger::new(b"mp-fused-test");
+            let standalone = prove_multipoint_twisted(params, &claims, &rho, &mut chp);
+
+            let eq_rho = crate::pcs::ring_switch::build_eq_parallel(&rho);
+            let a_claims: Vec<Vec<F128>> = claims
+                .iter()
+                .map(|c| build_claim_weight(params, c.z_row, c.z_col))
+                .collect();
+            let mut scratch = MultipointScratch::new(m);
+            let mut chf = FsChallenger::new(b"mp-fused-test");
+            let fused = prove_multipoint_twisted_fused(
+                params,
+                &claims,
+                &rho,
+                &eq_rho,
+                &a_claims,
+                &mut scratch,
+                &mut chf,
+            );
+            assert_eq!(standalone, fused, "fused proof must be byte-identical");
+            let mut chv = FsChallenger::new(b"mp-fused-test");
+            assert!(
+                verify_multipoint_twisted(params, &claims, &rho, &fused, &mut chv).is_some(),
+                "fused proof verifies"
+            );
+        }
+    }
+
     /// Multipoint twisted evaluation across column counts at m = 23, against
     /// the batched Frobenius assist where the latter fits in memory (its
     /// suffix state at 4K+ columns is gigabytes). Informational.
@@ -3185,6 +3467,33 @@ mod tests {
                 .expect("bench proof verifies");
             let verify_ms = t.elapsed().as_secs_f64() * 1e3;
             std::hint::black_box(v);
+
+            // Fused variant: context (shared with the merged open in the
+            // integrated form) timed separately from the marginal prove.
+            let t = std::time::Instant::now();
+            let eq_rho = crate::pcs::ring_switch::build_eq_parallel(&rho);
+            let a_claims: Vec<Vec<F128>> = claims
+                .iter()
+                .map(|c| build_claim_weight(&params, c.z_row, c.z_col))
+                .collect();
+            let mut scratch = MultipointScratch::new(m);
+            let ctx_ms = t.elapsed().as_secs_f64() * 1e3;
+            let mut fused_best = f64::INFINITY;
+            for _ in 0..3 {
+                let mut fs = FsChallenger::new(b"multipoint-bench");
+                let t = std::time::Instant::now();
+                let p = prove_multipoint_twisted_fused(
+                    &params,
+                    &claims,
+                    &rho,
+                    &eq_rho,
+                    &a_claims,
+                    &mut scratch,
+                    &mut fs,
+                );
+                fused_best = fused_best.min(t.elapsed().as_secs_f64() * 1e3);
+                assert_eq!(p, proof, "fused bench proof matches standalone");
+            }
             let assist = if run_assist {
                 let mut best_a = f64::INFINITY;
                 for _ in 0..3 {
@@ -3199,7 +3508,8 @@ mod tests {
                 "skipped (suffix state in the GBs)".to_string()
             };
             println!(
-                "cols = {cols:>6}: multipoint prove {best:7.2} ms  verify {verify_ms:6.2} ms;  \
+                "cols = {cols:>6}: multipoint prove {best:7.2} ms (fused marginal \
+                 {fused_best:6.2} ms + context {ctx_ms:5.2} ms)  verify {verify_ms:6.2} ms;  \
                  batched assist prove {assist}"
             );
         }
