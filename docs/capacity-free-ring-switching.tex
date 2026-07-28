@@ -201,6 +201,39 @@ $M[t][j] = e_t^{2^j}$ is universal and precomputed once; per proof,
 $128$ evaluations of $\Phi$ plus one $128^2$-multiply matvec.
 \end{remark}
 
+\begin{remark}[dual form: a multipoint view]\label{rem:dual}
+The twists can be moved off the claim points and onto $\rho$. Writing
+$a_d := \eq(z_{\mathrm r}, \rowof(d))\,\eq(z_{\mathrm c}, \colof(d))$,
+the $j$-th statement of Theorem~\ref{thm:main} is
+$\sum_d \eq(\rho, d)\, a_d^{2^j}$; since squaring is additive in
+characteristic $2$ and $\eq(\sigma, d)^2 = \eq(\sigma^2, d)$ at
+Boolean $d$ (Lemma~\ref{lem:transport} in the $\rho$-slot),
+\[
+  \textstyle\sum_d \eq(\rho, d)\, a_d^{2}
+  \;=\;
+  \bigl(\sum_d \eq(\rho^{2^{-1}}, d)\, a_d\bigr)^{2},
+\]
+and iterating,
+\[
+  \fjag\bigl(z_{\mathrm r}^{2^j}, z_{\mathrm c}^{2^j}, \rho\bigr)
+  \;=\;
+  \fjag\bigl(z_{\mathrm r}, z_{\mathrm c}, \rho^{2^{-j}}\bigr)^{2^j},
+\]
+where $\rho^{2^{-j}}$ is the coordinate-wise $j$-fold Frobenius
+inverse (iterated square roots --- cheap linear maps). In this form
+all $128$ statements evaluate the \emph{single untwisted} jagged
+multilinear at $128$ derived points: the batched assist is a
+multipoint-evaluation argument for $\fjag(z_{\mathrm r}, z_{\mathrm c},
+\cdot)$, and every $z$-side quantity in the assist (column weights,
+the $z$-half of each transition weight) becomes statement-independent.
+No formulation collapses the family further: expanding the twisted
+factors over an $\Ftwo$-basis writes the $128$ statement values as the
+image, under the invertible Moore matrix, of $128$ independent
+bilinear contractions of the $\rho$-side data --- the batch width is
+information-inherent, and only the surrounding structure (points,
+coefficients, boundary combinatorics, verifier chains) can be shared.
+\end{remark}
+
 \section{The batched assist}\label{sec:protocol}
 
 The $128$ statements share the boundary-bit domain and batch into
