@@ -1262,13 +1262,17 @@ fn merged_capacity_attribution() {
     const NUS: [usize; 5] = [14, 15, 16, 17, 18];
 
     let cfgs: Vec<_> = NUS.iter().map(|&nu| mixed_registry(nu)).collect();
-    flock_core::scratch::prewarm_prover(cfgs.last().unwrap().0.m_total());
     let mut rng = Rng::new(0x_4E_26_ED_31);
     let sha2_inputs = random_sha2_inputs(&mut rng, COUNTS[0]);
     let blake3_inputs = random_blake3_inputs(&mut rng, COUNTS[1]);
 
     for (i, &nu) in NUS.iter().enumerate() {
         let (registry, sha2_r1cs, blake3_r1cs) = &cfgs[i];
+        // Prewarm per tier — the production shape (Setup constructors
+        // prewarm their own size). One largest-tier prewarm up front left
+        // the smaller tiers' pool classes empty, measuring a mixed-size
+        // pool scenario production never runs.
+        flock_core::scratch::prewarm_prover(registry.m_total());
         let s2_circuit = sha2_r1cs.csc_lincheck_circuit();
         let b3_circuit = blake3_r1cs.csc_lincheck_circuit();
         let union = UnionInstance::new(registry, COUNTS.to_vec());

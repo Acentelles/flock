@@ -50,7 +50,20 @@ pub const K_SKIP: usize = 6;
 /// full-utilization zerocheck), so the gate engages at half utilization.
 /// Full utilization itself stays dense (live · 2 > n): it is the anchor
 /// configuration and the dense kernels are the calibrated choice there.
-pub const SPARSE_TAIL_GATE: usize = 2;
+pub const SPARSE_TAIL_GATE: usize = 1;
+
+/// [`SPARSE_TAIL_GATE`] with an env override (`FLOCK_SPARSE_GATE`) — a
+/// tuning knob for A/B experiments; the constant above is the default.
+/// Value-identical either way (the sparse kernels drop only zero terms).
+fn sparse_tail_gate() -> usize {
+    static GATE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("FLOCK_SPARSE_GATE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(SPARSE_TAIL_GATE)
+    })
+}
 
 /// One run of identically-shaped blocks inside a [`PaddingSpec`] run-list.
 ///
@@ -471,7 +484,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     let sparse_from_round2 = live.as_ref().is_some_and(|list| {
         let live_elems: usize = list.iter().map(|&(s, e)| e - s).sum();
         let n_out = 1usize << n_mlv;
-        n_out >= 8 && live_elems * SPARSE_TAIL_GATE <= n_out
+        n_out >= 8 && live_elems * sparse_tail_gate() <= n_out
     });
     let (mut a_mlv, mut b_mlv, msg_1, msg_inf) = if sparse_from_round2 {
         multilinear::uni_skip_fold_and_round_pair_runs_sparse(
@@ -550,7 +563,7 @@ fn prove_packed_padded_inner<C: Challenger>(
 
         let use_sparse = live.as_ref().is_some_and(|list| {
             let live_elems: usize = list.iter().map(|&(s, e)| e - s).sum();
-            a_mlv.len() >= 8 && live_elems * SPARSE_TAIL_GATE <= a_mlv.len()
+            a_mlv.len() >= 8 && live_elems * sparse_tail_gate() <= a_mlv.len()
         });
         if !use_sparse
             && let Some(list) = live.take()
