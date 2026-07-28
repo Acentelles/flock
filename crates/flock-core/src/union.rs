@@ -273,14 +273,22 @@ impl<'r> UnionInstance<'r> {
     /// destination runs of `n_t` words, disjoint sources), which is what the
     /// copy costs at scale: it is pure memory traffic, ~127 MB at `M = 30`.
     pub fn compact_witness(&self, z_padded: &[F128]) -> Vec<F128> {
-        use rayon::prelude::*;
-
-        assert_eq!(z_padded.len(), self.packed_len(), "padded buffer length");
         debug_assert!(
             self.dropped_words_are_zero(z_padded),
             "padded buffer must be zero on every dropped word \
              (dummy rows, useless columns, gaps)"
         );
+        self.compact_witness_unchecked(z_padded)
+    }
+
+    /// [`Self::compact_witness`] without the dropped-words-are-zero debug
+    /// assertion — for the `PooledDirty` witness mode, where dropped words
+    /// are dirty by design and provably never read (the gather below reads
+    /// declared rows only).
+    pub fn compact_witness_unchecked(&self, z_padded: &[F128]) -> Vec<F128> {
+        use rayon::prelude::*;
+
+        assert_eq!(z_padded.len(), self.packed_len(), "padded buffer length");
         let nu = self.n_log();
         // POOLED, not `vec![F128::ZERO; …]`. A fresh 134 MB zeroed Vec at
         // M = 30 costs ~3.0 ms to allocate and write versus ~0.6 ms for an
@@ -530,23 +538,37 @@ impl<'r> UnionInstance<'r> {
     /// written as zeros), so after [`Self::slot_dests`] + generation the
     /// buffers hold exactly what [`Self::assemble_witness`] would have
     /// scattered.
-    /// The returned flag is `pre_zeroed`: when padding dominates (capacity
-    /// at least twice the declared dense area), the buffers are FRESH
-    /// lazily-zeroed allocations — untouched padding pages cost nothing —
-    /// and the drivers skip every dummy-region write. Pooled (dirty)
-    /// buffers would instead force a memset of the whole padding, which at
-    /// deep over-capacity dwarfs the prove itself. Callers must NOT return
-    /// `pre_zeroed` buffers to the scratch pool: they would come back
-    /// dirty (re-imposing the memset) and crowd the pool with
-    /// capacity-sized allocations.
-    pub fn take_witness_buffers(&self) -> (Vec<F128>, Vec<F128>, Vec<F128>, bool) {
+    /// `padding_unread`: the caller certifies that every downstream
+    /// consumer of these buffers is support-gated (the merged pipeline —
+    /// zerocheck run-lists, count-proportional lincheck, declared-only
+    /// compaction, precomputed-`s_hat_v` ring switch), so padding may stay
+    /// dirty — pooled resident buffers with NO zeroing at any utilization.
+    /// Otherwise: pooled + zeroed at high utilization, fresh lazy-zero when
+    /// padding dominates (capacity ≥ 2× the declared dense area).
+    pub fn take_witness_buffers(
+        &self,
+        padding_unread: bool,
+    ) -> (
+        Vec<F128>,
+        Vec<F128>,
+        Vec<F128>,
+        crate::union::WitnessBufMode,
+    ) {
         let len = self.packed_len();
+        if padding_unread {
+            return (
+                crate::scratch::take_f128(len),
+                crate::scratch::take_f128(len),
+                crate::scratch::take_f128(len),
+                crate::union::WitnessBufMode::PooledDirty,
+            );
+        }
         if self.dense_words() * 2 <= len {
             return (
                 crate::alloc_zeroed_vec(len),
                 crate::alloc_zeroed_vec(len),
                 crate::alloc_zeroed_vec(len),
-                true,
+                crate::union::WitnessBufMode::FreshZeroed,
             );
         }
         let mut bufs = [
@@ -558,7 +580,7 @@ impl<'r> UnionInstance<'r> {
             self.zero_gaps(buf);
         }
         let [z, a, b] = bufs;
-        (z, a, b, false)
+        (z, a, b, crate::union::WitnessBufMode::PooledZeroed)
     }
 
     /// A fully zeroed padded union buffer from the scratch pool — resident
@@ -602,7 +624,7 @@ impl<'r> UnionInstance<'r> {
         z: &'d mut [F128],
         a: &'d mut [F128],
         b: &'d mut [F128],
-        pre_zeroed: bool,
+        elide_padding_writes: bool,
     ) -> Vec<SlotWitnessDest<'d>> {
         for buf in [&*z, &*a, &*b] {
             assert_eq!(buf.len(), self.packed_len(), "padded buffer length");
@@ -624,7 +646,7 @@ impl<'r> UnionInstance<'r> {
                 z: carve(&mut zr, skip, words),
                 a: carve(&mut ar, skip, words),
                 b: carve(&mut br, skip, words),
-                pre_zeroed,
+                elide_padding_writes,
             });
             cursor = range.end;
         }
@@ -798,6 +820,26 @@ pub struct SlotWitness {
     pub b_packed: Vec<F128>,
 }
 
+/// How [`UnionInstance::take_witness_buffers`] sourced the padded buffers — it
+/// decides whether the drivers may elide zero-valued writes and whether
+/// the buffers belong back in the scratch pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WitnessBufMode {
+    /// Pooled buffers, gaps zeroed here, drivers zero their padding —
+    /// the classic contract: every dropped word IS zero.
+    PooledZeroed,
+    /// Fresh `alloc_zeroed` buffers (lazy zero pages): every word is
+    /// zero without a single write; drivers elide all zero-valued
+    /// writes. NOT returned to the pool (they would come back dirty
+    /// and crowd it with capacity-sized allocations).
+    FreshZeroed,
+    /// Pooled buffers, nothing zeroed: the caller guarantees every
+    /// consumer is support-gated (dummy rows, gaps, and padding are
+    /// NEVER read), so their contents are unobservable. Drivers elide
+    /// all zero-valued writes; buffers return to the pool resident.
+    PooledDirty,
+}
+
 /// A per-slot destination view into the padded union witness buffers: the
 /// slot's aligned `2^{m_t−7}`-word block of each of `z`, `a`, `b`, handed
 /// out by [`UnionInstance::slot_dests`]. A witness driver writes these in
@@ -812,11 +854,11 @@ pub struct SlotWitnessDest<'d> {
     pub z: &'d mut [F128],
     pub a: &'d mut [F128],
     pub b: &'d mut [F128],
-    /// The destination (and the driver's stripe sourcing) is guaranteed
-    /// all-zero on entry: the driver may skip every write whose value is
-    /// zero (dummy groups, padding suffix, stripe tails). See
-    /// [`UnionInstance::take_witness_buffers`].
-    pub pre_zeroed: bool,
+    /// The driver may ELIDE every zero-valued write (dummy groups, the
+    /// padding suffix, dummy stripe regions): the destination is either
+    /// already zero (`FreshZeroed`) or its dropped words are never read
+    /// (`PooledDirty`). See [`UnionInstance::take_witness_buffers`].
+    pub elide_padding_writes: bool,
 }
 
 #[cfg(test)]

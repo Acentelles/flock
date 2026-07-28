@@ -472,7 +472,14 @@ impl<'a> UnionSlotProverInput<'a> {
 fn build_union_witness(
     union: &flock_core::union::UnionInstance<'_>,
     sources: Vec<UnionSlotWitnessSource<'_>>,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<Vec<u8>>, bool) {
+    padding_unread: bool,
+) -> (
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    Vec<Vec<u8>>,
+    flock_core::union::WitnessBufMode,
+) {
     assert_eq!(
         sources.len(),
         union.registry().num_types(),
@@ -497,12 +504,19 @@ fn build_union_witness(
             }
         }
         let (z, a, b) = union.assemble_witness(witnesses);
-        return (z, a, b, stripes, false);
+        return (
+            z,
+            a,
+            b,
+            stripes,
+            flock_core::union::WitnessBufMode::PooledZeroed,
+        );
     }
 
-    let (mut z, mut a, mut b, pre_zeroed) = union.take_witness_buffers();
+    let (mut z, mut a, mut b, mode) = union.take_witness_buffers(padding_unread);
+    let elide = mode != flock_core::union::WitnessBufMode::PooledZeroed;
     let stripes = union
-        .slot_dests(&mut z, &mut a, &mut b, pre_zeroed)
+        .slot_dests(&mut z, &mut a, &mut b, elide)
         .into_iter()
         .zip(sources)
         .map(|(dst, source)| match source {
@@ -518,7 +532,7 @@ fn build_union_witness(
             }
         })
         .collect();
-    (z, a, b, stripes, pre_zeroed)
+    (z, a, b, stripes, mode)
 }
 
 /// Statement-binding selector for the union prove path. Private: the two
@@ -656,8 +670,15 @@ pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
         circuits.push(slot.lincheck_circuit);
     }
     let t = std::time::Instant::now();
-    let (z_packed, a_packed_f128, b_packed_f128, stripes, pre_zeroed) =
-        build_union_witness(union, sources);
+    // The merged pipeline never reads dropped words: zerocheck is
+    // run-list-gated, the union lincheck is count-proportional, compaction
+    // reads declared rows only, and (when s_hat_v is precomputed — the
+    // condition below) the ring-switch succinct step reads nothing bulk.
+    // Padding may therefore stay dirty in pooled resident buffers.
+    let padding_unread = m - union.n_log() >= pcs::LOG_PACKING;
+    let (z_packed, a_packed_f128, b_packed_f128, stripes, buf_mode) =
+        build_union_witness(union, sources, padding_unread);
+    let give_back = buf_mode != flock_core::union::WitnessBufMode::FreshZeroed;
     let linchecks: Vec<(Vec<u8>, &dyn lincheck::LincheckCircuit)> =
         stripes.into_iter().zip(circuits).collect();
     if trace {
@@ -674,6 +695,9 @@ pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
     let t = std::time::Instant::now();
     let q: Vec<F128> = if union.compaction_is_identity() {
         z_packed.clone()
+    } else if buf_mode == flock_core::union::WitnessBufMode::PooledDirty {
+        // Dropped words are dirty by design in this mode — and never read.
+        union.compact_witness_unchecked(&z_packed)
     } else {
         union.compact_witness(&z_packed)
     };
@@ -730,7 +754,7 @@ pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
         }
         out
     };
-    if !pre_zeroed {
+    if give_back {
         flock_core::scratch::give_f128(a_packed_f128);
         flock_core::scratch::give_f128(b_packed_f128);
     }
@@ -748,7 +772,7 @@ pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
         lincheck::prove_union_capture_z_vec(union, &lc_slots, &x_ab, challenger)
     };
     for (stripe, _) in linchecks {
-        if !pre_zeroed {
+        if give_back {
             flock_core::scratch::give_u8(stripe);
         }
     }
@@ -797,7 +821,7 @@ pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
         &lig_config,
         challenger,
     );
-    if !pre_zeroed {
+    if give_back {
         flock_core::scratch::give_f128(z_packed);
     }
 
@@ -853,8 +877,9 @@ fn prove_union_with_binding<Ch: Challenger>(
         sources.push(slot.source);
         circuits.push(slot.lincheck_circuit);
     }
-    let (z_packed, a_packed_f128, b_packed_f128, stripes, pre_zeroed) =
-        build_union_witness(union, sources);
+    let (z_packed, a_packed_f128, b_packed_f128, stripes, buf_mode) =
+        build_union_witness(union, sources, false);
+    let give_back = buf_mode != flock_core::union::WitnessBufMode::FreshZeroed;
     let linchecks: Vec<(Vec<u8>, &dyn lincheck::LincheckCircuit)> =
         stripes.into_iter().zip(circuits).collect();
 
@@ -919,7 +944,7 @@ fn prove_union_with_binding<Ch: Challenger>(
         )
     };
     // a/b are consumed; recycle the buffers as in `prove_fast_core`.
-    if !pre_zeroed {
+    if give_back {
         flock_core::scratch::give_f128(a_packed_f128);
         flock_core::scratch::give_f128(b_packed_f128);
     }
@@ -943,7 +968,7 @@ fn prove_union_with_binding<Ch: Challenger>(
     // Recycle the stripes (as large as the witness itself) rather than
     // unmapping them — the drivers take them from the same pool.
     for (stripe, _) in linchecks {
-        if !pre_zeroed {
+        if give_back {
             flock_core::scratch::give_u8(stripe);
         }
     }
@@ -1363,8 +1388,9 @@ pub fn prove_fast_ligerito_jagged_union_timed<Ch: Challenger>(
         sources.push(slot.source);
         circuits.push(slot.lincheck_circuit);
     }
-    let (z_packed, a_packed_f128, b_packed_f128, stripes, pre_zeroed) =
-        build_union_witness(union, sources);
+    let (z_packed, a_packed_f128, b_packed_f128, stripes, buf_mode) =
+        build_union_witness(union, sources, false);
+    let give_back = buf_mode != flock_core::union::WitnessBufMode::FreshZeroed;
     let linchecks: Vec<(Vec<u8>, &dyn lincheck::LincheckCircuit)> =
         stripes.into_iter().zip(circuits).collect();
     t.witness_place_s = t0.elapsed().as_secs_f64();
@@ -1416,7 +1442,7 @@ pub fn prove_fast_ligerito_jagged_union_timed<Ch: Challenger>(
         )
     };
     t.zerocheck_s = t0.elapsed().as_secs_f64();
-    if !pre_zeroed {
+    if give_back {
         flock_core::scratch::give_f128(a_packed_f128);
         flock_core::scratch::give_f128(b_packed_f128);
     }
@@ -1438,7 +1464,7 @@ pub fn prove_fast_ligerito_jagged_union_timed<Ch: Challenger>(
     // Recycle the stripes (as large as the witness itself) rather than
     // unmapping them — the drivers take them from the same pool.
     for (stripe, _) in linchecks {
-        if !pre_zeroed {
+        if give_back {
             flock_core::scratch::give_u8(stripe);
         }
     }

@@ -1307,6 +1307,65 @@ fn merged_capacity_attribution() {
     }
 }
 
+/// The merged pipeline's dropped words are UNREAD — the evidence for the
+/// `PooledDirty` witness mode: proofs must be byte-identical whether the
+/// pooled buffers arrive clean or POISONED (every consumer is
+/// support-gated: zerocheck run-lists, the count-proportional union
+/// lincheck, declared-only compaction, the precomputed-`s_hat_v` ring
+/// switch). Covers partial counts and a zero-count slot.
+#[test]
+fn merged_padding_unread_poison_pool() {
+    let (registry, sha2_r1cs, blake3_r1cs) = mixed_registry(7);
+    let s2_circuit = sha2_r1cs.csc_lincheck_circuit();
+    let b3_circuit = blake3_r1cs.csc_lincheck_circuit();
+    for counts in [[50usize, 37], [8, 0]] {
+        let union = UnionInstance::new(&registry, counts.to_vec());
+        let pcs_params = union_pcs_params(&union);
+        let mut rng = Rng::new(0x_D1_47_00 ^ counts[0] as u64);
+        let sha2_inputs = random_sha2_inputs(&mut rng, counts[0]);
+        let blake3_inputs = random_blake3_inputs(&mut rng, counts[1]);
+        let mut prove = || {
+            let slots = vec![
+                UnionSlotProverInput::in_place(
+                    |dst| sha2::generate_witness_batch_major_partial_into(&sha2_inputs, 7, dst),
+                    s2_circuit,
+                ),
+                UnionSlotProverInput::in_place(
+                    |dst| blake3::generate_witness_batch_major_partial_into(&blake3_inputs, 7, dst),
+                    b3_circuit,
+                ),
+            ];
+            let mut ch = FsChallenger::new(DOMAIN);
+            prover::prove_fast_ligerito_jagged_union_merged(&union, &pcs_params, slots, &mut ch)
+        };
+        let (p1, c1, cl1) = prove();
+        // Poison the pools with exact-size buffers so `take` hands them out.
+        let len = union.packed_len();
+        let poison = F128::new(0xDEAD_BEEF_DEAD_BEEF, 0xDEAD_BEEF_DEAD_BEEF);
+        for _ in 0..6 {
+            flock_core::scratch::give_f128(vec![poison; len]);
+        }
+        for _ in 0..4 {
+            flock_core::scratch::give_u8(vec![0xAD; 1 << 20]);
+        }
+        let (p2, c2, cl2) = prove();
+        assert_eq!(c1.root, c2.root, "commitment must ignore dropped words");
+        assert_eq!(p1, p2, "proof must be byte-identical under a poisoned pool");
+        assert_eq!(cl1, cl2);
+        let circuits: [&dyn LincheckCircuit; 2] = [s2_circuit, b3_circuit];
+        let mut chv = FsChallenger::new(DOMAIN);
+        verifier::verify_ligerito_jagged_union_merged(
+            &union,
+            &circuits,
+            &c2,
+            &p2,
+            &pcs_params,
+            &mut chv,
+        )
+        .expect("poison-pool proof verifies");
+    }
+}
+
 /// In-place witness generation is BYTE-IDENTICAL to prebuilt + scatter.
 ///
 /// [`UnionSlotProverInput::in_place`] hands each driver the slot's aligned

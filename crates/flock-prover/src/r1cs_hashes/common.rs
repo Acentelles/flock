@@ -538,7 +538,7 @@ where
             z: &mut z,
             a: &mut a,
             b: &mut b,
-            pre_zeroed: false,
+            elide_padding_writes: false,
         },
         per_group,
     );
@@ -579,7 +579,7 @@ where
         z,
         a,
         b,
-        pre_zeroed: _,
+        elide_padding_writes: _,
     } = dst;
     for buf in [&*z, &*a, &*b] {
         assert_eq!(buf.len(), total_f128, "witness destination length");
@@ -683,7 +683,7 @@ where
             z: &mut z,
             a: &mut a,
             b: &mut b,
-            pre_zeroed: false,
+            elide_padding_writes: false,
         },
         per_group,
     );
@@ -719,27 +719,30 @@ where
         z,
         a,
         b,
-        pre_zeroed,
+        elide_padding_writes,
     } = dst;
     for buf in [&*z, &*a, &*b] {
         assert_eq!(buf.len(), total_f128, "witness destination length");
     }
-    // A pre-zeroed destination gets a FRESH lazily-zeroed stripe and skips
-    // every zero-valued write: dummy groups, the padding suffix, and the
-    // stripe tails all stay untouched zero pages. Otherwise: pooled
-    // (resident) stripe — `stripe_from_rows` writes rows
-    // `[0, useful_words)` of every group — including fully-dummy groups,
-    // which flush zeros — so only each group's TAIL rows need clearing, a
-    // few percent of the buffer instead of faulting in all of it.
-    let mut stripe = if pre_zeroed {
-        vec![0u8; n_total * u64_per_block * 8]
+    // Pooled (resident) stripe. `stripe_from_rows` writes rows
+    // `[0, useful_words)` of the groups it visits, so each visited group's
+    // TAIL rows need clearing — a few percent of the buffer. When padding
+    // writes are elided, only the live groups are visited (dummy stripe
+    // regions are never read downstream: the union lincheck's row folds
+    // are count-proportional), and the padding suffix of z/a/b is skipped
+    // outright (already zero, or dirty-but-unread, per the mode).
+    let live_groups = inputs.len().div_ceil(BM_V);
+    let mut stripe = flock_core::scratch::take_u8(n_total * u64_per_block * 8);
+    let tail_groups = if elide_padding_writes {
+        live_groups
     } else {
-        flock_core::scratch::take_u8(n_total * u64_per_block * 8)
+        n_total / BM_V
     };
-    if !pre_zeroed {
-        stripe
-            .par_chunks_mut(u64_per_block * 64)
-            .for_each(|g| g[useful_words * 64..].fill(0));
+    stripe
+        .par_chunks_mut(u64_per_block * 64)
+        .take(tail_groups)
+        .for_each(|g| g[useful_words * 64..].fill(0));
+    if !elide_padding_writes {
         // Zero the padding suffix (contiguous chunk-columns >=
         // useful_chunks); the group loop fully writes the useful prefix —
         // declared rows from the builders, dummy rows as zero flushes.
@@ -759,10 +762,10 @@ where
     let sp = SendPtr(stripe.as_ptr() as *mut u64);
     let inputs_ref = inputs;
 
-    // Pre-zeroed destinations skip all-dummy groups outright (their region
-    // is already zero); the trailing partial group still zero-flushes its
-    // dead lanes.
-    let n_groups = if pre_zeroed {
+    // Elided-padding destinations skip all-dummy groups outright (their
+    // region is zero or never read); the trailing partial group still
+    // zero-flushes its dead lanes.
+    let n_groups = if elide_padding_writes {
         n_declared.div_ceil(BM_V)
     } else {
         n_total / BM_V
