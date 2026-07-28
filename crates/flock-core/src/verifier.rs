@@ -233,6 +233,11 @@ enum UnionVerifyBinding<'a> {
 /// (before any challenge) and additionally enter through the heights and
 /// the lincheck's const-pin target terms.
 ///
+/// Since wire v6 the shipped Mixed protocol uses the MERGED transport
+/// ([`verify_ligerito_jagged_union_merged`]); this jagged-transport entry
+/// remains as the differential/regression oracle's verifier — not a wire
+/// mode.
+///
 /// `circuits` are the per-type lincheck circuits, one per registry type,
 /// **in slot order** (the registry's order — capacity area descending).
 pub fn verify_ligerito_jagged_union<Ch: Challenger>(
@@ -360,12 +365,13 @@ pub fn verify_ligerito_jagged_union_harness<Ch: Challenger>(
     )
 }
 
-/// Shared body of the two union verify entries; `binding` selects the
-/// statement binding, everything else is identical.
-/// The MERGED-transport union verifier — PROTOTYPE, kept in lockstep with
-/// [`verify_union_with_binding`] (identical binding + PIOP replay; only the
-/// PCS verification differs: `pcs::verify_batch_merged`). Mixed binding
-/// only; pow2-lane commitments only.
+/// The MERGED-transport union verifier (wire v6) — the Mixed protocol's
+/// verify entry, kept in lockstep with [`verify_union_with_binding`]
+/// (identical binding + PIOP replay; only the PCS verification differs:
+/// `pcs::verify_batch_merged`). Mixed binding only; handles both
+/// lane-major and power-of-two commitments (dispatched on
+/// `commitment.params.num_lanes`, which the params-equality check below
+/// pins to the count-derived value).
 pub fn verify_ligerito_jagged_union_merged<Ch: Challenger>(
     union: &crate::union::UnionInstance<'_>,
     circuits: &[&dyn lincheck::LincheckCircuit],
@@ -459,6 +465,8 @@ pub fn verify_ligerito_jagged_union_merged<Ch: Challenger>(
     Ok(R1csClaim { ab, c })
 }
 
+/// Shared body of the jagged-transport union verify entries; `binding`
+/// selects the statement binding, everything else is identical.
 fn verify_union_with_binding<Ch: Challenger>(
     union: &crate::union::UnionInstance<'_>,
     binding: UnionVerifyBinding<'_>,

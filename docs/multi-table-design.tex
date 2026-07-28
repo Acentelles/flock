@@ -29,7 +29,7 @@
 \newtheorem{definition}{Definition}
 
 \title{Multi-Table Proving in Flock:\\ One Proof for Heterogeneous Hash Batches\\[0.6ex]
-\large Design document --- working draft v0.6}
+\large Design document --- working draft v0.7}
 \author{Flock}
 \date{July 27, 2026}
 
@@ -967,15 +967,18 @@ harness for the union PIOP before and after the jagged layer lands, and
 \subsection{Capacity-free ring-switching: a merged reduction (design
 sketch)}\label{sec:merged}
 
-Status: \textbf{prototype implemented}, side by side with the shipped
-jagged transport (no default switch, no wire change; the shipped path is
-byte-untouched and its fixtures pass unchanged). The load-bearing
-algebra is test-pinned (the Frobenius identity, the linearized-%
-coefficient extraction, the batched assist against the brute-force
-twisted evaluation), and the full pipeline round-trips with a tamper
-matrix on real mixed instances; measured results are folded into the
-cost paragraphs below. Adoption --- the polish list, integer-lane
-support, and the wire/fixture switchover --- is gated on design review.
+Status: \textbf{shipped} --- since wire v6 the Mixed protocol's opening
+IS this merged transport (design review passed 2026-07-27). The
+load-bearing algebra is test-pinned (the Frobenius identity, the
+linearized-coefficient extraction, the batched assist against the
+brute-force twisted evaluation), and the full pipeline round-trips with
+a tamper matrix --- proof-field tampers and commitment-params tampers
+(the params-vs-root binding) --- on real mixed instances at all three
+commit configurations (integer lanes at full and partial utilization,
+power of two); measured results are folded into the cost paragraphs
+below. The jagged transport remains in-tree as the differential/%
+regression oracle (the M6 byte-pinned fixtures and the merged-vs-jagged
+A/B tests), not a wire mode.
 
 \paragraph{The padded-domain floor, measured.} Ring-switching is the one
 pipeline stage that still sees the capacity: its weight and its sumcheck
@@ -1118,24 +1121,20 @@ new argument at all --- survives as a fallback for small registries
 not at thousands; and unlike the comb there is no preprocessing escape,
 since \code{col\_prefix\_sums} is per-proof).
 
-\paragraph{What it buys, per tier --- measured (prototype) and
-estimated (after polish).} The design's central claim is now
-\textbf{measured}: on the m30 load, the prototype's prove-time growth
-from the right-sized tier to $4\times$ over-capacity is
-$+14.1$\,ms, against the jagged path's $+40.7$\,ms --- the merged
-transport is near-capacity-free, and the $256$--$512$\,MB
-$b_{\mathrm{combined}}$ transient is gone at every tier. The
-prototype's \emph{constant} is unoptimized: $+34$\,ms over the shipped
-path at the right-sized tier, fully attributed to the polish list ---
-the pow2-only commit ($\approx 7$\,ms vs.\ integer lanes; needs the
-lane-major eq-basis open), the per-element-unrank weight build (needs
-the segmented-cursor treatment), the single eq claim riding the mixed
-path's \emph{materializing} combine (fusable --- the eq basis
-factors), and the untuned $128K$-statement assist prover (including
-its $\approx 150$\,MB suffix-row footprint). With those, the
-estimate stands at $\approx 9$--$12$\,ms flat: roughly break-even at
-full utilization, $\approx -13$\,ms at $2\times$, $\approx -35$\,ms
-at $4\times$. Proof: slightly smaller (the $\tilde b$ vector and
+\paragraph{What it buys, per tier --- measured.} The design's central
+claim is \textbf{measured}: on the m30 load, prove-time growth from the
+right-sized tier to $4\times$ over-capacity is $+14.1$\,ms, against the
+jagged path's $+40.7$\,ms --- the merged transport is near-capacity-%
+free, and the $256$--$512$\,MB $b_{\mathrm{combined}}$ transient is
+gone at every tier. The prototype's $+34$\,ms right-sized-tier constant
+was retired by the polish pass (integer-lane commit with the lane-major
+eq-basis open, the segmented-cursor weight build, the seeded fused
+combine for the lone eq claim, the block-dispatched assist prover):
+warm in-run A/B at the right-sized tier reads $124.9$ vs.\
+$130.9$\,ms in the merged path's favor, cold-gated runs put it within
+$\approx 5$--$10$\,ms of the shipped constant (the batched assist's
+remaining fixed cost), and it wins outright at $2\times$ capacity and
+above. Proof: slightly smaller (the $\tilde b$ vector and
 spot-check go, one batched assist arrives at unchanged size).
 Verifier: $\lesssim 1$\,ms added (measured within noise at test
 scale).
@@ -1277,14 +1276,16 @@ same type list); selecting a tier selects a registry digest. Each doubling
 of capacity costs one static sumcheck round; see \S\ref{sec:open}.
 
 \paragraph{Wire format (as shipped).} \code{proof\_io} is at
-\code{VERSION} 5, which adds a \emph{Mixed} flavor alongside the existing
-R1CS and Chain flavors (whose payloads --- \code{hash\_kind} included ---
-are unchanged; versioning is strict, so v4 files are rejected). A mixed
+\code{VERSION} 6, which switches the \emph{Mixed} flavor's payload to
+the merged transport of \S\ref{sec:merged} (v5 introduced the flavor
+with the jagged-transport payload; the R1CS and Chain flavors ---
+\code{hash\_kind} included --- are unchanged throughout; versioning is
+strict, so older files are rejected). A mixed
 bundle carries: the registry \emph{tier id} --- a stable one-byte code
 that pins the \emph{full} registry, base matrices, widths, and the uniform
 capacity $\nu$ included (current tiers: BLAKE3$+$SHA-256 at $\nu = 7$ and
 $\nu = 10$) --- the counts vector (one \code{u64} per type, in slot
-order), the commitment, and the union proof. CLI: \code{flock\_chain
+order), the commitment, and the merged-transport union proof. CLI: \code{flock\_chain
 prove --mix blake3=N,sha2=M} proves one mixed proof on the smallest
 fitting tier; \code{verify} auto-detects the bundle flavor. The statement
 remains well-formedness only (no per-invocation IO); the existing
@@ -1427,6 +1428,11 @@ fewer at $\nu = 10$ low utilization. Since draft v0.4:
         the fused opening no longer materializes $W_\rho$ ($134$\,MB at
         $M = 30$) --- the fused open dropped $16.0 \to 14.4$\,ms and
         peak memory by the full $134$\,MB.
+  \item (v0.7) The \emph{merged jagged/ring-switch transport}
+        (\S\ref{sec:merged}) shipped as the Mixed flavor's opening ---
+        wire \code{VERSION} 6; design review passed 2026-07-27. The
+        jagged transport and its byte-pinned fixtures stay in-tree as
+        the differential oracle.
 \end{itemize}
 
 Measured at $m = 30$ BLAKE3 on Apple silicon: the direct path proves at
@@ -1443,18 +1449,17 @@ $\approx 11$\,ms, of which $\approx 83\%$ is the per-type comb builds
 (item~\ref{item:manytypes}).
 
 The merged jagged/ring-switch transport of \S\ref{sec:merged} is
-implemented as a side-by-side \textbf{prototype}
-(\code{open\_batch\_merged}, the Frobenius assist, the
-\code{\_merged} union prove/verify pair): end-to-end roundtrip and
-tamper matrix on real mixed instances, capacity-freedom measured at
-the m30 load ($+14.1$ vs $+40.7$\,ms growth to the $4\times$ tier);
-its unoptimized constant and the adoption gate are recorded in
-\S\ref{sec:merged}.
+\textbf{shipped as of wire v6} (\code{open\_batch\_merged}, the
+Frobenius assist, the \code{\_merged} union prove/verify pair behind
+the Mixed flavor): end-to-end roundtrip and tamper matrix --- proof
+fields and commitment params --- on real mixed instances,
+capacity-freedom measured at the m30 load ($+14.1$ vs $+40.7$\,ms
+growth to the $4\times$ tier); the jagged transport stays in-tree as
+the differential oracle (\S\ref{sec:merged}).
 
 Open follow-ups, in the order they are likely to matter: a Keccak
 batch-major driver (the registry machinery accepts the type; only the
-driver is missing); the lookup/bus layer (\S\ref{sec:open}); the
-merged-transport polish + adoption decision (\S\ref{sec:merged}); and
+driver is missing); the lookup/bus layer (\S\ref{sec:open}); and
 comb delegation (item~\ref{item:manytypes}), explicitly deferred until
 registry growth or verify latency demands it.
 

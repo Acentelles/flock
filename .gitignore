@@ -60,3 +60,7 @@ docs/local/
 
 # Built design-doc PDFs (source .tex files are tracked; PDFs are build output)
 docs/*.pdf
+docs/*.aux
+docs/*.log
+docs/*.out
+docs/*.toc

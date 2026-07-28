@@ -35,8 +35,8 @@ pub struct R1csProofJaggedLigerito {
 
 /// [`R1csProofJaggedLigerito`] with the MERGED jagged/ring-switch opening
 /// (design doc §"Capacity-free ring-switching") — the PIOP sub-proofs are
-/// identical; only the transport differs. Prototype, side by side with the
-/// jagged path; not in any wire format.
+/// identical; only the transport differs. The Mixed flavor's wire payload
+/// since v6; the jagged variant remains as the differential oracle.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct R1csProofMergedLigerito {
     pub zerocheck: zerocheck::ZerocheckProof,

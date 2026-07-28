@@ -27,7 +27,7 @@ use flock_core::challenger::Challenger;
 use flock_core::lincheck::LincheckCircuit;
 use flock_core::pcs::ligerito::LigeritoProfile;
 use flock_core::pcs::{Commitment, PcsParams};
-use flock_core::proof::{R1csClaim, R1csProofJaggedLigerito};
+use flock_core::proof::{R1csClaim, R1csProofMergedLigerito};
 use flock_core::r1cs::BlockR1cs;
 use flock_core::schedule::{Registry, TableType};
 use flock_core::union::UnionInstance;
@@ -177,14 +177,15 @@ impl MixedSetup {
     /// Prove the mixed statement: `inputs.sha2.len()` SHA-256 and
     /// `inputs.blake3.len()` BLAKE3 compressions (the declared counts),
     /// dummy rows zeroed via the partial batch-major drivers, through the
-    /// union prove entry under the `flock-mixed-v1` binding.
+    /// MERGED-transport union prove entry (wire v6, design doc
+    /// §"Capacity-free ring-switching") under the `flock-mixed-v1` binding.
     pub fn prove<Ch: Challenger>(
         &self,
         sha2_inputs: &[sha2::Compression],
         blake3_inputs: &[blake3::Compression],
         profile: LigeritoProfile,
         challenger: &mut Ch,
-    ) -> (R1csProofJaggedLigerito, Commitment, R1csClaim) {
+    ) -> (R1csProofMergedLigerito, Commitment, R1csClaim) {
         let nu = self.id.nu();
         let counts = MixedCounts {
             sha2: sha2_inputs.len(),
@@ -205,7 +206,7 @@ impl MixedSetup {
                 self.blake3_r1cs.csc_lincheck_circuit(),
             ),
         ];
-        prover::prove_fast_ligerito_jagged_union(&union, &pcs_params, slots, challenger)
+        prover::prove_fast_ligerito_jagged_union_merged(&union, &pcs_params, slots, challenger)
     }
 
     /// Verify a mixed proof against the declared counts. The Ligerito
@@ -217,7 +218,7 @@ impl MixedSetup {
         &self,
         counts: MixedCounts,
         commitment: &Commitment,
-        proof: &R1csProofJaggedLigerito,
+        proof: &R1csProofMergedLigerito,
         challenger: &mut Ch,
     ) -> Result<R1csClaim, VerifyError> {
         let union = self.union(counts);
@@ -226,7 +227,7 @@ impl MixedSetup {
             self.sha2_r1cs.csc_lincheck_circuit(),
             self.blake3_r1cs.csc_lincheck_circuit(),
         ];
-        verifier::verify_ligerito_jagged_union(
+        verifier::verify_ligerito_jagged_union_merged(
             &union,
             &circuits,
             commitment,

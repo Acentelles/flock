@@ -44,16 +44,18 @@ use flock_core::pcs::Commitment;
 pub const MAGIC: [u8; 5] = *b"FLOCK";
 
 /// Format version. Bumped on incompatible serialization changes.
-/// v5 (current) adds the Mixed flavor ([`MixedProofBundleLigerito`]:
-/// registry id + counts vector + jagged-transport proof); the existing
-/// R1cs/Chain flavors' payloads are unchanged, but versioning is strict so
-/// v4 files are rejected.
-/// v4 added `ood_values` + `fold_grinding_nonces` to `LigeritoProof` and
-/// `profile` to `PcsParams` (Johnson+OOD profiles). v3 restructured
-/// `BaseFoldProof`: per-query Merkle paths were replaced by shared octopus
-/// multi-proofs (one per Merkle tree). v2 added `HashKind` to
-/// [`ChainProofBundle`].
-pub const VERSION: u8 = 5;
+/// v6 (current) switches the Mixed flavor's payload to the MERGED
+/// jagged/ring-switch transport ([`MixedProofBundleLigerito`] now carries
+/// an `R1csProofMergedLigerito` — design doc §"Capacity-free
+/// ring-switching"); the R1cs/Chain flavors' payloads are unchanged, but
+/// versioning is strict so v5 files are rejected.
+/// v5 added the Mixed flavor (registry id + counts vector +
+/// jagged-transport proof). v4 added `ood_values` + `fold_grinding_nonces`
+/// to `LigeritoProof` and `profile` to `PcsParams` (Johnson+OOD profiles).
+/// v3 restructured `BaseFoldProof`: per-query Merkle paths were replaced by
+/// shared octopus multi-proofs (one per Merkle tree). v2 added `HashKind`
+/// to [`ChainProofBundle`].
+pub const VERSION: u8 = 6;
 
 /// Which hash function a chain proof is over. Carried in
 /// [`ChainProofBundle`] so the verifier (e.g. the CLI) can pick the right
@@ -222,11 +224,12 @@ impl ChainProofBundleLigerito {
     }
 }
 
-/// Bundles a multi-table MIXED proof (wire format v5): the built-in
+/// Bundles a multi-table MIXED proof (wire format v6): the built-in
 /// registry id — which pins the FULL registry, type list and uniform
 /// capacity `nu` included (see [`crate::mixed::MixedRegistryId`]) — the
 /// declared counts vector (one `u64` per type, **in slot order**), the
-/// commitment to the dense stack, and the jagged-transport union proof.
+/// commitment to the dense stack, and the MERGED-transport union proof
+/// (design doc §"Capacity-free ring-switching").
 /// The statement is well-formedness only (design doc §"Statement,
 /// transcript, wire format"): the commitment opens to tables with the
 /// declared counts, every declared row satisfying its type's hash relation
@@ -238,7 +241,7 @@ pub struct MixedProofBundleLigerito {
     /// SHA-256, then BLAKE3).
     pub counts: Vec<u64>,
     pub commitment: Commitment,
-    pub proof: flock_core::proof::R1csProofJaggedLigerito,
+    pub proof: flock_core::proof::R1csProofMergedLigerito,
 }
 
 impl MixedProofBundleLigerito {
@@ -508,7 +511,8 @@ mod tests {
             .expect("verify round-tripped chain proof");
     }
 
-    /// Mixed bundle (wire v5) end-to-end: prove a small partial-count mixed
+    /// Mixed bundle (wire v6, merged transport) end-to-end: prove a small
+    /// partial-count mixed
     /// instance on the nu7 tier, serialize, roundtrip, verify from the
     /// deserialized bundle (registry rebuilt from the id, counts from the
     /// bundle), and reject count tampering.

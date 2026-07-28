@@ -545,6 +545,11 @@ enum UnionProveBinding<'a> {
 /// points) and the union-column lincheck. Verify with
 /// [`flock_core::verifier::verify_ligerito_jagged_union`].
 ///
+/// Since wire v6 the shipped Mixed protocol uses the MERGED transport
+/// ([`prove_fast_ligerito_jagged_union_merged`]); this jagged-transport
+/// entry remains as the differential/regression oracle (the M6 byte-pinned
+/// fixtures and the merged-vs-jagged A/B tests) — not a wire mode.
+///
 /// `slots` are one per registry type, **in slot order** — the registry's
 /// order, i.e. sorted by capacity area descending (under uniform capacity:
 /// by `k_log` descending; e.g. SHA-256 (κ = 15) before BLAKE3 (κ = 14)).
@@ -609,14 +614,14 @@ pub fn prove_fast_ligerito_jagged_union_harness<Ch: Challenger>(
     )
 }
 
-/// Shared body of the two union prove entries; `binding` selects the
-/// statement binding, everything else is identical.
-/// The MERGED-transport union prover (design doc §"Capacity-free
-/// ring-switching") — PROTOTYPE, side by side with the jagged path and
-/// kept in lockstep with [`prove_union_with_binding`]: identical witness
-/// assembly, commit (pow2 lanes only — the merged open does not yet
-/// support integer-lane commitments), Mixed binding, zerocheck, and
-/// lincheck; only the PCS open differs (`pcs::open_batch_merged`).
+/// The MERGED-transport union prover (wire v6; design doc §"Capacity-free
+/// ring-switching") — the Mixed protocol's prove entry, kept in lockstep
+/// with [`prove_union_with_binding`]: identical witness assembly, commit
+/// (lane-major when `PcsParams::num_lanes` is set, power-of-two
+/// otherwise), Mixed binding, zerocheck, and lincheck; only the PCS open
+/// differs (`pcs::open_batch_merged`). Same witness contract as
+/// [`prove_fast_ligerito_jagged_union`], which remains the jagged-transport
+/// differential oracle.
 pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
     union: &flock_core::union::UnionInstance<'_>,
     pcs_params: &PcsParams,
@@ -759,6 +764,8 @@ pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
     (proof, commitment, claim)
 }
 
+/// Shared body of the jagged-transport union prove entries; `binding`
+/// selects the statement binding, everything else is identical.
 fn prove_union_with_binding<Ch: Challenger>(
     union: &flock_core::union::UnionInstance<'_>,
     binding: UnionProveBinding<'_>,

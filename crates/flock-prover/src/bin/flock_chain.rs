@@ -1,5 +1,5 @@
 //! `flock_chain` — CLI for proving and verifying hash-chain proofs, and
-//! (since wire v5) multi-table MIXED proofs.
+//! (since wire v5) multi-table MIXED proofs (merged transport since v6).
 //!
 //! ```text
 //! Usage:
