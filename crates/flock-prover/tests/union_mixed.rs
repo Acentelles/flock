@@ -1145,16 +1145,16 @@ fn merged_transport_roundtrip_and_tamper() {
 /// (the Φ-pass runs on the dense domain), so its prove time should be
 /// near-flat from ν = 14 to ν = 16 where the jagged path's open grows
 /// with 2^(M−7). Informational (printed, one loose assertion); arms
-/// alternated in-process per this box's timing rules. NOTE the arms are
-/// not byte-comparable: jagged runs the SHIPPED config (integer lanes),
-/// merged the prototype (pow2 lanes).
+/// alternated in-process per this box's timing rules. Both arms run the
+/// shipped commit config (integer lanes); the merged arm IS the wire-v6
+/// protocol, the jagged arm the differential oracle.
 #[test]
 #[ignore] // Heavy + informational — run explicitly with --ignored --nocapture
 fn merged_transport_m30_probe() {
     let _quiet = timing_lock();
     use std::time::Instant;
     const COUNTS: [usize; 2] = [16384, 16384];
-    const NUS: [usize; 2] = [14, 16];
+    const NUS: [usize; 3] = [14, 15, 16];
 
     let cfgs: Vec<_> = NUS.iter().map(|&nu| mixed_registry(nu)).collect();
     flock_core::scratch::prewarm_prover(cfgs.last().unwrap().0.m_total());
@@ -1200,8 +1200,7 @@ fn merged_transport_m30_probe() {
                         &mut ch,
                     );
                 } else {
-                    let mut pcs_params = union_pcs_params(&union);
-                    pcs_params.num_lanes = None;
+                    let pcs_params = union_pcs_params(&union);
                     let (proof, commitment, claim) =
                         prover::prove_fast_ligerito_jagged_union_merged(
                             &union,
@@ -1241,8 +1240,8 @@ fn merged_transport_m30_probe() {
     }
     // The design claim, loosely: the merged transport's capacity growth from
     // 1x to 4x over-capacity must be well under the jagged path's.
-    let jagged_growth = mins[1][0] - mins[0][0];
-    let merged_growth = mins[1][1] - mins[0][1];
+    let jagged_growth = mins[NUS.len() - 1][0] - mins[0][0];
+    let merged_growth = mins[NUS.len() - 1][1] - mins[0][1];
     assert!(
         merged_growth < 0.6 * jagged_growth + 5.0,
         "merged transport must be near-capacity-free: jagged grows \
