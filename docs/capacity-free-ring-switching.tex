@@ -402,15 +402,15 @@ changed boundary bit, amortized $O(\log h)$ layers).
 
 A prototype confirms all of it ($m = 23$, $K = 2$, Apple silicon;
 exact-value tests against the brute-force twisted weight, including
-non-power-of-two strided shapes): prove totals $17 / 26 / 32$\,ms
-across $368 / 4096 / 32768$ columns --- and $30$\,ms at $27962$
+non-power-of-two strided shapes): prove totals $17 / 24 / 31$\,ms
+across $368 / 4096 / 32768$ columns --- and $29$\,ms at $27962$
 columns of height $300$, the non-power-of-two stride --- of which the
 dense passes and sumcheck hold flat at ${\approx}15$\,ms, the values
-are $2 / 7.7 / 8.9$\,ms, and the single anchor assist is
-$0.4 / 2.8 / 7$\,ms (column-parallelized at small statement counts;
+are $2 / 7.5 / 8.9$\,ms, and the single anchor assist is
+$0.4 / 1.7 / 7$\,ms (column-parallelized past ${\sim}2^{14}$ columns;
 the largest remaining column-linear term, and the run tabulation
 applies to it in principle). Verification measures
-$0.4 / 0.6 / 1.8$\,ms. The batched assist measures $5.5$\,ms at $368$
+$0.3 / 0.6 / 1.7$\,ms. The batched assist measures $5.5$\,ms at $368$
 columns and is memory-infeasible past a few thousand.
 
 \section{Implementation}\label{sec:eval}

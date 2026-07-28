@@ -1535,10 +1535,13 @@ pub fn prove_frobenius_assist<C: Challenger>(
         let mut per: Vec<([[F128; 4]; 4], [[F128; 4]; 4])> =
             vec![([[F128::ZERO; 4]; 4], [[F128::ZERO; 4]; 4]); sts.len()];
         let c4 = ch4.as_ref();
+        // Per-layer barriers cost ~tens of µs; the serial layer pass is
+        // ~6 multiplies/column. Column-parallelism only pays past ~2^14
+        // columns per statement.
         let inner_par = sts.len() < 16
             && sts
                 .first()
-                .is_some_and(|st| st.cols.len() >= 4 * ASSIST_CHUNK);
+                .is_some_and(|st| st.cols.len() >= 64 * ASSIST_CHUNK);
         if inner_par {
             // Few statements over many columns (the multipoint anchor's K):
             // parallelize WITHIN each statement — same values,
