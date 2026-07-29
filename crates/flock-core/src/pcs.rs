@@ -1884,7 +1884,20 @@ pub fn verify_batch_merged<Ch: Challenger>(
     if proof.ring_switches.len() != n_rs {
         return Err(VerifyErrorJagged::Jagged);
     }
+    // `VERIFY_TRACE` phase split. The Ligerito inner verify has its own
+    // `LIG_VERIFY_TRACE`, but it is a small tail here — the jagged Frobenius
+    // assist is the term that scales with the row/column split.
+    let trace = std::env::var("VERIFY_TRACE").is_ok();
+    let tfmt = |s: f64| -> String {
+        let ms = s * 1000.0;
+        if ms < 1.0 {
+            format!("{:>8.2} µs", s * 1e6)
+        } else {
+            format!("{:>8.2} ms", ms)
+        }
+    };
     challenger.observe_label(b"flock-merged-open-v0");
+    let t = std::time::Instant::now();
     let mut rs_outputs = Vec::with_capacity(n_rs);
     for i in 0..n_rs {
         let out = ring_switch::verify_succinct(
@@ -1896,6 +1909,12 @@ pub fn verify_batch_merged<Ch: Challenger>(
         )
         .map_err(VerifyErrorJagged::RingSwitch)?;
         rs_outputs.push(out);
+    }
+    if trace {
+        eprintln!(
+            "        [vbm] ring_switch::verify_succinct ×{n_rs}: {}",
+            tfmt(t.elapsed().as_secs_f64())
+        );
     }
     let gammas: Vec<F128> = (0..n_rs).map(|_| challenger.sample_f128()).collect();
     let mut target = F128::ZERO;
@@ -1917,8 +1936,16 @@ pub fn verify_batch_merged<Ch: Challenger>(
         rho.push(r);
     }
 
+    let t = std::time::Instant::now();
     let params = jagged::JaggedParams::from_heights(heights, n_log, dense_log);
     let k_cols = params.k;
+    if trace {
+        eprintln!(
+            "        [vbm] JaggedParams::from_heights (n_log={n_log}, dense_log={dense_log}, k_cols={k_cols}): {}",
+            tfmt(t.elapsed().as_secs_f64())
+        );
+    }
+    let t = std::time::Instant::now();
     // The claims' c_{i,j}: derived from the transcript (γ-scaled r''-eq
     // tensors → fold byte tables → linearized coefficients).
     let coeffs: Vec<Vec<F128>> = rs_outputs
@@ -1941,12 +1968,26 @@ pub fn verify_batch_merged<Ch: Challenger>(
             }
         })
         .collect();
+    if trace {
+        eprintln!(
+            "        [vbm] coeffs (fold byte tables ×{n_rs}): {}",
+            tfmt(t.elapsed().as_secs_f64())
+        );
+    }
+    let t = std::time::Instant::now();
     let v = jagged::verify_frobenius_assist(&params, &fclaims, &rho, &proof.frobenius, challenger)
         .ok_or(VerifyErrorJagged::Jagged)?;
+    if trace {
+        eprintln!(
+            "        [vbm] jagged::verify_frobenius_assist: {}",
+            tfmt(t.elapsed().as_secs_f64())
+        );
+    }
     if running != proof.q_eval * v {
         return Err(VerifyErrorJagged::VirtualOpen);
     }
 
+    let t = std::time::Instant::now();
     let pd = PackedDirectClaimRef {
         point: &rho,
         value: proof.q_eval,
@@ -1962,6 +2003,12 @@ pub fn verify_batch_merged<Ch: Challenger>(
         challenger,
     )
     .map_err(|_| VerifyErrorJagged::Ligerito)?;
+    if trace {
+        eprintln!(
+            "        [vbm] verify_opening_batch_ligerito_mixed: {}",
+            tfmt(t.elapsed().as_secs_f64())
+        );
+    }
     Ok(())
 }
 

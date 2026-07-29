@@ -409,9 +409,22 @@ pub fn verify_union<Ch: Challenger>(
     // 1. Sample α (matches prover's order).
     let alpha = challenger.sample_f128();
 
+    // `VERIFY_TRACE` splits this verify into its comb phase (the O(Σ_t nnz_t)
+    // per-slot fold) and everything after it. Off by default.
+    let trace = std::env::var("VERIFY_TRACE").is_ok();
+    let fmt = |s: f64| -> String {
+        let ms = s * 1000.0;
+        if ms < 1.0 {
+            format!("{:>8.2} µs", s * 1e6)
+        } else {
+            format!("{:>8.2} ms", ms)
+        }
+    };
+
     // 2. Per-type α-batched combs via each type's quirky table (same calls
     //    the prover made), pre-scaled by the slot prefix weight w_t(r) so
     //    the closed form below only supplies the bound-point subcube factor.
+    let t_comb = std::time::Instant::now();
     let mut combs: Vec<Vec<F128>> = registry
         .types()
         .iter()
@@ -419,8 +432,19 @@ pub fn verify_union<Ch: Challenger>(
         .zip(circuits)
         .map(|((ty, slot), circuit)| {
             let inner = ty.k_log - k_skip;
+            let t = std::time::Instant::now();
             let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest[..inner], k_skip);
+            let t_eq = t.elapsed();
+            let t = std::time::Instant::now();
             let mut comb = circuit.fold_alpha_batched(alpha, &eq_inner);
+            if trace {
+                eprintln!(
+                    "        [lcv] slot k_log={}: build_quirky_eq_table {} | fold_alpha_batched {}",
+                    ty.k_log,
+                    fmt(t_eq.as_secs_f64()),
+                    fmt(t.elapsed().as_secs_f64())
+                );
+            }
             if slot.prefix_bits > 0 {
                 let w_t = eq_prefix_weight(&x_ab.x_inner_rest[inner..], slot.prefix);
                 for v in &mut comb {
@@ -430,6 +454,13 @@ pub fn verify_union<Ch: Challenger>(
             comb
         })
         .collect();
+    let t_after_comb = std::time::Instant::now();
+    if trace {
+        eprintln!(
+            "        [lcv] comb phase total: {}",
+            fmt(t_comb.elapsed().as_secs_f64())
+        );
+    }
 
     // 2b. Constant-wire pins (mirror of prove): β_t sampled after α in slot
     //     order, the comb gains +β_t at the pin, and the target gains the
@@ -483,6 +514,12 @@ pub fn verify_union<Ch: Challenger>(
     let lambda = lagrange_weights_naive(k_skip, r_inner_skip);
     let w = inner_product(&lambda, &proof.z_partial);
 
+    if trace {
+        eprintln!(
+            "        [lcv] sumcheck replay + collapse ({inner_rest_len} rounds): {}",
+            fmt(t_after_comb.elapsed().as_secs_f64())
+        );
+    }
     Ok(LincheckClaim {
         r_inner_skip,
         r_inner_rest: rr,

@@ -207,8 +207,11 @@ count**, so a proof with zero Merkle paths still paid the full 547M walk. That
 is why 0+8 improves 7×.
 
 Correction to an earlier claim in these notes: the verifier is *not* dominated
-by `fold_alpha_batched` to the extent assumed — the residual 115 ms is PCS
-opening + zerocheck replay, and that is now the thing to attack next.
+by `fold_alpha_batched` to the extent assumed. The residual is
+`jagged::verify_frobenius_assist` — see the phase breakdown in the
+Merkle-vs-BLAKE3 section, which measures it rather than guessing (an earlier
+revision of this line guessed "PCS opening + zerocheck replay" and both were
+wrong: each is ~250 µs).
 
 ## How `eq_hi` is recovered
 
@@ -278,14 +281,19 @@ single-threaded, verify 6–8×. Stable across a 8× range of sizes.
 
 Three things worth keeping:
 
-* **`dense_m` matches exactly at every size, and so does proof size (within
-  3%).** Same hash count really does mean same committed area — a path's 26
-  blocks carry ~400K useful bits, and 26 loose blocks carry ~400K too. So the 8×
-  is *not* data volume. It is the shape: same area split as (few rows × `2^19`
-  block) instead of (many rows × `2^14`). Everything in the PIOP that scales
-  with `k_log` rather than with total area — 13 lincheck rounds instead of 8, a
-  `comb_vec` of `2^19` instead of `2^14` — is paid per proof no matter how few
-  paths there are.
+* **The circuit is the same size — this is not a bigger circuit.** Measured:
+
+  | | k_log | useful bits | bits/hash | base nnz | system nnz | nnz/hash |
+  |---|---|---|---|---|---|---|
+  | merkle ×8 | 19 | 3,404,168 | 16,366 | 546,771,284 | 4,374,170,272 | 21,029,664 |
+  | blake3 ×208 | 14 | 3,205,072 | 15,409 | 21,028,097 | 4,373,844,176 | 21,028,097 |
+
+  The two constraint systems differ by **0.0075%** in nonzeros (1,567 per
+  compression — the swap gadget) and 6.2% in witness bits. `dense_m` and proof
+  size match for the same reason. So the 8× is not circuit size and not data
+  volume; it is the *shape*, same area split as (few rows × `2^19` block)
+  instead of (many rows × `2^14`). See the phase breakdown below for which
+  term that actually hits.
 * **Both verifies are nearly flat in size** (Merkle 95 → 110 ms while the work
   grows 8×), which is the same statement: verify is fixed cost. So Merkle
   verify-per-compression falls 457 → 66 µs from 8 to 64 paths and keeps
@@ -296,12 +304,62 @@ Three things worth keeping:
   8–64 paths). That is 8–22% of Merkle prove, so ~90% of the gap is genuinely
   proving, not hashing.
 
-**The fold is no longer the lever.** The factored fold is ~13 ms of the 95 ms
-single-threaded Merkle verify — 14%. The 20× win above was real but the
-remaining 82 ms is zerocheck replay + PCS opening + lincheck sumcheck replay,
-undecomposed. Attributing it needs a `verify_ligerito_jagged_union_merged_timed`
-(only the non-merged jagged path has a timed variant today). **That is the next
-measurement to take**, before optimizing anything else.
+## Where the 8× actually is: `verify_frobenius_assist`
+
+Measured, not inferred (`VERIFY_TRACE=1 MVB_REPS=1 MVB_PATHS=8`, 1 thread,
+steady-state rep). **Two earlier guesses in these notes were wrong; this
+replaces them.**
+
+| phase | merkle (k_log 19) | blake3 (k_log 14) | ratio |
+|---|---|---|---|
+| `bind_statement` | 0.3 µs | 0.3 µs | — |
+| `zerocheck::verify` (m_total 22 both) | 268 µs | 291 µs | **1.0×** |
+| `lincheck::verify_union` | 14.4 ms | 9.9 ms | 1.5× |
+|  · of which `fold_alpha_batched` | 12.4 ms | 9.6 ms | 1.3× |
+|  · of which sumcheck replay | 530 µs (13 rd) | 91 µs (8 rd) | — |
+| `ring_switch::verify_succinct` ×2 | 234 µs | 245 µs | **1.0×** |
+| `JaggedParams::from_heights` | 6.5 µs | 0.5 µs | — |
+| coeffs (fold byte tables) | 53 µs | 53 µs | **1.0×** |
+| **`jagged::verify_frobenius_assist`** | **81.5 ms** | **3.3 ms** | **24.5×** |
+| `verify_opening_batch_ligerito_mixed` | 252 µs | 224 µs | **1.0×** |
+| total | 96.8 ms | 14.1 ms | 6.9× |
+
+**`verify_frobenius_assist` is 78 ms of the ~83 ms gap — 94% of it.** Everything
+else is at parity or nearly so.
+
+Note what this rules out:
+
+* **The zerocheck is identical** (268 vs 291 µs) — `m_total = nu + k_log = 22`
+  on both sides, so it never could have been the difference.
+* **The actual PCS opening is identical** (252 vs 224 µs). The Ligerito
+  recursive verify is ~0.24 ms total (`LIG_VERIFY_TRACE`). "PCS is expensive"
+  was wrong; the *jagged transport around it* is.
+* **The lincheck is only 1.5× apart**, and the fold inside it 1.3× — the eq
+  factorization brought a 26× structural disadvantage to near parity, which is
+  the real vindication of that work. It also kills the "13 rounds vs 8 rounds
+  and a 2^19 comb vector" story: those cost 530 µs and 91 µs.
+
+**Mechanism.** The Frobenius assist scales with the number of committed jagged
+**columns**, and that count is set by the BLOCK WIDTH, not the row count:
+
+```
+columns = 2^col_log,  col_log = m_total − LOG_PACKING − nu = k_log − 7
+  merkle  k_log 19 → 2^12 = 4096 columns   (used: ⌈425521/128⌉ = 3325)
+  blake3  k_log 14 → 2^7  =  128 columns   (used: ⌈ 15409/128⌉ =  121)
+```
+
+32× the columns, 24.5× the time. And since `col_log` cancels `nu`, **adding
+paths does not help** — which is exactly why both verifies are flat in size
+(Merkle 95 → 110 ms while work grows 8×) and why per-compression verify
+improves purely by amortization.
+
+**Consequence for what to do next.** Merkle verify is a function of `k_log`
+alone, so the lever is narrowing the composite block, not more paths and not
+the fold. Note this makes the SHA-256 backend *counterproductive* for verify:
+κ = 15 gives a composite `k_log = 15 + 5 = 20`, i.e. **more** columns than
+BLAKE3's 19 — it would cut the fold (already at parity) and grow the term that
+actually dominates. The candidates worth costing are making the assist itself
+cheaper, or reducing `depth`'s contribution to `k_log`.
 
 Verify parallelizes ~2.9× on 4 cores (95 → 32 ms) but production ships the
 1-thread pool deliberately; `FLOCK_VERIFY_THREADS` exists only for this bench.

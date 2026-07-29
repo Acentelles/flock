@@ -54,7 +54,32 @@ const DEPTH: usize = 26;
 /// Repetitions per timed phase (after a warm-up). Median is reported. 7 rather
 /// than 3: at these sizes prove is 15–350 ms and verify 4–100 ms, small enough
 /// that 3 reps left the BLAKE3 column visibly non-monotonic in size.
-const REPS: usize = 7;
+/// Override with `MVB_REPS` (`MVB_REPS=1` for a quick `VERIFY_TRACE` run).
+fn reps() -> usize {
+    std::env::var("MVB_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(7)
+}
+
+/// Path counts to sweep; override with e.g. `MVB_PATHS=8,16`. Each must be a
+/// power of two — it is the registry's `2^nu` row capacity.
+fn path_counts() -> Vec<usize> {
+    match std::env::var("MVB_PATHS") {
+        Ok(v) => v
+            .split(',')
+            .filter_map(|s| s.trim().parse::<usize>().ok())
+            .inspect(|n| {
+                assert!(
+                    n.is_power_of_two(),
+                    "MVB_PATHS entries must be powers of two"
+                )
+            })
+            .collect(),
+        Err(_) => vec![8, 16, 32, 64],
+    }
+}
 
 struct Rng(u64);
 impl Rng {
@@ -95,9 +120,10 @@ fn median<F: FnMut() -> R + Send, R: Send>(pool: Option<&rayon::ThreadPool>, mut
         t.elapsed().as_secs_f64()
     };
     let _ = run(); // warm-up: first touch of caches / lazily-built tables
-    let mut v: Vec<f64> = (0..REPS).map(|_| run()).collect();
+    let n = reps();
+    let mut v: Vec<f64> = (0..n).map(|_| run()).collect();
     v.sort_by(f64::total_cmp);
-    v[REPS / 2]
+    v[n / 2]
 }
 
 /// One measured configuration.
@@ -110,6 +136,16 @@ struct Row {
     nu: usize,
     /// Committed stack size.
     dense_m: usize,
+    /// `k_log` of the table type: the block is `2^k_log` columns wide.
+    k_log: usize,
+    /// Useful (non-padding) witness bits over all declared rows.
+    useful_bits_total: usize,
+    /// Nonzeros of the BASE block — what ONE `fold_alpha_batched` walks, and
+    /// all that is stored, since `A = I_rows ⊗ A_0`.
+    base_nnz: usize,
+    /// Nonzeros of the whole constraint system, `rows × base_nnz`: the actual
+    /// size of the R1CS being proven.
+    system_nnz: usize,
     proof_bytes: usize,
     witness_multi: f64,
     prove_multi: f64,
@@ -125,6 +161,9 @@ fn measure(
     rows: usize,
     nu: usize,
     registry: &Registry,
+    k_log: usize,
+    useful_bits: usize,
+    base_nnz: usize,
     circuit: &dyn flock_core::lincheck::LincheckCircuit,
     make_witness: &(
          dyn Fn() -> (
@@ -196,6 +235,10 @@ fn measure(
         rows,
         nu,
         dense_m: pcs_params.m,
+        k_log,
+        useful_bits_total: useful_bits * rows,
+        base_nnz,
+        system_nnz: base_nnz * rows,
         proof_bytes: bincode::serialize(&proof).map(|b| b.len()).unwrap_or(0),
         witness_multi,
         prove_multi,
@@ -212,12 +255,20 @@ fn merkle_row(n_paths: usize, solo: &rayon::ThreadPool) -> Row {
     let walker = layout.build_walker();
     let mut rng = Rng(0x_2600_A711);
     let paths: Vec<PathInput> = (0..n_paths).map(|_| rng.path()).collect();
+    // The composite is `depth` copies of the BLAKE3 block plus the swap gadget
+    // and globals, so the base block IS one whole path. `effective_nnz` is what
+    // the materialized composite would hold; the walker stores one base copy
+    // and the factored fold touches ~1/depth of it.
+    let base_nnz = walker.effective_nnz();
     measure(
         format!("merkle d{DEPTH} x{n_paths}"),
         n_paths * DEPTH,
         n_paths,
         nu,
         &registry,
+        layout.k_log,
+        layout.useful_bits,
+        base_nnz,
         &walker,
         &|| layout.generate_witness_batch_major_partial(&paths, nu),
         solo,
@@ -231,12 +282,22 @@ fn blake3_row(n_hashes: usize, solo: &rayon::ThreadPool) -> Row {
     let registry = Registry::new(vec![TableType::from_block_r1cs(&r1cs)], nu);
     let mut rng = Rng(0x_B3_2600_A711);
     let blocks: Vec<blake3::Compression> = (0..n_hashes).map(|_| rng.compression()).collect();
+    let base_nnz: usize = r1cs
+        .a_0
+        .rows
+        .iter()
+        .chain(r1cs.b_0.rows.iter())
+        .map(|r| r.len())
+        .sum();
     measure(
         format!("blake3 loose x{n_hashes}"),
         n_hashes,
         n_hashes,
         nu,
         &registry,
+        r1cs.k_log,
+        r1cs.useful_bits,
+        base_nnz,
         r1cs.csc_lincheck_circuit(),
         &|| blake3::generate_witness_batch_major_partial(&blocks, nu),
         solo,
@@ -263,10 +324,10 @@ fn main() {
         }
     );
     println!("  depth           : {DEPTH}  =>  1 path = {DEPTH} compressions");
-    println!("  reps            : median of {REPS} after warm-up\n");
+    println!("  reps            : median of {} after warm-up\n", reps());
 
     let mut rows = Vec::new();
-    for &n_paths in &[8usize, 16, 32, 64] {
+    for n_paths in path_counts() {
         rows.push(merkle_row(n_paths, &solo));
         rows.push(blake3_row(n_paths * DEPTH, &solo));
     }
@@ -297,6 +358,26 @@ fn main() {
             r.prove_multi * 1e3,
             r.prove_solo * 1e3,
             r.verify * 1e3,
+        );
+    }
+
+    // Is the Merkle circuit actually bigger? `system_nnz` is the size of the
+    // R1CS proven; `base_nnz` is what one fold walks and all that is stored.
+    println!("\ncircuit size (is the Merkle system bigger?):");
+    println!(
+        "{:<22} {:>6} {:>13} {:>9} {:>13} {:>13} {:>11}",
+        "config", "k_log", "useful bits", "bits/hash", "base nnz", "system nnz", "nnz/hash"
+    );
+    for r in &rows {
+        println!(
+            "{:<22} {:>6} {:>13} {:>9} {:>13} {:>13} {:>11}",
+            r.label,
+            r.k_log,
+            r.useful_bits_total,
+            r.useful_bits_total / r.hashes,
+            r.base_nnz,
+            r.system_nnz,
+            r.system_nnz / r.hashes,
         );
     }
 
