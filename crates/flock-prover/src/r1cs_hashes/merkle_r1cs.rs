@@ -951,12 +951,26 @@ fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, Vec<u32>) {
 ///   they are transposed once over the full composite.
 ///
 /// At depth 26 over BLAKE3 this is ~88 MB resident instead of ~4.4 GB (plus
-/// a second 4.4 GB for the transpose). It performs the *same* ~547M gather
-/// operations — the saving is storage, not arithmetic. That is an acceptable
-/// trade because the matrices are off the prove hot path entirely: the
-/// batch-major witness drivers emit `a` and `b` during hashing, and the
-/// zerocheck runs on the packed witness, so `fold_alpha_batched` is called
-/// once per proof.
+/// a second 4.4 GB for the transpose).
+///
+/// ## The `eq` factorization
+///
+/// Storage was the walker's first purpose; arithmetic is the second. Because
+/// levels tile **aligned** `2^κ` subcubes, the level index is a set of high
+/// address bits, and lincheck's `eq_inner` table is a per-bit product above
+/// the univariate-skip region — so the table is rank-1 across those subcubes:
+///
+/// ```text
+///   eq_inner[l·2^κ + r] = ρ_l · eq_base[r]
+///   ⇒ ξ_M(l·2^κ + c_b)  = ρ_l · ξ_base(c_b)
+/// ```
+///
+/// [`Self::fold_factored`] therefore folds the base block ONCE and pays one
+/// multiply per composite column, instead of `depth` independent gathers:
+/// ~21.6M operations instead of ~547M at depth 26, on prover and verifier
+/// alike. [`Self::factor_eq`] *verifies* the factorization rather than
+/// assuming it, and [`Self::fold_per_level`] is the general fallback, so an
+/// unstructured table gets a slower answer and never a wrong one.
 pub struct MerkleWalkerCircuit {
     n_cols: usize,
     depth: usize,
@@ -990,8 +1004,10 @@ impl MerkleWalkerCircuit {
         sz(&self.base) + sz(&self.extras)
     }
 
-    /// Nonzeros the walker traverses per `fold_alpha_batched` — equal to the
-    /// materialized matrices' nonzero count.
+    /// Nonzeros of the system the walker represents — equal to the
+    /// materialized matrices' nonzero count, and the cost of
+    /// [`Self::fold_per_level`]. The factored fold touches only
+    /// `base_nnz + extras_nnz` of them (~1/depth).
     pub fn effective_nnz(&self) -> usize {
         let (ba, bb) = self.base.nnz();
         let (xa, xb) = self.extras.nnz();
@@ -1019,6 +1035,133 @@ impl MerkleWalkerCircuit {
     fn hash_base(&self, level: usize) -> usize {
         level << self.base_k_log
     }
+
+    /// Factor `eq_inner` across the level subcubes: find `(eq_base, ρ)` with
+    ///
+    /// ```text
+    ///   eq_inner[l·2^κ + r] == ρ_l · eq_base[r]   for all l < depth, r < 2^κ
+    /// ```
+    ///
+    /// or `None` when no such pair exists.
+    ///
+    /// Lincheck's tables always factor. `build_quirky_eq_table` produces
+    /// `L_{i_skip}(z_skip) · eq(x_rest, i_rest)` with the skip dimension in the
+    /// low `K_SKIP = 6` bits and `eq` a per-bit product above them, so it is
+    /// rank-1 at every bit boundary ≥ `K_SKIP` — and levels tile aligned `2^κ`
+    /// subcubes with `κ = 14 > K_SKIP`. (The union's per-slot `w_t` prefix
+    /// weight scales the *comb*, not the table, so it does not disturb this.)
+    ///
+    /// The pair is **verified, not assumed**: ρ is read off one reference
+    /// column and then every entry is checked. That costs `depth · 2^κ`
+    /// multiplies — 0.43M at depth 26, versus the 547M the factorization
+    /// removes — so the guarantee is nearly free, and a caller with an
+    /// unstructured table falls back to [`Self::fold_per_level`] instead of
+    /// silently getting a wrong comb.
+    fn factor_eq(&self, eq_inner: &[F128]) -> Option<(Vec<F128>, Vec<F128>)> {
+        use rayon::prelude::*;
+        let sub = 1usize << self.base_k_log;
+        let slice = |l: usize| &eq_inner[self.hash_base(l)..][..sub];
+
+        // A reference position with a nonzero entry, to divide by. Generic
+        // tables hit this at (0, 0).
+        let Some((l_ref, r0)) = (0..self.depth).find_map(|l| {
+            slice(l).iter().position(|v| *v != F128::ZERO).map(|r| (l, r))
+        }) else {
+            // Every level slice is zero, so every base gather is zero however
+            // it is computed. Report the trivial factorization and let the
+            // fast path run — the extras read `eq_inner` directly and are
+            // unaffected.
+            return Some((vec![F128::ZERO; sub], vec![F128::ZERO; self.depth]));
+        };
+
+        // Absorb ρ_{l_ref} into eq_base, making ρ_{l_ref} = 1.
+        let eq_base = slice(l_ref).to_vec();
+        let inv = eq_base[r0].inv();
+        let rho: Vec<F128> = (0..self.depth)
+            .map(|l| eq_inner[self.hash_base(l) + r0] * inv)
+            .collect();
+
+        let exact = (0..self.depth).into_par_iter().all(|l| {
+            let rho_l = rho[l];
+            slice(l)
+                .iter()
+                .zip(&eq_base)
+                .all(|(&e, &base)| e == rho_l * base)
+        });
+        exact.then_some((eq_base, rho))
+    }
+
+    /// Whether `eq_inner` admits the rank-1 level factorization that
+    /// [`Self::fold_alpha_batched`] exploits. Lincheck's tables do; a random
+    /// vector does not (unless `depth == 1`, where the claim is vacuous).
+    pub fn eq_factors_over_levels(&self, eq_inner: &[F128]) -> bool {
+        self.factor_eq(eq_inner).is_some()
+    }
+
+    /// The factored fold: one gather pass over the base block against
+    /// `eq_base`, then one multiply per composite column.
+    ///
+    /// ```text
+    ///   comb[c] = extras_comb(c) + ρ_{level(c)} · base_comb(c_base)
+    ///   base_comb(c_b) = α · ξ^A_base(c_b) + ξ^B_base(c_b)
+    /// ```
+    ///
+    /// α distributes over the level scale, so the base comb can be α-batched
+    /// once up front and reused by every level.
+    fn fold_factored(
+        &self,
+        alpha: F128,
+        eq_inner: &[F128],
+        eq_base: &[F128],
+        rho: &[F128],
+    ) -> Vec<F128> {
+        use rayon::prelude::*;
+        let sub = 1usize << self.base_k_log;
+
+        // The base block's own comb, ONCE — this is the depth-fold saving.
+        let mut base_comb = vec![F128::ZERO; sub];
+        base_comb
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(c_base, slot)| {
+                let (ba, bb) = self.base.gather(c_base, eq_base, 0);
+                *slot = alpha * ba + bb;
+            });
+
+        let mut out = vec![F128::ZERO; self.n_cols];
+        out.par_iter_mut().enumerate().for_each(|(c, slot)| {
+            let (xa, xb) = self.extras.gather(c, eq_inner, 0);
+            let mut v = alpha * xa + xb;
+            if let Some((level, c_base)) = self.decode(c) {
+                v += rho[level] * base_comb[c_base];
+            }
+            *slot = v;
+        });
+        out
+    }
+
+    /// The general fold: `depth` independent per-level gathers, correct for
+    /// **any** `eq_inner`. This is the fallback when [`Self::factor_eq`]
+    /// finds no factorization, and the oracle the factored path is tested
+    /// against.
+    ///
+    /// Cost is the full effective nonzero count ([`Self::effective_nnz`]),
+    /// ~547M at depth 26 over BLAKE3.
+    pub fn fold_per_level(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
+        use rayon::prelude::*;
+        assert_eq!(eq_inner.len(), self.n_cols);
+        let mut out = vec![F128::ZERO; self.n_cols];
+        out.par_iter_mut().enumerate().for_each(|(c, slot)| {
+            let (mut sa, mut sb) = self.extras.gather(c, eq_inner, 0);
+            if let Some((level, c_base)) = self.decode(c) {
+                let (ba, bb) = self.base.gather(c_base, eq_inner, self.hash_base(level));
+                sa += ba;
+                sb += bb;
+            }
+            *slot = alpha * sa + sb;
+        });
+        out
+    }
 }
 
 impl flock_core::lincheck::LincheckCircuit for MerkleWalkerCircuit {
@@ -1031,23 +1174,28 @@ impl flock_core::lincheck::LincheckCircuit for MerkleWalkerCircuit {
     }
 
     fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
-        use rayon::prelude::*;
         assert_eq!(eq_inner.len(), self.n_cols);
-        let one_col = |c: usize| -> F128 {
-            let (mut sa, mut sb) = self.extras.gather(c, eq_inner, 0);
-            if let Some((level, c_base)) = self.decode(c) {
-                let (ba, bb) = self.base.gather(c_base, eq_inner, self.hash_base(level));
-                sa += ba;
-                sb += bb;
-            }
-            alpha * sa + sb
-        };
-        let mut out = vec![F128::ZERO; self.n_cols];
-        out.par_iter_mut()
-            .enumerate()
-            .for_each(|(c, slot)| *slot = one_col(c));
-        out
+        if force_per_level() {
+            return self.fold_per_level(alpha, eq_inner);
+        }
+        match self.factor_eq(eq_inner) {
+            Some((eq_base, rho)) => self.fold_factored(alpha, eq_inner, &eq_base, &rho),
+            None => self.fold_per_level(alpha, eq_inner),
+        }
     }
+}
+
+/// A/B knob (`FLOCK_MERKLE_FOLD_PER_LEVEL=1`): skip the factorization and
+/// always take the general per-level walk. Value-identical either way — the
+/// factorization is verified before use — so one process can time both and
+/// cancel thermal drift. Same role as `lincheck::FOLD_IBLOCK`.
+fn force_per_level() -> bool {
+    static FORCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCE.get_or_init(|| {
+        std::env::var("FLOCK_MERKLE_FOLD_PER_LEVEL")
+            .ok()
+            .is_some_and(|v| v != "0" && !v.is_empty())
+    })
 }
 
 /// One Merkle path: the leaf digest, its index, and one sibling per level

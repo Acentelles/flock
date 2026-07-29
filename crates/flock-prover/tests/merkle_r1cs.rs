@@ -5,7 +5,8 @@
 //! depth. They are the reference oracle for the depth-26 walker path.
 
 use flock_core::field::F128;
-use flock_core::lincheck::{CscCircuit, LincheckCircuit};
+use flock_core::lincheck::{build_quirky_eq_table, CscCircuit, LincheckCircuit};
+use flock_core::zerocheck::K_SKIP;
 use flock_prover::r1cs_hashes::merkle_r1cs::{
     blake3_spec, reference_root, MerkleTreeLayout, PathInput, SLOT_WORDS,
 };
@@ -319,10 +320,28 @@ impl Rng {
     }
 }
 
+/// Assert two combs are equal, naming the first offending column.
+fn assert_comb_eq(got: &[F128], want: &[F128], ctx: &str) {
+    assert_eq!(got.len(), want.len(), "{ctx}: comb length");
+    if got != want {
+        let bad = (0..got.len()).find(|&c| got[c] != want[c]).unwrap();
+        panic!(
+            "{ctx}: comb mismatch at column {bad} (of {}): {:?} vs {:?}",
+            got.len(),
+            got[bad],
+            want[bad]
+        );
+    }
+}
+
 /// THE walker test: `fold_alpha_batched` must agree with the CSC circuit over
 /// the fully materialized composite matrices, column for column, on random
 /// `eq_inner`. This is what licenses using the walker at depth 26, where the
 /// materialized form does not fit in memory.
+///
+/// A random table does not factor over the level subcubes (for `depth > 1`),
+/// so this also pins the general `fold_per_level` fallback — both the
+/// dispatching entry point and the fallback directly.
 #[test]
 fn walker_matches_materialized() {
     for depth in [1usize, 2, 3] {
@@ -346,21 +365,120 @@ fn walker_matches_materialized() {
         for trial in 0..3 {
             let eq: Vec<F128> = (0..walker.n_cols()).map(|_| rng.f128()).collect();
             let alpha = rng.f128();
-            let got = walker.fold_alpha_batched(alpha, &eq);
+            // A random table is rank-1 across levels only when there is a
+            // single level, where the claim is vacuous.
+            assert_eq!(
+                walker.eq_factors_over_levels(&eq),
+                depth == 1,
+                "depth {depth} trial {trial}: random eq factorability"
+            );
             let want = reference.fold_alpha_batched(alpha, &eq);
-            assert_eq!(got.len(), want.len());
-            if got != want {
-                let bad = (0..got.len()).find(|&c| got[c] != want[c]).unwrap();
-                panic!(
-                    "depth {depth} trial {trial}: comb mismatch at column {bad} \
-                     (of {}): walker {:?} vs materialized {:?}",
-                    got.len(),
-                    got[bad],
-                    want[bad]
-                );
-            }
+            assert_comb_eq(
+                &walker.fold_alpha_batched(alpha, &eq),
+                &want,
+                &format!("depth {depth} trial {trial} dispatched"),
+            );
+            assert_comb_eq(
+                &walker.fold_per_level(alpha, &eq),
+                &want,
+                &format!("depth {depth} trial {trial} per-level"),
+            );
         }
     }
+}
+
+/// A lincheck-shaped `eq_inner`: `build_quirky_eq_table` at a random point,
+/// exactly what `lincheck::prove` / `verify_union` hand the circuit.
+fn quirky_eq(rng: &mut Rng, k_log: usize) -> Vec<F128> {
+    let x_inner_rest: Vec<F128> = (0..k_log - K_SKIP).map(|_| rng.f128()).collect();
+    build_quirky_eq_table(rng.f128(), &x_inner_rest, K_SKIP)
+}
+
+/// The factorization, against the materialized oracle. On a *real* lincheck
+/// table the walker takes the factored path — one base fold plus a multiply
+/// per column — and it must still agree with the full composite matrices
+/// column for column.
+#[test]
+fn walker_factored_matches_materialized() {
+    for depth in [1usize, 2, 3] {
+        let layout = MerkleTreeLayout::new(depth, blake3_spec());
+        let (a_0, b_0) = layout.build_matrices();
+        let reference = CscCircuit::from_matrices(&a_0, &b_0)
+            .with_const_pin(Some(layout.const_pos()));
+        let walker = layout.build_walker();
+
+        let mut rng = Rng::new(0x_FAC7_0000 + depth as u64);
+        for trial in 0..3 {
+            let eq = quirky_eq(&mut rng, layout.k_log);
+            assert_eq!(eq.len(), walker.n_cols(), "depth {depth} eq length");
+            let alpha = rng.f128();
+            assert!(
+                walker.eq_factors_over_levels(&eq),
+                "depth {depth} trial {trial}: a quirky eq table MUST factor over \
+                 the aligned level subcubes — if this fails the fast fold is \
+                 silently never used"
+            );
+            let want = reference.fold_alpha_batched(alpha, &eq);
+            assert_comb_eq(
+                &walker.fold_alpha_batched(alpha, &eq),
+                &want,
+                &format!("depth {depth} trial {trial} factored vs materialized"),
+            );
+            assert_comb_eq(
+                &walker.fold_per_level(alpha, &eq),
+                &want,
+                &format!("depth {depth} trial {trial} per-level vs materialized"),
+            );
+        }
+    }
+}
+
+/// The factorization at the depth we ship, where no materialized reference
+/// exists: the factored fold must equal the general per-level walk, which
+/// `walker_factored_matches_materialized` ties to the real matrices at small
+/// depth. Also reports the speedup, since that is the whole point.
+#[test]
+fn walker_factored_matches_per_level_at_depth26() {
+    use std::time::Instant;
+
+    let layout = MerkleTreeLayout::new(26, blake3_spec());
+    let walker = layout.build_walker();
+    let mut rng = Rng::new(0x_FAC7_001A);
+    let eq = quirky_eq(&mut rng, layout.k_log);
+    let alpha = rng.f128();
+    assert!(walker.eq_factors_over_levels(&eq), "depth 26 quirky eq must factor");
+
+    // Time both on the full pool AND on one thread. The verifier runs its
+    // PIOP replay inside a dedicated single-thread pool
+    // (`flock_core::verifier`), so the 1-thread column is the one that
+    // predicts verify time; the parallel column understates the win because
+    // the per-level walk parallelizes better than the base fold.
+    let solo = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("1-thread pool");
+    let bench = |label: &str, pool: Option<&rayon::ThreadPool>| {
+        let run = |f: &(dyn Fn() -> Vec<F128> + Sync)| match pool {
+            Some(p) => p.install(|| f()),
+            None => f(),
+        };
+        let t = Instant::now();
+        let fast = run(&|| walker.fold_alpha_batched(alpha, &eq));
+        let t_fast = t.elapsed();
+        let t = Instant::now();
+        let slow = run(&|| walker.fold_per_level(alpha, &eq));
+        let t_slow = t.elapsed();
+        assert_comb_eq(&fast, &slow, &format!("depth 26 factored vs per-level ({label})"));
+        println!(
+            "depth 26 fold, {label:>9}: factored {:>8.1} ms  per-level {:>8.1} ms  ({:.1}×)",
+            t_fast.as_secs_f64() * 1e3,
+            t_slow.as_secs_f64() * 1e3,
+            t_slow.as_secs_f64() / t_fast.as_secs_f64(),
+        );
+    };
+    println!("{} effective nonzeros", walker.effective_nnz());
+    bench("parallel", None);
+    bench("1 thread", Some(&solo));
 }
 
 /// The walker is the memory story: at the real depth it must stay small,
