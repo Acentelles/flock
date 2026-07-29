@@ -802,8 +802,19 @@ where
     // or explicitly writes F128::ZERO at padding holes (padded path).
     // Saves ~22 ms of sequential zero-fill at m=29 (256 MB total) that would
     // otherwise cap the parallel speedup of this phase at ~2.5× on 8 cores.
-    let mut a_folded: Vec<F128> = crate::scratch::take_f128(n_out);
-    let mut b_folded: Vec<F128> = crate::scratch::take_f128(n_out);
+    //
+    // LIVE-SPAN OUTPUT on the sparse dispatch: the buffer holds 2 slots per
+    // LIVE pair instead of the full padded `n_out`. The live pair count is
+    // count-derived and so identical at every capacity (6.0M at the m30 load),
+    // which is what takes this phase — and the scratch pool it shares with the
+    // open — off the capacity axis. Dead pairs are not stored at all rather
+    // than stored-and-skipped.
+    let out_len = match live_pairs {
+        Some(iv) => 2 * iv.iter().map(|&(s, e)| e - s).sum::<usize>(),
+        None => n_out,
+    };
+    let mut a_folded: Vec<F128> = crate::scratch::take_f128(out_len);
+    let mut b_folded: Vec<F128> = crate::scratch::take_f128(out_len);
 
     let eq = SplitEqGhash::new(&mlv_challenges[1..]);
     let lo_size = 1usize << eq.n_lo;
@@ -835,23 +846,21 @@ where
         const LIVE_PAIRS_PER_TASK: usize = 1 << 16;
         let (pieces, tasks) = balanced_interval_tasks(iv, LIVE_PAIRS_PER_TASK);
 
-        // Each task owns the output span of its pieces — disjoint and in
-        // address order, so the buffers carve by successive `split_at_mut`.
+        // Each task owns the COMPACTED output span of its pieces — 2 slots per
+        // live pair, disjoint and in address order, so the buffers carve by
+        // successive `split_at_mut` with no gap arithmetic (the previous
+        // global carve had to skip `2*s - off` dead slots between tasks).
         let mut work: Vec<(&[(usize, usize)], &mut [F128], &mut [F128])> =
             Vec::with_capacity(tasks.len());
         {
             let (mut a_rem, mut b_rem): (&mut [F128], &mut [F128]) =
                 (&mut a_folded[..], &mut b_folded[..]);
-            let mut off = 0usize;
             for t in &tasks {
-                let (s, e) = (pieces[t.start].0, pieces[t.end - 1].1);
-                let (_, rest) = std::mem::take(&mut a_rem).split_at_mut(2 * s - off);
-                let (a_task, rest) = rest.split_at_mut(2 * (e - s));
+                let span: usize = pieces[t.clone()].iter().map(|&(s, e)| 2 * (e - s)).sum();
+                let (a_task, rest) = std::mem::take(&mut a_rem).split_at_mut(span);
                 a_rem = rest;
-                let (_, rest) = std::mem::take(&mut b_rem).split_at_mut(2 * s - off);
-                let (b_task, rest) = rest.split_at_mut(2 * (e - s));
+                let (b_task, rest) = std::mem::take(&mut b_rem).split_at_mut(span);
                 b_rem = rest;
-                off = 2 * e;
                 work.push((&pieces[t.clone()], a_task, b_task));
             }
         }
@@ -859,9 +868,15 @@ where
         let (sum1, sum_inf) = work
             .into_par_iter()
             .map(|(task_pieces, a_task, b_task)| {
-                let out_base = task_pieces[0].0;
                 let (mut s1, mut s_inf) = (F128::ZERO, F128::ZERO);
+                // Slots written so far in this task. `fold_pair_run` reads at
+                // the GLOBAL `2*pair` but writes at `2*(pair - out_base)`, so
+                // biasing `out_base` per piece compacts the output without the
+                // kernel body knowing — keeping one fold body shared with the
+                // dense dispatch and all three arch variants (bd0f222).
+                let mut local = 0usize;
                 for &(ps, pe) in task_pieces {
+                    let out_base = ps - local / 2;
                     // Split at hi-block boundaries: one `eq_hi` factor per run,
                     // hoisted out of the inner loop exactly as in the dense
                     // dispatch.
@@ -877,6 +892,7 @@ where
                         s_inf += eq_h * pinf.reduce();
                         t = run_end;
                     }
+                    local += 2 * (pe - ps);
                 }
                 (s1, s_inf)
             })
@@ -958,27 +974,7 @@ fn uni_skip_fold_and_round_pair_runs(
         padding.covered_bits()
     );
 
-    // Sparse mode (no dead writes): the canonical live-pair interval list IS
-    // the skip predicate — the kernel visits live pairs only, so no per-pair
-    // table is built and `is_dead` is never consulted. A pair (post-URM
-    // chunks `2k`, `2k+1`) covers witness bits
-    // `[k·2^(k_skip+1), (k+1)·2^(k_skip+1))`, which is exactly
-    // `useful_block_intervals` at block size `2^(k_skip+1)` (merged, so
-    // intervals that share a boundary pair are never processed twice).
-    if !write_dead {
-        let pair_intervals = padding.useful_block_intervals(k_skip + 1);
-        return fold_and_round_pair_kernel(
-            a_packed,
-            b_packed,
-            m,
-            k_skip,
-            table,
-            mlv_challenges,
-            |_| false,
-            false,
-            Some(&pair_intervals),
-        );
-    }
+    debug_assert!(write_dead, "the sparse path builds its own live-pair list");
 
     // Dense mode: every output slot must be written, so the dispatch stays
     // over the whole domain and the predicate comes from a precomputed
@@ -1012,6 +1008,11 @@ fn uni_skip_fold_and_round_pair_runs(
 /// kernels), so the `2·2^(m−k_skip)`-word zero fill can be skipped. Message
 /// and useful-interval values are byte-identical to the public wrapper.
 /// Multi-run specs only.
+/// Returns the fold outputs in LIVE-SPAN (compacted) storage together with the
+/// [`LiveLayout`] that maps them back to the padded domain: slot `2*rank(k)`
+/// and `2*rank(k)+1` hold live pair `k`'s two outputs. Dead pairs occupy no
+/// storage, so the buffers are count-derived — the same size at every capacity
+/// — instead of `2^(m-k_skip)`.
 pub fn uni_skip_fold_and_round_pair_runs_sparse(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -1020,21 +1021,36 @@ pub fn uni_skip_fold_and_round_pair_runs_sparse(
     table: &UniSkipFoldTable,
     mlv_challenges: &[F128],
     padding: &PaddingSpec,
-) -> (Vec<F128>, Vec<F128>, F128, F128) {
+) -> (Vec<F128>, Vec<F128>, F128, F128, LiveLayout) {
     assert!(
         padding.as_single_run().is_none(),
         "the sparse round-2 variant is for multi-run specs only"
     );
-    uni_skip_fold_and_round_pair_runs(
+    // The canonical live-pair interval list IS the skip predicate — the kernel
+    // visits live pairs only, so no per-pair table is built and `is_dead` is
+    // never consulted. A pair (post-URM chunks `2k`, `2k+1`) covers witness
+    // bits `[k·2^(k_skip+1), (k+1)·2^(k_skip+1))`, which is exactly
+    // `useful_block_intervals` at block size `2^(k_skip+1)` (merged, so
+    // intervals that share a boundary pair are never processed twice).
+    let pair_intervals = padding.useful_block_intervals(k_skip + 1);
+    // Each live pair contributes the two adjacent output positions 2k, 2k+1,
+    // so the stored set is the pair list doubled — pair-aligned by
+    // construction, which is what keeps the NEXT round's fold pairs
+    // well-defined under compaction.
+    let store = LiveLayout::new(pair_intervals.iter().map(|&(s, e)| (2 * s, 2 * e)).collect());
+    let (a, b, msg1, msg_inf) = fold_and_round_pair_kernel(
         a_packed,
         b_packed,
         m,
         k_skip,
         table,
         mlv_challenges,
-        padding,
+        |_| false,
         false,
-    )
+        Some(&pair_intervals),
+    );
+    debug_assert_eq!(a.len(), store.len(), "compacted output length");
+    (a, b, msg1, msg_inf, store)
 }
 
 // ---------------------------------------------------------------------------
@@ -1351,6 +1367,97 @@ pub fn fold_and_compute_round_pair_into(
 /// of the folded (half-size) domain is live iff `{2x, 2x+1}` intersects a
 /// live input interval — `[s, e)` maps to `[s/2, (e+1)/2)` — with touching
 /// output intervals merged so the list stays canonical.
+/// Compacted storage for a sparse multilinear table: the buffer holds only
+/// the live positions, in global order, instead of the full padded domain.
+///
+/// WHY. Under a count-derived multi-run spec the live support is a fixed
+/// ~6.0M pairs at every capacity, but the fold buffers are sized by the
+/// PADDED domain — 2^24 words at nu = 14 and 2^28 at nu = 18 for the same
+/// live work. The sparse kernels already skip the dead positions, so the
+/// arithmetic is capacity-free; what is not free is scattering that fixed
+/// live set over a 16x wider span. MEASURED (m30, steady state): zerocheck
+/// round 2 + tail cost +8.6 ms at nu = 18 over nu = 14 on identical live
+/// volume, and the open pays another ~6 ms because the capacity-sized
+/// buffers crowd the scratch pool.
+///
+/// The mapping is an interval-rank: global `y` in `intervals[i]` is stored at
+/// `offs[i] + (y - intervals[i].0)`; anything outside is honestly ZERO and is
+/// zero-substituted on read (never stored). Reads within a kernel task ascend,
+/// so the interval index is a monotone cursor, not a search.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveLayout {
+    /// Canonical global intervals: sorted, disjoint, non-touching.
+    intervals: Vec<(usize, usize)>,
+    /// `offs[i]` = number of live positions before `intervals[i]`.
+    offs: Vec<usize>,
+    /// Total stored positions = compacted buffer length.
+    len: usize,
+}
+
+impl LiveLayout {
+    /// Build from a canonical interval list (sorted, disjoint, non-touching —
+    /// exactly what [`shrink_intervals`] and `useful_block_intervals` return).
+    pub fn new(intervals: Vec<(usize, usize)>) -> Self {
+        debug_assert!(
+            intervals.windows(2).all(|w| w[0].1 < w[1].0),
+            "canonical list required (sorted, disjoint, non-touching)"
+        );
+        debug_assert!(intervals.iter().all(|&(s, e)| s < e), "non-empty pieces");
+        let mut offs = Vec::with_capacity(intervals.len());
+        let mut acc = 0usize;
+        for &(s, e) in &intervals {
+            offs.push(acc);
+            acc += e - s;
+        }
+        Self {
+            intervals,
+            offs,
+            len: acc,
+        }
+    }
+
+    /// Compacted buffer length.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn intervals(&self) -> &[(usize, usize)] {
+        &self.intervals
+    }
+
+    /// Compacted offset of `intervals()[i]`'s first position.
+    pub fn offset_of(&self, i: usize) -> usize {
+        self.offs[i]
+    }
+
+    /// Seed a monotone cursor for reads starting at global `y`.
+    pub fn seek(&self, y: usize) -> usize {
+        self.intervals.partition_point(|&(_, e)| e <= y)
+    }
+
+    /// Compacted slot of global `y`, or `None` when `y` is dead (value ZERO).
+    /// `cur` must be a cursor from [`Self::seek`] advanced only by ASCENDING
+    /// `y` — the kernels read in address order, so this stays O(1) amortized.
+    #[inline]
+    pub fn rank(&self, cur: &mut usize, y: usize) -> Option<usize> {
+        while *cur < self.intervals.len() && self.intervals[*cur].1 <= y {
+            *cur += 1;
+        }
+        let (s, _) = *self.intervals.get(*cur)?;
+        (s <= y).then(|| self.offs[*cur] + (y - s))
+    }
+
+    /// True when the layout stores a contiguous prefix of the domain, i.e.
+    /// compaction is the identity and the dense kernels can run unchanged.
+    pub fn is_dense(&self, domain: usize) -> bool {
+        matches!(self.intervals.as_slice(), [(0, e)] if *e == domain)
+    }
+}
+
 pub fn shrink_intervals(live: &[(usize, usize)]) -> Vec<(usize, usize)> {
     let mut out: Vec<(usize, usize)> = Vec::with_capacity(live.len());
     for &(s, e) in live {
@@ -1390,19 +1497,16 @@ pub fn fold_and_round_pair_sparse_into(
     b_out: &mut [F128],
     r_fold: F128,
     r_next: &[F128],
-    live_in: &[(usize, usize)],
-) -> (F128, F128, Vec<(usize, usize)>) {
-    let n = a.len();
-    assert_eq!(b.len(), n);
-    assert!(n.is_power_of_two() && n >= 8);
-    let half = n / 2;
-    assert!(a_out.len() >= half && b_out.len() >= half);
+    store_in: &LiveLayout,
+    domain: usize,
+) -> (F128, F128, LiveLayout) {
+    assert!(domain.is_power_of_two() && domain >= 8);
+    assert_eq!(a.len(), store_in.len());
+    assert_eq!(b.len(), store_in.len());
+    let n = domain;
     let log_n = n.trailing_zeros() as usize;
     assert_eq!(r_next.len(), log_n - 1);
-    debug_assert!(
-        live_in.windows(2).all(|w| w[0].1 < w[1].0),
-        "canonical list"
-    );
+    let live_in = store_in.intervals();
     debug_assert!(live_in.last().is_none_or(|&(_, e)| e <= n));
 
     // eq split over the message's pair domain (size half/2), exactly as the
@@ -1412,6 +1516,13 @@ pub fn fold_and_round_pair_sparse_into(
 
     let live_out = shrink_intervals(live_in);
     let pair_cover = shrink_intervals(&live_out);
+    // Stored set of the OUTPUT: 2 slots per covered pair. A pair may straddle
+    // a live/dead boundary (`pair_cover` is not pair-aligned in general); the
+    // dead half folds from zero-substituted reads to an honest ZERO, so
+    // storing it costs one slot and keeps the layout pair-aligned for the next
+    // round. Superset of `live_out`, and every extra slot holds a true zero.
+    let store_out = LiveLayout::new(pair_cover.iter().map(|&(s, e)| (2 * s, 2 * e)).collect());
+    assert!(a_out.len() >= store_out.len() && b_out.len() >= store_out.len());
 
     // The pair cover split into tasks of roughly equal LIVE work, each with
     // its own disjoint output slices — parallel like the dense kernel,
@@ -1431,18 +1542,14 @@ pub fn fold_and_round_pair_sparse_into(
     let mut work: Vec<(&[(usize, usize)], &mut [F128], &mut [F128])> =
         Vec::with_capacity(tasks.len());
     {
-        let mut a_rem: &mut [F128] = &mut a_out[..half];
-        let mut b_rem: &mut [F128] = &mut b_out[..half];
-        let mut off = 0usize;
+        let mut a_rem: &mut [F128] = &mut a_out[..store_out.len()];
+        let mut b_rem: &mut [F128] = &mut b_out[..store_out.len()];
         for t in &tasks {
-            let (ps, pe) = (pieces[t.start].0, pieces[t.end - 1].1);
-            let (_, rest) = std::mem::take(&mut a_rem).split_at_mut(2 * ps - off);
-            let (a_task, rest) = rest.split_at_mut(2 * (pe - ps));
+            let span: usize = pieces[t.clone()].iter().map(|&(s, e)| 2 * (e - s)).sum();
+            let (a_task, rest) = std::mem::take(&mut a_rem).split_at_mut(span);
             a_rem = rest;
-            let (_, rest) = std::mem::take(&mut b_rem).split_at_mut(2 * ps - off);
-            let (b_task, rest) = rest.split_at_mut(2 * (pe - ps));
+            let (b_task, rest) = std::mem::take(&mut b_rem).split_at_mut(span);
             b_rem = rest;
-            off = 2 * pe;
             work.push((&pieces[t.clone()], a_task, b_task));
         }
     }
@@ -1452,25 +1559,26 @@ pub fn fold_and_round_pair_sparse_into(
         .into_par_iter()
         .map(|(task_pieces, a_task, b_task)| {
             let ps = task_pieces[0].0;
-            // Zero-substituting source reads: a task-local cursor walks
-            // `live_in` monotonically as the read position `y` ascends
-            // (reads within a task are ascending), seeded by binary search.
-            let mut cur = live_in.partition_point(|&(_, e)| e <= 4 * ps);
+            // Zero-substituting source reads THROUGH the compaction map: a
+            // task-local cursor walks the stored intervals monotonically as
+            // the read position `y` ascends (reads within a task ascend),
+            // seeded by binary search. A dead `y` is not stored at all and
+            // reads as its honest value, ZERO.
+            let mut cur = store_in.seek(4 * ps);
             let read2 = |cur: &mut usize, y: usize| -> (F128, F128) {
-                while *cur < live_in.len() && live_in[*cur].1 <= y {
-                    *cur += 1;
-                }
-                if *cur < live_in.len() && live_in[*cur].0 <= y {
-                    (a[y], b[y])
-                } else {
-                    (F128::ZERO, F128::ZERO)
+                match store_in.rank(cur, y) {
+                    Some(i) => (a[i], b[i]),
+                    None => (F128::ZERO, F128::ZERO),
                 }
             };
             let mut s1 = F128::ZERO;
             let mut s_inf = F128::ZERO;
-            // A task may cover several live pieces; the dead gaps between
-            // them fall inside its output span and are simply never written.
+            // A task may cover several live pieces; the dead gaps between them
+            // occupy no output storage, so each piece's slots follow the
+            // previous piece's directly.
+            let mut local = 0usize;
             for &(piece_s, piece_e) in task_pieces {
+                let piece_base = local;
                 let mut t = piece_s;
                 while t < piece_e {
                     let run_end = (((t >> eq.n_lo) + 1) << eq.n_lo).min(piece_e);
@@ -1486,7 +1594,7 @@ pub fn fold_and_round_pair_sparse_into(
                         let a1 = a10 + r_fold * (a11 + a10);
                         let b0 = b00 + r_fold * (b01 + b00);
                         let b1 = b10 + r_fold * (b11 + b10);
-                        let o = 2 * (tt - ps);
+                        let o = piece_base + 2 * (tt - piece_s);
                         a_task[o] = a0;
                         a_task[o + 1] = a1;
                         b_task[o] = b0;
@@ -1500,6 +1608,7 @@ pub fn fold_and_round_pair_sparse_into(
                     s_inf += eq_h * p_inf.reduce();
                     t = run_end;
                 }
+                local += 2 * (piece_e - piece_s);
             }
             (s1, s_inf)
         })
@@ -1507,7 +1616,22 @@ pub fn fold_and_round_pair_sparse_into(
             || (F128::ZERO, F128::ZERO),
             |(x1, xi), (y1, yi)| (x1 + y1, xi + yi),
         );
-    (r_next[0] * sum1, sum_inf, live_out)
+    (r_next[0] * sum1, sum_inf, store_out)
+}
+
+/// Scatter a live-span buffer back to the full padded domain, zeroing the
+/// dead positions — the bridge back to the dense kernels, which index by
+/// global position. Needed only when the tail leaves the sparse path
+/// (`SPARSE_TAIL_GATE > 1`, or the domain drops below the fused threshold).
+pub fn expand_to_dense(compact: &[F128], store: &LiveLayout, domain: usize) -> Vec<F128> {
+    debug_assert_eq!(compact.len(), store.len());
+    let mut out = crate::scratch::take_f128(domain);
+    out.fill(F128::ZERO);
+    for (i, &(s, e)) in store.intervals().iter().enumerate() {
+        let off = store.offset_of(i);
+        out[s..e].copy_from_slice(&compact[off..off + (e - s)]);
+    }
+    out
 }
 
 /// Zero every position of `v[..len]` outside the canonical live interval
@@ -1609,6 +1733,63 @@ pub fn uni_skip_fold_and_round_pair_optimized(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `LiveLayout` is an order-preserving bijection between the live global
+    /// positions and `0..len`, and reports every dead position as absent.
+    /// Checked against a brute-force rank over the whole domain, including
+    /// the fragmented and boundary-touching shapes the multi-run specs
+    /// actually produce.
+    #[test]
+    fn live_layout_ranks_match_brute_force() {
+        let cases: Vec<(Vec<(usize, usize)>, usize)> = vec![
+            (vec![], 16),
+            (vec![(0, 32)], 32),
+            (vec![(0, 10), (16, 26), (32, 42)], 64),
+            (vec![(3, 4)], 8),
+            (vec![(0, 1), (2, 3), (4, 5), (6, 7)], 8),
+            (vec![(5, 9), (11, 12), (20, 40)], 48),
+        ];
+        for (iv, domain) in cases {
+            let layout = LiveLayout::new(iv.clone());
+            // Brute-force: the compacted index is the count of live positions
+            // strictly before y, and None when y itself is dead.
+            let live_at = |y: usize| iv.iter().any(|&(s, e)| s <= y && y < e);
+            let mut expect_len = 0usize;
+            let mut cur = layout.seek(0);
+            for y in 0..domain {
+                let got = layout.rank(&mut cur, y);
+                if live_at(y) {
+                    assert_eq!(got, Some(expect_len), "rank at {y} for {iv:?}");
+                    expect_len += 1;
+                } else {
+                    assert_eq!(got, None, "dead {y} must not be stored, {iv:?}");
+                }
+            }
+            assert_eq!(layout.len(), expect_len, "len for {iv:?}");
+            assert_eq!(layout.is_empty(), expect_len == 0);
+            // A cursor seeded mid-domain agrees with one walked from zero.
+            for probe in [0, domain / 3, domain / 2, domain.saturating_sub(1)] {
+                let mut c = layout.seek(probe);
+                let mut c0 = layout.seek(0);
+                let mut walk = None;
+                for y in 0..=probe {
+                    walk = layout.rank(&mut c0, y);
+                }
+                assert_eq!(layout.rank(&mut c, probe), walk, "seek({probe}) {iv:?}");
+            }
+        }
+    }
+
+    /// `is_dense` recognises exactly the layouts where compaction is the
+    /// identity — the gate for keeping the dense kernels on the anchor shape.
+    #[test]
+    fn live_layout_is_dense_only_for_full_cover() {
+        assert!(LiveLayout::new(vec![(0, 32)]).is_dense(32));
+        assert!(!LiveLayout::new(vec![(0, 16)]).is_dense(32));
+        assert!(!LiveLayout::new(vec![(1, 32)]).is_dense(32));
+        assert!(!LiveLayout::new(vec![(0, 8), (16, 32)]).is_dense(32));
+        assert!(!LiveLayout::new(vec![]).is_dense(32));
+    }
 
     /// The task cut is a faithful partition of the live set: pieces
     /// concatenate back to the input intervals (no element added, dropped or

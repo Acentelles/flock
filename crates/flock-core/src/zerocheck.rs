@@ -29,7 +29,7 @@ pub mod univariate_skip_optimized;
 use multilinear::{
     UniSkipFoldTable, fold_and_compute_round_pair_into, fold_and_round_pair_sparse_into,
     fold_in_place_pair, interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
-    uni_skip_fold_and_round_pair_optimized_packed_padded, zero_dead_regions,
+    uni_skip_fold_and_round_pair_optimized_packed_padded,
 };
 use univariate_skip_optimized::{
     c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
@@ -470,24 +470,31 @@ fn prove_packed_padded_inner<C: Challenger>(
     mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
     // Support-proportional prover (M6): under a multi-run count-derived spec
     // the post-URM tables are zero outside the declared support (the live
-    // interval list). While that support is sparse (live·16 ≤ n), round 2
-    // skips its dead-pair zero writes and the tail rounds fold/evaluate over
-    // the live intervals only — every skipped term carries an `a·b` factor
-    // of zero, so all messages and folded values are byte-identical to the
-    // dense path. Once the live fraction crosses the threshold, the dead
-    // regions are zeroed once and the dense kernels resume.
-    let mut live: Option<Vec<(usize, usize)>> = if padding.as_single_run().is_none() {
-        Some(padding.useful_block_intervals(k_skip))
-    } else {
-        None
-    };
-    let sparse_from_round2 = live.as_ref().is_some_and(|list| {
+    // interval list). While that support is sparse (live·16 ≤ n), round 2 and
+    // the tail rounds fold/evaluate over the live intervals only — every
+    // skipped term carries an `a·b` factor of zero, so all messages and folded
+    // values are byte-identical to the dense path.
+    //
+    // The buffers hold the LIVE SPAN, not the padded domain: dead positions get
+    // no storage at all, so both the fold cost and the footprint are
+    // count-derived and the phase leaves the capacity axis entirely. When the
+    // tail leaves the sparse path — the live fraction crosses the gate, or the
+    // domain drops below the fused threshold and the naive kernels need global
+    // indexing — `expand_to_dense` scatters the live span back into a full
+    // padded buffer once. See [`multilinear::LiveLayout`].
+    let sparse_from_round2 = padding.as_single_run().is_none() && {
+        let list = padding.useful_block_intervals(k_skip);
         let live_elems: usize = list.iter().map(|&(s, e)| e - s).sum();
         let n_out = 1usize << n_mlv;
         n_out >= 8 && live_elems * sparse_tail_gate() <= n_out
-    });
-    let (mut a_mlv, mut b_mlv, msg_1, msg_inf) = if sparse_from_round2 {
-        multilinear::uni_skip_fold_and_round_pair_runs_sparse(
+    };
+    // `store` is the compaction map for the tail buffers: `Some` means they
+    // hold ONLY the live span, `None` means the full padded domain. `domain`
+    // is the logical multilinear size and halves every round regardless —
+    // under compaction it is no longer `a_mlv.len()`.
+    let mut domain = 1usize << n_mlv;
+    let (mut a_mlv, mut b_mlv, msg_1, msg_inf, mut store) = if sparse_from_round2 {
+        let (a, b, m1, mi, st) = multilinear::uni_skip_fold_and_round_pair_runs_sparse(
             a_packed,
             b_packed,
             m,
@@ -495,9 +502,10 @@ fn prove_packed_padded_inner<C: Challenger>(
             &fold_table,
             &mlv_arg,
             padding,
-        )
+        );
+        (a, b, m1, mi, Some(st))
     } else {
-        uni_skip_fold_and_round_pair_optimized_packed_padded(
+        let (a, b, m1, mi) = uni_skip_fold_and_round_pair_optimized_packed_padded(
             a_packed,
             b_packed,
             m,
@@ -505,7 +513,8 @@ fn prove_packed_padded_inner<C: Challenger>(
             &fold_table,
             &mlv_arg,
             padding,
-        )
+        );
+        (a, b, m1, mi, None)
     };
 
     if zc_timing {
@@ -545,15 +554,17 @@ fn prove_packed_padded_inner<C: Challenger>(
         (Vec::new(), Vec::new())
     };
 
-    // See the round-2 comment: `live` drives the tail's sparse rounds;
     // `sparse_dirty` tracks whether the current buffers' dead regions hold
-    // unwritten scratch (true from the start when round 2 skipped its
-    // dead-pair zero writes).
+    // unwritten scratch. Under compaction the dead regions are not stored at
+    // all, so leaving the sparse path means EXPANDING (scatter + zero-fill)
+    // rather than zeroing in place.
     let mut sparse_dirty = sparse_from_round2;
 
     for i in 0..(n_mlv - 1) {
         let rho_prev = mlv_rhos[i];
-        let log_n_before = a_mlv.len().trailing_zeros() as usize;
+        // From the LOGICAL domain, not the buffer: under live-span storage
+        // `a_mlv.len()` is the compacted length and need not be a power of two.
+        let log_n_before = domain.trailing_zeros() as usize;
 
         // r_next for the next round's message: length log_n_before - 1.
         // r_next[0] = ONE (Convention A factor); r_next[1..] are the eq
@@ -561,42 +572,50 @@ fn prove_packed_padded_inner<C: Challenger>(
         let mut r_next = vec![F128::ONE; log_n_before - 1];
         r_next[1..].copy_from_slice(&r[k_skip + i + 2..]);
 
-        let use_sparse = live.as_ref().is_some_and(|list| {
-            let live_elems: usize = list.iter().map(|&(s, e)| e - s).sum();
-            a_mlv.len() >= 8 && live_elems * sparse_tail_gate() <= a_mlv.len()
+        // The sparse path also requires the fused domain (>= 1024): below it
+        // the naive kernels index globally, so compaction must be undone.
+        let use_sparse = store.as_ref().is_some_and(|st| {
+            domain >= 1024 && st.len() * sparse_tail_gate() <= domain
         });
         if !use_sparse
-            && let Some(list) = live.take()
+            && let Some(st) = store.take()
             && sparse_dirty
         {
-            let len = a_mlv.len();
-            zero_dead_regions(&mut a_mlv, len, &list);
-            zero_dead_regions(&mut b_mlv, len, &list);
+            // Back to global indexing: scatter the live span into a full
+            // padded buffer and zero the rest.
+            let a_full = multilinear::expand_to_dense(&a_mlv, &st, domain);
+            let b_full = multilinear::expand_to_dense(&b_mlv, &st, domain);
+            crate::scratch::give_f128(std::mem::replace(&mut a_mlv, a_full));
+            crate::scratch::give_f128(std::mem::replace(&mut b_mlv, b_full));
             sparse_dirty = false;
         }
 
         let (m1, mi) = if use_sparse {
-            let half = a_mlv.len() / 2;
-            if a_nxt.len() < half {
+            let st = store.as_ref().expect("use_sparse implies store");
+            // Output storage is bounded by the input's: shrinking pairs can
+            // only round outward by one slot per interval end.
+            let cap = st.len() + 2 * st.intervals().len() + 2;
+            if a_nxt.len() < cap {
                 crate::scratch::give_f128(a_nxt);
                 crate::scratch::give_f128(b_nxt);
-                a_nxt = crate::scratch::take_f128(half);
-                b_nxt = crate::scratch::take_f128(half);
+                a_nxt = crate::scratch::take_f128(cap);
+                b_nxt = crate::scratch::take_f128(cap);
             }
-            let (m1, mi, live_out) = fold_and_round_pair_sparse_into(
+            let (m1, mi, store_out) = fold_and_round_pair_sparse_into(
                 &a_mlv,
                 &b_mlv,
-                &mut a_nxt[..half],
-                &mut b_nxt[..half],
+                &mut a_nxt[..cap],
+                &mut b_nxt[..cap],
                 rho_prev,
                 &r_next,
-                live.as_ref().expect("use_sparse implies live"),
+                st,
+                domain,
             );
             std::mem::swap(&mut a_mlv, &mut a_nxt);
             std::mem::swap(&mut b_mlv, &mut b_nxt);
-            a_mlv.truncate(half);
-            b_mlv.truncate(half);
-            live = Some(live_out);
+            a_mlv.truncate(store_out.len());
+            b_mlv.truncate(store_out.len());
+            store = Some(store_out);
             sparse_dirty = true;
             (m1, mi)
         } else if log_n_before >= 10 {
@@ -623,11 +642,17 @@ fn prove_packed_padded_inner<C: Challenger>(
             round_pair_naive(&a_mlv, &b_mlv, &r_next)
         };
 
+        domain /= 2;
         multilinear_msgs.push((m1, mi));
         challenger.observe_f128(m1);
         challenger.observe_f128(mi);
         mlv_rhos.push(challenger.sample_f128());
     }
+    debug_assert!(
+        store.is_none(),
+        "the tail must leave live-span storage before the final binding \
+         (domain drops below the fused threshold, forcing expansion)"
+    );
 
     // ---- 8. Final binding at ρ_{n_mlv} (the last challenge) ----
     let rho_last = *mlv_rhos.last().expect("at least one ρ sampled");
