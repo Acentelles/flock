@@ -210,5 +210,9 @@ required-features = ["unsound-challenger"]
 name = "permutation"
 harness = false
 
+[[bench]]
+name = "perm_vs_gkr"
+harness = false
+
 [lints]
 workspace = true
