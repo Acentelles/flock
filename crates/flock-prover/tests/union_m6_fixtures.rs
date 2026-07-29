@@ -23,6 +23,12 @@
 //! -- --ignored`. To regenerate digests after an INTENTIONAL transcript
 //! change (a protocol change, not an M6-style optimization), run with
 //! `M6_FIXTURES_PRINT=1 ... --nocapture` and update the constants.
+//!
+//! Re-pin history: integer-lane union commit (the shipped config); BLAKE3
+//! I/O-region word alignment (M_BASE 513 → 512, out_hi/params words
+//! aligned, const pin moved to the end — the circuit/wiring layer's
+//! prerequisite). The SHA-256 anchor digest survived the latter unchanged,
+//! pinning that the re-layout touched nothing outside BLAKE3.
 
 use ::sha2 as sha2_hash;
 use flock_core::proof::{R1csClaim, R1csProofJaggedLigerito};
@@ -115,22 +121,22 @@ fn m6_mixed_union_proof_bytes_pinned() {
         (
             "mixed-nu10-1024-1024",
             [1024, 1024],
-            "67f4d77e8f501caaa859db1f2a7ace87fa50af0e93b296f9f59d1f1e1fe28e67",
+            "59b47c7b7010f8cb11a23cded29c8d7fabadb882a0b8eeaa681fd27b87d0d574",
         ),
         (
             "mixed-nu10-50-37",
             [50, 37],
-            "1172fa9f14fa8a1eedf8edc9636240f5067a26e3eacd774300a8550dea1d7d86",
+            "fa2dbfb4e458028a3b72f1468aababc613ddaa5713821f3755408b1fb34b6e91",
         ),
         (
             "mixed-nu10-8-8",
             [8, 8],
-            "a82bf3c36d9751b2d622fdde8b5201c74a76bb6f2c13c448911acb03635a9450",
+            "d2ef6a3708f0efa26f1be9c530cf2a5bce49773d72a63f3a50261c224314443e",
         ),
         (
             "mixed-nu10-0-64",
             [0, 64],
-            "00fd1afa4028dd60972ded5e85d863e96eeecf7861a630d2dfedf33d4287a88f",
+            "41196de9b7e2b0651cdc69761357c68914213e8913254286316de4740bff41e6",
         ),
     ];
 
@@ -194,7 +200,7 @@ fn m6_mixed_union_proof_bytes_pinned() {
 fn m6_single_type_anchor_proof_bytes_pinned() {
     // BLAKE3, 256 blocks (m = 22).
     {
-        const EXPECTED: &str = "e340960f1df498b91c4d48f2fd0f051346223a18263cabfe6e07bb898784f594";
+        const EXPECTED: &str = "70ddf94f00ff6979bed209a7d8f83f9365d2ed7c1a71b24d2b444ce1afed5bc8";
         let n_blocks = 256usize;
         let setup = blake3::Blake3Setup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_B3B3);
