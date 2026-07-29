@@ -453,21 +453,75 @@ depths 1/2/3/26, at full and partial counts (including 1-of-8 declared, so
 dummy rows and the const pin are covered), with per-path varying indices so both
 swap directions occur at every level.
 
-### Caveats on the phase attribution at 27k
+### Full breakdown at 26,624 compressions, after the packed driver
 
-Two things I could not pin down, recorded so nobody trusts them by accident:
+Both columns are from **one** traced run each, and each reconciles with that
+run's own total — the only way these are meaningful (see the caveat below).
 
-* Inside `coeffs + frobenius assist` (1017 ms at 1024 paths), the two
-  `[frobenius]` sub-timers account for only 477 ms. The other ~540 ms is inside
-  the bundle with no timer of its own. BLAKE3's same residual is ~1.9 ms, so it
-  scales with something Merkle-specific, but *which* call is unmeasured.
-* `zerocheck + s_hat_v_c` is at parity at small sizes but 224 ms vs 54 ms at
-  1024 paths, despite `m_total = 29` on **both** sides. Unexplained; likely the
-  sparse/dense kernel gate seeing different shapes, not verified.
+**Prove** (4 threads; run totals: Merkle 424 ms, BLAKE3 176 ms):
 
-Also note prove numbers vary run to run at these sizes (merkle 1451 ms
-untraced vs 2298 ms with `PCS_TRACE=1`), so phase breakdowns should only be
-compared *within* one run, never against a table from another.
+| phase | merkle | blake3 | ratio | Δ |
+|---|---|---|---|---|
+| witness gen | 31 ms | 15 ms | 2.1× | +16 |
+| `compact q` | 4.79 ms | 2.43 ms | 2.0× | +2 |
+| `commit` | 34.39 ms | 38.19 ms | **0.9×** | −4 |
+| `zerocheck + s_hat_v_c` | 63.12 ms | 60.76 ms | **1.04×** | +2 |
+| `lincheck` | 15.45 ms | 10.50 ms | 1.5× | +5 |
+| open · ring_switch | 0.22 ms | 0.20 ms | 1.1× | 0 |
+| open · W build + round-0 | 6.20 ms | 6.09 ms | **1.0×** | 0 |
+| open · merged sumcheck (22 rd) | 5.31 ms | 5.78 ms | **0.9×** | −1 |
+| **open · coeffs + frobenius assist** | **226.55 ms** | **8.36 ms** | **27×** | **+218** |
+| open · inner Ligerito | 35.47 ms | 30.87 ms | 1.1× | +5 |
+| total | 424 ms | 176 ms | 2.4× | +248 |
+
+**The assist is +218 of the +248 ms prove gap — 88%.** Everything else is at
+parity or within 2×.
+
+**Verify** (1 thread, production config; run totals: Merkle 158.9 ms, BLAKE3
+15.8 ms):
+
+| phase | merkle | blake3 | ratio | Δ |
+|---|---|---|---|---|
+| `bind_statement` | 0.3 µs | 0.4 µs | — | 0 |
+| `zerocheck::verify` (m_total 29 both) | 375 µs | 295 µs | **1.3×** | 0 |
+| `lincheck::verify_union` | 15.65 ms | 9.16 ms | 1.7× | +6 |
+|  · of which `fold_alpha_batched` | 13.57 ms | 8.93 ms | 1.5× | +5 |
+| pcs · `ring_switch::verify_succinct` | 246 µs | 251 µs | **1.0×** | 0 |
+| pcs · `JaggedParams::from_heights` | 2.6 µs | 0.2 µs | — | 0 |
+| pcs · coeffs | 676 µs | 53 µs | 12.7× | +1 |
+| **pcs · `verify_frobenius_assist`** | **141.15 ms** | **5.37 ms** | **26×** | **+136** |
+| pcs · Ligerito open | 545 µs | 534 µs | **1.0×** | 0 |
+| total | 158.9 ms | 15.8 ms | 10.1× | +143 |
+
+**The assist is +136 of the +143 ms verify gap — 95%.** `k_cols` is 12 vs 7 as
+always (4096 vs 128 columns).
+
+So after the witness fix there is **exactly one term left** on either side, and
+it is the same term. Post-fix ratios at 26,624: prove/mt 2.2–3.0×, prove/1t
+**1.9×**, verify 10.1× (verify was untouched — witness gen is prover-only).
+
+### The zerocheck asymmetry: RESOLVED, it was not real
+
+An earlier revision of these notes flagged `zerocheck + s_hat_v_c` at 224 ms vs
+54 ms at 1024 paths as an unexplained asymmetry, despite `m_total = 29` on both
+sides. It measures **63.12 vs 60.76 ms — parity** — after the packed driver.
+
+Nothing in the zerocheck changed. What changed is that the old witness path
+allocated and freed 1.6 GB of `Vec<bool>` immediately beforehand, so the
+zerocheck then ran on cold, faulting pages. It was allocator/page-fault noise
+attributed to the wrong phase. Worth remembering as a measurement hazard: a
+phase can be slow because of what the *previous* phase did to the page tables.
+
+### Remaining caveat
+
+Inside `coeffs + frobenius assist` (226.55 ms), the two `[frobenius]` sub-timers
+account for 163.4 ms; the other ~63 ms has no timer of its own (BLAKE3's
+equivalent residual is ~2.4 ms). Still unattributed.
+
+Also: prove varies run to run at these sizes, and `PCS_TRACE=1` itself costs
+time, so phase breakdowns are only valid *within* a single run — never compared
+against a table from another. Both tables above are internally reconciled
+against their own run's totals for exactly this reason.
 
 ---
 
