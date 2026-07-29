@@ -35,28 +35,42 @@ fn path(rng: &mut Rng, depth: usize, index: u64) -> PathInput {
     }
 }
 
-/// Geometry: the layout is `depth` hash blocks plus the per-level gadget
-/// columns, and it lands on the `k_log` the density analysis predicted.
+/// Geometry: each level occupies an aligned `2^14` subcube (the alignment the
+/// walker's `eq` factorization needs), so `k_log = 14 + log2(next_pow2(depth))`
+/// and the useful region ends after the last level's `t` block.
 #[test]
 fn layout_geometry() {
     let spec = blake3_spec();
-    // 1 const + 256 leaf + depth index bits + depth · (512 + 15,409).
-    for (depth, want_useful, want_k_log) in [
-        (1usize, 257 + 1 + 15_921, 14usize),
-        (2, 257 + 2 + 2 * 15_921, 15),
-        (26, 257 + 26 + 26 * 15_921, 19),
-    ] {
+    const U: usize = 15_409; // blake3 useful bits
+    const STRIDE: usize = 1 << 14;
+    for (depth, want_k_log) in [(1usize, 14usize), (2, 15), (3, 16), (26, 19)] {
         let layout = MerkleTreeLayout::new(depth, spec.clone());
-        assert_eq!(layout.useful_bits, want_useful, "depth {depth} useful_bits");
+        // Level 0 additionally carries const + leaf + index bits; every later
+        // level ends after its 512 gadget columns.
+        let globals_end = U + 512 + 1 + 256 + depth;
+        let last_level_end = (depth - 1) * STRIDE + U + 512;
+        assert_eq!(
+            layout.useful_bits,
+            globals_end.max(last_level_end),
+            "depth {depth} useful_bits"
+        );
         assert_eq!(layout.k_log, want_k_log, "depth {depth} k_log");
         assert!(layout.useful_bits <= layout.k());
+        // Every level's subcube is exactly the base block, and levels are
+        // aligned — this is what makes the level index a set of address bits.
+        assert_eq!(layout.hash_bit(0, 0), 0);
+        for l in 0..depth {
+            assert_eq!(layout.hash_bit(l, 0), l * STRIDE, "level {l} not aligned");
+        }
     }
-    // The depth-26 experiment target: 79% column utilization, 3,237 packed
-    // chunk-columns per path (of the 4,096 the padded block would hold).
+
+    // The depth-26 experiment target. Padding each level to 2^14 costs 2.7%
+    // more columns than the tightly-packed layout (414,229 → 425,521) and
+    // buys the walker's 26× eq factorization; k_log is unchanged at 19.
     let l26 = MerkleTreeLayout::new(26, spec);
-    assert_eq!(l26.useful_bits, 414_229);
+    assert_eq!(l26.useful_bits, 425_521);
     assert_eq!(l26.k_log, 19);
-    assert_eq!(l26.useful_bits.div_ceil(128), 3_237);
+    assert_eq!(l26.useful_bits.div_ceil(128), 3_325);
 }
 
 /// The composite R1CS accepts an honest path, at every index pattern that
@@ -162,7 +176,7 @@ fn tampering_is_rejected() {
         ("sibling L1 bit 200", layout.sibling_bit(1, 200)),
         ("root bit 0", layout.root_bit(0)),
         ("root bit 255", layout.root_bit(255)),
-        ("const wire", MerkleTreeLayout::CONST_POS),
+        ("const wire", layout.const_pos()),
     ];
     for (what, col) in cases {
         let mut bad = z.clone();
@@ -283,7 +297,7 @@ fn batch_major_slot_layout_and_padding() {
             assert_eq!(a[addr], F128::ZERO, "dummy row {i} a word {w}");
             assert_eq!(b[addr], F128::ZERO, "dummy row {i} b word {w}");
         }
-        let pin = MerkleTreeLayout::CONST_POS;
+        let pin = layout.const_pos();
         assert_eq!(
             (stripe[(i / 8) * k + pin] >> (i % 8)) & 1,
             0,
@@ -315,7 +329,7 @@ fn walker_matches_materialized() {
         let layout = MerkleTreeLayout::new(depth, blake3_spec());
         let (a_0, b_0) = layout.build_matrices();
         let reference = CscCircuit::from_matrices(&a_0, &b_0)
-            .with_const_pin(Some(MerkleTreeLayout::CONST_POS));
+            .with_const_pin(Some(layout.const_pos()));
         let walker = layout.build_walker();
 
         assert_eq!(walker.n_cols(), reference.n_cols(), "depth {depth} n_cols");

@@ -46,27 +46,39 @@
 //! — the base encoder makes them free inputs, we make them gadget outputs.
 //! So the gadget costs only the `2^8` AND columns `t_j` per level.
 //!
-//! ## Composite layout (`depth = D`, base block `useful_bits = U`)
+//! ## Composite layout (`depth = D`, base block `2^κ` wide, `useful_bits = U`)
+//!
+//! Level `l` occupies the **aligned subcube** `[l·2^κ, (l+1)·2^κ)` — a
+//! level's slot IS the base block. The per-level gadget columns and the
+//! globals live in the base block's own padding region `[U, 2^κ)`:
 //!
 //! ```text
-//!   z[0]                                  = 1            (the table's const_pin)
-//!   z[1        .. 257)                    = leaf digest        (free input)
-//!   z[257      .. 257+D)                  = index bits b_0..b_D (free input)
-//!   per level l, base LB(l) = 257+D + l·(512+U):
-//!     z[LB(l)       .. LB(l)+256)         = sibling S_l        (free input)
-//!     z[LB(l)+256   .. LB(l)+512)         = t_l (the ANDs)
-//!     z[LB(l)+512   .. LB(l)+512+U)       = the hash block, verbatim
-//!   z[useful_bits .. 2^k_log)             = padding (forced 0 by empty rows)
+//!   per level l, at l·2^κ:
+//!     z[l·2^κ         .. l·2^κ + U)       = the hash block, verbatim
+//!     z[l·2^κ + U     .. +256)            = sibling S_l         (free input)
+//!     z[l·2^κ + U+256 .. +512)            = t_l (the ANDs)
+//!   level 0 additionally:
+//!     z[U+512]                            = 1     (the table's const_pin)
+//!     z[U+513 .. U+769)                   = leaf digest         (free input)
+//!     z[U+769 .. U+769+D)                 = index bits b_0..b_D (free input)
+//!   every level's tail, and slots ≥ D     = padding (forced 0 by empty rows)
 //! ```
 //!
-//! Each level embeds the base encoder's block by a **pure column offset**;
+//! so `k_log = κ + log2(next_pow2(D))`.
+//!
+//! **The alignment is load-bearing**, not cosmetic. It makes the level index
+//! a set of high address bits, which is what lets the lincheck's `eq` table
+//! factor across levels — see [`MerkleWalkerCircuit`]. Padding each level up
+//! to `2^κ` costs ~2.7% more columns than tight packing and does not move
+//! `k_log`.
+//!
+//! Each level embeds the base encoder's block by a **pure column shift**;
 //! the composite then overrides exactly three row groups per level: the
 //! block's own constant wire (re-derived from the global one), the 512-bit
 //! message region (the swap gadget above), and every other free input —
 //! the input chaining value, counter, block length and flags — which is
-//! pinned to the Merkle node constants. Everything else, all `2^k_log`-wide
-//! rows of the hash relation, is the base matrix with its column indices
-//! shifted.
+//! pinned to the Merkle node constants. Everything else, every row of the
+//! hash relation, is the base matrix with its indices shifted.
 //!
 //! ## What this does NOT enforce
 //!
@@ -240,49 +252,60 @@ fn blake3_fixed_bits() -> Vec<(usize, bool)> {
 
 /// Column layout of the composite Merkle-path block. All offsets are bit
 /// indices into one table row (one path).
+///
+/// Level `l` occupies the **aligned subcube** `[l·2^κ, (l+1)·2^κ)` where
+/// `κ = spec.k_log` — i.e. a level's slot IS the base block. That alignment
+/// is load-bearing for [`MerkleWalkerCircuit`]: it makes the level index a
+/// set of high address bits, so the lincheck's `eq` table factors across
+/// levels. See that type's docs.
 #[derive(Clone)]
 pub struct MerkleTreeLayout {
     pub spec: HashSpec,
     /// Number of levels = tree depth.
     pub depth: usize,
-    /// log2 of the composite block width (smallest power of two ≥
-    /// [`Self::useful_bits`]).
+    /// log2 of the composite block width: `spec.k_log + log2(levels rounded
+    /// up to a power of two)`.
     pub k_log: usize,
-    /// Useful columns of the composite block.
+    /// Useful columns of the composite block. Note the useful region has
+    /// interior holes — each level's slot has a tail of genuine padding
+    /// (`2^κ − spec.useful_bits − 512`, and less in level 0 which also holds
+    /// the globals). Those columns are forced to zero by empty rows.
     pub useful_bits: usize,
-    /// First column of a level's region; level `l` starts at
-    /// `levels_base + l * level_stride`.
-    pub levels_base: usize,
-    /// Columns per level: `2·SLOT_BITS + spec.useful_bits`.
-    pub level_stride: usize,
 }
 
 impl MerkleTreeLayout {
-    /// The global constant-one column, and the table's `const_pin`.
-    pub const CONST_POS: usize = 0;
-    /// First column of the leaf digest.
-    pub const LEAF_BASE: usize = 1;
-    /// First column of the index bits.
-    pub const INDEX_BASE: usize = Self::LEAF_BASE + SLOT_BITS;
-
     /// Lay out a `depth`-level Merkle path over `spec`.
     pub fn new(depth: usize, spec: HashSpec) -> Self {
         assert!(depth >= 1, "depth must be ≥ 1");
-        let levels_base = Self::INDEX_BASE + depth;
-        let level_stride = 2 * SLOT_BITS + spec.useful_bits;
-        let useful_bits = levels_base + depth * level_stride;
-        let k_log = useful_bits.next_power_of_two().trailing_zeros() as usize;
+        // Levels tile aligned 2^κ subcubes, so the composite needs one
+        // subcube per level rounded up to a power of two.
+        let k_log = spec.k_log + depth.next_power_of_two().trailing_zeros() as usize;
         assert!(
-            k_log >= 7,
+            spec.k_log >= 7,
             "the union's BatchMajor chunking requires k_log ≥ 7"
         );
+        // Per-level gadget columns and (in level 0) the globals live in the
+        // base block's own padding region.
+        let globals_end = spec.useful_bits + 2 * SLOT_BITS + 1 + SLOT_BITS + depth;
+        assert!(
+            globals_end <= 1usize << spec.k_log,
+            "depth {depth} does not fit: the gadget ({} bits) plus the globals \
+             ({} bits) exceed the base block's {} padding columns",
+            2 * SLOT_BITS,
+            1 + SLOT_BITS + depth,
+            (1usize << spec.k_log) - spec.useful_bits,
+        );
+        // Last nonzero column: level 0 carries the globals; every later
+        // level ends after its `t` region.
+        let last_level_end =
+            ((depth - 1) << spec.k_log) + spec.useful_bits + 2 * SLOT_BITS;
+        let useful_bits = globals_end.max(last_level_end);
+        debug_assert!(useful_bits <= 1usize << k_log);
         Self {
             spec,
             depth,
             k_log,
             useful_bits,
-            levels_base,
-            level_stride,
         }
     }
 
@@ -291,39 +314,47 @@ impl MerkleTreeLayout {
         1usize << self.k_log
     }
 
+    /// The global constant-one column, and the table's `const_pin`. Lives in
+    /// level 0's padding region, right after its gadget columns.
+    pub fn const_pos(&self) -> usize {
+        self.spec.useful_bits + 2 * SLOT_BITS
+    }
+
     /// Bit `j` of the leaf digest.
     pub fn leaf_bit(&self, j: usize) -> usize {
         debug_assert!(j < SLOT_BITS);
-        Self::LEAF_BASE + j
+        self.const_pos() + 1 + j
     }
 
     /// Indicator bit of level `l` (bit `l` of the index).
     pub fn index_bit(&self, level: usize) -> usize {
         debug_assert!(level < self.depth);
-        Self::INDEX_BASE + level
+        self.const_pos() + 1 + SLOT_BITS + level
     }
 
+    /// First column of level `l`'s aligned subcube.
     fn level_base(&self, level: usize) -> usize {
         debug_assert!(level < self.depth);
-        self.levels_base + level * self.level_stride
+        level << self.spec.k_log
     }
 
-    /// Bit `j` of level `l`'s sibling digest.
+    /// Bit `j` of level `l`'s sibling digest — in the base block's padding.
     pub fn sibling_bit(&self, level: usize, j: usize) -> usize {
         debug_assert!(j < SLOT_BITS);
-        self.level_base(level) + j
+        self.level_base(level) + self.spec.useful_bits + j
     }
 
     /// Bit `j` of level `l`'s AND column `t = b_l · (prev ⊕ sibling)`.
     fn t_bit(&self, level: usize, j: usize) -> usize {
         debug_assert!(j < SLOT_BITS);
-        self.level_base(level) + SLOT_BITS + j
+        self.level_base(level) + self.spec.useful_bits + SLOT_BITS + j
     }
 
-    /// Base-block column `c` of level `l`'s embedded hash block.
+    /// Base-block column `c` of level `l`'s embedded hash block. The
+    /// embedding is now a pure shift by `l·2^κ`.
     pub fn hash_bit(&self, level: usize, c: usize) -> usize {
-        debug_assert!(c < self.spec.useful_bits);
-        self.level_base(level) + 2 * SLOT_BITS + c
+        debug_assert!(c < 1usize << self.spec.k_log);
+        self.level_base(level) + c
     }
 
     /// Bit `j` of the digest entering level `l`: the leaf at level 0, else
@@ -379,7 +410,7 @@ impl MerkleTreeLayout {
     /// pure offset.
     fn extras(&self) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
         let k = self.k();
-        let gc = Self::CONST_POS;
+        let gc = self.const_pos();
         let mut a: Vec<Vec<usize>> = vec![Vec::new(); k];
         let mut b: Vec<Vec<usize>> = vec![Vec::new(); k];
 
@@ -537,7 +568,7 @@ impl MerkleTreeLayout {
             b_0,
             c_0: identity(self.k()),
             layout: WitnessLayout::BatchMajor,
-            const_pin: Some(Self::CONST_POS),
+            const_pin: Some(self.const_pos()),
             digest_cache: std::sync::OnceLock::new(),
             csc_cache: std::sync::OnceLock::new(),
         }
@@ -587,12 +618,10 @@ impl MerkleTreeLayout {
         MerkleWalkerCircuit {
             n_cols: k,
             depth: self.depth,
-            levels_base: self.levels_base,
-            level_stride: self.level_stride,
-            base_useful: self.spec.useful_bits,
+            base_k_log: self.spec.k_log,
             base,
             extras,
-            const_pin: Some(Self::CONST_POS),
+            const_pin: Some(self.const_pos()),
         }
     }
 
@@ -617,7 +646,7 @@ impl MerkleTreeLayout {
             self.depth
         );
         let mut z = vec![false; self.k()];
-        z[Self::CONST_POS] = true;
+        z[self.const_pos()] = true;
         write_digest(&mut z, self.leaf_bit(0), &input.leaf);
         for l in 0..self.depth {
             z[self.index_bit(l)] = (input.index >> l) & 1 == 1;
@@ -673,9 +702,10 @@ impl MerkleTreeLayout {
         };
 
         // The global constant: 1·1 = 1.
-        z[Self::CONST_POS] = true;
-        a[Self::CONST_POS] = true;
-        b[Self::CONST_POS] = true;
+        let gc = self.const_pos();
+        z[gc] = true;
+        a[gc] = true;
+        b[gc] = true;
 
         for j in 0..SLOT_BITS {
             free(&mut z, &mut a, &mut b, self.leaf_bit(j), digest_bit(&input.leaf, j));
@@ -930,9 +960,7 @@ fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, Vec<u32>) {
 pub struct MerkleWalkerCircuit {
     n_cols: usize,
     depth: usize,
-    levels_base: usize,
-    level_stride: usize,
-    base_useful: usize,
+    base_k_log: usize,
     base: Csc,
     extras: Csc,
     const_pin: Option<usize>,
@@ -970,32 +998,26 @@ impl MerkleWalkerCircuit {
         self.depth * (ba + bb) + xa + xb
     }
 
-    /// Decode a composite column into `(level, base column)` if it lands
-    /// inside a level's embedded hash block. Globals, gadget columns and
-    /// padding return `None` — those draw only on `extras`.
+    /// Decode a composite column into `(level, base column)`. Levels tile
+    /// aligned `2^κ` subcubes, so this is a shift and a mask. Columns past
+    /// the last level return `None`; gadget and global columns DO decode,
+    /// but land in the base block's padding where the base CSC is empty, so
+    /// they contribute nothing — which is exactly right.
     #[inline]
     fn decode(&self, c: usize) -> Option<(usize, usize)> {
-        if c < self.levels_base {
+        let level = c >> self.base_k_log;
+        if level >= self.depth {
             return None;
         }
-        let off = c - self.levels_base;
-        let level = off / self.level_stride;
-        if level >= self.depth {
-            return None; // padding past the last level
-        }
-        let within = off % self.level_stride;
-        // [0, 256) sibling, [256, 512) t, [512, 512+useful) the hash block.
-        let c_base = within.checked_sub(2 * SLOT_BITS)?;
-        debug_assert!(c_base < self.base_useful);
-        Some((level, c_base))
+        Some((level, c & ((1usize << self.base_k_log) - 1)))
     }
 
-    /// First composite column of level `l`'s hash block — also the row
-    /// offset the base gather uses, since the embedding shifts rows and
-    /// columns alike.
+    /// First composite column of level `l`'s subcube — also the row offset
+    /// the base gather uses, since the embedding shifts rows and columns
+    /// alike.
     #[inline]
     fn hash_base(&self, level: usize) -> usize {
-        self.levels_base + level * self.level_stride + 2 * SLOT_BITS
+        level << self.base_k_log
     }
 }
 

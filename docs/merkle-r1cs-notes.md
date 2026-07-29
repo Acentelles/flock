@@ -74,14 +74,15 @@ against `CscCircuit` over the fully materialized matrices at depths 1-3.
 
 ## Geometry
 
-depth 26, BLAKE3: `k_log = 19`, `useful_bits = 414,229` (79% utilization),
-3,237 chunk-columns/path.
+Levels occupy **aligned `2^14` subcubes** (see the factorization section —
+the alignment is load-bearing). depth 26, BLAKE3: `k_log = 19`,
+`useful_bits = 425,521`, 3,325 chunk-columns/path.
 
 | nu | paths | dense words | dense_m | M (single-type) |
 |---|---|---|---|---|
-| 3 | 8 | 25,896 | 22 | 22 |
-| 4 | 16 | 51,792 | 23 | 23 |
-| 7 | 128 | 414,336 | 26 | 26 |
+| 3 | 8 | 26,600 | 22 | 22 |
+| 4 | 16 | 53,200 | 23 | 23 |
+| 7 | 128 | 425,600 | 26 | 26 |
 
 Mixed `merkle26+blake3`: Merkle (κ=19) sorts before BLAKE3 (κ=14); areas
 `33·2^(nu+14)` round to `2^(nu+20)`, so `M = nu + 20`, ~52% utilization.
@@ -96,7 +97,7 @@ Measured, `merkle26+blake3@nu3`, dense_m 22:
 
 ---
 
-# NEXT: a ~25× faster lincheck fold (in flight, not implemented)
+# The ~25× lincheck fold: alignment DONE, factorization NEXT
 
 **Benedikt's observation, confirmed.** The verifier's cost is dominated by
 `fold_alpha_batched`, which is `O(nnz) = 547M` field ops — and both sides pay
@@ -122,35 +123,38 @@ eq_inner[l·2^κ + r_b] = eq_hi[l] · eq_base[r_b]
 One base fold (21M) + one multiply per composite column (0.5M) + extras (94K)
 ≈ **21.6M vs 547M, a 25× cut on prover AND verifier.**
 
-## What blocks it today
+## Step 1 — the aligned re-layout: **DONE**
 
-`level_stride = 15,921` is **not** a power of two, so the level index is not a
-set of address bits and `eq` does not factor across level boundaries. Alignment
-is exactly what's missing. (Verified: without it, each level's `eq` slice is an
-arbitrary slice of the tensor, not rank-1 in `r_b`.)
-
-## The re-layout
-
-Set `level_stride = 2^κ_base = 16,384` — i.e. level `l`'s subcube IS the base
-block. The gadget columns move into the base block's own padding region
-`[15409, 16384)`, which has 975 free columns:
+The old `level_stride = 15,921` was not a power of two, so the level index was
+not a set of address bits and `eq` did not factor. Now `level_stride = 2^κ`:
+level `l`'s subcube IS the base block, and the gadget columns live in the base
+block's own padding region `[15409, 16384)` (975 free columns):
 
 ```
 level l at l·2^14:
   [0, 15409)        base block, verbatim
   [15409, 15665)    sibling S_l
   [15665, 15921)    t_l
-level 0 additionally (fits: 15409 + 769 + depth ≤ 16384 for depth ≤ 206):
+level 0 additionally (asserted to fit; holds for depth ≤ 206):
   [15921, 15922)          global const  (const_pin)
   [15922, 16178)          leaf
   [16178, 16178+depth)    index bits
 ```
 
-`k_log = κ_base + ceil(log2(depth))`. Unchanged at depths 1, 2, 3, 26.
+`k_log = κ + log2(next_pow2(depth))` — unchanged at depths 1, 2, 3, 26.
+`CONST_POS` is no longer 0; it is `layout.const_pos()`.
 
-Cost: `useful_bits` 414,229 → 425,521 (+2.7%), chunk-cols 3237 → 3325 (+2.7%).
-**`dense_m` at nu=3 is unchanged (22), and `k_log` is unchanged (19)** — so at
-the tier we ship, the re-layout is free.
+Cost as predicted: `useful_bits` 414,229 → 425,521 (+2.7%), chunk-cols
+3237 → 3325. **`dense_m` at nu=3 unchanged (22), `k_log` unchanged (19)** — free
+at the tier we ship. All tests including `walker_matches_materialized` and the
+real-depth roundtrips pass unchanged.
+
+## Step 2 — the factorization: NOT YET DONE
+
+The walker still does `depth` independent per-level gathers
+(`fold_alpha_batched` → `decode` + `base.gather` per column). The alignment now
+makes the rank-1 factorization *valid*; it is not yet *exploited*. Verify is
+still ~470 ms.
 
 ## Implementation note: extracting `eq_hi`
 

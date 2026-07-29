@@ -97,7 +97,10 @@ fn depth26_union_geometry() {
     assert_eq!(s.registry.num_types(), 1);
     assert_eq!(s.registry.types()[0].k_log, 19);
     assert_eq!(s.registry.types()[0].useful_bits, s.layout.useful_bits);
-    assert_eq!(s.registry.types()[0].const_pin, Some(MerkleTreeLayout::CONST_POS));
+    assert_eq!(
+        s.registry.types()[0].const_pin,
+        Some(s.layout.const_pos())
+    );
     // One type ⇒ no address-space rounding: M = nu + k_log exactly.
     assert_eq!(s.registry.m_total(), NU + 19);
 

@@ -566,19 +566,19 @@ mod tests {
         assert_eq!(setup.registry.m_total(), 3 + 20);
         assert_eq!(setup.merkle_layout.depth, MERKLE_DEPTH);
 
-        // Merkle contributes 3,237 chunk-columns per path, BLAKE3 121.
+        // Merkle contributes 3,325 chunk-columns per path, BLAKE3 121.
         let counts = MerkleMixedCounts {
             merkle: 8,
             blake3: 8,
         };
         let union = setup.union(counts);
-        assert_eq!(union.dense_words(), 8 * 3_237 + 8 * 121);
+        assert_eq!(union.dense_words(), 8 * 3_325 + 8 * 121);
         assert_eq!(union.dense_m(), 22);
         // A Merkle-only instance still works (count 0 for the other slot).
         let merkle_only = MerkleMixedCounts {
             merkle: 8,
             blake3: 0,
         };
-        assert_eq!(setup.union(merkle_only).dense_words(), 8 * 3_237);
+        assert_eq!(setup.union(merkle_only).dense_words(), 8 * 3_325);
     }
 }
