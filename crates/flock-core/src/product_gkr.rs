@@ -1276,24 +1276,66 @@ mod tests {
     #[ignore = "timing probe, not a correctness test"]
     fn fold_scaling_probe() {
         let mut rng = Rng::new(0xF01D);
-        eprintln!("threads = {}", rayon::current_num_threads());
+        let threads = rayon::current_num_threads();
+        eprintln!("threads = {threads}");
+        // `fold_into` is the plain (last-round) fold; `fold_and_message` is the
+        // fused kernel that carries almost all of `prove_batched`'s fold time.
+        // Both are reported so the fusion's cost per output is visible.
+        eprintln!("  width        plain-fold          fused fold+msg      fused/plain");
         for &log_n in &[14usize, 16, 18, 20] {
             let n = 1usize << log_n;
+            let half = n / 2;
             let src: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
-            let mut dst = vec![F128::ZERO; n / 2];
             let rho = rng.f128();
-            fold_into(&src, rho, &mut dst); // warm
-            let iters = 20;
-            let t0 = std::time::Instant::now();
-            for _ in 0..iters {
-                fold_into(std::hint::black_box(&src), rho, &mut dst);
-            }
-            let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
-            let gib = (n / 2) as f64 * 48.0 / (ms * 1e-3) / 1e9;
+            let lambda = rng.f128();
+            // The fused kernel folds four vectors and emits the next round's
+            // message, whose eq spans the folded width's pairs.
+            let eq_pt: Vec<F128> = (0..log_n.saturating_sub(2)).map(|_| rng.f128()).collect();
+            let eq = SplitEqGhash::new(&eq_pt);
+            let mut dst: [Vec<F128>; 4] = std::array::from_fn(|_| vec![F128::ZERO; half]);
+
+            let time = |iters: usize, mut run: Box<dyn FnMut()>| -> f64 {
+                run();
+                let t0 = std::time::Instant::now();
+                for _ in 0..iters {
+                    run();
+                }
+                t0.elapsed().as_secs_f64() * 1e3 / iters as f64
+            };
+
+            let plain = {
+                let mut d = vec![F128::ZERO; half];
+                let s = &src;
+                time(
+                    20,
+                    Box::new(move || fold_into(std::hint::black_box(s), rho, &mut d)),
+                )
+            };
+            let fused = {
+                let s = &src;
+                let d = &mut dst;
+                let eqr = &eq;
+                time(
+                    20,
+                    Box::new(move || {
+                        let [d0, d1, d2, d3] = d;
+                        fold_and_message(
+                            [s, s, s, s],
+                            rho,
+                            [d0, d1, d2, d3].map(|x| x.as_mut_slice()),
+                            lambda,
+                            Some(eqr),
+                        );
+                    }),
+                )
+            };
+            // Plain folds one vector; fused folds four and emits a message.
             eprintln!(
-                "  fold 2^{log_n} -> 2^{}: {ms:8.3} ms  ({gib:6.1} GB/s, {:5.2} ns/out)",
+                "  2^{log_n}->2^{:<3}  {plain:7.3} ms {:5.2} ns/out   {fused:7.3} ms {:5.2} ns/out   {:5.2}x",
                 log_n - 1,
-                ms * 1e6 / (n / 2) as f64
+                plain * 1e6 / half as f64,
+                fused * 1e6 / (4 * half) as f64,
+                fused / (4.0 * plain),
             );
         }
     }
