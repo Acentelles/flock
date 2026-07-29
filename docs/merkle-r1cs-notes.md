@@ -364,6 +364,77 @@ cheaper, or reducing `depth`'s contribution to `k_log`.
 Verify parallelizes ~2.9× on 4 cores (95 → 32 ms) but production ships the
 1-thread pool deliberately; `FLOCK_VERIFY_THREADS` exists only for this bench.
 
+## Scaling to 27k compressions: the ratio does NOT amortize away
+
+`MVB_PATHS=8,128,256,512,1024`, 4 P-cores, verify 1 thread. Peak RSS 2.6 GB at
+1024 paths.
+
+| compressions | paths | dense_m | merkle prove/mt | blake3 | ratio | merkle verify | blake3 | ratio |
+|---|---|---|---|---|---|---|---|---|
+| 208 | 8 | 22 | 153 ms | 15 ms | 9.0× | 99 ms | 13.0 ms | 7.9× |
+| 3,328 | 128 | 26 | 284 ms | 40 ms | 7.1× | 118.7 ms | 13.6 ms | 8.7× |
+| 6,656 | 256 | 27 | 429 ms | 58 ms | 7.4× | 141.4 ms | 14.4 ms | 9.8× |
+| 13,312 | 512 | 28 | 636 ms | 87 ms | 7.3× | 135.6 ms | 14.6 ms | 9.3× |
+| 26,624 | 1024 | 29 | 1451 ms | 176 ms | 8.2× | 147.2 ms | 18.5 ms | 8.0× |
+
+**The ~8× is scale-invariant over a 128× range.** Both sides amortize at the
+same rate (merkle prove 734 → 54.5 µs/compression, blake3 73 → 6.6 µs), so the
+ratio survives. **This refutes a prediction made in this session**: since the
+Frobenius assist looked near-fixed (its column count is `k_log`-derived and
+independent of row count), the gap "should" have collapsed at scale. It didn't,
+because a second Merkle-specific cost grows with area.
+
+Verify is the good news: nearly flat in absolute terms on both sides (Merkle
+99 → 147 ms while the work grows 128×), so verify-per-compression falls
+478 → 5.5 µs (Merkle) and 62 → 0.7 µs (BLAKE3).
+
+### What grows: witness generation
+
+| compressions | merkle wit/mt | blake3 wit/mt | share of merkle prove |
+|---|---|---|---|
+| 208 | 13 ms | 0 ms | 8% |
+| 3,328 | 88 ms | 3 ms | 31% |
+| 6,656 | 179 ms | 4 ms | 42% |
+| 13,312 | 348 ms | 5 ms | 55% |
+| 26,624 | 735 ms | 19 ms | 51% |
+
+So the answer is **scale-dependent**: at 208 compressions the assist is ~94% of
+the prove gap and witness gen ~8%; by 13k–27k, witness gen is over half of
+Merkle prove and ~40× BLAKE3's per compression.
+
+**This is an implementation gap, not a protocol one.** `build_witness_zab`
+already calls the *packed* `node_witness_ab` hook into u64 buffers — and then
+throws the packing away:
+
+1. unpacks bit-by-bit into three `vec![false; 2^19]` (**1.5 MB of `Vec<bool>`
+   per path**, and `.collect()` holds all of them at once — 1.6 GB at 1024
+   paths, which is most of the 2.6 GB peak RSS);
+2. a **sequential** scatter loop repacks those bools into `F128` via
+   `pack_word` (128 bit-tests per word);
+3. the stripe pass walks the bools bit-by-bit a *third* time.
+
+BLAKE3's `drive_witness_batch_major_partial_into` keeps everything in packed
+`BmRow` u64s, writes straight into the destination, runs fully parallel, and
+elides padding writes. Wiring the Merkle driver the same way is the single
+biggest prover win available, and it needs no new math — `node_witness_ab`
+already produces exactly the packed shape.
+
+### Caveats on the phase attribution at 27k
+
+Two things I could not pin down, recorded so nobody trusts them by accident:
+
+* Inside `coeffs + frobenius assist` (1017 ms at 1024 paths), the two
+  `[frobenius]` sub-timers account for only 477 ms. The other ~540 ms is inside
+  the bundle with no timer of its own. BLAKE3's same residual is ~1.9 ms, so it
+  scales with something Merkle-specific, but *which* call is unmeasured.
+* `zerocheck + s_hat_v_c` is at parity at small sizes but 224 ms vs 54 ms at
+  1024 paths, despite `m_total = 29` on **both** sides. Unexplained; likely the
+  sparse/dense kernel gate seeing different shapes, not verified.
+
+Also note prove numbers vary run to run at these sizes (merkle 1451 ms
+untraced vs 2298 ms with `PCS_TRACE=1`), so phase breakdowns should only be
+compared *within* one run, never against a table from another.
+
 ---
 
 ## Other open items
