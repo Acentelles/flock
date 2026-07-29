@@ -1154,3 +1154,325 @@ pub(crate) mod tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// End-to-end tests: commit → bind → zerocheck → lincheck → packed-direct open.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod e2e_tests {
+    use super::tests::{Rng, mixed_gate, mixed_witness, mult_gate, mult_witness};
+    use super::*;
+    use crate::challenger::FsChallenger;
+
+    const TRANSCRIPT: &[u8] = b"flock-element-e2e";
+
+    fn run_prove(stmt: &ElementStatement<'_>, z: &[F128]) -> (ElementProof, ElementClaim) {
+        let mut ch = FsChallenger::new(TRANSCRIPT);
+        prove(stmt, z, &mut ch)
+    }
+
+    fn run_verify(
+        stmt: &ElementStatement<'_>,
+        proof: &ElementProof,
+    ) -> Result<ElementClaim, VerifyError> {
+        let mut ch = FsChallenger::new(TRANSCRIPT);
+        verify(stmt, proof, &mut ch)
+    }
+
+    /// Round-trip a mult-gate table at several `(n_log, kappa, n)` shapes —
+    /// `m_words` at the Ligerito floor and above it, non-power-of-two counts,
+    /// full utilization, and the empty table. The claims `verify` returns must
+    /// match the prover's byte for byte.
+    #[test]
+    fn prove_verify_roundtrip_mult_gate() {
+        let mut rng = Rng::new(20260729);
+        // (n_log, n): kappa = 2, so m_words = n_log + 2 ≥ MIN_M_WORDS ⇒ n_log ≥ 6.
+        for (n_log, n) in [
+            (6usize, 64usize), // m_words = 8, the floor, full utilization
+            (6, 37),           // non-power-of-two count
+            (6, 1),            // one real row
+            (6, 0),            // empty table: all-zero witness
+            (7, 100),          // non-power-of-two, wider
+            (8, 256),          // full utilization one level up
+        ] {
+            let ty = mult_gate(2);
+            let z = mult_witness(&ty, n_log, n, &mut rng);
+            assert!(ty.satisfies(&z, n_log, n), "n_log={n_log} n={n}");
+            let stmt = ElementStatement { ty: &ty, n_log, n };
+
+            let (proof, claim_p) = run_prove(&stmt, &z);
+            let claim_v = run_verify(&stmt, &proof)
+                .unwrap_or_else(|e| panic!("verify rejected n_log={n_log} n={n}: {e:?}"));
+            assert_eq!(claim_p, claim_v, "n_log={n_log} n={n}");
+            // The two output claims are the witness MLE at two distinct points.
+            assert_eq!(claim_v.r.len(), stmt.m_words());
+            assert_eq!(claim_v.r_prime.len(), stmt.m_words());
+            assert_ne!(claim_v.r, claim_v.r_prime, "claim points must differ");
+        }
+    }
+
+    /// The mixed table — free wires, a mult, a mult-acc, a linear pin and a
+    /// padding column — round-trips at `kappa = 3`.
+    #[test]
+    fn prove_verify_roundtrip_mixed_gate() {
+        let mut rng = Rng::new(4242);
+        let ty = mixed_gate(&mut rng);
+        for (n_log, n) in [(5usize, 32usize), (5, 19), (6, 40)] {
+            let z = mixed_witness(&ty, n_log, n, &mut rng);
+            assert!(ty.satisfies(&z, n_log, n));
+            let stmt = ElementStatement { ty: &ty, n_log, n };
+            let (proof, claim_p) = run_prove(&stmt, &z);
+            let claim_v = run_verify(&stmt, &proof)
+                .unwrap_or_else(|e| panic!("verify rejected n_log={n_log} n={n}: {e:?}"));
+            assert_eq!(claim_p, claim_v);
+        }
+    }
+
+    /// A witness violating ONE constraint in ONE row must be rejected, even
+    /// though the prover follows the honest algorithm on it.
+    #[test]
+    fn violated_constraint_is_rejected() {
+        let mut rng = Rng::new(31415);
+        let (n_log, n) = (6usize, 40usize);
+        let ty = mult_gate(2);
+        let rows = 1usize << n_log;
+        for bad_row in [0usize, 17, 39] {
+            let mut z = mult_witness(&ty, n_log, n, &mut rng);
+            // Break the product column of one real row.
+            z[2 * rows + bad_row] += F128::ONE;
+            assert!(!ty.satisfies(&z, n_log, n));
+            let stmt = ElementStatement { ty: &ty, n_log, n };
+            let (proof, _) = run_prove(&stmt, &z);
+            assert_eq!(
+                run_verify(&stmt, &proof),
+                Err(VerifyError::Zerocheck(
+                    zerocheck::VerifyError::SumcheckFinalFailed
+                )),
+                "row {bad_row}"
+            );
+        }
+    }
+
+    /// A dirty dummy row (non-zero past the declared count) is a violation too:
+    /// the padding rows sit inside the zerocheck's sum, they are not skipped.
+    #[test]
+    fn dirty_dummy_row_is_rejected() {
+        let mut rng = Rng::new(2718);
+        let (n_log, n) = (6usize, 40usize);
+        let ty = mult_gate(2);
+        let mut z = mult_witness(&ty, n_log, n, &mut rng);
+        z[2 * (1usize << n_log) + 50] = F128::ONE;
+        let stmt = ElementStatement { ty: &ty, n_log, n };
+        let (proof, _) = run_prove(&stmt, &z);
+        assert!(run_verify(&stmt, &proof).is_err());
+    }
+
+    /// Correct round messages but wrong final claim values. Both `ec` and
+    /// `ẑ(r')` must be pinned — `ec` by the zerocheck's own final check, and
+    /// `ẑ(r')` by the lincheck's residual check.
+    #[test]
+    fn wrong_claim_values_are_rejected() {
+        let mut rng = Rng::new(161803);
+        let (n_log, n) = (6usize, 40usize);
+        let ty = mult_gate(2);
+        let z = mult_witness(&ty, n_log, n, &mut rng);
+        let stmt = ElementStatement { ty: &ty, n_log, n };
+        let (proof, _) = run_prove(&stmt, &z);
+        assert!(run_verify(&stmt, &proof).is_ok(), "honest proof");
+
+        let mut bad_ec = proof.clone();
+        bad_ec.zerocheck.ec += F128::ONE;
+        assert_eq!(
+            run_verify(&stmt, &bad_ec),
+            Err(VerifyError::Zerocheck(
+                zerocheck::VerifyError::SumcheckFinalFailed
+            )),
+            "wrong ec"
+        );
+
+        let mut bad_z = proof.clone();
+        bad_z.lincheck.z_eval += F128::ONE;
+        assert_eq!(
+            run_verify(&stmt, &bad_z),
+            Err(VerifyError::Lincheck(
+                lincheck::VerifyError::SumcheckFinalFailed
+            )),
+            "wrong z_eval"
+        );
+
+        // `ea`/`eb` feed the lincheck target, so tampering with either breaks
+        // the reduction rather than the zerocheck.
+        type Tamper = fn(&mut ElementProof);
+        for (name, mutate) in [
+            ("ea", (|p| p.zerocheck.ea += F128::ONE) as Tamper),
+            ("eb", |p| p.zerocheck.eb += F128::ONE),
+        ] {
+            let mut bad = proof.clone();
+            mutate(&mut bad);
+            assert!(run_verify(&stmt, &bad).is_err(), "wrong {name}");
+        }
+
+        // A different root claims a different witness entirely.
+        let mut bad_root = proof.clone();
+        bad_root.root[0] ^= 1;
+        assert!(run_verify(&stmt, &bad_root).is_err(), "wrong root");
+    }
+
+    /// Statement mismatch: the whole statement is bound before any challenge, so
+    /// verifying under a different count or a different table type diverges at
+    /// the first challenge and rejects.
+    #[test]
+    fn statement_mismatch_is_rejected() {
+        let mut rng = Rng::new(577215);
+        let (n_log, n) = (6usize, 40usize);
+        let ty = mult_gate(2);
+        let z = mult_witness(&ty, n_log, n, &mut rng);
+        let stmt = ElementStatement { ty: &ty, n_log, n };
+        let (proof, _) = run_prove(&stmt, &z);
+        assert!(run_verify(&stmt, &proof).is_ok(), "honest statement");
+
+        // Wrong count — same witness, same capacity, different declared `n`.
+        for bad_n in [n - 1, n + 1, 1usize << n_log] {
+            let bad = ElementStatement {
+                ty: &ty,
+                n_log,
+                n: bad_n,
+            };
+            assert!(run_verify(&bad, &proof).is_err(), "count {bad_n}");
+        }
+
+        // Wrong type digest — an operand swap in the mult row. The witness still
+        // satisfies nothing about it; the transcript diverges regardless.
+        let mut swapped = ElementTableBuilder::new(2);
+        swapped.free_wire(0).free_wire(1).mult(2, 1, 0);
+        let other = swapped.build().unwrap();
+        assert_ne!(ty.digest(), other.digest());
+        let bad = ElementStatement {
+            ty: &other,
+            n_log,
+            n,
+        };
+        assert!(run_verify(&bad, &proof).is_err(), "wrong type digest");
+
+        // Wrong capacity: a different `n_log` changes m_words, so the rebuilt
+        // commitment params and every round count are wrong.
+        let bad = ElementStatement {
+            ty: &ty,
+            n_log: n_log + 1,
+            n,
+        };
+        assert!(run_verify(&bad, &proof).is_err(), "wrong capacity");
+
+        // A count above the capacity is rejected on shape alone.
+        let bad = ElementStatement {
+            ty: &ty,
+            n_log,
+            n: (1usize << n_log) + 1,
+        };
+        assert!(matches!(
+            run_verify(&bad, &proof),
+            Err(VerifyError::CountExceedsCapacity { .. })
+        ));
+    }
+
+    /// Truncated and bit-flipped proof bytes. Serialization is the repo's
+    /// `bincode`; a mutation must either fail to deserialize or fail to verify —
+    /// never verify.
+    #[test]
+    fn mutated_proof_bytes_are_rejected() {
+        let mut rng = Rng::new(1414213);
+        let (n_log, n) = (6usize, 40usize);
+        let ty = mult_gate(2);
+        let z = mult_witness(&ty, n_log, n, &mut rng);
+        let stmt = ElementStatement { ty: &ty, n_log, n };
+        let (proof, _) = run_prove(&stmt, &z);
+        let bytes = bincode::serialize(&proof).expect("serialize");
+        // The honest bytes round-trip and verify.
+        let decoded: ElementProof = bincode::deserialize(&bytes).expect("deserialize");
+        assert_eq!(decoded, proof);
+        assert!(run_verify(&stmt, &decoded).is_ok());
+
+        // Truncation at several depths.
+        for frac in [1usize, 2, 4, 8] {
+            let cut = bytes.len() - bytes.len() / frac;
+            match bincode::deserialize::<ElementProof>(&bytes[..cut]) {
+                Err(_) => {}
+                Ok(p) => assert!(
+                    run_verify(&stmt, &p).is_err(),
+                    "truncated to {cut} bytes verified"
+                ),
+            }
+        }
+
+        // Bit flips spread across the payload — the roots, the round messages,
+        // the claim values and the Ligerito opening all live in here.
+        let n_flips = 24usize;
+        for i in 0..n_flips {
+            let pos = i * (bytes.len() / n_flips);
+            let mut bad = bytes.clone();
+            bad[pos] ^= 1 << (i % 8);
+            match bincode::deserialize::<ElementProof>(&bad) {
+                Err(_) => {}
+                Ok(p) => assert!(
+                    run_verify(&stmt, &p).is_err(),
+                    "bit flip at byte {pos} verified"
+                ),
+            }
+        }
+    }
+
+    /// A proof is not transferable to a different transcript.
+    #[test]
+    fn proof_is_bound_to_its_transcript() {
+        let mut rng = Rng::new(66);
+        let (n_log, n) = (6usize, 40usize);
+        let ty = mult_gate(2);
+        let z = mult_witness(&ty, n_log, n, &mut rng);
+        let stmt = ElementStatement { ty: &ty, n_log, n };
+        let (proof, _) = run_prove(&stmt, &z);
+        let mut other = FsChallenger::new(b"a-different-domain");
+        assert!(verify(&stmt, &proof, &mut other).is_err());
+    }
+
+    /// Smoke measurement (NOT a benchmark): PIOP-only prove time at
+    /// `n_log = 16, kappa = 2` — the two sumcheck phases, without the commit or
+    /// the opening, which is what the milestone's cost target is about. Prints
+    /// under `--nocapture`; the assertion is on correctness, not on the clock.
+    #[test]
+    fn piop_smoke_at_n_log_16() {
+        let (n_log, kappa) = (16usize, 2usize);
+        let ty = mult_gate(kappa);
+        let n = (1usize << n_log) - 3; // non-trivial, near-full utilization
+        let z = mult_witness(&ty, n_log, n, &mut Rng::new(7));
+
+        let t_wit = std::time::Instant::now();
+        let (mut pa, mut pb) = ty.apply(&z, n_log);
+        broadcast_add(&mut pa, ty.a_const(), n_log);
+        broadcast_add(&mut pb, ty.b_const(), n_log);
+        let wit_ms = t_wit.elapsed().as_secs_f64() * 1e3;
+
+        let mut ch = FsChallenger::new(b"element-smoke");
+        let t_zc = std::time::Instant::now();
+        let (_zc_proof, zc_claim) = zerocheck::prove(pa, pb, &z, n_log, kappa, &mut ch);
+        let zc_ms = t_zc.elapsed().as_secs_f64() * 1e3;
+
+        let (va, vb) = strip_constants(&ty, &zc_claim);
+        let t_lc = std::time::Instant::now();
+        let (_lc_proof, lc_claim) = lincheck::prove(&ty, &z, n_log, &zc_claim.r, va, vb, &mut ch);
+        let lc_ms = t_lc.elapsed().as_secs_f64() * 1e3;
+
+        eprintln!(
+            "[element-smoke] n_log={n_log} kappa={kappa} m_words={} \
+             (Az,Bz gather {wit_ms:.2} ms) zerocheck {zc_ms:.2} ms + lincheck {lc_ms:.2} ms \
+             = PIOP {:.2} ms",
+            n_log + kappa,
+            zc_ms + lc_ms
+        );
+
+        // Correctness of what we just timed.
+        assert_eq!(zc_claim.r.len(), n_log + kappa);
+        assert_eq!(lc_claim.r_prime.len(), n_log + kappa);
+        assert!(!lc_claim.z_eval.is_zero());
+    }
+}
