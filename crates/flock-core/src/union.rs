@@ -120,15 +120,26 @@ impl<'r> UnionInstance<'r> {
         self.registry().m_bool()
     }
 
-    /// Packed length of the boolean region in 128-bit words, `2^(M_bool−7)`.
+    /// Packed length of the boolean region in 128-bit words, `2^(M_bool−7)`;
+    /// `0` when there are no boolean types (the region is empty — `M_bool = 0`,
+    /// so the naive shift would underflow).
     pub fn boolean_packed_len(&self) -> usize {
-        1usize << (self.m_bool() - 7)
+        if self.num_boolean() == 0 {
+            0
+        } else {
+            1usize << (self.m_bool() - 7)
+        }
     }
 
     /// Boolean-region chunk-column variable count `M_bool − 7 − nu` — the
-    /// boolean lincheck's column domain past the shared row block.
+    /// boolean lincheck's column domain past the shared row block. `0` when
+    /// there are no boolean types (no boolean PIOP runs).
     pub fn boolean_col_log(&self) -> usize {
-        self.m_bool() - 7 - self.n_log()
+        if self.num_boolean() == 0 {
+            0
+        } else {
+            self.m_bool() - 7 - self.n_log()
+        }
     }
 
     /// Number of boolean types (a prefix of the slots) and of element types
@@ -1662,6 +1673,22 @@ mod tests {
         assert_eq!(union.element_word_range(), 0..0);
         assert!(union.element_prefix_coords().is_empty());
         assert!(union.element_slot_layout().is_empty());
+    }
+
+    /// Mirror of the above for an ELEMENT-ONLY registry: `M_bool = 0`, so the
+    /// boolean-region accessors must return 0 rather than underflow on
+    /// `M_bool − 7` (a release build masks the shift and hides it; debug
+    /// panics). No boolean PIOP runs, so 0 is also the honest answer.
+    #[test]
+    fn element_only_boolean_accessors_do_not_underflow() {
+        let reg = Registry::new(vec![elem_ty(3, 5), elem_ty(2, 3)], 4);
+        let union = UnionInstance::new(&reg, vec![7, 5]);
+        assert_eq!(union.num_boolean(), 0);
+        assert_eq!(union.m_bool(), 0);
+        assert_eq!(union.boolean_packed_len(), 0);
+        assert_eq!(union.boolean_col_log(), 0);
+        assert!(union.boolean_padding_spec().runs().is_empty());
+        assert!(union.has_element());
     }
 
     /// Mixed registry: heights, dense words, region ranges and the padding

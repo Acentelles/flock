@@ -15,7 +15,17 @@
 //!   claims five frozen prefix coordinates (`element_base >> M_elem = 0b10000`).
 //!
 //! Run with `cargo test --release -p flock-prover --test union_element --
-//! --ignored`.
+//! --ignored`. A DEBUG run needs `--test-threads=1`: the parallel debug harness
+//! overflows a worker stack in the Ligerito recursion, the repo's known
+//! pre-existing hazard (`union_mixed` behaves the same way).
+//!
+//! Two cases below feed the prover a witness whose DROPPED words are non-zero,
+//! which violates the union's honest-witness contract. In debug that trips
+//! `compact_witness`'s assertion (asserted directly, in
+//! `satisfying_dummy_row_is_rejected_under_the_union`); in release the
+//! assertion is compiled out and the resulting proof is REJECTED. Both halves
+//! are the closure of the standalone milestone's dummy-row gap, so each is
+//! checked in the profile where it is observable.
 
 use flock_core::element_r1cs::{ElementTableBuilder, ElementTableType};
 use flock_core::field::F128;
@@ -326,36 +336,49 @@ fn element_only_agrees_with_the_standalone_proof() {
     assert_eq!(registry.m_total(), nu + kappa + 7);
 
     let mut rng = Rng::new(0x0E1E_D1FF);
-    // Cases: honest at several counts, then three ways of breaking the witness.
-    // `tamper` returns the count and mutates the witness in place.
+    // Cases: honest at several counts, then five ways of breaking the witness.
+    // `tamper` mutates the witness in place; `dirty_support` marks the tampers
+    // that write a word the union's height-`n_t` transport DROPS (a dummy row,
+    // a padding column). Those violate the union prover's honest-witness
+    // contract, which `UnionInstance::compact_witness` debug-asserts — so in a
+    // debug build the union prover panics rather than producing a rejected
+    // proof, and only the release arm is a verdict to compare. (The panic
+    // itself is asserted in `satisfying_dummy_row_is_rejected_under_the_union`.)
     type Tamper = fn(&mut Vec<F128>, usize, usize);
-    let cases: Vec<(&str, usize, Option<Tamper>)> = vec![
-        ("honest full", 1 << nu, None),
-        ("honest partial", 2731, None),
-        ("honest empty", 0, None),
+    let cases: Vec<(&str, usize, Option<Tamper>, bool)> = vec![
+        ("honest full", 1 << nu, None, false),
+        ("honest partial", 2731, None, false),
+        ("honest empty", 0, None, false),
         (
             "broken product",
             2731,
             Some(|z: &mut Vec<F128>, nu: usize, _n: usize| z[(2 << nu) + 7] += F128::ONE),
+            false,
         ),
         (
             "broken linear pin",
             2731,
             Some(|z: &mut Vec<F128>, nu: usize, _n: usize| z[(3 << nu) + 100] += F128::ONE),
+            false,
         ),
         (
             "dirty dummy row",
             2731,
             Some(|z: &mut Vec<F128>, nu: usize, n: usize| z[(2 << nu) + n + 5] = F128::ONE),
+            true,
         ),
         (
             "non-zero padding column",
             2731,
             Some(|z: &mut Vec<F128>, nu: usize, _n: usize| z[4 << nu] = F128::ONE),
+            true,
         ),
     ];
 
-    for (name, n, tamper) in cases {
+    for (name, n, tamper, dirty_support) in cases {
+        if dirty_support && cfg!(debug_assertions) {
+            continue;
+        }
         let mut z = gate_witness(&ty, nu, n, w0, w1, &mut rng);
         if let Some(t) = tamper {
             t(&mut z, nu, n);
@@ -464,34 +487,52 @@ fn satisfying_dummy_row_is_rejected_under_the_union() {
     );
     assert_eq!(union.dense_words(), ty.k() * n);
 
-    // (2) The proof is rejected. (Release build: the debug assertion above is
-    // compiled out, so the prover runs and produces a proof that opens the
-    // stack WITHOUT the dummy row while its zerocheck summed the row in.)
-    let zc = z.clone();
-    let mut ch_p = FsChallenger::new(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_mixed_class(
-        &union,
-        &pcs_params,
-        Vec::new(),
-        vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
-            dst.copy_from_slice(&zc)
-        })],
-        &mut ch_p,
-    );
-    let mut ch_v = FsChallenger::new(DOMAIN);
-    let verdict = verifier::verify_ligerito_jagged_union_mixed_class(
-        &union,
-        &[],
-        &commitment,
-        &proof,
-        &pcs_params,
-        &mut ch_v,
-    );
-    assert!(
-        verdict.is_err(),
-        "a satisfying non-zero dummy row must be rejected under the union \
-         (the standalone milestone's known gap, closed structurally)"
-    );
+    // (1b) DEBUG builds: the compaction's honest-witness assertion fires — the
+    // prover refuses to build a stack whose dropped words are not zero.
+    if cfg!(debug_assertions) {
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            union.compact_witness(&z);
+        }));
+        std::panic::set_hook(hook);
+        assert!(
+            caught.is_err(),
+            "compact_witness must reject a non-zero dropped word"
+        );
+    }
+
+    // (2) RELEASE builds: the debug assertion is compiled out, so the prover
+    // runs and produces a proof that opens the stack WITHOUT the dummy row
+    // while its element zerocheck summed the row in — and that proof is
+    // REJECTED. This is the closure of the standalone milestone's known gap.
+    if !cfg!(debug_assertions) {
+        let zc = z.clone();
+        let mut ch_p = FsChallenger::new(DOMAIN);
+        let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_mixed_class(
+            &union,
+            &pcs_params,
+            Vec::new(),
+            vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
+                dst.copy_from_slice(&zc)
+            })],
+            &mut ch_p,
+        );
+        let mut ch_v = FsChallenger::new(DOMAIN);
+        let verdict = verifier::verify_ligerito_jagged_union_mixed_class(
+            &union,
+            &[],
+            &commitment,
+            &proof,
+            &pcs_params,
+            &mut ch_v,
+        );
+        assert!(
+            verdict.is_err(),
+            "a satisfying non-zero dummy row must be rejected under the union \
+             (the standalone milestone's known gap, closed structurally)"
+        );
+    }
 
     // The same witness with the dummy row zeroed IS accepted, so the rejection
     // above is about the dummy row and nothing else.
