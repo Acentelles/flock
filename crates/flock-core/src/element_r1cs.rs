@@ -1218,6 +1218,10 @@ mod e2e_tests {
             assert_eq!(claim_v.r.len(), stmt.m_words());
             assert_eq!(claim_v.r_prime.len(), stmt.m_words());
             assert_ne!(claim_v.r, claim_v.r_prime, "claim points must differ");
+            // The lincheck collapses the row half, so it costs `kappa` rounds —
+            // not `m_words` — and the two points share their row coordinates.
+            assert_eq!(proof.lincheck.rounds.len(), ty.kappa(), "n_log={n_log}");
+            assert_eq!(&claim_v.r[..n_log], &claim_v.r_prime[..n_log]);
         }
     }
 

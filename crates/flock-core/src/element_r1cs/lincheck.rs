@@ -2,33 +2,58 @@
 //!
 //! The zerocheck leaves two claims at `r = (r_row, r_con)` — `Âz(r)` and
 //! `B̂z(r)`, once the verifier has stripped the affine constants. The verifier
-//! samples `α` and one degree-2 sumcheck over `y = (y_row, y_col)` reduces both
-//! to a single witness claim:
+//! samples `α` and one degree-2 sumcheck reduces both to a single witness claim.
+//!
+//! ## Collapsing the row half
+//!
+//! The statement to reduce is
 //!
 //! ```text
-//! Σ_y (Â + α·B̂)(r, y) · ẑ(y)  =  va + α·vb
+//! Σ_y (Â + α·B̂)(r, y) · ẑ(y)  =  va + α·vb,      y = (y_row, y_col)
 //! ```
 //!
-//! The weight vector factors, which is what makes it cheap. Because the full
-//! system is `I_{2^n_log} ⊗ A_0`, the MLE splits as
-//! `Â((x_row,x_con),(y_row,y_col)) = eq(x_row,y_row)·Â_0(x_con,y_col)`, so
+//! but it does **not** need a sumcheck over `y_row`. Because the full system is
+//! `I_{2^n_log} ⊗ A_0`, the MLE splits as
+//! `Â((x_row,x_con),(y_row,y_col)) = eq(x_row,y_row)·Â_0(x_con,y_col)`, and the
+//! `eq(r_row, y_row)` factor sums the row variables away in closed form:
 //!
 //! ```text
-//! u[(c << n_log) + j] = eq_row[j] · comb[c],
+//! Σ_y Â(r,y)·ẑ(y) = Σ_c Â_0(r_con, c) · zc[c],
+//! zc[c] = Σ_j eq(r_row, j) · z[(c << n_log) + j]  =  ẑ(r_row, c)
+//! ```
+//!
+//! That is an **exact algebraic identity**, not a probabilistic reduction, so
+//! collapsing it costs nothing in soundness. What is left is a sumcheck over the
+//! `kappa` column variables only:
+//!
+//! ```text
+//! Σ_c comb[c] · zc[c] = va + α·vb,
 //! comb[c] = Σ_con eq_con[con] · (A_0 + α·B_0)[con, c]
 //! ```
 //!
 //! `comb` is an `O(nnz)` base-block marginal — the same comb shape as the
-//! boolean lincheck's, but tiny (a few entries per gate type). The verifier
-//! rebuilds it and evaluates `eq(r_row, r'_row) · (Â_0 + α·B̂_0)(r_con, r'_col)`
-//! in `O(2^kappa + nnz)` for its final check.
+//! boolean lincheck's, but tiny (a few entries per gate type). `zc` is one
+//! partial fold of the witness at `r_row`, exactly what the boolean lincheck's
+//! `partial_fold_packed_z` produces for its own outer half.
 //!
-//! The sumcheck loop itself is the boolean lincheck's calibrated product-sumcheck
-//! core, called directly: [`crate::lincheck::sumcheck_round_eval_par`],
+//! This is the structure the boolean lincheck already has: the output claim
+//! **reuses** the incoming point's row coordinates rather than sampling fresh
+//! ones, so the claim point is `(r_row, r'_col)` and the verifier's final check
+//! is just `(Â_0 + α·B̂_0)(r_con, r'_col) · ẑ(r_row, r'_col)` — no
+//! `eq(r_row, r'_row)` factor, because there is no `r'_row`.
+//!
+//! Cost, versus a sumcheck over all of `y`: `kappa` rounds instead of
+//! `kappa + n_log` (so `2·n_log` fewer field elements on the wire), one
+//! `O(2^m_words)` fold pass instead of `m_words` of them, and no
+//! full-domain weight table to materialize at all.
+//!
+//! The sumcheck loop itself is the boolean lincheck's calibrated
+//! product-sumcheck core, called directly:
+//! [`crate::lincheck::sumcheck_round_eval_par`],
 //! [`crate::lincheck::sumcheck_bind_both_and_eval_next`] (fold + next-round
 //! message in one pass) and [`crate::lincheck::sumcheck_bind_top_in_place_par`].
 //! Rounds bind the **top** remaining variable, so the challenge list reversed is
-//! the claim point LSB-first — matching the rows-low witness layout.
+//! the column point LSB-first — matching the rows-low witness layout.
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -39,7 +64,6 @@ use crate::field::F128;
 use crate::lincheck::{
     sumcheck_bind_both_and_eval_next, sumcheck_bind_top_in_place_par, sumcheck_round_eval_par,
 };
-use crate::zerocheck::multilinear::eq_eval;
 use crate::zerocheck::univariate_skip::build_eq;
 
 const LABEL: &[u8] = b"flock-element-lc-v0";
@@ -47,29 +71,32 @@ const LABEL: &[u8] = b"flock-element-lc-v0";
 /// Round messages plus the output witness claim value.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Proof {
-    /// Per-round `(q(1), q(∞))`, length `n_log + kappa`. Top variable bound
-    /// first.
+    /// Per-round `(q(1), q(∞))`, length **`kappa`** — the column variables only;
+    /// the row variables are summed away in closed form (see the module docs).
+    /// Top variable bound first.
     pub rounds: Vec<(F128, F128)>,
-    /// `ẑ(r')` — the second packed-direct claim.
+    /// `ẑ(r_row, r'_col)` — the second packed-direct claim.
     pub z_eval: F128,
 }
 
 /// What a verified lincheck leaves for the opening.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Claim {
-    /// `r' = (r'_row, r'_col)`, LSB-first (rows low). Length `n_log + kappa`.
+    /// The claim point `(r_row, r'_col)`, LSB-first (rows low), length
+    /// `n_log + kappa`. The low `n_log` coordinates are **inherited** from the
+    /// zerocheck's point — only the `kappa` column coordinates are fresh.
     pub r_prime: Vec<F128>,
     pub z_eval: F128,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VerifyError {
-    /// Wrong number of round messages.
+    /// Wrong number of round messages (expected `kappa`).
     BadRoundCount { expected: usize, got: usize },
     /// `r` (the zerocheck point) has the wrong length for this statement.
     BadPointLength { expected: usize, got: usize },
     /// The final consistency check
-    /// `running == eq(r_row,r'_row)·(Â_0+αB̂_0)(r_con,r'_col) · z_eval` failed.
+    /// `running == (Â_0 + α·B̂_0)(r_con, r'_col) · z_eval` failed.
     SumcheckFinalFailed,
 }
 
@@ -87,7 +114,8 @@ pub fn prove<C: Challenger>(
     vb: F128,
     ch: &mut C,
 ) -> (Proof, Claim) {
-    let m_words = ty.kappa() + n_log;
+    let kappa = ty.kappa();
+    let m_words = kappa + n_log;
     assert_eq!(r.len(), m_words, "zerocheck point length");
     assert_eq!(z.len(), 1usize << m_words, "witness length");
 
@@ -96,46 +124,48 @@ pub fn prove<C: Challenger>(
 
     // Rows live in the LOW coordinates of the point, columns in the high ones.
     let (r_row, r_con) = r.split_at(n_log);
-    let comb = comb_vector(ty, alpha, &build_eq(r_con));
-    let mut u = weight_table(&crate::pcs::ring_switch::build_eq_parallel(r_row), &comb);
-    let mut wz = z.to_vec();
+    let mut comb = comb_vector(ty, alpha, &build_eq(r_con));
+    // The row collapse: one pass over the witness, `2^kappa` outputs.
+    let mut zc = partial_fold_rows(z, r_row);
     debug_assert_eq!(
-        u.iter().zip(&wz).fold(F128::ZERO, |a, (x, y)| a + *x * *y),
+        comb.iter()
+            .zip(&zc)
+            .fold(F128::ZERO, |a, (x, y)| a + *x * *y),
         va + alpha * vb,
         "lincheck target must be the honest weighted inner product"
     );
 
-    // Product sumcheck, top variable first. Round 0's message is the only
-    // standalone pass; every later message falls out of binding the previous
-    // round (see `sumcheck_bind_both_and_eval_next`).
-    let mut rounds = Vec::with_capacity(m_words);
-    let mut r_rounds = Vec::with_capacity(m_words);
-    let (mut e1, mut einf) = sumcheck_round_eval_par(&u, &wz);
-    for t in 0..m_words {
-        ch.observe_f128(e1);
-        ch.observe_f128(einf);
-        let rho = ch.sample_f128();
-        rounds.push((e1, einf));
-        r_rounds.push(rho);
-        if t + 1 < m_words {
-            let (n1, ninf) = sumcheck_bind_both_and_eval_next(&mut u, &mut wz, rho);
-            e1 = n1;
-            einf = ninf;
-        } else {
-            sumcheck_bind_top_in_place_par(&mut u, rho);
-            sumcheck_bind_top_in_place_par(&mut wz, rho);
+    // Product sumcheck over the column variables, top variable first. Round 0's
+    // message is the only standalone pass; every later message falls out of
+    // binding the previous round (see `sumcheck_bind_both_and_eval_next`).
+    let mut rounds = Vec::with_capacity(kappa);
+    let mut r_rounds = Vec::with_capacity(kappa);
+    if kappa > 0 {
+        let (mut e1, mut einf) = sumcheck_round_eval_par(&comb, &zc);
+        for t in 0..kappa {
+            ch.observe_f128(e1);
+            ch.observe_f128(einf);
+            let rho = ch.sample_f128();
+            rounds.push((e1, einf));
+            r_rounds.push(rho);
+            if t + 1 < kappa {
+                let (n1, ninf) = sumcheck_bind_both_and_eval_next(&mut comb, &mut zc, rho);
+                e1 = n1;
+                einf = ninf;
+            } else {
+                sumcheck_bind_top_in_place_par(&mut comb, rho);
+                sumcheck_bind_top_in_place_par(&mut zc, rho);
+            }
         }
     }
-    debug_assert_eq!(wz.len(), 1);
-    let z_eval = wz[0];
-
-    // Top-bit-first binding: round `t` bound bit `m_words − 1 − t`, so reversing
-    // gives the point in the LSB-first convention the packed-direct claims use.
-    let mut r_prime = r_rounds;
-    r_prime.reverse();
+    debug_assert_eq!(zc.len(), 1);
+    let z_eval = zc[0];
 
     let proof = Proof { rounds, z_eval };
-    let claim = Claim { r_prime, z_eval };
+    let claim = Claim {
+        r_prime: claim_point(r_row, r_rounds),
+        z_eval,
+    };
     (proof, claim)
 }
 
@@ -149,16 +179,17 @@ pub fn verify<C: Challenger>(
     proof: &Proof,
     ch: &mut C,
 ) -> Result<Claim, VerifyError> {
-    let m_words = ty.kappa() + n_log;
+    let kappa = ty.kappa();
+    let m_words = kappa + n_log;
     if r.len() != m_words {
         return Err(VerifyError::BadPointLength {
             expected: m_words,
             got: r.len(),
         });
     }
-    if proof.rounds.len() != m_words {
+    if proof.rounds.len() != kappa {
         return Err(VerifyError::BadRoundCount {
-            expected: m_words,
+            expected: kappa,
             got: proof.rounds.len(),
         });
     }
@@ -169,7 +200,7 @@ pub fn verify<C: Challenger>(
     // Replay the product sumcheck. `q(0) = running + q(1)` in char 2, then
     // `q(X) = einf·X² + c1·X + q(0)`. Same chain as `crate::lincheck::verify`.
     let mut running = va + alpha * vb;
-    let mut r_rounds = Vec::with_capacity(m_words);
+    let mut r_rounds = Vec::with_capacity(kappa);
     for &(e1, einf) in &proof.rounds {
         ch.observe_f128(e1);
         ch.observe_f128(einf);
@@ -179,23 +210,20 @@ pub fn verify<C: Challenger>(
         running = einf * rho * rho + c1 * rho + e0;
         r_rounds.push(rho);
     }
-    let mut r_prime = r_rounds;
-    r_prime.reverse();
-
-    // Final check: the weight vector's own MLE at `r'`, in O(2^kappa + nnz).
-    // `û(r') = eq(r_row, r'_row) · (Â_0 + α·B̂_0)(r_con, r'_col)`, and the second
-    // factor is the same `comb` marginal the prover built, evaluated against
-    // `eq(r'_col)`.
     let (r_row, r_con) = r.split_at(n_log);
-    let (r_prime_row, r_prime_col) = r_prime.split_at(n_log);
+    let r_prime = claim_point(r_row, r_rounds);
+
+    // Final check: `(Â_0 + α·B̂_0)(r_con, r'_col)` in O(2^kappa + nnz) — the
+    // same `comb` marginal the prover built, evaluated against `eq(r'_col)`.
+    // There is no `eq(r_row, r'_row)` factor: the row coordinates were never
+    // resampled, they are `r_row` itself.
     let comb = comb_vector(ty, alpha, &build_eq(r_con));
-    let eq_col = build_eq(r_prime_col);
+    let eq_col = build_eq(&r_prime[n_log..]);
     let base = comb
         .iter()
         .zip(&eq_col)
         .fold(F128::ZERO, |acc, (c, e)| acc + *c * *e);
-    let u_at_r_prime = eq_eval(r_row, r_prime_row) * base;
-    if running != u_at_r_prime * proof.z_eval {
+    if running != base * proof.z_eval {
         return Err(VerifyError::SumcheckFinalFailed);
     }
 
@@ -203,6 +231,18 @@ pub fn verify<C: Challenger>(
         r_prime,
         z_eval: proof.z_eval,
     })
+}
+
+/// The output claim point `(r_row, r'_col)`, LSB-first.
+///
+/// `r_row` is inherited from the zerocheck; `col_rounds` are the sumcheck
+/// challenges in **binding** order, which is top-variable-first, so round `t`
+/// bound column bit `kappa − 1 − t` and reversing puts them LSB-first.
+fn claim_point(r_row: &[F128], col_rounds: Vec<F128>) -> Vec<F128> {
+    let mut point = Vec::with_capacity(r_row.len() + col_rounds.len());
+    point.extend_from_slice(r_row);
+    point.extend(col_rounds.into_iter().rev());
+    point
 }
 
 /// `comb[c] = Σ_con eq_con[con] · (A_0 + α·B_0)[con, c]` — the eq-weighted
@@ -225,21 +265,34 @@ fn comb_vector(ty: &ElementTableType, alpha: F128, eq_con: &[F128]) -> Vec<F128>
     comb
 }
 
-/// Materialize `u[(c << n_log) + j] = eq_row[j] · comb[c]` — the factored weight
-/// vector over the full word domain, laid out rows-low to match the witness.
-fn weight_table(eq_row: &[F128], comb: &[F128]) -> Vec<F128> {
+/// The row collapse: `zc[c] = Σ_j eq(r_row, j) · z[(c << n_log) + j] = ẑ(r_row, c)`,
+/// a length-`2^kappa` vector.
+///
+/// Rows-low layout means each column's rows are contiguous, so this is one
+/// chunked dot product — `2^m_words` multiplications in a single pass, split
+/// across columns. This replaces both the full-domain weight table and the
+/// `n_log` row rounds of the uncollapsed protocol.
+///
+/// Takes the row **point**, not a prebuilt eq table, so no caller can pass the
+/// wrong one of the two.
+///
+/// Parallelism is over columns, so it engages `2^kappa` threads — ample for a
+/// wide block, but at the `kappa = 2` smoke shape only four. This pass is now
+/// essentially the whole cost of the phase (~0.85 ms of a ~3 ms PIOP at
+/// `n_log = 16`), so if the phase ever needs tuning, splitting by row block and
+/// reducing per-column accumulators is the thing to try. Left simple: the
+/// milestone is 3× inside its target.
+fn partial_fold_rows(z: &[F128], r_row: &[F128]) -> Vec<F128> {
+    let eq_row = crate::pcs::ring_switch::build_eq_parallel(r_row);
     let rows = eq_row.len();
-    // Uninit alloc: the chunked map below writes every slot exactly once before
-    // any read.
-    let mut u = crate::alloc_uninit_f128_vec(comb.len() * rows);
-    u.par_chunks_mut(rows)
-        .zip(comb.par_iter())
-        .for_each(|(dst, &c)| {
-            for (d, &e) in dst.iter_mut().zip(eq_row) {
-                *d = c * e;
-            }
-        });
-    u
+    debug_assert_eq!(z.len() % rows, 0);
+    z.par_chunks(rows)
+        .map(|col| {
+            col.iter()
+                .zip(&eq_row)
+                .fold(F128::ZERO, |acc, (v, e)| acc + *v * *e)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -248,6 +301,7 @@ mod tests {
     use crate::challenger::FsChallenger;
     use crate::element_r1cs::broadcast_add;
     use crate::element_r1cs::tests::{Rng, mixed_gate, mixed_witness, mult_gate, mult_witness};
+    use crate::zerocheck::multilinear::eq_eval;
 
     /// Direct MLE evaluation at `point`, binding the low variable first.
     fn mle_eval(table: &[F128], point: &[F128]) -> F128 {
@@ -265,10 +319,22 @@ mod tests {
         (mle_eval(&az, r), mle_eval(&bz, r))
     }
 
+    fn bits(v: usize, n: usize) -> Vec<F128> {
+        (0..n)
+            .map(|i| {
+                if (v >> i) & 1 == 1 {
+                    F128::ONE
+                } else {
+                    F128::ZERO
+                }
+            })
+            .collect()
+    }
+
     /// Brute-force `Σ_y (Â + α·B̂)(r, y)·ẑ(y)` from the *unfactored* definition:
     /// walk every `(x, y)` pair of the block-diagonal system explicitly. This is
-    /// the independent check on the factorization `u = eq_row ⊗ comb` — if the
-    /// row/column split or the index convention were wrong, this disagrees.
+    /// the independent check on the row collapse — if the closed-form row sum or
+    /// the index convention were wrong, this disagrees.
     fn brute_force_weighted_sum(
         ty: &ElementTableType,
         z: &[F128],
@@ -278,17 +344,6 @@ mod tests {
     ) -> F128 {
         let width = ty.width();
         let rows = 1usize << n_log;
-        let bits = |v: usize, n: usize| -> Vec<F128> {
-            (0..n)
-                .map(|i| {
-                    if (v >> i) & 1 == 1 {
-                        F128::ONE
-                    } else {
-                        F128::ZERO
-                    }
-                })
-                .collect()
-        };
         let (r_row, r_con) = r.split_at(n_log);
         let mut acc = F128::ZERO;
         // Σ_x eq(r, x) Σ_y M[x, y] z[y], with M = I ⊗ (A_0 + αB_0):
@@ -310,11 +365,13 @@ mod tests {
         acc
     }
 
-    /// The factored weight table's inner product against `z` must equal the
+    /// The collapsed inner product `Σ_c comb[c]·zc[c]` must equal the
     /// brute-force block-diagonal sum, and must equal `va + α·vb` for the true
-    /// `Âz(r)`, `B̂z(r)`. Both directions of the reduction's premise.
+    /// `Âz(r)`, `B̂z(r)`. This is the load-bearing identity behind dropping the
+    /// row rounds — the sumcheck below only ever sees `kappa` variables, so if
+    /// the collapse were wrong nothing else would catch it.
     #[test]
-    fn weight_factorization_matches_brute_force() {
+    fn row_collapse_matches_brute_force() {
         let mut rng = Rng::new(1234);
         for (ty, kappa) in [(mult_gate(2), 2usize), (mixed_gate(&mut rng), 3)] {
             for n_log in [1usize, 2, 4] {
@@ -326,17 +383,21 @@ mod tests {
 
                 let (r_row, r_con) = r.split_at(n_log);
                 let comb = comb_vector(&ty, alpha, &build_eq(r_con));
-                let u = weight_table(&build_eq(r_row), &comb);
-                let factored = u.iter().zip(&z).fold(F128::ZERO, |a, (x, y)| a + *x * *y);
+                let zc = partial_fold_rows(&z, r_row);
+                assert_eq!(zc.len(), ty.width());
+                let collapsed = comb
+                    .iter()
+                    .zip(&zc)
+                    .fold(F128::ZERO, |a, (x, y)| a + *x * *y);
 
                 assert_eq!(
-                    factored,
+                    collapsed,
                     brute_force_weighted_sum(&ty, &z, n_log, &r, alpha),
-                    "κ={kappa} n_log={n_log}: factored weights vs brute force"
+                    "κ={kappa} n_log={n_log}: collapsed weights vs brute force"
                 );
                 let (va, vb) = true_claims(&ty, &z, n_log, &r);
                 assert_eq!(
-                    factored,
+                    collapsed,
                     va + alpha * vb,
                     "κ={kappa} n_log={n_log}: target vs Âz(r) + α·B̂z(r)"
                 );
@@ -344,10 +405,36 @@ mod tests {
         }
     }
 
+    /// The collapsed vector really is the witness restricted to `r_row`:
+    /// `zc[c] = ẑ(r_row, c)` for every boolean column `c`. That identity is what
+    /// makes the output claim `ẑ(r_row, r'_col)` an evaluation of the *committed*
+    /// polynomial, hence openable by the PCS.
+    #[test]
+    fn partial_fold_is_the_witness_at_r_row() {
+        let mut rng = Rng::new(4711);
+        for (kappa, n_log) in [(2usize, 3usize), (3, 4), (1, 5)] {
+            let width = 1usize << kappa;
+            let z: Vec<F128> = (0..width << n_log).map(|_| rng.f128()).collect();
+            let r_row: Vec<F128> = (0..n_log).map(|_| rng.f128()).collect();
+            let zc = partial_fold_rows(&z, &r_row);
+            for c in 0..width {
+                let mut point = r_row.clone();
+                point.extend(bits(c, kappa));
+                assert_eq!(zc[c], mle_eval(&z, &point), "κ={kappa} c={c}");
+            }
+            // …and therefore its MLE at a random column point is ẑ(r_row, ·).
+            let r_col: Vec<F128> = (0..kappa).map(|_| rng.f128()).collect();
+            let mut point = r_row.clone();
+            point.extend_from_slice(&r_col);
+            assert_eq!(mle_eval(&zc, &r_col), mle_eval(&z, &point), "κ={kappa}");
+        }
+    }
+
     /// **Differential test** on random instances: the prover's round messages
     /// must be the honest sumcheck of the true weighted inner product. Replaying
     /// the verifier's chain from the *brute-force* target must land on
-    /// `û(r')·ẑ(r')`, and `z_eval` must be `z`'s MLE at `r'`.
+    /// `ĉomb(r'_col)·ẑ(r_row, r'_col)`, and `z_eval` must be the witness MLE at
+    /// the claim point.
     #[test]
     fn round_messages_match_brute_force_on_random_instances() {
         let mut rng = Rng::new(99);
@@ -361,6 +448,11 @@ mod tests {
                 let mut ch = FsChallenger::new(b"element-lc-diff");
                 let (proof, claim) = prove(&ty, &z, n_log, &r, va, vb, &mut ch);
 
+                // The wire cost is now kappa rounds, not kappa + n_log.
+                assert_eq!(proof.rounds.len(), kappa, "round count is kappa only");
+                // The row coordinates are inherited, not resampled.
+                assert_eq!(&claim.r_prime[..n_log], &r[..n_log], "rows inherited");
+
                 // Re-derive α as the prover did.
                 let mut ch2 = FsChallenger::new(b"element-lc-diff");
                 ch2.observe_label(LABEL);
@@ -369,28 +461,26 @@ mod tests {
                 assert_eq!(
                     claim.z_eval,
                     mle_eval(&z, &claim.r_prime),
-                    "κ={kappa} n_log={n_log}: z_eval is ẑ(r')"
+                    "κ={kappa} n_log={n_log}: z_eval is ẑ(r_row, r'_col)"
                 );
 
                 let mut running = brute_force_weighted_sum(&ty, &z, n_log, &r, alpha);
-                // The challenges in binding order are the reverse of r_prime.
-                let bind_order: Vec<F128> = claim.r_prime.iter().rev().copied().collect();
+                // Challenges in binding order are the reverse of the column half.
+                let bind_order: Vec<F128> = claim.r_prime[n_log..].iter().rev().copied().collect();
                 for (&(e1, einf), &rho) in proof.rounds.iter().zip(&bind_order) {
                     let e0 = running + e1;
                     let c1 = e0 + e1 + einf;
                     running = einf * rho * rho + c1 * rho + e0;
                 }
-                let (r_row, r_con) = r.split_at(n_log);
-                let (rp_row, rp_col) = claim.r_prime.split_at(n_log);
-                let comb = comb_vector(&ty, alpha, &build_eq(r_con));
-                let eq_col = build_eq(rp_col);
+                let comb = comb_vector(&ty, alpha, &build_eq(&r[n_log..]));
+                let eq_col = build_eq(&claim.r_prime[n_log..]);
                 let base = comb
                     .iter()
                     .zip(&eq_col)
                     .fold(F128::ZERO, |a, (c, e)| a + *c * *e);
                 assert_eq!(
                     running,
-                    eq_eval(r_row, rp_row) * base * claim.z_eval,
+                    base * claim.z_eval,
                     "κ={kappa} n_log={n_log}: chain from brute-force target"
                 );
             }
@@ -439,6 +529,30 @@ mod tests {
         let mut ch_v = FsChallenger::new(b"element-lc-mixed");
         let claim_v = verify(&ty, n_log, &r, va, vb, &proof, &mut ch_v).expect("verify");
         assert_eq!(claim_p, claim_v);
+    }
+
+    /// A single-column table (`kappa = 1`) still has a well-formed one-round
+    /// sumcheck — the loop's fused branch is never taken there, so it is the
+    /// edge the `t + 1 < kappa` guard exists for.
+    #[test]
+    fn kappa_one_roundtrips() {
+        let mut rng = Rng::new(31337);
+        // kappa = 1: one column, a free wire (tautology row).
+        let mut b = crate::element_r1cs::ElementTableBuilder::new(1);
+        b.free_wire(0);
+        let ty = b.build().expect("free wire is valid");
+        let n_log = 4usize;
+        let z: Vec<F128> = (0..1usize << (1 + n_log)).map(|_| rng.f128()).collect();
+        let r: Vec<F128> = (0..1 + n_log).map(|_| rng.f128()).collect();
+        let (va, vb) = true_claims(&ty, &z, n_log, &r);
+
+        let mut ch_p = FsChallenger::new(b"element-lc-k1");
+        let (proof, claim_p) = prove(&ty, &z, n_log, &r, va, vb, &mut ch_p);
+        assert_eq!(proof.rounds.len(), 1);
+        let mut ch_v = FsChallenger::new(b"element-lc-k1");
+        let claim_v = verify(&ty, n_log, &r, va, vb, &proof, &mut ch_v).expect("verify");
+        assert_eq!(claim_p, claim_v);
+        assert_eq!(claim_v.z_eval, mle_eval(&z, &claim_v.r_prime));
     }
 
     /// Tamper matrix: every round message, `z_eval`, and the incoming claims
