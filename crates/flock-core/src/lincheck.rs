@@ -1059,7 +1059,7 @@ fn sparse_row_fold_alpha_batched(
 /// One round of product-sumcheck on `(c, z)`: compute `(q(1), q(∞))` =
 /// `(Σ c_hi·z_hi, Σ (c_hi+c_lo)·(z_hi+z_lo))` over the top-bit split. The
 /// `len()` of `c` and `z` is even; `half = len/2`.
-fn sumcheck_round_eval_par(c: &[F128], z: &[F128]) -> (F128, F128) {
+pub(crate) fn sumcheck_round_eval_par(c: &[F128], z: &[F128]) -> (F128, F128) {
     use rayon::prelude::*;
     let half = c.len() / 2;
     debug_assert_eq!(z.len(), c.len());
@@ -1086,7 +1086,7 @@ fn sumcheck_round_eval_par(c: &[F128], z: &[F128]) -> (F128, F128) {
 
 /// Bind the top remaining variable of `v` at challenge `r`: `v[i] ← v[i] +
 /// r·(v[i+half] + v[i])` for `i ∈ [0, half)`, then truncate to `half`. In-place.
-fn sumcheck_bind_top_in_place_par(v: &mut Vec<F128>, r: F128) {
+pub(crate) fn sumcheck_bind_top_in_place_par(v: &mut Vec<F128>, r: F128) {
     use rayon::prelude::*;
     let half = v.len() / 2;
     if half < SUMCHECK_PAR_THRESHOLD {
@@ -1130,7 +1130,7 @@ fn sumcheck_bind_top_in_place_par(v: &mut Vec<F128>, r: F128) {
 /// well-defined next round — the caller guarantees this by only fusing when a
 /// later round exists). The returned message is bit-identical to
 /// `sumcheck_round_eval_par` run on the bound tables.
-fn sumcheck_bind_both_and_eval_next(
+pub(crate) fn sumcheck_bind_both_and_eval_next(
     comb: &mut Vec<F128>,
     z: &mut Vec<F128>,
     r: F128,
