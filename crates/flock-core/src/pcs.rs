@@ -644,34 +644,46 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             .collect();
         let mut rs_dense_all: Vec<&[F128]> = rs_baked.clone();
         rs_dense_all.extend(materialized.iter().map(|v| v.as_slice()));
-        let prime = b_combined
-            .par_chunks_mut(2)
-            .enumerate()
-            .map(|(i, chunk)| {
-                let mut b0 = F128::ZERO;
-                let mut b1 = F128::ZERO;
-                for v in rs_dense_all.iter() {
-                    b0 += v[2 * i];
-                    b1 += v[2 * i + 1];
-                }
-                for (v, g) in pd_dense.iter() {
-                    b0 += *g * v[2 * i];
-                    b1 += *g * v[2 * i + 1];
-                }
-                chunk[0] = b0;
-                chunk[1] = b1;
-                let a0 = packed_witness[2 * i];
-                let a1 = packed_witness[2 * i + 1];
-                (a0 * b0, (a0 + a1) * (b0 + b1))
-            })
-            .reduce(
-                || (F128::ZERO, F128::ZERO),
-                |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
-            );
-        for v in materialized {
-            crate::scratch::give_f128(v);
+        if rs_dense_all.is_empty() && pd_dense.is_empty() {
+            // All-sparse open (e.g. the permutation check's five pinned-coord
+            // claims): the per-element loop below would write zeros into every
+            // slot and accumulate `a·0` into the prime. Skip straight to the
+            // memset — the sparse scatter-adds that follow supply the whole of
+            // `b_combined`, and the prime they fold in is the whole prime.
+            b_combined.par_chunks_mut(1 << 13).for_each(|c| {
+                c.fill(F128::ZERO);
+            });
+            (F128::ZERO, F128::ZERO)
+        } else {
+            let prime = b_combined
+                .par_chunks_mut(2)
+                .enumerate()
+                .map(|(i, chunk)| {
+                    let mut b0 = F128::ZERO;
+                    let mut b1 = F128::ZERO;
+                    for v in rs_dense_all.iter() {
+                        b0 += v[2 * i];
+                        b1 += v[2 * i + 1];
+                    }
+                    for (v, g) in pd_dense.iter() {
+                        b0 += *g * v[2 * i];
+                        b1 += *g * v[2 * i + 1];
+                    }
+                    chunk[0] = b0;
+                    chunk[1] = b1;
+                    let a0 = packed_witness[2 * i];
+                    let a1 = packed_witness[2 * i + 1];
+                    (a0 * b0, (a0 + a1) * (b0 + b1))
+                })
+                .reduce(
+                    || (F128::ZERO, F128::ZERO),
+                    |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+                );
+            for v in materialized {
+                crate::scratch::give_f128(v);
+            }
+            prime
         }
-        prime
     };
     let mut adjust_prime_for_delta = |idx: usize, delta: F128| {
         let pair = idx / 2;

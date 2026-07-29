@@ -1807,11 +1807,17 @@ pub(crate) fn fold_b128_from_table(eq_lo: &[F128], eq_hi: &[F128], tables: &[F12
 const SPARSE_ZERO_THRESHOLD: usize = 3;
 
 /// Sparse representation of `build_eq(coords)` when `coords` contains exact
-/// `F128::ZERO` entries: stores values at the compact (live) tensor positions
-/// and a `live_positions` table that maps compact bit `j` → original coord
-/// position. Avoids materializing the scattered `(full_idx, val)` pairs —
-/// consumers compute the scattered idx on-the-fly via [`Self::scatter_idx`]
-/// (a bit-deposit / pdep operation) at the point of use.
+/// `F128::ZERO` or `F128::ONE` entries: stores values at the compact (live)
+/// tensor positions and a `live_positions` table that maps compact bit `j` →
+/// original coord position. Avoids materializing the scattered
+/// `(full_idx, val)` pairs — consumers compute the scattered idx on-the-fly
+/// via [`Self::scatter_idx`] (a bit-deposit / pdep operation) at the point of
+/// use.
+///
+/// A coord that is exactly boolean pins its index bit rather than doubling the
+/// tensor: `ZERO` forces the bit to 0 (it simply drops out of
+/// `live_positions`), `ONE` forces it to 1 (it drops out *and* sets that bit
+/// in [`Self::base`]). Both halve the tensor per pinned coord.
 #[derive(Clone, Debug)]
 pub struct SparseEqTensor {
     /// `build_eq(live_coords)` — length `2^live_positions.len()`.
@@ -1820,6 +1826,11 @@ pub struct SparseEqTensor {
     /// `j` of an enumeration index maps to bit `live_positions[j]` of the full
     /// scattered index.
     pub live_positions: Vec<usize>,
+    /// Scattered-index bits forced to 1 by coords equal to `F128::ONE`.
+    /// OR-ed into every scattered index. Disjoint from `live_positions`, so it
+    /// shifts the whole support by a constant and preserves `scatter_idx`'s
+    /// monotonicity in `c` (which `sparse_scatter_add_parallel` relies on).
+    pub base: usize,
 }
 
 impl SparseEqTensor {
@@ -1834,7 +1845,7 @@ impl SparseEqTensor {
     /// the noise floor.)
     #[inline(always)]
     pub fn scatter_idx(&self, c: usize) -> usize {
-        let mut full = 0usize;
+        let mut full = self.base;
         for (j, &pos) in self.live_positions.iter().enumerate() {
             full |= ((c >> j) & 1) << pos;
         }
@@ -1862,18 +1873,25 @@ impl SparseEqTensor {
     }
 }
 
-/// Build the sparse `build_eq(coords)` representation, skipping the zero-coord
-/// halvings. The output's `live_tensor` is the `build_eq` table over only the
-/// nonzero coords (length `2^live_count`); the scattered (full) index for
-/// compact entry `c` is reconstructed lazily via [`SparseEqTensor::scatter_idx`].
+/// Build the sparse `build_eq(coords)` representation, skipping the halvings
+/// for every coord that is exactly boolean. The output's `live_tensor` is the
+/// `build_eq` table over only the non-boolean coords (length `2^live_count`);
+/// the scattered (full) index for compact entry `c` is reconstructed lazily via
+/// [`SparseEqTensor::scatter_idx`], which OR-s in the `ONE` coords' pinned bits.
 ///
 /// O(2^live_count) time and memory, vs the dense `build_eq`'s `O(2^coords.len())`.
 pub fn build_eq_sparse(coords: &[F128]) -> SparseEqTensor {
-    let live_positions: Vec<usize> = coords
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &c)| if c == F128::ZERO { None } else { Some(i) })
-        .collect();
+    let mut live_positions: Vec<usize> = Vec::with_capacity(coords.len());
+    let mut base = 0usize;
+    for (i, &c) in coords.iter().enumerate() {
+        if c == F128::ZERO {
+            // eq factor pins index bit `i` to 0 — drop it.
+        } else if c == F128::ONE {
+            base |= 1 << i; // pins index bit `i` to 1
+        } else {
+            live_positions.push(i);
+        }
+    }
     let live_coords: Vec<F128> = live_positions.iter().map(|&i| coords[i]).collect();
     // Sequential build_eq. `build_eq_parallel` *does* save ~0.4 ms on the build
     // itself at 19 live coords, but the downstream `fold_1b_rows_sparse` /
@@ -1884,6 +1902,33 @@ pub fn build_eq_sparse(coords: &[F128]) -> SparseEqTensor {
     SparseEqTensor {
         live_tensor,
         live_positions,
+        base,
+    }
+}
+
+/// Sparse eq tensor for a point whose coords are `prefix_bits` pinned boolean
+/// values (in scattered-index bit order given by `pinned`), with the remaining
+/// coords carrying an **already-built** tensor. Lets a caller that opens the
+/// same random point under several boolean prefixes/suffixes build `build_eq`
+/// once and reuse it, instead of one dense build per point.
+///
+/// `live_positions` must be ascending and disjoint from the pinned bits, and
+/// `live_tensor.len()` must be `2^live_positions.len()`.
+pub fn sparse_eq_from_parts(
+    live_tensor: Vec<F128>,
+    live_positions: Vec<usize>,
+    base: usize,
+) -> SparseEqTensor {
+    debug_assert_eq!(live_tensor.len(), 1usize << live_positions.len());
+    debug_assert!(live_positions.windows(2).all(|w| w[0] < w[1]));
+    debug_assert!(
+        live_positions.iter().all(|&p| base & (1 << p) == 0),
+        "pinned base bits must be disjoint from live positions"
+    );
+    SparseEqTensor {
+        live_tensor,
+        live_positions,
+        base,
     }
 }
 
@@ -3716,6 +3761,59 @@ mod tests {
             // Support size = 2^live_count.
             let live_count = n_coords - zero_pos.len();
             assert_eq!(sparse_eq.len(), 1usize << live_count);
+        }
+    }
+
+    /// Coords pinned to exactly `ONE` must halve the tensor just like `ZERO`
+    /// ones, shifting the support via `base` instead of dropping it to bit 0.
+    #[test]
+    fn build_eq_sparse_pins_one_coords() {
+        let mut rng = Rng::new(0xB001_0001);
+        // (n_coords, zero positions, one positions)
+        let cases: &[(usize, &[usize], &[usize])] = &[
+            (1, &[], &[0]),
+            (4, &[0], &[3]),
+            (6, &[1, 4], &[0, 5]),
+            (8, &[], &[0, 1, 2, 3, 4, 5, 6, 7]), // fully boolean → unit vector
+            (10, &[2, 7], &[0, 9]),
+        ];
+        for &(n_coords, zero_pos, one_pos) in cases {
+            let coords: Vec<F128> = (0..n_coords)
+                .map(|i| {
+                    if zero_pos.contains(&i) {
+                        F128::ZERO
+                    } else if one_pos.contains(&i) {
+                        F128::ONE
+                    } else {
+                        rng.f128()
+                    }
+                })
+                .collect();
+            let dense = build_eq(&coords);
+            let sparse_eq = build_eq_sparse(&coords);
+
+            // Tensor is halved once per pinned coord, of either kind.
+            let live_count = n_coords - zero_pos.len() - one_pos.len();
+            assert_eq!(sparse_eq.len(), 1usize << live_count);
+            // Every `ONE` coord pins its index bit in `base`.
+            for &p in one_pos {
+                assert_ne!(sparse_eq.base & (1 << p), 0, "bit {p} not pinned");
+            }
+
+            let materialized = sparse_eq.materialize();
+            let mut covered = vec![false; dense.len()];
+            for &(idx, val) in &materialized {
+                assert_eq!(val, dense[idx], "sparse value mismatch at idx={idx}");
+                covered[idx] = true;
+            }
+            for (i, &c) in covered.iter().enumerate() {
+                if !c {
+                    assert_eq!(dense[i], F128::ZERO, "dense[{i}] nonzero but absent");
+                }
+            }
+            for w in materialized.windows(2) {
+                assert!(w[0].0 < w[1].0, "support not strictly ascending");
+            }
         }
     }
 
