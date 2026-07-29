@@ -526,6 +526,15 @@ impl ElementTableBuilder {
 pub struct ElementStatement<'a> {
     pub ty: &'a ElementTableType,
     pub n_log: usize,
+    /// Declared count of real rows. Transcript-bound (so a proof does not
+    /// transfer between counts), but note the scope boundary: this milestone's
+    /// PIOP proves the *relation* over the whole padded row domain and does not
+    /// independently prove that rows `[n, 2^n_log)` are **zero**. That costs
+    /// nothing standalone — the relation holds on every row, so a proof at count
+    /// `n` is equally a proof at full capacity — and it becomes structural in
+    /// the union integration, where the committed height is count-derived and
+    /// the dummy rows are not committed at all. Pinned by
+    /// `e2e_tests::satisfying_dummy_row_is_not_detected`.
     pub n: usize,
 }
 
@@ -1257,15 +1266,50 @@ mod e2e_tests {
     /// A dirty dummy row (non-zero past the declared count) is a violation too:
     /// the padding rows sit inside the zerocheck's sum, they are not skipped.
     #[test]
-    fn dirty_dummy_row_is_rejected() {
+    fn relation_violating_dummy_row_is_rejected() {
         let mut rng = Rng::new(2718);
         let (n_log, n) = (6usize, 40usize);
         let ty = mult_gate(2);
         let mut z = mult_witness(&ty, n_log, n, &mut rng);
+        // Row 50 is past the count. Setting its product column alone makes
+        // `(0)(0) = 1` — a relation violation, caught like any other.
         z[2 * (1usize << n_log) + 50] = F128::ONE;
         let stmt = ElementStatement { ty: &ty, n_log, n };
         let (proof, _) = run_prove(&stmt, &z);
         assert!(run_verify(&stmt, &proof).is_err());
+    }
+
+    /// SCOPE BOUNDARY (documented, not a defect). The PIOP proves the relation
+    /// over the whole padded row domain; it does NOT independently prove the
+    /// other half of the statement, that rows `[n, 2^n_log)` are *zero*. A row
+    /// past the count that is itself relation-satisfying therefore verifies
+    /// under the smaller declared count.
+    ///
+    /// This costs nothing here — the relation holds on every row, so a proof at
+    /// count `n` is equally a proof at full capacity — and it disappears in the
+    /// union integration, where the committed height is count-derived and the
+    /// dummy rows do not exist in the commitment at all ("dropped words are
+    /// zero" becomes structural). Pinned as a test so the boundary is visible
+    /// rather than latent; see the `n`-field docs on [`ElementStatement`].
+    #[test]
+    fn satisfying_dummy_row_is_not_detected() {
+        let mut rng = Rng::new(2719);
+        let (n_log, n) = (6usize, 40usize);
+        let ty = mult_gate(2);
+        let rows = 1usize << n_log;
+        let mut z = mult_witness(&ty, n_log, n, &mut rng);
+        // Fill row 50 (past the count) with a *satisfying* mult triple.
+        let (a, b) = (rng.f128(), rng.f128());
+        z[50] = a;
+        z[rows + 50] = b;
+        z[2 * rows + 50] = a * b;
+        let stmt = ElementStatement { ty: &ty, n_log, n };
+        let (proof, _) = run_prove(&stmt, &z);
+        assert!(
+            run_verify(&stmt, &proof).is_ok(),
+            "the relation holds on every row, so this proof is accepted — \
+             zero-ness of dummy rows is the union integration's job"
+        );
     }
 
     /// Correct round messages but wrong final claim values. Both `ec` and
