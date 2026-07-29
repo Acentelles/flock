@@ -4,14 +4,51 @@ Branch `merkle-path-r1cs`, off `multitable`. Status: **working end to end at
 depth 26**, both as a standalone single-type registry and as a shipped
 `merkle26+blake3` mixed tier.
 
+## Where this stands (read this first)
+
+Done since the "alignment DONE, factorization NEXT" state:
+
+1. **The `eq` tensor factorization** — the fold is 20× faster single-threaded
+   (259 → 13 ms at depth 26), which cut end-to-end verify 3× (365 → 119 ms on
+   `merkle26+blake3@nu3`).
+2. **The repo builds on stable** — the `isolate_lowest_one` feature gates are
+   gone, replaced by `bits::lowest_one`, with no version floor. Drop `+nightly`.
+   CI's fmt/clippy gates now pass (they did not before).
+3. **A matched-hash-count benchmark vs a plain BLAKE3 table**
+   (`benches/merkle_vs_plain_blake3.rs`), swept to 26,624 compressions.
+4. **Witness gen on the batch-major driver** — 32× (735 → 23 ms at 26k),
+   taking Merkle prove 4.4× (1451 → 328 ms) and the prove gap from 8.2× to
+   ~2.2×.
+
+**The one thing left is `jagged`'s Frobenius assist.** It is 88% of the
+remaining prove gap and 95% of the verify gap at 26k, on both sides, and its
+cost is `256 statements × ~3326 columns × 2(m+1)` — driven by the *block width*
+`k_log`, not the batch size, so more paths never help. Levers: cut the 256
+statements, exploit that Merkle's columns are one run of equal heights, or
+narrow `k_log`. Note this makes the SHA-256 backend **counterproductive**
+(κ = 15 ⇒ composite `k_log` 20 ⇒ more columns), reversing what the open items
+below used to say.
+
+Three claims in earlier revisions of this file were measured to be wrong and are
+corrected in place: the verifier is not dominated by `fold_alpha_batched`; the
+PCS *opening* is at parity (it is the jagged transport around it); and the
+`zerocheck` asymmetry was page-fault noise, not real.
+
 ## What exists
 
 | file | what |
 |---|---|
-| `crates/flock-prover/src/r1cs_hashes/merkle_r1cs.rs` | the composite R1CS, `HashSpec` backend abstraction, witness + row-witness generators, the walker `LincheckCircuit` + its `eq` factorization |
-| `crates/flock-prover/tests/merkle_r1cs.rs` | R1CS correctness, `a`/`b` emission, BatchMajor layout, walker equivalence |
+| `crates/flock-prover/src/r1cs_hashes/merkle_r1cs.rs` | the composite R1CS, `HashSpec` backend abstraction, the batch-major witness driver (+ the `Vec<bool>` oracle), the walker `LincheckCircuit` + its `eq` factorization |
+| `crates/flock-prover/tests/merkle_r1cs.rs` | R1CS correctness, `a`/`b` emission, BatchMajor layout, walker equivalence, packed-vs-bool witness equality |
 | `crates/flock-prover/tests/merkle_union.rs` | union + mixed-tier roundtrips at depth 26 |
 | `crates/flock-prover/src/mixed.rs` | `RegistryFamily`, `MerkleMixedSetup`, `MerkleMixedCounts`, tier codes 3 & 4 |
+| `crates/flock-prover/benches/merkle_vs_plain_blake3.rs` | the matched-hash-count comparison; `MVB_PATHS` / `MVB_REPS` |
+
+Env knobs added for A/B and attribution, all off by default:
+`FLOCK_MERKLE_FOLD_PER_LEVEL` (skip the `eq` factorization),
+`FLOCK_VERIFY_THREADS` (the verify pool is 1 thread in production),
+`VERIFY_TRACE` (per-phase verify breakdown, incl. the merged union entry),
+`PCS_TRACE` (per-phase prove breakdown — pre-existing).
 
 Run: `cargo test -p flock-prover --release --test merkle_r1cs --test merkle_union`
 (add `-- --include-ignored` for the real-depth proofs). No `+nightly` — see the
