@@ -1,0 +1,1069 @@
+//! Element tables in the union: element-only and mixed boolean+element proofs
+//! end to end, plus the tamper matrix, the dummy-row closure, and the
+//! differential against the standalone element proof.
+//!
+//! Geometry notes (why these `(ν, κ)` pairs): the committed dense stack must
+//! reach `dense_m = 22`, the smallest embedded Ligerito security config
+//! (`union::MIN_DENSE_M`), so the union needs `M ≥ 22`.
+//!
+//! - **Element-only**: one element slot IS the address space, so
+//!   `M = ν + κ + 7`. `ν = 12, κ = 3` lands exactly on 22 (2^15 committed
+//!   words) with 4096 rows of 8 word-columns.
+//! - **Mixed**: BLAKE3 (κ_bool = 14) at `ν = 7` gives a boolean region of
+//!   `2^21`, an element region of `2^17` based at `2^21`, so `M = 22`. The
+//!   boolean claims then carry ONE frozen-zero high coordinate and the element
+//!   claims five frozen prefix coordinates (`element_base >> M_elem = 0b10000`).
+//!
+//! Run with `cargo test --release -p flock-prover --test union_element --
+//! --ignored`.
+
+use flock_core::element_r1cs::{ElementTableBuilder, ElementTableType};
+use flock_core::field::F128;
+use flock_core::proof::R1csProofMixedClassLigerito;
+use flock_prover::challenger::FsChallenger;
+use flock_core::pcs::ligerito::LigeritoProfile;
+use flock_prover::challenger::Challenger as _;
+use flock_prover::pcs::PcsParams;
+use flock_prover::prover::{self, UnionElementSlotInput, UnionSlotProverInput};
+use flock_prover::r1cs_hashes::blake3;
+use flock_prover::schedule::{Registry, TableType};
+use flock_prover::union::UnionInstance;
+use flock_prover::verifier;
+use std::sync::Arc;
+
+const DOMAIN: &[u8] = b"flock-union-element-v0";
+
+/// SplitMix64 PRNG, the repo's test RNG convention.
+struct Rng(u64);
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn next_u32(&mut self) -> u32 {
+        self.next_u64() as u32
+    }
+    fn f128(&mut self) -> F128 {
+        F128::new(self.next_u64(), self.next_u64())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The test element block: every row encoding the class supports.
+// ---------------------------------------------------------------------------
+
+/// Columns `0,1` free wires (the operands), `2 = z0·z1`, `3 = w0·z0 + w1·z1`
+/// (a linear pin); columns `4..2^κ` are self-pinned zero padding. So `k = 4`
+/// real word-columns of the `2^κ` the slot spans.
+fn gate_block(kappa: usize, w0: F128, w1: F128) -> Arc<ElementTableType> {
+    assert!(kappa >= 2, "the block needs at least 4 columns");
+    let mut b = ElementTableBuilder::new(kappa);
+    b.free_wire(0)
+        .free_wire(1)
+        .mult(2, 0, 1)
+        .linear(3, &[(0, w0), (1, w1)]);
+    Arc::new(b.build().expect("gate block is valid"))
+}
+
+/// A satisfying witness for [`gate_block`]: `n` real rows of random operands,
+/// rows `[n, 2^nu)` and the padding columns all zero. BatchMajor, rows low.
+fn gate_witness(
+    ty: &ElementTableType,
+    nu: usize,
+    n: usize,
+    w0: F128,
+    w1: F128,
+    rng: &mut Rng,
+) -> Vec<F128> {
+    let at = |c: usize, j: usize| (c << nu) + j;
+    let mut z = vec![F128::ZERO; ty.width() << nu];
+    for j in 0..n {
+        let (a, b) = (rng.f128(), rng.f128());
+        z[at(0, j)] = a;
+        z[at(1, j)] = b;
+        z[at(2, j)] = a * b;
+        z[at(3, j)] = w0 * a + w1 * b;
+    }
+    assert!(ty.satisfies(&z, nu, n), "generated witness must satisfy");
+    z
+}
+
+/// PCS params over the committed dense stack — same shape as `union_mixed`'s.
+fn union_pcs_params(union: &UnionInstance<'_>) -> PcsParams {
+    PcsParams {
+        m: union.dense_m(),
+        log_inv_rate: 1,
+        log_batch_size: 6,
+        profile: LigeritoProfile::Fast,
+        num_lanes: union.commit_lanes(6),
+        merkle_hash: Default::default(),
+    }
+}
+
+fn random_blake3_inputs(rng: &mut Rng, n: usize) -> Vec<blake3::Compression> {
+    (0..n)
+        .map(|_| {
+            let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+            let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+            let counter = ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64);
+            (cv, m, counter, 64u32, 11u32)
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Element-only union proofs
+// ---------------------------------------------------------------------------
+
+/// **Element-only union proof**, at several `(ν, κ, counts)` shapes including
+/// non-power-of-two and partial counts, one and two element slots.
+///
+/// Also the count-proportionality assertion: the committed dense area is
+/// exactly `Σ_t n_t · used_cols_t` (before the power-of-two rounding and the
+/// config floor).
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn element_only_union_roundtrip() {
+    let mut rng = Rng::new(0x0E1E_0001);
+    let (w0, w1) = (F128::new(7, 0), F128::new(0, 3));
+
+    // Shapes: (nu, kappas, counts). M = ceil(log2(Σ 2^{nu+κ_t+7})) must be ≥ 22.
+    let shapes: Vec<(usize, Vec<usize>, Vec<usize>)> = vec![
+        (12, vec![3], vec![1 << 12]),  // M = 22, full utilization
+        (12, vec![3], vec![2731]),     // non-power-of-two count
+        (12, vec![3], vec![1]),        // one real row
+        (12, vec![3], vec![0]),        // empty table
+        (11, vec![3, 3], vec![2048, 1365]), // two equal slots, M = 22
+        (11, vec![4, 2], vec![1000, 2048]), // two slots of different widths
+    ];
+    for (nu, kappas, counts) in shapes {
+        let tys: Vec<Arc<ElementTableType>> =
+            kappas.iter().map(|&k| gate_block(k, w0, w1)).collect();
+        let registry = Registry::new(
+            tys.iter().map(|t| TableType::element(t.clone())).collect(),
+            nu,
+        );
+        assert_eq!(registry.num_boolean(), 0);
+        assert_eq!(registry.num_element(), kappas.len());
+        assert_eq!(registry.m_bool(), 0, "no boolean region");
+        assert_eq!(registry.element_base(), 0, "the region IS the prefix subcube");
+        assert!(
+            registry.m_total() >= 22,
+            "shape (nu={nu}, kappas={kappas:?}) commits below the Ligerito floor"
+        );
+        // Element types in SLOT order (area-descending), which is what the
+        // counts and the prover inputs are indexed by.
+        let slot_tys: Vec<Arc<ElementTableType>> = registry
+            .element_types()
+            .iter()
+            .map(|t| match &t.class {
+                flock_core::schedule::TableClass::LargeField(e) => e.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        let union = UnionInstance::new(&registry, counts.clone());
+        let pcs_params = union_pcs_params(&union);
+
+        // Count-proportional committed area: Σ_t n_t · used_cols_t.
+        let expected_dense: usize = slot_tys
+            .iter()
+            .zip(&counts)
+            .map(|(t, &n)| t.k() * n)
+            .sum();
+        assert_eq!(
+            union.dense_words(),
+            expected_dense,
+            "dense area must be count-proportional (nu={nu}, counts={counts:?})"
+        );
+
+        let witnesses: Vec<Vec<F128>> = slot_tys
+            .iter()
+            .zip(&counts)
+            .map(|(t, &n)| gate_witness(t, nu, n, w0, w1, &mut rng))
+            .collect();
+        let element_slots: Vec<UnionElementSlotInput<'_>> = witnesses
+            .iter()
+            .map(|w| UnionElementSlotInput::new(move |dst: &mut [F128]| dst.copy_from_slice(w)))
+            .collect();
+
+        let mut ch_p = FsChallenger::new(DOMAIN);
+        let (proof, commitment, claims_p) = prover::prove_fast_ligerito_jagged_union_mixed_class(
+            &union,
+            &pcs_params,
+            Vec::new(),
+            element_slots,
+            &mut ch_p,
+        );
+        assert!(proof.boolean.is_none(), "no boolean class");
+        let el = proof.element.as_ref().expect("element sub-proof");
+        assert_eq!(
+            el.zerocheck.rounds.len(),
+            union.m_elem() - 7,
+            "element zerocheck spans the region"
+        );
+        assert_eq!(
+            el.lincheck.rounds.len(),
+            union.m_elem() - 7 - nu,
+            "the lincheck's row half is collapsed"
+        );
+
+        let mut ch_v = FsChallenger::new(DOMAIN);
+        let claims_v = verifier::verify_ligerito_jagged_union_mixed_class(
+            &union,
+            &[],
+            &commitment,
+            &proof,
+            &pcs_params,
+            &mut ch_v,
+        )
+        .unwrap_or_else(|e| panic!("verify rejected (nu={nu}, counts={counts:?}): {e:?}"));
+        assert_eq!(claims_p, claims_v);
+        assert!(claims_v.boolean.is_none());
+        let c = claims_v.element.expect("element claims");
+        // Both claims share the reused row coordinates.
+        assert_eq!(&c.c_point[..nu], &c.lc_point[..nu]);
+        assert_eq!(c.c_point.len(), registry.m_total() - 7);
+    }
+}
+
+/// The element claims are discharged by the **opening**, not just by the PIOP.
+///
+/// On an element-only proof the batched opening carries NO ring-switched claims
+/// at all — the two packed-direct element claims are its entire intake — so
+/// tampering with the opening's own messages (the virtual-opening sumcheck and
+/// its final `f_eval`) probes exactly the packed-direct path: `target_combined`
+/// and `b̂_combined(ρ)` are built from the element claim values and points, and
+/// nothing else.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn element_claims_are_bound_by_the_opening() {
+    let (nu, kappa) = (12usize, 3usize);
+    let (w0, w1) = (F128::new(17, 0), F128::new(0, 23));
+    let ty = gate_block(kappa, w0, w1);
+    let registry = Registry::new(vec![TableType::element(ty.clone())], nu);
+    let n = 2731usize;
+    let union = UnionInstance::new(&registry, vec![n]);
+    let pcs_params = union_pcs_params(&union);
+
+    let mut rng = Rng::new(0x0E1E_09E4);
+    let z = gate_witness(&ty, nu, n, w0, w1, &mut rng);
+    let zc = z.clone();
+    let mut ch_p = FsChallenger::new(DOMAIN);
+    let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_mixed_class(
+        &union,
+        &pcs_params,
+        Vec::new(),
+        vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
+            dst.copy_from_slice(&zc)
+        })],
+        &mut ch_p,
+    );
+    let verify = |p: &R1csProofMixedClassLigerito| {
+        let mut ch = FsChallenger::new(DOMAIN);
+        verifier::verify_ligerito_jagged_union_mixed_class(
+            &union,
+            &[],
+            &commitment,
+            p,
+            &pcs_params,
+            &mut ch,
+        )
+    };
+    assert!(verify(&proof).is_ok(), "honest proof");
+    assert!(
+        proof.pcs_open.ring_switches.is_empty(),
+        "an element-only opening has no ring-switched claims — \
+         the packed-direct intake is all of it"
+    );
+
+    // `f_eval` is what the virtual-opening sumcheck's final check compares
+    // against `b̂_combined(ρ)·f_eval`, with `b̂_combined` built ENTIRELY from
+    // the two packed-direct claims.
+    let mut bad = proof.clone();
+    bad.pcs_open.f_eval += F128::ONE;
+    assert!(verify(&bad).is_err(), "tampered f_eval");
+
+    // Every virtual-opening round message, and the jagged `b_tilde`.
+    for i in 0..proof.pcs_open.virtual_open_rounds.len() {
+        for which in 0..2 {
+            let mut bad = proof.clone();
+            if which == 0 {
+                bad.pcs_open.virtual_open_rounds[i].0 += F128::ONE;
+            } else {
+                bad.pcs_open.virtual_open_rounds[i].1 += F128::ONE;
+            }
+            assert!(
+                verify(&bad).is_err(),
+                "tampered virtual-open round {i} msg {which}"
+            );
+        }
+    }
+    let mut bad = proof.clone();
+    bad.pcs_open.b_tilde[0] += F128::ONE;
+    assert!(verify(&bad).is_err(), "tampered b_tilde");
+}
+
+/// **Differential** (acceptance criterion 5): on the same element instance, an
+/// element-only union proof accepts exactly when the STANDALONE element proof
+/// does — over honest witnesses and over each way of breaking one. The two are
+/// not byte-identical (different statement bindings, different domains), but
+/// they must never disagree on accept/reject.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn element_only_agrees_with_the_standalone_proof() {
+    use flock_core::element_r1cs::{ElementStatement, self as el};
+
+    let (nu, kappa) = (12usize, 3usize);
+    let (w0, w1) = (F128::new(11, 0), F128::new(0, 5));
+    let ty = gate_block(kappa, w0, w1);
+    let registry = Registry::new(vec![TableType::element(ty.clone())], nu);
+    assert_eq!(registry.m_total(), nu + kappa + 7);
+
+    let mut rng = Rng::new(0x0E1E_D1FF);
+    // Cases: honest at several counts, then three ways of breaking the witness.
+    // `tamper` returns the count and mutates the witness in place.
+    type Tamper = fn(&mut Vec<F128>, usize, usize);
+    let cases: Vec<(&str, usize, Option<Tamper>)> = vec![
+        ("honest full", 1 << nu, None),
+        ("honest partial", 2731, None),
+        ("honest empty", 0, None),
+        (
+            "broken product",
+            2731,
+            Some(|z: &mut Vec<F128>, nu: usize, _n: usize| z[(2 << nu) + 7] += F128::ONE),
+        ),
+        (
+            "broken linear pin",
+            2731,
+            Some(|z: &mut Vec<F128>, nu: usize, _n: usize| z[(3 << nu) + 100] += F128::ONE),
+        ),
+        (
+            "dirty dummy row",
+            2731,
+            Some(|z: &mut Vec<F128>, nu: usize, n: usize| z[(2 << nu) + n + 5] = F128::ONE),
+        ),
+        (
+            "non-zero padding column",
+            2731,
+            Some(|z: &mut Vec<F128>, nu: usize, _n: usize| z[4 << nu] = F128::ONE),
+        ),
+    ];
+
+    for (name, n, tamper) in cases {
+        let mut z = gate_witness(&ty, nu, n, w0, w1, &mut rng);
+        if let Some(t) = tamper {
+            t(&mut z, nu, n);
+        }
+
+        // --- Union (element-only) verdict.
+        let union = UnionInstance::new(&registry, vec![n]);
+        let pcs_params = union_pcs_params(&union);
+        let zc = z.clone();
+        let mut ch_p = FsChallenger::new(DOMAIN);
+        let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_mixed_class(
+            &union,
+            &pcs_params,
+            Vec::new(),
+            vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
+                dst.copy_from_slice(&zc)
+            })],
+            &mut ch_p,
+        );
+        let mut ch_v = FsChallenger::new(DOMAIN);
+        let union_ok = verifier::verify_ligerito_jagged_union_mixed_class(
+            &union,
+            &[],
+            &commitment,
+            &proof,
+            &pcs_params,
+            &mut ch_v,
+        )
+        .is_ok();
+
+        // --- Standalone verdict on the same instance.
+        let stmt = ElementStatement {
+            ty: &ty,
+            n_log: nu,
+            n,
+        };
+        let mut ch_p = FsChallenger::new(DOMAIN);
+        let (sp, _) = el::prove(&stmt, &z, &mut ch_p);
+        let mut ch_v = FsChallenger::new(DOMAIN);
+        let standalone_ok = el::verify(&stmt, &sp, &mut ch_v).is_ok();
+
+        assert_eq!(
+            union_ok, standalone_ok,
+            "union and standalone disagree on '{name}' \
+             (union {union_ok}, standalone {standalone_ok})"
+        );
+        // Every tamper here is a RELATION violation (a dirty dummy row sets a
+        // product column without its operands, so `(0)(0) = 1`), so both
+        // provers' verdicts are also the expected ones.
+        assert_eq!(
+            union_ok,
+            tamper.is_none(),
+            "unexpected verdict on '{name}'"
+        );
+    }
+}
+
+/// **Dummy-row closure** (acceptance criterion 4). The standalone milestone's
+/// known gap (`satisfying_dummy_row_is_not_detected`) is that a *satisfying*
+/// non-zero row past the declared count verifies: the PIOP proves the relation
+/// on every row, not that dummy rows are zero.
+///
+/// Under the union that gap closes STRUCTURALLY, and this pins both halves of
+/// the mechanism:
+///
+/// 1. the height-`n_t` transport does not commit those words at all
+///    (`jagged_heights` stops at `n_t`), so the compaction's
+///    dropped-words-are-zero invariant catches them in debug builds; and
+/// 2. the proof a release prover produces on such a witness is REJECTED — the
+///    committed stack it opens against is the one with the dummy row deleted,
+///    while its element zerocheck summed the row in.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn satisfying_dummy_row_is_rejected_under_the_union() {
+    let (nu, kappa) = (12usize, 3usize);
+    let (w0, w1) = (F128::new(13, 0), F128::new(0, 9));
+    let ty = gate_block(kappa, w0, w1);
+    let registry = Registry::new(vec![TableType::element(ty.clone())], nu);
+    let n = 2731usize;
+    let union = UnionInstance::new(&registry, vec![n]);
+    let pcs_params = union_pcs_params(&union);
+
+    let mut rng = Rng::new(0x0E1E_DEAD);
+    let mut z = gate_witness(&ty, nu, n, w0, w1, &mut rng);
+    // Row `n + 5` is a dummy row. Fill it with a fully SATISFYING assignment —
+    // the standalone PIOP accepts exactly this (see its scope-boundary test).
+    let (a, b) = (rng.f128(), rng.f128());
+    let at = |c: usize, j: usize| (c << nu) + j;
+    z[at(0, n + 5)] = a;
+    z[at(1, n + 5)] = b;
+    z[at(2, n + 5)] = a * b;
+    z[at(3, n + 5)] = w0 * a + w1 * b;
+    assert!(
+        ty.satisfies(&z, nu, 1 << nu),
+        "the tampered witness satisfies the RELATION on every row"
+    );
+
+    // (1) The words are not committed: the heights stop at n_t, so the
+    // compaction map drops them — and the honest-witness invariant it asserts
+    // in debug builds is exactly "every dropped word is zero", which this
+    // witness violates.
+    let heights = union.jagged_heights();
+    assert!(
+        heights.iter().all(|&h| h as usize == n || h == 0),
+        "used columns commit exactly n_t rows"
+    );
+    assert_eq!(union.dense_words(), ty.k() * n);
+
+    // (2) The proof is rejected. (Release build: the debug assertion above is
+    // compiled out, so the prover runs and produces a proof that opens the
+    // stack WITHOUT the dummy row while its zerocheck summed the row in.)
+    let zc = z.clone();
+    let mut ch_p = FsChallenger::new(DOMAIN);
+    let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_mixed_class(
+        &union,
+        &pcs_params,
+        Vec::new(),
+        vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
+            dst.copy_from_slice(&zc)
+        })],
+        &mut ch_p,
+    );
+    let mut ch_v = FsChallenger::new(DOMAIN);
+    let verdict = verifier::verify_ligerito_jagged_union_mixed_class(
+        &union,
+        &[],
+        &commitment,
+        &proof,
+        &pcs_params,
+        &mut ch_v,
+    );
+    assert!(
+        verdict.is_err(),
+        "a satisfying non-zero dummy row must be rejected under the union \
+         (the standalone milestone's known gap, closed structurally)"
+    );
+
+    // The same witness with the dummy row zeroed IS accepted, so the rejection
+    // above is about the dummy row and nothing else.
+    for c in 0..4 {
+        z[at(c, n + 5)] = F128::ZERO;
+    }
+    let zc = z.clone();
+    let mut ch_p = FsChallenger::new(DOMAIN);
+    let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_mixed_class(
+        &union,
+        &pcs_params,
+        Vec::new(),
+        vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
+            dst.copy_from_slice(&zc)
+        })],
+        &mut ch_p,
+    );
+    let mut ch_v = FsChallenger::new(DOMAIN);
+    assert!(
+        verifier::verify_ligerito_jagged_union_mixed_class(
+            &union,
+            &[],
+            &commitment,
+            &proof,
+            &pcs_params,
+            &mut ch_v,
+        )
+        .is_ok(),
+        "the clean witness must verify"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Mixed boolean + element
+// ---------------------------------------------------------------------------
+
+/// The mixed setup: BLAKE3 (κ = 14) + the element gate block, at ν = 7 → a
+/// `2^21` boolean region, a `2^17` element region based at `2^21`, `M = 22`.
+struct Mixed {
+    registry: Registry,
+    blake3_r1cs: flock_core::r1cs::BlockR1cs,
+    ty: Arc<ElementTableType>,
+    w: (F128, F128),
+}
+
+fn mixed_setup(nu: usize, kappa: usize) -> Mixed {
+    let w = (F128::new(3, 0), F128::new(0, 7));
+    let ty = gate_block(kappa, w.0, w.1);
+    let blake3_r1cs = blake3::build_block_r1cs(nu);
+    let registry = Registry::new(
+        vec![
+            // Element type FIRST in the input list, so the class-major sort has
+            // something to do.
+            TableType::element(ty.clone()),
+            TableType::from_block_r1cs(&blake3_r1cs),
+        ],
+        nu,
+    );
+    assert_eq!(registry.num_boolean(), 1, "BLAKE3 sorts before the element");
+    assert!(registry.types()[1].is_element());
+    Mixed {
+        registry,
+        blake3_r1cs,
+        ty,
+        w,
+    }
+}
+
+/// **THE milestone test**: one proof attesting a mixed batch of boolean rows
+/// (BLAKE3 compressions) and element rows (F128 gates), plus the tamper matrix.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn mixed_boolean_element_roundtrip_and_tamper() {
+    let (nu, kappa) = (7usize, 3usize);
+    let m = mixed_setup(nu, kappa);
+    assert_eq!(m.registry.m_total(), 22);
+    assert_eq!(m.registry.m_bool(), 21);
+    assert_eq!(m.registry.m_elem(), 17);
+    assert_eq!(m.registry.element_base(), 1 << 21);
+
+    let (n_bool, n_elem) = (100usize, 90usize); // both non-powers of two
+    let union = UnionInstance::new(&m.registry, vec![n_bool, n_elem]);
+    let pcs_params = union_pcs_params(&union);
+    // Region geometry the two PIOPs run over.
+    assert_eq!(union.boolean_packed_len(), 1 << 14);
+    assert_eq!(union.element_word_range(), (1 << 14)..((1 << 14) + (1 << 10)));
+    // Count-proportional dense area across BOTH classes.
+    assert_eq!(
+        union.dense_words(),
+        121 * n_bool + m.ty.k() * n_elem,
+        "dense area is count-proportional over both classes"
+    );
+
+    let mut rng = Rng::new(0x0E1E_B1AD);
+    let inputs = random_blake3_inputs(&mut rng, n_bool);
+    let z_elem = gate_witness(&m.ty, nu, n_elem, m.w.0, m.w.1, &mut rng);
+    let circuit = m.blake3_r1cs.csc_lincheck_circuit();
+
+    let prove = |union: &UnionInstance<'_>, params: &PcsParams| {
+        let z_elem = z_elem.clone();
+        let mut ch = FsChallenger::new(DOMAIN);
+        prover::prove_fast_ligerito_jagged_union_mixed_class(
+            union,
+            params,
+            vec![UnionSlotProverInput::new(
+                blake3::generate_witness_batch_major_partial(&inputs, nu),
+                circuit,
+            )],
+            vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
+                dst.copy_from_slice(&z_elem)
+            })],
+            &mut ch,
+        )
+    };
+    let (proof, commitment, claims_p) = prove(&union, &pcs_params);
+    assert!(proof.boolean.is_some() && proof.element.is_some());
+
+    let verify = |union: &UnionInstance<'_>,
+                  params: &PcsParams,
+                  commitment: &flock_prover::pcs::Commitment,
+                  proof: &R1csProofMixedClassLigerito| {
+        let mut ch = FsChallenger::new(DOMAIN);
+        verifier::verify_ligerito_jagged_union_mixed_class(
+            union, &[circuit], commitment, proof, params, &mut ch,
+        )
+    };
+    let claims_v = verify(&union, &pcs_params, &commitment, &proof).expect("honest mixed proof");
+    assert_eq!(claims_p, claims_v);
+    let bc = claims_v.boolean.as_ref().expect("boolean claims");
+    let ec = claims_v.element.as_ref().expect("element claims");
+    // The boolean claims carry M − M_bool = 1 frozen-ZERO high coordinate.
+    assert_eq!(*bc.ab.point.x_outer.last().unwrap(), F128::ZERO);
+    assert_eq!(*bc.c.point.x_outer.last().unwrap(), F128::ZERO);
+    // The element claims carry the region's five frozen prefix coordinates
+    // (element_base >> M_elem = 0b10000, LSB-first).
+    assert_eq!(
+        &ec.c_point[ec.c_point.len() - 5..],
+        &[F128::ZERO, F128::ZERO, F128::ZERO, F128::ZERO, F128::ONE]
+    );
+
+    // ---- Tamper matrix ---------------------------------------------------
+    //
+    // (a) A tampered ELEMENT word.
+    {
+        let mut bad_elem = z_elem.clone();
+        bad_elem[(2 << nu) + 3] += F128::ONE; // break one product
+        let inputs = &inputs;
+        let mut ch = FsChallenger::new(DOMAIN);
+        let (p, cm, _) = prover::prove_fast_ligerito_jagged_union_mixed_class(
+            &union,
+            &pcs_params,
+            vec![UnionSlotProverInput::new(
+                blake3::generate_witness_batch_major_partial(inputs, nu),
+                circuit,
+            )],
+            vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
+                dst.copy_from_slice(&bad_elem)
+            })],
+            &mut ch,
+        );
+        assert!(
+            verify(&union, &pcs_params, &cm, &p).is_err(),
+            "a tampered element word must be rejected"
+        );
+    }
+
+    // (b) A tampered BOOLEAN word: flip one input bit so the trace is
+    //     inconsistent with the (unchanged) declared statement is not possible
+    //     — instead flip a witness word directly by proving on a corrupted
+    //     boolean witness through the prebuilt path.
+    {
+        let (mut z, a, b, stripe) = blake3::generate_witness_batch_major_partial(&inputs, nu);
+        z[5] += F128::ONE;
+        let z_elem = z_elem.clone();
+        let mut ch = FsChallenger::new(DOMAIN);
+        let (p, cm, _) = prover::prove_fast_ligerito_jagged_union_mixed_class(
+            &union,
+            &pcs_params,
+            vec![UnionSlotProverInput::new((z, a, b, stripe), circuit)],
+            vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
+                dst.copy_from_slice(&z_elem)
+            })],
+            &mut ch,
+        );
+        assert!(
+            verify(&union, &pcs_params, &cm, &p).is_err(),
+            "a tampered boolean word must be rejected"
+        );
+    }
+
+    // (c) Wrong declared counts, each class in turn — they bind in the
+    //     statement, in the heights, and in the lincheck's pin target.
+    for bad_counts in [
+        vec![n_bool + 1, n_elem],
+        vec![n_bool - 1, n_elem],
+        vec![n_bool, n_elem + 1],
+        vec![n_bool, n_elem - 1],
+    ] {
+        let bad = UnionInstance::new(&m.registry, bad_counts.clone());
+        let bad_params = union_pcs_params(&bad);
+        assert!(
+            verify(&bad, &bad_params, &commitment, &proof).is_err(),
+            "counts {bad_counts:?} must be rejected"
+        );
+    }
+
+    // (d) Swapped registry digest: same geometry, different element base block
+    //     (one linear coefficient changed). Verifier-side quantities are all
+    //     identical, so only the digest binding catches it.
+    {
+        let other_ty = gate_block(kappa, m.w.0, m.w.1 + F128::ONE);
+        let other = Registry::new(
+            vec![
+                TableType::from_block_r1cs(&m.blake3_r1cs),
+                TableType::element(other_ty),
+            ],
+            nu,
+        );
+        assert_ne!(m.registry.digest(), other.digest());
+        let bad = UnionInstance::new(&other, vec![n_bool, n_elem]);
+        assert_eq!(bad.dense_m(), union.dense_m(), "same geometry");
+        assert!(
+            verify(&bad, &pcs_params, &commitment, &proof).is_err(),
+            "a swapped registry digest must be rejected"
+        );
+    }
+
+    // (e) Tampered claim values, in every sub-proof.
+    {
+        type Mut = fn(&mut R1csProofMixedClassLigerito);
+        let cases: [(&str, Mut); 5] = [
+            ("element ec", |p| {
+                p.element.as_mut().unwrap().zerocheck.ec += F128::ONE
+            }),
+            ("element ea", |p| {
+                p.element.as_mut().unwrap().zerocheck.ea += F128::ONE
+            }),
+            ("element z_eval", |p| {
+                p.element.as_mut().unwrap().lincheck.z_eval += F128::ONE
+            }),
+            ("element zc round", |p| {
+                p.element.as_mut().unwrap().zerocheck.rounds[0].0 += F128::ONE
+            }),
+            ("element lc round", |p| {
+                p.element.as_mut().unwrap().lincheck.rounds[0].1 += F128::ONE
+            }),
+        ];
+        for (name, mutate) in cases {
+            let mut bad = proof.clone();
+            mutate(&mut bad);
+            assert!(
+                verify(&union, &pcs_params, &commitment, &bad).is_err(),
+                "tampered {name} must be rejected"
+            );
+        }
+    }
+
+    // (f) A missing / extra class sub-proof.
+    {
+        let mut bad = proof.clone();
+        bad.element = None;
+        assert!(matches!(
+            verify(&union, &pcs_params, &commitment, &bad),
+            Err(verifier::VerifyError::ClassMismatch)
+        ));
+        let mut bad = proof.clone();
+        bad.boolean = None;
+        assert!(matches!(
+            verify(&union, &pcs_params, &commitment, &bad),
+            Err(verifier::VerifyError::ClassMismatch)
+        ));
+    }
+
+    // (g) Truncated and bit-flipped proof bytes.
+    {
+        let bytes = bincode::serialize(&proof).expect("serialize");
+        let decoded: R1csProofMixedClassLigerito =
+            bincode::deserialize(&bytes).expect("deserialize");
+        assert_eq!(decoded, proof);
+        assert!(verify(&union, &pcs_params, &commitment, &decoded).is_ok());
+        for frac in [1usize, 2, 4, 8] {
+            let cut = bytes.len() - bytes.len() / frac;
+            match bincode::deserialize::<R1csProofMixedClassLigerito>(&bytes[..cut]) {
+                Err(_) => {}
+                Ok(p) => assert!(
+                    verify(&union, &pcs_params, &commitment, &p).is_err(),
+                    "truncation to {cut} bytes verified"
+                ),
+            }
+        }
+        let n_flips = 16usize;
+        for i in 0..n_flips {
+            let pos = i * (bytes.len() / n_flips);
+            let mut b = bytes.clone();
+            b[pos] ^= 1 << (i % 8);
+            match bincode::deserialize::<R1csProofMixedClassLigerito>(&b) {
+                Err(_) => {}
+                Ok(p) => assert!(
+                    verify(&union, &pcs_params, &commitment, &p).is_err(),
+                    "bit flip at byte {pos} verified"
+                ),
+            }
+        }
+    }
+
+    // (h) A different transcript domain.
+    {
+        let mut ch = FsChallenger::new(b"a-different-domain");
+        assert!(
+            verifier::verify_ligerito_jagged_union_mixed_class(
+                &union,
+                &[circuit],
+                &commitment,
+                &proof,
+                &pcs_params,
+                &mut ch,
+            )
+            .is_err(),
+            "the proof must be bound to its transcript"
+        );
+    }
+}
+
+/// A mixed proof where ONE class has count zero, in both directions. The
+/// zero-count class still occupies its address space (all zero) and its PIOP
+/// still runs — over a domain whose declared support is empty.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn mixed_with_one_class_at_zero_count() {
+    let (nu, kappa) = (7usize, 3usize);
+    let m = mixed_setup(nu, kappa);
+    let circuit = m.blake3_r1cs.csc_lincheck_circuit();
+
+    for (n_bool, n_elem) in [(0usize, 90usize), (100usize, 0usize)] {
+        let union = UnionInstance::new(&m.registry, vec![n_bool, n_elem]);
+        let pcs_params = union_pcs_params(&union);
+        assert_eq!(
+            union.dense_words(),
+            121 * n_bool + m.ty.k() * n_elem,
+            "a zero count contributes no committed words"
+        );
+
+        let mut rng = Rng::new(0x0E1E_0000 + n_bool as u64);
+        let inputs = random_blake3_inputs(&mut rng, n_bool);
+        let z_elem = gate_witness(&m.ty, nu, n_elem, m.w.0, m.w.1, &mut rng);
+
+        let mut ch_p = FsChallenger::new(DOMAIN);
+        let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_mixed_class(
+            &union,
+            &pcs_params,
+            vec![UnionSlotProverInput::new(
+                blake3::generate_witness_batch_major_partial(&inputs, nu),
+                circuit,
+            )],
+            vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
+                dst.copy_from_slice(&z_elem)
+            })],
+            &mut ch_p,
+        );
+        let mut ch_v = FsChallenger::new(DOMAIN);
+        verifier::verify_ligerito_jagged_union_mixed_class(
+            &union,
+            &[circuit],
+            &commitment,
+            &proof,
+            &pcs_params,
+            &mut ch_v,
+        )
+        .unwrap_or_else(|e| panic!("verify rejected (n_bool={n_bool}, n_elem={n_elem}): {e:?}"));
+    }
+}
+
+/// A boolean-only registry proved through the MIXED-CLASS entry must be
+/// transcript-identical to the same registry proved through the plain union
+/// entry: the mixed-class pipeline adds nothing when there is no element
+/// class. Only the proof struct differs (an `Option` wrapper), so the sub-proof
+/// bytes and the claims must match exactly.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn boolean_only_mixed_class_matches_the_plain_entry() {
+    // ν = 8 so a BLAKE3-only registry lands on M = 22, the smallest embedded
+    // Ligerito config (at ν = 7 it would be M = 21, which has none).
+    let nu = 8usize;
+    let blake3_r1cs = blake3::build_block_r1cs(nu);
+    let registry = Registry::new(vec![TableType::from_block_r1cs(&blake3_r1cs)], nu);
+    let n = 100usize;
+    let union = UnionInstance::new(&registry, vec![n]);
+    let pcs_params = union_pcs_params(&union);
+    let circuit = blake3_r1cs.csc_lincheck_circuit();
+    let mut rng = Rng::new(0x0E1E_B001);
+    let inputs = random_blake3_inputs(&mut rng, n);
+
+    let mut ch = FsChallenger::new(DOMAIN);
+    let (plain, cm_plain, claim_plain) = prover::prove_fast_ligerito_jagged_union(
+        &union,
+        &pcs_params,
+        vec![UnionSlotProverInput::new(
+            blake3::generate_witness_batch_major_partial(&inputs, nu),
+            circuit,
+        )],
+        &mut ch,
+    );
+    let tail_plain = ch.sample_f128();
+
+    let mut ch = FsChallenger::new(DOMAIN);
+    let (mixed, cm_mixed, claim_mixed) = prover::prove_fast_ligerito_jagged_union_mixed_class(
+        &union,
+        &pcs_params,
+        vec![UnionSlotProverInput::new(
+            blake3::generate_witness_batch_major_partial(&inputs, nu),
+            circuit,
+        )],
+        Vec::new(),
+        &mut ch,
+    );
+    let tail_mixed = ch.sample_f128();
+
+    assert_eq!(cm_plain.root, cm_mixed.root);
+    assert!(mixed.element.is_none());
+    let b = mixed.boolean.as_ref().expect("boolean sub-proof");
+    assert_eq!(
+        bincode::serialize(&plain.zerocheck).unwrap(),
+        bincode::serialize(&b.zerocheck).unwrap()
+    );
+    assert_eq!(
+        bincode::serialize(&plain.lincheck).unwrap(),
+        bincode::serialize(&b.lincheck).unwrap()
+    );
+    assert_eq!(
+        bincode::serialize(&plain.pcs_open).unwrap(),
+        bincode::serialize(&mixed.pcs_open).unwrap()
+    );
+    assert_eq!(Some(claim_plain), claim_mixed.boolean);
+    assert_eq!(
+        tail_plain, tail_mixed,
+        "post-proof transcript state must match"
+    );
+
+    // …and both verify.
+    let mut ch = FsChallenger::new(DOMAIN);
+    verifier::verify_ligerito_jagged_union_mixed_class(
+        &union,
+        &[circuit],
+        &cm_mixed,
+        &mixed,
+        &pcs_params,
+        &mut ch,
+    )
+    .expect("boolean-only mixed-class proof verifies");
+}
+
+// ---------------------------------------------------------------------------
+// Byte-identity fixtures for the mixed-class wire payload.
+//
+// SHA-256 digests of the serialized proof bundle on deterministic seeded
+// witnesses — the same convention as `union_m6_fixtures`, and the same
+// determinism argument: witness generation is pure, the challenger is
+// Fiat-Shamir, and every parallel reduction is XOR/add in GF(2^128)
+// (associative + commutative), so the digests are stable across runs and
+// thread counts.
+//
+// These pin the mixed-class transcript AS SHIPPED so a later optimization has
+// to prove it changed no value. Regenerate after an INTENTIONAL protocol
+// change with `ELEMENT_FIXTURES_PRINT=1 ... --nocapture`.
+// ---------------------------------------------------------------------------
+
+use sha2 as sha2_hash;
+use sha2_hash::Digest as _;
+
+/// SHA-256 over bincode(proof) ‖ commitment root ‖ the class claim values.
+fn bundle_digest(
+    proof: &R1csProofMixedClassLigerito,
+    commitment: &flock_prover::pcs::Commitment,
+    claims: &flock_core::proof::UnionClassClaims,
+) -> String {
+    let mut h = sha2_hash::Sha256::new();
+    h.update(bincode::serialize(proof).expect("proof serializes"));
+    h.update(commitment.root);
+    let mut absorb = |v: F128| {
+        h.update(v.lo.to_le_bytes());
+        h.update(v.hi.to_le_bytes());
+    };
+    if let Some(b) = &claims.boolean {
+        absorb(b.ab.value);
+        absorb(b.c.value);
+    }
+    if let Some(e) = &claims.element {
+        absorb(e.c_value);
+        absorb(e.lc_value);
+    }
+    let out = h.finalize();
+    out.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn check(label: &str, expected: &str, got: String) {
+    if std::env::var_os("ELEMENT_FIXTURES_PRINT").is_some() {
+        println!("(\"{label}\", \"{got}\"),");
+        return;
+    }
+    assert_eq!(
+        got, expected,
+        "mixed-class byte-identity broken for fixture `{label}`"
+    );
+}
+
+/// Element-only and mixed BLAKE3+element proofs across the utilization ladder.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn mixed_class_proof_bytes_pinned() {
+    // Element-only: nu = 12, kappa = 3 (M = 22).
+    const ELEMENT_ONLY: [(&str, usize, &str); 3] = [
+        ("elem-nu12-full", 1 << 12, "4d0c0c2cb2066016f4251ae2fdbb369c3016b016fb29726e9f1a3af02c94a2a9"),
+        ("elem-nu12-2731", 2731, "9b054ebe8ab29c9733f0aafd9c41b505d5a3a69d8ac045717a30adf04d129cf8"),
+        ("elem-nu12-0", 0, "1a48d112df56c0814c5eaa26a00ed070ec1b503b65ba19a33139ae6b93f52a24"),
+    ];
+    // Mixed: BLAKE3 + element at nu = 7 (M = 22); counts in slot order
+    // (BLAKE3 first — the boolean class leads).
+    const MIXED: [(&str, [usize; 2], &str); 4] = [
+        ("mix-nu7-128-128", [128, 128], "9fcbcdb71c82a935a70e40227d4e3bee0ee3d34aa0a4cb8befe8e60c40b3d723"),
+        ("mix-nu7-100-90", [100, 90], "2b067c25a2d7699cb75e0640fc7900d74c7b3531dbb94d73d834acb51d97de17"),
+        ("mix-nu7-0-90", [0, 90], "54969b84307468c6a15b7f4fb3cabe148fea13123ad8847024af43fb1289dbd0"),
+        ("mix-nu7-100-0", [100, 0], "37857ba1e0c49adc774a0caafe29b77a32ef88adb3b9640d139b18097a01122f"),
+    ];
+
+    let (w0, w1) = (F128::new(0x51F0, 0), F128::new(0, 0x2C7E));
+
+    // ---- element-only ----
+    let (nu, kappa) = (12usize, 3usize);
+    let ty = gate_block(kappa, w0, w1);
+    let registry = Registry::new(vec![TableType::element(ty.clone())], nu);
+    for (label, n, expected) in ELEMENT_ONLY {
+        let union = UnionInstance::new(&registry, vec![n]);
+        let pcs_params = union_pcs_params(&union);
+        let mut rng = Rng::new(0xE1E_0000 ^ n as u64);
+        let z = gate_witness(&ty, nu, n, w0, w1, &mut rng);
+        let mut ch = FsChallenger::new(DOMAIN);
+        let (proof, commitment, claims) = prover::prove_fast_ligerito_jagged_union_mixed_class(
+            &union,
+            &pcs_params,
+            Vec::new(),
+            vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
+                dst.copy_from_slice(&z)
+            })],
+            &mut ch,
+        );
+        check(label, expected, bundle_digest(&proof, &commitment, &claims));
+    }
+
+    // ---- mixed ----
+    let (nu, kappa) = (7usize, 3usize);
+    let m = mixed_setup(nu, kappa);
+    let circuit = m.blake3_r1cs.csc_lincheck_circuit();
+    for (label, counts, expected) in MIXED {
+        let [n_bool, n_elem] = counts;
+        let union = UnionInstance::new(&m.registry, counts.to_vec());
+        let pcs_params = union_pcs_params(&union);
+        let mut rng = Rng::new(0xE1E_1000 ^ ((n_bool as u64) << 16) ^ n_elem as u64);
+        let inputs = random_blake3_inputs(&mut rng, n_bool);
+        let z_elem = gate_witness(&m.ty, nu, n_elem, m.w.0, m.w.1, &mut rng);
+        let mut ch = FsChallenger::new(DOMAIN);
+        let (proof, commitment, claims) = prover::prove_fast_ligerito_jagged_union_mixed_class(
+            &union,
+            &pcs_params,
+            vec![UnionSlotProverInput::new(
+                blake3::generate_witness_batch_major_partial(&inputs, nu),
+                circuit,
+            )],
+            vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
+                dst.copy_from_slice(&z_elem)
+            })],
+            &mut ch,
+        );
+        check(label, expected, bundle_digest(&proof, &commitment, &claims));
+    }
+}

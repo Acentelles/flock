@@ -19,6 +19,12 @@ pub enum VerifyError {
     PcsC(pcs::VerifyError),
     /// The jagged-path batched opening rejected (see [`verify_ligerito_jagged`]).
     PcsJagged(pcs::VerifyErrorJagged),
+    /// The element-region PIOP rejected.
+    Element(crate::element_r1cs::union::VerifyError),
+    /// A mixed-class proof carries a class sub-proof the registry has no type
+    /// for, or omits one it does — the statement and the proof disagree on
+    /// which PIOPs ran.
+    ClassMismatch,
 }
 
 /// Per-phase wall-clock timings (seconds) of a verify, for benchmark cost
@@ -197,6 +203,7 @@ pub fn verify_ligerito_jagged<Ch: Challenger>(
     verify_claims_jagged_ligerito(
         commitment,
         &[ab.clone(), c.clone()],
+        &[],
         &r1cs.jagged_heights(),
         r1cs.n_log(),
         r1cs.m,
@@ -319,6 +326,7 @@ pub fn verify_ligerito_jagged_union_timed<Ch: Challenger>(
     verify_claims_jagged_ligerito(
         commitment,
         &[ab.clone(), c.clone()],
+        &[],
         &union.jagged_heights(),
         union.n_log(),
         union.m_total(),
@@ -472,22 +480,88 @@ pub fn verify_ligerito_jagged_union_merged<Ch: Challenger>(
     Ok(R1csClaim { ab, c })
 }
 
-/// Shared body of the jagged-transport union verify entries; `binding`
-/// selects the statement binding, everything else is identical.
-fn verify_union_with_binding<Ch: Challenger>(
+/// [`verify_ligerito_jagged_union`] for a **mixed-class** proof — the mirror of
+/// `flock_prover::prover::prove_fast_ligerito_jagged_union_mixed_class`.
+///
+/// Replays each class's PIOP over its own region in the prover's Fiat–Shamir
+/// order (boolean zerocheck + lincheck, then the element region's zerocheck +
+/// lincheck), then verifies the single jagged opening with the boolean AB/C
+/// claims ring-switched and the element C/LC claims packed-direct.
+///
+/// A sub-proof must be present exactly when the registry has a type of that
+/// class; a mismatch is a rejection, not a panic. `circuits` are the
+/// per-BOOLEAN-type lincheck circuits, in slot order.
+pub fn verify_ligerito_jagged_union_mixed_class<Ch: Challenger>(
+    union: &crate::union::UnionInstance<'_>,
+    circuits: &[&dyn lincheck::LincheckCircuit],
+    commitment: &Commitment,
+    proof: &crate::proof::R1csProofMixedClassLigerito,
+    pcs_params: &crate::pcs::PcsParams,
+    challenger: &mut Ch,
+) -> Result<crate::proof::UnionClassClaims, VerifyError> {
+    if proof.boolean.is_some() != (union.num_boolean() > 0)
+        || proof.element.is_some() != union.has_element()
+    {
+        return Err(VerifyError::ClassMismatch);
+    }
+    let (claims, packed_direct_points) = verify_union_piops(
+        union,
+        UnionVerifyBinding::Mixed,
+        circuits,
+        commitment,
+        proof.boolean.as_ref(),
+        proof.element.as_ref(),
+        pcs_params,
+        challenger,
+    )?;
+    let z_claims: Vec<ZClaim> = claims
+        .boolean
+        .as_ref()
+        .map(|c| vec![c.ab.clone(), c.c.clone()])
+        .unwrap_or_default();
+    let refs: Vec<pcs::PackedDirectClaimRef<'_>> = packed_direct_points
+        .iter()
+        .map(|(point, value)| pcs::PackedDirectClaimRef {
+            point,
+            value: *value,
+        })
+        .collect();
+    verify_claims_jagged_ligerito(
+        commitment,
+        &z_claims,
+        &refs,
+        &union.jagged_heights(),
+        union.n_log(),
+        union.m_total(),
+        &proof.pcs_open,
+        pcs_params,
+        challenger,
+    )
+    .map_err(VerifyError::PcsJagged)?;
+    Ok(claims)
+}
+
+/// Shared PIOP replay for both union verify shapes: statement binding, the
+/// boolean class's zerocheck + lincheck over the `M_bool` prefix subcube, then
+/// the element region's PIOP. Returns the per-class claims and the element
+/// class's `(point, value)` pairs for the packed-direct intake.
+///
+/// Runs on the 1-thread verifier pool, like every other verify core.
+#[allow(clippy::too_many_arguments)]
+fn verify_union_piops<Ch: Challenger>(
     union: &crate::union::UnionInstance<'_>,
     binding: UnionVerifyBinding<'_>,
     circuits: &[&dyn lincheck::LincheckCircuit],
     commitment: &Commitment,
-    proof: &R1csProofJaggedLigerito,
+    boolean: Option<&crate::proof::BooleanPiopProof>,
+    element: Option<&crate::element_r1cs::union::Proof>,
     pcs_params: &crate::pcs::PcsParams,
     challenger: &mut Ch,
-) -> Result<R1csClaim, VerifyError> {
+) -> Result<(crate::proof::UnionClassClaims, Vec<(Vec<F128>, F128)>), VerifyError> {
     // The commitment is to the DENSE stack q (M4/M5): PcsParams.m is the
     // dense variable count — count-dependent under height-n_t stacking,
     // derived from the declared counts — while the PIOP and the
-    // virtual-opening sumcheck run over the M-variable padded address
-    // space.
+    // virtual-opening sumcheck run over the M-variable padded address space.
     assert_eq!(
         pcs_params.m,
         union.dense_m(),
@@ -510,7 +584,8 @@ fn verify_union_with_binding<Ch: Challenger>(
     }
     // Verification is single-threaded; run the PIOP replay on the dedicated
     // 1-thread pool (verify_claims_jagged_ligerito installs it itself).
-    let (ab, c) = verifier_pool().install(|| -> Result<(ZClaim, ZClaim), VerifyError> {
+    type PiopOut = (crate::proof::UnionClassClaims, Vec<(Vec<F128>, F128)>);
+    verifier_pool().install(|| -> Result<PiopOut, VerifyError> {
         match binding {
             UnionVerifyBinding::Mixed => union.bind_statement(challenger, commitment),
             UnionVerifyBinding::SingleTypeHarness(slot_r1cs) => {
@@ -519,43 +594,109 @@ fn verify_union_with_binding<Ch: Challenger>(
             }
         }
 
-        // The boolean PIOP runs over the BOOLEAN REGION only — the prefix
-        // subcube `[0, 2^M_bool)`, `M_bool = M` for a boolean-only registry.
-        // (The element region cannot join this sum: `c = z` there.)
-        let zc_claim = zerocheck::verify(union.m_bool(), &proof.zerocheck, challenger)
-            .map_err(VerifyError::Zerocheck)?;
-        let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
-        // The union-column lincheck (one circuit per BOOLEAN slot, in slot
-        // order); the declared counts additionally bind through the per-type
-        // const-pin target terms.
-        let lc_claim = lincheck::verify_union(
-            union,
-            circuits,
-            &x_ab,
-            zc_claim.a_eval,
-            zc_claim.b_eval,
-            &proof.lincheck,
-            challenger,
-        )
-        .map_err(VerifyError::Lincheck)?;
+        let bool_claim = match boolean {
+            Some(piop) => {
+                // The boolean PIOP runs over the BOOLEAN REGION only — the
+                // prefix subcube `[0, 2^M_bool)`, `M_bool = M` for a
+                // boolean-only registry. (The element region cannot join this
+                // sum: `c = z` there.)
+                let zc_claim = zerocheck::verify(union.m_bool(), &piop.zerocheck, challenger)
+                    .map_err(VerifyError::Zerocheck)?;
+                let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
+                // The union-column lincheck (one circuit per BOOLEAN slot, in
+                // slot order); the declared counts additionally bind through
+                // the per-type const-pin target terms.
+                let lc_claim = lincheck::verify_union(
+                    union,
+                    circuits,
+                    &x_ab,
+                    zc_claim.a_eval,
+                    zc_claim.b_eval,
+                    &piop.lincheck,
+                    challenger,
+                )
+                .map_err(VerifyError::Lincheck)?;
+                Some(R1csClaim {
+                    ab: ZClaim {
+                        point: union.ab_claim_point(
+                            lc_claim.r_inner_skip,
+                            &lc_claim.r_inner_rest,
+                            &x_ab.x_outer,
+                        ),
+                        value: lc_claim.w,
+                    },
+                    c: ZClaim {
+                        point: union.c_claim_point(zc_claim.z, &zc_claim.r_rest),
+                        value: zc_claim.c_eval,
+                    },
+                })
+            }
+            None => None,
+        };
 
-        let ab = ZClaim {
-            point: union.ab_claim_point(
-                lc_claim.r_inner_skip,
-                &lc_claim.r_inner_rest,
-                &x_ab.x_outer,
+        let el_claim = match element {
+            Some(p) => Some(
+                crate::element_r1cs::union::verify(union, p, challenger)
+                    .map_err(VerifyError::Element)?,
             ),
-            value: lc_claim.w,
+            None => None,
         };
-        let c = ZClaim {
-            point: union.c_claim_point(zc_claim.z, &zc_claim.r_rest),
-            value: zc_claim.c_eval,
-        };
-        Ok((ab, c))
-    })?;
+        let packed_direct = el_claim
+            .as_ref()
+            .map(|c: &crate::element_r1cs::union::Claims| {
+                vec![
+                    (c.c_point.clone(), c.c_value),
+                    (c.lc_point.clone(), c.lc_value),
+                ]
+            })
+            .unwrap_or_default();
+
+        Ok((
+            crate::proof::UnionClassClaims {
+                boolean: bool_claim,
+                element: el_claim,
+            },
+            packed_direct,
+        ))
+    })
+}
+
+/// Shared body of the jagged-transport union verify entries; `binding`
+/// selects the statement binding, everything else is identical.
+fn verify_union_with_binding<Ch: Challenger>(
+    union: &crate::union::UnionInstance<'_>,
+    binding: UnionVerifyBinding<'_>,
+    circuits: &[&dyn lincheck::LincheckCircuit],
+    commitment: &Commitment,
+    proof: &R1csProofJaggedLigerito,
+    pcs_params: &crate::pcs::PcsParams,
+    challenger: &mut Ch,
+) -> Result<R1csClaim, VerifyError> {
+    assert!(
+        !union.has_element(),
+        "this entry consumes R1csProofJaggedLigerito (boolean classes only); \
+         element registries go through verify_ligerito_jagged_union_mixed_class"
+    );
+    let piop = crate::proof::BooleanPiopProof {
+        zerocheck: proof.zerocheck.clone(),
+        lincheck: proof.lincheck.clone(),
+    };
+    let (claims, packed_direct) = verify_union_piops(
+        union,
+        binding,
+        circuits,
+        commitment,
+        Some(&piop),
+        None,
+        pcs_params,
+        challenger,
+    )?;
+    debug_assert!(packed_direct.is_empty());
+    let claim = claims.boolean.expect("boolean sub-proof was supplied");
     verify_claims_jagged_ligerito(
         commitment,
-        &[ab.clone(), c.clone()],
+        &[claim.ab.clone(), claim.c.clone()],
+        &[],
         &union.jagged_heights(),
         union.n_log(),
         union.m_total(),
@@ -564,7 +705,7 @@ fn verify_union_with_binding<Ch: Challenger>(
         challenger,
     )
     .map_err(VerifyError::PcsJagged)?;
-    Ok(R1csClaim { ab, c })
+    Ok(claim)
 }
 
 /// Verify a jagged-path batched PCS opening over an arbitrary list of
@@ -582,6 +723,7 @@ fn verify_union_with_binding<Ch: Challenger>(
 pub fn verify_claims_jagged_ligerito<Ch: Challenger>(
     commitment: &Commitment,
     claims: &[ZClaim],
+    packed_direct: &[pcs::PackedDirectClaimRef<'_>],
     heights: &[u64],
     n_log: usize,
     virtual_m: usize,
@@ -614,7 +756,7 @@ pub fn verify_claims_jagged_ligerito<Ch: Challenger>(
             &values,
             &z_skips,
             &x_refs,
-            &[],
+            packed_direct,
             heights,
             n_log,
             virtual_m - pcs::LOG_PACKING,
