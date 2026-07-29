@@ -12,6 +12,10 @@
 //! Workspace-wide Clippy `allow`s for the hand-tuned numeric kernels are
 //! declared in `[workspace.lints.clippy]` at the repo root.
 
+// `u64::isolate_lowest_one` in the chain bit walker — still unstable on the
+// installed toolchains.
+#![feature(isolate_most_least_significant_one)]
+
 pub use flock_core::*;
 
 pub mod chain;

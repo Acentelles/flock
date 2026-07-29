@@ -17,6 +17,10 @@
 //! Workspace-wide Clippy `allow`s for the hand-tuned numeric kernels are
 //! declared in `[workspace.lints.clippy]` at the repo root.
 
+// `u{32,64}::isolate_lowest_one` in the NTT inverse tables and the sparse
+// zerocheck round — still unstable on the installed toolchains.
+#![feature(isolate_most_least_significant_one)]
+
 pub mod bits;
 pub mod challenger;
 pub mod field;
