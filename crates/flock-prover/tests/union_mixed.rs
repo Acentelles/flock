@@ -1288,13 +1288,39 @@ fn merged_capacity_attribution() {
         // prewarm their own size). One largest-tier prewarm up front left
         // the smaller tiers' pool classes empty, measuring a mixed-size
         // pool scenario production never runs.
-        flock_core::scratch::prewarm_prover(registry.m_total());
+        //
+        // `FLOCK_PROBE_PREWARM=0` skips it. The merged path has NO production
+        // prewarm call of its own, and `prewarm_prover` sizes its whole set
+        // off the padded `m` — at nu = 18 that is 5x2^28 + 11x2^27 = 45 GB
+        // first-touched on a 36 GB box. The knob measures how much of the
+        // high-tier capacity cost is that prewarm rather than the prove.
         let s2_circuit = sha2_r1cs.csc_lincheck_circuit();
         let b3_circuit = blake3_r1cs.csc_lincheck_circuit();
         let union = UnionInstance::new(registry, COUNTS.to_vec());
+        match std::env::var("FLOCK_PROBE_PREWARM").as_deref() {
+            Ok("0") => {}
+            // The old shape: whole set sized off the PADDED m. Kept behind the
+            // knob as the A/B arm that shows why it is wrong above nu = 16.
+            Ok("m") => flock_core::scratch::prewarm_prover(registry.m_total()),
+            _ => flock_core::scratch::prewarm_prover_union(registry.m_total(), union.dense_m()),
+        }
         let pcs_params = union_pcs_params(&union);
+        // Timed passes, `FLOCK_PROBE_PASSES` (default 3; pass 0 is an untimed
+        // warm-up). One prove is ~0.13 s while a fresh process costs ~0.9 s of
+        // untimed setup, so extra passes buy samples ~7x cheaper than extra
+        // invocations. The noise on this box is background CPU contention,
+        // which only ever INFLATES a sample — so the estimator is the MINIMUM
+        // and more samples strictly help. Long inter-process cooldowns do not:
+        // they were sized for a heat model that the gate disproved (it returns
+        // to the cold band with zero cooldown).
+        let passes: usize = std::env::var("FLOCK_PROBE_PASSES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
         let mut best = f64::INFINITY;
-        for pass in 0..3 {
+        let mut cold = f64::NAN;
+        let mut all = Vec::with_capacity(passes);
+        for pass in 0..passes {
             let slots = vec![
                 UnionSlotProverInput::in_place(
                     |dst| sha2::generate_witness_batch_major_partial_into(&sha2_inputs, nu, dst),
@@ -1316,13 +1342,27 @@ fn merged_capacity_attribution() {
                 &mut ch,
             );
             let ms = t.elapsed().as_secs_f64() * 1e3;
-            if pass > 0 {
+            if pass == 0 {
+                // The genuine ONE-SHOT cost: nothing resident, every buffer
+                // first-touched. Excluded from `best` (it always loses) but
+                // reported — for a CLI prove it is the only number that is
+                // real, and at high capacity it is far the largest of the three
+                // regimes this probe can distinguish.
+                cold = ms;
+            } else {
                 best = best.min(ms);
+                all.push(ms);
             }
         }
+        // Per-pass times too: the spread within one invocation is the cheapest
+        // contamination check there is (a clean run's passes cluster; a
+        // contended one shows fliers well above the minimum).
+        let spread: Vec<String> = all.iter().map(|v| format!("{v:.1}")).collect();
         println!(
-            "merged nu = {nu} (M = {}): {best:.1} ms (best of 2)",
-            union.m_total()
+            "merged nu = {nu} (M = {}): cold {cold:.1} | min {best:.1} (of {}) [{}]",
+            union.m_total(),
+            all.len(),
+            spread.join(" ")
         );
     }
 }
