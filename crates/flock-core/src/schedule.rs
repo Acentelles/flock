@@ -305,9 +305,10 @@ impl Registry {
         // starts past `2^M_bool` (not past the tighter `bool_extent`), rounded
         // up to its own alignment. Both are powers of two, so this is
         // `2^max(M_bool, M_elem)` — and `0` with no boolean types.
-        let element_base = if elem_extent == 0 {
-            0
-        } else if bool_extent == 0 {
+        // With no element types the base is meaningless (0); with no boolean
+        // types the element region starts at 0 and IS the prefix subcube, so
+        // an element-only registry wastes no address space.
+        let element_base = if elem_extent == 0 || bool_extent == 0 {
             0
         } else {
             1usize << m_bool.max(m_elem)

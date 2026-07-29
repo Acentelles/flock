@@ -66,7 +66,81 @@ use crate::lincheck::{
 };
 use crate::zerocheck::univariate_skip::build_eq;
 
-const LABEL: &[u8] = b"flock-element-lc-v0";
+/// Domain label of the standalone single-table lincheck. The union's
+/// element-region lincheck runs the same sumcheck core under its own label
+/// (see [`column_sumcheck_prove`] / [`column_sumcheck_replay`]).
+pub const LABEL: &[u8] = b"flock-element-lc-v0";
+
+// ---------------------------------------------------------------------------
+// The shared product-sumcheck core. Both element linchecks — the standalone
+// one below and the union's element-region one (`super::union`) — reduce the
+// SAME shape: a length-`2^rounds` weight vector against a length-`2^rounds`
+// row-collapsed witness vector. Factored rather than copy-pasted: this
+// codebase has a documented drift bug from duplicated sumcheck loops.
+// ---------------------------------------------------------------------------
+
+/// Run the product sumcheck `Σ_c comb[c]·g[c]`, binding the TOP remaining
+/// variable each round. Consumes both vectors down to length 1 and returns the
+/// per-round `(q(1), q(∞))` messages plus the challenges **in binding order**
+/// (top variable first); `g[0]` afterwards is `ĝ(r'_col)`.
+///
+/// `rounds = log2(comb.len())`. The `rounds == 0` case (a one-column block) is
+/// a no-op: the "sumcheck" is the bare claim.
+pub(crate) fn column_sumcheck_prove<C: Challenger>(
+    comb: &mut Vec<F128>,
+    g: &mut Vec<F128>,
+    ch: &mut C,
+) -> (Vec<(F128, F128)>, Vec<F128>) {
+    debug_assert_eq!(comb.len(), g.len());
+    let rounds = comb.len().trailing_zeros() as usize;
+    debug_assert_eq!(comb.len(), 1usize << rounds);
+    let mut msgs = Vec::with_capacity(rounds);
+    let mut challenges = Vec::with_capacity(rounds);
+    if rounds == 0 {
+        return (msgs, challenges);
+    }
+    // Round 0's message is the only standalone pass; every later message
+    // falls out of binding the previous round.
+    let (mut e1, mut einf) = sumcheck_round_eval_par(comb, g);
+    for t in 0..rounds {
+        ch.observe_f128(e1);
+        ch.observe_f128(einf);
+        let rho = ch.sample_f128();
+        msgs.push((e1, einf));
+        challenges.push(rho);
+        if t + 1 < rounds {
+            let (n1, ninf) = sumcheck_bind_both_and_eval_next(comb, g, rho);
+            e1 = n1;
+            einf = ninf;
+        } else {
+            sumcheck_bind_top_in_place_par(comb, rho);
+            sumcheck_bind_top_in_place_par(g, rho);
+        }
+    }
+    (msgs, challenges)
+}
+
+/// Verifier mirror of [`column_sumcheck_prove`]: replay the rounds from
+/// `target` and return the residual claim plus the challenges in binding order.
+/// `q(0) = running + q(1)` in char 2, then `q(X) = einf·X² + c1·X + q(0)`.
+pub(crate) fn column_sumcheck_replay<C: Challenger>(
+    target: F128,
+    rounds: &[(F128, F128)],
+    ch: &mut C,
+) -> (F128, Vec<F128>) {
+    let mut running = target;
+    let mut challenges = Vec::with_capacity(rounds.len());
+    for &(e1, einf) in rounds {
+        ch.observe_f128(e1);
+        ch.observe_f128(einf);
+        let rho = ch.sample_f128();
+        let e0 = running + e1;
+        let c1 = e0 + e1 + einf;
+        running = einf * rho * rho + c1 * rho + e0;
+        challenges.push(rho);
+    }
+    (running, challenges)
+}
 
 /// Round messages plus the output witness claim value.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,29 +209,9 @@ pub fn prove<C: Challenger>(
         "lincheck target must be the honest weighted inner product"
     );
 
-    // Product sumcheck over the column variables, top variable first. Round 0's
-    // message is the only standalone pass; every later message falls out of
-    // binding the previous round (see `sumcheck_bind_both_and_eval_next`).
-    let mut rounds = Vec::with_capacity(kappa);
-    let mut r_rounds = Vec::with_capacity(kappa);
-    if kappa > 0 {
-        let (mut e1, mut einf) = sumcheck_round_eval_par(&comb, &zc);
-        for t in 0..kappa {
-            ch.observe_f128(e1);
-            ch.observe_f128(einf);
-            let rho = ch.sample_f128();
-            rounds.push((e1, einf));
-            r_rounds.push(rho);
-            if t + 1 < kappa {
-                let (n1, ninf) = sumcheck_bind_both_and_eval_next(&mut comb, &mut zc, rho);
-                e1 = n1;
-                einf = ninf;
-            } else {
-                sumcheck_bind_top_in_place_par(&mut comb, rho);
-                sumcheck_bind_top_in_place_par(&mut zc, rho);
-            }
-        }
-    }
+    // The shared product sumcheck over the column variables, top first.
+    let (rounds, r_rounds) = column_sumcheck_prove(&mut comb, &mut zc, ch);
+    debug_assert_eq!(r_rounds.len(), kappa);
     debug_assert_eq!(zc.len(), 1);
     let z_eval = zc[0];
 
@@ -197,19 +251,8 @@ pub fn verify<C: Challenger>(
     ch.observe_label(LABEL);
     let alpha = ch.sample_f128();
 
-    // Replay the product sumcheck. `q(0) = running + q(1)` in char 2, then
-    // `q(X) = einf·X² + c1·X + q(0)`. Same chain as `crate::lincheck::verify`.
-    let mut running = va + alpha * vb;
-    let mut r_rounds = Vec::with_capacity(kappa);
-    for &(e1, einf) in &proof.rounds {
-        ch.observe_f128(e1);
-        ch.observe_f128(einf);
-        let rho = ch.sample_f128();
-        let e0 = running + e1;
-        let c1 = e0 + e1 + einf;
-        running = einf * rho * rho + c1 * rho + e0;
-        r_rounds.push(rho);
-    }
+    // Replay the shared product sumcheck.
+    let (running, r_rounds) = column_sumcheck_replay(va + alpha * vb, &proof.rounds, ch);
     let (r_row, r_con) = r.split_at(n_log);
     let r_prime = claim_point(r_row, r_rounds);
 

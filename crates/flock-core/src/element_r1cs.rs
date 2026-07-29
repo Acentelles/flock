@@ -64,6 +64,7 @@
 //! lincheck rounds → γ-batched opening.
 
 pub mod lincheck;
+pub mod union;
 pub mod zerocheck;
 
 use std::sync::OnceLock;
@@ -368,22 +369,38 @@ impl ElementTableType {
     ///
     /// Output layout matches the input: `az[(y << n_log) + j] = A_0[y]·z_j`.
     pub fn apply(&self, z: &[F128], n_log: usize) -> (Vec<F128>, Vec<F128>) {
-        let rows = 1usize << n_log;
         assert_eq!(z.len(), self.width() << n_log, "witness length");
-        let gather = |m: &SparseF128Matrix| {
-            use rayon::prelude::*;
-            let mut out = crate::alloc_zeroed_vec::<F128>(z.len());
-            out.par_chunks_mut(rows).enumerate().for_each(|(y, dst)| {
-                for &(col, coeff) in &m.rows[y] {
-                    let src = &z[col << n_log..(col << n_log) + rows];
-                    for (d, s) in dst.iter_mut().zip(src) {
-                        *d += coeff * *s;
-                    }
-                }
-            });
-            out
-        };
-        (gather(&self.a_0), gather(&self.b_0))
+        // `gather_into` seeds every slot before accumulating, so uninitialized
+        // is fine here — no memset tax.
+        let mut az = crate::alloc_uninit_vec::<F128>(z.len());
+        let mut bz = crate::alloc_uninit_vec::<F128>(z.len());
+        gather_into(&self.a_0, z, n_log, None, &mut az);
+        gather_into(&self.b_0, z, n_log, None, &mut bz);
+        (az, bz)
+    }
+
+    /// `pa = A_0·z + a_const` and `pb = B_0·z + b_const` written into
+    /// caller-supplied buffers — the two tables the zerocheck consumes, in one
+    /// pass each and with no allocation. Same sparse gather as [`Self::apply`]
+    /// (one shared kernel, so the two cannot drift), with the row-uniform
+    /// constant seeded into the accumulator instead of broadcast afterwards;
+    /// F128 addition is XOR, so the result is bit-identical to
+    /// `apply` + [`broadcast_add`].
+    ///
+    /// This is the in-place path the union's element witness assembly uses:
+    /// the destinations are slices of the padded union `a`/`b` buffers.
+    pub fn affine_products_into(
+        &self,
+        z: &[F128],
+        n_log: usize,
+        pa: &mut [F128],
+        pb: &mut [F128],
+    ) {
+        assert_eq!(z.len(), self.width() << n_log, "witness length");
+        assert_eq!(pa.len(), z.len(), "pa length");
+        assert_eq!(pb.len(), z.len(), "pb length");
+        gather_into(&self.a_0, z, n_log, Some(&self.a_const), pa);
+        gather_into(&self.b_0, z, n_log, Some(&self.b_const), pb);
     }
 
     /// Brute-force check that every row `j < n` satisfies the relation and that
@@ -411,6 +428,32 @@ impl ElementTableType {
         }
         true
     }
+}
+
+/// The shared sparse-gather kernel: `out[(y << n_log) + j] = M[y]·z_j + c[y]`,
+/// one pass per stored matrix entry per row (`O(nnz · 2^n_log)`, no matrix
+/// application on any hot path). `c = None` means no constant. Parallel over
+/// the output's `2^n_log`-word column chunks, which are disjoint.
+fn gather_into(
+    m: &SparseF128Matrix,
+    z: &[F128],
+    n_log: usize,
+    c: Option<&[F128]>,
+    out: &mut [F128],
+) {
+    use rayon::prelude::*;
+    let rows = 1usize << n_log;
+    debug_assert_eq!(out.len(), m.num_rows << n_log);
+    out.par_chunks_mut(rows).enumerate().for_each(|(y, dst)| {
+        let seed = c.map_or(F128::ZERO, |c| c[y]);
+        dst.fill(seed);
+        for &(col, coeff) in &m.rows[y] {
+            let src = &z[col << n_log..(col << n_log) + rows];
+            for (d, s) in dst.iter_mut().zip(src) {
+                *d += coeff * *s;
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -688,7 +731,7 @@ pub fn prove<C: Challenger>(
     let (mut pa, mut pb) = stmt.ty.apply(z, stmt.n_log);
     broadcast_add(&mut pa, stmt.ty.a_const(), stmt.n_log);
     broadcast_add(&mut pb, stmt.ty.b_const(), stmt.n_log);
-    let (zc_proof, zc_claim) = zerocheck::prove(pa, pb, z, stmt.n_log, stmt.ty.kappa(), ch);
+    let (zc_proof, zc_claim) = zerocheck::prove(pa, pb, z, m_words, ch);
 
     // ---- 3. Phase 2: batched lincheck. ----
     //
@@ -757,7 +800,7 @@ pub fn verify<C: Challenger>(
     };
     stmt.bind(&commitment.root, ch);
 
-    let zc_claim = zerocheck::verify(stmt.n_log, stmt.ty.kappa(), &proof.zerocheck, ch)
+    let zc_claim = zerocheck::verify(m_words, &proof.zerocheck, ch)
         .map_err(VerifyError::Zerocheck)?;
     let (va, vb) = strip_constants(stmt.ty, &zc_claim);
     let lc_claim = lincheck::verify(
@@ -1502,7 +1545,7 @@ mod e2e_tests {
 
         let mut ch = FsChallenger::new(b"element-smoke");
         let t_zc = std::time::Instant::now();
-        let (_zc_proof, zc_claim) = zerocheck::prove(pa, pb, &z, n_log, kappa, &mut ch);
+        let (_zc_proof, zc_claim) = zerocheck::prove(pa, pb, &z, n_log + kappa, &mut ch);
         let zc_ms = t_zc.elapsed().as_secs_f64() * 1e3;
 
         let (va, vb) = strip_constants(&ty, &zc_claim);

@@ -36,7 +36,10 @@ use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::zerocheck::univariate_skip::SplitEqGhash;
 
-const LABEL: &[u8] = b"flock-element-zc-v0";
+/// Domain label of the standalone single-table zerocheck. The union's
+/// element-region zerocheck runs the same protocol under its own label — see
+/// [`prove_with_label`].
+pub const LABEL: &[u8] = b"flock-element-zc-v0";
 
 /// The prover's round messages plus the three final evaluations.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,18 +89,32 @@ pub fn prove<C: Challenger>(
     pa: Vec<F128>,
     pb: Vec<F128>,
     z: &[F128],
-    n_log: usize,
-    kappa: usize,
+    m_words: usize,
     ch: &mut C,
 ) -> (Proof, Claim) {
-    let m_words = n_log + kappa;
+    prove_with_label(LABEL, pa, pb, z, m_words, ch)
+}
+
+/// [`prove`] under a caller-chosen domain label. The union's element-region
+/// zerocheck is exactly this protocol over `M_elem − 7` region word variables
+/// — the relation is block-diagonal across element slots, so the eq weight
+/// batches them implicitly and the gaps (where `pa = pb = z = 0`) contribute
+/// nothing.
+pub fn prove_with_label<C: Challenger>(
+    label: &[u8],
+    pa: Vec<F128>,
+    pb: Vec<F128>,
+    z: &[F128],
+    m_words: usize,
+    ch: &mut C,
+) -> (Proof, Claim) {
     let n_words = 1usize << m_words;
     assert_eq!(pa.len(), n_words, "pa length");
     assert_eq!(pb.len(), n_words, "pb length");
     assert_eq!(z.len(), n_words, "z length");
     assert!(m_words >= 1, "need at least one variable");
 
-    ch.observe_label(LABEL);
+    ch.observe_label(label);
     let tau = ch.sample_f128_vec(m_words);
 
     let (mut wa, mut wb) = (pa, pb);
@@ -141,12 +158,21 @@ pub fn prove<C: Challenger>(
 /// Verify a zerocheck proof over `n_log + kappa` variables, walking the
 /// challenger in lockstep with [`prove`].
 pub fn verify<C: Challenger>(
-    n_log: usize,
-    kappa: usize,
+    m_words: usize,
     proof: &Proof,
     ch: &mut C,
 ) -> Result<Claim, VerifyError> {
-    let m_words = n_log + kappa;
+    verify_with_label(LABEL, m_words, proof, ch)
+}
+
+/// [`verify`] under a caller-chosen domain label — mirror of
+/// [`prove_with_label`].
+pub fn verify_with_label<C: Challenger>(
+    label: &[u8],
+    m_words: usize,
+    proof: &Proof,
+    ch: &mut C,
+) -> Result<Claim, VerifyError> {
     if proof.rounds.len() != m_words {
         return Err(VerifyError::BadRoundCount {
             expected: m_words,
@@ -154,7 +180,7 @@ pub fn verify<C: Challenger>(
         });
     }
 
-    ch.observe_label(LABEL);
+    ch.observe_label(label);
     let tau = ch.sample_f128_vec(m_words);
 
     // Convention A chain, identical in shape to `crate::zerocheck::verify`: the
@@ -389,11 +415,10 @@ mod tests {
             let pb: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
             let z: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
 
-            // n_log/kappa only split the point; the sumcheck sees m_words.
-            let n_log = m_words / 2;
-            let kappa = m_words - n_log;
+            // The row/column split only matters to the caller; the sumcheck
+            // itself sees `m_words` variables and nothing else.
             let mut ch = FsChallenger::new(b"element-zc-diff");
-            let (proof, claim) = prove(pa.clone(), pb.clone(), &z, n_log, kappa, &mut ch);
+            let (proof, claim) = prove(pa.clone(), pb.clone(), &z, m_words, &mut ch);
 
             // Re-derive τ the way the prover did.
             let mut ch2 = FsChallenger::new(b"element-zc-diff");
@@ -433,9 +458,9 @@ mod tests {
             let (pa, pb) = prepare(&ty, &z, n_log);
 
             let mut ch_p = FsChallenger::new(b"element-zc-rt");
-            let (proof, claim_p) = prove(pa, pb, &z, n_log, 2, &mut ch_p);
+            let (proof, claim_p) = prove(pa, pb, &z, n_log + 2, &mut ch_p);
             let mut ch_v = FsChallenger::new(b"element-zc-rt");
-            let claim_v = verify(n_log, 2, &proof, &mut ch_v)
+            let claim_v = verify(n_log + 2, &proof, &mut ch_v)
                 .unwrap_or_else(|e| panic!("verify rejected at n_log={n_log} n={n}: {e:?}"));
             assert_eq!(claim_p, claim_v, "n_log={n_log} n={n}");
         }
@@ -454,10 +479,10 @@ mod tests {
         let (pa, pb) = prepare(&ty, &z, n_log);
 
         let mut ch_p = FsChallenger::new(b"element-zc-bad");
-        let (proof, _) = prove(pa, pb, &z, n_log, 2, &mut ch_p);
+        let (proof, _) = prove(pa, pb, &z, n_log + 2, &mut ch_p);
         let mut ch_v = FsChallenger::new(b"element-zc-bad");
         assert_eq!(
-            verify(n_log, 2, &proof, &mut ch_v),
+            verify(n_log + 2, &proof, &mut ch_v),
             Err(VerifyError::SumcheckFinalFailed)
         );
     }
@@ -475,9 +500,9 @@ mod tests {
         let (pa, pb) = prepare(&ty, &z, n_log);
 
         let mut ch_p = FsChallenger::new(b"element-zc-dirty");
-        let (proof, _) = prove(pa, pb, &z, n_log, 2, &mut ch_p);
+        let (proof, _) = prove(pa, pb, &z, n_log + 2, &mut ch_p);
         let mut ch_v = FsChallenger::new(b"element-zc-dirty");
-        assert!(verify(n_log, 2, &proof, &mut ch_v).is_err());
+        assert!(verify(n_log + 2, &proof, &mut ch_v).is_err());
     }
 
     /// Every proof component must be transcript-bound: flipping a bit anywhere
@@ -490,7 +515,7 @@ mod tests {
         let z = mult_witness(&ty, n_log, 13, &mut rng);
         let (pa, pb) = prepare(&ty, &z, n_log);
         let mut ch_p = FsChallenger::new(b"element-zc-mut");
-        let (proof, _) = prove(pa, pb, &z, n_log, kappa, &mut ch_p);
+        let (proof, _) = prove(pa, pb, &z, n_log + kappa, &mut ch_p);
 
         let n_rounds = proof.rounds.len();
         let mut cases: Vec<(String, Proof)> = Vec::new();
@@ -517,7 +542,7 @@ mod tests {
         for (name, bad) in cases {
             let mut ch = FsChallenger::new(b"element-zc-mut");
             assert!(
-                verify(n_log, kappa, &bad, &mut ch).is_err(),
+                verify(n_log + kappa, &bad, &mut ch).is_err(),
                 "verify accepted mutation: {name}"
             );
         }
@@ -541,10 +566,10 @@ mod tests {
         let z = mult_witness(&ty, n_log, 13, &mut rng);
         let (pa, pb) = prepare(&ty, &z, n_log);
         let mut ch_p = FsChallenger::new(b"element-zc-bind");
-        let (proof, _) = prove(pa, pb, &z, n_log, kappa, &mut ch_p);
+        let (proof, _) = prove(pa, pb, &z, n_log + kappa, &mut ch_p);
 
         let mut ch_honest = FsChallenger::new(b"element-zc-bind");
-        assert!(verify(n_log, kappa, &proof, &mut ch_honest).is_ok());
+        assert!(verify(n_log + kappa, &proof, &mut ch_honest).is_ok());
         let alpha_honest = ch_honest.sample_f128();
 
         let t = F128::new(3, 0);
@@ -553,7 +578,7 @@ mod tests {
         bad.eb = proof.eb * t.inv();
         let mut ch_bad = FsChallenger::new(b"element-zc-bind");
         assert!(
-            verify(n_log, kappa, &bad, &mut ch_bad).is_ok(),
+            verify(n_log + kappa, &bad, &mut ch_bad).is_ok(),
             "product-preserving swap is invisible to the zerocheck's own check"
         );
         assert_ne!(
@@ -572,11 +597,11 @@ mod tests {
         let z = mult_witness(&ty, n_log, 4, &mut rng);
         let (pa, pb) = prepare(&ty, &z, n_log);
         let mut ch_p = FsChallenger::new(b"element-zc-shape");
-        let (mut proof, _) = prove(pa, pb, &z, n_log, kappa, &mut ch_p);
+        let (mut proof, _) = prove(pa, pb, &z, n_log + kappa, &mut ch_p);
         proof.rounds.pop();
         let mut ch = FsChallenger::new(b"element-zc-shape");
         assert!(matches!(
-            verify(n_log, kappa, &proof, &mut ch),
+            verify(n_log + kappa, &proof, &mut ch),
             Err(VerifyError::BadRoundCount { .. })
         ));
     }
