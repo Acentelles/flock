@@ -37,6 +37,8 @@ use crate::lincheck::QuirkyPoint;
 use crate::pcs::Commitment;
 use crate::r1cs::{BlockR1cs, WitnessLayout};
 use crate::schedule::{Instance, Registry, TableType};
+#[cfg(test)]
+use crate::schedule::TableClass;
 use crate::zerocheck::{K_SKIP, PaddingSpec};
 
 /// Floor of the committed dense-stack size, as a bit-variable count: the
@@ -884,6 +886,7 @@ mod tests {
             b_0: stub(),
             c_0: stub(),
             const_pin: None,
+            class: TableClass::Boolean,
         }
     }
 

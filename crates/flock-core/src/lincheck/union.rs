@@ -642,7 +642,7 @@ pub fn verify_union_timed<Ch: Challenger>(
 mod tests {
     use super::*;
     use crate::r1cs::SparseBinaryMatrix;
-    use crate::schedule::TableType;
+    use crate::schedule::{TableClass, TableType};
 
     /// SplitMix64 PRNG, deterministic.
     struct Rng(u64);
@@ -684,6 +684,7 @@ mod tests {
             b_0: stub(),
             c_0: stub(),
             const_pin: None,
+            class: TableClass::Boolean,
         }
     }
 

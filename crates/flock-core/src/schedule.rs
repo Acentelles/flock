@@ -9,32 +9,88 @@
 //! [`Instance`] adds the per-proof declared counts `n_t` and derives the
 //! run-list [`PaddingSpec`] the zerocheck kernels consume.
 //!
+//! Types carry a [`TableClass`]: `Boolean` (the bit-level hash relations) or
+//! `LargeField` (the element relation of [`crate::element_r1cs`]). The
+//! scheduler is class-blind — an element type presents `k_log = kappa + 7`
+//! and `useful_bits = k·128`, so all the slot arithmetic below is shared —
+//! but the LAYOUT is class-major, giving each class its own disjoint aligned
+//! subcube so each class's PIOP can run over its own region only (see
+//! [`Registry::new`]).
+//!
 //! Phase 0 landed the types and their arithmetic; the union-instance layer
 //! that wires them into the prove/verify paths lives in [`crate::union`].
 
+use std::sync::Arc;
+
+use crate::element_r1cs::ElementTableType;
 use crate::r1cs::SparseBinaryMatrix;
 use crate::zerocheck::{PaddingRun, PaddingSpec};
 
+/// Largest `k_log` a registry accepts. Far above any real table (`M` would
+/// already be astronomical), and load-bearing for the injectivity of
+/// [`Registry::digest`]: it keeps the four leading bytes of a type's
+/// absorbed header (`k_log` as u32 LE) strictly below the four leading bytes
+/// of [`ELEMENT_CLASS_LABEL`], so no boolean type's encoding can be mistaken
+/// for an element-class suffix. See the digest's absorption order.
+pub const MAX_K_LOG: usize = 40;
+
+/// Domain label prefixed to the element-class payload inside
+/// [`Registry::digest`]. Absorbed ONLY for [`TableClass::LargeField`] types,
+/// which is what keeps a boolean-only registry's digest byte-identical to
+/// the pre-element-class one.
+const ELEMENT_CLASS_LABEL: &[u8] = b"flock-element-class-v0";
+
+/// What a table type's witness words MEAN — and therefore which PIOP proves
+/// the slot. The scheduler itself is class-blind: both classes present a
+/// `k_log`/`useful_bits` pair and the [`Slot`] arithmetic below is shared
+/// (design doc §"Mixed-class layout"). The class only selects the prover.
+#[derive(Clone, Debug, Default)]
+pub enum TableClass {
+    /// GF(2) bit-level tables — the hash relations. The payload is
+    /// [`TableType`]'s own `a_0`/`b_0`/`c_0`/`const_pin` fields.
+    #[default]
+    Boolean,
+    /// Large-field (element) tables: one F128 element per committed word,
+    /// the relation `(A_0 z + a)(B_0 z + b) = z` of [`crate::element_r1cs`].
+    /// The boolean matrix fields are empty stubs for these types (nothing
+    /// reads them; [`TableType::element`] is the only constructor).
+    ///
+    /// `Arc` because [`ElementTableType`] caches its digest in a `OnceLock`
+    /// and is therefore not `Clone`, while [`TableType`] is.
+    LargeField(Arc<ElementTableType>),
+}
+
 /// One table type: the base block of a single hash relation — exactly what
 /// [`crate::r1cs::BlockR1cs`] stores per block (a one-type registry is
-/// today's struct, minus the replication count).
+/// today's struct, minus the replication count) — or, since the element
+/// class landed, a large-field block (see [`TableClass`]).
 ///
-/// The matrices are `2^k_log × 2^k_log` sparse boolean in circuit form
-/// (`C_0 = I`); like `BlockR1cs`, walker-based encoders (Keccak) may carry
-/// empty stubs here and supply their own `LincheckCircuit`.
+/// For a boolean type the matrices are `2^k_log × 2^k_log` sparse boolean in
+/// circuit form (`C_0 = I`); like `BlockR1cs`, walker-based encoders
+/// (Keccak) may carry empty stubs here and supply their own
+/// `LincheckCircuit`.
 #[derive(Clone, Debug)]
 pub struct TableType {
     /// log2 of the base-block side `k = 2^k_log` — the design doc's `κ_t`.
+    /// For an element type this is `kappa + 7`: one row is `2^kappa` words
+    /// of 128 bits, and the 7 in-word bits are the element's basis
+    /// coordinates, so the slot bookkeeping below applies unchanged.
     pub k_log: usize,
     /// Useful bits per block: columns `[0, useful_bits)` carry real trace
-    /// data; columns `[useful_bits, 2^k_log)` are zero padding.
+    /// data; columns `[useful_bits, 2^k_log)` are zero padding. For an
+    /// element type this is `k · 128` — the real element columns — so
+    /// `used_cols` counts element columns.
     pub useful_bits: usize,
     pub a_0: SparseBinaryMatrix,
     pub b_0: SparseBinaryMatrix,
     pub c_0: SparseBinaryMatrix,
     /// Column of a constant-one wire to pin to 1 across all blocks, or
-    /// `None` (see `BlockR1cs::const_pin`).
+    /// `None` (see `BlockR1cs::const_pin`). Always `None` for element types:
+    /// the element relation pins constants through `a_const`/`b_const`.
     pub const_pin: Option<usize>,
+    /// Boolean or large-field. Defaults to [`TableClass::Boolean`], so a
+    /// struct literal that predates the class tag keeps its meaning.
+    pub class: TableClass,
 }
 
 impl TableType {
@@ -51,7 +107,49 @@ impl TableType {
             b_0: r1cs.b_0.clone(),
             c_0: r1cs.c_0.clone(),
             const_pin: r1cs.const_pin,
+            class: TableClass::Boolean,
         }
+    }
+
+    /// A large-field (element) table type, presented to the scheduler as a
+    /// `k_log = kappa + 7` block with `useful_bits = k · 128` (see the field
+    /// docs). The boolean matrix fields are empty stubs — the real payload
+    /// rides in [`TableClass::LargeField`].
+    pub fn element(ty: Arc<ElementTableType>) -> Self {
+        let stub = || SparseBinaryMatrix {
+            num_rows: 0,
+            num_cols: 0,
+            rows: Vec::new(),
+        };
+        Self {
+            k_log: ty.kappa() + 7,
+            useful_bits: ty.k() * 128,
+            a_0: stub(),
+            b_0: stub(),
+            c_0: stub(),
+            const_pin: None,
+            class: TableClass::element(ty),
+        }
+    }
+
+    /// The element payload, or `None` for a boolean type.
+    pub fn element_type(&self) -> Option<&ElementTableType> {
+        match &self.class {
+            TableClass::Boolean => None,
+            TableClass::LargeField(ty) => Some(ty),
+        }
+    }
+
+    /// Whether this type is proven by the large-field PIOP.
+    pub fn is_element(&self) -> bool {
+        matches!(self.class, TableClass::LargeField(_))
+    }
+}
+
+impl TableClass {
+    /// [`TableClass::LargeField`] from an owned element type.
+    pub fn element(ty: Arc<ElementTableType>) -> Self {
+        Self::LargeField(ty)
     }
 }
 
@@ -92,6 +190,20 @@ pub struct Registry {
     nu: usize,
     slots: Vec<Slot>,
     m_total: usize,
+    /// Number of boolean types — a PREFIX of `types`/`slots` by the
+    /// class-major sort. `types[num_boolean..]` are the element types.
+    num_boolean: usize,
+    /// `M_bool`: the boolean region is the prefix subcube `[0, 2^M_bool)`.
+    /// `0` when there are no boolean types (the region is empty).
+    m_bool: usize,
+    /// `M_elem`: the element region is the aligned subcube
+    /// `[element_base, element_base + 2^M_elem)`. `0` when there are no
+    /// element types.
+    m_elem: usize,
+    /// Start of the element region — a multiple of `2^M_elem`, hence a
+    /// subcube base whose top `M − M_elem` address bits are the fixed
+    /// pattern `element_base >> M_elem`. Meaningless when `m_elem == 0`.
+    element_base: usize,
     /// Lazily computed [`Self::digest`]. Unlike `BlockR1cs` (public fields,
     /// manual `Clone` resetting the cache), every field here is private and
     /// immutable after construction, so the cache can never go stale and the
@@ -101,14 +213,38 @@ pub struct Registry {
 
 impl Registry {
     /// Build a registry from table types and the uniform log2 row capacity
-    /// `nu` (any `nu ≥ 0`; the type is unsigned). Requires `k_log ≥ 7` for
-    /// every type (BatchMajor 128-bit chunking; all current hash encoders
-    /// have `k_log ≥ 14`).
+    /// `nu` (any `nu ≥ 0`; the type is unsigned). Requires
+    /// `7 ≤ k_log ≤ MAX_K_LOG` for every type (BatchMajor 128-bit chunking;
+    /// all current hash encoders have `k_log ≥ 14`).
     ///
     /// Computes each slot's area, offset `o_t`, and prefix
     /// `p_t = o_t >> m_t`, and the total variable count
     /// `M = log2(Σ_t 2^{m_t} rounded up to a power of two)`; asserts the
     /// alignment invariant `o_t ≡ 0 (mod 2^{m_t})`.
+    ///
+    /// ## Class-major layout
+    ///
+    /// Types sort **class-major**: boolean types first (area-descending, as
+    /// before, packing from offset 0), then element types (area-descending).
+    /// The two classes then occupy DISJOINT ALIGNED SUBCUBES, which is what
+    /// lets each class's PIOP run over its own region only (the union
+    /// zerocheck aliases `c = z`, so a shared domain with the element region
+    /// "marked dead" would make the honest global sum non-zero — see
+    /// [`crate::union`]):
+    ///
+    /// - the **boolean region** is the prefix subcube `[0, 2^{M_bool})`,
+    ///   where `2^{M_bool}` is the smallest power of two covering the
+    ///   boolean slots' total extent;
+    /// - the **element region** starts at `element_base`, the boolean
+    ///   region's end rounded up to a multiple of the element region's own
+    ///   size `2^{M_elem}` — so `element_base = 2^{max(M_bool, M_elem)}`
+    ///   when both classes are present, and `0` when there are no boolean
+    ///   types. Its top `M − M_elem` address bits are a fixed Boolean
+    ///   pattern.
+    ///
+    /// A boolean-only registry is unaffected in every respect (the element
+    /// arithmetic collapses and `M = M_bool`), which is what keeps the
+    /// existing byte-identity anchors intact.
     pub fn new(mut types: Vec<TableType>, nu: usize) -> Self {
         assert!(!types.is_empty(), "registry needs at least one table type");
         for ty in &types {
@@ -118,22 +254,76 @@ impl Registry {
                 ty.k_log
             );
             assert!(
+                ty.k_log <= MAX_K_LOG,
+                "k_log {} exceeds MAX_K_LOG = {MAX_K_LOG}",
+                ty.k_log
+            );
+            assert!(
                 ty.useful_bits <= 1usize << ty.k_log,
                 "useful_bits {} exceeds block size 2^{}",
                 ty.useful_bits,
                 ty.k_log
             );
+            if let Some(el) = ty.element_type() {
+                assert_eq!(ty.k_log, el.kappa() + 7, "element k_log must be kappa + 7");
+                assert_eq!(
+                    ty.useful_bits,
+                    el.k() * 128,
+                    "element useful_bits must be k · 128"
+                );
+                assert!(
+                    ty.const_pin.is_none(),
+                    "element types have no const pin (constants ride in a_const/b_const)"
+                );
+            }
         }
-        // Non-increasing capacity area = k_log descending (uniform capacity).
-        types.sort_by_key(|ty| std::cmp::Reverse(ty.k_log));
+        // Class-major, then non-increasing capacity area = k_log descending
+        // (uniform capacity). Stable, so equal-width types keep their given
+        // order — and the boolean types stay a prefix of the list.
+        types.sort_by_key(|ty| (ty.is_element(), std::cmp::Reverse(ty.k_log)));
+        let num_boolean = types.iter().filter(|ty| !ty.is_element()).count();
 
-        let mut offset = 0usize;
+        // Pack each class from its own base, area-descending. Boolean starts
+        // at 0; the element base needs the boolean extent first.
+        let extent = |tys: &[TableType]| -> usize {
+            tys.iter().map(|ty| 1usize << (nu + ty.k_log)).sum()
+        };
+        let bool_extent = extent(&types[..num_boolean]);
+        let elem_extent = extent(&types[num_boolean..]);
+        let pow2_log = |n: usize| n.next_power_of_two().trailing_zeros() as usize;
+        let m_bool = if bool_extent == 0 {
+            0
+        } else {
+            pow2_log(bool_extent)
+        };
+        let m_elem = if elem_extent == 0 {
+            0
+        } else {
+            pow2_log(elem_extent)
+        };
+        // The boolean region is the prefix SUBCUBE, so the element region
+        // starts past `2^M_bool` (not past the tighter `bool_extent`), rounded
+        // up to its own alignment. Both are powers of two, so this is
+        // `2^max(M_bool, M_elem)` — and `0` with no boolean types.
+        let element_base = if elem_extent == 0 {
+            0
+        } else if bool_extent == 0 {
+            0
+        } else {
+            1usize << m_bool.max(m_elem)
+        };
+
         let mut partial: Vec<(usize, usize)> = Vec::with_capacity(types.len()); // (m_slot, offset)
-        for ty in &types {
+        let mut offset = 0usize;
+        for (t, ty) in types.iter().enumerate() {
+            if t == num_boolean {
+                offset = element_base; // cross into the element region
+            }
             let m_slot = nu + ty.k_log;
-            // Guaranteed by the descending-area sort (each earlier area is a
-            // multiple of 2^m_slot); asserted because everything downstream
-            // (prefix freezing, subcube disjointness) rests on it.
+            // Guaranteed by the descending-area sort within each class (each
+            // earlier area is a multiple of 2^m_slot, and `element_base` is a
+            // multiple of 2^M_elem ≥ 2^m_slot); asserted because everything
+            // downstream (prefix freezing, subcube disjointness) rests on it.
             assert!(
                 offset.is_multiple_of(1usize << m_slot),
                 "slot offset {offset} not aligned to 2^{m_slot}"
@@ -141,8 +331,8 @@ impl Registry {
             partial.push((m_slot, offset));
             offset += 1usize << m_slot;
         }
-        let m_total = offset.next_power_of_two().trailing_zeros() as usize;
-        let slots = partial
+        let m_total = pow2_log(offset);
+        let slots: Vec<Slot> = partial
             .into_iter()
             .map(|(m_slot, offset)| Slot {
                 m_slot,
@@ -151,11 +341,41 @@ impl Registry {
                 prefix_bits: m_total - m_slot,
             })
             .collect();
+
+        // The two region invariants the disjoint PIOPs rest on, spelled out.
+        if num_boolean > 0 {
+            assert!(m_bool <= m_total, "boolean region exceeds the address space");
+            let last = &slots[num_boolean - 1];
+            assert!(
+                last.offset + last.area() <= 1usize << m_bool,
+                "boolean slots must fit the prefix subcube [0, 2^M_bool)"
+            );
+        }
+        if num_boolean < types.len() {
+            assert!(m_elem <= m_total, "element region exceeds the address space");
+            assert!(
+                element_base.is_multiple_of(1usize << m_elem),
+                "element region base {element_base} not aligned to 2^{m_elem}"
+            );
+            assert!(
+                num_boolean == 0 || element_base >= 1usize << m_bool,
+                "element region must start past the boolean prefix subcube"
+            );
+            assert!(
+                element_base + (1usize << m_elem) <= 1usize << m_total,
+                "element region subcube exceeds the address space"
+            );
+        }
+
         Self {
             types,
             nu,
             slots,
             m_total,
+            num_boolean,
+            m_bool,
+            m_elem,
+            element_base,
             digest_cache: std::sync::OnceLock::new(),
         }
     }
@@ -178,7 +398,21 @@ impl Registry {
     ///    `(present: u8, value: u64 LE)` — `(0, 0)` for `None`, `(1, col)`
     ///    for `Some(col)` — then the base matrices `a_0`, `b_0`, `c_0`, each
     ///    absorbed by the same length-prefixed routine `statement_digest`
-    ///    uses (`crate::r1cs::absorb_matrix`).
+    ///    uses (`crate::r1cs::absorb_matrix`);
+    /// 6. **for element types only**, appended after that type's stub
+    ///    matrices: the label [`ELEMENT_CLASS_LABEL`] followed by the
+    ///    element base block's own digest
+    ///    ([`ElementTableType::digest`], which covers `kappa`, `k`, `A_0`,
+    ///    `B_0`, `a_const`, `b_const`). A **boolean-only registry therefore
+    ///    absorbs exactly the bytes it absorbed before the element class
+    ///    existed** — the byte-identity bar for every pinned fixture.
+    ///
+    /// The conditional suffix keeps the encoding injective: a type's boolean
+    /// part is self-delimiting (fixed 21-byte header + three length-prefixed
+    /// matrices), and after it the next four bytes either begin the label
+    /// (`"floc"`, i.e. `0x636f6c66` read as u32 LE) or the next type's
+    /// `k_log`, which [`MAX_K_LOG`] bounds far below that — so a left-to-right
+    /// parse can never confuse the two.
     ///
     /// Lazily cached in `digest_cache`; first call materializes it,
     /// subsequent calls are essentially free.
@@ -201,9 +435,57 @@ impl Registry {
                 crate::r1cs::absorb_matrix(&mut h, &ty.a_0);
                 crate::r1cs::absorb_matrix(&mut h, &ty.b_0);
                 crate::r1cs::absorb_matrix(&mut h, &ty.c_0);
+                // Element payload appends ONLY when present — see above.
+                if let Some(el) = ty.element_type() {
+                    h.update(ELEMENT_CLASS_LABEL);
+                    h.update(&el.digest());
+                }
             }
             *h.finalize().as_bytes()
         })
+    }
+
+    /// Number of boolean types — a PREFIX of [`Self::types`] /
+    /// [`Self::slots`], by the class-major sort.
+    pub fn num_boolean(&self) -> usize {
+        self.num_boolean
+    }
+
+    /// Number of element types — the SUFFIX `types()[num_boolean()..]`.
+    pub fn num_element(&self) -> usize {
+        self.types.len() - self.num_boolean
+    }
+
+    /// The boolean types, in slot order.
+    pub fn boolean_types(&self) -> &[TableType] {
+        &self.types[..self.num_boolean]
+    }
+
+    /// The element types, in slot order.
+    pub fn element_types(&self) -> &[TableType] {
+        &self.types[self.num_boolean..]
+    }
+
+    /// `M_bool` — the boolean region is the prefix subcube `[0, 2^{M_bool})`
+    /// and the boolean PIOP runs over exactly that many variables. `0` when
+    /// there are no boolean types. Equals [`Self::m_total`] for a
+    /// boolean-only registry (which is why that case is untouched).
+    pub fn m_bool(&self) -> usize {
+        self.m_bool
+    }
+
+    /// `M_elem` — the element region is the aligned subcube
+    /// `[element_base, element_base + 2^{M_elem})`. `0` with no element types.
+    pub fn m_elem(&self) -> usize {
+        self.m_elem
+    }
+
+    /// Base address of the element region: a multiple of `2^{M_elem}`, so the
+    /// region's top `M − M_elem` address bits are frozen to the Boolean
+    /// pattern `element_base >> M_elem`. Meaningless when
+    /// [`Self::num_element`] is 0.
+    pub fn element_base(&self) -> usize {
+        self.element_base
     }
 
     /// The types, in slot order (non-increasing capacity area).
@@ -337,7 +619,20 @@ mod tests {
             b_0: stub(),
             c_0: stub(),
             const_pin: None,
+            class: TableClass::Boolean,
         }
+    }
+
+    /// An element type of the given shape: `kappa` column bits, all `2^kappa`
+    /// columns free wires (so `k = 2^kappa` and every column is used). Only
+    /// the shape matters to the schedule.
+    pub(crate) fn elem_ty(kappa: usize) -> TableType {
+        use crate::element_r1cs::ElementTableBuilder;
+        let mut b = ElementTableBuilder::new(kappa);
+        for y in 0..1usize << kappa {
+            b.free_wire(y);
+        }
+        TableType::element(Arc::new(b.build().expect("free-wire block is valid")))
     }
 
     /// SplitMix64 PRNG, deterministic.
@@ -587,6 +882,7 @@ mod tests {
                         b_0: stub(),
                         c_0: stub(),
                         const_pin: Some(2),
+                        class: TableClass::Boolean,
                     },
                 ],
                 3,
@@ -622,6 +918,7 @@ mod tests {
                         b_0: stub(),
                         c_0: stub(),
                         const_pin,
+                        class: TableClass::Boolean,
                     },
                 ],
                 nu,
@@ -643,5 +940,201 @@ mod tests {
         for (what, reg) in cases {
             assert_ne!(d, reg.digest(), "digest insensitive to {what}");
         }
+    }
+
+    // ---- element class: digest byte-identity + class-major layout ----------
+
+    /// **THE BYTE-IDENTITY BAR.** A boolean-only registry's digest must be
+    /// exactly the pre-element-class one: the element payload appends only
+    /// when present, so no boolean type absorbs a single new byte. Pinned
+    /// against constants captured at `c87a067` (the commit before the class
+    /// tag landed) rather than recomputed here, so a future absorption tweak
+    /// cannot silently move both sides together.
+    #[test]
+    fn boolean_only_digest_is_byte_identical() {
+        // Same shapes as `registry_digest_deterministic` / the layout tests.
+        let plain = Registry::new(vec![ty(10, 700), ty(9, 300)], 3);
+        assert_eq!(
+            hex(&plain.digest()),
+            "8010ecf651ca43eadfe415eac6a081c8f9022dd077070da0f22cea19297699ea",
+            "boolean-only digest moved — the element class must append nothing"
+        );
+        let with_pin = Registry::new(
+            vec![
+                ty(10, 700),
+                TableType {
+                    k_log: 9,
+                    useful_bits: 300,
+                    a_0: matrix(vec![vec![0, 3], vec![7]]),
+                    b_0: stub(),
+                    c_0: stub(),
+                    const_pin: Some(2),
+                    class: TableClass::Boolean,
+                },
+            ],
+            3,
+        );
+        assert_eq!(
+            hex(&with_pin.digest()),
+            "2662f8c311c8cdf715ed636bc46a5de16daf06e7516a2e299e6f80132ad9e9c2",
+            "boolean-only digest (with matrices + pin) moved"
+        );
+    }
+
+    fn hex(d: &[u8; 32]) -> String {
+        d.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// An element type moves the digest, and every component of its base
+    /// block is covered (kappa/k through the header, matrices and constants
+    /// through [`ElementTableType::digest`]).
+    #[test]
+    fn element_payload_binds_the_digest() {
+        use crate::element_r1cs::ElementTableBuilder;
+        use crate::field::F128;
+
+        let bool_only = Registry::new(vec![ty(10, 700)], 3);
+        let mixed = Registry::new(vec![ty(10, 700), elem_ty(3)], 3);
+        assert_ne!(
+            bool_only.digest(),
+            mixed.digest(),
+            "adding an element type must move the digest"
+        );
+
+        // Two element types with the SAME (k_log, useful_bits) header but
+        // different base blocks: only the appended element digest separates
+        // them, which is exactly what the suffix is for.
+        let mk = |scale: u64| {
+            let mut b = ElementTableBuilder::new(2);
+            b.free_wire(0).free_wire(1).free_wire(2);
+            b.linear(3, &[(0, F128::new(scale, 0))]);
+            Registry::new(
+                vec![
+                    ty(10, 700),
+                    TableType::element(Arc::new(b.build().expect("valid"))),
+                ],
+                3,
+            )
+        };
+        assert_ne!(
+            mk(5).digest(),
+            mk(7).digest(),
+            "element matrix coefficients must bind"
+        );
+        assert_eq!(mk(5).digest(), mk(5).digest(), "deterministic");
+    }
+
+    /// Class-major sort: boolean slots are a prefix, element slots the
+    /// suffix, each area-descending — even when the element type is WIDER
+    /// than a boolean one (so a pure `k_log` sort would interleave them).
+    #[test]
+    fn class_major_sort_puts_booleans_first() {
+        // Element κ = 7 → k_log = 14; boolean k_logs 12 and 10. A pure
+        // area-descending sort would put the element type first.
+        let reg = Registry::new(vec![elem_ty(7), ty(10, 700), ty(12, 4000)], 2);
+        let shape: Vec<(usize, bool)> = reg
+            .types()
+            .iter()
+            .map(|t| (t.k_log, t.is_element()))
+            .collect();
+        assert_eq!(shape, vec![(12, false), (10, false), (14, true)]);
+        assert_eq!(reg.num_boolean(), 2);
+        assert_eq!(reg.num_element(), 1);
+        assert_eq!(reg.boolean_types().len(), 2);
+        assert!(reg.element_types()[0].is_element());
+    }
+
+    /// Region arithmetic, hand-computed on the three shapes that matter:
+    /// boolean-only (unchanged from today), element-only (the element region
+    /// IS the whole space, no wasted half), and mixed (disjoint aligned
+    /// subcubes with the boolean region a prefix subcube).
+    #[test]
+    fn class_regions_are_disjoint_aligned_subcubes() {
+        // (a) Boolean-only: M = M_bool, no element region — today's geometry.
+        let reg = Registry::new(vec![ty(10, 700), ty(9, 300)], 3);
+        assert_eq!((reg.m_total(), reg.m_bool(), reg.m_elem()), (14, 14, 0));
+        assert_eq!(reg.num_element(), 0);
+
+        // (b) Element-only: κ = 3 → k_log 10, ν = 3 → area 2^13, M_elem = 13,
+        // base 0, M = 13. The element region is the whole prefix subcube.
+        let reg = Registry::new(vec![elem_ty(3)], 3);
+        assert_eq!((reg.m_total(), reg.m_bool(), reg.m_elem()), (13, 0, 13));
+        assert_eq!(reg.element_base(), 0);
+        assert_eq!(reg.slots()[0].offset, 0);
+
+        // (c) Mixed, boolean-dominant: boolean areas 2^13 + 2^12 = 0x3000 →
+        // M_bool = 14; element area 2^13 → M_elem = 13. Base rounds the
+        // boolean SUBCUBE end (2^14) up to a multiple of 2^13 = 2^14, so
+        // there is a virtual gap [0x3000, 0x4000) and M = 15.
+        let reg = Registry::new(vec![ty(10, 700), ty(9, 300), elem_ty(3)], 3);
+        assert_eq!((reg.m_total(), reg.m_bool(), reg.m_elem()), (15, 14, 13));
+        assert_eq!(reg.element_base(), 1 << 14);
+        assert_eq!(
+            reg.slots(),
+            &[
+                Slot { m_slot: 13, offset: 0, prefix: 0b00, prefix_bits: 2 },
+                Slot { m_slot: 12, offset: 1 << 13, prefix: 0b010, prefix_bits: 3 },
+                Slot { m_slot: 13, offset: 1 << 14, prefix: 0b10, prefix_bits: 2 },
+            ]
+        );
+
+        // (d) Mixed, element-dominant: boolean area 2^10 → M_bool = 10;
+        // element areas 2^13 + 2^12 → M_elem = 14. The base is the boolean
+        // subcube end rounded up to 2^14, so M = 15 and the element region
+        // is [2^14, 2^15).
+        let reg = Registry::new(vec![ty(7, 128), elem_ty(3), elem_ty(2)], 3);
+        assert_eq!((reg.m_total(), reg.m_bool(), reg.m_elem()), (15, 10, 14));
+        assert_eq!(reg.element_base(), 1 << 14);
+        assert_eq!(reg.slots()[1].offset, 1 << 14);
+        assert_eq!(reg.slots()[2].offset, (1 << 14) + (1 << 13));
+
+        // The invariants, spelled out for every mixed shape above.
+        for reg in [
+            Registry::new(vec![ty(10, 700), ty(9, 300), elem_ty(3)], 3),
+            Registry::new(vec![ty(7, 128), elem_ty(3), elem_ty(2)], 3),
+            Registry::new(vec![elem_ty(3), elem_ty(3)], 4),
+        ] {
+            let nb = reg.num_boolean();
+            // Boolean region is the prefix subcube [0, 2^M_bool).
+            for slot in &reg.slots()[..nb] {
+                assert!(slot.offset + slot.area() <= 1usize << reg.m_bool());
+            }
+            // Element region is an aligned subcube disjoint from it.
+            let base = reg.element_base();
+            let top = base + (1usize << reg.m_elem());
+            assert!(nb == 0 || base >= 1usize << reg.m_bool(), "regions overlap");
+            assert!(top <= 1usize << reg.m_total());
+            assert!(base.is_multiple_of(1usize << reg.m_elem()));
+            for slot in &reg.slots()[nb..] {
+                assert!(slot.offset >= base && slot.offset + slot.area() <= top);
+                assert!(slot.offset.is_multiple_of(slot.area()));
+            }
+        }
+    }
+
+    /// An element type's presented shape: `k_log = kappa + 7`,
+    /// `useful_bits = k · 128`, no const pin — the three facts the slot
+    /// bookkeeping (`used_cols`, heights, `padding_spec`) reads.
+    #[test]
+    fn element_type_presents_word_geometry() {
+        use crate::element_r1cs::ElementTableBuilder;
+        let mut b = ElementTableBuilder::new(3); // width 8
+        b.free_wire(0).free_wire(1).mult(2, 0, 1); // k = 3 real columns
+        let el = Arc::new(b.build().unwrap());
+        let ty = TableType::element(el);
+        assert_eq!(ty.k_log, 3 + 7);
+        assert_eq!(ty.useful_bits, 3 * 128);
+        assert_eq!(ty.const_pin, None);
+        assert!(ty.is_element());
+        assert_eq!(ty.element_type().map(|e| e.kappa()), Some(3));
+        // 8 word-columns in the slot, 3 of them used.
+        assert_eq!(1usize << (ty.k_log - 7), 8);
+        assert_eq!(ty.useful_bits.div_ceil(128), 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "MAX_K_LOG")]
+    fn registry_rejects_absurd_k_log() {
+        let _ = Registry::new(vec![ty(MAX_K_LOG + 1, 128)], 1);
     }
 }
