@@ -130,6 +130,10 @@ pub enum VerifyError {
     LayerCheckFailed,
     /// A final layer claim disagreed with the witness-derived input value.
     InputMismatch,
+    /// The proof is not shaped for this `μ`: wrong number of layers, or a layer
+    /// carrying the wrong number of sumcheck rounds. Returned rather than
+    /// panicked so an untrusted proof cannot take the verifier down.
+    MalformedProof,
 }
 
 // ---------------------------------------------------------------------------
@@ -569,13 +573,17 @@ fn verify_product<C: Challenger>(
     layers: &[LayerProof],
     ch: &mut C,
 ) -> Result<(F128, Vec<F128>), VerifyError> {
-    assert_eq!(layers.len(), mu);
+    if layers.len() != mu {
+        return Err(VerifyError::MalformedProof);
+    }
     ch.observe_f128(top);
 
     let mut v_claim = top;
     let mut r_pt: Vec<F128> = Vec::new();
     for (k, layer) in layers.iter().enumerate() {
-        assert_eq!(layer.rounds.len(), k);
+        if layer.rounds.len() != k {
+            return Err(VerifyError::MalformedProof);
+        }
         let mut c_run = v_claim;
         let mut r_prime = Vec::with_capacity(k + 1);
         for i in 0..k {
@@ -1087,7 +1095,9 @@ fn verify_batched_core<C: Challenger>(
     sigma_opt: Option<&[usize]>,
     ch: &mut C,
 ) -> Result<ProductGkrBatchedClaim, VerifyError> {
-    assert_eq!(proof.layers.len(), mu);
+    if proof.layers.len() != mu {
+        return Err(VerifyError::MalformedProof);
+    }
     ch.observe_label(DOMAIN_BATCHED);
     let alpha = ch.sample_f128();
     let beta = ch.sample_f128();
@@ -1102,7 +1112,9 @@ fn verify_batched_core<C: Challenger>(
     let mut claim_r = proof.top_rhs;
     let mut r_pt: Vec<F128> = Vec::new();
     for (k, layer) in proof.layers.iter().enumerate() {
-        assert_eq!(layer.rounds.len(), k);
+        if layer.rounds.len() != k {
+            return Err(VerifyError::MalformedProof);
+        }
         let lambda = ch.sample_f128();
         let mut c_run = claim_l + lambda * claim_r;
         let mut r_prime = Vec::with_capacity(k + 1);
@@ -1483,5 +1495,104 @@ mod tests {
         let mut chv = FsChallenger::new(b"prod-gkr-batched-test");
         bind(&mut chv, &w, &w, &sigma);
         assert!(verify_batched(mu, &proof, &mut chv).is_err());
+    }
+
+    /// A proof of the wrong shape must be rejected, not panicked on — matching
+    /// `zerocheck::verify_rejects_shape_errors`. These used to be `assert_eq!`,
+    /// so a malformed proof from an untrusted source took the verifier down.
+    #[test]
+    fn verify_rejects_shape_errors() {
+        let mu = 6;
+        let (f, g, sigma) = honest_instance(mu, 0x5111);
+
+        let mut chp = FsChallenger::new(b"prod-gkr-shape");
+        bind(&mut chp, &f, &g, &sigma);
+        let (batched, _) = prove_batched(&f, &g, &sigma, &mut chp);
+
+        let verify_shape = |p: &ProductGkrBatchedProof, mu: usize| {
+            let mut ch = FsChallenger::new(b"prod-gkr-shape");
+            bind(&mut ch, &f, &g, &sigma);
+            verify_batched(mu, p, &mut ch)
+        };
+        // Wrong layer count (both directions).
+        let mut short = batched.clone();
+        short.layers.pop();
+        assert_eq!(verify_shape(&short, mu), Err(VerifyError::MalformedProof));
+        assert_eq!(
+            verify_shape(&batched, mu - 1),
+            Err(VerifyError::MalformedProof)
+        );
+        // Right layer count, wrong round count inside a layer.
+        let mut bad_rounds = batched.clone();
+        bad_rounds.layers[mu - 1].rounds.pop();
+        assert_eq!(
+            verify_shape(&bad_rounds, mu),
+            Err(VerifyError::MalformedProof)
+        );
+
+        // Same for the unbatched verifier.
+        let mut chp = FsChallenger::new(b"prod-gkr-shape");
+        bind(&mut chp, &f, &g, &sigma);
+        let (plain, _) = prove(&f, &g, &sigma, &mut chp);
+        let mut trimmed = plain.clone();
+        trimmed.layers_lhs.pop();
+        let mut ch = FsChallenger::new(b"prod-gkr-shape");
+        bind(&mut ch, &f, &g, &sigma);
+        assert_eq!(
+            verify(mu, &trimmed, &mut ch),
+            Err(VerifyError::MalformedProof)
+        );
+    }
+
+    /// `verify_batched` reads `s_σ(ρ)` out of the proof, so its input check
+    /// `claim_r = g(ρ) + α·s_σ(ρ) + β` has **two** prover-supplied unknowns and
+    /// is satisfied by a one-parameter family: shift `g_eval` by δ and
+    /// `s_sigma_eval` by `δ/α` and it still holds (char 2, so the two δ's
+    /// cancel). Nothing else in the transcript pins either value — the evals are
+    /// observed only after every challenge is drawn.
+    ///
+    /// That is the documented precondition ("sound only if `s_σ` is pinned
+    /// downstream"), pinned here as behaviour so it cannot regress silently, and
+    /// paired with the demonstration that `verify_batched_with_sigma` — which
+    /// recomputes `s_σ(ρ)` from a verifier-known σ — rejects the same forgery.
+    #[test]
+    fn batched_verify_trusts_s_sigma_unless_sigma_is_known() {
+        const DOMAIN_TEST: &[u8] = b"prod-gkr-forge";
+        let mu = 7;
+        let (f, g, sigma) = honest_instance(mu, 0xD00D);
+        let mut chp = FsChallenger::new(DOMAIN_TEST);
+        bind(&mut chp, &f, &g, &sigma);
+        let (proof, _) = prove_batched(&f, &g, &sigma, &mut chp);
+
+        // Replay the transcript prefix to recover α, exactly as a prover would.
+        let mut cha = FsChallenger::new(DOMAIN_TEST);
+        bind(&mut cha, &f, &g, &sigma);
+        cha.observe_label(DOMAIN_BATCHED);
+        let alpha = cha.sample_f128();
+
+        let delta = F128::new(0xDEAD_BEEF, 0x1234);
+        let mut forged = proof.clone();
+        forged.g_eval += delta;
+        forged.s_sigma_eval += delta * alpha.inv();
+
+        // Trusting verifier: accepts, and hands back the forged evals.
+        let mut chv = FsChallenger::new(DOMAIN_TEST);
+        bind(&mut chv, &f, &g, &sigma);
+        let claim = verify_batched(mu, &forged, &mut chv).expect("trusting verifier accepts");
+        assert_eq!(claim.g_eval, proof.g_eval + delta);
+        assert_ne!(claim.g_eval, proof.g_eval, "forgery really did change g(ρ)");
+
+        // σ-aware verifier: recomputes s_σ(ρ), so the shift no longer cancels.
+        let mut chv = FsChallenger::new(DOMAIN_TEST);
+        bind(&mut chv, &f, &g, &sigma);
+        assert_eq!(
+            verify_batched_with_sigma(mu, &forged, &sigma, &mut chv),
+            Err(VerifyError::InputMismatch),
+        );
+
+        // ...and still accepts the honest proof.
+        let mut chv = FsChallenger::new(DOMAIN_TEST);
+        bind(&mut chv, &f, &g, &sigma);
+        verify_batched_with_sigma(mu, &proof, &sigma, &mut chv).expect("honest proof verifies");
     }
 }
