@@ -18,14 +18,14 @@ pub mod keccak;
 /// 3-wide Keccak-f[1600] R1CS (3 independent permutations per K_LOG=17 block)
 /// for tighter PCS utilization (~97% vs the single encoder's ~65%).
 pub mod keccak3;
-/// Merkle-path verification as ONE monolithic R1CS block per path — the
-/// multi-table-legal form (one table row = one whole path), as opposed to
-/// [`merkle_path_common`]'s shift-sumcheck composition over a batch of
-/// independent per-level compressions.
-pub mod merkle_r1cs;
 /// Generic Merkle-path glue ([`MerkleLayout`]-parameterized prove/verify),
 /// analogous to [`chain_common`] but with a per-row bit selector.
 ///
 /// [`MerkleLayout`]: merkle_path_common::MerkleLayout
 pub mod merkle_path_common;
+/// Merkle-path verification as ONE monolithic R1CS block per path — the
+/// multi-table-legal form (one table row = one whole path), as opposed to
+/// [`merkle_path_common`]'s shift-sumcheck composition over a batch of
+/// independent per-level compressions.
+pub mod merkle_r1cs;
 pub mod sha2;

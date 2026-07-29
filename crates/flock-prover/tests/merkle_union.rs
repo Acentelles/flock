@@ -12,17 +12,17 @@
 //! ν = 3 is the lincheck's floor (`n_outer ≥ 8`) and lands exactly on the
 //! smallest embedded Ligerito config, so it is the cheapest real-depth proof.
 
-use flock_core::pcs::ligerito::LigeritoProfile;
 use flock_core::pcs::PcsParams;
+use flock_core::pcs::ligerito::LigeritoProfile;
 use flock_core::schedule::{Registry, TableType};
 use flock_core::union::UnionInstance;
 use flock_core::verifier;
 use flock_prover::challenger::FsChallenger;
-use flock_prover::prover::{self, UnionSlotProverInput};
 use flock_prover::mixed::{MerkleMixedCounts, MerkleMixedSetup, MixedRegistryId};
+use flock_prover::prover::{self, UnionSlotProverInput};
 use flock_prover::r1cs_hashes::blake3;
 use flock_prover::r1cs_hashes::merkle_r1cs::{
-    blake3_spec, reference_root, MerkleTreeLayout, PathInput, SLOT_WORDS,
+    MerkleTreeLayout, PathInput, SLOT_WORDS, blake3_spec, reference_root,
 };
 
 const DOMAIN: &[u8] = b"flock-merkle-union-e2e-v0";
@@ -45,8 +45,8 @@ impl Rng {
         std::array::from_fn(|_| self.next_u32())
     }
     fn path(&mut self, depth: usize) -> PathInput {
-        let index = ((self.next_u32() as u64) << 32 | self.next_u32() as u64)
-            & ((1u64 << depth) - 1);
+        let index =
+            ((self.next_u32() as u64) << 32 | self.next_u32() as u64) & ((1u64 << depth) - 1);
         PathInput {
             leaf: self.digest(),
             index,
@@ -97,15 +97,15 @@ fn depth26_union_geometry() {
     assert_eq!(s.registry.num_types(), 1);
     assert_eq!(s.registry.types()[0].k_log, 19);
     assert_eq!(s.registry.types()[0].useful_bits, s.layout.useful_bits);
-    assert_eq!(
-        s.registry.types()[0].const_pin,
-        Some(s.layout.const_pos())
-    );
+    assert_eq!(s.registry.types()[0].const_pin, Some(s.layout.const_pos()));
     // One type ⇒ no address-space rounding: M = nu + k_log exactly.
     assert_eq!(s.registry.m_total(), NU + 19);
 
     let union = s.union(1 << NU);
-    assert_eq!(union.dense_words(), (1 << NU) * s.layout.useful_bits.div_ceil(128));
+    assert_eq!(
+        union.dense_words(),
+        (1 << NU) * s.layout.useful_bits.div_ceil(128)
+    );
     assert_eq!(union.dense_m(), 22, "lands on the smallest Ligerito config");
     assert_eq!(s.pcs_params(&union).m, 22);
 }

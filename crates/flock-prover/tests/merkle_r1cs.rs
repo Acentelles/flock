@@ -5,10 +5,10 @@
 //! depth. They are the reference oracle for the depth-26 walker path.
 
 use flock_core::field::F128;
-use flock_core::lincheck::{build_quirky_eq_table, CscCircuit, LincheckCircuit};
+use flock_core::lincheck::{CscCircuit, LincheckCircuit, build_quirky_eq_table};
 use flock_core::zerocheck::K_SKIP;
 use flock_prover::r1cs_hashes::merkle_r1cs::{
-    blake3_spec, reference_root, MerkleTreeLayout, PathInput, SLOT_WORDS,
+    MerkleTreeLayout, PathInput, SLOT_WORDS, blake3_spec, reference_root,
 };
 
 struct Rng(u64);
@@ -230,7 +230,11 @@ fn emitted_ab_matches_matrix_application() {
             let input = path(&mut rng, depth, index);
             let [z, a, b] = layout.build_witness_zab(&input);
             // The z half must agree with the plain witness builder.
-            assert_eq!(z, layout.build_witness(&input), "depth {depth} idx {index} z");
+            assert_eq!(
+                z,
+                layout.build_witness(&input),
+                "depth {depth} idx {index} z"
+            );
             let want_a = r1cs.apply_a(&z);
             let want_b = r1cs.apply_b(&z);
             for (name, got, want) in [("a", &a, &want_a), ("b", &b, &want_b)] {
@@ -260,7 +264,9 @@ fn batch_major_slot_layout_and_padding() {
     let n_total = 1usize << nu;
     let n_paths = 5; // deliberately partial: rows 5..8 are dummies
     let mut rng = Rng::new(0x_B4_7C_44_01);
-    let paths: Vec<PathInput> = (0..n_paths).map(|i| path(&mut rng, depth, i as u64 & 1)).collect();
+    let paths: Vec<PathInput> = (0..n_paths)
+        .map(|i| path(&mut rng, depth, i as u64 & 1))
+        .collect();
 
     let (z, a, b, stripe) = layout.generate_witness_batch_major_partial(&paths, nu);
     let words_per_block = k / 128;
@@ -347,8 +353,8 @@ fn walker_matches_materialized() {
     for depth in [1usize, 2, 3] {
         let layout = MerkleTreeLayout::new(depth, blake3_spec());
         let (a_0, b_0) = layout.build_matrices();
-        let reference = CscCircuit::from_matrices(&a_0, &b_0)
-            .with_const_pin(Some(layout.const_pos()));
+        let reference =
+            CscCircuit::from_matrices(&a_0, &b_0).with_const_pin(Some(layout.const_pos()));
         let walker = layout.build_walker();
 
         assert_eq!(walker.n_cols(), reference.n_cols(), "depth {depth} n_cols");
@@ -358,7 +364,12 @@ fn walker_matches_materialized() {
             "depth {depth} const_pin — the union asserts these match the TableType"
         );
         // The walker traverses exactly the materialized nonzero count.
-        let nnz: usize = a_0.rows.iter().chain(b_0.rows.iter()).map(|r| r.len()).sum();
+        let nnz: usize = a_0
+            .rows
+            .iter()
+            .chain(b_0.rows.iter())
+            .map(|r| r.len())
+            .sum();
         assert_eq!(walker.effective_nnz(), nnz, "depth {depth} nnz");
 
         let mut rng = Rng::new(0x_A17C_0057);
@@ -403,8 +414,8 @@ fn walker_factored_matches_materialized() {
     for depth in [1usize, 2, 3] {
         let layout = MerkleTreeLayout::new(depth, blake3_spec());
         let (a_0, b_0) = layout.build_matrices();
-        let reference = CscCircuit::from_matrices(&a_0, &b_0)
-            .with_const_pin(Some(layout.const_pos()));
+        let reference =
+            CscCircuit::from_matrices(&a_0, &b_0).with_const_pin(Some(layout.const_pos()));
         let walker = layout.build_walker();
 
         let mut rng = Rng::new(0x_FAC7_0000 + depth as u64);
@@ -446,7 +457,10 @@ fn walker_factored_matches_per_level_at_depth26() {
     let mut rng = Rng::new(0x_FAC7_001A);
     let eq = quirky_eq(&mut rng, layout.k_log);
     let alpha = rng.f128();
-    assert!(walker.eq_factors_over_levels(&eq), "depth 26 quirky eq must factor");
+    assert!(
+        walker.eq_factors_over_levels(&eq),
+        "depth 26 quirky eq must factor"
+    );
 
     // Time both on the full pool AND on one thread. The verifier runs its
     // PIOP replay inside a dedicated single-thread pool
@@ -459,7 +473,7 @@ fn walker_factored_matches_per_level_at_depth26() {
         .expect("1-thread pool");
     let bench = |label: &str, pool: Option<&rayon::ThreadPool>| {
         let run = |f: &(dyn Fn() -> Vec<F128> + Sync)| match pool {
-            Some(p) => p.install(|| f()),
+            Some(p) => p.install(f),
             None => f(),
         };
         let t = Instant::now();
@@ -468,7 +482,11 @@ fn walker_factored_matches_per_level_at_depth26() {
         let t = Instant::now();
         let slow = run(&|| walker.fold_per_level(alpha, &eq));
         let t_slow = t.elapsed();
-        assert_comb_eq(&fast, &slow, &format!("depth 26 factored vs per-level ({label})"));
+        assert_comb_eq(
+            &fast,
+            &slow,
+            &format!("depth 26 factored vs per-level ({label})"),
+        );
         println!(
             "depth 26 fold, {label:>9}: factored {:>8.1} ms  per-level {:>8.1} ms  ({:.1}×)",
             t_fast.as_secs_f64() * 1e3,

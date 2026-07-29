@@ -297,8 +297,7 @@ impl MerkleTreeLayout {
         );
         // Last nonzero column: level 0 carries the globals; every later
         // level ends after its `t` region.
-        let last_level_end =
-            ((depth - 1) << spec.k_log) + spec.useful_bits + 2 * SLOT_BITS;
+        let last_level_end = ((depth - 1) << spec.k_log) + spec.useful_bits + 2 * SLOT_BITS;
         let useful_bits = globals_end.max(last_level_end);
         debug_assert!(useful_bits <= 1usize << k_log);
         Self {
@@ -499,8 +498,14 @@ impl MerkleTreeLayout {
                     continue;
                 }
                 let r = self.hash_bit(l, c);
-                a[r] = base_a.rows[c].iter().map(|&x| self.hash_bit(l, x)).collect();
-                b[r] = base_b.rows[c].iter().map(|&x| self.hash_bit(l, x)).collect();
+                a[r] = base_a.rows[c]
+                    .iter()
+                    .map(|&x| self.hash_bit(l, x))
+                    .collect();
+                b[r] = base_b.rows[c]
+                    .iter()
+                    .map(|&x| self.hash_bit(l, x))
+                    .collect();
             }
         }
 
@@ -664,8 +669,7 @@ impl MerkleTreeLayout {
             let (left, right) = if bit { (prev, sib) } else { (sib, prev) };
             let block = (self.spec.node_witness)(&left, &right);
             let dst = self.hash_bit(l, 0);
-            z[dst..dst + self.spec.useful_bits]
-                .copy_from_slice(&block[..self.spec.useful_bits]);
+            z[dst..dst + self.spec.useful_bits].copy_from_slice(&block[..self.spec.useful_bits]);
             prev = read_digest(&block, self.spec.out_cv_base);
         }
         z
@@ -708,7 +712,13 @@ impl MerkleTreeLayout {
         b[gc] = true;
 
         for j in 0..SLOT_BITS {
-            free(&mut z, &mut a, &mut b, self.leaf_bit(j), digest_bit(&input.leaf, j));
+            free(
+                &mut z,
+                &mut a,
+                &mut b,
+                self.leaf_bit(j),
+                digest_bit(&input.leaf, j),
+            );
         }
         for l in 0..self.depth {
             let bit = (input.index >> l) & 1 == 1;
@@ -812,23 +822,20 @@ impl MerkleTreeLayout {
         // Stripe: `stripe[g*k + c]` bit `r` = z of row `8g + r` at column c.
         // Rows past `paths.len()` contribute 0, so dummy rows stay zero.
         let mut stripe = vec![0u8; (n_total / 8) * k];
-        stripe
-            .par_chunks_mut(k)
-            .enumerate()
-            .for_each(|(g, chunk)| {
-                for r in 0..8 {
-                    let row = 8 * g + r;
-                    if row >= per_path.len() {
-                        continue;
-                    }
-                    let pz = &per_path[row][0];
-                    for c in 0..self.useful_bits {
-                        if pz[c] {
-                            chunk[c] |= 1u8 << r;
-                        }
+        stripe.par_chunks_mut(k).enumerate().for_each(|(g, chunk)| {
+            for r in 0..8 {
+                let row = 8 * g + r;
+                if row >= per_path.len() {
+                    continue;
+                }
+                let pz = &per_path[row][0];
+                for c in 0..self.useful_bits {
+                    if pz[c] {
+                        chunk[c] |= 1u8 << r;
                     }
                 }
-            });
+            }
+        });
 
         (z, a, b, stripe)
     }
@@ -998,9 +1005,8 @@ impl MerkleWalkerCircuit {
     /// Resident bytes of the two CSC transposes — the whole point of the
     /// walker. Compare `depth · base_nnz · 8` for the materialized form.
     pub fn resident_bytes(&self) -> usize {
-        let sz = |c: &Csc| {
-            4 * (c.a_col_ptr.len() + c.a_rows.len() + c.b_col_ptr.len() + c.b_rows.len())
-        };
+        let sz =
+            |c: &Csc| 4 * (c.a_col_ptr.len() + c.a_rows.len() + c.b_col_ptr.len() + c.b_rows.len());
         sz(&self.base) + sz(&self.extras)
     }
 
@@ -1065,7 +1071,10 @@ impl MerkleWalkerCircuit {
         // A reference position with a nonzero entry, to divide by. Generic
         // tables hit this at (0, 0).
         let Some((l_ref, r0)) = (0..self.depth).find_map(|l| {
-            slice(l).iter().position(|v| *v != F128::ZERO).map(|r| (l, r))
+            slice(l)
+                .iter()
+                .position(|v| *v != F128::ZERO)
+                .map(|r| (l, r))
         }) else {
             // Every level slice is zero, so every base gather is zero however
             // it is computed. Report the trivial factorization and let the
@@ -1236,10 +1245,7 @@ fn read_digest(z: &[bool], base: usize) -> [u32; SLOT_WORDS] {
 /// Reference Merkle root: fold the path natively with the same node
 /// compression the R1CS encodes. Mirrors [`MerkleTreeLayout::build_witness`]
 /// without touching the witness, so a test can cross-check the two.
-pub fn reference_root(
-    spec: &HashSpec,
-    input: &PathInput,
-) -> [u32; SLOT_WORDS] {
+pub fn reference_root(spec: &HashSpec, input: &PathInput) -> [u32; SLOT_WORDS] {
     let mut prev = input.leaf;
     for (l, sib) in input.siblings.iter().enumerate() {
         let bit = (input.index >> l) & 1 == 1;

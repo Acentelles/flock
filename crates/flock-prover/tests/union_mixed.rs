@@ -1328,7 +1328,7 @@ fn merged_padding_unread_poison_pool() {
         let mut rng = Rng::new(0x_D1_47_00 ^ counts[0] as u64);
         let sha2_inputs = random_sha2_inputs(&mut rng, counts[0]);
         let blake3_inputs = random_blake3_inputs(&mut rng, counts[1]);
-        let mut prove = || {
+        let prove = || {
             let slots = vec![
                 UnionSlotProverInput::in_place(
                     |dst| sha2::generate_witness_batch_major_partial_into(&sha2_inputs, 7, dst),
