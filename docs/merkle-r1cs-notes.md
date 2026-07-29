@@ -257,14 +257,33 @@ subcubes with `κ = 14 > 6`. The union's per-slot `w_t` prefix weight scales the
   (including a `counts.len() != 2` check that happens to pass).
   `--mix merkle=N,blake3=M` needs parsing.
 - ~~**Two `#![feature(isolate_most_least_significant_one)]` lines**~~
-  **RESOLVED.** `isolate_most_least_significant_one` stabilized in **1.97.0**,
-  so both lines are gone and the repo is stable-clean — it now builds on plain
-  `cargo build` (measured on stable 1.97.1; the four call sites are
-  `ntt/inv_table.rs:87`, `inv_table_deg4.rs:110`,
-  `zerocheck/multilinear.rs:385`, `chain.rs:399`). Note the gates did not
-  merely become redundant, they became *breaking*: `#![feature]` is a hard
-  error on the stable channel, so the old tree no longer compiled there at all.
-  **Drop `+nightly` from the run commands.**
+  **RESOLVED, the second way.** Taking the notes' own second option: the four
+  sites are now `flock_core::bits::lowest_one` (`x & x.wrapping_neg()`), and
+  both `#![feature]` lines are gone. The method itself is no longer used
+  anywhere.
+
+  Dropping the gates alone was not enough. `isolate_most_least_significant_one`
+  stabilized in **1.97.0**, so gate-removal makes the tree need stable ≥ 1.97 —
+  but `edition = "2024"` otherwise builds on anything from 1.85, so that would
+  have silently raised the floor twelve releases and broken exactly the older
+  toolchain that motivated the gates in the first place. The rewrite depends on
+  no version at all.
+
+  Note also that the gates had stopped being merely redundant and become
+  *breaking*: `#![feature]` is a hard error (E0554) on stable, so the gated tree
+  did not build on stable 1.97.1 **at all**, only on nightly. That is the
+  build failure to expect if you check out any commit before `ba3dea6`.
+
+  Verified: `cargo build --workspace --all-targets` (release and debug) on
+  stable 1.97.1 **and** nightly 1.99. `bits::lowest_one` is pinned against a
+  `trailing_zeros` reference — deliberately not against
+  `usize::isolate_lowest_one`, since the point is that the tree builds without
+  it, tests included. `main` never carried the gates, so this restores parity
+  rather than diverging. **Drop `+nightly` from the run commands.**
+
+  Not declared: a `rust-version` MSRV. The true floor is now whatever edition
+  2024 needs (1.85), but only 1.97.1 and 1.99 were actually tested here, and an
+  untested MSRV claim is worse than none.
 - **The digest gap.** With stub matrices, `Registry::digest` binds the Merkle
   slot's `k_log`, `useful_bits` and `const_pin` — hence its depth, and in
   practice its backend — but **not** its constraint system. The verifier's
