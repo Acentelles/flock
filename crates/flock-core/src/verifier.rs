@@ -54,12 +54,29 @@ pub struct VerifyPhaseTimings {
 /// run their body via `verifier_pool().install(..)`. Any `par_iter` reached from
 /// there uses this 1-thread pool and collapses onto a single worker, without
 /// touching the prover's use of the global pool.
+/// Thread count for [`verifier_pool`]. **1 in production** — the override
+/// (`FLOCK_VERIFY_THREADS`) exists only so a benchmark can ask what the verify
+/// would cost with the prover's parallelism, since the pool below is otherwise
+/// the one place that decision is made. Read once per process, so a single run
+/// measures a single configuration.
+fn verifier_threads() -> usize {
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("FLOCK_VERIFY_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1)
+    })
+}
+
 fn verifier_pool() -> &'static rayon::ThreadPool {
     use std::sync::OnceLock;
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
+            .num_threads(verifier_threads())
             // The whole verify body runs on this worker — including the deep
             // recursive Ligerito verifier — so give it an ample stack. A rayon
             // worker otherwise defaults to ~2 MiB (vs the 8 MiB main thread),

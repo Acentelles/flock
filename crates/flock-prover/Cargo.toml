@@ -210,5 +210,9 @@ required-features = ["unsound-challenger"]
 name = "permutation"
 harness = false
 
+[[bench]]
+name = "merkle_vs_plain_blake3"
+harness = false
+
 [lints]
 workspace = true

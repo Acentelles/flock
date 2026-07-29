@@ -249,6 +249,65 @@ subcubes with `κ = 14 > 6`. The union's per-slot `w_t` prefix weight scales the
 
 ---
 
+# What the structure costs: Merkle table vs plain BLAKE3 table
+
+`benches/merkle_vs_plain_blake3.rs`. A depth-26 path is 26 compressions, so `n`
+paths is measured against **26n loose BLAKE3 compressions** — same hashing work,
+different R1CS encoding. Both sides go through the same union entry as a
+single-type registry, so only the table type differs. M4, 4 P-cores, median of 7.
+
+Caveat on what this compares: the Merkle side also proves the level-to-level
+dataflow (each digest feeds the next, plus a conditional swap per level); the
+plain side proves 26n *unrelated* compressions and nothing about how they
+connect. The plain side is a **lower bound** on any real Merkle circuit, not an
+equivalent statement.
+
+| | hashes | rows | dense_m | proof | wit/mt | prove/mt | prove/1t | verify/1t | verify/4t |
+|---|---|---|---|---|---|---|---|---|---|
+| merkle ×8 | 208 | 8 | 22 | 226 KiB | 10 ms | 126 ms | 256 ms | 95.0 ms | 32.1 ms |
+| blake3 | 208 | 208 | 22 | 220 KiB | 0 ms | 14 ms | 21 ms | 12.0 ms | 4.7 ms |
+| merkle ×16 | 416 | 16 | 23 | 237 KiB | 14 ms | 140 ms | 286 ms | 100.2 ms | 35.7 ms |
+| blake3 | 416 | 416 | 23 | 231 KiB | 0 ms | 19 ms | 26 ms | 12.6 ms | 4.4 ms |
+| merkle ×32 | 832 | 32 | 24 | 249 KiB | 20 ms | 154 ms | 331 ms | 105.0 ms | 35.9 ms |
+| blake3 | 832 | 832 | 24 | 242 KiB | 1 ms | 17 ms | 31 ms | 12.7 ms | 6.1 ms |
+| merkle ×64 | 1664 | 64 | 25 | 269 KiB | 41 ms | 183 ms | 401 ms | 109.5 ms | 36.5 ms |
+| blake3 | 1664 | 1664 | 25 | 261 KiB | 1 ms | 22 ms | 44 ms | 13.4 ms | 4.7 ms |
+
+**The structure costs roughly 8×** — prove 8.5–11× multi-threaded, 9–12×
+single-threaded, verify 6–8×. Stable across a 8× range of sizes.
+
+Three things worth keeping:
+
+* **`dense_m` matches exactly at every size, and so does proof size (within
+  3%).** Same hash count really does mean same committed area — a path's 26
+  blocks carry ~400K useful bits, and 26 loose blocks carry ~400K too. So the 8×
+  is *not* data volume. It is the shape: same area split as (few rows × `2^19`
+  block) instead of (many rows × `2^14`). Everything in the PIOP that scales
+  with `k_log` rather than with total area — 13 lincheck rounds instead of 8, a
+  `comb_vec` of `2^19` instead of `2^14` — is paid per proof no matter how few
+  paths there are.
+* **Both verifies are nearly flat in size** (Merkle 95 → 110 ms while the work
+  grows 8×), which is the same statement: verify is fixed cost. So Merkle
+  verify-per-compression falls 457 → 66 µs from 8 to 64 paths and keeps
+  improving; the 8× ratio is what survives after both sides amortize.
+* **Witness generation is not the story.** Broken out on purpose: Merkle
+  witness gen is 10–41 ms (BLAKE3's is 0–1 ms — 26n independent compressions
+  parallelize perfectly, a path's 26 levels are a sequential chain over only
+  8–64 paths). That is 8–22% of Merkle prove, so ~90% of the gap is genuinely
+  proving, not hashing.
+
+**The fold is no longer the lever.** The factored fold is ~13 ms of the 95 ms
+single-threaded Merkle verify — 14%. The 20× win above was real but the
+remaining 82 ms is zerocheck replay + PCS opening + lincheck sumcheck replay,
+undecomposed. Attributing it needs a `verify_ligerito_jagged_union_merged_timed`
+(only the non-merged jagged path has a timed variant today). **That is the next
+measurement to take**, before optimizing anything else.
+
+Verify parallelizes ~2.9× on 4 cores (95 → 32 ms) but production ships the
+1-thread pool deliberately; `FLOCK_VERIFY_THREADS` exists only for this bench.
+
+---
+
 ## Other open items
 
 - **`proof_io` / CLI don't know the new tiers.** `MixedProofBundleLigerito`
