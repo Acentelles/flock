@@ -163,6 +163,7 @@ fn m6_mixed_union_proof_bytes_pinned() {
             // path (identity compaction fills every lane), so they pin that
             // it is untouched.
             num_lanes: union.commit_lanes(6),
+            merkle_hash: Default::default(),
         };
         // Per-fixture seed so each count vector has its own witness stream.
         let mut rng = Rng::new(0x4D36_0000 ^ ((n_sha2 as u64) << 16) ^ n_blake3 as u64);

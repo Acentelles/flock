@@ -74,6 +74,7 @@ fn r1cs_prove_verify_roundtrip_ligerito() {
         log_batch_size: 6,
         profile: Default::default(),
         num_lanes: None,
+        merkle_hash: Default::default(),
     };
     let mut ch_p = FsChallenger::new(b"flock-lig-r1cs-v0");
     let z_packed = pcs::pack_witness(&z, r1cs.m);

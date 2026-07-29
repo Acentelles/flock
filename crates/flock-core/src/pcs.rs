@@ -2047,6 +2047,7 @@ mod tests {
             log_batch_size: initial_k,
             profile: Default::default(),
             num_lanes: None,
+            merkle_hash: Default::default(),
         };
         let z_packed = pack_witness(&z, m);
         let (commitment, prover_data) = commit(&z_packed, &params);
@@ -2071,6 +2072,7 @@ mod tests {
             grinding_bits: grinding_bits.clone(),
             fold_grinding_bits: vec![0; n_levels],
             ood_samples: vec![0; n_levels],
+            merkle_hash: Default::default(),
         };
         let lig_v_cfg = crate::pcs::ligerito::VerifierConfig {
             log_inv_rates,
@@ -2084,6 +2086,7 @@ mod tests {
             grinding_bits,
             fold_grinding_bits: vec![0; n_levels],
             ood_samples: vec![0; n_levels],
+            merkle_hash: Default::default(),
         };
 
         let mut ch_p = FsChallenger::new(b"flock-test-lig-v0");
@@ -2147,6 +2150,7 @@ mod tests {
             log_batch_size: initial_k,
             profile: Default::default(),
             num_lanes: None,
+            merkle_hash: Default::default(),
         };
         let z_packed = pack_witness(&z, m);
         let (commitment, prover_data) = commit(&z_packed, &params);
@@ -2316,6 +2320,7 @@ mod tests {
             log_batch_size: initial_k,
             profile: Default::default(),
             num_lanes: None,
+            merkle_hash: Default::default(),
         };
         let z_packed = pack_witness(&z, m_virtual);
         // The dense stack: used columns are the contiguous word prefix, so
