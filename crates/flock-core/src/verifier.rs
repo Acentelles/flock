@@ -284,7 +284,7 @@ pub fn verify_ligerito_jagged_union_timed<Ch: Challenger>(
         verifier_pool().install(|| -> Result<(ZClaim, ZClaim, f64, f64, f64), VerifyError> {
             union.bind_statement(challenger, commitment);
             let t0 = Instant::now();
-            let zc_claim = zerocheck::verify(union.m_total(), &proof.zerocheck, challenger)
+            let zc_claim = zerocheck::verify(union.m_bool(), &proof.zerocheck, challenger)
                 .map_err(VerifyError::Zerocheck)?;
             let zerocheck_s = t0.elapsed().as_secs_f64();
             let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
@@ -380,6 +380,13 @@ pub fn verify_ligerito_jagged_union_merged<Ch: Challenger>(
     pcs_params: &crate::pcs::PcsParams,
     challenger: &mut Ch,
 ) -> Result<R1csClaim, VerifyError> {
+    // Mirror of the prove-side guard: the merged transport has no
+    // packed-direct intake, so it cannot carry element claims yet.
+    assert!(
+        !union.has_element(),
+        "the merged transport does not carry element claims yet — \
+         use verify_ligerito_jagged_union"
+    );
     assert_eq!(
         pcs_params.m,
         union.dense_m(),
@@ -512,11 +519,14 @@ fn verify_union_with_binding<Ch: Challenger>(
             }
         }
 
-        let zc_claim = zerocheck::verify(union.m_total(), &proof.zerocheck, challenger)
+        // The boolean PIOP runs over the BOOLEAN REGION only — the prefix
+        // subcube `[0, 2^M_bool)`, `M_bool = M` for a boolean-only registry.
+        // (The element region cannot join this sum: `c = z` there.)
+        let zc_claim = zerocheck::verify(union.m_bool(), &proof.zerocheck, challenger)
             .map_err(VerifyError::Zerocheck)?;
         let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
-        // The union-column lincheck (one circuit per slot, in slot order);
-        // the declared counts additionally bind through the per-type
+        // The union-column lincheck (one circuit per BOOLEAN slot, in slot
+        // order); the declared counts additionally bind through the per-type
         // const-pin target terms.
         let lc_claim = lincheck::verify_union(
             union,

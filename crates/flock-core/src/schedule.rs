@@ -571,26 +571,94 @@ impl<'r> Instance<'r> {
     ///   `BlockR1cs::padding_spec`); the rest are an explicit zero run
     ///   (`useful = 0`), NOT an implicit gap, because later slots must keep
     ///   their static offsets.
-    /// - **The trailing gap** `[Σ_t 2^{nu+k_log_t}, 2^M)` after the last
-    ///   slot is the run-list's implicit all-zero gap.
+    /// - **Inter-slot gaps** — since the class-major layout, the boolean
+    ///   region's subcube tail plus the run-up to `element_base` — are an
+    ///   explicit zero run, for the same reason useless columns are: later
+    ///   slots must keep their static offsets. Every gap is a whole number
+    ///   of chunk-columns (`element_base` is a power of two `≥ 2^{7+nu}` and
+    ///   every slot area is a multiple of `2^{7+nu}`).
+    /// - **The trailing gap** after the last slot is the run-list's implicit
+    ///   all-zero gap.
+    ///
+    /// Element slots need no special case: their `k_log = kappa + 7` makes
+    /// `n_cols = 2^kappa` word-columns and `useful_cols = k`, so the same
+    /// two runs describe "k used element columns at the declared row count,
+    /// the rest zero padding".
     pub fn padding_spec(&self) -> PaddingSpec {
         let nu = self.registry.nu();
-        let mut runs = Vec::with_capacity(2 * self.counts.len());
-        for (ty, &n_t) in self.registry.types().iter().zip(&self.counts) {
+        let col_bits = 7 + nu;
+        let mut runs = Vec::with_capacity(3 * self.counts.len());
+        let mut cursor = 0usize;
+        for ((ty, slot), &n_t) in self
+            .registry
+            .types()
+            .iter()
+            .zip(self.registry.slots())
+            .zip(&self.counts)
+        {
+            // Explicit zero run for any gap before this slot.
+            debug_assert!(slot.offset >= cursor);
+            let gap = slot.offset - cursor;
+            debug_assert!(gap.is_multiple_of(1usize << col_bits), "gap {gap} not column-aligned");
+            runs.push(PaddingRun {
+                k_log: col_bits,
+                useful_bits_per_block: 0,
+                n_blocks: gap >> col_bits,
+            });
             let n_cols = 1usize << (ty.k_log - 7);
             let useful_cols = ty.useful_bits.div_ceil(128).min(n_cols);
             // Declared data: chunk-columns with the declared-row prefix.
             runs.push(PaddingRun {
-                k_log: 7 + nu,
+                k_log: col_bits,
                 useful_bits_per_block: n_t << 7,
                 n_blocks: useful_cols,
             });
             // Useless chunk-columns: address space with no data (explicit).
             runs.push(PaddingRun {
-                k_log: 7 + nu,
+                k_log: col_bits,
                 useful_bits_per_block: 0,
                 n_blocks: n_cols - useful_cols,
             });
+            cursor = slot.offset + slot.area();
+        }
+        PaddingSpec::from_runs(runs)
+    }
+
+    /// The boolean-class prefix of [`Self::padding_spec`] — the run-list over
+    /// the boolean region `[0, 2^{M_bool})` alone, which is the domain the
+    /// boolean zerocheck runs on. Identical to [`Self::padding_spec`] for a
+    /// boolean-only registry (the element runs and the class gap are exactly
+    /// what it drops), so the boolean PIOP is untouched there.
+    pub fn boolean_padding_spec(&self) -> PaddingSpec {
+        let nu = self.registry.nu();
+        let col_bits = 7 + nu;
+        let nb = self.registry.num_boolean();
+        let mut runs = Vec::with_capacity(3 * nb);
+        let mut cursor = 0usize;
+        for ((ty, slot), &n_t) in self.registry.types()[..nb]
+            .iter()
+            .zip(&self.registry.slots()[..nb])
+            .zip(&self.counts[..nb])
+        {
+            let gap = slot.offset - cursor;
+            runs.push(PaddingRun {
+                k_log: col_bits,
+                useful_bits_per_block: 0,
+                n_blocks: gap >> col_bits,
+            });
+            let n_cols = 1usize << (ty.k_log - 7);
+            let useful_cols = ty.useful_bits.div_ceil(128).min(n_cols);
+            runs.push(PaddingRun {
+                k_log: col_bits,
+                useful_bits_per_block: n_t << 7,
+                n_blocks: useful_cols,
+            });
+            runs.push(PaddingRun {
+                k_log: col_bits,
+                useful_bits_per_block: 0,
+                n_blocks: n_cols - useful_cols,
+            });
+            cursor = slot.offset + slot.area();
         }
         PaddingSpec::from_runs(runs)
     }

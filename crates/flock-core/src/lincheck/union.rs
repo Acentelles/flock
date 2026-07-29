@@ -148,11 +148,12 @@ pub fn union_comb_partial(
     rr: &[F128],
     k_skip: usize,
 ) -> Vec<F128> {
-    assert_eq!(combs.len(), registry.num_types());
-    assert_eq!(rr.len(), registry.m_total() - registry.nu() - k_skip);
+    let nb = registry.num_boolean();
+    assert_eq!(combs.len(), nb);
+    assert_eq!(rr.len(), registry.m_bool() - registry.nu() - k_skip);
     let n_skip = 1usize << k_skip;
     let mut out = vec![F128::ZERO; n_skip];
-    for ((ty, slot), comb) in registry.types().iter().zip(registry.slots()).zip(combs) {
+    for ((ty, slot), comb) in registry.boolean_types().iter().zip(registry.slots()).zip(combs) {
         assert_eq!(comb.len(), 1usize << ty.k_log);
         let inner = ty.k_log - k_skip;
         let p_t = eq_prefix_weight(&rr[inner..], slot.prefix);
@@ -185,17 +186,17 @@ pub fn prove_union_capture_z_vec<Ch: Challenger>(
     let registry = union.registry();
     let k_skip = K_SKIP;
     let nu = union.n_log();
-    let col_vars = union.m_total() - nu;
+    let col_vars = union.m_bool() - nu;
     let inner_rest_len = col_vars - k_skip;
     assert!(nu >= 3, "lincheck stripe fold needs n_outer ≥ 8 (nu ≥ 3)");
     assert_eq!(
         slots.len(),
-        registry.num_types(),
-        "one lincheck input per registry type"
+        registry.num_boolean(),
+        "one lincheck input per BOOLEAN registry type (element slots have their own PIOP)"
     );
     assert_eq!(x_ab.x_inner_rest.len(), inner_rest_len);
     assert_eq!(x_ab.x_outer.len(), nu);
-    for (ty, slot_in) in registry.types().iter().zip(slots) {
+    for (ty, slot_in) in registry.boolean_types().iter().zip(slots) {
         assert_eq!(
             slot_in.circuit.n_cols(),
             1usize << ty.k_log,
@@ -228,7 +229,10 @@ pub fn prove_union_capture_z_vec<Ch: Challenger>(
     //    and placed at the slot's aligned column offset `o_t / 2^ν`.
     //    Dense union-column placement (see module docs); a single slot is
     //    today's comb vector, moved.
-    let single = registry.num_types() == 1;
+    // The T = 1 fast path (today's vectors verbatim) needs the one boolean
+    // slot to FILL the boolean region — true for every single-type registry,
+    // and for no multi-slot one.
+    let single = registry.num_boolean() == 1 && registry.slots()[0].m_slot == registry.m_bool();
     let t_comb = if trace {
         Some(std::time::Instant::now())
     } else {
@@ -239,7 +243,12 @@ pub fn prove_union_capture_z_vec<Ch: Challenger>(
     } else {
         vec![F128::ZERO; 1usize << col_vars]
     };
-    for ((ty, slot), slot_in) in registry.types().iter().zip(registry.slots()).zip(slots) {
+    for ((ty, slot), slot_in) in registry
+        .boolean_types()
+        .iter()
+        .zip(registry.slots())
+        .zip(slots)
+    {
         let inner = ty.k_log - k_skip;
         let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest[..inner], k_skip);
         let comb_t = slot_in.circuit.fold_alpha_batched(alpha, &eq_inner);
@@ -291,7 +300,7 @@ pub fn prove_union_capture_z_vec<Ch: Challenger>(
         vec![F128::ZERO; 1usize << col_vars]
     };
     for (((ty, slot), slot_in), &n_t) in registry
-        .types()
+        .boolean_types()
         .iter()
         .zip(registry.slots())
         .zip(slots)
@@ -350,16 +359,16 @@ pub fn verify_union<Ch: Challenger>(
     let registry = union.registry();
     let k_skip = K_SKIP;
     let nu = union.n_log();
-    let col_vars = union.m_total() - nu;
+    let col_vars = union.m_bool() - nu;
     let inner_rest_len = col_vars - k_skip;
     let n_skip = 1usize << k_skip;
 
     assert_eq!(
         circuits.len(),
-        registry.num_types(),
-        "one circuit per registry type"
+        registry.num_boolean(),
+        "one circuit per BOOLEAN registry type (element slots have their own PIOP)"
     );
-    for (ty, circuit) in registry.types().iter().zip(circuits) {
+    for (ty, circuit) in registry.boolean_types().iter().zip(circuits) {
         let k = 1usize << ty.k_log;
         if circuit.n_cols() != k {
             return Err(VerifyError::BadMatrixShape {
@@ -413,7 +422,7 @@ pub fn verify_union<Ch: Challenger>(
     //    the prover made), pre-scaled by the slot prefix weight w_t(r) so
     //    the closed form below only supplies the bound-point subcube factor.
     let mut combs: Vec<Vec<F128>> = registry
-        .types()
+        .boolean_types()
         .iter()
         .zip(registry.slots())
         .zip(circuits)
@@ -512,16 +521,16 @@ pub fn verify_union_timed<Ch: Challenger>(
     let registry = union.registry();
     let k_skip = K_SKIP;
     let nu = union.n_log();
-    let col_vars = union.m_total() - nu;
+    let col_vars = union.m_bool() - nu;
     let inner_rest_len = col_vars - k_skip;
     let n_skip = 1usize << k_skip;
 
     assert_eq!(
         circuits.len(),
-        registry.num_types(),
-        "one circuit per registry type"
+        registry.num_boolean(),
+        "one circuit per BOOLEAN registry type (element slots have their own PIOP)"
     );
-    for (ty, circuit) in registry.types().iter().zip(circuits) {
+    for (ty, circuit) in registry.boolean_types().iter().zip(circuits) {
         let k = 1usize << ty.k_log;
         if circuit.n_cols() != k {
             return Err(VerifyError::BadMatrixShape {
@@ -572,7 +581,7 @@ pub fn verify_union_timed<Ch: Challenger>(
     // --- per-type comb construction (the O(Σ_t nnz_t) fold_alpha_batched) ---
     let t0 = Instant::now();
     let mut combs: Vec<Vec<F128>> = registry
-        .types()
+        .boolean_types()
         .iter()
         .zip(registry.slots())
         .zip(circuits)

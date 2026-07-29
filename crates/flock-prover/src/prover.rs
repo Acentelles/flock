@@ -645,6 +645,15 @@ pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
     R1csClaim,
 ) {
     let m = union.m_total();
+    // Element claims ride the UNMERGED jagged transport only in this
+    // milestone: the merged intake requires DeferredDense ring-switch claims
+    // and has no packed-direct path. Rejected loudly rather than silently
+    // dropping the element PIOP.
+    assert!(
+        !union.has_element(),
+        "the merged transport does not carry element claims yet — \
+         use prove_fast_ligerito_jagged_union"
+    );
     assert_eq!(
         pcs_params.m,
         union.dense_m(),
@@ -846,7 +855,6 @@ fn prove_union_with_binding<Ch: Challenger>(
     if let UnionProveBinding::SingleTypeHarness(slot_r1cs) = binding {
         union.expect_single_type_slot(slot_r1cs);
     }
-    let m = union.m_total();
     // The commitment is to the DENSE stack q (M4): PcsParams.m is the dense
     // variable count; the PIOP and the virtual-opening sumcheck keep the
     // M-variable padded address space.
@@ -913,32 +921,39 @@ fn prove_union_with_binding<Ch: Challenger>(
         }
     }
 
-    // Zerocheck over the union address space, driven by the count-derived
-    // run-list (the existing kernels' general multi-run paths — value-
-    // identical to the single-run spec on honestly-zero padding).
+    // Zerocheck over the BOOLEAN REGION of the union address space — the
+    // prefix subcube `[0, 2^M_bool)` — driven by the count-derived run-list
+    // (the existing kernels' general multi-run paths, value-identical to the
+    // single-run spec on honestly-zero padding).
+    //
+    // The element region is NOT part of this sum. It cannot be: the union
+    // zerocheck passes `c = z`, so on the element region the honest summand is
+    // `0·0 − z ≠ 0` and the global sum would not vanish. `M_bool = M` for a
+    // boolean-only registry, so nothing here changes for one.
     let padding = union.padding_spec();
+    let bool_padding = union.boolean_padding_spec();
+    let m_bool = union.m_bool();
+    let bool_words = union.boolean_packed_len();
     let (zc_proof, zc_claim, s_hat_v_c) = {
         // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
-        let a_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                a_packed_f128.as_ptr() as *const u8,
-                a_packed_f128.len() * core::mem::size_of::<F128>(),
-            )
+        let view = |v: &[F128]| -> &[u8] {
+            unsafe {
+                std::slice::from_raw_parts(
+                    v.as_ptr() as *const u8,
+                    bool_words * core::mem::size_of::<F128>(),
+                )
+            }
         };
-        let b_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                b_packed_f128.as_ptr() as *const u8,
-                b_packed_f128.len() * core::mem::size_of::<F128>(),
-            )
-        };
-        let c_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                z_packed.as_ptr() as *const u8,
-                z_packed.len() * core::mem::size_of::<F128>(),
-            )
-        };
+        let a_packed = view(&a_packed_f128);
+        let b_packed = view(&b_packed_f128);
+        let c_packed = view(&z_packed);
         zerocheck::prove_packed_padded_capture_s_hat_v_c(
-            a_packed, b_packed, c_packed, m, &padding, challenger,
+            a_packed,
+            b_packed,
+            c_packed,
+            m_bool,
+            &bool_padding,
+            challenger,
         )
     };
     // a/b are consumed; recycle the buffers as in `prove_fast_core`.
@@ -981,11 +996,18 @@ fn prove_union_with_binding<Ch: Challenger>(
     };
 
     // `s_hat_v_from_z_vec` needs `z_vec.len() = 2^LOG_PACKING · 2^tail`;
-    // the union fold has `len = 2^(M−ν)` and `tail = M−ν−LOG_PACKING`, so
-    // the condition is `M−ν ≥ LOG_PACKING` — for a single-type registry
-    // exactly the old `k_log ≥ LOG_PACKING`, and always true for real
-    // registries (every `k_log ≥ 7`).
-    let s_hat_v_ab = if m - union.n_log() >= pcs::LOG_PACKING {
+    // the boolean fold has `len = 2^(M_bool−ν)` and
+    // `tail = M_bool−ν−LOG_PACKING`, so the condition is
+    // `M_bool−ν ≥ LOG_PACKING` — for a single-type registry exactly the old
+    // `k_log ≥ LOG_PACKING`, and always true for real registries (every
+    // `k_log ≥ 7`).
+    //
+    // The precomputed value stays honest even though the AB claim's point now
+    // carries `M − M_bool` frozen ZERO high coordinates: `s_hat_v[b] =
+    // Σ_j eq(suffix, j)·bit_b(w[j])` and those zeros kill every `j` outside
+    // the boolean region, so the full-buffer fold equals this boolean-region
+    // one term for term.
+    let s_hat_v_ab = if m_bool - union.n_log() >= pcs::LOG_PACKING {
         Some(pcs::ring_switch::s_hat_v_from_z_vec(
             &z_vec_pre,
             &lc_claim.r_inner_rest[1..],
