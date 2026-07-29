@@ -193,8 +193,24 @@ fn build_s_id_vec(mu: usize, basis: &[F128]) -> Vec<F128> {
     v
 }
 
-/// Threshold for the embarrassingly-parallel gate loop.
-const PAR_THRESHOLD: usize = 1 << 12;
+/// Threshold for the embarrassingly-parallel gate loop. Overridable via
+/// `FLOCK_GKR_GATE` for tuning.
+///
+/// At μ=20 this keeps the four widest layers — ~94% of the gate work — on the
+/// pool while the geometrically shrinking tail runs serial instead of paying a
+/// rayon dispatch per layer. Measured best-of-3 on an M4 Max: 0.86 ms here
+/// against 1.22 ms at the previous `1<<12`.
+const PAR_THRESHOLD_DEFAULT: usize = 1 << 16;
+
+fn par_threshold() -> usize {
+    static GATE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("FLOCK_GKR_GATE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(PAR_THRESHOLD_DEFAULT)
+    })
+}
 
 /// Phase tracing, enabled by `GKR_TRACE=1` (mirrors `PERM_TRACE` in
 /// [`crate::permutation`]). Read once.
@@ -420,7 +436,7 @@ fn mle_eval(table: &[F128], point: &[F128]) -> F128 {
 fn build_layer(v_next: &[F128]) -> Vec<F128> {
     let h = v_next.len() / 2;
     let gate = |i: usize| v_next[i] * v_next[i + h];
-    if h >= PAR_THRESHOLD {
+    if h >= par_threshold() {
         (0..h).into_par_iter().map(gate).collect()
     } else {
         (0..h).map(gate).collect()
@@ -832,18 +848,32 @@ pub fn prove_batched<C: Challenger>(
     let beta = ch.sample_f128();
 
     let basis = s_id_basis(mu);
-    let s_id_vec = build_s_id_vec(mu, &basis);
-    let s_sig_vec: Vec<F128> = sigma.par_iter().map(|&sx| s_id_vec[sx]).collect();
+    // `s_id(x)` is the field element whose bit pattern *is* `x`, so it needs no
+    // table: `n = 2^μ` must fit a `usize`, hence μ ≤ 64 and every tag is just
+    // the index widened. That drops the `O(N)` `s_id` build outright, and turns
+    // `s_σ` from a random-access gather through that table into a linear map.
+    // (`tag_matches_basis_expansion` pins this against `s_id_value`.)
+    debug_assert!(mu <= 64, "s_id-as-index needs μ ≤ 64");
+    let tag = |i: usize| F128::new(i as u64, 0);
+    let s_sig_vec: Vec<F128> = sigma
+        .par_iter()
+        .with_min_len(par_threshold())
+        .map(|&sx| tag(sx))
+        .collect();
+    tp(&mut t, "  s_sigma");
     let lhs: Vec<F128> = f
         .par_iter()
-        .zip(&s_id_vec)
-        .map(|(fx, sx)| *fx + alpha * *sx + beta)
+        .enumerate()
+        .with_min_len(par_threshold())
+        .map(|(x, fx)| *fx + alpha * tag(x) + beta)
         .collect();
     let rhs: Vec<F128> = g
         .par_iter()
         .zip(&s_sig_vec)
+        .with_min_len(par_threshold())
         .map(|(gx, sx)| *gx + alpha * *sx + beta)
         .collect();
+    tp(&mut t, "  lhs,rhs");
 
     // Build both circuits' layers (index k has 2^k entries; k = mu is input).
     let mut l_layers: Vec<Vec<F128>> = vec![Vec::new(); mu + 1];
@@ -858,7 +888,7 @@ pub fn prove_batched<C: Challenger>(
     let top_rhs = r_layers[0][0];
     ch.observe_f128(top_lhs);
     ch.observe_f128(top_rhs);
-    tp(&mut t, "witness+layers");
+    tp(&mut t, "  build-layers");
 
     let mut r_pt: Vec<F128> = Vec::new();
     let mut layers = Vec::with_capacity(mu);
@@ -1265,6 +1295,22 @@ mod tests {
                 log_n - 1,
                 ms * 1e6 / (n / 2) as f64
             );
+        }
+    }
+
+    /// `prove_batched` builds its `s_id` tags by widening the index instead of
+    /// expanding the basis into an `O(N)` table. Pin the two against each other,
+    /// including the `build_s_id_vec` table `prove` still uses.
+    #[test]
+    fn tag_matches_basis_expansion() {
+        for mu in 1..=12 {
+            let basis = s_id_basis(mu);
+            let table = build_s_id_vec(mu, &basis);
+            for x in 0..(1usize << mu) {
+                let tag = F128::new(x as u64, 0);
+                assert_eq!(tag, s_id_value(x, &basis), "μ={mu}, x={x}: basis");
+                assert_eq!(tag, table[x], "μ={mu}, x={x}: table");
+            }
         }
     }
 
