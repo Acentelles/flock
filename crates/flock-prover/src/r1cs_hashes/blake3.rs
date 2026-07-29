@@ -1611,7 +1611,11 @@ fn bm_add_inline(
 /// Build one V = 8 group of compressions into interleaved rows. Mirrors
 /// [`build_block_witness_ab_packed_into`] field-for-field (byte-equality is
 /// pinned by the lockstep test below).
-fn build_group_batch_major(
+/// `pub(crate)` so the composite Merkle block can reuse it per level: a
+/// level's subcube IS this base block, aligned to a `2^k_log` boundary (hence
+/// a whole number of `u64` rows), so `merkle_r1cs` calls this on the level's
+/// row window and then writes only the swap-gadget and global columns itself.
+pub(crate) fn build_group_batch_major(
     inputs: [&Compression; BM_V],
     rz: &mut [BmRow],
     ra: &mut [BmRow],

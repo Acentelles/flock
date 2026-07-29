@@ -161,6 +161,25 @@ pub struct HashSpec {
     /// a matrix application anywhere on this path.
     pub node_witness_ab:
         fn(&[u32; SLOT_WORDS], &[u32; SLOT_WORDS], &mut [u64], &mut [u64], &mut [u64]),
+    /// **The batch-major fast path**: `BM_V = 8` node compressions at once,
+    /// written lane-interleaved into one level's row window.
+    ///
+    /// `rows[w][j]` is `u64` word `w` of lane `j`'s block, matching
+    /// `common::BmRow` (spelled out here because `BmRow`/`BM_V` are
+    /// crate-internal and this struct is public). Rows are zero on entry and
+    /// the writers OR into them, exactly as the per-hash batch-major group
+    /// builders do — so this is the same primitive BLAKE3's own driver uses,
+    /// which is the point: the composite gets the base encoder's lane-parallel
+    /// witness generation for free instead of unpacking to `bool` and back.
+    ///
+    /// The pairs are `(left, right)` per lane, already swapped.
+    #[allow(clippy::type_complexity)]
+    pub node_group_ab: fn(
+        &[([u32; SLOT_WORDS], [u32; SLOT_WORDS]); 8],
+        &mut [[u64; 8]],
+        &mut [[u64; 8]],
+        &mut [[u64; 8]],
+    ),
     /// Base-block columns the composite pins to constants, as
     /// `(column, value)`: every free input of the base encoder EXCEPT the
     /// message region, which the swap gadget drives.
@@ -182,6 +201,7 @@ pub fn blake3_spec() -> HashSpec {
         build_matrices: blake3::build_matrices,
         node_witness: blake3_node_witness,
         node_witness_ab: blake3_node_witness_ab,
+        node_group_ab: blake3_node_group_ab,
         fixed_bits: blake3_fixed_bits,
     }
 }
@@ -221,6 +241,27 @@ fn blake3_node_witness_ab(
         a,
         b,
     );
+}
+
+/// Eight node compressions at once, straight into a level's row window —
+/// BLAKE3's own batch-major group builder, fed the Merkle node constants.
+fn blake3_node_group_ab(
+    pairs: &[([u32; SLOT_WORDS], [u32; SLOT_WORDS]); 8],
+    rz: &mut [[u64; 8]],
+    ra: &mut [[u64; 8]],
+    rb: &mut [[u64; 8]],
+) {
+    let blocks: [blake3::Compression; 8] = std::array::from_fn(|j| {
+        (
+            blake3::BLAKE3_IV,
+            node_msg(&pairs[j].0, &pairs[j].1),
+            NODE_COUNTER,
+            NODE_BLOCK_LEN,
+            BLAKE3_FLAG_PARENT,
+        )
+    });
+    let refs: [&blake3::Compression; 8] = std::array::from_fn(|j| &blocks[j]);
+    blake3::build_group_batch_major(refs, rz, ra, rb);
 }
 
 /// BLAKE3's free inputs other than the message: `cv = IV`, `counter = 0`,
@@ -779,6 +820,180 @@ impl MerkleTreeLayout {
     /// (`flock_core::lincheck::union`). Do NOT substitute a "path over zero
     /// inputs": that would set the pin and be rejected.
     pub fn generate_witness_batch_major_partial(
+        &self,
+        paths: &[PathInput],
+        nu: usize,
+    ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
+        let k = self.k();
+        let total = (1usize << nu) * (k / 128);
+        let mut z = vec![F128::ZERO; total];
+        let mut a = vec![F128::ZERO; total];
+        let mut b = vec![F128::ZERO; total];
+        let stripe = self.generate_witness_batch_major_partial_into(
+            paths,
+            nu,
+            flock_core::union::SlotWitnessDest {
+                z: &mut z,
+                a: &mut a,
+                b: &mut b,
+                elide_padding_writes: false,
+            },
+        );
+        (z, a, b, stripe)
+    }
+
+    /// [`Self::generate_witness_batch_major_partial`] writing into a union
+    /// slot's destination buffers — the copy-free assembly path, and the
+    /// implementation both variants share.
+    ///
+    /// Runs on the same `common::drive_witness_batch_major_partial_into`
+    /// driver as the per-hash encoders, with the same `BM_V = 8` lane-parallel
+    /// group builder underneath (see [`HashSpec::node_group_ab`]). The
+    /// composite is expressible this way *because levels are `2^κ`-aligned*:
+    /// level `l`'s subcube is exactly the base block at u64-row offset
+    /// `l · 2^κ/64`, so the base encoder's packed output drops in with no bit
+    /// shifting, and the only columns this function writes itself are the swap
+    /// gadget (sibling, `t`) and level 0's globals.
+    pub fn generate_witness_batch_major_partial_into(
+        &self,
+        paths: &[PathInput],
+        nu: usize,
+        dst: flock_core::union::SlotWitnessDest<'_>,
+    ) -> Vec<u8> {
+        use super::common::{BM_V, BmRow, or_bit_row, or_u32_row};
+
+        const _: () = assert!(BM_V == 8, "HashSpec::node_group_ab hardcodes 8 lanes");
+        assert!(
+            paths.len() <= 1usize << nu,
+            "{} paths > 2^{nu} rows",
+            paths.len()
+        );
+        for p in paths {
+            assert_eq!(
+                p.siblings.len(),
+                self.depth,
+                "need one sibling digest per level"
+            );
+        }
+        let spec = &self.spec;
+        // A level window is a whole number of u64 rows — the alignment that
+        // makes this driver usable at all.
+        assert!(
+            spec.k_log >= 6,
+            "a level stride of 2^{} bits is not a u64 multiple",
+            spec.k_log
+        );
+        let words_per_level = 1usize << (spec.k_log - 6);
+        // The output chaining value must be u64-aligned so the next level's
+        // input can be read straight back out of the packed rows.
+        assert_eq!(
+            spec.out_cv_base % 64,
+            0,
+            "out_cv_base must be u64-aligned to chain levels in packed form"
+        );
+        let out_word = spec.out_cv_base / 64;
+        let depth = self.depth;
+
+        // Window-relative offsets. Level-independent, since every level's
+        // subcube is the base block (see `sibling_bit` / `t_bit`).
+        let sib_off = spec.useful_bits;
+        let t_off = spec.useful_bits + SLOT_BITS;
+        let const_off = self.const_pos();
+        let leaf_off = const_off + 1;
+        let index_off = const_off + 1 + SLOT_BITS;
+
+        super::common::drive_witness_batch_major_partial_into(
+            paths,
+            nu,
+            self.k_log,
+            self.useful_bits,
+            dst,
+            move |group, rz, ra, rb| {
+                // Per-lane running digest: the leaf, then each level's output.
+                let mut prev: [[u32; SLOT_WORDS]; BM_V] = std::array::from_fn(|j| group[j].leaf);
+
+                for l in 0..depth {
+                    let w0 = l * words_per_level;
+                    let win = w0..w0 + words_per_level;
+                    let (wz, wa, wb): (&mut [BmRow], &mut [BmRow], &mut [BmRow]) =
+                        (&mut rz[win.clone()], &mut ra[win.clone()], &mut rb[win]);
+
+                    // The conditional swap, per lane. `mask` is the index bit
+                    // broadcast over a word — the AND row's `a` operand.
+                    let mut pairs = [([0u32; SLOT_WORDS], [0u32; SLOT_WORDS]); BM_V];
+                    let mut mask = [0u32; BM_V];
+                    for j in 0..BM_V {
+                        let bit = (group[j].index >> l) & 1 == 1;
+                        mask[j] = if bit { !0u32 } else { 0 };
+                        let sib = group[j].siblings[l];
+                        pairs[j] = if bit { (prev[j], sib) } else { (sib, prev[j]) };
+                    }
+
+                    // The hash block itself, verbatim from the base encoder —
+                    // including the rows the composite overrides, whose row
+                    // kinds already agree (see `HashSpec::node_witness_ab`).
+                    (spec.node_group_ab)(&pairs, wz, wa, wb);
+
+                    for w in 0..SLOT_WORDS {
+                        // Sibling: a free column (z = a = S, b = 1).
+                        let sib: [u32; BM_V] = std::array::from_fn(|j| group[j].siblings[l][w]);
+                        or_u32_row(wz, sib_off + 32 * w, &sib);
+                        or_u32_row(wa, sib_off + 32 * w, &sib);
+                        or_u32_row(wb, sib_off + 32 * w, &[!0u32; BM_V]);
+
+                        // t = b_l · (prev ⊕ S): A = [b_l], B = [prev, S].
+                        let xor: [u32; BM_V] = std::array::from_fn(|j| prev[j][w] ^ sib[j]);
+                        let t: [u32; BM_V] = std::array::from_fn(|j| mask[j] & xor[j]);
+                        or_u32_row(wz, t_off + 32 * w, &t);
+                        or_u32_row(wa, t_off + 32 * w, &mask);
+                        or_u32_row(wb, t_off + 32 * w, &xor);
+                    }
+
+                    if l == 0 {
+                        // The globals live in level 0's padding region.
+                        or_bit_row(wz, const_off);
+                        or_bit_row(wa, const_off);
+                        or_bit_row(wb, const_off);
+                        for w in 0..SLOT_WORDS {
+                            let leaf: [u32; BM_V] = std::array::from_fn(|j| group[j].leaf[w]);
+                            or_u32_row(wz, leaf_off + 32 * w, &leaf);
+                            or_u32_row(wa, leaf_off + 32 * w, &leaf);
+                            or_u32_row(wb, leaf_off + 32 * w, &[!0u32; BM_V]);
+                        }
+                        // One index bit per level. Written one at a time
+                        // rather than 32 at a stride: bits at or above `depth`
+                        // are interior padding that empty rows force to zero,
+                        // so a wider store would break the R1CS.
+                        for i in 0..depth {
+                            let v: [u32; BM_V] =
+                                std::array::from_fn(|j| ((group[j].index >> i) & 1) as u32);
+                            or_u32_row(wz, index_off + i, &v);
+                            or_u32_row(wa, index_off + i, &v);
+                            or_bit_row(wb, index_off + i);
+                        }
+                    }
+
+                    // Chain: read this level's output CV back out of the
+                    // packed rows (u64-aligned, asserted above).
+                    for j in 0..BM_V {
+                        for w in 0..SLOT_WORDS / 2 {
+                            let word = wz[out_word + w][j];
+                            prev[j][2 * w] = word as u32;
+                            prev[j][2 * w + 1] = (word >> 32) as u32;
+                        }
+                    }
+                }
+            },
+        )
+    }
+
+    /// The original per-path `Vec<bool>` builder, retained as the reference
+    /// oracle for [`Self::generate_witness_batch_major_partial_into`] — the
+    /// same role `build_matrices` plays for the walker. Straightforward and
+    /// slow: it unpacks the base encoder's packed rows bit-by-bit and then
+    /// repacks them, allocating 3 × `2^k_log` bytes of `Vec<bool>` per path.
+    /// Not `#[cfg(test)]` because the equality test is an integration test.
+    pub fn generate_witness_batch_major_partial_bool(
         &self,
         paths: &[PathInput],
         nu: usize,

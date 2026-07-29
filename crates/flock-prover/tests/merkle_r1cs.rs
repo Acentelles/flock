@@ -398,6 +398,63 @@ fn walker_matches_materialized() {
     }
 }
 
+/// THE packed-driver test: the batch-major driver must produce **bit-identical**
+/// `(z, a, b, stripe)` to the original per-path `Vec<bool>` builder.
+///
+/// This is what licenses replacing the witness generator: the packed path
+/// reuses BLAKE3's lane-parallel group builder per level and writes only the
+/// swap gadget and globals itself, so a single misplaced bit offset would be
+/// invisible to the R1CS-satisfaction tests at some depths but caught here at
+/// every depth. Partial counts are covered too (dummy rows must stay
+/// identically zero, const pin included — the union's lincheck target
+/// depends on it).
+#[test]
+fn packed_driver_matches_bool_reference() {
+    for (depth, nu, n_paths) in [
+        (1usize, 3usize, 8usize),
+        (2, 3, 8),
+        (3, 3, 5), // partial: 3 dummy rows
+        (26, 3, 8),
+        (26, 4, 11), // partial at a wider capacity
+        (26, 3, 1),  // single declared path, 7 dummies
+    ] {
+        let layout = MerkleTreeLayout::new(depth, blake3_spec());
+        let mut rng = Rng::new(0x_9AC7_ED00 + (depth as u64) * 16 + nu as u64);
+        // Vary the index across paths so both swap directions occur at every
+        // level; a fixed index would leave one branch of the gadget untested.
+        let paths: Vec<PathInput> = (0..n_paths)
+            .map(|i| path(&mut rng, depth, (i as u64).wrapping_mul(0x9E37_79B9)))
+            .collect();
+
+        let (gz, ga, gb, gs) = layout.generate_witness_batch_major_partial(&paths, nu);
+        let (wz, wa, wb, ws) = layout.generate_witness_batch_major_partial_bool(&paths, nu);
+
+        let ctx = format!("depth {depth}, nu {nu}, {n_paths} paths");
+        for (name, got, want) in [("z", &gz, &wz), ("a", &ga, &wa), ("b", &gb, &wb)] {
+            assert_eq!(got.len(), want.len(), "{ctx}: {name} length");
+            if got != want {
+                let i = (0..got.len()).find(|&i| got[i] != want[i]).unwrap();
+                panic!(
+                    "{ctx}: {name} differs at word {i} of {}: packed {:?} vs bool {:?}",
+                    got.len(),
+                    got[i],
+                    want[i]
+                );
+            }
+        }
+        assert_eq!(gs.len(), ws.len(), "{ctx}: stripe length");
+        if gs != ws {
+            let i = (0..gs.len()).find(|&i| gs[i] != ws[i]).unwrap();
+            panic!(
+                "{ctx}: stripe differs at byte {i} of {}: packed {:#04x} vs bool {:#04x}",
+                gs.len(),
+                gs[i],
+                ws[i]
+            );
+        }
+    }
+}
+
 /// A lincheck-shaped `eq_inner`: `build_quirky_eq_table` at a random point,
 /// exactly what `lincheck::prove` / `verify_union` hand the circuit.
 fn quirky_eq(rng: &mut Rng, k_log: usize) -> Vec<F128> {

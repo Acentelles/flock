@@ -402,22 +402,56 @@ So the answer is **scale-dependent**: at 208 compressions the assist is ~94% of
 the prove gap and witness gen ~8%; by 13k–27k, witness gen is over half of
 Merkle prove and ~40× BLAKE3's per compression.
 
-**This is an implementation gap, not a protocol one.** `build_witness_zab`
-already calls the *packed* `node_witness_ab` hook into u64 buffers — and then
-throws the packing away:
+This was an implementation gap, not a protocol one. **FIXED** — see the next
+section. The old path (`generate_witness_batch_major_partial_bool`, retained as
+the test oracle) called the *packed* `node_witness_ab` hook into u64 buffers and
+then threw the packing away:
 
-1. unpacks bit-by-bit into three `vec![false; 2^19]` (**1.5 MB of `Vec<bool>`
-   per path**, and `.collect()` holds all of them at once — 1.6 GB at 1024
-   paths, which is most of the 2.6 GB peak RSS);
-2. a **sequential** scatter loop repacks those bools into `F128` via
+1. unpacked bit-by-bit into three `vec![false; 2^19]` (1.5 MB of `Vec<bool>`
+   per path, and `.collect()` held all of them at once — 1.6 GB at 1024 paths);
+2. a **sequential** scatter loop repacked those bools into `F128` via
    `pack_word` (128 bit-tests per word);
-3. the stripe pass walks the bools bit-by-bit a *third* time.
+3. the stripe pass walked the bools bit-by-bit a *third* time.
 
-BLAKE3's `drive_witness_batch_major_partial_into` keeps everything in packed
-`BmRow` u64s, writes straight into the destination, runs fully parallel, and
-elides padding writes. Wiring the Merkle driver the same way is the single
-biggest prover win available, and it needs no new math — `node_witness_ab`
-already produces exactly the packed shape.
+## The packed Merkle driver: witness gen 32×, prove 4.4× at 27k
+
+The Merkle slot now runs on the **same** driver as the per-hash encoders —
+`common::drive_witness_batch_major_partial_into` with a `BM_V = 8` lane-parallel
+group builder — and reuses BLAKE3's own `build_group_batch_major` per level.
+
+**Why that composes at all: the `2^κ` alignment, again.** Level `l`'s subcube is
+exactly the base block at u64-row offset `l · 2^κ/64`, so the base encoder's
+packed output drops in with **no bit shifting**. And per the pin-to-zero
+subtlety above, the base encoder's `(z, a, b)` is already correct for every
+overridden row — including the message region, where the gadget's
+`a = S_j ⊕ t_j = left_j` coincides with the base free column's `a = left_j`. So
+the driver writes the hash block verbatim and this code adds only the swap
+gadget (sibling, `t`), level 0's globals, and a 4-word read-back of the output
+CV to chain to the next level.
+
+| compressions | wit before | wit after | speedup | prove/mt before | after | speedup | m/b3 ratio before → after |
+|---|---|---|---|---|---|---|---|
+| 208 | 13 ms | 0 ms | — | 153 ms | 121 ms | 1.3× | 9.0× → 9.3× |
+| 6,656 | 179 ms | 5 ms | **36×** | 429 ms | 189 ms | **2.3×** | 7.4× → **3.2×** |
+| 26,624 | 735 ms | 23 ms | **32×** | 1451 ms | 328 ms | **4.4×** | 8.2× → **2.2×** |
+
+Merkle witness gen vs BLAKE3's at 27k is now **23 ms vs 13 ms — 1.8×**, down
+from 39×. The residual 1.8× is the 6% extra bits plus the fact that a path's 26
+levels are a sequential chain (only lanes parallelize, not levels). `prove/1t`
+at 27k: 2933 → 765 ms. Verify is unchanged (147 → 143 ms), which is the sanity
+check: witness gen is prover-only.
+
+**Correction to a claim made earlier in this session.** I wrote that the 1.6 GB
+of `Vec<bool>` was "most of the 2.6 GB peak RSS". It was not: peak RSS at 1024
+paths measured **2.59 GB before and 2.56 GB after**, i.e. unchanged. Peak is set
+by the PCS commit/open phase, and the witness peak sat below it. There is no
+memory win here, only a time win.
+
+Licensed by `packed_driver_matches_bool_reference`: the packed driver must be
+**bit-identical** to the `Vec<bool>` oracle in all of `(z, a, b, stripe)`, at
+depths 1/2/3/26, at full and partial counts (including 1-of-8 declared, so
+dummy rows and the const pin are covered), with per-path varying indices so both
+swap directions occur at every level.
 
 ### Caveats on the phase attribution at 27k
 
