@@ -1076,9 +1076,19 @@ fn prove_union_with_binding<Ch: Challenger>(
             generate: input.generate,
         });
     }
+    let trace = std::env::var("PCS_TRACE").is_ok();
+    let t = std::time::Instant::now();
     let (z_packed, a_packed_f128, b_packed_f128, stripes, buf_mode) =
         build_union_witness(union, sources, false);
     let give_back = buf_mode != flock_core::union::WitnessBufMode::FreshZeroed;
+    if trace {
+        eprintln!(
+            "  [prove_union] witgen (padded 2^{}, {:?}): {:7.2} ms",
+            union.m_total() - 7,
+            buf_mode,
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
     // Element slots' stripes are empty; `zip` truncates to the boolean prefix.
     let mut stripes = stripes;
     let element_stripes = stripes.split_off(union.num_boolean());
@@ -1092,11 +1102,19 @@ fn prove_union_with_binding<Ch: Challenger>(
     // two with the m22 config floor. When the compaction map is the
     // identity (single-slot registries at full utilization — the
     // byte-identity anchors), q IS the padded buffer and no copy is made.
+    let t = std::time::Instant::now();
     let dense_q: Option<Vec<F128>> = if union.compaction_is_identity() {
         None
     } else {
         Some(union.compact_witness(&z_packed))
     };
+    if trace {
+        eprintln!(
+            "  [prove_union] compact q (2^{} dense): {:7.2} ms",
+            union.dense_m() - 7,
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
     // Integer-lane commit: when the dense stack leaves whole high-bit lanes
     // empty (`UnionInstance::commit_lanes`), encode + hash only the real ones.
     //
@@ -1106,11 +1124,18 @@ fn prove_union_with_binding<Ch: Challenger>(
     // 128, so t = 61 of 64 lanes at M = 30). Both arms therefore dispatch on
     // `num_lanes` alone.
     let commit_stack: &[F128] = dense_q.as_deref().unwrap_or(&z_packed);
+    let t = std::time::Instant::now();
     let (commitment, prover_data) = if pcs_params.num_lanes.is_some() {
         pcs::commit_lane_major(commit_stack, pcs_params)
     } else {
         pcs::commit(commit_stack, pcs_params)
     };
+    if trace {
+        eprintln!(
+            "  [prove_union] commit: {:7.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
     match binding {
         UnionProveBinding::Mixed => union.bind_statement(challenger, &commitment),
         UnionProveBinding::SingleTypeHarness(slot_r1cs) => {
@@ -1135,6 +1160,7 @@ fn prove_union_with_binding<Ch: Challenger>(
     // The element region's copies of `a`/`b`, taken BEFORE the boolean
     // zerocheck recycles those buffers. `2^(M_elem−7)` words each — the element
     // area, not the capacity.
+    let t = std::time::Instant::now();
     let element_ab: Option<(Vec<F128>, Vec<F128>)> = union.has_element().then(|| {
         let r = union.element_word_range();
         (
@@ -1143,7 +1169,16 @@ fn prove_union_with_binding<Ch: Challenger>(
         )
     });
 
+    if trace && element_ab.is_some() {
+        eprintln!(
+            "  [prove_union] element a/b copies (2^{} words): {:7.2} ms",
+            union.m_elem() - 7,
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
     // ---- The boolean class's PIOP pair, over the prefix subcube.
+    let t_bool = std::time::Instant::now();
     let boolean = (union.num_boolean() > 0).then(|| {
         let (zc_proof, zc_claim, s_hat_v_c) = {
             // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
@@ -1229,6 +1264,13 @@ fn prove_union_with_binding<Ch: Challenger>(
         )
     });
 
+    if trace && union.num_boolean() > 0 {
+        eprintln!(
+            "  [prove_union] boolean zerocheck + lincheck (M_bool = {}): {:7.2} ms",
+            union.m_bool(),
+            t_bool.elapsed().as_secs_f64() * 1e3
+        );
+    }
     // a/b are consumed; recycle the buffers as in `prove_fast_core`.
     if give_back {
         flock_core::scratch::give_f128(a_packed_f128);
@@ -1245,10 +1287,18 @@ fn prove_union_with_binding<Ch: Challenger>(
     // ---- The element class's PIOP pair, over the element region. Runs AFTER
     // the boolean pair, so its τ' is drawn from a transcript that already
     // absorbed every boolean message (and vice versa is impossible).
+    let t = std::time::Instant::now();
     let element = element_ab.map(|(pa, pb)| {
         let r = union.element_word_range();
         flock_core::element_r1cs::union::prove(union, &z_packed[r], pa, pb, challenger)
     });
+    if trace && element.is_some() {
+        eprintln!(
+            "  [prove_union] element region PIOP (2^{} words): {:7.2} ms",
+            union.m_elem() - 7,
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
 
     // ---- One opening over all four claims: the boolean pair ring-switched,
     // the element pair PACKED-DIRECT (their points are already packed-MLE
@@ -1266,6 +1316,7 @@ fn prove_union_with_binding<Ch: Challenger>(
         Some((_, claims)) => element_packed_direct_claims(claims),
         None => Vec::new(),
     };
+    let t = std::time::Instant::now();
     let pcs_open = open_claims_with_precomputed_jagged_ligerito(
         z_packed,
         dense_q,
@@ -1280,6 +1331,20 @@ fn prove_union_with_binding<Ch: Challenger>(
         &lig_config,
         challenger,
     );
+    if trace {
+        eprintln!(
+            "  [prove_union] open (rs×{}, pd×{}): {:7.2} ms",
+            z_claims.len(),
+            packed_direct.len(),
+            t.elapsed().as_secs_f64() * 1e3
+        );
+        // Self-delimiting: one line per prove, tagging the arm, so a trace
+        // reader never has to guess which prove a phase belonged to.
+        eprintln!(
+            "  [prove_union] === done (element: {}) ===",
+            element.is_some()
+        );
+    }
 
     (
         UnionProveOutput {

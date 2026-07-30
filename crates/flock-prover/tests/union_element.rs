@@ -1146,7 +1146,12 @@ fn fmt(r: (f64, f64, f64)) -> String {
 ///
 /// Both arms commit the SAME dense size (`dense_m` asserted equal), so the
 /// Ligerito half of the work is identical and only the padded-domain and PIOP
-/// differences show. Sweeping `ν` attributes the delta from MEASUREMENT rather
+/// differences show. Both also drive their boolean slot through the IN-PLACE
+/// driver, which is what the real prover uses: with `UnionSlotProverInput::new`
+/// a single-slot boolean registry takes `assemble_witness`'s zero-copy
+/// passthrough, which ANY second slot loses — element or boolean — so comparing
+/// against it would charge the element class for a multi-slot cost it does not
+/// own. Sweeping `ν` attributes the delta from MEASUREMENT rather
 /// than from reasoning: a cost driven by the doubled padded domain scales with
 /// `2^M`, so it must grow ~4× per two steps of `ν`, while the element PIOP
 /// scales with its own (much smaller) region.
@@ -1215,8 +1220,10 @@ fn mixed_class_cost_probe() {
                 let (pa, ca, _) = prover::prove_fast_ligerito_jagged_union_mixed_class(
                     &u_bool,
                     &p_bool,
-                    vec![UnionSlotProverInput::new(
-                        blake3::generate_witness_batch_major_partial(&inputs, nu),
+                    vec![UnionSlotProverInput::in_place(
+                        |dst| {
+                            blake3::generate_witness_batch_major_partial_into(&inputs, nu, dst)
+                        },
                         circuit,
                     )],
                     Vec::new(),
@@ -1231,8 +1238,10 @@ fn mixed_class_cost_probe() {
                 let (pb, cb, _) = prover::prove_fast_ligerito_jagged_union_mixed_class(
                     &u_mixed,
                     &p_mixed,
-                    vec![UnionSlotProverInput::new(
-                        blake3::generate_witness_batch_major_partial(&inputs, nu),
+                    vec![UnionSlotProverInput::in_place(
+                        |dst| {
+                            blake3::generate_witness_batch_major_partial_into(&inputs, nu, dst)
+                        },
                         circuit,
                     )],
                     vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
@@ -1372,14 +1381,17 @@ leaves a {} hole inside the 2^26 prefix subcube, but the element region \
         for rep in 0..=reps {
             let bool_slots = || {
                 vec![
-                    UnionSlotProverInput::new(
-                        flock_prover::r1cs_hashes::sha2::generate_witness_batch_major_partial(
-                            &s2_inputs, nu,
-                        ),
+                    UnionSlotProverInput::in_place(
+                        |dst| {
+                            flock_prover::r1cs_hashes::sha2::
+                                generate_witness_batch_major_partial_into(&s2_inputs, nu, dst)
+                        },
                         s2_circuit,
                     ),
-                    UnionSlotProverInput::new(
-                        blake3::generate_witness_batch_major_partial(&b3_inputs, nu),
+                    UnionSlotProverInput::in_place(
+                        |dst| {
+                            blake3::generate_witness_batch_major_partial_into(&b3_inputs, nu, dst)
+                        },
                         b3_circuit,
                     ),
                 ]
