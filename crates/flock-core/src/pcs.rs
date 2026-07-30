@@ -571,6 +571,35 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             .par_chunks_mut(b)
             .enumerate()
             .map(|(hi, out_block)| {
+                // DEAD-BLOCK SKIP. A claim's `e_hi = eq_hi[hi]` is exactly
+                // `F128::ZERO` on every block whose high address bits fall
+                // outside the claim's own support — which is what a claim point
+                // with FROZEN high coordinates produces (`build_eq` of a
+                // zero coord kills half the tensor). When EVERY claim's factor
+                // vanishes on a block, so does `b_combined` there:
+                // `fold_one_slot(0, table) = Σ_k table[k·256 + 0]`, and
+                // `build_fold_byte_table` fills `value = 0` with the empty sum,
+                // so it is exactly zero. Storing zeros directly is therefore
+                // bit-identical to folding, and skips 16 table lookups +
+                // 15 XORs + a GF multiply per word.
+                //
+                // This is where the multi-table design's DISJOINTNESS pays: the
+                // boolean class's claim points carry `M − M_bool` frozen-zero
+                // high coordinates, so their basis vanishes on the whole
+                // element region AND the inter-class gap — half the address
+                // space or more. The element class's claims are `Sparse` and
+                // only ever touch their own subcube (scatter-added below), so
+                // after this skip the combine costs `O(2^M_bool + element
+                // support)` rather than `O(2^M)`.
+                //
+                // Zeros still have to be STORED, not skipped: the
+                // virtual-opening sumcheck's round-0 fold reads `b_combined`
+                // densely when the witness support is not sparse.
+                if rs_deferred.iter().all(|d| d.1[hi] == F128::ZERO) {
+                    out_block.fill(F128::ZERO);
+                    // The prime's terms here are `a·0`, i.e. zero.
+                    return (F128::ZERO, F128::ZERO);
+                }
                 // Accumulate each claim's block: first claim writes, rest add.
                 // `e_hi` is read once per claim per block, then swept over eq_lo.
                 for (ci, (eq_lo, eq_hi, table, _)) in rs_deferred.iter().enumerate() {
