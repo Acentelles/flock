@@ -574,9 +574,9 @@ fn prove_packed_padded_inner<C: Challenger>(
 
         // The sparse path also requires the fused domain (>= 1024): below it
         // the naive kernels index globally, so compaction must be undone.
-        let use_sparse = store.as_ref().is_some_and(|st| {
-            domain >= 1024 && st.len() * sparse_tail_gate() <= domain
-        });
+        let use_sparse = store
+            .as_ref()
+            .is_some_and(|st| domain >= 1024 && st.len() * sparse_tail_gate() <= domain);
         if !use_sparse
             && let Some(st) = store.take()
             && sparse_dirty

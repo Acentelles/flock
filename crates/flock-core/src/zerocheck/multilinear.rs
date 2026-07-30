@@ -1037,7 +1037,12 @@ pub fn uni_skip_fold_and_round_pair_runs_sparse(
     // so the stored set is the pair list doubled — pair-aligned by
     // construction, which is what keeps the NEXT round's fold pairs
     // well-defined under compaction.
-    let store = LiveLayout::new(pair_intervals.iter().map(|&(s, e)| (2 * s, 2 * e)).collect());
+    let store = LiveLayout::new(
+        pair_intervals
+            .iter()
+            .map(|&(s, e)| (2 * s, 2 * e))
+            .collect(),
+    );
     let (a, b, msg1, msg_inf) = fold_and_round_pair_kernel(
         a_packed,
         b_packed,
