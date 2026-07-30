@@ -214,5 +214,9 @@ harness = false
 name = "merkle_vs_plain_blake3"
 harness = false
 
+[[bench]]
+name = "perm_vs_gkr"
+harness = false
+
 [lints]
 workspace = true

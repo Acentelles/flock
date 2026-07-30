@@ -70,7 +70,7 @@ use crate::pcs::{
     ProverData, commit,
 };
 use crate::zerocheck::PaddingSpec;
-use crate::zerocheck::univariate_skip::{SplitEqGhash, build_eq};
+use crate::zerocheck::univariate_skip::SplitEqGhash;
 
 const DOMAIN: &[u8] = b"flock-perm-v0";
 
@@ -221,8 +221,11 @@ fn build_grand_product(h: &[F128]) -> Vec<F128> {
         // the disjoint segment v[write..write+half]. Split so both borrow safely.
         let (done, rest) = v.split_at_mut(write);
         let src = &done[read..read + size];
+        // Only the wide top levels are worth splitting; the tree tail shrinks
+        // geometrically and would otherwise pay a rayon dispatch per level.
         rest[..half]
             .par_iter_mut()
+            .with_min_len(par_threshold())
             .enumerate()
             .for_each(|(j, d)| *d = src[2 * j] * src[2 * j + 1]);
         read = write;
@@ -236,7 +239,27 @@ fn build_grand_product(h: &[F128]) -> Vec<F128> {
 /// Size at/above which a per-round sumcheck op is worth dispatching to rayon.
 /// Below it the serial path avoids parallel-dispatch + alloc overhead — crucial
 /// because sumcheck rounds shrink geometrically, so most rounds are tiny.
-const PAR_THRESHOLD: usize = 1 << 12;
+///
+/// Measured on M4 Max (10 perf cores) by sweeping `FLOCK_PERM_PAR_GATE` and
+/// timing the PIOP phases alone (`PERM_TRACE=1`). At the old `1<<12` the
+/// mid-size rounds were dispatch-bound — the PIOP cost 1.32 ms at μ=14 and
+/// 3.15 ms at μ=16 against 0.71 ms and 2.58 ms for the *same work run
+/// single-threaded*, i.e. rayon was a net loss there. `1<<14` fixes that
+/// (0.68 / 2.00 ms) without hurting μ≥18; going further to `1<<18` regresses
+/// μ=18 by 40% as genuinely parallel rounds fall back to serial.
+const PAR_THRESHOLD_DEFAULT: usize = 1 << 14;
+
+/// [`PAR_THRESHOLD_DEFAULT`], overridable via `FLOCK_PERM_PAR_GATE` for tuning
+/// (mirrors `zerocheck::sparse_tail_gate`). Read once.
+fn par_threshold() -> usize {
+    static GATE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("FLOCK_PERM_PAR_GATE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(PAR_THRESHOLD_DEFAULT)
+    })
+}
 
 /// Bind the low variable at `ρ`: `u[x] ← u[2x]·(1+ρ) + u[2x+1]·ρ`, halving `u`.
 /// Large folds run in parallel into a **pooled** buffer (reads old `u`, writes
@@ -245,7 +268,7 @@ const PAR_THRESHOLD: usize = 1 << 12;
 fn fold_in_place(u: &mut Vec<F128>, rho: F128) {
     let half = u.len() / 2;
     let one_minus = F128::ONE + rho;
-    if half >= PAR_THRESHOLD {
+    if half >= par_threshold() {
         // `take_f128(half)` returns a length-`half` buffer; the map writes every
         // slot (write-before-read contract satisfied).
         let mut out = crate::scratch::take_f128(half);
@@ -377,6 +400,43 @@ fn v_open_points(rho: &[F128]) -> [Vec<F128>; 5] {
     ]
 }
 
+/// Sparse `eq_ind`s for the five points of [`v_open_points`], sharing **one**
+/// `eq(ρ)` tensor.
+///
+/// Every one of the five points is `ρ` plus a single pinned boolean coord, so
+/// each `eq_ind` is the same length-`2^μ` tensor `eq(ρ)` scattered to a
+/// different half of the length-`2^(μ+1)` index space — and the root, being
+/// fully boolean, is a single entry. Building them densely instead costs five
+/// sequential `build_eq`s of length `2^(μ+1)`, i.e. `10·2^μ` multiplications
+/// against the `2^μ` here (~15 ms of the prove time at μ=20).
+///
+/// Coord `j` of a point maps to bit `j` of the scattered index (`build_eq`
+/// writes `t[x | 1<<i] = t[x]·r_i`), so:
+/// `v(ρ,b)` pins bit 0 to `b` with `ρ` live on bits `1..=μ`; `v(b,ρ)` pins bit
+/// `μ` with `ρ` live on bits `0..μ`; the root pins every bit (index `2N−2`).
+fn v_open_eq_inds(rho: &[F128]) -> [DirectEqInd; 5] {
+    use crate::pcs::ring_switch::{build_eq_parallel, sparse_eq_from_parts};
+    let mu = rho.len();
+    let eq_rho = build_eq_parallel(rho); // 2^μ, shared by all four ρ-points
+    let low_live: Vec<usize> = (1..=mu).collect(); // ρ on bits 1..=μ
+    let high_live: Vec<usize> = (0..mu).collect(); // ρ on bits 0..μ-1
+    let sparse = |tensor: Vec<F128>, live: Vec<usize>, base: usize| {
+        DirectEqInd::Sparse(sparse_eq_from_parts(tensor, live, base))
+    };
+    [
+        // v(ρ,0): bit 0 = 0 — the even (a) slots.
+        sparse(eq_rho.clone(), low_live.clone(), 0),
+        // v(ρ,1): bit 0 = 1 — the odd (b) slots.
+        sparse(eq_rho.clone(), low_live, 1),
+        // v(1,ρ): bit μ = 1 — the upper half (c).
+        sparse(eq_rho.clone(), high_live.clone(), 1 << mu),
+        // v(0,ρ): bit μ = 0 — the lower half (the leaves).
+        sparse(eq_rho, high_live, 0),
+        // Root v[2N-2]: fully boolean, so a single scattered entry.
+        sparse(vec![F128::ONE], Vec::new(), (1usize << (mu + 1)) - 2),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // Batched zerocheck round message
 // ---------------------------------------------------------------------------
@@ -444,7 +504,7 @@ fn round_message(
     };
 
     // Parallelize over the (≤128) outer blocks for big rounds; serial otherwise.
-    if block * n_blocks >= PAR_THRESHOLD {
+    if block * n_blocks >= par_threshold() {
         (0..n_blocks).into_par_iter().map(block_fn).reduce(
             || (F128::ZERO, F128::ZERO),
             |(o0, i0), (o1, i1)| (o0 + o1, i0 + i1),
@@ -517,29 +577,56 @@ pub fn prove<C: Challenger>(
             }
         }
     }
-    let s_sig_vec: Vec<F128> = sigma.par_iter().map(|&sx| s_id_vec[sx]).collect();
+    // `with_min_len(par_threshold())` keeps these maps on one task below the
+    // threshold: at μ=8 the whole witness build is ~30 µs of real work, so
+    // splitting it across the pool costs several times more than it saves.
+    let s_sig_vec: Vec<F128> = sigma
+        .par_iter()
+        .with_min_len(par_threshold())
+        .map(|&sx| s_id_vec[sx])
+        .collect();
     let p: Vec<F128> = f
         .par_iter()
         .zip(&s_id_vec)
+        .with_min_len(par_threshold())
         .map(|(fx, sx)| *fx + beta * *sx + gamma)
         .collect();
     let q: Vec<F128> = g
         .par_iter()
         .zip(&s_sig_vec)
+        .with_min_len(par_threshold())
         .map(|(gx, sx)| *gx + beta * *sx + gamma)
         .collect();
+    tp("  tags+p,q");
     let q_inv = batch_inverse(&q);
-    let leaves: Vec<F128> = p.par_iter().zip(&q_inv).map(|(px, qx)| *px * *qx).collect();
+    tp("  batch_inv");
+    let leaves: Vec<F128> = p
+        .par_iter()
+        .zip(&q_inv)
+        .with_min_len(par_threshold())
+        .map(|(px, qx)| *px * *qx)
+        .collect();
 
     // Grand-product tree over the leaves and its derived views. The first half
     // of `v` IS the leaves (`v(0,x) = ℓ(x)`), so no separate `h` is committed.
     let v = build_grand_product(&leaves);
-    let a: Vec<F128> = (0..n).into_par_iter().map(|i| v[2 * i]).collect();
-    let b: Vec<F128> = (0..n).into_par_iter().map(|i| v[2 * i + 1]).collect();
+    tp("  tree");
+    let a: Vec<F128> = (0..n)
+        .into_par_iter()
+        .with_min_len(par_threshold())
+        .map(|i| v[2 * i])
+        .collect();
+    let b: Vec<F128> = (0..n)
+        .into_par_iter()
+        .with_min_len(par_threshold())
+        .map(|i| v[2 * i + 1])
+        .collect();
     let c: Vec<F128> = v[n..2 * n].to_vec(); // c[i] = v[n+i]
     let v0: Vec<F128> = v[..n].to_vec();
     let claimed_product = v[2 * n - 2];
-    tp("witness+v");
+    // NOTE: `tp` resets on each call, so the four "  "-prefixed sub-phases
+    // above partition what used to be reported as one "witness+v" phase.
+    tp("  a,b,c,v0 views");
 
     // Commit to the single aux poly `v` (μ+1 vars) and observe its root —
     // binding `v` before the zerocheck challenges (a known `ρ` would break
@@ -602,13 +689,18 @@ pub fn prove<C: Challenger>(
     // `v` at `(ρ,0), (ρ,1), (1,ρ), (0,ρ)` and the product root — five claims.
     let v_points = v_open_points(&rho);
     let v_values = [v_x0, v_x1, v_1x, v_0x, claimed_product];
+    // Sparse eq_inds sharing one `eq(ρ)` build — see `v_open_eq_inds`. The
+    // representation is prover-side only, so this is transcript-identical to
+    // the dense form (the combine scatter-adds them onto the same b_combined).
+    let v_eq_inds = v_open_eq_inds(&rho);
     let v_claims: Vec<PackedDirectClaim> = v_points
         .iter()
         .zip(v_values)
-        .map(|(point, value)| PackedDirectClaim {
+        .zip(v_eq_inds)
+        .map(|((point, value), eq_ind)| PackedDirectClaim {
             point: point.clone(),
             value,
-            eq_ind: DirectEqInd::Dense(build_eq(point)),
+            eq_ind,
         })
         .collect();
     let v_open = open_v(v, &pdata_v, &commitment_v, &v_claims, ch);

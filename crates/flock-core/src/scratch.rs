@@ -106,6 +106,18 @@ pub(crate) fn try_take_f128(n: usize) -> Option<Vec<F128>> {
 /// smallest-capacity buffer is evicted (large buffers are the expensive ones
 /// to re-fault; a run that ramps problem sizes upward must not get its big
 /// buffers crowded out by stale small ones).
+///
+/// TRIED AND REJECTED (2026-07-28): byte-budgeted eviction, largest-first, to
+/// stop zerocheck's capacity-scaled giants (12.9 GB at nu = 18) from crowding
+/// out the dense set the open cycles. A single-session A/B over budgets
+/// 4 / 12 / 24 / 512 GB moved the nu = 18 steady total by NOTHING
+/// (132.5 / 132.6 / 134.6 / 133.7; nu = 14 113.5 / 114.3 / 113.0 / 113.2).
+/// Per-phase it is a zero-sum dial — shedding the giants takes the open's
+/// oversized takes from 32-256x down to right-sized (`ligerito` -6 ms) and
+/// hands the same back to the zerocheck tail, which then re-faults them.
+/// Cross-session measurement made it look like a ~3 ms win; it is not one.
+/// The residual is the capacity-scaled buffers EXISTING, which no eviction
+/// policy can address — see the live-span note on zerocheck's fold output.
 pub fn give_f128(v: Vec<F128>) {
     if v.capacity() == 0 {
         return;
@@ -213,19 +225,76 @@ pub fn give_u8(v: Vec<u8>) {
 /// z/a/b, zerocheck tail ping-pong ×2, open-stage transients, rs_eq_ind ×2,
 /// b_combined → 11 buffers. ~1.1 GB resident at m = 29; release with
 /// [`clear`].
+///
+/// Sized for a UNIFORM buffer set, i.e. the single-table paths where the
+/// padded `m` drives every class. The merged/union path is not uniform in
+/// `m` — use [`prewarm_prover_union`].
 pub fn prewarm_prover(m: usize) {
+    prewarm_sets(&[(m, 5, 11)]);
+}
+
+/// Byte budget for first-touched prewarm pages. Prewarming is only ever a
+/// win while the touched set stays comfortably resident: past that the OS
+/// starts compressing and reclaiming, and the prewarm costs more than the
+/// faults it was meant to remove. MEASURED on the m30 load (one-shot prove,
+/// median of 3): touching the full padded-`m` set reads 10.6 GB / 399 ms at
+/// nu = 16, 21 GB / 477 ms at nu = 17 and 45 GB / 604 ms at nu = 18 — against
+/// 450-460 ms for no prewarm at all. So the win inverts between 10 and 21 GB
+/// on a 36 GB box; 8 GB keeps a margin and preserves every tier that was
+/// already winning.
+const PREWARM_BUDGET_BYTES: usize = 8 << 30;
+
+/// Prewarm for a MERGED/UNION prove, whose buffer set is NOT uniform in `m`.
+///
+/// Only witgen (3 small) and zerocheck (2 large + 2 small) scale with the
+/// padded capacity; commit, compaction and the whole open work on the
+/// count-derived DENSE stack, which is the same size at every capacity. Both
+/// sets are prewarmed — the dense one first, since it is small and always
+/// pays — and the capacity set is included only while it fits
+/// [`PREWARM_BUDGET_BYTES`].
+///
+/// Sizing the WHOLE set off the padded `m` (what [`prewarm_prover`] does, and
+/// what the union probes used to call) inverts the point of prewarming at high
+/// capacity: it force-touches the padding this pipeline exists to skip. The
+/// capacity-scaled buffers are `alloc_uninit` and written under the sparse
+/// contract, so their padded pages are otherwise NEVER faulted in — at
+/// nu = 18 the prove touches ~3 GB of the ~19 GB it allocates.
+pub fn prewarm_prover_union(m_capacity: usize, m_dense: usize) {
+    // Dense classes always; capacity classes in the counts actually taken
+    // (zerocheck 2 large + 2 small, witgen 3 small) when they fit the budget.
+    if m_capacity > m_dense {
+        prewarm_sets(&[(m_dense, 5, 11), (m_capacity, 2, 5)]);
+    } else {
+        prewarm_sets(&[(m_dense, 5, 11)]);
+    }
+}
+
+/// Allocate and first-touch `(m, n_large, n_small)` buffer sets in order,
+/// stopping once the cumulative touched bytes would exceed
+/// [`PREWARM_BUDGET_BYTES`]. Earlier sets have priority, so callers list the
+/// always-worth-it ones first. Buffers allocated past the budget are skipped
+/// entirely rather than allocated-but-untouched: an untouched pooled buffer
+/// would still be handed out by `take` and fault during the prove, which is
+/// exactly the cost this is trying to place off the prove path.
+fn prewarm_sets(sets: &[(usize, usize, usize)]) {
     use rayon::prelude::*;
-    if m < 7 {
-        return;
-    }
-    let small = 1usize << (m - 7);
-    let large = 1usize << (m - 6);
     let mut bufs: Vec<Vec<F128>> = Vec::new();
-    for _ in 0..5 {
-        bufs.push(take_f128(large));
-    }
-    for _ in 0..11 {
-        bufs.push(take_f128(small));
+    let mut budget = PREWARM_BUDGET_BYTES;
+    let w = core::mem::size_of::<F128>();
+    for &(m, n_large, n_small) in sets {
+        if m < 7 {
+            continue;
+        }
+        for (count, len) in [(n_large, 1usize << (m - 6)), (n_small, 1usize << (m - 7))] {
+            for _ in 0..count {
+                let bytes = len * w;
+                if bytes > budget {
+                    break;
+                }
+                budget -= bytes;
+                bufs.push(take_f128(len));
+            }
+        }
     }
     // First-touch every page of every buffer, all cores. Already-resident
     // (re-warmed) buffers cost a fast memset; fresh ones fault here, once.
