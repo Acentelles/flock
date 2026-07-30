@@ -1823,11 +1823,20 @@ pub fn open_batch_merged<Ch: Challenger>(
             coeffs: c,
         })
         .collect();
+    if trace {
+        eprintln!(
+            "    [frobenius] linearized_coefficients (x{}): {:6.2} ms",
+            coeffs.len(),
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    let t_assist = std::time::Instant::now();
     let frobenius = jagged::prove_frobenius_assist(&params, &fclaims, &rho, challenger);
     if trace {
         eprintln!(
-            "  [open_merged] coeffs + frobenius assist: {:6.2} ms",
-            t.elapsed().as_secs_f64() * 1e3
+            "  [open_merged] coeffs + frobenius assist: {:6.2} ms (assist alone {:6.2} ms)",
+            t.elapsed().as_secs_f64() * 1e3,
+            t_assist.elapsed().as_secs_f64() * 1e3
         );
     }
     debug_assert_eq!(

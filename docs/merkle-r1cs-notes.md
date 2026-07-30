@@ -593,11 +593,65 @@ zerocheck then ran on cold, faulting pages. It was allocator/page-fault noise
 attributed to the wrong phase. Worth remembering as a measurement hazard: a
 phase can be slow because of what the *previous* phase did to the page tables.
 
+## Inside the Frobenius assist
+
+`VERIFY_TRACE` / `PCS_TRACE` now split the assist itself. At 26,624
+compressions (`k_cols` 12 vs 7 ⇒ 3326 vs 122 merged columns, 256 statements,
+m = 22):
+
+**Verify** — the assist is **one loop**:
+
+| phase | merkle | blake3 | ratio | share of merkle assist |
+|---|---|---|---|---|
+| round replay (46 rounds) | 3.3 µs | 3.2 µs | 1.0× | 0.0% |
+| `frobenius_statements` | 5.75 ms | 277 µs | 21× | 4.6% |
+| · of which spec enumeration | 12 µs | 13 µs | 1.0× | 0.0% |
+| **`assist_w_at` — the `W(σ)` walk** | **116.62 ms** | **4.23 ms** | **27.6×** | **93%** |
+| boundary DP (4-state, m+1 layers) | ~0.2 ms | ~0.2 ms | 1.0× | 0.2% |
+| assist total | 125.05 ms | 4.74 ms | 26× | |
+
+The 99.8%/93% split of `W(σ)` vs the DP is measured, not inferred (per-statement
+nanos accumulator; the verify pool is 1 thread so the sum is wall-clock). And
+27.6× is the column ratio 3326/122 = 27.3× — so `assist_w_at` *is* the
+`O(2^k)` term, exactly as its own doc comment claims ("`2(m+1)`
+multiplications per distinct column — the verifier's only `2^k`-scale work").
+
+Its body is `cols × (m+1) × 2` multiplies: for each column, a fresh
+`Π_layer eq(t_{y-1}[layer], σ_c) · eq(t_y[layer], σ_d)`. That is
+256 × 3326 × 46 ≈ **39.2M multiplies**, and 116.62 ms / 39.2M = **2.97 ns per
+F128 multiply** — i.e. the loop is already at raw multiply cost. It will not
+yield to micro-optimization; it needs *fewer products*. Two openings worth
+costing: Merkle's columns are **one run of equal heights** (all 3325 used
+columns have height `n_t`, so `t_y = y·n_t` is an arithmetic progression —
+consecutive `eq` products are related), and the 256 statements all walk the
+*same* column set with only `σ` differing.
+
+**Prove** — three roughly equal thirds, all column-scaled:
+
+| phase | merkle | blake3 | ratio | share |
+|---|---|---|---|---|
+| `linearized_coefficients` (×2) | 0.03 ms | 0.03 ms | 1.0× | 0.0% |
+| statements + suffix rows | 92.32 ms | 2.45 ms | 38× | 50% |
+| `v` + round loop | 49.83 ms | 2.37 ms | 21× | 27% |
+| **`free()` the suffix rows** | **44.00 ms** | 1.73 ms | 25× | **24%** |
+| assist total | 186.22 ms | 6.62 ms | 28× | |
+
+**A quarter of the Merkle assist prove time is deallocation.** The suffix rows
+are `(m+2)·n_cols` × `[F128; 4]` per statement — **1247 MiB across the 256
+statements** (4.9 MiB each) versus 45 MiB for BLAKE3. That is the assist
+prover's whole footprint, it is transient, and it explains both the `free()` cost
+and why this phase is memory-bound rather than arithmetic-bound. Note this also
+resolves the residual these notes previously logged as unattributed (~39 ms with
+"no sub-timer"): it was the drop, happening after the last timer printed.
+
+`linearized_coefficients` was the other suspect for that residual. It is 0.03 ms
+— not a factor at all.
+
 ### Remaining caveat
 
-Inside `coeffs + frobenius assist` (226.55 ms), the two `[frobenius]` sub-timers
-account for 163.4 ms; the other ~63 ms has no timer of its own (BLAKE3's
-equivalent residual is ~2.4 ms). Still unattributed.
+(The former caveat here — an unattributed residual inside
+`coeffs + frobenius assist` — is resolved above: it was the suffix-row
+deallocation, which happened after the last timer printed.)
 
 Also: prove varies run to run at these sizes, and `PCS_TRACE=1` itself costs
 time, so phase breakdowns are only valid *within* a single run — never compared

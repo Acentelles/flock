@@ -1331,6 +1331,20 @@ fn frobenius_statements(
     use rayon::prelude::*;
     let m = params.m;
     let sparse = assist_sparse_transitions();
+    // Trace the two halves separately: the sequential Frobenius-powering walk
+    // that enumerates the 128·K specs, then the parallel per-spec build (one
+    // `2^k`-entry column `eq` table each, which is the part that scales with
+    // the block width).
+    let trace = std::env::var("VERIFY_TRACE").is_ok() || std::env::var("PCS_TRACE").is_ok();
+    let tfmt = |s: f64| -> String {
+        let ms = s * 1000.0;
+        if ms < 1.0 {
+            format!("{:>8.2} µs", s * 1e6)
+        } else {
+            format!("{:>8.2} ms", ms)
+        }
+    };
+    let t = std::time::Instant::now();
     let mut specs: Vec<(Vec<F128>, Vec<F128>, F128)> = Vec::new();
     for claim in claims {
         assert_eq!(claim.coeffs.len(), 128);
@@ -1348,7 +1362,15 @@ fn frobenius_statements(
             }
         }
     }
-    specs
+    if trace {
+        eprintln!(
+            "            [fro-st] spec enumeration (x{}): {}",
+            specs.len(),
+            tfmt(t.elapsed().as_secs_f64())
+        );
+    }
+    let t = std::time::Instant::now();
+    let out: Vec<FrobeniusStatement> = specs
         .into_par_iter()
         .map(|(zr, zc, c)| {
             let mut cols = assist_columns(params, &zc);
@@ -1377,7 +1399,16 @@ fn frobenius_statements(
                 prefix_row,
             }
         })
-        .collect()
+        .collect();
+    if trace {
+        eprintln!(
+            "            [fro-st] per-spec build{} ({} cols each): {}",
+            if with_sfx { " + suffix rows" } else { "" },
+            out.first().map_or(0, |s| s.cols.len()),
+            tfmt(t.elapsed().as_secs_f64())
+        );
+    }
+    out
 }
 
 /// One statement's per-layer pass: fold the previous layer's challenges
@@ -1607,6 +1638,24 @@ pub fn prove_frobenius_assist<C: Challenger>(
             t.elapsed().as_secs_f64() * 1e3
         );
     }
+    // The suffix rows are the assist prover's whole memory footprint —
+    // `(m+2)·n_cols` `[F128; 4]` per statement, so `2^k`-scaled and NOT small
+    // (at k=12, m=22, 256 statements it is over a gigabyte). Freeing it is
+    // itself measurable, so time it explicitly rather than leave it in the
+    // caller's residual.
+    if trace {
+        let per = sts.first().map_or(0, |s| s.sfx.len() * 64);
+        let t_drop = std::time::Instant::now();
+        let n = sts.len();
+        drop(sts);
+        eprintln!(
+            "    [frobenius] free suffix rows ({} MiB = {} x {:.1} MiB): {:6.2} ms",
+            n * per / (1 << 20),
+            n,
+            per as f64 / (1 << 20) as f64,
+            t_drop.elapsed().as_secs_f64() * 1e3
+        );
+    }
     FrobeniusAssistProof { v, rounds }
 }
 
@@ -1626,9 +1675,23 @@ pub fn verify_frobenius_assist<C: Challenger>(
     if proof.rounds.len() != 2 * (m + 1) {
         return None;
     }
+    // `VERIFY_TRACE` sub-split of the assist — it dominates the Merkle-table
+    // verify, so its three phases are worth separating: the transcript replay,
+    // building the 128·K statements (a `2^k`-column `eq` table each), and the
+    // per-statement `W(σ)` walk + boundary DP.
+    let trace = std::env::var("VERIFY_TRACE").is_ok();
+    let tfmt = |s: f64| -> String {
+        let ms = s * 1000.0;
+        if ms < 1.0 {
+            format!("{:>8.2} µs", s * 1e6)
+        } else {
+            format!("{:>8.2} ms", ms)
+        }
+    };
     challenger.observe_label(b"flock-frobenius-assist-v0");
     challenger.observe_f128(proof.v);
 
+    let t = std::time::Instant::now();
     let mut claim = proof.v;
     let mut sigma = Vec::with_capacity(2 * (m + 1));
     for &(g_one, g_inf) in &proof.rounds {
@@ -1638,8 +1701,25 @@ pub fn verify_frobenius_assist<C: Challenger>(
         claim = fold_round_claim(claim, g_one, g_inf, r);
         sigma.push(r);
     }
+    if trace {
+        eprintln!(
+            "          [fro-v] round replay ({} rounds): {}",
+            proof.rounds.len(),
+            tfmt(t.elapsed().as_secs_f64())
+        );
+    }
 
+    let t = std::time::Instant::now();
     let sts = frobenius_statements(params, claims, rho, false);
+    if trace {
+        eprintln!(
+            "          [fro-v] frobenius_statements (x{}, {} cols each): {}",
+            sts.len(),
+            sts.first().map_or(0, |s| s.cols.len()),
+            tfmt(t.elapsed().as_secs_f64())
+        );
+    }
+    let t = std::time::Instant::now();
     // With few statements (the multipoint anchor's K), the statement-level
     // parallelism below can't occupy the pool; parallelize the per-column
     // `W(σ)` walk inside each statement instead (XOR-reassociated sums —
@@ -1655,10 +1735,22 @@ pub fn verify_frobenius_assist<C: Challenger>(
                 .reduce(|| F128::ZERO, |a, b| a + b)
         }
     };
+    // Split `W(σ)` (column-scaled) from the boundary DP (not column-scaled)
+    // by accumulating nanos per statement — 256 `Instant` pairs against a
+    // 100 ms+ body, so the probe itself is noise. Trace-gated.
+    let w_nanos = std::sync::atomic::AtomicU64::new(0);
     let expect = sts
         .par_iter()
         .map(|st| {
+            // `Option` so an untraced verify makes no timing calls at all.
+            let t_w = trace.then(std::time::Instant::now);
             let w = w_at(&st.cols, &sigma);
+            if let Some(t_w) = t_w {
+                w_nanos.fetch_add(
+                    t_w.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
             let mut g = [F128::ZERO; 4];
             g[STATE_SUCCESS] = F128::ONE;
             let sparse = assist_sparse_transitions();
@@ -1685,6 +1777,20 @@ pub fn verify_frobenius_assist<C: Challenger>(
             w * g[STATE_INITIAL]
         })
         .reduce(|| F128::ZERO, |a, b| a + b);
+    if trace {
+        let total = t.elapsed().as_secs_f64();
+        // Summed across statements, so on N threads it exceeds wall-clock by
+        // ~N. Reported as a share of the summed total, which is thread-count
+        // independent.
+        let w_sum = w_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
+        eprintln!(
+            "          [fro-v] W(σ) walk + boundary DP: {}  (W(σ) is {:.1}% of it: {} summed over {} statements)",
+            tfmt(total),
+            100.0 * w_sum / total.max(f64::MIN_POSITIVE),
+            tfmt(w_sum),
+            sts.len(),
+        );
+    }
     (claim == expect).then_some(proof.v)
 }
 
