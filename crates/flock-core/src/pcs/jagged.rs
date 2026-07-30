@@ -1108,6 +1108,143 @@ fn assist_suffix_rows_blocked(
     rows
 }
 
+/// The **statement-independent** upper part of the blocked suffix store:
+/// layers `[lo, m+1]`, in the flat layout shifted down by `off[lo]`.
+///
+/// The suffix recurrence at layer `ℓ` reads `eq4s[ℓ]`, which is built from
+/// `point_bit(z_row, ℓ)` and `point_bit(rho, ℓ)`; `point_bit` zero-pads, so
+/// for `ℓ ≥ z_row.len()` the table is a function of the SHARED `rho` alone —
+/// identical for every statement of a Frobenius batch (their `z_row`s differ
+/// but have equal length). Building these layers once and sharing them
+/// across the `128·K` statements is what keeps the per-statement build to
+/// the low layers, where (at uniform column heights) most of the blocks
+/// live anyway.
+///
+/// Values are bit-identical to the corresponding slice of
+/// [`assist_suffix_rows_blocked`] — same recurrence, same inputs — pinned by
+/// `blocked_low_plus_tail_matches_full`.
+fn assist_shared_tail_blocked(
+    blocks: &AssistBlocks,
+    rho: &[F128],
+    sparse: &[[[(usize, usize); 2]; 4]; 4],
+    m: usize,
+    lo: usize,
+) -> Vec<[F128; 4]> {
+    use rayon::prelude::*;
+    debug_assert!(lo >= 1 && lo <= m + 1);
+    let base = blocks.off[lo];
+    let mut rows = vec![[F128::ZERO; 4]; blocks.total() - base];
+    rows[blocks.off[m + 1] - base][STATE_SUCCESS] = F128::ONE;
+    for layer in (lo..=m).rev() {
+        // `point_bit(z_row, layer)` is 0 for every statement here.
+        let t = build_eq_table(&[F128::ZERO, point_bit(rho, layer)]);
+        let eq4 = [t[0], t[1], t[2], t[3]];
+        let pbase = blocks.off[layer + 1] - base;
+        let (head, tail) = rows.split_at_mut(pbase);
+        let dst = &mut head[blocks.off[layer] - base..];
+        let src = &*tail;
+        let (parent, cd) = (&blocks.parent[layer], &blocks.cd[layer]);
+        dst.par_chunks_mut(ASSIST_CHUNK)
+            .zip(parent.par_chunks(ASSIST_CHUNK))
+            .zip(cd.par_chunks(ASSIST_CHUNK))
+            .for_each(|((dc, pc), cc)| {
+                for ((slot, &p), &t) in dc.iter_mut().zip(pc).zip(cc) {
+                    let rows_cd = &sparse[t as usize];
+                    let sv = &src[p as usize];
+                    for (s, out) in slot.iter_mut().enumerate() {
+                        let (i0, o0) = rows_cd[s][0];
+                        let (i1, o1) = rows_cd[s][1];
+                        *out = eq4[i0] * sv[o0] + eq4[i1] * sv[o1];
+                    }
+                }
+            });
+    }
+    rows
+}
+
+/// The statement's own LOW layers `[0, lo)` of the blocked suffix store,
+/// with layer `lo − 1` reading its parents from the shared `tail`
+/// ([`assist_shared_tail_blocked`]). Together the two are slot-for-slot the
+/// full [`assist_suffix_rows_blocked`] store.
+fn assist_suffix_low_blocked(
+    blocks: &AssistBlocks,
+    eq4s: &[[F128; 4]],
+    sparse: &[[[(usize, usize); 2]; 4]; 4],
+    lo: usize,
+    tail: &[[F128; 4]],
+    par: bool,
+) -> Vec<[F128; 4]> {
+    use rayon::prelude::*;
+    #[inline]
+    fn step(
+        dst: &mut [F128; 4],
+        src: &[F128; 4],
+        cd: u8,
+        eq4: &[F128; 4],
+        sparse: &[[[(usize, usize); 2]; 4]; 4],
+    ) {
+        let rows_cd = &sparse[cd as usize];
+        for (s, slot) in dst.iter_mut().enumerate() {
+            let (i0, o0) = rows_cd[s][0];
+            let (i1, o1) = rows_cd[s][1];
+            *slot = eq4[i0] * src[o0] + eq4[i1] * src[o1];
+        }
+    }
+
+    debug_assert!(lo >= 1);
+    let mut rows = vec![[F128::ZERO; 4]; blocks.off[lo]];
+    for layer in (0..lo).rev() {
+        let eq4 = &eq4s[layer];
+        let (parent, cd) = (&blocks.parent[layer], &blocks.cd[layer]);
+        let (head, rest) = rows.split_at_mut(blocks.off[layer + 1]);
+        let dst = &mut head[blocks.off[layer]..];
+        let src: &[[F128; 4]] = if layer + 1 == lo {
+            &tail[..blocks.n_blocks(lo)]
+        } else {
+            &rest[..blocks.n_blocks(layer + 1)]
+        };
+        if par {
+            dst.par_chunks_mut(ASSIST_CHUNK)
+                .zip(parent.par_chunks(ASSIST_CHUNK))
+                .zip(cd.par_chunks(ASSIST_CHUNK))
+                .for_each(|((dc, pc), cc)| {
+                    for ((slot, &p), &t) in dc.iter_mut().zip(pc).zip(cc) {
+                        step(slot, &src[p as usize], t, eq4, sparse);
+                    }
+                });
+        } else {
+            for ((slot, &p), &t) in dst.iter_mut().zip(parent).zip(cd) {
+                step(slot, &src[p as usize], t, eq4, sparse);
+            }
+        }
+    }
+    rows
+}
+
+/// `eq((t_{y-1}, t_y), σ)` per deduped column, by DESCENDING the block tree:
+/// a block's value is its parent's times its layer quadrant — one multiply
+/// per block, against the dense `2(m+1)` per column. The layer-0 values are
+/// the per-column tensor products, shared by every statement of a batch
+/// (they depend on the pairs and `σ` alone); pairing them with the
+/// statement's weights afterwards is the same field product reassociated,
+/// so `Σ_y w_y·eq_y` equals [`assist_w_at_blocked`] exactly.
+fn assist_eq_at_blocked(blocks: &AssistBlocks, sigma: &[F128], m: usize) -> Vec<F128> {
+    debug_assert_eq!(sigma.len(), 2 * (m + 1));
+    let mut vals = vec![F128::ONE]; // the layer-(m+1) root
+    for layer in (0..=m).rev() {
+        let (rc, rd) = (sigma[2 * layer], sigma[2 * layer + 1]);
+        let (rc1, rd1) = (F128::ONE + rc, F128::ONE + rd);
+        let e = [rc1 * rd1, rc * rd1, rc1 * rd, rc * rd];
+        let (parent, cd) = (&blocks.parent[layer], &blocks.cd[layer]);
+        let mut next = Vec::with_capacity(blocks.n_blocks(layer));
+        for (&p, &t) in parent.iter().zip(cd) {
+            next.push(vals[p as usize] * e[t as usize]);
+        }
+        vals = next;
+    }
+    vals
+}
+
 /// Ascend the block tree one layer, folding the layer's two challenges into the
 /// weight partials: `p[ℓ+1][B] = Σ_{b ⊆ B} ch4[cd_ℓ(b)]·p[ℓ][b]`.
 ///
@@ -1168,17 +1305,27 @@ fn fold_partials(
 fn assist_buckets(
     p: &[F128],
     sfx: &[[F128; 4]],
+    tail: &[[F128; 4]],
+    lo_off: usize,
     blocks: &AssistBlocks,
     layer: usize,
     par: bool,
 ) -> [[F128; 4]; 4] {
     use rayon::prelude::*;
     let pbase = blocks.off[layer + 1];
+    // The parent layer's suffix slots: the statement's own store below the
+    // shared boundary (`lo_off = off[lo]`), the statement-independent tail
+    // above it. A full store passes `lo_off = usize::MAX`.
+    let (src, base) = if pbase < lo_off {
+        (sfx, pbase)
+    } else {
+        (tail, pbase - lo_off)
+    };
     let (parent, cd) = (&blocks.parent[layer], &blocks.cd[layer]);
     let body = |pc: &[F128], pp: &[u32], cc: &[u8]| {
         let mut b = [[F128::ZERO; 4]; 4];
         for ((&v, &par), &t) in pc.iter().zip(pp).zip(cc) {
-            let s = &sfx[pbase + par as usize];
+            let s = &src[base + par as usize];
             let bk = &mut b[t as usize];
             bk[0] += v * s[0];
             bk[1] += v * s[1];
@@ -1344,7 +1491,7 @@ pub fn prove_assist<C: Challenger>(
         if let Some(c4) = ch4 {
             fold_partials(&mut p, &mut scratch, &blocks, layer - 1, &c4, true);
         }
-        let buckets = assist_buckets(&p, &sfx, &blocks, layer, true);
+        let buckets = assist_buckets(&p, &sfx, &[], usize::MAX, &blocks, layer, true);
         let u = assist_u_rows(&prefix_row, &eq4s[layer], &sparse);
 
         // c-round.
@@ -1641,14 +1788,16 @@ struct FrobeniusStatement {
 /// column weights scaled by `c_{i,j}`. Statements with `c_{i,j} = 0` are
 /// skipped (their contribution is identically zero).
 ///
-/// `blocks` is `Some` on the prover, which needs the suffix store and the
-/// layer-0 weight partials; the verifier takes `None` and touches neither.
+/// `prover` is `Some((blocks, tail, lo))` on the prover, which needs the
+/// suffix store and the layer-0 weight partials — each statement builds only
+/// its low layers `[0, lo)`, sharing `tail` above ([`assist_shared_tail_blocked`]).
+/// The verifier takes `None` and touches neither.
 fn frobenius_statements(
     params: &JaggedParams,
     claims: &[FrobeniusClaim<'_>],
     rho: &[F128],
     bounds: &[(u64, u64, u32)],
-    blocks: Option<&AssistBlocks>,
+    prover: Option<(&AssistBlocks, &[[F128; 4]], usize)>,
 ) -> Vec<FrobeniusStatement> {
     use rayon::prelude::*;
     let m = params.m;
@@ -1686,9 +1835,9 @@ fn frobenius_statements(
                     [t[0], t[1], t[2], t[3]]
                 })
                 .collect();
-            let (sfx, p) = match blocks {
-                Some(b) => (
-                    assist_suffix_rows_blocked(b, &eq4s, &sparse, m, inner),
+            let (sfx, p) = match prover {
+                Some((b, tail, lo)) => (
+                    assist_suffix_low_blocked(b, &eq4s, &sparse, lo, tail, inner),
                     b.seed(&cols),
                 ),
                 None => (Vec::new(), Vec::new()),
@@ -1718,6 +1867,8 @@ fn frobenius_statements(
 fn frobenius_layer_pass(
     st: &mut FrobeniusStatement,
     blocks: &AssistBlocks,
+    tail: &[[F128; 4]],
+    lo_off: usize,
     layer: usize,
     prev_ch4: Option<&[F128; 4]>,
     sparse: &[[[(usize, usize); 2]; 4]; 4],
@@ -1726,7 +1877,7 @@ fn frobenius_layer_pass(
     if let Some(ch4) = prev_ch4 {
         fold_partials(&mut st.p, &mut st.scratch, blocks, layer - 1, ch4, par);
     }
-    let buckets = assist_buckets(&st.p, &st.sfx, blocks, layer, par);
+    let buckets = assist_buckets(&st.p, &st.sfx, tail, lo_off, blocks, layer, par);
     let u = assist_u_rows(&st.prefix_row, &st.eq4s[layer], sparse);
     (u, buckets)
 }
@@ -1750,12 +1901,19 @@ pub fn prove_frobenius_assist<C: Challenger>(
     let sparse = assist_sparse_transitions();
     let bounds = assist_boundaries(params);
     let blocks = AssistBlocks::new(&bounds, m);
-    let mut sts = frobenius_statements(params, claims, rho, &bounds, Some(&blocks));
+    // Layers ≥ lo of the suffix store are statement-independent (their eq
+    // tables read only the shared `rho`); build them once for all 128·K
+    // statements. Per statement only the low layers remain.
+    let lo = params.n.clamp(1, m + 1);
+    let tail = assist_shared_tail_blocked(&blocks, rho, &sparse, m, lo);
+    let lo_off = blocks.off[lo];
+    let mut sts = frobenius_statements(params, claims, rho, &bounds, Some((&blocks, &tail, lo)));
     if trace {
         eprintln!(
-            "    [frobenius] statements + suffix rows (x{}, {} blocks vs {} dense): {:6.2} ms",
+            "    [frobenius] statements + suffix rows (x{}, {} low + {} shared blocks vs {} dense): {:6.2} ms",
             sts.len(),
-            blocks.total(),
+            lo_off,
+            blocks.total() - lo_off,
             (m + 2) * blocks.n_cols,
             t.elapsed().as_secs_f64() * 1e3
         );
@@ -1796,14 +1954,16 @@ pub fn prove_frobenius_assist<C: Challenger>(
             // parallelize WITHIN each statement — same values,
             // XOR-reassociated.
             for (st, o) in sts.iter_mut().zip(per.iter_mut()) {
-                *o = frobenius_layer_pass(st, &blocks, layer, c4, &sparse, true);
+                *o = frobenius_layer_pass(st, &blocks, &tail, lo_off, layer, c4, &sparse, true);
             }
         } else {
             sts.par_chunks_mut(8)
                 .zip(per.par_chunks_mut(8))
                 .for_each(|(stc, oc)| {
                     for (st, o) in stc.iter_mut().zip(oc.iter_mut()) {
-                        *o = frobenius_layer_pass(st, &blocks, layer, c4, &sparse, false);
+                        *o = frobenius_layer_pass(
+                            st, &blocks, &tail, lo_off, layer, c4, &sparse, false,
+                        );
                     }
                 });
         }
@@ -1911,11 +2071,39 @@ pub fn verify_frobenius_assist<C: Challenger>(
 
     let bounds = assist_boundaries(params);
     let blocks = AssistBlocks::new(&bounds, m);
+    let t = std::time::Instant::now();
     let sts = frobenius_statements(params, claims, rho, &bounds, None);
+    if trace {
+        eprintln!(
+            "          [fro-v] statements (x{}, {} cols each): {}",
+            sts.len(),
+            sts.first().map_or(0, |s| s.cols.len()),
+            tfmt(t.elapsed().as_secs_f64())
+        );
+    }
+    // `eq(pair, σ)` per column, hoisted out of the per-statement loop — one
+    // tree descent shared by all statements; each statement then pays a
+    // plain weighted dot. Same field products as the per-statement ascent
+    // ([`assist_w_at_blocked`]), reassociated, so `w` is bit-identical.
+    let t = std::time::Instant::now();
+    let eq_cols = assist_eq_at_blocked(&blocks, &sigma, m);
+    if trace {
+        eprintln!(
+            "          [fro-v] eq descent ({} blocks, once for {} statements): {}",
+            blocks.total(),
+            sts.len(),
+            tfmt(t.elapsed().as_secs_f64())
+        );
+    }
+    let t = std::time::Instant::now();
     let expect = sts
         .par_iter()
         .map(|st| {
-            let w = assist_w_at_blocked(&blocks, &st.cols, &sigma, m);
+            let w = st
+                .cols
+                .iter()
+                .zip(&eq_cols)
+                .fold(F128::ZERO, |acc, (&(w, _, _), &e)| acc + w * e);
             let mut g = [F128::ZERO; 4];
             g[STATE_SUCCESS] = F128::ONE;
             let sparse = assist_sparse_transitions();
@@ -1942,6 +2130,13 @@ pub fn verify_frobenius_assist<C: Challenger>(
             w * g[STATE_INITIAL]
         })
         .reduce(|| F128::ZERO, |a, b| a + b);
+    if trace {
+        eprintln!(
+            "          [fro-v] per-statement dot + boundary DP (x{}): {}",
+            sts.len(),
+            tfmt(t.elapsed().as_secs_f64())
+        );
+    }
     (claim == expect).then_some(proof.v)
 }
 
@@ -4076,6 +4271,78 @@ mod tests {
         }
     }
 
+    /// The shared-tail split of the blocked store must be slot-for-slot the
+    /// monolithic build: layers `≥ lo` from [`assist_shared_tail_blocked`]
+    /// (which reconstructs the statement-independent eq tables from `rho`
+    /// alone), layers `< lo` from [`assist_suffix_low_blocked`] reading its
+    /// boundary parents out of that tail. This is the load-bearing check for
+    /// sharing the tail across a Frobenius batch: if the zero-padding
+    /// argument were off by one layer, the prover would silently emit a
+    /// wrong proof.
+    #[test]
+    fn blocked_low_plus_tail_matches_full() {
+        let mut ch = RandomChallenger::new(0x5A11_7A1B);
+        let sparse = assist_sparse_transitions();
+        for (heights, n, m) in blocked_shapes() {
+            let params = JaggedParams::from_heights(&heights, n, m);
+            let bounds = assist_boundaries(&params);
+            let blocks = AssistBlocks::new(&bounds, m);
+            // eq tables exactly as `frobenius_statements` builds them: the
+            // statement's `z_row` below its length, zero-padded above.
+            let zr = sample_vec(&mut ch, n);
+            let rho = sample_vec(&mut ch, m);
+            let eq4s: Vec<[F128; 4]> = (0..=m)
+                .map(|layer| {
+                    let t = build_eq_table(&[point_bit(&zr, layer), point_bit(&rho, layer)]);
+                    [t[0], t[1], t[2], t[3]]
+                })
+                .collect();
+            let full = assist_suffix_rows_blocked(&blocks, &eq4s, &sparse, m, false);
+            let lo = n.clamp(1, m + 1);
+            let tail = assist_shared_tail_blocked(&blocks, &rho, &sparse, m, lo);
+            assert_eq!(
+                tail[..],
+                full[blocks.off[lo]..],
+                "shared tail (lo={lo}) heights {heights:?}"
+            );
+            for par in [false, true] {
+                let low = assist_suffix_low_blocked(&blocks, &eq4s, &sparse, lo, &tail, par);
+                assert_eq!(
+                    low[..],
+                    full[..blocks.off[lo]],
+                    "low layers (lo={lo}, par={par}) heights {heights:?}"
+                );
+            }
+        }
+    }
+
+    /// The hoisted per-column eq vector (one tree descent, shared by every
+    /// statement) dotted with a statement's weights must equal the
+    /// per-statement ascent [`assist_w_at_blocked`] — bit-identical, the
+    /// same field products reassociated.
+    #[test]
+    fn hoisted_blocked_eq_matches_w_at() {
+        let mut ch = RandomChallenger::new(0x0157_E97A);
+        for (heights, n, m) in blocked_shapes() {
+            let params = JaggedParams::from_heights(&heights, n, m);
+            let bounds = assist_boundaries(&params);
+            let blocks = AssistBlocks::new(&bounds, m);
+            let cols = assist_columns_at(&bounds, &sample_vec(&mut ch, params.k));
+            let sigma = sample_vec(&mut ch, 2 * (m + 1));
+            let eq_cols = assist_eq_at_blocked(&blocks, &sigma, m);
+            assert_eq!(eq_cols.len(), cols.len(), "heights {heights:?}");
+            let dot = cols
+                .iter()
+                .zip(&eq_cols)
+                .fold(F128::ZERO, |acc, (&(w, _, _), &e)| acc + w * e);
+            assert_eq!(
+                dot,
+                assist_w_at_blocked(&blocks, &cols, &sigma, m),
+                "heights {heights:?}"
+            );
+        }
+    }
+
     #[test]
     fn blocked_layer_state_matches_dense() {
         // The two block-scale kernels composed, driven layer by layer with the
@@ -4118,7 +4385,7 @@ mod tests {
                 }
                 for par in [false, true] {
                     assert_eq!(
-                        assist_buckets(&p, &blk_sfx, &blocks, layer, par),
+                        assist_buckets(&p, &blk_sfx, &[], usize::MAX, &blocks, layer, par),
                         want,
                         "buckets at layer {layer} (par={par}) heights {heights:?}"
                     );
