@@ -212,6 +212,33 @@ the boolean domain breaks the honest sum. The implementation runs the
 boolean PIOP over its subcube and appends frozen-zero high coordinates to
 its claims.)
 
+\begin{remark}[Dead addresses: the audit, and the plan]\label{rem:dead}
+The two-subcube structure inflates the address space: since neither
+class region can live inside the other's subcube (the $c{=}z$ trap
+again), \emph{any} nonempty element class costs one extra address bit
+over the boolean extent --- up to $2\times$ address space, mostly dead,
+regardless of how small the element tables are (and symmetrically if the
+classes swap order). The audit of who pays for a dead address:
+commitment, \emph{nothing} (height-$0$ columns commit no words ---
+measured exactly flat); both PIOPs, \emph{nothing} (the dead region is
+outside both domains --- the point of the design); wiring,
+\emph{nothing} (the cell space indexes (table, io-slot) $\times$ rows
+compactly and never sees union addresses); verifier, a few frozen
+coordinates. Two places do pay: the \emph{unmerged} transport's
+padded-domain auxiliaries ($b_{\mathrm{combined}}$ and its fold chain
+scale with $2^{M-7}$ --- a few ms per extra bit at $M \approx 30$), and
+the materialized padded witness buffer ($\sim$134\,MB of zero pages per
+extra bit at that scale, plus its fill pass). The plan: accept now;
+the \textbf{merged transport computes over the dense domain} and has
+neither cost, so merged intake (\S\ref{sec:status}) retires the first
+payer for circuit proofs; the buffer cost is removable by the
+previously-shelved dense-born witness refactor, whose value grows with
+exactly this inflation --- revivable if profiles say so. Rejected:
+packing the boolean domain as multiple subcubes --- buys back at most
+one bit for extra zerocheck transcripts or a non-factoring domain
+indicator.
+\end{remark}
+
 \subsection{The relation}
 
 A large-field type is a base block over $\F$: $2^\kappa$ witness columns
