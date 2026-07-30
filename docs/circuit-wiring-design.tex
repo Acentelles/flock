@@ -353,7 +353,13 @@ each cell its word.
 Worked example: $\nu = 10$, a SHA-256 gate table with schema words
 $(h_0, h_1, m_0 \ldots m_3, o_0, o_1)$, a mult table with $(a, b, c)$,
 one public slot --- $12$ cell-slots padded to $2^c = 16$, so $\mu = 14$
-and $16{,}384$ cells. Cell $(\iota{=}2, j{=}17)$ is ``the $m_0$ input
+and $16{,}384$ cells. (The schema is a per-type choice, not forced by
+the trace: this is the \emph{chaining} compression gate, $h$ wireable so
+multi-compression hashes --- FS chains, Merkle leaves --- wire gate
+$i{+}1$'s $h$ to gate $i$'s output, and IV instances wire $h$ to the
+public IV cell. An IV-\emph{pinned} 6-word variant drops $h_0, h_1$ and
+pins the IV in the relation instead; a word left out of the schema must
+be pinned by the relation, else it is free witness.) Cell $(\iota{=}2, j{=}17)$ is ``the $m_0$ input
 word of sha2 gate \#17''; its committed word is the bit-concatenation of
 $\iota$'s two registry constants with $j$:
 $[\,p_{\mathrm{sha2}} \mid \mathrm{chunk}(m_0) \mid j\,]$. Everything in
