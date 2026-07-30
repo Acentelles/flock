@@ -626,7 +626,59 @@ columns have height `n_t`, so `t_y = y·n_t` is an arithmetic progression —
 consecutive `eq` products are related), and the 256 statements all walk the
 *same* column set with only `σ` differing.
 
-**Prove** — three roughly equal thirds, all column-scaled:
+### The hoist: `W(σ)` computed once, not 128·K times — verify 5.6×
+
+Writing out what `W(σ)` computes exposed pure redundancy. In
+`verify_frobenius_assist`, across the 256 statements:
+
+* `σ` is the sumcheck's final point — **sampled once, shared**;
+* the column height pairs `(t_{y-1}, t_y)` come from `params.col_prefix_sums`
+  alone, and `assist_columns` merges purely on pair equality — so the pair
+  sequence, its order, and the merge boundaries are **identical** in every
+  statement;
+* only the per-column *weight* differs (each statement's Frobenius-powered
+  `eq(z_c, ·)` scaled by `c_{i,j}`).
+
+So the whole `Π_layer eq(t[layer], σ)` tensor product — all `2(m+1)` multiplies
+per column — was being recomputed 256 times on identical inputs.
+[`assist_eq_pairs_at`] now computes it **once** into a shared table, and each
+statement becomes a dot product `Σ_y w_y · E_y`.
+
+| | before | after | |
+|---|---|---|---|
+| `eq(pairs, σ)` | — | 473 µs | computed once |
+| per-statement dot + DP | — | 976 µs | (dot 756 µs summed) |
+| **`W(σ)` total** | **116.62 ms** | **1.45 ms** | **80×** |
+| `frobenius_statements` | 5.75 ms | 6.24 ms | unchanged |
+| **assist total** | **125.05 ms** | **9.35 ms** | **13.4×** |
+| **Merkle verify** | **140.6 ms** | **25.0 ms** | **5.6×** |
+| BLAKE3 verify | 14.2 ms | 10.2 ms | 1.4× |
+| verify ratio | 9.9× | **2.45×** | |
+
+80×, better than the 38× the multiply count predicted (39.2M → 1.0M) — the old
+inner loop selected `σ` or `1+σ` per bit, so it was branch-bound as well as
+multiply-bound, while the dot product is a clean stream. Prove is untouched and
+unchanged (~160 ms BLAKE3 / ~320–390 ms Merkle across runs; a 209 ms BLAKE3
+reading in one run was thermal noise, confirmed by re-running).
+
+Licensed by `hoisted_eq_pairs_match_assist_w_at`, which asserts **bit-identical**
+results against `assist_w_at` (same products, different association order — and
+GF(2^128) has no rounding to hide behind) *and* pins the shared-pair-sequence
+invariant directly rather than leaving it to a `debug_assert`, since if that ever
+breaks the hoist is silently wrong for every statement but the first.
+
+**Verify at 26,624 is now 25.3 ms, and the lincheck fold is the biggest phase
+again**: `lincheck::verify_union` 14.64 ms (58%, of which `fold_alpha_batched`
+~12.4 ms vs BLAKE3's 8.7 ms — only 1.4×) against the assist's 9.35 ms. Inside
+the assist, `frobenius_statements` is now dominant at 6.24 ms (67%) — that one
+does not hoist, since each statement's `z_col` is genuinely different (Frobenius
+powers), so its `2^k`-entry `eq` table really is per-statement. ~1.7 ms of the
+9.35 ms is unattributed; by analogy with the prover it is likely the statement
+drop (~34 MB), not verified.
+
+**Prove** — three roughly equal thirds, all column-scaled. **Not** improved by
+the hoist above, which is verifier-only; the prover's suffix-row streaming is a
+different algorithm:
 
 | phase | merkle | blake3 | ratio | share |
 |---|---|---|---|---|

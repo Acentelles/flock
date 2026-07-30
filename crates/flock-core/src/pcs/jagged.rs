@@ -830,6 +830,67 @@ fn assist_w_at(cols: &[(F128, u64, u64)], rho: &[F128], m: usize) -> F128 {
     acc
 }
 
+/// The run-length-merged column height pairs `(t_{y-1}, t_y)`, derived from
+/// `params` ALONE.
+///
+/// This is the key to hoisting `W(σ)` out of the per-statement loop: every
+/// Frobenius statement's `cols` carries the same pair sequence in the same
+/// order with the same merge boundaries, because [`assist_columns`] takes the
+/// pairs from `col_prefix_sums` and merges purely on pair equality — only the
+/// *weights* differ per statement. Kept as a separate function (rather than
+/// reading `sts[0]`) so that invariant is enforced by construction.
+fn assist_column_pairs(params: &JaggedParams) -> Vec<(u64, u64)> {
+    let n_cols = 1usize << params.k;
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(n_cols);
+    for y in 0..n_cols {
+        let pair = (params.col_prefix_sums[y], params.col_prefix_sums[y + 1]);
+        if out.last() != Some(&pair) {
+            out.push(pair);
+        }
+    }
+    out
+}
+
+/// `eq((t_{y-1}, t_y), σ)` for every merged column — the `2(m+1)`-multiply
+/// tensor product that [`assist_w_at`] recomputes per column, evaluated ONCE
+/// for the whole statement set.
+///
+/// `σ` is interleaved `(c_0, d_0, c_1, d_1, …)` and `eq(b, r)` at a boolean `b`
+/// is `r` or `1 + r` in characteristic 2, so this is exactly the product
+/// `assist_w_at` forms; multiplication is associative, so pairing it with the
+/// weight afterwards is bit-identical to folding the weight in first.
+fn assist_eq_pairs_at(pairs: &[(u64, u64)], sigma: &[F128], m: usize) -> Vec<F128> {
+    use rayon::prelude::*;
+    debug_assert_eq!(sigma.len(), 2 * (m + 1));
+    let one_col = |&(t_c, t_next): &(u64, u64)| -> F128 {
+        let mut e = F128::ONE;
+        for layer in 0..=m {
+            let rc = sigma[2 * layer];
+            let rd = sigma[2 * layer + 1];
+            e *= if (t_c >> layer) & 1 == 1 {
+                rc
+            } else {
+                F128::ONE + rc
+            };
+            e *= if (t_next >> layer) & 1 == 1 {
+                rd
+            } else {
+                F128::ONE + rd
+            };
+        }
+        e
+    };
+    if pairs.len() < 2 * ASSIST_CHUNK {
+        pairs.iter().map(one_col).collect()
+    } else {
+        pairs
+            .par_iter()
+            .with_min_len(ASSIST_CHUNK)
+            .map(one_col)
+            .collect()
+    }
+}
+
 /// Column-chunk size for the assist's parallel passes: coarse enough to
 /// amortize rayon task overhead at typical column counts (2^k in the
 /// hundreds–thousands), fine enough to load-balance a P-core pool.
@@ -1719,32 +1780,57 @@ pub fn verify_frobenius_assist<C: Challenger>(
             tfmt(t.elapsed().as_secs_f64())
         );
     }
+    // ---- `eq((t_{y-1}, t_y), σ)`, once for ALL statements.
+    //
+    // This is the verifier's only `2^k`-scale work, and it used to run once per
+    // statement — `128·K` times over identical inputs. The pair sequence comes
+    // from `params` and `σ` is shared, so only the per-column WEIGHT differs
+    // between statements (each one's Frobenius-powered `eq(z_c, ·)` scaled by
+    // `c_{i,j}`). Hoisting the tensor product out turns
+    // `128·K · n_cols · 2(m+1)` multiplies into `n_cols · 2(m+1)` plus one
+    // `128·K · n_cols` dot-product pass — at 256 statements, m = 22 and 3326
+    // columns that is 39.2M → 1.0M.
+    let t_eq = std::time::Instant::now();
+    let pairs = assist_column_pairs(params);
+    let eq_pairs = assist_eq_pairs_at(&pairs, &sigma, m);
+    if trace {
+        eprintln!(
+            "          [fro-v] eq(pairs, σ) hoisted ({} cols, once for {} statements): {}",
+            pairs.len(),
+            sts.len(),
+            tfmt(t_eq.elapsed().as_secs_f64())
+        );
+    }
     let t = std::time::Instant::now();
-    // With few statements (the multipoint anchor's K), the statement-level
-    // parallelism below can't occupy the pool; parallelize the per-column
-    // `W(σ)` walk inside each statement instead (XOR-reassociated sums —
-    // value-identical).
-    let few_statements = sts.len() < 16;
-    let w_at = |cols: &[(F128, u64, u64)], sigma: &[F128]| -> F128 {
-        const PAR_CHUNK: usize = 1 << 10;
-        if !few_statements || cols.len() < 2 * PAR_CHUNK {
-            assist_w_at(cols, sigma, m)
-        } else {
-            cols.par_chunks(PAR_CHUNK)
-                .map(|cc| assist_w_at(cc, sigma, m))
-                .reduce(|| F128::ZERO, |a, b| a + b)
-        }
-    };
-    // Split `W(σ)` (column-scaled) from the boundary DP (not column-scaled)
-    // by accumulating nanos per statement — 256 `Instant` pairs against a
-    // 100 ms+ body, so the probe itself is noise. Trace-gated.
+    // Split the per-statement dot product from the boundary DP by accumulating
+    // nanos per statement. Trace-gated.
     let w_nanos = std::sync::atomic::AtomicU64::new(0);
     let expect = sts
         .par_iter()
         .map(|st| {
             // `Option` so an untraced verify makes no timing calls at all.
             let t_w = trace.then(std::time::Instant::now);
-            let w = w_at(&st.cols, &sigma);
+            debug_assert_eq!(
+                st.cols.len(),
+                eq_pairs.len(),
+                "every statement must share the params-derived column set"
+            );
+            // Weight × the shared tensor product. Multiplication is
+            // associative, so this is bit-identical to `assist_w_at` folding
+            // the weight in first, and the summation order is unchanged.
+            let w = st
+                .cols
+                .iter()
+                .zip(&pairs)
+                .zip(&eq_pairs)
+                .map(|((&(w, t_c, t_next), &(pc, pd)), &e)| {
+                    debug_assert!(
+                        t_c == pc && t_next == pd,
+                        "statement column pairs diverged from params"
+                    );
+                    w * e
+                })
+                .fold(F128::ZERO, |a, x| a + x);
             if let Some(t_w) = t_w {
                 w_nanos.fetch_add(
                     t_w.elapsed().as_nanos() as u64,
@@ -1784,7 +1870,7 @@ pub fn verify_frobenius_assist<C: Challenger>(
         // independent.
         let w_sum = w_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
         eprintln!(
-            "          [fro-v] W(σ) walk + boundary DP: {}  (W(σ) is {:.1}% of it: {} summed over {} statements)",
+            "          [fro-v] per-statement dot product + boundary DP: {}  (dot is {:.1}% of it: {} summed over {} statements)",
             tfmt(total),
             100.0 * w_sum / total.max(f64::MIN_POSITIVE),
             tfmt(w_sum),
@@ -3182,6 +3268,84 @@ mod tests {
             *qi = ch.sample_f128();
         }
         (params, q)
+    }
+
+    /// The hoisted `eq(pairs, σ)` table must reproduce [`assist_w_at`] exactly.
+    ///
+    /// `verify_frobenius_assist` computes `W(σ)` once for all statements as
+    /// `Σ_y w_y · eq((t_{y-1},t_y), σ)` with the tensor product shared; the
+    /// oracle folds the weight in first, per statement. Those are the same
+    /// products in a different association order, so the results must be
+    /// **bit-identical**, not merely close — there is no rounding to hide
+    /// behind in GF(2^128).
+    ///
+    /// Also pins the invariant the hoist rests on: every statement's `cols`
+    /// carries the params-derived pair sequence, in order, with identical merge
+    /// boundaries. If that ever stops holding, the hoist is silently wrong for
+    /// all but the first statement, so it is checked directly here rather than
+    /// left to a `debug_assert`.
+    #[test]
+    fn hoisted_eq_pairs_match_assist_w_at() {
+        use crate::pcs::ring_switch;
+        let mut ch = RandomChallenger::new(0x0E9_9A1_5ED);
+        for &(n, k, m) in &[(3usize, 2usize, 5usize), (4, 3, 7), (3, 4, 8)] {
+            let (params, _q) = random_instance(&mut ch, n, k, m);
+            let rho = sample_vec(&mut ch, m);
+            // Interleaved (c_0, d_0, …) point of the assist's 2(m+1) vars.
+            let sigma = sample_vec(&mut ch, 2 * (m + 1));
+
+            let claims_data: Vec<(Vec<F128>, Vec<F128>, Vec<F128>)> = (0..2)
+                .map(|_| {
+                    let zr = sample_vec(&mut ch, n);
+                    let zc = sample_vec(&mut ch, k);
+                    let eq_r: Vec<F128> = (0..128).map(|_| ch.sample_f128()).collect();
+                    let coeffs = ring_switch::linearized_coefficients(
+                        &ring_switch::build_fold_byte_table(&eq_r),
+                    );
+                    (zr, zc, coeffs)
+                })
+                .collect();
+            let fclaims: Vec<FrobeniusClaim<'_>> = claims_data
+                .iter()
+                .map(|(zr, zc, c)| FrobeniusClaim {
+                    z_row: zr,
+                    z_col: zc,
+                    coeffs: c,
+                })
+                .collect();
+
+            let sts = frobenius_statements(&params, &fclaims, &rho, false);
+            assert!(!sts.is_empty(), "n={n} k={k} m={m}: no statements");
+            let pairs = assist_column_pairs(&params);
+            let eq_pairs = assist_eq_pairs_at(&pairs, &sigma, m);
+
+            for (si, st) in sts.iter().enumerate() {
+                // The invariant: identical pair sequence, order and merges.
+                assert_eq!(
+                    st.cols.len(),
+                    pairs.len(),
+                    "n={n} k={k} m={m} stmt {si}: merged column count"
+                );
+                for (ci, (&(_, t_c, t_next), &(pc, pd))) in st.cols.iter().zip(&pairs).enumerate() {
+                    assert_eq!(
+                        (t_c, t_next),
+                        (pc, pd),
+                        "n={n} k={k} m={m} stmt {si} col {ci}: pair"
+                    );
+                }
+                let hoisted = st
+                    .cols
+                    .iter()
+                    .zip(&eq_pairs)
+                    .map(|(&(w, _, _), &e)| w * e)
+                    .fold(F128::ZERO, |a, x| a + x);
+                assert_eq!(
+                    hoisted,
+                    assist_w_at(&st.cols, &sigma, m),
+                    "n={n} k={k} m={m} stmt {si}: hoisted W(σ) != assist_w_at"
+                );
+            }
+        }
     }
 
     /// The batched Frobenius assist proves exactly the Φ-twisted weight
