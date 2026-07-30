@@ -451,7 +451,14 @@ $\mu \approx \nu + 5$ this is $\sim$12\,ms at $\nu = 16$; sizing $\nu$ to
 the circuit family makes it the honest cost. The v2 refinement (mask dummy
 leaves to 1 --- sound since $\sigma$ maps live cells to live cells; all-1
 subtrees skip by run lists; count-derived closed-form corrections on the
-verifier side) is sketched and deferred.
+verifier side) is sketched and deferred. The 1's live only in the
+prover's uncommitted product-tree leaf vector, built per proof from the
+committed values and $\alpha, \beta$ --- the trace's dummy rows stay
+all-zero, as the zerocheck and jagged transport require (indeed the
+masked input-layer reconstruction uses $\hat w_{\mathrm{live}} = \hat w$,
+which holds \emph{because} dummy cells read zeros); the correction terms
+are the $\mathrm{live}$-indicator MLEs, per-slot aligned-interval eq
+sums the verifier evaluates from the counts.
 
 % ===========================================================================
 \section{Binding \texorpdfstring{$\hat s_\sigma(\rho)$}{s-sigma}: the
