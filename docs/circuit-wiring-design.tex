@@ -350,6 +350,24 @@ of length $k{+}1$; a constant wired into $n$ gates is one long cycle;
 unread outputs are fixed points. The wire-value polynomial $w$ assigns
 each cell its word.
 
+Worked example: $\nu = 10$, a SHA-256 gate table with schema words
+$(h_0, h_1, m_0 \ldots m_3, o_0, o_1)$, a mult table with $(a, b, c)$,
+one public slot --- $12$ cell-slots padded to $2^c = 16$, so $\mu = 14$
+and $16{,}384$ cells. Cell $(\iota{=}2, j{=}17)$ is ``the $m_0$ input
+word of sha2 gate \#17''; its committed word is the bit-concatenation of
+$\iota$'s two registry constants with $j$:
+$[\,p_{\mathrm{sha2}} \mid \mathrm{chunk}(m_0) \mid j\,]$. Everything in
+the wiring argument speaks this $14$-bit language --- $w$, $\sigma$, the
+$\sid$ tags in the product are \emph{cell} indices, never union
+addresses. The point of the second index space is compression: run over
+union addresses (with $\sigma$ fixing non-IO words) and the product pays
+a factor per \emph{trace word} --- the sha2 slot alone is $2^{18}$
+words, dominated by round intermediates no wire touches, plus the dead
+inter-class space of Remark~\ref{rem:dead}; the cell space pays per
+\emph{schema word}, $2^{14}$ here, and is immune to both. The verifier's
+per-slot data is tiny: $2^c$ coefficients $\eq(\rho_\iota, \iota)$ and
+each $\iota$'s constant (prefix, column) pair from the registry.
+
 % ===========================================================================
 \section{The wiring argument}\label{sec:wiring}
 
