@@ -239,6 +239,29 @@ one bit for extra zerocheck transcripts or a non-factoring domain
 indicator.
 \end{remark}
 
+\begin{remark}[Taxonomy of emptiness]\label{rem:empty}
+Four kinds, two index spaces, one invariant. (1) \emph{Non-IO trace
+columns}: real committed witness, just not wireable --- no cells index
+them. (2) \emph{Dead addresses} (unused block columns, alignment gaps,
+the inter-class region): height 0, never committed, outside both PIOP
+domains, not cells; the virtual $\hat f$ is definitionally zero there
+and the transport identity $\ip{q}{W_\rho} = \hat f(\rho)$ is the
+binding. (3) \emph{Dummy rows} ($n_t \le j < 2^\nu$): uncommitted and
+virtually zero on the union side (a claim implying a nonzero one breaks
+the transport identity --- the closure tests); inside the PIOP domains,
+where zero rows satisfy both classes' relations (homogeneity;
+$a_0 \odot b_0 = 0$) and run lists skip the work; and dummy \emph{cells}
+on the wiring side --- value 0 read from the padded buffer,
+$\sigma$-fixed by validation, identical product factors both sides
+(the capacity tax is their only cost), zero contributions to the gather
+folds. (4) \emph{Cell-space padding} (pad slots, unused public rows):
+indices with no address at all --- value 0 by definition, $\sigma$-fixed,
+nothing on disk to contradict. The invariant: everything unnamed is
+zero, and zero is both \emph{satisfying} (for the relations) and
+\emph{inert} (for the wiring) --- enforced everywhere a prover could
+cheat by the commitment simply not containing those words.
+\end{remark}
+
 \subsection{The relation}
 
 A large-field type is a base block over $\F$: $2^\kappa$ witness columns
