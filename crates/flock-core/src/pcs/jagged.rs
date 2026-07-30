@@ -1062,6 +1062,88 @@ fn assist_suffix_backward_shifted(
     }
 }
 
+/// Recycler for the assist prover's per-statement suffix buffers.
+///
+/// These are `128·K` vectors of `lo · n_cols · 64` bytes — 192 MiB total at
+/// depth 8, 522 MiB at depth 26 — and the allocator `munmap`s them on drop.
+/// Measured, that drop costs 9.3 ms and 26.2 ms respectively: ~0.77 µs per
+/// 16 KiB page in both cases, i.e. the work is **per page**, so consolidating
+/// the 256 allocations into one would not have helped. The only fix is to stop
+/// handing the pages back.
+///
+/// Same rationale and the same write-before-read contract as
+/// [`crate::scratch`], but a separate pool: that one is bounded at 24 buffers
+/// (sized for the prove cycle's handful of giants) and this wants `128·K` of
+/// them, which would evict everything else.
+///
+/// Retention is bounded by [`SFX_MAX_POOLED`]. The trade is explicit: the
+/// prover keeps the suffix footprint resident between proofs instead of
+/// re-faulting and re-unmapping it. Call [`clear_sfx_pool`] to release it.
+mod sfx_pool {
+    use super::F128;
+    use std::sync::Mutex;
+
+    /// One statement set at `128·K = 256`, plus slack for a second shape.
+    const SFX_MAX_POOLED: usize = 320;
+
+    static POOL: Mutex<Vec<Vec<[F128; 4]>>> = Mutex::new(Vec::new());
+
+    /// A buffer of length `n`, recycled when one is big enough. Contents are
+    /// STALE — the caller must write every slot before reading it.
+    pub(super) fn take(n: usize) -> Vec<[F128; 4]> {
+        {
+            let mut pool = POOL.lock().unwrap();
+            // Smallest fitting, so a run of small shapes cannot be served
+            // (and thereby pinned) by an oversized buffer.
+            if let Some(i) = pool
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| v.capacity() >= n)
+                .min_by_key(|(_, v)| v.capacity())
+                .map(|(i, _)| i)
+            {
+                let mut v = pool.swap_remove(i);
+                drop(pool);
+                // `[F128; 4]` is Copy, so growing with a dummy value and
+                // never reading it is sound; callers overwrite everything.
+                v.clear();
+                v.resize(n, [F128::ZERO; 4]);
+                return v;
+            }
+        }
+        vec![[F128::ZERO; 4]; n]
+    }
+
+    pub(super) fn give(v: Vec<[F128; 4]>) {
+        if v.capacity() == 0 {
+            return;
+        }
+        let mut pool = POOL.lock().unwrap();
+        pool.push(v);
+        if pool.len() > SFX_MAX_POOLED {
+            // Drop the smallest — the large ones are what cost to re-fault.
+            if let Some(i) = pool
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, v)| v.capacity())
+                .map(|(i, _)| i)
+            {
+                pool.swap_remove(i);
+            }
+        }
+    }
+
+    /// Release every retained buffer to the OS.
+    pub fn clear() {
+        POOL.lock().unwrap().clear();
+    }
+}
+
+/// Release the assist prover's retained suffix buffers (see [`sfx_pool`]).
+pub fn clear_suffix_pool() {
+    sfx_pool::clear();
+}
+
 /// The per-statement suffix blocks: layers `0..n_row`, seeded from the shared
 /// tail's first block (layer `n_row`).
 fn assist_suffix_low(
@@ -1079,9 +1161,11 @@ fn assist_suffix_low(
     }
     // `lo + 1` blocks: layers `0..lo`, plus a copy of layer `lo` as the seed
     // the recurrence reads. Truncated before returning.
-    let mut rows = vec![[F128::ZERO; 4]; (lo + 1) * n_cols];
+    let mut rows = sfx_pool::take((lo + 1) * n_cols);
     rows[lo * n_cols..].copy_from_slice(&shared_tail[..n_cols]);
     assist_suffix_backward(&mut rows, cols, eq4s, sparse, 0, lo - 1);
+    // Keep the seed block allocated (truncate does not shrink capacity) so the
+    // buffer returns to the pool at the size the next proof will ask for.
     rows.truncate(lo * n_cols);
     rows
 }
@@ -1871,14 +1955,19 @@ pub fn prove_frobenius_assist<C: Challenger>(
     // (at k=12, m=22, 256 statements it is over a gigabyte). Freeing it is
     // itself measurable, so time it explicitly rather than leave it in the
     // caller's residual.
+    let per = sts.first().map_or(0, |s| s.sfx.len() * 64);
+    let shared = sfx_tail.len() * 64;
+    let n = sts.len();
+    let t_drop = std::time::Instant::now();
+    // Recycle rather than free: see `sfx_pool`. This is what turns the drop
+    // from a per-page `munmap` into a pointer move.
+    for st in &mut sts {
+        sfx_pool::give(std::mem::take(&mut st.sfx));
+    }
+    drop(sts);
     if trace {
-        let per = sts.first().map_or(0, |s| s.sfx.len() * 64);
-        let shared = sfx_tail.len() * 64;
-        let t_drop = std::time::Instant::now();
-        let n = sts.len();
-        drop(sts);
         eprintln!(
-            "    [frobenius] free suffix rows ({} MiB = {} x {:.1} MiB low + {:.1} MiB shared): {:6.2} ms",
+            "    [frobenius] recycle suffix rows ({} MiB = {} x {:.1} MiB low + {:.1} MiB shared): {:6.2} ms",
             (n * per + shared) / (1 << 20),
             n,
             per as f64 / (1 << 20) as f64,

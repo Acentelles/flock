@@ -690,6 +690,54 @@ Verify is flat in path count at depth 8 too (13.1 → 14.6 → 14.4 ms across
 every bench configuration round-trips prove + verify + claim equality before any
 timing is reported, so all six depth-8 configs are verified proofs.
 
+### Recycling the suffix buffers: the `free()` third disappears
+
+The suffix drop was ~24-31% of the assist prove. It is **per-page** work, not
+per-call — 0.77 µs per 16 KiB page at both depth 8 (192 MiB, 9.3 ms) and depth 26
+(522 MiB, 26.2 ms) — so consolidating the 256 allocations into one would not have
+helped. Only not returning the pages to the OS helps, which is precisely what
+`crate::scratch` exists for, and its module doc already names this exact cost.
+That pool is bounded at 24 buffers though, sized for the prove cycle's few
+giants, so `128·K` of these would evict everything. Hence a dedicated
+`sfx_pool` (same contract; `clear_suffix_pool()` releases it).
+
+Depth 26, per-proof, from one traced run:
+
+| | pre-pool (steady) | cold proof #1 | warm proof #3 |
+|---|---|---|---|
+| statements + suffix build | 60.54 ms | 118.21 ms | **20.73 ms** |
+| `v` + round loop | 50.70 ms | 59.72 ms | **29.93 ms** |
+| free / recycle | 26.23 ms | 0.13 ms | **0.05 ms** |
+| **assist total** | **137.64 ms** | 178.15 ms | **51.00 ms** |
+
+**Read the two right-hand columns separately — they are different claims.**
+
+* The `free()` → `recycle` saving (26.23 → 0.05 ms, 525×) is unconditional: even
+  a single cold proof gets it, because the buffers go to the pool instead of
+  `munmap`.
+* The build and round-loop savings (60.54 → 20.73 and 50.70 → 29.93) are
+  **warm-pool page-residency effects, not algorithmic**. Cold proof #1 is
+  *slower* than the pre-pool steady state (118.21 vs 60.54), because pre-pool the
+  allocator could recycle pages the previous proof had just freed, whereas the
+  first pooled proof faults 522 MiB fresh. Proof #2 is 38.30 and #3 is 20.73, so
+  it takes a couple of proofs to converge.
+
+So: a long-running prover gets the full 2.7× on the assist; a one-shot CLI
+invocation gets ~26 ms. The bench warms up before timing, so its medians are the
+steady-state figure.
+
+Headline, 7-rep medians:
+
+| | merkle | blake3 | ratio |
+|---|---|---|---|
+| depth 26, 26,624 · prove/mt | **208 ms** (was 287) | 146 ms | **1.42×** (was 1.85) |
+| depth 26 · prove/1t | **569 ms** (was 631) | 401 ms | 1.42× |
+| depth 8, 32,768 · prove/mt | **181 ms** (was 214) | 165 ms | **1.10×** (was 1.24) |
+| depth 8 · prove/1t | **508 ms** (was 553) | 457 ms | 1.11× |
+
+The trade is explicit: the prover now keeps the suffix footprint resident
+between proofs. Peak RSS moved 2.24 → 2.51 GB at depth 26.
+
 ### The zerocheck asymmetry: RESOLVED, it was not real
 
 An earlier revision of these notes flagged `zerocheck + s_hat_v_c` at 224 ms vs
