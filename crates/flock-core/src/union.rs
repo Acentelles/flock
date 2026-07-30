@@ -1065,6 +1065,7 @@ mod tests {
             c_0: stub(),
             const_pin: None,
             class: TableClass::Boolean,
+            io_schema: Vec::new(),
         }
     }
 

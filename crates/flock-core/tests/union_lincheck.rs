@@ -166,6 +166,7 @@ fn table_type(slot: &SlotData) -> TableType {
         c_0: identity(1 << slot.k_log),
         const_pin: slot.pin,
         class: TableClass::Boolean,
+        io_schema: Vec::new(),
     }
 }
 

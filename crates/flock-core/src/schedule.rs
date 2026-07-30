@@ -40,6 +40,72 @@ pub const MAX_K_LOG: usize = 40;
 /// the pre-element-class one.
 const ELEMENT_CLASS_LABEL: &[u8] = b"flock-element-class-v0";
 
+/// Domain label prefixed to a type's IO-schema payload inside
+/// [`Registry::digest`]. Absorbed ONLY for types with a NON-EMPTY schema
+/// ([`TableType::io_schema`]), the same append-only trick as
+/// [`ELEMENT_CLASS_LABEL`]: a registry built without schemas digests exactly
+/// as it did before they existed.
+const IO_SCHEMA_LABEL: &[u8] = b"flock-io-schema-v0";
+
+/// Which side of a gate an [`IoWord`] is. **Metadata for circuit validation
+/// only** — the wiring argument is direction-blind (a permutation neither
+/// knows nor cares which cell of a wire class is the producer); the circuit
+/// layer uses it for the single-producer rule
+/// (`crate::circuit::CircuitError::MultipleProducers`) and the dataflow
+/// order that acyclicity is checked against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IoDirection {
+    In,
+    Out,
+}
+
+impl IoDirection {
+    /// Absorption byte for [`Registry::digest`].
+    fn code(self) -> u8 {
+        match self {
+            IoDirection::In => 0,
+            IoDirection::Out => 1,
+        }
+    }
+}
+
+/// One entry of a table type's **IO schema**: a 128-bit word-column of the
+/// type's row that circuits may wire, plus its direction.
+///
+/// The unit is a committed WORD, not a bit — the aligned IO regions
+/// (`chain_common::ChainLayout`'s `region_log = 8` slots for SHA-256/BLAKE3,
+/// one element column for a large-field type) make a wire value exactly one
+/// committed word, which is what collapses the gather to a packed-direct
+/// claim (design doc §"The wiring argument", Remark "Where each convention is
+/// load-bearing"). A word left OUT of the schema is internal: no circuit can
+/// wire it, so the relation must pin it or it is free witness.
+///
+/// `word_col` indexes the type's own row: word `w` of slot `t`'s row `j` is
+/// union word `(o_t >> 7) + (w << nu) + j` — see
+/// [`crate::union::UnionInstance::slot_word_range`] and
+/// [`crate::circuit::CellSpace::gate_word_addr`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IoWord {
+    /// Word-column index within the type's row, `< ceil(useful_bits / 128)`.
+    pub word_col: usize,
+    pub dir: IoDirection,
+}
+
+impl IoWord {
+    pub const fn input(word_col: usize) -> Self {
+        Self {
+            word_col,
+            dir: IoDirection::In,
+        }
+    }
+    pub const fn output(word_col: usize) -> Self {
+        Self {
+            word_col,
+            dir: IoDirection::Out,
+        }
+    }
+}
+
 /// What a table type's witness words MEAN — and therefore which PIOP proves
 /// the slot. The scheduler itself is class-blind: both classes present a
 /// `k_log`/`useful_bits` pair and the [`Slot`] arithmetic below is shared
@@ -91,6 +157,13 @@ pub struct TableType {
     /// Boolean or large-field. Defaults to [`TableClass::Boolean`], so a
     /// struct literal that predates the class tag keeps its meaning.
     pub class: TableClass,
+    /// The type's **IO schema**: the ordered list of wireable word-columns
+    /// (see [`IoWord`]). EMPTY for a type no circuit wires — the default,
+    /// and the state in which this type absorbs no schema bytes into
+    /// [`Registry::digest`]. The order is the type's contribution to the
+    /// cell-slot enumeration ([`crate::circuit::CellSpace`]), so it is
+    /// digest-visible and must not be permuted casually.
+    pub io_schema: Vec<IoWord>,
 }
 
 impl TableType {
@@ -108,6 +181,7 @@ impl TableType {
             c_0: r1cs.c_0.clone(),
             const_pin: r1cs.const_pin,
             class: TableClass::Boolean,
+            io_schema: Vec::new(),
         }
     }
 
@@ -129,7 +203,22 @@ impl TableType {
             c_0: stub(),
             const_pin: None,
             class: TableClass::element(ty),
+            io_schema: Vec::new(),
         }
+    }
+
+    /// This type with the given IO schema attached — the only way a circuit
+    /// can name any of its words. Word-columns are validated against the
+    /// type's real width by [`Registry::new`].
+    pub fn with_io_schema(mut self, io_schema: Vec<IoWord>) -> Self {
+        self.io_schema = io_schema;
+        self
+    }
+
+    /// Number of 128-bit word-columns a row of this type really uses:
+    /// `ceil(useful_bits / 128)`. The IO schema's `word_col` bound.
+    pub fn used_word_cols(&self) -> usize {
+        self.useful_bits.div_ceil(128)
     }
 
     /// The element payload, or `None` for a boolean type.
@@ -276,6 +365,24 @@ impl Registry {
                     "element types have no const pin (constants ride in a_const/b_const)"
                 );
             }
+            // IO schema: every entry must name a real word-column of this
+            // type's row, and no word may appear twice (one cell per word —
+            // the cell-slot enumeration and hence σ's index space depend on
+            // it).
+            let used_cols = ty.used_word_cols();
+            let mut seen = std::collections::BTreeSet::new();
+            for w in &ty.io_schema {
+                assert!(
+                    w.word_col < used_cols,
+                    "IO schema word-column {} is outside the type's {used_cols} used columns",
+                    w.word_col
+                );
+                assert!(
+                    seen.insert(w.word_col),
+                    "IO schema names word-column {} twice",
+                    w.word_col
+                );
+            }
         }
         // Class-major, then non-increasing capacity area = k_log descending
         // (uniform capacity). Stable, so equal-width types keep their given
@@ -406,14 +513,24 @@ impl Registry {
     ///    ([`ElementTableType::digest`], which covers `kappa`, `k`, `A_0`,
     ///    `B_0`, `a_const`, `b_const`). A **boolean-only registry therefore
     ///    absorbs exactly the bytes it absorbed before the element class
-    ///    existed** — the byte-identity bar for every pinned fixture.
+    ///    existed** — the byte-identity bar for every pinned fixture;
+    /// 7. **for types with a non-empty IO schema only**, appended after
+    ///    that (so after the element payload when both are present): the
+    ///    label [`IO_SCHEMA_LABEL`], the entry count as u32 LE, then per
+    ///    [`IoWord`] in schema order its `word_col` (u32 LE) and direction
+    ///    byte. A registry whose types carry no schema — every registry
+    ///    that predates the wiring layer — absorbs nothing here, the same
+    ///    byte-identity bar.
     ///
-    /// The conditional suffix keeps the encoding injective: a type's boolean
+    /// The conditional suffixes keep the encoding injective: a type's boolean
     /// part is self-delimiting (fixed 21-byte header + three length-prefixed
-    /// matrices), and after it the next four bytes either begin the label
-    /// (`"floc"`, i.e. `0x636f6c66` read as u32 LE) or the next type's
+    /// matrices), and after it the next four bytes either begin one of the two
+    /// labels (`"floc"`, i.e. `0x636f6c66` read as u32 LE) or the next type's
     /// `k_log`, which [`MAX_K_LOG`] bounds far below that — so a left-to-right
-    /// parse can never confuse the two.
+    /// parse can never confuse a suffix with the next type. The two labels are
+    /// distinct and neither is a prefix of the other, they appear in a fixed
+    /// order, and the schema payload is length-prefixed, so the suffixes cannot
+    /// be confused with each other either.
     ///
     /// Lazily cached in `digest_cache`; first call materializes it,
     /// subsequent calls are essentially free.
@@ -440,6 +557,15 @@ impl Registry {
                 if let Some(el) = ty.element_type() {
                     h.update(ELEMENT_CLASS_LABEL);
                     h.update(&el.digest());
+                }
+                // IO schema appends ONLY when non-empty — see above.
+                if !ty.io_schema.is_empty() {
+                    h.update(IO_SCHEMA_LABEL);
+                    h.update(&(ty.io_schema.len() as u32).to_le_bytes());
+                    for w in &ty.io_schema {
+                        h.update(&(w.word_col as u32).to_le_bytes());
+                        h.update(&[w.dir.code()]);
+                    }
                 }
             }
             *h.finalize().as_bytes()
@@ -689,6 +815,7 @@ mod tests {
             c_0: stub(),
             const_pin: None,
             class: TableClass::Boolean,
+            io_schema: Vec::new(),
         }
     }
 
@@ -952,6 +1079,7 @@ mod tests {
                         c_0: stub(),
                         const_pin: Some(2),
                         class: TableClass::Boolean,
+                        io_schema: Vec::new(),
                     },
                 ],
                 3,
@@ -988,6 +1116,7 @@ mod tests {
                         c_0: stub(),
                         const_pin,
                         class: TableClass::Boolean,
+                        io_schema: Vec::new(),
                     },
                 ],
                 nu,
@@ -1039,6 +1168,7 @@ mod tests {
                     c_0: stub(),
                     const_pin: Some(2),
                     class: TableClass::Boolean,
+                    io_schema: Vec::new(),
                 },
             ],
             3,
@@ -1052,6 +1182,84 @@ mod tests {
 
     fn hex(d: &[u8; 32]) -> String {
         d.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    // ---- IO schemas: the same append-only bar, and full digest coverage ----
+
+    /// **THE BYTE-IDENTITY BAR for IO schemas.** A registry whose types carry
+    /// no schema — every registry that predates the wiring layer — must digest
+    /// exactly as before, against the same pinned constants as
+    /// [`boolean_only_digest_is_byte_identical`]. An explicitly EMPTY schema is
+    /// the same registry as no schema at all: the payload appends only when
+    /// non-empty.
+    #[test]
+    fn schemaless_digest_is_byte_identical() {
+        let plain = Registry::new(vec![ty(10, 700), ty(9, 300)], 3);
+        let empty = Registry::new(
+            vec![
+                ty(10, 700).with_io_schema(Vec::new()),
+                ty(9, 300).with_io_schema(Vec::new()),
+            ],
+            3,
+        );
+        assert_eq!(hex(&plain.digest()), hex(&empty.digest()));
+        assert_eq!(
+            hex(&plain.digest()),
+            "8010ecf651ca43eadfe415eac6a081c8f9022dd077070da0f22cea19297699ea",
+            "an empty IO schema must absorb nothing"
+        );
+    }
+
+    /// Every part of a schema moves the digest: its presence, the entry count,
+    /// a word-column, a direction, and the ORDER of the entries (which is the
+    /// type's contribution to the cell-slot enumeration, so it must bind).
+    #[test]
+    fn io_schema_binds_the_digest() {
+        let mk = |schema: Vec<IoWord>| {
+            Registry::new(vec![ty(10, 700).with_io_schema(schema), ty(9, 300)], 3).digest()
+        };
+        let base = mk(vec![IoWord::input(0), IoWord::output(2)]);
+        let cases = [
+            ("presence", mk(Vec::new())),
+            ("entry count", mk(vec![IoWord::input(0)])),
+            ("word column", mk(vec![IoWord::input(1), IoWord::output(2)])),
+            ("direction", mk(vec![IoWord::output(0), IoWord::output(2)])),
+            ("order", mk(vec![IoWord::output(2), IoWord::input(0)])),
+        ];
+        for (what, d) in cases {
+            assert_ne!(base, d, "digest insensitive to {what}");
+        }
+        // …and which TYPE carries it: the same schema on the other type.
+        let other = Registry::new(
+            vec![
+                ty(10, 700),
+                ty(9, 300).with_io_schema(vec![IoWord::input(0), IoWord::output(2)]),
+            ],
+            3,
+        );
+        assert_ne!(
+            base,
+            other.digest(),
+            "digest insensitive to the schema's type"
+        );
+    }
+
+    /// The schema's word-columns are validated against the type's real width,
+    /// and no word may be named twice.
+    #[test]
+    #[should_panic(expected = "outside the type's")]
+    fn io_schema_word_column_out_of_range() {
+        // useful_bits = 300 → ceil(300/128) = 3 used word-columns.
+        Registry::new(vec![ty(9, 300).with_io_schema(vec![IoWord::input(3)])], 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "twice")]
+    fn io_schema_duplicate_word_column() {
+        Registry::new(
+            vec![ty(9, 300).with_io_schema(vec![IoWord::input(1), IoWord::output(1)])],
+            3,
+        );
     }
 
     /// An element type moves the digest, and every component of its base
