@@ -57,9 +57,9 @@ polynomial} (Lemma~\ref{lem:gather}) --- no gather sumcheck, no new
 committed columns. (iii) Word wires are $\F$-elements under the identity
 basis map, which is exactly what makes the hash$\leftrightarrow$field
 boundary of the recursion plan a pure copy argument. Status: the
-large-field class and its union integration are \textbf{implemented}; the
-wiring layer is designed, its primitive reviewed, and its prerequisites
-landed.
+large-field class, its union integration, and the wiring layer are all
+\textbf{implemented} --- circuit proofs verify end to end, with the
+SHA-256 binary tree as the driving workload.
 \end{abstract}
 
 \tableofcontents
@@ -118,7 +118,7 @@ Three layers over the unchanged multi-table core:
         hosts both; the two PIOP families run on disjoint address regions
         and meet at the transport batch.
   \item \textbf{Wiring = copy constraints} (\S\ref{sec:wiring};
-        \emph{designed}). A permutation $\sigma$ on the cell space of all
+        \emph{implemented}). A permutation $\sigma$ on the cell space of all
         IO words, checked by \code{product\_gkr}; the wire-value claim
         factors into packed-direct claims on the union polynomial.
   \item \textbf{Public IO = a public cell segment} (\S\ref{sec:cells}):
@@ -346,7 +346,9 @@ lands, element and circuit proofs ride the unmerged path.
 \begin{definition}[IO schema]
 A registry type carries lists of 128-aligned trace-word positions
 designating gate inputs and outputs (generalizing \code{ChainLayout});
-words outside the schema are internal. \emph{Not yet implemented.}
+words outside the schema are internal. \emph{Implemented}
+(\code{schedule::IoWord}); the payload appends to the registry digest only
+when non-empty, so schemaless registries digest byte-identically.
 \end{definition}
 
 \begin{definition}[Circuit]
@@ -619,8 +621,9 @@ zerocheck $\to$ boolean lincheck $\to$ element $\tau'$ $\to$ element
 zerocheck $\to$ $\alpha'$ $\to$ element lincheck $\to$ wiring GKR
 ($\alpha, \beta$ are squeezed at its entry, so statement binding must
 precede it) $\to$ $\gamma$-batched
-opening. Implemented through the element lincheck; the wiring GKR slot is
-next.
+opening. \emph{Implemented end to end}: the circuit half of the binding
+(digest + public words) appends under its own versioned label, so a
+non-circuit proof's transcript is unchanged byte for byte.
 
 % ===========================================================================
 \section{Cost accounting}\label{sec:costs}
@@ -648,15 +651,24 @@ map and the multi-table document.
         layout, disjoint PIOPs, four claims through one unmerged opening,
         dummy-row closure. All existing anchors green untouched.
   \item \code{product\_gkr} soundness review (two passes, 2026-07-29).
+  \item \textbf{Wiring milestone} (2026-07-30, \code{6b1dc6a..f1c8721}):
+        registry IO schemas, the circuit module (cell space,
+        validation, canonical wiring, digest, $\sigma$), the wiring GKR
+        and gather recombination, public IO, and the circuit prove/verify
+        entries --- gather claims joining the element claims' unmerged
+        packed-direct intake, no transport change. All four binding
+        obligations of \S\ref{sec:wiring}/\S\ref{sec:statement} are
+        test-pinned, the $g$-side one by running the real $g = w \circ \sigma$
+        forgery. Driving workloads green: a SHA-256 binary tree against a
+        native tree computation, an element chain, the cross-class
+        crossing, a randomized-wiring differential oracle. Every existing
+        anchor and byte fixture untouched. Measured at $\nu = 10$ over 511
+        SHA-256 gates ($\mu = 14$): wiring GKR + gather $1.2$\,ms of a
+        $12.1$\,ms prove, $4.1$\,KB of a $294$\,KB proof, 8 gather claims.
 \end{itemize}
 
 \paragraph{Next.}
 \begin{enumerate}[nosep]
-  \item \textbf{Wiring milestone}: registry IO schemas, circuit
-        representation/validation/digest, the cell space, the wiring GKR
-        call and gather recombination with the binding requirements of
-        \S\ref{sec:wiring}/\S\ref{sec:statement}, public IO.
-        First driving workload: a SHA-256 (or BLAKE3) binary-tree circuit.
   \item \textbf{Delegation design} (comb + $\sigma$, one design) --- the
         recursion map's top-priority item.
   \item \textbf{Merged-transport intake} for packed-direct claims +
