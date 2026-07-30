@@ -62,6 +62,27 @@ pub struct R1csProofMixedClassLigerito {
     pub pcs_open: pcs::BatchOpeningProofJaggedLigerito,
 }
 
+/// A **circuit** proof: a mixed-class union proof plus the wiring argument
+/// over the circuit's cell space. What it attests, in one proof: every gate row
+/// satisfies its table's relation, the circuit's wiring equalities hold, and
+/// the designated cells equal the statement's public words.
+///
+/// The gather claims ride the SAME opening as the class claims (they are
+/// packed-direct claims on the unmerged jagged path), so `pcs_open` covers all
+/// of them; only the wiring transcript and the gather VALUES are extra (the
+/// claim points are transcript-derived).
+///
+/// A separate type rather than an `Option` field on
+/// [`R1csProofMixedClassLigerito`], whose serialized bytes are pinned by the
+/// `union_element` anchor — non-circuit proofs must keep going out unchanged.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct R1csProofCircuitLigerito {
+    pub boolean: Option<BooleanPiopProof>,
+    pub element: Option<crate::element_r1cs::union::Proof>,
+    pub wiring: crate::circuit::WiringProof,
+    pub pcs_open: pcs::BatchOpeningProofJaggedLigerito,
+}
+
 /// The boolean class's two PIOP sub-proofs, as they appear inside
 /// [`R1csProofMixedClassLigerito`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

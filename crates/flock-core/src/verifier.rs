@@ -25,6 +25,12 @@ pub enum VerifyError {
     /// for, or omits one it does — the statement and the proof disagree on
     /// which PIOPs ran.
     ClassMismatch,
+    /// The wiring (copy-constraint) argument rejected.
+    Wiring(crate::circuit::WiringError),
+    /// The circuit and the union instance are not the same statement: a
+    /// different registry, or gate counts that are not the union's declared
+    /// counts. A rejection, not a panic — both come from the caller.
+    CircuitMismatch,
 }
 
 /// Per-phase wall-clock timings (seconds) of a verify, for benchmark cost
@@ -223,6 +229,12 @@ enum UnionVerifyBinding<'a> {
     /// counts vector, and the commitment root
     /// ([`crate::union::UnionInstance::bind_statement`]).
     Mixed,
+    /// The circuit binding: [`UnionVerifyBinding::Mixed`] plus the circuit
+    /// digest and the public words.
+    Circuit {
+        circuit: &'a crate::circuit::Circuit,
+        public: &'a [F128],
+    },
     /// The M1/M2 differential-harness binding: the slot's single-table
     /// `BlockR1cs` statement digest. Single-type registries only; not a
     /// protocol mode.
@@ -511,6 +523,7 @@ pub fn verify_ligerito_jagged_union_mixed_class<Ch: Challenger>(
         commitment,
         proof.boolean.as_ref(),
         proof.element.as_ref(),
+        None,
         pcs_params,
         challenger,
     )?;
@@ -555,6 +568,7 @@ fn verify_union_piops<Ch: Challenger>(
     commitment: &Commitment,
     boolean: Option<&crate::proof::BooleanPiopProof>,
     element: Option<&crate::element_r1cs::union::Proof>,
+    wiring: Option<&crate::circuit::WiringProof>,
     pcs_params: &crate::pcs::PcsParams,
     challenger: &mut Ch,
 ) -> Result<(crate::proof::UnionClassClaims, Vec<(Vec<F128>, F128)>), VerifyError> {
@@ -588,6 +602,9 @@ fn verify_union_piops<Ch: Challenger>(
     verifier_pool().install(|| -> Result<PiopOut, VerifyError> {
         match binding {
             UnionVerifyBinding::Mixed => union.bind_statement(challenger, commitment),
+            UnionVerifyBinding::Circuit { circuit, public } => {
+                union.bind_statement_circuit(challenger, commitment, &circuit.digest(), public)
+            }
             UnionVerifyBinding::SingleTypeHarness(slot_r1cs) => {
                 union.expect_single_type_slot(slot_r1cs);
                 union.bind_statement_single_type(challenger, slot_r1cs, commitment);
@@ -641,7 +658,7 @@ fn verify_union_piops<Ch: Challenger>(
             ),
             None => None,
         };
-        let packed_direct = el_claim
+        let mut packed_direct = el_claim
             .as_ref()
             .map(|c: &crate::element_r1cs::union::Claims| {
                 vec![
@@ -651,6 +668,16 @@ fn verify_union_piops<Ch: Challenger>(
             })
             .unwrap_or_default();
 
+        // The wiring argument replays AFTER both classes' PIOPs, at the
+        // prover's transcript position; its gather claims join the same
+        // packed-direct intake the element claims ride.
+        if let UnionVerifyBinding::Circuit { circuit, public } = binding {
+            let proof = wiring.ok_or(VerifyError::CircuitMismatch)?;
+            let gather = crate::circuit::verify_wiring(circuit, public, proof, challenger)
+                .map_err(VerifyError::Wiring)?;
+            packed_direct.extend(gather);
+        }
+
         Ok((
             crate::proof::UnionClassClaims {
                 boolean: bool_claim,
@@ -659,6 +686,76 @@ fn verify_union_piops<Ch: Challenger>(
             packed_direct,
         ))
     })
+}
+
+/// The **circuit** verify entry — the mirror of
+/// `flock_prover::prover::prove_fast_ligerito_jagged_union_circuit`.
+///
+/// Replays both class PIOPs, then the wiring argument over the circuit's cell
+/// space (σ-aware GKR + the recombination and `f_eval == g_eval` bindings),
+/// then verifies the single jagged opening carrying the class claims AND the
+/// wiring's gather claims.
+///
+/// The circuit is verifier-known (v1): it holds the full description, rebuilds
+/// σ and evaluates `ŝ_σ(ρ)` itself in `O(2^μ)`. `public` are the statement's
+/// public words, bound into the transcript alongside the circuit digest.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_ligerito_jagged_union_circuit<Ch: Challenger>(
+    union: &crate::union::UnionInstance<'_>,
+    circuit: &crate::circuit::Circuit,
+    public: &[F128],
+    circuits: &[&dyn lincheck::LincheckCircuit],
+    commitment: &Commitment,
+    proof: &crate::proof::R1csProofCircuitLigerito,
+    pcs_params: &crate::pcs::PcsParams,
+    challenger: &mut Ch,
+) -> Result<crate::proof::UnionClassClaims, VerifyError> {
+    // The circuit's gate counts ARE the union's declared counts, and its
+    // registry is the union's — the same statement, or no statement at all.
+    if !circuit.check_instance(union) || public.len() != circuit.num_public() {
+        return Err(VerifyError::CircuitMismatch);
+    }
+    if proof.boolean.is_some() != (union.num_boolean() > 0)
+        || proof.element.is_some() != union.has_element()
+    {
+        return Err(VerifyError::ClassMismatch);
+    }
+    let (claims, packed_direct_points) = verify_union_piops(
+        union,
+        UnionVerifyBinding::Circuit { circuit, public },
+        circuits,
+        commitment,
+        proof.boolean.as_ref(),
+        proof.element.as_ref(),
+        Some(&proof.wiring),
+        pcs_params,
+        challenger,
+    )?;
+    let z_claims: Vec<ZClaim> = claims
+        .boolean
+        .as_ref()
+        .map(|c| vec![c.ab.clone(), c.c.clone()])
+        .unwrap_or_default();
+    let refs: Vec<pcs::PackedDirectClaimRef<'_>> = packed_direct_points
+        .iter()
+        .map(|(point, value)| pcs::PackedDirectClaimRef {
+            point,
+            value: *value,
+        })
+        .collect();
+    verify_claims_jagged_ligerito(
+        commitment,
+        &z_claims,
+        &refs,
+        &union.jagged_heights(),
+        union.n_log(),
+        union.m_total(),
+        &proof.pcs_open,
+        pcs_params,
+        challenger,
+    )
+    .map_err(VerifyError::PcsJagged)?;
+    Ok(claims)
 }
 
 /// Shared body of the jagged-transport union verify entries; `binding`
@@ -687,6 +784,7 @@ fn verify_union_with_binding<Ch: Challenger>(
         circuits,
         commitment,
         Some(&piop),
+        None,
         None,
         pcs_params,
         challenger,

@@ -591,17 +591,28 @@ fn build_union_witness(
     (z, a, b, stripes, mode)
 }
 
-/// Statement-binding selector for the union prove path. Private: the two
-/// public entries below fix the variant.
+/// Statement-binding selector for the union prove path. Private: the public
+/// entries below fix the variant.
 enum UnionProveBinding<'a> {
     /// The protocol binding: `flock-mixed-v1` over the registry digest, the
     /// counts vector, and the commitment root
     /// ([`flock_core::union::UnionInstance::bind_statement`]).
     Mixed,
+    /// The circuit binding: [`UnionProveBinding::Mixed`] plus the circuit
+    /// digest and the public words, and the wiring GKR after the class PIOPs.
+    Circuit(CircuitProverInput<'a>),
     /// The M1/M2 differential-harness binding: the slot's single-table
     /// `BlockR1cs` statement digest, transcript-identical to the direct
     /// jagged path. Single-type registries only; not a protocol mode.
     SingleTypeHarness(&'a BlockR1cs),
+}
+
+/// A circuit's prover input: the circuit (whose gate counts must be the
+/// union's declared counts) and its public words, in public-segment order.
+#[derive(Clone, Copy)]
+pub struct CircuitProverInput<'a> {
+    pub circuit: &'a flock_core::circuit::Circuit,
+    pub public: &'a [F128],
 }
 
 /// Prove a registry instance through the **union address space** — Phase 2
@@ -712,8 +723,10 @@ pub fn prove_fast_ligerito_jagged_union_mixed_class<Ch: Challenger>(
     let UnionProveOutput {
         boolean,
         element,
+        wiring,
         pcs_open,
     } = out;
+    debug_assert!(wiring.is_none(), "the mixed-class binding runs no wiring");
     let (bool_proof, bool_claim) = match boolean {
         Some((p, c)) => (Some(p), Some(c)),
         None => (None, None),
@@ -726,6 +739,75 @@ pub fn prove_fast_ligerito_jagged_union_mixed_class<Ch: Challenger>(
         flock_core::proof::R1csProofMixedClassLigerito {
             boolean: bool_proof,
             element: el_proof,
+            pcs_open,
+        },
+        commitment,
+        flock_core::proof::UnionClassClaims {
+            boolean: bool_claim,
+            element: el_claim,
+        },
+    )
+}
+
+/// The **circuit** prove entry: [`prove_fast_ligerito_jagged_union_mixed_class`]
+/// plus the wiring argument over `circuit`'s cell space, so ONE proof attests
+/// per-row relations AND the circuit's wiring equalities AND the public IO.
+///
+/// The circuit's gate counts must be the union's declared counts (they are the
+/// same statement datum — asserted here and rejected at verify), and its
+/// registry must be the union's.
+///
+/// Fiat–Shamir order: commit → `bind_statement_circuit` (statement + circuit
+/// digest + public words) → boolean τ/ZC/LC → element τ'/ZC/α'/LC → wiring GKR
+/// (α, β at its entry) → gather values observed → γ-batched opening. The gather
+/// claims join the same `packed_direct` list the element claims ride.
+///
+/// Verify with [`flock_core::verifier::verify_ligerito_jagged_union_circuit`].
+pub fn prove_fast_ligerito_jagged_union_circuit<Ch: Challenger>(
+    union: &flock_core::union::UnionInstance<'_>,
+    circuit: &flock_core::circuit::Circuit,
+    public: &[F128],
+    pcs_params: &PcsParams,
+    slots: Vec<UnionSlotProverInput<'_>>,
+    element_slots: Vec<UnionElementSlotInput<'_>>,
+    challenger: &mut Ch,
+) -> (
+    flock_core::proof::R1csProofCircuitLigerito,
+    Commitment,
+    flock_core::proof::UnionClassClaims,
+) {
+    assert!(
+        circuit.check_instance(union),
+        "the circuit and the union instance must be the same statement \
+         (same registry, and the circuit's gate counts ARE the union's counts)"
+    );
+    let (out, commitment) = prove_union_with_binding(
+        union,
+        UnionProveBinding::Circuit(CircuitProverInput { circuit, public }),
+        pcs_params,
+        slots,
+        element_slots,
+        challenger,
+    );
+    let UnionProveOutput {
+        boolean,
+        element,
+        wiring,
+        pcs_open,
+    } = out;
+    let (bool_proof, bool_claim) = match boolean {
+        Some((p, c)) => (Some(p), Some(c)),
+        None => (None, None),
+    };
+    let (el_proof, el_claim) = match element {
+        Some((p, c)) => (Some(p), Some(c)),
+        None => (None, None),
+    };
+    (
+        flock_core::proof::R1csProofCircuitLigerito {
+            boolean: bool_proof,
+            element: el_proof,
+            wiring: wiring.expect("the circuit binding runs the wiring argument"),
             pcs_open,
         },
         commitment,
@@ -988,6 +1070,9 @@ struct UnionProveOutput {
         flock_core::element_r1cs::union::Proof,
         flock_core::element_r1cs::union::Claims,
     )>,
+    /// The wiring argument's transcript — `Some` exactly under
+    /// [`UnionProveBinding::Circuit`].
+    wiring: Option<flock_core::circuit::WiringProof>,
     pcs_open: pcs::BatchOpeningProofJaggedLigerito,
 }
 
@@ -995,7 +1080,7 @@ impl UnionProveOutput {
     /// Repackage a boolean-only run as the byte-pinned
     /// [`R1csProofJaggedLigerito`]; `None` if an element half is present.
     fn into_boolean_only(self) -> Option<(R1csProofJaggedLigerito, R1csClaim)> {
-        if self.element.is_some() {
+        if self.element.is_some() || self.wiring.is_some() {
             return None;
         }
         let (piop, claim) = self.boolean?;
@@ -1138,6 +1223,12 @@ fn prove_union_with_binding<Ch: Challenger>(
     }
     match binding {
         UnionProveBinding::Mixed => union.bind_statement(challenger, &commitment),
+        UnionProveBinding::Circuit(ci) => union.bind_statement_circuit(
+            challenger,
+            &commitment,
+            &ci.circuit.digest(),
+            ci.public,
+        ),
         UnionProveBinding::SingleTypeHarness(slot_r1cs) => {
             union.bind_statement_single_type(challenger, slot_r1cs, &commitment)
         }
@@ -1300,10 +1391,36 @@ fn prove_union_with_binding<Ch: Challenger>(
         );
     }
 
-    // ---- One opening over all four claims: the boolean pair ring-switched,
-    // the element pair PACKED-DIRECT (their points are already packed-MLE
-    // points, and their region-prefix coordinates are Boolean — so a Sparse
-    // eq tensor, no ring switch).
+    // ---- The wiring argument over the circuit's cell space, AFTER both
+    // classes' PIOPs (so its α, β come from a transcript that already absorbed
+    // every class message) and BEFORE the opening its gather claims join.
+    //
+    // It reads `z_packed` — the padded buffer the commitment was built from,
+    // whose dummy rows are zero by the union's witness contract, which is what
+    // makes the dummy cells' `w = 0` honest.
+    let t = std::time::Instant::now();
+    let wiring = match &binding {
+        UnionProveBinding::Circuit(ci) => Some(flock_core::circuit::prove_wiring(
+            ci.circuit,
+            &z_packed,
+            ci.public,
+            challenger,
+        )),
+        _ => None,
+    };
+    if trace && let Some((_, claims)) = &wiring {
+        eprintln!(
+            "  [prove_union] wiring GKR + gather (μ = {}, {} claims): {:7.2} ms",
+            binding_circuit_mu(&binding),
+            claims.len(),
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
+    // ---- One opening over every claim: the boolean pair ring-switched, the
+    // element pair and the wiring's gather claims PACKED-DIRECT (their points
+    // are already packed-MLE points whose high coordinates are Boolean — so a
+    // Sparse eq tensor, no ring switch).
     let heights = union.jagged_heights();
     let (z_claims, pre): (Vec<ZClaim>, Vec<Option<&[F128]>>) = match &boolean {
         Some((_, claim, s_hat_v_ab, s_hat_v_c)) => (
@@ -1312,10 +1429,14 @@ fn prove_union_with_binding<Ch: Challenger>(
         ),
         None => (Vec::new(), Vec::new()),
     };
-    let packed_direct: Vec<pcs::PackedDirectClaim> = match &element {
+    let mut packed_direct: Vec<pcs::PackedDirectClaim> = match &element {
         Some((_, claims)) => element_packed_direct_claims(claims),
         None => Vec::new(),
     };
+    let wiring = wiring.map(|(proof, gather_claims)| {
+        packed_direct.extend(gather_claims);
+        proof
+    });
     let t = std::time::Instant::now();
     let pcs_open = open_claims_with_precomputed_jagged_ligerito(
         z_packed,
@@ -1350,10 +1471,19 @@ fn prove_union_with_binding<Ch: Challenger>(
         UnionProveOutput {
             boolean: boolean.map(|(piop, claim, _, _)| (piop, claim)),
             element,
+            wiring,
             pcs_open,
         },
         commitment,
     )
+}
+
+/// `μ` of the circuit binding's cell space, for the trace line only.
+fn binding_circuit_mu(binding: &UnionProveBinding<'_>) -> usize {
+    match binding {
+        UnionProveBinding::Circuit(ci) => ci.circuit.cells().mu(),
+        _ => 0,
+    }
 }
 
 /// The element class's two claims as packed-direct PCS claims, in the fixed

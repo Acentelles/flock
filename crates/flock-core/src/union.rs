@@ -595,6 +595,37 @@ impl<'r> UnionInstance<'r> {
         challenger.observe_bytes(&commitment.root);
     }
 
+    /// [`Self::bind_statement`] plus the CIRCUIT half of the statement: the
+    /// circuit digest ([`crate::circuit::Circuit::digest`], which covers the
+    /// gate counts, the IO schemas through the registry digest, the wiring and
+    /// the public layout) and the public words themselves.
+    ///
+    /// Absorbed before any challenge, and in particular before the wiring
+    /// GKR — which squeezes `α, β` at entry, so the multiset statement must
+    /// already be fixed (design doc §"Statement, transcript, Fiat–Shamir";
+    /// `circuit::prove_wiring`'s contract).
+    ///
+    /// **Append-only:** the existing four observations are unchanged and the
+    /// circuit payload follows under its own versioned label, so a non-circuit
+    /// proof's transcript is byte-identical to today's.
+    pub fn bind_statement_circuit<Ch: Challenger>(
+        &self,
+        challenger: &mut Ch,
+        commitment: &Commitment,
+        circuit_digest: &[u8; 32],
+        public: &[F128],
+    ) {
+        self.bind_statement(challenger, commitment);
+        challenger.observe_label(b"flock-circuit-stmt-v1");
+        challenger.observe_bytes(circuit_digest);
+        let mut words_le = Vec::with_capacity(16 * public.len());
+        for w in public {
+            words_le.extend_from_slice(&w.lo.to_le_bytes());
+            words_le.extend_from_slice(&w.hi.to_le_bytes());
+        }
+        challenger.observe_bytes(&words_le);
+    }
+
     /// M1/M2 **harness** guard (differential tests only): the registry has
     /// exactly one type and `slot_r1cs` is that type's single-table
     /// [`BlockR1cs`] view (same variable count, width, useful bits, const
