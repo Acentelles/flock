@@ -504,7 +504,7 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
 /// A task's pieces are contiguous in index but not in address: its output
 /// range spans the gaps it skips, and it simply never writes them, which is
 /// exactly the sparse contract (dead output is left untouched).
-fn balanced_interval_tasks(
+pub(crate) fn balanced_interval_tasks(
     live: &[(usize, usize)],
     target: usize,
 ) -> (Vec<(usize, usize)>, Vec<std::ops::Range<usize>>) {

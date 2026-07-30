@@ -164,26 +164,32 @@ pub const G_MSG_IDX: [[usize; 2]; N_G_PER_ROUND] = [
 // Layout positions (bit indices into the per-block z slice of length K)
 // ---------------------------------------------------------------------------
 
-// **I/O-aligned layout** for the hash chain (forked from `blake3`): the input
-// chaining value `cv` lives in aligned slot 0 and the output chaining value
-// `out_lo` (= state[0..8] ^ state[8..16]) in aligned slot 1 — each a clean
-// 256-bit (`2^8`) window, so the chain shift argument folds them via a single
-// tensor opening. cv/out_lo are *exactly* 256 bits, so the slots have NO
-// interior padding. Everything else (const, m, counters, flags, G-blocks,
-// out_hi) packs after the two slots. The re-layout is purely a change of these
-// base offsets — all bit placement goes through the `*_bit` accessors below.
+// **I/O-aligned layout**: every wireable region sits on a 128-bit word
+// boundary, so a region word is exactly one committed F128 word (the
+// circuit/wiring layer's requirement; the chain shift argument's 256-bit
+// slot alignment for cv/out_lo is the special case that started this).
+// The first 11 words are the full I/O prefix:
+//   words 0-1  cv       [0, 256)      input chaining value
+//   words 2-3  out_lo   [256, 512)    output cv (state[0..8]^state[8..16])
+//   words 4-7  m        [512, 1024)   the 16 message words
+//   word  8    params   [1024, 1152)  t_lo | t_hi | blen | flags
+//   words 9-10 out_hi   [1152, 1408)  high output half (extended output)
+// The G-blocks (internal, never wired) follow unaligned, and the constant
+// pin sits at the very END so it displaces no region — the same move
+// SHA-256's layout made (`sha2.rs`: pin after the aligned slots). All bit
+// placement goes through the `*_bit` accessors below.
 pub const SLOT_BITS: usize = 256; // 2^8, one 256-bit chaining value
 pub const CV_BASE: usize = 0; // input region, slot 0: [0, 256)
 pub const OUT_LO_BASE: usize = SLOT_BITS; // output region, slot 1: [256, 512)
-pub const Z_CONST_POS: usize = 2 * SLOT_BITS; // 512
-pub const M_BASE: usize = Z_CONST_POS + 1; // 513
-pub const T_LO_BASE: usize = M_BASE + 16 * WORD_BITS; // 1025
-pub const T_HI_BASE: usize = T_LO_BASE + WORD_BITS; // 1057
-pub const BLEN_BASE: usize = T_HI_BASE + WORD_BITS; // 1089
-pub const FLAGS_BASE: usize = BLEN_BASE + WORD_BITS; // 1121
-pub const GS_BASE: usize = FLAGS_BASE + WORD_BITS; // 1153
-pub const OUT_HI_BASE: usize = GS_BASE + N_G * G_STRIDE; // 15,153
-pub const USEFUL_BITS: usize = OUT_HI_BASE + 8 * WORD_BITS; // 15,409
+pub const M_BASE: usize = 2 * SLOT_BITS; // 512, words 4-7
+pub const T_LO_BASE: usize = M_BASE + 16 * WORD_BITS; // 1024
+pub const T_HI_BASE: usize = T_LO_BASE + WORD_BITS; // 1056
+pub const BLEN_BASE: usize = T_HI_BASE + WORD_BITS; // 1088
+pub const FLAGS_BASE: usize = BLEN_BASE + WORD_BITS; // 1120
+pub const OUT_HI_BASE: usize = FLAGS_BASE + WORD_BITS; // 1152, words 9-10
+pub const GS_BASE: usize = OUT_HI_BASE + 8 * WORD_BITS; // 1408
+pub const Z_CONST_POS: usize = GS_BASE + N_G * G_STRIDE; // 15,408
+pub const USEFUL_BITS: usize = Z_CONST_POS + 1; // 15,409
 
 // G sub-block: ADD `add_idx` ∈ 0..6 (carry_aux only), then lin-id
 // `which` ∈ 0..2.
@@ -1954,19 +1960,28 @@ mod tests {
 
     #[test]
     fn layout_constants() {
-        // I/O-aligned layout: cv in slot 0, out_lo in slot 1 (both 256-bit).
+        // I/O-aligned layout: cv in slot 0, out_lo in slot 1 (both 256-bit),
+        // and EVERY wireable region on a 128-bit word boundary (m, params,
+        // out_hi), const pin at the end.
         assert_eq!(CV_BASE, 0);
         assert_eq!(OUT_LO_BASE, 256);
-        assert_eq!(Z_CONST_POS, 512);
-        assert_eq!(M_BASE, 513);
-        assert_eq!(GS_BASE, 1153);
+        assert_eq!(M_BASE, 512);
+        assert_eq!(T_LO_BASE, 1024);
+        assert_eq!(OUT_HI_BASE, 1152);
+        assert_eq!(GS_BASE, 1408);
         assert_eq!(G_STRIDE, 250);
         assert_eq!(N_G, 56);
-        assert_eq!(OUT_HI_BASE, 15_153);
+        assert_eq!(Z_CONST_POS, 15_408);
         assert_eq!(USEFUL_BITS, 15_409);
         assert!(USEFUL_BITS <= K);
         assert_eq!(CV_BASE % SLOT_BITS, 0);
         assert_eq!(OUT_LO_BASE % SLOT_BITS, 0);
+        // Word alignment of every wireable region (the wiring layer's
+        // gather lemma freezes whole 128-bit words).
+        for base in [CV_BASE, OUT_LO_BASE, M_BASE, T_LO_BASE, OUT_HI_BASE] {
+            assert_eq!(base % 128, 0);
+        }
+        assert_eq!(Z_CONST_POS, USEFUL_BITS - 1);
     }
 
     /// Reference compression matches the `blake3` crate for empty input

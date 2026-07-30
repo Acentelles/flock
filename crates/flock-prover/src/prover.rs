@@ -271,6 +271,17 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
 /// compaction map is the identity. Must be called at the same transcript
 /// position as the verifier's
 /// [`flock_core::verifier::verify_claims_jagged_ligerito`].
+///
+/// `packed_direct` carries claims that skip ring-switching entirely — the
+/// element class's two witness claims, whose points are already packed-MLE
+/// points (an element IS a word). Pass `&[]` for a purely boolean opening;
+/// that path is byte-identical to the pre-element one.
+///
+/// TODO(perf): a non-empty `packed_direct` disables the `stream_b` fast path in
+/// `pcs::compute_combined_basis_and_target` (it requires
+/// `packed_direct.is_empty()` — the sparse scatter-adds need a materialized
+/// `b_combined` to land on), so mixed proofs materialize the full-domain basis.
+/// Accepted for this milestone.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn open_claims_with_precomputed_jagged_ligerito<Ch: Challenger>(
     z_packed: Vec<F128>,
@@ -279,6 +290,7 @@ pub(crate) fn open_claims_with_precomputed_jagged_ligerito<Ch: Challenger>(
     commitment: &Commitment,
     claims: &[ZClaim],
     precomputed_s_hat_v: &[Option<&[F128]>],
+    packed_direct: &[pcs::PackedDirectClaim],
     padding: &zerocheck::PaddingSpec,
     heights: &[u64],
     n_log: usize,
@@ -297,7 +309,7 @@ pub(crate) fn open_claims_with_precomputed_jagged_ligerito<Ch: Challenger>(
         commitment,
         &x_refs,
         precomputed_s_hat_v,
-        &[],
+        packed_direct,
         padding,
         heights,
         n_log,
@@ -369,6 +381,7 @@ pub fn prove_fast_ligerito_jagged_from_witness<Ch: Challenger>(
         &commitment,
         &[ab.clone(), c.clone()],
         &[pre_ab, pre_c],
+        &[],
         &padding,
         &heights,
         r1cs.n_log(),
@@ -406,6 +419,38 @@ enum UnionSlotWitnessSource<'a> {
     /// union buffers and writes it directly, returning the lincheck stripe.
     /// No copy — see [`flock_core::union::SlotWitnessDest`].
     InPlace(Box<dyn FnOnce(flock_core::union::SlotWitnessDest<'_>) -> Vec<u8> + Send + 'a>),
+    /// An ELEMENT slot: the closure writes the slot's committed element words
+    /// into the `z` view and `element_r1cs::union::fill_slot` derives `a`/`b`
+    /// from them by sparse gather. There is no lincheck stripe — the element
+    /// lincheck folds the committed region itself.
+    Element {
+        ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+        generate: Box<dyn FnOnce(&mut [F128]) + Send + 'a>,
+    },
+}
+
+/// One ELEMENT slot's prover input: a closure that writes the slot's committed
+/// element words. One per registry element type, in slot order.
+///
+/// **Contract** (same as [`flock_core::union::SlotWitnessDest`]): the closure
+/// must write EVERY word of its `2^{ν+κ}`-word block — real rows from the
+/// generator, dummy rows `[n_t, 2^ν)` and padding columns as zeros. The block
+/// comes from the recycled scratch pool and starts out holding stale data. The
+/// element PIOP sums over the WHOLE region, so a stale word is not merely
+/// uncommitted, it would break the zerocheck.
+pub struct UnionElementSlotInput<'a> {
+    generate: Box<dyn FnOnce(&mut [F128]) + Send + 'a>,
+}
+
+impl<'a> UnionElementSlotInput<'a> {
+    /// `generate` receives the slot's `2^{ν+κ}`-word block in the BatchMajor,
+    /// rows-low layout the element class fixes: word `(c << ν) + row` is
+    /// (column `c`, row `row`).
+    pub fn new(generate: impl FnOnce(&mut [F128]) + Send + 'a) -> Self {
+        Self {
+            generate: Box::new(generate),
+        }
+    }
 }
 
 impl<'a> UnionSlotProverInput<'a> {
@@ -467,6 +512,12 @@ impl<'a> UnionSlotProverInput<'a> {
 /// buffers are allocated once and each slot is materialized into its own
 /// aligned block — generated there directly for in-place slots, copied there
 /// for prebuilt ones. Either way the result is the same padded buffer.
+///
+/// Element slots always take the in-place path (their `z` block is generated
+/// there and `a`/`b` derived from it by sparse gather), so the all-prebuilt
+/// fast path below only ever sees a boolean-only registry. The returned stripe
+/// vector has one entry per slot, EMPTY for element slots — the element
+/// lincheck folds the committed region directly and has no stripe.
 fn build_union_witness(
     union: &flock_core::union::UnionInstance<'_>,
     sources: Vec<UnionSlotWitnessSource<'_>>,
@@ -498,7 +549,7 @@ fn build_union_witness(
                     witnesses.push(witness);
                     stripes.push(z_lincheck);
                 }
-                UnionSlotWitnessSource::InPlace(_) => unreachable!("checked above"),
+                _ => unreachable!("checked above"),
             }
         }
         let (z, a, b) = union.assemble_witness(witnesses);
@@ -513,6 +564,7 @@ fn build_union_witness(
 
     let (mut z, mut a, mut b, mode) = union.take_witness_buffers(padding_unread);
     let elide = mode != flock_core::union::WitnessBufMode::PooledZeroed;
+    let nu = union.n_log();
     let stripes = union
         .slot_dests(&mut z, &mut a, &mut b, elide)
         .into_iter()
@@ -527,6 +579,10 @@ fn build_union_witness(
                 dst.a.copy_from_slice(&witness.a_packed);
                 dst.b.copy_from_slice(&witness.b_packed);
                 z_lincheck
+            }
+            UnionSlotWitnessSource::Element { ty, generate } => {
+                flock_core::element_r1cs::union::fill_slot(&ty, nu, dst.z, dst.a, dst.b, generate);
+                Vec::new()
             }
         })
         .collect();
@@ -593,12 +649,88 @@ pub fn prove_fast_ligerito_jagged_union<Ch: Challenger>(
     slots: Vec<UnionSlotProverInput<'_>>,
     challenger: &mut Ch,
 ) -> (R1csProofJaggedLigerito, Commitment, R1csClaim) {
-    prove_union_with_binding(
+    assert!(
+        !union.has_element(),
+        "this entry produces R1csProofJaggedLigerito (boolean classes only); \
+         element registries go through prove_fast_ligerito_jagged_union_mixed_class"
+    );
+    let (out, commitment) = prove_union_with_binding(
         union,
         UnionProveBinding::Mixed,
         pcs_params,
         slots,
+        Vec::new(),
         challenger,
+    );
+    out.into_boolean_only()
+        .map(|(proof, claim)| (proof, commitment, claim))
+        .expect("asserted boolean-only above")
+}
+
+/// The **mixed-class** union prove entry: the same pipeline as
+/// [`prove_fast_ligerito_jagged_union`], plus the element class. `slots` is one
+/// [`UnionSlotProverInput`] per BOOLEAN registry type and `element_slots` one
+/// [`UnionElementSlotInput`] per ELEMENT type, each in slot order.
+///
+/// Fiat–Shamir order (every prover message observed before the challenge that
+/// depends on it): commit → `bind_statement` → boolean τ → boolean zerocheck →
+/// boolean lincheck (α, β_t) → element τ' → element zerocheck → element α' →
+/// element lincheck → γ-batched opening. All four claims — boolean AB and C
+/// ring-switched, element C and LC **packed-direct** — ride ONE
+/// `open_batch_jagged_ligerito` call.
+///
+/// Either class may be absent: a boolean-only registry produces
+/// `element: None` (and is transcript-identical to
+/// [`prove_fast_ligerito_jagged_union`] — only the proof struct differs), an
+/// element-only one `boolean: None` and an opening with no ring-switched
+/// claims at all.
+///
+/// Same witness contract as [`prove_fast_ligerito_jagged_union`] for boolean
+/// slots; see [`UnionElementSlotInput`] for the element one. Verify with
+/// [`flock_core::verifier::verify_ligerito_jagged_union_mixed_class`].
+pub fn prove_fast_ligerito_jagged_union_mixed_class<Ch: Challenger>(
+    union: &flock_core::union::UnionInstance<'_>,
+    pcs_params: &PcsParams,
+    slots: Vec<UnionSlotProverInput<'_>>,
+    element_slots: Vec<UnionElementSlotInput<'_>>,
+    challenger: &mut Ch,
+) -> (
+    flock_core::proof::R1csProofMixedClassLigerito,
+    Commitment,
+    flock_core::proof::UnionClassClaims,
+) {
+    let (out, commitment) = prove_union_with_binding(
+        union,
+        UnionProveBinding::Mixed,
+        pcs_params,
+        slots,
+        element_slots,
+        challenger,
+    );
+    let UnionProveOutput {
+        boolean,
+        element,
+        pcs_open,
+    } = out;
+    let (bool_proof, bool_claim) = match boolean {
+        Some((p, c)) => (Some(p), Some(c)),
+        None => (None, None),
+    };
+    let (el_proof, el_claim) = match element {
+        Some((p, c)) => (Some(p), Some(c)),
+        None => (None, None),
+    };
+    (
+        flock_core::proof::R1csProofMixedClassLigerito {
+            boolean: bool_proof,
+            element: el_proof,
+            pcs_open,
+        },
+        commitment,
+        flock_core::proof::UnionClassClaims {
+            boolean: bool_claim,
+            element: el_claim,
+        },
     )
 }
 
@@ -617,13 +749,17 @@ pub fn prove_fast_ligerito_jagged_union_harness<Ch: Challenger>(
     slots: Vec<UnionSlotProverInput<'_>>,
     challenger: &mut Ch,
 ) -> (R1csProofJaggedLigerito, Commitment, R1csClaim) {
-    prove_union_with_binding(
+    let (out, commitment) = prove_union_with_binding(
         union,
         UnionProveBinding::SingleTypeHarness(slot_r1cs),
         pcs_params,
         slots,
+        Vec::new(),
         challenger,
-    )
+    );
+    out.into_boolean_only()
+        .map(|(proof, claim)| (proof, commitment, claim))
+        .expect("the harness binding is single-type boolean")
 }
 
 /// The MERGED-transport union prover (wire v6; design doc §"Capacity-free
@@ -645,6 +781,15 @@ pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
     R1csClaim,
 ) {
     let m = union.m_total();
+    // Element claims ride the UNMERGED jagged transport only in this
+    // milestone: the merged intake requires DeferredDense ring-switch claims
+    // and has no packed-direct path. Rejected loudly rather than silently
+    // dropping the element PIOP.
+    assert!(
+        !union.has_element(),
+        "the merged transport does not carry element claims yet — \
+         use prove_fast_ligerito_jagged_union"
+    );
     assert_eq!(
         pcs_params.m,
         union.dense_m(),
@@ -832,21 +977,56 @@ pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
     (proof, commitment, claim)
 }
 
+/// What [`prove_union_with_binding`] produces: each class's PIOP sub-proof
+/// paired with its claims (`None` when the registry has no type of that class),
+/// plus the single opening covering all of them.
+struct UnionProveOutput {
+    boolean: Option<(flock_core::proof::BooleanPiopProof, R1csClaim)>,
+    element: Option<(
+        flock_core::element_r1cs::union::Proof,
+        flock_core::element_r1cs::union::Claims,
+    )>,
+    pcs_open: pcs::BatchOpeningProofJaggedLigerito,
+}
+
+impl UnionProveOutput {
+    /// Repackage a boolean-only run as the byte-pinned
+    /// [`R1csProofJaggedLigerito`]; `None` if an element half is present.
+    fn into_boolean_only(self) -> Option<(R1csProofJaggedLigerito, R1csClaim)> {
+        if self.element.is_some() {
+            return None;
+        }
+        let (piop, claim) = self.boolean?;
+        Some((
+            R1csProofJaggedLigerito {
+                zerocheck: piop.zerocheck,
+                lincheck: piop.lincheck,
+                pcs_open: self.pcs_open,
+            },
+            claim,
+        ))
+    }
+}
+
 /// Shared body of the jagged-transport union prove entries; `binding`
 /// selects the statement binding, everything else is identical.
+///
+/// Runs the two class PIOPs over their DISJOINT regions in the Fiat–Shamir
+/// order documented on [`prove_fast_ligerito_jagged_union_mixed_class`], then
+/// batches all four claims into one jagged opening.
 fn prove_union_with_binding<Ch: Challenger>(
     union: &flock_core::union::UnionInstance<'_>,
     binding: UnionProveBinding<'_>,
     pcs_params: &PcsParams,
     slots: Vec<UnionSlotProverInput<'_>>,
+    element_slots: Vec<UnionElementSlotInput<'_>>,
     challenger: &mut Ch,
-) -> (R1csProofJaggedLigerito, Commitment, R1csClaim) {
+) -> (UnionProveOutput, Commitment) {
     // Harness guard + slot statement consistency (also asserts one type) —
     // before doing anything heavy.
     if let UnionProveBinding::SingleTypeHarness(slot_r1cs) = binding {
         union.expect_single_type_slot(slot_r1cs);
     }
-    let m = union.m_total();
     // The commitment is to the DENSE stack q (M4): PcsParams.m is the dense
     // variable count; the PIOP and the virtual-opening sumcheck keep the
     // M-variable padded address space.
@@ -857,8 +1037,13 @@ fn prove_union_with_binding<Ch: Challenger>(
     );
     assert_eq!(
         slots.len(),
-        union.registry().num_types(),
-        "need one prover input per registry type"
+        union.num_boolean(),
+        "need one prover input per BOOLEAN registry type"
+    );
+    assert_eq!(
+        element_slots.len(),
+        union.num_element(),
+        "need one element prover input per ELEMENT registry type"
     );
 
     let log_n = union.dense_m() - pcs::LOG_PACKING;
@@ -866,18 +1051,46 @@ fn prove_union_with_binding<Ch: Challenger>(
         pcs::ligerito::prover_config_for(log_n, pcs_params.log_batch_size, pcs_params.profile)
             .expect("Ligerito default config; bump m for tiny instances");
 
-    // Union witness assembly: in-place slots generate straight into the
-    // union buffers, prebuilt ones are copied (single slot: zero-copy
-    // passthrough). The per-slot lincheck stripes come back alongside.
-    let mut sources = Vec::with_capacity(slots.len());
+    // Union witness assembly, in slot order (booleans first, then elements —
+    // the class-major sort): in-place slots generate straight into the union
+    // buffers, prebuilt ones are copied (single slot: zero-copy passthrough),
+    // element slots generate their `z` block and derive `a`/`b` from it. The
+    // per-slot lincheck stripes come back alongside (empty for element slots).
+    let mut sources = Vec::with_capacity(slots.len() + element_slots.len());
     let mut circuits = Vec::with_capacity(slots.len());
     for slot in slots {
         sources.push(slot.source);
         circuits.push(slot.lincheck_circuit);
     }
+    for (ty, input) in union.registry().element_types().iter().zip(element_slots) {
+        let element = match &ty.class {
+            flock_core::schedule::TableClass::LargeField(el) => el.clone(),
+            flock_core::schedule::TableClass::Boolean => {
+                unreachable!("element_types() are LargeField")
+            }
+        };
+        sources.push(UnionSlotWitnessSource::Element {
+            ty: element,
+            generate: input.generate,
+        });
+    }
+    let trace = std::env::var("PCS_TRACE").is_ok();
+    let t = std::time::Instant::now();
     let (z_packed, a_packed_f128, b_packed_f128, stripes, buf_mode) =
         build_union_witness(union, sources, false);
     let give_back = buf_mode != flock_core::union::WitnessBufMode::FreshZeroed;
+    if trace {
+        eprintln!(
+            "  [prove_union] witgen (padded 2^{}, {:?}): {:7.2} ms",
+            union.m_total() - 7,
+            buf_mode,
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    // Element slots' stripes are empty; `zip` truncates to the boolean prefix.
+    let mut stripes = stripes;
+    let element_stripes = stripes.split_off(union.num_boolean());
+    debug_assert!(element_stripes.iter().all(|s| s.is_empty()));
     let linchecks: Vec<(Vec<u8>, &dyn lincheck::LincheckCircuit)> =
         stripes.into_iter().zip(circuits).collect();
 
@@ -887,11 +1100,19 @@ fn prove_union_with_binding<Ch: Challenger>(
     // two with the m22 config floor. When the compaction map is the
     // identity (single-slot registries at full utilization — the
     // byte-identity anchors), q IS the padded buffer and no copy is made.
+    let t = std::time::Instant::now();
     let dense_q: Option<Vec<F128>> = if union.compaction_is_identity() {
         None
     } else {
         Some(union.compact_witness(&z_packed))
     };
+    if trace {
+        eprintln!(
+            "  [prove_union] compact q (2^{} dense): {:7.2} ms",
+            union.dense_m() - 7,
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
     // Integer-lane commit: when the dense stack leaves whole high-bit lanes
     // empty (`UnionInstance::commit_lanes`), encode + hash only the real ones.
     //
@@ -901,11 +1122,18 @@ fn prove_union_with_binding<Ch: Challenger>(
     // 128, so t = 61 of 64 lanes at M = 30). Both arms therefore dispatch on
     // `num_lanes` alone.
     let commit_stack: &[F128] = dense_q.as_deref().unwrap_or(&z_packed);
+    let t = std::time::Instant::now();
     let (commitment, prover_data) = if pcs_params.num_lanes.is_some() {
         pcs::commit_lane_major(commit_stack, pcs_params)
     } else {
         pcs::commit(commit_stack, pcs_params)
     };
+    if trace {
+        eprintln!(
+            "  [prove_union] commit: {:7.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
     match binding {
         UnionProveBinding::Mixed => union.bind_statement(challenger, &commitment),
         UnionProveBinding::SingleTypeHarness(slot_r1cs) => {
@@ -913,56 +1141,136 @@ fn prove_union_with_binding<Ch: Challenger>(
         }
     }
 
-    // Zerocheck over the union address space, driven by the count-derived
-    // run-list (the existing kernels' general multi-run paths — value-
-    // identical to the single-run spec on honestly-zero padding).
+    // Zerocheck over the BOOLEAN REGION of the union address space — the
+    // prefix subcube `[0, 2^M_bool)` — driven by the count-derived run-list
+    // (the existing kernels' general multi-run paths, value-identical to the
+    // single-run spec on honestly-zero padding).
+    //
+    // The element region is NOT part of this sum. It cannot be: the union
+    // zerocheck passes `c = z`, so on the element region the honest summand is
+    // `0·0 − z ≠ 0` and the global sum would not vanish. `M_bool = M` for a
+    // boolean-only registry, so nothing here changes for one.
     let padding = union.padding_spec();
-    let (zc_proof, zc_claim, s_hat_v_c) = {
-        // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
-        let a_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                a_packed_f128.as_ptr() as *const u8,
-                a_packed_f128.len() * core::mem::size_of::<F128>(),
+    let bool_padding = union.boolean_padding_spec();
+    let m_bool = union.m_bool();
+    let bool_words = union.boolean_packed_len();
+
+    // The element region's copies of `a`/`b`, taken BEFORE the boolean
+    // zerocheck recycles those buffers. `2^(M_elem−7)` words each — the element
+    // area, not the capacity.
+    let t = std::time::Instant::now();
+    let element_ab: Option<(Vec<F128>, Vec<F128>)> = union.has_element().then(|| {
+        let r = union.element_word_range();
+        (a_packed_f128[r.clone()].to_vec(), b_packed_f128[r].to_vec())
+    });
+
+    if trace && element_ab.is_some() {
+        eprintln!(
+            "  [prove_union] element a/b copies (2^{} words): {:7.2} ms",
+            union.m_elem() - 7,
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
+    // ---- The boolean class's PIOP pair, over the prefix subcube.
+    let t_bool = std::time::Instant::now();
+    let boolean = (union.num_boolean() > 0).then(|| {
+        let (zc_proof, zc_claim, s_hat_v_c) = {
+            // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
+            let view = |v: &[F128]| -> &[u8] {
+                unsafe {
+                    std::slice::from_raw_parts(
+                        v.as_ptr() as *const u8,
+                        bool_words * core::mem::size_of::<F128>(),
+                    )
+                }
+            };
+            let a_packed = view(&a_packed_f128);
+            let b_packed = view(&b_packed_f128);
+            let c_packed = view(&z_packed);
+            zerocheck::prove_packed_padded_capture_s_hat_v_c(
+                a_packed,
+                b_packed,
+                c_packed,
+                m_bool,
+                &bool_padding,
+                challenger,
             )
         };
-        let b_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                b_packed_f128.as_ptr() as *const u8,
-                b_packed_f128.len() * core::mem::size_of::<F128>(),
-            )
+
+        let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
+
+        // M2: the union-column lincheck — one sumcheck over the boolean
+        // column domain against the per-slot stripes and circuits. On the M1
+        // single-type registries it is byte-identical to invoking the slot's
+        // own lincheck (the union of one slot has m = M_bool = M).
+        let (lc_proof, lc_claim, z_vec_pre) = {
+            let lc_slots: Vec<lincheck::UnionLincheckSlot<'_>> = linchecks
+                .iter()
+                .map(|(stripe, circuit)| lincheck::UnionLincheckSlot {
+                    z_lincheck: stripe,
+                    circuit: *circuit,
+                })
+                .collect();
+            lincheck::prove_union_capture_z_vec(union, &lc_slots, &x_ab, challenger)
         };
-        let c_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                z_packed.as_ptr() as *const u8,
-                z_packed.len() * core::mem::size_of::<F128>(),
-            )
+
+        let ab = ZClaim {
+            point: union.ab_claim_point(
+                lc_claim.r_inner_skip,
+                &lc_claim.r_inner_rest,
+                &x_ab.x_outer,
+            ),
+            value: lc_claim.w,
         };
-        zerocheck::prove_packed_padded_capture_s_hat_v_c(
-            a_packed, b_packed, c_packed, m, &padding, challenger,
+        let c = ZClaim {
+            point: union.c_claim_point(zc_claim.z, &zc_claim.r_rest),
+            value: zc_claim.c_eval,
+        };
+
+        // `s_hat_v_from_z_vec` needs `z_vec.len() = 2^LOG_PACKING · 2^tail`;
+        // the boolean fold has `len = 2^(M_bool−ν)` and
+        // `tail = M_bool−ν−LOG_PACKING`, so the condition is
+        // `M_bool−ν ≥ LOG_PACKING` — for a single-type registry exactly the
+        // old `k_log ≥ LOG_PACKING`, and always true for real registries
+        // (every `k_log ≥ 7`).
+        //
+        // The precomputed value stays honest even though the AB claim's point
+        // now carries `M − M_bool` frozen ZERO high coordinates:
+        // `s_hat_v[b] = Σ_j eq(suffix, j)·bit_b(w[j])` and those zeros kill
+        // every `j` outside the boolean region, so the full-buffer fold equals
+        // this boolean-region one term for term.
+        let s_hat_v_ab = if m_bool - union.n_log() >= pcs::LOG_PACKING {
+            Some(pcs::ring_switch::s_hat_v_from_z_vec(
+                &z_vec_pre,
+                &lc_claim.r_inner_rest[1..],
+            ))
+        } else {
+            None
+        };
+        (
+            flock_core::proof::BooleanPiopProof {
+                zerocheck: zc_proof,
+                lincheck: lc_proof,
+            },
+            R1csClaim { ab, c },
+            s_hat_v_ab,
+            s_hat_v_c,
         )
-    };
+    });
+
+    if trace && union.num_boolean() > 0 {
+        eprintln!(
+            "  [prove_union] boolean zerocheck + lincheck (M_bool = {}): {:7.2} ms",
+            union.m_bool(),
+            t_bool.elapsed().as_secs_f64() * 1e3
+        );
+    }
     // a/b are consumed; recycle the buffers as in `prove_fast_core`.
     if give_back {
         flock_core::scratch::give_f128(a_packed_f128);
         flock_core::scratch::give_f128(b_packed_f128);
     }
-
-    let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
-
-    // M2: the union-column lincheck — one sumcheck over the union column
-    // domain against the per-slot stripes and circuits. On the M1
-    // single-type registries it is byte-identical to invoking the slot's
-    // own lincheck (the union of one slot has m = M).
-    let (lc_proof, lc_claim, z_vec_pre) = {
-        let lc_slots: Vec<lincheck::UnionLincheckSlot<'_>> = linchecks
-            .iter()
-            .map(|(stripe, circuit)| lincheck::UnionLincheckSlot {
-                z_lincheck: stripe,
-                circuit: *circuit,
-            })
-            .collect();
-        lincheck::prove_union_capture_z_vec(union, &lc_slots, &x_ab, challenger)
-    };
     // Recycle the stripes (as large as the witness itself) rather than
     // unmapping them — the drivers take them from the same pool.
     for (stripe, _) in linchecks {
@@ -971,53 +1279,101 @@ fn prove_union_with_binding<Ch: Challenger>(
         }
     }
 
-    let ab = ZClaim {
-        point: union.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
-        value: lc_claim.w,
-    };
-    let c = ZClaim {
-        point: union.c_claim_point(zc_claim.z, &zc_claim.r_rest),
-        value: zc_claim.c_eval,
-    };
+    // ---- The element class's PIOP pair, over the element region. Runs AFTER
+    // the boolean pair, so its τ' is drawn from a transcript that already
+    // absorbed every boolean message (and vice versa is impossible).
+    let t = std::time::Instant::now();
+    let element = element_ab.map(|(pa, pb)| {
+        let r = union.element_word_range();
+        flock_core::element_r1cs::union::prove(union, &z_packed[r], pa, pb, challenger)
+    });
+    if trace && element.is_some() {
+        eprintln!(
+            "  [prove_union] element region PIOP (2^{} words): {:7.2} ms",
+            union.m_elem() - 7,
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
 
-    // `s_hat_v_from_z_vec` needs `z_vec.len() = 2^LOG_PACKING · 2^tail`;
-    // the union fold has `len = 2^(M−ν)` and `tail = M−ν−LOG_PACKING`, so
-    // the condition is `M−ν ≥ LOG_PACKING` — for a single-type registry
-    // exactly the old `k_log ≥ LOG_PACKING`, and always true for real
-    // registries (every `k_log ≥ 7`).
-    let s_hat_v_ab = if m - union.n_log() >= pcs::LOG_PACKING {
-        Some(pcs::ring_switch::s_hat_v_from_z_vec(
-            &z_vec_pre,
-            &lc_claim.r_inner_rest[1..],
-        ))
-    } else {
-        None
-    };
-
+    // ---- One opening over all four claims: the boolean pair ring-switched,
+    // the element pair PACKED-DIRECT (their points are already packed-MLE
+    // points, and their region-prefix coordinates are Boolean — so a Sparse
+    // eq tensor, no ring switch).
     let heights = union.jagged_heights();
-    let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
-    let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
+    let (z_claims, pre): (Vec<ZClaim>, Vec<Option<&[F128]>>) = match &boolean {
+        Some((_, claim, s_hat_v_ab, s_hat_v_c)) => (
+            vec![claim.ab.clone(), claim.c.clone()],
+            vec![s_hat_v_ab.as_deref(), Some(s_hat_v_c.as_slice())],
+        ),
+        None => (Vec::new(), Vec::new()),
+    };
+    let packed_direct: Vec<pcs::PackedDirectClaim> = match &element {
+        Some((_, claims)) => element_packed_direct_claims(claims),
+        None => Vec::new(),
+    };
+    let t = std::time::Instant::now();
     let pcs_open = open_claims_with_precomputed_jagged_ligerito(
         z_packed,
         dense_q,
         &prover_data,
         &commitment,
-        &[ab.clone(), c.clone()],
-        &[pre_ab, pre_c],
+        &z_claims,
+        &pre,
+        &packed_direct,
         &padding,
         &heights,
         union.n_log(),
         &lig_config,
         challenger,
     );
+    if trace {
+        eprintln!(
+            "  [prove_union] open (rs×{}, pd×{}): {:7.2} ms",
+            z_claims.len(),
+            packed_direct.len(),
+            t.elapsed().as_secs_f64() * 1e3
+        );
+        // Self-delimiting: one line per prove, tagging the arm, so a trace
+        // reader never has to guess which prove a phase belonged to.
+        eprintln!(
+            "  [prove_union] === done (element: {}) ===",
+            element.is_some()
+        );
+    }
 
-    let proof = R1csProofJaggedLigerito {
-        zerocheck: zc_proof,
-        lincheck: lc_proof,
-        pcs_open,
-    };
-    let claim = R1csClaim { ab, c };
-    (proof, commitment, claim)
+    (
+        UnionProveOutput {
+            boolean: boolean.map(|(piop, claim, _, _)| (piop, claim)),
+            element,
+            pcs_open,
+        },
+        commitment,
+    )
+}
+
+/// The element class's two claims as packed-direct PCS claims, in the fixed
+/// order `[C at r, LC at (r_row, r'_col)]` — the order the verifier rebuilds.
+///
+/// `DirectEqInd::Sparse` because the points' region-prefix coordinates are a
+/// fixed Boolean pattern: `build_eq_sparse` pins those index bits instead of
+/// doubling the tensor, so the eq support is the element region rather than the
+/// whole address space. (With no prefix — an element-only registry whose region
+/// IS the address space — it degrades to the dense tensor, which is correct and
+/// what the dense variant would have built anyway.)
+fn element_packed_direct_claims(
+    claims: &flock_core::element_r1cs::union::Claims,
+) -> Vec<pcs::PackedDirectClaim> {
+    [
+        (&claims.c_point, claims.c_value),
+        (&claims.lc_point, claims.lc_value),
+    ]
+    .into_iter()
+    .map(|(point, value)| pcs::PackedDirectClaim {
+        point: point.clone(),
+        value,
+        eq_ind: pcs::DirectEqInd::Sparse(pcs::ring_switch::build_eq_sparse(point)),
+    })
+    .collect()
 }
 
 /// Everything the prover produces *before* the PCS open: the zerocheck +
@@ -1496,6 +1852,7 @@ pub fn prove_fast_ligerito_jagged_union_timed<Ch: Challenger>(
         &commitment,
         &[ab.clone(), c.clone()],
         &[pre_ab, pre_c],
+        &[],
         &padding,
         &heights,
         union.n_log(),

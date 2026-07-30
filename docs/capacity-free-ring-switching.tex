@@ -271,6 +271,66 @@ for $\sum H = V$; (4) the verifier checks
 $c^* = \hat q(\rho)\cdot V$, with $\hat q(\rho)$ discharged by the
 ordinary eq-basis opening.
 
+\paragraph{Cost: the boundary run tree.}\label{par:runtree}
+The prover streams the boundary program one pass per layer: at layer
+$\ell$ it folds the previous layer's two challenges into each column's
+running weight $we_y$ and accumulates the four bucketed sums
+$B[c\,{+}\,2d] = \sum_y we_y\, S_y[\ell{+}1]$, from which both round
+messages follow. Read per column this is $O(\mathrm{cols})$ per layer
+per statement --- $O(128\,K \cdot \mathrm{cols} \cdot m)$ overall, with
+stored suffix state of the same size.
+
+Both quantities the layer touches, however, are functions of the
+boundary pair's bits $\ge \ell$ alone: the transition tag
+$cd_\ell = (\mathrm{bit}_\ell T_{y-1}, \mathrm{bit}_\ell T_y)$, which
+selects the layer matrix, and the suffix vector
+$S[\ell] = M_\ell \cdots M_m e_S$. Both are therefore constant on the
+maximal runs of consecutive columns whose pair agrees above $\ell$; a
+run at layer $\ell{+}1$ is a union of runs at layer $\ell$, so the runs
+form a tree. The recursion then collapses in both directions: the
+suffix vectors \emph{descend} it, one node's vector coming from its
+parent's in $8$ multiplies, and the running weights \emph{ascend} it,
+$cd_\ell$ being constant on a node so its factor pulls out of the
+node's sum by distributivity --- one multiply per node where the
+per-column form spent one per column per layer. The layer's buckets
+need only the per-node partial sums, $4$ multiplies each.
+
+Cost becomes $O(128\,K \sum_\ell \mathrm{runs}(\ell))$. For the
+registry's shape ($k_t$ consecutive columns of height $n_t$) the pair
+advances by $n_t$ inside a run, so its bits above $\ell$ change only
+every $2^\ell/n_t$ columns and
+$\sum_\ell \mathrm{runs}(\ell) = O(\mathrm{cols} \cdot \log n_t + m)$
+against the per-column $\mathrm{cols}\cdot(m{+}2)$ --- a saving in both
+time and the suffix footprint. The verifier's $W(\sigma)$ walk collapses
+on the same tree, its per-layer quadrant product
+$\eq(c,\sigma_{\mathrm c})\eq(d,\sigma_{\mathrm d})$ being likewise
+run-constant: one multiply per node against $2(m{+}1)$ per column.
+Everything here is distributivity and associativity over $\F$, so the
+transcript is bit-identical to the per-column form.
+
+Measured ($256$ statements, Apple silicon), against the per-column
+form: at $m = 16$ over $64$ columns of heights $300/700$, prove
+$1.8 \to 1.7$\,ms and verify $0.44 \to 0.29$\,ms; at $m = 21$ over
+$192$ columns of heights $2^{10}\!\ldots\!2^{13}$, $3.5 \to 2.8$ and
+$1.02 \to 0.45$; at $m = 23$ over $368$ full-height columns --- the
+worst case, $\log n_t$ within a factor $1.6$ of $m$ --- $5.3 \to 4.3$
+and $1.78 \to 0.54$. The single-statement assist of the unmerged path
+runs the same tree: $0.15 \to 0.06$\,ms at $m = 21$.
+
+At the width where \S\ref{sec:multipoint} takes over the collapse is
+sharper still, the verifier especially: $4096$ columns of height
+$2^{11}$ at $m = 23$ prove $68.5 \to 41.9$\,ms and verify
+$17.8 \to 3.5$\,ms ($57$K nodes against $102$K per-column slots, so
+$940$\,MB of suffix state across the $256$ statements rather than
+$1.7$\,GB); $4096$ columns of height $300$ at $m = 21$, $64.5 \to 33.6$
+and $15.8 \to 3.2$. That makes the batched assist merely expensive at
+$4$K rather than infeasible, but it does not move the crossover: the
+multipoint protocol proves the same $4096$-column statement in
+$24$\,ms in total. The single-statement assist is flat there
+($2.1 \to 2.2$\,ms) --- at thousands of columns its per-layer column
+pass already fills the pool, and the tree trades arithmetic for a less
+regular gather --- while its verifier still gains $2.8\times$.
+
 \begin{theorem}[soundness, sketch]\label{thm:soundness}
 Against the committed $q$: if the ring-switching statement is false
 for the embedding of $q$, the verifier accepts with
@@ -306,10 +366,13 @@ on the committed witness), hence $256$ statements in one sumcheck.
 protocol}\label{sec:multipoint}
 
 The batched assist walks the boundary program once per statement:
-prover time $O(128\,K \cdot \mathrm{cols} \cdot m)$ and, for the
-round streaming, suffix state of the same size. At hundreds of columns
-this is a few milliseconds; a registry with tens of thousands of
-columns pays hundreds of milliseconds and gigabytes. The
+prover time $O(128\,K \sum_\ell \mathrm{runs}(\ell))$ by the run tree
+of \S\ref{par:runtree} --- $O(128\,K \cdot \mathrm{cols}\cdot\log n_t)$
+at the registry's shape --- and, for the round streaming, suffix state
+of the same size. At hundreds of columns this is a few milliseconds; a
+registry with tens of thousands of columns still pays hundreds of
+milliseconds and gigabytes, the tree saving a $m/\log n_t$ factor but
+not the column-linearity itself. The
 $128\times$ factor is \emph{not} inherent to the verifier's goal: by
 Remark~\ref{rem:dual} the statements are evaluations of the single
 untwisted $\fjag$, and only their $c$-combination $V$ is consumed. The
@@ -407,9 +470,9 @@ across $368 / 4096 / 32768$ columns --- and $29$\,ms at $27962$
 columns of height $300$, the non-power-of-two stride --- of which the
 dense passes and sumcheck hold flat at ${\approx}15$\,ms, the values
 are $2 / 7.5 / 8.9$\,ms, and the single anchor assist is
-$0.4 / 1.7 / 7$\,ms (column-parallelized past ${\sim}2^{14}$ columns;
-the largest remaining column-linear term, and the run tabulation
-applies to it in principle). Verification measures
+$0.4 / 1.7 / 7$\,ms (column-parallelized past ${\sim}2^{14}$ columns,
+and now also run-collapsed by the tree of \S\ref{par:runtree}; the
+largest remaining column-linear term). Verification measures
 $0.3 / 0.6 / 1.7$\,ms. The batched assist measures $5.5$\,ms at $368$
 columns and is memory-infeasible past a few thousand. A fused variant
 shares its dense context with the surrounding merged opening ---

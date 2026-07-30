@@ -20,7 +20,7 @@ use flock_core::lincheck::{
     build_quirky_eq_table, pack_z_lincheck,
 };
 use flock_core::r1cs::SparseBinaryMatrix;
-use flock_core::schedule::{Registry, TableType};
+use flock_core::schedule::{Registry, TableClass, TableType};
 use flock_core::union::UnionInstance;
 use flock_core::zerocheck::multilinear::lagrange_weights_naive;
 use flock_core::zerocheck::univariate_skip::pack_bits;
@@ -165,6 +165,7 @@ fn table_type(slot: &SlotData) -> TableType {
         b_0: slot.b0.clone(),
         c_0: identity(1 << slot.k_log),
         const_pin: slot.pin,
+        class: TableClass::Boolean,
     }
 }
 

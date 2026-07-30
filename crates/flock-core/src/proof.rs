@@ -44,6 +44,42 @@ pub struct R1csProofMergedLigerito {
     pub pcs_open: pcs::MergedOpenProof,
 }
 
+/// A **mixed-class** union proof: the boolean PIOP, the element-region PIOP,
+/// and ONE jagged-transport opening covering all four claims (boolean AB + C
+/// ring-switched, element C + LC packed-direct).
+///
+/// Each class's sub-proof is `Option`: a boolean-only registry has no element
+/// half, an element-only one no boolean half. Deliberately a NEW type rather
+/// than extra fields on [`R1csProofJaggedLigerito`] — that struct's serialized
+/// bytes are pinned by the `union_m6_fixtures` anchors, and boolean-only proofs
+/// must keep going out through it unchanged.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct R1csProofMixedClassLigerito {
+    /// Boolean zerocheck + lincheck over the `M_bool` prefix subcube.
+    pub boolean: Option<BooleanPiopProof>,
+    /// The element-region zerocheck + lincheck.
+    pub element: Option<crate::element_r1cs::union::Proof>,
+    pub pcs_open: pcs::BatchOpeningProofJaggedLigerito,
+}
+
+/// The boolean class's two PIOP sub-proofs, as they appear inside
+/// [`R1csProofMixedClassLigerito`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BooleanPiopProof {
+    pub zerocheck: zerocheck::ZerocheckProof,
+    pub lincheck: lincheck::LincheckProof,
+}
+
+/// The claims a verified mixed-class union proof leaves behind, per class.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnionClassClaims {
+    /// Boolean AB + C — `None` when the registry has no boolean types.
+    pub boolean: Option<R1csClaim>,
+    /// Element C + LC, in union word coordinates — `None` when the registry
+    /// has no element types.
+    pub element: Option<crate::element_r1cs::union::Claims>,
+}
+
 /// A claim of the form `ẑ(point) = value` for the witness `z`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ZClaim {

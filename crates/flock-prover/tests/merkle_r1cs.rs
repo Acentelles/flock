@@ -666,7 +666,7 @@ fn chunk_layout_geometry() {
         for i in 0..layout.leaf_blocks {
             assert_eq!(
                 layout.leaf_data_bit(i, 0),
-                i * STRIDE + 513,
+                i * STRIDE + layout.spec.msg_base,
                 "chunk block {i} msg"
             );
         }

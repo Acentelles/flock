@@ -36,6 +36,8 @@ use crate::field::F128;
 use crate::lincheck::QuirkyPoint;
 use crate::pcs::Commitment;
 use crate::r1cs::{BlockR1cs, WitnessLayout};
+#[cfg(test)]
+use crate::schedule::TableClass;
 use crate::schedule::{Instance, Registry, TableType};
 use crate::zerocheck::{K_SKIP, PaddingSpec};
 
@@ -100,10 +102,134 @@ impl<'r> UnionInstance<'r> {
         self.m_total() - 7 - self.n_log()
     }
 
+    // -----------------------------------------------------------------------
+    // Class regions. The two classes occupy DISJOINT aligned subcubes
+    // (`Registry::new`), and each class's PIOP runs over its own region only —
+    // the boolean zerocheck aliases `c = z`, so on the element region the
+    // honest summand `ab − c` is `0·0 − z ≠ 0` and a shared domain could not
+    // be proven honestly (see the module-level "Disjoint PIOPs" note).
+    // -----------------------------------------------------------------------
+
+    /// `M_bool`: the boolean PIOP's variable count. Its domain is the PREFIX
+    /// subcube `[0, 2^{M_bool})` of the union address space, so it reads the
+    /// leading `2^{M_bool−7}` words of the padded buffers and its claim points
+    /// gain `M − M_bool` frozen-zero high coordinates on the way out
+    /// ([`Self::ab_claim_point`] / [`Self::c_claim_point`] append them).
+    /// Equals [`Self::m_total`] for a boolean-only registry.
+    pub fn m_bool(&self) -> usize {
+        self.registry().m_bool()
+    }
+
+    /// Packed length of the boolean region in 128-bit words, `2^(M_bool−7)`;
+    /// `0` when there are no boolean types (the region is empty — `M_bool = 0`,
+    /// so the naive shift would underflow).
+    pub fn boolean_packed_len(&self) -> usize {
+        if self.num_boolean() == 0 {
+            0
+        } else {
+            1usize << (self.m_bool() - 7)
+        }
+    }
+
+    /// Boolean-region chunk-column variable count `M_bool − 7 − nu` — the
+    /// boolean lincheck's column domain past the shared row block. `0` when
+    /// there are no boolean types (no boolean PIOP runs).
+    pub fn boolean_col_log(&self) -> usize {
+        if self.num_boolean() == 0 {
+            0
+        } else {
+            self.m_bool() - 7 - self.n_log()
+        }
+    }
+
+    /// Number of boolean types (a prefix of the slots) and of element types
+    /// (the suffix).
+    pub fn num_boolean(&self) -> usize {
+        self.registry().num_boolean()
+    }
+    pub fn num_element(&self) -> usize {
+        self.registry().num_element()
+    }
+
+    /// Whether the registry has any large-field type — i.e. whether the
+    /// element PIOP runs at all. `false` restores every boolean-only path
+    /// exactly.
+    pub fn has_element(&self) -> bool {
+        self.num_element() > 0
+    }
+
+    /// `M_elem`: the element region is the aligned subcube
+    /// `[element_base, element_base + 2^{M_elem})`, so the element PIOP runs
+    /// over `M_elem − 7` WORD variables (elements are words; there is no
+    /// in-word structure to fold).
+    pub fn m_elem(&self) -> usize {
+        self.registry().m_elem()
+    }
+
+    /// Word range of the element region inside the padded union buffers.
+    /// Empty when there are no element types.
+    pub fn element_word_range(&self) -> core::ops::Range<usize> {
+        if !self.has_element() {
+            return 0..0;
+        }
+        let start = self.registry().element_base() >> 7;
+        start..start + (1usize << (self.m_elem() - 7))
+    }
+
+    /// The element region's frozen high WORD coordinates, LSB-first: the
+    /// Boolean pattern the top `M − M_elem` word variables take for every
+    /// address in the region (`element_base >> M_elem`). Element claim points
+    /// are `region point ‖ these`.
+    pub fn element_prefix_coords(&self) -> Vec<F128> {
+        if !self.has_element() {
+            return Vec::new();
+        }
+        let bits = self.m_total() - self.m_elem();
+        let prefix = self.registry().element_base() >> self.m_elem();
+        (0..bits)
+            .map(|i| {
+                if (prefix >> i) & 1 == 1 {
+                    F128::ONE
+                } else {
+                    F128::ZERO
+                }
+            })
+            .collect()
+    }
+
+    /// Per-element-slot geometry, in slot order: the slot's word offset
+    /// RELATIVE to the element region, its `kappa`, and its declared count.
+    /// The element PIOP addresses the region, not the union, so these are the
+    /// offsets it uses.
+    pub fn element_slot_layout(&self) -> Vec<ElementSlotLayout> {
+        let base_word = self.registry().element_base() >> 7;
+        let nb = self.num_boolean();
+        self.registry().types()[nb..]
+            .iter()
+            .zip(&self.registry().slots()[nb..])
+            .zip(&self.counts()[nb..])
+            .map(|((ty, slot), &n_t)| ElementSlotLayout {
+                region_word_offset: (slot.offset >> 7) - base_word,
+                kappa: ty.k_log - 7,
+                n_t,
+            })
+            .collect()
+    }
+
     /// The count-derived run-list padding over the union BatchMajor buffer —
-    /// delegates to [`Instance::padding_spec`].
+    /// delegates to [`Instance::padding_spec`]. Covers BOTH classes: it
+    /// describes the padded buffer's zero structure for the transport
+    /// (ring-switch folds, the virtual-opening sumcheck's live intervals),
+    /// which spans the whole address space regardless of class.
     pub fn padding_spec(&self) -> PaddingSpec {
         self.instance.padding_spec()
+    }
+
+    /// The boolean region's own run-list — the padding spec the boolean
+    /// zerocheck consumes over its `M_bool`-variable domain. Identical to
+    /// [`Self::padding_spec`] for a boolean-only registry.
+    pub fn boolean_padding_spec(&self) -> PaddingSpec {
+        self.instance.boolean_padding_spec()
     }
 
     /// Per-chunk-column heights (in packed words) of the union jagged grid,
@@ -363,16 +489,24 @@ impl<'r> UnionInstance<'r> {
     // makes them multi-slot-ready as-is (the row coordinates are shared by
     // every slot under uniform capacity). Shared by prover and verifier —
     // any divergence is a transcript break, so both call these.
+    //
+    // Since the element class, the boolean PIOP runs over the `M_bool`-variable
+    // PREFIX subcube, so these speak `M_bool` on the input side and append the
+    // `M − M_bool` frozen-ZERO high address coordinates on the output side —
+    // the boolean region is `[0, 2^{M_bool})`, so those bits are 0 at every
+    // boolean address. For a boolean-only registry `M_bool = M` and nothing is
+    // appended, which is why the existing anchors are byte-identical.
     // -----------------------------------------------------------------------
 
-    /// Lincheck's **semantic** quirky point from the zerocheck claim: split
-    /// the address-ordered `mlv` challenges (length `M − 6`) into
+    /// Lincheck's **semantic** quirky point from the boolean zerocheck claim:
+    /// split the address-ordered `mlv` challenges (length `M_bool − 6`) into
     /// `x_inner_rest = [dim6, chunk…]` and `x_outer = batch`. Union analog of
-    /// [`BlockR1cs::x_ab_from_mlv`] (BatchMajor).
+    /// [`BlockR1cs::x_ab_from_mlv`] (BatchMajor). Stays in BOOLEAN-REGION
+    /// coordinates — the boolean lincheck's column domain is `M_bool − nu`.
     pub fn x_ab_from_mlv(&self, z_skip: F128, mlv: &[F128]) -> QuirkyPoint {
         let nu = self.n_log();
-        assert_eq!(mlv.len(), self.m_total() - K_SKIP);
-        let mut x_inner_rest = Vec::with_capacity(1 + self.col_log());
+        assert_eq!(mlv.len(), self.m_bool() - K_SKIP);
+        let mut x_inner_rest = Vec::with_capacity(1 + self.boolean_col_log());
         x_inner_rest.push(mlv[0]);
         x_inner_rest.extend_from_slice(&mlv[1 + nu..]);
         QuirkyPoint {
@@ -382,10 +516,16 @@ impl<'r> UnionInstance<'r> {
         }
     }
 
+    /// The `M − M_bool` frozen-zero high address coordinates that lift a
+    /// boolean-region point into the union address space.
+    fn boolean_frozen_high(&self) -> usize {
+        self.m_total() - self.m_bool()
+    }
+
     /// Address-ordered `ZClaim` point for the AB claim after lincheck
     /// replaces the inner coordinates with `(r_inner_skip, r_inner_rest)`.
     /// Union analog of [`BlockR1cs::ab_claim_point`] (BatchMajor): the
-    /// address-ordered suffix is `[dim6 | batch | chunk]`.
+    /// address-ordered suffix is `[dim6 | batch | chunk | frozen zeros]`.
     pub fn ab_claim_point(
         &self,
         r_inner_skip: F128,
@@ -393,10 +533,12 @@ impl<'r> UnionInstance<'r> {
         x_outer: &[F128],
     ) -> QuirkyPoint {
         assert_eq!(x_outer.len(), self.n_log());
-        assert_eq!(r_inner_rest.len(), 1 + self.col_log());
-        let mut suffix = Vec::with_capacity(x_outer.len() + r_inner_rest.len() - 1);
+        assert_eq!(r_inner_rest.len(), 1 + self.boolean_col_log());
+        let frozen = self.boolean_frozen_high();
+        let mut suffix = Vec::with_capacity(x_outer.len() + r_inner_rest.len() - 1 + frozen);
         suffix.extend_from_slice(x_outer);
         suffix.extend_from_slice(&r_inner_rest[1..]);
+        suffix.extend(std::iter::repeat_n(F128::ZERO, frozen));
         QuirkyPoint {
             z_skip: r_inner_skip,
             x_inner_rest: vec![r_inner_rest[0]],
@@ -404,15 +546,20 @@ impl<'r> UnionInstance<'r> {
         }
     }
 
-    /// Address-ordered `ZClaim` point for the C claim from the zerocheck's
-    /// `r_rest` (already address-ordered). Union analog of
+    /// Address-ordered `ZClaim` point for the C claim from the boolean
+    /// zerocheck's `r_rest` (already address-ordered, length `M_bool − 6`),
+    /// lifted with the frozen-zero high coordinates. Union analog of
     /// [`BlockR1cs::c_claim_point`] (BatchMajor).
     pub fn c_claim_point(&self, z_skip: F128, r_rest: &[F128]) -> QuirkyPoint {
-        assert_eq!(r_rest.len(), self.m_total() - K_SKIP);
+        assert_eq!(r_rest.len(), self.m_bool() - K_SKIP);
+        let frozen = self.boolean_frozen_high();
+        let mut x_outer = Vec::with_capacity(r_rest.len() - 1 + frozen);
+        x_outer.extend_from_slice(&r_rest[1..]);
+        x_outer.extend(std::iter::repeat_n(F128::ZERO, frozen));
         QuirkyPoint {
             z_skip,
             x_inner_rest: vec![r_rest[0]],
-            x_outer: r_rest[1..].to_vec(),
+            x_outer,
         }
     }
 
@@ -808,6 +955,39 @@ fn slot_buffer_zero_off_support(w: &SlotWitness, used_cols: usize, nu: usize, n_
     })
 }
 
+/// One element slot's geometry inside the element REGION (not the union):
+/// where its aligned block starts in region-word coordinates, how wide its
+/// rows are, and how many are declared. Produced by
+/// [`UnionInstance::element_slot_layout`]; the element PIOP addresses the
+/// region, so these are the only offsets it needs.
+///
+/// The region-word index of (column `c`, row `j`) in this slot is
+/// `region_word_offset + (c << nu) + j`, and — since `region_word_offset` is a
+/// multiple of `2^{nu + kappa}` — that is also
+/// `(q << (nu + kappa)) | (c << nu) | j` for the slot's region prefix
+/// `q = region_word_offset >> (nu + kappa)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ElementSlotLayout {
+    pub region_word_offset: usize,
+    pub kappa: usize,
+    pub n_t: usize,
+}
+
+impl ElementSlotLayout {
+    /// The slot's region prefix `q` — the value the region's top
+    /// `(M_elem − 7) − nu − kappa` word coordinates are frozen to inside this
+    /// slot.
+    pub fn region_prefix(&self, nu: usize) -> usize {
+        self.region_word_offset >> (nu + self.kappa)
+    }
+
+    /// The slot's column-domain block in the region column domain (the region
+    /// word index with the `nu` row bits dropped): `[q << kappa, (q+1) << kappa)`.
+    pub fn column_offset(&self, nu: usize) -> usize {
+        self.region_word_offset >> nu
+    }
+}
+
 /// One slot's packed witness buffers, exactly as the existing batch-major
 /// drivers produce them (`generate_witness_batch_major`'s `(z, a, b, _)`):
 /// `z`, `a = A·z`, `b = B·z`, each `2^{m_t−7}` packed words in the slot's
@@ -884,6 +1064,7 @@ mod tests {
             b_0: stub(),
             c_0: stub(),
             const_pin: None,
+            class: TableClass::Boolean,
         }
     }
 
@@ -1459,6 +1640,363 @@ mod tests {
             base,
             sample(&UnionInstance::new(&reg2, vec![5, 3]), 0xAA),
             "registry digest must bind"
+        );
+    }
+
+    // ---- element slots through the union bookkeeping -----------------------
+
+    /// An element type of shape `(kappa, k)`: `k` free-wire columns, the rest
+    /// self-pinned zero padding. Only the shape matters here.
+    fn elem_ty(kappa: usize, k: usize) -> TableType {
+        use crate::element_r1cs::ElementTableBuilder;
+        let mut b = ElementTableBuilder::new(kappa);
+        for y in 0..k {
+            b.free_wire(y);
+        }
+        TableType::element(std::sync::Arc::new(
+            b.build().expect("free wires are valid"),
+        ))
+    }
+
+    /// A boolean-only registry's `boolean_padding_spec` IS its `padding_spec`
+    /// (the class gap and the element runs are exactly what it drops), and the
+    /// boolean claim-point helpers append nothing — the byte-identity
+    /// precondition for every existing anchor.
+    #[test]
+    fn boolean_only_regions_are_the_whole_space() {
+        let reg = Registry::new(vec![ty(10, 700), ty(9, 300)], 3);
+        let union = UnionInstance::new(&reg, vec![5, 3]);
+        assert_eq!(union.m_bool(), union.m_total());
+        assert!(!union.has_element());
+        assert_eq!(union.num_element(), 0);
+        assert_eq!(union.boolean_packed_len(), union.packed_len());
+        assert_eq!(union.boolean_col_log(), union.col_log());
+        assert_eq!(union.boolean_padding_spec(), union.padding_spec());
+        assert_eq!(union.element_word_range(), 0..0);
+        assert!(union.element_prefix_coords().is_empty());
+        assert!(union.element_slot_layout().is_empty());
+    }
+
+    /// Mirror of the above for an ELEMENT-ONLY registry: `M_bool = 0`, so the
+    /// boolean-region accessors must return 0 rather than underflow on
+    /// `M_bool − 7` (a release build masks the shift and hides it; debug
+    /// panics). No boolean PIOP runs, so 0 is also the honest answer.
+    #[test]
+    fn element_only_boolean_accessors_do_not_underflow() {
+        let reg = Registry::new(vec![elem_ty(3, 5), elem_ty(2, 3)], 4);
+        let union = UnionInstance::new(&reg, vec![7, 5]);
+        assert_eq!(union.num_boolean(), 0);
+        assert_eq!(union.m_bool(), 0);
+        assert_eq!(union.boolean_packed_len(), 0);
+        assert_eq!(union.boolean_col_log(), 0);
+        assert!(union.boolean_padding_spec().runs().is_empty());
+        assert!(union.has_element());
+    }
+
+    /// Mixed registry: heights, dense words, region ranges and the padding
+    /// run-list, hand-computed. Element slots need no special case — their
+    /// `k_log = kappa + 7` makes `used_cols` count element columns.
+    #[test]
+    fn mixed_class_bookkeeping_hand_computed() {
+        // Boolean: k_log 10 (8 word-cols, 6 used) and 9 (4 word-cols, 3 used).
+        // Element: kappa 3, k 5 → k_log 10, 8 word-cols, 5 used.
+        // nu = 3 → boolean areas 2^13 + 2^12 = 0x3000, M_bool = 14;
+        // element area 2^13, M_elem = 13, base 2^14, M = 15.
+        let reg = Registry::new(vec![ty(10, 700), ty(9, 300), elem_ty(3, 5)], 3);
+        let union = UnionInstance::new(&reg, vec![5, 3, 7]);
+        assert_eq!(
+            (union.m_total(), union.m_bool(), union.m_elem()),
+            (15, 14, 13)
+        );
+        assert_eq!(union.col_log(), 15 - 7 - 3); // 32 union word-columns
+        assert_eq!(union.boolean_col_log(), 14 - 7 - 3); // 16 boolean columns
+        assert_eq!(union.packed_len(), 1 << 8);
+        assert_eq!(union.boolean_packed_len(), 1 << 7);
+
+        // Element region: [2^14, 2^14 + 2^13) in bits = [128, 192) in words.
+        assert_eq!(union.element_word_range(), 128..192);
+        // Its frozen high WORD coords: M − M_elem = 2 bits of value
+        // element_base >> M_elem = 2^14 >> 13 = 0b10.
+        assert_eq!(
+            union.element_prefix_coords(),
+            vec![F128::ZERO, F128::ONE],
+            "prefix 0b10, LSB-first"
+        );
+        // One element slot filling the region, at region offset 0.
+        assert_eq!(
+            union.element_slot_layout(),
+            vec![ElementSlotLayout {
+                region_word_offset: 0,
+                kappa: 3,
+                n_t: 7
+            }]
+        );
+
+        // Heights: 32 columns. Slot A cols 0..8 (6 used @5), slot B cols 8..12
+        // (3 used @3), gap 12..16, element cols 16..24 (5 used @7), 24..32 gap.
+        #[rustfmt::skip]
+        let expected: Vec<u64> = vec![
+            5, 5, 5, 5, 5, 5, 0, 0,
+            3, 3, 3, 0,
+            0, 0, 0, 0,             // boolean subcube tail (the class gap)
+            7, 7, 7, 7, 7, 0, 0, 0, // element slot: 5 of 8 columns used
+            0, 0, 0, 0, 0, 0, 0, 0, // element region tail
+        ];
+        assert_eq!(union.jagged_heights(), expected);
+        assert_eq!(union.dense_words(), 6 * 5 + 3 * 3 + 5 * 7);
+        assert_eq!(
+            union.jagged_heights().iter().sum::<u64>(),
+            union.dense_words() as u64,
+            "unrank ≡ compaction map"
+        );
+        assert!(
+            !union.compaction_is_identity(),
+            "a class gap breaks identity"
+        );
+
+        // The padding run-list: an explicit zero run for the class gap, and
+        // the element slot's two runs exactly like a boolean slot's.
+        let runs = union.padding_spec();
+        let cols = |n_blocks, useful| crate::zerocheck::PaddingRun {
+            k_log: 7 + 3,
+            useful_bits_per_block: useful,
+            n_blocks,
+        };
+        assert_eq!(
+            runs.runs(),
+            &[
+                cols(6, 5 << 7),
+                cols(2, 0),
+                cols(3, 3 << 7),
+                cols(1, 0),
+                cols(4, 0),      // class gap [0x3000, 0x4000)
+                cols(5, 7 << 7), // element: 5 used columns at n = 7
+                cols(3, 0),
+            ]
+        );
+        assert_eq!(runs.covered_bits(), (1 << 14) + (1 << 13));
+
+        // The boolean spec stops at the boolean slots — no class gap, no
+        // element runs — and covers the boolean extent only.
+        let bool_runs = union.boolean_padding_spec();
+        assert_eq!(
+            bool_runs.runs(),
+            &[cols(6, 5 << 7), cols(2, 0), cols(3, 3 << 7), cols(1, 0)]
+        );
+        assert_eq!(bool_runs.covered_bits(), (1 << 13) + (1 << 12));
+        // Every useful interval of the boolean spec lies in the boolean region.
+        for (_, e) in bool_runs.useful_intervals() {
+            assert!(e <= 1usize << union.m_bool());
+        }
+        // …and the full spec's element intervals lie in the element region.
+        let elem_lo = 1usize << 14;
+        assert!(
+            runs.useful_intervals()
+                .iter()
+                .all(|&(s, e)| e <= 1usize << 14 || s >= elem_lo)
+        );
+    }
+
+    /// Two element slots of different widths pack area-descending inside the
+    /// region, each at its own aligned offset, and their region prefixes are
+    /// the subcube patterns the element lincheck freezes.
+    #[test]
+    fn two_element_slots_share_the_region() {
+        // Element kappa 3 (k_log 10, area 2^13) + kappa 2 (k_log 9, area 2^12)
+        // at nu = 3, no boolean types: M_elem = 14, base 0, M = 14.
+        let reg = Registry::new(vec![elem_ty(2, 3), elem_ty(3, 6)], 3);
+        let union = UnionInstance::new(&reg, vec![4, 6]);
+        assert_eq!(
+            (union.m_total(), union.m_bool(), union.m_elem()),
+            (14, 0, 14)
+        );
+        assert_eq!(union.element_word_range(), 0..(1 << 7));
+        assert!(
+            union.element_prefix_coords().is_empty(),
+            "the region IS the address space — nothing to freeze"
+        );
+        // Class-major + area-descending: kappa 3 first.
+        let layout = union.element_slot_layout();
+        assert_eq!(
+            layout,
+            vec![
+                ElementSlotLayout {
+                    region_word_offset: 0,
+                    kappa: 3,
+                    n_t: 4
+                },
+                ElementSlotLayout {
+                    region_word_offset: 64,
+                    kappa: 2,
+                    n_t: 6
+                },
+            ]
+        );
+        let nu = union.n_log();
+        // Region prefixes: slot 0 spans [0, 2^6) words (nu+kappa = 6) → q = 0;
+        // slot 1 spans [2^6, 2^6 + 2^5) → q = 2 over its own 2 prefix bits.
+        assert_eq!(layout[0].region_prefix(nu), 0);
+        assert_eq!(layout[1].region_prefix(nu), 2);
+        assert_eq!(layout[0].column_offset(nu), 0);
+        assert_eq!(layout[1].column_offset(nu), 8);
+        // Counts are in SLOT order: slot 0 (kappa 3, 6 used cols) at n = 4,
+        // slot 1 (kappa 2, 3 used cols) at n = 6.
+        #[rustfmt::skip]
+        assert_eq!(union.jagged_heights(), vec![
+            4, 4, 4, 4, 4, 4, 0, 0,
+            6, 6, 6, 0,
+            0, 0, 0, 0,
+        ]);
+        assert_eq!(union.dense_words(), 6 * 4 + 3 * 6);
+        // Boolean side is empty: no runs, no columns.
+        assert!(union.boolean_padding_spec().runs().is_empty());
+    }
+
+    /// `compact_witness` over a mixed registry: element words compact exactly
+    /// like boolean ones (the commitment does not care what a word means), and
+    /// the class gap vanishes along with the dummy rows and useless columns.
+    #[test]
+    fn compact_witness_carries_element_words() {
+        let reg = Registry::new(vec![ty(10, 512), elem_ty(3, 5)], 3);
+        let union = UnionInstance::new(&reg, vec![5, 7]);
+        // Boolean: 8 cols, 4 used; element: 8 cols, 5 used.
+        let mut z = vec![F128::ZERO; union.packed_len()];
+        let base = union.element_word_range().start;
+        for c in 0..4usize {
+            for i in 0..5usize {
+                z[(c << 3) + i] = F128 {
+                    lo: i as u64,
+                    hi: c as u64,
+                };
+            }
+        }
+        for c in 0..5usize {
+            for i in 0..7usize {
+                z[base + (c << 3) + i] = F128 {
+                    lo: i as u64,
+                    hi: 0x100 + c as u64,
+                };
+            }
+        }
+        let q = union.compact_witness(&z);
+        assert_eq!(union.dense_words(), 4 * 5 + 5 * 7);
+        let mut cursor = 0usize;
+        for (tag, cols, n_t) in [(0u64, 4usize, 5usize), (0x100, 5, 7)] {
+            for c in 0..cols {
+                for i in 0..n_t {
+                    assert_eq!(
+                        q[cursor],
+                        F128 {
+                            lo: i as u64,
+                            hi: tag + c as u64
+                        },
+                        "tag {tag:#x} col {c} word {i}"
+                    );
+                    cursor += 1;
+                }
+            }
+        }
+        assert_eq!(cursor, union.dense_words());
+        assert!(q[cursor..].iter().all(|w| *w == F128::ZERO), "pad tail");
+
+        // unrank ≡ compaction across the class boundary too.
+        let params = crate::pcs::jagged::JaggedParams::from_heights(
+            &union.jagged_heights(),
+            union.n_log(),
+            union.dense_m() - 7,
+        );
+        for e in 0..union.dense_words() as u64 {
+            let (row, col) = params.unrank(e);
+            assert_eq!(q[e as usize], z[(col << 3) + row], "unrank at {e}");
+        }
+    }
+
+    /// `slot_dests` carves the element slot's block too, and `zero_gaps`
+    /// zeroes the class gap — so an element driver writing its own block in
+    /// place leaves the region's gaps honestly zero, which the element
+    /// zerocheck relies on (it sums over the whole region).
+    #[test]
+    fn slot_dests_cover_the_element_slot_and_zero_the_class_gap() {
+        let reg = Registry::new(vec![ty(10, 700), ty(9, 300), elem_ty(3, 5)], 3);
+        let union = UnionInstance::new(&reg, vec![8, 8, 8]);
+        assert_eq!(union.packed_len(), 1 << 8);
+        assert_eq!(union.slot_word_range(0), 0..64);
+        assert_eq!(union.slot_word_range(1), 64..96);
+        assert_eq!(union.slot_word_range(2), 128..192);
+
+        let poison = F128 { lo: !0, hi: !0 };
+        let (mut z, mut a, mut b) = (
+            vec![poison; 1 << 8],
+            vec![poison; 1 << 8],
+            vec![poison; 1 << 8],
+        );
+        for buf in [&mut z, &mut a, &mut b] {
+            union.zero_gaps(buf);
+        }
+        // Gaps: [96, 128) (class gap) and [192, 256) (region tail).
+        for buf in [&z, &a, &b] {
+            assert!(buf[96..128].iter().all(|w| *w == F128::ZERO), "class gap");
+            assert!(buf[192..].iter().all(|w| *w == F128::ZERO), "region tail");
+        }
+        let dests = union.slot_dests(&mut z, &mut a, &mut b, false);
+        assert_eq!(dests.len(), 3);
+        assert_eq!(dests[2].z.len(), 64, "element slot block is 2^(nu+kappa)");
+        // A driver writing every word of its block leaves no poison behind.
+        for d in dests {
+            d.z.fill(F128::ZERO);
+            d.a.fill(F128::ZERO);
+            d.b.fill(F128::ZERO);
+        }
+        for buf in [&z, &a, &b] {
+            assert!(buf.iter().all(|w| *w == F128::ZERO));
+        }
+    }
+
+    /// Boolean claim points gain exactly `M − M_bool` frozen-ZERO high
+    /// coordinates and are otherwise the boolean-region formulas — so the
+    /// resulting union point evaluates the witness on the boolean region only.
+    #[test]
+    fn boolean_claim_points_freeze_the_high_coords() {
+        let reg = Registry::new(vec![ty(10, 700), ty(9, 300), elem_ty(3, 5)], 3);
+        let union = UnionInstance::new(&reg, vec![5, 3, 7]);
+        let (m, m_bool) = (union.m_total(), union.m_bool());
+        assert_eq!((m, m_bool), (15, 14));
+        let frozen = m - m_bool;
+        let mut rng = Rng::new(0xE1E_C7);
+
+        let mlv = rng.f128_vec(m_bool - K_SKIP);
+        let x_ab = union.x_ab_from_mlv(rng.next_f128(), &mlv);
+        assert_eq!(x_ab.x_outer.len(), union.n_log());
+        assert_eq!(
+            x_ab.x_inner_rest.len(),
+            1 + union.boolean_col_log(),
+            "the semantic point stays in boolean-region coordinates"
+        );
+
+        let r_inner_rest = rng.f128_vec(1 + union.boolean_col_log());
+        let ab = union.ab_claim_point(rng.next_f128(), &r_inner_rest, &x_ab.x_outer);
+        let full = ab.x_inner_rest.len() + ab.x_outer.len();
+        assert_eq!(full, m - K_SKIP, "the point must address the UNION space");
+        assert!(
+            ab.x_outer[ab.x_outer.len() - frozen..]
+                .iter()
+                .all(|c| *c == F128::ZERO),
+            "high coords frozen to zero"
+        );
+        assert_eq!(
+            &ab.x_outer[..ab.x_outer.len() - frozen],
+            &[x_ab.x_outer.as_slice(), &r_inner_rest[1..]].concat()[..],
+            "the boolean part is unchanged"
+        );
+
+        let r_rest = rng.f128_vec(m_bool - K_SKIP);
+        let c = union.c_claim_point(rng.next_f128(), &r_rest);
+        assert_eq!(c.x_inner_rest.len() + c.x_outer.len(), m - K_SKIP);
+        assert_eq!(&c.x_outer[..r_rest.len() - 1], &r_rest[1..]);
+        assert!(
+            c.x_outer[r_rest.len() - 1..]
+                .iter()
+                .all(|x| *x == F128::ZERO)
         );
     }
 }

@@ -865,7 +865,9 @@ mod tests {
                 best_ntt = best_ntt.min(t.elapsed().as_secs_f64() * 1e3);
             }
             // Merkle over the (encoded) codeword: n_positions leaves, each
-            // num_ntts F128 wide.
+            // num_ntts F128 wide. Timed under the default hash (SHA-256) — this
+            // probe compares lane counts, not hashes, and has no `PcsParams` in
+            // scope; use `HashKind::Blake3` here to re-measure the other one.
             let bytes: &[u8] =
                 unsafe { core::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 16) };
             let mut best_merkle = f64::INFINITY;

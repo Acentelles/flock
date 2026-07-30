@@ -231,6 +231,9 @@ impl MixedSetup {
             profile,
             // Integer-lane commit — see `UnionInstance::commit_lanes`.
             num_lanes: union.commit_lanes(6),
+            // Default (SHA-256), matching the single-type setups. Both sides
+            // derive this the same way, so it stays statement-derived; make it
+            // a parameter here if the Mixed path ever needs BLAKE3.
             merkle_hash: Default::default(),
         }
     }

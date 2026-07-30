@@ -861,7 +861,13 @@ pub fn prove_batched<C: Challenger>(
     // the index widened. That drops the `O(N)` `s_id` build outright, and turns
     // `s_σ` from a random-access gather through that table into a linear map.
     // (`tag_matches_basis_expansion` pins this against `s_id_value`.)
-    debug_assert!(mu <= 64, "s_id-as-index needs μ ≤ 64");
+    //
+    // A hard assert, not a debug one: past μ = 64 the `tag` below silently
+    // stops being `s_id`, so a release build would produce a proof of the wrong
+    // statement rather than fail. (Unreachable in practice — `2^μ` field
+    // elements would not fit memory — which is exactly why it must not be the
+    // check that is compiled out.)
+    assert!(mu <= 64, "s_id-as-index needs μ ≤ 64");
     let tag = |i: usize| F128::new(i as u64, 0);
     let s_sig_vec: Vec<F128> = sigma
         .par_iter()
@@ -1542,6 +1548,90 @@ mod tests {
             verify(mu, &trimmed, &mut ch),
             Err(VerifyError::MalformedProof)
         );
+    }
+
+    /// **Transcript tamper matrix.** Every field of a batched proof is bound:
+    /// flipping any one of them must be REJECTED (never accepted, never
+    /// panicked on) by the σ-aware verifier — the only one callers may use.
+    ///
+    /// The single exception is `s_sigma_eval`, which that verifier recomputes
+    /// from its own σ and therefore ignores; the assertion below pins that
+    /// meaning (and that the returned claim carries the RECOMPUTED value, not
+    /// the proof's), which is the whole difference from the trusting variant.
+    #[test]
+    fn batched_rejects_transcript_tampering() {
+        const DOMAIN_TEST: &[u8] = b"prod-gkr-tamper";
+        let mu = 5;
+        let (f, g, sigma) = honest_instance(mu, 0x7A47);
+        let mut chp = FsChallenger::new(DOMAIN_TEST);
+        bind(&mut chp, &f, &g, &sigma);
+        let (proof, claim) = prove_batched(&f, &g, &sigma, &mut chp);
+
+        let check = |p: &ProductGkrBatchedProof| {
+            let mut ch = FsChallenger::new(DOMAIN_TEST);
+            bind(&mut ch, &f, &g, &sigma);
+            verify_batched_with_sigma(mu, p, &sigma, &mut ch)
+        };
+        assert!(check(&proof).is_ok(), "the honest proof must verify");
+
+        // Every scalar of the transcript, one at a time.
+        let mut mutations: Vec<(String, ProductGkrBatchedProof)> = Vec::new();
+        let mut push = |name: String, p: ProductGkrBatchedProof| mutations.push((name, p));
+        for (name, sel) in [
+            ("top_lhs", 0usize),
+            ("top_rhs", 1),
+            ("both tops", 2),
+            ("f_eval", 3),
+            ("g_eval", 4),
+        ] {
+            let mut p = proof.clone();
+            match sel {
+                0 => p.top_lhs += F128::ONE,
+                1 => p.top_rhs += F128::ONE,
+                2 => {
+                    p.top_lhs += F128::ONE;
+                    p.top_rhs += F128::ONE;
+                }
+                3 => p.f_eval += F128::ONE,
+                _ => p.g_eval += F128::ONE,
+            }
+            push(name.to_string(), p);
+        }
+        for k in 0..mu {
+            for (name, sel) in [("vl0", 0usize), ("vl1", 1), ("vr0", 2), ("vr1", 3)] {
+                let mut p = proof.clone();
+                let layer = &mut p.layers[k];
+                match sel {
+                    0 => layer.vl0 += F128::ONE,
+                    1 => layer.vl1 += F128::ONE,
+                    2 => layer.vr0 += F128::ONE,
+                    _ => layer.vr1 += F128::ONE,
+                }
+                push(format!("layer {k} {name}"), p);
+            }
+            for i in 0..proof.layers[k].rounds.len() {
+                for half in 0..2 {
+                    let mut p = proof.clone();
+                    let r = &mut p.layers[k].rounds[i];
+                    if half == 0 {
+                        r.0 += F128::ONE;
+                    } else {
+                        r.1 += F128::ONE;
+                    }
+                    push(format!("layer {k} round {i}.{half}"), p);
+                }
+            }
+        }
+        for (name, p) in &mutations {
+            assert!(check(p).is_err(), "tampered {name} verified");
+        }
+
+        // `s_sigma_eval` is verifier-recomputed under a known σ, so the field is
+        // inert there — and the claim reports the honest value.
+        let mut inert = proof.clone();
+        inert.s_sigma_eval += F128::ONE;
+        let out = check(&inert).expect("σ-aware verify ignores the proof's s_σ(ρ)");
+        assert_eq!(out.s_sigma_eval, claim.s_sigma_eval);
     }
 
     /// `verify_batched` reads `s_σ(ρ)` out of the proof, so its input check

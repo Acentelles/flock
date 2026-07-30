@@ -19,6 +19,7 @@
 
 pub mod bits;
 pub mod challenger;
+pub mod element_r1cs;
 pub mod field;
 pub mod hash;
 pub mod lincheck;
