@@ -125,6 +125,7 @@ fn union_pcs_params(union: &UnionInstance<'_>) -> PcsParams {
         // Integer-lane commit: skip the encode + hash of the whole zero lanes
         // the power-of-two rounding of the dense stack leaves behind.
         num_lanes: union.commit_lanes(6),
+        merkle_hash: Default::default(),
     }
 }
 

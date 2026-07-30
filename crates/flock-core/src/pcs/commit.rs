@@ -15,7 +15,7 @@
 //! Merkle leaf is **one** F_{2^128} element = 16 bytes.
 
 use crate::field::F128;
-use crate::merkle::{self, Hash};
+use crate::merkle::{self, Hash, HashKind};
 use crate::ntt::AdditiveNttF128;
 use crate::pcs::pack::LOG_PACKING;
 use serde::{Deserialize, Serialize};
@@ -54,6 +54,14 @@ pub struct PcsParams {
     /// `[t, 2^log_batch_size)` are definitionally zero on the opening side.
     #[serde(default)]
     pub num_lanes: Option<usize>,
+    /// Hash backing the Merkle commitment. Defaults to SHA-256, so params
+    /// serialized before this option existed deserialize unchanged.
+    ///
+    /// The verifier must be given the same value the prover committed under —
+    /// it is carried in [`Commitment`] alongside the root for exactly that
+    /// reason.
+    #[serde(default)]
+    pub merkle_hash: HashKind,
 }
 
 impl PcsParams {
@@ -105,6 +113,37 @@ impl PcsParams {
     /// Merkle leaf size in bytes = `num_ntts() * 16`.
     pub fn leaf_size_bytes(&self) -> usize {
         self.num_ntts() * core::mem::size_of::<F128>()
+    }
+
+    /// Ligerito prover config for these params.
+    ///
+    /// Prefer this over calling [`ligerito::prover_config_for`] directly: the
+    /// embedded security config carries its own `hash` field, but the Merkle
+    /// hash the opening must use is the one the *commitment* was built under.
+    /// This stamps `self.merkle_hash` over it, so the L0 tree and every
+    /// recursive level cannot end up on different hashes.
+    ///
+    /// [`ligerito::prover_config_for`]: crate::pcs::ligerito::prover_config_for
+    pub fn ligerito_prover_config(&self) -> Result<crate::pcs::ligerito::ProverConfig, String> {
+        let mut cfg = crate::pcs::ligerito::prover_config_for(
+            self.log_msg_len(),
+            self.log_batch_size,
+            self.profile,
+        )?;
+        cfg.merkle_hash = self.merkle_hash;
+        Ok(cfg)
+    }
+
+    /// Verifier-side counterpart to [`Self::ligerito_prover_config`], stamped
+    /// with the same Merkle hash for the same reason.
+    pub fn ligerito_verifier_config(&self) -> Result<crate::pcs::ligerito::VerifierConfig, String> {
+        let mut cfg = crate::pcs::ligerito::verifier_config_for(
+            self.log_msg_len(),
+            self.log_batch_size,
+            self.profile,
+        )?;
+        cfg.merkle_hash = self.merkle_hash;
+        Ok(cfg)
     }
 
     fn validate(&self) {
@@ -413,7 +452,7 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
     // Initial tree: one leaf per codeword position, each containing the
     // row-batch lanes (num_ntts F_{2^128} values = 2^log_batch_size). This is
     // Ligerito's L0 commitment.
-    let merkle_tree = merkle::merkle_tree(codeword_bytes, params.n_leaves());
+    let merkle_tree = merkle::merkle_tree(codeword_bytes, params.n_leaves(), params.merkle_hash);
     let root = *merkle_tree.last().expect("merkle tree non-empty");
     if timing {
         eprintln!(
@@ -526,6 +565,35 @@ mod tests {
         }
     }
 
+    /// The Ligerito configs derived from `PcsParams` must carry the params'
+    /// Merkle hash, not the embedded security config's `hash` field. If they
+    /// diverge, the L0 commitment and the recursive levels are built under
+    /// different hashes and nothing verifies — silently, and only at the
+    /// geometries that reach recursion.
+    #[test]
+    fn ligerito_configs_inherit_the_params_merkle_hash() {
+        let mut params = default_params(22);
+        params.log_batch_size = 6;
+
+        assert_eq!(params.merkle_hash, HashKind::Sha256);
+        assert_eq!(
+            params.ligerito_prover_config().unwrap().merkle_hash,
+            HashKind::Sha256
+        );
+
+        params.merkle_hash = HashKind::Blake3;
+        assert_eq!(
+            params.ligerito_prover_config().unwrap().merkle_hash,
+            HashKind::Blake3,
+            "prover config must follow PcsParams, not the embedded TOML"
+        );
+        assert_eq!(
+            params.ligerito_verifier_config().unwrap().merkle_hash,
+            HashKind::Blake3,
+            "verifier config must follow PcsParams, not the embedded TOML"
+        );
+    }
+
     fn default_params(m: usize) -> PcsParams {
         PcsParams {
             m,
@@ -533,6 +601,7 @@ mod tests {
             log_batch_size: 1,
             profile: Default::default(),
             num_lanes: None,
+            merkle_hash: Default::default(),
         }
     }
 
@@ -551,6 +620,7 @@ mod tests {
                 log_batch_size,
                 profile: Default::default(),
                 num_lanes: None,
+                merkle_hash: Default::default(),
             };
             let z = rng.bits(1 << m);
             let z_packed = super::super::pack::pack_witness(&z, m);
@@ -570,9 +640,10 @@ mod tests {
             let oracle_bytes: &[u8] = unsafe {
                 core::slice::from_raw_parts(oracle.as_ptr() as *const u8, oracle.len() * 16)
             };
-            let oracle_root = *crate::merkle::merkle_tree(oracle_bytes, params.n_leaves())
-                .last()
-                .unwrap();
+            let oracle_root =
+                *crate::merkle::merkle_tree(oracle_bytes, params.n_leaves(), params.merkle_hash)
+                    .last()
+                    .unwrap();
             assert_eq!(
                 commitment.root, oracle_root,
                 "root mismatch at m={m} r={log_inv_rate}"
@@ -596,6 +667,7 @@ mod tests {
                 log_batch_size,
                 profile: Default::default(),
                 num_lanes: None,
+                merkle_hash: Default::default(),
             };
             let explicit = PcsParams {
                 num_lanes: Some(full),
@@ -632,6 +704,7 @@ mod tests {
                     log_batch_size,
                     profile: Default::default(),
                     num_lanes: Some(t),
+                    merkle_hash: Default::default(),
                 };
                 let full_params = PcsParams {
                     num_lanes: None,
@@ -681,7 +754,7 @@ mod tests {
                         pd_t.codeword.len() * 16,
                     )
                 };
-                let root = *crate::merkle::merkle_tree(bytes, t_params.n_leaves())
+                let root = *crate::merkle::merkle_tree(bytes, t_params.n_leaves(), t_params.merkle_hash)
                     .last()
                     .unwrap();
                 assert_eq!(root, _c_t.root, "root must be over t-wide leaves");
@@ -739,6 +812,7 @@ mod tests {
                     log_batch_size,
                     profile: Default::default(),
                     num_lanes: Some(t),
+                    merkle_hash: Default::default(),
                 };
                 // Reference: the plain t-lane commit of the compacted message.
                 let mut extract = vec![F128::ZERO; t * d];
@@ -796,7 +870,7 @@ mod tests {
             let mut best_merkle = f64::INFINITY;
             for _ in 0..n_runs {
                 let t = Instant::now();
-                let tree = merkle::merkle_tree(bytes, n_positions);
+                let tree = merkle::merkle_tree(bytes, n_positions, HashKind::default());
                 best_merkle = best_merkle.min(t.elapsed().as_secs_f64() * 1e3);
                 std::hint::black_box(tree.last());
             }

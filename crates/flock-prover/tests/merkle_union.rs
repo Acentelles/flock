@@ -86,6 +86,7 @@ impl Setup {
             log_batch_size: 6,
             profile: LigeritoProfile::Fast,
             num_lanes: union.commit_lanes(6),
+            merkle_hash: Default::default(),
         }
     }
 }

@@ -1420,6 +1420,7 @@ mod tests {
                 log_batch_size: 6,
                 profile: Default::default(),
                 num_lanes: None,
+                merkle_hash: Default::default(),
             },
         };
         let sample = |union: &UnionInstance<'_>, root: u8| {

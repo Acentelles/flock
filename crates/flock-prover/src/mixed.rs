@@ -231,6 +231,7 @@ impl MixedSetup {
             profile,
             // Integer-lane commit — see `UnionInstance::commit_lanes`.
             num_lanes: union.commit_lanes(6),
+            merkle_hash: Default::default(),
         }
     }
 
@@ -383,6 +384,7 @@ impl MerkleMixedSetup {
             log_batch_size: 6,
             profile,
             num_lanes: union.commit_lanes(6),
+            merkle_hash: Default::default(),
         }
     }
 

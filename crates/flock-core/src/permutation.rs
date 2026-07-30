@@ -313,6 +313,7 @@ fn pcs_params(num_vars: usize) -> PcsParams {
         log_batch_size: PCS_LOG_BATCH_SIZE,
         profile: Default::default(),
         num_lanes: None,
+        merkle_hash: Default::default(),
     }
 }
 
