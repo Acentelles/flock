@@ -784,20 +784,47 @@ pub struct JaggedAssistProof {
     pub rounds: Vec<(F128, F128)>,
 }
 
+/// The distinct boundary pairs `(t_{y-1}, t_y)` in column order, each tagged
+/// with the number of original columns it covers. Equal adjacent pairs are the
+/// zero-height columns (including the zero-padded tail). Depends on
+/// `col_prefix_sums` alone, so a batch of statements over the same params
+/// shares one list — and the block tree keyed off it ([`AssistBlocks`]).
+fn assist_boundaries(params: &JaggedParams) -> Vec<(u64, u64, u32)> {
+    let n_col = params.col_prefix_sums.len() - 1;
+    let mut out: Vec<(u64, u64, u32)> = Vec::with_capacity(n_col);
+    for y in 0..n_col {
+        let (t_c, t_next) = (params.col_prefix_sums[y], params.col_prefix_sums[y + 1]);
+        match out.last_mut() {
+            Some((c, d, run)) if *c == t_c && *d == t_next => *run += 1,
+            _ => out.push((t_c, t_next, 1)),
+        }
+    }
+    out
+}
+
 /// The assist's per-column terms `(w_y, t_{y-1}, t_y)`, with runs of columns
 /// sharing the same `(t_{y-1}, t_y)` pair — zero-height columns, including the
 /// zero-padded tail — collapsed into one term of summed weight `Σ eq(z_col, y)`.
 /// Pure regrouping of identical summands: transcript-invariant.
 fn assist_columns(params: &JaggedParams, z_col: &[F128]) -> Vec<(F128, u64, u64)> {
+    assist_columns_at(&assist_boundaries(params), z_col)
+}
+
+/// [`assist_columns`] against a prebuilt boundary list: the same summands in
+/// the same order, just with the run structure read off instead of rediscovered.
+fn assist_columns_at(bounds: &[(u64, u64, u32)], z_col: &[F128]) -> Vec<(F128, u64, u64)> {
     let eq_col = build_eq_table(z_col);
-    let mut out: Vec<(F128, u64, u64)> = Vec::with_capacity(eq_col.len());
-    for (y, &w) in eq_col.iter().enumerate() {
-        let (t_c, t_next) = (params.col_prefix_sums[y], params.col_prefix_sums[y + 1]);
-        match out.last_mut() {
-            Some((w_acc, c, d)) if *c == t_c && *d == t_next => *w_acc += w,
-            _ => out.push((w, t_c, t_next)),
+    let mut out: Vec<(F128, u64, u64)> = Vec::with_capacity(bounds.len());
+    let mut y = 0usize;
+    for &(t_c, t_next, run) in bounds {
+        let mut w = F128::ZERO;
+        for &e in &eq_col[y..y + run as usize] {
+            w += e;
         }
+        y += run as usize;
+        out.push((w, t_c, t_next));
     }
+    debug_assert_eq!(y, eq_col.len());
     out
 }
 
@@ -805,7 +832,10 @@ fn assist_columns(params: &JaggedParams, z_col: &[F128]) -> Vec<(F128, u64, u64)
 /// `W(ρ) = Σ_y w_y · Π_ℓ eq(t_{y-1}[ℓ], ρ_{c,ℓ}) · eq(t_y[ℓ], ρ_{d,ℓ})`, with
 /// `ρ` in the interleaved order `(c_0, d_0, c_1, d_1, …)`. `eq(b, r)` at a
 /// boolean `b` is `r` or `1 + r` (char 2), so this is `2(m+1)` multiplications
-/// per distinct column — the verifier's only `2^k`-scale work.
+/// per distinct column. Superseded in production by [`assist_w_at_blocked`],
+/// which spends one multiply per *run* of columns; retained as that form's
+/// correctness reference (`blocked_w_at_matches_dense`).
+#[cfg(test)]
 fn assist_w_at(cols: &[(F128, u64, u64)], rho: &[F128], m: usize) -> F128 {
     debug_assert_eq!(rho.len(), 2 * (m + 1));
     let mut acc = F128::ZERO;
@@ -857,17 +887,17 @@ fn assist_sparse_transitions() -> [[[(usize, usize); 2]; 4]; 4] {
 }
 
 /// All columns' suffix vectors `S_y[ℓ] = M_ℓ(bits_y)···M_m(bits_y)·e_S`, laid
-/// out **layer-major** (`rows[ℓ·n_cols + y]`) so each sumcheck round streams
-/// one contiguous row. Built with one parallel pass per layer, `m → 0`; a
-/// column costs 8 multiplications per layer (two surviving transitions per
-/// state). Row 0's `INITIAL` entries are the columns' full `ĝ` values.
+/// out **layer-major** (`rows[ℓ·n_cols + y]`), one column per slot. Superseded
+/// in production by the block-collapsed [`assist_suffix_rows_blocked`], which
+/// stores one slot per *run* of columns agreeing above `ℓ`; retained as that
+/// form's correctness reference (`blocked_suffix_rows_match_dense`).
+#[cfg(test)]
 fn assist_suffix_rows(
     cols: &[(F128, u64, u64)],
     eq4s: &[[F128; 4]],
     sparse: &[[[(usize, usize); 2]; 4]; 4],
     m: usize,
 ) -> Vec<[F128; 4]> {
-    use rayon::prelude::*;
     let n_cols = cols.len();
     let mut rows = vec![[F128::ZERO; 4]; (m + 2) * n_cols];
     for seed in &mut rows[(m + 1) * n_cols..] {
@@ -878,22 +908,350 @@ fn assist_suffix_rows(
         let dst = &mut head[layer * n_cols..];
         let src = &tail[..n_cols];
         let eq4 = &eq4s[layer];
-        dst.par_chunks_mut(ASSIST_CHUNK)
-            .zip(src.par_chunks(ASSIST_CHUNK))
-            .zip(cols.par_chunks(ASSIST_CHUNK))
-            .for_each(|((dc, sc), cc)| {
-                for ((dv, sv), &(_, t_c, t_next)) in dc.iter_mut().zip(sc).zip(cc) {
-                    let cd = ((t_c >> layer) & 1) as usize + 2 * ((t_next >> layer) & 1) as usize;
-                    let rows_cd = &sparse[cd];
-                    for (s, slot) in dv.iter_mut().enumerate() {
-                        let (i0, o0) = rows_cd[s][0];
-                        let (i1, o1) = rows_cd[s][1];
-                        *slot = eq4[i0] * sv[o0] + eq4[i1] * sv[o1];
-                    }
-                }
-            });
+        for ((dv, sv), &(_, t_c, t_next)) in dst.iter_mut().zip(src).zip(cols) {
+            let cd = ((t_c >> layer) & 1) as usize + 2 * ((t_next >> layer) & 1) as usize;
+            let rows_cd = &sparse[cd];
+            for (s, slot) in dv.iter_mut().enumerate() {
+                let (i0, o0) = rows_cd[s][0];
+                let (i1, o1) = rows_cd[s][1];
+                *slot = eq4[i0] * sv[o0] + eq4[i1] * sv[o1];
+            }
+        }
     }
     rows
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// The assist's block tree: the run structure that collapses BOTH directions
+// of its layer recursion from per-column to per-run work.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// The laminar family of runs the assist's layer recursion is constant on: for
+/// each layer `ℓ`, the maximal runs of consecutive (deduped) columns whose
+/// boundary pair `(t_{y-1}, t_y)` agrees on every bit `≥ ℓ`.
+///
+/// Both quantities the recursion touches at layer `ℓ` are functions of those
+/// bits alone, hence constant on such a run:
+///
+/// - the transition tag `cd_ℓ = bit_ℓ(t_{y-1}) + 2·bit_ℓ(t_y)`, which selects
+///   the layer matrix, and
+/// - the suffix vector `S[ℓ] = M_ℓ···M_m·e_S`.
+///
+/// A layer-`ℓ+1` run is a union of layer-`ℓ` runs, so the runs form a tree, and
+/// the recursion collapses in both directions: the suffix vectors DESCEND it
+/// ([`assist_suffix_rows_blocked`], 8 multiplies per block instead of per
+/// column) and the running column weights ASCEND it ([`fold_partials`], one
+/// multiply per block where the dense form spent one per column per layer).
+///
+/// The registry's shape is `k_t` consecutive columns of height `n_t`, so inside
+/// a run the pair advances by `n_t` and its bits above `ℓ` change only every
+/// `2^ℓ/n_t` columns: `Σ_ℓ blocks(ℓ) = O(n_cols·log n_t + m)` against the dense
+/// `(m + 2)·n_cols`. Keyed off `col_prefix_sums` alone, so all `128·K`
+/// statements of a Frobenius batch share one tree — only their weights differ.
+struct AssistBlocks {
+    /// `starts[ℓ]`: ascending block start indices into the deduped columns.
+    /// Layer 0 is one block per column (adjacent equal pairs are already merged
+    /// by [`assist_boundaries`]); layer `m + 1` is a single block, every pair
+    /// being below `2^{m+1}`.
+    starts: Vec<Vec<u32>>,
+    /// `parent[ℓ][b]`: the layer-`ℓ+1` block containing layer-`ℓ` block `b`.
+    /// Non-decreasing in `b`, and `parent[ℓ][b] ≤ b`.
+    parent: Vec<Vec<u32>>,
+    /// `first_child[ℓ][B]`: the first layer-`ℓ` block inside layer-`ℓ+1` block
+    /// `B` — `parent[ℓ]` inverted. Length `blocks(ℓ+1)`; a block's children are
+    /// the contiguous range up to the next entry, which is what lets
+    /// [`fold_partials`] write each parent independently.
+    first_child: Vec<Vec<u32>>,
+    /// `cd[ℓ][b]`: the block's constant transition tag.
+    cd: Vec<Vec<u8>>,
+    /// Flat-array base of each layer's blocks; `off[m + 2]` is the total.
+    off: Vec<usize>,
+    n_cols: usize,
+}
+
+impl AssistBlocks {
+    fn new(bounds: &[(u64, u64, u32)], m: usize) -> Self {
+        let n_cols = bounds.len();
+        let mut starts: Vec<Vec<u32>> = Vec::with_capacity(m + 2);
+        let mut parent: Vec<Vec<u32>> = Vec::with_capacity(m + 1);
+        let mut first_child: Vec<Vec<u32>> = Vec::with_capacity(m + 1);
+        let mut cd: Vec<Vec<u8>> = Vec::with_capacity(m + 1);
+        starts.push((0..n_cols as u32).collect());
+        for layer in 0..=m {
+            let cur = &starts[layer];
+            let mut next: Vec<u32> = Vec::new();
+            let mut kids: Vec<u32> = Vec::new();
+            let mut par: Vec<u32> = Vec::with_capacity(cur.len());
+            let mut tag: Vec<u8> = Vec::with_capacity(cur.len());
+            let mut last: Option<(u64, u64)> = None;
+            for (b, &s) in cur.iter().enumerate() {
+                // Any column of the block represents it: the block is defined
+                // by agreement above `layer`, and `cd` reads bit `layer`.
+                let (t_c, t_next, _) = bounds[s as usize];
+                tag.push(((t_c >> layer) & 1) as u8 + 2 * (((t_next >> layer) & 1) as u8));
+                let hi = (t_c >> (layer + 1), t_next >> (layer + 1));
+                if last != Some(hi) {
+                    next.push(s);
+                    kids.push(b as u32);
+                    last = Some(hi);
+                }
+                par.push(next.len() as u32 - 1);
+            }
+            starts.push(next);
+            parent.push(par);
+            first_child.push(kids);
+            cd.push(tag);
+        }
+        debug_assert_eq!(starts[m + 1].len(), 1, "all pairs are below 2^(m+1)");
+        let mut off = Vec::with_capacity(m + 3);
+        let mut acc = 0usize;
+        for s in &starts {
+            off.push(acc);
+            acc += s.len();
+        }
+        off.push(acc);
+        AssistBlocks {
+            starts,
+            parent,
+            first_child,
+            cd,
+            off,
+            n_cols,
+        }
+    }
+
+    #[inline]
+    fn n_blocks(&self, layer: usize) -> usize {
+        self.starts[layer].len()
+    }
+
+    /// Total slots across all layers — the blocked suffix store's size, against
+    /// the dense `(m + 2)·n_cols`.
+    #[inline]
+    fn total(&self) -> usize {
+        self.off[self.off.len() - 1]
+    }
+
+    /// Layer-0 partials: each block's summed column weight. (Layer 0 blocks are
+    /// singletons, but summing the range keeps this independent of that.)
+    fn seed(&self, cols: &[(F128, u64, u64)]) -> Vec<F128> {
+        debug_assert_eq!(cols.len(), self.n_cols);
+        let s = &self.starts[0];
+        (0..s.len())
+            .map(|b| {
+                let lo = s[b] as usize;
+                let hi = s.get(b + 1).map_or(self.n_cols, |&x| x as usize);
+                cols[lo..hi]
+                    .iter()
+                    .fold(F128::ZERO, |acc, &(w, _, _)| acc + w)
+            })
+            .collect()
+    }
+}
+
+/// The suffix vectors `S[ℓ]`, one slot per block per layer, flat in the block
+/// tree's layout. Descends the tree: a block's vector comes from its parent's at
+/// 8 multiplications (two surviving transitions per state), so the build costs
+/// `Σ_ℓ 8·blocks(ℓ)` against the dense `8·(m + 2)·n_cols`. Layer 0's `INITIAL`
+/// entries are still the columns' full `ĝ` values.
+///
+/// `par` parallelizes within a layer — for the few-statement callers whose
+/// statement-level dispatch can't occupy the pool.
+fn assist_suffix_rows_blocked(
+    blocks: &AssistBlocks,
+    eq4s: &[[F128; 4]],
+    sparse: &[[[(usize, usize); 2]; 4]; 4],
+    m: usize,
+    par: bool,
+) -> Vec<[F128; 4]> {
+    use rayon::prelude::*;
+    #[inline]
+    fn step(
+        dst: &mut [F128; 4],
+        src: &[F128; 4],
+        cd: u8,
+        eq4: &[F128; 4],
+        sparse: &[[[(usize, usize); 2]; 4]; 4],
+    ) {
+        let rows_cd = &sparse[cd as usize];
+        for (s, slot) in dst.iter_mut().enumerate() {
+            let (i0, o0) = rows_cd[s][0];
+            let (i1, o1) = rows_cd[s][1];
+            *slot = eq4[i0] * src[o0] + eq4[i1] * src[o1];
+        }
+    }
+
+    let mut rows = vec![[F128::ZERO; 4]; blocks.total()];
+    rows[blocks.off[m + 1]][STATE_SUCCESS] = F128::ONE;
+    for layer in (0..=m).rev() {
+        let pbase = blocks.off[layer + 1];
+        let (head, tail) = rows.split_at_mut(pbase);
+        let dst = &mut head[blocks.off[layer]..];
+        let src = &*tail;
+        let eq4 = &eq4s[layer];
+        let (parent, cd) = (&blocks.parent[layer], &blocks.cd[layer]);
+        if par {
+            dst.par_chunks_mut(ASSIST_CHUNK)
+                .zip(parent.par_chunks(ASSIST_CHUNK))
+                .zip(cd.par_chunks(ASSIST_CHUNK))
+                .for_each(|((dc, pc), cc)| {
+                    for ((slot, &p), &t) in dc.iter_mut().zip(pc).zip(cc) {
+                        step(slot, &src[p as usize], t, eq4, sparse);
+                    }
+                });
+        } else {
+            for ((slot, &p), &t) in dst.iter_mut().zip(parent).zip(cd) {
+                step(slot, &src[p as usize], t, eq4, sparse);
+            }
+        }
+    }
+    rows
+}
+
+/// Ascend the block tree one layer, folding the layer's two challenges into the
+/// weight partials: `p[ℓ+1][B] = Σ_{b ⊆ B} ch4[cd_ℓ(b)]·p[ℓ][b]`.
+///
+/// This is the entirety of the dense form's running-weight fold
+/// (`we_y ·= e_c·e_d`, one multiply per column per layer): `cd_ℓ` is constant on
+/// a layer-`ℓ` block, so the factor pulls out of the block's sum by
+/// distributivity — one multiply per block, exact. Written as a gather over each
+/// parent's contiguous child range, so `par` can hand parents to separate
+/// threads; `out` is scratch, swapped into `p` on the way out.
+fn fold_partials(
+    p: &mut Vec<F128>,
+    out: &mut Vec<F128>,
+    blocks: &AssistBlocks,
+    layer: usize,
+    ch4: &[F128; 4],
+    par: bool,
+) {
+    use rayon::prelude::*;
+    let (cd, kids) = (&blocks.cd[layer], &blocks.first_child[layer]);
+    let n_child = blocks.n_blocks(layer);
+    debug_assert_eq!(p.len(), n_child);
+    out.clear();
+    out.resize(kids.len(), F128::ZERO);
+    let gather = |b: usize, slot: &mut F128| {
+        let lo = kids[b] as usize;
+        let hi = kids.get(b + 1).map_or(n_child, |&x| x as usize);
+        *slot = (lo..hi).fold(F128::ZERO, |acc, c| acc + ch4[cd[c] as usize] * p[c]);
+    };
+    // Chunked, not `par_iter_mut`: the latter splits down to single parents, so
+    // the layers where only a handful of blocks survive would pay full rayon
+    // fork cost for a few multiplies. One chunk runs inline.
+    if par {
+        out.par_chunks_mut(ASSIST_CHUNK)
+            .enumerate()
+            .for_each(|(ci, oc)| {
+                let base = ci * ASSIST_CHUNK;
+                for (i, slot) in oc.iter_mut().enumerate() {
+                    gather(base + i, slot);
+                }
+            });
+    } else {
+        for (b, slot) in out.iter_mut().enumerate() {
+            gather(b, slot);
+        }
+    }
+    std::mem::swap(p, out);
+    debug_assert_eq!(p.len(), blocks.n_blocks(layer + 1));
+}
+
+/// The layer's only pass over block-scale state: bucket each block's weight
+/// partial against its parent's suffix vector,
+/// `B[cd] = Σ_{b: cd_ℓ(b) = cd} p[b]·S[ℓ+1][parent(b)]` — 4 multiplies per
+/// block, where the dense form spent 4 per column. Both round messages come
+/// from these buckets alone.
+///
+/// `par` chunks over blocks with XOR-reduced partials (value-identical
+/// reassociation) — for callers whose statement count can't occupy the pool.
+fn assist_buckets(
+    p: &[F128],
+    sfx: &[[F128; 4]],
+    blocks: &AssistBlocks,
+    layer: usize,
+    par: bool,
+) -> [[F128; 4]; 4] {
+    use rayon::prelude::*;
+    let pbase = blocks.off[layer + 1];
+    let (parent, cd) = (&blocks.parent[layer], &blocks.cd[layer]);
+    let body = |pc: &[F128], pp: &[u32], cc: &[u8]| {
+        let mut b = [[F128::ZERO; 4]; 4];
+        for ((&v, &par), &t) in pc.iter().zip(pp).zip(cc) {
+            let s = &sfx[pbase + par as usize];
+            let bk = &mut b[t as usize];
+            bk[0] += v * s[0];
+            bk[1] += v * s[1];
+            bk[2] += v * s[2];
+            bk[3] += v * s[3];
+        }
+        b
+    };
+    if par {
+        p.par_chunks(ASSIST_CHUNK)
+            .zip(parent.par_chunks(ASSIST_CHUNK))
+            .zip(cd.par_chunks(ASSIST_CHUNK))
+            .map(|((pc, pp), cc)| body(pc, pp, cc))
+            .reduce(
+                || [[F128::ZERO; 4]; 4],
+                |mut x, y| {
+                    for (xv, yv) in x.iter_mut().zip(&y) {
+                        *xv = add4(xv, yv);
+                    }
+                    x
+                },
+            )
+    } else {
+        body(p, parent, cd)
+    }
+}
+
+/// `u[c + 2d]ᵀ = b_ℓᵀ·M_ℓ^{(c,d)}`, via the sparse transition rows — the
+/// statement-local half of a layer's message, independent of the column scale.
+fn assist_u_rows(
+    prefix_row: &[F128; 4],
+    eq4: &[F128; 4],
+    sparse: &[[[(usize, usize); 2]; 4]; 4],
+) -> [[F128; 4]; 4] {
+    let mut u = [[F128::ZERO; 4]; 4];
+    for (cd, uv) in u.iter_mut().enumerate() {
+        for (s, &bs) in prefix_row.iter().enumerate() {
+            let (i0, o0) = sparse[cd][s][0];
+            let (i1, o1) = sparse[cd][s][1];
+            uv[o0] += bs * eq4[i0];
+            uv[o1] += bs * eq4[i1];
+        }
+    }
+    u
+}
+
+/// `W(σ) = Σ_y w_y·Π_ℓ eq(t_{y-1}[ℓ], σ_{c,ℓ})·eq(t_y[ℓ], σ_{d,ℓ})` by the same
+/// ascent: the layer's four quadrant products `eq(c, σ_c)·eq(d, σ_d)` are
+/// constant on a block, so the walk costs one multiply per block instead of
+/// [`assist_w_at`]'s `2(m + 1)` per column — the verifier's only `2^k`-scale
+/// work. Value-identical (reassociation of the same field product).
+fn assist_w_at_blocked(
+    blocks: &AssistBlocks,
+    cols: &[(F128, u64, u64)],
+    sigma: &[F128],
+    m: usize,
+) -> F128 {
+    debug_assert_eq!(sigma.len(), 2 * (m + 1));
+    let mut p = blocks.seed(cols);
+    let mut scratch = Vec::with_capacity(p.len());
+    for layer in 0..=m {
+        let (rc, rd) = (sigma[2 * layer], sigma[2 * layer + 1]);
+        let (rc1, rd1) = (F128::ONE + rc, F128::ONE + rd);
+        fold_partials(
+            &mut p,
+            &mut scratch,
+            blocks,
+            layer,
+            &[rc1 * rd1, rc * rd1, rc1 * rd, rc * rd],
+            false,
+        );
+    }
+    p[0]
 }
 
 #[inline]
@@ -947,13 +1305,13 @@ pub fn prove_assist<C: Challenger>(
     z_index: &[F128],
     challenger: &mut C,
 ) -> JaggedAssistProof {
-    use rayon::prelude::*;
     let m = params.m;
     assert_eq!(z_row.len(), params.n);
     assert_eq!(z_col.len(), params.k);
     assert_eq!(z_index.len(), m);
-    let cols = assist_columns(params, z_col);
-    let n_cols = cols.len();
+    let bounds = assist_boundaries(params);
+    let cols = assist_columns_at(&bounds, z_col);
+    let blocks = AssistBlocks::new(&bounds, m);
 
     let eq4s: Vec<[F128; 4]> = (0..=m)
         .map(|layer| {
@@ -962,79 +1320,32 @@ pub fn prove_assist<C: Challenger>(
         })
         .collect();
     let sparse = assist_sparse_transitions();
-    let sfx = assist_suffix_rows(&cols, &eq4s, &sparse, m);
+    // One statement, so both block-scale passes parallelize within the layer.
+    let sfx = assist_suffix_rows_blocked(&blocks, &eq4s, &sparse, m, true);
 
-    // β = Σ_y w_y·ĝ_y — the INITIAL entries of suffix row 0.
-    let beta = cols
-        .par_iter()
-        .zip(sfx[..n_cols].par_iter())
-        .map(|(&(w, _, _), s)| w * s[STATE_INITIAL])
-        .reduce(|| F128::ZERO, |x, y| x + y);
+    // β = Σ_y w_y·ĝ_y — the INITIAL entries of suffix layer 0.
+    let mut p = blocks.seed(&cols);
+    let beta = p
+        .iter()
+        .zip(&sfx[blocks.off[0]..])
+        .fold(F128::ZERO, |acc, (&w, s)| acc + w * s[STATE_INITIAL]);
 
     challenger.observe_label(b"flock-jagged-assist-v0");
     challenger.observe_f128(beta);
 
     let mut prefix_row = [F128::ZERO; 4];
     prefix_row[STATE_INITIAL] = F128::ONE;
-    let mut we: Vec<F128> = cols.iter().map(|&(w, _, _)| w).collect();
-    let mut prev_ch: Option<(F128, F128)> = None;
+    let mut scratch = Vec::with_capacity(p.len());
+    let mut ch4: Option<[F128; 4]> = None;
     let mut rounds = Vec::with_capacity(2 * (m + 1));
     for layer in 0..=m {
-        let row = &sfx[(layer + 1) * n_cols..(layer + 2) * n_cols];
-
-        // The layer's only column pass.
-        let buckets = we
-            .par_chunks_mut(ASSIST_CHUNK)
-            .zip(cols.par_chunks(ASSIST_CHUNK))
-            .zip(row.par_chunks(ASSIST_CHUNK))
-            .map(|((wc, cc), sc)| {
-                let mut b = [[F128::ZERO; 4]; 4];
-                for ((w_e, &(_, t_c, t_next)), s) in wc.iter_mut().zip(cc).zip(sc) {
-                    if let Some((rc, rd)) = prev_ch {
-                        let pl = layer - 1;
-                        let ec = if (t_c >> pl) & 1 == 1 {
-                            rc
-                        } else {
-                            F128::ONE + rc
-                        };
-                        let ed = if (t_next >> pl) & 1 == 1 {
-                            rd
-                        } else {
-                            F128::ONE + rd
-                        };
-                        *w_e *= ec * ed;
-                    }
-                    let cd = ((t_c >> layer) & 1) as usize + 2 * ((t_next >> layer) & 1) as usize;
-                    let v = *w_e;
-                    let bk = &mut b[cd];
-                    bk[0] += v * s[0];
-                    bk[1] += v * s[1];
-                    bk[2] += v * s[2];
-                    bk[3] += v * s[3];
-                }
-                b
-            })
-            .reduce(
-                || [[F128::ZERO; 4]; 4],
-                |mut x, y| {
-                    for (xv, yv) in x.iter_mut().zip(&y) {
-                        *xv = add4(xv, yv);
-                    }
-                    x
-                },
-            );
-
-        // u[c + 2d]ᵀ = b_ℓᵀ·M_ℓ^{(c,d)}, via the sparse transition rows.
-        let eq4 = &eq4s[layer];
-        let mut u = [[F128::ZERO; 4]; 4];
-        for (cd, uv) in u.iter_mut().enumerate() {
-            for (s, &bs) in prefix_row.iter().enumerate() {
-                let (i0, o0) = sparse[cd][s][0];
-                let (i1, o1) = sparse[cd][s][1];
-                uv[o0] += bs * eq4[i0];
-                uv[o1] += bs * eq4[i1];
-            }
+        // Ascend one layer with the previous layer's challenge quadrants, then
+        // the layer's only block-scale pass.
+        if let Some(c4) = ch4 {
+            fold_partials(&mut p, &mut scratch, &blocks, layer - 1, &c4, true);
         }
+        let buckets = assist_buckets(&p, &sfx, &blocks, layer, true);
+        let u = assist_u_rows(&prefix_row, &eq4s[layer], &sparse);
 
         // c-round.
         let g_one = dot4(&u[1], &buckets[1]) + dot4(&u[3], &buckets[3]);
@@ -1061,8 +1372,11 @@ pub fn prove_assist<C: Challenger>(
 
         // Advance the prefix past the now fully-bound layer:
         // b_{ℓ+1}ᵀ = b_ℓᵀ·M_ℓ(rc, rd) = (1+rd)·ud[0] + rd·ud[1].
-        prefix_row = comb4(F128::ONE + rd, &ud0, rd, &ud1);
-        prev_ch = Some((rc, rd));
+        let rd1 = F128::ONE + rd;
+        prefix_row = comb4(rd1, &ud0, rd, &ud1);
+        // The next layer's ascent folds this layer's `ec·ed` into the weight
+        // partials — the quadrant products once, not per column.
+        ch4 = Some([rc1 * rd1, rc * rd1, rc1 * rd, rc * rd]);
     }
 
     JaggedAssistProof { beta, rounds }
@@ -1180,8 +1494,9 @@ pub fn verify_assist<C: Challenger>(
         rho.push(r);
     }
 
-    let cols = assist_columns(params, z_col);
-    let w = assist_w_at(&cols, &rho, m);
+    let bounds = assist_boundaries(params);
+    let cols = assist_columns_at(&bounds, z_col);
+    let w = assist_w_at_blocked(&AssistBlocks::new(&bounds, m), &cols, &rho, m);
     let g = g_hat_eval_cd(z_row, z_index, m, |l| (rho[2 * l], rho[2 * l + 1]));
     (claim == w * g).then_some(proof.beta)
 }
@@ -1309,12 +1624,15 @@ pub struct FrobeniusAssistProof {
 }
 
 /// Per-statement prover state: one (claim, Frobenius power) pair, with the
-/// coefficient pre-scaled into the column weights.
+/// coefficient pre-scaled into the column weights. `sfx` and `p` live in the
+/// shared block tree's layout — `p` is the running weight partials at the
+/// current layer, shrinking as it ascends.
 struct FrobeniusStatement {
     cols: Vec<(F128, u64, u64)>,
     eq4s: Vec<[F128; 4]>,
     sfx: Vec<[F128; 4]>,
-    we: Vec<F128>,
+    p: Vec<F128>,
+    scratch: Vec<F128>,
     prefix_row: [F128; 4],
 }
 
@@ -1322,11 +1640,15 @@ struct FrobeniusStatement {
 /// assist objects at coordinate-wise `2^j`-powered `(z_row, z_col)` with
 /// column weights scaled by `c_{i,j}`. Statements with `c_{i,j} = 0` are
 /// skipped (their contribution is identically zero).
+///
+/// `blocks` is `Some` on the prover, which needs the suffix store and the
+/// layer-0 weight partials; the verifier takes `None` and touches neither.
 fn frobenius_statements(
     params: &JaggedParams,
     claims: &[FrobeniusClaim<'_>],
     rho: &[F128],
-    with_sfx: bool,
+    bounds: &[(u64, u64, u32)],
+    blocks: Option<&AssistBlocks>,
 ) -> Vec<FrobeniusStatement> {
     use rayon::prelude::*;
     let m = params.m;
@@ -1348,10 +1670,13 @@ fn frobenius_statements(
             }
         }
     }
+    // The suffix build parallelizes within the layer only when there are too
+    // few statements for this outer dispatch to occupy the pool.
+    let inner = specs.len() < 16;
     specs
         .into_par_iter()
         .map(|(zr, zc, c)| {
-            let mut cols = assist_columns(params, &zc);
+            let mut cols = assist_columns_at(bounds, &zc);
             for (w, _, _) in cols.iter_mut() {
                 *w *= c;
             }
@@ -1361,123 +1686,48 @@ fn frobenius_statements(
                     [t[0], t[1], t[2], t[3]]
                 })
                 .collect();
-            let sfx = if with_sfx {
-                assist_suffix_rows(&cols, &eq4s, &sparse, m)
-            } else {
-                Vec::new()
+            let (sfx, p) = match blocks {
+                Some(b) => (
+                    assist_suffix_rows_blocked(b, &eq4s, &sparse, m, inner),
+                    b.seed(&cols),
+                ),
+                None => (Vec::new(), Vec::new()),
             };
-            let we: Vec<F128> = cols.iter().map(|&(w, _, _)| w).collect();
+            let scratch = Vec::with_capacity(p.len());
             let mut prefix_row = [F128::ZERO; 4];
             prefix_row[STATE_INITIAL] = F128::ONE;
             FrobeniusStatement {
                 cols,
                 eq4s,
                 sfx,
-                we,
+                p,
+                scratch,
                 prefix_row,
             }
         })
         .collect()
 }
 
-/// One statement's per-layer pass: fold the previous layer's challenges
-/// into the running column weights, bucket against the suffix row, and form
-/// the statement's u-vectors from its prefix row. Shared by the chunked
-/// round dispatch of [`prove_frobenius_assist`].
+/// One statement's per-layer pass over the block tree: ascend one layer with the
+/// PREVIOUS layer's challenge quadrants (nothing else reads the partials in
+/// between, so the fold rides this pass rather than costing its own dispatch),
+/// then bucket the partials against their parents' suffix vectors and form the
+/// u-vectors from the prefix row. Shared by the chunked round dispatch of
+/// [`prove_frobenius_assist`]; `par` works within the statement for callers
+/// whose statement count can't occupy the pool.
 fn frobenius_layer_pass(
     st: &mut FrobeniusStatement,
+    blocks: &AssistBlocks,
     layer: usize,
-    ch4: Option<&[F128; 4]>,
+    prev_ch4: Option<&[F128; 4]>,
     sparse: &[[[(usize, usize); 2]; 4]; 4],
+    par: bool,
 ) -> ([[F128; 4]; 4], [[F128; 4]; 4]) {
-    let n_cols = st.cols.len();
-    let row = &st.sfx[(layer + 1) * n_cols..(layer + 2) * n_cols];
-    let mut buckets = [[F128::ZERO; 4]; 4];
-    for ((w_e, &(_, t_c, t_next)), s) in st.we.iter_mut().zip(&st.cols).zip(row) {
-        if let Some(ch4) = ch4 {
-            let pl = layer - 1;
-            let prev = ((t_c >> pl) & 1) as usize + 2 * ((t_next >> pl) & 1) as usize;
-            *w_e *= ch4[prev];
-        }
-        let cd = ((t_c >> layer) & 1) as usize + 2 * ((t_next >> layer) & 1) as usize;
-        let v = *w_e;
-        let bk = &mut buckets[cd];
-        bk[0] += v * s[0];
-        bk[1] += v * s[1];
-        bk[2] += v * s[2];
-        bk[3] += v * s[3];
+    if let Some(ch4) = prev_ch4 {
+        fold_partials(&mut st.p, &mut st.scratch, blocks, layer - 1, ch4, par);
     }
-    let eq4 = &st.eq4s[layer];
-    let mut u = [[F128::ZERO; 4]; 4];
-    for (cd, uv) in u.iter_mut().enumerate() {
-        for (s, &bs) in st.prefix_row.iter().enumerate() {
-            let (i0, o0) = sparse[cd][s][0];
-            let (i1, o1) = sparse[cd][s][1];
-            uv[o0] += bs * eq4[i0];
-            uv[o1] += bs * eq4[i1];
-        }
-    }
-    (u, buckets)
-}
-
-/// [`frobenius_layer_pass`] parallelized WITHIN the statement — column
-/// chunks with per-chunk bucket partials, XOR-reduced (value-identical
-/// reassociation). Used when the statement count is too small for the
-/// statement-chunked dispatch to occupy the pool (e.g. the multipoint
-/// protocol's K-statement anchor).
-fn frobenius_layer_pass_par(
-    st: &mut FrobeniusStatement,
-    layer: usize,
-    ch4: Option<&[F128; 4]>,
-    sparse: &[[[(usize, usize); 2]; 4]; 4],
-) -> ([[F128; 4]; 4], [[F128; 4]; 4]) {
-    use rayon::prelude::*;
-    let n_cols = st.cols.len();
-    let row = &st.sfx[(layer + 1) * n_cols..(layer + 2) * n_cols];
-    let buckets = st
-        .we
-        .par_chunks_mut(ASSIST_CHUNK)
-        .zip(st.cols.par_chunks(ASSIST_CHUNK))
-        .zip(row.par_chunks(ASSIST_CHUNK))
-        .map(|((wc, cc), rc)| {
-            let mut b = [[F128::ZERO; 4]; 4];
-            for ((w_e, &(_, t_c, t_next)), s) in wc.iter_mut().zip(cc).zip(rc) {
-                if let Some(ch4) = ch4 {
-                    let pl = layer - 1;
-                    let prev = ((t_c >> pl) & 1) as usize + 2 * ((t_next >> pl) & 1) as usize;
-                    *w_e *= ch4[prev];
-                }
-                let cd = ((t_c >> layer) & 1) as usize + 2 * ((t_next >> layer) & 1) as usize;
-                let v = *w_e;
-                let bk = &mut b[cd];
-                bk[0] += v * s[0];
-                bk[1] += v * s[1];
-                bk[2] += v * s[2];
-                bk[3] += v * s[3];
-            }
-            b
-        })
-        .reduce(
-            || [[F128::ZERO; 4]; 4],
-            |mut a, b| {
-                for (ar, br) in a.iter_mut().zip(&b) {
-                    for (x, y) in ar.iter_mut().zip(br) {
-                        *x += *y;
-                    }
-                }
-                a
-            },
-        );
-    let eq4 = &st.eq4s[layer];
-    let mut u = [[F128::ZERO; 4]; 4];
-    for (cd, uv) in u.iter_mut().enumerate() {
-        for (s, &bs) in st.prefix_row.iter().enumerate() {
-            let (i0, o0) = sparse[cd][s][0];
-            let (i1, o1) = sparse[cd][s][1];
-            uv[o0] += bs * eq4[i0];
-            uv[o1] += bs * eq4[i1];
-        }
-    }
+    let buckets = assist_buckets(&st.p, &st.sfx, blocks, layer, par);
+    let u = assist_u_rows(&st.prefix_row, &st.eq4s[layer], sparse);
     (u, buckets)
 }
 
@@ -1498,11 +1748,15 @@ pub fn prove_frobenius_assist<C: Challenger>(
     let trace = std::env::var("PCS_TRACE").is_ok();
     let t = std::time::Instant::now();
     let sparse = assist_sparse_transitions();
-    let mut sts = frobenius_statements(params, claims, rho, true);
+    let bounds = assist_boundaries(params);
+    let blocks = AssistBlocks::new(&bounds, m);
+    let mut sts = frobenius_statements(params, claims, rho, &bounds, Some(&blocks));
     if trace {
         eprintln!(
-            "    [frobenius] statements + suffix rows (x{}): {:6.2} ms",
+            "    [frobenius] statements + suffix rows (x{}, {} blocks vs {} dense): {:6.2} ms",
             sts.len(),
+            blocks.total(),
+            (m + 2) * blocks.n_cols,
             t.elapsed().as_secs_f64() * 1e3
         );
     }
@@ -1511,10 +1765,9 @@ pub fn prove_frobenius_assist<C: Challenger>(
     let v = sts
         .par_iter()
         .map(|st| {
-            st.cols
-                .iter()
-                .zip(&st.sfx[..st.cols.len()])
-                .map(|(&(w, _, _), s)| w * s[STATE_INITIAL])
+            st.p.iter()
+                .zip(&st.sfx[blocks.off[0]..])
+                .map(|(&w, s)| w * s[STATE_INITIAL])
                 .fold(F128::ZERO, |a, x| a + x)
         })
         .reduce(|| F128::ZERO, |a, b| a + b);
@@ -1525,36 +1778,32 @@ pub fn prove_frobenius_assist<C: Challenger>(
     let mut ch4: Option<[F128; 4]> = None;
     let mut rounds = Vec::with_capacity(2 * (m + 1));
     for layer in 0..=m {
-        // Per-statement column pass: fold the previous layer's challenges
-        // into the running weights and bucket against the suffix row; then
-        // the statement's u-vectors from its prefix row. Messages sum.
-        // Chunked dispatch: the per-statement work is ~a few thousand
+        // Per-statement block pass: ascend one layer with the previous layer's
+        // challenges, bucket the weight partials against their parents' suffix
+        // vectors, then the statement's u-vectors from its prefix row. Messages
+        // sum. Chunked dispatch: the per-statement work is ~a few thousand
         // multiplies, so per-statement rayon tasks are overhead-bound at
         // 128K statements x 2(m+1) rounds. 8 statements per task keeps
         // ~32 tasks per round.
         let mut per: Vec<([[F128; 4]; 4], [[F128; 4]; 4])> =
             vec![([[F128::ZERO; 4]; 4], [[F128::ZERO; 4]; 4]); sts.len()];
         let c4 = ch4.as_ref();
-        // Per-layer barriers cost ~tens of µs; the serial layer pass is
-        // ~6 multiplies/column. Column-parallelism only pays past ~2^14
-        // columns per statement.
-        let inner_par = sts.len() < 16
-            && sts
-                .first()
-                .is_some_and(|st| st.cols.len() >= 64 * ASSIST_CHUNK);
+        // Per-layer barriers cost ~tens of µs against ~5 multiplies per block.
+        // Block-parallelism only pays past ~2^14 blocks per statement.
+        let inner_par = sts.len() < 16 && blocks.n_blocks(layer) >= 64 * ASSIST_CHUNK;
         if inner_par {
-            // Few statements over many columns (the multipoint anchor's K):
+            // Few statements over many blocks (the multipoint anchor's K):
             // parallelize WITHIN each statement — same values,
             // XOR-reassociated.
             for (st, o) in sts.iter_mut().zip(per.iter_mut()) {
-                *o = frobenius_layer_pass_par(st, layer, c4, &sparse);
+                *o = frobenius_layer_pass(st, &blocks, layer, c4, &sparse, true);
             }
         } else {
             sts.par_chunks_mut(8)
                 .zip(per.par_chunks_mut(8))
                 .for_each(|(stc, oc)| {
                     for (st, o) in stc.iter_mut().zip(oc.iter_mut()) {
-                        *o = frobenius_layer_pass(st, layer, c4, &sparse);
+                        *o = frobenius_layer_pass(st, &blocks, layer, c4, &sparse, false);
                     }
                 });
         }
@@ -1595,7 +1844,7 @@ pub fn prove_frobenius_assist<C: Challenger>(
         for (st, (ud0, ud1)) in sts.iter_mut().zip(&folded) {
             st.prefix_row = comb4(rd1, ud0, rd, ud1);
         }
-        // The next layer folds `ec·ed` per column; precompute the four
+        // The next layer's ascent folds `ec·ed` per block; precompute the four
         // quadrant products once (multiplication associativity — value-
         // identical to the two-multiply form).
         ch4 = Some([rc1 * rd1, rc * rd1, rc1 * rd, rc * rd]);
@@ -1639,26 +1888,13 @@ pub fn verify_frobenius_assist<C: Challenger>(
         sigma.push(r);
     }
 
-    let sts = frobenius_statements(params, claims, rho, false);
-    // With few statements (the multipoint anchor's K), the statement-level
-    // parallelism below can't occupy the pool; parallelize the per-column
-    // `W(σ)` walk inside each statement instead (XOR-reassociated sums —
-    // value-identical).
-    let few_statements = sts.len() < 16;
-    let w_at = |cols: &[(F128, u64, u64)], sigma: &[F128]| -> F128 {
-        const PAR_CHUNK: usize = 1 << 10;
-        if !few_statements || cols.len() < 2 * PAR_CHUNK {
-            assist_w_at(cols, sigma, m)
-        } else {
-            cols.par_chunks(PAR_CHUNK)
-                .map(|cc| assist_w_at(cc, sigma, m))
-                .reduce(|| F128::ZERO, |a, b| a + b)
-        }
-    };
+    let bounds = assist_boundaries(params);
+    let blocks = AssistBlocks::new(&bounds, m);
+    let sts = frobenius_statements(params, claims, rho, &bounds, None);
     let expect = sts
         .par_iter()
         .map(|st| {
-            let w = w_at(&st.cols, &sigma);
+            let w = assist_w_at_blocked(&blocks, &st.cols, &sigma, m);
             let mut g = [F128::ZERO; 4];
             g[STATE_SUCCESS] = F128::ONE;
             let sparse = assist_sparse_transitions();
@@ -3413,8 +3649,13 @@ mod tests {
     }
 
     /// Multipoint twisted evaluation across column counts at m = 23, against
-    /// the batched Frobenius assist where the latter fits in memory (its
-    /// suffix state at 4K+ columns is gigabytes). Informational.
+    /// the batched Frobenius assist where the latter fits in memory. The block
+    /// tree cut its suffix state by ~1.8x (at 4096 columns, 940 MB across the
+    /// 256 statements against 1.7 GB), so 4K is now runnable rather than
+    /// hopeless — see the `assist_blocked` probe, which times it at reduced
+    /// iterations — but still far too heavy to allocate from a unit test, and
+    /// still the losing side at that width (42 ms of assist against this
+    /// protocol's 24 ms in total). Informational.
     #[test]
     #[ignore] // Timing probe — run explicitly with --ignored --nocapture
     fn multipoint_twisted_bench() {
@@ -3711,6 +3952,220 @@ mod tests {
                     .expect("honest assist must verify");
                 assert_eq!(beta, proof.beta);
             }
+        }
+    }
+
+    /// Shapes whose block tree genuinely compresses: the registry's own form
+    /// (runs of `k_t` consecutive columns of height `n_t`, zero gaps between
+    /// type regions), at power-of-two and odd strides, plus the degenerate ends.
+    /// `(heights, n, m)`.
+    fn blocked_shapes() -> Vec<(Vec<u64>, usize, usize)> {
+        vec![
+            // One long uniform run — the deepest compression.
+            (vec![5u64; 16], 3, 8),
+            // Odd stride, no power-of-two alignment anywhere.
+            (vec![13u64; 8], 4, 8),
+            // Two type regions of different heights, separated by a zero gap.
+            (
+                [vec![6u64; 5], vec![0; 3], vec![3; 6], vec![0; 2]].concat(),
+                3,
+                7,
+            ),
+            // Height 1: every column is its own block at every layer.
+            (vec![1u64; 8], 1, 4),
+            // Zero-height tail only, and a single non-empty column.
+            (vec![0u64, 0, 0, 7], 3, 4),
+            // Heights straddling a power of two (carries into the high bits).
+            (vec![7u64; 8], 3, 6),
+        ]
+    }
+
+    #[test]
+    fn blocked_tree_invariants() {
+        // The tree the collapse rests on: layer 0 one block per deduped
+        // column, layer m+1 a single block, parents non-decreasing and never
+        // ahead of the child (what makes `fold_partials` safe in place), and
+        // every block genuinely constant in the bits it claims.
+        for (heights, n, m) in blocked_shapes() {
+            let params = JaggedParams::from_heights(&heights, n, m);
+            let bounds = assist_boundaries(&params);
+            let blocks = AssistBlocks::new(&bounds, m);
+            assert_eq!(blocks.n_blocks(0), bounds.len(), "layer 0 is per-column");
+            assert_eq!(blocks.n_blocks(m + 1), 1, "layer m+1 is one block");
+            assert_eq!(blocks.total(), blocks.off[m + 2]);
+            for layer in 0..=m {
+                let (par, cd) = (&blocks.parent[layer], &blocks.cd[layer]);
+                assert_eq!(par.len(), blocks.n_blocks(layer));
+                let mut last = 0u32;
+                for (b, &p) in par.iter().enumerate() {
+                    assert!(p <= b as u32, "parent must not run ahead of the child");
+                    assert!(p == last || p == last + 1, "parents must be a run index");
+                    last = p;
+                }
+                // Each block is constant in bits ≥ layer, hence in `cd`.
+                let starts = &blocks.starts[layer];
+                for (b, &s) in starts.iter().enumerate() {
+                    let end = starts.get(b + 1).map_or(bounds.len(), |&x| x as usize);
+                    let (t_c, t_next, _) = bounds[s as usize];
+                    let want = ((t_c >> layer) & 1) as u8 + 2 * (((t_next >> layer) & 1) as u8);
+                    assert_eq!(cd[b], want);
+                    for &(c, d, _) in &bounds[s as usize..end] {
+                        assert_eq!((c >> layer, d >> layer), (t_c >> layer, t_next >> layer));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_suffix_rows_match_dense() {
+        // Every column's dense suffix vector equals the vector stored for the
+        // block containing it, at every layer — exactly, both dispatches.
+        let mut ch = RandomChallenger::new(0x51F5_B10C);
+        let sparse = assist_sparse_transitions();
+        for (heights, n, m) in blocked_shapes() {
+            let params = JaggedParams::from_heights(&heights, n, m);
+            let bounds = assist_boundaries(&params);
+            let blocks = AssistBlocks::new(&bounds, m);
+            let cols = assist_columns_at(&bounds, &sample_vec(&mut ch, params.k));
+            let eq4s: Vec<[F128; 4]> = (0..=m)
+                .map(|_| {
+                    let v = sample_vec(&mut ch, 2);
+                    let t = build_eq_table(&v);
+                    [t[0], t[1], t[2], t[3]]
+                })
+                .collect();
+            let dense = assist_suffix_rows(&cols, &eq4s, &sparse, m);
+            for par in [false, true] {
+                let blk = assist_suffix_rows_blocked(&blocks, &eq4s, &sparse, m, par);
+                for layer in 0..=m + 1 {
+                    let starts = &blocks.starts[layer];
+                    for (b, &s) in starts.iter().enumerate() {
+                        let end = starts.get(b + 1).map_or(cols.len(), |&x| x as usize);
+                        for y in s as usize..end {
+                            assert_eq!(
+                                blk[blocks.off[layer] + b],
+                                dense[layer * cols.len() + y],
+                                "layer {layer} column {y} (par={par}) heights {heights:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_layer_state_matches_dense() {
+        // The two block-scale kernels composed, driven layer by layer with the
+        // same challenges as the real prover: `assist_buckets` against the
+        // dense per-column bucketing, and `fold_partials` against the dense
+        // running-weight fold. This is the state pipeline the Frobenius batch
+        // runs (`prove_assist` is separately pinned bit-for-bit against
+        // `prove_assist_naive`, which shares no code with either).
+        let mut ch = RandomChallenger::new(0x810C_57A7);
+        let sparse = assist_sparse_transitions();
+        for (heights, n, m) in blocked_shapes() {
+            let params = JaggedParams::from_heights(&heights, n, m);
+            let bounds = assist_boundaries(&params);
+            let blocks = AssistBlocks::new(&bounds, m);
+            let cols = assist_columns_at(&bounds, &sample_vec(&mut ch, params.k));
+            let eq4s: Vec<[F128; 4]> = (0..=m)
+                .map(|_| {
+                    let v = sample_vec(&mut ch, 2);
+                    let t = build_eq_table(&v);
+                    [t[0], t[1], t[2], t[3]]
+                })
+                .collect();
+            let n_cols = cols.len();
+            let dense_sfx = assist_suffix_rows(&cols, &eq4s, &sparse, m);
+            let blk_sfx = assist_suffix_rows_blocked(&blocks, &eq4s, &sparse, m, false);
+
+            let mut we: Vec<F128> = cols.iter().map(|&(w, _, _)| w).collect();
+            let mut p = blocks.seed(&cols);
+            // Alternate the fold's dispatch across layers so both paths run.
+            let mut scratch = Vec::new();
+            for layer in 0..=m {
+                let row = &dense_sfx[(layer + 1) * n_cols..(layer + 2) * n_cols];
+                let mut want = [[F128::ZERO; 4]; 4];
+                for ((&w_e, &(_, t_c, t_next)), s) in we.iter().zip(&cols).zip(row) {
+                    let cd = ((t_c >> layer) & 1) as usize + 2 * ((t_next >> layer) & 1) as usize;
+                    let bk = &mut want[cd];
+                    for (slot, &sv) in bk.iter_mut().zip(s) {
+                        *slot += w_e * sv;
+                    }
+                }
+                for par in [false, true] {
+                    assert_eq!(
+                        assist_buckets(&p, &blk_sfx, &blocks, layer, par),
+                        want,
+                        "buckets at layer {layer} (par={par}) heights {heights:?}"
+                    );
+                }
+                // Advance both by the same challenge pair.
+                let (rc, rd) = (ch.sample_f128(), ch.sample_f128());
+                let (rc1, rd1) = (F128::ONE + rc, F128::ONE + rd);
+                let ch4 = [rc1 * rd1, rc * rd1, rc1 * rd, rc * rd];
+                for (w_e, &(_, t_c, t_next)) in we.iter_mut().zip(&cols) {
+                    let cd = ((t_c >> layer) & 1) as usize + 2 * ((t_next >> layer) & 1) as usize;
+                    *w_e *= ch4[cd];
+                }
+                fold_partials(&mut p, &mut scratch, &blocks, layer, &ch4, layer % 2 == 0);
+                // Each block's partial is the exact sum of its columns'.
+                let starts = &blocks.starts[layer + 1];
+                for (b, &s) in starts.iter().enumerate() {
+                    let end = starts.get(b + 1).map_or(n_cols, |&x| x as usize);
+                    let want = we[s as usize..end]
+                        .iter()
+                        .fold(F128::ZERO, |acc, &x| acc + x);
+                    assert_eq!(p[b], want, "partial at layer {} block {b}", layer + 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_w_at_matches_dense() {
+        // The verifier's W(σ) walk: the tree ascent equals the per-column
+        // product form exactly (reassociation of the same field product).
+        let mut ch = RandomChallenger::new(0x0C57_A7E4);
+        for (heights, n, m) in blocked_shapes() {
+            let params = JaggedParams::from_heights(&heights, n, m);
+            let bounds = assist_boundaries(&params);
+            let blocks = AssistBlocks::new(&bounds, m);
+            for _ in 0..4 {
+                let cols = assist_columns_at(&bounds, &sample_vec(&mut ch, params.k));
+                let sigma = sample_vec(&mut ch, 2 * (m + 1));
+                assert_eq!(
+                    assist_w_at_blocked(&blocks, &cols, &sigma, m),
+                    assist_w_at(&cols, &sigma, m),
+                    "W(σ) mismatch for heights {heights:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn assist_streamed_matches_naive_on_blocked_shapes() {
+        // The bit-identity check of `assist_streamed_matches_naive`, on the
+        // shapes where the block tree actually collapses layers — the naive
+        // prover shares no code with the blocked one.
+        let mut ch = RandomChallenger::new(0xB10C_4E46);
+        for (heights, n, m) in blocked_shapes() {
+            let params = JaggedParams::from_heights(&heights, n, m);
+            let z_row = sample_vec(&mut ch, n);
+            let z_col = sample_vec(&mut ch, params.k);
+            let z_idx = sample_vec(&mut ch, m);
+
+            let mut ch_a = FsChallenger::new(b"flock-jagged-assist-test");
+            let streamed = prove_assist(&params, &z_row, &z_col, &z_idx, &mut ch_a);
+            let mut ch_b = FsChallenger::new(b"flock-jagged-assist-test");
+            let naive = prove_assist_naive(&params, &z_row, &z_col, &z_idx, &mut ch_b);
+            assert_eq!(streamed.beta, naive.beta, "β mismatch heights {heights:?}");
+            assert_eq!(
+                streamed.rounds, naive.rounds,
+                "rounds mismatch heights {heights:?}"
+            );
         }
     }
 
