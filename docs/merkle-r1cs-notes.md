@@ -537,6 +537,50 @@ So after the witness fix there is **exactly one term left** on either side, and
 it is the same term. Post-fix ratios at 26,624: prove/mt 2.2–3.0×, prove/1t
 **1.9×**, verify 10.1× (verify was untouched — witness gen is prover-only).
 
+### Re-run after merging `multitable` (8 commits, incl. a zerocheck rewrite)
+
+`multitable` was merged in (`e5de8fb`): the `product_gkr` grand-product port,
+one shared `eq(ρ)` across the permutation's five v-openings, two zerocheck
+changes that stop scanning/scattering over the **padded** domain, and scratch
+prewarm sized by buffer class. Those zerocheck changes were the ones plausibly
+relevant here, since the Merkle table carries more padding per row than BLAKE3's
+(interior holes per level, 81% vs 94% utilization).
+
+A/B at 26,624 compressions, 7-rep medians, back to back on the same machine:
+
+| | pre-merge | post-merge |
+|---|---|---|
+| merkle prove/mt | 348 ms | **321 ms** (−8%) |
+| merkle prove/1t | 766 ms | 733 ms (−4%) |
+| merkle verify | 140.3 ms | 141.5 ms (flat) |
+| blake3 prove/mt | 156 ms | 156 ms (flat) |
+| blake3 verify | 14.4 ms | 14.1 ms (flat) |
+
+So: a modest Merkle prove gain, nothing else. Treat the 8% as suggestive rather
+than established — earlier in this session two 3-rep runs of the *same* build
+differed by 17% (328 vs 385 ms), so 8% is near the edge of what this harness
+distinguishes. BLAKE3 being flat while Merkle moves is at least consistent with
+the padded-domain story.
+
+**The structure is unchanged.** Post-merge phase breakdown at 26,624, each
+column from one traced run and reconciled against that run's own total:
+
+Prove (totals 335 vs 159 ms): witness 22/15, `compact q` 4.26/2.09, `commit`
+32.51/32.09 (**1.0×**), `zerocheck` 54.11/50.23 (**1.08×**), `lincheck`
+13.19/10.12, ring_switch 0.21/0.19, W build 6.88/5.59, merged sumcheck
+5.68/6.34 (**0.9×**), **frobenius assist 161.55/7.08 (23×)**, inner Ligerito
+30.00/35.63 (**0.8×** — Merkle faster). Assist = **88%** of the +176 ms gap.
+
+Verify (totals 139.9 vs 14.6 ms): `zerocheck::verify` 272/262 µs (**1.0×**),
+`lincheck::verify_union` 14.26/8.96 ms (fold 12.43/8.72), ring_switch 223/243 µs
+(**0.9×**), coeffs 307/256 µs, **`verify_frobenius_assist` 124.04/4.98 ms
+(25×)**, Ligerito open 496/493 µs (**1.0×**). Assist = **95%** of the +125 ms
+gap.
+
+Ratios post-merge: prove/mt 2.1–2.5×, prove/1t **1.8×**, verify 9.9×. Identical
+88%/95% attribution to pre-merge — the merge changed the constant, not the
+shape. `verify_frobenius_assist` remains the only thing worth attacking.
+
 ### The zerocheck asymmetry: RESOLVED, it was not real
 
 An earlier revision of these notes flagged `zerocheck + s_hat_v_c` at 224 ms vs
