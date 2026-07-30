@@ -15,8 +15,15 @@
 //! 3. **Cross-class**: a hash gate's output words feed an element `mult` gate —
 //!    the recursion plan's class boundary in miniature. The crossing is
 //!    ordinary wiring.
-//! 4. The **tamper matrix**, including the `g`-side forgery that proves the
-//!    `f_eval == g_eval` check bites.
+//! 4. The **tamper matrix**: a broken wiring equality on a per-gate-satisfying
+//!    witness, wrong public words, wrong gate counts, swapped wire
+//!    connections, bit-flipped transcript and gather values — plus the three
+//!    tests that pin the binding obligations one layer at a time:
+//!    `g_side_forgery_is_rejected` (the `g = w∘σ` attack that only
+//!    `f_eval == g_eval` stops), `fabricated_witness_fails_recombination`
+//!    (jointly consistent evals over the wrong vector), and
+//!    `gather_claims_are_bound_by_the_opening` (a self-consistent wiring proof
+//!    of a fabricated witness, rejected by the PCS opening).
 //! 5. A **differential oracle**: a brute-force wire-class checker over the
 //!    committed words, agreeing with accept/reject on randomized circuits with
 //!    randomly generated wirings.
@@ -600,6 +607,103 @@ fn g_side_forgery_is_rejected() {
         .expect("the honest control must verify");
 }
 
+/// **A fabricated witness**: the GKR run honestly on a DIFFERENT (but
+/// wiring-consistent) vector, so `f_eval == g_eval` holds jointly and every
+/// layer check passes — and the recombination is what fails, because the
+/// gather values are the ones the commitment carries.
+///
+/// This is the other half of the two-eval binding: `f_eval == g_eval` alone
+/// says the two products ran on the same vector, not that the vector is the
+/// committed one. Only the recombination ties it to the witness and the public
+/// words.
+#[test]
+fn fabricated_witness_fails_recombination() {
+    use flock_core::zerocheck::univariate_skip::build_eq;
+
+    let (nu, kappa) = (4usize, 2usize);
+    let registry = element_registry(nu, kappa);
+    let n = 3usize;
+    let n_public = 2usize;
+    let circuit = Circuit::new(
+        &registry,
+        vec![n],
+        n_public,
+        vec![
+            vec![Cell::new(EL_C, 0), Cell::new(EL_B, 1)],
+            vec![Cell::new(EL_C, 1), Cell::new(EL_B, 2)],
+        ],
+    )
+    .expect("valid");
+    let cells = circuit.cells();
+    let mut rng = Rng::new(0xFAB0_0001);
+    let public: Vec<F128> = (0..n_public).map(|_| rng.f128()).collect();
+
+    // Two committed buffers, both satisfying the wiring — the real one and the
+    // one the forger runs the argument on.
+    let mut buffers: Vec<Vec<F128>> = Vec::new();
+    for _ in 0..2 {
+        let mut packed = vec![F128::ZERO; 1usize << (registry.m_total() - 7)];
+        for iota in 0..cells.num_gate_slots() {
+            for row in 0..n {
+                packed[cells.gate_word_addr(iota, row)] = rng.f128();
+            }
+        }
+        for class in circuit.wires() {
+            let v = rng.f128();
+            for &idx in class {
+                let (iota, row) = (idx >> nu, idx & ((1 << nu) - 1));
+                packed[cells.gate_word_addr(iota, row)] = v;
+            }
+        }
+        buffers.push(packed);
+    }
+    let (real, fake) = (&buffers[0], &buffers[1]);
+
+    // The forger's transcript: an honest wiring proof of the FAKE buffer.
+    let mut ch = FsChallenger::new(DOMAIN);
+    let (fake_proof, _) = flock_core::circuit::prove_wiring(&circuit, fake, &public, &mut ch);
+
+    // Recover ρ by replaying, then compute the REAL buffer's gather values —
+    // the ones the PCS opening would accept — and splice them in.
+    let mut ch = FsChallenger::new(DOMAIN);
+    let rho = product_gkr::verify_batched_with_sigma(
+        cells.mu(),
+        &fake_proof.gkr,
+        circuit.sigma(),
+        &mut ch,
+    )
+    .expect("the fabricated GKR is internally honest")
+    .rho;
+    let eq_row = build_eq(&rho[..nu]);
+    let real_gather: Vec<F128> = (0..cells.num_gate_slots())
+        .map(|iota| {
+            let base = cells.gate_word_addr(iota, 0);
+            eq_row
+                .iter()
+                .enumerate()
+                .map(|(j, &e)| e * real[base + j])
+                .fold(F128::ZERO, |a, b| a + b)
+        })
+        .collect();
+    let spliced = flock_core::circuit::WiringProof {
+        gkr: fake_proof.gkr.clone(),
+        gather: real_gather,
+    };
+    let mut ch = FsChallenger::new(DOMAIN);
+    assert_eq!(
+        flock_core::circuit::verify_wiring(&circuit, &public, &spliced, &mut ch),
+        Err(WiringError::Recombination),
+        "jointly consistent evals over a fabricated vector must fail the \
+         recombination against the committed gather values"
+    );
+    // The control: the same GKR with its OWN gather values is internally
+    // consistent (it is an honest proof — of the wrong witness), which is
+    // precisely why the gather claims must ride the PCS opening.
+    let mut ch = FsChallenger::new(DOMAIN);
+    flock_core::circuit::verify_wiring(&circuit, &public, &fake_proof, &mut ch)
+        .expect("the fabricated proof is self-consistent — the opening is what rejects it");
+}
+
 // ===========================================================================
 // 2. The element chain, and 3. the cross-class circuit
 // ===========================================================================
@@ -655,7 +759,7 @@ fn element_chain_circuit() {
     let mut rng = Rng::new(0xC4A1_0001);
     let seed = rng.f128();
     let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
-    let (z, result) = chain_witness(&ty, nu, &a, seed);
+    let (z, result) = chain_witness(ty, nu, &a, seed);
 
     // Public segment: seed, a_0..a_{n-1}, result.
     let mut public = vec![seed];
@@ -844,6 +948,85 @@ fn cross_class_hash_into_mult() {
             Err(VerifyError::Wiring(_))
         ),
         "a self-consistent element gate on the WRONG operands must be rejected"
+    );
+}
+
+/// **The gather claims are bound by the OPENING.** A wiring proof that is
+/// internally honest — over a FABRICATED witness satisfying the same wiring —
+/// spliced in at the right transcript position: the wiring layer has nothing to
+/// object to (matching products, `f_eval == g_eval`, gather values that
+/// recombine), and the PCS opening is what rejects it, because those values are
+/// not the ones the commitment carries.
+///
+/// The circuit here wires only the chain's internal edges, leaving the seed
+/// free — a circuit whose public segment pinned every input would leave nothing
+/// to fabricate (which is itself the point of public IO).
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn gather_claims_are_bound_by_the_opening() {
+    let (nu, kappa, n) = (12usize, 3usize, 6usize);
+    let registry = element_registry(nu, kappa);
+    let ty = registry.types()[0].element_type().expect("element type");
+    let mut rng = Rng::new(0x09E4_0001);
+    let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+    let (z, _) = chain_witness(ty, nu, &a, rng.f128());
+    let (fake, _) = chain_witness(ty, nu, &a, rng.f128());
+    assert_ne!(z, fake, "the fabricated witness must differ");
+
+    let wires: Vec<Vec<Cell>> = (0..n - 1)
+        .map(|i| vec![Cell::new(EL_C, i), Cell::new(EL_B, i + 1)])
+        .collect();
+    let union = UnionInstance::new(&registry, vec![n]);
+    let pcs_params = union_pcs_params(&union);
+    let circuit = Circuit::new(&registry, vec![n], 0, wires).expect("valid");
+
+    let z_gen = z.clone();
+    let mut ch = FsChallenger::new(DOMAIN);
+    let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_circuit(
+        &union,
+        &circuit,
+        &[],
+        &pcs_params,
+        Vec::new(),
+        vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
+            dst.copy_from_slice(&z_gen)
+        })],
+        &mut ch,
+    );
+    let verify = |p: &R1csProofCircuitLigerito| {
+        let mut ch = FsChallenger::new(DOMAIN);
+        verifier::verify_ligerito_jagged_union_circuit(
+            &union,
+            &circuit,
+            &[],
+            &[],
+            &commitment,
+            p,
+            &pcs_params,
+            &mut ch,
+        )
+    };
+    verify(&proof).expect("the honest proof verifies");
+
+    // Replay the verifier's prefix to reach the wiring position — statement
+    // binding, then the element region's PIOP — and prove the wiring there over
+    // the fabricated witness.
+    let mut ch = FsChallenger::new(DOMAIN);
+    union.bind_statement_circuit(&mut ch, &commitment, &circuit.digest(), &[]);
+    flock_core::element_r1cs::union::verify(
+        &union,
+        proof.element.as_ref().expect("element half"),
+        &mut ch,
+    )
+    .expect("the honest element PIOP replays");
+    let (fake_wiring, _) = flock_core::circuit::prove_wiring(&circuit, &fake, &[], &mut ch);
+
+    let mut spliced = proof.clone();
+    spliced.wiring = fake_wiring;
+    let err = verify(&spliced).expect_err("a fabricated-witness wiring proof must be rejected");
+    assert!(
+        matches!(err, VerifyError::PcsJagged(_)),
+        "the OPENING must be what rejects it, not the wiring layer — got {err:?}"
     );
 }
 
