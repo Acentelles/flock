@@ -32,10 +32,11 @@ for why, and for the free 23% available by using a power-of-two depth.
 
 **What is left** is no longer one thing. The assist is down to 15% of verify at
 depth 8 and the **lincheck fold is now 74%** of it. The assist's residual cost is
-still `k_log`-driven (columns `2^(k_log-7)`), so narrowing the block helps and
-more paths never do — which still makes the SHA-256 backend
-**counterproductive** (κ = 15 ⇒ composite `k_log` 20 ⇒ more columns), reversing
-what the open items below say. The bigger prover lever is the
+still `k_log`-driven (columns `2^(k_log-7)`), so narrowing the block is the lever
+and batching mostly is not — precisely: flat in path count on the verifier,
+**logarithmic** on the prover (see the scaling sweeps). That still makes the
+SHA-256 backend **counterproductive** (κ = 15 ⇒ composite `k_log` 20 ⇒ more
+columns), reversing what the open items below say. The bigger prover lever is the
 **multipoint-twisted prototype** already in `pcs/jagged.rs`: it deletes the
 128·K-statement structure rather than sharing within it (so it subsumes both
 optimizations above), is tested against brute force, and is *not* wired into
@@ -737,6 +738,59 @@ Headline, 7-rep medians:
 
 The trade is explicit: the prover now keeps the suffix footprint resident
 between proofs. Peak RSS moved 2.24 → 2.51 GB at depth 26.
+
+### Does the assist scale with the number of paths? Flat on verify, log on prove
+
+Measured directly, since earlier revisions of these notes asserted "more paths
+never help" and that is right in spirit but too strong on the prover side. Fixed
+depth 26 throughout, so `k_log = 19`, `k_cols = 12` and 3326 merged columns are
+constant; only the path count moves.
+
+**Verify** — flat. 128× the paths and the assist went *down*:
+
+| paths | compressions | nu | m | assist |
+|---|---|---|---|---|
+| 8 | 208 | 3 | 15 | 9.24 ms |
+| 64 | 1,664 | 6 | 18 | 5.80 ms |
+| 1024 | 26,624 | 10 | 22 | 5.28 ms |
+
+The genuine `nu` dependence is visible only in the one sub-timer that isolates
+it: `eq(pairs, σ)` is 322 → 362 → 460 µs, and its `2(m+1)` factor goes 32 → 46,
+predicting 322 × 1.44 = 464 µs against 460 measured. Everything else drifts
+*downward*, which the model does not predict — single-rep measurements taken
+progressively later in a warming process, so read as noise, not effect.
+
+Post-hoist the verifier's dominant work is a per-statement dot product with **no
+`m` factor at all** (one multiply per column), which is why `nu` barely shows.
+
+**Prove** — logarithmic. Separate process per size so the recycler pool warms
+identically; 3rd proof each:
+
+| paths | compressions | nu | m | suffix build | `v` + rounds | footprint | assist |
+|---|---|---|---|---|---|---|---|
+| 8 | 208 | 3 | 15 | 8.50 ms | 20.91 ms | 158 MiB | 30.12 ms |
+| 64 | 1,664 | 6 | 18 | 12.88 ms | 24.29 ms | 314 MiB | 37.71 ms |
+| 1024 | 26,624 | 10 | 22 | 21.25 ms | 31.10 ms | 522 MiB | 52.77 ms |
+
+**128× the paths gives 1.75× the assist** — linear in `nu = log2(paths)`, and
+both components fit:
+
+* Round loop is `(m+1) · n_cols` per statement with `m = nu + k_log − 7`, so
+  `m+1` goes 16 → 19 → 23, predicting 1.19× and 1.44×; measured 1.16× and 1.49×.
+* Suffix build is `lo · n_cols` with `lo = nu`, plus a fixed part (each
+  statement's `assist_columns` builds a `2^k_cols` eq table regardless). Fitting
+  `a + b·nu` gives ≈3.0 ms + 1.82 ms/nu, predicting 13.96 ms at nu=6 vs 12.88.
+* Footprint is **exactly** linear in `nu`: 158/3, 314/6, 522/10 all land at
+  52.2–52.7 MiB per unit, i.e. `128·K · nu · n_cols · 64 B` with no fixed term.
+
+The prover has no escape from `nu` the way the verifier does: it must materialize
+`nu` suffix blocks per statement and run `m+1` full column passes.
+
+**Practical:** per compression the assist collapses with batching either way —
+prove 145 µs at 8 paths → 2.0 µs at 1024, a 72× improvement. So it is a
+per-*proof* toll set mainly by depth, with a logarithmic surcharge for batch size
+on the prover. The term to watch is the memory, being the one that is exactly
+linear in `nu`: at nu = 14 (16k paths) the recycler would retain ~730 MiB.
 
 ### The zerocheck asymmetry: RESOLVED, it was not real
 
