@@ -50,7 +50,18 @@ use flock_prover::r1cs_hashes::merkle_r1cs::{MerkleTreeLayout, PathInput, blake3
 use flock_prover::r1cs_hashes::{blake3, merkle_r1cs};
 
 const DOMAIN: &[u8] = b"flock-merkle-vs-blake3-bench-v0";
-const DEPTH: usize = 26;
+
+/// Merkle depth; override with `MVB_DEPTH`. Drives the composite block width
+/// `k_log = 14 + log2(next_pow2(depth))`, hence the jagged column count
+/// `2^(k_log-7)` that the Frobenius assist scales with — so it is the knob that
+/// moves the assist, unlike the path count.
+fn depth() -> usize {
+    std::env::var("MVB_DEPTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&d| d >= 1)
+        .unwrap_or(26)
+}
 /// Repetitions per timed phase (after a warm-up). Median is reported. 7 rather
 /// than 3: at these sizes prove is 15–350 ms and verify 4–100 ms, small enough
 /// that 3 reps left the BLAKE3 column visibly non-monotonic in size.
@@ -93,11 +104,11 @@ impl Rng {
     fn digest(&mut self) -> [u32; merkle_r1cs::SLOT_WORDS] {
         std::array::from_fn(|_| self.next_u32())
     }
-    fn path(&mut self) -> PathInput {
+    fn path(&mut self, depth: usize) -> PathInput {
         PathInput {
             leaf: self.digest(),
             index: ((self.next_u32() as u64) << 32) | self.next_u32() as u64,
-            siblings: (0..DEPTH).map(|_| self.digest()).collect(),
+            siblings: (0..depth).map(|_| self.digest()).collect(),
         }
     }
     fn compression(&mut self) -> blake3::Compression {
@@ -248,21 +259,22 @@ fn measure(
 }
 
 fn merkle_row(n_paths: usize, solo: &rayon::ThreadPool) -> Row {
+    let d = depth();
     let nu = n_paths.trailing_zeros() as usize;
-    let layout = MerkleTreeLayout::new(DEPTH, blake3_spec());
+    let layout = MerkleTreeLayout::new(d, blake3_spec());
     let stub = layout.build_block_r1cs_stub(nu);
     let registry = Registry::new(vec![TableType::from_block_r1cs(&stub)], nu);
     let walker = layout.build_walker();
     let mut rng = Rng(0x_2600_A711);
-    let paths: Vec<PathInput> = (0..n_paths).map(|_| rng.path()).collect();
+    let paths: Vec<PathInput> = (0..n_paths).map(|_| rng.path(d)).collect();
     // The composite is `depth` copies of the BLAKE3 block plus the swap gadget
     // and globals, so the base block IS one whole path. `effective_nnz` is what
     // the materialized composite would hold; the walker stores one base copy
     // and the factored fold touches ~1/depth of it.
     let base_nnz = walker.effective_nnz();
     measure(
-        format!("merkle d{DEPTH} x{n_paths}"),
-        n_paths * DEPTH,
+        format!("merkle d{d} x{n_paths}"),
+        n_paths * d,
         n_paths,
         nu,
         &registry,
@@ -323,13 +335,18 @@ fn main() {
             " (production default)"
         }
     );
-    println!("  depth           : {DEPTH}  =>  1 path = {DEPTH} compressions");
+    println!(
+        "  depth           : {}  =>  1 path = {} compressions, k_log = {}",
+        depth(),
+        depth(),
+        MerkleTreeLayout::new(depth(), blake3_spec()).k_log
+    );
     println!("  reps            : median of {} after warm-up\n", reps());
 
     let mut rows = Vec::new();
     for n_paths in path_counts() {
         rows.push(merkle_row(n_paths, &solo));
-        rows.push(blake3_row(n_paths * DEPTH, &solo));
+        rows.push(blake3_row(n_paths * depth(), &solo));
     }
 
     println!(

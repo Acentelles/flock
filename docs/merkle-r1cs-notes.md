@@ -20,14 +20,26 @@ Done since the "alignment DONE, factorization NEXT" state:
    taking Merkle prove 4.4× (1451 → 328 ms) and the prove gap from 8.2× to
    ~2.2×.
 
-**The one thing left is `jagged`'s Frobenius assist.** It is 88% of the
-remaining prove gap and 95% of the verify gap at 26k, on both sides, and its
-cost is `256 statements × ~3326 columns × 2(m+1)` — driven by the *block width*
-`k_log`, not the batch size, so more paths never help. Levers: cut the 256
-statements, exploit that Merkle's columns are one run of equal heights, or
-narrow `k_log`. Note this makes the SHA-256 backend **counterproductive**
-(κ = 15 ⇒ composite `k_log` 20 ⇒ more columns), reversing what the open items
-below used to say.
+5. **The Frobenius assist, both sides.** Verify: `eq(pairs, σ)` hoisted out of
+   the per-statement loop (it was recomputed 128·K times on identical inputs) —
+   `W(σ)` 116.62 → 1.45 ms, **Merkle verify 140.6 → 25.0 ms (5.6×)**. Prove: the
+   suffix tail is statement-independent above layer `params.n`, so it is built
+   once — footprint 1247 → 522 MiB, prove/1t ~780 → 631 ms.
+
+**Current state at 26,624 compressions**: prove ratio ~1.85×, verify ~2.50×
+(was ~8× on both). At **depth 8** it is 1.24× / 1.47× — see the depth-8 section
+for why, and for the free 23% available by using a power-of-two depth.
+
+**What is left** is no longer one thing. The assist is down to 15% of verify at
+depth 8 and the **lincheck fold is now 74%** of it. The assist's residual cost is
+still `k_log`-driven (columns `2^(k_log-7)`), so narrowing the block helps and
+more paths never do — which still makes the SHA-256 backend
+**counterproductive** (κ = 15 ⇒ composite `k_log` 20 ⇒ more columns), reversing
+what the open items below say. The bigger prover lever is the
+**multipoint-twisted prototype** already in `pcs/jagged.rs`: it deletes the
+128·K-statement structure rather than sharing within it (so it subsumes both
+optimizations above), is tested against brute force, and is *not* wired into
+`verify_batch_merged` — integration is the unfinished part.
 
 Three claims in earlier revisions of this file were measured to be wrong and are
 corrected in place: the verifier is not dominated by `fold_alpha_batched`; the
@@ -629,6 +641,54 @@ that test *before* rewiring the prover paid for itself — it caught an index
 underflow immediately (`assist_low_blocks` clamped to `m+2`, leaving the tail
 with no seed block for the per-statement pass to start from), which would
 otherwise have surfaced as a corrupt proof deep in a roundtrip.
+
+### Depth 8: near parity, and 19% of every depth-26 row is wasted
+
+`MVB_DEPTH=8`. A depth-8 path is 8 compressions, so 4096 paths = 32,768 of them
+— matched against 32,768 loose BLAKE3 blocks as usual.
+
+| | depth 8 (4096 paths, 32,768) | depth 26 (1024 paths, 26,624) |
+|---|---|---|
+| `k_log` / jagged columns | 17 / 1024 (1022 merged) | 19 / 4096 (3326 merged) |
+| row utilization | **99.6%** | 81.2% |
+| `dense_m` | 29 | 29 |
+| merkle prove/mt | 214 ms | 287 ms |
+| blake3 prove/mt | 172 ms | 155 ms |
+| **prove ratio** | **1.24×** | 1.85× |
+| merkle verify | **14.4 ms** | 25.7 ms |
+| blake3 verify | 9.8 ms | 10.3 ms |
+| **verify ratio** | **1.47×** | 2.50× |
+
+The column model predicted this and it held: 4× fewer columns bought **4.5×
+cheaper assist** on both sides — verify 9.35 → 2.07 ms, prove 137.64 → 29.66 ms,
+suffix footprint 522 → 192 MiB. Circuit size is identical to BLAKE3 again
+(21,029,709 vs 21,028,097 nnz/hash, +0.008%).
+
+**The lincheck fold now dominates at depth 8.** Of the 14.4 ms verify:
+`lincheck::verify_union` 10.23 ms (**74%**, `fold_alpha_batched` 9.66 ms), assist
+2.07 ms (15%), Ligerito open 0.50 ms. Since BLAKE3's fold is ~8.7 ms the fold is
+near parity, so most of the residual 1.47× is the assist's last 1.5 ms. That is a
+complete reversal of where this investigation started.
+
+**19% of every depth-26 row is wasted, and it is avoidable.**
+`k_log = 14 + log2(next_pow2(depth))`, so depth 26 allocates **32** level slots
+and uses 26; depth 8 uses 8 of 8. Hence 99.6% vs 81.2%, and why depth 8 fits
+32,768 compressions in the same `dense_m = 29` where depth 26 fits 26,624.
+
+The actionable form: **depth 32 costs exactly what depth 26 costs** — same
+`k_log = 19`, same column count, same assist, same commitment — while proving 32
+compressions per row instead of 26. That is 23% more hashing for free. If the
+depth is a design choice, powers of two are strictly better in this layout; if 26
+is fixed by the application, the 19% is the price of the aligned-subcube layout
+(which is what buys the `eq` factorization, so it is not a regression — just a
+cost worth knowing).
+
+Verify is flat in path count at depth 8 too (13.1 → 14.6 → 14.4 ms across
+32 → 1024 → 4096 paths), consistent with cost set by block width, not batch size.
+
+`packed_driver_matches_bool_reference` covers depth 8 at full and partial counts;
+every bench configuration round-trips prove + verify + claim equality before any
+timing is reported, so all six depth-8 configs are verified proofs.
 
 ### The zerocheck asymmetry: RESOLVED, it was not real
 

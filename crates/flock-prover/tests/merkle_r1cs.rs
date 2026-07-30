@@ -413,7 +413,9 @@ fn packed_driver_matches_bool_reference() {
     for (depth, nu, n_paths) in [
         (1usize, 3usize, 8usize),
         (2, 3, 8),
-        (3, 3, 5), // partial: 3 dummy rows
+        (3, 3, 5),  // partial: 3 dummy rows
+        (8, 3, 8),  // power-of-two depth: no wasted level slots
+        (8, 4, 13), // partial, power-of-two depth
         (26, 3, 8),
         (26, 4, 11), // partial at a wider capacity
         (26, 3, 1),  // single declared path, 7 dummies
