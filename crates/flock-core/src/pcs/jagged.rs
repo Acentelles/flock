@@ -928,13 +928,31 @@ fn assist_suffix_rows(
     sparse: &[[[(usize, usize); 2]; 4]; 4],
     m: usize,
 ) -> Vec<[F128; 4]> {
-    use rayon::prelude::*;
     let n_cols = cols.len();
     let mut rows = vec![[F128::ZERO; 4]; (m + 2) * n_cols];
     for seed in &mut rows[(m + 1) * n_cols..] {
         seed[STATE_SUCCESS] = F128::ONE;
     }
-    for layer in (0..=m).rev() {
+    assist_suffix_backward(&mut rows, cols, eq4s, sparse, 0, m);
+    rows
+}
+
+/// One backward step of the suffix recurrence, in place over a layer-major
+/// buffer: fills blocks `lo..=hi` from block `hi + 1`.
+///
+/// Note it reads only the height PAIR out of `cols` — the per-column weights
+/// never enter, which is half of why the tail below can be shared.
+fn assist_suffix_backward(
+    rows: &mut [[F128; 4]],
+    cols: &[(F128, u64, u64)],
+    eq4s: &[[F128; 4]],
+    sparse: &[[[(usize, usize); 2]; 4]; 4],
+    lo: usize,
+    hi: usize,
+) {
+    use rayon::prelude::*;
+    let n_cols = cols.len();
+    for layer in (lo..=hi).rev() {
         let (head, tail) = rows.split_at_mut((layer + 1) * n_cols);
         let dst = &mut head[layer * n_cols..];
         let src = &tail[..n_cols];
@@ -954,6 +972,117 @@ fn assist_suffix_rows(
                 }
             });
     }
+}
+
+/// The number of suffix blocks that must be built **per statement**: layers
+/// `0..n_row`. Everything from `n_row` up is shared — see
+/// [`assist_shared_suffix_tail`].
+///
+/// Clamped to `m + 1`, not `m + 2`: the tail must always keep block `m + 1`,
+/// the all-`STATE_SUCCESS` seed, because that is the block the per-statement
+/// backward pass starts from. A `z_row` longer than the dense depth would
+/// otherwise leave the tail empty and the seed nowhere.
+fn assist_low_blocks(n_row: usize, m: usize) -> usize {
+    n_row.min(m + 1)
+}
+
+/// The statement-INDEPENDENT tail of the suffix table: blocks for layers
+/// `n_row ..= m+1`, laid out layer-major with block `n_row` first.
+///
+/// `eq4s[layer] = eq([point_bit(z_row, layer), rho[layer]])`, and `point_bit`
+/// is `ZERO` past `z_row.len() = n_row`. So every layer at or above `n_row` has
+/// the same `eq4` for every statement — regardless of its Frobenius power,
+/// since squaring `ZERO` is `ZERO` — and the backward recurrence only ever
+/// reads `eq4s[layer..]` plus the height pairs, which are also shared. Hence
+/// the whole tail is common to all `128·K` statements and is built once.
+///
+/// Returns the tail and the shared `eq4s`, both of which the per-statement
+/// low-block pass needs.
+fn assist_shared_suffix_tail(
+    pairs_as_cols: &[(F128, u64, u64)],
+    rho: &[F128],
+    sparse: &[[[(usize, usize); 2]; 4]; 4],
+    m: usize,
+    n_row: usize,
+) -> Vec<[F128; 4]> {
+    let n_cols = pairs_as_cols.len();
+    let lo = assist_low_blocks(n_row, m);
+    // Layer-major over layers `lo ..= m+1`, so `m + 2 - lo` blocks.
+    let mut rows = vec![[F128::ZERO; 4]; (m + 2 - lo) * n_cols];
+    let seed_start = (m + 1 - lo) * n_cols;
+    for seed in &mut rows[seed_start..] {
+        seed[STATE_SUCCESS] = F128::ONE;
+    }
+    if lo <= m {
+        // `z_row` zero-padded: pass an empty point so `point_bit` yields ZERO.
+        let eq4s: Vec<[F128; 4]> = (0..=m)
+            .map(|layer| {
+                let t = build_eq_table(&[point_bit(&[], layer), point_bit(rho, layer)]);
+                [t[0], t[1], t[2], t[3]]
+            })
+            .collect();
+        // The buffer is shifted down by `lo`, so shift the layer indices too by
+        // handing the recurrence a view whose block `i` is layer `lo + i`.
+        assist_suffix_backward_shifted(&mut rows, pairs_as_cols, &eq4s, sparse, lo, m);
+    }
+    rows
+}
+
+/// [`assist_suffix_backward`] over a buffer whose block `0` is layer `lo`.
+fn assist_suffix_backward_shifted(
+    rows: &mut [[F128; 4]],
+    cols: &[(F128, u64, u64)],
+    eq4s: &[[F128; 4]],
+    sparse: &[[[(usize, usize); 2]; 4]; 4],
+    lo: usize,
+    hi: usize,
+) {
+    use rayon::prelude::*;
+    let n_cols = cols.len();
+    for layer in (lo..=hi).rev() {
+        let b = layer - lo;
+        let (head, tail) = rows.split_at_mut((b + 1) * n_cols);
+        let dst = &mut head[b * n_cols..];
+        let src = &tail[..n_cols];
+        let eq4 = &eq4s[layer];
+        dst.par_chunks_mut(ASSIST_CHUNK)
+            .zip(src.par_chunks(ASSIST_CHUNK))
+            .zip(cols.par_chunks(ASSIST_CHUNK))
+            .for_each(|((dc, sc), cc)| {
+                for ((dv, sv), &(_, t_c, t_next)) in dc.iter_mut().zip(sc).zip(cc) {
+                    let cd = ((t_c >> layer) & 1) as usize + 2 * ((t_next >> layer) & 1) as usize;
+                    let rows_cd = &sparse[cd];
+                    for (s, slot) in dv.iter_mut().enumerate() {
+                        let (i0, o0) = rows_cd[s][0];
+                        let (i1, o1) = rows_cd[s][1];
+                        *slot = eq4[i0] * sv[o0] + eq4[i1] * sv[o1];
+                    }
+                }
+            });
+    }
+}
+
+/// The per-statement suffix blocks: layers `0..n_row`, seeded from the shared
+/// tail's first block (layer `n_row`).
+fn assist_suffix_low(
+    cols: &[(F128, u64, u64)],
+    eq4s: &[[F128; 4]],
+    sparse: &[[[(usize, usize); 2]; 4]; 4],
+    m: usize,
+    n_row: usize,
+    shared_tail: &[[F128; 4]],
+) -> Vec<[F128; 4]> {
+    let n_cols = cols.len();
+    let lo = assist_low_blocks(n_row, m);
+    if lo == 0 {
+        return Vec::new();
+    }
+    // `lo + 1` blocks: layers `0..lo`, plus a copy of layer `lo` as the seed
+    // the recurrence reads. Truncated before returning.
+    let mut rows = vec![[F128::ZERO; 4]; (lo + 1) * n_cols];
+    rows[lo * n_cols..].copy_from_slice(&shared_tail[..n_cols]);
+    assist_suffix_backward(&mut rows, cols, eq4s, sparse, 0, lo - 1);
+    rows.truncate(lo * n_cols);
     rows
 }
 
@@ -1387,7 +1516,7 @@ fn frobenius_statements(
     params: &JaggedParams,
     claims: &[FrobeniusClaim<'_>],
     rho: &[F128],
-    with_sfx: bool,
+    sfx_tail: Option<&[[F128; 4]]>,
 ) -> Vec<FrobeniusStatement> {
     use rayon::prelude::*;
     let m = params.m;
@@ -1444,10 +1573,11 @@ fn frobenius_statements(
                     [t[0], t[1], t[2], t[3]]
                 })
                 .collect();
-            let sfx = if with_sfx {
-                assist_suffix_rows(&cols, &eq4s, &sparse, m)
-            } else {
-                Vec::new()
+            // Only the per-statement low blocks; layers at or above
+            // `params.n` come from the shared tail.
+            let sfx = match sfx_tail {
+                Some(tail) => assist_suffix_low(&cols, &eq4s, &sparse, m, params.n, tail),
+                None => Vec::new(),
             };
             let we: Vec<F128> = cols.iter().map(|&(w, _, _)| w).collect();
             let mut prefix_row = [F128::ZERO; 4];
@@ -1464,12 +1594,35 @@ fn frobenius_statements(
     if trace {
         eprintln!(
             "            [fro-st] per-spec build{} ({} cols each): {}",
-            if with_sfx { " + suffix rows" } else { "" },
+            if sfx_tail.is_some() {
+                " + low suffix blocks"
+            } else {
+                ""
+            },
             out.first().map_or(0, |s| s.cols.len()),
             tfmt(t.elapsed().as_secs_f64())
         );
     }
     out
+}
+
+/// Suffix block for `block` (a layer index), from the statement's own low
+/// blocks when `block < lo`, else from the tail shared by every statement.
+/// See [`assist_shared_suffix_tail`] for why the tail is common.
+#[inline]
+fn sfx_block<'a>(
+    own: &'a [[F128; 4]],
+    tail: &'a [[F128; 4]],
+    lo: usize,
+    block: usize,
+    n_cols: usize,
+) -> &'a [[F128; 4]] {
+    if block < lo {
+        &own[block * n_cols..(block + 1) * n_cols]
+    } else {
+        let b = block - lo;
+        &tail[b * n_cols..(b + 1) * n_cols]
+    }
 }
 
 /// One statement's per-layer pass: fold the previous layer's challenges
@@ -1481,9 +1634,11 @@ fn frobenius_layer_pass(
     layer: usize,
     ch4: Option<&[F128; 4]>,
     sparse: &[[[(usize, usize); 2]; 4]; 4],
+    sfx_tail: &[[F128; 4]],
+    lo: usize,
 ) -> ([[F128; 4]; 4], [[F128; 4]; 4]) {
     let n_cols = st.cols.len();
-    let row = &st.sfx[(layer + 1) * n_cols..(layer + 2) * n_cols];
+    let row = sfx_block(&st.sfx, sfx_tail, lo, layer + 1, n_cols);
     let mut buckets = [[F128::ZERO; 4]; 4];
     for ((w_e, &(_, t_c, t_next)), s) in st.we.iter_mut().zip(&st.cols).zip(row) {
         if let Some(ch4) = ch4 {
@@ -1522,10 +1677,12 @@ fn frobenius_layer_pass_par(
     layer: usize,
     ch4: Option<&[F128; 4]>,
     sparse: &[[[(usize, usize); 2]; 4]; 4],
+    sfx_tail: &[[F128; 4]],
+    lo: usize,
 ) -> ([[F128; 4]; 4], [[F128; 4]; 4]) {
     use rayon::prelude::*;
     let n_cols = st.cols.len();
-    let row = &st.sfx[(layer + 1) * n_cols..(layer + 2) * n_cols];
+    let row = sfx_block(&st.sfx, sfx_tail, lo, layer + 1, n_cols);
     let buckets = st
         .we
         .par_chunks_mut(ASSIST_CHUNK)
@@ -1590,7 +1747,16 @@ pub fn prove_frobenius_assist<C: Challenger>(
     let trace = std::env::var("PCS_TRACE").is_ok();
     let t = std::time::Instant::now();
     let sparse = assist_sparse_transitions();
-    let mut sts = frobenius_statements(params, claims, rho, true);
+    // The suffix tail (layers >= params.n) is identical for every statement —
+    // `point_bit` zero-pads `z_row`, so those layers' eq4s depend only on rho.
+    // Build it ONCE; each statement then materializes only layers `0..n`.
+    let lo = assist_low_blocks(params.n, m);
+    let pairs_as_cols: Vec<(F128, u64, u64)> = assist_column_pairs(params)
+        .into_iter()
+        .map(|(c, d)| (F128::ZERO, c, d))
+        .collect();
+    let sfx_tail = assist_shared_suffix_tail(&pairs_as_cols, rho, &sparse, m, params.n);
+    let mut sts = frobenius_statements(params, claims, rho, Some(&sfx_tail));
     if trace {
         eprintln!(
             "    [frobenius] statements + suffix rows (x{}): {:6.2} ms",
@@ -1603,9 +1769,10 @@ pub fn prove_frobenius_assist<C: Challenger>(
     let v = sts
         .par_iter()
         .map(|st| {
+            let n_cols = st.cols.len();
             st.cols
                 .iter()
-                .zip(&st.sfx[..st.cols.len()])
+                .zip(sfx_block(&st.sfx, &sfx_tail, lo, 0, n_cols))
                 .map(|(&(w, _, _), s)| w * s[STATE_INITIAL])
                 .fold(F128::ZERO, |a, x| a + x)
         })
@@ -1639,14 +1806,14 @@ pub fn prove_frobenius_assist<C: Challenger>(
             // parallelize WITHIN each statement — same values,
             // XOR-reassociated.
             for (st, o) in sts.iter_mut().zip(per.iter_mut()) {
-                *o = frobenius_layer_pass_par(st, layer, c4, &sparse);
+                *o = frobenius_layer_pass_par(st, layer, c4, &sparse, &sfx_tail, lo);
             }
         } else {
             sts.par_chunks_mut(8)
                 .zip(per.par_chunks_mut(8))
                 .for_each(|(stc, oc)| {
                     for (st, o) in stc.iter_mut().zip(oc.iter_mut()) {
-                        *o = frobenius_layer_pass(st, layer, c4, &sparse);
+                        *o = frobenius_layer_pass(st, layer, c4, &sparse, &sfx_tail, lo);
                     }
                 });
         }
@@ -1706,14 +1873,16 @@ pub fn prove_frobenius_assist<C: Challenger>(
     // caller's residual.
     if trace {
         let per = sts.first().map_or(0, |s| s.sfx.len() * 64);
+        let shared = sfx_tail.len() * 64;
         let t_drop = std::time::Instant::now();
         let n = sts.len();
         drop(sts);
         eprintln!(
-            "    [frobenius] free suffix rows ({} MiB = {} x {:.1} MiB): {:6.2} ms",
-            n * per / (1 << 20),
+            "    [frobenius] free suffix rows ({} MiB = {} x {:.1} MiB low + {:.1} MiB shared): {:6.2} ms",
+            (n * per + shared) / (1 << 20),
             n,
             per as f64 / (1 << 20) as f64,
+            shared as f64 / (1 << 20) as f64,
             t_drop.elapsed().as_secs_f64() * 1e3
         );
     }
@@ -1771,7 +1940,7 @@ pub fn verify_frobenius_assist<C: Challenger>(
     }
 
     let t = std::time::Instant::now();
-    let sts = frobenius_statements(params, claims, rho, false);
+    let sts = frobenius_statements(params, claims, rho, None);
     if trace {
         eprintln!(
             "          [fro-v] frobenius_statements (x{}, {} cols each): {}",
@@ -3270,6 +3439,66 @@ mod tests {
         (params, q)
     }
 
+    /// The split suffix table (shared tail + per-statement low blocks) must
+    /// reassemble into exactly what [`assist_suffix_rows`] builds monolithically.
+    ///
+    /// This is the load-bearing check for the prover-side sharing: suffix blocks
+    /// at layers `>= z_row.len()` are claimed to be statement-independent,
+    /// because `point_bit` zero-pads `z_row` and the recurrence reads only
+    /// `eq4s[layer..]` plus the height pairs. If that is off by one layer, the
+    /// prover silently emits a wrong proof.
+    #[test]
+    fn split_suffix_matches_monolithic() {
+        let mut ch = RandomChallenger::new(0x5F17_5FFB);
+        let sparse = assist_sparse_transitions();
+        for &(n_row, k, m) in &[
+            (3usize, 2usize, 5usize),
+            (4, 3, 7),
+            (2, 4, 8),
+            (1, 3, 6),
+            (6, 2, 6), // n_row == m: only the seed block is shared
+            (8, 2, 6), // n_row > m + 1: nothing is shared
+        ] {
+            let (params, _q) = random_instance(&mut ch, n_row, k, m);
+            let rho = sample_vec(&mut ch, m);
+            let zr = sample_vec(&mut ch, n_row);
+            let cols = assist_columns(&params, &sample_vec(&mut ch, k));
+            let n_cols = cols.len();
+
+            // Exactly the eq4s `frobenius_statements` builds for one statement.
+            let eq4s: Vec<[F128; 4]> = (0..=m)
+                .map(|layer| {
+                    let t = build_eq_table(&[point_bit(&zr, layer), point_bit(&rho, layer)]);
+                    [t[0], t[1], t[2], t[3]]
+                })
+                .collect();
+
+            let want = assist_suffix_rows(&cols, &eq4s, &sparse, m);
+            let tail = assist_shared_suffix_tail(&cols, &rho, &sparse, m, n_row);
+            let low = assist_suffix_low(&cols, &eq4s, &sparse, m, n_row, &tail);
+
+            let lo = assist_low_blocks(n_row, m);
+            assert_eq!(low.len(), lo * n_cols, "n_row={n_row} k={k} m={m}: low len");
+            assert_eq!(
+                tail.len(),
+                (m + 2 - lo) * n_cols,
+                "n_row={n_row} k={k} m={m}: tail len"
+            );
+            for layer in 0..=(m + 1) {
+                let got = if layer < lo {
+                    &low[layer * n_cols..(layer + 1) * n_cols]
+                } else {
+                    &tail[(layer - lo) * n_cols..(layer - lo + 1) * n_cols]
+                };
+                assert_eq!(
+                    got,
+                    &want[layer * n_cols..(layer + 1) * n_cols],
+                    "n_row={n_row} k={k} m={m}: suffix block for layer {layer}"
+                );
+            }
+        }
+    }
+
     /// The hoisted `eq(pairs, σ)` table must reproduce [`assist_w_at`] exactly.
     ///
     /// `verify_frobenius_assist` computes `W(σ)` once for all statements as
@@ -3314,7 +3543,7 @@ mod tests {
                 })
                 .collect();
 
-            let sts = frobenius_statements(&params, &fclaims, &rho, false);
+            let sts = frobenius_statements(&params, &fclaims, &rho, None);
             assert!(!sts.is_empty(), "n={n} k={k} m={m}: no statements");
             let pairs = assist_column_pairs(&params);
             let eq_pairs = assist_eq_pairs_at(&pairs, &sigma, m);

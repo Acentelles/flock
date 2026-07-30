@@ -581,6 +581,55 @@ Ratios post-merge: prove/mt 2.1–2.5×, prove/1t **1.8×**, verify 9.9×. Ident
 88%/95% attribution to pre-merge — the merge changed the constant, not the
 shape. `verify_frobenius_assist` remains the only thing worth attacking.
 
+### The prover's analogue: a shared suffix tail — 58% less memory, prove/1t 14%
+
+The verifier's hoist does not apply to the prover (its suffix-row streaming is a
+different algorithm), but a *different* sharing does, and it comes from two facts
+in the code rather than from the protocol:
+
+* `assist_suffix_rows` destructures `&(_, t_c, t_next)` — it reads only the
+  height PAIR, never the per-column weights.
+* `point_bit(z, layer)` returns `ZERO` past `z.len()`. So
+  `eq4s[layer] = eq([point_bit(z_row, layer), rho[layer]])` depends **only on
+  rho** for every `layer >= z_row.len() = params.n` — and squaring `ZERO` is
+  `ZERO`, so this holds at every Frobenius power.
+
+The backward recurrence reads only `eq4s[layer..]` plus the pairs, so by
+induction **every suffix block from layer `params.n` up is identical across all
+128·K statements**. At 1024 paths (`n = 10`, `m = 22`) that is blocks 10..23 —
+14 of 24. `assist_shared_suffix_tail` builds them once; each statement
+materializes only layers `0..n`, seeded from the tail.
+
+| | before | after | |
+|---|---|---|---|
+| suffix footprint | 1247 MiB | **522 MiB** | **58% less** |
+| statements + suffix build | 92.32 ms | 60.54 ms | 1.5× |
+| `v` + round loop | 49.83 ms | 50.70 ms | unchanged, as predicted |
+| `free()` the suffix rows | 44.00 ms | 26.23 ms | 1.7× |
+| **assist total** | **186.22 ms** | **137.64 ms** | **1.35×** |
+| Merkle prove/1t | 733–838 ms | **631 ms** | ~14% |
+| peak RSS | 2.78 GB | **2.24 GB** | |
+
+The 58% memory saving matched the prediction exactly (`1 − n/(m+2)` = 58.3%).
+The build saved less than that (35%, not 58%) because the per-spec pass also does
+`assist_columns` — a `2^k`-entry `eq` table per statement — which does **not**
+share, since each statement's `z_col` is genuinely Frobenius-powered. The round
+loop is unchanged by design: it reads the same blocks, just some of them from the
+shared array. Verify is unaffected (it passes `None` and never builds suffixes).
+
+Note the sharing fraction is `1 − n/(m+2)`, so it **grows as rows shrink** —
+Merkle at `nu = 10` saves 58% where BLAKE3 at `nu = 15` saves 37%. The Merkle
+table benefits more, which is the right direction for once.
+
+Licensed by `split_suffix_matches_monolithic`: the shared tail plus the
+per-statement low blocks must reassemble into exactly what `assist_suffix_rows`
+builds in one piece, checked block-by-block over 6 shapes including
+`n_row == m` (only the seed shared) and `n_row > m+1` (nothing shared). Writing
+that test *before* rewiring the prover paid for itself — it caught an index
+underflow immediately (`assist_low_blocks` clamped to `m+2`, leaving the tail
+with no seed block for the per-statement pass to start from), which would
+otherwise have surfaced as a corrupt proof deep in a roundtrip.
+
 ### The zerocheck asymmetry: RESOLVED, it was not real
 
 An earlier revision of these notes flagged `zerocheck + s_hat_v_c` at 224 ms vs
@@ -679,6 +728,9 @@ drop (~34 MB), not verified.
 **Prove** — three roughly equal thirds, all column-scaled. **Not** improved by
 the hoist above, which is verifier-only; the prover's suffix-row streaming is a
 different algorithm:
+
+(Superseded by the shared-suffix-tail section below — the numbers here are the
+pre-optimization baseline.)
 
 | phase | merkle | blake3 | ratio | share |
 |---|---|---|---|---|
