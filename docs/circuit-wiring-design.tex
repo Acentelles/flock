@@ -329,6 +329,14 @@ each cell its word.
 \subsection{Mechanism: why a permutation proves the copy
 constraints}\label{sec:wiring-mech}
 
+Terminology first: ``copy constraints'' is Plonk's name for the
+\emph{wiring equalities} --- the requirements that certain cells hold
+equal values. They are \textbf{not} R1CS constraints: no gate, row,
+column, or matrix entry implements them, and the R1CS stays
+block-diagonal with each gate an island. Their entire enforcement is the
+product identity below, which lives outside the constraint system and
+commits nothing.
+
 \paragraph{No dataflow.} At the proof level nothing is ``read'' or
 ``routed''. Every gate is a self-contained row whose constraints touch
 only its \emph{own} cells. ``Gate $A$'s output feeds gates $B$ and $C$''
