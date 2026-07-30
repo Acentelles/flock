@@ -75,6 +75,77 @@ pub enum VerifyError {
     SumcheckFinalFailed,
 }
 
+// ---------------------------------------------------------------------------
+// Count-proportional row rounds
+// ---------------------------------------------------------------------------
+
+/// Engage the support-proportional row rounds while
+/// `live_rows · SPARSE_GATE ≤ capacity_rows` — i.e. at or below half
+/// utilization. Full utilization stays dense: the sparse path's per-column
+/// bookkeeping only pays for itself once a real fraction of the rows is dead,
+/// and the dense kernels are the calibrated choice at the anchor shape.
+const SPARSE_GATE: usize = 2;
+
+/// The declared row support of a region, per COLUMN — everything the
+/// support-proportional row rounds need.
+///
+/// Rows are the LOW `nu` address bits, so a column's live rows are a PREFIX
+/// `[0, live[c])` and folding maps prefix to prefix (`live' = ceil(live/2)`).
+/// That is what makes the skipping a per-column loop bound rather than an
+/// interval intersection.
+///
+/// `a_dead`/`b_dead` are the values `pa`/`pb` take on a column's DEAD rows.
+/// They are not zero — on a dummy row `z = 0` so `A_0·z = 0`, leaving the
+/// affine constant `a_const[y]` — but they are *constant down the column*, and
+/// folding a constant preserves it, so a fully-dead entry equals `a_dead[c]` at
+/// EVERY round. Substituting them analytically is what makes the sparse path
+/// **bit-identical** to the dense one instead of merely value-identical: no
+/// round message changes, so no pinned proof moves.
+///
+/// `wz` needs no such vector: the witness itself is zero on every dead word.
+#[derive(Clone, Debug)]
+pub struct RowSupport {
+    /// Declared live rows of each region column; `0` for padding columns and
+    /// inter-slot gaps (which are dead in all three tables at every row).
+    pub live: Vec<usize>,
+    /// `a_const[y]` / `b_const[y]` of each region column, i.e. the value the
+    /// column's dead rows carry. `F128::ZERO` where `live` is 0.
+    pub a_dead: Vec<F128>,
+    pub b_dead: Vec<F128>,
+}
+
+impl RowSupport {
+    /// Total declared rows across the region.
+    fn live_rows(&self) -> usize {
+        self.live.iter().sum()
+    }
+
+    /// Whether the support is sparse enough for the row rounds to pay off.
+    fn worth_skipping(&self, nu: usize) -> bool {
+        nu > 0 && self.live_rows() * SPARSE_GATE <= self.live.len() << nu
+    }
+
+    /// Live PAIR intervals over the post-fold index space of a round with
+    /// `row_vars` remaining row variables: column `c` owns
+    /// `[c·P, c·P + ceil(live[c]/2))` with `P = 2^(row_vars−1)`.
+    fn pair_intervals(&self, row_vars: usize) -> Vec<(usize, usize)> {
+        let p = 1usize << (row_vars - 1);
+        self.live
+            .iter()
+            .enumerate()
+            .filter(|&(_, &n)| n > 0)
+            .map(|(c, &n)| (c * p, c * p + n.div_ceil(2)))
+            .collect()
+    }
+
+    /// Halve every column's live prefix — the support after one row round.
+    fn halve(&mut self) {
+        for n in &mut self.live {
+            *n = n.div_ceil(2);
+        }
+    }
+}
+
 /// Prove the zerocheck for one element table.
 ///
 /// `pa`, `pb` are `(Az + a_const)` and `(Bz + b_const)` over the whole padded
@@ -108,6 +179,32 @@ pub fn prove_with_label<C: Challenger>(
     m_words: usize,
     ch: &mut C,
 ) -> (Proof, Claim) {
+    prove_with_support(label, pa, pb, z, m_words, 0, None, ch)
+}
+
+/// [`prove_with_label`] with the declared row support, so the row rounds cost
+/// `O(live rows · columns)` instead of `O(2^m_words)`.
+///
+/// `nu` is the number of LOW row variables and `support` describes their
+/// per-column live prefixes ([`RowSupport`]). The output is **bit-identical**
+/// to `support = None`: a dead pair contributes nothing to either round message
+/// (`G(1)`'s summand is `a_const·b_const + 0 = 0` by the type's validity rule,
+/// and `G(∞)`'s factor `wa[i0] + wa[i1]` vanishes in characteristic 2 because
+/// both entries hold the same constant), and the one boundary pair per column
+/// reads its dead half from `a_dead`/`b_dead` rather than from the buffer.
+///
+/// Requires the honest-witness contract the union already imposes: `z` is
+/// identically zero on dummy rows, padding columns and gaps. Debug-asserted.
+pub fn prove_with_support<C: Challenger>(
+    label: &[u8],
+    pa: Vec<F128>,
+    pb: Vec<F128>,
+    z: &[F128],
+    m_words: usize,
+    nu: usize,
+    support: Option<&RowSupport>,
+    ch: &mut C,
+) -> (Proof, Claim) {
     let n_words = 1usize << m_words;
     assert_eq!(pa.len(), n_words, "pa length");
     assert_eq!(pb.len(), n_words, "pb length");
@@ -117,21 +214,87 @@ pub fn prove_with_label<C: Challenger>(
     ch.observe_label(label);
     let tau = ch.sample_f128_vec(m_words);
 
+    // Support-proportional row rounds, or all-dense. Decided ONCE: a mid-loop
+    // switch would have to reconcile the sparse path's unwritten dead slots
+    // with the dense kernel's full-array reads, and the row rounds carry
+    // essentially all the work anyway (round 0 alone is half of it).
+    let mut sparse = match support {
+        Some(sup) if sup.worth_skipping(nu) => {
+            assert_eq!(sup.live.len(), 1usize << (m_words - nu), "support columns");
+            debug_assert!(
+                dead_words_are_zero(z, nu, sup),
+                "the witness must be zero on every dead word \
+                 (dummy rows, padding columns, gaps)"
+            );
+            Some(sup.clone())
+        }
+        _ => None,
+    };
+
     let (mut wa, mut wb) = (pa, pb);
-    let mut wz = z.to_vec();
+    // The working copy of the witness. On the sparse path only the live
+    // prefixes are ever read, so copying the dead tail (which is most of the
+    // region at low utilization) would itself be O(2^m_words) — the one pass
+    // that would have kept the row rounds off the count axis.
+    let mut wz = match &sparse {
+        Some(sup) => {
+            let rows = 1usize << nu;
+            let mut w = crate::scratch::take_f128(n_words);
+            for (c, &n) in sup.live.iter().enumerate() {
+                w[c * rows..c * rows + n].copy_from_slice(&z[c * rows..c * rows + n]);
+            }
+            w
+        }
+        None => z.to_vec(),
+    };
     let mut rounds = Vec::with_capacity(m_words);
     let mut r = Vec::with_capacity(m_words);
     for i in 0..m_words {
         let eq = SplitEqGhash::new(&tau[i + 1..]);
-        let (g1, g_inf) = round_message(&wa, &wb, &wz, &eq);
+        let row_vars = nu.saturating_sub(i);
+        let use_sparse = sparse.is_some() && row_vars > 0;
+        let (g1, g_inf) = match (&sparse, use_sparse) {
+            (Some(sup), true) => round_message_sparse(&wa, &wb, &wz, &eq, row_vars, sup),
+            _ => round_message(&wa, &wb, &wz, &eq),
+        };
         ch.observe_f128(g1);
         ch.observe_f128(g_inf);
         let rho = ch.sample_f128();
         rounds.push((g1, g_inf));
         r.push(rho);
-        fold_low(&mut wa, rho);
-        fold_low(&mut wb, rho);
-        fold_low(&mut wz, rho);
+        match (&mut sparse, use_sparse) {
+            (Some(sup), true) => {
+                fold_low_sparse(&mut wa, rho, row_vars, &sup.live, &sup.a_dead);
+                fold_low_sparse(&mut wb, rho, row_vars, &sup.live, &sup.b_dead);
+                fold_low_sparse_zero(&mut wz, rho, row_vars, &sup.live);
+                sup.halve();
+                if row_vars == 1 {
+                    // Last row round: the column rounds that follow are dense,
+                    // so give them a fully valid array. Only the columns with
+                    // NO declared rows are unwritten, and their correct final
+                    // value is the constant their dead rows carry — NOT zero.
+                    // Folding a constant column preserves it, so `a_dead[c]`
+                    // is what the dense path would have produced; writing zero
+                    // instead loses `â_const(r)` from `ea`, which the lincheck
+                    // then fails to reconcile (a count-0 slot is exactly this
+                    // case). `wz` really is zero: the witness is.
+                    // O(columns), negligible.
+                    let done = std::mem::take(&mut sparse).expect("checked");
+                    for (c, &n) in done.live.iter().enumerate() {
+                        if n == 0 {
+                            wa[c] = done.a_dead[c];
+                            wb[c] = done.b_dead[c];
+                            wz[c] = F128::ZERO;
+                        }
+                    }
+                }
+            }
+            _ => {
+                fold_low(&mut wa, rho);
+                fold_low(&mut wb, rho);
+                fold_low(&mut wz, rho);
+            }
+        }
     }
     debug_assert_eq!(wa.len(), 1);
 
@@ -278,6 +441,178 @@ fn round_message(wa: &[F128], wb: &[F128], wz: &[F128], eq: &SplitEqGhash) -> (F
             (g1, g_inf)
         }
     }
+}
+
+/// For each LIVE pair index in `[lo, hi)`, call `f(xp, c, odd_live)`: the
+/// pair's flat index, its region column, and whether the pair's ODD row is
+/// still live (if not, the caller substitutes the column's dead value).
+///
+/// `iv` is the per-column live pair intervals, ascending and disjoint, so the
+/// entry point is a `partition_point` and each interval's column is `s / pairs`.
+#[inline]
+fn for_live_pairs(
+    iv: &[(usize, usize)],
+    lo: usize,
+    hi: usize,
+    pairs: usize,
+    live: &[usize],
+    mut f: impl FnMut(usize, usize, bool),
+) {
+    let start = iv.partition_point(|&(_, e)| e <= lo);
+    for &(s, e) in &iv[start..] {
+        if s >= hi {
+            break;
+        }
+        let c = s / pairs;
+        let nl = live[c];
+        for xp in s.max(lo)..e.min(hi) {
+            f(xp, c, 2 * (xp - c * pairs) + 1 < nl);
+        }
+    }
+}
+
+/// Support-proportional sibling of [`round_message`]: the same eq-weighted
+/// `(G(1), G(∞))` over the LIVE pairs only.
+///
+/// A pair whose two rows are both dead contributes nothing to either message —
+/// see [`prove_with_support`] — so the walk covers just the per-column live
+/// prefixes. The single boundary pair a column has when its live count is odd
+/// reads its dead half from `a_dead`/`b_dead` (and zero for `wz`), which is why
+/// this is bit-identical rather than merely value-identical.
+///
+/// **Block-major, like the dense kernel.** Tasks are `eq.hi` blocks and the
+/// `eq_hi` factor is applied ONCE to each block's accumulated sum, not per
+/// pair. Doing it per pair costs an extra F128 multiply on every element and
+/// measured *slower* than the dense kernel it was meant to beat, even at 1/16
+/// utilization.
+fn round_message_sparse(
+    wa: &[F128],
+    wb: &[F128],
+    wz: &[F128],
+    eq: &SplitEqGhash,
+    row_vars: usize,
+    sup: &RowSupport,
+) -> (F128, F128) {
+    let rows = 1usize << row_vars; // rows per column, this round
+    let pairs = rows / 2; // post-fold rows per column
+    let block = eq.lo.len();
+    let n_blocks = eq.hi.len();
+    let iv = sup.pair_intervals(row_vars);
+
+    let block_fn = |x_hi: usize| -> (F128, F128) {
+        let base = x_hi * block;
+        let (mut s1, mut s_inf) = (F128::ZERO, F128::ZERO);
+        for_live_pairs(&iv, base, base + block, pairs, &sup.live, |xp, c, odd| {
+            let i0 = 2 * xp;
+            let (a0, b0) = (wa[i0], wb[i0]);
+            let (a1, b1, z1) = if odd {
+                (wa[i0 + 1], wb[i0 + 1], wz[i0 + 1])
+            } else {
+                (sup.a_dead[c], sup.b_dead[c], F128::ZERO)
+            };
+            let el = eq.lo[xp - base];
+            s1 += el * (a1 * b1 + z1);
+            // Char 2: (a1 − a0)(b1 − b0) = (a0 + a1)(b0 + b1).
+            s_inf += el * ((a0 + a1) * (b0 + b1));
+        });
+        let eh = eq.hi[x_hi];
+        (eh * s1, eh * s_inf)
+    };
+
+    // Gate on the LIVE pair count, not the dense size: at low utilization the
+    // real work is a few hundred pairs and rayon task spawn would dominate it.
+    match crate::sumcheck_round_min_len(live_pairs_total(&iv), n_blocks) {
+        Some(min_len) => (0..n_blocks)
+            .into_par_iter()
+            .with_min_len(min_len)
+            .map(block_fn)
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(a1, ai), (b1, bi)| (a1 + b1, ai + bi),
+            ),
+        None => (0..n_blocks).map(block_fn).fold(
+            (F128::ZERO, F128::ZERO),
+            |(a1, ai), (b1, bi)| (a1 + b1, ai + bi),
+        ),
+    }
+}
+
+/// Total live pairs described by an interval list.
+fn live_pairs_total(iv: &[(usize, usize)]) -> usize {
+    iv.iter().map(|&(s, e)| e - s).sum()
+}
+
+/// Support-proportional sibling of [`fold_low`] for `pa`/`pb`: fold only each
+/// column's live pair prefix, substituting `dead[c]` for a dead odd row.
+///
+/// Dead output slots are left UNWRITTEN. That is sound because liveness is a
+/// per-column prefix that folding maps to a prefix, so nothing downstream ever
+/// reads them — the message and fold of every later round are bounded by the
+/// halved prefix, and the last row round fills the fully-dead columns before
+/// the dense column rounds take over.
+///
+/// Parallel over FLAT output chunks (not columns): element blocks are narrow
+/// and tall, so a column-parallel fold collapses to `2^kappa` threads.
+fn fold_low_sparse(u: &mut Vec<F128>, rho: F128, row_vars: usize, live: &[usize], dead: &[F128]) {
+    let pairs = 1usize << (row_vars - 1);
+    let half = u.len() / 2;
+    let iv: Vec<(usize, usize)> = live
+        .iter()
+        .enumerate()
+        .filter(|&(_, &n)| n > 0)
+        .map(|(c, &n)| (c * pairs, c * pairs + n.div_ceil(2)))
+        .collect();
+    let mut out = crate::scratch::take_f128(half);
+    {
+        let src: &[F128] = u;
+        let total = live_pairs_total(&iv);
+        // Gate on LIVE work: `par_chunks_mut` over the full output would spawn
+        // a task per chunk regardless of how few pairs are live, and at low
+        // utilization that spawn cost is the whole round.
+        match crate::fold_min_len(total) {
+            None => {
+                let out: &mut [F128] = &mut out;
+                for_live_pairs(&iv, 0, half, pairs, live, |xp, c, odd| {
+                    let i0 = 2 * xp;
+                    let a0 = src[i0];
+                    let a1 = if odd { src[i0 + 1] } else { dead[c] };
+                    out[xp] = a0 + rho * (a1 + a0);
+                });
+            }
+            Some(_) => {
+                let chunk = (half / rayon::current_num_threads().max(1))
+                    .next_power_of_two()
+                    .max(1 << 10);
+                out.par_chunks_mut(chunk).enumerate().for_each(|(k, dst)| {
+                    let base = k * chunk;
+                    for_live_pairs(&iv, base, base + dst.len(), pairs, live, |xp, c, odd| {
+                        let i0 = 2 * xp;
+                        let a0 = src[i0];
+                        let a1 = if odd { src[i0 + 1] } else { dead[c] };
+                        dst[xp - base] = a0 + rho * (a1 + a0);
+                    });
+                });
+            }
+        }
+    }
+    let old = std::mem::replace(u, out);
+    crate::scratch::give_f128(old);
+}
+
+/// [`fold_low_sparse`] for the witness table, whose dead rows are genuinely
+/// zero (so the substituted odd half is `F128::ZERO`).
+fn fold_low_sparse_zero(u: &mut Vec<F128>, rho: F128, row_vars: usize, live: &[usize]) {
+    let zeros = vec![F128::ZERO; live.len()];
+    fold_low_sparse(u, rho, row_vars, live, &zeros);
+}
+
+/// Whether the witness is zero on every word the support declares dead — the
+/// precondition the sparse row rounds rest on.
+fn dead_words_are_zero(z: &[F128], nu: usize, sup: &RowSupport) -> bool {
+    let rows = 1usize << nu;
+    sup.live.iter().enumerate().all(|(c, &n)| {
+        z[c * rows + n..(c + 1) * rows].iter().all(|w| w.is_zero())
+    })
 }
 
 /// Bind the low variable of one table at `rho`, halving it:

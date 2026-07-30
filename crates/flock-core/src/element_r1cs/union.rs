@@ -117,6 +117,38 @@ pub fn region_slots<'r>(union: &UnionInstance<'r>) -> Vec<RegionSlot<'r>> {
         .collect()
 }
 
+/// The region's declared row support, per region COLUMN: `n_t` on slot `t`'s
+/// used columns and 0 on its padding columns, on inter-slot gaps and on the
+/// region tail — plus the affine constants those columns' dead rows carry.
+///
+/// This is what makes the element zerocheck's row rounds count-proportional
+/// (see [`zerocheck::RowSupport`]). It is derived from the SAME per-slot counts
+/// the jagged heights use, so prover and verifier cannot disagree about which
+/// rows exist — and it changes no round message, so it is invisible to the
+/// verifier entirely.
+fn row_support(slots: &[RegionSlot<'_>], nu: usize, e_vars: usize) -> zerocheck::RowSupport {
+    let n_cols = 1usize << (e_vars - nu);
+    let mut live = vec![0usize; n_cols];
+    let mut a_dead = vec![F128::ZERO; n_cols];
+    let mut b_dead = vec![F128::ZERO; n_cols];
+    for s in slots {
+        let off = s.layout.column_offset(nu);
+        // Only the `k` REAL columns carry data; the padding columns past them
+        // are pinned to zero by their all-zero constraint rows, so they are
+        // dead at every row (and their constants are zero anyway).
+        for y in 0..s.ty.k() {
+            live[off + y] = s.layout.n_t;
+            a_dead[off + y] = s.ty.a_const()[y];
+            b_dead[off + y] = s.ty.b_const()[y];
+        }
+    }
+    zerocheck::RowSupport {
+        live,
+        a_dead,
+        b_dead,
+    }
+}
+
 /// The region PIOP's proof: the two phases' round messages and final values.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Proof {
@@ -169,15 +201,27 @@ pub fn prove<C: Challenger>(
     assert!(!slots.is_empty(), "region PIOP needs at least one element slot");
     assert_eq!(z.len(), 1usize << e_vars, "region witness length");
 
-    // ---- Phase 1: one zerocheck over the whole region.
-    let (zc_proof, zc) = zerocheck::prove_with_label(ZC_LABEL, pa, pb, z, e_vars, ch);
+    // ---- Phase 1: one zerocheck over the whole region, with the declared row
+    // support so the row rounds cost `O(Σ n_t · used_cols)` instead of
+    // `O(2^E)`. Bit-identical to the dense path — see `zerocheck::RowSupport`.
+    let support = row_support(&slots, nu, e_vars);
+    let (zc_proof, zc) = zerocheck::prove_with_support(
+        ZC_LABEL,
+        pa,
+        pb,
+        z,
+        e_vars,
+        nu,
+        Some(&support),
+        ch,
+    );
     let (va, vb) = strip_constants(&slots, nu, &zc);
 
     // ---- Phase 2: the column-domain lincheck with the per-slot collapse.
     ch.observe_label(LC_LABEL);
     let alpha = ch.sample_f128();
     let mut comb = region_comb(&slots, nu, e_vars, alpha, &zc.r);
-    let mut g = collapse_rows(z, &zc.r[..nu]);
+    let mut g = collapse_rows(z, &zc.r[..nu], Some(&support.live));
     debug_assert_eq!(
         comb.iter().zip(&g).fold(F128::ZERO, |a, (x, y)| a + *x * *y),
         va + alpha * vb,
@@ -395,13 +439,19 @@ fn region_comb_at(
 /// single pass — and it is the row collapse of the REGION, gaps included
 /// (where it is zero), which is what makes the output claim an evaluation of
 /// the committed polynomial.
-fn collapse_rows(z: &[F128], r_row: &[F128]) -> Vec<F128> {
+fn collapse_rows(z: &[F128], r_row: &[F128], live: Option<&[usize]>) -> Vec<F128> {
     let eq_row = crate::pcs::ring_switch::build_eq_parallel(r_row);
     let rows = eq_row.len();
     debug_assert_eq!(z.len() % rows, 0);
     z.par_chunks(rows)
-        .map(|col| {
-            col.iter()
+        .enumerate()
+        .map(|(c, col)| {
+            // Count-proportional: the witness is zero past the declared rows,
+            // so truncating the dot product drops only zero terms — the sum is
+            // bit-identical.
+            let n = live.map_or(rows, |l| l[c]);
+            col[..n]
+                .iter()
                 .zip(&eq_row)
                 .fold(F128::ZERO, |acc, (v, e)| acc + *v * *e)
         })
@@ -679,7 +729,7 @@ mod tests {
             let alpha = rng.f128();
 
             let comb = region_comb(&slots, nu, e_vars, alpha, &r);
-            let g = collapse_rows(&z, &r[..nu]);
+            let g = collapse_rows(&z, &r[..nu], None);
             let collapsed = comb.iter().zip(&g).fold(F128::ZERO, |a, (x, y)| a + *x * *y);
 
             // Brute force from the UNFACTORED definition: walk every (x, y)
@@ -717,7 +767,7 @@ mod tests {
         for (nu, cols) in [(3usize, 4usize), (2, 8), (4, 2)] {
             let z: Vec<F128> = (0..cols << nu).map(|_| rng.f128()).collect();
             let r_row: Vec<F128> = (0..nu).map(|_| rng.f128()).collect();
-            let g = collapse_rows(&z, &r_row);
+            let g = collapse_rows(&z, &r_row, None);
             assert_eq!(g.len(), cols);
             let col_vars = cols.trailing_zeros() as usize;
             for u in 0..cols {
@@ -851,32 +901,56 @@ mod tests {
         }
     }
 
-    /// Padding columns are pinned to zero by their all-zero constraint rows,
-    /// across the region — a non-zero padding column is a relation violation.
+    /// **THE TRUST BOUNDARY of the support-proportional row rounds.** Padding
+    /// columns are pinned to zero by their all-zero constraint rows, so a
+    /// non-zero padding column is a relation violation — and the DENSE zerocheck
+    /// catches it, because the dirty word sits inside its sum.
+    ///
+    /// The count-proportional row rounds do NOT, and cannot: they skip every
+    /// word the declared support calls dead, so a dirty dead word is simply
+    /// never read. That is exactly the boolean side's run-list contract ("only
+    /// sound, and only bit-identical to the dense computation, for honest
+    /// zeros"), and under the union the enforcer is the TRANSPORT — a dead word
+    /// is not committed, so a non-zero one breaks `⟨q, W_ρ⟩ = f̂(ρ)` and the
+    /// opening rejects. End-to-end coverage lives in
+    /// `union_element::{satisfying_dummy_row_is_rejected_under_the_union,
+    /// element_only_agrees_with_the_standalone_proof}`.
+    ///
+    /// This test pins both halves by picking the utilization that decides which
+    /// path runs: FULL utilization keeps the gate closed (dense, caught), half
+    /// utilization opens it (skipped, and the PIOP alone accepts).
     #[test]
-    fn padding_column_is_pinned_across_the_region() {
-        let mut rng = Rng::new(0x9AD_0);
+    fn padding_column_boundary_dense_catches_sparse_delegates() {
         let nu = 3usize;
         // kappa 2, k = 3: column 3 is padding.
-        let cases = vec![mult_case(2)];
-        let mut h = build(vec![], &cases, nu, &[4], &mut rng);
-        let union = UnionInstance::new(&h.registry, h.counts.clone());
-        let range = union.slot_word_range(0);
-        h.z[range.start + 3 * (1 << nu)] = F128::ONE;
-        let zc = h.z[range.clone()].to_vec();
-        cases[0].ty.affine_products_into(
-            &zc,
-            nu,
-            &mut h.pa[range.clone()],
-            &mut h.pb[range.clone()],
-        );
-        let z_region = region(&union, &h.z).to_vec();
-        let pa = region(&union, &h.pa).to_vec();
-        let pb = region(&union, &h.pb).to_vec();
-        let mut ch_p = FsChallenger::new(b"element-region-pad");
-        let (proof, _) = prove(&union, &z_region, pa, pb, &mut ch_p);
-        let mut ch_v = FsChallenger::new(b"element-region-pad");
-        assert!(verify(&union, &proof, &mut ch_v).is_err());
+        for (n_t, dense_path) in [(1usize << nu, true), (4, false)] {
+            let mut rng = Rng::new(0x9AD_0 + n_t as u64);
+            let cases = vec![mult_case(2)];
+            let mut h = build(vec![], &cases, nu, &[n_t], &mut rng);
+            let union = UnionInstance::new(&h.registry, h.counts.clone());
+            let range = union.slot_word_range(0);
+            h.z[range.start + 3 * (1 << nu)] = F128::ONE;
+            let zc = h.z[range.clone()].to_vec();
+            cases[0].ty.affine_products_into(
+                &zc,
+                nu,
+                &mut h.pa[range.clone()],
+                &mut h.pb[range.clone()],
+            );
+            let z_region = region(&union, &h.z).to_vec();
+            let pa = region(&union, &h.pa).to_vec();
+            let pb = region(&union, &h.pb).to_vec();
+            let mut ch_p = FsChallenger::new(b"element-region-pad");
+            let (proof, _) = prove(&union, &z_region, pa, pb, &mut ch_p);
+            let mut ch_v = FsChallenger::new(b"element-region-pad");
+            let rejected = verify(&union, &proof, &mut ch_v).is_err();
+            assert_eq!(
+                rejected, dense_path,
+                "n_t={n_t}: the dense zerocheck must catch a dirty padding \
+                 column; the support-proportional one delegates it to the \
+                 transport"
+            );
+        }
     }
 
     /// Tamper matrix on the region proof: every round message and both final
@@ -983,6 +1057,81 @@ mod tests {
         let other_union = UnionInstance::new(&other, vec![0, 4]);
         let mut ch = FsChallenger::new(b"element-region-geo");
         assert!(verify(&other_union, &proof, &mut ch).is_err());
+    }
+
+    /// **THE optimization's own oracle.** The support-proportional row rounds
+    /// must produce a BIT-IDENTICAL proof to the dense ones — same round
+    /// messages, same finals — at every utilization, and be cheaper.
+    ///
+    /// Bit-identity is what lets the pinned mixed-class fixtures survive the
+    /// change, and it rests on two facts: a fully-dead pair contributes nothing
+    /// to either round message (`G(1)`'s summand is `a_const·b_const + 0 = 0`
+    /// by the validity rule, and `G(∞)`'s factor `wa[i0] + wa[i1]` vanishes in
+    /// characteristic 2 because both halves hold the same constant), and a
+    /// boundary pair's dead half is exactly `a_dead[c]` because folding
+    /// preserves a constant column.
+    ///
+    /// Arms alternate in one process; timings are a median over reps and
+    /// nothing asserts on the clock.
+    #[test]
+    fn support_proportional_rounds_are_bit_identical() {
+        use crate::element_r1cs::zerocheck;
+        use std::time::Instant;
+
+        let mut rng = Rng::new(0x5044_0A17);
+        let nu = 14usize;
+        let cases = vec![mult_case(3)]; // kappa 3: 8 columns, 3 real + padding
+        let rows = 1usize << nu;
+        eprintln!("\n[element-rows] nu={nu}, region 2^17 words, median [min – max] ms");
+        for div in [1usize, 2, 4, 16, 64] {
+            let n = rows / div;
+            let h = build(vec![], &cases, nu, &[n], &mut rng);
+            let union = UnionInstance::new(&h.registry, h.counts.clone());
+            let e_vars = union.m_elem() - 7;
+            let z = region(&union, &h.z).to_vec();
+            let pa = region(&union, &h.pa).to_vec();
+            let pb = region(&union, &h.pb).to_vec();
+            let slots = region_slots(&union);
+            let sup = row_support(&slots, nu, e_vars);
+
+            let reps = 5usize;
+            let (mut t_dense, mut t_sparse) = (Vec::new(), Vec::new());
+            for rep in 0..=reps {
+                let mut ch = FsChallenger::new(b"element-rows-ab");
+                let t = Instant::now();
+                let (dense, dclaim) = zerocheck::prove_with_support(
+                    zerocheck::LABEL, pa.clone(), pb.clone(), &z, e_vars, nu, None, &mut ch,
+                );
+                let ms_d = t.elapsed().as_secs_f64() * 1e3;
+
+                let mut ch = FsChallenger::new(b"element-rows-ab");
+                let t = Instant::now();
+                let (sparse, sclaim) = zerocheck::prove_with_support(
+                    zerocheck::LABEL, pa.clone(), pb.clone(), &z, e_vars, nu, Some(&sup), &mut ch,
+                );
+                let ms_s = t.elapsed().as_secs_f64() * 1e3;
+
+                assert_eq!(dense, sparse, "n={n}: round messages must be identical");
+                assert_eq!(dclaim, sclaim, "n={n}: claims must be identical");
+                if rep > 0 {
+                    t_dense.push(ms_d);
+                    t_sparse.push(ms_s);
+                }
+            }
+            let med = |mut v: Vec<f64>| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                (v[0], v[v.len() / 2], v[v.len() - 1])
+            };
+            let (d, sp) = (med(t_dense), med(t_sparse));
+            eprintln!(
+                "[element-rows]  n={n:>5} of {rows} ({:>4.1}% rows, {:>4.1}% words)  \
+dense {:6.2} [{:5.2} – {:5.2}]  support {:6.2} [{:5.2} – {:5.2}]  {:4.1}x",
+                100.0 * n as f64 / rows as f64,
+                100.0 * (cases[0].ty.k() * n) as f64 / (1usize << e_vars) as f64,
+                d.1, d.0, d.2, sp.1, sp.0, sp.2,
+                d.1 / sp.1,
+            );
+        }
     }
 
     /// `fill_slot` derives `pa`/`pb` exactly as the standalone prover's
