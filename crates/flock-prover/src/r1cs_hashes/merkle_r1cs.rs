@@ -27,6 +27,22 @@
 //! GF(2) the pair `(left, right)` is exactly the conditional swap: `b_l = 1`
 //! puts the running digest on the left, `b_l = 0` on the right.
 //!
+//! ## The chunk-leaf variant (PCS L0 openings)
+//!
+//! [`MerkleTreeLayout::with_blake3_chunk_leaf`] prepends a **chunk-leaf
+//! segment** to the node levels: `leaf_bytes/64` base blocks that hash the
+//! raw leaf bytes as one BLAKE3 chunk (`CHUNK_START` on the first block,
+//! `CHUNK_END` on the last, chaining through `h_in`, counter 0), whose final
+//! chaining value seeds `prev` in place of the leaf-digest global. One row
+//! then verifies one PCS L0 opening — leaf hash AND path — under exactly
+//! `flock_core::merkle`'s BLAKE3 tree semantics (leaf = non-root chunk CV of
+//! the leaf bytes, node = non-root PARENT compression). Chunk blocks need no
+//! gadget columns at all: the base encoder's free message region IS the leaf
+//! data, and its chaining-value rows are witness-identical to the pin (block
+//! 0: IV) and copy (block `i`: block `i−1`'s output) overrides. The walker
+//! is oblivious — chunk blocks embed the same stripped base at their subcube
+//! offset, and everything flavor-specific rides in the extras.
+//!
 //! ## The swap gadget under `C = I`
 //!
 //! The R1CS is the circuit shape `(A·z) ⊙ (B·z) = z`: every witness column
@@ -115,7 +131,16 @@ pub const NODE_BLOCK_LEN: u32 = 64;
 /// final parent. Keeping all levels uniform is what lets the composite be
 /// `depth` copies of one base block; set [`HashSpec::flags`] if you need the
 /// bit-exact BLAKE3 tree.
+///
+/// This IS the semantics of `flock_core::merkle`'s BLAKE3 mode: its
+/// internal nodes are non-root PARENT-flagged chaining values
+/// (`hazmat::merge_subtrees_non_root`), so the node levels here match the
+/// PCS commitment bit-for-bit with no `flags` override.
 pub const BLAKE3_FLAG_PARENT: u32 = 4;
+/// BLAKE3 `CHUNK_START` flag: first block of a chunk.
+pub const BLAKE3_FLAG_CHUNK_START: u32 = 1;
+/// BLAKE3 `CHUNK_END` flag: last block of a chunk.
+pub const BLAKE3_FLAG_CHUNK_END: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Hash backend description
@@ -144,6 +169,10 @@ pub struct HashSpec {
     pub out_cv_base: usize,
     /// Base offset of the 512-bit message region: `left ‖ right`.
     pub msg_base: usize,
+    /// Base offset of the 32-bit flags word — the one input whose PIN value
+    /// varies across the chunk-leaf segment (see
+    /// [`MerkleTreeLayout::with_blake3_chunk_leaf`]).
+    pub flags_base: usize,
     /// Domain flags passed to every node compression.
     pub flags: u32,
     /// The base encoder's sparse `(A_0, B_0)`.
@@ -184,6 +213,23 @@ pub struct HashSpec {
     /// `(column, value)`: every free input of the base encoder EXCEPT the
     /// message region, which the swap gadget drives.
     pub fixed_bits: fn() -> Vec<(usize, bool)>,
+    /// **Raw** base-block builders, for compressions that are not tree
+    /// nodes — the chunk-leaf segment feeds these arbitrary
+    /// `(h_in, msg, counter, block_len, flags)`. Same output contract as the
+    /// node builders above.
+    pub raw_witness: fn(&[u32; SLOT_WORDS], &[u32; 16], u64, u32, u32) -> Vec<bool>,
+    #[allow(clippy::type_complexity)]
+    pub raw_witness_ab:
+        fn(&[u32; SLOT_WORDS], &[u32; 16], u64, u32, u32, &mut [u64], &mut [u64], &mut [u64]),
+    /// Raw counterpart of [`Self::node_group_ab`]: 8 arbitrary compressions
+    /// at once into one block window.
+    #[allow(clippy::type_complexity)]
+    pub raw_group_ab: fn(
+        &[([u32; SLOT_WORDS], [u32; 16], u64, u32, u32); 8],
+        &mut [[u64; 8]],
+        &mut [[u64; 8]],
+        &mut [[u64; 8]],
+    ),
 }
 
 /// BLAKE3 backend (the default). One level = one
@@ -197,12 +243,16 @@ pub fn blake3_spec() -> HashSpec {
         in_cv_base: blake3::CV_BASE,
         out_cv_base: blake3::OUT_LO_BASE,
         msg_base: blake3::M_BASE,
+        flags_base: blake3::FLAGS_BASE,
         flags: BLAKE3_FLAG_PARENT,
         build_matrices: blake3::build_matrices,
         node_witness: blake3_node_witness,
         node_witness_ab: blake3_node_witness_ab,
         node_group_ab: blake3_node_group_ab,
         fixed_bits: blake3_fixed_bits,
+        raw_witness: blake3::build_block_witness,
+        raw_witness_ab: blake3::build_block_witness_ab_packed_into,
+        raw_group_ab: blake3_raw_group_ab,
     }
 }
 
@@ -264,6 +314,18 @@ fn blake3_node_group_ab(
     blake3::build_group_batch_major(refs, rz, ra, rb);
 }
 
+/// Eight arbitrary compressions at once — the chunk-leaf segment's group
+/// builder ([`HashSpec::raw_group_ab`]).
+fn blake3_raw_group_ab(
+    blocks: &[blake3::Compression; 8],
+    rz: &mut [[u64; 8]],
+    ra: &mut [[u64; 8]],
+    rb: &mut [[u64; 8]],
+) {
+    let refs: [&blake3::Compression; 8] = std::array::from_fn(|j| &blocks[j]);
+    blake3::build_group_batch_major(refs, rz, ra, rb);
+}
+
 /// BLAKE3's free inputs other than the message: `cv = IV`, `counter = 0`,
 /// `block_len = 64`, `flags = PARENT`.
 fn blake3_fixed_bits() -> Vec<(usize, bool)> {
@@ -304,8 +366,11 @@ pub struct MerkleTreeLayout {
     pub spec: HashSpec,
     /// Number of levels = tree depth.
     pub depth: usize,
-    /// log2 of the composite block width: `spec.k_log + log2(levels rounded
-    /// up to a power of two)`.
+    /// Chunk-leaf blocks preceding the node levels, or 0 for the plain
+    /// digest-leaf path. See [`Self::with_blake3_chunk_leaf`].
+    pub leaf_blocks: usize,
+    /// log2 of the composite block width: `spec.k_log + log2(blocks rounded
+    /// up to a power of two)` where `blocks = leaf_blocks + depth`.
     pub k_log: usize,
     /// Useful columns of the composite block. Note the useful region has
     /// interior holes — each level's slot has a tail of genuine padding
@@ -344,9 +409,76 @@ impl MerkleTreeLayout {
         Self {
             spec,
             depth,
+            leaf_blocks: 0,
             k_log,
             useful_bits,
         }
+    }
+
+    /// Lay out a **chunk-leaf** path: `leaf_bytes` of leaf data hashed as a
+    /// single BLAKE3 chunk (a chain of `leaf_bytes/64` compressions,
+    /// `CHUNK_START` on the first block and `CHUNK_END` on the last, chaining
+    /// through `h_in`), followed by `depth` PARENT-node levels with the swap
+    /// gadget. This is exactly `flock_core::merkle`'s BLAKE3 mode — leaf =
+    /// non-root chaining value of the leaf bytes, node = non-root
+    /// PARENT-flagged compression — so one row verifies one PCS L0 opening
+    /// bit-for-bit.
+    ///
+    /// The leaf digest global of the digest-leaf layout disappears: node
+    /// level 0's `prev` IS the last chunk block's output chaining value, and
+    /// the leaf enters as data through the chunk blocks' 512-bit message
+    /// regions (free inputs at [`Self::leaf_data_bit`]).
+    ///
+    /// `leaf_bytes` must be a positive multiple of 64 and at most 1024 (one
+    /// chunk): whole 64-byte blocks keep `block_len` uniform at 64, and a
+    /// single chunk keeps the counter at 0 with no chunk-tree merge. The 1
+    /// KiB PCS leaf is 16 blocks.
+    pub fn with_blake3_chunk_leaf(depth: usize, leaf_bytes: usize, spec: HashSpec) -> Self {
+        assert!(depth >= 1, "depth must be ≥ 1");
+        assert!(
+            (64..=1024).contains(&leaf_bytes) && leaf_bytes.is_multiple_of(64),
+            "leaf_bytes {leaf_bytes} must be a positive multiple of 64 ≤ 1024 (one chunk)"
+        );
+        let leaf_blocks = leaf_bytes / 64;
+        let blocks = leaf_blocks + depth;
+        let k_log = spec.k_log + blocks.next_power_of_two().trailing_zeros() as usize;
+        assert!(
+            spec.k_log >= 7,
+            "the union's BatchMajor chunking requires k_log ≥ 7"
+        );
+        // Node-level gadget columns fit the base padding (as in `new`), and
+        // the globals (const + index bits) fit chunk block 0's padding.
+        assert!(
+            spec.useful_bits + 2 * SLOT_BITS <= 1usize << spec.k_log,
+            "the swap gadget does not fit the base block's padding"
+        );
+        assert!(
+            spec.useful_bits + 1 + depth <= 1usize << spec.k_log,
+            "depth {depth} does not fit: the globals exceed chunk block 0's padding"
+        );
+        // The last block is a node level (depth ≥ 1), so the last nonzero
+        // column is its `t` region's end.
+        let useful_bits = ((blocks - 1) << spec.k_log) + spec.useful_bits + 2 * SLOT_BITS;
+        debug_assert!(useful_bits <= 1usize << k_log);
+        Self {
+            spec,
+            depth,
+            leaf_blocks,
+            k_log,
+            useful_bits,
+        }
+    }
+
+    /// Total base-block subcubes: the chunk-leaf segment plus the node
+    /// levels. This — not `depth` — is what tiles the composite.
+    pub fn total_blocks(&self) -> usize {
+        self.leaf_blocks + self.depth
+    }
+
+    /// First column of subcube `t` (chunk blocks first, then node levels).
+    fn block_base(&self, t: usize) -> usize {
+        debug_assert!(t < self.total_blocks());
+        t << self.spec.k_log
     }
 
     /// Composite width `2^k_log`.
@@ -355,27 +487,70 @@ impl MerkleTreeLayout {
     }
 
     /// The global constant-one column, and the table's `const_pin`. Lives in
-    /// level 0's padding region, right after its gadget columns.
+    /// the first subcube's padding region: after level 0's gadget columns on
+    /// the digest-leaf path, right at the padding start on the chunk-leaf
+    /// path (chunk blocks have no gadget columns).
     pub fn const_pos(&self) -> usize {
-        self.spec.useful_bits + 2 * SLOT_BITS
+        if self.leaf_blocks == 0 {
+            self.spec.useful_bits + 2 * SLOT_BITS
+        } else {
+            self.spec.useful_bits
+        }
     }
 
-    /// Bit `j` of the leaf digest.
+    /// Bit `j` of the leaf digest. Digest-leaf layouts only — the chunk-leaf
+    /// path has no leaf digest global (the leaf enters as data, see
+    /// [`Self::leaf_data_bit`]).
     pub fn leaf_bit(&self, j: usize) -> usize {
         debug_assert!(j < SLOT_BITS);
+        debug_assert!(self.leaf_blocks == 0, "chunk-leaf has no leaf digest");
         self.const_pos() + 1 + j
+    }
+
+    /// Bit `j` of chunk block `i`'s 512-bit slice of the leaf data — the
+    /// block's message region.
+    pub fn leaf_data_bit(&self, block: usize, j: usize) -> usize {
+        debug_assert!(block < self.leaf_blocks);
+        debug_assert!(j < 2 * SLOT_BITS);
+        self.block_base(block) + self.spec.msg_base + j
     }
 
     /// Indicator bit of level `l` (bit `l` of the index).
     pub fn index_bit(&self, level: usize) -> usize {
         debug_assert!(level < self.depth);
-        self.const_pos() + 1 + SLOT_BITS + level
+        if self.leaf_blocks == 0 {
+            self.const_pos() + 1 + SLOT_BITS + level
+        } else {
+            self.const_pos() + 1 + level
+        }
     }
 
-    /// First column of level `l`'s aligned subcube.
+    /// First column of level `l`'s aligned subcube (node levels sit after
+    /// the chunk-leaf segment).
     fn level_base(&self, level: usize) -> usize {
         debug_assert!(level < self.depth);
-        level << self.spec.k_log
+        self.block_base(self.leaf_blocks + level)
+    }
+
+    /// Bit `j` of chunk block `i`'s output chaining value.
+    fn chunk_out_cv_bit(&self, block: usize, j: usize) -> usize {
+        debug_assert!(block < self.leaf_blocks);
+        debug_assert!(j < SLOT_BITS);
+        self.block_base(block) + self.spec.out_cv_base + j
+    }
+
+    /// Domain flags of chunk block `i`: `CHUNK_START` on the first block,
+    /// `CHUNK_END` on the last (both on a single-block leaf), non-root.
+    fn chunk_flags(&self, block: usize) -> u32 {
+        debug_assert!(block < self.leaf_blocks);
+        let mut f = 0;
+        if block == 0 {
+            f |= BLAKE3_FLAG_CHUNK_START;
+        }
+        if block + 1 == self.leaf_blocks {
+            f |= BLAKE3_FLAG_CHUNK_END;
+        }
+        f
     }
 
     /// Bit `j` of level `l`'s sibling digest — in the base block's padding.
@@ -397,11 +572,16 @@ impl MerkleTreeLayout {
         self.level_base(level) + c
     }
 
-    /// Bit `j` of the digest entering level `l`: the leaf at level 0, else
-    /// the previous level's output chaining value.
+    /// Bit `j` of the digest entering level `l`: at level 0 the leaf —
+    /// the digest global, or on the chunk-leaf path the last chunk block's
+    /// output chaining value — else the previous level's output.
     pub fn prev_bit(&self, level: usize, j: usize) -> usize {
         if level == 0 {
-            self.leaf_bit(j)
+            if self.leaf_blocks == 0 {
+                self.leaf_bit(j)
+            } else {
+                self.chunk_out_cv_bit(self.leaf_blocks - 1, j)
+            }
         } else {
             self.hash_bit(level - 1, self.spec.out_cv_base + j)
         }
@@ -466,14 +646,56 @@ impl MerkleTreeLayout {
         a[gc] = vec![gc];
         b[gc] = vec![gc];
 
-        for j in 0..SLOT_BITS {
-            free(&mut a, &mut b, self.leaf_bit(j));
+        if self.leaf_blocks == 0 {
+            for j in 0..SLOT_BITS {
+                free(&mut a, &mut b, self.leaf_bit(j));
+            }
         }
         for l in 0..self.depth {
             free(&mut a, &mut b, self.index_bit(l));
         }
 
         let fixed = (self.spec.fixed_bits)();
+
+        // The chunk-leaf segment. Same three override groups as a node level,
+        // with the message left FREE (it is the leaf data) in place of the
+        // swap gadget, and the pins adjusted per block: the flags word takes
+        // the block's chunk flags, and past block 0 the input chaining value
+        // becomes a copy of the previous block's output — the chunk chain.
+        for i in 0..self.leaf_blocks {
+            let base = self.block_base(i);
+
+            // Override 1: the block's constant wire, re-derived.
+            let r = base + self.spec.z_const_pos;
+            a[r] = vec![gc];
+            b[r] = vec![gc];
+
+            // Override 2: the message region is the leaf data — free inputs.
+            for j in 0..2 * SLOT_BITS {
+                free(&mut a, &mut b, base + self.spec.msg_base + j);
+            }
+
+            // Override 3: the pins, from the node fixed set with the two
+            // chunk-specific substitutions.
+            let flags = self.chunk_flags(i);
+            let fb = self.spec.flags_base;
+            let cvb = self.spec.in_cv_base;
+            for &(c, v) in &fixed {
+                let r = base + c;
+                if i > 0 && c >= cvb && c < cvb + SLOT_BITS {
+                    a[r] = vec![self.chunk_out_cv_bit(i - 1, c - cvb)];
+                    b[r] = vec![gc];
+                    continue;
+                }
+                let v = if c >= fb && c < fb + 32 {
+                    (flags >> (c - fb)) & 1 == 1
+                } else {
+                    v
+                };
+                a[r] = if v { vec![gc] } else { Vec::new() };
+                b[r] = vec![gc];
+            }
+        }
         for l in 0..self.depth {
             for j in 0..SLOT_BITS {
                 free(&mut a, &mut b, self.sibling_bit(l, j));
@@ -531,22 +753,18 @@ impl MerkleTreeLayout {
         let ovr = self.base_overridden();
         debug_assert_eq!(base_a.num_rows, 1usize << self.spec.k_log);
 
-        for l in 0..self.depth {
-            // The hash block, embedded by a pure column offset. Overridden
-            // rows are already written by `extras`.
+        for t in 0..self.total_blocks() {
+            // The hash block, embedded by a pure column offset — chunk
+            // blocks and node levels alike. Overridden rows are already
+            // written by `extras`.
+            let base = self.block_base(t);
             for c in 0..self.spec.useful_bits {
                 if ovr[c] {
                     continue;
                 }
-                let r = self.hash_bit(l, c);
-                a[r] = base_a.rows[c]
-                    .iter()
-                    .map(|&x| self.hash_bit(l, x))
-                    .collect();
-                b[r] = base_b.rows[c]
-                    .iter()
-                    .map(|&x| self.hash_bit(l, x))
-                    .collect();
+                let r = base + c;
+                a[r] = base_a.rows[c].iter().map(|&x| base + x).collect();
+                b[r] = base_b.rows[c].iter().map(|&x| base + x).collect();
             }
         }
 
@@ -663,7 +881,10 @@ impl MerkleTreeLayout {
 
         MerkleWalkerCircuit {
             n_cols: k,
-            depth: self.depth,
+            // The walker walks SUBCUBES; the chunk-leaf blocks embed the
+            // same stripped base as the node levels, so it need not tell
+            // them apart.
+            depth: self.total_blocks(),
             base_k_log: self.spec.k_log,
             base,
             extras,
@@ -680,6 +901,10 @@ impl MerkleTreeLayout {
     /// Panics if `input.siblings.len() != depth` or the index does not fit
     /// in `depth` bits.
     pub fn build_witness(&self, input: &PathInput) -> Vec<bool> {
+        assert_eq!(
+            self.leaf_blocks, 0,
+            "chunk-leaf layout: use the _chunk builders"
+        );
         assert_eq!(
             input.siblings.len(),
             self.depth,
@@ -729,6 +954,10 @@ impl MerkleTreeLayout {
     /// offset (its row kinds already match the composite's overrides) and the
     /// gadget rows are written from the values at hand.
     pub fn build_witness_zab(&self, input: &PathInput) -> [Vec<bool>; 3] {
+        assert_eq!(
+            self.leaf_blocks, 0,
+            "chunk-leaf layout: use the _chunk builders"
+        );
         assert_eq!(
             input.siblings.len(),
             self.depth,
@@ -863,6 +1092,10 @@ impl MerkleTreeLayout {
         use super::common::{BM_V, BmRow, or_bit_row, or_u32_row};
 
         const _: () = assert!(BM_V == 8, "HashSpec::node_group_ab hardcodes 8 lanes");
+        assert_eq!(
+            self.leaf_blocks, 0,
+            "chunk-leaf layout: use the _chunk builders"
+        );
         assert!(
             paths.len() <= 1usize << nu,
             "{} paths > 2^{nu} rows",
@@ -1006,13 +1239,6 @@ impl MerkleTreeLayout {
             "{} paths > 2^{nu} = {n_total} rows",
             paths.len()
         );
-        assert!(
-            n_total.is_multiple_of(8),
-            "the lincheck stripe needs 2^nu ≥ 8 (nu ≥ 3)"
-        );
-        let k = self.k();
-        let words_per_block = k / 128;
-        let total = n_total * words_per_block;
 
         // Per-path row-witnesses first (embarrassingly parallel), then the
         // BatchMajor scatter + stripe transpose.
@@ -1020,6 +1246,26 @@ impl MerkleTreeLayout {
             .par_iter()
             .map(|p| self.build_witness_zab(p))
             .collect();
+        self.scatter_zab_batch_major(&per_path, nu)
+    }
+
+    /// The BatchMajor scatter + stripe transpose behind the `_bool` oracles,
+    /// shared by both leaf flavors.
+    fn scatter_zab_batch_major(
+        &self,
+        per_path: &[[Vec<bool>; 3]],
+        nu: usize,
+    ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
+        use rayon::prelude::*;
+
+        let n_total = 1usize << nu;
+        assert!(
+            n_total.is_multiple_of(8),
+            "the lincheck stripe needs 2^nu ≥ 8 (nu ≥ 3)"
+        );
+        let k = self.k();
+        let words_per_block = k / 128;
+        let total = n_total * words_per_block;
 
         let mut z = vec![F128::ZERO; total];
         let mut a = vec![F128::ZERO; total];
@@ -1054,6 +1300,427 @@ impl MerkleTreeLayout {
 
         (z, a, b, stripe)
     }
+
+    // -----------------------------------------------------------------------
+    // Chunk-leaf witness (the `_chunk` builders)
+    // -----------------------------------------------------------------------
+
+    fn assert_chunk_input(&self, input: &ChunkPathInput) {
+        assert!(
+            self.leaf_blocks > 0,
+            "digest-leaf layout: use the PathInput builders"
+        );
+        assert_eq!(
+            input.leaf_data.len(),
+            64 * self.leaf_blocks,
+            "leaf data must be {} bytes",
+            64 * self.leaf_blocks
+        );
+        assert_eq!(
+            input.siblings.len(),
+            self.depth,
+            "need one sibling digest per level"
+        );
+        assert!(
+            self.depth >= 64 || input.index < (1u64 << self.depth),
+            "index {} does not fit in {} bits",
+            input.index,
+            self.depth
+        );
+    }
+
+    /// The input chaining value the fixed set pins — chunk block 0 starts
+    /// from the same IV the node compressions use. Decoded from
+    /// [`HashSpec::fixed_bits`] so the witness and the pin rows cannot
+    /// disagree.
+    fn pinned_in_cv(&self) -> [u32; SLOT_WORDS] {
+        let base = self.spec.in_cv_base;
+        let mut cv = [0u32; SLOT_WORDS];
+        for &(c, v) in &(self.spec.fixed_bits)() {
+            if v && c >= base && c < base + SLOT_BITS {
+                let j = c - base;
+                cv[j / 32] |= 1u32 << (j % 32);
+            }
+        }
+        cv
+    }
+
+    /// Boolean witness for ONE chunk-leaf opening (length `2^k_log`).
+    pub fn build_witness_chunk(&self, input: &ChunkPathInput) -> Vec<bool> {
+        self.assert_chunk_input(input);
+        let mut z = vec![false; self.k()];
+        z[self.const_pos()] = true;
+        for l in 0..self.depth {
+            z[self.index_bit(l)] = (input.index >> l) & 1 == 1;
+        }
+
+        // The chunk chain: h_in of block 0 is the IV, then each block's
+        // output chaining value feeds the next block's input.
+        let mut prev = self.pinned_in_cv();
+        for i in 0..self.leaf_blocks {
+            let m = leaf_msg_words(&input.leaf_data, i);
+            let block = (self.spec.raw_witness)(
+                &prev,
+                &m,
+                NODE_COUNTER,
+                NODE_BLOCK_LEN,
+                self.chunk_flags(i),
+            );
+            let dst = self.block_base(i);
+            z[dst..dst + self.spec.useful_bits].copy_from_slice(&block[..self.spec.useful_bits]);
+            prev = read_digest(&block, self.spec.out_cv_base);
+        }
+
+        // The node levels — identical to the digest-leaf path, with `prev`
+        // seeded by the chunk chain instead of a leaf digest global.
+        for l in 0..self.depth {
+            let bit = (input.index >> l) & 1 == 1;
+            let sib = input.siblings[l];
+            write_digest(&mut z, self.sibling_bit(l, 0), &sib);
+            for j in 0..SLOT_BITS {
+                z[self.t_bit(l, j)] = bit && (digest_bit(&prev, j) ^ digest_bit(&sib, j));
+            }
+            let (left, right) = if bit { (prev, sib) } else { (sib, prev) };
+            let block = (self.spec.node_witness)(&left, &right);
+            let dst = self.hash_bit(l, 0);
+            z[dst..dst + self.spec.useful_bits].copy_from_slice(&block[..self.spec.useful_bits]);
+            prev = read_digest(&block, self.spec.out_cv_base);
+        }
+        z
+    }
+
+    /// Full ROW-witness `(z, a, b)` for ONE chunk-leaf opening. Chunk blocks
+    /// copy the base encoder's row-witness verbatim: its free-input rows for
+    /// the message ARE the composite's leaf-data rows, and its free-input
+    /// rows for the chaining value are witness-identical to the pin (block
+    /// 0) and copy (later blocks) overrides, because the chained values
+    /// agree by construction.
+    pub fn build_witness_zab_chunk(&self, input: &ChunkPathInput) -> [Vec<bool>; 3] {
+        self.assert_chunk_input(input);
+        let k = self.k();
+        let mut z = vec![false; k];
+        let mut a = vec![false; k];
+        let mut b = vec![false; k];
+
+        let free = |z: &mut [bool], a: &mut [bool], b: &mut [bool], c: usize, v: bool| {
+            z[c] = v;
+            a[c] = v;
+            b[c] = true;
+        };
+
+        let gc = self.const_pos();
+        z[gc] = true;
+        a[gc] = true;
+        b[gc] = true;
+        for l in 0..self.depth {
+            let bit = (input.index >> l) & 1 == 1;
+            free(&mut z, &mut a, &mut b, self.index_bit(l), bit);
+        }
+
+        let base_words = (1usize << self.spec.k_log) / 64;
+        let mut wz = vec![0u64; base_words];
+        let mut wa = vec![0u64; base_words];
+        let mut wb = vec![0u64; base_words];
+
+        let mut prev = self.pinned_in_cv();
+        for i in 0..self.leaf_blocks {
+            let m = leaf_msg_words(&input.leaf_data, i);
+            wz.fill(0);
+            wa.fill(0);
+            wb.fill(0);
+            (self.spec.raw_witness_ab)(
+                &prev,
+                &m,
+                NODE_COUNTER,
+                NODE_BLOCK_LEN,
+                self.chunk_flags(i),
+                &mut wz,
+                &mut wa,
+                &mut wb,
+            );
+            let dst = self.block_base(i);
+            for c in 0..self.spec.useful_bits {
+                z[dst + c] = word_bit(&wz, c);
+                a[dst + c] = word_bit(&wa, c);
+                b[dst + c] = word_bit(&wb, c);
+            }
+            prev = read_digest_words(&wz, self.spec.out_cv_base);
+        }
+
+        for l in 0..self.depth {
+            let bit = (input.index >> l) & 1 == 1;
+            let sib = input.siblings[l];
+            for j in 0..SLOT_BITS {
+                free(
+                    &mut z,
+                    &mut a,
+                    &mut b,
+                    self.sibling_bit(l, j),
+                    digest_bit(&sib, j),
+                );
+            }
+            for j in 0..SLOT_BITS {
+                let xor = digest_bit(&prev, j) ^ digest_bit(&sib, j);
+                let c = self.t_bit(l, j);
+                z[c] = bit && xor;
+                a[c] = bit;
+                b[c] = xor;
+            }
+            let (left, right) = if bit { (prev, sib) } else { (sib, prev) };
+            wz.fill(0);
+            wa.fill(0);
+            wb.fill(0);
+            (self.spec.node_witness_ab)(&left, &right, &mut wz, &mut wa, &mut wb);
+            let dst = self.hash_bit(l, 0);
+            for c in 0..self.spec.useful_bits {
+                z[dst + c] = word_bit(&wz, c);
+                a[dst + c] = word_bit(&wa, c);
+                b[dst + c] = word_bit(&wb, c);
+            }
+            prev = read_digest_words(&wz, self.spec.out_cv_base);
+        }
+        [z, a, b]
+    }
+
+    /// Chunk-leaf counterpart of
+    /// [`Self::generate_witness_batch_major_partial`].
+    pub fn generate_witness_batch_major_partial_chunk(
+        &self,
+        paths: &[ChunkPathInput],
+        nu: usize,
+    ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
+        let k = self.k();
+        let total = (1usize << nu) * (k / 128);
+        let mut z = vec![F128::ZERO; total];
+        let mut a = vec![F128::ZERO; total];
+        let mut b = vec![F128::ZERO; total];
+        let stripe = self.generate_witness_batch_major_partial_into_chunk(
+            paths,
+            nu,
+            flock_core::union::SlotWitnessDest {
+                z: &mut z,
+                a: &mut a,
+                b: &mut b,
+                elide_padding_writes: false,
+            },
+        );
+        (z, a, b, stripe)
+    }
+
+    /// Chunk-leaf counterpart of
+    /// [`Self::generate_witness_batch_major_partial_into`], on the same
+    /// driver: the chunk segment runs the base encoder's raw group builder
+    /// per block window (no gadget columns at all — the message rows ARE the
+    /// leaf data, and the chaining rows match the pin/copy overrides
+    /// witness-for-witness), then the node levels run exactly as the
+    /// digest-leaf path, shifted by `leaf_blocks` windows.
+    pub fn generate_witness_batch_major_partial_into_chunk(
+        &self,
+        paths: &[ChunkPathInput],
+        nu: usize,
+        dst: flock_core::union::SlotWitnessDest<'_>,
+    ) -> Vec<u8> {
+        use super::common::{BM_V, BmRow, or_bit_row, or_u32_row};
+
+        const _: () = assert!(BM_V == 8, "HashSpec group builders hardcode 8 lanes");
+        assert!(
+            paths.len() <= 1usize << nu,
+            "{} paths > 2^{nu} rows",
+            paths.len()
+        );
+        for p in paths {
+            self.assert_chunk_input(p);
+        }
+        let spec = &self.spec;
+        assert!(
+            spec.k_log >= 6,
+            "a block stride of 2^{} bits is not a u64 multiple",
+            spec.k_log
+        );
+        let words_per_level = 1usize << (spec.k_log - 6);
+        assert_eq!(
+            spec.out_cv_base % 64,
+            0,
+            "out_cv_base must be u64-aligned to chain blocks in packed form"
+        );
+        let out_word = spec.out_cv_base / 64;
+        let depth = self.depth;
+        let leaf_blocks = self.leaf_blocks;
+        let iv = self.pinned_in_cv();
+
+        let sib_off = spec.useful_bits;
+        let t_off = spec.useful_bits + SLOT_BITS;
+        let const_off = self.const_pos();
+        let index_off = const_off + 1;
+
+        super::common::drive_witness_batch_major_partial_into(
+            paths,
+            nu,
+            self.k_log,
+            self.useful_bits,
+            dst,
+            move |group, rz, ra, rb| {
+                let mut prev: [[u32; SLOT_WORDS]; BM_V] = [iv; BM_V];
+
+                // The chunk chain, one block window at a time.
+                for i in 0..leaf_blocks {
+                    let w0 = i * words_per_level;
+                    let win = w0..w0 + words_per_level;
+                    let (wz, wa, wb): (&mut [BmRow], &mut [BmRow], &mut [BmRow]) =
+                        (&mut rz[win.clone()], &mut ra[win.clone()], &mut rb[win]);
+
+                    let flags = {
+                        let mut f = 0;
+                        if i == 0 {
+                            f |= BLAKE3_FLAG_CHUNK_START;
+                        }
+                        if i + 1 == leaf_blocks {
+                            f |= BLAKE3_FLAG_CHUNK_END;
+                        }
+                        f
+                    };
+                    let blocks: [([u32; SLOT_WORDS], [u32; 16], u64, u32, u32); BM_V] =
+                        std::array::from_fn(|j| {
+                            (
+                                prev[j],
+                                leaf_msg_words(&group[j].leaf_data, i),
+                                NODE_COUNTER,
+                                NODE_BLOCK_LEN,
+                                flags,
+                            )
+                        });
+                    (spec.raw_group_ab)(&blocks, wz, wa, wb);
+
+                    if i == 0 {
+                        // The globals live in chunk block 0's padding region.
+                        or_bit_row(wz, const_off);
+                        or_bit_row(wa, const_off);
+                        or_bit_row(wb, const_off);
+                        for l in 0..depth {
+                            let v: [u32; BM_V] =
+                                std::array::from_fn(|j| ((group[j].index >> l) & 1) as u32);
+                            or_u32_row(wz, index_off + l, &v);
+                            or_u32_row(wa, index_off + l, &v);
+                            or_bit_row(wb, index_off + l);
+                        }
+                    }
+
+                    for j in 0..BM_V {
+                        for w in 0..SLOT_WORDS / 2 {
+                            let word = wz[out_word + w][j];
+                            prev[j][2 * w] = word as u32;
+                            prev[j][2 * w + 1] = (word >> 32) as u32;
+                        }
+                    }
+                }
+
+                // The node levels, shifted by the chunk segment.
+                for l in 0..depth {
+                    let w0 = (leaf_blocks + l) * words_per_level;
+                    let win = w0..w0 + words_per_level;
+                    let (wz, wa, wb): (&mut [BmRow], &mut [BmRow], &mut [BmRow]) =
+                        (&mut rz[win.clone()], &mut ra[win.clone()], &mut rb[win]);
+
+                    let mut pairs = [([0u32; SLOT_WORDS], [0u32; SLOT_WORDS]); BM_V];
+                    let mut mask = [0u32; BM_V];
+                    for j in 0..BM_V {
+                        let bit = (group[j].index >> l) & 1 == 1;
+                        mask[j] = if bit { !0u32 } else { 0 };
+                        let sib = group[j].siblings[l];
+                        pairs[j] = if bit { (prev[j], sib) } else { (sib, prev[j]) };
+                    }
+
+                    (spec.node_group_ab)(&pairs, wz, wa, wb);
+
+                    for w in 0..SLOT_WORDS {
+                        let sib: [u32; BM_V] = std::array::from_fn(|j| group[j].siblings[l][w]);
+                        or_u32_row(wz, sib_off + 32 * w, &sib);
+                        or_u32_row(wa, sib_off + 32 * w, &sib);
+                        or_u32_row(wb, sib_off + 32 * w, &[!0u32; BM_V]);
+
+                        let xor: [u32; BM_V] = std::array::from_fn(|j| prev[j][w] ^ sib[j]);
+                        let t: [u32; BM_V] = std::array::from_fn(|j| mask[j] & xor[j]);
+                        or_u32_row(wz, t_off + 32 * w, &t);
+                        or_u32_row(wa, t_off + 32 * w, &mask);
+                        or_u32_row(wb, t_off + 32 * w, &xor);
+                    }
+
+                    for j in 0..BM_V {
+                        for w in 0..SLOT_WORDS / 2 {
+                            let word = wz[out_word + w][j];
+                            prev[j][2 * w] = word as u32;
+                            prev[j][2 * w + 1] = (word >> 32) as u32;
+                        }
+                    }
+                }
+            },
+        )
+    }
+
+    /// `Vec<bool>` reference oracle for
+    /// [`Self::generate_witness_batch_major_partial_into_chunk`].
+    pub fn generate_witness_batch_major_partial_bool_chunk(
+        &self,
+        paths: &[ChunkPathInput],
+        nu: usize,
+    ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
+        use rayon::prelude::*;
+
+        assert!(
+            paths.len() <= 1usize << nu,
+            "{} paths > 2^{nu} rows",
+            paths.len()
+        );
+        let per_path: Vec<[Vec<bool>; 3]> = paths
+            .par_iter()
+            .map(|p| self.build_witness_zab_chunk(p))
+            .collect();
+        self.scatter_zab_batch_major(&per_path, nu)
+    }
+
+    /// Reference root for a chunk-leaf opening: the chunk chain then the
+    /// node fold, natively, with the same compressions the R1CS encodes.
+    pub fn reference_root_chunk(&self, input: &ChunkPathInput) -> [u32; SLOT_WORDS] {
+        self.assert_chunk_input(input);
+        let mut prev = self.pinned_in_cv();
+        for i in 0..self.leaf_blocks {
+            let m = leaf_msg_words(&input.leaf_data, i);
+            let block = (self.spec.raw_witness)(
+                &prev,
+                &m,
+                NODE_COUNTER,
+                NODE_BLOCK_LEN,
+                self.chunk_flags(i),
+            );
+            prev = read_digest(&block, self.spec.out_cv_base);
+        }
+        for (l, sib) in input.siblings.iter().enumerate() {
+            let bit = (input.index >> l) & 1 == 1;
+            let (left, right) = if bit { (prev, *sib) } else { (*sib, prev) };
+            let block = (self.spec.node_witness)(&left, &right);
+            prev = read_digest(&block, self.spec.out_cv_base);
+        }
+        prev
+    }
+}
+
+/// One chunk-leaf opening: the raw leaf bytes (`64 · leaf_blocks` of them),
+/// the leaf's index, and one sibling chaining value per level (level 0 =
+/// closest to the leaf).
+#[derive(Clone, Debug)]
+pub struct ChunkPathInput {
+    pub leaf_data: Vec<u8>,
+    pub index: u64,
+    pub siblings: Vec<[u32; SLOT_WORDS]>,
+}
+
+/// Chunk block `i`'s 16-word message: bytes `[64i, 64(i+1))` of the leaf
+/// data as little-endian words, per the BLAKE3 spec.
+fn leaf_msg_words(data: &[u8], block: usize) -> [u32; 16] {
+    std::array::from_fn(|w| {
+        let o = block * 64 + 4 * w;
+        u32::from_le_bytes(data[o..o + 4].try_into().unwrap())
+    })
 }
 
 /// Bit `i` of a u64-word buffer (LSB-first within each word).

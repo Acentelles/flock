@@ -754,9 +754,10 @@ mod tests {
                         pd_t.codeword.len() * 16,
                     )
                 };
-                let root = *crate::merkle::merkle_tree(bytes, t_params.n_leaves(), t_params.merkle_hash)
-                    .last()
-                    .unwrap();
+                let root =
+                    *crate::merkle::merkle_tree(bytes, t_params.n_leaves(), t_params.merkle_hash)
+                        .last()
+                        .unwrap();
                 assert_eq!(root, _c_t.root, "root must be over t-wide leaves");
             }
         }

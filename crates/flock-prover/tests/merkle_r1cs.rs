@@ -598,3 +598,289 @@ fn padding_must_be_zero() {
     z[layout.useful_bits] = true;
     assert!(!r1cs.satisfies(&z), "nonzero padding column was accepted");
 }
+
+// ---------------------------------------------------------------------------
+// The chunk-leaf layout (BLAKE3 L0 openings: 1 KiB leaf + PARENT path)
+// ---------------------------------------------------------------------------
+
+use flock_core::merkle::{self as core_merkle, HashKind};
+use flock_prover::r1cs_hashes::merkle_r1cs::ChunkPathInput;
+
+fn chunk_input(rng: &mut Rng, depth: usize, leaf_bytes: usize, index: u64) -> ChunkPathInput {
+    ChunkPathInput {
+        leaf_data: (0..leaf_bytes).map(|_| rng.next_u32() as u8).collect(),
+        index,
+        siblings: (0..depth).map(|_| rng.digest()).collect(),
+    }
+}
+
+fn digest_to_hash(d: &[u32; SLOT_WORDS]) -> [u8; 32] {
+    let mut h = [0u8; 32];
+    for (w, word) in d.iter().enumerate() {
+        h[4 * w..4 * w + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    h
+}
+
+fn hash_to_digest(h: &[u8; 32]) -> [u32; SLOT_WORDS] {
+    std::array::from_fn(|w| u32::from_le_bytes(h[4 * w..4 * w + 4].try_into().unwrap()))
+}
+
+/// Geometry of the chunk-leaf layout: chunk blocks tile first, node levels
+/// after; the globals shrink to const + index bits in chunk block 0's
+/// padding; the L0 shape (1 KiB leaf, depth 13) lands on k_log 19 — the
+/// same width as the depth-26 digest table.
+#[test]
+fn chunk_layout_geometry() {
+    let spec = blake3_spec();
+    const U: usize = 15_409;
+    const STRIDE: usize = 1 << 14;
+    for (depth, leaf_bytes, want_k_log) in
+        [(1usize, 64usize, 15usize), (2, 128, 16), (13, 1024, 19)]
+    {
+        let layout = MerkleTreeLayout::with_blake3_chunk_leaf(depth, leaf_bytes, spec.clone());
+        let blocks = leaf_bytes / 64 + depth;
+        assert_eq!(layout.leaf_blocks, leaf_bytes / 64);
+        assert_eq!(layout.total_blocks(), blocks);
+        assert_eq!(layout.k_log, want_k_log, "depth {depth} leaf {leaf_bytes}");
+        assert_eq!(
+            layout.useful_bits,
+            (blocks - 1) * STRIDE + U + 512,
+            "depth {depth} leaf {leaf_bytes} useful_bits"
+        );
+        assert_eq!(
+            layout.const_pos(),
+            U,
+            "const sits at chunk block 0's padding start"
+        );
+        assert_eq!(layout.index_bit(0), U + 1);
+        // Node levels sit after the chunk segment.
+        for l in 0..depth {
+            assert_eq!(
+                layout.hash_bit(l, 0),
+                (leaf_bytes / 64 + l) * STRIDE,
+                "level {l} not aligned past the chunk segment"
+            );
+        }
+        // The leaf data enters through the chunk blocks' message regions.
+        for i in 0..layout.leaf_blocks {
+            assert_eq!(
+                layout.leaf_data_bit(i, 0),
+                i * STRIDE + 513,
+                "chunk block {i} msg"
+            );
+        }
+    }
+}
+
+/// An honest chunk-leaf opening satisfies the materialized composite, at
+/// both swap directions, and the root column agrees with the native fold —
+/// covering the chunk chain's in_cv copy rows (2 chunk blocks) and both
+/// flag patterns.
+#[test]
+fn honest_chunk_openings_satisfy() {
+    let (depth, leaf_bytes) = (1usize, 128usize); // 2 chunk blocks + 1 node level
+    let layout = MerkleTreeLayout::with_blake3_chunk_leaf(depth, leaf_bytes, blake3_spec());
+    let r1cs = layout.build_block_r1cs(0);
+    let mut rng = Rng::new(0x_C4_09_77_31);
+
+    for index in 0..(1u64 << depth) {
+        let input = chunk_input(&mut rng, depth, leaf_bytes, index);
+        let z = layout.build_witness_chunk(&input);
+        assert!(
+            r1cs.satisfies(&z),
+            "honest chunk witness rejected at index {index}"
+        );
+        assert_eq!(
+            layout.read_root(&z),
+            layout.reference_root_chunk(&input),
+            "root column disagrees with the native fold at index {index}"
+        );
+
+        // zab: emitted a/b must equal the matrix application, exactly.
+        let [z2, a, b] = layout.build_witness_zab_chunk(&input);
+        assert_eq!(z2, z, "zab z half");
+        assert_eq!(a, r1cs.apply_a(&z), "zab a half");
+        assert_eq!(b, r1cs.apply_b(&z), "zab b half");
+    }
+
+    // Tampering: leaf data, index bit, root, and a chunk-chain bit must all
+    // be load-bearing.
+    let input = chunk_input(&mut rng, depth, leaf_bytes, 1);
+    let z0 = layout.build_witness_chunk(&input);
+    assert!(r1cs.satisfies(&z0));
+    for (name, col) in [
+        ("leaf data bit", layout.leaf_data_bit(1, 7)),
+        ("index bit", layout.index_bit(0)),
+        (
+            "root bit",
+            layout.hash_bit(depth - 1, layout.spec.out_cv_base + 3),
+        ),
+        (
+            "chunk chain cv bit",
+            layout.hash_bit(0, layout.spec.in_cv_base + 11),
+        ),
+    ] {
+        let mut z = z0.clone();
+        z[col] ^= true;
+        assert!(!r1cs.satisfies(&z), "{name} flip was accepted");
+    }
+}
+
+/// **The production pin**: the chunk-leaf table must reproduce
+/// `flock_core::merkle`'s BLAKE3 tree bit-for-bit — leaves as non-root
+/// chunk chaining values of the raw 1 KiB leaf bytes, internal nodes as
+/// non-root PARENT compressions — at the real L0 shape (depth 13, 1 KiB
+/// leaves) and a small shape. Index convention: the table's bit `l` puts
+/// the running digest LEFT, `flock_core` puts it left on an even node
+/// index, so the table index is the complement of the tree position.
+#[test]
+fn chunk_root_matches_flock_core_blake3_tree() {
+    let mut rng = Rng::new(0x_1F_5A_33_D7);
+    for (depth, leaf_bytes) in [(3usize, 256usize), (13, 1024)] {
+        let n_leaves = 1usize << depth;
+        let data: Vec<u8> = (0..n_leaves * leaf_bytes)
+            .map(|_| rng.next_u32() as u8)
+            .collect();
+        let tree = core_merkle::merkle_tree(&data, n_leaves, HashKind::Blake3);
+        let root = tree[tree.len() - 1];
+
+        let layout = MerkleTreeLayout::with_blake3_chunk_leaf(depth, leaf_bytes, blake3_spec());
+        let positions: Vec<usize> = if depth <= 3 {
+            (0..n_leaves).collect()
+        } else {
+            vec![0, 1, 4097, 5000, n_leaves - 1]
+        };
+        for pos in positions {
+            // Siblings bottom-up out of the flat tree (leaves first, then
+            // each level, root last).
+            let mut siblings = Vec::with_capacity(depth);
+            let mut seg = 0usize; // start of current level
+            let mut width = n_leaves;
+            let mut idx = pos;
+            for _ in 0..depth {
+                siblings.push(hash_to_digest(&tree[seg + (idx ^ 1)]));
+                seg += width;
+                width /= 2;
+                idx >>= 1;
+            }
+            let input = ChunkPathInput {
+                leaf_data: data[pos * leaf_bytes..(pos + 1) * leaf_bytes].to_vec(),
+                index: !(pos as u64) & ((1u64 << depth) - 1),
+                siblings,
+            };
+            assert_eq!(
+                digest_to_hash(&layout.reference_root_chunk(&input)),
+                root,
+                "depth {depth} pos {pos}: native fold vs flock_core tree"
+            );
+            let z = layout.build_witness_chunk(&input);
+            assert_eq!(
+                digest_to_hash(&layout.read_root(&z)),
+                root,
+                "depth {depth} pos {pos}: witness root vs flock_core tree"
+            );
+        }
+        // And the leaf hash itself matches hash_leaf.
+        let one = core_merkle::hash_leaf(&data[..leaf_bytes], HashKind::Blake3);
+        let input = ChunkPathInput {
+            leaf_data: data[..leaf_bytes].to_vec(),
+            index: !0u64 & ((1u64 << depth) - 1),
+            siblings: (0..depth).map(|_| rng.digest()).collect(),
+        };
+        let z = layout.build_witness_chunk(&input);
+        let leaf_cv: [u32; SLOT_WORDS] = std::array::from_fn(|w| {
+            let base = layout.hash_bit(0, 0) - (1 << 14) + layout.spec.out_cv_base; // last chunk block
+            let mut word = 0u32;
+            for b in 0..32 {
+                if z[base + 32 * w + b] {
+                    word |= 1 << b;
+                }
+            }
+            word
+        });
+        assert_eq!(digest_to_hash(&leaf_cv), one, "chunk CV vs hash_leaf");
+    }
+}
+
+/// The chunk packed driver must be bit-identical to the per-path bool
+/// builder — including partial counts with zero dummy rows — at the real
+/// L0 shape and small shapes.
+#[test]
+fn chunk_packed_driver_matches_bool_reference() {
+    for (depth, leaf_bytes, nu, n_paths) in [
+        (1usize, 64usize, 3usize, 5usize),
+        (2, 128, 3, 8),
+        (13, 1024, 3, 5),
+    ] {
+        let layout = MerkleTreeLayout::with_blake3_chunk_leaf(depth, leaf_bytes, blake3_spec());
+        let mut rng = Rng::new(0x_7E_00_D1_44 ^ (depth as u64) << 8 ^ leaf_bytes as u64);
+        let paths: Vec<ChunkPathInput> = (0..n_paths)
+            .map(|i| chunk_input(&mut rng, depth, leaf_bytes, (i as u64) & ((1 << depth) - 1)))
+            .collect();
+        let packed = layout.generate_witness_batch_major_partial_chunk(&paths, nu);
+        let reference = layout.generate_witness_batch_major_partial_bool_chunk(&paths, nu);
+        assert_eq!(packed.0, reference.0, "z (depth {depth} leaf {leaf_bytes})");
+        assert_eq!(packed.1, reference.1, "a (depth {depth} leaf {leaf_bytes})");
+        assert_eq!(packed.2, reference.2, "b (depth {depth} leaf {leaf_bytes})");
+        assert_eq!(
+            packed.3, reference.3,
+            "stripe (depth {depth} leaf {leaf_bytes})"
+        );
+    }
+}
+
+/// The walker must agree with the materialized composite on the chunk-leaf
+/// layout too — the chunk blocks embed the same stripped base, with their
+/// pin/copy/free-message replacements in the extras.
+#[test]
+fn chunk_walker_matches_materialized() {
+    for (depth, leaf_bytes) in [(1usize, 64usize), (1, 128)] {
+        let layout = MerkleTreeLayout::with_blake3_chunk_leaf(depth, leaf_bytes, blake3_spec());
+        let (a_0, b_0) = layout.build_matrices();
+        let reference =
+            CscCircuit::from_matrices(&a_0, &b_0).with_const_pin(Some(layout.const_pos()));
+        let walker = layout.build_walker();
+        assert_eq!(walker.n_cols(), reference.n_cols());
+        assert_eq!(walker.const_pin_col(), reference.const_pin_col());
+        let nnz: usize = a_0
+            .rows
+            .iter()
+            .chain(b_0.rows.iter())
+            .map(|r| r.len())
+            .sum();
+        assert_eq!(walker.effective_nnz(), nnz, "leaf {leaf_bytes} nnz");
+
+        let mut rng = Rng::new(0x_3C_71_88_2F);
+        for trial in 0..2 {
+            let eq: Vec<F128> = (0..walker.n_cols()).map(|_| rng.f128()).collect();
+            let alpha = rng.f128();
+            let want = reference.fold_alpha_batched(alpha, &eq);
+            assert_comb_eq(
+                &walker.fold_alpha_batched(alpha, &eq),
+                &want,
+                &format!("chunk leaf {leaf_bytes} trial {trial} dispatched"),
+            );
+            assert_comb_eq(
+                &walker.fold_per_level(alpha, &eq),
+                &want,
+                &format!("chunk leaf {leaf_bytes} trial {trial} per-level"),
+            );
+        }
+    }
+
+    // The quirky eq table must still factor over the subcubes at the real
+    // L0 shape — the walker's fast path at prove time.
+    let layout = MerkleTreeLayout::with_blake3_chunk_leaf(13, 1024, blake3_spec());
+    let walker = layout.build_walker();
+    let mut rng = Rng::new(0x_66_11_09_AB);
+    let m_inner = layout.k_log;
+    let z_skip = rng.f128();
+    let xs: Vec<F128> = (0..m_inner - K_SKIP).map(|_| rng.f128()).collect();
+    let eq = build_quirky_eq_table(z_skip, &xs, K_SKIP);
+    assert_eq!(eq.len(), walker.n_cols());
+    assert!(
+        walker.eq_factors_over_levels(&eq),
+        "lincheck's table must factor over the 29 subcubes"
+    );
+}
