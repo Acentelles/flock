@@ -603,6 +603,11 @@ pub fn prove_wiring<C: Challenger>(
     let cells = circuit.cells();
     let (nu, mu) = (cells.nu(), cells.mu());
     let rows = 1usize << nu;
+    // Phase trace, `WIRING_TRACE=1` — the module's counterpart of `PCS_TRACE` /
+    // `GKR_TRACE`, so the wiring overhead can be attributed (build w vs the
+    // grand product vs the gather folds) without instrumenting the caller.
+    let trace = std::env::var("WIRING_TRACE").is_ok();
+    let t = std::time::Instant::now();
 
     // ---- w over the cell space. Gate cells read the committed buffer; public
     // cells take the statement words; dummy cells are zero (pooled buffers come
@@ -625,13 +630,28 @@ pub fn prove_wiring<C: Challenger>(
         }
     }
 
+    if trace {
+        eprintln!(
+            "  [wiring] build w (2^{mu} cells): {:7.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
     // ---- One grand-product permutation check at f = g = w.
+    let t = std::time::Instant::now();
     let (gkr, claim) = product_gkr::prove_batched(&w, &w, circuit.sigma(), ch);
     crate::scratch::give_f128(w);
+    if trace {
+        eprintln!(
+            "  [wiring] product GKR (μ = {mu}): {:7.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
 
     // ---- The gather: one eq-weighted row fold per gate cell-slot, O(2^ν)
     // each, landing on the packed-direct claim shape (design doc, Lemma
     // "Gather factorization").
+    let t = std::time::Instant::now();
     let eq_row = build_eq(&claim.rho[..nu]);
     let mut gather = Vec::with_capacity(cells.num_gate_slots());
     let mut claims = Vec::with_capacity(cells.num_gate_slots());
@@ -648,6 +668,13 @@ pub fn prove_wiring<C: Challenger>(
             eq_ind: DirectEqInd::Sparse(ring_switch::build_eq_sparse(&point)),
             point,
         });
+    }
+    if trace {
+        eprintln!(
+            "  [wiring] gather ({} claims × 2^{nu}): {:7.2} ms",
+            claims.len(),
+            t.elapsed().as_secs_f64() * 1e3
+        );
     }
 
     (WiringProof { gkr, gather }, claims)
