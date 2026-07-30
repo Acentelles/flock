@@ -326,6 +326,68 @@ each cell its word.
 % ===========================================================================
 \section{The wiring argument}\label{sec:wiring}
 
+\subsection{Mechanism: why a permutation proves the copy
+constraints}\label{sec:wiring-mech}
+
+\paragraph{No dataflow.} At the proof level nothing is ``read'' or
+``routed''. Every gate is a self-contained row whose constraints touch
+only its \emph{own} cells. ``Gate $A$'s output feeds gates $B$ and $C$''
+is purely the statement that three committed cells --- $A$'s output cell
+$p$, $B$'s input cell $q$, $C$'s input cell $r$ --- \emph{hold equal
+values}. A wire is an equivalence class of cells; fan-out $k$ is a class
+of size $k{+}1$. The value is not moved anywhere; it is present in
+several cells, and the wiring argument proves those cells agree.
+
+\paragraph{Classes as a permutation.} Pick any permutation $\sigma$ of
+$\cells$ whose orbits are the wire classes --- concretely, rotate each
+class cyclically ($\sigma(p) = q,\ \sigma(q) = r,\ \sigma(r) = p$ in the
+example) and fix every unwired cell.
+
+\begin{lemma}[Tag rigidity]\label{lem:tags}
+Let $L = \{(w_x, x)\}_{x\in\cells}$ and
+$R = \{(w_x, \sigma(x))\}_{x\in\cells}$, as multisets of
+(value, position-tag) pairs. Then $L = R$ iff $w$ is constant on every
+orbit of $\sigma$.
+\end{lemma}
+
+\begin{proof}
+Each side holds exactly one pair carrying each tag, so multiset equality
+must match them tag-by-tag: the $L$-pair at tag $q$ is $(w_q, q)$, while
+the $R$-pair at tag $q$ is $(w_{\sigma^{-1}(q)}, q)$. Hence $L = R$ iff
+$w_q = w_{\sigma^{-1}(q)}$ for every $q$, i.e.\ $w$ is
+$\sigma$-invariant, i.e.\ constant on orbits. In the example: tag $q$
+forces $w_q = w_p$, tag $r$ forces $w_r = w_q$, tag $p$ forces
+$w_p = w_r$ --- chasing tags around the cycle equates the whole class,
+which is exactly how one cycle of length $k{+}1$ enforces a fan-out-$k$
+wire.
+\end{proof}
+
+\paragraph{Multisets as products.} Encode a pair as the linear factor
+$(w_x + \alpha\,\sid(x) + \beta)$ in formal variables $\alpha, \beta$.
+The map pair $\mapsto$ factor is injective and polynomials factor
+uniquely, so
+\[
+  \prod_x \bigl(w_x + \alpha\,\sid(x) + \beta\bigr)
+  \;=\;
+  \prod_x \bigl(w_x + \alpha\,\sid(\sigma(x)) + \beta\bigr)
+\]
+holds \emph{as polynomials in $\alpha,\beta$} iff $L = R$. The verifier
+samples $\alpha, \beta$ \textbf{after} the witness is committed and
+checks the two products at that one point; a false identity survives with
+probability $O(N/2^{128})$ (Schwartz--Zippel). Note both sides use the
+\emph{same} committed value vector $w$ --- only the tag pairing differs.
+This is the $f{=}g{=}w$ instantiation of \S\ref{sec:gkr}, and computing
+and comparing the two grand products is precisely what the GKR does,
+with no committed oracle.
+
+Corollaries: direction never enters --- $\sigma$ neither knows nor cares
+which cell is the producer; an output read by nobody is a fixed point
+(no constraint, no cost); single-producer and acyclicity are
+circuit-\emph{validation} properties (they make the satisfying
+assignment unique given the inputs), not proof obligations.
+
+\subsection{The protocol and the gather factorization}
+
 After commitment and statement binding, run
 \code{product\_gkr::prove\_batched}$(f{=}g{=}w, \sigma)$ over $\cells$:
 all wiring and public-IO equalities at once, claims $\hat w(\rho)$ and
