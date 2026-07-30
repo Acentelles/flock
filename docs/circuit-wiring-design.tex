@@ -1,0 +1,556 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1.1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xspace}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+
+% ---------------------------------------------------------------------------
+% Macros (shared with multi-table-design.tex)
+% ---------------------------------------------------------------------------
+\newcommand{\F}{\mathbb{F}}
+\newcommand{\Ftwo}{\F_2}
+\newcommand{\eq}{\mathsf{eq}}
+\newcommand{\nnz}{\mathsf{nnz}}
+\newcommand{\ip}[2]{\langle #1, #2 \rangle}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\out}{\mathrm{out}}
+\newcommand{\inn}{\mathrm{in}}
+\newcommand{\sid}{s_{\mathrm{id}}}
+\newcommand{\ssig}{s_{\sigma}}
+\newcommand{\cells}{\mathcal{P}}
+\newcommand{\settled}[1]{\medskip\noindent\textbf{SETTLED} (#1).\xspace}
+
+\newtheorem{lemma}{Lemma}
+\newtheorem{remark}{Remark}
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+
+\title{Circuits over Flock Tables:\\ Large-Field Gates, Copy-Constraint Wiring, and the Road to Recursion\\[0.6ex]
+\large Design document --- working draft v0.2}
+\author{Flock}
+\date{July 29, 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document designs circuit proving over the multi-table core: wires
+carry 128-bit words, each gate is one row of a registry table, and the
+wiring (plus public inputs/outputs) is enforced on top of the unchanged
+per-row relations. The driving goal is \textbf{recursion-completeness}: the
+gate inventory must express Flock's own verifier. That goal fixes the
+architecture. (i) The registry hosts two \emph{classes} of table in one
+union commitment: boolean tables (hashes, GF(2) traces, ring-switched
+claims) and \textbf{large-field tables} ($\F_{2^{128}}$-native R1CS, one
+constraint per field multiplication, Spartan-style PIOP, packed-direct
+claims with no ring-switch) --- a committed word is an $\F$-element either
+way, so the classes differ only in their PIOPs, which run on disjoint
+regions of the address space. (ii) Wiring is a Plonk-style copy-constraint
+permutation realized with the reviewed \code{product\_gkr} grand product;
+under the multi-table addressing conventions its evaluation claim
+\emph{factors into a handful of packed evaluations of the committed union
+polynomial} (Lemma~\ref{lem:gather}) --- no gather sumcheck, no new
+committed columns. (iii) Word wires are $\F$-elements under the identity
+basis map, which is exactly what makes the hash$\leftrightarrow$field
+boundary of the recursion plan a pure copy argument. Status: the
+large-field class and its union integration are \textbf{implemented}; the
+wiring layer is designed, its primitive reviewed, and its prerequisites
+landed.
+\end{abstract}
+
+\tableofcontents
+
+% ===========================================================================
+\section{Goals and non-goals}\label{sec:goals}
+
+\paragraph{Goal.} One proof attesting that a \emph{circuit} evaluates
+correctly: a DAG whose gates are rows of registry tables and whose wires
+carry 128-bit words --- (i) every row satisfies its type's relation, (ii)
+equal wire endpoints carry equal words, (iii) designated wires equal
+statement values.
+
+\paragraph{Goal: recursion-completeness.} The architecture must capture
+\emph{the Flock verifier itself} as a circuit. Per the measured taxonomy in
+\code{docs/local/recursion-verifier-map.md}, the verifier is
+$\sim$10.2k SHA-256 compressions (78--98\% of the circuit: Merkle queries
+$\sim$9.1k, FS transcript $\sim$1.0k, PoW just 14 --- grinding is
+prover-side work, the verifier checks one hash per grind and the
+leading-zero test is free bit logic) plus $\sim$46k
+$\F$-multiplications, plus control flow. \S\ref{sec:recursion} traces what this demands; the short
+version is that it fixed three choices: the large-field table class
+(\S\ref{sec:element}), 128-bit wire granularity (a word \emph{is} an
+$\F$-element in the identity basis, so field- and hash-native gates
+exchange values by pure copy), and the succinctness-closure requirements
+on $\sigma$ and the lincheck comb (\S\ref{sec:sigma},
+\S\ref{sec:recursion}).
+
+\paragraph{Design priorities} (inherited from the multi-table document):
+prover throughput; gradual landing with byte-identity anchors; static
+registry structure with per-proof counts.
+
+\paragraph{Non-goals (v1).}
+\begin{itemize}[nosep]
+  \item \emph{Dynamic dataflow}: data-dependent addressing, RAM, shared
+        lookup tables, prover-chosen wiring (needs LogUp multiplicities;
+        \S\ref{sec:logup}). The verifier does \emph{not} need it once the
+        inner protocol is shape-normalized (\S\ref{sec:recursion}).
+  \item \emph{Sub-word wiring}: quantities finer than 128 bits are not
+        routed; sub-word gate parameters are pinned per-type or exposed as
+        public constant words; verifier control bits live in boolean-class
+        tables where bit access is free.
+  \item \emph{Cross-proof buses}: a circuit lives inside one proof.
+\end{itemize}
+
+% ===========================================================================
+\section{Architecture overview}\label{sec:arch}
+
+Three layers over the unchanged multi-table core:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Gate semantics = class-tagged tables}
+        (\S\ref{sec:element}; \emph{implemented}). Boolean tables are the
+        existing hash tables. Large-field tables carry $\F$-native R1CS
+        rows (multiplication gates and friends). One union commitment
+        hosts both; the two PIOP families run on disjoint address regions
+        and meet at the transport batch.
+  \item \textbf{Wiring = copy constraints} (\S\ref{sec:wiring};
+        \emph{designed}). A permutation $\sigma$ on the cell space of all
+        IO words, checked by \code{product\_gkr}; the wire-value claim
+        factors into packed-direct claims on the union polynomial.
+  \item \textbf{Public IO = a public cell segment} (\S\ref{sec:cells}):
+        statement words and constants are cells whose values the verifier
+        evaluates itself; $\sigma$ wires them into the gates. Constants
+        (IVs, the constant-1 cell that pins inversion gadgets) come for
+        free.
+\end{enumerate}
+
+% ===========================================================================
+\section{Preliminaries}\label{sec:prelim}
+
+We use the multi-table document's notation: uniform row capacity $2^\nu$,
+union bit-address space of $M$ variables, packed polynomial $\hat f$ over
+$M-7$ word variables, committed dense stack $\hat q$ (height-$n_t$
+stacking; dropped words are definitionally zero and the jagged transport
+enforces it). Facts this design leans on:
+
+\begin{enumerate}[nosep]
+  \item \textbf{BatchMajor, rows low.} The packed word address of
+        (chunk-column $w$, row $i$) inside a slot is $(w \ll \nu) + i$.
+        One committed $\F$-element is 128 consecutive trace bits of a
+        single invocation (boolean class) or one witness element
+        (large-field class).
+  \item \textbf{Slot alignment.} A packed address decomposes as
+        $[\, i \mid w \mid p_t \,]$ with the slot prefix $p_t$ Boolean.
+  \item \textbf{128-aligned IO regions.} Every wireable region of every
+        encoder sits on a word boundary.
+  \item \textbf{Claim seam.} Throughout, \emph{the transport} means the
+        multi-table document's \textbf{jagged transport} --- the
+        commitment-side opening pipeline ($\gamma$-batching $\to$
+        virtual-open/merged sumcheck $\to$ the jagged identity
+        $\ip{q}{W_\rho} = \hat f(\rho)$ $\to$ one Ligerito opening) that
+        \emph{consumes} every PIOP's claims; it is not the wiring/bus
+        argument, which is a claim \emph{producer} upstream of it
+        (\S\ref{sec:wiring}). The transport is class-agnostic: it
+        $\gamma$-batches \emph{weighted openings of the committed words}.
+        Each table class prepares its own claims. Bit structure is
+        internal to the boolean class --- its constraints are over bits,
+        so its PIOP claims exit through ring-switching, \emph{that
+        class's} bit$\to$word bridge --- while the element class and the
+        wiring layer emit word-level evaluations directly
+        (\code{PackedDirectClaim}s, now carried on the union path). Bits
+        never cross the seam; what crosses is a (weight, value) pair. The
+        one trace of bit-ness the transport carries is that the boolean
+        bridge's weights are Frobenius-structured (128 components) rather
+        than plain $\eq$ --- the element/wiring weights are the
+        degenerate single-component case (\S\ref{sec:routing}).
+\end{enumerate}
+
+\subsection{The product-GKR primitive (reviewed)}\label{sec:gkr}
+
+\code{product\_gkr} proves, for $f, g : \{0,1\}^\mu \to \F$ and
+$\sigma : [N] \to [N]$, $N = 2^\mu$, with challenges $\alpha, \beta$
+squeezed at entry:
+\[
+  \prod_i \bigl(f_i + \alpha\,\sid(i) + \beta\bigr) \;=\;
+  \prod_i \bigl(g_i + \alpha\,\ssig(i) + \beta\bigr),
+  \qquad \ssig(i) = \sid(\sigma(i)),
+\]
+certifying the multiset equality $\{(f_i, i)\} = \{(g_i, \sigma(i))\}$;
+with $f = g = w$ this is the copy-constraint statement (\emph{$w$ constant
+on the cycles of $\sigma$}). \code{prove\_batched} runs both product trees
+in lockstep ($\lambda$-combined, eq-weighted degree-2 layers) and lands at
+a \emph{single} point $\rho$, emitting $\hat f(\rho), \hat g(\rho),
+\hat s_\sigma(\rho)$. No committed oracle, no inversions; prover $O(N)$
+multiplications; transcript $O(\mu^2)$; measured 7.6\,ms / 7.4\,KiB at
+$\mu = 20$.
+
+The module is a PIOP: its claims are sound only once the caller binds them
+--- the statement into the challenger before the call, and the surfaced
+evaluations to the committed witness afterwards. The specific requirements
+appear where the wiring protocol uses them (\S\ref{sec:wiring},
+\S\ref{sec:statement}).
+
+% ===========================================================================
+\section{The large-field table class}\label{sec:element}
+
+\emph{Status: implemented} — standalone (\code{5339bee}, \code{bc6bab0})
+and integrated into the union (\code{c87a067..09918ed}); mixed
+boolean+element proofs verify end to end.
+
+\settled{Ron} Each registry type is class-tagged \code{boolean} or
+\code{large-field}. The two PIOPs operate on \textbf{disjoint regions} of
+the trace: class-major slot sort, the boolean region a prefix subcube
+$[0, 2^{M_{\mathrm{bool}}})$, the element region a disjoint aligned
+subcube with Boolean-frozen prefix coordinates. (The one-domain
+alternative is \emph{unsound} under the boolean $C{=}I$ convention: the
+zerocheck's $c$-side aliases the witness, so nonzero element data inside
+the boolean domain breaks the honest sum. The implementation runs the
+boolean PIOP over its subcube and appends frozen-zero high coordinates to
+its claims.)
+
+\subsection{The relation}
+
+A large-field type is a base block over $\F$: $2^\kappa$ witness columns
+per row, \textbf{C = identity} (constraint domain $\equiv$ column domain),
+sparse $A_0, B_0 \in \F^{2^\kappa \times 2^\kappa}$, and \textbf{affine
+constant vectors} $a_0, b_0 \in \F^{2^\kappa}$ carried in the registry
+(not the witness):
+\[
+  (A_0 z + a_0)\,(B_0 z + b_0) \;=\; z
+  \quad\text{per row, per column.}
+\]
+\settled{Ron} No constant-1 column (it would waste a word-column in
+tables only a few columns wide); constants live in the matrices, and the
+verifier evaluates $\hat a_0, \hat b_0$ in closed form ---
+count-independent, since the constant vector is uniform across rows.
+\textbf{Validity rule}, enforced at construction: $a_0 \odot b_0 = 0$
+(disjoint supports), so an all-zero row satisfies the relation ---
+dummy/padding rows stay complete, sound, and free. Standard rows:
+multiplication ($A_0 = e_a$, $B_0 = e_b$), free wire ($A_0 = e_y$,
+$b_0[y] = 1$: a tautology), linear-pinned-to-wire ($A_0 =$ combination,
+$b_0[y] = 1$), padding column (all-zero row forces $z_y = 0$). Inversion:
+constrain $u = x \cdot y$ and wire $u$ to the public constant-1 cell.
+Gate granularity beyond \code{mult}/\code{mult-acc} is deferred.
+
+\subsection{The PIOP: Spartan-style, two phases}
+
+\settled{Ron} Phase 1: a large-field zerocheck,
+$\sum_x \eq(\tau,x)\bigl((A z + a_0)(Bz + b_0) - z\bigr)(x) = 0$ over the
+element region --- plain degree-3 eq-weighted rounds, no univariate skip,
+no packing; one zerocheck across all element slots (the same eq-derived
+implicit batching as the boolean union). Because $C = I$, the $c$-claim is
+\emph{directly} a witness evaluation at the zerocheck's point. Phase 2: an
+$\alpha$-batched lincheck for the $A$/$B$ claims.
+
+\paragraph{The collapsed lincheck.} Because the full system is
+$I_{2^\nu} \otimes A_0$, the lincheck weight factors as
+$\eq(r_{\mathrm{row}}, y_{\mathrm{row}})\cdot \mathrm{comb}(y_{\mathrm{col}})$,
+so the row half sums away in closed form: the prover partial-folds $z$ at
+$r_{\mathrm{row}}$ (one pass) and sumchecks only the $\kappa$ column
+variables. Output claim $\hat z(r_{\mathrm{row}}, r'_{\mathrm{col}})$ ---
+row coordinates \emph{inherited} from the zerocheck, so the element
+class's two claims share their row point; the verifier's final check is
+$(\hat A_0 + \alpha \hat B_0)(r_{\mathrm{con}}, r'_{\mathrm{col}})$ in
+$O(\nnz)$ --- a few entries per gate type, so \textbf{the comb problem
+does not exist for element tables}. Anything built on top should assume
+$\kappa$ rounds. (Landed as \code{c87a067}.)
+
+\paragraph{Witness and padding.} $Az, Bz$ are sparse gathers emitted
+during generation (for a mult gate, literally the operand values); dummy
+rows are all-zero, satisfy the relation, contribute nothing to round
+polynomials, and --- under the union's height-$n_t$ stacking --- are
+\emph{not committed}, making dummy-row zero-ness structural (the
+$\ip{q}{W_\rho} = \hat f(\rho)$ transport identity breaks otherwise;
+test-pinned in both debug and release forms).
+
+\subsection{Claim routing through the transport}\label{sec:routing}
+
+Element claims are packed evaluations --- \emph{no ring-switch}. On the
+unmerged jagged path they ride as \code{PackedDirectClaim}s (implemented:
+four claims --- boolean AB, C ring-switched; element C, LC packed-direct
+--- through one opening). On the \textbf{merged} (v6) transport the same
+composition holds structurally: the merged sumcheck is a $\gamma$-batched
+multi-weight transport whose per-claim weights are
+\code{FrobeniusClaim}\{$z_{\mathrm{row}}, z_{\mathrm{col}}$,
+coeffs[128]\}; a ring-switched claim contributes its 128-coefficient
+Frobenius residue, and an element claim is the \emph{degenerate}
+single-component case $\mathrm{coeffs} = \gamma \cdot e_0$ --- no extra
+rounds, weight factors as $\eq_{\mathrm{row}} \otimes \eq_{\mathrm{col}}$
+(streamable). A pure-element proof degenerates to plain
+jagged$\to$Ligerito with no Frobenius content at all. \emph{Extending the merged path's claim intake --- today it accepts
+ring-switched claims only --- is future work}; known items: the point
+split assumes a skip coordinate, the assist should specialize
+single-component claims (ties into the \emph{jagged remainder},
+\S\ref{sec:open}),
+\code{stream\_b} currently disables on packed-direct claims (accepted,
+TODO), and the merged entries assert element-free until then. Until that
+lands, element and circuit proofs ride the unmerged path.
+
+% ===========================================================================
+\section{The circuit model}\label{sec:cells}
+
+\begin{definition}[IO schema]
+A registry type carries lists of 128-aligned trace-word positions
+designating gate inputs and outputs (generalizing \code{ChainLayout});
+words outside the schema are internal. \emph{Not yet implemented.}
+\end{definition}
+
+\begin{definition}[Circuit]
+Gate counts per type (each gate one row), a set of \emph{public cells}
+(statement words and constants), and a wiring: a partition of all IO cells
+into wires. Valid iff every wire has at most one producer, the dataflow
+graph is acyclic, and the induced $\sigma$ is a permutation.
+\end{definition}
+
+\begin{remark}[Semantics are satisfiability]
+The proof enforces gates + wiring; that a satisfying assignment computes
+``the'' output is a property of the circuit (single producer, acyclicity),
+checked by whoever endorses the circuit digest — as in Plonk.
+\end{remark}
+
+\paragraph{The cell space.} Enumerate cell-slots: pairs (type, io-word
+position) across both classes, plus public cell-slots, padded to $2^c$.
+$\cells = \{0,1\}^{\mu}$, $\mu = \nu + c$, cell $p = (j, \iota)$ with the
+row $j$ in the \emph{low} bits. A gate cell maps to committed word
+$W_\iota(j) = [\, j \mid \mathrm{chunk}(\iota) \mid p_{t(\iota)}\,]$;
+public slots hold statement words; everything else is a dummy cell (value
+0, fixed by $\sigma$). Wires are $\sigma$-cycles: fan-out $k$ is a cycle
+of length $k{+}1$; a constant wired into $n$ gates is one long cycle;
+unread outputs are fixed points. The wire-value polynomial $w$ assigns
+each cell its word.
+
+% ===========================================================================
+\section{The wiring argument}\label{sec:wiring}
+
+After commitment and statement binding, run
+\code{product\_gkr::prove\_batched}$(f{=}g{=}w, \sigma)$ over $\cells$:
+all wiring and public-IO equalities at once, claims $\hat w(\rho)$ and
+$\hat s_\sigma(\rho)$ at one $\rho = (\rho_r, \rho_\iota)$. Dummy cells
+cost nothing and threaten nothing ($\sigma$-fixed, identical factors both
+sides).
+
+\begin{lemma}[Gather factorization]\label{lem:gather}
+With cells indexed rows-low,
+\[
+  \hat w(\rho_r, \rho_\iota)
+  \;=\;
+  \sum_{\iota\ \mathrm{gate}} \eq(\rho_\iota, \iota)\cdot
+     \hat f\bigl(\rho_r \| \mathrm{chunk}(\iota) \| p_{t(\iota)}\bigr)
+  \;+\;
+  \sum_{\iota\ \mathrm{public}} \eq(\rho_\iota, \iota)\cdot
+     \hat v_\iota(\rho_r).
+\]
+\end{lemma}
+
+\begin{proof}
+Expand and use multilinearity of $\hat f$ in its low (row) coordinates:
+$\sum_j \eq(\rho_r, j) \hat f(j \| x) = \hat f(\rho_r \| x)$. Public slots
+contribute their MLEs; dummies contribute 0.
+\end{proof}
+
+Every gate term is a packed evaluation at a point random in the row
+coordinates and Boolean in all high coordinates --- the existing
+packed-direct claim shape, consumable with no gather sumcheck and no new
+committed columns. The $\eq(\rho_\iota, \iota)$ coefficients and the
+public sum are verifier-computed in $O(2^c + \#\mathrm{public})$; the
+verifier checks the transported values recombine to $\hat w(\rho)$,
+\textbf{and} that
+$f_{\mathrm{eval}} = g_{\mathrm{eval}} = $ this recombined value ---
+\emph{both} of the GKR's surfaced evaluations must be bound to the
+committed witness; binding only one leaves the other product's input
+vector prover-chosen. Likewise, v1 verification uses the $\sigma$-aware
+verifier (never the trusting variant), and circuit validation enforces
+that $\sigma$ is a permutation (completeness; soundness fails closed).
+
+\begin{remark}[Where each convention is load-bearing]
+Rows-low lets $\hat f$'s multilinearity absorb the row fold; uniform
+capacity makes a slot's row variable the union row variable; slot
+alignment freezes the high coordinates Boolean; 128-aligned IO regions
+make a wire word one committed word. Remove any one and the lemma degrades
+into a real gather argument.
+\end{remark}
+
+\paragraph{Capacity tax.} \settled{Ron; recorded as potential
+improvement} The product runs over all $2^\mu$ cells --- capacity, not
+counts: a dummy factor $\alpha\sid(p) + \beta \ne 1$ cannot be skipped. At
+$\mu \approx \nu + 5$ this is $\sim$12\,ms at $\nu = 16$; sizing $\nu$ to
+the circuit family makes it the honest cost. The v2 refinement (mask dummy
+leaves to 1 --- sound since $\sigma$ maps live cells to live cells; all-1
+subtrees skip by run lists; count-derived closed-form corrections on the
+verifier side) is sketched and deferred.
+
+% ===========================================================================
+\section{Binding \texorpdfstring{$\hat s_\sigma(\rho)$}{s-sigma}: the
+circuit lifecycle}\label{sec:sigma}
+
+\settled{Ron} \textbf{v1: verifier-known circuit.} The verifier holds the
+circuit and evaluates $\hat s_\sigma(\rho)$ in $O(|\cells|)$
+(\code{verify\_batched\_with\_sigma}) --- a few ms, subdominant to the
+lincheck comb the verifier already pays ($O(\nnz)$, $\sim$83\% of verify).
+\textbf{v2: preprocessed $\sigma$ commitment} for repeated circuits ---
+the \emph{same} delegation problem as comb delegation (registry-/circuit-
+static data, commit once, open per proof); the two must share one design.
+Recursion \emph{requires} the v2 form (an $O(2^\mu)$ in-circuit evaluation
+is unaffordable); v1 is for native verification. Structured wirings
+(chains, complete trees) evaluate in $O(\mu)$ --- the existing
+\code{chain.rs}/\code{merkle\_path.rs} glue is the degenerate case of this
+layer and stays.
+
+% ===========================================================================
+\section{Why copy constraints and not a LogUp bus}\label{sec:logup}
+
+For a \emph{fixed} circuit, $\sigma$-cycles handle fan-out natively with a
+pure permutation and zero new committed columns, using the reviewed
+primitive. A LogUp bus (emit/consume tuples with multiplicities) is the
+right architecture for \emph{dynamic} dataflow --- and \code{logup\_gkr}
+exists unported on \code{flock-dev} --- but the verifier does not need it
+(\S\ref{sec:recursion}), and the migration path preserves everything: the
+cell space, IO schemas, Lemma~\ref{lem:gather} and the transport seams
+carry over; only the multiset argument swaps. Prover-\emph{ordered} data
+(sorted query lists) needs only plain multiset equality --- no tags, no
+trust boundary --- which the same primitive provides.
+
+% ===========================================================================
+\section{Recursion: capturing the verifier}\label{sec:recursion}
+
+The verifier is expressible as a \emph{fixed-topology} circuit in this
+model, given three things (all now designed or landed):
+
+\begin{enumerate}[nosep]
+  \item \textbf{The large-field class} (\S\ref{sec:element};
+        \emph{landed}): the $\sim$46k multiplications cost 1 constraint
+        each instead of $\sim$2187 bit-arithmetized ones. The recursion
+        map's ``two instances composed by a crossing argument'' becomes
+        two \emph{regions of one committed trace}, and the crossing
+        ($\sim$15.8k opened-row elements + transcript) is ordinary wiring
+        --- pure copy, because the bit$\leftrightarrow$element map is the
+        identity in the standard basis. Element slots need no
+        ring-switch, so the verifier-of-the-verifier also loses the
+        $\code{eval\_rs\_eq}$ family ($\sim$15k mults): recursion gets
+        simpler as it recurses.
+  \item \textbf{Inner-protocol shape normalization} (family J), settled:
+        \settled{Ron} query sampling \emph{with replacement} (the
+        rejection loop and dedup disappear; soundness re-accounted);
+        Merkle openings as \emph{full independent fixed-depth paths}
+        first ($\sim$30\% more hash work, fully static circuit), with
+        \emph{Merkle caps} (commit the top-$2^k$ layer; every path
+        shortens by $k$) as the later knob. \settled{Ron} The Merkle/FS
+        hash is \textbf{BLAKE3 throughout} --- the $2\times$ circuit-size
+        win inverts the native HW-SHA decision; the selectable-hash
+        machinery is merged.
+  \item \textbf{Succinctness closure}: every verifier component polylog
+        in-circuit or delegated. The violations are comb reconstruction
+        ($O(\nnz)$, 84\% of verify --- ``the one change without which
+        recursion is not worth attempting''), the v1 $\sigma$ evaluation
+        ($O(2^\mu)$ --- v2 fixes it), and the \emph{jagged remainder}
+        (\S\ref{sec:open}) --- avoidable initially by recursing the
+        direct path, where that phase does not exist. The wiring
+        layer's own verifier is $O(\mu^2)$ sumcheck replay --- closure-
+        safe; the element comb is $O(\nnz(A_0))$ --- trivially safe.
+\end{enumerate}
+
+Bit-level control (query index bits, path direction selects, FS byte
+packing) lives in boolean-class glue tables where $\Ftwo$-linear work is
+free; word granularity carries everything across the boundary.
+
+% ===========================================================================
+\section{Statement, transcript, Fiat--Shamir}\label{sec:statement}
+
+Statement: (registry digest, circuit digest, public words, commitment
+root); the circuit digest covers gate counts (which determine the union
+counts), IO schemas, wiring, and the public-cell layout. Transcript order:
+commit $\to$ \code{bind\_statement} $\to$ boolean $\tau$ $\to$ boolean
+zerocheck $\to$ boolean lincheck $\to$ element $\tau'$ $\to$ element
+zerocheck $\to$ $\alpha'$ $\to$ element lincheck $\to$ wiring GKR
+($\alpha, \beta$ are squeezed at its entry, so statement binding must
+precede it) $\to$ $\gamma$-batched
+opening. Implemented through the element lincheck; the wiring GKR slot is
+next.
+
+% ===========================================================================
+\section{Cost accounting}\label{sec:costs}
+
+Element PIOP: sub-ms at verifier-circuit scales; claims add $O(1)$ terms
+to the combine. Wiring: $O(2^{\mu})$ prover multiplications
+($\mu = \nu + c$, $\sim$12\,ms at $\mu = 21$), transcript +7--15\,KB;
+verifier $O(\mu^2)$ + $O(2^c + \#\mathrm{public})$ + (v1 only)
+$O(|\cells|)$ for $\hat s_\sigma$. Measured baselines and the recursion
+sizing ($m \approx 26.6$ with BLAKE3 + Slim ladder) live in the recursion
+map and the multi-table document.
+
+% ===========================================================================
+\section{Implementation status and roadmap}\label{sec:status}
+
+\paragraph{Landed (2026-07-29, branch \code{multitable}).}
+\begin{itemize}[nosep]
+  \item BLAKE3 IO word alignment (\code{f95dfbb}) --- fixtures re-pinned;
+        SHA-256 anchor byte-identical across the change.
+  \item Large-field table class, standalone (\code{5339bee},
+        \code{bc6bab0}): types, both PIOP phases, end-to-end single-table
+        proof, tamper matrix.
+  \item Union integration (\code{c87a067..09918ed}): collapsed lincheck,
+        class tags (boolean-only digests byte-identical), class-major
+        layout, disjoint PIOPs, four claims through one unmerged opening,
+        dummy-row closure. All existing anchors green untouched.
+  \item \code{product\_gkr} soundness review (two passes, 2026-07-29).
+\end{itemize}
+
+\paragraph{Next.}
+\begin{enumerate}[nosep]
+  \item \textbf{Wiring milestone}: registry IO schemas, circuit
+        representation/validation/digest, the cell space, the wiring GKR
+        call and gather recombination with the binding requirements of
+        \S\ref{sec:wiring}/\S\ref{sec:statement}, public IO.
+        First driving workload: a SHA-256 (or BLAKE3) binary-tree circuit.
+  \item \textbf{Delegation design} (comb + $\sigma$, one design) --- the
+        recursion map's top-priority item.
+  \item \textbf{Merged-transport intake} for packed-direct claims +
+        \code{stream\_b} support (perf follow-up; unmerged path is the
+        correctness oracle).
+  \item Deferred: count-proportional element prover; LogUp bus;
+        capacity-tax refinement; Merkle caps; keccak batch-major tier.
+\end{enumerate}
+
+% ===========================================================================
+\section{Open questions}\label{sec:open}
+
+\begin{enumerate}[nosep]
+  \item Delegation design shape (comb + $\sigma$ + assist): SPARK-style
+        sparse commitment vs.\ alternatives; adaptive-ordering caveat from
+        the recursion map (\S5.1) must be preserved.
+  \item Element gate granularity: fuse macro-gates (Horner, dot-product-k,
+        sumcheck-round) once the verifier-circuit profile shows where the
+        cells concentrate.
+  \item Sub-word gate parameters (BLAKE3 counters/flags): per-type pinning
+        vs.\ public constant words --- decide when the BLAKE3 circuit gate
+        is specified.
+  \item Boolean glue tables for the recursion (byte packing,
+        bit-decomposition, conditional swap): exact table inventory.
+  \item Query-ladder profile for recursion-facing proofs (Slim vs.\ Fast)
+        and the Merkle-caps parameter.
+  \item \textbf{The jagged remainder} (named here; \emph{postponed}). At
+        the end of the merged transport the verifier must evaluate each
+        claim's jagged-composed weight at the final point; it cannot do so
+        alone in polylog time, and the current delegation (the Frobenius
+        assist) costs the verifier column-linear work $\times$ 128
+        components per claim --- the dominant merged-path verify cost and
+        its recursion blocker. The multipoint-twisted replacement is well
+        past prototype --- a fused multipoint prover sharing the
+        merged-open context, with column-parallel dispatch, landed
+        2026-07-27 with measured numbers (see the capacity-free note) ---
+        but the delegation remains \emph{column-linear} (active run-tree
+        work improves the constant by $m/\log n_t$, not the linearity
+        itself), and the soundness write-up is owed; that write-up should
+        also specialize single-component (element/wiring) weights.
+        Postponable for this document's milestones because:
+        element claims ride the existing assist correctly (just 128$\times$
+        wasteful on their components, negligible at few claims), and the
+        first recursion can target the \emph{direct} path, where this
+        phase does not exist.
+\end{enumerate}
+
+\end{document}
