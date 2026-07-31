@@ -1455,3 +1455,113 @@ leaves a {} hole inside the 2^26 prefix subcube, but the element region \
         );
     }
 }
+
+/// A mixed boolean+element proof over the MERGED transport — the first thing
+/// to drive a packed-direct claim through it.
+///
+/// The merged (Frobenius) path is the shipped, capacity-free one, but element
+/// claims are packed-direct and it had no intake for them, so mixed proofs
+/// were confined to the unmerged jagged path and its padded-domain
+/// auxiliaries. The intake works by expressing a packed-direct claim's weight
+/// as the F₂-linear map `x ↦ γ·x`, which the merged weight builder cannot
+/// distinguish from a ring-switched claim's Φ-fold.
+///
+/// Both transports carry the same claim set, so they must agree on the CLAIMS
+/// while their openings differ — and the merged one must still reject
+/// tampering, or the packed-direct claims would be riding along unchecked.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn mixed_proofs_verify_over_the_merged_transport() {
+    let (nu, kappa) = (7usize, 3usize);
+    let m = mixed_setup(nu, kappa);
+    let (n_bool, n_elem) = (100usize, 90usize);
+    let union = UnionInstance::new(&m.registry, vec![n_bool, n_elem]);
+    let pcs_params = union_pcs_params(&union);
+
+    let mut rng = Rng::new(0x_4D_47_44_01);
+    let inputs = random_blake3_inputs(&mut rng, n_bool);
+    let z_elem = gate_witness(&m.ty, nu, n_elem, m.w.0, m.w.1, &mut rng);
+    let circuit = m.blake3_r1cs.csc_lincheck_circuit();
+
+    let bool_slot = || {
+        UnionSlotProverInput::new(
+            blake3::generate_witness_batch_major_partial(&inputs, nu),
+            circuit,
+        )
+    };
+    let elem_slot = || {
+        let z = z_elem.clone();
+        UnionElementSlotInput::new(move |dst: &mut [F128]| dst.copy_from_slice(&z))
+    };
+
+    // Merged.
+    let mut ch = FsChallenger::new(DOMAIN);
+    let (merged, commitment, claims_m) =
+        prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
+            &union,
+            &pcs_params,
+            vec![bool_slot()],
+            vec![elem_slot()],
+            &mut ch,
+        );
+    assert!(merged.boolean.is_some() && merged.element.is_some());
+    let mut ch_v = FsChallenger::new(DOMAIN);
+    let got = verifier::verify_ligerito_jagged_union_mixed_class_merged(
+        &union,
+        &[circuit],
+        &commitment,
+        &merged,
+        &pcs_params,
+        &mut ch_v,
+    )
+    .unwrap_or_else(|e| panic!("merged rejected an honest mixed proof: {e:?}"));
+    assert_eq!(got, claims_m);
+
+    // Jagged, same statement: same claims, different opening.
+    let mut ch = FsChallenger::new(DOMAIN);
+    let (jagged, commitment_j, claims_j) = prover::prove_fast_ligerito_jagged_union_mixed_class(
+        &union,
+        &pcs_params,
+        vec![bool_slot()],
+        vec![elem_slot()],
+        &mut ch,
+    );
+    assert_eq!(commitment_j.root, commitment.root, "same witness, same root");
+    assert_eq!(
+        claims_j, claims_m,
+        "the transports must agree on the claims they carry"
+    );
+
+    // Tampering must still be caught on the merged path.
+    for (what, bad) in [
+        ("opening", {
+            let mut b = merged.clone();
+            b.pcs_open.q_eval += F128::ONE;
+            b
+        }),
+        ("element claim", {
+            let mut b = merged.clone();
+            b.element.as_mut().unwrap().lincheck.z_eval += F128::ONE;
+            b
+        }),
+        ("boolean claim", {
+            let mut b = merged.clone();
+            b.boolean.as_mut().unwrap().lincheck.z_partial[0] += F128::ONE;
+            b
+        }),
+    ] {
+        let mut ch_v = FsChallenger::new(DOMAIN);
+        assert!(
+            verifier::verify_ligerito_jagged_union_mixed_class_merged(
+                &union,
+                &[circuit],
+                &commitment,
+                &bad,
+                &pcs_params,
+                &mut ch_v,
+            )
+            .is_err(),
+            "tampered {what} must be rejected by the merged transport"
+        );
+    }
+}
