@@ -1,0 +1,603 @@
+//! **Fancy jagged** — the §6 variant of Hemo–Jue–Rabinovich–Roh–Rothblum
+//! ("Jagged Polynomial Commitments", ePrint 2025/917, EUROCRYPT 2026), for the
+//! case where columns are grouped into **tables**: runs of columns that share a
+//! height. The verifier's evaluation of the sparse→dense weight then costs
+//! `O(#tables)` instead of `O(#columns)`.
+//!
+//! Standalone kernel, deliberately not wired into the commitment path — same
+//! posture as [`super::jagged`] ("the packing-agnostic kernel … does not wire
+//! into ring-switch / ligerito"). See "Adoption cost" below for why wiring is
+//! not a small change.
+//!
+//! ## Why grouping columns needs a different layout
+//!
+//! Basic jagged flattens column-major: within column `y`, dense index
+//! `i = t_{y−1} + row`. Grouping columns into a table would then put column
+//! `col` of table `y` at `i = t_{y−1} + col·h_y + row` — and `h_y` is an
+//! arbitrary height, so `col·h_y` is a general multiplication, which no
+//! small branching program can check.
+//!
+//! Fancy jagged flattens **row-major within a table**:
+//!
+//! ```text
+//!   i = t_{y−1} + row·2^{c_y} + col          (table y is 2^{c_y} columns wide)
+//! ```
+//!
+//! Now the stride is a power of two, so `row·2^{c_y}` is a *shift* by the
+//! constant `c_y` — and the whole relation is checkable bit-by-bit. **That is
+//! the entire trick**: the layout change is what buys the per-table verifier
+//! cost, which is also why table widths must be powers of two.
+//!
+//! ## The width-6 branching program
+//!
+//! `g_u(row, col, i, t_prev, t_next) = [ i = t_prev + row·2^u + col ∧ i < t_next ]`
+//!
+//! read once, LSB→MSB. Against basic jagged's width-4 program it differs in
+//! exactly the two ways §6 names:
+//!
+//! * it adds **three** bits per layer (`t_prev`, the shifted `row`, and `col`)
+//!   rather than two, so the carry reaches 2 and the register is a **trit**;
+//! * the `2^u` factor is just an index shift, `u` being a per-table constant.
+//!
+//! With the one inequality bit that is `3 × 2 = 6` states. Branching-program
+//! evaluation is quadratic in width, so each evaluation costs `(6/4)² = 2.25×`
+//! a basic-jagged one — the trade §6 calls a mild caveat, against a factor of
+//! `#columns / #tables`.
+//!
+//! ## Non-power-of-two widths
+//!
+//! Do not pad. [`FancyJaggedParams::from_tables`] decomposes a width-`W` table
+//! into the `popcount(W)` power-of-two tables named by `W`'s set bits (§6's
+//! "a table of width 9 … one of width 8 and one of width 1"), so the verifier
+//! cost is `Σ_T log₂(#col(T))`.
+//!
+//! **This re-indexes the polynomial.** After decomposition, `tab` enumerates
+//! *physical* sub-tables and `col` is an offset within one, so a claim stated
+//! against the original `(table, row, col)` coordinates is not a claim against
+//! these. Callers own that translation.
+//!
+//! ## Adoption cost, for flock specifically
+//!
+//! Two things, one small and one not:
+//!
+//! * The registry already *has* the table structure — a slot is `k_t`
+//!   consecutive columns of height `n_t`, which is exactly a table — and
+//!   `jagged::assist_boundaries` currently flattens it away into per-column
+//!   boundary pairs. So the configuration is free.
+//! * But the dense stack is column-major (`UnionInstance::compact_witness`),
+//!   and fancy jagged needs row-major-within-table. That changes what `q` is,
+//!   hence the commitment.
+//!
+//! The prize is not a faster assist but **no assist**: §6 notes the verifier
+//! "can compute the latter on its own, *or* employ a similar jagged assist" —
+//! the assist is the fallback for when per-column evaluation is too expensive
+//! for the verifier, and per-table it is not. Composed with the Frobenius
+//! decomposition, `Ŵ(ρ) = Σ_j c_j·f̂(z^{2^j}, ρ)` becomes directly evaluable,
+//! so the 128·K-statement delegation — 88% of the measured prove gap — has
+//! nothing left to do. Note §6 itself claims only a verifier improvement; the
+//! prover's own weight pass stays `O(area)`, "similarly to Section 3".
+
+use crate::field::F128;
+use crate::lincheck::build_eq_table;
+use crate::pcs::jagged::{int_bit, point_bit};
+
+/// One physical table: `2^log_width` columns, `height` rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Table {
+    pub log_width: u32,
+    pub height: u64,
+}
+
+/// Fancy-jagged configuration — §6's `(t_y, c_y)_y`, plus the variable counts.
+///
+/// Table `y` occupies dense indices `[table_prefix_sums[y], table_prefix_sums[y+1])`,
+/// is `2^{log_widths[y]}` columns wide, and holds `heights[y]` rows.
+#[derive(Clone, Debug)]
+pub struct FancyJaggedParams {
+    /// `log2` bound on rows per table (`row` variable count).
+    pub n: usize,
+    /// `log2` of the number of tables (`tab` variable count).
+    pub k: usize,
+    /// `log2` bound on table width (`col` variable count) = `max_y c_y`.
+    pub c: usize,
+    /// `log2` of the dense area bound: `Σ_y 2^{c_y}·h_y ≤ 2^m`.
+    pub m: usize,
+    pub log_widths: Vec<u32>,
+    pub heights: Vec<u64>,
+    /// Length `2^k + 1`; `[y]` is table `y`'s start, `[y+1]` its end.
+    pub table_prefix_sums: Vec<u64>,
+}
+
+impl FancyJaggedParams {
+    /// Build from physical tables, zero-padding the table count to `2^k`.
+    /// Every width must already be a power of two — use
+    /// [`Self::from_tables`] to get there from arbitrary widths.
+    pub fn new(tables: &[Table], n: usize, m: usize) -> Self {
+        assert!(!tables.is_empty(), "need at least one table");
+        let k = tables.len().next_power_of_two().trailing_zeros() as usize;
+        let n_tab = 1usize << k;
+        let c = tables.iter().map(|t| t.log_width as usize).max().unwrap();
+        let mut log_widths = vec![0u32; n_tab];
+        let mut heights = vec![0u64; n_tab];
+        let mut table_prefix_sums = Vec::with_capacity(n_tab + 1);
+        let mut acc = 0u64;
+        table_prefix_sums.push(0);
+        for (y, slot) in log_widths.iter_mut().enumerate() {
+            let (lw, h) = match tables.get(y) {
+                Some(t) => (t.log_width, t.height),
+                None => (0, 0), // padding table: width 1, height 0, empty
+            };
+            assert!(h <= 1u64 << n, "table {y} height {h} exceeds 2^{n}");
+            *slot = lw;
+            heights[y] = h;
+            acc += (1u64 << lw) * h;
+            table_prefix_sums.push(acc);
+        }
+        assert!(acc <= 1u64 << m, "dense area {acc} exceeds 2^{m}");
+        Self {
+            n,
+            k,
+            c,
+            m,
+            log_widths,
+            heights,
+            table_prefix_sums,
+        }
+    }
+
+    /// Build from **logical** `(width, height)` tables of arbitrary width,
+    /// decomposing each into the power-of-two tables named by its set bits,
+    /// widest first (§6: width 9 → 8 then 1).
+    ///
+    /// Re-indexes the polynomial — see the module docs.
+    pub fn from_tables(logical: &[(u64, u64)], n: usize, m: usize) -> Self {
+        let mut phys = Vec::new();
+        for &(width, height) in logical {
+            assert!(width > 0, "table width must be positive");
+            for bit in (0..u64::BITS).rev() {
+                if (width >> bit) & 1 == 1 {
+                    phys.push(Table {
+                        log_width: bit,
+                        height,
+                    });
+                }
+            }
+        }
+        Self::new(&phys, n, m)
+    }
+
+    /// Total nonzero entries `Σ_y 2^{c_y}·h_y`.
+    pub fn area(&self) -> u64 {
+        *self.table_prefix_sums.last().unwrap()
+    }
+
+    /// Number of physical tables actually carrying data — the quantity the
+    /// verifier's cost is proportional to, against basic jagged's column count.
+    pub fn live_tables(&self) -> usize {
+        self.heights.iter().filter(|&&h| h > 0).count()
+    }
+
+    /// The bijection `i ↦ (tab, row, col)` for `i < area()`, i.e.
+    /// `i = t_{tab} + row·2^{c_tab} + col`.
+    pub fn unrank(&self, i: u64) -> (usize, u64, u64) {
+        debug_assert!(i < self.area());
+        let tab = self.table_prefix_sums.partition_point(|&t| t <= i) - 1;
+        let off = i - self.table_prefix_sums[tab];
+        let w = 1u64 << self.log_widths[tab];
+        (tab, off / w, off % w)
+    }
+
+    /// Inverse of [`Self::unrank`]; `None` if out of the table's extent.
+    pub fn rank(&self, tab: usize, row: u64, col: u64) -> Option<u64> {
+        if tab >= 1usize << self.k
+            || row >= self.heights[tab]
+            || col >= 1u64 << self.log_widths[tab]
+        {
+            return None;
+        }
+        Some(self.table_prefix_sums[tab] + (row << self.log_widths[tab]) + col)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The width-6 branching program
+// ---------------------------------------------------------------------------
+
+/// `state = carry + 3·less_than`, carry ∈ {0,1,2}.
+const STATE_INITIAL: usize = 0; // carry 0, not-yet-less
+const STATE_SUCCESS: usize = 3; // carry 0, less-than established
+const N_STATES: usize = 6;
+
+/// One layer of `g_u(row, col, i, t_prev, t_next) = [i = t_prev + row·2^u + col
+/// ∧ i < t_next]`, reading LSB→MSB. `row` is the already-shifted row bit (bit
+/// `layer − u` of the row). Returns the next state, or `None` on the rejecting
+/// sink (the addition disagrees with `i` at this bit).
+#[inline]
+fn transition(
+    row: bool,
+    col: bool,
+    index: bool,
+    prev: bool,
+    next: bool,
+    state: usize,
+) -> Option<usize> {
+    let carry = state % 3;
+    let less = state / 3;
+    // Three addends plus the carry: max 1+1+1+2 = 5, so the carry out is ≤ 2 —
+    // this is the trit §6 calls for.
+    let sum = row as usize + col as usize + prev as usize + carry;
+    if (index as usize) != (sum & 1) {
+        return None;
+    }
+    let new_carry = sum >> 1;
+    debug_assert!(new_carry <= 2);
+    // i < t_next, decided LSB→MSB: equal bits defer to the lower decision,
+    // differing bits let the higher one rule.
+    let new_less = if index == next { less } else { next as usize };
+    Some(new_carry + 3 * new_less)
+}
+
+/// Bit `layer` of a row point shifted up by `u` — i.e. bit `layer − u` of the
+/// row, which is how the `·2^u` factor enters.
+#[inline]
+fn shifted_row_bit(z_row: &[F128], layer: usize, u: usize) -> F128 {
+    if layer >= u {
+        point_bit(z_row, layer - u)
+    } else {
+        F128::ZERO
+    }
+}
+
+/// Multilinear extension `ĝ_u(z_row, z_col, z_index, t_prev, t_next)` by the
+/// Holmgren–Rothblum layer DP over the 6 reachable states, with the boundary
+/// coordinates supplied per layer by `pn`. `O(m)` field ops.
+fn g_hat_cd(
+    z_row: &[F128],
+    z_col: &[F128],
+    z_index: &[F128],
+    m: usize,
+    u: usize,
+    pn: impl Fn(usize) -> (F128, F128),
+) -> F128 {
+    // dp[s] = weight of reaching the accepting sink from state `s` over the
+    // layers already processed. Seed the accepting state, peel MSB→LSB, read
+    // off the initial state.
+    let mut dp = [F128::ZERO; N_STATES];
+    dp[STATE_SUCCESS] = F128::ONE;
+    for layer in (0..=m).rev() {
+        let (prev, next) = pn(layer);
+        let eq = build_eq_table(&[
+            shifted_row_bit(z_row, layer, u),
+            point_bit(z_col, layer),
+            point_bit(z_index, layer),
+            prev,
+            next,
+        ]);
+        let mut new_dp = [F128::ZERO; N_STATES];
+        for (s, slot) in new_dp.iter_mut().enumerate() {
+            let mut acc = F128::ZERO;
+            for (idx, &w) in eq.iter().enumerate() {
+                let row = idx & 1 != 0;
+                let col = (idx >> 1) & 1 != 0;
+                let index = (idx >> 2) & 1 != 0;
+                let prev_b = (idx >> 3) & 1 != 0;
+                let next_b = (idx >> 4) & 1 != 0;
+                // `col < 2^u`: this table is only `2^u` wide, so col's bits at
+                // positions ≥ u must be zero. Without this the addition would
+                // alias — col = 2^u looks exactly like row+1, col = 0 — and the
+                // map would stop being a bijection. Dropping the branch (rather
+                // than pinning the coordinate) keeps the correct `(1 + z_col_j)`
+                // factor on the surviving bit-0 branch, which is what the MLE of
+                // a function vanishing on `col_j = 1` requires.
+                if col && layer >= u {
+                    continue;
+                }
+                if let Some(out) = transition(row, col, index, prev_b, next_b, s) {
+                    acc += w * dp[out];
+                }
+            }
+            *slot = acc;
+        }
+        dp = new_dp;
+    }
+    dp[STATE_INITIAL]
+}
+
+/// [`g_hat_cd`] at boolean table boundaries.
+fn g_hat(
+    z_row: &[F128],
+    z_col: &[F128],
+    z_index: &[F128],
+    m: usize,
+    u: usize,
+    t_prev: u64,
+    t_next: u64,
+) -> F128 {
+    g_hat_cd(z_row, z_col, z_index, m, u, |layer| {
+        (int_bit(t_prev, layer), int_bit(t_next, layer))
+    })
+}
+
+/// Evaluate `f̂_{t,c}(z_tab, z_row, z_col, z_index)` at an arbitrary field
+/// point — §6's
+///
+/// ```text
+///   f_{t,c} = Σ_y eq(z_tab, y) · Σ_u eq(u, c_y) · ĝ_u(z_row, z_col, i, t_y, t_{y−1})
+/// ```
+///
+/// The configuration is public, so `c_y` is a known constant per table and the
+/// inner `Σ_u` collapses to its single live term `u = c_y`.
+///
+/// Cost `O(#live_tables · m)` — against basic jagged's `O(#columns · m)`, which
+/// is the point of the whole variant.
+pub fn f_hat_fancy(
+    params: &FancyJaggedParams,
+    z_tab: &[F128],
+    z_row: &[F128],
+    z_col: &[F128],
+    z_index: &[F128],
+) -> F128 {
+    assert_eq!(z_tab.len(), params.k, "z_tab must span the table vars");
+    assert_eq!(z_row.len(), params.n, "z_row must span the row vars");
+    assert_eq!(z_col.len(), params.c, "z_col must span the col vars");
+    assert_eq!(z_index.len(), params.m, "z_index must span the dense vars");
+    let eq_tab = build_eq_table(z_tab);
+    let mut acc = F128::ZERO;
+    for y in 0..1usize << params.k {
+        // Empty tables contribute nothing: t_prev == t_next makes `i < t_next`
+        // unsatisfiable for any `i ≥ t_prev`.
+        if params.heights[y] == 0 {
+            continue;
+        }
+        acc += eq_tab[y]
+            * g_hat(
+                z_row,
+                z_col,
+                z_index,
+                params.m,
+                params.log_widths[y] as usize,
+                params.table_prefix_sums[y],
+                params.table_prefix_sums[y + 1],
+            );
+    }
+    acc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic field elements for tests.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> F128 {
+            let mut out = [0u64; 2];
+            for w in out.iter_mut() {
+                self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = self.0;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                *w = z ^ (z >> 31);
+            }
+            F128 {
+                lo: out[0],
+                hi: out[1],
+            }
+        }
+        fn vec(&mut self, len: usize) -> Vec<F128> {
+            (0..len).map(|_| self.next()).collect()
+        }
+    }
+
+    fn sample() -> FancyJaggedParams {
+        // 2 tables: (2 cols × 3 rows) then (1 col × 2 rows) = area 8.
+        FancyJaggedParams::new(
+            &[
+                Table {
+                    log_width: 1,
+                    height: 3,
+                },
+                Table {
+                    log_width: 0,
+                    height: 2,
+                },
+            ],
+            2,
+            4,
+        )
+    }
+
+    /// The bijection round-trips and tiles `[0, area)` exactly once.
+    #[test]
+    fn bijection_is_a_bijection() {
+        let p = sample();
+        assert_eq!(p.area(), 2 * 3 + 1 * 2);
+        let mut seen = vec![false; p.area() as usize];
+        for tab in 0..1usize << p.k {
+            for row in 0..p.heights[tab] {
+                for col in 0..1u64 << p.log_widths[tab] {
+                    let i = p.rank(tab, row, col).expect("in extent");
+                    assert!(!seen[i as usize], "index {i} hit twice");
+                    seen[i as usize] = true;
+                    assert_eq!(p.unrank(i), (tab, row, col));
+                }
+            }
+        }
+        assert!(seen.into_iter().all(|b| b), "some dense index unmapped");
+    }
+
+    /// At boolean points the branching program IS the indicator of the
+    /// bijection — the defining property of `f_{t,c}` (§6, Eq. 8).
+    #[test]
+    fn boolean_points_give_the_indicator() {
+        let p = sample();
+        let bits = |v: u64, len: usize| -> Vec<F128> {
+            (0..len)
+                .map(|b| {
+                    if (v >> b) & 1 == 1 {
+                        F128::ONE
+                    } else {
+                        F128::ZERO
+                    }
+                })
+                .collect()
+        };
+        for tab in 0..1u64 << p.k {
+            for row in 0..1u64 << p.n {
+                for col in 0..1u64 << p.c {
+                    for i in 0..1u64 << p.m {
+                        let got = f_hat_fancy(
+                            &p,
+                            &bits(tab, p.k),
+                            &bits(row, p.n),
+                            &bits(col, p.c),
+                            &bits(i, p.m),
+                        );
+                        let want = if p.rank(tab as usize, row, col) == Some(i) {
+                            F128::ONE
+                        } else {
+                            F128::ZERO
+                        };
+                        assert_eq!(
+                            got, want,
+                            "indicator mismatch at tab={tab} row={row} col={col} i={i}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// **The decisive test.** At a random FIELD point the branching-program
+    /// assembly must equal the honest multilinear extension of that indicator,
+    /// computed by brute force over the whole cube.
+    #[test]
+    fn field_point_matches_brute_force_mle() {
+        let p = sample();
+        let mut rng = Rng(0x_FA5C_1A66);
+        for trial in 0..4 {
+            let z_tab = rng.vec(p.k);
+            let z_row = rng.vec(p.n);
+            let z_col = rng.vec(p.c);
+            let z_idx = rng.vec(p.m);
+
+            let got = f_hat_fancy(&p, &z_tab, &z_row, &z_col, &z_idx);
+
+            // Σ over every boolean (tab,row,col,i) of eq(·)·indicator.
+            let (et, er, ec, ei) = (
+                build_eq_table(&z_tab),
+                build_eq_table(&z_row),
+                build_eq_table(&z_col),
+                build_eq_table(&z_idx),
+            );
+            let mut want = F128::ZERO;
+            for tab in 0..1usize << p.k {
+                for row in 0..1u64 << p.n {
+                    for col in 0..1u64 << p.c {
+                        if let Some(i) = p.rank(tab, row, col) {
+                            want += et[tab] * er[row as usize] * ec[col as usize] * ei[i as usize];
+                        }
+                    }
+                }
+            }
+            assert_eq!(got, want, "trial {trial}: BP assembly != brute-force MLE");
+        }
+    }
+
+    /// Eq. 8: `p̂(z_tab,z_row,z_col) = Σ_i q(i)·f̂_{t,c}(…,i)`, with `f̂` taken
+    /// at a random field point in the index slot and the dense `q` random.
+    #[test]
+    fn eq8_reduction_holds() {
+        let p = sample();
+        let mut rng = Rng(0x_E98_0008);
+        let q: Vec<F128> = rng.vec(1usize << p.m);
+        let z_tab = rng.vec(p.k);
+        let z_row = rng.vec(p.n);
+        let z_col = rng.vec(p.c);
+
+        // Left: p̂ at the claim point, p defined from q through the bijection.
+        let (et, er, ec) = (
+            build_eq_table(&z_tab),
+            build_eq_table(&z_row),
+            build_eq_table(&z_col),
+        );
+        let mut lhs = F128::ZERO;
+        for tab in 0..1usize << p.k {
+            for row in 0..1u64 << p.n {
+                for col in 0..1u64 << p.c {
+                    if let Some(i) = p.rank(tab, row, col) {
+                        lhs += et[tab] * er[row as usize] * ec[col as usize] * q[i as usize];
+                    }
+                }
+            }
+        }
+
+        // Right: Σ_i q(i) · f̂ at boolean i.
+        let bits = |v: u64, len: usize| -> Vec<F128> {
+            (0..len)
+                .map(|b| {
+                    if (v >> b) & 1 == 1 {
+                        F128::ONE
+                    } else {
+                        F128::ZERO
+                    }
+                })
+                .collect()
+        };
+        let mut rhs = F128::ZERO;
+        for i in 0..1u64 << p.m {
+            rhs += q[i as usize] * f_hat_fancy(&p, &z_tab, &z_row, &z_col, &bits(i, p.m));
+        }
+        assert_eq!(lhs, rhs, "Eq. 8 reduction failed");
+    }
+
+    /// Decomposition: a width-9 table becomes widths 8 and 1 (§6's example),
+    /// tiles the same area, and the whole config still passes the field-point
+    /// MLE check.
+    #[test]
+    fn decomposition_of_non_power_of_two_width() {
+        let p = FancyJaggedParams::from_tables(&[(9, 2)], 1, 6);
+        assert_eq!(p.log_widths[..2], [3, 0], "9 = 8 + 1, widest first");
+        assert_eq!(p.heights[..2], [2, 2]);
+        assert_eq!(p.area(), 9 * 2);
+        assert_eq!(p.live_tables(), 2);
+
+        let mut rng = Rng(0x_D3C0_9009);
+        let z_tab = rng.vec(p.k);
+        let z_row = rng.vec(p.n);
+        let z_col = rng.vec(p.c);
+        let z_idx = rng.vec(p.m);
+        let got = f_hat_fancy(&p, &z_tab, &z_row, &z_col, &z_idx);
+
+        let (et, er, ec, ei) = (
+            build_eq_table(&z_tab),
+            build_eq_table(&z_row),
+            build_eq_table(&z_col),
+            build_eq_table(&z_idx),
+        );
+        let mut want = F128::ZERO;
+        for tab in 0..1usize << p.k {
+            for row in 0..1u64 << p.n {
+                for col in 0..1u64 << p.c {
+                    if let Some(i) = p.rank(tab, row, col) {
+                        want += et[tab] * er[row as usize] * ec[col as usize] * ei[i as usize];
+                    }
+                }
+            }
+        }
+        assert_eq!(got, want);
+    }
+
+    /// The whole point: cost is proportional to TABLES, not columns. A registry
+    /// slot of 3,325 equal-height columns is 9 tables after decomposition, with
+    /// `Σ log₂(width) = 48` against 3,325 columns for basic jagged.
+    #[test]
+    fn table_count_replaces_column_count() {
+        let p = FancyJaggedParams::from_tables(&[(3_325, 1 << 10)], 10, 32);
+        assert_eq!(p.live_tables(), 3_325u64.count_ones() as usize);
+        assert_eq!(p.live_tables(), 9);
+        let sum_log: u32 = p.log_widths[..p.live_tables()].iter().sum();
+        assert_eq!(sum_log, 48);
+        assert_eq!(p.area(), 3_325 * (1 << 10));
+    }
+}

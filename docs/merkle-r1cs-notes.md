@@ -42,6 +42,79 @@ columns), reversing what the open items below say. The bigger prover lever is th
 optimizations above), is tested against brute force, and is *not* wired into
 `verify_batch_merged` — integration is the unfinished part.
 
+## Fancy jagged (paper §6): kernel landed, wiring deferred
+
+`crates/flock-core/src/pcs/jagged_fancy.rs`. The paper is Hemo–Jue–Rabinovich–
+Roh–Rothblum, *Jagged Polynomial Commitments*, ePrint 2025/917, EUROCRYPT 2026
+— the reference `capacity-free-ring-switching.tex:524` still has as a TODO.
+`jagged.rs` implements the paper's **basic** jagged (its own header says so);
+§6's "fancy jagged" is the variant for when columns are grouped into **tables**
+(runs sharing a height), and it makes the verifier's weight evaluation cost
+`O(#tables)` instead of `O(#columns)`.
+
+**Why this is the right lever.** A registry slot IS a table in the paper's
+sense — `k_t` consecutive columns of height `n_t` — and `assist_boundaries`
+currently flattens that away into per-column boundary pairs. Decomposing our
+widths into power-of-two tables:
+
+| | cols | tables | `Σ log₂(width)` | ÷2.25 (width 6) | net |
+|---|---|---|---|---|---|
+| merkle d26 | 3,326 | 9 | 48 | | **31×** |
+| merkle d8 | 1,022 | 9 | 44 | | **10×** |
+| plain BLAKE3 | 122 | 5 | 18 | | **3.0×** |
+
+Note it **narrows the ratio** (31× vs 3×) rather than removing the term from
+both arms — the opposite of the reverted rectangular fast path — and it needs
+only equal heights *within* a table, so it covers partial counts and mixed
+registries too.
+
+**Two findings from reading §6 closely.**
+
+1. **It requires a different dense layout, and that is the whole trick.** `g_u`
+   checks `i = t_{y−1} + row·2^{c_y} + col` — **row-major within a table**.
+   Column-major (basic jagged, and `UnionInstance::compact_witness`) would give
+   `i = t_{y−1} + col·h_y + row`, and `h_y` is an arbitrary height, so `col·h_y`
+   is a general multiplication that no small branching program can check.
+   Row-major makes the stride `2^{c_y}`, hence a shift. This is also why table
+   widths must be powers of two.
+
+2. **§6 improves only the verifier.** Its one sentence on the prover: the
+   weight sequence "can be computed … **similarly to Section 3**" — `O(area)`,
+   unchanged. There is no theorem and no prover cost analysis in §6. In the
+   paper's regime (§7: 2^12 columns, area 2^29) the prover's per-column term is
+   ~119K against 537M, i.e. noise, so there was nothing to advertise.
+
+   Flock's regime inverts that for a reason not in the paper: the capacity-free
+   merged reduction needs the **Φ-twisted** weight, and the Frobenius
+   decomposition turns that into **128·K = 256** statements. That multiplier is
+   what makes our assist 88% of the prove gap. So the prize is not a faster
+   assist but **no assist** — §6 notes the verifier "can compute the latter on
+   its own, *or* employ a similar jagged assist", the assist being the fallback
+   for when per-column is too costly for the verifier. Per-table it is not, and
+   composed with `Ŵ(ρ) = Σ_j c_j·f̂(z^{2^j}, ρ)` the verifier evaluates it
+   directly. Estimated new verifier cost ~1.8M field ops (~2 ms) against
+   basic jagged's ~300M direct route — **estimate from the construction, not a
+   measurement.**
+
+**What landed.** The width-6 branching program (trit carry — three addends per
+layer instead of two — plus the inequality bit), its Holmgren–Rothblum layer DP,
+the configuration `(t_y, c_y)` with power-of-two decomposition (§6's width 9 →
+8 + 1), and `f_hat_fancy`. Tests: the bijection tiles `[0,area)` exactly once;
+boolean points give the indicator; **a random field point matches the
+brute-force MLE over the whole cube**; Eq. 8 reduction; decomposition; and the
+table-vs-column count.
+
+One real bug the tests caught, worth remembering: the BP as stated in §6 does
+**not** bound `col < 2^{c_y}`, so an over-wide `col` aliases onto another row's
+slot (`col = 2^u` looks exactly like `row+1, col = 0`) and the map stops being a
+bijection. The fix drops those branches rather than pinning the coordinate,
+which keeps the `(1 + z_col_j)` factor the MLE of a function vanishing on
+`col_j = 1` requires.
+
+**Not wired.** Adoption needs the row-major dense stack, i.e. a new
+`compact_witness` and therefore a new commitment. Same posture as the
+multipoint-twisted prototype: correct and tested in-tree, integration separate.
+
 ## Tried and reverted: the rectangular fast path (commit 2009aff, reverted)
 
 Worth knowing about, and recoverable from history — but deliberately NOT in the

@@ -143,7 +143,7 @@ impl JaggedParams {
 /// Bit `layer` of the field "point" `z`: the coordinate `z[layer]` if present,
 /// else `ZERO` (the variable is pinned to 0 — i.e. zero-padded).
 #[inline]
-fn point_bit(z: &[F128], layer: usize) -> F128 {
+pub(crate) fn point_bit(z: &[F128], layer: usize) -> F128 {
     if layer < z.len() {
         z[layer]
     } else {
@@ -153,7 +153,7 @@ fn point_bit(z: &[F128], layer: usize) -> F128 {
 
 /// Bit `layer` of the integer `t`, as a field element.
 #[inline]
-fn int_bit(t: u64, layer: usize) -> F128 {
+pub(crate) fn int_bit(t: u64, layer: usize) -> F128 {
     if (t >> layer) & 1 == 1 {
         F128::ONE
     } else {

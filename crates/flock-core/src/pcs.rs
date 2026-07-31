@@ -21,6 +21,7 @@
 
 pub mod commit;
 pub mod jagged;
+pub mod jagged_fancy;
 pub mod ligerito;
 pub mod pack;
 pub mod ring_switch;
