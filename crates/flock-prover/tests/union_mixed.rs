@@ -2591,3 +2591,127 @@ fn two_blake3_phase_breakdown() {
     println!("    blake3 (kappa=14): {blake3_nnz_mix}");
     println!("    sha2   (kappa=15): {sha2_nnz}");
 }
+
+/// The accumulation route end to end on REAL proofs: verify each with its
+/// matrix work deferred, fold it all into one accumulator, discharge.
+///
+/// First test whose assertions come out of the full proof verifier rather
+/// than being driven by hand, so it pins the composition a recursion circuit
+/// will arithmetise — in particular that the deferred verify reads no base
+/// matrix.
+///
+/// It also prints the cost split, which does NOT favour batching and is not
+/// supposed to: folding k claims costs k·nnz, the same as checking them
+/// directly, plus the discharge. Measured at N=4 the batch is several times
+/// slower. The route's value is that the fold's VERIFIER is matrix-free
+/// (O(κ)) while its PROVER carries the k·nnz — that asymmetry is what a
+/// circuit needs, and it is worth nothing natively.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored --nocapture`
+fn batch_verify_defers_all_matrix_work_to_one_discharge() {
+    use flock_core::aggregate;
+    use std::time::Instant;
+
+    const N: usize = 4;
+    let n_blocks = 256usize;
+    let setup = blake3::Blake3Setup::new_batch_major(n_blocks);
+    let lc_circuit = setup.r1cs.csc_lincheck_circuit();
+    let registry = Registry::new(
+        vec![TableType::from_block_r1cs(&setup.r1cs)],
+        setup.r1cs.n_log(),
+    );
+    let union = UnionInstance::new(&registry, vec![n_blocks]);
+
+    // N independent proofs of the same circuit.
+    let proofs: Vec<_> = (0..N)
+        .map(|i| {
+            let mut rng = Rng::new(0xBA7C_0000 + i as u64);
+            let inputs = random_blake3_inputs(&mut rng, n_blocks);
+            let slot = UnionSlotProverInput::new(
+                blake3::generate_witness_batch_major(&inputs, setup.n_blocks_log()),
+                lc_circuit,
+            );
+            let mut ch = FsChallenger::new(DOMAIN);
+            prover::prove_fast_ligerito_jagged_union(&union, &setup.pcs_params, vec![slot], &mut ch)
+        })
+        .collect();
+
+    // Baseline: today's verify, which discharges the matrix work per proof.
+    let t = Instant::now();
+    for (proof, commitment, claim) in &proofs {
+        let mut ch = FsChallenger::new(DOMAIN);
+        let got = verifier::verify_ligerito_jagged_union(
+            &union,
+            &[lc_circuit],
+            commitment,
+            proof,
+            &setup.pcs_params,
+            &mut ch,
+        )
+        .expect("honest proof");
+        assert_eq!(&got, claim);
+    }
+    let full_s = t.elapsed().as_secs_f64();
+
+    // Deferred: verify each succinctly, keep the assertions.
+    let t = Instant::now();
+    let assertions: Vec<_> = proofs
+        .iter()
+        .map(|(proof, commitment, claim)| {
+            let mut ch = FsChallenger::new(DOMAIN);
+            let (got, assertion) = verifier::verify_ligerito_jagged_union_deferred(
+                &union,
+                &[lc_circuit],
+                commitment,
+                proof,
+                &setup.pcs_params,
+                &mut ch,
+            )
+            .expect("honest proof");
+            assert_eq!(&got, claim, "deferred verify must yield the same claim");
+            assertion
+        })
+        .collect();
+    let succinct_s = t.elapsed().as_secs_f64();
+
+    // One fold + one discharge for the whole batch.
+    let mats = [(&setup.r1cs.a_0, &setup.r1cs.b_0)];
+    let t = Instant::now();
+    aggregate::fold_and_discharge(&registry, &mats, &assertions)
+        .expect("the batch's matrix work must discharge");
+    let agg_s = t.elapsed().as_secs_f64();
+
+    println!(
+        "batch of {N} (blake3, {n_blocks} blocks):\n  \
+         per-proof verify (discharging) {:7.2} ms total, {:6.2} ms each\n  \
+         deferred verify                {:7.2} ms total, {:6.2} ms each\n  \
+         fold + single discharge        {:7.2} ms\n  \
+         batch total                    {:7.2} ms  ({:.2}x — slower, as expected)",
+        full_s * 1e3,
+        full_s * 1e3 / N as f64,
+        succinct_s * 1e3,
+        succinct_s * 1e3 / N as f64,
+        agg_s * 1e3,
+        (succinct_s + agg_s) * 1e3,
+        full_s / (succinct_s + agg_s),
+    );
+
+    // A corrupted proof in the batch must not survive the discharge.
+    let mut bad = proofs[1].0.clone();
+    bad.lincheck.matrix_evals[0].0 += flock_core::field::F128::ONE;
+    let mut ch = FsChallenger::new(DOMAIN);
+    let (_, bad_assertion) = verifier::verify_ligerito_jagged_union_deferred(
+        &union,
+        &[lc_circuit],
+        &proofs[1].1,
+        &bad,
+        &setup.pcs_params,
+        &mut ch,
+    )
+    .expect("the deferred verify is oblivious — it defers");
+    let mixed = [assertions[0].clone(), bad_assertion];
+    assert!(
+        aggregate::fold_and_discharge(&registry, &mats, &mixed).is_err(),
+        "a corrupted proof must poison the batch"
+    );
+}

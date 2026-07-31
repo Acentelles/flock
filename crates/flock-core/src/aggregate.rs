@@ -7,11 +7,20 @@
 //! [`Accumulator`]. Nobody reads a matrix until somebody discharges the
 //! accumulator — once, at the end.
 //!
-//! Natively that is batch verification: `N` proofs of one registry cost `N`
-//! succinct replays plus a single `O(Σ_t nnz_t)` discharge, rather than that
-//! discharge `N` times (~9 ms per proof at M30, and ~84% of verify).
+//! **This does not make native verification faster** — measured, batching is
+//! several times SLOWER. Folding `k` claims costs `k · nnz` (the row phase
+//! builds `g_i` per claim), which is exactly what checking those `k` claims
+//! directly costs, plus the final discharge on top. No random-linear-
+//! combination avoids it: the combined weight is a sum of `k` rank-1 terms,
+//! so every nonzero still needs `k` multiplications. `k` claims at `k`
+//! distinct points cost `k` passes over the matrix, full stop.
 //!
-//! Its real purpose is to be the thing a recursion circuit arithmetises.
+//! What the fold buys is an ASYMMETRY, and it is worth only one thing:
+//! recursion. The fold's PROVER pays that `k · nnz`; the fold's VERIFIER
+//! pays `O(κ)` and reads no matrix at all. That moves the matrix work from
+//! inside a circuit — where it is nnz-preserving and the fixed point cannot
+//! close — to a native prover, where it is ordinary. So this module is the
+//! thing a recursion circuit arithmetises.
 //! [`verify_aggregate`] touches no matrix, so it is exactly what a merge
 //! circuit replays: verify the children succinctly, fold their claims plus
 //! the accumulators they carried, output one accumulator. The proof that
@@ -89,6 +98,8 @@ pub enum AggregateError {
     Reported(VerifyError),
     /// A fold did not verify.
     Fold(matrix_fold::FoldError),
+    /// The accumulated claims did not hold against the real matrices.
+    Discharge,
 }
 
 /// Claims to fold for one type, in a fixed order: the prior accumulator's
@@ -160,6 +171,32 @@ pub fn prove_aggregate<Ch: Challenger>(
             per_type,
         },
     ))
+}
+
+/// Fold a batch of assertions and discharge them.
+///
+/// The caller verifies each proof with a `*_deferred` entry (each proof has
+/// its own union instance, commitment and challenger, so there is nothing
+/// useful to abstract there) and passes the assertions here.
+///
+/// Use this to exercise or test the route end to end, NOT to speed up native
+/// verification — see the module docs: folding `k` claims costs `k · nnz`,
+/// so this is strictly more work than discharging each assertion directly.
+/// Its value is that the *verifier* half is matrix-free.
+pub fn fold_and_discharge(
+    registry: &Registry,
+    mats: &[TypeMatrices<'_>],
+    assertions: &[MatrixAssertion],
+) -> Result<(), AggregateError> {
+    let mut chp = crate::challenger::FsChallenger::new(DOMAIN);
+    let (proof, _) = prove_aggregate(registry, mats, assertions, None, &mut chp)?;
+    let mut chv = crate::challenger::FsChallenger::new(DOMAIN);
+    let acc = verify_aggregate(registry, assertions, None, &proof, &mut chv)?;
+    if acc.discharge(mats) {
+        Ok(())
+    } else {
+        Err(AggregateError::Discharge)
+    }
 }
 
 /// Replay an aggregation. **Reads no matrix** — this is the half a merge
