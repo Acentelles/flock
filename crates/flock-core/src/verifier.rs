@@ -663,6 +663,14 @@ fn mixed_class_inner<Ch: Challenger>(
     {
         return Err(VerifyError::ClassMismatch);
     }
+    // Per-phase field-op attribution, `--features mul-count` + `MUL_TRACE=1`.
+    // The sibling of `VERIFY_TRACE`, for arithmetic rather than wall clock —
+    // and the two rank phases differently, which is the point.
+    #[cfg(feature = "mul-count")]
+    let mul_trace = std::env::var("MUL_TRACE").is_ok();
+    #[cfg(feature = "mul-count")]
+    let at_start = crate::field::gf2_128::op_count::snapshot();
+
     let (claims, packed_direct_points, matrix, el_matrix) = verify_union_piops(
         union,
         UnionVerifyBinding::Mixed,
@@ -674,6 +682,10 @@ fn mixed_class_inner<Ch: Challenger>(
         pcs_params,
         challenger,
     )?;
+
+    #[cfg(feature = "mul-count")]
+    let after_piops = crate::field::gf2_128::op_count::snapshot();
+
     let matrix = if defer {
         matrix
     } else {
@@ -711,6 +723,32 @@ fn mixed_class_inner<Ch: Challenger>(
         challenger,
     )
     .map_err(VerifyError::PcsJagged)?;
+
+    #[cfg(feature = "mul-count")]
+    if mul_trace {
+        let end = crate::field::gf2_128::op_count::snapshot();
+        let cc = |a: &crate::field::gf2_128::op_count::Snapshot,
+                  b: &crate::field::gf2_128::op_count::Snapshot| {
+            let muls = (b.native_muls - a.native_muls)
+                .saturating_sub((b.invs - a.invs) * crate::field::gf2_128::op_count::MULS_PER_INV);
+            let invs = b.invs - a.invs;
+            (muls, invs, muls + invs)
+        };
+        let (pm, pi, pc) = cc(&at_start, &after_piops);
+        let (om, oi, oc) = cc(&after_piops, &end);
+        let total = pc + oc;
+        println!(
+            "  [mul] PIOP replay (zerocheck+lincheck, both classes): \
+             {pm:>8} muls {pi:>5} invs = {pc:>8} constraints ({:>5.1}%)",
+            100.0 * pc as f64 / total as f64
+        );
+        println!(
+            "  [mul] opening (jagged assist + Ligerito):             \
+             {om:>8} muls {oi:>5} invs = {oc:>8} constraints ({:>5.1}%)",
+            100.0 * oc as f64 / total as f64
+        );
+    }
+
     Ok((claims, matrix))
 }
 

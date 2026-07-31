@@ -2090,8 +2090,22 @@ pub fn verify_batch_merged<Ch: Challenger>(
         );
     }
     let t = std::time::Instant::now();
+    #[cfg(feature = "mul-count")]
+    let assist_start = crate::field::gf2_128::op_count::snapshot();
     let v = jagged::verify_frobenius_assist(&params, &fclaims, &rho, &proof.frobenius, challenger)
         .ok_or(VerifyErrorJagged::Jagged)?;
+    #[cfg(feature = "mul-count")]
+    if std::env::var("MUL_TRACE").is_ok() {
+        let e = crate::field::gf2_128::op_count::snapshot();
+        let invs = e.invs - assist_start.invs;
+        let muls = (e.native_muls - assist_start.native_muls)
+            .saturating_sub(invs * crate::field::gf2_128::op_count::MULS_PER_INV);
+        println!(
+            "  [mul]   of which jagged::verify_frobenius_assist:    {muls:>8} muls {invs:>5} invs \
+             = {:>8} constraints",
+            muls + invs
+        );
+    }
     if trace {
         eprintln!(
             "        [vbm] jagged::verify_frobenius_assist: {}",

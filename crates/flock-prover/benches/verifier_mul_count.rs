@@ -102,8 +102,8 @@ fn header() {
     println!("  {}", "-".repeat(85));
 }
 
-/// Whole-verify denominator: an element-only union proof.
-fn measure_whole_verify() -> Snapshot {
+/// `(full verify, deferred verify)` for an element-only union proof.
+fn measure_whole_verify() -> (Snapshot, Snapshot) {
     let nu = 12usize;
     let kappas = [3usize];
     let counts = [1usize << 12];
@@ -153,7 +153,7 @@ fn measure_whole_verify() -> Snapshot {
     );
 
     let mut ch_v = FsChallenger::new(DOMAIN);
-    let (_, snap) = op_count::measure(|| {
+    let (_, full) = op_count::measure(|| {
         verifier::verify_ligerito_jagged_union_mixed_class(
             &union,
             &[],
@@ -164,7 +164,24 @@ fn measure_whole_verify() -> Snapshot {
         )
         .expect("honest proof verifies")
     });
-    snap
+
+    // The SAME proof through the deferred entry — the one a recursion circuit
+    // replays, which emits the matrix claims instead of evaluating them. The
+    // difference is exactly the O(nnz) matrix work that folding removes, and
+    // it is the reason a whole-verify number overstates what recursion pays.
+    let mut ch_d = FsChallenger::new(DOMAIN);
+    let (_, deferred) = op_count::measure(|| {
+        verifier::verify_ligerito_jagged_union_mixed_class_deferred(
+            &union,
+            &[],
+            &commitment,
+            &proof,
+            &pcs_params,
+            &mut ch_d,
+        )
+        .expect("honest proof verifies")
+    });
+    (full, deferred)
 }
 
 /// A BLAKE3 single-table proof — the **boolean** class, which is what runs the
@@ -204,8 +221,19 @@ fn main() {
 
     println!("\n=== whole verify ===");
     header();
-    let elem = measure_whole_verify();
-    row("element-only (nu=12, kappa=3)", elem, None);
+    let (elem_full, elem_deferred) = measure_whole_verify();
+    row("element-only, full verify", elem_full, None);
+    row(
+        "element-only, DEFERRED (recursion target)",
+        elem_deferred,
+        None,
+    );
+    println!(
+        "    -> the matrix work folding removes: {} constraints ({:.0}% of the full verify)",
+        elem_full.circuit_constraints() - elem_deferred.circuit_constraints(),
+        100.0 * (elem_full.circuit_constraints() - elem_deferred.circuit_constraints()) as f64
+            / elem_full.circuit_constraints() as f64
+    );
     let boolean = measure_boolean_verify(256);
     row("BLAKE3 boolean (K=256, m=22)", boolean, None);
     println!(

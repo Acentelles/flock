@@ -104,13 +104,41 @@ fn round2_pair_skip(run: &crate::zerocheck::PaddingRun, k_skip: usize) -> (usize
 /// nothing; recomputing it inside the traced verifier would add `2^dim − 1`
 /// constraints for a value that never varies.
 fn subspace_denominator(dim: usize) -> F128 {
+    subspace_denominator_pair(dim).0
+}
+
+/// `(den, den⁻¹)`. The **inverse is cached too**: it is a constant, and
+/// inverting it per call cost one `inv` (255 native muls) every time for a
+/// value that never varies. In-circuit it is a public constant, so this takes
+/// it from one constraint to none.
+fn subspace_denominator_pair(dim: usize) -> (F128, F128) {
     use std::sync::OnceLock;
-    static CACHE: OnceLock<[F128; 9]> = OnceLock::new();
+    static CACHE: OnceLock<[(F128, F128); 9]> = OnceLock::new();
     let table = CACHE.get_or_init(|| {
-        std::array::from_fn(|d| (1..(1usize << d)).fold(F128::ONE, |acc, i| acc * PHI_8_TABLE[i]))
+        std::array::from_fn(|d| {
+            let den = (1..(1usize << d)).fold(F128::ONE, |acc, i| acc * PHI_8_TABLE[i]);
+            (den, den.inv())
+        })
     });
     assert!(dim < 9, "dim {dim} exceeds PHI_8_TABLE's 2^8 nodes");
     table[dim]
+}
+
+/// `Z_N(z) · den⁻¹` — the part of every weight on `nodes` that does not depend
+/// on which node. `None` when `z` is itself a node, where `Z_N(z) = 0` and the
+/// weights degenerate to that node's indicator.
+///
+/// Split out from [`lagrange_weights_on_coset`] so a caller that needs only
+/// *some* of the weights does not pay an inversion for the rest —
+/// [`interpolate_at_z_combined`] needs the Λ half of a 2·ell-node set and was
+/// computing, then discarding, the other 64.
+fn coset_weight_scale(nodes: &[F128], dim: usize, z: F128) -> Option<F128> {
+    debug_assert_eq!(nodes.len(), 1usize << dim);
+    let z_n = nodes.iter().fold(F128::ONE, |acc, &s| acc * (z + s));
+    if z_n.is_zero() {
+        return None;
+    }
+    Some(z_n * subspace_denominator_pair(dim).1)
 }
 
 /// Lagrange weights on `nodes`, an F₂-subspace of dimension `dim` or a coset
@@ -143,23 +171,19 @@ fn subspace_denominator(dim: usize) -> F128 {
 /// Natively the difference is sub-millisecond either way, which is why the
 /// textbook form survived this long.
 fn lagrange_weights_on_coset(nodes: &[F128], dim: usize, z: F128) -> Vec<F128> {
-    debug_assert_eq!(nodes.len(), 1usize << dim);
-    // Z_N(z) = Π_{s ∈ N} (z + s).
-    let z_n = nodes.iter().fold(F128::ONE, |acc, &s| acc * (z + s));
-    if z_n.is_zero() {
+    match coset_weight_scale(nodes, dim, z) {
+        Some(scale) => nodes.iter().map(|&s| scale * (z + s).inv()).collect(),
         // `z` landed exactly on a node, where the closed form divides by zero.
-        // The weights are then the indicator of that node. On a Fiat–Shamir
+        // The weights are then that node's indicator. On a Fiat–Shamir
         // challenge this has probability ≈ 2^-121; it is handled exactly
         // anyway because natively it costs one branch. The circuit backend
         // omits the branch and carries the negligible term in its soundness
         // accounting instead — a fixed-topology circuit cannot afford it.
-        return nodes
+        None => nodes
             .iter()
             .map(|&s| if s == z { F128::ONE } else { F128::ZERO })
-            .collect();
+            .collect(),
     }
-    let scale = z_n * subspace_denominator(dim).inv();
-    nodes.iter().map(|&s| scale * (z + s).inv()).collect()
 }
 
 pub fn lagrange_weights_naive(k_skip: usize, z: F128) -> Vec<F128> {
@@ -217,14 +241,26 @@ pub fn interpolate_at_z_combined(values_on_lambda: &[F128], k_skip: usize, z: F1
     // The node set is Λ ∪ S = `φ_8({0..2^{k_skip+1}−1})`, itself an
     // F₂-subspace of dimension `k_skip + 1`; only the Λ half carries values,
     // the S half being zero by the zerocheck assumption. So the whole
-    // `O(ell²)` double loop collapses to the same closed form, and the
-    // weights this needs are the Λ-half entries.
-    let weights = lagrange_weights_on_coset(&PHI_8_TABLE[..2 * ell], k_skip + 1, z);
-    let mut acc = F128::ZERO;
-    for i in 0..ell {
-        acc += weights[ell + i] * values_on_lambda[i];
+    // `O(ell²)` double loop collapses to the same closed form — and only the
+    // Λ-half weights are ever used, so only those are computed. (Materializing
+    // all `2·ell` and indexing the top half cost 64 inversions per call for
+    // values immediately discarded.)
+    let nodes = &PHI_8_TABLE[..2 * ell];
+    match coset_weight_scale(nodes, k_skip + 1, z) {
+        Some(scale) => {
+            let mut acc = F128::ZERO;
+            for i in 0..ell {
+                acc += scale * (z + nodes[ell + i]).inv() * values_on_lambda[i];
+            }
+            acc
+        }
+        // `z` is one of the nodes: on Λ the interpolant is that node's value,
+        // on S it is zero (the zerocheck assumption this reconstruction rests on).
+        None => nodes[ell..]
+            .iter()
+            .position(|&s| s == z)
+            .map_or(F128::ZERO, |i| values_on_lambda[i]),
     }
-    acc
 }
 
 /// Evaluate the multilinear eq polynomial at a point: `eq(r, x) = Π_i (1 + r_i + x_i)`
