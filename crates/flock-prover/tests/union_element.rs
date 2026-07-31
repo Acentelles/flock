@@ -1007,6 +1007,12 @@ fn boolean_only_mixed_class_matches_the_plain_entry() {
 // batched squeeze per level, so every Fiat–Shamir stream downstream of the
 // first query phase shifts. All seven digests moved — transcript-only, with
 // every roundtrip, tamper and differential test in this file green across it.
+//
+// 16-byte-aligned Fiat–Shamir framing (2026-07-31): fixed 16-byte op headers
+// and payloads padded to a multiple of 16, so every observed F128 starts on a
+// 128-bit boundary and a recursion circuit can place it into BLAKE3's `m` by
+// pure copy instead of a byte-shift packing gate. ~15% more FS compressions;
+// domain separation unchanged. Every digest moved, as a framing change must.
 // ---------------------------------------------------------------------------
 
 use sha2 as sha2_hash;
@@ -1057,17 +1063,17 @@ fn mixed_class_proof_bytes_pinned() {
         (
             "elem-nu12-full",
             1 << 12,
-            "0ac211e72147f4d53162bc5423a675b24b1293b68f4482d346eda3cff8531fdd",
+            "a98bdae28db0841a113e3601108a83ed31b8f530ce50fd4fa91c0985af20c5b9",
         ),
         (
             "elem-nu12-2731",
             2731,
-            "25584901370be1db5f455a03b5c84c5d1092c26f1904e0377ee22d7f6a99fba0",
+            "15b8d6dcb3193c27ce7fa0e0fbeaa375a901bfe15a33c398506db8596449dd1a",
         ),
         (
             "elem-nu12-0",
             0,
-            "a5d9d52769a7ecc17e4dc05597041403b2fdfbabe8480acd209118a5d9ede691",
+            "1952f55bcaf1e20a719f9f8cda84808e73a1dbb046300bd5fb99d4c6a83da6e9",
         ),
     ];
     // Mixed: BLAKE3 + element at nu = 7 (M = 22); counts in slot order
@@ -1076,22 +1082,22 @@ fn mixed_class_proof_bytes_pinned() {
         (
             "mix-nu7-128-128",
             [128, 128],
-            "42bd5c3321f2bbe9f2adc7bc9613416ef1e37104f979fd92d999a147c9021e46",
+            "5382d3c81e67af04346b9975f4e90037afaa0782fe7e23fea5dd4bf344056bee",
         ),
         (
             "mix-nu7-100-90",
             [100, 90],
-            "bc4ee7bdf2225297457cf75b276c42fc28e0bf5e38cbeaa94800aa7e951aab54",
+            "54b9e04617179e7655f0cfff2543ecdc1ae130ac4da6e48cbf1e6eb57c004699",
         ),
         (
             "mix-nu7-0-90",
             [0, 90],
-            "3c9e7db9e9c9fc0cde87288dc2b8c4ae0569f024578df3a001712b85cc569753",
+            "3d16811c6a95241f0f1bda882be84a6e36b80a99c9816a097872df35d07cf93f",
         ),
         (
             "mix-nu7-100-0",
             [100, 0],
-            "f5a19b88a0ee34cb34f81d748b59fc3d3e4ebf3638fe52fe660396c38dd5f944",
+            "ad9ea3875fdad9932f39313c4b45d9f8c55f1b2f4b5a2cb0046852428123ac75",
         ),
     ];
 

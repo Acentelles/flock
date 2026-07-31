@@ -38,6 +38,15 @@
 //! All six digests moved, which is the correct signature — the change is
 //! transcript-only, and the M1/M2 differentials plus every roundtrip and
 //! tamper test stayed green across it.
+//! **16-byte-aligned Fiat–Shamir framing** (2026-07-31): each op's header is
+//! now a fixed 16-byte `[op][kind][0;6][len u64]` and byte payloads are padded
+//! to a multiple of 16, so every observed `F128` starts on a 128-bit boundary
+//! of the absorbed stream. That is what lets a recursion circuit place values
+//! into BLAKE3's `m` words by PURE COPY — under the old 1–2 byte tags, seven
+//! values in eight straddled two `m` words and would have needed a byte-shift
+//! packing gate and a boolean glue table. Costs ~15% more FS compressions.
+//! Domain separation is unchanged (op/kind bytes and the length still bind).
+//! Every digest moved, as a framing change must.
 
 use ::sha2 as sha2_hash;
 use flock_core::proof::{R1csClaim, R1csProofJaggedLigerito};
@@ -130,22 +139,22 @@ fn m6_mixed_union_proof_bytes_pinned() {
         (
             "mixed-nu10-1024-1024",
             [1024, 1024],
-            "41ebcf0c2c0a4f40ef259773907963bbdd2d4133e3359e5510a51ea52ca25e0b",
+            "76db51bfe698c8d4322c3364cc1022b294979044d36d0e78cfd4c7430d39f7c1",
         ),
         (
             "mixed-nu10-50-37",
             [50, 37],
-            "18ae1691aa812c716958c179c090f416e1dbf68b0e731f57a074d5ba5479b84e",
+            "51ceedd53629062b9527407503662697435461b62aeb444e5237f69264e37292",
         ),
         (
             "mixed-nu10-8-8",
             [8, 8],
-            "55bc443f8d9c8e65a02d0ab7ed4602f4e4500d80a3dca44487ba2deaf182f7a9",
+            "f29a543e0d236e0985c06f05bc3323483ccc6d989a52fb58cd3cd1c4c76c8fb4",
         ),
         (
             "mixed-nu10-0-64",
             [0, 64],
-            "0d076fc17698b31e6542b0768a6ed888a8a67f176c7013e88776205ce8187b7e",
+            "6baf98543d9753eb6729498863fd079a6e508a8ea576977863fd080f1e8be037",
         ),
     ];
 
@@ -209,7 +218,7 @@ fn m6_mixed_union_proof_bytes_pinned() {
 fn m6_single_type_anchor_proof_bytes_pinned() {
     // BLAKE3, 256 blocks (m = 22).
     {
-        const EXPECTED: &str = "2a9a9ac7a3f6f5f66fe497db63077c1f1c516d7381b405eebd6acd0957c7c445";
+        const EXPECTED: &str = "79c8a05a95fe178431237b6a586d9a7eb34e9029dce40a53961dfa2f1bfc60c8";
         let n_blocks = 256usize;
         let setup = blake3::Blake3Setup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_B3B3);
@@ -237,7 +246,7 @@ fn m6_single_type_anchor_proof_bytes_pinned() {
 
     // SHA-256, 128 blocks (m = 22).
     {
-        const EXPECTED: &str = "bf1f9bb4df70eb1cc20c51fd3922d916aa8fa7df8eaa0315a1f99aa6e64251ed";
+        const EXPECTED: &str = "9fb1f58c4135f253abb56b67232555e2f228e7332196fae643221bd2a084f694";
         let n_blocks = 128usize;
         let setup = sha2::Sha256HybridSetup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_5252);

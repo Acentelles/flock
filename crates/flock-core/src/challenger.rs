@@ -251,9 +251,8 @@ impl FsChallenger {
             },
             n_absorbed: 0,
         };
-        c.absorb(&[OP_DOMAIN]);
-        c.absorb(&(domain.len() as u64).to_le_bytes());
-        c.absorb(domain);
+        c.absorb_header(OP_DOMAIN, 0, domain.len() as u64);
+        c.absorb_padded(domain);
         c
     }
 
@@ -277,6 +276,45 @@ impl FsChallenger {
             }
         }
         self.n_absorbed = self.n_absorbed.wrapping_add(bytes.len() as u64);
+    }
+
+    /// Absorb one op's 16-byte header: `[op][kind][0;6][len u64 LE]`.
+    ///
+    /// **Why 16 and not 2.** Every observed value is an `F128` — 16 bytes, and
+    /// exactly one 128-bit committed word. A recursion circuit replaying this
+    /// transcript has to place those bytes into BLAKE3's `m` words, and its
+    /// wires carry 128-bit words, so the placement is a pure copy *iff* each
+    /// value starts at a multiple of 16 in the absorbed stream. Under the
+    /// former 1–2 byte tags and 8-byte length prefixes it did not: successive
+    /// scalars landed at `2 + 18k`, so seven values in eight straddled two `m`
+    /// words and sometimes two rows. Expressing that needs a byte-shifted
+    /// merge, which a copy constraint cannot state — it would cost a packing
+    /// gate and a boolean glue table. A fixed 16-byte header removes the
+    /// misalignment at its source.
+    ///
+    /// Domain separation is unchanged: the op and kind bytes still make an
+    /// `observe_f128_slice` of length 1 distinguishable from an
+    /// `observe_f128`, and the length still binds.
+    #[inline]
+    fn absorb_header(&mut self, op: u8, kind: u8, len: u64) {
+        let mut h = [0u8; 16];
+        h[0] = op;
+        h[1] = kind;
+        h[8..].copy_from_slice(&len.to_le_bytes());
+        self.absorb(&h);
+    }
+
+    /// Absorb a byte payload, zero-padded up to a multiple of 16.
+    ///
+    /// Unambiguous because the true length rides in the header: two payloads
+    /// with the same padded form must share a length, hence be equal.
+    #[inline]
+    fn absorb_padded(&mut self, bytes: &[u8]) {
+        self.absorb(bytes);
+        let rem = bytes.len() % 16;
+        if rem != 0 {
+            self.absorb(&[0u8; 16][..16 - rem]);
+        }
     }
 
     #[inline]
@@ -338,28 +376,25 @@ impl FsChallenger {
 
 impl Challenger for FsChallenger {
     fn observe_label(&mut self, label: &[u8]) {
-        self.absorb(&[OP_LABEL]);
-        self.absorb(&(label.len() as u64).to_le_bytes());
-        self.absorb(label);
+        self.absorb_header(OP_LABEL, 0, label.len() as u64);
+        self.absorb_padded(label);
     }
 
     fn observe_f128(&mut self, value: F128) {
-        self.absorb(&[OP_OBSERVE, KIND_SCALAR]);
+        self.absorb_header(OP_OBSERVE, KIND_SCALAR, 1);
         self.absorb_f128(value);
     }
 
     fn observe_f128_slice(&mut self, values: &[F128]) {
-        self.absorb(&[OP_OBSERVE, KIND_SLICE]);
-        self.absorb(&(values.len() as u64).to_le_bytes());
+        self.absorb_header(OP_OBSERVE, KIND_SLICE, values.len() as u64);
         for v in values {
             self.absorb_f128(*v);
         }
     }
 
     fn observe_bytes(&mut self, bytes: &[u8]) {
-        self.absorb(&[OP_BYTES]);
-        self.absorb(&(bytes.len() as u64).to_le_bytes());
-        self.absorb(bytes);
+        self.absorb_header(OP_BYTES, 0, bytes.len() as u64);
+        self.absorb_padded(bytes);
     }
 
     fn sample_f128(&mut self) -> F128 {
@@ -368,7 +403,7 @@ impl Challenger for FsChallenger {
             fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             fs_count::SQUEEZED_BYTES.fetch_add(16, std::sync::atomic::Ordering::Relaxed);
         }
-        self.absorb(&[OP_SQUEEZE, KIND_SCALAR]);
+        self.absorb_header(OP_SQUEEZE, KIND_SCALAR, 1);
         let mut buf = [0u8; 16];
         self.squeeze_into(&mut buf);
         // Re-absorb the squeezed bytes so subsequent ops bind to this challenge.
@@ -385,8 +420,7 @@ impl Challenger for FsChallenger {
             fs_count::SQUEEZED_BYTES
                 .fetch_add((n * 16) as u64, std::sync::atomic::Ordering::Relaxed);
         }
-        self.absorb(&[OP_SQUEEZE, KIND_SLICE]);
-        self.absorb(&(n as u64).to_le_bytes());
+        self.absorb_header(OP_SQUEEZE, KIND_SLICE, n as u64);
         let mut buf = vec![0u8; n * 16];
         self.squeeze_into(&mut buf);
         self.absorb(&buf);

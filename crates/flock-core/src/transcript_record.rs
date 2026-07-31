@@ -67,29 +67,32 @@ pub enum TranscriptOp {
 }
 
 impl TranscriptOp {
-    /// Bytes this op absorbs into the running state, per `FsChallenger`'s
-    /// tagging (op byte, optional kind byte, optional `u64` length prefix,
-    /// payload). Squeezed output is re-absorbed, so squeeze ops absorb too.
+    /// Bytes this op absorbs: a fixed 16-byte header
+    /// `[op][kind][0;6][len u64]`, then the payload zero-padded to a multiple
+    /// of 16. Squeezed output is re-absorbed, so squeeze ops absorb too.
     ///
-    /// This encodes the same byte layout the circuit's packing gadgets will
-    /// have to reproduce, which is exactly why it is cross-checked against the
-    /// live challenger's own byte counter rather than trusted.
+    /// **Why everything is 16-aligned.** Every observed value is an `F128` —
+    /// 16 bytes, and exactly one 128-bit committed word. A recursion circuit
+    /// replaying this transcript places those bytes into BLAKE3's `m` words,
+    /// and its wires carry 128-bit words, so the placement is a *pure copy*
+    /// iff each value starts at a multiple of 16. The former 1–2 byte tags and
+    /// 8-byte length prefixes broke that (scalars landed at `2 + 18k`, so seven
+    /// in eight straddled two `m` words), which would have cost a byte-shift
+    /// packing gate and a boolean glue table. Alignment removes the problem at
+    /// its source for ~15% more FS compressions.
+    ///
+    /// This is the byte layout the circuit reproduces, which is why it is
+    /// cross-checked against the live challenger's own counter rather than
+    /// trusted.
     pub fn absorbed_bytes(&self) -> usize {
-        match self {
-            // OP_LABEL ‖ len ‖ label
-            TranscriptOp::Label(l) => 1 + 8 + l.len(),
-            // OP_OBSERVE ‖ KIND_SCALAR ‖ lo ‖ hi
-            TranscriptOp::ObserveScalar => 2 + 16,
-            // OP_OBSERVE ‖ KIND_SLICE ‖ len ‖ n×(lo ‖ hi)
-            TranscriptOp::ObserveSlice(n) => 2 + 8 + 16 * n,
-            // OP_BYTES ‖ len ‖ bytes
-            TranscriptOp::ObserveBytes(len) => 1 + 8 + len,
-            // OP_SQUEEZE ‖ KIND_SCALAR, then the 16 squeezed bytes re-absorbed
-            TranscriptOp::SqueezeScalar => 2 + 16,
-            // OP_SQUEEZE ‖ KIND_SLICE ‖ len, then 16n squeezed bytes re-absorbed
-            TranscriptOp::SqueezeSlice(n) => 2 + 8 + 16 * n,
-            // the nonce, absorbed through `observe_bytes`
-            TranscriptOp::Pow { .. } => 1 + 8 + 8,
+        let pad16 = |n: usize| n.div_ceil(16) * 16;
+        16 + match self {
+            TranscriptOp::Label(l) => pad16(l.len()),
+            TranscriptOp::ObserveScalar | TranscriptOp::SqueezeScalar => 16,
+            TranscriptOp::ObserveSlice(n) | TranscriptOp::SqueezeSlice(n) => 16 * n,
+            TranscriptOp::ObserveBytes(len) => pad16(*len),
+            // The PoW nonce rides `observe_bytes(8)`.
+            TranscriptOp::Pow { .. } => 16,
         }
     }
 
@@ -409,7 +412,7 @@ mod tests {
         // The recorder wraps an already-constructed challenger, so the domain
         // separator (OP_DOMAIN ‖ len ‖ domain) is absorbed before recording
         // starts and is not part of the shape.
-        let domain_bytes = (1 + 8 + domain.len()) as u64;
+        let domain_bytes = (16 + domain.len().div_ceil(16) * 16) as u64;
         assert_eq!(
             shape.absorbed_bytes() as u64,
             inner.absorbed_bytes() - domain_bytes,
