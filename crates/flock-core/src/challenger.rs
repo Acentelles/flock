@@ -163,14 +163,18 @@ fn splitmix64(state: &mut u64) -> u64 {
 // hash it was produced with (see `FsChallenger::with_hash`).
 // ---------------------------------------------------------------------------
 
-const OP_DOMAIN: u8 = 0x01;
-const OP_LABEL: u8 = 0x02;
-const OP_OBSERVE: u8 = 0x03;
-const OP_SQUEEZE: u8 = 0x04;
-const OP_BYTES: u8 = 0x05;
+// Public so [`crate::transcript_record`] can reconstruct the absorbed byte
+// stream from a recorded shape against ONE definition of the framing rather
+// than a copy of it.
+pub const OP_DOMAIN: u8 = 0x01;
+pub const OP_LABEL: u8 = 0x02;
+pub const OP_OBSERVE: u8 = 0x03;
+pub const OP_SQUEEZE: u8 = 0x04;
+pub const OP_BYTES: u8 = 0x05;
 
-const KIND_SCALAR: u8 = 0x01;
-const KIND_SLICE: u8 = 0x02;
+pub const KIND_SCALAR: u8 = 0x01;
+pub const KIND_SLICE: u8 = 0x02;
+pub const KIND_NONE: u8 = 0x00;
 
 /// Global Fiat–Shamir hash counters, enabled with `--features hash-count`.
 /// Tracks the squeeze count, the squeezed output length and the PoW checks;

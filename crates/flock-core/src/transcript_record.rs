@@ -239,6 +239,111 @@ impl TranscriptShape {
     }
 }
 
+/// One 128-bit word of the absorbed byte stream.
+///
+/// The 16-byte-aligned framing makes the stream a sequence of whole 128-bit
+/// words, and BLAKE3 consumes it 64 bytes — i.e. exactly four of these — at a
+/// time as one block's `m`. So each word maps to one `m` word of one row, and
+/// the circuit's job per word is to decide *where it comes from*:
+///
+/// - [`Const`](StreamWord::Const) → a public cell (op headers, label bytes,
+///   padding),
+/// - [`Value`](StreamWord::Value) → the wire already holding that proof value,
+///   by **pure copy** — the whole point of aligning the framing,
+/// - [`Squeezed`](StreamWord::Squeezed) → the wire holding that challenge,
+///   which the FS chain itself produced and the transcript re-absorbs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamWord {
+    Const(F128),
+    /// The `i`-th observed value, counting `F128`s in observation order.
+    Value(usize),
+    /// The `i`-th squeezed challenge word, in squeeze order.
+    Squeezed(usize),
+}
+
+impl TranscriptShape {
+    /// The absorbed byte stream as 128-bit words, given the domain the
+    /// challenger was built with.
+    ///
+    /// This is the circuit's placement map: word `k` of the result is `m` word
+    /// `k % 4` of block `k / 4`. It is derived from the recorded shape and the
+    /// framing constants in [`crate::challenger`], so there is one definition
+    /// of the encoding, not two.
+    pub fn stream_words(&self, domain: &[u8]) -> Vec<StreamWord> {
+        use crate::challenger::{
+            KIND_NONE, KIND_SCALAR, KIND_SLICE, OP_BYTES, OP_DOMAIN, OP_LABEL, OP_OBSERVE,
+            OP_SQUEEZE,
+        };
+        let header = |op: u8, kind: u8, len: u64| {
+            StreamWord::Const(F128::new(op as u64 | ((kind as u64) << 8), len))
+        };
+        // Bytes, zero-padded to a multiple of 16, as little-endian words.
+        let padded = |b: &[u8], out: &mut Vec<StreamWord>| {
+            for c in b.chunks(16) {
+                let mut w = [0u8; 16];
+                w[..c.len()].copy_from_slice(c);
+                out.push(StreamWord::Const(F128::new(
+                    u64::from_le_bytes(w[..8].try_into().unwrap()),
+                    u64::from_le_bytes(w[8..].try_into().unwrap()),
+                )));
+            }
+        };
+
+        let mut out = Vec::new();
+        // The domain is absorbed at construction, before recording starts.
+        out.push(header(OP_DOMAIN, KIND_NONE, domain.len() as u64));
+        padded(domain, &mut out);
+
+        let (mut values, mut challenges) = (0usize, 0usize);
+        for op in &self.ops {
+            match op {
+                TranscriptOp::Label(l) => {
+                    out.push(header(OP_LABEL, KIND_NONE, l.len() as u64));
+                    padded(l, &mut out);
+                }
+                TranscriptOp::ObserveScalar => {
+                    out.push(header(OP_OBSERVE, KIND_SCALAR, 1));
+                    out.push(StreamWord::Value(values));
+                    values += 1;
+                }
+                TranscriptOp::ObserveSlice(n) => {
+                    out.push(header(OP_OBSERVE, KIND_SLICE, *n as u64));
+                    for _ in 0..*n {
+                        out.push(StreamWord::Value(values));
+                        values += 1;
+                    }
+                }
+                TranscriptOp::ObserveBytes(len) => {
+                    out.push(header(OP_BYTES, KIND_NONE, *len as u64));
+                    // Content is caller-supplied bytes; the circuit wires them
+                    // from wherever they live. Recorded as zero padding here
+                    // because the shape does not carry values.
+                    for _ in 0..len.div_ceil(16) {
+                        out.push(StreamWord::Const(F128::ZERO));
+                    }
+                }
+                TranscriptOp::SqueezeScalar => {
+                    out.push(header(OP_SQUEEZE, KIND_SCALAR, 1));
+                    out.push(StreamWord::Squeezed(challenges));
+                    challenges += 1;
+                }
+                TranscriptOp::SqueezeSlice(n) => {
+                    out.push(header(OP_SQUEEZE, KIND_SLICE, *n as u64));
+                    for _ in 0..*n {
+                        out.push(StreamWord::Squeezed(challenges));
+                        challenges += 1;
+                    }
+                }
+                TranscriptOp::Pow { .. } => {
+                    out.push(header(OP_BYTES, KIND_NONE, 8));
+                    out.push(StreamWord::Const(F128::ZERO)); // the nonce, padded
+                }
+            }
+        }
+        out
+    }
+}
+
 /// A [`Challenger`] decorator that records the transcript's shape while
 /// delegating every call to `inner` unchanged.
 ///
@@ -418,6 +523,68 @@ mod tests {
             inner.absorbed_bytes() - domain_bytes,
             "TranscriptOp::absorbed_bytes disagrees with FsChallenger"
         );
+    }
+
+    /// **The stream model is right**: reconstructing the absorbed bytes from a
+    /// recorded shape and hashing them with plain BLAKE3 reproduces the
+    /// challenge `FsChallenger` actually produced.
+    ///
+    /// This is the assumption the whole FS-chain circuit rests on — the
+    /// circuit hashes the stream `stream_words` describes, so if that
+    /// description is off by a byte the circuit proves the wrong transcript.
+    /// Checked against the live challenger rather than derived.
+    #[test]
+    fn stream_words_reconstruct_what_the_challenger_absorbs() {
+        let domain: &[u8] = b"flock-stream-model";
+        let mut rec = RecordingChallenger::new(FsChallenger::with_hash(domain, HashKind::Blake3));
+
+        // Absorb a spread of op kinds, then take one challenge. Everything
+        // before the squeeze must be in the stream, byte for byte.
+        let vals = [
+            F128::new(0x0123_4567_89AB_CDEF, 0xFEDC_BA98_7654_3210),
+            F128::new(1, 2),
+            F128::new(3, 4),
+            F128::new(5, 6),
+        ];
+        rec.observe_label(b"phase-one");
+        rec.observe_f128(vals[0]);
+        rec.observe_f128_slice(&vals[1..4]);
+        let got = rec.sample_f128();
+        let shape = rec.shape();
+
+        // Rebuild the stream, substituting the observed values.
+        let words = shape.stream_words(domain);
+        let mut bytes = Vec::new();
+        for w in &words {
+            let v = match *w {
+                StreamWord::Const(c) => c,
+                StreamWord::Value(i) => vals[i],
+                // The squeeze's own output is re-absorbed AFTER it is produced,
+                // so it is not part of the prefix the challenge derives from.
+                StreamWord::Squeezed(_) => break,
+            };
+            bytes.extend_from_slice(&v.lo.to_le_bytes());
+            bytes.extend_from_slice(&v.hi.to_le_bytes());
+        }
+
+        // `sample_f128` absorbs its header, then finalizes and takes 16 bytes.
+        let mut h = ::blake3::Hasher::new();
+        h.update(&bytes);
+        let mut buf = [0u8; 16];
+        h.finalize_xof().fill(&mut buf);
+        let want = F128::new(
+            u64::from_le_bytes(buf[..8].try_into().unwrap()),
+            u64::from_le_bytes(buf[8..].try_into().unwrap()),
+        );
+
+        assert_eq!(
+            got, want,
+            "the reconstructed stream is not what FsChallenger absorbed — the \
+             FS-chain circuit would hash the wrong bytes"
+        );
+        // Every word is whole: the stream is a multiple of 16 bytes, so each
+        // BLAKE3 block is exactly four stream words and no value straddles one.
+        assert_eq!(bytes.len() % 16, 0);
     }
 
     #[test]
