@@ -17,6 +17,7 @@
 //! Workspace-wide Clippy `allow`s for the hand-tuned numeric kernels are
 //! declared in `[workspace.lints.clippy]` at the repo root.
 
+pub mod aggregate;
 pub mod bits;
 pub mod challenger;
 pub mod element_r1cs;

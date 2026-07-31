@@ -965,3 +965,117 @@ fn two_proofs_fold_two_to_one_per_matrix() {
         "the B accumulator is unaffected by the A-side tamper"
     );
 }
+
+/// The aggregation driver end to end: succinctly verify real proofs, fold
+/// their matrix work into one accumulator, discharge once.
+///
+/// This is the composition the recursion circuit arithmetises — and the
+/// native payoff on its own, since N proofs now cost N succinct replays plus
+/// ONE `O(Σ_t nnz_t)` discharge instead of N of them. `verify_aggregate`
+/// reads no matrix, which is what makes it circuit-shaped; the only place
+/// anything looks at `A₀`/`B₀` is the prover and the final discharge.
+#[test]
+fn aggregating_real_proofs_defers_all_matrix_work_to_one_discharge() {
+    use flock_core::aggregate::{self, AggregateError};
+
+    const SEED: u64 = 0xA66_5EED;
+    let nu = 4usize;
+    // Same seed ⇒ same base matrices; different counts ⇒ different proofs.
+    let slots: Vec<SlotData> = [11usize, 7, 14, 5]
+        .into_iter()
+        .map(|n| build_slot(9, 300, nu, n, Some(0), SEED))
+        .collect();
+    let registry = Registry::new(vec![table_type(&slots[0])], nu);
+    let m = registry.m_total();
+    let mats: Vec<(&SparseBinaryMatrix, &SparseBinaryMatrix)> =
+        vec![(&slots[0].a0, &slots[0].b0)];
+
+    // Prove one instance and return the assertion its succinct verify emits.
+    let assert_of = |slot: &SlotData, tamper: bool| -> lincheck::MatrixAssertion {
+        let union = UnionInstance::new(&registry, vec![slot.n]);
+        let off = registry.slots()[0].offset;
+        let mut z_addr = vec![false; 1 << m];
+        let mut a_addr = vec![false; 1 << m];
+        let mut b_addr = vec![false; 1 << m];
+        place_addr(&mut z_addr, &slot.z_sem, slot.k_log, nu, off);
+        place_addr(&mut a_addr, &slot.a_sem, slot.k_log, nu, off);
+        place_addr(&mut b_addr, &slot.b_sem, slot.k_log, nu, off);
+        let c_addr: Vec<bool> = a_addr.iter().zip(&b_addr).map(|(x, y)| *x & *y).collect();
+        let (a_p, b_p, c_p) = (pack_bits(&a_addr), pack_bits(&b_addr), pack_bits(&c_addr));
+        let stripe = pack_z_lincheck(&slot.z_sem, nu + slot.k_log, slot.k_log);
+        let circ = SparseMatrixCircuit::new(&slot.a0, &slot.b0).with_const_pin(slot.pin);
+
+        let mut ch = FsChallenger::new(DOMAIN);
+        let (zc_proof, zc) =
+            zerocheck::prove_packed_padded(&a_p, &b_p, &c_p, m, &union.padding_spec(), &mut ch);
+        let x_ab = union.x_ab_from_mlv(zc.z, &zc.mlv_challenges);
+        let (mut proof, _c, _g) = lincheck::prove_union_capture_z_vec(
+            &union,
+            &[UnionLincheckSlot { z_lincheck: &stripe, circuit: &circ }],
+            &x_ab,
+            &mut ch,
+        );
+        if tamper {
+            proof.matrix_evals[0].1 += F128::ONE;
+        }
+        let circuits: Vec<&dyn LincheckCircuit> = vec![&circ];
+        let mut chv = FsChallenger::new(DOMAIN);
+        let zcv = zerocheck::verify(m, &zc_proof, &mut chv).expect("zerocheck accepts");
+        let xv = union.x_ab_from_mlv(zcv.z, &zcv.mlv_challenges);
+        lincheck::verify_union_deferred(
+            &union, &circuits, &xv, zcv.a_eval, zcv.b_eval, &proof, &mut chv,
+        )
+        .expect("deferred verify accepts")
+        .1
+    };
+
+    let run = |asserts: &[lincheck::MatrixAssertion],
+               prior: Option<&aggregate::Accumulator>|
+     -> Result<aggregate::Accumulator, AggregateError> {
+        let mut chp = FsChallenger::new(b"agg");
+        let (proof, acc_p) =
+            aggregate::prove_aggregate(&registry, &mats, asserts, prior, &mut chp)?;
+        let mut chv = FsChallenger::new(b"agg");
+        let acc_v = aggregate::verify_aggregate(&registry, asserts, prior, &proof, &mut chv)?;
+        assert_eq!(acc_p, acc_v, "prover and verifier accumulators must agree");
+        Ok(acc_v)
+    };
+
+    // Leaf: two proofs, 2 → 1 per accumulator.
+    let a0 = assert_of(&slots[0], false);
+    let a1 = assert_of(&slots[1], false);
+    let acc = run(&[a0, a1], None).expect("leaf aggregation verifies");
+    assert!(acc.discharge(&mats), "leaf accumulator must discharge");
+    assert_eq!(acc.registry_digest, registry.digest());
+
+    // Merge: two more proofs folded in on top — 3 → 1 per accumulator (one
+    // inherited, two fresh). Still one discharge at the end.
+    let a2 = assert_of(&slots[2], false);
+    let a3 = assert_of(&slots[3], false);
+    let acc2 = run(&[a2, a3], Some(&acc)).expect("merge aggregation verifies");
+    assert!(acc2.discharge(&mats), "merged accumulator must discharge");
+
+    // A tampered report is caught by the equation check inside
+    // `verify_aggregate` — a caller cannot forget it.
+    let bad = assert_of(&slots[1], true);
+    assert!(
+        matches!(run(&[bad], None), Err(AggregateError::Reported(_))),
+        "a tampered matrix report must be rejected"
+    );
+
+    // An accumulator from another registry must not be folded in.
+    let other_slot = build_slot(8, 120, nu, 9, None, 0xBAD_5EED);
+    let other = Registry::new(vec![table_type(&other_slot)], nu);
+    let alien = aggregate::Accumulator {
+        registry_digest: other.digest(),
+        per_type: acc.per_type.clone(),
+    };
+    let a0b = assert_of(&slots[0], false);
+    assert!(
+        matches!(
+            run(&[a0b], Some(&alien)),
+            Err(AggregateError::RegistryMismatch)
+        ),
+        "an accumulator from a different registry must be rejected"
+    );
+}
