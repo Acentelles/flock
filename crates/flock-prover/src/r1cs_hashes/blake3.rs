@@ -191,6 +191,55 @@ pub const GS_BASE: usize = OUT_HI_BASE + 8 * WORD_BITS; // 1408
 pub const Z_CONST_POS: usize = GS_BASE + N_G * G_STRIDE; // 15,408
 pub const USEFUL_BITS: usize = Z_CONST_POS + 1; // 15,409
 
+// ---------------------------------------------------------------------------
+// Wiring IO schema
+// ---------------------------------------------------------------------------
+
+/// Cell-slot indices into [`io_schema`] — the schema's order IS the
+/// enumeration order, so these are the `ι` a circuit wires against.
+pub const IO_CV0: usize = 0;
+pub const IO_CV1: usize = 1;
+pub const IO_M0: usize = 2;
+pub const IO_PARAMS: usize = 6;
+pub const IO_OUT_LO0: usize = 7;
+pub const IO_OUT_LO1: usize = 8;
+pub const IO_OUT_HI0: usize = 9;
+pub const IO_OUT_HI1: usize = 10;
+
+/// The wireable words of one compression, in 128-bit words of the row.
+///
+/// **Everything a caller supplies must be here.** `cv`, `m`, and the packed
+/// `(counter, block_len, flags)` word are free witness — the relation does not
+/// pin them — so a word left out of the schema could be chosen by the prover.
+/// That is why the params word is an *input* rather than a constant: a circuit
+/// wires it to a public cell, which is what pins the chunk index and the
+/// `CHUNK_START`/`CHUNK_END`/`ROOT` flags per row position.
+///
+/// Both output halves are exposed. `out_lo` is the chaining value the next
+/// block consumes; `out_hi` is only meaningful for root/XOF compressions, but
+/// a schema word that goes unwired is σ-fixed and costs nothing, whereas an
+/// omitted one would be unconstrained.
+///
+/// The 128-bit alignment this depends on landed in `f95dfbb`
+/// ([`CV_BASE`] = 0, [`OUT_LO_BASE`] = 256, [`M_BASE`] = 512).
+pub fn io_schema() -> Vec<flock_core::schedule::IoWord> {
+    use flock_core::schedule::IoWord;
+    let w = |bit_base: usize| bit_base / 128;
+    vec![
+        IoWord::input(w(CV_BASE)),          // cv[0..4]
+        IoWord::input(w(CV_BASE) + 1),      // cv[4..8]
+        IoWord::input(w(M_BASE)),           // m[0..4]
+        IoWord::input(w(M_BASE) + 1),       // m[4..8]
+        IoWord::input(w(M_BASE) + 2),       // m[8..12]
+        IoWord::input(w(M_BASE) + 3),       // m[12..16]
+        IoWord::input(w(T_LO_BASE)),        // counter_lo|counter_hi|block_len|flags
+        IoWord::output(w(OUT_LO_BASE)),     // out_lo[0..4]
+        IoWord::output(w(OUT_LO_BASE) + 1), // out_lo[4..8]
+        IoWord::output(w(OUT_HI_BASE)),     // out_hi[0..4]
+        IoWord::output(w(OUT_HI_BASE) + 1), // out_hi[4..8]
+    ]
+}
+
 // G sub-block: ADD `add_idx` ∈ 0..6 (carry_aux only), then lin-id
 // `which` ∈ 0..2.
 const ADD_TMP0: usize = 0;
@@ -1803,6 +1852,55 @@ pub fn generate_witness_batch_major_partial_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The IO schema must cover **every free-witness input region**: a word
+    /// the relation does not pin and the schema does not expose is a value the
+    /// prover picks. It must also be word-aligned and non-overlapping, and its
+    /// named cell-slot constants must match its order.
+    #[test]
+    fn io_schema_covers_every_unpinned_input() {
+        use flock_core::schedule::IoDirection;
+        let schema = io_schema();
+
+        // Named indices agree with the enumeration order.
+        assert_eq!(schema[IO_CV0].word_col, CV_BASE / 128);
+        assert_eq!(schema[IO_M0].word_col, M_BASE / 128);
+        assert_eq!(schema[IO_PARAMS].word_col, T_LO_BASE / 128);
+        assert_eq!(schema[IO_OUT_LO0].word_col, OUT_LO_BASE / 128);
+        assert_eq!(schema[IO_OUT_HI0].word_col, OUT_HI_BASE / 128);
+
+        // Distinct words, and each region is 128-bit aligned.
+        let mut cols: Vec<usize> = schema.iter().map(|w| w.word_col).collect();
+        let n = cols.len();
+        cols.sort_unstable();
+        cols.dedup();
+        assert_eq!(cols.len(), n, "schema repeats a word column");
+        for base in [CV_BASE, OUT_LO_BASE, M_BASE, T_LO_BASE, OUT_HI_BASE] {
+            assert_eq!(base % 128, 0, "region at bit {base} is not word-aligned");
+        }
+
+        // Every input bit of the block is exposed: cv, m and the packed params
+        // word. `GS_BASE` onward is internal (round intermediates, carries) and
+        // is pinned by the relation, so it is correctly absent.
+        let covered: std::collections::HashSet<usize> = schema
+            .iter()
+            .filter(|w| w.dir == IoDirection::In)
+            .map(|w| w.word_col)
+            .collect();
+        for bit in (CV_BASE..CV_BASE + SLOT_BITS).step_by(128) {
+            assert!(covered.contains(&(bit / 128)), "cv bit {bit} unexposed");
+        }
+        for bit in (M_BASE..M_BASE + 16 * WORD_BITS).step_by(128) {
+            assert!(covered.contains(&(bit / 128)), "m bit {bit} unexposed");
+        }
+        assert!(
+            covered.contains(&(T_LO_BASE / 128)),
+            "counter/block_len/flags word unexposed — the prover could choose \
+             the chunk index and the CHUNK_START/CHUNK_END/ROOT flags"
+        );
+        // And the params word covers exactly those four u32s.
+        assert_eq!(OUT_HI_BASE - T_LO_BASE, 128);
+    }
 
     /// SplitMix64.
     struct Rng(u64);

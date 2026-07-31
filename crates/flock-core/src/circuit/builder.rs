@@ -68,6 +68,12 @@ pub enum SlotWitness {
     /// `word[(col << nu) + row]`, length `width << nu`. Feeds
     /// `UnionElementSlotInput`'s closure directly.
     Element(Vec<F128>),
+    /// The gate type does not pack its own witness. Boolean slots are
+    /// bit-packed by the hash modules' `generate_witness_batch_major*`, which
+    /// lives in `flock-prover`, above this crate — so the builder cannot
+    /// produce those buffers and does not pretend to. Recover the typed rows
+    /// with [`BuiltCircuit::rows`] and hand them to that generator.
+    DeferredToRows,
 }
 
 /// A gate type: its constraint system and its native evaluation, together.
@@ -98,12 +104,13 @@ pub trait GateType {
 }
 
 /// Object-safe view of a declared slot, erasing `GateType::Row`.
-trait SlotBuild {
+trait SlotBuild: std::any::Any {
     fn table(&self) -> TableType;
     fn n_in(&self) -> usize;
     fn push(&mut self, inputs: &[F128]) -> Vec<F128>;
     fn rows(&self) -> usize;
     fn witness(&self, nu: usize) -> SlotWitness;
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 struct GateSlot<G: GateType> {
@@ -114,7 +121,10 @@ struct GateSlot<G: GateType> {
     n_out: usize,
 }
 
-impl<G: GateType> SlotBuild for GateSlot<G> {
+impl<G: GateType + 'static> SlotBuild for GateSlot<G>
+where
+    G::Row: 'static,
+{
     fn table(&self) -> TableType {
         self.table.clone()
     }
@@ -139,6 +149,9 @@ impl<G: GateType> SlotBuild for GateSlot<G> {
     fn witness(&self, nu: usize) -> SlotWitness {
         self.gate.witness(&self.rows, nu)
     }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// Everything [`CircuitBuilder::finish`] produces: the statement and the
@@ -155,6 +168,7 @@ pub struct BuiltCircuit {
     pub public: Vec<F128>,
     /// `registry_slot[declared] = registry index`.
     registry_slot: Vec<usize>,
+    slots: Vec<Box<dyn SlotBuild>>,
 }
 
 impl BuiltCircuit {
@@ -162,6 +176,28 @@ impl BuiltCircuit {
     /// class-major, area-descending, so declaration order is not slot order.
     pub fn registry_slot(&self, s: SlotId) -> usize {
         self.registry_slot[s.0]
+    }
+
+    /// A slot's rows in instantiation order, with their concrete type
+    /// recovered.
+    ///
+    /// The escape hatch for witnesses the builder cannot pack — a boolean slot
+    /// hands back its `&[Compression]` here, and the caller feeds it to
+    /// `generate_witness_batch_major_partial`. Row ORDER is the builder's
+    /// contract: row `j` of this slice is row `j` of the committed trace, which
+    /// is what makes the wiring the builder emitted correct for that witness.
+    ///
+    /// Panics if `s` was not declared with `G`.
+    pub fn rows<G>(&self, s: SlotId) -> &[G::Row]
+    where
+        G: GateType + 'static,
+        G::Row: 'static,
+    {
+        &self.slots[s.0]
+            .as_any()
+            .downcast_ref::<GateSlot<G>>()
+            .expect("slot was declared with a different GateType")
+            .rows
     }
 }
 
@@ -184,7 +220,11 @@ impl CircuitBuilder {
 
     /// Declare a gate slot. Every gate of this type shares the slot, and the
     /// slot's row capacity is the registry's uniform `2^nu`.
-    pub fn slot<G: GateType + 'static>(&mut self, gate: G) -> SlotId {
+    pub fn slot<G>(&mut self, gate: G) -> SlotId
+    where
+        G: GateType + 'static,
+        G::Row: 'static,
+    {
         let table = gate.table();
         let n_in = table
             .io_schema
@@ -341,6 +381,7 @@ impl CircuitBuilder {
             .iter()
             .map(|&d| self.slots[d].witness(self.nu))
             .collect();
+        let slots = self.slots;
 
         let circuit = Circuit::new(&registry, counts.clone(), public_values.len(), wires)?;
         Ok(BuiltCircuit {
@@ -350,6 +391,7 @@ impl CircuitBuilder {
             witnesses,
             public: public_values,
             registry_slot,
+            slots,
         })
     }
 }
