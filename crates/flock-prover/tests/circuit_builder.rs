@@ -1416,6 +1416,7 @@ fn mvp2b_full_element_zerocheck_replayed() {
         SlotWitness::Element(z) => z.clone(),
         _ => unreachable!(),
     };
+    let t = std::time::Instant::now();
     let mut c = FsChallenger::new(DOMAIN);
     let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_circuit(
         &outer,
@@ -1431,6 +1432,8 @@ fn mvp2b_full_element_zerocheck_replayed() {
         })],
         &mut c,
     );
+    let prove_ms = t.elapsed().as_secs_f64() * 1e3;
+    let t = std::time::Instant::now();
     let mut c = FsChallenger::new(DOMAIN);
     verifier::verify_ligerito_jagged_union_circuit(
         &outer,
@@ -1443,14 +1446,17 @@ fn mvp2b_full_element_zerocheck_replayed() {
         &mut c,
     )
     .expect("the replayed zerocheck verifies");
+    let verify_ms = t.elapsed().as_secs_f64() * 1e3;
 
     println!(
         "\n=== MVP-2b: the whole element zerocheck, in-circuit ===\n  \
          zerocheck {m_words} rounds + lincheck {LC_ROUNDS} rounds | \
-         {} BLAKE3 rows + {} element rows | M={} | {} public words",
+         {} BLAKE3 rows + {} element rows | M={} | {} public words | {} proof bytes\n  \
+         prove {prove_ms:.1} ms | verify {verify_ms:.2} ms",
         built.counts[built.registry_slot(hash)],
         built.counts[built.registry_slot(arith)],
         outer.m_total(),
         built.public.len(),
+        bincode::serialize(&proof).unwrap().len(),
     );
 }
