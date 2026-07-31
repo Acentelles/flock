@@ -653,7 +653,23 @@ fn chunk_layout_geometry() {
             U,
             "const sits at chunk block 0's padding start"
         );
-        assert_eq!(layout.index_bit(0), U + 1);
+        // The index is a word-aligned 128-bit WORD, not a tight run after the
+        // constant — that is what makes it wireable, and it is why the
+        // Fiat-Shamir query binding needs no mask gadget: the query index IS
+        // the low `depth` bits of the challenge word.
+        assert_eq!(layout.index_word_base() % 128, 0, "index word is aligned");
+        assert!(
+            layout.index_word_base() > U,
+            "index word clears the constant-one column"
+        );
+        assert_eq!(layout.index_bit(0), layout.index_word_base());
+        for l in 0..depth {
+            assert_eq!(layout.index_bit(l), layout.index_word_base() + l);
+        }
+        assert!(
+            layout.index_word_base() + 128 <= STRIDE,
+            "the whole index word fits chunk block 0's padding"
+        );
         // Node levels sit after the chunk segment.
         for l in 0..depth {
             assert_eq!(

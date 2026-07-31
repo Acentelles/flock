@@ -452,9 +452,13 @@ impl MerkleTreeLayout {
             spec.useful_bits + 2 * SLOT_BITS <= 1usize << spec.k_log,
             "the swap gadget does not fit the base block's padding"
         );
+        // The globals are the constant-one column plus a word-aligned 128-bit
+        // index WORD (see `index_word_base`), not a tight run of `depth` bits.
+        let index_end = (spec.useful_bits + 1).div_ceil(128) * 128 + 128;
         assert!(
-            spec.useful_bits + 1 + depth <= 1usize << spec.k_log,
-            "depth {depth} does not fit: the globals exceed chunk block 0's padding"
+            index_end <= 1usize << spec.k_log,
+            "the index word does not fit chunk block 0's padding: {index_end} > 2^{}",
+            spec.k_log
         );
         // The last block is a node level (depth ≥ 1), so the last nonzero
         // column is its `t` region's end.
@@ -515,13 +519,32 @@ impl MerkleTreeLayout {
         self.block_base(block) + self.spec.msg_base + j
     }
 
+    /// First column of the index **word** — chunk-leaf layouts only.
+    ///
+    /// The index is a full 128-bit word at a word-aligned position, not a
+    /// tight run of `depth` bits, so that a circuit can WIRE it. The Merkle
+    /// index is its low `depth` bits; the rest are free and unread.
+    ///
+    /// That is what makes the Fiat–Shamir query binding free of any gadget.
+    /// `sample_queries` computes `(v.lo as usize) & (block_len − 1)` with
+    /// `block_len = 2^depth`, so the query index IS the low `depth` bits of the
+    /// challenge word. Wire the challenge straight into this word and the
+    /// masking is not a computation at all — it is expressed by which bits the
+    /// relation reads. The high bits ride along, pinned by the copy constraint
+    /// and ignored by the relation.
+    pub fn index_word_base(&self) -> usize {
+        debug_assert!(self.leaf_blocks > 0, "digest-leaf layouts pack the index");
+        // Clear the constant-one column, then round up to a word boundary.
+        (self.const_pos() + 1).div_ceil(128) * 128
+    }
+
     /// Indicator bit of level `l` (bit `l` of the index).
     pub fn index_bit(&self, level: usize) -> usize {
         debug_assert!(level < self.depth);
         if self.leaf_blocks == 0 {
             self.const_pos() + 1 + SLOT_BITS + level
         } else {
-            self.const_pos() + 1 + level
+            self.index_word_base() + level
         }
     }
 
@@ -651,8 +674,19 @@ impl MerkleTreeLayout {
                 free(&mut a, &mut b, self.leaf_bit(j));
             }
         }
-        for l in 0..self.depth {
-            free(&mut a, &mut b, self.index_bit(l));
+        if self.leaf_blocks == 0 {
+            for l in 0..self.depth {
+                free(&mut a, &mut b, self.index_bit(l));
+            }
+        } else {
+            // The whole index WORD is free, not just its `depth` index bits.
+            // A zero-pinned remainder would make the committed word equal the
+            // bare index, and wiring that to a Fiat–Shamir challenge would
+            // demand the challenge's high bits be zero — unsatisfiable. The
+            // relation still reads only the low `depth`.
+            for j in 0..128 {
+                free(&mut a, &mut b, self.index_word_base() + j);
+            }
         }
 
         let fixed = (self.spec.fixed_bits)();
@@ -1412,9 +1446,13 @@ impl MerkleTreeLayout {
         z[gc] = true;
         a[gc] = true;
         b[gc] = true;
-        for l in 0..self.depth {
-            let bit = (input.index >> l) & 1 == 1;
-            free(&mut z, &mut a, &mut b, self.index_bit(l), bit);
+        // The whole index word is free, so every one of its 128 columns needs
+        // its `z·1 = z` witness — not just the `depth` index bits. Bits at or
+        // above `depth` are zero here; when the word is wired to a Fiat-Shamir
+        // challenge they carry the challenge's remaining bits.
+        for j in 0..128 {
+            let bit = j < self.depth && (input.index >> j) & 1 == 1;
+            free(&mut z, &mut a, &mut b, self.index_word_base() + j, bit);
         }
 
         let base_words = (1usize << self.spec.k_log) / 64;
@@ -1551,7 +1589,9 @@ impl MerkleTreeLayout {
         let sib_off = spec.useful_bits;
         let t_off = spec.useful_bits + SLOT_BITS;
         let const_off = self.const_pos();
-        let index_off = const_off + 1;
+        // The index is a word-aligned 128-bit WORD, not a tight run after the
+        // constant — see `index_word_base`.
+        let index_off = self.index_word_base();
 
         super::common::drive_witness_batch_major_partial_into(
             paths,
@@ -1596,9 +1636,18 @@ impl MerkleTreeLayout {
                         or_bit_row(wz, const_off);
                         or_bit_row(wa, const_off);
                         or_bit_row(wb, const_off);
-                        for l in 0..depth {
-                            let v: [u32; BM_V] =
-                                std::array::from_fn(|j| ((group[j].index >> l) & 1) as u32);
+                        // The whole index WORD is free, so all 128 columns
+                        // need their `z·1 = z` witness. Columns at or above
+                        // `depth` are zero here; when the word is wired to a
+                        // Fiat-Shamir challenge they carry its remaining bits.
+                        for l in 0..128 {
+                            let v: [u32; BM_V] = std::array::from_fn(|j| {
+                                if l < depth {
+                                    ((group[j].index >> l) & 1) as u32
+                                } else {
+                                    0
+                                }
+                            });
                             or_u32_row(wz, index_off + l, &v);
                             or_u32_row(wa, index_off + l, &v);
                             or_bit_row(wb, index_off + l);
