@@ -398,6 +398,121 @@ impl<'r> UnionInstance<'r> {
     /// The gather is parallel over the used chunk-columns (disjoint
     /// destination runs of `n_t` words, disjoint sources), which is what the
     /// copy costs at scale: it is pure memory traffic, ~127 MB at `M = 30`.
+    /// Power-of-two sub-table widths for a slot of `used_cols` columns, widest
+    /// first — the decomposition fancy jagged needs (paper §6: "a table of
+    /// width 9 can be represented by two tables: one of width 8 and one of
+    /// width 1"). Sums to `used_cols`, length `popcount(used_cols)`.
+    pub fn subtable_widths(used_cols: usize) -> Vec<usize> {
+        let mut out = Vec::with_capacity(used_cols.count_ones() as usize);
+        for bit in (0..usize::BITS).rev() {
+            if (used_cols >> bit) & 1 == 1 {
+                out.push(1usize << bit);
+            }
+        }
+        out
+    }
+
+    /// [`Self::compact_witness`] in the **row-major-within-table** order that
+    /// fancy jagged ([`crate::pcs::jagged_fancy`]) requires:
+    ///
+    /// ```text
+    ///   column-major (today):  dense = table_base + col·n_t + row
+    ///   row-major   (fancy):   dense = table_base + row·2^c + col
+    /// ```
+    ///
+    /// Each slot's `used_cols` columns are first split into power-of-two
+    /// sub-tables by [`Self::subtable_widths`], because the row-major stride
+    /// must be a power of two — that is exactly what lets §6's branching
+    /// program check `i = t_prev + row·2^c + col` with a shift instead of a
+    /// general multiplication.
+    ///
+    /// Same length and the same multiset of words as [`Self::compact_witness`];
+    /// only the permutation differs.
+    ///
+    /// **This is a transpose**, where the column-major form is a per-column
+    /// `copy_from_slice`. The padded buffer is BatchMajor, whose packed-word
+    /// address is `(chunk << nu) | row` — column-major in the same sense as
+    /// today's dense stack, which is why that path is nearly a memcpy. Tiled
+    /// so both the strided source reads and the contiguous destination writes
+    /// stay cache-resident.
+    ///
+    /// Deliberately confined here: the padded buffer keeps BatchMajor (the
+    /// zerocheck's padding gating gets one contiguous run out of it, and the
+    /// fold order depends on the batch dims being low), so this function IS
+    /// the adapter between the two representations.
+    pub fn compact_witness_row_major(&self, z_padded: &[F128]) -> Vec<F128> {
+        debug_assert!(
+            self.dropped_words_are_zero(z_padded),
+            "padded buffer must be zero on every dropped word"
+        );
+        self.compact_witness_row_major_unchecked(z_padded)
+    }
+
+    /// [`Self::compact_witness_row_major`] without the dropped-words-are-zero
+    /// assertion, mirroring [`Self::compact_witness_unchecked`].
+    pub fn compact_witness_row_major_unchecked(&self, z_padded: &[F128]) -> Vec<F128> {
+        use rayon::prelude::*;
+
+        /// Tile side, in F128 words: a 32×32 tile is 16 KB, so both sides of
+        /// the transpose stay L1-resident across the inner loops.
+        const TILE: usize = 32;
+
+        assert_eq!(z_padded.len(), self.packed_len(), "padded buffer length");
+        let nu = self.n_log();
+        let dense = self.dense_words();
+        let mut q = crate::scratch::take_f128(self.committed_words());
+        q[dense..]
+            .par_chunks_mut(1 << 16)
+            .for_each(|c| c.fill(F128::ZERO));
+
+        let mut rest: &mut [F128] = &mut q;
+        let mut cursor = 0usize;
+        for ((ty, slot), &n_t) in self
+            .registry()
+            .types()
+            .iter()
+            .zip(self.registry().slots())
+            .zip(self.counts())
+        {
+            let used_cols = self.used_cols(ty);
+            let (dst, tail) = rest.split_at_mut(used_cols * n_t);
+            rest = tail;
+            cursor += used_cols * n_t;
+            if n_t == 0 {
+                continue;
+            }
+            let start = slot.offset >> 7;
+            let mut dst_rest = dst;
+            let mut col_base = 0usize;
+            for width in Self::subtable_widths(used_cols) {
+                let (sub, next) = dst_rest.split_at_mut(width * n_t);
+                dst_rest = next;
+                // Row-tiles are disjoint destination runs, so parallel over
+                // them; within a tile, walk source columns outer (contiguous
+                // reads) and scatter across the destination's row stride.
+                sub.par_chunks_mut(TILE * width)
+                    .enumerate()
+                    .for_each(|(rt, out)| {
+                        let row0 = rt * TILE;
+                        let n_rows = out.len() / width;
+                        for ct in (0..width).step_by(TILE) {
+                            let n_cols = TILE.min(width - ct);
+                            for c in 0..n_cols {
+                                let src = start + ((col_base + ct + c) << nu) + row0;
+                                for r in 0..n_rows {
+                                    out[r * width + ct + c] = z_padded[src + r];
+                                }
+                            }
+                        }
+                    });
+                col_base += width;
+            }
+            debug_assert!(dst_rest.is_empty(), "sub-table widths must tile the slot");
+        }
+        debug_assert_eq!(cursor, self.dense_words());
+        q
+    }
+
     pub fn compact_witness(&self, z_padded: &[F128]) -> Vec<F128> {
         debug_assert!(
             self.dropped_words_are_zero(z_padded),
@@ -1997,6 +2112,173 @@ mod tests {
             c.x_outer[r_rest.len() - 1..]
                 .iter()
                 .all(|x| *x == F128::ZERO)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Row-major compaction (fancy jagged, paper §6)
+    // -----------------------------------------------------------------------
+
+    /// The power-of-two decomposition: §6's width-9 example, and the real
+    /// depth-26 Merkle slot width.
+    #[test]
+    fn subtable_widths_decompose() {
+        assert_eq!(UnionInstance::subtable_widths(9), vec![8, 1]);
+        assert_eq!(UnionInstance::subtable_widths(1), vec![1]);
+        assert_eq!(UnionInstance::subtable_widths(8), vec![8]);
+        let w = UnionInstance::subtable_widths(3_325);
+        assert_eq!(w.len(), 9, "popcount(3325)");
+        assert_eq!(w.iter().sum::<usize>(), 3_325);
+        assert!(w.windows(2).all(|p| p[0] > p[1]), "widest first");
+        assert!(w.iter().all(|x| x.is_power_of_two()));
+    }
+
+    /// A padded buffer whose every live word is stamped with its own source
+    /// address, so each destination slot can be checked against the row-major
+    /// index formula directly. A permutation test alone would not catch two
+    /// rows being swapped; this does.
+    #[test]
+    fn row_major_index_formula() {
+        let nu = 4usize;
+        let reg = Registry::new(vec![ty(10, 700), ty(9, 300)], nu);
+        for counts in [vec![16usize, 16], vec![11, 13], vec![16, 0], vec![5, 1]] {
+            let union = UnionInstance::new(&reg, counts.clone());
+            // Stamp only the live words; everything else stays zero so the
+            // checked entry point's dropped-words assertion still holds.
+            let mut padded = vec![F128::ZERO; union.packed_len()];
+            for ((ty_i, slot), &n_t) in reg.types().iter().zip(reg.slots()).zip(&counts) {
+                let used = ty_i.useful_bits.div_ceil(128).min(1 << (ty_i.k_log - 7));
+                let start = slot.offset >> 7;
+                for col in 0..used {
+                    for row in 0..n_t {
+                        let a = start + (col << nu) + row;
+                        padded[a] = F128 {
+                            lo: a as u64 + 1,
+                            hi: 0,
+                        };
+                    }
+                }
+            }
+
+            let q = union.compact_witness_row_major(&padded);
+            assert_eq!(q.len(), union.committed_words());
+
+            // Walk the expected layout independently and compare.
+            let mut d = 0usize;
+            for ((ty_i, slot), &n_t) in reg.types().iter().zip(reg.slots()).zip(&counts) {
+                let used = ty_i.useful_bits.div_ceil(128).min(1 << (ty_i.k_log - 7));
+                let start = slot.offset >> 7;
+                let mut col_base = 0usize;
+                for width in UnionInstance::subtable_widths(used) {
+                    for row in 0..n_t {
+                        for c in 0..width {
+                            let src = start + ((col_base + c) << nu) + row;
+                            assert_eq!(
+                                q[d],
+                                F128 {
+                                    lo: src as u64 + 1,
+                                    hi: 0
+                                },
+                                "counts {counts:?}: dense[{d}] should hold source {src} \
+                                 (sub-table width {width}, row {row}, col {c})"
+                            );
+                            d += 1;
+                        }
+                    }
+                    col_base += width;
+                }
+            }
+            assert_eq!(d, union.dense_words());
+            assert!(
+                q[union.dense_words()..].iter().all(|x| *x == F128::ZERO),
+                "the power-of-two pad tail must be zero"
+            );
+        }
+    }
+
+    /// Row-major and column-major must move the SAME multiset of words — same
+    /// length, same pad tail, only the permutation differs.
+    #[test]
+    fn row_major_is_a_permutation_of_column_major() {
+        let nu = 4usize;
+        let reg = Registry::new(vec![ty(10, 700), ty(9, 300)], nu);
+        for counts in [vec![16usize, 16], vec![11, 13], vec![9, 0]] {
+            let union = UnionInstance::new(&reg, counts.clone());
+            let mut padded = vec![F128::ZERO; union.packed_len()];
+            for ((ty_i, slot), &n_t) in reg.types().iter().zip(reg.slots()).zip(&counts) {
+                let used = ty_i.useful_bits.div_ceil(128).min(1 << (ty_i.k_log - 7));
+                let start = slot.offset >> 7;
+                for col in 0..used {
+                    for row in 0..n_t {
+                        let a = start + (col << nu) + row;
+                        padded[a] = F128 {
+                            lo: a as u64 + 1,
+                            hi: 0,
+                        };
+                    }
+                }
+            }
+            let cm = union.compact_witness(&padded);
+            let rm = union.compact_witness_row_major(&padded);
+            assert_eq!(cm.len(), rm.len());
+            let dense = union.dense_words();
+            let mut a: Vec<u64> = cm[..dense].iter().map(|x| x.lo).collect();
+            let mut b: Vec<u64> = rm[..dense].iter().map(|x| x.lo).collect();
+            a.sort_unstable();
+            b.sort_unstable();
+            assert_eq!(a, b, "counts {counts:?}: different multisets of words");
+            assert!(cm[dense..].iter().all(|x| *x == F128::ZERO));
+            assert!(rm[dense..].iter().all(|x| *x == F128::ZERO));
+            // And they really are different orders (unless the slot is 1 wide).
+            assert_ne!(
+                cm[..dense],
+                rm[..dense],
+                "counts {counts:?}: expected a transpose"
+            );
+        }
+    }
+
+    /// Cost of the transpose against the column-major copy, at the real
+    /// depth-26 Merkle geometry (κ = 19, 3,325 used columns, 2^10 rows). The
+    /// column-major path is a per-column `copy_from_slice` and already
+    /// bandwidth-bound, so this is the number that decides whether paying a
+    /// transpose to delete the Frobenius assist is worth it.
+    ///
+    /// `cargo test -p flock-core --release union::tests::row_major_transpose_cost
+    /// -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn row_major_transpose_cost() {
+        let _ = crate::init_perf_thread_pool();
+        let nu = 10usize;
+        let reg = Registry::new(vec![ty(19, 425_521)], nu);
+        let union = UnionInstance::new(&reg, vec![1 << nu]);
+        let padded = vec![F128::ONE; union.packed_len()];
+        let mb = union.dense_words() as f64 * 16.0 / 1e6;
+
+        let time = |f: &dyn Fn() -> Vec<F128>| -> f64 {
+            let _ = f(); // warm
+            let mut best = f64::INFINITY;
+            for _ in 0..5 {
+                let t = std::time::Instant::now();
+                let q = f();
+                std::hint::black_box(&q);
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            best * 1e3
+        };
+        let cm = time(&|| union.compact_witness_row_major_unchecked(&padded));
+        let base = time(&|| union.compact_witness_unchecked(&padded));
+        eprintln!(
+            "  dense {:.1} MB ({} words, {} sub-tables)\n  \
+             column-major copy : {:7.2} ms\n  \
+             row-major transpose: {:7.2} ms  ({:.2}x)",
+            mb,
+            union.dense_words(),
+            UnionInstance::subtable_widths(3_325).len(),
+            base,
+            cm,
+            cm / base
         );
     }
 }

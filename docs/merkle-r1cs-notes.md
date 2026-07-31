@@ -111,9 +111,47 @@ bijection. The fix drops those branches rather than pinning the coordinate,
 which keeps the `(1 + z_col_j)` factor the MLE of a function vanishing on
 `col_j = 1` requires.
 
-**Not wired.** Adoption needs the row-major dense stack, i.e. a new
-`compact_witness` and therefore a new commitment. Same posture as the
-multipoint-twisted prototype: correct and tested in-tree, integration separate.
+**Row-major compaction landed.** `UnionInstance::compact_witness_row_major`
+plus `subtable_widths`. Each slot's `used_cols` columns are split into
+power-of-two sub-tables (widest first), and each is transposed from the
+BatchMajor source into `dense = table_base + row·2^c + col`.
+
+**Measured at the real depth-26 geometry** (κ = 19, 3,325 used columns → 9
+sub-tables, 2^10 rows, 54.5 MB):
+
+```
+column-major copy  : 1.93 ms
+row-major transpose: 5.63 ms   (2.92x)
+```
+
+So the transpose costs **+3.7 ms** against the ~258 ms of assist it would let
+us delete — a 70:1 trade. (Warm-buffer microbenchmark; in a full prove the
+column-major path traces at ~5.5 ms on cold pages, so treat the 2.92× ratio as
+the robust figure, not the absolutes.)
+
+Tiled 32×32 (16 KB, L1-resident) so both the strided source reads and the
+contiguous destination writes stay hot; row-tiles are disjoint so it
+parallelizes.
+
+**The change is confined to `compact_witness`.** The padded buffer keeps
+BatchMajor — the zerocheck's padding gating gets one contiguous run from having
+the chunk bits high, and the fold order depends on the batch dims being low —
+so the witness drivers, zerocheck, lincheck stripes and ring-switch are all
+untouched. This function IS the adapter between the two representations.
+
+Tests: `subtable_widths_decompose` (§6's 9 → 8+1, and 3,325 → 9 widths);
+`row_major_index_formula`, which stamps every live padded word with its own
+source address and checks each destination slot against the formula — a
+permutation test alone would not catch two rows being swapped;
+`row_major_is_a_permutation_of_column_major` (same multiset, same pad tail,
+genuinely a different order); and the `#[ignore]`d `row_major_transpose_cost`.
+
+**Still not wired.** What remains is the consumer side: `build_merged_weight_and_prime`
+must switch to the row-major bijection (symmetric change — hoist `eq_r[row]`
+and walk columns, where today it hoists `eq_c[col]` and walks rows), the
+configuration must replace `col_prefix_sums`, and `verify_batch_merged` must
+evaluate `Ŵ(ρ)` through `f_hat_fancy` instead of delegating to the assist.
+`commit` and the eq-basis opening of `q̂(ρ)` are layout-agnostic.
 
 ## Tried and reverted: the rectangular fast path (commit 2009aff, reverted)
 
