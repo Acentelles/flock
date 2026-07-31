@@ -773,9 +773,32 @@ map and the multi-table document.
   \item Delegation design shape (comb + $\sigma$ + assist): SPARK-style
         sparse commitment vs.\ alternatives; adaptive-ordering caveat from
         the recursion map (\S5.1) must be preserved.
-  \item Element gate granularity: fuse macro-gates (Horner, dot-product-k,
-        sumcheck-round) once the verifier-circuit profile shows where the
-        cells concentrate.
+  \item Element gate granularity: \emph{candidate list derived}
+        2026-07-31 (see \code{docs/local/recursion-handoff.md},
+        ``The macro-gate operation list''). Scoping the replay path
+        ($\sim$1{,}370 lines, once deferral removes the matrix work) yields
+        $\sim$19 operations in three tiers: scalars
+        (\code{add}/\code{mul}/\code{inv}/\code{assert\_eq}), sumcheck-round
+        machinery, and tensor ops (\code{eq\_*}, Lagrange/interpolation, the
+        induced-basis evaluations). The same list is the \code{Arith} trait
+        the verifier would be written against, so choosing gate granularity
+        and choosing the abstraction are one decision.
+
+        Granularity should be \emph{macro}, not add/mul, and there is now a
+        concrete reason rather than an aesthetic one. $\varphi_8$ is a field
+        homomorphism, so the interpolation node set
+        $V = \varphi_8(\{0..2^m-1\})$ is an $\Ftwo$-subspace and its vanishing
+        polynomial $Z_V(X) = \prod_{s \in V}(X+s)$ is \emph{linearized}
+        (verified: \code{phi8\_node\_sets\_have\_linearized\_vanishing\_polynomials}).
+        Hence $L_i(z) = Z_V(z) / ((z + \varphi_8(i))\cdot d_i)$ with $d_i$
+        constant --- one additive map and one inverse in place of an
+        $O(\ell^2)$ product. At $\ell = 64$ the combined interpolation's
+        $\sim$16k multiplications become $\sim$128, and $Z_V$ being
+        $\Ftwo$-linear makes it \emph{free in the boolean class}. Natively the
+        naive product is sub-millisecond and not worth changing; in-circuit
+        the difference is decisive. At add/mul granularity the saving is
+        unreachable, because the circuit would be forced to trace whichever
+        loop the native code happens to use.
   \item Sub-word gate parameters (BLAKE3 counters/flags): per-type pinning
         vs.\ public constant words --- decide when the BLAKE3 circuit gate
         is specified.

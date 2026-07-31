@@ -1739,6 +1739,83 @@ pub fn uni_skip_fold_and_round_pair_optimized(
 mod tests {
     use super::*;
 
+    /// The interpolation node sets are **F₂-subspaces**, so their vanishing
+    /// polynomials are *linearized* (additive).
+    ///
+    /// `φ_8` is a field homomorphism, hence additive, and `{0..2^m−1}` is an
+    /// F₂-subspace of GF(2^8) under XOR — so `V = φ_8({0..2^m−1})` is an
+    /// F₂-subspace of F_{2^128} and `Z_V(X) = Π_{s∈V}(X+s)` satisfies
+    /// `Z_V(a+b) = Z_V(a) + Z_V(b)`.
+    ///
+    /// This is a *cost* property, and a large one. The Lagrange weights
+    /// [`lagrange_weights_naive`] computes as `Π_{j≠i}(z+φ(j))` are really
+    /// `Z_V(z) / (z + φ(i))` — one additive map plus an inverse, instead of
+    /// the naive `O(ell²)` product. At `ell = 64` that is ~4k muls collapsing
+    /// to ~64, and [`interpolate_at_z_combined`]'s ~16k muls collapsing to
+    /// ~128. Natively the naive form is sub-millisecond and not worth
+    /// changing; **in-circuit the difference is decisive**, and an additive
+    /// map over F_{2^128} is F₂-linear, i.e. free in the boolean class.
+    ///
+    /// Pinned here because the recursion circuit's cost model depends on it,
+    /// and because it is a property of `PHI_8_TABLE`'s contents rather than of
+    /// any code that could be reviewed for it.
+    #[test]
+    fn phi8_node_sets_have_linearized_vanishing_polynomials() {
+        use crate::field::PHI_8_TABLE;
+
+        // Z_V(x) = Π_{s ∈ V} (x + s) over the first 2^m table entries.
+        let z_v = |m: usize, x: F128| -> F128 {
+            (0..(1usize << m)).fold(F128::ONE, |acc, i| acc * (x + PHI_8_TABLE[i]))
+        };
+
+        for m in 1..=6usize {
+            // Additivity on a spread of points, including the subspace itself.
+            let probes = [
+                F128::new(0, 0),
+                F128::new(1, 0),
+                F128::new(0x0123_4567_89AB_CDEF, 0xFEDC_BA98_7654_3210),
+                F128::new(0xDEAD_BEEF_CAFE_F00D, 0x0BAD_C0DE_1234_5678),
+                PHI_8_TABLE[1],
+                PHI_8_TABLE[(1usize << m) - 1],
+            ];
+            for a in probes {
+                for b in probes {
+                    assert_eq!(
+                        z_v(m, a + b),
+                        z_v(m, a) + z_v(m, b),
+                        "Z_V not additive at m={m}"
+                    );
+                }
+            }
+            // And it vanishes exactly on the subspace.
+            for i in 0..(1usize << m) {
+                assert_eq!(z_v(m, PHI_8_TABLE[i]), F128::ZERO, "Z_V(s) != 0 at m={m}");
+            }
+        }
+
+        // The payoff, stated as an identity: the naive Lagrange weight equals
+        // the closed form `Z_V(z) / ((z + φ(i)) · Z_V'(φ(i)))`, where the
+        // derivative of a linearized polynomial is the constant `c_0` — here
+        // recovered as `Z_V(x)/x` in the limit, i.e. the coefficient obtained
+        // from any single evaluation off the subspace divided out. We check
+        // the ratio form directly, which is what a circuit would evaluate.
+        let m = 3usize;
+        let z = F128::new(0x9E37_79B9_7F4A_7C15, 0xBF58_476D_1CE4_E5B9);
+        let naive = lagrange_weights_naive(m, z);
+        let zv_z = z_v(m, z);
+        for (i, &w) in naive.iter().enumerate() {
+            // den_i = Π_{j≠i}(φ(i)+φ(j)), the constant part.
+            let mut den = F128::ONE;
+            for j in 0..(1usize << m) {
+                if j != i {
+                    den *= PHI_8_TABLE[i] + PHI_8_TABLE[j];
+                }
+            }
+            let closed = zv_z * ((z + PHI_8_TABLE[i]) * den).inv();
+            assert_eq!(w, closed, "closed-form Lagrange weight disagrees at i={i}");
+        }
+    }
+
     /// `LiveLayout` is an order-preserving bijection between the live global
     /// positions and `0..len`, and reports every dead position as absent.
     /// Checked against a brute-force rank over the whole domain, including
