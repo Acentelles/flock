@@ -363,6 +363,179 @@ pub fn f_hat_fancy(
     acc
 }
 
+// ---------------------------------------------------------------------------
+// Aligned tables: §6 adapted to a global column index
+// ---------------------------------------------------------------------------
+
+/// A table pinned to an **aligned block** of the global column index.
+///
+/// §6 gives tables their own `tab ∈ {0,1}^k` variable. Flock's claims don't:
+/// the ring-switch claim point splits as `[row | chunk]` over the padded
+/// witness's BatchMajor address, so `z_col` is a single `k_cols`-bit field over
+/// the *global* chunk index and there is no separate table variable.
+///
+/// The fix is the union layer's own trick — aligned addressing instead of an
+/// extra variable. A table occupying the aligned block
+/// `[col_offset, col_offset + 2^log_width)` splits the global column as
+/// `global = (col_offset >> log_width)·2^log_width + within`, so
+///
+/// ```text
+///   eq(z_col, global) = eq(z_col[..lw], within) · eq(z_col[lw..], col_offset >> lw)
+/// ```
+///
+/// — the low coordinates feed the branching program's `col` slot and the high
+/// ones become a known scalar selecting the table. Tables of differing widths
+/// coexist, exactly as registry slots of differing `κ_t` do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AlignedTable {
+    pub log_width: u32,
+    pub height: u64,
+    /// First global column; must be a multiple of `2^log_width`.
+    pub col_offset: u64,
+}
+
+/// Aligned-table configuration over a global column index of `k_cols` bits.
+#[derive(Clone, Debug)]
+pub struct AlignedParams {
+    pub n: usize,
+    pub k_cols: usize,
+    pub m: usize,
+    pub tables: Vec<AlignedTable>,
+    /// Dense start of each table, length `tables.len() + 1`.
+    pub prefix_sums: Vec<u64>,
+}
+
+impl AlignedParams {
+    pub fn new(tables: Vec<AlignedTable>, n: usize, k_cols: usize, m: usize) -> Self {
+        let mut prefix_sums = Vec::with_capacity(tables.len() + 1);
+        let mut acc = 0u64;
+        prefix_sums.push(0);
+        for t in &tables {
+            assert!(
+                t.col_offset.is_multiple_of(1u64 << t.log_width),
+                "table at {} is not {}-aligned",
+                t.col_offset,
+                1u64 << t.log_width
+            );
+            assert!(
+                t.col_offset + (1u64 << t.log_width) <= 1u64 << k_cols,
+                "table exceeds the global column space"
+            );
+            assert!(t.height <= 1u64 << n, "table height exceeds 2^n");
+            acc += (1u64 << t.log_width) * t.height;
+            prefix_sums.push(acc);
+        }
+        assert!(acc <= 1u64 << m, "dense area {acc} exceeds 2^{m}");
+        Self {
+            n,
+            k_cols,
+            m,
+            tables,
+            prefix_sums,
+        }
+    }
+
+    pub fn area(&self) -> u64 {
+        *self.prefix_sums.last().unwrap()
+    }
+
+    /// `i ↦ (global_col, row)` — the **row-major-within-table** bijection that
+    /// `UnionInstance::compact_witness_row_major` writes.
+    pub fn unrank(&self, i: u64) -> (u64, u64) {
+        debug_assert!(i < self.area());
+        let t = self.prefix_sums.partition_point(|&s| s <= i) - 1;
+        let tab = &self.tables[t];
+        let off = i - self.prefix_sums[t];
+        let w = 1u64 << tab.log_width;
+        (tab.col_offset + (off % w), off / w)
+    }
+}
+
+/// `f̂(z_row, z_col, z_index)` for an aligned-table configuration:
+///
+/// ```text
+///   Σ_tables eq(z_col[lw..], col_offset >> lw)
+///            · ĝ_{lw}(z_row, z_col[..lw], z_index, t_prev, t_next)
+/// ```
+///
+/// Cost `O(#tables · m)` against basic jagged's `O(#columns · m)`.
+pub fn f_hat_aligned(
+    params: &AlignedParams,
+    z_row: &[F128],
+    z_col: &[F128],
+    z_index: &[F128],
+) -> F128 {
+    assert_eq!(z_row.len(), params.n, "z_row must span the row vars");
+    assert_eq!(
+        z_col.len(),
+        params.k_cols,
+        "z_col must span the column vars"
+    );
+    assert_eq!(z_index.len(), params.m, "z_index must span the dense vars");
+    let mut acc = F128::ZERO;
+    for (t, tab) in params.tables.iter().enumerate() {
+        if tab.height == 0 {
+            continue;
+        }
+        let lw = tab.log_width as usize;
+        // High coordinates select this aligned block; a known scalar.
+        let mut sel = F128::ONE;
+        let prefix = tab.col_offset >> lw;
+        for (b, &zc) in z_col[lw..].iter().enumerate() {
+            sel *= if (prefix >> b) & 1 == 1 {
+                zc
+            } else {
+                F128::ONE + zc
+            };
+        }
+        if sel.is_zero() {
+            continue;
+        }
+        acc += sel
+            * g_hat(
+                z_row,
+                &z_col[..lw],
+                z_index,
+                params.m,
+                lw,
+                params.prefix_sums[t],
+                params.prefix_sums[t + 1],
+            );
+    }
+    acc
+}
+
+/// The untwisted weight over the dense cube for the **row-major** stack —
+/// `W[d] = eq(z_row, row(d))·eq(z_col, col(d))`, zero past the area.
+///
+/// The row-major mirror of `jagged::build_merged_weight_and_prime`'s inner
+/// loop: that one hoists `eq_col` and walks rows, this hoists `eq_row` and
+/// walks columns, because a run of `2^lw` consecutive dense indices now shares
+/// a row instead of a column.
+pub fn build_weight_row_major(
+    params: &AlignedParams,
+    z_row: &[F128],
+    z_col: &[F128],
+    out: &mut [F128],
+) {
+    assert_eq!(out.len(), 1usize << params.m);
+    let eq_r = build_eq_table(z_row);
+    let eq_c = build_eq_table(z_col);
+    out.fill(F128::ZERO);
+    for (t, tab) in params.tables.iter().enumerate() {
+        let w = 1usize << tab.log_width;
+        let base = params.prefix_sums[t] as usize;
+        for row in 0..tab.height as usize {
+            let r = eq_r[row];
+            let dst = &mut out[base + row * w..base + (row + 1) * w];
+            let cols = &eq_c[tab.col_offset as usize..tab.col_offset as usize + w];
+            for (slot, &c) in dst.iter_mut().zip(cols) {
+                *slot = r * c;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,5 +772,172 @@ mod tests {
         let sum_log: u32 = p.log_widths[..p.live_tables()].iter().sum();
         assert_eq!(sum_log, 48);
         assert_eq!(p.area(), 3_325 * (1 << 10));
+    }
+
+    // -----------------------------------------------------------------------
+    // Aligned tables, and the tie-in to `compact_witness_row_major`
+    // -----------------------------------------------------------------------
+
+    /// `f̂_aligned` at a random field point must equal the honest MLE of the
+    /// row-major bijection's indicator, brute-forced over the whole cube.
+    #[test]
+    fn aligned_field_point_matches_brute_force() {
+        // Two aligned tables of differing width over a 3-bit column index:
+        // [0,4) at height 3, then [4,6) at height 2. Area 4·3 + 2·2 = 16.
+        let p = AlignedParams::new(
+            vec![
+                AlignedTable {
+                    log_width: 2,
+                    height: 3,
+                    col_offset: 0,
+                },
+                AlignedTable {
+                    log_width: 1,
+                    height: 2,
+                    col_offset: 4,
+                },
+            ],
+            2,
+            3,
+            5,
+        );
+        assert_eq!(p.area(), 16);
+
+        let mut rng = Rng(0x_A116_9ED0);
+        for trial in 0..4 {
+            let z_row = rng.vec(p.n);
+            let z_col = rng.vec(p.k_cols);
+            let z_idx = rng.vec(p.m);
+            let got = f_hat_aligned(&p, &z_row, &z_col, &z_idx);
+
+            let (er, ec, ei) = (
+                build_eq_table(&z_row),
+                build_eq_table(&z_col),
+                build_eq_table(&z_idx),
+            );
+            let mut want = F128::ZERO;
+            for i in 0..p.area() {
+                let (col, row) = p.unrank(i);
+                want += er[row as usize] * ec[col as usize] * ei[i as usize];
+            }
+            assert_eq!(got, want, "trial {trial}");
+        }
+    }
+
+    /// `build_weight_row_major` must be the boolean table whose MLE
+    /// `f̂_aligned` computes — i.e. folding it at `ρ` gives `f̂_aligned(…, ρ)`.
+    #[test]
+    fn row_major_weight_folds_to_f_hat() {
+        let p = AlignedParams::new(
+            vec![
+                AlignedTable {
+                    log_width: 2,
+                    height: 3,
+                    col_offset: 0,
+                },
+                AlignedTable {
+                    log_width: 1,
+                    height: 2,
+                    col_offset: 4,
+                },
+            ],
+            2,
+            3,
+            5,
+        );
+        let mut rng = Rng(0x_0DD_F01D);
+        let z_row = rng.vec(p.n);
+        let z_col = rng.vec(p.k_cols);
+        let rho = rng.vec(p.m);
+
+        let mut w = vec![F128::ZERO; 1usize << p.m];
+        build_weight_row_major(&p, &z_row, &z_col, &mut w);
+
+        // Σ_d eq(ρ,d)·W[d] must equal f̂_aligned at ρ.
+        let eq_rho = build_eq_table(&rho);
+        let mut folded = F128::ZERO;
+        for (d, &wd) in w.iter().enumerate() {
+            folded += eq_rho[d] * wd;
+        }
+        assert_eq!(folded, f_hat_aligned(&p, &z_row, &z_col, &rho));
+    }
+
+    /// **The tie-in.** With `q` produced by
+    /// `UnionInstance::compact_witness_row_major`, the aligned-table
+    /// configuration must satisfy the jagged reduction against the real union
+    /// geometry: `Σ_d q[d]·W[d] = p̂(z_row, z_col)`, where `p̂` is evaluated
+    /// directly on the padded witness. This is what says the kernel and the
+    /// compaction agree on the same bijection.
+    #[test]
+    fn reduction_holds_against_compact_witness_row_major() {
+        use crate::r1cs::SparseBinaryMatrix;
+        use crate::schedule::{Registry, TableClass, TableType};
+        use crate::union::UnionInstance;
+
+        let stub = || SparseBinaryMatrix {
+            num_rows: 0,
+            num_cols: 0,
+            rows: Vec::new(),
+        };
+        let ty = |k_log: usize, useful_bits: usize| TableType {
+            k_log,
+            useful_bits,
+            a_0: stub(),
+            b_0: stub(),
+            c_0: stub(),
+            const_pin: None,
+            class: TableClass::Boolean,
+        };
+        let nu = 3usize;
+        // ONE slot, its columns padded to the full power-of-two width so the
+        // whole slot is a single aligned table — free here, since the dense
+        // area already rounds up to that.
+        let reg = Registry::new(vec![ty(10, 8 * 128)], nu);
+        let union = UnionInstance::new(&reg, vec![1 << nu]);
+        let n_cols = 1usize << (10 - 7); // 8 chunk-columns
+        let nt = 1u64 << nu;
+
+        let mut rng = Rng(0x_C0FF_EE01);
+        let mut padded = vec![F128::ZERO; union.packed_len()];
+        for col in 0..n_cols {
+            for row in 0..nt as usize {
+                padded[(col << nu) + row] = rng.next();
+            }
+        }
+        let q = union.compact_witness_row_major(&padded);
+        let dense_log = union.committed_words().trailing_zeros() as usize;
+
+        let p = AlignedParams::new(
+            vec![AlignedTable {
+                log_width: (10 - 7) as u32,
+                height: nt,
+                col_offset: 0,
+            }],
+            nu,
+            10 - 7,
+            dense_log,
+        );
+        assert_eq!(p.area(), (n_cols as u64) * nt);
+
+        let z_row = rng.vec(nu);
+        let z_col = rng.vec(10 - 7);
+
+        // Left: p̂ read straight off the padded witness at (z_row, z_col).
+        let (er, ec) = (build_eq_table(&z_row), build_eq_table(&z_col));
+        let mut lhs = F128::ZERO;
+        for col in 0..n_cols {
+            for row in 0..nt as usize {
+                lhs += er[row] * ec[col] * padded[(col << nu) + row];
+            }
+        }
+
+        // Right: Σ_d q[d]·W[d] on the row-major stack.
+        let mut w = vec![F128::ZERO; 1usize << dense_log];
+        build_weight_row_major(&p, &z_row, &z_col, &mut w);
+        let mut rhs = F128::ZERO;
+        for (d, &wd) in w.iter().enumerate() {
+            rhs += q[d] * wd;
+        }
+        assert_eq!(lhs, rhs, "row-major jagged reduction failed");
     }
 }

@@ -146,12 +146,58 @@ permutation test alone would not catch two rows being swapped;
 `row_major_is_a_permutation_of_column_major` (same multiset, same pad tail,
 genuinely a different order); and the `#[ignore]`d `row_major_transpose_cost`.
 
+**The aligned-table adaptation, and the weight builder.** One thing §6 does not
+give us: it hands tables their own `tab ∈ {0,1}^k` variable, but flock's claims
+have no such variable — the ring-switch claim point splits as `[row | chunk]`
+over the padded witness's BatchMajor address, so `z_col` is a single
+`k_cols`-bit field over the *global* chunk index. Reading `open_batch_merged`
+made that concrete (`z_col = &x[1 + n_log..]`).
+
+The fix is the union layer's own trick, aligned addressing instead of an extra
+variable. A table on the aligned block `[off, off + 2^lw)` splits the global
+column as `global = (off >> lw)·2^lw + within`, so
+
+```
+eq(z_col, global) = eq(z_col[..lw], within) · eq(z_col[lw..], off >> lw)
+```
+
+— low coordinates feed the BP's `col` slot, high ones become a known scalar
+selecting the table. Tables of differing widths coexist, exactly as registry
+slots of differing κ_t do. `AlignedParams` / `AlignedTable` / `f_hat_aligned`.
+
+Also landed: `build_weight_row_major`, the row-major mirror of
+`jagged::build_merged_weight_and_prime`'s inner loop — that one hoists `eq_col`
+and walks rows; this hoists `eq_row` and walks columns, because a run of `2^lw`
+consecutive dense indices now shares a row instead of a column.
+
+Tests: `aligned_field_point_matches_brute_force` (two tables of differing width,
+field point vs brute-force MLE); `row_major_weight_folds_to_f_hat` (folding the
+weight at ρ gives `f_hat_aligned` at ρ); and the tie-in,
+**`reduction_holds_against_compact_witness_row_major`** — with `q` from the real
+`UnionInstance::compact_witness_row_major`, `Σ_d q[d]·W[d] = p̂(z_row, z_col)`
+read straight off the padded witness. That is the test saying the kernel and the
+compaction agree on one bijection.
+
+**A geometry note worth knowing.** Padding a slot's `used_cols` up to the full
+power-of-two width makes the whole slot ONE aligned table — no decomposition, no
+prefix selection, `k_cols` coordinates all going to `col`. At depth 26 that is
+**free**: `dense_words` = 3,325·1024 = 3,404,800 already rounds to
+`committed_words` = 2^22 = 4,194,304, so the 19% we would "add" is padding the
+commitment already carries. Free whenever `n_t` is a power of two; for partial
+counts the power-of-two rounding absorbs most of it.
+
 **Still not wired.** What remains is the consumer side: `build_merged_weight_and_prime`
-must switch to the row-major bijection (symmetric change — hoist `eq_r[row]`
-and walk columns, where today it hoists `eq_c[col]` and walks rows), the
-configuration must replace `col_prefix_sums`, and `verify_batch_merged` must
-evaluate `Ŵ(ρ)` through `f_hat_fancy` instead of delegating to the assist.
-`commit` and the eq-basis opening of `q̂(ρ)` are layout-agnostic.
+must switch to `build_weight_row_major` (Φ-twisted, per claim, fused with the
+round-0 prime as today), `open_batch_merged` must take the row-major `q`,
+`verify_batch_merged` must evaluate `Ŵ(ρ)` as `Σ_j c_j·f_hat_aligned(z^{2^j}, ρ)`
+instead of delegating, and `MergedOpenProof.frobenius` goes away. `commit` and
+the eq-basis opening of `q̂(ρ)` are layout-agnostic.
+
+These cannot be split across commits — the weight and the verifier's evaluation
+must agree on the bijection, so any intermediate state is broken. And it is a
+**transcript change**: it will invalidate `union_m6_fixtures`' pinned bundle
+digests, which exist as deliberate anchors. Regenerating them
+(`M6_FIXTURES_PRINT=1`) is a decision to make knowingly, not a side effect.
 
 ## Tried and reverted: the rectangular fast path (commit 2009aff, reverted)
 
