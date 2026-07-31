@@ -1154,8 +1154,22 @@ fn verify_union_piops<Ch: Challenger>(
         // packed-direct intake the element claims ride.
         if let UnionVerifyBinding::Circuit { circuit, public } = binding {
             let proof = wiring.ok_or(VerifyError::CircuitMismatch)?;
+            #[cfg(feature = "mul-count")]
+            let wiring_start = crate::field::gf2_128::op_count::snapshot();
             let gather = crate::circuit::verify_wiring(circuit, public, proof, challenger)
                 .map_err(VerifyError::Wiring)?;
+            #[cfg(feature = "mul-count")]
+            if std::env::var("MUL_TRACE").is_ok() {
+                let e = crate::field::gf2_128::op_count::snapshot();
+                let invs = e.invs - wiring_start.invs;
+                let muls = (e.native_muls - wiring_start.native_muls)
+                    .saturating_sub(invs * crate::field::gf2_128::op_count::MULS_PER_INV);
+                println!(
+                    "  [mul] wiring GKR (grand product + sigma):             \
+                     {muls:>8} muls {invs:>5} invs = {:>8} constraints",
+                    muls + invs
+                );
+            }
             packed_direct.extend(gather);
         }
 
