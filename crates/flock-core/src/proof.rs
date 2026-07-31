@@ -62,6 +62,21 @@ pub struct R1csProofMixedClassLigerito {
     pub pcs_open: pcs::BatchOpeningProofJaggedLigerito,
 }
 
+/// A **mixed-class** union proof over the MERGED (Frobenius) transport —
+/// [`R1csProofMixedClassLigerito`]'s counterpart on the shipped, capacity-free
+/// path.
+///
+/// Identical PIOP content; only the opening differs. The element class's two
+/// claims ride as packed-direct claims, which the merged transport carries by
+/// expressing each as the `F₂`-linear map `x ↦ γ·x` — indistinguishable, to
+/// its weight builder, from a ring-switched claim's Φ-fold.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct R1csProofMixedClassMerged {
+    pub boolean: Option<BooleanPiopProof>,
+    pub element: Option<crate::element_r1cs::union::Proof>,
+    pub pcs_open: pcs::MergedOpenProof,
+}
+
 /// The boolean class's two PIOP sub-proofs, as they appear inside
 /// [`R1csProofMixedClassLigerito`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

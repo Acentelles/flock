@@ -505,6 +505,7 @@ pub fn verify_ligerito_jagged_union_merged<Ch: Challenger>(
                 &values,
                 &z_skips,
                 &x_refs,
+                &[],
                 &heights,
                 union.n_log(),
                 &proof.pcs_open,
@@ -626,6 +627,88 @@ fn mixed_class_inner<Ch: Challenger>(
     )
     .map_err(VerifyError::PcsJagged)?;
     Ok((claims, matrix))
+}
+
+/// [`verify_ligerito_jagged_union_mixed_class`] over the MERGED transport.
+///
+/// Same statement, same PIOP replay; only the opening differs. The element
+/// class's two claims ride as packed-direct claims, which the merged
+/// transport carries by expressing each weight as the `F₂`-linear map
+/// `x ↦ γ·x` — indistinguishable, to its per-claim weight builder, from a
+/// ring-switched claim's Φ-fold.
+pub fn verify_ligerito_jagged_union_mixed_class_merged<Ch: Challenger>(
+    union: &crate::union::UnionInstance<'_>,
+    circuits: &[&dyn lincheck::LincheckCircuit],
+    commitment: &Commitment,
+    proof: &crate::proof::R1csProofMixedClassMerged,
+    pcs_params: &crate::pcs::PcsParams,
+    challenger: &mut Ch,
+) -> Result<crate::proof::UnionClassClaims, VerifyError> {
+    if proof.boolean.is_some() != (union.num_boolean() > 0)
+        || proof.element.is_some() != union.has_element()
+    {
+        return Err(VerifyError::ClassMismatch);
+    }
+    let (claims, packed_direct_points) = verify_union_piops(
+        union,
+        UnionVerifyBinding::Mixed,
+        circuits,
+        commitment,
+        proof.boolean.as_ref(),
+        proof.element.as_ref(),
+        pcs_params,
+        challenger,
+    )?;
+
+    // Same construction as the boolean-only merged verifier: the PCS point
+    // is `x_inner_rest ‖ x_outer`, with the skip coordinate carried
+    // separately in `z_skip`.
+    let cl: Vec<ZClaim> = match &claims.boolean {
+        Some(c) => vec![c.ab.clone(), c.c.clone()],
+        None => Vec::new(),
+    };
+    let values: Vec<F128> = cl.iter().map(|z| z.value).collect();
+    let z_skips: Vec<F128> = cl.iter().map(|z| z.point.z_skip).collect();
+    let x_fulls: Vec<Vec<F128>> = cl
+        .iter()
+        .map(|z| {
+            let mut v = z.point.x_inner_rest.clone();
+            v.extend_from_slice(&z.point.x_outer);
+            v
+        })
+        .collect();
+    let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
+    let pd: Vec<pcs::PackedDirectClaimRef<'_>> = packed_direct_points
+        .iter()
+        .map(|(point, value)| pcs::PackedDirectClaimRef {
+            point,
+            value: *value,
+        })
+        .collect();
+    let log_n = pcs_params.m - pcs::LOG_PACKING;
+    let lig_v_config = crate::pcs::ligerito::verifier_config_for(
+        log_n,
+        pcs_params.log_batch_size,
+        pcs_params.profile,
+    )
+    .expect("Ligerito default verifier config");
+    verifier_pool()
+        .install(|| {
+            pcs::verify_batch_merged(
+                commitment,
+                &values,
+                &z_skips,
+                &x_refs,
+                &pd,
+                &union.jagged_heights(),
+                union.n_log(),
+                &proof.pcs_open,
+                &lig_v_config,
+                challenger,
+            )
+        })
+        .map_err(VerifyError::PcsJagged)?;
+    Ok(claims)
 }
 
 /// Shared PIOP replay for both union verify shapes: statement binding, the
