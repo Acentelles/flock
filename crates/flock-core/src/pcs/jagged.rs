@@ -5053,6 +5053,94 @@ mod tests {
         );
     }
 
+    /// The two assist entries at ONE shape, so their prover costs are
+    /// comparable: the single-statement [`prove_assist`] against the
+    /// `128·K`-statement [`prove_frobenius_assist`] that the ring-switched
+    /// union path actually runs. The shape is the L0-opening union's
+    /// (`k=12` columns, `n_t=218` rows, `m=20`).
+    ///
+    /// `cargo test --release pcs::jagged::tests::assist_single_vs_frobenius
+    /// -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn assist_single_vs_frobenius() {
+        use std::time::Instant;
+
+        let _ = crate::init_perf_thread_pool();
+        let (n, k, m) = (8usize, 12usize, 20usize);
+        let (used, height) = (3709usize, 218u64);
+        let mut heights = vec![0u64; 1usize << k];
+        for h in &mut heights[..used] {
+            *h = height;
+        }
+        let params = JaggedParams::from_heights(&heights, n, m);
+
+        let mut rc = RandomChallenger::new(0xF20B_1005);
+        let z_row = sample_vec(&mut rc, n);
+        let z_col = sample_vec(&mut rc, k);
+        let z_idx = sample_vec(&mut rc, m);
+
+        // Single statement (no ring switching): one boundary-program walk.
+        let reps = 5;
+        let mut t_single = f64::INFINITY;
+        for _ in 0..reps {
+            let t = Instant::now();
+            let mut ch = FsChallenger::new(b"flock-assist-cmp");
+            let p = prove_assist(&params, &z_row, &z_col, &z_idx, &mut ch);
+            std::hint::black_box(&p);
+            t_single = t_single.min(t.elapsed().as_secs_f64());
+        }
+
+        // The ring-switched path: K claims, each carrying 128 linearized
+        // coefficients, so 128·K statements share one sumcheck.
+        let k_claims = 2usize;
+        let claims_data: Vec<(Vec<F128>, Vec<F128>, Vec<F128>)> = (0..k_claims)
+            .map(|_| {
+                (
+                    sample_vec(&mut rc, n),
+                    sample_vec(&mut rc, k),
+                    sample_vec(&mut rc, 128),
+                )
+            })
+            .collect();
+        let claims: Vec<FrobeniusClaim<'_>> = claims_data
+            .iter()
+            .map(|(zr, zc, c)| FrobeniusClaim {
+                z_row: zr,
+                z_col: zc,
+                coeffs: c,
+            })
+            .collect();
+        let rho = sample_vec(&mut rc, m);
+        let mut t_frob = f64::INFINITY;
+        for _ in 0..reps {
+            let t = Instant::now();
+            let mut ch = FsChallenger::new(b"flock-assist-cmp");
+            let p = prove_frobenius_assist(&params, &claims, &rho, &mut ch);
+            std::hint::black_box(&p);
+            t_frob = t_frob.min(t.elapsed().as_secs_f64());
+        }
+
+        let n_stmt = 128 * k_claims;
+        eprintln!(
+            "  shape: {used} live columns of height {height}, m={m}, {} rounds",
+            2 * (m + 1)
+        );
+        eprintln!(
+            "  jagged assist    (1 statement)    : {:>8.2} ms",
+            t_single * 1e3
+        );
+        eprintln!(
+            "  frobenius assist ({n_stmt} statements) : {:>8.2} ms",
+            t_frob * 1e3
+        );
+        eprintln!(
+            "  ratio: {:.1}x for {n_stmt}x the statements ({:.2} ms marginal per statement)",
+            t_frob / t_single,
+            (t_frob - t_single) * 1e3 / n_stmt as f64
+        );
+    }
+
     /// Diagnose the sumcheck's ~4× parallel scaling: is it the memory-bandwidth
     /// ceiling, or fine-grained-kernel inefficiency? Compares a memcpy baseline,
     /// fold and reduction kernels, each fine-grained (current style) vs
