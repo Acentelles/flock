@@ -784,21 +784,34 @@ map and the multi-table document.
         the verifier would be written against, so choosing gate granularity
         and choosing the abstraction are one decision.
 
-        Granularity should be \emph{macro}, not add/mul, and there is now a
-        concrete reason rather than an aesthetic one. $\varphi_8$ is a field
-        homomorphism, so the interpolation node set
-        $V = \varphi_8(\{0..2^m-1\})$ is an $\Ftwo$-subspace and its vanishing
-        polynomial $Z_V(X) = \prod_{s \in V}(X+s)$ is \emph{linearized}
-        (verified: \code{phi8\_node\_sets\_have\_linearized\_vanishing\_polynomials}).
+        \settled{Ron} \textbf{Do not fuse: the gate inventory stays at
+        \emph{tier 0}} (\code{mult} + \code{linear}, which
+        \code{ElementTableBuilder} already provides, so everything above
+        decomposes with no new table type). The profile this question was
+        waiting on now exists and says the cells are not there: per the
+        taxonomy in \S\ref{sec:intro}, hashing is 78--98\% of the circuit
+        against $\sim$46k multiplications, so fusing would shave cell count
+        inside $\sim$12\% of the trace. The operation list survives as the
+        \code{Arith} \emph{API} scoping --- what must become backend-generic
+        --- and its granularity is set by \emph{native} throughput (the
+        $\sim$1.4\,ms opening's blocked and parallel loops), not by circuit
+        cost. Two lists, not one.
+
+        A worked example of the cost asymmetry, kept because the rule
+        generalizes: $\varphi_8$ is a field homomorphism, so the interpolation
+        node set $V = \varphi_8(\{0..2^m-1\})$ is an $\Ftwo$-subspace and its
+        vanishing polynomial $Z_V(X) = \prod_{s \in V}(X+s)$ is
+        \emph{linearized} (verified:
+        \code{phi8\_node\_sets\_have\_linearized\_vanishing\_polynomials}).
         Hence $L_i(z) = Z_V(z) / ((z + \varphi_8(i))\cdot d_i)$ with $d_i$
         constant --- one additive map and one inverse in place of an
-        $O(\ell^2)$ product. At $\ell = 64$ the combined interpolation's
-        $\sim$16k multiplications become $\sim$128, and $Z_V$ being
-        $\Ftwo$-linear makes it \emph{free in the boolean class}. Natively the
-        naive product is sub-millisecond and not worth changing; in-circuit
-        the difference is decisive. At add/mul granularity the saving is
-        unreachable, because the circuit would be forced to trace whichever
-        loop the native code happens to use.
+        $O(\ell^2)$ product, collapsing $\sim$20k of the $\sim$46k
+        multiplications, and $Z_V$ being $\Ftwo$-linear makes it \emph{free in
+        the boolean class}. The right response is to fix the \emph{native}
+        implementation, after which a tier-0 backend traces the good algorithm
+        with no abstraction hiding the choice. The rule: an implementation
+        being sub-millisecond and one-time natively says nothing about its
+        shape when arithmetised.
   \item Sub-word gate parameters (BLAKE3 counters/flags): per-type pinning
         vs.\ public constant words --- decide when the BLAKE3 circuit gate
         is specified.
