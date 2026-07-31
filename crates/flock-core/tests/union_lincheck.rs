@@ -633,3 +633,101 @@ fn deferred_lincheck_matches_and_defers_the_matrix_work() {
         "the assertion is what must catch it"
     );
 }
+
+/// The bridge between the two halves of the accumulation route: a real
+/// `MatrixAssertion` decomposes into per-matrix claims that `matrix_fold`
+/// can fold.
+///
+/// The decomposition is the load-bearing algebra. For a single boolean type
+/// filling the region, `fold_alpha_batched`'s contract
+/// `comb[c] = α·Σ_{r∈colA(c)} eq_inner[r] + Σ_{r∈colB(c)} eq_inner[r]`
+/// and the closed-form collapse give
+///
+/// ```text
+///   target = α·⟨W_row⊗W_col, A₀⟩ + ⟨W_row⊗W_col, B₀⟩ + β·W_col[pin]
+/// ```
+///
+/// with `W_row = λ(z_skip) ⊗ eq(x_inner_rest)` and `W_col = z_partial ⊗ eq(rr)`
+/// — exactly `matrix_fold::Weight`'s shape. Pinning this is what says the
+/// verifier's matrix work really is two evaluations of two *static* matrices,
+/// which is what makes accumulating them (rather than delegating, or paying
+/// them in-circuit) sound. It also shows why A and B stay separate claims:
+/// only their α-combination appears in the target, and α is per-proof.
+#[test]
+fn matrix_assertion_decomposes_into_foldable_claims() {
+    use flock_core::matrix_fold::{self, MatrixClaim, Weight};
+
+    let nu = 4usize;
+    let slot = build_slot(9, 300, nu, 11, Some(0), 0xF0_0D_01);
+    let registry = Registry::new(vec![table_type(&slot)], nu);
+    let m = registry.m_total();
+    let union = UnionInstance::new(&registry, vec![slot.n]);
+
+    let mut z_addr = vec![false; 1 << m];
+    let mut a_addr = vec![false; 1 << m];
+    let mut b_addr = vec![false; 1 << m];
+    place_addr(&mut z_addr, &slot.z_sem, slot.k_log, nu, registry.slots()[0].offset);
+    place_addr(&mut a_addr, &slot.a_sem, slot.k_log, nu, registry.slots()[0].offset);
+    place_addr(&mut b_addr, &slot.b_sem, slot.k_log, nu, registry.slots()[0].offset);
+    let c_addr: Vec<bool> = a_addr.iter().zip(&b_addr).map(|(x, y)| *x & *y).collect();
+    let (a_p, b_p, c_p) = (pack_bits(&a_addr), pack_bits(&b_addr), pack_bits(&c_addr));
+
+    let stripe = pack_z_lincheck(&slot.z_sem, nu + slot.k_log, slot.k_log);
+    let circ = SparseMatrixCircuit::new(&slot.a0, &slot.b0).with_const_pin(slot.pin);
+    let mut ch_p = FsChallenger::new(DOMAIN);
+    let (zc_proof, zc_claim) =
+        zerocheck::prove_packed_padded(&a_p, &b_p, &c_p, m, &union.padding_spec(), &mut ch_p);
+    let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
+    let lc_slots = [UnionLincheckSlot { z_lincheck: &stripe, circuit: &circ }];
+    let (lc_proof, _claim, _g) =
+        lincheck::prove_union_capture_z_vec(&union, &lc_slots, &x_ab, &mut ch_p);
+
+    let circuits: Vec<&dyn LincheckCircuit> = vec![&circ];
+    let mut ch_v = FsChallenger::new(DOMAIN);
+    let zc = zerocheck::verify(m, &zc_proof, &mut ch_v).expect("zerocheck accepts");
+    let x = union.x_ab_from_mlv(zc.z, &zc.mlv_challenges);
+    let (_, assertion) = lincheck::verify_union_deferred(
+        &union, &circuits, &x, zc.a_eval, zc.b_eval, &lc_proof, &mut ch_v,
+    )
+    .expect("deferred verify accepts");
+    assert!(assertion.check(&union, &circuits).is_ok(), "assertion is honest");
+
+    // ---- Decompose into the two per-matrix claims.
+    let inner = slot.k_log - K_SKIP;
+    let row = Weight::low_eq(
+        lagrange_weights_naive(K_SKIP, assertion.z_skip),
+        assertion.x_inner_rest[..inner].to_vec(),
+    );
+    let col = Weight::low_eq(assertion.z_partial.clone(), assertion.rr.clone());
+    assert_eq!(row.n_vars(), slot.k_log, "row weight spans the block");
+    assert_eq!(col.n_vars(), slot.k_log, "column weight spans the block");
+
+    let claim_a = MatrixClaim::honest(row.clone(), col.clone(), &slot.a0);
+    let claim_b = MatrixClaim::honest(row, col.clone(), &slot.b0);
+    let beta = assertion.betas[0].expect("this slot is pinned");
+    let pin_term = beta * col.materialize()[slot.pin.unwrap()];
+
+    assert_eq!(
+        assertion.alpha * claim_a.value + claim_b.value + pin_term,
+        assertion.target,
+        "the assertion must decompose as α·⟨W,A⟩ + ⟨W,B⟩ + β·W_col[pin]"
+    );
+
+    // ---- And the claims fold. A second honest claim about the SAME matrix
+    // stands in for a second proof's claim; folding is over one matrix, which
+    // is why A and B get their own accumulators.
+    let other = MatrixClaim::honest(
+        Weight::eq((0..slot.k_log).map(|i| F128::new(0x51 + i as u64, 7)).collect()),
+        Weight::eq((0..slot.k_log).map(|i| F128::new(0x77 + i as u64, 3)).collect()),
+        &slot.a0,
+    );
+    let pair = [claim_a, other];
+    let mut ch = FsChallenger::new(b"fold");
+    let (fold_proof, _) = matrix_fold::prove_fold(&slot.a0, &pair, &mut ch);
+    let mut chv = FsChallenger::new(b"fold");
+    let acc = matrix_fold::verify_fold(&pair, &fold_proof, &mut chv).expect("fold verifies");
+    assert!(
+        acc.check_direct(&slot.a0),
+        "the accumulated claim must discharge against the real base matrix"
+    );
+}

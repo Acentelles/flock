@@ -23,6 +23,7 @@ pub mod element_r1cs;
 pub mod field;
 pub mod hash;
 pub mod lincheck;
+pub mod matrix_fold;
 pub mod merkle;
 pub mod ntt;
 pub mod pcs;
