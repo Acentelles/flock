@@ -399,6 +399,63 @@ inter-class space of Remark~\ref{rem:dead}; the cell space pays per
 per-slot data is tiny: $2^c$ coefficients $\eq(\rho_\iota, \iota)$ and
 each $\iota$'s constant (prefix, column) pair from the registry.
 
+\subsection{Re-absorbing squeezed output}\label{sec:reabsorb}
+
+\code{FsChallenger} absorbs each challenge back into the transcript after
+squeezing it. \textbf{That is redundant}, and dropping it is worth 26\% of the
+FS chain. Analysed here; \emph{not yet taken}, because it is a change to
+Fiat--Shamir and deserves to be a decision rather than an edit.
+
+\paragraph{The argument.} Fiat--Shamir needs two things: every challenge is a
+deterministic function of everything absorbed before it, and everything
+absorbed afterwards binds to it. Write $S_k$ for the state after the $k$-th
+squeeze's \emph{header} is absorbed, so $c_k = \mathrm{XOF}(S_k)$. The first
+property holds by construction. The second holds because $c_k$ is
+\emph{determined by} $S_k$: a later message is absorbed into a state derived
+from $S_k$, so binding to the transcript-so-far already binds to $c_k$.
+Re-absorbing contributes $\mathrm{absorb}(S_k, f(S_k))$, which is another
+deterministic function of $S_k$ alone --- no entropy enters, and no binding is
+added that the state did not already carry.
+
+\paragraph{What is actually required} is that the state \emph{advance} between
+squeezes; otherwise two consecutive \code{sample\_f128} calls would return the
+same value, the state being unchanged. The squeeze header supplies that, since
+it is absorbed before the squeeze. The re-absorb is belt-and-braces on a
+mechanism already sufficient.
+
+\paragraph{Provenance.} The pattern is Merlin/STROBE's, where squeezing
+\emph{mutates} the state because absorb and squeeze are one operation on the
+rate. \code{FsChallenger} uses BLAKE3 as a hash, so \code{finalize\_xof} runs
+on a clone and mutates nothing; re-absorbing emulates the sponge. Given the
+header absorb, the emulation is unnecessary.
+
+\paragraph{Measured} on the element transcript
+(\code{TranscriptShape::blake3\_inventory}, and the model in
+\code{tests/transcript\_shape.rs}):
+
+\begin{center}
+\begin{tabular}{lrrrrrr}
+ & absorbed B & absorb & parents & finalize blk & finalize par & \textbf{rows} \\
+\hline
+as shipped        & 16{,}960 & 265 & 15 & 108 & 208 & \textbf{698} \\
+without re-absorb &  8{,}752 & 136 &  7 & 108 & 162 & \textbf{515} \\
+\end{tabular}
+\end{center}
+
+\noindent
+Absorbed bytes nearly halve, because squeezed output was half the stream. Rows
+fall only 26\%: the finalize \emph{count} is fixed by the protocol, and only
+the stack depth shrinks. It also removes the circuit's one circular wire ---
+the re-absorbed challenge, taken from the ROOT row that derived it
+(\S\ref{sec:builder}) --- after which every \code{m} word is a transcript value
+or a constant.
+
+\paragraph{The caveat, which is unchanged either way.} Both encodings reveal
+$\mathrm{XOF}(S)$ and then keep absorbing into $S$, so both rest on that
+leaking nothing useful about future challenges. Removing the re-absorb neither
+weakens nor strengthens this; it is the duplex assumption, and it should be
+stated wherever the FS transcript's security is written down.
+
 \subsection{Describing circuits: the builder}\label{sec:builder}
 
 \settled{Ron} Circuits are described by a \textbf{builder}, not by

@@ -28,7 +28,7 @@
 use flock_core::element_r1cs::{ElementTableBuilder, ElementTableType};
 use flock_core::field::F128;
 use flock_core::pcs::ligerito::LigeritoProfile;
-use flock_core::transcript_record::RecordingChallenger;
+use flock_core::transcript_record::{RecordingChallenger, TranscriptOp, TranscriptShape};
 use flock_prover::challenger::FsChallenger;
 use flock_prover::pcs::PcsParams;
 use flock_prover::prover::{self, UnionElementSlotInput};
@@ -97,6 +97,46 @@ fn union_pcs_params(union: &UnionInstance<'_>) -> PcsParams {
         num_lanes: union.commit_lanes(6),
         merkle_hash: Default::default(),
     }
+}
+
+/// What the FS chain would cost if a squeeze's output were **not re-absorbed**.
+///
+/// The challenge is a deterministic function of the state, so feeding it back
+/// adds no information — the state advance that squeezes actually need comes
+/// from the squeeze *header*, which is absorbed first. Modelled here rather
+/// than in the library because it is a hypothesis about the encoding, not the
+/// encoding.
+fn inventory_without_reabsorb(shape: &TranscriptShape, domain_len: usize) -> (usize, [usize; 5]) {
+    let mut offset = 16 + domain_len.div_ceil(16) * 16;
+    let (mut fin_blocks, mut fin_parents, mut xof) = (0usize, 0usize, 0usize);
+    let complete = |o: usize| o.saturating_sub(1) / 1024;
+    for op in shape.ops() {
+        match op {
+            TranscriptOp::SqueezeScalar | TranscriptOp::SqueezeSlice(_) => {
+                offset += 16; // header only; the output does not come back
+                fin_blocks += 1;
+                fin_parents += complete(offset).count_ones() as usize;
+                xof += op.squeezed_bytes().div_ceil(64).saturating_sub(1);
+            }
+            TranscriptOp::Pow { .. } => {
+                fin_blocks += 1;
+                fin_parents += complete(offset).count_ones() as usize;
+                offset += op.absorbed_bytes(); // the nonce IS a real absorb
+            }
+            _ => offset += op.absorbed_bytes(),
+        }
+    }
+    let c = complete(offset);
+    (
+        offset,
+        [
+            offset.saturating_sub(1) / 64,
+            c - c.count_ones() as usize,
+            fin_blocks,
+            fin_parents,
+            xof,
+        ],
+    )
 }
 
 /// Prove + verify an element-only union proof, recording BOTH sides.
@@ -258,6 +298,21 @@ fn element_only_transcript_shape_is_pinned() {
         "    (a flat one-per-squeeze model would say {}, missing {} stack merges)",
         inv.total() - inv.finalize_parents,
         inv.finalize_parents,
+    );
+
+    let (nb, parts) = inventory_without_reabsorb(&shape, DOMAIN.len());
+    let alt: usize = parts.iter().sum();
+    println!(
+        "  WITHOUT re-absorbing squeezes: {} -> {nb} absorbed bytes; rows \
+         absorb {} | chunk parents {} | finalize blocks {} | finalize parents {} | xof {} \
+         = {alt} ({:+.0}%)",
+        shape.absorbed_bytes(),
+        parts[0],
+        parts[1],
+        parts[2],
+        parts[3],
+        parts[4],
+        100.0 * (alt as f64 / inv.total() as f64 - 1.0),
     );
 
     if std::env::var_os("TRANSCRIPT_SHAPE_PRINT").is_some() {
