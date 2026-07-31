@@ -2716,3 +2716,54 @@ fn batch_verify_defers_all_matrix_work_to_one_discharge() {
         "a corrupted proof must poison the batch"
     );
 }
+
+/// Where the fold's time actually goes, piece by piece — 21M nonzeros
+/// should not cost 16 ms on a 10-core pool.
+#[test]
+#[ignore]
+fn fold_cost_probe() {
+    use flock_core::matrix_fold;
+    use std::time::Instant;
+
+    let n_blocks = 256usize;
+    let setup = blake3::Blake3Setup::new_batch_major(n_blocks);
+    let lc = setup.r1cs.csc_lincheck_circuit();
+    let k_cols = 1usize << setup.r1cs.k_log;
+    let nnz: usize = setup.r1cs.a_0.rows.iter().map(|r| r.len()).sum::<usize>()
+        + setup.r1cs.b_0.rows.iter().map(|r| r.len()).sum::<usize>();
+    let w: Vec<flock_core::field::F128> = (0..k_cols)
+        .map(|i| flock_core::field::F128::new(i as u64 * 0x9E37, 5))
+        .collect();
+
+    let t = Instant::now();
+    let c1 = lc.fold_alpha_batched(flock_core::field::F128::ONE, &w);
+    let one_comb = t.elapsed().as_secs_f64();
+
+    let t = Instant::now();
+    let (sa, _sb) = lc.fold_split(&w);
+    let split = t.elapsed().as_secs_f64();
+
+    let t = Instant::now();
+    let rm = matrix_fold::row_marginal(&setup.r1cs.a_0, &w, k_cols);
+    let row_m = t.elapsed().as_secs_f64();
+
+    let t = Instant::now();
+    let cm = matrix_fold::col_marginal(&setup.r1cs.a_0, &w, k_cols);
+    let col_m = t.elapsed().as_secs_f64();
+
+    std::hint::black_box((&c1, &sa, &rm, &cm));
+    println!(
+        "blake3 k_log={} nnz(A+B)={:.1}M  threads={}\n  \
+         fold_alpha_batched (tuned, A+B)  {:7.3} ms\n  \
+         fold_split (one pass, both)      {:7.3} ms\n  \
+         row_marginal   (generic, A only) {:7.3} ms\n  \
+         col_marginal   (generic, A only) {:7.3} ms",
+        setup.r1cs.k_log,
+        nnz as f64 / 1e6,
+        rayon::current_num_threads(),
+        one_comb * 1e3,
+        split * 1e3,
+        row_m * 1e3,
+        col_m * 1e3,
+    );
+}

@@ -255,6 +255,24 @@ impl<'a> LincheckCircuit for SparseMatrixCircuit<'a> {
     fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
         sparse_row_fold_alpha_batched(alpha, self.a_0, self.b_0, eq_inner)
     }
+    /// One scatter pass per matrix rather than the default's two folds over
+    /// both — half the nonzero touches.
+    fn fold_split(&self, eq_inner: &[F128]) -> (Vec<F128>, Vec<F128>) {
+        let scatter = |m: &SparseBinaryMatrix| {
+            let mut out = vec![F128::ZERO; m.num_cols];
+            for (r, cols) in m.rows.iter().enumerate() {
+                let w = eq_inner[r];
+                if w == F128::ZERO {
+                    continue;
+                }
+                for &c in cols {
+                    out[c] += w;
+                }
+            }
+            out
+        };
+        (scatter(self.a_0), scatter(self.b_0))
+    }
     fn const_pin_col(&self) -> Option<usize> {
         self.const_pin
     }
@@ -373,6 +391,40 @@ impl LincheckCircuit for CscCircuit {
             .enumerate()
             .for_each(|(c, slot)| *slot = one_col(c));
         out
+    }
+
+    /// One pass, both outputs. The α-batched kernel above already forms
+    /// `sa` and `sb` apart and only mixes them at the end, so keeping them
+    /// apart costs strictly LESS — the walk is identical and the per-column
+    /// multiply disappears. The default would walk twice.
+    fn fold_split(&self, eq_inner: &[F128]) -> (Vec<F128>, Vec<F128>) {
+        use rayon::prelude::*;
+        assert_eq!(eq_inner.len(), self.n_cols);
+        let one_col = |c: usize| {
+            let mut sa = F128::ZERO;
+            for &r in &self.a_rows[self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize] {
+                sa += eq_inner[r as usize];
+            }
+            let mut sb = F128::ZERO;
+            for &r in &self.b_rows[self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize] {
+                sb += eq_inner[r as usize];
+            }
+            (sa, sb)
+        };
+        if self.n_cols < SUMCHECK_PAR_THRESHOLD {
+            return (0..self.n_cols).map(one_col).unzip();
+        }
+        let mut xa = vec![F128::ZERO; self.n_cols];
+        let mut xb = vec![F128::ZERO; self.n_cols];
+        xa.par_iter_mut()
+            .zip(xb.par_iter_mut())
+            .enumerate()
+            .for_each(|(c, (pa, pb))| {
+                let (sa, sb) = one_col(c);
+                *pa = sa;
+                *pb = sb;
+            });
+        (xa, xb)
     }
 }
 
