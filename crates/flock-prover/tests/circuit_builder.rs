@@ -768,3 +768,320 @@ fn mvp_fs_chain_of_a_real_proof() {
         bincode::serialize(&proof).unwrap().len(),
     );
 }
+
+/// The element arithmetic gate: `a`, `b` in; `a·b` and `a+b` out.
+///
+/// Both outputs on every row is deliberate. Tier-0 is all the element table
+/// offers (`mult` and `linear`), the profiling said the arithmetic is ~12% of a
+/// verifier circuit so fusing buys little, and one row per operation either way
+/// means the spare output costs nothing but columns.
+struct ArithGate {
+    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+}
+
+impl ArithGate {
+    fn new() -> Self {
+        use flock_core::element_r1cs::ElementTableBuilder;
+        let mut b = ElementTableBuilder::new(2); // 4 columns
+        b.free_wire(0)
+            .free_wire(1)
+            .mult(2, 0, 1)
+            .linear(3, &[(0, F128::ONE), (1, F128::ONE)]);
+        Self {
+            ty: std::sync::Arc::new(b.build().expect("arith block")),
+        }
+    }
+}
+
+impl GateType for ArithGate {
+    type Row = (F128, F128);
+
+    fn table(&self) -> TableType {
+        use flock_prover::schedule::IoWord;
+        TableType::element(self.ty.clone()).with_io_schema(vec![
+            IoWord::input(0),
+            IoWord::input(1),
+            IoWord::output(2), // a·b
+            IoWord::output(3), // a+b
+        ])
+    }
+
+    fn eval(&self, inputs: &[F128]) -> (Vec<F128>, Self::Row) {
+        let (a, b) = (inputs[0], inputs[1]);
+        (vec![a * b, a + b], (a, b))
+    }
+
+    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
+        let at = |c: usize, j: usize| (c << nu) + j;
+        let mut z = vec![F128::ZERO; self.ty.width() << nu];
+        for (j, &(a, b)) in rows.iter().enumerate() {
+            z[at(0, j)] = a;
+            z[at(1, j)] = b;
+            z[at(2, j)] = a * b;
+            z[at(3, j)] = a + b;
+        }
+        SlotWitness::Element(z)
+    }
+}
+
+/// **MVP-2**: a zerocheck sumcheck round replayed in-circuit, against a
+/// challenge the FS chain *derived* rather than one handed in.
+///
+/// This is the handoff's vertical slice — "FS replay plus one sumcheck-round
+/// replay against a pure-element inner proof". It is the first circuit where
+/// the two classes share a union: BLAKE3 rows deriving the challenge, element
+/// rows consuming it, joined by copy constraints across the class boundary.
+///
+/// The round is `zerocheck.rs`'s, verbatim:
+/// ```text
+///   g0       = (c_running + r_eq·g1) · (1 + r_eq)⁻¹
+///   c_next   = g0·(1+ρ) + g1·ρ + g∞·ρ·(1+ρ)
+/// ```
+/// The inverse needs no gate: witness `d⁻¹`, emit `d·d⁻¹`, and connect that
+/// product to a public cell holding 1.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn mvp2_sumcheck_round_consumes_a_derived_challenge() {
+    use flock_core::challenger::Challenger as _;
+    use flock_core::transcript_record::{RecordingChallenger, StreamWord};
+    use flock_prover::prover::UnionElementSlotInput;
+    use flock_prover::r1cs_hashes::fs_chain::{CvSource, FsChain};
+
+    const D: &[u8] = b"flock-mvp2";
+    let nu = 8usize;
+
+    // ---- the transcript: observe a round message, squeeze the fold challenge ----
+    let mut rng = Rng(0x27C4_0001);
+    let mut f = || F128::new(rng.next_u32() as u64, rng.next_u32() as u64);
+    let (c_running, r_eq, g1, g_inf) = (f(), f(), f(), f());
+
+    let mut ch = RecordingChallenger::new(FsChallenger::with_hash(D, HashKind::Blake3));
+    ch.observe_label(b"flock-zerocheck-v0");
+    ch.observe_f128(g1);
+    ch.observe_f128(g_inf);
+    let rho = ch.sample_f128(); // THE fold challenge, derived below in-circuit
+    let shape = ch.shape();
+    let stream = shape.stream_words(D);
+    let bytes = stream.to_bytes(ch.values(), ch.payloads());
+
+    // Native round update — what the circuit must reproduce.
+    let g0 = (c_running + r_eq * g1) * (F128::ONE + r_eq).inv();
+    let one_plus_rho = F128::ONE + rho;
+    let c_next = g0 * one_plus_rho + g1 * rho + g_inf * rho * one_plus_rho;
+
+    // ---- FS chain over the transcript ----
+    let mut chain = FsChain::new();
+    let upto = stream.finalize_after[0];
+    chain.absorb(&bytes[..upto * 16]);
+    let out = chain.finalize(16);
+    assert_eq!(
+        F128::new(
+            u64::from_le_bytes(out[..8].try_into().unwrap()),
+            u64::from_le_bytes(out[8..].try_into().unwrap())
+        ),
+        rho
+    );
+    chain.absorb(&bytes[upto * 16..]);
+    let trace = chain.finish();
+
+    // ---- circuit: BLAKE3 slot derives rho, element slot consumes it ----
+    let mut b = CircuitBuilder::new(nu);
+    let hash = b.slot(Blake3Gate { nu });
+    let arith = b.slot(ArithGate::new());
+
+    let one = b.public_value(F128::ONE);
+    let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+    let iv = [b.public_value(iv_w[0]), b.public_value(iv_w[1])];
+    let mut outs: Vec<Vec<Wire>> = Vec::new();
+    let mut inputs: Vec<[Wire; 7]> = Vec::new();
+    let mut word_wire: Vec<Option<Wire>> = vec![None; stream.words.len()];
+
+    for (i, row) in trace.rows.iter().enumerate() {
+        let (_, _, counter, blen, flags) = *row;
+        let link = trace.links[i];
+        let params = b.public_value(pack_params(counter, blen, flags));
+        if let Some(root) = link.repeats {
+            let s = inputs[root];
+            let gi = [s[0], s[1], s[2], s[3], s[4], s[5], params];
+            inputs.push(gi);
+            outs.push(b.gate(hash, &gi));
+            continue;
+        }
+        let (cv_in, m_in) = match link.right {
+            Some(right) => {
+                let l = match link.cv {
+                    CvSource::Row(r) => r,
+                    CvSource::Iv => unreachable!(),
+                };
+                (iv, [outs[l][0], outs[l][1], outs[right][0], outs[right][1]])
+            }
+            None => {
+                let cv_in = match link.cv {
+                    CvSource::Iv => iv,
+                    CvSource::Row(r) => [outs[r][0], outs[r][1]],
+                };
+                let base = trace.block_offsets[i].expect("stream block") / 16;
+                let real = (blen as usize) / 16;
+                let mut m = [iv[0]; 4];
+                for (j, slot) in m.iter_mut().enumerate() {
+                    let wi = base + j;
+                    *slot = if j >= real || wi >= stream.words.len() {
+                        b.public_value(F128::ZERO)
+                    } else {
+                        match word_wire[wi] {
+                            Some(w) => w,
+                            None => {
+                                let w = match stream.words[wi] {
+                                    // The round message is WITNESS: the same
+                                    // wire feeds the hash and the arithmetic,
+                                    // and that shared wire is the binding.
+                                    StreamWord::Value(k) => b.value(ch.values()[k]),
+                                    other => b.public_value(match other {
+                                        StreamWord::Const(c) => c,
+                                        _ => unreachable!("no raw-byte ops here"),
+                                    }),
+                                };
+                                word_wire[wi] = Some(w);
+                                w
+                            }
+                        }
+                    };
+                }
+                (cv_in, m)
+            }
+        };
+        let gi = [
+            cv_in[0], cv_in[1], m_in[0], m_in[1], m_in[2], m_in[3], params,
+        ];
+        inputs.push(gi);
+        outs.push(b.gate(hash, &gi));
+    }
+
+    // rho, derived — the ROOT row's out_lo low word.
+    let rho_w = outs[trace.squeezes[0][0]][0];
+    // g1 and g_inf are the SAME wires the hash consumed (stream words 2 and 3
+    // of the observe ops); recover them by their stream index.
+    let value_wire = |k: usize| -> Wire {
+        let wi = stream
+            .words
+            .iter()
+            .position(|w| matches!(*w, StreamWord::Value(i) if i == k))
+            .expect("observed value is in the stream");
+        word_wire[wi].expect("its word was wired")
+    };
+    let g1_w = value_wire(0);
+    let ginf_w = value_wire(1);
+
+    let mul = |b: &mut CircuitBuilder, x: Wire, y: Wire| b.gate(arith, &[x, y])[0];
+    let add = |b: &mut CircuitBuilder, x: Wire, y: Wire| b.gate(arith, &[x, y])[1];
+
+    let c_run_w = b.public_value(c_running);
+    let r_eq_w = b.public_value(r_eq);
+
+    // g0 = (c_running + r_eq·g1) · (1 + r_eq)⁻¹
+    let t1 = mul(&mut b, r_eq_w, g1_w);
+    let t2 = add(&mut b, c_run_w, t1);
+    let d = add(&mut b, one, r_eq_w);
+    let dinv = b.value((F128::ONE + r_eq).inv()); // witnessed reciprocal
+    let dprod = mul(&mut b, d, dinv);
+    // Pin `d·d⁻¹ = 1` against a public cell used for NOTHING else. Connecting
+    // it to the shared `one` would be cyclic: `one` feeds the gate computing
+    // `d`, so `d`'s product flowing back into `one` closes a loop, and
+    // `Circuit::new` rejects it.
+    let one_pin = b.public_value(F128::ONE);
+    b.connect(dprod, one_pin);
+    let g0_w = mul(&mut b, t2, dinv);
+
+    // c_next = g0·(1+ρ) + g1·ρ + g∞·ρ·(1+ρ)
+    let u = add(&mut b, one, rho_w);
+    let p1 = mul(&mut b, g0_w, u);
+    let p2 = mul(&mut b, g1_w, rho_w);
+    let p3 = mul(&mut b, ginf_w, rho_w);
+    let p4 = mul(&mut b, p3, u);
+    let s1 = add(&mut b, p1, p2);
+    let c_next_w = add(&mut b, s1, p4);
+    b.publish(c_next_w);
+
+    let built = b.finish().expect("valid circuit");
+    assert_eq!(
+        *built.public.last().unwrap(),
+        c_next,
+        "the circuit's round output must equal the native one"
+    );
+
+    // ---- prove / verify ----
+    let outer = UnionInstance::new(&built.registry, built.counts.clone());
+    let params = PcsParams {
+        m: outer.dense_m(),
+        log_inv_rate: 1,
+        log_batch_size: 6,
+        profile: LigeritoProfile::Fast,
+        num_lanes: outer.commit_lanes(6),
+        merkle_hash: Default::default(),
+    };
+    let r1cs = blake3::build_block_r1cs(nu);
+    let lc = r1cs.csc_lincheck_circuit();
+    let hash_rows = built.rows::<Blake3Gate>(hash);
+    let el = match &built.witnesses[built.registry_slot(arith)] {
+        SlotWitness::Element(z) => z.clone(),
+        _ => panic!("arith slot is element-class"),
+    };
+
+    let mut c = FsChallenger::new(DOMAIN);
+    let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_circuit(
+        &outer,
+        &built.circuit,
+        &built.public,
+        &params,
+        vec![UnionSlotProverInput::new(
+            blake3::generate_witness_batch_major_partial(hash_rows, nu),
+            lc,
+        )],
+        vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
+            dst.copy_from_slice(&el)
+        })],
+        &mut c,
+    );
+    let mut c = FsChallenger::new(DOMAIN);
+    verifier::verify_ligerito_jagged_union_circuit(
+        &outer,
+        &built.circuit,
+        &built.public,
+        &[lc],
+        &commitment,
+        &proof,
+        &params,
+        &mut c,
+    )
+    .expect("MVP-2 verifies");
+
+    // A wrong claimed round output is rejected: the challenge is derived and
+    // the arithmetic consumes it, so the two halves cannot be decoupled.
+    let mut bad = built.public.clone();
+    let last = bad.len() - 1;
+    bad[last] += F128::ONE;
+    let mut c = FsChallenger::new(DOMAIN);
+    assert!(
+        verifier::verify_ligerito_jagged_union_circuit(
+            &outer,
+            &built.circuit,
+            &bad,
+            &[lc],
+            &commitment,
+            &proof,
+            &params,
+            &mut c,
+        )
+        .is_err(),
+        "a tampered round output must be rejected"
+    );
+
+    println!(
+        "\n=== MVP-2: FS chain + one sumcheck round ===\n  \
+         {} BLAKE3 rows + {} element rows, M={}, {} public words",
+        built.counts[built.registry_slot(hash)],
+        built.counts[built.registry_slot(arith)],
+        outer.m_total(),
+        built.public.len(),
+    );
+}

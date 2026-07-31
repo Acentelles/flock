@@ -206,6 +206,9 @@ pub struct CircuitBuilder {
     slots: Vec<Box<dyn SlotBuild>>,
     wires: Vec<WireData>,
     public: Vec<Wire>,
+    /// Union-find over wires, so [`CircuitBuilder::connect`] can merge two
+    /// equivalence classes that were created independently.
+    parent: Vec<usize>,
 }
 
 impl CircuitBuilder {
@@ -215,7 +218,45 @@ impl CircuitBuilder {
             slots: Vec::new(),
             wires: Vec::new(),
             public: Vec::new(),
+            parent: Vec::new(),
         }
+    }
+
+    fn find(&mut self, w: Wire) -> usize {
+        let mut r = w.0;
+        while self.parent[r] != r {
+            r = self.parent[r];
+        }
+        let mut c = w.0;
+        while self.parent[c] != r {
+            let next = self.parent[c];
+            self.parent[c] = r;
+            c = next;
+        }
+        r
+    }
+
+    /// Assert two wires carry the same value: merge their classes, so the
+    /// wiring argument enforces it.
+    ///
+    /// This is the circuit's `assert_eq`. It is also how an inverse is
+    /// expressed — witness `y`, emit `x·y`, and connect that product to a
+    /// public cell holding 1 — so no inversion gate is needed.
+    ///
+    /// Panics if the two values differ: that is a witness-generator bug, and
+    /// the circuit would otherwise be unsatisfiable with no indication why.
+    pub fn connect(&mut self, a: Wire, b: Wire) {
+        let (ra, rb) = (self.find(a), self.find(b));
+        if ra == rb {
+            return;
+        }
+        assert_eq!(
+            self.wires[ra].value, self.wires[rb].value,
+            "connect() on wires holding different values"
+        );
+        let cells = std::mem::take(&mut self.wires[rb].cells);
+        self.wires[ra].cells.extend(cells);
+        self.parent[rb] = ra;
     }
 
     /// Declare a gate slot. Every gate of this type shares the slot, and the
@@ -254,6 +295,7 @@ impl CircuitBuilder {
             value,
             cells: Vec::new(),
         });
+        self.parent.push(self.wires.len() - 1);
         Wire(self.wires.len() - 1)
     }
 
@@ -276,7 +318,8 @@ impl CircuitBuilder {
             self.nu
         );
 
-        let vals: Vec<F128> = inputs.iter().map(|w| self.wires[w.0].value).collect();
+        let roots: Vec<usize> = inputs.iter().map(|&w| self.find(w)).collect();
+        let vals: Vec<F128> = roots.iter().map(|&r| self.wires[r].value).collect();
         let outputs = self.slots[slot.0].push(&vals);
 
         // Cells are assigned once the registry order is known; record the
@@ -295,6 +338,7 @@ impl CircuitBuilder {
                     value,
                     cells: vec![Cell::new(encode(slot.0, n_in + k), row)],
                 });
+                self.parent.push(self.wires.len() - 1);
                 Wire(self.wires.len() - 1)
             })
             .collect()
@@ -356,10 +400,11 @@ impl CircuitBuilder {
             }
         }
         // Public cells.
-        let public_values: Vec<F128> = self.public.iter().map(|w| self.wires[w.0].value).collect();
-        for (p, w) in self.public.iter().enumerate() {
+        let pubs: Vec<usize> = self.public.clone().iter().map(|&w| self.find(w)).collect();
+        let public_values: Vec<F128> = pubs.iter().map(|&r| self.wires[r].value).collect();
+        for (p, &r) in pubs.iter().enumerate() {
             let slot = num_gate_slots + p / rows_per_public_slot;
-            self.wires[w.0]
+            self.wires[r]
                 .cells
                 .push(Cell::new(slot, p % rows_per_public_slot));
         }
