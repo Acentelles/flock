@@ -328,6 +328,35 @@ impl TranscriptShape {
     }
 }
 
+impl Stream {
+    /// The absorbed bytes, with every word resolved.
+    pub fn to_bytes(&self, values: &[F128], payloads: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.words.len() * 16);
+        for w in &self.words {
+            let v = match *w {
+                StreamWord::Const(c) => c,
+                StreamWord::Value(i) => values[i],
+                StreamWord::Bytes { payload, word } => {
+                    let p = &payloads[payload];
+                    let mut b = [0u8; 16];
+                    let lo = word * 16;
+                    let hi = (lo + 16).min(p.len());
+                    if lo < p.len() {
+                        b[..hi - lo].copy_from_slice(&p[lo..hi]);
+                    }
+                    F128::new(
+                        u64::from_le_bytes(b[..8].try_into().unwrap()),
+                        u64::from_le_bytes(b[8..].try_into().unwrap()),
+                    )
+                }
+            };
+            out.extend_from_slice(&v.lo.to_le_bytes());
+            out.extend_from_slice(&v.hi.to_le_bytes());
+        }
+        out
+    }
+}
+
 /// One 128-bit word of the absorbed byte stream.
 ///
 /// The 16-byte-aligned framing makes the stream a sequence of whole 128-bit
@@ -347,6 +376,12 @@ pub enum StreamWord {
     Const(F128),
     /// The `i`-th observed value, counting `F128`s in observation order.
     Value(usize),
+    /// Word `word` of the `payload`-th `observe_bytes` payload (or PoW nonce),
+    /// zero-padded to a whole 16-byte word.
+    Bytes {
+        payload: usize,
+        word: usize,
+    },
 }
 
 impl TranscriptShape {
@@ -383,7 +418,7 @@ impl TranscriptShape {
         out.push(header(OP_DOMAIN, KIND_NONE, domain.len() as u64));
         padded(domain, &mut out);
 
-        let mut values = 0usize;
+        let (mut values, mut payloads) = (0usize, 0usize);
         for op in &self.ops {
             match op {
                 TranscriptOp::Label(l) => {
@@ -404,12 +439,13 @@ impl TranscriptShape {
                 }
                 TranscriptOp::ObserveBytes(len) => {
                     out.push(header(OP_BYTES, KIND_NONE, *len as u64));
-                    // Content is caller-supplied bytes; the circuit wires them
-                    // from wherever they live. Recorded as zero padding here
-                    // because the shape does not carry values.
-                    for _ in 0..len.div_ceil(16) {
-                        out.push(StreamWord::Const(F128::ZERO));
+                    for w in 0..len.div_ceil(16) {
+                        out.push(StreamWord::Bytes {
+                            payload: payloads,
+                            word: w,
+                        });
                     }
+                    payloads += 1;
                 }
                 // Only the header: the squeezed output is not absorbed. The
                 // finalize happens right after it, so record the split point —
@@ -426,7 +462,11 @@ impl TranscriptShape {
                     // `grind_pow` digests the state BEFORE absorbing the nonce.
                     finalize_after.push(out.len());
                     out.push(header(OP_BYTES, KIND_NONE, 8));
-                    out.push(StreamWord::Const(F128::ZERO)); // the nonce, padded
+                    out.push(StreamWord::Bytes {
+                        payload: payloads,
+                        word: 0,
+                    });
+                    payloads += 1;
                 }
             }
         }
@@ -460,6 +500,9 @@ pub struct Stream {
 pub struct RecordingChallenger<Ch: Challenger> {
     inner: Ch,
     ops: Vec<TranscriptOp>,
+    values: Vec<F128>,
+    payloads: Vec<Vec<u8>>,
+    challenges: Vec<F128>,
 }
 
 impl<Ch: Challenger> RecordingChallenger<Ch> {
@@ -467,7 +510,29 @@ impl<Ch: Challenger> RecordingChallenger<Ch> {
         Self {
             inner,
             ops: Vec::new(),
+            values: Vec::new(),
+            payloads: Vec::new(),
+            challenges: Vec::new(),
         }
+    }
+
+    /// Every observed `F128`, in observation order — the `Value(i)` words.
+    pub fn values(&self) -> &[F128] {
+        &self.values
+    }
+
+    /// Every `observe_bytes` payload and every PoW nonce, in order — the
+    /// `Bytes { payload, .. }` words. PoW nonces are captured here because
+    /// `grind_pow` absorbs them on the INNER challenger, so the decorator never
+    /// sees the `observe_bytes` call.
+    pub fn payloads(&self) -> &[Vec<u8>] {
+        &self.payloads
+    }
+
+    /// Every squeezed `F128`, in squeeze order. Not part of the stream — it is
+    /// not absorbed — but it is what the FS chain's circuit outputs.
+    pub fn challenges(&self) -> &[F128] {
+        &self.challenges
     }
 
     /// The shape recorded so far.
@@ -499,38 +564,48 @@ impl<Ch: Challenger> Challenger for RecordingChallenger<Ch> {
 
     fn observe_f128(&mut self, value: F128) {
         self.ops.push(TranscriptOp::ObserveScalar);
+        self.values.push(value);
         self.inner.observe_f128(value);
     }
 
     fn observe_f128_slice(&mut self, values: &[F128]) {
         self.ops.push(TranscriptOp::ObserveSlice(values.len()));
+        self.values.extend_from_slice(values);
         // Delegate the SLICE call — not `n` scalar calls (see module docs).
         self.inner.observe_f128_slice(values);
     }
 
     fn observe_bytes(&mut self, bytes: &[u8]) {
         self.ops.push(TranscriptOp::ObserveBytes(bytes.len()));
+        self.payloads.push(bytes.to_vec());
         self.inner.observe_bytes(bytes);
     }
 
     fn sample_f128(&mut self) -> F128 {
         self.ops.push(TranscriptOp::SqueezeScalar);
-        self.inner.sample_f128()
+        let c = self.inner.sample_f128();
+        self.challenges.push(c);
+        c
     }
 
     fn sample_f128_vec(&mut self, n: usize) -> Vec<F128> {
         self.ops.push(TranscriptOp::SqueezeSlice(n));
         // Delegate the SLICE call — one squeeze, not `n` (see module docs).
-        self.inner.sample_f128_vec(n)
+        let c = self.inner.sample_f128_vec(n);
+        self.challenges.extend_from_slice(&c);
+        c
     }
 
     fn grind_pow(&mut self, bits: u32) -> u64 {
         self.ops.push(TranscriptOp::Pow { bits });
-        self.inner.grind_pow(bits)
+        let nonce = self.inner.grind_pow(bits);
+        self.payloads.push(nonce.to_le_bytes().to_vec());
+        nonce
     }
 
     fn verify_pow(&mut self, nonce: u64, bits: u32) -> bool {
         self.ops.push(TranscriptOp::Pow { bits });
+        self.payloads.push(nonce.to_le_bytes().to_vec());
         self.inner.verify_pow(nonce, bits)
     }
 }
@@ -660,20 +735,16 @@ mod tests {
 
         // Rebuild the stream, substituting the observed values.
         let stream = shape.stream_words(domain);
-        let mut bytes = Vec::new();
         assert_eq!(
             stream.finalize_after,
             vec![stream.words.len()],
             "one squeeze, at the end"
         );
-        for w in &stream.words {
-            let v = match *w {
-                StreamWord::Const(c) => c,
-                StreamWord::Value(i) => vals[i],
-            };
-            bytes.extend_from_slice(&v.lo.to_le_bytes());
-            bytes.extend_from_slice(&v.hi.to_le_bytes());
-        }
+        // Resolve through the recorder's own captures, so the reconstruction
+        // uses exactly what the challenger saw.
+        let bytes = stream.to_bytes(rec.values(), rec.payloads());
+        assert_eq!(rec.values(), vals, "recorder captured the observed values");
+        assert_eq!(rec.challenges(), &[got], "recorder captured the challenge");
 
         // `sample_f128` absorbs its header, then finalizes and takes 16 bytes.
         let mut h = ::blake3::Hasher::new();

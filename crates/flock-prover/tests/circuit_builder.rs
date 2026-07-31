@@ -329,6 +329,7 @@ fn fs_chain_circuit_derives_the_challenges() {
     let resolve = |w: &StreamWord| match *w {
         StreamWord::Const(c) => c,
         StreamWord::Value(i) => values[i],
+        StreamWord::Bytes { .. } => unreachable!("this script observes no raw bytes"),
     };
     // Squeezed output is not absorbed, so nothing in the stream marks a
     // squeeze — `finalize_after` says how many words precede each one.
@@ -509,5 +510,261 @@ fn fs_chain_circuit_derives_the_challenges() {
         trace.rows.len(),
         built.public.len(),
         challenges.len()
+    );
+}
+
+/// **The MVP proof, on a REAL transcript**: record an actual element-only
+/// Flock proof, then prove in-circuit that its Fiat–Shamir challenges are the
+/// correct BLAKE3 derivation of its transcript.
+///
+/// The scripted test above shows the mechanism; this shows it at the shape and
+/// scale the recursive verifier will actually meet — every op kind the protocol
+/// emits, a multi-chunk transcript, and finalizes deep enough that the chunk
+/// stack has real depth.
+#[test]
+#[ignore] // Heavy — run with `-- --ignored`.
+fn mvp_fs_chain_of_a_real_proof() {
+    use flock_core::element_r1cs::{ElementTableBuilder, ElementTableType};
+    use flock_core::transcript_record::{RecordingChallenger, TranscriptOp};
+    use flock_prover::prover::UnionElementSlotInput;
+    use flock_prover::r1cs_hashes::fs_chain::{CvSource, FsChain};
+    use flock_prover::schedule::Registry;
+    use std::sync::Arc;
+
+    const INNER: &[u8] = b"flock-union-element-v0";
+    let (inner_nu, kappa, count) = (12usize, 3usize, 1usize << 12);
+
+    // ---- an ordinary element-only proof, recorded ----
+    let (w0, w1) = (F128::new(7, 0), F128::new(0, 3));
+    let ty: Arc<ElementTableType> = {
+        let mut b = ElementTableBuilder::new(kappa);
+        b.free_wire(0)
+            .free_wire(1)
+            .mult(2, 0, 1)
+            .linear(3, &[(0, w0), (1, w1)]);
+        Arc::new(b.build().expect("gate block"))
+    };
+    let registry = Registry::new(vec![TableType::element(ty.clone())], inner_nu);
+    let union = UnionInstance::new(&registry, vec![count]);
+    let inner_params = PcsParams {
+        m: union.dense_m(),
+        log_inv_rate: 1,
+        log_batch_size: 6,
+        profile: LigeritoProfile::Fast,
+        num_lanes: union.commit_lanes(6),
+        merkle_hash: Default::default(),
+    };
+    let mut rng = Rng(0x11FE_0001);
+    let z = {
+        let at = |c: usize, j: usize| (c << inner_nu) + j;
+        let mut z = vec![F128::ZERO; ty.width() << inner_nu];
+        for j in 0..count {
+            let (a, b) = (
+                F128::new(rng.next_u32() as u64, rng.next_u32() as u64),
+                F128::new(rng.next_u32() as u64, rng.next_u32() as u64),
+            );
+            z[at(0, j)] = a;
+            z[at(1, j)] = b;
+            z[at(2, j)] = a * b;
+            z[at(3, j)] = w0 * a + w1 * b;
+        }
+        z
+    };
+    // BLAKE3 transcript: the FS chain is a BLAKE3 circuit, and BLAKE3 is the
+    // settled Merkle/FS hash for this work. `FsChallenger::new` defaults to
+    // SHA-256, which would be a different chain entirely.
+    let mut ch_p = FsChallenger::with_hash(INNER, HashKind::Blake3);
+    let (inner_proof, inner_commit, _) = prover::prove_fast_ligerito_jagged_union_mixed_class(
+        &union,
+        &inner_params,
+        Vec::new(),
+        vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
+            dst.copy_from_slice(&z)
+        })],
+        &mut ch_p,
+    );
+
+    // Record the VERIFIER's transcript — that is what a recursive verifier replays.
+    let mut rec = RecordingChallenger::new(FsChallenger::with_hash(INNER, HashKind::Blake3));
+    verifier::verify_ligerito_jagged_union_mixed_class(
+        &union,
+        &[],
+        &inner_commit,
+        &inner_proof,
+        &inner_params,
+        &mut rec,
+    )
+    .expect("inner proof verifies");
+    let shape = rec.shape();
+    let stream = shape.stream_words(INNER);
+    let bytes = stream.to_bytes(rec.values(), rec.payloads());
+    let challenges = rec.challenges().to_vec();
+
+    // ---- replay it through the FS chain ----
+    let mut chain = FsChain::new();
+    let mut at = 0usize;
+    let mut produced: Vec<F128> = Vec::new();
+    // Every finalizing op needs its rows, but a PoW's state digest is the
+    // grinding base, NOT a challenge — the circuit still computes it, and it
+    // still binds, but it is not part of `challenges`.
+    let fin_ops: Vec<&TranscriptOp> = shape.ops().iter().filter(|o| o.finalizes()).collect();
+    for (i, &upto) in stream.finalize_after.iter().enumerate() {
+        chain.absorb(&bytes[at * 16..upto * 16]);
+        at = upto;
+        let op = fin_ops[i];
+        let out = chain.finalize(op.squeezed_bytes());
+        if !matches!(op, TranscriptOp::Pow { .. }) {
+            for c in out.chunks(16) {
+                produced.push(F128::new(
+                    u64::from_le_bytes(c[..8].try_into().unwrap()),
+                    u64::from_le_bytes(c[8..].try_into().unwrap()),
+                ));
+            }
+        }
+    }
+    chain.absorb(&bytes[at * 16..]);
+    let trace = chain.finish();
+    let first = produced.iter().zip(&challenges).position(|(a, b)| a != b);
+    assert_eq!(
+        (produced.len(), first),
+        (challenges.len(), None),
+        "chain vs verifier: {} produced, {} expected, first mismatch at {:?}",
+        produced.len(),
+        challenges.len(),
+        first
+    );
+
+    // ---- the circuit ----
+    let nu = (trace.rows.len().next_power_of_two().trailing_zeros() as usize).max(1);
+    let mut b = CircuitBuilder::new(nu);
+    let g = b.slot(Blake3Gate { nu });
+    let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+    let iv = [b.public_value(iv_w[0]), b.public_value(iv_w[1])];
+    let mut word_wire: Vec<Option<Wire>> = vec![None; stream.words.len()];
+    let mut outs: Vec<Vec<Wire>> = Vec::with_capacity(trace.rows.len());
+    let mut inputs: Vec<[Wire; 7]> = Vec::with_capacity(trace.rows.len());
+
+    for (i, row) in trace.rows.iter().enumerate() {
+        let (_, _, counter, blen, flags) = *row;
+        let link = trace.links[i];
+        let params = b.public_value(pack_params(counter, blen, flags));
+        if let Some(root) = link.repeats {
+            // An XOF output block: same cv and message as the ROOT row, only
+            // the counter differs, so wire the identical sources.
+            let src = inputs[root];
+            let g_in = [src[0], src[1], src[2], src[3], src[4], src[5], params];
+            inputs.push(g_in);
+            outs.push(b.gate(g, &g_in));
+            continue;
+        }
+        let (cv_in, m_in) = match link.right {
+            Some(right) => {
+                let l = match link.cv {
+                    CvSource::Row(r) => r,
+                    CvSource::Iv => unreachable!(),
+                };
+                (iv, [outs[l][0], outs[l][1], outs[right][0], outs[right][1]])
+            }
+            None => {
+                let cv_in = match link.cv {
+                    CvSource::Iv => iv,
+                    CvSource::Row(r) => [outs[r][0], outs[r][1]],
+                };
+                let base = trace.block_offsets[i].expect("stream block") / 16;
+                let real = (blen as usize) / 16;
+                let mut m = [iv[0]; 4];
+                for (j, slot) in m.iter_mut().enumerate() {
+                    let wi = base + j;
+                    *slot = if j >= real || wi >= stream.words.len() {
+                        b.public_value(F128::ZERO)
+                    } else {
+                        match word_wire[wi] {
+                            Some(w) => w,
+                            None => {
+                                let v = F128::new(
+                                    u64::from_le_bytes(
+                                        bytes[wi * 16..wi * 16 + 8].try_into().unwrap(),
+                                    ),
+                                    u64::from_le_bytes(
+                                        bytes[wi * 16 + 8..wi * 16 + 16].try_into().unwrap(),
+                                    ),
+                                );
+                                let w = b.public_value(v);
+                                word_wire[wi] = Some(w);
+                                w
+                            }
+                        }
+                    };
+                }
+                (cv_in, m)
+            }
+        };
+        let g_in = [
+            cv_in[0], cv_in[1], m_in[0], m_in[1], m_in[2], m_in[3], params,
+        ];
+        inputs.push(g_in);
+        outs.push(b.gate(g, &g_in));
+    }
+    for s in &trace.squeezes {
+        b.publish(outs[s[0]][0]);
+    }
+    let built = b.finish().expect("valid circuit");
+
+    let outer = UnionInstance::new(&built.registry, built.counts.clone());
+    let outer_params = PcsParams {
+        m: outer.dense_m(),
+        log_inv_rate: 1,
+        log_batch_size: 6,
+        profile: LigeritoProfile::Fast,
+        num_lanes: outer.commit_lanes(6),
+        merkle_hash: Default::default(),
+    };
+    let r1cs = blake3::build_block_r1cs(nu);
+    let lc = r1cs.csc_lincheck_circuit();
+    let rows = built.rows::<Blake3Gate>(g);
+
+    let t = std::time::Instant::now();
+    let mut c = FsChallenger::new(DOMAIN);
+    let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_circuit(
+        &outer,
+        &built.circuit,
+        &built.public,
+        &outer_params,
+        vec![UnionSlotProverInput::new(
+            blake3::generate_witness_batch_major_partial(rows, nu),
+            lc,
+        )],
+        Vec::new(),
+        &mut c,
+    );
+    let prove_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    let t = std::time::Instant::now();
+    let mut c = FsChallenger::new(DOMAIN);
+    verifier::verify_ligerito_jagged_union_circuit(
+        &outer,
+        &built.circuit,
+        &built.public,
+        &[lc],
+        &commitment,
+        &proof,
+        &outer_params,
+        &mut c,
+    )
+    .expect("the MVP proof verifies");
+    let verify_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    println!(
+        "\n=== MVP: FS chain of a real element-only proof ===\n  \
+         inner: {} transcript ops, {} absorbed bytes, {} challenges\n  \
+         outer: {} BLAKE3 rows (nu={nu}, M={}), {} public words, {} proof bytes\n  \
+         prove {prove_ms:.0} ms | verify {verify_ms:.1} ms",
+        shape.len(),
+        bytes.len(),
+        challenges.len(),
+        trace.rows.len(),
+        outer.m_total(),
+        built.public.len(),
+        bincode::serialize(&proof).unwrap().len(),
     );
 }

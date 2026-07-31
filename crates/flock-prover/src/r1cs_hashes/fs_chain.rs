@@ -62,6 +62,10 @@ pub struct Link {
     /// For `PARENT` rows, the row supplying the RIGHT half of the message.
     /// (`cv` supplies the left half; a parent's own `cv` input is the IV.)
     pub right: Option<usize>,
+    /// For an XOF output block, the ROOT row whose `cv` and message it repeats
+    /// — only the counter differs. A circuit wires those inputs to the same
+    /// places and varies just the params word.
+    pub repeats: Option<usize>,
 }
 
 /// The compression sequence for one transcript.
@@ -183,6 +187,7 @@ impl FsChain {
         let link = Link {
             cv: self.chunk_cv_row.map_or(CvSource::Iv, CvSource::Row),
             right: None,
+            repeats: None,
         };
         let row = self.emit(
             (cv, m, self.chunk_counter, self.buf.len() as u32, flags),
@@ -217,6 +222,7 @@ impl FsChain {
             let link = Link {
                 cv: CvSource::Row(left_row),
                 right: Some(row),
+                repeats: None,
             };
             row = self.emit((IV, m, 0, BLOCK_BYTES as u32, PARENT), link, None);
             cv = out[..8].try_into().unwrap();
@@ -252,6 +258,7 @@ impl FsChain {
             Link {
                 cv: self.chunk_cv_row.map_or(CvSource::Iv, CvSource::Row),
                 right: None,
+                repeats: None,
             },
             Some(self.buf_offset),
         );
@@ -273,6 +280,7 @@ impl FsChain {
                 Link {
                     cv: CvSource::Row(left_row),
                     right: Some(row),
+                    repeats: None,
                 },
                 None,
             );
@@ -281,6 +289,7 @@ impl FsChain {
                 (pm, IV, 0, BLOCK_BYTES as u32, pf);
         }
         ids.push(row);
+        let root_row = row;
 
         // The root compression yields the first 64 output bytes; further blocks
         // re-run it at counter 1, 2, … — counter-mode, hence independent.
@@ -296,6 +305,7 @@ impl FsChain {
                 Link {
                     cv: CvSource::Iv,
                     right: None,
+                    repeats: Some(root_row),
                 },
                 None,
             );
