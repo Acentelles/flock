@@ -1579,6 +1579,27 @@ const FOLD_TABLE_SIZE: usize = 256;
 /// Build the 16×256 byte-lookup table the fold indexes: `table[k·256 + v]` =
 /// `Σ_{bit b set in v} eq_r_dprime[k·8 + b]`. For the ring-switch fold,
 /// `eq_r_dprime` already has γ_k baked in, so the table carries γ too.
+/// Fold weights for the map `x ↦ γ·x`.
+///
+/// [`fold_one_slot`] applies the `F₂`-linear map whose weight on bit `i` of
+/// its input is `weights[i]`, so scaling by γ — itself `F₂`-linear — is just
+/// `weights[i] = γ · basis_i`. That is what lets a PACKED-DIRECT claim ride
+/// the merged transport's per-claim weight loop unchanged: a ring-switched
+/// claim supplies its Φ-fold weights, a packed-direct one supplies these,
+/// and the weight builder cannot tell them apart.
+pub(crate) fn identity_fold_weights(gamma: F128) -> Vec<F128> {
+    (0..1usize << LOG_PACKING)
+        .map(|i| {
+            let basis = if i < 64 {
+                F128::new(1u64 << i, 0)
+            } else {
+                F128::new(0, 1u64 << (i - 64))
+            };
+            gamma * basis
+        })
+        .collect()
+}
+
 pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
     assert_eq!(eq_r_dprime.len(), 1 << LOG_PACKING);
     let mut tables = vec![F128::ZERO; FOLD_N_BYTES * FOLD_TABLE_SIZE];
@@ -2944,6 +2965,40 @@ pub fn eval_rs_eq_finish_from_prefix_binary_q(
         }
     }
     eval.fold_vertical(eq_r_dprime)
+}
+
+#[cfg(test)]
+mod identity_fold_tests {
+    use super::*;
+
+    /// `fold_one_slot` with [`identity_fold_weights`] IS multiplication by γ.
+    ///
+    /// The merged transport's weight builder calls `fold_one_slot` per claim
+    /// with that claim's fold table; this identity is what lets a
+    /// packed-direct claim — whose weight is the plain `γ·eq_row ⊗ eq_col` —
+    /// be expressed in the same form as a ring-switched one, so the builder
+    /// needs no special case.
+    #[test]
+    fn identity_fold_is_scalar_multiplication() {
+        let mut seed = 0x1234_5678_9ABC_DEF0u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let lo = seed;
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            F128::new(lo, seed)
+        };
+        for _ in 0..32 {
+            let gamma = next();
+            let table = build_fold_byte_table(&identity_fold_weights(gamma));
+            for _ in 0..8 {
+                let x = next();
+                assert_eq!(fold_one_slot(x, &table), gamma * x);
+            }
+            // Including the degenerate inputs.
+            assert_eq!(fold_one_slot(F128::ZERO, &table), F128::ZERO);
+            assert_eq!(fold_one_slot(F128::ONE, &table), gamma);
+        }
+    }
 }
 
 #[cfg(test)]

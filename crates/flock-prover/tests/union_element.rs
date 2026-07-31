@@ -1044,17 +1044,17 @@ fn check(label: &str, expected: &str, got: String) {
 fn mixed_class_proof_bytes_pinned() {
     // Element-only: nu = 12, kappa = 3 (M = 22).
     const ELEMENT_ONLY: [(&str, usize, &str); 3] = [
-        ("elem-nu12-full", 1 << 12, "4d0c0c2cb2066016f4251ae2fdbb369c3016b016fb29726e9f1a3af02c94a2a9"),
-        ("elem-nu12-2731", 2731, "9b054ebe8ab29c9733f0aafd9c41b505d5a3a69d8ac045717a30adf04d129cf8"),
-        ("elem-nu12-0", 0, "1a48d112df56c0814c5eaa26a00ed070ec1b503b65ba19a33139ae6b93f52a24"),
+        ("elem-nu12-full", 1 << 12, "cb95c3eef3ba4c7f5806fcca47b5939991d9d411182f46137b4428bfc96cf835"),
+        ("elem-nu12-2731", 2731, "dd7c87beb9e15d4c6bbf0417171588533a5ea2595958d819c7995380f2f91e35"),
+        ("elem-nu12-0", 0, "f4b1b2703ac9931da1126ef6be5aca0f44e5f62b3afe6523588480a1dfeedc6c"),
     ];
     // Mixed: BLAKE3 + element at nu = 7 (M = 22); counts in slot order
     // (BLAKE3 first — the boolean class leads).
     const MIXED: [(&str, [usize; 2], &str); 4] = [
-        ("mix-nu7-128-128", [128, 128], "9fcbcdb71c82a935a70e40227d4e3bee0ee3d34aa0a4cb8befe8e60c40b3d723"),
-        ("mix-nu7-100-90", [100, 90], "2b067c25a2d7699cb75e0640fc7900d74c7b3531dbb94d73d834acb51d97de17"),
-        ("mix-nu7-0-90", [0, 90], "54969b84307468c6a15b7f4fb3cabe148fea13123ad8847024af43fb1289dbd0"),
-        ("mix-nu7-100-0", [100, 0], "37857ba1e0c49adc774a0caafe29b77a32ef88adb3b9640d139b18097a01122f"),
+        ("mix-nu7-128-128", [128, 128], "6764361a516d897eb3b6fbcfd4e6e0226fa7295ac070ffe5ab5e127d0fbcdbe7"),
+        ("mix-nu7-100-90", [100, 90], "b11b58760d75ac29b11c3dc0ff3f7aa668ac42dfc14c693dbe0ce1ec92f6e6ae"),
+        ("mix-nu7-0-90", [0, 90], "b2bddb64f4c8f792cf8eff3fae19bdeaa36d02a097ba1c44522461000a641e14"),
+        ("mix-nu7-100-0", [100, 0], "eff085eecad0561b5f173812875d800853f870569a8b912a6e7cc2bd4855eeff"),
     ];
 
     let (w0, w1) = (F128::new(0x51F0, 0), F128::new(0, 0x2C7E));
@@ -1452,6 +1452,116 @@ leaves a {} hole inside the 2^26 prefix subcube, but the element region \
             fmt(rbb),
             rbb.1 - ra.1,
             100.0 * (rbb.1 - ra.1) / ra.1,
+        );
+    }
+}
+
+/// A mixed boolean+element proof over the MERGED transport — the first thing
+/// to drive a packed-direct claim through it.
+///
+/// The merged (Frobenius) path is the shipped, capacity-free one, but element
+/// claims are packed-direct and it had no intake for them, so mixed proofs
+/// were confined to the unmerged jagged path and its padded-domain
+/// auxiliaries. The intake works by expressing a packed-direct claim's weight
+/// as the F₂-linear map `x ↦ γ·x`, which the merged weight builder cannot
+/// distinguish from a ring-switched claim's Φ-fold.
+///
+/// Both transports carry the same claim set, so they must agree on the CLAIMS
+/// while their openings differ — and the merged one must still reject
+/// tampering, or the packed-direct claims would be riding along unchecked.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn mixed_proofs_verify_over_the_merged_transport() {
+    let (nu, kappa) = (7usize, 3usize);
+    let m = mixed_setup(nu, kappa);
+    let (n_bool, n_elem) = (100usize, 90usize);
+    let union = UnionInstance::new(&m.registry, vec![n_bool, n_elem]);
+    let pcs_params = union_pcs_params(&union);
+
+    let mut rng = Rng::new(0x_4D_47_44_01);
+    let inputs = random_blake3_inputs(&mut rng, n_bool);
+    let z_elem = gate_witness(&m.ty, nu, n_elem, m.w.0, m.w.1, &mut rng);
+    let circuit = m.blake3_r1cs.csc_lincheck_circuit();
+
+    let bool_slot = || {
+        UnionSlotProverInput::new(
+            blake3::generate_witness_batch_major_partial(&inputs, nu),
+            circuit,
+        )
+    };
+    let elem_slot = || {
+        let z = z_elem.clone();
+        UnionElementSlotInput::new(move |dst: &mut [F128]| dst.copy_from_slice(&z))
+    };
+
+    // Merged.
+    let mut ch = FsChallenger::new(DOMAIN);
+    let (merged, commitment, claims_m) =
+        prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
+            &union,
+            &pcs_params,
+            vec![bool_slot()],
+            vec![elem_slot()],
+            &mut ch,
+        );
+    assert!(merged.boolean.is_some() && merged.element.is_some());
+    let mut ch_v = FsChallenger::new(DOMAIN);
+    let got = verifier::verify_ligerito_jagged_union_mixed_class_merged(
+        &union,
+        &[circuit],
+        &commitment,
+        &merged,
+        &pcs_params,
+        &mut ch_v,
+    )
+    .unwrap_or_else(|e| panic!("merged rejected an honest mixed proof: {e:?}"));
+    assert_eq!(got, claims_m);
+
+    // Jagged, same statement: same claims, different opening.
+    let mut ch = FsChallenger::new(DOMAIN);
+    let (jagged, commitment_j, claims_j) = prover::prove_fast_ligerito_jagged_union_mixed_class(
+        &union,
+        &pcs_params,
+        vec![bool_slot()],
+        vec![elem_slot()],
+        &mut ch,
+    );
+    assert_eq!(commitment_j.root, commitment.root, "same witness, same root");
+    assert_eq!(
+        claims_j, claims_m,
+        "the transports must agree on the claims they carry"
+    );
+
+    // Tampering must still be caught on the merged path.
+    for (what, bad) in [
+        ("opening", {
+            let mut b = merged.clone();
+            b.pcs_open.q_eval += F128::ONE;
+            b
+        }),
+        ("element claim", {
+            let mut b = merged.clone();
+            b.element.as_mut().unwrap().lincheck.z_eval += F128::ONE;
+            b
+        }),
+        ("boolean claim", {
+            let mut b = merged.clone();
+            b.boolean.as_mut().unwrap().lincheck.z_partial[0] += F128::ONE;
+            b
+        }),
+    ] {
+        let mut ch_v = FsChallenger::new(DOMAIN);
+        assert!(
+            verifier::verify_ligerito_jagged_union_mixed_class_merged(
+                &union,
+                &[circuit],
+                &commitment,
+                &bad,
+                &pcs_params,
+                &mut ch_v,
+            )
+            .is_err(),
+            "tampered {what} must be rejected by the merged transport"
         );
     }
 }

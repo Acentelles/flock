@@ -1717,6 +1717,7 @@ pub fn open_batch_merged<Ch: Challenger>(
     commitment: &Commitment,
     x_outers: &[&[F128]],
     precomputed_s_hat_v: &[Option<&[F128]>],
+    packed_direct: &[PackedDirectClaim],
     padding: &PaddingSpec,
     heights: &[u64],
     n_log: usize,
@@ -1740,9 +1741,23 @@ pub fn open_batch_merged<Ch: Challenger>(
             t.elapsed().as_secs_f64() * 1e3
         );
     }
+    // Packed-direct claims take their γ's from the same stream, AFTER the
+    // ring-switched ones — the verifier draws them in the same order.
+    let gammas_pd: Vec<F128> = packed_direct
+        .iter()
+        .map(|c| {
+            challenger.observe_f128_slice(&c.point);
+            challenger.observe_f128(c.value);
+            challenger.sample_f128()
+        })
+        .collect();
+
     let mut target = F128::ZERO;
     for ((_, o), g) in rs_results.iter().zip(&gammas_rs) {
         target += *g * o.sumcheck_claim;
+    }
+    for (c, g) in packed_direct.iter().zip(&gammas_pd) {
+        target += *g * c.value;
     }
 
     let dense_log = commitment.params.m - LOG_PACKING;
@@ -1753,7 +1768,16 @@ pub fn open_batch_merged<Ch: Challenger>(
     );
     let params = jagged::JaggedParams::from_heights(heights, n_log, dense_log);
     let k_cols = params.k;
-    let claim_data: Vec<(&[F128], &[F128], &[F128])> = rs_results
+    // A packed-direct claim's weight is the plain `γ·eq_row ⊗ eq_col`, which
+    // is what `fold_one_slot` computes from `identity_fold_weights(γ)` — so
+    // it enters the per-claim loop in exactly the ring-switched claims' form
+    // and the weight builder needs no special case. Its point carries NO
+    // univariate-skip coordinate, which is the one place the splits differ.
+    let pd_tables: Vec<Vec<F128>> = gammas_pd
+        .iter()
+        .map(|&g| ring_switch::build_fold_byte_table(&ring_switch::identity_fold_weights(g)))
+        .collect();
+    let mut claim_data: Vec<(&[F128], &[F128], &[F128])> = rs_results
         .iter()
         .zip(x_outers.iter())
         .map(|((_, o), x)| {
@@ -1765,6 +1789,14 @@ pub fn open_batch_merged<Ch: Challenger>(
             (&x[1..1 + n_log], &x[1 + n_log..], table)
         })
         .collect();
+    for (c, tab) in packed_direct.iter().zip(&pd_tables) {
+        assert_eq!(
+            c.point.len(),
+            n_log + k_cols,
+            "packed-direct point/row/col split mismatch (no skip coordinate)"
+        );
+        claim_data.push((&c.point[..n_log], &c.point[n_log..], tab.as_slice()));
+    }
 
     // The twisted weight over the dense cube (count-proportional Φ-pass;
     // zero tail past the jagged area).
@@ -1913,6 +1945,7 @@ pub fn verify_batch_merged<Ch: Challenger>(
     claims: &[F128],
     z_skips: &[F128],
     x_outers: &[&[F128]],
+    packed_direct: &[PackedDirectClaimRef<'_>],
     heights: &[u64],
     n_log: usize,
     proof: &MergedOpenProof,
@@ -1939,9 +1972,21 @@ pub fn verify_batch_merged<Ch: Challenger>(
         rs_outputs.push(out);
     }
     let gammas: Vec<F128> = (0..n_rs).map(|_| challenger.sample_f128()).collect();
+    // Packed-direct γ's follow the ring-switched ones, in the prover's order.
+    let gammas_pd: Vec<F128> = packed_direct
+        .iter()
+        .map(|c| {
+            challenger.observe_f128_slice(c.point);
+            challenger.observe_f128(c.value);
+            challenger.sample_f128()
+        })
+        .collect();
     let mut target = F128::ZERO;
     for (out, g) in rs_outputs.iter().zip(&gammas) {
         target += *g * out.sumcheck_claim;
+    }
+    for (c, g) in packed_direct.iter().zip(&gammas_pd) {
+        target += *g * c.value;
     }
 
     let dense_log = commitment.params.m - LOG_PACKING;
@@ -1970,7 +2015,17 @@ pub fn verify_batch_merged<Ch: Challenger>(
             ring_switch::linearized_coefficients(&ring_switch::build_fold_byte_table(&scaled))
         })
         .collect();
-    let fclaims: Vec<jagged::FrobeniusClaim<'_>> = x_outers
+    // A packed-direct claim's fold map is `x ↦ γ·x`, so its coefficients are
+    // the identity weights' — the same shape the assist already consumes.
+    let coeffs_pd: Vec<Vec<F128>> = gammas_pd
+        .iter()
+        .map(|&g| {
+            ring_switch::linearized_coefficients(&ring_switch::build_fold_byte_table(
+                &ring_switch::identity_fold_weights(g),
+            ))
+        })
+        .collect();
+    let mut fclaims: Vec<jagged::FrobeniusClaim<'_>> = x_outers
         .iter()
         .zip(&coeffs)
         .map(|(x, c)| {
@@ -1982,6 +2037,16 @@ pub fn verify_batch_merged<Ch: Challenger>(
             }
         })
         .collect();
+    for (c, co) in packed_direct.iter().zip(&coeffs_pd) {
+        if c.point.len() != n_log + k_cols {
+            return Err(VerifyErrorJagged::Jagged);
+        }
+        fclaims.push(jagged::FrobeniusClaim {
+            z_row: &c.point[..n_log],
+            z_col: &c.point[n_log..],
+            coeffs: co,
+        });
+    }
     let v = jagged::verify_frobenius_assist(&params, &fclaims, &rho, &proof.frobenius, challenger)
         .ok_or(VerifyErrorJagged::Jagged)?;
     if running != proof.q_eval * v {

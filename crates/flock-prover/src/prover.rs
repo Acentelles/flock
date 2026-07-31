@@ -673,6 +673,7 @@ pub fn prove_fast_ligerito_jagged_union<Ch: Challenger>(
         pcs_params,
         slots,
         Vec::new(),
+        Transport::Jagged,
         challenger,
     );
     out.into_boolean_only()
@@ -718,6 +719,7 @@ pub fn prove_fast_ligerito_jagged_union_mixed_class<Ch: Challenger>(
         pcs_params,
         slots,
         element_slots,
+        Transport::Jagged,
         challenger,
     );
     let UnionProveOutput {
@@ -739,7 +741,7 @@ pub fn prove_fast_ligerito_jagged_union_mixed_class<Ch: Challenger>(
         flock_core::proof::R1csProofMixedClassLigerito {
             boolean: bool_proof,
             element: el_proof,
-            pcs_open,
+            pcs_open: pcs_open.jagged(),
         },
         commitment,
         flock_core::proof::UnionClassClaims {
@@ -787,6 +789,12 @@ pub fn prove_fast_ligerito_jagged_union_circuit<Ch: Challenger>(
         pcs_params,
         slots,
         element_slots,
+        // The wiring layer's gather claims are packed-direct, and the merged
+        // transport's intake for those landed only after this entry — so the
+        // circuit path stays on the jagged transport for now. Moving it over
+        // is the natural follow-up, and the reason the transport is a
+        // parameter rather than a fork.
+        Transport::Jagged,
         challenger,
     );
     let UnionProveOutput {
@@ -808,7 +816,7 @@ pub fn prove_fast_ligerito_jagged_union_circuit<Ch: Challenger>(
             boolean: bool_proof,
             element: el_proof,
             wiring: wiring.expect("the circuit binding runs the wiring argument"),
-            pcs_open,
+            pcs_open: pcs_open.jagged(),
         },
         commitment,
         flock_core::proof::UnionClassClaims {
@@ -839,6 +847,7 @@ pub fn prove_fast_ligerito_jagged_union_harness<Ch: Challenger>(
         pcs_params,
         slots,
         Vec::new(),
+        Transport::Jagged,
         challenger,
     );
     out.into_boolean_only()
@@ -1042,6 +1051,7 @@ pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
         &commitment,
         &x_refs,
         &[pre_ab, pre_c],
+        &[],
         &padding,
         &heights,
         union.n_log(),
@@ -1073,7 +1083,41 @@ struct UnionProveOutput {
     /// The wiring argument's transcript — `Some` exactly under
     /// [`UnionProveBinding::Circuit`].
     wiring: Option<flock_core::circuit::WiringProof>,
-    pcs_open: pcs::BatchOpeningProofJaggedLigerito,
+    pcs_open: UnionOpen,
+}
+
+/// Which transport carried the claims. Both take the SAME claim set — the
+/// boolean pair ring-switched, the element pair packed-direct — so the choice
+/// is the last step of the prove and nothing upstream changes.
+enum UnionOpen {
+    Jagged(pcs::BatchOpeningProofJaggedLigerito),
+    Merged(pcs::MergedOpenProof),
+}
+
+impl UnionOpen {
+    fn jagged(self) -> pcs::BatchOpeningProofJaggedLigerito {
+        match self {
+            UnionOpen::Jagged(p) => p,
+            UnionOpen::Merged(_) => panic!("asked for a jagged open, got a merged one"),
+        }
+    }
+    fn merged(self) -> pcs::MergedOpenProof {
+        match self {
+            UnionOpen::Merged(p) => p,
+            UnionOpen::Jagged(_) => panic!("asked for a merged open, got a jagged one"),
+        }
+    }
+}
+
+/// The transport a union prove should use for its single opening.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    /// The unmerged jagged path: a virtual-opening sumcheck over the PADDED
+    /// packed domain, then the jagged transport.
+    Jagged,
+    /// The merged (Frobenius) path — capacity-free, computing over the DENSE
+    /// domain. The shipped transport.
+    Merged,
 }
 
 impl UnionProveOutput {
@@ -1088,7 +1132,7 @@ impl UnionProveOutput {
             R1csProofJaggedLigerito {
                 zerocheck: piop.zerocheck,
                 lincheck: piop.lincheck,
-                pcs_open: self.pcs_open,
+                pcs_open: self.pcs_open.jagged(),
             },
             claim,
         ))
@@ -1107,6 +1151,7 @@ fn prove_union_with_binding<Ch: Challenger>(
     pcs_params: &PcsParams,
     slots: Vec<UnionSlotProverInput<'_>>,
     element_slots: Vec<UnionElementSlotInput<'_>>,
+    transport: Transport,
     challenger: &mut Ch,
 ) -> (UnionProveOutput, Commitment) {
     // Harness guard + slot statement consistency (also asserts one type) —
@@ -1438,20 +1483,46 @@ fn prove_union_with_binding<Ch: Challenger>(
         proof
     });
     let t = std::time::Instant::now();
-    let pcs_open = open_claims_with_precomputed_jagged_ligerito(
-        z_packed,
-        dense_q,
-        &prover_data,
-        &commitment,
-        &z_claims,
-        &pre,
-        &packed_direct,
-        &padding,
-        &heights,
-        union.n_log(),
-        &lig_config,
-        challenger,
-    );
+    let pcs_open = match transport {
+        Transport::Jagged => UnionOpen::Jagged(open_claims_with_precomputed_jagged_ligerito(
+            z_packed,
+            dense_q,
+            &prover_data,
+            &commitment,
+            &z_claims,
+            &pre,
+            &packed_direct,
+            &padding,
+            &heights,
+            union.n_log(),
+            &lig_config,
+            challenger,
+        )),
+        Transport::Merged => {
+            // Same claims, different transport: the ring-switched pair goes
+            // in as quirky points, the element pair as packed-direct — which
+            // the merged open now carries (identity fold weights).
+            let x_fulls: Vec<Vec<F128>> =
+                z_claims.iter().map(|cl| quirky_x_outer_full(&cl.point)).collect();
+            let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
+            let open = pcs::open_batch_merged(
+                dense_q.expect("the merged transport needs the dense stack"),
+                &z_packed,
+                &prover_data,
+                &commitment,
+                &x_refs,
+                &pre,
+                &packed_direct,
+                &padding,
+                &heights,
+                union.n_log(),
+                &lig_config,
+                challenger,
+            );
+            flock_core::scratch::give_f128(z_packed);
+            UnionOpen::Merged(open)
+        }
+    };
     if trace {
         eprintln!(
             "  [prove_union] open (rs×{}, pd×{}): {:7.2} ms",
@@ -2004,3 +2075,62 @@ pub fn prove_fast_ligerito_jagged_union_timed<Ch: Challenger>(
     let claim = R1csClaim { ab, c };
     (proof, commitment, claim, t)
 }
+
+/// [`prove_fast_ligerito_jagged_union_mixed_class`] over the MERGED
+/// transport — the same statement and PIOPs, opened on the shipped
+/// capacity-free path instead of the unmerged jagged one.
+///
+/// This is what lets an element (or, upstream, a circuit) proof stop paying
+/// the unmerged path's padded-domain auxiliaries: the merged transport
+/// computes over the DENSE domain. It became possible once the merged open
+/// grew a packed-direct intake — the element class's two claims are
+/// packed-direct, which is why they were confined to the jagged path.
+pub fn prove_fast_ligerito_jagged_union_mixed_class_merged<Ch: Challenger>(
+    union: &flock_core::union::UnionInstance<'_>,
+    pcs_params: &PcsParams,
+    slots: Vec<UnionSlotProverInput<'_>>,
+    element_slots: Vec<UnionElementSlotInput<'_>>,
+    challenger: &mut Ch,
+) -> (
+    flock_core::proof::R1csProofMixedClassMerged,
+    Commitment,
+    flock_core::proof::UnionClassClaims,
+) {
+    let (out, commitment) = prove_union_with_binding(
+        union,
+        UnionProveBinding::Mixed,
+        pcs_params,
+        slots,
+        element_slots,
+        Transport::Merged,
+        challenger,
+    );
+    let UnionProveOutput {
+        boolean,
+        element,
+        wiring,
+        pcs_open,
+    } = out;
+    debug_assert!(wiring.is_none(), "the Mixed binding runs no wiring");
+    let (bool_proof, bool_claim) = match boolean {
+        Some((p, c)) => (Some(p), Some(c)),
+        None => (None, None),
+    };
+    let (el_proof, el_claim) = match element {
+        Some((p, c)) => (Some(p), Some(c)),
+        None => (None, None),
+    };
+    (
+        flock_core::proof::R1csProofMixedClassMerged {
+            boolean: bool_proof,
+            element: el_proof,
+            pcs_open: pcs_open.merged(),
+        },
+        commitment,
+        flock_core::proof::UnionClassClaims {
+            boolean: bool_claim,
+            element: el_claim,
+        },
+    )
+}
+
