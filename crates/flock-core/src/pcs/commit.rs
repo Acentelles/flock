@@ -873,8 +873,7 @@ mod tests {
             let mut best_merkle = f64::INFINITY;
             for _ in 0..n_runs {
                 let t = Instant::now();
-                let tree =
-                    merkle::merkle_tree(bytes, n_positions, crate::hash::HashKind::default());
+                let tree = merkle::merkle_tree(bytes, n_positions, HashKind::default());
                 best_merkle = best_merkle.min(t.elapsed().as_secs_f64() * 1e3);
                 std::hint::black_box(tree.last());
             }

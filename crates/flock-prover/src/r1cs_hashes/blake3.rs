@@ -1032,7 +1032,11 @@ fn write_lin_word_ab_packed(bit_off: usize, val: u32, z: &mut [u64], a: &mut [u6
 /// **No c buffer.** Since `C = I` (this is the circuit-shape R1CS), `c == z`
 /// byte-for-byte; callers use `z_packed` directly as the c-side input to
 /// zerocheck.
-fn build_block_witness_ab_packed_into(
+// `pub(crate)` so the composite Merkle encoder (`super::merkle_r1cs`) can
+// embed one compression's row-witness at a column offset instead of
+// re-deriving it — the row kinds above are exactly what its overridden rows
+// demand (see that module's `HashSpec::node_witness_ab`).
+pub(crate) fn build_block_witness_ab_packed_into(
     cv: &[u32; 8],
     m: &[u32; 16],
     counter: u64,
@@ -1614,7 +1618,11 @@ fn bm_add_inline(
 /// Build one V = 8 group of compressions into interleaved rows. Mirrors
 /// [`build_block_witness_ab_packed_into`] field-for-field (byte-equality is
 /// pinned by the lockstep test below).
-fn build_group_batch_major(
+/// `pub(crate)` so the composite Merkle block can reuse it per level: a
+/// level's subcube IS this base block, aligned to a `2^k_log` boundary (hence
+/// a whole number of `u64` rows), so `merkle_r1cs` calls this on the level's
+/// row window and then writes only the swap-gadget and global columns itself.
+pub(crate) fn build_group_batch_major(
     inputs: [&Compression; BM_V],
     rz: &mut [BmRow],
     ra: &mut [BmRow],

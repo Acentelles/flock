@@ -23,4 +23,9 @@ pub mod keccak3;
 ///
 /// [`MerkleLayout`]: merkle_path_common::MerkleLayout
 pub mod merkle_path_common;
+/// Merkle-path verification as ONE monolithic R1CS block per path — the
+/// multi-table-legal form (one table row = one whole path), as opposed to
+/// [`merkle_path_common`]'s shift-sumcheck composition over a batch of
+/// independent per-level compressions.
+pub mod merkle_r1cs;
 pub mod sha2;

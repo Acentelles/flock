@@ -23,7 +23,7 @@ use std::time::Instant;
 
 use flock_prover::challenger::FsChallenger;
 use flock_prover::field::F128;
-use flock_prover::mixed::{MixedCounts, MixedRegistryId, MixedSetup};
+use flock_prover::mixed::{MixedCounts, MixedRegistryId, MixedSetup, RegistryFamily};
 use flock_prover::pcs::Commitment;
 use flock_prover::proof_io::{
     BundleFlavor, ChainProofBundleLigerito, HashKind, MixedProofBundleLigerito, peek_flavor,
@@ -306,7 +306,13 @@ fn cmd_prove_mix(mix: MixSpec, args: Args) -> Result<(), String> {
         format!(
             "--mix: count {max_count} exceeds every built-in registry tier \
              (largest capacity: {}); split the workload",
-            1usize << MixedRegistryId::ALL.last().unwrap().nu()
+            // Only this family's tiers — `ALL` also carries the
+            // Merkle+BLAKE3 tiers, whose capacities are unrelated here.
+            1usize
+                << MixedRegistryId::family_tiers(RegistryFamily::Sha2Blake3)
+                    .last()
+                    .unwrap()
+                    .nu()
         )
     })?;
     eprintln!(

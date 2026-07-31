@@ -66,12 +66,29 @@ pub struct VerifyPhaseTimings {
 /// run their body via `verifier_pool().install(..)`. Any `par_iter` reached from
 /// there uses this 1-thread pool and collapses onto a single worker, without
 /// touching the prover's use of the global pool.
+/// Thread count for [`verifier_pool`]. **1 in production** — the override
+/// (`FLOCK_VERIFY_THREADS`) exists only so a benchmark can ask what the verify
+/// would cost with the prover's parallelism, since the pool below is otherwise
+/// the one place that decision is made. Read once per process, so a single run
+/// measures a single configuration.
+fn verifier_threads() -> usize {
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("FLOCK_VERIFY_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1)
+    })
+}
+
 fn verifier_pool() -> &'static rayon::ThreadPool {
     use std::sync::OnceLock;
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
+            .num_threads(verifier_threads())
             // The whole verify body runs on this worker — including the deep
             // recursive Ligerito verifier — so give it an ample stack. A rayon
             // worker otherwise defaults to ~2 MiB (vs the 8 MiB main thread),
@@ -456,13 +473,40 @@ pub fn verify_ligerito_jagged_union_merged<Ch: Challenger>(
         ));
     }
     let defer_merged = false;
+    // `VERIFY_TRACE` phase breakdown, as on the direct path
+    // (`verify_core_inner`). Off by default.
+    let trace = std::env::var("VERIFY_TRACE").is_ok();
+    let fmt = |s: f64| -> String {
+        let ms = s * 1000.0;
+        if ms < 1.0 {
+            format!("{:>8.2} µs", s * 1e6)
+        } else {
+            format!("{:>8.2} ms", ms)
+        }
+    };
     type MergedPiop = (ZClaim, ZClaim, lincheck::MatrixAssertion);
     let (ab, c, matrix) = verifier_pool().install(|| -> Result<MergedPiop, VerifyError> {
+        let t = std::time::Instant::now();
         union.bind_statement(challenger, commitment);
+        if trace {
+            eprintln!(
+                "      [vum] bind_statement: {}",
+                fmt(t.elapsed().as_secs_f64())
+            );
+        }
+        let t = std::time::Instant::now();
         let zc_claim = zerocheck::verify(union.m_total(), &proof.zerocheck, challenger)
             .map_err(VerifyError::Zerocheck)?;
+        if trace {
+            eprintln!(
+                "      [vum] zerocheck::verify (m_total={}): {}",
+                union.m_total(),
+                fmt(t.elapsed().as_secs_f64())
+            );
+        }
         let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
         // DEFERRED — discharged by the wrapper below (or accumulated).
+        let t = std::time::Instant::now();
         let (lc_claim, matrix) = lincheck::verify_union_deferred(
             union,
             circuits,
@@ -473,6 +517,12 @@ pub fn verify_ligerito_jagged_union_merged<Ch: Challenger>(
             challenger,
         )
         .map_err(VerifyError::Lincheck)?;
+        if trace {
+            eprintln!(
+                "      [vum] lincheck::verify_union: {}",
+                fmt(t.elapsed().as_secs_f64())
+            );
+        }
         let ab = ZClaim {
             point: union.ab_claim_point(
                 lc_claim.r_inner_skip,
@@ -494,40 +544,46 @@ pub fn verify_ligerito_jagged_union_merged<Ch: Challenger>(
     })?;
     let heights = union.jagged_heights();
     let claims = [ab.clone(), c.clone()];
-    verifier_pool()
-        .install(|| {
-            let z_skips: Vec<F128> = claims.iter().map(|cl| cl.point.z_skip).collect();
-            let values: Vec<F128> = claims.iter().map(|cl| cl.value).collect();
-            let x_fulls: Vec<Vec<F128>> = claims
-                .iter()
-                .map(|cl| {
-                    let mut v = cl.point.x_inner_rest.clone();
-                    v.extend_from_slice(&cl.point.x_outer);
-                    v
-                })
-                .collect();
-            let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
-            let log_n = pcs_params.m - pcs::LOG_PACKING;
-            let lig_v_config = crate::pcs::ligerito::verifier_config_for(
-                log_n,
-                pcs_params.log_batch_size,
-                pcs_params.profile,
-            )
-            .expect("Ligerito default verifier config");
-            pcs::verify_batch_merged(
-                commitment,
-                &values,
-                &z_skips,
-                &x_refs,
-                &[],
-                &heights,
-                union.n_log(),
-                &proof.pcs_open,
-                &lig_v_config,
-                challenger,
-            )
-        })
-        .map_err(VerifyError::PcsJagged)?;
+    let t_open = std::time::Instant::now();
+    let open_result = verifier_pool().install(|| {
+        let z_skips: Vec<F128> = claims.iter().map(|cl| cl.point.z_skip).collect();
+        let values: Vec<F128> = claims.iter().map(|cl| cl.value).collect();
+        let x_fulls: Vec<Vec<F128>> = claims
+            .iter()
+            .map(|cl| {
+                let mut v = cl.point.x_inner_rest.clone();
+                v.extend_from_slice(&cl.point.x_outer);
+                v
+            })
+            .collect();
+        let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
+        let log_n = pcs_params.m - pcs::LOG_PACKING;
+        let lig_v_config = crate::pcs::ligerito::verifier_config_for(
+            log_n,
+            pcs_params.log_batch_size,
+            pcs_params.profile,
+        )
+        .expect("Ligerito default verifier config");
+        pcs::verify_batch_merged(
+            commitment,
+            &values,
+            &z_skips,
+            &x_refs,
+            &[],
+            &heights,
+            union.n_log(),
+            &proof.pcs_open,
+            &lig_v_config,
+            challenger,
+        )
+    });
+    if trace {
+        eprintln!(
+            "      [vum] pcs::verify_batch_merged: {}",
+            fmt(t_open.elapsed().as_secs_f64())
+        );
+    }
+    open_result.map_err(VerifyError::PcsJagged)?;
     let _ = matrix;
     Ok(R1csClaim { ab, c })
 }

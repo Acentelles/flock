@@ -211,6 +211,14 @@ name = "permutation"
 harness = false
 
 [[bench]]
+name = "merkle_vs_plain_blake3"
+harness = false
+
+[[bench]]
+name = "merkle_l0_opening"
+harness = false
+
+[[bench]]
 name = "perm_vs_gkr"
 harness = false
 

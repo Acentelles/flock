@@ -677,6 +677,13 @@ pub fn verify_union_deferred<Ch: Challenger>(
     //    consistency check. They ride out in the `MatrixAssertion` instead.
     //    Nothing between here and there touches the challenger on their
     //    account, so lifting them out leaves the transcript untouched.
+    //
+    //    Merge note (`merkle-path-r1cs`): that branch added a `VERIFY_TRACE`
+    //    split of this function into "comb phase" and "everything after".
+    //    Deferral removed the comb phase from here entirely, so the
+    //    instrumentation had nothing left to time and is not carried over.
+    //    The measurement it existed for still lives in [`verify_union_timed`],
+    //    which builds combs inline on purpose.
 
     // 2b. Constant-wire pins (mirror of prove): β_t sampled after α in slot
     //     order, the comb gains +β_t at the pin, and the target gains the
