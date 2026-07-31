@@ -527,6 +527,24 @@ impl ElementTableBuilder {
     /// the relation shape allows: a [`Self::mult`] into `tmp`, then a
     /// [`Self::linear`] summing `tmp` and `addend` into `out`. (One row cannot
     /// do it: the right-hand side of a row is exactly one column.)
+    /// `z[out] = (Σ aᵢ·z[..]) · (Σ bⱼ·z[..])` — a product of two **linear
+    /// combinations**, in one constraint.
+    ///
+    /// `A_0` and `B_0` are matrix *rows*, so a sum on either side of a product
+    /// is free: it rides the row of the multiplication that consumes it rather
+    /// than costing a column of its own. That matters because in this class an
+    /// addition is not free — every committed column is the output of exactly
+    /// one row, `linear` ones included — so `(a+b)·c` written as an add then a
+    /// mult costs two constraints where this costs one.
+    ///
+    /// [`Self::mult`] is the special case of one term per side.
+    pub fn mult_lin(&mut self, out: usize, a: &[(usize, F128)], b: &[(usize, F128)]) -> &mut Self {
+        self.touch(out);
+        self.a_rows[out] = a.to_vec();
+        self.b_rows[out] = b.to_vec();
+        self
+    }
+
     pub fn mult_acc(
         &mut self,
         out: usize,

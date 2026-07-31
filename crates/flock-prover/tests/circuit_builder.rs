@@ -769,12 +769,23 @@ fn mvp_fs_chain_of_a_real_proof() {
     );
 }
 
-/// The element arithmetic gate: `a`, `b` in; `a·b` and `a+b` out.
+/// The element arithmetic gate: four inputs, and both a **fused product** and
+/// a four-way sum out.
 ///
-/// Both outputs on every row is deliberate. Tier-0 is all the element table
-/// offers (`mult` and `linear`), the profiling said the arithmetic is ~12% of a
-/// verifier circuit so fusing buys little, and one row per operation either way
-/// means the spare output costs nothing but columns.
+/// ```text
+///   prod = (a0 + a1) · (b0 + b1)
+///   sum  =  a0 + a1  +  b0 + b1
+/// ```
+///
+/// The fusion is the point. In the element class an addition is NOT free —
+/// every committed column is the output of exactly one R1CS row, `linear` ones
+/// included — but `A_0` and `B_0` are matrix *rows*, so a sum on either side of
+/// a product rides the multiplication's own row instead of costing a column.
+/// A naive one-op-per-row gate spends 12 rows on a sumcheck round; this spends
+/// 8, and the saving is per round of the real replay.
+///
+/// Every operation the round needs is one call: `x·y` is `(x+0)·(y+0)`,
+/// `(x+y)·z` is direct, and `x+y+z` is the sum output.
 struct ArithGate {
     ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
 }
@@ -782,11 +793,14 @@ struct ArithGate {
 impl ArithGate {
     fn new() -> Self {
         use flock_core::element_r1cs::ElementTableBuilder;
-        let mut b = ElementTableBuilder::new(2); // 4 columns
+        let one = F128::ONE;
+        let mut b = ElementTableBuilder::new(3); // 8 columns; 6,7 self-pinned zero
         b.free_wire(0)
             .free_wire(1)
-            .mult(2, 0, 1)
-            .linear(3, &[(0, F128::ONE), (1, F128::ONE)]);
+            .free_wire(2)
+            .free_wire(3)
+            .mult_lin(4, &[(0, one), (1, one)], &[(2, one), (3, one)])
+            .linear(5, &[(0, one), (1, one), (2, one), (3, one)]);
         Self {
             ty: std::sync::Arc::new(b.build().expect("arith block")),
         }
@@ -794,31 +808,36 @@ impl ArithGate {
 }
 
 impl GateType for ArithGate {
-    type Row = (F128, F128);
+    type Row = [F128; 4];
 
     fn table(&self) -> TableType {
         use flock_prover::schedule::IoWord;
         TableType::element(self.ty.clone()).with_io_schema(vec![
             IoWord::input(0),
             IoWord::input(1),
-            IoWord::output(2), // a·b
-            IoWord::output(3), // a+b
+            IoWord::input(2),
+            IoWord::input(3),
+            IoWord::output(4), // (a0+a1)·(b0+b1)
+            IoWord::output(5), // a0+a1+b0+b1
         ])
     }
 
     fn eval(&self, inputs: &[F128]) -> (Vec<F128>, Self::Row) {
-        let (a, b) = (inputs[0], inputs[1]);
-        (vec![a * b, a + b], (a, b))
+        let r: [F128; 4] = [inputs[0], inputs[1], inputs[2], inputs[3]];
+        let prod = (r[0] + r[1]) * (r[2] + r[3]);
+        let sum = r[0] + r[1] + r[2] + r[3];
+        (vec![prod, sum], r)
     }
 
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
         let at = |c: usize, j: usize| (c << nu) + j;
         let mut z = vec![F128::ZERO; self.ty.width() << nu];
-        for (j, &(a, b)) in rows.iter().enumerate() {
-            z[at(0, j)] = a;
-            z[at(1, j)] = b;
-            z[at(2, j)] = a * b;
-            z[at(3, j)] = a + b;
+        for (j, r) in rows.iter().enumerate() {
+            for (c, &v) in r.iter().enumerate() {
+                z[at(c, j)] = v;
+            }
+            z[at(4, j)] = (r[0] + r[1]) * (r[2] + r[3]);
+            z[at(5, j)] = r[0] + r[1] + r[2] + r[3];
         }
         SlotWitness::Element(z)
     }
@@ -972,34 +991,34 @@ fn mvp2_sumcheck_round_consumes_a_derived_challenge() {
     let g1_w = value_wire(0);
     let ginf_w = value_wire(1);
 
-    let mul = |b: &mut CircuitBuilder, x: Wire, y: Wire| b.gate(arith, &[x, y])[0];
-    let add = |b: &mut CircuitBuilder, x: Wire, y: Wire| b.gate(arith, &[x, y])[1];
-
+    let zero = b.public_value(F128::ZERO);
     let c_run_w = b.public_value(c_running);
     let r_eq_w = b.public_value(r_eq);
 
-    // g0 = (c_running + r_eq·g1) · (1 + r_eq)⁻¹
-    let t1 = mul(&mut b, r_eq_w, g1_w);
-    let t2 = add(&mut b, c_run_w, t1);
-    let d = add(&mut b, one, r_eq_w);
-    let dinv = b.value((F128::ONE + r_eq).inv()); // witnessed reciprocal
-    let dprod = mul(&mut b, d, dinv);
-    // Pin `d·d⁻¹ = 1` against a public cell used for NOTHING else. Connecting
-    // it to the shared `one` would be cyclic: `one` feeds the gate computing
-    // `d`, so `d`'s product flowing back into `one` closes a loop, and
-    // `Circuit::new` rejects it.
+    // Eight rows for the round. Each additive term rides the row of the
+    // multiplication consuming it, so no addition costs a constraint of its
+    // own except the final three-way sum.
+    //   1. t1     = r_eq·g1
+    let t1 = b.gate(arith, &[r_eq_w, zero, g1_w, zero])[0];
+    //   2. dprod  = (1 + r_eq)·d⁻¹, pinned to 1
+    let dinv = b.value((F128::ONE + r_eq).inv());
+    let dprod = b.gate(arith, &[one, r_eq_w, dinv, zero])[0];
+    // A pin cell used for NOTHING else: connecting to the shared `one` would
+    // be cyclic, since `one` feeds this very gate.
     let one_pin = b.public_value(F128::ONE);
     b.connect(dprod, one_pin);
-    let g0_w = mul(&mut b, t2, dinv);
-
-    // c_next = g0·(1+ρ) + g1·ρ + g∞·ρ·(1+ρ)
-    let u = add(&mut b, one, rho_w);
-    let p1 = mul(&mut b, g0_w, u);
-    let p2 = mul(&mut b, g1_w, rho_w);
-    let p3 = mul(&mut b, ginf_w, rho_w);
-    let p4 = mul(&mut b, p3, u);
-    let s1 = add(&mut b, p1, p2);
-    let c_next_w = add(&mut b, s1, p4);
+    //   3. g0     = (c_running + t1)·d⁻¹   ← the addition is free here
+    let g0_w = b.gate(arith, &[c_run_w, t1, dinv, zero])[0];
+    //   4. p1     = g0·(1 + ρ)             ← and here
+    let p1 = b.gate(arith, &[g0_w, zero, one, rho_w])[0];
+    //   5. p2     = g1·ρ
+    let p2 = b.gate(arith, &[g1_w, zero, rho_w, zero])[0];
+    //   6. p3     = g∞·ρ
+    let p3 = b.gate(arith, &[ginf_w, zero, rho_w, zero])[0];
+    //   7. p4     = p3·(1 + ρ)
+    let p4 = b.gate(arith, &[p3, zero, one, rho_w])[0];
+    //   8. c_next = p1 + p2 + p4           ← three-way sum in one row
+    let c_next_w = b.gate(arith, &[p1, p2, p4, zero])[1];
     b.publish(c_next_w);
 
     let built = b.finish().expect("valid circuit");
