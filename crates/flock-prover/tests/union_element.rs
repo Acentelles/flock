@@ -1044,17 +1044,17 @@ fn check(label: &str, expected: &str, got: String) {
 fn mixed_class_proof_bytes_pinned() {
     // Element-only: nu = 12, kappa = 3 (M = 22).
     const ELEMENT_ONLY: [(&str, usize, &str); 3] = [
-        ("elem-nu12-full", 1 << 12, "4d0c0c2cb2066016f4251ae2fdbb369c3016b016fb29726e9f1a3af02c94a2a9"),
-        ("elem-nu12-2731", 2731, "9b054ebe8ab29c9733f0aafd9c41b505d5a3a69d8ac045717a30adf04d129cf8"),
-        ("elem-nu12-0", 0, "1a48d112df56c0814c5eaa26a00ed070ec1b503b65ba19a33139ae6b93f52a24"),
+        ("elem-nu12-full", 1 << 12, "cb95c3eef3ba4c7f5806fcca47b5939991d9d411182f46137b4428bfc96cf835"),
+        ("elem-nu12-2731", 2731, "dd7c87beb9e15d4c6bbf0417171588533a5ea2595958d819c7995380f2f91e35"),
+        ("elem-nu12-0", 0, "f4b1b2703ac9931da1126ef6be5aca0f44e5f62b3afe6523588480a1dfeedc6c"),
     ];
     // Mixed: BLAKE3 + element at nu = 7 (M = 22); counts in slot order
     // (BLAKE3 first — the boolean class leads).
     const MIXED: [(&str, [usize; 2], &str); 4] = [
-        ("mix-nu7-128-128", [128, 128], "9fcbcdb71c82a935a70e40227d4e3bee0ee3d34aa0a4cb8befe8e60c40b3d723"),
-        ("mix-nu7-100-90", [100, 90], "2b067c25a2d7699cb75e0640fc7900d74c7b3531dbb94d73d834acb51d97de17"),
-        ("mix-nu7-0-90", [0, 90], "54969b84307468c6a15b7f4fb3cabe148fea13123ad8847024af43fb1289dbd0"),
-        ("mix-nu7-100-0", [100, 0], "37857ba1e0c49adc774a0caafe29b77a32ef88adb3b9640d139b18097a01122f"),
+        ("mix-nu7-128-128", [128, 128], "6764361a516d897eb3b6fbcfd4e6e0226fa7295ac070ffe5ab5e127d0fbcdbe7"),
+        ("mix-nu7-100-90", [100, 90], "b11b58760d75ac29b11c3dc0ff3f7aa668ac42dfc14c693dbe0ce1ec92f6e6ae"),
+        ("mix-nu7-0-90", [0, 90], "b2bddb64f4c8f792cf8eff3fae19bdeaa36d02a097ba1c44522461000a641e14"),
+        ("mix-nu7-100-0", [100, 0], "eff085eecad0561b5f173812875d800853f870569a8b912a6e7cc2bd4855eeff"),
     ];
 
     let (w0, w1) = (F128::new(0x51F0, 0), F128::new(0, 0x2C7E));

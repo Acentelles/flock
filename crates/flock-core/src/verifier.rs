@@ -649,7 +649,7 @@ pub fn verify_ligerito_jagged_union_mixed_class_merged<Ch: Challenger>(
     {
         return Err(VerifyError::ClassMismatch);
     }
-    let (claims, packed_direct_points) = verify_union_piops(
+    let (claims, packed_direct_points, matrix, el_matrix) = verify_union_piops(
         union,
         UnionVerifyBinding::Mixed,
         circuits,
@@ -659,6 +659,17 @@ pub fn verify_ligerito_jagged_union_mixed_class_merged<Ch: Challenger>(
         pcs_params,
         challenger,
     )?;
+    // Both classes' matrix work comes back undischarged from the PIOP
+    // replay; this is a non-deferred entry, so discharge here — after the
+    // replay and BEFORE the opening, as the sibling entries do, so an
+    // inconsistent lincheck is rejected as Lincheck and before the expensive
+    // PCS work.
+    if let Some(a) = matrix {
+        a.check(union, circuits).map_err(VerifyError::Lincheck)?;
+    }
+    if let Some(a) = el_matrix {
+        a.check_reported(union).map_err(VerifyError::Element)?;
+    }
 
     // Same construction as the boolean-only merged verifier: the PCS point
     // is `x_inner_rest ‖ x_outer`, with the skip coordinate carried
