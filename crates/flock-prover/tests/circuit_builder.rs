@@ -97,13 +97,14 @@ struct Blake3Gate {
 
 impl GateType for Blake3Gate {
     type Row = blake3::Compression;
+    type Hint = ();
 
     fn table(&self) -> TableType {
         TableType::from_block_r1cs(&blake3::build_block_r1cs(self.nu))
             .with_io_schema(blake3::io_schema())
     }
 
-    fn eval(&self, inputs: &[F128]) -> (Vec<F128>, Self::Row) {
+    fn eval(&self, inputs: &[F128], _hint: &()) -> (Vec<F128>, Self::Row) {
         // Schema In-order: cv0, cv1, m0..m3, params.
         let cv = unpack8(inputs[0], inputs[1]);
         let mut m = [0u32; 16];
@@ -809,6 +810,7 @@ impl ArithGate {
 
 impl GateType for ArithGate {
     type Row = [F128; 4];
+    type Hint = ();
 
     fn table(&self) -> TableType {
         use flock_prover::schedule::IoWord;
@@ -822,7 +824,7 @@ impl GateType for ArithGate {
         ])
     }
 
-    fn eval(&self, inputs: &[F128]) -> (Vec<F128>, Self::Row) {
+    fn eval(&self, inputs: &[F128], _hint: &()) -> (Vec<F128>, Self::Row) {
         let r: [F128; 4] = [inputs[0], inputs[1], inputs[2], inputs[3]];
         let prod = (r[0] + r[1]) * (r[2] + r[3]);
         let sum = r[0] + r[1] + r[2] + r[3];

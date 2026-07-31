@@ -89,13 +89,31 @@ pub trait GateType {
     /// gate type emit the slot's witness once.
     type Row;
 
+    /// Nondeterministic advice for [`eval`](GateType::eval): data the gate
+    /// needs to run that does not travel on a wire.
+    ///
+    /// Wires carry whole 128-bit words at word-aligned schema positions, so
+    /// only word-aligned data is wireable at all — and of that, only data some
+    /// other gate produces or consumes has any reason to be. A Merkle opening
+    /// is the motivating case: its leaf, index and root are wired, but its
+    /// sibling digests are read by nothing else and sit unaligned in each
+    /// node's padding. They are supplied here instead.
+    ///
+    /// A hint is invisible to the statement. The constraints still pin
+    /// everything the relation depends on, so a wrong hint yields a row that
+    /// fails to satisfy them — it cannot buy a false proof, only a broken one.
+    /// Gates that need no advice set this to `()` and are instantiated with
+    /// [`CircuitBuilder::gate`].
+    type Hint;
+
     /// The registry type: constraints, width, and the `io_schema` whose order
     /// defines this gate's input and output positions.
     fn table(&self) -> TableType;
 
     /// Evaluate one gate. `inputs` are the schema's `In` words in schema
     /// order; returns the `Out` words in schema order, plus the row record.
-    fn eval(&self, inputs: &[F128]) -> (Vec<F128>, Self::Row);
+    /// `hint` is this instance's advice — see [`Hint`](GateType::Hint).
+    fn eval(&self, inputs: &[F128], hint: &Self::Hint) -> (Vec<F128>, Self::Row);
 
     /// The slot's committed witness, given every row in instantiation order
     /// and the uniform capacity `nu`. Rows `[rows.len(), 2^nu)` are dummy and
@@ -107,7 +125,7 @@ pub trait GateType {
 trait SlotBuild: std::any::Any {
     fn table(&self) -> TableType;
     fn n_in(&self) -> usize;
-    fn push(&mut self, inputs: &[F128]) -> Vec<F128>;
+    fn push(&mut self, inputs: &[F128], hint: &dyn std::any::Any) -> Vec<F128>;
     fn rows(&self) -> usize;
     fn witness(&self, nu: usize) -> SlotWitness;
     fn as_any(&self) -> &dyn std::any::Any;
@@ -124,6 +142,7 @@ struct GateSlot<G: GateType> {
 impl<G: GateType + 'static> SlotBuild for GateSlot<G>
 where
     G::Row: 'static,
+    G::Hint: 'static,
 {
     fn table(&self) -> TableType {
         self.table.clone()
@@ -131,8 +150,14 @@ where
     fn n_in(&self) -> usize {
         self.n_in
     }
-    fn push(&mut self, inputs: &[F128]) -> Vec<F128> {
-        let (outputs, row) = self.gate.eval(inputs);
+    fn push(&mut self, inputs: &[F128], hint: &dyn std::any::Any) -> Vec<F128> {
+        let hint = hint.downcast_ref::<G::Hint>().unwrap_or_else(|| {
+            panic!(
+                "gate expects a hint of type {}; use gate_with_hint to supply one",
+                std::any::type_name::<G::Hint>()
+            )
+        });
+        let (outputs, row) = self.gate.eval(inputs, hint);
         assert_eq!(
             outputs.len(),
             self.n_out,
@@ -265,6 +290,7 @@ impl CircuitBuilder {
     where
         G: GateType + 'static,
         G::Row: 'static,
+        G::Hint: 'static,
     {
         let table = gate.table();
         let n_in = table
@@ -300,8 +326,22 @@ impl CircuitBuilder {
     }
 
     /// Instantiate a gate: allocate a row, bind `inputs` to its input cells,
-    /// evaluate, and return wires for its outputs.
+    /// evaluate, and return wires for its outputs. For a gate type whose
+    /// [`Hint`](GateType::Hint) is `()`; use [`gate_with_hint`] otherwise.
+    ///
+    /// [`gate_with_hint`]: CircuitBuilder::gate_with_hint
     pub fn gate(&mut self, slot: SlotId, inputs: &[Wire]) -> Vec<Wire> {
+        self.gate_with_hint(slot, inputs, &())
+    }
+
+    /// Instantiate a gate, supplying this instance's nondeterministic advice.
+    /// See [`GateType::Hint`]; `hint` must be that exact type.
+    pub fn gate_with_hint<H: std::any::Any>(
+        &mut self,
+        slot: SlotId,
+        inputs: &[Wire],
+        hint: &H,
+    ) -> Vec<Wire> {
         let s = &self.slots[slot.0];
         assert_eq!(
             inputs.len(),
@@ -320,7 +360,7 @@ impl CircuitBuilder {
 
         let roots: Vec<usize> = inputs.iter().map(|&w| self.find(w)).collect();
         let vals: Vec<F128> = roots.iter().map(|&r| self.wires[r].value).collect();
-        let outputs = self.slots[slot.0].push(&vals);
+        let outputs = self.slots[slot.0].push(&vals, hint);
 
         // Cells are assigned once the registry order is known; record the
         // (declared slot, schema index, row) triple and resolve in `finish`.
@@ -478,6 +518,7 @@ mod tests {
 
     impl GateType for MultGate {
         type Row = (F128, F128, F128);
+        type Hint = ();
 
         fn table(&self) -> TableType {
             TableType::element(self.ty.clone()).with_io_schema(vec![
@@ -487,7 +528,7 @@ mod tests {
             ])
         }
 
-        fn eval(&self, inputs: &[F128]) -> (Vec<F128>, Self::Row) {
+        fn eval(&self, inputs: &[F128], _hint: &()) -> (Vec<F128>, Self::Row) {
             let (a, b) = (inputs[0], inputs[1]);
             let c = a * b;
             (vec![c], (a, b, c))
