@@ -239,6 +239,27 @@ fn element_only_transcript_shape_is_pinned() {
         shape.squeeze_roles().len(),
     );
 
+    // The FS chain's actual row inventory, derived from the schedule rather
+    // than estimated. `finalize_parents` is the term a flat "one compression
+    // per squeeze" model misses: a finalize collapses the chunk stack, so it
+    // gets more expensive as the transcript grows.
+    let inv = shape.blake3_inventory(DOMAIN.len());
+    println!(
+        "  BLAKE3 rows: absorb {} | chunk parents {} | finalize blocks {} | \
+         finalize parents {} | xof {} = {} total",
+        inv.absorb_blocks,
+        inv.chunk_parents,
+        inv.finalize_blocks,
+        inv.finalize_parents,
+        inv.xof_blocks,
+        inv.total(),
+    );
+    println!(
+        "    (a flat one-per-squeeze model would say {}, missing {} stack merges)",
+        inv.total() - inv.finalize_parents,
+        inv.finalize_parents,
+    );
+
     if std::env::var_os("TRANSCRIPT_SHAPE_PRINT").is_some() {
         println!("const EXPECTED: &str = \"{}\";", shape.digest_hex());
         return;

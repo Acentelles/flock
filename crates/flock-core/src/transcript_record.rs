@@ -239,6 +239,93 @@ impl TranscriptShape {
     }
 }
 
+/// The BLAKE3 compression inventory of one transcript — the FS chain's actual
+/// row count, broken out by flavour because they differ in flags, in counter,
+/// and in whether they serialize.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Blake3Inventory {
+    /// Blocks compressed as the stream is absorbed. Sequential within a 1 KiB
+    /// chunk, independent across chunks.
+    pub absorb_blocks: usize,
+    /// `PARENT` compressions that build the chunk tree during absorption:
+    /// `C − popcount(C)` for `C` complete chunks.
+    pub chunk_parents: usize,
+    /// The pending block each finalization must compress — one per squeeze.
+    pub finalize_blocks: usize,
+    /// **The term a flat "one compression per squeeze" model misses.** A
+    /// finalize is not local: it collapses the current chunk stack, so it costs
+    /// `popcount(complete chunks)` `PARENT` compressions, the last of them
+    /// `ROOT`. That grows as the transcript does, so late squeezes cost more
+    /// than early ones.
+    pub finalize_parents: usize,
+    /// XOF output blocks past the first: the root compression already yields
+    /// 64 bytes, so only longer squeezes need more. Counter-mode, hence
+    /// mutually independent.
+    pub xof_blocks: usize,
+}
+
+impl Blake3Inventory {
+    pub fn total(&self) -> usize {
+        self.absorb_blocks
+            + self.chunk_parents
+            + self.finalize_blocks
+            + self.finalize_parents
+            + self.xof_blocks
+    }
+}
+
+impl TranscriptShape {
+    /// Count the BLAKE3 compressions this transcript actually costs, by
+    /// walking the recorded schedule and tracking the byte offset — which is
+    /// all that is needed, since the chunk stack's depth at any point is
+    /// `popcount(offset / 1024)`.
+    ///
+    /// Derived rather than estimated: the FS chain's row inventory is exactly
+    /// this, and the flat `one per squeeze` approximation the hash-count bench
+    /// uses undercounts it (see [`Blake3Inventory::finalize_parents`]).
+    pub fn blake3_inventory(&self, domain_len: usize) -> Blake3Inventory {
+        let mut inv = Blake3Inventory::default();
+        // The domain header + padded domain is absorbed at construction.
+        let mut offset = 16 + domain_len.div_ceil(16) * 16;
+
+        // Complete chunks at a byte offset: a chunk stays "current" until more
+        // data follows it, so an exact multiple of 1024 has not closed yet.
+        let complete_chunks = |o: usize| o.saturating_sub(1) / 1024;
+
+        let mut finalize_at = |o: usize, out_bytes: usize, inv: &mut Blake3Inventory| {
+            let c = complete_chunks(o);
+            inv.finalize_blocks += 1;
+            inv.finalize_parents += c.count_ones() as usize;
+            inv.xof_blocks += out_bytes.div_ceil(64).saturating_sub(1);
+        };
+
+        for op in &self.ops {
+            match op {
+                TranscriptOp::SqueezeScalar | TranscriptOp::SqueezeSlice(_) => {
+                    // The header is absorbed, THEN the state is finalized, then
+                    // the squeezed output is re-absorbed.
+                    offset += 16;
+                    finalize_at(offset, op.squeezed_bytes(), &mut inv);
+                    offset += op.absorbed_bytes() - 16;
+                }
+                TranscriptOp::Pow { .. } => {
+                    // `grind_pow` digests the state first, then absorbs the nonce.
+                    finalize_at(offset, 32, &mut inv);
+                    offset += op.absorbed_bytes();
+                }
+                _ => offset += op.absorbed_bytes(),
+            }
+        }
+
+        // The live hasher compresses a block once it is full AND more input
+        // arrives, so the final block waits for a finalize.
+        inv.absorb_blocks = offset.saturating_sub(1) / 64;
+        let c = complete_chunks(offset);
+        inv.chunk_parents = c - (c.count_ones() as usize);
+        inv
+    }
+}
+
 /// One 128-bit word of the absorbed byte stream.
 ///
 /// The 16-byte-aligned framing makes the stream a sequence of whole 128-bit
