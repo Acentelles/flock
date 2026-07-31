@@ -47,7 +47,7 @@
 //! The opening uses **Ligerito**, which requires `v` to be large enough for
 //! the recursion to be feasible (`ligerito::default_config` succeeds). At
 //! `log_batch_size = log_inv_rate = 1` the floor is `log_n ≥ 8` (the L0 block
-//! must hold `udr_queries(1) = 243` distinct queries, so `2^log_n ≥ 243`);
+//! must be at least `udr_queries(1) = 243` wide, so `2^log_n ≥ 243`);
 //! since `v` has `μ+1` vars, that means **μ ≥ 7**. Committing a single poly
 //! (rather than `h` and `v` separately) also keeps it to one opening —
 //! Ligerito's succinct verifier is not transcript-balanced for chaining two

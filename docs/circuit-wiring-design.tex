@@ -586,15 +586,17 @@ model, given three things (all now designed or landed):
         $\code{eval\_rs\_eq}$ family ($\sim$15k mults): recursion gets
         simpler as it recurses.
   \item \textbf{Inner-protocol shape normalization} (family J), settled:
-        \settled{Ron} query sampling \emph{with replacement} (the
-        rejection loop and dedup disappear; soundness re-accounted);
+        \settled{Ron} query sampling \emph{with replacement} ---
+        \emph{landed}, see \S\ref{sec:replacement-sampling}; the rejection
+        loop, the \code{HashSet} and the sort are gone, and the soundness
+        re-accounting came out at \emph{no change to any query count}.
         Merkle openings as \emph{full independent fixed-depth paths}
         first ($\sim$30\% more hash work, fully static circuit), with
         \emph{Merkle caps} (commit the top-$2^k$ layer; every path
-        shortens by $k$) as the later knob. \settled{Ron} The Merkle/FS
-        hash is \textbf{BLAKE3 throughout} --- the $2\times$ circuit-size
-        win inverts the native HW-SHA decision; the selectable-hash
-        machinery is merged.
+        shortens by $k$) as the later knob --- still owed. \settled{Ron}
+        The Merkle/FS hash is \textbf{BLAKE3 throughout} --- the
+        $2\times$ circuit-size win inverts the native HW-SHA decision;
+        the selectable-hash machinery is merged.
   \item \textbf{Succinctness closure}: every verifier component polylog
         in-circuit or delegated.
         \textbf{The matrix work --- both classes' combs --- is SOLVED, and
@@ -617,6 +619,63 @@ model, given three things (all now designed or landed):
 Bit-level control (query index bits, path direction selects, FS byte
 packing) lives in boolean-class glue tables where $\Ftwo$-linear work is
 free; word granularity carries everything across the boundary.
+
+\subsection{Query sampling with replacement}\label{sec:replacement-sampling}
+
+The inner protocol used to sample \emph{distinct} query positions:
+draw, reduce mod the block length, reject on a repeat, and finally sort.
+An unbounded loop, a hash set and a sort --- three shapes a
+fixed-topology circuit cannot express. The sampler now draws with
+replacement: exactly $q$ draws, duplicates kept, returned in sample
+order. In circuit terms it is one fixed-length squeeze followed by a
+low-bit mask per element, and nothing else. (Block lengths are powers of
+two, so the mask is exact --- the reduction was never a source of bias,
+only the distinctness was a source of control flow.)
+
+\paragraph{The re-accounting: no query count moves.}
+Let $S$ be the agreement set of a word at distance $\gamma$ from the
+code, $|S|/n \le 1-\gamma$. The bad event is that every queried position
+lands in $S$. For $q$ independent uniform draws that probability is
+exactly $(|S|/n)^q \le (1-\gamma)^q$. Sampling without replacement gives
+the hypergeometric $\prod_{i<q} (|S|-i)/(n-i)$, which is
+\emph{smaller}. The implementation solves $q = \lceil 100 / \log_2
+(1/(1-\gamma)) \rceil$ --- i.e.\ it was already pricing the
+with-replacement bound, and the old distinct-query sampler was buying
+slack that no formula ever spent. So the switch costs nothing and every
+per-level query count is unchanged: 243 at rate $1/2$, 148 at $1/4$, and
+so on. The $\alpha$-batching of the induced basis is likewise
+indifferent --- a repeated position merges into one constraint carrying
+the summed weight, and a violated position still puts a nonzero entry at
+both slots, leaving the multilinear Schwartz--Zippel term $\lceil \log_2
+Q\rceil / 2^{128}$ untouched. The one real cost of a duplicate is one
+fewer independent position, and that is exactly what the bound above
+already charges for.
+
+\paragraph{Where the obligation moved.}
+Two, both native-side. The octopus multi-proof wants strictly ascending
+unique leaf positions, so the verifier now collapses the multiset itself
+--- and while collapsing it must \emph{reject a prover that answered one
+position with two different rows}, since only one row per position
+reaches the Merkle check while every slot feeds the induced basis. That
+sort does not need to arithmetise: it disappears in-circuit under the
+other half of family J, where openings become independent fixed-depth
+paths and a duplicate is simply a repeated path.
+
+\paragraph{Consequence for the FS chain.}
+The draws are now a single batched squeeze per level rather than $q$
+sequentially-dependent duplex rounds. At L0 that is $\sim$62 sequential
+compressions in place of $243{+}$ --- one finalize, one counter-mode XOF
+fill whose blocks are mutually independent, one bulk re-absorb. This
+directly sizes the FS chain table, which has to replay the whole chain.
+A bit-packed squeeze (one field element carrying $\sim$6 query indices)
+would cut it by another $\sim$8$\times$ and remains available; it was not
+taken because it trades the short low-bit mask for a full 128-bit
+decomposition per squeezed element.
+
+The ladder shapes still refuse a block narrower than its query count.
+That is now a proof-size convention rather than a soundness requirement
+--- such a block would open most of itself --- and holding it fixed is
+what keeps every shipped ladder identical across the change.
 
 % ===========================================================================
 \section{Statement, transcript, Fiat--Shamir}\label{sec:statement}

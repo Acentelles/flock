@@ -182,6 +182,19 @@ const UDR_TARGET_BITS: f64 = 100.0;
 /// Per-query soundness saturates below 1 bit (`γ < 1/2`), so slimmer codes
 /// bottom out near `UDR_TARGET_BITS` queries: 243 at rate 1/2, 148 at 1/4,
 /// 121 at 1/8, 110 at 1/16, 105 at 1/32.
+///
+/// **This count is already the with-replacement count.** The bad event is
+/// "every queried position lands in the agreement set `S`", `|S|/n ≤ 1−γ`.
+/// For `q` independent uniform draws that is exactly `(|S|/n)^q ≤ (1−γ)^q`,
+/// which is the `q = ⌈100 / log₂(1/(1−γ))⌉` solved for here. Sampling
+/// *without* replacement is the strictly better hypergeometric
+/// `∏_{i<q} (|S|−i)/(n−i) ≤ (1−γ)^q`, so the old distinct-query sampler was
+/// buying slack this function never spent. Moving to [`sample_queries`] (with
+/// replacement) therefore changes **no** query count — it only stops earning
+/// an unclaimed bonus. See also the alpha-batching note in
+/// [`induce_sumcheck_evaluate_at_residual`]: repeated positions merge into one
+/// constraint with a combined weight, which leaves the multilinear
+/// Schwartz–Zippel term `⌈log₂ Q⌉/2^128` untouched.
 pub fn udr_queries(log_inv_rate: usize) -> usize {
     assert!(log_inv_rate > 0, "log_inv_rate=0 (rate 1) has no soundness");
     let per_q = udr_per_query_bits_asymptotic(log_inv_rate);
@@ -284,7 +297,14 @@ struct LadderShape {
 /// Shared shape derivation behind [`default_config`] and
 /// [`LigeritoSecurityConfig::derive_profile`]: 3-bit recursive folds with the
 /// rate index increasing by ≥ 1 per level, bumped further whenever the block
-/// length couldn't accommodate `queries_at_rate(rate)` distinct queries.
+/// length is narrower than `queries_at_rate(rate)`.
+///
+/// That width rule is a **proof-size convention, not a soundness bound**:
+/// [`sample_queries`] draws with replacement and stays sound for any width
+/// (see [`udr_queries`]). A block narrower than its query count would just
+/// open most of itself, which is a shape worth refusing. Keeping the rule
+/// unchanged also keeps every shipped ladder byte-identical to before the
+/// with-replacement switch.
 fn derive_ladder_shape(
     log_n: usize,
     initial_k: usize,
@@ -1839,6 +1859,15 @@ pub(crate) fn induce_sumcheck_evaluate_at_residual(
     // indices ≥ n_queries. Replaces the legacy α^i Vandermonde scheme;
     // soundness bound goes from `Q/q` (univariate S-Z) to `⌈log₂ Q⌉/q`
     // (multilinear S-Z), matching the rest of the multilinear protocol.
+    //
+    // `queries` is a multiset — sampling is with replacement — so two slots
+    // `i ≠ i'` may share a position and merge into that position's single
+    // constraint with combined weight `eq(α,i) + eq(α,i')`. The batching
+    // argument is indifferent: a violated position still yields a nonzero
+    // entry of the violation vector at both `i` and `i'`, so the S-Z term
+    // stays `⌈log₂ Q⌉/2^128`. What a duplicate does cost is one fewer
+    // *independent* position, and that is already priced into the query count
+    // (see [`udr_queries`]).
     let alpha_pows: Vec<F128> = if n_queries == 0 {
         Vec::new()
     } else {
@@ -3133,29 +3162,49 @@ impl SumcheckProver {
 // Prover / Verifier — stubs
 // ===================================================================
 
-/// Sample `count` distinct positions in `[0, block_len)` via the challenger.
-/// Asserts `count <= block_len` — otherwise no number of samples could satisfy
-/// the distinctness requirement (would infinite-loop).
-fn sample_distinct_queries<Ch: Challenger>(
+/// Sample `count` positions in `[0, block_len)` via the challenger, **with
+/// replacement**: exactly `count` draws, duplicates allowed, returned in
+/// sample order (unsorted).
+///
+/// Shaped for arithmetisation. The old sampler rejected repeats, which cost a
+/// `HashSet`, a sort, and an unbounded loop — none of which a circuit can
+/// express. All three are gone: this is one fixed-length squeeze followed by a
+/// low-bit mask per element, a fully static shape.
+///
+/// The single `sample_f128_vec` squeeze also matters for the FS chain the
+/// recursive verifier has to replay. Per-element `sample_f128` calls are
+/// `count` sequentially-dependent duplex rounds (absorb tag, finalize, absorb
+/// the 16 squeezed bytes); the batched form is one finalize, one XOF fill —
+/// counter-mode, so its blocks are independent — and one bulk re-absorb. At
+/// L0 (243 queries) that is ~62 sequential compressions instead of 243+.
+///
+/// `block_len` is a power of two (it is `2^(log_msg_cols + log_inv_rate)`), so
+/// masking the low bits is exact and unbiased — no modular reduction and no
+/// rejection needed for uniformity either.
+///
+/// `count` may exceed `block_len` without harm; the soundness bound
+/// (see [`udr_queries`]) is the independent-sample one and never depended on
+/// distinctness. Ladder shapes still keep `block_len >= count` — see
+/// [`derive_ladder_shape`] — but that is now a proof-size convention rather
+/// than a correctness requirement.
+fn sample_queries<Ch: Challenger>(
     challenger: &mut Ch,
     block_len: usize,
     count: usize,
 ) -> Vec<usize> {
     assert!(
-        count <= block_len,
-        "sample_distinct_queries: count ({count}) > block_len ({block_len}) — config is too thin for this query count"
+        block_len.is_power_of_two(),
+        "sample_queries: block_len ({block_len}) must be a power of two"
     );
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::with_capacity(count);
-    while out.len() < count {
-        let v = challenger.sample_f128();
-        let q = (v.lo as usize) % block_len;
-        if seen.insert(q) {
-            out.push(q);
-        }
+    if count == 0 {
+        return Vec::new();
     }
-    out.sort_unstable();
-    out
+    let mask = block_len - 1;
+    challenger
+        .sample_f128_vec(count)
+        .iter()
+        .map(|v| (v.lo as usize) & mask)
+        .collect()
 }
 
 /// Build a single octopus multi-proof for all `queries` against `tree`.
@@ -3700,7 +3749,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
 
     // Open L0; lane-fold weights = r_lane_fold.
     let num_queries_0 = config.queries[0];
-    let queries_0 = sample_distinct_queries(challenger, l0_block_len, num_queries_0);
+    let queries_0 = sample_queries(challenger, l0_block_len, num_queries_0);
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     let _t = std::time::Instant::now();
     let opened_rows_0: Vec<Vec<F128>> = queries_0.iter().map(|&q| l0_row(q).to_vec()).collect();
@@ -3782,7 +3831,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             grinding_nonces.push(nonce_last);
             let num_queries_last = config.queries[i + 1];
             let queries_last =
-                sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_last);
+                sample_queries(challenger, wtns_prev.block_len, num_queries_last);
             let _t = std::time::Instant::now();
             let opened_rows_last: Vec<Vec<F128>> = queries_last
                 .iter()
@@ -3894,7 +3943,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let nonce_i = challenger.grind_pow(config.grinding_bits[i + 1] as u32);
         grinding_nonces.push(nonce_i);
         let num_queries_i = config.queries[i + 1];
-        let queries_i = sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i);
+        let queries_i = sample_queries(challenger, wtns_prev.block_len, num_queries_i);
         let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
         let _t = std::time::Instant::now();
         let opened_rows_i: Vec<Vec<F128>> = queries_i
@@ -4110,7 +4159,7 @@ where
 
     let num_queries_0 = config.queries[0];
     let _t = std::time::Instant::now();
-    let queries_0 = sample_distinct_queries(challenger, block_len_0, num_queries_0);
+    let queries_0 = sample_queries(challenger, block_len_0, num_queries_0);
     if trace {
         t_sample_q += _t.elapsed();
     }
@@ -4250,7 +4299,7 @@ where
             let num_queries_last = config.queries[i + 1];
             let _t = std::time::Instant::now();
             let queries_last =
-                sample_distinct_queries(challenger, prev_block_len, num_queries_last);
+                sample_queries(challenger, prev_block_len, num_queries_last);
             // Basis-induction challenge for the LAST commitment. Sampled here —
             // after `yr` was observed (top of this branch) and the queries are
             // fixed — so a forged `yr` cannot be adapted to it. Mirrors `alpha_i`
@@ -4389,7 +4438,7 @@ where
                     t_merkle.as_secs_f64() * 1e3
                 );
                 eprintln!(
-                    "  sample_distinct_queries:   {:.2} ms",
+                    "  sample_queries:            {:.2} ms",
                     t_sample_q.as_secs_f64() * 1e3
                 );
                 eprintln!(
@@ -4458,7 +4507,7 @@ where
         let prev_num_interleaved = 1usize << prev_log_num_interleaved;
         let num_queries_i = config.queries[i + 1];
         let _t = std::time::Instant::now();
-        let queries_i = sample_distinct_queries(challenger, prev_block_len, num_queries_i);
+        let queries_i = sample_queries(challenger, prev_block_len, num_queries_i);
         if trace {
             t_sample_q += _t.elapsed();
         }
@@ -4654,7 +4703,7 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
     nonce_idx += 1;
 
     let num_queries_0 = config.queries[0];
-    let queries_0 = sample_distinct_queries(challenger, block_len_0, num_queries_0);
+    let queries_0 = sample_queries(challenger, block_len_0, num_queries_0);
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     if !verify_level_opens(
         &proof.initial_root,
@@ -4775,7 +4824,7 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
             let prev_num_interleaved = 1usize << prev_log_num_interleaved;
             let num_queries_last = config.queries[i + 1];
             let queries_last =
-                sample_distinct_queries(challenger, prev_block_len, num_queries_last);
+                sample_queries(challenger, prev_block_len, num_queries_last);
             // Final-level basis-induction challenge — sampled after `yr` and the
             // queries are fixed. Same position as the succinct verifier
             // (recursive_verifier_with_basis_succinct), which verifies the same
@@ -4894,7 +4943,7 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
         let prev_block_len = 1usize << (prev_log_msg_cols + prev_log_inv_rate);
         let prev_num_interleaved = 1usize << prev_log_num_interleaved;
         let num_queries_i = config.queries[i + 1];
-        let queries_i = sample_distinct_queries(challenger, prev_block_len, num_queries_i);
+        let queries_i = sample_queries(challenger, prev_block_len, num_queries_i);
         let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
         if recursive_proof_idx >= proof.recursive_proofs.len() {
             return false;
@@ -5011,7 +5060,7 @@ fn recursive_prover_inner<Ch: Challenger>(
 
     // ---- Queries + open wtns_0 ----
     let num_queries_0 = udr_queries(log_inv_rate_0);
-    let queries_0 = sample_distinct_queries(challenger, wtns_0.block_len, num_queries_0);
+    let queries_0 = sample_queries(challenger, wtns_0.block_len, num_queries_0);
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     let t = std::time::Instant::now();
     let opened_rows_0: Vec<Vec<F128>> = queries_0.iter().map(|&q| wtns_0.row(q).to_vec()).collect();
@@ -5086,7 +5135,7 @@ fn recursive_prover_inner<Ch: Challenger>(
             // wtns_prev's rate (= log_inv_rates[i+1] for wtns_{i+1}).
             let num_queries_last = udr_queries(config.log_inv_rates[i + 1]);
             let queries_last =
-                sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_last);
+                sample_queries(challenger, wtns_prev.block_len, num_queries_last);
             let opened_rows_last: Vec<Vec<F128>> = queries_last
                 .iter()
                 .map(|&q| wtns_prev.row(q).to_vec())
@@ -5141,7 +5190,7 @@ fn recursive_prover_inner<Ch: Challenger>(
 
         // Open wtns_prev. wtns_prev = wtns_{i+1} uses log_inv_rates[i+1].
         let num_queries_i = udr_queries(config.log_inv_rates[i + 1]);
-        let queries_i = sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i);
+        let queries_i = sample_queries(challenger, wtns_prev.block_len, num_queries_i);
         let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
         let t = std::time::Instant::now();
         let opened_rows_i: Vec<Vec<F128>> = queries_i
@@ -5182,6 +5231,16 @@ fn recursive_prover_inner<Ch: Challenger>(
 
 /// Verify all opened rows against one root via a single octopus multi-proof.
 /// `queries` must be sorted ascending and aligned with `opened_rows`.
+/// Check the level's opened rows against `root`.
+///
+/// `queries` is a **multiset in sample order** — sampling is with replacement
+/// (see [`sample_queries`]) — while [`merkle::verify_merkle_multi_proof`] wants
+/// strictly ascending unique positions. Collapsing the two is this function's
+/// job, and it is where a repeated position has to be pinned down: only one row
+/// per position reaches the Merkle check, but *every* slot feeds
+/// `induce_sumcheck_enforced_sum`, so a prover that answered one position with
+/// two different rows would slip an unchecked row into the induced basis. Rows
+/// at a repeated position must therefore agree.
 fn verify_level_opens(
     root: &Hash,
     block_len: usize,
@@ -5207,7 +5266,33 @@ fn verify_level_opens(
         };
         leaf_hashes.push(merkle::hash_leaf(bytes, kind));
     }
-    merkle::verify_merkle_multi_proof(root, block_len, queries, &leaf_hashes, multi_proof, kind)
+
+    // Sort slot indices by position (stable order is irrelevant — equal
+    // positions must carry equal leaves anyway), then dedup.
+    let mut slots: Vec<usize> = (0..queries.len()).collect();
+    slots.sort_unstable_by_key(|&i| queries[i]);
+    let mut positions: Vec<usize> = Vec::with_capacity(slots.len());
+    let mut unique_leaves: Vec<Hash> = Vec::with_capacity(slots.len());
+    for &i in &slots {
+        if positions.last() == Some(&queries[i]) {
+            // Repeat of the previous position: the row must be the same one.
+            if unique_leaves[unique_leaves.len() - 1] != leaf_hashes[i] {
+                return false;
+            }
+            continue;
+        }
+        positions.push(queries[i]);
+        unique_leaves.push(leaf_hashes[i]);
+    }
+
+    merkle::verify_merkle_multi_proof(
+        root,
+        block_len,
+        &positions,
+        &unique_leaves,
+        multi_proof,
+        kind,
+    )
 }
 
 /// Verifier counterpart to [`recursive_prover`]. Supports arbitrary `R ≥ 1`.
@@ -5250,7 +5335,7 @@ pub fn recursive_verifier<Ch: Challenger>(
     let block_len_0 = 1usize << (log_msg_cols_0 + log_inv_rate_0);
     let num_interleaved_0 = 1usize << initial_k;
     let num_queries_0 = udr_queries(log_inv_rate_0);
-    let queries_0 = sample_distinct_queries(challenger, block_len_0, num_queries_0);
+    let queries_0 = sample_queries(challenger, block_len_0, num_queries_0);
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
 
     if !verify_level_opens(
@@ -5362,7 +5447,7 @@ pub fn recursive_verifier<Ch: Challenger>(
             let prev_num_interleaved = 1usize << prev_log_num_interleaved;
             let num_queries_last = udr_queries(prev_log_inv_rate);
             let queries_last =
-                sample_distinct_queries(challenger, prev_block_len, num_queries_last);
+                sample_queries(challenger, prev_block_len, num_queries_last);
             // Final-level basis-induction challenge (after yr + queries fixed).
             let alpha_last = challenger.sample_f128_vec(ceil_log2(num_queries_last));
             if !verify_level_opens(
@@ -5434,7 +5519,7 @@ pub fn recursive_verifier<Ch: Challenger>(
         let prev_block_len = 1usize << (prev_log_msg_cols + prev_log_inv_rate);
         let prev_num_interleaved = 1usize << prev_log_num_interleaved;
         let num_queries_i = udr_queries(prev_log_inv_rate);
-        let queries_i = sample_distinct_queries(challenger, prev_block_len, num_queries_i);
+        let queries_i = sample_queries(challenger, prev_block_len, num_queries_i);
         let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
 
         if recursive_proof_idx >= proof.recursive_proofs.len() {
@@ -6698,7 +6783,7 @@ mod tests {
                 );
                 return usize::MAX;
             }
-            let qs = sample_distinct_queries(&mut ch, bl, qn);
+            let qs = sample_queries(&mut ch, bl, qn);
             let sib = multi_proof_num_siblings(&qs, bl);
             let opened = qn * (1usize << log_num_interleaved[i]) * ELEM;
             let merkle = sib * 32;
@@ -7019,6 +7104,129 @@ mod tests {
         assert!(ok, "basis-based verifier rejected valid proof");
     }
 
+    /// The sampler draws with replacement: exactly `count` positions, in
+    /// range, challenger-deterministic, from ONE batched squeeze — and at the
+    /// shipped L0 shape it really does repeat, so the duplicate handling below
+    /// is on the live path rather than a theoretical branch.
+    #[test]
+    fn sample_queries_is_with_replacement_from_one_batched_squeeze() {
+        use crate::challenger::Challenger;
+        let block_len = 1usize << 13;
+        let count = udr_queries(1); // 243 — the shipped L0 count at rate 1/2
+
+        let mut ch = crate::challenger::FsChallenger::new(b"sample-queries-test");
+        let qs = sample_queries(&mut ch, block_len, count);
+
+        // Exactly `count` draws. The old sampler's draw count was data-
+        // dependent (it redrew on a repeat); this one is not, which is the
+        // whole point for the circuit.
+        assert_eq!(qs.len(), count);
+        assert!(qs.iter().all(|&q| q < block_len));
+
+        // Challenger-deterministic.
+        let mut ch2 = crate::challenger::FsChallenger::new(b"sample-queries-test");
+        assert_eq!(sample_queries(&mut ch2, block_len, count), qs);
+
+        // One `sample_f128_vec` squeeze plus a low-bit mask — nothing else.
+        // This pins the transcript shape the FS chain table has to replay.
+        let mut ch3 = crate::challenger::FsChallenger::new(b"sample-queries-test");
+        let raw = ch3.sample_f128_vec(count);
+        let expected: Vec<usize> = raw
+            .iter()
+            .map(|v| (v.lo as usize) & (block_len - 1))
+            .collect();
+        assert_eq!(qs, expected);
+
+        // 243 draws into 2^13 has a birthday expectation of ~3.6 collisions.
+        let mut uniq = qs.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert!(
+            uniq.len() < qs.len(),
+            "expected repeats among 243 draws into 2^13, got {} unique",
+            uniq.len()
+        );
+    }
+
+    /// A repeated query position must carry a single row. Only one row per
+    /// position reaches the Merkle check, but every slot feeds
+    /// `induce_sumcheck_enforced_sum` — so without this check a prover could
+    /// slip an unchecked row into the induced basis through the second slot.
+    #[test]
+    fn verify_level_opens_rejects_disagreeing_rows_at_a_repeated_position() {
+        use crate::challenger::Challenger;
+        let (log_msg, log_interleaved, log_inv_rate) = (4usize, 2usize, 2usize);
+        let num_interleaved = 1usize << log_interleaved;
+        let poly_len = (1usize << log_msg) * num_interleaved;
+
+        let mut ch = crate::challenger::RandomChallenger::new(0x0DDD_1CE5);
+        let poly: Vec<F128> = (0..poly_len).map(|_| ch.sample_f128()).collect();
+        let ntt = AdditiveNttF128::standard(log_msg + log_inv_rate);
+        let w = ligero_commit(
+            &poly,
+            log_msg,
+            log_interleaved,
+            log_inv_rate,
+            &ntt,
+            HashKind::Sha256,
+        );
+
+        // A multiset in sample order with a deliberate repeat — the shape
+        // `sample_queries` now produces (unsorted, duplicates kept).
+        let queries = vec![9usize, 2, 9, 5];
+        let honest: Vec<Vec<F128>> = queries.iter().map(|&q| w.row(q).to_vec()).collect();
+        let proof = merkle_multi_proof_for(&w.tree, w.block_len, &queries);
+        let root = w.root();
+
+        assert!(
+            verify_level_opens(
+                &root,
+                w.block_len,
+                &queries,
+                &honest,
+                num_interleaved,
+                &proof,
+                HashKind::Sha256
+            ),
+            "honest unsorted opening with a repeat must verify"
+        );
+
+        // Slot 2 is the second occurrence of position 9. Tamper it: whichever
+        // of the two slots the dedup keeps, the other disagrees.
+        let mut forged = honest.clone();
+        forged[2][0] += F128::ONE;
+        assert!(
+            !verify_level_opens(
+                &root,
+                w.block_len,
+                &queries,
+                &forged,
+                num_interleaved,
+                &proof,
+                HashKind::Sha256
+            ),
+            "disagreeing rows at a repeated position must be rejected"
+        );
+
+        // Control: the same tamper at a non-repeated position is caught by the
+        // Merkle check itself, so the new check is not what is doing the work
+        // above by accident.
+        let mut tampered = honest.clone();
+        tampered[1][0] += F128::ONE;
+        assert!(
+            !verify_level_opens(
+                &root,
+                w.block_len,
+                &queries,
+                &tampered,
+                num_interleaved,
+                &proof,
+                HashKind::Sha256
+            ),
+            "a tampered row at a unique position must fail the Merkle check"
+        );
+    }
+
     /// `induce_sumcheck_evaluate_at_residual` matches dense
     /// `induce_sumcheck_poly` + `partial_eval_lsb`.
     #[test]
@@ -7115,7 +7323,9 @@ mod tests {
         let ntt = AdditiveNttF128::standard(log_msg_cols + log_inv_rate);
         let wtns = ligero_commit(&yr, log_msg_cols, 0, log_inv_rate, &ntt, HashKind::Sha256);
 
-        // Distinct query positions (the protocol always samples distinct ones).
+        // Distinct query positions. The protocol samples with replacement, so
+        // distinctness is not required here — it just keeps this fixture's
+        // expected values easy to reason about.
         let mut queries: Vec<usize> = Vec::new();
         let mut q = 1usize;
         while queries.len() < num_queries {

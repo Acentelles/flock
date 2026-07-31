@@ -636,8 +636,11 @@ fn pcs_params(m_words: usize) -> PcsParams {
 }
 
 /// Smallest `m_words` Ligerito's recursion can open at the parameters above
-/// (the L0 block must hold `udr_queries(1) = 243` distinct queries). Below it
-/// [`prove`] cannot run; the PIOP phases themselves have no such floor.
+/// (the L0 block must be at least `udr_queries(1) = 243` wide). Queries are
+/// sampled with replacement, so that is a ladder-shape convention rather than
+/// a soundness requirement — but it is the one `default_config` enforces.
+/// Below it [`prove`] cannot run; the PIOP phases themselves have no such
+/// floor.
 pub const MIN_M_WORDS: usize = 8;
 
 fn ligerito_prover_config(m_words: usize) -> ProverConfig {

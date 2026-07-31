@@ -32,6 +32,12 @@
 //! aligned, const pin moved to the end — the circuit/wiring layer's
 //! prerequisite). The SHA-256 anchor digest survived the latter unchanged,
 //! pinning that the re-layout touched nothing outside BLAKE3.
+//! Ligerito query sampling **with replacement** (2026-07-31): the sampler
+//! stopped rejecting repeats and moved to a single batched squeeze per level,
+//! so every Fiat–Shamir stream downstream of the first query phase shifts.
+//! All six digests moved, which is the correct signature — the change is
+//! transcript-only, and the M1/M2 differentials plus every roundtrip and
+//! tamper test stayed green across it.
 
 use ::sha2 as sha2_hash;
 use flock_core::proof::{R1csClaim, R1csProofJaggedLigerito};
@@ -124,22 +130,22 @@ fn m6_mixed_union_proof_bytes_pinned() {
         (
             "mixed-nu10-1024-1024",
             [1024, 1024],
-            "3375527896c6f364dbf986a4dda6389f08bfc4a244d20b17c50ab62e67476b42",
+            "41ebcf0c2c0a4f40ef259773907963bbdd2d4133e3359e5510a51ea52ca25e0b",
         ),
         (
             "mixed-nu10-50-37",
             [50, 37],
-            "d08231e2c17732c775d41493bf0fb1215f6dee67dff5d2f29af5dc517b56b315",
+            "18ae1691aa812c716958c179c090f416e1dbf68b0e731f57a074d5ba5479b84e",
         ),
         (
             "mixed-nu10-8-8",
             [8, 8],
-            "57340829db5e8d4cf8eeb0e7d425a9566079aa45e31b6f5dfeec8799cfa3ca87",
+            "55bc443f8d9c8e65a02d0ab7ed4602f4e4500d80a3dca44487ba2deaf182f7a9",
         ),
         (
             "mixed-nu10-0-64",
             [0, 64],
-            "ac9f2de9efc357498a780616d3a9d89766c7549fb61ecae123a22866bf323dca",
+            "0d076fc17698b31e6542b0768a6ed888a8a67f176c7013e88776205ce8187b7e",
         ),
     ];
 
@@ -203,7 +209,7 @@ fn m6_mixed_union_proof_bytes_pinned() {
 fn m6_single_type_anchor_proof_bytes_pinned() {
     // BLAKE3, 256 blocks (m = 22).
     {
-        const EXPECTED: &str = "3fc71fcc859e41939347b350f4bee3c6c4f5634a14a88b4a9837837b94f2fc4e";
+        const EXPECTED: &str = "2a9a9ac7a3f6f5f66fe497db63077c1f1c516d7381b405eebd6acd0957c7c445";
         let n_blocks = 256usize;
         let setup = blake3::Blake3Setup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_B3B3);
@@ -231,7 +237,7 @@ fn m6_single_type_anchor_proof_bytes_pinned() {
 
     // SHA-256, 128 blocks (m = 22).
     {
-        const EXPECTED: &str = "62c5dd92f540dcd900134cfb2c369f373ae9ef4b889be9e3139ea775ba6644b6";
+        const EXPECTED: &str = "bf1f9bb4df70eb1cc20c51fd3922d916aa8fa7df8eaa0315a1f99aa6e64251ed";
         let n_blocks = 128usize;
         let setup = sha2::Sha256HybridSetup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_5252);

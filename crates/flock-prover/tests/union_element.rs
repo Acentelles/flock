@@ -997,6 +997,12 @@ fn boolean_only_mixed_class_matches_the_plain_entry() {
 // These pin the mixed-class transcript AS SHIPPED so a later optimization has
 // to prove it changed no value. Regenerate after an INTENTIONAL protocol
 // change with `ELEMENT_FIXTURES_PRINT=1 ... --nocapture`.
+//
+// Re-pin history: Ligerito query sampling **with replacement** (2026-07-31).
+// The sampler stopped rejecting repeated positions and moved to a single
+// batched squeeze per level, so every Fiat–Shamir stream downstream of the
+// first query phase shifts. All seven digests moved — transcript-only, with
+// every roundtrip, tamper and differential test in this file green across it.
 // ---------------------------------------------------------------------------
 
 use sha2 as sha2_hash;
@@ -1044,17 +1050,17 @@ fn check(label: &str, expected: &str, got: String) {
 fn mixed_class_proof_bytes_pinned() {
     // Element-only: nu = 12, kappa = 3 (M = 22).
     const ELEMENT_ONLY: [(&str, usize, &str); 3] = [
-        ("elem-nu12-full", 1 << 12, "cb95c3eef3ba4c7f5806fcca47b5939991d9d411182f46137b4428bfc96cf835"),
-        ("elem-nu12-2731", 2731, "dd7c87beb9e15d4c6bbf0417171588533a5ea2595958d819c7995380f2f91e35"),
-        ("elem-nu12-0", 0, "f4b1b2703ac9931da1126ef6be5aca0f44e5f62b3afe6523588480a1dfeedc6c"),
+        ("elem-nu12-full", 1 << 12, "0ac211e72147f4d53162bc5423a675b24b1293b68f4482d346eda3cff8531fdd"),
+        ("elem-nu12-2731", 2731, "25584901370be1db5f455a03b5c84c5d1092c26f1904e0377ee22d7f6a99fba0"),
+        ("elem-nu12-0", 0, "a5d9d52769a7ecc17e4dc05597041403b2fdfbabe8480acd209118a5d9ede691"),
     ];
     // Mixed: BLAKE3 + element at nu = 7 (M = 22); counts in slot order
     // (BLAKE3 first — the boolean class leads).
     const MIXED: [(&str, [usize; 2], &str); 4] = [
-        ("mix-nu7-128-128", [128, 128], "6764361a516d897eb3b6fbcfd4e6e0226fa7295ac070ffe5ab5e127d0fbcdbe7"),
-        ("mix-nu7-100-90", [100, 90], "b11b58760d75ac29b11c3dc0ff3f7aa668ac42dfc14c693dbe0ce1ec92f6e6ae"),
-        ("mix-nu7-0-90", [0, 90], "b2bddb64f4c8f792cf8eff3fae19bdeaa36d02a097ba1c44522461000a641e14"),
-        ("mix-nu7-100-0", [100, 0], "eff085eecad0561b5f173812875d800853f870569a8b912a6e7cc2bd4855eeff"),
+        ("mix-nu7-128-128", [128, 128], "42bd5c3321f2bbe9f2adc7bc9613416ef1e37104f979fd92d999a147c9021e46"),
+        ("mix-nu7-100-90", [100, 90], "bc4ee7bdf2225297457cf75b276c42fc28e0bf5e38cbeaa94800aa7e951aab54"),
+        ("mix-nu7-0-90", [0, 90], "3c9e7db9e9c9fc0cde87288dc2b8c4ae0569f024578df3a001712b85cc569753"),
+        ("mix-nu7-100-0", [100, 0], "f5a19b88a0ee34cb34f81d748b59fc3d3e4ebf3638fe52fe660396c38dd5f944"),
     ];
 
     let (w0, w1) = (F128::new(0x51F0, 0), F128::new(0, 0x2C7E));
