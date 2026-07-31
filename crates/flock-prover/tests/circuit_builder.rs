@@ -1104,3 +1104,295 @@ fn mvp2_sumcheck_round_consumes_a_derived_challenge() {
         built.public.len(),
     );
 }
+
+/// **The whole element zerocheck replayed in-circuit**, against challenges the
+/// FS chain derives — a real proof, every round, and the final consistency
+/// check.
+///
+/// A mirror of `element_r1cs::zerocheck::verify_with_label`, statement by
+/// statement. That is a deliberate, recorded choice (wiring doc §"Mirroring the
+/// verifier, for now"): at ~150 element rows a hand-written replay is hours and
+/// prejudges nothing, and the decision gets revisited when the opening's ~47k
+/// arrives.
+///
+/// What it proves: *there exist round messages such that hashing them in the
+/// verifier's order yields these challenges, and the Convention-A chain run on
+/// them reaches a running claim equal to `ea·eb + ec`* — the zerocheck's own
+/// accept condition. The round messages are witness, and the same wires feed
+/// both the hash and the arithmetic, so the prover cannot shop for challenges.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn mvp2b_full_element_zerocheck_replayed() {
+    use flock_core::challenger::Challenger as _;
+    use flock_core::element_r1cs::{ElementTableBuilder, zerocheck};
+    use flock_core::transcript_record::{RecordingChallenger, StreamWord};
+    use flock_prover::prover::UnionElementSlotInput;
+    use flock_prover::r1cs_hashes::fs_chain::{CvSource, FsChain};
+
+    const D: &[u8] = b"flock-mvp2b";
+    const LABEL: &[u8] = b"flock-element-union-zc-v0";
+    let nu = 9usize;
+
+    // ---- a real element zerocheck over a small satisfying witness ----
+    let (kappa, n_log) = (2usize, 3usize); // 4 columns x 8 rows
+    let m_words = kappa + n_log;
+    let ety = {
+        let mut b = ElementTableBuilder::new(kappa);
+        b.free_wire(0).free_wire(1).mult(2, 0, 1);
+        b.build().expect("mult block")
+    };
+    let mut rng = Rng(0x2B00_0001);
+    let mut f = || F128::new(rng.next_u32() as u64, rng.next_u32() as u64);
+    let z = {
+        let at = |c: usize, j: usize| (c << n_log) + j;
+        let mut z = vec![F128::ZERO; ety.width() << n_log];
+        for j in 0..(1usize << n_log) {
+            let (a, bb) = (f(), f());
+            z[at(0, j)] = a;
+            z[at(1, j)] = bb;
+            z[at(2, j)] = a * bb;
+        }
+        z
+    };
+    assert!(ety.satisfies(&z, n_log, 1 << n_log));
+    let (mut pa, mut pb) = (vec![F128::ZERO; z.len()], vec![F128::ZERO; z.len()]);
+    ety.affine_products_into(&z, n_log, &mut pa, &mut pb);
+
+    let mut ch_p = FsChallenger::with_hash(D, HashKind::Blake3);
+    let (zc_proof, _) = zerocheck::prove_with_label(LABEL, pa, pb, &z, m_words, &mut ch_p);
+
+    // ---- record the verifier's transcript for it ----
+    let mut rec = RecordingChallenger::new(FsChallenger::with_hash(D, HashKind::Blake3));
+    zerocheck::verify_with_label(LABEL, m_words, &zc_proof, &mut rec).expect("zerocheck verifies");
+    let shape = rec.shape();
+    let stream = shape.stream_words(D);
+    let bytes = stream.to_bytes(rec.values(), rec.payloads());
+    let challenges = rec.challenges().to_vec();
+    assert_eq!(
+        challenges.len(),
+        m_words * 2,
+        "tau slice + one rho per round"
+    );
+
+    // ---- FS chain over it ----
+    let mut chain = FsChain::new();
+    let mut at = 0usize;
+    let fin: Vec<usize> = shape
+        .ops()
+        .iter()
+        .filter(|o| o.finalizes())
+        .map(|o| o.squeezed_bytes())
+        .collect();
+    for (k, &upto) in stream.finalize_after.iter().enumerate() {
+        chain.absorb(&bytes[at * 16..upto * 16]);
+        at = upto;
+        chain.finalize(fin[k]);
+    }
+    chain.absorb(&bytes[at * 16..]);
+    let trace = chain.finish();
+
+    // ---- circuit ----
+    let mut b = CircuitBuilder::new(nu);
+    let hash = b.slot(Blake3Gate { nu });
+    let arith = b.slot(ArithGate::new());
+    let zero = b.public_value(F128::ZERO);
+    let one = b.public_value(F128::ONE);
+    let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+    let iv = [b.public_value(iv_w[0]), b.public_value(iv_w[1])];
+
+    let mut outs: Vec<Vec<Wire>> = Vec::new();
+    let mut ins: Vec<[Wire; 7]> = Vec::new();
+    let mut word_wire: Vec<Option<Wire>> = vec![None; stream.words.len()];
+    // Every observed value gets its wire up front. Most are consumed by the
+    // hash as well, and that shared wire is the binding — but the transcript's
+    // TAIL is absorbed after the last squeeze and never compressed, so no row
+    // covers it. Here that is `ea`, `eb`, `ec`: in a standalone zerocheck they
+    // bind nothing, and in the real protocol the lincheck's alpha binds them.
+    for (wi, w) in stream.words.iter().enumerate() {
+        if let StreamWord::Value(k) = *w {
+            word_wire[wi] = Some(b.value(rec.values()[k]));
+        }
+    }
+    for (i, row) in trace.rows.iter().enumerate() {
+        let (_, _, counter, blen, flags) = *row;
+        let link = trace.links[i];
+        let params = b.public_value(pack_params(counter, blen, flags));
+        if let Some(root) = link.repeats {
+            let s = ins[root];
+            let gi = [s[0], s[1], s[2], s[3], s[4], s[5], params];
+            ins.push(gi);
+            outs.push(b.gate(hash, &gi));
+            continue;
+        }
+        let (cv_in, m_in) = match link.right {
+            Some(right) => {
+                let l = match link.cv {
+                    CvSource::Row(r) => r,
+                    CvSource::Iv => unreachable!(),
+                };
+                (iv, [outs[l][0], outs[l][1], outs[right][0], outs[right][1]])
+            }
+            None => {
+                let cv_in = match link.cv {
+                    CvSource::Iv => iv,
+                    CvSource::Row(r) => [outs[r][0], outs[r][1]],
+                };
+                let base = trace.block_offsets[i].expect("stream block") / 16;
+                let real = (blen as usize) / 16;
+                let mut m = [iv[0]; 4];
+                for (j, slot) in m.iter_mut().enumerate() {
+                    let wi = base + j;
+                    *slot = if j >= real || wi >= stream.words.len() {
+                        zero
+                    } else {
+                        match word_wire[wi] {
+                            Some(w) => w,
+                            None => {
+                                let w = match stream.words[wi] {
+                                    StreamWord::Const(c) => b.public_value(c),
+                                    _ => unreachable!("values are pre-wired"),
+                                };
+                                word_wire[wi] = Some(w);
+                                w
+                            }
+                        }
+                    };
+                }
+                (cv_in, m)
+            }
+        };
+        let gi = [
+            cv_in[0], cv_in[1], m_in[0], m_in[1], m_in[2], m_in[3], params,
+        ];
+        ins.push(gi);
+        outs.push(b.gate(hash, &gi));
+    }
+
+    // Challenge k's wire: the ROOT row of finalize k gives its first 16 bytes.
+    // The tau slice is one squeeze of `m_words` words, so its later words come
+    // from the XOF rows that follow that root.
+    let challenge_wire = |k: usize| -> Wire {
+        // finalize 0 is the tau slice (m_words challenges), then one per round.
+        if k < m_words {
+            // A 64-byte XOF block IS the four schema outputs, in order:
+            // out_lo0, out_lo1, out_hi0, out_hi1. So challenge k sits at
+            // output k%4 of block k/4.
+            outs[trace.squeezes[0][k / 4]][k % 4]
+        } else {
+            outs[trace.squeezes[1 + (k - m_words)][0]][0]
+        }
+    };
+    let value_wire = |k: usize| -> Wire {
+        let wi = stream
+            .words
+            .iter()
+            .position(|w| matches!(*w, StreamWord::Value(i) if i == k))
+            .expect("observed value is in the stream");
+        word_wire[wi].expect("wired")
+    };
+
+    // ---- the replay, mirroring zerocheck::verify_with_label ----
+    let mut running = zero; // a zerocheck starts at target 0
+    let mut running_v = F128::ZERO;
+    for i in 0..m_words {
+        let t = challenge_wire(i);
+        let t_v = challenges[i];
+        let (g1, g_inf) = (value_wire(2 * i), value_wire(2 * i + 1));
+        let (g1_v, g_inf_v) = (zc_proof.rounds[i].0, zc_proof.rounds[i].1);
+        let rho = challenge_wire(m_words + i);
+        let rho_v = challenges[m_words + i];
+
+        // g0 = (running + t·g1) · (1+t)⁻¹
+        let t_g1 = b.gate(arith, &[t, zero, g1, zero])[0];
+        let dinv_v = (F128::ONE + t_v).inv();
+        let dinv = b.value(dinv_v);
+        let dprod = b.gate(arith, &[one, t, dinv, zero])[0];
+        let pin = b.public_value(F128::ONE);
+        b.connect(dprod, pin);
+        let g0 = b.gate(arith, &[running, t_g1, dinv, zero])[0];
+        let g0_v = (running_v + t_v * g1_v) * dinv_v;
+
+        // running = g0·(1+ρ) + g1·ρ + g∞·ρ·(1+ρ)
+        let p1 = b.gate(arith, &[g0, zero, one, rho])[0];
+        let p2 = b.gate(arith, &[g1, zero, rho, zero])[0];
+        let p3 = b.gate(arith, &[g_inf, zero, rho, zero])[0];
+        let p4 = b.gate(arith, &[p3, zero, one, rho])[0];
+        running = b.gate(arith, &[p1, p2, p4, zero])[1];
+        let opr = F128::ONE + rho_v;
+        running_v = g0_v * opr + g1_v * rho_v + g_inf_v * rho_v * opr;
+    }
+
+    // Final consistency: running == ea·eb + ec.
+    let ea = value_wire(2 * m_words);
+    let eb = value_wire(2 * m_words + 1);
+    let ec = value_wire(2 * m_words + 2);
+    let eaeb = b.gate(arith, &[ea, zero, eb, zero])[0];
+    let rhs = b.gate(arith, &[eaeb, ec, zero, zero])[1];
+    // THE accept condition. Both sides are COMPUTED, so connecting them
+    // directly would give the class two producers; in characteristic 2 the
+    // equality is `running + rhs == 0`, pinned against a fresh public zero
+    // (fresh because `zero` feeds these very gates, and reusing it is cyclic).
+    let diff = b.gate(arith, &[running, rhs, zero, zero])[1];
+    let zero_pin = b.public_value(F128::ZERO);
+    b.connect(diff, zero_pin);
+    assert_eq!(
+        running_v,
+        zc_proof.ea * zc_proof.eb + zc_proof.ec,
+        "native mirror must agree with the real verifier"
+    );
+    b.publish(running);
+
+    let built = b.finish().expect("valid circuit");
+    let outer = UnionInstance::new(&built.registry, built.counts.clone());
+    let params = PcsParams {
+        m: outer.dense_m(),
+        log_inv_rate: 1,
+        log_batch_size: 6,
+        profile: LigeritoProfile::Fast,
+        num_lanes: outer.commit_lanes(6),
+        merkle_hash: Default::default(),
+    };
+    let r1cs = blake3::build_block_r1cs(nu);
+    let lc = r1cs.csc_lincheck_circuit();
+    let hrows = built.rows::<Blake3Gate>(hash);
+    let el = match &built.witnesses[built.registry_slot(arith)] {
+        SlotWitness::Element(z) => z.clone(),
+        _ => unreachable!(),
+    };
+    let mut c = FsChallenger::new(DOMAIN);
+    let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_circuit(
+        &outer,
+        &built.circuit,
+        &built.public,
+        &params,
+        vec![UnionSlotProverInput::new(
+            blake3::generate_witness_batch_major_partial(hrows, nu),
+            lc,
+        )],
+        vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
+            dst.copy_from_slice(&el)
+        })],
+        &mut c,
+    );
+    let mut c = FsChallenger::new(DOMAIN);
+    verifier::verify_ligerito_jagged_union_circuit(
+        &outer,
+        &built.circuit,
+        &built.public,
+        &[lc],
+        &commitment,
+        &proof,
+        &params,
+        &mut c,
+    )
+    .expect("the replayed zerocheck verifies");
+
+    println!(
+        "\n=== MVP-2b: the whole element zerocheck, in-circuit ===\n  \
+         {m_words} rounds | {} BLAKE3 rows + {} element rows | M={} | {} public words",
+        built.counts[built.registry_slot(hash)],
+        built.counts[built.registry_slot(arith)],
+        outer.m_total(),
+        built.public.len(),
+    );
+}

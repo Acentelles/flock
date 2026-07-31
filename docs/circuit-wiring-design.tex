@@ -458,6 +458,38 @@ leaking nothing useful about future challenges. Removing the re-absorb neither
 weakens nor strengthens this; it is the duplex assumption, and it should be
 stated wherever the FS transcript's security is written down.
 
+\subsection{Mirroring the verifier, for now}\label{sec:mirror}
+
+\settled{Ron} \textbf{The in-circuit replay is hand-written, mirroring the
+native verifier} --- decided 2026-07-31, \emph{with a revisit trigger}, not as
+a permanent architecture.
+
+The alternative is to make the replay generic over its value type so the
+native verifier and a circuit-emitting backend are one source
+(\S\ref{sec:open}). Both were live; the mirror wins \emph{at this scale} and
+the decision is recorded because it is the kind that otherwise gets made by
+accretion.
+
+\paragraph{Why the mirror, now.} The element PIOP replay measures 133
+multiplications and 15 inversions --- roughly 150 element rows with the fused
+gate, against the FS chain's 515. Hand-writing that is hours, and it prejudges
+nothing structural: the gate inventory is tier 0 either way
+(\S\ref{sec:open}), and the operation list a generic backend would need is
+already derived.
+
+\paragraph{Why it is not permanent.} A mirror is a second implementation of
+the verifier, statement by statement, that must stay in lockstep forever. SP1
+made this choice and carries $\sim$9.8k lines of \code{recursion/circuit}
+against $\sim$1.5k of native verifier --- and keeps them in sync by convention
+and \code{/// Reference:} comments. The ratio is the warning.
+
+\paragraph{Revisit when} the opening enters (MVP-3). Its arithmetic is
+$\sim$47k constraints against the replay's 148, so the mirror grows by two
+orders of magnitude there, and that is where the SP1 ratio starts to bite.
+The measurement that should decide it is how much of the native path's
+throughput survives genericity --- the $\sim$1.4\,ms opening is the number at
+risk, and it is measurable before committing.
+
 \subsection{Describing circuits: the builder}\label{sec:builder}
 
 \settled{Ron} Circuits are described by a \textbf{builder}, not by
