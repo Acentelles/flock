@@ -642,6 +642,121 @@ fn mixed_class_inner<Ch: Challenger>(
     Ok((claims, matrix))
 }
 
+/// The **circuit** verify entry over the MERGED transport — the production
+/// shape, and the mirror of
+/// `flock_prover::prover::prove_fast_ligerito_union_circuit_merged`.
+///
+/// Same replay as the jagged variant: both class PIOPs, then the wiring
+/// argument over the circuit's cell space (σ-aware GKR plus the
+/// recombination and `f_eval == g_eval` bindings). Only the opening differs
+/// — the wiring's gather claims are packed-direct, which the merged
+/// transport carries the same way it carries the element class's.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_ligerito_union_circuit_merged<Ch: Challenger>(
+    union: &crate::union::UnionInstance<'_>,
+    circuit: &crate::circuit::Circuit,
+    public: &[F128],
+    circuits: &[&dyn lincheck::LincheckCircuit],
+    commitment: &Commitment,
+    proof: &crate::proof::R1csProofCircuitMerged,
+    pcs_params: &crate::pcs::PcsParams,
+    challenger: &mut Ch,
+) -> Result<crate::proof::UnionClassClaims, VerifyError> {
+    if !circuit.check_instance(union) || public.len() != circuit.num_public() {
+        return Err(VerifyError::CircuitMismatch);
+    }
+    if proof.boolean.is_some() != (union.num_boolean() > 0)
+        || proof.element.is_some() != union.has_element()
+    {
+        return Err(VerifyError::ClassMismatch);
+    }
+    let (claims, packed_direct_points, matrix, el_matrix) = verify_union_piops(
+        union,
+        UnionVerifyBinding::Circuit { circuit, public },
+        circuits,
+        commitment,
+        proof.boolean.as_ref(),
+        proof.element.as_ref(),
+        Some(&proof.wiring),
+        pcs_params,
+        challenger,
+    )?;
+    if let Some(a) = matrix {
+        a.check(union, circuits).map_err(VerifyError::Lincheck)?;
+    }
+    if let Some(a) = el_matrix {
+        a.check_reported(union).map_err(VerifyError::Element)?;
+    }
+    verify_merged_opening(
+        union,
+        commitment,
+        &claims,
+        &packed_direct_points,
+        &proof.pcs_open,
+        pcs_params,
+        challenger,
+    )
+}
+
+/// The merged transport's verification, shared by the mixed-class and circuit
+/// entries: the boolean pair ring-switched, everything else packed-direct.
+fn verify_merged_opening<Ch: Challenger>(
+    union: &crate::union::UnionInstance<'_>,
+    commitment: &Commitment,
+    claims: &crate::proof::UnionClassClaims,
+    packed_direct_points: &[(Vec<F128>, F128)],
+    pcs_open: &crate::pcs::MergedOpenProof,
+    pcs_params: &crate::pcs::PcsParams,
+    challenger: &mut Ch,
+) -> Result<crate::proof::UnionClassClaims, VerifyError> {
+    let cl: Vec<ZClaim> = match &claims.boolean {
+        Some(c) => vec![c.ab.clone(), c.c.clone()],
+        None => Vec::new(),
+    };
+    let values: Vec<F128> = cl.iter().map(|z| z.value).collect();
+    let z_skips: Vec<F128> = cl.iter().map(|z| z.point.z_skip).collect();
+    let x_fulls: Vec<Vec<F128>> = cl
+        .iter()
+        .map(|z| {
+            let mut v = z.point.x_inner_rest.clone();
+            v.extend_from_slice(&z.point.x_outer);
+            v
+        })
+        .collect();
+    let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
+    let pd: Vec<pcs::PackedDirectClaimRef<'_>> = packed_direct_points
+        .iter()
+        .map(|(point, value)| pcs::PackedDirectClaimRef {
+            point,
+            value: *value,
+        })
+        .collect();
+    let log_n = pcs_params.m - pcs::LOG_PACKING;
+    let lig_v_config = crate::pcs::ligerito::verifier_config_for(
+        log_n,
+        pcs_params.log_batch_size,
+        pcs_params.profile,
+    )
+    .expect("Ligerito default verifier config");
+    verifier_pool()
+        .install(|| {
+            pcs::verify_batch_merged(
+                commitment,
+                &values,
+                &z_skips,
+                &x_refs,
+                &pd,
+                &union.jagged_heights(),
+                union.n_log(),
+                pcs_open,
+                &lig_v_config,
+                challenger,
+            )
+        })
+        .map_err(VerifyError::PcsJagged)?;
+    Ok(claims.clone())
+}
+
 /// [`verify_ligerito_jagged_union_mixed_class`] over the MERGED transport.
 ///
 /// Same statement, same PIOP replay; only the opening differs. The element

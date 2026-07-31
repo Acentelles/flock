@@ -783,18 +783,89 @@ pub fn prove_fast_ligerito_jagged_union_circuit<Ch: Challenger>(
         "the circuit and the union instance must be the same statement \
          (same registry, and the circuit's gate counts ARE the union's counts)"
     );
+    let (proof, commitment, claims) =
+        prove_circuit_inner(union, circuit, public, pcs_params, slots, element_slots, Transport::Jagged, challenger);
+    (
+        flock_core::proof::R1csProofCircuitLigerito {
+            boolean: proof.boolean,
+            element: proof.element,
+            wiring: proof.wiring,
+            pcs_open: proof.pcs_open.jagged(),
+        },
+        commitment,
+        claims,
+    )
+}
+
+/// The **circuit** prove entry over the MERGED transport — the production
+/// shape.
+///
+/// Same statement, same PIOPs, same claim set; the single opening rides the
+/// shipped capacity-free path instead of the unmerged jagged one. The wiring
+/// argument's gather claims are packed-direct, which the merged transport
+/// carries the same way it carries the element class's — so this is the
+/// transport argument and nothing else.
+///
+/// Verify with [`flock_core::verifier::verify_ligerito_union_circuit_merged`].
+#[allow(clippy::too_many_arguments)]
+pub fn prove_fast_ligerito_union_circuit_merged<Ch: Challenger>(
+    union: &flock_core::union::UnionInstance<'_>,
+    circuit: &flock_core::circuit::Circuit,
+    public: &[F128],
+    pcs_params: &PcsParams,
+    slots: Vec<UnionSlotProverInput<'_>>,
+    element_slots: Vec<UnionElementSlotInput<'_>>,
+    challenger: &mut Ch,
+) -> (
+    flock_core::proof::R1csProofCircuitMerged,
+    Commitment,
+    flock_core::proof::UnionClassClaims,
+) {
+    let (proof, commitment, claims) =
+        prove_circuit_inner(union, circuit, public, pcs_params, slots, element_slots, Transport::Merged, challenger);
+    (
+        flock_core::proof::R1csProofCircuitMerged {
+            boolean: proof.boolean,
+            element: proof.element,
+            wiring: proof.wiring,
+            pcs_open: proof.pcs_open.merged(),
+        },
+        commitment,
+        claims,
+    )
+}
+
+/// The two circuit prove entries' shared body: everything but which transport
+/// carries the single opening.
+struct CircuitProveParts {
+    boolean: Option<flock_core::proof::BooleanPiopProof>,
+    element: Option<flock_core::element_r1cs::union::Proof>,
+    wiring: flock_core::circuit::WiringProof,
+    pcs_open: UnionOpen,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_circuit_inner<Ch: Challenger>(
+    union: &flock_core::union::UnionInstance<'_>,
+    circuit: &flock_core::circuit::Circuit,
+    public: &[F128],
+    pcs_params: &PcsParams,
+    slots: Vec<UnionSlotProverInput<'_>>,
+    element_slots: Vec<UnionElementSlotInput<'_>>,
+    transport: Transport,
+    challenger: &mut Ch,
+) -> (
+    CircuitProveParts,
+    Commitment,
+    flock_core::proof::UnionClassClaims,
+) {
     let (out, commitment) = prove_union_with_binding(
         union,
         UnionProveBinding::Circuit(CircuitProverInput { circuit, public }),
         pcs_params,
         slots,
         element_slots,
-        // The wiring layer's gather claims are packed-direct, and the merged
-        // transport's intake for those landed only after this entry — so the
-        // circuit path stays on the jagged transport for now. Moving it over
-        // is the natural follow-up, and the reason the transport is a
-        // parameter rather than a fork.
-        Transport::Jagged,
+        transport,
         challenger,
     );
     let UnionProveOutput {
@@ -812,11 +883,11 @@ pub fn prove_fast_ligerito_jagged_union_circuit<Ch: Challenger>(
         None => (None, None),
     };
     (
-        flock_core::proof::R1csProofCircuitLigerito {
+        CircuitProveParts {
             boolean: bool_proof,
             element: el_proof,
             wiring: wiring.expect("the circuit binding runs the wiring argument"),
-            pcs_open: pcs_open.jagged(),
+            pcs_open,
         },
         commitment,
         flock_core::proof::UnionClassClaims {

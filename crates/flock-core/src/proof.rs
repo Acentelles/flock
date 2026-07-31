@@ -98,6 +98,24 @@ pub struct R1csProofMixedClassMerged {
     pub pcs_open: pcs::MergedOpenProof,
 }
 
+/// A **circuit** proof over the MERGED (Frobenius) transport — the
+/// production shape, and [`R1csProofCircuitLigerito`]'s counterpart on the
+/// shipped capacity-free path.
+///
+/// Identical content; only the opening differs. The wiring argument's gather
+/// claims are packed-direct, which the merged transport carries by expressing
+/// each weight as the `F₂`-linear map `x ↦ γ·x` — the same intake the element
+/// class's claims use. The jagged variant is kept as the differential oracle:
+/// both transports carry the SAME claim set, so they must agree on the claims
+/// while their openings differ.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct R1csProofCircuitMerged {
+    pub boolean: Option<BooleanPiopProof>,
+    pub element: Option<crate::element_r1cs::union::Proof>,
+    pub wiring: crate::circuit::WiringProof,
+    pub pcs_open: pcs::MergedOpenProof,
+}
+
 /// The boolean class's two PIOP sub-proofs, as they appear inside
 /// [`R1csProofMixedClassLigerito`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

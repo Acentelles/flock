@@ -1275,3 +1275,120 @@ fn wiring_cost_probe() {
     assert_eq!(claims.len(), cells.num_gate_slots());
     assert_eq!(wiring.gather.len(), claims.len());
 }
+
+/// Circuit proofs over the MERGED transport — the production shape.
+///
+/// The wiring argument's gather claims are packed-direct, so until the merged
+/// transport grew an intake for those, circuit proofs were stuck on the
+/// unmerged jagged path and its padded-domain auxiliaries. Now they are not.
+///
+/// The jagged path is kept precisely for this test: both transports carry the
+/// SAME claim set, so they must agree on the CLAIMS while their openings
+/// differ. That is a much sharper check than either path verifying alone —
+/// a merged-only test would rationalise a wrong weight as "well, it verifies".
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn circuit_proofs_verify_over_the_merged_transport() {
+    let (nu, k_leaves) = (7usize, 3usize);
+    let (registry, r1cs) = sha2_registry(nu);
+    let mut rng = Rng::new(0x_4D_47_C1_02);
+    let tree = build_tree(k_leaves, nu, &mut rng);
+
+    let union = UnionInstance::new(&registry, vec![tree.n_gates]);
+    let pcs_params = union_pcs_params(&union);
+    let circuit = Circuit::new(
+        &registry,
+        vec![tree.n_gates],
+        tree.public.len(),
+        tree.wires.clone(),
+    )
+    .expect("the tree circuit is valid");
+    let circuit_lc = r1cs.csc_lincheck_circuit();
+    let slot = || {
+        UnionSlotProverInput::new(
+            sha2::generate_witness_batch_major_partial(&tree.compressions, nu),
+            circuit_lc,
+        )
+    };
+
+    // Merged: the production path.
+    let mut ch = FsChallenger::new(DOMAIN);
+    let (merged, commitment, claims_m) = prover::prove_fast_ligerito_union_circuit_merged(
+        &union,
+        &circuit,
+        &tree.public,
+        &pcs_params,
+        vec![slot()],
+        Vec::new(),
+        &mut ch,
+    );
+    let mut ch_v = FsChallenger::new(DOMAIN);
+    let got = verifier::verify_ligerito_union_circuit_merged(
+        &union,
+        &circuit,
+        &tree.public,
+        &[circuit_lc],
+        &commitment,
+        &merged,
+        &pcs_params,
+        &mut ch_v,
+    )
+    .unwrap_or_else(|e| panic!("merged rejected an honest circuit proof: {e:?}"));
+    assert_eq!(got, claims_m);
+
+    // Jagged, same statement: the transports must agree on the claims.
+    let mut ch = FsChallenger::new(DOMAIN);
+    let (jagged, commitment_j, claims_j) = prover::prove_fast_ligerito_jagged_union_circuit(
+        &union,
+        &circuit,
+        &tree.public,
+        &pcs_params,
+        vec![slot()],
+        Vec::new(),
+        &mut ch,
+    );
+    assert_eq!(commitment_j.root, commitment.root, "same witness, same root");
+    assert_eq!(
+        claims_j, claims_m,
+        "the two transports must agree on the claims they carry"
+    );
+    // The wiring transcripts are identical too — the argument runs before the
+    // opening and cannot depend on it.
+    assert_eq!(jagged.wiring, merged.wiring, "wiring is transport-independent");
+
+    // Tampering must still be caught on the merged path — otherwise the
+    // gather claims would be riding along unchecked.
+    for (what, bad) in [
+        ("opening", {
+            let mut b = merged.clone();
+            b.pcs_open.q_eval += F128::ONE;
+            b
+        }),
+        ("gather value", {
+            let mut b = merged.clone();
+            b.wiring.gather[0] += F128::ONE;
+            b
+        }),
+        ("boolean claim", {
+            let mut b = merged.clone();
+            b.boolean.as_mut().unwrap().lincheck.z_partial[0] += F128::ONE;
+            b
+        }),
+    ] {
+        let mut ch_v = FsChallenger::new(DOMAIN);
+        assert!(
+            verifier::verify_ligerito_union_circuit_merged(
+                &union,
+                &circuit,
+                &tree.public,
+                &[circuit_lc],
+                &commitment,
+                &bad,
+                &pcs_params,
+                &mut ch_v,
+            )
+            .is_err(),
+            "tampered {what} must be rejected by the merged transport"
+        );
+    }
+}
