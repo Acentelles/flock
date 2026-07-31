@@ -533,6 +533,23 @@ mod tests {
         }
     }
 
+    /// Shapes with a longer eq-point than the early tests used.
+    #[test]
+    fn fold_at_the_lincheck_shape() {
+        for (k, s) in [(9usize, 6usize), (8, 6), (7, 6), (7, 3)] {
+            let m = matrix(k, 5, 0x5150 + k as u64);
+            let mut rng = Rng(0x9001 + k as u64);
+            let claims: Vec<MatrixClaim> =
+                (0..2).map(|_| honest_claim(&m, k, s, &mut rng)).collect();
+            let mut chp = FsChallenger::new(D);
+            let (proof, _) = prove_fold(&m, &claims, &mut chp);
+            let mut chv = FsChallenger::new(D);
+            let out = verify_fold(&claims, &proof, &mut chv)
+                .unwrap_or_else(|e| panic!("k={k} s={s}: {e:?}"));
+            assert!(out.check_direct(&m), "k={k} s={s}");
+        }
+    }
+
     /// The fold accepts honest claims, and its output claim is TRUE — i.e. it
     /// discharges directly against the matrix. That is the property the whole
     /// scheme rests on: the accumulator can be believed at the root.

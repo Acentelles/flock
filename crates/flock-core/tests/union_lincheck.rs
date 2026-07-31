@@ -850,3 +850,118 @@ fn reported_matrix_evals_agree_with_reading_the_matrices() {
         }
     }
 }
+
+/// The actual 2→1 step: two INDEPENDENT proofs of the same circuit, their A
+/// and B claims folded into one accumulator each, and a third proof folded in
+/// on top.
+///
+/// The other fold tests use synthetic claims; these come from two real
+/// lincheck runs at unrelated points, which is what aggregation actually
+/// presents. Both accumulators must stay discharge-true, and a corrupted
+/// report must not yield a true one — either the fold rejects it outright or
+/// the accumulator it produces fails the root discharge. Both outcomes are
+/// sound; only a true-looking accumulator would not be.
+#[test]
+fn two_proofs_fold_two_to_one_per_matrix() {
+    use flock_core::matrix_fold::{self, FoldError, MatrixClaim};
+
+    const SEED: u64 = 0x5EED_5EED;
+    let nu = 4usize;
+    // Same seed ⇒ same base matrices (drawn before the witness); different
+    // declared counts ⇒ genuinely different proofs of the same circuit.
+    let slots = [
+        build_slot(9, 300, nu, 11, Some(0), SEED),
+        build_slot(9, 300, nu, 7, Some(0), SEED),
+        build_slot(9, 300, nu, 14, Some(0), SEED),
+    ];
+    for s in &slots[1..] {
+        assert_eq!(slots[0].a0.rows, s.a0.rows, "same circuit, by seed");
+        assert_eq!(slots[0].b0.rows, s.b0.rows, "same circuit, by seed");
+    }
+    let (a0, b0) = (&slots[0].a0, &slots[0].b0);
+
+    let registry = Registry::new(vec![table_type(&slots[0])], nu);
+    let m = registry.m_total();
+
+    // Prove one instance and return its (A, B) claim pair.
+    let claims_of = |slot: &SlotData, tamper: bool| -> (MatrixClaim, MatrixClaim) {
+        let union = UnionInstance::new(&registry, vec![slot.n]);
+        let off = registry.slots()[0].offset;
+        let mut z_addr = vec![false; 1 << m];
+        let mut a_addr = vec![false; 1 << m];
+        let mut b_addr = vec![false; 1 << m];
+        place_addr(&mut z_addr, &slot.z_sem, slot.k_log, nu, off);
+        place_addr(&mut a_addr, &slot.a_sem, slot.k_log, nu, off);
+        place_addr(&mut b_addr, &slot.b_sem, slot.k_log, nu, off);
+        let c_addr: Vec<bool> = a_addr.iter().zip(&b_addr).map(|(x, y)| *x & *y).collect();
+        let (a_p, b_p, c_p) = (pack_bits(&a_addr), pack_bits(&b_addr), pack_bits(&c_addr));
+        let stripe = pack_z_lincheck(&slot.z_sem, nu + slot.k_log, slot.k_log);
+        let circ = SparseMatrixCircuit::new(&slot.a0, &slot.b0).with_const_pin(slot.pin);
+
+        let mut ch = FsChallenger::new(DOMAIN);
+        let (zc_proof, zc) =
+            zerocheck::prove_packed_padded(&a_p, &b_p, &c_p, m, &union.padding_spec(), &mut ch);
+        let x_ab = union.x_ab_from_mlv(zc.z, &zc.mlv_challenges);
+        let (mut proof, _c, _g) = lincheck::prove_union_capture_z_vec(
+            &union,
+            &[UnionLincheckSlot { z_lincheck: &stripe, circuit: &circ }],
+            &x_ab,
+            &mut ch,
+        );
+        if tamper {
+            proof.matrix_evals[0].0 += F128::ONE;
+        }
+
+        let circuits: Vec<&dyn LincheckCircuit> = vec![&circ];
+        let mut chv = FsChallenger::new(DOMAIN);
+        let zcv = zerocheck::verify(m, &zc_proof, &mut chv).expect("zerocheck accepts");
+        let xv = union.x_ab_from_mlv(zcv.z, &zcv.mlv_challenges);
+        let (_, assertion) = lincheck::verify_union_deferred(
+            &union, &circuits, &xv, zcv.a_eval, zcv.b_eval, &proof, &mut chv,
+        )
+        .expect("deferred verify accepts");
+        assertion.claims(&registry).swap_remove(0)
+    };
+
+    // One accumulator per matrix — A and B never mix.
+    let fold2 = |mat: &SparseBinaryMatrix,
+                 pair: [MatrixClaim; 2]|
+     -> Result<MatrixClaim, FoldError> {
+        let mut chp = FsChallenger::new(b"acc");
+        let (proof, _) = matrix_fold::prove_fold(mat, &pair, &mut chp);
+        let mut chv = FsChallenger::new(b"acc");
+        matrix_fold::verify_fold(&pair, &proof, &mut chv)
+    };
+
+    let (a1, b1) = claims_of(&slots[0], false);
+    let (a2, b2) = claims_of(&slots[1], false);
+    assert_ne!(a1.row.point, a2.row.point, "two proofs, two points");
+
+    let acc_a = fold2(a0, [a1, a2]).expect("A fold verifies");
+    let acc_b = fold2(b0, [b1, b2]).expect("B fold verifies");
+    assert!(acc_a.check_direct(a0), "A accumulator must be true");
+    assert!(acc_b.check_direct(b0), "B accumulator must be true");
+
+    // A third proof folds in on top — the tree continues, and an accumulated
+    // claim (plain eq ⊗ eq) folds against a fresh one (λ ⊗ eq shape).
+    let (a3, b3) = claims_of(&slots[2], false);
+    let acc_a = fold2(a0, [acc_a, a3]).expect("A fold verifies at depth 2");
+    let acc_b = fold2(b0, [acc_b, b3]).expect("B fold verifies at depth 2");
+    assert!(acc_a.check_direct(a0), "A accumulator survives depth 2");
+    assert!(acc_b.check_direct(b0), "B accumulator survives depth 2");
+
+    // A corrupted report must not yield a true accumulator — and must not
+    // disturb the other matrix, since A and B accumulate separately.
+    let (bad_a, good_b) = claims_of(&slots[1], true);
+    let (a1, b1) = claims_of(&slots[0], false);
+    match fold2(a0, [a1, bad_a]) {
+        Err(_) => {}
+        Ok(acc) => assert!(!acc.check_direct(a0), "a corrupted A report survived"),
+    }
+    assert!(
+        fold2(b0, [b1, good_b])
+            .expect("B fold verifies")
+            .check_direct(b0),
+        "the B accumulator is unaffected by the A-side tamper"
+    );
+}
