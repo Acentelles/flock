@@ -732,8 +732,12 @@ fn matrix_assertion_decomposes_into_foldable_claims() {
         &slot.a0,
     );
     let pair = [claim_a, other];
+    let combs: Vec<Vec<F128>> = pair
+        .iter()
+        .map(|c| matrix_fold::col_marginal(&slot.a0, &c.row.materialize(), slot.a0.num_cols))
+        .collect();
     let mut ch = FsChallenger::new(b"fold");
-    let (fold_proof, _) = matrix_fold::prove_fold(&slot.a0, &pair, &mut ch);
+    let (fold_proof, _) = matrix_fold::prove_fold(&slot.a0, &combs, &pair, &mut ch);
     let mut chv = FsChallenger::new(b"fold");
     let acc = matrix_fold::verify_fold(&pair, &fold_proof, &mut chv).expect("fold verifies");
     assert!(
@@ -822,8 +826,12 @@ fn reported_matrix_evals_agree_with_reading_the_matrices() {
         &slot_a.a0,
     );
     let pair = [ca0, other];
+    let combs: Vec<Vec<F128>> = pair
+        .iter()
+        .map(|c| matrix_fold::col_marginal(&slot_a.a0, &c.row.materialize(), slot_a.a0.num_cols))
+        .collect();
     let mut ch = FsChallenger::new(b"fold");
-    let (fp, _) = matrix_fold::prove_fold(&slot_a.a0, &pair, &mut ch);
+    let (fp, _) = matrix_fold::prove_fold(&slot_a.a0, &combs, &pair, &mut ch);
     let mut chv = FsChallenger::new(b"fold");
     let acc = matrix_fold::verify_fold(&pair, &fp, &mut chv).expect("fold verifies");
     assert!(acc.check_direct(&slot_a.a0), "accumulator must stay true");
@@ -927,8 +935,12 @@ fn two_proofs_fold_two_to_one_per_matrix() {
     let fold2 = |mat: &SparseBinaryMatrix,
                  pair: [MatrixClaim; 2]|
      -> Result<MatrixClaim, FoldError> {
+        let combs: Vec<Vec<F128>> = pair
+            .iter()
+            .map(|c| matrix_fold::col_marginal(mat, &c.row.materialize(), mat.num_cols))
+            .collect();
         let mut chp = FsChallenger::new(b"acc");
-        let (proof, _) = matrix_fold::prove_fold(mat, &pair, &mut chp);
+        let (proof, _) = matrix_fold::prove_fold(mat, &combs, &pair, &mut chp);
         let mut chv = FsChallenger::new(b"acc");
         matrix_fold::verify_fold(&pair, &proof, &mut chv)
     };
@@ -989,6 +1001,9 @@ fn aggregating_real_proofs_defers_all_matrix_work_to_one_discharge() {
     let m = registry.m_total();
     let mats: Vec<(&SparseBinaryMatrix, &SparseBinaryMatrix)> =
         vec![(&slots[0].a0, &slots[0].b0)];
+    // The tuned column-marginal path the fold uses for its k·nnz work.
+    let agg_circ = SparseMatrixCircuit::new(&slots[0].a0, &slots[0].b0)
+        .with_const_pin(slots[0].pin);
 
     // Prove one instance and return the assertion its succinct verify emits.
     let assert_of = |slot: &SlotData, tamper: bool| -> lincheck::MatrixAssertion {
@@ -1033,8 +1048,9 @@ fn aggregating_real_proofs_defers_all_matrix_work_to_one_discharge() {
                prior: Option<&aggregate::Accumulator>|
      -> Result<aggregate::Accumulator, AggregateError> {
         let mut chp = FsChallenger::new(b"agg");
+        let circs: Vec<&dyn LincheckCircuit> = vec![&agg_circ];
         let (proof, acc_p) =
-            aggregate::prove_aggregate(&registry, &mats, asserts, prior, &mut chp)?;
+            aggregate::prove_aggregate(&registry, &mats, &circs, asserts, prior, &mut chp)?;
         let mut chv = FsChallenger::new(b"agg");
         let acc_v = aggregate::verify_aggregate(&registry, asserts, prior, &proof, &mut chv)?;
         assert_eq!(acc_p, acc_v, "prover and verifier accumulators must agree");

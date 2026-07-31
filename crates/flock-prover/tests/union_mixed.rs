@@ -2676,8 +2676,9 @@ fn batch_verify_defers_all_matrix_work_to_one_discharge() {
 
     // One fold + one discharge for the whole batch.
     let mats = [(&setup.r1cs.a_0, &setup.r1cs.b_0)];
+    let circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![lc_circuit];
     let t = Instant::now();
-    aggregate::fold_and_discharge(&registry, &mats, &assertions)
+    aggregate::fold_and_discharge(&registry, &mats, &circs, &assertions)
         .expect("the batch's matrix work must discharge");
     let agg_s = t.elapsed().as_secs_f64();
 
@@ -2711,7 +2712,7 @@ fn batch_verify_defers_all_matrix_work_to_one_discharge() {
     .expect("the deferred verify is oblivious — it defers");
     let mixed = [assertions[0].clone(), bad_assertion];
     assert!(
-        aggregate::fold_and_discharge(&registry, &mats, &mixed).is_err(),
+        aggregate::fold_and_discharge(&registry, &mats, &circs, &mixed).is_err(),
         "a corrupted proof must poison the batch"
     );
 }

@@ -43,6 +43,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::challenger::Challenger;
+use crate::field::F128;
 use crate::lincheck::{MatrixAssertion, VerifyError};
 use crate::matrix_fold::{self, FoldProof, MatrixClaim};
 use crate::r1cs::SparseBinaryMatrix;
@@ -66,8 +67,44 @@ pub struct Accumulator {
 }
 
 impl Accumulator {
-    /// Discharge every accumulated claim against the real matrices — the
-    /// `O(Σ_t nnz_t)` root check, paid once for everything folded in.
+    /// Discharge through each type's tuned column-marginal kernel.
+    ///
+    /// A claim's bilinear form is `Σ_c col(c)·comb(c)` with
+    /// `comb = Σ_r row(r)·M[r,·]` — a column marginal, which is what
+    /// `fold_split` computes with the type's own walker/CSC path.
+    ///
+    /// **Measured SLOWER than [`Self::discharge`]** (17.3 ms vs 15.3 ms on
+    /// the N=4 BLAKE3 batch), and the reason is worth keeping: `fold_split`
+    /// returns both matrices' marginals, but the accumulated A and B claims
+    /// fold under separate transcripts and so carry *different* row points —
+    /// each call therefore throws half its work away. The fold's own k·nnz
+    /// pass does not have this problem, because there A and B share a row
+    /// weight and one call serves both. Kept for callers without the raw
+    /// matrices; prefer `discharge`.
+    pub fn discharge_with_circuits(
+        &self,
+        circuits: &[&dyn crate::lincheck::LincheckCircuit],
+    ) -> bool {
+        if self.per_type.len() != circuits.len() {
+            return false;
+        }
+        let dot = |a: &[F128], b: &[F128]| {
+            a.iter()
+                .zip(b)
+                .fold(F128::ZERO, |acc, (x, y)| acc + *x * *y)
+        };
+        self.per_type.iter().zip(circuits).all(|((ca, cb), circ)| {
+            // A and B accumulate under separate folds, so their row points
+            // differ; each needs its own marginal.
+            let (xa, _) = circ.fold_split(&ca.row.materialize());
+            let (_, xb) = circ.fold_split(&cb.row.materialize());
+            dot(&ca.col.materialize(), &xa) == ca.value
+                && dot(&cb.col.materialize(), &xb) == cb.value
+        })
+    }
+
+    /// Discharge every accumulated claim against the raw matrices — the
+    /// generic `O(Σ_t nnz_t)` root check, for callers without circuits.
     pub fn discharge(&self, mats: &[TypeMatrices<'_>]) -> bool {
         self.per_type.len() == mats.len()
             && self
@@ -137,6 +174,7 @@ fn bind<Ch: Challenger>(registry: &Registry, prior: Option<&Accumulator>, ch: &m
 pub fn prove_aggregate<Ch: Challenger>(
     registry: &Registry,
     mats: &[TypeMatrices<'_>],
+    circuits: &[&dyn crate::lincheck::LincheckCircuit],
     assertions: &[MatrixAssertion],
     prior: Option<&Accumulator>,
     ch: &mut Ch,
@@ -158,8 +196,28 @@ pub fn prove_aggregate<Ch: Challenger>(
     let mut per_type = Vec::with_capacity(registry.num_boolean());
     for (t, (ma, mb)) in mats.iter().enumerate() {
         let (ca, cb) = gather(registry, assertions, prior, t);
-        let (pa, out_a) = matrix_fold::prove_fold(ma, &ca, ch);
-        let (pb, out_b) = matrix_fold::prove_fold(mb, &cb, ch);
+        // The k·nnz work. ONE `fold_split` per claim yields the column
+        // marginals for BOTH matrices, so the A- and B-folds share it — and
+        // it runs on the type's tuned kernel rather than a generic sparse
+        // walk. Claims share their row weight (A and B are reported at the
+        // same point), so `ca` and `cb` agree here row-wise.
+        let n_cols = 1usize << registry.boolean_types()[t].k_log;
+        let mut combs_a = Vec::with_capacity(ca.len());
+        let mut combs_b = Vec::with_capacity(cb.len());
+        for (qa, qb) in ca.iter().zip(&cb) {
+            let (xa, xb) = if qa.row == qb.row {
+                circuits[t].fold_split(&qa.row.materialize())
+            } else {
+                (
+                    matrix_fold::col_marginal(ma, &qa.row.materialize(), n_cols),
+                    matrix_fold::col_marginal(mb, &qb.row.materialize(), n_cols),
+                )
+            };
+            combs_a.push(xa);
+            combs_b.push(xb);
+        }
+        let (pa, out_a) = matrix_fold::prove_fold(ma, &combs_a, &ca, ch);
+        let (pb, out_b) = matrix_fold::prove_fold(mb, &combs_b, &cb, ch);
         folds.push((pa, pb));
         per_type.push((out_a, out_b));
     }
@@ -186,10 +244,11 @@ pub fn prove_aggregate<Ch: Challenger>(
 pub fn fold_and_discharge(
     registry: &Registry,
     mats: &[TypeMatrices<'_>],
+    circuits: &[&dyn crate::lincheck::LincheckCircuit],
     assertions: &[MatrixAssertion],
 ) -> Result<(), AggregateError> {
     let mut chp = crate::challenger::FsChallenger::new(DOMAIN);
-    let (proof, _) = prove_aggregate(registry, mats, assertions, None, &mut chp)?;
+    let (proof, _) = prove_aggregate(registry, mats, circuits, assertions, None, &mut chp)?;
     let mut chv = crate::challenger::FsChallenger::new(DOMAIN);
     let acc = verify_aggregate(registry, assertions, None, &proof, &mut chv)?;
     if acc.discharge(mats) {

@@ -27,14 +27,22 @@
 //! A claim is `Σ_{r,c} row(r)·col(c)·M[r,c] = v` for structured weights. `k`
 //! claims about one `M` fold to one in two sumchecks:
 //!
-//! 1. **Row.** With `g_i(r) = Σ_c col_i(c)·M[r,c]`, each claim reads
-//!    `Σ_r row_i(r)·g_i(r) = v_i`. A degree-2 sumcheck on the λ-combination
-//!    `Σ_i λ_i row_i(r)·g_i(r)` binds every claim to one shared `ρ_row`. The
-//!    prover then sends the `k` values `g_i(ρ_row)`.
-//! 2. **Column.** Because `ρ_row` is now shared, every `g_i(ρ_row) =
-//!    Σ_c col_i(c)·h(c)` reads against the *same* `h(c) = M̂(ρ_row, c)` — so
-//!    the column side collapses to a single sumcheck on `Σ_i μ_i col_i`,
-//!    landing on `h(ρ_col) = M̂(ρ_row, ρ_col)`.
+//! 1. **Column.** With `comb_i(c) = Σ_r row_i(r)·M[r,c]`, each claim reads
+//!    `Σ_c col_i(c)·comb_i(c) = v_i`. A degree-2 sumcheck on the
+//!    λ-combination binds every claim to one shared `ρ_col`; the prover then
+//!    sends the `k` values `comb_i(ρ_col)`.
+//! 2. **Row.** Because `ρ_col` is now shared, every `comb_i(ρ_col) =
+//!    Σ_r row_i(r)·h(r)` reads against the *same* `h(r) = M̂(r, ρ_col)` — so
+//!    the row side collapses to a single sumcheck on `Σ_i μ_i row_i`,
+//!    landing on `h(ρ_row) = M̂(ρ_row, ρ_col)`.
+//!
+//! The order is deliberate and is the difference between a fast fold and a
+//! slow one. The `k` per-claim marginals are the dominant `k · nnz` cost,
+//! and in THIS order they are **column** marginals — which is exactly what
+//! [`crate::lincheck::LincheckCircuit::fold_split`] computes, with each
+//! type's tuned walker/CSC kernel. Only the single shared marginal of step 2
+//! runs against the raw matrix. Ordered the other way the k-fold work would
+//! be row marginals, which no tuned kernel provides.
 //!
 //! The output is a plain evaluation claim, which folds again by the same
 //! machinery (a plain evaluation is just a claim whose weights are `eq`
@@ -49,6 +57,7 @@
 //! `(q(1), q(∞))` with `q(0)` re-derived from the running claim, and each
 //! round binds the LOW remaining variable.
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::challenger::Challenger;
@@ -56,6 +65,11 @@ use crate::field::F128;
 use crate::r1cs::SparseBinaryMatrix;
 
 const DOMAIN: &[u8] = b"flock-matrix-fold-v0";
+
+/// Rows per parallel block in the two matrix passes. Large enough that the
+/// per-block accumulator (one `2^k_col` vector in the scatter pass) is
+/// amortised, small enough to keep every worker fed.
+const G_ROW_CHUNK: usize = 1 << 10;
 
 /// A structured weight over `2^k` entries: `low ⊗ eq(point)`, with `low`
 /// occupying the LOW `log2(low.len())` coordinates.
@@ -157,19 +171,29 @@ pub fn bilinear(row: &Weight, col: &Weight, m: &SparseBinaryMatrix) -> F128 {
         rw.len() >= m.num_rows && cw.len() >= m.num_cols,
         "weights are too small for the matrix"
     );
-    let mut acc = F128::ZERO;
-    for (r, cols) in m.rows.iter().enumerate() {
-        let wr = rw[r];
-        if wr == F128::ZERO {
-            continue;
-        }
-        let mut inner = F128::ZERO;
-        for &c in cols {
-            inner += cw[c];
-        }
-        acc += wr * inner;
-    }
-    acc
+    // One pass over the nonzeros, split by rows — the discharge pays this
+    // twice per type, so it is worth the same treatment as the fold's own
+    // passes rather than being the sequential straggler behind them.
+    m.rows
+        .par_chunks(G_ROW_CHUNK)
+        .enumerate()
+        .map(|(blk, chunk)| {
+            let base = blk * G_ROW_CHUNK;
+            let mut acc = F128::ZERO;
+            for (j, cols) in chunk.iter().enumerate() {
+                let wr = rw[base + j];
+                if wr == F128::ZERO {
+                    continue;
+                }
+                let mut inner = F128::ZERO;
+                for &c in cols {
+                    inner += cw[c];
+                }
+                acc += wr * inner;
+            }
+            acc
+        })
+        .reduce(|| F128::ZERO, |a, b| a + b)
 }
 
 impl MatrixClaim {
@@ -189,9 +213,12 @@ impl MatrixClaim {
 /// the `k` bridge values `g_i(ρ_row)`, and the output evaluation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FoldProof {
-    pub row_rounds: Vec<(F128, F128)>,
-    pub bridge: Vec<F128>,
+    /// Column phase (first): binds every claim to a shared `ρ_col`.
     pub col_rounds: Vec<(F128, F128)>,
+    /// `comb_i(ρ_col)` per claim — what lets the row phase collapse to one.
+    pub bridge: Vec<F128>,
+    /// Row phase (second): one sumcheck against the shared marginal.
+    pub row_rounds: Vec<(F128, F128)>,
     pub value: F128,
 }
 
@@ -274,10 +301,12 @@ fn observe_claims<Ch: Challenger>(claims: &[MatrixClaim], ch: &mut Ch) {
 /// claims (registry digest, statement) into `ch` beforehand.
 pub fn prove_fold<Ch: Challenger>(
     m: &SparseBinaryMatrix,
+    combs: &[Vec<F128>],
     claims: &[MatrixClaim],
     ch: &mut Ch,
 ) -> (FoldProof, MatrixClaim) {
     assert!(!claims.is_empty(), "nothing to fold");
+    assert_eq!(combs.len(), claims.len(), "one column marginal per claim");
     let k_row = claims[0].row.n_vars();
     let k_col = claims[0].col.n_vars();
     for c in claims {
@@ -288,90 +317,74 @@ pub fn prove_fold<Ch: Challenger>(
     observe_claims(claims, ch);
     let lambdas: Vec<F128> = (0..claims.len()).map(|_| ch.sample_f128()).collect();
 
-    // Row phase. g_i(r) = Σ_{c ∈ rows[r]} col_i(c) — one pass over the
-    // nonzeros per claim.
-    let cols: Vec<Vec<F128>> = claims.iter().map(|c| c.col.materialize()).collect();
+    // Column phase: Σ_c Σ_i λ_i·col_i(c)·comb_i(c). `combs` is the k·nnz
+    // work, done by the caller with the type's tuned kernel.
     let mut pairs: Vec<(Vec<F128>, Vec<F128>)> = claims
         .iter()
-        .zip(&cols)
-        .map(|(claim, col)| {
-            let mut g = vec![F128::ZERO; 1usize << k_row];
-            for (r, cs) in m.rows.iter().enumerate() {
-                let mut acc = F128::ZERO;
-                for &c in cs {
-                    acc += col[c];
-                }
-                g[r] = acc;
-            }
-            (claim.row.materialize(), g)
+        .zip(combs)
+        .map(|(claim, comb)| {
+            let mut g = comb.clone();
+            g.resize(1usize << k_col, F128::ZERO);
+            (claim.col.materialize(), g)
         })
         .collect();
 
-    let mut row_rounds = Vec::with_capacity(k_row);
-    let mut rho_row = Vec::with_capacity(k_row);
-    for _ in 0..k_row {
-        let msg = round_message(&pairs, &lambdas);
-        ch.observe_f128(msg.0);
-        ch.observe_f128(msg.1);
-        let r = ch.sample_f128();
-        row_rounds.push(msg);
-        rho_row.push(r);
-        for (a, b) in &mut pairs {
-            fold_low(a, r);
-            fold_low(b, r);
-        }
-    }
-    // The bridge: g_i(ρ_row). The verifier evaluates row_i(ρ_row) itself.
-    let bridge: Vec<F128> = pairs.iter().map(|(_, g)| g[0]).collect();
-    for &v in &bridge {
-        ch.observe_f128(v);
-    }
-
-    // Column phase. Every g_i(ρ_row) reads against the same h(c) =
-    // M̂(ρ_row, c), so one μ-combined sumcheck serves all k.
-    let mus: Vec<F128> = (0..claims.len()).map(|_| ch.sample_f128()).collect();
-    let eq_row = Weight::eq(rho_row.clone()).materialize();
-    let mut h = vec![F128::ZERO; 1usize << k_col];
-    for (r, cs) in m.rows.iter().enumerate() {
-        let w = eq_row[r];
-        if w == F128::ZERO {
-            continue;
-        }
-        for &c in cs {
-            h[c] += w;
-        }
-    }
-    let mut w_mu = vec![F128::ZERO; 1usize << k_col];
-    for (col, &mu) in cols.iter().zip(&mus) {
-        for (dst, &src) in w_mu.iter_mut().zip(col) {
-            *dst += mu * src;
-        }
-    }
-
-    let mut col_pairs = vec![(w_mu, h)];
-    let one = [F128::ONE];
     let mut col_rounds = Vec::with_capacity(k_col);
     let mut rho_col = Vec::with_capacity(k_col);
     for _ in 0..k_col {
-        let msg = round_message(&col_pairs, &one);
+        let msg = round_message(&pairs, &lambdas);
         ch.observe_f128(msg.0);
         ch.observe_f128(msg.1);
         let r = ch.sample_f128();
         col_rounds.push(msg);
         rho_col.push(r);
-        for (a, b) in &mut col_pairs {
+        for (a, b) in &mut pairs {
             fold_low(a, r);
             fold_low(b, r);
         }
     }
-    let value = col_pairs[0].1[0];
+    let bridge: Vec<F128> = pairs.iter().map(|(_, g)| g[0]).collect();
+    for &v in &bridge {
+        ch.observe_f128(v);
+    }
+
+    // Row phase. Every bridge value reads against the same h(r) = M̂(r, ρ_col),
+    // so ONE marginal serves all k — the only pass this function makes over
+    // the matrix itself.
+    let mus: Vec<F128> = (0..claims.len()).map(|_| ch.sample_f128()).collect();
+    let eq_col = Weight::eq(rho_col.clone()).materialize();
+    let h = row_marginal(m, &eq_col, 1usize << k_row);
+    let mut w_mu = vec![F128::ZERO; 1usize << k_row];
+    for (claim, &mu) in claims.iter().zip(&mus) {
+        for (dst, src) in w_mu.iter_mut().zip(claim.row.materialize()) {
+            *dst += mu * src;
+        }
+    }
+
+    let mut row_pairs = vec![(w_mu, h)];
+    let one = [F128::ONE];
+    let mut row_rounds = Vec::with_capacity(k_row);
+    let mut rho_row = Vec::with_capacity(k_row);
+    for _ in 0..k_row {
+        let msg = round_message(&row_pairs, &one);
+        ch.observe_f128(msg.0);
+        ch.observe_f128(msg.1);
+        let r = ch.sample_f128();
+        row_rounds.push(msg);
+        rho_row.push(r);
+        for (a, b) in &mut row_pairs {
+            fold_low(a, r);
+            fold_low(b, r);
+        }
+    }
+    let value = row_pairs[0].1[0];
     ch.observe_f128(value);
 
     (
         FoldProof {
-            row_rounds,
-            bridge,
             col_rounds,
+            bridge,
+            row_rounds,
             value,
         },
         MatrixClaim {
@@ -380,6 +393,61 @@ pub fn prove_fold<Ch: Challenger>(
             value,
         },
     )
+}
+
+/// `out[r] = Σ_c w[c]·M[r,c]` — the row marginal, one parallel pass over the
+/// nonzeros. The tuned per-type kernels only go the other way (column
+/// marginals), so this direction is generic; the fold needs it exactly once.
+pub fn row_marginal(m: &SparseBinaryMatrix, w: &[F128], n_rows: usize) -> Vec<F128> {
+    let mut out = vec![F128::ZERO; n_rows];
+    out.par_chunks_mut(G_ROW_CHUNK)
+        .enumerate()
+        .for_each(|(blk, dst)| {
+            let base = blk * G_ROW_CHUNK;
+            for (j, slot) in dst.iter_mut().enumerate() {
+                let Some(cs) = m.rows.get(base + j) else { break };
+                let mut acc = F128::ZERO;
+                for &c in cs {
+                    acc += w[c];
+                }
+                *slot = acc;
+            }
+        });
+    out
+}
+
+/// `out[c] = Σ_r w[r]·M[r,c]` — the column marginal, generic fallback for
+/// callers without a [`crate::lincheck::LincheckCircuit`]. Prefer that
+/// trait's `fold_split`, which is what the tuned kernels implement.
+pub fn col_marginal(m: &SparseBinaryMatrix, w: &[F128], n_cols: usize) -> Vec<F128> {
+    m.rows
+        .par_chunks(G_ROW_CHUNK)
+        .enumerate()
+        .fold(
+            || vec![F128::ZERO; n_cols],
+            |mut acc, (blk, chunk)| {
+                let base = blk * G_ROW_CHUNK;
+                for (j, cs) in chunk.iter().enumerate() {
+                    let wr = w[base + j];
+                    if wr == F128::ZERO {
+                        continue;
+                    }
+                    for &c in cs {
+                        acc[c] += wr;
+                    }
+                }
+                acc
+            },
+        )
+        .reduce(
+            || vec![F128::ZERO; n_cols],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(&b) {
+                    *x += *y;
+                }
+                a
+            },
+        )
 }
 
 /// Replay a fold. `O(k·κ)` — no matrix access at all, which is what lets a
@@ -408,12 +476,12 @@ pub fn verify_fold<Ch: Challenger>(
     observe_claims(claims, ch);
     let lambdas: Vec<F128> = (0..claims.len()).map(|_| ch.sample_f128()).collect();
 
-    // Row sumcheck: target is the λ-combination of the claimed values.
+    // Column sumcheck: target is the λ-combination of the claimed values.
     let target = claims
         .iter()
         .zip(&lambdas)
         .fold(F128::ZERO, |acc, (c, &l)| acc + l * c.value);
-    let (running, rho_row) = replay_rounds(&proof.row_rounds, target, ch);
+    let (running, rho_col) = replay_rounds(&proof.col_rounds, target, ch);
     for &v in &proof.bridge {
         ch.observe_f128(v);
     }
@@ -422,26 +490,26 @@ pub fn verify_fold<Ch: Challenger>(
         .zip(&lambdas)
         .zip(&proof.bridge)
         .fold(F128::ZERO, |acc, ((c, &l), &g)| {
-            acc + l * c.row.eval(&rho_row) * g
+            acc + l * c.col.eval(&rho_col) * g
         });
     if running != expect {
-        return Err(FoldError::ConsistencyFailed { which: "row" });
+        return Err(FoldError::ConsistencyFailed { which: "col" });
     }
 
-    // Column sumcheck: target is the μ-combination of the bridge values.
+    // Row sumcheck: target is the μ-combination of the bridge values.
     let mus: Vec<F128> = (0..claims.len()).map(|_| ch.sample_f128()).collect();
     let target = proof
         .bridge
         .iter()
         .zip(&mus)
         .fold(F128::ZERO, |acc, (&g, &m)| acc + m * g);
-    let (running, rho_col) = replay_rounds(&proof.col_rounds, target, ch);
+    let (running, rho_row) = replay_rounds(&proof.row_rounds, target, ch);
     let w_mu = claims
         .iter()
         .zip(&mus)
-        .fold(F128::ZERO, |acc, (c, &m)| acc + m * c.col.eval(&rho_col));
+        .fold(F128::ZERO, |acc, (c, &m)| acc + m * c.row.eval(&rho_row));
     if running != w_mu * proof.value {
-        return Err(FoldError::ConsistencyFailed { which: "col" });
+        return Err(FoldError::ConsistencyFailed { which: "row" });
     }
     ch.observe_f128(proof.value);
 
@@ -476,6 +544,14 @@ mod tests {
             self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
             ((self.0 >> 33) as usize) % n
         }
+    }
+
+    /// Column marginals the generic way — tests have no tuned circuit.
+    fn gen_combs(m: &SparseBinaryMatrix, claims: &[MatrixClaim]) -> Vec<Vec<F128>> {
+        claims
+            .iter()
+            .map(|c| col_marginal(m, &c.row.materialize(), m.num_cols))
+            .collect()
     }
 
     /// A random sparse binary matrix with ~`per_row` nonzeros per row.
@@ -542,7 +618,8 @@ mod tests {
             let claims: Vec<MatrixClaim> =
                 (0..2).map(|_| honest_claim(&m, k, s, &mut rng)).collect();
             let mut chp = FsChallenger::new(D);
-            let (proof, _) = prove_fold(&m, &claims, &mut chp);
+            let combs = gen_combs(&m, &claims);
+            let (proof, _) = prove_fold(&m, &combs, &claims, &mut chp);
             let mut chv = FsChallenger::new(D);
             let out = verify_fold(&claims, &proof, &mut chv)
                 .unwrap_or_else(|e| panic!("k={k} s={s}: {e:?}"));
@@ -567,7 +644,8 @@ mod tests {
             }
 
             let mut chp = FsChallenger::new(D);
-            let (proof, out_p) = prove_fold(&m, &claims, &mut chp);
+            let combs = gen_combs(&m, &claims);
+            let (proof, out_p) = prove_fold(&m, &combs, &claims, &mut chp);
             let mut chv = FsChallenger::new(D);
             let out_v = verify_fold(&claims, &proof, &mut chv).expect("honest fold verifies");
             assert_eq!(out_p, out_v, "prover and verifier must agree (k={count})");
@@ -591,12 +669,14 @@ mod tests {
         let mut acc = Vec::new();
         for pair in level0.chunks(2) {
             let mut ch = FsChallenger::new(D);
-            let (proof, _) = prove_fold(&m, pair, &mut ch);
+            let combs = gen_combs(&m, pair);
+            let (proof, _) = prove_fold(&m, &combs, pair, &mut ch);
             let mut chv = FsChallenger::new(D);
             acc.push(verify_fold(pair, &proof, &mut chv).expect("level-0 fold"));
         }
         let mut ch = FsChallenger::new(D);
-        let (proof, _) = prove_fold(&m, &acc, &mut ch);
+        let combs = gen_combs(&m, &acc);
+        let (proof, _) = prove_fold(&m, &combs, &acc, &mut ch);
         let mut chv = FsChallenger::new(D);
         let root = verify_fold(&acc, &proof, &mut chv).expect("level-1 fold");
         assert!(root.check_direct(&m), "the root claim must be true");
@@ -616,7 +696,8 @@ mod tests {
             claims[bad_index].value += F128::ONE;
 
             let mut chp = FsChallenger::new(D);
-            let (proof, _) = prove_fold(&m, &claims, &mut chp);
+            let combs = gen_combs(&m, &claims);
+            let (proof, _) = prove_fold(&m, &combs, &claims, &mut chp);
             let mut chv = FsChallenger::new(D);
             match verify_fold(&claims, &proof, &mut chv) {
                 Err(_) => {}
@@ -637,7 +718,8 @@ mod tests {
         let mut rng = Rng(0xCD02);
         let claims: Vec<MatrixClaim> = (0..2).map(|_| honest_claim(&m, k, 6, &mut rng)).collect();
         let mut ch = FsChallenger::new(D);
-        let (good, _) = prove_fold(&m, &claims, &mut ch);
+        let combs = gen_combs(&m, &claims);
+        let (good, _) = prove_fold(&m, &combs, &claims, &mut ch);
 
         let mut tampers = Vec::new();
         let mut t = good.clone();
@@ -678,7 +760,8 @@ mod tests {
         let mut rng = Rng(0x11);
         let claims: Vec<MatrixClaim> = (0..2).map(|_| honest_claim(&m, k, 5, &mut rng)).collect();
         let mut ch = FsChallenger::new(D);
-        let (good, _) = prove_fold(&m, &claims, &mut ch);
+        let combs = gen_combs(&m, &claims);
+        let (good, _) = prove_fold(&m, &combs, &claims, &mut ch);
 
         let mut short = good.clone();
         short.row_rounds.pop();
