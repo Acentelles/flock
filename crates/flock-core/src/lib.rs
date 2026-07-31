@@ -20,6 +20,7 @@
 pub mod aggregate;
 pub mod bits;
 pub mod challenger;
+pub mod circuit;
 pub mod element_r1cs;
 pub mod field;
 pub mod hash;

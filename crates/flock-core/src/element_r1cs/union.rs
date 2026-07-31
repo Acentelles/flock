@@ -675,6 +675,7 @@ mod tests {
             },
             const_pin: None,
             class: crate::schedule::TableClass::Boolean,
+            io_schema: Vec::new(),
         }
     }
 
