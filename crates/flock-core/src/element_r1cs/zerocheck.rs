@@ -530,10 +530,11 @@ fn round_message_sparse(
                 || (F128::ZERO, F128::ZERO),
                 |(a1, ai), (b1, bi)| (a1 + b1, ai + bi),
             ),
-        None => (0..n_blocks).map(block_fn).fold(
-            (F128::ZERO, F128::ZERO),
-            |(a1, ai), (b1, bi)| (a1 + b1, ai + bi),
-        ),
+        None => (0..n_blocks)
+            .map(block_fn)
+            .fold((F128::ZERO, F128::ZERO), |(a1, ai), (b1, bi)| {
+                (a1 + b1, ai + bi)
+            }),
     }
 }
 
@@ -610,9 +611,10 @@ fn fold_low_sparse_zero(u: &mut Vec<F128>, rho: F128, row_vars: usize, live: &[u
 /// precondition the sparse row rounds rest on.
 fn dead_words_are_zero(z: &[F128], nu: usize, sup: &RowSupport) -> bool {
     let rows = 1usize << nu;
-    sup.live.iter().enumerate().all(|(c, &n)| {
-        z[c * rows + n..(c + 1) * rows].iter().all(|w| w.is_zero())
-    })
+    sup.live
+        .iter()
+        .enumerate()
+        .all(|(c, &n)| z[c * rows + n..(c + 1) * rows].iter().all(|w| w.is_zero()))
 }
 
 /// Bind the low variable of one table at `rho`, halving it:

@@ -486,7 +486,9 @@ pub fn verify_ligerito_jagged_union_merged<Ch: Challenger>(
             value: zc_claim.c_eval,
         };
         if !defer_merged {
-            matrix.check(union, circuits).map_err(VerifyError::Lincheck)?;
+            matrix
+                .check(union, circuits)
+                .map_err(VerifyError::Lincheck)?;
         }
         Ok((ab, c, matrix))
     })?;
@@ -573,8 +575,16 @@ pub fn verify_ligerito_jagged_union_mixed_class_deferred<Ch: Challenger>(
     proof: &crate::proof::R1csProofMixedClassLigerito,
     pcs_params: &crate::pcs::PcsParams,
     challenger: &mut Ch,
-) -> Result<(crate::proof::UnionClassClaims, Option<lincheck::MatrixAssertion>), VerifyError> {
-    mixed_class_inner(union, circuits, commitment, proof, pcs_params, true, challenger)
+) -> Result<
+    (
+        crate::proof::UnionClassClaims,
+        Option<lincheck::MatrixAssertion>,
+    ),
+    VerifyError,
+> {
+    mixed_class_inner(
+        union, circuits, commitment, proof, pcs_params, true, challenger,
+    )
 }
 
 fn mixed_class_inner<Ch: Challenger>(
@@ -585,7 +595,13 @@ fn mixed_class_inner<Ch: Challenger>(
     pcs_params: &crate::pcs::PcsParams,
     defer: bool,
     challenger: &mut Ch,
-) -> Result<(crate::proof::UnionClassClaims, Option<lincheck::MatrixAssertion>), VerifyError> {
+) -> Result<
+    (
+        crate::proof::UnionClassClaims,
+        Option<lincheck::MatrixAssertion>,
+    ),
+    VerifyError,
+> {
     if proof.boolean.is_some() != (union.num_boolean() > 0)
         || proof.element.is_some() != union.has_element()
     {
@@ -697,7 +713,6 @@ pub fn verify_ligerito_union_circuit_merged<Ch: Challenger>(
         challenger,
     )
 }
-
 
 /// [`verify_ligerito_union_circuit_merged`] with the matrix work left
 /// undischarged — what a merge node runs on each child proof.
@@ -1203,7 +1218,9 @@ fn verify_union_with_binding<Ch: Challenger>(
     let matrix = if defer {
         Some(matrix)
     } else {
-        matrix.check(union, circuits).map_err(VerifyError::Lincheck)?;
+        matrix
+            .check(union, circuits)
+            .map_err(VerifyError::Lincheck)?;
         None
     };
     verify_claims_jagged_ligerito(

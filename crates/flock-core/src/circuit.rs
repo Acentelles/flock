@@ -257,8 +257,14 @@ impl CellSpace {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CircuitError {
     /// `counts` has the wrong length, or a count exceeds the row capacity.
-    Counts { got: usize, want: usize },
-    CountOverCapacity { ty: usize, n: usize },
+    Counts {
+        got: usize,
+        want: usize,
+    },
+    CountOverCapacity {
+        ty: usize,
+        n: usize,
+    },
     /// A wire names a cell-slot or row outside the cell space.
     UnknownCell(Cell),
     /// A wire names a DUMMY cell: a pad slot, a gate row past that type's
@@ -269,7 +275,9 @@ pub enum CircuitError {
     RepeatedCell(Cell),
     EmptyClass,
     /// Two `out`-direction cells in one wire class — the single-producer rule.
-    MultipleProducers { class: usize },
+    MultipleProducers {
+        class: usize,
+    },
     /// The gate dataflow (producer → consumer) has a cycle.
     Cyclic,
     /// σ is not a permutation. Unreachable given disjointness; checked anyway,
@@ -785,7 +793,11 @@ mod tests {
     }
 
     fn stub() -> SparseBinaryMatrix {
-        SparseBinaryMatrix { num_rows: 0, num_cols: 0, rows: Vec::new() }
+        SparseBinaryMatrix {
+            num_rows: 0,
+            num_cols: 0,
+            rows: Vec::new(),
+        }
     }
 
     /// A boolean type of the given width with the given schema — only its
@@ -807,8 +819,7 @@ mod tests {
     fn mult_ty(kappa: usize, schema: Vec<IoWord>) -> TableType {
         let mut b = ElementTableBuilder::new(kappa);
         b.free_wire(0).free_wire(1).mult(2, 0, 1);
-        TableType::element(Arc::new(b.build().expect("mult block is valid")))
-            .with_io_schema(schema)
+        TableType::element(Arc::new(b.build().expect("mult block is valid"))).with_io_schema(schema)
     }
 
     /// A mixed registry with schemas on both classes: one wide boolean type,
@@ -822,7 +833,10 @@ mod tests {
                     3000,
                     vec![IoWord::input(0), IoWord::input(5), IoWord::output(2)],
                 ),
-                mult_ty(3, vec![IoWord::input(0), IoWord::input(1), IoWord::output(2)]),
+                mult_ty(
+                    3,
+                    vec![IoWord::input(0), IoWord::input(1), IoWord::output(2)],
+                ),
                 mult_ty(2, vec![IoWord::input(1), IoWord::output(2)]),
             ],
             nu,
@@ -867,7 +881,13 @@ mod tests {
                 }
                 // The claim point IS the word address, bit for bit.
                 let rho_row: Vec<F128> = (0..nu)
-                    .map(|i| if (row >> i) & 1 == 1 { F128::ONE } else { F128::ZERO })
+                    .map(|i| {
+                        if (row >> i) & 1 == 1 {
+                            F128::ONE
+                        } else {
+                            F128::ZERO
+                        }
+                    })
                     .collect();
                 let point = cells.gate_claim_point(iota, &rho_row);
                 assert_eq!(point.len(), union.m_total() - 7);
@@ -972,7 +992,10 @@ mod tests {
         // A singleton class is a σ-fixed no-op, not an error.
         let single = Circuit::new(&reg, vec![n], 5, vec![vec![Cell::new(2, 0)]]).unwrap();
         assert_eq!(single.wires().len(), 1);
-        assert_eq!(single.sigma(), (0..single.sigma().len()).collect::<Vec<_>>());
+        assert_eq!(
+            single.sigma(),
+            (0..single.sigma().len()).collect::<Vec<_>>()
+        );
     }
 
     /// σ's orbits ARE the wire classes, and σ is a permutation that fixes every
@@ -1086,8 +1109,13 @@ mod tests {
             ),
             (
                 "one class dropped",
-                Circuit::new(&reg, vec![4], 5, vec![vec![Cell::new(2, 0), Cell::new(0, 1)]])
-                    .unwrap(),
+                Circuit::new(
+                    &reg,
+                    vec![4],
+                    5,
+                    vec![vec![Cell::new(2, 0), Cell::new(0, 1)]],
+                )
+                .unwrap(),
             ),
         ];
         for (what, c) in cases {
@@ -1118,11 +1146,7 @@ mod tests {
 
     /// A padded union buffer for `reg` whose gate cells satisfy `wires`, built
     /// by writing a random value per wire class. Dummy rows stay zero.
-    fn buffer_for(
-        reg: &Registry,
-        circuit: &Circuit,
-        rng: &mut Rng,
-    ) -> (Vec<F128>, Vec<F128>) {
+    fn buffer_for(reg: &Registry, circuit: &Circuit, rng: &mut Rng) -> (Vec<F128>, Vec<F128>) {
         let cells = circuit.cells();
         let nu = cells.nu();
         let mut packed = vec![F128::ZERO; 1usize << (reg.m_total() - 7)];
@@ -1183,7 +1207,12 @@ mod tests {
                 // boolean out → boolean in (a chain), and a fan-out onto both
                 // element types plus a public cell.
                 vec![Cell::new(2, 0), Cell::new(0, 1), Cell::new(3, 2)],
-                vec![Cell::new(2, 1), Cell::new(4, 3), Cell::new(6, 0), Cell::new(8, 4)],
+                vec![
+                    Cell::new(2, 1),
+                    Cell::new(4, 3),
+                    Cell::new(6, 0),
+                    Cell::new(8, 4),
+                ],
                 vec![Cell::new(5, 1), Cell::new(1, 2)],
             ],
         )

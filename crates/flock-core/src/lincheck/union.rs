@@ -154,7 +154,12 @@ pub fn union_comb_partial(
     assert_eq!(rr.len(), registry.m_bool() - registry.nu() - k_skip);
     let n_skip = 1usize << k_skip;
     let mut out = vec![F128::ZERO; n_skip];
-    for ((ty, slot), comb) in registry.boolean_types().iter().zip(registry.slots()).zip(combs) {
+    for ((ty, slot), comb) in registry
+        .boolean_types()
+        .iter()
+        .zip(registry.slots())
+        .zip(combs)
+    {
         assert_eq!(comb.len(), 1usize << ty.k_log);
         let inner = ty.k_log - k_skip;
         let p_t = eq_prefix_weight(&rr[inner..], slot.prefix);
@@ -362,10 +367,7 @@ pub fn prove_union_capture_z_vec<Ch: Challenger>(
         .map(|(ty, (comb_a, comb_b))| {
             let inner = ty.k_log - k_skip;
             let w_col = col_weight(&proof.z_partial, &claim.r_inner_rest[..inner], k_skip);
-            (
-                inner_product(&w_col, comb_a),
-                inner_product(&w_col, comb_b),
-            )
+            (inner_product(&w_col, comb_a), inner_product(&w_col, comb_b))
         })
         .collect();
 

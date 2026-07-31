@@ -127,9 +127,8 @@ mod kernels;
 mod union;
 
 pub use union::{
-    MatrixAssertion, UnionLincheckSlot, eq_prefix_sum, eq_prefix_weight,
-    prove_union_capture_z_vec, union_comb_partial, verify_union, verify_union_deferred,
-    verify_union_timed,
+    MatrixAssertion, UnionLincheckSlot, eq_prefix_sum, eq_prefix_weight, prove_union_capture_z_vec,
+    union_comb_partial, verify_union, verify_union_deferred, verify_union_timed,
 };
 
 #[cfg(target_arch = "x86_64")]

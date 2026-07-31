@@ -39,8 +39,8 @@
 use flock_core::circuit::{Cell, Circuit, CircuitError, WiringError};
 use flock_core::element_r1cs::{ElementTableBuilder, ElementTableType};
 use flock_core::field::F128;
-use flock_core::pcs::ligerito::LigeritoProfile;
 use flock_core::pcs::PcsParams;
+use flock_core::pcs::ligerito::LigeritoProfile;
 use flock_core::product_gkr;
 use flock_core::proof::R1csProofCircuitLigerito;
 use flock_prover::challenger::FsChallenger;
@@ -218,10 +218,7 @@ fn build_tree(k_leaves: usize, nu: usize, rng: &mut Rng) -> Tree {
     }
     // The root's output to the public output cells.
     let out_base = iv_cells + 4 * leaves;
-    wires.push(vec![
-        Cell::new(SHA_O0, n_gates - 1),
-        pub_cell(out_base, nu),
-    ]);
+    wires.push(vec![Cell::new(SHA_O0, n_gates - 1), pub_cell(out_base, nu)]);
     wires.push(vec![
         Cell::new(SHA_O1, n_gates - 1),
         pub_cell(out_base + 1, nu),
@@ -424,7 +421,9 @@ fn sha256_binary_tree_circuit() {
         // those two connections.
         let i0 = swapped
             .iter()
-            .position(|c| c.contains(&Cell::new(SHA_O0, 0)) && c.contains(&Cell::new(SHA_M0, leaves)))
+            .position(|c| {
+                c.contains(&Cell::new(SHA_O0, 0)) && c.contains(&Cell::new(SHA_M0, leaves))
+            })
             .expect("leaf 0 → parent m0");
         let i1 = swapped
             .iter()
@@ -562,7 +561,10 @@ fn g_side_forgery_is_rejected() {
         gkr.top_lhs, gkr.top_rhs,
         "the forged products DO match — the multiset identity holds for g = w∘σ"
     );
-    assert_ne!(claim.f_eval, claim.g_eval, "…but the two vectors differ at ρ");
+    assert_ne!(
+        claim.f_eval, claim.g_eval,
+        "…but the two vectors differ at ρ"
+    );
 
     // Honest gather values for the honest `f = w` side, so the recombination
     // check passes and ONLY the g-side binding is left to catch it.
@@ -740,7 +742,10 @@ fn chain_witness(ty: &ElementTableType, nu: usize, a: &[F128], seed: F128) -> (V
         z[at(2, j)] = aj * b;
         b = aj * b;
     }
-    assert!(ty.satisfies(&z, nu, a.len()), "generated witness must satisfy");
+    assert!(
+        ty.satisfies(&z, nu, a.len()),
+        "generated witness must satisfy"
+    );
     (z, b)
 }
 
@@ -752,9 +757,7 @@ fn element_chain_circuit() {
     let (nu, kappa, n) = (12usize, 3usize, 20usize);
     let registry = element_registry(nu, kappa);
     assert_eq!(registry.m_total(), 22);
-    let ty = registry.types()[0]
-        .element_type()
-        .expect("element type");
+    let ty = registry.types()[0].element_type().expect("element type");
 
     let mut rng = Rng::new(0xC4A1_0001);
     let seed = rng.f128();
@@ -846,7 +849,11 @@ fn cross_class_hash_into_mult() {
         ],
         nu,
     );
-    assert_eq!(registry.num_boolean(), 1, "SHA-256 sorts before the element");
+    assert_eq!(
+        registry.num_boolean(),
+        1,
+        "SHA-256 sorts before the element"
+    );
     assert!(registry.types()[1].is_element());
     assert_eq!(registry.m_total(), 23);
 
@@ -1065,9 +1072,7 @@ fn oracle_accepts(circuit: &Circuit, z: &[F128], nu: usize, public: &[F128]) -> 
 fn randomized_wirings_agree_with_the_oracle() {
     let (nu, kappa, n) = (12usize, 3usize, 8usize);
     let registry = element_registry(nu, kappa);
-    let ty = registry.types()[0]
-        .element_type()
-        .expect("element");
+    let ty = registry.types()[0].element_type().expect("element");
     let union = UnionInstance::new(&registry, vec![n]);
     let pcs_params = union_pcs_params(&union);
     const PUB: usize = 3;
@@ -1176,7 +1181,8 @@ fn randomized_wirings_agree_with_the_oracle() {
         )
         .is_ok();
         assert_eq!(
-            got, expected,
+            got,
+            expected,
             "case {case}: proof and brute-force oracle disagree \
              ({} classes, repaired: {repair})",
             circuit.wires().len()
@@ -1186,8 +1192,14 @@ fn randomized_wirings_agree_with_the_oracle() {
     }
     // The differential is only worth anything if both verdicts occurred over
     // non-trivial wirings.
-    assert!(accepts > 0 && rejects > 0, "{accepts} accepts, {rejects} rejects");
-    assert!(classes_seen >= 12, "wirings were too sparse to test anything");
+    assert!(
+        accepts > 0 && rejects > 0,
+        "{accepts} accepts, {rejects} rejects"
+    );
+    assert!(
+        classes_seen >= 12,
+        "wirings were too sparse to test anything"
+    );
 }
 
 // ===========================================================================
@@ -1347,14 +1359,20 @@ fn circuit_proofs_verify_over_the_merged_transport() {
         Vec::new(),
         &mut ch,
     );
-    assert_eq!(commitment_j.root, commitment.root, "same witness, same root");
+    assert_eq!(
+        commitment_j.root, commitment.root,
+        "same witness, same root"
+    );
     assert_eq!(
         claims_j, claims_m,
         "the two transports must agree on the claims they carry"
     );
     // The wiring transcripts are identical too — the argument runs before the
     // opening and cannot depend on it.
-    assert_eq!(jagged.wiring, merged.wiring, "wiring is transport-independent");
+    assert_eq!(
+        jagged.wiring, merged.wiring,
+        "wiring is transport-independent"
+    );
 
     // Tampering must still be caught on the merged path — otherwise the
     // gather claims would be riding along unchecked.

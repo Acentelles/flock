@@ -754,9 +754,10 @@ mod tests {
                         pd_t.codeword.len() * 16,
                     )
                 };
-                let root = *crate::merkle::merkle_tree(bytes, t_params.n_leaves(), t_params.merkle_hash)
-                    .last()
-                    .unwrap();
+                let root =
+                    *crate::merkle::merkle_tree(bytes, t_params.n_leaves(), t_params.merkle_hash)
+                        .last()
+                        .unwrap();
                 assert_eq!(root, _c_t.root, "root must be over t-wide leaves");
             }
         }
@@ -872,7 +873,8 @@ mod tests {
             let mut best_merkle = f64::INFINITY;
             for _ in 0..n_runs {
                 let t = Instant::now();
-                let tree = merkle::merkle_tree(bytes, n_positions, crate::hash::HashKind::default());
+                let tree =
+                    merkle::merkle_tree(bytes, n_positions, crate::hash::HashKind::default());
                 best_merkle = best_merkle.min(t.elapsed().as_secs_f64() * 1e3);
                 std::hint::black_box(tree.last());
             }

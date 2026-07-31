@@ -581,9 +581,7 @@ fn build_union_witness(
                 z_lincheck
             }
             UnionSlotWitnessSource::Element { ty, generate } => {
-                flock_core::element_r1cs::union::fill_slot(
-                    &ty, nu, dst.z, dst.a, dst.b, generate,
-                );
+                flock_core::element_r1cs::union::fill_slot(&ty, nu, dst.z, dst.a, dst.b, generate);
                 Vec::new()
             }
         })
@@ -783,8 +781,16 @@ pub fn prove_fast_ligerito_jagged_union_circuit<Ch: Challenger>(
         "the circuit and the union instance must be the same statement \
          (same registry, and the circuit's gate counts ARE the union's counts)"
     );
-    let (proof, commitment, claims) =
-        prove_circuit_inner(union, circuit, public, pcs_params, slots, element_slots, Transport::Jagged, challenger);
+    let (proof, commitment, claims) = prove_circuit_inner(
+        union,
+        circuit,
+        public,
+        pcs_params,
+        slots,
+        element_slots,
+        Transport::Jagged,
+        challenger,
+    );
     (
         flock_core::proof::R1csProofCircuitLigerito {
             boolean: proof.boolean,
@@ -821,8 +827,16 @@ pub fn prove_fast_ligerito_union_circuit_merged<Ch: Challenger>(
     Commitment,
     flock_core::proof::UnionClassClaims,
 ) {
-    let (proof, commitment, claims) =
-        prove_circuit_inner(union, circuit, public, pcs_params, slots, element_slots, Transport::Merged, challenger);
+    let (proof, commitment, claims) = prove_circuit_inner(
+        union,
+        circuit,
+        public,
+        pcs_params,
+        slots,
+        element_slots,
+        Transport::Merged,
+        challenger,
+    );
     (
         flock_core::proof::R1csProofCircuitMerged {
             boolean: proof.boolean,
@@ -1339,12 +1353,9 @@ fn prove_union_with_binding<Ch: Challenger>(
     }
     match binding {
         UnionProveBinding::Mixed => union.bind_statement(challenger, &commitment),
-        UnionProveBinding::Circuit(ci) => union.bind_statement_circuit(
-            challenger,
-            &commitment,
-            &ci.circuit.digest(),
-            ci.public,
-        ),
+        UnionProveBinding::Circuit(ci) => {
+            union.bind_statement_circuit(challenger, &commitment, &ci.circuit.digest(), ci.public)
+        }
         UnionProveBinding::SingleTypeHarness(slot_r1cs) => {
             union.bind_statement_single_type(challenger, slot_r1cs, &commitment)
         }
@@ -1370,10 +1381,7 @@ fn prove_union_with_binding<Ch: Challenger>(
     let t = std::time::Instant::now();
     let element_ab: Option<(Vec<F128>, Vec<F128>)> = union.has_element().then(|| {
         let r = union.element_word_range();
-        (
-            a_packed_f128[r.clone()].to_vec(),
-            b_packed_f128[r].to_vec(),
-        )
+        (a_packed_f128[r.clone()].to_vec(), b_packed_f128[r].to_vec())
     });
 
     if trace && element_ab.is_some() {
@@ -1517,10 +1525,7 @@ fn prove_union_with_binding<Ch: Challenger>(
     let t = std::time::Instant::now();
     let wiring = match &binding {
         UnionProveBinding::Circuit(ci) => Some(flock_core::circuit::prove_wiring(
-            ci.circuit,
-            &z_packed,
-            ci.public,
-            challenger,
+            ci.circuit, &z_packed, ci.public, challenger,
         )),
         _ => None,
     };
@@ -1573,8 +1578,10 @@ fn prove_union_with_binding<Ch: Challenger>(
             // Same claims, different transport: the ring-switched pair goes
             // in as quirky points, the element pair as packed-direct — which
             // the merged open now carries (identity fold weights).
-            let x_fulls: Vec<Vec<F128>> =
-                z_claims.iter().map(|cl| quirky_x_outer_full(&cl.point)).collect();
+            let x_fulls: Vec<Vec<F128>> = z_claims
+                .iter()
+                .map(|cl| quirky_x_outer_full(&cl.point))
+                .collect();
             let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
             let open = pcs::open_batch_merged(
                 dense_q.expect("the merged transport needs the dense stack"),
@@ -2204,4 +2211,3 @@ pub fn prove_fast_ligerito_jagged_union_mixed_class_merged<Ch: Challenger>(
         },
     )
 }
-

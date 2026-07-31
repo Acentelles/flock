@@ -3830,8 +3830,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let nonce_last = challenger.grind_pow(config.grinding_bits[i + 1] as u32);
             grinding_nonces.push(nonce_last);
             let num_queries_last = config.queries[i + 1];
-            let queries_last =
-                sample_queries(challenger, wtns_prev.block_len, num_queries_last);
+            let queries_last = sample_queries(challenger, wtns_prev.block_len, num_queries_last);
             let _t = std::time::Instant::now();
             let opened_rows_last: Vec<Vec<F128>> = queries_last
                 .iter()
@@ -4298,8 +4297,7 @@ where
             let prev_num_interleaved = 1usize << prev_log_num_interleaved;
             let num_queries_last = config.queries[i + 1];
             let _t = std::time::Instant::now();
-            let queries_last =
-                sample_queries(challenger, prev_block_len, num_queries_last);
+            let queries_last = sample_queries(challenger, prev_block_len, num_queries_last);
             // Basis-induction challenge for the LAST commitment. Sampled here —
             // after `yr` was observed (top of this branch) and the queries are
             // fixed — so a forged `yr` cannot be adapted to it. Mirrors `alpha_i`
@@ -4823,8 +4821,7 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
             let prev_block_len = 1usize << (prev_log_msg_cols + prev_log_inv_rate);
             let prev_num_interleaved = 1usize << prev_log_num_interleaved;
             let num_queries_last = config.queries[i + 1];
-            let queries_last =
-                sample_queries(challenger, prev_block_len, num_queries_last);
+            let queries_last = sample_queries(challenger, prev_block_len, num_queries_last);
             // Final-level basis-induction challenge — sampled after `yr` and the
             // queries are fixed. Same position as the succinct verifier
             // (recursive_verifier_with_basis_succinct), which verifies the same
@@ -5134,8 +5131,7 @@ fn recursive_prover_inner<Ch: Challenger>(
             }
             // wtns_prev's rate (= log_inv_rates[i+1] for wtns_{i+1}).
             let num_queries_last = udr_queries(config.log_inv_rates[i + 1]);
-            let queries_last =
-                sample_queries(challenger, wtns_prev.block_len, num_queries_last);
+            let queries_last = sample_queries(challenger, wtns_prev.block_len, num_queries_last);
             let opened_rows_last: Vec<Vec<F128>> = queries_last
                 .iter()
                 .map(|&q| wtns_prev.row(q).to_vec())
@@ -5446,8 +5442,7 @@ pub fn recursive_verifier<Ch: Challenger>(
             let prev_block_len = 1usize << (prev_log_msg_cols + prev_log_inv_rate);
             let prev_num_interleaved = 1usize << prev_log_num_interleaved;
             let num_queries_last = udr_queries(prev_log_inv_rate);
-            let queries_last =
-                sample_queries(challenger, prev_block_len, num_queries_last);
+            let queries_last = sample_queries(challenger, prev_block_len, num_queries_last);
             // Final-level basis-induction challenge (after yr + queries fixed).
             let alpha_last = challenger.sample_f128_vec(ceil_log2(num_queries_last));
             if !verify_level_opens(

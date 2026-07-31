@@ -173,8 +173,8 @@ const KIND_SCALAR: u8 = 0x01;
 const KIND_SLICE: u8 = 0x02;
 
 /// Global Fiat–Shamir hash counters, enabled with `--features hash-count`.
-/// Tracks the squeeze count and the PoW checks; absorbed transcript bytes are
-/// tracked via [`FsChallenger::absorbed_bytes`].
+/// Tracks the squeeze count, the squeezed output length and the PoW checks;
+/// absorbed transcript bytes are tracked via [`FsChallenger::absorbed_bytes`].
 #[cfg(feature = "hash-count")]
 pub mod fs_count {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -182,18 +182,31 @@ pub mod fs_count {
     /// Number of XOF finalizations (one per `sample_f128` /
     /// `sample_f128_vec` / PoW state-digest extraction).
     pub static SQUEEZES: AtomicU64 = AtomicU64::new(0);
+    /// Total bytes of squeezed OUTPUT. Tracked separately from the squeeze
+    /// count because the two scale differently: a squeeze costs one
+    /// finalization of the pending state plus one compression per 64 bytes of
+    /// output. That distinction was invisible while every squeeze was a
+    /// 16-byte `sample_f128`, and became load-bearing when query sampling
+    /// moved to one batched `sample_f128_vec` per level (3888 bytes at L0 —
+    /// 61 output blocks, not 1).
+    pub static SQUEEZED_BYTES: AtomicU64 = AtomicU64::new(0);
     /// Number of PoW evaluations, under whichever hash the transcript uses
     /// (1 compression each; 40 B input).
     pub static POW_SHA256: AtomicU64 = AtomicU64::new(0);
 
     pub fn reset() {
         SQUEEZES.store(0, Relaxed);
+        SQUEEZED_BYTES.store(0, Relaxed);
         POW_SHA256.store(0, Relaxed);
     }
 
-    /// (squeezes, pow_calls)
-    pub fn snapshot() -> (u64, u64) {
-        (SQUEEZES.load(Relaxed), POW_SHA256.load(Relaxed))
+    /// (squeezes, squeezed_bytes, pow_calls)
+    pub fn snapshot() -> (u64, u64, u64) {
+        (
+            SQUEEZES.load(Relaxed),
+            SQUEEZED_BYTES.load(Relaxed),
+            POW_SHA256.load(Relaxed),
+        )
     }
 }
 
@@ -304,7 +317,10 @@ impl FsChallenger {
     #[inline]
     fn state_digest(&self) -> [u8; 32] {
         #[cfg(feature = "hash-count")]
-        fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            fs_count::SQUEEZED_BYTES.fetch_add(32, std::sync::atomic::Ordering::Relaxed);
+        }
         match &self.state {
             FsState::Sha256(h) => h.clone().finalize().into(),
             FsState::Blake3(h) => *h.finalize().as_bytes(),
@@ -348,7 +364,10 @@ impl Challenger for FsChallenger {
 
     fn sample_f128(&mut self) -> F128 {
         #[cfg(feature = "hash-count")]
-        fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            fs_count::SQUEEZED_BYTES.fetch_add(16, std::sync::atomic::Ordering::Relaxed);
+        }
         self.absorb(&[OP_SQUEEZE, KIND_SCALAR]);
         let mut buf = [0u8; 16];
         self.squeeze_into(&mut buf);
@@ -361,7 +380,11 @@ impl Challenger for FsChallenger {
 
     fn sample_f128_vec(&mut self, n: usize) -> Vec<F128> {
         #[cfg(feature = "hash-count")]
-        fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            fs_count::SQUEEZED_BYTES
+                .fetch_add((n * 16) as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         self.absorb(&[OP_SQUEEZE, KIND_SLICE]);
         self.absorb(&(n as u64).to_le_bytes());
         let mut buf = vec![0u8; n * 16];

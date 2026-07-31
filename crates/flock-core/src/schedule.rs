@@ -392,9 +392,8 @@ impl Registry {
 
         // Pack each class from its own base, area-descending. Boolean starts
         // at 0; the element base needs the boolean extent first.
-        let extent = |tys: &[TableType]| -> usize {
-            tys.iter().map(|ty| 1usize << (nu + ty.k_log)).sum()
-        };
+        let extent =
+            |tys: &[TableType]| -> usize { tys.iter().map(|ty| 1usize << (nu + ty.k_log)).sum() };
         let bool_extent = extent(&types[..num_boolean]);
         let elem_extent = extent(&types[num_boolean..]);
         let pow2_log = |n: usize| n.next_power_of_two().trailing_zeros() as usize;
@@ -452,7 +451,10 @@ impl Registry {
 
         // The two region invariants the disjoint PIOPs rest on, spelled out.
         if num_boolean > 0 {
-            assert!(m_bool <= m_total, "boolean region exceeds the address space");
+            assert!(
+                m_bool <= m_total,
+                "boolean region exceeds the address space"
+            );
             let last = &slots[num_boolean - 1];
             assert!(
                 last.offset + last.area() <= 1usize << m_bool,
@@ -460,7 +462,10 @@ impl Registry {
             );
         }
         if num_boolean < types.len() {
-            assert!(m_elem <= m_total, "element region exceeds the address space");
+            assert!(
+                m_elem <= m_total,
+                "element region exceeds the address space"
+            );
             assert!(
                 element_base.is_multiple_of(1usize << m_elem),
                 "element region base {element_base} not aligned to 2^{m_elem}"
@@ -726,7 +731,10 @@ impl<'r> Instance<'r> {
             // Explicit zero run for any gap before this slot.
             debug_assert!(slot.offset >= cursor);
             let gap = slot.offset - cursor;
-            debug_assert!(gap.is_multiple_of(1usize << col_bits), "gap {gap} not column-aligned");
+            debug_assert!(
+                gap.is_multiple_of(1usize << col_bits),
+                "gap {gap} not column-aligned"
+            );
             runs.push(PaddingRun {
                 k_log: col_bits,
                 useful_bits_per_block: 0,
@@ -1349,9 +1357,24 @@ mod tests {
         assert_eq!(
             reg.slots(),
             &[
-                Slot { m_slot: 13, offset: 0, prefix: 0b00, prefix_bits: 2 },
-                Slot { m_slot: 12, offset: 1 << 13, prefix: 0b010, prefix_bits: 3 },
-                Slot { m_slot: 13, offset: 1 << 14, prefix: 0b10, prefix_bits: 2 },
+                Slot {
+                    m_slot: 13,
+                    offset: 0,
+                    prefix: 0b00,
+                    prefix_bits: 2
+                },
+                Slot {
+                    m_slot: 12,
+                    offset: 1 << 13,
+                    prefix: 0b010,
+                    prefix_bits: 3
+                },
+                Slot {
+                    m_slot: 13,
+                    offset: 1 << 14,
+                    prefix: 0b10,
+                    prefix_bits: 2
+                },
             ]
         );
 

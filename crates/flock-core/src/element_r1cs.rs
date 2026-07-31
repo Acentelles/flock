@@ -389,13 +389,7 @@ impl ElementTableType {
     ///
     /// This is the in-place path the union's element witness assembly uses:
     /// the destinations are slices of the padded union `a`/`b` buffers.
-    pub fn affine_products_into(
-        &self,
-        z: &[F128],
-        n_log: usize,
-        pa: &mut [F128],
-        pb: &mut [F128],
-    ) {
+    pub fn affine_products_into(&self, z: &[F128], n_log: usize, pa: &mut [F128], pb: &mut [F128]) {
         assert_eq!(z.len(), self.width() << n_log, "witness length");
         assert_eq!(pa.len(), z.len(), "pa length");
         assert_eq!(pb.len(), z.len(), "pb length");
@@ -803,8 +797,8 @@ pub fn verify<C: Challenger>(
     };
     stmt.bind(&commitment.root, ch);
 
-    let zc_claim = zerocheck::verify(m_words, &proof.zerocheck, ch)
-        .map_err(VerifyError::Zerocheck)?;
+    let zc_claim =
+        zerocheck::verify(m_words, &proof.zerocheck, ch).map_err(VerifyError::Zerocheck)?;
     let (va, vb) = strip_constants(stmt.ty, &zc_claim);
     let lc_claim = lincheck::verify(
         stmt.ty,

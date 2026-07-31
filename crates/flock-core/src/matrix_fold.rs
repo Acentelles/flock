@@ -413,11 +413,16 @@ impl FoldMatrix for SparseBinaryMatrix {
         out
     }
     fn col_marginal(&self, w: &[F128], n_cols: usize) -> Vec<F128> {
-        scatter_cols(self.rows.len(), n_cols, |r, f| {
-            for &c in &self.rows[r] {
-                f(c, F128::ONE);
-            }
-        }, w)
+        scatter_cols(
+            self.rows.len(),
+            n_cols,
+            |r, f| {
+                for &c in &self.rows[r] {
+                    f(c, F128::ONE);
+                }
+            },
+            w,
+        )
     }
     fn n_rows(&self) -> usize {
         self.num_rows
@@ -448,11 +453,16 @@ impl FoldMatrix for crate::element_r1cs::SparseF128Matrix {
         out
     }
     fn col_marginal(&self, w: &[F128], n_cols: usize) -> Vec<F128> {
-        scatter_cols(self.rows.len(), n_cols, |r, f| {
-            for &(c, coeff) in &self.rows[r] {
-                f(c, coeff);
-            }
-        }, w)
+        scatter_cols(
+            self.rows.len(),
+            n_cols,
+            |r, f| {
+                for &(c, coeff) in &self.rows[r] {
+                    f(c, coeff);
+                }
+            },
+            w,
+        )
     }
     fn n_rows(&self) -> usize {
         self.num_rows

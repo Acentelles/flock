@@ -177,7 +177,10 @@ pub struct Claims {
 pub enum VerifyError {
     Zerocheck(zerocheck::VerifyError),
     /// Wrong number of lincheck round messages (expected `E − nu`).
-    LincheckRoundCount { expected: usize, got: usize },
+    LincheckRoundCount {
+        expected: usize,
+        got: usize,
+    },
     /// The lincheck's final consistency check `running == Ĉomb(r'_col)·z_eval`
     /// failed.
     LincheckFinalFailed,
@@ -199,23 +202,18 @@ pub fn prove<C: Challenger>(
 ) -> (Proof, Claims) {
     let slots = region_slots(union);
     let (nu, e_vars) = (union.n_log(), union.m_elem() - 7);
-    assert!(!slots.is_empty(), "region PIOP needs at least one element slot");
+    assert!(
+        !slots.is_empty(),
+        "region PIOP needs at least one element slot"
+    );
     assert_eq!(z.len(), 1usize << e_vars, "region witness length");
 
     // ---- Phase 1: one zerocheck over the whole region, with the declared row
     // support so the row rounds cost `O(Σ n_t · used_cols)` instead of
     // `O(2^E)`. Bit-identical to the dense path — see `zerocheck::RowSupport`.
     let support = row_support(&slots, nu, e_vars);
-    let (zc_proof, zc) = zerocheck::prove_with_support(
-        ZC_LABEL,
-        pa,
-        pb,
-        z,
-        e_vars,
-        nu,
-        Some(&support),
-        ch,
-    );
+    let (zc_proof, zc) =
+        zerocheck::prove_with_support(ZC_LABEL, pa, pb, z, e_vars, nu, Some(&support), ch);
     let (va, vb) = strip_constants(&slots, nu, &zc);
 
     // ---- Phase 2: the column-domain lincheck with the per-slot collapse.
@@ -224,7 +222,9 @@ pub fn prove<C: Challenger>(
     let mut comb = region_comb(&slots, nu, e_vars, alpha, &zc.r);
     let mut g = collapse_rows(z, &zc.r[..nu], Some(&support.live));
     debug_assert_eq!(
-        comb.iter().zip(&g).fold(F128::ZERO, |a, (x, y)| a + *x * *y),
+        comb.iter()
+            .zip(&g)
+            .fold(F128::ZERO, |a, (x, y)| a + *x * *y),
         va + alpha * vb,
         "region lincheck target must be the honest weighted inner product"
     );
@@ -273,7 +273,10 @@ pub fn verify_deferred<C: Challenger>(
 ) -> Result<(Claims, ElementAssertion), VerifyError> {
     let slots = region_slots(union);
     let (nu, e_vars) = (union.n_log(), union.m_elem() - 7);
-    assert!(!slots.is_empty(), "region PIOP needs at least one element slot");
+    assert!(
+        !slots.is_empty(),
+        "region PIOP needs at least one element slot"
+    );
     let lc_rounds = e_vars - nu;
     if proof.lincheck.rounds.len() != lc_rounds {
         return Err(VerifyError::LincheckRoundCount {
@@ -288,8 +291,7 @@ pub fn verify_deferred<C: Challenger>(
 
     ch.observe_label(LC_LABEL);
     let alpha = ch.sample_f128();
-    let (running, bind_order) =
-        column_sumcheck_replay(va + alpha * vb, &proof.lincheck.rounds, ch);
+    let (running, bind_order) = column_sumcheck_replay(va + alpha * vb, &proof.lincheck.rounds, ch);
 
     // Final check: `Ĉomb(r'_col) · z_eval`. Evaluated by the closed form —
     // per-slot comb MLE times the "the bound point addresses slot t" prefix-eq
@@ -780,7 +782,10 @@ mod tests {
             let w = c.ty.width() << nu;
             assert_eq!(range.len(), w);
             let rows = (c.make)(nu, n_t, rng);
-            assert!(c.ty.satisfies(&rows, nu, n_t), "generated witness must satisfy");
+            assert!(
+                c.ty.satisfies(&rows, nu, n_t),
+                "generated witness must satisfy"
+            );
             fill_slot(
                 &c.ty,
                 nu,
@@ -816,7 +821,12 @@ mod tests {
             // One element slot filling the region (no prefix at all).
             (vec![], vec![mult_case(2)], 3, vec![5]),
             // Two element slots of different widths → real slot prefixes.
-            (vec![], vec![mixed_case(&mut rng), mult_case(2)], 3, vec![6, 3]),
+            (
+                vec![],
+                vec![mixed_case(&mut rng), mult_case(2)],
+                3,
+                vec![6, 3],
+            ),
             // Mixed with a boolean slot in front → a region prefix too.
             (vec![(10, 700)], vec![mult_case(2)], 3, vec![0]),
             (vec![(10, 700), (9, 300)], vec![mult_case(3)], 2, vec![4]),
@@ -850,7 +860,12 @@ mod tests {
         let mut rng = Rng::new(0xC0_11A_25E);
         for (bools, cases, nu, counts_elem) in [
             (vec![], vec![mult_case(2)], 2, vec![3]),
-            (vec![(10, 700)], vec![mult_case(2), free_case(1)], 2, vec![0, 2, 1]),
+            (
+                vec![(10, 700)],
+                vec![mult_case(2), free_case(1)],
+                2,
+                vec![0, 2, 1],
+            ),
         ] {
             let cases: Vec<Case> = cases;
             let n_elem = cases.len();
@@ -866,7 +881,10 @@ mod tests {
 
             let comb = region_comb(&slots, nu, e_vars, alpha, &r);
             let g = collapse_rows(&z, &r[..nu], None);
-            let collapsed = comb.iter().zip(&g).fold(F128::ZERO, |a, (x, y)| a + *x * *y);
+            let collapsed = comb
+                .iter()
+                .zip(&g)
+                .fold(F128::ZERO, |a, (x, y)| a + *x * *y);
 
             // Brute force from the UNFACTORED definition: walk every (x, y)
             // pair of the block-diagonal region system explicitly.
@@ -1015,7 +1033,12 @@ mod tests {
             (vec![], vec![mult_case(2)], 3, vec![5]),
             (vec![], vec![mult_case(2)], 3, vec![8]),
             (vec![], vec![mult_case(2)], 3, vec![0]),
-            (vec![], vec![mixed_case(&mut rng), mult_case(2)], 3, vec![6, 3]),
+            (
+                vec![],
+                vec![mixed_case(&mut rng), mult_case(2)],
+                3,
+                vec![6, 3],
+            ),
             (vec![(10, 700)], vec![mult_case(3)], 2, vec![0, 3]),
             (
                 vec![(10, 700), (9, 300)],
@@ -1301,14 +1324,28 @@ mod tests {
                 let mut ch = FsChallenger::new(b"element-rows-ab");
                 let t = Instant::now();
                 let (dense, dclaim) = zerocheck::prove_with_support(
-                    zerocheck::LABEL, pa.clone(), pb.clone(), &z, e_vars, nu, None, &mut ch,
+                    zerocheck::LABEL,
+                    pa.clone(),
+                    pb.clone(),
+                    &z,
+                    e_vars,
+                    nu,
+                    None,
+                    &mut ch,
                 );
                 let ms_d = t.elapsed().as_secs_f64() * 1e3;
 
                 let mut ch = FsChallenger::new(b"element-rows-ab");
                 let t = Instant::now();
                 let (sparse, sclaim) = zerocheck::prove_with_support(
-                    zerocheck::LABEL, pa.clone(), pb.clone(), &z, e_vars, nu, Some(&sup), &mut ch,
+                    zerocheck::LABEL,
+                    pa.clone(),
+                    pb.clone(),
+                    &z,
+                    e_vars,
+                    nu,
+                    Some(&sup),
+                    &mut ch,
                 );
                 let ms_s = t.elapsed().as_secs_f64() * 1e3;
 
@@ -1329,7 +1366,12 @@ mod tests {
 dense {:6.2} [{:5.2} – {:5.2}]  support {:6.2} [{:5.2} – {:5.2}]  {:4.1}x",
                 100.0 * n as f64 / rows as f64,
                 100.0 * (cases[0].ty.k() * n) as f64 / (1usize << e_vars) as f64,
-                d.1, d.0, d.2, sp.1, sp.0, sp.2,
+                d.1,
+                d.0,
+                d.2,
+                sp.1,
+                sp.0,
+                sp.2,
                 d.1 / sp.1,
             );
         }

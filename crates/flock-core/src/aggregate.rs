@@ -43,8 +43,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::challenger::Challenger;
-use crate::field::F128;
 use crate::element_r1cs::union::ElementAssertion;
+use crate::field::F128;
 use crate::lincheck::{MatrixAssertion, VerifyError};
 use crate::matrix_fold::{self, FoldProof, MatrixClaim};
 use crate::r1cs::SparseBinaryMatrix;
@@ -296,10 +296,7 @@ pub fn prove_aggregate_classes<Ch: Challenger>(
     }
 
     Ok((
-        AggregateProof {
-            folds,
-            el_folds,
-        },
+        AggregateProof { folds, el_folds },
         Accumulator {
             registry_digest: registry.digest(),
             per_type,

@@ -591,8 +591,14 @@ fn deferred_lincheck_matches_and_defers_the_matrix_work() {
         zerocheck::prove_packed_padded(&a_p, &b_p, &c_p, m, &union.padding_spec(), &mut ch_p);
     let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
     let lc_slots = [
-        UnionLincheckSlot { z_lincheck: &stripe_a, circuit: &circ_a },
-        UnionLincheckSlot { z_lincheck: &stripe_b, circuit: &circ_b },
+        UnionLincheckSlot {
+            z_lincheck: &stripe_a,
+            circuit: &circ_a,
+        },
+        UnionLincheckSlot {
+            z_lincheck: &stripe_b,
+            circuit: &circ_b,
+        },
     ];
     let (lc_proof, _lc_claim, _g) =
         lincheck::prove_union_capture_z_vec(&union, &lc_slots, &x_ab, &mut ch_p);
@@ -614,7 +620,10 @@ fn deferred_lincheck_matches_and_defers_the_matrix_work() {
     let (deferred, assertion) =
         lincheck::verify_union_deferred(&union, &circuits, &x, va, vb, &lc_proof, &mut ch)
             .expect("deferred verify accepts");
-    assert_eq!(direct, deferred, "the split must not change the witness claim");
+    assert_eq!(
+        direct, deferred,
+        "the split must not change the witness claim"
+    );
     assert!(
         assertion.check(&union, &circuits).is_ok(),
         "an honest assertion must discharge"
@@ -677,9 +686,27 @@ fn matrix_assertion_decomposes_into_foldable_claims() {
     let mut z_addr = vec![false; 1 << m];
     let mut a_addr = vec![false; 1 << m];
     let mut b_addr = vec![false; 1 << m];
-    place_addr(&mut z_addr, &slot.z_sem, slot.k_log, nu, registry.slots()[0].offset);
-    place_addr(&mut a_addr, &slot.a_sem, slot.k_log, nu, registry.slots()[0].offset);
-    place_addr(&mut b_addr, &slot.b_sem, slot.k_log, nu, registry.slots()[0].offset);
+    place_addr(
+        &mut z_addr,
+        &slot.z_sem,
+        slot.k_log,
+        nu,
+        registry.slots()[0].offset,
+    );
+    place_addr(
+        &mut a_addr,
+        &slot.a_sem,
+        slot.k_log,
+        nu,
+        registry.slots()[0].offset,
+    );
+    place_addr(
+        &mut b_addr,
+        &slot.b_sem,
+        slot.k_log,
+        nu,
+        registry.slots()[0].offset,
+    );
     let c_addr: Vec<bool> = a_addr.iter().zip(&b_addr).map(|(x, y)| *x & *y).collect();
     let (a_p, b_p, c_p) = (pack_bits(&a_addr), pack_bits(&b_addr), pack_bits(&c_addr));
 
@@ -689,7 +716,10 @@ fn matrix_assertion_decomposes_into_foldable_claims() {
     let (zc_proof, zc_claim) =
         zerocheck::prove_packed_padded(&a_p, &b_p, &c_p, m, &union.padding_spec(), &mut ch_p);
     let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
-    let lc_slots = [UnionLincheckSlot { z_lincheck: &stripe, circuit: &circ }];
+    let lc_slots = [UnionLincheckSlot {
+        z_lincheck: &stripe,
+        circuit: &circ,
+    }];
     let (lc_proof, _claim, _g) =
         lincheck::prove_union_capture_z_vec(&union, &lc_slots, &x_ab, &mut ch_p);
 
@@ -701,7 +731,10 @@ fn matrix_assertion_decomposes_into_foldable_claims() {
         &union, &circuits, &x, zc.a_eval, zc.b_eval, &lc_proof, &mut ch_v,
     )
     .expect("deferred verify accepts");
-    assert!(assertion.check(&union, &circuits).is_ok(), "assertion is honest");
+    assert!(
+        assertion.check(&union, &circuits).is_ok(),
+        "assertion is honest"
+    );
 
     // ---- Decompose into the two per-matrix claims.
     let inner = slot.k_log - K_SKIP;
@@ -728,8 +761,16 @@ fn matrix_assertion_decomposes_into_foldable_claims() {
     // stands in for a second proof's claim; folding is over one matrix, which
     // is why A and B get their own accumulators.
     let other = MatrixClaim::honest(
-        Weight::eq((0..slot.k_log).map(|i| F128::new(0x51 + i as u64, 7)).collect()),
-        Weight::eq((0..slot.k_log).map(|i| F128::new(0x77 + i as u64, 3)).collect()),
+        Weight::eq(
+            (0..slot.k_log)
+                .map(|i| F128::new(0x51 + i as u64, 7))
+                .collect(),
+        ),
+        Weight::eq(
+            (0..slot.k_log)
+                .map(|i| F128::new(0x77 + i as u64, 3))
+                .collect(),
+        ),
         &slot.a0,
     );
     let pair = [claim_a, other];
@@ -788,8 +829,14 @@ fn reported_matrix_evals_agree_with_reading_the_matrices() {
         zerocheck::prove_packed_padded(&a_p, &b_p, &c_p, m, &union.padding_spec(), &mut ch_p);
     let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
     let lc_slots = [
-        UnionLincheckSlot { z_lincheck: &stripe_a, circuit: &circ_a },
-        UnionLincheckSlot { z_lincheck: &stripe_b, circuit: &circ_b },
+        UnionLincheckSlot {
+            z_lincheck: &stripe_a,
+            circuit: &circ_a,
+        },
+        UnionLincheckSlot {
+            z_lincheck: &stripe_b,
+            circuit: &circ_b,
+        },
     ];
     let (lc_proof, _c, _g) =
         lincheck::prove_union_capture_z_vec(&union, &lc_slots, &x_ab, &mut ch_p);
@@ -799,17 +846,21 @@ fn reported_matrix_evals_agree_with_reading_the_matrices() {
         let mut ch = FsChallenger::new(DOMAIN);
         let zc = zerocheck::verify(m, &zc_proof, &mut ch).expect("zerocheck accepts");
         let x = union.x_ab_from_mlv(zc.z, &zc.mlv_challenges);
-        lincheck::verify_union_deferred(
-            &union, &circuits, &x, zc.a_eval, zc.b_eval, proof, &mut ch,
-        )
-        .map(|(_, a)| a)
+        lincheck::verify_union_deferred(&union, &circuits, &x, zc.a_eval, zc.b_eval, proof, &mut ch)
+            .map(|(_, a)| a)
     };
 
     // Honest: both routes accept, and every reported value is the honest
     // bilinear form of a real base matrix.
     let assertion = assertion_for(&lc_proof).expect("deferred verify accepts");
-    assert!(assertion.check(&union, &circuits).is_ok(), "matrix route accepts");
-    assert!(assertion.check_reported(&registry).is_ok(), "reported route accepts");
+    assert!(
+        assertion.check(&union, &circuits).is_ok(),
+        "matrix route accepts"
+    );
+    assert!(
+        assertion.check_reported(&registry).is_ok(),
+        "reported route accepts"
+    );
     for ((ca, cb), slot) in assertion
         .claims(&registry)
         .into_iter()
@@ -822,8 +873,16 @@ fn reported_matrix_evals_agree_with_reading_the_matrices() {
     // The claims fold, and the accumulator stays true.
     let (ca0, _) = assertion.claims(&registry).swap_remove(0);
     let other = matrix_fold::MatrixClaim::honest(
-        matrix_fold::Weight::eq((0..slot_a.k_log).map(|i| F128::new(9 + i as u64, 4)).collect()),
-        matrix_fold::Weight::eq((0..slot_a.k_log).map(|i| F128::new(5 + i as u64, 6)).collect()),
+        matrix_fold::Weight::eq(
+            (0..slot_a.k_log)
+                .map(|i| F128::new(9 + i as u64, 4))
+                .collect(),
+        ),
+        matrix_fold::Weight::eq(
+            (0..slot_a.k_log)
+                .map(|i| F128::new(5 + i as u64, 6))
+                .collect(),
+        ),
         &slot_a.a0,
     );
     let pair = [ca0, other];
@@ -913,7 +972,10 @@ fn two_proofs_fold_two_to_one_per_matrix() {
         let x_ab = union.x_ab_from_mlv(zc.z, &zc.mlv_challenges);
         let (mut proof, _c, _g) = lincheck::prove_union_capture_z_vec(
             &union,
-            &[UnionLincheckSlot { z_lincheck: &stripe, circuit: &circ }],
+            &[UnionLincheckSlot {
+                z_lincheck: &stripe,
+                circuit: &circ,
+            }],
             &x_ab,
             &mut ch,
         );
@@ -933,18 +995,17 @@ fn two_proofs_fold_two_to_one_per_matrix() {
     };
 
     // One accumulator per matrix — A and B never mix.
-    let fold2 = |mat: &SparseBinaryMatrix,
-                 pair: [MatrixClaim; 2]|
-     -> Result<MatrixClaim, FoldError> {
-        let combs: Vec<Vec<F128>> = pair
-            .iter()
-            .map(|c| matrix_fold::col_marginal(mat, &c.row.materialize(), mat.num_cols))
-            .collect();
-        let mut chp = FsChallenger::new(b"acc");
-        let (proof, _) = matrix_fold::prove_fold(mat, &combs, &pair, &mut chp);
-        let mut chv = FsChallenger::new(b"acc");
-        matrix_fold::verify_fold(&pair, &proof, &mut chv)
-    };
+    let fold2 =
+        |mat: &SparseBinaryMatrix, pair: [MatrixClaim; 2]| -> Result<MatrixClaim, FoldError> {
+            let combs: Vec<Vec<F128>> = pair
+                .iter()
+                .map(|c| matrix_fold::col_marginal(mat, &c.row.materialize(), mat.num_cols))
+                .collect();
+            let mut chp = FsChallenger::new(b"acc");
+            let (proof, _) = matrix_fold::prove_fold(mat, &combs, &pair, &mut chp);
+            let mut chv = FsChallenger::new(b"acc");
+            matrix_fold::verify_fold(&pair, &proof, &mut chv)
+        };
 
     let (a1, b1) = claims_of(&slots[0], false);
     let (a2, b2) = claims_of(&slots[1], false);
@@ -1000,11 +1061,10 @@ fn aggregating_real_proofs_defers_all_matrix_work_to_one_discharge() {
         .collect();
     let registry = Registry::new(vec![table_type(&slots[0])], nu);
     let m = registry.m_total();
-    let mats: Vec<(&SparseBinaryMatrix, &SparseBinaryMatrix)> =
-        vec![(&slots[0].a0, &slots[0].b0)];
+    let mats: Vec<(&SparseBinaryMatrix, &SparseBinaryMatrix)> = vec![(&slots[0].a0, &slots[0].b0)];
     // The tuned column-marginal path the fold uses for its k·nnz work.
-    let agg_circ = SparseMatrixCircuit::new(&slots[0].a0, &slots[0].b0)
-        .with_const_pin(slots[0].pin);
+    let agg_circ =
+        SparseMatrixCircuit::new(&slots[0].a0, &slots[0].b0).with_const_pin(slots[0].pin);
 
     // Prove one instance and return the assertion its succinct verify emits.
     let assert_of = |slot: &SlotData, tamper: bool| -> lincheck::MatrixAssertion {
@@ -1027,7 +1087,10 @@ fn aggregating_real_proofs_defers_all_matrix_work_to_one_discharge() {
         let x_ab = union.x_ab_from_mlv(zc.z, &zc.mlv_challenges);
         let (mut proof, _c, _g) = lincheck::prove_union_capture_z_vec(
             &union,
-            &[UnionLincheckSlot { z_lincheck: &stripe, circuit: &circ }],
+            &[UnionLincheckSlot {
+                z_lincheck: &stripe,
+                circuit: &circ,
+            }],
             &x_ab,
             &mut ch,
         );

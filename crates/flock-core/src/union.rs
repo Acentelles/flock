@@ -36,9 +36,9 @@ use crate::field::F128;
 use crate::lincheck::QuirkyPoint;
 use crate::pcs::Commitment;
 use crate::r1cs::{BlockR1cs, WitnessLayout};
-use crate::schedule::{Instance, Registry, TableType};
 #[cfg(test)]
 use crate::schedule::TableClass;
+use crate::schedule::{Instance, Registry, TableType};
 use crate::zerocheck::{K_SKIP, PaddingSpec};
 
 /// Floor of the committed dense-stack size, as a bit-variable count: the
@@ -1685,7 +1685,9 @@ mod tests {
         for y in 0..k {
             b.free_wire(y);
         }
-        TableType::element(std::sync::Arc::new(b.build().expect("free wires are valid")))
+        TableType::element(std::sync::Arc::new(
+            b.build().expect("free wires are valid"),
+        ))
     }
 
     /// A boolean-only registry's `boolean_padding_spec` IS its `padding_spec`
@@ -1734,7 +1736,10 @@ mod tests {
         // element area 2^13, M_elem = 13, base 2^14, M = 15.
         let reg = Registry::new(vec![ty(10, 700), ty(9, 300), elem_ty(3, 5)], 3);
         let union = UnionInstance::new(&reg, vec![5, 3, 7]);
-        assert_eq!((union.m_total(), union.m_bool(), union.m_elem()), (15, 14, 13));
+        assert_eq!(
+            (union.m_total(), union.m_bool(), union.m_elem()),
+            (15, 14, 13)
+        );
         assert_eq!(union.col_log(), 15 - 7 - 3); // 32 union word-columns
         assert_eq!(union.boolean_col_log(), 14 - 7 - 3); // 16 boolean columns
         assert_eq!(union.packed_len(), 1 << 8);
@@ -1752,7 +1757,11 @@ mod tests {
         // One element slot filling the region, at region offset 0.
         assert_eq!(
             union.element_slot_layout(),
-            vec![ElementSlotLayout { region_word_offset: 0, kappa: 3, n_t: 7 }]
+            vec![ElementSlotLayout {
+                region_word_offset: 0,
+                kappa: 3,
+                n_t: 7
+            }]
         );
 
         // Heights: 32 columns. Slot A cols 0..8 (6 used @5), slot B cols 8..12
@@ -1772,7 +1781,10 @@ mod tests {
             union.dense_words() as u64,
             "unrank ≡ compaction map"
         );
-        assert!(!union.compaction_is_identity(), "a class gap breaks identity");
+        assert!(
+            !union.compaction_is_identity(),
+            "a class gap breaks identity"
+        );
 
         // The padding run-list: an explicit zero run for the class gap, and
         // the element slot's two runs exactly like a boolean slot's.
@@ -1826,7 +1838,10 @@ mod tests {
         // at nu = 3, no boolean types: M_elem = 14, base 0, M = 14.
         let reg = Registry::new(vec![elem_ty(2, 3), elem_ty(3, 6)], 3);
         let union = UnionInstance::new(&reg, vec![4, 6]);
-        assert_eq!((union.m_total(), union.m_bool(), union.m_elem()), (14, 0, 14));
+        assert_eq!(
+            (union.m_total(), union.m_bool(), union.m_elem()),
+            (14, 0, 14)
+        );
         assert_eq!(union.element_word_range(), 0..(1 << 7));
         assert!(
             union.element_prefix_coords().is_empty(),
@@ -1837,8 +1852,16 @@ mod tests {
         assert_eq!(
             layout,
             vec![
-                ElementSlotLayout { region_word_offset: 0, kappa: 3, n_t: 4 },
-                ElementSlotLayout { region_word_offset: 64, kappa: 2, n_t: 6 },
+                ElementSlotLayout {
+                    region_word_offset: 0,
+                    kappa: 3,
+                    n_t: 4
+                },
+                ElementSlotLayout {
+                    region_word_offset: 64,
+                    kappa: 2,
+                    n_t: 6
+                },
             ]
         );
         let nu = union.n_log();
@@ -1873,12 +1896,18 @@ mod tests {
         let base = union.element_word_range().start;
         for c in 0..4usize {
             for i in 0..5usize {
-                z[(c << 3) + i] = F128 { lo: i as u64, hi: c as u64 };
+                z[(c << 3) + i] = F128 {
+                    lo: i as u64,
+                    hi: c as u64,
+                };
             }
         }
         for c in 0..5usize {
             for i in 0..7usize {
-                z[base + (c << 3) + i] = F128 { lo: i as u64, hi: 0x100 + c as u64 };
+                z[base + (c << 3) + i] = F128 {
+                    lo: i as u64,
+                    hi: 0x100 + c as u64,
+                };
             }
         }
         let q = union.compact_witness(&z);
@@ -1889,7 +1918,10 @@ mod tests {
                 for i in 0..n_t {
                     assert_eq!(
                         q[cursor],
-                        F128 { lo: i as u64, hi: tag + c as u64 },
+                        F128 {
+                            lo: i as u64,
+                            hi: tag + c as u64
+                        },
                         "tag {tag:#x} col {c} word {i}"
                     );
                     cursor += 1;
@@ -1993,6 +2025,10 @@ mod tests {
         let c = union.c_claim_point(rng.next_f128(), &r_rest);
         assert_eq!(c.x_inner_rest.len() + c.x_outer.len(), m - K_SKIP);
         assert_eq!(&c.x_outer[..r_rest.len() - 1], &r_rest[1..]);
-        assert!(c.x_outer[r_rest.len() - 1..].iter().all(|x| *x == F128::ZERO));
+        assert!(
+            c.x_outer[r_rest.len() - 1..]
+                .iter()
+                .all(|x| *x == F128::ZERO)
+        );
     }
 }
