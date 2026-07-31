@@ -940,10 +940,6 @@ mod tests {
         }
     }
 
-    /// Prove → verify roundtrip on satisfying witnesses at several shapes:
-    /// one slot / two slots, with and without a boolean region in front, at
-    /// partial, full and ZERO counts.
-    #[test]
     /// The reported per-slot evaluations reproduce the comb the verifier used
     /// to build itself — so deferring changed what is COMPUTED, not what is
     /// CHECKED. Also pins that the deferred verify leaves the matrix work
@@ -1009,6 +1005,10 @@ mod tests {
         }
     }
 
+    /// Prove → verify roundtrip on satisfying witnesses at several shapes:
+    /// one slot / two slots, with and without a boolean region in front, at
+    /// partial, full and ZERO counts.
+    #[test]
     fn prove_verify_roundtrip_honest() {
         let mut rng = Rng::new(0x2044_1A11);
         let shapes: Vec<(Vec<(usize, usize)>, Vec<Case>, usize, Vec<usize>)> = vec![
