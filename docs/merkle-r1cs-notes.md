@@ -26,26 +26,69 @@ Done since the "alignment DONE, factorization NEXT" state:
    suffix tail is statement-independent above layer `params.n`, so it is built
    once — footprint 1247 → 522 MiB, prove/1t ~780 → 631 ms.
 
-**Current state at 26,624 compressions**: prove ratio ~1.85×, verify ~2.50×
-(was ~8× on both). At **depth 8** it is 1.24× / 1.47× — see the depth-8 section
-for why, and for the free 23% available by using a power-of-two depth.
+6. **The rectangular fast path — the assist is now SKIPPED entirely on
+   single-type grids.** `jagged_heights` gives every declared chunk-column the
+   same height `2^n_log`, so a single-type registry at full utilization has a
+   *rectangular* grid: `d = col·2^n + row` is a clean bit split, hence
+   `eq(ρ,d) = eq(ρ_lo,row)·eq(ρ_hi,col)` and each Frobenius power's jagged
+   evaluation factors into two contractions of `O(m)`. So `Ŵ(ρ)` is closed form
+   and the `128·K`-statement delegation is not merely cheap but **unnecessary**.
 
-**What is left** is no longer one thing. The assist is down to 15% of verify at
-depth 8 and the **lincheck fold is now 74%** of it. The assist's residual cost is
-still `k_log`-driven (columns `2^(k_log-7)`), so narrowing the block is the lever
-and batching mostly is not — precisely: flat in path count on the verifier,
-**logarithmic** on the prover (see the scaling sweeps). That still makes the
-SHA-256 backend **counterproductive** (κ = 15 ⇒ composite `k_log` 20 ⇒ more
-columns), reversing what the open items below say. The bigger prover lever is the
-**multipoint-twisted prototype** already in `pcs/jagged.rs`: it deletes the
-128·K-statement structure rather than sharing within it (so it subsumes both
-optimizations above), is tested against brute force, and is *not* wired into
-`verify_batch_merged` — integration is the unfinished part.
+   `jagged::rect_used_cols` detects the shape from `col_prefix_sums` (public,
+   both sides derive it identically); `jagged::twisted_weight_rect` evaluates
+   `Ŵ(ρ)`; `MergedOpenProof.frobenius` became `Option<_>`, and the verifier
+   REQUIRES the arm to match the shape so a prover cannot choose.
 
-Three claims in earlier revisions of this file were measured to be wrong and are
-corrected in place: the verifier is not dominated by `fold_alpha_batched`; the
-PCS *opening* is at parity (it is the jagged transport around it); and the
-`zerocheck` asymmetry was page-fault noise, not real.
+   **Prove reached parity with plain BLAKE3 at both depths**, because the assist
+   was the *only* width-dependent prover phase — everything else scales with
+   total data, which the benchmark matches:
+
+   | 32,768 compressions | before | after |
+   |---|---|---|
+   | d8 prove/mt | 1.30× | **0.96×** |
+   | d8 prove/1t | 1.13× | **1.00×** |
+   | d8 verify | 1.19× | **1.15×** |
+   | d26 prove/mt | 1.44× | **1.02×** |
+   | d26 prove/1t | 1.47× | **1.02×** |
+   | d26 verify | 1.75× | **1.44×** |
+
+   Verify-side `Ŵ(ρ)`: **53 µs, 0.3% of verify** (was a 128·K sumcheck). The
+   verifier is now `fold_alpha_batched` at 84–86% on BOTH sides — no longer a
+   Merkle-specific problem. Depth 26 keeps a 1.44× verify gap because the
+   lincheck fold is *also* width-dependent (2^19 vs 2^14 columns); the `eq`
+   factorization mitigated but did not erase that.
+
+   Licensed by `rect_closed_form_matches_frobenius_assist` (closed form vs the
+   trusted 128·K construction across 5 shapes, including truncated columns) and
+   `rect_detector_rejects_jagged` (partial counts, holes, mixed heights all
+   fall back). `union_mixed`'s tamper matrix gained "assist removed from a
+   jagged grid".
+
+   **Not** applicable to: partial counts (height = an arbitrary declared count)
+   or mixed registries (heights differ per slot). Those stay on the assist.
+
+**Current state, matched at 32,768 compressions** (was ~8× on both when this
+branch started): **prove is at parity** — d8 1.00× / d26 1.02× on one thread —
+and verify is d8 1.15× / d26 1.44×.
+
+**What is left is `lincheck::fold_alpha_batched` — 84–86% of verify, and on BOTH
+sides**, so it is no longer a Merkle-specific problem. The assist is gone from
+single-type grids (53 µs, 0.3% of verify); the multipoint-twisted prototype in
+`pcs/jagged.rs` now only matters for the shapes the fast path does not cover —
+partial counts and mixed registries.
+
+The residual d26 verify gap (1.44×) is the fold being width-dependent too:
+2^19 columns against BLAKE3's 2^14. Narrowing the block is still the lever, which
+keeps the SHA-256 backend **counterproductive** (κ = 15 ⇒ composite `k_log` 20),
+reversing what the open items below say. The structural fix remains a
+correctly-shaped table (one row per compression, linking via shift sumcheck or
+copy constraints) — see the aspect-ratio discussion.
+
+Earlier revisions of this file made claims that later measurement contradicted,
+corrected in place: the PCS *opening* is at parity (it is the jagged transport
+around it); the `zerocheck` asymmetry was page-fault noise, not real; and "the
+verifier is not dominated by `fold_alpha_batched`" was true *then* and is false
+*now* — with the assist removed, the fold is 84–86% of it.
 
 ## What exists
 

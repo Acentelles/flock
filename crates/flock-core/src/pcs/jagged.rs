@@ -2179,6 +2179,131 @@ pub fn verify_with_assist<C: Challenger>(
 }
 
 // ---------------------------------------------------------------------------
+// Rectangular fast path: when the grid is not actually jagged, Ŵ(ρ) is closed
+// form and the assist is not merely cheap but UNNECESSARY.
+//
+// `BlockR1cs::jagged_heights` gives every declared chunk-column the SAME
+// height `2^n_log`, so a single-type registry at full utilization has a
+// rectangular grid: the dense address splits cleanly as `d = col·2^n + row`,
+// and `eq(ρ,d) = eq(ρ_lo,row)·eq(ρ_hi,col)`. Per Frobenius power the jagged
+// evaluation then factors into two independent contractions, each `O(m)` —
+// so the verifier can evaluate `Ŵ(ρ)` itself and the `128·K`-statement
+// delegation disappears.
+//
+// Partial counts (height = an arbitrary declared count) and mixed registries
+// (heights differing per slot) are genuinely jagged and keep the assist.
+// ---------------------------------------------------------------------------
+
+/// `Σ_{i<limit} eq(a,i)·eq(b,i)` over `a.len() == b.len()` coordinates,
+/// LSB-first (matching [`build_eq_table`]: `point[t]` ↔ bit `t`).
+///
+/// Per coordinate the summand factors as `γ_t(0) = (1+a_t)(1+b_t)`,
+/// `γ_t(1) = a_t·b_t`, whose sum is `1 + a_t + b_t` — the characteristic-2
+/// collapse of `Σ_x eq(a,x)eq(b,x) = eq(a,b)`. The prefix `i < limit` is then
+/// the union of `popcount(limit)` aligned dyadic blocks, walked MSB-first:
+/// at each set bit, everything below the fixed prefix is free.
+fn eq_prod_prefix(a: &[F128], b: &[F128], limit: u64) -> F128 {
+    debug_assert_eq!(a.len(), b.len());
+    let len = a.len();
+    debug_assert!(limit <= 1u64 << len);
+    // free[t] = Π_{t'<t} (1 + a_{t'} + b_{t'}) — the unconstrained low coords.
+    let mut free = Vec::with_capacity(len + 1);
+    free.push(F128::ONE);
+    for t in 0..len {
+        free.push(free[t] * (F128::ONE + a[t] + b[t]));
+    }
+    if limit == 1u64 << len {
+        return free[len]; // the full contraction
+    }
+    let mut total = F128::ZERO;
+    let mut fixed = F128::ONE;
+    for t in (0..len).rev() {
+        let g0 = (F128::ONE + a[t]) * (F128::ONE + b[t]);
+        if (limit >> t) & 1 == 1 {
+            total += fixed * g0 * free[t];
+            fixed *= a[t] * b[t];
+        } else {
+            fixed *= g0;
+        }
+    }
+    total
+}
+
+/// Detect the rectangular shape: every nonzero column has height exactly
+/// `2^n` (the full row capacity), the nonzero columns form a prefix, and the
+/// column-variable count matches the address split `m − n`. Returns the
+/// number of used columns.
+///
+/// Derived from `col_prefix_sums` alone — public data both sides compute
+/// identically — so it is sound to branch the protocol on it.
+pub(crate) fn rect_used_cols(params: &JaggedParams) -> Option<u64> {
+    if params.m < params.n || params.k != params.m - params.n {
+        return None;
+    }
+    let h = 1u64 << params.n;
+    let ps = &params.col_prefix_sums;
+    let n_col = 1usize << params.k;
+    let mut used = 0usize;
+    while used < n_col && ps[used + 1] - ps[used] == h {
+        used += 1;
+    }
+    if used == 0 {
+        return None;
+    }
+    // Everything past the prefix must be empty, or the grid is ragged.
+    if ps[n_col] != ps[used] {
+        return None;
+    }
+    Some(used as u64)
+}
+
+/// Closed-form `Ŵ(ρ)` for the shape [`rect_used_cols`] accepts — the value
+/// the assist would otherwise prove as its `v`.
+///
+/// ```text
+///   Ŵ(ρ) = Σ_i Σ_j c_{i,j} · ( Σ_{row<2^n} eq(ρ_lo,row)·eq(z_r^{2^j},row) )
+///                            · ( Σ_{col<C}  eq(ρ_hi,col)·eq(z_c^{2^j},col) )
+/// ```
+///
+/// by Theorem "Frobenius decomposition" plus the clean `d = col·2^n + row`
+/// bit split. Cost `O(128·K·m)`; the assist it replaces is
+/// `O(128·K·cols·log n_t)`.
+pub(crate) fn twisted_weight_rect(
+    params: &JaggedParams,
+    claims: &[FrobeniusClaim<'_>],
+    rho: &[F128],
+    used_cols: u64,
+) -> F128 {
+    debug_assert_eq!(rho.len(), params.m);
+    let (rho_lo, rho_hi) = rho.split_at(params.n);
+    let mut acc = F128::ZERO;
+    for claim in claims {
+        assert_eq!(claim.coeffs.len(), 128);
+        assert_eq!(claim.z_row.len(), params.n, "z_row must span the row vars");
+        assert_eq!(claim.z_col.len(), params.k, "z_col must span the col vars");
+        let mut zr = claim.z_row.to_vec();
+        let mut zc = claim.z_col.to_vec();
+        // Same walk as `frobenius_statements`: use, then square.
+        for &c in claim.coeffs.iter() {
+            if !c.is_zero() {
+                let mut row = F128::ONE;
+                for (a, b) in rho_lo.iter().zip(&zr) {
+                    row *= F128::ONE + *a + *b;
+                }
+                acc += c * row * eq_prod_prefix(rho_hi, &zc, used_cols);
+            }
+            for x in zr.iter_mut() {
+                *x = *x * *x;
+            }
+            for x in zc.iter_mut() {
+                *x = *x * *x;
+            }
+        }
+    }
+    acc
+}
+
+// ---------------------------------------------------------------------------
 // Multipoint twisted evaluation — PROTOTYPE (research note §"Scaling in the
 // number of columns"). Replaces the batched Frobenius assist's 128·K
 // boundary-DP statements with: the prover SENDS the 128·K dual-form values
@@ -5139,6 +5264,93 @@ mod tests {
             t_frob / t_single,
             (t_frob - t_single) * 1e3 / n_stmt as f64
         );
+    }
+
+    /// The rectangular fast path must reproduce the assist's `v` exactly.
+    ///
+    /// This is what licenses skipping `prove_frobenius_assist` entirely on
+    /// rectangular grids: the closed form is checked against the trusted
+    /// `128·K`-statement construction across several shapes, including the
+    /// truncated-column case (`used < 2^k`) that the dyadic prefix walk in
+    /// [`eq_prod_prefix`] exists for.
+    #[test]
+    fn rect_closed_form_matches_frobenius_assist() {
+        for &(n, k, used) in &[
+            (4usize, 3usize, 8usize), // full cube: no truncation
+            (4, 3, 5),                // truncated columns
+            (6, 4, 11),               // truncated, odd count
+            (3, 5, 1),                // a single live column
+            (5, 4, 13),               // popcount(13) = 3 dyadic blocks
+        ] {
+            let m = n + k;
+            let mut heights = vec![0u64; 1usize << k];
+            for h in &mut heights[..used] {
+                *h = 1u64 << n; // full row capacity ⇒ rectangular
+            }
+            let params = JaggedParams::from_heights(&heights, n, m);
+            assert_eq!(
+                rect_used_cols(&params),
+                Some(used as u64),
+                "shape (n={n},k={k},used={used}) should be detected as rectangular"
+            );
+
+            let mut rc = RandomChallenger::new(0x_1EC7_0001 ^ ((used as u64) << 8) ^ n as u64);
+            let claims_data: Vec<(Vec<F128>, Vec<F128>, Vec<F128>)> = (0..2)
+                .map(|_| {
+                    (
+                        sample_vec(&mut rc, n),
+                        sample_vec(&mut rc, k),
+                        sample_vec(&mut rc, 128),
+                    )
+                })
+                .collect();
+            let claims: Vec<FrobeniusClaim<'_>> = claims_data
+                .iter()
+                .map(|(zr, zc, c)| FrobeniusClaim {
+                    z_row: zr,
+                    z_col: zc,
+                    coeffs: c,
+                })
+                .collect();
+            let rho = sample_vec(&mut rc, m);
+
+            let mut ch = FsChallenger::new(b"flock-rect-cmp");
+            let proof = prove_frobenius_assist(&params, &claims, &rho, &mut ch);
+            let closed = twisted_weight_rect(&params, &claims, &rho, used as u64);
+            assert_eq!(
+                closed, proof.v,
+                "closed form != assist v at (n={n}, k={k}, used={used})"
+            );
+        }
+    }
+
+    /// Genuinely jagged shapes must NOT take the fast path.
+    #[test]
+    fn rect_detector_rejects_jagged() {
+        let (n, k, m) = (5usize, 4usize, 9usize);
+        let full = 1u64 << n;
+        // Heights below capacity — the partial-count case.
+        let mut h = vec![0u64; 1usize << k];
+        for x in &mut h[..6] {
+            *x = full - 1;
+        }
+        assert_eq!(rect_used_cols(&JaggedParams::from_heights(&h, n, m)), None);
+        // A hole in the middle of the prefix.
+        let mut h = vec![0u64; 1usize << k];
+        for x in &mut h[..6] {
+            *x = full;
+        }
+        h[3] = 0;
+        assert_eq!(rect_used_cols(&JaggedParams::from_heights(&h, n, m)), None);
+        // Mixed heights, as a two-slot registry produces.
+        let mut h = vec![0u64; 1usize << k];
+        for x in &mut h[..4] {
+            *x = full;
+        }
+        for x in &mut h[4..6] {
+            *x = full / 2;
+        }
+        assert_eq!(rect_used_cols(&JaggedParams::from_heights(&h, n, m)), None);
     }
 
     /// Diagnose the sumcheck's ~4× parallel scaling: is it the memory-bandwidth

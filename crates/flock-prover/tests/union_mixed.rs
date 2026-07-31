@@ -1089,12 +1089,25 @@ fn merged_transport_roundtrip_and_tamper() {
         let mut bad = proof.clone();
         bad.pcs_open.merged_rounds[3].0 += F128::ONE;
         reject(&bad, "merged sumcheck round");
+        // This registry has two slots of differing height, so the grid is
+        // genuinely jagged and the assist is present. (A rectangular grid
+        // carries `None` and the verifier evaluates Ŵ(ρ) itself — see the
+        // dedicated fast-path tests.)
+        assert!(
+            proof.pcs_open.frobenius.is_some(),
+            "a mixed, differing-height registry is jagged"
+        );
         let mut bad = proof.clone();
-        bad.pcs_open.frobenius.v += F128::ONE;
+        bad.pcs_open.frobenius.as_mut().unwrap().v += F128::ONE;
         reject(&bad, "frobenius V");
         let mut bad = proof.clone();
-        bad.pcs_open.frobenius.rounds[5].1 += F128::ONE;
+        bad.pcs_open.frobenius.as_mut().unwrap().rounds[5].1 += F128::ONE;
         reject(&bad, "frobenius round");
+        // Dropping the assist on a jagged grid must be rejected outright,
+        // not silently rerouted to the closed form.
+        let mut bad = proof.clone();
+        bad.pcs_open.frobenius = None;
+        reject(&bad, "assist removed from a jagged grid");
         let mut bad = proof.clone();
         bad.zerocheck.round1_ab[0] += F128::ONE;
         reject(&bad, "zerocheck round 1");
