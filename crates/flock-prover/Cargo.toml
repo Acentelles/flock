@@ -9,6 +9,7 @@ description = "Apple-silicon-optimized end-to-end prover for Flock (R1CS over GF
 [features]
 # Forwarded to flock-core. See that crate's manifest for semantics.
 hash-count = ["flock-core/hash-count"]
+mul-count = ["flock-core/mul-count"]
 unsound-challenger = ["flock-core/unsound-challenger"]
 
 [dependencies]
@@ -193,6 +194,11 @@ harness = false
 name = "verifier_hash_count"
 harness = false
 required-features = ["hash-count"]
+
+[[bench]]
+name = "verifier_mul_count"
+harness = false
+required-features = ["mul-count"]
 
 [[bench]]
 name = "witness_lincheck_probe"

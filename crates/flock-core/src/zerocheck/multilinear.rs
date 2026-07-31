@@ -91,25 +91,81 @@ fn round2_pair_skip(run: &crate::zerocheck::PaddingRun, k_skip: usize) -> (usize
 /// F_{2^128} via `φ_8`. Subtraction is XOR in characteristic 2.
 ///
 /// O(2^{2·k_skip}) field multiplies — one-time cost.
+/// `Π_{v ∈ V, v ≠ 0} v` for `V = φ_8({0..2^dim−1})`.
+///
+/// This single constant is **every** Lagrange denominator on `V` *and on any
+/// coset of it*: for a node set `N = a + V` and `i ∈ N`, as `j` ranges over
+/// `N \ {i}` the difference `node_i + node_j` ranges over `V \ {0}`, so
+/// `Π_{j≠i}(node_i + node_j)` is independent of both `i` and `a`. (It is the
+/// formal derivative of `V`'s linearized vanishing polynomial — see
+/// `phi8_node_sets_have_linearized_vanishing_polynomials`.)
+///
+/// Cached because in the recursion circuit it is a **public constant** costing
+/// nothing; recomputing it inside the traced verifier would add `2^dim − 1`
+/// constraints for a value that never varies.
+fn subspace_denominator(dim: usize) -> F128 {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<[F128; 9]> = OnceLock::new();
+    let table = CACHE.get_or_init(|| {
+        std::array::from_fn(|d| (1..(1usize << d)).fold(F128::ONE, |acc, i| acc * PHI_8_TABLE[i]))
+    });
+    assert!(dim < 9, "dim {dim} exceeds PHI_8_TABLE's 2^8 nodes");
+    table[dim]
+}
+
+/// Lagrange weights on `nodes`, an F₂-subspace of dimension `dim` or a coset
+/// of one, evaluated at `z`.
+///
+/// Uses the closed form
+///
+/// ```text
+///     L_i(z) = Z_N(z) / ((z + node_i) · den),     Z_N(X) = Π_{s∈N}(X + s)
+/// ```
+///
+/// with `den` the shared constant from [`subspace_denominator`]. That is
+/// `O(|N|)` where the textbook product form is `O(|N|²)`.
+///
+/// Measured (`benches/verifier_mul_count.rs`, counting one constraint per
+/// multiplication and one per inversion — the recursion circuit's cost model,
+/// not the native one, where an inversion is ~255 muls):
+///
+/// | routine | before | after |
+/// |---|---|---|
+/// | `lagrange_weights_naive` | 8,192 | 194 |
+/// | `interpolate_at_z_on_lambda` | 8,256 | 258 |
+/// | `interpolate_at_z_combined` | 16,448 | 450 |
+///
+/// End to end that takes a BLAKE3 boolean verify from 183,965 to 119,721
+/// constraints — **35% off the verifier's whole arithmetic** — because these
+/// are called from a dozen sites (the lincheck, `pcs.rs`, `ring_switch.rs`
+/// per claim), not just the zerocheck's round 1.
+///
+/// Natively the difference is sub-millisecond either way, which is why the
+/// textbook form survived this long.
+fn lagrange_weights_on_coset(nodes: &[F128], dim: usize, z: F128) -> Vec<F128> {
+    debug_assert_eq!(nodes.len(), 1usize << dim);
+    // Z_N(z) = Π_{s ∈ N} (z + s).
+    let z_n = nodes.iter().fold(F128::ONE, |acc, &s| acc * (z + s));
+    if z_n.is_zero() {
+        // `z` landed exactly on a node, where the closed form divides by zero.
+        // The weights are then the indicator of that node. On a Fiat–Shamir
+        // challenge this has probability ≈ 2^-121; it is handled exactly
+        // anyway because natively it costs one branch. The circuit backend
+        // omits the branch and carries the negligible term in its soundness
+        // accounting instead — a fixed-topology circuit cannot afford it.
+        return nodes
+            .iter()
+            .map(|&s| if s == z { F128::ONE } else { F128::ZERO })
+            .collect();
+    }
+    let scale = z_n * subspace_denominator(dim).inv();
+    nodes.iter().map(|&s| scale * (z + s).inv()).collect()
+}
+
 pub fn lagrange_weights_naive(k_skip: usize, z: F128) -> Vec<F128> {
     let ell = 1usize << k_skip;
     assert!(ell <= 256, "k_skip > 8 would exceed PHI_8_TABLE");
-    let mut weights = vec![F128::ZERO; ell];
-    for i in 0..ell {
-        let si = PHI_8_TABLE[i];
-        let mut num = F128::ONE;
-        let mut den = F128::ONE;
-        for j in 0..ell {
-            if j == i {
-                continue;
-            }
-            let sj = PHI_8_TABLE[j];
-            num *= z + sj;
-            den *= si + sj;
-        }
-        weights[i] = num * den.inv();
-    }
-    weights
+    lagrange_weights_on_coset(&PHI_8_TABLE[..ell], k_skip, z)
 }
 
 /// Lagrange weights `L_i^Λ(z)` for `i ∈ 0..2^k_skip` at the fold point `z`,
@@ -121,22 +177,8 @@ pub fn lagrange_weights_naive(k_skip: usize, z: F128) -> Vec<F128> {
 pub fn lagrange_weights_lambda_naive(k_skip: usize, z: F128) -> Vec<F128> {
     let ell = 1usize << k_skip;
     assert!(2 * ell <= 256, "Λ ∪ S must fit in F_8 (need k_skip ≤ 7)");
-    let mut weights = vec![F128::ZERO; ell];
-    for i in 0..ell {
-        let si = PHI_8_TABLE[ell + i];
-        let mut num = F128::ONE;
-        let mut den = F128::ONE;
-        for j in 0..ell {
-            if j == i {
-                continue;
-            }
-            let sj = PHI_8_TABLE[ell + j];
-            num *= z + sj;
-            den *= si + sj;
-        }
-        weights[i] = num * den.inv();
-    }
-    weights
+    // Λ is the coset `φ_8(2^k_skip) + V`, so it shares V's denominator.
+    lagrange_weights_on_coset(&PHI_8_TABLE[ell..2 * ell], k_skip, z)
 }
 
 /// Interpolate a degree-`< 2^k_skip` polynomial at z, given its `2^k_skip`
@@ -172,24 +214,15 @@ pub fn interpolate_at_z_combined(values_on_lambda: &[F128], k_skip: usize, z: F1
     let ell = 1usize << k_skip;
     assert_eq!(values_on_lambda.len(), ell);
     assert!(2 * ell <= 256, "Λ ∪ S must fit in F_8 (need k_skip ≤ 7)");
-    let n_total = 2 * ell;
+    // The node set is Λ ∪ S = `φ_8({0..2^{k_skip+1}−1})`, itself an
+    // F₂-subspace of dimension `k_skip + 1`; only the Λ half carries values,
+    // the S half being zero by the zerocheck assumption. So the whole
+    // `O(ell²)` double loop collapses to the same closed form, and the
+    // weights this needs are the Λ-half entries.
+    let weights = lagrange_weights_on_coset(&PHI_8_TABLE[..2 * ell], k_skip + 1, z);
     let mut acc = F128::ZERO;
     for i in 0..ell {
-        // i-th Λ node = node index `ell + i` in PHI_8_TABLE.
-        let node_idx = ell + i;
-        let si = PHI_8_TABLE[node_idx];
-        let mut num = F128::ONE;
-        let mut den = F128::ONE;
-        for j in 0..n_total {
-            if j == node_idx {
-                continue;
-            }
-            let sj = PHI_8_TABLE[j];
-            num *= z + sj;
-            den *= si + sj;
-        }
-        let weight = num * den.inv();
-        acc += weight * values_on_lambda[i];
+        acc += weights[ell + i] * values_on_lambda[i];
     }
     acc
 }
@@ -1738,6 +1771,116 @@ pub fn uni_skip_fold_and_round_pair_optimized(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The closed-form Lagrange weights agree with the textbook `O(ell²)`
+    /// product, at every `k_skip` the protocol can use, on random points AND
+    /// on the degenerate points the closed form has to special-case (`z`
+    /// exactly on a node, where it would otherwise divide by zero).
+    ///
+    /// The textbook form is reproduced here rather than kept in the module: it
+    /// is the reference this is differential-tested against, and having it live
+    /// only in the test makes it impossible to call by accident.
+    #[test]
+    fn closed_form_lagrange_matches_the_textbook_product() {
+        fn textbook(nodes: &[F128], z: F128) -> Vec<F128> {
+            (0..nodes.len())
+                .map(|i| {
+                    let mut num = F128::ONE;
+                    let mut den = F128::ONE;
+                    for j in 0..nodes.len() {
+                        if j != i {
+                            num *= z + nodes[j];
+                            den *= nodes[i] + nodes[j];
+                        }
+                    }
+                    num * den.inv()
+                })
+                .collect()
+        }
+
+        let mut state = 0x243F_6A88_85A3_08D3u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let hi = state;
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            F128::new(hi, state)
+        };
+
+        for k_skip in 1..=6usize {
+            let ell = 1usize << k_skip;
+            // S-domain, Λ-domain (a coset), and the combined domain.
+            let domains: [(&[F128], usize); 3] = [
+                (&PHI_8_TABLE[..ell], k_skip),
+                (&PHI_8_TABLE[ell..2 * ell], k_skip),
+                (&PHI_8_TABLE[..2 * ell], k_skip + 1),
+            ];
+            for (nodes, dim) in domains {
+                for _ in 0..8 {
+                    let z = next();
+                    assert_eq!(
+                        lagrange_weights_on_coset(nodes, dim, z),
+                        textbook(nodes, z),
+                        "closed form disagrees at k_skip={k_skip}, dim={dim}"
+                    );
+                }
+                // Every node, the branch the closed form special-cases.
+                for &node in nodes {
+                    assert_eq!(
+                        lagrange_weights_on_coset(nodes, dim, node),
+                        textbook(nodes, node),
+                        "closed form disagrees ON a node at dim={dim}"
+                    );
+                }
+            }
+
+            // And the public entry points, end to end.
+            let values: Vec<F128> = (0..ell).map(|_| next()).collect();
+            for _ in 0..4 {
+                let z = next();
+                let want: F128 = textbook(&PHI_8_TABLE[ell..2 * ell], z)
+                    .iter()
+                    .zip(&values)
+                    .fold(F128::ZERO, |a, (w, v)| a + *w * *v);
+                assert_eq!(interpolate_at_z_on_lambda(&values, k_skip, z), want);
+
+                let want_combined: F128 = textbook(&PHI_8_TABLE[..2 * ell], z)[ell..]
+                    .iter()
+                    .zip(&values)
+                    .fold(F128::ZERO, |a, (w, v)| a + *w * *v);
+                assert_eq!(interpolate_at_z_combined(&values, k_skip, z), want_combined);
+            }
+        }
+    }
+
+    /// Every Lagrange denominator on a subspace or coset is the SAME constant
+    /// — the fact the closed form is built on. Checked directly so a change to
+    /// `PHI_8_TABLE`'s ordering (which would break the subspace structure
+    /// without breaking anything else) fails here.
+    #[test]
+    fn subspace_denominators_are_uniform_across_nodes_and_cosets() {
+        for dim in 1..=6usize {
+            let n = 1usize << dim;
+            let expected = subspace_denominator(dim);
+            for (label, nodes) in [
+                ("subspace", &PHI_8_TABLE[..n]),
+                ("coset", &PHI_8_TABLE[n..2 * n]),
+            ] {
+                for i in 0..n {
+                    let den = (0..n)
+                        .filter(|&j| j != i)
+                        .fold(F128::ONE, |acc, j| acc * (nodes[i] + nodes[j]));
+                    assert_eq!(
+                        den, expected,
+                        "{label} denominator varies at dim={dim}, i={i}"
+                    );
+                }
+            }
+        }
+    }
 
     /// The interpolation node sets are **F₂-subspaces**, so their vanishing
     /// polynomials are *linearized* (additive).

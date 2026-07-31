@@ -806,8 +806,13 @@ pub fn verify<C: Challenger>(
         .map(|(x, y)| *x + *y)
         .collect();
     let combined_at_z = interpolate_at_z_combined(&combined_at_lambda, k_skip, z);
-    let p_c_at_z = interpolate_at_z_on_lambda(&proof.round1_c, k_skip, z);
-    let mut c_running = combined_at_z + p_c_at_z;
+    // `P^C(z)` was already computed above as `computed_c_eval` — same function,
+    // same arguments. Recomputing it cost a second Λ-interpolation: under the
+    // textbook weights that was 8,256 constraints, 4.5% of a BLAKE3 boolean
+    // verify's entire arithmetic, for a value already in hand (measured,
+    // `benches/verifier_mul_count.rs`). Sub-millisecond natively, which is why
+    // it went unnoticed.
+    let mut c_running = combined_at_z + computed_c_eval;
 
     // ---- Multilinear sumcheck chain ----
     //
