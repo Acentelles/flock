@@ -68,6 +68,8 @@
 //! 4. the returned gather claims reach the PCS opening, which is what binds
 //!    them to the commitment (and observes their values before `γ`).
 
+pub mod builder;
+
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};

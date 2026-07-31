@@ -103,10 +103,6 @@ fn round2_pair_skip(run: &crate::zerocheck::PaddingRun, k_skip: usize) -> (usize
 /// Cached because in the recursion circuit it is a **public constant** costing
 /// nothing; recomputing it inside the traced verifier would add `2^dim − 1`
 /// constraints for a value that never varies.
-fn subspace_denominator(dim: usize) -> F128 {
-    subspace_denominator_pair(dim).0
-}
-
 /// `(den, den⁻¹)`. The **inverse is cached too**: it is a constant, and
 /// inverting it per call cost one `inv` (255 native muls) every time for a
 /// value that never varies. In-circuit it is a public constant, so this takes
@@ -1900,7 +1896,7 @@ mod tests {
     fn subspace_denominators_are_uniform_across_nodes_and_cosets() {
         for dim in 1..=6usize {
             let n = 1usize << dim;
-            let expected = subspace_denominator(dim);
+            let expected = subspace_denominator_pair(dim).0;
             for (label, nodes) in [
                 ("subspace", &PHI_8_TABLE[..n]),
                 ("coset", &PHI_8_TABLE[n..2 * n]),
