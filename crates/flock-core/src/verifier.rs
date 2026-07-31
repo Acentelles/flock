@@ -469,6 +469,7 @@ pub fn verify_ligerito_jagged_union_merged<Ch: Challenger>(
                 &values,
                 &z_skips,
                 &x_refs,
+                &[],
                 &heights,
                 union.n_log(),
                 &proof.pcs_open,

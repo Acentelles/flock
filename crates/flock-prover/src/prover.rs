@@ -960,6 +960,7 @@ pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
         &commitment,
         &x_refs,
         &[pre_ab, pre_c],
+        &[],
         &padding,
         &heights,
         union.n_log(),
