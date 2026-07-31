@@ -1705,15 +1705,7 @@ pub struct MergedOpenProof {
     pub ring_switches: Vec<RingSwitchProof>,
     pub merged_rounds: Vec<(F128, F128)>,
     pub q_eval: F128,
-    /// The batched Frobenius assist proving `Ŵ(ρ)` — `None` when the jagged
-    /// grid is **rectangular** (`jagged::rect_used_cols`), because the
-    /// verifier then evaluates `Ŵ(ρ)` itself in closed form and the
-    /// `128·K`-statement delegation is unnecessary.
-    ///
-    /// Which arm applies is fixed by `col_prefix_sums` — public data both
-    /// sides derive identically — and the verifier REQUIRES the proof to
-    /// match the shape, so a prover cannot choose.
-    pub frobenius: Option<jagged::FrobeniusAssistProof>,
+    pub frobenius: jagged::FrobeniusAssistProof,
     pub inner: BatchOpeningProofLigerito,
 }
 
@@ -1867,38 +1859,19 @@ pub fn open_batch_merged<Ch: Challenger>(
             t.elapsed().as_secs_f64() * 1e3
         );
     }
-    // Rectangular grids need no assist at all: the verifier evaluates Ŵ(ρ)
-    // in closed form. `w_eval` (the merged sumcheck's folded weight) is the
-    // same value, so the branch is checked here for free.
     let t_assist = std::time::Instant::now();
-    let rect = jagged::rect_used_cols(&params);
-    let frobenius = match rect {
-        Some(used) => {
-            debug_assert_eq!(
-                jagged::twisted_weight_rect(&params, &fclaims, &rho, used),
-                w_eval,
-                "closed-form Ŵ(ρ) must equal the folded weight MLE"
-            );
-            None
-        }
-        None => {
-            let p = jagged::prove_frobenius_assist(&params, &fclaims, &rho, challenger);
-            debug_assert_eq!(p.v, w_eval, "assist V must equal the folded weight MLE");
-            Some(p)
-        }
-    };
+    let frobenius = jagged::prove_frobenius_assist(&params, &fclaims, &rho, challenger);
     if trace {
         eprintln!(
-            "  [open_merged] coeffs + frobenius assist: {:6.2} ms (assist alone {:6.2} ms{})",
+            "  [open_merged] coeffs + frobenius assist: {:6.2} ms (assist alone {:6.2} ms)",
             t.elapsed().as_secs_f64() * 1e3,
-            t_assist.elapsed().as_secs_f64() * 1e3,
-            if rect.is_some() {
-                " — SKIPPED, rectangular grid"
-            } else {
-                ""
-            }
+            t_assist.elapsed().as_secs_f64() * 1e3
         );
     }
+    debug_assert_eq!(
+        frobenius.v, w_eval,
+        "assist V must equal the folded weight MLE"
+    );
     let _ = w_eval;
 
     // ---- eq-basis Ligerito opening of q̂(ρ): one packed-direct claim on
@@ -2052,24 +2025,11 @@ pub fn verify_batch_merged<Ch: Challenger>(
         );
     }
     let t = std::time::Instant::now();
-    // The shape decides which arm is legal; a mismatched proof is rejected
-    // rather than silently taking the other path.
-    let v = match (jagged::rect_used_cols(&params), &proof.frobenius) {
-        (Some(used), None) => jagged::twisted_weight_rect(&params, &fclaims, &rho, used),
-        (None, Some(assist)) => {
-            jagged::verify_frobenius_assist(&params, &fclaims, &rho, assist, challenger)
-                .ok_or(VerifyErrorJagged::Jagged)?
-        }
-        _ => return Err(VerifyErrorJagged::Jagged),
-    };
+    let v = jagged::verify_frobenius_assist(&params, &fclaims, &rho, &proof.frobenius, challenger)
+        .ok_or(VerifyErrorJagged::Jagged)?;
     if trace {
         eprintln!(
-            "        [vbm] Ŵ(ρ) via {}: {}",
-            if proof.frobenius.is_some() {
-                "verify_frobenius_assist"
-            } else {
-                "closed form (rectangular)"
-            },
+            "        [vbm] jagged::verify_frobenius_assist: {}",
             tfmt(t.elapsed().as_secs_f64())
         );
     }
