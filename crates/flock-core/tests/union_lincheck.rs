@@ -539,3 +539,97 @@ fn two_type_union_lincheck_matches_brute_force() {
         "corrupted pinned-slot count must be rejected"
     );
 }
+
+/// The deferred split is behaviour-preserving, and the deferred half really
+/// does leave the matrix work undone.
+///
+/// `verify_union` is `verify_union_deferred` + `MatrixAssertion::check`, so the
+/// two must agree on every input — including tampered ones, where the
+/// interesting property is *which* half rejects. A corrupted round message
+/// perturbs `running`, which the assertion carries as `target`, so the deferred
+/// pass still returns `Ok` and only `check` catches it. That is the point of
+/// the split: nothing before `check` reads a base matrix, which is why a
+/// circuit can replay the deferred half and carry the assertion out as a claim
+/// instead of paying `O(nnz)`.
+#[test]
+fn deferred_lincheck_matches_and_defers_the_matrix_work() {
+    let nu = 4usize;
+    let slot_a = build_slot(9, 300, nu, 11, Some(0), 0x2A_2A_01);
+    let slot_b = build_slot(8, 120, nu, 13, None, 0x2B_2B_02);
+    let registry = Registry::new(vec![table_type(&slot_a), table_type(&slot_b)], nu);
+    let m = registry.m_total();
+    let union = UnionInstance::new(&registry, vec![slot_a.n, slot_b.n]);
+
+    let mut z_addr = vec![false; 1 << m];
+    let mut a_addr = vec![false; 1 << m];
+    let mut b_addr = vec![false; 1 << m];
+    for (slot, layout) in [&slot_a, &slot_b].into_iter().zip(registry.slots()) {
+        place_addr(&mut z_addr, &slot.z_sem, slot.k_log, nu, layout.offset);
+        place_addr(&mut a_addr, &slot.a_sem, slot.k_log, nu, layout.offset);
+        place_addr(&mut b_addr, &slot.b_sem, slot.k_log, nu, layout.offset);
+    }
+    let c_addr: Vec<bool> = a_addr.iter().zip(&b_addr).map(|(x, y)| *x & *y).collect();
+    let (a_p, b_p, c_p) = (pack_bits(&a_addr), pack_bits(&b_addr), pack_bits(&c_addr));
+
+    let stripe_a = pack_z_lincheck(&slot_a.z_sem, nu + slot_a.k_log, slot_a.k_log);
+    let stripe_b = pack_z_lincheck(&slot_b.z_sem, nu + slot_b.k_log, slot_b.k_log);
+    let circ_a = SparseMatrixCircuit::new(&slot_a.a0, &slot_a.b0).with_const_pin(slot_a.pin);
+    let circ_b = SparseMatrixCircuit::new(&slot_b.a0, &slot_b.b0);
+    let mut ch_p = FsChallenger::new(DOMAIN);
+    let (zc_proof, zc_claim) =
+        zerocheck::prove_packed_padded(&a_p, &b_p, &c_p, m, &union.padding_spec(), &mut ch_p);
+    let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
+    let lc_slots = [
+        UnionLincheckSlot { z_lincheck: &stripe_a, circuit: &circ_a },
+        UnionLincheckSlot { z_lincheck: &stripe_b, circuit: &circ_b },
+    ];
+    let (lc_proof, _lc_claim, _g) =
+        lincheck::prove_union_capture_z_vec(&union, &lc_slots, &x_ab, &mut ch_p);
+
+    let circuits: Vec<&dyn lincheck::LincheckCircuit> = vec![&circ_a, &circ_b];
+    // The transcript up to the lincheck does not depend on the lincheck proof.
+    let replay = || {
+        let mut ch = FsChallenger::new(DOMAIN);
+        let zc = zerocheck::verify(m, &zc_proof, &mut ch).expect("zerocheck untampered");
+        let x = union.x_ab_from_mlv(zc.z, &zc.mlv_challenges);
+        (x, zc.a_eval, zc.b_eval, ch)
+    };
+
+    // Honest: both entries agree, and the assertion discharges.
+    let (x, va, vb, mut ch) = replay();
+    let direct = lincheck::verify_union(&union, &circuits, &x, va, vb, &lc_proof, &mut ch)
+        .expect("direct verify accepts");
+    let (x, va, vb, mut ch) = replay();
+    let (deferred, assertion) =
+        lincheck::verify_union_deferred(&union, &circuits, &x, va, vb, &lc_proof, &mut ch)
+            .expect("deferred verify accepts");
+    assert_eq!(direct, deferred, "the split must not change the witness claim");
+    assert!(
+        assertion.check(&union, &circuits).is_ok(),
+        "an honest assertion must discharge"
+    );
+
+    // Tampered: the composition still rejects, but the deferred half does not —
+    // it never reads a matrix, so `check` is what catches it.
+    let mut bad = lc_proof.clone();
+    bad.rounds[1].0.lo ^= 1;
+    let (x, va, vb, mut ch) = replay();
+    assert!(
+        matches!(
+            lincheck::verify_union(&union, &circuits, &x, va, vb, &bad, &mut ch),
+            Err(lincheck::VerifyError::ConsistencyFailed { .. })
+        ),
+        "composed verifier must still reject a corrupted round message"
+    );
+    let (x, va, vb, mut ch) = replay();
+    let (_, tampered) =
+        lincheck::verify_union_deferred(&union, &circuits, &x, va, vb, &bad, &mut ch)
+            .expect("the deferred half accepts — it defers");
+    assert!(
+        matches!(
+            tampered.check(&union, &circuits),
+            Err(lincheck::VerifyError::ConsistencyFailed { .. })
+        ),
+        "the assertion is what must catch it"
+    );
+}

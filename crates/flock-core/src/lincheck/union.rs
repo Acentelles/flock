@@ -340,6 +340,98 @@ pub fn prove_union_capture_z_vec<Ch: Challenger>(
     (proof, claim, captured)
 }
 
+/// The `O(nnz)` residue of the lincheck verifier: everything its final
+/// consistency check needs EXCEPT the per-type comb folds.
+///
+/// The verifier's whole dependence on the base matrices is this one
+/// assertion — a bilinear form in `α·Â₀ + B̂₀` at a rank-1 tensor point,
+/// with the row weight `λ(z_skip) ⊗ eq(x_inner_rest)` and the column weight
+/// `z_partial ⊗ eq(rr)`. Everything else the verifier does is succinct.
+/// [`verify_union`] discharges it immediately (identical behaviour to
+/// before this split); [`verify_union_deferred`] hands it back undischarged
+/// so a caller can instead
+///
+/// * batch it across many proofs of the same registry and pay `O(nnz)`
+///   once rather than per proof, or
+/// * carry it as a public claim into an accumulator — the recursion path,
+///   where a circuit replays only the succinct verifier and never pays the
+///   matrix work at all.
+///
+/// Two of the four tensor factors (`λ(z_skip)` from the univariate skip,
+/// and the proof-supplied `z_partial`) are not `eq`-tensors, so this is a
+/// weighted sum rather than a plain MLE evaluation; a folding protocol's
+/// first sumcheck is what turns it into one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MatrixAssertion {
+    /// The challenge batching the A- and B-matrices.
+    pub alpha: F128,
+    /// Row-side weight: `λ(z_skip) ⊗ eq(x_inner_rest)`.
+    pub z_skip: F128,
+    pub x_inner_rest: Vec<F128>,
+    /// Column-side weight: `z_partial ⊗ eq(rr)`.
+    pub rr: Vec<F128>,
+    pub z_partial: Vec<F128>,
+    /// Const-wire pin challenges, one entry per boolean slot in slot order
+    /// (`None` where the type has no pin). Applied to the comb at the pin
+    /// column; the target-side half of the pin is already folded into
+    /// [`Self::target`].
+    pub betas: Vec<Option<F128>>,
+    /// What the weighted bilinear sum must equal.
+    pub target: F128,
+}
+
+impl MatrixAssertion {
+    /// Discharge the assertion: rebuild the per-type combs (`O(Σ_t nnz_t)`,
+    /// the only place the base matrices are read) and check the closed-form
+    /// Comb-hat collapse against [`Self::target`].
+    pub fn check(
+        &self,
+        union: &UnionInstance<'_>,
+        circuits: &[&dyn LincheckCircuit],
+    ) -> Result<(), VerifyError> {
+        let registry = union.registry();
+        let k_skip = K_SKIP;
+        assert_eq!(
+            circuits.len(),
+            registry.num_boolean(),
+            "one circuit per BOOLEAN registry type"
+        );
+        let mut combs: Vec<Vec<F128>> = registry
+            .boolean_types()
+            .iter()
+            .zip(registry.slots())
+            .zip(circuits)
+            .map(|((ty, slot), circuit)| {
+                let inner = ty.k_log - k_skip;
+                let eq_inner =
+                    build_quirky_eq_table(self.z_skip, &self.x_inner_rest[..inner], k_skip);
+                let mut comb = circuit.fold_alpha_batched(self.alpha, &eq_inner);
+                if slot.prefix_bits > 0 {
+                    let w_t = eq_prefix_weight(&self.x_inner_rest[inner..], slot.prefix);
+                    for v in &mut comb {
+                        *v *= w_t;
+                    }
+                }
+                comb
+            })
+            .collect();
+
+        for ((circuit, comb), beta) in circuits.iter().zip(&mut combs).zip(&self.betas) {
+            if let (Some(col), Some(beta)) = (circuit.const_pin_col(), beta) {
+                comb[col] += *beta;
+            }
+        }
+
+        let comb_partial = union_comb_partial(registry, &combs, &self.rr, k_skip);
+        if self.target != inner_product(&comb_partial, &self.z_partial) {
+            return Err(VerifyError::ConsistencyFailed {
+                which: "sumcheck-final",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Verify a union-column lincheck proof: walk the challenger in lockstep
 /// with [`prove_union_capture_z_vec`], replay the rounds, and check the
 /// final consistency against the closed-form Comb-hat collapse
@@ -347,6 +439,10 @@ pub fn prove_union_capture_z_vec<Ch: Challenger>(
 /// `O(T·M)` prefix weights, never anything union-sized. `circuits` are the
 /// per-type lincheck circuits in slot order. Returns the single witness
 /// claim `ẑ(c*-columns, r|_R-rows)`.
+///
+/// This is [`verify_union_deferred`] followed immediately by
+/// [`MatrixAssertion::check`] — identical accept/reject, and the entry
+/// point every existing caller keeps using.
 pub fn verify_union<Ch: Challenger>(
     union: &UnionInstance<'_>,
     circuits: &[&dyn LincheckCircuit],
@@ -356,6 +452,31 @@ pub fn verify_union<Ch: Challenger>(
     proof: &LincheckProof,
     challenger: &mut Ch,
 ) -> Result<LincheckClaim, VerifyError> {
+    let (claim, assertion) =
+        verify_union_deferred(union, circuits, x_ab, v_a, v_b, proof, challenger)?;
+    assertion.check(union, circuits)?;
+    Ok(claim)
+}
+
+/// [`verify_union`] with the matrix work left undischarged: replays the
+/// whole protocol succinctly and returns the witness claim alongside the
+/// [`MatrixAssertion`] the caller must discharge (or accumulate) for the
+/// proof to mean anything.
+///
+/// **The returned claim is conditional.** Nothing here reads the base
+/// matrices, so a proof whose lincheck is simply wrong still yields
+/// `Ok(..)`; only [`MatrixAssertion::check`], or a folding protocol that
+/// eventually discharges it, rejects that. Callers that are not
+/// accumulating must use [`verify_union`].
+pub fn verify_union_deferred<Ch: Challenger>(
+    union: &UnionInstance<'_>,
+    circuits: &[&dyn LincheckCircuit],
+    x_ab: &QuirkyPoint,
+    v_a: F128,
+    v_b: F128,
+    proof: &LincheckProof,
+    challenger: &mut Ch,
+) -> Result<(LincheckClaim, MatrixAssertion), VerifyError> {
     let registry = union.registry();
     let k_skip = K_SKIP;
     let nu = union.n_log();
@@ -418,39 +539,28 @@ pub fn verify_union<Ch: Challenger>(
     // 1. Sample α (matches prover's order).
     let alpha = challenger.sample_f128();
 
-    // 2. Per-type α-batched combs via each type's quirky table (same calls
-    //    the prover made), pre-scaled by the slot prefix weight w_t(r) so
-    //    the closed form below only supplies the bound-point subcube factor.
-    let mut combs: Vec<Vec<F128>> = registry
-        .boolean_types()
-        .iter()
-        .zip(registry.slots())
-        .zip(circuits)
-        .map(|((ty, slot), circuit)| {
-            let inner = ty.k_log - k_skip;
-            let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest[..inner], k_skip);
-            let mut comb = circuit.fold_alpha_batched(alpha, &eq_inner);
-            if slot.prefix_bits > 0 {
-                let w_t = eq_prefix_weight(&x_ab.x_inner_rest[inner..], slot.prefix);
-                for v in &mut comb {
-                    *v *= w_t;
-                }
-            }
-            comb
-        })
-        .collect();
+    // 2. The per-type α-batched combs are NOT built here — they are the
+    //    only `O(nnz)` step, and they are needed nowhere before the final
+    //    consistency check. They ride out in the `MatrixAssertion` instead.
+    //    Nothing between here and there touches the challenger on their
+    //    account, so lifting them out leaves the transcript untouched.
 
     // 2b. Constant-wire pins (mirror of prove): β_t sampled after α in slot
     //     order, the comb gains +β_t at the pin, and the target gains the
     //     count-derived β_t · Σ_{row<n_t} eq(x_outer, row) — declared rows
     //     carry pin = 1, dummy rows are all-zero (pin included). At full
     //     utilization the sum is exactly 1, reproducing today's target += β.
+    //     Only the target half is count-derived work; the comb half is
+    //     carried in the assertion.
     let mut target = alpha * v_a + v_b;
-    for ((circuit, comb), &n_t) in circuits.iter().zip(&mut combs).zip(union.counts()) {
-        if let Some(col) = circuit.const_pin_col() {
+    let mut betas: Vec<Option<F128>> = Vec::with_capacity(circuits.len());
+    for (circuit, &n_t) in circuits.iter().zip(union.counts()) {
+        if circuit.const_pin_col().is_some() {
             let beta = challenger.sample_f128();
-            comb[col] += beta;
+            betas.push(Some(beta));
             target += beta * eq_prefix_sum(&x_ab.x_outer, n_t);
+        } else {
+            betas.push(None);
         }
     }
 
@@ -473,18 +583,21 @@ pub fn verify_union<Ch: Challenger>(
     // 4. Observe z_partial AFTER the sumcheck rounds (matches prover order).
     challenger.observe_f128_slice(&proof.z_partial);
 
-    // 5. Final consistency against the closed-form Comb-hat collapse. `rr`
-    //    is LSB-first: the loop bound the TOP coordinate first, so rr[i]
-    //    binds column coordinate k_skip + i.
+    // 5. The final consistency check — the closed-form Comb-hat collapse
+    //    against `running` — is exactly the deferred assertion. `rr` is
+    //    LSB-first: the loop bound the TOP coordinate first, so rr[i] binds
+    //    column coordinate k_skip + i.
     let mut rr = r_rounds;
     rr.reverse();
-    let comb_partial = union_comb_partial(registry, &combs, &rr, k_skip);
-    let final_sum = inner_product(&comb_partial, &proof.z_partial);
-    if running != final_sum {
-        return Err(VerifyError::ConsistencyFailed {
-            which: "sumcheck-final",
-        });
-    }
+    let assertion = MatrixAssertion {
+        alpha,
+        z_skip: x_ab.z_skip,
+        x_inner_rest: x_ab.x_inner_rest.clone(),
+        rr: rr.clone(),
+        z_partial: proof.z_partial.clone(),
+        betas,
+        target: running,
+    };
 
     // 6.–7. Fresh skip challenge after z_partial; claim value via φ8
     //       Lagrange (identical to the single-table verifier).
@@ -492,11 +605,14 @@ pub fn verify_union<Ch: Challenger>(
     let lambda = lagrange_weights_naive(k_skip, r_inner_skip);
     let w = inner_product(&lambda, &proof.z_partial);
 
-    Ok(LincheckClaim {
-        r_inner_skip,
-        r_inner_rest: rr,
-        w,
-    })
+    Ok((
+        LincheckClaim {
+            r_inner_skip,
+            r_inner_rest: rr,
+            w,
+        },
+        assertion,
+    ))
 }
 
 /// [`verify_union`] with the per-type comb-construction phase timed
