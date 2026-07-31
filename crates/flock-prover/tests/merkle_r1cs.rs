@@ -606,7 +606,7 @@ fn padding_must_be_zero() {
 use flock_core::merkle::{self as core_merkle, HashKind};
 use flock_prover::r1cs_hashes::merkle_r1cs::ChunkPathInput;
 
-fn chunk_input(rng: &mut Rng, depth: usize, leaf_bytes: usize, index: u64) -> ChunkPathInput {
+fn chunk_input(rng: &mut Rng, depth: usize, leaf_bytes: usize, index: u128) -> ChunkPathInput {
     ChunkPathInput {
         leaf_data: (0..leaf_bytes).map(|_| rng.next_u32() as u8).collect(),
         index,
@@ -700,7 +700,7 @@ fn honest_chunk_openings_satisfy() {
     let r1cs = layout.build_block_r1cs(0);
     let mut rng = Rng::new(0x_C4_09_77_31);
 
-    for index in 0..(1u64 << depth) {
+    for index in 0..(1u128 << depth) {
         let input = chunk_input(&mut rng, depth, leaf_bytes, index);
         let z = layout.build_witness_chunk(&input);
         assert!(
@@ -782,7 +782,7 @@ fn chunk_root_matches_flock_core_blake3_tree() {
             }
             let input = ChunkPathInput {
                 leaf_data: data[pos * leaf_bytes..(pos + 1) * leaf_bytes].to_vec(),
-                index: !(pos as u64) & ((1u64 << depth) - 1),
+                index: !(pos as u128) & ((1u128 << depth) - 1),
                 siblings,
             };
             assert_eq!(
@@ -801,7 +801,7 @@ fn chunk_root_matches_flock_core_blake3_tree() {
         let one = core_merkle::hash_leaf(&data[..leaf_bytes], HashKind::Blake3);
         let input = ChunkPathInput {
             leaf_data: data[..leaf_bytes].to_vec(),
-            index: !0u64 & ((1u64 << depth) - 1),
+            index: !0u128 & ((1u128 << depth) - 1),
             siblings: (0..depth).map(|_| rng.digest()).collect(),
         };
         let z = layout.build_witness_chunk(&input);
@@ -831,8 +831,13 @@ fn chunk_packed_driver_matches_bool_reference() {
     ] {
         let layout = MerkleTreeLayout::with_blake3_chunk_leaf(depth, leaf_bytes, blake3_spec());
         let mut rng = Rng::new(0x_7E_00_D1_44 ^ (depth as u64) << 8 ^ leaf_bytes as u64);
+        // Full index WORDS, high bits and all — the two drivers must agree on
+        // every one of the 128 columns, not just the `depth` the relation reads.
         let paths: Vec<ChunkPathInput> = (0..n_paths)
-            .map(|i| chunk_input(&mut rng, depth, leaf_bytes, (i as u64) & ((1 << depth) - 1)))
+            .map(|i| {
+                let hi = (0..4).fold(0u128, |acc, _| (acc << 32) | rng.next_u32() as u128);
+                chunk_input(&mut rng, depth, leaf_bytes, (hi << depth) | i as u128)
+            })
             .collect();
         let packed = layout.generate_witness_batch_major_partial_chunk(&paths, nu);
         let reference = layout.generate_witness_batch_major_partial_bool_chunk(&paths, nu);
@@ -843,6 +848,78 @@ fn chunk_packed_driver_matches_bool_reference() {
             packed.3, reference.3,
             "stripe (depth {depth} leaf {leaf_bytes})"
         );
+    }
+}
+
+/// **What makes the index wireable**: the index column is a full 128-bit
+/// word, and every bit at or above `depth` is genuinely free — the relation
+/// reads only the low `depth`, so an opening whose index word carries
+/// arbitrary high bits still satisfies, and still folds to the same root.
+///
+/// That is the whole mechanism behind binding a Merkle opening to a
+/// Fiat–Shamir query without a masking gadget. `sample_queries` derives a
+/// position as `challenge.lo & (block_len − 1)`; a circuit wires the challenge
+/// WORD into this column, and the `& (block_len − 1)` is not computed anywhere
+/// — it is expressed by which columns the relation reads. If the high bits
+/// were pinned to zero (as they were before they became a word) the copy
+/// constraint against a real challenge would be unsatisfiable.
+///
+/// The complement is checked too: the low `depth` bits are NOT free.
+#[test]
+fn index_word_high_bits_are_free() {
+    let (depth, leaf_bytes) = (2usize, 128usize);
+    let layout = MerkleTreeLayout::with_blake3_chunk_leaf(depth, leaf_bytes, blake3_spec());
+    let r1cs = layout.build_block_r1cs(0);
+
+    for pos in 0..(1u128 << depth) {
+        let mut rng = Rng::new(0x_B1_7E_5A_09 ^ pos as u64);
+        let bare = chunk_input(&mut rng, depth, leaf_bytes, pos);
+
+        // The same opening, with a full challenge word above the position.
+        let hi = (0..4).fold(0u128, |acc, _| (acc << 32) | rng.next_u32() as u128);
+        let dressed = ChunkPathInput {
+            index: (hi << depth) | pos,
+            ..bare.clone()
+        };
+        assert_ne!(dressed.index >> depth, 0, "test needs nonzero high bits");
+
+        let (zb, zd) = (
+            layout.build_witness_chunk(&bare),
+            layout.build_witness_chunk(&dressed),
+        );
+        assert!(
+            r1cs.satisfies(&zd),
+            "a nonzero high half was rejected at position {pos}"
+        );
+        assert_eq!(
+            layout.read_root(&zd),
+            layout.reference_root_chunk(&dressed),
+            "high bits perturbed the root at position {pos}"
+        );
+        assert_eq!(
+            layout.read_root(&zd),
+            layout.read_root(&zb),
+            "high bits are read by the fold at position {pos}"
+        );
+
+        // The two witnesses differ in exactly the index word's high columns —
+        // nothing else in the trace moved.
+        let differ: Vec<usize> = (0..zb.len()).filter(|&c| zb[c] != zd[c]).collect();
+        let want: Vec<usize> = (depth..128)
+            .filter(|&j| (hi >> (j - depth)) & 1 == 1)
+            .map(|j| layout.index_word_base() + j)
+            .collect();
+        assert_eq!(differ, want, "high bits leaked outside the index word");
+
+        // ...and the low bits really are load-bearing.
+        for l in 0..depth {
+            let mut bad = zd.clone();
+            bad[layout.index_bit(l)] ^= true;
+            assert!(
+                !r1cs.satisfies(&bad),
+                "flipping index bit {l} was accepted at position {pos}"
+            );
+        }
     }
 }
 

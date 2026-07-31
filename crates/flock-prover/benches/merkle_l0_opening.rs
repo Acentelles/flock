@@ -85,7 +85,7 @@ impl Rng {
     fn opening(&mut self, d: usize, leaf: usize) -> ChunkPathInput {
         ChunkPathInput {
             leaf_data: (0..leaf).map(|_| self.next_u32() as u8).collect(),
-            index: ((self.next_u32() as u64) << 32 | self.next_u32() as u64) & ((1u64 << d) - 1),
+            index: ((self.next_u32() as u128) << 32 | self.next_u32() as u128) & ((1u128 << d) - 1),
             siblings: (0..d).map(|_| self.digest()).collect(),
         }
     }

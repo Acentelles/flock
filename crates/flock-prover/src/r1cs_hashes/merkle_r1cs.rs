@@ -576,6 +576,69 @@ impl MerkleTreeLayout {
         f
     }
 
+    // -----------------------------------------------------------------------
+    // Wiring IO schema
+    // -----------------------------------------------------------------------
+
+    /// Schema position of word `w` (`< 4`) of chunk block `block`'s leaf data.
+    pub fn io_leaf(&self, block: usize, w: usize) -> usize {
+        debug_assert!(block < self.leaf_blocks && w < 4);
+        4 * block + w
+    }
+
+    /// Schema position of the index word.
+    pub fn io_index(&self) -> usize {
+        4 * self.leaf_blocks
+    }
+
+    /// Schema position of root half `h` (`0` = bits `[0,128)`).
+    pub fn io_root(&self, h: usize) -> usize {
+        debug_assert!(h < 2);
+        4 * self.leaf_blocks + 1 + h
+    }
+
+    /// The wireable words of one opening — chunk-leaf layouts only.
+    ///
+    /// Inputs: the leaf data (`4` words per chunk block, in block order) then
+    /// the index word. Outputs: the two halves of the root.
+    ///
+    /// **What is deliberately absent is the sibling path.** Each level's
+    /// sibling digest sits at [`sibling_bit`](Self::sibling_bit) — inside that
+    /// level's base-block padding, at `useful_bits`, which is not word-aligned
+    /// and shares its word with the level's own hash columns. It is therefore
+    /// not expressible as a schema word at all. That costs nothing here: a
+    /// sibling is free witness read by no other gate, and the relation already
+    /// binds it, because the level's compression consumes it and the chain
+    /// terminates in the root this schema exports. A prover who changes a
+    /// sibling changes the root. Circuits supply the path as a
+    /// [`GateType::Hint`](flock_core::circuit::builder::GateType::Hint).
+    ///
+    /// Everything that IS here has an outside claimant: the leaf data is read
+    /// by whatever proves the opened values, the index binds to the
+    /// Fiat–Shamir query, and the root binds to the committed root.
+    pub fn io_schema(&self) -> Vec<flock_core::schedule::IoWord> {
+        use flock_core::schedule::IoWord;
+        assert!(
+            self.leaf_blocks > 0,
+            "io_schema is chunk-leaf only: the digest-leaf layout packs its \
+             index tightly, so no word-aligned index word exists to wire"
+        );
+        let w = |bit: usize| {
+            debug_assert_eq!(bit % 128, 0, "schema word {bit} is not 128-aligned");
+            bit / 128
+        };
+        let mut schema = Vec::with_capacity(4 * self.leaf_blocks + 3);
+        for block in 0..self.leaf_blocks {
+            for j in 0..4 {
+                schema.push(IoWord::input(w(self.leaf_data_bit(block, 128 * j))));
+            }
+        }
+        schema.push(IoWord::input(w(self.index_word_base())));
+        schema.push(IoWord::output(w(self.root_bit(0))));
+        schema.push(IoWord::output(w(self.root_bit(128))));
+        schema
+    }
+
     /// Bit `j` of level `l`'s sibling digest — in the base block's padding.
     pub fn sibling_bit(&self, level: usize, j: usize) -> usize {
         debug_assert!(j < SLOT_BITS);
@@ -1355,12 +1418,8 @@ impl MerkleTreeLayout {
             self.depth,
             "need one sibling digest per level"
         );
-        assert!(
-            self.depth >= 64 || input.index < (1u64 << self.depth),
-            "index {} does not fit in {} bits",
-            input.index,
-            self.depth
-        );
+        // No bound on `index`: the word's high bits are free by construction
+        // (see `ChunkPathInput::index`). Only the low `depth` are read.
     }
 
     /// The input chaining value the fixed set pins — chunk block 0 starts
@@ -1384,8 +1443,10 @@ impl MerkleTreeLayout {
         self.assert_chunk_input(input);
         let mut z = vec![false; self.k()];
         z[self.const_pos()] = true;
-        for l in 0..self.depth {
-            z[self.index_bit(l)] = (input.index >> l) & 1 == 1;
+        // The whole index WORD, not just the `depth` bits the fold reads — the
+        // columns above are free and carry the wired challenge's high bits.
+        for j in 0..128 {
+            z[self.index_word_base() + j] = (input.index >> j) & 1 == 1;
         }
 
         // The chunk chain: h_in of block 0 is the IV, then each block's
@@ -1447,11 +1508,11 @@ impl MerkleTreeLayout {
         a[gc] = true;
         b[gc] = true;
         // The whole index word is free, so every one of its 128 columns needs
-        // its `z·1 = z` witness — not just the `depth` index bits. Bits at or
-        // above `depth` are zero here; when the word is wired to a Fiat-Shamir
-        // challenge they carry the challenge's remaining bits.
+        // its `z·1 = z` witness — not just the `depth` index bits. The bits at
+        // or above `depth` are read by no row; they carry whatever the wired
+        // Fiat-Shamir challenge put there.
         for j in 0..128 {
-            let bit = j < self.depth && (input.index >> j) & 1 == 1;
+            let bit = (input.index >> j) & 1 == 1;
             free(&mut z, &mut a, &mut b, self.index_word_base() + j, bit);
         }
 
@@ -1638,16 +1699,11 @@ impl MerkleTreeLayout {
                         or_bit_row(wb, const_off);
                         // The whole index WORD is free, so all 128 columns
                         // need their `z·1 = z` witness. Columns at or above
-                        // `depth` are zero here; when the word is wired to a
-                        // Fiat-Shamir challenge they carry its remaining bits.
+                        // `depth` are read by no row; they carry whatever the
+                        // wired Fiat-Shamir challenge put there.
                         for l in 0..128 {
-                            let v: [u32; BM_V] = std::array::from_fn(|j| {
-                                if l < depth {
-                                    ((group[j].index >> l) & 1) as u32
-                                } else {
-                                    0
-                                }
-                            });
+                            let v: [u32; BM_V] =
+                                std::array::from_fn(|j| ((group[j].index >> l) & 1) as u32);
                             or_u32_row(wz, index_off + l, &v);
                             or_u32_row(wa, index_off + l, &v);
                             or_bit_row(wb, index_off + l);
@@ -1754,12 +1810,22 @@ impl MerkleTreeLayout {
 }
 
 /// One chunk-leaf opening: the raw leaf bytes (`64 · leaf_blocks` of them),
-/// the leaf's index, and one sibling chaining value per level (level 0 =
+/// the leaf's index word, and one sibling chaining value per level (level 0 =
 /// closest to the leaf).
 #[derive(Clone, Debug)]
 pub struct ChunkPathInput {
     pub leaf_data: Vec<u8>,
-    pub index: u64,
+    /// The **whole 128-bit index word**, of which the Merkle position is the
+    /// low `depth` bits — see [`MerkleTreeLayout::index_word_base`].
+    ///
+    /// It is a full word because it is wired: a circuit binds this opening to
+    /// a Fiat–Shamir query by connecting the challenge word here, and a copy
+    /// constraint relates whole words. The bits at or above `depth` are
+    /// committed and pinned by that constraint but read by no relation row,
+    /// so they carry the challenge's remaining bits at no cost and the
+    /// masking `sample_queries` does natively — `& (block_len − 1)` — needs no
+    /// gadget. A caller that only has a position passes `pos as u128`.
+    pub index: u128,
     pub siblings: Vec<[u32; SLOT_WORDS]>,
 }
 
