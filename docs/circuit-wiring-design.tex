@@ -399,6 +399,69 @@ inter-class space of Remark~\ref{rem:dead}; the cell space pays per
 per-slot data is tiny: $2^c$ coefficients $\eq(\rho_\iota, \iota)$ and
 each $\iota$'s constant (prefix, column) pair from the registry.
 
+\subsection{Describing circuits: the builder}\label{sec:builder}
+
+\settled{Ron} Circuits are described by a \textbf{builder}, not by
+hand-written cell lists. \emph{Design settled 2026-07-31; unbuilt.}
+
+\paragraph{The problem.} \code{Circuit::new(registry, counts, num\_public,
+wires)} takes the wiring as raw equivalence classes of
+\code{Cell::new(slot, row)}. The witness is built \emph{separately}: in
+\code{tests/circuit\_wiring.rs} the \code{Tree} struct assembles
+$(h_{\mathrm{in}}, m)$ per gate row in one place while the
+\code{Vec<Vec<Cell>>} is assembled in another. Two artifacts that must
+agree, with nothing enforcing it --- a mismatch is a silently wrong
+\emph{statement}, not a compile error. Three circuits are already built this
+way (\code{sha256\_binary\_tree\_circuit}, \code{element\_chain\_circuit},
+\code{cross\_class\_hash\_into\_mult}); the recursion work would add a
+fourth, larger than all of them.
+
+\paragraph{The principle} is the one that justified the transcript recorder
+(\S\ref{sec:replacement-sampling} and \code{transcript\_record}): \emph{one
+description, both views}. A gate type carries its constraints and its native
+evaluation together, so instantiating a gate emits the row, the wiring and
+the witness entry from a single call and they cannot drift.
+
+\begin{verbatim}
+    trait GateType {
+        fn table(&self) -> TableType;                  // constraints + io_schema
+        fn eval(&self, inputs: &[Word]) -> Vec<Word>;  // native execution
+    }
+
+    impl CircuitBuilder {
+        fn slot(&mut self, g: impl GateType) -> SlotId;
+        fn gate(&mut self, s: SlotId, inputs: &[Wire]) -> Vec<Wire>;
+        fn public(&mut self, w: Wire);
+        fn finish(self) -> (Registry, Circuit, Witness);
+    }
+\end{verbatim}
+
+\code{gate} allocates a row in the slot, binds the input wires (emitting the
+copy constraints), runs \code{eval} to fill that row, and returns wires for
+the outputs. \code{counts} falls out of how many rows each slot allocated
+rather than being passed in.
+
+\paragraph{Two constraints on the shape.} Row allocation must be
+deterministic in instantiation order, because \code{Circuit::digest} is
+statement-binding (\S\ref{sec:statement}) and a regenerated circuit must be
+\emph{the same} circuit. And \code{Wire} must distinguish ``not yet placed''
+from a concrete \code{Cell}, so a value can be consumed before its producer
+is emitted --- the FS chain needs this, since a squeezed challenge is
+re-absorbed into the transcript that produced it.
+
+\paragraph{Validation is free.} Rebuild the three existing hand-built
+circuits through the builder and assert \code{Circuit::digest()} and the
+proof bytes are unchanged. If the builder is right, nothing moves --- the
+same byte-identity discipline the rest of the repo uses.
+
+\paragraph{What it subsumes.} The Fiat--Shamir chain circuit stops being a
+bespoke pipeline and becomes a \emph{client}: recorder $\to$ schedule $\to$
+builder calls. The byte-packing glue the FS stream needs (message values land
+at arbitrary byte offsets, unlike the tree circuits where 128-bit words align
+and wiring is pure copy) is just another \code{GateType}. A future
+circuit-emitting backend for the verifier's arithmetic (\S\ref{sec:open}) is
+another client. Nothing in the builder is recursion-specific.
+
 % ===========================================================================
 \section{The wiring argument}\label{sec:wiring}
 
