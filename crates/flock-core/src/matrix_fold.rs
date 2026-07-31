@@ -164,47 +164,27 @@ pub struct MatrixClaim {
 
 /// `Σ_{r,c} row(r)·col(c)·M[r,c]` — one pass over the nonzeros, `O(nnz)`.
 /// The honest value of a claim, and the root discharge.
-pub fn bilinear(row: &Weight, col: &Weight, m: &SparseBinaryMatrix) -> F128 {
+pub fn bilinear(row: &Weight, col: &Weight, m: &dyn FoldMatrix) -> F128 {
     let rw = row.materialize();
     let cw = col.materialize();
     assert!(
-        rw.len() >= m.num_rows && cw.len() >= m.num_cols,
+        rw.len() >= m.n_rows() && cw.len() >= m.n_cols(),
         "weights are too small for the matrix"
     );
-    // One pass over the nonzeros, split by rows — the discharge pays this
-    // twice per type, so it is worth the same treatment as the fold's own
-    // passes rather than being the sequential straggler behind them.
-    m.rows
-        .par_chunks(G_ROW_CHUNK)
-        .enumerate()
-        .map(|(blk, chunk)| {
-            let base = blk * G_ROW_CHUNK;
-            let mut acc = F128::ZERO;
-            for (j, cols) in chunk.iter().enumerate() {
-                let wr = rw[base + j];
-                if wr == F128::ZERO {
-                    continue;
-                }
-                let mut inner = F128::ZERO;
-                for &c in cols {
-                    inner += cw[c];
-                }
-                acc += wr * inner;
-            }
-            acc
-        })
-        .reduce(|| F128::ZERO, |a, b| a + b)
+    // ⟨row ⊗ col, M⟩ = ⟨row, M·col⟩ — one marginal, then a dot product.
+    let g = m.row_marginal(&cw, rw.len());
+    rw.iter().zip(&g).fold(F128::ZERO, |a, (x, y)| a + *x * *y)
 }
 
 impl MatrixClaim {
     /// An honest claim about `m` at the given weights.
-    pub fn honest(row: Weight, col: Weight, m: &SparseBinaryMatrix) -> Self {
+    pub fn honest(row: Weight, col: Weight, m: &dyn FoldMatrix) -> Self {
         let value = bilinear(&row, &col, m);
         Self { row, col, value }
     }
 
     /// Discharge the claim directly — the `O(nnz)` root check.
-    pub fn check_direct(&self, m: &SparseBinaryMatrix) -> bool {
+    pub fn check_direct(&self, m: &dyn FoldMatrix) -> bool {
         bilinear(&self.row, &self.col, m) == self.value
     }
 }
@@ -300,7 +280,7 @@ fn observe_claims<Ch: Challenger>(claims: &[MatrixClaim], ch: &mut Ch) {
 /// never inside a circuit. The caller must have bound whatever pins the
 /// claims (registry digest, statement) into `ch` beforehand.
 pub fn prove_fold<Ch: Challenger>(
-    m: &SparseBinaryMatrix,
+    m: &dyn FoldMatrix,
     combs: &[Vec<F128>],
     claims: &[MatrixClaim],
     ch: &mut Ch,
@@ -353,7 +333,7 @@ pub fn prove_fold<Ch: Challenger>(
     // the matrix itself.
     let mus: Vec<F128> = (0..claims.len()).map(|_| ch.sample_f128()).collect();
     let eq_col = Weight::eq(rho_col.clone()).materialize();
-    let h = row_marginal(m, &eq_col, 1usize << k_row);
+    let h = m.row_marginal(&eq_col, 1usize << k_row);
     let mut w_mu = vec![F128::ZERO; 1usize << k_row];
     for (claim, &mu) in claims.iter().zip(&mus) {
         for (dst, src) in w_mu.iter_mut().zip(claim.row.materialize()) {
@@ -395,46 +375,110 @@ pub fn prove_fold<Ch: Challenger>(
     )
 }
 
-/// `out[r] = Σ_c w[c]·M[r,c]` — the row marginal, one parallel pass over the
-/// nonzeros. The tuned per-type kernels only go the other way (column
-/// marginals), so this direction is generic; the fold needs it exactly once.
-pub fn row_marginal(m: &SparseBinaryMatrix, w: &[F128], n_rows: usize) -> Vec<F128> {
-    let mut out = vec![F128::ZERO; n_rows];
-    out.par_chunks_mut(G_ROW_CHUNK)
-        .enumerate()
-        .for_each(|(blk, dst)| {
-            let base = blk * G_ROW_CHUNK;
-            for (j, slot) in dst.iter_mut().enumerate() {
-                let Some(cs) = m.rows.get(base + j) else { break };
-                let mut acc = F128::ZERO;
-                for &c in cs {
-                    acc += w[c];
-                }
-                *slot = acc;
-            }
-        });
-    out
+/// A matrix the fold can walk. Implemented for both constraint-system
+/// flavours: the boolean class's `GF(2)` supports and the element class's
+/// `F128`-coefficient matrices.
+///
+/// Only the two marginals are needed, in both directions — everything else
+/// the fold does lives on `2^κ`-sized vectors.
+pub trait FoldMatrix: Sync {
+    /// `out[r] = Σ_c w[c]·M[r,c]`.
+    fn row_marginal(&self, w: &[F128], n_rows: usize) -> Vec<F128>;
+    /// `out[c] = Σ_r w[r]·M[r,c]`. For boolean types prefer
+    /// [`crate::lincheck::LincheckCircuit::fold_split`], which is the same
+    /// quantity through each type's tuned kernel.
+    fn col_marginal(&self, w: &[F128], n_cols: usize) -> Vec<F128>;
+    fn n_rows(&self) -> usize;
+    fn n_cols(&self) -> usize;
 }
 
-/// `out[c] = Σ_r w[r]·M[r,c]` — the column marginal, generic fallback for
-/// callers without a [`crate::lincheck::LincheckCircuit`]. Prefer that
-/// trait's `fold_split`, which is what the tuned kernels implement.
-pub fn col_marginal(m: &SparseBinaryMatrix, w: &[F128], n_cols: usize) -> Vec<F128> {
-    m.rows
-        .par_chunks(G_ROW_CHUNK)
-        .enumerate()
+impl FoldMatrix for SparseBinaryMatrix {
+    fn row_marginal(&self, w: &[F128], n_rows: usize) -> Vec<F128> {
+        let mut out = vec![F128::ZERO; n_rows];
+        out.par_chunks_mut(G_ROW_CHUNK)
+            .enumerate()
+            .for_each(|(blk, dst)| {
+                let base = blk * G_ROW_CHUNK;
+                for (j, slot) in dst.iter_mut().enumerate() {
+                    let Some(cs) = self.rows.get(base + j) else {
+                        break;
+                    };
+                    let mut acc = F128::ZERO;
+                    for &c in cs {
+                        acc += w[c];
+                    }
+                    *slot = acc;
+                }
+            });
+        out
+    }
+    fn col_marginal(&self, w: &[F128], n_cols: usize) -> Vec<F128> {
+        scatter_cols(self.rows.len(), n_cols, |r, f| {
+            for &c in &self.rows[r] {
+                f(c, F128::ONE);
+            }
+        }, w)
+    }
+    fn n_rows(&self) -> usize {
+        self.num_rows
+    }
+    fn n_cols(&self) -> usize {
+        self.num_cols
+    }
+}
+
+impl FoldMatrix for crate::element_r1cs::SparseF128Matrix {
+    fn row_marginal(&self, w: &[F128], n_rows: usize) -> Vec<F128> {
+        let mut out = vec![F128::ZERO; n_rows];
+        out.par_chunks_mut(G_ROW_CHUNK)
+            .enumerate()
+            .for_each(|(blk, dst)| {
+                let base = blk * G_ROW_CHUNK;
+                for (j, slot) in dst.iter_mut().enumerate() {
+                    let Some(cs) = self.rows.get(base + j) else {
+                        break;
+                    };
+                    let mut acc = F128::ZERO;
+                    for &(c, coeff) in cs {
+                        acc += coeff * w[c];
+                    }
+                    *slot = acc;
+                }
+            });
+        out
+    }
+    fn col_marginal(&self, w: &[F128], n_cols: usize) -> Vec<F128> {
+        scatter_cols(self.rows.len(), n_cols, |r, f| {
+            for &(c, coeff) in &self.rows[r] {
+                f(c, coeff);
+            }
+        }, w)
+    }
+    fn n_rows(&self) -> usize {
+        self.num_rows
+    }
+    fn n_cols(&self) -> usize {
+        self.num_cols
+    }
+}
+
+/// Shared scatter for the column marginals: per-worker accumulators reduced
+/// by XOR (addition is XOR, so the reduction is exact and order-free).
+fn scatter_cols(
+    n_rows: usize,
+    n_cols: usize,
+    each: impl Fn(usize, &mut dyn FnMut(usize, F128)) + Sync,
+    w: &[F128],
+) -> Vec<F128> {
+    (0..n_rows)
+        .into_par_iter()
+        .with_min_len(G_ROW_CHUNK)
         .fold(
             || vec![F128::ZERO; n_cols],
-            |mut acc, (blk, chunk)| {
-                let base = blk * G_ROW_CHUNK;
-                for (j, cs) in chunk.iter().enumerate() {
-                    let wr = w[base + j];
-                    if wr == F128::ZERO {
-                        continue;
-                    }
-                    for &c in cs {
-                        acc[c] += wr;
-                    }
+            |mut acc, r| {
+                let wr = w[r];
+                if wr != F128::ZERO {
+                    each(r, &mut |c, coeff| acc[c] += wr * coeff);
                 }
                 acc
             },
@@ -448,6 +492,16 @@ pub fn col_marginal(m: &SparseBinaryMatrix, w: &[F128], n_cols: usize) -> Vec<F1
                 a
             },
         )
+}
+
+/// `out[r] = Σ_c w[c]·M[r,c]` — free function kept for existing callers.
+pub fn row_marginal(m: &SparseBinaryMatrix, w: &[F128], n_rows: usize) -> Vec<F128> {
+    FoldMatrix::row_marginal(m, w, n_rows)
+}
+
+/// `out[c] = Σ_r w[r]·M[r,c]` — free function kept for existing callers.
+pub fn col_marginal(m: &SparseBinaryMatrix, w: &[F128], n_cols: usize) -> Vec<F128> {
+    FoldMatrix::col_marginal(m, w, n_cols)
 }
 
 /// Replay a fold. `O(k·κ)` — no matrix access at all, which is what lets a

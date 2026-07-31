@@ -151,6 +151,16 @@ pub struct Proof {
     pub rounds: Vec<(F128, F128)>,
     /// `ẑ(r_row, r'_col)` — the second packed-direct claim.
     pub z_eval: F128,
+    /// Per element slot in region order, the UNSCALED bilinear forms
+    /// `(⟨eq_con ⊗ eq_col, A_0⟩, ⟨…, B_0⟩)` — the matrix work, split so it
+    /// can be accumulated instead of evaluated by the verifier.
+    ///
+    /// Element combs are small, which is beside the point: arithmetising one
+    /// is nnz-PRESERVING (the gadget's matrix is the matrix it evaluates), so
+    /// a recursion circuit that pays it inline cannot close its fixed point
+    /// regardless of size. Same treatment as the boolean class's
+    /// `lincheck::LincheckProof::matrix_evals`.
+    pub matrix_evals: Vec<(F128, F128)>,
 }
 
 /// What a verified lincheck leaves for the opening.
@@ -215,7 +225,13 @@ pub fn prove<C: Challenger>(
     debug_assert_eq!(zc.len(), 1);
     let z_eval = zc[0];
 
-    let proof = Proof { rounds, z_eval };
+    // The standalone element lincheck does not accumulate; the union path
+    // fills this in (see `union::prove`).
+    let proof = Proof {
+        rounds,
+        z_eval,
+        matrix_evals: Vec::new(),
+    };
     let claim = Claim {
         r_prime: claim_point(r_row, r_rounds),
         z_eval,

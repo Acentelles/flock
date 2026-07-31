@@ -578,7 +578,7 @@ fn mixed_class_inner<Ch: Challenger>(
     {
         return Err(VerifyError::ClassMismatch);
     }
-    let (claims, packed_direct_points, matrix) = verify_union_piops(
+    let (claims, packed_direct_points, matrix, el_matrix) = verify_union_piops(
         union,
         UnionVerifyBinding::Mixed,
         circuits,
@@ -588,13 +588,19 @@ fn mixed_class_inner<Ch: Challenger>(
         pcs_params,
         challenger,
     )?;
-    let matrix = match (defer, matrix) {
-        (false, Some(a)) => {
+    let matrix = if defer {
+        matrix
+    } else {
+        if let Some(a) = matrix {
             a.check(union, circuits).map_err(VerifyError::Lincheck)?;
-            None
         }
-        (_, m) => m,
+        if let Some(a) = &el_matrix {
+            a.check_reported(union).map_err(VerifyError::Element)?;
+        }
+        None
     };
+    let el_matrix = if defer { el_matrix } else { None };
+    let _ = &el_matrix;
     let z_claims: Vec<ZClaim> = claims
         .boolean
         .as_ref()
@@ -675,6 +681,7 @@ fn verify_union_piops<Ch: Challenger>(
         }
 
         let mut matrix: Option<lincheck::MatrixAssertion> = None;
+        let mut el_matrix: Option<crate::element_r1cs::union::ElementAssertion> = None;
         let bool_claim = match boolean {
             Some(piop) => {
                 // The boolean PIOP runs over the BOOLEAN REGION only — the
@@ -719,11 +726,16 @@ fn verify_union_piops<Ch: Challenger>(
             None => None,
         };
 
+        // DEFERRED on this side too: the element class's matrix work leaves
+        // as its own assertion rather than being evaluated here, so a
+        // `*_deferred` entry really does defer BOTH classes.
         let el_claim = match element {
-            Some(p) => Some(
-                crate::element_r1cs::union::verify(union, p, challenger)
-                    .map_err(VerifyError::Element)?,
-            ),
+            Some(p) => {
+                let (c, a) = crate::element_r1cs::union::verify_deferred(union, p, challenger)
+                    .map_err(VerifyError::Element)?;
+                el_matrix = Some(a);
+                Some(c)
+            }
             None => None,
         };
         let packed_direct = el_claim
@@ -743,6 +755,7 @@ fn verify_union_piops<Ch: Challenger>(
             },
             packed_direct,
             matrix,
+            el_matrix,
         ))
     })
 }
@@ -755,7 +768,16 @@ type UnionPiopOut = (
     crate::proof::UnionClassClaims,
     Vec<(Vec<F128>, F128)>,
     Option<lincheck::MatrixAssertion>,
+    Option<crate::element_r1cs::union::ElementAssertion>,
 );
+
+/// Both classes' undischarged matrix work, as a `*_deferred` entry returns
+/// it. Either half is `None` when that class has no types in the registry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeferredMatrixWork {
+    pub boolean: Option<lincheck::MatrixAssertion>,
+    pub element: Option<crate::element_r1cs::union::ElementAssertion>,
+}
 
 /// Shared body of the jagged-transport union verify entries; `binding`
 /// selects the statement binding, everything else is identical.
@@ -778,7 +800,7 @@ fn verify_union_with_binding<Ch: Challenger>(
         zerocheck: proof.zerocheck.clone(),
         lincheck: proof.lincheck.clone(),
     };
-    let (claims, packed_direct, matrix) = verify_union_piops(
+    let (claims, packed_direct, matrix, _el) = verify_union_piops(
         union,
         binding,
         circuits,

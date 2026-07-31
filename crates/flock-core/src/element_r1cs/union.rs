@@ -85,6 +85,7 @@ use super::lincheck::{column_sumcheck_prove, column_sumcheck_replay};
 use super::{ElementTableType, zerocheck};
 use crate::challenger::Challenger;
 use crate::field::F128;
+use crate::matrix_fold::MatrixClaim;
 use crate::union::{ElementSlotLayout, UnionInstance};
 use crate::zerocheck::univariate_skip::build_eq;
 
@@ -229,9 +230,17 @@ pub fn prove<C: Challenger>(
     );
     let (lc_rounds, bind_order) = column_sumcheck_prove(&mut comb, &mut g, ch);
     debug_assert_eq!(g.len(), 1);
+    // The matrix work, reported rather than left for the verifier to redo:
+    // per slot the UNSCALED pair (⟨W,A_0⟩, ⟨W,B_0⟩) at the row point the
+    // zerocheck fixed and the column point the sumcheck just bound. The
+    // slot's two prefix weights are verifier scalars and stay out — what
+    // accumulates must name the static matrix alone.
+    let r_col: Vec<F128> = bind_order.iter().rev().copied().collect();
+    let matrix_evals = slot_matrix_evals(&slots, nu, &zc.r, &r_col);
     let lc_proof = super::lincheck::Proof {
         rounds: lc_rounds,
         z_eval: g[0],
+        matrix_evals,
     };
 
     let claims = assemble_claims(union, &zc, &bind_order, g[0]);
@@ -250,6 +259,18 @@ pub fn verify<C: Challenger>(
     proof: &Proof,
     ch: &mut C,
 ) -> Result<Claims, VerifyError> {
+    let (claims, assertion) = verify_deferred(union, proof, ch)?;
+    assertion.check_reported(union)?;
+    Ok(claims)
+}
+
+/// [`verify`] with the matrix work left undischarged — the element class's
+/// half of the accumulation route. Reads no base matrix.
+pub fn verify_deferred<C: Challenger>(
+    union: &UnionInstance<'_>,
+    proof: &Proof,
+    ch: &mut C,
+) -> Result<(Claims, ElementAssertion), VerifyError> {
     let slots = region_slots(union);
     let (nu, e_vars) = (union.n_log(), union.m_elem() - 7);
     assert!(!slots.is_empty(), "region PIOP needs at least one element slot");
@@ -274,16 +295,24 @@ pub fn verify<C: Challenger>(
     // per-slot comb MLE times the "the bound point addresses slot t" prefix-eq
     // factor — in `O(Σ_t (2^{κ_t} + nnz_t))`, never anything region-sized.
     let r_col: Vec<F128> = bind_order.iter().rev().copied().collect();
-    let base = region_comb_at(&slots, nu, alpha, &zc.r, &r_col);
-    if running != base * proof.lincheck.z_eval {
-        return Err(VerifyError::LincheckFinalFailed);
-    }
+    // DEFERRED: `running = Ĉomb(r_col)·z_eval` is the only place the base
+    // matrices enter, and Ĉomb is exactly the scaled combination of the
+    // reported per-slot bilinear forms. The assertion keeps both sides and
+    // checks `Ĉomb·z_eval == running` rather than dividing out `z_eval` —
+    // which would be wrong precisely when `z_eval = 0` (an all-dummy
+    // instance), where the relation constrains the matrices not at all.
+    let assertion = ElementAssertion {
+        alpha,
+        r_con: zc.r[nu..].to_vec(),
+        r_col,
+        evals: proof.lincheck.matrix_evals.clone(),
+        z_eval: proof.lincheck.z_eval,
+        target: running,
+    };
 
-    Ok(assemble_claims(
-        union,
-        &zc,
-        &bind_order,
-        proof.lincheck.z_eval,
+    Ok((
+        assemble_claims(union, &zc, &bind_order, proof.lincheck.z_eval),
+        assertion,
     ))
 }
 
@@ -404,10 +433,116 @@ fn region_comb(
     out
 }
 
+/// Per slot, `(⟨eq_con ⊗ eq_col, A_0⟩, ⟨eq_con ⊗ eq_col, B_0⟩)` — unscaled.
+///
+/// Element weights are plain `eq ⊗ eq`: unlike the boolean class there is no
+/// univariate skip, so no `λ` factor appears. That makes an element claim
+/// the simplest shape [`crate::matrix_fold::Weight`] has.
+fn slot_matrix_evals(
+    slots: &[RegionSlot<'_>],
+    nu: usize,
+    r: &[F128],
+    r_col: &[F128],
+) -> Vec<(F128, F128)> {
+    slots
+        .iter()
+        .map(|s| {
+            let kappa = s.layout.kappa;
+            let row = crate::matrix_fold::Weight::eq(r[nu..nu + kappa].to_vec());
+            let col = crate::matrix_fold::Weight::eq(r_col[..kappa].to_vec());
+            (
+                crate::matrix_fold::bilinear(&row, &col, s.ty.a_0()),
+                crate::matrix_fold::bilinear(&row, &col, s.ty.b_0()),
+            )
+        })
+        .collect()
+}
+
+/// The element class's undischarged matrix work — its counterpart of
+/// [`crate::lincheck::MatrixAssertion`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ElementAssertion {
+    pub alpha: F128,
+    /// Row point (`eq` over the constraint coordinates) and column point.
+    pub r_con: Vec<F128>,
+    pub r_col: Vec<F128>,
+    /// Per slot, the reported `(⟨W,A_0⟩, ⟨W,B_0⟩)`.
+    pub evals: Vec<(F128, F128)>,
+    /// The witness evaluation the combination multiplies.
+    pub z_eval: F128,
+    /// What `Ĉomb·z_eval` must equal — the sumcheck's running claim.
+    pub target: F128,
+}
+
+impl ElementAssertion {
+    /// The per-slot `(A_0, B_0)` claims, ready for
+    /// [`crate::matrix_fold::prove_fold`].
+    pub fn claims(&self, union: &UnionInstance<'_>) -> Vec<(MatrixClaim, MatrixClaim)> {
+        region_slots(union)
+            .iter()
+            .zip(&self.evals)
+            .map(|(s, &(va, vb))| {
+                let kappa = s.layout.kappa;
+                let row = crate::matrix_fold::Weight::eq(self.r_con[..kappa].to_vec());
+                let col = crate::matrix_fold::Weight::eq(self.r_col[..kappa].to_vec());
+                (
+                    MatrixClaim {
+                        row: row.clone(),
+                        col: col.clone(),
+                        value: va,
+                    },
+                    MatrixClaim {
+                        row,
+                        col,
+                        value: vb,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Check the reported values reproduce the target — scalars only, no
+    /// matrix read.
+    pub fn check_reported(&self, union: &UnionInstance<'_>) -> Result<(), VerifyError> {
+        let nu = union.n_log();
+        let slots = region_slots(union);
+        if self.evals.len() != slots.len() {
+            return Err(VerifyError::LincheckFinalFailed);
+        }
+        let mut acc = F128::ZERO;
+        for (s, &(va, vb)) in slots.iter().zip(&self.evals) {
+            let kappa = s.layout.kappa;
+            let w_r = eq_prefix_weight(&self.r_con[kappa..], s.layout.region_prefix(nu));
+            let w_col = eq_prefix_weight(&self.r_col[kappa..], s.layout.region_prefix(nu));
+            acc += w_r * w_col * (va + self.alpha * vb);
+        }
+        if acc * self.z_eval != self.target {
+            return Err(VerifyError::LincheckFinalFailed);
+        }
+        Ok(())
+    }
+}
+
+/// Closed-form `Ĉomb(r_col)` — what the verifier used to evaluate inline,
+/// now the differential oracle for the reported path
+/// (`reported_evals_match_the_inline_comb`). Reads the base matrices, which
+/// is exactly why the verifier no longer calls it.
+#[cfg(test)]
+fn region_comb_at_oracle(
+    slots: &[RegionSlot<'_>],
+    nu: usize,
+    alpha: F128,
+    r: &[F128],
+    r_col: &[F128],
+) -> F128 {
+    region_comb_at(slots, nu, alpha, r, r_col)
+}
+
 /// Closed-form `Ĉomb(r_col)` — the verifier's counterpart of
 /// [`region_comb`], without materializing anything region-sized: each slot
 /// contributes its own comb MLE at the bound point times the subcube prefix-eq
 /// factor "the bound point addresses slot `t`".
+#[cfg_attr(not(test), allow(dead_code))]
 fn region_comb_at(
     slots: &[RegionSlot<'_>],
     nu: usize,
@@ -808,6 +943,71 @@ mod tests {
     /// one slot / two slots, with and without a boolean region in front, at
     /// partial, full and ZERO counts.
     #[test]
+    /// The reported per-slot evaluations reproduce the comb the verifier used
+    /// to build itself — so deferring changed what is COMPUTED, not what is
+    /// CHECKED. Also pins that the deferred verify leaves the matrix work
+    /// genuinely undone: a corrupted report sails past it and is caught only
+    /// by `check_reported`.
+    #[test]
+    fn reported_evals_match_the_inline_comb() {
+        let mut rng = Rng::new(0x5EED_0BEE);
+        for counts_elem in [vec![5usize], vec![6, 3]] {
+            let cases: Vec<Case> = if counts_elem.len() == 1 {
+                vec![mult_case(2)]
+            } else {
+                vec![mixed_case(&mut rng), mult_case(2)]
+            };
+            let h = build(vec![], &cases, 3, &counts_elem, &mut rng);
+            let union = UnionInstance::new(&h.registry, h.counts.clone());
+            let z_region = region(&union, &h.z).to_vec();
+            let pa = region(&union, &h.pa).to_vec();
+            let pb = region(&union, &h.pb).to_vec();
+            let mut ch_p = FsChallenger::new(b"element-report-rt");
+            let (proof, _) = prove(&union, &z_region, pa, pb, &mut ch_p);
+
+            let mut ch_v = FsChallenger::new(b"element-report-rt");
+            let (_, assertion) =
+                verify_deferred(&union, &proof, &mut ch_v).expect("deferred accepts");
+            assert!(assertion.check_reported(&union).is_ok(), "honest report");
+
+            // The reported values, recombined with the verifier's own
+            // scalars, ARE the old inline comb.
+            let slots = region_slots(&union);
+            let nu = union.n_log();
+            let inline = region_comb_at_oracle(
+                &slots,
+                nu,
+                assertion.alpha,
+                &{
+                    let mut r = vec![F128::ZERO; nu];
+                    r.extend_from_slice(&assertion.r_con);
+                    r
+                },
+                &assertion.r_col,
+            );
+            let mut recombined = F128::ZERO;
+            for (s, &(va, vb)) in slots.iter().zip(&assertion.evals) {
+                let kappa = s.layout.kappa;
+                let w_r = eq_prefix_weight(&assertion.r_con[kappa..], s.layout.region_prefix(nu));
+                let w_col = eq_prefix_weight(&assertion.r_col[kappa..], s.layout.region_prefix(nu));
+                recombined += w_r * w_col * (va + assertion.alpha * vb);
+            }
+            assert_eq!(recombined, inline, "counts {counts_elem:?}");
+
+            // A corrupted report is invisible to the deferred verify.
+            let mut bad = proof.clone();
+            bad.lincheck.matrix_evals[0].0 += F128::ONE;
+            let mut ch = FsChallenger::new(b"element-report-rt");
+            let (_, a2) = verify_deferred(&union, &bad, &mut ch).expect("defers");
+            assert!(
+                a2.check_reported(&union).is_err(),
+                "check_reported must catch it"
+            );
+            let mut ch = FsChallenger::new(b"element-report-rt");
+            assert!(verify(&union, &bad, &mut ch).is_err(), "composed rejects");
+        }
+    }
+
     fn prove_verify_roundtrip_honest() {
         let mut rng = Rng::new(0x2044_1A11);
         let shapes: Vec<(Vec<(usize, usize)>, Vec<Case>, usize, Vec<usize>)> = vec![

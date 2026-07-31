@@ -111,7 +111,7 @@ impl Accumulator {
                 .per_type
                 .iter()
                 .zip(mats)
-                .all(|((ca, cb), (a, b))| ca.check_direct(a) && cb.check_direct(b))
+                .all(|((ca, cb), (a, b))| ca.check_direct(*a) && cb.check_direct(*b))
     }
 }
 
@@ -216,8 +216,8 @@ pub fn prove_aggregate<Ch: Challenger>(
             combs_a.push(xa);
             combs_b.push(xb);
         }
-        let (pa, out_a) = matrix_fold::prove_fold(ma, &combs_a, &ca, ch);
-        let (pb, out_b) = matrix_fold::prove_fold(mb, &combs_b, &cb, ch);
+        let (pa, out_a) = matrix_fold::prove_fold(*ma, &combs_a, &ca, ch);
+        let (pb, out_b) = matrix_fold::prove_fold(*mb, &combs_b, &cb, ch);
         folds.push((pa, pb));
         per_type.push((out_a, out_b));
     }
