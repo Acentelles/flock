@@ -3175,8 +3175,14 @@ impl SumcheckProver {
 /// recursive verifier has to replay. Per-element `sample_f128` calls are
 /// `count` sequentially-dependent duplex rounds (absorb tag, finalize, absorb
 /// the 16 squeezed bytes); the batched form is one finalize, one XOF fill —
-/// counter-mode, so its blocks are independent — and one bulk re-absorb. At
-/// L0 (243 queries) that is ~62 sequential compressions instead of 243+.
+/// counter-mode, so its blocks are mutually independent — and one bulk
+/// re-absorb. At L0 (243 queries) that trades 243 finalizations for **one**,
+/// and 243 XOF output blocks for **61**: the old path squeezed 16 bytes at a
+/// time and threw away 48 of every 64. Measured over a whole verification
+/// (`--features hash-count`, `verifier_hash_count`), the finalization count is
+/// where the entire win lands — m=30 rate 2 goes 363 → 106, while absorb
+/// blocks and XOF output barely move. Finalizations are also the part that
+/// actually serializes, since each squeeze's output is re-absorbed.
 ///
 /// `block_len` is a power of two (it is `2^(log_msg_cols + log_inv_rate)`), so
 /// masking the low bits is exact and unbiased — no modular reduction and no

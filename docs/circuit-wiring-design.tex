@@ -663,14 +663,35 @@ paths and a duplicate is simply a repeated path.
 
 \paragraph{Consequence for the FS chain.}
 The draws are now a single batched squeeze per level rather than $q$
-sequentially-dependent duplex rounds. At L0 that is $\sim$62 sequential
-compressions in place of $243{+}$ --- one finalize, one counter-mode XOF
-fill whose blocks are mutually independent, one bulk re-absorb. This
-directly sizes the FS chain table, which has to replay the whole chain.
+sequentially-dependent duplex rounds. Measured over a whole verification
+(\code{--features hash-count}, \code{verifier\_hash\_count}), with the
+BLAKE3 estimate split into its four parts:
+
+\begin{center}
+\begin{tabular}{lrrrrr}
+\textbf{m=30, rate 2} & absorb & parent & \textbf{finalizations} & xof out & total \\
+\hline
+distinct sampling      & 295 & 19 & \textbf{363} & 123 & 800 \\
+with replacement       & 287 & 18 & \textbf{106} & 123 & 534 \\
+\end{tabular}
+\end{center}
+
+\noindent
+The entire win is in the \emph{finalizations}, and that is the right
+place for it: absorb blocks are sequential only within a 1\,KiB chunk,
+XOF output blocks are counter-mode and mutually independent, but each
+squeeze's output is re-absorbed --- so the finalization count \emph{is}
+the serial depth of the transcript. At L0 specifically, 243
+finalizations become one, and the 243 XOF output blocks become 61,
+because the old path squeezed 16 bytes at a time and discarded 48 of
+every 64. Sizing the FS chain table off the total (534) rather than the
+parts would miss all of this.
+
 A bit-packed squeeze (one field element carrying $\sim$6 query indices)
-would cut it by another $\sim$8$\times$ and remains available; it was not
-taken because it trades the short low-bit mask for a full 128-bit
-decomposition per squeezed element.
+would cut the XOF-output and absorb terms further and remains available;
+it was not taken because it trades the short low-bit mask for a full
+128-bit decomposition per squeezed element, and because those terms are
+no longer the binding ones.
 
 The ladder shapes still refuse a block narrower than its query count.
 That is now a proof-size convention rather than a soundness requirement
