@@ -88,9 +88,11 @@ impl TranscriptOp {
         let pad16 = |n: usize| n.div_ceil(16) * 16;
         16 + match self {
             TranscriptOp::Label(l) => pad16(l.len()),
-            TranscriptOp::ObserveScalar | TranscriptOp::SqueezeScalar => 16,
-            TranscriptOp::ObserveSlice(n) | TranscriptOp::SqueezeSlice(n) => 16 * n,
+            TranscriptOp::ObserveScalar => 16,
+            TranscriptOp::ObserveSlice(n) => 16 * n,
             TranscriptOp::ObserveBytes(len) => pad16(*len),
+            // A squeeze absorbs only its header — the output is not fed back.
+            TranscriptOp::SqueezeScalar | TranscriptOp::SqueezeSlice(_) => 0,
             // The PoW nonce rides `observe_bytes(8)`.
             TranscriptOp::Pow { .. } => 16,
         }
@@ -337,15 +339,14 @@ impl TranscriptShape {
 ///   padding),
 /// - [`Value`](StreamWord::Value) → the wire already holding that proof value,
 ///   by **pure copy** — the whole point of aligning the framing,
-/// - [`Squeezed`](StreamWord::Squeezed) → the wire holding that challenge,
-///   which the FS chain itself produced and the transcript re-absorbs.
+/// Squeezed output never appears: it is not absorbed, so a challenge is only
+/// ever an *output* of the chain, never an input to it. That is what leaves the
+/// FS chain acyclic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamWord {
     Const(F128),
     /// The `i`-th observed value, counting `F128`s in observation order.
     Value(usize),
-    /// The `i`-th squeezed challenge word, in squeeze order.
-    Squeezed(usize),
 }
 
 impl TranscriptShape {
@@ -356,7 +357,7 @@ impl TranscriptShape {
     /// `k % 4` of block `k / 4`. It is derived from the recorded shape and the
     /// framing constants in [`crate::challenger`], so there is one definition
     /// of the encoding, not two.
-    pub fn stream_words(&self, domain: &[u8]) -> Vec<StreamWord> {
+    pub fn stream_words(&self, domain: &[u8]) -> Stream {
         use crate::challenger::{
             KIND_NONE, KIND_SCALAR, KIND_SLICE, OP_BYTES, OP_DOMAIN, OP_LABEL, OP_OBSERVE,
             OP_SQUEEZE,
@@ -377,11 +378,12 @@ impl TranscriptShape {
         };
 
         let mut out = Vec::new();
+        let mut finalize_after: Vec<usize> = Vec::new();
         // The domain is absorbed at construction, before recording starts.
         out.push(header(OP_DOMAIN, KIND_NONE, domain.len() as u64));
         padded(domain, &mut out);
 
-        let (mut values, mut challenges) = (0usize, 0usize);
+        let mut values = 0usize;
         for op in &self.ops {
             match op {
                 TranscriptOp::Label(l) => {
@@ -409,26 +411,43 @@ impl TranscriptShape {
                         out.push(StreamWord::Const(F128::ZERO));
                     }
                 }
+                // Only the header: the squeezed output is not absorbed. The
+                // finalize happens right after it, so record the split point —
+                // without a re-absorbed word there is nothing else marking it.
                 TranscriptOp::SqueezeScalar => {
                     out.push(header(OP_SQUEEZE, KIND_SCALAR, 1));
-                    out.push(StreamWord::Squeezed(challenges));
-                    challenges += 1;
+                    finalize_after.push(out.len());
                 }
                 TranscriptOp::SqueezeSlice(n) => {
                     out.push(header(OP_SQUEEZE, KIND_SLICE, *n as u64));
-                    for _ in 0..*n {
-                        out.push(StreamWord::Squeezed(challenges));
-                        challenges += 1;
-                    }
+                    finalize_after.push(out.len());
                 }
                 TranscriptOp::Pow { .. } => {
+                    // `grind_pow` digests the state BEFORE absorbing the nonce.
+                    finalize_after.push(out.len());
                     out.push(header(OP_BYTES, KIND_NONE, 8));
                     out.push(StreamWord::Const(F128::ZERO)); // the nonce, padded
                 }
             }
         }
-        out
+        Stream {
+            words: out,
+            finalize_after,
+        }
     }
+}
+
+/// The absorbed stream, plus where its finalizes fall.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stream {
+    /// The absorbed bytes as 128-bit words. Word `k` is `m` word `k % 4` of
+    /// block `k / 4`.
+    pub words: Vec<StreamWord>,
+    /// For each finalization in order, how many words precede it.
+    ///
+    /// Needed because squeezed output is no longer fed back, so nothing in the
+    /// stream itself marks a squeeze's position any more.
+    pub finalize_after: Vec<usize>,
 }
 
 /// A [`Challenger`] decorator that records the transcript's shape while
@@ -640,15 +659,17 @@ mod tests {
         let shape = rec.shape();
 
         // Rebuild the stream, substituting the observed values.
-        let words = shape.stream_words(domain);
+        let stream = shape.stream_words(domain);
         let mut bytes = Vec::new();
-        for w in &words {
+        assert_eq!(
+            stream.finalize_after,
+            vec![stream.words.len()],
+            "one squeeze, at the end"
+        );
+        for w in &stream.words {
             let v = match *w {
                 StreamWord::Const(c) => c,
                 StreamWord::Value(i) => vals[i],
-                // The squeeze's own output is re-absorbed AFTER it is produced,
-                // so it is not part of the prefix the challenge derives from.
-                StreamWord::Squeezed(_) => break,
             };
             bytes.extend_from_slice(&v.lo.to_le_bytes());
             bytes.extend_from_slice(&v.hi.to_le_bytes());

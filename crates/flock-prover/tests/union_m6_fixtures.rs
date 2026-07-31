@@ -47,6 +47,12 @@
 //! packing gate and a boolean glue table. Costs ~15% more FS compressions.
 //! Domain separation is unchanged (op/kind bytes and the length still bind).
 //! Every digest moved, as a framing change must.
+//! **Squeezed output is no longer re-absorbed** (2026-07-31): the challenge is
+//! `XOF(state)`, so feeding it back added no entropy and no binding the state
+//! did not already carry — later observations bind to it because they are
+//! absorbed into the very state that produced it. Halves the absorbed stream
+//! and takes the FS chain 698 -> 515 rows. See circuit-wiring-design.tex
+//! §"Re-absorbing squeezed output" for the argument.
 
 use ::sha2 as sha2_hash;
 use flock_core::proof::{R1csClaim, R1csProofJaggedLigerito};
@@ -139,22 +145,22 @@ fn m6_mixed_union_proof_bytes_pinned() {
         (
             "mixed-nu10-1024-1024",
             [1024, 1024],
-            "76db51bfe698c8d4322c3364cc1022b294979044d36d0e78cfd4c7430d39f7c1",
+            "c21d5ccebfb055edfa233b2b1e0c05b7935a43d4516c4cdc580943ce8ee2f019",
         ),
         (
             "mixed-nu10-50-37",
             [50, 37],
-            "51ceedd53629062b9527407503662697435461b62aeb444e5237f69264e37292",
+            "2ef70d45be5a060e2921c2f47fae38af5920846ba4eb16f7b0f873b542d059ae",
         ),
         (
             "mixed-nu10-8-8",
             [8, 8],
-            "f29a543e0d236e0985c06f05bc3323483ccc6d989a52fb58cd3cd1c4c76c8fb4",
+            "a07a815604ca5a88418b76731a1b74fb32b1fdadb666a879ae0049d9bb3be8ff",
         ),
         (
             "mixed-nu10-0-64",
             [0, 64],
-            "6baf98543d9753eb6729498863fd079a6e508a8ea576977863fd080f1e8be037",
+            "0c92ac957c148e584fd704b5cb9148a11653b2b6686a0c6f6a716de964de76d1",
         ),
     ];
 
@@ -218,7 +224,7 @@ fn m6_mixed_union_proof_bytes_pinned() {
 fn m6_single_type_anchor_proof_bytes_pinned() {
     // BLAKE3, 256 blocks (m = 22).
     {
-        const EXPECTED: &str = "79c8a05a95fe178431237b6a586d9a7eb34e9029dce40a53961dfa2f1bfc60c8";
+        const EXPECTED: &str = "39cec089515ddb592475a5d324d281b8cc3024498d067b0a38918fea12961c4d";
         let n_blocks = 256usize;
         let setup = blake3::Blake3Setup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_B3B3);
@@ -246,7 +252,7 @@ fn m6_single_type_anchor_proof_bytes_pinned() {
 
     // SHA-256, 128 blocks (m = 22).
     {
-        const EXPECTED: &str = "9fb1f58c4135f253abb56b67232555e2f228e7332196fae643221bd2a084f694";
+        const EXPECTED: &str = "bdec741a3a8f1d7514fba00626d2433d7b90ee4eea775137ba4e446e6a6cc62e";
         let n_blocks = 128usize;
         let setup = sha2::Sha256HybridSetup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_5252);

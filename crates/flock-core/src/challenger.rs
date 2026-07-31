@@ -19,6 +19,13 @@
 //!   squeezing bytes from it, then re-absorbing the squeezed bytes so the next
 //!   challenge binds to the previous one (Merlin-style duplex).
 //!
+//!   Squeezed output is **not** fed back in. The challenge is
+//!   `XOF(state)` — a deterministic function of the state — so absorbing it
+//!   would add no entropy and no binding the state does not already carry.
+//!   What squeezes actually need is that the state *advance* between them,
+//!   and the squeeze header supplies that. See
+//!   `docs/circuit-wiring-design.tex` §"Re-absorbing squeezed output".
+//!
 //!   The transcript hash is independent of the Merkle hash
 //!   ([`crate::pcs::commit::PcsParams::merkle_hash`]) — set both to the same
 //!   value if you want the whole system resting on a single primitive.
@@ -145,9 +152,12 @@ fn splitmix64(state: &mut u64) -> u64 {
 // same total length. Tagging, absorption order and the duplex structure are
 // identical for both hashes — only the primitive differs.
 //
-// Sampling clones the live hasher, squeezes challenge bytes, and absorbs the
-// squeezed output back into the live state. This "duplex" pattern binds each
-// subsequent challenge/observation to all prior squeezed output.
+// Sampling absorbs a header, then clones the live hasher and squeezes challenge
+// bytes from the clone. The output is NOT absorbed back: it is `XOF(state)`, so
+// feeding it in adds nothing the state does not already determine. Later
+// observations still bind to the challenge, because they are absorbed into the
+// very state that produced it. The header absorb is what makes two consecutive
+// squeezes differ.
 //
 // How the squeeze itself is done is the one place the two hashes genuinely
 // diverge, because SHA-256 is not an extendable-output function and BLAKE3 is:
@@ -410,8 +420,6 @@ impl Challenger for FsChallenger {
         self.absorb_header(OP_SQUEEZE, KIND_SCALAR, 1);
         let mut buf = [0u8; 16];
         self.squeeze_into(&mut buf);
-        // Re-absorb the squeezed bytes so subsequent ops bind to this challenge.
-        self.absorb(&buf);
         let lo = u64::from_le_bytes(buf[..8].try_into().unwrap());
         let hi = u64::from_le_bytes(buf[8..].try_into().unwrap());
         F128 { lo, hi }
@@ -427,7 +435,6 @@ impl Challenger for FsChallenger {
         self.absorb_header(OP_SQUEEZE, KIND_SLICE, n as u64);
         let mut buf = vec![0u8; n * 16];
         self.squeeze_into(&mut buf);
-        self.absorb(&buf);
         buf.as_chunks::<16>()
             .0
             .iter()

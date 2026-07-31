@@ -324,36 +324,42 @@ fn fs_chain_circuit_derives_the_challenges() {
     let challenges = [c0, c1, c2];
 
     // ---- resolve the stream, and replay it through the chain ----
-    let words = shape.stream_words(D);
+    let stream = shape.stream_words(D);
+    let words = &stream.words;
     let resolve = |w: &StreamWord| match *w {
         StreamWord::Const(c) => c,
         StreamWord::Value(i) => values[i],
-        StreamWord::Squeezed(i) => challenges[i],
     };
+    // Squeezed output is not absorbed, so nothing in the stream marks a
+    // squeeze — `finalize_after` says how many words precede each one.
     let mut chain = FsChain::new();
-    let mut squeeze_words: Vec<usize> = Vec::new(); // stream index of each challenge
-    let mut pending: Vec<u8> = Vec::new();
-    for (wi, w) in words.iter().enumerate() {
-        if let StreamWord::Squeezed(k) = *w {
-            // Everything before the challenge is absorbed, then it is produced.
-            chain.absorb(&pending);
-            pending.clear();
-            let out = chain.finalize(16);
-            assert_eq!(
-                F128::new(
-                    u64::from_le_bytes(out[..8].try_into().unwrap()),
-                    u64::from_le_bytes(out[8..].try_into().unwrap())
-                ),
-                challenges[k],
-                "chain reproduced a different challenge than the challenger"
-            );
-            squeeze_words.push(wi);
+    let mut at = 0usize;
+    for (k, &upto) in stream.finalize_after.iter().enumerate() {
+        let mut pending: Vec<u8> = Vec::new();
+        for w in &words[at..upto] {
+            let v = resolve(w);
+            pending.extend_from_slice(&v.lo.to_le_bytes());
+            pending.extend_from_slice(&v.hi.to_le_bytes());
         }
-        let v = resolve(w);
-        pending.extend_from_slice(&v.lo.to_le_bytes());
-        pending.extend_from_slice(&v.hi.to_le_bytes());
+        chain.absorb(&pending);
+        at = upto;
+        let out = chain.finalize(16);
+        assert_eq!(
+            F128::new(
+                u64::from_le_bytes(out[..8].try_into().unwrap()),
+                u64::from_le_bytes(out[8..].try_into().unwrap())
+            ),
+            challenges[k],
+            "chain reproduced a different challenge than the challenger"
+        );
     }
-    chain.absorb(&pending);
+    let mut tail: Vec<u8> = Vec::new();
+    for w in &words[at..] {
+        let v = resolve(w);
+        tail.extend_from_slice(&v.lo.to_le_bytes());
+        tail.extend_from_slice(&v.hi.to_le_bytes());
+    }
+    chain.absorb(&tail);
     let trace = chain.finish();
 
     // ---- build the circuit ----
@@ -401,11 +407,6 @@ fn fs_chain_circuit_derives_the_challenges() {
                     let w = match words.get(wi).filter(|_| j < real_words) {
                         // Zero padding past `block_len`.
                         None => b.public_value(F128::ZERO),
-                        Some(StreamWord::Squeezed(k)) => {
-                            // THE binding wire: challenge k re-absorbed, taken
-                            // from the ROOT row that derived it.
-                            outs[trace.squeezes[*k][0]][0]
-                        }
                         Some(sw) => match word_wire[wi] {
                             Some([w]) => w,
                             None => {

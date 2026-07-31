@@ -1013,6 +1013,10 @@ fn boolean_only_mixed_class_matches_the_plain_entry() {
 // 128-bit boundary and a recursion circuit can place it into BLAKE3's `m` by
 // pure copy instead of a byte-shift packing gate. ~15% more FS compressions;
 // domain separation unchanged. Every digest moved, as a framing change must.
+//
+// Squeezed output is no longer re-absorbed (2026-07-31): the challenge is
+// XOF(state), so feeding it back added no entropy and no binding. Halves the
+// absorbed stream, FS chain 698 -> 515 rows, and leaves the chain acyclic.
 // ---------------------------------------------------------------------------
 
 use sha2 as sha2_hash;
@@ -1063,17 +1067,17 @@ fn mixed_class_proof_bytes_pinned() {
         (
             "elem-nu12-full",
             1 << 12,
-            "a98bdae28db0841a113e3601108a83ed31b8f530ce50fd4fa91c0985af20c5b9",
+            "f5a7fb83f887acb390ce6d92b58d197d32c1a9f18efa64ea2e218e3cdecee9da",
         ),
         (
             "elem-nu12-2731",
             2731,
-            "15b8d6dcb3193c27ce7fa0e0fbeaa375a901bfe15a33c398506db8596449dd1a",
+            "0ab42030736701161c0c81c07c79d91c05be516dc56d6fd78f62793b8028fe56",
         ),
         (
             "elem-nu12-0",
             0,
-            "1952f55bcaf1e20a719f9f8cda84808e73a1dbb046300bd5fb99d4c6a83da6e9",
+            "23e34ee7eb1c4bbf7d1be49f26f61854c0c82f8fb67c5e7491fd169dab844526",
         ),
     ];
     // Mixed: BLAKE3 + element at nu = 7 (M = 22); counts in slot order
@@ -1082,22 +1086,22 @@ fn mixed_class_proof_bytes_pinned() {
         (
             "mix-nu7-128-128",
             [128, 128],
-            "5382d3c81e67af04346b9975f4e90037afaa0782fe7e23fea5dd4bf344056bee",
+            "23a883b73bee76f11beab82eb968da8ac03fdd5e9163474033f346acaedffdc2",
         ),
         (
             "mix-nu7-100-90",
             [100, 90],
-            "54b9e04617179e7655f0cfff2543ecdc1ae130ac4da6e48cbf1e6eb57c004699",
+            "c981781792c0a6056665998b8582bb8422193bac97fdf774a4de2b49c1e3a4f4",
         ),
         (
             "mix-nu7-0-90",
             [0, 90],
-            "3d16811c6a95241f0f1bda882be84a6e36b80a99c9816a097872df35d07cf93f",
+            "3fbdf9c154ce51df889e7b7a19174dfb13dd0594583ada488055af04d8bb9ec3",
         ),
         (
             "mix-nu7-100-0",
             [100, 0],
-            "ad9ea3875fdad9932f39313c4b45d9f8c55f1b2f4b5a2cb0046852428123ac75",
+            "a6f2a176cd09507ba0edddbdd256c32e7e9c9d80bc4fdc75780c88f33e8fb85d",
         ),
     ];
 

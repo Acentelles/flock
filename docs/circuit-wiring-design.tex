@@ -402,9 +402,8 @@ each $\iota$'s constant (prefix, column) pair from the registry.
 \subsection{Re-absorbing squeezed output}\label{sec:reabsorb}
 
 \code{FsChallenger} absorbs each challenge back into the transcript after
-squeezing it. \textbf{That is redundant}, and dropping it is worth 26\% of the
-FS chain. Analysed here; \emph{not yet taken}, because it is a change to
-Fiat--Shamir and deserves to be a decision rather than an edit.
+squeezing it. \textbf{That was redundant, and it is gone} --- \settled{Ron} \emph{taken
+2026-07-31}, worth 26\% of the FS chain.
 
 \paragraph{The argument.} Fiat--Shamir needs two things: every challenge is a
 deterministic function of everything absorbed before it, and everything
@@ -445,10 +444,13 @@ without re-absorb &  8{,}752 & 136 &  7 & 108 & 162 & \textbf{515} \\
 \noindent
 Absorbed bytes nearly halve, because squeezed output was half the stream. Rows
 fall only 26\%: the finalize \emph{count} is fixed by the protocol, and only
-the stack depth shrinks. It also removes the circuit's one circular wire ---
-the re-absorbed challenge, taken from the ROOT row that derived it
-(\S\ref{sec:builder}) --- after which every \code{m} word is a transcript value
-or a constant.
+the stack depth shrinks --- an estimate of $\sim$40\% assumed otherwise and was
+wrong. It also removed the circuit's one circular wire, the re-absorbed
+challenge taken from the ROOT row that derived it, so \textbf{the FS chain is
+now acyclic}: a challenge is only ever an output, and every \code{m} word is a
+transcript value or a constant. \code{StreamWord} lost its \code{Squeezed}
+variant accordingly, and \code{Stream::finalize\_after} now carries where the
+squeezes fall, since nothing in the stream marks them any more.
 
 \paragraph{The caveat, which is unchanged either way.} Both encodings reveal
 $\mathrm{XOF}(S)$ and then keep absorbing into $S$, so both rest on that
