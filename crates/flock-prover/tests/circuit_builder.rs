@@ -1164,14 +1164,30 @@ fn mvp2b_full_element_zerocheck_replayed() {
     // ---- record the verifier's transcript for it ----
     let mut rec = RecordingChallenger::new(FsChallenger::with_hash(D, HashKind::Blake3));
     zerocheck::verify_with_label(LABEL, m_words, &zc_proof, &mut rec).expect("zerocheck verifies");
+
+    // Phase 2 continues on the SAME transcript — the recorder is a challenger,
+    // so the script just carries on. The round messages here are synthetic (a
+    // standalone lincheck would need the union's comb and g vectors); what is
+    // real is the round algebra and the transcript order.
+    const LC_LABEL: &[u8] = b"flock-element-union-lc-v0";
+    const LC_ROUNDS: usize = 3;
+    rec.observe_label(LC_LABEL);
+    let alpha_v = rec.sample_f128();
+    let lc_msgs: Vec<(F128, F128)> = (0..LC_ROUNDS).map(|_| (f(), f())).collect();
+    let mut lc_rho_v = Vec::with_capacity(LC_ROUNDS);
+    for &(e1, einf) in &lc_msgs {
+        rec.observe_f128(e1);
+        rec.observe_f128(einf);
+        lc_rho_v.push(rec.sample_f128());
+    }
     let shape = rec.shape();
     let stream = shape.stream_words(D);
     let bytes = stream.to_bytes(rec.values(), rec.payloads());
     let challenges = rec.challenges().to_vec();
     assert_eq!(
         challenges.len(),
-        m_words * 2,
-        "tau slice + one rho per round"
+        m_words * 2 + 1 + LC_ROUNDS,
+        "tau slice + a rho per zerocheck round + alpha + a rho per lincheck round"
     );
 
     // ---- FS chain over it ----
@@ -1279,6 +1295,8 @@ fn mvp2b_full_element_zerocheck_replayed() {
             // output k%4 of block k/4.
             outs[trace.squeezes[0][k / 4]][k % 4]
         } else {
+            // Every later squeeze is a single word: finalize `1 + (k - m_words)`,
+            // first output.
             outs[trace.squeezes[1 + (k - m_words)][0]][0]
         }
     };
@@ -1323,9 +1341,19 @@ fn mvp2b_full_element_zerocheck_replayed() {
     }
 
     // Final consistency: running == ea·eb + ec.
+    // Phase 2's target. The real `verify_deferred` first strips the affine
+    // constants (`strip_constants`, an eq-table dot per slot) to get (va, vb);
+    // that needs the union's slot layout, so this standalone mirror starts from
+    // the zerocheck's own (ea, eb).
+    let alpha_w = challenge_wire(m_words * 2);
     let ea = value_wire(2 * m_words);
     let eb = value_wire(2 * m_words + 1);
     let ec = value_wire(2 * m_words + 2);
+    let mut lc_running = b.gate(arith, &[alpha_w, zero, eb, zero])[0]; // α·eb
+    let mut lc_running_v = alpha_v * zc_proof.eb;
+    lc_running = b.gate(arith, &[lc_running, ea, zero, zero])[1]; // + ea
+    lc_running_v += zc_proof.ea;
+
     let eaeb = b.gate(arith, &[ea, zero, eb, zero])[0];
     let rhs = b.gate(arith, &[eaeb, ec, zero, zero])[1];
     // THE accept condition. Both sides are COMPUTED, so connecting them
@@ -1335,6 +1363,35 @@ fn mvp2b_full_element_zerocheck_replayed() {
     let diff = b.gate(arith, &[running, rhs, zero, zero])[1];
     let zero_pin = b.public_value(F128::ZERO);
     b.connect(diff, zero_pin);
+
+    // ---- Phase 2: the lincheck's column sumcheck ----
+    //
+    // `column_sumcheck_replay`'s round is
+    //     e0 = running + e1;  c1 = e0 + e1 + einf;  running = einf·ρ² + c1·ρ + e0
+    // and in characteristic 2 the two `e1` terms CANCEL, so `c1 = running +
+    // einf`. That is what makes a lincheck round four gates against the
+    // zerocheck's eight: no inversion, and the `c1` sum rides its product.
+    for (i, &(e1_v, einf_v)) in lc_msgs.iter().enumerate() {
+        let e0_v = lc_running_v + e1_v;
+        assert_eq!(
+            e0_v + e1_v + einf_v,
+            lc_running_v + einf_v,
+            "the char-2 cancellation this fusion relies on"
+        );
+        let rho_v = lc_rho_v[i];
+        let rho = challenge_wire(m_words * 2 + 1 + i);
+        let e1 = value_wire(2 * m_words + 3 + 2 * i);
+        let einf = value_wire(2 * m_words + 3 + 2 * i + 1);
+
+        //   1. ρ²          2. einf·ρ²      3. (running + einf)·ρ
+        //   4. sum: einf·ρ² + c1·ρ + running + e1     (= …+ e0)
+        let rho2 = b.gate(arith, &[rho, zero, rho, zero])[0];
+        let p = b.gate(arith, &[einf, zero, rho2, zero])[0];
+        let q = b.gate(arith, &[lc_running, einf, rho, zero])[0];
+        lc_running = b.gate(arith, &[p, q, lc_running, e1])[1];
+        lc_running_v = einf_v * rho_v * rho_v + (lc_running_v + einf_v) * rho_v + e0_v;
+    }
+    b.publish(lc_running);
     assert_eq!(
         running_v,
         zc_proof.ea * zc_proof.eb + zc_proof.ec,
@@ -1389,7 +1446,8 @@ fn mvp2b_full_element_zerocheck_replayed() {
 
     println!(
         "\n=== MVP-2b: the whole element zerocheck, in-circuit ===\n  \
-         {m_words} rounds | {} BLAKE3 rows + {} element rows | M={} | {} public words",
+         zerocheck {m_words} rounds + lincheck {LC_ROUNDS} rounds | \
+         {} BLAKE3 rows + {} element rows | M={} | {} public words",
         built.counts[built.registry_slot(hash)],
         built.counts[built.registry_slot(arith)],
         outer.m_total(),
