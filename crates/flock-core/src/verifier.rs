@@ -698,6 +698,71 @@ pub fn verify_ligerito_union_circuit_merged<Ch: Challenger>(
     )
 }
 
+
+/// [`verify_ligerito_union_circuit_merged`] with the matrix work left
+/// undischarged — what a merge node runs on each child proof.
+///
+/// Everything else is verified: both class PIOPs, the wiring argument, and
+/// the single merged opening. What comes back alongside the claims is the two
+/// classes' [`DeferredMatrixWork`], for the caller to fold into an
+/// accumulator ([`crate::aggregate`]) rather than evaluate.
+///
+/// No base matrix is read anywhere in it — that is what lets a recursion
+/// circuit replay it. There is deliberately NO jagged counterpart: the merged
+/// transport is the production path, and building deferred machinery on the
+/// legacy one would be work aimed at something being retired.
+///
+/// **The claims are conditional on the returned work**: a proof whose
+/// lincheck is simply wrong still returns `Ok` here. Callers that are not
+/// accumulating must use [`verify_ligerito_union_circuit_merged`].
+#[allow(clippy::too_many_arguments)]
+pub fn verify_ligerito_union_circuit_merged_deferred<Ch: Challenger>(
+    union: &crate::union::UnionInstance<'_>,
+    circuit: &crate::circuit::Circuit,
+    public: &[F128],
+    circuits: &[&dyn lincheck::LincheckCircuit],
+    commitment: &Commitment,
+    proof: &crate::proof::R1csProofCircuitMerged,
+    pcs_params: &crate::pcs::PcsParams,
+    challenger: &mut Ch,
+) -> Result<(crate::proof::UnionClassClaims, DeferredMatrixWork), VerifyError> {
+    if !circuit.check_instance(union) || public.len() != circuit.num_public() {
+        return Err(VerifyError::CircuitMismatch);
+    }
+    if proof.boolean.is_some() != (union.num_boolean() > 0)
+        || proof.element.is_some() != union.has_element()
+    {
+        return Err(VerifyError::ClassMismatch);
+    }
+    let (claims, packed_direct_points, matrix, el_matrix) = verify_union_piops(
+        union,
+        UnionVerifyBinding::Circuit { circuit, public },
+        circuits,
+        commitment,
+        proof.boolean.as_ref(),
+        proof.element.as_ref(),
+        Some(&proof.wiring),
+        pcs_params,
+        challenger,
+    )?;
+    let claims = verify_merged_opening(
+        union,
+        commitment,
+        &claims,
+        &packed_direct_points,
+        &proof.pcs_open,
+        pcs_params,
+        challenger,
+    )?;
+    Ok((
+        claims,
+        DeferredMatrixWork {
+            boolean: matrix,
+            element: el_matrix,
+        },
+    ))
+}
+
 /// The merged transport's verification, shared by the mixed-class and circuit
 /// entries: the boolean pair ring-switched, everything else packed-direct.
 fn verify_merged_opening<Ch: Challenger>(

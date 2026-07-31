@@ -44,6 +44,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::challenger::Challenger;
 use crate::field::F128;
+use crate::element_r1cs::union::ElementAssertion;
 use crate::lincheck::{MatrixAssertion, VerifyError};
 use crate::matrix_fold::{self, FoldProof, MatrixClaim};
 use crate::r1cs::SparseBinaryMatrix;
@@ -54,6 +55,13 @@ const DOMAIN: &[u8] = b"flock-aggregate-v0";
 /// The base matrices of one boolean type, `(A₀, B₀)`.
 pub type TypeMatrices<'a> = (&'a SparseBinaryMatrix, &'a SparseBinaryMatrix);
 
+/// The base matrices of one element type, `(A₀, B₀)` — `F128` coefficients,
+/// not `GF(2)` supports.
+pub type ElementMatrices<'a> = (
+    &'a crate::element_r1cs::SparseF128Matrix,
+    &'a crate::element_r1cs::SparseF128Matrix,
+);
+
 /// Accumulated matrix claims: one `(A₀, B₀)` pair per boolean type, in slot
 /// order, tied to the registry they are about.
 ///
@@ -63,7 +71,17 @@ pub type TypeMatrices<'a> = (&'a SparseBinaryMatrix, &'a SparseBinaryMatrix);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Accumulator {
     pub registry_digest: [u8; 32],
+    /// Boolean types, in slot order.
     pub per_type: Vec<(MatrixClaim, MatrixClaim)>,
+    /// Element types, in slot order — a SEPARATE group, because they name
+    /// different matrices.
+    ///
+    /// The key is really `(registry, type, matrix)`. The registry digest
+    /// covers the first component; the class split is the second. Folding a
+    /// boolean type's claim with an element type's would be folding claims
+    /// about different polynomials, which is meaningless — so the groups
+    /// never mix, exactly as `A₀` and `B₀` never mix within a group.
+    pub per_element: Vec<(MatrixClaim, MatrixClaim)>,
 }
 
 impl Accumulator {
@@ -113,12 +131,25 @@ impl Accumulator {
                 .zip(mats)
                 .all(|((ca, cb), (a, b))| ca.check_direct(*a) && cb.check_direct(*b))
     }
+
+    /// Discharge the element group against its `F128`-coefficient matrices.
+    pub fn discharge_element(&self, mats: &[ElementMatrices<'_>]) -> bool {
+        self.per_element.len() == mats.len()
+            && self
+                .per_element
+                .iter()
+                .zip(mats)
+                .all(|((ca, cb), (a, b))| ca.check_direct(*a) && cb.check_direct(*b))
+    }
 }
 
 /// Per boolean type, the two folds `(A₀, B₀)`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregateProof {
+    /// Per boolean type, the two folds `(A₀, B₀)`.
     pub folds: Vec<(FoldProof, FoldProof)>,
+    /// Per element type, likewise.
+    pub el_folds: Vec<(FoldProof, FoldProof)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,6 +164,8 @@ pub enum AggregateError {
     /// An assertion's reported matrix evaluations do not reproduce its
     /// target (`MatrixAssertion::check_reported`).
     Reported(VerifyError),
+    /// Likewise on the element side.
+    ReportedElement(crate::element_r1cs::union::VerifyError),
     /// A fold did not verify.
     Fold(matrix_fold::FoldError),
     /// The accumulated claims did not hold against the real matrices.
@@ -179,6 +212,24 @@ pub fn prove_aggregate<Ch: Challenger>(
     prior: Option<&Accumulator>,
     ch: &mut Ch,
 ) -> Result<(AggregateProof, Accumulator), AggregateError> {
+    prove_aggregate_classes(registry, mats, circuits, assertions, &[], &[], prior, ch)
+}
+
+/// [`prove_aggregate`] over BOTH classes: the boolean assertions against
+/// their `GF(2)` matrices, the element ones against their `F128` matrices,
+/// each group folding independently because they name different
+/// polynomials.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_aggregate_classes<Ch: Challenger>(
+    registry: &Registry,
+    mats: &[TypeMatrices<'_>],
+    circuits: &[&dyn crate::lincheck::LincheckCircuit],
+    assertions: &[MatrixAssertion],
+    el_mats: &[ElementMatrices<'_>],
+    el_assertions: &[(&crate::union::UnionInstance<'_>, ElementAssertion)],
+    prior: Option<&Accumulator>,
+    ch: &mut Ch,
+) -> Result<(AggregateProof, Accumulator), AggregateError> {
     if assertions.is_empty() && prior.is_none() {
         return Err(AggregateError::Empty);
     }
@@ -222,13 +273,60 @@ pub fn prove_aggregate<Ch: Challenger>(
         per_type.push((out_a, out_b));
     }
 
+    // The element group: same fold, different matrices. Its claims are plain
+    // eq ⊗ eq (no univariate skip), so no tuned column-marginal kernel
+    // applies and the generic one is used.
+    let mut el_folds = Vec::with_capacity(el_mats.len());
+    let mut per_element = Vec::with_capacity(el_mats.len());
+    for (t, (ma, mb)) in el_mats.iter().enumerate() {
+        let (ca, cb) = gather_element(el_assertions, prior, t);
+        let n_cols = ma.num_cols;
+        let combs_a: Vec<Vec<F128>> = ca
+            .iter()
+            .map(|q| matrix_fold::FoldMatrix::col_marginal(*ma, &q.row.materialize(), n_cols))
+            .collect();
+        let combs_b: Vec<Vec<F128>> = cb
+            .iter()
+            .map(|q| matrix_fold::FoldMatrix::col_marginal(*mb, &q.row.materialize(), n_cols))
+            .collect();
+        let (pa, out_a) = matrix_fold::prove_fold(*ma, &combs_a, &ca, ch);
+        let (pb, out_b) = matrix_fold::prove_fold(*mb, &combs_b, &cb, ch);
+        el_folds.push((pa, pb));
+        per_element.push((out_a, out_b));
+    }
+
     Ok((
-        AggregateProof { folds },
+        AggregateProof {
+            folds,
+            el_folds,
+        },
         Accumulator {
             registry_digest: registry.digest(),
             per_type,
+            per_element,
         },
     ))
+}
+
+/// Element claims to fold for one type: the prior's first, then one per
+/// assertion — the same fixed order the boolean side uses.
+fn gather_element(
+    assertions: &[(&crate::union::UnionInstance<'_>, ElementAssertion)],
+    prior: Option<&Accumulator>,
+    t: usize,
+) -> (Vec<MatrixClaim>, Vec<MatrixClaim>) {
+    let mut a = Vec::with_capacity(assertions.len() + 1);
+    let mut b = Vec::with_capacity(assertions.len() + 1);
+    if let Some(p) = prior {
+        a.push(p.per_element[t].0.clone());
+        b.push(p.per_element[t].1.clone());
+    }
+    for (union, assertion) in assertions {
+        let (ca, cb) = assertion.claims(union).swap_remove(t);
+        a.push(ca);
+        b.push(cb);
+    }
+    (a, b)
 }
 
 /// Fold a batch of assertions and discharge them.
@@ -275,6 +373,18 @@ pub fn verify_aggregate<Ch: Challenger>(
     proof: &AggregateProof,
     ch: &mut Ch,
 ) -> Result<Accumulator, AggregateError> {
+    verify_aggregate_classes(registry, assertions, &[], prior, proof, ch)
+}
+
+/// [`verify_aggregate`] over BOTH classes. Reads no matrix of either kind.
+pub fn verify_aggregate_classes<Ch: Challenger>(
+    registry: &Registry,
+    assertions: &[MatrixAssertion],
+    el_assertions: &[(&crate::union::UnionInstance<'_>, ElementAssertion)],
+    prior: Option<&Accumulator>,
+    proof: &AggregateProof,
+    ch: &mut Ch,
+) -> Result<Accumulator, AggregateError> {
     if assertions.is_empty() && prior.is_none() {
         return Err(AggregateError::Empty);
     }
@@ -301,8 +411,29 @@ pub fn verify_aggregate<Ch: Challenger>(
         per_type.push((out_a, out_b));
     }
 
+    // The element group, replayed the same way. Its fold count is the number
+    // of element types, which the accumulator (if any) must already agree on.
+    if let Some(p) = prior {
+        if p.per_element.len() != proof.el_folds.len() {
+            return Err(AggregateError::RegistryMismatch);
+        }
+    }
+    for (union, assertion) in el_assertions {
+        assertion
+            .check_reported(union)
+            .map_err(AggregateError::ReportedElement)?;
+    }
+    let mut per_element = Vec::with_capacity(proof.el_folds.len());
+    for (t, (pa, pb)) in proof.el_folds.iter().enumerate() {
+        let (ca, cb) = gather_element(el_assertions, prior, t);
+        let out_a = matrix_fold::verify_fold(&ca, pa, ch).map_err(AggregateError::Fold)?;
+        let out_b = matrix_fold::verify_fold(&cb, pb, ch).map_err(AggregateError::Fold)?;
+        per_element.push((out_a, out_b));
+    }
+
     Ok(Accumulator {
         registry_digest: registry.digest(),
         per_type,
+        per_element,
     })
 }

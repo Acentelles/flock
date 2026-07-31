@@ -1392,3 +1392,122 @@ fn circuit_proofs_verify_over_the_merged_transport() {
         );
     }
 }
+
+/// A native merge node, end to end: verify two circuit proofs with their
+/// matrix work DEFERRED, fold both children's claims into one accumulator,
+/// discharge once.
+///
+/// This is the operation a recursion merge circuit performs, built natively
+/// first so its Fiat–Shamir order, accumulator shape and discharge API are
+/// settled before any of it is arithmetised. The deferred verify reads no
+/// base matrix — that is what makes it circuit-shaped — and the O(nnz) work
+/// happens only in the fold's prover and the final discharge, neither of
+/// which a circuit would contain.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn a_merge_node_folds_two_circuit_proofs() {
+    use flock_core::aggregate;
+
+    let (nu, k_leaves) = (7usize, 3usize);
+    let (registry, r1cs) = sha2_registry(nu);
+    let circuit_lc = r1cs.csc_lincheck_circuit();
+
+    // Two independent proofs of the SAME circuit — different witnesses, so
+    // their claims land at unrelated points, which is what a merge sees.
+    let mut proofs = Vec::new();
+    let mut trees = Vec::new();
+    for seed in [0x_4D_47_01u64, 0x_4D_47_02] {
+        let mut rng = Rng::new(seed);
+        let tree = build_tree(k_leaves, nu, &mut rng);
+        let union = UnionInstance::new(&registry, vec![tree.n_gates]);
+        let pcs_params = union_pcs_params(&union);
+        let circuit = Circuit::new(
+            &registry,
+            vec![tree.n_gates],
+            tree.public.len(),
+            tree.wires.clone(),
+        )
+        .expect("valid circuit");
+        let mut ch = FsChallenger::new(DOMAIN);
+        let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit_merged(
+            &union,
+            &circuit,
+            &tree.public,
+            &pcs_params,
+            vec![UnionSlotProverInput::new(
+                sha2::generate_witness_batch_major_partial(&tree.compressions, nu),
+                circuit_lc,
+            )],
+            Vec::new(),
+            &mut ch,
+        );
+        proofs.push((proof, commitment, pcs_params, circuit));
+        trees.push(tree);
+    }
+
+    // The merge node's first job: verify each child succinctly, keeping its
+    // matrix work.
+    let mut assertions = Vec::new();
+    for ((proof, commitment, pcs_params, circuit), tree) in proofs.iter().zip(&trees) {
+        let union = UnionInstance::new(&registry, vec![tree.n_gates]);
+        let mut ch = FsChallenger::new(DOMAIN);
+        let (_, work) = verifier::verify_ligerito_union_circuit_merged_deferred(
+            &union,
+            circuit,
+            &tree.public,
+            &[circuit_lc],
+            commitment,
+            proof,
+            pcs_params,
+            &mut ch,
+        )
+        .expect("deferred verify accepts an honest child");
+        assert!(
+            work.element.is_none(),
+            "this circuit is boolean-only, so no element work"
+        );
+        assertions.push(work.boolean.expect("a boolean PIOP ran"));
+    }
+
+    // Its second job: fold both children's claims into ONE accumulator.
+    let mats = [(&r1cs.a_0, &r1cs.b_0)];
+    let circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![circuit_lc];
+    let mut chp = FsChallenger::new(b"merge");
+    let (agg, acc) =
+        aggregate::prove_aggregate(&registry, &mats, &circs, &assertions, None, &mut chp)
+            .expect("the fold proves");
+    let mut chv = FsChallenger::new(b"merge");
+    let acc_v = aggregate::verify_aggregate(&registry, &assertions, None, &agg, &mut chv)
+        .expect("the fold verifies");
+    assert_eq!(acc, acc_v, "prover and verifier accumulators must agree");
+
+    // The accumulator summarises BOTH children's matrix obligations, and
+    // discharging it once retroactively validates both linchecks.
+    assert!(acc.discharge(&mats), "the merged accumulator must be true");
+    assert_eq!(acc.registry_digest, registry.digest());
+
+    // A corrupted child must poison the accumulator — the deferred verify
+    // cannot see it, so this is the only thing standing between a bad child
+    // and an accepted merge.
+    // A corrupted child must poison the accumulator — the deferred verify
+    // cannot see it, so this is the only thing standing between a bad child
+    // and an accepted merge.
+    //
+    // Note WHICH accumulator: the PROVER computes its output from the real
+    // matrix, so its claim is honest no matter what the inputs said. It is
+    // the VERIFIER's accumulator that is conditional on them, and the one a
+    // merge node would carry forward.
+    let mut bad = assertions.clone();
+    bad[1].evals[0].0 += F128::ONE;
+    let mut chp = FsChallenger::new(b"merge");
+    let (bad_agg, _) = aggregate::prove_aggregate(&registry, &mats, &circs, &bad, None, &mut chp)
+        .expect("the prover will happily fold false claims");
+    let mut chv = FsChallenger::new(b"merge");
+    match aggregate::verify_aggregate(&registry, &bad, None, &bad_agg, &mut chv) {
+        Err(_) => {}
+        Ok(a) => assert!(
+            !a.discharge(&mats),
+            "a corrupted child produced a true accumulator"
+        ),
+    }
+}
