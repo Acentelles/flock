@@ -14,6 +14,9 @@ pub mod blake3;
 /// [`ChainLayout`]: chain_common::ChainLayout
 pub mod chain_common;
 pub mod common;
+/// The Fiat–Shamir chain: BLAKE3 over a transcript with a finalize forked at
+/// every squeeze — the FS chain's witness generator, over [`blake3`]'s rows.
+pub mod fs_chain;
 pub mod keccak;
 /// 3-wide Keccak-f[1600] R1CS (3 independent permutations per K_LOG=17 block)
 /// for tighter PCS utilization (~97% vs the single encoder's ~65%).

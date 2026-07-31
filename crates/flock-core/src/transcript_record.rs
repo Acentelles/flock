@@ -292,7 +292,7 @@ impl TranscriptShape {
         // data follows it, so an exact multiple of 1024 has not closed yet.
         let complete_chunks = |o: usize| o.saturating_sub(1) / 1024;
 
-        let mut finalize_at = |o: usize, out_bytes: usize, inv: &mut Blake3Inventory| {
+        let finalize_at = |o: usize, out_bytes: usize, inv: &mut Blake3Inventory| {
             let c = complete_chunks(o);
             inv.finalize_blocks += 1;
             inv.finalize_parents += c.count_ones() as usize;
