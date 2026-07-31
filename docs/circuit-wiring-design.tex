@@ -596,14 +596,22 @@ model, given three things (all now designed or landed):
         win inverts the native HW-SHA decision; the selectable-hash
         machinery is merged.
   \item \textbf{Succinctness closure}: every verifier component polylog
-        in-circuit or delegated. The violations are comb reconstruction
-        ($O(\nnz)$, 84\% of verify --- ``the one change without which
-        recursion is not worth attempting''), the v1 $\sigma$ evaluation
-        ($O(2^\mu)$ --- v2 fixes it), and the \emph{jagged remainder}
-        (\S\ref{sec:open}) --- avoidable initially by recursing the
-        direct path, where that phase does not exist. The wiring
-        layer's own verifier is $O(\mu^2)$ sumcheck replay --- closure-
-        safe; the element comb is $O(\nnz(A_0))$ --- trivially safe.
+        in-circuit or delegated.
+        \textbf{The matrix work --- both classes' combs --- is SOLVED, and
+        by deferral rather than delegation}: the verifier emits its
+        bilinear-form claims instead of evaluating them, and they fold into
+        a constant-size accumulator discharged once at the root. That is a
+        design in its own right; see
+        \code{docs/folding-verifier-design.tex}, which also carries the
+        argument for why arithmetising the comb directly can never close a
+        fixed point ($\nnz$-preserving), the merge composition, and the
+        retraction that this buys nothing natively. Landed, with a native
+        merge node folding two circuit proofs.
+        Remaining violations: the v1 $\sigma$ evaluation
+        ($O(2^\mu)$ --- v2 fixes it) and the \emph{jagged remainder}
+        (\S\ref{sec:open}), which is no longer avoidable by choosing a
+        transport now that circuit proofs ride the merged one. The wiring
+        layer's own verifier is $O(\mu^2)$ sumcheck replay --- closure-safe.
 \end{enumerate}
 
 Bit-level control (query index bits, path direction selects, FS byte
