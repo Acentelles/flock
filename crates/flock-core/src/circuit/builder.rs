@@ -535,6 +535,7 @@ mod tests {
             ty.ty.satisfies(
                 match &built.witnesses[0] {
                     SlotWitness::Element(z) => z,
+                    other => panic!("element slot produced {other:?}"),
                 },
                 nu,
                 n
