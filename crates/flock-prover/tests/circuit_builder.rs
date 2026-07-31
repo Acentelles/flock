@@ -22,6 +22,7 @@
 
 use flock_core::circuit::builder::{CircuitBuilder, GateType, SlotWitness, Wire};
 use flock_core::field::F128;
+use flock_core::hash::HashKind;
 use flock_core::pcs::PcsParams;
 use flock_core::pcs::ligerito::LigeritoProfile;
 use flock_prover::challenger::FsChallenger;
@@ -268,5 +269,244 @@ fn blake3_chunk_chain_through_the_builder() {
         )
         .is_err(),
         "a tampered public output must be rejected"
+    );
+}
+
+/// **MVP-1**: the Fiat–Shamir chain as a circuit — the challenges are DERIVED,
+/// not asserted.
+///
+/// Given a public transcript, the circuit proves that a stated set of
+/// challenges is the correct BLAKE3 Fiat–Shamir derivation of it. That is the
+/// piece with no fallback: everything else a recursive verifier does checks an
+/// arithmetic relation a circuit can state directly, but if the challenge words
+/// were free witness a prover would choose challenges that make a false inner
+/// proof pass, and every other constraint would still be satisfied.
+///
+/// The load-bearing wiring is the **re-absorbed challenge**. A squeeze's output
+/// goes straight back into the transcript, so the `m` word holding challenge
+/// `k` is wired from the `out_lo` of the ROOT row that produced it — a pure
+/// copy, which is what the 16-byte-aligned framing bought. Take that word as a
+/// public constant instead and the circuit asserts the challenges rather than
+/// deriving them, which is the entire content of Fiat–Shamir.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn fs_chain_circuit_derives_the_challenges() {
+    use flock_core::challenger::Challenger as _;
+    use flock_core::transcript_record::{RecordingChallenger, StreamWord};
+    use flock_prover::r1cs_hashes::fs_chain::{CvSource, FsChain};
+
+    const D: &[u8] = b"flock-fs-chain-mvp";
+    let nu = 8usize; // BLAKE3 kappa = 14 ⇒ M = 22; 256 rows of capacity
+
+    // ---- drive a real challenger, capturing values and challenges ----
+    let mut rng = Rng(0xF5C4_0001);
+    let mut f = || F128::new(rng.next_u32() as u64, rng.next_u32() as u64);
+    // A slice long enough to cross the 1 KiB chunk boundary, so the parent
+    // tree and a non-empty chunk stack are actually exercised.
+    let slice: Vec<F128> = (0..70).map(|_| f()).collect();
+    let scalars: [F128; 3] = [f(), f(), f()];
+
+    let mut ch = RecordingChallenger::new(FsChallenger::with_hash(D, HashKind::Blake3));
+    ch.observe_label(b"mvp-phase");
+    ch.observe_f128(scalars[0]);
+    ch.observe_f128_slice(&slice);
+    let c0 = ch.sample_f128();
+    ch.observe_f128(scalars[1]);
+    let c1 = ch.sample_f128();
+    ch.observe_f128(scalars[2]);
+    let c2 = ch.sample_f128();
+    let shape = ch.shape();
+
+    let values: Vec<F128> = std::iter::once(scalars[0])
+        .chain(slice.iter().copied())
+        .chain([scalars[1], scalars[2]])
+        .collect();
+    let challenges = [c0, c1, c2];
+
+    // ---- resolve the stream, and replay it through the chain ----
+    let words = shape.stream_words(D);
+    let resolve = |w: &StreamWord| match *w {
+        StreamWord::Const(c) => c,
+        StreamWord::Value(i) => values[i],
+        StreamWord::Squeezed(i) => challenges[i],
+    };
+    let mut chain = FsChain::new();
+    let mut squeeze_words: Vec<usize> = Vec::new(); // stream index of each challenge
+    let mut pending: Vec<u8> = Vec::new();
+    for (wi, w) in words.iter().enumerate() {
+        if let StreamWord::Squeezed(k) = *w {
+            // Everything before the challenge is absorbed, then it is produced.
+            chain.absorb(&pending);
+            pending.clear();
+            let out = chain.finalize(16);
+            assert_eq!(
+                F128::new(
+                    u64::from_le_bytes(out[..8].try_into().unwrap()),
+                    u64::from_le_bytes(out[8..].try_into().unwrap())
+                ),
+                challenges[k],
+                "chain reproduced a different challenge than the challenger"
+            );
+            squeeze_words.push(wi);
+        }
+        let v = resolve(w);
+        pending.extend_from_slice(&v.lo.to_le_bytes());
+        pending.extend_from_slice(&v.hi.to_le_bytes());
+    }
+    chain.absorb(&pending);
+    let trace = chain.finish();
+
+    // ---- build the circuit ----
+    let mut b = CircuitBuilder::new(nu);
+    let g = b.slot(Blake3Gate { nu });
+    let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+    let iv = [b.public_value(iv_w[0]), b.public_value(iv_w[1])];
+
+    // Stream words become public cells, EXCEPT squeezed ones, which are wired
+    // from the row that produced them.
+    let mut word_wire: Vec<Option<[Wire; 1]>> = vec![None; words.len()];
+    let mut outs: Vec<Vec<Wire>> = Vec::with_capacity(trace.rows.len());
+
+    for (i, row) in trace.rows.iter().enumerate() {
+        let (cv, m, counter, blen, flags) = *row;
+        let link = trace.links[i];
+        let params = b.public_value(pack_params(counter, blen, flags));
+
+        let (cv_in, m_in): ([Wire; 2], [Wire; 4]) = match link.right {
+            // PARENT: cv is the IV; the message is left‖right chaining values.
+            Some(right) => {
+                let l = &outs[match link.cv {
+                    CvSource::Row(r) => r,
+                    CvSource::Iv => unreachable!("a parent's left input is a row"),
+                }];
+                let r = &outs[right];
+                (iv, [l[0], l[1], r[0], r[1]])
+            }
+            // A transcript block: cv chains, the message is stream words.
+            None => {
+                let cv_in = match link.cv {
+                    CvSource::Iv => iv,
+                    CvSource::Row(r) => [outs[r][0], outs[r][1]],
+                };
+                let base = trace.block_offsets[i].expect("a stream block has an offset") / 16;
+                // `block_len` bounds how much of this block is real stream. A
+                // finalize's pending block is usually SHORT — its remaining
+                // words are BLAKE3's zero padding, not the next transcript
+                // bytes, and in particular not the challenge this very finalize
+                // is about to produce.
+                let real_words = (blen as usize) / 16;
+                let mut m_in = [iv[0]; 4];
+                for j in 0..4 {
+                    let wi = base + j;
+                    let w = match words.get(wi).filter(|_| j < real_words) {
+                        // Zero padding past `block_len`.
+                        None => b.public_value(F128::ZERO),
+                        Some(StreamWord::Squeezed(k)) => {
+                            // THE binding wire: challenge k re-absorbed, taken
+                            // from the ROOT row that derived it.
+                            outs[trace.squeezes[*k][0]][0]
+                        }
+                        Some(sw) => match word_wire[wi] {
+                            Some([w]) => w,
+                            None => {
+                                let w = b.public_value(resolve(sw));
+                                word_wire[wi] = Some([w]);
+                                w
+                            }
+                        },
+                    };
+                    m_in[j] = w;
+                }
+                let _ = (cv, m);
+                (cv_in, m_in)
+            }
+        };
+
+        outs.push(b.gate(
+            g,
+            &[
+                cv_in[0], cv_in[1], m_in[0], m_in[1], m_in[2], m_in[3], params,
+            ],
+        ));
+    }
+
+    // The derived challenges are the circuit's public output.
+    for k in 0..challenges.len() {
+        b.publish(outs[trace.squeezes[k][0]][0]);
+    }
+
+    let built = b.finish().expect("builder produces a valid circuit");
+    assert_eq!(built.counts, vec![trace.rows.len()]);
+    let pub_out = &built.public[built.public.len() - challenges.len()..];
+    assert_eq!(
+        pub_out, &challenges,
+        "published challenges must be the real ones"
+    );
+
+    // ---- prove / verify ----
+    let union = UnionInstance::new(&built.registry, built.counts.clone());
+    let pcs_params = PcsParams {
+        m: union.dense_m(),
+        log_inv_rate: 1,
+        log_batch_size: 6,
+        profile: LigeritoProfile::Fast,
+        num_lanes: union.commit_lanes(6),
+        merkle_hash: Default::default(),
+    };
+    let r1cs = blake3::build_block_r1cs(nu);
+    let lc = r1cs.csc_lincheck_circuit();
+    let rows = built.rows::<Blake3Gate>(g);
+
+    let mut c = FsChallenger::new(DOMAIN);
+    let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_circuit(
+        &union,
+        &built.circuit,
+        &built.public,
+        &pcs_params,
+        vec![UnionSlotProverInput::new(
+            blake3::generate_witness_batch_major_partial(rows, nu),
+            lc,
+        )],
+        Vec::new(),
+        &mut c,
+    );
+    let mut c = FsChallenger::new(DOMAIN);
+    verifier::verify_ligerito_jagged_union_circuit(
+        &union,
+        &built.circuit,
+        &built.public,
+        &[lc],
+        &commitment,
+        &proof,
+        &pcs_params,
+        &mut c,
+    )
+    .expect("the FS chain circuit verifies");
+
+    // A wrong claimed challenge breaks the wiring: it is derived, not asserted.
+    let mut bad = built.public.clone();
+    let last = bad.len() - 1;
+    bad[last] += F128::ONE;
+    let mut c = FsChallenger::new(DOMAIN);
+    assert!(
+        verifier::verify_ligerito_jagged_union_circuit(
+            &union,
+            &built.circuit,
+            &bad,
+            &[lc],
+            &commitment,
+            &proof,
+            &pcs_params,
+            &mut c,
+        )
+        .is_err(),
+        "a tampered challenge must be rejected"
+    );
+
+    println!(
+        "FS chain circuit: {} rows, {} public words, {} challenges derived",
+        trace.rows.len(),
+        built.public.len(),
+        challenges.len()
     );
 }

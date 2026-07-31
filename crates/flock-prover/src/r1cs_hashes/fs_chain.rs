@@ -74,6 +74,16 @@ pub struct FsChainTrace {
     /// first is the `ROOT` compression; any others are counter-mode XOF blocks
     /// and are mutually independent.
     pub squeezes: Vec<Vec<usize>>,
+    /// For a row that compresses transcript bytes, the byte offset of its
+    /// block; `None` for `PARENT` and XOF rows, whose message is chaining
+    /// values rather than stream bytes.
+    ///
+    /// This is what lets a circuit wire a row's `m` back to the stream — and in
+    /// particular wire a **re-absorbed challenge** from the row that produced
+    /// it, instead of taking it on trust as a public constant. Without it the
+    /// circuit would assert the challenges rather than derive them, which is
+    /// the entire content of Fiat–Shamir.
+    pub block_offsets: Vec<Option<usize>>,
 }
 
 /// Incremental BLAKE3 with forkable finalization.
@@ -90,6 +100,10 @@ pub struct FsChain {
     /// Completed subtree CVs, with the row that produced each.
     stack: Vec<([u32; 8], usize)>,
     buf: Vec<u8>,
+    block_offsets: Vec<Option<usize>>,
+    /// Byte offset of the pending block's first byte.
+    buf_offset: usize,
+    absorbed: usize,
 }
 
 fn words(block: &[u8]) -> [u32; 16] {
@@ -128,12 +142,16 @@ impl FsChain {
             blocks_in_chunk: 0,
             stack: Vec::new(),
             buf: Vec::with_capacity(BLOCK_BYTES),
+            block_offsets: Vec::new(),
+            buf_offset: 0,
+            absorbed: 0,
         }
     }
 
-    fn emit(&mut self, c: Compression, link: Link) -> usize {
+    fn emit(&mut self, c: Compression, link: Link, offset: Option<usize>) -> usize {
         self.rows.push(c);
         self.links.push(link);
+        self.block_offsets.push(offset);
         self.rows.len() - 1
     }
 
@@ -146,6 +164,7 @@ impl FsChain {
                 self.compress_pending(false);
             }
             self.buf.push(b);
+            self.absorbed += 1;
         }
     }
 
@@ -168,8 +187,10 @@ impl FsChain {
         let row = self.emit(
             (cv, m, self.chunk_counter, self.buf.len() as u32, flags),
             link,
+            Some(self.buf_offset),
         );
         self.buf.clear();
+        self.buf_offset = self.absorbed;
 
         let next_cv: [u32; 8] = out[..8].try_into().unwrap();
         if flags & CHUNK_END != 0 {
@@ -197,7 +218,7 @@ impl FsChain {
                 cv: CvSource::Row(left_row),
                 right: Some(row),
             };
-            row = self.emit((IV, m, 0, BLOCK_BYTES as u32, PARENT), link);
+            row = self.emit((IV, m, 0, BLOCK_BYTES as u32, PARENT), link, None);
             cv = out[..8].try_into().unwrap();
             total >>= 1;
         }
@@ -232,6 +253,7 @@ impl FsChain {
                 cv: self.chunk_cv_row.map_or(CvSource::Iv, CvSource::Row),
                 right: None,
             },
+            Some(self.buf_offset),
         );
         let mut node: [u32; 8] = out[..8].try_into().unwrap();
         let (mut root_m, mut root_cv, mut root_counter, mut root_blen, mut root_flags) =
@@ -252,6 +274,7 @@ impl FsChain {
                     cv: CvSource::Row(left_row),
                     right: Some(row),
                 },
+                None,
             );
             node = out[..8].try_into().unwrap();
             (root_m, root_cv, root_counter, root_blen, root_flags) =
@@ -274,6 +297,7 @@ impl FsChain {
                     cv: CvSource::Iv,
                     right: None,
                 },
+                None,
             );
             ids.push(r);
             for w in o.iter() {
@@ -291,6 +315,7 @@ impl FsChain {
             rows: self.rows,
             links: self.links,
             squeezes: self.squeezes,
+            block_offsets: self.block_offsets,
         }
     }
 }
