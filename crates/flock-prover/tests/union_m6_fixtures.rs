@@ -24,7 +24,10 @@
 //! change (a protocol change, not an M6-style optimization), run with
 //! `M6_FIXTURES_PRINT=1 ... --nocapture` and update the constants.
 //!
-//! Re-pin history: integer-lane union commit (the shipped config); BLAKE3
+//! Re-pin history: integer-lane union commit (the shipped config); the
+//! lincheck's `matrix_evals` report (the deferred/accumulated matrix work —
+//! this moves the single-table anchors too, since even an empty vector
+//! serializes); BLAKE3
 //! I/O-region word alignment (M_BASE 513 → 512, out_hi/params words
 //! aligned, const pin moved to the end — the circuit/wiring layer's
 //! prerequisite). The SHA-256 anchor digest survived the latter unchanged,
@@ -121,22 +124,22 @@ fn m6_mixed_union_proof_bytes_pinned() {
         (
             "mixed-nu10-1024-1024",
             [1024, 1024],
-            "59b47c7b7010f8cb11a23cded29c8d7fabadb882a0b8eeaa681fd27b87d0d574",
+            "3375527896c6f364dbf986a4dda6389f08bfc4a244d20b17c50ab62e67476b42",
         ),
         (
             "mixed-nu10-50-37",
             [50, 37],
-            "fa2dbfb4e458028a3b72f1468aababc613ddaa5713821f3755408b1fb34b6e91",
+            "d08231e2c17732c775d41493bf0fb1215f6dee67dff5d2f29af5dc517b56b315",
         ),
         (
             "mixed-nu10-8-8",
             [8, 8],
-            "d2ef6a3708f0efa26f1be9c530cf2a5bce49773d72a63f3a50261c224314443e",
+            "57340829db5e8d4cf8eeb0e7d425a9566079aa45e31b6f5dfeec8799cfa3ca87",
         ),
         (
             "mixed-nu10-0-64",
             [0, 64],
-            "41196de9b7e2b0651cdc69761357c68914213e8913254286316de4740bff41e6",
+            "ac9f2de9efc357498a780616d3a9d89766c7549fb61ecae123a22866bf323dca",
         ),
     ];
 
@@ -200,7 +203,7 @@ fn m6_mixed_union_proof_bytes_pinned() {
 fn m6_single_type_anchor_proof_bytes_pinned() {
     // BLAKE3, 256 blocks (m = 22).
     {
-        const EXPECTED: &str = "70ddf94f00ff6979bed209a7d8f83f9365d2ed7c1a71b24d2b444ce1afed5bc8";
+        const EXPECTED: &str = "3fc71fcc859e41939347b350f4bee3c6c4f5634a14a88b4a9837837b94f2fc4e";
         let n_blocks = 256usize;
         let setup = blake3::Blake3Setup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_B3B3);
@@ -228,7 +231,7 @@ fn m6_single_type_anchor_proof_bytes_pinned() {
 
     // SHA-256, 128 blocks (m = 22).
     {
-        const EXPECTED: &str = "59ee6e30868277816735b9fe048deefc1cde752c84f7823a52d2031a6261c175";
+        const EXPECTED: &str = "62c5dd92f540dcd900134cfb2c369f373ae9ef4b889be9e3139ea775ba6644b6";
         let n_blocks = 128usize;
         let setup = sha2::Sha256HybridSetup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_5252);

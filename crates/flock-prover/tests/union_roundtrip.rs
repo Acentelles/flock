@@ -105,23 +105,44 @@ fn blake3_union_matches_jagged_byte_identical() {
         &mut ch_p,
     );
 
-    // ---- THE differential: the ENTIRE proofs are byte-identical. The
-    // lincheck sub-proof is asserted first on its own — it is the piece M2
-    // replaced with the union-column lincheck, whose single-slot
-    // degeneration must be byte-for-byte today's lincheck.
+    // ---- THE differential: the proofs are byte-identical EXCEPT for the
+    // lincheck's `matrix_evals`, which the union path reports so its matrix
+    // work can be accumulated and the direct path (which does not
+    // accumulate) leaves empty. The lincheck sub-proof is asserted first on
+    // its own — it is the piece M2 replaced with the union-column lincheck,
+    // whose single-slot degeneration must be byte-for-byte today's
+    // lincheck, sumcheck content included.
     assert_eq!(
         comm_jagged.root, comm_union.root,
         "commitment root diverged"
     );
     assert_eq!(claim_jagged, claim_union, "accepted claims diverged");
     assert_eq!(
-        bincode::serialize(&proof_jagged.lincheck).unwrap(),
-        bincode::serialize(&proof_union.lincheck).unwrap(),
-        "union-column lincheck must be byte-identical to today's lincheck on one slot"
+        bincode::serialize(&(
+            &proof_jagged.lincheck.rounds,
+            &proof_jagged.lincheck.z_partial
+        ))
+        .unwrap(),
+        bincode::serialize(&(
+            &proof_union.lincheck.rounds,
+            &proof_union.lincheck.z_partial
+        ))
+        .unwrap(),
+        "union-column lincheck sumcheck must be byte-identical to today's on one slot"
     );
+    assert!(
+        proof_jagged.lincheck.matrix_evals.is_empty()
+            && proof_union.lincheck.matrix_evals.len() == 1,
+        "only the union path reports matrix evals (one boolean type here)"
+    );
+    let strip = |p: &flock_core::proof::R1csProofJaggedLigerito| {
+        let mut p = p.clone();
+        p.lincheck.matrix_evals.clear();
+        bincode::serialize(&p).unwrap()
+    };
     assert_eq!(
-        bincode::serialize(&proof_jagged).unwrap(),
-        bincode::serialize(&proof_union).unwrap(),
+        strip(&proof_jagged),
+        strip(&proof_union),
         "union proof must be byte-identical to the jagged path at full utilization"
     );
 
@@ -204,13 +225,31 @@ fn sha256_union_matches_jagged_byte_identical() {
     );
     assert_eq!(claim_jagged, claim_union, "accepted claims diverged");
     assert_eq!(
-        bincode::serialize(&proof_jagged.lincheck).unwrap(),
-        bincode::serialize(&proof_union.lincheck).unwrap(),
-        "union-column lincheck must be byte-identical to today's lincheck on one slot"
+        bincode::serialize(&(
+            &proof_jagged.lincheck.rounds,
+            &proof_jagged.lincheck.z_partial
+        ))
+        .unwrap(),
+        bincode::serialize(&(
+            &proof_union.lincheck.rounds,
+            &proof_union.lincheck.z_partial
+        ))
+        .unwrap(),
+        "union-column lincheck sumcheck must be byte-identical to today's on one slot"
     );
+    assert!(
+        proof_jagged.lincheck.matrix_evals.is_empty()
+            && proof_union.lincheck.matrix_evals.len() == 1,
+        "only the union path reports matrix evals (one boolean type here)"
+    );
+    let strip = |p: &flock_core::proof::R1csProofJaggedLigerito| {
+        let mut p = p.clone();
+        p.lincheck.matrix_evals.clear();
+        bincode::serialize(&p).unwrap()
+    };
     assert_eq!(
-        bincode::serialize(&proof_jagged).unwrap(),
-        bincode::serialize(&proof_union).unwrap(),
+        strip(&proof_jagged),
+        strip(&proof_union),
         "union proof must be byte-identical to the jagged path at full utilization"
     );
 

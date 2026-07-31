@@ -185,6 +185,28 @@ pub trait LincheckCircuit: Sync {
     /// `c ∈ [0, n_cols())`. `eq_inner.len() == n_cols()`.
     fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128>;
 
+    /// The same two column marginals, kept APART: `((eq^T·A_0), (eq^T·B_0))`.
+    ///
+    /// Accumulation needs them separate. The lincheck's target only ever
+    /// carries their α-combination, and α is per-proof, so a claim about
+    /// `α·A_0 + B_0` would be a claim about a different polynomial in every
+    /// proof and could never be folded with its neighbours; claims about
+    /// `A_0` and `B_0` individually are about registry-static matrices and
+    /// fold forever. See [`crate::matrix_fold`].
+    ///
+    /// The default costs two folds. It touches the same nonzeros as one, so
+    /// an implementation that emits both vectors in a single pass is free to
+    /// override — the arithmetic is identical, only the accumulation differs.
+    fn fold_split(&self, eq_inner: &[F128]) -> (Vec<F128>, Vec<F128>) {
+        let b = self.fold_alpha_batched(F128::ZERO, eq_inner);
+        let mut a = self.fold_alpha_batched(F128::ONE, eq_inner);
+        // char 2: fold(1) = A + B, so A = fold(1) + B.
+        for (x, y) in a.iter_mut().zip(&b) {
+            *x += *y;
+        }
+        (a, b)
+    }
+
     /// Column index of a constant-one wire to pin, or `None` if the circuit has
     /// no such wire. When `Some(col)`, lincheck folds one extra `β`-term into the
     /// comb so the sumcheck also proves that the committed constant column is the
@@ -392,6 +414,20 @@ pub struct LincheckProof {
     /// sumcheck-bound `r_rest` dims. Folded against φ8 Lagrange weights at a
     /// fresh `z_skip` to yield the output claim's value.
     pub z_partial: Vec<F128>,
+    /// Per boolean type in slot order, the UNSCALED bilinear forms
+    /// `(⟨W_row_t ⊗ W_col_t, A_0⟩, ⟨…, B_0⟩)` — the matrix work, split so it
+    /// can be accumulated.
+    ///
+    /// The verifier cannot derive these: its final check is one equation in
+    /// `2T` unknowns. It checks that equation and then hands the values out
+    /// as per-matrix claims ([`crate::matrix_fold::MatrixClaim`]) instead of
+    /// evaluating the matrices itself. A prover who reports them
+    /// inconsistently fails the equation; one who reports them consistently
+    /// but wrongly poisons the accumulator, which the root discharge
+    /// catches.
+    ///
+    /// Empty on the single-table path, which does not accumulate.
+    pub matrix_evals: Vec<(F128, F128)>,
 }
 
 /// Lincheck output: one MLE evaluation claim on `z`, at the quirky inner
@@ -1481,7 +1517,14 @@ fn column_sumcheck_prove<Ch: Challenger>(
     let mut r_inner_rest = r_rounds;
     r_inner_rest.reverse();
 
-    let proof = LincheckProof { rounds, z_partial };
+    // The shared sumcheck core knows nothing of matrices; the union prover
+    // fills `matrix_evals` in afterwards, once `r_inner_rest` fixes the
+    // column weight. The single-table path leaves it empty.
+    let proof = LincheckProof {
+        rounds,
+        z_partial,
+        matrix_evals: Vec::new(),
+    };
     let claim = LincheckClaim {
         r_inner_skip,
         r_inner_rest,

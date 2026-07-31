@@ -258,11 +258,21 @@ fn single_type_union_lincheck_is_byte_identical() {
         &mut ch2,
     );
 
+    // The SUMCHECK is byte-identical — that is what "T = 1 degenerates to the
+    // single-table lincheck" means. The union path additionally reports the
+    // per-matrix bilinear values for accumulation; the single-table path does
+    // not accumulate and leaves them empty, so they are compared separately
+    // (below) rather than papered over.
     assert_eq!(
-        bincode::serialize(&proof1).unwrap(),
-        bincode::serialize(&proof2).unwrap(),
-        "union lincheck proof must be byte-identical to the single-table one"
+        bincode::serialize(&(&proof1.rounds, &proof1.z_partial)).unwrap(),
+        bincode::serialize(&(&proof2.rounds, &proof2.z_partial)).unwrap(),
+        "union lincheck sumcheck must be byte-identical to the single-table one"
     );
+    assert!(
+        proof1.matrix_evals.is_empty(),
+        "the single-table path does not accumulate"
+    );
+    assert_eq!(proof2.matrix_evals.len(), 1, "one boolean type, one report");
     assert_eq!(claim1, claim2, "claims diverged");
     assert_eq!(zvec1, zvec2, "captured pre-sumcheck folds diverged");
     assert_eq!(
@@ -730,4 +740,113 @@ fn matrix_assertion_decomposes_into_foldable_claims() {
         acc.check_direct(&slot.a0),
         "the accumulated claim must discharge against the real base matrix"
     );
+}
+
+/// The accumulated path agrees with the direct one, on a TWO-type registry
+/// where the slot prefix weights are not 1.
+///
+/// `check` reads the matrices (`O(Σ_t nnz_t)`); `check_reported` reads only
+/// the prover's reported per-matrix values and the verifier's own scalars.
+/// They must accept the same proofs — and the reported values must be the
+/// honest bilinear forms, which is what `claims()` hands to the accumulator.
+/// Corrupting a reported value has to be caught by one side or the other:
+/// the equation if it is inconsistent, the claim's own discharge if it is
+/// consistent-but-wrong.
+#[test]
+fn reported_matrix_evals_agree_with_reading_the_matrices() {
+    use flock_core::matrix_fold;
+
+    let nu = 4usize;
+    let slot_a = build_slot(9, 300, nu, 11, Some(0), 0x2A_2A_01);
+    let slot_b = build_slot(8, 120, nu, 13, None, 0x2B_2B_02);
+    let registry = Registry::new(vec![table_type(&slot_a), table_type(&slot_b)], nu);
+    let m = registry.m_total();
+    let union = UnionInstance::new(&registry, vec![slot_a.n, slot_b.n]);
+
+    let mut z_addr = vec![false; 1 << m];
+    let mut a_addr = vec![false; 1 << m];
+    let mut b_addr = vec![false; 1 << m];
+    for (slot, layout) in [&slot_a, &slot_b].into_iter().zip(registry.slots()) {
+        place_addr(&mut z_addr, &slot.z_sem, slot.k_log, nu, layout.offset);
+        place_addr(&mut a_addr, &slot.a_sem, slot.k_log, nu, layout.offset);
+        place_addr(&mut b_addr, &slot.b_sem, slot.k_log, nu, layout.offset);
+    }
+    let c_addr: Vec<bool> = a_addr.iter().zip(&b_addr).map(|(x, y)| *x & *y).collect();
+    let (a_p, b_p, c_p) = (pack_bits(&a_addr), pack_bits(&b_addr), pack_bits(&c_addr));
+
+    let stripe_a = pack_z_lincheck(&slot_a.z_sem, nu + slot_a.k_log, slot_a.k_log);
+    let stripe_b = pack_z_lincheck(&slot_b.z_sem, nu + slot_b.k_log, slot_b.k_log);
+    let circ_a = SparseMatrixCircuit::new(&slot_a.a0, &slot_a.b0).with_const_pin(slot_a.pin);
+    let circ_b = SparseMatrixCircuit::new(&slot_b.a0, &slot_b.b0);
+    let mut ch_p = FsChallenger::new(DOMAIN);
+    let (zc_proof, zc_claim) =
+        zerocheck::prove_packed_padded(&a_p, &b_p, &c_p, m, &union.padding_spec(), &mut ch_p);
+    let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
+    let lc_slots = [
+        UnionLincheckSlot { z_lincheck: &stripe_a, circuit: &circ_a },
+        UnionLincheckSlot { z_lincheck: &stripe_b, circuit: &circ_b },
+    ];
+    let (lc_proof, _c, _g) =
+        lincheck::prove_union_capture_z_vec(&union, &lc_slots, &x_ab, &mut ch_p);
+
+    let circuits: Vec<&dyn LincheckCircuit> = vec![&circ_a, &circ_b];
+    let assertion_for = |proof: &lincheck::LincheckProof| {
+        let mut ch = FsChallenger::new(DOMAIN);
+        let zc = zerocheck::verify(m, &zc_proof, &mut ch).expect("zerocheck accepts");
+        let x = union.x_ab_from_mlv(zc.z, &zc.mlv_challenges);
+        lincheck::verify_union_deferred(
+            &union, &circuits, &x, zc.a_eval, zc.b_eval, proof, &mut ch,
+        )
+        .map(|(_, a)| a)
+    };
+
+    // Honest: both routes accept, and every reported value is the honest
+    // bilinear form of a real base matrix.
+    let assertion = assertion_for(&lc_proof).expect("deferred verify accepts");
+    assert!(assertion.check(&union, &circuits).is_ok(), "matrix route accepts");
+    assert!(assertion.check_reported(&registry).is_ok(), "reported route accepts");
+    for ((ca, cb), slot) in assertion
+        .claims(&registry)
+        .into_iter()
+        .zip([&slot_a, &slot_b])
+    {
+        assert!(ca.check_direct(&slot.a0), "reported A eval must be honest");
+        assert!(cb.check_direct(&slot.b0), "reported B eval must be honest");
+    }
+
+    // The claims fold, and the accumulator stays true.
+    let (ca0, _) = assertion.claims(&registry).swap_remove(0);
+    let other = matrix_fold::MatrixClaim::honest(
+        matrix_fold::Weight::eq((0..slot_a.k_log).map(|i| F128::new(9 + i as u64, 4)).collect()),
+        matrix_fold::Weight::eq((0..slot_a.k_log).map(|i| F128::new(5 + i as u64, 6)).collect()),
+        &slot_a.a0,
+    );
+    let pair = [ca0, other];
+    let mut ch = FsChallenger::new(b"fold");
+    let (fp, _) = matrix_fold::prove_fold(&slot_a.a0, &pair, &mut ch);
+    let mut chv = FsChallenger::new(b"fold");
+    let acc = matrix_fold::verify_fold(&pair, &fp, &mut chv).expect("fold verifies");
+    assert!(acc.check_direct(&slot_a.a0), "accumulator must stay true");
+
+    // Tampered report: caught by the equation, or by the claim's discharge.
+    for idx in 0..2 {
+        for which in 0..2 {
+            let mut bad = lc_proof.clone();
+            if which == 0 {
+                bad.matrix_evals[idx].0 += F128::ONE;
+            } else {
+                bad.matrix_evals[idx].1 += F128::ONE;
+            }
+            let a = assertion_for(&bad).expect("shape is still fine");
+            let equation = a.check_reported(&registry).is_err();
+            let claims = a.claims(&registry);
+            let slot = if idx == 0 { &slot_a } else { &slot_b };
+            let honest =
+                claims[idx].0.check_direct(&slot.a0) && claims[idx].1.check_direct(&slot.b0);
+            assert!(
+                equation || !honest,
+                "a tampered report survived both the equation and the claim (slot {idx}, {which})"
+            );
+        }
+    }
 }

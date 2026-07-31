@@ -61,6 +61,7 @@
 
 use crate::challenger::Challenger;
 use crate::field::F128;
+use crate::matrix_fold::{MatrixClaim, Weight};
 use crate::schedule::Registry;
 use crate::union::UnionInstance;
 use crate::zerocheck::K_SKIP;
@@ -243,6 +244,8 @@ pub fn prove_union_capture_z_vec<Ch: Challenger>(
     } else {
         vec![F128::ZERO; 1usize << col_vars]
     };
+    // Per-type (ξ_A, ξ_B), kept for the matrix-eval report after the sumcheck.
+    let mut split_combs: Vec<(Vec<F128>, Vec<F128>)> = Vec::with_capacity(registry.num_boolean());
     for ((ty, slot), slot_in) in registry
         .boolean_types()
         .iter()
@@ -251,7 +254,15 @@ pub fn prove_union_capture_z_vec<Ch: Challenger>(
     {
         let inner = ty.k_log - k_skip;
         let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest[..inner], k_skip);
-        let comb_t = slot_in.circuit.fold_alpha_batched(alpha, &eq_inner);
+        // Split, so the per-matrix bilinear values can be reported below.
+        // Same nonzeros as the α-batched fold; only the accumulation differs.
+        let (comb_a, comb_b) = slot_in.circuit.fold_split(&eq_inner);
+        let comb_t: Vec<F128> = comb_a
+            .iter()
+            .zip(&comb_b)
+            .map(|(a, b)| alpha * *a + *b)
+            .collect();
+        split_combs.push((comb_a, comb_b));
         if single {
             comb_vec = comb_t; // T = 1: w_1 = 1, offset 0 — today's vector.
         } else {
@@ -336,8 +347,45 @@ pub fn prove_union_capture_z_vec<Ch: Challenger>(
 
     // 4.–9. The existing sumcheck core, over the (longer) union column
     //       domain.
-    let (proof, claim) = column_sumcheck_prove(comb_vec, z_vec, k_skip, trace, challenger);
+    let (mut proof, claim) = column_sumcheck_prove(comb_vec, z_vec, k_skip, trace, challenger);
+
+    // 10. The matrix work, reported rather than folded into the target: for
+    //     each type the UNSCALED pair (⟨W_t, A_0⟩, ⟨W_t, B_0⟩) with the
+    //     column weight W_col_t = z_partial ⊗ eq(rr[..inner_t]) that the
+    //     sumcheck just fixed. The slot's prefix weights and β are verifier
+    //     scalars, so they stay out — what accumulates must be a claim about
+    //     the static matrix alone.
+    proof.matrix_evals = registry
+        .boolean_types()
+        .iter()
+        .zip(&split_combs)
+        .map(|(ty, (comb_a, comb_b))| {
+            let inner = ty.k_log - k_skip;
+            let w_col = col_weight(&proof.z_partial, &claim.r_inner_rest[..inner], k_skip);
+            (
+                inner_product(&w_col, comb_a),
+                inner_product(&w_col, comb_b),
+            )
+        })
+        .collect();
+
     (proof, claim, captured)
+}
+
+/// `z_partial ⊗ eq(rr)` over a type's own `2^{k_skip + rr.len()}` column
+/// domain — the lincheck's column weight, shared by the prover's report and
+/// the verifier's check so the two cannot drift.
+fn col_weight(z_partial: &[F128], rr: &[F128], k_skip: usize) -> Vec<F128> {
+    let n_skip = 1usize << k_skip;
+    debug_assert_eq!(z_partial.len(), n_skip);
+    let eq = build_eq_table(rr);
+    let mut out = Vec::with_capacity(n_skip * eq.len());
+    for &e in &eq {
+        for &zp in z_partial {
+            out.push(e * zp);
+        }
+    }
+    out
 }
 
 /// The `O(nnz)` residue of the lincheck verifier: everything its final
@@ -378,12 +426,95 @@ pub struct MatrixAssertion {
     pub betas: Vec<Option<F128>>,
     /// What the weighted bilinear sum must equal.
     pub target: F128,
+    /// The prover's per-type `(⟨W_t, A_0⟩, ⟨W_t, B_0⟩)`, in slot order —
+    /// unscaled, so each is a claim about a registry-static matrix and
+    /// nothing else. [`Self::check`] verifies they reproduce
+    /// [`Self::target`]; [`Self::claims`] hands them out for accumulation.
+    pub evals: Vec<(F128, F128)>,
 }
 
 impl MatrixAssertion {
+    /// The per-`(type, matrix)` claims this assertion asserts, in slot order
+    /// as `[(A_0 claim, B_0 claim); T]` — ready for
+    /// [`crate::matrix_fold::prove_fold`].
+    ///
+    /// A and B stay separate: the target only ever carries their
+    /// α-combination, and α is per-proof, so a claim about `α·A_0 + B_0`
+    /// would name a different polynomial in every proof. These name the
+    /// static matrices, and fold forever.
+    pub fn claims(&self, registry: &Registry) -> Vec<(MatrixClaim, MatrixClaim)> {
+        let k_skip = K_SKIP;
+        registry
+            .boolean_types()
+            .iter()
+            .zip(&self.evals)
+            .map(|(ty, &(v_a, v_b))| {
+                let inner = ty.k_log - k_skip;
+                let row = Weight::low_eq(
+                    lagrange_weights_naive(k_skip, self.z_skip),
+                    self.x_inner_rest[..inner].to_vec(),
+                );
+                let col = Weight::low_eq(self.z_partial.clone(), self.rr[..inner].to_vec());
+                (
+                    MatrixClaim {
+                        row: row.clone(),
+                        col: col.clone(),
+                        value: v_a,
+                    },
+                    MatrixClaim {
+                        row,
+                        col,
+                        value: v_b,
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// Discharge the assertion: rebuild the per-type combs (`O(Σ_t nnz_t)`,
     /// the only place the base matrices are read) and check the closed-form
     /// Comb-hat collapse against [`Self::target`].
+    pub fn check_reported(&self, registry: &Registry) -> Result<(), VerifyError> {
+        let k_skip = K_SKIP;
+        if self.evals.len() != registry.num_boolean() {
+            return Err(VerifyError::BadVectorLength {
+                which: "matrix_evals",
+                expected: registry.num_boolean(),
+                got: self.evals.len(),
+            });
+        }
+        // target = Σ_t P_t·w_t·(α·⟨W_t,A⟩ + ⟨W_t,B⟩) + Σ_t P_t·β_t·W_col_t[pin]
+        // — the slot prefix weights on both sides (w_t from the row point,
+        // P_t from the bound column point) and β are all verifier scalars.
+        let mut acc = F128::ZERO;
+        for (((ty, slot), &(v_a, v_b)), beta) in registry
+            .boolean_types()
+            .iter()
+            .zip(registry.slots())
+            .zip(&self.evals)
+            .zip(&self.betas)
+        {
+            let inner = ty.k_log - k_skip;
+            let w_t = eq_prefix_weight(&self.x_inner_rest[inner..], slot.prefix);
+            let p_t = eq_prefix_weight(&self.rr[inner..], slot.prefix);
+            acc += p_t * w_t * (self.alpha * v_a + v_b);
+            if let (Some(col), Some(beta)) = (ty.const_pin, beta) {
+                let w_col = col_weight(&self.z_partial, &self.rr[..inner], k_skip);
+                acc += p_t * *beta * w_col[col];
+            }
+        }
+        if acc != self.target {
+            return Err(VerifyError::ConsistencyFailed {
+                which: "matrix-evals",
+            });
+        }
+        Ok(())
+    }
+
+    /// Discharge against the real matrices — the `O(Σ_t nnz_t)` check. Used
+    /// by [`verify_union`], and the differential oracle for the accumulated
+    /// path: this and [`Self::check_reported`] + discharging the
+    /// [`Self::claims`] must accept exactly the same proofs.
     pub fn check(
         &self,
         union: &UnionInstance<'_>,
@@ -597,6 +728,7 @@ pub fn verify_union_deferred<Ch: Challenger>(
         z_partial: proof.z_partial.clone(),
         betas,
         target: running,
+        evals: proof.matrix_evals.clone(),
     };
 
     // 6.–7. Fresh skip challenge after z_partial; claim value via φ8
