@@ -821,10 +821,25 @@ impl MerkleTreeLayout {
                 free(&mut a, &mut b, self.sibling_bit(l, j));
             }
 
-            // t_j = b_l · (prev_j ⊕ sibling_j) — the only AND per bit.
+            // t_j = (1 + b_l) · (prev_j ⊕ sibling_j) — the only AND per bit.
+            //
+            // The complement, not `b_l` itself, so that `b_l` means what the
+            // TREE means by it: `flock_core::merkle` puts the running digest
+            // left at an EVEN node index, i.e. when bit `l` of the position is
+            // 0. With `left = sibling ⊕ t` and `right = prev ⊕ t` that needs
+            // `t = (1+b)·(prev ⊕ sib)`, and then the table's index IS the tree
+            // position rather than its complement.
+            //
+            // That equality is what lets a Fiat–Shamir challenge word be wired
+            // straight into the index (see `index_word_base`): `sample_queries`
+            // masks the challenge to get a position, so the circuit must open
+            // THAT position, not its complement.
+            //
+            // The `1` costs nothing — it is the global constant column, which
+            // every row here already references.
             for j in 0..SLOT_BITS {
                 let r = self.t_bit(l, j);
-                a[r] = vec![self.index_bit(l)];
+                a[r] = vec![gc, self.index_bit(l)];
                 b[r] = vec![self.prev_bit(l, j), self.sibling_bit(l, j)];
             }
 
@@ -1049,10 +1064,10 @@ impl MerkleTreeLayout {
             let sib = input.siblings[l];
             write_digest(&mut z, self.sibling_bit(l, 0), &sib);
             for j in 0..SLOT_BITS {
-                z[self.t_bit(l, j)] = bit && (digest_bit(&prev, j) ^ digest_bit(&sib, j));
+                z[self.t_bit(l, j)] = !bit && (digest_bit(&prev, j) ^ digest_bit(&sib, j));
             }
-            // b_l = 1 puts the running digest on the left.
-            let (left, right) = if bit { (prev, sib) } else { (sib, prev) };
+            // b_l = 0 puts the running digest on the left — the TREE's convention.
+            let (left, right) = if bit { (sib, prev) } else { (prev, sib) };
             let block = (self.spec.node_witness)(&left, &right);
             let dst = self.hash_bit(l, 0);
             z[dst..dst + self.spec.useful_bits].copy_from_slice(&block[..self.spec.useful_bits]);
@@ -1133,18 +1148,19 @@ impl MerkleTreeLayout {
                     digest_bit(&sib, j),
                 );
             }
-            // t_j = b_l · (prev_j ⊕ sibling_j): the AND row's operands are the
-            // index bit and the XOR of the two candidate children.
+            // t_j = (1 + b_l) · (prev_j ⊕ sibling_j): the AND row's operands
+            // are the COMPLEMENTED index bit and the XOR of the two
+            // candidate children. See `extras` for why the complement.
             for j in 0..SLOT_BITS {
                 let xor = digest_bit(&prev, j) ^ digest_bit(&sib, j);
                 let c = self.t_bit(l, j);
-                z[c] = bit && xor;
-                a[c] = bit;
+                z[c] = !bit && xor;
+                a[c] = !bit;
                 b[c] = xor;
             }
 
-            // b_l = 1 puts the running digest on the left.
-            let (left, right) = if bit { (prev, sib) } else { (sib, prev) };
+            // b_l = 0 puts the running digest on the left — the TREE's convention.
+            let (left, right) = if bit { (sib, prev) } else { (prev, sib) };
             wz.fill(0);
             wa.fill(0);
             wb.fill(0);
@@ -1277,9 +1293,9 @@ impl MerkleTreeLayout {
                     let mut mask = [0u32; BM_V];
                     for j in 0..BM_V {
                         let bit = (group[j].index >> l) & 1 == 1;
-                        mask[j] = if bit { !0u32 } else { 0 };
+                        mask[j] = if bit { 0 } else { !0u32 };
                         let sib = group[j].siblings[l];
-                        pairs[j] = if bit { (prev[j], sib) } else { (sib, prev[j]) };
+                        pairs[j] = if bit { (sib, prev[j]) } else { (prev[j], sib) };
                     }
 
                     // The hash block itself, verbatim from the base encoder —
@@ -1496,9 +1512,9 @@ impl MerkleTreeLayout {
             let sib = input.siblings[l];
             write_digest(&mut z, self.sibling_bit(l, 0), &sib);
             for j in 0..SLOT_BITS {
-                z[self.t_bit(l, j)] = bit && (digest_bit(&prev, j) ^ digest_bit(&sib, j));
+                z[self.t_bit(l, j)] = !bit && (digest_bit(&prev, j) ^ digest_bit(&sib, j));
             }
-            let (left, right) = if bit { (prev, sib) } else { (sib, prev) };
+            let (left, right) = if bit { (sib, prev) } else { (prev, sib) };
             let block = (self.spec.node_witness)(&left, &right);
             let dst = self.hash_bit(l, 0);
             z[dst..dst + self.spec.useful_bits].copy_from_slice(&block[..self.spec.useful_bits]);
@@ -1584,11 +1600,11 @@ impl MerkleTreeLayout {
             for j in 0..SLOT_BITS {
                 let xor = digest_bit(&prev, j) ^ digest_bit(&sib, j);
                 let c = self.t_bit(l, j);
-                z[c] = bit && xor;
-                a[c] = bit;
+                z[c] = !bit && xor;
+                a[c] = !bit;
                 b[c] = xor;
             }
-            let (left, right) = if bit { (prev, sib) } else { (sib, prev) };
+            let (left, right) = if bit { (sib, prev) } else { (prev, sib) };
             wz.fill(0);
             wa.fill(0);
             wb.fill(0);
@@ -1753,9 +1769,9 @@ impl MerkleTreeLayout {
                     let mut mask = [0u32; BM_V];
                     for j in 0..BM_V {
                         let bit = (group[j].index >> l) & 1 == 1;
-                        mask[j] = if bit { !0u32 } else { 0 };
+                        mask[j] = if bit { 0 } else { !0u32 };
                         let sib = group[j].siblings[l];
-                        pairs[j] = if bit { (prev[j], sib) } else { (sib, prev[j]) };
+                        pairs[j] = if bit { (sib, prev[j]) } else { (prev[j], sib) };
                     }
 
                     (spec.node_group_ab)(&pairs, wz, wa, wb);
@@ -1828,7 +1844,7 @@ impl MerkleTreeLayout {
         }
         for (l, sib) in input.siblings.iter().enumerate() {
             let bit = (input.index >> l) & 1 == 1;
-            let (left, right) = if bit { (prev, *sib) } else { (*sib, prev) };
+            let (left, right) = if bit { (*sib, prev) } else { (prev, *sib) };
             prev = compress(
                 &self.pinned_in_cv(),
                 &node_msg(&left, &right),
@@ -1861,7 +1877,7 @@ impl MerkleTreeLayout {
         }
         for (l, sib) in input.siblings.iter().enumerate() {
             let bit = (input.index >> l) & 1 == 1;
-            let (left, right) = if bit { (prev, *sib) } else { (*sib, prev) };
+            let (left, right) = if bit { (*sib, prev) } else { (prev, *sib) };
             let block = (self.spec.node_witness)(&left, &right);
             prev = read_digest(&block, self.spec.out_cv_base);
         }
@@ -2306,7 +2322,7 @@ pub fn reference_root(spec: &HashSpec, input: &PathInput) -> [u32; SLOT_WORDS] {
     let mut prev = input.leaf;
     for (l, sib) in input.siblings.iter().enumerate() {
         let bit = (input.index >> l) & 1 == 1;
-        let (left, right) = if bit { (prev, *sib) } else { (*sib, prev) };
+        let (left, right) = if bit { (*sib, prev) } else { (prev, *sib) };
         let block = (spec.node_witness)(&left, &right);
         prev = read_digest(&block, spec.out_cv_base);
     }

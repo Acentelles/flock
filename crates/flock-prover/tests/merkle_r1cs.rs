@@ -782,7 +782,9 @@ fn chunk_root_matches_flock_core_blake3_tree() {
             }
             let input = ChunkPathInput {
                 leaf_data: data[pos * leaf_bytes..(pos + 1) * leaf_bytes].to_vec(),
-                index: !(pos as u128) & ((1u128 << depth) - 1),
+                // The table index IS the tree position now (no
+                // complement) — that is what the polarity flip bought.
+                index: pos as u128,
                 siblings,
             };
             assert_eq!(

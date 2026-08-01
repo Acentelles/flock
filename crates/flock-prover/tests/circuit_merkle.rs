@@ -286,11 +286,14 @@ impl Tree {
     }
 }
 
-/// The table's index bit `l` means "the running digest goes LEFT at level
-/// `l`", while `flock_core::merkle` puts it left when the node index is even.
-/// So the table index is the complement of the tree position.
-fn table_index(pos: usize, depth: usize) -> u128 {
-    !(pos as u128) & ((1u128 << depth) - 1)
+/// The table's index and the tree position are THE SAME NUMBER (`0776f64`
+/// flipped the swap gadget's polarity to make it so). Kept as a named function
+/// because it is the identity that has to hold for a Fiat-Shamir challenge to
+/// be wireable straight into the index: `sample_queries` masks the challenge
+/// to a position, so the circuit must open that position and not its
+/// complement.
+fn table_index(pos: usize, _depth: usize) -> u128 {
+    pos as u128
 }
 
 /// **The gate, standalone**: the builder's rows reproduce the openings, the
@@ -379,12 +382,20 @@ fn merkle_index_wired_to_a_challenge() {
     hash_in.push(b.public_value(pack_params(0, 64, CHUNK_START | CHUNK_END)));
     let out = b.gate(hash, &hash_in);
 
-    // What the challenge word selects, natively — the table reads its low
-    // `depth` bits as the index, whose complement is the tree position.
+    // What the challenge word selects, natively. This is `sample_queries`'
+    // own arithmetic — `challenge.lo & (block_len - 1)` — and the circuit must
+    // open exactly this position. It does, with no masking gadget and no
+    // complement: the relation reads the index word's low `depth` columns, and
+    // the gadget's polarity makes the index the tree position.
     let compressed = blake3::blake3_compress(&IV, &m, 0, 64, CHUNK_START | CHUNK_END);
     let challenge = pack8(&compressed[0..8].try_into().unwrap())[0];
     let index = (challenge.lo as u128) | ((challenge.hi as u128) << 64);
-    let pos = (!index & ((1u128 << depth) - 1)) as usize;
+    let pos = (index & ((1u128 << depth) - 1)) as usize;
+    assert_eq!(
+        pos,
+        (challenge.lo as usize) & ((1 << depth) - 1),
+        "sample_queries' mask"
+    );
     assert_ne!(index >> depth, 0, "the challenge must have high bits set");
 
     // The opening: leaf data public, index NOT public — it comes off the wire.
