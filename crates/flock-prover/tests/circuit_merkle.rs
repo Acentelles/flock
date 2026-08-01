@@ -1701,6 +1701,48 @@ fn mvp4_slice(depth: usize, n_queries: usize, nu: usize) {
 // MVP-5: every level's query phase
 // ---------------------------------------------------------------------------
 
+/// Median wall-clock of `reps` timed runs after one discarded warm-up, plus
+/// the spread.
+///
+/// Single-shot timings on these tests vary by 15-20% — more than several of
+/// the effects being compared — so a lone number is not evidence. Every
+/// figure quoted from `mvp5`/`mvp6` should come from here.
+#[derive(Clone, Copy)]
+struct Timing {
+    median: f64,
+    min: f64,
+    max: f64,
+}
+
+impl std::fmt::Display for Timing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:.0} [{:.0}-{:.0}]", self.median, self.min, self.max)
+    }
+}
+
+/// Timed repetitions per phase. Five is enough to see the spread without
+/// making an `#[ignore]`d test tedious.
+const REPS: usize = 5;
+
+fn timed<T>(reps: usize, mut f: impl FnMut() -> T) -> (T, Timing) {
+    let mut out = f(); // warm-up, discarded
+    let mut ms = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let t = std::time::Instant::now();
+        out = f();
+        ms.push(t.elapsed().as_secs_f64() * 1e3);
+    }
+    ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    (
+        out,
+        Timing {
+            median: ms[ms.len() / 2],
+            min: ms[0],
+            max: ms[ms.len() - 1],
+        },
+    )
+}
+
 /// One Ligerito level's commitment shape.
 #[derive(Clone, Copy)]
 struct Level {
@@ -1971,10 +2013,7 @@ fn mvp5_all_levels_query_phase() {
     }
     let hint_refs: Vec<&dyn std::any::Any> =
         hints.iter().map(|h| h as &dyn std::any::Any).collect();
-    std::hint::black_box(shape.run(&vals, &hint_refs)); // warm
-    let t = Instant::now();
-    let built = shape.run(&vals, &hint_refs);
-    let online_ms = t.elapsed().as_secs_f64() * 1e3;
+    let (built, online_t) = timed(REPS, || shape.run(&vals, &hint_refs));
 
     // Every level opened the queries its own squeeze determined, and every
     // opening folds to that level's root.
@@ -2033,26 +2072,19 @@ fn mvp5_all_levels_query_phase() {
     let b3 = blake3::build_block_r1cs(nu);
     let b3_lc = b3.csc_lincheck_circuit();
 
-    let t = Instant::now();
-    let mut bool_slots: Vec<(usize, UnionSlotProverInput)> = vec![(
-        shape.registry_slot(hash),
-        UnionSlotProverInput::new(
-            blake3::generate_witness_batch_major_partial(built.rows::<Blake3Gate>(hash), nu),
-            b3_lc,
-        ),
-    )];
-    for (li, _) in levels.iter().enumerate() {
-        bool_slots.push((
-            shape.registry_slot(merkle[li]),
-            UnionSlotProverInput::new(
-                layouts[li].generate_witness_batch_major_partial_chunk(
-                    built.rows::<MerklePathGate>(merkle[li]),
-                    nu,
-                ),
-                &walkers[li],
-            ),
-        ));
-    }
+    // Witnesses once; each prove rep rebuilds its slot inputs from CLONES,
+    // outside the timer, because `UnionSlotProverInput::new` consumes them.
+    let (hash_wit, wit_t) = timed(3, || {
+        blake3::generate_witness_batch_major_partial(built.rows::<Blake3Gate>(hash), nu)
+    });
+    let merkle_wit: Vec<_> = (0..levels.len())
+        .map(|li| {
+            layouts[li].generate_witness_batch_major_partial_chunk(
+                built.rows::<MerklePathGate>(merkle[li]),
+                nu,
+            )
+        })
+        .collect();
     let els: Vec<Vec<F128>> = leaf_slot
         .iter()
         .map(|(_, s)| match &built.witnesses[shape.registry_slot(*s)] {
@@ -2060,9 +2092,7 @@ fn mvp5_all_levels_query_phase() {
             other => panic!("leaf-eval slot produced {other:?}"),
         })
         .collect();
-    let wit_ms = t.elapsed().as_secs_f64() * 1e3;
 
-    bool_slots.sort_by_key(|(i, _)| *i);
     let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> =
         vec![(shape.registry_slot(hash), b3_lc)];
     for (li, _) in levels.iter().enumerate() {
@@ -2072,45 +2102,57 @@ fn mvp5_all_levels_query_phase() {
     let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
         lcs_ord.into_iter().map(|(_, c)| c).collect();
 
-    // Element slots go in registry order too.
-    let mut el_ord: Vec<(usize, Vec<F128>)> = leaf_slot
-        .iter()
-        .zip(els)
-        .map(|((_, s), z)| (shape.registry_slot(*s), z))
-        .collect();
-    el_ord.sort_by_key(|(i, _)| *i);
-    let el_inputs: Vec<UnionElementSlotInput> = el_ord
-        .into_iter()
-        .map(|(_, z)| UnionElementSlotInput::new(move |dst: &mut [F128]| dst.copy_from_slice(&z)))
-        .collect();
+    let ((proof, commitment), prove_t) = timed(REPS, || {
+        let mut bool_slots: Vec<(usize, UnionSlotProverInput)> = vec![(
+            shape.registry_slot(hash),
+            UnionSlotProverInput::new(hash_wit.clone(), b3_lc),
+        )];
+        for (li, _) in levels.iter().enumerate() {
+            bool_slots.push((
+                shape.registry_slot(merkle[li]),
+                UnionSlotProverInput::new(merkle_wit[li].clone(), &walkers[li]),
+            ));
+        }
+        bool_slots.sort_by_key(|(i, _)| *i);
+        let mut el_ord: Vec<(usize, Vec<F128>)> = leaf_slot
+            .iter()
+            .zip(els.clone())
+            .map(|((_, s), z)| (shape.registry_slot(*s), z))
+            .collect();
+        el_ord.sort_by_key(|(i, _)| *i);
+        let el_inputs: Vec<UnionElementSlotInput> = el_ord
+            .into_iter()
+            .map(|(_, z)| {
+                UnionElementSlotInput::new(move |dst: &mut [F128]| dst.copy_from_slice(&z))
+            })
+            .collect();
+        let mut c = FsChallenger::new(DOMAIN);
+        let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_circuit(
+            &union,
+            &shape.circuit,
+            &built.public,
+            &pcs_params,
+            bool_slots.into_iter().map(|(_, s)| s).collect(),
+            el_inputs,
+            &mut c,
+        );
+        (proof, commitment)
+    });
 
-    let t = Instant::now();
-    let mut c = FsChallenger::new(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_circuit(
-        &union,
-        &shape.circuit,
-        &built.public,
-        &pcs_params,
-        bool_slots.into_iter().map(|(_, s)| s).collect(),
-        el_inputs,
-        &mut c,
-    );
-    let prove_ms = t.elapsed().as_secs_f64() * 1e3;
-
-    let t = Instant::now();
-    let mut c = FsChallenger::new(DOMAIN);
-    verifier::verify_ligerito_jagged_union_circuit(
-        &union,
-        &shape.circuit,
-        &built.public,
-        &lcs,
-        &commitment,
-        &proof,
-        &pcs_params,
-        &mut c,
-    )
-    .expect("the full query phase verifies");
-    let verify_ms = t.elapsed().as_secs_f64() * 1e3;
+    let (_, verify_t) = timed(REPS, || {
+        let mut c = FsChallenger::new(DOMAIN);
+        verifier::verify_ligerito_jagged_union_circuit(
+            &union,
+            &shape.circuit,
+            &built.public,
+            &lcs,
+            &commitment,
+            &proof,
+            &pcs_params,
+            &mut c,
+        )
+        .expect("the full query phase verifies")
+    });
 
     // ---- what it cost ----
     let mut nnz_total = 0usize;
@@ -2147,14 +2189,14 @@ fn mvp5_all_levels_query_phase() {
     report += &format!(
         "  stored lincheck nnz total {nnz_total} | dense {} words | dense_m {} | \
          M_bool {} | M_total {}\n\n  \
-         PER PROOF     {:6.0} ms = online {online_ms:.0} + witgen {wit_ms:.0} + prove {prove_ms:.0}\n  \
-         verifier side {verify_ms:6.1} ms | proof {:.1} KiB | {threads} threads\n  \
+         medians of {REPS} runs, spread in brackets\n  \
+         PER PROOF     online {online_t} + witgen {wit_t} + prove {prove_t} ms\n  \
+         verifier side {verify_t} ms | proof {:.1} KiB | {threads} threads\n  \
          SETUP         {setup_ms:6.0} ms\n",
         union.dense_words(),
         union.dense_m(),
         union.m_bool(),
         union.m_total(),
-        online_ms + wit_ms + prove_ms,
         bincode::serialize(&proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
     );
     println!("{report}");
@@ -2676,10 +2718,7 @@ fn mvp6_all_levels_collapsed() {
     // ---- online ----
     let hint_refs: Vec<&dyn std::any::Any> =
         hints.iter().map(|h| h as &dyn std::any::Any).collect();
-    std::hint::black_box(shape.run(&vals, &hint_refs));
-    let t = Instant::now();
-    let built = shape.run(&vals, &hint_refs);
-    let online_ms = t.elapsed().as_secs_f64() * 1e3;
+    let (built, online_t) = timed(REPS, || shape.run(&vals, &hint_refs));
 
     // Every opening folds to its level's root, and the accumulator is
     // enforced_sum — the same two claims MVP-5 makes, now over wired rows.
@@ -2726,34 +2765,14 @@ fn mvp6_all_levels_collapsed() {
     let spread_r1cs = spread_ty.build_block_r1cs(nu);
     let spread_lc = spread_r1cs.csc_lincheck_circuit();
 
-    let t = Instant::now();
-    let mut bool_slots: Vec<(usize, UnionSlotProverInput)> = vec![
-        (
-            shape.registry_slot(slots.b3),
-            UnionSlotProverInput::new(
-                blake3::generate_witness_batch_major_partial(
-                    built.rows::<Blake3Gate>(slots.b3),
-                    nu,
-                ),
-                b3_lc,
-            ),
-        ),
-        (
-            shape.registry_slot(slots.swap),
-            UnionSlotProverInput::new(
-                SwapTable::generate_witness_batch_major(built.rows::<SwapGate>(slots.swap), nu),
-                swap_lc,
-            ),
-        ),
-        (
-            shape.registry_slot(slots.spread),
-            UnionSlotProverInput::new(
-                spread_ty
-                    .generate_witness_batch_major(built.rows::<BitSpreadGate>(slots.spread), nu),
-                spread_lc,
-            ),
-        ),
-    ];
+    // Witnesses once; each prove rep rebuilds its inputs from CLONES outside
+    // the timer (`UnionSlotProverInput::new` consumes them).
+    let (b3_wit, wit_t) = timed(3, || {
+        blake3::generate_witness_batch_major_partial(built.rows::<Blake3Gate>(slots.b3), nu)
+    });
+    let swap_wit = SwapTable::generate_witness_batch_major(built.rows::<SwapGate>(slots.swap), nu);
+    let spread_wit =
+        spread_ty.generate_witness_batch_major(built.rows::<BitSpreadGate>(slots.spread), nu);
     let els: Vec<Vec<F128>> = leaf_slot
         .iter()
         .map(|(_, s)| match &built.witnesses[shape.registry_slot(*s)] {
@@ -2761,9 +2780,7 @@ fn mvp6_all_levels_collapsed() {
             other => panic!("leaf-eval slot produced {other:?}"),
         })
         .collect();
-    let wit_ms = t.elapsed().as_secs_f64() * 1e3;
 
-    bool_slots.sort_by_key(|(i, _)| *i);
     let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
         (shape.registry_slot(slots.b3), b3_lc),
         (shape.registry_slot(slots.swap), swap_lc),
@@ -2773,44 +2790,61 @@ fn mvp6_all_levels_collapsed() {
     let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
         lcs_ord.into_iter().map(|(_, c)| c).collect();
 
-    let mut el_ord: Vec<(usize, Vec<F128>)> = leaf_slot
-        .iter()
-        .zip(els)
-        .map(|((_, s), z)| (shape.registry_slot(*s), z))
-        .collect();
-    el_ord.sort_by_key(|(i, _)| *i);
-    let el_inputs: Vec<UnionElementSlotInput> = el_ord
-        .into_iter()
-        .map(|(_, z)| UnionElementSlotInput::new(move |dst: &mut [F128]| dst.copy_from_slice(&z)))
-        .collect();
+    let ((proof, commitment), prove_t) = timed(REPS, || {
+        let mut bool_slots: Vec<(usize, UnionSlotProverInput)> = vec![
+            (
+                shape.registry_slot(slots.b3),
+                UnionSlotProverInput::new(b3_wit.clone(), b3_lc),
+            ),
+            (
+                shape.registry_slot(slots.swap),
+                UnionSlotProverInput::new(swap_wit.clone(), swap_lc),
+            ),
+            (
+                shape.registry_slot(slots.spread),
+                UnionSlotProverInput::new(spread_wit.clone(), spread_lc),
+            ),
+        ];
+        bool_slots.sort_by_key(|(i, _)| *i);
+        let mut el_ord: Vec<(usize, Vec<F128>)> = leaf_slot
+            .iter()
+            .zip(els.clone())
+            .map(|((_, s), z)| (shape.registry_slot(*s), z))
+            .collect();
+        el_ord.sort_by_key(|(i, _)| *i);
+        let el_inputs: Vec<UnionElementSlotInput> = el_ord
+            .into_iter()
+            .map(|(_, z)| {
+                UnionElementSlotInput::new(move |dst: &mut [F128]| dst.copy_from_slice(&z))
+            })
+            .collect();
+        let mut c = FsChallenger::new(DOMAIN);
+        let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_circuit(
+            &union,
+            &shape.circuit,
+            &built.public,
+            &pcs_params,
+            bool_slots.into_iter().map(|(_, s)| s).collect(),
+            el_inputs,
+            &mut c,
+        );
+        (proof, commitment)
+    });
 
-    let t = Instant::now();
-    let mut c = FsChallenger::new(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_circuit(
-        &union,
-        &shape.circuit,
-        &built.public,
-        &pcs_params,
-        bool_slots.into_iter().map(|(_, s)| s).collect(),
-        el_inputs,
-        &mut c,
-    );
-    let prove_ms = t.elapsed().as_secs_f64() * 1e3;
-
-    let t = Instant::now();
-    let mut c = FsChallenger::new(DOMAIN);
-    verifier::verify_ligerito_jagged_union_circuit(
-        &union,
-        &shape.circuit,
-        &built.public,
-        &lcs,
-        &commitment,
-        &proof,
-        &pcs_params,
-        &mut c,
-    )
-    .expect("the collapsed query phase verifies");
-    let verify_ms = t.elapsed().as_secs_f64() * 1e3;
+    let (_, verify_t) = timed(REPS, || {
+        let mut c = FsChallenger::new(DOMAIN);
+        verifier::verify_ligerito_jagged_union_circuit(
+            &union,
+            &shape.circuit,
+            &built.public,
+            &lcs,
+            &commitment,
+            &proof,
+            &pcs_params,
+            &mut c,
+        )
+        .expect("the collapsed query phase verifies")
+    });
 
     let nnz = |r: &flock_core::r1cs::BlockR1cs| {
         r.a_0.rows.iter().map(|x| x.len()).sum::<usize>()
@@ -2821,9 +2855,9 @@ fn mvp6_all_levels_collapsed() {
          blake3 {} rows | swap {} | spread {} | leaf-eval {}+{}\n  \
          lincheck nnz {} (MVP-5: 105145720) | dense {} words | dense_m {} | \
          M_bool {} | mu {}\n\n  \
-         PER PROOF     {:6.0} ms = online {online_ms:.0} + witgen {wit_ms:.0} + \
-         prove {prove_ms:.0}\n  \
-         verifier side {verify_ms:6.1} ms | proof {:.1} KiB | {threads} threads\n  \
+         medians of {REPS} runs, spread in brackets\n  \
+         PER PROOF     online {online_t} + witgen {wit_t} + prove {prove_t} ms\n  \
+         verifier side {verify_t} ms | proof {:.1} KiB | {threads} threads\n  \
          SETUP         {setup_ms:6.0} ms\n",
         shape.counts[shape.registry_slot(slots.b3)],
         shape.counts[shape.registry_slot(slots.swap)],
@@ -2835,7 +2869,6 @@ fn mvp6_all_levels_collapsed() {
         union.dense_m(),
         union.m_bool(),
         shape.circuit.cells().mu(),
-        online_ms + wit_ms + prove_ms,
         bincode::serialize(&proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
     );
 }
