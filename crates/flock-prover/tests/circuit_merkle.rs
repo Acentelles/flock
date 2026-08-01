@@ -511,6 +511,11 @@ fn merkle_index_wired_to_a_challenge() {
 fn l0_shape_circuit_cost() {
     use std::time::Instant;
 
+    // Pin rayon to the physical P-cores, as `merkle_l0_opening` does. Without
+    // it the default pool spreads across efficiency cores and `prove` swings
+    // 53-91 ms run to run, which swamps everything being measured.
+    let threads = flock_core::init_perf_thread_pool().unwrap_or_else(rayon::current_num_threads);
+
     let (depth, leaf_bytes, n_paths) = (13usize, 1024usize, 218usize);
     let nu = 8usize; // 218 rows ⇒ capacity 256
     let mut rng = Rng(0x_10_5A_4E_11);
@@ -565,8 +570,29 @@ fn l0_shape_circuit_cost() {
     let walker = layout.build_walker();
     let rows = built.rows::<MerklePathGate>(g);
 
+    let witgen = || layout.generate_witness_batch_major_partial_chunk(rows, nu);
+    let prove = |witness| {
+        let mut ch = FsChallenger::new(DOMAIN);
+        prover::prove_fast_ligerito_jagged_union_circuit(
+            &union,
+            &built.circuit,
+            &built.public,
+            &pcs_params,
+            vec![UnionSlotProverInput::new(witness, &walker)],
+            Vec::new(),
+            &mut ch,
+        )
+    };
+
+    // WARM-UP. A first prove in a fresh process pays lazy initialization —
+    // twiddle tables, `OnceLock` caches, thread-pool spin-up, cold allocator —
+    // and came out 20-40% high. `merkle_l0_opening` reports a median after
+    // warm-up, so timing a cold single shot against it compares two different
+    // statistics. Discard one round, then measure.
+    std::hint::black_box(prove(witgen()));
+
     let t = Instant::now();
-    let witness = layout.generate_witness_batch_major_partial_chunk(rows, nu);
+    let witness = witgen();
     let wit_ms = t.elapsed().as_secs_f64() * 1e3;
 
     // How much of `build` is the gate re-executing BLAKE3 natively?
@@ -576,17 +602,8 @@ fn l0_shape_circuit_cost() {
     }
     let eval_ms = t.elapsed().as_secs_f64() * 1e3;
 
-    let mut ch = FsChallenger::new(DOMAIN);
     let t = Instant::now();
-    let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_circuit(
-        &union,
-        &built.circuit,
-        &built.public,
-        &pcs_params,
-        vec![UnionSlotProverInput::new(witness, &walker)],
-        Vec::new(),
-        &mut ch,
-    );
+    let (proof, commitment, _) = prove(witness);
     let prove_ms = t.elapsed().as_secs_f64() * 1e3;
 
     let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![&walker];
@@ -610,14 +627,33 @@ fn l0_shape_circuit_cost() {
     let verify_ms = t.elapsed().as_secs_f64() * 1e3;
 
     let proof_kib = bincode::serialize(&proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0;
+
+    // Split by what recurs. `circuit_structure_does_not_depend_on_the_witness`
+    // is what licenses the setup column: the statement is the same every
+    // proof, so anything that only builds the statement is paid once.
+    //
+    // `gates` straddles the line and is reported as it stands: only `eval` is
+    // witness work, the rest is wire-arena and union-find bookkeeping that a
+    // shape-once / replay-per-proof builder would move into setup. Until that
+    // split exists the whole phase is on the per-proof path, so `per-proof
+    // (today)` is honest and `per-proof (floor)` is what the split would buy.
+    let per_proof_now = gates_ms + wit_ms + prove_ms;
+    let per_proof_floor = eval_ms + wit_ms + prove_ms;
     println!(
         "\nL0 shape as a CIRCUIT: {n_paths} openings, depth {depth}, {leaf_bytes} B leaves\n\
-           k_log {}  nu {nu}  dense_m {}  public {}  wires {}\n\
-           tree {tree_ms:.0} ms | build {build_ms:.0} ms = gates {gates_ms:.0} \
-         (eval {eval_ms:.0}) + finish {finish_ms:.0} (TableType {table_ms:.0}) | witgen {wit_ms:.0} ms | \
-         prove {prove_ms:.0} ms | verify {verify_ms:.1} ms | \
-         proof {proof_kib:.1} KiB\n\
-           compare `cargo bench --bench merkle_l0_opening` for the same rows unwired.\n",
+           k_log {}  nu {nu}  dense_m {}  public {}  wires {}  proof {proof_kib:.1} KiB  \
+         {threads} threads\n\
+         \n\
+           PER PROOF (today)  {per_proof_now:6.0} ms = gates {gates_ms:.0} + witgen \
+         {wit_ms:.0} + prove {prove_ms:.0}\n\
+           PER PROOF (floor)  {per_proof_floor:6.0} ms = eval  {eval_ms:.0} + witgen \
+         {wit_ms:.0} + prove {prove_ms:.0}   (needs the builder split)\n\
+           verifier side      {verify_ms:6.1} ms\n\
+           one-time setup     {finish_ms:6.0} ms = finish, of which TableType \
+         {table_ms:.0}   (tree gen {tree_ms:.0} ms is the test's own fixture)\n\
+         \n\
+           compare `cargo bench --bench merkle_l0_opening`: 48 ms prove for the \
+         same rows unwired.\n",
         layout.k_log,
         union.dense_m(),
         built.public.len(),
