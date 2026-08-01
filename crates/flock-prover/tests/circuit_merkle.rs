@@ -495,3 +495,122 @@ fn merkle_index_wired_to_a_challenge() {
         "a tampered root must be rejected"
     );
 }
+
+/// **The real recursion shape, timed**: 218 depth-13 openings over 1 KiB
+/// leaves — the L0 workload a Ligerito verifier at dense m = 25 checks — as a
+/// circuit rather than a bare table.
+///
+/// The point of the measurement is the delta against `merkle_l0_opening`,
+/// which proves the identical 218 rows with no wiring at all. Everything the
+/// circuit adds is the copy-constraint layer: `product_gkr` over the cell
+/// space, whose size is `2^(nu + c)` with `c = ceil(log2(67 schema words))`,
+/// so mu = 8 + 7 = 15 here. That is tiny next to the k_log-19 slot, and the
+/// numbers should say so.
+#[test]
+#[ignore] // The real shape: ~8 MiB tree, minutes of proving. `-- --ignored`.
+fn l0_shape_circuit_cost() {
+    use std::time::Instant;
+
+    let (depth, leaf_bytes, n_paths) = (13usize, 1024usize, 218usize);
+    let nu = 8usize; // 218 rows ⇒ capacity 256
+    let mut rng = Rng(0x_10_5A_4E_11);
+    let t = Instant::now();
+    let tree = Tree::new(depth, leaf_bytes, &mut rng);
+    let tree_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    let t = Instant::now();
+    let mut b = CircuitBuilder::new(nu);
+    let g = b.slot(MerklePathGate::new(depth, leaf_bytes, nu, 1 << depth));
+    let positions: Vec<usize> = (0..n_paths).map(|i| (i * 37 + 11) % (1 << depth)).collect();
+    let roots: Vec<Vec<Wire>> = positions
+        .iter()
+        .map(|&pos| {
+            let leaf = tree.leaf(pos);
+            // Leaf data is free witness here — bound by the root, not pinned.
+            // In the full verifier it is wired to the arithmetic gate instead.
+            let mut inputs: Vec<Wire> = (0..leaf_bytes / 16)
+                .map(|w| b.value(leaf_word(leaf, 16 * w)))
+                .collect();
+            inputs.push(b.public_value(F128::new(table_index(pos, depth) as u64, 0)));
+            b.gate_with_hint(g, &inputs, &tree.siblings(pos))
+        })
+        .collect();
+    for root in &roots {
+        b.publish(root[0]);
+        b.publish(root[1]);
+    }
+    let built = b.finish().expect("builder produces a valid circuit");
+    let build_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    let union = UnionInstance::new(&built.registry, built.counts.clone());
+    let pcs_params = PcsParams {
+        m: union.dense_m(),
+        log_inv_rate: 1,
+        log_batch_size: 6,
+        profile: LigeritoProfile::Fast,
+        num_lanes: union.commit_lanes(6),
+        merkle_hash: Default::default(),
+    };
+    let layout = MerkleTreeLayout::with_blake3_chunk_leaf(depth, leaf_bytes, blake3_spec());
+    let walker = layout.build_walker();
+    let rows = built.rows::<MerklePathGate>(g);
+
+    let t = Instant::now();
+    let witness = layout.generate_witness_batch_major_partial_chunk(rows, nu);
+    let wit_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    // How much of `build` is the gate re-executing BLAKE3 natively?
+    let t = Instant::now();
+    for row in rows {
+        std::hint::black_box(layout.reference_root_chunk(row));
+    }
+    let eval_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    let mut ch = FsChallenger::new(DOMAIN);
+    let t = Instant::now();
+    let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_circuit(
+        &union,
+        &built.circuit,
+        &built.public,
+        &pcs_params,
+        vec![UnionSlotProverInput::new(witness, &walker)],
+        Vec::new(),
+        &mut ch,
+    );
+    let prove_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![&walker];
+    // No thread-pool wrapper: `flock_core::verifier` pins its own 1-thread
+    // `verifier_pool` around the verify cores, and the bench calls verify on
+    // the default pool exactly like this. Wrapping would change the regime,
+    // not match it.
+    let mut ch = FsChallenger::new(DOMAIN);
+    let t = Instant::now();
+    verifier::verify_ligerito_jagged_union_circuit(
+        &union,
+        &built.circuit,
+        &built.public,
+        &lcs,
+        &commitment,
+        &proof,
+        &pcs_params,
+        &mut ch,
+    )
+    .expect("the L0-shape circuit verifies");
+    let verify_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    let proof_kib = bincode::serialize(&proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0;
+    println!(
+        "\nL0 shape as a CIRCUIT: {n_paths} openings, depth {depth}, {leaf_bytes} B leaves\n\
+           k_log {}  nu {nu}  dense_m {}  public {}  wires {}\n\
+           tree {tree_ms:.0} ms | build {build_ms:.0} ms (of which native root eval \
+         {eval_ms:.0} ms) | witgen {wit_ms:.0} ms | \
+         prove {prove_ms:.0} ms | verify {verify_ms:.1} ms | \
+         proof {proof_kib:.1} KiB\n\
+           compare `cargo bench --bench merkle_l0_opening` for the same rows unwired.\n",
+        layout.k_log,
+        union.dense_m(),
+        built.public.len(),
+        built.circuit.wires().len(),
+    );
+}
