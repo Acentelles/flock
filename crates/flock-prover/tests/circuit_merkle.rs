@@ -1222,9 +1222,16 @@ fn mvp4_slice(depth: usize, n_queries: usize, nu: usize) {
     // ---- setup ----
     let t = Instant::now();
     let mut sb = ShapeBuilder::new(nu);
+    let t0 = Instant::now();
     let hash = sb.slot(Blake3Gate { nu });
+    let slot_hash_ms = t0.elapsed().as_secs_f64() * 1e3;
+    let t0 = Instant::now();
     let merkle = sb.slot(MerklePathGate::new(depth, leaf_bytes, nu, block_len));
+    let slot_merkle_ms = t0.elapsed().as_secs_f64() * 1e3;
+    let t0 = Instant::now();
     let leafeval = sb.slot(LeafEvalGate::new());
+    let slot_leaf_ms = t0.elapsed().as_secs_f64() * 1e3;
+    let t_wiring = Instant::now();
 
     // The FS chain, verbatim from MVP-1: every row's cv and message come from
     // an earlier row's output or from a transcript word.
@@ -1331,7 +1338,10 @@ fn mvp4_slice(depth: usize, n_queries: usize, nu: usize) {
         sb.publish(r[1]);
     }
     sb.publish(acc);
+    let wiring_ms = t_wiring.elapsed().as_secs_f64() * 1e3;
+    let t0 = Instant::now();
     let shape = sb.finish().expect("valid circuit");
+    let finish_ms = t0.elapsed().as_secs_f64() * 1e3;
     let setup_ms = t.elapsed().as_secs_f64() * 1e3;
 
     // ---- online ----
@@ -1550,7 +1560,9 @@ fn mvp4_slice(depth: usize, n_queries: usize, nu: usize) {
            PER PROOF     {:6.0} ms = online {online_ms:.0} + witgen {wit_ms:.0} + \
          prove {prove_ms:.0}\n\
            verifier side {verify_ms:6.1} ms\n\
-           SETUP         {setup_ms:6.0} ms   (off the proving path)\n",
+           SETUP         {setup_ms:6.0} ms = slot(blake3) {slot_hash_ms:.0} + \
+         slot(merkle) {slot_merkle_ms:.0} + slot(leaf) {slot_leaf_ms:.0} + \
+         wiring {wiring_ms:.0} + finish {finish_ms:.0}\n",
         shape.counts[shape.registry_slot(hash)],
         shape.counts[shape.registry_slot(merkle)],
         shape.counts[shape.registry_slot(leafeval)],

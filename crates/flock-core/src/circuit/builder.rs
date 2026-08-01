@@ -127,7 +127,11 @@ pub trait GateType {
 /// **Stateless.** Rows accumulate in the online phase, not here, so one shape
 /// can be run many times concurrently — the whole point of the split.
 trait SlotBuild: Any {
-    fn table(&self) -> TableType;
+    /// MOVE the table out. Called once, by `finish`, on its way into the
+    /// registry — which then owns it. Cloning here instead cost 2 deep copies
+    /// of every table's matrices; BLAKE3's are ~21M nonzeros, so that was
+    /// ~300 ms of pure memcpy per circuit.
+    fn take_table(&mut self) -> TableType;
     fn n_in(&self) -> usize;
     fn n_out(&self) -> usize;
     /// A fresh, empty `Vec<G::Row>` for one online run.
@@ -139,7 +143,8 @@ trait SlotBuild: Any {
 
 struct GateSlot<G: GateType> {
     gate: G,
-    table: TableType,
+    /// `None` after `finish` has moved it into the registry.
+    table: Option<TableType>,
     n_in: usize,
     n_out: usize,
 }
@@ -149,8 +154,10 @@ where
     G::Row: 'static,
     G::Hint: 'static,
 {
-    fn table(&self) -> TableType {
-        self.table.clone()
+    fn take_table(&mut self) -> TableType {
+        self.table
+            .take()
+            .expect("table already moved into the registry")
     }
     fn n_in(&self) -> usize {
         self.n_in
@@ -283,7 +290,7 @@ impl ShapeBuilder {
         );
         self.slots.push(Box::new(GateSlot {
             gate,
-            table,
+            table: Some(table),
             n_in,
             n_out,
         }));
@@ -394,30 +401,51 @@ impl ShapeBuilder {
         // each declared slot landed, then assert the result agrees with the
         // registry we actually get — so a change to the registry's ordering
         // fails loudly here rather than silently mis-wiring every circuit.
-        let tables: Vec<TableType> = self.slots.iter().map(|s| s.table()).collect();
-        let mut order: Vec<usize> = (0..tables.len()).collect();
-        order.sort_by_key(|&i| (tables[i].is_element(), std::cmp::Reverse(tables[i].k_log)));
+        // Tables MOVE from the slots into the registry: no clone at any point,
+        // because a table's matrices are the largest thing here by orders of
+        // magnitude. Order and cell-slot bases come from cheap metadata read
+        // before the move.
+        let mut taken: Vec<Option<TableType>> = self
+            .slots
+            .iter_mut()
+            .map(|s| Some(s.take_table()))
+            .collect();
+        let meta: Vec<(bool, usize, usize)> = taken
+            .iter()
+            .map(|t| {
+                let t = t.as_ref().expect("just taken");
+                (t.is_element(), t.k_log, t.io_schema.len())
+            })
+            .collect();
+        let mut order: Vec<usize> = (0..meta.len()).collect();
+        order.sort_by_key(|&i| (meta[i].0, std::cmp::Reverse(meta[i].1)));
 
-        let registry = Registry::new(order.iter().map(|&i| tables[i].clone()).collect(), self.nu);
+        let registry = Registry::new(
+            order
+                .iter()
+                .map(|&i| taken[i].take().expect("each slot moved once"))
+                .collect(),
+            self.nu,
+        );
         for (reg_idx, &declared) in order.iter().enumerate() {
             assert_eq!(
                 registry.types()[reg_idx].k_log,
-                tables[declared].k_log,
+                meta[declared].1,
                 "builder's slot ordering disagrees with Registry::new"
             );
         }
-        let mut registry_slot = vec![0usize; tables.len()];
+        let mut registry_slot = vec![0usize; meta.len()];
         for (reg_idx, &declared) in order.iter().enumerate() {
             registry_slot[declared] = reg_idx;
         }
 
         // Cell-slots enumerate in registry order, each type contributing its
         // io_schema words in schema order, then the public slots.
-        let mut iota_base = vec![0usize; tables.len()];
+        let mut iota_base = vec![0usize; meta.len()];
         let mut acc = 0usize;
         for &declared in &order {
             iota_base[declared] = acc;
-            acc += tables[declared].io_schema.len();
+            acc += meta[declared].2;
         }
         let num_gate_slots = acc;
         let rows_per_public_slot = 1usize << self.nu;
@@ -455,6 +483,11 @@ impl ShapeBuilder {
 
         let counts: Vec<usize> = order.iter().map(|&d| self.rows_per_slot[d]).collect();
 
+        // NOTE `Circuit::new` computes the REGISTRY digest, which hashes every
+        // table's matrices. At the recursion shape that is ~280 ms, dominated
+        // by BLAKE3's ~21M nonzeros — the single largest item in setup. It is
+        // a pure function of the table types, and `TableType` caches it, so a
+        // caller that reuses one `TableType` across circuits pays it once.
         let circuit = Circuit::new(&registry, counts.clone(), pubs.len(), wires)?;
         Ok(CircuitShape {
             registry,
