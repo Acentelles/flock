@@ -536,6 +536,41 @@ pub fn build_weight_row_major(
     }
 }
 
+/// `Ŵ(ρ)` for the aligned-table configuration: the Φ-twisted weight the merged
+/// reduction leaves the verifier owing, evaluated directly via the Frobenius
+/// decomposition instead of delegated to a `128·K`-statement assist.
+///
+/// ```text
+///   Ŵ(ρ) = Σ_i Σ_j c_{i,j} · f̂(z_row_i^{2^j}, z_col_i^{2^j}, ρ)
+/// ```
+///
+/// Same coefficient/power walk as `jagged::frobenius_statements`: use, then
+/// square. Cost `O(128·K · #tables · m)`.
+pub fn twisted_weight_aligned(
+    params: &AlignedParams,
+    claims: &[crate::pcs::jagged::FrobeniusClaim<'_>],
+    rho: &[F128],
+) -> F128 {
+    let mut acc = F128::ZERO;
+    for claim in claims {
+        assert_eq!(claim.coeffs.len(), 128);
+        let mut zr = claim.z_row.to_vec();
+        let mut zc = claim.z_col.to_vec();
+        for &c in claim.coeffs.iter() {
+            if !c.is_zero() {
+                acc += c * f_hat_aligned(params, &zr, &zc, rho);
+            }
+            for x in zr.iter_mut() {
+                *x = *x * *x;
+            }
+            for x in zc.iter_mut() {
+                *x = *x * *x;
+            }
+        }
+    }
+    acc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -939,5 +974,100 @@ mod tests {
             rhs += q[d] * wd;
         }
         assert_eq!(lhs, rhs, "row-major jagged reduction failed");
+    }
+
+    /// **Decision probe.** Does evaluating Ŵ(ρ) directly through the aligned
+    /// tables actually beat the (already eq-hoisted) Frobenius assist on the
+    /// VERIFIER, at the real depth-26 geometry and the real 128·K batch width?
+    ///
+    /// The paper's per-table win is stated against per-COLUMN direct
+    /// evaluation. Flock's assist is not that — it is a heavily optimized
+    /// sumcheck — and `f_hat_aligned` runs once per statement, so the 256×
+    /// batch could swamp the 3,326 -> 9 table saving. Measure before wiring.
+    ///
+    /// `cargo test -p flock-core --release --lib
+    ///  pcs::jagged_fancy::tests::aligned_vs_assist_verifier_cost
+    ///  -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn aligned_vs_assist_verifier_cost() {
+        use crate::challenger::FsChallenger;
+        use crate::pcs::jagged::{
+            FrobeniusClaim, JaggedParams, prove_frobenius_assist, verify_frobenius_assist,
+        };
+        use crate::union::UnionInstance;
+
+        let _ = crate::init_perf_thread_pool();
+        // depth-26 Merkle single-slot geometry: 3,325 used columns of height
+        // 2^10, dense_log 22, k_cols 12.
+        let (nu, k_cols, dense_log, used) = (10usize, 12usize, 22usize, 3_325usize);
+        let widths = UnionInstance::subtable_widths(used);
+        let mut tables = Vec::new();
+        let mut off = 0u64;
+        for w in &widths {
+            tables.push(AlignedTable {
+                log_width: w.trailing_zeros(),
+                height: 1u64 << nu,
+                col_offset: off,
+            });
+            off += *w as u64;
+        }
+        let ap = AlignedParams::new(tables, nu, k_cols, dense_log);
+        assert_eq!(ap.tables.len(), 9);
+
+        // Basic-jagged params over the same grid, for the assist baseline.
+        let mut heights = vec![0u64; 1usize << k_cols];
+        for h in &mut heights[..used] {
+            *h = 1u64 << nu;
+        }
+        let jp = JaggedParams::from_heights(&heights, nu, dense_log);
+
+        let mut rng = Rng(0x_A11_A5515);
+        let claims_data: Vec<(Vec<F128>, Vec<F128>, Vec<F128>)> = (0..2)
+            .map(|_| (rng.vec(nu), rng.vec(k_cols), rng.vec(128)))
+            .collect();
+        let claims: Vec<FrobeniusClaim<'_>> = claims_data
+            .iter()
+            .map(|(zr, zc, c)| FrobeniusClaim {
+                z_row: zr,
+                z_col: zc,
+                coeffs: c,
+            })
+            .collect();
+        let rho = rng.vec(dense_log);
+
+        let mut ch = FsChallenger::new(b"flock-aligned-probe");
+        let proof = prove_frobenius_assist(&jp, &claims, &rho, &mut ch);
+
+        let time = |f: &dyn Fn()| -> f64 {
+            f();
+            let mut best = f64::INFINITY;
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                f();
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            best * 1e3
+        };
+        let t_assist = time(&|| {
+            let mut c = FsChallenger::new(b"flock-aligned-probe");
+            let v = verify_frobenius_assist(&jp, &claims, &rho, &proof, &mut c);
+            std::hint::black_box(&v);
+        });
+        let t_direct = time(&|| {
+            let v = twisted_weight_aligned(&ap, &claims, &rho);
+            std::hint::black_box(&v);
+        });
+        eprintln!(
+            "  128·K = {} statements, {} aligned tables (from {} columns)\n  \
+             assist verify (eq-hoisted): {:8.2} ms\n  \
+             direct via aligned tables : {:8.2} ms   ({:.2}x)",
+            128 * claims.len(),
+            ap.tables.len(),
+            used,
+            t_assist,
+            t_direct,
+            t_direct / t_assist
+        );
     }
 }

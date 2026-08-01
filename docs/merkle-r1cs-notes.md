@@ -186,6 +186,43 @@ prefix selection, `k_cols` coordinates all going to `col`. At depth 26 that is
 commitment already carries. Free whenever `n_t` is a power of two; for partial
 counts the power-of-two rounding absorbs most of it.
 
+## STOP: the wire change would regress the verifier 5.4x
+
+Before touching the transcript I measured the thing the whole plan rests on —
+does evaluating `Ŵ(ρ)` directly through the aligned tables actually beat the
+assist on the verifier? At the real depth-26 geometry and the real batch width
+(`aligned_vs_assist_verifier_cost`):
+
+```
+128·K = 256 statements, 9 aligned tables (from 3,325 columns)
+  assist verify (eq-hoisted):  3.07 ms
+  direct via aligned tables : 16.52 ms   (5.38x)
+```
+
+**Direct evaluation is 5.4× SLOWER.** The reasoning that got us here was sound
+but incomplete: §6's per-table win is stated against per-COLUMN *direct*
+evaluation, and flock's assist is not that — it is a sumcheck whose `W(σ)` was
+already hoisted from 116.62 ms to 1.45 ms. Meanwhile `f_hat_aligned` runs once
+per statement, so the 256× batch swamps the 3,326 → 9 table saving.
+
+Wiring as planned would therefore trade **prover −258 ms** for **verifier
++13.5 ms** on a ~17 ms verifier — net positive overall, but a real regression on
+one side, for a wire-format change that invalidates the pinned fixtures. Not
+worth landing in that state.
+
+**The fix, and why it should come first.** The branching program's ρ-side is
+*shared* across all 256 statements: the `index` bits come from ρ and
+`prev`/`next` from the table, both statement-independent — only `row`/`col`
+vary. That is exactly the structure the existing eq hoist exploited on the
+assist. A batched `f_hat_aligned` that builds the shared `(index, prev, next)`
+partial once per `(table, layer)` and combines it with each statement's four
+`(row, col)` branches should cut most of the 16.52 ms — plausibly under the
+3.07 ms baseline, at which point the whole plan works and the wire change is
+worth making.
+
+Same discipline as the reverted rectangular fast path: measure before landing
+anything protocol-visible.
+
 **Still not wired.** What remains is the consumer side: `build_merged_weight_and_prime`
 must switch to `build_weight_row_major` (Φ-twisted, per claim, fused with the
 round-0 prime as today), `open_batch_merged` must take the row-major `q`,
