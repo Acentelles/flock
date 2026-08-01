@@ -2422,3 +2422,420 @@ fn collapsed_opening_matches_the_composite() {
         );
     }
 }
+
+/// **MVP-6: the full query phase, collapsed.** The same four levels as
+/// [`mvp5_all_levels_query_phase`], with every Merkle composite replaced by
+/// wiring over ONE BLAKE3 table.
+///
+/// The prediction from `wiring_scaling.rs` and the glue tables' measured nnz:
+/// lincheck ~105.1M → ~21.0M, wiring ~1.7 → ~18 ms, prove ~174 → ~119 ms.
+/// Note the FS chain's compressions and the openings' share the SAME slot —
+/// that is the point.
+///
+/// ONE `BitSpreadTable`, sized for the deepest level; shallower levels leave
+/// its extra outputs unwired, and an unwired schema word is sigma-fixed and
+/// costs nothing. Four depth-specific spread tables would have been four more
+/// types, which is the thing being removed.
+#[test]
+#[ignore] // The full shape. `-- --ignored`.
+fn mvp6_all_levels_collapsed() {
+    use flock_core::challenger::Challenger as _;
+    use flock_core::lincheck::build_eq_table;
+    use flock_core::transcript_record::{RecordingChallenger, TranscriptOp};
+    use flock_prover::prover::UnionElementSlotInput;
+    use flock_prover::r1cs_hashes::fs_chain::{CvSource, FsChain};
+    use std::time::Instant;
+
+    const SLICE: &[u8] = b"flock-mvp6-collapsed-v0";
+    let threads = flock_core::init_perf_thread_pool().unwrap_or_else(rayon::current_num_threads);
+    let levels = [
+        Level {
+            depth: 14,
+            lanes: 64,
+            queries: 218,
+        },
+        Level {
+            depth: 12,
+            lanes: 8,
+            queries: 106,
+        },
+        Level {
+            depth: 10,
+            lanes: 8,
+            queries: 71,
+        },
+        Level {
+            depth: 8,
+            lanes: 8,
+            queries: 53,
+        },
+    ];
+    let max_depth = levels.iter().map(|l| l.depth).max().unwrap();
+
+    let mut rng = Rng(0x_5EED_0006);
+    let trees: Vec<Tree> = levels
+        .iter()
+        .map(|l| Tree::new(l.depth, 16 * l.lanes, &mut rng))
+        .collect();
+
+    // ---- transcript ----
+    let mut rec = RecordingChallenger::new(FsChallenger::with_hash(SLICE, HashKind::Blake3));
+    let mut want: Vec<Vec<usize>> = Vec::new();
+    for (l, tree) in levels.iter().zip(&trees) {
+        rec.observe_bytes(&tree.root);
+        want.push(
+            rec.sample_f128_vec(l.queries)
+                .iter()
+                .map(|v| (v.lo as usize) & ((1usize << l.depth) - 1))
+                .collect(),
+        );
+    }
+    let t_shape = rec.shape();
+    let stream = t_shape.stream_words(SLICE);
+    let bytes = stream.to_bytes(rec.values(), rec.payloads());
+
+    let mut chain = FsChain::new();
+    let mut at = 0usize;
+    let fin_ops: Vec<&TranscriptOp> = t_shape.ops().iter().filter(|o| o.finalizes()).collect();
+    for (i, &upto) in stream.finalize_after.iter().enumerate() {
+        chain.absorb(&bytes[at * 16..upto * 16]);
+        at = upto;
+        chain.finalize(fin_ops[i].squeezed_bytes());
+    }
+    chain.absorb(&bytes[at * 16..]);
+    let trace = chain.finish();
+
+    // Rows in the ONE blake3 slot: the FS chain plus every opening's
+    // compressions.
+    let b3_rows: usize = trace.rows.len()
+        + levels
+            .iter()
+            .map(|l| (16 * l.lanes / 64 + l.depth) * l.queries)
+            .sum::<usize>();
+    let nu = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(3);
+
+    // ---- setup ----
+    let t = Instant::now();
+    let mut sb = ShapeBuilder::new(nu);
+    let slots = CollapsedSlots {
+        b3: sb.slot(Blake3Gate { nu }),
+        swap: sb.slot(SwapGate { nu }),
+        spread: sb.slot(BitSpreadGate {
+            ty: BitSpreadTable::new(max_depth),
+            nu,
+        }),
+    };
+    let mut leaf_slot: Vec<(usize, flock_core::circuit::builder::SlotId)> = Vec::new();
+    let leafeval: Vec<_> = levels
+        .iter()
+        .map(|l| match leaf_slot.iter().find(|(n, _)| *n == l.lanes) {
+            Some((_, s)) => *s,
+            None => {
+                let s = sb.slot(LeafEvalGate::new(l.lanes));
+                leaf_slot.push((l.lanes, s));
+                s
+            }
+        })
+        .collect();
+
+    // Values are pushed in DECLARATION order throughout; `emit_opening` pushes
+    // its own params into the same vector as it declares them.
+    let mut vals: Vec<F128> = Vec::new();
+    let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+    vals.extend_from_slice(&iv_w);
+    let iv = [sb.public_input(), sb.public_input()];
+
+    // The FS chain, into the same blake3 slot.
+    let mut word_wire: Vec<Option<Wire>> = vec![None; stream.words.len()];
+    let mut outs: Vec<Vec<Wire>> = Vec::with_capacity(trace.rows.len());
+    let mut gate_in: Vec<[Wire; 7]> = Vec::with_capacity(trace.rows.len());
+    for (i, row) in trace.rows.iter().enumerate() {
+        let (_, _, counter, blen, flags) = *row;
+        let link = trace.links[i];
+        vals.push(pack_params(counter, blen, flags));
+        let params = sb.public_input();
+        if let Some(root) = link.repeats {
+            let s = gate_in[root];
+            let g_in = [s[0], s[1], s[2], s[3], s[4], s[5], params];
+            gate_in.push(g_in);
+            outs.push(sb.gate(slots.b3, &g_in));
+            continue;
+        }
+        let (cv_in, m_in) = match link.right {
+            Some(right) => {
+                let l = match link.cv {
+                    CvSource::Row(r) => r,
+                    CvSource::Iv => unreachable!(),
+                };
+                (iv, [outs[l][0], outs[l][1], outs[right][0], outs[right][1]])
+            }
+            None => {
+                let cv_in = match link.cv {
+                    CvSource::Iv => iv,
+                    CvSource::Row(r) => [outs[r][0], outs[r][1]],
+                };
+                let base = trace.block_offsets[i].expect("stream block") / 16;
+                let real = (blen as usize) / 16;
+                let mut m = [iv[0]; 4];
+                for (j, slot) in m.iter_mut().enumerate() {
+                    let wi = base + j;
+                    *slot = if j >= real || wi >= stream.words.len() {
+                        vals.push(F128::ZERO);
+                        sb.public_input()
+                    } else {
+                        match word_wire[wi] {
+                            Some(w) => w,
+                            None => {
+                                vals.push(F128::new(
+                                    u64::from_le_bytes(
+                                        bytes[wi * 16..wi * 16 + 8].try_into().unwrap(),
+                                    ),
+                                    u64::from_le_bytes(
+                                        bytes[wi * 16 + 8..wi * 16 + 16].try_into().unwrap(),
+                                    ),
+                                ));
+                                let w = sb.public_input();
+                                word_wire[wi] = Some(w);
+                                w
+                            }
+                        }
+                    };
+                }
+                (cv_in, m)
+            }
+        };
+        let g_in = [
+            cv_in[0], cv_in[1], m_in[0], m_in[1], m_in[2], m_in[3], params,
+        ];
+        gate_in.push(g_in);
+        outs.push(sb.gate(slots.b3, &g_in));
+    }
+
+    // The openings.
+    let vees: Vec<Vec<F128>> = levels
+        .iter()
+        .map(|l| {
+            (0..l.lanes.trailing_zeros() as usize)
+                .map(|_| F128::new(rng.next_u32() as u64 | 1, rng.next_u32() as u64))
+                .collect()
+        })
+        .collect();
+    let alphas: Vec<Vec<F128>> = levels
+        .iter()
+        .map(|l| {
+            (0..l.queries)
+                .map(|_| F128::new(rng.next_u32() as u64, rng.next_u32() as u64 | 1))
+                .collect()
+        })
+        .collect();
+
+    vals.push(F128::ZERO);
+    let mut acc = sb.public_input();
+    let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
+    let mut all_roots: Vec<Vec<[Wire; 2]>> = Vec::new();
+    for (li, l) in levels.iter().enumerate() {
+        let sq = &trace.squeezes[li];
+        let vars = l.lanes.trailing_zeros() as usize;
+        vals.extend_from_slice(&vees[li]);
+        let vs: Vec<Wire> = (0..vars).map(|_| sb.public_input()).collect();
+        let blocks = 16 * l.lanes / 64;
+        let mut roots = Vec::with_capacity(l.queries);
+        for k in 0..l.queries {
+            let pos = want[li][k];
+            let leaf = trees[li].leaf(pos);
+            vals.extend((0..4 * blocks).map(|w| leaf_word(leaf, 16 * w)));
+            let leaf_w: Vec<Wire> = (0..4 * blocks).map(|_| sb.input()).collect();
+
+            // The challenge word IS the index word — no masking gadget.
+            let cw = outs[sq[k / 4]][k % 4];
+            roots.push(emit_opening(
+                &mut sb, slots, iv, &leaf_w, cw, l.depth, &mut vals,
+            ));
+            hints.extend(trees[li].siblings(pos));
+
+            // The same leaf words feed the arithmetic.
+            let mut a_in = leaf_w;
+            a_in.extend_from_slice(&vs);
+            vals.push(alphas[li][k]);
+            a_in.push(sb.public_input());
+            a_in.push(acc);
+            acc = sb.gate(leafeval[li], &a_in)[0];
+        }
+        all_roots.push(roots);
+    }
+    for roots in &all_roots {
+        for r in roots {
+            sb.publish(r[0]);
+            sb.publish(r[1]);
+        }
+    }
+    sb.publish(acc);
+    let shape = sb.finish().expect("valid collapsed circuit");
+    let setup_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    // ---- online ----
+    let hint_refs: Vec<&dyn std::any::Any> =
+        hints.iter().map(|h| h as &dyn std::any::Any).collect();
+    std::hint::black_box(shape.run(&vals, &hint_refs));
+    let t = Instant::now();
+    let built = shape.run(&vals, &hint_refs);
+    let online_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    // Every opening folds to its level's root, and the accumulator is
+    // enforced_sum — the same two claims MVP-5 makes, now over wired rows.
+    let mut at = built.public.len() - 1 - 2 * levels.iter().map(|l| l.queries).sum::<usize>();
+    for (li, l) in levels.iter().enumerate() {
+        let rw = digest_words(&hash_to_digest(&trees[li].root));
+        for k in 0..l.queries {
+            assert_eq!(
+                [built.public[at], built.public[at + 1]],
+                rw,
+                "L{li} root {k}"
+            );
+            at += 2;
+        }
+    }
+    let mut want_sum = F128::ZERO;
+    for (li, l) in levels.iter().enumerate() {
+        let eq = build_eq_table(&vees[li]);
+        for k in 0..l.queries {
+            let leaf = trees[li].leaf(want[li][k]);
+            let dot = (0..l.lanes)
+                .map(|w| leaf_word(leaf, 16 * w) * eq[w])
+                .fold(F128::ZERO, |a, x| a + x);
+            want_sum += alphas[li][k] * dot;
+        }
+    }
+    assert_eq!(*built.public.last().unwrap(), want_sum, "enforced_sum");
+
+    // ---- prove / verify ----
+    let union = UnionInstance::new(&shape.registry, shape.counts.clone());
+    let pcs_params = PcsParams {
+        m: union.dense_m(),
+        log_inv_rate: 1,
+        log_batch_size: 6,
+        profile: LigeritoProfile::Fast,
+        num_lanes: union.commit_lanes(6),
+        merkle_hash: Default::default(),
+    };
+    let b3 = blake3::build_block_r1cs(nu);
+    let b3_lc = b3.csc_lincheck_circuit();
+    let swap_r1cs = SwapTable::build_block_r1cs(nu);
+    let swap_lc = swap_r1cs.csc_lincheck_circuit();
+    let spread_ty = BitSpreadTable::new(max_depth);
+    let spread_r1cs = spread_ty.build_block_r1cs(nu);
+    let spread_lc = spread_r1cs.csc_lincheck_circuit();
+
+    let t = Instant::now();
+    let mut bool_slots: Vec<(usize, UnionSlotProverInput)> = vec![
+        (
+            shape.registry_slot(slots.b3),
+            UnionSlotProverInput::new(
+                blake3::generate_witness_batch_major_partial(
+                    built.rows::<Blake3Gate>(slots.b3),
+                    nu,
+                ),
+                b3_lc,
+            ),
+        ),
+        (
+            shape.registry_slot(slots.swap),
+            UnionSlotProverInput::new(
+                SwapTable::generate_witness_batch_major(built.rows::<SwapGate>(slots.swap), nu),
+                swap_lc,
+            ),
+        ),
+        (
+            shape.registry_slot(slots.spread),
+            UnionSlotProverInput::new(
+                spread_ty
+                    .generate_witness_batch_major(built.rows::<BitSpreadGate>(slots.spread), nu),
+                spread_lc,
+            ),
+        ),
+    ];
+    let els: Vec<Vec<F128>> = leaf_slot
+        .iter()
+        .map(|(_, s)| match &built.witnesses[shape.registry_slot(*s)] {
+            SlotWitness::Element(z) => z.clone(),
+            other => panic!("leaf-eval slot produced {other:?}"),
+        })
+        .collect();
+    let wit_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    bool_slots.sort_by_key(|(i, _)| *i);
+    let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
+        (shape.registry_slot(slots.b3), b3_lc),
+        (shape.registry_slot(slots.swap), swap_lc),
+        (shape.registry_slot(slots.spread), spread_lc),
+    ];
+    lcs_ord.sort_by_key(|(i, _)| *i);
+    let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
+        lcs_ord.into_iter().map(|(_, c)| c).collect();
+
+    let mut el_ord: Vec<(usize, Vec<F128>)> = leaf_slot
+        .iter()
+        .zip(els)
+        .map(|((_, s), z)| (shape.registry_slot(*s), z))
+        .collect();
+    el_ord.sort_by_key(|(i, _)| *i);
+    let el_inputs: Vec<UnionElementSlotInput> = el_ord
+        .into_iter()
+        .map(|(_, z)| UnionElementSlotInput::new(move |dst: &mut [F128]| dst.copy_from_slice(&z)))
+        .collect();
+
+    let t = Instant::now();
+    let mut c = FsChallenger::new(DOMAIN);
+    let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_circuit(
+        &union,
+        &shape.circuit,
+        &built.public,
+        &pcs_params,
+        bool_slots.into_iter().map(|(_, s)| s).collect(),
+        el_inputs,
+        &mut c,
+    );
+    let prove_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    let t = Instant::now();
+    let mut c = FsChallenger::new(DOMAIN);
+    verifier::verify_ligerito_jagged_union_circuit(
+        &union,
+        &shape.circuit,
+        &built.public,
+        &lcs,
+        &commitment,
+        &proof,
+        &pcs_params,
+        &mut c,
+    )
+    .expect("the collapsed query phase verifies");
+    let verify_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    let nnz = |r: &flock_core::r1cs::BlockR1cs| {
+        r.a_0.rows.iter().map(|x| x.len()).sum::<usize>()
+            + r.b_0.rows.iter().map(|x| x.len()).sum::<usize>()
+    };
+    println!(
+        "\nMVP-6 FULL QUERY PHASE, COLLAPSED (m=26 Fast ladder)\n  \
+         blake3 {} rows | swap {} | spread {} | leaf-eval {}+{}\n  \
+         lincheck nnz {} (MVP-5: 105145720) | dense {} words | dense_m {} | \
+         M_bool {} | mu {}\n\n  \
+         PER PROOF     {:6.0} ms = online {online_ms:.0} + witgen {wit_ms:.0} + \
+         prove {prove_ms:.0}\n  \
+         verifier side {verify_ms:6.1} ms | proof {:.1} KiB | {threads} threads\n  \
+         SETUP         {setup_ms:6.0} ms\n",
+        shape.counts[shape.registry_slot(slots.b3)],
+        shape.counts[shape.registry_slot(slots.swap)],
+        shape.counts[shape.registry_slot(slots.spread)],
+        shape.counts[shape.registry_slot(leaf_slot[0].1)],
+        shape.counts[shape.registry_slot(leaf_slot[1].1)],
+        nnz(&b3) + nnz(&swap_r1cs) + nnz(&spread_r1cs),
+        union.dense_words(),
+        union.dense_m(),
+        union.m_bool(),
+        shape.circuit.cells().mu(),
+        online_ms + wit_ms + prove_ms,
+        bincode::serialize(&proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
+    );
+}

@@ -104,8 +104,9 @@ fn scatter_zab(
         }
     }
 
+    use rayon::prelude::*;
     let mut stripe = vec![0u8; (n_total / 8) * k];
-    for (g, chunk) in stripe.chunks_mut(k).enumerate() {
+    stripe.par_chunks_mut(k).enumerate().for_each(|(g, chunk)| {
         for r in 0..8 {
             let row = 8 * g + r;
             if row >= per_row.len() {
@@ -117,7 +118,7 @@ fn scatter_zab(
                 }
             }
         }
-    }
+    });
     (z, a, b, stripe)
 }
 
@@ -320,7 +321,8 @@ impl SwapTable {
         rows: &[SwapInput],
         nu: usize,
     ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
-        let per: Vec<[Vec<bool>; 3]> = rows.iter().map(Self::build_witness).collect();
+        use rayon::prelude::*;
+        let per: Vec<[Vec<bool>; 3]> = rows.par_iter().map(Self::build_witness).collect();
         scatter_zab(&per, Self::k(), Self::USEFUL_BITS, nu)
     }
 }
@@ -470,7 +472,8 @@ impl BitSpreadTable {
         rows: &[u128],
         nu: usize,
     ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
-        let per: Vec<[Vec<bool>; 3]> = rows.iter().map(|&i| self.build_witness(i)).collect();
+        use rayon::prelude::*;
+        let per: Vec<[Vec<bool>; 3]> = rows.par_iter().map(|&i| self.build_witness(i)).collect();
         scatter_zab(&per, self.k(), self.useful_bits(), nu)
     }
 }
