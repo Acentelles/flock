@@ -1599,6 +1599,21 @@ fn mvp4_slice(depth: usize, n_queries: usize, nu: usize) {
             "",
             union.dense_words()
         );
+        // What the LINCHECK actually sweeps — O(nnz), and unrelated to trace
+        // size. The Merkle walker keeps ONE copy of the base CSC and walks it
+        // per block; BLAKE3's own slot sweeps the full materialized block.
+        let (ba, bb) = {
+            let (a, b) = blake3::build_matrices();
+            (
+                a.rows.iter().map(|r| r.len()).sum::<usize>(),
+                b.rows.iter().map(|r| r.len()).sum::<usize>(),
+            )
+        };
+        hdr += &format!(
+            "  lincheck nnz: merkle walker {} (effective) | blake3 block {}\n",
+            walker.effective_nnz(),
+            ba + bb,
+        );
         hdr += &format!(
             "  committed {} words (2^{}) | address space 2^{} cells = {} words \
              ({:.1}% used)\n  M_bool {} | M_elem {} | M_total {}\n",
