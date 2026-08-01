@@ -1,4 +1,4 @@
-//! **MVP-3, first half: Merkle openings as circuit gates.**
+//! **MVP-3: PCS query openings as circuit gates, and the arithmetic on them.**
 //!
 //! A recursive verifier's dominant cost is checking PCS query openings — 218
 //! depth-13 Merkle paths over 1 KiB leaves, per the L0 measurement. This file
@@ -25,8 +25,15 @@
 //!   union prover, over the walker lincheck circuit rather than materialized
 //!   matrices.
 //!
-//! Small shape (depth 2, 128-byte leaves) so the composite is 4 base blocks;
-//! the geometry is identical at the L0 shape, only wider.
+//! MVP-3b adds the other half — `LeafEvalGate`, an ELEMENT gate consuming the
+//! same leaf words to compute `Σ_i α_i · ⟨row_i, eq(v, ·)⟩`, the `enforced_sum`
+//! the Ligerito verifier checks. The 64 leaf words are one wire class each with
+//! cells in both slots, so the copy constraint is what makes "the leaf that is
+//! in the tree" and "the leaf the arithmetic ran on" the same leaf — across the
+//! boolean/element class boundary.
+//!
+//! Small shapes where the geometry allows; `l0_shape_circuit_cost` runs the
+//! real one (218 openings, depth 13, 1 KiB leaves).
 
 use flock_core::circuit::builder::{CircuitBuilder, GateType, ShapeBuilder, SlotWitness, Wire};
 use flock_core::field::F128;
@@ -720,4 +727,374 @@ fn circuit_structure_does_not_depend_on_the_witness() {
     let (ra, rc) = (a.rows::<MerklePathGate>(ga), c.rows::<MerklePathGate>(gc));
     assert_ne!(ra[0].leaf_data, rc[0].leaf_data, "same leaf data");
     assert_ne!(a.witness.public, c.witness.public, "same public values");
+}
+
+// ---------------------------------------------------------------------------
+// MVP-3b: the leaf arithmetic
+// ---------------------------------------------------------------------------
+
+/// What the verifier actually computes from the opened leaves, at one level:
+///
+/// ```text
+/// enforced_sum = Σ_i  α_i · ⟨row_i, eq(v_challenges, ·)⟩
+/// ```
+///
+/// (`ligerito::induce_sumcheck_enforced_sum`.) The inner product against an
+/// `eq` table IS the multilinear evaluation of the leaf's 64 lanes at the
+/// 6-dimensional point `v`, so this gate evaluates it by folding, one variable
+/// per level, and folds the α-weighted result into a running accumulator so
+/// the whole level's sum falls out of the last row.
+///
+/// Layout (`kappa = 8`, 256 columns, 200 real):
+///
+/// ```text
+///   0  .. 64   leaf lanes         (In — the SAME wires the Merkle gate reads)
+///  64  .. 70   v challenges       (In)
+///  70          alpha_i            (In)
+///  71          prev accumulator   (In)
+///  72  ..198   fold tree          (2 columns per node: d, then the folded value)
+/// 198          alpha_i · y
+/// 199          accumulator out    (Out)
+/// ```
+///
+/// **The fold, and why 2 columns per node.** `build_eq_table` is LSB-first, so
+/// variable `j` is bit `j` of the lane index and folding pairs `(2i, 2i+1)`:
+///
+/// ```text
+///   new[i] = (1+v)·f[2i] + v·f[2i+1] = f[2i] + v·(f[2i] + f[2i+1])
+/// ```
+///
+/// A row's left-hand side is a product of two linear forms, so `v·(f+f)` is
+/// one `mult_lin` — the addition rides the multiplication's `A_0` row for
+/// free — but the trailing `+ f[2i]` is outside the product and costs a
+/// `linear` row of its own. Hence 2 rows per node, 126 for the 63 nodes.
+///
+/// That is not the floor. Materializing only `d[i] = v·(f[2i]+f[2i+1])` and
+/// leaving `new[i]` as the *linear form* `f[2i] + d[i]` would let the next
+/// level's `mult_lin` absorb it, giving 1 row per node — at the price of `A_0`
+/// rows that grow to 127 terms at the last level. Left for later on purpose:
+/// this is the MVP.
+struct LeafEvalGate {
+    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+}
+
+const LE_LANES: usize = 64;
+const LE_VARS: usize = 6;
+const LE_V: usize = LE_LANES;
+const LE_ALPHA: usize = LE_V + LE_VARS;
+const LE_PREV: usize = LE_ALPHA + 1;
+const LE_FOLD: usize = LE_PREV + 1;
+const LE_N_IN: usize = LE_FOLD;
+const LE_T: usize = LE_FOLD + 2 * (LE_LANES - 1);
+const LE_ACC: usize = LE_T + 1;
+const LE_K: usize = LE_ACC + 1;
+const LE_KAPPA: usize = 8;
+
+/// First column of fold level `l` (`1..=LE_VARS`); level `l` has `64 >> l`
+/// nodes and each node owns two columns.
+fn le_base(l: usize) -> usize {
+    (1..l).fold(LE_FOLD, |acc, k| acc + 2 * (LE_LANES >> k))
+}
+
+/// The column holding entry `j` of the array entering fold level `l`.
+fn le_prev(l: usize, j: usize) -> usize {
+    if l == 1 {
+        j
+    } else {
+        le_base(l - 1) + 2 * j + 1
+    }
+}
+
+/// The fully folded value: the last level's single node.
+fn le_y() -> usize {
+    le_base(LE_VARS) + 1
+}
+
+impl LeafEvalGate {
+    fn new() -> Self {
+        use flock_core::element_r1cs::ElementTableBuilder;
+        let one = F128::ONE;
+        let mut b = ElementTableBuilder::new(LE_KAPPA);
+        for c in 0..LE_N_IN {
+            b.free_wire(c);
+        }
+        for l in 1..=LE_VARS {
+            for i in 0..(LE_LANES >> l) {
+                let (p0, p1) = (le_prev(l, 2 * i), le_prev(l, 2 * i + 1));
+                let d = le_base(l) + 2 * i;
+                b.mult_lin(d, &[(p0, one), (p1, one)], &[(LE_V + l - 1, one)]);
+                b.linear(d + 1, &[(p0, one), (d, one)]);
+            }
+        }
+        b.mult(LE_T, LE_ALPHA, le_y());
+        b.linear(LE_ACC, &[(LE_PREV, one), (LE_T, one)]);
+        Self {
+            ty: std::sync::Arc::new(b.build().expect("leaf-eval block is valid")),
+        }
+    }
+}
+
+impl GateType for LeafEvalGate {
+    /// The row's committed columns, verbatim.
+    type Row = Vec<F128>;
+    type Hint = ();
+
+    fn table(&self) -> TableType {
+        use flock_core::schedule::IoWord;
+        let mut schema: Vec<IoWord> = (0..LE_N_IN).map(IoWord::input).collect();
+        schema.push(IoWord::output(LE_ACC));
+        TableType::element(self.ty.clone()).with_io_schema(schema)
+    }
+
+    fn eval(&self, inputs: &[F128], _hint: &()) -> (Vec<F128>, Self::Row) {
+        let mut z = vec![F128::ZERO; LE_K];
+        z[..LE_N_IN].copy_from_slice(&inputs[..LE_N_IN]);
+        for l in 1..=LE_VARS {
+            for i in 0..(LE_LANES >> l) {
+                let (p0, p1) = (z[le_prev(l, 2 * i)], z[le_prev(l, 2 * i + 1)]);
+                let d = le_base(l) + 2 * i;
+                z[d] = (p0 + p1) * z[LE_V + l - 1];
+                z[d + 1] = p0 + z[d];
+            }
+        }
+        z[LE_T] = z[LE_ALPHA] * z[le_y()];
+        z[LE_ACC] = z[LE_PREV] + z[LE_T];
+        (vec![z[LE_ACC]], z)
+    }
+
+    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
+        let mut z = vec![F128::ZERO; self.ty.width() << nu];
+        for (j, row) in rows.iter().enumerate() {
+            for (c, &v) in row.iter().enumerate() {
+                z[(c << nu) + j] = v;
+            }
+        }
+        SlotWitness::Element(z)
+    }
+}
+
+/// **MVP-3b: the opened leaf reaches the arithmetic.**
+///
+/// The two halves of checking a PCS query, in one circuit and one proof:
+///
+/// - a boolean [`MerklePathGate`] binds each leaf to the committed root, and
+/// - an element [`LeafEvalGate`] consumes the SAME leaf words and computes
+///   `α_i · ⟨row_i, eq(v, ·)⟩`, accumulating across openings.
+///
+/// The 64 leaf words are one wire class each with cells in BOTH slots, so the
+/// copy constraint is what makes "the leaf that is in the tree" and "the leaf
+/// the arithmetic ran on" the same leaf. That is the join the whole wiring
+/// layer exists for, and it crosses the class boundary: a `k_log`-19 boolean
+/// slot and a `kappa`-8 element slot in one union.
+///
+/// The published accumulator is checked against `enforced_sum` computed
+/// natively the way `ligerito::induce_sumcheck_enforced_sum` computes it.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn leaf_arithmetic_joins_the_merkle_openings() {
+    use flock_core::lincheck::build_eq_table;
+    use flock_prover::prover::UnionElementSlotInput;
+
+    // 1 KiB leaves: the L0 shape, and what makes a leaf exactly LE_LANES words.
+    let (depth, leaf_bytes, n_open) = (2usize, 1024usize, 4usize);
+    let nu = 3usize; // Merkle k_log is 19 here, so M = 22 at the Ligerito floor
+    let mut rng = Rng(0x_3B_1EA_F00);
+    let tree = Tree::new(depth, leaf_bytes, &mut rng);
+
+    let v: Vec<F128> = (0..LE_VARS)
+        .map(|_| F128::new(rng.next_u32() as u64 | 1, rng.next_u32() as u64))
+        .collect();
+    let alpha: Vec<F128> = (0..n_open)
+        .map(|_| F128::new(rng.next_u32() as u64, rng.next_u32() as u64 | 1))
+        .collect();
+    let positions: Vec<usize> = (0..n_open).map(|i| i % (1 << depth)).collect();
+
+    // ---- setup ----
+    let mut sb = ShapeBuilder::new(nu);
+    let merkle = sb.slot(MerklePathGate::new(depth, leaf_bytes, nu, 1 << depth));
+    let leafeval = sb.slot(LeafEvalGate::new());
+
+    let v_w: Vec<Wire> = (0..LE_VARS).map(|_| sb.public_input()).collect();
+    let mut acc = sb.public_input(); // the accumulator's seed, published as zero
+    let mut roots = Vec::new();
+    for _ in 0..n_open {
+        let leaf_w: Vec<Wire> = (0..LE_LANES).map(|_| sb.input()).collect();
+        let idx_w = sb.public_input();
+
+        // The join: `leaf_w` feeds the Merkle gate AND the arithmetic gate.
+        let mut m_in = leaf_w.clone();
+        m_in.push(idx_w);
+        roots.push(sb.gate_hinted(merkle, &m_in));
+
+        let mut a_in = leaf_w;
+        a_in.extend_from_slice(&v_w);
+        a_in.push(sb.public_input()); // alpha_i
+        a_in.push(acc);
+        acc = sb.gate(leafeval, &a_in)[0];
+    }
+    for r in &roots {
+        sb.publish(r[0]);
+        sb.publish(r[1]);
+    }
+    sb.publish(acc);
+    let shape = sb.finish().expect("valid circuit");
+
+    // ---- online ----
+    let mut vals: Vec<F128> = v.clone();
+    vals.push(F128::ZERO); // accumulator seed
+    let mut hints: Vec<Vec<[u32; SLOT_WORDS]>> = Vec::new();
+    for (i, &pos) in positions.iter().enumerate() {
+        let leaf = tree.leaf(pos);
+        vals.extend((0..LE_LANES).map(|w| leaf_word(leaf, 16 * w)));
+        vals.push(F128::new(table_index(pos, depth) as u64, 0));
+        vals.push(alpha[i]);
+        hints.push(tree.siblings(pos));
+    }
+    let hint_refs: Vec<&dyn std::any::Any> =
+        hints.iter().map(|h| h as &dyn std::any::Any).collect();
+    let built = shape.run(&vals, &hint_refs);
+
+    // ---- the join is structural, not incidental ----
+    // Every leaf word must be ONE wire class holding a cell in the Merkle
+    // slot's leaf region and a cell in the leaf-eval slot's. Without this the
+    // test would pass just as well on two unrelated circuits that happen to
+    // agree numerically, which is exactly what the wiring layer is for.
+    let iota_base = |reg: usize| -> usize {
+        (0..reg)
+            .map(|i| shape.registry.types()[i].io_schema.len())
+            .sum()
+    };
+    let (m_leaf, l_leaf) = (
+        iota_base(shape.registry_slot(merkle)),
+        iota_base(shape.registry_slot(leafeval)),
+    );
+    let joined = flock_core::circuit::wire_cells(&shape.circuit)
+        .iter()
+        .filter(|cls| {
+            let has = |lo: usize| cls.iter().any(|c| (lo..lo + LE_LANES).contains(&c.slot));
+            has(m_leaf) && has(l_leaf)
+        })
+        .count();
+    assert_eq!(
+        joined,
+        LE_LANES * n_open,
+        "leaf words are not shared between the Merkle and arithmetic slots"
+    );
+
+    // ---- the accumulator IS the verifier's enforced_sum ----
+    let eq = build_eq_table(&v);
+    let want = positions
+        .iter()
+        .enumerate()
+        .fold(F128::ZERO, |s, (i, &pos)| {
+            let leaf = tree.leaf(pos);
+            let dot = (0..LE_LANES)
+                .map(|w| leaf_word(leaf, 16 * w) * eq[w])
+                .fold(F128::ZERO, |a, x| a + x);
+            s + alpha[i] * dot
+        });
+    assert_eq!(
+        *built.public.last().unwrap(),
+        want,
+        "the circuit's accumulator disagrees with enforced_sum"
+    );
+    // ...and every opening still folds to the tree root.
+    let root_want = digest_words(&hash_to_digest(&tree.root));
+    let base = built.public.len() - 1 - 2 * n_open;
+    for i in 0..n_open {
+        assert_eq!(
+            [built.public[base + 2 * i], built.public[base + 2 * i + 1]],
+            root_want,
+            "opening {i} root"
+        );
+    }
+
+    // ---- prove / verify, both classes ----
+    let union = UnionInstance::new(&shape.registry, shape.counts.clone());
+    let pcs_params = PcsParams {
+        m: union.dense_m(),
+        log_inv_rate: 1,
+        log_batch_size: 6,
+        profile: LigeritoProfile::Fast,
+        num_lanes: union.commit_lanes(6),
+        merkle_hash: Default::default(),
+    };
+    let layout = MerkleTreeLayout::with_blake3_chunk_leaf(depth, leaf_bytes, blake3_spec());
+    let walker = layout.build_walker();
+    let el = match &built.witnesses[shape.registry_slot(leafeval)] {
+        SlotWitness::Element(z) => z.clone(),
+        other => panic!("leaf-eval slot produced {other:?}"),
+    };
+    // The fold is pinned by the relation, not merely consistent with it:
+    // an honest witness satisfies, and perturbing any one intermediate — a
+    // `mult_lin` product, its `linear` partner, or the alpha product — does
+    // not. Otherwise the accumulator could be reached without doing the
+    // arithmetic.
+    {
+        let ty = &LeafEvalGate::new().ty;
+        assert!(ty.satisfies(&el, nu, n_open), "honest leaf-eval witness");
+        for (what, col) in [
+            ("fold product", le_base(1)),
+            ("fold sum", le_base(4) + 1),
+            ("alpha product", LE_T),
+        ] {
+            let mut bad = el.clone();
+            bad[col << nu] += F128::ONE;
+            assert!(
+                !ty.satisfies(&bad, nu, n_open),
+                "{what} (column {col}) is not constrained"
+            );
+        }
+    }
+
+    let m_witness =
+        layout.generate_witness_batch_major_partial_chunk(built.rows::<MerklePathGate>(merkle), nu);
+
+    let mut ch = FsChallenger::new(DOMAIN);
+    let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_circuit(
+        &union,
+        &shape.circuit,
+        &built.public,
+        &pcs_params,
+        vec![UnionSlotProverInput::new(m_witness, &walker)],
+        vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
+            dst.copy_from_slice(&el)
+        })],
+        &mut ch,
+    );
+
+    let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![&walker];
+    let mut ch = FsChallenger::new(DOMAIN);
+    verifier::verify_ligerito_jagged_union_circuit(
+        &union,
+        &shape.circuit,
+        &built.public,
+        &lcs,
+        &commitment,
+        &proof,
+        &pcs_params,
+        &mut ch,
+    )
+    .expect("the joined Merkle + leaf-arithmetic circuit verifies");
+
+    // Tampering with the claimed sum breaks it — the accumulator is wired to
+    // the same leaf words the Merkle openings bind.
+    let mut bad = built.public.clone();
+    let last = bad.len() - 1;
+    bad[last] += F128::ONE;
+    let mut ch = FsChallenger::new(DOMAIN);
+    assert!(
+        verifier::verify_ligerito_jagged_union_circuit(
+            &union,
+            &shape.circuit,
+            &bad,
+            &lcs,
+            &commitment,
+            &proof,
+            &pcs_params,
+            &mut ch,
+        )
+        .is_err(),
+        "a tampered enforced_sum must be rejected"
+    );
 }
