@@ -54,6 +54,7 @@ const DOMAIN: &[u8] = b"flock-circuit-merkle-v0";
 
 const CHUNK_START: u32 = 1 << 0;
 const CHUNK_END: u32 = 1 << 1;
+const PARENT: u32 = 1 << 2;
 
 const IV: [u32; 8] = [
     0x6A09_E667,
@@ -105,6 +106,11 @@ fn leaf_word(data: &[u8], o: usize) -> F128 {
         u64::from_le_bytes(data[o..o + 8].try_into().unwrap()),
         u64::from_le_bytes(data[o + 8..o + 16].try_into().unwrap()),
     )
+}
+
+fn unpack8(a: F128, b: F128) -> [u32; SLOT_WORDS] {
+    let (x, y) = (unpack4(a), unpack4(b));
+    [x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3]]
 }
 
 fn digest_words(d: &[u32; SLOT_WORDS]) -> [F128; 2] {
@@ -2152,4 +2158,267 @@ fn mvp5_all_levels_query_phase() {
         bincode::serialize(&proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
     );
     println!("{report}");
+}
+
+// ---------------------------------------------------------------------------
+// The collapsed opening: wiring over ONE BLAKE3 table
+// ---------------------------------------------------------------------------
+
+use flock_prover::r1cs_hashes::merkle_glue::{BitSpreadTable, SwapInput, SwapTable};
+
+/// One Merkle level's conditional swap. The sibling is a [`GateType::Hint`] —
+/// it is not word-aligned-wireable in the composite and nothing else reads it
+/// here either, so it stays free witness.
+struct SwapGate {
+    nu: usize,
+}
+
+impl GateType for SwapGate {
+    type Row = SwapInput;
+    type Hint = [u32; SLOT_WORDS];
+
+    fn table(&self) -> TableType {
+        TableType::from_block_r1cs(&SwapTable::build_block_r1cs(self.nu))
+            .with_io_schema(SwapTable::io_schema())
+    }
+
+    fn eval(&self, inputs: &[F128], hint: &Self::Hint) -> (Vec<F128>, Self::Row) {
+        let row = SwapInput {
+            bit_word: (inputs[0].lo as u128) | ((inputs[0].hi as u128) << 64),
+            prev: unpack8(inputs[1], inputs[2]),
+            sib: *hint,
+        };
+        let (left, right) = SwapTable::outputs(&row);
+        let (lw, rw) = (digest_words(&left), digest_words(&right));
+        (vec![lw[0], lw[1], rw[0], rw[1]], row)
+    }
+
+    fn witness(&self, _rows: &[Self::Row], _nu: usize) -> SlotWitness {
+        SlotWitness::DeferredToRows
+    }
+}
+
+/// Relocate each of the index word's low `depth` bits into its own word, so a
+/// per-level swap row can read it at the one column its uniform relation is
+/// allowed to look at.
+struct BitSpreadGate {
+    ty: BitSpreadTable,
+    nu: usize,
+}
+
+impl GateType for BitSpreadGate {
+    type Row = u128;
+    type Hint = ();
+
+    fn table(&self) -> TableType {
+        TableType::from_block_r1cs(&self.ty.build_block_r1cs(self.nu))
+            .with_io_schema(self.ty.io_schema())
+    }
+
+    fn eval(&self, inputs: &[F128], _hint: &()) -> (Vec<F128>, u128) {
+        let idx = (inputs[0].lo as u128) | ((inputs[0].hi as u128) << 64);
+        let outs = (0..self.ty.depth)
+            .map(|l| F128::new(((idx >> l) & 1) as u64, 0))
+            .collect();
+        (outs, idx)
+    }
+
+    fn witness(&self, _rows: &[Self::Row], _nu: usize) -> SlotWitness {
+        SlotWitness::DeferredToRows
+    }
+}
+
+/// The three slots a collapsed opening writes into.
+#[derive(Clone, Copy)]
+struct CollapsedSlots {
+    b3: flock_core::circuit::builder::SlotId,
+    swap: flock_core::circuit::builder::SlotId,
+    spread: flock_core::circuit::builder::SlotId,
+}
+
+/// Emit one Merkle opening as rows of the shipped BLAKE3 table plus glue,
+/// wired together. Returns the two words of the root.
+///
+/// This is what replaces a composite row. The dataflow, per level:
+///
+/// ```text
+///   index word ─▶ BitSpread ─bit_l─▶ Swap ─left‖right─▶ BLAKE3 ─out_lo─▶ next Swap.prev
+/// ```
+///
+/// and before it, the chunk chain: `leaf_blocks` BLAKE3 rows whose out_lo
+/// threads row to row, seeded by the IV, `CHUNK_START` on the first and
+/// `CHUNK_END` on the last. Every arrow is a copy constraint on whole words.
+#[allow(clippy::too_many_arguments)]
+fn emit_opening(
+    sb: &mut ShapeBuilder,
+    s: CollapsedSlots,
+    iv: [Wire; 2],
+    leaf_w: &[Wire],
+    index_w: Wire,
+    depth: usize,
+    pubs: &mut Vec<F128>,
+) -> [Wire; 2] {
+    let blocks = leaf_w.len() / 4;
+    assert_eq!(leaf_w.len(), 4 * blocks, "leaf is whole 64-byte blocks");
+
+    // The index word's bits, one per level.
+    let bits = sb.gate(s.spread, &[index_w]);
+
+    // Chunk chain: the leaf hashed as a BLAKE3 chunk.
+    let mut cv = iv;
+    for i in 0..blocks {
+        let mut flags = 0u32;
+        if i == 0 {
+            flags |= CHUNK_START;
+        }
+        if i + 1 == blocks {
+            flags |= CHUNK_END;
+        }
+        pubs.push(pack_params(0, 64, flags));
+        let params = sb.public_input();
+        let out = sb.gate(
+            s.b3,
+            &[
+                cv[0],
+                cv[1],
+                leaf_w[4 * i],
+                leaf_w[4 * i + 1],
+                leaf_w[4 * i + 2],
+                leaf_w[4 * i + 3],
+                params,
+            ],
+        );
+        cv = [out[0], out[1]];
+    }
+
+    // Node levels: swap, then a PARENT compression over the swapped pair.
+    // The sibling is the swap's hint, supplied at `run` time in this call
+    // order — setup has no values.
+    for l in 0..depth {
+        let sw = sb.gate_hinted(s.swap, &[bits[l], cv[0], cv[1]]);
+        pubs.push(pack_params(0, 64, PARENT));
+        let params = sb.public_input();
+        let out = sb.gate(s.b3, &[iv[0], iv[1], sw[0], sw[1], sw[2], sw[3], params]);
+        cv = [out[0], out[1]];
+    }
+    cv
+}
+
+/// **The collapse, one opening at a time.** Emit an opening as BLAKE3 rows
+/// plus glue and check the root it computes is the one the composite computes
+/// — for the real L0 shape and a small one, at every index polarity that
+/// exercises both swap directions.
+///
+/// If this holds, a composite row and `leaf_blocks + depth` wired rows are
+/// interchangeable, and the whole collapse is a matter of scale.
+#[test]
+#[ignore] // Builds real BLAKE3 matrices. `-- --ignored`.
+fn collapsed_opening_matches_the_composite() {
+    for (depth, leaf_bytes, n_open) in [(3usize, 128usize, 8usize), (14, 1024, 3)] {
+        let blocks = leaf_bytes / 64;
+        let mut rng = Rng(0x_C0_11_09_5E ^ depth as u64);
+        let tree = Tree::new(depth, leaf_bytes, &mut rng);
+        // Rows: one bit-spread + `blocks + depth` BLAKE3 + `depth` swaps each.
+        let nu = (((blocks + depth) * n_open)
+            .next_power_of_two()
+            .trailing_zeros() as usize)
+            .max(3);
+
+        let mut sb = ShapeBuilder::new(nu);
+        let slots = CollapsedSlots {
+            b3: sb.slot(Blake3Gate { nu }),
+            swap: sb.slot(SwapGate { nu }),
+            spread: sb.slot(BitSpreadGate {
+                ty: BitSpreadTable::new(depth),
+                nu,
+            }),
+        };
+
+        let mut pubs: Vec<F128> = Vec::new();
+        let iv_w = pack8(&IV);
+        pubs.push(iv_w[0]);
+        pubs.push(iv_w[1]);
+        let iv = [sb.public_input(), sb.public_input()];
+
+        let positions: Vec<usize> = (0..n_open).map(|i| (i * 5 + 1) % (1 << depth)).collect();
+        let mut leaf_vals: Vec<F128> = Vec::new();
+        let mut idx_vals: Vec<F128> = Vec::new();
+        let mut roots = Vec::new();
+        for &pos in &positions {
+            let leaf_w: Vec<Wire> = (0..4 * blocks).map(|_| sb.input()).collect();
+            let index_w = sb.input();
+            roots.push(emit_opening(
+                &mut sb, slots, iv, &leaf_w, index_w, depth, &mut pubs,
+            ));
+            let leaf = tree.leaf(pos);
+            leaf_vals.extend((0..4 * blocks).map(|w| leaf_word(leaf, 16 * w)));
+            idx_vals.push(F128::new(pos as u64, 0));
+        }
+        for r in &roots {
+            sb.publish(r[0]);
+            sb.publish(r[1]);
+        }
+        let shape = sb.finish().expect("valid collapsed circuit");
+
+        // Inputs in declaration order: iv, then per opening (params are
+        // public_inputs emitted INSIDE emit_opening, already in `pubs`), and
+        // the leaf/index free wires. Rebuild that order exactly.
+        let mut vals: Vec<F128> = vec![iv_w[0], iv_w[1]];
+        let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
+        for (i, &pos) in positions.iter().enumerate() {
+            let leaf = tree.leaf(pos);
+            vals.extend((0..4 * blocks).map(|w| leaf_word(leaf, 16 * w)));
+            vals.push(idx_vals[i]);
+            // Then `emit_opening`'s own public params, in its call order.
+            for b in 0..blocks {
+                let mut f = 0u32;
+                if b == 0 {
+                    f |= CHUNK_START;
+                }
+                if b + 1 == blocks {
+                    f |= CHUNK_END;
+                }
+                vals.push(pack_params(0, 64, f));
+            }
+            for _ in 0..depth {
+                vals.push(pack_params(0, 64, PARENT));
+            }
+            hints.extend(tree.siblings(pos));
+        }
+        let hint_refs: Vec<&dyn std::any::Any> =
+            hints.iter().map(|h| h as &dyn std::any::Any).collect();
+        let built = shape.run(&vals, &hint_refs);
+
+        // Every opening's root is the tree's — i.e. the collapsed rows fold
+        // exactly as `root_chunk` does.
+        let layout = MerkleTreeLayout::with_blake3_chunk_leaf(depth, leaf_bytes, blake3_spec());
+        let want = digest_words(&hash_to_digest(&tree.root));
+        let base = built.public.len() - 2 * n_open;
+        for (i, &pos) in positions.iter().enumerate() {
+            assert_eq!(
+                [built.public[base + 2 * i], built.public[base + 2 * i + 1]],
+                want,
+                "depth {depth} opening {i} (pos {pos}) root"
+            );
+            // ...and it agrees with the composite on the same input.
+            let composite = layout.root_chunk(&ChunkPathInput {
+                leaf_data: tree.leaf(pos).to_vec(),
+                index: pos as u128,
+                siblings: tree.siblings(pos),
+            });
+            assert_eq!(
+                digest_words(&composite),
+                want,
+                "depth {depth} opening {i}: composite disagrees with the tree"
+            );
+        }
+        println!(
+            "  depth {depth} leaf {leaf_bytes}: {n_open} openings = {} blake3 + {} swap + \
+             {} spread rows, nu {nu}, mu {}",
+            shape.counts[shape.registry_slot(slots.b3)],
+            shape.counts[shape.registry_slot(slots.swap)],
+            shape.counts[shape.registry_slot(slots.spread)],
+            shape.circuit.cells().mu(),
+        );
+    }
 }
