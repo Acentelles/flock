@@ -1552,6 +1552,68 @@ fn mvp4_slice(depth: usize, n_queries: usize, nu: usize) {
         "a tampered transcript word must be rejected"
     );
 
+    // ---- trace size ----
+    // Two different sizes, and they behave differently:
+    //  * COMMITTED is jagged — `dense_words` sums `used_cols(ty) * n_t` over
+    //    real row counts, then rounds to a power of two. This is what the PCS
+    //    commits and opens.
+    //  * ADDRESS SPACE is capacity-based — `m_bool` is
+    //    `next_pow2(sum 2^(nu + k_log))`, so every slot pays a full `2^nu`
+    //    rows whether it uses them or not. This is what the zerocheck and
+    //    lincheck run over, and it is where the padding bites.
+    {
+        let mut hdr = format!(
+            "\nTRACE SIZE\n  {:<10} {:>6} {:>12} {:>8} {:>6} {:>12} {:>7}\n",
+            "slot", "k_log", "useful bits", "words", "rows", "dense words", "used"
+        );
+        let mut addr_cells = 0usize;
+        for (i, ty) in shape.registry.types().iter().enumerate() {
+            let words = ty.useful_bits.div_ceil(128);
+            let n_t = shape.counts[i];
+            let cells = 1usize << (nu + ty.k_log);
+            addr_cells += cells;
+            let name = if i == shape.registry_slot(hash) {
+                "blake3"
+            } else if i == shape.registry_slot(merkle) {
+                "merkle"
+            } else {
+                "leaf-eval"
+            };
+            hdr += &format!(
+                "  {:<10} {:>6} {:>12} {:>8} {:>6} {:>12} {:>6.1}%\n",
+                name,
+                ty.k_log,
+                ty.useful_bits,
+                words,
+                format!("{}/{}", n_t, 1usize << nu),
+                words * n_t,
+                100.0 * (words * n_t) as f64 / (cells / 128) as f64,
+            );
+        }
+        hdr += &format!(
+            "  {:<10} {:>6} {:>12} {:>8} {:>6} {:>12}\n",
+            "TOTAL",
+            "",
+            "",
+            "",
+            "",
+            union.dense_words()
+        );
+        hdr += &format!(
+            "  committed {} words (2^{}) | address space 2^{} cells = {} words \
+             ({:.1}% used)\n  M_bool {} | M_elem {} | M_total {}\n",
+            union.committed_words(),
+            union.dense_m() - 7,
+            (addr_cells as f64).log2().ceil() as usize,
+            addr_cells / 128,
+            100.0 * union.dense_words() as f64 / (addr_cells / 128) as f64,
+            union.m_bool(),
+            union.m_elem(),
+            union.m_total(),
+        );
+        println!("{hdr}");
+    }
+
     println!(
         "\nMVP-4 query phase: {n_queries} queries over a 2^{depth} x 1 KiB commitment\n\
            slots: blake3 {} rows, merkle {} rows, leaf-eval {} rows | public {} | \
