@@ -28,7 +28,7 @@
 //! Small shape (depth 2, 128-byte leaves) so the composite is 4 base blocks;
 //! the geometry is identical at the L0 shape, only wider.
 
-use flock_core::circuit::builder::{CircuitBuilder, GateType, SlotWitness, Wire};
+use flock_core::circuit::builder::{CircuitBuilder, GateType, ShapeBuilder, SlotWitness, Wire};
 use flock_core::field::F128;
 use flock_core::merkle::{self as core_merkle, HashKind};
 use flock_core::pcs::PcsParams;
@@ -310,7 +310,7 @@ fn merkle_openings_through_the_builder() {
                 .map(|w| b.public_value(leaf_word(leaf, 16 * w)))
                 .collect();
             inputs.push(b.public_value(F128::new(table_index(pos, depth) as u64, 0)));
-            b.gate_with_hint(g, &inputs, &tree.siblings(pos))
+            b.gate_with_hint(g, &inputs, tree.siblings(pos))
         })
         .collect();
     for root in &roots {
@@ -319,7 +319,7 @@ fn merkle_openings_through_the_builder() {
     }
 
     let built = b.finish().expect("builder produces a valid circuit");
-    assert_eq!(built.counts, vec![positions.len()]);
+    assert_eq!(built.shape.counts, vec![positions.len()]);
 
     // Every opening's row is the opening we asked for, and every published
     // root is the tree's.
@@ -331,7 +331,7 @@ fn merkle_openings_through_the_builder() {
         assert_eq!(rows[i].index, table_index(pos, depth), "row {i} index");
         assert_eq!(rows[i].siblings, tree.siblings(pos), "row {i} siblings");
     }
-    let published = &built.public[built.public.len() - 2 * positions.len()..];
+    let published = &built.witness.public[built.witness.public.len() - 2 * positions.len()..];
     for i in 0..positions.len() {
         assert_eq!(
             [published[2 * i], published[2 * i + 1]],
@@ -386,7 +386,7 @@ fn merkle_index_wired_to_a_challenge() {
         .map(|w| b.public_value(leaf_word(leaf, 16 * w)))
         .collect();
     inputs.push(out[0]); // ← the binding: challenge word IS the index word
-    let root = b.gate_with_hint(merkle, &inputs, &tree.siblings(pos));
+    let root = b.gate_with_hint(merkle, &inputs, tree.siblings(pos));
     b.publish(root[0]);
     b.publish(root[1]);
 
@@ -396,14 +396,14 @@ fn merkle_index_wired_to_a_challenge() {
     // and it arrived by WIRE: the public segment is the 7 compression inputs,
     // the 8 leaf words and the 2 published root halves, with no index among
     // them. Nothing but the copy constraint put it there.
-    assert_eq!(built.public.len(), 7 + leaf_bytes / 16 + 2);
+    assert_eq!(built.witness.public.len(), 7 + leaf_bytes / 16 + 2);
     let rows = built.rows::<MerklePathGate>(merkle);
     assert_eq!(rows.len(), 1);
     assert_eq!(
         rows[0].index, index,
         "the whole challenge word reached the row"
     );
-    let published = &built.public[built.public.len() - 2..];
+    let published = &built.witness.public[built.witness.public.len() - 2..];
     assert_eq!(
         [published[0], published[1]],
         digest_words(&hash_to_digest(&tree.root)),
@@ -411,7 +411,7 @@ fn merkle_index_wired_to_a_challenge() {
     );
 
     // ---- prove / verify ----
-    let union = UnionInstance::new(&built.registry, built.counts.clone());
+    let union = UnionInstance::new(&built.shape.registry, built.shape.counts.clone());
     let pcs_params = PcsParams {
         m: union.dense_m(),
         log_inv_rate: 1,
@@ -454,8 +454,8 @@ fn merkle_index_wired_to_a_challenge() {
     let mut ch = FsChallenger::new(DOMAIN);
     let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_circuit(
         &union,
-        &built.circuit,
-        &built.public,
+        &built.shape.circuit,
+        &built.witness.public,
         &pcs_params,
         slots.into_iter().map(|(_, s)| s).collect(),
         Vec::new(),
@@ -465,8 +465,8 @@ fn merkle_index_wired_to_a_challenge() {
     let mut ch = FsChallenger::new(DOMAIN);
     verifier::verify_ligerito_jagged_union_circuit(
         &union,
-        &built.circuit,
-        &built.public,
+        &built.shape.circuit,
+        &built.witness.public,
         &lcs,
         &commitment,
         &proof,
@@ -476,14 +476,14 @@ fn merkle_index_wired_to_a_challenge() {
     .expect("a challenge-derived Merkle opening verifies");
 
     // A wrong claimed root breaks the wiring — the opening is doing work.
-    let mut bad = built.public.clone();
+    let mut bad = built.witness.public.clone();
     let last = bad.len() - 1;
     bad[last] += F128::ONE;
     let mut ch = FsChallenger::new(DOMAIN);
     assert!(
         verifier::verify_ligerito_jagged_union_circuit(
             &union,
-            &built.circuit,
+            &built.shape.circuit,
             &bad,
             &lcs,
             &commitment,
@@ -530,34 +530,49 @@ fn l0_shape_circuit_cost() {
     std::hint::black_box(MerklePathGate::new(depth, leaf_bytes, nu, 1 << depth).table());
     let table_ms = t.elapsed().as_secs_f64() * 1e3;
 
+    // ---- SETUP: no values, no field arithmetic, paid once ----
     let t = Instant::now();
-    let mut b = CircuitBuilder::new(nu);
-    let g = b.slot(MerklePathGate::new(depth, leaf_bytes, nu, 1 << depth));
-    let positions: Vec<usize> = (0..n_paths).map(|i| (i * 37 + 11) % (1 << depth)).collect();
-    let roots: Vec<Vec<Wire>> = positions
-        .iter()
-        .map(|&pos| {
-            let leaf = tree.leaf(pos);
+    let mut sb = ShapeBuilder::new(nu);
+    let g = sb.slot(MerklePathGate::new(depth, leaf_bytes, nu, 1 << depth));
+    let roots: Vec<Vec<Wire>> = (0..n_paths)
+        .map(|_| {
             // Leaf data is free witness here — bound by the root, not pinned.
             // In the full verifier it is wired to the arithmetic gate instead.
-            let mut inputs: Vec<Wire> = (0..leaf_bytes / 16)
-                .map(|w| b.value(leaf_word(leaf, 16 * w)))
-                .collect();
-            inputs.push(b.public_value(F128::new(table_index(pos, depth) as u64, 0)));
-            b.gate_with_hint(g, &inputs, &tree.siblings(pos))
+            let mut ins: Vec<Wire> = (0..leaf_bytes / 16).map(|_| sb.input()).collect();
+            ins.push(sb.public_input());
+            sb.gate_hinted(g, &ins)
         })
         .collect();
     for root in &roots {
-        b.publish(root[0]);
-        b.publish(root[1]);
+        sb.publish(root[0]);
+        sb.publish(root[1]);
     }
-    let gates_ms = t.elapsed().as_secs_f64() * 1e3;
-    let t2 = Instant::now();
-    let built = b.finish().expect("builder produces a valid circuit");
-    let finish_ms = t2.elapsed().as_secs_f64() * 1e3;
-    let build_ms = t.elapsed().as_secs_f64() * 1e3;
+    let shape = sb.finish().expect("builder produces a valid circuit");
+    let setup_ms = t.elapsed().as_secs_f64() * 1e3;
 
-    let union = UnionInstance::new(&built.registry, built.counts.clone());
+    // ---- ONLINE: this proof's values ----
+    let positions: Vec<usize> = (0..n_paths).map(|i| (i * 37 + 11) % (1 << depth)).collect();
+    let gather = || {
+        let mut vals = Vec::with_capacity(shape.num_inputs());
+        let mut hints = Vec::with_capacity(n_paths);
+        for &pos in &positions {
+            let leaf = tree.leaf(pos);
+            vals.extend((0..leaf_bytes / 16).map(|w| leaf_word(leaf, 16 * w)));
+            vals.push(F128::new(table_index(pos, depth) as u64, 0));
+            hints.push(tree.siblings(pos));
+        }
+        (vals, hints)
+    };
+    let (vals, hints) = gather();
+    let hint_refs: Vec<&dyn std::any::Any> =
+        hints.iter().map(|h| h as &dyn std::any::Any).collect();
+
+    std::hint::black_box(shape.run(&vals, &hint_refs)); // warm
+    let t = Instant::now();
+    let built = shape.run(&vals, &hint_refs);
+    let online_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    let union = UnionInstance::new(&shape.registry, shape.counts.clone());
     let pcs_params = PcsParams {
         m: union.dense_m(),
         log_inv_rate: 1,
@@ -575,7 +590,7 @@ fn l0_shape_circuit_cost() {
         let mut ch = FsChallenger::new(DOMAIN);
         prover::prove_fast_ligerito_jagged_union_circuit(
             &union,
-            &built.circuit,
+            &shape.circuit,
             &built.public,
             &pcs_params,
             vec![UnionSlotProverInput::new(witness, &walker)],
@@ -615,7 +630,7 @@ fn l0_shape_circuit_cost() {
     let t = Instant::now();
     verifier::verify_ligerito_jagged_union_circuit(
         &union,
-        &built.circuit,
+        &shape.circuit,
         &built.public,
         &lcs,
         &commitment,
@@ -629,35 +644,26 @@ fn l0_shape_circuit_cost() {
     let proof_kib = bincode::serialize(&proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0;
 
     // Split by what recurs. `circuit_structure_does_not_depend_on_the_witness`
-    // is what licenses the setup column: the statement is the same every
-    // proof, so anything that only builds the statement is paid once.
-    //
-    // `gates` straddles the line and is reported as it stands: only `eval` is
-    // witness work, the rest is wire-arena and union-find bookkeeping that a
-    // shape-once / replay-per-proof builder would move into setup. Until that
-    // split exists the whole phase is on the per-proof path, so `per-proof
-    // (today)` is honest and `per-proof (floor)` is what the split would buy.
-    let per_proof_now = gates_ms + wit_ms + prove_ms;
-    let per_proof_floor = eval_ms + wit_ms + prove_ms;
+    // licenses the setup line: the statement is identical every proof, so
+    // `ShapeBuilder::finish` is paid once and `CircuitShape::run` per proof.
+    let per_proof = online_ms + wit_ms + prove_ms;
     println!(
         "\nL0 shape as a CIRCUIT: {n_paths} openings, depth {depth}, {leaf_bytes} B leaves\n\
            k_log {}  nu {nu}  dense_m {}  public {}  wires {}  proof {proof_kib:.1} KiB  \
          {threads} threads\n\
          \n\
-           PER PROOF (today)  {per_proof_now:6.0} ms = gates {gates_ms:.0} + witgen \
-         {wit_ms:.0} + prove {prove_ms:.0}\n\
-           PER PROOF (floor)  {per_proof_floor:6.0} ms = eval  {eval_ms:.0} + witgen \
-         {wit_ms:.0} + prove {prove_ms:.0}   (needs the builder split)\n\
-           verifier side      {verify_ms:6.1} ms\n\
-           one-time setup     {finish_ms:6.0} ms = finish, of which TableType \
+           PER PROOF     {per_proof:6.0} ms = online {online_ms:.0} (of which eval \
+         {eval_ms:.0}) + witgen {wit_ms:.0} + prove {prove_ms:.0}\n\
+           verifier side {verify_ms:6.1} ms\n\
+           SETUP         {setup_ms:6.0} ms = shape + finish, of which TableType \
          {table_ms:.0}   (tree gen {tree_ms:.0} ms is the test's own fixture)\n\
          \n\
-           compare `cargo bench --bench merkle_l0_opening`: 48 ms prove for the \
+        compare `cargo bench --bench merkle_l0_opening`: 48 ms prove for the \
          same rows unwired.\n",
         layout.k_log,
         union.dense_m(),
         built.public.len(),
-        built.circuit.wires().len(),
+        shape.circuit.wires().len(),
     );
 }
 
@@ -690,7 +696,7 @@ fn circuit_structure_does_not_depend_on_the_witness() {
                     .map(|w| b.value(leaf_word(leaf, 16 * w)))
                     .collect();
                 inputs.push(b.public_value(F128::new(table_index(pos, depth) as u64, 0)));
-                b.gate_with_hint(g, &inputs, &tree.siblings(pos))
+                b.gate_with_hint(g, &inputs, tree.siblings(pos))
             })
             .collect();
         for root in &roots {
@@ -704,14 +710,14 @@ fn circuit_structure_does_not_depend_on_the_witness() {
     let (c, gc) = build(0x_B2_22_00_02, 3);
 
     assert_eq!(
-        a.circuit.digest(),
-        c.circuit.digest(),
+        a.shape.circuit.digest(),
+        c.shape.circuit.digest(),
         "the statement moved when only the witness did"
     );
-    assert_eq!(a.counts, c.counts);
-    assert_eq!(a.public.len(), c.public.len());
+    assert_eq!(a.shape.counts, c.shape.counts);
+    assert_eq!(a.witness.public.len(), c.witness.public.len());
     // ...and the witnesses really are different, so the check is not vacuous.
     let (ra, rc) = (a.rows::<MerklePathGate>(ga), c.rows::<MerklePathGate>(gc));
     assert_ne!(ra[0].leaf_data, rc[0].leaf_data, "same leaf data");
-    assert_ne!(a.public, c.public, "same public values");
+    assert_ne!(a.witness.public, c.witness.public, "same public values");
 }

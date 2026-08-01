@@ -189,7 +189,7 @@ fn blake3_chunk_chain_through_the_builder() {
     b.publish(cv[1]);
 
     let built = b.finish().expect("builder produces a valid circuit");
-    assert_eq!(built.counts, vec![n_blocks]);
+    assert_eq!(built.shape.counts, vec![n_blocks]);
 
     // The builder's rows must reproduce a plain native BLAKE3 chunk.
     let rows = built.rows::<Blake3Gate>(g);
@@ -208,11 +208,11 @@ fn blake3_chunk_chain_through_the_builder() {
         want_cv = out[0..8].try_into().unwrap();
     }
     // ...and the published result is that chunk's chaining value.
-    let published = &built.public[built.public.len() - 2..];
+    let published = &built.witness.public[built.witness.public.len() - 2..];
     assert_eq!(unpack8(published[0], published[1]), want_cv);
 
     // ---- prove / verify ----
-    let union = UnionInstance::new(&built.registry, built.counts.clone());
+    let union = UnionInstance::new(&built.shape.registry, built.shape.counts.clone());
     let pcs_params = PcsParams {
         m: union.dense_m(),
         log_inv_rate: 1,
@@ -227,8 +227,8 @@ fn blake3_chunk_chain_through_the_builder() {
     let mut ch = FsChallenger::new(DOMAIN);
     let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_circuit(
         &union,
-        &built.circuit,
-        &built.public,
+        &built.shape.circuit,
+        &built.witness.public,
         &pcs_params,
         vec![UnionSlotProverInput::new(
             blake3::generate_witness_batch_major_partial(rows, nu),
@@ -241,8 +241,8 @@ fn blake3_chunk_chain_through_the_builder() {
     let mut ch = FsChallenger::new(DOMAIN);
     verifier::verify_ligerito_jagged_union_circuit(
         &union,
-        &built.circuit,
-        &built.public,
+        &built.shape.circuit,
+        &built.witness.public,
         &[lc],
         &commitment,
         &proof,
@@ -253,14 +253,14 @@ fn blake3_chunk_chain_through_the_builder() {
 
     // A wrong claimed chunk output breaks the last wire equality — the wiring
     // is doing real work, not just decorating a satisfiable trace.
-    let mut bad = built.public.clone();
+    let mut bad = built.witness.public.clone();
     let last = bad.len() - 1;
     bad[last] += F128::ONE;
     let mut ch = FsChallenger::new(DOMAIN);
     assert!(
         verifier::verify_ligerito_jagged_union_circuit(
             &union,
-            &built.circuit,
+            &built.shape.circuit,
             &bad,
             &[lc],
             &commitment,
@@ -439,15 +439,15 @@ fn fs_chain_circuit_derives_the_challenges() {
     }
 
     let built = b.finish().expect("builder produces a valid circuit");
-    assert_eq!(built.counts, vec![trace.rows.len()]);
-    let pub_out = &built.public[built.public.len() - challenges.len()..];
+    assert_eq!(built.shape.counts, vec![trace.rows.len()]);
+    let pub_out = &built.witness.public[built.witness.public.len() - challenges.len()..];
     assert_eq!(
         pub_out, &challenges,
         "published challenges must be the real ones"
     );
 
     // ---- prove / verify ----
-    let union = UnionInstance::new(&built.registry, built.counts.clone());
+    let union = UnionInstance::new(&built.shape.registry, built.shape.counts.clone());
     let pcs_params = PcsParams {
         m: union.dense_m(),
         log_inv_rate: 1,
@@ -463,8 +463,8 @@ fn fs_chain_circuit_derives_the_challenges() {
     let mut c = FsChallenger::new(DOMAIN);
     let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_circuit(
         &union,
-        &built.circuit,
-        &built.public,
+        &built.shape.circuit,
+        &built.witness.public,
         &pcs_params,
         vec![UnionSlotProverInput::new(
             blake3::generate_witness_batch_major_partial(rows, nu),
@@ -476,8 +476,8 @@ fn fs_chain_circuit_derives_the_challenges() {
     let mut c = FsChallenger::new(DOMAIN);
     verifier::verify_ligerito_jagged_union_circuit(
         &union,
-        &built.circuit,
-        &built.public,
+        &built.shape.circuit,
+        &built.witness.public,
         &[lc],
         &commitment,
         &proof,
@@ -487,14 +487,14 @@ fn fs_chain_circuit_derives_the_challenges() {
     .expect("the FS chain circuit verifies");
 
     // A wrong claimed challenge breaks the wiring: it is derived, not asserted.
-    let mut bad = built.public.clone();
+    let mut bad = built.witness.public.clone();
     let last = bad.len() - 1;
     bad[last] += F128::ONE;
     let mut c = FsChallenger::new(DOMAIN);
     assert!(
         verifier::verify_ligerito_jagged_union_circuit(
             &union,
-            &built.circuit,
+            &built.shape.circuit,
             &bad,
             &[lc],
             &commitment,
@@ -509,7 +509,7 @@ fn fs_chain_circuit_derives_the_challenges() {
     println!(
         "FS chain circuit: {} rows, {} public words, {} challenges derived",
         trace.rows.len(),
-        built.public.len(),
+        built.witness.public.len(),
         challenges.len()
     );
 }
@@ -711,7 +711,7 @@ fn mvp_fs_chain_of_a_real_proof() {
     }
     let built = b.finish().expect("valid circuit");
 
-    let outer = UnionInstance::new(&built.registry, built.counts.clone());
+    let outer = UnionInstance::new(&built.shape.registry, built.shape.counts.clone());
     let outer_params = PcsParams {
         m: outer.dense_m(),
         log_inv_rate: 1,
@@ -728,8 +728,8 @@ fn mvp_fs_chain_of_a_real_proof() {
     let mut c = FsChallenger::new(DOMAIN);
     let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_circuit(
         &outer,
-        &built.circuit,
-        &built.public,
+        &built.shape.circuit,
+        &built.witness.public,
         &outer_params,
         vec![UnionSlotProverInput::new(
             blake3::generate_witness_batch_major_partial(rows, nu),
@@ -744,8 +744,8 @@ fn mvp_fs_chain_of_a_real_proof() {
     let mut c = FsChallenger::new(DOMAIN);
     verifier::verify_ligerito_jagged_union_circuit(
         &outer,
-        &built.circuit,
-        &built.public,
+        &built.shape.circuit,
+        &built.witness.public,
         &[lc],
         &commitment,
         &proof,
@@ -765,7 +765,7 @@ fn mvp_fs_chain_of_a_real_proof() {
         challenges.len(),
         trace.rows.len(),
         outer.m_total(),
-        built.public.len(),
+        built.witness.public.len(),
         bincode::serialize(&proof).unwrap().len(),
     );
 }
@@ -1025,13 +1025,13 @@ fn mvp2_sumcheck_round_consumes_a_derived_challenge() {
 
     let built = b.finish().expect("valid circuit");
     assert_eq!(
-        *built.public.last().unwrap(),
+        *built.witness.public.last().unwrap(),
         c_next,
         "the circuit's round output must equal the native one"
     );
 
     // ---- prove / verify ----
-    let outer = UnionInstance::new(&built.registry, built.counts.clone());
+    let outer = UnionInstance::new(&built.shape.registry, built.shape.counts.clone());
     let params = PcsParams {
         m: outer.dense_m(),
         log_inv_rate: 1,
@@ -1043,7 +1043,7 @@ fn mvp2_sumcheck_round_consumes_a_derived_challenge() {
     let r1cs = blake3::build_block_r1cs(nu);
     let lc = r1cs.csc_lincheck_circuit();
     let hash_rows = built.rows::<Blake3Gate>(hash);
-    let el = match &built.witnesses[built.registry_slot(arith)] {
+    let el = match &built.witness.witnesses[built.registry_slot(arith)] {
         SlotWitness::Element(z) => z.clone(),
         _ => panic!("arith slot is element-class"),
     };
@@ -1051,8 +1051,8 @@ fn mvp2_sumcheck_round_consumes_a_derived_challenge() {
     let mut c = FsChallenger::new(DOMAIN);
     let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_circuit(
         &outer,
-        &built.circuit,
-        &built.public,
+        &built.shape.circuit,
+        &built.witness.public,
         &params,
         vec![UnionSlotProverInput::new(
             blake3::generate_witness_batch_major_partial(hash_rows, nu),
@@ -1066,8 +1066,8 @@ fn mvp2_sumcheck_round_consumes_a_derived_challenge() {
     let mut c = FsChallenger::new(DOMAIN);
     verifier::verify_ligerito_jagged_union_circuit(
         &outer,
-        &built.circuit,
-        &built.public,
+        &built.shape.circuit,
+        &built.witness.public,
         &[lc],
         &commitment,
         &proof,
@@ -1078,14 +1078,14 @@ fn mvp2_sumcheck_round_consumes_a_derived_challenge() {
 
     // A wrong claimed round output is rejected: the challenge is derived and
     // the arithmetic consumes it, so the two halves cannot be decoupled.
-    let mut bad = built.public.clone();
+    let mut bad = built.witness.public.clone();
     let last = bad.len() - 1;
     bad[last] += F128::ONE;
     let mut c = FsChallenger::new(DOMAIN);
     assert!(
         verifier::verify_ligerito_jagged_union_circuit(
             &outer,
-            &built.circuit,
+            &built.shape.circuit,
             &bad,
             &[lc],
             &commitment,
@@ -1100,10 +1100,10 @@ fn mvp2_sumcheck_round_consumes_a_derived_challenge() {
     println!(
         "\n=== MVP-2: FS chain + one sumcheck round ===\n  \
          {} BLAKE3 rows + {} element rows, M={}, {} public words",
-        built.counts[built.registry_slot(hash)],
-        built.counts[built.registry_slot(arith)],
+        built.shape.counts[built.registry_slot(hash)],
+        built.shape.counts[built.registry_slot(arith)],
         outer.m_total(),
-        built.public.len(),
+        built.witness.public.len(),
     );
 }
 
@@ -1402,7 +1402,7 @@ fn mvp2b_full_element_zerocheck_replayed() {
     b.publish(running);
 
     let built = b.finish().expect("valid circuit");
-    let outer = UnionInstance::new(&built.registry, built.counts.clone());
+    let outer = UnionInstance::new(&built.shape.registry, built.shape.counts.clone());
     let params = PcsParams {
         m: outer.dense_m(),
         log_inv_rate: 1,
@@ -1414,7 +1414,7 @@ fn mvp2b_full_element_zerocheck_replayed() {
     let r1cs = blake3::build_block_r1cs(nu);
     let lc = r1cs.csc_lincheck_circuit();
     let hrows = built.rows::<Blake3Gate>(hash);
-    let el = match &built.witnesses[built.registry_slot(arith)] {
+    let el = match &built.witness.witnesses[built.registry_slot(arith)] {
         SlotWitness::Element(z) => z.clone(),
         _ => unreachable!(),
     };
@@ -1422,8 +1422,8 @@ fn mvp2b_full_element_zerocheck_replayed() {
     let mut c = FsChallenger::new(DOMAIN);
     let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_circuit(
         &outer,
-        &built.circuit,
-        &built.public,
+        &built.shape.circuit,
+        &built.witness.public,
         &params,
         vec![UnionSlotProverInput::new(
             blake3::generate_witness_batch_major_partial(hrows, nu),
@@ -1439,8 +1439,8 @@ fn mvp2b_full_element_zerocheck_replayed() {
     let mut c = FsChallenger::new(DOMAIN);
     verifier::verify_ligerito_jagged_union_circuit(
         &outer,
-        &built.circuit,
-        &built.public,
+        &built.shape.circuit,
+        &built.witness.public,
         &[lc],
         &commitment,
         &proof,
@@ -1455,10 +1455,10 @@ fn mvp2b_full_element_zerocheck_replayed() {
          zerocheck {m_words} rounds + lincheck {LC_ROUNDS} rounds | \
          {} BLAKE3 rows + {} element rows | M={} | {} public words | {} proof bytes\n  \
          prove {prove_ms:.1} ms | verify {verify_ms:.2} ms",
-        built.counts[built.registry_slot(hash)],
-        built.counts[built.registry_slot(arith)],
+        built.shape.counts[built.registry_slot(hash)],
+        built.shape.counts[built.registry_slot(arith)],
         outer.m_total(),
-        built.public.len(),
+        built.witness.public.len(),
         bincode::serialize(&proof).unwrap().len(),
     );
 }

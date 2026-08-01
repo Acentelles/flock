@@ -33,6 +33,8 @@
 //! a *regenerated* circuit must be the SAME circuit, not merely an equivalent
 //! one.
 
+use std::any::{Any, TypeId};
+
 use crate::field::F128;
 use crate::schedule::{IoDirection, Registry, TableType};
 
@@ -41,25 +43,23 @@ use super::{Cell, Circuit, CircuitError};
 /// A value in the circuit, and the cells that must hold it.
 ///
 /// A wire IS an equivalence class under construction: binding it as a gate
-/// input appends that gate's input cell to the class, and [`CircuitBuilder`]
-/// hands the finished classes to [`Circuit::new`].
+/// input appends that gate's input cell to the class, and the builder hands
+/// the finished classes to [`Circuit::new`].
 ///
 /// Wires are usable before their producer is emitted — a value can be consumed
 /// by a gate declared earlier in the program than the one that defines it,
 /// because a class is just a set. The Fiat–Shamir chain needs this: a squeezed
-/// challenge is re-absorbed into the transcript that produced it.
+/// challenge is re-absorbed into the transcript that produced it. In the online
+/// phase such a wire takes its value from the input that supplies it, and the
+/// producing gate's output is then *checked* against it rather than overwriting
+/// it — see [`CircuitShape::run`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Wire(usize);
 
 /// A declared gate slot. Indexes the builder's DECLARATION order, which is not
-/// the registry's slot order — see [`BuiltCircuit::registry_slot`].
+/// the registry's slot order — see [`CircuitShape::registry_slot`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SlotId(usize);
-
-struct WireData {
-    value: F128,
-    cells: Vec<Cell>,
-}
 
 /// One slot's committed witness, in the form its class's prover input wants.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,7 +72,7 @@ pub enum SlotWitness {
     /// bit-packed by the hash modules' `generate_witness_batch_major*`, which
     /// lives in `flock-prover`, above this crate — so the builder cannot
     /// produce those buffers and does not pretend to. Recover the typed rows
-    /// with [`BuiltCircuit::rows`] and hand them to that generator.
+    /// with [`CircuitWitness::rows`] and hand them to that generator.
     DeferredToRows,
 }
 
@@ -103,7 +103,7 @@ pub trait GateType {
     /// everything the relation depends on, so a wrong hint yields a row that
     /// fails to satisfy them — it cannot buy a false proof, only a broken one.
     /// Gates that need no advice set this to `()` and are instantiated with
-    /// [`CircuitBuilder::gate`].
+    /// [`ShapeBuilder::gate`].
     type Hint;
 
     /// The registry type: constraints, width, and the `io_schema` whose order
@@ -121,20 +121,25 @@ pub trait GateType {
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness;
 }
 
-/// Object-safe view of a declared slot, erasing `GateType::Row`.
-trait SlotBuild: std::any::Any {
+/// Object-safe view of a declared slot, erasing `GateType::Row` and
+/// `GateType::Hint`.
+///
+/// **Stateless.** Rows accumulate in the online phase, not here, so one shape
+/// can be run many times concurrently — the whole point of the split.
+trait SlotBuild: Any {
     fn table(&self) -> TableType;
     fn n_in(&self) -> usize;
-    fn push(&mut self, inputs: &[F128], hint: &dyn std::any::Any) -> Vec<F128>;
-    fn rows(&self) -> usize;
-    fn witness(&self, nu: usize) -> SlotWitness;
-    fn as_any(&self) -> &dyn std::any::Any;
+    fn n_out(&self) -> usize;
+    /// A fresh, empty `Vec<G::Row>` for one online run.
+    fn new_rows(&self) -> Box<dyn Any>;
+    /// Evaluate one gate, appending its row.
+    fn push(&self, rows: &mut dyn Any, inputs: &[F128], hint: &dyn Any) -> Vec<F128>;
+    fn witness(&self, rows: &dyn Any, nu: usize) -> SlotWitness;
 }
 
 struct GateSlot<G: GateType> {
     gate: G,
     table: TableType,
-    rows: Vec<G::Row>,
     n_in: usize,
     n_out: usize,
 }
@@ -150,10 +155,19 @@ where
     fn n_in(&self) -> usize {
         self.n_in
     }
-    fn push(&mut self, inputs: &[F128], hint: &dyn std::any::Any) -> Vec<F128> {
+    fn n_out(&self) -> usize {
+        self.n_out
+    }
+    fn new_rows(&self) -> Box<dyn Any> {
+        Box::new(Vec::<G::Row>::new())
+    }
+    fn push(&self, rows: &mut dyn Any, inputs: &[F128], hint: &dyn Any) -> Vec<F128> {
+        let rows = rows
+            .downcast_mut::<Vec<G::Row>>()
+            .expect("row store belongs to another slot");
         let hint = hint.downcast_ref::<G::Hint>().unwrap_or_else(|| {
             panic!(
-                "gate expects a hint of type {}; use gate_with_hint to supply one",
+                "gate expects a hint of type {}; use gate_hinted and supply one",
                 std::any::type_name::<G::Hint>()
             )
         });
@@ -165,85 +179,66 @@ where
             outputs.len(),
             self.n_out
         );
-        self.rows.push(row);
+        rows.push(row);
         outputs
     }
-    fn rows(&self) -> usize {
-        self.rows.len()
-    }
-    fn witness(&self, nu: usize) -> SlotWitness {
-        self.gate.witness(&self.rows, nu)
-    }
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    fn witness(&self, rows: &dyn Any, nu: usize) -> SlotWitness {
+        self.gate.witness(
+            rows.downcast_ref::<Vec<G::Row>>()
+                .expect("row store belongs to another slot"),
+            nu,
+        )
     }
 }
 
-/// Everything [`CircuitBuilder::finish`] produces: the statement and the
-/// witness, from one description.
-pub struct BuiltCircuit {
-    pub registry: Registry,
-    pub circuit: Circuit,
-    /// Declared counts per slot, in REGISTRY order — what `UnionInstance::new`
-    /// wants.
-    pub counts: Vec<usize>,
-    /// Per-slot witnesses, in REGISTRY order.
-    pub witnesses: Vec<SlotWitness>,
-    /// The public segment, in publication order.
-    pub public: Vec<F128>,
-    /// `registry_slot[declared] = registry index`.
-    registry_slot: Vec<usize>,
-    slots: Vec<Box<dyn SlotBuild>>,
+/// One recorded gate instantiation. Wire indices, not values — this is the
+/// value-independent half.
+struct Step {
+    slot: usize,
+    inputs: Vec<usize>,
+    outputs: Vec<usize>,
+    hinted: bool,
 }
 
-impl BuiltCircuit {
-    /// Where a declared slot landed in the registry. `Registry::new` sorts
-    /// class-major, area-descending, so declaration order is not slot order.
-    pub fn registry_slot(&self, s: SlotId) -> usize {
-        self.registry_slot[s.0]
-    }
+// ---------------------------------------------------------------------------
+// Setup phase
+// ---------------------------------------------------------------------------
 
-    /// A slot's rows in instantiation order, with their concrete type
-    /// recovered.
-    ///
-    /// The escape hatch for witnesses the builder cannot pack — a boolean slot
-    /// hands back its `&[Compression]` here, and the caller feeds it to
-    /// `generate_witness_batch_major_partial`. Row ORDER is the builder's
-    /// contract: row `j` of this slice is row `j` of the committed trace, which
-    /// is what makes the wiring the builder emitted correct for that witness.
-    ///
-    /// Panics if `s` was not declared with `G`.
-    pub fn rows<G>(&self, s: SlotId) -> &[G::Row]
-    where
-        G: GateType + 'static,
-        G::Row: 'static,
-    {
-        &self.slots[s.0]
-            .as_any()
-            .downcast_ref::<GateSlot<G>>()
-            .expect("slot was declared with a different GateType")
-            .rows
-    }
-}
-
-pub struct CircuitBuilder {
+/// Builds the value-independent half of a circuit: which gates exist, how they
+/// are wired, and what is public. No field arithmetic happens here.
+///
+/// See [`CircuitShape`] for why the split exists. For a one-shot circuit where
+/// separating the phases buys nothing, [`CircuitBuilder`] is the same thing
+/// with values supplied inline.
+pub struct ShapeBuilder {
     nu: usize,
     slots: Vec<Box<dyn SlotBuild>>,
-    wires: Vec<WireData>,
-    public: Vec<Wire>,
-    /// Union-find over wires, so [`CircuitBuilder::connect`] can merge two
+    slot_types: Vec<TypeId>,
+    /// Cells per wire. A wire's value lives in the online phase, not here.
+    wires: Vec<Vec<Cell>>,
+    /// Union-find over wires, so [`ShapeBuilder::connect`] can merge two
     /// equivalence classes that were created independently.
     parent: Vec<usize>,
+    public: Vec<Wire>,
+    inputs: Vec<Wire>,
+    steps: Vec<Step>,
+    rows_per_slot: Vec<usize>,
+    n_hints: usize,
 }
 
-impl CircuitBuilder {
+impl ShapeBuilder {
     pub fn new(nu: usize) -> Self {
         Self {
             nu,
             slots: Vec::new(),
+            slot_types: Vec::new(),
             wires: Vec::new(),
-            public: Vec::new(),
             parent: Vec::new(),
+            public: Vec::new(),
+            inputs: Vec::new(),
+            steps: Vec::new(),
+            rows_per_slot: Vec::new(),
+            n_hints: 0,
         }
     }
 
@@ -261,27 +256,10 @@ impl CircuitBuilder {
         r
     }
 
-    /// Assert two wires carry the same value: merge their classes, so the
-    /// wiring argument enforces it.
-    ///
-    /// This is the circuit's `assert_eq`. It is also how an inverse is
-    /// expressed — witness `y`, emit `x·y`, and connect that product to a
-    /// public cell holding 1 — so no inversion gate is needed.
-    ///
-    /// Panics if the two values differ: that is a witness-generator bug, and
-    /// the circuit would otherwise be unsatisfiable with no indication why.
-    pub fn connect(&mut self, a: Wire, b: Wire) {
-        let (ra, rb) = (self.find(a), self.find(b));
-        if ra == rb {
-            return;
-        }
-        assert_eq!(
-            self.wires[ra].value, self.wires[rb].value,
-            "connect() on wires holding different values"
-        );
-        let cells = std::mem::take(&mut self.wires[rb].cells);
-        self.wires[ra].cells.extend(cells);
-        self.parent[rb] = ra;
+    fn new_wire(&mut self, cells: Vec<Cell>) -> Wire {
+        self.wires.push(cells);
+        self.parent.push(self.wires.len() - 1);
+        Wire(self.wires.len() - 1)
     }
 
     /// Declare a gate slot. Every gate of this type shares the slot, and the
@@ -306,42 +284,50 @@ impl CircuitBuilder {
         self.slots.push(Box::new(GateSlot {
             gate,
             table,
-            rows: Vec::new(),
             n_in,
             n_out,
         }));
+        self.slot_types.push(TypeId::of::<G>());
+        self.rows_per_slot.push(0);
         SlotId(self.slots.len() - 1)
     }
 
     /// A free value entering the circuit. It gets no producing cell, so it
     /// must be constrained by something — published, or consumed by a gate
     /// whose relation pins it.
-    pub fn value(&mut self, value: F128) -> Wire {
-        self.wires.push(WireData {
-            value,
-            cells: Vec::new(),
-        });
-        self.parent.push(self.wires.len() - 1);
-        Wire(self.wires.len() - 1)
+    ///
+    /// The online phase supplies one `F128` per `input()` call, in call order.
+    pub fn input(&mut self) -> Wire {
+        let w = self.new_wire(Vec::new());
+        self.inputs.push(w);
+        w
+    }
+
+    /// A value that is both free and public — the common case for circuit
+    /// inputs.
+    pub fn public_input(&mut self) -> Wire {
+        let w = self.input();
+        self.publish(w);
+        w
     }
 
     /// Instantiate a gate: allocate a row, bind `inputs` to its input cells,
-    /// evaluate, and return wires for its outputs. For a gate type whose
-    /// [`Hint`](GateType::Hint) is `()`; use [`gate_with_hint`] otherwise.
+    /// and return wires for its outputs. For a gate type whose
+    /// [`Hint`](GateType::Hint) is `()`; use [`gate_hinted`] otherwise.
     ///
-    /// [`gate_with_hint`]: CircuitBuilder::gate_with_hint
+    /// [`gate_hinted`]: ShapeBuilder::gate_hinted
     pub fn gate(&mut self, slot: SlotId, inputs: &[Wire]) -> Vec<Wire> {
-        self.gate_with_hint(slot, inputs, &())
+        self.emit(slot, inputs, false)
     }
 
-    /// Instantiate a gate, supplying this instance's nondeterministic advice.
-    /// See [`GateType::Hint`]; `hint` must be that exact type.
-    pub fn gate_with_hint<H: std::any::Any>(
-        &mut self,
-        slot: SlotId,
-        inputs: &[Wire],
-        hint: &H,
-    ) -> Vec<Wire> {
+    /// Instantiate a gate that consumes advice. The online phase supplies one
+    /// hint per `gate_hinted` call, in call order. See [`GateType::Hint`].
+    pub fn gate_hinted(&mut self, slot: SlotId, inputs: &[Wire]) -> Vec<Wire> {
+        self.n_hints += 1;
+        self.emit(slot, inputs, true)
+    }
+
+    fn emit(&mut self, slot: SlotId, inputs: &[Wire], hinted: bool) -> Vec<Wire> {
         let s = &self.slots[slot.0];
         assert_eq!(
             inputs.len(),
@@ -350,7 +336,9 @@ impl CircuitBuilder {
             s.n_in(),
             inputs.len()
         );
-        let row = s.rows();
+        let n_in = s.n_in();
+        let n_out = s.n_out();
+        let row = self.rows_per_slot[slot.0];
         assert!(
             row < (1usize << self.nu),
             "slot {} exceeded its 2^{} row capacity",
@@ -358,30 +346,22 @@ impl CircuitBuilder {
             self.nu
         );
 
-        let roots: Vec<usize> = inputs.iter().map(|&w| self.find(w)).collect();
-        let vals: Vec<F128> = roots.iter().map(|&r| self.wires[r].value).collect();
-        let outputs = self.slots[slot.0].push(&vals, hint);
-
         // Cells are assigned once the registry order is known; record the
         // (declared slot, schema index, row) triple and resolve in `finish`.
         for (k, w) in inputs.iter().enumerate() {
-            self.wires[w.0]
-                .cells
-                .push(Cell::new(encode(slot.0, k), row));
+            self.wires[w.0].push(Cell::new(encode(slot.0, k), row));
         }
-        let n_in = self.slots[slot.0].n_in();
+        let outputs: Vec<Wire> = (0..n_out)
+            .map(|k| self.new_wire(vec![Cell::new(encode(slot.0, n_in + k), row)]))
+            .collect();
+        self.rows_per_slot[slot.0] += 1;
+        self.steps.push(Step {
+            slot: slot.0,
+            inputs: inputs.iter().map(|w| w.0).collect(),
+            outputs: outputs.iter().map(|w| w.0).collect(),
+            hinted,
+        });
         outputs
-            .into_iter()
-            .enumerate()
-            .map(|(k, value)| {
-                self.wires.push(WireData {
-                    value,
-                    cells: vec![Cell::new(encode(slot.0, n_in + k), row)],
-                });
-                self.parent.push(self.wires.len() - 1);
-                Wire(self.wires.len() - 1)
-            })
-            .collect()
     }
 
     /// Publish a wire: it joins the public segment, in call order.
@@ -389,15 +369,26 @@ impl CircuitBuilder {
         self.public.push(w);
     }
 
-    /// A value that is both free and public — the common case for circuit
-    /// inputs.
-    pub fn public_value(&mut self, value: F128) -> Wire {
-        let w = self.value(value);
-        self.publish(w);
-        w
+    /// Assert two wires carry the same value: merge their classes, so the
+    /// wiring argument enforces it.
+    ///
+    /// This is the circuit's `assert_eq`. It is also how an inverse is
+    /// expressed — witness `y`, emit `x·y`, and connect that product to a
+    /// public cell holding 1 — so no inversion gate is needed.
+    ///
+    /// The value check this used to make eagerly now happens in
+    /// [`CircuitShape::run`], because there are no values here.
+    pub fn connect(&mut self, a: Wire, b: Wire) {
+        let (ra, rb) = (self.find(a), self.find(b));
+        if ra == rb {
+            return;
+        }
+        let cells = std::mem::take(&mut self.wires[rb]);
+        self.wires[ra].extend(cells);
+        self.parent[rb] = ra;
     }
 
-    pub fn finish(mut self) -> Result<BuiltCircuit, CircuitError> {
+    pub fn finish(mut self) -> Result<CircuitShape, CircuitError> {
         // Registry::new sorts class-major, area-descending, with a STABLE sort
         // on `(is_element, Reverse(k_log))`. Replicate that key to learn where
         // each declared slot landed, then assert the result agrees with the
@@ -415,7 +406,6 @@ impl CircuitBuilder {
                 "builder's slot ordering disagrees with Registry::new"
             );
         }
-        // registry_slot[declared] = registry index
         let mut registry_slot = vec![0usize; tables.len()];
         for (reg_idx, &declared) in order.iter().enumerate() {
             registry_slot[declared] = reg_idx;
@@ -433,64 +423,367 @@ impl CircuitBuilder {
         let rows_per_public_slot = 1usize << self.nu;
 
         // Resolve the placeholder cells to real cell-slot indices.
-        for wd in &mut self.wires {
-            for c in &mut wd.cells {
+        for cells in &mut self.wires {
+            for c in cells.iter_mut() {
                 let (declared, k) = decode(c.slot);
                 *c = Cell::new(iota_base[declared] + k, c.row);
             }
         }
         // Public cells.
         let pubs: Vec<usize> = self.public.clone().iter().map(|&w| self.find(w)).collect();
-        let public_values: Vec<F128> = pubs.iter().map(|&r| self.wires[r].value).collect();
         for (p, &r) in pubs.iter().enumerate() {
             let slot = num_gate_slots + p / rows_per_public_slot;
-            self.wires[r]
-                .cells
-                .push(Cell::new(slot, p % rows_per_public_slot));
+            self.wires[r].push(Cell::new(slot, p % rows_per_public_slot));
         }
+
+        // The online phase addresses values by class ROOT, so resolve every
+        // wire's root once here rather than walking the union-find per proof.
+        let n_wires = self.wires.len();
+        let root_of: Vec<usize> = (0..n_wires).map(|i| self.find(Wire(i))).collect();
+        let input_roots: Vec<usize> = self.inputs.iter().map(|&w| root_of[w.0]).collect();
 
         // A class of one cell needs no copy constraint.
         let mut wires: Vec<Vec<Cell>> = self
             .wires
             .into_iter()
-            .map(|wd| wd.cells)
             .filter(|c| c.len() > 1)
-            .collect();
+            .collect::<Vec<_>>();
         for c in &mut wires {
             c.sort_unstable();
         }
         wires.sort_unstable();
 
-        let counts: Vec<usize> = order.iter().map(|&d| self.slots[d].rows()).collect();
-        let witnesses: Vec<SlotWitness> = order
-            .iter()
-            .map(|&d| self.slots[d].witness(self.nu))
-            .collect();
-        let slots = self.slots;
+        let counts: Vec<usize> = order.iter().map(|&d| self.rows_per_slot[d]).collect();
 
-        let circuit = Circuit::new(&registry, counts.clone(), public_values.len(), wires)?;
-        Ok(BuiltCircuit {
+        let circuit = Circuit::new(&registry, counts.clone(), pubs.len(), wires)?;
+        Ok(CircuitShape {
             registry,
             circuit,
             counts,
-            witnesses,
-            public: public_values,
+            nu: self.nu,
+            order,
             registry_slot,
-            slots,
+            slots: self.slots,
+            slot_types: self.slot_types,
+            steps: self.steps,
+            n_wires,
+            root_of,
+            inputs: input_roots,
+            publics: pubs,
+            n_hints: self.n_hints,
         })
     }
 }
 
-// Placeholder cell-slot encoding, used only between `gate` and `finish`: the
-// registry's slot order is not known until every slot is declared, so cells
-// are stamped with (declared slot, schema index) and resolved at the end.
-#[inline]
-fn encode(declared: usize, schema_idx: usize) -> usize {
-    declared << 32 | schema_idx
+// ---------------------------------------------------------------------------
+// The shape: setup output, online input
+// ---------------------------------------------------------------------------
+
+/// The value-independent half of a circuit: the statement, plus the program
+/// needed to replay it against fresh values.
+///
+/// **Why the split.** The statement is the same for every proof of the same
+/// circuit — `Circuit::digest` binds the registry, the cell space and σ, none
+/// of which depend on a value. Building it is therefore setup, paid once; only
+/// evaluating the gates is per-proof. Measured at the recursion L0 shape (218
+/// depth-13 Merkle openings) the two are ~46 ms and ~4 ms, so keeping them
+/// together put an order of magnitude more work on the proving path than
+/// belonged there.
+///
+/// The shape is immutable and [`run`](Self::run) takes `&self`, so one shape
+/// serves any number of concurrent proofs.
+pub struct CircuitShape {
+    pub registry: Registry,
+    pub circuit: Circuit,
+    /// Declared counts per slot, in REGISTRY order — what `UnionInstance::new`
+    /// wants.
+    pub counts: Vec<usize>,
+    nu: usize,
+    /// `order[registry index] = declared slot`.
+    order: Vec<usize>,
+    /// `registry_slot[declared] = registry index`.
+    registry_slot: Vec<usize>,
+    slots: Vec<Box<dyn SlotBuild>>,
+    slot_types: Vec<TypeId>,
+    steps: Vec<Step>,
+    n_wires: usize,
+    root_of: Vec<usize>,
+    /// Class root per declared input, in declaration order.
+    inputs: Vec<usize>,
+    /// Class root per published cell, in publication order.
+    publics: Vec<usize>,
+    n_hints: usize,
 }
-#[inline]
-fn decode(v: usize) -> (usize, usize) {
-    (v >> 32, v & 0xFFFF_FFFF)
+
+impl CircuitShape {
+    /// Where a declared slot landed in the registry. `Registry::new` sorts
+    /// class-major, area-descending, so declaration order is not slot order.
+    pub fn registry_slot(&self, s: SlotId) -> usize {
+        self.registry_slot[s.0]
+    }
+
+    /// How many values [`run`](Self::run) expects.
+    pub fn num_inputs(&self) -> usize {
+        self.inputs.len()
+    }
+
+    /// How many hints [`run`](Self::run) expects.
+    pub fn num_hints(&self) -> usize {
+        self.n_hints
+    }
+
+    /// **The online phase.** Evaluate every gate against `inputs` and `hints`,
+    /// producing this proof's witness and public segment.
+    ///
+    /// `inputs` are the values of the [`ShapeBuilder::input`] wires in
+    /// declaration order; `hints` the advice for the
+    /// [`ShapeBuilder::gate_hinted`] calls in call order.
+    ///
+    /// Gates run in instantiation order, which is the order the caller wrote
+    /// them, so a gate's inputs must already have values — either supplied, or
+    /// produced by an earlier gate. A wire whose class holds *both* a supplied
+    /// input and a gate output (the forward reference the Fiat–Shamir chain
+    /// needs) takes the supplied value, and the gate's output is then asserted
+    /// equal to it rather than overwriting it. That assertion is what
+    /// [`ShapeBuilder::connect`] promises.
+    pub fn run(&self, inputs: &[F128], hints: &[&dyn Any]) -> CircuitWitness {
+        assert_eq!(
+            inputs.len(),
+            self.inputs.len(),
+            "circuit takes {} inputs, got {}",
+            self.inputs.len(),
+            inputs.len()
+        );
+        assert_eq!(
+            hints.len(),
+            self.n_hints,
+            "circuit takes {} hints, got {}",
+            self.n_hints,
+            hints.len()
+        );
+
+        let mut values = vec![F128::ZERO; self.n_wires];
+        let mut set = vec![false; self.n_wires];
+        for (&root, &v) in self.inputs.iter().zip(inputs) {
+            if set[root] {
+                assert_eq!(
+                    values[root], v,
+                    "connected inputs were given different values"
+                );
+            }
+            values[root] = v;
+            set[root] = true;
+        }
+
+        let mut rows: Vec<Box<dyn Any>> = self.slots.iter().map(|s| s.new_rows()).collect();
+        let unit = ();
+        let mut next_hint = 0usize;
+        for step in &self.steps {
+            let vals: Vec<F128> = step
+                .inputs
+                .iter()
+                .map(|&w| {
+                    let r = self.root_of[w];
+                    assert!(
+                        set[r],
+                        "gate input has no value yet: a gate was instantiated before \
+                         the gate producing one of its inputs"
+                    );
+                    values[r]
+                })
+                .collect();
+            let hint: &dyn Any = if step.hinted {
+                let h = hints[next_hint];
+                next_hint += 1;
+                h
+            } else {
+                &unit
+            };
+            let outs = self.slots[step.slot].push(rows[step.slot].as_mut(), &vals, hint);
+            for (&w, v) in step.outputs.iter().zip(outs) {
+                let r = self.root_of[w];
+                if set[r] {
+                    assert_eq!(
+                        values[r], v,
+                        "a connected wire disagrees with the gate output that produces it"
+                    );
+                } else {
+                    values[r] = v;
+                    set[r] = true;
+                }
+            }
+        }
+
+        let public: Vec<F128> = self
+            .publics
+            .iter()
+            .map(|&r| {
+                assert!(set[r], "a published wire was never given a value");
+                values[r]
+            })
+            .collect();
+        let witnesses: Vec<SlotWitness> = self
+            .order
+            .iter()
+            .map(|&d| self.slots[d].witness(rows[d].as_ref(), self.nu))
+            .collect();
+
+        CircuitWitness {
+            public,
+            witnesses,
+            rows,
+            slot_types: self.slot_types.clone(),
+        }
+    }
+}
+
+/// **The online phase's output**: one proof's worth of witness.
+pub struct CircuitWitness {
+    /// The public segment, in publication order.
+    pub public: Vec<F128>,
+    /// Per-slot witnesses, in REGISTRY order.
+    pub witnesses: Vec<SlotWitness>,
+    /// Per-slot rows, in DECLARED order.
+    rows: Vec<Box<dyn Any>>,
+    slot_types: Vec<TypeId>,
+}
+
+impl CircuitWitness {
+    /// A slot's rows in instantiation order, with their concrete type
+    /// recovered.
+    ///
+    /// The escape hatch for witnesses the builder cannot pack — a boolean slot
+    /// hands back its `&[Compression]` here, and the caller feeds it to
+    /// `generate_witness_batch_major_partial`. Row ORDER is the builder's
+    /// contract: row `j` of this slice is row `j` of the committed trace, which
+    /// is what makes the wiring the builder emitted correct for that witness.
+    ///
+    /// Panics if `s` was not declared with `G`.
+    pub fn rows<G>(&self, s: SlotId) -> &[G::Row]
+    where
+        G: GateType + 'static,
+        G::Row: 'static,
+    {
+        assert_eq!(
+            self.slot_types[s.0],
+            TypeId::of::<G>(),
+            "slot was declared with a different GateType"
+        );
+        self.rows[s.0]
+            .downcast_ref::<Vec<G::Row>>()
+            .expect("slot type matched but its rows did not")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// One-shot front door
+// ---------------------------------------------------------------------------
+
+/// Build a circuit and evaluate it in one pass, supplying values inline.
+///
+/// Convenience over [`ShapeBuilder`] + [`CircuitShape::run`] for circuits
+/// proved once — tests, and any caller that does not reuse the shape. It is
+/// exactly those two steps: `finish` builds the shape, then runs it. A caller
+/// that proves the same circuit repeatedly should use the two directly and
+/// keep the shape.
+pub struct CircuitBuilder {
+    shape: ShapeBuilder,
+    values: Vec<F128>,
+    hints: Vec<Box<dyn Any>>,
+}
+
+impl CircuitBuilder {
+    pub fn new(nu: usize) -> Self {
+        Self {
+            shape: ShapeBuilder::new(nu),
+            values: Vec::new(),
+            hints: Vec::new(),
+        }
+    }
+
+    pub fn slot<G>(&mut self, gate: G) -> SlotId
+    where
+        G: GateType + 'static,
+        G::Row: 'static,
+        G::Hint: 'static,
+    {
+        self.shape.slot(gate)
+    }
+
+    /// A free value entering the circuit. See [`ShapeBuilder::input`].
+    pub fn value(&mut self, value: F128) -> Wire {
+        self.values.push(value);
+        self.shape.input()
+    }
+
+    /// A value that is both free and public — the common case for circuit
+    /// inputs.
+    pub fn public_value(&mut self, value: F128) -> Wire {
+        let w = self.value(value);
+        self.publish(w);
+        w
+    }
+
+    pub fn gate(&mut self, slot: SlotId, inputs: &[Wire]) -> Vec<Wire> {
+        self.shape.gate(slot, inputs)
+    }
+
+    /// Instantiate a gate, supplying this instance's nondeterministic advice.
+    /// See [`GateType::Hint`]; `hint` must be that exact type.
+    pub fn gate_with_hint<H: Any>(&mut self, slot: SlotId, inputs: &[Wire], hint: H) -> Vec<Wire> {
+        self.hints.push(Box::new(hint));
+        self.shape.gate_hinted(slot, inputs)
+    }
+
+    pub fn publish(&mut self, w: Wire) {
+        self.shape.publish(w);
+    }
+
+    /// See [`ShapeBuilder::connect`]. The value check happens in `finish`,
+    /// when the gates are evaluated.
+    pub fn connect(&mut self, a: Wire, b: Wire) {
+        self.shape.connect(a, b);
+    }
+
+    pub fn finish(self) -> Result<BuiltCircuit, CircuitError> {
+        let shape = self.shape.finish()?;
+        let hints: Vec<&dyn Any> = self.hints.iter().map(|b| b.as_ref()).collect();
+        let witness = shape.run(&self.values, &hints);
+        Ok(BuiltCircuit { shape, witness })
+    }
+}
+
+/// Everything [`CircuitBuilder::finish`] produces: the statement and the
+/// witness, from one description.
+pub struct BuiltCircuit {
+    pub shape: CircuitShape,
+    pub witness: CircuitWitness,
+}
+
+impl BuiltCircuit {
+    pub fn registry_slot(&self, s: SlotId) -> usize {
+        self.shape.registry_slot(s)
+    }
+
+    /// See [`CircuitWitness::rows`].
+    pub fn rows<G>(&self, s: SlotId) -> &[G::Row]
+    where
+        G: GateType + 'static,
+        G::Row: 'static,
+    {
+        self.witness.rows::<G>(s)
+    }
+}
+
+// Placeholder cell-slot encoding, used only between `gate` and `finish`: the
+// real cell-slot index needs the registry order, which is not known until
+// every slot has been declared.
+fn encode(slot: usize, k: usize) -> usize {
+    slot << 32 | k
+}
+
+fn decode(c: usize) -> (usize, usize) {
+    (c >> 32, c & 0xFFFF_FFFF)
 }
 
 #[cfg(test)]
@@ -598,10 +891,14 @@ mod tests {
         hand.push(vec![Cell::new(EL_C, n - 1), Cell::new(PUB, 1 + n)]);
         let hand_circuit = Circuit::new(&registry, vec![n], n + 2, hand).expect("valid");
 
-        assert_eq!(built.counts, vec![n], "counts fall out of construction");
-        assert_eq!(built.public.len(), n + 2);
         assert_eq!(
-            built.circuit.digest(),
+            built.shape.counts,
+            vec![n],
+            "counts fall out of construction"
+        );
+        assert_eq!(built.witness.public.len(), n + 2);
+        assert_eq!(
+            built.shape.circuit.digest(),
             hand_circuit.digest(),
             "builder produced a DIFFERENT statement than the hand-built circuit"
         );
@@ -616,10 +913,10 @@ mod tests {
             want[at(2, j)] = aj * acc_v;
             acc_v = aj * acc_v;
         }
-        assert_eq!(built.witnesses[0], SlotWitness::Element(want));
+        assert_eq!(built.witness.witnesses[0], SlotWitness::Element(want));
         assert!(
             ty.ty.satisfies(
-                match &built.witnesses[0] {
+                match &built.witness.witnesses[0] {
                     SlotWitness::Element(z) => z,
                     other => panic!("element slot produced {other:?}"),
                 },
