@@ -617,3 +617,58 @@ fn l0_shape_circuit_cost() {
         built.circuit.wires().len(),
     );
 }
+
+/// **The circuit structure is witness-independent** — which is what makes
+/// `finish`'s cost amortizable across proofs.
+///
+/// Two circuits over different trees, opening different positions with
+/// different siblings, must produce the same `Circuit::digest`: the statement
+/// binds the registry, the cell space and sigma, none of which depend on a
+/// value. Only the witness and the public values differ.
+///
+/// The consequence for the timing in `l0_shape_circuit_cost`: `finish`'s work
+/// could be done once per recursion shape and reused, while the gate phase —
+/// `eval` computing each root — is genuinely per-proof, because that IS the
+/// witness.
+#[test]
+fn circuit_structure_does_not_depend_on_the_witness() {
+    let (depth, leaf_bytes, nu) = (2usize, 128usize, 6usize);
+
+    let build = |seed: u64, shift: usize| {
+        let mut rng = Rng(seed);
+        let tree = Tree::new(depth, leaf_bytes, &mut rng);
+        let mut b = CircuitBuilder::new(nu);
+        let g = b.slot(MerklePathGate::new(depth, leaf_bytes, nu, 1 << depth));
+        let roots: Vec<Vec<Wire>> = (0..1usize << depth)
+            .map(|i| {
+                let pos = (i + shift) % (1 << depth);
+                let leaf = tree.leaf(pos);
+                let mut inputs: Vec<Wire> = (0..leaf_bytes / 16)
+                    .map(|w| b.value(leaf_word(leaf, 16 * w)))
+                    .collect();
+                inputs.push(b.public_value(F128::new(table_index(pos, depth) as u64, 0)));
+                b.gate_with_hint(g, &inputs, &tree.siblings(pos))
+            })
+            .collect();
+        for root in &roots {
+            b.publish(root[0]);
+            b.publish(root[1]);
+        }
+        (b.finish().expect("valid circuit"), g)
+    };
+
+    let (a, ga) = build(0x_A1_11_00_01, 0);
+    let (c, gc) = build(0x_B2_22_00_02, 3);
+
+    assert_eq!(
+        a.circuit.digest(),
+        c.circuit.digest(),
+        "the statement moved when only the witness did"
+    );
+    assert_eq!(a.counts, c.counts);
+    assert_eq!(a.public.len(), c.public.len());
+    // ...and the witnesses really are different, so the check is not vacuous.
+    let (ra, rc) = (a.rows::<MerklePathGate>(ga), c.rows::<MerklePathGate>(gc));
+    assert_ne!(ra[0].leaf_data, rc[0].leaf_data, "same leaf data");
+    assert_ne!(a.public, c.public, "same public values");
+}
