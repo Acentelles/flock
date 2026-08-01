@@ -1145,17 +1145,35 @@ fn leaf_arithmetic_joins_the_merkle_openings() {
 #[test]
 #[ignore] // Heavy — run with `-- --ignored`.
 fn mvp4_query_phase_end_to_end() {
+    mvp4_slice(4, 6, 3);
+}
+
+/// The same slice at the **real L0 shape** — 218 queries over a 2^13 x 1 KiB
+/// commitment, what a Ligerito verifier at dense m = 25 actually checks — with
+/// the phases timed. Compare `l0_shape_circuit_cost`, which proves the Merkle
+/// openings alone at this shape: the delta is what deriving the queries and
+/// running the arithmetic on them costs.
+#[test]
+#[ignore] // The real shape. `-- --ignored`.
+fn mvp4_l0_shape_cost() {
+    mvp4_slice(13, 218, 8);
+}
+
+fn mvp4_slice(depth: usize, n_queries: usize, nu: usize) {
     use flock_core::challenger::Challenger as _;
     use flock_core::lincheck::build_eq_table;
     use flock_core::transcript_record::{RecordingChallenger, TranscriptOp};
     use flock_prover::prover::UnionElementSlotInput;
     use flock_prover::r1cs_hashes::fs_chain::{CvSource, FsChain};
 
+    use std::time::Instant;
+
     const SLICE: &[u8] = b"flock-mvp4-query-phase-v0";
-    let (depth, n_queries) = (4usize, 6usize);
+    // Pin the P-cores and measure warm, as `l0_shape_circuit_cost` does — the
+    // default pool and a cold first prove each move the numbers ~2x.
+    let threads = flock_core::init_perf_thread_pool().unwrap_or_else(rayon::current_num_threads);
     let block_len = 1usize << depth;
     let leaf_bytes = 16 * LE_LANES; // 1 KiB: 64 F128 lanes
-    let nu = 3usize; // 6 openings, and the Merkle slot's k_log is 19 ⇒ M ≥ 22
 
     // ---- a Ligerito-shaped L0 commitment ----
     let mut rng = Rng(0x_4E_C0_DE_01);
@@ -1202,6 +1220,7 @@ fn mvp4_query_phase_end_to_end() {
     assert_eq!(trace.squeezes.len(), 1, "one squeeze: the query draw");
 
     // ---- setup ----
+    let t = Instant::now();
     let mut sb = ShapeBuilder::new(nu);
     let hash = sb.slot(Blake3Gate { nu });
     let merkle = sb.slot(MerklePathGate::new(depth, leaf_bytes, nu, block_len));
@@ -1313,6 +1332,7 @@ fn mvp4_query_phase_end_to_end() {
     }
     sb.publish(acc);
     let shape = sb.finish().expect("valid circuit");
+    let setup_ms = t.elapsed().as_secs_f64() * 1e3;
 
     // ---- online ----
     let v: Vec<F128> = (0..LE_VARS)
@@ -1334,7 +1354,10 @@ fn mvp4_query_phase_end_to_end() {
     }
     let hint_refs: Vec<&dyn std::any::Any> =
         hints.iter().map(|h| h as &dyn std::any::Any).collect();
+    std::hint::black_box(shape.run(&vals, &hint_refs)); // warm
+    let t = Instant::now();
     let built = shape.run(&vals, &hint_refs);
+    let online_ms = t.elapsed().as_secs_f64() * 1e3;
 
     // **The chain is structural.** Each query's wire class must hold a cell in
     // the BLAKE3 slot's output region and a cell at the Merkle slot's index
@@ -1442,20 +1465,18 @@ fn mvp4_query_phase_end_to_end() {
     };
 
     // Boolean slots go in REGISTRY order.
+    let t = Instant::now();
+    let m_wit = layout.generate_witness_batch_major_partial_chunk(rows, nu);
+    let h_wit = blake3::generate_witness_batch_major_partial(built.rows::<Blake3Gate>(hash), nu);
+    let wit_ms = t.elapsed().as_secs_f64() * 1e3;
     let mut bool_slots = vec![
         (
             shape.registry_slot(merkle),
-            UnionSlotProverInput::new(
-                layout.generate_witness_batch_major_partial_chunk(rows, nu),
-                &walker,
-            ),
+            UnionSlotProverInput::new(m_wit, &walker),
         ),
         (
             shape.registry_slot(hash),
-            UnionSlotProverInput::new(
-                blake3::generate_witness_batch_major_partial(built.rows::<Blake3Gate>(hash), nu),
-                b3_lc,
-            ),
+            UnionSlotProverInput::new(h_wit, b3_lc),
         ),
     ];
     bool_slots.sort_by_key(|(i, _)| *i);
@@ -1467,6 +1488,7 @@ fn mvp4_query_phase_end_to_end() {
     let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
         lcs_ord.into_iter().map(|(_, c)| c).collect();
 
+    let t = Instant::now();
     let mut c = FsChallenger::new(DOMAIN);
     let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_circuit(
         &union,
@@ -1480,6 +1502,9 @@ fn mvp4_query_phase_end_to_end() {
         &mut c,
     );
 
+    let prove_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    let t = Instant::now();
     let mut c = FsChallenger::new(DOMAIN);
     verifier::verify_ligerito_jagged_union_circuit(
         &union,
@@ -1492,6 +1517,7 @@ fn mvp4_query_phase_end_to_end() {
         &mut c,
     )
     .expect("the query phase verifies");
+    let verify_ms = t.elapsed().as_secs_f64() * 1e3;
 
     // Tampering with a TRANSCRIPT word must break it. This is the sharp one:
     // that word is hashed into the challenge, the challenge is the index, and
@@ -1518,11 +1544,19 @@ fn mvp4_query_phase_end_to_end() {
 
     println!(
         "\nMVP-4 query phase: {n_queries} queries over a 2^{depth} x 1 KiB commitment\n\
-           slots: blake3 {} rows, merkle {} rows, leaf-eval {} rows | public {} | dense_m {}\n",
+           slots: blake3 {} rows, merkle {} rows, leaf-eval {} rows | public {} | \
+         dense_m {} | proof {:.1} KiB | {threads} threads\n\
+         \n\
+           PER PROOF     {:6.0} ms = online {online_ms:.0} + witgen {wit_ms:.0} + \
+         prove {prove_ms:.0}\n\
+           verifier side {verify_ms:6.1} ms\n\
+           SETUP         {setup_ms:6.0} ms   (off the proving path)\n",
         shape.counts[shape.registry_slot(hash)],
         shape.counts[shape.registry_slot(merkle)],
         shape.counts[shape.registry_slot(leafeval)],
         built.public.len(),
         union.dense_m(),
+        bincode::serialize(&proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
+        online_ms + wit_ms + prove_ms,
     );
 }
