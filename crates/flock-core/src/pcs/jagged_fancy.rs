@@ -571,6 +571,96 @@ pub fn twisted_weight_aligned(
     acc
 }
 
+/// The **Φ-twisted** weight over the dense cube for the row-major stack, plus
+/// the merged sumcheck's round-0 prime — the row-major counterpart of
+/// `jagged::build_merged_weight_and_prime`.
+///
+/// `W[d] = Σ_i Φ_i(eq(z_row_i, row(d))·eq(z_col_i, col(d)))`, zero past the
+/// area. Where the column-major builder hoists `eq_col` per column segment and
+/// streams rows, this hoists `eq_row` per row and streams the table's columns,
+/// because a run of `2^lw` consecutive dense indices now shares a row.
+///
+/// The prime is taken in a second pass rather than fused into the fill: under
+/// row-major a width-1 table's rows are single words, so element pairs
+/// `(2t, 2t+1)` straddle segment boundaries and per-segment fusion would be
+/// wrong. One extra streaming pass is the cheap, safe trade.
+pub fn build_weight_row_major_twisted(
+    params: &AlignedParams,
+    claims: &[(&[F128], &[F128], &[F128])],
+    q: &[F128],
+) -> (Vec<F128>, (F128, F128)) {
+    use rayon::prelude::*;
+
+    let n_total = 1usize << params.m;
+    assert_eq!(q.len(), n_total, "q must be the committed stack");
+    let tabs: Vec<(Vec<F128>, Vec<F128>, &[F128])> = claims
+        .iter()
+        .map(|&(zr, zc, t)| (build_eq_table(zr), build_eq_table(zc), t))
+        .collect();
+    // Pooled and dirty: the per-table fill writes every word of the area (the
+    // first claim assigns, later claims accumulate) and the tail is filled
+    // explicitly below.
+    let mut w = crate::scratch::take_f128(n_total);
+
+    let mut rest: &mut [F128] = &mut w;
+    for (t, tab) in params.tables.iter().enumerate() {
+        let width = 1usize << tab.log_width;
+        let span = width * tab.height as usize;
+        let (seg, tail) = rest.split_at_mut(span);
+        rest = tail;
+        debug_assert_eq!(
+            params.prefix_sums[t + 1] - params.prefix_sums[t],
+            span as u64
+        );
+        if span == 0 {
+            continue;
+        }
+        let c0 = tab.col_offset as usize;
+        seg.par_chunks_mut(width)
+            .enumerate()
+            .for_each(|(row, out)| {
+                let mut first = true;
+                for (eq_r, eq_c, fold) in tabs.iter() {
+                    let r = eq_r[row];
+                    let cols = &eq_c[c0..c0 + width];
+                    if first {
+                        for (slot, &c) in out.iter_mut().zip(cols) {
+                            *slot = crate::pcs::ring_switch::fold_one_slot(r * c, fold);
+                        }
+                        first = false;
+                    } else {
+                        for (slot, &c) in out.iter_mut().zip(cols) {
+                            *slot += crate::pcs::ring_switch::fold_one_slot(r * c, fold);
+                        }
+                    }
+                }
+            });
+    }
+    // The dead tail past the jagged area contributes zero on both sides.
+    rest.par_chunks_mut(1 << 16)
+        .for_each(|c| c.fill(F128::ZERO));
+
+    let prime = q
+        .par_chunks(1 << 14)
+        .zip(w.par_chunks(1 << 14))
+        .map(|(qc, wc)| {
+            let mut u0 = F128::ZERO;
+            let mut u2 = F128::ZERO;
+            for (qp, wp) in qc
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .zip(wc.as_chunks::<2>().0.iter())
+            {
+                u0 += qp[0] * wp[0];
+                u2 += (qp[0] + qp[1]) * (wp[0] + wp[1]);
+            }
+            (u0, u2)
+        })
+        .reduce(|| (F128::ZERO, F128::ZERO), |(a, b), (c, d)| (a + c, b + d));
+    (w, prime)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1068,6 +1158,174 @@ mod tests {
             t_assist,
             t_direct,
             t_direct / t_assist
+        );
+    }
+
+    /// **The prover-side number.** Does the row-major twisted weight build cost
+    /// the same as the column-major one it replaces? The `-258 ms` from
+    /// dropping the assist is only a net win if this pass does not eat it.
+    ///
+    /// `cargo test -p flock-core --release --lib
+    ///  pcs::jagged_fancy::tests::row_major_vs_column_major_weight_build
+    ///  -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn row_major_vs_column_major_weight_build() {
+        use crate::pcs::jagged::{JaggedParams, build_merged_weight_and_prime};
+        use crate::union::UnionInstance;
+
+        let _ = crate::init_perf_thread_pool();
+        let (nu, k_cols, dense_log, used) = (10usize, 12usize, 22usize, 3_325usize);
+
+        let widths = UnionInstance::subtable_widths(used);
+        let mut tables = Vec::new();
+        let mut off = 0u64;
+        for w in &widths {
+            tables.push(AlignedTable {
+                log_width: w.trailing_zeros(),
+                height: 1u64 << nu,
+                col_offset: off,
+            });
+            off += *w as u64;
+        }
+        let ap = AlignedParams::new(tables, nu, k_cols, dense_log);
+
+        let mut heights = vec![0u64; 1usize << k_cols];
+        for h in &mut heights[..used] {
+            *h = 1u64 << nu;
+        }
+        let jp = JaggedParams::from_heights(&heights, nu, dense_log);
+        assert_eq!(ap.area(), jp.area(), "both must cover the same dense area");
+
+        let mut rng = Rng(0x_B011_D000);
+        let q: Vec<F128> = (0..1usize << dense_log).map(|_| rng.next()).collect();
+        // Two claims, each with a real 16x256 byte-fold table, as the merged
+        // open has.
+        let data: Vec<(Vec<F128>, Vec<F128>, Vec<F128>)> = (0..2)
+            .map(|_| {
+                (
+                    rng.vec(nu),
+                    rng.vec(k_cols),
+                    crate::pcs::ring_switch::build_fold_byte_table(&rng.vec(128)),
+                )
+            })
+            .collect();
+        let claims: Vec<(&[F128], &[F128], &[F128])> = data
+            .iter()
+            .map(|(zr, zc, t)| (zr.as_slice(), zc.as_slice(), t.as_slice()))
+            .collect();
+
+        let time = |f: &dyn Fn()| -> f64 {
+            f();
+            let mut best = f64::INFINITY;
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                f();
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            best * 1e3
+        };
+        let t_col = time(&|| {
+            let r = build_merged_weight_and_prime(&jp, &claims, &q);
+            std::hint::black_box(&r.1);
+            crate::scratch::give_f128(r.0);
+        });
+        let t_row = time(&|| {
+            let r = build_weight_row_major_twisted(&ap, &claims, &q);
+            std::hint::black_box(&r.1);
+            crate::scratch::give_f128(r.0);
+        });
+        eprintln!(
+            "  dense 2^{dense_log} words, {} claims, {} aligned tables\n  \
+             column-major W + prime (today): {:8.2} ms\n  \
+             row-major    W + prime        : {:8.2} ms   ({:.2}x)",
+            claims.len(),
+            ap.tables.len(),
+            t_col,
+            t_row,
+            t_row / t_col
+        );
+    }
+
+    /// **Prover/verifier agreement.** The twisted row-major weight, folded at
+    /// ρ, must equal `twisted_weight_aligned` at ρ — i.e. the prover's
+    /// `w_eval` from the merged sumcheck and the verifier's own evaluation of
+    /// `Ŵ(ρ)` are the same value. That identity is the whole protocol; both
+    /// sides are tied through the SAME Φ by deriving the verifier's
+    /// coefficients from the prover's fold table.
+    #[test]
+    fn twisted_row_major_folds_to_twisted_weight_aligned() {
+        use crate::pcs::jagged::FrobeniusClaim;
+        use crate::pcs::ring_switch::{build_fold_byte_table, linearized_coefficients};
+
+        let (nu, k_cols, dense_log) = (2usize, 3usize, 5usize);
+        // Two aligned tables of differing width: [0,4) then [4,6).
+        let p = AlignedParams::new(
+            vec![
+                AlignedTable {
+                    log_width: 2,
+                    height: 3,
+                    col_offset: 0,
+                },
+                AlignedTable {
+                    log_width: 1,
+                    height: 2,
+                    col_offset: 4,
+                },
+            ],
+            nu,
+            k_cols,
+            dense_log,
+        );
+
+        let mut rng = Rng(0x_7015_7ED0);
+        let q: Vec<F128> = (0..1usize << dense_log).map(|_| rng.next()).collect();
+        // A LEGITIMATE fold table: `build_fold_byte_table` makes
+        // `fold_one_slot` 𝔽₂-linear, which is what the Frobenius
+        // decomposition needs. A random 16×256 table is not any linear map's
+        // byte decomposition, so `linearized_coefficients` would not describe
+        // it and the identity below would (correctly) fail.
+        let data: Vec<(Vec<F128>, Vec<F128>, Vec<F128>)> = (0..2)
+            .map(|_| {
+                (
+                    rng.vec(nu),
+                    rng.vec(k_cols),
+                    build_fold_byte_table(&rng.vec(128)),
+                )
+            })
+            .collect();
+        let claims: Vec<(&[F128], &[F128], &[F128])> = data
+            .iter()
+            .map(|(zr, zc, t)| (zr.as_slice(), zc.as_slice(), t.as_slice()))
+            .collect();
+
+        let (w, _) = build_weight_row_major_twisted(&p, &claims, &q);
+        let rho = rng.vec(dense_log);
+        let eq_rho = build_eq_table(&rho);
+        let mut folded = F128::ZERO;
+        for (d, &wd) in w.iter().enumerate() {
+            folded += eq_rho[d] * wd;
+        }
+        crate::scratch::give_f128(w);
+
+        // Verifier side: the same Φ, decomposed into Frobenius powers.
+        let coeffs: Vec<Vec<F128>> = data
+            .iter()
+            .map(|(_, _, t)| linearized_coefficients(t))
+            .collect();
+        let fclaims: Vec<FrobeniusClaim<'_>> = data
+            .iter()
+            .zip(&coeffs)
+            .map(|((zr, zc, _), c)| FrobeniusClaim {
+                z_row: zr,
+                z_col: zc,
+                coeffs: c,
+            })
+            .collect();
+        assert_eq!(
+            folded,
+            twisted_weight_aligned(&p, &fclaims, &rho),
+            "prover's folded W(ρ) != verifier's Ŵ(ρ)"
         );
     }
 }

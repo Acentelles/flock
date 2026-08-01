@@ -186,12 +186,23 @@ prefix selection, `k_cols` coordinates all going to `col`. At depth 26 that is
 commitment already carries. Free whenever `n_t` is a power of two; for partial
 counts the power-of-two rounding absorbs most of it.
 
-## STOP: the wire change would regress the verifier 5.4x
+## STOP: the PROVER side is clean, the VERIFIER regresses 5.4x
 
-Before touching the transcript I measured the thing the whole plan rests on —
-does evaluating `Ŵ(ρ)` directly through the aligned tables actually beat the
-assist on the verifier? At the real depth-26 geometry and the real batch width
-(`aligned_vs_assist_verifier_cost`):
+Both sides measured before touching the transcript. Prover first, since the
+whole plan rests on the assist's 258 ms actually going away:
+
+| prover, depth 26, 1 thread | |
+|---|---|
+| Frobenius assist, deleted | **−258 ms** (measured in the d26 trace) |
+| row-major W + prime vs column-major | 5.99 vs 6.12 ms → **−0.13 ms** (0.98×) |
+| transpose in compaction | **+3.7 ms** |
+| **net** | **≈ −254 ms** |
+
+So the prover side is confirmed: the row-major weight build is at parity — very
+slightly faster, likely the longer contiguous runs the wide sub-tables give —
+and the transpose is noise against what is removed.
+
+The verifier is the problem (`aligned_vs_assist_verifier_cost`):
 
 ```
 128·K = 256 statements, 9 aligned tables (from 3,325 columns)
@@ -205,10 +216,24 @@ evaluation, and flock's assist is not that — it is a sumcheck whose `W(σ)` wa
 already hoisted from 116.62 ms to 1.45 ms. Meanwhile `f_hat_aligned` runs once
 per statement, so the 256× batch swamps the 3,326 → 9 table saving.
 
-Wiring as planned would therefore trade **prover −258 ms** for **verifier
-+13.5 ms** on a ~17 ms verifier — net positive overall, but a real regression on
-one side, for a wire-format change that invalidates the pinned fixtures. Not
-worth landing in that state.
+Net across both sides: prover **−254 ms**, verifier **+13.5 ms** on a ~17 ms
+verifier. Strongly positive overall, but a real regression on one side bought
+with a wire-format change that invalidates the pinned m6 fixtures. Not worth
+landing in that state.
+
+Also landed: `build_weight_row_major_twisted` (the Φ-twisted production
+builder, prime taken in a second pass — under row-major a width-1 table's rows
+are single words, so element pairs straddle segments and per-segment fusion
+would be wrong), and `twisted_row_major_folds_to_twisted_weight_aligned`, which
+pins the identity the protocol actually needs: the prover's folded `W(ρ)` equals
+the verifier's `Ŵ(ρ)`, with both sides tied through the same Φ by deriving the
+verifier's coefficients from the prover's fold table.
+
+That test earned its keep immediately by failing on a bad setup of mine: I first
+fed it a *random* 16×256 fold table, which is not any 𝔽₂-linear map's byte
+decomposition, so `linearized_coefficients` did not describe it and the
+Frobenius decomposition legitimately did not apply. Real tables come from
+`build_fold_byte_table`.
 
 **The fix, and why it should come first.** The branching program's ρ-side is
 *shared* across all 256 statements: the `index` bits come from ρ and
