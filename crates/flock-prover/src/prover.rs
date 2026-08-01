@@ -1378,6 +1378,22 @@ fn prove_union_with_binding<Ch: Challenger>(
     // The element region's copies of `a`/`b`, taken BEFORE the boolean
     // zerocheck recycles those buffers. `2^(M_elem−7)` words each — the element
     // area, not the capacity.
+    //
+    // **This copy must be FAITHFUL, not compacted.** It is tempting to copy
+    // only the live runs (slot `t`'s BatchMajor word is `(col << nu) + row`, so
+    // its declared content is `used_cols` runs of `n_t` words) and leave the
+    // rest as lazy zero pages — at the recursion shape the region is ~1% live
+    // and that turns 18 ms of memcpy into 0.5 ms. It is WRONG: dummy rows being
+    // zero is an invariant the honest witness path maintains, not one this code
+    // enforces, and `union_element::satisfying_dummy_row_is_rejected_under_the_union`
+    // exists precisely because a prover can put satisfying content in a dummy
+    // row. Compacting here would sanitize that content out of `a`/`b` while the
+    // commitment still carries it. Tried 2026-08-01; a `debug_assert` comparing
+    // against the full slice caught it.
+    //
+    // The region being sized by CAPACITY (`2^(nu + k_log)` per slot) rather
+    // than by counts is what makes this expensive when `nu` is large. That is a
+    // union-layout question, not one this copy can answer.
     let t = std::time::Instant::now();
     let element_ab: Option<(Vec<F128>, Vec<F128>)> = union.has_element().then(|| {
         let r = union.element_word_range();
