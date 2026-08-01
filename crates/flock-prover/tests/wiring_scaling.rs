@@ -19,7 +19,7 @@
 
 use std::time::Instant;
 
-use flock_core::circuit::builder::{GateType, ShapeBuilder, SlotWitness, Wire};
+use flock_core::circuit::builder::{GateType, ShapeBuilder, SlotWitness};
 use flock_core::element_r1cs::{ElementTableBuilder, ElementTableType};
 use flock_core::field::F128;
 use flock_core::schedule::IoWord;

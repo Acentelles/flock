@@ -25,6 +25,7 @@ pub mod keccak3;
 /// analogous to [`chain_common`] but with a per-row bit selector.
 ///
 /// [`MerkleLayout`]: merkle_path_common::MerkleLayout
+pub mod merkle_glue;
 pub mod merkle_path_common;
 /// Merkle-path verification as ONE monolithic R1CS block per path — the
 /// multi-table-legal form (one table row = one whole path), as opposed to
