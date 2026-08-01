@@ -1109,3 +1109,420 @@ fn leaf_arithmetic_joins_the_merkle_openings() {
         "a tampered enforced_sum must be rejected"
     );
 }
+
+// ---------------------------------------------------------------------------
+// MVP-4: the vertical slice
+// ---------------------------------------------------------------------------
+
+/// **The query phase of a PCS verification, entirely in-circuit.**
+///
+/// Every earlier MVP proved one link. This joins them, and the join is that
+/// *nothing about which leaves get opened is an input*:
+///
+/// ```text
+///   transcript bytes ──(FS chain, BLAKE3)──▶ challenge words
+///                                                │  copy constraint
+///                                                ▼
+///                                          index word of a Merkle opening
+///                                                │  copy constraint (leaf words)
+///                                                ▼
+///                                          leaf-eval ──▶ enforced_sum
+/// ```
+///
+/// The commitment is Ligerito-shaped: `block_len` codeword rows of 64 `F128`
+/// lanes each — a 1 KiB leaf under `log_batch_size = 6` — hashed into a BLAKE3
+/// Merkle tree by `flock_core::merkle`, which is exactly what `ligero_commit`
+/// builds and what `verify_level_opens` checks against
+/// (`chunk_root_matches_flock_core_blake3_tree` pins the table to it).
+///
+/// The query rule is the protocol's: `sample_queries` is
+/// `challenger.sample_f128_vec(count)` masked with `block_len - 1`, and the
+/// circuit reproduces it with no gadget at all — the challenge word is wired
+/// into the index and the relation reads its low `depth` columns.
+///
+/// Six queries on purpose: a squeeze spans 64-byte XOF blocks and challenge
+/// `k` is output `k % 4` of block `k / 4`, so six crosses a block boundary.
+#[test]
+#[ignore] // Heavy — run with `-- --ignored`.
+fn mvp4_query_phase_end_to_end() {
+    use flock_core::challenger::Challenger as _;
+    use flock_core::lincheck::build_eq_table;
+    use flock_core::transcript_record::{RecordingChallenger, TranscriptOp};
+    use flock_prover::prover::UnionElementSlotInput;
+    use flock_prover::r1cs_hashes::fs_chain::{CvSource, FsChain};
+
+    const SLICE: &[u8] = b"flock-mvp4-query-phase-v0";
+    let (depth, n_queries) = (4usize, 6usize);
+    let block_len = 1usize << depth;
+    let leaf_bytes = 16 * LE_LANES; // 1 KiB: 64 F128 lanes
+    let nu = 3usize; // 6 openings, and the Merkle slot's k_log is 19 ⇒ M ≥ 22
+
+    // ---- a Ligerito-shaped L0 commitment ----
+    let mut rng = Rng(0x_4E_C0_DE_01);
+    let tree = Tree::new(depth, leaf_bytes, &mut rng);
+
+    // ---- the transcript, and the queries it determines ----
+    let mut ch = FsChallenger::with_hash(SLICE, HashKind::Blake3);
+    ch.observe_bytes(&tree.root);
+    let want_positions: Vec<usize> = ch
+        .sample_f128_vec(n_queries)
+        .iter()
+        .map(|v| (v.lo as usize) & (block_len - 1))
+        .collect();
+
+    // Record the same transcript: the shape drives the circuit.
+    let mut rec = RecordingChallenger::new(FsChallenger::with_hash(SLICE, HashKind::Blake3));
+    rec.observe_bytes(&tree.root);
+    let derived = rec.sample_f128_vec(n_queries);
+    assert_eq!(
+        derived
+            .iter()
+            .map(|v| (v.lo as usize) & (block_len - 1))
+            .collect::<Vec<_>>(),
+        want_positions,
+        "recording the transcript changed it"
+    );
+    let t_shape = rec.shape();
+    let stream = t_shape.stream_words(SLICE);
+    let bytes = stream.to_bytes(rec.values(), rec.payloads());
+    let challenges = rec.challenges().to_vec();
+    assert_eq!(challenges.len(), n_queries);
+
+    // ---- replay it through the FS chain ----
+    let mut chain = FsChain::new();
+    let mut at = 0usize;
+    let fin_ops: Vec<&TranscriptOp> = t_shape.ops().iter().filter(|o| o.finalizes()).collect();
+    for (i, &upto) in stream.finalize_after.iter().enumerate() {
+        chain.absorb(&bytes[at * 16..upto * 16]);
+        at = upto;
+        chain.finalize(fin_ops[i].squeezed_bytes());
+    }
+    chain.absorb(&bytes[at * 16..]);
+    let trace = chain.finish();
+    assert_eq!(trace.squeezes.len(), 1, "one squeeze: the query draw");
+
+    // ---- setup ----
+    let mut sb = ShapeBuilder::new(nu);
+    let hash = sb.slot(Blake3Gate { nu });
+    let merkle = sb.slot(MerklePathGate::new(depth, leaf_bytes, nu, block_len));
+    let leafeval = sb.slot(LeafEvalGate::new());
+
+    // The FS chain, verbatim from MVP-1: every row's cv and message come from
+    // an earlier row's output or from a transcript word.
+    let iv = [sb.public_input(), sb.public_input()];
+    let mut word_wire: Vec<Option<Wire>> = vec![None; stream.words.len()];
+    let mut outs: Vec<Vec<Wire>> = Vec::with_capacity(trace.rows.len());
+    let mut gate_in: Vec<[Wire; 7]> = Vec::with_capacity(trace.rows.len());
+    // Input values in declaration order. Every FS wire is a `public_input`,
+    // declared and published in the same order, so a value's index here IS its
+    // index in the public segment — which the tamper check below relies on.
+    let mut fs_values: Vec<F128> = Vec::new();
+    let mut first_msg_pub: Option<usize> = None;
+    let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+    fs_values.extend_from_slice(&iv_w);
+
+    for (i, row) in trace.rows.iter().enumerate() {
+        let (_, _, counter, blen, flags) = *row;
+        let link = trace.links[i];
+        let params = sb.public_input();
+        fs_values.push(pack_params(counter, blen, flags));
+        if let Some(root) = link.repeats {
+            let s = gate_in[root];
+            let g_in = [s[0], s[1], s[2], s[3], s[4], s[5], params];
+            gate_in.push(g_in);
+            outs.push(sb.gate(hash, &g_in));
+            continue;
+        }
+        let (cv_in, m_in) = match link.right {
+            Some(right) => {
+                let l = match link.cv {
+                    CvSource::Row(r) => r,
+                    CvSource::Iv => unreachable!(),
+                };
+                (iv, [outs[l][0], outs[l][1], outs[right][0], outs[right][1]])
+            }
+            None => {
+                let cv_in = match link.cv {
+                    CvSource::Iv => iv,
+                    CvSource::Row(r) => [outs[r][0], outs[r][1]],
+                };
+                let base = trace.block_offsets[i].expect("stream block") / 16;
+                let real = (blen as usize) / 16;
+                let mut m = [iv[0]; 4];
+                for (j, slot) in m.iter_mut().enumerate() {
+                    let wi = base + j;
+                    *slot = if j >= real || wi >= stream.words.len() {
+                        fs_values.push(F128::ZERO);
+                        sb.public_input()
+                    } else {
+                        match word_wire[wi] {
+                            Some(w) => w,
+                            None => {
+                                fs_values.push(F128::new(
+                                    u64::from_le_bytes(
+                                        bytes[wi * 16..wi * 16 + 8].try_into().unwrap(),
+                                    ),
+                                    u64::from_le_bytes(
+                                        bytes[wi * 16 + 8..wi * 16 + 16].try_into().unwrap(),
+                                    ),
+                                ));
+                                let w = sb.public_input();
+                                first_msg_pub.get_or_insert(fs_values.len() - 1);
+                                word_wire[wi] = Some(w);
+                                w
+                            }
+                        }
+                    };
+                }
+                (cv_in, m)
+            }
+        };
+        let g_in = [
+            cv_in[0], cv_in[1], m_in[0], m_in[1], m_in[2], m_in[3], params,
+        ];
+        gate_in.push(g_in);
+        outs.push(sb.gate(hash, &g_in));
+    }
+
+    // **The binding.** Challenge `k` is output `k % 4` of the squeeze's block
+    // `k / 4` — so this is the wire, and there is no other route from the
+    // transcript to a query.
+    let sq = &trace.squeezes[0];
+    let challenge_w: Vec<Wire> = (0..n_queries).map(|k| outs[sq[k / 4]][k % 4]).collect();
+
+    // The openings, and the arithmetic on them.
+    let v_w: Vec<Wire> = (0..LE_VARS).map(|_| sb.public_input()).collect();
+    let mut acc = sb.public_input();
+    let mut roots = Vec::new();
+    for (k, &cw) in challenge_w.iter().enumerate() {
+        let leaf_w: Vec<Wire> = (0..LE_LANES).map(|_| sb.input()).collect();
+        let mut m_in = leaf_w.clone();
+        m_in.push(cw); // ← the challenge word IS the index word
+        roots.push(sb.gate_hinted(merkle, &m_in));
+
+        let mut a_in = leaf_w;
+        a_in.extend_from_slice(&v_w);
+        a_in.push(sb.public_input()); // alpha_k
+        a_in.push(acc);
+        acc = sb.gate(leafeval, &a_in)[0];
+        let _ = k;
+    }
+    for r in &roots {
+        sb.publish(r[0]);
+        sb.publish(r[1]);
+    }
+    sb.publish(acc);
+    let shape = sb.finish().expect("valid circuit");
+
+    // ---- online ----
+    let v: Vec<F128> = (0..LE_VARS)
+        .map(|_| F128::new(rng.next_u32() as u64 | 1, rng.next_u32() as u64))
+        .collect();
+    let alpha: Vec<F128> = (0..n_queries)
+        .map(|_| F128::new(rng.next_u32() as u64, rng.next_u32() as u64 | 1))
+        .collect();
+
+    let mut vals = fs_values;
+    vals.extend_from_slice(&v);
+    vals.push(F128::ZERO); // accumulator seed
+    let mut hints: Vec<Vec<[u32; SLOT_WORDS]>> = Vec::new();
+    for (k, &pos) in want_positions.iter().enumerate() {
+        let leaf = tree.leaf(pos);
+        vals.extend((0..LE_LANES).map(|w| leaf_word(leaf, 16 * w)));
+        vals.push(alpha[k]);
+        hints.push(tree.siblings(pos));
+    }
+    let hint_refs: Vec<&dyn std::any::Any> =
+        hints.iter().map(|h| h as &dyn std::any::Any).collect();
+    let built = shape.run(&vals, &hint_refs);
+
+    // **The chain is structural.** Each query's wire class must hold a cell in
+    // the BLAKE3 slot's output region and a cell at the Merkle slot's index
+    // word, and each leaf word a cell in the Merkle slot and one in the
+    // leaf-eval slot. Values agreeing is not enough: without these classes the
+    // circuit would be three unrelated computations that happen to line up.
+    {
+        let iota = |reg: usize| -> usize {
+            (0..reg)
+                .map(|i| shape.registry.types()[i].io_schema.len())
+                .sum::<usize>()
+        };
+        let (h, m, l) = (
+            iota(shape.registry_slot(hash)),
+            iota(shape.registry_slot(merkle)),
+            iota(shape.registry_slot(leafeval)),
+        );
+        let classes = flock_core::circuit::wire_cells(&shape.circuit);
+        let spans = |lo_a: usize, n_a: usize, lo_b: usize, n_b: usize| {
+            classes
+                .iter()
+                .filter(|cls| {
+                    let has =
+                        |lo: usize, n: usize| cls.iter().any(|c| (lo..lo + n).contains(&c.slot));
+                    has(lo_a, n_a) && has(lo_b, n_b)
+                })
+                .count()
+        };
+        // blake3 outputs are schema words 7..11; the Merkle index is word 64.
+        assert_eq!(
+            spans(h + blake3::IO_OUT_LO0, 4, m + 4 * (leaf_bytes / 64), 1),
+            n_queries,
+            "challenge words are not wired to the Merkle index words"
+        );
+        assert_eq!(
+            spans(m, LE_LANES, l, LE_LANES),
+            LE_LANES * n_queries,
+            "leaf words are not shared with the arithmetic slot"
+        );
+    }
+
+    // The circuit opened the positions the TRANSCRIPT chose. If the wiring
+    // from challenge to index were wrong, `run`'s own equality check on the
+    // Merkle rows' index word would already have fired; assert it anyway,
+    // because this is the sentence the whole slice exists to make true.
+    let rows = built.rows::<MerklePathGate>(merkle);
+    for (k, &pos) in want_positions.iter().enumerate() {
+        assert_eq!(
+            (rows[k].index & (block_len as u128 - 1)) as usize,
+            pos,
+            "opening {k} did not open the query the transcript derived"
+        );
+        assert_eq!(
+            rows[k].index,
+            (challenges[k].lo as u128) | ((challenges[k].hi as u128) << 64),
+            "opening {k}'s index is not the whole challenge word"
+        );
+        assert_eq!(rows[k].leaf_data, tree.leaf(pos), "opening {k} leaf");
+    }
+    // ...every opening folds to the committed root...
+    let root_want = digest_words(&hash_to_digest(&tree.root));
+    let base = built.public.len() - 1 - 2 * n_queries;
+    for k in 0..n_queries {
+        assert_eq!(
+            [built.public[base + 2 * k], built.public[base + 2 * k + 1]],
+            root_want,
+            "opening {k} root"
+        );
+    }
+    // ...and the accumulator is the verifier's enforced_sum over them.
+    let eq = build_eq_table(&v);
+    let want_sum = want_positions
+        .iter()
+        .enumerate()
+        .fold(F128::ZERO, |s, (k, &pos)| {
+            let leaf = tree.leaf(pos);
+            let dot = (0..LE_LANES)
+                .map(|w| leaf_word(leaf, 16 * w) * eq[w])
+                .fold(F128::ZERO, |a, x| a + x);
+            s + alpha[k] * dot
+        });
+    assert_eq!(
+        *built.public.last().unwrap(),
+        want_sum,
+        "enforced_sum disagrees with the native computation"
+    );
+
+    // ---- prove / verify: three slots, both classes ----
+    let union = UnionInstance::new(&shape.registry, shape.counts.clone());
+    let pcs_params = PcsParams {
+        m: union.dense_m(),
+        log_inv_rate: 1,
+        log_batch_size: 6,
+        profile: LigeritoProfile::Fast,
+        num_lanes: union.commit_lanes(6),
+        merkle_hash: Default::default(),
+    };
+    let layout = MerkleTreeLayout::with_blake3_chunk_leaf(depth, leaf_bytes, blake3_spec());
+    let walker = layout.build_walker();
+    let b3 = blake3::build_block_r1cs(nu);
+    let b3_lc = b3.csc_lincheck_circuit();
+    let el = match &built.witnesses[shape.registry_slot(leafeval)] {
+        SlotWitness::Element(z) => z.clone(),
+        other => panic!("leaf-eval slot produced {other:?}"),
+    };
+
+    // Boolean slots go in REGISTRY order.
+    let mut bool_slots = vec![
+        (
+            shape.registry_slot(merkle),
+            UnionSlotProverInput::new(
+                layout.generate_witness_batch_major_partial_chunk(rows, nu),
+                &walker,
+            ),
+        ),
+        (
+            shape.registry_slot(hash),
+            UnionSlotProverInput::new(
+                blake3::generate_witness_batch_major_partial(built.rows::<Blake3Gate>(hash), nu),
+                b3_lc,
+            ),
+        ),
+    ];
+    bool_slots.sort_by_key(|(i, _)| *i);
+    let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
+        (shape.registry_slot(merkle), &walker),
+        (shape.registry_slot(hash), b3_lc),
+    ];
+    lcs_ord.sort_by_key(|(i, _)| *i);
+    let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
+        lcs_ord.into_iter().map(|(_, c)| c).collect();
+
+    let mut c = FsChallenger::new(DOMAIN);
+    let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_circuit(
+        &union,
+        &shape.circuit,
+        &built.public,
+        &pcs_params,
+        bool_slots.into_iter().map(|(_, s)| s).collect(),
+        vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
+            dst.copy_from_slice(&el)
+        })],
+        &mut c,
+    );
+
+    let mut c = FsChallenger::new(DOMAIN);
+    verifier::verify_ligerito_jagged_union_circuit(
+        &union,
+        &shape.circuit,
+        &built.public,
+        &lcs,
+        &commitment,
+        &proof,
+        &pcs_params,
+        &mut c,
+    )
+    .expect("the query phase verifies");
+
+    // Tampering with a TRANSCRIPT word must break it. This is the sharp one:
+    // that word is hashed into the challenge, the challenge is the index, and
+    // the index selects the leaf — so a transcript the prover did not commit to
+    // cannot be made to justify the openings it already produced.
+    let msg_pub = first_msg_pub.expect("the transcript has message words");
+    let mut bad = built.public.clone();
+    bad[msg_pub] += F128::ONE;
+    let mut c = FsChallenger::new(DOMAIN);
+    assert!(
+        verifier::verify_ligerito_jagged_union_circuit(
+            &union,
+            &shape.circuit,
+            &bad,
+            &lcs,
+            &commitment,
+            &proof,
+            &pcs_params,
+            &mut c,
+        )
+        .is_err(),
+        "a tampered transcript word must be rejected"
+    );
+
+    println!(
+        "\nMVP-4 query phase: {n_queries} queries over a 2^{depth} x 1 KiB commitment\n\
+           slots: blake3 {} rows, merkle {} rows, leaf-eval {} rows | public {} | dense_m {}\n",
+        shape.counts[shape.registry_slot(hash)],
+        shape.counts[shape.registry_slot(merkle)],
+        shape.counts[shape.registry_slot(leafeval)],
+        built.public.len(),
+        union.dense_m(),
+    );
+}
