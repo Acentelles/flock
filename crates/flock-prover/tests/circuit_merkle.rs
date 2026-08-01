@@ -225,7 +225,7 @@ impl GateType for MerklePathGate {
             index: (index_word.lo as u128) | ((index_word.hi as u128) << 64),
             siblings: hint.clone(),
         };
-        let root = self.layout.reference_root_chunk(&row);
+        let root = self.layout.root_chunk(&row);
         (digest_words(&root).to_vec(), row)
     }
 
@@ -518,6 +518,13 @@ fn l0_shape_circuit_cost() {
     let tree = Tree::new(depth, leaf_bytes, &mut rng);
     let tree_ms = t.elapsed().as_secs_f64() * 1e3;
 
+    // How expensive is just materializing the TableType at k_log 19? It
+    // carries a 2^19 identity `c_0`, and `finish` handles one per slot.
+    std::hint::black_box(MerklePathGate::new(depth, leaf_bytes, nu, 1 << depth).table());
+    let t = Instant::now(); // second call: the first pays cold-allocator faults
+    std::hint::black_box(MerklePathGate::new(depth, leaf_bytes, nu, 1 << depth).table());
+    let table_ms = t.elapsed().as_secs_f64() * 1e3;
+
     let t = Instant::now();
     let mut b = CircuitBuilder::new(nu);
     let g = b.slot(MerklePathGate::new(depth, leaf_bytes, nu, 1 << depth));
@@ -565,7 +572,7 @@ fn l0_shape_circuit_cost() {
     // How much of `build` is the gate re-executing BLAKE3 natively?
     let t = Instant::now();
     for row in rows {
-        std::hint::black_box(layout.reference_root_chunk(row));
+        std::hint::black_box(layout.root_chunk(row));
     }
     let eval_ms = t.elapsed().as_secs_f64() * 1e3;
 
@@ -607,7 +614,7 @@ fn l0_shape_circuit_cost() {
         "\nL0 shape as a CIRCUIT: {n_paths} openings, depth {depth}, {leaf_bytes} B leaves\n\
            k_log {}  nu {nu}  dense_m {}  public {}  wires {}\n\
            tree {tree_ms:.0} ms | build {build_ms:.0} ms = gates {gates_ms:.0} \
-         (eval {eval_ms:.0}) + finish {finish_ms:.0} | witgen {wit_ms:.0} ms | \
+         (eval {eval_ms:.0}) + finish {finish_ms:.0} (TableType {table_ms:.0}) | witgen {wit_ms:.0} ms | \
          prove {prove_ms:.0} ms | verify {verify_ms:.1} ms | \
          proof {proof_kib:.1} KiB\n\
            compare `cargo bench --bench merkle_l0_opening` for the same rows unwired.\n",

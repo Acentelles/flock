@@ -177,6 +177,15 @@ pub struct HashSpec {
     pub flags: u32,
     /// The base encoder's sparse `(A_0, B_0)`.
     pub build_matrices: fn() -> (SparseBinaryMatrix, SparseBinaryMatrix),
+    /// One compression's output chaining value, and NOTHING else.
+    ///
+    /// The witness builders below all reach the digest by materializing a
+    /// `2^k_log`-bool block and reading 256 bits back out — right for witness
+    /// generation, absurd when only the digest is wanted. A circuit gate
+    /// computing a root does `leaf_blocks + depth` compressions per opening
+    /// and needs no witness at all, so it uses this. Pinned equal to the
+    /// witness path by `fast_root_matches_the_witness_fold`.
+    pub compress: fn(&[u32; SLOT_WORDS], &[u32; 16], u64, u32, u32) -> [u32; SLOT_WORDS],
     /// One node compression's boolean witness block (length `2^k_log`),
     /// given the two child digests.
     pub node_witness: fn(&[u32; SLOT_WORDS], &[u32; SLOT_WORDS]) -> Vec<bool>,
@@ -246,6 +255,7 @@ pub fn blake3_spec() -> HashSpec {
         flags_base: blake3::FLAGS_BASE,
         flags: BLAKE3_FLAG_PARENT,
         build_matrices: blake3::build_matrices,
+        compress: blake3_compress_cv,
         node_witness: blake3_node_witness,
         node_witness_ab: blake3_node_witness_ab,
         node_group_ab: blake3_node_group_ab,
@@ -262,6 +272,19 @@ fn node_msg(left: &[u32; SLOT_WORDS], right: &[u32; SLOT_WORDS]) -> [u32; 16] {
     m[..SLOT_WORDS].copy_from_slice(left);
     m[SLOT_WORDS..].copy_from_slice(right);
     m
+}
+
+/// The output chaining value of one BLAKE3 compression — the first 8 words of
+/// the 16-word output, which is what every non-XOF use takes.
+fn blake3_compress_cv(
+    cv: &[u32; SLOT_WORDS],
+    m: &[u32; 16],
+    counter: u64,
+    block_len: u32,
+    flags: u32,
+) -> [u32; SLOT_WORDS] {
+    let out = blake3::blake3_compress(cv, m, counter, block_len, flags);
+    out[..SLOT_WORDS].try_into().expect("SLOT_WORDS ≤ 16")
 }
 
 fn blake3_node_witness(left: &[u32; SLOT_WORDS], right: &[u32; SLOT_WORDS]) -> Vec<bool> {
@@ -1783,8 +1806,45 @@ impl MerkleTreeLayout {
         self.scatter_zab_batch_major(&per_path, nu)
     }
 
+    /// Root of a chunk-leaf opening, computing **only** the root.
+    ///
+    /// Same fold as [`Self::reference_root_chunk`], but through
+    /// [`HashSpec::compress`] instead of the witness builders — so it does
+    /// `leaf_blocks + depth` compressions and allocates nothing, rather than
+    /// materializing a `2^k_log`-bool block per compression to read 256 bits
+    /// out of it. At the L0 shape (16 + 13 per opening) that is the difference
+    /// between ~400 µs and ~20 µs per opening.
+    ///
+    /// This is what a circuit gate wants: it needs the root to wire, and the
+    /// witness comes later in bulk from the batch-major drivers.
+    /// `fast_root_matches_the_witness_fold` pins the two equal.
+    pub fn root_chunk(&self, input: &ChunkPathInput) -> [u32; SLOT_WORDS] {
+        self.assert_chunk_input(input);
+        let compress = self.spec.compress;
+        let mut prev = self.pinned_in_cv();
+        for i in 0..self.leaf_blocks {
+            let m = leaf_msg_words(&input.leaf_data, i);
+            prev = compress(&prev, &m, NODE_COUNTER, NODE_BLOCK_LEN, self.chunk_flags(i));
+        }
+        for (l, sib) in input.siblings.iter().enumerate() {
+            let bit = (input.index >> l) & 1 == 1;
+            let (left, right) = if bit { (prev, *sib) } else { (*sib, prev) };
+            prev = compress(
+                &self.pinned_in_cv(),
+                &node_msg(&left, &right),
+                NODE_COUNTER,
+                NODE_BLOCK_LEN,
+                self.spec.flags,
+            );
+        }
+        prev
+    }
+
     /// Reference root for a chunk-leaf opening: the chunk chain then the
     /// node fold, natively, with the same compressions the R1CS encodes.
+    ///
+    /// Kept as the oracle. Prefer [`Self::root_chunk`] when only the root is
+    /// wanted — this one pays a full witness block per compression.
     pub fn reference_root_chunk(&self, input: &ChunkPathInput) -> [u32; SLOT_WORDS] {
         self.assert_chunk_input(input);
         let mut prev = self.pinned_in_cv();

@@ -923,6 +923,30 @@ fn index_word_high_bits_are_free() {
     }
 }
 
+/// `root_chunk` — the allocation-free fold a circuit gate uses — must agree
+/// with `reference_root_chunk`, which reaches the same digest by
+/// materializing a full witness block per compression. The fast path skips
+/// the witness entirely, so nothing else would catch it drifting.
+///
+/// Both swap directions at every position, plus full random index words, so
+/// the high bits are confirmed not to reach the fold.
+#[test]
+fn fast_root_matches_the_witness_fold() {
+    for (depth, leaf_bytes) in [(1usize, 64usize), (2, 128), (3, 256), (13, 1024)] {
+        let layout = MerkleTreeLayout::with_blake3_chunk_leaf(depth, leaf_bytes, blake3_spec());
+        let mut rng = Rng::new(0x_FA_57_00_07u64.wrapping_mul(depth as u64 + 1));
+        for pos in 0..(1u128 << depth).min(8) {
+            let hi = (0..4).fold(0u128, |acc, _| (acc << 32) | rng.next_u32() as u128);
+            let input = chunk_input(&mut rng, depth, leaf_bytes, (hi << depth) | pos);
+            assert_eq!(
+                layout.root_chunk(&input),
+                layout.reference_root_chunk(&input),
+                "depth {depth} leaf {leaf_bytes} pos {pos}: fast fold disagrees"
+            );
+        }
+    }
+}
+
 /// The walker must agree with the materialized composite on the chunk-leaf
 /// layout too — the chunk blocks embed the same stripped base, with their
 /// pin/copy/free-message replacements in the extras.
