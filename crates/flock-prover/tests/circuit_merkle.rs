@@ -787,60 +787,100 @@ fn circuit_structure_does_not_depend_on_the_witness() {
 /// this is the MVP.
 struct LeafEvalGate {
     ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+    lay: LeafLayout,
 }
 
-const LE_LANES: usize = 64;
-const LE_VARS: usize = 6;
-const LE_V: usize = LE_LANES;
-const LE_ALPHA: usize = LE_V + LE_VARS;
-const LE_PREV: usize = LE_ALPHA + 1;
-const LE_FOLD: usize = LE_PREV + 1;
-const LE_N_IN: usize = LE_FOLD;
-const LE_T: usize = LE_FOLD + 2 * (LE_LANES - 1);
-const LE_ACC: usize = LE_T + 1;
-const LE_K: usize = LE_ACC + 1;
-const LE_KAPPA: usize = 8;
-
-/// First column of fold level `l` (`1..=LE_VARS`); level `l` has `64 >> l`
-/// nodes and each node owns two columns.
-fn le_base(l: usize) -> usize {
-    (1..l).fold(LE_FOLD, |acc, k| acc + 2 * (LE_LANES >> k))
+/// The column layout of a [`LeafEvalGate`] over `lanes` leaf words.
+///
+/// Parameterised because the levels differ: L0's leaves are 1 KiB (64 lanes
+/// at `log_batch_size = 6`) and every recursive level's are 128 B (8 lanes).
+/// Same shape, different width — and two levels with the same lane count
+/// share one table type, hence one slot.
+#[derive(Clone, Copy)]
+struct LeafLayout {
+    lanes: usize,
+    vars: usize,
+    v: usize,
+    alpha: usize,
+    prev: usize,
+    fold: usize,
+    n_in: usize,
+    t: usize,
+    acc: usize,
+    k: usize,
+    kappa: usize,
 }
 
-/// The column holding entry `j` of the array entering fold level `l`.
-fn le_prev(l: usize, j: usize) -> usize {
-    if l == 1 {
-        j
-    } else {
-        le_base(l - 1) + 2 * j + 1
+impl LeafLayout {
+    fn new(lanes: usize) -> Self {
+        assert!(lanes.is_power_of_two() && lanes >= 2);
+        let vars = lanes.trailing_zeros() as usize;
+        let (v, alpha) = (lanes, lanes + vars);
+        let (prev, fold) = (alpha + 1, alpha + 2);
+        let t = fold + 2 * (lanes - 1);
+        let k = t + 2;
+        Self {
+            lanes,
+            vars,
+            v,
+            alpha,
+            prev,
+            fold,
+            n_in: fold,
+            t,
+            acc: t + 1,
+            k,
+            kappa: k.next_power_of_two().trailing_zeros().max(2) as usize,
+        }
+    }
+
+    /// First column of fold level `l` (`1..=vars`); level `l` has
+    /// `lanes >> l` nodes and each node owns two columns.
+    fn base(&self, l: usize) -> usize {
+        (1..l).fold(self.fold, |acc, k| acc + 2 * (self.lanes >> k))
+    }
+
+    /// The column holding entry `j` of the array entering fold level `l`.
+    fn prev_col(&self, l: usize, j: usize) -> usize {
+        if l == 1 {
+            j
+        } else {
+            self.base(l - 1) + 2 * j + 1
+        }
+    }
+
+    /// The fully folded value: the last level's single node.
+    fn y(&self) -> usize {
+        self.base(self.vars) + 1
     }
 }
 
-/// The fully folded value: the last level's single node.
-fn le_y() -> usize {
-    le_base(LE_VARS) + 1
-}
+/// L0's lane count, and the width the single-level tests use.
+const LE_LANES: usize = 64;
+const LE_VARS: usize = 6;
 
 impl LeafEvalGate {
-    fn new() -> Self {
+    fn new(lanes: usize) -> Self {
         use flock_core::element_r1cs::ElementTableBuilder;
         let one = F128::ONE;
-        let mut b = ElementTableBuilder::new(LE_KAPPA);
-        for c in 0..LE_N_IN {
+        let lay = LeafLayout::new(lanes);
+        let mut b = ElementTableBuilder::new(lay.kappa);
+        for c in 0..lay.n_in {
             b.free_wire(c);
         }
-        for l in 1..=LE_VARS {
-            for i in 0..(LE_LANES >> l) {
-                let (p0, p1) = (le_prev(l, 2 * i), le_prev(l, 2 * i + 1));
-                let d = le_base(l) + 2 * i;
-                b.mult_lin(d, &[(p0, one), (p1, one)], &[(LE_V + l - 1, one)]);
+        for l in 1..=lay.vars {
+            for i in 0..(lay.lanes >> l) {
+                let (p0, p1) = (lay.prev_col(l, 2 * i), lay.prev_col(l, 2 * i + 1));
+                let d = lay.base(l) + 2 * i;
+                b.mult_lin(d, &[(p0, one), (p1, one)], &[(lay.v + l - 1, one)]);
                 b.linear(d + 1, &[(p0, one), (d, one)]);
             }
         }
-        b.mult(LE_T, LE_ALPHA, le_y());
-        b.linear(LE_ACC, &[(LE_PREV, one), (LE_T, one)]);
+        b.mult(lay.t, lay.alpha, lay.y());
+        b.linear(lay.acc, &[(lay.prev, one), (lay.t, one)]);
         Self {
             ty: std::sync::Arc::new(b.build().expect("leaf-eval block is valid")),
+            lay,
         }
     }
 }
@@ -852,25 +892,26 @@ impl GateType for LeafEvalGate {
 
     fn table(&self) -> TableType {
         use flock_core::schedule::IoWord;
-        let mut schema: Vec<IoWord> = (0..LE_N_IN).map(IoWord::input).collect();
-        schema.push(IoWord::output(LE_ACC));
+        let mut schema: Vec<IoWord> = (0..self.lay.n_in).map(IoWord::input).collect();
+        schema.push(IoWord::output(self.lay.acc));
         TableType::element(self.ty.clone()).with_io_schema(schema)
     }
 
     fn eval(&self, inputs: &[F128], _hint: &()) -> (Vec<F128>, Self::Row) {
-        let mut z = vec![F128::ZERO; LE_K];
-        z[..LE_N_IN].copy_from_slice(&inputs[..LE_N_IN]);
-        for l in 1..=LE_VARS {
-            for i in 0..(LE_LANES >> l) {
-                let (p0, p1) = (z[le_prev(l, 2 * i)], z[le_prev(l, 2 * i + 1)]);
-                let d = le_base(l) + 2 * i;
-                z[d] = (p0 + p1) * z[LE_V + l - 1];
+        let lay = self.lay;
+        let mut z = vec![F128::ZERO; lay.k];
+        z[..lay.n_in].copy_from_slice(&inputs[..lay.n_in]);
+        for l in 1..=lay.vars {
+            for i in 0..(lay.lanes >> l) {
+                let (p0, p1) = (z[lay.prev_col(l, 2 * i)], z[lay.prev_col(l, 2 * i + 1)]);
+                let d = lay.base(l) + 2 * i;
+                z[d] = (p0 + p1) * z[lay.v + l - 1];
                 z[d + 1] = p0 + z[d];
             }
         }
-        z[LE_T] = z[LE_ALPHA] * z[le_y()];
-        z[LE_ACC] = z[LE_PREV] + z[LE_T];
-        (vec![z[LE_ACC]], z)
+        z[lay.t] = z[lay.alpha] * z[lay.y()];
+        z[lay.acc] = z[lay.prev] + z[lay.t];
+        (vec![z[lay.acc]], z)
     }
 
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
@@ -923,7 +964,7 @@ fn leaf_arithmetic_joins_the_merkle_openings() {
     // ---- setup ----
     let mut sb = ShapeBuilder::new(nu);
     let merkle = sb.slot(MerklePathGate::new(depth, leaf_bytes, nu, 1 << depth));
-    let leafeval = sb.slot(LeafEvalGate::new());
+    let leafeval = sb.slot(LeafEvalGate::new(LE_LANES));
 
     let v_w: Vec<Wire> = (0..LE_VARS).map(|_| sb.public_input()).collect();
     let mut acc = sb.public_input(); // the accumulator's seed, published as zero
@@ -1042,12 +1083,12 @@ fn leaf_arithmetic_joins_the_merkle_openings() {
     // not. Otherwise the accumulator could be reached without doing the
     // arithmetic.
     {
-        let ty = &LeafEvalGate::new().ty;
+        let ty = &LeafEvalGate::new(LE_LANES).ty;
         assert!(ty.satisfies(&el, nu, n_open), "honest leaf-eval witness");
         for (what, col) in [
-            ("fold product", le_base(1)),
-            ("fold sum", le_base(4) + 1),
-            ("alpha product", LE_T),
+            ("fold product", LeafLayout::new(LE_LANES).base(1)),
+            ("fold sum", LeafLayout::new(LE_LANES).base(4) + 1),
+            ("alpha product", LeafLayout::new(LE_LANES).t),
         ] {
             let mut bad = el.clone();
             bad[col << nu] += F128::ONE;
@@ -1229,7 +1270,7 @@ fn mvp4_slice(depth: usize, n_queries: usize, nu: usize) {
     let merkle = sb.slot(MerklePathGate::new(depth, leaf_bytes, nu, block_len));
     let slot_merkle_ms = t0.elapsed().as_secs_f64() * 1e3;
     let t0 = Instant::now();
-    let leafeval = sb.slot(LeafEvalGate::new());
+    let leafeval = sb.slot(LeafEvalGate::new(LE_LANES));
     let slot_leaf_ms = t0.elapsed().as_secs_f64() * 1e3;
     let t_wiring = Instant::now();
 
@@ -1648,4 +1689,467 @@ fn mvp4_slice(depth: usize, n_queries: usize, nu: usize) {
         bincode::serialize(&proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
         online_ms + wit_ms + prove_ms,
     );
+}
+
+// ---------------------------------------------------------------------------
+// MVP-5: every level's query phase
+// ---------------------------------------------------------------------------
+
+/// One Ligerito level's commitment shape.
+#[derive(Clone, Copy)]
+struct Level {
+    /// `log2(block_len)` = `log_msg_cols + log_inv_rate`; the tree's depth.
+    depth: usize,
+    /// Interleaved lanes per codeword row; the leaf is `16 * lanes` bytes.
+    lanes: usize,
+    queries: usize,
+}
+
+/// **The whole query phase**: all four levels of the m=26 Fast ladder, in one
+/// circuit and one proof.
+///
+/// The ladder (`docs/local/recursion-verifier-map.md` §2.5c, from
+/// `configs/ligerito/m26_fast.toml`) is
+/// `(log_inv_rate, log_msg_cols, lanes, queries)` per level; `block_len` is
+/// `msg_cols << log_inv_rate`, so the tree depth is their sum:
+///
+/// ```text
+///   L0  rate 1  cols 13  lanes 64  218 queries  ⇒  depth 14, 1 KiB leaves
+///   L1  rate 2  cols 10  lanes  8  106 queries  ⇒  depth 12, 128 B leaves
+///   L2  rate 3  cols  7  lanes  8   71 queries  ⇒  depth 10, 128 B leaves
+///   L3  rate 4  cols  4  lanes  8   53 queries  ⇒  depth  8, 128 B leaves
+/// ```
+///
+/// **What this measures.** Each level's tree shape yields a DIFFERENT
+/// `MerkleTreeLayout` — different `useful_bits`, different matrices — so each
+/// is its own table type, and each one's walker stores its own copy of
+/// BLAKE3's base CSC. The lincheck sweeps once per slot, so the prediction is
+/// ~5 x 21M nonzeros against MVP-4's ~2 x. This is the measurement that
+/// decides whether collapsing the composites into one plain BLAKE3 table is
+/// worth the conditional-swap and bit-decomposition glue it would need.
+///
+/// L1..L3 share one 8-lane leaf-eval slot: same lane count, same table type.
+#[test]
+#[ignore] // The full shape. `-- --ignored`.
+fn mvp5_all_levels_query_phase() {
+    use flock_core::challenger::Challenger as _;
+    use flock_core::lincheck::build_eq_table;
+    use flock_core::transcript_record::{RecordingChallenger, TranscriptOp};
+    use flock_prover::prover::UnionElementSlotInput;
+    use flock_prover::r1cs_hashes::fs_chain::{CvSource, FsChain};
+    use std::time::Instant;
+
+    const SLICE: &[u8] = b"flock-mvp5-all-levels-v0";
+    let threads = flock_core::init_perf_thread_pool().unwrap_or_else(rayon::current_num_threads);
+    let levels = [
+        Level {
+            depth: 14,
+            lanes: 64,
+            queries: 218,
+        },
+        Level {
+            depth: 12,
+            lanes: 8,
+            queries: 106,
+        },
+        Level {
+            depth: 10,
+            lanes: 8,
+            queries: 71,
+        },
+        Level {
+            depth: 8,
+            lanes: 8,
+            queries: 53,
+        },
+    ];
+    let nu = 8usize; // 218 is the largest row count
+
+    // ---- one commitment per level ----
+    let mut rng = Rng(0x_5EED_0005);
+    let trees: Vec<Tree> = levels
+        .iter()
+        .map(|l| Tree::new(l.depth, 16 * l.lanes, &mut rng))
+        .collect();
+
+    // ---- the transcript: absorb each root, then draw that level's queries ----
+    let mut rec = RecordingChallenger::new(FsChallenger::with_hash(SLICE, HashKind::Blake3));
+    let mut want: Vec<Vec<usize>> = Vec::new();
+    for (l, tree) in levels.iter().zip(&trees) {
+        rec.observe_bytes(&tree.root);
+        want.push(
+            rec.sample_f128_vec(l.queries)
+                .iter()
+                .map(|v| (v.lo as usize) & ((1usize << l.depth) - 1))
+                .collect(),
+        );
+    }
+    let t_shape = rec.shape();
+    let stream = t_shape.stream_words(SLICE);
+    let bytes = stream.to_bytes(rec.values(), rec.payloads());
+    let challenges = rec.challenges().to_vec();
+    assert_eq!(
+        challenges.len(),
+        levels.iter().map(|l| l.queries).sum::<usize>()
+    );
+
+    let mut chain = FsChain::new();
+    let mut at = 0usize;
+    let fin_ops: Vec<&TranscriptOp> = t_shape.ops().iter().filter(|o| o.finalizes()).collect();
+    for (i, &upto) in stream.finalize_after.iter().enumerate() {
+        chain.absorb(&bytes[at * 16..upto * 16]);
+        at = upto;
+        chain.finalize(fin_ops[i].squeezed_bytes());
+    }
+    chain.absorb(&bytes[at * 16..]);
+    let trace = chain.finish();
+    assert_eq!(trace.squeezes.len(), levels.len(), "one squeeze per level");
+
+    // ---- setup ----
+    let t = Instant::now();
+    let mut sb = ShapeBuilder::new(nu);
+    let hash = sb.slot(Blake3Gate { nu });
+    let merkle: Vec<_> = levels
+        .iter()
+        .map(|l| sb.slot(MerklePathGate::new(l.depth, 16 * l.lanes, nu, 1 << l.depth)))
+        .collect();
+    // One leaf-eval slot per distinct lane count; L1..L3 share.
+    let mut leaf_slot: Vec<(usize, flock_core::circuit::builder::SlotId)> = Vec::new();
+    let leafeval: Vec<_> = levels
+        .iter()
+        .map(|l| match leaf_slot.iter().find(|(n, _)| *n == l.lanes) {
+            Some((_, s)) => *s,
+            None => {
+                let s = sb.slot(LeafEvalGate::new(l.lanes));
+                leaf_slot.push((l.lanes, s));
+                s
+            }
+        })
+        .collect();
+
+    let iv = [sb.public_input(), sb.public_input()];
+    let mut word_wire: Vec<Option<Wire>> = vec![None; stream.words.len()];
+    let mut outs: Vec<Vec<Wire>> = Vec::with_capacity(trace.rows.len());
+    let mut gate_in: Vec<[Wire; 7]> = Vec::with_capacity(trace.rows.len());
+    let mut fs_values: Vec<F128> = Vec::new();
+    let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+    fs_values.extend_from_slice(&iv_w);
+
+    for (i, row) in trace.rows.iter().enumerate() {
+        let (_, _, counter, blen, flags) = *row;
+        let link = trace.links[i];
+        let params = sb.public_input();
+        fs_values.push(pack_params(counter, blen, flags));
+        if let Some(root) = link.repeats {
+            let s = gate_in[root];
+            let g_in = [s[0], s[1], s[2], s[3], s[4], s[5], params];
+            gate_in.push(g_in);
+            outs.push(sb.gate(hash, &g_in));
+            continue;
+        }
+        let (cv_in, m_in) = match link.right {
+            Some(right) => {
+                let l = match link.cv {
+                    CvSource::Row(r) => r,
+                    CvSource::Iv => unreachable!(),
+                };
+                (iv, [outs[l][0], outs[l][1], outs[right][0], outs[right][1]])
+            }
+            None => {
+                let cv_in = match link.cv {
+                    CvSource::Iv => iv,
+                    CvSource::Row(r) => [outs[r][0], outs[r][1]],
+                };
+                let base = trace.block_offsets[i].expect("stream block") / 16;
+                let real = (blen as usize) / 16;
+                let mut m = [iv[0]; 4];
+                for (j, slot) in m.iter_mut().enumerate() {
+                    let wi = base + j;
+                    *slot = if j >= real || wi >= stream.words.len() {
+                        fs_values.push(F128::ZERO);
+                        sb.public_input()
+                    } else {
+                        match word_wire[wi] {
+                            Some(w) => w,
+                            None => {
+                                fs_values.push(F128::new(
+                                    u64::from_le_bytes(
+                                        bytes[wi * 16..wi * 16 + 8].try_into().unwrap(),
+                                    ),
+                                    u64::from_le_bytes(
+                                        bytes[wi * 16 + 8..wi * 16 + 16].try_into().unwrap(),
+                                    ),
+                                ));
+                                let w = sb.public_input();
+                                word_wire[wi] = Some(w);
+                                w
+                            }
+                        }
+                    };
+                }
+                (cv_in, m)
+            }
+        };
+        let g_in = [
+            cv_in[0], cv_in[1], m_in[0], m_in[1], m_in[2], m_in[3], params,
+        ];
+        gate_in.push(g_in);
+        outs.push(sb.gate(hash, &g_in));
+    }
+
+    // Per level: challenge words → indices, openings, arithmetic.
+    let mut v_w: Vec<Vec<Wire>> = Vec::new();
+    let mut acc = sb.public_input();
+    let mut all_roots: Vec<Vec<Vec<Wire>>> = Vec::new();
+    for (li, l) in levels.iter().enumerate() {
+        let sq = &trace.squeezes[li];
+        let vars = l.lanes.trailing_zeros() as usize;
+        let vs: Vec<Wire> = (0..vars).map(|_| sb.public_input()).collect();
+        let mut roots = Vec::with_capacity(l.queries);
+        for k in 0..l.queries {
+            let cw = outs[sq[k / 4]][k % 4];
+            let leaf_w: Vec<Wire> = (0..l.lanes).map(|_| sb.input()).collect();
+            let mut m_in = leaf_w.clone();
+            m_in.push(cw);
+            roots.push(sb.gate_hinted(merkle[li], &m_in));
+
+            let mut a_in = leaf_w;
+            a_in.extend_from_slice(&vs);
+            a_in.push(sb.public_input()); // alpha
+            a_in.push(acc);
+            acc = sb.gate(leafeval[li], &a_in)[0];
+        }
+        v_w.push(vs);
+        all_roots.push(roots);
+    }
+    for roots in &all_roots {
+        for r in roots {
+            sb.publish(r[0]);
+            sb.publish(r[1]);
+        }
+    }
+    sb.publish(acc);
+    let shape = sb.finish().expect("valid circuit");
+    let setup_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    // ---- online ----
+    let vees: Vec<Vec<F128>> = levels
+        .iter()
+        .map(|l| {
+            (0..l.lanes.trailing_zeros() as usize)
+                .map(|_| F128::new(rng.next_u32() as u64 | 1, rng.next_u32() as u64))
+                .collect()
+        })
+        .collect();
+    let alphas: Vec<Vec<F128>> = levels
+        .iter()
+        .map(|l| {
+            (0..l.queries)
+                .map(|_| F128::new(rng.next_u32() as u64, rng.next_u32() as u64 | 1))
+                .collect()
+        })
+        .collect();
+
+    let mut vals = fs_values;
+    vals.push(F128::ZERO); // accumulator seed
+    let mut hints: Vec<Vec<[u32; SLOT_WORDS]>> = Vec::new();
+    for (li, l) in levels.iter().enumerate() {
+        vals.extend_from_slice(&vees[li]);
+        for k in 0..l.queries {
+            let pos = want[li][k];
+            let leaf = trees[li].leaf(pos);
+            vals.extend((0..l.lanes).map(|w| leaf_word(leaf, 16 * w)));
+            vals.push(alphas[li][k]);
+            hints.push(trees[li].siblings(pos));
+        }
+    }
+    let hint_refs: Vec<&dyn std::any::Any> =
+        hints.iter().map(|h| h as &dyn std::any::Any).collect();
+    std::hint::black_box(shape.run(&vals, &hint_refs)); // warm
+    let t = Instant::now();
+    let built = shape.run(&vals, &hint_refs);
+    let online_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    // Every level opened the queries its own squeeze determined, and every
+    // opening folds to that level's root.
+    for (li, l) in levels.iter().enumerate() {
+        let rows = built.rows::<MerklePathGate>(merkle[li]);
+        assert_eq!(rows.len(), l.queries);
+        for k in 0..l.queries {
+            assert_eq!(
+                (rows[k].index & ((1u128 << l.depth) - 1)) as usize,
+                want[li][k],
+                "L{li} opening {k} is not the query the transcript derived"
+            );
+        }
+    }
+    let mut at = built.public.len() - 1 - 2 * levels.iter().map(|l| l.queries).sum::<usize>();
+    for (li, l) in levels.iter().enumerate() {
+        let rw = digest_words(&hash_to_digest(&trees[li].root));
+        for k in 0..l.queries {
+            assert_eq!(
+                [built.public[at], built.public[at + 1]],
+                rw,
+                "L{li} root {k}"
+            );
+            at += 2;
+        }
+    }
+    // ...and the accumulator is enforced_sum over ALL levels.
+    let mut want_sum = F128::ZERO;
+    for (li, l) in levels.iter().enumerate() {
+        let eq = build_eq_table(&vees[li]);
+        for k in 0..l.queries {
+            let leaf = trees[li].leaf(want[li][k]);
+            let dot = (0..l.lanes)
+                .map(|w| leaf_word(leaf, 16 * w) * eq[w])
+                .fold(F128::ZERO, |a, x| a + x);
+            want_sum += alphas[li][k] * dot;
+        }
+    }
+    assert_eq!(*built.public.last().unwrap(), want_sum, "enforced_sum");
+
+    // ---- prove / verify ----
+    let union = UnionInstance::new(&shape.registry, shape.counts.clone());
+    let pcs_params = PcsParams {
+        m: union.dense_m(),
+        log_inv_rate: 1,
+        log_batch_size: 6,
+        profile: LigeritoProfile::Fast,
+        num_lanes: union.commit_lanes(6),
+        merkle_hash: Default::default(),
+    };
+    let layouts: Vec<MerkleTreeLayout> = levels
+        .iter()
+        .map(|l| MerkleTreeLayout::with_blake3_chunk_leaf(l.depth, 16 * l.lanes, blake3_spec()))
+        .collect();
+    let walkers: Vec<_> = layouts.iter().map(|l| l.build_walker()).collect();
+    let b3 = blake3::build_block_r1cs(nu);
+    let b3_lc = b3.csc_lincheck_circuit();
+
+    let t = Instant::now();
+    let mut bool_slots: Vec<(usize, UnionSlotProverInput)> = vec![(
+        shape.registry_slot(hash),
+        UnionSlotProverInput::new(
+            blake3::generate_witness_batch_major_partial(built.rows::<Blake3Gate>(hash), nu),
+            b3_lc,
+        ),
+    )];
+    for (li, _) in levels.iter().enumerate() {
+        bool_slots.push((
+            shape.registry_slot(merkle[li]),
+            UnionSlotProverInput::new(
+                layouts[li].generate_witness_batch_major_partial_chunk(
+                    built.rows::<MerklePathGate>(merkle[li]),
+                    nu,
+                ),
+                &walkers[li],
+            ),
+        ));
+    }
+    let els: Vec<Vec<F128>> = leaf_slot
+        .iter()
+        .map(|(_, s)| match &built.witnesses[shape.registry_slot(*s)] {
+            SlotWitness::Element(z) => z.clone(),
+            other => panic!("leaf-eval slot produced {other:?}"),
+        })
+        .collect();
+    let wit_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    bool_slots.sort_by_key(|(i, _)| *i);
+    let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> =
+        vec![(shape.registry_slot(hash), b3_lc)];
+    for (li, _) in levels.iter().enumerate() {
+        lcs_ord.push((shape.registry_slot(merkle[li]), &walkers[li]));
+    }
+    lcs_ord.sort_by_key(|(i, _)| *i);
+    let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
+        lcs_ord.into_iter().map(|(_, c)| c).collect();
+
+    // Element slots go in registry order too.
+    let mut el_ord: Vec<(usize, Vec<F128>)> = leaf_slot
+        .iter()
+        .zip(els)
+        .map(|((_, s), z)| (shape.registry_slot(*s), z))
+        .collect();
+    el_ord.sort_by_key(|(i, _)| *i);
+    let el_inputs: Vec<UnionElementSlotInput> = el_ord
+        .into_iter()
+        .map(|(_, z)| UnionElementSlotInput::new(move |dst: &mut [F128]| dst.copy_from_slice(&z)))
+        .collect();
+
+    let t = Instant::now();
+    let mut c = FsChallenger::new(DOMAIN);
+    let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_circuit(
+        &union,
+        &shape.circuit,
+        &built.public,
+        &pcs_params,
+        bool_slots.into_iter().map(|(_, s)| s).collect(),
+        el_inputs,
+        &mut c,
+    );
+    let prove_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    let t = Instant::now();
+    let mut c = FsChallenger::new(DOMAIN);
+    verifier::verify_ligerito_jagged_union_circuit(
+        &union,
+        &shape.circuit,
+        &built.public,
+        &lcs,
+        &commitment,
+        &proof,
+        &pcs_params,
+        &mut c,
+    )
+    .expect("the full query phase verifies");
+    let verify_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    // ---- what it cost ----
+    let mut nnz_total = 0usize;
+    let mut report = String::from("\nMVP-5 FULL QUERY PHASE (m=26 Fast ladder)\n");
+    report += &format!(
+        "  {:<12} {:>6} {:>8} {:>7} {:>14}\n",
+        "slot", "k_log", "rows", "words", "lincheck nnz"
+    );
+    for (i, ty) in shape.registry.types().iter().enumerate() {
+        let words = ty.useful_bits.div_ceil(128);
+        let nnz = if i == shape.registry_slot(hash) {
+            let (a, b) = blake3::build_matrices();
+            let n = a.rows.iter().map(|r| r.len()).sum::<usize>()
+                + b.rows.iter().map(|r| r.len()).sum::<usize>();
+            nnz_total += n;
+            n
+        } else if let Some(li) = (0..levels.len()).find(|&li| shape.registry_slot(merkle[li]) == i)
+        {
+            let n = walkers[li].effective_nnz() / layouts[li].total_blocks();
+            nnz_total += n;
+            n
+        } else {
+            0
+        };
+        report += &format!(
+            "  {:<12} {:>6} {:>8} {:>7} {:>14}\n",
+            format!("slot{i}"),
+            ty.k_log,
+            shape.counts[i],
+            words * shape.counts[i],
+            nnz
+        );
+    }
+    report += &format!(
+        "  stored lincheck nnz total {nnz_total} | dense {} words | dense_m {} | \
+         M_bool {} | M_total {}\n\n  \
+         PER PROOF     {:6.0} ms = online {online_ms:.0} + witgen {wit_ms:.0} + prove {prove_ms:.0}\n  \
+         verifier side {verify_ms:6.1} ms | proof {:.1} KiB | {threads} threads\n  \
+         SETUP         {setup_ms:6.0} ms\n",
+        union.dense_words(),
+        union.dense_m(),
+        union.m_bool(),
+        union.m_total(),
+        online_ms + wit_ms + prove_ms,
+        bincode::serialize(&proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
+    );
+    println!("{report}");
 }
