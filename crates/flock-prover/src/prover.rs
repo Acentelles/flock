@@ -1292,6 +1292,7 @@ fn prove_union_with_binding<Ch: Challenger>(
         });
     }
     let trace = std::env::var("PCS_TRACE").is_ok();
+    let t_all = std::time::Instant::now();
     let t = std::time::Instant::now();
     let (z_packed, a_packed_f128, b_packed_f128, stripes, buf_mode) =
         build_union_witness(union, sources, false);
@@ -1351,6 +1352,7 @@ fn prove_union_with_binding<Ch: Challenger>(
             t.elapsed().as_secs_f64() * 1e3
         );
     }
+    let t = std::time::Instant::now();
     match binding {
         UnionProveBinding::Mixed => union.bind_statement(challenger, &commitment),
         UnionProveBinding::Circuit(ci) => {
@@ -1359,6 +1361,13 @@ fn prove_union_with_binding<Ch: Challenger>(
         UnionProveBinding::SingleTypeHarness(slot_r1cs) => {
             union.bind_statement_single_type(challenger, slot_r1cs, &commitment)
         }
+    }
+
+    if trace {
+        eprintln!(
+            "  [prove_union] bind statement: {:7.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
     }
 
     // Zerocheck over the BOOLEAN REGION of the union address space — the
@@ -1558,7 +1567,10 @@ fn prove_union_with_binding<Ch: Challenger>(
     // element pair and the wiring's gather claims PACKED-DIRECT (their points
     // are already packed-MLE points whose high coordinates are Boolean — so a
     // Sparse eq tensor, no ring switch).
+    let t = std::time::Instant::now();
     let heights = union.jagged_heights();
+    let t_h = t.elapsed().as_secs_f64() * 1e3;
+    let t = std::time::Instant::now();
     let (z_claims, pre): (Vec<ZClaim>, Vec<Option<&[F128]>>) = match &boolean {
         Some((_, claim, s_hat_v_ab, s_hat_v_c)) => (
             vec![claim.ab.clone(), claim.c.clone()],
@@ -1566,14 +1578,26 @@ fn prove_union_with_binding<Ch: Challenger>(
         ),
         None => (Vec::new(), Vec::new()),
     };
+    let t_z = t.elapsed().as_secs_f64() * 1e3;
+    let t = std::time::Instant::now();
     let mut packed_direct: Vec<pcs::PackedDirectClaim> = match &element {
         Some((_, claims)) => element_packed_direct_claims(claims),
         None => Vec::new(),
     };
+    let t_e = t.elapsed().as_secs_f64() * 1e3;
+    let t = std::time::Instant::now();
     let wiring = wiring.map(|(proof, gather_claims)| {
         packed_direct.extend(gather_claims);
         proof
     });
+    let t_w = t.elapsed().as_secs_f64() * 1e3;
+    if trace {
+        eprintln!(
+            "  [prove_union] claim assembly: {:7.2} ms  (heights {t_h:.2} + z_claims \
+             {t_z:.2} + element pd {t_e:.2} + wiring pd {t_w:.2})",
+            t_h + t_z + t_e + t_w
+        );
+    }
     let t = std::time::Instant::now();
     let pcs_open = match transport {
         Transport::Jagged => UnionOpen::Jagged(open_claims_with_precomputed_jagged_ligerito(
@@ -1627,7 +1651,8 @@ fn prove_union_with_binding<Ch: Challenger>(
         // Self-delimiting: one line per prove, tagging the arm, so a trace
         // reader never has to guess which prove a phase belonged to.
         eprintln!(
-            "  [prove_union] === done (element: {}) ===",
+            "  [prove_union] TOTAL {:7.2} ms === done (element: {}) ===",
+            t_all.elapsed().as_secs_f64() * 1e3,
             element.is_some()
         );
     }
