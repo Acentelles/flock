@@ -539,7 +539,10 @@ fn l0_shape_circuit_cost() {
         b.publish(root[0]);
         b.publish(root[1]);
     }
+    let gates_ms = t.elapsed().as_secs_f64() * 1e3;
+    let t2 = Instant::now();
     let built = b.finish().expect("builder produces a valid circuit");
+    let finish_ms = t2.elapsed().as_secs_f64() * 1e3;
     let build_ms = t.elapsed().as_secs_f64() * 1e3;
 
     let union = UnionInstance::new(&built.registry, built.counts.clone());
@@ -603,8 +606,8 @@ fn l0_shape_circuit_cost() {
     println!(
         "\nL0 shape as a CIRCUIT: {n_paths} openings, depth {depth}, {leaf_bytes} B leaves\n\
            k_log {}  nu {nu}  dense_m {}  public {}  wires {}\n\
-           tree {tree_ms:.0} ms | build {build_ms:.0} ms (of which native root eval \
-         {eval_ms:.0} ms) | witgen {wit_ms:.0} ms | \
+           tree {tree_ms:.0} ms | build {build_ms:.0} ms = gates {gates_ms:.0} \
+         (eval {eval_ms:.0}) + finish {finish_ms:.0} | witgen {wit_ms:.0} ms | \
          prove {prove_ms:.0} ms | verify {verify_ms:.1} ms | \
          proof {proof_kib:.1} KiB\n\
            compare `cargo bench --bench merkle_l0_opening` for the same rows unwired.\n",
