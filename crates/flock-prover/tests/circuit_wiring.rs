@@ -42,7 +42,7 @@ use flock_core::field::F128;
 use flock_core::pcs::PcsParams;
 use flock_core::pcs::ligerito::LigeritoProfile;
 use flock_core::product_gkr;
-use flock_core::proof::R1csProofCircuitLigerito;
+use flock_core::proof::R1csProofCircuitMerged;
 use flock_prover::challenger::FsChallenger;
 use flock_prover::prover::{self, UnionElementSlotInput, UnionSlotProverInput};
 use flock_prover::r1cs_hashes::sha2;
@@ -281,7 +281,7 @@ fn sha256_binary_tree_circuit() {
     let circuit_lc = r1cs.csc_lincheck_circuit();
     let prove = |compressions: &[([u32; 8], [u32; 16])], public: &[F128]| {
         let mut ch = FsChallenger::new(DOMAIN);
-        prover::prove_fast_ligerito_jagged_union_circuit(
+        prover::prove_fast_ligerito_union_circuit_merged(
             &union,
             &circuit,
             public,
@@ -296,9 +296,9 @@ fn sha256_binary_tree_circuit() {
     };
     let verify = |public: &[F128],
                   commitment: &flock_prover::pcs::Commitment,
-                  proof: &R1csProofCircuitLigerito| {
+                  proof: &R1csProofCircuitMerged| {
         let mut ch = FsChallenger::new(DOMAIN);
-        verifier::verify_ligerito_jagged_union_circuit(
+        verifier::verify_ligerito_union_circuit_merged(
             &union,
             &circuit,
             public,
@@ -367,7 +367,7 @@ fn sha256_binary_tree_circuit() {
         let bad_params = union_pcs_params(&bad_union);
         let mut ch = FsChallenger::new(DOMAIN);
         assert_eq!(
-            verifier::verify_ligerito_jagged_union_circuit(
+            verifier::verify_ligerito_union_circuit_merged(
                 &bad_union,
                 &circuit,
                 &tree.public,
@@ -397,7 +397,7 @@ fn sha256_binary_tree_circuit() {
         .expect("still a valid circuit");
         let mut ch = FsChallenger::new(DOMAIN);
         assert!(
-            verifier::verify_ligerito_jagged_union_circuit(
+            verifier::verify_ligerito_union_circuit_merged(
                 &bad_union,
                 &bad_circuit,
                 &tree.public,
@@ -439,7 +439,7 @@ fn sha256_binary_tree_circuit() {
         assert_ne!(circuit.digest(), swapped_circuit.digest());
         let mut ch = FsChallenger::new(DOMAIN);
         assert!(
-            verifier::verify_ligerito_jagged_union_circuit(
+            verifier::verify_ligerito_union_circuit_merged(
                 &union,
                 &swapped_circuit,
                 &tree.public,
@@ -470,7 +470,7 @@ fn sha256_binary_tree_circuit() {
         );
 
         let bytes = bincode::serialize(&proof).expect("serialize");
-        let decoded: R1csProofCircuitLigerito = bincode::deserialize(&bytes).expect("deserialize");
+        let decoded: R1csProofCircuitMerged = bincode::deserialize(&bytes).expect("deserialize");
         assert_eq!(decoded, proof);
         assert!(verify(&tree.public, &commitment, &decoded).is_ok());
         let n_flips = 16usize;
@@ -478,7 +478,7 @@ fn sha256_binary_tree_circuit() {
             let pos = i * (bytes.len() / n_flips);
             let mut b = bytes.clone();
             b[pos] ^= 1 << (i % 8);
-            match bincode::deserialize::<R1csProofCircuitLigerito>(&b) {
+            match bincode::deserialize::<R1csProofCircuitMerged>(&b) {
                 Err(_) => {}
                 Ok(p) => assert!(
                     verify(&tree.public, &commitment, &p).is_err(),
@@ -786,7 +786,7 @@ fn element_chain_circuit() {
     let prove = |z: &[F128], public: &[F128]| {
         let z = z.to_vec();
         let mut ch = FsChallenger::new(DOMAIN);
-        prover::prove_fast_ligerito_jagged_union_circuit(
+        prover::prove_fast_ligerito_union_circuit_merged(
             &union,
             &circuit,
             public,
@@ -800,7 +800,7 @@ fn element_chain_circuit() {
     };
     let (proof, commitment, _) = prove(&z, &public);
     let mut ch = FsChallenger::new(DOMAIN);
-    verifier::verify_ligerito_jagged_union_circuit(
+    verifier::verify_ligerito_union_circuit_merged(
         &union,
         &circuit,
         &public,
@@ -818,7 +818,7 @@ fn element_chain_circuit() {
     let (p, cm, _) = prove(&z, &bad_public);
     let mut ch = FsChallenger::new(DOMAIN);
     assert!(
-        verifier::verify_ligerito_jagged_union_circuit(
+        verifier::verify_ligerito_union_circuit_merged(
             &union,
             &circuit,
             &bad_public,
@@ -898,7 +898,7 @@ fn cross_class_hash_into_mult() {
 
     let prove = |z: Vec<F128>, public: &[F128]| {
         let mut ch = FsChallenger::new(DOMAIN);
-        prover::prove_fast_ligerito_jagged_union_circuit(
+        prover::prove_fast_ligerito_union_circuit_merged(
             &union,
             &circuit,
             public,
@@ -916,7 +916,7 @@ fn cross_class_hash_into_mult() {
     let (proof, commitment, claims) = prove(z.clone(), &public);
     assert!(claims.boolean.is_some() && claims.element.is_some());
     let mut ch = FsChallenger::new(DOMAIN);
-    verifier::verify_ligerito_jagged_union_circuit(
+    verifier::verify_ligerito_union_circuit_merged(
         &union,
         &circuit,
         &public,
@@ -942,7 +942,7 @@ fn cross_class_hash_into_mult() {
     let mut ch = FsChallenger::new(DOMAIN);
     assert!(
         matches!(
-            verifier::verify_ligerito_jagged_union_circuit(
+            verifier::verify_ligerito_union_circuit_merged(
                 &union,
                 &circuit,
                 &bad_public,
@@ -989,7 +989,7 @@ fn gather_claims_are_bound_by_the_opening() {
 
     let z_gen = z.clone();
     let mut ch = FsChallenger::new(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_circuit(
+    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit_merged(
         &union,
         &circuit,
         &[],
@@ -1000,9 +1000,9 @@ fn gather_claims_are_bound_by_the_opening() {
         })],
         &mut ch,
     );
-    let verify = |p: &R1csProofCircuitLigerito| {
+    let verify = |p: &R1csProofCircuitMerged| {
         let mut ch = FsChallenger::new(DOMAIN);
-        verifier::verify_ligerito_jagged_union_circuit(
+        verifier::verify_ligerito_union_circuit_merged(
             &union,
             &circuit,
             &[],
@@ -1157,7 +1157,7 @@ fn randomized_wirings_agree_with_the_oracle() {
         let expected = oracle_accepts(&circuit, &z, nu, &public);
         let z_gen = z.clone();
         let mut ch = FsChallenger::new(DOMAIN);
-        let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_circuit(
+        let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit_merged(
             &union,
             &circuit,
             &public,
@@ -1169,7 +1169,7 @@ fn randomized_wirings_agree_with_the_oracle() {
             &mut ch,
         );
         let mut ch = FsChallenger::new(DOMAIN);
-        let got = verifier::verify_ligerito_jagged_union_circuit(
+        let got = verifier::verify_ligerito_union_circuit_merged(
             &union,
             &circuit,
             &public,
@@ -1244,7 +1244,7 @@ fn wiring_cost_probe() {
 
     let t = std::time::Instant::now();
     let mut ch = FsChallenger::new(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_circuit(
+    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit_merged(
         &union,
         &circuit,
         &tree.public,
@@ -1260,7 +1260,7 @@ fn wiring_cost_probe() {
 
     let t = std::time::Instant::now();
     let mut ch = FsChallenger::new(DOMAIN);
-    verifier::verify_ligerito_jagged_union_circuit(
+    verifier::verify_ligerito_union_circuit_merged(
         &union,
         &circuit,
         &tree.public,
@@ -1288,16 +1288,15 @@ fn wiring_cost_probe() {
     assert_eq!(wiring.gather.len(), claims.len());
 }
 
-/// Circuit proofs over the MERGED transport — the production shape.
+/// Circuit proofs over the MERGED transport — the production shape (and,
+/// since the jagged transport's removal, the only one).
 ///
 /// The wiring argument's gather claims are packed-direct, so until the merged
 /// transport grew an intake for those, circuit proofs were stuck on the
-/// unmerged jagged path and its padded-domain auxiliaries. Now they are not.
-///
-/// The jagged path is kept precisely for this test: both transports carry the
-/// SAME claim set, so they must agree on the CLAIMS while their openings
-/// differ. That is a much sharper check than either path verifying alone —
-/// a merged-only test would rationalise a wrong weight as "well, it verifies".
+/// unmerged jagged path and its padded-domain auxiliaries. The jagged A/B
+/// arm this test carried was run for the last time at the removal's B1 gate
+/// (claims/root/wiring equality all held); what remains is the merged
+/// tamper matrix over the gather claims.
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn circuit_proofs_verify_over_the_merged_transport() {
@@ -1347,32 +1346,6 @@ fn circuit_proofs_verify_over_the_merged_transport() {
     )
     .unwrap_or_else(|e| panic!("merged rejected an honest circuit proof: {e:?}"));
     assert_eq!(got, claims_m);
-
-    // Jagged, same statement: the transports must agree on the claims.
-    let mut ch = FsChallenger::new(DOMAIN);
-    let (jagged, commitment_j, claims_j) = prover::prove_fast_ligerito_jagged_union_circuit(
-        &union,
-        &circuit,
-        &tree.public,
-        &pcs_params,
-        vec![slot()],
-        Vec::new(),
-        &mut ch,
-    );
-    assert_eq!(
-        commitment_j.root, commitment.root,
-        "same witness, same root"
-    );
-    assert_eq!(
-        claims_j, claims_m,
-        "the two transports must agree on the claims they carry"
-    );
-    // The wiring transcripts are identical too — the argument runs before the
-    // opening and cannot depend on it.
-    assert_eq!(
-        jagged.wiring, merged.wiring,
-        "wiring is transport-independent"
-    );
 
     // Tampering must still be caught on the merged path — otherwise the
     // gather claims would be riding along unchecked.
