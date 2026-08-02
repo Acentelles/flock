@@ -109,11 +109,23 @@ pub enum VerifyErrorJagged {
 pub enum DirectEqInd {
     /// Fully-materialized `eq_ind(point)` of length `2^L`.
     Dense(Vec<F128>),
-    /// Deferred eq tensor: only the point rides in; the combine
-    /// materializes `γ·eq(point)` directly as `b_combined` with a seeded
-    /// build (no separate eq buffer, no re-scale pass). Currently consumed
-    /// only by the merged transport's inner open (a single such claim, no
-    /// RS claims); transcript-identical to `Dense` of the same point.
+    /// Deferred eq tensor: only the point rides in. Two roles:
+    ///
+    /// - The merged transport's inner open (a single such claim, no RS
+    ///   claims): the combine materializes `γ·eq(point)` directly as
+    ///   `b_combined` with a seeded build (no separate eq buffer, no
+    ///   re-scale pass).
+    /// - The inert carrier for OUTER merged claims and the
+    ///   pre-materialization form on the union prover's jagged arm:
+    ///   [`open_batch_merged`] derives its weights from `point`/`value`
+    ///   alone and never reads `eq_ind`, so deferred claims ride through it
+    ///   unbuilt; the jagged transport converts them to `Sparse` before its
+    ///   open (a forgotten conversion trips the "EqPoint claims are only
+    ///   supported alone" assert in the combine rather than dropping the
+    ///   contribution).
+    ///
+    /// Transcript-identical to `Dense` of the same point in every role —
+    /// the representation is prover-side only.
     EqPoint(Vec<F128>),
     /// Sparse representation — non-zero entries at scattered indices.
     /// Built from a claim point with one or more exactly-zero coords via

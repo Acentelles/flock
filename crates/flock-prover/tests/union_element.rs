@@ -445,7 +445,13 @@ fn element_only_agrees_with_the_standalone_proof() {
 ///    dropped-words-are-zero invariant catches them in debug builds; and
 /// 2. the proof a release prover produces on such a witness is REJECTED — the
 ///    committed stack it opens against is the one with the dummy row deleted,
-///    while its element zerocheck summed the row in.
+///    while the padded buffer it opens FROM still carries the row. (Not the
+///    element zerocheck: since the count-proportional row rounds, its
+///    `RowSupport` SKIPS dead rows at ≤ 50% region utilization — this shape
+///    included — so the zerocheck's claims are those of the sanitized
+///    witness. The enforcer is the TRANSPORT: a dead word is not committed,
+///    so a non-zero one breaks `⟨q, W_ρ⟩ = f̂(ρ)` and the opening rejects —
+///    see the scope note in `element_r1cs/union.rs`.)
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn satisfying_dummy_row_is_rejected_under_the_union() {
@@ -499,9 +505,11 @@ fn satisfying_dummy_row_is_rejected_under_the_union() {
     }
 
     // (2) RELEASE builds: the debug assertion is compiled out, so the prover
-    // runs and produces a proof that opens the stack WITHOUT the dummy row
-    // while its element zerocheck summed the row in — and that proof is
-    // REJECTED. This is the closure of the standalone milestone's known gap.
+    // runs and produces a proof that commits the stack WITHOUT the dummy row
+    // while the padded buffer its virtual-opening sumcheck reads still
+    // carries it — and that proof is REJECTED (the dense f-side's round 0
+    // sums the dirty word into a claim the committed stack cannot support).
+    // This is the closure of the standalone milestone's known gap.
     if !cfg!(debug_assertions) {
         let zc = z.clone();
         let mut ch_p = FsChallenger::new(DOMAIN);
