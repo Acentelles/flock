@@ -30,8 +30,8 @@
 //! union-column-domain vectors and runs the existing sumcheck core
 //! (`column_sumcheck_prove`) over them. A single-slot registry reproduces
 //! today's two vectors verbatim (`w_1 = 1`, offset `0`), so the `T = 1`
-//! union lincheck is **byte-identical** to the single-table one — the M2
-//! differential oracle. Dense union-column vectors are the simple, correct
+//! union lincheck is **byte-identical** to the single-table one (the M2
+//! differential property). Dense union-column vectors are the simple, correct
 //! choice at current scales; the per-slot factorized / scalar-tail
 //! iteration (collapsed slots contribute `O(1)` per remaining round, doc
 //! §"One sumcheck over the union column domain") is a later performance

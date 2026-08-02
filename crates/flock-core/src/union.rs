@@ -23,19 +23,16 @@
 //! slot *is* today's instance.
 //!
 //! The prove/verify entries (`flock_prover::prover::
-//! prove_fast_ligerito_jagged_union` / [`crate::verifier::
-//! verify_ligerito_jagged_union`]) accept any registry under the
-//! `flock-mixed-v1` binding. The M1/M2 single-type harness binding
-//! ([`Self::bind_statement_single_type`], transcript-identical to the
-//! direct jagged path) is retained for the byte-identity differential
-//! tests — the regression anchor for the plumbing — behind the dedicated
-//! `*_harness` entries; it is not a protocol mode.
+//! prove_fast_ligerito_jagged_union_merged` / [`crate::verifier::
+//! verify_ligerito_jagged_union_merged`], and their mixed-class variants)
+//! accept any registry under the `flock-mixed-v1` binding. (The M1/M2
+//! single-type harness binding died with the jagged transport and its
+//! byte-identity differential tests.)
 
 use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::lincheck::QuirkyPoint;
 use crate::pcs::Commitment;
-use crate::r1cs::{BlockR1cs, WitnessLayout};
 use crate::schedule::{Instance, Registry, TableType};
 #[cfg(test)]
 use crate::schedule::TableClass;
@@ -233,7 +230,7 @@ impl<'r> UnionInstance<'r> {
     }
 
     /// Per-chunk-column heights (in packed words) of the union jagged grid,
-    /// for the jagged opening path (`pcs::open_batch_jagged_ligerito`):
+    /// for the opening path (`pcs::open_batch_merged`):
     /// `2^col_log` entries in union column order. Slot `t` occupies columns
     /// `[o_t >> (7+nu), o_t >> (7+nu) + 2^{k_log_t−7})` (alignment makes the
     /// offset exact). Shared by the prover and verifier wiring — any
@@ -344,7 +341,7 @@ impl<'r> UnionInstance<'r> {
     /// — that tail is WHOLE zero lanes, so committing only the first
     /// `t = ceil(dense_words / 2^log_dim)` of them drops the encode + hash of
     /// the rest. See [`crate::pcs::commit_lane_major`] for the layout and
-    /// `pcs::open_batch_jagged_ligerito` for how the opening follows (the
+    /// `pcs::open_batch_merged` for how the opening follows (the
     /// relabelling is a rotation of the index variables, so the jagged
     /// weight/assist machinery is untouched — only its evaluation point
     /// rotates).
@@ -580,10 +577,7 @@ impl<'r> UnionInstance<'r> {
     /// Domain-separated from the single-table binding
     /// ([`crate::proof::bind_statement`]: `flock-r1cs-v0` + the `BlockR1cs`
     /// statement digest), so a mixed proof can never be replayed as a
-    /// single-table proof or vice versa. This is also why a SINGLE-TYPE
-    /// instance proved under this binding is deliberately **not**
-    /// byte-identical to the direct jagged path — that byte-identity is the
-    /// harness binding's job ([`Self::bind_statement_single_type`]).
+    /// single-table proof or vice versa.
     pub fn bind_statement<Ch: Challenger>(&self, challenger: &mut Ch, commitment: &Commitment) {
         challenger.observe_label(b"flock-mixed-v1");
         challenger.observe_bytes(&self.registry().digest());
@@ -593,70 +587,6 @@ impl<'r> UnionInstance<'r> {
         }
         challenger.observe_bytes(&counts_le);
         challenger.observe_bytes(&commitment.root);
-    }
-
-    /// M1/M2 **harness** guard (differential tests only): the registry has
-    /// exactly one type and `slot_r1cs` is that type's single-table
-    /// [`BlockR1cs`] view (same variable count, width, useful bits, const
-    /// pin, BatchMajor layout, `k_skip = 6`). Returns the type. The
-    /// `*_harness` prove/verify entries call this before doing anything
-    /// transcript-visible; the protocol entries (`flock-mixed-v1` binding)
-    /// do not. (The base matrices are not compared — they are bound by
-    /// [`Self::bind_statement_single_type`] through the `BlockR1cs`
-    /// statement digest.)
-    pub fn expect_single_type_slot(&self, slot_r1cs: &BlockR1cs) -> &'r TableType {
-        let registry = self.registry();
-        assert_eq!(
-            registry.num_types(),
-            1,
-            "the single-type harness binding is single-type only; \
-             multi-type registries go through the flock-mixed-v1 binding"
-        );
-        let ty = &registry.types()[0];
-        assert_eq!(
-            slot_r1cs.layout,
-            WitnessLayout::BatchMajor,
-            "the union path requires the BatchMajor witness layout"
-        );
-        assert_eq!(slot_r1cs.m, self.m_total(), "slot BlockR1cs m != union M");
-        assert_eq!(slot_r1cs.k_log, ty.k_log, "slot BlockR1cs k_log mismatch");
-        assert_eq!(slot_r1cs.k_skip, K_SKIP, "BatchMajor requires k_skip = 6");
-        assert_eq!(
-            slot_r1cs.useful_bits, ty.useful_bits,
-            "slot BlockR1cs useful_bits mismatch"
-        );
-        assert_eq!(
-            slot_r1cs.const_pin, ty.const_pin,
-            "slot BlockR1cs const_pin mismatch"
-        );
-        ty
-    }
-
-    /// M1/M2 **harness** transcript binding (differential tests only): bind
-    /// exactly today's single-table statement — [`crate::proof::
-    /// bind_statement`] over the slot's [`BlockR1cs`] statement digest + the
-    /// commitment root — keeping the transcript byte-identical to the
-    /// existing jagged path. Single-type registries only.
-    ///
-    /// Since M3 the protocol binding is [`Self::bind_statement`]
-    /// (`flock-mixed-v1`); this one is kept solely so the M1/M2
-    /// byte-identity differential tests (`flock-prover`'s
-    /// `tests/union_roundtrip.rs`) remain a live regression anchor for the
-    /// union plumbing. It is not a protocol mode and does not appear in any
-    /// wire format.
-    pub fn bind_statement_single_type<Ch: Challenger>(
-        &self,
-        challenger: &mut Ch,
-        slot_r1cs: &BlockR1cs,
-        commitment: &Commitment,
-    ) {
-        assert_eq!(
-            self.registry().num_types(),
-            1,
-            "the harness binding is the single-table statement digest; \
-             multi-type registries go through the flock-mixed-v1 binding"
-        );
-        crate::proof::bind_statement(challenger, slot_r1cs, commitment);
     }
 
     // -----------------------------------------------------------------------
@@ -841,7 +771,7 @@ impl<'r> UnionInstance<'r> {
     ///
     /// Support-proportional copies (M6): a slot at partial utilization only
     /// copies the declared `n_t`-word prefix of each used chunk-column — the
-    /// witness contract (see `prove_fast_ligerito_jagged_union`) makes the
+    /// witness contract (see `prove_fast_ligerito_jagged_union_merged`) makes the
     /// slot buffers zero everywhere else (dummy rows, useless columns), so
     /// the zero-initialized union buffers already hold those words'
     /// values and the result is byte-identical to the full-slot copy.
@@ -1044,6 +974,7 @@ pub struct SlotWitnessDest<'d> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::r1cs::{BlockR1cs, WitnessLayout};
     use crate::r1cs::SparseBinaryMatrix;
 
     /// Empty matrix stub — nothing here applies the matrices (same practice
@@ -1571,17 +1502,6 @@ mod tests {
         for (buf, tag_a, tag_b) in [(&z, 0xA0, 0xB0), (&a, 0xA1, 0xB1), (&b, 0xA2, 0xB2)] {
             assert_eq!(buf[..], expected(tag_a, tag_b)[..], "tag {tag_a:#x}");
         }
-    }
-
-    /// The harness guard rejects multi-type registries — multi-type
-    /// instances go through the flock-mixed-v1 binding, never the harness.
-    #[test]
-    #[should_panic(expected = "single-type only")]
-    fn expect_single_type_slot_rejects_multi_type() {
-        let reg = Registry::new(vec![ty(10, 700), ty(9, 300)], 3);
-        let union = UnionInstance::new(&reg, vec![5, 3]);
-        let r1cs = block_r1cs(10, 700, 3);
-        let _ = union.expect_single_type_slot(&r1cs);
     }
 
     /// The `flock-mixed-v1` binding is deterministic and sensitive to every

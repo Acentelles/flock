@@ -7,7 +7,7 @@ use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::lincheck;
 use crate::pcs::{self, Commitment};
-use crate::proof::{R1csClaim, R1csProofJaggedLigerito, R1csProofLigerito, ZClaim};
+use crate::proof::{R1csClaim, R1csProofLigerito, ZClaim};
 use crate::r1cs::BlockR1cs;
 use crate::zerocheck;
 
@@ -28,8 +28,8 @@ pub enum VerifyError {
 }
 
 /// Per-phase wall-clock timings (seconds) of a verify, for benchmark cost
-/// breakdowns. Produced by [`verify_ligerito_timed`] (direct) and
-/// [`verify_ligerito_jagged_union_timed`] (union). Benchmark-only.
+/// breakdowns. Produced by [`verify_ligerito_timed`] (direct).
+/// Benchmark-only.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct VerifyPhaseTimings {
     /// `zerocheck::verify` — the zerocheck PIOP replay.
@@ -43,8 +43,7 @@ pub struct VerifyPhaseTimings {
     /// whose single-table lincheck folds the comb in lockstep with the
     /// sumcheck (no separable phase).
     pub lincheck_comb_s: f64,
-    /// The batched PCS opening verify (`verify_claims_ligerito` /
-    /// `verify_claims_jagged_ligerito`).
+    /// The batched PCS opening verify (`verify_claims_ligerito`).
     pub open_s: f64,
 }
 
@@ -106,8 +105,7 @@ pub fn verify_ligerito<Ch: Challenger>(
     Ok(R1csClaim { ab, c })
 }
 
-/// [`verify_ligerito`] with per-phase timers — the direct-path counterpart
-/// of [`verify_ligerito_jagged_union_timed`]. Splits the verify into
+/// [`verify_ligerito`] with per-phase timers. Splits the verify into
 /// zerocheck-verify / lincheck-verify / opening-verify (the single-table
 /// lincheck has no separable comb phase, so `lincheck_comb_s == 0`). Kept in
 /// lockstep with `verify_ligerito`; benchmark-only, production path
@@ -179,204 +177,20 @@ pub fn verify_ligerito_timed<Ch: Challenger>(
     Ok((R1csClaim { ab, c }, t))
 }
 
-/// Verify an R1CS proof whose opening went through the **jagged transport**:
-/// replay zerocheck + lincheck → the two base z-claims (identical to
-/// [`verify_ligerito`] — the PIOP is shared), then verify the jagged-path
-/// batched opening covering both. Mirror of
-/// `flock_prover::prover::prove_fast_ligerito_jagged_from_witness`.
-pub fn verify_ligerito_jagged<Ch: Challenger>(
-    r1cs: &BlockR1cs,
-    commitment: &Commitment,
-    proof: &R1csProofJaggedLigerito,
-    lincheck_circuit: &dyn lincheck::LincheckCircuit,
-    pcs_params: &crate::pcs::PcsParams,
-    challenger: &mut Ch,
-) -> Result<R1csClaim, VerifyError> {
-    let (ab, c) = verify_core(
-        r1cs,
-        &proof.zerocheck,
-        &proof.lincheck,
-        commitment,
-        lincheck_circuit,
-        challenger,
-    )?;
-    verify_claims_jagged_ligerito(
-        commitment,
-        &[ab.clone(), c.clone()],
-        &[],
-        &r1cs.jagged_heights(),
-        r1cs.n_log(),
-        r1cs.m,
-        &proof.pcs_open,
-        pcs_params,
-        challenger,
-    )
-    .map_err(VerifyError::PcsJagged)?;
-    Ok(R1csClaim { ab, c })
-}
-
-/// Statement-binding selector for the union verify path. Private: the two
-/// public entries below fix the variant (mirror of the prove-side enum in
+/// Statement-binding selector for the union verify path. One variant on
+/// this branch (`recursion_circuit` adds `Circuit`); kept as an enum so the
+/// binding dispatch below stays a match (mirror of the prove-side enum in
 /// `flock_prover::prover`).
-enum UnionVerifyBinding<'a> {
+enum UnionVerifyBinding {
     /// The protocol binding: `flock-mixed-v1` over the registry digest, the
     /// counts vector, and the commitment root
     /// ([`crate::union::UnionInstance::bind_statement`]).
     Mixed,
-    /// The M1/M2 differential-harness binding: the slot's single-table
-    /// `BlockR1cs` statement digest. Single-type registries only; not a
-    /// protocol mode.
-    SingleTypeHarness(&'a BlockR1cs),
-}
-
-/// Verify a proof produced by the **union prove entry**
-/// (`flock_prover::prover::prove_fast_ligerito_jagged_union`): bind the
-/// statement as `flock-mixed-v1` (registry digest + counts vector +
-/// commitment root, [`crate::union::UnionInstance::bind_statement`]),
-/// replay zerocheck + the union-column lincheck over the union address
-/// space with the claim points derived from the
-/// [`crate::union::UnionInstance`], then verify the jagged-path batched
-/// opening against the union's heights. The counts bind in the transcript
-/// (before any challenge) and additionally enter through the heights and
-/// the lincheck's const-pin target terms.
-///
-/// Since wire v6 the shipped Mixed protocol uses the MERGED transport
-/// ([`verify_ligerito_jagged_union_merged`]); this jagged-transport entry
-/// remains as the differential/regression oracle's verifier — not a wire
-/// mode.
-///
-/// `circuits` are the per-type lincheck circuits, one per registry type,
-/// **in slot order** (the registry's order — capacity area descending).
-pub fn verify_ligerito_jagged_union<Ch: Challenger>(
-    union: &crate::union::UnionInstance<'_>,
-    circuits: &[&dyn lincheck::LincheckCircuit],
-    commitment: &Commitment,
-    proof: &R1csProofJaggedLigerito,
-    pcs_params: &crate::pcs::PcsParams,
-    challenger: &mut Ch,
-) -> Result<R1csClaim, VerifyError> {
-    verify_union_with_binding(
-        union,
-        UnionVerifyBinding::Mixed,
-        circuits,
-        commitment,
-        proof,
-        pcs_params,
-        challenger,
-    )
-}
-
-/// [`verify_ligerito_jagged_union`] (the protocol `flock-mixed-v1` binding)
-/// with per-phase timers — the union counterpart of [`verify_ligerito_timed`].
-/// Splits the verify into zerocheck-verify / lincheck-verify (with the
-/// per-type comb construction, i.e. the multi-slot circuit replay, timed
-/// separately as `lincheck_comb_s`) / opening-verify. Kept in lockstep with
-/// `verify_ligerito_jagged_union`; benchmark-only, production path undisturbed.
-pub fn verify_ligerito_jagged_union_timed<Ch: Challenger>(
-    union: &crate::union::UnionInstance<'_>,
-    circuits: &[&dyn lincheck::LincheckCircuit],
-    commitment: &Commitment,
-    proof: &R1csProofJaggedLigerito,
-    pcs_params: &crate::pcs::PcsParams,
-    challenger: &mut Ch,
-) -> Result<(R1csClaim, VerifyPhaseTimings), VerifyError> {
-    use std::time::Instant;
-    assert_eq!(
-        pcs_params.m,
-        union.dense_m(),
-        "PcsParams.m must equal the union's dense_m (committed stack size)"
-    );
-    // PIOP replay (bind + zerocheck + union lincheck) on the 1-thread pool.
-    let (ab, c, zerocheck_s, lincheck_s, lincheck_comb_s) =
-        verifier_pool().install(|| -> Result<(ZClaim, ZClaim, f64, f64, f64), VerifyError> {
-            union.bind_statement(challenger, commitment);
-            let t0 = Instant::now();
-            let zc_claim = zerocheck::verify(union.m_bool(), &proof.zerocheck, challenger)
-                .map_err(VerifyError::Zerocheck)?;
-            let zerocheck_s = t0.elapsed().as_secs_f64();
-            let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
-            let t0 = Instant::now();
-            let (lc_claim, comb_s) = lincheck::verify_union_timed(
-                union,
-                circuits,
-                &x_ab,
-                zc_claim.a_eval,
-                zc_claim.b_eval,
-                &proof.lincheck,
-                challenger,
-            )
-            .map_err(VerifyError::Lincheck)?;
-            let lincheck_s = t0.elapsed().as_secs_f64();
-            let ab = ZClaim {
-                point: union.ab_claim_point(
-                    lc_claim.r_inner_skip,
-                    &lc_claim.r_inner_rest,
-                    &x_ab.x_outer,
-                ),
-                value: lc_claim.w,
-            };
-            let c = ZClaim {
-                point: union.c_claim_point(zc_claim.z, &zc_claim.r_rest),
-                value: zc_claim.c_eval,
-            };
-            Ok((ab, c, zerocheck_s, lincheck_s, comb_s))
-        })?;
-
-    let t0 = Instant::now();
-    verify_claims_jagged_ligerito(
-        commitment,
-        &[ab.clone(), c.clone()],
-        &[],
-        &union.jagged_heights(),
-        union.n_log(),
-        union.m_total(),
-        &proof.pcs_open,
-        pcs_params,
-        challenger,
-    )
-    .map_err(VerifyError::PcsJagged)?;
-    let open_s = t0.elapsed().as_secs_f64();
-
-    let t = VerifyPhaseTimings {
-        zerocheck_s,
-        lincheck_s,
-        lincheck_comb_s,
-        open_s,
-    };
-    Ok((R1csClaim { ab, c }, t))
-}
-
-/// [`verify_ligerito_jagged_union`] under the M1/M2 **harness** binding
-/// (the slot's single-table `BlockR1cs` statement digest) — the mirror of
-/// `flock_prover::prover::prove_fast_ligerito_jagged_union_harness`.
-/// Single-type registries only; on those, acceptance is equivalent to
-/// [`verify_ligerito_jagged`] with the slot's `BlockR1cs` at full
-/// utilization — the transcript walk is byte-identical.
-/// Test/differential harness only — not a protocol mode.
-pub fn verify_ligerito_jagged_union_harness<Ch: Challenger>(
-    union: &crate::union::UnionInstance<'_>,
-    slot_r1cs: &BlockR1cs,
-    commitment: &Commitment,
-    proof: &R1csProofJaggedLigerito,
-    lincheck_circuit: &dyn lincheck::LincheckCircuit,
-    pcs_params: &crate::pcs::PcsParams,
-    challenger: &mut Ch,
-) -> Result<R1csClaim, VerifyError> {
-    verify_union_with_binding(
-        union,
-        UnionVerifyBinding::SingleTypeHarness(slot_r1cs),
-        &[lincheck_circuit],
-        commitment,
-        proof,
-        pcs_params,
-        challenger,
-    )
 }
 
 /// The MERGED-transport union verifier (wire v6) — the Mixed protocol's
-/// verify entry, kept in lockstep with [`verify_union_with_binding`]
-/// (identical binding + PIOP replay; only the PCS verification differs:
-/// `pcs::verify_batch_merged`). Mixed binding only; handles both
+/// verify entry: the shared PIOP replay (`verify_union_piops`) followed by
+/// `pcs::verify_batch_merged`. Mixed binding only; handles both
 /// lane-major and power-of-two commitments (dispatched on
 /// `commitment.params.num_lanes`, which the params-equality check below
 /// pins to the count-derived value).
@@ -388,12 +202,12 @@ pub fn verify_ligerito_jagged_union_merged<Ch: Challenger>(
     pcs_params: &crate::pcs::PcsParams,
     challenger: &mut Ch,
 ) -> Result<R1csClaim, VerifyError> {
-    // Mirror of the prove-side guard: the merged transport has no
-    // packed-direct intake, so it cannot carry element claims yet.
+    // Mirror of the prove-side guard: this entry consumes `R1csClaim` —
+    // structurally boolean-only.
     assert!(
         !union.has_element(),
-        "the merged transport does not carry element claims yet — \
-         use verify_ligerito_jagged_union"
+        "this entry is boolean-only; element registries go through \
+         verify_ligerito_jagged_union_mixed_class_merged"
     );
     assert_eq!(
         pcs_params.m,
@@ -479,67 +293,6 @@ pub fn verify_ligerito_jagged_union_merged<Ch: Challenger>(
         })
         .map_err(VerifyError::PcsJagged)?;
     Ok(R1csClaim { ab, c })
-}
-
-/// [`verify_ligerito_jagged_union`] for a **mixed-class** proof — the mirror of
-/// `flock_prover::prover::prove_fast_ligerito_jagged_union_mixed_class`.
-///
-/// Replays each class's PIOP over its own region in the prover's Fiat–Shamir
-/// order (boolean zerocheck + lincheck, then the element region's zerocheck +
-/// lincheck), then verifies the single jagged opening with the boolean AB/C
-/// claims ring-switched and the element C/LC claims packed-direct.
-///
-/// A sub-proof must be present exactly when the registry has a type of that
-/// class; a mismatch is a rejection, not a panic. `circuits` are the
-/// per-BOOLEAN-type lincheck circuits, in slot order.
-pub fn verify_ligerito_jagged_union_mixed_class<Ch: Challenger>(
-    union: &crate::union::UnionInstance<'_>,
-    circuits: &[&dyn lincheck::LincheckCircuit],
-    commitment: &Commitment,
-    proof: &crate::proof::R1csProofMixedClassLigerito,
-    pcs_params: &crate::pcs::PcsParams,
-    challenger: &mut Ch,
-) -> Result<crate::proof::UnionClassClaims, VerifyError> {
-    if proof.boolean.is_some() != (union.num_boolean() > 0)
-        || proof.element.is_some() != union.has_element()
-    {
-        return Err(VerifyError::ClassMismatch);
-    }
-    let (claims, packed_direct_points) = verify_union_piops(
-        union,
-        UnionVerifyBinding::Mixed,
-        circuits,
-        commitment,
-        proof.boolean.as_ref(),
-        proof.element.as_ref(),
-        pcs_params,
-        challenger,
-    )?;
-    let z_claims: Vec<ZClaim> = claims
-        .boolean
-        .as_ref()
-        .map(|c| vec![c.ab.clone(), c.c.clone()])
-        .unwrap_or_default();
-    let refs: Vec<pcs::PackedDirectClaimRef<'_>> = packed_direct_points
-        .iter()
-        .map(|(point, value)| pcs::PackedDirectClaimRef {
-            point,
-            value: *value,
-        })
-        .collect();
-    verify_claims_jagged_ligerito(
-        commitment,
-        &z_claims,
-        &refs,
-        &union.jagged_heights(),
-        union.n_log(),
-        union.m_total(),
-        &proof.pcs_open,
-        pcs_params,
-        challenger,
-    )
-    .map_err(VerifyError::PcsJagged)?;
-    Ok(claims)
 }
 
 /// [`verify_ligerito_jagged_union_mixed_class`] over the MERGED transport.
@@ -633,7 +386,7 @@ pub fn verify_ligerito_jagged_union_mixed_class_merged<Ch: Challenger>(
 #[allow(clippy::too_many_arguments)]
 fn verify_union_piops<Ch: Challenger>(
     union: &crate::union::UnionInstance<'_>,
-    binding: UnionVerifyBinding<'_>,
+    binding: UnionVerifyBinding,
     circuits: &[&dyn lincheck::LincheckCircuit],
     commitment: &Commitment,
     boolean: Option<&crate::proof::BooleanPiopProof>,
@@ -666,15 +419,11 @@ fn verify_union_piops<Ch: Challenger>(
         ));
     }
     // Verification is single-threaded; run the PIOP replay on the dedicated
-    // 1-thread pool (verify_claims_jagged_ligerito installs it itself).
+    // 1-thread pool, like the opening verify after it.
     type PiopOut = (crate::proof::UnionClassClaims, Vec<(Vec<F128>, F128)>);
     verifier_pool().install(|| -> Result<PiopOut, VerifyError> {
         match binding {
             UnionVerifyBinding::Mixed => union.bind_statement(challenger, commitment),
-            UnionVerifyBinding::SingleTypeHarness(slot_r1cs) => {
-                union.expect_single_type_slot(slot_r1cs);
-                union.bind_statement_single_type(challenger, slot_r1cs, commitment);
-            }
         }
 
         let bool_claim = match boolean {
@@ -741,112 +490,6 @@ fn verify_union_piops<Ch: Challenger>(
             },
             packed_direct,
         ))
-    })
-}
-
-/// Shared body of the jagged-transport union verify entries; `binding`
-/// selects the statement binding, everything else is identical.
-fn verify_union_with_binding<Ch: Challenger>(
-    union: &crate::union::UnionInstance<'_>,
-    binding: UnionVerifyBinding<'_>,
-    circuits: &[&dyn lincheck::LincheckCircuit],
-    commitment: &Commitment,
-    proof: &R1csProofJaggedLigerito,
-    pcs_params: &crate::pcs::PcsParams,
-    challenger: &mut Ch,
-) -> Result<R1csClaim, VerifyError> {
-    assert!(
-        !union.has_element(),
-        "this entry consumes R1csProofJaggedLigerito (boolean classes only); \
-         element registries go through verify_ligerito_jagged_union_mixed_class"
-    );
-    let piop = crate::proof::BooleanPiopProof {
-        zerocheck: proof.zerocheck.clone(),
-        lincheck: proof.lincheck.clone(),
-    };
-    let (claims, packed_direct) = verify_union_piops(
-        union,
-        binding,
-        circuits,
-        commitment,
-        Some(&piop),
-        None,
-        pcs_params,
-        challenger,
-    )?;
-    debug_assert!(packed_direct.is_empty());
-    let claim = claims.boolean.expect("boolean sub-proof was supplied");
-    verify_claims_jagged_ligerito(
-        commitment,
-        &[claim.ab.clone(), claim.c.clone()],
-        &[],
-        &union.jagged_heights(),
-        union.n_log(),
-        union.m_total(),
-        &proof.pcs_open,
-        pcs_params,
-        challenger,
-    )
-    .map_err(VerifyError::PcsJagged)?;
-    Ok(claim)
-}
-
-/// Verify a jagged-path batched PCS opening over an arbitrary list of
-/// `ẑ`-claims — the jagged counterpart of [`verify_claims_ligerito`], and the
-/// mirror of the prover's `pcs::open_batch_jagged_ligerito` call. `heights` /
-/// `n_log` describe the committed jagged grid (see
-/// [`BlockR1cs::jagged_heights`]; the union heights — and hence the dense
-/// size — are count-dependent under height-`n_t` stacking); `virtual_m` is
-/// the bit-variable count of the VIRTUAL (padded) polynomial the PIOP ran
-/// over (`= pcs_params.m` on the single-table paths;
-/// `= UnionInstance::m_total` under the dense-stack commit, where
-/// `pcs_params.m` is the smaller dense size). Both sides derive all three
-/// from the statement, never from the proof. Must run at the same
-/// transcript position as the prover's open.
-pub fn verify_claims_jagged_ligerito<Ch: Challenger>(
-    commitment: &Commitment,
-    claims: &[ZClaim],
-    packed_direct: &[pcs::PackedDirectClaimRef<'_>],
-    heights: &[u64],
-    n_log: usize,
-    virtual_m: usize,
-    pcs_open: &pcs::BatchOpeningProofJaggedLigerito,
-    pcs_params: &crate::pcs::PcsParams,
-    challenger: &mut Ch,
-) -> Result<(), pcs::VerifyErrorJagged> {
-    // Verification is single-threaded; run the body on the dedicated 1-thread pool.
-    verifier_pool().install(move || {
-        let z_skips: Vec<F128> = claims.iter().map(|c| c.point.z_skip).collect();
-        let values: Vec<F128> = claims.iter().map(|c| c.value).collect();
-        let x_fulls: Vec<Vec<F128>> = claims
-            .iter()
-            .map(|c| {
-                let mut v = c.point.x_inner_rest.clone();
-                v.extend_from_slice(&c.point.x_outer);
-                v
-            })
-            .collect();
-        let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
-        let log_n = pcs_params.m - pcs::LOG_PACKING;
-        let lig_v_config = crate::pcs::ligerito::verifier_config_for(
-            log_n,
-            pcs_params.log_batch_size,
-            pcs_params.profile,
-        )
-        .expect("Ligerito default verifier config");
-        pcs::verify_opening_batch_jagged_ligerito(
-            commitment,
-            &values,
-            &z_skips,
-            &x_refs,
-            packed_direct,
-            heights,
-            n_log,
-            virtual_m - pcs::LOG_PACKING,
-            pcs_open,
-            &lig_v_config,
-            challenger,
-        )
     })
 }
 
