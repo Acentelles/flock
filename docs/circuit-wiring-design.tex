@@ -931,10 +931,15 @@ map and the multi-table document.
         \code{stream\_b} support (perf follow-up; unmerged path is the
         correctness oracle).
   \item Deferred: count-proportional element prover; LogUp bus;
-        capacity-tax refinement; keccak batch-major tier; the in-circuit
-        cap-node select (a $c$-bit multiplexer over the absorbed cap
-        words --- \code{MerklePathGate} still verifies full-depth paths
-        against its synthetic trees).
+        capacity-tax refinement; keccak batch-major tier; an
+        \emph{in-circuit} cap-node select (mux or LogUp lookup). MVP-6
+        handles capping with the \emph{boundary select} instead: the
+        circuit publishes each query's challenge word and terminal
+        digest, and the checker indexes the absorbed cap natively ---
+        the $c$-bit select costs the circuit nothing, at one extra
+        published word per query. Go in-circuit only if that public
+        surface ever matters. The composite \code{MerklePathGate}
+        stays full-depth as the uncapped differential oracle.
 \end{enumerate}
 
 % ===========================================================================
