@@ -44,7 +44,13 @@ use flock_core::pcs::Commitment;
 pub const MAGIC: [u8; 5] = *b"FLOCK";
 
 /// Format version. Bumped on incompatible serialization changes.
-/// v6 (current) switches the Mixed flavor's payload to the MERGED
+/// v7 (current): Merkle capping — `Commitment.root`, `LigeritoProof.
+/// initial_root`, and `recursive_roots` become cap-node VECTORS (the
+/// commitment is the cap layer at depth ⌈log2 q⌉; the transcript absorbs
+/// the cap itself), and the per-tree octopus multi-proofs become flat
+/// per-query capped paths. The symmetric bookend to v3, which introduced
+/// the octopus.
+/// v6 switched the Mixed flavor's payload to the MERGED
 /// jagged/ring-switch transport ([`MixedProofBundleLigerito`] now carries
 /// an `R1csProofMergedLigerito` — design doc §"Capacity-free
 /// ring-switching"); the R1cs/Chain flavors' payloads are unchanged, but
@@ -55,7 +61,7 @@ pub const MAGIC: [u8; 5] = *b"FLOCK";
 /// v3 restructured `BaseFoldProof`: per-query Merkle paths were replaced by
 /// shared octopus multi-proofs (one per Merkle tree). v2 added `HashKind`
 /// to [`ChainProofBundle`].
-pub const VERSION: u8 = 6;
+pub const VERSION: u8 = 7;
 
 /// Which hash function a chain proof is over. Carried in
 /// [`ChainProofBundle`] so the verifier (e.g. the CLI) can pick the right
@@ -436,7 +442,7 @@ mod tests {
         assert_eq!(bytes[6], FLAVOR_R1CS_LIGERITO);
 
         let bundle2 = R1csProofBundleLigerito::from_bytes(&bytes).expect("must round-trip");
-        assert_eq!(bundle2.commitment.root, commitment.root);
+        assert_eq!(bundle2.commitment.cap, commitment.cap);
 
         let mut chv = FsChallenger::new(b"flock-proofio-lig");
         setup
@@ -546,7 +552,7 @@ mod tests {
         let bundle2 = MixedProofBundleLigerito::from_bytes(&bytes).expect("must round-trip");
         assert_eq!(bundle2.registry_id, bundle.registry_id);
         assert_eq!(bundle2.counts, bundle.counts);
-        assert_eq!(bundle2.commitment.root, bundle.commitment.root);
+        assert_eq!(bundle2.commitment.cap, bundle.commitment.cap);
 
         // Verify from the deserialized bundle alone (+ the rebuilt tier).
         let setup2 = MixedSetup::new(bundle2.registry_id);

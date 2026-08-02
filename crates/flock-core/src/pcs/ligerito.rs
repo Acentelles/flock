@@ -1495,11 +1495,13 @@ impl LigeritoSecurityConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecursiveProof {
-    /// One row per query, each of `num_interleaved` F128 entries. Rows are
-    /// emitted in **sorted** query-position order so they align with the
-    /// merkle multi-proof.
+    /// One row per query, each of `num_interleaved` F128 entries, in SAMPLE
+    /// order (replacement sampling: a duplicate query is just a repeated
+    /// row).
     pub opened_rows: Vec<Vec<F128>>,
-    /// Single octopus multi-proof shared across all queries at this level.
+    /// Per-query CAPPED Merkle paths, flat: `queries.len()` paths of
+    /// `depth − cap_depth` siblings each, concatenated in sample order. A
+    /// duplicate query repeats its path. Verified against the level's cap.
     pub merkle_proof: Vec<Hash>,
 }
 
@@ -1507,16 +1509,21 @@ pub struct RecursiveProof {
 pub struct FinalProof {
     /// Remaining polynomial sent in clear at the last recursive step.
     pub yr: Vec<F128>,
-    /// Same sorted-by-position convention as [`RecursiveProof`].
+    /// Same flat per-query capped-path convention as [`RecursiveProof`].
     pub opened_rows: Vec<Vec<F128>>,
     pub merkle_proof: Vec<Hash>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LigeritoProof {
-    pub initial_root: Hash,
+    /// The L0 commitment CAP: the `2^c₀` tree nodes at depth `c₀ =
+    /// cap_depth(queries[0], d₀)` below the root. There is no root — the
+    /// transcript absorbs the cap itself.
+    pub initial_cap: Vec<Hash>,
     pub initial_proof: RecursiveProof,
-    pub recursive_roots: Vec<Hash>,
+    /// Per recursive level, that tree's cap (`2^cᵢ` nodes) — the prover's
+    /// commit message for the level, absorbed in full.
+    pub recursive_caps: Vec<Vec<Hash>>,
     pub recursive_proofs: Vec<RecursiveProof>,
     pub final_proof: FinalProof,
     pub sumcheck_transcript: Vec<SumcheckMessage>,
@@ -1544,8 +1551,8 @@ impl LigeritoProof {
         let level_bytes = |p: &RecursiveProof| -> usize {
             p.opened_rows.iter().map(|r| r.len() * ELEM).sum::<usize>() + p.merkle_proof.len() * 32
         };
-        let mut total = 32;
-        total += self.recursive_roots.len() * 32;
+        let mut total = self.initial_cap.len() * 32;
+        total += self.recursive_caps.iter().map(|c| c.len() * 32).sum::<usize>();
         total += level_bytes(&self.initial_proof);
         for p in &self.recursive_proofs {
             total += level_bytes(p);
@@ -1577,7 +1584,9 @@ impl LigeritoProof {
             }
         };
 
-        let roots_b = 32 * (1 + self.recursive_roots.len());
+        let roots_b = 32
+            * (self.initial_cap.len()
+                + self.recursive_caps.iter().map(|c| c.len()).sum::<usize>());
         let init_opened: usize = self
             .initial_proof
             .opened_rows
@@ -2356,6 +2365,12 @@ impl LigeroWitness {
     #[inline]
     pub fn root(&self) -> Hash {
         self.tree[self.tree.len() - 1]
+    }
+
+    /// The cap layer at depth `c` — this witness's commitment message.
+    #[inline]
+    pub fn cap(&self, c: usize) -> &[Hash] {
+        merkle::cap_layer(&self.tree, self.block_len, c)
     }
 }
 
@@ -3213,9 +3228,16 @@ fn sample_queries<Ch: Challenger>(
         .collect()
 }
 
-/// Build a single octopus multi-proof for all `queries` against `tree`.
-fn merkle_multi_proof_for(tree: &[Hash], block_len: usize, queries: &[usize]) -> Vec<Hash> {
-    merkle::merkle_multi_proof(tree, block_len, queries)
+/// Per-query CAPPED Merkle paths for `queries` against `tree`, flat in
+/// sample order: `queries.len()` paths of `log2(block_len) − c` siblings
+/// each. Duplicates repeat their path — no sorting, no dedup.
+fn merkle_paths_for(tree: &[Hash], block_len: usize, queries: &[usize], c: usize) -> Vec<Hash> {
+    let d = block_len.trailing_zeros() as usize;
+    let mut out = Vec::with_capacity(queries.len() * (d - c));
+    for &q in queries {
+        out.extend(merkle::merkle_proof_capped(tree, block_len, q, c));
+    }
+    out
 }
 
 /// Drive the recursive Ligerito prover to prove `poly(eval_point) = claimed_value`.
@@ -3564,15 +3586,21 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     challenger.observe_f128(target);
 
     // L0 codeword + tree are borrowed (reused from upstream `pcs::commit`).
-    // wtns_0 access reduces to: root (last tree node), row(q), block_len.
-    let initial_root: Hash = l0_tree[l0_tree.len() - 1];
+    // wtns_0 access reduces to: cap (a tree-layer slice), row(q), block_len.
     let l0_block_len = block_len_0;
+    // Every tree's cap depth is a config-static function of its query count
+    // and depth — the FS shape must never depend on sampled data.
+    let cap_depth_of = |q: usize, block_len: usize| -> usize {
+        merkle::cap_depth(q, block_len.trailing_zeros() as usize)
+    };
+    let c_0 = cap_depth_of(config.queries[0], l0_block_len);
+    let initial_cap: Vec<Hash> = merkle::cap_layer(l0_tree, l0_block_len, c_0).to_vec();
     let l0_num_interleaved = num_interleaved_0;
     let l0_row = |q: usize| -> &[F128] {
         let start = q * l0_num_interleaved;
         &l0_codeword[start..start + l0_num_interleaved]
     };
-    challenger.observe_bytes(&initial_root);
+    challenger.observe_bytes(initial_cap.as_flattened());
 
     // L0 takes no explicit OOD samples: it is bound by the opening's own
     // evaluation claim (`target` at the post-commit random point behind
@@ -3655,7 +3683,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     if trace {
         t_commits += _t.elapsed();
     }
-    challenger.observe_bytes(&wtns_1.root());
+    challenger.observe_bytes(wtns_1.cap(cap_depth_of(config.queries[1], wtns_1.block_len)).as_flattened());
 
     // OOD binding for the L1 commit: each sample evaluates f1's multilinear
     // extension at a random transcript point z ∈ F^{n1}, sends the claimed
@@ -3697,7 +3725,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     let _t = std::time::Instant::now();
     let opened_rows_0: Vec<Vec<F128>> = queries_0.iter().map(|&q| l0_row(q).to_vec()).collect();
-    let merkle_proof_0 = merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0);
+    let merkle_proof_0 = merkle_paths_for(l0_tree, l0_block_len, &queries_0, c_0);
     if trace {
         t_opens += _t.elapsed();
     }
@@ -3737,7 +3765,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
 
     // Recursive levels — same as recursive_prover_inner from here.
     let mut wtns_prev = wtns_1;
-    let mut recursive_roots: Vec<Hash> = vec![wtns_prev.root()];
+    let mut recursive_caps: Vec<Vec<Hash>> =
+        vec![wtns_prev.cap(cap_depth_of(config.queries[1], wtns_prev.block_len)).to_vec()];
     let mut recursive_proofs: Vec<RecursiveProof> = Vec::new();
     // All fold challenges in binding order (returned to the caller).
     let mut ris_all: Vec<F128> = r_lane_fold.clone();
@@ -3780,8 +3809,12 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 .iter()
                 .map(|&q| wtns_prev.row(q).to_vec())
                 .collect();
-            let merkle_proof_last =
-                merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
+            let merkle_proof_last = merkle_paths_for(
+                &wtns_prev.tree,
+                wtns_prev.block_len,
+                &queries_last,
+                cap_depth_of(num_queries_last, wtns_prev.block_len),
+            );
             if trace {
                 t_opens += _t.elapsed();
             }
@@ -3822,9 +3855,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             }
             return (
                 LigeritoProof {
-                    initial_root,
+                    initial_cap,
                     initial_proof,
-                    recursive_roots,
+                    recursive_caps,
                     recursive_proofs,
                     final_proof: FinalProof {
                         yr,
@@ -3859,9 +3892,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         if trace {
             t_commits += _t.elapsed();
         }
-        let root_next = wtns_next.root();
-        challenger.observe_bytes(&root_next);
-        recursive_roots.push(root_next);
+        let cap_next = wtns_next
+            .cap(cap_depth_of(config.queries[i + 2], wtns_next.block_len))
+            .to_vec();
+        challenger.observe_bytes(cap_next.as_flattened());
+        recursive_caps.push(cap_next);
 
         // OOD binding for the L_{i+2} commit (same as the L1 block above).
         {
@@ -3893,8 +3928,12 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             .iter()
             .map(|&q| wtns_prev.row(q).to_vec())
             .collect();
-        let merkle_proof_i =
-            merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
+        let merkle_proof_i = merkle_paths_for(
+            &wtns_prev.tree,
+            wtns_prev.block_len,
+            &queries_i,
+            cap_depth_of(num_queries_i, wtns_prev.block_len),
+        );
         if trace {
             t_opens += _t.elapsed();
         }
@@ -3948,7 +3987,7 @@ pub fn recursive_verifier_with_basis_succinct<Ch, F>(
     proof: &LigeritoProof,
     log_n: usize,
     target: F128,
-    expected_initial_root: &Hash,
+    expected_initial_cap: &[Hash],
     l0_num_lanes: usize,
     eval_b_residual: F,
     challenger: &mut Ch,
@@ -3974,13 +4013,13 @@ where
     if r < 1 || config.recursive_ks.len() != r || config.log_inv_rates.len() != r + 1 {
         return false;
     }
-    if &proof.initial_root != expected_initial_root {
+    if proof.initial_cap.as_slice() != expected_initial_cap {
         return false;
     }
 
     challenger.observe_label(b"flock-ligerito-basis-v0");
     challenger.observe_f128(target);
-    challenger.observe_bytes(&proof.initial_root);
+    challenger.observe_bytes(proof.initial_cap.as_flattened());
 
     let log_inv_rate_0 = config.log_inv_rates[0];
     let log_msg_cols_0 = log_n - initial_k;
@@ -4050,11 +4089,11 @@ where
         running_quad = RoundQuad::from_msg(msg, t_r);
     }
 
-    if proof.recursive_roots.is_empty() {
+    if proof.recursive_caps.is_empty() {
         return false;
     }
-    let root_1 = proof.recursive_roots[0];
-    challenger.observe_bytes(&root_1);
+    let cap_1: &[Hash] = &proof.recursive_caps[0];
+    challenger.observe_bytes(cap_1.as_flattened());
 
     // OOD binding mirror for the L1 commit: sample z, read the claimed
     // evaluation from the proof, and glue the claim into the running
@@ -4109,7 +4148,7 @@ where
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     let _t = std::time::Instant::now();
     if !verify_level_opens(
-        &proof.initial_root,
+        &proof.initial_cap,
         block_len_0,
         &queries_0,
         &proof.initial_proof.opened_rows,
@@ -4167,7 +4206,7 @@ where
     }];
     let mut ris: Vec<F128> = r_lane_fold.clone();
 
-    let mut prev_root = root_1;
+    let mut prev_cap: &[Hash] = cap_1;
     let mut prev_log_num_interleaved = config.recursive_ks[0];
     let mut prev_log_msg_cols = n1 - prev_log_num_interleaved;
     let mut prev_log_inv_rate = config.log_inv_rates[1];
@@ -4252,7 +4291,7 @@ where
             }
             let _t = std::time::Instant::now();
             if !verify_level_opens(
-                &prev_root,
+                prev_cap,
                 prev_block_len,
                 &queries_last,
                 &proof.final_proof.opened_rows,
@@ -4399,12 +4438,12 @@ where
             return inner == t_r;
         }
 
-        if next_root_idx >= proof.recursive_roots.len() {
+        if next_root_idx >= proof.recursive_caps.len() {
             return false;
         }
-        let root_next = proof.recursive_roots[next_root_idx];
+        let cap_next: &[Hash] = &proof.recursive_caps[next_root_idx];
         next_root_idx += 1;
-        challenger.observe_bytes(&root_next);
+        challenger.observe_bytes(cap_next.as_flattened());
 
         // OOD binding mirror for the L_{i+2} commit.
         for _ in 0..ood_count(i + 2) {
@@ -4461,7 +4500,7 @@ where
         recursive_proof_idx += 1;
         let _t = std::time::Instant::now();
         if !verify_level_opens(
-            &prev_root,
+            prev_cap,
             prev_block_len,
             &queries_i,
             &rp.opened_rows,
@@ -4501,7 +4540,7 @@ where
             beta: beta_i,
         });
 
-        prev_root = root_next;
+        prev_cap = cap_next;
         let k_next = config.recursive_ks[i + 1];
         if n_current < k_next {
             return false;
@@ -4523,7 +4562,7 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
     proof: &LigeritoProof,
     b_initial: &[F128],
     target: F128,
-    expected_initial_root: &Hash,
+    expected_initial_cap: &[Hash],
     challenger: &mut Ch,
 ) -> bool {
     let log_n = b_initial.len().trailing_zeros() as usize;
@@ -4536,13 +4575,13 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
     if b_initial.len() != 1usize << log_n {
         return false;
     }
-    if &proof.initial_root != expected_initial_root {
+    if proof.initial_cap.as_slice() != expected_initial_cap {
         return false;
     }
 
     challenger.observe_label(b"flock-ligerito-basis-v0");
     challenger.observe_f128(target);
-    challenger.observe_bytes(&proof.initial_root);
+    challenger.observe_bytes(proof.initial_cap.as_flattened());
 
     let log_inv_rate_0 = config.log_inv_rates[0];
     let log_msg_cols_0 = log_n - initial_k;
@@ -4601,11 +4640,11 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
     }
 
     // Observe wtns_1 root + open wtns_0.
-    if proof.recursive_roots.is_empty() {
+    if proof.recursive_caps.is_empty() {
         return false;
     }
-    let root_1 = proof.recursive_roots[0];
-    challenger.observe_bytes(&root_1);
+    let cap_1: &[Hash] = &proof.recursive_caps[0];
+    challenger.observe_bytes(cap_1.as_flattened());
 
     // OOD binding mirror for the L1 commit.
     for _ in 0..ood_count(1) {
@@ -4648,7 +4687,7 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
     let queries_0 = sample_queries(challenger, block_len_0, num_queries_0);
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     if !verify_level_opens(
-        &proof.initial_root,
+        &proof.initial_cap,
         block_len_0,
         &queries_0,
         &proof.initial_proof.opened_rows,
@@ -4692,7 +4731,7 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
     let mut basis_separations: Vec<F128> = vec![beta_0];
     let mut ris: Vec<F128> = r_lane_fold.clone();
 
-    let mut prev_root = root_1;
+    let mut prev_cap: &[Hash] = cap_1;
     let mut prev_log_num_interleaved = config.recursive_ks[0];
     let mut prev_log_msg_cols = n1 - prev_log_num_interleaved;
     let mut prev_log_inv_rate = config.log_inv_rates[1];
@@ -4772,7 +4811,7 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
             // proof, so both stay in lockstep.
             let alpha_last = challenger.sample_f128_vec(ceil_log2(num_queries_last));
             if !verify_level_opens(
-                &prev_root,
+                prev_cap,
                 prev_block_len,
                 &queries_last,
                 &proof.final_proof.opened_rows,
@@ -4839,12 +4878,12 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
             return inner == t_r;
         }
 
-        if next_root_idx >= proof.recursive_roots.len() {
+        if next_root_idx >= proof.recursive_caps.len() {
             return false;
         }
-        let root_next = proof.recursive_roots[next_root_idx];
+        let cap_next: &[Hash] = &proof.recursive_caps[next_root_idx];
         next_root_idx += 1;
-        challenger.observe_bytes(&root_next);
+        challenger.observe_bytes(cap_next.as_flattened());
 
         // OOD binding mirror for the L_{i+2} commit.
         for _ in 0..ood_count(i + 2) {
@@ -4892,7 +4931,7 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
         let rp = &proof.recursive_proofs[recursive_proof_idx];
         recursive_proof_idx += 1;
         if !verify_level_opens(
-            &prev_root,
+            prev_cap,
             prev_block_len,
             &queries_i,
             &rp.opened_rows,
@@ -4928,7 +4967,7 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
         basis_ris_starts.push(ris.len());
         basis_separations.push(beta_i);
 
-        prev_root = root_next;
+        prev_cap = cap_next;
         let k_next = config.recursive_ks[i + 1];
         if n_current < k_next {
             return false;
@@ -4973,8 +5012,14 @@ fn recursive_prover_inner<Ch: Challenger>(
     let initial_k = config.initial_k;
     let log_inv_rate_0 = config.log_inv_rates[0];
 
-    let initial_root = wtns_0.root();
-    challenger.observe_bytes(&initial_root);
+    // Config-static cap depths (the legacy/UDR path derives its query
+    // counts from `udr_queries`, so the caps do too).
+    let cap_depth_of = |q: usize, block_len: usize| -> usize {
+        merkle::cap_depth(q, block_len.trailing_zeros() as usize)
+    };
+    let c_0 = cap_depth_of(udr_queries(log_inv_rate_0), wtns_0.block_len);
+    let initial_cap: Vec<Hash> = wtns_0.cap(c_0).to_vec();
+    challenger.observe_bytes(initial_cap.as_flattened());
 
     // ---- Partial-eval at z[0..initial_k] and commit f¹ (wtns_1) ----
     let v_challenges_0 = eval_point[..initial_k].to_vec();
@@ -4997,7 +5042,11 @@ fn recursive_prover_inner<Ch: Challenger>(
     let t_l1 = t.elapsed();
     t_commits += t_l1;
     tlog!("  [ligerito]   L1 commit: {:.2?}", t_l1);
-    challenger.observe_bytes(&wtns_1.root());
+    challenger.observe_bytes(
+        wtns_1
+            .cap(cap_depth_of(udr_queries(config.log_inv_rates[1]), wtns_1.block_len))
+            .as_flattened(),
+    );
 
     // ---- Queries + open wtns_0 ----
     let num_queries_0 = udr_queries(log_inv_rate_0);
@@ -5005,7 +5054,7 @@ fn recursive_prover_inner<Ch: Challenger>(
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     let t = std::time::Instant::now();
     let opened_rows_0: Vec<Vec<F128>> = queries_0.iter().map(|&q| wtns_0.row(q).to_vec()).collect();
-    let merkle_proof_0 = merkle_multi_proof_for(&wtns_0.tree, wtns_0.block_len, &queries_0);
+    let merkle_proof_0 = merkle_paths_for(&wtns_0.tree, wtns_0.block_len, &queries_0, c_0);
     t_opens += t.elapsed();
     let initial_proof = RecursiveProof {
         opened_rows: opened_rows_0.clone(),
@@ -5043,7 +5092,11 @@ fn recursive_prover_inner<Ch: Challenger>(
 
     // ---- Recursive levels ----
     let mut wtns_prev = wtns_1;
-    let mut recursive_roots: Vec<Hash> = vec![wtns_prev.root()];
+    let mut recursive_caps: Vec<Vec<Hash>> = vec![
+        wtns_prev
+            .cap(cap_depth_of(udr_queries(config.log_inv_rates[1]), wtns_prev.block_len))
+            .to_vec(),
+    ];
     let mut recursive_proofs: Vec<RecursiveProof> = Vec::new();
 
     for i in 0..r {
@@ -5080,12 +5133,16 @@ fn recursive_prover_inner<Ch: Challenger>(
                 .iter()
                 .map(|&q| wtns_prev.row(q).to_vec())
                 .collect();
-            let merkle_proof_last =
-                merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
+            let merkle_proof_last = merkle_paths_for(
+                &wtns_prev.tree,
+                wtns_prev.block_len,
+                &queries_last,
+                cap_depth_of(num_queries_last, wtns_prev.block_len),
+            );
             return LigeritoProof {
-                initial_root,
+                initial_cap,
                 initial_proof,
-                recursive_roots,
+                recursive_caps,
                 recursive_proofs,
                 final_proof: FinalProof {
                     yr,
@@ -5124,9 +5181,14 @@ fn recursive_prover_inner<Ch: Challenger>(
         let t_li = t.elapsed();
         t_commits += t_li;
         tlog!("  [ligerito]   L{} commit: {:.2?}", i + 2, t_li);
-        let root_next = wtns_next.root();
-        challenger.observe_bytes(&root_next);
-        recursive_roots.push(root_next);
+        let cap_next = wtns_next
+            .cap(cap_depth_of(
+                udr_queries(config.log_inv_rates[i + 2]),
+                wtns_next.block_len,
+            ))
+            .to_vec();
+        challenger.observe_bytes(cap_next.as_flattened());
+        recursive_caps.push(cap_next);
 
         // Open wtns_prev. wtns_prev = wtns_{i+1} uses log_inv_rates[i+1].
         let num_queries_i = udr_queries(config.log_inv_rates[i + 1]);
@@ -5137,8 +5199,12 @@ fn recursive_prover_inner<Ch: Challenger>(
             .iter()
             .map(|&q| wtns_prev.row(q).to_vec())
             .collect();
-        let merkle_proof_i =
-            merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
+        let merkle_proof_i = merkle_paths_for(
+            &wtns_prev.tree,
+            wtns_prev.block_len,
+            &queries_i,
+            cap_depth_of(num_queries_i, wtns_prev.block_len),
+        );
         t_opens += t.elapsed();
         recursive_proofs.push(RecursiveProof {
             opened_rows: opened_rows_i.clone(),
@@ -5169,32 +5235,37 @@ fn recursive_prover_inner<Ch: Challenger>(
     unreachable!("recursive loop should return on last iter")
 }
 
-/// Verify all opened rows against one root via a single octopus multi-proof.
-/// `queries` must be sorted ascending and aligned with `opened_rows`.
-/// Check the level's opened rows against `root`.
-///
-/// `queries` is a **multiset in sample order** — sampling is with replacement
-/// (see [`sample_queries`]) — while [`merkle::verify_merkle_multi_proof`] wants
-/// strictly ascending unique positions. Collapsing the two is this function's
-/// job, and it is where a repeated position has to be pinned down: only one row
-/// per position reaches the Merkle check, but *every* slot feeds
-/// `induce_sumcheck_enforced_sum`, so a prover that answered one position with
-/// two different rows would slip an unchecked row into the induced basis. Rows
-/// at a repeated position must therefore agree.
+/// Check the level's opened rows against its CAP: one independent capped
+/// Merkle path per slot, in sample order — no sorting, no dedup, and no
+/// repeated-position consistency check. A duplicate query simply repeats
+/// its path, and a prover answering one position with two DIFFERENT rows
+/// fails outright: the tree has one leaf there, so at most one of the rows
+/// can fold to the transcript-fixed cap node. The cap's size is
+/// config-static (`cap_depth(queries.len(), d)` — `queries.len()` IS the
+/// config count, the verifier sampled them itself), so a wrong-size cap or
+/// a wrong-length flat path vector rejects on shape before any hashing.
 fn verify_level_opens(
-    root: &Hash,
+    cap: &[Hash],
     block_len: usize,
     queries: &[usize],
     opened_rows: &[Vec<F128>],
     expected_num_interleaved: usize,
-    multi_proof: &[Hash],
+    paths: &[Hash],
     kind: HashKind,
 ) -> bool {
     if queries.len() != opened_rows.len() {
         return false;
     }
-    let mut leaf_hashes: Vec<Hash> = Vec::with_capacity(opened_rows.len());
-    for row in opened_rows {
+    let d = block_len.trailing_zeros() as usize;
+    let c = merkle::cap_depth(queries.len(), d);
+    if cap.len() != (1 << c) {
+        return false;
+    }
+    let path_len = d - c;
+    if paths.len() != queries.len() * path_len {
+        return false;
+    }
+    for (slot, (&q, row)) in queries.iter().zip(opened_rows).enumerate() {
         if row.len() != expected_num_interleaved {
             return false;
         }
@@ -5204,35 +5275,19 @@ fn verify_level_opens(
                 row.len() * core::mem::size_of::<F128>(),
             )
         };
-        leaf_hashes.push(merkle::hash_leaf(bytes, kind));
-    }
-
-    // Sort slot indices by position (stable order is irrelevant — equal
-    // positions must carry equal leaves anyway), then dedup.
-    let mut slots: Vec<usize> = (0..queries.len()).collect();
-    slots.sort_unstable_by_key(|&i| queries[i]);
-    let mut positions: Vec<usize> = Vec::with_capacity(slots.len());
-    let mut unique_leaves: Vec<Hash> = Vec::with_capacity(slots.len());
-    for &i in &slots {
-        if positions.last() == Some(&queries[i]) {
-            // Repeat of the previous position: the row must be the same one.
-            if unique_leaves[unique_leaves.len() - 1] != leaf_hashes[i] {
-                return false;
-            }
-            continue;
+        let leaf = merkle::hash_leaf(bytes, kind);
+        if !merkle::verify_merkle_proof_capped(
+            cap,
+            block_len,
+            &leaf,
+            q,
+            &paths[slot * path_len..][..path_len],
+            kind,
+        ) {
+            return false;
         }
-        positions.push(queries[i]);
-        unique_leaves.push(leaf_hashes[i]);
     }
-
-    merkle::verify_merkle_multi_proof(
-        root,
-        block_len,
-        &positions,
-        &unique_leaves,
-        multi_proof,
-        kind,
-    )
+    true
 }
 
 /// Verifier counterpart to [`recursive_prover`]. Supports arbitrary `R ≥ 1`.
@@ -5262,12 +5317,12 @@ pub fn recursive_verifier<Ch: Challenger>(
     challenger.observe_f128_slice(eval_point);
 
     // ---- Roots ----
-    challenger.observe_bytes(&proof.initial_root);
-    if proof.recursive_roots.len() != r {
+    challenger.observe_bytes(proof.initial_cap.as_flattened());
+    if proof.recursive_caps.len() != r {
         return false;
     }
-    let root_1 = proof.recursive_roots[0];
-    challenger.observe_bytes(&root_1);
+    let cap_1: &[Hash] = &proof.recursive_caps[0];
+    challenger.observe_bytes(cap_1.as_flattened());
 
     // ---- Open wtns_0 + α₀ ----
     let log_inv_rate_0 = config.log_inv_rates[0];
@@ -5279,7 +5334,7 @@ pub fn recursive_verifier<Ch: Challenger>(
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
 
     if !verify_level_opens(
-        &proof.initial_root,
+        &proof.initial_cap,
         block_len_0,
         &queries_0,
         &proof.initial_proof.opened_rows,
@@ -5341,7 +5396,7 @@ pub fn recursive_verifier<Ch: Challenger>(
     basis_separations.push(beta_0);
 
     // ---- Recursive iterations ----
-    let mut prev_root = root_1;
+    let mut prev_cap: &[Hash] = cap_1;
     let mut prev_log_num_interleaved = config.recursive_ks[0];
     let mut prev_log_msg_cols = n1 - prev_log_num_interleaved;
     let mut prev_log_inv_rate = config.log_inv_rates[1]; // wtns_1's rate
@@ -5390,7 +5445,7 @@ pub fn recursive_verifier<Ch: Challenger>(
             // Final-level basis-induction challenge (after yr + queries fixed).
             let alpha_last = challenger.sample_f128_vec(ceil_log2(num_queries_last));
             if !verify_level_opens(
-                &prev_root,
+                prev_cap,
                 prev_block_len,
                 &queries_last,
                 &proof.final_proof.opened_rows,
@@ -5448,12 +5503,12 @@ pub fn recursive_verifier<Ch: Challenger>(
         }
 
         // Non-last: read next root, sample queries on prev_root, induce basis, intro + glue.
-        if next_root_idx >= proof.recursive_roots.len() {
+        if next_root_idx >= proof.recursive_caps.len() {
             return false;
         }
-        let root_next = proof.recursive_roots[next_root_idx];
+        let cap_next: &[Hash] = &proof.recursive_caps[next_root_idx];
         next_root_idx += 1;
-        challenger.observe_bytes(&root_next);
+        challenger.observe_bytes(cap_next.as_flattened());
 
         let prev_block_len = 1usize << (prev_log_msg_cols + prev_log_inv_rate);
         let prev_num_interleaved = 1usize << prev_log_num_interleaved;
@@ -5467,7 +5522,7 @@ pub fn recursive_verifier<Ch: Challenger>(
         let rp = &proof.recursive_proofs[recursive_proof_idx];
         recursive_proof_idx += 1;
         if !verify_level_opens(
-            &prev_root,
+            prev_cap,
             prev_block_len,
             &queries_i,
             &rp.opened_rows,
@@ -5505,7 +5560,7 @@ pub fn recursive_verifier<Ch: Challenger>(
         basis_separations.push(beta_i);
 
         // Update prev for next iteration: prev_root = root_next, dims = next commit's dims.
-        prev_root = root_next;
+        prev_cap = cap_next;
         let k_next = config.recursive_ks[i + 1];
         if n_current < k_next {
             return false;
@@ -5910,7 +5965,11 @@ mod tests {
             &ntt_0,
             HashKind::Sha256,
         );
-        let initial_root = wtns_0.root();
+        let initial_cap = |q0: usize| -> Vec<Hash> {
+            wtns_0
+                .cap(merkle::cap_depth(q0, wtns_0.block_len.trailing_zeros() as usize))
+                .to_vec()
+        };
 
         let mut p_ch = crate::challenger::FsChallenger::new(b"pow-test");
         let proof = recursive_prover_with_basis(
@@ -5940,7 +5999,7 @@ mod tests {
         };
         let mut v_ch = crate::challenger::FsChallenger::new(b"pow-test");
         let ok =
-            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_root, &mut v_ch);
+            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_cap(v_cfg.queries[0]), &mut v_ch);
         assert!(
             ok,
             "verifier should accept proof with valid grinding nonces"
@@ -5951,7 +6010,7 @@ mod tests {
         bad_proof.grinding_nonces[0] = bad_proof.grinding_nonces[0].wrapping_add(1);
         let mut v_ch = crate::challenger::FsChallenger::new(b"pow-test");
         let ok =
-            recursive_verifier_with_basis(&v_cfg, &bad_proof, &b, target, &initial_root, &mut v_ch);
+            recursive_verifier_with_basis(&v_cfg, &bad_proof, &b, target, &initial_cap(v_cfg.queries[0]), &mut v_ch);
         assert!(
             !ok,
             "verifier must reject proof with tampered grinding nonce"
@@ -6709,8 +6768,9 @@ mod tests {
             recursive_ks, log_inv_rates, queries_per_level
         );
 
-        // Drive a challenger-deterministic query sampling, count siblings.
-        let mut ch = crate::challenger::FsChallenger::new(b"estimate");
+        // CLOSED FORM under capping: per tree, `q` capped paths of
+        // `d − c` siblings plus a `2^c`-node cap, `c = cap_depth(q, d)` —
+        // deterministic, no sampling. (`sib` counts paths + cap nodes.)
         let mut total_opened = 0usize;
         let mut total_merkle = 0usize;
         for i in 0..=r {
@@ -6722,8 +6782,8 @@ mod tests {
                 );
                 return usize::MAX;
             }
-            let qs = sample_queries(&mut ch, bl, qn);
-            let sib = multi_proof_num_siblings(&qs, bl);
+            let c = merkle::cap_depth(qn, log_block_len[i]);
+            let sib = qn * (log_block_len[i] - c) + (1usize << c);
             let opened = qn * (1usize << log_num_interleaved[i]) * ELEM;
             let merkle = sib * 32;
             let label = if i == 0 {
@@ -6912,7 +6972,7 @@ mod tests {
 
         let mut p_ch = crate::challenger::FsChallenger::new(b"test-r2");
         let proof = recursive_prover(&cfg, &poly, &z, v, &mut p_ch);
-        assert_eq!(proof.recursive_roots.len(), 2);
+        assert_eq!(proof.recursive_caps.len(), 2);
         assert_eq!(proof.recursive_proofs.len(), 1);
 
         let mut v_ch = crate::challenger::FsChallenger::new(b"test-r2");
@@ -7010,7 +7070,11 @@ mod tests {
             &ntt_0,
             HashKind::Sha256,
         );
-        let initial_root = wtns_0.root();
+        let initial_cap = |q0: usize| -> Vec<Hash> {
+            wtns_0
+                .cap(merkle::cap_depth(q0, wtns_0.block_len.trailing_zeros() as usize))
+                .to_vec()
+        };
 
         let mut p_ch = crate::challenger::FsChallenger::new(b"basis-test");
         let proof = recursive_prover_with_basis(
@@ -7039,7 +7103,7 @@ mod tests {
         };
         let mut v_ch = crate::challenger::FsChallenger::new(b"basis-test");
         let ok =
-            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_root, &mut v_ch);
+            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_cap(v_cfg.queries[0]), &mut v_ch);
         assert!(ok, "basis-based verifier rejected valid proof");
     }
 
@@ -7111,15 +7175,22 @@ mod tests {
         );
 
         // A multiset in sample order with a deliberate repeat — the shape
-        // `sample_queries` now produces (unsorted, duplicates kept).
+        // `sample_queries` produces (unsorted, duplicates kept). Under
+        // per-query capped paths there is no dedup and no explicit
+        // agreement check: each slot's row is Merkle-bound by its OWN path
+        // against the cap, so two DIFFERENT rows at one position cannot
+        // both verify — the tree has one leaf there. The statement this
+        // test pins is unchanged; the mechanism moved from an explicit
+        // comparison to per-path binding.
         let queries = vec![9usize, 2, 9, 5];
+        let c = merkle::cap_depth(queries.len(), w.block_len.trailing_zeros() as usize);
+        let cap = w.cap(c).to_vec();
         let honest: Vec<Vec<F128>> = queries.iter().map(|&q| w.row(q).to_vec()).collect();
-        let proof = merkle_multi_proof_for(&w.tree, w.block_len, &queries);
-        let root = w.root();
+        let proof = merkle_paths_for(&w.tree, w.block_len, &queries, c);
 
         assert!(
             verify_level_opens(
-                &root,
+                &cap,
                 w.block_len,
                 &queries,
                 &honest,
@@ -7130,13 +7201,13 @@ mod tests {
             "honest unsorted opening with a repeat must verify"
         );
 
-        // Slot 2 is the second occurrence of position 9. Tamper it: whichever
-        // of the two slots the dedup keeps, the other disagrees.
+        // Slot 2 is the second occurrence of position 9. Tamper it: its own
+        // path check fails (position 9's leaf is fixed by the cap).
         let mut forged = honest.clone();
         forged[2][0] += F128::ONE;
         assert!(
             !verify_level_opens(
-                &root,
+                &cap,
                 w.block_len,
                 &queries,
                 &forged,
@@ -7147,14 +7218,13 @@ mod tests {
             "disagreeing rows at a repeated position must be rejected"
         );
 
-        // Control: the same tamper at a non-repeated position is caught by the
-        // Merkle check itself, so the new check is not what is doing the work
-        // above by accident.
+        // Control: the same tamper at a non-repeated position is equally
+        // caught — every slot is bound the same way.
         let mut tampered = honest.clone();
         tampered[1][0] += F128::ONE;
         assert!(
             !verify_level_opens(
-                &root,
+                &cap,
                 w.block_len,
                 &queries,
                 &tampered,
@@ -7162,8 +7232,60 @@ mod tests {
                 &proof,
                 HashKind::Sha256
             ),
-            "a tampered row at a unique position must fail the Merkle check"
+            "a tampered row at a unique position must fail its path check"
         );
+
+        // Shape checks: a truncated or extended flat path vector, and a cap
+        // of the wrong size, reject before any hashing.
+        let mut short = proof.clone();
+        short.pop();
+        assert!(!verify_level_opens(
+            &cap,
+            w.block_len,
+            &queries,
+            &honest,
+            num_interleaved,
+            &short,
+            HashKind::Sha256
+        ));
+        let mut long = proof.clone();
+        long.push([0u8; 32]);
+        assert!(!verify_level_opens(
+            &cap,
+            w.block_len,
+            &queries,
+            &honest,
+            num_interleaved,
+            &long,
+            HashKind::Sha256
+        ));
+        let wrong_cap = w.cap(c + 1).to_vec();
+        assert!(!verify_level_opens(
+            &wrong_cap,
+            w.block_len,
+            &queries,
+            &honest,
+            num_interleaved,
+            &proof,
+            HashKind::Sha256
+        ));
+
+        // Wrong-position binding: swap two slots' path segments (rows
+        // unchanged) — each row now folds against the other's siblings.
+        let path_len = w.block_len.trailing_zeros() as usize - c;
+        let mut swapped = proof.clone();
+        for t in 0..path_len {
+            swapped.swap(t, path_len + t); // slot 0 <-> slot 1
+        }
+        assert!(!verify_level_opens(
+            &cap,
+            w.block_len,
+            &queries,
+            &honest,
+            num_interleaved,
+            &swapped,
+            HashKind::Sha256
+        ));
     }
 
     /// `induce_sumcheck_evaluate_at_residual` matches dense
@@ -7367,7 +7489,11 @@ mod tests {
             &ntt_0,
             HashKind::Sha256,
         );
-        let initial_root = wtns_0.root();
+        let initial_cap = |q0: usize| -> Vec<Hash> {
+            wtns_0
+                .cap(merkle::cap_depth(q0, wtns_0.block_len.trailing_zeros() as usize))
+                .to_vec()
+        };
 
         let mut p_ch = crate::challenger::FsChallenger::new(b"succ-cmp");
         let proof = recursive_prover_with_basis(
@@ -7398,7 +7524,7 @@ mod tests {
         // Dense verifier
         let mut v_ch = crate::challenger::FsChallenger::new(b"succ-cmp");
         let dense_ok =
-            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_root, &mut v_ch);
+            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_cap(v_cfg.queries[0]), &mut v_ch);
         assert!(dense_ok, "dense verifier must accept");
 
         // Succinct verifier — batch eval_b is just eq(z, ris ++ y_bits) by construction
@@ -7425,7 +7551,7 @@ mod tests {
             &proof,
             log_n,
             target,
-            &initial_root,
+            &initial_cap(v_cfg.queries[0]),
             1usize << v_cfg.initial_k,
             eval_b_residual,
             &mut v_ch2,
@@ -7519,7 +7645,11 @@ mod tests {
             &ntt_0,
             HashKind::Sha256,
         );
-        let initial_root = wtns_0.root();
+        let initial_cap = |q0: usize| -> Vec<Hash> {
+            wtns_0
+                .cap(merkle::cap_depth(q0, wtns_0.block_len.trailing_zeros() as usize))
+                .to_vec()
+        };
 
         let mut p_ch = crate::challenger::FsChallenger::new(b"ood-test");
         let proof = recursive_prover_with_basis(
@@ -7539,7 +7669,7 @@ mod tests {
 
         let dense = |proof: &LigeritoProof| {
             let mut ch = crate::challenger::FsChallenger::new(b"ood-test");
-            recursive_verifier_with_basis(&v_cfg, proof, &b, target, &initial_root, &mut ch)
+            recursive_verifier_with_basis(&v_cfg, proof, &b, target, &initial_cap(v_cfg.queries[0]), &mut ch)
         };
         let eval_b_residual = {
             let z = z.clone();
@@ -7568,7 +7698,7 @@ mod tests {
                 proof,
                 log_n,
                 target,
-                &initial_root,
+                &initial_cap(v_cfg.queries[0]),
                 1usize << v_cfg.initial_k,
                 &eval_b_residual,
                 &mut ch,
@@ -7636,7 +7766,11 @@ mod tests {
             &ntt_0,
             HashKind::Sha256,
         );
-        let initial_root = wtns_0.root();
+        let initial_cap = |q0: usize| -> Vec<Hash> {
+            wtns_0
+                .cap(merkle::cap_depth(q0, wtns_0.block_len.trailing_zeros() as usize))
+                .to_vec()
+        };
 
         let mut p_ch = crate::challenger::FsChallenger::new(b"m22-fast");
         let proof = recursive_prover_with_basis(
@@ -7651,7 +7785,7 @@ mod tests {
 
         let mut v_ch = crate::challenger::FsChallenger::new(b"m22-fast");
         assert!(
-            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_root, &mut v_ch),
+            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_cap(v_cfg.queries[0]), &mut v_ch),
             "m22 fast profile proof must verify"
         );
     }
@@ -7696,7 +7830,11 @@ mod tests {
             &ntt_0,
             HashKind::Blake3,
         );
-        let initial_root = wtns_0.root();
+        let initial_cap = |q0: usize| -> Vec<Hash> {
+            wtns_0
+                .cap(merkle::cap_depth(q0, wtns_0.block_len.trailing_zeros() as usize))
+                .to_vec()
+        };
 
         let mut p_ch = crate::challenger::FsChallenger::new(b"m22-blake3");
         let proof = recursive_prover_with_basis(
@@ -7711,7 +7849,7 @@ mod tests {
 
         let mut v_ch = crate::challenger::FsChallenger::new(b"m22-blake3");
         assert!(
-            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_root, &mut v_ch),
+            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_cap(v_cfg.queries[0]), &mut v_ch),
             "blake3 Merkle proof must verify"
         );
 
@@ -7726,7 +7864,7 @@ mod tests {
                 &proof,
                 &b,
                 target,
-                &initial_root,
+                &initial_cap(v_cfg.queries[0]),
                 &mut w_ch
             ),
             "a sha256-configured verifier must reject a blake3 proof"
@@ -7766,7 +7904,11 @@ mod tests {
                 let ntt_0 = AdditiveNttF128::standard(log_msg_cols_0 + 1);
                 let wtns_0 =
                     ligero_commit(&poly, log_msg_cols_0, initial_k, 1, &ntt_0, merkle_hash);
-                let initial_root = wtns_0.root();
+                let initial_cap = |q0: usize| -> Vec<Hash> {
+            wtns_0
+                .cap(merkle::cap_depth(q0, wtns_0.block_len.trailing_zeros() as usize))
+                .to_vec()
+        };
 
                 let mut p_ch = crate::challenger::FsChallenger::with_hash(b"m22-matrix", fs_hash);
                 let proof = recursive_prover_with_basis(
@@ -7786,7 +7928,7 @@ mod tests {
                         &proof,
                         &b,
                         target,
-                        &initial_root,
+                        &initial_cap(v_cfg.queries[0]),
                         &mut v_ch
                     ),
                     "merkle={merkle_hash} fs={fs_hash} must verify"
@@ -7805,7 +7947,7 @@ mod tests {
                         &proof,
                         &b,
                         target,
-                        &initial_root,
+                        &initial_cap(v_cfg.queries[0]),
                         &mut w_ch
                     ),
                     "merkle={merkle_hash}: an {other_fs} transcript must reject an {fs_hash} proof"
@@ -7876,7 +8018,11 @@ mod tests {
             &ntt_0,
             HashKind::Sha256,
         );
-        let initial_root = wtns_0.root();
+        let initial_cap = |q0: usize| -> Vec<Hash> {
+            wtns_0
+                .cap(merkle::cap_depth(q0, wtns_0.block_len.trailing_zeros() as usize))
+                .to_vec()
+        };
 
         let mut p_ch = crate::challenger::FsChallenger::new(b"batched");
         let proof = recursive_prover_with_basis(
@@ -7905,7 +8051,7 @@ mod tests {
         };
         let mut v_ch = crate::challenger::FsChallenger::new(b"batched");
         let ok =
-            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_root, &mut v_ch);
+            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_cap(v_cfg.queries[0]), &mut v_ch);
         assert!(ok, "batched-basis verifier rejected valid proof");
     }
 
@@ -7973,8 +8119,8 @@ mod tests {
         );
 
         // Proofs must be byte-identical (same FS state, same prover work).
-        assert_eq!(proof_a.initial_root, proof_b.initial_root);
-        assert_eq!(proof_a.recursive_roots, proof_b.recursive_roots);
+        assert_eq!(proof_a.initial_cap, proof_b.initial_cap);
+        assert_eq!(proof_a.recursive_caps, proof_b.recursive_caps);
         assert_eq!(proof_a.final_proof.yr, proof_b.final_proof.yr);
         assert_eq!(
             proof_a.sumcheck_transcript.len(),

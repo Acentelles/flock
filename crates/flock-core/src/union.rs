@@ -570,7 +570,7 @@ impl<'r> UnionInstance<'r> {
     /// order, the `flock-mixed-v1` domain label, the registry digest
     /// ([`Registry::digest`]), the counts vector (one u64 LE per type, in
     /// slot order, as a single byte string — its length is additionally
-    /// bound through the digest's type count), and the commitment root. The
+    /// bound through the digest's type count), and the commitment CAP. The
     /// counts are the only per-proof statement data; everything else is
     /// registry-static.
     ///
@@ -586,7 +586,7 @@ impl<'r> UnionInstance<'r> {
             counts_le.extend_from_slice(&(n_t as u64).to_le_bytes());
         }
         challenger.observe_bytes(&counts_le);
-        challenger.observe_bytes(&commitment.root);
+        challenger.observe_bytes(commitment.cap.as_flattened());
     }
 
     /// [`Self::bind_statement`] plus the CIRCUIT half of the statement: the
@@ -1546,7 +1546,7 @@ mod tests {
         use crate::pcs::PcsParams;
 
         let commitment = |root_byte: u8| Commitment {
-            root: [root_byte; 32],
+            cap: vec![[root_byte; 32]],
             params: PcsParams {
                 m: 14,
                 log_inv_rate: 1,
@@ -1582,7 +1582,7 @@ mod tests {
         assert_ne!(
             base,
             sample(&UnionInstance::new(&reg, vec![5, 3]), 0xAB),
-            "commitment root must bind"
+            "commitment cap must bind"
         );
         // A registry tamper invisible to every other verifier-side quantity
         // (useful_bits +1 within the same chunk-column) still moves the

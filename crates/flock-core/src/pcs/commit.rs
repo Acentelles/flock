@@ -146,6 +146,25 @@ impl PcsParams {
         Ok(cfg)
     }
 
+    /// The L0 query count these params imply — the exact rule every opener
+    /// uses to pick its config: the embedded security config when one exists
+    /// for `(log_msg_len, log_batch_size, profile)` (the flock-prover
+    /// paths), else `udr_queries(log_inv_rate)` (the `default_config` paths:
+    /// the standalone element proof and the permutation check, whose
+    /// `queries[0]` IS `udr_queries`). Commit-time cap sizing MUST agree
+    /// with the opener's config — this is that single source of truth.
+    pub fn l0_queries(&self) -> usize {
+        match self.ligerito_prover_config() {
+            Ok(cfg) => cfg.queries[0],
+            Err(_) => crate::pcs::ligerito::udr_queries(self.log_inv_rate),
+        }
+    }
+
+    /// Cap depth of the L0 commitment tree: `min(⌈log2 q₀⌉, k_code)`.
+    pub fn l0_cap_depth(&self) -> usize {
+        merkle::cap_depth(self.l0_queries(), self.k_code())
+    }
+
     fn validate(&self) {
         assert!(
             self.m >= LOG_PACKING + self.log_batch_size,
@@ -167,10 +186,14 @@ impl PcsParams {
     }
 }
 
-/// Public commitment (Merkle root + params).
+/// Public commitment (Merkle CAP + params). The cap is the `2^c` tree nodes
+/// at depth `c = params.l0_cap_depth()` below the root — the commitment IS
+/// the cap; there is no root (a 32-byte id, if ever needed externally, is
+/// just a hash of the cap and lives outside the protocol). Openings
+/// authenticate leaf → cap node in `k_code − c` siblings.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Commitment {
-    pub root: Hash,
+    pub cap: Vec<Hash>,
     pub params: PcsParams,
 }
 
@@ -453,7 +476,8 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
     // row-batch lanes (num_ntts F_{2^128} values = 2^log_batch_size). This is
     // Ligerito's L0 commitment.
     let merkle_tree = merkle::merkle_tree(codeword_bytes, params.n_leaves(), params.merkle_hash);
-    let root = *merkle_tree.last().expect("merkle tree non-empty");
+    let cap =
+        merkle::cap_layer(&merkle_tree, params.n_leaves(), params.l0_cap_depth()).to_vec();
     if timing {
         eprintln!(
             "[commit-timing] merkle: {:.2} ms",
@@ -463,7 +487,7 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
 
     (
         Commitment {
-            root,
+            cap,
             params: params.clone(),
         },
         ProverData {
@@ -640,13 +664,16 @@ mod tests {
             let oracle_bytes: &[u8] = unsafe {
                 core::slice::from_raw_parts(oracle.as_ptr() as *const u8, oracle.len() * 16)
             };
-            let oracle_root =
-                *crate::merkle::merkle_tree(oracle_bytes, params.n_leaves(), params.merkle_hash)
-                    .last()
-                    .unwrap();
+            let oracle_tree =
+                crate::merkle::merkle_tree(oracle_bytes, params.n_leaves(), params.merkle_hash);
+            let oracle_cap = crate::merkle::cap_layer(
+                &oracle_tree,
+                params.n_leaves(),
+                params.l0_cap_depth(),
+            );
             assert_eq!(
-                commitment.root, oracle_root,
-                "root mismatch at m={m} r={log_inv_rate}"
+                commitment.cap, oracle_cap,
+                "cap mismatch at m={m} r={log_inv_rate}"
             );
         }
     }
@@ -677,7 +704,7 @@ mod tests {
             let z_packed = super::super::pack::pack_witness(&z, m);
             let (c_none, pd_none) = commit(&z_packed, &base);
             let (c_full, pd_full) = commit(&z_packed, &explicit);
-            assert_eq!(c_none.root, c_full.root, "root diverged (m={m})");
+            assert_eq!(c_none.cap, c_full.cap, "cap diverged (m={m})");
             assert_eq!(pd_none.codeword, pd_full.codeword, "codeword diverged");
             assert_eq!(pd_none.merkle_tree, pd_full.merkle_tree, "tree diverged");
         }
@@ -754,11 +781,14 @@ mod tests {
                         pd_t.codeword.len() * 16,
                     )
                 };
-                let root =
-                    *crate::merkle::merkle_tree(bytes, t_params.n_leaves(), t_params.merkle_hash)
-                        .last()
-                        .unwrap();
-                assert_eq!(root, _c_t.root, "root must be over t-wide leaves");
+                let tree =
+                    crate::merkle::merkle_tree(bytes, t_params.n_leaves(), t_params.merkle_hash);
+                let cap = crate::merkle::cap_layer(
+                    &tree,
+                    t_params.n_leaves(),
+                    t_params.l0_cap_depth(),
+                );
+                assert_eq!(cap, _c_t.cap, "cap must be over t-wide leaves");
             }
         }
     }
@@ -822,7 +852,7 @@ mod tests {
                 }
                 let (c_ref, pd_ref) = commit(&extract, &params);
                 let (c_grid, pd_grid) = commit_lane_major(&q, &params);
-                assert_eq!(c_ref.root, c_grid.root, "root diverged (m={m}, t={t})");
+                assert_eq!(c_ref.cap, c_grid.cap, "cap diverged (m={m}, t={t})");
                 assert_eq!(pd_ref.codeword, pd_grid.codeword, "codeword diverged");
                 assert_eq!(pd_ref.merkle_tree, pd_grid.merkle_tree, "tree diverged");
             }
@@ -948,8 +978,12 @@ mod tests {
             let (commitment, prover_data) = commit(&z_packed, &params);
             assert_eq!(prover_data.codeword.len(), params.codeword_len_f128());
             assert_eq!(
-                prover_data.merkle_tree.last().copied().unwrap(),
-                commitment.root
+                crate::merkle::cap_layer(
+                    &prover_data.merkle_tree,
+                    params.n_leaves(),
+                    params.l0_cap_depth(),
+                ),
+                commitment.cap
             );
             assert_eq!(z_packed.len(), 1 << params.log_msg_len());
         }
@@ -964,7 +998,7 @@ mod tests {
         let params = default_params(m);
         let (c1, _) = commit(&z_packed, &params);
         let (c2, _) = commit(&z_packed, &params);
-        assert_eq!(c1.root, c2.root);
+        assert_eq!(c1.cap, c2.cap);
     }
 
     #[test]
@@ -976,7 +1010,7 @@ mod tests {
         let (c1, _) = commit(&super::super::pack::pack_witness(&z, m), &params);
         z[7] ^= true;
         let (c2, _) = commit(&super::super::pack::pack_witness(&z, m), &params);
-        assert_ne!(c1.root, c2.root);
+        assert_ne!(c1.cap, c2.cap);
     }
 
     #[test]

@@ -2377,7 +2377,7 @@ mod tests {
         let (proof_f, commit_f, claim_f) = setup.prove_fast(&blocks, &mut ch_f);
         let mut ch_g = FsChallenger::new(b"flock-blake3-gvf");
         let (proof_g, commit_g, claim_g) = setup.prove_ligerito(&blocks, &mut ch_g);
-        assert_eq!(commit_f.root, commit_g.root);
+        assert_eq!(commit_f.cap, commit_g.cap);
         assert_eq!(claim_f, claim_g);
         assert_eq!(
             bincode::serialize(&proof_f).unwrap(),

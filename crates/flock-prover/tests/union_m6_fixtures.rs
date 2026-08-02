@@ -29,6 +29,7 @@
 //! this branch has replacement sampling (`4e46b0a`, one batched squeeze per
 //! Ligerito level), which `multitable` predates — the multitable-minted
 //! digests can never match here. Same statements, same witness streams.
+//! Re-pinned 2026-08-02: Merkle capping (proof_io v7): cap layers absorbed instead of roots (ObserveBytes 32 -> 32*2^c per commit absorb); octopus multi-proofs replaced by flat per-query capped paths.
 
 use ::sha2 as sha2_hash;
 use flock_core::proof::{R1csClaim, R1csProofMergedLigerito};
@@ -102,7 +103,7 @@ fn merged_bundle_digest(
 ) -> String {
     let mut h = sha2_hash::Sha256::new();
     h.update(bincode::serialize(proof).expect("proof serializes"));
-    h.update(commitment.root);
+    h.update(commitment.cap.as_flattened());
     for v in [claim.ab.value, claim.c.value] {
         h.update(v.lo.to_le_bytes());
         h.update(v.hi.to_le_bytes());
@@ -125,22 +126,22 @@ fn m6_merged_union_proof_bytes_pinned() {
         (
             "merged-nu10-1024-1024",
             [1024, 1024],
-            "80c4b4a45364edf0b7ef0584e85f0df86315ed4f15d441995319f8570bdce6b2",
+            "8654c643caf72b07f37f491bf0581c19d50333a8bd94e0922d700571cfc208a5",
         ),
         (
             "merged-nu10-50-37",
             [50, 37],
-            "ef3fd929c11a8189b5cf88cc1fcaa47d917f24cbed461a890d5d983776e9315b",
+            "10e57f16ec4d2ece6579f6792851c2b43e6c92d156022c9d9b7a09da4e894b57",
         ),
         (
             "merged-nu10-8-8",
             [8, 8],
-            "af82e9380d598848c8ce5ac2cccbb8d661149094ac0b5189e058d7eb5fdb6d95",
+            "78ed6a4a12d9ff056c60a76ce75c2f8ffc9788c3969551e12a2ad19e94f14914",
         ),
         (
             "merged-nu10-0-64",
             [0, 64],
-            "580f429158221ef4724051b25792dd336ee688a65f4d0b85a527dca395d1938f",
+            "98205e1f6cafdb039ccd942c72f91d2b0d2c4b5ce69781b04c921acd529120ba",
         ),
     ];
 
@@ -216,7 +217,7 @@ fn m6_merged_union_proof_bytes_pinned() {
 fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
     // BLAKE3, 256 blocks (m = 22).
     {
-        const EXPECTED: &str = "44391e5c57dc31796d13b02918945861d78a9e567786890185512b8636fec973";
+        const EXPECTED: &str = "b7e79cbaa6357eb28abee2884771e12b35b660cca3ece9e84ed00a5dc4eda844";
         let n_blocks = 256usize;
         let setup = blake3::Blake3Setup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_B3B3);
@@ -248,7 +249,7 @@ fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
 
     // SHA-256, 128 blocks (m = 22).
     {
-        const EXPECTED: &str = "75db4462867f6e75861f78ca6ffd1cc1a7b43f9c045bdf547a965de9b816cdcf";
+        const EXPECTED: &str = "05f36986af292887ba636c17acf60ed8deb45d9d5cdfe10b6bd272b45cb3f923";
         let n_blocks = 128usize;
         let setup = sha2::Sha256HybridSetup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_5252);

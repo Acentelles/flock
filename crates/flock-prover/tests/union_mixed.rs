@@ -209,8 +209,8 @@ fn mixed_blake3_sha256_roundtrip_and_tamper() {
         flock_core::pcs::commit(&q, &pcs_params)
     };
     assert_eq!(
-        commitment.root, comm_direct.root,
-        "commitment root must equal a direct commit of the compacted union stack"
+        commitment.cap, comm_direct.cap,
+        "commitment cap must equal a direct commit of the compacted union stack"
     );
 
     // ---- Verify (circuits in slot order).
@@ -1127,8 +1127,17 @@ fn merged_transport_roundtrip_and_tamper() {
         bad.pcs_open.frobenius.rounds[5].1 += F128::ONE;
         reject(&bad, "frobenius round");
         let mut bad = proof.clone();
-        bad.pcs_open.inner.ligerito.initial_root = [0u8; 32].into();
-        reject(&bad, "inner open initial root");
+        bad.pcs_open.inner.ligerito.initial_cap = vec![[0u8; 32]];
+        reject(&bad, "inner open initial cap (wrong size + content)");
+        let mut bad = proof.clone();
+        bad.pcs_open.inner.ligerito.initial_cap[0][0] ^= 1;
+        reject(&bad, "inner open initial cap node");
+        let mut bad = proof.clone();
+        bad.pcs_open.inner.ligerito.recursive_caps[0][0][0] ^= 1;
+        reject(&bad, "inner open recursive cap node");
+        let mut bad = proof.clone();
+        bad.pcs_open.inner.ligerito.recursive_caps[0].push([0u8; 32]);
+        reject(&bad, "inner open recursive cap length");
         let mut bad = proof.clone();
         bad.zerocheck.round1_ab[0] += F128::ONE;
         reject(&bad, "zerocheck round 1");
@@ -1462,7 +1471,7 @@ fn merged_padding_unread_poison_pool() {
             flock_core::scratch::give_u8(vec![0xAD; 1 << 20]);
         }
         let (p2, c2, cl2) = prove();
-        assert_eq!(c1.root, c2.root, "commitment must ignore dropped words");
+        assert_eq!(c1.cap, c2.cap, "commitment must ignore dropped words");
         assert_eq!(p1, p2, "proof must be byte-identical under a poisoned pool");
         assert_eq!(cl1, cl2);
         let circuits: [&dyn LincheckCircuit; 2] = [s2_circuit, b3_circuit];
@@ -1537,7 +1546,7 @@ fn in_place_generation_matches_prebuilt_byte_identical() {
         ]);
 
         assert_eq!(
-            prebuilt_comm.root, in_place_comm.root,
+            prebuilt_comm.cap, in_place_comm.cap,
             "commitment root differs at counts {counts:?}"
         );
         assert_eq!(

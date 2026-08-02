@@ -337,7 +337,7 @@ fn element_claims_are_bound_by_the_opening() {
 
     // The inner eq-basis opening of q̂(ρ).
     let mut bad = proof.clone();
-    bad.pcs_open.inner.ligerito.initial_root = [0u8; 32].into();
+    bad.pcs_open.inner.ligerito.initial_cap = vec![[0u8; 32]];
     assert!(verify(&bad).is_err(), "tampered inner open root");
 }
 
@@ -580,7 +580,7 @@ fn dummy_row_is_structurally_invisible_under_the_union() {
             z_clean[at(c, n + 5)] = F128::ZERO;
         }
         let (proof_clean, cm_clean, claims_clean) = prove(&z_clean);
-        assert_eq!(cm_dirty.root, cm_clean.root, "same committed stack");
+        assert_eq!(cm_dirty.cap, cm_clean.cap, "same committed stack");
         assert_eq!(claims_dirty, claims_clean, "same claims");
         assert_eq!(
             bincode::serialize(&proof_dirty).unwrap(),
@@ -1011,7 +1011,7 @@ fn boolean_only_mixed_class_matches_the_plain_entry() {
     );
     let tail_mixed = ch.sample_f128();
 
-    assert_eq!(cm_plain.root, cm_mixed.root);
+    assert_eq!(cm_plain.cap, cm_mixed.cap);
     assert!(mixed.element.is_none());
     let b = mixed.boolean.as_ref().expect("boolean sub-proof");
     assert_eq!(
@@ -1082,7 +1082,7 @@ fn bundle_digest_merged(
 ) -> String {
     let mut h = sha2_hash::Sha256::new();
     h.update(bincode::serialize(proof).expect("proof serializes"));
-    h.update(commitment.root);
+    h.update(commitment.cap.as_flattened());
     let mut absorb = |v: F128| {
         h.update(v.lo.to_le_bytes());
         h.update(v.hi.to_le_bytes());
@@ -1110,19 +1110,20 @@ fn bundle_digest_merged(
 /// Re-pinned on `recursion_circuit` 2026-08-02 at the jagged-removal merge:
 /// this branch has replacement sampling (`4e46b0a`), which `multitable`
 /// predates — the multitable-minted digests can never match here.
+/// Re-pinned 2026-08-02: Merkle capping (proof_io v7): cap layers absorbed instead of roots (ObserveBytes 32 -> 32*2^c per commit absorb); octopus multi-proofs replaced by flat per-query capped paths.
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn mixed_class_merged_proof_bytes_pinned() {
     const ELEMENT_ONLY: [(&str, usize, &str); 3] = [
-        ("elem-merged-nu12-full", 1 << 12, "31c98db91ab7f1b4fe8fca4937f5cde1d969ced5e54b7105f8e5243163b7e712"),
-        ("elem-merged-nu12-2731", 2731, "c8106ddeebde9c2a5b94d7083cff1f603b4c98c6e85e512cd241e20b9ac9de06"),
-        ("elem-merged-nu12-0", 0, "a0d3b2af20acecadc6f123a1d0a17667345c9224a505f518ad87a39b167bd958"),
+        ("elem-merged-nu12-full", 1 << 12, "6f07e2ecc5a412b9efbe216236921cec9f173d7b730f64053cf3749ce292b8ee"),
+        ("elem-merged-nu12-2731", 2731, "8501391830c61823af1304bdfe19bee7d7cfb15921452aaaafa54e3f21b631ed"),
+        ("elem-merged-nu12-0", 0, "88d55a70c2c5d10de0da99babf472c590e46f5c977544ff0d56fdcd3290492b2"),
     ];
     const MIXED: [(&str, [usize; 2], &str); 4] = [
-        ("mix-merged-nu7-128-128", [128, 128], "a3ca0fdb034f9490b565d8a1a4c998fc68f4ec04edaf538027259efded23c13b"),
-        ("mix-merged-nu7-100-90", [100, 90], "2846b7593827d798ac6aded69ed5a2e85c3c2681847be26a44de3c8c0584c980"),
-        ("mix-merged-nu7-0-90", [0, 90], "d21c8c5e781367e96ef6e7e528c9b1a5e298dc30c60bee81abbd0019e2167a71"),
-        ("mix-merged-nu7-100-0", [100, 0], "92fc311cfe8d5f8d9c536a224b5f048f9063a0f71fdc7d178995237f90c4bc1c"),
+        ("mix-merged-nu7-128-128", [128, 128], "9652ad66d25e4123049f8b07be51256aec4abaaaae5f6f0d7e845c88ffdce3fc"),
+        ("mix-merged-nu7-100-90", [100, 90], "30af426e3e9daa3c1b620faa982f845f3f661dcc54fded205d480fbed89449e8"),
+        ("mix-merged-nu7-0-90", [0, 90], "a467e01e2c2e20b0e658ece80df8002a212e69c3b444afeef1781ec1394191b0"),
+        ("mix-merged-nu7-100-0", [100, 0], "32cdfda3f38bb0f975cc83e0c7c0261c340a6c245778b2b66fb778fd3f6d6495"),
     ];
 
     let (w0, w1) = (F128::new(0x51F0, 0), F128::new(0, 0x2C7E));

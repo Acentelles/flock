@@ -604,15 +604,15 @@ impl ElementStatement<'_> {
         1usize << self.m_words()
     }
 
-    /// Absorb label, type digest, capacity, count and commitment root — the
+    /// Absorb label, type digest, capacity, count and commitment cap — the
     /// whole statement — BEFORE any challenge is squeezed. Prover and verifier
     /// call this at the same transcript position.
-    fn bind<C: Challenger>(&self, root: &Hash, ch: &mut C) {
+    fn bind<C: Challenger>(&self, cap: &[Hash], ch: &mut C) {
         ch.observe_label(DOMAIN);
         ch.observe_bytes(&self.ty.digest());
         ch.observe_bytes(&(self.n_log as u64).to_le_bytes());
         ch.observe_bytes(&(self.n as u64).to_le_bytes());
-        ch.observe_bytes(root);
+        ch.observe_bytes(cap.as_flattened());
     }
 }
 
@@ -673,8 +673,8 @@ fn ligerito_verifier_config(m_words: usize) -> VerifierConfig {
 /// PIOP phases, and one batched opening of both output claims.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ElementProof {
-    /// Merkle root of the committed witness words.
-    pub root: Hash,
+    /// Merkle cap layer of the committed witness words (the commitment).
+    pub cap: Vec<Hash>,
     pub zerocheck: zerocheck::Proof,
     pub lincheck: lincheck::Proof,
     /// Packed-direct opening of `ec = ẑ(r)` and `ẑ(r')` — the mixed open with
@@ -737,7 +737,7 @@ pub fn prove<C: Challenger>(
     // ---- 1. Commit the witness words, then bind the whole statement. ----
     let params = pcs_params(m_words);
     let (commitment, pdata) = commit(z, &params);
-    stmt.bind(&commitment.root, ch);
+    stmt.bind(&commitment.cap, ch);
 
     // ---- 2. Phase 1: element zerocheck. ----
     //
@@ -772,7 +772,7 @@ pub fn prove<C: Challenger>(
     );
 
     let proof = ElementProof {
-        root: commitment.root,
+        cap: commitment.cap,
         zerocheck: zc_proof,
         lincheck: lc_proof,
         open,
@@ -807,13 +807,13 @@ pub fn verify<C: Challenger>(
         });
     }
 
-    // Rebuild the commitment from the proof's root + statement-derived params,
+    // Rebuild the commitment from the proof's cap + statement-derived params,
     // and bind at the prover's transcript position.
     let commitment = Commitment {
-        root: proof.root,
+        cap: proof.cap.clone(),
         params: pcs_params(m_words),
     };
-    stmt.bind(&commitment.root, ch);
+    stmt.bind(&commitment.cap, ch);
 
     let zc_claim =
         zerocheck::verify(m_words, &proof.zerocheck, ch).map_err(VerifyError::Zerocheck)?;
@@ -1421,7 +1421,7 @@ mod e2e_tests {
 
         // A different root claims a different witness entirely.
         let mut bad_root = proof.clone();
-        bad_root.root[0] ^= 1;
+        bad_root.cap[0][0] ^= 1;
         assert!(run_verify(&stmt, &bad_root).is_err(), "wrong root");
     }
 

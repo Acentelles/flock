@@ -145,6 +145,28 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     lig_config: &ligerito::ProverConfig,
     challenger: &mut Ch,
 ) -> BatchOpeningProofLigerito {
+    // Belt-and-braces on the cap-depth derivation: the commit-time cap
+    // (from `PcsParams::l0_cap_depth`) must be the layer the opener's
+    // config implies — a config-source disagreement fails loudly here at
+    // prove time instead of as a verifier reject.
+    assert_eq!(
+        commitment.cap.len(),
+        1usize
+            << crate::merkle::cap_depth(
+                lig_config.queries[0],
+                commitment.params.k_code(),
+            ),
+        "commitment cap size disagrees with the opener config's L0 query count"
+    );
+    debug_assert_eq!(
+        commitment.cap.as_slice(),
+        crate::merkle::cap_layer(
+            &prover_data.merkle_tree,
+            commitment.params.n_leaves(),
+            crate::merkle::cap_depth(lig_config.queries[0], commitment.params.k_code()),
+        ),
+        "commitment cap is not the prover tree's cap layer"
+    );
     let trace = std::env::var("PCS_TRACE").is_ok();
     let t_total = std::time::Instant::now();
 
@@ -904,7 +926,7 @@ pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
         &proof.ligerito,
         log_n,
         target_combined,
-        &commitment.root,
+        &commitment.cap,
         commitment.params.num_ntts(),
         eval_b_residual,
         challenger,
@@ -977,6 +999,28 @@ pub fn open_batch_merged<Ch: Challenger>(
 ) -> MergedOpenProof {
     let trace = std::env::var("PCS_TRACE").is_ok();
     let t_total = std::time::Instant::now();
+    // Belt-and-braces on the cap-depth derivation: the commit-time cap
+    // (from `PcsParams::l0_cap_depth`) must be the layer the opener's
+    // config implies — a config-source disagreement fails loudly here at
+    // prove time instead of as a verifier reject.
+    assert_eq!(
+        commitment.cap.len(),
+        1usize
+            << crate::merkle::cap_depth(
+                lig_config.queries[0],
+                commitment.params.k_code(),
+            ),
+        "commitment cap size disagrees with the opener config's L0 query count"
+    );
+    debug_assert_eq!(
+        commitment.cap.as_slice(),
+        crate::merkle::cap_layer(
+            &prover_data.merkle_tree,
+            commitment.params.n_leaves(),
+            crate::merkle::cap_depth(lig_config.queries[0], commitment.params.k_code()),
+        ),
+        "commitment cap is not the prover tree's cap layer"
+    );
     challenger.observe_label(b"flock-merged-open-v0");
     let t = std::time::Instant::now();
     // Element-only registries produce no ring-switched claims; skip the batch

@@ -252,10 +252,13 @@ fn element_only_transcript_shape_is_data_independent() {
 /// Re-pinned 2026-08-02: element-only mixed-class moved to the MERGED
 /// transport (the jagged transport was removed); the shape now ends with
 /// the succinct verifier's trailing spot-check draws.
+/// Re-pinned 2026-08-02 (later): Merkle capping — commit absorbs are the
+/// cap layers (ObserveBytes 32 -> 32·2^c), octopus removed. The cap sizes
+/// are config-static, which the data-independence test enforces.
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn element_only_transcript_shape_is_pinned() {
-    const EXPECTED: &str = "19d614e295cb6b121250cca6b8fef1d0ed00d49e7a20b28476f9e472ab649d9e";
+    const EXPECTED: &str = "f862c08b983a0a80488605e592f1ace6b0d3fa24058ce981c2771735d3ab3a14";
 
     let (_, shape) = record_element_only(12, &[3], &[1 << 12], 0xB0DD_1E01);
 

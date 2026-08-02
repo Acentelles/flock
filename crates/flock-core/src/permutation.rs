@@ -83,8 +83,8 @@ const DOMAIN: &[u8] = b"flock-perm-v0";
 /// MLE openings the sumcheck reduces to.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermutationProof {
-    /// Merkle root of the PCS commitment to the grand-product poly `v` (size `2N`).
-    pub v_root: Hash,
+    /// Merkle cap of the PCS commitment to the grand-product poly `v` (size `2N`).
+    pub v_cap: Vec<Hash>,
     /// Claimed grand product `∏ ℓ(x)`; must be `ONE` for an honest permutation.
     pub claimed_product: F128,
     /// Per-round `(G(1), G(∞))`, length `μ`.
@@ -629,13 +629,13 @@ pub fn prove<C: Challenger>(
     // above partition what used to be reported as one "witness+v" phase.
     tp("  a,b,c,v0 views");
 
-    // Commit to the single aux poly `v` (μ+1 vars) and observe its root —
+    // Commit to the single aux poly `v` (μ+1 vars) and observe its cap —
     // binding `v` before the zerocheck challenges (a known `ρ` would break
     // zerocheck soundness).
     let params_v = pcs_params(mu + 1);
     let (commitment_v, pdata_v) = commit(&v, &params_v);
     tp("commit(v)");
-    ch.observe_bytes(&commitment_v.root);
+    ch.observe_bytes(commitment_v.cap.as_flattened());
     ch.observe_f128(claimed_product);
     let alpha = ch.sample_f128();
     let r = ch.sample_f128_vec(mu);
@@ -708,7 +708,7 @@ pub fn prove<C: Challenger>(
     tp("open(v)");
 
     let proof = PermutationProof {
-        v_root: commitment_v.root,
+        v_cap: commitment_v.cap.clone(),
         claimed_product,
         rounds,
         f_eval,
@@ -751,13 +751,14 @@ pub fn verify<C: Challenger>(
     let beta = ch.sample_f128();
     let gamma = ch.sample_f128();
 
-    // Rebuild the `v` commitment from the proof root + params derived from μ, and
-    // observe the root at the same transcript position the prover committed.
+    // Rebuild the `v` commitment from the proof cap + params derived from μ,
+    // and observe the cap at the same transcript position the prover
+    // committed.
     let commitment_v = Commitment {
-        root: proof.v_root,
+        cap: proof.v_cap.clone(),
         params: pcs_params(mu + 1),
     };
-    ch.observe_bytes(&commitment_v.root);
+    ch.observe_bytes(commitment_v.cap.as_flattened());
     ch.observe_f128(proof.claimed_product);
     let alpha = ch.sample_f128();
     let r = ch.sample_f128_vec(mu);

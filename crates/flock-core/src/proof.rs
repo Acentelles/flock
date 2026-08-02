@@ -109,7 +109,7 @@ pub struct R1csClaim {
 }
 
 /// Bind the Fiat-Shamir transcript to the statement: the R1CS instance digest
-/// + the PCS commitment root. Call once at the top of every R1CS prove/verify
+/// + the PCS commitment cap. Call once at the top of every R1CS prove/verify
 /// path, before any sub-protocol challenge is drawn. RandomChallenger ignores
 /// these observations; FsChallenger uses them to defeat statement substitution.
 pub fn bind_statement<Ch: Challenger>(
@@ -119,5 +119,5 @@ pub fn bind_statement<Ch: Challenger>(
 ) {
     challenger.observe_label(b"flock-r1cs-v0");
     challenger.observe_bytes(&r1cs.statement_digest());
-    challenger.observe_bytes(&commitment.root);
+    challenger.observe_bytes(commitment.cap.as_flattened());
 }
