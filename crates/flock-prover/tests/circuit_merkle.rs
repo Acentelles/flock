@@ -2154,6 +2154,73 @@ fn mvp5_all_levels_query_phase() {
         .expect("the full query phase verifies")
     });
 
+    // ---- MERGED-transport arm (B1 of the jagged-removal exit gate): the
+    // same statement through the merged circuit entry, timed the same way.
+    // Records the jagged-vs-merged circuit numbers — prove, verify, proof
+    // size, and the Frobenius-assist share of the proof (the term that
+    // grows with the gather-claim count on merged and was never measured
+    // at MVP scale) — before the jagged arm is deleted.
+    let ((m_proof, m_commitment), m_prove_t) = timed(REPS, || {
+        let mut bool_slots: Vec<(usize, UnionSlotProverInput)> = vec![(
+            shape.registry_slot(hash),
+            UnionSlotProverInput::new(hash_wit.clone(), b3_lc),
+        )];
+        for (li, _) in levels.iter().enumerate() {
+            bool_slots.push((
+                shape.registry_slot(merkle[li]),
+                UnionSlotProverInput::new(merkle_wit[li].clone(), &walkers[li]),
+            ));
+        }
+        bool_slots.sort_by_key(|(i, _)| *i);
+        let mut el_ord: Vec<(usize, Vec<F128>)> = leaf_slot
+            .iter()
+            .zip(els.clone())
+            .map(|((_, s), z)| (shape.registry_slot(*s), z))
+            .collect();
+        el_ord.sort_by_key(|(i, _)| *i);
+        let el_inputs: Vec<UnionElementSlotInput> = el_ord
+            .into_iter()
+            .map(|(_, z)| {
+                UnionElementSlotInput::new(move |dst: &mut [F128]| dst.copy_from_slice(&z))
+            })
+            .collect();
+        let mut c = FsChallenger::new(DOMAIN);
+        let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit_merged(
+            &union,
+            &shape.circuit,
+            &built.public,
+            &pcs_params,
+            bool_slots.into_iter().map(|(_, s)| s).collect(),
+            el_inputs,
+            &mut c,
+        );
+        (proof, commitment)
+    });
+    assert_eq!(m_commitment.root, commitment.root, "same witness, same root");
+    let (_, m_verify_t) = timed(REPS, || {
+        let mut c = FsChallenger::new(DOMAIN);
+        verifier::verify_ligerito_union_circuit_merged(
+            &union,
+            &shape.circuit,
+            &built.public,
+            &lcs,
+            &m_commitment,
+            &m_proof,
+            &pcs_params,
+            &mut c,
+        )
+        .expect("the merged arm verifies")
+    });
+    println!(
+        "  MERGED ARM    prove {m_prove_t} ms | verify {m_verify_t} ms | proof {:.1} KiB \
+         (frobenius {:.1} KiB, {} merged rounds) | {} gather claims",
+        bincode::serialize(&m_proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
+        bincode::serialize(&m_proof.pcs_open.frobenius).map(|b| b.len()).unwrap_or(0) as f64
+            / 1024.0,
+        m_proof.pcs_open.merged_rounds.len(),
+        shape.circuit.cells().num_gate_slots(),
+    );
+
     // ---- what it cost ----
     let mut nnz_total = 0usize;
     let mut report = String::from("\nMVP-5 FULL QUERY PHASE (m=26 Fast ladder)\n");
@@ -2845,6 +2912,77 @@ fn mvp6_all_levels_collapsed() {
         )
         .expect("the collapsed query phase verifies")
     });
+
+    // ---- MERGED-transport arm (B1 of the jagged-removal exit gate): the
+    // same statement through the merged circuit entry, timed the same way.
+    // Records the jagged-vs-merged circuit numbers — prove, verify, proof
+    // size, and the Frobenius-assist share of the proof (the term that
+    // grows with the gather-claim count on merged and was never measured
+    // at MVP scale) — before the jagged arm is deleted.
+    let ((m_proof, m_commitment), m_prove_t) = timed(REPS, || {
+        let mut bool_slots: Vec<(usize, UnionSlotProverInput)> = vec![
+            (
+                shape.registry_slot(slots.b3),
+                UnionSlotProverInput::new(b3_wit.clone(), b3_lc),
+            ),
+            (
+                shape.registry_slot(slots.swap),
+                UnionSlotProverInput::new(swap_wit.clone(), swap_lc),
+            ),
+            (
+                shape.registry_slot(slots.spread),
+                UnionSlotProverInput::new(spread_wit.clone(), spread_lc),
+            ),
+        ];
+        bool_slots.sort_by_key(|(i, _)| *i);
+        let mut el_ord: Vec<(usize, Vec<F128>)> = leaf_slot
+            .iter()
+            .zip(els.clone())
+            .map(|((_, s), z)| (shape.registry_slot(*s), z))
+            .collect();
+        el_ord.sort_by_key(|(i, _)| *i);
+        let el_inputs: Vec<UnionElementSlotInput> = el_ord
+            .into_iter()
+            .map(|(_, z)| {
+                UnionElementSlotInput::new(move |dst: &mut [F128]| dst.copy_from_slice(&z))
+            })
+            .collect();
+        let mut c = FsChallenger::new(DOMAIN);
+        let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit_merged(
+            &union,
+            &shape.circuit,
+            &built.public,
+            &pcs_params,
+            bool_slots.into_iter().map(|(_, s)| s).collect(),
+            el_inputs,
+            &mut c,
+        );
+        (proof, commitment)
+    });
+    assert_eq!(m_commitment.root, commitment.root, "same witness, same root");
+    let (_, m_verify_t) = timed(REPS, || {
+        let mut c = FsChallenger::new(DOMAIN);
+        verifier::verify_ligerito_union_circuit_merged(
+            &union,
+            &shape.circuit,
+            &built.public,
+            &lcs,
+            &m_commitment,
+            &m_proof,
+            &pcs_params,
+            &mut c,
+        )
+        .expect("the merged arm verifies")
+    });
+    println!(
+        "  MERGED ARM    prove {m_prove_t} ms | verify {m_verify_t} ms | proof {:.1} KiB \
+         (frobenius {:.1} KiB, {} merged rounds) | {} gather claims",
+        bincode::serialize(&m_proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
+        bincode::serialize(&m_proof.pcs_open.frobenius).map(|b| b.len()).unwrap_or(0) as f64
+            / 1024.0,
+        m_proof.pcs_open.merged_rounds.len(),
+        shape.circuit.cells().num_gate_slots(),
+    );
 
     let nnz = |r: &flock_core::r1cs::BlockR1cs| {
         r.a_0.rows.iter().map(|x| x.len()).sum::<usize>()
