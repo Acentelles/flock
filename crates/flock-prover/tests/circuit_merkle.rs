@@ -196,11 +196,12 @@ impl MerklePathGate {
     ///
     /// Real-protocol paths are CAPPED since Merkle capping landed: they are
     /// `d − c` deep and the index's high `c` bits select a node of the
-    /// absorbed cap layer rather than folding to a root. That needs a
-    /// `c`-bit multiplexer over the cap words (plus the cap-absorb FS
-    /// obligation) — a new gadget deferred to the real-proof milestone.
-    /// This gate keeps full-depth paths against its synthetic trees, where
-    /// the assert above IS the index-binding argument.
+    /// absorbed cap layer rather than folding to a root. The COLLAPSED path
+    /// models this (`emit_opening` + the boundary select in `mvp6`): the
+    /// select is done by the checker on published words, so no mux gadget
+    /// exists in-circuit. This COMPOSITE gate stays full-depth against its
+    /// synthetic trees, where the assert above IS the index-binding
+    /// argument; it is the uncapped differential oracle, not the protocol.
     fn new(depth: usize, leaf_bytes: usize, nu: usize, block_len: usize) -> Self {
         assert!(
             block_len.is_power_of_two() && block_len.trailing_zeros() as usize == depth,
@@ -2312,6 +2313,7 @@ fn emit_opening(
     leaf_w: &[Wire],
     index_w: Wire,
     depth: usize,
+    cap_depth: usize,
     pubs: &mut Vec<F128>,
 ) -> [Wire; 2] {
     let blocks = leaf_w.len() / 4;
@@ -2349,8 +2351,12 @@ fn emit_opening(
 
     // Node levels: swap, then a PARENT compression over the swapped pair.
     // The sibling is the swap's hint, supplied at `run` time in this call
-    // order — setup has no values.
-    for l in 0..depth {
+    // order — setup has no values. Under capping the fold stops `cap_depth`
+    // levels below the root: the returned digest is the depth-`cap_depth`
+    // ancestor, which the CHECKER compares against the absorbed cap layer
+    // (the boundary select — the circuit never touches the cap words).
+    // `cap_depth = 0` is the uncapped statement, terminal = root.
+    for l in 0..(depth - cap_depth) {
         let sw = sb.gate_hinted(s.swap, &[bits[l], cv[0], cv[1]]);
         pubs.push(pack_params(0, 64, PARENT));
         let params = sb.public_input();
@@ -2404,7 +2410,7 @@ fn collapsed_opening_matches_the_composite() {
             let leaf_w: Vec<Wire> = (0..4 * blocks).map(|_| sb.input()).collect();
             let index_w = sb.input();
             roots.push(emit_opening(
-                &mut sb, slots, iv, &leaf_w, index_w, depth, &mut pubs,
+                &mut sb, slots, iv, &leaf_w, index_w, depth, 0, &mut pubs,
             ));
             let leaf = tree.leaf(pos);
             leaf_vals.extend((0..4 * blocks).map(|w| leaf_word(leaf, 16 * w)));
@@ -2492,6 +2498,15 @@ fn collapsed_opening_matches_the_composite() {
 /// its extra outputs unwired, and an unwired schema word is sigma-fixed and
 /// costs nothing. Four depth-specific spread tables would have been four more
 /// types, which is the thing being removed.
+///
+/// **Capped openings (the real protocol since Merkle capping)**: each level
+/// absorbs its depth-c cap layer (`c = cap_depth(q, d)`) instead of a root,
+/// paths fold only `d − c` levels, and the terminal digest is bound by the
+/// BOUNDARY SELECT — the circuit publishes `(challenge, digest)` per query
+/// and the checker compares the digest against `cap[pos >> (d − c)]`
+/// natively. The c-bit select costs the circuit nothing; the price is one
+/// extra published word per query and ~18 KiB more FS absorb (the caps),
+/// against ~3.3k fewer BLAKE3 rows and ~3.3k fewer swaps.
 #[test]
 #[ignore] // The full shape. `-- --ignored`.
 fn mvp6_all_levels_collapsed() {
@@ -2535,16 +2550,26 @@ fn mvp6_all_levels_collapsed() {
         .collect();
 
     // ---- transcript ----
+    // Capping: the commitment is the depth-c cap layer, absorbed flattened
+    // where the root used to be. The synthetic trees are core merkle trees,
+    // so `cap_layer` reads the caps straight out of them.
+    let cap_depths: Vec<usize> = levels
+        .iter()
+        .map(|l| core_merkle::cap_depth(l.queries, l.depth))
+        .collect();
     let mut rec = RecordingChallenger::new(FsChallenger::with_hash(SLICE, HashKind::Blake3));
+    let mut chals: Vec<Vec<F128>> = Vec::new();
     let mut want: Vec<Vec<usize>> = Vec::new();
-    for (l, tree) in levels.iter().zip(&trees) {
-        rec.observe_bytes(&tree.root);
+    for (li, (l, tree)) in levels.iter().zip(&trees).enumerate() {
+        let cap = core_merkle::cap_layer(&tree.flat, 1 << l.depth, cap_depths[li]);
+        rec.observe_bytes(cap.as_flattened());
+        let cs = rec.sample_f128_vec(l.queries);
         want.push(
-            rec.sample_f128_vec(l.queries)
-                .iter()
+            cs.iter()
                 .map(|v| (v.lo as usize) & ((1usize << l.depth) - 1))
                 .collect(),
         );
+        chals.push(cs);
     }
     let t_shape = rec.shape();
     let stream = t_shape.stream_words(SLICE);
@@ -2566,7 +2591,8 @@ fn mvp6_all_levels_collapsed() {
     let b3_rows: usize = trace.rows.len()
         + levels
             .iter()
-            .map(|l| (16 * l.lanes / 64 + l.depth) * l.queries)
+            .zip(&cap_depths)
+            .map(|(l, &c)| (16 * l.lanes / 64 + l.depth - c) * l.queries)
             .sum::<usize>();
     let nu = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(3);
 
@@ -2688,14 +2714,15 @@ fn mvp6_all_levels_collapsed() {
     vals.push(F128::ZERO);
     let mut acc = sb.public_input();
     let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
-    let mut all_roots: Vec<Vec<[Wire; 2]>> = Vec::new();
+    let mut all_opens: Vec<Vec<(Wire, [Wire; 2])>> = Vec::new();
     for (li, l) in levels.iter().enumerate() {
         let sq = &trace.squeezes[li];
+        let c = cap_depths[li];
         let vars = l.lanes.trailing_zeros() as usize;
         vals.extend_from_slice(&vees[li]);
         let vs: Vec<Wire> = (0..vars).map(|_| sb.public_input()).collect();
         let blocks = 16 * l.lanes / 64;
-        let mut roots = Vec::with_capacity(l.queries);
+        let mut opens = Vec::with_capacity(l.queries);
         for k in 0..l.queries {
             let pos = want[li][k];
             let leaf = trees[li].leaf(pos);
@@ -2704,10 +2731,9 @@ fn mvp6_all_levels_collapsed() {
 
             // The challenge word IS the index word — no masking gadget.
             let cw = outs[sq[k / 4]][k % 4];
-            roots.push(emit_opening(
-                &mut sb, slots, iv, &leaf_w, cw, l.depth, &mut vals,
-            ));
-            hints.extend(trees[li].siblings(pos));
+            let cv = emit_opening(&mut sb, slots, iv, &leaf_w, cw, l.depth, c, &mut vals);
+            opens.push((cw, cv));
+            hints.extend(trees[li].siblings(pos).into_iter().take(l.depth - c));
 
             // The same leaf words feed the arithmetic.
             let mut a_in = leaf_w;
@@ -2717,12 +2743,18 @@ fn mvp6_all_levels_collapsed() {
             a_in.push(acc);
             acc = sb.gate(leafeval[li], &a_in)[0];
         }
-        all_roots.push(roots);
+        all_opens.push(opens);
     }
-    for roots in &all_roots {
-        for r in roots {
-            sb.publish(r[0]);
-            sb.publish(r[1]);
+    // The boundary select: each opening publishes its challenge word and its
+    // terminal digest. The checker derives the cap index from the challenge
+    // natively and compares the digest against the absorbed cap — the c-bit
+    // select never enters the circuit. Publishing `cw` (the same wire the
+    // spread gate consumes) is what binds the high bits: no index bit floats.
+    for opens in &all_opens {
+        for (cw, cv) in opens {
+            sb.publish(*cw);
+            sb.publish(cv[0]);
+            sb.publish(cv[1]);
         }
     }
     sb.publish(acc);
@@ -2734,18 +2766,25 @@ fn mvp6_all_levels_collapsed() {
         hints.iter().map(|h| h as &dyn std::any::Any).collect();
     let (built, online_t) = timed(REPS, || shape.run(&vals, &hint_refs));
 
-    // Every opening folds to its level's root, and the accumulator is
-    // enforced_sum — the same two claims MVP-5 makes, now over wired rows.
-    let mut at = built.public.len() - 1 - 2 * levels.iter().map(|l| l.queries).sum::<usize>();
+    // Every opening folds to its cap node, and the accumulator is
+    // enforced_sum — the root equality of the uncapped statement became a
+    // per-query cap-node equality, checked HERE, natively: read the
+    // published challenge word, mask, take the high c bits, index the cap.
+    let mut at = built.public.len() - 1 - 3 * levels.iter().map(|l| l.queries).sum::<usize>();
     for (li, l) in levels.iter().enumerate() {
-        let rw = digest_words(&hash_to_digest(&trees[li].root));
+        let c = cap_depths[li];
+        let cap = core_merkle::cap_layer(&trees[li].flat, 1 << l.depth, c);
         for k in 0..l.queries {
+            assert_eq!(built.public[at], chals[li][k], "L{li} challenge {k}");
+            let pos = (chals[li][k].lo as usize) & ((1usize << l.depth) - 1);
+            assert_eq!(pos, want[li][k], "L{li} position {k}");
+            let node = digest_words(&hash_to_digest(&cap[pos >> (l.depth - c)]));
             assert_eq!(
-                [built.public[at], built.public[at + 1]],
-                rw,
-                "L{li} root {k}"
+                [built.public[at + 1], built.public[at + 2]],
+                node,
+                "L{li} cap node {k}"
             );
-            at += 2;
+            at += 3;
         }
     }
     let mut want_sum = F128::ZERO;
