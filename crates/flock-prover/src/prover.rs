@@ -466,10 +466,10 @@ enum UnionProveBinding {
 
 /// The MERGED-transport union prover (wire v6; design doc §"Capacity-free
 /// ring-switching") — the Mixed protocol's prove entry for BOOLEAN-only
-/// registries, kept in lockstep with [`prove_union_with_binding`]:
-/// identical witness assembly, commit (lane-major when
-/// `PcsParams::num_lanes` is set, power-of-two otherwise), Mixed binding,
-/// zerocheck, and lincheck.
+/// registries: a thin wrapper over [`prove_union_with_binding`] (the one
+/// shared body, since the two-body split died with the jagged transport),
+/// repackaging the boolean sub-proofs as the wire's
+/// [`flock_core::proof::R1csProofMergedLigerito`].
 ///
 /// Witness contract: rows `[n_t, 2^nu)` of each slot must be identically
 /// zero — the count-derived run-list padding lets the kernels skip them
@@ -491,7 +491,6 @@ pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
     Commitment,
     R1csClaim,
 ) {
-    let m = union.m_total();
     // This entry returns `R1csClaim` — structurally boolean-only. Element
     // registries go through the mixed-class entry, whose merged open carries
     // their claims packed-direct.
@@ -500,192 +499,24 @@ pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
         "this entry is boolean-only; element registries go through \
          prove_fast_ligerito_jagged_union_mixed_class_merged"
     );
-    assert_eq!(
-        pcs_params.m,
-        union.dense_m(),
-        "PcsParams.m must equal the union's dense_m (committed stack size)"
-    );
-    assert_eq!(
-        slots.len(),
-        union.registry().num_types(),
-        "need one prover input per registry type"
-    );
-    let log_n = union.dense_m() - pcs::LOG_PACKING;
-    let lig_config =
-        pcs::ligerito::prover_config_for(log_n, pcs_params.log_batch_size, pcs_params.profile)
-            .expect("Ligerito default config; bump m for tiny instances");
-
-    let trace = std::env::var("PCS_TRACE").is_ok();
-    let mut sources = Vec::with_capacity(slots.len());
-    let mut circuits = Vec::with_capacity(slots.len());
-    for slot in slots {
-        sources.push(slot.source);
-        circuits.push(slot.lincheck_circuit);
-    }
-    let t = std::time::Instant::now();
-    // The merged pipeline never reads dropped words: zerocheck is
-    // run-list-gated, the union lincheck is count-proportional, compaction
-    // reads declared rows only, and (when s_hat_v is precomputed — the
-    // condition below) the ring-switch succinct step reads nothing bulk.
-    // Padding may therefore stay dirty in pooled resident buffers.
-    let padding_unread = m - union.n_log() >= pcs::LOG_PACKING;
-    let (z_packed, a_packed_f128, b_packed_f128, stripes, buf_mode) =
-        build_union_witness(union, sources, padding_unread);
-    let give_back = buf_mode != flock_core::union::WitnessBufMode::FreshZeroed;
-    let linchecks: Vec<(Vec<u8>, &dyn lincheck::LincheckCircuit)> =
-        stripes.into_iter().zip(circuits).collect();
-    if trace {
-        eprintln!(
-            "  [prove_merged] witgen (padded 2^{}): {:7.2} ms",
-            m - 7,
-            t.elapsed().as_secs_f64() * 1e3
-        );
-    }
-
-    // The dense stack, OWNED (the merged open consumes it for the inner
-    // eq-basis opening). Identity compaction copies — a prototype cost only
-    // (single-slot full-utilization registries).
-    let t = std::time::Instant::now();
-    let q: Vec<F128> = if union.compaction_is_identity() {
-        z_packed.clone()
-    } else if buf_mode == flock_core::union::WitnessBufMode::PooledDirty {
-        // Dropped words are dirty by design in this mode — and never read.
-        union.compact_witness_unchecked(&z_packed)
-    } else {
-        union.compact_witness(&z_packed)
-    };
-    if trace {
-        eprintln!(
-            "  [prove_merged] compact q (2^{} dense): {:7.2} ms",
-            union.dense_m() - 7,
-            t.elapsed().as_secs_f64() * 1e3
-        );
-    }
-    let t = std::time::Instant::now();
-    let (commitment, prover_data) = if pcs_params.num_lanes.is_some() {
-        pcs::commit_lane_major(&q, pcs_params)
-    } else {
-        pcs::commit(&q, pcs_params)
-    };
-    union.bind_statement(challenger, &commitment);
-    if trace {
-        eprintln!(
-            "  [prove_merged] commit: {:7.2} ms",
-            t.elapsed().as_secs_f64() * 1e3
-        );
-    }
-
-    let padding = union.padding_spec();
-    let (zc_proof, zc_claim, s_hat_v_c) = {
-        let a_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                a_packed_f128.as_ptr() as *const u8,
-                a_packed_f128.len() * core::mem::size_of::<F128>(),
-            )
-        };
-        let b_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                b_packed_f128.as_ptr() as *const u8,
-                b_packed_f128.len() * core::mem::size_of::<F128>(),
-            )
-        };
-        let c_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                z_packed.as_ptr() as *const u8,
-                z_packed.len() * core::mem::size_of::<F128>(),
-            )
-        };
-        let t = std::time::Instant::now();
-        let out = zerocheck::prove_packed_padded_capture_s_hat_v_c(
-            a_packed, b_packed, c_packed, m, &padding, challenger,
-        );
-        if trace {
-            eprintln!(
-                "  [prove_merged] zerocheck + s_hat_v_c: {:7.2} ms",
-                t.elapsed().as_secs_f64() * 1e3
-            );
-        }
-        out
-    };
-    if give_back {
-        flock_core::scratch::give_f128(a_packed_f128);
-        flock_core::scratch::give_f128(b_packed_f128);
-    }
-
-    let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
-    let t = std::time::Instant::now();
-    let (lc_proof, lc_claim, z_vec_pre) = {
-        let lc_slots: Vec<lincheck::UnionLincheckSlot<'_>> = linchecks
-            .iter()
-            .map(|(stripe, circuit)| lincheck::UnionLincheckSlot {
-                z_lincheck: stripe,
-                circuit: *circuit,
-            })
-            .collect();
-        lincheck::prove_union_capture_z_vec(union, &lc_slots, &x_ab, challenger)
-    };
-    for (stripe, _) in linchecks {
-        if give_back {
-            flock_core::scratch::give_u8(stripe);
-        }
-    }
-    if trace {
-        eprintln!(
-            "  [prove_merged] lincheck: {:7.2} ms",
-            t.elapsed().as_secs_f64() * 1e3
-        );
-    }
-
-    let ab = ZClaim {
-        point: union.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
-        value: lc_claim.w,
-    };
-    let c = ZClaim {
-        point: union.c_claim_point(zc_claim.z, &zc_claim.r_rest),
-        value: zc_claim.c_eval,
-    };
-    let s_hat_v_ab = if m - union.n_log() >= pcs::LOG_PACKING {
-        Some(pcs::ring_switch::s_hat_v_from_z_vec(
-            &z_vec_pre,
-            &lc_claim.r_inner_rest[1..],
-        ))
-    } else {
-        None
-    };
-
-    let heights = union.jagged_heights();
-    let x_fulls: Vec<Vec<F128>> = [&ab, &c]
-        .iter()
-        .map(|cl| quirky_x_outer_full(&cl.point))
-        .collect();
-    let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
-    let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
-    let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
-    let pcs_open = pcs::open_batch_merged(
-        q,
-        &z_packed,
-        &prover_data,
-        &commitment,
-        &x_refs,
-        &[pre_ab, pre_c],
-        &[],
-        &padding,
-        &heights,
-        union.n_log(),
-        &lig_config,
+    let (out, commitment) = prove_union_with_binding(
+        union,
+        UnionProveBinding::Mixed,
+        pcs_params,
+        slots,
+        Vec::new(),
         challenger,
     );
-    if give_back {
-        flock_core::scratch::give_f128(z_packed);
-    }
-
-    let proof = flock_core::proof::R1csProofMergedLigerito {
-        zerocheck: zc_proof,
-        lincheck: lc_proof,
-        pcs_open,
-    };
-    let claim = R1csClaim { ab, c };
-    (proof, commitment, claim)
+    let (piop, claim) = out.boolean.expect("asserted boolean-only above");
+    (
+        flock_core::proof::R1csProofMergedLigerito {
+            zerocheck: piop.zerocheck,
+            lincheck: piop.lincheck,
+            pcs_open: out.pcs_open,
+        },
+        commitment,
+        claim,
+    )
 }
 
 /// What [`prove_union_with_binding`] produces: each class's PIOP sub-proof
@@ -763,8 +594,22 @@ fn prove_union_with_binding<Ch: Challenger>(
     }
     let trace = std::env::var("PCS_TRACE").is_ok();
     let t = std::time::Instant::now();
+    // BOOLEAN-only registries never read dropped words: the zerocheck is
+    // run-list-gated, the union lincheck is count-proportional, compaction
+    // reads declared rows only, and (when s_hat_v is precomputed) the
+    // ring-switch succinct step reads nothing bulk. Padding may therefore
+    // stay dirty in pooled resident buffers. NOT extended to the element
+    // class (the element PIOP copies its whole word range and its region
+    // buffers' dirty-padding behavior has not been audited — a follow-up),
+    // and NOT under IDENTITY compaction: there q IS the padded buffer, so
+    // its padding words are committed and must be honest zeros — dirty
+    // pooling would put garbage into the committed stack (a latent hazard
+    // of the pre-unification standalone body, never exercised there).
+    let padding_unread = !union.has_element()
+        && !union.compaction_is_identity()
+        && union.m_total() - union.n_log() >= pcs::LOG_PACKING;
     let (z_packed, a_packed_f128, b_packed_f128, stripes, buf_mode) =
-        build_union_witness(union, sources, false);
+        build_union_witness(union, sources, padding_unread);
     let give_back = buf_mode != flock_core::union::WitnessBufMode::FreshZeroed;
     if trace {
         eprintln!(
@@ -784,14 +629,19 @@ fn prove_union_with_binding<Ch: Challenger>(
     // True dense-stack commit (height-n_t stacking): commit the compacted
     // stack q — the declared n_t-row prefix of every used chunk-column;
     // dummy rows, useless columns and gaps dropped; padded to a power of
-    // two with the m22 config floor. When the compaction map is the
-    // identity (single-slot registries at full utilization — the
-    // byte-identity anchors), q IS the padded buffer and no copy is made.
+    // two with the m22 config floor. The stack is OWNED (the merged open
+    // consumes it for the inner eq-basis opening): identity compaction
+    // (single-slot registries at full utilization) copies — a prototype
+    // cost only. Under PooledDirty, dropped words are dirty by design —
+    // and never read — so the compaction skips the honest-zeros
+    // debug_assert.
     let t = std::time::Instant::now();
-    let dense_q: Option<Vec<F128>> = if union.compaction_is_identity() {
-        None
+    let q: Vec<F128> = if union.compaction_is_identity() {
+        z_packed.clone()
+    } else if buf_mode == flock_core::union::WitnessBufMode::PooledDirty {
+        union.compact_witness_unchecked(&z_packed)
     } else {
-        Some(union.compact_witness(&z_packed))
+        union.compact_witness(&z_packed)
     };
     if trace {
         eprintln!(
@@ -808,12 +658,11 @@ fn prove_union_with_binding<Ch: Challenger>(
     // chunk-columns are still a contiguous zero tail (BLAKE3 commits 121 of
     // 128, so t = 61 of 64 lanes at M = 30). Both arms therefore dispatch on
     // `num_lanes` alone.
-    let commit_stack: &[F128] = dense_q.as_deref().unwrap_or(&z_packed);
     let t = std::time::Instant::now();
     let (commitment, prover_data) = if pcs_params.num_lanes.is_some() {
-        pcs::commit_lane_major(commit_stack, pcs_params)
+        pcs::commit_lane_major(&q, pcs_params)
     } else {
-        pcs::commit(commit_stack, pcs_params)
+        pcs::commit(&q, pcs_params)
     };
     if trace {
         eprintln!(
@@ -1004,12 +853,7 @@ fn prove_union_with_binding<Ch: Challenger>(
         z_claims.iter().map(|cl| quirky_x_outer_full(&cl.point)).collect();
     let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
     let pcs_open = pcs::open_batch_merged(
-        // The merged open consumes the dense stack. Identity compaction
-        // leaves `dense_q` as None (q IS the padded buffer); clone it —
-        // `z_packed` is still borrowed below as the ring-switch f-side. A
-        // prototype cost only (single-slot full-utilization registries),
-        // same as the shipped body.
-        dense_q.unwrap_or_else(|| z_packed.clone()),
+        q,
         &z_packed,
         &prover_data,
         &commitment,

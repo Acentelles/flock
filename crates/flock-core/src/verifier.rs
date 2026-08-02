@@ -189,11 +189,11 @@ enum UnionVerifyBinding {
 }
 
 /// The MERGED-transport union verifier (wire v6) — the Mixed protocol's
-/// verify entry: the shared PIOP replay (`verify_union_piops`) followed by
-/// `pcs::verify_batch_merged`. Mixed binding only; handles both
-/// lane-major and power-of-two commitments (dispatched on
-/// `commitment.params.num_lanes`, which the params-equality check below
-/// pins to the count-derived value).
+/// verify entry for BOOLEAN-only registries: a thin wrapper over
+/// [`verify_ligerito_jagged_union_mixed_class_merged`] (the one shared
+/// body). Handles both lane-major and power-of-two commitments (dispatched
+/// on `commitment.params.num_lanes`, which the shared body's
+/// params-equality check pins to the count-derived value).
 pub fn verify_ligerito_jagged_union_merged<Ch: Challenger>(
     union: &crate::union::UnionInstance<'_>,
     circuits: &[&dyn lincheck::LincheckCircuit],
@@ -209,90 +209,21 @@ pub fn verify_ligerito_jagged_union_merged<Ch: Challenger>(
         "this entry is boolean-only; element registries go through \
          verify_ligerito_jagged_union_mixed_class_merged"
     );
-    assert_eq!(
-        pcs_params.m,
-        union.dense_m(),
-        "PcsParams.m must equal the union's dense_m (committed stack size)"
-    );
-    // Same params-equality rejection as the jagged path (the transcript
-    // binds only the root; the opening reads the leaf width / lane count
-    // from the commitment's params, so they must equal the count-derived
-    // ones).
-    if commitment.params.m != pcs_params.m
-        || commitment.params.log_batch_size != pcs_params.log_batch_size
-        || commitment.params.log_inv_rate != pcs_params.log_inv_rate
-        || commitment.params.num_ntts() != pcs_params.num_ntts()
-    {
-        return Err(VerifyError::PcsJagged(
-            crate::pcs::VerifyErrorJagged::Ligerito,
-        ));
-    }
-    let (ab, c) = verifier_pool().install(|| -> Result<(ZClaim, ZClaim), VerifyError> {
-        union.bind_statement(challenger, commitment);
-        let zc_claim = zerocheck::verify(union.m_total(), &proof.zerocheck, challenger)
-            .map_err(VerifyError::Zerocheck)?;
-        let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
-        let lc_claim = lincheck::verify_union(
-            union,
-            circuits,
-            &x_ab,
-            zc_claim.a_eval,
-            zc_claim.b_eval,
-            &proof.lincheck,
-            challenger,
-        )
-        .map_err(VerifyError::Lincheck)?;
-        let ab = ZClaim {
-            point: union.ab_claim_point(
-                lc_claim.r_inner_skip,
-                &lc_claim.r_inner_rest,
-                &x_ab.x_outer,
-            ),
-            value: lc_claim.w,
-        };
-        let c = ZClaim {
-            point: union.c_claim_point(zc_claim.z, &zc_claim.r_rest),
-            value: zc_claim.c_eval,
-        };
-        Ok((ab, c))
-    })?;
-    let heights = union.jagged_heights();
-    let claims = [ab.clone(), c.clone()];
-    verifier_pool()
-        .install(|| {
-            let z_skips: Vec<F128> = claims.iter().map(|cl| cl.point.z_skip).collect();
-            let values: Vec<F128> = claims.iter().map(|cl| cl.value).collect();
-            let x_fulls: Vec<Vec<F128>> = claims
-                .iter()
-                .map(|cl| {
-                    let mut v = cl.point.x_inner_rest.clone();
-                    v.extend_from_slice(&cl.point.x_outer);
-                    v
-                })
-                .collect();
-            let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
-            let log_n = pcs_params.m - pcs::LOG_PACKING;
-            let lig_v_config = crate::pcs::ligerito::verifier_config_for(
-                log_n,
-                pcs_params.log_batch_size,
-                pcs_params.profile,
-            )
-            .expect("Ligerito default verifier config");
-            pcs::verify_batch_merged(
-                commitment,
-                &values,
-                &z_skips,
-                &x_refs,
-                &[],
-                &heights,
-                union.n_log(),
-                &proof.pcs_open,
-                &lig_v_config,
-                challenger,
-            )
-        })
-        .map_err(VerifyError::PcsJagged)?;
-    Ok(R1csClaim { ab, c })
+    // Repackage as a boolean-only mixed-class proof and run the one shared
+    // verify body (the two-body split died with the jagged transport). The
+    // clone is a few hundred KB against a multi-ms verify.
+    let mixed = crate::proof::R1csProofMixedClassMerged {
+        boolean: Some(crate::proof::BooleanPiopProof {
+            zerocheck: proof.zerocheck.clone(),
+            lincheck: proof.lincheck.clone(),
+        }),
+        element: None,
+        pcs_open: proof.pcs_open.clone(),
+    };
+    let claims = verify_ligerito_jagged_union_mixed_class_merged(
+        union, circuits, commitment, &mixed, pcs_params, challenger,
+    )?;
+    Ok(claims.boolean.expect("asserted boolean-only above"))
 }
 
 /// [`verify_ligerito_jagged_union_mixed_class`] over the MERGED transport.
