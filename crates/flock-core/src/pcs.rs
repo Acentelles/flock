@@ -55,18 +55,16 @@ pub enum VerifyError {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum VerifyErrorJagged {
+pub enum VerifyErrorOpen {
     RingSwitch(ring_switch::VerifyError),
     /// The virtual-opening sumcheck rejected (wrong round count, or the final
     /// round does not match `b̂_combined(ρ) · f_eval`).
     VirtualOpen,
-    /// The assist layer rejected: the Frobenius-assist replay failed, or the
-    /// assist-verified `β = Ŵ_ρ(ris ‖ r_extra)` does not match the MLE of the
-    /// proof's `b_tilde` at `r_extra` (the spot-check binding `b_tilde` to the
-    /// true weight table).
-    Jagged,
-    /// The Ligerito recursive verifier rejected the fused opening (including
-    /// its final check, which consumes the proof's `b_tilde`).
+    /// The assist layer rejected (the Frobenius-assist replay failed), or a
+    /// claim-shape mismatch reached the merged open.
+    Assist,
+    /// The Ligerito recursive verifier rejected the opening (also raised by
+    /// the merged verifier's commitment-params equality check).
     Ligerito,
 }
 
@@ -1221,12 +1219,12 @@ pub fn verify_batch_merged<Ch: Challenger>(
     proof: &MergedOpenProof,
     lig_config: &ligerito::VerifierConfig,
     challenger: &mut Ch,
-) -> Result<(), VerifyErrorJagged> {
+) -> Result<(), VerifyErrorOpen> {
     let n_rs = claims.len();
     assert_eq!(z_skips.len(), n_rs);
     assert_eq!(x_outers.len(), n_rs);
     if proof.ring_switches.len() != n_rs {
-        return Err(VerifyErrorJagged::Jagged);
+        return Err(VerifyErrorOpen::Assist);
     }
     // `VERIFY_TRACE` phase split. The Ligerito inner verify has its own
     // `LIG_VERIFY_TRACE`, but it is a small tail here — the jagged Frobenius
@@ -1251,7 +1249,7 @@ pub fn verify_batch_merged<Ch: Challenger>(
             &proof.ring_switches[i],
             challenger,
         )
-        .map_err(VerifyErrorJagged::RingSwitch)?;
+        .map_err(VerifyErrorOpen::RingSwitch)?;
         rs_outputs.push(out);
     }
     if trace {
@@ -1280,7 +1278,7 @@ pub fn verify_batch_merged<Ch: Challenger>(
 
     let dense_log = commitment.params.m - LOG_PACKING;
     if proof.merged_rounds.len() != dense_log {
-        return Err(VerifyErrorJagged::VirtualOpen);
+        return Err(VerifyErrorOpen::VirtualOpen);
     }
     let mut running = target;
     let mut rho = Vec::with_capacity(dense_log);
@@ -1336,7 +1334,7 @@ pub fn verify_batch_merged<Ch: Challenger>(
         .collect();
     for (c, co) in packed_direct.iter().zip(&coeffs_pd) {
         if c.point.len() != n_log + k_cols {
-            return Err(VerifyErrorJagged::Jagged);
+            return Err(VerifyErrorOpen::Assist);
         }
         fclaims.push(jagged::FrobeniusClaim {
             z_row: &c.point[..n_log],
@@ -1354,7 +1352,7 @@ pub fn verify_batch_merged<Ch: Challenger>(
     #[cfg(feature = "mul-count")]
     let assist_start = crate::field::gf2_128::op_count::snapshot();
     let v = jagged::verify_frobenius_assist(&params, &fclaims, &rho, &proof.frobenius, challenger)
-        .ok_or(VerifyErrorJagged::Jagged)?;
+        .ok_or(VerifyErrorOpen::Assist)?;
     #[cfg(feature = "mul-count")]
     if std::env::var("MUL_TRACE").is_ok() {
         let e = crate::field::gf2_128::op_count::snapshot();
@@ -1374,7 +1372,7 @@ pub fn verify_batch_merged<Ch: Challenger>(
         );
     }
     if running != proof.q_eval * v {
-        return Err(VerifyErrorJagged::VirtualOpen);
+        return Err(VerifyErrorOpen::VirtualOpen);
     }
 
     let t = std::time::Instant::now();
@@ -1392,7 +1390,7 @@ pub fn verify_batch_merged<Ch: Challenger>(
         lig_config,
         challenger,
     )
-    .map_err(|_| VerifyErrorJagged::Ligerito)?;
+    .map_err(|_| VerifyErrorOpen::Ligerito)?;
     if trace {
         eprintln!(
             "        [vbm] verify_opening_batch_ligerito_mixed: {}",

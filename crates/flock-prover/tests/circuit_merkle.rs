@@ -476,7 +476,7 @@ fn merkle_index_wired_to_a_challenge() {
         lcs.into_iter().map(|(_, c)| c).collect();
 
     let mut ch = FsChallenger::new(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit_merged(
+    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
         &union,
         &built.shape.circuit,
         &built.witness.public,
@@ -487,7 +487,7 @@ fn merkle_index_wired_to_a_challenge() {
     );
 
     let mut ch = FsChallenger::new(DOMAIN);
-    verifier::verify_ligerito_union_circuit_merged(
+    verifier::verify_ligerito_union_circuit(
         &union,
         &built.shape.circuit,
         &built.witness.public,
@@ -505,7 +505,7 @@ fn merkle_index_wired_to_a_challenge() {
     bad[last] += F128::ONE;
     let mut ch = FsChallenger::new(DOMAIN);
     assert!(
-        verifier::verify_ligerito_union_circuit_merged(
+        verifier::verify_ligerito_union_circuit(
             &union,
             &built.shape.circuit,
             &bad,
@@ -612,7 +612,7 @@ fn l0_shape_circuit_cost() {
     let witgen = || layout.generate_witness_batch_major_partial_chunk(rows, nu);
     let prove = |witness| {
         let mut ch = FsChallenger::new(DOMAIN);
-        prover::prove_fast_ligerito_union_circuit_merged(
+        prover::prove_fast_ligerito_union_circuit(
             &union,
             &shape.circuit,
             &built.public,
@@ -652,7 +652,7 @@ fn l0_shape_circuit_cost() {
     // not match it.
     let mut ch = FsChallenger::new(DOMAIN);
     let t = Instant::now();
-    verifier::verify_ligerito_union_circuit_merged(
+    verifier::verify_ligerito_union_circuit(
         &union,
         &shape.circuit,
         &built.public,
@@ -1109,7 +1109,7 @@ fn leaf_arithmetic_joins_the_merkle_openings() {
         layout.generate_witness_batch_major_partial_chunk(built.rows::<MerklePathGate>(merkle), nu);
 
     let mut ch = FsChallenger::new(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit_merged(
+    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
         &union,
         &shape.circuit,
         &built.public,
@@ -1123,7 +1123,7 @@ fn leaf_arithmetic_joins_the_merkle_openings() {
 
     let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![&walker];
     let mut ch = FsChallenger::new(DOMAIN);
-    verifier::verify_ligerito_union_circuit_merged(
+    verifier::verify_ligerito_union_circuit(
         &union,
         &shape.circuit,
         &built.public,
@@ -1142,7 +1142,7 @@ fn leaf_arithmetic_joins_the_merkle_openings() {
     bad[last] += F128::ONE;
     let mut ch = FsChallenger::new(DOMAIN);
     assert!(
-        verifier::verify_ligerito_union_circuit_merged(
+        verifier::verify_ligerito_union_circuit(
             &union,
             &shape.circuit,
             &bad,
@@ -1547,7 +1547,7 @@ fn mvp4_slice(depth: usize, n_queries: usize, nu: usize) {
 
     let t = Instant::now();
     let mut c = FsChallenger::new(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit_merged(
+    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
         &union,
         &shape.circuit,
         &built.public,
@@ -1563,7 +1563,7 @@ fn mvp4_slice(depth: usize, n_queries: usize, nu: usize) {
 
     let t = Instant::now();
     let mut c = FsChallenger::new(DOMAIN);
-    verifier::verify_ligerito_union_circuit_merged(
+    verifier::verify_ligerito_union_circuit(
         &union,
         &shape.circuit,
         &built.public,
@@ -1585,7 +1585,7 @@ fn mvp4_slice(depth: usize, n_queries: usize, nu: usize) {
     bad[msg_pub] += F128::ONE;
     let mut c = FsChallenger::new(DOMAIN);
     assert!(
-        verifier::verify_ligerito_union_circuit_merged(
+        verifier::verify_ligerito_union_circuit(
             &union,
             &shape.circuit,
             &bad,
@@ -2127,7 +2127,7 @@ fn mvp5_all_levels_query_phase() {
             })
             .collect();
         let mut c = FsChallenger::new(DOMAIN);
-        let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit_merged(
+        let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
             &union,
             &shape.circuit,
             &built.public,
@@ -2141,7 +2141,7 @@ fn mvp5_all_levels_query_phase() {
 
     let (_, verify_t) = timed(REPS, || {
         let mut c = FsChallenger::new(DOMAIN);
-        verifier::verify_ligerito_union_circuit_merged(
+        verifier::verify_ligerito_union_circuit(
             &union,
             &shape.circuit,
             &built.public,
@@ -2825,7 +2825,7 @@ fn mvp6_all_levels_collapsed() {
             })
             .collect();
         let mut c = FsChallenger::new(DOMAIN);
-        let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit_merged(
+        let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
             &union,
             &shape.circuit,
             &built.public,
@@ -2839,7 +2839,7 @@ fn mvp6_all_levels_collapsed() {
 
     let (_, verify_t) = timed(REPS, || {
         let mut c = FsChallenger::new(DOMAIN);
-        verifier::verify_ligerito_union_circuit_merged(
+        verifier::verify_ligerito_union_circuit(
             &union,
             &shape.circuit,
             &built.public,

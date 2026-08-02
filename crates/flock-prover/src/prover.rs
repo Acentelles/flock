@@ -483,9 +483,9 @@ pub struct CircuitProverInput<'a> {
 /// wiring GKR (α, β at its entry) → gather values observed → γ-batched
 /// opening.
 ///
-/// Verify with [`flock_core::verifier::verify_ligerito_union_circuit_merged`].
+/// Verify with [`flock_core::verifier::verify_ligerito_union_circuit`].
 #[allow(clippy::too_many_arguments)]
-pub fn prove_fast_ligerito_union_circuit_merged<Ch: Challenger>(
+pub fn prove_fast_ligerito_union_circuit<Ch: Challenger>(
     union: &flock_core::union::UnionInstance<'_>,
     circuit: &flock_core::circuit::Circuit,
     public: &[F128],
@@ -557,7 +557,7 @@ pub fn prove_fast_ligerito_union_circuit_merged<Ch: Challenger>(
 /// `n_t ≤ 2^nu` and zero the remainder; the full-utilization
 /// `generate_witness_batch_major` drivers fill padding rows with real dummy
 /// invocations (pin = 1) and are only valid here at `n_t = 2^nu`.
-pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
+pub fn prove_fast_ligerito_union<Ch: Challenger>(
     union: &flock_core::union::UnionInstance<'_>,
     pcs_params: &PcsParams,
     slots: Vec<UnionSlotProverInput<'_>>,
@@ -573,7 +573,7 @@ pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
     assert!(
         !union.has_element(),
         "this entry is boolean-only; element registries go through \
-         prove_fast_ligerito_jagged_union_mixed_class_merged"
+         prove_fast_ligerito_union_mixed_class"
     );
     let (out, commitment) = prove_union_with_binding(
         union,
@@ -614,7 +614,7 @@ struct UnionProveOutput {
 /// binding, everything else is identical.
 ///
 /// Runs the two class PIOPs over their DISJOINT regions in the Fiat–Shamir
-/// order documented on [`prove_fast_ligerito_jagged_union_mixed_class_merged`],
+/// order documented on [`prove_fast_ligerito_union_mixed_class`],
 /// then batches all four claims into one merged opening.
 fn prove_union_with_binding<Ch: Challenger>(
     union: &flock_core::union::UnionInstance<'_>,
@@ -1394,10 +1394,10 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
 /// zerocheck → boolean lincheck (α, β_t) → element τ' → element zerocheck →
 /// element α' → element lincheck → γ-batched merged opening. Either class
 /// may be absent: a boolean-only registry produces `element: None` (and is
-/// transcript-identical to [`prove_fast_ligerito_jagged_union_merged`] —
+/// transcript-identical to [`prove_fast_ligerito_union`] —
 /// only the proof struct differs), an element-only one `boolean: None` and
 /// an opening with no ring-switched claims at all.
-pub fn prove_fast_ligerito_jagged_union_mixed_class_merged<Ch: Challenger>(
+pub fn prove_fast_ligerito_union_mixed_class<Ch: Challenger>(
     union: &flock_core::union::UnionInstance<'_>,
     pcs_params: &PcsParams,
     slots: Vec<UnionSlotProverInput<'_>>,

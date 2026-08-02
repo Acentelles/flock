@@ -14,8 +14,8 @@
 //! statement — it is the "what does the structure cost" baseline.
 //!
 //! Both sides run through the SAME union entry
-//! (`prove_fast_ligerito_jagged_union_merged` /
-//! `verify_ligerito_jagged_union_merged`) as a single-type registry, so the
+//! (`prove_fast_ligerito_union` /
+//! `verify_ligerito_union`) as a single-type registry, so the
 //! only difference is the table type. Comparing Merkle-via-union against
 //! BLAKE3-via-direct-path would confound the encoding with the proving entry.
 //!
@@ -198,7 +198,7 @@ fn measure(
 
     let prove = || {
         let mut ch = FsChallenger::new(DOMAIN);
-        prover::prove_fast_ligerito_jagged_union_merged(
+        prover::prove_fast_ligerito_union(
             &union,
             &pcs_params,
             vec![UnionSlotProverInput::new(make_witness(), circuit)],
@@ -210,7 +210,7 @@ fn measure(
     // to confirm the pair actually round-trips before reporting any number.
     let (proof, commitment, claim) = prove();
     let mut ch_v = FsChallenger::new(DOMAIN);
-    let claim_v = verifier::verify_ligerito_jagged_union_merged(
+    let claim_v = verifier::verify_ligerito_union(
         &union,
         &[circuit],
         &commitment,
@@ -230,7 +230,7 @@ fn measure(
     let prove_solo = median(Some(solo), prove);
     let verify = median(None, || {
         let mut ch = FsChallenger::new(DOMAIN);
-        verifier::verify_ligerito_jagged_union_merged(
+        verifier::verify_ligerito_union(
             &union,
             &[circuit],
             &commitment,

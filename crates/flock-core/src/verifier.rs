@@ -18,7 +18,7 @@ pub enum VerifyError {
     PcsAb(pcs::VerifyError),
     PcsC(pcs::VerifyError),
     /// The jagged-path batched opening rejected (see [`verify_ligerito_jagged`]).
-    PcsJagged(pcs::VerifyErrorJagged),
+    PcsOpen(pcs::VerifyErrorOpen),
     /// The element-region PIOP rejected.
     Element(crate::element_r1cs::union::VerifyError),
     /// A mixed-class proof carries a class sub-proof the registry has no type
@@ -220,11 +220,11 @@ enum UnionVerifyBinding<'a> {
 
 /// The MERGED-transport union verifier (wire v6) — the Mixed protocol's
 /// verify entry for BOOLEAN-only registries: a thin wrapper over
-/// [`verify_ligerito_jagged_union_mixed_class_merged`] (the one shared
+/// [`verify_ligerito_union_mixed_class`] (the one shared
 /// body). Handles both lane-major and power-of-two commitments (dispatched
 /// on `commitment.params.num_lanes`, which the shared body's
 /// params-equality check pins to the count-derived value).
-pub fn verify_ligerito_jagged_union_merged<Ch: Challenger>(
+pub fn verify_ligerito_union<Ch: Challenger>(
     union: &crate::union::UnionInstance<'_>,
     circuits: &[&dyn lincheck::LincheckCircuit],
     commitment: &Commitment,
@@ -237,7 +237,7 @@ pub fn verify_ligerito_jagged_union_merged<Ch: Challenger>(
     assert!(
         !union.has_element(),
         "this entry is boolean-only; element registries go through \
-         verify_ligerito_jagged_union_mixed_class_merged"
+         verify_ligerito_union_mixed_class"
     );
     // Repackage as a boolean-only mixed-class proof and run the one shared
     // verify body (the two-body split died with the jagged transport). The
@@ -250,7 +250,7 @@ pub fn verify_ligerito_jagged_union_merged<Ch: Challenger>(
         element: None,
         pcs_open: proof.pcs_open.clone(),
     };
-    let claims = verify_ligerito_jagged_union_mixed_class_merged(
+    let claims = verify_ligerito_union_mixed_class(
         union, circuits, commitment, &mixed, pcs_params, challenger,
     )?;
     Ok(claims.boolean.expect("asserted boolean-only above"))
@@ -258,7 +258,7 @@ pub fn verify_ligerito_jagged_union_merged<Ch: Challenger>(
 
 /// The **circuit** verify entry over the MERGED transport — the production
 /// shape, and the mirror of
-/// `flock_prover::prover::prove_fast_ligerito_union_circuit_merged`.
+/// `flock_prover::prover::prove_fast_ligerito_union_circuit`.
 ///
 /// Same replay as the jagged variant: both class PIOPs, then the wiring
 /// argument over the circuit's cell space (σ-aware GKR plus the
@@ -266,7 +266,7 @@ pub fn verify_ligerito_jagged_union_merged<Ch: Challenger>(
 /// — the wiring's gather claims are packed-direct, which the merged
 /// transport carries the same way it carries the element class's.
 #[allow(clippy::too_many_arguments)]
-pub fn verify_ligerito_union_circuit_merged<Ch: Challenger>(
+pub fn verify_ligerito_union_circuit<Ch: Challenger>(
     union: &crate::union::UnionInstance<'_>,
     circuit: &crate::circuit::Circuit,
     public: &[F128],
@@ -312,7 +312,7 @@ pub fn verify_ligerito_union_circuit_merged<Ch: Challenger>(
     )
 }
 
-/// [`verify_ligerito_union_circuit_merged`] with the matrix work left
+/// [`verify_ligerito_union_circuit`] with the matrix work left
 /// undischarged — what a merge node runs on each child proof.
 ///
 /// Everything else is verified: both class PIOPs, the wiring argument, and
@@ -327,9 +327,9 @@ pub fn verify_ligerito_union_circuit_merged<Ch: Challenger>(
 ///
 /// **The claims are conditional on the returned work**: a proof whose
 /// lincheck is simply wrong still returns `Ok` here. Callers that are not
-/// accumulating must use [`verify_ligerito_union_circuit_merged`].
+/// accumulating must use [`verify_ligerito_union_circuit`].
 #[allow(clippy::too_many_arguments)]
-pub fn verify_ligerito_union_circuit_merged_deferred<Ch: Challenger>(
+pub fn verify_ligerito_union_circuit_deferred<Ch: Challenger>(
     union: &crate::union::UnionInstance<'_>,
     circuit: &crate::circuit::Circuit,
     public: &[F128],
@@ -431,7 +431,7 @@ fn verify_merged_opening<Ch: Challenger>(
                 challenger,
             )
         })
-        .map_err(VerifyError::PcsJagged)?;
+        .map_err(VerifyError::PcsOpen)?;
     Ok(claims.clone())
 }
 
@@ -442,7 +442,7 @@ fn verify_merged_opening<Ch: Challenger>(
 /// transport carries by expressing each weight as the `F₂`-linear map
 /// `x ↦ γ·x` — indistinguishable, to its per-claim weight builder, from a
 /// ring-switched claim's Φ-fold.
-pub fn verify_ligerito_jagged_union_mixed_class_merged<Ch: Challenger>(
+pub fn verify_ligerito_union_mixed_class<Ch: Challenger>(
     union: &crate::union::UnionInstance<'_>,
     circuits: &[&dyn lincheck::LincheckCircuit],
     commitment: &Commitment,
@@ -525,8 +525,101 @@ pub fn verify_ligerito_jagged_union_mixed_class_merged<Ch: Challenger>(
                 challenger,
             )
         })
-        .map_err(VerifyError::PcsJagged)?;
+        .map_err(VerifyError::PcsOpen)?;
     Ok(claims)
+}
+
+/// [`verify_ligerito_union_mixed_class`] with the matrix work left
+/// undischarged: everything else is verified, and both classes' assertions
+/// come back as [`DeferredMatrixWork`] for the caller to discharge or
+/// accumulate ([`crate::aggregate`]).
+///
+/// This is the "succinct verify" of the accumulation route — no base matrix
+/// is read anywhere in it, which is what lets a recursion circuit replay it.
+/// **The returned claims are conditional on the assertions**: a proof whose
+/// lincheck is simply wrong still returns `Ok` here, so a caller that is not
+/// accumulating must use [`verify_ligerito_union_mixed_class`].
+pub fn verify_ligerito_union_mixed_class_deferred<Ch: Challenger>(
+    union: &crate::union::UnionInstance<'_>,
+    circuits: &[&dyn lincheck::LincheckCircuit],
+    commitment: &Commitment,
+    proof: &crate::proof::R1csProofMixedClassMerged,
+    pcs_params: &crate::pcs::PcsParams,
+    challenger: &mut Ch,
+) -> Result<(crate::proof::UnionClassClaims, DeferredMatrixWork), VerifyError> {
+    if proof.boolean.is_some() != (union.num_boolean() > 0)
+        || proof.element.is_some() != union.has_element()
+    {
+        return Err(VerifyError::ClassMismatch);
+    }
+    let (claims, packed_direct_points, matrix, el_matrix) = verify_union_piops(
+        union,
+        UnionVerifyBinding::Mixed,
+        circuits,
+        commitment,
+        proof.boolean.as_ref(),
+        proof.element.as_ref(),
+        None,
+        pcs_params,
+        challenger,
+    )?;
+    // DEFERRED: both classes' matrix work rides out undischarged for the
+    // caller to check or accumulate (`crate::aggregate`). The returned
+    // claims are CONDITIONAL on the assertions.
+    let deferred = DeferredMatrixWork {
+        boolean: matrix,
+        element: el_matrix,
+    };
+
+    // Same construction as the boolean-only merged verifier: the PCS point
+    // is `x_inner_rest ‖ x_outer`, with the skip coordinate carried
+    // separately in `z_skip`.
+    let cl: Vec<ZClaim> = match &claims.boolean {
+        Some(c) => vec![c.ab.clone(), c.c.clone()],
+        None => Vec::new(),
+    };
+    let values: Vec<F128> = cl.iter().map(|z| z.value).collect();
+    let z_skips: Vec<F128> = cl.iter().map(|z| z.point.z_skip).collect();
+    let x_fulls: Vec<Vec<F128>> = cl
+        .iter()
+        .map(|z| {
+            let mut v = z.point.x_inner_rest.clone();
+            v.extend_from_slice(&z.point.x_outer);
+            v
+        })
+        .collect();
+    let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
+    let pd: Vec<pcs::PackedDirectClaimRef<'_>> = packed_direct_points
+        .iter()
+        .map(|(point, value)| pcs::PackedDirectClaimRef {
+            point,
+            value: *value,
+        })
+        .collect();
+    let log_n = pcs_params.m - pcs::LOG_PACKING;
+    let lig_v_config = crate::pcs::ligerito::verifier_config_for(
+        log_n,
+        pcs_params.log_batch_size,
+        pcs_params.profile,
+    )
+    .expect("Ligerito default verifier config");
+    verifier_pool()
+        .install(|| {
+            pcs::verify_batch_merged(
+                commitment,
+                &values,
+                &z_skips,
+                &x_refs,
+                &pd,
+                &union.jagged_heights(),
+                union.n_log(),
+                &proof.pcs_open,
+                &lig_v_config,
+                challenger,
+            )
+        })
+        .map_err(VerifyError::PcsOpen)?;
+    Ok((claims, deferred))
 }
 
 /// Shared PIOP replay for both union verify shapes: statement binding, the
@@ -567,8 +660,8 @@ fn verify_union_piops<Ch: Challenger>(
         || commitment.params.log_inv_rate != pcs_params.log_inv_rate
         || commitment.params.num_ntts() != pcs_params.num_ntts()
     {
-        return Err(VerifyError::PcsJagged(
-            crate::pcs::VerifyErrorJagged::Ligerito,
+        return Err(VerifyError::PcsOpen(
+            crate::pcs::VerifyErrorOpen::Ligerito,
         ));
     }
     // Verification is single-threaded; run the PIOP replay on the dedicated

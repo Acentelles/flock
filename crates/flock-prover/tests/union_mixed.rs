@@ -23,7 +23,7 @@
 use flock_core::field::F128;
 use flock_core::lincheck::LincheckCircuit;
 use flock_core::pcs::ligerito::LigeritoProfile;
-use flock_core::pcs::{PcsParams, VerifyErrorJagged};
+use flock_core::pcs::{PcsParams, VerifyErrorOpen};
 use flock_core::proof::R1csProofMergedLigerito;
 use flock_core::r1cs::BlockR1cs;
 use flock_core::union::SlotWitness;
@@ -173,7 +173,7 @@ fn mixed_blake3_sha256_roundtrip_and_tamper() {
     ];
     let mut ch_p = FsChallenger::new(DOMAIN);
     let (proof, commitment, claim) =
-        prover::prove_fast_ligerito_jagged_union_merged(&union, &pcs_params, slots, &mut ch_p);
+        prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch_p);
 
     // ---- The commitment is a commitment to the COMPACTED union buffer
     // (the M4 dense stack): regenerate the witnesses, assemble them
@@ -217,7 +217,7 @@ fn mixed_blake3_sha256_roundtrip_and_tamper() {
     let circuits: [&dyn LincheckCircuit; 2] = [sha2_circuit, blake3_circuit];
     let verify = |union: &UnionInstance<'_>, proof: &R1csProofMergedLigerito| {
         let mut ch_v = FsChallenger::new(DOMAIN);
-        verifier::verify_ligerito_jagged_union_merged(
+        verifier::verify_ligerito_union(
             union,
             &circuits,
             &commitment,
@@ -290,7 +290,7 @@ fn mixed_blake3_sha256_roundtrip_and_tamper() {
             bad_comm.params.num_lanes = bad_lanes;
             let mut ch_v = FsChallenger::new(DOMAIN);
             assert!(
-                verifier::verify_ligerito_jagged_union_merged(
+                verifier::verify_ligerito_union(
                     &union,
                     &circuits,
                     &bad_comm,
@@ -326,8 +326,8 @@ fn mixed_blake3_sha256_roundtrip_and_tamper() {
         let mut bad = proof.clone();
         bad.pcs_open.q_eval.lo ^= 1;
         match verify(&union, &bad) {
-            Err(VerifyError::PcsJagged(VerifyErrorJagged::VirtualOpen)) => {}
-            other => panic!("tampered q_eval: expected PcsJagged(VirtualOpen), got {other:?}"),
+            Err(VerifyError::PcsOpen(VerifyErrorOpen::VirtualOpen)) => {}
+            other => panic!("tampered q_eval: expected PcsOpen(VirtualOpen), got {other:?}"),
         }
     }
 }
@@ -384,11 +384,11 @@ fn mixed_partial_counts_roundtrip_and_tamper() {
         ];
         let mut ch_p = FsChallenger::new(DOMAIN);
         let (proof, commitment, claim) =
-            prover::prove_fast_ligerito_jagged_union_merged(&union, &pcs_params, slots, &mut ch_p);
+            prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch_p);
 
         let verify = |union: &UnionInstance<'_>| {
             let mut ch_v = FsChallenger::new(DOMAIN);
-            verifier::verify_ligerito_jagged_union_merged(
+            verifier::verify_ligerito_union(
                 union,
                 &circuits,
                 &commitment,
@@ -473,7 +473,7 @@ fn mixed_area_saving_roundtrip() {
     ];
     let mut ch_p = FsChallenger::new(DOMAIN);
     let (proof, commitment, claim) =
-        prover::prove_fast_ligerito_jagged_union_merged(&union, &pcs_params, slots, &mut ch_p);
+        prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch_p);
     assert_eq!(
         commitment.params.m, 22,
         "the produced commitment must be to the 2^15-word dense stack"
@@ -482,7 +482,7 @@ fn mixed_area_saving_roundtrip() {
     let circuits: [&dyn LincheckCircuit; 2] = [sha2_circuit, blake3_circuit];
     let verify = |union: &UnionInstance<'_>| {
         let mut ch_v = FsChallenger::new(DOMAIN);
-        verifier::verify_ligerito_jagged_union_merged(
+        verifier::verify_ligerito_union(
             union,
             &circuits,
             &commitment,
@@ -531,7 +531,7 @@ fn mixed_prove_rejects_swapped_slot_order() {
         ),
     ];
     let mut ch_p = FsChallenger::new(DOMAIN);
-    let _ = prover::prove_fast_ligerito_jagged_union_merged(&union, &pcs_params, slots, &mut ch_p);
+    let _ = prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch_p);
 }
 
 /// A single-type instance through the NEW binding roundtrips. The proof is
@@ -562,10 +562,10 @@ fn blake3_single_type_roundtrip_under_mixed_binding() {
     );
     let mut ch_p = FsChallenger::new(DOMAIN);
     let (proof, commitment, claim) =
-        prover::prove_fast_ligerito_jagged_union_merged(&union, &setup.pcs_params, vec![slot], &mut ch_p);
+        prover::prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch_p);
 
     let mut ch_v = FsChallenger::new(DOMAIN);
-    let claim_v = verifier::verify_ligerito_jagged_union_merged(
+    let claim_v = verifier::verify_ligerito_union(
         &union,
         &[lc_circuit],
         &commitment,
@@ -581,7 +581,7 @@ fn blake3_single_type_roundtrip_under_mixed_binding() {
 /// a single-slot registry at full utilization leaves `dense_q` as `None`
 /// (q IS the padded buffer), which the merged arm must handle by cloning —
 /// it used to `expect` and panic. The shipped standalone body always handled
-/// this (`prove_fast_ligerito_jagged_union_merged`); this pins the enum path
+/// this (`prove_fast_ligerito_union`); this pins the enum path
 /// the mixed-class entries take.
 #[test]
 #[ignore] // Heavier — run with `cargo test -p flock-prover --test union_mixed -- --ignored`
@@ -606,7 +606,7 @@ fn identity_compaction_roundtrips_over_the_merged_transport() {
         lc_circuit,
     );
     let mut ch_p = FsChallenger::new(DOMAIN);
-    let (proof, commitment, claims) = prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
+    let (proof, commitment, claims) = prover::prove_fast_ligerito_union_mixed_class(
         &union,
         &setup.pcs_params,
         vec![slot],
@@ -614,7 +614,7 @@ fn identity_compaction_roundtrips_over_the_merged_transport() {
         &mut ch_p,
     );
     let mut ch_v = FsChallenger::new(DOMAIN);
-    let claims_v = verifier::verify_ligerito_jagged_union_mixed_class_merged(
+    let claims_v = verifier::verify_ligerito_union_mixed_class(
         &union,
         &[lc_circuit],
         &commitment,
@@ -663,7 +663,7 @@ fn mixed_throughput_smoke() {
             blake3::generate_witness_batch_major(&blake3_inputs, nu),
             b3_circuit,
         );
-        let _ = prover::prove_fast_ligerito_jagged_union_merged(
+        let _ = prover::prove_fast_ligerito_union(
             &b3_union,
             &b3_setup.pcs_params,
             vec![slot],
@@ -687,7 +687,7 @@ fn mixed_throughput_smoke() {
             sha2::generate_witness_batch_major(&sha2_inputs, nu),
             s2_circuit,
         );
-        let _ = prover::prove_fast_ligerito_jagged_union_merged(
+        let _ = prover::prove_fast_ligerito_union(
             &s2_union,
             &s2_setup.pcs_params,
             vec![slot],
@@ -719,7 +719,7 @@ fn mixed_throughput_smoke() {
                 b3_mix_circuit,
             ),
         ];
-        let _ = prover::prove_fast_ligerito_jagged_union_merged(&union, &pcs_params, slots, &mut ch);
+        let _ = prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
         if timed {
             mixed_ms = t.elapsed().as_secs_f64() * 1e3;
         }
@@ -790,13 +790,13 @@ fn mixed_low_utilization_smoke() {
             let mut ch = FsChallenger::new(DOMAIN);
             let t = Instant::now();
             let (proof, commitment, claim) =
-                prover::prove_fast_ligerito_jagged_union_merged(&union, &pcs_params, slots, &mut ch);
+                prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
             if timed {
                 prove_ms = prove_ms.min(t.elapsed().as_secs_f64() * 1e3);
                 // Roundtrip while we're here.
                 let circuits: [&dyn LincheckCircuit; 2] = [s2_circuit, b3_circuit];
                 let mut ch_v = FsChallenger::new(DOMAIN);
-                let claim_v = verifier::verify_ligerito_jagged_union_merged(
+                let claim_v = verifier::verify_ligerito_union(
                     &union,
                     &circuits,
                     &commitment,
@@ -971,13 +971,13 @@ fn run_capacity_sweep(counts: [usize; 2], nus: &[usize]) {
             let mut ch = FsChallenger::new(DOMAIN);
             let t = Instant::now();
             let (proof, commitment, claim) =
-                prover::prove_fast_ligerito_jagged_union_merged(&union, &pcs_params, slots, &mut ch);
+                prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
             let prove_ms = t.elapsed().as_secs_f64() * 1e3;
 
             let circuits: [&dyn LincheckCircuit; 2] = [s2_circuit, b3_circuit];
             let mut ch_v = FsChallenger::new(DOMAIN);
             let t = Instant::now();
-            let claim_v = verifier::verify_ligerito_jagged_union_merged(
+            let claim_v = verifier::verify_ligerito_union(
                 &union,
                 &circuits,
                 &commitment,
@@ -1076,9 +1076,9 @@ fn merged_transport_roundtrip_and_tamper() {
         ];
         let mut ch = FsChallenger::new(DOMAIN);
         let (proof, commitment, claim) =
-            prover::prove_fast_ligerito_jagged_union_merged(&union, &pcs_params, slots, &mut ch);
+            prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
         let mut ch_v = FsChallenger::new(DOMAIN);
-        let claim_v = verifier::verify_ligerito_jagged_union_merged(
+        let claim_v = verifier::verify_ligerito_union(
             &union,
             &circuits,
             &commitment,
@@ -1093,7 +1093,7 @@ fn merged_transport_roundtrip_and_tamper() {
         let reject = |p: &flock_core::proof::R1csProofMergedLigerito, what: &str| {
             let mut ch_v = FsChallenger::new(DOMAIN);
             assert!(
-                verifier::verify_ligerito_jagged_union_merged(
+                verifier::verify_ligerito_union(
                     &union,
                     &circuits,
                     &commitment,
@@ -1139,7 +1139,7 @@ fn merged_transport_roundtrip_and_tamper() {
             let union_bad = UnionInstance::new(&registry, vec![counts[0], counts[1] - 1]);
             let mut ch_v = FsChallenger::new(DOMAIN);
             assert!(
-                verifier::verify_ligerito_jagged_union_merged(
+                verifier::verify_ligerito_union(
                     &union_bad,
                     &circuits,
                     &commitment,
@@ -1165,7 +1165,7 @@ fn merged_transport_roundtrip_and_tamper() {
             assert_eq!(union.jagged_heights(), union_bad.jagged_heights());
             let mut ch_v = FsChallenger::new(DOMAIN);
             assert!(
-                verifier::verify_ligerito_jagged_union_merged(
+                verifier::verify_ligerito_union(
                     &union_bad,
                     &circuits,
                     &commitment,
@@ -1191,7 +1191,7 @@ fn merged_transport_roundtrip_and_tamper() {
         };
         let mut ch_v = FsChallenger::new(DOMAIN);
         assert!(
-            verifier::verify_ligerito_jagged_union_merged(
+            verifier::verify_ligerito_union(
                 &union,
                 &circuits,
                 &bad_commitment,
@@ -1206,7 +1206,7 @@ fn merged_transport_roundtrip_and_tamper() {
         bad_commitment.params.log_inv_rate += 1;
         let mut ch_v = FsChallenger::new(DOMAIN);
         assert!(
-            verifier::verify_ligerito_jagged_union_merged(
+            verifier::verify_ligerito_union(
                 &union,
                 &circuits,
                 &bad_commitment,
@@ -1263,11 +1263,11 @@ fn merged_transport_m30_probe() {
             let t = Instant::now();
             let pcs_params = union_pcs_params(&union);
             let (proof, commitment, claim) =
-                prover::prove_fast_ligerito_jagged_union_merged(&union, &pcs_params, slots, &mut ch);
+                prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
             let ms = t.elapsed().as_secs_f64() * 1e3;
             if pass == 0 {
                 let mut ch_v = FsChallenger::new(DOMAIN);
-                let claim_v = verifier::verify_ligerito_jagged_union_merged(
+                let claim_v = verifier::verify_ligerito_union(
                     &union,
                     &circuits,
                     &commitment,
@@ -1388,7 +1388,7 @@ fn merged_capacity_attribution() {
             ];
             let mut ch = FsChallenger::new(DOMAIN);
             let t = Instant::now();
-            let (_p, _c, _cl) = prover::prove_fast_ligerito_jagged_union_merged(
+            let (_p, _c, _cl) = prover::prove_fast_ligerito_union(
                 &union,
                 &pcs_params,
                 slots,
@@ -1449,7 +1449,7 @@ fn merged_padding_unread_poison_pool() {
                 ),
             ];
             let mut ch = FsChallenger::new(DOMAIN);
-            prover::prove_fast_ligerito_jagged_union_merged(&union, &pcs_params, slots, &mut ch)
+            prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch)
         };
         let (p1, c1, cl1) = prove();
         // Poison the pools with exact-size buffers so `take` hands them out.
@@ -1467,7 +1467,7 @@ fn merged_padding_unread_poison_pool() {
         assert_eq!(cl1, cl2);
         let circuits: [&dyn LincheckCircuit; 2] = [s2_circuit, b3_circuit];
         let mut chv = FsChallenger::new(DOMAIN);
-        verifier::verify_ligerito_jagged_union_merged(
+        verifier::verify_ligerito_union(
             &union,
             &circuits,
             &c2,
@@ -1508,7 +1508,7 @@ fn in_place_generation_matches_prebuilt_byte_identical() {
         let prove = |slots: Vec<UnionSlotProverInput<'_>>| {
             let mut ch = FsChallenger::new(DOMAIN);
             let (proof, commitment, _claim) =
-                prover::prove_fast_ligerito_jagged_union_merged(&union, &pcs_params, slots, &mut ch);
+                prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
             (
                 bincode::serialize(&proof).expect("proof serializes"),
                 commitment,
@@ -1549,7 +1549,7 @@ fn in_place_generation_matches_prebuilt_byte_identical() {
         let mut ch = FsChallenger::new(DOMAIN);
         let proof: R1csProofMergedLigerito =
             bincode::deserialize(&in_place_bytes).expect("proof deserializes");
-        verifier::verify_ligerito_jagged_union_merged(
+        verifier::verify_ligerito_union(
             &union,
             &circuits,
             &in_place_comm,
@@ -1606,7 +1606,7 @@ fn mixed_m30_throughput() {
                 circuit,
             );
             let mut ch = FsChallenger::new(DOMAIN);
-            let _ = prover::prove_fast_ligerito_jagged_union_merged(
+            let _ = prover::prove_fast_ligerito_union(
                 &union,
                 &setup.pcs_params,
                 vec![slot],
@@ -1621,7 +1621,7 @@ fn mixed_m30_throughput() {
                 blake3::generate_witness_batch_major(&blake3_inputs, nu),
                 circuit,
             );
-            let _ = prover::prove_fast_ligerito_jagged_union_merged(
+            let _ = prover::prove_fast_ligerito_union(
                 &union,
                 &setup.pcs_params,
                 vec![slot],
@@ -1646,7 +1646,7 @@ fn mixed_m30_throughput() {
                 circuit,
             );
             let mut ch = FsChallenger::new(DOMAIN);
-            let _ = prover::prove_fast_ligerito_jagged_union_merged(
+            let _ = prover::prove_fast_ligerito_union(
                 &union,
                 &setup.pcs_params,
                 vec![slot],
@@ -1661,7 +1661,7 @@ fn mixed_m30_throughput() {
                 sha2::generate_witness_batch_major(&sha2_inputs, nu),
                 circuit,
             );
-            let _ = prover::prove_fast_ligerito_jagged_union_merged(
+            let _ = prover::prove_fast_ligerito_union(
                 &union,
                 &setup.pcs_params,
                 vec![slot],
@@ -1701,7 +1701,7 @@ fn mixed_m30_throughput() {
             ),
         ];
         let mut ch = FsChallenger::new(DOMAIN);
-        let _ = prover::prove_fast_ligerito_jagged_union_merged(&union, &pcs_params, slots, &mut ch);
+        let _ = prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
     }
     let mut mixed_ms = f64::INFINITY;
     let mut mixed_out = None;
@@ -1718,7 +1718,7 @@ fn mixed_m30_throughput() {
         ];
         let mut ch = FsChallenger::new(DOMAIN);
         let t = Instant::now();
-        let out = prover::prove_fast_ligerito_jagged_union_merged(&union, &pcs_params, slots, &mut ch);
+        let out = prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
         mixed_ms = mixed_ms.min(t.elapsed().as_secs_f64() * 1e3);
         mixed_out = Some(out);
     }
@@ -1728,7 +1728,7 @@ fn mixed_m30_throughput() {
     let circuits: [&dyn LincheckCircuit; 2] = [s2_mix_circuit, b3_mix_circuit];
     let t = Instant::now();
     let mut ch_v = FsChallenger::new(DOMAIN);
-    let claim_v = verifier::verify_ligerito_jagged_union_merged(
+    let claim_v = verifier::verify_ligerito_union(
         &union,
         &circuits,
         &commitment,
@@ -1914,7 +1914,7 @@ fn two_blake3_tables_vs_direct() {
                 UnionSlotProverInput::new(blake3::generate_witness_batch_major(hi, nu), circuit),
             ];
             let mut ch = FsChallenger::new(DOMAIN);
-            let _ = prover::prove_fast_ligerito_jagged_union_merged(&union, &pcs_params, slots, &mut ch);
+            let _ = prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
         }
         let mut best = f64::INFINITY;
         let mut out = None;
@@ -1925,7 +1925,7 @@ fn two_blake3_tables_vs_direct() {
             ];
             let mut ch = FsChallenger::new(DOMAIN);
             let t = Instant::now();
-            let o = prover::prove_fast_ligerito_jagged_union_merged(&union, &pcs_params, slots, &mut ch);
+            let o = prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
             best = best.min(t.elapsed().as_secs_f64() * 1e3);
             out = Some(o);
         }
@@ -1934,7 +1934,7 @@ fn two_blake3_tables_vs_direct() {
         let circuits: [&dyn LincheckCircuit; 2] = [circuit, circuit];
         let t = Instant::now();
         let mut ch = FsChallenger::new(DOMAIN);
-        verifier::verify_ligerito_jagged_union_merged(
+        verifier::verify_ligerito_union(
             &union,
             &circuits,
             &comm,
@@ -1968,7 +1968,7 @@ fn two_blake3_tables_vs_direct() {
                 circuit,
             )];
             let mut ch = FsChallenger::new(DOMAIN);
-            let _ = prover::prove_fast_ligerito_jagged_union_merged(&union, &pcs_params, slots, &mut ch);
+            let _ = prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
         }
         let mut best = f64::INFINITY;
         let mut out = None;
@@ -1979,7 +1979,7 @@ fn two_blake3_tables_vs_direct() {
             )];
             let mut ch = FsChallenger::new(DOMAIN);
             let t = Instant::now();
-            let o = prover::prove_fast_ligerito_jagged_union_merged(&union, &pcs_params, slots, &mut ch);
+            let o = prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
             best = best.min(t.elapsed().as_secs_f64() * 1e3);
             out = Some(o);
         }
@@ -1988,7 +1988,7 @@ fn two_blake3_tables_vs_direct() {
         let circuits: [&dyn LincheckCircuit; 1] = [circuit];
         let t = Instant::now();
         let mut ch = FsChallenger::new(DOMAIN);
-        verifier::verify_ligerito_jagged_union_merged(
+        verifier::verify_ligerito_union(
             &union,
             &circuits,
             &comm,

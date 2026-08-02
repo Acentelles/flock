@@ -225,7 +225,7 @@ fn blake3_chunk_chain_through_the_builder() {
     let lc = r1cs.csc_lincheck_circuit();
 
     let mut ch = FsChallenger::new(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit_merged(
+    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
         &union,
         &built.shape.circuit,
         &built.witness.public,
@@ -239,7 +239,7 @@ fn blake3_chunk_chain_through_the_builder() {
     );
 
     let mut ch = FsChallenger::new(DOMAIN);
-    verifier::verify_ligerito_union_circuit_merged(
+    verifier::verify_ligerito_union_circuit(
         &union,
         &built.shape.circuit,
         &built.witness.public,
@@ -258,7 +258,7 @@ fn blake3_chunk_chain_through_the_builder() {
     bad[last] += F128::ONE;
     let mut ch = FsChallenger::new(DOMAIN);
     assert!(
-        verifier::verify_ligerito_union_circuit_merged(
+        verifier::verify_ligerito_union_circuit(
             &union,
             &built.shape.circuit,
             &bad,
@@ -461,7 +461,7 @@ fn fs_chain_circuit_derives_the_challenges() {
     let rows = built.rows::<Blake3Gate>(g);
 
     let mut c = FsChallenger::new(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit_merged(
+    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
         &union,
         &built.shape.circuit,
         &built.witness.public,
@@ -474,7 +474,7 @@ fn fs_chain_circuit_derives_the_challenges() {
         &mut c,
     );
     let mut c = FsChallenger::new(DOMAIN);
-    verifier::verify_ligerito_union_circuit_merged(
+    verifier::verify_ligerito_union_circuit(
         &union,
         &built.shape.circuit,
         &built.witness.public,
@@ -492,7 +492,7 @@ fn fs_chain_circuit_derives_the_challenges() {
     bad[last] += F128::ONE;
     let mut c = FsChallenger::new(DOMAIN);
     assert!(
-        verifier::verify_ligerito_union_circuit_merged(
+        verifier::verify_ligerito_union_circuit(
             &union,
             &built.shape.circuit,
             &bad,
@@ -575,7 +575,7 @@ fn mvp_fs_chain_of_a_real_proof() {
     // settled Merkle/FS hash for this work. `FsChallenger::new` defaults to
     // SHA-256, which would be a different chain entirely.
     let mut ch_p = FsChallenger::with_hash(INNER, HashKind::Blake3);
-    let (inner_proof, inner_commit, _) = prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
+    let (inner_proof, inner_commit, _) = prover::prove_fast_ligerito_union_mixed_class(
         &union,
         &inner_params,
         Vec::new(),
@@ -587,7 +587,7 @@ fn mvp_fs_chain_of_a_real_proof() {
 
     // Record the VERIFIER's transcript — that is what a recursive verifier replays.
     let mut rec = RecordingChallenger::new(FsChallenger::with_hash(INNER, HashKind::Blake3));
-    verifier::verify_ligerito_jagged_union_mixed_class_merged(
+    verifier::verify_ligerito_union_mixed_class(
         &union,
         &[],
         &inner_commit,
@@ -726,7 +726,7 @@ fn mvp_fs_chain_of_a_real_proof() {
 
     let t = std::time::Instant::now();
     let mut c = FsChallenger::new(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit_merged(
+    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
         &outer,
         &built.shape.circuit,
         &built.witness.public,
@@ -742,7 +742,7 @@ fn mvp_fs_chain_of_a_real_proof() {
 
     let t = std::time::Instant::now();
     let mut c = FsChallenger::new(DOMAIN);
-    verifier::verify_ligerito_union_circuit_merged(
+    verifier::verify_ligerito_union_circuit(
         &outer,
         &built.shape.circuit,
         &built.witness.public,
@@ -1049,7 +1049,7 @@ fn mvp2_sumcheck_round_consumes_a_derived_challenge() {
     };
 
     let mut c = FsChallenger::new(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit_merged(
+    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
         &outer,
         &built.shape.circuit,
         &built.witness.public,
@@ -1064,7 +1064,7 @@ fn mvp2_sumcheck_round_consumes_a_derived_challenge() {
         &mut c,
     );
     let mut c = FsChallenger::new(DOMAIN);
-    verifier::verify_ligerito_union_circuit_merged(
+    verifier::verify_ligerito_union_circuit(
         &outer,
         &built.shape.circuit,
         &built.witness.public,
@@ -1083,7 +1083,7 @@ fn mvp2_sumcheck_round_consumes_a_derived_challenge() {
     bad[last] += F128::ONE;
     let mut c = FsChallenger::new(DOMAIN);
     assert!(
-        verifier::verify_ligerito_union_circuit_merged(
+        verifier::verify_ligerito_union_circuit(
             &outer,
             &built.shape.circuit,
             &bad,
@@ -1420,7 +1420,7 @@ fn mvp2b_full_element_zerocheck_replayed() {
     };
     let t = std::time::Instant::now();
     let mut c = FsChallenger::new(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit_merged(
+    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
         &outer,
         &built.shape.circuit,
         &built.witness.public,
@@ -1437,7 +1437,7 @@ fn mvp2b_full_element_zerocheck_replayed() {
     let prove_ms = t.elapsed().as_secs_f64() * 1e3;
     let t = std::time::Instant::now();
     let mut c = FsChallenger::new(DOMAIN);
-    verifier::verify_ligerito_union_circuit_merged(
+    verifier::verify_ligerito_union_circuit(
         &outer,
         &built.shape.circuit,
         &built.witness.public,

@@ -187,7 +187,7 @@ fn m6_merged_union_proof_bytes_pinned() {
         ];
         let mut ch = FsChallenger::new(DOMAIN);
         let (proof, commitment, claim) =
-            prover::prove_fast_ligerito_jagged_union_merged(&union, &pcs_params, slots, &mut ch);
+            prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
         let bundle = MixedProofBundleLigerito {
             registry_id: MixedRegistryId::Blake3Sha2Nu10,
             counts: counts.iter().map(|&n| n as u64).collect(),
@@ -233,7 +233,7 @@ fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
             circuit,
         );
         let mut ch = FsChallenger::new(DOMAIN);
-        let (proof, commitment, claim) = prover::prove_fast_ligerito_jagged_union_merged(
+        let (proof, commitment, claim) = prover::prove_fast_ligerito_union(
             &union,
             &setup.pcs_params,
             vec![slot],
@@ -265,7 +265,7 @@ fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
             circuit,
         );
         let mut ch = FsChallenger::new(DOMAIN);
-        let (proof, commitment, claim) = prover::prove_fast_ligerito_jagged_union_merged(
+        let (proof, commitment, claim) = prover::prove_fast_ligerito_union(
             &union,
             &setup.pcs_params,
             vec![slot],

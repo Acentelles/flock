@@ -144,7 +144,7 @@ fn measure_whole_verify() -> (Snapshot, Snapshot) {
         .collect();
 
     let mut ch_p = FsChallenger::new(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_mixed_class(
+    let (proof, commitment, _) = prover::prove_fast_ligerito_union_mixed_class(
         &union,
         &pcs_params,
         Vec::new(),
@@ -154,7 +154,7 @@ fn measure_whole_verify() -> (Snapshot, Snapshot) {
 
     let mut ch_v = FsChallenger::new(DOMAIN);
     let (_, full) = op_count::measure(|| {
-        verifier::verify_ligerito_jagged_union_mixed_class(
+        verifier::verify_ligerito_union_mixed_class(
             &union,
             &[],
             &commitment,
@@ -171,7 +171,7 @@ fn measure_whole_verify() -> (Snapshot, Snapshot) {
     // it is the reason a whole-verify number overstates what recursion pays.
     let mut ch_d = FsChallenger::new(DOMAIN);
     let (_, deferred) = op_count::measure(|| {
-        verifier::verify_ligerito_jagged_union_mixed_class_deferred(
+        verifier::verify_ligerito_union_mixed_class_deferred(
             &union,
             &[],
             &commitment,

@@ -23,8 +23,8 @@
 //! slot *is* today's instance.
 //!
 //! The prove/verify entries (`flock_prover::prover::
-//! prove_fast_ligerito_jagged_union_merged` / [`crate::verifier::
-//! verify_ligerito_jagged_union_merged`], and their mixed-class variants)
+//! prove_fast_ligerito_union` / [`crate::verifier::
+//! verify_ligerito_union`], and their mixed-class variants)
 //! accept any registry under the `flock-mixed-v1` binding. (The M1/M2
 //! single-type harness binding died with the jagged transport and its
 //! byte-identity differential tests.)
@@ -802,7 +802,7 @@ impl<'r> UnionInstance<'r> {
     ///
     /// Support-proportional copies (M6): a slot at partial utilization only
     /// copies the declared `n_t`-word prefix of each used chunk-column — the
-    /// witness contract (see `prove_fast_ligerito_jagged_union_merged`) makes the
+    /// witness contract (see `prove_fast_ligerito_union`) makes the
     /// slot buffers zero everywhere else (dummy rows, useless columns), so
     /// the zero-initialized union buffers already hold those words'
     /// values and the result is byte-identical to the full-slot copy.

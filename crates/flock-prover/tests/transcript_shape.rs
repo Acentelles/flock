@@ -140,7 +140,7 @@ fn record_element_only(
         .collect();
 
     let mut ch_p = RecordingChallenger::new(FsChallenger::new(DOMAIN));
-    let (proof, commitment, _claims_p) = prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
+    let (proof, commitment, _claims_p) = prover::prove_fast_ligerito_union_mixed_class(
         &union,
         &pcs_params,
         Vec::new(),
@@ -149,7 +149,7 @@ fn record_element_only(
     );
 
     let mut ch_v = RecordingChallenger::new(FsChallenger::new(DOMAIN));
-    verifier::verify_ligerito_jagged_union_mixed_class_merged(
+    verifier::verify_ligerito_union_mixed_class(
         &union,
         &[],
         &commitment,
