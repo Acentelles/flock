@@ -203,7 +203,7 @@ fn element_only_union_roundtrip() {
             .collect();
 
         let mut ch_p = FsChallenger::new(DOMAIN);
-        let (proof, commitment, claims_p) = prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
+        let (proof, commitment, claims_p) = prover::prove_fast_ligerito_union_mixed_class(
             &union,
             &pcs_params,
             Vec::new(),
@@ -224,7 +224,7 @@ fn element_only_union_roundtrip() {
         );
 
         let mut ch_v = FsChallenger::new(DOMAIN);
-        let claims_v = verifier::verify_ligerito_jagged_union_mixed_class_merged(
+        let claims_v = verifier::verify_ligerito_union_mixed_class(
             &union,
             &[],
             &commitment,
@@ -265,7 +265,7 @@ fn element_claims_are_bound_by_the_opening() {
     let z = gate_witness(&ty, nu, n, w0, w1, &mut rng);
     let zc = z.clone();
     let mut ch_p = FsChallenger::new(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
+    let (proof, commitment, _) = prover::prove_fast_ligerito_union_mixed_class(
         &union,
         &pcs_params,
         Vec::new(),
@@ -276,7 +276,7 @@ fn element_claims_are_bound_by_the_opening() {
     );
     let verify = |p: &R1csProofMixedClassMerged| {
         let mut ch = FsChallenger::new(DOMAIN);
-        verifier::verify_ligerito_jagged_union_mixed_class_merged(
+        verifier::verify_ligerito_union_mixed_class(
             &union,
             &[],
             &commitment,
@@ -421,7 +421,7 @@ fn element_only_agrees_with_the_standalone_proof() {
         let pcs_params = union_pcs_params(&union);
         let zc = z.clone();
         let mut ch_p = FsChallenger::new(DOMAIN);
-        let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
+        let (proof, commitment, _) = prover::prove_fast_ligerito_union_mixed_class(
             &union,
             &pcs_params,
             Vec::new(),
@@ -431,7 +431,7 @@ fn element_only_agrees_with_the_standalone_proof() {
             &mut ch_p,
         );
         let mut ch_v = FsChallenger::new(DOMAIN);
-        let union_ok = verifier::verify_ligerito_jagged_union_mixed_class_merged(
+        let union_ok = verifier::verify_ligerito_union_mixed_class(
             &union,
             &[],
             &commitment,
@@ -564,7 +564,7 @@ fn dummy_row_is_structurally_invisible_under_the_union() {
         let prove = |z: &[F128]| {
             let zc = z.to_vec();
             let mut ch_p = FsChallenger::new(DOMAIN);
-            prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
+            prover::prove_fast_ligerito_union_mixed_class(
                 &union,
                 &pcs_params,
                 Vec::new(),
@@ -597,7 +597,7 @@ fn dummy_row_is_structurally_invisible_under_the_union() {
     }
     let zc = z.clone();
     let mut ch_p = FsChallenger::new(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
+    let (proof, commitment, _) = prover::prove_fast_ligerito_union_mixed_class(
         &union,
         &pcs_params,
         Vec::new(),
@@ -608,7 +608,7 @@ fn dummy_row_is_structurally_invisible_under_the_union() {
     );
     let mut ch_v = FsChallenger::new(DOMAIN);
     assert!(
-        verifier::verify_ligerito_jagged_union_mixed_class_merged(
+        verifier::verify_ligerito_union_mixed_class(
             &union,
             &[],
             &commitment,
@@ -690,7 +690,7 @@ fn mixed_boolean_element_roundtrip_and_tamper() {
     let prove = |union: &UnionInstance<'_>, params: &PcsParams| {
         let z_elem = z_elem.clone();
         let mut ch = FsChallenger::new(DOMAIN);
-        prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
+        prover::prove_fast_ligerito_union_mixed_class(
             union,
             params,
             vec![UnionSlotProverInput::new(
@@ -711,7 +711,7 @@ fn mixed_boolean_element_roundtrip_and_tamper() {
                   commitment: &flock_prover::pcs::Commitment,
                   proof: &R1csProofMixedClassMerged| {
         let mut ch = FsChallenger::new(DOMAIN);
-        verifier::verify_ligerito_jagged_union_mixed_class_merged(
+        verifier::verify_ligerito_union_mixed_class(
             union, &[circuit], commitment, proof, params, &mut ch,
         )
     };
@@ -737,7 +737,7 @@ fn mixed_boolean_element_roundtrip_and_tamper() {
         bad_elem[(2 << nu) + 3] += F128::ONE; // break one product
         let inputs = &inputs;
         let mut ch = FsChallenger::new(DOMAIN);
-        let (p, cm, _) = prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
+        let (p, cm, _) = prover::prove_fast_ligerito_union_mixed_class(
             &union,
             &pcs_params,
             vec![UnionSlotProverInput::new(
@@ -764,7 +764,7 @@ fn mixed_boolean_element_roundtrip_and_tamper() {
         z[5] += F128::ONE;
         let z_elem = z_elem.clone();
         let mut ch = FsChallenger::new(DOMAIN);
-        let (p, cm, _) = prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
+        let (p, cm, _) = prover::prove_fast_ligerito_union_mixed_class(
             &union,
             &pcs_params,
             vec![UnionSlotProverInput::new((z, a, b, stripe), circuit)],
@@ -898,7 +898,7 @@ fn mixed_boolean_element_roundtrip_and_tamper() {
     {
         let mut ch = FsChallenger::new(b"a-different-domain");
         assert!(
-            verifier::verify_ligerito_jagged_union_mixed_class_merged(
+            verifier::verify_ligerito_union_mixed_class(
                 &union,
                 &[circuit],
                 &commitment,
@@ -936,7 +936,7 @@ fn mixed_with_one_class_at_zero_count() {
         let z_elem = gate_witness(&m.ty, nu, n_elem, m.w.0, m.w.1, &mut rng);
 
         let mut ch_p = FsChallenger::new(DOMAIN);
-        let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
+        let (proof, commitment, _) = prover::prove_fast_ligerito_union_mixed_class(
             &union,
             &pcs_params,
             vec![UnionSlotProverInput::new(
@@ -949,7 +949,7 @@ fn mixed_with_one_class_at_zero_count() {
             &mut ch_p,
         );
         let mut ch_v = FsChallenger::new(DOMAIN);
-        verifier::verify_ligerito_jagged_union_mixed_class_merged(
+        verifier::verify_ligerito_union_mixed_class(
             &union,
             &[circuit],
             &commitment,
@@ -987,7 +987,7 @@ fn boolean_only_mixed_class_matches_the_plain_entry() {
     let inputs = random_blake3_inputs(&mut rng, n);
 
     let mut ch = FsChallenger::new(DOMAIN);
-    let (plain, cm_plain, claim_plain) = prover::prove_fast_ligerito_jagged_union_merged(
+    let (plain, cm_plain, claim_plain) = prover::prove_fast_ligerito_union(
         &union,
         &pcs_params,
         vec![UnionSlotProverInput::new(
@@ -999,7 +999,7 @@ fn boolean_only_mixed_class_matches_the_plain_entry() {
     let tail_plain = ch.sample_f128();
 
     let mut ch = FsChallenger::new(DOMAIN);
-    let (mixed, cm_mixed, claim_mixed) = prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
+    let (mixed, cm_mixed, claim_mixed) = prover::prove_fast_ligerito_union_mixed_class(
         &union,
         &pcs_params,
         vec![UnionSlotProverInput::new(
@@ -1034,7 +1034,7 @@ fn boolean_only_mixed_class_matches_the_plain_entry() {
 
     // …and both verify.
     let mut ch = FsChallenger::new(DOMAIN);
-    verifier::verify_ligerito_jagged_union_mixed_class_merged(
+    verifier::verify_ligerito_union_mixed_class(
         &union,
         &[circuit],
         &cm_mixed,
@@ -1134,7 +1134,7 @@ fn mixed_class_merged_proof_bytes_pinned() {
         let z = gate_witness(&ty, nu, n, w0, w1, &mut rng);
         let mut ch = FsChallenger::new(DOMAIN);
         let (proof, commitment, claims) =
-            prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
+            prover::prove_fast_ligerito_union_mixed_class(
                 &union,
                 &pcs_params,
                 Vec::new(),
@@ -1163,7 +1163,7 @@ fn mixed_class_merged_proof_bytes_pinned() {
         let z_elem = gate_witness(&m.ty, nu, n_elem, m.w.0, m.w.1, &mut rng);
         let mut ch = FsChallenger::new(DOMAIN);
         let (proof, commitment, claims) =
-            prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
+            prover::prove_fast_ligerito_union_mixed_class(
                 &union,
                 &pcs_params,
                 vec![UnionSlotProverInput::new(
@@ -1291,7 +1291,7 @@ fn mixed_class_cost_probe() {
                 // --- arm A: boolean only.
                 let t = Instant::now();
                 let mut ch = FsChallenger::new(DOMAIN);
-                let (pa, ca, _) = prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
+                let (pa, ca, _) = prover::prove_fast_ligerito_union_mixed_class(
                     &u_bool,
                     &p_bool,
                     vec![UnionSlotProverInput::in_place(
@@ -1309,7 +1309,7 @@ fn mixed_class_cost_probe() {
                 let ze = z_elem.clone();
                 let t = Instant::now();
                 let mut ch = FsChallenger::new(DOMAIN);
-                let (pb, cb, _) = prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
+                let (pb, cb, _) = prover::prove_fast_ligerito_union_mixed_class(
                     &u_mixed,
                     &p_mixed,
                     vec![UnionSlotProverInput::in_place(
@@ -1356,12 +1356,12 @@ fn mixed_class_cost_probe() {
                 }
                 // Correctness, every rep: both arms verify.
                 let mut ch = FsChallenger::new(DOMAIN);
-                verifier::verify_ligerito_jagged_union_mixed_class_merged(
+                verifier::verify_ligerito_union_mixed_class(
                     &u_bool, &[circuit], &ca, &pa, &p_bool, &mut ch,
                 )
                 .expect("boolean-only arm verifies");
                 let mut ch = FsChallenger::new(DOMAIN);
-                verifier::verify_ligerito_jagged_union_mixed_class_merged(
+                verifier::verify_ligerito_union_mixed_class(
                     &u_mixed, &[circuit], &cb, &pb, &p_mixed, &mut ch,
                 )
                 .expect("mixed arm verifies");
@@ -1472,7 +1472,7 @@ leaves a {} hole inside the 2^26 prefix subcube, but the element region \
             };
             let t = Instant::now();
             let mut ch = FsChallenger::new(DOMAIN);
-            let (pa, ca, _) = prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
+            let (pa, ca, _) = prover::prove_fast_ligerito_union_mixed_class(
                 &u_a,
                 &p_a,
                 bool_slots(),
@@ -1484,7 +1484,7 @@ leaves a {} hole inside the 2^26 prefix subcube, but the element region \
             let ze = z_elem.clone();
             let t = Instant::now();
             let mut ch = FsChallenger::new(DOMAIN);
-            let (pb, cb, _) = prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
+            let (pb, cb, _) = prover::prove_fast_ligerito_union_mixed_class(
                 &u_b,
                 &p_b,
                 bool_slots(),
@@ -1499,7 +1499,7 @@ leaves a {} hole inside the 2^26 prefix subcube, but the element region \
                 t_b.push(ms_b);
             }
             let mut ch = FsChallenger::new(DOMAIN);
-            verifier::verify_ligerito_jagged_union_mixed_class_merged(
+            verifier::verify_ligerito_union_mixed_class(
                 &u_a,
                 &[s2_circuit, b3_circuit],
                 &ca,
@@ -1509,7 +1509,7 @@ leaves a {} hole inside the 2^26 prefix subcube, but the element region \
             )
             .expect("two-hash arm verifies");
             let mut ch = FsChallenger::new(DOMAIN);
-            verifier::verify_ligerito_jagged_union_mixed_class_merged(
+            verifier::verify_ligerito_union_mixed_class(
                 &u_b,
                 &[s2_circuit, b3_circuit],
                 &cb,
@@ -1571,7 +1571,7 @@ fn mixed_proofs_verify_over_the_merged_transport() {
     // Merged.
     let mut ch = FsChallenger::new(DOMAIN);
     let (merged, commitment, claims_m) =
-        prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
+        prover::prove_fast_ligerito_union_mixed_class(
             &union,
             &pcs_params,
             vec![bool_slot()],
@@ -1580,7 +1580,7 @@ fn mixed_proofs_verify_over_the_merged_transport() {
         );
     assert!(merged.boolean.is_some() && merged.element.is_some());
     let mut ch_v = FsChallenger::new(DOMAIN);
-    let got = verifier::verify_ligerito_jagged_union_mixed_class_merged(
+    let got = verifier::verify_ligerito_union_mixed_class(
         &union,
         &[circuit],
         &commitment,
@@ -1611,7 +1611,7 @@ fn mixed_proofs_verify_over_the_merged_transport() {
     ] {
         let mut ch_v = FsChallenger::new(DOMAIN);
         assert!(
-            verifier::verify_ligerito_jagged_union_mixed_class_merged(
+            verifier::verify_ligerito_union_mixed_class(
                 &union,
                 &[circuit],
                 &commitment,
@@ -1679,7 +1679,7 @@ fn element_only_proofs_verify_over_the_merged_transport() {
         // Merged.
         let mut ch_p = FsChallenger::new(DOMAIN);
         let (merged, commitment, claims_m) =
-            prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
+            prover::prove_fast_ligerito_union_mixed_class(
                 &union,
                 &pcs_params,
                 Vec::new(),
@@ -1692,7 +1692,7 @@ fn element_only_proofs_verify_over_the_merged_transport() {
             "element-only: the merged open must carry no ring-switched claims"
         );
         let mut ch_v = FsChallenger::new(DOMAIN);
-        let claims_v = verifier::verify_ligerito_jagged_union_mixed_class_merged(
+        let claims_v = verifier::verify_ligerito_union_mixed_class(
             &union,
             &[],
             &commitment,

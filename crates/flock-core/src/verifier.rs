@@ -18,7 +18,7 @@ pub enum VerifyError {
     PcsAb(pcs::VerifyError),
     PcsC(pcs::VerifyError),
     /// The jagged-path batched opening rejected (see [`verify_ligerito_jagged`]).
-    PcsJagged(pcs::VerifyErrorJagged),
+    PcsOpen(pcs::VerifyErrorOpen),
     /// The element-region PIOP rejected.
     Element(crate::element_r1cs::union::VerifyError),
     /// A mixed-class proof carries a class sub-proof the registry has no type
@@ -190,11 +190,11 @@ enum UnionVerifyBinding {
 
 /// The MERGED-transport union verifier (wire v6) — the Mixed protocol's
 /// verify entry for BOOLEAN-only registries: a thin wrapper over
-/// [`verify_ligerito_jagged_union_mixed_class_merged`] (the one shared
+/// [`verify_ligerito_union_mixed_class`] (the one shared
 /// body). Handles both lane-major and power-of-two commitments (dispatched
 /// on `commitment.params.num_lanes`, which the shared body's
 /// params-equality check pins to the count-derived value).
-pub fn verify_ligerito_jagged_union_merged<Ch: Challenger>(
+pub fn verify_ligerito_union<Ch: Challenger>(
     union: &crate::union::UnionInstance<'_>,
     circuits: &[&dyn lincheck::LincheckCircuit],
     commitment: &Commitment,
@@ -207,7 +207,7 @@ pub fn verify_ligerito_jagged_union_merged<Ch: Challenger>(
     assert!(
         !union.has_element(),
         "this entry is boolean-only; element registries go through \
-         verify_ligerito_jagged_union_mixed_class_merged"
+         verify_ligerito_union_mixed_class"
     );
     // Repackage as a boolean-only mixed-class proof and run the one shared
     // verify body (the two-body split died with the jagged transport). The
@@ -220,7 +220,7 @@ pub fn verify_ligerito_jagged_union_merged<Ch: Challenger>(
         element: None,
         pcs_open: proof.pcs_open.clone(),
     };
-    let claims = verify_ligerito_jagged_union_mixed_class_merged(
+    let claims = verify_ligerito_union_mixed_class(
         union, circuits, commitment, &mixed, pcs_params, challenger,
     )?;
     Ok(claims.boolean.expect("asserted boolean-only above"))
@@ -233,7 +233,7 @@ pub fn verify_ligerito_jagged_union_merged<Ch: Challenger>(
 /// transport carries by expressing each weight as the `F₂`-linear map
 /// `x ↦ γ·x` — indistinguishable, to its per-claim weight builder, from a
 /// ring-switched claim's Φ-fold.
-pub fn verify_ligerito_jagged_union_mixed_class_merged<Ch: Challenger>(
+pub fn verify_ligerito_union_mixed_class<Ch: Challenger>(
     union: &crate::union::UnionInstance<'_>,
     circuits: &[&dyn lincheck::LincheckCircuit],
     commitment: &Commitment,
@@ -304,7 +304,7 @@ pub fn verify_ligerito_jagged_union_mixed_class_merged<Ch: Challenger>(
                 challenger,
             )
         })
-        .map_err(VerifyError::PcsJagged)?;
+        .map_err(VerifyError::PcsOpen)?;
     Ok(claims)
 }
 
@@ -345,8 +345,8 @@ fn verify_union_piops<Ch: Challenger>(
         || commitment.params.log_inv_rate != pcs_params.log_inv_rate
         || commitment.params.num_ntts() != pcs_params.num_ntts()
     {
-        return Err(VerifyError::PcsJagged(
-            crate::pcs::VerifyErrorJagged::Ligerito,
+        return Err(VerifyError::PcsOpen(
+            crate::pcs::VerifyErrorOpen::Ligerito,
         ));
     }
     // Verification is single-threaded; run the PIOP replay on the dedicated
