@@ -647,6 +647,34 @@ fn assist_columns(params: &JaggedParams, z_col: &[F128]) -> Vec<(F128, u64, u64)
 /// [`assist_columns`] against a prebuilt boundary list: the same summands in
 /// the same order, just with the run structure read off instead of rediscovered.
 fn assist_columns_at(bounds: &[(u64, u64, u32)], z_col: &[F128]) -> Vec<(F128, u64, u64)> {
+    // Boolean column points (the gather claims' `bits(word_col) ‖
+    // bits(slot_prefix)`) have a ONE-HOT eq table: the per-run sums are an
+    // indicator of the run containing the hot column, so the dense
+    // 2^|z_col| build is skipped. Value-identical to the dense path.
+    let hot: Option<usize> = z_col.iter().enumerate().try_fold(0usize, |acc, (i, &x)| {
+        if x == F128::ZERO {
+            Some(acc)
+        } else if x == F128::ONE {
+            Some(acc | (1 << i))
+        } else {
+            None
+        }
+    });
+    if let Some(h) = hot {
+        let mut out: Vec<(F128, u64, u64)> = Vec::with_capacity(bounds.len());
+        let mut y = 0usize;
+        for &(t_c, t_next, run) in bounds {
+            let w = if (y..y + run as usize).contains(&h) {
+                F128::ONE
+            } else {
+                F128::ZERO
+            };
+            y += run as usize;
+            out.push((w, t_c, t_next));
+        }
+        debug_assert_eq!(y, 1usize << z_col.len());
+        return out;
+    }
     let eq_col = build_eq_table(z_col);
     let mut out: Vec<(F128, u64, u64)> = Vec::with_capacity(bounds.len());
     let mut y = 0usize;
