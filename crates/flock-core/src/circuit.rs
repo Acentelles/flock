@@ -76,7 +76,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::challenger::Challenger;
 use crate::field::F128;
-use crate::pcs::{DirectEqInd, PackedDirectClaim, ring_switch};
+use crate::pcs::{DirectEqInd, PackedDirectClaim};
 use crate::product_gkr;
 use crate::schedule::{IoDirection, IoWord, Registry};
 use crate::union::UnionInstance;
