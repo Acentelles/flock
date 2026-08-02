@@ -575,7 +575,7 @@ fn mvp_fs_chain_of_a_real_proof() {
     // settled Merkle/FS hash for this work. `FsChallenger::new` defaults to
     // SHA-256, which would be a different chain entirely.
     let mut ch_p = FsChallenger::with_hash(INNER, HashKind::Blake3);
-    let (inner_proof, inner_commit, _) = prover::prove_fast_ligerito_jagged_union_mixed_class(
+    let (inner_proof, inner_commit, _) = prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
         &union,
         &inner_params,
         Vec::new(),
@@ -587,7 +587,7 @@ fn mvp_fs_chain_of_a_real_proof() {
 
     // Record the VERIFIER's transcript — that is what a recursive verifier replays.
     let mut rec = RecordingChallenger::new(FsChallenger::with_hash(INNER, HashKind::Blake3));
-    verifier::verify_ligerito_jagged_union_mixed_class(
+    verifier::verify_ligerito_jagged_union_mixed_class_merged(
         &union,
         &[],
         &inner_commit,

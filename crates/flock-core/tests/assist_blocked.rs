@@ -167,7 +167,9 @@ fn assist_shapes_probe() {
             "frobenius assist must verify [{label}]"
         );
 
-        // ---- Single-statement assist (the unmerged path).
+        // ---- Single-statement assist (spec-level `prove_assist`; its
+        // transport caller was removed with the jagged transport, the
+        // function remains the Lemma 4.6 reference).
         let (zr, zc, zi) = (rng.vec(n), rng.vec(k), rng.vec(m));
         let mut ap = FsChallenger::new(b"assist-blocked-probe");
         let aproof = prove_assist(&params, &zr, &zc, &zi, &mut ap);

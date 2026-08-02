@@ -28,7 +28,7 @@
 use flock_core::element_r1cs::{ElementTableBuilder, ElementTableType};
 use flock_core::field::F128;
 use flock_core::pcs::ligerito::LigeritoProfile;
-use flock_core::transcript_record::RecordingChallenger;
+use flock_core::transcript_record::{RecordingChallenger, TranscriptOp};
 use flock_prover::challenger::FsChallenger;
 use flock_prover::pcs::PcsParams;
 use flock_prover::prover::{self, UnionElementSlotInput};
@@ -140,7 +140,7 @@ fn record_element_only(
         .collect();
 
     let mut ch_p = RecordingChallenger::new(FsChallenger::new(DOMAIN));
-    let (proof, commitment, _claims_p) = prover::prove_fast_ligerito_jagged_union_mixed_class(
+    let (proof, commitment, _claims_p) = prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
         &union,
         &pcs_params,
         Vec::new(),
@@ -149,7 +149,7 @@ fn record_element_only(
     );
 
     let mut ch_v = RecordingChallenger::new(FsChallenger::new(DOMAIN));
-    verifier::verify_ligerito_jagged_union_mixed_class(
+    verifier::verify_ligerito_jagged_union_mixed_class_merged(
         &union,
         &[],
         &commitment,
@@ -186,15 +186,44 @@ fn element_only_transcript_shape_is_data_independent() {
     for (count, seed) in cases {
         let (shape_p, shape_v) = record_element_only(nu, &kappas, &[count], seed);
 
-        // Prover and verifier share one transcript, so their shapes must be
-        // equal — a differential over the entire FS order, for free.
-        assert_eq!(
-            shape_p.first_difference(&shape_v),
-            None,
-            "prover and verifier transcript shapes diverge at count={count} \
-             (op {:?}); FS order is broken",
-            shape_p.first_difference(&shape_v)
-        );
+        // Prover and verifier share one transcript, so the prover's shape
+        // must be a PREFIX of the verifier's: every op the prover performs,
+        // the verifier replays in the same order. On the merged transport
+        // the verifier legitimately continues past the prover's last op —
+        // the succinct Ligerito verifier's closing spot-check draws its
+        // base-level queries and β AFTER the proof is complete
+        // (`sample_queries` + `beta_last`), randomness the prover never
+        // needs. Those trailing ops must be SQUEEZES (or PoW) only: a
+        // verifier-only ABSORB really would be a broken FS order. (The
+        // removed jagged transport happened to be draw-symmetric end to
+        // end, which is why this test could assert strict equality before.)
+        match shape_p.first_difference(&shape_v) {
+            None => {}
+            Some(i) => {
+                assert_eq!(
+                    i,
+                    shape_p.ops().len(),
+                    "prover and verifier transcript shapes diverge MID-STREAM \
+                     at op {i} (count={count}); FS order is broken \
+                     (prover {:?} vs verifier {:?})",
+                    shape_p.ops().get(i),
+                    shape_v.ops().get(i),
+                );
+                for (j, op) in shape_v.ops()[i..].iter().enumerate() {
+                    assert!(
+                        matches!(
+                            op,
+                            TranscriptOp::SqueezeScalar
+                                | TranscriptOp::SqueezeSlice(_)
+                                | TranscriptOp::Pow { .. }
+                        ),
+                        "verifier-only op {} past the prover's end is not a \
+                         squeeze: {op:?} (count={count}); FS order is broken",
+                        i + j,
+                    );
+                }
+            }
+        }
 
         match &reference {
             None => reference = Some(shape_v),
@@ -220,10 +249,13 @@ fn element_only_transcript_shape_is_data_independent() {
 /// and record why in the re-pin history below.
 ///
 /// Re-pin history: initial pin (2026-07-31), element-only nu=12 kappa=3.
+/// Re-pinned 2026-08-02: element-only mixed-class moved to the MERGED
+/// transport (the jagged transport was removed); the shape now ends with
+/// the succinct verifier's trailing spot-check draws.
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn element_only_transcript_shape_is_pinned() {
-    const EXPECTED: &str = "2efd5caf0afbc530fc5df1ca2d859c128facddf15d7b99c4f852c0ac40ea1c79";
+    const EXPECTED: &str = "19d614e295cb6b121250cca6b8fef1d0ed00d49e7a20b28476f9e472ab649d9e";
 
     let (_, shape) = record_element_only(12, &[3], &[1 << 12], 0xB0DD_1E01);
 

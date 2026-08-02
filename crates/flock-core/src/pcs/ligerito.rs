@@ -2712,7 +2712,7 @@ fn fold_and_msg_lsb(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>, S
 /// element-wise would. That makes the rotation a matter of ADDRESSING rather
 /// than DATA: no `2^m`-word transpose of `q` and `W_ρ` (2 × 134 MB of traffic
 /// plus two big allocations at `M = 30`), and the emitted proof is
-/// byte-identical either way — see `pcs::open_batch_jagged_ligerito`.
+/// byte-identical either way — see the merged open (`pcs::open_batch_merged`).
 fn fold_and_msg_blocked(
     f: &[F128],
     b: &[F128],
@@ -3489,68 +3489,6 @@ pub(crate) fn recursive_prover_with_basis_precomputed_round0_lanes<Ch: Challenge
         challenger,
     )
     .0
-}
-
-/// Fusion entry for the jagged opening path
-/// (`pcs::open_batch_jagged_ligerito`). Produces a proof and transcript
-/// **byte-identical** to [`recursive_prover_with_basis_precomputed_round0`],
-/// then additionally:
-///
-/// 1. returns the fold challenges `ris` (all `log_n − yr_log_n` of them, in
-///    binding order: the `initial_k` L0 lane folds, then every recursive
-///    level's folds) alongside the proof — the caller needs them to evaluate
-///    the basis MLE at `ris ‖ ·` after the opening; and
-/// 2. mirrors the trailing challenger samples of
-///    [`recursive_verifier_with_basis_succinct`] (`alpha_last`, `beta_last` —
-///    drawn by the verifier after the final queries to bind `yr` to the last
-///    commitment) so a caller that continues the transcript past the Ligerito
-///    opening stays in lockstep with the verifier. The legacy entries end the
-///    transcript at the opening, so they never need this mirror.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn recursive_prover_with_basis_precomputed_round0_fused<Ch: Challenger>(
-    config: &ProverConfig,
-    packed_witness: Vec<F128>,
-    b_initial: Vec<F128>,
-    target: F128,
-    l0_codeword: &[F128],
-    l0_tree: &[Hash],
-    l0_num_lanes: usize,
-    l0_lane_major: bool,
-    l0_jit_basis: Option<BasisWindowFn<'_>>,
-    round0_uv: (F128, F128),
-    challenger: &mut Ch,
-) -> (LigeritoProof, Vec<F128>) {
-    let (proof, ris) = recursive_prover_with_basis_impl(
-        config,
-        packed_witness,
-        b_initial,
-        target,
-        l0_codeword,
-        l0_tree,
-        l0_num_lanes,
-        l0_lane_major,
-        if l0_lane_major {
-            l0_num_lanes
-        } else {
-            usize::MAX
-        },
-        l0_jit_basis,
-        Some(SumcheckMessage {
-            u_0: round0_uv.0,
-            u_2: round0_uv.1,
-        }),
-        challenger,
-    );
-    // Verifier mirror: the succinct verifier samples the last level's
-    // basis-induction challenge `alpha_last` (after the final queries) and the
-    // batching challenge `beta_last` for the yr-binding proximity tie. The
-    // values only feed the verifier's local final check — the prover's proof
-    // is already fully determined — but the samples advance the Fiat–Shamir
-    // state, so both sides must draw them before the transcript continues.
-    let num_queries_last = config.queries[config.recursive_steps];
-    let _alpha_last = challenger.sample_f128_vec(ceil_log2(num_queries_last));
-    let _beta_last = challenger.sample_f128();
-    (proof, ris)
 }
 
 /// Shared body of the `recursive_prover_with_basis*` entries. Returns the
