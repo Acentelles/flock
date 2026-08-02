@@ -675,7 +675,14 @@ pub fn prove_wiring<C: Challenger>(
         gather.push(v);
         claims.push(PackedDirectClaim {
             value: v,
-            eq_ind: DirectEqInd::Sparse(ring_switch::build_eq_sparse(&point)),
+            // DEFERRED: the merged open (the only transport) never reads
+            // `eq_ind` — it derives its identity-fold weights from
+            // `point`/`value` alone — so the `2^nu`-entry tensor per gate
+            // slot (~32 MiB at MVP-6's ~120 slots) is never built. A claim
+            // that DID need a materialized tensor would trip the combine's
+            // "EqPoint claims are only supported alone" assert rather than
+            // silently dropping the contribution.
+            eq_ind: DirectEqInd::EqPoint(point.clone()),
             point,
         });
     }
