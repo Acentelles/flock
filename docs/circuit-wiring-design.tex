@@ -744,10 +744,22 @@ model, given three things (all now designed or landed):
         \emph{landed}, see \S\ref{sec:replacement-sampling}; the rejection
         loop, the \code{HashSet} and the sort are gone, and the soundness
         re-accounting came out at \emph{no change to any query count}.
-        Merkle openings as \emph{full independent fixed-depth paths}
-        first ($\sim$30\% more hash work, fully static circuit), with
-        \emph{Merkle caps} (commit the top-$2^k$ layer; every path
-        shortens by $k$) as the later knob --- still owed. \settled{Ron}
+        Merkle openings: \emph{capped paths landed} \settled{Ron},
+        skipping the full-depth intermediate. Each tree commits its
+        depth-$c$ \emph{cap layer}, $c = \lceil \log_2 q \rceil$ clamped
+        to the tree depth, and the cap \emph{is} the commitment: the
+        $2^c$ nodes are absorbed into the transcript where the root used
+        to be, no root at all (\settled{Ron} --- a root over the cap is
+        pointless indirection). Openings are independent per-query paths
+        of $d-c$ siblings in sample order, duplicates simply repeated;
+        the octopus multi-proof is deleted. At $c = \lceil \log_2 q
+        \rceil$ the marginal cap doubling and the $q$ saved siblings per
+        level roughly cancel, which prices the whole feature at
+        $+24.1$\,KiB at $m{=}26$ Fast while native verifier pair hashes
+        \emph{drop} $2396 \to 2157 = \sum_\ell q_\ell (d_\ell -
+        c_\ell)$ --- cap verification hashes nothing (equality against
+        the absorbed layer), and proof size is now closed-form
+        deterministic. Wire format is \code{proof\_io} v7.
         The Merkle/FS hash is \textbf{BLAKE3 throughout} --- the
         $2\times$ circuit-size win inverts the native HW-SHA decision;
         the selectable-hash machinery is merged.
@@ -806,14 +818,16 @@ fewer independent position, and that is exactly what the bound above
 already charges for.
 
 \paragraph{Where the obligation moved.}
-Two, both native-side. The octopus multi-proof wants strictly ascending
-unique leaf positions, so the verifier now collapses the multiset itself
---- and while collapsing it must \emph{reject a prover that answered one
-position with two different rows}, since only one row per position
-reaches the Merkle check while every slot feeds the induced basis. That
-sort does not need to arithmetise: it disappears in-circuit under the
-other half of family J, where openings become independent fixed-depth
-paths and a duplicate is simply a repeated path.
+Nowhere, any longer. While the octopus multi-proof was the transport it
+wanted strictly ascending unique leaf positions, so the verifier
+collapsed the multiset itself --- and while collapsing it had to
+\emph{reject a prover that answered one position with two different
+rows}, since only one row per position reached the Merkle check while
+every slot fed the induced basis. With capped paths landed (the other
+half of family J) that machinery is deleted \emph{natively} as well:
+every slot carries its own path against the transcript-fixed cap, so a
+duplicate answered with two different rows fails its own path check,
+and no sort, dedup, or agreement check exists on either side.
 
 \paragraph{Consequence for the FS chain.}
 The draws are now a single batched squeeze per level rather than $q$
@@ -917,7 +931,10 @@ map and the multi-table document.
         \code{stream\_b} support (perf follow-up; unmerged path is the
         correctness oracle).
   \item Deferred: count-proportional element prover; LogUp bus;
-        capacity-tax refinement; Merkle caps; keccak batch-major tier.
+        capacity-tax refinement; keccak batch-major tier; the in-circuit
+        cap-node select (a $c$-bit multiplexer over the absorbed cap
+        words --- \code{MerklePathGate} still verifies full-depth paths
+        against its synthetic trees).
 \end{enumerate}
 
 % ===========================================================================

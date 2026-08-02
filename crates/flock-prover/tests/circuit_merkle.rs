@@ -193,6 +193,14 @@ impl MerklePathGate {
     /// bits, so the two agree only when `depth = log2(block_len)`. Asserting
     /// it here means a circuit cannot silently wire a challenge that the
     /// relation truncates differently than the sampler did.
+    ///
+    /// Real-protocol paths are CAPPED since Merkle capping landed: they are
+    /// `d − c` deep and the index's high `c` bits select a node of the
+    /// absorbed cap layer rather than folding to a root. That needs a
+    /// `c`-bit multiplexer over the cap words (plus the cap-absorb FS
+    /// obligation) — a new gadget deferred to the real-proof milestone.
+    /// This gate keeps full-depth paths against its synthetic trees, where
+    /// the assert above IS the index-binding argument.
     fn new(depth: usize, leaf_bytes: usize, nu: usize, block_len: usize) -> Self {
         assert!(
             block_len.is_power_of_two() && block_len.trailing_zeros() as usize == depth,
