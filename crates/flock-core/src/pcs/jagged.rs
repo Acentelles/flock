@@ -1355,17 +1355,50 @@ pub fn verify_assist<C: Challenger>(
 /// assist's branching program computes exactly this extension via its
 /// comparison state, so prover table and verifier evaluation agree by
 /// construction). `claims` = `(z_row, z_col, γ-baked fold table)` views.
+/// One claim's (or claim group's) contribution to the merged weight.
+pub(crate) enum MergedWeightClaim<'a> {
+    /// A ring-switched claim: its F₂-linear fold table applied to
+    /// `eq_row ⊗ eq_col` — additive but not F128-homogeneous, so it cannot
+    /// join a scalar group.
+    Folded {
+        z_row: &'a [F128],
+        z_col: &'a [F128],
+        table: &'a [F128],
+    },
+    /// A GROUP of γ-scaled (F128-linear) packed-direct claims sharing one
+    /// row point: `Σᵢ γᵢ·eq_rowᵢ(row)·eq_colᵢ(col) =
+    /// eq_row(row)·(Σᵢ γᵢ·eq_colᵢ(col))`, so the whole group costs ONE
+    /// multiply-sweep against the precombined (already γ-summed) column
+    /// table. Exact — field multiplication distributes and the sums
+    /// reassociate — so the produced `W` is bit-identical to per-claim
+    /// fold-table sweeps. This is what keeps the Φ-pass from scaling with
+    /// the circuit path's gather-claim count (~2^c claims, one shared
+    /// ρ_row).
+    Scalar { z_row: &'a [F128], cols: Vec<F128> },
+}
+
 pub(crate) fn build_merged_weight_and_prime(
     params: &JaggedParams,
-    claims: &[(&[F128], &[F128], &[F128])],
+    claims: &[MergedWeightClaim<'_>],
     q: &[F128],
 ) -> (Vec<F128>, (F128, F128)) {
     use rayon::prelude::*;
     let area = params.area() as usize;
     let n_total = 1usize << params.m;
-    let tabs: Vec<(Vec<F128>, Vec<F128>, &[F128])> = claims
+    enum ColSide<'a> {
+        Fold(Vec<F128>, &'a [F128]),
+        Combined(&'a [F128]),
+    }
+    let tabs: Vec<(Vec<F128>, ColSide<'_>)> = claims
         .iter()
-        .map(|&(zr, zc, t)| (build_eq_table(zr), build_eq_table(zc), t))
+        .map(|c| match c {
+            MergedWeightClaim::Folded { z_row, z_col, table } => {
+                (build_eq_table(z_row), ColSide::Fold(build_eq_table(z_col), *table))
+            }
+            MergedWeightClaim::Scalar { z_row, cols } => {
+                (build_eq_table(z_row), ColSide::Combined(cols.as_slice()))
+            }
+        })
         .collect();
     assert_eq!(q.len(), n_total);
     let mut w = crate::scratch::take_f128(n_total);
@@ -1393,7 +1426,7 @@ pub(crate) fn build_merged_weight_and_prime(
             // Zero the dead tail of this chunk (past the jagged area).
             out[(live_end - base) as usize..].fill(F128::ZERO);
             let mut first_claim = true;
-            for (eq_r, eq_c, tab) in tabs.iter() {
+            for (eq_r, side) in tabs.iter() {
                 let mut col = ps.partition_point(|&t| t <= base) - 1;
                 let mut e = base;
                 while e < live_end {
@@ -1401,17 +1434,35 @@ pub(crate) fn build_merged_weight_and_prime(
                         col += 1;
                     }
                     let seg_end = ps[col + 1].min(live_end);
-                    let c_hoist = eq_c[col];
                     let row0 = (e - ps[col]) as usize;
                     let dst = &mut out[(e - base) as usize..(seg_end - base) as usize];
                     let rows = &eq_r[row0..row0 + dst.len()];
-                    if first_claim {
-                        for (slot, &r) in dst.iter_mut().zip(rows) {
-                            *slot = crate::pcs::ring_switch::fold_one_slot(r * c_hoist, tab);
+                    match side {
+                        ColSide::Fold(eq_c, tab) => {
+                            let c_hoist = eq_c[col];
+                            if first_claim {
+                                for (slot, &r) in dst.iter_mut().zip(rows) {
+                                    *slot =
+                                        crate::pcs::ring_switch::fold_one_slot(r * c_hoist, tab);
+                                }
+                            } else {
+                                for (slot, &r) in dst.iter_mut().zip(rows) {
+                                    *slot +=
+                                        crate::pcs::ring_switch::fold_one_slot(r * c_hoist, tab);
+                                }
+                            }
                         }
-                    } else {
-                        for (slot, &r) in dst.iter_mut().zip(rows) {
-                            *slot += crate::pcs::ring_switch::fold_one_slot(r * c_hoist, tab);
+                        ColSide::Combined(cols) => {
+                            let c_hoist = cols[col];
+                            if first_claim {
+                                for (slot, &r) in dst.iter_mut().zip(rows) {
+                                    *slot = r * c_hoist;
+                                }
+                            } else {
+                                for (slot, &r) in dst.iter_mut().zip(rows) {
+                                    *slot += r * c_hoist;
+                                }
+                            }
                         }
                     }
                     e = seg_end;
@@ -1504,15 +1555,45 @@ fn frobenius_statements(
             }
         }
     }
+    // MERGE specs sharing a row point into one statement. A statement's
+    // whole contribution — its seed, every layer pass, and the verifier's
+    // closed-form expectation — is LINEAR in its per-column weights, and
+    // everything else it carries (`eq4s`, the suffix rows) depends only on
+    // `(z_row, ρ)`. So specs with identical `z_row` collapse into one
+    // statement whose column weights are the γ-weighted sum: exact (field
+    // sums and products reassociate), hence transcript-identical — the
+    // assist's `V` and round messages are sums over statements of forms
+    // linear in the weights. The circuit path's gather claims all share
+    // ρ_row, so its ~2^c statements become ONE; a ring-switched claim's 128
+    // Frobenius twists have distinct squared rows and stay singletons.
+    let mut groups: Vec<(Vec<F128>, Vec<(Vec<F128>, F128)>)> = Vec::new();
+    for (zr, zc, c) in specs {
+        match groups.iter_mut().find(|(g, _)| *g == zr) {
+            Some((_, members)) => members.push((zc, c)),
+            None => groups.push((zr, vec![(zc, c)])),
+        }
+    }
     // The suffix build parallelizes within the layer only when there are too
     // few statements for this outer dispatch to occupy the pool.
-    let inner = specs.len() < 16;
-    specs
+    let inner = groups.len() < 16;
+    groups
         .into_par_iter()
-        .map(|(zr, zc, c)| {
-            let mut cols = assist_columns_at(bounds, &zc);
-            for (w, _, _) in cols.iter_mut() {
-                *w *= c;
+        .map(|(zr, members)| {
+            let mut cols: Vec<(F128, u64, u64)> = Vec::new();
+            for (i, (zc, c)) in members.iter().enumerate() {
+                let mut cs = assist_columns_at(bounds, zc);
+                for (w, _, _) in cs.iter_mut() {
+                    *w *= *c;
+                }
+                if i == 0 {
+                    cols = cs;
+                } else {
+                    debug_assert_eq!(cols.len(), cs.len());
+                    for (dst, src) in cols.iter_mut().zip(cs) {
+                        debug_assert_eq!((dst.1, dst.2), (src.1, src.2));
+                        dst.0 += src.0;
+                    }
+                }
             }
             let eq4s: Vec<[F128; 4]> = (0..=m)
                 .map(|layer| {
