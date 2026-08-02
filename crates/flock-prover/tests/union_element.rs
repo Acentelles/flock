@@ -29,7 +29,7 @@
 
 use flock_core::element_r1cs::{ElementTableBuilder, ElementTableType};
 use flock_core::field::F128;
-use flock_core::proof::R1csProofMixedClassLigerito;
+use flock_core::proof::{R1csProofMixedClassLigerito, R1csProofMixedClassMerged};
 use flock_prover::challenger::FsChallenger;
 use flock_core::pcs::ligerito::LigeritoProfile;
 use flock_prover::challenger::Challenger as _;
@@ -1114,6 +1114,115 @@ fn mixed_class_proof_bytes_pinned() {
             &mut ch,
         );
         check(label, expected, bundle_digest(&proof, &commitment, &claims));
+    }
+}
+
+/// The MERGED mirror of [`bundle_digest`].
+fn bundle_digest_merged(
+    proof: &R1csProofMixedClassMerged,
+    commitment: &flock_prover::pcs::Commitment,
+    claims: &flock_core::proof::UnionClassClaims,
+) -> String {
+    let mut h = sha2_hash::Sha256::new();
+    h.update(bincode::serialize(proof).expect("proof serializes"));
+    h.update(commitment.root);
+    let mut absorb = |v: F128| {
+        h.update(v.lo.to_le_bytes());
+        h.update(v.hi.to_le_bytes());
+    };
+    if let Some(b) = &claims.boolean {
+        absorb(b.ab.value);
+        absorb(b.c.value);
+    }
+    if let Some(e) = &claims.element {
+        absorb(e.c_value);
+        absorb(e.lc_value);
+    }
+    let out = h.finalize();
+    out.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The MERGED mirror of [`mixed_class_proof_bytes_pinned`]: the same seven
+/// statements (same seeds, same witnesses) through the merged transport.
+/// Minted ahead of the jagged transport's removal — the merged mixed-class
+/// path previously had no absolute byte anchor at all, and the ELEMENT_ONLY
+/// half pins the element-only merged transcript at its birth (it exists
+/// only since `open_batch_merged` learned to skip an empty ring-switch
+/// batch).
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn mixed_class_merged_proof_bytes_pinned() {
+    const ELEMENT_ONLY: [(&str, usize, &str); 3] = [
+        ("elem-merged-nu12-full", 1 << 12, "aac66716936f5d9c6e337e7c9c289b6695ec66e74776d149c5cf7a9e8f5d664e"),
+        ("elem-merged-nu12-2731", 2731, "f3b484ba070ad5c1cbb8dd8dfb97a870d8ca47bb5059237379cbbfdea293c9ba"),
+        ("elem-merged-nu12-0", 0, "28378d181bf578f370ae53b4ef8d013e9d00dab6556ef272253435ca852bd439"),
+    ];
+    const MIXED: [(&str, [usize; 2], &str); 4] = [
+        ("mix-merged-nu7-128-128", [128, 128], "522edb70a0951e8b68365cb576a9425741b983a26706f3700a231321cfa93252"),
+        ("mix-merged-nu7-100-90", [100, 90], "edcde983e018d0b32b96e5a86fcf10a0a69f7cae5141e5e41cfbf8390a5361b7"),
+        ("mix-merged-nu7-0-90", [0, 90], "f74d2cc433879afc036543e8fe70a4443e44f309e1aa1a757d4dae47d8c0f8e5"),
+        ("mix-merged-nu7-100-0", [100, 0], "3aaa194c91595c605abc3ce8cd3992657a7de27eefb96f1f24ad77e7739ab700"),
+    ];
+
+    let (w0, w1) = (F128::new(0x51F0, 0), F128::new(0, 0x2C7E));
+
+    // ---- element-only ----
+    let (nu, kappa) = (12usize, 3usize);
+    let ty = gate_block(kappa, w0, w1);
+    let registry = Registry::new(vec![TableType::element(ty.clone())], nu);
+    for (label, n, expected) in ELEMENT_ONLY {
+        let union = UnionInstance::new(&registry, vec![n]);
+        let pcs_params = union_pcs_params(&union);
+        let mut rng = Rng::new(0xE1E_0000 ^ n as u64);
+        let z = gate_witness(&ty, nu, n, w0, w1, &mut rng);
+        let mut ch = FsChallenger::new(DOMAIN);
+        let (proof, commitment, claims) =
+            prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
+                &union,
+                &pcs_params,
+                Vec::new(),
+                vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
+                    dst.copy_from_slice(&z)
+                })],
+                &mut ch,
+            );
+        check(
+            label,
+            expected,
+            bundle_digest_merged(&proof, &commitment, &claims),
+        );
+    }
+
+    // ---- mixed ----
+    let (nu, kappa) = (7usize, 3usize);
+    let m = mixed_setup(nu, kappa);
+    let circuit = m.blake3_r1cs.csc_lincheck_circuit();
+    for (label, counts, expected) in MIXED {
+        let [n_bool, n_elem] = counts;
+        let union = UnionInstance::new(&m.registry, counts.to_vec());
+        let pcs_params = union_pcs_params(&union);
+        let mut rng = Rng::new(0xE1E_1000 ^ ((n_bool as u64) << 16) ^ n_elem as u64);
+        let inputs = random_blake3_inputs(&mut rng, n_bool);
+        let z_elem = gate_witness(&m.ty, nu, n_elem, m.w.0, m.w.1, &mut rng);
+        let mut ch = FsChallenger::new(DOMAIN);
+        let (proof, commitment, claims) =
+            prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
+                &union,
+                &pcs_params,
+                vec![UnionSlotProverInput::new(
+                    blake3::generate_witness_batch_major_partial(&inputs, nu),
+                    circuit,
+                )],
+                vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
+                    dst.copy_from_slice(&z_elem)
+                })],
+                &mut ch,
+            );
+        check(
+            label,
+            expected,
+            bundle_digest_merged(&proof, &commitment, &claims),
+        );
     }
 }
 

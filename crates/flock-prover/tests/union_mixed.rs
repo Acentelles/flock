@@ -1132,12 +1132,21 @@ fn merged_transport_roundtrip_and_tamper() {
                 "tampered proof ({what}) must be rejected at counts {counts:?}"
             );
         };
+        // Field-complete walk of MergedOpenProof: every field of the merged
+        // open is hit at least once (this is the surviving transport's
+        // tamper oracle once the jagged transport is removed).
         let mut bad = proof.clone();
-        bad.pcs_open.q_eval += F128::ONE;
-        reject(&bad, "q_eval");
+        bad.pcs_open.ring_switches[0].s_hat_v[0] += F128::ONE;
+        reject(&bad, "ring-switch s_hat_v");
         let mut bad = proof.clone();
         bad.pcs_open.merged_rounds[3].0 += F128::ONE;
         reject(&bad, "merged sumcheck round");
+        let mut bad = proof.clone();
+        bad.pcs_open.merged_rounds.pop();
+        reject(&bad, "merged sumcheck truncation");
+        let mut bad = proof.clone();
+        bad.pcs_open.q_eval += F128::ONE;
+        reject(&bad, "q_eval");
         let mut bad = proof.clone();
         bad.pcs_open.frobenius.v += F128::ONE;
         reject(&bad, "frobenius V");
@@ -1145,8 +1154,56 @@ fn merged_transport_roundtrip_and_tamper() {
         bad.pcs_open.frobenius.rounds[5].1 += F128::ONE;
         reject(&bad, "frobenius round");
         let mut bad = proof.clone();
+        bad.pcs_open.inner.ligerito.initial_root = [0u8; 32].into();
+        reject(&bad, "inner open initial root");
+        let mut bad = proof.clone();
         bad.zerocheck.round1_ab[0] += F128::ONE;
         reject(&bad, "zerocheck round 1");
+
+        // Statement tampers, ported from the jagged roundtrip's matrix: the
+        // binding absorbs registry digest + counts before any challenge.
+        {
+            let union_bad = UnionInstance::new(&registry, vec![counts[0], counts[1] - 1]);
+            let mut ch_v = FsChallenger::new(DOMAIN);
+            assert!(
+                verifier::verify_ligerito_jagged_union_merged(
+                    &union_bad,
+                    &circuits,
+                    &commitment,
+                    &proof,
+                    &pcs_params,
+                    &mut ch_v,
+                )
+                .is_err(),
+                "wrong counts vector must be rejected on the merged transport"
+            );
+        }
+        {
+            // `useful_bits + 1` rounds to the same chunk-column count, so the
+            // ONLY verifier-side divergence is the registry digest inside the
+            // binding — isolating it as load-bearing (same probe as the
+            // jagged matrix).
+            let mut blake3_ty = TableType::from_block_r1cs(&blake3_r1cs);
+            blake3_ty.useful_bits += 1;
+            let registry_bad =
+                Registry::new(vec![TableType::from_block_r1cs(&sha2_r1cs), blake3_ty], nu);
+            assert_ne!(registry.digest(), registry_bad.digest());
+            let union_bad = UnionInstance::new(&registry_bad, counts.to_vec());
+            assert_eq!(union.jagged_heights(), union_bad.jagged_heights());
+            let mut ch_v = FsChallenger::new(DOMAIN);
+            assert!(
+                verifier::verify_ligerito_jagged_union_merged(
+                    &union_bad,
+                    &circuits,
+                    &commitment,
+                    &proof,
+                    &pcs_params,
+                    &mut ch_v,
+                )
+                .is_err(),
+                "tampered registry digest must be rejected on the merged transport"
+            );
+        }
 
         // Params-vs-root binding: the transcript binds only the commitment
         // ROOT, but the opening reads the leaf width / lane count from
