@@ -1060,19 +1060,38 @@ pub fn open_batch_merged<Ch: Challenger>(
                 "packed-direct point/row/col split mismatch (no skip coordinate)"
             );
             let (zr, zc) = (&c.point[..n_log], &c.point[n_log..]);
-            let eq_c = crate::lincheck::build_eq_table(zc);
-            match groups.iter_mut().find(|(r, _)| *r == zr) {
-                Some((_, cols)) => {
-                    for (dst, e) in cols.iter_mut().zip(eq_c) {
+            // A Boolean column point's eq table is a one-hot indicator, so
+            // its γ-contribution is a single scatter — the gather claims'
+            // column parts are exactly this (`bits(word_col) ‖
+            // bits(slot_prefix)`), and building a 2^k_cols table per claim
+            // is k_cols-exponential waste (~2^20 per claim at MVP-5's
+            // composite registry). Random column points (the element
+            // claims) keep the dense build. Value-identical either way.
+            let hot: Option<usize> = zc.iter().enumerate().try_fold(0usize, |acc, (i, &x)| {
+                if x == F128::ZERO {
+                    Some(acc)
+                } else if x == F128::ONE {
+                    Some(acc | (1 << i))
+                } else {
+                    None
+                }
+            });
+            let cols = match groups.iter_mut().find(|(r, _)| *r == zr) {
+                Some((_, cols)) => cols,
+                None => {
+                    groups.push((zr, vec![F128::ZERO; 1 << k_cols]));
+                    &mut groups.last_mut().unwrap().1
+                }
+            };
+            match hot {
+                Some(h) => cols[h] += g,
+                None => {
+                    for (dst, e) in cols
+                        .iter_mut()
+                        .zip(crate::lincheck::build_eq_table(zc))
+                    {
                         *dst += g * e;
                     }
-                }
-                None => {
-                    let mut cols = eq_c;
-                    for e in cols.iter_mut() {
-                        *e = g * *e;
-                    }
-                    groups.push((zr, cols));
                 }
             }
         }
