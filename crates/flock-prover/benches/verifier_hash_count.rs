@@ -107,6 +107,11 @@ fn run(m: usize, rate: usize) {
     let mut ch_p = FsChallenger::new(b"flock-hash-count");
     let (proof, commitment, _) = setup.prove_fast(&blocks, &mut ch_p);
     println!("  (prove: {:.1} s)", t0.elapsed().as_secs_f64());
+    println!(
+        "  PCS open proof: {} B (+ {} cap nodes in the commitment)",
+        proof.pcs_open.ligerito.size_bytes(),
+        commitment.cap.len(),
+    );
 
     reset_counters();
     let mut ch_v = FsChallenger::new(b"flock-hash-count");

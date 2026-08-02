@@ -2362,11 +2362,6 @@ impl LigeroWitness {
         &self.mat[start..start + self.num_interleaved]
     }
 
-    #[inline]
-    pub fn root(&self) -> Hash {
-        self.tree[self.tree.len() - 1]
-    }
-
     /// The cap layer at depth `c` — this witness's commitment message.
     #[inline]
     pub fn cap(&self, c: usize) -> &[Hash] {
@@ -6687,37 +6682,6 @@ mod tests {
         size_breakdown_at(23, 4, vec![4, 4, 3, 3], vec![1, 2, 3, 4, 5]);
     }
 
-    /// Count the merkle multi-proof siblings that would be needed for `positions`
-    /// against a tree with `num_leaves` leaves. Same algorithm as
-    /// `merkle::merkle_multi_proof` but counts only — no tree allocation,
-    /// O(positions.len() · log num_leaves). For size estimation at scales where
-    /// the actual tree wouldn't fit in memory.
-    fn multi_proof_num_siblings(positions: &[usize], num_leaves: usize) -> usize {
-        let mut active: Vec<usize> = positions.to_vec();
-        active.sort_unstable();
-        active.dedup();
-        let mut sib_count = 0usize;
-        let mut level_len = num_leaves;
-        while level_len > 1 {
-            let mut next = Vec::with_capacity(active.len());
-            let mut i = 0;
-            while i < active.len() {
-                let p = active[i];
-                let sib_active = i + 1 < active.len() && active[i + 1] == (p ^ 1);
-                if sib_active {
-                    i += 2;
-                } else {
-                    sib_count += 1;
-                    i += 1;
-                }
-                next.push(p >> 1);
-            }
-            active = next;
-            level_len >>= 1;
-        }
-        sib_count
-    }
-
     /// Analytical size estimator — runs **only** the challenger-driven query
     /// sampling + merkle-multi-proof counting. Does NOT materialize the
     /// polynomial or any merkle tree, so it scales to m=29, m=30+.
@@ -6769,10 +6733,11 @@ mod tests {
         );
 
         // CLOSED FORM under capping: per tree, `q` capped paths of
-        // `d − c` siblings plus a `2^c`-node cap, `c = cap_depth(q, d)` —
-        // deterministic, no sampling. (`sib` counts paths + cap nodes.)
+        // `d − c` siblings plus a `2^c`-node cap (the commitment),
+        // `c = cap_depth(q, d)` — deterministic, no sampling.
         let mut total_opened = 0usize;
         let mut total_merkle = 0usize;
+        let mut total_caps = 0usize;
         for i in 0..=r {
             let bl = 1usize << log_block_len[i];
             let qn = queries_per_level[i];
@@ -6783,7 +6748,8 @@ mod tests {
                 return usize::MAX;
             }
             let c = merkle::cap_depth(qn, log_block_len[i]);
-            let sib = qn * (log_block_len[i] - c) + (1usize << c);
+            let sib = qn * (log_block_len[i] - c);
+            let cap_b = (1usize << c) * 32;
             let opened = qn * (1usize << log_num_interleaved[i]) * ELEM;
             let merkle = sib * 32;
             let label = if i == 0 {
@@ -6794,28 +6760,29 @@ mod tests {
                 "L{} (recursive)"
             };
             eprintln!(
-                "  {label} [bl=2^{}, lanes=2^{}, q={qn}]: opened={}  merkle={} ({} sibs)",
+                "  {label} [bl=2^{}, lanes=2^{}, q={qn}, c={c}]: opened={}  merkle={} ({} sibs)  cap={}",
                 log_block_len[i],
                 log_num_interleaved[i],
                 kb(opened),
                 kb(merkle),
                 sib,
+                kb(cap_b),
             );
             total_opened += opened;
             total_merkle += merkle;
+            total_caps += cap_b;
         }
         let yr_b = (1usize << yr_log_n) * ELEM;
-        let roots_b = (r + 1) * 32;
         // Transcript: 1 start + 1 intro per recursive boundary (R) + sum(k_i) folds, all (u_0, u_2).
         let sumcheck_msgs = 1 + r + recursive_ks.iter().sum::<usize>();
         let tx_b = sumcheck_msgs * 2 * ELEM;
-        let total = total_opened + total_merkle + yr_b + roots_b + tx_b;
+        let total = total_opened + total_merkle + total_caps + yr_b + tx_b;
         eprintln!(
-            "  TOTALS: opened={}  merkle={}  yr={}  roots={}  transcript={}  → GRAND={}",
+            "  TOTALS: opened={}  merkle={}  caps={}  yr={}  transcript={}  → GRAND={}",
             kb(total_opened),
             kb(total_merkle),
+            kb(total_caps),
             kb(yr_b),
-            kb(roots_b),
             kb(tx_b),
             kb(total),
         );
@@ -6829,15 +6796,11 @@ mod tests {
         // Measure the real proof at the same shape (cheap at m=20) instead of
         // hardcoding a baseline that goes stale when query counts change.
         let actual = size_breakdown_at(20, 4, vec![4, 3], vec![1, 2, 4]);
-        let diff = estimated.abs_diff(actual);
-        eprintln!("estimator={estimated}  actual={actual}  diff={diff}");
-        // Drift is from different challenger seeds producing different query
-        // positions (and hence slightly different octopus sibling counts).
-        // 5% is plenty of room.
-        assert!(
-            diff < actual / 20,
-            "estimator drift too large: {diff} bytes"
-        );
+        eprintln!("estimator={estimated}  actual={actual}");
+        // Under capping every term is deterministic — q·(d−c) path siblings
+        // and a 2^c cap per level, config-fixed opened rows, yr, transcript,
+        // nonces — so the estimate is EXACT, not a bound.
+        assert_eq!(estimated, actual, "the capped size estimate is closed-form");
     }
 
     /// **The headline measurement**: Ligerito at m=29 with decreasing rate.
@@ -8280,6 +8243,6 @@ mod tests {
             &ntt,
             HashKind::Sha256,
         );
-        assert_eq!(w.root(), w2.root());
+        assert_eq!(w.tree.last(), w2.tree.last());
     }
 }
