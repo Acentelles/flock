@@ -576,6 +576,55 @@ fn blake3_single_type_roundtrip_under_mixed_binding() {
     assert_eq!(claim_v, claim);
 }
 
+/// Identity compaction through the MERGED arm of `prove_union_with_binding`:
+/// a single-slot registry at full utilization leaves `dense_q` as `None`
+/// (q IS the padded buffer), which the merged arm must handle by cloning —
+/// it used to `expect` and panic. The shipped standalone body always handled
+/// this (`prove_fast_ligerito_jagged_union_merged`); this pins the enum path
+/// the mixed-class entries take.
+#[test]
+#[ignore] // Heavier — run with `cargo test -p flock-prover --test union_mixed -- --ignored`
+fn identity_compaction_roundtrips_over_the_merged_transport() {
+    let n_blocks = 256usize;
+    let setup = blake3::Blake3Setup::new_batch_major(n_blocks);
+    let mut rng = Rng::new(0x03_31_1D_B3);
+    let inputs = random_blake3_inputs(&mut rng, n_blocks);
+    let lc_circuit = setup.r1cs.csc_lincheck_circuit();
+
+    let registry = Registry::new(
+        vec![TableType::from_block_r1cs(&setup.r1cs)],
+        setup.r1cs.n_log(),
+    );
+    let union = UnionInstance::new(&registry, vec![n_blocks]);
+    assert!(
+        union.compaction_is_identity(),
+        "single slot at full utilization must be the identity compaction"
+    );
+    let slot = UnionSlotProverInput::new(
+        blake3::generate_witness_batch_major(&inputs, setup.n_blocks_log()),
+        lc_circuit,
+    );
+    let mut ch_p = FsChallenger::new(DOMAIN);
+    let (proof, commitment, claims) = prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
+        &union,
+        &setup.pcs_params,
+        vec![slot],
+        Vec::new(),
+        &mut ch_p,
+    );
+    let mut ch_v = FsChallenger::new(DOMAIN);
+    let claims_v = verifier::verify_ligerito_jagged_union_mixed_class_merged(
+        &union,
+        &[lc_circuit],
+        &commitment,
+        &proof,
+        &setup.pcs_params,
+        &mut ch_v,
+    )
+    .unwrap_or_else(|e| panic!("merged rejected an honest identity-compaction proof: {e:?}"));
+    assert_eq!(claims_v, claims);
+}
+
 /// Informational mixed-vs-singles prove-time smoke — prints prove wall
 /// times (including witness generation, matching `jagged_throughput`'s
 /// accounting) for the mixed instance and for the two single-type jagged

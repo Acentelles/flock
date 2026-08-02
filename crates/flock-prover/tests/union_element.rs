@@ -1573,3 +1573,101 @@ fn mixed_proofs_verify_over_the_merged_transport() {
         );
     }
 }
+
+/// Element-only registries produce ZERO ring-switched claims, so the merged
+/// open's ring-switch batch is empty — the `!x_outers.is_empty()` guard in
+/// `open_batch_merged` is what makes this proof possible at all (the batched
+/// ring-switch prover asserts a non-empty batch). This test is the birth
+/// certificate of the element-only MERGED transcript, and the
+/// cross-transport claims/root equality against the jagged element-only
+/// prove is the one differential check this path gets while the jagged
+/// transport still exists.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn element_only_proofs_verify_over_the_merged_transport() {
+    let mut rng = Rng::new(0x0E1E_4D47);
+    let (w0, w1) = (F128::new(7, 0), F128::new(0, 3));
+    // Full utilization, a partial count, and two slots of different widths —
+    // the same shape axes as `element_only_union_roundtrip`.
+    let shapes: Vec<(usize, Vec<usize>, Vec<usize>)> = vec![
+        (12, vec![3], vec![1 << 12]),
+        (12, vec![3], vec![2731]),
+        (11, vec![4, 2], vec![1000, 2048]),
+    ];
+    for (nu, kappas, counts) in shapes {
+        let tys: Vec<Arc<ElementTableType>> =
+            kappas.iter().map(|&k| gate_block(k, w0, w1)).collect();
+        let registry = Registry::new(
+            tys.iter().map(|t| TableType::element(t.clone())).collect(),
+            nu,
+        );
+        let slot_tys: Vec<Arc<ElementTableType>> = registry
+            .element_types()
+            .iter()
+            .map(|t| match &t.class {
+                flock_core::schedule::TableClass::LargeField(e) => e.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        let union = UnionInstance::new(&registry, counts.clone());
+        let pcs_params = union_pcs_params(&union);
+        let witnesses: Vec<Vec<F128>> = slot_tys
+            .iter()
+            .zip(&counts)
+            .map(|(t, &n)| gate_witness(t, nu, n, w0, w1, &mut rng))
+            .collect();
+        let element_slots = || -> Vec<UnionElementSlotInput<'_>> {
+            witnesses
+                .iter()
+                .map(|w| {
+                    UnionElementSlotInput::new(move |dst: &mut [F128]| dst.copy_from_slice(w))
+                })
+                .collect()
+        };
+
+        // Merged.
+        let mut ch_p = FsChallenger::new(DOMAIN);
+        let (merged, commitment, claims_m) =
+            prover::prove_fast_ligerito_jagged_union_mixed_class_merged(
+                &union,
+                &pcs_params,
+                Vec::new(),
+                element_slots(),
+                &mut ch_p,
+            );
+        assert!(merged.boolean.is_none(), "no boolean class");
+        assert!(
+            merged.pcs_open.ring_switches.is_empty(),
+            "element-only: the merged open must carry no ring-switched claims"
+        );
+        let mut ch_v = FsChallenger::new(DOMAIN);
+        let claims_v = verifier::verify_ligerito_jagged_union_mixed_class_merged(
+            &union,
+            &[],
+            &commitment,
+            &merged,
+            &pcs_params,
+            &mut ch_v,
+        )
+        .unwrap_or_else(|e| {
+            panic!("merged rejected an honest element-only proof (nu={nu}, counts={counts:?}): {e:?}")
+        });
+        assert_eq!(claims_v, claims_m);
+
+        // Jagged, same statement: the claims and the commitment are
+        // transport-independent.
+        let mut ch_j = FsChallenger::new(DOMAIN);
+        let (_, commitment_j, claims_j) = prover::prove_fast_ligerito_jagged_union_mixed_class(
+            &union,
+            &pcs_params,
+            Vec::new(),
+            element_slots(),
+            &mut ch_j,
+        );
+        assert_eq!(commitment_j.root, commitment.root, "same witness, same root");
+        assert_eq!(
+            claims_j, claims_m,
+            "the transports must agree on the element claims (nu={nu}, counts={counts:?})"
+        );
+    }
+}

@@ -1399,7 +1399,12 @@ fn prove_union_with_binding<Ch: Challenger>(
                 z_claims.iter().map(|cl| quirky_x_outer_full(&cl.point)).collect();
             let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
             let open = pcs::open_batch_merged(
-                dense_q.expect("the merged transport needs the dense stack"),
+                // The merged open consumes the dense stack. Identity
+                // compaction leaves `dense_q` as None (q IS the padded
+                // buffer); clone it — `z_packed` is still borrowed below as
+                // the ring-switch f-side. A prototype cost only (single-slot
+                // full-utilization registries), same as the shipped body.
+                dense_q.unwrap_or_else(|| z_packed.clone()),
                 &z_packed,
                 &prover_data,
                 &commitment,

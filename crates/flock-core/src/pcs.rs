@@ -1740,13 +1740,21 @@ pub fn open_batch_merged<Ch: Challenger>(
     let t_total = std::time::Instant::now();
     challenger.observe_label(b"flock-merged-open-v0");
     let t = std::time::Instant::now();
-    let (rs_results, gammas_rs) = ring_switch::prove_batched_padded_with_precomputed(
-        padded_witness,
-        x_outers,
-        precomputed_s_hat_v,
-        padding,
-        challenger,
-    );
+    // Element-only registries produce no ring-switched claims; skip the batch
+    // entirely (the callee asserts a non-empty batch). This branch DEFINES the
+    // element-only merged transcript: nothing is absorbed for the empty batch,
+    // exactly as in the mixed open's `n_rs > 0` guard.
+    let (rs_results, gammas_rs) = if !x_outers.is_empty() {
+        ring_switch::prove_batched_padded_with_precomputed(
+            padded_witness,
+            x_outers,
+            precomputed_s_hat_v,
+            padding,
+            challenger,
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
     if trace {
         eprintln!(
             "  [open_merged] ring_switch: {:6.2} ms",
