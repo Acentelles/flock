@@ -1914,12 +1914,28 @@ pub fn build_eq_sparse(coords: &[F128]) -> SparseEqTensor {
         }
     }
     let live_coords: Vec<F128> = live_positions.iter().map(|&i| coords[i]).collect();
-    // Sequential build_eq. `build_eq_parallel` *does* save ~0.4 ms on the build
-    // itself at 19 live coords, but the downstream `fold_1b_rows_sparse` /
-    // `fold_b128_elems_sparse_pairs` then pay cross-core L2/L3 traffic to
-    // consume a tensor that was distributed across worker caches — net wash to
-    // slight loss at the ring_switch level. Keep the tensor cache-local here.
-    let live_tensor = build_eq(&live_coords);
+    // Builder choice is size-gated, byte-identical either way (`build_eq_parallel`
+    // is documented byte-identical to `build_eq`):
+    //
+    // - Below the gate (chain/merkle sparse claims, ~19 live coords):
+    //   sequential. `build_eq_parallel` *does* save ~0.4 ms on the build
+    //   itself at 19 live coords, but the downstream `fold_1b_rows_sparse` /
+    //   `fold_b128_elems_sparse_pairs` then pay cross-core L2/L3 traffic to
+    //   consume a tensor that was distributed across worker caches — net wash
+    //   to slight loss at the ring_switch level. Keep the tensor cache-local.
+    // - At or above it (the union's element packed-direct claims: every
+    //   region address bit is random, up to `m_elem − 7` live coords):
+    //   parallel. At ≥ 2^20 entries the build itself dominates, and the
+    //   consumer there (`sparse_scatter_add_parallel`) is rayon-partitioned
+    //   by contiguous ranges, so worker-distributed pages land on the workers
+    //   that consume them — the same reasoning as the standalone element
+    //   path's dense `build_eq_parallel` build (`element_r1cs.rs`).
+    const PAR_LIVE_COORDS: usize = 20;
+    let live_tensor = if live_coords.len() >= PAR_LIVE_COORDS {
+        build_eq_parallel(&live_coords)
+    } else {
+        build_eq(&live_coords)
+    };
     SparseEqTensor {
         live_tensor,
         live_positions,

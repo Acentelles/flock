@@ -1355,6 +1355,26 @@ fn prove_union_with_binding<Ch: Challenger>(
         Some((_, claims)) => element_packed_direct_claims(claims),
         None => Vec::new(),
     };
+    // The deferred claims materialize per transport: only the jagged combine
+    // reads `eq_ind` (as a scattered Sparse tensor); the merged open derives
+    // its weights from `point`/`value` alone, so the deferred form rides
+    // through it unbuilt and the `2^(m_elem−7)`-entry tensors are never made.
+    let packed_direct = match transport {
+        Transport::Jagged => {
+            let t = std::time::Instant::now();
+            let packed_direct = materialize_deferred_eq(packed_direct);
+            if trace && !packed_direct.is_empty() {
+                eprintln!(
+                    "  [prove_union] element eq tensors (pd×{}, 2^{} each): {:7.2} ms",
+                    packed_direct.len(),
+                    union.m_elem() - 7,
+                    t.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            packed_direct
+        }
+        Transport::Merged => packed_direct,
+    };
     let t = std::time::Instant::now();
     let pcs_open = match transport {
         Transport::Jagged => UnionOpen::Jagged(open_claims_with_precomputed_jagged_ligerito(
@@ -1424,12 +1444,12 @@ fn prove_union_with_binding<Ch: Challenger>(
 /// The element class's two claims as packed-direct PCS claims, in the fixed
 /// order `[C at r, LC at (r_row, r'_col)]` — the order the verifier rebuilds.
 ///
-/// `DirectEqInd::Sparse` because the points' region-prefix coordinates are a
-/// fixed Boolean pattern: `build_eq_sparse` pins those index bits instead of
-/// doubling the tensor, so the eq support is the element region rather than the
-/// whole address space. (With no prefix — an element-only registry whose region
-/// IS the address space — it degrades to the dense tensor, which is correct and
-/// what the dense variant would have built anyway.)
+/// The claims ride as DEFERRED `DirectEqInd::EqPoint`: the shipped (merged)
+/// transport never reads `eq_ind` — `open_batch_merged` builds its own
+/// identity-fold weights from `point`/`value` — so materializing an eq
+/// tensor here would be `2^(m_elem−7)` F128 per claim of pure waste. Only
+/// the jagged transport consumes a materialized tensor; its arm converts
+/// via [`materialize_deferred_eq`] just before the open.
 fn element_packed_direct_claims(
     claims: &flock_core::element_r1cs::union::Claims,
 ) -> Vec<pcs::PackedDirectClaim> {
@@ -1441,9 +1461,37 @@ fn element_packed_direct_claims(
     .map(|(point, value)| pcs::PackedDirectClaim {
         point: point.clone(),
         value,
-        eq_ind: pcs::DirectEqInd::Sparse(pcs::ring_switch::build_eq_sparse(point)),
+        eq_ind: pcs::DirectEqInd::EqPoint(point.clone()),
     })
     .collect()
+}
+
+/// Materialize the deferred (`EqPoint`) claims into `Sparse` tensors for the
+/// jagged transport, whose combine scatters `γ·eq_ind` into `b_combined`
+/// (`sparse_scatter_add_parallel`); the merged transport skips this — it
+/// never reads `eq_ind`.
+///
+/// `DirectEqInd::Sparse` because the points' region-prefix coordinates are a
+/// fixed Boolean pattern: `build_eq_sparse` pins those index bits instead of
+/// doubling the tensor, so the eq support is the element region rather than the
+/// whole address space. (With no prefix — an element-only registry whose region
+/// IS the address space — it degrades to the dense tensor, which is correct and
+/// what the dense variant would have built anyway.)
+///
+/// The tensor is built from the claim's own `point`, so the result is
+/// value-identical to building it at claim-assembly time — the jagged
+/// transcript cannot move. If this conversion were ever forgotten, the
+/// combine's "EqPoint claims are only supported alone, with no RS claims"
+/// assert fails fast rather than silently dropping the contribution.
+fn materialize_deferred_eq(
+    mut claims: Vec<pcs::PackedDirectClaim>,
+) -> Vec<pcs::PackedDirectClaim> {
+    for c in &mut claims {
+        if matches!(c.eq_ind, pcs::DirectEqInd::EqPoint(_)) {
+            c.eq_ind = pcs::DirectEqInd::Sparse(pcs::ring_switch::build_eq_sparse(&c.point));
+        }
+    }
+    claims
 }
 
 /// Everything the prover produces *before* the PCS open: the zerocheck +
