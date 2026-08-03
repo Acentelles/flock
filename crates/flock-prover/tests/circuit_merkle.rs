@@ -6675,6 +6675,122 @@ fn mvp9_boolean_leaf_tape() {
         }
         let t_final = tsp;
 
+        // ---- the boolean zerocheck's multilinear rounds in-circuit ----
+        // The skip round (round1 interpolation at z) stays checker-native;
+        // its output seeds the chain as CHECKER-VALIDATED advice. The 16
+        // rounds are ZcRoundGate rows: eq weights t_i are the 7 baked
+        // ghash constants then the 9 r_outer squeeze wires, rho from the
+        // chain, msgs from the stream, g0 as advice with published-zero
+        // deltas — family I, no in-circuit inversion.
+        let (zc0, zc_rounds2) = {
+            use flock_core::transcript_record::TranscriptOp as Op4;
+            let ops2 = t_shape.ops();
+            let (mut v2, mut c2, mut f2, mut i2) = (0usize, 0usize, 0usize, 0usize);
+            let bump2 = |op: &Op4, v: &mut usize, c: &mut usize, f: &mut usize| {
+                if op.finalizes() {
+                    *f += 1;
+                }
+                match op {
+                    Op4::SqueezeScalar => *c += 1,
+                    Op4::SqueezeSlice(n) => *c += n,
+                    Op4::ObserveScalar => *v += 1,
+                    Op4::ObserveSlice(n) => *v += n,
+                    _ => {}
+                }
+            };
+            while !matches!(&ops2[i2], Op4::Label(l) if l.as_slice() == b"flock-zerocheck-v0") {
+                bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
+                i2 += 1;
+            }
+            i2 += 1;
+            // r_skip: SqueezeSlice(6)
+            bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
+            i2 += 1;
+            // r_outer: SqueezeSlice(9)
+            let (outer_ch, outer_fin) = (c2, f2);
+            bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
+            i2 += 1;
+            let r1ab_v = v2;
+            bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
+            i2 += 1;
+            let r1c_v = v2;
+            bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
+            i2 += 1;
+            let z_ch = c2;
+            bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
+            i2 += 1;
+            let mut rounds2 = Vec::new();
+            while matches!(ops2[i2], Op4::ObserveScalar)
+                && matches!(ops2[i2 + 1], Op4::ObserveScalar)
+                && matches!(ops2[i2 + 2], Op4::SqueezeScalar)
+            {
+                let g_v = v2;
+                bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
+                bump2(&ops2[i2 + 1], &mut v2, &mut c2, &mut f2);
+                let (ch, fin) = (c2, f2);
+                bump2(&ops2[i2 + 2], &mut v2, &mut c2, &mut f2);
+                rounds2.push((g_v, ch, fin));
+                i2 += 3;
+            }
+            ((outer_ch, outer_fin, r1ab_v, r1c_v, z_ch), rounds2)
+        };
+        let (outer_ch, outer_fin, r1ab_v, r1c_v, z_ch) = zc0;
+        // Native seed + g0/running chain.
+        use flock_core::zerocheck::multilinear::{
+            interpolate_at_z_combined, interpolate_at_z_on_lambda,
+        };
+        use flock_core::zerocheck::univariate_skip_optimized::{
+            medium_challenges_ghash, small_challenges_ghash,
+        };
+        let zval = chals[z_ch];
+        let c_eval = interpolate_at_z_on_lambda(&vals_rec[r1c_v..r1c_v + 64], 6, zval);
+        let combined: Vec<F128> = vals_rec[r1ab_v..r1ab_v + 64]
+            .iter()
+            .zip(&vals_rec[r1c_v..r1c_v + 64])
+            .map(|(a, b)| *a + *b)
+            .collect();
+        let zc_seed = interpolate_at_z_combined(&combined, 6, zval) + c_eval;
+        let mut t_vals: Vec<F128> = Vec::new();
+        t_vals.extend_from_slice(&small_challenges_ghash());
+        t_vals.extend_from_slice(&medium_challenges_ghash());
+        for j in 0..zc_rounds2.len() - 7 {
+            t_vals.push(chals[outer_ch + j]);
+        }
+        let mut g0_native = Vec::new();
+        let mut zc_run = zc_seed;
+        for (k2, &(g_v, ch, _)) in zc_rounds2.iter().enumerate() {
+            let (g1, gi) = (vals_rec[g_v], vals_rec[g_v + 1]);
+            let t = t_vals[k2];
+            let g0 = (zc_run + t * g1) * (F128::ONE + t).inv();
+            g0_native.push(g0);
+            let rho = chals[ch];
+            zc_run = g0 * (F128::ONE + rho) + g1 * rho + gi * rho * (F128::ONE + rho);
+        }
+        let zc_end_native = zc_run;
+        // The circuit chain.
+        let zslot = sb.slot(ZcRoundGate::new());
+        leaf_slot.push((500, zslot));
+        vals.push(zc_seed);
+        let zc_seed_w = sb.public_input();
+        let mut zrw = zc_seed_w;
+        let mut zc_deltas2: Vec<Wire> = Vec::new();
+        for (k2, &(g_v, _, fin)) in zc_rounds2.iter().enumerate() {
+            let t_w = if k2 < 7 {
+                vals.push(t_vals[k2]);
+                sb.public_input()
+            } else {
+                let j = k2 - 7;
+                let sq = &trace.squeezes[outer_fin];
+                outs[sq[j / 4]][j % 4]
+            };
+            let rho_w = outs[trace.squeezes[fin][0]][0];
+            vals.push(g0_native[k2]);
+            let g0w = sb.public_input();
+            let g = sb.gate(zslot, &[zrw, wv(g_v), wv(g_v + 1), t_w, rho_w, g0w, ow]);
+            zc_deltas2.push(g[0]);
+            zrw = g[1];
+        }
+
         for (a_wires, opens) in &to_publish {
             for w in a_wires {
                 sb.publish(*w);
@@ -6696,6 +6812,11 @@ fn mvp9_boolean_leaf_tape() {
         sb.publish(tw);
         sb.publish(runw);
         sb.publish(t_final);
+        sb.publish(zc_seed_w);
+        for d in &zc_deltas2 {
+            sb.publish(*d);
+        }
+        sb.publish(zrw);
         let shape = sb.finish().expect("valid leaf query-phase circuit");
         let hint_refs: Vec<&dyn std::any::Any> =
             hints.iter().map(|h| h as &dyn std::any::Any).collect();
@@ -6704,6 +6825,8 @@ fn mvp9_boolean_leaf_tape() {
         // ---- boundary checks: alphas, cap selects, and the enforced sums.
         let total_pub: usize = levels.len()
             + 3
+            + 2
+            + zc_rounds2.len()
             + 3 * pows.len()
             + levels
                 .iter()
@@ -6763,15 +6886,34 @@ fn mvp9_boolean_leaf_tape() {
                 );
             }
         }
+        // The zc block sits at the very tail: seed, deltas, end.
+        let zc_tail = 2 + zc_rounds2.len();
+        assert_eq!(
+            built.public[built.public.len() - zc_tail],
+            zc_seed,
+            "the zc seed advice is the native skip output"
+        );
+        for k2 in 0..zc_rounds2.len() {
+            assert_eq!(
+                built.public[built.public.len() - zc_tail + 1 + k2],
+                F128::ZERO,
+                "zc delta {k2}"
+            );
+        }
+        assert_eq!(
+            built.public[built.public.len() - 1],
+            zc_end_native,
+            "the zc chain ends at the native running claim"
+        );
         // The intake boundary: the advice target and the in-circuit
         // running, both checker-validated against the native replay.
         assert_eq!(
-            built.public[built.public.len() - 3],
+            built.public[built.public.len() - zc_tail - 3],
             native_target,
             "the RS target advice is the native gamma-combination"
         );
         assert_eq!(
-            built.public[built.public.len() - 2],
+            built.public[built.public.len() - zc_tail - 2],
             native_running,
             "the W-rounds fold the target to the native running claim"
         );
@@ -6804,7 +6946,7 @@ fn mvp9_boolean_leaf_tape() {
                 }
             }
             assert_eq!(
-                built.public[built.public.len() - 1],
+                built.public[built.public.len() - zc_tail - 1],
                 nt,
                 "the spine's final t_r matches the native replay"
             );
