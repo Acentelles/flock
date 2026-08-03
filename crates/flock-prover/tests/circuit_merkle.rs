@@ -7216,54 +7216,72 @@ fn mvp9_boolean_leaf_tape() {
         lcs_ord.sort_by_key(|(i, _)| *i);
         let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
             lcs_ord.into_iter().map(|(_, cc)| cc).collect();
-        let mut bool_slots: Vec<(usize, UnionSlotProverInput)> = vec![
-            (
-                shape.registry_slot(slots.b3),
-                UnionSlotProverInput::new(b3_wit, b3_lc),
-            ),
-            (
-                shape.registry_slot(slots.swap),
-                UnionSlotProverInput::new(swap_wit, swap_lc),
-            ),
-            (
-                shape.registry_slot(slots.spread),
-                UnionSlotProverInput::new(spread_wit, spread_lc),
-            ),
-        ];
-        bool_slots.sort_by_key(|(i, _)| *i);
-        let mut el_ord: Vec<(usize, Vec<F128>)> = leaf_slot
-            .iter()
-            .zip(els)
-            .map(|((_, sl), z)| (shape.registry_slot(*sl), z))
-            .collect();
-        el_ord.sort_by_key(|(i, _)| *i);
-        let el_inputs: Vec<UnionElementSlotInput> = el_ord
-            .into_iter()
-            .map(|(_, z)| {
-                UnionElementSlotInput::new(move |dst: &mut [F128]| dst.copy_from_slice(&z))
-            })
-            .collect();
-        let mut ch = FsChallenger::new(DOMAIN);
-        let (oproof, ocommit, _) = prover::prove_fast_ligerito_union_circuit(
-            &union_o,
-            &shape.circuit,
-            &built.public,
-            &pcs_o,
-            bool_slots.into_iter().map(|(_, x)| x).collect(),
-            el_inputs,
-            &mut ch,
+        let ((oproof, ocommit), prove_t) = timed(REPS, || {
+            let mut bool_slots: Vec<(usize, UnionSlotProverInput)> = vec![
+                (
+                    shape.registry_slot(slots.b3),
+                    UnionSlotProverInput::new(b3_wit.clone(), b3_lc),
+                ),
+                (
+                    shape.registry_slot(slots.swap),
+                    UnionSlotProverInput::new(swap_wit.clone(), swap_lc),
+                ),
+                (
+                    shape.registry_slot(slots.spread),
+                    UnionSlotProverInput::new(spread_wit.clone(), spread_lc),
+                ),
+            ];
+            bool_slots.sort_by_key(|(i, _)| *i);
+            let mut el_ord: Vec<(usize, Vec<F128>)> = leaf_slot
+                .iter()
+                .zip(els.clone())
+                .map(|((_, sl), z)| (shape.registry_slot(*sl), z))
+                .collect();
+            el_ord.sort_by_key(|(i, _)| *i);
+            let el_inputs: Vec<UnionElementSlotInput> = el_ord
+                .into_iter()
+                .map(|(_, z)| {
+                    UnionElementSlotInput::new(move |dst: &mut [F128]| dst.copy_from_slice(&z))
+                })
+                .collect();
+            let mut ch = FsChallenger::new(DOMAIN);
+            let (p, c, _) = prover::prove_fast_ligerito_union_circuit(
+                &union_o,
+                &shape.circuit,
+                &built.public,
+                &pcs_o,
+                bool_slots.into_iter().map(|(_, x)| x).collect(),
+                el_inputs,
+                &mut ch,
+            );
+            (p, c)
+        });
+        let (_, verify_t) = timed(REPS, || {
+            let mut ch = FsChallenger::new(DOMAIN);
+            verifier::verify_ligerito_union_circuit(
+                &union_o,
+                &shape.circuit,
+                &built.public,
+                &lcs,
+                &ocommit,
+                &oproof,
+                &pcs_o,
+                &mut ch,
+            )
+            .expect("the leaf query-phase circuit verifies")
+        });
+        println!(
+            "\nMVP-9 BOOLEAN LEAF (inner: blake3 workload m=22, rs×2 pd=0)\n  \
+             nu {} | dense_m {} | mu {} | b3 rows {}\n\n  \
+             medians of {REPS} runs, spread in brackets\n  \
+             PER PROOF     prove {prove_t} ms\n  \
+             verifier side {verify_t} ms | proof {:.1} KiB | {} threads\n",
+            nu,
+            union_o.dense_m(),
+            shape.circuit.cells().mu(),
+            b3_rows,
+            bincode::serialize(&oproof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
+            rayon::current_num_threads(),
         );
-        let mut ch = FsChallenger::new(DOMAIN);
-        verifier::verify_ligerito_union_circuit(
-            &union_o,
-            &shape.circuit,
-            &built.public,
-            &lcs,
-            &ocommit,
-            &oproof,
-            &pcs_o,
-            &mut ch,
-        )
-        .expect("the leaf query-phase circuit verifies");
     }
 }
