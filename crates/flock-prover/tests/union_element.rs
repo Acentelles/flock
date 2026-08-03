@@ -151,6 +151,7 @@ fn element_only_union_roundtrip() {
         (12, vec![3], vec![0]),        // empty table
         (11, vec![3, 3], vec![2048, 1365]), // two equal slots, M = 22
         (11, vec![4, 2], vec![1000, 2048]), // two slots of different widths
+        (8, vec![7], vec![200]),            // kappa = 7: the packed-word width
     ];
     for (nu, kappas, counts) in shapes {
         let tys: Vec<Arc<ElementTableType>> =
