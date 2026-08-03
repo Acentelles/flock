@@ -9113,6 +9113,28 @@ fn mvp10_leaf_outer_inner_tape() {
         )
         .expect("the swap outer verifies");
         let verify_ms = t0v.elapsed().as_secs_f64() * 1e3;
+        // The DEFERRED verify — what a parent node actually runs: no
+        // native sigma discharge (the O(2^mu) eval leaves as a foldable
+        // claim), no matrix work. The plain-vs-deferred gap IS sigma v1's
+        // cost, and route B is why recursion never pays it.
+        let t0d = std::time::Instant::now();
+        let mut ch2 = FsChallenger::new(DOMAIN);
+        verifier::verify_ligerito_union_circuit_deferred(
+            &union2,
+            &shape2.circuit,
+            &built2.public,
+            &lcs2,
+            &ocommit,
+            &oproof,
+            &pcs2,
+            &mut ch2,
+        )
+        .expect("the swap outer verifies deferred");
+        let deferred_ms = t0d.elapsed().as_secs_f64() * 1e3;
+        println!(
+            "  outer verify: plain {verify_ms:.0} ms | DEFERRED {deferred_ms:.0} ms \
+             (the gap = the native sigma discharge a parent never pays)"
+        );
         (
             b3_rows,
             nu2,
