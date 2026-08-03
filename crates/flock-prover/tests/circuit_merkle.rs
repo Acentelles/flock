@@ -5907,3 +5907,148 @@ fn mvp6_all_levels_collapsed() {
         shape.circuit.cells().num_gate_slots(),
     );
 }
+
+/// **Phase 2, step 1 — the boolean LEAF tape.** A real blake3 workload
+/// proof — the recursion tree's leaf shape (rs×2, pd = 0) — is natively
+/// verified under a RecordingChallenger, and the R = 2 multipoint region
+/// is located and validated field-for-field on the tape: 2×128 RS dual
+/// values, the γ^{128 i + j} schedule folding through the two-product
+/// rounds to the anchor's claimed v. The MVP-8-step-1 mirror for the leaf
+/// inner; the wires phase 2's assembly reads now have named indices.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn mvp9_boolean_leaf_tape() {
+    use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
+
+    let n_blocks = 256usize;
+    let setup = blake3::Blake3Setup::new_batch_major(n_blocks);
+    let mut rng = Rng(0x4D50_9B00);
+    let inputs: Vec<blake3::Compression> = (0..n_blocks)
+        .map(|_| {
+            let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+            let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+            let counter = ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64);
+            (cv, m, counter, 64u32, 11u32)
+        })
+        .collect();
+    let circuit = setup.r1cs.csc_lincheck_circuit();
+    let registry = flock_prover::schedule::Registry::new(
+        vec![TableType::from_block_r1cs(&setup.r1cs)],
+        setup.r1cs.n_log(),
+    );
+    let union = UnionInstance::new(&registry, vec![n_blocks]);
+    let slot = UnionSlotProverInput::new(
+        blake3::generate_witness_batch_major(&inputs, setup.n_blocks_log()),
+        circuit,
+    );
+    let mut ch = FsChallenger::new(DOMAIN);
+    let (proof, commitment, _claim) =
+        prover::prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
+
+    let mut rec = RecordingChallenger::new(FsChallenger::new(DOMAIN));
+    verifier::verify_ligerito_union(
+        &union,
+        &[circuit],
+        &commitment,
+        &proof,
+        &setup.pcs_params,
+        &mut rec,
+    )
+    .expect("the leaf workload proof verifies");
+    let t_shape = rec.shape();
+    let chals: Vec<F128> = rec.challenges().to_vec();
+    let vals_rec = rec.values();
+
+    // The leaf's opening shape: rs×2, pd = 0 — R = 2, P = 0.
+    let fro = &proof.pcs_open.frobenius;
+    assert_eq!(fro.values.len(), 2, "the boolean class contributes rs×2");
+    assert!(fro.values.iter().all(|v| v.len() == 128), "128 values per RS claim");
+    assert!(fro.group_values.is_empty(), "no packed-direct claims at the leaf");
+
+    // Locate the multipoint region with a minimal cursor (value/challenge
+    // ordinals), exactly as parse_open_levels does for the element inner.
+    let ops = t_shape.ops();
+    let (mut v, mut c, mut i) = (0usize, 0usize, 0usize);
+    let bump = |op: &Op, v: &mut usize, c: &mut usize| {
+        match op {
+            Op::SqueezeScalar => *c += 1,
+            Op::SqueezeSlice(n) => *c += n,
+            Op::ObserveScalar => *v += 1,
+            Op::ObserveSlice(n) => *v += n,
+            _ => {}
+        }
+    };
+    while !matches!(&ops[i], Op::Label(l) if l.as_slice() == b"flock-multipoint-twisted-v1") {
+        bump(&ops[i], &mut v, &mut c);
+        i += 1;
+    }
+    i += 1;
+    let mut val_vs = Vec::new();
+    while matches!(ops[i], Op::ObserveScalar) {
+        val_vs.push(v);
+        bump(&ops[i], &mut v, &mut c);
+        i += 1;
+    }
+    assert_eq!(val_vs.len(), 256, "2×128 RS dual values absorbed");
+    assert!(matches!(ops[i], Op::SqueezeScalar), "multipoint gamma");
+    let gamma = chals[c];
+    bump(&ops[i], &mut v, &mut c);
+    i += 1;
+    let mut rounds = Vec::new();
+    while matches!(ops[i], Op::ObserveScalar) {
+        let g_v = v;
+        for _ in 0..2 {
+            assert!(matches!(ops[i], Op::ObserveScalar));
+            bump(&ops[i], &mut v, &mut c);
+            i += 1;
+        }
+        assert!(matches!(ops[i], Op::SqueezeScalar), "mp round");
+        rounds.push((g_v, c));
+        bump(&ops[i], &mut v, &mut c);
+        i += 1;
+    }
+    assert!(
+        matches!(&ops[i], Op::Label(l) if l.as_slice() == b"flock-frobenius-assist-v0"),
+        "anchor label"
+    );
+    i += 1;
+    let anchor_v = v;
+    assert!(matches!(ops[i], Op::ObserveScalar));
+    bump(&ops[i], &mut v, &mut c);
+    i += 1;
+    let mut anchor_rounds = 0usize;
+    while matches!(ops[i], Op::ObserveScalar) {
+        for _ in 0..2 {
+            bump(&ops[i], &mut v, &mut c);
+            i += 1;
+        }
+        assert!(matches!(ops[i], Op::SqueezeScalar), "anchor round");
+        anchor_rounds += 1;
+        bump(&ops[i], &mut v, &mut c);
+        i += 1;
+    }
+    assert_eq!(rounds.len(), fro.rounds.len(), "two-product round count");
+    assert_eq!(anchor_rounds, fro.anchor.rounds.len(), "anchor round count");
+    assert_eq!(vals_rec[anchor_v], fro.anchor.v, "anchor v on the tape");
+
+    // The located stream words ARE the proof's RS dual values, in order.
+    for (k, &vi) in val_vs.iter().enumerate() {
+        assert_eq!(vals_rec[vi], fro.values[k / 128][k % 128], "RS value {k}");
+    }
+
+    // The accept chain with the R = 2 schedule: T0 = Σ γ^{128 i + j}·A_ij
+    // folds through the rounds to T_m == anchor.v.
+    let mut t = F128::ZERO;
+    let mut pw = F128::ONE;
+    for &vi in &val_vs {
+        t += pw * vals_rec[vi];
+        pw *= gamma;
+    }
+    for &(g_v, ch_ix) in &rounds {
+        let (g1, gi) = (vals_rec[g_v], vals_rec[g_v + 1]);
+        let r = chals[ch_ix];
+        let g0 = t + g1;
+        t = g0 + (g1 + g0 + gi) * r + gi * r * r;
+    }
+    assert_eq!(t, fro.anchor.v, "T_m must equal the anchor's claimed v (R = 2)");
+}
