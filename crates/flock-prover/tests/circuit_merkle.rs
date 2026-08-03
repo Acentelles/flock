@@ -6865,6 +6865,122 @@ fn mvp9_boolean_leaf_tape() {
             lrn
         };
 
+        // ---- the R = 2 multipoint chains ----
+        // T0 = Σ gamma^{128i+j}·A_ij over the 256 absorbed dual values
+        // (gamma-power chain + tr-row MACs), the rounds via mrslot,
+        // T_m + anchor.v published as a zero-delta, and the anchor's own
+        // rounds folded to an endpoint checked against the native replay.
+        // The anchor EXPECT (RS statements, ĝ closed form) stays
+        // checker-native with the family-H batch.
+        let (mp_gamma_fin, mp_rounds3, mp_anchor_v, mp_anchor_rounds3) = {
+            use flock_core::transcript_record::TranscriptOp as Op5;
+            let ops3 = t_shape.ops();
+            let (mut v3, mut c3, mut f3, mut i3) = (0usize, 0usize, 0usize, 0usize);
+            let bump3 = |op: &Op5, v: &mut usize, c: &mut usize, f: &mut usize| {
+                if op.finalizes() {
+                    *f += 1;
+                }
+                match op {
+                    Op5::SqueezeScalar => *c += 1,
+                    Op5::SqueezeSlice(n) => *c += n,
+                    Op5::ObserveScalar => *v += 1,
+                    Op5::ObserveSlice(n) => *v += n,
+                    _ => {}
+                }
+            };
+            while !matches!(&ops3[i3], Op5::Label(l) if l.as_slice() == b"flock-multipoint-twisted-v1")
+            {
+                bump3(&ops3[i3], &mut v3, &mut c3, &mut f3);
+                i3 += 1;
+            }
+            i3 += 1;
+            while matches!(ops3[i3], Op5::ObserveScalar) {
+                bump3(&ops3[i3], &mut v3, &mut c3, &mut f3);
+                i3 += 1;
+            }
+            let gfin = f3;
+            bump3(&ops3[i3], &mut v3, &mut c3, &mut f3);
+            i3 += 1;
+            let mut rds = Vec::new();
+            while matches!(ops3[i3], Op5::ObserveScalar) && !matches!(ops3[i3], Op5::Label(_)) {
+                if !matches!(ops3[i3 + 2], Op5::SqueezeScalar) {
+                    break;
+                }
+                let g_v = v3;
+                bump3(&ops3[i3], &mut v3, &mut c3, &mut f3);
+                bump3(&ops3[i3 + 1], &mut v3, &mut c3, &mut f3);
+                let (ch, fin) = (c3, f3);
+                bump3(&ops3[i3 + 2], &mut v3, &mut c3, &mut f3);
+                rds.push((g_v, ch, fin));
+                i3 += 3;
+            }
+            assert!(
+                matches!(&ops3[i3], Op5::Label(l) if l.as_slice() == b"flock-frobenius-assist-v0")
+            );
+            i3 += 1;
+            let av = v3;
+            bump3(&ops3[i3], &mut v3, &mut c3, &mut f3);
+            i3 += 1;
+            let mut ards = Vec::new();
+            while matches!(ops3[i3], Op5::ObserveScalar) {
+                let g_v = v3;
+                bump3(&ops3[i3], &mut v3, &mut c3, &mut f3);
+                bump3(&ops3[i3 + 1], &mut v3, &mut c3, &mut f3);
+                let (ch, fin) = (c3, f3);
+                bump3(&ops3[i3 + 2], &mut v3, &mut c3, &mut f3);
+                ards.push((g_v, ch, fin));
+                i3 += 3;
+            }
+            (gfin, rds, av, ards)
+        };
+        let mp_gamma_w = outs[trace.squeezes[mp_gamma_fin][0]][0];
+        let mut mp_t0 = zw;
+        let mut mp_pw = ow;
+        for (k3, &vi) in val_vs.iter().enumerate() {
+            mp_t0 = sb.gate(spine, &[zw, zw, zw, mp_t0, zw, zw, wv(vi), mp_pw, zw])[3];
+            if k3 + 1 < val_vs.len() {
+                mp_pw = sb.gate(spine, &[zw, zw, zw, zw, zw, zw, mp_pw, mp_gamma_w, zw])[3];
+            }
+        }
+        let mut mp_tm = mp_t0;
+        for &(g_v, _, fin) in &mp_rounds3 {
+            let r_w = outs[trace.squeezes[fin][0]][0];
+            mp_tm = sb.gate(mrslot, &[mp_tm, wv(g_v), wv(g_v + 1), r_w])[0];
+        }
+        let mp_delta = sb.gate(spine, &[zw, zw, zw, mp_tm, zw, zw, wv(mp_anchor_v), ow, zw])[3];
+        let mut anc = wv(mp_anchor_v);
+        for &(g_v, _, fin) in &mp_anchor_rounds3 {
+            let r_w = outs[trace.squeezes[fin][0]][0];
+            anc = sb.gate(mrslot, &[anc, wv(g_v), wv(g_v + 1), r_w])[0];
+        }
+        let anc_end_native = {
+            let mut t = vals_rec[mp_anchor_v];
+            for &(g_v, ch, _) in &mp_anchor_rounds3 {
+                let (g1, gi) = (vals_rec[g_v], vals_rec[g_v + 1]);
+                let r = chals[ch];
+                let g0 = t + g1;
+                t = g0 + (g1 + g0 + gi) * r + gi * r * r;
+            }
+            t
+        };
+
+        // ---- MatrixAssertion emission ----
+        // The deferred matrix work exits as bound publics: alpha and the
+        // lincheck round challenges (chain wires — the assertion's point),
+        // plus the matrix_evals as advice publics (they are NOT absorbed —
+        // deferral leaves them proof-side, pinned by the one-equation final
+        // check and the root discharge, both checker-native for now).
+        let mut assert_pub: Vec<Wire> = vec![alpha_w2];
+        for &(_, _, fin) in &lc_rounds2 {
+            assert_pub.push(outs[trace.squeezes[fin][0]][0]);
+        }
+        for &(a, b) in &proof.lincheck.matrix_evals {
+            vals.push(a);
+            assert_pub.push(sb.public_input());
+            vals.push(b);
+            assert_pub.push(sb.public_input());
+        }
+
         for (a_wires, opens) in &to_publish {
             for w in a_wires {
                 sb.publish(*w);
@@ -6892,15 +7008,22 @@ fn mvp9_boolean_leaf_tape() {
         }
         sb.publish(zrw);
         sb.publish(lcw);
+        sb.publish(mp_delta);
+        sb.publish(anc);
+        for w in &assert_pub {
+            sb.publish(*w);
+        }
         let shape = sb.finish().expect("valid leaf query-phase circuit");
         let hint_refs: Vec<&dyn std::any::Any> =
             hints.iter().map(|h| h as &dyn std::any::Any).collect();
         let built = shape.run(&vals, &hint_refs);
 
         // ---- boundary checks: alphas, cap selects, and the enforced sums.
+        let n_assert_pub = 1 + lc_rounds2.len() + 2 * proof.lincheck.matrix_evals.len();
         let total_pub: usize = levels.len()
             + 3
-            + 3
+            + 5
+            + n_assert_pub
             + zc_rounds2.len()
             + 3 * pows.len()
             + levels
@@ -6961,13 +7084,36 @@ fn mvp9_boolean_leaf_tape() {
                 );
             }
         }
-        // The zc + lc blocks sit at the very tail: seed, deltas, end, lc end.
+        // Tail order: [.., zc_end, lc_end, mp_delta, anc, assertion fields].
+        {
+            let base = built.public.len() - n_assert_pub;
+            assert_eq!(built.public[base], chals[alpha_ch2], "assertion alpha");
+            for (k4, &(_, ch, _)) in lc_rounds2.iter().enumerate() {
+                assert_eq!(built.public[base + 1 + k4], chals[ch], "assertion r {k4}");
+            }
+            let me_base = base + 1 + lc_rounds2.len();
+            for (k4, &(a, b)) in proof.lincheck.matrix_evals.iter().enumerate() {
+                assert_eq!(built.public[me_base + 2 * k4], a, "matrix eval a {k4}");
+                assert_eq!(built.public[me_base + 2 * k4 + 1], b, "matrix eval b {k4}");
+            }
+        }
+        let tail0 = built.public.len() - n_assert_pub;
         assert_eq!(
-            built.public[built.public.len() - 1],
+            built.public[tail0 - 2],
+            F128::ZERO,
+            "T_m + anchor.v is the multipoint zero-delta"
+        );
+        assert_eq!(
+            built.public[tail0 - 1],
+            anc_end_native,
+            "the anchor rounds end at the native claim"
+        );
+        assert_eq!(
+            built.public[tail0 - 3],
             lc_end_native,
             "the lincheck chain ends at the native running claim"
         );
-        let zc_tail = 3 + zc_rounds2.len();
+        let zc_tail = n_assert_pub + 5 + zc_rounds2.len();
         assert_eq!(
             built.public[built.public.len() - zc_tail],
             zc_seed,
@@ -6981,7 +7127,7 @@ fn mvp9_boolean_leaf_tape() {
             );
         }
         assert_eq!(
-            built.public[built.public.len() - 2],
+            built.public[tail0 - 4],
             zc_end_native,
             "the zc chain ends at the native running claim"
         );
