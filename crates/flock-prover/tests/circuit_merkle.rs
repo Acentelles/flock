@@ -6381,7 +6381,7 @@ fn mvp9_boolean_leaf_tape() {
                 }
             })
             .collect();
-        let (_start_v, piop_o, gammas_o, w_rounds, _mp2, _inner_pd2, _yr_v2, levels) =
+        let (start_v, piop_o, gammas_o, w_rounds, _mp2, inner_pd2, _yr_v2, levels) =
             parse_open_levels(t_shape.ops(), 32 * lig.initial_cap.len(), r);
         assert!(piop_o.is_none(), "a boolean tape has no element PIOP");
         assert!(gammas_o.is_empty(), "no packed-direct claims at the leaf");
@@ -6602,6 +6602,79 @@ fn mvp9_boolean_leaf_tape() {
             runw = sb.gate(mrslot, &[runw, wv(rr.g_v), wv(rr.g_v + 1), r_w])[0];
         }
 
+        // ---- the ligerito spine (2a on the leaf): start = gamma'·q_eval,
+        // eval/build per fold round, intro-folds for OODs and levels with
+        // the LeafEval accumulators consumed IN-CIRCUIT; the final t_r
+        // publishes and is checked against a native replay — equality
+        // transitively validates every eval/build/fold gate AND the accs.
+        vals.push(F128::ZERO);
+        let zw = sb.public_input();
+        vals.push(F128::ONE);
+        let ow = sb.public_input();
+        let spine = sb.slot(SpineGate::new());
+        leaf_slot.push((0, spine));
+        let gpw = outs[trace.squeezes[inner_pd2.fin][0]][0];
+        let tw0 = sb.gate(spine, &[zw, zw, zw, zw, zw, zw, wv(inner_pd2.q_v), gpw, zw]);
+        let mut tsp = tw0[3];
+        let st = sb.gate(
+            spine,
+            &[zw, zw, zw, zw, wv(start_v), wv(start_v + 1), tsp, ow, zw],
+        );
+        let (mut qc, mut qb, mut qa) = (st[0], st[1], st[2]);
+        for (li, lvl) in levels.iter().enumerate() {
+            for (j, &mv) in lvl.fold_msg_vs.iter().enumerate() {
+                let rw = outs[trace.squeezes[lvl.fold_fins[j]][0]][0];
+                let ev = sb.gate(spine, &[qc, qb, qa, zw, zw, zw, zw, zw, rw]);
+                tsp = ev[4];
+                let bld = sb.gate(
+                    spine,
+                    &[zw, zw, zw, zw, wv(mv), wv(mv + 1), tsp, ow, zw],
+                );
+                (qc, qb, qa) = (bld[0], bld[1], bld[2]);
+            }
+            if li < r {
+                for od in &lvl.ood {
+                    let bw = outs[trace.squeezes[od.beta_fin][0]][0];
+                    let f = sb.gate(
+                        spine,
+                        &[
+                            qc,
+                            qb,
+                            qa,
+                            tsp,
+                            wv(od.intro_v),
+                            wv(od.intro_v + 1),
+                            wv(od.y_v),
+                            bw,
+                            zw,
+                        ],
+                    );
+                    (qc, qb, qa, tsp) = (f[0], f[1], f[2], f[3]);
+                }
+                let bw = outs[trace.squeezes[lvl.beta_fin][0]][0];
+                let f = sb.gate(
+                    spine,
+                    &[
+                        qc,
+                        qb,
+                        qa,
+                        tsp,
+                        wv(lvl.intro_v),
+                        wv(lvl.intro_v + 1),
+                        level_accs[li],
+                        bw,
+                        zw,
+                    ],
+                );
+                (qc, qb, qa, tsp) = (f[0], f[1], f[2], f[3]);
+            } else {
+                let bw = outs[trace.squeezes[lvl.beta_fin][0]][0];
+                let f = sb.gate(spine, &[zw, zw, zw, tsp, zw, zw, level_accs[li], bw, zw]);
+                tsp = f[3];
+            }
+        }
+        let t_final = tsp;
+
         for (a_wires, opens) in &to_publish {
             for w in a_wires {
                 sb.publish(*w);
@@ -6622,6 +6695,7 @@ fn mvp9_boolean_leaf_tape() {
         }
         sb.publish(tw);
         sb.publish(runw);
+        sb.publish(t_final);
         let shape = sb.finish().expect("valid leaf query-phase circuit");
         let hint_refs: Vec<&dyn std::any::Any> =
             hints.iter().map(|h| h as &dyn std::any::Any).collect();
@@ -6629,7 +6703,7 @@ fn mvp9_boolean_leaf_tape() {
 
         // ---- boundary checks: alphas, cap selects, and the enforced sums.
         let total_pub: usize = levels.len()
-            + 2
+            + 3
             + 3 * pows.len()
             + levels
                 .iter()
@@ -6692,15 +6766,49 @@ fn mvp9_boolean_leaf_tape() {
         // The intake boundary: the advice target and the in-circuit
         // running, both checker-validated against the native replay.
         assert_eq!(
-            built.public[built.public.len() - 2],
+            built.public[built.public.len() - 3],
             native_target,
             "the RS target advice is the native gamma-combination"
         );
         assert_eq!(
-            built.public[built.public.len() - 1],
+            built.public[built.public.len() - 2],
             native_running,
             "the W-rounds fold the target to the native running claim"
         );
+        // The spine's t_r, against the native quad replay.
+        {
+            let quad = |u0: F128, u2: F128, t: F128| (u0, t + u2, u2);
+            let evalq = |q: (F128, F128, F128), x: F128| q.0 + x * q.1 + x * x * q.2;
+            let mut nt = chals[inner_pd2.ch] * vals_rec[inner_pd2.q_v];
+            let mut nq = quad(vals_rec[start_v], vals_rec[start_v + 1], nt);
+            for (li, lvl) in levels.iter().enumerate() {
+                for (j, &mv) in lvl.fold_msg_vs.iter().enumerate() {
+                    nt = evalq(nq, chals[lvl.fold_chs[j]]);
+                    nq = quad(vals_rec[mv], vals_rec[mv + 1], nt);
+                }
+                if li < levels.len() - 1 {
+                    for od in &lvl.ood {
+                        let b = chals[od.beta_ch];
+                        let iq =
+                            quad(vals_rec[od.intro_v], vals_rec[od.intro_v + 1], vals_rec[od.y_v]);
+                        nq = (nq.0 + b * iq.0, nq.1 + b * iq.1, nq.2 + b * iq.2);
+                        nt += b * vals_rec[od.y_v];
+                    }
+                    let b = chals[lvl.beta_ch];
+                    let iq =
+                        quad(vals_rec[lvl.intro_v], vals_rec[lvl.intro_v + 1], native_sums[li]);
+                    nq = (nq.0 + b * iq.0, nq.1 + b * iq.1, nq.2 + b * iq.2);
+                    nt += b * native_sums[li];
+                } else {
+                    nt += chals[lvl.beta_ch] * native_sums[li];
+                }
+            }
+            assert_eq!(
+                built.public[built.public.len() - 1],
+                nt,
+                "the spine's final t_r matches the native replay"
+            );
+        }
 
         // ---- prove / verify the leaf query-phase circuit ----
         let union_o = UnionInstance::new(&shape.registry, shape.counts.clone());
