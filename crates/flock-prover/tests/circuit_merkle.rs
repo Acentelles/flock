@@ -3018,6 +3018,57 @@ impl GateType for MergedRoundGate {
     }
 }
 
+/// Multiply-accumulate: `out = acc + x·y` — the workhorse of the multipoint
+/// intake (gamma-power chains, the `T0`/`V` sums, and zero-delta joins:
+/// `mac(a, b, one) = a + b` is the char-2 equality delta).
+struct MacGate {
+    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+}
+
+impl MacGate {
+    fn new() -> Self {
+        use flock_core::element_r1cs::ElementTableBuilder;
+        let o = F128::ONE;
+        // in: acc(0), x(1), y(2)
+        let mut b = ElementTableBuilder::new(3);
+        for w in 0..3 {
+            b.free_wire(w);
+        }
+        b.mult(3, 1, 2);
+        b.linear(4, &[(0, o), (3, o)]);
+        Self {
+            ty: std::sync::Arc::new(b.build().expect("mac gate")),
+        }
+    }
+}
+
+impl GateType for MacGate {
+    type Row = Vec<F128>;
+    type Hint = ();
+    fn table(&self) -> TableType {
+        use flock_core::schedule::IoWord;
+        let mut schema: Vec<IoWord> = (0..3).map(IoWord::input).collect();
+        schema.push(IoWord::output(4));
+        TableType::element(self.ty.clone()).with_io_schema(schema)
+    }
+    fn eval(&self, inputs: &[F128], _h: &()) -> (Vec<F128>, Self::Row) {
+        let mut z = vec![F128::ZERO; 5];
+        z[..3].copy_from_slice(&inputs[..3]);
+        z[3] = z[1] * z[2];
+        z[4] = z[0] + z[3];
+        (vec![z[4]], z)
+    }
+    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
+        let mut z = vec![F128::ZERO; self.ty.width() << nu];
+        for (j, row) in rows.iter().enumerate() {
+            for (col, &v) in row.iter().enumerate() {
+                z[(col << nu) + j] = v;
+            }
+        }
+        SlotWitness::Element(z)
+    }
+}
+
 /// One element-zerocheck round (degree-3, convention A): `g0` rides as
 /// ADVICE (a public input) and the gate enforces its defining identity as a
 /// published-zero delta — the family-I pattern, no in-circuit inversion:
@@ -4244,16 +4295,20 @@ fn mvp7_real_query_phase() {
         .collect();
     let sxslot = sb.slot(SuffixGate::new(yr_log));
     leaf_slot.push((300, sxslot));
+    // ONE prefix slot at pl_full serves every prefix length: shorter calls
+    // pad their (a, b) blocks with zero pairs — each padded factor is
+    // 1 + 0 + 0 = 1, so the wide gate is exact. (Was one slot per distinct
+    // pl: two extra kappa-6 types whose schemas alone were ~200K cells.)
     let mut pf_slots: Vec<(usize, flock_core::circuit::builder::SlotId)> = Vec::new();
     let mut pf_slot = |sb: &mut ShapeBuilder,
                        leaf_slot: &mut Vec<(usize, flock_core::circuit::builder::SlotId)>,
-                       pl: usize| {
-        match pf_slots.iter().find(|(n, _)| *n == pl) {
+                       _pl: usize| {
+        match pf_slots.first() {
             Some((_, sl)) => *sl,
             None => {
-                let sl = sb.slot(PrefixGate::new(pl));
-                leaf_slot.push((310 + pl, sl));
-                pf_slots.push((pl, sl));
+                let sl = sb.slot(PrefixGate::new(pl_full));
+                leaf_slot.push((310 + pl_full, sl));
+                pf_slots.push((pl_full, sl));
                 sl
             }
         }
@@ -4294,7 +4349,9 @@ fn mvp7_real_query_phase() {
             for j in 0..folded {
                 g_in.push(outs[sq[j / 4]][j % 4]);
             }
+            g_in.extend(std::iter::repeat_n(zw, pl_full - folded));
             g_in.extend_from_slice(&later);
+            g_in.extend(std::iter::repeat_n(zw, pl_full - folded));
             g_in.push(ow);
             let p = sb.gate(sl, &g_in)[0];
             let mut s_in = vec![p];
@@ -4324,6 +4381,35 @@ fn mvp7_real_query_phase() {
     Some(sb.gate(fdslot, &g_in)[0])
     };
 
+    // ---- MVP-8 step 2: the multipoint intake in-circuit ----
+    // T0 = Σ gamma^k·B_k (Mac chain over the absorbed group values), the m
+    // two-product rounds through the SAME MergedRoundGate slot the W-rounds
+    // use, and two zero-delta joins: T_m == anchor.v binds the round chain
+    // to the anchor's claimed evaluation, and running_W == q_eval·V with
+    // V = Σ B_k IN-CIRCUIT replaces the boundary's native v. The anchor's
+    // own rounds + expect (the AssistLayerGate chains) are step 3.
+    let macslot = sb.slot(MacGate::new());
+    leaf_slot.push((600, macslot));
+    let gamma_w = chw(&outs, &trace.squeezes, mp.gamma_fin);
+    let mut t0 = zw;
+    let mut vsum = zw;
+    let mut pw = ow;
+    for (k, &vi) in mp.val_vs.iter().enumerate() {
+        t0 = sb.gate(macslot, &[t0, pw, wv(vi)])[0];
+        vsum = sb.gate(macslot, &[vsum, wv(vi), ow])[0];
+        if k + 1 < mp.val_vs.len() {
+            pw = sb.gate(macslot, &[zw, pw, gamma_w])[0];
+        }
+    }
+    let mut tm = t0;
+    for rr in &mp.rounds {
+        let r_w = chw(&outs, &trace.squeezes, rr.fin);
+        tm = sb.gate(mrslot, &[tm, wv(rr.g_v), wv(rr.g_v + 1), r_w])[0];
+    }
+    let delta_tm = sb.gate(macslot, &[tm, wv(mp.anchor_v), ow])[0];
+    let qv = sb.gate(macslot, &[zw, wv(inner_pd.q_v), vsum])[0];
+    let delta_rq = sb.gate(macslot, &[running_w, qv, ow])[0];
+
     for (a_wires, opens) in &to_publish {
         for w in a_wires {
             sb.publish(*w);
@@ -4350,6 +4436,8 @@ fn mvp7_real_query_phase() {
     if let Some(w) = inner_w {
         sb.publish(w);
     }
+    sb.publish(delta_tm);
+    sb.publish(delta_rq);
     let shape = sb.finish().expect("valid real-query circuit");
     let setup_ms = t.elapsed().as_secs_f64() * 1e3;
 
@@ -4358,8 +4446,20 @@ fn mvp7_real_query_phase() {
     let (built, online_t) = timed(REPS, || shape.run(&vals, &hint_refs));
 
     // ---- the boundary checks ----
+    // The two multipoint zero-deltas sit at the very end of the public
+    // segment: T_m == anchor.v and running_W == q_eval·V.
+    assert_eq!(
+        built.public[built.public.len() - 2],
+        F128::ZERO,
+        "T_m must equal the anchor's claimed v (in-circuit)"
+    );
+    assert_eq!(
+        built.public[built.public.len() - 1],
+        F128::ZERO,
+        "running_W must equal q_eval·V (in-circuit V)"
+    );
     let yr_pub =
-        levels.len() * yr_len + usize::from(closeout) + 1 + piop.zc_rounds.len() + 3;
+        levels.len() * yr_len + usize::from(closeout) + 1 + piop.zc_rounds.len() + 3 + 2;
     let total_pub: usize = 1 + yr_pub
         + levels
             .iter()
