@@ -733,14 +733,34 @@ already put that entire verification path in-circuit. Concretely:
         multiplications.
 \end{enumerate}
 
-Open sub-questions, recorded for the design pass: the $\sigma$-table
-column encoding (commit $\hat s_\sigma$ directly as element-class
-columns, or the permutation in a form the GKR's fractional terms
-consume); whether witness and preprocessing share one commitment tree
-per level or stay separate (separate keeps the witness path untouched);
-and the exact absorb point of the preprocessing caps relative to
-\code{bind\_statement} (before the wiring GKR's $\alpha, \beta$, like
-every commitment).
+Open sub-questions for route A: the $\sigma$-table column encoding;
+shared vs.\ separate commitment trees; the preprocessing-cap absorb
+point.
+
+\paragraph{Route B --- defer $\sigma$ into the accumulator
+(recommended).} The cell space is $\mu = \nu + c$ bits, so the
+$\sigma$ table reshapes as a $2^{\nu} \times 2^{c}$ matrix and
+$\hat s_\sigma(\rho)$ with $\rho$ split into (row, col) coordinates is
+\emph{literally a} \code{MatrixClaim} --- the object the accumulator
+already folds. The outer circuit emits the GKR endpoint claim as a
+$\sigma$-family assertion (the assertion-emission machinery of the
+boundary contract, \S\ref{sec:boundary}); the accumulator folds
+same-shape $\sigma$ claims $2 \to 1$ at every merge node exactly as it
+folds the A/B claims (valid because shape normalisation makes $\sigma$
+identical at every internal node --- leaf inners are boolean-only and
+emit none); the root discharge evaluates $s_\sigma$ once, natively.
+In-circuit cost beyond emission: \emph{zero}. The price is the native
+fold, $O(2^{\mu})$ per merge node --- a few ms against a $\sim$60\,ms
+per-node budget.
+
+This is also the consistent choice: the comb faced the same
+delegate-vs-defer fork and DEFERRAL won (matrix-claim accumulation,
+succinct verify $\sim$1.9\,ms), and this section's own constraint ---
+one design for both --- then selects route B for $\sigma$ too. Route A
+stays the recorded fallback if per-node fold cost or accumulator-state
+growth ever bites. Route B makes shape normalisation load-bearing
+earlier (same-$\sigma$ folding needs one internal-node shape), which
+the closure plan requires regardless.
 
 % ===========================================================================
 \section{Why copy constraints and not a LogUp bus}\label{sec:logup}
