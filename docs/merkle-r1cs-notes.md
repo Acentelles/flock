@@ -1355,3 +1355,73 @@ against their own run's totals for exactly this reason.
   only remaining lever on the fold, at 2× the committed area. Worth it only if
   the fold is still the bottleneck after the PCS-opening work, which at 115 ms
   total verify it no longer is.
+
+---
+
+## 2026-08-03 — `jagged.rs` shrunk: the assist code is gone
+
+Every measurement above that names `verify_frobenius_assist`,
+`prove_frobenius_assist`, `prove_assist`/`verify_assist`, `f_hat_t`,
+`prove_multipoint_twisted`, or the `aligned_vs_assist_verifier_cost` probe was
+taken against code that **no longer exists**. The numbers stand as the record of
+why the assist was dropped; the functions do not. Do not go looking for them.
+
+`crates/flock-core/src/pcs/jagged.rs` went **4,943 → 544 lines** (89% cut; ~390
+of what remains is the kept code, the rest the new tests). What survives
+is only what the shipped merged transport actually reaches:
+
+| Kept | Reached from |
+|---|---|
+| `JaggedParams` (`from_heights`, `area`, `unrank`) | the flat-geometry cross-check in `jagged_fancy`; `union`'s column-major compaction tests |
+| `point_bit`, `int_bit` | both branching programs |
+| `MergedWeightClaim`, `build_merged_weight_and_prime` | `pcs::open_batch_merged`; the column-major reference in `row_major_vs_column_major_weight_build` |
+| `FrobeniusClaim` | `pcs::open_batch_merged` / `verify_batch_merged` → `jagged_fancy::twisted_weight_aligned_batched` |
+| `fold_round_claim`, `fold_oop_par`, `fold_and_round_oop_par` | the merged sumcheck |
+
+Removed: the basic jagged sumcheck (`prove`/`verify`, `generate_f_and_claim*`,
+`replay_rounds`), the width-4 `f̂_t` evaluator and its BP, the §5 jagged assist
+(including the blocked run-tree `AssistBlocks` and the Lemma 4.6 streaming
+prover), the batched Frobenius assist, `prove_with_assist`/`verify_with_assist`,
+the multipoint-twisted transport, and the inverse-Frobenius/Moore machinery
+(`sqrt_basis`, `frob_inv`, `rho_inverse_powers`, `inv_frob_basis`,
+`linear_byte_tables`, `assist_g_values`). Also deleted:
+`crates/flock-core/tests/assist_blocked.rs` and `jagged_fancy`'s
+`aligned_vs_assist_verifier_cost` probe (its baseline no longer compiles).
+
+Two independent causes, worth separating: upstream's replacement of the
+standalone jagged transport with the merged one orphaned `prove`/`verify` and
+everything below them; §6 per-table evaluation plus the ρ-side hoist orphaned
+the assists. Neither is a candidate for revival — the first because the
+transport is gone, the second because direct evaluation now *wins*.
+
+**The Frobenius decomposition is untouched and still load-bearing.** It is not
+the assist. `ring_switch::linearized_coefficients` still builds the `c_{i,j}`
+(`pcs.rs:1181` prover, `1363`/`1377` verifier), `FrobeniusClaim` still carries
+them, and `twisted_weight_aligned_batched` still walks
+`Ŵ(ρ) = Σ_i Σ_j c_{i,j}·f̂(z_i^{2^j}, ρ)` with the `z ← z²` squaring loop. Only
+the sumcheck that used to prove that value on the prover's behalf is gone.
+
+New coverage: the three fold kernels had no correctness test of their own — the
+only code walking them was the `runtime_m25`/`scaling_diag` benchmarks, which
+went with the rest. `round_folding_preserves_the_sumcheck_claim` now checks the
+round invariant end to end (folded claim = `Σ a'·b'`, and the fused message
+matches a serial reference) at every size from 64 down to 1, plus two smaller
+tests pinning `fold_round_claim`'s char-2 encoding and the bit accessors.
+
+Verified: `cargo build --workspace` clean; 510 fast tests pass; all ignored
+suites pass (`flock-core --lib` 12, `flock-prover --tests` 57); **all 6
+byte-identity fixtures unchanged** — the 4 `m6_merged_union_proof_bytes_pinned`
+digests and the 2 single-slot anchors, which is the proof that this was pure
+dead-code removal and not a protocol change. `cargo fmt --check` clean. Clippy
+went 9 warnings → 4, all 4 pre-existing (`jagged.rs:207` is verbatim-carried,
+the other 3 are in `union_element.rs`/`union_mixed.rs`).
+
+One pre-existing failure, unrelated and confirmed identical at HEAD in a
+throwaway worktree: `pcs::tests::pcs_ligerito_backend_roundtrip` panics in
+`ligerito.rs:3144` (`sample_distinct_queries: count (103) > block_len (64)`) —
+an `#[ignore]`d test with a too-thin config.
+
+Not done, still dead, deliberately left: `FancyJaggedParams` / `f_hat_fancy` in
+`jagged_fancy.rs`. Unreachable from production, but they are the §6-faithful
+reference that `f_hat_aligned` (the prefix-selected variant that *is* shipped)
+is cross-checked against in four tests. That is worth more than the lines cost.
