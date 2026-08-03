@@ -6381,7 +6381,7 @@ fn mvp9_boolean_leaf_tape() {
                 }
             })
             .collect();
-        let (start_v, piop_o, gammas_o, w_rounds, _mp2, inner_pd2, _yr_v2, levels) =
+        let (start_v, piop_o, gammas_o, w_rounds, _mp2, inner_pd2, yr_v2, levels) =
             parse_open_levels(t_shape.ops(), 32 * lig.initial_cap.len(), r);
         assert!(piop_o.is_none(), "a boolean tape has no element PIOP");
         assert!(gammas_o.is_empty(), "no packed-direct claims at the leaf");
@@ -6865,6 +6865,118 @@ fn mvp9_boolean_leaf_tape() {
             lrn
         };
 
+        // ---- the residual region (mvp7's 2b, ported to the leaf) ----
+        // Per-level ResidualGates compute the induced-basis residuals
+        // (next_s chain from a boundary-bound q_field, prefix over LATER
+        // levels' fold wires, suffix subset products), and the close-out
+        // (prefix/suffix/partial-combine/final-dot) assembles eval_b and
+        // dots the absorbed yr words — `inner == t_r` then closes between
+        // circuit outputs, exactly as on mvp7.
+        let yr_log = {
+            let yl = proof.pcs_open.inner.ligerito.final_proof.yr.len();
+            assert!(yl.is_power_of_two());
+            yl.trailing_zeros() as usize
+        };
+        let yr_len = 1usize << yr_log;
+        let mut resid_pub: Vec<Vec<Wire>> = Vec::new();
+        for (li, lvl) in levels.iter().enumerate() {
+            let pl: usize = levels[li + 1..].iter().map(|l| l.fold_fins.len()).sum();
+            let lmc = pl + yr_log;
+            let sks = sk_at_vks(lmc);
+            let rslot = sb.slot(ResidualGate::new(lmc, pl, yr_log, &sks));
+            leaf_slot.push((100 + li, rslot));
+            let ris_w: Vec<Wire> = levels[li + 1..]
+                .iter()
+                .flat_map(|l| l.fold_fins.iter().map(|&f| outs[trace.squeezes[f][0]][0]))
+                .collect();
+            let alpha_vals: Vec<F128> = (0..lvl.a_count).map(|j| chals[lvl.a_ch + j]).collect();
+            let aw = build_eq_table(&alpha_vals);
+            let mut accs: Vec<Wire> = (0..yr_len).map(|_| zw).collect();
+            for k in 0..geo[li].q {
+                let pos = (chals[lvl.q_ch + k].lo as usize) & ((1usize << geo[li].depth) - 1);
+                vals.push(F128::new(pos as u64, 0));
+                let qf = sb.public_input();
+                vals.push(aw[k]);
+                let awp = sb.public_input();
+                let mut g_in = vec![qf];
+                g_in.extend_from_slice(&ris_w);
+                g_in.push(awp);
+                g_in.push(ow);
+                g_in.extend_from_slice(&accs);
+                accs = sb.gate(rslot, &g_in);
+            }
+            resid_pub.push(accs);
+        }
+        let pl_full: usize = levels.iter().map(|l| l.fold_fins.len()).sum();
+        let ris_full: Vec<Wire> = levels
+            .iter()
+            .flat_map(|l| l.fold_fins.iter().map(|&f| outs[trace.squeezes[f][0]][0]))
+            .collect();
+        let sxslot = sb.slot(SuffixGate::new(yr_log));
+        leaf_slot.push((300, sxslot));
+        let pfslot2 = sb.slot(PrefixGate::new(pl_full));
+        leaf_slot.push((310 + pl_full, pfslot2));
+        let mut evb_accs: Vec<Wire> = (0..yr_len).map(|_| zw).collect();
+        {
+            assert_eq!(w_rounds.len(), pl_full + yr_log, "rho spans the dense domain");
+            let mut g_in = vec![outs[trace.squeezes[inner_pd2.fin][0]][0]];
+            for rr in &w_rounds[..pl_full] {
+                g_in.push(outs[trace.squeezes[rr.fin][0]][0]);
+            }
+            g_in.extend_from_slice(&ris_full);
+            g_in.push(ow);
+            let pw2 = sb.gate(pfslot2, &g_in)[0];
+            let mut s_in = vec![pw2];
+            for rr in &w_rounds[pl_full..] {
+                s_in.push(outs[trace.squeezes[rr.fin][0]][0]);
+            }
+            s_in.push(ow);
+            s_in.extend_from_slice(&evb_accs);
+            evb_accs = sb.gate(sxslot, &s_in);
+        }
+        for (li, lvl) in levels.iter().enumerate() {
+            for od in &lvl.ood {
+                let folded = od.z_len - yr_log;
+                let later: Vec<Wire> = levels[li + 1..]
+                    .iter()
+                    .flat_map(|l| l.fold_fins.iter().map(|&f| outs[trace.squeezes[f][0]][0]))
+                    .collect();
+                assert_eq!(later.len(), folded, "OOD prefix = later folds");
+                let sq = &trace.squeezes[od.z_fin];
+                let mut g_in = vec![outs[trace.squeezes[od.beta_fin][0]][0]];
+                for j in 0..folded {
+                    g_in.push(outs[sq[j / 4]][j % 4]);
+                }
+                g_in.extend(std::iter::repeat_n(zw, pl_full - folded));
+                g_in.extend_from_slice(&later);
+                g_in.extend(std::iter::repeat_n(zw, pl_full - folded));
+                g_in.push(ow);
+                let pw2 = sb.gate(pfslot2, &g_in)[0];
+                let mut s_in = vec![pw2];
+                for j in 0..yr_log {
+                    let jj = folded + j;
+                    s_in.push(outs[sq[jj / 4]][jj % 4]);
+                }
+                s_in.push(ow);
+                s_in.extend_from_slice(&evb_accs);
+                evb_accs = sb.gate(sxslot, &s_in);
+            }
+        }
+        let pcslot = sb.slot(PartialCombineGate::new(yr_log));
+        leaf_slot.push((301, pcslot));
+        let mut comb = evb_accs;
+        for (li, lvl) in levels.iter().enumerate() {
+            let mut g_in = vec![outs[trace.squeezes[lvl.beta_fin][0]][0]];
+            g_in.extend_from_slice(&comb);
+            g_in.extend_from_slice(&resid_pub[li]);
+            comb = sb.gate(pcslot, &g_in);
+        }
+        let fdslot = sb.slot(FinalDotGate::new(yr_log));
+        leaf_slot.push((302, fdslot));
+        let mut g_in: Vec<Wire> = (0..yr_len).map(|y| wv(yr_v2 + y)).collect();
+        g_in.extend_from_slice(&comb);
+        let inner_w = sb.gate(fdslot, &g_in)[0];
+
         // ---- the R = 2 multipoint chains ----
         // T0 = Σ gamma^{128i+j}·A_ij over the 256 absorbed dual values
         // (gamma-power chain + tr-row MACs), the rounds via mrslot,
@@ -6999,6 +7111,12 @@ fn mvp9_boolean_leaf_tape() {
                 sb.publish(*w);
             }
         }
+        for accs in &resid_pub {
+            for w in accs {
+                sb.publish(*w);
+            }
+        }
+        sb.publish(inner_w);
         sb.publish(tw);
         sb.publish(runw);
         sb.publish(t_final);
@@ -7021,6 +7139,8 @@ fn mvp9_boolean_leaf_tape() {
         // ---- boundary checks: alphas, cap selects, and the enforced sums.
         let n_assert_pub = 1 + lc_rounds2.len() + 2 * proof.lincheck.matrix_evals.len();
         let total_pub: usize = levels.len()
+            + levels.len() * yr_len
+            + 1
             + 3
             + 5
             + n_assert_pub
@@ -7057,6 +7177,108 @@ fn mvp9_boolean_leaf_tape() {
                 built.public[at2 + li],
                 *want,
                 "L{li} enforced sum matches the native replica"
+            );
+        }
+        // The residual accumulators, against the native induced-basis
+        // replica (sks replicated via sk_at_vks — the mvp7 discipline).
+        let resid_base = at2 + native_sums.len() + 3 * pows.len();
+        let mut resid_native: Vec<Vec<F128>> = vec![vec![F128::ZERO; yr_len]; levels.len()];
+        {
+            let mut at3 = resid_base;
+            for (li, lvl) in levels.iter().enumerate() {
+                let pl: usize = levels[li + 1..].iter().map(|l| l.fold_fins.len()).sum();
+                let lmc = pl + yr_log;
+                let sks = sk_at_vks(lmc);
+                let inv = |v: F128| if v == F128::ZERO { F128::ZERO } else { v.inv() };
+                let ris: Vec<F128> = levels[li + 1..]
+                    .iter()
+                    .flat_map(|l| l.fold_chs.iter().map(|&i| chals[i]))
+                    .collect();
+                let alpha_vals: Vec<F128> =
+                    (0..lvl.a_count).map(|j| chals[lvl.a_ch + j]).collect();
+                let aw = build_eq_table(&alpha_vals);
+                for y in 0..yr_len {
+                    let mut sum = F128::ZERO;
+                    for k in 0..geo[li].q {
+                        let pos = (chals[lvl.q_ch + k].lo as usize)
+                            & ((1usize << geo[li].depth) - 1);
+                        let mut sk = Vec::with_capacity(lmc);
+                        if lmc > 0 {
+                            sk.push(F128::new(pos as u64, 0));
+                            for j in 1..lmc {
+                                sk.push(sk[j - 1] * sk[j - 1] + sks[j - 1] * sk[j - 1]);
+                            }
+                        }
+                        let mut prod = F128::ONE;
+                        for j in 0..pl {
+                            prod *= F128::ONE + ris[j] * (F128::ONE + sk[j] * inv(sks[j]));
+                        }
+                        for j in 0..yr_log {
+                            if (y >> j) & 1 == 1 {
+                                prod *= sk[pl + j] * inv(sks[pl + j]);
+                            }
+                        }
+                        sum += aw[k] * prod;
+                    }
+                    assert_eq!(built.public[at3], sum, "L{li} residual y={y}");
+                    resid_native[li][y] = sum;
+                    at3 += 1;
+                }
+            }
+            // The close-out inner, natively — and THE CLOSURE: it must
+            // equal the spine's native t_r, so `inner == t_r` holds
+            // between two circuit outputs.
+            let ris_v: Vec<F128> = levels
+                .iter()
+                .flat_map(|l| l.fold_chs.iter().map(|&i| chals[i]))
+                .collect();
+            let plf = ris_v.len();
+            let mut inner_n = F128::ZERO;
+            for y in 0..yr_len {
+                let mut evb = chals[inner_pd2.ch];
+                for j in 0..plf {
+                    evb *= F128::ONE + chals[w_rounds[j].ch] + ris_v[j];
+                }
+                for j in 0..yr_log {
+                    evb *= if (y >> j) & 1 == 1 {
+                        chals[w_rounds[plf + j].ch]
+                    } else {
+                        F128::ONE + chals[w_rounds[plf + j].ch]
+                    };
+                }
+                let mut combn = evb;
+                for (li, lvl) in levels.iter().enumerate() {
+                    combn += chals[lvl.beta_ch] * resid_native[li][y];
+                    for od in &lvl.ood {
+                        let folded = od.z_len - yr_log;
+                        let later: Vec<F128> = levels[li + 1..]
+                            .iter()
+                            .flat_map(|l| l.fold_chs.iter().map(|&i| chals[i]))
+                            .collect();
+                        let mut t = chals[od.beta_ch];
+                        for j in 0..folded {
+                            t *= F128::ONE + chals[od.z_ch + j] + later[j];
+                        }
+                        for j in 0..yr_log {
+                            t *= if (y >> j) & 1 == 1 {
+                                chals[od.z_ch + folded + j]
+                            } else {
+                                F128::ONE + chals[od.z_ch + folded + j]
+                            };
+                        }
+                        combn += t;
+                    }
+                }
+                inner_n += vals_rec[yr_v2 + y] * combn;
+            }
+            assert_eq!(built.public[at3], inner_n, "the close-out inner");
+            // THE CLOSURE, between circuit outputs: the residual side's
+            // inner and the spine's t_r are the same statement scalar.
+            let zc_tail2 = n_assert_pub + 5 + zc_rounds2.len();
+            assert_eq!(
+                built.public[at3],
+                built.public[built.public.len() - zc_tail2 - 1],
+                "inner == t_r: the leaf statement closes"
             );
         }
         let pow_base = at2 + native_sums.len();
