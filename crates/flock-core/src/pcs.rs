@@ -982,6 +982,61 @@ pub struct MergedOpenProof {
     pub inner: BatchOpeningProofLigerito,
 }
 
+/// γ-combine the packed-direct claims into merged-column scalar groups,
+/// keyed by shared row point in first-occurrence order: `Σᵢ γᵢ·eq_rowᵢ(row)·
+/// eq_colᵢ(col) = eq_row(row)·(Σᵢ γᵢ·eq_colᵢ(col))`, so a group costs ONE
+/// sweep wherever it is consumed — the merged `W` build, the multipoint
+/// protocol (one dual value per group), and the anchor assist. Built
+/// identically on both sides (the prover's claim order is the verifier's).
+///
+/// A Boolean column point's eq table is a one-hot indicator, so its
+/// γ-contribution is a single scatter — the gather claims' column parts are
+/// exactly this (`bits(word_col) ‖ bits(slot_prefix)`), and building a
+/// `2^k_cols` table per claim is `k_cols`-exponential waste (~2^20 per
+/// claim at MVP-5's composite registry). Random column points (the element
+/// claims) keep the dense build. Value-identical either way.
+fn scalar_claim_groups<'a>(
+    points: impl Iterator<Item = &'a [F128]>,
+    gammas: &[F128],
+    n_log: usize,
+    k_cols: usize,
+) -> Vec<(&'a [F128], Vec<F128>)> {
+    let mut groups: Vec<(&[F128], Vec<F128>)> = Vec::new();
+    for (point, &g) in points.zip(gammas) {
+        assert_eq!(
+            point.len(),
+            n_log + k_cols,
+            "packed-direct point/row/col split mismatch (no skip coordinate)"
+        );
+        let (zr, zc) = (&point[..n_log], &point[n_log..]);
+        let hot: Option<usize> = zc.iter().enumerate().try_fold(0usize, |acc, (i, &x)| {
+            if x == F128::ZERO {
+                Some(acc)
+            } else if x == F128::ONE {
+                Some(acc | (1 << i))
+            } else {
+                None
+            }
+        });
+        let cols = match groups.iter_mut().find(|(r, _)| *r == zr) {
+            Some((_, cols)) => cols,
+            None => {
+                groups.push((zr, vec![F128::ZERO; 1 << k_cols]));
+                &mut groups.last_mut().unwrap().1
+            }
+        };
+        match hot {
+            Some(h) => cols[h] += g,
+            None => {
+                for (dst, e) in cols.iter_mut().zip(crate::lincheck::build_eq_table(zc)) {
+                    *dst += g * e;
+                }
+            }
+        }
+    }
+    groups
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn open_batch_merged<Ch: Challenger>(
     q: Vec<F128>,
@@ -1071,14 +1126,23 @@ pub fn open_batch_merged<Ch: Challenger>(
     );
     let params = jagged::JaggedParams::from_heights(heights, n_log, dense_log);
     let k_cols = params.k;
+    // Packed-direct claims are γ-SCALAR maps (`x ↦ γ·x`), so claims sharing
+    // a row point collapse into merged-column scalar groups, built ONCE and
+    // consumed by the weight builder, the multipoint protocol, and the
+    // anchor ([`scalar_claim_groups`]). A packed-direct point carries NO
+    // univariate-skip coordinate, which is the one place the splits differ.
+    let pd_groups = scalar_claim_groups(
+        packed_direct.iter().map(|c| c.point.as_slice()),
+        &gammas_pd,
+        n_log,
+        k_cols,
+    );
     // Ring-switched claims enter the weight builder with their F₂-linear
-    // fold tables; packed-direct claims are γ-SCALAR maps (`x ↦ γ·x`), so
-    // claims sharing a row point collapse into ONE Scalar group with a
-    // precombined column table — `Σᵢ γᵢ·eq_colᵢ` — instead of a per-claim
-    // fold-table sweep (bit-identical W; see `MergedWeightClaim::Scalar`).
-    // The circuit path's gather claims all share ρ_row, so its ~2^c claims
-    // cost one sweep. A packed-direct point carries NO univariate-skip
-    // coordinate, which is the one place the splits differ.
+    // fold tables; the scalar groups with their precombined column tables —
+    // `Σᵢ γᵢ·eq_colᵢ` — instead of a per-claim fold-table sweep
+    // (bit-identical W; see `MergedWeightClaim::Scalar`). The circuit
+    // path's gather claims all share ρ_row, so its ~2^c claims cost one
+    // sweep.
     let mut weight_claims: Vec<jagged::MergedWeightClaim<'_>> = rs_results
         .iter()
         .zip(x_outers.iter())
@@ -1095,56 +1159,11 @@ pub fn open_batch_merged<Ch: Challenger>(
             }
         })
         .collect();
-    {
-        let mut groups: Vec<(&[F128], Vec<F128>)> = Vec::new();
-        for (c, &g) in packed_direct.iter().zip(gammas_pd.iter()) {
-            assert_eq!(
-                c.point.len(),
-                n_log + k_cols,
-                "packed-direct point/row/col split mismatch (no skip coordinate)"
-            );
-            let (zr, zc) = (&c.point[..n_log], &c.point[n_log..]);
-            // A Boolean column point's eq table is a one-hot indicator, so
-            // its γ-contribution is a single scatter — the gather claims'
-            // column parts are exactly this (`bits(word_col) ‖
-            // bits(slot_prefix)`), and building a 2^k_cols table per claim
-            // is k_cols-exponential waste (~2^20 per claim at MVP-5's
-            // composite registry). Random column points (the element
-            // claims) keep the dense build. Value-identical either way.
-            let hot: Option<usize> = zc.iter().enumerate().try_fold(0usize, |acc, (i, &x)| {
-                if x == F128::ZERO {
-                    Some(acc)
-                } else if x == F128::ONE {
-                    Some(acc | (1 << i))
-                } else {
-                    None
-                }
-            });
-            let cols = match groups.iter_mut().find(|(r, _)| *r == zr) {
-                Some((_, cols)) => cols,
-                None => {
-                    groups.push((zr, vec![F128::ZERO; 1 << k_cols]));
-                    &mut groups.last_mut().unwrap().1
-                }
-            };
-            match hot {
-                Some(h) => cols[h] += g,
-                None => {
-                    for (dst, e) in cols
-                        .iter_mut()
-                        .zip(crate::lincheck::build_eq_table(zc))
-                    {
-                        *dst += g * e;
-                    }
-                }
-            }
-        }
-        weight_claims.extend(
-            groups
-                .into_iter()
-                .map(|(z_row, cols)| jagged::MergedWeightClaim::Scalar { z_row, cols }),
-        );
-    }
+    weight_claims.extend(
+        pd_groups
+            .iter()
+            .map(|(z_row, cols)| jagged::MergedWeightClaim::Scalar { z_row, cols }),
+    );
 
     // The twisted weight over the dense cube (count-proportional Φ-pass;
     // zero tail past the jagged area).
@@ -1219,7 +1238,7 @@ pub fn open_batch_merged<Ch: Challenger>(
 
     // ---- Frobenius assist: proves V = Ŵ(ρ).
     let t = std::time::Instant::now();
-    let mut coeffs: Vec<Vec<F128>> = rs_results
+    let coeffs: Vec<Vec<F128>> = rs_results
         .iter()
         .map(|(_, o)| match &o.rs_eq_ind {
             ring_switch::RsEqInd::DeferredDense { table, .. } => {
@@ -1228,16 +1247,7 @@ pub fn open_batch_merged<Ch: Challenger>(
             _ => unreachable!("checked above"),
         })
         .collect();
-    // A γ-scalar map's linearized polynomial is `γ·x` — coefficient γ at
-    // Frobenius index 0, zero elsewhere. Building the 4096-entry byte table
-    // per claim just to linearize it back out is pure waste at circuit
-    // gather-claim counts.
-    for &g in gammas_pd.iter() {
-        let mut c = vec![F128::ZERO; 128];
-        c[0] = g;
-        coeffs.push(c);
-    }
-    let mut fclaims: Vec<jagged::FrobeniusClaim<'_>> = x_outers
+    let fclaims: Vec<jagged::FrobeniusClaim<'_>> = x_outers
         .iter()
         .zip(&coeffs)
         .map(|(x, c)| jagged::FrobeniusClaim {
@@ -1246,13 +1256,12 @@ pub fn open_batch_merged<Ch: Challenger>(
             coeffs: c,
         })
         .collect();
-    for (c, co) in packed_direct.iter().zip(coeffs[rs_results.len()..].iter()) {
-        fclaims.push(jagged::FrobeniusClaim {
-            z_row: &c.point[..n_log],
-            z_col: &c.point[n_log..],
-            coeffs: co,
-        });
-    }
+    // The packed-direct claims enter as the merged-column scalar groups:
+    // one untwisted dual value per group instead of 128 per claim.
+    let gclaims: Vec<jagged::ScalarGroupClaim<'_>> = pd_groups
+        .iter()
+        .map(|(z_row, cols)| jagged::ScalarGroupClaim { z_row, cols })
+        .collect();
     if trace {
         eprintln!(
             "    [frobenius] linearized_coefficients (x{}): {:6.2} ms",
@@ -1261,11 +1270,13 @@ pub fn open_batch_merged<Ch: Challenger>(
         );
     }
     let t_assist = std::time::Instant::now();
-    // The multipoint replacement (docs/multipoint-twisted-assist.tex): 128K
-    // claimed dual values + one product sumcheck + ONE untwisted anchor,
-    // instead of a per-statement assist — family K collapses, and every
-    // verifier piece is a shape the recursion circuit already has.
-    let frobenius = jagged::prove_multipoint_twisted(&params, &fclaims, &rho, challenger);
+    // The two-product multipoint replacement
+    // (docs/multipoint-twisted-assist.tex): 128R + P claimed dual values +
+    // one two-product sumcheck + ONE untwisted anchor, instead of a
+    // per-statement assist — family K collapses, and every verifier piece
+    // is a shape the recursion circuit already has.
+    let frobenius =
+        jagged::prove_multipoint_twisted(&params, &fclaims, &gclaims, &rho, challenger);
     if trace {
         eprintln!(
             "  [open_merged] coeffs + multipoint assist: {:6.2} ms (assist alone {:6.2} ms)",
@@ -1284,6 +1295,9 @@ pub fn open_batch_merged<Ch: Challenger>(
                 }
                 v += cl.coeffs[j] * t;
             }
+        }
+        for &b in &frobenius.group_values {
+            v += b;
         }
         debug_assert_eq!(v, w_eval, "multipoint V must equal the folded weight MLE");
     }
@@ -1433,26 +1447,7 @@ pub fn verify_batch_merged<Ch: Challenger>(
             ring_switch::linearized_coefficients(&ring_switch::build_fold_byte_table(&scaled))
         })
         .collect();
-    // A packed-direct claim's fold map is `x ↦ γ·x`, whose linearized
-    // polynomial is γ at Frobenius index 0 and zero elsewhere — built
-    // directly (the byte-table detour is claim-count-linear waste; the
-    // debug assert pins the equivalence).
-    let coeffs_pd: Vec<Vec<F128>> = gammas_pd
-        .iter()
-        .map(|&g| {
-            let mut c = vec![F128::ZERO; 128];
-            c[0] = g;
-            debug_assert_eq!(
-                c,
-                ring_switch::linearized_coefficients(&ring_switch::build_fold_byte_table(
-                    &ring_switch::identity_fold_weights(g),
-                )),
-                "direct γ-scalar coefficients must equal the linearized table"
-            );
-            c
-        })
-        .collect();
-    let mut fclaims: Vec<jagged::FrobeniusClaim<'_>> = x_outers
+    let fclaims: Vec<jagged::FrobeniusClaim<'_>> = x_outers
         .iter()
         .zip(&coeffs)
         .map(|(x, c)| {
@@ -1464,27 +1459,44 @@ pub fn verify_batch_merged<Ch: Challenger>(
             }
         })
         .collect();
-    for (c, co) in packed_direct.iter().zip(&coeffs_pd) {
+    // The packed-direct claims collapse into the SAME merged-column scalar
+    // groups the prover built (identical claim order → identical groups):
+    // a group's fold map is the identity with its γ's baked into the cols,
+    // so it carries one dual value and no 128-coefficient vector at all.
+    for c in packed_direct.iter() {
         if c.point.len() != n_log + k_cols {
             return Err(VerifyErrorOpen::Assist);
         }
-        fclaims.push(jagged::FrobeniusClaim {
-            z_row: &c.point[..n_log],
-            z_col: &c.point[n_log..],
-            coeffs: co,
-        });
     }
+    let pd_groups = scalar_claim_groups(
+        packed_direct.iter().map(|c| c.point),
+        &gammas_pd,
+        n_log,
+        k_cols,
+    );
+    let gclaims: Vec<jagged::ScalarGroupClaim<'_>> = pd_groups
+        .iter()
+        .map(|(z_row, cols)| jagged::ScalarGroupClaim { z_row, cols })
+        .collect();
     if trace {
         eprintln!(
-            "        [vbm] coeffs (fold byte tables ×{n_rs}): {}",
+            "        [vbm] coeffs (fold byte tables ×{n_rs}) + {} scalar groups: {}",
+            gclaims.len(),
             tfmt(t.elapsed().as_secs_f64())
         );
     }
     let t = std::time::Instant::now();
     #[cfg(feature = "mul-count")]
     let assist_start = crate::field::gf2_128::op_count::snapshot();
-    let v = jagged::verify_multipoint_twisted(&params, &fclaims, &rho, &proof.frobenius, challenger)
-        .ok_or(VerifyErrorOpen::Assist)?;
+    let v = jagged::verify_multipoint_twisted(
+        &params,
+        &fclaims,
+        &gclaims,
+        &rho,
+        &proof.frobenius,
+        challenger,
+    )
+    .ok_or(VerifyErrorOpen::Assist)?;
     #[cfg(feature = "mul-count")]
     if std::env::var("MUL_TRACE").is_ok() {
         let e = crate::field::gf2_128::op_count::snapshot();

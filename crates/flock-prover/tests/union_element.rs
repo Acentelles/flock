@@ -325,9 +325,12 @@ fn element_claims_are_bound_by_the_opening() {
     }
 
     // The Frobenius assist — V and every round message — proves Ŵ(ρ), i.e.
-    // the element claims' weight evaluation.
+    // the element claims' weight evaluation. An element-only proof has no
+    // ring-switched claims, so its dual values are the scalar groups'
+    // (`group_values`); `values` is empty.
+    assert!(proof.pcs_open.frobenius.values.is_empty());
     let mut bad = proof.clone();
-    bad.pcs_open.frobenius.values[0][0] += F128::ONE;
+    bad.pcs_open.frobenius.group_values[0] += F128::ONE;
     assert!(verify(&bad).is_err(), "tampered frobenius V");
     for i in 0..proof.pcs_open.frobenius.rounds.len() {
         for which in 0..2 {
@@ -1075,6 +1078,10 @@ use sha2_hash::Digest as _;
 // Re-pinned 2026-08-02: multipoint-twisted assist (proof_io v8) — the
 // per-statement assist became 128K dual values + one product sumcheck +
 // one untwisted anchor; transcript + wire moved by design.
+// Re-pinned 2026-08-02: two-product multipoint grouping (proof_io v9) —
+// the element claims here are packed-direct, so they collapse into
+// merged-column scalar groups carrying ONE dual value each (128 -> 1 per
+// distinct row point); multipoint label v1.
 fn check(label: &str, expected: &str, got: String) {
     if std::env::var_os("ELEMENT_FIXTURES_PRINT").is_some() {
         println!("(\"{label}\", \"{got}\"),");
@@ -1123,19 +1130,22 @@ fn bundle_digest_merged(
 /// this branch has replacement sampling (`4e46b0a`), which `multitable`
 /// predates — the multitable-minted digests can never match here.
 /// Re-pinned 2026-08-02: Merkle capping (proof_io v7): cap layers absorbed instead of roots (ObserveBytes 32 -> 32*2^c per commit absorb); octopus multi-proofs replaced by flat per-query capped paths.
+/// Re-pinned 2026-08-02: two-product multipoint grouping (proof_io v9) —
+/// element/packed-direct claims enter as merged-column scalar groups, one
+/// dual value each; multipoint label v1, values absorb 128K -> 128R+P.
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn mixed_class_merged_proof_bytes_pinned() {
     const ELEMENT_ONLY: [(&str, usize, &str); 3] = [
-        ("elem-merged-nu12-full", 1 << 12, "9e38a7b79ce0f35b2c1496d47939a58af5418a3ec52f6c87c1e505b5642ee858"),
-        ("elem-merged-nu12-2731", 2731, "7b68360cd6f31f258bc8905c12e15ab1c9a8a4f409d7e2a8522105ee525ae6f9"),
-        ("elem-merged-nu12-0", 0, "7106a6e5b6bef99d552c0d8e0c251a9d18cae84a7514fa3f827b5949e321083b"),
+        ("elem-merged-nu12-full", 1 << 12, "f8de0ecee28cb721807e8ee4e08d05ae5a1be6d8344106499c0148acb19514dc"),
+        ("elem-merged-nu12-2731", 2731, "742fda0fae0bb6cbc4f435dfb9e2dd5b3c0298dc395360d2b3102b07ed56fc94"),
+        ("elem-merged-nu12-0", 0, "7e67d3845c2293f9700df51b8ef0c2cc572ec6b4488caec93dc8c6575dc720f8"),
     ];
     const MIXED: [(&str, [usize; 2], &str); 4] = [
-        ("mix-merged-nu7-128-128", [128, 128], "82631e17e38c883716b1db45bcdb1e18c184c4e6a4bd70943bf760115dbd436c"),
-        ("mix-merged-nu7-100-90", [100, 90], "90a424223247e4acd0c1c32e08d16a9f0bdd115e265f29c4966e3edaa9f4e8a9"),
-        ("mix-merged-nu7-0-90", [0, 90], "f611153a34d9df89731e83a65051af8718051dc5503160e4210c9dfecec410af"),
-        ("mix-merged-nu7-100-0", [100, 0], "7921ded32fcd660407a42bf2cb478d5e130699d1725344465805293e53ca7774"),
+        ("mix-merged-nu7-128-128", [128, 128], "f4454462c5453208c29f7b18ddf062a38760f49507208b282f2fec06de722b6d"),
+        ("mix-merged-nu7-100-90", [100, 90], "7ab07aaae81259e9bf50070eab3adbafa0bed5c4e6e36bcf068a09c234f2fd46"),
+        ("mix-merged-nu7-0-90", [0, 90], "18041290acbd4146f81ce8d8be37659586805ddc11d59a3ed72045badc2a838a"),
+        ("mix-merged-nu7-100-0", [100, 0], "a301490e89d165bf8a3f7cbd6c4596a0227b3b4883a0262ffe1c1baade0ec0ea"),
     ];
 
     let (w0, w1) = (F128::new(0x51F0, 0), F128::new(0, 0x2C7E));

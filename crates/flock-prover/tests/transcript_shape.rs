@@ -261,7 +261,11 @@ fn element_only_transcript_shape_is_pinned() {
 // Re-pinned 2026-08-02: multipoint-twisted assist (proof_io v8) — the
 // per-statement assist became 128K dual values + one product sumcheck +
 // one untwisted anchor; transcript + wire moved by design.
-    const EXPECTED: &str = "32891070a26dbcd9ca5d348bdeef4cd5ad5ddda6774d1f48824ef6b6655e1429";
+// Re-pinned 2026-08-02: two-product multipoint grouping (proof_io v9) —
+// element-only claims are all packed-direct, so the values absorb shrinks
+// from 128·K to ONE word per merged-row group and the sumcheck is the
+// single untwisted product; multipoint label v1.
+    const EXPECTED: &str = "25a137909e6f2bbd3c92b16010ce0b2ef07307994b828889e52ce2c641944261";
 
     let (_, shape) = record_element_only(12, &[3], &[1 << 12], 0xB0DD_1E01);
 

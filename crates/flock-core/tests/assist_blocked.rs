@@ -150,20 +150,20 @@ fn assist_shapes_probe() {
         ];
         let rho = rng.vec(m);
         let mut fp = FsChallenger::new(b"assist-blocked-probe");
-        let fproof = prove_frobenius_assist(&params, &claims, &rho, &mut fp);
+        let fproof = prove_frobenius_assist(&params, &claims, &[], &rho, &mut fp);
         let fprove = min_ms(iters, || {
             let mut ch = FsChallenger::new(b"assist-blocked-probe");
-            std::hint::black_box(prove_frobenius_assist(&params, &claims, &rho, &mut ch));
+            std::hint::black_box(prove_frobenius_assist(&params, &claims, &[], &rho, &mut ch));
         });
         let fverify = min_ms(iters, || {
             let mut ch = FsChallenger::new(b"assist-blocked-probe");
             std::hint::black_box(verify_frobenius_assist(
-                &params, &claims, &rho, &fproof, &mut ch,
+                &params, &claims, &[], &rho, &fproof, &mut ch,
             ));
         });
         let mut vch = FsChallenger::new(b"assist-blocked-probe");
         assert!(
-            verify_frobenius_assist(&params, &claims, &rho, &fproof, &mut vch).is_some(),
+            verify_frobenius_assist(&params, &claims, &[], &rho, &fproof, &mut vch).is_some(),
             "frobenius assist must verify [{label}]"
         );
 

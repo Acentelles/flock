@@ -44,7 +44,17 @@ use flock_core::pcs::Commitment;
 pub const MAGIC: [u8; 5] = *b"FLOCK";
 
 /// Format version. Bumped on incompatible serialization changes.
-/// v8 (current): the multipoint-twisted assist — `MergedOpenProof.
+/// v9 (current): the two-product multipoint grouping — packed-direct
+/// claims collapse by shared row point into merged-column scalar groups
+/// carrying ONE untwisted dual value each
+/// (`MultipointTwistedProof.group_values`); ring-switched claims keep 128.
+/// The sumcheck becomes two products (`ā·g + b̄·eq(ρ,·)`) and the single
+/// anchor binds the whole endpoint sum via closed-form-baked coefficients.
+/// The multipoint label bumps to v1 and the values' absorb shrinks from
+/// `128·K` to `128·R + P` words. Soundness:
+/// docs/multipoint-twisted-assist.tex §"The two-product grouping".
+///
+/// v8: the multipoint-twisted assist — `MergedOpenProof.
 /// frobenius` becomes `MultipointTwistedProof` (128K claimed dual values,
 /// m product-sumcheck rounds, one untwisted anchor); the transcript gains
 /// the values' absorb + gamma squeeze and loses the per-statement assist
@@ -67,7 +77,7 @@ pub const MAGIC: [u8; 5] = *b"FLOCK";
 /// v3 restructured `BaseFoldProof`: per-query Merkle paths were replaced by
 /// shared octopus multi-proofs (one per Merkle tree). v2 added `HashKind`
 /// to [`ChainProofBundle`].
-pub const VERSION: u8 = 8;
+pub const VERSION: u8 = 9;
 
 /// Which hash function a chain proof is over. Carried in
 /// [`ChainProofBundle`] so the verifier (e.g. the CLI) can pick the right
