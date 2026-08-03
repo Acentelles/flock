@@ -2395,6 +2395,240 @@ impl GateType for SpineGate {
     }
 }
 
+/// The residual-basis gate (step 2b): one query's contribution to a level's
+/// `induce_sumcheck_evaluate_at_residual`, at every residual position `y`.
+///
+/// From `q_field` the novel-basis chain runs `s_{k+1} = s_k (s_k + c_k)`
+/// (`c_k = s_k(v_k)`, a constant; the `1/s_k(v_k)` normalizations fold into
+/// downstream weights). The level's post-intro fold challenges `ris` build
+/// `prefix = prod_k (1 + ris_k (1 + W_k))`, the suffix `W`s form subset
+/// products over the `2^yr` residual positions (`1 + p_j(1+w) = w` iff the
+/// bit is set), and `aw * prefix * subset(y)` accumulates into `2^yr` running
+/// sums. One gate row per (level, query); the accumulators chain across
+/// queries like `LeafEvalGate`'s.
+///
+/// `q_field` is a public input, bound at the boundary: the checker masks the
+/// (already published) challenge word natively — same pattern as the cap
+/// select.
+struct ResidualGate {
+    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+    sks_vks: Vec<F128>,
+    acc_out: Vec<usize>,
+    lmc: usize,
+    pl: usize,
+    yr: usize,
+    n_in: usize,
+    k: usize,
+}
+
+impl ResidualGate {
+    /// Column layout, in declaration order:
+    ///   q(0), ris(1..=pl), aw, one, acc_in[yr]          — inputs (n_in)
+    ///   s_1..s_{lmc-1}                                   — the chain
+    ///   pk_0..pk_{pl-1}, pr_1..pr_{pl-1}                 — prefix terms/products
+    ///   w_0..w_{yl-1}                                    — normalized suffix
+    ///   sp for each y with >=2 bits                      — subset products
+    ///   t = aw*prefix, c_y (y>0), acc_out[yr]            — the contributions
+    fn new(log_msg_cols: usize, prefix_len: usize, yr_log_n: usize, sks_vks: &[F128]) -> Self {
+        use flock_core::element_r1cs::ElementTableBuilder;
+        let one_w = F128::ONE;
+        let (lmc, pl, yl) = (log_msg_cols, prefix_len, yr_log_n);
+        assert_eq!(pl + yl, lmc);
+        let yr = 1usize << yl;
+        let inv = |v: F128| if v == F128::ZERO { F128::ZERO } else { v.inv() };
+        let n_in = 1 + pl + 1 + 1 + yr;
+        let (q, aw, one, acc0) = (0usize, 1 + pl, 2 + pl, 3 + pl);
+        let mut c = n_in; // next free column
+        let mut b = ElementTableBuilder::new(6);
+        for wcol in 0..n_in {
+            b.free_wire(wcol);
+        }
+        // s columns: s_col[k] holds s_k(q); s_0 IS the q input column.
+        let mut s_col = vec![q];
+        for k in 1..lmc {
+            b.mult_lin(
+                c,
+                &[(s_col[k - 1], one_w)],
+                &[(s_col[k - 1], one_w), (one, sks_vks[k - 1])],
+            );
+            s_col.push(c);
+            c += 1;
+        }
+        // prefix: pk = ris_k * (1 + W_k), pr = running product of (1 + pk).
+        let mut pr = one; // empty product
+        for k in 0..pl {
+            let ivk = inv(sks_vks[k]);
+            b.mult_lin(c, &[(1 + k, one_w)], &[(one, one_w), (s_col[k], ivk)]);
+            let pk = c;
+            c += 1;
+            b.mult_lin(c, &[(pr, one_w)], &[(one, one_w), (pk, one_w)]);
+            pr = c;
+            c += 1;
+        }
+        // suffix W columns, normalized.
+        let mut w = Vec::with_capacity(yl);
+        for j in 0..yl {
+            b.linear(c, &[(s_col[pl + j], inv(sks_vks[pl + j]))]);
+            w.push(c);
+            c += 1;
+        }
+        // subset products; sp[y]: None = 1 (y=0), single bit = w[j].
+        let mut sp: Vec<Option<usize>> = vec![None; yr];
+        for (j, &wc) in w.iter().enumerate() {
+            sp[1 << j] = Some(wc);
+        }
+        for y in 1..yr {
+            if sp[y].is_none() {
+                let low = y & y.wrapping_neg();
+                b.mult(c, sp[y ^ low].unwrap(), sp[low].unwrap());
+                sp[y] = Some(c);
+                c += 1;
+            }
+        }
+        // t = aw * prefix; contributions and accumulators.
+        b.mult(c, aw, pr);
+        let t = c;
+        c += 1;
+        let mut acc_out = Vec::with_capacity(yr);
+        for (y, spy) in sp.iter().enumerate() {
+            let cy = match spy {
+                None => t,
+                Some(spc) => {
+                    b.mult(c, t, *spc);
+                    c += 1;
+                    c - 1
+                }
+            };
+            b.linear(c, &[(acc0 + y, one_w), (cy, one_w)]);
+            acc_out.push(c);
+            c += 1;
+        }
+        assert!(c <= 64, "residual gate spills kappa=6 ({c} cols)");
+        Self {
+            ty: std::sync::Arc::new(b.build().expect("residual gate is valid")),
+            sks_vks: sks_vks.to_vec(),
+            acc_out,
+            lmc,
+            pl,
+            yr,
+            n_in,
+            k: c,
+        }
+    }
+}
+
+impl GateType for ResidualGate {
+    type Row = Vec<F128>;
+    type Hint = ();
+
+    fn table(&self) -> TableType {
+        use flock_core::schedule::IoWord;
+        let mut schema: Vec<IoWord> = (0..self.n_in).map(IoWord::input).collect();
+        for &o in &self.acc_out {
+            schema.push(IoWord::output(o));
+        }
+        TableType::element(self.ty.clone()).with_io_schema(schema)
+    }
+
+    fn eval(&self, inputs: &[F128], _hint: &()) -> (Vec<F128>, Self::Row) {
+        // A structural mirror of `new()`: same column cursor, same order.
+        let inv = |v: F128| if v == F128::ZERO { F128::ZERO } else { v.inv() };
+        let (lmc, pl) = (self.lmc, self.pl);
+        let yl = lmc - pl;
+        let acc0 = 3 + pl;
+        let mut z = vec![F128::ZERO; self.k];
+        z[..self.n_in].copy_from_slice(&inputs[..self.n_in]);
+        let mut c = self.n_in;
+        let mut s_col = vec![0usize];
+        for k in 1..lmc {
+            z[c] = z[s_col[k - 1]] * (z[s_col[k - 1]] + self.sks_vks[k - 1]);
+            s_col.push(c);
+            c += 1;
+        }
+        let mut pr_v = F128::ONE;
+        for k in 0..pl {
+            z[c] = z[1 + k] * (F128::ONE + z[s_col[k]] * inv(self.sks_vks[k]));
+            let pk = z[c];
+            c += 1;
+            z[c] = pr_v * (F128::ONE + pk);
+            pr_v = z[c];
+            c += 1;
+        }
+        let mut w = Vec::with_capacity(yl);
+        for j in 0..yl {
+            z[c] = z[s_col[pl + j]] * inv(self.sks_vks[pl + j]);
+            w.push(c);
+            c += 1;
+        }
+        let mut sp: Vec<Option<usize>> = vec![None; self.yr];
+        for (j, &wc) in w.iter().enumerate() {
+            sp[1 << j] = Some(wc);
+        }
+        for y in 1..self.yr {
+            if sp[y].is_none() {
+                let low = y & y.wrapping_neg();
+                z[c] = z[sp[y ^ low].unwrap()] * z[sp[low].unwrap()];
+                sp[y] = Some(c);
+                c += 1;
+            }
+        }
+        z[c] = z[1 + pl] * pr_v;
+        let t = c;
+        c += 1;
+        let mut outs = Vec::with_capacity(self.yr);
+        for (y, spy) in sp.iter().enumerate() {
+            let cy = match spy {
+                None => z[t],
+                Some(spc) => {
+                    z[c] = z[t] * z[*spc];
+                    c += 1;
+                    z[c - 1]
+                }
+            };
+            z[c] = z[acc0 + y] + cy;
+            outs.push(z[c]);
+            c += 1;
+        }
+        (outs, z)
+    }
+
+    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
+        let mut z = vec![F128::ZERO; self.ty.width() << nu];
+        for (j, row) in rows.iter().enumerate() {
+            for (col, &v) in row.iter().enumerate() {
+                z[(col << nu) + j] = v;
+            }
+        }
+        SlotWitness::Element(z)
+    }
+}
+
+/// `s_{k+1}(x) = s_k(x)^2 + s_k(v_k) s_k(x)` — the subspace-polynomial chain,
+/// and its `s_k(v_k)` constants (a replica of ligerito's pub(crate)
+/// `eval_sk_at_vks`, pinned by the residual boundary check below).
+fn sk_at_vks(log_n: usize) -> Vec<F128> {
+    let next = |s: F128, c: F128| s * s + c * s;
+    let mut sks = vec![F128::ZERO; log_n + 1];
+    sks[0] = F128::ONE;
+    if log_n == 0 {
+        return sks;
+    }
+    let mut layer: Vec<F128> = (1..=log_n).map(|i| F128::new(1u64 << i, 0)).collect();
+    let mut cur = log_n;
+    for i in 0..log_n {
+        for j in 0..cur {
+            let v = next(layer[j], sks[i]);
+            if j == 0 {
+                sks[i + 1] = v;
+            } else {
+                layer[j - 1] = v;
+            }
+        }
+        cur -= 1;
+    }
+    sks
+}
+
 /// One open-phase level, located on a recorded op tape. `*_fin` are finalize
 /// ordinals (indices into `FsChainTrace::squeezes`); `*_ch` index into
 /// `RecordingChallenger::challenges()`.
@@ -2607,8 +2841,12 @@ fn parse_open_levels(
 /// enforced sum (the LeafEval accumulators, consumed in-circuit rather than
 /// boundary-checked) — and publishes the final `t_r`, checked against a
 /// native replay. The start target is a fixed public input until the merged
-/// intake lands (2c). Still native: the residual/eval_b arithmetic (2b) and
-/// the PoW bit-predicates. The inner proof commits with
+/// intake lands (2c). **2b stage 1**: per-level `ResidualGate`s evaluate the
+/// induced-basis residuals (`next_s` chain, prefix over later fold
+/// challenges, suffix subset products) with `q_field` boundary-bound like
+/// the cap select; the `2^yr` accumulators publish and check against a
+/// native replica. Still native: eval_b, the OOD residuals, the final
+/// `inner == t_r`, and the PoW bit-predicates. The inner proof commits with
 /// the lane grid at full utilization — count 2^13 x 4 cols = 2^15 words =
 /// exactly 2^22 dense bits, t = 64 — so L0 is the real 64-lane / 1 KiB-leaf
 /// shape with zero padding.
@@ -2956,6 +3194,46 @@ fn mvp7_real_query_phase() {
         }
     }
     let t_final = tw;
+
+    // ---- the residual basis (2b, stage 1): induce_..._at_residual in-circuit ----
+    // Level li's basis prefix folds over the LATER levels' fold challenges;
+    // yr comes from the proof. eval_b / OOD residuals / the final inner==t_r
+    // stay native for now.
+    let yr_log = {
+        let yl = proof.pcs_open.inner.ligerito.final_proof.yr.len();
+        assert!(yl.is_power_of_two());
+        yl.trailing_zeros() as usize
+    };
+    let yr_len = 1usize << yr_log;
+    let mut resid_pub: Vec<Vec<Wire>> = Vec::new();
+    for (li, lvl) in levels.iter().enumerate() {
+        let pl: usize = levels[li + 1..].iter().map(|l| l.fold_fins.len()).sum();
+        let lmc = pl + yr_log;
+        let sks = sk_at_vks(lmc);
+        let rslot = sb.slot(ResidualGate::new(lmc, pl, yr_log, &sks));
+        leaf_slot.push((100 + li, rslot));
+        let ris_w: Vec<Wire> = levels[li + 1..]
+            .iter()
+            .flat_map(|l| l.fold_fins.iter().map(|&f| chw(&outs, &trace.squeezes, f)))
+            .collect();
+        let alpha_vals: Vec<F128> = (0..lvl.a_count).map(|j| chals[lvl.a_ch + j]).collect();
+        let aw = flock_core::lincheck::build_eq_table(&alpha_vals);
+        let mut accs: Vec<Wire> = (0..yr_len).map(|_| zw).collect();
+        for k in 0..geo[li].q {
+            let pos = (chals[lvl.q_ch + k].lo as usize) & ((1usize << geo[li].depth) - 1);
+            vals.push(F128::new(pos as u64, 0));
+            let qf = sb.public_input();
+            vals.push(aw[k]);
+            let awp = sb.public_input();
+            let mut g_in = vec![qf];
+            g_in.extend_from_slice(&ris_w);
+            g_in.push(awp);
+            g_in.push(ow);
+            g_in.extend_from_slice(&accs);
+            accs = sb.gate(rslot, &g_in);
+        }
+        resid_pub.push(accs);
+    }
     for (a_wires, opens) in &to_publish {
         for w in a_wires {
             sb.publish(*w);
@@ -2967,6 +3245,11 @@ fn mvp7_real_query_phase() {
         }
     }
     sb.publish(t_final);
+    for accs in &resid_pub {
+        for w in accs {
+            sb.publish(*w);
+        }
+    }
     let shape = sb.finish().expect("valid real-query circuit");
     let setup_ms = t.elapsed().as_secs_f64() * 1e3;
 
@@ -2975,11 +3258,13 @@ fn mvp7_real_query_phase() {
     let (built, online_t) = timed(REPS, || shape.run(&vals, &hint_refs));
 
     // ---- the boundary checks ----
-    let total_pub: usize = 1 + levels
-        .iter()
-        .zip(&geo)
-        .map(|(l, g)| l.a_count + 3 * g.q)
-        .sum::<usize>();
+    let yr_pub = levels.len() * yr_len;
+    let total_pub: usize = 1 + yr_pub
+        + levels
+            .iter()
+            .zip(&geo)
+            .map(|(l, g)| l.a_count + 3 * g.q)
+            .sum::<usize>();
     let mut at = built.public.len() - total_pub;
     for (li, lvl) in levels.iter().enumerate() {
         let g = &geo[li];
@@ -3030,6 +3315,45 @@ fn mvp7_real_query_phase() {
         }
     }
     assert_eq!(built.public[at], nt, "the spine's final t_r");
+    at += 1;
+    // Native replica of induce_sumcheck_evaluate_at_residual, per level.
+    for (li, lvl) in levels.iter().enumerate() {
+        let pl: usize = levels[li + 1..].iter().map(|l| l.fold_fins.len()).sum();
+        let lmc = pl + yr_log;
+        let sks = sk_at_vks(lmc);
+        let inv = |v: F128| if v == F128::ZERO { F128::ZERO } else { v.inv() };
+        let ris: Vec<F128> = levels[li + 1..]
+            .iter()
+            .flat_map(|l| l.fold_chs.iter().map(|&i| chals[i]))
+            .collect();
+        let alpha_vals: Vec<F128> = (0..lvl.a_count).map(|j| chals[lvl.a_ch + j]).collect();
+        let aw = build_eq_table(&alpha_vals);
+        for y in 0..yr_len {
+            let mut sum = F128::ZERO;
+            for k in 0..geo[li].q {
+                let pos = (chals[lvl.q_ch + k].lo as usize) & ((1usize << geo[li].depth) - 1);
+                let mut sk = Vec::with_capacity(lmc);
+                if lmc > 0 {
+                    sk.push(F128::new(pos as u64, 0));
+                    for j in 1..lmc {
+                        sk.push(sk[j - 1] * sk[j - 1] + sks[j - 1] * sk[j - 1]);
+                    }
+                }
+                let mut prod = F128::ONE;
+                for j in 0..pl {
+                    prod *= F128::ONE + ris[j] * (F128::ONE + sk[j] * inv(sks[j]));
+                }
+                for j in 0..yr_log {
+                    if (y >> j) & 1 == 1 {
+                        prod *= sk[pl + j] * inv(sks[pl + j]);
+                    }
+                }
+                sum += aw[k] * prod;
+            }
+            assert_eq!(built.public[at], sum, "L{li} residual y={y}");
+            at += 1;
+        }
+    }
 
     // ---- prove / verify the circuit itself ----
     let union = UnionInstance::new(&shape.registry, shape.counts.clone());
