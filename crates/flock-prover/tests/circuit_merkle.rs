@@ -8646,7 +8646,7 @@ fn mvp10_circuit_inner_tape() {
         assert_eq!(commitment.cap, lig.initial_cap, "commitment IS the L0 cap");
         let r_lvl = lig.recursive_caps.len();
         let lvl_src = level_sources(lig);
-        let (_start_v, piop_o, gammas_o, _w_rounds, _mp_o, _inner_pd2, _yr_v2, levels) =
+        let (_start_v, piop_o, gammas_o, _w_rounds, mp_o, _inner_pd2, _yr_v2, levels) =
             parse_open_levels(ops, 32 * lig.initial_cap.len(), r_lvl);
         assert!(piop_o.is_some(), "a mixed tape carries the element PIOP");
         assert_eq!(
@@ -8748,6 +8748,9 @@ fn mvp10_circuit_inner_tape() {
         let ow = sb.public_input();
         let macs = sb.slot(MacGate::new());
         let zcr = sb.slot(ZcRoundGate::new());
+        // Shared by the element lincheck, the multipoint two-product rounds
+        // and the anchor's rounds — one round gate, three chains.
+        let mrs = sb.slot(MergedRoundGate::new());
         let mut gkr_deltas: Vec<Wire> = Vec::new();
         let g = &gkr_rec;
         let alpha_w = outs[trace.squeezes[g.alpha_fin][0]][0];
@@ -8808,6 +8811,54 @@ fn mvp10_circuit_inner_tape() {
         let r2 = sb.gate(macs, &[r1, beta_w, ow])[0];
         gkr_deltas.push(sb.gate(macs, &[r2, cr_w, ow])[0]);
 
+        // ---- assembly step 5: the MULTIPOINT intake at R = 2 AND P > 0 ----
+        // The first tape with both kinds of claim in one schedule: 2x128 RS
+        // dual values THEN the P group values, batched by CONSECUTIVE gamma
+        // powers across both (no discontinuity at the boundary — pinned in
+        // the region walk above). T0 accumulates them through MacGate rows,
+        // the m two-product rounds fold it through the same
+        // MergedRoundGate slot the element lincheck uses, and
+        // `T_m == anchor.v` closes as a published-zero delta.
+        let mp_gamma_w = outs[trace.squeezes[mp_o.gamma_fin][0]][0];
+        assert_eq!(
+            mp_o.val_vs.len(),
+            256 + n_p,
+            "the R=2 + P schedule spans both claim kinds"
+        );
+        let mut t0_w = zw;
+        let mut pw_w = ow;
+        for (k, &vi) in mp_o.val_vs.iter().enumerate() {
+            t0_w = sb.gate(macs, &[t0_w, pw_w, wv(vi)])[0];
+            if k + 1 < mp_o.val_vs.len() {
+                pw_w = sb.gate(macs, &[zw, pw_w, mp_gamma_w])[0];
+            }
+        }
+        let mut tm_w = t0_w;
+        for rr in &mp_o.rounds {
+            let rho_w = outs[trace.squeezes[rr.fin][0]][0];
+            tm_w = sb.gate(mrs, &[tm_w, wv(rr.g_v), wv(rr.g_v + 1), rho_w])[0];
+        }
+        let mp_delta = sb.gate(macs, &[tm_w, wv(mp_o.anchor_v), ow])[0];
+        // The anchor's own rounds fold its claimed v to an endpoint, which
+        // publishes and is held against the native replay (its EXPECT is the
+        // family-H boundary item the leaf already retired; porting that here
+        // is the next increment).
+        let mut anc_w = wv(mp_o.anchor_v);
+        for rr in &mp_o.anchor_rounds {
+            let rho_w = outs[trace.squeezes[rr.fin][0]][0];
+            anc_w = sb.gate(mrs, &[anc_w, wv(rr.g_v), wv(rr.g_v + 1), rho_w])[0];
+        }
+        let anc_end_n = {
+            let mut t = vals_rec[mp_o.anchor_v];
+            for rr in &mp_o.anchor_rounds {
+                let (g1, gi) = (vals_rec[rr.g_v], vals_rec[rr.g_v + 1]);
+                let r = chals[rr.ch];
+                let g0 = t + g1;
+                t = g0 + (g1 + g0 + gi) * r + gi * r * r;
+            }
+            t
+        };
+
         // ---- assembly step 3: the ELEMENT PIOP rounds in-circuit ----
         // The mixed inner's element half, type reuse from mvp8: the
         // zerocheck's rounds are ZcRoundGate rows (tau slice wires as eq
@@ -8818,7 +8869,6 @@ fn mvp10_circuit_inner_tape() {
         // kappa=2 slot and the general treatment lands with the real inner
         // (the mvp9-outer swap) — so the zc chain end publishes and the lc
         // entry enters as checker-validated advice.
-        let mrs = sb.slot(MergedRoundGate::new());
         let mut el_g0: Vec<F128> = Vec::new();
         let mut el_run_n = F128::ZERO;
         for (k, &(gv, _, ch)) in el_rec.zc_rounds.iter().enumerate() {
@@ -8919,6 +8969,8 @@ fn mvp10_circuit_inner_tape() {
         }
         sb.publish(el_zr);
         sb.publish(el_lcw);
+        sb.publish(mp_delta);
+        sb.publish(anc_w);
         // ---- the SIGMA ASSERTION emission (route B, in-circuit) ----
         // The claim exits as bound publics: the value is the deferred
         // s_sigma stream word — the SAME wire the rhs input check just
@@ -8929,7 +8981,7 @@ fn mvp10_circuit_inner_tape() {
         for w in &pt_w {
             sb.publish(*w);
         }
-        let n_tail = 2 + gkr_deltas.len() + el_deltas.len() + 2 + 1 + mu_i;
+        let n_tail = 2 + gkr_deltas.len() + el_deltas.len() + 2 + 2 + 1 + mu_i;
         let n_query_pub: usize = levels.len()
             + levels
                 .iter()
@@ -9017,9 +9069,22 @@ fn mvp10_circuit_inner_tape() {
             el_assert.target,
             "the element lc chain ends at the native assertion's target"
         );
+        // The multipoint intake: T_m == anchor.v as a zero-delta, and the
+        // anchor chain's endpoint against the native replay.
+        let mp_base = el_base + el_deltas.len() + 2;
+        assert_eq!(
+            built2.public[mp_base],
+            F128::ZERO,
+            "T_m + anchor.v is the multipoint zero-delta (R=2 and P>0)"
+        );
+        assert_eq!(
+            built2.public[mp_base + 1],
+            anc_end_n,
+            "the anchor rounds end at the native claim"
+        );
         // The sigma assertion, as the accumulator would read it: the value
         // and the mu point coordinates, matched against the native claim.
-        let sig_base = el_base + el_deltas.len() + 2;
+        let sig_base = mp_base + 2;
         assert_eq!(
             built2.public[sig_base],
             proof.wiring.gkr.s_sigma_eval,
@@ -9163,8 +9228,9 @@ fn mvp10_circuit_inner_tape() {
          inner: nu {} | dense_m {} | pd claims {} (2 element + {} gathers) | P {} | mu {}\n  \
          outer: chain b3 rows {} | nu {} | dense_m {} | mu {}\n  \
          outer carries: the chain, the QUERY PHASE (61-word leaves), the\n         \
-         WIRING GKR ({} layers, {} zero-deltas), the element PIOP, and the\n         \
-         sigma assertion (value + {} point coords, discharges)\n  \
+         WIRING GKR ({} layers, {} zero-deltas), the element PIOP, the\n         \
+         MULTIPOINT intake (R=2 and P={}), and the sigma assertion\n         \
+         (value + {} point coords, discharges)\n  \
          proof {:.1} KiB\n",
         nu,
         union.dense_m(),
@@ -9178,6 +9244,7 @@ fn mvp10_circuit_inner_tape() {
         outer_stats.3,
         proof.wiring.gkr.layers.len(),
         outer_stats.4,
+        n_p,
         built.shape.circuit.cells().mu(),
         outer_stats.5 as f64 / 1024.0,
     );
