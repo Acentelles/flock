@@ -6232,7 +6232,7 @@ fn mvp9_boolean_leaf_tape() {
     // linearized coefficients derived from the SAME pub helpers, and
     // running == q_eval·V closed with the R = 2 recombination. This is the
     // exact relation chain the leaf circuit will publish as zero-deltas.
-    {
+    let (native_target, native_running) = {
         use flock_core::pcs::ring_switch as rs;
         use flock_core::zerocheck::univariate_skip::build_eq;
         let (mut v, mut c, mut i) = (0usize, 0usize, 0usize);
@@ -6320,7 +6320,8 @@ fn mvp9_boolean_leaf_tape() {
             }
         }
         assert_eq!(running, q_eval * big_v, "the R = 2 merged boundary replays");
-    }
+        (target, running)
+    };
 
     // ---- phase 2a step 2 + the query-phase port: the leaf's chain AND
     // query phase in-circuit — Merkle openings against the absorbed caps,
@@ -6358,7 +6359,7 @@ fn mvp9_boolean_leaf_tape() {
                 }
             })
             .collect();
-        let (_start_v, piop_o, gammas_o, _w_rounds, _mp2, _inner_pd2, _yr_v2, levels) =
+        let (_start_v, piop_o, gammas_o, w_rounds, _mp2, _inner_pd2, _yr_v2, levels) =
             parse_open_levels(t_shape.ops(), 32 * lig.initial_cap.len(), r);
         assert!(piop_o.is_none(), "a boolean tape has no element PIOP");
         assert!(gammas_o.is_empty(), "no packed-direct claims at the leaf");
@@ -6553,6 +6554,32 @@ fn mvp9_boolean_leaf_tape() {
             to_publish.push((a_wires, opens));
             level_accs.push(acc);
         }
+        // ---- the intake W-rounds in-circuit: the RS target enters as
+        // CHECKER-VALIDATED advice (its sc dots are family-H — the bit
+        // transpose — deferred to the boundary batch), the W-rounds fold
+        // it through mrslot binding rho, and `running` publishes; the
+        // checker closes target == Σ γ·sc and running == q_eval·V
+        // natively (the 2b replay above is the reference).
+        let mut vmap: Vec<Option<usize>> = Vec::new();
+        for (wi, w) in stream.words.iter().enumerate() {
+            if let flock_core::transcript_record::StreamWord::Value(vi) = *w {
+                if vmap.len() <= vi {
+                    vmap.resize(vi + 1, None);
+                }
+                vmap[vi] = Some(wi);
+            }
+        }
+        let wv = |vi: usize| -> Wire { ww[vmap[vi].expect("stream word")].expect("wired") };
+        let mrslot = sb.slot(MergedRoundGate::new());
+        leaf_slot.push((400, mrslot));
+        vals.push(native_target);
+        let tw = sb.public_input();
+        let mut runw = tw;
+        for rr in &w_rounds {
+            let r_w = outs[trace.squeezes[rr.fin][0]][0];
+            runw = sb.gate(mrslot, &[runw, wv(rr.g_v), wv(rr.g_v + 1), r_w])[0];
+        }
+
         for (a_wires, opens) in &to_publish {
             for w in a_wires {
                 sb.publish(*w);
@@ -6571,6 +6598,8 @@ fn mvp9_boolean_leaf_tape() {
                 sb.publish(*w);
             }
         }
+        sb.publish(tw);
+        sb.publish(runw);
         let shape = sb.finish().expect("valid leaf query-phase circuit");
         let hint_refs: Vec<&dyn std::any::Any> =
             hints.iter().map(|h| h as &dyn std::any::Any).collect();
@@ -6578,6 +6607,7 @@ fn mvp9_boolean_leaf_tape() {
 
         // ---- boundary checks: alphas, cap selects, and the enforced sums.
         let total_pub: usize = levels.len()
+            + 2
             + 3 * pows.len()
             + levels
                 .iter()
@@ -6637,6 +6667,18 @@ fn mvp9_boolean_leaf_tape() {
                 );
             }
         }
+        // The intake boundary: the advice target and the in-circuit
+        // running, both checker-validated against the native replay.
+        assert_eq!(
+            built.public[built.public.len() - 2],
+            native_target,
+            "the RS target advice is the native gamma-combination"
+        );
+        assert_eq!(
+            built.public[built.public.len() - 1],
+            native_running,
+            "the W-rounds fold the target to the native running claim"
+        );
 
         // ---- prove / verify the leaf query-phase circuit ----
         let union_o = UnionInstance::new(&shape.registry, shape.counts.clone());
