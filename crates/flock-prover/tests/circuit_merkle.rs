@@ -8646,7 +8646,7 @@ fn mvp10_circuit_inner_tape() {
         assert_eq!(commitment.cap, lig.initial_cap, "commitment IS the L0 cap");
         let r_lvl = lig.recursive_caps.len();
         let lvl_src = level_sources(lig);
-        let (_start_v, piop_o, gammas_o, _w_rounds, mp_o, _inner_pd2, _yr_v2, levels) =
+        let (start_v, piop_o, gammas_o, _w_rounds, mp_o, inner_pd2, _yr_v2, levels) =
             parse_open_levels(ops, 32 * lig.initial_cap.len(), r_lvl);
         assert!(piop_o.is_some(), "a mixed tape carries the element PIOP");
         assert_eq!(
@@ -8859,6 +8859,116 @@ fn mvp10_circuit_inner_tape() {
             t
         };
 
+        // ---- assembly step 6: the LIGERITO SPINE ----
+        // Start from gamma'*q_eval, then per level: eval the running quad at
+        // each fold challenge and rebuild it from the absorbed message,
+        // intro-folding the OOD claims and — at every level but the last —
+        // this level's enforced sum, which is the QUERY PHASE's own
+        // accumulator wire, consumed in-circuit. The final t_r publishes and
+        // is held against a native replay, which transitively validates every
+        // eval/build/fold row AND the accumulators feeding them.
+        let spine = sb.slot(SpineGate::new());
+        let gpw = outs[trace.squeezes[inner_pd2.fin][0]][0];
+        let tw0 = sb.gate(
+            spine,
+            &[zw, zw, zw, zw, zw, zw, wv(inner_pd2.q_v), gpw, zw],
+        );
+        let mut tsp = tw0[3];
+        let st = sb.gate(
+            spine,
+            &[zw, zw, zw, zw, wv(start_v), wv(start_v + 1), tsp, ow, zw],
+        );
+        let (mut qc, mut qb, mut qa) = (st[0], st[1], st[2]);
+        for (li, lvl) in levels.iter().enumerate() {
+            for (j, &mv) in lvl.fold_msg_vs.iter().enumerate() {
+                let rw = outs[trace.squeezes[lvl.fold_fins[j]][0]][0];
+                let ev = sb.gate(spine, &[qc, qb, qa, zw, zw, zw, zw, zw, rw]);
+                tsp = ev[4];
+                let bld = sb.gate(
+                    spine,
+                    &[zw, zw, zw, zw, wv(mv), wv(mv + 1), tsp, ow, zw],
+                );
+                (qc, qb, qa) = (bld[0], bld[1], bld[2]);
+            }
+            if li < r_lvl {
+                for od in &lvl.ood {
+                    let bw = outs[trace.squeezes[od.beta_fin][0]][0];
+                    let f = sb.gate(
+                        spine,
+                        &[
+                            qc,
+                            qb,
+                            qa,
+                            tsp,
+                            wv(od.intro_v),
+                            wv(od.intro_v + 1),
+                            wv(od.y_v),
+                            bw,
+                            zw,
+                        ],
+                    );
+                    (qc, qb, qa, tsp) = (f[0], f[1], f[2], f[3]);
+                }
+                let bw = outs[trace.squeezes[lvl.beta_fin][0]][0];
+                let f = sb.gate(
+                    spine,
+                    &[
+                        qc,
+                        qb,
+                        qa,
+                        tsp,
+                        wv(lvl.intro_v),
+                        wv(lvl.intro_v + 1),
+                        level_accs[li],
+                        bw,
+                        zw,
+                    ],
+                );
+                (qc, qb, qa, tsp) = (f[0], f[1], f[2], f[3]);
+            } else {
+                let bw = outs[trace.squeezes[lvl.beta_fin][0]][0];
+                let f = sb.gate(spine, &[zw, zw, zw, tsp, zw, zw, level_accs[li], bw, zw]);
+                tsp = f[3];
+            }
+        }
+        let t_final = tsp;
+        // The native quad replay the published t_r must match.
+        let t_final_n = {
+            let quad = |u0: F128, u2: F128, t: F128| (u0, t + u2, u2);
+            let evalq = |q: (F128, F128, F128), x: F128| q.0 + x * q.1 + x * x * q.2;
+            let mut nt = chals[inner_pd2.ch] * vals_rec[inner_pd2.q_v];
+            let mut nq = quad(vals_rec[start_v], vals_rec[start_v + 1], nt);
+            for (li, lvl) in levels.iter().enumerate() {
+                for (j, &mv) in lvl.fold_msg_vs.iter().enumerate() {
+                    nt = evalq(nq, chals[lvl.fold_chs[j]]);
+                    nq = quad(vals_rec[mv], vals_rec[mv + 1], nt);
+                }
+                if li < r_lvl {
+                    for od in &lvl.ood {
+                        let b = chals[od.beta_ch];
+                        let iq = quad(
+                            vals_rec[od.intro_v],
+                            vals_rec[od.intro_v + 1],
+                            vals_rec[od.y_v],
+                        );
+                        nq = (nq.0 + b * iq.0, nq.1 + b * iq.1, nq.2 + b * iq.2);
+                        nt += b * vals_rec[od.y_v];
+                    }
+                    let b = chals[lvl.beta_ch];
+                    let iq = quad(
+                        vals_rec[lvl.intro_v],
+                        vals_rec[lvl.intro_v + 1],
+                        native_sums[li],
+                    );
+                    nq = (nq.0 + b * iq.0, nq.1 + b * iq.1, nq.2 + b * iq.2);
+                    nt += b * native_sums[li];
+                } else {
+                    nt += chals[lvl.beta_ch] * native_sums[li];
+                }
+            }
+            nt
+        };
+
         // ---- assembly step 3: the ELEMENT PIOP rounds in-circuit ----
         // The mixed inner's element half, type reuse from mvp8: the
         // zerocheck's rounds are ZcRoundGate rows (tau slice wires as eq
@@ -8971,6 +9081,7 @@ fn mvp10_circuit_inner_tape() {
         sb.publish(el_lcw);
         sb.publish(mp_delta);
         sb.publish(anc_w);
+        sb.publish(t_final);
         // ---- the SIGMA ASSERTION emission (route B, in-circuit) ----
         // The claim exits as bound publics: the value is the deferred
         // s_sigma stream word — the SAME wire the rhs input check just
@@ -8981,7 +9092,7 @@ fn mvp10_circuit_inner_tape() {
         for w in &pt_w {
             sb.publish(*w);
         }
-        let n_tail = 2 + gkr_deltas.len() + el_deltas.len() + 2 + 2 + 1 + mu_i;
+        let n_tail = 2 + gkr_deltas.len() + el_deltas.len() + 2 + 3 + 1 + mu_i;
         let n_query_pub: usize = levels.len()
             + levels
                 .iter()
@@ -9082,9 +9193,16 @@ fn mvp10_circuit_inner_tape() {
             anc_end_n,
             "the anchor rounds end at the native claim"
         );
+        // THE LIGERITO CLOSE: the in-circuit spine — every eval/build/fold
+        // row plus the query phase's accumulators — reaches the native t_r.
+        assert_eq!(
+            built2.public[mp_base + 2],
+            t_final_n,
+            "the spine's final t_r matches the native replay"
+        );
         // The sigma assertion, as the accumulator would read it: the value
         // and the mu point coordinates, matched against the native claim.
-        let sig_base = mp_base + 2;
+        let sig_base = mp_base + 3;
         assert_eq!(
             built2.public[sig_base],
             proof.wiring.gkr.s_sigma_eval,
@@ -9131,7 +9249,7 @@ fn mvp10_circuit_inner_tape() {
         // The element slots the GKR transcription added, in REGISTRY order.
         // Every element slot: the GKR/PIOP round gates AND the leaf-eval
         // slots the query phase created.
-        let mut el_all: Vec<flock_core::circuit::builder::SlotId> = vec![macs, zcr, mrs];
+        let mut el_all: Vec<flock_core::circuit::builder::SlotId> = vec![macs, zcr, mrs, spine];
         el_all.extend(le_slots.iter().map(|(_, sl)| *sl));
         let mut el_ord: Vec<(usize, Vec<F128>)> = el_all
             .into_iter()
@@ -9229,8 +9347,8 @@ fn mvp10_circuit_inner_tape() {
          outer: chain b3 rows {} | nu {} | dense_m {} | mu {}\n  \
          outer carries: the chain, the QUERY PHASE (61-word leaves), the\n         \
          WIRING GKR ({} layers, {} zero-deltas), the element PIOP, the\n         \
-         MULTIPOINT intake (R=2 and P={}), and the sigma assertion\n         \
-         (value + {} point coords, discharges)\n  \
+         MULTIPOINT intake (R=2 and P={}), the SPINE (t_r bound), and the\n         \
+         sigma assertion (value + {} point coords, discharges)\n  \
          proof {:.1} KiB\n",
         nu,
         union.dense_m(),
