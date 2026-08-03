@@ -8054,3 +8054,326 @@ fn mvp9_boolean_leaf_tape() {
         );
     }
 }
+
+/// **MVP-10 step 1 — the circuit-inner tape.** Phase 3's inner is a CIRCUIT
+/// proof; this pins its transcript regions before any assembly — the same
+/// step 1 every phase ran. The inner is a minimal MIXED circuit (one blake3
+/// compression feeding a MacGate chain across the class boundary, end
+/// published), proven over the circuit path and natively verified under a
+/// RecordingChallenger. Pinned: the region order (boolean PIOP → element
+/// PIOP → wiring GKR → merged open), the boolean zerocheck slices, the
+/// wiring GKR's final (f, g, s_σ) triple on the value stream (the value the
+/// σ route-B assertion carries), the packed-direct claims = element (2) +
+/// the wiring GATHERS (count and every gather value absorbed), rs×2, and
+/// the FIRST R=2 + P>0 multipoint schedule: T0 = Σ γ^{128i+j}·A_ij +
+/// Σ γ^{256+k}·B_k folds through the rounds to T_m == anchor.v.
+/// Scaffolding inner per the mvp8 precedent; mvp9's outer becomes the
+/// inner when phase-3 transcription starts.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn mvp10_circuit_inner_tape() {
+    use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
+    use flock_prover::prover::UnionElementSlotInput;
+
+    // nu 11 puts the blake3 slot alone at 2^22 dense bits — the Ligerito
+    // floor — with ONE live row (pay-per-live carries the capacity).
+    let nu = 11usize;
+    let mut rng = Rng(0x4D51_0001);
+    let mut b = CircuitBuilder::new(nu);
+    let hash = b.slot(Blake3Gate { nu });
+    let mac = b.slot(MacGate::new());
+    let iv = pack8(&IV);
+    let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let mut hash_in = vec![b.public_value(iv[0]), b.public_value(iv[1])];
+    for j in 0..4 {
+        hash_in.push(b.public_value(pack4(m[4 * j..4 * j + 4].try_into().unwrap())));
+    }
+    hash_in.push(b.public_value(pack_params(0, 64, CHUNK_START | CHUNK_END)));
+    let out = b.gate(hash, &hash_in);
+    let zero = b.public_value(F128::ZERO);
+    let mut acc = zero;
+    for j in 0..3 {
+        acc = b.gate(mac, &[acc, out[j], out[j + 1]])[0];
+    }
+    b.publish(acc);
+    let built = b.finish().expect("the mixed inner builds");
+
+    // ---- prove over the circuit path, verify natively ----
+    let union = UnionInstance::new(&built.shape.registry, built.shape.counts.clone());
+    let pcs_params = PcsParams {
+        m: union.dense_m(),
+        log_inv_rate: 1,
+        log_batch_size: 6,
+        profile: LigeritoProfile::Fast,
+        num_lanes: union.commit_lanes(6),
+        merkle_hash: Default::default(),
+    };
+    let blake_r1cs = blake3::build_block_r1cs(nu);
+    let blake_lc = blake_r1cs.csc_lincheck_circuit();
+    let el_z = match MacGate::new().witness(built.rows::<MacGate>(mac), nu) {
+        SlotWitness::Element(z) => z,
+        other => panic!("mac witness is {other:?}"),
+    };
+    let mut ch = FsChallenger::new(DOMAIN);
+    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
+        &union,
+        &built.shape.circuit,
+        &built.witness.public,
+        &pcs_params,
+        vec![UnionSlotProverInput::new(
+            blake3::generate_witness_batch_major_partial(built.rows::<Blake3Gate>(hash), nu),
+            blake_lc,
+        )],
+        vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
+            dst.copy_from_slice(&el_z)
+        })],
+        &mut ch,
+    );
+    let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
+    let mut rec = RecordingChallenger::new(FsChallenger::new(DOMAIN));
+    verifier::verify_ligerito_union_circuit(
+        &union,
+        &built.shape.circuit,
+        &built.witness.public,
+        &lcs,
+        &commitment,
+        &proof,
+        &pcs_params,
+        &mut rec,
+    )
+    .expect("the mixed circuit inner verifies");
+    let t_shape = rec.shape();
+    let chals: Vec<F128> = rec.challenges().to_vec();
+    let vals_rec = rec.values();
+    let ops = t_shape.ops();
+
+    // ---- the label map: the region order phase 3 builds against ----
+    let find = |label: &[u8]| -> Vec<usize> {
+        ops.iter()
+            .enumerate()
+            .filter_map(|(i, op)| match op {
+                Op::Label(l) if l.as_slice() == label => Some(i),
+                _ => None,
+            })
+            .collect()
+    };
+    let zc_l = find(b"flock-zerocheck-v0");
+    let lc_l = find(b"flock-lincheck-v0");
+    let el_l = find(b"flock-element-union-lc-v0");
+    let gkr_l = find(b"flock-product-gkr-batched-v0");
+    let mo_l = find(b"flock-merged-open-v0");
+    let rs_l = find(b"flock-ring-switch-v0");
+    let mp_l = find(b"flock-multipoint-twisted-v1");
+    let fa_l = find(b"flock-frobenius-assist-v0");
+    assert_eq!(zc_l.len(), 1, "one boolean zerocheck");
+    assert_eq!(lc_l.len(), 1, "one boolean lincheck");
+    assert_eq!(el_l.len(), 1, "one element lincheck region");
+    assert_eq!(gkr_l.len(), 1, "one batched wiring GKR");
+    assert_eq!(mo_l.len(), 1, "one merged open");
+    assert_eq!(rs_l.len(), 2, "rs x 2 — one ab/c pair for the boolean class");
+    assert_eq!(mp_l.len(), 1, "one multipoint region");
+    assert_eq!(fa_l.len(), 1, "one anchor region");
+    assert!(zc_l[0] < lc_l[0], "boolean zc before boolean lc");
+    assert!(lc_l[0] < el_l[0], "boolean PIOP before element PIOP");
+    assert!(el_l[0] < gkr_l[0], "element PIOP before the wiring GKR");
+    assert!(gkr_l[0] < mo_l[0], "wiring GKR before the merged open");
+    assert!(mo_l[0] < rs_l[0] && rs_l[1] < mp_l[0] && mp_l[0] < fa_l[0]);
+
+    // (v, c) counters up to an op index — the walker every pin shares.
+    let vc_at = |end: usize| -> (usize, usize) {
+        let (mut v, mut c) = (0usize, 0usize);
+        for op in &ops[..end] {
+            match op {
+                Op::SqueezeScalar => c += 1,
+                Op::SqueezeSlice(n) => c += n,
+                Op::ObserveScalar => v += 1,
+                Op::ObserveSlice(n) => v += n,
+                _ => {}
+            }
+        }
+        (v, c)
+    };
+
+    // ---- the boolean zerocheck slices, same shape as the leaf ----
+    let bp = proof.boolean.as_ref().expect("boolean side present");
+    assert!(proof.element.is_some(), "element side present");
+    {
+        let mut i = zc_l[0] + 1;
+        assert!(matches!(ops[i], Op::SqueezeSlice(_)), "zc tau lo");
+        i += 1;
+        assert!(matches!(ops[i], Op::SqueezeSlice(_)), "zc tau hi");
+        i += 1;
+        assert!(matches!(ops[i], Op::ObserveSlice(64)), "round1_ab");
+        let (v0, _) = vc_at(i);
+        assert_eq!(
+            &vals_rec[v0..v0 + 64],
+            &bp.zerocheck.round1_ab[..],
+            "round1_ab on the stream"
+        );
+        i += 1;
+        assert!(matches!(ops[i], Op::ObserveSlice(64)), "round1_c");
+        let (v1, _) = vc_at(i);
+        assert_eq!(
+            &vals_rec[v1..v1 + 64],
+            &bp.zerocheck.round1_c[..],
+            "round1_c on the stream"
+        );
+    }
+
+    // ---- the wiring GKR's final claim triple (f, g, s_sigma) ----
+    // s_sigma_eval is the value the sigma route-B assertion carries out;
+    // its stream position is what the phase-3 assembly will wire.
+    {
+        let (gv0, _) = vc_at(gkr_l[0]);
+        let (gv1, _) = vc_at(mo_l[0]);
+        let region = &vals_rec[gv0..gv1];
+        let triple = [
+            proof.wiring.gkr.f_eval,
+            proof.wiring.gkr.g_eval,
+            proof.wiring.gkr.s_sigma_eval,
+        ];
+        assert!(
+            region.windows(3).any(|w| w == triple),
+            "the GKR final (f, g, s_sigma) triple is absorbed in its region"
+        );
+    }
+
+    // ---- the merged open: rs x 2, then the packed-direct claims ----
+    let (pd_recs, mp_val_v) = {
+        let mut i = mo_l[0] + 1;
+        for k in 0..2 {
+            assert!(
+                matches!(&ops[i], Op::Label(l) if l.as_slice() == b"flock-ring-switch-v0"),
+                "rs region {k}"
+            );
+            i += 1;
+            assert!(matches!(ops[i], Op::ObserveSlice(128)), "s_hat_v slice");
+            let (sv, _) = vc_at(i);
+            assert_eq!(
+                &vals_rec[sv..sv + 128],
+                &proof.pcs_open.ring_switches[k].s_hat_v[..],
+                "s_hat_v {k} on the stream"
+            );
+            i += 1;
+            assert!(matches!(ops[i], Op::SqueezeSlice(7)), "r_dprime");
+            i += 1;
+        }
+        for _ in 0..2 {
+            assert!(matches!(ops[i], Op::SqueezeScalar), "rs gamma");
+            i += 1;
+        }
+        // Packed-direct claims: [ObserveSlice(point), ObserveScalar(value),
+        // SqueezeScalar(gamma)] each — the slice discriminates them from the
+        // W rounds that follow.
+        let mut pd_recs: Vec<(usize, usize)> = Vec::new(); // (point_len, value index)
+        while let Op::ObserveSlice(n) = ops[i] {
+            let (_, _) = vc_at(i);
+            i += 1;
+            assert!(matches!(ops[i], Op::ObserveScalar), "pd value");
+            let (pv, _) = vc_at(i);
+            i += 1;
+            assert!(matches!(ops[i], Op::SqueezeScalar), "pd gamma");
+            i += 1;
+            pd_recs.push((n, pv));
+        }
+        // W rounds until the multipoint label.
+        let mut w_rounds = 0usize;
+        while matches!(ops[i], Op::ObserveScalar) {
+            assert!(matches!(ops[i + 1], Op::ObserveScalar), "w round pair");
+            assert!(matches!(ops[i + 2], Op::SqueezeScalar), "w round squeeze");
+            i += 3;
+            w_rounds += 1;
+        }
+        assert_eq!(
+            w_rounds,
+            proof.pcs_open.merged_rounds.len(),
+            "the W rounds fill the dense domain"
+        );
+        while !matches!(&ops[i], Op::Label(l) if l.as_slice() == b"flock-multipoint-twisted-v1") {
+            i += 1;
+        }
+        i += 1;
+        let (mv, _) = vc_at(i);
+        (pd_recs, mv)
+    };
+    // The pd claims are the element class's two (c, lc) plus one per wiring
+    // GATHER; every gather value is absorbed, in proof order.
+    assert_eq!(
+        pd_recs.len(),
+        2 + proof.wiring.gather.len(),
+        "pd claims = element (c, lc) + the wiring gathers"
+    );
+    let pd_vals: Vec<F128> = pd_recs.iter().map(|&(_, pv)| vals_rec[pv]).collect();
+    for (k, g) in proof.wiring.gather.iter().enumerate() {
+        assert!(
+            pd_vals.contains(g),
+            "gather value {k} rides a packed-direct claim"
+        );
+    }
+
+    // ---- the multipoint: the FIRST R=2 + P>0 schedule ----
+    let fro = &proof.pcs_open.frobenius;
+    let n_p = fro.group_values.len();
+    assert!(n_p > 0, "a circuit inner carries scalar groups (P > 0)");
+    {
+        let mut i = mp_l[0] + 1;
+        let mut n_vals = 0usize;
+        while matches!(ops[i], Op::ObserveScalar) {
+            n_vals += 1;
+            i += 1;
+        }
+        assert_eq!(n_vals, 256 + n_p, "2x128 RS dual values + P group values");
+        assert!(matches!(ops[i], Op::SqueezeScalar), "multipoint gamma");
+        let (_, gc) = vc_at(i);
+        let gamma = chals[gc];
+        i += 1;
+        // The located values ARE the proof's, in schedule order.
+        for k in 0..n_vals {
+            let want = if k < 256 {
+                fro.values[k / 128][k % 128]
+            } else {
+                fro.group_values[k - 256]
+            };
+            assert_eq!(vals_rec[mp_val_v + k], want, "mp value {k}");
+        }
+        // T0 under the R=2 + P schedule folds through the rounds to the
+        // anchor's claimed v — consecutive gamma powers across BOTH kinds.
+        let mut t = F128::ZERO;
+        let mut pw = F128::ONE;
+        for k in 0..n_vals {
+            t += pw * vals_rec[mp_val_v + k];
+            pw *= gamma;
+        }
+        let mut rounds = 0usize;
+        while matches!(ops[i], Op::ObserveScalar)
+            && matches!(ops[i + 1], Op::ObserveScalar)
+            && matches!(ops[i + 2], Op::SqueezeScalar)
+        {
+            let (gv, _) = vc_at(i);
+            let (_, rc) = vc_at(i + 2);
+            let (g1, gi) = (vals_rec[gv], vals_rec[gv + 1]);
+            let r = chals[rc];
+            let g0 = t + g1;
+            t = g0 + (g1 + g0 + gi) * r + gi * r * r;
+            i += 3;
+            rounds += 1;
+        }
+        assert_eq!(rounds, fro.rounds.len(), "mp round count");
+        assert!(
+            matches!(&ops[i], Op::Label(l) if l.as_slice() == b"flock-frobenius-assist-v0"),
+            "anchor label follows the rounds"
+        );
+        assert_eq!(t, fro.anchor.v, "T_m == anchor.v under the R=2+P schedule");
+    }
+
+    println!(
+        "\nMVP-10 CIRCUIT-INNER TAPE (mixed: blake3 + mac, wired)\n  \
+         nu {} | dense_m {} | pd claims {} (2 element + {} gathers) | P {} | ops {}\n",
+        nu,
+        union.dense_m(),
+        pd_recs.len(),
+        proof.wiring.gather.len(),
+        n_p,
+        ops.len(),
+    );
+}
