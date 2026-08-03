@@ -8106,7 +8106,9 @@ fn mvp10_circuit_inner_tape() {
         log_batch_size: 6,
         profile: LigeritoProfile::Fast,
         num_lanes: union.commit_lanes(6),
-        merkle_hash: Default::default(),
+        // BLAKE3 for BOTH Merkle and FS (above): the outer's chain and
+        // opening gates model blake3 — the defaults diverge silently.
+        merkle_hash: HashKind::Blake3,
     };
     let blake_r1cs = blake3::build_block_r1cs(nu);
     let blake_lc = blake_r1cs.csc_lincheck_circuit();
@@ -8114,7 +8116,7 @@ fn mvp10_circuit_inner_tape() {
         SlotWitness::Element(z) => z,
         other => panic!("mac witness is {other:?}"),
     };
-    let mut ch = FsChallenger::new(DOMAIN);
+    let mut ch = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
     let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
         &union,
         &built.shape.circuit,
@@ -8130,7 +8132,7 @@ fn mvp10_circuit_inner_tape() {
         &mut ch,
     );
     let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
-    let mut rec = RecordingChallenger::new(FsChallenger::new(DOMAIN));
+    let mut rec = RecordingChallenger::new(FsChallenger::with_hash(DOMAIN, HashKind::Blake3));
     verifier::verify_ligerito_union_circuit(
         &union,
         &built.shape.circuit,
@@ -8446,14 +8448,122 @@ fn mvp10_circuit_inner_tape() {
         assert_eq!(t, fro.anchor.v, "T_m == anchor.v under the R=2+P schedule");
     }
 
+    // ---- assembly step 1: the chain in-circuit ----
+    // The inner's whole blake3-FS transcript replays through ONE b3 slot;
+    // squeeze wires ARE the challenges. Two derived challenges publish and
+    // are held against the recorded ordinals — the GKR alpha (mid-tape)
+    // and the multipoint gamma (deep tape) — then the outer proves and
+    // verifies over the circuit path. The query phase comes next.
+    let outer_stats = {
+        use flock_prover::r1cs_hashes::fs_chain::FsChain;
+        let stream = t_shape.stream_words(DOMAIN);
+        let bytes = stream.to_bytes(rec.values(), rec.payloads());
+        let mut chain = FsChain::new();
+        let mut at = 0usize;
+        let fin_ops: Vec<_> = t_shape.ops().iter().filter(|o| o.finalizes()).collect();
+        assert_eq!(
+            stream.finalize_after.len(),
+            fin_ops.len(),
+            "finalize alignment"
+        );
+        for (k, &upto) in stream.finalize_after.iter().enumerate() {
+            chain.absorb(&bytes[at * 16..upto * 16]);
+            at = upto;
+            chain.finalize(fin_ops[k].squeezed_bytes());
+        }
+        chain.absorb(&bytes[at * 16..]);
+        let trace = chain.finish();
+        let b3_rows = trace.rows.len();
+        let nu2 = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(3);
+        let mut sb = ShapeBuilder::new(nu2);
+        let b3s = sb.slot(Blake3Gate { nu: nu2 });
+        let mut vals: Vec<F128> = Vec::new();
+        let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+        vals.extend_from_slice(&iv_w);
+        let iv2 = [sb.public_input(), sb.public_input()];
+        let (outs, _ww) = emit_fs_chain(&mut sb, b3s, iv2, &trace, &stream, &bytes, &mut vals);
+        // fin ordinal of a squeeze op = finalizing ops strictly before it.
+        let fin_at = |end: usize| ops[..end].iter().filter(|o| o.finalizes()).count();
+        let ga_fin = fin_at(gkr_l[0] + 1);
+        let ga_w = outs[trace.squeezes[ga_fin][0]][0];
+        let mut mp_i = mp_l[0] + 1;
+        while matches!(ops[mp_i], Op::ObserveScalar) {
+            mp_i += 1;
+        }
+        assert!(matches!(ops[mp_i], Op::SqueezeScalar), "mp gamma op");
+        let mg_fin = fin_at(mp_i);
+        let mg_w = outs[trace.squeezes[mg_fin][0]][0];
+        sb.publish(ga_w);
+        sb.publish(mg_w);
+        let shape2 = sb.finish().expect("the mvp10 chain circuit builds");
+        let built2 = shape2.run(&vals, &[]);
+        let (_, ga_c) = vc_at(gkr_l[0] + 1);
+        let (_, mg_c) = vc_at(mp_i);
+        let np2 = built2.public.len();
+        assert_eq!(
+            built2.public[np2 - 2],
+            chals[ga_c],
+            "the GKR alpha derives in-circuit"
+        );
+        assert_eq!(
+            built2.public[np2 - 1],
+            chals[mg_c],
+            "the multipoint gamma derives in-circuit"
+        );
+        // The outer proves and verifies over the circuit path.
+        let union2 = UnionInstance::new(&shape2.registry, shape2.counts.clone());
+        let pcs2 = PcsParams {
+            m: union2.dense_m(),
+            log_inv_rate: 1,
+            log_batch_size: 6,
+            profile: LigeritoProfile::Fast,
+            num_lanes: union2.commit_lanes(6),
+            merkle_hash: Default::default(),
+        };
+        let b3_r1cs2 = blake3::build_block_r1cs(nu2);
+        let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
+        let mut ch2 = FsChallenger::new(DOMAIN);
+        let (oproof, ocommit, _) = prover::prove_fast_ligerito_union_circuit(
+            &union2,
+            &shape2.circuit,
+            &built2.public,
+            &pcs2,
+            vec![UnionSlotProverInput::new(
+                blake3::generate_witness_batch_major_partial(built2.rows::<Blake3Gate>(b3s), nu2),
+                b3_lc2,
+            )],
+            Vec::new(),
+            &mut ch2,
+        );
+        let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![b3_lc2];
+        let mut ch2 = FsChallenger::new(DOMAIN);
+        verifier::verify_ligerito_union_circuit(
+            &union2,
+            &shape2.circuit,
+            &built2.public,
+            &lcs2,
+            &ocommit,
+            &oproof,
+            &pcs2,
+            &mut ch2,
+        )
+        .expect("the mvp10 chain circuit verifies");
+        (b3_rows, nu2, union2.dense_m(), shape2.circuit.cells().mu())
+    };
+
     println!(
         "\nMVP-10 CIRCUIT-INNER TAPE (mixed: blake3 + mac, wired)\n  \
-         nu {} | dense_m {} | pd claims {} (2 element + {} gathers) | P {} | ops {}\n",
+         nu {} | dense_m {} | pd claims {} (2 element + {} gathers) | P {} | ops {}\n  \
+         chain: b3 rows {} | outer nu {} | outer dense_m {} | outer mu {}\n",
         nu,
         union.dense_m(),
         pd_recs.len(),
         proof.wiring.gather.len(),
         n_p,
         ops.len(),
+        outer_stats.0,
+        outer_stats.1,
+        outer_stats.2,
+        outer_stats.3,
     );
 }
