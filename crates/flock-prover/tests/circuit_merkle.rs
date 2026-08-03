@@ -2962,11 +2962,81 @@ impl GateType for FinalDotGate {
     }
 }
 
+/// One merged W-round of the verifier (`jagged::fold_round_claim`):
+/// `t' = (t + g1) + (t + gi) r + gi r^2` — messages `(G(1), G(inf))` wire
+/// from the absorbed stream, `r` from the chain squeeze; the chain of these
+/// binds rho and carries the outer gamma-combination down to `running`.
+struct MergedRoundGate {
+    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+}
+
+impl MergedRoundGate {
+    fn new() -> Self {
+        use flock_core::element_r1cs::ElementTableBuilder;
+        let o = F128::ONE;
+        // in: t(0), g1(1), gi(2), r(3)
+        let mut b = ElementTableBuilder::new(4);
+        for w in 0..4 {
+            b.free_wire(w);
+        }
+        b.mult_lin(4, &[(0, o), (2, o)], &[(3, o)]); // (t+gi) r
+        b.mult(5, 3, 3); // r^2
+        b.mult(6, 5, 2); // gi r^2
+        b.linear(7, &[(0, o), (1, o), (4, o), (6, o)]);
+        Self {
+            ty: std::sync::Arc::new(b.build().expect("merged round gate")),
+        }
+    }
+}
+
+impl GateType for MergedRoundGate {
+    type Row = Vec<F128>;
+    type Hint = ();
+    fn table(&self) -> TableType {
+        use flock_core::schedule::IoWord;
+        let mut schema: Vec<IoWord> = (0..4).map(IoWord::input).collect();
+        schema.push(IoWord::output(7));
+        TableType::element(self.ty.clone()).with_io_schema(schema)
+    }
+    fn eval(&self, inputs: &[F128], _h: &()) -> (Vec<F128>, Self::Row) {
+        let mut z = vec![F128::ZERO; 8];
+        z[..4].copy_from_slice(&inputs[..4]);
+        z[4] = (z[0] + z[2]) * z[3];
+        z[5] = z[3] * z[3];
+        z[6] = z[5] * z[2];
+        z[7] = z[0] + z[1] + z[4] + z[6];
+        (vec![z[7]], z)
+    }
+    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
+        let mut z = vec![F128::ZERO; self.ty.width() << nu];
+        for (j, row) in rows.iter().enumerate() {
+            for (col, &v) in row.iter().enumerate() {
+                z[(col << nu) + j] = v;
+            }
+        }
+        SlotWitness::Element(z)
+    }
+}
+
 /// One packed-direct claim on the tape: its absorbed point/value and gamma.
 struct PdRec {
     pt_v: usize,
     pt_len: usize,
     val_v: usize,
+    fin: usize,
+    ch: usize,
+}
+
+/// One merged W-round: the (G(1), G(inf)) value index and the rho squeeze.
+struct RoundRec {
+    g_v: usize,
+    fin: usize,
+    ch: usize,
+}
+
+/// The inner ligerito intake's single claim: q_eval's value index + gamma'.
+struct InnerPd {
+    q_v: usize,
     fin: usize,
     ch: usize,
 }
@@ -3015,7 +3085,7 @@ fn parse_open_levels(
     ops: &[flock_core::transcript_record::TranscriptOp],
     cap0_bytes: usize,
     r: usize,
-) -> (usize, Vec<PdRec>, usize, Vec<OpenLevel>) {
+) -> (usize, Vec<PdRec>, Vec<RoundRec>, InnerPd, usize, Vec<OpenLevel>) {
     use flock_core::transcript_record::TranscriptOp as Op;
     struct Cur<'a> {
         ops: &'a [Op],
@@ -3065,6 +3135,8 @@ fn parse_open_levels(
     // POINTS are stream words (wireable), and each gamma is a scalar squeeze.
     let mut cur = Cur { ops, i: 0, fin: 0, ch: 0, v: 0 };
     let mut gammas: Vec<PdRec> = Vec::new();
+    let mut rounds: Vec<RoundRec> = Vec::new();
+    let mut inner_pd: Option<InnerPd> = None;
     let mut in_pd = false;
     while cur.i < start {
         if matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == b"flock-merged-open-v0") {
@@ -3090,9 +3162,40 @@ fn parse_open_levels(
                 continue;
             }
             in_pd = false;
+            // The merged W-rounds follow the intake immediately: one
+            // [ObserveScalar x2, SqueezeScalar] triplet per dense variable
+            // (= the outer claims' point length).
+            let dense_log = gammas.last().expect("outer claims first").pt_len;
+            for _ in 0..dense_log {
+                let g_v = cur.v;
+                cur.expect_obs_scalar();
+                cur.expect_obs_scalar();
+                assert!(matches!(ops[cur.i], Op::SqueezeScalar), "rho");
+                rounds.push(RoundRec {
+                    g_v,
+                    fin: cur.fin,
+                    ch: cur.ch,
+                });
+                cur.bump();
+            }
+            continue;
+        }
+        if matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == b"flock-pcs-packed-direct-v0") {
+            cur.bump();
+            let q_v = cur.v;
+            cur.expect_obs_scalar(); // q_eval
+            assert!(matches!(ops[cur.i], Op::SqueezeScalar), "inner gamma");
+            inner_pd = Some(InnerPd {
+                q_v,
+                fin: cur.fin,
+                ch: cur.ch,
+            });
+            cur.bump();
+            continue;
         }
         cur.bump();
     }
+    let inner_pd = inner_pd.expect("the inner ligerito intake");
     cur.bump(); // the open-phase initial cap absorb
     let start_v = cur.v;
     cur.expect_obs_scalar(); // sumcheck start msg u_0
@@ -3207,7 +3310,7 @@ fn parse_open_levels(
             a_count,
         });
     }
-    (start_v, gammas, yr_v, levels)
+    (start_v, gammas, rounds, inner_pd, yr_v, levels)
 }
 
 // ---------------------------------------------------------------------------
@@ -3237,12 +3340,18 @@ fn parse_open_levels(
 /// enforced sum (the LeafEval accumulators, consumed in-circuit rather than
 /// boundary-checked) — and publishes the final `t_r`, checked against a
 /// native replay. The start target is a fixed public input until the merged
-/// intake lands (2c). **2b stage 1**: per-level `ResidualGate`s evaluate the
+/// intake lands (2c — now DONE, see below). **2b stage 1**: per-level `ResidualGate`s evaluate the
 /// induced-basis residuals (`next_s` chain, prefix over later fold
 /// challenges, suffix subset products) with `q_field` boundary-bound like
 /// the cap select; the `2^yr` accumulators publish and check against a
-/// native replica. Still native: eval_b, the OOD residuals, the final
-/// `inner == t_r`, and the PoW bit-predicates. The inner proof commits with
+/// native replica. **2c (the merged intake)**: the outer target is the
+/// gamma-combination of the ABSORBED claim values (SpineGate tr-rows), the
+/// W-rounds fold it through `MergedRoundGate` binding rho, and the ligerito
+/// spine starts from gamma' * q_eval — every scalar in the statement is
+/// transcript-bound, and `inner == t_r` closes BETWEEN CIRCUIT OUTPUTS.
+/// Still native: the Frobenius assist (the published `running` is checked
+/// against `q_eval * v` natively), the PoW bit-predicates, and the element
+/// PIOP's own round arithmetic. The inner proof commits with
 /// the lane grid at full utilization — count 2^13 x 4 cols = 2^15 words =
 /// exactly 2^22 dense bits, t = 64 — so L0 is the real 64-lane / 1 KiB-leaf
 /// shape with zero padding.
@@ -3259,10 +3368,6 @@ fn mvp7_real_query_phase() {
     use std::time::Instant;
 
     const DOMAIN7: &[u8] = b"flock-mvp7-real-v0";
-    /// The spine's start target. UNBOUND in 2a — its true value is the merged
-    /// intake's gamma-combination (step 2c); any fixed nonzero value
-    /// exercises the full quad chain against the native replay below.
-    const T0: F128 = F128::new(0xDEAD, 0xBEEF);
     const INNER_NU: usize = 13;
     let threads = flock_core::init_perf_thread_pool().unwrap_or_else(rayon::current_num_threads);
 
@@ -3367,7 +3472,7 @@ fn mvp7_real_query_phase() {
             }
         })
         .collect();
-    let (start_v, gammas, yr_v, levels) =
+    let (start_v, gammas, w_rounds, inner_pd, yr_v, levels) =
         parse_open_levels(t_shape.ops(), 32 * lig.initial_cap.len(), r);
     assert_eq!(levels.len(), r + 1);
 
@@ -3546,23 +3651,40 @@ fn mvp7_real_query_phase() {
         level_accs.push(acc);
     }
 
-    // ---- the sumcheck spine (2a): the verifier's running quad, in-circuit ----
-    // BUILD from the start message at the (for now unbound) start target; per
-    // fold round EVAL at the chain's challenge then BUILD from the next
-    // message; at level boundaries INTRO-FOLD the OOD claims and the level's
-    // enforced sum — the LeafEval accumulators, consumed here instead of
-    // boundary-checked. The start target becomes intake arithmetic later; a
-    // fixed nonzero value exercises every gate on real data meanwhile.
+    // ---- the merged intake + W-rounds (2c): binding the start target ----
+    // The outer target is the gamma-combination of the element claims'
+    // absorbed values; each merged round folds it through the quadratic
+    // (t+g1) + (t+gi)r + gi r^2, binding rho; the boundary check below
+    // closes `running == q_eval * v` with the assist's v native. The
+    // ligerito spine then starts from gamma' * q_eval — every scalar in the
+    // statement is now transcript-bound.
     vals.push(F128::ZERO);
     let zw = sb.public_input();
     vals.push(F128::ONE);
     let ow = sb.public_input();
-    vals.push(T0);
-    let mut tw = sb.public_input();
     let chw = |outs: &Vec<Vec<Wire>>, trace_sq: &Vec<Vec<usize>>, fin: usize| -> Wire {
         outs[trace_sq[fin][0]][0]
     };
     let wv = |vi: usize| -> Wire { word_wire[vmap[vi].expect("stream word")].expect("wired") };
+    // Outer target: SpineGate tr-rows accumulate gamma_k * value_k.
+    let mut mt = zw;
+    for pd in &gammas {
+        let gw = chw(&outs, &trace.squeezes, pd.fin);
+        let f = sb.gate(spine, &[zw, zw, zw, mt, zw, zw, wv(pd.val_v), gw, zw]);
+        mt = f[3];
+    }
+    // The W-rounds, binding rho.
+    let mrslot = sb.slot(MergedRoundGate::new());
+    leaf_slot.push((400, mrslot));
+    for rr in &w_rounds {
+        let rw = chw(&outs, &trace.squeezes, rr.fin);
+        mt = sb.gate(mrslot, &[mt, wv(rr.g_v), wv(rr.g_v + 1), rw])[0];
+    }
+    let running_w = mt;
+    // The ligerito start target: gamma' * q_eval.
+    let gpw = chw(&outs, &trace.squeezes, inner_pd.fin);
+    let tw0 = sb.gate(spine, &[zw, zw, zw, zw, zw, zw, wv(inner_pd.q_v), gpw, zw]);
+    let mut tw = tw0[3];
     let st = sb.gate(spine, &[zw, zw, zw, zw, wv(start_v), wv(start_v + 1), tw, ow, zw]);
     let (mut qc, mut qb, mut qa) = (st[0], st[1], st[2]);
     for (li, lvl) in levels.iter().enumerate() {
@@ -3672,20 +3794,21 @@ fn mvp7_real_query_phase() {
         }
     };
     let mut evb_accs: Vec<Wire> = (0..yr_len).map(|_| zw).collect();
-    // Packed-direct claims: seed = gamma, prefix over the full fold chain.
-    for pd in &gammas {
-        assert_eq!(pd.pt_len, pl_full + yr_log, "PD point spans the dense domain");
+    // The ligerito layer sees ONE packed-direct claim: (rho, q_eval) with
+    // gamma'. rho's coords are the merged-round squeezes — chain wires.
+    {
+        assert_eq!(w_rounds.len(), pl_full + yr_log, "rho spans the dense domain");
         let sl = pf_slot(&mut sb, &mut leaf_slot, pl_full);
-        let mut g_in = vec![chw(&outs, &trace.squeezes, pd.fin)];
-        for j in 0..pl_full {
-            g_in.push(wv(pd.pt_v + j));
+        let mut g_in = vec![chw(&outs, &trace.squeezes, inner_pd.fin)];
+        for rr in &w_rounds[..pl_full] {
+            g_in.push(chw(&outs, &trace.squeezes, rr.fin));
         }
         g_in.extend_from_slice(&ris_full);
         g_in.push(ow);
         let p = sb.gate(sl, &g_in)[0];
         let mut s_in = vec![p];
-        for j in 0..yr_log {
-            s_in.push(wv(pd.pt_v + pl_full + j));
+        for rr in &w_rounds[pl_full..] {
+            s_in.push(chw(&outs, &trace.squeezes, rr.fin));
         }
         s_in.push(ow);
         s_in.extend_from_slice(&evb_accs);
@@ -3747,6 +3870,7 @@ fn mvp7_real_query_phase() {
         }
     }
     sb.publish(t_final);
+    sb.publish(running_w);
     for accs in &resid_pub {
         for w in accs {
             sb.publish(*w);
@@ -3763,7 +3887,7 @@ fn mvp7_real_query_phase() {
     let (built, online_t) = timed(REPS, || shape.run(&vals, &hint_refs));
 
     // ---- the boundary checks ----
-    let yr_pub = levels.len() * yr_len + usize::from(closeout);
+    let yr_pub = levels.len() * yr_len + usize::from(closeout) + 1;
     let total_pub: usize = 1 + yr_pub
         + levels
             .iter()
@@ -3797,7 +3921,8 @@ fn mvp7_real_query_phase() {
     let vals_rec = rec.values();
     let quad = |u0: F128, u2: F128, t: F128| (u0, t + u2, u2);
     let evalq = |q: (F128, F128, F128), x: F128| q.0 + x * q.1 + x * x * q.2;
-    let mut nt = T0;
+    // The bound start target: gamma' * q_eval.
+    let mut nt = chals[inner_pd.ch] * vals_rec[inner_pd.q_v];
     let mut nq = quad(vals_rec[start_v], vals_rec[start_v + 1], nt);
     for (li, lvl) in levels.iter().enumerate() {
         for (j, &mv) in lvl.fold_msg_vs.iter().enumerate() {
@@ -3821,6 +3946,22 @@ fn mvp7_real_query_phase() {
     }
     assert_eq!(built.public[at], nt, "the spine's final t_r");
     at += 1;
+    // The merged rounds, natively: outer gamma-combination through
+    // fold_round_claim. The native verify already enforced
+    // `running == q_eval * v` (the assist stays native), so the published
+    // running matching this replica closes the outer chain.
+    {
+        let mut mt = F128::ZERO;
+        for pd in &gammas {
+            mt += chals[pd.ch] * vals_rec[pd.val_v];
+        }
+        for rr in &w_rounds {
+            let (g1, gi, rch) = (vals_rec[rr.g_v], vals_rec[rr.g_v + 1], chals[rr.ch]);
+            mt = (mt + g1) + (mt + gi) * rch + gi * (rch * rch);
+        }
+        assert_eq!(built.public[at], mt, "the merged running claim");
+        at += 1;
+    }
     // Native replica of induce_sumcheck_evaluate_at_residual, per level.
     let mut resid_native: Vec<Vec<F128>> = vec![vec![F128::ZERO; yr_len]; levels.len()];
     for (li, lvl) in levels.iter().enumerate() {
@@ -3873,20 +4014,16 @@ fn mvp7_real_query_phase() {
         let pl_full = ris_v.len();
         let mut inner_n = F128::ZERO;
         for y in 0..yr_len {
-            let mut evb = F128::ZERO;
-            for (k, pt) in pd_pts.iter().enumerate() {
-                let mut t = chals[gammas[k].ch];
-                for j in 0..pl_full {
-                    t *= F128::ONE + pt[j] + ris_v[j];
-                }
-                for j in 0..yr_log {
-                    t *= if (y >> j) & 1 == 1 {
-                        pt[pl_full + j]
-                    } else {
-                        F128::ONE + pt[pl_full + j]
-                    };
-                }
-                evb += t;
+            let mut evb = chals[inner_pd.ch];
+            for j in 0..pl_full {
+                evb *= F128::ONE + chals[w_rounds[j].ch] + ris_v[j];
+            }
+            for j in 0..yr_log {
+                evb *= if (y >> j) & 1 == 1 {
+                    chals[w_rounds[pl_full + j].ch]
+                } else {
+                    F128::ONE + chals[w_rounds[pl_full + j].ch]
+                };
             }
             let mut comb = evb;
             for (li, lvl) in levels.iter().enumerate() {
@@ -3914,6 +4051,10 @@ fn mvp7_real_query_phase() {
             inner_n += rec.values()[yr_v + y] * comb;
         }
         assert_eq!(built.public[at], inner_n, "the close-out inner");
+        // THE CLOSURE: with the start target bound, the spine's t_r and the
+        // residual side's inner are the same statement scalar — the native
+        // verifier's final check, now enforced between two circuit outputs.
+        assert_eq!(built.public[at], nt, "inner == t_r: the statement closes");
     }
 
     // ---- prove / verify the circuit itself ----
