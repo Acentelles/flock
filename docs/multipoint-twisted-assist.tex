@@ -11,7 +11,7 @@
 
 \title{The multipoint twisted evaluation:\\ soundness of the Frobenius-assist replacement}
 \author{flock — recursion track}
-\date{2026-08-02 (v0.1)}
+\date{2026-08-02 (v0.2: the two-product grouping)}
 
 \begin{document}
 \maketitle
@@ -160,6 +160,80 @@ Second, the anchor's coefficient vectors are $\gamma^{128i}$ at index $0$
 only; nothing about the anchor's own soundness argument changes, it is
 invoked as a black box at one point.
 
+\section{The two-product grouping (v1, shipped)}
+
+The protocol above treats every claim uniformly: $128$ dual values each.
+That is the right shape for a ring-switched claim, whose $\Phi_i$ has
+$128$ live coefficients — but a \emph{packed-direct} claim's fold map is
+the $\F$-scalar $\Phi_i(x) = \gamma_i x$, i.e.\ $c_{i,j} = 0$ past index
+$0$, so $127$ of its values are absorbed, pinned, shipped, and never used.
+A gate-rich circuit union carries $300+$ packed-direct claims (mostly
+gather claims), which made the uniform protocol regress the outer proof
+5$\times$ in prove time and 3$\times$ in size. The shipped v1 protocol
+splits the claim set:
+
+\begin{itemize}[nosep]
+  \item \textbf{RS claims} $i = 0,\dots,R-1$: unchanged — $128$ dual
+        values $A_{i,j}$, batching weights $\gamma^{128 i + j}$.
+  \item \textbf{Scalar groups} $k = 0,\dots,P-1$: packed-direct claims
+        sharing a row point merge — $\Sigma_i \gamma_i\,
+        \eq_{z_i^{\mathrm{row}}}\!\otimes\eq_{z_i^{\mathrm{col}}} =
+        \eq_{z^{\mathrm{row}}}\otimes\bigl(\Sigma_i \gamma_i\,
+        \eq_{z_i^{\mathrm{col}}}\bigr)$, exactly the merged-$W$ build's
+        \code{MergedWeightClaim::Scalar}, with the $\gamma$'s baked into
+        the merged column weights $w_k$ and fold map the \emph{identity}.
+        Group $k$'s weight is $h_k(d) = \eq(z_k^{\mathrm{row}},
+        \mathrm{row}(d))\cdot w_k(\mathrm{col}(d))$; it needs the single
+        \emph{untwisted} value $B_k = \hat h_k(\rho)$, batched at weight
+        $\gamma^{128 R + k}$. All circuit gather claims share $\rho_{\mathrm{row}}$,
+        so they are ONE group.
+\end{itemize}
+
+The batching weights remain the consecutive powers
+$\gamma^0,\dots,\gamma^{128R + P - 1}$, so step (ii) of the soundness
+proof is still a single univariate Schwartz--Zippel, now of degree
+$< 128R + P$. The sumcheck target becomes
+\[
+  T_0 \;\stackrel{?}{=}\; \sum_{d} \bigl[\bar a(d)\,g(d) \;+\;
+  \bar b(d)\,\eq(\rho,d)\bigr],
+  \qquad
+  \bar a = \sum_i \gamma^{128 i} a_i,\quad
+  \bar b = \sum_k \gamma^{128R + k} h_k,
+\]
+with $g$ as before — \emph{two} products, still degree-2 rounds (four
+prover arrays, the second pair being $\bar b$ and the untouched
+$\eq(\rho,\cdot)$ that $g$ is derived from). A group's partner is
+untwisted because its only Frobenius index is $0$, where
+$\rho^{2^{-0}} = \rho$: its ``$g$'' degenerates to $\eq(\rho,\cdot)$.
+
+\textbf{One anchor still suffices.} The endpoint identity is now
+$T_m = \hat g(\rho'')\cdot\hat{\bar a}(\rho'') +
+\eq(\rho,\rho'')\cdot\hat{\bar b}(\rho'')$ — two bound values against two
+closed-form factors. Rather than binding them separately (a second
+assist) or claiming them (two extra scalars plus a mixing challenge),
+the verifier \emph{bakes the closed-form factors into the anchor's
+coefficients}: RS claim $i$ enters at $c_0 = \gamma^{128 i}\,\hat
+g(\rho'')$, group $k$ at coefficient $\gamma^{128R + k}\,\eq(\rho,\rho'')$.
+The anchor's verified output is then exactly the endpoint sum, the
+accept check is the plain equality $T_m = s$, and no additional proof
+data travels. (Both factors are deterministic functions of transcript
+state, available to both parties before the anchor runs; the assist is
+sound for any verifier-chosen coefficients, invoked once as before.)
+
+The soundness theorem is unchanged in structure with
+$\varepsilon \le (128R + P - 1)/|\F| + 2m/|\F| +
+\varepsilon_{\mathrm{assist}}$, and the output becomes
+$V = \sum_{i,j} c_{i,j} (A'_{i,j})^{2^j} + \sum_k B'_k$ — a group's
+$\gamma$'s live inside $w_k$, so its recombination coefficient is $1$.
+
+Costs, against the uniform protocol on the gate-rich shape: values
+absorbed $128K \to 128R + P$ (the proof shrinks by $\sim$16 bytes per
+eliminated value); prover DP sweeps $128K \to 128R + P$ (one per group
+instead of $128$ per raw claim); the anchor is unchanged (it already
+merged same-row statements). An element-only proof has $R = 0$ and
+skips the twisted machinery — inverse-Frobenius points, byte-table
+map, and the $128m$-multiplication closed form — entirely.
+
 \section{Costs, and what this buys the recursion}
 
 Verifier: $128K$ absorbs $+$ $O(128K)$ multiplications for the target and
@@ -184,8 +258,9 @@ per claim.
 \begin{enumerate}[nosep]
   \item The wire format changes where the merged opening carries
         \code{FrobeniusAssistProof}: the replacement transcript is
-        \code{MultipointTwistedProof} $=$ ($128K$ values, $m$ rounds, one
-        anchor). Byte pins re-pin deliberately, with history.
+        \code{MultipointTwistedProof} $=$ ($128R$ RS values $+$ $P$ group
+        values, $m$ rounds, one anchor). Byte pins re-pin deliberately,
+        with history.
   \item The transcript ordering must keep the values' absorb \emph{before}
         the $\gamma$ squeeze (step (ii) depends on it) — the prototype
         already does.
