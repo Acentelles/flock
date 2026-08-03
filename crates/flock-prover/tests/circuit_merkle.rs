@@ -5381,7 +5381,13 @@ struct Lvl {
     c: usize,
     path: usize,
     depth: usize,
+    /// The FOLD width `2^folds` — the lane-weight domain.
     lanes: usize,
+    /// The COMMITTED width: `num_lanes` active lanes, which for a mixed
+    /// union is an arbitrary integer `<= lanes` (the top lanes are
+    /// definitionally zero and never encoded). Equal to `lanes` whenever
+    /// the lane count happens to be a power of two.
+    row_words: usize,
 }
 
 /// The per-level `(cap, opened rows, flat sibling paths)` triples a Ligerito
@@ -5442,12 +5448,14 @@ fn level_geometry(
         let path = paths.len() / q;
         assert_eq!(paths.len(), q * path, "L{li}: flat paths divide evenly");
         let depth = path + c;
-        let lanes = rows[0].len();
-        assert!(lanes.is_power_of_two() && lanes >= 4, "L{li}: lanes {lanes}");
-        assert_eq!(
-            lanes,
-            1 << lvl.fold_fins.len(),
-            "L{li}: one fold challenge per lane bit"
+        // The lane-fold weights are `2^folds` wide; the committed row may be
+        // NARROWER (its top lanes are definitionally zero), and the dot below
+        // zips — which IS the zero-fill, exactly as the native verifier does.
+        let lanes = 1usize << lvl.fold_fins.len();
+        let row_words = rows[0].len();
+        assert!(
+            row_words >= 1 && row_words <= lanes,
+            "L{li}: opened width {row_words} must fit the fold width {lanes}"
         );
         let fold_vals: Vec<F128> = lvl.fold_chs.iter().map(|&i| chals[i]).collect();
         let alpha_vals: Vec<F128> = (0..lvl.a_count).map(|j| chals[lvl.a_ch + j]).collect();
@@ -5481,7 +5489,14 @@ fn level_geometry(
             sum += aw[k] * dot;
         }
         native_sums.push(sum);
-        geo.push(Lvl { q, c, path, depth, lanes });
+        geo.push(Lvl {
+            q,
+            c,
+            path,
+            depth,
+            lanes,
+            row_words,
+        });
     }
     (geo, native_sums)
 }
@@ -5540,17 +5555,29 @@ fn emit_query_phase(
         };
         vals.push(F128::ZERO);
         let mut acc = sb.public_input();
+        // Zero wire for the fold's known-zero top lanes (only declared when
+        // the committed row is narrower than the fold).
+        let pad_w = if g.row_words < g.lanes {
+            vals.push(F128::ZERO);
+            Some(sb.public_input())
+        } else {
+            None
+        };
         let mut opens: Vec<(Wire, [Wire; 2])> = Vec::with_capacity(g.q);
         for k in 0..g.q {
             vals.extend_from_slice(&rows[k]);
-            let leaf_w: Vec<Wire> = (0..g.lanes).map(|_| sb.input()).collect();
+            let leaf_w: Vec<Wire> = (0..g.row_words).map(|_| sb.input()).collect();
             let cw = outs[sqq[k / 4]][k % 4];
             let cv = emit_opening(sb, slots, iv, &leaf_w, cw, g.depth, g.c, vals);
             opens.push((cw, cv));
             hints.extend(paths[k * g.path..(k + 1) * g.path].iter().map(hash_to_digest));
+            // The fold reads the full `2^folds` domain: the committed words
+            // then the definitionally-zero top lanes.
+            let mut fold_w = leaf_w.clone();
+            fold_w.resize(g.lanes, pad_w.unwrap_or(leaf_w[0]));
             let lanes = g.lanes.min(8);
             for h in 0..le_groups {
-                let mut a_in: Vec<Wire> = leaf_w[lanes * h..lanes * (h + 1)].to_vec();
+                let mut a_in: Vec<Wire> = fold_w[lanes * h..lanes * (h + 1)].to_vec();
                 a_in.extend_from_slice(&v_wires[..le_vars]);
                 vals.push(aw[k] * hw[h]);
                 a_in.push(sb.public_input());
@@ -5587,8 +5614,24 @@ fn emit_opening(
     cap_depth: usize,
     pubs: &mut Vec<F128>,
 ) -> [Wire; 2] {
-    let blocks = leaf_w.len() / 4;
-    assert_eq!(leaf_w.len(), 4 * blocks, "leaf is whole 64-byte blocks");
+    // A leaf need NOT be a whole number of 64-byte blocks: a mixed circuit
+    // union commits `num_lanes` ACTIVE lanes (`dense_words.div_ceil(2^log_dim)`
+    // — an arbitrary integer, since the top lanes are definitionally zero and
+    // never encoded), so a row can be e.g. 61 words = 976 bytes. BLAKE3 hashes
+    // that as 16 blocks whose last carries b = 16 bytes with the rest of the
+    // message zero — and the compression's `b` is already a free input here,
+    // so the partial block costs one zero-padding wire, not a wire-format
+    // change. `blocks` counts up to a chunk's 16; larger leaves would need
+    // real chunk merging, which nothing here produces.
+    assert!(!leaf_w.is_empty(), "a leaf has data");
+    let blocks = leaf_w.len().div_ceil(4);
+    assert!(blocks <= 16, "a leaf is one BLAKE3 chunk (<= 1024 bytes)");
+    let pad_w = if leaf_w.len() % 4 == 0 {
+        None
+    } else {
+        pubs.push(F128::ZERO);
+        Some(sb.public_input())
+    };
 
     // The index word's bits, one per level.
     let bits = sb.gate(s.spread, &[index_w]);
@@ -5603,19 +5646,20 @@ fn emit_opening(
         if i + 1 == blocks {
             flags |= CHUNK_END;
         }
-        pubs.push(pack_params(0, 64, flags));
+        // The final block carries only the bytes that remain.
+        let words = (leaf_w.len() - 4 * i).min(4);
+        pubs.push(pack_params(0, 16 * words as u32, flags));
         let params = sb.public_input();
+        let mw = |j: usize| -> Wire {
+            if j < words {
+                leaf_w[4 * i + j]
+            } else {
+                pad_w.expect("a short block needs the zero pad")
+            }
+        };
         let out = sb.gate(
             s.b3,
-            &[
-                cv[0],
-                cv[1],
-                leaf_w[4 * i],
-                leaf_w[4 * i + 1],
-                leaf_w[4 * i + 2],
-                leaf_w[4 * i + 3],
-                params,
-            ],
+            &[cv[0], cv[1], mw(0), mw(1), mw(2), mw(3), params],
         );
         cv = [out[0], out[1]];
     }
@@ -8589,53 +8633,84 @@ fn mvp10_circuit_inner_tape() {
         chain.absorb(&bytes[at * 16..]);
         let trace = chain.finish();
 
-        // ---- the QUERY PHASE is BLOCKED, and the block is a finding ----
-        // A mixed CIRCUIT union commits `num_lanes` ACTIVE lanes, and that
-        // count is `dense_words.div_ceil(2^log_dim)` — an arbitrary
-        // integer. This inner's L0 opens rows of 61 words against a 2^6
-        // wide fold: the three missing lanes are structurally zero, so the
-        // NATIVE side is fine (the capped paths verify, and the
-        // enforced-sum dot truncates against the eq table). But the
-        // circuit's opening gate hashes a leaf as whole 64-BYTE BLOCKS,
-        // and 61 words is not a whole number of blocks — so the query
-        // phase of a mixed circuit inner cannot be expressed at all today.
-        // MVP-7 and MVP-9 never met this: their inners' `num_lanes` landed
-        // on a power of two by luck of `dense_words`.
-        //
-        // Two fixes, and the choice moves proof bytes, so it is a
-        // deliberate decision rather than something to paper over here:
-        //   (a) round `num_lanes` up to a multiple of 4 (or to a power of
-        //       two) in `dense_lanes` — a couple of lines, slightly more
-        //       committed padding, every leaf becomes whole blocks, and
-        //       every byte fixture re-pins;
-        //   (b) teach the opening gate a length-aware final block (blake3
-        //       hashes arbitrary lengths) — no wire change, more circuit.
-        {
-            let lig = &proof.pcs_open.inner.ligerito;
-            let lvl_src = level_sources(lig);
-            let l0_words = lvl_src[0].1[0].len();
-            assert_eq!(l0_words, 61, "the finding, pinned: L0 opens 61 lanes");
-            assert_ne!(l0_words % 4, 0, "61 words is not whole 64-byte blocks");
-            assert!(
-                lvl_src[1..].iter().all(|(_, rows, _)| rows[0].len() % 4 == 0),
-                "only L0 carries the active-lane count; deeper levels are clean"
-            );
-            assert_eq!(
-                union.commit_lanes(6),
-                Some(l0_words),
-                "the opened width IS the union's active lane count"
-            );
-        }
+        // ---- assembly step 4: the QUERY PHASE, via the shared emitters ----
+        // A mixed CIRCUIT union commits `num_lanes` ACTIVE lanes — an
+        // arbitrary integer (61 here), since the top lanes are
+        // definitionally zero and never encoded. MVP-7 and MVP-9 never met
+        // that: their inners' lane counts were powers of two by luck of
+        // `dense_words`. It costs one zero-padding wire in the leaf hash
+        // (BLAKE3's block length is already a free input) and one in the
+        // lane fold; the shared emitters carry both, so this is three calls
+        // rather than a third copy of the machinery.
+        let lig = &proof.pcs_open.inner.ligerito;
+        assert_eq!(commitment.cap, lig.initial_cap, "commitment IS the L0 cap");
+        let r_lvl = lig.recursive_caps.len();
+        let lvl_src = level_sources(lig);
+        let (_start_v, piop_o, gammas_o, _w_rounds, _mp_o, _inner_pd2, _yr_v2, levels) =
+            parse_open_levels(ops, 32 * lig.initial_cap.len(), r_lvl);
+        assert!(piop_o.is_some(), "a mixed tape carries the element PIOP");
+        assert_eq!(
+            gammas_o.len(),
+            pd_recs.len(),
+            "the parser and the region walk agree on the pd claims"
+        );
+        let (geo, native_sums) = level_geometry(&levels, &lvl_src, &chals, HashKind::Blake3);
+        assert_eq!(geo[0].row_words, 61, "the mixed inner's active lane count");
+        assert_ne!(geo[0].row_words % 4, 0, "not a whole number of blocks");
+        assert!(geo[0].row_words < geo[0].lanes, "and narrower than the fold");
 
-        let b3_rows = trace.rows.len();
+        let b3_rows = trace.rows.len()
+            + geo
+                .iter()
+                .map(|g| (g.row_words.div_ceil(4) + g.path) * g.q)
+                .sum::<usize>();
         let nu2 = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(3);
+        let max_path = geo.iter().map(|g| g.path).max().unwrap().max(1);
         let mut sb = ShapeBuilder::new(nu2);
-        let b3s = sb.slot(Blake3Gate { nu: nu2 });
+        let qslots = CollapsedSlots {
+            b3: sb.slot(Blake3Gate { nu: nu2 }),
+            swap: sb.slot(SwapGate { nu: nu2 }),
+            spread: sb.slot(BitSpreadGate {
+                ty: BitSpreadTable::new(max_path),
+                nu: nu2,
+            }),
+        };
+        let b3s = qslots.b3;
+        let mut le_slots: Vec<(usize, flock_core::circuit::builder::SlotId)> = Vec::new();
+        let leafeval: Vec<_> = geo
+            .iter()
+            .map(|g| {
+                let lanes = g.lanes.min(8);
+                match le_slots.iter().find(|(n, _)| *n == lanes) {
+                    Some((_, sl)) => *sl,
+                    None => {
+                        let sl = sb.slot(LeafEvalGate::new(lanes));
+                        le_slots.push((lanes, sl));
+                        sl
+                    }
+                }
+            })
+            .collect();
         let mut vals: Vec<F128> = Vec::new();
         let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
         vals.extend_from_slice(&iv_w);
         let iv2 = [sb.public_input(), sb.public_input()];
         let (outs, ww) = emit_fs_chain(&mut sb, b3s, iv2, &trace, &stream, &bytes, &mut vals);
+        let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
+        let (to_publish, level_accs) = emit_query_phase(
+            &mut sb,
+            qslots,
+            iv2,
+            &leafeval,
+            &levels,
+            &geo,
+            &lvl_src,
+            &trace.squeezes,
+            &outs,
+            &chals,
+            &mut vals,
+            &mut hints,
+        );
         let ga_fin = fin_at(gkr_l[0] + 1);
         let ga_w = outs[trace.squeezes[ga_fin][0]][0];
         let mut mp_i = mp_l[0] + 1;
@@ -8818,8 +8893,22 @@ fn mvp10_circuit_inner_tape() {
         // Everything publishes HERE, after every public input is declared:
         // `built.public` lists entries in DECLARATION order, so an early
         // publish misindexes the tail (the recorded MVP-7 gotcha).
-        // Tail order: [ga, mg | gkr deltas | el deltas, el zc end, el lc
-        // end | s_sigma | rho...].
+        // Tail order: [query phase (alphas, per-query (cw, cv)), accs |
+        // ga, mg | gkr deltas | el deltas, el zc end, el lc end |
+        // s_sigma | rho...].
+        for (a_wires, opens) in &to_publish {
+            for w in a_wires {
+                sb.publish(*w);
+            }
+            for (cw, cv) in opens {
+                sb.publish(*cw);
+                sb.publish(cv[0]);
+                sb.publish(cv[1]);
+            }
+        }
+        for w in &level_accs {
+            sb.publish(*w);
+        }
         sb.publish(ga_w);
         sb.publish(mg_w);
         for d in &gkr_deltas {
@@ -8841,8 +8930,50 @@ fn mvp10_circuit_inner_tape() {
             sb.publish(*w);
         }
         let n_tail = 2 + gkr_deltas.len() + el_deltas.len() + 2 + 1 + mu_i;
+        let n_query_pub: usize = levels.len()
+            + levels
+                .iter()
+                .zip(&geo)
+                .map(|(l, g)| l.a_count + 3 * g.q)
+                .sum::<usize>();
         let shape2 = sb.finish().expect("the mvp10 chain circuit builds");
-        let built2 = shape2.run(&vals, &[]);
+        let hint_refs: Vec<&dyn std::any::Any> =
+            hints.iter().map(|h| h as &dyn std::any::Any).collect();
+        let built2 = shape2.run(&vals, &hint_refs);
+        // The query-phase boundary: published alphas are the recorded
+        // challenges, each published terminal digest is the cap node the
+        // challenge selects, and each accumulator equals the native
+        // enforced sum — over 61-word leaves and a 64-wide fold.
+        {
+            let mut at = built2.public.len() - n_tail - n_query_pub;
+            for (li, lvl) in levels.iter().enumerate() {
+                let g = &geo[li];
+                let (cap, _, _) = lvl_src[li];
+                for j in 0..lvl.a_count {
+                    assert_eq!(built2.public[at + j], chals[lvl.a_ch + j], "L{li} alpha {j}");
+                }
+                at += lvl.a_count;
+                for k in 0..g.q {
+                    let chal = chals[lvl.q_ch + k];
+                    assert_eq!(built2.public[at], chal, "L{li} challenge {k}");
+                    let pos = (chal.lo as usize) & ((1usize << g.depth) - 1);
+                    let node = digest_words(&hash_to_digest(&cap[pos >> g.path]));
+                    assert_eq!(
+                        [built2.public[at + 1], built2.public[at + 2]],
+                        node,
+                        "L{li} cap node {k}"
+                    );
+                    at += 3;
+                }
+            }
+            for (li, want) in native_sums.iter().enumerate() {
+                assert_eq!(
+                    built2.public[at + li],
+                    *want,
+                    "L{li} enforced sum matches the native replica"
+                );
+            }
+        }
         let (_, ga_c) = vc_at(gkr_l[0] + 1);
         let (_, mg_c) = vc_at(mp_i);
         let base2 = built2.public.len() - n_tail;
@@ -8927,8 +9058,17 @@ fn mvp10_circuit_inner_tape() {
         };
         let b3_r1cs2 = blake3::build_block_r1cs(nu2);
         let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
+        let swap_r1cs2 = SwapTable::build_block_r1cs(nu2);
+        let swap_lc2 = swap_r1cs2.csc_lincheck_circuit();
+        let spread_ty2 = BitSpreadTable::new(max_path);
+        let spread_r1cs2 = spread_ty2.build_block_r1cs(nu2);
+        let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
         // The element slots the GKR transcription added, in REGISTRY order.
-        let mut el_ord: Vec<(usize, Vec<F128>)> = [macs, zcr, mrs]
+        // Every element slot: the GKR/PIOP round gates AND the leaf-eval
+        // slots the query phase created.
+        let mut el_all: Vec<flock_core::circuit::builder::SlotId> = vec![macs, zcr, mrs];
+        el_all.extend(le_slots.iter().map(|(_, sl)| *sl));
+        let mut el_ord: Vec<(usize, Vec<F128>)> = el_all
             .into_iter()
             .map(|sl| {
                 let z = match &built2.witnesses[shape2.registry_slot(sl)] {
@@ -8945,20 +9085,57 @@ fn mvp10_circuit_inner_tape() {
                 UnionElementSlotInput::new(move |dst: &mut [F128]| dst.copy_from_slice(&z))
             })
             .collect();
+        let mut bslots: Vec<(usize, UnionSlotProverInput)> = vec![
+            (
+                shape2.registry_slot(qslots.b3),
+                UnionSlotProverInput::new(
+                    blake3::generate_witness_batch_major_partial(
+                        built2.rows::<Blake3Gate>(qslots.b3),
+                        nu2,
+                    ),
+                    b3_lc2,
+                ),
+            ),
+            (
+                shape2.registry_slot(qslots.swap),
+                UnionSlotProverInput::new(
+                    SwapTable::generate_witness_batch_major(
+                        built2.rows::<SwapGate>(qslots.swap),
+                        nu2,
+                    ),
+                    swap_lc2,
+                ),
+            ),
+            (
+                shape2.registry_slot(qslots.spread),
+                UnionSlotProverInput::new(
+                    spread_ty2.generate_witness_batch_major(
+                        built2.rows::<BitSpreadGate>(qslots.spread),
+                        nu2,
+                    ),
+                    spread_lc2,
+                ),
+            ),
+        ];
+        bslots.sort_by_key(|(i, _)| *i);
+        let mut lco: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
+            (shape2.registry_slot(qslots.b3), b3_lc2),
+            (shape2.registry_slot(qslots.swap), swap_lc2),
+            (shape2.registry_slot(qslots.spread), spread_lc2),
+        ];
+        lco.sort_by_key(|(i, _)| *i);
+        let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
+            lco.into_iter().map(|(_, c)| c).collect();
         let mut ch2 = FsChallenger::new(DOMAIN);
         let (oproof, ocommit, _) = prover::prove_fast_ligerito_union_circuit(
             &union2,
             &shape2.circuit,
             &built2.public,
             &pcs2,
-            vec![UnionSlotProverInput::new(
-                blake3::generate_witness_batch_major_partial(built2.rows::<Blake3Gate>(b3s), nu2),
-                b3_lc2,
-            )],
+            bslots.into_iter().map(|(_, x)| x).collect(),
             el_inputs,
             &mut ch2,
         );
-        let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![b3_lc2];
         let mut ch2 = FsChallenger::new(DOMAIN);
         verifier::verify_ligerito_union_circuit(
             &union2,
@@ -8985,8 +9162,9 @@ fn mvp10_circuit_inner_tape() {
         "\nMVP-10 CIRCUIT-INNER TAPE (mixed: blake3 + mac, wired)\n  \
          inner: nu {} | dense_m {} | pd claims {} (2 element + {} gathers) | P {} | mu {}\n  \
          outer: chain b3 rows {} | nu {} | dense_m {} | mu {}\n  \
-         outer carries: the chain, the WIRING GKR ({} layers, {} zero-deltas),\n         \
-         and the sigma assertion (value + {} point coords, discharges)\n  \
+         outer carries: the chain, the QUERY PHASE (61-word leaves), the\n         \
+         WIRING GKR ({} layers, {} zero-deltas), the element PIOP, and the\n         \
+         sigma assertion (value + {} point coords, discharges)\n  \
          proof {:.1} KiB\n",
         nu,
         union.dense_m(),
@@ -9003,4 +9181,70 @@ fn mvp10_circuit_inner_tape() {
         built.shape.circuit.cells().mu(),
         outer_stats.5 as f64 / 1024.0,
     );
+}
+
+/// A Merkle leaf need not be a whole number of 64-byte blocks — and the
+/// opening gate hashes the partial final block correctly.
+///
+/// This is the shape a MIXED CIRCUIT union produces: it commits `num_lanes`
+/// ACTIVE lanes, `dense_words.div_ceil(2^log_dim)`, an arbitrary integer
+/// (the top lanes are definitionally zero and never encoded — see
+/// `ligerito`'s "high-bit-lane commit"). MVP-7 and MVP-9 never met it
+/// because their inners' lane counts were powers of two by luck of
+/// `dense_words`; MVP-10's realistic mixed inner opens 61-word rows.
+///
+/// BLAKE3 hashes 61 words = 976 bytes as one chunk of 16 blocks whose last
+/// carries `b = 16`, and the compression's `b` is a free input to the gate,
+/// so the only cost is one zero-padding wire. Pinned against
+/// `merkle::hash_leaf` itself at every width, whole blocks and partial
+/// alike.
+#[test]
+fn partial_block_leaves_hash_correctly() {
+    for words in [1usize, 3, 4, 8, 61, 64] {
+        let (depth, leaf_bytes) = (2usize, 16 * words);
+        let nu = 6usize;
+        let mut rng = Rng(0x_B10C_0000 ^ words as u64);
+        let tree = Tree::new(depth, leaf_bytes, &mut rng);
+        let pos = 2usize;
+
+        let mut sb = ShapeBuilder::new(nu);
+        let slots = CollapsedSlots {
+            b3: sb.slot(Blake3Gate { nu }),
+            swap: sb.slot(SwapGate { nu }),
+            spread: sb.slot(BitSpreadGate {
+                ty: BitSpreadTable::new(depth),
+                nu,
+            }),
+        };
+        let mut vals: Vec<F128> = Vec::new();
+        let iv_w = pack8(&IV);
+        vals.extend_from_slice(&iv_w);
+        let iv = [sb.public_input(), sb.public_input()];
+        let leaf = tree.leaf(pos);
+        let leaf_w: Vec<Wire> = (0..words)
+            .map(|w| {
+                vals.push(leaf_word(leaf, 16 * w));
+                sb.public_input()
+            })
+            .collect();
+        vals.push(F128::new(pos as u64, 0));
+        let idx_w = sb.public_input();
+        let root = emit_opening(&mut sb, slots, iv, &leaf_w, idx_w, depth, 0, &mut vals);
+        sb.publish(root[0]);
+        sb.publish(root[1]);
+        let shape = sb.finish().expect("the opening circuit builds");
+        let hints: Vec<[u32; SLOT_WORDS]> = tree.siblings(pos);
+        let hint_refs: Vec<&dyn std::any::Any> =
+            hints.iter().map(|h| h as &dyn std::any::Any).collect();
+        let built = shape.run(&vals, &hint_refs);
+
+        // The in-circuit chunk chain reproduces `hash_leaf` on a leaf that
+        // is NOT block-aligned, and the fold reaches the real root.
+        let n = built.public.len();
+        assert_eq!(
+            [built.public[n - 2], built.public[n - 1]],
+            digest_words(&hash_to_digest(&tree.root)),
+            "width {words}: the opening folds to the tree root"
+        );
+    }
 }
