@@ -8200,9 +8200,9 @@ fn mvp10_leaf_outer_inner_tape() {
     assert!(claims.boolean.is_some(), "boolean claims from the real inner");
     assert!(claims.element.is_some(), "element claims from the real inner");
     // The DEFERRED verify of the same proof: the independent reference for
-    // the sigma assertion (and later the element assertion) — the
-    // method-note discipline, verifier-exported over formulas-written-twice.
-    let (_el_assert_i, sigma_native_i) = {
+    // the sigma assertion and the element assertion — the method-note
+    // discipline, verifier-exported over formulas-written-twice.
+    let (el_assert_i, sigma_native_i) = {
         let mut ch = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
         let (_, work, sigma) = verifier::verify_ligerito_union_circuit_deferred(
             &union_i,
@@ -8873,6 +8873,97 @@ fn mvp10_leaf_outer_inner_tape() {
         let r2 = sb.gate(macs, &[r1, g_beta_w, ow])[0];
         gkr_deltas.push(sb.gate(macs, &[r2, cr_w, ow])[0]);
 
+        // ---- the swap, step 5: the MULTI-SLOT element PIOP in-circuit ----
+        // Type reuse only (zcr, macs, mrslot all exist): the zerocheck's
+        // rounds are ZcRoundGate rows with the tau slice wires as eq
+        // weights, g0 as advice with published-zero deltas; the lincheck
+        // entry is DERIVED — va = ea + a_sum, vb = eb + b_sum, entry =
+        // va + alpha·vb — with only the two strip sums as advice. The
+        // GENERAL strip (the multi-slot delta mvp10's single-slot form
+        // deferred): a_sum = Σ_slots w_t·<eq(r_con[..κ_t]), a_const_t>,
+        // w_t the region-prefix weight — computed from region_slots, the
+        // verifier's own layout, and held against the deferred verify's
+        // exported ElementAssertion (never a formula written twice).
+        assert_eq!(
+            piop_i.zc_rounds.len(),
+            piop_i.tau_len,
+            "one element zc round per tau coordinate"
+        );
+        assert_eq!(
+            el_assert_i.alpha,
+            chals[piop_i.alpha_ch],
+            "the located alpha is the assertion's"
+        );
+        let (a_sum_n, b_sum_n) = {
+            let slots_el = flock_core::element_r1cs::union::region_slots(&union_i);
+            let nu_i = union_i.n_log();
+            let mut a_sum = F128::ZERO;
+            let mut b_sum = F128::ZERO;
+            for s in &slots_el {
+                let kappa = s.ty.kappa();
+                let eq_con = flock_core::zerocheck::univariate_skip::build_eq(
+                    &el_assert_i.r_con[..kappa],
+                );
+                let prefix = s.layout.region_prefix(nu_i);
+                let mut w = F128::ONE;
+                for (j, &x) in el_assert_i.r_con[kappa..].iter().enumerate() {
+                    w *= if (prefix >> j) & 1 == 1 { x } else { F128::ONE + x };
+                }
+                let dot = |c: &[F128]| -> F128 {
+                    eq_con
+                        .iter()
+                        .zip(c)
+                        .fold(F128::ZERO, |acc, (e, v)| acc + *e * *v)
+                };
+                a_sum += w * dot(s.ty.a_const());
+                b_sum += w * dot(s.ty.b_const());
+            }
+            (a_sum, b_sum)
+        };
+        // The native g0/running chain — the zc rounds' advice + reference.
+        let mut el_g0: Vec<F128> = Vec::new();
+        let el_run_n = {
+            let mut run = F128::ZERO;
+            for (k, rr) in piop_i.zc_rounds.iter().enumerate() {
+                let (g1, gi) = (vals_rec[rr.g_v], vals_rec[rr.g_v + 1]);
+                let t2 = chals[piop_i.tau_ch + k];
+                let rho = chals[rr.ch];
+                let g0 = (run + t2 * g1) * (F128::ONE + t2).inv();
+                el_g0.push(g0);
+                run = g0 * (F128::ONE + rho) + g1 * rho + gi * rho * (F128::ONE + rho);
+            }
+            run
+        };
+        let mut el_zr = zw;
+        let mut el_deltas: Vec<Wire> = Vec::new();
+        let sqt = &trace.squeezes[piop_i.tau_fin];
+        for (k, rr) in piop_i.zc_rounds.iter().enumerate() {
+            let t_w = outs[sqt[k / 4]][k % 4];
+            let rho_w = outs[trace.squeezes[rr.fin][0]][0];
+            vals.push(el_g0[k]);
+            let g0w = sb.public_input();
+            let o = sb.gate(
+                zcr,
+                &[el_zr, wv(rr.g_v), wv(rr.g_v + 1), t_w, rho_w, g0w, ow],
+            );
+            el_deltas.push(o[0]);
+            el_zr = o[1];
+        }
+        let el_alpha_w = outs[trace.squeezes[piop_i.alpha_fin][0]][0];
+        let ea_w = wv(piop_i.eab_v);
+        let eb_w = wv(piop_i.eab_v + 1);
+        vals.push(a_sum_n);
+        let asum_w = sb.public_input();
+        vals.push(b_sum_n);
+        let bsum_w = sb.public_input();
+        let va_w = sb.gate(macs, &[ea_w, asum_w, ow])[0];
+        let vb_w = sb.gate(macs, &[eb_w, bsum_w, ow])[0];
+        let mut el_lcw = sb.gate(macs, &[va_w, el_alpha_w, vb_w])[0];
+        for rr in &piop_i.lc_rounds {
+            let rho_w = outs[trace.squeezes[rr.fin][0]][0];
+            el_lcw = sb.gate(mrslot, &[el_lcw, wv(rr.g_v), wv(rr.g_v + 1), rho_w])[0];
+        }
+
         for (a_wires, opens) in &to_publish {
             for w in a_wires {
                 sb.publish(*w);
@@ -8907,6 +8998,11 @@ fn mvp10_leaf_outer_inner_tape() {
         for w in &pt_w {
             sb.publish(*w);
         }
+        for d in &el_deltas {
+            sb.publish(*d);
+        }
+        sb.publish(el_zr);
+        sb.publish(el_lcw);
         let shape2 = sb.finish().expect("the swap outer builds");
         // Cell-slot budget: gate slots + public blocks must stay <= 256
         // for mu 23 (every gate IO word is ALSO a wiring gather claim —
@@ -8938,7 +9034,9 @@ fn mvp10_leaf_outer_inner_tape() {
             + 1
             + gkr_deltas.len()
             + 1
-            + mu_i;
+            + mu_i
+            + el_deltas.len()
+            + 2;
         let mut at2 = built2.public.len() - n_tail - n_query_pub;
         for (li, lvl) in levels.iter().enumerate() {
             let g = &geo[li];
@@ -9051,6 +9149,27 @@ fn mvp10_leaf_outer_inner_tape() {
         assert!(
             sa.check(&lo.shape.circuit),
             "the emitted sigma assertion discharges against the real inner"
+        );
+        // The element PIOP: every zc delta zero, the zc chain ends at the
+        // native running claim, and THE INDEPENDENT CLOSE — the in-circuit
+        // lincheck chain (entry derived through the GENERAL strip) ends at
+        // the deferred verify's own assertion target.
+        let el_base = sig_base + 1 + mu_i;
+        for (k, d) in built2.public[el_base..el_base + el_deltas.len()]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(*d, F128::ZERO, "element piop delta {k}");
+        }
+        assert_eq!(
+            built2.public[el_base + el_deltas.len()],
+            el_run_n,
+            "the element zc chain ends at the native running claim"
+        );
+        assert_eq!(
+            built2.public[el_base + el_deltas.len() + 1],
+            el_assert_i.target,
+            "the element lc chain ends at the native assertion's target"
         );
 
         // The outer-of-outer proves and verifies over the circuit path.
@@ -9190,13 +9309,14 @@ fn mvp10_leaf_outer_inner_tape() {
     };
 
     println!(
-        "\nMVP-10 SWAP steps 1-4 — the LEAF OUTER as the inner\n  \
+        "\nMVP-10 SWAP steps 1-5 — the LEAF OUTER as the inner\n  \
          inner: dense_m {} | mu {} | levels (q, depth) {:?}\n  \
          pd claims {} (element pair + {} gathers) | P {} | L0 lanes {}/{}\n  \
          outer-of-outer: b3 rows {} | nu {} | dense_m {} | mu {}\n  \
          carries: chain, QUERY PHASE, PoW, W-rounds (rho bound), SPINE\n  \
          (t_r bound), RESIDUAL (rotated; inner == t_r closes), WIRING\n  \
-         GKR (21 layers) + the sigma assertion (emitted, discharges)\n  \
+         GKR (21 layers) + sigma (emitted, discharges), and the\n  \
+         MULTI-SLOT element PIOP (general strip; target closes)\n  \
          prove {:.0} ms | verify {:.0} ms | proof {:.1} KiB\n",
         lo.pcs.m,
         lo.shape.circuit.cells().mu(),
