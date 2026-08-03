@@ -4608,7 +4608,7 @@ fn mvp7_real_query_phase() {
         .find(|(n, _)| *n == 310 + pl_full)
         .expect("the close-out created the prefix slot")
         .1;
-    let mut prefix_product = |sb: &mut ShapeBuilder, factors: &[(Wire, Wire)]| -> Wire {
+    let prefix_product = |sb: &mut ShapeBuilder, factors: &[(Wire, Wire)]| -> Wire {
         let mut seed = ow;
         for chunk in factors.chunks(pl_full) {
             let mut g_in = vec![seed];
@@ -5968,6 +5968,9 @@ fn mvp6_all_levels_collapsed() {
 #[ignore] // Heavier — run with `-- --ignored`.
 fn mvp9_boolean_leaf_tape() {
     use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
+    // Pin the perf pool BEFORE any rayon touch (the native leaf prove would
+    // otherwise auto-initialize the global pool at all cores).
+    let threads = flock_core::init_perf_thread_pool().unwrap_or_else(rayon::current_num_threads);
 
     let n_blocks = 256usize;
     let setup = blake3::Blake3Setup::new_batch_major(n_blocks);
@@ -6326,7 +6329,6 @@ fn mvp9_boolean_leaf_tape() {
             bump(&ops[i], &mut v, &mut c);
             i += 1;
         }
-        i += 1;
         let q_eval = vals_rec[v];
         let mut big_v = F128::ZERO;
         for (k, cs) in coeffs.iter().enumerate() {
@@ -7503,7 +7505,7 @@ fn mvp9_boolean_leaf_tape() {
             shape.circuit.cells().mu(),
             b3_rows,
             bincode::serialize(&oproof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
-            rayon::current_num_threads(),
+            threads,
         );
     }
 }
