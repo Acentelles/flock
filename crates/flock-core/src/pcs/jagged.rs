@@ -627,7 +627,10 @@ pub struct JaggedAssistProof {
 /// zero-height columns (including the zero-padded tail). Depends on
 /// `col_prefix_sums` alone, so a batch of statements over the same params
 /// shares one list — and the block tree keyed off it ([`AssistBlocks`]).
-fn assist_boundaries(params: &JaggedParams) -> Vec<(u64, u64, u32)> {
+/// `pub`: the recursion circuit's anchor gates consume the run structure
+/// (per-run boundary pairs) — sourced from here, like
+/// [`assist_sparse_transitions`], so the two cannot drift.
+pub fn assist_boundaries(params: &JaggedParams) -> Vec<(u64, u64, u32)> {
     let n_col = params.col_prefix_sums.len() - 1;
     let mut out: Vec<(u64, u64, u32)> = Vec::with_capacity(n_col);
     for y in 0..n_col {

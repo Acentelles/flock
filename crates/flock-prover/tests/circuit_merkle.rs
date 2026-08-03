@@ -3069,6 +3069,117 @@ impl GateType for MacGate {
     }
 }
 
+/// One layer of the multipoint anchor's 4-state boundary DP (MVP-8 step 3;
+/// oracle-tested standalone in `circuit_assist.rs` — this is the same gate,
+/// both sourcing the transition table from `flock_core::pcs::jagged`).
+struct AssistLayerGate {
+    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+}
+
+const AL_IN: usize = 9; // g0..g3, za, rb, rc, rd, one
+const AL_OUT0: usize = 49;
+
+impl AssistLayerGate {
+    fn new() -> Self {
+        use flock_core::element_r1cs::ElementTableBuilder;
+        let one = F128::ONE;
+        let sparse = flock_core::pcs::jagged::assist_sparse_transitions();
+        let mut b = ElementTableBuilder::new(6);
+        for w in 0..AL_IN {
+            b.free_wire(w);
+        }
+        b.mult(9, 4, 5)
+            .linear(10, &[(8, one), (4, one), (5, one), (9, one)])
+            .linear(11, &[(4, one), (9, one)])
+            .linear(12, &[(5, one), (9, one)]);
+        let eq4 = [10usize, 11, 12, 9];
+        b.mult(13, 6, 7)
+            .linear(14, &[(8, one), (6, one), (7, one), (13, one)])
+            .linear(15, &[(6, one), (13, one)])
+            .linear(16, &[(7, one), (13, one)]);
+        let e = [14usize, 15, 16, 13];
+        let p = |i: usize, o: usize| 17 + 4 * i + o;
+        for i in 0..4 {
+            for o in 0..4 {
+                b.mult(p(i, o), eq4[i], o);
+            }
+        }
+        for (cd, rows) in sparse.iter().enumerate() {
+            for (s, row) in rows.iter().enumerate() {
+                let [(i0, o0), (i1, o1)] = *row;
+                b.mult_lin(
+                    33 + 4 * cd + s,
+                    &[(p(i0, o0), one), (p(i1, o1), one)],
+                    &[(e[cd], one)],
+                );
+            }
+        }
+        for s in 0..4 {
+            b.linear(
+                AL_OUT0 + s,
+                &[(33 + s, one), (37 + s, one), (41 + s, one), (45 + s, one)],
+            );
+        }
+        Self {
+            ty: std::sync::Arc::new(b.build().expect("assist layer gate")),
+        }
+    }
+}
+
+impl GateType for AssistLayerGate {
+    type Row = Vec<F128>;
+    type Hint = ();
+    fn table(&self) -> TableType {
+        use flock_core::schedule::IoWord;
+        let mut schema: Vec<IoWord> = (0..AL_IN).map(IoWord::input).collect();
+        for s in 0..4 {
+            schema.push(IoWord::output(AL_OUT0 + s));
+        }
+        TableType::element(self.ty.clone()).with_io_schema(schema)
+    }
+    fn eval(&self, inputs: &[F128], _h: &()) -> (Vec<F128>, Self::Row) {
+        let sparse = flock_core::pcs::jagged::assist_sparse_transitions();
+        let mut z = vec![F128::ZERO; 53];
+        z[..AL_IN].copy_from_slice(&inputs[..AL_IN]);
+        let one = F128::ONE;
+        z[9] = z[4] * z[5];
+        z[10] = one + z[4] + z[5] + z[9];
+        z[11] = z[4] + z[9];
+        z[12] = z[5] + z[9];
+        let eq4 = [10usize, 11, 12, 9];
+        z[13] = z[6] * z[7];
+        z[14] = one + z[6] + z[7] + z[13];
+        z[15] = z[6] + z[13];
+        z[16] = z[7] + z[13];
+        let e = [14usize, 15, 16, 13];
+        let p = |i: usize, o: usize| 17 + 4 * i + o;
+        for i in 0..4 {
+            for o in 0..4 {
+                z[p(i, o)] = z[eq4[i]] * z[o];
+            }
+        }
+        for (cd, rows) in sparse.iter().enumerate() {
+            for (s, row) in rows.iter().enumerate() {
+                let [(i0, o0), (i1, o1)] = *row;
+                z[33 + 4 * cd + s] = z[e[cd]] * (z[p(i0, o0)] + z[p(i1, o1)]);
+            }
+        }
+        for s in 0..4 {
+            z[AL_OUT0 + s] = z[33 + s] + z[37 + s] + z[41 + s] + z[45 + s];
+        }
+        (z[AL_OUT0..AL_OUT0 + 4].to_vec(), z)
+    }
+    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
+        let mut z = vec![F128::ZERO; self.ty.width() << nu];
+        for (j, row) in rows.iter().enumerate() {
+            for (col, &v) in row.iter().enumerate() {
+                z[(col << nu) + j] = v;
+            }
+        }
+        SlotWitness::Element(z)
+    }
+}
+
 /// One element-zerocheck round (degree-3, convention A): `g0` rides as
 /// ADVICE (a public input) and the gate enforces its defining identity as a
 /// published-zero delta — the family-I pattern, no in-circuit inversion:
@@ -4393,22 +4504,172 @@ fn mvp7_real_query_phase() {
     let gamma_w = chw(&outs, &trace.squeezes, mp.gamma_fin);
     let mut t0 = zw;
     let mut vsum = zw;
-    let mut pw = ow;
+    let mut pws: Vec<Wire> = vec![ow];
     for (k, &vi) in mp.val_vs.iter().enumerate() {
-        t0 = sb.gate(macslot, &[t0, pw, wv(vi)])[0];
+        t0 = sb.gate(macslot, &[t0, pws[k], wv(vi)])[0];
         vsum = sb.gate(macslot, &[vsum, wv(vi), ow])[0];
         if k + 1 < mp.val_vs.len() {
-            pw = sb.gate(macslot, &[zw, pw, gamma_w])[0];
+            let p = sb.gate(macslot, &[zw, pws[k], gamma_w])[0];
+            pws.push(p);
         }
     }
     let mut tm = t0;
+    let mut rho2_w: Vec<Wire> = Vec::new();
     for rr in &mp.rounds {
         let r_w = chw(&outs, &trace.squeezes, rr.fin);
+        rho2_w.push(r_w);
         tm = sb.gate(mrslot, &[tm, wv(rr.g_v), wv(rr.g_v + 1), r_w])[0];
     }
     let delta_tm = sb.gate(macslot, &[tm, wv(mp.anchor_v), ow])[0];
     let qv = sb.gate(macslot, &[zw, wv(inner_pd.q_v), vsum])[0];
     let delta_rq = sb.gate(macslot, &[running_w, qv, ow])[0];
+
+    // ---- MVP-8 step 3: the anchor in-circuit ----
+    // 3a: the anchor's claimed v folds through its 2(m+1) rounds (mrslot
+    // reuse); the squeezes are the sigma wires the expect consumes.
+    let mut acl = wv(mp.anchor_v);
+    let mut sig_w: Vec<Wire> = Vec::new();
+    for rr in &mp.anchor_rounds {
+        let r_w = chw(&outs, &trace.squeezes, rr.fin);
+        sig_w.push(r_w);
+        acl = sb.gate(mrslot, &[acl, wv(rr.g_v), wv(rr.g_v + 1), r_w])[0];
+    }
+    let m_mp = mp.rounds.len();
+    assert_eq!(sig_w.len(), 2 * (m_mp + 1), "sigma spans the anchor layers");
+
+    // The pl_full prefix slot (created in the close-out above); a chunked
+    // product of (1 + a + b) factors, seed-chained across rows, padded
+    // factors (zw, zw) = 1.
+    let pfslot = leaf_slot
+        .iter()
+        .find(|(n, _)| *n == 310 + pl_full)
+        .expect("the close-out created the prefix slot")
+        .1;
+    let mut prefix_product = |sb: &mut ShapeBuilder, factors: &[(Wire, Wire)]| -> Wire {
+        let mut seed = ow;
+        for chunk in factors.chunks(pl_full) {
+            let mut g_in = vec![seed];
+            for (a, _) in chunk {
+                g_in.push(*a);
+            }
+            g_in.extend(std::iter::repeat_n(zw, pl_full - chunk.len()));
+            for (_, b) in chunk {
+                g_in.push(*b);
+            }
+            g_in.extend(std::iter::repeat_n(zw, pl_full - chunk.len()));
+            g_in.push(ow);
+            seed = sb.gate(pfslot, &g_in)[0];
+        }
+        seed
+    };
+
+    // 3b: e_at = eq(rho, rho'') — rho is the W-round challenge wires.
+    let rho_w: Vec<Wire> = w_rounds
+        .iter()
+        .map(|rr| chw(&outs, &trace.squeezes, rr.fin))
+        .collect();
+    let factors: Vec<(Wire, Wire)> = rho_w.iter().copied().zip(rho2_w.iter().copied()).collect();
+    let e_at_w = prefix_product(&mut sb, &factors);
+
+    // 3c: the expect. Groups by shared row part (structural for this fixed
+    // shape — asserted one dual value per group), run structure from the
+    // inner's jagged boundaries (pub, same source as the verifier).
+    let n_log_i = INNER_NU;
+    let k_cols_i = gammas[0].pt_len - n_log_i;
+    let mut groups_ix: Vec<Vec<usize>> = Vec::new();
+    for (i, pt) in pd_pts.iter().enumerate() {
+        match groups_ix
+            .iter_mut()
+            .find(|g| pd_pts[g[0]][..n_log_i] == pt[..n_log_i])
+        {
+            Some(g) => g.push(i),
+            None => groups_ix.push(vec![i]),
+        }
+    }
+    assert_eq!(groups_ix.len(), mp.val_vs.len(), "one dual value per group");
+    let params_i = flock_core::pcs::jagged::JaggedParams::from_heights(
+        &inner_union.jagged_heights(),
+        n_log_i,
+        m_mp,
+    );
+    let bounds = flock_core::pcs::jagged::assist_boundaries(&params_i);
+    // Shape assumption: singleton used-column runs, plus AT MOST one
+    // zero-height tail run (absent at full utilization — this inner).
+    let n_runs = bounds.len();
+    let has_tail = bounds[n_runs - 1].0 == bounds[n_runs - 1].1;
+    let n_single = if has_tail { n_runs - 1 } else { n_runs };
+    for &(_, _, len) in &bounds[..n_single] {
+        assert_eq!(len, 1, "used columns are singleton runs");
+    }
+
+    // Per-run boundary eq products at sigma (statement-independent).
+    let eqc: Vec<Wire> = bounds
+        .iter()
+        .map(|&(t_c, t_next, _)| {
+            let mut factors = Vec::with_capacity(2 * (m_mp + 1));
+            for l in 0..=m_mp {
+                factors.push((sig_w[2 * l], if (t_c >> l) & 1 == 1 { ow } else { zw }));
+                factors.push((sig_w[2 * l + 1], if (t_next >> l) & 1 == 1 { ow } else { zw }));
+            }
+            prefix_product(&mut sb, &factors)
+        })
+        .collect();
+
+    // Per (claim, singleton run) column-eq sums, the tail by char-2
+    // complement (total eq mass is 1), then the gamma_pd combination and
+    // the per-statement dot + DP + coefficient.
+    let alslot = sb.slot(AssistLayerGate::new());
+    leaf_slot.push((601, alslot));
+    let mut expect = zw;
+    for (g_ix, members) in groups_ix.iter().enumerate() {
+        let mut run_w: Vec<Wire> = vec![zw; n_runs];
+        for &i in members {
+            let pd = &gammas[i];
+            let gpd_w = chw(&outs, &trace.squeezes, pd.fin);
+            let mut tail = ow;
+            for r in 0..n_single {
+                let y = r as u64;
+                let factors: Vec<(Wire, Wire)> = (0..k_cols_i)
+                    .map(|j| {
+                        (
+                            wv(pd.pt_v + n_log_i + j),
+                            if (y >> j) & 1 == 1 { ow } else { zw },
+                        )
+                    })
+                    .collect();
+                let s = prefix_product(&mut sb, &factors);
+                tail = sb.gate(macslot, &[tail, s, ow])[0];
+                run_w[r] = sb.gate(macslot, &[run_w[r], gpd_w, s])[0];
+            }
+            if has_tail {
+                run_w[n_runs - 1] = sb.gate(macslot, &[run_w[n_runs - 1], gpd_w, tail])[0];
+            }
+        }
+        let mut w_st = zw;
+        for (r, &rw) in run_w.iter().enumerate() {
+            w_st = sb.gate(macslot, &[w_st, rw, eqc[r]])[0];
+        }
+        let mut g = [zw, zw, ow, zw]; // STATE_SUCCESS seed
+        let row0 = pd_pts[members[0]].len(); // silence: row wires below
+        let _ = row0;
+        for layer in (0..=m_mp).rev() {
+            let za = if layer < n_log_i {
+                wv(gammas[members[0]].pt_v + layer)
+            } else {
+                zw
+            };
+            let rb = if layer < m_mp { rho2_w[layer] } else { zw };
+            let mut a_in = g.to_vec();
+            a_in.extend_from_slice(&[za, rb, sig_w[2 * layer], sig_w[2 * layer + 1], ow]);
+            let o = sb.gate(alslot, &a_in);
+            g = [o[0], o[1], o[2], o[3]];
+        }
+        let coeff = sb.gate(macslot, &[zw, pws[g_ix], e_at_w])[0];
+        let wd = sb.gate(macslot, &[zw, w_st, g[0]])[0];
+        expect = sb.gate(macslot, &[expect, coeff, wd])[0];
+    }
+    // 3d: the join — the anchor's folded claim equals the expect.
+    let delta_anchor = sb.gate(macslot, &[acl, expect, ow])[0];
 
     for (a_wires, opens) in &to_publish {
         for w in a_wires {
@@ -4438,6 +4699,7 @@ fn mvp7_real_query_phase() {
     }
     sb.publish(delta_tm);
     sb.publish(delta_rq);
+    sb.publish(delta_anchor);
     let shape = sb.finish().expect("valid real-query circuit");
     let setup_ms = t.elapsed().as_secs_f64() * 1e3;
 
@@ -4446,20 +4708,26 @@ fn mvp7_real_query_phase() {
     let (built, online_t) = timed(REPS, || shape.run(&vals, &hint_refs));
 
     // ---- the boundary checks ----
-    // The two multipoint zero-deltas sit at the very end of the public
-    // segment: T_m == anchor.v and running_W == q_eval·V.
+    // The three multipoint zero-deltas sit at the very end of the public
+    // segment: T_m == anchor.v, running_W == q_eval·V, and the anchor's
+    // folded claim == the in-circuit expect.
     assert_eq!(
-        built.public[built.public.len() - 2],
+        built.public[built.public.len() - 3],
         F128::ZERO,
         "T_m must equal the anchor's claimed v (in-circuit)"
     );
     assert_eq!(
-        built.public[built.public.len() - 1],
+        built.public[built.public.len() - 2],
         F128::ZERO,
         "running_W must equal q_eval·V (in-circuit V)"
     );
+    assert_eq!(
+        built.public[built.public.len() - 1],
+        F128::ZERO,
+        "the anchor's claim must equal the in-circuit expect"
+    );
     let yr_pub =
-        levels.len() * yr_len + usize::from(closeout) + 1 + piop.zc_rounds.len() + 3 + 2;
+        levels.len() * yr_len + usize::from(closeout) + 1 + piop.zc_rounds.len() + 3 + 3;
     let total_pub: usize = 1 + yr_pub
         + levels
             .iter()
