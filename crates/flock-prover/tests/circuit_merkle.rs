@@ -3546,6 +3546,7 @@ struct PdRec {
 }
 
 /// One merged W-round: the (G(1), G(inf)) value index and the rho squeeze.
+#[derive(Clone)]
 struct RoundRec {
     g_v: usize,
     fin: usize,
@@ -8538,7 +8539,7 @@ fn mvp10_circuit_inner_tape() {
         assert_eq!(commitment.cap, lig.initial_cap, "commitment IS the L0 cap");
         let r_lvl = lig.recursive_caps.len();
         let lvl_src = level_sources(lig);
-        let (start_v, piop_o, gammas_o, w_rounds, mp_o, inner_pd2, _yr_v2, levels) =
+        let (start_v, piop_o, gammas_o, w_rounds, mp_o, inner_pd2, yr_v2, levels) =
             parse_open_levels(ops, 32 * lig.initial_cap.len(), r_lvl);
         assert!(piop_o.is_some(), "a mixed tape carries the element PIOP");
         assert_eq!(
@@ -8930,6 +8931,46 @@ fn mvp10_circuit_inner_tape() {
             nt
         };
 
+        // ---- assembly step 8: the RESIDUAL region (shared emitter) ----
+        // Per-level ResidualGate accumulators and the close-out, ending in
+        // the residual-side inner; `inner == t_r` then closes the mixed
+        // statement between published wires, exactly as on mvp7 and the
+        // leaf. The slots are element-class and join el_all below.
+        let yr_len = proof.pcs_open.inner.ligerito.final_proof.yr.len();
+        let yr_wires: Vec<Wire> = (0..yr_len).map(|y| wv(yr_v2 + y)).collect();
+        // The inner commits INTEGER lanes (61 < 2^6), so the merged
+        // boundary's pd claim reaches ligerito at the ROTATED point
+        // (`rotate_lane_point`: the lane bits live at the TOP of rho and
+        // become the grid's LOW variables) — the residual pairing therefore
+        // consumes the W-rounds rotated left by `len − initial_k`. mvp7 and
+        // mvp9's inners had power-of-two lanes, so neither could reveal the
+        // rotation; the closure refusing to hold is what found it.
+        let lane_major = geo[0].row_words < geo[0].lanes;
+        let w_resid: Vec<RoundRec> = if lane_major {
+            let k_rot = w_rounds.len() - levels[0].fold_fins.len();
+            let mut v = w_rounds[k_rot..].to_vec();
+            v.extend_from_slice(&w_rounds[..k_rot]);
+            v
+        } else {
+            w_rounds.to_vec()
+        };
+        let mut resid_slots: Vec<(usize, flock_core::circuit::builder::SlotId)> = Vec::new();
+        let (resid_pub, inner_w, _pfslot) = emit_residual_region(
+            &mut sb,
+            &mut resid_slots,
+            &levels,
+            &geo,
+            &w_resid,
+            inner_pd2.fin,
+            &yr_wires,
+            &trace.squeezes,
+            &outs,
+            &chals,
+            &mut vals,
+            zw,
+            ow,
+        );
+
         // ---- assembly step 3: the ELEMENT PIOP rounds in-circuit ----
         // The mixed inner's element half, type reuse from mvp8: the
         // zerocheck's rounds are ZcRoundGate rows (tau slice wires as eq
@@ -9045,6 +9086,12 @@ fn mvp10_circuit_inner_tape() {
         sb.publish(t_final);
         sb.publish(tgt_w);
         sb.publish(runw);
+        for accs in &resid_pub {
+            for w in accs {
+                sb.publish(*w);
+            }
+        }
+        sb.publish(inner_w);
         // ---- the SIGMA ASSERTION emission (route B, in-circuit) ----
         // The claim exits as bound publics: the value is the deferred
         // s_sigma stream word — the SAME wire the rhs input check just
@@ -9055,7 +9102,8 @@ fn mvp10_circuit_inner_tape() {
         for w in &pt_w {
             sb.publish(*w);
         }
-        let n_tail = 2 + gkr_deltas.len() + el_deltas.len() + 2 + 5 + 1 + mu_i;
+        let n_tail =
+            2 + gkr_deltas.len() + el_deltas.len() + 2 + 5 + levels.len() * yr_len + 1 + 1 + mu_i;
         let n_query_pub: usize = levels.len()
             + levels
                 .iter()
@@ -9175,9 +9223,26 @@ fn mvp10_circuit_inner_tape() {
             native_running,
             "the W-rounds fold the target to the native running claim"
         );
+        // The residual region against the shared native replica — and THE
+        // CLOSURE: the residual-side inner and the spine's t_r are the same
+        // statement scalar, both held against published circuit outputs.
+        let inner_n = check_residual_publics(
+            &built2.public,
+            mp_base + 5,
+            &levels,
+            &geo,
+            &w_resid,
+            inner_pd2.ch,
+            &vals_rec[yr_v2..yr_v2 + yr_len],
+            &chals,
+        );
+        assert_eq!(
+            inner_n, t_final_n,
+            "inner == t_r: the mixed statement closes"
+        );
         // The sigma assertion, as the accumulator would read it: the value
         // and the mu point coordinates, matched against the native claim.
-        let sig_base = mp_base + 5;
+        let sig_base = mp_base + 5 + levels.len() * yr_len + 1;
         assert_eq!(
             built2.public[sig_base],
             proof.wiring.gkr.s_sigma_eval,
@@ -9226,6 +9291,7 @@ fn mvp10_circuit_inner_tape() {
         // slots the query phase created.
         let mut el_all: Vec<flock_core::circuit::builder::SlotId> = vec![macs, zcr, mrs, spine];
         el_all.extend(le_slots.iter().map(|(_, sl)| *sl));
+        el_all.extend(resid_slots.iter().map(|(_, sl)| *sl));
         let mut el_ord: Vec<(usize, Vec<F128>)> = el_all
             .into_iter()
             .map(|sl| {
@@ -9322,8 +9388,9 @@ fn mvp10_circuit_inner_tape() {
          outer: chain b3 rows {} | nu {} | dense_m {} | mu {}\n  \
          outer carries: the chain, the QUERY PHASE (61-word leaves), the\n         \
          WIRING GKR ({} layers, {} zero-deltas), the element PIOP, the\n         \
-         MULTIPOINT intake (R=2 and P={}), the SPINE (t_r bound), and the\n         \
-         sigma assertion (value + {} point coords, discharges)\n  \
+         MULTIPOINT intake (R=2 and P={}), the SPINE (t_r bound), the\n         \
+         RESIDUAL region (rotated lane-major pairing; inner == t_r closes),\n         \
+         and the sigma assertion (value + {} point coords, discharges)\n  \
          proof {:.1} KiB\n",
         nu,
         union.dense_m(),
