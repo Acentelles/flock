@@ -3637,13 +3637,12 @@ fn mvp7_real_query_phase() {
     }
 
     // ---- eval_b + the close-out (2b stage 2) ----
-    // BLOCKED behind MVP7_CLOSEOUT=1: with these ~6 extra element types the
-    // outer union's boolean RS claims lose their DeferredDense shape (the
-    // dense suffix drops under 16 — `use_split` in ring_switch.rs — and the
-    // merged open only accepts DeferredDense), so the OUTER prove panics.
-    // The gates and their native replica are done and kept; the union-shape
-    // limitation is the open item.
-    let closeout = std::env::var("MVP7_CLOSEOUT").is_ok();
+    // (These gates once needed MVP7_CLOSEOUT=1: the extra element types
+    // pushed the outer union's boolean RS claims off the DeferredDense
+    // shape — small/sparse suffixes routed to forms the merged open
+    // rejects. ring_switch now defers every claim, so the close-out is
+    // unconditional.)
+    let closeout = true;
     assert_eq!(gammas.len(), pd_pts.len(), "one gamma per claim");
     for (k, pd) in gammas.iter().enumerate() {
         for j in 0..pd.pt_len {
