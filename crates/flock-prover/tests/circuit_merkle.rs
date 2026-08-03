@@ -3855,10 +3855,13 @@ fn parse_open_levels(
 /// constants (ZcJoinGate), enters the lincheck at `va + alpha vb`, and
 /// reuses MergedRoundGate for the lincheck rounds; the published target IS
 /// the deferred ElementAssertion's target, and the ec join forces the merged
-/// intake's first absorbed value to be the zerocheck's output. Still native:
-/// the Frobenius assist (the published `running` is checked against
-/// `q_eval * v` natively), the PoW bit-predicates, and the claim-POINT joins
-/// (they only feed the assist). The inner proof commits with
+/// intake's first absorbed value to be the zerocheck's output. **MVP-8
+/// (2026-08-03) closed the rest**: the multipoint region is fully
+/// in-circuit (MacGate T0/V chains, mrslot rounds, the AssistLayerGate
+/// anchor DP with claim-POINT joins load-bearing, three tail zero-deltas —
+/// the native `v` is gone), the PoW bit predicate binds through published
+/// digest/nonce wires, and the ElementAssertion exits as bound publics.
+/// Nothing in the pure-element verifier is native. The inner proof commits with
 /// the lane grid at full utilization — count 2^13 x 4 cols = 2^15 words =
 /// exactly 2^22 dense bits, t = 64 — so L0 is the real 64-lane / 1 KiB-leaf
 /// shape with zero padding.
