@@ -8231,13 +8231,34 @@ fn mvp10_circuit_inner_tape() {
     // folding the claims | the (f, g, s_sigma) triple observed last].
     // s_sigma_eval is the value the sigma route-B assertion carries out;
     // rho = the accumulated (rho_i, c_k) squeezes are its point wires.
-    {
+    //
+    // The walk also RECORDS the ordinals the assembly wires against, and
+    // the per-round `g0` advice values the round gate consumes.
+    struct GkrLayerRec {
+        lam_fin: usize,
+        rounds: Vec<(usize, usize)>, // (g_v, squeeze fin)
+        g0s: Vec<F128>,
+        v_v: usize, // vl0; vl1/vr0/vr1 follow
+        ck_fin: usize,
+    }
+    struct GkrRec {
+        alpha_fin: usize,
+        beta_fin: usize,
+        top_v: usize,
+        layers: Vec<GkrLayerRec>,
+        fgs_v: usize, // f_eval, g_eval, s_sigma consecutive
+    }
+    // fin ordinal of the op at `end` = finalizing ops strictly before it.
+    let fin_at = |end: usize| ops[..end].iter().filter(|o| o.finalizes()).count();
+    let gkr_rec = {
         let gkr = &proof.wiring.gkr;
         let mut i = gkr_l[0] + 1;
         assert!(matches!(ops[i], Op::SqueezeScalar), "gkr alpha");
         let (_, c_alpha) = vc_at(i);
+        let alpha_fin = fin_at(i);
         i += 1;
         assert!(matches!(ops[i], Op::SqueezeScalar), "gkr beta");
+        let beta_fin = fin_at(i);
         i += 1;
         assert!(matches!(ops[i], Op::ObserveScalar), "top lhs");
         let (tv, _) = vc_at(i);
@@ -8248,14 +8269,18 @@ fn mvp10_circuit_inner_tape() {
         // The layer walk + native replay in lockstep.
         let (mut claim_l, mut claim_r) = (gkr.top_lhs, gkr.top_rhs);
         let mut r_pt: Vec<F128> = Vec::new();
+        let mut lrecs: Vec<GkrLayerRec> = Vec::new();
         for (k, layer) in gkr.layers.iter().enumerate() {
             assert_eq!(layer.rounds.len(), k, "layer {k} has k rounds");
             assert!(matches!(ops[i], Op::SqueezeScalar), "layer {k} lambda");
             let (_, lc2) = vc_at(i);
             let lambda = chals[lc2];
+            let lam_fin = fin_at(i);
             i += 1;
             let mut c_run = claim_l + lambda * claim_r;
             let mut r_prime = Vec::with_capacity(k + 1);
+            let mut rrecs: Vec<(usize, usize)> = Vec::new();
+            let mut g0s: Vec<F128> = Vec::new();
             for (t2, &(g1, gi)) in layer.rounds.iter().enumerate() {
                 assert!(matches!(ops[i], Op::ObserveScalar), "round obs g1");
                 let (gv, _) = vc_at(i);
@@ -8264,9 +8289,11 @@ fn mvp10_circuit_inner_tape() {
                 assert!(matches!(ops[i + 2], Op::SqueezeScalar), "round rho");
                 let (_, rc2) = vc_at(i + 2);
                 let rho = chals[rc2];
+                rrecs.push((gv, fin_at(i + 2)));
                 i += 3;
                 let r_eq = r_pt[t2];
                 let g0 = (c_run + r_eq * g1) * (F128::ONE + r_eq).inv();
+                g0s.push(g0);
                 c_run = g0 * (F128::ONE + rho) + g1 * rho + gi * rho * (F128::ONE + rho);
                 r_prime.push(rho);
             }
@@ -8287,11 +8314,19 @@ fn mvp10_circuit_inner_tape() {
             assert!(matches!(ops[i], Op::SqueezeScalar), "layer {k} c_k");
             let (_, cc2) = vc_at(i);
             let c_k = chals[cc2];
+            let ck_fin = fin_at(i);
             i += 1;
             claim_l = (F128::ONE + c_k) * layer.vl0 + c_k * layer.vl1;
             claim_r = (F128::ONE + c_k) * layer.vr0 + c_k * layer.vr1;
             r_prime.push(c_k);
             r_pt = r_prime;
+            lrecs.push(GkrLayerRec {
+                lam_fin,
+                rounds: rrecs,
+                g0s,
+                v_v: vv,
+                ck_fin,
+            });
         }
         // The input checks: s_id(rho) closed-form NATIVE (identity MLE —
         // in-circuit it is O(mu) affine work), s_sigma from the PROOF —
@@ -8318,7 +8353,14 @@ fn mvp10_circuit_inner_tape() {
         assert_eq!(vals_rec[fv], gkr.f_eval, "f_eval on the stream");
         assert_eq!(vals_rec[fv + 1], gkr.g_eval, "g_eval on the stream");
         assert_eq!(vals_rec[fv + 2], gkr.s_sigma_eval, "s_sigma on the stream");
-    }
+        GkrRec {
+            alpha_fin,
+            beta_fin,
+            top_v: tv,
+            layers: lrecs,
+            fgs_v: fv,
+        }
+    };
 
     // ---- the merged open: rs x 2, then the packed-direct claims ----
     let (pd_recs, mp_val_v) = {
@@ -8481,9 +8523,7 @@ fn mvp10_circuit_inner_tape() {
         let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
         vals.extend_from_slice(&iv_w);
         let iv2 = [sb.public_input(), sb.public_input()];
-        let (outs, _ww) = emit_fs_chain(&mut sb, b3s, iv2, &trace, &stream, &bytes, &mut vals);
-        // fin ordinal of a squeeze op = finalizing ops strictly before it.
-        let fin_at = |end: usize| ops[..end].iter().filter(|o| o.finalizes()).count();
+        let (outs, ww) = emit_fs_chain(&mut sb, b3s, iv2, &trace, &stream, &bytes, &mut vals);
         let ga_fin = fin_at(gkr_l[0] + 1);
         let ga_w = outs[trace.squeezes[ga_fin][0]][0];
         let mut mp_i = mp_l[0] + 1;
@@ -8493,23 +8533,161 @@ fn mvp10_circuit_inner_tape() {
         assert!(matches!(ops[mp_i], Op::SqueezeScalar), "mp gamma op");
         let mg_fin = fin_at(mp_i);
         let mg_w = outs[trace.squeezes[mg_fin][0]][0];
+
+        // ---- assembly step 2: the WIRING GKR in-circuit ----
+        // The region that makes an inner a CIRCUIT proof. Every piece is
+        // type reuse on the pinned map: the layer rounds are ZcRoundGate
+        // rows (eq weight = the prior layer's point coordinate, g0 as
+        // advice with a published-zero delta — family I, no in-circuit
+        // inversion); the layer close and the claim folds are MacGate
+        // chains; s_id(rho) is a MacGate chain over the point wires with
+        // the identity basis as constants (the closed form the verifier
+        // uses, from the now-pub helper); and the two input checks close
+        // as published-zero deltas — the rhs one consuming the DEFERRED
+        // s_sigma stream word, which then leaves as the sigma assertion.
+        let mut vmap: Vec<Option<usize>> = Vec::new();
+        for (wi, w) in stream.words.iter().enumerate() {
+            if let flock_core::transcript_record::StreamWord::Value(vi) = *w {
+                if vmap.len() <= vi {
+                    vmap.resize(vi + 1, None);
+                }
+                vmap[vi] = Some(wi);
+            }
+        }
+        let wv = |vi: usize| -> Wire { ww[vmap[vi].expect("stream word")].expect("wired") };
+        vals.push(F128::ZERO);
+        let zw = sb.public_input();
+        vals.push(F128::ONE);
+        let ow = sb.public_input();
+        let macs = sb.slot(MacGate::new());
+        let zcr = sb.slot(ZcRoundGate::new());
+        let mut gkr_deltas: Vec<Wire> = Vec::new();
+        let g = &gkr_rec;
+        let alpha_w = outs[trace.squeezes[g.alpha_fin][0]][0];
+        let beta_w = outs[trace.squeezes[g.beta_fin][0]][0];
+        // The grand products agree: a published-zero delta on the tops.
+        let (mut cl_w, mut cr_w) = (wv(g.top_v), wv(g.top_v + 1));
+        gkr_deltas.push(sb.gate(macs, &[cl_w, cr_w, ow])[0]);
+        let mut pt_w: Vec<Wire> = Vec::new();
+        for lr in &g.layers {
+            let lam_w = outs[trace.squeezes[lr.lam_fin][0]][0];
+            let mut run_w = sb.gate(macs, &[cl_w, lam_w, cr_w])[0];
+            let mut pt_next: Vec<Wire> = Vec::with_capacity(lr.rounds.len() + 1);
+            for (t2, &(gv, rfin)) in lr.rounds.iter().enumerate() {
+                let rho_w = outs[trace.squeezes[rfin][0]][0];
+                vals.push(lr.g0s[t2]);
+                let g0w = sb.public_input();
+                let o = sb.gate(
+                    zcr,
+                    &[run_w, wv(gv), wv(gv + 1), pt_w[t2], rho_w, g0w, ow],
+                );
+                gkr_deltas.push(o[0]);
+                run_w = o[1];
+                pt_next.push(rho_w);
+            }
+            // The layer close: run == vl0·vl1 + lambda·(vr0·vr1).
+            let (vl0, vl1) = (wv(lr.v_v), wv(lr.v_v + 1));
+            let (vr0, vr1) = (wv(lr.v_v + 2), wv(lr.v_v + 3));
+            let pl = sb.gate(macs, &[zw, vl0, vl1])[0];
+            let pr = sb.gate(macs, &[zw, vr0, vr1])[0];
+            let gate_w = sb.gate(macs, &[pl, lam_w, pr])[0];
+            gkr_deltas.push(sb.gate(macs, &[gate_w, run_w, ow])[0]);
+            // The claim fold: claim' = v0 + c·(v0 + v1) (char-2 form of
+            // (1+c)·v0 + c·v1).
+            let ck_w = outs[trace.squeezes[lr.ck_fin][0]][0];
+            let sl = sb.gate(macs, &[vl0, vl1, ow])[0];
+            let sr = sb.gate(macs, &[vr0, vr1, ow])[0];
+            cl_w = sb.gate(macs, &[vl0, ck_w, sl])[0];
+            cr_w = sb.gate(macs, &[vr0, ck_w, sr])[0];
+            pt_next.push(ck_w);
+            pt_w = pt_next;
+        }
+        let mu_i = built.shape.circuit.cells().mu();
+        assert_eq!(pt_w.len(), mu_i, "the GKR point spans the inner cell space");
+        // s_id(rho) = sum basis_i · rho_i — constants from the shared helper.
+        let basis_i = flock_core::product_gkr::s_id_basis(mu_i);
+        let mut sid_w = zw;
+        for (j, &bj) in basis_i.iter().enumerate() {
+            vals.push(bj);
+            let bw = sb.public_input();
+            sid_w = sb.gate(macs, &[sid_w, bw, pt_w[j]])[0];
+        }
+        // The two input checks, as published-zero deltas.
+        let (f_w, g_w, sig_w) = (wv(g.fgs_v), wv(g.fgs_v + 1), wv(g.fgs_v + 2));
+        let l1 = sb.gate(macs, &[f_w, alpha_w, sid_w])[0];
+        let l2 = sb.gate(macs, &[l1, beta_w, ow])[0];
+        gkr_deltas.push(sb.gate(macs, &[l2, cl_w, ow])[0]);
+        let r1 = sb.gate(macs, &[g_w, alpha_w, sig_w])[0];
+        let r2 = sb.gate(macs, &[r1, beta_w, ow])[0];
+        gkr_deltas.push(sb.gate(macs, &[r2, cr_w, ow])[0]);
+
+        // Everything publishes HERE, after every public input is declared:
+        // `built.public` lists entries in DECLARATION order, so an early
+        // publish misindexes the tail (the recorded MVP-7 gotcha).
+        // Tail order: [ga, mg | gkr deltas | s_sigma | rho...].
         sb.publish(ga_w);
         sb.publish(mg_w);
+        for d in &gkr_deltas {
+            sb.publish(*d);
+        }
+        // ---- the SIGMA ASSERTION emission (route B, in-circuit) ----
+        // The claim exits as bound publics: the value is the deferred
+        // s_sigma stream word — the SAME wire the rhs input check just
+        // consumed, so it cannot be a free public — and the point is the
+        // GKR's own accumulated squeeze wires. A checker reads them
+        // straight into a SigmaAssertion for the accumulator.
+        sb.publish(sig_w);
+        for w in &pt_w {
+            sb.publish(*w);
+        }
+        let n_tail = 2 + gkr_deltas.len() + 1 + mu_i;
         let shape2 = sb.finish().expect("the mvp10 chain circuit builds");
         let built2 = shape2.run(&vals, &[]);
         let (_, ga_c) = vc_at(gkr_l[0] + 1);
         let (_, mg_c) = vc_at(mp_i);
-        let np2 = built2.public.len();
+        let base2 = built2.public.len() - n_tail;
         assert_eq!(
-            built2.public[np2 - 2],
+            built2.public[base2],
             chals[ga_c],
             "the GKR alpha derives in-circuit"
         );
         assert_eq!(
-            built2.public[np2 - 1],
+            built2.public[base2 + 1],
             chals[mg_c],
             "the multipoint gamma derives in-circuit"
         );
+        // Every GKR delta is zero: the top pair, each layer round's g0
+        // identity, each layer close, and both input checks.
+        for (k, d) in built2.public[base2 + 2..base2 + 2 + gkr_deltas.len()]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(*d, F128::ZERO, "gkr delta {k}");
+        }
+        // The sigma assertion, as the accumulator would read it: the value
+        // and the mu point coordinates, matched against the native claim.
+        let sig_base = base2 + 2 + gkr_deltas.len();
+        assert_eq!(
+            built2.public[sig_base],
+            proof.wiring.gkr.s_sigma_eval,
+            "the emitted sigma value is the proof's deferred evaluation"
+        );
+        let sig_rho = &built2.public[sig_base + 1..sig_base + 1 + mu_i];
+        {
+            // The point equals the GKR's own final point, and the emitted
+            // pair IS a SigmaAssertion that discharges against the inner
+            // circuit's sigma table — the root's O(2^mu) check, fed
+            // entirely from the outer's public segment.
+            let sa = flock_core::circuit::SigmaAssertion {
+                rho: sig_rho.to_vec(),
+                nu: built.shape.circuit.cells().nu(),
+                value: built2.public[sig_base],
+            };
+            assert!(
+                sa.check(&built.shape.circuit),
+                "the emitted sigma assertion discharges against the inner circuit"
+            );
+        }
         // The outer proves and verifies over the circuit path.
         let union2 = UnionInstance::new(&shape2.registry, shape2.counts.clone());
         let pcs2 = PcsParams {
@@ -8522,6 +8700,24 @@ fn mvp10_circuit_inner_tape() {
         };
         let b3_r1cs2 = blake3::build_block_r1cs(nu2);
         let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
+        // The element slots the GKR transcription added, in REGISTRY order.
+        let mut el_ord: Vec<(usize, Vec<F128>)> = [macs, zcr]
+            .into_iter()
+            .map(|sl| {
+                let z = match &built2.witnesses[shape2.registry_slot(sl)] {
+                    SlotWitness::Element(z) => z.clone(),
+                    other => panic!("gkr slot produced {other:?}"),
+                };
+                (shape2.registry_slot(sl), z)
+            })
+            .collect();
+        el_ord.sort_by_key(|(i, _)| *i);
+        let el_inputs: Vec<UnionElementSlotInput> = el_ord
+            .into_iter()
+            .map(|(_, z)| {
+                UnionElementSlotInput::new(move |dst: &mut [F128]| dst.copy_from_slice(&z))
+            })
+            .collect();
         let mut ch2 = FsChallenger::new(DOMAIN);
         let (oproof, ocommit, _) = prover::prove_fast_ligerito_union_circuit(
             &union2,
@@ -8532,7 +8728,7 @@ fn mvp10_circuit_inner_tape() {
                 blake3::generate_witness_batch_major_partial(built2.rows::<Blake3Gate>(b3s), nu2),
                 b3_lc2,
             )],
-            Vec::new(),
+            el_inputs,
             &mut ch2,
         );
         let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![b3_lc2];
@@ -8548,22 +8744,36 @@ fn mvp10_circuit_inner_tape() {
             &mut ch2,
         )
         .expect("the mvp10 chain circuit verifies");
-        (b3_rows, nu2, union2.dense_m(), shape2.circuit.cells().mu())
+        (
+            b3_rows,
+            nu2,
+            union2.dense_m(),
+            shape2.circuit.cells().mu(),
+            gkr_deltas.len(),
+            bincode::serialize(&oproof).map(|b| b.len()).unwrap_or(0),
+        )
     };
 
     println!(
         "\nMVP-10 CIRCUIT-INNER TAPE (mixed: blake3 + mac, wired)\n  \
-         nu {} | dense_m {} | pd claims {} (2 element + {} gathers) | P {} | ops {}\n  \
-         chain: b3 rows {} | outer nu {} | outer dense_m {} | outer mu {}\n",
+         inner: nu {} | dense_m {} | pd claims {} (2 element + {} gathers) | P {} | mu {}\n  \
+         outer: chain b3 rows {} | nu {} | dense_m {} | mu {}\n  \
+         outer carries: the chain, the WIRING GKR ({} layers, {} zero-deltas),\n         \
+         and the sigma assertion (value + {} point coords, discharges)\n  \
+         proof {:.1} KiB\n",
         nu,
         union.dense_m(),
         pd_recs.len(),
         proof.wiring.gather.len(),
         n_p,
-        ops.len(),
+        built.shape.circuit.cells().mu(),
         outer_stats.0,
         outer_stats.1,
         outer_stats.2,
         outer_stats.3,
+        proof.wiring.gkr.layers.len(),
+        outer_stats.4,
+        built.shape.circuit.cells().mu(),
+        outer_stats.5 as f64 / 1024.0,
     );
 }
