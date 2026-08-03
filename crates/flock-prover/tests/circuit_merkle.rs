@@ -3018,6 +3018,165 @@ impl GateType for MergedRoundGate {
     }
 }
 
+/// One element-zerocheck round (degree-3, convention A): `g0` rides as
+/// ADVICE (a public input) and the gate enforces its defining identity as a
+/// published-zero delta — the family-I pattern, no in-circuit inversion:
+///
+///   delta = g0 (1+t) + running + t g1          (must be 0)
+///   running' = g0 (1+rho) + g1 rho + g_inf rho (1+rho)
+struct ZcRoundGate {
+    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+}
+
+impl ZcRoundGate {
+    fn new() -> Self {
+        use flock_core::element_r1cs::ElementTableBuilder;
+        let o = F128::ONE;
+        // in: running(0) g1(1) gi(2) t(3) rho(4) g0(5) one(6)
+        let mut b = ElementTableBuilder::new(4);
+        for w in 0..7 {
+            b.free_wire(w);
+        }
+        b.mult_lin(7, &[(5, o)], &[(6, o), (3, o)]); // g0(1+t)
+        b.mult(8, 3, 1); // t g1
+        b.linear(9, &[(7, o), (0, o), (8, o)]); // delta
+        b.mult_lin(10, &[(5, o)], &[(6, o), (4, o)]); // g0(1+rho)
+        b.mult(11, 1, 4); // g1 rho
+        b.mult_lin(12, &[(4, o)], &[(6, o), (4, o)]); // rho(1+rho)
+        b.mult(13, 2, 12); // gi rho(1+rho)
+        b.linear(14, &[(10, o), (11, o), (13, o)]);
+        Self {
+            ty: std::sync::Arc::new(b.build().expect("zc round gate")),
+        }
+    }
+}
+
+impl GateType for ZcRoundGate {
+    type Row = Vec<F128>;
+    type Hint = ();
+    fn table(&self) -> TableType {
+        use flock_core::schedule::IoWord;
+        let mut schema: Vec<IoWord> = (0..7).map(IoWord::input).collect();
+        schema.push(IoWord::output(9));
+        schema.push(IoWord::output(14));
+        TableType::element(self.ty.clone()).with_io_schema(schema)
+    }
+    fn eval(&self, inputs: &[F128], _h: &()) -> (Vec<F128>, Self::Row) {
+        let mut z = vec![F128::ZERO; 15];
+        z[..7].copy_from_slice(&inputs[..7]);
+        z[7] = z[5] * (z[6] + z[3]);
+        z[8] = z[3] * z[1];
+        z[9] = z[7] + z[0] + z[8];
+        z[10] = z[5] * (z[6] + z[4]);
+        z[11] = z[1] * z[4];
+        z[12] = z[4] * (z[6] + z[4]);
+        z[13] = z[2] * z[12];
+        z[14] = z[10] + z[11] + z[13];
+        (vec![z[9], z[14]], z)
+    }
+    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
+        let mut z = vec![F128::ZERO; self.ty.width() << nu];
+        for (j, row) in rows.iter().enumerate() {
+            for (col, &v) in row.iter().enumerate() {
+                z[(col << nu) + j] = v;
+            }
+        }
+        SlotWitness::Element(z)
+    }
+}
+
+/// The zerocheck's closing identity `running = ea eb + ec` (published-zero
+/// delta) and the constant-strip + lincheck entry: with the inner shape's
+/// single kappa=2 slot at full prefix, `va = ea + <eq(r_con), a_const>` and
+/// likewise `vb` — the four eq-tensor weights over the last two zerocheck
+/// challenges, with the table's affine constants baked as weights.
+struct ZcJoinGate {
+    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+    ac: Vec<F128>,
+    bc: Vec<F128>,
+}
+
+impl ZcJoinGate {
+    fn new(a_const: &[F128], b_const: &[F128]) -> Self {
+        use flock_core::element_r1cs::ElementTableBuilder;
+        let o = F128::ONE;
+        assert_eq!(a_const.len(), 4, "kappa=2 slot");
+        // in: running(0) ea(1) eb(2) ec(3) r0(4) r1(5) one(6)
+        let mut b = ElementTableBuilder::new(4);
+        for w in 0..7 {
+            b.free_wire(w);
+        }
+        b.mult(7, 1, 2); // ea eb
+        b.linear(8, &[(0, o), (7, o), (3, o)]); // delta
+        b.mult_lin(9, &[(6, o), (4, o)], &[(6, o), (5, o)]); // (1+r0)(1+r1)
+        b.mult_lin(10, &[(4, o)], &[(6, o), (5, o)]); // r0(1+r1)
+        b.mult_lin(11, &[(6, o), (4, o)], &[(5, o)]); // (1+r0)r1
+        b.mult(12, 4, 5); // r0 r1
+        // The builder rejects zero coefficients — free-wire columns have
+        // zero affine constants, so filter.
+        let mut ta = vec![(1usize, o)];
+        let mut tb = vec![(2usize, o)];
+        for (c, (&wa, &wb)) in a_const.iter().zip(b_const).enumerate() {
+            if wa != F128::ZERO {
+                ta.push((9 + c, wa));
+            }
+            if wb != F128::ZERO {
+                tb.push((9 + c, wb));
+            }
+        }
+        b.linear(13, &ta); // va
+        b.linear(14, &tb); // vb
+        Self {
+            ty: std::sync::Arc::new(b.build().expect("zc join gate")),
+            ac: a_const.to_vec(),
+            bc: b_const.to_vec(),
+        }
+    }
+}
+
+impl GateType for ZcJoinGate {
+    type Row = Vec<F128>;
+    type Hint = ();
+    fn table(&self) -> TableType {
+        use flock_core::schedule::IoWord;
+        let mut schema: Vec<IoWord> = (0..7).map(IoWord::input).collect();
+        for o in [8, 13, 14] {
+            schema.push(IoWord::output(o));
+        }
+        TableType::element(self.ty.clone()).with_io_schema(schema)
+    }
+    fn eval(&self, inputs: &[F128], _h: &()) -> (Vec<F128>, Self::Row) {
+        let mut z = vec![F128::ZERO; 15];
+        z[..7].copy_from_slice(&inputs[..7]);
+        z[7] = z[1] * z[2];
+        z[8] = z[0] + z[7] + z[3];
+        z[9] = (z[6] + z[4]) * (z[6] + z[5]);
+        z[10] = z[4] * (z[6] + z[5]);
+        z[11] = (z[6] + z[4]) * z[5];
+        z[12] = z[4] * z[5];
+        z[13] = z[1]
+            + z[9] * self.ac[0]
+            + z[10] * self.ac[1]
+            + z[11] * self.ac[2]
+            + z[12] * self.ac[3];
+        z[14] = z[2]
+            + z[9] * self.bc[0]
+            + z[10] * self.bc[1]
+            + z[11] * self.bc[2]
+            + z[12] * self.bc[3];
+        (vec![z[8], z[13], z[14]], z)
+    }
+    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
+        let mut z = vec![F128::ZERO; self.ty.width() << nu];
+        for (j, row) in rows.iter().enumerate() {
+            for (col, &v) in row.iter().enumerate() {
+                z[(col << nu) + j] = v;
+            }
+        }
+        SlotWitness::Element(z)
+    }
+}
+
 /// One packed-direct claim on the tape: its absorbed point/value and gamma.
 struct PdRec {
     pt_v: usize,
@@ -3039,6 +3198,19 @@ struct InnerPd {
     q_v: usize,
     fin: usize,
     ch: usize,
+}
+
+/// The element PIOP on the tape: tau, the zerocheck rounds, (ea, eb, ec),
+/// alpha, and the lincheck rounds.
+struct PiopRec {
+    tau_fin: usize,
+    tau_ch: usize,
+    tau_len: usize,
+    zc_rounds: Vec<RoundRec>,
+    eab_v: usize,
+    alpha_fin: usize,
+    alpha_ch: usize,
+    lc_rounds: Vec<RoundRec>,
 }
 
 /// One OOD claim on the tape: where its `z` squeezed, its `y`/intro-msg
@@ -3085,7 +3257,7 @@ fn parse_open_levels(
     ops: &[flock_core::transcript_record::TranscriptOp],
     cap0_bytes: usize,
     r: usize,
-) -> (usize, Vec<PdRec>, Vec<RoundRec>, InnerPd, usize, Vec<OpenLevel>) {
+) -> (usize, PiopRec, Vec<PdRec>, Vec<RoundRec>, InnerPd, usize, Vec<OpenLevel>) {
     use flock_core::transcript_record::TranscriptOp as Op;
     struct Cur<'a> {
         ops: &'a [Op],
@@ -3137,8 +3309,58 @@ fn parse_open_levels(
     let mut gammas: Vec<PdRec> = Vec::new();
     let mut rounds: Vec<RoundRec> = Vec::new();
     let mut inner_pd: Option<InnerPd> = None;
+    let mut piop: Option<PiopRec> = None;
     let mut in_pd = false;
     while cur.i < start {
+        if matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == b"flock-element-union-zc-v0") {
+            cur.bump();
+            let (tau_fin, tau_ch, tau_len) = match ops[cur.i] {
+                Op::SqueezeSlice(n) => (cur.fin, cur.ch, n),
+                ref o => panic!("tau, got {o:?}"),
+            };
+            cur.bump();
+            let mut zc_rounds = Vec::with_capacity(tau_len);
+            for _ in 0..tau_len {
+                let g_v = cur.v;
+                cur.expect_obs_scalar();
+                cur.expect_obs_scalar();
+                assert!(matches!(ops[cur.i], Op::SqueezeScalar), "zc rho");
+                zc_rounds.push(RoundRec { g_v, fin: cur.fin, ch: cur.ch });
+                cur.bump();
+            }
+            let eab_v = cur.v;
+            cur.expect_obs_scalar(); // ea
+            cur.expect_obs_scalar(); // eb
+            cur.expect_obs_scalar(); // ec
+            assert!(
+                matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == b"flock-element-union-lc-v0"),
+                "lc label"
+            );
+            cur.bump();
+            assert!(matches!(ops[cur.i], Op::SqueezeScalar), "alpha");
+            let (alpha_fin, alpha_ch) = (cur.fin, cur.ch);
+            cur.bump();
+            let mut lc_rounds = Vec::new();
+            while matches!(ops[cur.i], Op::ObserveScalar) {
+                let g_v = cur.v;
+                cur.expect_obs_scalar();
+                cur.expect_obs_scalar();
+                assert!(matches!(ops[cur.i], Op::SqueezeScalar), "lc rho");
+                lc_rounds.push(RoundRec { g_v, fin: cur.fin, ch: cur.ch });
+                cur.bump();
+            }
+            piop = Some(PiopRec {
+                tau_fin,
+                tau_ch,
+                tau_len,
+                zc_rounds,
+                eab_v,
+                alpha_fin,
+                alpha_ch,
+                lc_rounds,
+            });
+            continue;
+        }
         if matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == b"flock-merged-open-v0") {
             in_pd = true;
             cur.bump();
@@ -3310,7 +3532,15 @@ fn parse_open_levels(
             a_count,
         });
     }
-    (start_v, gammas, rounds, inner_pd, yr_v, levels)
+    (
+        start_v,
+        piop.expect("the element PIOP"),
+        gammas,
+        rounds,
+        inner_pd,
+        yr_v,
+        levels,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3349,9 +3579,16 @@ fn parse_open_levels(
 /// W-rounds fold it through `MergedRoundGate` binding rho, and the ligerito
 /// spine starts from gamma' * q_eval — every scalar in the statement is
 /// transcript-bound, and `inner == t_r` closes BETWEEN CIRCUIT OUTPUTS.
-/// Still native: the Frobenius assist (the published `running` is checked
-/// against `q_eval * v` natively), the PoW bit-predicates, and the element
-/// PIOP's own round arithmetic. The inner proof commits with
+/// **The PIOP spine extension**: the element zerocheck replays with `g0` as
+/// advice (published-zero identity deltas — family I, no in-circuit
+/// inversion), closes `running = ea eb + ec`, strips the slot's affine
+/// constants (ZcJoinGate), enters the lincheck at `va + alpha vb`, and
+/// reuses MergedRoundGate for the lincheck rounds; the published target IS
+/// the deferred ElementAssertion's target, and the ec join forces the merged
+/// intake's first absorbed value to be the zerocheck's output. Still native:
+/// the Frobenius assist (the published `running` is checked against
+/// `q_eval * v` natively), the PoW bit-predicates, and the claim-POINT joins
+/// (they only feed the assist). The inner proof commits with
 /// the lane grid at full utilization — count 2^13 x 4 cols = 2^15 words =
 /// exactly 2^22 dense bits, t = 64 — so L0 is the real 64-lane / 1 KiB-leaf
 /// shape with zero padding.
@@ -3380,7 +3617,7 @@ fn mvp7_real_query_phase() {
         )
     };
     let (w0, w1) = (F128::new(7, 0), F128::new(0, 3));
-    let ty = {
+    let inner_ty = {
         let mut b = ElementTableBuilder::new(2);
         b.free_wire(0)
             .free_wire(1)
@@ -3388,11 +3625,11 @@ fn mvp7_real_query_phase() {
             .linear(3, &[(0, w0), (1, w1)]);
         Arc::new(b.build().expect("gate block is valid"))
     };
-    let registry = Registry::new(vec![TableType::element(ty.clone())], INNER_NU);
+    let registry = Registry::new(vec![TableType::element(inner_ty.clone())], INNER_NU);
     let n_rows = 1usize << INNER_NU; // full utilization: dense = 4 * 2^20 = 2^22
     let witness: Vec<F128> = {
         let at = |c: usize, j: usize| (c << INNER_NU) + j;
-        let mut z = vec![F128::ZERO; ty.width() << INNER_NU];
+        let mut z = vec![F128::ZERO; inner_ty.width() << INNER_NU];
         for j in 0..n_rows {
             let (a, b) = (rf(&mut rng), rf(&mut rng));
             z[at(0, j)] = a;
@@ -3472,7 +3709,7 @@ fn mvp7_real_query_phase() {
             }
         })
         .collect();
-    let (start_v, gammas, w_rounds, inner_pd, yr_v, levels) =
+    let (start_v, piop, gammas, w_rounds, inner_pd, yr_v, levels) =
         parse_open_levels(t_shape.ops(), 32 * lig.initial_cap.len(), r);
     assert_eq!(levels.len(), r + 1);
 
@@ -3666,6 +3903,80 @@ fn mvp7_real_query_phase() {
         outs[trace_sq[fin][0]][0]
     };
     let wv = |vi: usize| -> Wire { word_wire[vmap[vi].expect("stream word")].expect("wired") };
+    // ---- the element PIOP (spine extension): zerocheck + lincheck ----
+    // g0 rides as advice per zerocheck round; its defining identity and the
+    // closing `running = ea eb + ec` publish as zero-deltas. The strip gate
+    // folds the slot's affine constants at the last two zerocheck challenges,
+    // and the lincheck's two rounds reuse MergedRoundGate. The `ec` join
+    // (published-zero) forces the merged intake's first absorbed value to BE
+    // the zerocheck's output.
+    let zc_natives: Vec<F128> = {
+        // native g0 chain, needed as the advice values
+        let mut out = Vec::with_capacity(piop.tau_len);
+        let mut running = F128::ZERO;
+        for (i, rr) in piop.zc_rounds.iter().enumerate() {
+            let (g1, gi) = (rec.values()[rr.g_v], rec.values()[rr.g_v + 1]);
+            let t = chals[piop.tau_ch + i];
+            let rho = chals[rr.ch];
+            let g0 = (running + t * g1) * (F128::ONE + t).inv();
+            out.push(g0);
+            running = g0 * (F128::ONE + rho) + g1 * rho + gi * rho * (F128::ONE + rho);
+        }
+        out
+    };
+    let zslot = sb.slot(ZcRoundGate::new());
+    leaf_slot.push((500, zslot));
+    let mut zr = zw;
+    let mut zc_deltas: Vec<Wire> = Vec::new();
+    for (i, rr) in piop.zc_rounds.iter().enumerate() {
+        let sqt = &trace.squeezes[piop.tau_fin];
+        let t_w = outs[sqt[i / 4]][i % 4];
+        let rho_w = chw(&outs, &trace.squeezes, rr.fin);
+        vals.push(zc_natives[i]);
+        let g0w = sb.public_input();
+        let g = sb.gate(
+            zslot,
+            &[zr, wv(rr.g_v), wv(rr.g_v + 1), t_w, rho_w, g0w, ow],
+        );
+        zc_deltas.push(g[0]);
+        zr = g[1];
+    }
+    let jslot = sb.slot(ZcJoinGate::new(inner_ty.a_const(), inner_ty.b_const()));
+    leaf_slot.push((501, jslot));
+    let nzc = piop.zc_rounds.len();
+    let jr = sb.gate(
+        jslot,
+        &[
+            zr,
+            wv(piop.eab_v),
+            wv(piop.eab_v + 1),
+            wv(piop.eab_v + 2),
+            chw(&outs, &trace.squeezes, piop.zc_rounds[nzc - 2].fin),
+            chw(&outs, &trace.squeezes, piop.zc_rounds[nzc - 1].fin),
+            ow,
+        ],
+    );
+    let (zc_fin_delta, va_w, vb_w) = (jr[0], jr[1], jr[2]);
+    let alpha_w = chw(&outs, &trace.squeezes, piop.alpha_fin);
+    let lc0 = sb.gate(spine, &[zw, zw, zw, va_w, zw, zw, vb_w, alpha_w, zw])[3];
+    let mut lr = lc0;
+    // (MergedRoundGate is declared just below for the W-rounds; the lincheck
+    // rounds share it, so hoist the slot.)
+    let mrslot = sb.slot(MergedRoundGate::new());
+    leaf_slot.push((400, mrslot));
+    for rr in &piop.lc_rounds {
+        lr = sb.gate(
+            mrslot,
+            &[lr, wv(rr.g_v), wv(rr.g_v + 1), chw(&outs, &trace.squeezes, rr.fin)],
+        )[0];
+    }
+    let lc_target = lr;
+    // ec join: the intake's first absorbed value == the zerocheck's ec.
+    let ec_join = sb.gate(
+        spine,
+        &[zw, zw, zw, wv(piop.eab_v + 2), zw, zw, wv(gammas[0].val_v), ow, zw],
+    )[3];
+
     // Outer target: SpineGate tr-rows accumulate gamma_k * value_k.
     let mut mt = zw;
     for pd in &gammas {
@@ -3674,8 +3985,6 @@ fn mvp7_real_query_phase() {
         mt = f[3];
     }
     // The W-rounds, binding rho.
-    let mrslot = sb.slot(MergedRoundGate::new());
-    leaf_slot.push((400, mrslot));
     for rr in &w_rounds {
         let rw = chw(&outs, &trace.squeezes, rr.fin);
         mt = sb.gate(mrslot, &[mt, wv(rr.g_v), wv(rr.g_v + 1), rw])[0];
@@ -3871,6 +4180,12 @@ fn mvp7_real_query_phase() {
     }
     sb.publish(t_final);
     sb.publish(running_w);
+    for d in &zc_deltas {
+        sb.publish(*d);
+    }
+    sb.publish(zc_fin_delta);
+    sb.publish(ec_join);
+    sb.publish(lc_target);
     for accs in &resid_pub {
         for w in accs {
             sb.publish(*w);
@@ -3887,7 +4202,8 @@ fn mvp7_real_query_phase() {
     let (built, online_t) = timed(REPS, || shape.run(&vals, &hint_refs));
 
     // ---- the boundary checks ----
-    let yr_pub = levels.len() * yr_len + usize::from(closeout) + 1;
+    let yr_pub =
+        levels.len() * yr_len + usize::from(closeout) + 1 + piop.zc_rounds.len() + 3;
     let total_pub: usize = 1 + yr_pub
         + levels
             .iter()
@@ -3960,6 +4276,57 @@ fn mvp7_real_query_phase() {
             mt = (mt + g1) + (mt + gi) * rch + gi * (rch * rch);
         }
         assert_eq!(built.public[at], mt, "the merged running claim");
+        at += 1;
+    }
+    // The PIOP: every zero-delta must BE zero, and the lincheck target must
+    // match a native replay (which is the deferred assertion's target).
+    {
+        for i in 0..piop.zc_rounds.len() {
+            assert_eq!(built.public[at + i], F128::ZERO, "zc delta {i}");
+        }
+        at += piop.zc_rounds.len();
+        assert_eq!(built.public[at], F128::ZERO, "zc final delta");
+        at += 1;
+        assert_eq!(built.public[at], F128::ZERO, "ec join");
+        at += 1;
+        // native lincheck replay
+        let mut running = F128::ZERO;
+        for (i, rr) in piop.zc_rounds.iter().enumerate() {
+            let (g1, gi) = (rec.values()[rr.g_v], rec.values()[rr.g_v + 1]);
+            let (t, rho) = (chals[piop.tau_ch + i], chals[rr.ch]);
+            let g0 = (running + t * g1) * (F128::ONE + t).inv();
+            running = g0 * (F128::ONE + rho) + g1 * rho + gi * rho * (F128::ONE + rho);
+        }
+        let (ea, eb, ec) = (
+            rec.values()[piop.eab_v],
+            rec.values()[piop.eab_v + 1],
+            rec.values()[piop.eab_v + 2],
+        );
+        assert_eq!(running, ea * eb + ec, "native zc closes");
+        let nzc = piop.zc_rounds.len();
+        let (r0, r1) = (
+            chals[piop.zc_rounds[nzc - 2].ch],
+            chals[piop.zc_rounds[nzc - 1].ch],
+        );
+        let eqt = [
+            (F128::ONE + r0) * (F128::ONE + r1),
+            r0 * (F128::ONE + r1),
+            (F128::ONE + r0) * r1,
+            r0 * r1,
+        ];
+        let (mut va, mut vb) = (ea, eb);
+        for c in 0..4 {
+            va += eqt[c] * inner_ty.a_const()[c];
+            vb += eqt[c] * inner_ty.b_const()[c];
+        }
+        let mut lrn = va + chals[piop.alpha_ch] * vb;
+        for rr in &piop.lc_rounds {
+            let (e1, ei) = (rec.values()[rr.g_v], rec.values()[rr.g_v + 1]);
+            let rho = chals[rr.ch];
+            let e0 = lrn + e1;
+            lrn = ei * rho * rho + (e0 + e1 + ei) * rho + e0;
+        }
+        assert_eq!(built.public[at], lrn, "the deferred assertion's target");
         at += 1;
     }
     // Native replica of induce_sumcheck_evaluate_at_residual, per level.
