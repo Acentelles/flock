@@ -5432,6 +5432,21 @@ fn emit_query_phase(
 /// returned accumulators and `inner` AFTER all inputs are declared (the
 /// recorded MVP-7 gotcha). Also returns the `pl_full`-wide prefix slot,
 /// which the anchor-expect machinery reuses for its chunked products.
+///
+/// **CHUNKING (the mu-25 fix).** Every gate instantiates at
+/// `chunk_log = min(yr_log, 3)` — kappa 6 REGARDLESS of the proof's yr.
+/// The real inner's yr = 32 otherwise pushed the close-out schemas to
+/// kappa 7-8 (~600 IO words, cell space c = 10, and every O(2^mu) pass
+/// paid 16x). A yr > 8 region runs as `2^(yr_log-3)` chunks of 8:
+/// - the close-out claims' HIGH-bit eq factors ride the PREFIX SLOT
+///   (seed = the claim's prefix product, factors = high coords vs the
+///   chunk bits) — wire-bound, no new trust;
+/// - the residual rows' high subset factor `sp_hi(h)` rides the CHECKER
+///   tier (`awp = aw·sp_hi`, recomputed natively from the validated
+///   position by `check_residual_publics` — the alpha-expansion trust
+///   class; a wrong value fails the published accumulators);
+/// - cross-chunk dots sum through a degenerate `SuffixGate(0)` adder.
+/// Shapes with yr <= 8 take the single-chunk path BIT-IDENTICALLY.
 #[allow(clippy::too_many_arguments)]
 fn emit_residual_region(
     sb: &mut ShapeBuilder,
@@ -5452,13 +5467,20 @@ fn emit_residual_region(
     let yr_len = yr_wires.len();
     assert!(yr_len.is_power_of_two());
     let yr_log = yr_len.trailing_zeros() as usize;
+    let chunk_log = yr_log.min(3);
+    let chunk = 1usize << chunk_log;
+    let n_chunks = 1usize << (yr_log - chunk_log);
+    let inv = |v: F128| if v == F128::ZERO { F128::ZERO } else { v.inv() };
     let chw = |fin: usize| -> Wire { outs[sq[fin][0]][0] };
     let mut resid_pub: Vec<Vec<Wire>> = Vec::new();
     for (li, lvl) in levels.iter().enumerate() {
         let pl: usize = levels[li + 1..].iter().map(|l| l.fold_fins.len()).sum();
-        let lmc = pl + yr_log;
+        let lmc_full = pl + yr_log;
+        let sks_full = sk_at_vks(lmc_full);
+        let lmc = pl + chunk_log;
         let sks = sk_at_vks(lmc);
-        let rslot = sb.slot(ResidualGate::new(lmc, pl, yr_log, &sks));
+        debug_assert_eq!(&sks[..], &sks_full[..lmc + 1], "sk_at_vks is prefix-stable");
+        let rslot = sb.slot(ResidualGate::new(lmc, pl, chunk_log, &sks));
         leaf_slot.push((100 + li, rslot));
         let ris_w: Vec<Wire> = levels[li + 1..]
             .iter()
@@ -5469,16 +5491,44 @@ fn emit_residual_region(
         let mut accs: Vec<Wire> = (0..yr_len).map(|_| zw).collect();
         for k in 0..geo[li].q {
             let pos = (chals[lvl.q_ch + k].lo as usize) & ((1usize << geo[li].depth) - 1);
-            vals.push(F128::new(pos as u64, 0));
-            let qf = sb.public_input();
-            vals.push(aw[k]);
-            let awp = sb.public_input();
-            let mut g_in = vec![qf];
-            g_in.extend_from_slice(&ris_w);
-            g_in.push(awp);
-            g_in.push(ow);
-            g_in.extend_from_slice(&accs);
-            accs = sb.gate(rslot, &g_in);
+            // The high subset factors sp_hi(h), natively from the full
+            // chain (the checker tier — see the doc comment).
+            let sp_hi: Vec<F128> = {
+                let mut sk = Vec::with_capacity(lmc_full);
+                if lmc_full > 0 {
+                    sk.push(F128::new(pos as u64, 0));
+                    for j in 1..lmc_full {
+                        sk.push(sk[j - 1] * sk[j - 1] + sks_full[j - 1] * sk[j - 1]);
+                    }
+                }
+                let w_hi: Vec<F128> = (chunk_log..yr_log)
+                    .map(|j| sk[pl + j] * inv(sks_full[pl + j]))
+                    .collect();
+                (0..n_chunks)
+                    .map(|h| {
+                        let mut p = F128::ONE;
+                        for (j, &wj) in w_hi.iter().enumerate() {
+                            if (h >> j) & 1 == 1 {
+                                p *= wj;
+                            }
+                        }
+                        p
+                    })
+                    .collect()
+            };
+            for (h, &sph) in sp_hi.iter().enumerate() {
+                vals.push(F128::new(pos as u64, 0));
+                let qf = sb.public_input();
+                vals.push(aw[k] * sph);
+                let awp = sb.public_input();
+                let mut g_in = vec![qf];
+                g_in.extend_from_slice(&ris_w);
+                g_in.push(awp);
+                g_in.push(ow);
+                g_in.extend_from_slice(&accs[h * chunk..(h + 1) * chunk]);
+                let out = sb.gate(rslot, &g_in);
+                accs[h * chunk..(h + 1) * chunk].copy_from_slice(&out);
+            }
         }
         resid_pub.push(accs);
     }
@@ -5491,11 +5541,47 @@ fn emit_residual_region(
         .iter()
         .flat_map(|l| l.fold_fins.iter().map(|&f| chw(f)))
         .collect();
-    let sxslot = sb.slot(SuffixGate::new(yr_log));
+    let sxslot = sb.slot(SuffixGate::new(chunk_log));
     leaf_slot.push((300, sxslot));
     let pfslot = sb.slot(PrefixGate::new(pl_full));
     leaf_slot.push((310 + pl_full, pfslot));
+    let sx0 = if n_chunks > 1 {
+        let s = sb.slot(SuffixGate::new(0));
+        leaf_slot.push((303, s));
+        Some(s)
+    } else {
+        None
+    };
     let mut evb_accs: Vec<Wire> = (0..yr_len).map(|_| zw).collect();
+    // Fold one claim (prefix product p at full-yl coord wires) into the
+    // accumulators: per chunk, the high-coord eq factor is a prefix row
+    // seeded by p (wire-bound), then a suffix row over the low coords.
+    let apply_suffix =
+        |sb: &mut ShapeBuilder, evb_accs: &mut [Wire], p: Wire, coords: &[Wire]| {
+            assert_eq!(coords.len(), yr_log, "the claim tail spans yr");
+            for h in 0..n_chunks {
+                let ph = if n_chunks == 1 {
+                    p
+                } else {
+                    let hi = &coords[chunk_log..];
+                    let mut g_in = vec![p];
+                    g_in.extend_from_slice(hi);
+                    g_in.extend(std::iter::repeat_n(zw, pl_full - hi.len()));
+                    for (j, _) in hi.iter().enumerate() {
+                        g_in.push(if (h >> j) & 1 == 1 { ow } else { zw });
+                    }
+                    g_in.extend(std::iter::repeat_n(zw, pl_full - hi.len()));
+                    g_in.push(ow);
+                    sb.gate(pfslot, &g_in)[0]
+                };
+                let mut s_in = vec![ph];
+                s_in.extend_from_slice(&coords[..chunk_log]);
+                s_in.push(ow);
+                s_in.extend_from_slice(&evb_accs[h * chunk..(h + 1) * chunk]);
+                let out = sb.gate(sxslot, &s_in);
+                evb_accs[h * chunk..(h + 1) * chunk].copy_from_slice(&out);
+            }
+        };
     {
         assert_eq!(w_rounds.len(), pl_full + yr_log, "rho spans the dense domain");
         let mut g_in = vec![chw(inner_pd_fin)];
@@ -5505,13 +5591,8 @@ fn emit_residual_region(
         g_in.extend_from_slice(&ris_full);
         g_in.push(ow);
         let pw = sb.gate(pfslot, &g_in)[0];
-        let mut s_in = vec![pw];
-        for rr in &w_rounds[pl_full..] {
-            s_in.push(chw(rr.fin));
-        }
-        s_in.push(ow);
-        s_in.extend_from_slice(&evb_accs);
-        evb_accs = sb.gate(sxslot, &s_in);
+        let coords: Vec<Wire> = w_rounds[pl_full..].iter().map(|rr| chw(rr.fin)).collect();
+        apply_suffix(sb, &mut evb_accs, pw, &coords);
     }
     for (li, lvl) in levels.iter().enumerate() {
         for od in &lvl.ood {
@@ -5531,31 +5612,41 @@ fn emit_residual_region(
             g_in.extend(std::iter::repeat_n(zw, pl_full - folded));
             g_in.push(ow);
             let pw = sb.gate(pfslot, &g_in)[0];
-            let mut s_in = vec![pw];
-            for j in 0..yr_log {
-                let jj = folded + j;
-                s_in.push(outs[sqz[jj / 4]][jj % 4]);
-            }
-            s_in.push(ow);
-            s_in.extend_from_slice(&evb_accs);
-            evb_accs = sb.gate(sxslot, &s_in);
+            let coords: Vec<Wire> = (0..yr_log)
+                .map(|j| {
+                    let jj = folded + j;
+                    outs[sqz[jj / 4]][jj % 4]
+                })
+                .collect();
+            apply_suffix(sb, &mut evb_accs, pw, &coords);
         }
     }
     // beta-weighted residuals fold in per level, then the yr dot.
-    let pcslot = sb.slot(PartialCombineGate::new(yr_log));
+    let pcslot = sb.slot(PartialCombineGate::new(chunk_log));
     leaf_slot.push((301, pcslot));
     let mut comb = evb_accs;
     for (li, lvl) in levels.iter().enumerate() {
-        let mut g_in = vec![chw(lvl.beta_fin)];
-        g_in.extend_from_slice(&comb);
-        g_in.extend_from_slice(&resid_pub[li]);
-        comb = sb.gate(pcslot, &g_in);
+        for h in 0..n_chunks {
+            let mut g_in = vec![chw(lvl.beta_fin)];
+            g_in.extend_from_slice(&comb[h * chunk..(h + 1) * chunk]);
+            g_in.extend_from_slice(&resid_pub[li][h * chunk..(h + 1) * chunk]);
+            let out = sb.gate(pcslot, &g_in);
+            comb[h * chunk..(h + 1) * chunk].copy_from_slice(&out);
+        }
     }
-    let fdslot = sb.slot(FinalDotGate::new(yr_log));
+    let fdslot = sb.slot(FinalDotGate::new(chunk_log));
     leaf_slot.push((302, fdslot));
-    let mut g_in: Vec<Wire> = yr_wires.to_vec();
-    g_in.extend_from_slice(&comb);
-    let inner_w = sb.gate(fdslot, &g_in)[0];
+    let mut inner_w: Option<Wire> = None;
+    for h in 0..n_chunks {
+        let mut g_in: Vec<Wire> = yr_wires[h * chunk..(h + 1) * chunk].to_vec();
+        g_in.extend_from_slice(&comb[h * chunk..(h + 1) * chunk]);
+        let dot = sb.gate(fdslot, &g_in)[0];
+        inner_w = Some(match inner_w {
+            None => dot,
+            Some(acc) => sb.gate(sx0.expect("the cross-chunk adder"), &[dot, ow, acc])[0],
+        });
+    }
+    let inner_w = inner_w.expect("at least one chunk");
     (resid_pub, inner_w, pfslot)
 }
 
@@ -9034,7 +9125,7 @@ fn mvp10_leaf_outer_inner_tape() {
     };
 
     println!(
-        "\nMVP-10 SWAP steps 1-3 — the LEAF OUTER as the inner\n  \
+        "\nMVP-10 SWAP steps 1-4 — the LEAF OUTER as the inner\n  \
          inner: dense_m {} | mu {} | levels (q, depth) {:?}\n  \
          pd claims {} (element pair + {} gathers) | P {} | L0 lanes {}/{}\n  \
          outer-of-outer: b3 rows {} | nu {} | dense_m {} | mu {}\n  \
