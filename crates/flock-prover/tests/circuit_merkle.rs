@@ -5941,11 +5941,11 @@ fn mvp9_boolean_leaf_tape() {
         blake3::generate_witness_batch_major(&inputs, setup.n_blocks_log()),
         circuit,
     );
-    let mut ch = FsChallenger::new(DOMAIN);
+    let mut ch = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
     let (proof, commitment, _claim) =
         prover::prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
 
-    let mut rec = RecordingChallenger::new(FsChallenger::new(DOMAIN));
+    let mut rec = RecordingChallenger::new(FsChallenger::with_hash(DOMAIN, HashKind::Blake3));
     verifier::verify_ligerito_union(
         &union,
         &[circuit],
@@ -6192,4 +6192,113 @@ fn mvp9_boolean_leaf_tape() {
         t = g0 + (g1 + g0 + gi) * r + gi * r * r;
     }
     assert_eq!(t, fro.anchor.v, "T_m must equal the anchor's claimed v (R = 2)");
+
+    // ---- phase 2a step 2: the leaf chain in-circuit (the skeleton) ----
+    // The leaf tape's whole FS chain replays through the blake3 slot; the
+    // multipoint gamma publishes and is checked against the recorded
+    // challenge — one squeeze validated end-to-end pins the replay, since
+    // every earlier row feeds it. The outer proves and verifies over the
+    // circuit path: the first outer proof OF a real workload proof's
+    // transcript.
+    {
+        use flock_prover::r1cs_hashes::fs_chain::FsChain;
+        let stream = t_shape.stream_words(DOMAIN);
+        let bytes = stream.to_bytes(rec.values(), rec.payloads());
+        let mut chain = FsChain::new();
+        let mut at = 0usize;
+        let fin_ops: Vec<_> = t_shape.ops().iter().filter(|o| o.finalizes()).collect();
+        for (k, &upto) in stream.finalize_after.iter().enumerate() {
+            chain.absorb(&bytes[at * 16..upto * 16]);
+            at = upto;
+            chain.finalize(fin_ops[k].squeezed_bytes());
+        }
+        chain.absorb(&bytes[at * 16..]);
+        let trace = chain.finish();
+
+        let nu_o = 13usize;
+        let mut sb = ShapeBuilder::new(nu_o);
+        let b3slot = sb.slot(Blake3Gate { nu: nu_o });
+        let mut vals: Vec<F128> = Vec::new();
+        let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+        vals.extend_from_slice(&iv_w);
+        let iv = [sb.public_input(), sb.public_input()];
+        assert_eq!(
+            stream.finalize_after.len(),
+            fin_ops.len(),
+            "every finalizing op has a stream finalize point"
+        );
+        // The gamma squeeze's finalize ordinal, from a full (fin, ch) walk.
+        let gamma_ch = chals
+            .iter()
+            .position(|&x| x == gamma)
+            .expect("gamma among the challenges");
+        let mut gamma_fin = None;
+        {
+            let (mut fin, mut cc) = (0usize, 0usize);
+            for op in t_shape.ops() {
+                if matches!(op, Op::SqueezeScalar) && cc == gamma_ch {
+                    gamma_fin = Some(fin);
+                    break;
+                }
+                if op.finalizes() {
+                    fin += 1;
+                }
+                match op {
+                    Op::SqueezeScalar => cc += 1,
+                    Op::SqueezeSlice(n) => cc += n,
+                    _ => {}
+                }
+            }
+        }
+        let gamma_fin = gamma_fin.expect("gamma squeeze located");
+        let (outs, _ww) = emit_fs_chain(&mut sb, b3slot, iv, &trace, &stream, &bytes, &mut vals);
+        sb.publish(outs[trace.squeezes[gamma_fin][0]][0]);
+        let shape = sb.finish().expect("valid leaf-chain circuit");
+        let built = shape.run(&vals, &[]);
+        assert_eq!(
+            *built.public.last().unwrap(),
+            gamma,
+            "the chain derives the multipoint gamma"
+        );
+
+        let union_o = UnionInstance::new(&shape.registry, shape.counts.clone());
+        let pcs_o = PcsParams {
+            m: union_o.dense_m(),
+            log_inv_rate: 1,
+            log_batch_size: 6,
+            profile: LigeritoProfile::Fast,
+            num_lanes: union_o.commit_lanes(6),
+            merkle_hash: Default::default(),
+        };
+        let b3_r1cs = blake3::build_block_r1cs(nu_o);
+        let b3_lc = b3_r1cs.csc_lincheck_circuit();
+        let mut ch = FsChallenger::new(DOMAIN);
+        let (oproof, ocommit, _) = prover::prove_fast_ligerito_union_circuit(
+            &union_o,
+            &shape.circuit,
+            &built.public,
+            &pcs_o,
+            vec![UnionSlotProverInput::new(
+                blake3::generate_witness_batch_major_partial(
+                    built.rows::<Blake3Gate>(b3slot),
+                    nu_o,
+                ),
+                b3_lc,
+            )],
+            Vec::new(),
+            &mut ch,
+        );
+        let mut ch = FsChallenger::new(DOMAIN);
+        verifier::verify_ligerito_union_circuit(
+            &union_o,
+            &shape.circuit,
+            &built.public,
+            &[b3_lc],
+            &ocommit,
+            &oproof,
+            &pcs_o,
+            &mut ch,
+        )
+        .expect("the leaf chain circuit verifies");
+    }
 }
