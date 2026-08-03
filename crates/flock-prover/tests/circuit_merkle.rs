@@ -6334,6 +6334,37 @@ fn mvp6_all_levels_collapsed() {
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn mvp9_boolean_leaf_tape() {
+    build_leaf_outer();
+}
+
+/// The leaf outer's artifacts, returned by [`build_leaf_outer`] so the
+/// recursion swap can consume the proof as ITS inner: the circuit shape
+/// (owning registry + counts — `UnionInstance::new(&shape.registry,
+/// shape.counts.clone())` reconstructs the instance), the public segment,
+/// the BLAKE3/BLAKE3 circuit proof, and the boolean tables whose lincheck
+/// circuits a verifier needs (in registry order via the `*_slot` indices).
+struct LeafOuter {
+    shape: flock_core::circuit::builder::CircuitShape,
+    public: Vec<F128>,
+    proof: flock_core::proof::R1csProofCircuitMerged,
+    commitment: flock_core::pcs::Commitment,
+    pcs: PcsParams,
+    b3_r1cs: flock_core::r1cs::BlockR1cs,
+    swap_r1cs: flock_core::r1cs::BlockR1cs,
+    spread_r1cs: flock_core::r1cs::BlockR1cs,
+    b3_slot: usize,
+    swap_slot: usize,
+    spread_slot: usize,
+}
+
+/// mvp9's WHOLE construction as the shared builder the swap consumes: the
+/// real blake3 workload leaf, its recorded native verify, the outer circuit
+/// carrying the leaf's complete deferred verification, and the outer's own
+/// prove/verify over the circuit path — BLAKE3 for BOTH the FS chain and
+/// the Merkle trees, so the proof is recursable (each default diverges
+/// silently otherwise; the two recorded hash gotchas). Every tape pin and
+/// native replica stays inside: the builder IS the mvp9 test.
+fn build_leaf_outer() -> LeafOuter {
     use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
     // Pin the perf pool BEFORE any rayon touch (the native leaf prove would
     // otherwise auto-initialize the global pool at all cores).
@@ -7851,6 +7882,8 @@ fn mvp9_boolean_leaf_tape() {
         }
 
         // ---- prove / verify the leaf query-phase circuit ----
+        // BLAKE3 for both hashes: the outer proof is the SWAP's inner, so
+        // it must be recursable — the same two gotchas the leaf hit.
         let union_o = UnionInstance::new(&shape.registry, shape.counts.clone());
         let pcs_o = PcsParams {
             m: union_o.dense_m(),
@@ -7858,7 +7891,7 @@ fn mvp9_boolean_leaf_tape() {
             log_batch_size: 6,
             profile: LigeritoProfile::Fast,
             num_lanes: union_o.commit_lanes(6),
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Blake3,
         };
         let b3_r1cs = blake3::build_block_r1cs(nu);
         let b3_lc = b3_r1cs.csc_lincheck_circuit();
@@ -7916,7 +7949,7 @@ fn mvp9_boolean_leaf_tape() {
                     UnionElementSlotInput::new(move |dst: &mut [F128]| dst.copy_from_slice(&z))
                 })
                 .collect();
-            let mut ch = FsChallenger::new(DOMAIN);
+            let mut ch = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
             let (p, c, _) = prover::prove_fast_ligerito_union_circuit(
                 &union_o,
                 &shape.circuit,
@@ -7929,7 +7962,7 @@ fn mvp9_boolean_leaf_tape() {
             (p, c)
         });
         let (_, verify_t) = timed(REPS, || {
-            let mut ch = FsChallenger::new(DOMAIN);
+            let mut ch = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
             verifier::verify_ligerito_union_circuit(
                 &union_o,
                 &shape.circuit,
@@ -7955,7 +7988,162 @@ fn mvp9_boolean_leaf_tape() {
             bincode::serialize(&oproof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
             threads,
         );
+        let (b3_slot, swap_slot, spread_slot) = (
+            shape.registry_slot(slots.b3),
+            shape.registry_slot(slots.swap),
+            shape.registry_slot(slots.spread),
+        );
+        LeafOuter {
+            public: built.public.clone(),
+            shape,
+            proof: oproof,
+            commitment: ocommit,
+            pcs: pcs_o,
+            b3_r1cs,
+            swap_r1cs,
+            spread_r1cs,
+            b3_slot,
+            swap_slot,
+            spread_slot,
+        }
     }
+}
+
+/// **THE SWAP, step 1 — mvp9's outer becomes the inner.** The leaf-outer
+/// circuit proof (the first real recursion node, BLAKE3/BLAKE3 from the
+/// shared builder) is natively verified under a RecordingChallenger and its
+/// tape walked by the SAME machinery mvp10's assembly consumes:
+/// parse_open_levels, the region label map, level_geometry (native capped
+/// paths + enforced-sum replicas per level), and the R=2 + P multipoint
+/// schedule replayed to the anchor's claimed v — pinned before any
+/// assembly, the step-1 pattern every phase ran. What it establishes about
+/// the REAL inner's shape: the element PIOP parses at multi-slot scale, the
+/// packed-direct claims are the element (c, lc) pair plus every wiring
+/// gather, the R=2 + P>0 schedule holds, and the committed lane count is
+/// once more an arbitrary integer.
+#[test]
+#[ignore] // Builds the whole leaf outer first. `-- --ignored`.
+fn mvp10_leaf_outer_inner_tape() {
+    use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
+    let lo = build_leaf_outer();
+    let union_i = UnionInstance::new(&lo.shape.registry, lo.shape.counts.clone());
+    let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
+        (lo.b3_slot, lo.b3_r1cs.csc_lincheck_circuit()),
+        (lo.swap_slot, lo.swap_r1cs.csc_lincheck_circuit()),
+        (lo.spread_slot, lo.spread_r1cs.csc_lincheck_circuit()),
+    ];
+    lcs_ord.sort_by_key(|(i, _)| *i);
+    let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
+        lcs_ord.into_iter().map(|(_, cc)| cc).collect();
+    let mut rec = RecordingChallenger::new(FsChallenger::with_hash(DOMAIN, HashKind::Blake3));
+    let claims = verifier::verify_ligerito_union_circuit(
+        &union_i,
+        &lo.shape.circuit,
+        &lo.public,
+        &lcs,
+        &lo.commitment,
+        &lo.proof,
+        &lo.pcs,
+        &mut rec,
+    )
+    .expect("the leaf outer verifies as the inner");
+    assert!(claims.boolean.is_some(), "boolean claims from the real inner");
+    assert!(claims.element.is_some(), "element claims from the real inner");
+    let t_shape = rec.shape();
+    let chals: Vec<F128> = rec.challenges().to_vec();
+    let vals_rec = rec.values();
+    let ops = t_shape.ops();
+
+    // The region order, by label — identical to the minimal mixed inner's.
+    let find = |label: &[u8]| -> Vec<usize> {
+        ops.iter()
+            .enumerate()
+            .filter_map(|(i, op)| match op {
+                Op::Label(l) if l.as_slice() == label => Some(i),
+                _ => None,
+            })
+            .collect()
+    };
+    let zc_l = find(b"flock-zerocheck-v0");
+    let lc_l = find(b"flock-lincheck-v0");
+    let elzc_l = find(b"flock-element-union-zc-v0");
+    let el_l = find(b"flock-element-union-lc-v0");
+    let gkr_l = find(b"flock-product-gkr-batched-v0");
+    let mo_l = find(b"flock-merged-open-v0");
+    let rs_l = find(b"flock-ring-switch-v0");
+    let mp_l = find(b"flock-multipoint-twisted-v1");
+    let fa_l = find(b"flock-frobenius-assist-v0");
+    assert_eq!(
+        (zc_l.len(), lc_l.len(), elzc_l.len(), el_l.len(), gkr_l.len()),
+        (1, 1, 1, 1, 1),
+        "one region each"
+    );
+    assert_eq!((mo_l.len(), rs_l.len(), mp_l.len(), fa_l.len()), (1, 2, 1, 1));
+    assert!(zc_l[0] < lc_l[0] && lc_l[0] < elzc_l[0] && elzc_l[0] < el_l[0]);
+    assert!(el_l[0] < gkr_l[0] && gkr_l[0] < mo_l[0]);
+    assert!(mo_l[0] < rs_l[0] && rs_l[1] < mp_l[0] && mp_l[0] < fa_l[0]);
+
+    // parse_open_levels + level_geometry — the assembly's own walkers,
+    // unchanged, on the real-inner tape.
+    let lig = &lo.proof.pcs_open.inner.ligerito;
+    let r = lig.recursive_caps.len();
+    let lvl_src = level_sources(lig);
+    let (_start_v, piop_i, gammas_i, w_rounds, mp_i, _inner_pd_i, _yr_v, levels) =
+        parse_open_levels(ops, 32 * lig.initial_cap.len(), r);
+    assert_eq!(levels.len(), r + 1);
+    let piop_i = piop_i.expect("the real inner HAS an element PIOP");
+    assert!(!piop_i.zc_rounds.is_empty() && !piop_i.lc_rounds.is_empty());
+    let n_gather = lo.proof.wiring.gather.len();
+    assert_eq!(
+        gammas_i.len(),
+        2 + n_gather,
+        "pd claims = the element (c, lc) pair + the outer's gathers"
+    );
+    assert_eq!(w_rounds.len(), lo.pcs.m - 7, "W spans the dense domain");
+    let (geo, _native_sums) = level_geometry(&levels, &lvl_src, &chals, HashKind::Blake3);
+    assert!(geo[0].row_words <= geo[0].lanes, "committed width fits the fold");
+
+    // The R=2 + P schedule replays to the anchor's claimed v.
+    let n_p = lo.proof.pcs_open.frobenius.group_values.len();
+    assert!(n_p > 0, "the mixed inner groups its pd claims");
+    assert_eq!(
+        mp_i.val_vs.len(),
+        256 + n_p,
+        "T0 spans the RS dual values then the P group values"
+    );
+    let gamma_mp = chals[mp_i.gamma_ch];
+    let mut pw = F128::ONE;
+    let mut t0 = F128::ZERO;
+    for &vi in &mp_i.val_vs {
+        t0 += pw * vals_rec[vi];
+        pw *= gamma_mp;
+    }
+    let mut tm = t0;
+    for rr in &mp_i.rounds {
+        let (g1, gi) = (vals_rec[rr.g_v], vals_rec[rr.g_v + 1]);
+        let rch = chals[rr.ch];
+        let g0 = tm + g1;
+        tm = g0 + (g1 + g0 + gi) * rch + gi * rch * rch;
+    }
+    assert_eq!(
+        tm,
+        vals_rec[mp_i.anchor_v],
+        "T0 folds to the anchor's claimed v"
+    );
+
+    println!(
+        "\nMVP-10 SWAP step 1 — the LEAF OUTER as the inner (tape pinned)\n  \
+         inner: dense_m {} | mu {} | levels (q, depth) {:?}\n  \
+         pd claims {} (element pair + {} gathers) | P {} | L0 lanes {}/{}\n",
+        lo.pcs.m,
+        lo.shape.circuit.cells().mu(),
+        geo.iter().map(|g| (g.q, g.depth)).collect::<Vec<_>>(),
+        gammas_i.len(),
+        n_gather,
+        n_p,
+        geo[0].row_words,
+        geo[0].lanes,
+    );
 }
 
 /// **MVP-10 step 1 — the circuit-inner tape.** Phase 3's inner is a CIRCUIT
