@@ -8149,6 +8149,27 @@ fn mvp10_circuit_inner_tape() {
     let vals_rec = rec.values();
     let ops = t_shape.ops();
 
+    // The DEFERRED verify of the same inner, as the independent reference
+    // for everything the outer will re-derive: it exposes the element
+    // assertion (alpha, r_con, target) and the sigma assertion natively,
+    // so the assembly is checked against the verifier's own data rather
+    // than against a formula this test also wrote.
+    let (el_assert, sigma_native) = {
+        let mut ch = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
+        let (_, work, sigma) = verifier::verify_ligerito_union_circuit_deferred(
+            &union,
+            &built.shape.circuit,
+            &built.witness.public,
+            &lcs,
+            &commitment,
+            &proof,
+            &pcs_params,
+            &mut ch,
+        )
+        .expect("the deferred verify accepts the same inner");
+        (work.element.expect("an element PIOP ran"), sigma)
+    };
+
     // ---- the label map: the region order phase 3 builds against ----
     let find = |label: &[u8]| -> Vec<usize> {
         ops.iter()
@@ -8161,7 +8182,9 @@ fn mvp10_circuit_inner_tape() {
     };
     let zc_l = find(b"flock-zerocheck-v0");
     let lc_l = find(b"flock-lincheck-v0");
+    let elzc_l = find(b"flock-element-union-zc-v0");
     let el_l = find(b"flock-element-union-lc-v0");
+    assert_eq!(elzc_l.len(), 1, "one element zerocheck");
     let gkr_l = find(b"flock-product-gkr-batched-v0");
     let mo_l = find(b"flock-merged-open-v0");
     let rs_l = find(b"flock-ring-switch-v0");
@@ -8170,6 +8193,7 @@ fn mvp10_circuit_inner_tape() {
     assert_eq!(zc_l.len(), 1, "one boolean zerocheck");
     assert_eq!(lc_l.len(), 1, "one boolean lincheck");
     assert_eq!(el_l.len(), 1, "one element lincheck region");
+    assert!(elzc_l[0] < el_l[0], "element zc before element lc");
     assert_eq!(gkr_l.len(), 1, "one batched wiring GKR");
     assert_eq!(mo_l.len(), 1, "one merged open");
     assert_eq!(rs_l.len(), 2, "rs x 2 — one ab/c pair for the boolean class");
@@ -8359,6 +8383,67 @@ fn mvp10_circuit_inner_tape() {
             top_v: tv,
             layers: lrecs,
             fgs_v: fv,
+        }
+    };
+
+    // ---- the ELEMENT PIOP region, located ----
+    // The mixed inner's other half (mvp9's inner was boolean-only, mvp8's
+    // element-only — this is the first tape carrying both). Shape, per
+    // `parse_open_levels`' element branch: [tau slice | tau_len rounds |
+    // ea, eb, ec | lc label | alpha | lc rounds].
+    struct ElPiopRec {
+        tau_fin: usize,
+        tau_ch: usize,
+        zc_rounds: Vec<(usize, usize, usize)>, // (g_v, fin, ch)
+        eab_v: usize,
+        alpha_fin: usize,
+        alpha_ch: usize,
+        lc_rounds: Vec<(usize, usize, usize)>,
+    }
+    let el_rec = {
+        let mut i = elzc_l[0] + 1;
+        let (tau_fin, tau_ch, tau_len) = match ops[i] {
+            Op::SqueezeSlice(n) => (fin_at(i), vc_at(i).1, n),
+            ref o => panic!("element tau, got {o:?}"),
+        };
+        i += 1;
+        let mut zc_rounds = Vec::with_capacity(tau_len);
+        for _ in 0..tau_len {
+            let (gv, _) = vc_at(i);
+            assert!(matches!(ops[i], Op::ObserveScalar), "el zc msg");
+            assert!(matches!(ops[i + 1], Op::ObserveScalar), "el zc msg");
+            assert!(matches!(ops[i + 2], Op::SqueezeScalar), "el zc rho");
+            zc_rounds.push((gv, fin_at(i + 2), vc_at(i + 2).1));
+            i += 3;
+        }
+        let (eab_v, _) = vc_at(i);
+        for _ in 0..3 {
+            assert!(matches!(ops[i], Op::ObserveScalar), "el zc final");
+            i += 1;
+        }
+        assert_eq!(i, el_l[0], "the lc label follows the finals");
+        i += 1;
+        assert!(matches!(ops[i], Op::SqueezeScalar), "el lc alpha");
+        let (alpha_fin, alpha_ch) = (fin_at(i), vc_at(i).1);
+        i += 1;
+        let mut lc_rounds = Vec::new();
+        while matches!(ops[i], Op::ObserveScalar)
+            && matches!(ops[i + 1], Op::ObserveScalar)
+            && matches!(ops[i + 2], Op::SqueezeScalar)
+        {
+            let (gv, _) = vc_at(i);
+            lc_rounds.push((gv, fin_at(i + 2), vc_at(i + 2).1));
+            i += 3;
+        }
+        assert!(!zc_rounds.is_empty() && !lc_rounds.is_empty(), "el rounds");
+        ElPiopRec {
+            tau_fin,
+            tau_ch,
+            zc_rounds,
+            eab_v,
+            alpha_fin,
+            alpha_ch,
+            lc_rounds,
         }
     };
 
@@ -8621,15 +8706,103 @@ fn mvp10_circuit_inner_tape() {
         let r2 = sb.gate(macs, &[r1, beta_w, ow])[0];
         gkr_deltas.push(sb.gate(macs, &[r2, cr_w, ow])[0]);
 
+        // ---- assembly step 3: the ELEMENT PIOP rounds in-circuit ----
+        // The mixed inner's element half, type reuse from mvp8: the
+        // zerocheck's rounds are ZcRoundGate rows (tau slice wires as eq
+        // weights, g0 advice + zero deltas) and the lincheck's are
+        // MergedRoundGate rows. BOUNDARY-FIRST, as the leaf's skip round
+        // was: the constant strip joining them (`va = ea + <eq(r_con),
+        // a_const>`) stays checker-native — ZcJoinGate is specialised to a
+        // kappa=2 slot and the general treatment lands with the real inner
+        // (the mvp9-outer swap) — so the zc chain end publishes and the lc
+        // entry enters as checker-validated advice.
+        let mrs = sb.slot(MergedRoundGate::new());
+        let mut el_g0: Vec<F128> = Vec::new();
+        let mut el_run_n = F128::ZERO;
+        for (k, &(gv, _, ch)) in el_rec.zc_rounds.iter().enumerate() {
+            let (g1, gi) = (vals_rec[gv], vals_rec[gv + 1]);
+            let t = chals[el_rec.tau_ch + k];
+            let rho = chals[ch];
+            let g0 = (el_run_n + t * g1) * (F128::ONE + t).inv();
+            el_g0.push(g0);
+            el_run_n = g0 * (F128::ONE + rho) + g1 * rho + gi * rho * (F128::ONE + rho);
+        }
+        let mut el_zr = zw;
+        let mut el_deltas: Vec<Wire> = Vec::new();
+        for (k, &(gv, rfin, _)) in el_rec.zc_rounds.iter().enumerate() {
+            let sqt = &trace.squeezes[el_rec.tau_fin];
+            let t_w = outs[sqt[k / 4]][k % 4];
+            let rho_w = outs[trace.squeezes[rfin][0]][0];
+            vals.push(el_g0[k]);
+            let g0w = sb.public_input();
+            let o = sb.gate(
+                zcr,
+                &[el_zr, wv(gv), wv(gv + 1), t_w, rho_w, g0w, ow],
+            );
+            el_deltas.push(o[0]);
+            el_zr = o[1];
+        }
+        // The lincheck entry is `va + alpha·vb`, where the strip adds the
+        // slot's affine constants: `va = ea + a_sum`, `vb = eb + b_sum`
+        // with `a_sum = w·<eq(r_con), a_const>` (likewise b). ONLY the two
+        // sums are advice — the entry itself is DERIVED in-circuit from
+        // the absorbed ea/eb and the chain's alpha wire, so a prover
+        // cannot choose it. alpha and r_con come from the native
+        // assertion, so the strip is checked against the verifier's own
+        // data, not against a formula this test also wrote.
+        let el_alpha_w = outs[trace.squeezes[el_rec.alpha_fin][0]][0];
+        assert_eq!(
+            el_assert.alpha, chals[el_rec.alpha_ch],
+            "the located alpha is the assertion's"
+        );
+        let (a_sum_n, b_sum_n) = {
+            let mt = MacGate::new();
+            let kappa = mt.ty.kappa();
+            let eq_con = flock_core::zerocheck::univariate_skip::build_eq(
+                &el_assert.r_con[..kappa],
+            );
+            // Single slot at the region start: the prefix bits are all
+            // zero, so the region weight is the all-zero eq pattern.
+            let w = el_assert.r_con[kappa..]
+                .iter()
+                .fold(F128::ONE, |acc, &x| acc * (F128::ONE + x));
+            let dot = |c: &[F128]| -> F128 {
+                eq_con
+                    .iter()
+                    .zip(c)
+                    .fold(F128::ZERO, |acc, (e, v)| acc + *e * *v)
+            };
+            (w * dot(mt.ty.a_const()), w * dot(mt.ty.b_const()))
+        };
+        let ea_w = wv(el_rec.eab_v);
+        let eb_w = wv(el_rec.eab_v + 1);
+        vals.push(a_sum_n);
+        let asum_w = sb.public_input();
+        vals.push(b_sum_n);
+        let bsum_w = sb.public_input();
+        let va_w = sb.gate(macs, &[ea_w, asum_w, ow])[0];
+        let vb_w = sb.gate(macs, &[eb_w, bsum_w, ow])[0];
+        let mut el_lcw = sb.gate(macs, &[va_w, el_alpha_w, vb_w])[0];
+        for &(gv, rfin, _) in &el_rec.lc_rounds {
+            let rho_w = outs[trace.squeezes[rfin][0]][0];
+            el_lcw = sb.gate(mrs, &[el_lcw, wv(gv), wv(gv + 1), rho_w])[0];
+        }
+
         // Everything publishes HERE, after every public input is declared:
         // `built.public` lists entries in DECLARATION order, so an early
         // publish misindexes the tail (the recorded MVP-7 gotcha).
-        // Tail order: [ga, mg | gkr deltas | s_sigma | rho...].
+        // Tail order: [ga, mg | gkr deltas | el deltas, el zc end, el lc
+        // end | s_sigma | rho...].
         sb.publish(ga_w);
         sb.publish(mg_w);
         for d in &gkr_deltas {
             sb.publish(*d);
         }
+        for d in &el_deltas {
+            sb.publish(*d);
+        }
+        sb.publish(el_zr);
+        sb.publish(el_lcw);
         // ---- the SIGMA ASSERTION emission (route B, in-circuit) ----
         // The claim exits as bound publics: the value is the deferred
         // s_sigma stream word — the SAME wire the rhs input check just
@@ -8640,7 +8813,7 @@ fn mvp10_circuit_inner_tape() {
         for w in &pt_w {
             sb.publish(*w);
         }
-        let n_tail = 2 + gkr_deltas.len() + 1 + mu_i;
+        let n_tail = 2 + gkr_deltas.len() + el_deltas.len() + 2 + 1 + mu_i;
         let shape2 = sb.finish().expect("the mvp10 chain circuit builds");
         let built2 = shape2.run(&vals, &[]);
         let (_, ga_c) = vc_at(gkr_l[0] + 1);
@@ -8664,9 +8837,31 @@ fn mvp10_circuit_inner_tape() {
         {
             assert_eq!(*d, F128::ZERO, "gkr delta {k}");
         }
+        // The element PIOP's own deltas and chain ends.
+        let el_base = base2 + 2 + gkr_deltas.len();
+        for (k, d) in built2.public[el_base..el_base + el_deltas.len()]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(*d, F128::ZERO, "element piop delta {k}");
+        }
+        assert_eq!(
+            built2.public[el_base + el_deltas.len()],
+            el_run_n,
+            "the element zc chain ends at the native running claim"
+        );
+        // THE INDEPENDENT CLOSE: the in-circuit lincheck chain — entry
+        // derived from the absorbed finals, folded through the rounds —
+        // ends exactly at the native ElementAssertion's target. Nothing
+        // in this equality comes from a formula the test wrote twice.
+        assert_eq!(
+            built2.public[el_base + el_deltas.len() + 1],
+            el_assert.target,
+            "the element lc chain ends at the native assertion's target"
+        );
         // The sigma assertion, as the accumulator would read it: the value
         // and the mu point coordinates, matched against the native claim.
-        let sig_base = base2 + 2 + gkr_deltas.len();
+        let sig_base = el_base + el_deltas.len() + 2;
         assert_eq!(
             built2.public[sig_base],
             proof.wiring.gkr.s_sigma_eval,
@@ -8674,15 +8869,20 @@ fn mvp10_circuit_inner_tape() {
         );
         let sig_rho = &built2.public[sig_base + 1..sig_base + 1 + mu_i];
         {
-            // The point equals the GKR's own final point, and the emitted
-            // pair IS a SigmaAssertion that discharges against the inner
-            // circuit's sigma table — the root's O(2^mu) check, fed
-            // entirely from the outer's public segment.
+            // The emitted pair IS a SigmaAssertion, rebuilt from the
+            // outer's PUBLIC SEGMENT ALONE — and it equals the one the
+            // native deferred verify produced, so the in-circuit emission
+            // and the merge node's input are literally the same claim.
             let sa = flock_core::circuit::SigmaAssertion {
                 rho: sig_rho.to_vec(),
                 nu: built.shape.circuit.cells().nu(),
                 value: built2.public[sig_base],
             };
+            assert_eq!(sa.rho, sigma_native.rho, "the emitted sigma point");
+            assert_eq!(sa.value, sigma_native.value, "the emitted sigma value");
+            assert_eq!(sa.nu, sigma_native.nu, "the emitted sigma split");
+            // And it discharges against the inner circuit's sigma table —
+            // the root's O(2^mu) check, fed from the public segment.
             assert!(
                 sa.check(&built.shape.circuit),
                 "the emitted sigma assertion discharges against the inner circuit"
@@ -8701,7 +8901,7 @@ fn mvp10_circuit_inner_tape() {
         let b3_r1cs2 = blake3::build_block_r1cs(nu2);
         let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
         // The element slots the GKR transcription added, in REGISTRY order.
-        let mut el_ord: Vec<(usize, Vec<F128>)> = [macs, zcr]
+        let mut el_ord: Vec<(usize, Vec<F128>)> = [macs, zcr, mrs]
             .into_iter()
             .map(|sl| {
                 let z = match &built2.witnesses[shape2.registry_slot(sl)] {
