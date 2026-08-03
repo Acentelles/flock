@@ -704,12 +704,78 @@ pub fn prove_wiring<C: Challenger>(
 /// Runs the σ-AWARE GKR verifier (v1: the verifier holds the circuit, so it
 /// evaluates `ŝ_σ(ρ)` itself in `O(2^μ)` rather than trusting the proof), then
 /// the two binding checks of the module contract.
+/// The wiring GKR's deferred sigma evaluation (sigma v2 route B — design
+/// doc §sigma): the claim `s_sigma_hat(rho) = value`, destined for the
+/// accumulator's sigma family and the root discharge. `rho` is the GKR
+/// endpoint over the `mu = nu + c` cell coordinates, row-low.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SigmaAssertion {
+    pub rho: Vec<F128>,
+    pub nu: usize,
+    pub value: F128,
+}
+
+impl SigmaAssertion {
+    /// The accumulator's form: a `MatrixClaim` on the sigma table reshaped
+    /// `2^nu × 2^c` (`M[r, c] = s_sig[(c << nu) + r]` — the cell space's
+    /// `(col << nu) | row` convention, so the point splits row-low).
+    pub fn claim(&self) -> crate::matrix_fold::MatrixClaim {
+        crate::matrix_fold::MatrixClaim {
+            row: crate::matrix_fold::Weight::eq(self.rho[..self.nu].to_vec()),
+            col: crate::matrix_fold::Weight::eq(self.rho[self.nu..].to_vec()),
+            value: self.value,
+        }
+    }
+
+    /// The sigma table in the accumulator's matrix shape, from the SAME
+    /// encoding the verifier evaluates ([`product_gkr::build_s_sigma_vec`]).
+    pub fn matrix(circuit: &Circuit) -> crate::matrix_fold::DenseMatrix {
+        let cells = circuit.cells();
+        crate::matrix_fold::DenseMatrix {
+            vals: product_gkr::build_s_sigma_vec(cells.mu(), circuit.sigma()),
+            n_rows_log: cells.nu(),
+        }
+    }
+
+    /// The root discharge: the claimed evaluation against the real table —
+    /// `O(2^mu)`, paid once at the root, never per node.
+    pub fn check(&self, circuit: &Circuit) -> bool {
+        let c = self.claim();
+        crate::matrix_fold::bilinear(&c.row, &c.col, &Self::matrix(circuit)) == self.value
+    }
+}
+
+/// [`verify_wiring`] with the sigma evaluation DEFERRED (sigma v2 route B):
+/// the batched GKR verifies TRUSTING the proof's claimed `s_sigma_eval`,
+/// and the claim exits as a [`SigmaAssertion`] for the accumulator — a
+/// lying value either breaks the GKR's own input check or fails the root
+/// discharge. Everything else — the recombination, the f/g binding, the
+/// gather claims — is checked identically to v1.
+pub fn verify_wiring_deferred<C: Challenger>(
+    circuit: &Circuit,
+    public: &[F128],
+    proof: &WiringProof,
+    ch: &mut C,
+) -> Result<(Vec<(Vec<F128>, F128)>, SigmaAssertion), WiringError> {
+    verify_wiring_core(circuit, public, proof, true, ch)
+}
+
 pub fn verify_wiring<C: Challenger>(
     circuit: &Circuit,
     public: &[F128],
     proof: &WiringProof,
     ch: &mut C,
 ) -> Result<Vec<(Vec<F128>, F128)>, WiringError> {
+    verify_wiring_core(circuit, public, proof, false, ch).map(|(g, _)| g)
+}
+
+fn verify_wiring_core<C: Challenger>(
+    circuit: &Circuit,
+    public: &[F128],
+    proof: &WiringProof,
+    defer_sigma: bool,
+    ch: &mut C,
+) -> Result<(Vec<(Vec<F128>, F128)>, SigmaAssertion), WiringError> {
     if public.len() != circuit.num_public() {
         return Err(WiringError::MalformedProof);
     }
@@ -719,8 +785,12 @@ pub fn verify_wiring<C: Challenger>(
         return Err(WiringError::MalformedProof);
     }
 
-    let claim = product_gkr::verify_batched_with_sigma(mu, &proof.gkr, circuit.sigma(), ch)
-        .map_err(WiringError::Gkr)?;
+    let claim = if defer_sigma {
+        product_gkr::verify_batched(mu, &proof.gkr, ch)
+    } else {
+        product_gkr::verify_batched_with_sigma(mu, &proof.gkr, circuit.sigma(), ch)
+    }
+    .map_err(WiringError::Gkr)?;
 
     // ---- Recombination (design doc, Lemma "Gather factorization"):
     // ŵ(ρ) = Σ_{gate ι} eq(ρ_ι, ι)·v_ι + Σ_{public ι} eq(ρ_ι, ι)·v̂_ι(ρ_row).
@@ -747,14 +817,22 @@ pub fn verify_wiring<C: Challenger>(
         return Err(WiringError::GEvalMismatch);
     }
 
-    Ok((0..cells.num_gate_slots())
-        .map(|iota| {
-            (
-                cells.gate_claim_point(iota, &claim.rho[..nu]),
-                proof.gather[iota],
-            )
-        })
-        .collect())
+    let assertion = SigmaAssertion {
+        rho: claim.rho.clone(),
+        nu,
+        value: claim.s_sigma_eval,
+    };
+    Ok((
+        (0..cells.num_gate_slots())
+            .map(|iota| {
+                (
+                    cells.gate_claim_point(iota, &claim.rho[..nu]),
+                    proof.gather[iota],
+                )
+            })
+            .collect(),
+        assertion,
+    ))
 }
 
 /// The wire classes a circuit declares, as cells — the brute-force oracle's
@@ -1246,6 +1324,66 @@ mod tests {
         assert_eq!(
             roundtrip(&circuit, &packed, &bad_public),
             Err(WiringError::Gkr(product_gkr::VerifyError::ProductMismatch))
+        );
+    }
+
+    /// Sigma v2 route B at the wiring level: the deferred verify agrees
+    /// with v1 gather-for-gather on an honest proof, its assertion
+    /// discharges against the real table (and via the MatrixClaim path —
+    /// the accumulator's form), a tampered assertion value fails the
+    /// discharge, and a naively tampered claimed `s_sigma_eval` is caught
+    /// by the GKR's own input check.
+    #[test]
+    fn wiring_sigma_deferral() {
+        let nu = 3;
+        let reg = mixed_registry(nu);
+        let counts = vec![5usize, 4, 6];
+        let circuit = Circuit::new(
+            &reg,
+            counts,
+            9,
+            vec![
+                vec![Cell::new(2, 0), Cell::new(0, 1), Cell::new(3, 2)],
+                vec![
+                    Cell::new(2, 1),
+                    Cell::new(4, 3),
+                    Cell::new(6, 0),
+                    Cell::new(8, 4),
+                ],
+                vec![Cell::new(5, 1), Cell::new(1, 2)],
+            ],
+        )
+        .expect("valid circuit");
+        let mut rng = Rng::new(0x516A_B001);
+        let (packed, public) = buffer_for(&reg, &circuit, &mut rng);
+        let mut ch = FsChallenger::new(b"circuit-sigma-b");
+        let (proof, _) = prove_wiring(&circuit, &packed, &public, &mut ch);
+
+        let mut ch = FsChallenger::new(b"circuit-sigma-b");
+        let v1 = verify_wiring(&circuit, &public, &proof, &mut ch).expect("v1 accepts");
+        let mut ch = FsChallenger::new(b"circuit-sigma-b");
+        let (gathers, assertion) =
+            verify_wiring_deferred(&circuit, &public, &proof, &mut ch).expect("deferred accepts");
+        assert_eq!(v1, gathers, "deferred and v1 agree on the gather claims");
+        assert!(assertion.check(&circuit), "the sigma assertion discharges");
+        let mc = assertion.claim();
+        let m = SigmaAssertion::matrix(&circuit);
+        assert_eq!(
+            crate::matrix_fold::bilinear(&mc.row, &mc.col, &m),
+            mc.value,
+            "the MatrixClaim form discharges — the accumulator's path"
+        );
+
+        let mut bad = assertion.clone();
+        bad.value += F128::ONE;
+        assert!(!bad.check(&circuit), "a tampered assertion fails the discharge");
+
+        let mut bad_proof = proof.clone();
+        bad_proof.gkr.s_sigma_eval += F128::ONE;
+        let mut ch = FsChallenger::new(b"circuit-sigma-b");
+        assert!(
+            verify_wiring_deferred(&circuit, &public, &bad_proof, &mut ch).is_err(),
+            "a naively tampered s_sigma_eval breaks the GKR input check"
         );
     }
 
