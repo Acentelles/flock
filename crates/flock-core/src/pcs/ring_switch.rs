@@ -1579,7 +1579,8 @@ const FOLD_TABLE_SIZE: usize = 256;
 /// Build the 16×256 byte-lookup table the fold indexes: `table[k·256 + v]` =
 /// `Σ_{bit b set in v} eq_r_dprime[k·8 + b]`. For the ring-switch fold,
 /// `eq_r_dprime` already has γ_k baked in, so the table carries γ too.
-pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
+/// `pub`: see [`linearized_coefficients`].
+pub fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
     assert_eq!(eq_r_dprime.len(), 1 << LOG_PACKING);
     let mut tables = vec![F128::ZERO; FOLD_N_BYTES * FOLD_TABLE_SIZE];
     for byte_idx in 0..FOLD_N_BYTES {
@@ -1744,7 +1745,9 @@ fn moore_inverse() -> &'static [F128] {
 /// jagged/ring-switch reduction (design doc §"Capacity-free
 /// ring-switching") to express the Φ-twisted weight evaluation as a
 /// combination of ordinary assist statements at Frobenius-powered points.
-pub(crate) fn linearized_coefficients(tables: &[F128]) -> Vec<F128> {
+/// `pub`: the recursion circuit's R = 2 delta derives the RS claims'
+/// coefficients from the SAME linearization — no drift.
+pub fn linearized_coefficients(tables: &[F128]) -> Vec<F128> {
     let minv = moore_inverse();
     let phi: Vec<F128> = (0..128)
         .map(|t| fold_one_slot(bit_basis(t), tables))

@@ -6193,6 +6193,103 @@ fn mvp9_boolean_leaf_tape() {
     }
     assert_eq!(t, fro.anchor.v, "T_m must equal the anchor's claimed v (R = 2)");
 
+    // ---- phase 2b step 1: the ring-switch regions pinned, and the R = 2
+    // merged boundary replayed from located pieces: the two s_hat_v slices
+    // ARE the proof's, r_dprime/gamma ordinals named, the succinct outputs
+    // (claim transpose dot) rebuilt, the W-rounds folded to `running`, the
+    // linearized coefficients derived from the SAME pub helpers, and
+    // running == q_eval·V closed with the R = 2 recombination. This is the
+    // exact relation chain the leaf circuit will publish as zero-deltas.
+    {
+        use flock_core::pcs::ring_switch as rs;
+        use flock_core::zerocheck::univariate_skip::build_eq;
+        let (mut v, mut c, mut i) = (0usize, 0usize, 0usize);
+        let bump = |op: &Op, v: &mut usize, c: &mut usize| match op {
+            Op::SqueezeScalar => *c += 1,
+            Op::SqueezeSlice(n) => *c += n,
+            Op::ObserveScalar => *v += 1,
+            Op::ObserveSlice(n) => *v += n,
+            _ => {}
+        };
+        while !matches!(&ops[i], Op::Label(l) if l.as_slice() == b"flock-merged-open-v0") {
+            bump(&ops[i], &mut v, &mut c);
+            i += 1;
+        }
+        i += 1;
+        let mut rs_recs: Vec<(usize, usize)> = Vec::new();
+        while matches!(&ops[i], Op::Label(l) if l.as_slice() == b"flock-ring-switch-v0") {
+            i += 1;
+            assert!(matches!(ops[i], Op::ObserveSlice(128)), "s_hat_v slice");
+            let sv = v;
+            bump(&ops[i], &mut v, &mut c);
+            i += 1;
+            assert!(matches!(ops[i], Op::SqueezeSlice(7)), "r_dprime");
+            let rc = c;
+            bump(&ops[i], &mut v, &mut c);
+            i += 1;
+            rs_recs.push((sv, rc));
+        }
+        assert_eq!(rs_recs.len(), 2, "rs×2 at the leaf");
+        let mut gs = Vec::new();
+        for _ in 0..2 {
+            assert!(matches!(ops[i], Op::SqueezeScalar), "rs gamma");
+            gs.push(chals[c]);
+            bump(&ops[i], &mut v, &mut c);
+            i += 1;
+        }
+        let mut target = F128::ZERO;
+        let mut coeffs: Vec<Vec<F128>> = Vec::new();
+        for (k, &(sv, rc)) in rs_recs.iter().enumerate() {
+            let shv = &vals_rec[sv..sv + 128];
+            assert_eq!(
+                shv,
+                &proof.pcs_open.ring_switches[k].s_hat_v[..],
+                "s_hat_v {k} on the stream"
+            );
+            let rdp: Vec<F128> = (0..7).map(|j| chals[rc + j]).collect();
+            let eq = build_eq(&rdp);
+            target += gs[k] * rs::inner_product(&rs::tensor_algebra_transpose(shv), &eq);
+            let scaled: Vec<F128> = eq.iter().map(|x| gs[k] * *x).collect();
+            coeffs.push(rs::linearized_coefficients(&rs::build_fold_byte_table(&scaled)));
+        }
+        let mut running = target;
+        while matches!(ops[i], Op::ObserveScalar)
+            && matches!(ops[i + 1], Op::ObserveScalar)
+            && matches!(ops[i + 2], Op::SqueezeScalar)
+        {
+            let (g1, gi) = (vals_rec[v], vals_rec[v + 1]);
+            for _ in 0..2 {
+                bump(&ops[i], &mut v, &mut c);
+                i += 1;
+            }
+            let r = chals[c];
+            bump(&ops[i], &mut v, &mut c);
+            i += 1;
+            let g0 = running + g1;
+            running = g0 + (g1 + g0 + gi) * r + gi * r * r;
+        }
+        while !matches!(&ops[i], Op::Label(l) if l.as_slice() == b"flock-pcs-packed-direct-v0") {
+            bump(&ops[i], &mut v, &mut c);
+            i += 1;
+        }
+        i += 1;
+        let q_eval = vals_rec[v];
+        let mut big_v = F128::ZERO;
+        for (k, cs) in coeffs.iter().enumerate() {
+            for (j, &cj) in cs.iter().enumerate() {
+                if cj.is_zero() {
+                    continue;
+                }
+                let mut x = fro.values[k][j];
+                for _ in 0..j {
+                    x = x * x;
+                }
+                big_v += cj * x;
+            }
+        }
+        assert_eq!(running, q_eval * big_v, "the R = 2 merged boundary replays");
+    }
+
     // ---- phase 2a step 2: the leaf chain in-circuit (the skeleton) ----
     // The leaf tape's whole FS chain replays through the blake3 slot; the
     // multipoint gamma publishes and is checked against the recorded
