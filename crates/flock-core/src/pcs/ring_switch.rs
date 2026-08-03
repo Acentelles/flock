@@ -2560,6 +2560,8 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     //    lets the fold skip streaming the multi-MB tensor (see
     //    `fold_1b_rows_split`). Tiny test sizes (len not divisible by 16) fall
     //    back to the materialized tensor + the legacy multi-fold.
+    // Gates the s_hat_v fold KERNEL only (the MFR split kernels need 16-wide
+    // lo blocks). The rs_eq_ind below defers regardless — see the else arm.
     let use_split = l.is_multiple_of(16);
     let t = std::time::Instant::now();
     let dense_splits: Vec<(Vec<F128>, Vec<F128>)> = if use_split {
@@ -2725,13 +2727,41 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                             table: build_fold_byte_table(&scaled_eq_r_dprime),
                         }
                     } else {
-                        RsEqInd::Dense(fold_b128_elems(&dense_tensors[d], &scaled_eq_r_dprime))
+                        // Small suffixes (l < 16) can't ride the MFR split
+                        // kernels, but the DEFERRED form itself is generic:
+                        // build a degenerate split (lo = full below 4 coords)
+                        // so the merged open — which requires DeferredDense
+                        // and reads only the byte table — accepts the claim.
+                        // Gate-rich circuit unions hit this. Byte-identical
+                        // to the Dense fold on every consumer.
+                        let sfx = &dense_suffixes[d];
+                        let n_lo = if sfx.len() >= 4 { split_n_lo(sfx.len()) } else { sfx.len() };
+                        let (eq_lo, eq_hi) = build_eq_split(sfx, n_lo);
+                        RsEqInd::DeferredDense {
+                            eq_lo,
+                            eq_hi,
+                            table: build_fold_byte_table(&scaled_eq_r_dprime),
+                        }
                     }
                 }
-                Kind::Sparse(s) => RsEqInd::Sparse {
-                    len: l,
-                    entries: fold_b128_elems_sparse_pairs(&sparse_supports[s], &scaled_eq_r_dprime),
-                },
+                // Sparse routing (>=3 exact-zero suffix coords) only ever
+                // optimized the pre-merged combine's rs_eq_ind fold; the
+                // merged transport — the only shipped one — requires the
+                // deferred form and re-derives eq from the claim point, so
+                // sparse claims defer like everyone else. (The sparse
+                // s_hat_v kernels upstream are untouched.) Circuit unions
+                // hit this: their boolean claims gain zero coords as the
+                // element region grows.
+                Kind::Sparse(sp) => {
+                    let sfx = sparse_suffixes[sp];
+                    let n_lo = if sfx.len() >= 4 { split_n_lo(sfx.len()) } else { sfx.len() };
+                    let (eq_lo, eq_hi) = build_eq_split(sfx, n_lo);
+                    RsEqInd::DeferredDense {
+                        eq_lo,
+                        eq_hi,
+                        table: build_fold_byte_table(&scaled_eq_r_dprime),
+                    }
+                }
             };
             (
                 RingSwitchProof { s_hat_v: w.s_hat_v },
@@ -3963,9 +3993,13 @@ mod tests {
             assert_eq!(results[0].0, p_ab, "s_hat_v[ab] mismatch at m={m}");
             assert_eq!(results[1].0, p_c, "s_hat_v[c]  mismatch at m={m}");
             assert_eq!(results[2].0, p_chain, "s_hat_v[chain] mismatch at m={m}");
+            // The sparse KERNELS still produce s_hat_v (pinned above); the
+            // rs_eq_ind itself defers like every claim since the merged
+            // transport (the only shipped one) requires DeferredDense and
+            // sparse only ever optimized the pre-merged combine.
             assert!(
-                matches!(results[2].1.rs_eq_ind, RsEqInd::Sparse { .. }),
-                "chain claim should be sparse"
+                matches!(results[2].1.rs_eq_ind, RsEqInd::DeferredDense { .. }),
+                "chain claim defers like every claim"
             );
             // Dense routing = either the materialized `Dense` (non-split l) or
             // the fused `DeferredDense` (split l, l % 16 == 0).
