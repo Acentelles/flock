@@ -186,7 +186,7 @@ prefix selection, `k_cols` coordinates all going to `col`. At depth 26 that is
 commitment already carries. Free whenever `n_t` is a power of two; for partial
 counts the power-of-two rounding absorbs most of it.
 
-## STOP: the PROVER side is clean, the VERIFIER regresses 5.4x
+## The ρ-side hoist clears the blocker — BOTH sides now win
 
 Both sides measured before touching the transcript. Prover first, since the
 whole plan rests on the assist's 258 ms actually going away:
@@ -202,24 +202,35 @@ So the prover side is confirmed: the row-major weight build is at parity — ver
 slightly faster, likely the longer contiguous runs the wide sub-tables give —
 and the transpose is noise against what is removed.
 
-The verifier is the problem (`aligned_vs_assist_verifier_cost`):
+The verifier was the blocker, and the ρ-side hoist fixes it
+(`aligned_vs_assist_verifier_cost`, 128·K = 256 statements, 9 aligned tables
+from 3,325 columns):
 
 ```
-128·K = 256 statements, 9 aligned tables (from 3,325 columns)
-  assist verify (eq-hoisted):  3.07 ms
-  direct via aligned tables : 16.52 ms   (5.38x)
+assist verify (eq-hoisted)   : 2.92 – 6.55 ms   (noisy: a full sumcheck replay)
+direct, per-statement eq     : 16.96 ms         (the naive version: 3-5x WORSE)
+direct, ρ-side hoisted       :  1.26 – 1.27 ms  (13.2x vs unbatched)
 ```
 
-**Direct evaluation is 5.4× SLOWER.** The reasoning that got us here was sound
-but incomplete: §6's per-table win is stated against per-COLUMN *direct*
-evaluation, and flock's assist is not that — it is a sumcheck whose `W(σ)` was
-already hoisted from 116.62 ms to 1.45 ms. Meanwhile `f_hat_aligned` runs once
-per statement, so the 256× batch swamps the 3,326 → 9 table saving.
+**So direct evaluation now beats the assist by 2.3–5.2×**, and it is far more
+stable (1.26/1.26/1.27 across runs, against the assist's 2.92/6.55/3.33).
 
-Net across both sides: prover **−254 ms**, verifier **+13.5 ms** on a ~17 ms
-verifier. Strongly positive overall, but a real regression on one side bought
-with a wire-format change that invalidates the pinned m6 fixtures. Not worth
-landing in that state.
+Why the hoist is worth 13×: the unbatched `g_hat_cd` builds a 32-entry eq table
+per layer and walks 6 states × 32 branches, almost all of it
+statement-independent. Two structural facts collapse it —
+
+* `t_prev`/`t_next` enter as **boolean** coordinates, so their eq weights are 1
+  on the matching branch and 0 on the other: no sum over them at all;
+* at any layer **exactly one** of `row`/`col` is live (below `u` the shifted row
+  bit is out of range; at or above `u`, `z_col` has only `u` coordinates), so
+  `sum = b + prev + carry` with `b` the single live bit.
+
+Hence `index` is **forced by parity** and there is exactly one transition per
+(live bit, state) — 12 entries per layer, depending only on ρ and the table
+boundaries. Per-statement layer cost falls from ~223 multiplications to **24**.
+
+Net across both sides: prover **−254 ms**, verifier **−1.6 to −5.3 ms**. Both
+directions favour fancy jagged, so the wire change is now justified.
 
 Also landed: `build_weight_row_major_twisted` (the Φ-twisted production
 builder, prime taken in a second pass — under row-major a width-1 table's rows
@@ -235,18 +246,13 @@ decomposition, so `linearized_coefficients` did not describe it and the
 Frobenius decomposition legitimately did not apply. Real tables come from
 `build_fold_byte_table`.
 
-**The fix, and why it should come first.** The branching program's ρ-side is
-*shared* across all 256 statements: the `index` bits come from ρ and
-`prev`/`next` from the table, both statement-independent — only `row`/`col`
-vary. That is exactly the structure the existing eq hoist exploited on the
-assist. A batched `f_hat_aligned` that builds the shared `(index, prev, next)`
-partial once per `(table, layer)` and combines it with each statement's four
-`(row, col)` branches should cut most of the 16.52 ms — plausibly under the
-3.07 ms baseline, at which point the whole plan works and the wire change is
-worth making.
+`twisted_weight_aligned_batched` is the hoisted path;
+`batched_matches_unbatched` pins that it is an algebraic regrouping, not an
+approximation.
 
-Same discipline as the reverted rectangular fast path: measure before landing
-anything protocol-visible.
+Same discipline as the reverted rectangular fast path throughout: measure before
+landing anything protocol-visible. That order caught the naive version's 3–5×
+regression before it reached a wire format.
 
 **Still not wired.** What remains is the consumer side: `build_merged_weight_and_prime`
 must switch to `build_weight_row_major` (Φ-twisted, per claim, fused with the

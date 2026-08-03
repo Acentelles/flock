@@ -661,6 +661,156 @@ pub fn build_weight_row_major_twisted(
     (w, prime)
 }
 
+// ---------------------------------------------------------------------------
+// Batched evaluation: hoist the ρ-side out of the 128·K statements
+// ---------------------------------------------------------------------------
+//
+// The unbatched `g_hat_cd` builds a 32-entry eq table per layer and walks
+// 6 states × 32 branches. Almost all of that is statement-independent, and two
+// structural facts collapse it:
+//
+// * `t_prev`/`t_next` enter as BOOLEAN coordinates, so their eq weights are 1
+//   on the matching branch and 0 on the other — there is no sum over them.
+// * At any layer exactly ONE of `row`/`col` is live. Below `u` the shifted row
+//   bit is out of range (pinned 0); at or above `u` the col coordinate is
+//   (`z_col` has exactly `u` coordinates). So `sum = b + prev + carry` either
+//   way, with `b` the single live bit.
+//
+// Hence `index` is FORCED by parity, and there is exactly one transition per
+// (live bit, state) — a weight and a target. That is 12 entries per layer,
+// statement-independent apart from the live coordinate, so the per-statement
+// layer cost falls from ~223 multiplications to 24.
+
+/// Statement-independent transition schedule for one table: per layer, for
+/// each value of the live statement bit and each state, the forced index
+/// weight and the target state. Depends only on ρ and the table's boundaries,
+/// so it is built once and reused by all `128·K` statements.
+struct Schedule {
+    w: Vec<[[F128; N_STATES]; 2]>,
+    to: Vec<[[u8; N_STATES]; 2]>,
+}
+
+fn schedule(rho: &[F128], m: usize, t_prev: u64, t_next: u64) -> Schedule {
+    let mut w = Vec::with_capacity(m + 1);
+    let mut to = Vec::with_capacity(m + 1);
+    for layer in 0..=m {
+        let r = point_bit(rho, layer);
+        let prev = (t_prev >> layer) & 1 == 1;
+        let next = (t_next >> layer) & 1 == 1;
+        let mut wl = [[F128::ZERO; N_STATES]; 2];
+        let mut tl = [[0u8; N_STATES]; 2];
+        for b in 0..2usize {
+            for s in 0..N_STATES {
+                let carry = s % 3;
+                let less = s / 3;
+                let sum = b + prev as usize + carry;
+                let index = sum & 1;
+                let new_carry = sum >> 1;
+                let new_less = if (index == 1) == next {
+                    less
+                } else {
+                    next as usize
+                };
+                wl[b][s] = if index == 1 { r } else { F128::ONE + r };
+                tl[b][s] = (new_carry + 3 * new_less) as u8;
+            }
+        }
+        w.push(wl);
+        to.push(tl);
+    }
+    Schedule { w, to }
+}
+
+/// `ĝ_u` against a prebuilt [`Schedule`] — the per-statement half of the DP.
+/// 24 multiplications per layer, against `g_hat_cd`'s ~223.
+fn g_hat_scheduled(sched: &Schedule, z_row: &[F128], z_col: &[F128], m: usize, u: usize) -> F128 {
+    let mut dp = [F128::ZERO; N_STATES];
+    dp[STATE_SUCCESS] = F128::ONE;
+    for layer in (0..=m).rev() {
+        // The single live coordinate; the other side is pinned to bit 0.
+        let live = if layer >= u {
+            point_bit(z_row, layer - u)
+        } else {
+            point_bit(z_col, layer)
+        };
+        let w0 = F128::ONE + live;
+        let w1 = live;
+        let (wl, tl) = (&sched.w[layer], &sched.to[layer]);
+        let mut nd = [F128::ZERO; N_STATES];
+        for (s, out) in nd.iter_mut().enumerate() {
+            *out =
+                w0 * (wl[0][s] * dp[tl[0][s] as usize]) + w1 * (wl[1][s] * dp[tl[1][s] as usize]);
+        }
+        dp = nd;
+    }
+    dp[STATE_INITIAL]
+}
+
+/// [`twisted_weight_aligned`] with the ρ-side hoisted out of the `128·K`
+/// statements: one [`Schedule`] per live table, then a 24-multiplication-per-
+/// layer DP per statement. Same value, and the same coefficient/power walk.
+pub fn twisted_weight_aligned_batched(
+    params: &AlignedParams,
+    claims: &[crate::pcs::jagged::FrobeniusClaim<'_>],
+    rho: &[F128],
+) -> F128 {
+    // Shared across every statement: only ρ and the table boundaries enter.
+    let live: Vec<(usize, Schedule)> = params
+        .tables
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.height > 0)
+        .map(|(i, _)| {
+            (
+                i,
+                schedule(
+                    rho,
+                    params.m,
+                    params.prefix_sums[i],
+                    params.prefix_sums[i + 1],
+                ),
+            )
+        })
+        .collect();
+
+    let mut acc = F128::ZERO;
+    for claim in claims {
+        assert_eq!(claim.coeffs.len(), 128);
+        let mut zr = claim.z_row.to_vec();
+        let mut zc = claim.z_col.to_vec();
+        for &c in claim.coeffs.iter() {
+            if !c.is_zero() {
+                let mut f = F128::ZERO;
+                for (i, sched) in live.iter() {
+                    let lw = params.tables[*i].log_width as usize;
+                    // Aligned-block selector from the high column coordinates.
+                    let prefix = params.tables[*i].col_offset >> lw;
+                    let mut sel = F128::ONE;
+                    for (b, &z) in zc[lw..].iter().enumerate() {
+                        sel *= if (prefix >> b) & 1 == 1 {
+                            z
+                        } else {
+                            F128::ONE + z
+                        };
+                    }
+                    if sel.is_zero() {
+                        continue;
+                    }
+                    f += sel * g_hat_scheduled(sched, &zr, &zc[..lw], params.m, lw);
+                }
+                acc += c * f;
+            }
+            for x in zr.iter_mut() {
+                *x = *x * *x;
+            }
+            for x in zc.iter_mut() {
+                *x = *x * *x;
+            }
+        }
+    }
+    acc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1148,16 +1298,25 @@ mod tests {
             let v = twisted_weight_aligned(&ap, &claims, &rho);
             std::hint::black_box(&v);
         });
+        let t_batched = time(&|| {
+            let v = twisted_weight_aligned_batched(&ap, &claims, &rho);
+            std::hint::black_box(&v);
+        });
         eprintln!(
             "  128·K = {} statements, {} aligned tables (from {} columns)\n  \
-             assist verify (eq-hoisted): {:8.2} ms\n  \
-             direct via aligned tables : {:8.2} ms   ({:.2}x)",
+             assist verify (eq-hoisted)   : {:8.2} ms   (the baseline to beat)\n  \
+             direct, per-statement eq     : {:8.2} ms   ({:.2}x)\n  \
+             direct, ρ-side hoisted       : {:8.2} ms   ({:.2}x vs assist, \
+             {:.1}x vs unbatched)",
             128 * claims.len(),
             ap.tables.len(),
             used,
             t_assist,
             t_direct,
-            t_direct / t_assist
+            t_direct / t_assist,
+            t_batched,
+            t_batched / t_assist,
+            t_direct / t_batched,
         );
     }
 
@@ -1327,5 +1486,68 @@ mod tests {
             twisted_weight_aligned(&p, &fclaims, &rho),
             "prover's folded W(ρ) != verifier's Ŵ(ρ)"
         );
+    }
+
+    /// The batched evaluator must agree exactly with the unbatched one — the
+    /// hoist is an algebraic regrouping, not an approximation.
+    #[test]
+    fn batched_matches_unbatched() {
+        use crate::pcs::jagged::FrobeniusClaim;
+        use crate::pcs::ring_switch::{build_fold_byte_table, linearized_coefficients};
+
+        // Widths 4 and 2 at differing offsets, plus an empty table.
+        let p = AlignedParams::new(
+            vec![
+                AlignedTable {
+                    log_width: 2,
+                    height: 3,
+                    col_offset: 0,
+                },
+                AlignedTable {
+                    log_width: 1,
+                    height: 2,
+                    col_offset: 4,
+                },
+                AlignedTable {
+                    log_width: 1,
+                    height: 0,
+                    col_offset: 6,
+                },
+            ],
+            2,
+            3,
+            5,
+        );
+        let mut rng = Rng(0x_BA7C_4ED0);
+        for trial in 0..3 {
+            let data: Vec<(Vec<F128>, Vec<F128>, Vec<F128>)> = (0..2)
+                .map(|_| {
+                    (
+                        rng.vec(p.n),
+                        rng.vec(p.k_cols),
+                        build_fold_byte_table(&rng.vec(128)),
+                    )
+                })
+                .collect();
+            let coeffs: Vec<Vec<F128>> = data
+                .iter()
+                .map(|(_, _, t)| linearized_coefficients(t))
+                .collect();
+            let claims: Vec<FrobeniusClaim<'_>> = data
+                .iter()
+                .zip(&coeffs)
+                .map(|((zr, zc, _), c)| FrobeniusClaim {
+                    z_row: zr,
+                    z_col: zc,
+                    coeffs: c,
+                })
+                .collect();
+            let rho = rng.vec(p.m);
+            assert_eq!(
+                twisted_weight_aligned_batched(&p, &claims, &rho),
+                twisted_weight_aligned(&p, &claims, &rho),
+                "trial {trial}"
+            );
+        }
     }
 }
