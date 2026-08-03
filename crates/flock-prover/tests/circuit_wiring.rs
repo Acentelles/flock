@@ -1437,12 +1437,15 @@ fn a_merge_node_folds_two_circuit_proofs() {
     }
 
     // The merge node's first job: verify each child succinctly, keeping its
-    // matrix work.
+    // matrix work AND its sigma claim (route B: the wiring's s_sigma(rho)
+    // evaluation rides out as a foldable claim instead of the O(2^mu)
+    // discharge).
     let mut assertions = Vec::new();
+    let mut sigmas = Vec::new();
     for ((proof, commitment, pcs_params, circuit), tree) in proofs.iter().zip(&trees) {
         let union = UnionInstance::new(&registry, vec![tree.n_gates]);
         let mut ch = FsChallenger::new(DOMAIN);
-        let (_, work) = verifier::verify_ligerito_union_circuit_deferred(
+        let (_, work, sigma) = verifier::verify_ligerito_union_circuit_deferred(
             &union,
             circuit,
             &tree.public,
@@ -1458,24 +1461,72 @@ fn a_merge_node_folds_two_circuit_proofs() {
             "this circuit is boolean-only, so no element work"
         );
         assertions.push(work.boolean.expect("a boolean PIOP ran"));
+        sigmas.push(sigma);
     }
+    // Both children prove the SAME circuit, which is what makes their sigma
+    // claims foldable (the accumulator is digest-keyed).
+    assert_eq!(
+        proofs[0].3.digest(),
+        proofs[1].3.digest(),
+        "the children share one circuit"
+    );
 
-    // Its second job: fold both children's claims into ONE accumulator.
+    // Its second job: fold both children's claims into ONE accumulator —
+    // matrix work and sigma together (sigma never travels alone).
     let mats = [(&r1cs.a_0, &r1cs.b_0)];
     let circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![circuit_lc];
+    let circuit0 = &proofs[0].3;
     let mut chp = FsChallenger::new(b"merge");
-    let (agg, acc) =
-        aggregate::prove_aggregate(&registry, &mats, &circs, &assertions, None, &mut chp)
-            .expect("the fold proves");
+    let (agg, acc) = aggregate::prove_aggregate_classes(
+        &registry,
+        &mats,
+        &circs,
+        &assertions,
+        &[],
+        &[],
+        Some((circuit0, &sigmas)),
+        None,
+        &mut chp,
+    )
+    .expect("the fold proves");
     let mut chv = FsChallenger::new(b"merge");
-    let acc_v = aggregate::verify_aggregate(&registry, &assertions, None, &agg, &mut chv)
-        .expect("the fold verifies");
+    let acc_v = aggregate::verify_aggregate_classes(
+        &registry,
+        &assertions,
+        &[],
+        Some((circuit0, &sigmas)),
+        None,
+        &agg,
+        &mut chv,
+    )
+    .expect("the fold verifies");
     assert_eq!(acc, acc_v, "prover and verifier accumulators must agree");
 
     // The accumulator summarises BOTH children's matrix obligations, and
-    // discharging it once retroactively validates both linchecks.
+    // discharging it once retroactively validates both linchecks — and the
+    // folded sigma claim discharges against the circuit's own table: the
+    // root's single O(2^mu) evaluation, once for the whole tree.
     assert!(acc.discharge(&mats), "the merged accumulator must be true");
+    assert!(
+        acc.sigma.is_some(),
+        "the sigma group carries the folded claim"
+    );
+    assert!(
+        acc.discharge_sigma(circuit0),
+        "the folded sigma claim discharges at the root"
+    );
     assert_eq!(acc.registry_digest, registry.digest());
+    // A tampered folded sigma value must fail the root discharge.
+    {
+        let mut bad_acc = acc.clone();
+        if let Some((_, claim)) = bad_acc.sigma.as_mut() {
+            claim.value += F128::ONE;
+        }
+        assert!(
+            !bad_acc.discharge_sigma(circuit0),
+            "a tampered sigma claim fails the root discharge"
+        );
+    }
 
     // A corrupted child must poison the accumulator — the deferred verify
     // cannot see it, so this is the only thing standing between a bad child

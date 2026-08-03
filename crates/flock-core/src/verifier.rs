@@ -284,7 +284,7 @@ pub fn verify_ligerito_union_circuit<Ch: Challenger>(
     {
         return Err(VerifyError::ClassMismatch);
     }
-    let (claims, packed_direct_points, matrix, el_matrix) = verify_union_piops(
+    let (claims, packed_direct_points, matrix, el_matrix, _sigma) = verify_union_piops(
         union,
         UnionVerifyBinding::Circuit { circuit, public },
         circuits,
@@ -292,6 +292,7 @@ pub fn verify_ligerito_union_circuit<Ch: Challenger>(
         proof.boolean.as_ref(),
         proof.element.as_ref(),
         Some(&proof.wiring),
+        false,
         pcs_params,
         challenger,
     )?;
@@ -317,8 +318,12 @@ pub fn verify_ligerito_union_circuit<Ch: Challenger>(
 ///
 /// Everything else is verified: both class PIOPs, the wiring argument, and
 /// the single merged opening. What comes back alongside the claims is the two
-/// classes' [`DeferredMatrixWork`], for the caller to fold into an
-/// accumulator ([`crate::aggregate`]) rather than evaluate.
+/// classes' [`DeferredMatrixWork`] AND the wiring's
+/// [`SigmaAssertion`](crate::circuit::SigmaAssertion) (route B: the
+/// `s_sigma(rho)` evaluation leaves as a foldable claim instead of costing
+/// its O(2^mu) discharge here), for the caller to fold into an accumulator
+/// ([`crate::aggregate`]) rather than evaluate. Sigma never travels alone —
+/// it accumulates together with the matrix assertions of the same proof.
 ///
 /// No base matrix is read anywhere in it — that is what lets a recursion
 /// circuit replay it. There is deliberately NO jagged counterpart: the merged
@@ -338,7 +343,14 @@ pub fn verify_ligerito_union_circuit_deferred<Ch: Challenger>(
     proof: &crate::proof::R1csProofCircuitMerged,
     pcs_params: &crate::pcs::PcsParams,
     challenger: &mut Ch,
-) -> Result<(crate::proof::UnionClassClaims, DeferredMatrixWork), VerifyError> {
+) -> Result<
+    (
+        crate::proof::UnionClassClaims,
+        DeferredMatrixWork,
+        crate::circuit::SigmaAssertion,
+    ),
+    VerifyError,
+> {
     if !circuit.check_instance(union) || public.len() != circuit.num_public() {
         return Err(VerifyError::CircuitMismatch);
     }
@@ -347,7 +359,7 @@ pub fn verify_ligerito_union_circuit_deferred<Ch: Challenger>(
     {
         return Err(VerifyError::ClassMismatch);
     }
-    let (claims, packed_direct_points, matrix, el_matrix) = verify_union_piops(
+    let (claims, packed_direct_points, matrix, el_matrix, sigma) = verify_union_piops(
         union,
         UnionVerifyBinding::Circuit { circuit, public },
         circuits,
@@ -355,6 +367,7 @@ pub fn verify_ligerito_union_circuit_deferred<Ch: Challenger>(
         proof.boolean.as_ref(),
         proof.element.as_ref(),
         Some(&proof.wiring),
+        true,
         pcs_params,
         challenger,
     )?;
@@ -373,6 +386,7 @@ pub fn verify_ligerito_union_circuit_deferred<Ch: Challenger>(
             boolean: matrix,
             element: el_matrix,
         },
+        sigma.expect("a circuit binding always verifies wiring"),
     ))
 }
 
@@ -451,7 +465,7 @@ pub fn verify_ligerito_union_mixed_class<Ch: Challenger>(
     {
         return Err(VerifyError::ClassMismatch);
     }
-    let (claims, packed_direct_points, matrix, el_matrix) = verify_union_piops(
+    let (claims, packed_direct_points, matrix, el_matrix, _sigma) = verify_union_piops(
         union,
         UnionVerifyBinding::Mixed,
         circuits,
@@ -459,6 +473,7 @@ pub fn verify_ligerito_union_mixed_class<Ch: Challenger>(
         proof.boolean.as_ref(),
         proof.element.as_ref(),
         None,
+        false,
         pcs_params,
         challenger,
     )?;
@@ -544,7 +559,7 @@ pub fn verify_ligerito_union_mixed_class_deferred<Ch: Challenger>(
     {
         return Err(VerifyError::ClassMismatch);
     }
-    let (claims, packed_direct_points, matrix, el_matrix) = verify_union_piops(
+    let (claims, packed_direct_points, matrix, el_matrix, _sigma) = verify_union_piops(
         union,
         UnionVerifyBinding::Mixed,
         circuits,
@@ -552,6 +567,7 @@ pub fn verify_ligerito_union_mixed_class_deferred<Ch: Challenger>(
         proof.boolean.as_ref(),
         proof.element.as_ref(),
         None,
+        false,
         pcs_params,
         challenger,
     )?;
@@ -625,6 +641,7 @@ fn verify_union_piops<Ch: Challenger>(
     boolean: Option<&crate::proof::BooleanPiopProof>,
     element: Option<&crate::element_r1cs::union::Proof>,
     wiring: Option<&crate::circuit::WiringProof>,
+    defer_sigma: bool,
     pcs_params: &crate::pcs::PcsParams,
     challenger: &mut Ch,
 ) -> Result<UnionPiopOut, VerifyError> {
@@ -732,13 +749,24 @@ fn verify_union_piops<Ch: Challenger>(
 
         // The wiring argument replays AFTER both classes' PIOPs, at the
         // prover's transcript position; its gather claims join the same
-        // packed-direct intake the element claims ride.
+        // packed-direct intake the element claims ride. Deferred callers
+        // get the sigma evaluation back as a claim (route B) instead of
+        // paying its O(2^mu) discharge here — same transcript either way.
+        let mut sigma: Option<crate::circuit::SigmaAssertion> = None;
         if let UnionVerifyBinding::Circuit { circuit, public } = binding {
             let proof = wiring.ok_or(VerifyError::CircuitMismatch)?;
             #[cfg(feature = "mul-count")]
             let wiring_start = crate::field::gf2_128::op_count::snapshot();
-            let gather = crate::circuit::verify_wiring(circuit, public, proof, challenger)
-                .map_err(VerifyError::Wiring)?;
+            let gather = if defer_sigma {
+                let (gather, sig) =
+                    crate::circuit::verify_wiring_deferred(circuit, public, proof, challenger)
+                        .map_err(VerifyError::Wiring)?;
+                sigma = Some(sig);
+                gather
+            } else {
+                crate::circuit::verify_wiring(circuit, public, proof, challenger)
+                    .map_err(VerifyError::Wiring)?
+            };
             #[cfg(feature = "mul-count")]
             if std::env::var("MUL_TRACE").is_ok() {
                 let e = crate::field::gf2_128::op_count::snapshot();
@@ -762,6 +790,7 @@ fn verify_union_piops<Ch: Challenger>(
             packed_direct,
             matrix,
             el_matrix,
+            sigma,
         ))
     })
 }
@@ -775,6 +804,7 @@ type UnionPiopOut = (
     Vec<(Vec<F128>, F128)>,
     Option<lincheck::MatrixAssertion>,
     Option<crate::element_r1cs::union::ElementAssertion>,
+    Option<crate::circuit::SigmaAssertion>,
 );
 
 /// Both classes' undischarged matrix work, as a `*_deferred` entry returns
