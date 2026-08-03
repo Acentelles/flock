@@ -4525,8 +4525,7 @@ fn mvp7_real_query_phase() {
     }
     let yr_len = proof.pcs_open.inner.ligerito.final_proof.yr.len();
     let yr_wires: Vec<Wire> = (0..yr_len).map(|y| wv(yr_v + y)).collect();
-    let pl_full: usize = levels.iter().map(|l| l.fold_fins.len()).sum();
-    let (resid_pub, inner_w, pfslot) = emit_residual_region(
+    let (resid_pub, inner_w, (pfslot, pf_w)) = emit_residual_region(
         &mut sb,
         &mut leaf_slot,
         &levels,
@@ -4587,21 +4586,21 @@ fn mvp7_real_query_phase() {
     let m_mp = mp.rounds.len();
     assert_eq!(sig_w.len(), 2 * (m_mp + 1), "sigma spans the anchor layers");
 
-    // The residual region's pl_full prefix slot; a chunked product of
+    // The residual region's prefix slot (width pf_w); a chunked product of
     // (1 + a + b) factors, seed-chained across rows, padded factors
     // (zw, zw) = 1.
     let prefix_product = |sb: &mut ShapeBuilder, factors: &[(Wire, Wire)]| -> Wire {
         let mut seed = ow;
-        for chunk in factors.chunks(pl_full) {
+        for chunk in factors.chunks(pf_w) {
             let mut g_in = vec![seed];
             for (a, _) in chunk {
                 g_in.push(*a);
             }
-            g_in.extend(std::iter::repeat_n(zw, pl_full - chunk.len()));
+            g_in.extend(std::iter::repeat_n(zw, pf_w - chunk.len()));
             for (_, b) in chunk {
                 g_in.push(*b);
             }
-            g_in.extend(std::iter::repeat_n(zw, pl_full - chunk.len()));
+            g_in.extend(std::iter::repeat_n(zw, pf_w - chunk.len()));
             g_in.push(ow);
             seed = sb.gate(pfslot, &g_in)[0];
         }
@@ -5430,8 +5429,12 @@ fn emit_query_phase(
 ///
 /// Appends public `vals` in declaration order; the caller publishes the
 /// returned accumulators and `inner` AFTER all inputs are declared (the
-/// recorded MVP-7 gotcha). Also returns the `pl_full`-wide prefix slot,
-/// which the anchor-expect machinery reuses for its chunked products.
+/// recorded MVP-7 gotcha). Also returns the prefix slot AND ITS WIDTH
+/// `min(pl_full, 8)`, which the anchor-expect machinery reuses for its
+/// chunked products — longer factor lists seed-chain across rows. (The
+/// cap keeps the schema at 19 IO words instead of 2·pl_full + 3; every
+/// gate cell-slot is also a wiring gather claim, so schema words are the
+/// μ AND claim-count budget.)
 ///
 /// **CHUNKING (the mu-25 fix).** Every gate instantiates at
 /// `chunk_log = min(yr_log, 3)` — kappa 6 REGARDLESS of the proof's yr.
@@ -5462,7 +5465,11 @@ fn emit_residual_region(
     vals: &mut Vec<F128>,
     zw: Wire,
     ow: Wire,
-) -> (Vec<Vec<Wire>>, Wire, flock_core::circuit::builder::SlotId) {
+) -> (
+    Vec<Vec<Wire>>,
+    Wire,
+    (flock_core::circuit::builder::SlotId, usize),
+) {
     use flock_core::lincheck::build_eq_table;
     let yr_len = yr_wires.len();
     assert!(yr_len.is_power_of_two());
@@ -5543,14 +5550,26 @@ fn emit_residual_region(
         .collect();
     let sxslot = sb.slot(SuffixGate::new(chunk_log));
     leaf_slot.push((300, sxslot));
-    let pfslot = sb.slot(PrefixGate::new(pl_full));
-    leaf_slot.push((310 + pl_full, pfslot));
-    let sx0 = if n_chunks > 1 {
-        let s = sb.slot(SuffixGate::new(0));
-        leaf_slot.push((303, s));
-        Some(s)
-    } else {
-        None
+    let pf_w = pl_full.min(8);
+    let pfslot = sb.slot(PrefixGate::new(pf_w));
+    leaf_slot.push((310 + pf_w, pfslot));
+    // Seed-chained prefix product: any factor list, `pf_w` per row.
+    let prefix_chain = |sb: &mut ShapeBuilder, seed: Wire, factors: &[(Wire, Wire)]| -> Wire {
+        let mut s = seed;
+        for chunk_f in factors.chunks(pf_w) {
+            let mut g_in = vec![s];
+            for (a, _) in chunk_f {
+                g_in.push(*a);
+            }
+            g_in.extend(std::iter::repeat_n(zw, pf_w - chunk_f.len()));
+            for (_, b) in chunk_f {
+                g_in.push(*b);
+            }
+            g_in.extend(std::iter::repeat_n(zw, pf_w - chunk_f.len()));
+            g_in.push(ow);
+            s = sb.gate(pfslot, &g_in)[0];
+        }
+        s
     };
     let mut evb_accs: Vec<Wire> = (0..yr_len).map(|_| zw).collect();
     // Fold one claim (prefix product p at full-yl coord wires) into the
@@ -5563,16 +5582,12 @@ fn emit_residual_region(
                 let ph = if n_chunks == 1 {
                     p
                 } else {
-                    let hi = &coords[chunk_log..];
-                    let mut g_in = vec![p];
-                    g_in.extend_from_slice(hi);
-                    g_in.extend(std::iter::repeat_n(zw, pl_full - hi.len()));
-                    for (j, _) in hi.iter().enumerate() {
-                        g_in.push(if (h >> j) & 1 == 1 { ow } else { zw });
-                    }
-                    g_in.extend(std::iter::repeat_n(zw, pl_full - hi.len()));
-                    g_in.push(ow);
-                    sb.gate(pfslot, &g_in)[0]
+                    let factors: Vec<(Wire, Wire)> = coords[chunk_log..]
+                        .iter()
+                        .enumerate()
+                        .map(|(j, &cw2)| (cw2, if (h >> j) & 1 == 1 { ow } else { zw }))
+                        .collect();
+                    prefix_chain(sb, p, &factors)
                 };
                 let mut s_in = vec![ph];
                 s_in.extend_from_slice(&coords[..chunk_log]);
@@ -5584,13 +5599,12 @@ fn emit_residual_region(
         };
     {
         assert_eq!(w_rounds.len(), pl_full + yr_log, "rho spans the dense domain");
-        let mut g_in = vec![chw(inner_pd_fin)];
-        for rr in &w_rounds[..pl_full] {
-            g_in.push(chw(rr.fin));
-        }
-        g_in.extend_from_slice(&ris_full);
-        g_in.push(ow);
-        let pw = sb.gate(pfslot, &g_in)[0];
+        let factors: Vec<(Wire, Wire)> = w_rounds[..pl_full]
+            .iter()
+            .map(|rr| chw(rr.fin))
+            .zip(ris_full.iter().copied())
+            .collect();
+        let pw = prefix_chain(sb, chw(inner_pd_fin), &factors);
         let coords: Vec<Wire> = w_rounds[pl_full..].iter().map(|rr| chw(rr.fin)).collect();
         apply_suffix(sb, &mut evb_accs, pw, &coords);
     }
@@ -5603,15 +5617,10 @@ fn emit_residual_region(
                 .collect();
             assert_eq!(later.len(), folded, "OOD prefix = later folds");
             let sqz = &sq[od.z_fin];
-            let mut g_in = vec![chw(od.beta_fin)];
-            for j in 0..folded {
-                g_in.push(outs[sqz[j / 4]][j % 4]);
-            }
-            g_in.extend(std::iter::repeat_n(zw, pl_full - folded));
-            g_in.extend_from_slice(&later);
-            g_in.extend(std::iter::repeat_n(zw, pl_full - folded));
-            g_in.push(ow);
-            let pw = sb.gate(pfslot, &g_in)[0];
+            let factors: Vec<(Wire, Wire)> = (0..folded)
+                .map(|j| (outs[sqz[j / 4]][j % 4], later[j]))
+                .collect();
+            let pw = prefix_chain(sb, chw(od.beta_fin), &factors);
             let coords: Vec<Wire> = (0..yr_log)
                 .map(|j| {
                     let jj = folded + j;
@@ -5643,11 +5652,20 @@ fn emit_residual_region(
         let dot = sb.gate(fdslot, &g_in)[0];
         inner_w = Some(match inner_w {
             None => dot,
-            Some(acc) => sb.gate(sx0.expect("the cross-chunk adder"), &[dot, ow, acc])[0],
+            Some(acc) => {
+                // Cross-chunk adder as a SUFFIX row with a zero point:
+                // e = [1, 0, ..], so out[0] = acc + dot·1 — no extra type.
+                let mut s_in = vec![dot];
+                s_in.extend(std::iter::repeat_n(zw, chunk_log));
+                s_in.push(ow);
+                s_in.push(acc);
+                s_in.extend(std::iter::repeat_n(zw, chunk - 1));
+                sb.gate(sxslot, &s_in)[0]
+            }
         });
     }
     let inner_w = inner_w.expect("at least one chunk");
-    (resid_pub, inner_w, pfslot)
+    (resid_pub, inner_w, (pfslot, pf_w))
 }
 
 /// Check the residual region's published wires against a NATIVE replica:
@@ -7318,8 +7336,7 @@ fn build_leaf_outer() -> LeafOuter {
         // circuit outputs, exactly as on mvp7.
         let yr_len = proof.pcs_open.inner.ligerito.final_proof.yr.len();
         let yr_wires: Vec<Wire> = (0..yr_len).map(|y| wv(yr_v2 + y)).collect();
-        let pl_full: usize = levels.iter().map(|l| l.fold_fins.len()).sum();
-        let (resid_pub, inner_w, pfslot2) = emit_residual_region(
+        let (resid_pub, inner_w, (pfslot2, pf_w)) = emit_residual_region(
             &mut sb,
             &mut leaf_slot,
             &levels,
@@ -7625,16 +7642,16 @@ fn build_leaf_outer() -> LeafOuter {
         // The circuit side. Advice square-root chains for rho^(2^-j).
         let prefix_product = |sb: &mut ShapeBuilder, factors: &[(Wire, Wire)]| -> Wire {
             let mut seed = ow;
-            for chunk in factors.chunks(pl_full) {
+            for chunk in factors.chunks(pf_w) {
                 let mut g_in = vec![seed];
                 for (a, _) in chunk {
                     g_in.push(*a);
                 }
-                g_in.extend(std::iter::repeat_n(zw, pl_full - chunk.len()));
+                g_in.extend(std::iter::repeat_n(zw, pf_w - chunk.len()));
                 for (_, b) in chunk {
                     g_in.push(*b);
                 }
-                g_in.extend(std::iter::repeat_n(zw, pl_full - chunk.len()));
+                g_in.extend(std::iter::repeat_n(zw, pf_w - chunk.len()));
                 g_in.push(ow);
                 seed = sb.gate(pfslot2, &g_in)[0];
             }
@@ -8758,7 +8775,7 @@ fn mvp10_leaf_outer_inner_tape() {
             v
         };
         let mut resid_slots: Vec<(usize, flock_core::circuit::builder::SlotId)> = Vec::new();
-        let (resid_pub, inner_w, _pfslot2) = emit_residual_region(
+        let (resid_pub, inner_w, _pf) = emit_residual_region(
             &mut sb,
             &mut resid_slots,
             &levels,
@@ -8873,6 +8890,16 @@ fn mvp10_leaf_outer_inner_tape() {
             sb.publish(*w);
         }
         let shape2 = sb.finish().expect("the swap outer builds");
+        // Cell-slot budget: gate slots + public blocks must stay <= 256
+        // for mu 23 (every gate IO word is ALSO a wiring gather claim —
+        // schema words are the budget for both). 250/256 as of the
+        // prefix-width cap; the anchor expect's AssistLayerGate will
+        // spend ~13 of the next doubling unless paid by a consolidation.
+        assert!(
+            shape2.circuit.cells().slots().len() <= 256,
+            "the swap outer's cell-slot budget regressed past mu 23 ({} slots)",
+            shape2.circuit.cells().slots().len()
+        );
         let hint_refs: Vec<&dyn std::any::Any> =
             hints.iter().map(|h| h as &dyn std::any::Any).collect();
         let built2 = shape2.run(&vals, &hint_refs);
@@ -10180,7 +10207,7 @@ fn mvp10_circuit_inner_tape() {
             w_rounds.to_vec()
         };
         let mut resid_slots: Vec<(usize, flock_core::circuit::builder::SlotId)> = Vec::new();
-        let (resid_pub, inner_w, pfslot) = emit_residual_region(
+        let (resid_pub, inner_w, (pfslot, pf_w)) = emit_residual_region(
             &mut sb,
             &mut resid_slots,
             &levels,
@@ -10590,21 +10617,20 @@ fn mvp10_circuit_inner_tape() {
             "the R=2 + P anchor expect replays natively"
         );
 
-        // The circuit side. The residual region's pl_full prefix slot
+        // The circuit side. The residual region's prefix slot (width pf_w)
         // carries every chunked (1 + a + b) product.
-        let pl_full: usize = levels.iter().map(|l| l.fold_fins.len()).sum();
         let prefix_product = |sb: &mut ShapeBuilder, factors: &[(Wire, Wire)]| -> Wire {
             let mut seed = ow;
-            for chunk in factors.chunks(pl_full) {
+            for chunk in factors.chunks(pf_w) {
                 let mut g_in = vec![seed];
                 for (a, _) in chunk {
                     g_in.push(*a);
                 }
-                g_in.extend(std::iter::repeat_n(zw, pl_full - chunk.len()));
+                g_in.extend(std::iter::repeat_n(zw, pf_w - chunk.len()));
                 for (_, b) in chunk {
                     g_in.push(*b);
                 }
-                g_in.extend(std::iter::repeat_n(zw, pl_full - chunk.len()));
+                g_in.extend(std::iter::repeat_n(zw, pf_w - chunk.len()));
                 g_in.push(ow);
                 seed = sb.gate(pfslot, &g_in)[0];
             }
