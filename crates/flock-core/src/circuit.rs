@@ -667,8 +667,17 @@ pub fn prove_wiring<C: Challenger>(
     let mut claims = Vec::with_capacity(cells.num_gate_slots());
     for iota in 0..cells.num_gate_slots() {
         let base = cells.gate_word_addr(iota, 0);
+        let CellSlot::Gate { ty, .. } = cells.slots()[iota] else {
+            unreachable!("the first num_gate_slots cell-slots are gate slots")
+        };
+        // Fold the LIVE prefix only: dummy rows are honest zeros in the
+        // padded buffer (the element closure contract; the boolean padding
+        // spec), so this is value-identical — and it makes the claim
+        // independent of whatever a pooled buffer's dead tail holds,
+        // instead of relying on it being clean.
+        let live = circuit.counts()[ty].min(rows);
         let mut v = F128::ZERO;
-        for (j, &e) in eq_row.iter().enumerate() {
+        for (j, &e) in eq_row.iter().take(live).enumerate() {
             v += e * packed[base + j];
         }
         let point = cells.gate_claim_point(iota, &claim.rho[..nu]);

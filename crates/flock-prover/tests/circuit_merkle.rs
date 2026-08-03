@@ -2131,9 +2131,7 @@ fn mvp5_all_levels_query_phase() {
         el_ord.sort_by_key(|(i, _)| *i);
         let el_inputs: Vec<UnionElementSlotInput> = el_ord
             .into_iter()
-            .map(|(_, z)| {
-                UnionElementSlotInput::new(move |dst: &mut [F128]| dst.copy_from_slice(&z))
-            })
+            .map(|(i, z)| live_element_input(z, shape.counts[i], nu))
             .collect();
         let mut c = FsChallenger::new(DOMAIN);
         let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
@@ -2617,6 +2615,32 @@ impl GateType for ResidualGate {
         }
         SlotWitness::Element(z)
     }
+}
+
+/// An element slot input that writes only the LIVE row prefix of each
+/// column. The destination block arrives freshly zeroed (element unions
+/// never pool dirty buffers) and the source's dead words are zero by the
+/// element closure contract, so skipping them is value-identical — the
+/// witgen counterpart of the wiring layer's live gather fold. Copies
+/// `count` rows of each of the `dst.len() >> nu` columns.
+fn live_element_input(
+    z: Vec<F128>,
+    count: usize,
+    nu: usize,
+) -> flock_prover::prover::UnionElementSlotInput<'static> {
+    flock_prover::prover::UnionElementSlotInput::new(move |dst: &mut [F128]| {
+        debug_assert_eq!(dst.len(), z.len());
+        let rows = 1usize << nu;
+        if count >= rows {
+            dst.copy_from_slice(&z);
+            return;
+        }
+        let width = dst.len() >> nu;
+        for col in 0..width {
+            let base = col << nu;
+            dst[base..base + count].copy_from_slice(&z[base..base + count]);
+        }
+    })
 }
 
 /// `s_{k+1}(x) = s_k(x)^2 + s_k(v_k) s_k(x)` — the subspace-polynomial chain,
@@ -5069,9 +5093,7 @@ fn mvp7_real_query_phase() {
         el_ord.sort_by_key(|(i, _)| *i);
         let el_inputs: Vec<UnionElementSlotInput> = el_ord
             .into_iter()
-            .map(|(_, z)| {
-                UnionElementSlotInput::new(move |dst: &mut [F128]| dst.copy_from_slice(&z))
-            })
+            .map(|(i, z)| live_element_input(z, shape.counts[i], nu))
             .collect();
         let mut c = FsChallenger::new(DOMAIN);
         let (cproof, ccommitment, _) = prover::prove_fast_ligerito_union_circuit(
@@ -6373,9 +6395,7 @@ fn mvp6_all_levels_collapsed() {
         el_ord.sort_by_key(|(i, _)| *i);
         let el_inputs: Vec<UnionElementSlotInput> = el_ord
             .into_iter()
-            .map(|(_, z)| {
-                UnionElementSlotInput::new(move |dst: &mut [F128]| dst.copy_from_slice(&z))
-            })
+            .map(|(i, z)| live_element_input(z, shape.counts[i], nu))
             .collect();
         let mut c = FsChallenger::new(DOMAIN);
         let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
@@ -8077,9 +8097,7 @@ fn build_leaf_outer() -> LeafOuter {
             el_ord.sort_by_key(|(i, _)| *i);
             let el_inputs: Vec<UnionElementSlotInput> = el_ord
                 .into_iter()
-                .map(|(_, z)| {
-                    UnionElementSlotInput::new(move |dst: &mut [F128]| dst.copy_from_slice(&z))
-                })
+                .map(|(i, z)| live_element_input(z, shape.counts[i], nu))
                 .collect();
             let mut ch = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
             let (p, c, _) = prover::prove_fast_ligerito_union_circuit(
@@ -9102,9 +9120,7 @@ fn mvp10_leaf_outer_inner_tape() {
         el_ord.sort_by_key(|(i, _)| *i);
         let el_inputs: Vec<UnionElementSlotInput> = el_ord
             .into_iter()
-            .map(|(_, z)| {
-                UnionElementSlotInput::new(move |dst: &mut [F128]| dst.copy_from_slice(&z))
-            })
+            .map(|(i, z)| live_element_input(z, shape2.counts[i], nu2))
             .collect();
         let mut lco: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
             (shape2.registry_slot(qslots.b3), b3_lc2),
@@ -11099,9 +11115,7 @@ fn mvp10_circuit_inner_tape() {
         el_ord.sort_by_key(|(i, _)| *i);
         let el_inputs: Vec<UnionElementSlotInput> = el_ord
             .into_iter()
-            .map(|(_, z)| {
-                UnionElementSlotInput::new(move |dst: &mut [F128]| dst.copy_from_slice(&z))
-            })
+            .map(|(i, z)| live_element_input(z, shape2.counts[i], nu2))
             .collect();
         let mut bslots: Vec<(usize, UnionSlotProverInput)> = vec![
             (
