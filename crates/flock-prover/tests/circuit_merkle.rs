@@ -2410,6 +2410,15 @@ impl GateType for SpineGate {
 /// `q_field` is a public input, bound at the boundary: the checker masks the
 /// (already published) challenge word natively — same pattern as the cap
 /// select.
+/// Smallest kappa whose column budget holds `c_need`, floored at the
+/// region-friendly 6. Prior shapes stay at 6 (bit-identical); the real
+/// inner's yr=32 close-out pushes some gates to 7 or 8 — both licensed
+/// (the kappa-7 probe, and MVP-7's original kappa-8 leaf-eval table).
+fn gate_kappa(c_need: usize) -> usize {
+    assert!(c_need <= 256, "gate spills kappa=8 ({c_need} cols)");
+    (c_need.next_power_of_two().trailing_zeros() as usize).max(6)
+}
+
 struct ResidualGate {
     ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
     sks_vks: Vec<F128>,
@@ -2438,8 +2447,15 @@ impl ResidualGate {
         let inv = |v: F128| if v == F128::ZERO { F128::ZERO } else { v.inv() };
         let n_in = 1 + pl + 1 + 1 + yr;
         let (q, aw, one, acc0) = (0usize, 1 + pl, 2 + pl, 3 + pl);
+        // Total columns, counted up front so kappa ADAPTS: inputs, the
+        // chain (lmc−1), prefix (2·pl), suffix (yl), subset products
+        // (yr−1−yl), t, contributions (yr−1) and accumulators (yr).
+        // Real-inner shapes spill kappa 6; the kappa-7 probe licenses 7
+        // (prior shapes stay at 6, bit-identical).
+        let c_need = 1 + 4 * pl + yl + 4 * yr;
+        let kappa = gate_kappa(c_need);
         let mut c = n_in; // next free column
-        let mut b = ElementTableBuilder::new(6);
+        let mut b = ElementTableBuilder::new(kappa);
         for wcol in 0..n_in {
             b.free_wire(wcol);
         }
@@ -2503,7 +2519,7 @@ impl ResidualGate {
             acc_out.push(c);
             c += 1;
         }
-        assert!(c <= 64, "residual gate spills kappa=6 ({c} cols)");
+        assert_eq!(c, c_need, "the residual column count is the counted one");
         Self {
             ty: std::sync::Arc::new(b.build().expect("residual gate is valid")),
             sks_vks: sks_vks.to_vec(),
@@ -2649,8 +2665,10 @@ impl PrefixGate {
         let o = F128::ONE;
         let n_in = 2 + 2 * pl; // seed, a[pl], b[pl], one
         let one = n_in - 1;
+        let c_need = 2 + 4 * pl;
+        let kappa = gate_kappa(c_need);
         let mut c = n_in;
-        let mut bl = ElementTableBuilder::new(6);
+        let mut bl = ElementTableBuilder::new(kappa);
         for w in 0..n_in {
             bl.free_wire(w);
         }
@@ -2662,7 +2680,7 @@ impl PrefixGate {
             pr = c;
             c += 1;
         }
-        assert!(c <= 64, "prefix gate spills ({c})");
+        assert_eq!(c, c_need, "the prefix column count is the counted one");
         Self {
             ty: std::sync::Arc::new(bl.build().expect("prefix gate")),
             pl,
@@ -2721,8 +2739,10 @@ impl SuffixGate {
         let yr = 1usize << yl;
         let n_in = 2 + yl + yr; // p, ptS[yl], one, acc[yr]
         let (pt0, one, acc0) = (1, 1 + yl, 2 + yl);
+        let c_need = 2 * yl + 5 * yr;
+        let kappa = gate_kappa(c_need);
         let mut c = n_in;
-        let mut bl = ElementTableBuilder::new(6);
+        let mut bl = ElementTableBuilder::new(kappa);
         for w in 0..n_in {
             bl.free_wire(w);
         }
@@ -2752,7 +2772,7 @@ impl SuffixGate {
             acc_out.push(c);
             c += 1;
         }
-        assert!(c <= 64, "suffix gate spills ({c})");
+        assert_eq!(c, c_need, "the suffix column count is the counted one");
         Self {
             ty: std::sync::Arc::new(bl.build().expect("suffix gate")),
             acc_out,
@@ -2833,8 +2853,10 @@ impl PartialCombineGate {
         let o = F128::ONE;
         let yr = 1usize << yl;
         let n_in = 1 + 2 * yr; // beta, acc[yr], resid[yr]
+        let c_need = 1 + 4 * yr;
+        let kappa = gate_kappa(c_need);
         let mut c = n_in;
-        let mut bl = ElementTableBuilder::new(6);
+        let mut bl = ElementTableBuilder::new(kappa);
         for w in 0..n_in {
             bl.free_wire(w);
         }
@@ -2906,8 +2928,10 @@ impl FinalDotGate {
         let o = F128::ONE;
         let yr = 1usize << yl;
         let n_in = 2 * yr; // yr words, combined
+        let c_need = 3 * yr + 1;
+        let kappa = gate_kappa(c_need);
         let mut c = n_in;
-        let mut bl = ElementTableBuilder::new(6);
+        let mut bl = ElementTableBuilder::new(kappa);
         for w in 0..n_in {
             bl.free_wire(w);
         }
@@ -8088,7 +8112,7 @@ fn mvp10_leaf_outer_inner_tape() {
     let lig = &lo.proof.pcs_open.inner.ligerito;
     let r = lig.recursive_caps.len();
     let lvl_src = level_sources(lig);
-    let (_start_v, piop_i, gammas_i, w_rounds, mp_i, _inner_pd_i, _yr_v, levels) =
+    let (start_v_i, piop_i, gammas_i, w_rounds, mp_i, inner_pd_i, yr_v_i, levels) =
         parse_open_levels(ops, 32 * lig.initial_cap.len(), r);
     assert_eq!(levels.len(), r + 1);
     let piop_i = piop_i.expect("the real inner HAS an element PIOP");
@@ -8253,6 +8277,265 @@ fn mvp10_leaf_outer_inner_tape() {
             &mut vals,
             &mut hints,
         );
+
+        // ---- the swap, step 3: intake W-rounds, spine, residual ----
+        // The opening-side machinery above the query phase, at real-inner
+        // scale. The RS target enters as checker-validated advice (family
+        // H) with the pd half summed in (the step-7 two-halves fact); the
+        // W-rounds bind rho through mrslot; the spine closes at t_r; the
+        // shared residual emitter closes `inner == t_r` — with the
+        // lane-major rotation (56 < 64 committed lanes) at the call site.
+        let mut vmap: Vec<Option<usize>> = Vec::new();
+        for (wi, w) in stream.words.iter().enumerate() {
+            if let flock_core::transcript_record::StreamWord::Value(vi) = *w {
+                if vmap.len() <= vi {
+                    vmap.resize(vi + 1, None);
+                }
+                vmap[vi] = Some(wi);
+            }
+        }
+        let wv = |vi: usize| -> Wire { ww[vmap[vi].expect("stream word")].expect("wired") };
+        vals.push(F128::ZERO);
+        let zw = sb.public_input();
+        vals.push(F128::ONE);
+        let ow = sb.public_input();
+        let mrslot = sb.slot(MergedRoundGate::new());
+        let spine = sb.slot(SpineGate::new());
+
+        // The rs×2 regions, located: s_hat_v ordinals + r_dprime / gamma
+        // challenge ordinals.
+        let (rs_recs2, rs_gam_ch2) = {
+            let vc_at2 = |end: usize| -> (usize, usize) {
+                let (mut v2, mut c2) = (0usize, 0usize);
+                for op in &ops[..end] {
+                    match op {
+                        Op::SqueezeScalar => c2 += 1,
+                        Op::SqueezeSlice(n) => c2 += n,
+                        Op::ObserveScalar => v2 += 1,
+                        Op::ObserveSlice(n) => v2 += n,
+                        _ => {}
+                    }
+                }
+                (v2, c2)
+            };
+            let mut i2 = rs_l[0];
+            let mut recs: Vec<(usize, usize)> = Vec::new();
+            for k in 0..2 {
+                assert!(
+                    matches!(&ops[i2], Op::Label(l) if l.as_slice() == b"flock-ring-switch-v0"),
+                    "rs region {k}"
+                );
+                i2 += 1;
+                assert!(matches!(ops[i2], Op::ObserveSlice(128)), "s_hat_v slice");
+                let (sv, _) = vc_at2(i2);
+                assert_eq!(
+                    &vals_rec[sv..sv + 128],
+                    &lo.proof.pcs_open.ring_switches[k].s_hat_v[..],
+                    "s_hat_v {k} on the stream"
+                );
+                i2 += 1;
+                assert!(matches!(ops[i2], Op::SqueezeSlice(7)), "r_dprime");
+                recs.push((sv, vc_at2(i2).1));
+                i2 += 1;
+            }
+            let gch = vc_at2(i2).1;
+            for _ in 0..2 {
+                assert!(matches!(ops[i2], Op::SqueezeScalar), "rs gamma");
+                i2 += 1;
+            }
+            (recs, gch)
+        };
+        // The two-halves target + running, natively — the reference the
+        // advice target and the published running are held against.
+        let (native_target, native_running) = {
+            use flock_core::pcs::ring_switch as rsw;
+            use flock_core::zerocheck::univariate_skip::build_eq;
+            let gs: Vec<F128> = (0..2).map(|k| chals[rs_gam_ch2 + k]).collect();
+            let mut target = F128::ZERO;
+            let mut coeffs: Vec<Vec<F128>> = Vec::new();
+            for (k, &(sv, rc)) in rs_recs2.iter().enumerate() {
+                let shv = &vals_rec[sv..sv + 128];
+                let rdp: Vec<F128> = (0..7).map(|j| chals[rc + j]).collect();
+                let eq = build_eq(&rdp);
+                target += gs[k] * rsw::inner_product(&rsw::tensor_algebra_transpose(shv), &eq);
+                let scaled: Vec<F128> = eq.iter().map(|x| gs[k] * *x).collect();
+                coeffs
+                    .push(rsw::linearized_coefficients(&rsw::build_fold_byte_table(&scaled)));
+            }
+            for pd in &gammas_i {
+                target += chals[pd.ch] * vals_rec[pd.val_v];
+            }
+            let mut running = target;
+            for rr in &w_rounds {
+                let (g1, gi) = (vals_rec[rr.g_v], vals_rec[rr.g_v + 1]);
+                let rc = chals[rr.ch];
+                let g0 = running + g1;
+                running = g0 + (g1 + g0 + gi) * rc + gi * rc * rc;
+            }
+            let fro = &lo.proof.pcs_open.frobenius;
+            let mut big_v = F128::ZERO;
+            for (k, cs) in coeffs.iter().enumerate() {
+                for (j, &cj) in cs.iter().enumerate() {
+                    if cj.is_zero() {
+                        continue;
+                    }
+                    let mut x = fro.values[k][j];
+                    for _ in 0..j {
+                        x = x * x;
+                    }
+                    big_v += cj * x;
+                }
+            }
+            for &v in &fro.group_values {
+                big_v += v;
+            }
+            assert_eq!(
+                running,
+                vals_rec[inner_pd_i.q_v] * big_v,
+                "the R=2 + P merged boundary replays at real-inner scale"
+            );
+            (target, running)
+        };
+        vals.push(native_target);
+        let tgt_w = sb.public_input();
+        let mut runw = tgt_w;
+        for rr in &w_rounds {
+            let r_w = outs[trace.squeezes[rr.fin][0]][0];
+            runw = sb.gate(mrslot, &[runw, wv(rr.g_v), wv(rr.g_v + 1), r_w])[0];
+        }
+
+        // The ligerito SPINE: start gamma'·q_eval, eval/build per fold,
+        // intro-folds consuming the query phase's accumulator wires;
+        // t_final publishes against the native replay.
+        let gpw = outs[trace.squeezes[inner_pd_i.fin][0]][0];
+        let tw0 = sb.gate(
+            spine,
+            &[zw, zw, zw, zw, zw, zw, wv(inner_pd_i.q_v), gpw, zw],
+        );
+        let mut tsp = tw0[3];
+        let st = sb.gate(
+            spine,
+            &[zw, zw, zw, zw, wv(start_v_i), wv(start_v_i + 1), tsp, ow, zw],
+        );
+        let (mut qc, mut qb, mut qa) = (st[0], st[1], st[2]);
+        for (li, lvl) in levels.iter().enumerate() {
+            for (j, &mv) in lvl.fold_msg_vs.iter().enumerate() {
+                let rw = outs[trace.squeezes[lvl.fold_fins[j]][0]][0];
+                let ev = sb.gate(spine, &[qc, qb, qa, zw, zw, zw, zw, zw, rw]);
+                tsp = ev[4];
+                let bld = sb.gate(
+                    spine,
+                    &[zw, zw, zw, zw, wv(mv), wv(mv + 1), tsp, ow, zw],
+                );
+                (qc, qb, qa) = (bld[0], bld[1], bld[2]);
+            }
+            if li < r {
+                for od in &lvl.ood {
+                    let bw = outs[trace.squeezes[od.beta_fin][0]][0];
+                    let f = sb.gate(
+                        spine,
+                        &[
+                            qc,
+                            qb,
+                            qa,
+                            tsp,
+                            wv(od.intro_v),
+                            wv(od.intro_v + 1),
+                            wv(od.y_v),
+                            bw,
+                            zw,
+                        ],
+                    );
+                    (qc, qb, qa, tsp) = (f[0], f[1], f[2], f[3]);
+                }
+                let bw = outs[trace.squeezes[lvl.beta_fin][0]][0];
+                let f = sb.gate(
+                    spine,
+                    &[
+                        qc,
+                        qb,
+                        qa,
+                        tsp,
+                        wv(lvl.intro_v),
+                        wv(lvl.intro_v + 1),
+                        level_accs[li],
+                        bw,
+                        zw,
+                    ],
+                );
+                (qc, qb, qa, tsp) = (f[0], f[1], f[2], f[3]);
+            } else {
+                let bw = outs[trace.squeezes[lvl.beta_fin][0]][0];
+                let f = sb.gate(spine, &[zw, zw, zw, tsp, zw, zw, level_accs[li], bw, zw]);
+                tsp = f[3];
+            }
+        }
+        let t_final = tsp;
+        let t_final_n = {
+            let quad = |u0: F128, u2: F128, t: F128| (u0, t + u2, u2);
+            let evalq = |q: (F128, F128, F128), x: F128| q.0 + x * q.1 + x * x * q.2;
+            let mut nt = chals[inner_pd_i.ch] * vals_rec[inner_pd_i.q_v];
+            let mut nq = quad(vals_rec[start_v_i], vals_rec[start_v_i + 1], nt);
+            for (li, lvl) in levels.iter().enumerate() {
+                for (j, &mv) in lvl.fold_msg_vs.iter().enumerate() {
+                    nt = evalq(nq, chals[lvl.fold_chs[j]]);
+                    nq = quad(vals_rec[mv], vals_rec[mv + 1], nt);
+                }
+                if li < r {
+                    for od in &lvl.ood {
+                        let b = chals[od.beta_ch];
+                        let iq = quad(
+                            vals_rec[od.intro_v],
+                            vals_rec[od.intro_v + 1],
+                            vals_rec[od.y_v],
+                        );
+                        nq = (nq.0 + b * iq.0, nq.1 + b * iq.1, nq.2 + b * iq.2);
+                        nt += b * vals_rec[od.y_v];
+                    }
+                    let b = chals[lvl.beta_ch];
+                    let iq = quad(
+                        vals_rec[lvl.intro_v],
+                        vals_rec[lvl.intro_v + 1],
+                        native_sums[li],
+                    );
+                    nq = (nq.0 + b * iq.0, nq.1 + b * iq.1, nq.2 + b * iq.2);
+                    nt += b * native_sums[li];
+                } else {
+                    nt += chals[lvl.beta_ch] * native_sums[li];
+                }
+            }
+            nt
+        };
+
+        // The RESIDUAL region via the shared emitter — the lane-major
+        // rotation again (the c7daa3d shape fact, now at 56/64).
+        let yr_len = lo.proof.pcs_open.inner.ligerito.final_proof.yr.len();
+        let yr_wires: Vec<Wire> = (0..yr_len).map(|y| wv(yr_v_i + y)).collect();
+        let lane_major = geo[0].row_words < geo[0].lanes;
+        assert!(lane_major, "the real inner commits integer lanes");
+        let w_resid: Vec<RoundRec> = {
+            let k_rot = w_rounds.len() - levels[0].fold_fins.len();
+            let mut v = w_rounds[k_rot..].to_vec();
+            v.extend_from_slice(&w_rounds[..k_rot]);
+            v
+        };
+        let mut resid_slots: Vec<(usize, flock_core::circuit::builder::SlotId)> = Vec::new();
+        let (resid_pub, inner_w, _pfslot2) = emit_residual_region(
+            &mut sb,
+            &mut resid_slots,
+            &levels,
+            &geo,
+            &w_resid,
+            inner_pd_i.fin,
+            &yr_wires,
+            &trace.squeezes,
+            &outs,
+            &chals,
+            &mut vals,
+            zw,
+            ow,
+        );
+
         for (a_wires, opens) in &to_publish {
             for w in a_wires {
                 sb.publish(*w);
@@ -8271,6 +8554,15 @@ fn mvp10_leaf_outer_inner_tape() {
                 sb.publish(*w);
             }
         }
+        sb.publish(t_final);
+        sb.publish(tgt_w);
+        sb.publish(runw);
+        for accs in &resid_pub {
+            for w in accs {
+                sb.publish(*w);
+            }
+        }
+        sb.publish(inner_w);
         let shape2 = sb.finish().expect("the swap outer builds");
         let hint_refs: Vec<&dyn std::any::Any> =
             hints.iter().map(|h| h as &dyn std::any::Any).collect();
@@ -8285,7 +8577,7 @@ fn mvp10_leaf_outer_inner_tape() {
             .zip(&geo)
             .map(|(l, g)| l.a_count + 3 * g.q)
             .sum();
-        let n_tail = levels.len() + 3 * pows.len();
+        let n_tail = levels.len() + 3 * pows.len() + 3 + levels.len() * yr_len + 1;
         let mut at2 = built2.public.len() - n_tail - n_query_pub;
         for (li, lvl) in levels.iter().enumerate() {
             let g = &geo[li];
@@ -8339,6 +8631,38 @@ fn mvp10_leaf_outer_inner_tape() {
                 );
             }
         }
+        // The opening side: spine t_r, target advice, running, and the
+        // residual region — closed by inner == t_r at real-inner scale.
+        let sp_base = pow_base + 3 * pows.len();
+        assert_eq!(
+            built2.public[sp_base],
+            t_final_n,
+            "the spine's t_r matches the native replay"
+        );
+        assert_eq!(
+            built2.public[sp_base + 1],
+            native_target,
+            "the target advice is the native two-halves combination"
+        );
+        assert_eq!(
+            built2.public[sp_base + 2],
+            native_running,
+            "the W-rounds fold the target to the native running claim"
+        );
+        let inner_n = check_residual_publics(
+            &built2.public,
+            sp_base + 3,
+            &levels,
+            &geo,
+            &w_resid,
+            inner_pd_i.ch,
+            &vals_rec[yr_v_i..yr_v_i + yr_len],
+            &chals,
+        );
+        assert_eq!(
+            inner_n, t_final_n,
+            "inner == t_r: the real-inner statement closes"
+        );
 
         // The outer-of-outer proves and verifies over the circuit path.
         let union2 = UnionInstance::new(&shape2.registry, shape2.counts.clone());
@@ -8390,14 +8714,17 @@ fn mvp10_leaf_outer_inner_tape() {
             ),
         ];
         bslots.sort_by_key(|(i, _)| *i);
-        let mut el_ord: Vec<(usize, Vec<F128>)> = le_slots
-            .iter()
-            .map(|(_, sl)| {
-                let z = match &built2.witnesses[shape2.registry_slot(*sl)] {
+        let mut el_all2: Vec<flock_core::circuit::builder::SlotId> = vec![mrslot, spine];
+        el_all2.extend(le_slots.iter().map(|(_, sl)| *sl));
+        el_all2.extend(resid_slots.iter().map(|(_, sl)| *sl));
+        let mut el_ord: Vec<(usize, Vec<F128>)> = el_all2
+            .into_iter()
+            .map(|sl| {
+                let z = match &built2.witnesses[shape2.registry_slot(sl)] {
                     SlotWitness::Element(z) => z.clone(),
-                    other => panic!("leaf-eval slot produced {other:?}"),
+                    other => panic!("element slot produced {other:?}"),
                 };
-                (shape2.registry_slot(*sl), z)
+                (shape2.registry_slot(sl), z)
             })
             .collect();
         el_ord.sort_by_key(|(i, _)| *i);
@@ -8453,11 +8780,12 @@ fn mvp10_leaf_outer_inner_tape() {
     };
 
     println!(
-        "\nMVP-10 SWAP steps 1+2 — the LEAF OUTER as the inner\n  \
+        "\nMVP-10 SWAP steps 1-3 — the LEAF OUTER as the inner\n  \
          inner: dense_m {} | mu {} | levels (q, depth) {:?}\n  \
          pd claims {} (element pair + {} gathers) | P {} | L0 lanes {}/{}\n  \
          outer-of-outer: b3 rows {} | nu {} | dense_m {} | mu {}\n  \
-         carries: the chain, the QUERY PHASE (real-inner scale), PoW\n  \
+         carries: chain, QUERY PHASE, PoW, W-rounds (rho bound), SPINE\n  \
+         (t_r bound), RESIDUAL (rotated; inner == t_r closes)\n  \
          prove {:.0} ms | verify {:.0} ms | proof {:.1} KiB\n",
         lo.pcs.m,
         lo.shape.circuit.cells().mu(),
