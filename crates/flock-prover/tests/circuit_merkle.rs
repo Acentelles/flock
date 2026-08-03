@@ -4156,29 +4156,7 @@ fn mvp7_real_query_phase() {
     assert_eq!(commitment.cap, lig.initial_cap, "commitment IS the L0 cap");
     let r = lig.recursive_caps.len();
     assert_eq!(lig.recursive_proofs.len(), r - 1, "levels with opens = r + 1");
-    let lvl_src: Vec<(&[[u8; 32]], &Vec<Vec<F128>>, &Vec<[u8; 32]>)> = (0..=r)
-        .map(|li| {
-            if li == 0 {
-                (
-                    lig.initial_cap.as_slice(),
-                    &lig.initial_proof.opened_rows,
-                    &lig.initial_proof.merkle_proof,
-                )
-            } else if li < r {
-                (
-                    lig.recursive_caps[li - 1].as_slice(),
-                    &lig.recursive_proofs[li - 1].opened_rows,
-                    &lig.recursive_proofs[li - 1].merkle_proof,
-                )
-            } else {
-                (
-                    lig.recursive_caps[r - 1].as_slice(),
-                    &lig.final_proof.opened_rows,
-                    &lig.final_proof.merkle_proof,
-                )
-            }
-        })
-        .collect();
+    let lvl_src = level_sources(lig);
     let (start_v, piop, gammas, w_rounds, mp, inner_pd, yr_v, levels) =
         parse_open_levels(t_shape.ops(), 32 * lig.initial_cap.len(), r);
     let piop = piop.expect("the element PIOP");
@@ -5406,6 +5384,40 @@ struct Lvl {
     lanes: usize,
 }
 
+/// The per-level `(cap, opened rows, flat sibling paths)` triples a Ligerito
+/// proof reports, in level order: L0's initial cap, then each recursive cap,
+/// with the FINAL level reusing the last recursive cap. Since Merkle
+/// capping, this is the whole witness a query phase needs — the proof itself
+/// carries it, so no prover data is ever plumbed through.
+fn level_sources(
+    lig: &flock_core::pcs::ligerito::LigeritoProof,
+) -> Vec<(&[[u8; 32]], &Vec<Vec<F128>>, &Vec<[u8; 32]>)> {
+    let r = lig.recursive_caps.len();
+    (0..=r)
+        .map(|li| {
+            if li == 0 {
+                (
+                    lig.initial_cap.as_slice(),
+                    &lig.initial_proof.opened_rows,
+                    &lig.initial_proof.merkle_proof,
+                )
+            } else if li < r {
+                (
+                    lig.recursive_caps[li - 1].as_slice(),
+                    &lig.recursive_proofs[li - 1].opened_rows,
+                    &lig.recursive_proofs[li - 1].merkle_proof,
+                )
+            } else {
+                (
+                    lig.recursive_caps[r - 1].as_slice(),
+                    &lig.final_proof.opened_rows,
+                    &lig.final_proof.merkle_proof,
+                )
+            }
+        })
+        .collect()
+}
+
 /// Per level: `q`, cap bits `c`, path length `d − c`, depth, lanes — plus
 /// the NATIVE cross-checks that pin every piece of the plumbing before any
 /// circuit exists: each opened row verifies against its cap under the
@@ -6616,29 +6628,7 @@ fn mvp9_boolean_leaf_tape() {
         let lig = &proof.pcs_open.inner.ligerito;
         assert_eq!(commitment.cap, lig.initial_cap, "commitment IS the L0 cap");
         let r = lig.recursive_caps.len();
-        let lvl_src: Vec<(&[[u8; 32]], &Vec<Vec<F128>>, &Vec<[u8; 32]>)> = (0..=r)
-            .map(|li| {
-                if li == 0 {
-                    (
-                        lig.initial_cap.as_slice(),
-                        &lig.initial_proof.opened_rows,
-                        &lig.initial_proof.merkle_proof,
-                    )
-                } else if li < r {
-                    (
-                        lig.recursive_caps[li - 1].as_slice(),
-                        &lig.recursive_proofs[li - 1].opened_rows,
-                        &lig.recursive_proofs[li - 1].merkle_proof,
-                    )
-                } else {
-                    (
-                        lig.recursive_caps[r - 1].as_slice(),
-                        &lig.final_proof.opened_rows,
-                        &lig.final_proof.merkle_proof,
-                    )
-                }
-            })
-            .collect();
+        let lvl_src = level_sources(lig);
         let (start_v, piop_o, gammas_o, w_rounds, _mp2, inner_pd2, yr_v2, levels) =
             parse_open_levels(t_shape.ops(), 32 * lig.initial_cap.len(), r);
         assert!(piop_o.is_none(), "a boolean tape has no element PIOP");
