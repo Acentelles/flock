@@ -5959,6 +5959,147 @@ fn mvp9_boolean_leaf_tape() {
     let chals: Vec<F128> = rec.challenges().to_vec();
     let vals_rec = rec.values();
 
+    if std::env::var("MVP9_DUMP").is_ok() {
+        for (i, op) in t_shape.ops().iter().enumerate().take(160) {
+            eprintln!("op {i:>3}: {op:?}");
+        }
+    }
+
+    // ---- the boolean PIOP region, located and pinned (phase 2a) ----
+    // bind -> zerocheck (skip slices + rounds + finals) -> lincheck
+    // (rounds + z_partial + matrix_evals). Every absorbed value is
+    // identified against the proof field it carries, so the assembly's
+    // wires have named indices — the MVP-8-step-1 pattern.
+    {
+        use flock_core::transcript_record::TranscriptOp as Op2;
+        let ops = t_shape.ops();
+        let (mut v, mut c, mut i) = (0usize, 0usize, 0usize);
+        let bump = |op: &Op2, v: &mut usize, c: &mut usize| match op {
+            Op2::SqueezeScalar => *c += 1,
+            Op2::SqueezeSlice(n) => *c += n,
+            Op2::ObserveScalar => *v += 1,
+            Op2::ObserveSlice(n) => *v += n,
+            _ => {}
+        };
+        while !matches!(&ops[i], Op2::Label(l) if l.as_slice() == b"flock-zerocheck-v0") {
+            bump(&ops[i], &mut v, &mut c);
+            i += 1;
+        }
+        i += 1;
+        assert!(matches!(ops[i], Op2::SqueezeSlice(_)), "zc tau lo");
+        bump(&ops[i], &mut v, &mut c);
+        i += 1;
+        assert!(matches!(ops[i], Op2::SqueezeSlice(_)), "zc tau hi");
+        bump(&ops[i], &mut v, &mut c);
+        i += 1;
+        let r1ab_v = v;
+        assert!(matches!(ops[i], Op2::ObserveSlice(64)), "round1_ab");
+        bump(&ops[i], &mut v, &mut c);
+        i += 1;
+        let r1c_v = v;
+        assert!(matches!(ops[i], Op2::ObserveSlice(64)), "round1_c");
+        bump(&ops[i], &mut v, &mut c);
+        i += 1;
+        assert!(matches!(ops[i], Op2::SqueezeScalar), "z_skip");
+        bump(&ops[i], &mut v, &mut c);
+        i += 1;
+        assert_eq!(&vals_rec[r1ab_v..r1ab_v + 64], &proof.zerocheck.round1_ab[..], "round1_ab words");
+        assert_eq!(&vals_rec[r1c_v..r1c_v + 64], &proof.zerocheck.round1_c[..], "round1_c words");
+        let mut zc_rounds = Vec::new();
+        loop {
+            // rounds are [obs, obs, squeeze]; the finals are obs NOT
+            // followed by a squeeze.
+            if matches!(ops[i], Op2::ObserveScalar)
+                && matches!(ops[i + 1], Op2::ObserveScalar)
+                && matches!(ops[i + 2], Op2::SqueezeScalar)
+            {
+                zc_rounds.push((v, c + 1));
+                for _ in 0..3 {
+                    bump(&ops[i], &mut v, &mut c);
+                    i += 1;
+                }
+            } else {
+                break;
+            }
+        }
+        assert_eq!(zc_rounds.len(), proof.zerocheck.multilinear_rounds.len(), "zc rounds");
+        for ((g_v, _), want) in zc_rounds.iter().zip(&proof.zerocheck.multilinear_rounds) {
+            assert_eq!((vals_rec[*g_v], vals_rec[*g_v + 1]), *want, "zc round msg");
+        }
+        let mut zc_finals = Vec::new();
+        while matches!(ops[i], Op2::ObserveScalar) {
+            zc_finals.push(vals_rec[v]);
+            bump(&ops[i], &mut v, &mut c);
+            i += 1;
+        }
+        let want_finals = [
+            proof.zerocheck.final_a_eval,
+            proof.zerocheck.final_b_eval,
+            proof.zerocheck.final_c_eval,
+        ];
+        assert_eq!(&want_finals[..zc_finals.len()], &zc_finals[..], "zc finals");
+        assert!(
+            matches!(&ops[i], Op2::Label(l) if l.as_slice() == b"flock-lincheck-v0"),
+            "lincheck label, got {:?}",
+            ops[i]
+        );
+        i += 1;
+        let mut lc_pre_squeezes = 0usize;
+        while matches!(ops[i], Op2::SqueezeScalar) {
+            lc_pre_squeezes += 1;
+            bump(&ops[i], &mut v, &mut c);
+            i += 1;
+        }
+        assert!(lc_pre_squeezes >= 1, "lc alpha");
+        let mut lc_rounds = Vec::new();
+        while matches!(ops[i], Op2::ObserveScalar)
+            && matches!(ops[i + 1], Op2::ObserveScalar)
+            && matches!(ops[i + 2], Op2::SqueezeScalar)
+        {
+            lc_rounds.push((v, c + 1));
+            for _ in 0..3 {
+                bump(&ops[i], &mut v, &mut c);
+                i += 1;
+            }
+        }
+        assert_eq!(lc_rounds.len(), proof.lincheck.rounds.len(), "lc rounds");
+        for ((g_v, _), want) in lc_rounds.iter().zip(&proof.lincheck.rounds) {
+            assert_eq!((vals_rec[*g_v], vals_rec[*g_v + 1]), *want, "lc round msg");
+        }
+        // The lincheck tail: z_partial (a 64-slice) and the matrix_evals
+        // pairs, in whatever op order — located by value identification.
+        let mut zp_v = None;
+        let mut tail_scalars = Vec::new();
+        while !matches!(&ops[i], Op2::Label(l) if l.as_slice() == b"flock-merged-open-v0") {
+            match ops[i] {
+                Op2::ObserveSlice(64) if zp_v.is_none() => zp_v = Some(v),
+                Op2::ObserveScalar => tail_scalars.push(vals_rec[v]),
+                Op2::ObserveSlice(n) => {
+                    tail_scalars.extend_from_slice(&vals_rec[v..v + n]);
+                }
+                _ => {}
+            }
+            bump(&ops[i], &mut v, &mut c);
+            i += 1;
+        }
+        let zp_v = zp_v.expect("z_partial slice on the tape");
+        assert_eq!(
+            &vals_rec[zp_v..zp_v + 64],
+            &proof.lincheck.z_partial[..],
+            "z_partial words"
+        );
+        // matrix_evals are NOT on the tape — the deferral leaves them
+        // proof-side, pinned only by the lincheck's final one-equation
+        // check and the accumulator's root discharge. In the outer
+        // circuit they enter as published advice bound by that equation
+        // (the assertion-emission shape for the leaf).
+        assert!(
+            tail_scalars.is_empty(),
+            "the lincheck tail carries only z_partial"
+        );
+        assert!(!proof.lincheck.matrix_evals.is_empty(), "the deferred matrix work");
+    }
+
     // The leaf's opening shape: rs×2, pd = 0 — R = 2, P = 0.
     let fro = &proof.pcs_open.frobenius;
     assert_eq!(fro.values.len(), 2, "the boolean class contributes rs×2");
