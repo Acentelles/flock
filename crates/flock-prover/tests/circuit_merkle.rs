@@ -5935,13 +5935,32 @@ fn mvp6_all_levels_collapsed() {
     );
 }
 
-/// **Phase 2, step 1 — the boolean LEAF tape.** A real blake3 workload
-/// proof — the recursion tree's leaf shape (rs×2, pd = 0) — is natively
-/// verified under a RecordingChallenger, and the R = 2 multipoint region
-/// is located and validated field-for-field on the tape: 2×128 RS dual
-/// values, the γ^{128 i + j} schedule folding through the two-product
-/// rounds to the anchor's claimed v. The MVP-8-step-1 mirror for the leaf
-/// inner; the wires phase 2's assembly reads now have named indices.
+/// **MVP-9: the boolean LEAF — the recursion tree's real leaf shape
+/// (rs×2, pd = 0).** A real blake3 workload proof (blake3 for BOTH the
+/// FS chain and the Merkle trees — each default diverges silently) is
+/// natively verified under a RecordingChallenger, and the outer circuit
+/// grows over the recorded tape in the mvp7 pattern:
+///
+/// - TAPE PINS, all field-for-field vs the proof: the R = 2 multipoint
+///   region (2×128 RS dual values, γ^{128i+j} schedule, T0 → rounds →
+///   T_m == anchor.v), the boolean PIOP (zerocheck tau/skip slices/
+///   rounds/finals, lincheck rounds + z_partial; matrix_evals are NOT
+///   absorbed — deferred proof-side by design), and the ring-switch
+///   regions (s_hat_v slices, r_dprime/gamma ordinals) with the whole
+///   R = 2 merged boundary replayed: succinct outputs, W-fold,
+///   linearized coefficients, running == q_eval·V.
+/// - IN-CIRCUIT: the full FS chain; the full query phase (collapsed
+///   openings against the absorbed caps, FS-derived v, boundary-
+///   expanded alpha, per-level enforced sums == native replicas); the
+///   PoW bit predicate (published digest/nonce wires, checker-applied);
+///   and the intake W-rounds (target as checker-validated advice — the
+///   sc dots are family-H, the bit-matrix transpose — with rho BOUND
+///   in-circuit and running published). The outer proves and verifies
+///   over the circuit path.
+///
+/// Remaining for the leaf node: the ligerito spine, the boolean PIOP
+/// gates (skip round checker-native first), the R = 2 T0/anchor deltas,
+/// MatrixAssertion emission, then the family-H upgrade batch.
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn mvp9_boolean_leaf_tape() {
