@@ -44,7 +44,13 @@ use flock_core::pcs::Commitment;
 pub const MAGIC: [u8; 5] = *b"FLOCK";
 
 /// Format version. Bumped on incompatible serialization changes.
-/// v7 (current): Merkle capping — `Commitment.root`, `LigeritoProof.
+/// v8 (current): the multipoint-twisted assist — `MergedOpenProof.
+/// frobenius` becomes `MultipointTwistedProof` (128K claimed dual values,
+/// m product-sumcheck rounds, one untwisted anchor); the transcript gains
+/// the values' absorb + gamma squeeze and loses the per-statement assist
+/// rounds. Soundness: docs/multipoint-twisted-assist.tex.
+///
+/// v7: Merkle capping — `Commitment.root`, `LigeritoProof.
 /// initial_root`, and `recursive_roots` become cap-node VECTORS (the
 /// commitment is the cap layer at depth ⌈log2 q⌉; the transcript absorbs
 /// the cap itself), and the per-tree octopus multi-proofs become flat
@@ -61,7 +67,7 @@ pub const MAGIC: [u8; 5] = *b"FLOCK";
 /// v3 restructured `BaseFoldProof`: per-query Merkle paths were replaced by
 /// shared octopus multi-proofs (one per Merkle tree). v2 added `HashKind`
 /// to [`ChainProofBundle`].
-pub const VERSION: u8 = 7;
+pub const VERSION: u8 = 8;
 
 /// Which hash function a chain proof is over. Carried in
 /// [`ChainProofBundle`] so the verifier (e.g. the CLI) can pick the right

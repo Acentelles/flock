@@ -258,7 +258,10 @@ fn element_only_transcript_shape_is_data_independent() {
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn element_only_transcript_shape_is_pinned() {
-    const EXPECTED: &str = "f862c08b983a0a80488605e592f1ace6b0d3fa24058ce981c2771735d3ab3a14";
+// Re-pinned 2026-08-02: multipoint-twisted assist (proof_io v8) — the
+// per-statement assist became 128K dual values + one product sumcheck +
+// one untwisted anchor; transcript + wire moved by design.
+    const EXPECTED: &str = "32891070a26dbcd9ca5d348bdeef4cd5ad5ddda6774d1f48824ef6b6655e1429";
 
     let (_, shape) = record_element_only(12, &[3], &[1 << 12], 0xB0DD_1E01);
 

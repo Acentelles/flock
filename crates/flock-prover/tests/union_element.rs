@@ -327,7 +327,7 @@ fn element_claims_are_bound_by_the_opening() {
     // The Frobenius assist — V and every round message — proves Ŵ(ρ), i.e.
     // the element claims' weight evaluation.
     let mut bad = proof.clone();
-    bad.pcs_open.frobenius.v += F128::ONE;
+    bad.pcs_open.frobenius.values[0][0] += F128::ONE;
     assert!(verify(&bad).is_err(), "tampered frobenius V");
     for i in 0..proof.pcs_open.frobenius.rounds.len() {
         for which in 0..2 {
@@ -1072,6 +1072,9 @@ fn boolean_only_mixed_class_matches_the_plain_entry() {
 use sha2 as sha2_hash;
 use sha2_hash::Digest as _;
 
+// Re-pinned 2026-08-02: multipoint-twisted assist (proof_io v8) — the
+// per-statement assist became 128K dual values + one product sumcheck +
+// one untwisted anchor; transcript + wire moved by design.
 fn check(label: &str, expected: &str, got: String) {
     if std::env::var_os("ELEMENT_FIXTURES_PRINT").is_some() {
         println!("(\"{label}\", \"{got}\"),");
@@ -1124,15 +1127,15 @@ fn bundle_digest_merged(
 #[ignore] // Heavier — run with `-- --ignored`.
 fn mixed_class_merged_proof_bytes_pinned() {
     const ELEMENT_ONLY: [(&str, usize, &str); 3] = [
-        ("elem-merged-nu12-full", 1 << 12, "6f07e2ecc5a412b9efbe216236921cec9f173d7b730f64053cf3749ce292b8ee"),
-        ("elem-merged-nu12-2731", 2731, "8501391830c61823af1304bdfe19bee7d7cfb15921452aaaafa54e3f21b631ed"),
-        ("elem-merged-nu12-0", 0, "88d55a70c2c5d10de0da99babf472c590e46f5c977544ff0d56fdcd3290492b2"),
+        ("elem-merged-nu12-full", 1 << 12, "9e38a7b79ce0f35b2c1496d47939a58af5418a3ec52f6c87c1e505b5642ee858"),
+        ("elem-merged-nu12-2731", 2731, "7b68360cd6f31f258bc8905c12e15ab1c9a8a4f409d7e2a8522105ee525ae6f9"),
+        ("elem-merged-nu12-0", 0, "7106a6e5b6bef99d552c0d8e0c251a9d18cae84a7514fa3f827b5949e321083b"),
     ];
     const MIXED: [(&str, [usize; 2], &str); 4] = [
-        ("mix-merged-nu7-128-128", [128, 128], "9652ad66d25e4123049f8b07be51256aec4abaaaae5f6f0d7e845c88ffdce3fc"),
-        ("mix-merged-nu7-100-90", [100, 90], "30af426e3e9daa3c1b620faa982f845f3f661dcc54fded205d480fbed89449e8"),
-        ("mix-merged-nu7-0-90", [0, 90], "a467e01e2c2e20b0e658ece80df8002a212e69c3b444afeef1781ec1394191b0"),
-        ("mix-merged-nu7-100-0", [100, 0], "32cdfda3f38bb0f975cc83e0c7c0261c340a6c245778b2b66fb778fd3f6d6495"),
+        ("mix-merged-nu7-128-128", [128, 128], "82631e17e38c883716b1db45bcdb1e18c184c4e6a4bd70943bf760115dbd436c"),
+        ("mix-merged-nu7-100-90", [100, 90], "90a424223247e4acd0c1c32e08d16a9f0bdd115e265f29c4966e3edaa9f4e8a9"),
+        ("mix-merged-nu7-0-90", [0, 90], "f611153a34d9df89731e83a65051af8718051dc5503160e4210c9dfecec410af"),
+        ("mix-merged-nu7-100-0", [100, 0], "7921ded32fcd660407a42bf2cb478d5e130699d1725344465805293e53ca7774"),
     ];
 
     let (w0, w1) = (F128::new(0x51F0, 0), F128::new(0, 0x2C7E));

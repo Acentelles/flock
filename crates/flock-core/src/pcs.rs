@@ -978,7 +978,7 @@ pub struct MergedOpenProof {
     pub ring_switches: Vec<RingSwitchProof>,
     pub merged_rounds: Vec<(F128, F128)>,
     pub q_eval: F128,
-    pub frobenius: jagged::FrobeniusAssistProof,
+    pub frobenius: jagged::MultipointTwistedProof,
     pub inner: BatchOpeningProofLigerito,
 }
 
@@ -1261,18 +1261,32 @@ pub fn open_batch_merged<Ch: Challenger>(
         );
     }
     let t_assist = std::time::Instant::now();
-    let frobenius = jagged::prove_frobenius_assist(&params, &fclaims, &rho, challenger);
+    // The multipoint replacement (docs/multipoint-twisted-assist.tex): 128K
+    // claimed dual values + one product sumcheck + ONE untwisted anchor,
+    // instead of a per-statement assist — family K collapses, and every
+    // verifier piece is a shape the recursion circuit already has.
+    let frobenius = jagged::prove_multipoint_twisted(&params, &fclaims, &rho, challenger);
     if trace {
         eprintln!(
-            "  [open_merged] coeffs + frobenius assist: {:6.2} ms (assist alone {:6.2} ms)",
+            "  [open_merged] coeffs + multipoint assist: {:6.2} ms (assist alone {:6.2} ms)",
             t.elapsed().as_secs_f64() * 1e3,
             t_assist.elapsed().as_secs_f64() * 1e3
         );
     }
-    debug_assert_eq!(
-        frobenius.v, w_eval,
-        "assist V must equal the folded weight MLE"
-    );
+    #[cfg(debug_assertions)]
+    {
+        let mut v = F128::ZERO;
+        for (cl, vs) in fclaims.iter().zip(&frobenius.values) {
+            for (j, &a) in vs.iter().enumerate() {
+                let mut t = a;
+                for _ in 0..j {
+                    t *= t;
+                }
+                v += cl.coeffs[j] * t;
+            }
+        }
+        debug_assert_eq!(v, w_eval, "multipoint V must equal the folded weight MLE");
+    }
     let _ = w_eval;
 
     // ---- eq-basis Ligerito opening of q̂(ρ): one packed-direct claim on
@@ -1469,7 +1483,7 @@ pub fn verify_batch_merged<Ch: Challenger>(
     let t = std::time::Instant::now();
     #[cfg(feature = "mul-count")]
     let assist_start = crate::field::gf2_128::op_count::snapshot();
-    let v = jagged::verify_frobenius_assist(&params, &fclaims, &rho, &proof.frobenius, challenger)
+    let v = jagged::verify_multipoint_twisted(&params, &fclaims, &rho, &proof.frobenius, challenger)
         .ok_or(VerifyErrorOpen::Assist)?;
     #[cfg(feature = "mul-count")]
     if std::env::var("MUL_TRACE").is_ok() {

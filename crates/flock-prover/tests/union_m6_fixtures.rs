@@ -82,6 +82,9 @@ fn random_sha2_inputs(rng: &mut Rng, n: usize) -> Vec<sha2::Compression> {
         .collect()
 }
 
+// Re-pinned 2026-08-02: multipoint-twisted assist (proof_io v8) — the
+// per-statement assist became 128K dual values + one product sumcheck +
+// one untwisted anchor; transcript + wire moved by design.
 fn check(label: &str, expected: &str, got: String) {
     if std::env::var_os("M6_FIXTURES_PRINT").is_some() {
         println!("(\"{label}\", \"{got}\"),");
@@ -126,22 +129,22 @@ fn m6_merged_union_proof_bytes_pinned() {
         (
             "merged-nu10-1024-1024",
             [1024, 1024],
-            "8654c643caf72b07f37f491bf0581c19d50333a8bd94e0922d700571cfc208a5",
+            "ddc1287d05329784bf48472502fa6c255f10d916b3b16fe2985f2414303d2eb8",
         ),
         (
             "merged-nu10-50-37",
             [50, 37],
-            "10e57f16ec4d2ece6579f6792851c2b43e6c92d156022c9d9b7a09da4e894b57",
+            "d36901681ab64202a855e85b7f4275277a08bfc56512d915cf511bafaf0d809f",
         ),
         (
             "merged-nu10-8-8",
             [8, 8],
-            "78ed6a4a12d9ff056c60a76ce75c2f8ffc9788c3969551e12a2ad19e94f14914",
+            "cfc63402f97c73aa051a00644bb00c19a29ff1568261c6d096efbb09a9f178fc",
         ),
         (
             "merged-nu10-0-64",
             [0, 64],
-            "98205e1f6cafdb039ccd942c72f91d2b0d2c4b5ce69781b04c921acd529120ba",
+            "0ae4e8cc3dd1d0db33e572205530fda06dc155c675dec9f91beb8071a2155f04",
         ),
     ];
 
@@ -217,7 +220,7 @@ fn m6_merged_union_proof_bytes_pinned() {
 fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
     // BLAKE3, 256 blocks (m = 22).
     {
-        const EXPECTED: &str = "b7e79cbaa6357eb28abee2884771e12b35b660cca3ece9e84ed00a5dc4eda844";
+        const EXPECTED: &str = "90dfd59f46fd3030549d3c197241302ae9b0955b860bb0ad0b2d92784a6d4f9d";
         let n_blocks = 256usize;
         let setup = blake3::Blake3Setup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_B3B3);
@@ -249,7 +252,7 @@ fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
 
     // SHA-256, 128 blocks (m = 22).
     {
-        const EXPECTED: &str = "05f36986af292887ba636c17acf60ed8deb45d9d5cdfe10b6bd272b45cb3f923";
+        const EXPECTED: &str = "9a1a69e23bf54049c1080119fa0ba1fdbcb8015c3b5d321b0699c732e2dfe1bc";
         let n_blocks = 128usize;
         let setup = sha2::Sha256HybridSetup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_5252);
