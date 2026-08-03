@@ -702,10 +702,45 @@ lincheck comb the verifier already pays ($O(\nnz)$, $\sim$83\% of verify).
 the \emph{same} delegation problem as comb delegation (registry-/circuit-
 static data, commit once, open per proof); the two must share one design.
 Recursion \emph{requires} the v2 form (an $O(2^\mu)$ in-circuit evaluation
-is unaffordable); v1 is for native verification. Structured wirings
+is unaffordable --- measured at 4.2M constraints / 210 inversions on the
+leaf outer); v1 is for native verification. Structured wirings
 (chains, complete trees) evaluate in $O(\mu)$ --- the existing
 \code{chain.rs}/\code{merkle\_path.rs} glue is the degenerate case of this
 layer and stays.
+
+\paragraph{v2 design sketch (2026-08-03).} The observation that makes v2
+cheap: with the merged transport, a preprocessed commitment's opening is
+just \emph{more packed-direct claims}, and the transcription work has
+already put that entire verification path in-circuit. Concretely:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Setup} (statement time): commit the circuit-static data
+        --- the $\sigma$ tables the wiring GKR evaluates \emph{and} the
+        registry-static comb columns the lincheck delegation needs --- as
+        one \emph{preprocessing commitment} under the same PCS. The
+        circuit digest covers it; under shape normalisation it is a
+        CONSTANT of the recursion shape, absorbed once.
+  \item \textbf{Per proof}: the verifier's $\hat s_\sigma(\rho)$ (and the
+        comb evaluations) become packed-direct claims against the
+        preprocessing commitment --- a second merged opening. The claims
+        share row points by construction, so the two-product grouping
+        collapses them to a handful of dual values.
+  \item \textbf{In-circuit}: the second opening verifies with the SAME
+        transcribed machinery (query phase against the preprocessing
+        caps, spine, multipoint intake) --- no new gate types. The
+        $O(2^\mu)$ evaluation is replaced by a second query-phase
+        instance: a few thousand blake3 rows, not millions of
+        multiplications.
+\end{enumerate}
+
+Open sub-questions, recorded for the design pass: the $\sigma$-table
+column encoding (commit $\hat s_\sigma$ directly as element-class
+columns, or the permutation in a form the GKR's fractional terms
+consume); whether witness and preprocessing share one commitment tree
+per level or stay separate (separate keeps the witness path untouched);
+and the exact absorb point of the preprocessing caps relative to
+\code{bind\_statement} (before the wiring GKR's $\alpha, \beta$, like
+every commitment).
 
 % ===========================================================================
 \section{Why copy constraints and not a LogUp bus}\label{sec:logup}
