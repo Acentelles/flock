@@ -1150,6 +1150,7 @@ fn aggregating_real_proofs_defers_all_matrix_work_to_one_discharge() {
         registry_digest: other.digest(),
         per_type: acc.per_type.clone(),
         per_element: Vec::new(),
+        sigma: None,
     };
     let a0b = assert_of(&slots[0], false);
     assert!(
