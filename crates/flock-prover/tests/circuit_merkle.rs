@@ -3247,6 +3247,203 @@ impl GateType for ZcRoundGate {
     }
 }
 
+/// One Λ-node of the univariate skip's interpolation (the family-H pass,
+/// first item): the barycentric NUMERATOR recurrence
+///
+///   A' = A·(z+λ),   B' = B·(z+λ) + v·A
+///
+/// accumulates `B_final = Σ_i v_i · Π_{j≠i}(z+λ_j)` in one forward pass —
+/// no inversions, no advice, and (unlike the native closed form's
+/// `Z(z)/(z+λ_i)` branch) EXACT even when z lands on a node. Both
+/// interpolations (`round1_c` alone and the combined `ab+c`) share the
+/// node products, so one row carries both accumulators.
+struct SkipNodeGate {
+    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+}
+
+impl SkipNodeGate {
+    fn new() -> Self {
+        use flock_core::element_r1cs::ElementTableBuilder;
+        let o = F128::ONE;
+        // in: A(0) bc(1) bab(2) z(3) lam(4) vc(5) vab(6)
+        let mut b = ElementTableBuilder::new(4);
+        for w in 0..7 {
+            b.free_wire(w);
+        }
+        b.mult_lin(7, &[(0, o)], &[(3, o), (4, o)]); // A' = A (z+lam)
+        b.mult_lin(8, &[(1, o)], &[(3, o), (4, o)]); // bc (z+lam)
+        b.mult(9, 5, 0); // vc A
+        b.linear(10, &[(8, o), (9, o)]); // bc'
+        b.mult_lin(11, &[(2, o)], &[(3, o), (4, o)]); // bab (z+lam)
+        b.mult_lin(12, &[(6, o), (5, o)], &[(0, o)]); // (vab+vc) A
+        b.linear(13, &[(11, o), (12, o)]); // bab'
+        Self {
+            ty: std::sync::Arc::new(b.build().expect("skip node gate")),
+        }
+    }
+}
+
+impl GateType for SkipNodeGate {
+    type Row = Vec<F128>;
+    type Hint = ();
+    fn table(&self) -> TableType {
+        use flock_core::schedule::IoWord;
+        let mut schema: Vec<IoWord> = (0..7).map(IoWord::input).collect();
+        schema.push(IoWord::output(7));
+        schema.push(IoWord::output(10));
+        schema.push(IoWord::output(13));
+        TableType::element(self.ty.clone()).with_io_schema(schema)
+    }
+    fn eval(&self, inputs: &[F128], _h: &()) -> (Vec<F128>, Self::Row) {
+        let mut z = vec![F128::ZERO; 14];
+        z[..7].copy_from_slice(&inputs[..7]);
+        let zl = z[3] + z[4];
+        z[7] = z[0] * zl;
+        z[8] = z[1] * zl;
+        z[9] = z[5] * z[0];
+        z[10] = z[8] + z[9];
+        z[11] = z[2] * zl;
+        z[12] = (z[6] + z[5]) * z[0];
+        z[13] = z[11] + z[12];
+        (vec![z[7], z[10], z[13]], z)
+    }
+    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
+        let mut z = vec![F128::ZERO; self.ty.width() << nu];
+        for (j, row) in rows.iter().enumerate() {
+            for (col, &v) in row.iter().enumerate() {
+                z[(col << nu) + j] = v;
+            }
+        }
+        SlotWitness::Element(z)
+    }
+}
+
+/// The skip round's close-out (one row): scales the two numerator sums by
+/// the subspace-denominator inverses and the linearized `Z_S(z)`.
+///
+/// The φ8 node sets are F₂-subspaces, so `Z_S(X) = Σ_j c_j·X^(2^j)` is
+/// LINEARIZED — its evaluation is a constant-coefficient combination of the
+/// squaring-chain wires `z^(2^j)`, free inside the row — and the Lagrange
+/// denominator is the same constant for every node (it is `Z'_S = c_0`, the
+/// formal derivative). Outputs: `rc = interpolate_on_lambda(round1_c)(z)` —
+/// which BINDS `final_c_eval` (never absorbed; the native verifier
+/// recomputes-and-compares, so the published wire is its binding) — and
+/// `seed = combined_at_z + rc`, the multilinear chain's entry, replacing
+/// the zc-seed advice.
+struct SkipCloseGate {
+    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+}
+
+impl SkipCloseGate {
+    /// Linearized coefficients of `Z_{V_m}` over `V_m = φ_8({0..2^m−1})` via
+    /// the subspace-polynomial recursion `Z_{k+1} = Z_k² + Z_k(φ(2^k))·Z_k`
+    /// (squaring shifts the coefficient basis: `(Σ c_j X^(2^j))² =
+    /// Σ c_j²·X^(2^(j+1))`).
+    fn linearized_coeffs(dim: usize) -> Vec<F128> {
+        use flock_core::field::PHI_8_TABLE;
+        let mut c = vec![F128::ONE];
+        for k in 0..dim {
+            let bk = PHI_8_TABLE[1 << k];
+            let mut t = F128::ZERO;
+            let mut p = bk;
+            for &cj in &c {
+                t += cj * p;
+                p = p * p;
+            }
+            let mut nc = vec![F128::ZERO; c.len() + 1];
+            for (j, &cj) in c.iter().enumerate() {
+                nc[j + 1] += cj * cj;
+                nc[j] += t * cj;
+            }
+            c = nc;
+        }
+        c
+    }
+
+    fn new() -> Self {
+        use flock_core::element_r1cs::ElementTableBuilder;
+        use flock_core::field::PHI_8_TABLE;
+        let o = F128::ONE;
+        let c = Self::linearized_coeffs(6);
+        // Z_{V6} vanishes on V6 and matches the product form off it; the
+        // denominator is its formal derivative c_0. One-time construction
+        // checks — the constants below are load-bearing for soundness.
+        let zv6 = |x: F128| {
+            let mut acc = F128::ZERO;
+            let mut p = x;
+            for &cj in &c {
+                acc += cj * p;
+                p = p * p;
+            }
+            acc
+        };
+        assert_eq!(zv6(PHI_8_TABLE[1]), F128::ZERO, "Z_V6 vanishes on V6");
+        assert_eq!(zv6(PHI_8_TABLE[63]), F128::ZERO, "Z_V6 vanishes on V6");
+        let den6 = (1..64).fold(F128::ONE, |acc, i| acc * PHI_8_TABLE[i]);
+        assert_eq!(c[0], den6, "den6 is Z_V6's formal derivative");
+        let den7 = zv6(PHI_8_TABLE[64]) * den6;
+        // in: bc(0) bab(1) zp_j = z^(2^j) at (2+j) for j in 0..7
+        let mut b = ElementTableBuilder::new(4);
+        for w in 0..9 {
+            b.free_wire(w);
+        }
+        let zs: Vec<(usize, F128)> = c
+            .iter()
+            .enumerate()
+            .filter(|&(_, &cj)| cj != F128::ZERO)
+            .map(|(j, &cj)| (2 + j, cj))
+            .collect();
+        b.mult_lin(9, &[(1, den7.inv())], &zs); // combined_at_z
+        b.linear(10, &[(0, den6.inv())]); // rc
+        b.linear(11, &[(9, o), (10, o)]); // seed
+        Self {
+            ty: std::sync::Arc::new(b.build().expect("skip close gate")),
+        }
+    }
+}
+
+impl GateType for SkipCloseGate {
+    type Row = Vec<F128>;
+    type Hint = ();
+    fn table(&self) -> TableType {
+        use flock_core::schedule::IoWord;
+        let mut schema: Vec<IoWord> = (0..9).map(IoWord::input).collect();
+        schema.push(IoWord::output(10));
+        schema.push(IoWord::output(11));
+        TableType::element(self.ty.clone()).with_io_schema(schema)
+    }
+    fn eval(&self, inputs: &[F128], _h: &()) -> (Vec<F128>, Self::Row) {
+        use flock_core::field::PHI_8_TABLE;
+        let c = Self::linearized_coeffs(6);
+        let den6 = c[0];
+        let mut t6 = F128::ZERO;
+        let mut p = PHI_8_TABLE[64];
+        for &cj in &c {
+            t6 += cj * p;
+            p = p * p;
+        }
+        let mut z = vec![F128::ZERO; 12];
+        z[..9].copy_from_slice(&inputs[..9]);
+        let zs = c
+            .iter()
+            .enumerate()
+            .fold(F128::ZERO, |acc, (j, &cj)| acc + cj * z[2 + j]);
+        z[9] = (t6 * den6).inv() * z[1] * zs;
+        z[10] = den6.inv() * z[0];
+        z[11] = z[9] + z[10];
+        (vec![z[10], z[11]], z)
+    }
+    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
+        let mut z = vec![F128::ZERO; self.ty.width() << nu];
+        for (j, row) in rows.iter().enumerate() {
+            for (col, &v) in row.iter().enumerate() {
+                z[(col << nu) + j] = v;
+            }
+        }
+        SlotWitness::Element(z)
+    }
+}
+
 /// The zerocheck's closing identity `running = ea eb + ec` (published-zero
 /// delta) and the constant-strip + lincheck entry: with the inner shape's
 /// single kappa=2 slot at full prefix, `va = ea + <eq(r_con), a_const>` and
@@ -6677,13 +6874,17 @@ fn mvp9_boolean_leaf_tape() {
         }
         let t_final = tsp;
 
-        // ---- the boolean zerocheck's multilinear rounds in-circuit ----
-        // The skip round (round1 interpolation at z) stays checker-native;
-        // its output seeds the chain as CHECKER-VALIDATED advice. The 16
-        // rounds are ZcRoundGate rows: eq weights t_i are the 7 baked
-        // ghash constants then the 9 r_outer squeeze wires, rho from the
-        // chain, msgs from the stream, g0 as advice with published-zero
-        // deltas — family I, no in-circuit inversion.
+        // ---- the boolean zerocheck in-circuit ----
+        // The SKIP ROUND is fully bound (the family-H pass, item 1): the
+        // barycentric numerator recurrence over the Λ nodes (SkipNodeGate,
+        // 64 rows — no inversions, no advice), z^(2^j) via spine tr-rows,
+        // and the close gate baking the linearized Z_S coefficients and
+        // subspace denominators. Its rc output binds final_c_eval and its
+        // seed output IS the multilinear chain's entry — the zc-seed
+        // advice is gone. The 16 rounds are ZcRoundGate rows: eq weights
+        // t_i are the 7 baked ghash constants then the 9 r_outer squeeze
+        // wires, rho from the chain, msgs from the stream, g0 as advice
+        // with published-zero deltas — family I, no in-circuit inversion.
         let zc0 = {
             use flock_core::transcript_record::TranscriptOp as Op4;
             let ops2 = t_shape.ops();
@@ -6718,7 +6919,7 @@ fn mvp9_boolean_leaf_tape() {
             let r1c_v = v2;
             bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
             i2 += 1;
-            let z_ch = c2;
+            let (z_ch, z_fin) = (c2, f2);
             bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
             i2 += 1;
             let mut rounds2 = Vec::new();
@@ -6768,7 +6969,7 @@ fn mvp9_boolean_leaf_tape() {
                 i2 += 3;
             }
             (
-                (outer_ch, outer_fin, r1ab_v, r1c_v, z_ch),
+                (outer_ch, outer_fin, r1ab_v, r1c_v, z_ch, z_fin),
                 rounds2,
                 finals_v,
                 (alpha_ch2, alpha_fin2, beta_ch2, beta_fin2),
@@ -6776,7 +6977,7 @@ fn mvp9_boolean_leaf_tape() {
             )
         };
         let (zc0, zc_rounds2, zc_finals_v, lc_chs, lc_rounds2) = zc0;
-        let (outer_ch, outer_fin, r1ab_v, r1c_v, z_ch) = zc0;
+        let (outer_ch, outer_fin, r1ab_v, r1c_v, z_ch, z_fin) = zc0;
         let (alpha_ch2, alpha_fin2, beta_ch2, beta_fin2) = lc_chs;
         assert!(zc_finals_v.len() >= 2, "zc finals (v_a, v_b) on the tape");
         // Native seed + g0/running chain.
@@ -6811,12 +7012,34 @@ fn mvp9_boolean_leaf_tape() {
             zc_run = g0 * (F128::ONE + rho) + g1 * rho + gi * rho * (F128::ONE + rho);
         }
         let zc_end_native = zc_run;
-        // The circuit chain.
+        // The circuit chain — the skip round first.
+        let z_w = outs[trace.squeezes[z_fin][0]][0];
+        let mut zpw = vec![z_w];
+        for j in 1..7 {
+            let p = zpw[j - 1];
+            zpw.push(sb.gate(spine, &[zw, zw, zw, zw, zw, zw, p, p, zw])[3]);
+        }
+        let skslot = sb.slot(SkipNodeGate::new());
+        leaf_slot.push((510, skslot));
+        let (mut ska, mut skc, mut skab) = (ow, zw, zw);
+        for i in 0..64 {
+            vals.push(flock_core::field::PHI_8_TABLE[64 + i]);
+            let lam_w = sb.public_input();
+            let g = sb.gate(
+                skslot,
+                &[ska, skc, skab, z_w, lam_w, wv(r1c_v + i), wv(r1ab_v + i)],
+            );
+            (ska, skc, skab) = (g[0], g[1], g[2]);
+        }
+        let scslot = sb.slot(SkipCloseGate::new());
+        leaf_slot.push((511, scslot));
+        let mut cin = vec![skc, skab];
+        cin.extend_from_slice(&zpw);
+        let cl = sb.gate(scslot, &cin);
+        let (rc_w, seed_w) = (cl[0], cl[1]);
         let zslot = sb.slot(ZcRoundGate::new());
         leaf_slot.push((500, zslot));
-        vals.push(zc_seed);
-        let zc_seed_w = sb.public_input();
-        let mut zrw = zc_seed_w;
+        let mut zrw = seed_w;
         let mut zc_deltas2: Vec<Wire> = Vec::new();
         for (k2, &(g_v, _, fin)) in zc_rounds2.iter().enumerate() {
             let t_w = if k2 < 7 {
@@ -7122,7 +7345,8 @@ fn mvp9_boolean_leaf_tape() {
         sb.publish(tw);
         sb.publish(runw);
         sb.publish(t_final);
-        sb.publish(zc_seed_w);
+        sb.publish(rc_w);
+        sb.publish(seed_w);
         for d in &zc_deltas2 {
             sb.publish(*d);
         }
@@ -7144,7 +7368,7 @@ fn mvp9_boolean_leaf_tape() {
             + levels.len() * yr_len
             + 1
             + 3
-            + 5
+            + 6
             + n_assert_pub
             + zc_rounds2.len()
             + 3 * pows.len()
@@ -7276,7 +7500,7 @@ fn mvp9_boolean_leaf_tape() {
             assert_eq!(built.public[at3], inner_n, "the close-out inner");
             // THE CLOSURE, between circuit outputs: the residual side's
             // inner and the spine's t_r are the same statement scalar.
-            let zc_tail2 = n_assert_pub + 5 + zc_rounds2.len();
+            let zc_tail2 = n_assert_pub + 6 + zc_rounds2.len();
             assert_eq!(
                 built.public[at3],
                 built.public[built.public.len() - zc_tail2 - 1],
@@ -7337,15 +7561,20 @@ fn mvp9_boolean_leaf_tape() {
             lc_end_native,
             "the lincheck chain ends at the native running claim"
         );
-        let zc_tail = n_assert_pub + 5 + zc_rounds2.len();
+        let zc_tail = n_assert_pub + 6 + zc_rounds2.len();
         assert_eq!(
             built.public[built.public.len() - zc_tail],
+            proof.zerocheck.final_c_eval,
+            "the skip interpolation binds final_c_eval"
+        );
+        assert_eq!(
+            built.public[built.public.len() - zc_tail + 1],
             zc_seed,
-            "the zc seed advice is the native skip output"
+            "the in-circuit skip seed equals the native interpolation"
         );
         for k2 in 0..zc_rounds2.len() {
             assert_eq!(
-                built.public[built.public.len() - zc_tail + 1 + k2],
+                built.public[built.public.len() - zc_tail + 2 + k2],
                 F128::ZERO,
                 "zc delta {k2}"
             );
