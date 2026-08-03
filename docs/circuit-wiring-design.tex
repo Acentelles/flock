@@ -882,6 +882,65 @@ opening. \emph{Implemented end to end}: the circuit half of the binding
 non-circuit proof's transcript is unchanged byte for byte.
 
 % ===========================================================================
+\section{The boundary-checker contract}\label{sec:boundary}
+
+The transcription work (MVP-4 through the boolean leaf) settled a uniform
+trust structure for what the \emph{outer verifier} checks natively about a
+circuit proof's public segment. Every published word is one of two kinds:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Circuit-derived wires} — chain squeeze outputs, stream
+        words, gate outputs. These are bound by the opening; publishing
+        them only \emph{exposes} them.
+  \item \textbf{Advice publics} — values the circuit consumes but cannot
+        cheaply derive (eq-tensor expansions, the zerocheck's skip-round
+        seed, per-round $g_0$, deferred matrix evaluations). Each is bound
+        by a checker equation over kind-(1) values and proof data.
+\end{enumerate}
+
+The checker obligations, per verified inner (the leaf inventory; the
+pure-element inner is the subset without the RS items):
+
+\begin{itemize}[nosep]
+  \item \emph{Cap selects}: per query, mask the published challenge word,
+        index the absorbed cap, compare the published terminal digest.
+  \item \emph{Eq expansions}: the $\alpha$ weights and the leaf-eval
+        hi-group weights are $\mathrm{eq}$-tensor expansions of published
+        challenge words, recomputed natively and matched against the
+        advice inputs.
+  \item \emph{Grinding}: per PoW op, $H(\text{digest} \| \text{nonce})$
+        has the required leading zeros (canonical zero nonce at zero-bit
+        sites); digest and nonce are kind-(1) wires.
+  \item \emph{Zero-deltas}: the published identity deltas (zerocheck
+        $g_0$ rows, the multipoint's $T_m = \text{anchor}.v$ and
+        $\text{claim} = \text{expect}$, the merged boundary) are zero.
+  \item \emph{Advice seeds and chain ends}: the zerocheck seed equals the
+        skip-round interpolation at $z$; each published chain end equals
+        the native replay from bound data.
+  \item \emph{The family-H batch} (boundary-first; the standing upgrade
+        target): the RS transpose dots (a bit-matrix transpose), the
+        linearized fold coefficients, the $V$ recombination's Frobenius
+        squarings, and the twisted closed form $\hat g(\rho'')$ — all
+        $\F_2$-linear maps of bound words, recomputed natively.
+  \item \emph{Assertion consumption}: the emitted
+        \code{ElementAssertion}/\code{MatrixAssertion} fields (points as
+        kind-(1) wires, matrix evaluations as advice bound by the
+        lincheck's one-equation final check) feed the accumulator from
+        the public segment alone.
+\end{itemize}
+
+Two properties make this sound and cheap. Soundness: kind-(2) advice
+never floats — every piece closes through an equation whose other
+operands are kind-(1) or proof scalars the transcript absorbed. Cost:
+the checker's native work is $O(q + \text{rounds} + 128R + P +
+\#\mathrm{pow})$ field operations plus tens of hashes — nothing
+$O(2^m)$, so the deferral discipline survives the boundary. The
+contract shrinks monotonically as items move in-circuit (the family-H
+batch is one coherent pass of boolean-class bit machinery), and it is
+part of the statement: a checker that skips an item verifies a weaker
+claim.
+
+% ===========================================================================
 \section{Cost accounting}\label{sec:costs}
 
 Element PIOP: sub-ms at verifier-circuit scales; claims add $O(1)$ terms
