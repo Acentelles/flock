@@ -6463,7 +6463,50 @@ fn mvp9_boolean_leaf_tape() {
         let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
         vals.extend_from_slice(&iv_w);
         let iv = [sb.public_input(), sb.public_input()];
-        let (outs, _ww) = emit_fs_chain(&mut sb, slots.b3, iv, &trace, &stream, &bytes, &mut vals);
+        let (outs, ww) = emit_fs_chain(&mut sb, slots.b3, iv, &trace, &stream, &bytes, &mut vals);
+
+        // The PoW grinding ops, located and bound (the mvp7 machinery).
+        struct PowRec {
+            fin: usize,
+            pay: usize,
+            bits: u32,
+        }
+        let pows: Vec<PowRec> = {
+            use flock_core::transcript_record::TranscriptOp as Op3;
+            let mut out = Vec::new();
+            let (mut fin, mut pay) = (0usize, 0usize);
+            for op in t_shape.ops() {
+                if let Op3::Pow { bits } = op {
+                    out.push(PowRec {
+                        fin,
+                        pay,
+                        bits: *bits,
+                    });
+                }
+                if op.finalizes() {
+                    fin += 1;
+                }
+                match op {
+                    Op3::ObserveBytes(_) | Op3::Pow { .. } => pay += 1,
+                    _ => {}
+                }
+            }
+            out
+        };
+        assert!(!pows.is_empty(), "the Fast profile grinds");
+        let pow_pub: Vec<[Wire; 3]> = pows
+            .iter()
+            .map(|pr| {
+                let sq = &trace.squeezes[pr.fin];
+                let wi = stream
+                    .words
+                    .iter()
+                    .position(|w| matches!(w, flock_core::transcript_record::StreamWord::Bytes { payload, .. } if *payload == pr.pay))
+                    .expect("pow nonce stream word");
+                let nw = ww[wi].expect("pow nonce wired");
+                [outs[sq[0]][0], outs[sq[0]][1], nw]
+            })
+            .collect();
 
         let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
         let mut to_publish: Vec<(Vec<Wire>, Vec<(Wire, [Wire; 2])>)> = Vec::new();
@@ -6523,6 +6566,11 @@ fn mvp9_boolean_leaf_tape() {
         for w in &level_accs {
             sb.publish(*w);
         }
+        for pp in &pow_pub {
+            for w in pp {
+                sb.publish(*w);
+            }
+        }
         let shape = sb.finish().expect("valid leaf query-phase circuit");
         let hint_refs: Vec<&dyn std::any::Any> =
             hints.iter().map(|h| h as &dyn std::any::Any).collect();
@@ -6530,6 +6578,7 @@ fn mvp9_boolean_leaf_tape() {
 
         // ---- boundary checks: alphas, cap selects, and the enforced sums.
         let total_pub: usize = levels.len()
+            + 3 * pows.len()
             + levels
                 .iter()
                 .zip(&geo)
@@ -6562,6 +6611,31 @@ fn mvp9_boolean_leaf_tape() {
                 *want,
                 "L{li} enforced sum matches the native replica"
             );
+        }
+        let pow_base = at2 + native_sums.len();
+        for (k, pr) in pows.iter().enumerate() {
+            let d0 = built.public[pow_base + 3 * k];
+            let d1 = built.public[pow_base + 3 * k + 1];
+            let nn = built.public[pow_base + 3 * k + 2];
+            let mut digest = [0u8; 32];
+            digest[..8].copy_from_slice(&d0.lo.to_le_bytes());
+            digest[8..16].copy_from_slice(&d0.hi.to_le_bytes());
+            digest[16..24].copy_from_slice(&d1.lo.to_le_bytes());
+            digest[24..].copy_from_slice(&d1.hi.to_le_bytes());
+            assert_eq!(nn.hi, 0, "pow {k}: nonce word zero-padded");
+            if pr.bits == 0 {
+                assert_eq!(nn.lo, 0, "pow {k}: canonical zero nonce");
+            } else {
+                assert!(
+                    flock_core::challenger::pow_has_leading_zero_bits(
+                        &digest,
+                        nn.lo,
+                        pr.bits,
+                        HashKind::Blake3,
+                    ),
+                    "pow {k}: grinding predicate on the published wires"
+                );
+            }
         }
 
         // ---- prove / verify the leaf query-phase circuit ----
