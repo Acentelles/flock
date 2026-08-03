@@ -4008,6 +4008,39 @@ fn mvp7_real_query_phase() {
         assert_eq!(t, fro.anchor.v, "T_m must equal the anchor's claimed v");
     }
 
+    // ---- PoW grinding ops, located on the tape ----
+    // Each Pow op finalizes the chain (the state digest — output wires the
+    // replay already computes) and absorbs one aligned 8-byte nonce word
+    // (a Bytes payload). Record (finalize ordinal, payload ordinal, bits).
+    struct PowRec {
+        fin: usize,
+        pay: usize,
+        bits: u32,
+    }
+    let pows: Vec<PowRec> = {
+        use flock_core::transcript_record::TranscriptOp as Op;
+        let mut out = Vec::new();
+        let (mut fin, mut pay) = (0usize, 0usize);
+        for op in t_shape.ops() {
+            if let Op::Pow { bits } = op {
+                out.push(PowRec {
+                    fin,
+                    pay,
+                    bits: *bits,
+                });
+            }
+            if op.finalizes() {
+                fin += 1;
+            }
+            match op {
+                Op::ObserveBytes(_) | Op::Pow { .. } => pay += 1,
+                _ => {}
+            }
+        }
+        out
+    };
+    assert!(!pows.is_empty(), "the Fast profile grinds");
+
     // Per level: q, c, path depth d-c, lanes — and the native cross-checks
     // that pin every piece of the plumbing before the circuit exists: each
     // opened row verifies against its cap under the recorded challenge, and
@@ -4671,6 +4704,26 @@ fn mvp7_real_query_phase() {
     // 3d: the join — the anchor's folded claim equals the expect.
     let delta_anchor = sb.gate(macslot, &[acl, expect, ow])[0];
 
+    // ---- the PoW bit predicate (boundary pattern) ----
+    // Per Pow op, publish (state-digest words, nonce word): the digest is
+    // the chain finalize's first two output words, the nonce its aligned
+    // stream word. The checker recomputes H(digest ‖ nonce) natively and
+    // applies the leading-zero predicate — the same trust structure as the
+    // alpha expansion and the cap select.
+    let pow_pub: Vec<[Wire; 3]> = pows
+        .iter()
+        .map(|pr| {
+            let sq = &trace.squeezes[pr.fin];
+            let wi = stream
+                .words
+                .iter()
+                .position(|w| matches!(w, flock_core::transcript_record::StreamWord::Bytes { payload, .. } if *payload == pr.pay))
+                .expect("pow nonce stream word");
+            let nw = word_wire[wi].expect("pow nonce wired");
+            [outs[sq[0]][0], outs[sq[0]][1], nw]
+        })
+        .collect();
+
     for (a_wires, opens) in &to_publish {
         for w in a_wires {
             sb.publish(*w);
@@ -4700,6 +4753,11 @@ fn mvp7_real_query_phase() {
     sb.publish(delta_tm);
     sb.publish(delta_rq);
     sb.publish(delta_anchor);
+    for p in &pow_pub {
+        for w in p {
+            sb.publish(*w);
+        }
+    }
     let shape = sb.finish().expect("valid real-query circuit");
     let setup_ms = t.elapsed().as_secs_f64() * 1e3;
 
@@ -4708,26 +4766,48 @@ fn mvp7_real_query_phase() {
     let (built, online_t) = timed(REPS, || shape.run(&vals, &hint_refs));
 
     // ---- the boundary checks ----
-    // The three multipoint zero-deltas sit at the very end of the public
-    // segment: T_m == anchor.v, running_W == q_eval·V, and the anchor's
-    // folded claim == the in-circuit expect.
-    assert_eq!(
-        built.public[built.public.len() - 3],
-        F128::ZERO,
-        "T_m must equal the anchor's claimed v (in-circuit)"
-    );
-    assert_eq!(
-        built.public[built.public.len() - 2],
-        F128::ZERO,
-        "running_W must equal q_eval·V (in-circuit V)"
-    );
-    assert_eq!(
-        built.public[built.public.len() - 1],
-        F128::ZERO,
-        "the anchor's claim must equal the in-circuit expect"
-    );
-    let yr_pub =
-        levels.len() * yr_len + usize::from(closeout) + 1 + piop.zc_rounds.len() + 3 + 3;
+    // The tail publics: three multipoint zero-deltas (T_m == anchor.v,
+    // running_W == q_eval·V, claim == expect), then per-Pow (digest word0,
+    // digest word1, nonce word) triples the checker validates natively.
+    let pow_base = built.public.len() - 3 * pows.len();
+    for (i, off) in [3, 2, 1].into_iter().enumerate() {
+        assert_eq!(
+            built.public[pow_base - off],
+            F128::ZERO,
+            "multipoint zero-delta {i}"
+        );
+    }
+    for (i, pr) in pows.iter().enumerate() {
+        let d0 = built.public[pow_base + 3 * i];
+        let d1 = built.public[pow_base + 3 * i + 1];
+        let nn = built.public[pow_base + 3 * i + 2];
+        let mut digest = [0u8; 32];
+        digest[..8].copy_from_slice(&d0.lo.to_le_bytes());
+        digest[8..16].copy_from_slice(&d0.hi.to_le_bytes());
+        digest[16..24].copy_from_slice(&d1.lo.to_le_bytes());
+        digest[24..].copy_from_slice(&d1.hi.to_le_bytes());
+        assert_eq!(nn.hi, 0, "pow {i}: nonce word is 8 bytes zero-padded");
+        if pr.bits == 0 {
+            assert_eq!(nn.lo, 0, "pow {i}: canonical zero nonce");
+        } else {
+            assert!(
+                flock_core::challenger::pow_has_leading_zero_bits(
+                    &digest,
+                    nn.lo,
+                    pr.bits,
+                    HashKind::Blake3,
+                ),
+                "pow {i}: grinding predicate on the published wires"
+            );
+        }
+    }
+    let yr_pub = levels.len() * yr_len
+        + usize::from(closeout)
+        + 1
+        + piop.zc_rounds.len()
+        + 3
+        + 3
+        + 3 * pows.len();
     let total_pub: usize = 1 + yr_pub
         + levels
             .iter()

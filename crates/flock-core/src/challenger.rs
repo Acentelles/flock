@@ -599,7 +599,10 @@ fn has_leading_zero_bits(h: &[u8], bits: u32) -> bool {
 /// the transcript's own hash keeps the whole protocol resting on one primitive
 /// rather than pulling in a second.
 #[inline]
-fn pow_has_leading_zero_bits(
+/// `pub`: the recursion circuit's boundary checker applies the SAME
+/// predicate to the published (state digest, nonce) wires — sourced from
+/// here so the grinding convention cannot drift.
+pub fn pow_has_leading_zero_bits(
     state_digest: &[u8; 32],
     nonce: u64,
     bits: u32,
