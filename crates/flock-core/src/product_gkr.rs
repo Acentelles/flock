@@ -1085,6 +1085,19 @@ pub fn verify_batched<C: Challenger>(
 /// verifier computes `s_σ(ρ)` itself from `sigma` and uses it in the final
 /// relation instead of trusting `proof.s_sigma_eval` (the recursion / hookup
 /// setting). `sigma.len()` must be `2^mu`.
+/// The sigma table as the F128 vector the verifier's `s_sigma(rho)` is the
+/// MLE of: `s_sig[x] = s_id_vec[sigma[x]]`. `pub` for sigma v2 route B
+/// (circuit-wiring-design.tex §sigma): the accumulator's sigma claims are
+/// MatrixClaims on this vector reshaped `2^nu × 2^c`, and the root
+/// discharge evaluates it once — sourced from here so the encoding cannot
+/// drift from the verifier's.
+pub fn build_s_sigma_vec(mu: usize, sigma: &[usize]) -> Vec<F128> {
+    assert_eq!(sigma.len(), 1usize << mu, "σ length must be 2^mu");
+    let basis = s_id_basis(mu);
+    let s_id_vec = build_s_id_vec(mu, &basis);
+    sigma.iter().map(|&sx| s_id_vec[sx]).collect()
+}
+
 pub fn verify_batched_with_sigma<C: Challenger>(
     mu: usize,
     proof: &ProductGkrBatchedProof,

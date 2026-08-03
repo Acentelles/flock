@@ -392,6 +392,48 @@ pub trait FoldMatrix: Sync {
     fn n_cols(&self) -> usize;
 }
 
+/// A dense column-major matrix over a flat vector: `M[r, c] =
+/// vals[(c << n_rows_log) + r]`. The shape sigma v2 route B folds — the
+/// sigma table over the cell space (`mu = nu + c` bits, cell index
+/// `(col << nu) | row`) reshaped so `s_sigma_hat(rho)` splits as a
+/// MatrixClaim with `row = eq(rho[..nu])`, `col = eq(rho[nu..])`.
+pub struct DenseMatrix {
+    pub vals: Vec<F128>,
+    pub n_rows_log: usize,
+}
+
+impl FoldMatrix for DenseMatrix {
+    fn row_marginal(&self, w: &[F128], n_rows: usize) -> Vec<F128> {
+        assert_eq!(n_rows, 1usize << self.n_rows_log);
+        let mut out = vec![F128::ZERO; n_rows];
+        for (c, &wc) in w.iter().enumerate() {
+            let base = c << self.n_rows_log;
+            for (r, slot) in out.iter_mut().enumerate() {
+                *slot += wc * self.vals[base + r];
+            }
+        }
+        out
+    }
+    fn col_marginal(&self, w: &[F128], n_cols: usize) -> Vec<F128> {
+        let n_rows = 1usize << self.n_rows_log;
+        assert_eq!(self.vals.len(), n_cols << self.n_rows_log);
+        (0..n_cols)
+            .map(|c| {
+                let base = c << self.n_rows_log;
+                (0..n_rows)
+                    .map(|r| w[r] * self.vals[base + r])
+                    .fold(F128::ZERO, |a, x| a + x)
+            })
+            .collect()
+    }
+    fn n_rows(&self) -> usize {
+        1usize << self.n_rows_log
+    }
+    fn n_cols(&self) -> usize {
+        self.vals.len() >> self.n_rows_log
+    }
+}
+
 impl FoldMatrix for SparseBinaryMatrix {
     fn row_marginal(&self, w: &[F128], n_rows: usize) -> Vec<F128> {
         let mut out = vec![F128::ZERO; n_rows];
