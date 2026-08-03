@@ -3225,6 +3225,25 @@ struct OodRec {
     beta_ch: usize,
 }
 
+/// The multipoint region of the merged open, located on the tape (MVP-8):
+/// the group values' absorb, the batching gamma, the two-product sumcheck
+/// rounds, and the anchor assist's `v` + rounds. For a pure-element inner
+/// (R = 0) the RS values are absent and the sumcheck is the single
+/// untwisted product — see docs/multipoint-twisted-assist.tex.
+struct MpRec {
+    /// Value indices of the P group values `B_k` (stream-wireable).
+    val_vs: Vec<usize>,
+    /// The batching gamma squeeze: `(fin, ch)`.
+    gamma_fin: usize,
+    gamma_ch: usize,
+    /// The m two-product sumcheck rounds.
+    rounds: Vec<RoundRec>,
+    /// The anchor's claimed twisted evaluation `v` (value index).
+    anchor_v: usize,
+    /// The anchor's `2(m + 1)` rounds.
+    anchor_rounds: Vec<RoundRec>,
+}
+
 /// One open-phase level, located on a recorded op tape. `*_fin` are finalize
 /// ordinals (indices into `FsChainTrace::squeezes`); `*_ch` index into
 /// `RecordingChallenger::challenges()`.
@@ -3253,11 +3272,12 @@ struct OpenLevel {
 /// cap absorbs, OOD groups, PoW, queries, alpha, beta per level), asserting
 /// each op kind — a config change that moves the shape fails here, loudly,
 /// not as a wrong wire.
+#[allow(clippy::type_complexity)]
 fn parse_open_levels(
     ops: &[flock_core::transcript_record::TranscriptOp],
     cap0_bytes: usize,
     r: usize,
-) -> (usize, PiopRec, Vec<PdRec>, Vec<RoundRec>, InnerPd, usize, Vec<OpenLevel>) {
+) -> (usize, PiopRec, Vec<PdRec>, Vec<RoundRec>, MpRec, InnerPd, usize, Vec<OpenLevel>) {
     use flock_core::transcript_record::TranscriptOp as Op;
     struct Cur<'a> {
         ops: &'a [Op],
@@ -3308,6 +3328,7 @@ fn parse_open_levels(
     let mut cur = Cur { ops, i: 0, fin: 0, ch: 0, v: 0 };
     let mut gammas: Vec<PdRec> = Vec::new();
     let mut rounds: Vec<RoundRec> = Vec::new();
+    let mut mp: Option<MpRec> = None;
     let mut inner_pd: Option<InnerPd> = None;
     let mut piop: Option<PiopRec> = None;
     let mut in_pd = false;
@@ -3402,6 +3423,65 @@ fn parse_open_levels(
             }
             continue;
         }
+        if matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == b"flock-multipoint-twisted-v1") {
+            // The multipoint region: P group-value absorbs, the batching
+            // gamma, m two-product rounds, then the anchor's label + v +
+            // 2(m + 1) rounds. Each loop terminates on the next label /
+            // squeeze, so a shape change fails loudly here.
+            cur.bump();
+            let mut val_vs = Vec::new();
+            while matches!(ops[cur.i], Op::ObserveScalar) {
+                val_vs.push(cur.v);
+                cur.bump();
+            }
+            assert!(matches!(ops[cur.i], Op::SqueezeScalar), "multipoint gamma");
+            let (gamma_fin, gamma_ch) = (cur.fin, cur.ch);
+            cur.bump();
+            let mut mp_rounds = Vec::new();
+            while matches!(ops[cur.i], Op::ObserveScalar) {
+                let g_v = cur.v;
+                cur.expect_obs_scalar();
+                cur.expect_obs_scalar();
+                assert!(matches!(ops[cur.i], Op::SqueezeScalar), "multipoint round");
+                mp_rounds.push(RoundRec {
+                    g_v,
+                    fin: cur.fin,
+                    ch: cur.ch,
+                });
+                cur.bump();
+            }
+            assert!(
+                matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == b"flock-frobenius-assist-v0"),
+                "op {}: expected the anchor label, got {:?}",
+                cur.i,
+                ops[cur.i]
+            );
+            cur.bump();
+            let anchor_v = cur.v;
+            cur.expect_obs_scalar();
+            let mut anchor_rounds = Vec::new();
+            while matches!(ops[cur.i], Op::ObserveScalar) {
+                let g_v = cur.v;
+                cur.expect_obs_scalar();
+                cur.expect_obs_scalar();
+                assert!(matches!(ops[cur.i], Op::SqueezeScalar), "anchor round");
+                anchor_rounds.push(RoundRec {
+                    g_v,
+                    fin: cur.fin,
+                    ch: cur.ch,
+                });
+                cur.bump();
+            }
+            mp = Some(MpRec {
+                val_vs,
+                gamma_fin,
+                gamma_ch,
+                rounds: mp_rounds,
+                anchor_v,
+                anchor_rounds,
+            });
+            continue;
+        }
         if matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == b"flock-pcs-packed-direct-v0") {
             cur.bump();
             let q_v = cur.v;
@@ -3418,6 +3498,7 @@ fn parse_open_levels(
         cur.bump();
     }
     let inner_pd = inner_pd.expect("the inner ligerito intake");
+    let mp = mp.expect("the multipoint region");
     cur.bump(); // the open-phase initial cap absorb
     let start_v = cur.v;
     cur.expect_obs_scalar(); // sumcheck start msg u_0
@@ -3537,6 +3618,7 @@ fn parse_open_levels(
         piop.expect("the element PIOP"),
         gammas,
         rounds,
+        mp,
         inner_pd,
         yr_v,
         levels,
@@ -3709,9 +3791,60 @@ fn mvp7_real_query_phase() {
             }
         })
         .collect();
-    let (start_v, piop, gammas, w_rounds, inner_pd, yr_v, levels) =
+    let (start_v, piop, gammas, w_rounds, mp, inner_pd, yr_v, levels) =
         parse_open_levels(t_shape.ops(), 32 * lig.initial_cap.len(), r);
     assert_eq!(levels.len(), r + 1);
+
+    // The multipoint region, validated field-for-field against the proof:
+    // the located stream words ARE the proof's group values / round
+    // messages / anchor transcript, in order — so the wires the MVP-8
+    // assembly reads are the scalars the native verifier consumed. R = 0
+    // for this pure-element inner: no RS values exist.
+    {
+        let fro = &proof.pcs_open.frobenius;
+        let vals_rec = rec.values();
+        assert!(fro.values.is_empty(), "pure-element inner has R = 0");
+        assert_eq!(mp.val_vs.len(), fro.group_values.len(), "group value count");
+        for (vi, want) in mp.val_vs.iter().zip(&fro.group_values) {
+            assert_eq!(vals_rec[*vi], *want, "group value stream word");
+        }
+        assert_eq!(mp.rounds.len(), fro.rounds.len(), "two-product round count");
+        for (rr, want) in mp.rounds.iter().zip(&fro.rounds) {
+            assert_eq!((vals_rec[rr.g_v], vals_rec[rr.g_v + 1]), *want, "mp round msg");
+        }
+        assert_eq!(vals_rec[mp.anchor_v], fro.anchor.v, "anchor v stream word");
+        assert_eq!(
+            mp.anchor_rounds.len(),
+            fro.anchor.rounds.len(),
+            "anchor round count"
+        );
+        for (rr, want) in mp.anchor_rounds.iter().zip(&fro.anchor.rounds) {
+            assert_eq!(
+                (vals_rec[rr.g_v], vals_rec[rr.g_v + 1]),
+                *want,
+                "anchor round msg"
+            );
+        }
+        // The native accept relations, replayed from the located pieces:
+        // T0 = sum gamma^k B_k folds through the rounds to T_m == anchor.v,
+        // and the anchor.v folds through its rounds to the expect the DP
+        // gates will compute. This is the exact statement the in-circuit
+        // assembly must publish as zero-deltas.
+        let gamma = chals[mp.gamma_ch];
+        let mut t = F128::ZERO;
+        let mut pw = F128::ONE;
+        for &vi in &mp.val_vs {
+            t += pw * vals_rec[vi];
+            pw *= gamma;
+        }
+        for rr in &mp.rounds {
+            let (g1, gi) = (vals_rec[rr.g_v], vals_rec[rr.g_v + 1]);
+            let r = chals[rr.ch];
+            let g0 = t + g1;
+            t = g0 + (g1 + g0 + gi) * r + gi * r * r;
+        }
+        assert_eq!(t, fro.anchor.v, "T_m must equal the anchor's claimed v");
+    }
 
     // Per level: q, c, path depth d-c, lanes — and the native cross-checks
     // that pin every piece of the plumbing before the circuit exists: each
