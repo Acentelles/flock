@@ -3808,14 +3808,26 @@ fn mvp7_real_query_phase() {
         }),
     };
     let mut leaf_slot: Vec<(usize, flock_core::circuit::builder::SlotId)> = Vec::new();
+    // ONE 8-lane leaf-eval type serves every level: a 64-lane leaf is 8
+    // CHAINED rows, row h taking lanes [8h, 8h+8) with alpha input
+    // `alpha_k·eq(v[3..], h)` — the same boundary-expanded-public pattern
+    // alpha itself rides — because `y_64 = Σ_h eq(v[3..], h)·y_8(group h)`
+    // (split the lane index at bit 3; build_eq_table is LSB-first). This
+    // deletes the kappa-8 slot: 2^21 element-region words (27% of the
+    // region) and a 73-word schema from the cell space. The high v wires
+    // stay bound through the residual/prefix gates, which consume every
+    // level's fold wires.
     let leafeval: Vec<_> = geo
         .iter()
-        .map(|g| match leaf_slot.iter().find(|(n, _)| *n == g.lanes) {
-            Some((_, s)) => *s,
-            None => {
-                let s = sb.slot(LeafEvalGate::new(g.lanes));
-                leaf_slot.push((g.lanes, s));
-                s
+        .map(|g| {
+            let lanes = g.lanes.min(8);
+            match leaf_slot.iter().find(|(n, _)| *n == lanes) {
+                Some((_, s)) => *s,
+                None => {
+                    let s = sb.slot(LeafEvalGate::new(lanes));
+                    leaf_slot.push((lanes, s));
+                    s
+                }
             }
         })
         .collect();
@@ -3863,6 +3875,14 @@ fn mvp7_real_query_phase() {
             .collect();
         let alpha_vals: Vec<F128> = (0..lvl.a_count).map(|j| chals[lvl.a_ch + j]).collect();
         let aw = build_eq_table(&alpha_vals);
+        // The hi-group weights of the leaf-eval split: eq over the native
+        // values of the fold challenges past the 8-lane gate's three.
+        let le_vars = g.lanes.min(8).trailing_zeros() as usize;
+        let le_groups = g.lanes >> le_vars;
+        let hw = {
+            let v_hi: Vec<F128> = lvl.fold_chs[le_vars..].iter().map(|&i| chals[i]).collect();
+            build_eq_table(&v_hi)
+        };
         vals.push(F128::ZERO);
         let mut acc = sb.public_input();
         let mut opens: Vec<(Wire, [Wire; 2])> = Vec::with_capacity(g.q);
@@ -3877,12 +3897,15 @@ fn mvp7_real_query_phase() {
                     .iter()
                     .map(hash_to_digest),
             );
-            let mut a_in = leaf_w;
-            a_in.extend_from_slice(&v_wires);
-            vals.push(aw[k]);
-            a_in.push(sb.public_input());
-            a_in.push(acc);
-            acc = sb.gate(leafeval[li], &a_in)[0];
+            let lanes = g.lanes.min(8);
+            for h in 0..le_groups {
+                let mut a_in: Vec<Wire> = leaf_w[lanes * h..lanes * (h + 1)].to_vec();
+                a_in.extend_from_slice(&v_wires[..le_vars]);
+                vals.push(aw[k] * hw[h]);
+                a_in.push(sb.public_input());
+                a_in.push(acc);
+                acc = sb.gate(leafeval[li], &a_in)[0];
+            }
         }
         to_publish.push((a_wires, opens));
         level_accs.push(acc);
