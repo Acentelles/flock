@@ -6200,7 +6200,7 @@ fn mvp9_boolean_leaf_tape() {
         prover::prove_fast_ligerito_union(&union, &leaf_pcs, vec![slot], &mut ch);
 
     let mut rec = RecordingChallenger::new(FsChallenger::with_hash(DOMAIN, HashKind::Blake3));
-    verifier::verify_ligerito_union(
+    let native_claims = verifier::verify_ligerito_union(
         &union,
         &[circuit],
         &commitment,
@@ -7041,6 +7041,10 @@ fn mvp9_boolean_leaf_tape() {
         leaf_slot.push((500, zslot));
         let mut zrw = seed_w;
         let mut zc_deltas2: Vec<Wire> = Vec::new();
+        // The eq-weight wires, kept in round order: they are exactly the
+        // zerocheck's r_rest — the c claim's point — which the anchor
+        // expect consumes below.
+        let mut zc_t_w: Vec<Wire> = Vec::new();
         for (k2, &(g_v, _, fin)) in zc_rounds2.iter().enumerate() {
             let t_w = if k2 < 7 {
                 vals.push(t_vals[k2]);
@@ -7050,6 +7054,7 @@ fn mvp9_boolean_leaf_tape() {
                 let sq = &trace.squeezes[outer_fin];
                 outs[sq[j / 4]][j % 4]
             };
+            zc_t_w.push(t_w);
             let rho_w = outs[trace.squeezes[fin][0]][0];
             vals.push(g0_native[k2]);
             let g0w = sb.public_input();
@@ -7209,7 +7214,7 @@ fn mvp9_boolean_leaf_tape() {
         // rounds folded to an endpoint checked against the native replay.
         // The anchor EXPECT (RS statements, ĝ closed form) stays
         // checker-native with the family-H batch.
-        let (mp_gamma_fin, mp_rounds3, mp_anchor_v, mp_anchor_rounds3) = {
+        let (mp_gamma_ch, mp_gamma_fin, mp_rounds3, mp_anchor_v, mp_anchor_rounds3) = {
             use flock_core::transcript_record::TranscriptOp as Op5;
             let ops3 = t_shape.ops();
             let (mut v3, mut c3, mut f3, mut i3) = (0usize, 0usize, 0usize, 0usize);
@@ -7235,7 +7240,7 @@ fn mvp9_boolean_leaf_tape() {
                 bump3(&ops3[i3], &mut v3, &mut c3, &mut f3);
                 i3 += 1;
             }
-            let gfin = f3;
+            let (gch, gfin) = (c3, f3);
             bump3(&ops3[i3], &mut v3, &mut c3, &mut f3);
             i3 += 1;
             let mut rds = Vec::new();
@@ -7268,26 +7273,32 @@ fn mvp9_boolean_leaf_tape() {
                 ards.push((g_v, ch, fin));
                 i3 += 3;
             }
-            (gfin, rds, av, ards)
+            (gch, gfin, rds, av, ards)
         };
         let mp_gamma_w = outs[trace.squeezes[mp_gamma_fin][0]][0];
         let mut mp_t0 = zw;
         let mut mp_pw = ow;
+        let mut mp_pws: Vec<Wire> = vec![ow];
         for (k3, &vi) in val_vs.iter().enumerate() {
             mp_t0 = sb.gate(spine, &[zw, zw, zw, mp_t0, zw, zw, wv(vi), mp_pw, zw])[3];
             if k3 + 1 < val_vs.len() {
                 mp_pw = sb.gate(spine, &[zw, zw, zw, zw, zw, zw, mp_pw, mp_gamma_w, zw])[3];
+                mp_pws.push(mp_pw);
             }
         }
         let mut mp_tm = mp_t0;
+        let mut mp_rho2_w: Vec<Wire> = Vec::new();
         for &(g_v, _, fin) in &mp_rounds3 {
             let r_w = outs[trace.squeezes[fin][0]][0];
+            mp_rho2_w.push(r_w);
             mp_tm = sb.gate(mrslot, &[mp_tm, wv(g_v), wv(g_v + 1), r_w])[0];
         }
         let mp_delta = sb.gate(spine, &[zw, zw, zw, mp_tm, zw, zw, wv(mp_anchor_v), ow, zw])[3];
         let mut anc = wv(mp_anchor_v);
+        let mut mp_sig_w: Vec<Wire> = Vec::new();
         for &(g_v, _, fin) in &mp_anchor_rounds3 {
             let r_w = outs[trace.squeezes[fin][0]][0];
+            mp_sig_w.push(r_w);
             anc = sb.gate(mrslot, &[anc, wv(g_v), wv(g_v + 1), r_w])[0];
         }
         let anc_end_native = {
@@ -7300,6 +7311,294 @@ fn mvp9_boolean_leaf_tape() {
             }
             t
         };
+
+        // ---- the R=2 anchor EXPECT in-circuit (family-H pass, item 2) ----
+        // The anchor's accept `claim == expect` becomes a published
+        // zero-delta: expect = Σ_i γ^{128·i}·ĝ(ρ″)·(w_i·DP_i) over the two
+        // RS statements (P = 0 at the leaf; each RS anchor claim has only
+        // c[0] ≠ 0, so the singleton statements sit at the UNSQUARED claim
+        // points). ĝ(ρ″) = Σ_j γ^j·eq(ρ^{2^-j}, ρ″), with the
+        // inverse-Frobenius points as ADVICE bound by forward squaring
+        // deltas y·y + prev = 0 (squaring is a bijection in char 2, so the
+        // deltas pin the advice exactly — no checker item); every eq
+        // product rides the existing prefix slot (char-2 eq factors are
+        // affine, zw-padded pairs contribute 1); the DP is AssistLayerGate.
+        let m_mp2 = mp_rounds3.len();
+        assert_eq!(mp_sig_w.len(), 2 * (m_mp2 + 1), "sigma spans the anchor layers");
+        assert_eq!(w_rounds.len(), m_mp2, "merged rho spans the dense domain");
+        let n_log_i = union.n_log();
+        let params_i = flock_core::pcs::jagged::JaggedParams::from_heights(
+            &union.jagged_heights(),
+            n_log_i,
+            m_mp2,
+        );
+        let k_cols_i = params_i.k;
+        let bounds_i = flock_core::pcs::jagged::assist_boundaries(&params_i);
+        let n_runs = bounds_i.len();
+        let has_tail = bounds_i[n_runs - 1].0 == bounds_i[n_runs - 1].1;
+        let n_single = if has_tail { n_runs - 1 } else { n_runs };
+        for &(_, _, len) in &bounds_i[..n_single] {
+            assert_eq!(len, 1, "used columns are singleton runs");
+        }
+
+        // The statements' points, as (native value, wire) pairs pinned
+        // against the native claims: ab = [lc r0 | zc mlv[1..1+ν] | lc
+        // r1..], c = r_rest = [7 ghash weights | r_outer] verbatim.
+        let mlv_pw: Vec<(F128, Wire)> = zc_rounds2
+            .iter()
+            .map(|&(_, ch, fin)| (chals[ch], outs[trace.squeezes[fin][0]][0]))
+            .collect();
+        // The lincheck binds the TOP bit each round, so r_inner_rest is its
+        // round challenges REVERSED (LSB-first address order).
+        let lc_pw: Vec<(F128, Wire)> = lc_rounds2
+            .iter()
+            .rev()
+            .map(|&(_, ch, fin)| (chals[ch], outs[trace.squeezes[fin][0]][0]))
+            .collect();
+        assert_eq!(lc_pw.len(), 1 + k_cols_i, "lc rounds = 1 + col bits");
+        let mut xab_pw: Vec<(F128, Wire)> = vec![lc_pw[0]];
+        xab_pw.extend_from_slice(&mlv_pw[1..1 + n_log_i]);
+        xab_pw.extend_from_slice(&lc_pw[1..]);
+        let mut xc_pw: Vec<(F128, Wire)> = Vec::new();
+        for (k2, &tw2) in zc_t_w.iter().enumerate() {
+            let nv = if k2 < 7 {
+                t_vals[k2]
+            } else {
+                chals[outer_ch + (k2 - 7)]
+            };
+            xc_pw.push((nv, tw2));
+        }
+        let x_ab_n: Vec<F128> = {
+            let p = &native_claims.ab.point;
+            let mut v = p.x_inner_rest.clone();
+            v.extend_from_slice(&p.x_outer);
+            v
+        };
+        let x_c_n: Vec<F128> = {
+            let p = &native_claims.c.point;
+            let mut v = p.x_inner_rest.clone();
+            v.extend_from_slice(&p.x_outer);
+            v
+        };
+        assert_eq!(x_ab_n.len(), 1 + n_log_i + k_cols_i, "ab point split");
+        assert_eq!(x_c_n.len(), 1 + n_log_i + k_cols_i, "c point split");
+        for (i2, (&(nv, _), &xn)) in xab_pw.iter().zip(&x_ab_n).enumerate() {
+            assert_eq!(nv, xn, "ab point coord {i2} is the located wire");
+        }
+        for (i2, (&(nv, _), &xn)) in xc_pw.iter().zip(&x_c_n).enumerate() {
+            assert_eq!(nv, xn, "c point coord {i2} is the located wire");
+        }
+
+        // Native replica of the whole expect — validates the formula
+        // against the accepted proof before any gate exists.
+        let frob_inv_native = |x: F128| {
+            let mut y = x;
+            for _ in 0..127 {
+                y = y * y;
+            }
+            y
+        };
+        let gamma_n = chals[mp_gamma_ch];
+        let mut gpow_n = vec![F128::ONE];
+        for j in 1..129 {
+            gpow_n.push(gpow_n[j - 1] * gamma_n);
+        }
+        let rho_mrg_n: Vec<F128> = w_rounds.iter().map(|rr| chals[rr.ch]).collect();
+        let point_n: Vec<F128> = mp_rounds3.iter().map(|&(_, ch, _)| chals[ch]).collect();
+        let sig_n: Vec<F128> = mp_anchor_rounds3
+            .iter()
+            .map(|&(_, ch, _)| chals[ch])
+            .collect();
+        let bit = |b: bool| if b { F128::ONE } else { F128::ZERO };
+        let g_at_n = {
+            let mut rinv = rho_mrg_n.clone();
+            let mut acc = F128::ZERO;
+            for (j, &gp) in gpow_n.iter().enumerate().take(128) {
+                if j > 0 {
+                    for x in rinv.iter_mut() {
+                        *x = frob_inv_native(*x);
+                    }
+                }
+                let mut prod = gp;
+                for (t2, &x) in point_n.iter().enumerate() {
+                    prod *= F128::ONE + rinv[t2] + x;
+                }
+                acc += prod;
+            }
+            acc
+        };
+        let eqc_n: Vec<F128> = bounds_i
+            .iter()
+            .map(|&(t_c, t_next, _)| {
+                let mut p = F128::ONE;
+                for l in 0..=m_mp2 {
+                    p *= F128::ONE + sig_n[2 * l] + bit((t_c >> l) & 1 == 1);
+                    p *= F128::ONE + sig_n[2 * l + 1] + bit((t_next >> l) & 1 == 1);
+                }
+                p
+            })
+            .collect();
+        let expect_n = {
+            let sparse = flock_core::pcs::jagged::assist_sparse_transitions();
+            let mut acc = F128::ZERO;
+            for (si, xs) in [&x_ab_n, &x_c_n].iter().enumerate() {
+                let z_row = &xs[1..1 + n_log_i];
+                let z_col = &xs[1 + n_log_i..];
+                let mut run_n = vec![F128::ZERO; n_runs];
+                let mut tail = F128::ONE;
+                for (r, slot2) in run_n.iter_mut().take(n_single).enumerate() {
+                    let mut s = F128::ONE;
+                    for (jj, &zc) in z_col.iter().enumerate() {
+                        s *= F128::ONE + zc + bit((r >> jj) & 1 == 1);
+                    }
+                    *slot2 = s;
+                    tail += s;
+                }
+                if has_tail {
+                    run_n[n_runs - 1] = tail;
+                }
+                let w_n = run_n
+                    .iter()
+                    .zip(&eqc_n)
+                    .fold(F128::ZERO, |a, (&x, &e)| a + x * e);
+                let mut g = [F128::ZERO; 4];
+                g[flock_core::pcs::jagged::STATE_SUCCESS] = F128::ONE;
+                for layer in (0..=m_mp2).rev() {
+                    let za = if layer < n_log_i { z_row[layer] } else { F128::ZERO };
+                    let rb = if layer < m_mp2 { point_n[layer] } else { F128::ZERO };
+                    let eq4 = build_eq_table(&[za, rb]);
+                    let (rc, rd) = (sig_n[2 * layer], sig_n[2 * layer + 1]);
+                    let e = [
+                        (F128::ONE + rc) * (F128::ONE + rd),
+                        rc * (F128::ONE + rd),
+                        (F128::ONE + rc) * rd,
+                        rc * rd,
+                    ];
+                    let mut prev = [F128::ZERO; 4];
+                    for (cd, &ecd) in e.iter().enumerate() {
+                        for (s2, slot2) in prev.iter_mut().enumerate() {
+                            let (i0, o0) = sparse[cd][s2][0];
+                            let (i1, o1) = sparse[cd][s2][1];
+                            *slot2 += ecd * (eq4[i0] * g[o0] + eq4[i1] * g[o1]);
+                        }
+                    }
+                    g = prev;
+                }
+                let coeff = if si == 0 { g_at_n } else { gpow_n[128] * g_at_n };
+                acc += coeff * (w_n * g[flock_core::pcs::jagged::STATE_INITIAL]);
+            }
+            acc
+        };
+        assert_eq!(
+            expect_n, anc_end_native,
+            "the R=2 anchor expect replays natively"
+        );
+
+        // The circuit side. Advice square-root chains for rho^(2^-j).
+        let prefix_product = |sb: &mut ShapeBuilder, factors: &[(Wire, Wire)]| -> Wire {
+            let mut seed = ow;
+            for chunk in factors.chunks(pl_full) {
+                let mut g_in = vec![seed];
+                for (a, _) in chunk {
+                    g_in.push(*a);
+                }
+                g_in.extend(std::iter::repeat_n(zw, pl_full - chunk.len()));
+                for (_, b) in chunk {
+                    g_in.push(*b);
+                }
+                g_in.extend(std::iter::repeat_n(zw, pl_full - chunk.len()));
+                g_in.push(ow);
+                seed = sb.gate(pfslot2, &g_in)[0];
+            }
+            seed
+        };
+        let mut rinv_n: Vec<F128> = rho_mrg_n.clone();
+        let mut rinv_w: Vec<Wire> = w_rounds
+            .iter()
+            .map(|rr| outs[trace.squeezes[rr.fin][0]][0])
+            .collect();
+        let mut sqrt_deltas: Vec<Wire> = Vec::new();
+        let mut ghat = zw;
+        for j in 0..128 {
+            if j > 0 {
+                let mut lvl_w = Vec::with_capacity(m_mp2);
+                for t2 in 0..m_mp2 {
+                    let y = frob_inv_native(rinv_n[t2]);
+                    rinv_n[t2] = y;
+                    vals.push(y);
+                    let yw = sb.public_input();
+                    sqrt_deltas
+                        .push(sb.gate(spine, &[zw, zw, zw, rinv_w[t2], zw, zw, yw, yw, zw])[3]);
+                    lvl_w.push(yw);
+                }
+                rinv_w = lvl_w;
+            }
+            let factors: Vec<(Wire, Wire)> = rinv_w
+                .iter()
+                .copied()
+                .zip(mp_rho2_w.iter().copied())
+                .collect();
+            let eqj = prefix_product(&mut sb, &factors);
+            ghat = sb.gate(spine, &[zw, zw, zw, ghat, zw, zw, mp_pws[j], eqj, zw])[3];
+        }
+        // Per-run boundary eq products at sigma (statement-independent).
+        let eqc_w: Vec<Wire> = bounds_i
+            .iter()
+            .map(|&(t_c, t_next, _)| {
+                let mut factors = Vec::with_capacity(2 * (m_mp2 + 1));
+                for l in 0..=m_mp2 {
+                    factors.push((mp_sig_w[2 * l], if (t_c >> l) & 1 == 1 { ow } else { zw }));
+                    factors
+                        .push((mp_sig_w[2 * l + 1], if (t_next >> l) & 1 == 1 { ow } else { zw }));
+                }
+                prefix_product(&mut sb, &factors)
+            })
+            .collect();
+        // Per statement: run weights, the w dot, the DP, the coefficient.
+        let alslot = sb.slot(AssistLayerGate::new());
+        leaf_slot.push((601, alslot));
+        let mut expect_w = zw;
+        for (si, xs) in [&xab_pw, &xc_pw].iter().enumerate() {
+            let z_row_w: Vec<Wire> = xs[1..1 + n_log_i].iter().map(|&(_, w)| w).collect();
+            let z_col_w: Vec<Wire> = xs[1 + n_log_i..].iter().map(|&(_, w)| w).collect();
+            let mut run_w: Vec<Wire> = vec![zw; n_runs];
+            let mut tail_w = ow;
+            for (r, slot2) in run_w.iter_mut().take(n_single).enumerate() {
+                let factors: Vec<(Wire, Wire)> = z_col_w
+                    .iter()
+                    .enumerate()
+                    .map(|(jj, &zc)| (zc, if (r >> jj) & 1 == 1 { ow } else { zw }))
+                    .collect();
+                let s = prefix_product(&mut sb, &factors);
+                *slot2 = s;
+                tail_w = sb.gate(spine, &[zw, zw, zw, tail_w, zw, zw, s, ow, zw])[3];
+            }
+            if has_tail {
+                run_w[n_runs - 1] = tail_w;
+            }
+            let mut w_st = zw;
+            for (r, &rw) in run_w.iter().enumerate() {
+                w_st = sb.gate(spine, &[zw, zw, zw, w_st, zw, zw, rw, eqc_w[r], zw])[3];
+            }
+            let mut g = [zw, zw, ow, zw]; // STATE_SUCCESS seed
+            for layer in (0..=m_mp2).rev() {
+                let za = if layer < n_log_i { z_row_w[layer] } else { zw };
+                let rb = if layer < m_mp2 { mp_rho2_w[layer] } else { zw };
+                let mut a_in = g.to_vec();
+                a_in.extend_from_slice(&[za, rb, mp_sig_w[2 * layer], mp_sig_w[2 * layer + 1], ow]);
+                let o = sb.gate(alslot, &a_in);
+                g = [o[0], o[1], o[2], o[3]];
+            }
+            let coeff = if si == 0 {
+                ghat
+            } else {
+                sb.gate(spine, &[zw, zw, zw, zw, zw, zw, mp_pws[128], ghat, zw])[3]
+            };
+            let wd = sb.gate(spine, &[zw, zw, zw, zw, zw, zw, w_st, g[0], zw])[3];
+            expect_w = sb.gate(spine, &[zw, zw, zw, expect_w, zw, zw, coeff, wd, zw])[3];
+        }
+        // The join: the anchor's folded claim equals the in-circuit expect.
+        let anchor_delta2 = sb.gate(spine, &[zw, zw, zw, anc, zw, zw, expect_w, ow, zw])[3];
 
         // ---- MatrixAssertion emission ----
         // The deferred matrix work exits as bound publics: alpha and the
@@ -7357,12 +7656,29 @@ fn mvp9_boolean_leaf_tape() {
         for w in &assert_pub {
             sb.publish(*w);
         }
+        for d in &sqrt_deltas {
+            sb.publish(*d);
+        }
+        sb.publish(anchor_delta2);
         let shape = sb.finish().expect("valid leaf query-phase circuit");
         let hint_refs: Vec<&dyn std::any::Any> =
             hints.iter().map(|h| h as &dyn std::any::Any).collect();
         let built = shape.run(&vals, &hint_refs);
 
         // ---- boundary checks: alphas, cap selects, and the enforced sums.
+        // The anchor-expect tail (sqrt-chain deltas + the claim==expect
+        // delta) is appended after everything else; `plen` is the public
+        // length BEFORE it, so every older from-the-end offset holds.
+        let n_anchor_tail = sqrt_deltas.len() + 1;
+        let plen = built.public.len() - n_anchor_tail;
+        for (k5, d) in built.public[plen..plen + sqrt_deltas.len()].iter().enumerate() {
+            assert_eq!(*d, F128::ZERO, "sqrt-chain delta {k5}");
+        }
+        assert_eq!(
+            *built.public.last().unwrap(),
+            F128::ZERO,
+            "the anchor claim == expect zero-delta"
+        );
         let n_assert_pub = 1 + lc_rounds2.len() + 2 * proof.lincheck.matrix_evals.len();
         let total_pub: usize = levels.len()
             + levels.len() * yr_len
@@ -7377,7 +7693,7 @@ fn mvp9_boolean_leaf_tape() {
                 .zip(&geo)
                 .map(|(l, g)| l.a_count + 3 * g.q)
                 .sum::<usize>();
-        let mut at2 = built.public.len() - total_pub;
+        let mut at2 = plen - total_pub;
         for (li, lvl) in levels.iter().enumerate() {
             let g = &geo[li];
             let (cap, _, _) = lvl_src[li];
@@ -7503,7 +7819,7 @@ fn mvp9_boolean_leaf_tape() {
             let zc_tail2 = n_assert_pub + 6 + zc_rounds2.len();
             assert_eq!(
                 built.public[at3],
-                built.public[built.public.len() - zc_tail2 - 1],
+                built.public[plen - zc_tail2 - 1],
                 "inner == t_r: the leaf statement closes"
             );
         }
@@ -7534,7 +7850,7 @@ fn mvp9_boolean_leaf_tape() {
         }
         // Tail order: [.., zc_end, lc_end, mp_delta, anc, assertion fields].
         {
-            let base = built.public.len() - n_assert_pub;
+            let base = plen - n_assert_pub;
             assert_eq!(built.public[base], chals[alpha_ch2], "assertion alpha");
             for (k4, &(_, ch, _)) in lc_rounds2.iter().enumerate() {
                 assert_eq!(built.public[base + 1 + k4], chals[ch], "assertion r {k4}");
@@ -7545,7 +7861,7 @@ fn mvp9_boolean_leaf_tape() {
                 assert_eq!(built.public[me_base + 2 * k4 + 1], b, "matrix eval b {k4}");
             }
         }
-        let tail0 = built.public.len() - n_assert_pub;
+        let tail0 = plen - n_assert_pub;
         assert_eq!(
             built.public[tail0 - 2],
             F128::ZERO,
@@ -7563,18 +7879,18 @@ fn mvp9_boolean_leaf_tape() {
         );
         let zc_tail = n_assert_pub + 6 + zc_rounds2.len();
         assert_eq!(
-            built.public[built.public.len() - zc_tail],
+            built.public[plen - zc_tail],
             proof.zerocheck.final_c_eval,
             "the skip interpolation binds final_c_eval"
         );
         assert_eq!(
-            built.public[built.public.len() - zc_tail + 1],
+            built.public[plen - zc_tail + 1],
             zc_seed,
             "the in-circuit skip seed equals the native interpolation"
         );
         for k2 in 0..zc_rounds2.len() {
             assert_eq!(
-                built.public[built.public.len() - zc_tail + 2 + k2],
+                built.public[plen - zc_tail + 2 + k2],
                 F128::ZERO,
                 "zc delta {k2}"
             );
@@ -7587,12 +7903,12 @@ fn mvp9_boolean_leaf_tape() {
         // The intake boundary: the advice target and the in-circuit
         // running, both checker-validated against the native replay.
         assert_eq!(
-            built.public[built.public.len() - zc_tail - 3],
+            built.public[plen - zc_tail - 3],
             native_target,
             "the RS target advice is the native gamma-combination"
         );
         assert_eq!(
-            built.public[built.public.len() - zc_tail - 2],
+            built.public[plen - zc_tail - 2],
             native_running,
             "the W-rounds fold the target to the native running claim"
         );
@@ -7625,7 +7941,7 @@ fn mvp9_boolean_leaf_tape() {
                 }
             }
             assert_eq!(
-                built.public[built.public.len() - zc_tail - 1],
+                built.public[plen - zc_tail - 1],
                 nt,
                 "the spine's final t_r matches the native replay"
             );
