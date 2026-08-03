@@ -2629,6 +2629,360 @@ fn sk_at_vks(log_n: usize) -> Vec<F128> {
     sks
 }
 
+/// 2b stage 2, split into kappa<=6 gates (kappa=7 breaks the union's
+/// column-split): PrefixGate computes `seed * prod_j (1 + a_j + b_j)` — the
+/// char-2 eq prefix of a packed-direct claim (seed = gamma, a = point,
+/// b = fold challenges) or an OOD claim (seed = beta, a = z). SuffixGate
+/// tensors the point's tail over the 2^yr binary positions and accumulates;
+/// PartialCombineGate folds `beta * resid` into the running combined vector;
+/// FinalDotGate dots against the absorbed yr words.
+struct PrefixGate {
+    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+    pl: usize,
+    n_in: usize,
+    k: usize,
+}
+
+impl PrefixGate {
+    fn new(pl: usize) -> Self {
+        use flock_core::element_r1cs::ElementTableBuilder;
+        let o = F128::ONE;
+        let n_in = 2 + 2 * pl; // seed, a[pl], b[pl], one
+        let one = n_in - 1;
+        let mut c = n_in;
+        let mut bl = ElementTableBuilder::new(6);
+        for w in 0..n_in {
+            bl.free_wire(w);
+        }
+        let mut pr = 0;
+        for j in 0..pl {
+            bl.linear(c, &[(one, o), (1 + j, o), (1 + pl + j, o)]);
+            c += 1;
+            bl.mult(c, pr, c - 1);
+            pr = c;
+            c += 1;
+        }
+        assert!(c <= 64, "prefix gate spills ({c})");
+        Self {
+            ty: std::sync::Arc::new(bl.build().expect("prefix gate")),
+            pl,
+            n_in,
+            k: c,
+        }
+    }
+}
+
+impl GateType for PrefixGate {
+    type Row = Vec<F128>;
+    type Hint = ();
+    fn table(&self) -> TableType {
+        use flock_core::schedule::IoWord;
+        let mut schema: Vec<IoWord> = (0..self.n_in).map(IoWord::input).collect();
+        schema.push(IoWord::output(self.k - 1));
+        TableType::element(self.ty.clone()).with_io_schema(schema)
+    }
+    fn eval(&self, inputs: &[F128], _h: &()) -> (Vec<F128>, Self::Row) {
+        let mut z = vec![F128::ZERO; self.k];
+        z[..self.n_in].copy_from_slice(&inputs[..self.n_in]);
+        let mut c = self.n_in;
+        let mut pr = z[0];
+        for j in 0..self.pl {
+            z[c] = F128::ONE + z[1 + j] + z[1 + self.pl + j];
+            c += 1;
+            z[c] = pr * z[c - 1];
+            pr = z[c];
+            c += 1;
+        }
+        (vec![pr], z)
+    }
+    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
+        let mut z = vec![F128::ZERO; self.ty.width() << nu];
+        for (j, row) in rows.iter().enumerate() {
+            for (col, &v) in row.iter().enumerate() {
+                z[(col << nu) + j] = v;
+            }
+        }
+        SlotWitness::Element(z)
+    }
+}
+
+struct SuffixGate {
+    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+    acc_out: Vec<usize>,
+    yl: usize,
+    n_in: usize,
+    k: usize,
+}
+
+impl SuffixGate {
+    fn new(yl: usize) -> Self {
+        use flock_core::element_r1cs::ElementTableBuilder;
+        let o = F128::ONE;
+        let yr = 1usize << yl;
+        let n_in = 2 + yl + yr; // p, ptS[yl], one, acc[yr]
+        let (pt0, one, acc0) = (1, 1 + yl, 2 + yl);
+        let mut c = n_in;
+        let mut bl = ElementTableBuilder::new(6);
+        for w in 0..n_in {
+            bl.free_wire(w);
+        }
+        let mut e = vec![one];
+        for j in 0..yl {
+            bl.linear(c, &[(one, o), (pt0 + j, o)]);
+            let neg = c;
+            c += 1;
+            let mut nx = Vec::new();
+            for &pv in &e {
+                bl.mult(c, pv, neg);
+                nx.push(c);
+                c += 1;
+            }
+            for &pv in &e {
+                bl.mult(c, pv, pt0 + j);
+                nx.push(c);
+                c += 1;
+            }
+            e = nx;
+        }
+        let mut acc_out = Vec::new();
+        for (y, &ey) in e.iter().enumerate() {
+            bl.mult(c, 0, ey);
+            c += 1;
+            bl.linear(c, &[(acc0 + y, o), (c - 1, o)]);
+            acc_out.push(c);
+            c += 1;
+        }
+        assert!(c <= 64, "suffix gate spills ({c})");
+        Self {
+            ty: std::sync::Arc::new(bl.build().expect("suffix gate")),
+            acc_out,
+            yl,
+            n_in,
+            k: c,
+        }
+    }
+}
+
+impl GateType for SuffixGate {
+    type Row = Vec<F128>;
+    type Hint = ();
+    fn table(&self) -> TableType {
+        use flock_core::schedule::IoWord;
+        let mut schema: Vec<IoWord> = (0..self.n_in).map(IoWord::input).collect();
+        for &oc in &self.acc_out {
+            schema.push(IoWord::output(oc));
+        }
+        TableType::element(self.ty.clone()).with_io_schema(schema)
+    }
+    fn eval(&self, inputs: &[F128], _h: &()) -> (Vec<F128>, Self::Row) {
+        let yl = self.yl;
+        let (pt0, acc0) = (1, 2 + yl);
+        let mut z = vec![F128::ZERO; self.k];
+        z[..self.n_in].copy_from_slice(&inputs[..self.n_in]);
+        let mut c = self.n_in;
+        let mut e = vec![F128::ONE];
+        for j in 0..yl {
+            z[c] = F128::ONE + z[pt0 + j];
+            let neg = z[c];
+            c += 1;
+            let mut nx = Vec::new();
+            for &pv in &e {
+                z[c] = pv * neg;
+                nx.push(z[c]);
+                c += 1;
+            }
+            for &pv in &e {
+                z[c] = pv * z[pt0 + j];
+                nx.push(z[c]);
+                c += 1;
+            }
+            e = nx;
+        }
+        let mut outs = Vec::new();
+        for (y, &ey) in e.iter().enumerate() {
+            z[c] = z[0] * ey;
+            c += 1;
+            z[c] = z[acc0 + y] + z[c - 1];
+            outs.push(z[c]);
+            c += 1;
+        }
+        (outs, z)
+    }
+    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
+        let mut z = vec![F128::ZERO; self.ty.width() << nu];
+        for (j, row) in rows.iter().enumerate() {
+            for (col, &v) in row.iter().enumerate() {
+                z[(col << nu) + j] = v;
+            }
+        }
+        SlotWitness::Element(z)
+    }
+}
+
+struct PartialCombineGate {
+    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+    acc_out: Vec<usize>,
+    yr: usize,
+    n_in: usize,
+    k: usize,
+}
+
+impl PartialCombineGate {
+    fn new(yl: usize) -> Self {
+        use flock_core::element_r1cs::ElementTableBuilder;
+        let o = F128::ONE;
+        let yr = 1usize << yl;
+        let n_in = 1 + 2 * yr; // beta, acc[yr], resid[yr]
+        let mut c = n_in;
+        let mut bl = ElementTableBuilder::new(6);
+        for w in 0..n_in {
+            bl.free_wire(w);
+        }
+        let mut acc_out = Vec::new();
+        for y in 0..yr {
+            bl.mult(c, 0, 1 + yr + y);
+            c += 1;
+            bl.linear(c, &[(1 + y, o), (c - 1, o)]);
+            acc_out.push(c);
+            c += 1;
+        }
+        Self {
+            ty: std::sync::Arc::new(bl.build().expect("partial combine")),
+            acc_out,
+            yr,
+            n_in,
+            k: c,
+        }
+    }
+}
+
+impl GateType for PartialCombineGate {
+    type Row = Vec<F128>;
+    type Hint = ();
+    fn table(&self) -> TableType {
+        use flock_core::schedule::IoWord;
+        let mut schema: Vec<IoWord> = (0..self.n_in).map(IoWord::input).collect();
+        for &oc in &self.acc_out {
+            schema.push(IoWord::output(oc));
+        }
+        TableType::element(self.ty.clone()).with_io_schema(schema)
+    }
+    fn eval(&self, inputs: &[F128], _h: &()) -> (Vec<F128>, Self::Row) {
+        let yr = self.yr;
+        let mut z = vec![F128::ZERO; self.k];
+        z[..self.n_in].copy_from_slice(&inputs[..self.n_in]);
+        let mut c = self.n_in;
+        let mut outs = Vec::new();
+        for y in 0..yr {
+            z[c] = z[0] * z[1 + yr + y];
+            c += 1;
+            z[c] = z[1 + y] + z[c - 1];
+            outs.push(z[c]);
+            c += 1;
+        }
+        (outs, z)
+    }
+    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
+        let mut z = vec![F128::ZERO; self.ty.width() << nu];
+        for (j, row) in rows.iter().enumerate() {
+            for (col, &v) in row.iter().enumerate() {
+                z[(col << nu) + j] = v;
+            }
+        }
+        SlotWitness::Element(z)
+    }
+}
+
+struct FinalDotGate {
+    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+    yr: usize,
+    n_in: usize,
+    k: usize,
+}
+
+impl FinalDotGate {
+    fn new(yl: usize) -> Self {
+        use flock_core::element_r1cs::ElementTableBuilder;
+        let o = F128::ONE;
+        let yr = 1usize << yl;
+        let n_in = 2 * yr; // yr words, combined
+        let mut c = n_in;
+        let mut bl = ElementTableBuilder::new(6);
+        for w in 0..n_in {
+            bl.free_wire(w);
+        }
+        let mut terms = Vec::new();
+        for y in 0..yr {
+            bl.mult(c, y, yr + y);
+            terms.push((c, o));
+            c += 1;
+        }
+        bl.linear(c, &terms);
+        c += 1;
+        Self {
+            ty: std::sync::Arc::new(bl.build().expect("final dot")),
+            yr,
+            n_in,
+            k: c,
+        }
+    }
+}
+
+impl GateType for FinalDotGate {
+    type Row = Vec<F128>;
+    type Hint = ();
+    fn table(&self) -> TableType {
+        use flock_core::schedule::IoWord;
+        let mut schema: Vec<IoWord> = (0..self.n_in).map(IoWord::input).collect();
+        schema.push(IoWord::output(self.k - 1));
+        TableType::element(self.ty.clone()).with_io_schema(schema)
+    }
+    fn eval(&self, inputs: &[F128], _h: &()) -> (Vec<F128>, Self::Row) {
+        let yr = self.yr;
+        let mut z = vec![F128::ZERO; self.k];
+        z[..self.n_in].copy_from_slice(&inputs[..self.n_in]);
+        let mut c = self.n_in;
+        let mut inner = F128::ZERO;
+        for y in 0..yr {
+            z[c] = z[y] * z[yr + y];
+            inner += z[c];
+            c += 1;
+        }
+        z[c] = inner;
+        (vec![inner], z)
+    }
+    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
+        let mut z = vec![F128::ZERO; self.ty.width() << nu];
+        for (j, row) in rows.iter().enumerate() {
+            for (col, &v) in row.iter().enumerate() {
+                z[(col << nu) + j] = v;
+            }
+        }
+        SlotWitness::Element(z)
+    }
+}
+
+/// One packed-direct claim on the tape: its absorbed point/value and gamma.
+struct PdRec {
+    pt_v: usize,
+    pt_len: usize,
+    val_v: usize,
+    fin: usize,
+    ch: usize,
+}
+
+/// One OOD claim on the tape: where its `z` squeezed, its `y`/intro-msg
+/// values, and its beta.
+struct OodRec {
+    z_fin: usize,
+    z_ch: usize,
+    z_len: usize,
+    y_v: usize,
+    intro_v: usize,
+    beta_fin: usize,
+    beta_ch: usize,
+}
+
 /// One open-phase level, located on a recorded op tape. `*_fin` are finalize
 /// ordinals (indices into `FsChainTrace::squeezes`); `*_ch` index into
 /// `RecordingChallenger::challenges()`.
@@ -2637,9 +2991,8 @@ struct OpenLevel {
     fold_chs: Vec<usize>,
     /// Value index of each fold round's message `u_0` (`u_2` is `+1`).
     fold_msg_vs: Vec<usize>,
-    /// OOD claims folded before this level's queries:
-    /// `(y value idx, intro-msg value idx, beta fin, beta ch)`.
-    ood: Vec<(usize, usize, usize, usize)>,
+    /// OOD claims folded before this level's queries.
+    ood: Vec<OodRec>,
     /// The level's intro message value idx (unused for the final level).
     intro_v: usize,
     /// The intro/final beta: `(fin, ch)`.
@@ -2662,7 +3015,7 @@ fn parse_open_levels(
     ops: &[flock_core::transcript_record::TranscriptOp],
     cap0_bytes: usize,
     r: usize,
-) -> (usize, Vec<OpenLevel>) {
+) -> (usize, Vec<PdRec>, usize, Vec<OpenLevel>) {
     use flock_core::transcript_record::TranscriptOp as Op;
     struct Cur<'a> {
         ops: &'a [Op],
@@ -2707,8 +3060,37 @@ fn parse_open_levels(
         .collect();
     assert!(starts.len() >= 2, "expected bind + open cap absorbs");
     let start = *starts.last().unwrap();
+    // The merged intake absorbs, per packed-direct claim, [point slice,
+    // value, gamma squeeze] right after the merged-open label — so the claim
+    // POINTS are stream words (wireable), and each gamma is a scalar squeeze.
     let mut cur = Cur { ops, i: 0, fin: 0, ch: 0, v: 0 };
+    let mut gammas: Vec<PdRec> = Vec::new();
+    let mut in_pd = false;
     while cur.i < start {
+        if matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == b"flock-merged-open-v0") {
+            in_pd = true;
+            cur.bump();
+            continue;
+        }
+        if in_pd {
+            if let Op::ObserveSlice(n) = ops[cur.i] {
+                let pt_v = cur.v;
+                cur.bump();
+                let val_v = cur.v;
+                cur.expect_obs_scalar();
+                assert!(matches!(ops[cur.i], Op::SqueezeScalar), "pd gamma");
+                gammas.push(PdRec {
+                    pt_v,
+                    pt_len: n,
+                    val_v,
+                    fin: cur.fin,
+                    ch: cur.ch,
+                });
+                cur.bump();
+                continue;
+            }
+            in_pd = false;
+        }
         cur.bump();
     }
     cur.bump(); // the open-phase initial cap absorb
@@ -2717,6 +3099,7 @@ fn parse_open_levels(
     cur.expect_obs_scalar(); // ... u_2
 
     let mut levels = Vec::new();
+    let mut yr_v = 0usize;
     for li in 0..=r {
         // Fold batch: [Pow?] SqueezeScalar + ObserveScalar x2 per round. Only
         // consume a Pow that fronts a fold — the query-grinding Pow follows
@@ -2753,7 +3136,11 @@ fn parse_open_levels(
             );
             cur.bump();
             while !matches!(cur.ops[cur.i], Op::Pow { .. }) {
-                assert!(matches!(cur.ops[cur.i], Op::SqueezeSlice(_)), "OOD z");
+                let z_len = match cur.ops[cur.i] {
+                    Op::SqueezeSlice(n) => n,
+                    ref o => panic!("OOD z, got {o:?}"),
+                };
+                let (z_fin, z_ch) = (cur.fin, cur.ch);
                 cur.bump();
                 let y_v = cur.v;
                 cur.expect_obs_scalar(); // y
@@ -2761,11 +3148,20 @@ fn parse_open_levels(
                 cur.expect_obs_scalar(); // intro u_0
                 cur.expect_obs_scalar(); // intro u_2
                 assert!(matches!(cur.ops[cur.i], Op::SqueezeScalar), "OOD beta");
-                ood.push((y_v, intro_v, cur.fin, cur.ch));
+                ood.push(OodRec {
+                    z_fin,
+                    z_ch,
+                    z_len,
+                    y_v,
+                    intro_v,
+                    beta_fin: cur.fin,
+                    beta_ch: cur.ch,
+                });
                 cur.bump();
             }
         } else {
             // Final level: the yr observes.
+            yr_v = cur.v;
             while matches!(cur.ops[cur.i], Op::ObserveScalar) {
                 cur.bump();
             }
@@ -2811,7 +3207,7 @@ fn parse_open_levels(
             a_count,
         });
     }
-    (start_v, levels)
+    (start_v, gammas, yr_v, levels)
 }
 
 // ---------------------------------------------------------------------------
@@ -2925,7 +3321,7 @@ fn mvp7_real_query_phase() {
 
     // ---- record the REAL verifier transcript ----
     let mut rec = RecordingChallenger::new(FsChallenger::with_hash(DOMAIN7, HashKind::Blake3));
-    verifier::verify_ligerito_union_mixed_class(
+    let claims_v = verifier::verify_ligerito_union_mixed_class(
         &inner_union,
         &[],
         &commitment,
@@ -2934,6 +3330,10 @@ fn mvp7_real_query_phase() {
         &mut rec,
     )
     .expect("the inner proof verifies natively");
+    let el_claims = claims_v.element.as_ref().expect("element claims");
+    // The packed-direct intake order (verifier.rs): [(c_point, c_value),
+    // (lc_point, lc_value)].
+    let pd_pts: Vec<Vec<F128>> = vec![el_claims.c_point.clone(), el_claims.lc_point.clone()];
     let t_shape = rec.shape();
     let stream = t_shape.stream_words(DOMAIN7);
     let bytes = stream.to_bytes(rec.values(), rec.payloads());
@@ -2967,7 +3367,8 @@ fn mvp7_real_query_phase() {
             }
         })
         .collect();
-    let (start_v, levels) = parse_open_levels(t_shape.ops(), 32 * lig.initial_cap.len(), r);
+    let (start_v, gammas, yr_v, levels) =
+        parse_open_levels(t_shape.ops(), 32 * lig.initial_cap.len(), r);
     assert_eq!(levels.len(), r + 1);
 
     // Per level: q, c, path depth d-c, lanes — and the native cross-checks
@@ -3173,11 +3574,11 @@ fn mvp7_real_query_phase() {
             (qc, qb, qa) = (bld[0], bld[1], bld[2]);
         }
         if li < r {
-            for &(y_v, intro_v, beta_fin, _) in &lvl.ood {
-                let bw = chw(&outs, &trace.squeezes, beta_fin);
+            for od in &lvl.ood {
+                let bw = chw(&outs, &trace.squeezes, od.beta_fin);
                 let f = sb.gate(
                     spine,
-                    &[qc, qb, qa, tw, wv(intro_v), wv(intro_v + 1), wv(y_v), bw, zw],
+                    &[qc, qb, qa, tw, wv(od.intro_v), wv(od.intro_v + 1), wv(od.y_v), bw, zw],
                 );
                 (qc, qb, qa, tw) = (f[0], f[1], f[2], f[3]);
             }
@@ -3234,6 +3635,108 @@ fn mvp7_real_query_phase() {
         }
         resid_pub.push(accs);
     }
+
+    // ---- eval_b + the close-out (2b stage 2) ----
+    // BLOCKED behind MVP7_CLOSEOUT=1: with these ~6 extra element types the
+    // outer union's boolean RS claims lose their DeferredDense shape (the
+    // dense suffix drops under 16 — `use_split` in ring_switch.rs — and the
+    // merged open only accepts DeferredDense), so the OUTER prove panics.
+    // The gates and their native replica are done and kept; the union-shape
+    // limitation is the open item.
+    let closeout = std::env::var("MVP7_CLOSEOUT").is_ok();
+    assert_eq!(gammas.len(), pd_pts.len(), "one gamma per claim");
+    for (k, pd) in gammas.iter().enumerate() {
+        for j in 0..pd.pt_len {
+            assert_eq!(rec.values()[pd.pt_v + j], pd_pts[k][j], "pt {k}:{j} on tape");
+        }
+    }
+    let pl_full: usize = levels.iter().map(|l| l.fold_fins.len()).sum();
+    let inner_w = if !closeout { None } else {
+    let ris_full: Vec<Wire> = levels
+        .iter()
+        .flat_map(|l| l.fold_fins.iter().map(|&f| chw(&outs, &trace.squeezes, f)))
+        .collect();
+    let sxslot = sb.slot(SuffixGate::new(yr_log));
+    leaf_slot.push((300, sxslot));
+    let mut pf_slots: Vec<(usize, flock_core::circuit::builder::SlotId)> = Vec::new();
+    let mut pf_slot = |sb: &mut ShapeBuilder,
+                       leaf_slot: &mut Vec<(usize, flock_core::circuit::builder::SlotId)>,
+                       pl: usize| {
+        match pf_slots.iter().find(|(n, _)| *n == pl) {
+            Some((_, sl)) => *sl,
+            None => {
+                let sl = sb.slot(PrefixGate::new(pl));
+                leaf_slot.push((310 + pl, sl));
+                pf_slots.push((pl, sl));
+                sl
+            }
+        }
+    };
+    let mut evb_accs: Vec<Wire> = (0..yr_len).map(|_| zw).collect();
+    // Packed-direct claims: seed = gamma, prefix over the full fold chain.
+    for pd in &gammas {
+        assert_eq!(pd.pt_len, pl_full + yr_log, "PD point spans the dense domain");
+        let sl = pf_slot(&mut sb, &mut leaf_slot, pl_full);
+        let mut g_in = vec![chw(&outs, &trace.squeezes, pd.fin)];
+        for j in 0..pl_full {
+            g_in.push(wv(pd.pt_v + j));
+        }
+        g_in.extend_from_slice(&ris_full);
+        g_in.push(ow);
+        let p = sb.gate(sl, &g_in)[0];
+        let mut s_in = vec![p];
+        for j in 0..yr_log {
+            s_in.push(wv(pd.pt_v + pl_full + j));
+        }
+        s_in.push(ow);
+        s_in.extend_from_slice(&evb_accs);
+        evb_accs = sb.gate(sxslot, &s_in);
+    }
+    // OOD claims: same shape, seed = beta, point = the squeezed z.
+    for (li, lvl) in levels.iter().enumerate() {
+        for od in &lvl.ood {
+            let folded = od.z_len - yr_log;
+            let later: Vec<Wire> = levels[li + 1..]
+                .iter()
+                .flat_map(|l| l.fold_fins.iter().map(|&f| chw(&outs, &trace.squeezes, f)))
+                .collect();
+            assert_eq!(later.len(), folded, "OOD prefix = later folds");
+            let sl = pf_slot(&mut sb, &mut leaf_slot, folded);
+            let sq = &trace.squeezes[od.z_fin];
+            let mut g_in = vec![chw(&outs, &trace.squeezes, od.beta_fin)];
+            for j in 0..folded {
+                g_in.push(outs[sq[j / 4]][j % 4]);
+            }
+            g_in.extend_from_slice(&later);
+            g_in.push(ow);
+            let p = sb.gate(sl, &g_in)[0];
+            let mut s_in = vec![p];
+            for j in 0..yr_log {
+                let jj = folded + j;
+                s_in.push(outs[sq[jj / 4]][jj % 4]);
+            }
+            s_in.push(ow);
+            s_in.extend_from_slice(&evb_accs);
+            evb_accs = sb.gate(sxslot, &s_in);
+        }
+    }
+    // beta-weighted residuals fold in per level, then the yr dot.
+    let pcslot = sb.slot(PartialCombineGate::new(yr_log));
+    leaf_slot.push((301, pcslot));
+    let mut comb = evb_accs;
+    for (li, lvl) in levels.iter().enumerate() {
+        let mut g_in = vec![chw(&outs, &trace.squeezes, lvl.beta_fin)];
+        g_in.extend_from_slice(&comb);
+        g_in.extend_from_slice(&resid_pub[li]);
+        comb = sb.gate(pcslot, &g_in);
+    }
+    let fdslot = sb.slot(FinalDotGate::new(yr_log));
+    leaf_slot.push((302, fdslot));
+    let mut g_in: Vec<Wire> = (0..yr_len).map(|y| wv(yr_v + y)).collect();
+    g_in.extend_from_slice(&comb);
+    Some(sb.gate(fdslot, &g_in)[0])
+    };
+
     for (a_wires, opens) in &to_publish {
         for w in a_wires {
             sb.publish(*w);
@@ -3250,6 +3753,9 @@ fn mvp7_real_query_phase() {
             sb.publish(*w);
         }
     }
+    if let Some(w) = inner_w {
+        sb.publish(w);
+    }
     let shape = sb.finish().expect("valid real-query circuit");
     let setup_ms = t.elapsed().as_secs_f64() * 1e3;
 
@@ -3258,7 +3764,7 @@ fn mvp7_real_query_phase() {
     let (built, online_t) = timed(REPS, || shape.run(&vals, &hint_refs));
 
     // ---- the boundary checks ----
-    let yr_pub = levels.len() * yr_len;
+    let yr_pub = levels.len() * yr_len + usize::from(closeout);
     let total_pub: usize = 1 + yr_pub
         + levels
             .iter()
@@ -3300,11 +3806,11 @@ fn mvp7_real_query_phase() {
             nq = quad(vals_rec[mv], vals_rec[mv + 1], nt);
         }
         if li < levels.len() - 1 {
-            for &(y_v, intro_v, _, beta_ch) in &lvl.ood {
-                let b = chals[beta_ch];
-                let iq = quad(vals_rec[intro_v], vals_rec[intro_v + 1], vals_rec[y_v]);
+            for od in &lvl.ood {
+                let b = chals[od.beta_ch];
+                let iq = quad(vals_rec[od.intro_v], vals_rec[od.intro_v + 1], vals_rec[od.y_v]);
                 nq = (nq.0 + b * iq.0, nq.1 + b * iq.1, nq.2 + b * iq.2);
-                nt += b * vals_rec[y_v];
+                nt += b * vals_rec[od.y_v];
             }
             let b = chals[lvl.beta_ch];
             let iq = quad(vals_rec[lvl.intro_v], vals_rec[lvl.intro_v + 1], native_sums[li]);
@@ -3317,6 +3823,7 @@ fn mvp7_real_query_phase() {
     assert_eq!(built.public[at], nt, "the spine's final t_r");
     at += 1;
     // Native replica of induce_sumcheck_evaluate_at_residual, per level.
+    let mut resid_native: Vec<Vec<F128>> = vec![vec![F128::ZERO; yr_len]; levels.len()];
     for (li, lvl) in levels.iter().enumerate() {
         let pl: usize = levels[li + 1..].iter().map(|l| l.fold_fins.len()).sum();
         let lmc = pl + yr_log;
@@ -3351,8 +3858,63 @@ fn mvp7_real_query_phase() {
                 sum += aw[k] * prod;
             }
             assert_eq!(built.public[at], sum, "L{li} residual y={y}");
+            resid_native[li][y] = sum;
             at += 1;
         }
+    }
+    // evb + combine, natively: gamma-weighted char-2 eq products, then the
+    // yr dot. The published inner must match; it equals the TRUE t_r of the
+    // native verify (which accepted), while the spine's t_final still starts
+    // from the unbound T0 — the merged intake (2c) closes that gap.
+    if closeout {
+        let ris_v: Vec<F128> = levels
+            .iter()
+            .flat_map(|l| l.fold_chs.iter().map(|&i| chals[i]))
+            .collect();
+        let pl_full = ris_v.len();
+        let mut inner_n = F128::ZERO;
+        for y in 0..yr_len {
+            let mut evb = F128::ZERO;
+            for (k, pt) in pd_pts.iter().enumerate() {
+                let mut t = chals[gammas[k].ch];
+                for j in 0..pl_full {
+                    t *= F128::ONE + pt[j] + ris_v[j];
+                }
+                for j in 0..yr_log {
+                    t *= if (y >> j) & 1 == 1 {
+                        pt[pl_full + j]
+                    } else {
+                        F128::ONE + pt[pl_full + j]
+                    };
+                }
+                evb += t;
+            }
+            let mut comb = evb;
+            for (li, lvl) in levels.iter().enumerate() {
+                comb += chals[lvl.beta_ch] * resid_native[li][y];
+                for od in &lvl.ood {
+                    let folded = od.z_len - yr_log;
+                    let later: Vec<F128> = levels[li + 1..]
+                        .iter()
+                        .flat_map(|l| l.fold_chs.iter().map(|&i| chals[i]))
+                        .collect();
+                    let mut t = chals[od.beta_ch];
+                    for j in 0..folded {
+                        t *= F128::ONE + chals[od.z_ch + j] + later[j];
+                    }
+                    for j in 0..yr_log {
+                        t *= if (y >> j) & 1 == 1 {
+                            chals[od.z_ch + folded + j]
+                        } else {
+                            F128::ONE + chals[od.z_ch + folded + j]
+                        };
+                    }
+                    comb += t;
+                }
+            }
+            inner_n += rec.values()[yr_v + y] * comb;
+        }
+        assert_eq!(built.public[at], inner_n, "the close-out inner");
     }
 
     // ---- prove / verify the circuit itself ----
