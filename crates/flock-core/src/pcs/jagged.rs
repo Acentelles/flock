@@ -185,8 +185,12 @@ fn transition(row: bool, index: bool, curr: bool, next: bool, state: usize) -> O
     Some(new_carry + (new_comparison << 1))
 }
 
-const STATE_INITIAL: usize = 0; // carry=0, comparison=0
-const STATE_SUCCESS: usize = 2; // carry=0, comparison=1
+// The two boundary states are `pub`: the recursion circuit's in-circuit
+// anchor verifier chains the same 4-state DP (`assist_sparse_transitions`)
+// and needs the seed/read-out indices — see the transcription work in
+// `flock-prover/tests/`.
+pub const STATE_INITIAL: usize = 0; // carry=0, comparison=0
+pub const STATE_SUCCESS: usize = 2; // carry=0, comparison=1
 
 /// Multilinear extension `ĝ(z_r, z_i, c, d)` of the branching program, with
 /// the per-layer height coordinates supplied by `cd(layer)` as arbitrary field
@@ -751,7 +755,10 @@ const ASSIST_CHUNK: usize = 256;
 /// each row has exactly two entries `(index into the layer's eq4 table, next
 /// state)` — and they are layer-independent (a layer only supplies its eq4
 /// table `eq((z_row[ℓ], z_index[ℓ]), ·)`).
-fn assist_sparse_transitions() -> [[[(usize, usize); 2]; 4]; 4] {
+/// `pub`: the recursion circuit's anchor gates bake this table into their
+/// relation; sourcing it from here (rather than a test-side replica) means
+/// a protocol change cannot silently drift the two apart.
+pub fn assist_sparse_transitions() -> [[[(usize, usize); 2]; 4]; 4] {
     let mut table = [[[(0usize, 0usize); 2]; 4]; 4];
     for (cd, rows) in table.iter_mut().enumerate() {
         let (c, d) = (cd & 1 != 0, cd & 2 != 0);
