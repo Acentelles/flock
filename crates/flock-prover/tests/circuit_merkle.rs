@@ -6682,7 +6682,7 @@ fn mvp9_boolean_leaf_tape() {
         // ghash constants then the 9 r_outer squeeze wires, rho from the
         // chain, msgs from the stream, g0 as advice with published-zero
         // deltas — family I, no in-circuit inversion.
-        let (zc0, zc_rounds2) = {
+        let zc0 = {
             use flock_core::transcript_record::TranscriptOp as Op4;
             let ops2 = t_shape.ops();
             let (mut v2, mut c2, mut f2, mut i2) = (0usize, 0usize, 0usize, 0usize);
@@ -6732,9 +6732,51 @@ fn mvp9_boolean_leaf_tape() {
                 rounds2.push((g_v, ch, fin));
                 i2 += 3;
             }
-            ((outer_ch, outer_fin, r1ab_v, r1c_v, z_ch), rounds2)
+            // the zc finals (v_a, v_b — the lincheck's entry values)
+            let mut finals_v = Vec::new();
+            while matches!(ops2[i2], Op4::ObserveScalar) {
+                finals_v.push(v2);
+                bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
+                i2 += 1;
+            }
+            assert!(
+                matches!(&ops2[i2], Op4::Label(l) if l.as_slice() == b"flock-lincheck-v0"),
+                "lincheck label"
+            );
+            i2 += 1;
+            let (alpha_ch2, alpha_fin2) = (c2, f2);
+            assert!(matches!(ops2[i2], Op4::SqueezeScalar), "lc alpha");
+            bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
+            i2 += 1;
+            let (beta_ch2, beta_fin2) = (c2, f2);
+            assert!(matches!(ops2[i2], Op4::SqueezeScalar), "lc beta (const pin)");
+            bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
+            i2 += 1;
+            let mut lc_rounds2 = Vec::new();
+            while matches!(ops2[i2], Op4::ObserveScalar)
+                && matches!(ops2[i2 + 1], Op4::ObserveScalar)
+                && matches!(ops2[i2 + 2], Op4::SqueezeScalar)
+            {
+                let g_v = v2;
+                bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
+                bump2(&ops2[i2 + 1], &mut v2, &mut c2, &mut f2);
+                let (ch, fin) = (c2, f2);
+                bump2(&ops2[i2 + 2], &mut v2, &mut c2, &mut f2);
+                lc_rounds2.push((g_v, ch, fin));
+                i2 += 3;
+            }
+            (
+                (outer_ch, outer_fin, r1ab_v, r1c_v, z_ch),
+                rounds2,
+                finals_v,
+                (alpha_ch2, alpha_fin2, beta_ch2, beta_fin2),
+                lc_rounds2,
+            )
         };
+        let (zc0, zc_rounds2, zc_finals_v, lc_chs, lc_rounds2) = zc0;
         let (outer_ch, outer_fin, r1ab_v, r1c_v, z_ch) = zc0;
+        let (alpha_ch2, alpha_fin2, beta_ch2, beta_fin2) = lc_chs;
+        assert!(zc_finals_v.len() >= 2, "zc finals (v_a, v_b) on the tape");
         // Native seed + g0/running chain.
         use flock_core::zerocheck::multilinear::{
             interpolate_at_z_combined, interpolate_at_z_on_lambda,
@@ -6791,6 +6833,38 @@ fn mvp9_boolean_leaf_tape() {
             zrw = g[1];
         }
 
+        // ---- the lincheck rounds in-circuit ----
+        // The entry is FULLY BOUND: target = alpha·v_a + v_b + beta with
+        // alpha/beta chain squeezes and v_a/v_b the zerocheck finals on the
+        // stream (SpineGate tr-rows). The rounds are MergedRoundGate; the
+        // end publishes and equals the native chain (the comb-side final
+        // consistency and the deferred matrix equation stay checker-native).
+        let alpha_w2 = outs[trace.squeezes[alpha_fin2][0]][0];
+        let beta_w2 = outs[trace.squeezes[beta_fin2][0]][0];
+        let s1 = sb.gate(
+            spine,
+            &[zw, zw, zw, zw, zw, zw, wv(zc_finals_v[0]), alpha_w2, zw],
+        )[3];
+        let s2 = sb.gate(spine, &[zw, zw, zw, s1, zw, zw, wv(zc_finals_v[1]), ow, zw])[3];
+        let mut lcw = sb.gate(spine, &[zw, zw, zw, s2, zw, zw, beta_w2, ow, zw])[3];
+        for &(g_v, _, fin) in &lc_rounds2 {
+            let rho_w = outs[trace.squeezes[fin][0]][0];
+            lcw = sb.gate(mrslot, &[lcw, wv(g_v), wv(g_v + 1), rho_w])[0];
+        }
+        // Native replica of the same chain.
+        let lc_end_native = {
+            let mut lrn = chals[alpha_ch2] * vals_rec[zc_finals_v[0]]
+                + vals_rec[zc_finals_v[1]]
+                + chals[beta_ch2];
+            for &(g_v, ch, _) in &lc_rounds2 {
+                let (e1, ei) = (vals_rec[g_v], vals_rec[g_v + 1]);
+                let rho = chals[ch];
+                let e0 = lrn + e1;
+                lrn = ei * rho * rho + (e0 + e1 + ei) * rho + e0;
+            }
+            lrn
+        };
+
         for (a_wires, opens) in &to_publish {
             for w in a_wires {
                 sb.publish(*w);
@@ -6817,6 +6891,7 @@ fn mvp9_boolean_leaf_tape() {
             sb.publish(*d);
         }
         sb.publish(zrw);
+        sb.publish(lcw);
         let shape = sb.finish().expect("valid leaf query-phase circuit");
         let hint_refs: Vec<&dyn std::any::Any> =
             hints.iter().map(|h| h as &dyn std::any::Any).collect();
@@ -6825,7 +6900,7 @@ fn mvp9_boolean_leaf_tape() {
         // ---- boundary checks: alphas, cap selects, and the enforced sums.
         let total_pub: usize = levels.len()
             + 3
-            + 2
+            + 3
             + zc_rounds2.len()
             + 3 * pows.len()
             + levels
@@ -6886,8 +6961,13 @@ fn mvp9_boolean_leaf_tape() {
                 );
             }
         }
-        // The zc block sits at the very tail: seed, deltas, end.
-        let zc_tail = 2 + zc_rounds2.len();
+        // The zc + lc blocks sit at the very tail: seed, deltas, end, lc end.
+        assert_eq!(
+            built.public[built.public.len() - 1],
+            lc_end_native,
+            "the lincheck chain ends at the native running claim"
+        );
+        let zc_tail = 3 + zc_rounds2.len();
         assert_eq!(
             built.public[built.public.len() - zc_tail],
             zc_seed,
@@ -6901,7 +6981,7 @@ fn mvp9_boolean_leaf_tape() {
             );
         }
         assert_eq!(
-            built.public[built.public.len() - 1],
+            built.public[built.public.len() - 2],
             zc_end_native,
             "the zc chain ends at the native running claim"
         );
