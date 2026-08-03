@@ -4724,6 +4724,25 @@ fn mvp7_real_query_phase() {
         })
         .collect();
 
+    // ---- ASSERTION EMISSION: the ElementAssertion exits as bound publics.
+    // For this one-slot inner every field is already a wire: alpha (chain),
+    // r_con = the zerocheck challenges, r_col = the lincheck challenges
+    // (chain squeezes), evals = the ZcJoin-derived (va, vb) — the
+    // strip_constants values the native assertion carries — z_eval = the
+    // element c claim's absorbed value (ec-joined to the zerocheck), and
+    // target = lc_target (published below with the PIOP tail). The
+    // accumulator can reconstruct the assertion from the public segment
+    // alone. Multi-slot inners absorb per-slot eval pairs — a shape
+    // extension for the mixed phase.
+    let mut assertion_pub: Vec<Wire> = vec![alpha_w];
+    for rr in &piop.zc_rounds {
+        assertion_pub.push(chw(&outs, &trace.squeezes, rr.fin));
+    }
+    for rr in &piop.lc_rounds {
+        assertion_pub.push(chw(&outs, &trace.squeezes, rr.fin));
+    }
+    assertion_pub.extend_from_slice(&[va_w, vb_w, wv(gammas[0].val_v)]);
+
     for (a_wires, opens) in &to_publish {
         for w in a_wires {
             sb.publish(*w);
@@ -4758,6 +4777,9 @@ fn mvp7_real_query_phase() {
             sb.publish(*w);
         }
     }
+    for w in &assertion_pub {
+        sb.publish(*w);
+    }
     let shape = sb.finish().expect("valid real-query circuit");
     let setup_ms = t.elapsed().as_secs_f64() * 1e3;
 
@@ -4767,9 +4789,30 @@ fn mvp7_real_query_phase() {
 
     // ---- the boundary checks ----
     // The tail publics: three multipoint zero-deltas (T_m == anchor.v,
-    // running_W == q_eval·V, claim == expect), then per-Pow (digest word0,
-    // digest word1, nonce word) triples the checker validates natively.
-    let pow_base = built.public.len() - 3 * pows.len();
+    // running_W == q_eval·V, claim == expect), per-Pow (digest word0,
+    // digest word1, nonce word) triples the checker validates natively,
+    // then the emitted ElementAssertion fields.
+    let n_assert = 1 + piop.zc_rounds.len() + piop.lc_rounds.len() + 3;
+    let assert_base = built.public.len() - n_assert;
+    {
+        let vals_rec = rec.values();
+        let mut at = assert_base;
+        assert_eq!(built.public[at], chals[piop.alpha_ch], "assertion alpha");
+        at += 1;
+        for rr in &piop.zc_rounds {
+            assert_eq!(built.public[at], chals[rr.ch], "assertion r_con");
+            at += 1;
+        }
+        for rr in &piop.lc_rounds {
+            assert_eq!(built.public[at], chals[rr.ch], "assertion r_col");
+            at += 1;
+        }
+        // evals = (va, vb) are strip_constants derivations — validated
+        // transitively by the lincheck target equality; z_eval is the
+        // absorbed c-claim value.
+        assert_eq!(built.public[at + 2], vals_rec[gammas[0].val_v], "assertion z_eval");
+    }
+    let pow_base = assert_base - 3 * pows.len();
     for (i, off) in [3, 2, 1].into_iter().enumerate() {
         assert_eq!(
             built.public[pow_base - off],
@@ -4807,7 +4850,8 @@ fn mvp7_real_query_phase() {
         + piop.zc_rounds.len()
         + 3
         + 3
-        + 3 * pows.len();
+        + 3 * pows.len()
+        + n_assert;
     let total_pub: usize = 1 + yr_pub
         + levels
             .iter()
