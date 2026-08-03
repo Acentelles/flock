@@ -8100,7 +8100,7 @@ fn mvp10_leaf_outer_inner_tape() {
         "pd claims = the element (c, lc) pair + the outer's gathers"
     );
     assert_eq!(w_rounds.len(), lo.pcs.m - 7, "W spans the dense domain");
-    let (geo, _native_sums) = level_geometry(&levels, &lvl_src, &chals, HashKind::Blake3);
+    let (geo, native_sums) = level_geometry(&levels, &lvl_src, &chals, HashKind::Blake3);
     assert!(geo[0].row_words <= geo[0].lanes, "committed width fits the fold");
 
     // The R=2 + P schedule replays to the anchor's claimed v.
@@ -8131,10 +8131,334 @@ fn mvp10_leaf_outer_inner_tape() {
         "T0 folds to the anchor's claimed v"
     );
 
+    // ---- the swap, step 2: the class-agnostic half in-circuit ----
+    // The outer-of-outer's first rows: the REAL inner's whole FS chain
+    // replays through one b3 slot, the query phase lands via the shared
+    // emitters (56-word L0 leaves — a partial final block again), and the
+    // PoW predicate binds through the boundary pattern. The regions above
+    // the query phase (GKR, element PIOP, intake, spine, residual, expect)
+    // follow in later increments.
+    let outer_stats = {
+        use flock_prover::prover::UnionElementSlotInput;
+        use flock_prover::r1cs_hashes::fs_chain::FsChain;
+        let stream = t_shape.stream_words(DOMAIN);
+        let bytes = stream.to_bytes(rec.values(), rec.payloads());
+        let mut chain = FsChain::new();
+        let mut at = 0usize;
+        let fin_ops: Vec<_> = ops.iter().filter(|o| o.finalizes()).collect();
+        assert_eq!(
+            stream.finalize_after.len(),
+            fin_ops.len(),
+            "finalize alignment"
+        );
+        for (k, &upto) in stream.finalize_after.iter().enumerate() {
+            chain.absorb(&bytes[at * 16..upto * 16]);
+            at = upto;
+            chain.finalize(fin_ops[k].squeezed_bytes());
+        }
+        chain.absorb(&bytes[at * 16..]);
+        let trace = chain.finish();
+        let b3_rows = trace.rows.len()
+            + geo
+                .iter()
+                .map(|g| (g.row_words.div_ceil(4) + g.path) * g.q)
+                .sum::<usize>();
+        let nu2 = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(3);
+        let max_path = geo.iter().map(|g| g.path).max().unwrap().max(1);
+        let mut sb = ShapeBuilder::new(nu2);
+        let qslots = CollapsedSlots {
+            b3: sb.slot(Blake3Gate { nu: nu2 }),
+            swap: sb.slot(SwapGate { nu: nu2 }),
+            spread: sb.slot(BitSpreadGate {
+                ty: BitSpreadTable::new(max_path),
+                nu: nu2,
+            }),
+        };
+        let mut le_slots: Vec<(usize, flock_core::circuit::builder::SlotId)> = Vec::new();
+        let leafeval: Vec<_> = geo
+            .iter()
+            .map(|g| {
+                let lanes = g.lanes.min(8);
+                match le_slots.iter().find(|(n, _)| *n == lanes) {
+                    Some((_, sl)) => *sl,
+                    None => {
+                        let sl = sb.slot(LeafEvalGate::new(lanes));
+                        le_slots.push((lanes, sl));
+                        sl
+                    }
+                }
+            })
+            .collect();
+        let mut vals: Vec<F128> = Vec::new();
+        let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+        vals.extend_from_slice(&iv_w);
+        let iv2 = [sb.public_input(), sb.public_input()];
+        let (outs, ww) =
+            emit_fs_chain(&mut sb, qslots.b3, iv2, &trace, &stream, &bytes, &mut vals);
+
+        // The PoW grinding ops, located and bound (the mvp7 machinery).
+        struct PowRec {
+            fin: usize,
+            pay: usize,
+            bits: u32,
+        }
+        let pows: Vec<PowRec> = {
+            let mut out = Vec::new();
+            let (mut fin, mut pay) = (0usize, 0usize);
+            for op in ops {
+                if let Op::Pow { bits } = op {
+                    out.push(PowRec {
+                        fin,
+                        pay,
+                        bits: *bits,
+                    });
+                }
+                if op.finalizes() {
+                    fin += 1;
+                }
+                match op {
+                    Op::ObserveBytes(_) | Op::Pow { .. } => pay += 1,
+                    _ => {}
+                }
+            }
+            out
+        };
+        assert!(!pows.is_empty(), "the Fast profile grinds");
+        let pow_pub: Vec<[Wire; 3]> = pows
+            .iter()
+            .map(|pr| {
+                let sq = &trace.squeezes[pr.fin];
+                let wi = stream
+                    .words
+                    .iter()
+                    .position(|w| matches!(w, flock_core::transcript_record::StreamWord::Bytes { payload, .. } if *payload == pr.pay))
+                    .expect("pow nonce stream word");
+                let nw = ww[wi].expect("pow nonce wired");
+                [outs[sq[0]][0], outs[sq[0]][1], nw]
+            })
+            .collect();
+
+        let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
+        let (to_publish, level_accs) = emit_query_phase(
+            &mut sb,
+            qslots,
+            iv2,
+            &leafeval,
+            &levels,
+            &geo,
+            &lvl_src,
+            &trace.squeezes,
+            &outs,
+            &chals,
+            &mut vals,
+            &mut hints,
+        );
+        for (a_wires, opens) in &to_publish {
+            for w in a_wires {
+                sb.publish(*w);
+            }
+            for (cw, cv) in opens {
+                sb.publish(*cw);
+                sb.publish(cv[0]);
+                sb.publish(cv[1]);
+            }
+        }
+        for w in &level_accs {
+            sb.publish(*w);
+        }
+        for p in &pow_pub {
+            for w in p {
+                sb.publish(*w);
+            }
+        }
+        let shape2 = sb.finish().expect("the swap outer builds");
+        let hint_refs: Vec<&dyn std::any::Any> =
+            hints.iter().map(|h| h as &dyn std::any::Any).collect();
+        let built2 = shape2.run(&vals, &hint_refs);
+
+        // The query-phase boundary at real-inner scale: published alphas
+        // are the recorded challenges, each terminal digest is the cap node
+        // its challenge selects, each accumulator equals the native
+        // enforced sum, and every PoW triple satisfies the predicate.
+        let n_query_pub: usize = levels
+            .iter()
+            .zip(&geo)
+            .map(|(l, g)| l.a_count + 3 * g.q)
+            .sum();
+        let n_tail = levels.len() + 3 * pows.len();
+        let mut at2 = built2.public.len() - n_tail - n_query_pub;
+        for (li, lvl) in levels.iter().enumerate() {
+            let g = &geo[li];
+            let (cap, _, _) = lvl_src[li];
+            for j in 0..lvl.a_count {
+                assert_eq!(built2.public[at2 + j], chals[lvl.a_ch + j], "L{li} alpha {j}");
+            }
+            at2 += lvl.a_count;
+            for k in 0..g.q {
+                let chal = chals[lvl.q_ch + k];
+                assert_eq!(built2.public[at2], chal, "L{li} challenge {k}");
+                let pos = (chal.lo as usize) & ((1usize << g.depth) - 1);
+                let node = digest_words(&hash_to_digest(&cap[pos >> g.path]));
+                assert_eq!(
+                    [built2.public[at2 + 1], built2.public[at2 + 2]],
+                    node,
+                    "L{li} cap node {k}"
+                );
+                at2 += 3;
+            }
+        }
+        for (li, want) in native_sums.iter().enumerate() {
+            assert_eq!(
+                built2.public[at2 + li],
+                *want,
+                "L{li} enforced sum matches the native replica"
+            );
+        }
+        let pow_base = at2 + native_sums.len();
+        for (k, pr) in pows.iter().enumerate() {
+            let d0 = built2.public[pow_base + 3 * k];
+            let d1 = built2.public[pow_base + 3 * k + 1];
+            let nn = built2.public[pow_base + 3 * k + 2];
+            let mut digest = [0u8; 32];
+            digest[..8].copy_from_slice(&d0.lo.to_le_bytes());
+            digest[8..16].copy_from_slice(&d0.hi.to_le_bytes());
+            digest[16..24].copy_from_slice(&d1.lo.to_le_bytes());
+            digest[24..].copy_from_slice(&d1.hi.to_le_bytes());
+            assert_eq!(nn.hi, 0, "pow {k}: nonce word zero-padded");
+            if pr.bits == 0 {
+                assert_eq!(nn.lo, 0, "pow {k}: canonical zero nonce");
+            } else {
+                assert!(
+                    flock_core::challenger::pow_has_leading_zero_bits(
+                        &digest,
+                        nn.lo,
+                        pr.bits,
+                        HashKind::Blake3,
+                    ),
+                    "pow {k}: grinding predicate on the published wires"
+                );
+            }
+        }
+
+        // The outer-of-outer proves and verifies over the circuit path.
+        let union2 = UnionInstance::new(&shape2.registry, shape2.counts.clone());
+        let pcs2 = PcsParams {
+            m: union2.dense_m(),
+            log_inv_rate: 1,
+            log_batch_size: 6,
+            profile: LigeritoProfile::Fast,
+            num_lanes: union2.commit_lanes(6),
+            merkle_hash: Default::default(),
+        };
+        let b3_r1cs2 = blake3::build_block_r1cs(nu2);
+        let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
+        let swap_r1cs2 = SwapTable::build_block_r1cs(nu2);
+        let swap_lc2 = swap_r1cs2.csc_lincheck_circuit();
+        let spread_ty2 = BitSpreadTable::new(max_path);
+        let spread_r1cs2 = spread_ty2.build_block_r1cs(nu2);
+        let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
+        let mut bslots: Vec<(usize, UnionSlotProverInput)> = vec![
+            (
+                shape2.registry_slot(qslots.b3),
+                UnionSlotProverInput::new(
+                    blake3::generate_witness_batch_major_partial(
+                        built2.rows::<Blake3Gate>(qslots.b3),
+                        nu2,
+                    ),
+                    b3_lc2,
+                ),
+            ),
+            (
+                shape2.registry_slot(qslots.swap),
+                UnionSlotProverInput::new(
+                    SwapTable::generate_witness_batch_major(
+                        built2.rows::<SwapGate>(qslots.swap),
+                        nu2,
+                    ),
+                    swap_lc2,
+                ),
+            ),
+            (
+                shape2.registry_slot(qslots.spread),
+                UnionSlotProverInput::new(
+                    spread_ty2.generate_witness_batch_major(
+                        built2.rows::<BitSpreadGate>(qslots.spread),
+                        nu2,
+                    ),
+                    spread_lc2,
+                ),
+            ),
+        ];
+        bslots.sort_by_key(|(i, _)| *i);
+        let mut el_ord: Vec<(usize, Vec<F128>)> = le_slots
+            .iter()
+            .map(|(_, sl)| {
+                let z = match &built2.witnesses[shape2.registry_slot(*sl)] {
+                    SlotWitness::Element(z) => z.clone(),
+                    other => panic!("leaf-eval slot produced {other:?}"),
+                };
+                (shape2.registry_slot(*sl), z)
+            })
+            .collect();
+        el_ord.sort_by_key(|(i, _)| *i);
+        let el_inputs: Vec<UnionElementSlotInput> = el_ord
+            .into_iter()
+            .map(|(_, z)| {
+                UnionElementSlotInput::new(move |dst: &mut [F128]| dst.copy_from_slice(&z))
+            })
+            .collect();
+        let mut lco: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
+            (shape2.registry_slot(qslots.b3), b3_lc2),
+            (shape2.registry_slot(qslots.swap), swap_lc2),
+            (shape2.registry_slot(qslots.spread), spread_lc2),
+        ];
+        lco.sort_by_key(|(i, _)| *i);
+        let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
+            lco.into_iter().map(|(_, c)| c).collect();
+        let t0p = std::time::Instant::now();
+        let mut ch2 = FsChallenger::new(DOMAIN);
+        let (oproof, ocommit, _) = prover::prove_fast_ligerito_union_circuit(
+            &union2,
+            &shape2.circuit,
+            &built2.public,
+            &pcs2,
+            bslots.into_iter().map(|(_, x)| x).collect(),
+            el_inputs,
+            &mut ch2,
+        );
+        let prove_ms = t0p.elapsed().as_secs_f64() * 1e3;
+        let t0v = std::time::Instant::now();
+        let mut ch2 = FsChallenger::new(DOMAIN);
+        verifier::verify_ligerito_union_circuit(
+            &union2,
+            &shape2.circuit,
+            &built2.public,
+            &lcs2,
+            &ocommit,
+            &oproof,
+            &pcs2,
+            &mut ch2,
+        )
+        .expect("the swap outer verifies");
+        let verify_ms = t0v.elapsed().as_secs_f64() * 1e3;
+        (
+            b3_rows,
+            nu2,
+            union2.dense_m(),
+            shape2.circuit.cells().mu(),
+            prove_ms,
+            verify_ms,
+            bincode::serialize(&oproof).map(|b| b.len()).unwrap_or(0),
+        )
+    };
+
     println!(
-        "\nMVP-10 SWAP step 1 — the LEAF OUTER as the inner (tape pinned)\n  \
+        "\nMVP-10 SWAP steps 1+2 — the LEAF OUTER as the inner\n  \
          inner: dense_m {} | mu {} | levels (q, depth) {:?}\n  \
-         pd claims {} (element pair + {} gathers) | P {} | L0 lanes {}/{}\n",
+         pd claims {} (element pair + {} gathers) | P {} | L0 lanes {}/{}\n  \
+         outer-of-outer: b3 rows {} | nu {} | dense_m {} | mu {}\n  \
+         carries: the chain, the QUERY PHASE (real-inner scale), PoW\n  \
+         prove {:.0} ms | verify {:.0} ms | proof {:.1} KiB\n",
         lo.pcs.m,
         lo.shape.circuit.cells().mu(),
         geo.iter().map(|g| (g.q, g.depth)).collect::<Vec<_>>(),
@@ -8143,6 +8467,13 @@ fn mvp10_leaf_outer_inner_tape() {
         n_p,
         geo[0].row_words,
         geo[0].lanes,
+        outer_stats.0,
+        outer_stats.1,
+        outer_stats.2,
+        outer_stats.3,
+        outer_stats.4,
+        outer_stats.5,
+        outer_stats.6 as f64 / 1024.0,
     );
 }
 
