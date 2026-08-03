@@ -121,7 +121,10 @@ impl RowSupport {
     }
 
     /// Whether the support is sparse enough for the row rounds to pay off.
-    fn worth_skipping(&self, nu: usize) -> bool {
+    /// `pub(crate)`: the union's witness assembly gates its live-only
+    /// `pa`/`pb` derivation on the SAME predicate (see
+    /// `element_r1cs::union::dead_rows_unread`), so the two cannot drift.
+    pub(crate) fn worth_skipping(&self, nu: usize) -> bool {
         nu > 0 && self.live_rows() * SPARSE_GATE <= self.live.len() << nu
     }
 

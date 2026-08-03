@@ -374,8 +374,8 @@ impl ElementTableType {
         // is fine here — no memset tax.
         let mut az = crate::alloc_uninit_vec::<F128>(z.len());
         let mut bz = crate::alloc_uninit_vec::<F128>(z.len());
-        gather_into(&self.a_0, z, n_log, None, &mut az);
-        gather_into(&self.b_0, z, n_log, None, &mut bz);
+        gather_into(&self.a_0, z, n_log, None, None, &mut az);
+        gather_into(&self.b_0, z, n_log, None, None, &mut bz);
         (az, bz)
     }
 
@@ -389,12 +389,26 @@ impl ElementTableType {
     ///
     /// This is the in-place path the union's element witness assembly uses:
     /// the destinations are slices of the padded union `a`/`b` buffers.
-    pub fn affine_products_into(&self, z: &[F128], n_log: usize, pa: &mut [F128], pb: &mut [F128]) {
+    ///
+    /// `live = Some(n)` writes only rows `[0, n)` per column — the relation is
+    /// row-diagonal, so the live prefix is exact — and leaves the dead rows
+    /// UNWRITTEN (they hold buffer background, not the constants the full pass
+    /// writes). Sound only when nothing reads them: the region zerocheck's
+    /// sparse path substitutes dead halves from `RowSupport::{a,b}_dead`
+    /// analytically. Callers gate on `element_r1cs::union::dead_rows_unread`.
+    pub fn affine_products_into(
+        &self,
+        z: &[F128],
+        n_log: usize,
+        live: Option<usize>,
+        pa: &mut [F128],
+        pb: &mut [F128],
+    ) {
         assert_eq!(z.len(), self.width() << n_log, "witness length");
         assert_eq!(pa.len(), z.len(), "pa length");
         assert_eq!(pb.len(), z.len(), "pb length");
-        gather_into(&self.a_0, z, n_log, Some(&self.a_const), pa);
-        gather_into(&self.b_0, z, n_log, Some(&self.b_const), pb);
+        gather_into(&self.a_0, z, n_log, Some(&self.a_const), live, pa);
+        gather_into(&self.b_0, z, n_log, Some(&self.b_const), live, pb);
     }
 
     /// Brute-force check that every row `j < n` satisfies the relation and that
@@ -428,21 +442,27 @@ impl ElementTableType {
 /// one pass per stored matrix entry per row (`O(nnz · 2^n_log)`, no matrix
 /// application on any hot path). `c = None` means no constant. Parallel over
 /// the output's `2^n_log`-word column chunks, which are disjoint.
+/// `live = Some(n)` writes rows `[0, n)` only — exact per row (the relation is
+/// row-diagonal), dead rows left unwritten (see [`ElementTableType::
+/// affine_products_into`] for when that is sound).
 fn gather_into(
     m: &SparseF128Matrix,
     z: &[F128],
     n_log: usize,
     c: Option<&[F128]>,
+    live: Option<usize>,
     out: &mut [F128],
 ) {
     use rayon::prelude::*;
     let rows = 1usize << n_log;
+    let n = live.map_or(rows, |l| l.min(rows));
     debug_assert_eq!(out.len(), m.num_rows << n_log);
     out.par_chunks_mut(rows).enumerate().for_each(|(y, dst)| {
         let seed = c.map_or(F128::ZERO, |c| c[y]);
+        let dst = &mut dst[..n];
         dst.fill(seed);
         for &(col, coeff) in &m.rows[y] {
-            let src = &z[col << n_log..(col << n_log) + rows];
+            let src = &z[col << n_log..(col << n_log) + n];
             for (d, s) in dst.iter_mut().zip(src) {
                 *d += coeff * *s;
             }

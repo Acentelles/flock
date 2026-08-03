@@ -605,6 +605,12 @@ fn collapse_rows(z: &[F128], r_row: &[F128], live: Option<&[usize]>) -> Vec<F128
 /// [`ElementTableType::affine_products_into`] derives `pa`/`pb` in place by
 /// sparse gather.
 ///
+/// `live = Some(n_t)` derives only the declared rows' `pa`/`pb`, leaving dead
+/// rows unwritten — pass it exactly when [`dead_rows_unread`] holds (the
+/// region zerocheck will run its sparse path, which substitutes dead halves
+/// from `RowSupport::{a,b}_dead` analytically and never reads them; pinned
+/// byte-identical by `dummy_row_is_structurally_invisible_under_the_union`).
+///
 /// This is the union's in-place witness path for element slots — the
 /// `SlotWitnessDest` counterpart of the boolean drivers, minus the lincheck
 /// stripe (the element lincheck folds the committed region directly, so there
@@ -612,6 +618,7 @@ fn collapse_rows(z: &[F128], r_row: &[F128], live: Option<&[usize]>) -> Vec<F128
 pub fn fill_slot(
     ty: &ElementTableType,
     nu: usize,
+    live: Option<usize>,
     z: &mut [F128],
     pa: &mut [F128],
     pb: &mut [F128],
@@ -620,7 +627,53 @@ pub fn fill_slot(
     let words = ty.width() << nu;
     assert_eq!(z.len(), words, "element slot z block");
     generate(z);
-    ty.affine_products_into(z, nu, pa, pb);
+    ty.affine_products_into(z, nu, live, pa, pb);
+}
+
+/// Whether the region zerocheck will take its SPARSE row rounds — the arm
+/// that never reads dead rows of `pa`/`pb` (their values are substituted
+/// analytically from the per-column constants). This is the gate for
+/// live-only `pa`/`pb` derivation ([`fill_slot`]'s `live`) and for the
+/// live-span region copy ([`copy_live_region`]): both are byte-identical to
+/// the full versions exactly when this holds, because the words they leave
+/// unwritten are unread everywhere.
+pub fn dead_rows_unread(union: &UnionInstance<'_>) -> bool {
+    let slots = region_slots(union);
+    if slots.is_empty() {
+        return false;
+    }
+    let (nu, e_vars) = (union.n_log(), union.m_elem() - 7);
+    row_support(&slots, nu, e_vars).worth_skipping(nu)
+}
+
+/// The element region's `a`/`b` tables copied LIVE SPANS ONLY into
+/// lazy-zeroed buffers: per slot, per used column, rows `[0, n_t)`. Only
+/// valid under [`dead_rows_unread`] — the sparse zerocheck reads live
+/// prefixes and substitutes dead values analytically, so the zeros this
+/// leaves where the full copy would have carried constants (or a dirty
+/// buffer's stale words) are never observed. `a_region`/`b_region` are the
+/// element word ranges of the padded union buffers.
+pub fn copy_live_region(
+    union: &UnionInstance<'_>,
+    a_region: &[F128],
+    b_region: &[F128],
+) -> (Vec<F128>, Vec<F128>) {
+    let (nu, e_vars) = (union.n_log(), union.m_elem() - 7);
+    let words = 1usize << e_vars;
+    assert_eq!(a_region.len(), words, "element region a length");
+    assert_eq!(b_region.len(), words, "element region b length");
+    let mut pa = crate::alloc_zeroed_vec::<F128>(words);
+    let mut pb = crate::alloc_zeroed_vec::<F128>(words);
+    for s in region_slots(union) {
+        let off = s.layout.column_offset(nu);
+        let n_t = s.layout.n_t;
+        for y in 0..s.ty.k() {
+            let base = (off + y) << nu;
+            pa[base..base + n_t].copy_from_slice(&a_region[base..base + n_t]);
+            pb[base..base + n_t].copy_from_slice(&b_region[base..base + n_t]);
+        }
+    }
+    (pa, pb)
 }
 
 #[cfg(test)]
@@ -789,6 +842,7 @@ mod tests {
             fill_slot(
                 &c.ty,
                 nu,
+                None,
                 &mut z[range.clone()],
                 &mut pa[range.clone()],
                 &mut pb[range.clone()],
@@ -1105,6 +1159,7 @@ mod tests {
             cases[bad_slot].ty.affine_products_into(
                 &zc,
                 nu,
+                None,
                 &mut h.pa[range.clone()],
                 &mut h.pb[range.clone()],
             );
@@ -1158,6 +1213,7 @@ mod tests {
             cases[0].ty.affine_products_into(
                 &zc,
                 nu,
+                None,
                 &mut h.pa[range.clone()],
                 &mut h.pb[range.clone()],
             );
@@ -1396,7 +1452,7 @@ dense {:6.2} [{:5.2} – {:5.2}]  support {:6.2} [{:5.2} – {:5.2}]  {:4.1}x",
         let mut z = vec![F128::ZERO; words];
         let mut pa = vec![F128::ZERO; words];
         let mut pb = vec![F128::ZERO; words];
-        fill_slot(&ty, nu, &mut z, &mut pa, &mut pb, |dst| {
+        fill_slot(&ty, nu, None, &mut z, &mut pa, &mut pb, |dst| {
             dst.copy_from_slice(&rows)
         });
         assert_eq!(z, rows);

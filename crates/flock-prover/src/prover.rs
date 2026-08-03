@@ -428,11 +428,19 @@ fn build_union_witness(
     let (mut z, mut a, mut b, mode) = union.take_witness_buffers(padding_unread);
     let elide = mode != flock_core::union::WitnessBufMode::PooledZeroed;
     let nu = union.n_log();
+    // Live-only element `pa`/`pb` derivation: when the region zerocheck will
+    // take its sparse arm, dead rows of `a`/`b` are unread everywhere (their
+    // values are substituted analytically), so the gather skips them — the
+    // same pay-per-live discipline the boolean side's run-lists apply. Gated
+    // by the zerocheck's OWN predicate so the two cannot drift.
+    let elem_live = union.has_element()
+        && flock_core::element_r1cs::union::dead_rows_unread(union);
     let stripes = union
         .slot_dests(&mut z, &mut a, &mut b, elide)
         .into_iter()
         .zip(sources)
-        .map(|(dst, source)| match source {
+        .enumerate()
+        .map(|(i, (dst, source))| match source {
             UnionSlotWitnessSource::InPlace(generate) => generate(dst),
             UnionSlotWitnessSource::Prebuilt {
                 witness,
@@ -444,7 +452,10 @@ fn build_union_witness(
                 z_lincheck
             }
             UnionSlotWitnessSource::Element { ty, generate } => {
-                flock_core::element_r1cs::union::fill_slot(&ty, nu, dst.z, dst.a, dst.b, generate);
+                let live = elem_live.then(|| union.counts()[i]);
+                flock_core::element_r1cs::union::fill_slot(
+                    &ty, nu, live, dst.z, dst.a, dst.b, generate,
+                );
                 Vec::new()
             }
         })
@@ -678,9 +689,12 @@ fn prove_union_with_binding<Ch: Challenger>(
     // reads declared rows only, and (when s_hat_v is precomputed) the
     // ring-switch succinct step reads nothing bulk. Padding may therefore
     // stay dirty in pooled resident buffers. NOT extended to the element
-    // class (the element PIOP copies its whole word range and its region
-    // buffers' dirty-padding behavior has not been audited — a follow-up),
-    // and NOT under IDENTITY compaction: there q IS the padded buffer, so
+    // class for `z`: the element zerocheck debug-asserts `z` is zero on
+    // every dead word and the region PIOP folds the committed words, so
+    // the element `z` blocks must be honestly written in full. (`a`/`b`
+    // dead rows ARE elided on the sparse-zerocheck arm — see
+    // `build_union_witness` — that part of the old follow-up is done.)
+    // And NOT under IDENTITY compaction: there q IS the padded buffer, so
     // its padding words are committed and must be honest zeros — dirty
     // pooling would put garbage into the committed stack (a latent hazard
     // of the pre-unification standalone body, never exercised there).
@@ -782,25 +796,33 @@ fn prove_union_with_binding<Ch: Challenger>(
     // zerocheck recycles those buffers. `2^(M_elem−7)` words each — the element
     // area, not the capacity.
     //
-    // **This copy must be FAITHFUL, not compacted.** It is tempting to copy
-    // only the live runs (slot `t`'s BatchMajor word is `(col << nu) + row`, so
-    // its declared content is `used_cols` runs of `n_t` words) and leave the
-    // rest as lazy zero pages — at the recursion shape the region is ~1% live
-    // and that turns 18 ms of memcpy into 0.5 ms. It is WRONG: dummy rows being
-    // zero is an invariant the honest witness path maintains, not one this code
-    // enforces, and `union_element::satisfying_dummy_row_is_rejected_under_the_union`
-    // exists precisely because a prover can put satisfying content in a dummy
-    // row. Compacting here would sanitize that content out of `a`/`b` while the
-    // commitment still carries it. Tried 2026-08-01; a `debug_assert` comparing
-    // against the full slice caught it.
+    // On the sparse-zerocheck arm (`dead_rows_unread` — the same predicate
+    // that gated the live-only derivation above, so dead rows of `a`/`b`
+    // were never even written) the copy takes LIVE SPANS ONLY into
+    // lazy-zeroed buffers: the sparse row rounds read live prefixes and
+    // substitute dead values analytically from `RowSupport::{a,b}_dead`,
+    // so the zeros left behind are unread — byte-identical, pinned by
+    // `dummy_row_is_structurally_invisible_under_the_union`. (An earlier
+    // note here forbade compacting this copy outright, citing the jagged-
+    // era rejection posture; on the merged transport dead words are
+    // structurally invisible and the DENSE arm below keeps the faithful
+    // full copy.)
     //
-    // The region being sized by CAPACITY (`2^(nu + k_log)` per slot) rather
-    // than by counts is what makes this expensive when `nu` is large. That is a
-    // union-layout question, not one this copy can answer.
+    // On the dense arm (> 50% region utilization) the zerocheck reads the
+    // whole region, so the copy stays faithful — including whatever the
+    // full derivation wrote on dead rows (the per-column constants).
     let t = std::time::Instant::now();
     let element_ab: Option<(Vec<F128>, Vec<F128>)> = union.has_element().then(|| {
         let r = union.element_word_range();
-        (a_packed_f128[r.clone()].to_vec(), b_packed_f128[r].to_vec())
+        if flock_core::element_r1cs::union::dead_rows_unread(union) {
+            flock_core::element_r1cs::union::copy_live_region(
+                union,
+                &a_packed_f128[r.clone()],
+                &b_packed_f128[r],
+            )
+        } else {
+            (a_packed_f128[r.clone()].to_vec(), b_packed_f128[r].to_vec())
+        }
     });
 
     if trace && element_ab.is_some() {

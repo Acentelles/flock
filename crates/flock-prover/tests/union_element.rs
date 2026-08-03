@@ -1365,6 +1365,7 @@ fn mixed_class_cost_probe() {
                 flock_core::element_r1cs::union::fill_slot(
                     &ty,
                     nu,
+                    None,
                     &mut zr[..slot_words],
                     &mut ar[..slot_words],
                     &mut brr[..slot_words],

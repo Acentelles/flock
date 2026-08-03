@@ -1158,7 +1158,7 @@ fn mvp2b_full_element_zerocheck_replayed() {
     };
     assert!(ety.satisfies(&z, n_log, 1 << n_log));
     let (mut pa, mut pb) = (vec![F128::ZERO; z.len()], vec![F128::ZERO; z.len()]);
-    ety.affine_products_into(&z, n_log, &mut pa, &mut pb);
+    ety.affine_products_into(&z, n_log, None, &mut pa, &mut pb);
 
     let mut ch_p = FsChallenger::with_hash(D, HashKind::Blake3);
     let (zc_proof, _) = zerocheck::prove_with_label(LABEL, pa, pb, &z, m_words, &mut ch_p);
