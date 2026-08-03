@@ -2235,7 +2235,7 @@ fn emit_fs_chain(
     stream: &flock_core::transcript_record::Stream,
     bytes: &[u8],
     vals: &mut Vec<F128>,
-) -> Vec<Vec<Wire>> {
+) -> (Vec<Vec<Wire>>, Vec<Option<Wire>>) {
     use flock_prover::r1cs_hashes::fs_chain::CvSource;
     let mut word_wire: Vec<Option<Wire>> = vec![None; stream.words.len()];
     let mut outs: Vec<Vec<Wire>> = Vec::with_capacity(trace.rows.len());
@@ -2301,7 +2301,98 @@ fn emit_fs_chain(
         gate_in.push(g_in);
         outs.push(sb.gate(b3, &g_in));
     }
-    outs
+    (outs, word_wire)
+}
+
+/// The sumcheck-spine gate: one fold-and-eval step of the verifier's running
+/// quadratic, `RoundQuad` in circuit form (char-2, so `u1 = t + u0` is the
+/// linear coefficient trick):
+///
+///   c' = c + beta*u0     b' = b + beta*(y + u2)     a' = a + beta*u2
+///   tr' = tr + beta*y    t' = c' + r*b' + r^2*a'
+///
+/// Three degenerate uses cover every verifier step with ONE table type:
+/// BUILD `from_msg` (zero quad in, beta = 1, y = the running target),
+/// EVAL a held quad (beta = 0; only t' consumed), and INTRO-FOLD an OOD or
+/// enforced-sum claim (consume c', b', a', tr'; t' unwired).
+struct SpineGate {
+    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+}
+
+const SP_IN: usize = 9; // c b a tr u0 u2 y beta r
+const SP_K: usize = 21;
+
+impl SpineGate {
+    fn new() -> Self {
+        use flock_core::element_r1cs::ElementTableBuilder;
+        let one = F128::ONE;
+        let (c, b, a, tr, u0, u2, y, beta, r) = (0, 1, 2, 3, 4, 5, 6, 7, 8);
+        let (pc, pb, pa, pt, co, bo, ao, tro, r2, m1, m2, to) =
+            (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20);
+        let mut bld = ElementTableBuilder::new(5);
+        for w in 0..SP_IN {
+            bld.free_wire(w);
+        }
+        bld.mult(pc, beta, u0)
+            .mult_lin(pb, &[(y, one), (u2, one)], &[(beta, one)])
+            .mult(pa, beta, u2)
+            .mult(pt, beta, y)
+            .linear(co, &[(c, one), (pc, one)])
+            .linear(bo, &[(b, one), (pb, one)])
+            .linear(ao, &[(a, one), (pa, one)])
+            .linear(tro, &[(tr, one), (pt, one)])
+            .mult(r2, r, r)
+            .mult(m1, r, bo)
+            .mult(m2, r2, ao)
+            .linear(to, &[(co, one), (m1, one), (m2, one)]);
+        Self {
+            ty: std::sync::Arc::new(bld.build().expect("spine gate is valid")),
+        }
+    }
+}
+
+impl GateType for SpineGate {
+    type Row = Vec<F128>;
+    type Hint = ();
+
+    fn table(&self) -> TableType {
+        use flock_core::schedule::IoWord;
+        let mut schema: Vec<IoWord> = (0..SP_IN).map(IoWord::input).collect();
+        for o in [13, 14, 15, 16, 20] {
+            schema.push(IoWord::output(o));
+        }
+        TableType::element(self.ty.clone()).with_io_schema(schema)
+    }
+
+    fn eval(&self, inputs: &[F128], _hint: &()) -> (Vec<F128>, Self::Row) {
+        let mut z = vec![F128::ZERO; SP_K];
+        z[..SP_IN].copy_from_slice(&inputs[..SP_IN]);
+        let (c, b, a, tr, u0, u2, y, beta, r) =
+            (z[0], z[1], z[2], z[3], z[4], z[5], z[6], z[7], z[8]);
+        z[9] = beta * u0;
+        z[10] = (y + u2) * beta;
+        z[11] = beta * u2;
+        z[12] = beta * y;
+        z[13] = c + z[9];
+        z[14] = b + z[10];
+        z[15] = a + z[11];
+        z[16] = tr + z[12];
+        z[17] = r * r;
+        z[18] = r * z[14];
+        z[19] = z[17] * z[15];
+        z[20] = z[13] + z[18] + z[19];
+        (vec![z[13], z[14], z[15], z[16], z[20]], z)
+    }
+
+    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
+        let mut z = vec![F128::ZERO; self.ty.width() << nu];
+        for (j, row) in rows.iter().enumerate() {
+            for (col, &v) in row.iter().enumerate() {
+                z[(col << nu) + j] = v;
+            }
+        }
+        SlotWitness::Element(z)
+    }
 }
 
 /// One open-phase level, located on a recorded op tape. `*_fin` are finalize
@@ -2310,6 +2401,16 @@ fn emit_fs_chain(
 struct OpenLevel {
     fold_fins: Vec<usize>,
     fold_chs: Vec<usize>,
+    /// Value index of each fold round's message `u_0` (`u_2` is `+1`).
+    fold_msg_vs: Vec<usize>,
+    /// OOD claims folded before this level's queries:
+    /// `(y value idx, intro-msg value idx, beta fin, beta ch)`.
+    ood: Vec<(usize, usize, usize, usize)>,
+    /// The level's intro message value idx (unused for the final level).
+    intro_v: usize,
+    /// The intro/final beta: `(fin, ch)`.
+    beta_fin: usize,
+    beta_ch: usize,
     q_fin: usize,
     q_ch: usize,
     q_count: usize,
@@ -2327,13 +2428,14 @@ fn parse_open_levels(
     ops: &[flock_core::transcript_record::TranscriptOp],
     cap0_bytes: usize,
     r: usize,
-) -> Vec<OpenLevel> {
+) -> (usize, Vec<OpenLevel>) {
     use flock_core::transcript_record::TranscriptOp as Op;
     struct Cur<'a> {
         ops: &'a [Op],
         i: usize,
         fin: usize,
         ch: usize,
+        v: usize,
     }
     impl Cur<'_> {
         fn bump(&mut self) {
@@ -2344,6 +2446,8 @@ fn parse_open_levels(
             match op {
                 Op::SqueezeScalar => self.ch += 1,
                 Op::SqueezeSlice(n) => self.ch += n,
+                Op::ObserveScalar => self.v += 1,
+                Op::ObserveSlice(n) => self.v += n,
                 _ => {}
             }
             self.i += 1;
@@ -2369,11 +2473,12 @@ fn parse_open_levels(
         .collect();
     assert!(starts.len() >= 2, "expected bind + open cap absorbs");
     let start = *starts.last().unwrap();
-    let mut cur = Cur { ops, i: 0, fin: 0, ch: 0 };
+    let mut cur = Cur { ops, i: 0, fin: 0, ch: 0, v: 0 };
     while cur.i < start {
         cur.bump();
     }
     cur.bump(); // the open-phase initial cap absorb
+    let start_v = cur.v;
     cur.expect_obs_scalar(); // sumcheck start msg u_0
     cur.expect_obs_scalar(); // ... u_2
 
@@ -2384,6 +2489,7 @@ fn parse_open_levels(
         // this loop and must survive it.
         let mut fold_fins = Vec::new();
         let mut fold_chs = Vec::new();
+        let mut fold_msg_vs = Vec::new();
         loop {
             match cur.ops[cur.i] {
                 Op::Pow { .. }
@@ -2395,12 +2501,14 @@ fn parse_open_levels(
                     fold_fins.push(cur.fin);
                     fold_chs.push(cur.ch);
                     cur.bump();
+                    fold_msg_vs.push(cur.v);
                     cur.expect_obs_scalar();
                     cur.expect_obs_scalar();
                 }
                 _ => break,
             }
         }
+        let mut ood = Vec::new();
         if li < r {
             // The NEXT commitment's cap, then its OOD groups.
             assert!(
@@ -2413,10 +2521,13 @@ fn parse_open_levels(
             while !matches!(cur.ops[cur.i], Op::Pow { .. }) {
                 assert!(matches!(cur.ops[cur.i], Op::SqueezeSlice(_)), "OOD z");
                 cur.bump();
+                let y_v = cur.v;
                 cur.expect_obs_scalar(); // y
+                let intro_v = cur.v;
                 cur.expect_obs_scalar(); // intro u_0
                 cur.expect_obs_scalar(); // intro u_2
                 assert!(matches!(cur.ops[cur.i], Op::SqueezeScalar), "OOD beta");
+                ood.push((y_v, intro_v, cur.fin, cur.ch));
                 cur.bump();
             }
         } else {
@@ -2442,15 +2553,22 @@ fn parse_open_levels(
             ref o => panic!("op {}: expected alpha squeeze, got {o:?}", cur.i),
         };
         cur.bump();
+        let intro_v = cur.v;
         if li < r {
             cur.expect_obs_scalar(); // intro u_0
             cur.expect_obs_scalar(); // intro u_2
         }
         assert!(matches!(cur.ops[cur.i], Op::SqueezeScalar), "beta");
+        let (beta_fin, beta_ch) = (cur.fin, cur.ch);
         cur.bump();
         levels.push(OpenLevel {
             fold_fins,
             fold_chs,
+            fold_msg_vs,
+            ood,
+            intro_v,
+            beta_fin,
+            beta_ch,
             q_fin,
             q_ch,
             q_count,
@@ -2459,7 +2577,7 @@ fn parse_open_levels(
             a_count,
         });
     }
-    levels
+    (start_v, levels)
 }
 
 // ---------------------------------------------------------------------------
@@ -2483,8 +2601,14 @@ fn parse_open_levels(
 ///   The checker masks, indexes the cap, and compares the sums against
 ///   natively recomputed `enforced_sum` values.
 ///
-/// The PoW bit-predicates and the residual/eval_b arithmetic above the query
-/// phase stay native (step 2, transcription). The inner proof commits with
+/// **Step 2a, the sumcheck spine, is IN**: one `SpineGate` element type
+/// replays the verifier's running quadratic across all levels — build from
+/// each message, eval at each chain challenge, intro-fold every OOD claim and
+/// enforced sum (the LeafEval accumulators, consumed in-circuit rather than
+/// boundary-checked) — and publishes the final `t_r`, checked against a
+/// native replay. The start target is a fixed public input until the merged
+/// intake lands (2c). Still native: the residual/eval_b arithmetic (2b) and
+/// the PoW bit-predicates. The inner proof commits with
 /// the lane grid at full utilization — count 2^13 x 4 cols = 2^15 words =
 /// exactly 2^22 dense bits, t = 64 — so L0 is the real 64-lane / 1 KiB-leaf
 /// shape with zero padding.
@@ -2501,6 +2625,10 @@ fn mvp7_real_query_phase() {
     use std::time::Instant;
 
     const DOMAIN7: &[u8] = b"flock-mvp7-real-v0";
+    /// The spine's start target. UNBOUND in 2a — its true value is the merged
+    /// intake's gamma-combination (step 2c); any fixed nonzero value
+    /// exercises the full quad chain against the native replay below.
+    const T0: F128 = F128::new(0xDEAD, 0xBEEF);
     const INNER_NU: usize = 13;
     let threads = flock_core::init_perf_thread_pool().unwrap_or_else(rayon::current_num_threads);
 
@@ -2601,7 +2729,7 @@ fn mvp7_real_query_phase() {
             }
         })
         .collect();
-    let levels = parse_open_levels(t_shape.ops(), 32 * lig.initial_cap.len(), r);
+    let (start_v, levels) = parse_open_levels(t_shape.ops(), 32 * lig.initial_cap.len(), r);
     assert_eq!(levels.len(), r + 1);
 
     // Per level: q, c, path depth d-c, lanes — and the native cross-checks
@@ -2711,18 +2839,34 @@ fn mvp7_real_query_phase() {
         })
         .collect();
 
+    let spine = sb.slot(SpineGate::new());
+    leaf_slot.push((0, spine));
+
     let mut vals: Vec<F128> = Vec::new();
     let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
     vals.extend_from_slice(&iv_w);
     let iv = [sb.public_input(), sb.public_input()];
-    let outs = emit_fs_chain(&mut sb, slots.b3, iv, &trace, &stream, &bytes, &mut vals);
+    let (outs, word_wire) = emit_fs_chain(&mut sb, slots.b3, iv, &trace, &stream, &bytes, &mut vals);
+    // Observed-value index -> absorbed-stream word index, for wiring the
+    // sumcheck messages (they are absorbed proof scalars, so their wires
+    // already exist as the chain's block inputs).
+    let mut vmap: Vec<Option<usize>> = Vec::new();
+    for (wi, w) in stream.words.iter().enumerate() {
+        if let flock_core::transcript_record::StreamWord::Value(vi) = *w {
+            if vmap.len() <= vi {
+                vmap.resize(vi + 1, None);
+            }
+            vmap[vi] = Some(wi);
+        }
+    }
 
     let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
     // (alpha wires, per-query (cw, cv), acc) per level — published AFTER the
     // loop: `built.public` lists entries in DECLARATION order, so publishing
     // inside the loop would interleave with the next level's public inputs
     // and break the tail walk below.
-    let mut to_publish: Vec<(Vec<Wire>, Vec<(Wire, [Wire; 2])>, Wire)> = Vec::new();
+    let mut to_publish: Vec<(Vec<Wire>, Vec<(Wire, [Wire; 2])>)> = Vec::new();
+    let mut level_accs: Vec<Wire> = Vec::new();
     for (li, lvl) in levels.iter().enumerate() {
         let g = &geo[li];
         let (_, rows, paths) = lvl_src[li];
@@ -2759,9 +2903,60 @@ fn mvp7_real_query_phase() {
             a_in.push(acc);
             acc = sb.gate(leafeval[li], &a_in)[0];
         }
-        to_publish.push((a_wires, opens, acc));
+        to_publish.push((a_wires, opens));
+        level_accs.push(acc);
     }
-    for (a_wires, opens, acc) in &to_publish {
+
+    // ---- the sumcheck spine (2a): the verifier's running quad, in-circuit ----
+    // BUILD from the start message at the (for now unbound) start target; per
+    // fold round EVAL at the chain's challenge then BUILD from the next
+    // message; at level boundaries INTRO-FOLD the OOD claims and the level's
+    // enforced sum — the LeafEval accumulators, consumed here instead of
+    // boundary-checked. The start target becomes intake arithmetic later; a
+    // fixed nonzero value exercises every gate on real data meanwhile.
+    vals.push(F128::ZERO);
+    let zw = sb.public_input();
+    vals.push(F128::ONE);
+    let ow = sb.public_input();
+    vals.push(T0);
+    let mut tw = sb.public_input();
+    let chw = |outs: &Vec<Vec<Wire>>, trace_sq: &Vec<Vec<usize>>, fin: usize| -> Wire {
+        outs[trace_sq[fin][0]][0]
+    };
+    let wv = |vi: usize| -> Wire { word_wire[vmap[vi].expect("stream word")].expect("wired") };
+    let st = sb.gate(spine, &[zw, zw, zw, zw, wv(start_v), wv(start_v + 1), tw, ow, zw]);
+    let (mut qc, mut qb, mut qa) = (st[0], st[1], st[2]);
+    for (li, lvl) in levels.iter().enumerate() {
+        for (j, &mv) in lvl.fold_msg_vs.iter().enumerate() {
+            let rw = chw(&outs, &trace.squeezes, lvl.fold_fins[j]);
+            let ev = sb.gate(spine, &[qc, qb, qa, zw, zw, zw, zw, zw, rw]);
+            tw = ev[4];
+            let bld = sb.gate(spine, &[zw, zw, zw, zw, wv(mv), wv(mv + 1), tw, ow, zw]);
+            (qc, qb, qa) = (bld[0], bld[1], bld[2]);
+        }
+        if li < r {
+            for &(y_v, intro_v, beta_fin, _) in &lvl.ood {
+                let bw = chw(&outs, &trace.squeezes, beta_fin);
+                let f = sb.gate(
+                    spine,
+                    &[qc, qb, qa, tw, wv(intro_v), wv(intro_v + 1), wv(y_v), bw, zw],
+                );
+                (qc, qb, qa, tw) = (f[0], f[1], f[2], f[3]);
+            }
+            let bw = chw(&outs, &trace.squeezes, lvl.beta_fin);
+            let f = sb.gate(
+                spine,
+                &[qc, qb, qa, tw, wv(lvl.intro_v), wv(lvl.intro_v + 1), level_accs[li], bw, zw],
+            );
+            (qc, qb, qa, tw) = (f[0], f[1], f[2], f[3]);
+        } else {
+            let bw = chw(&outs, &trace.squeezes, lvl.beta_fin);
+            let f = sb.gate(spine, &[zw, zw, zw, tw, zw, zw, level_accs[li], bw, zw]);
+            tw = f[3];
+        }
+    }
+    let t_final = tw;
+    for (a_wires, opens) in &to_publish {
         for w in a_wires {
             sb.publish(*w);
         }
@@ -2770,8 +2965,8 @@ fn mvp7_real_query_phase() {
             sb.publish(cv[0]);
             sb.publish(cv[1]);
         }
-        sb.publish(*acc);
     }
+    sb.publish(t_final);
     let shape = sb.finish().expect("valid real-query circuit");
     let setup_ms = t.elapsed().as_secs_f64() * 1e3;
 
@@ -2780,11 +2975,11 @@ fn mvp7_real_query_phase() {
     let (built, online_t) = timed(REPS, || shape.run(&vals, &hint_refs));
 
     // ---- the boundary checks ----
-    let total_pub: usize = levels
+    let total_pub: usize = 1 + levels
         .iter()
         .zip(&geo)
-        .map(|(l, g)| l.a_count + 3 * g.q + 1)
-        .sum();
+        .map(|(l, g)| l.a_count + 3 * g.q)
+        .sum::<usize>();
     let mut at = built.public.len() - total_pub;
     for (li, lvl) in levels.iter().enumerate() {
         let g = &geo[li];
@@ -2805,9 +3000,36 @@ fn mvp7_real_query_phase() {
             );
             at += 3;
         }
-        assert_eq!(built.public[at], native_sums[li], "L{li} enforced sum");
-        at += 1;
     }
+    // The spine, replayed natively over the recorded transcript: same quad
+    // math, same start target, native enforced sums. Equality transitively
+    // validates every eval/build/fold gate AND the LeafEval accumulators.
+    let vals_rec = rec.values();
+    let quad = |u0: F128, u2: F128, t: F128| (u0, t + u2, u2);
+    let evalq = |q: (F128, F128, F128), x: F128| q.0 + x * q.1 + x * x * q.2;
+    let mut nt = T0;
+    let mut nq = quad(vals_rec[start_v], vals_rec[start_v + 1], nt);
+    for (li, lvl) in levels.iter().enumerate() {
+        for (j, &mv) in lvl.fold_msg_vs.iter().enumerate() {
+            nt = evalq(nq, chals[lvl.fold_chs[j]]);
+            nq = quad(vals_rec[mv], vals_rec[mv + 1], nt);
+        }
+        if li < levels.len() - 1 {
+            for &(y_v, intro_v, _, beta_ch) in &lvl.ood {
+                let b = chals[beta_ch];
+                let iq = quad(vals_rec[intro_v], vals_rec[intro_v + 1], vals_rec[y_v]);
+                nq = (nq.0 + b * iq.0, nq.1 + b * iq.1, nq.2 + b * iq.2);
+                nt += b * vals_rec[y_v];
+            }
+            let b = chals[lvl.beta_ch];
+            let iq = quad(vals_rec[lvl.intro_v], vals_rec[lvl.intro_v + 1], native_sums[li]);
+            nq = (nq.0 + b * iq.0, nq.1 + b * iq.1, nq.2 + b * iq.2);
+            nt += b * native_sums[li];
+        } else {
+            nt += chals[lvl.beta_ch] * native_sums[li];
+        }
+    }
+    assert_eq!(built.public[at], nt, "the spine's final t_r");
 
     // ---- prove / verify the circuit itself ----
     let union = UnionInstance::new(&shape.registry, shape.counts.clone());
@@ -3332,6 +3554,9 @@ fn mvp6_all_levels_collapsed() {
 
     // Values are pushed in DECLARATION order throughout; `emit_opening` pushes
     // its own params into the same vector as it declares them.
+    let spine = sb.slot(SpineGate::new());
+    leaf_slot.push((0, spine));
+
     let mut vals: Vec<F128> = Vec::new();
     let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
     vals.extend_from_slice(&iv_w);
