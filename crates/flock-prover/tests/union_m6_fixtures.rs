@@ -229,12 +229,8 @@ fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
             circuit,
         );
         let mut ch = FsChallenger::new(DOMAIN);
-        let (proof, commitment, claim) = prover::prove_fast_ligerito_union(
-            &union,
-            &setup.pcs_params,
-            vec![slot],
-            &mut ch,
-        );
+        let (proof, commitment, claim) =
+            prover::prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
         check(
             "merged-anchor-blake3-m22",
             EXPECTED,
@@ -261,12 +257,8 @@ fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
             circuit,
         );
         let mut ch = FsChallenger::new(DOMAIN);
-        let (proof, commitment, claim) = prover::prove_fast_ligerito_union(
-            &union,
-            &setup.pcs_params,
-            vec![slot],
-            &mut ch,
-        );
+        let (proof, commitment, claim) =
+            prover::prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
         check(
             "merged-anchor-sha2-m22",
             EXPECTED,

@@ -1330,7 +1330,7 @@ mod tests {
     #[test]
     #[ignore]
     fn row_major_vs_column_major_weight_build() {
-        use crate::pcs::jagged::{JaggedParams, build_merged_weight_and_prime};
+        use crate::pcs::jagged::{JaggedParams, MergedWeightClaim, build_merged_weight_and_prime};
         use crate::union::UnionInstance;
 
         let _ = crate::init_perf_thread_pool();
@@ -1384,8 +1384,19 @@ mod tests {
             }
             best * 1e3
         };
+        // Upstream's builder takes `MergedWeightClaim`; ring-switched claims are
+        // the `Folded` arm (an F₂-linear fold table), which is what the
+        // row-major builder still models.
+        let col_claims: Vec<MergedWeightClaim<'_>> = data
+            .iter()
+            .map(|(zr, zc, t)| MergedWeightClaim::Folded {
+                z_row: zr,
+                z_col: zc,
+                table: t,
+            })
+            .collect();
         let t_col = time(&|| {
-            let r = build_merged_weight_and_prime(&jp, &claims, &q);
+            let r = build_merged_weight_and_prime(&jp, &col_claims, &q);
             std::hint::black_box(&r.1);
             crate::scratch::give_f128(r.0);
         });

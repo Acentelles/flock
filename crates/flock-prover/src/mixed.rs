@@ -424,7 +424,7 @@ impl MerkleMixedSetup {
                 self.blake3_r1cs.csc_lincheck_circuit(),
             ),
         ];
-        prover::prove_fast_ligerito_jagged_union_merged(&union, &pcs_params, slots, challenger)
+        prover::prove_fast_ligerito_union(&union, &pcs_params, slots, challenger)
     }
 
     /// Verify against the declared counts. Params are re-derived from the
@@ -439,7 +439,7 @@ impl MerkleMixedSetup {
     ) -> Result<R1csClaim, VerifyError> {
         let union = self.union(counts);
         let pcs_params = self.pcs_params(counts, commitment.params.profile);
-        verifier::verify_ligerito_jagged_union_merged(
+        verifier::verify_ligerito_union(
             &union,
             &self.circuits(),
             commitment,

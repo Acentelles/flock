@@ -129,7 +129,7 @@ fn depth26_roundtrip() {
 
     let t = std::time::Instant::now();
     let mut ch_p = FsChallenger::new(DOMAIN);
-    let (proof, commitment, claim) = prover::prove_fast_ligerito_jagged_union_merged(
+    let (proof, commitment, claim) = prover::prove_fast_ligerito_union(
         &union,
         &pcs_params,
         vec![UnionSlotProverInput::new(witness, &s.walker)],
@@ -139,7 +139,7 @@ fn depth26_roundtrip() {
 
     let t = std::time::Instant::now();
     let mut ch_v = FsChallenger::new(DOMAIN);
-    let claim_v = verifier::verify_ligerito_jagged_union_merged(
+    let claim_v = verifier::verify_ligerito_union(
         &union,
         &[&s.walker],
         &commitment,
@@ -189,14 +189,14 @@ fn depth26_partial_counts_roundtrip() {
         let witness = s.layout.generate_witness_batch_major_partial(&paths, NU);
 
         let mut ch_p = FsChallenger::new(DOMAIN);
-        let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_merged(
+        let (proof, commitment, _) = prover::prove_fast_ligerito_union(
             &union,
             &pcs_params,
             vec![UnionSlotProverInput::new(witness, &s.walker)],
             &mut ch_p,
         );
         let mut ch_v = FsChallenger::new(DOMAIN);
-        verifier::verify_ligerito_jagged_union_merged(
+        verifier::verify_ligerito_union(
             &union,
             &[&s.walker],
             &commitment,
@@ -314,7 +314,7 @@ fn depth26_wrong_count_is_rejected() {
     let pcs_params = s.pcs_params(&union);
     let witness = s.layout.generate_witness_batch_major_partial(&paths, NU);
     let mut ch_p = FsChallenger::new(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_jagged_union_merged(
+    let (proof, commitment, _) = prover::prove_fast_ligerito_union(
         &union,
         &pcs_params,
         vec![UnionSlotProverInput::new(witness, &s.walker)],
@@ -324,7 +324,7 @@ fn depth26_wrong_count_is_rejected() {
     let lying = s.union(6);
     let mut ch_v = FsChallenger::new(DOMAIN);
     assert!(
-        verifier::verify_ligerito_jagged_union_merged(
+        verifier::verify_ligerito_union(
             &lying,
             &[&s.walker],
             &commitment,

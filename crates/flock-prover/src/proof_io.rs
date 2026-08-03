@@ -44,14 +44,7 @@ use flock_core::pcs::Commitment;
 pub const MAGIC: [u8; 5] = *b"FLOCK";
 
 /// Format version. Bumped on incompatible serialization changes.
-/// v7 (current) drops the Frobenius assist from the Mixed flavor's merged
-/// payload: since fancy jagged (ePrint 2025/917 §6) the dense stack is
-/// row-major-within-table and the verifier evaluates the twisted weight
-/// `Ŵ(ρ)` itself from the aligned tables, so `MergedOpenProof` no longer
-/// carries `frobenius` and the transcript absorbs no assist rounds. The
-/// commitment also changes: `q` is the row-major permutation of the same
-/// words, so v6 files are rejected.
-/// v6 switched the Mixed flavor's payload to the MERGED
+/// v6 (current) switched the Mixed flavor's payload to the MERGED
 /// jagged/ring-switch transport ([`MixedProofBundleLigerito`] now carries
 /// an `R1csProofMergedLigerito` — design doc §"Capacity-free
 /// ring-switching"); the R1cs/Chain flavors' payloads are unchanged, but
@@ -62,7 +55,7 @@ pub const MAGIC: [u8; 5] = *b"FLOCK";
 /// v3 restructured `BaseFoldProof`: per-query Merkle paths were replaced by
 /// shared octopus multi-proofs (one per Merkle tree). v2 added `HashKind`
 /// to [`ChainProofBundle`].
-pub const VERSION: u8 = 7;
+pub const VERSION: u8 = 6;
 
 /// Which hash function a chain proof is over. Carried in
 /// [`ChainProofBundle`] so the verifier (e.g. the CLI) can pick the right

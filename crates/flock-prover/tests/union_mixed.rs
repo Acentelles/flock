@@ -663,12 +663,8 @@ fn mixed_throughput_smoke() {
             blake3::generate_witness_batch_major(&blake3_inputs, nu),
             b3_circuit,
         );
-        let _ = prover::prove_fast_ligerito_union(
-            &b3_union,
-            &b3_setup.pcs_params,
-            vec![slot],
-            &mut ch,
-        );
+        let _ =
+            prover::prove_fast_ligerito_union(&b3_union, &b3_setup.pcs_params, vec![slot], &mut ch);
         if timed {
             b3_ms = t.elapsed().as_secs_f64() * 1e3;
         }
@@ -687,12 +683,8 @@ fn mixed_throughput_smoke() {
             sha2::generate_witness_batch_major(&sha2_inputs, nu),
             s2_circuit,
         );
-        let _ = prover::prove_fast_ligerito_union(
-            &s2_union,
-            &s2_setup.pcs_params,
-            vec![slot],
-            &mut ch,
-        );
+        let _ =
+            prover::prove_fast_ligerito_union(&s2_union, &s2_setup.pcs_params, vec![slot], &mut ch);
         if timed {
             s2_ms = t.elapsed().as_secs_f64() * 1e3;
         }
@@ -1255,7 +1247,9 @@ fn merged_transport_m30_probe() {
                     s2_circuit,
                 ),
                 UnionSlotProverInput::in_place(
-                    |dst| blake3::generate_witness_batch_major_partial_into(&blake3_inputs, nu, dst),
+                    |dst| {
+                        blake3::generate_witness_batch_major_partial_into(&blake3_inputs, nu, dst)
+                    },
                     b3_circuit,
                 ),
             ];
@@ -1285,7 +1279,11 @@ fn merged_transport_m30_probe() {
     }
     println!("merged m30 probe, counts {COUNTS:?} (min of 2, ms, prove incl. witgen):");
     for (i, &nu) in NUS.iter().enumerate() {
-        println!("  nu = {nu} (M = {}): merged {:.1}", cfgs[i].0.m_total(), mins[i]);
+        println!(
+            "  nu = {nu} (M = {}): merged {:.1}",
+            cfgs[i].0.m_total(),
+            mins[i]
+        );
     }
     // The capacity-free design claim, now as an ABSOLUTE flatness bound (the
     // jagged comparator is gone — its final A/B record, 2026-08-02 on this
@@ -1388,12 +1386,8 @@ fn merged_capacity_attribution() {
             ];
             let mut ch = FsChallenger::new(DOMAIN);
             let t = Instant::now();
-            let (_p, _c, _cl) = prover::prove_fast_ligerito_union(
-                &union,
-                &pcs_params,
-                slots,
-                &mut ch,
-            );
+            let (_p, _c, _cl) =
+                prover::prove_fast_ligerito_union(&union, &pcs_params, slots, &mut ch);
             let ms = t.elapsed().as_secs_f64() * 1e3;
             if pass == 0 {
                 // The genuine ONE-SHOT cost: nothing resident, every buffer
@@ -1467,15 +1461,8 @@ fn merged_padding_unread_poison_pool() {
         assert_eq!(cl1, cl2);
         let circuits: [&dyn LincheckCircuit; 2] = [s2_circuit, b3_circuit];
         let mut chv = FsChallenger::new(DOMAIN);
-        verifier::verify_ligerito_union(
-            &union,
-            &circuits,
-            &c2,
-            &p2,
-            &pcs_params,
-            &mut chv,
-        )
-        .expect("poison-pool proof verifies");
+        verifier::verify_ligerito_union(&union, &circuits, &c2, &p2, &pcs_params, &mut chv)
+            .expect("poison-pool proof verifies");
     }
 }
 
@@ -1606,12 +1593,8 @@ fn mixed_m30_throughput() {
                 circuit,
             );
             let mut ch = FsChallenger::new(DOMAIN);
-            let _ = prover::prove_fast_ligerito_union(
-                &union,
-                &setup.pcs_params,
-                vec![slot],
-                &mut ch,
-            );
+            let _ =
+                prover::prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
         }
         let mut best = f64::INFINITY;
         for _ in 0..ITERS {
@@ -1621,12 +1604,8 @@ fn mixed_m30_throughput() {
                 blake3::generate_witness_batch_major(&blake3_inputs, nu),
                 circuit,
             );
-            let _ = prover::prove_fast_ligerito_union(
-                &union,
-                &setup.pcs_params,
-                vec![slot],
-                &mut ch,
-            );
+            let _ =
+                prover::prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
             best = best.min(t.elapsed().as_secs_f64() * 1e3);
         }
         (best, setup.m())
@@ -1646,12 +1625,8 @@ fn mixed_m30_throughput() {
                 circuit,
             );
             let mut ch = FsChallenger::new(DOMAIN);
-            let _ = prover::prove_fast_ligerito_union(
-                &union,
-                &setup.pcs_params,
-                vec![slot],
-                &mut ch,
-            );
+            let _ =
+                prover::prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
         }
         let mut best = f64::INFINITY;
         for _ in 0..ITERS {
@@ -1661,12 +1636,8 @@ fn mixed_m30_throughput() {
                 sha2::generate_witness_batch_major(&sha2_inputs, nu),
                 circuit,
             );
-            let _ = prover::prove_fast_ligerito_union(
-                &union,
-                &setup.pcs_params,
-                vec![slot],
-                &mut ch,
-            );
+            let _ =
+                prover::prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
             best = best.min(t.elapsed().as_secs_f64() * 1e3);
         }
         (best, setup.m())
@@ -1934,15 +1905,8 @@ fn two_blake3_tables_vs_direct() {
         let circuits: [&dyn LincheckCircuit; 2] = [circuit, circuit];
         let t = Instant::now();
         let mut ch = FsChallenger::new(DOMAIN);
-        verifier::verify_ligerito_union(
-            &union,
-            &circuits,
-            &comm,
-            &proof,
-            &pcs_params,
-            &mut ch,
-        )
-        .expect("union two-table verify rejected honest proof");
+        verifier::verify_ligerito_union(&union, &circuits, &comm, &proof, &pcs_params, &mut ch)
+            .expect("union two-table verify rejected honest proof");
         let v_ms = t.elapsed().as_secs_f64() * 1e3;
         (best, bytes, v_ms, union.committed_words())
     };
@@ -1988,22 +1952,14 @@ fn two_blake3_tables_vs_direct() {
         let circuits: [&dyn LincheckCircuit; 1] = [circuit];
         let t = Instant::now();
         let mut ch = FsChallenger::new(DOMAIN);
-        verifier::verify_ligerito_union(
-            &union,
-            &circuits,
-            &comm,
-            &proof,
-            &pcs_params,
-            &mut ch,
-        )
-        .expect("union single-table verify rejected honest proof");
+        verifier::verify_ligerito_union(&union, &circuits, &comm, &proof, &pcs_params, &mut ch)
+            .expect("union single-table verify rejected honest proof");
         let v_ms = t.elapsed().as_secs_f64() * 1e3;
         (best, bytes, v_ms, union.committed_words())
     };
 
     // ---- Report.
-    let committed_all_equal =
-        direct_committed == u2_committed && u2_committed == u1_committed;
+    let committed_all_equal = direct_committed == u2_committed && u2_committed == u1_committed;
     println!(
         "\ntwo-blake3-table control: 2N = {n_total} total invocations, \
          best-of-{ITERS} (prove incl. witgen)\n"
