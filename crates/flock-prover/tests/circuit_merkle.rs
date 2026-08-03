@@ -8073,10 +8073,44 @@ fn mvp10_leaf_outer_inner_tape() {
     .expect("the leaf outer verifies as the inner");
     assert!(claims.boolean.is_some(), "boolean claims from the real inner");
     assert!(claims.element.is_some(), "element claims from the real inner");
+    // The DEFERRED verify of the same proof: the independent reference for
+    // the sigma assertion (and later the element assertion) — the
+    // method-note discipline, verifier-exported over formulas-written-twice.
+    let (_el_assert_i, sigma_native_i) = {
+        let mut ch = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
+        let (_, work, sigma) = verifier::verify_ligerito_union_circuit_deferred(
+            &union_i,
+            &lo.shape.circuit,
+            &lo.public,
+            &lcs,
+            &lo.commitment,
+            &lo.proof,
+            &lo.pcs,
+            &mut ch,
+        )
+        .expect("the deferred verify accepts the leaf outer");
+        (work.element.expect("an element PIOP ran"), sigma)
+    };
     let t_shape = rec.shape();
     let chals: Vec<F128> = rec.challenges().to_vec();
     let vals_rec = rec.values();
     let ops = t_shape.ops();
+    // (v, c) counters and fin ordinal up to an op index — the walkers'
+    // shared cursor helpers (O(tape) each; test-side only).
+    let vc_at = |end: usize| -> (usize, usize) {
+        let (mut v, mut c) = (0usize, 0usize);
+        for op in &ops[..end] {
+            match op {
+                Op::SqueezeScalar => c += 1,
+                Op::SqueezeSlice(n) => c += n,
+                Op::ObserveScalar => v += 1,
+                Op::ObserveSlice(n) => v += n,
+                _ => {}
+            }
+        }
+        (v, c)
+    };
+    let fin_at = |end: usize| ops[..end].iter().filter(|o| o.finalizes()).count();
 
     // The region order, by label — identical to the minimal mixed inner's.
     let find = |label: &[u8]| -> Vec<usize> {
@@ -8154,6 +8188,131 @@ fn mvp10_leaf_outer_inner_tape() {
         vals_rec[mp_i.anchor_v],
         "T0 folds to the anchor's claimed v"
     );
+
+    // ---- the wiring GKR walk (the mvp10 walker at 21 layers) ----
+    // Records every ordinal the transcription wires against and replays the
+    // whole layer recursion natively in lockstep, input checks included —
+    // the rhs consuming the DEFERRED s_sigma from the proof.
+    struct GkrLayerRec {
+        lam_fin: usize,
+        rounds: Vec<(usize, usize)>, // (g_v, squeeze fin)
+        g0s: Vec<F128>,
+        v_v: usize, // vl0; vl1/vr0/vr1 follow
+        ck_fin: usize,
+    }
+    struct GkrRec {
+        alpha_fin: usize,
+        beta_fin: usize,
+        top_v: usize,
+        layers: Vec<GkrLayerRec>,
+        fgs_v: usize, // f_eval, g_eval, s_sigma consecutive
+    }
+    let gkr_rec = {
+        let gkr = &lo.proof.wiring.gkr;
+        let mut i = gkr_l[0] + 1;
+        assert!(matches!(ops[i], Op::SqueezeScalar), "gkr alpha");
+        let (_, c_alpha) = vc_at(i);
+        let alpha_fin = fin_at(i);
+        i += 1;
+        assert!(matches!(ops[i], Op::SqueezeScalar), "gkr beta");
+        let beta_fin = fin_at(i);
+        i += 1;
+        assert!(matches!(ops[i], Op::ObserveScalar), "top lhs");
+        let (tv, _) = vc_at(i);
+        assert_eq!(vals_rec[tv], gkr.top_lhs, "top_lhs on the stream");
+        assert_eq!(vals_rec[tv + 1], gkr.top_rhs, "top_rhs on the stream");
+        assert_eq!(gkr.top_lhs, gkr.top_rhs, "the grand products agree");
+        i += 2;
+        let (mut claim_l, mut claim_r) = (gkr.top_lhs, gkr.top_rhs);
+        let mut r_pt: Vec<F128> = Vec::new();
+        let mut lrecs: Vec<GkrLayerRec> = Vec::new();
+        for (k, layer) in gkr.layers.iter().enumerate() {
+            assert_eq!(layer.rounds.len(), k, "layer {k} has k rounds");
+            assert!(matches!(ops[i], Op::SqueezeScalar), "layer {k} lambda");
+            let (_, lc2) = vc_at(i);
+            let lambda = chals[lc2];
+            let lam_fin = fin_at(i);
+            i += 1;
+            let mut c_run = claim_l + lambda * claim_r;
+            let mut r_prime = Vec::with_capacity(k + 1);
+            let mut rrecs: Vec<(usize, usize)> = Vec::new();
+            let mut g0s: Vec<F128> = Vec::new();
+            for (t2, &(g1, gi)) in layer.rounds.iter().enumerate() {
+                assert!(matches!(ops[i], Op::ObserveScalar), "round obs g1");
+                let (gv, _) = vc_at(i);
+                assert_eq!(vals_rec[gv], g1, "layer {k} round {t2} g1");
+                assert_eq!(vals_rec[gv + 1], gi, "layer {k} round {t2} g_inf");
+                assert!(matches!(ops[i + 2], Op::SqueezeScalar), "round rho");
+                let (_, rc2) = vc_at(i + 2);
+                let rho = chals[rc2];
+                rrecs.push((gv, fin_at(i + 2)));
+                i += 3;
+                let r_eq = r_pt[t2];
+                let g0 = (c_run + r_eq * g1) * (F128::ONE + r_eq).inv();
+                g0s.push(g0);
+                c_run = g0 * (F128::ONE + rho) + g1 * rho + gi * rho * (F128::ONE + rho);
+                r_prime.push(rho);
+            }
+            let (vv, _) = vc_at(i);
+            for (j, want) in [layer.vl0, layer.vl1, layer.vr0, layer.vr1]
+                .into_iter()
+                .enumerate()
+            {
+                assert!(matches!(ops[i], Op::ObserveScalar), "layer value obs");
+                assert_eq!(vals_rec[vv + j], want, "layer {k} value {j}");
+                i += 1;
+            }
+            assert_eq!(
+                c_run,
+                layer.vl0 * layer.vl1 + lambda * (layer.vr0 * layer.vr1),
+                "layer {k} closes"
+            );
+            assert!(matches!(ops[i], Op::SqueezeScalar), "layer {k} c_k");
+            let (_, cc2) = vc_at(i);
+            let c_k = chals[cc2];
+            let ck_fin = fin_at(i);
+            i += 1;
+            claim_l = (F128::ONE + c_k) * layer.vl0 + c_k * layer.vl1;
+            claim_r = (F128::ONE + c_k) * layer.vr0 + c_k * layer.vr1;
+            r_prime.push(c_k);
+            r_pt = r_prime;
+            lrecs.push(GkrLayerRec {
+                lam_fin,
+                rounds: rrecs,
+                g0s,
+                v_v: vv,
+                ck_fin,
+            });
+        }
+        let mu_i = lo.shape.circuit.cells().mu();
+        assert_eq!(r_pt.len(), mu_i, "the GKR point spans the inner cell space");
+        let alpha2 = chals[c_alpha];
+        let beta2 = chals[c_alpha + 1];
+        let basis = flock_core::product_gkr::s_id_basis(mu_i);
+        let s_id_rho = flock_core::product_gkr::s_id_eval(&basis, &r_pt);
+        assert_eq!(
+            claim_l,
+            gkr.f_eval + alpha2 * s_id_rho + beta2,
+            "lhs input check replays"
+        );
+        assert_eq!(
+            claim_r,
+            gkr.g_eval + alpha2 * gkr.s_sigma_eval + beta2,
+            "rhs input check replays with the DEFERRED sigma value"
+        );
+        let (fv, _) = vc_at(i);
+        assert!(matches!(ops[i], Op::ObserveScalar), "f_eval obs");
+        assert_eq!(vals_rec[fv], gkr.f_eval, "f_eval on the stream");
+        assert_eq!(vals_rec[fv + 1], gkr.g_eval, "g_eval on the stream");
+        assert_eq!(vals_rec[fv + 2], gkr.s_sigma_eval, "s_sigma on the stream");
+        GkrRec {
+            alpha_fin,
+            beta_fin,
+            top_v: tv,
+            layers: lrecs,
+            fgs_v: fv,
+        }
+    };
 
     // ---- the swap, step 2: the class-agnostic half in-circuit ----
     // The outer-of-outer's first rows: the REAL inner's whole FS chain
@@ -8305,19 +8464,7 @@ fn mvp10_leaf_outer_inner_tape() {
         // The rs×2 regions, located: s_hat_v ordinals + r_dprime / gamma
         // challenge ordinals.
         let (rs_recs2, rs_gam_ch2) = {
-            let vc_at2 = |end: usize| -> (usize, usize) {
-                let (mut v2, mut c2) = (0usize, 0usize);
-                for op in &ops[..end] {
-                    match op {
-                        Op::SqueezeScalar => c2 += 1,
-                        Op::SqueezeSlice(n) => c2 += n,
-                        Op::ObserveScalar => v2 += 1,
-                        Op::ObserveSlice(n) => v2 += n,
-                        _ => {}
-                    }
-                }
-                (v2, c2)
-            };
+            let vc_at2 = &vc_at;
             let mut i2 = rs_l[0];
             let mut recs: Vec<(usize, usize)> = Vec::new();
             for k in 0..2 {
@@ -8536,6 +8683,70 @@ fn mvp10_leaf_outer_inner_tape() {
             ow,
         );
 
+        // ---- the swap, step 4: the WIRING GKR in-circuit + sigma ----
+        // Type reuse verbatim at 21 layers: rounds are ZcRoundGate rows
+        // (eq weight = the prior layer's point coordinate, g0 advice +
+        // zero delta), layer closes and claim folds are MacGate chains,
+        // s_id(rho) is a MacGate chain with the identity basis as
+        // constants, and the input checks close as published-zero deltas
+        // — the rhs consuming the DEFERRED s_sigma stream word, which
+        // then exits as the sigma assertion (route B at recursion scale).
+        let macs = sb.slot(MacGate::new());
+        let zcr = sb.slot(ZcRoundGate::new());
+        let mut gkr_deltas: Vec<Wire> = Vec::new();
+        let gr = &gkr_rec;
+        let g_alpha_w = outs[trace.squeezes[gr.alpha_fin][0]][0];
+        let g_beta_w = outs[trace.squeezes[gr.beta_fin][0]][0];
+        let (mut cl_w, mut cr_w) = (wv(gr.top_v), wv(gr.top_v + 1));
+        gkr_deltas.push(sb.gate(macs, &[cl_w, cr_w, ow])[0]);
+        let mut pt_w: Vec<Wire> = Vec::new();
+        for lr in &gr.layers {
+            let lam_w = outs[trace.squeezes[lr.lam_fin][0]][0];
+            let mut run_w = sb.gate(macs, &[cl_w, lam_w, cr_w])[0];
+            let mut pt_next: Vec<Wire> = Vec::with_capacity(lr.rounds.len() + 1);
+            for (t2, &(gv, rfin)) in lr.rounds.iter().enumerate() {
+                let rho_w = outs[trace.squeezes[rfin][0]][0];
+                vals.push(lr.g0s[t2]);
+                let g0w = sb.public_input();
+                let o = sb.gate(
+                    zcr,
+                    &[run_w, wv(gv), wv(gv + 1), pt_w[t2], rho_w, g0w, ow],
+                );
+                gkr_deltas.push(o[0]);
+                run_w = o[1];
+                pt_next.push(rho_w);
+            }
+            let (vl0, vl1) = (wv(lr.v_v), wv(lr.v_v + 1));
+            let (vr0, vr1) = (wv(lr.v_v + 2), wv(lr.v_v + 3));
+            let pl2 = sb.gate(macs, &[zw, vl0, vl1])[0];
+            let pr2 = sb.gate(macs, &[zw, vr0, vr1])[0];
+            let gate_w = sb.gate(macs, &[pl2, lam_w, pr2])[0];
+            gkr_deltas.push(sb.gate(macs, &[gate_w, run_w, ow])[0]);
+            let ck_w = outs[trace.squeezes[lr.ck_fin][0]][0];
+            let sl2 = sb.gate(macs, &[vl0, vl1, ow])[0];
+            let sr2 = sb.gate(macs, &[vr0, vr1, ow])[0];
+            cl_w = sb.gate(macs, &[vl0, ck_w, sl2])[0];
+            cr_w = sb.gate(macs, &[vr0, ck_w, sr2])[0];
+            pt_next.push(ck_w);
+            pt_w = pt_next;
+        }
+        let mu_i = lo.shape.circuit.cells().mu();
+        assert_eq!(pt_w.len(), mu_i, "the GKR point spans the inner cell space");
+        let basis_i = flock_core::product_gkr::s_id_basis(mu_i);
+        let mut sid_w = zw;
+        for (j, &bj) in basis_i.iter().enumerate() {
+            vals.push(bj);
+            let bw = sb.public_input();
+            sid_w = sb.gate(macs, &[sid_w, bw, pt_w[j]])[0];
+        }
+        let (f_w, g_w, sig_w) = (wv(gr.fgs_v), wv(gr.fgs_v + 1), wv(gr.fgs_v + 2));
+        let l1 = sb.gate(macs, &[f_w, g_alpha_w, sid_w])[0];
+        let l2 = sb.gate(macs, &[l1, g_beta_w, ow])[0];
+        gkr_deltas.push(sb.gate(macs, &[l2, cl_w, ow])[0]);
+        let r1 = sb.gate(macs, &[g_w, g_alpha_w, sig_w])[0];
+        let r2 = sb.gate(macs, &[r1, g_beta_w, ow])[0];
+        gkr_deltas.push(sb.gate(macs, &[r2, cr_w, ow])[0]);
+
         for (a_wires, opens) in &to_publish {
             for w in a_wires {
                 sb.publish(*w);
@@ -8563,6 +8774,13 @@ fn mvp10_leaf_outer_inner_tape() {
             }
         }
         sb.publish(inner_w);
+        for d in &gkr_deltas {
+            sb.publish(*d);
+        }
+        sb.publish(sig_w);
+        for w in &pt_w {
+            sb.publish(*w);
+        }
         let shape2 = sb.finish().expect("the swap outer builds");
         let hint_refs: Vec<&dyn std::any::Any> =
             hints.iter().map(|h| h as &dyn std::any::Any).collect();
@@ -8577,7 +8795,14 @@ fn mvp10_leaf_outer_inner_tape() {
             .zip(&geo)
             .map(|(l, g)| l.a_count + 3 * g.q)
             .sum();
-        let n_tail = levels.len() + 3 * pows.len() + 3 + levels.len() * yr_len + 1;
+        let n_tail = levels.len()
+            + 3 * pows.len()
+            + 3
+            + levels.len() * yr_len
+            + 1
+            + gkr_deltas.len()
+            + 1
+            + mu_i;
         let mut at2 = built2.public.len() - n_tail - n_query_pub;
         for (li, lvl) in levels.iter().enumerate() {
             let g = &geo[li];
@@ -8663,6 +8888,34 @@ fn mvp10_leaf_outer_inner_tape() {
             inner_n, t_final_n,
             "inner == t_r: the real-inner statement closes"
         );
+        // The GKR deltas and the sigma assertion, read from the public
+        // segment alone — route B at recursion scale: the discharge below
+        // is the ROOT's O(2^mu) check against the real inner's own table.
+        let gkr_base = sp_base + 3 + levels.len() * yr_len + 1;
+        for (k, d) in built2.public[gkr_base..gkr_base + gkr_deltas.len()]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(*d, F128::ZERO, "gkr delta {k}");
+        }
+        let sig_base = gkr_base + gkr_deltas.len();
+        assert_eq!(
+            built2.public[sig_base],
+            lo.proof.wiring.gkr.s_sigma_eval,
+            "the emitted sigma value is the proof's deferred evaluation"
+        );
+        let sa = flock_core::circuit::SigmaAssertion {
+            rho: built2.public[sig_base + 1..sig_base + 1 + mu_i].to_vec(),
+            nu: lo.shape.circuit.cells().nu(),
+            value: built2.public[sig_base],
+        };
+        assert_eq!(sa.rho, sigma_native_i.rho, "the emitted sigma point");
+        assert_eq!(sa.value, sigma_native_i.value, "the emitted sigma value");
+        assert_eq!(sa.nu, sigma_native_i.nu, "the emitted sigma split");
+        assert!(
+            sa.check(&lo.shape.circuit),
+            "the emitted sigma assertion discharges against the real inner"
+        );
 
         // The outer-of-outer proves and verifies over the circuit path.
         let union2 = UnionInstance::new(&shape2.registry, shape2.counts.clone());
@@ -8714,7 +8967,8 @@ fn mvp10_leaf_outer_inner_tape() {
             ),
         ];
         bslots.sort_by_key(|(i, _)| *i);
-        let mut el_all2: Vec<flock_core::circuit::builder::SlotId> = vec![mrslot, spine];
+        let mut el_all2: Vec<flock_core::circuit::builder::SlotId> =
+            vec![mrslot, spine, macs, zcr];
         el_all2.extend(le_slots.iter().map(|(_, sl)| *sl));
         el_all2.extend(resid_slots.iter().map(|(_, sl)| *sl));
         let mut el_ord: Vec<(usize, Vec<F128>)> = el_all2
@@ -8785,7 +9039,8 @@ fn mvp10_leaf_outer_inner_tape() {
          pd claims {} (element pair + {} gathers) | P {} | L0 lanes {}/{}\n  \
          outer-of-outer: b3 rows {} | nu {} | dense_m {} | mu {}\n  \
          carries: chain, QUERY PHASE, PoW, W-rounds (rho bound), SPINE\n  \
-         (t_r bound), RESIDUAL (rotated; inner == t_r closes)\n  \
+         (t_r bound), RESIDUAL (rotated; inner == t_r closes), WIRING\n  \
+         GKR (21 layers) + the sigma assertion (emitted, discharges)\n  \
          prove {:.0} ms | verify {:.0} ms | proof {:.1} KiB\n",
         lo.pcs.m,
         lo.shape.circuit.cells().mu(),
