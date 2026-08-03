@@ -8964,6 +8964,50 @@ fn mvp10_leaf_outer_inner_tape() {
             el_lcw = sb.gate(mrslot, &[el_lcw, wv(rr.g_v), wv(rr.g_v + 1), rho_w])[0];
         }
 
+        // ---- the swap, step 6: the multipoint intake at R=2, P=2 ----
+        // T0 over the 256 RS dual values then the P group values with
+        // consecutive gamma powers (kept as mp_pws — the expect's budget),
+        // the two-product rounds through mrslot, T_m == anchor.v as a
+        // published-zero delta, and the anchor's own rounds folded to an
+        // endpoint held against the native replay.
+        let mp_gamma_w = outs[trace.squeezes[mp_i.gamma_fin][0]][0];
+        let mut t0_w = zw;
+        let mut pw_w = ow;
+        let mut mp_pws: Vec<Wire> = vec![ow];
+        for (k, &vi) in mp_i.val_vs.iter().enumerate() {
+            t0_w = sb.gate(macs, &[t0_w, pw_w, wv(vi)])[0];
+            if k + 1 < mp_i.val_vs.len() {
+                pw_w = sb.gate(macs, &[zw, pw_w, mp_gamma_w])[0];
+                mp_pws.push(pw_w);
+            }
+        }
+        let mut tm_w = t0_w;
+        let mut mp_rho2_w: Vec<Wire> = Vec::new();
+        for rr in &mp_i.rounds {
+            let rho_w = outs[trace.squeezes[rr.fin][0]][0];
+            mp_rho2_w.push(rho_w);
+            tm_w = sb.gate(mrslot, &[tm_w, wv(rr.g_v), wv(rr.g_v + 1), rho_w])[0];
+        }
+        let mp_delta = sb.gate(macs, &[tm_w, wv(mp_i.anchor_v), ow])[0];
+        let mut anc_w = wv(mp_i.anchor_v);
+        let mut mp_sig_w: Vec<Wire> = Vec::new();
+        for rr in &mp_i.anchor_rounds {
+            let rho_w = outs[trace.squeezes[rr.fin][0]][0];
+            mp_sig_w.push(rho_w);
+            anc_w = sb.gate(mrslot, &[anc_w, wv(rr.g_v), wv(rr.g_v + 1), rho_w])[0];
+        }
+        let anc_end_n = {
+            let mut t2 = vals_rec[mp_i.anchor_v];
+            for rr in &mp_i.anchor_rounds {
+                let (g1, gi) = (vals_rec[rr.g_v], vals_rec[rr.g_v + 1]);
+                let r3 = chals[rr.ch];
+                let g0 = t2 + g1;
+                t2 = g0 + (g1 + g0 + gi) * r3 + gi * r3 * r3;
+            }
+            t2
+        };
+        let _ = (&mp_pws, &mp_rho2_w, &mp_sig_w);
+
         for (a_wires, opens) in &to_publish {
             for w in a_wires {
                 sb.publish(*w);
@@ -9003,6 +9047,8 @@ fn mvp10_leaf_outer_inner_tape() {
         }
         sb.publish(el_zr);
         sb.publish(el_lcw);
+        sb.publish(mp_delta);
+        sb.publish(anc_w);
         let shape2 = sb.finish().expect("the swap outer builds");
         // Cell-slot budget: gate slots + public blocks must stay <= 256
         // for mu 23 (every gate IO word is ALSO a wiring gather claim —
@@ -9036,6 +9082,7 @@ fn mvp10_leaf_outer_inner_tape() {
             + 1
             + mu_i
             + el_deltas.len()
+            + 2
             + 2;
         let mut at2 = built2.public.len() - n_tail - n_query_pub;
         for (li, lvl) in levels.iter().enumerate() {
@@ -9170,6 +9217,20 @@ fn mvp10_leaf_outer_inner_tape() {
             built2.public[el_base + el_deltas.len() + 1],
             el_assert_i.target,
             "the element lc chain ends at the native assertion's target"
+        );
+        // The multipoint intake: T_m == anchor.v as a zero-delta, and the
+        // anchor chain's endpoint against the native replay (its EXPECT is
+        // the remaining increment).
+        let mp_base2 = el_base + el_deltas.len() + 2;
+        assert_eq!(
+            built2.public[mp_base2],
+            F128::ZERO,
+            "T_m + anchor.v is the multipoint zero-delta (R=2 and P>0)"
+        );
+        assert_eq!(
+            built2.public[mp_base2 + 1],
+            anc_end_n,
+            "the anchor rounds end at the native claim"
         );
 
         // The outer-of-outer proves and verifies over the circuit path.
@@ -9315,8 +9376,8 @@ fn mvp10_leaf_outer_inner_tape() {
          outer-of-outer: b3 rows {} | nu {} | dense_m {} | mu {}\n  \
          carries: chain, QUERY PHASE, PoW, W-rounds (rho bound), SPINE\n  \
          (t_r bound), RESIDUAL (rotated; inner == t_r closes), WIRING\n  \
-         GKR (21 layers) + sigma (emitted, discharges), and the\n  \
-         MULTI-SLOT element PIOP (general strip; target closes)\n  \
+         GKR (21 layers) + sigma (emitted, discharges), the MULTI-SLOT\n  \
+         element PIOP (general strip), and the MULTIPOINT intake\n  \
          prove {:.0} ms | verify {:.0} ms | proof {:.1} KiB\n",
         lo.pcs.m,
         lo.shape.circuit.cells().mu(),
