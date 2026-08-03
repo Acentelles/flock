@@ -4272,58 +4272,7 @@ fn mvp7_real_query_phase() {
     // that pin every piece of the plumbing before the circuit exists: each
     // opened row verifies against its cap under the recorded challenge, and
     // the recorded weights reproduce `induce_sumcheck_enforced_sum`.
-    let mut geo: Vec<Lvl> = Vec::new();
-    let mut native_sums: Vec<F128> = Vec::new();
-    for (li, lvl) in levels.iter().enumerate() {
-        let (cap, rows, paths) = lvl_src[li];
-        let q = lvl.q_count;
-        assert_eq!(rows.len(), q, "L{li}: one opened row per query");
-        let c = cap.len().trailing_zeros() as usize;
-        assert_eq!(cap.len(), 1 << c, "L{li}: cap is a power of two");
-        let path = paths.len() / q;
-        assert_eq!(paths.len(), q * path, "L{li}: flat paths divide evenly");
-        let depth = path + c;
-        let lanes = rows[0].len();
-        assert!(lanes.is_power_of_two() && lanes >= 4, "L{li}: lanes {lanes}");
-        assert_eq!(
-            lanes,
-            1 << lvl.fold_fins.len(),
-            "L{li}: one fold challenge per lane bit"
-        );
-        let fold_vals: Vec<F128> = lvl.fold_chs.iter().map(|&i| chals[i]).collect();
-        let alpha_vals: Vec<F128> = (0..lvl.a_count).map(|j| chals[lvl.a_ch + j]).collect();
-        let eqv = build_eq_table(&fold_vals);
-        let aw = build_eq_table(&alpha_vals);
-        let mut sum = F128::ZERO;
-        for (k, row) in rows.iter().enumerate() {
-            let pos = (chals[lvl.q_ch + k].lo as usize) & ((1usize << depth) - 1);
-            let mut leaf_bytes = Vec::with_capacity(16 * lanes);
-            for f in row {
-                leaf_bytes.extend_from_slice(&f.lo.to_le_bytes());
-                leaf_bytes.extend_from_slice(&f.hi.to_le_bytes());
-            }
-            let lh = core_merkle::hash_leaf(&leaf_bytes, HashKind::Blake3);
-            assert!(
-                core_merkle::verify_merkle_proof_capped(
-                    cap,
-                    1 << depth,
-                    &lh,
-                    pos,
-                    &paths[k * path..(k + 1) * path],
-                    HashKind::Blake3,
-                ),
-                "L{li} query {k}: capped path verifies natively"
-            );
-            let dot = row
-                .iter()
-                .zip(eqv.iter())
-                .map(|(&x, &e)| x * e)
-                .fold(F128::ZERO, |a, v| a + v);
-            sum += aw[k] * dot;
-        }
-        native_sums.push(sum);
-        geo.push(Lvl { q, c, path, depth, lanes });
-    }
+    let (geo, native_sums) = level_geometry(&levels, &lvl_src, &chals, HashKind::Blake3);
 
     // ---- the FS chain over the real byte stream ----
     let mut chain = FsChain::new();
@@ -5455,6 +5404,74 @@ struct Lvl {
     path: usize,
     depth: usize,
     lanes: usize,
+}
+
+/// Per level: `q`, cap bits `c`, path length `d − c`, depth, lanes — plus
+/// the NATIVE cross-checks that pin every piece of the plumbing before any
+/// circuit exists: each opened row verifies against its cap under the
+/// recorded challenge, and the recorded weights reproduce
+/// `induce_sumcheck_enforced_sum`. Returns `(geo, native_sums)`; the sums
+/// are what the in-circuit leaf-eval accumulators must equal.
+fn level_geometry(
+    levels: &[OpenLevel],
+    lvl_src: &[(&[[u8; 32]], &Vec<Vec<F128>>, &Vec<[u8; 32]>)],
+    chals: &[F128],
+    hash: HashKind,
+) -> (Vec<Lvl>, Vec<F128>) {
+    use flock_core::lincheck::build_eq_table;
+    let mut geo: Vec<Lvl> = Vec::new();
+    let mut native_sums: Vec<F128> = Vec::new();
+    for (li, lvl) in levels.iter().enumerate() {
+        let (cap, rows, paths) = lvl_src[li];
+        let q = lvl.q_count;
+        assert_eq!(rows.len(), q, "L{li}: one opened row per query");
+        let c = cap.len().trailing_zeros() as usize;
+        assert_eq!(cap.len(), 1 << c, "L{li}: cap is a power of two");
+        let path = paths.len() / q;
+        assert_eq!(paths.len(), q * path, "L{li}: flat paths divide evenly");
+        let depth = path + c;
+        let lanes = rows[0].len();
+        assert!(lanes.is_power_of_two() && lanes >= 4, "L{li}: lanes {lanes}");
+        assert_eq!(
+            lanes,
+            1 << lvl.fold_fins.len(),
+            "L{li}: one fold challenge per lane bit"
+        );
+        let fold_vals: Vec<F128> = lvl.fold_chs.iter().map(|&i| chals[i]).collect();
+        let alpha_vals: Vec<F128> = (0..lvl.a_count).map(|j| chals[lvl.a_ch + j]).collect();
+        let eqv = build_eq_table(&fold_vals);
+        let aw = build_eq_table(&alpha_vals);
+        let mut sum = F128::ZERO;
+        for (k, row) in rows.iter().enumerate() {
+            let pos = (chals[lvl.q_ch + k].lo as usize) & ((1usize << depth) - 1);
+            let mut leaf_bytes = Vec::with_capacity(16 * lanes);
+            for f in row {
+                leaf_bytes.extend_from_slice(&f.lo.to_le_bytes());
+                leaf_bytes.extend_from_slice(&f.hi.to_le_bytes());
+            }
+            let lh = core_merkle::hash_leaf(&leaf_bytes, hash);
+            assert!(
+                core_merkle::verify_merkle_proof_capped(
+                    cap,
+                    1 << depth,
+                    &lh,
+                    pos,
+                    &paths[k * path..(k + 1) * path],
+                    hash,
+                ),
+                "L{li} query {k}: capped path verifies natively"
+            );
+            let dot = row
+                .iter()
+                .zip(eqv.iter())
+                .map(|(&x, &e)| x * e)
+                .fold(F128::ZERO, |a, v| a + v);
+            sum += aw[k] * dot;
+        }
+        native_sums.push(sum);
+        geo.push(Lvl { q, c, path, depth, lanes });
+    }
+    (geo, native_sums)
 }
 
 /// Emit the whole QUERY PHASE — every level's Merkle openings against the
@@ -6628,51 +6645,8 @@ fn mvp9_boolean_leaf_tape() {
         assert!(gammas_o.is_empty(), "no packed-direct claims at the leaf");
         assert_eq!(levels.len(), r + 1);
 
-        let mut geo: Vec<Lvl> = Vec::new();
-        let mut native_sums: Vec<F128> = Vec::new();
-        for (li, lvl) in levels.iter().enumerate() {
-            let (cap, rows, paths) = lvl_src[li];
-            let q = lvl.q_count;
-            assert_eq!(rows.len(), q, "L{li}: one opened row per query");
-            let c = cap.len().trailing_zeros() as usize;
-            let path = paths.len() / q;
-            let depth = path + c;
-            let lanes = rows[0].len();
-            assert_eq!(lanes, 1 << lvl.fold_fins.len(), "L{li}: lanes vs folds");
-            let fold_vals: Vec<F128> = lvl.fold_chs.iter().map(|&i| chals[i]).collect();
-            let alpha_vals: Vec<F128> = (0..lvl.a_count).map(|j| chals[lvl.a_ch + j]).collect();
-            let eqv = build_eq_table(&fold_vals);
-            let aw = build_eq_table(&alpha_vals);
-            let mut sum = F128::ZERO;
-            for (k, row) in rows.iter().enumerate() {
-                let pos = (chals[lvl.q_ch + k].lo as usize) & ((1usize << depth) - 1);
-                let mut leaf_bytes = Vec::with_capacity(16 * lanes);
-                for f in row {
-                    leaf_bytes.extend_from_slice(&f.lo.to_le_bytes());
-                    leaf_bytes.extend_from_slice(&f.hi.to_le_bytes());
-                }
-                let lh = core_merkle::hash_leaf(&leaf_bytes, HashKind::Blake3);
-                assert!(
-                    core_merkle::verify_merkle_proof_capped(
-                        cap,
-                        1 << depth,
-                        &lh,
-                        pos,
-                        &paths[k * path..(k + 1) * path],
-                        HashKind::Blake3,
-                    ),
-                    "L{li} query {k}: capped path verifies natively"
-                );
-                let dot = row
-                    .iter()
-                    .zip(eqv.iter())
-                    .map(|(&x, &e)| x * e)
-                    .fold(F128::ZERO, |a, vv| a + vv);
-                sum += aw[k] * dot;
-            }
-            native_sums.push(sum);
-            geo.push(Lvl { q, c, path, depth, lanes });
-        }
+        let (geo, native_sums) =
+            level_geometry(&levels, &lvl_src, &chals, HashKind::Blake3);
 
         let stream = t_shape.stream_words(DOMAIN);
         let bytes = stream.to_bytes(rec.values(), rec.payloads());
