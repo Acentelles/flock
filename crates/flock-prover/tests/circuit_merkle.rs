@@ -4272,13 +4272,6 @@ fn mvp7_real_query_phase() {
     // that pin every piece of the plumbing before the circuit exists: each
     // opened row verifies against its cap under the recorded challenge, and
     // the recorded weights reproduce `induce_sumcheck_enforced_sum`.
-    struct Lvl {
-        q: usize,
-        c: usize,
-        path: usize,
-        depth: usize,
-        lanes: usize,
-    }
     let mut geo: Vec<Lvl> = Vec::new();
     let mut native_sums: Vec<F128> = Vec::new();
     for (li, lvl) in levels.iter().enumerate() {
@@ -4409,62 +4402,24 @@ fn mvp7_real_query_phase() {
     }
 
     let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
-    // (alpha wires, per-query (cw, cv), acc) per level — published AFTER the
-    // loop: `built.public` lists entries in DECLARATION order, so publishing
-    // inside the loop would interleave with the next level's public inputs
-    // and break the tail walk below.
-    let mut to_publish: Vec<(Vec<Wire>, Vec<(Wire, [Wire; 2])>)> = Vec::new();
-    let mut level_accs: Vec<Wire> = Vec::new();
-    for (li, lvl) in levels.iter().enumerate() {
-        let g = &geo[li];
-        let (_, rows, paths) = lvl_src[li];
-        let sqq = &trace.squeezes[lvl.q_fin];
-        let sqa = &trace.squeezes[lvl.a_fin];
-        // alpha words: chain outputs, PUBLISHED for the checker's expansion.
-        let a_wires: Vec<Wire> = (0..lvl.a_count).map(|j| outs[sqa[j / 4]][j % 4]).collect();
-        // v: this level's fold challenges, chain outputs, wired straight in.
-        let v_wires: Vec<Wire> = lvl
-            .fold_fins
-            .iter()
-            .map(|&f| outs[trace.squeezes[f][0]][0])
-            .collect();
-        let alpha_vals: Vec<F128> = (0..lvl.a_count).map(|j| chals[lvl.a_ch + j]).collect();
-        let aw = build_eq_table(&alpha_vals);
-        // The hi-group weights of the leaf-eval split: eq over the native
-        // values of the fold challenges past the 8-lane gate's three.
-        let le_vars = g.lanes.min(8).trailing_zeros() as usize;
-        let le_groups = g.lanes >> le_vars;
-        let hw = {
-            let v_hi: Vec<F128> = lvl.fold_chs[le_vars..].iter().map(|&i| chals[i]).collect();
-            build_eq_table(&v_hi)
-        };
-        vals.push(F128::ZERO);
-        let mut acc = sb.public_input();
-        let mut opens: Vec<(Wire, [Wire; 2])> = Vec::with_capacity(g.q);
-        for k in 0..g.q {
-            vals.extend_from_slice(&rows[k]);
-            let leaf_w: Vec<Wire> = (0..g.lanes).map(|_| sb.input()).collect();
-            let cw = outs[sqq[k / 4]][k % 4];
-            let cv = emit_opening(&mut sb, slots, iv, &leaf_w, cw, g.depth, g.c, &mut vals);
-            opens.push((cw, cv));
-            hints.extend(
-                paths[k * g.path..(k + 1) * g.path]
-                    .iter()
-                    .map(hash_to_digest),
-            );
-            let lanes = g.lanes.min(8);
-            for h in 0..le_groups {
-                let mut a_in: Vec<Wire> = leaf_w[lanes * h..lanes * (h + 1)].to_vec();
-                a_in.extend_from_slice(&v_wires[..le_vars]);
-                vals.push(aw[k] * hw[h]);
-                a_in.push(sb.public_input());
-                a_in.push(acc);
-                acc = sb.gate(leafeval[li], &a_in)[0];
-            }
-        }
-        to_publish.push((a_wires, opens));
-        level_accs.push(acc);
-    }
+    // The query phase, via the shared emitter. Its `to_publish` is published
+    // AFTER every input is declared: `built.public` lists entries in
+    // DECLARATION order, so publishing inside the loop would interleave with
+    // the next level's public inputs and break the tail walk below.
+    let (to_publish, level_accs) = emit_query_phase(
+        &mut sb,
+        slots,
+        iv,
+        &leafeval,
+        &levels,
+        &geo,
+        &lvl_src,
+        &trace.squeezes,
+        &outs,
+        &chals,
+        &mut vals,
+        &mut hints,
+    );
 
     // ---- the merged intake + W-rounds (2c): binding the start target ----
     // The outer target is the gamma-combination of the element claims'
@@ -5491,6 +5446,93 @@ struct CollapsedSlots {
     b3: flock_core::circuit::builder::SlotId,
     swap: flock_core::circuit::builder::SlotId,
     spread: flock_core::circuit::builder::SlotId,
+}
+
+/// One opened Ligerito level's geometry, as the proof itself reports it.
+struct Lvl {
+    q: usize,
+    c: usize,
+    path: usize,
+    depth: usize,
+    lanes: usize,
+}
+
+/// Emit the whole QUERY PHASE — every level's Merkle openings against the
+/// absorbed caps, plus the leaf-eval accumulators — as circuit rows.
+///
+/// This is the class-agnostic half of a deferred verifier: it reads the
+/// proof's own rows and paths, wires each query's challenge word straight
+/// into the opening (no masking gadget — the relation reads the low `depth`
+/// columns), and folds the opened rows against the fold challenges into one
+/// accumulator per level. MVP-7, MVP-9 and MVP-10 all need exactly this, so
+/// it lives here once rather than three times.
+///
+/// Appends the sibling `hints` and the public `vals` in declaration order;
+/// returns the per-level `(alpha wires, per-query (challenge, terminal
+/// digest))` to publish AFTER every input is declared — publishing inside
+/// the loop would interleave with the next level's inputs and misindex the
+/// public segment (the recorded MVP-7 gotcha) — and the accumulators.
+#[allow(clippy::too_many_arguments)]
+fn emit_query_phase(
+    sb: &mut ShapeBuilder,
+    slots: CollapsedSlots,
+    iv: [Wire; 2],
+    leafeval: &[flock_core::circuit::builder::SlotId],
+    levels: &[OpenLevel],
+    geo: &[Lvl],
+    lvl_src: &[(&[[u8; 32]], &Vec<Vec<F128>>, &Vec<[u8; 32]>)],
+    sq: &[Vec<usize>],
+    outs: &[Vec<Wire>],
+    chals: &[F128],
+    vals: &mut Vec<F128>,
+    hints: &mut Vec<[u32; SLOT_WORDS]>,
+) -> (Vec<(Vec<Wire>, Vec<(Wire, [Wire; 2])>)>, Vec<Wire>) {
+    use flock_core::lincheck::build_eq_table;
+    let mut to_publish: Vec<(Vec<Wire>, Vec<(Wire, [Wire; 2])>)> = Vec::new();
+    let mut level_accs: Vec<Wire> = Vec::new();
+    for (li, lvl) in levels.iter().enumerate() {
+        let g = &geo[li];
+        let (_, rows, paths) = lvl_src[li];
+        let sqq = &sq[lvl.q_fin];
+        let sqa = &sq[lvl.a_fin];
+        // alpha words: chain outputs, PUBLISHED for the checker's expansion.
+        let a_wires: Vec<Wire> = (0..lvl.a_count).map(|j| outs[sqa[j / 4]][j % 4]).collect();
+        // v: this level's fold challenges, chain outputs, wired straight in.
+        let v_wires: Vec<Wire> = lvl.fold_fins.iter().map(|&f| outs[sq[f][0]][0]).collect();
+        let alpha_vals: Vec<F128> = (0..lvl.a_count).map(|j| chals[lvl.a_ch + j]).collect();
+        let aw = build_eq_table(&alpha_vals);
+        // The hi-group weights of the leaf-eval split: eq over the native
+        // values of the fold challenges past the 8-lane gate's three.
+        let le_vars = g.lanes.min(8).trailing_zeros() as usize;
+        let le_groups = g.lanes >> le_vars;
+        let hw = {
+            let v_hi: Vec<F128> = lvl.fold_chs[le_vars..].iter().map(|&i| chals[i]).collect();
+            build_eq_table(&v_hi)
+        };
+        vals.push(F128::ZERO);
+        let mut acc = sb.public_input();
+        let mut opens: Vec<(Wire, [Wire; 2])> = Vec::with_capacity(g.q);
+        for k in 0..g.q {
+            vals.extend_from_slice(&rows[k]);
+            let leaf_w: Vec<Wire> = (0..g.lanes).map(|_| sb.input()).collect();
+            let cw = outs[sqq[k / 4]][k % 4];
+            let cv = emit_opening(sb, slots, iv, &leaf_w, cw, g.depth, g.c, vals);
+            opens.push((cw, cv));
+            hints.extend(paths[k * g.path..(k + 1) * g.path].iter().map(hash_to_digest));
+            let lanes = g.lanes.min(8);
+            for h in 0..le_groups {
+                let mut a_in: Vec<Wire> = leaf_w[lanes * h..lanes * (h + 1)].to_vec();
+                a_in.extend_from_slice(&v_wires[..le_vars]);
+                vals.push(aw[k] * hw[h]);
+                a_in.push(sb.public_input());
+                a_in.push(acc);
+                acc = sb.gate(leafeval[li], &a_in)[0];
+            }
+        }
+        to_publish.push((a_wires, opens));
+        level_accs.push(acc);
+    }
+    (to_publish, level_accs)
 }
 
 /// Emit one Merkle opening as rows of the shipped BLAKE3 table plus glue,
@@ -6586,13 +6628,6 @@ fn mvp9_boolean_leaf_tape() {
         assert!(gammas_o.is_empty(), "no packed-direct claims at the leaf");
         assert_eq!(levels.len(), r + 1);
 
-        struct Lvl {
-            q: usize,
-            c: usize,
-            path: usize,
-            depth: usize,
-            lanes: usize,
-        }
         let mut geo: Vec<Lvl> = Vec::new();
         let mut native_sums: Vec<F128> = Vec::new();
         for (li, lvl) in levels.iter().enumerate() {
@@ -6731,50 +6766,20 @@ fn mvp9_boolean_leaf_tape() {
             .collect();
 
         let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
-        let mut to_publish: Vec<(Vec<Wire>, Vec<(Wire, [Wire; 2])>)> = Vec::new();
-        let mut level_accs: Vec<Wire> = Vec::new();
-        for (li, lvl) in levels.iter().enumerate() {
-            let g = &geo[li];
-            let (_, rows, paths) = lvl_src[li];
-            let sqq = &trace.squeezes[lvl.q_fin];
-            let sqa = &trace.squeezes[lvl.a_fin];
-            let a_wires: Vec<Wire> = (0..lvl.a_count).map(|j| outs[sqa[j / 4]][j % 4]).collect();
-            let v_wires: Vec<Wire> = lvl
-                .fold_fins
-                .iter()
-                .map(|&f| outs[trace.squeezes[f][0]][0])
-                .collect();
-            let alpha_vals: Vec<F128> = (0..lvl.a_count).map(|j| chals[lvl.a_ch + j]).collect();
-            let aw = build_eq_table(&alpha_vals);
-            let le_vars = g.lanes.min(8).trailing_zeros() as usize;
-            let le_groups = g.lanes >> le_vars;
-            let hw = {
-                let v_hi: Vec<F128> = lvl.fold_chs[le_vars..].iter().map(|&i| chals[i]).collect();
-                build_eq_table(&v_hi)
-            };
-            vals.push(F128::ZERO);
-            let mut acc = sb.public_input();
-            let mut opens: Vec<(Wire, [Wire; 2])> = Vec::with_capacity(g.q);
-            for k in 0..g.q {
-                vals.extend_from_slice(&rows[k]);
-                let leaf_w: Vec<Wire> = (0..g.lanes).map(|_| sb.input()).collect();
-                let cw = outs[sqq[k / 4]][k % 4];
-                let cv = emit_opening(&mut sb, slots, iv, &leaf_w, cw, g.depth, g.c, &mut vals);
-                opens.push((cw, cv));
-                hints.extend(paths[k * g.path..(k + 1) * g.path].iter().map(hash_to_digest));
-                let lanes = g.lanes.min(8);
-                for h in 0..le_groups {
-                    let mut a_in: Vec<Wire> = leaf_w[lanes * h..lanes * (h + 1)].to_vec();
-                    a_in.extend_from_slice(&v_wires[..le_vars]);
-                    vals.push(aw[k] * hw[h]);
-                    a_in.push(sb.public_input());
-                    a_in.push(acc);
-                    acc = sb.gate(leafeval[li], &a_in)[0];
-                }
-            }
-            to_publish.push((a_wires, opens));
-            level_accs.push(acc);
-        }
+        let (to_publish, level_accs) = emit_query_phase(
+            &mut sb,
+            slots,
+            iv,
+            &leafeval,
+            &levels,
+            &geo,
+            &lvl_src,
+            &trace.squeezes,
+            &outs,
+            &chals,
+            &mut vals,
+            &mut hints,
+        );
         // ---- the intake W-rounds in-circuit: the RS target enters as
         // CHECKER-VALIDATED advice (its sc dots are family-H — the bit
         // transpose — deferred to the boundary batch), the W-rounds fold
