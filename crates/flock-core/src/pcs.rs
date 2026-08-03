@@ -1706,7 +1706,6 @@ pub struct MergedOpenProof {
     pub ring_switches: Vec<RingSwitchProof>,
     pub merged_rounds: Vec<(F128, F128)>,
     pub q_eval: F128,
-    pub frobenius: jagged::FrobeniusAssistProof,
     pub inner: BatchOpeningProofLigerito,
 }
 
@@ -1719,7 +1718,8 @@ pub fn open_batch_merged<Ch: Challenger>(
     x_outers: &[&[F128]],
     precomputed_s_hat_v: &[Option<&[F128]>],
     padding: &PaddingSpec,
-    heights: &[u64],
+    tables: &[jagged_fancy::AlignedTable],
+    k_cols: usize,
     n_log: usize,
     lig_config: &ligerito::ProverConfig,
     challenger: &mut Ch,
@@ -1752,8 +1752,9 @@ pub fn open_batch_merged<Ch: Challenger>(
         1usize << dense_log,
         "q must be the committed stack"
     );
-    let params = jagged::JaggedParams::from_heights(heights, n_log, dense_log);
-    let k_cols = params.k;
+    // Fancy jagged (paper §6): one aligned table per power-of-two sub-block of
+    // each slot's used columns, over the ROW-MAJOR dense stack.
+    let params = jagged_fancy::AlignedParams::new(tables.to_vec(), n_log, k_cols, dense_log);
     let claim_data: Vec<(&[F128], &[F128], &[F128])> = rs_results
         .iter()
         .zip(x_outers.iter())
@@ -1770,7 +1771,7 @@ pub fn open_batch_merged<Ch: Challenger>(
     // The twisted weight over the dense cube (count-proportional Φ-pass;
     // zero tail past the jagged area).
     let t = std::time::Instant::now();
-    let (w, (u0, u2)) = jagged::build_merged_weight_and_prime(&params, &claim_data, &q);
+    let (w, (u0, u2)) = jagged_fancy::build_weight_row_major_twisted(&params, &claim_data, &q);
     if trace {
         eprintln!(
             "  [open_merged] W build + round-0 prime (2^{} words): {:6.2} ms",
@@ -1860,18 +1861,21 @@ pub fn open_batch_merged<Ch: Challenger>(
             t.elapsed().as_secs_f64() * 1e3
         );
     }
-    let t_assist = std::time::Instant::now();
-    let frobenius = jagged::prove_frobenius_assist(&params, &fclaims, &rho, challenger);
+    // No assist. The aligned tables make Ŵ(ρ) directly evaluable by the
+    // verifier (paper §6: "the verifier can compute the latter on its own, or
+    // employ a similar jagged assist" — per-table it does not need to), so the
+    // 128·K-statement delegation has nothing left to do.
     if trace {
         eprintln!(
-            "  [open_merged] coeffs + frobenius assist: {:6.2} ms (assist alone {:6.2} ms)",
-            t.elapsed().as_secs_f64() * 1e3,
-            t_assist.elapsed().as_secs_f64() * 1e3
+            "  [open_merged] coeffs (x{}) — no assist (fancy jagged): {:6.2} ms",
+            coeffs.len(),
+            t.elapsed().as_secs_f64() * 1e3
         );
     }
     debug_assert_eq!(
-        frobenius.v, w_eval,
-        "assist V must equal the folded weight MLE"
+        jagged_fancy::twisted_weight_aligned_batched(&params, &fclaims, &rho),
+        w_eval,
+        "the verifier's Ŵ(ρ) must equal the merged sumcheck's folded weight"
     );
     let _ = w_eval;
 
@@ -1912,7 +1916,6 @@ pub fn open_batch_merged<Ch: Challenger>(
         ring_switches: rs_results.into_iter().map(|(p, _)| p).collect(),
         merged_rounds,
         q_eval,
-        frobenius,
         inner,
     }
 }
@@ -1923,7 +1926,8 @@ pub fn verify_batch_merged<Ch: Challenger>(
     claims: &[F128],
     z_skips: &[F128],
     x_outers: &[&[F128]],
-    heights: &[u64],
+    tables: &[jagged_fancy::AlignedTable],
+    k_cols: usize,
     n_log: usize,
     proof: &MergedOpenProof,
     lig_config: &ligerito::VerifierConfig,
@@ -1988,11 +1992,11 @@ pub fn verify_batch_merged<Ch: Challenger>(
     }
 
     let t = std::time::Instant::now();
-    let params = jagged::JaggedParams::from_heights(heights, n_log, dense_log);
-    let k_cols = params.k;
+    let params = jagged_fancy::AlignedParams::new(tables.to_vec(), n_log, k_cols, dense_log);
     if trace {
         eprintln!(
-            "        [vbm] JaggedParams::from_heights (n_log={n_log}, dense_log={dense_log}, k_cols={k_cols}): {}",
+            "        [vbm] AlignedParams (n_log={n_log}, dense_log={dense_log}, k_cols={k_cols}, {} tables): {}",
+            params.tables.len(),
             tfmt(t.elapsed().as_secs_f64())
         );
     }
@@ -2026,11 +2030,14 @@ pub fn verify_batch_merged<Ch: Challenger>(
         );
     }
     let t = std::time::Instant::now();
-    let v = jagged::verify_frobenius_assist(&params, &fclaims, &rho, &proof.frobenius, challenger)
-        .ok_or(VerifyErrorJagged::Jagged)?;
+    // Ŵ(ρ) directly: Σ_i Σ_j c_{i,j}·f̂(z^{2^j}, ρ) over the aligned tables,
+    // with the ρ-side of the branching program hoisted out of the 128·K
+    // statements. No sub-protocol, so nothing is absorbed here.
+    let v = jagged_fancy::twisted_weight_aligned_batched(&params, &fclaims, &rho);
     if trace {
         eprintln!(
-            "        [vbm] jagged::verify_frobenius_assist: {}",
+            "        [vbm] Ŵ(ρ) direct, {} aligned tables: {}",
+            params.tables.len(),
             tfmt(t.elapsed().as_secs_f64())
         );
     }

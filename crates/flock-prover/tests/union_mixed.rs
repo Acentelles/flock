@@ -1089,12 +1089,11 @@ fn merged_transport_roundtrip_and_tamper() {
         let mut bad = proof.clone();
         bad.pcs_open.merged_rounds[3].0 += F128::ONE;
         reject(&bad, "merged sumcheck round");
-        let mut bad = proof.clone();
-        bad.pcs_open.frobenius.v += F128::ONE;
-        reject(&bad, "frobenius V");
-        let mut bad = proof.clone();
-        bad.pcs_open.frobenius.rounds[5].1 += F128::ONE;
-        reject(&bad, "frobenius round");
+        // Since fancy jagged there is no Frobenius assist to tamper with: the
+        // verifier evaluates Ŵ(ρ) itself from the aligned tables, so the
+        // transcript carries no assist rounds at all. What used to be caught
+        // by tampering the assist's V is now caught by `q_eval` and the merged
+        // sumcheck rounds above — Ŵ(ρ) is recomputed, not received.
         let mut bad = proof.clone();
         bad.zerocheck.round1_ab[0] += F128::ONE;
         reject(&bad, "zerocheck round 1");

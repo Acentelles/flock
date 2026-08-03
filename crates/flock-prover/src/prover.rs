@@ -836,13 +836,15 @@ pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
     // eq-basis opening). Identity compaction copies — a prototype cost only
     // (single-slot full-utilization registries).
     let t = std::time::Instant::now();
-    let q: Vec<F128> = if union.compaction_is_identity() {
-        z_packed.clone()
-    } else if buf_mode == flock_core::union::WitnessBufMode::PooledDirty {
+    // Fancy jagged needs the ROW-MAJOR stack. Note there is no identity
+    // shortcut any more: row-major is a transpose of the BatchMajor buffer even
+    // when compaction drops nothing, so `compaction_is_identity()` no longer
+    // means "the padded buffer already IS q".
+    let q: Vec<F128> = if buf_mode == flock_core::union::WitnessBufMode::PooledDirty {
         // Dropped words are dirty by design in this mode — and never read.
-        union.compact_witness_unchecked(&z_packed)
+        union.compact_witness_row_major_unchecked(&z_packed)
     } else {
-        union.compact_witness(&z_packed)
+        union.compact_witness_row_major(&z_packed)
     };
     if trace {
         eprintln!(
@@ -943,7 +945,7 @@ pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
         None
     };
 
-    let heights = union.jagged_heights();
+    let tables = union.aligned_tables();
     let x_fulls: Vec<Vec<F128>> = [&ab, &c]
         .iter()
         .map(|cl| quirky_x_outer_full(&cl.point))
@@ -959,7 +961,8 @@ pub fn prove_fast_ligerito_jagged_union_merged<Ch: Challenger>(
         &x_refs,
         &[pre_ab, pre_c],
         &padding,
-        &heights,
+        &tables,
+        union.col_log(),
         union.n_log(),
         &lig_config,
         challenger,

@@ -1668,6 +1668,10 @@ pub fn verify_assist<C: Challenger>(
 /// assist's branching program computes exactly this extension via its
 /// comparison state, so prover table and verifier evaluation agree by
 /// construction). `claims` = `(z_row, z_col, γ-baked fold table)` views.
+// Retained as the column-major reference: the merged path now builds the
+// weight row-major (`jagged_fancy::build_weight_row_major_twisted`), and
+// `jagged_fancy`'s timing probe measures the two against each other.
+#[allow(dead_code)]
 pub(crate) fn build_merged_weight_and_prime(
     params: &JaggedParams,
     claims: &[(&[F128], &[F128], &[F128])],

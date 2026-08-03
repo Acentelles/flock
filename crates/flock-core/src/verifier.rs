@@ -492,7 +492,7 @@ pub fn verify_ligerito_jagged_union_merged<Ch: Challenger>(
         };
         Ok((ab, c))
     })?;
-    let heights = union.jagged_heights();
+    let tables = union.aligned_tables();
     let claims = [ab.clone(), c.clone()];
     let t_open = std::time::Instant::now();
     let open_result = verifier_pool().install(|| {
@@ -519,7 +519,8 @@ pub fn verify_ligerito_jagged_union_merged<Ch: Challenger>(
             &values,
             &z_skips,
             &x_refs,
-            &heights,
+            &tables,
+            union.col_log(),
             union.n_log(),
             &proof.pcs_open,
             &lig_v_config,

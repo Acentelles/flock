@@ -42,7 +42,7 @@ columns), reversing what the open items below say. The bigger prover lever is th
 optimizations above), is tested against brute force, and is *not* wired into
 `verify_batch_merged` — integration is the unfinished part.
 
-## Fancy jagged (paper §6): kernel landed, wiring deferred
+## Fancy jagged (paper §6): WIRED, wire v7
 
 `crates/flock-core/src/pcs/jagged_fancy.rs`. The paper is Hemo–Jue–Rabinovich–
 Roh–Rothblum, *Jagged Polynomial Commitments*, ePrint 2025/917, EUROCRYPT 2026
@@ -254,18 +254,55 @@ Same discipline as the reverted rectangular fast path throughout: measure before
 landing anything protocol-visible. That order caught the naive version's 3–5×
 regression before it reached a wire format.
 
-**Still not wired.** What remains is the consumer side: `build_merged_weight_and_prime`
-must switch to `build_weight_row_major` (Φ-twisted, per claim, fused with the
-round-0 prime as today), `open_batch_merged` must take the row-major `q`,
-`verify_batch_merged` must evaluate `Ŵ(ρ)` as `Σ_j c_j·f_hat_aligned(z^{2^j}, ρ)`
-instead of delegating, and `MergedOpenProof.frobenius` goes away. `commit` and
-the eq-basis opening of `q̂(ρ)` are layout-agnostic.
+**WIRED (wire v7).** The merged path now runs fancy jagged end to end:
+`open_batch_merged` takes the row-major `q` and `AlignedParams` and builds the
+weight with `build_weight_row_major_twisted`; `verify_batch_merged` evaluates
+`Ŵ(ρ)` with `twisted_weight_aligned_batched`; `MergedOpenProof.frobenius` is
+gone and the transcript absorbs no assist rounds.
 
-These cannot be split across commits — the weight and the verifier's evaluation
-must agree on the bijection, so any intermediate state is broken. And it is a
-**transcript change**: it will invalidate `union_m6_fixtures`' pinned bundle
-digests, which exist as deliberate anchors. Regenerating them
-(`M6_FIXTURES_PRINT=1`) is a decision to make knowingly, not a side effect.
+Measured, same sweep as before / after:
+
+| | hashes | prove/mt | prove/1t | verify |
+|---|---|---|---|---|
+| d26 | 1,664 | 1.96 → **1.27** | 3.41 → **1.20** | 2.17 → **1.48** |
+| d26 | 6,656 | 1.97 → **1.22** | 2.16 → **1.11** | 2.18 → **1.49** |
+| d26 | 26,624 | 1.56 → **1.14** | 1.40 → **1.06** | 2.06 → **1.49** |
+| d8 | 2,048 | 1.22 → **1.02** | 1.74 → **1.05** | 1.29 → **1.14** |
+| d8 | 8,192 | 1.36 → **1.03** | 1.35 → **1.02** | 1.31 → **1.17** |
+| d8 | 32,768 | 1.21 → **1.06** | 1.13 → **1.00** | 1.34 → **1.17** |
+
+The largest win is at SMALL batch — d26 1,664 goes 3.41× → 1.20× — because the
+assist was a fixed per-proof cost driven by `k_log`, so it dominated there and
+never amortized. Verify beat the projection too (2.06 → 1.49 at d26; I had
+guessed "modest"), because the ρ-hoisted direct evaluation is genuinely cheaper
+than the assist rather than merely absent.
+
+Two things the wiring turned up that the component work had not:
+
+* **The identity-compaction shortcut had to go.** `prove_..._merged` had three
+  branches — `compaction_is_identity() → z_packed.clone()`, `PooledDirty →
+  compact_witness_unchecked`, else the row-major one — and I had changed only
+  the third. Row-major is a *transpose* even when compaction drops nothing, so
+  "the padded buffer already IS q" is no longer true. `merged_padding_unread_poison_pool`
+  caught it as a verify failure.
+* **The pinned m6 fixtures were never at risk.** They exercise
+  `prove_fast_ligerito_jagged_union` — the NON-merged path — so they pass
+  untouched. Three messages of hedging about regenerating them was misplaced;
+  no fixture moved.
+
+The four `union_mixed` assist-tamper cases are gone: there is no assist to
+tamper with, and what they covered is now caught by `q_eval` and the merged
+sumcheck rounds, since `Ŵ(ρ)` is recomputed rather than received.
+
+Pre-existing, unrelated: `pcs::tests::pcs_ligerito_backend_roundtrip` fails on
+clean HEAD too. And `measure_integer_lane_savings` is a load-sensitive timing
+test that fails only under a parallel `--ignored` run — its own comment says it
+"tolerates a loaded machine".
+
+**What is left is the lincheck fold**, which after all of this is the dominant
+verify term on BOTH sides and the reason d26 verify sits at 1.49× rather than
+1.0×: the fold is width-dependent (2^19 columns against 2^14), which the `eq`
+factorization mitigated but did not erase.
 
 ## Tried and reverted: the rectangular fast path (commit 2009aff, reverted)
 

@@ -412,6 +412,45 @@ impl<'r> UnionInstance<'r> {
         out
     }
 
+    /// The fancy-jagged table configuration for this instance: one aligned
+    /// table per power-of-two sub-block of each slot's used columns, in the
+    /// order [`Self::compact_witness_row_major`] writes them.
+    ///
+    /// A registry slot is already a table in the paper's sense — `k_t`
+    /// consecutive columns of one height `n_t` — so the only work is splitting
+    /// its `used_cols` into power-of-two widths. Each resulting block is
+    /// aligned in the global column index: the slot's own column base is a
+    /// multiple of `2^{k_log_t−7}` (the union's slot alignment), and the
+    /// running offsets inside the slot are partial sums of descending powers
+    /// of two, hence multiples of every later width.
+    ///
+    /// Total area is `Σ_t n_t · used_cols_t` = [`Self::dense_words`], so
+    /// adopting this changes only the permutation of `q`, never its size —
+    /// `committed_words`, `dense_m` and `commit_lanes` are untouched.
+    pub fn aligned_tables(&self) -> Vec<crate::pcs::jagged_fancy::AlignedTable> {
+        use crate::pcs::jagged_fancy::AlignedTable;
+        let nu = self.n_log();
+        let mut out = Vec::new();
+        for ((ty, slot), &n_t) in self
+            .registry()
+            .types()
+            .iter()
+            .zip(self.registry().slots())
+            .zip(self.counts())
+        {
+            let mut col = (slot.offset >> (7 + nu)) as u64;
+            for width in Self::subtable_widths(self.used_cols(ty)) {
+                out.push(AlignedTable {
+                    log_width: width.trailing_zeros(),
+                    height: n_t as u64,
+                    col_offset: col,
+                });
+                col += width as u64;
+            }
+        }
+        out
+    }
+
     /// [`Self::compact_witness`] in the **row-major-within-table** order that
     /// fancy jagged ([`crate::pcs::jagged_fancy`]) requires:
     ///
