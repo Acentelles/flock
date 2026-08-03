@@ -21,22 +21,10 @@ pub struct R1csProofLigerito {
     pub pcs_open: pcs::BatchOpeningProofLigerito,
 }
 
-/// [`R1csProofLigerito`] with the opening routed through the **jagged
-/// transport** (`pcs::open_batch_jagged_ligerito`) instead of the direct
-/// mixed Ligerito open. The PIOP part (zerocheck + lincheck) is identical —
-/// on the same statement and witness the two proofs share a byte-identical
-/// transcript prefix up to the opening stage.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct R1csProofJaggedLigerito {
-    pub zerocheck: zerocheck::ZerocheckProof,
-    pub lincheck: lincheck::LincheckProof,
-    pub pcs_open: pcs::BatchOpeningProofJaggedLigerito,
-}
-
-/// [`R1csProofJaggedLigerito`] with the MERGED jagged/ring-switch opening
+/// [`R1csProofLigerito`] with the MERGED jagged/ring-switch opening
 /// (design doc §"Capacity-free ring-switching") — the PIOP sub-proofs are
 /// identical; only the transport differs. The Mixed flavor's wire payload
-/// since v6; the jagged variant remains as the differential oracle.
+/// since v6.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct R1csProofMergedLigerito {
     pub zerocheck: zerocheck::ZerocheckProof,
@@ -44,26 +32,26 @@ pub struct R1csProofMergedLigerito {
     pub pcs_open: pcs::MergedOpenProof,
 }
 
-/// A **mixed-class** union proof: the boolean PIOP, the element-region PIOP,
-/// and ONE jagged-transport opening covering all four claims (boolean AB + C
-/// ring-switched, element C + LC packed-direct).
+/// A **mixed-class** union proof over the MERGED (Frobenius) transport: the
+/// boolean PIOP, the element-region PIOP, and ONE merged opening covering
+/// all four claims (boolean AB + C ring-switched, element C + LC
+/// packed-direct — each expressed, to the weight builder, as the
+/// `F₂`-linear map `x ↦ γ·x`, indistinguishable from a ring-switched
+/// claim's Φ-fold).
 ///
 /// Each class's sub-proof is `Option`: a boolean-only registry has no element
-/// half, an element-only one no boolean half. Deliberately a NEW type rather
-/// than extra fields on [`R1csProofJaggedLigerito`] — that struct's serialized
-/// bytes are pinned by the `union_m6_fixtures` anchors, and boolean-only proofs
-/// must keep going out through it unchanged.
+/// half, an element-only one no boolean half.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct R1csProofMixedClassLigerito {
+pub struct R1csProofMixedClassMerged {
     /// Boolean zerocheck + lincheck over the `M_bool` prefix subcube.
     pub boolean: Option<BooleanPiopProof>,
     /// The element-region zerocheck + lincheck.
     pub element: Option<crate::element_r1cs::union::Proof>,
-    pub pcs_open: pcs::BatchOpeningProofJaggedLigerito,
+    pub pcs_open: pcs::MergedOpenProof,
 }
 
 /// The boolean class's two PIOP sub-proofs, as they appear inside
-/// [`R1csProofMixedClassLigerito`].
+/// [`R1csProofMixedClassMerged`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BooleanPiopProof {
     pub zerocheck: zerocheck::ZerocheckProof,

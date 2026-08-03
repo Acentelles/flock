@@ -329,7 +329,7 @@ impl BlockR1cs {
 
     /// Per-chunk-column heights (in packed words) of the committed witness's
     /// jagged grid, for the jagged opening path
-    /// (`pcs::open_batch_jagged_ligerito`): `2^(k_log−7)` entries, the leading
+    /// (`pcs::open_batch_merged`): `2^(k_log−7)` entries, the leading
     /// `ceil(useful_bits/128)` equal to `2^n_log` (every declared row) and the
     /// rest 0 (the padding chunk-columns, zero by the BatchMajor buffer
     /// layout — see [`Self::padding_spec`]). Shared by the prover and verifier

@@ -270,7 +270,7 @@ impl MixedSetup {
                 self.blake3_r1cs.csc_lincheck_circuit(),
             ),
         ];
-        prover::prove_fast_ligerito_jagged_union_merged(&union, &pcs_params, slots, challenger)
+        prover::prove_fast_ligerito_union(&union, &pcs_params, slots, challenger)
     }
 
     /// Verify a mixed proof against the declared counts. The Ligerito
@@ -291,7 +291,7 @@ impl MixedSetup {
             self.sha2_r1cs.csc_lincheck_circuit(),
             self.blake3_r1cs.csc_lincheck_circuit(),
         ];
-        verifier::verify_ligerito_jagged_union_merged(
+        verifier::verify_ligerito_union(
             &union,
             &circuits,
             commitment,

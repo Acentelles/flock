@@ -283,7 +283,7 @@ pub fn commit_into(
 //
 // [`lane_grid_from_lane_major`] converts the lane-major dense stack into the
 // LSB-lane "grid" array Ligerito folds; [`commit_lane_grid`] encodes it while
-// dropping the zero lanes. See `pcs::open_batch_jagged_ligerito`.
+// dropping the zero lanes. See `pcs::open_batch_merged`.
 // ---------------------------------------------------------------------------
 
 /// Number of nonzero high-bit lanes of a dense stack: `ceil(dense_words / D)`
