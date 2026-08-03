@@ -948,9 +948,9 @@ circuit proof's public segment. Every published word is one of two kinds:
         words, gate outputs. These are bound by the opening; publishing
         them only \emph{exposes} them.
   \item \textbf{Advice publics} — values the circuit consumes but cannot
-        cheaply derive (eq-tensor expansions, the zerocheck's skip-round
-        seed, per-round $g_0$, deferred matrix evaluations). Each is bound
-        by a checker equation over kind-(1) values and proof data.
+        cheaply derive (eq-tensor expansions, per-round $g_0$, deferred
+        matrix evaluations). Each is bound by a checker equation over
+        kind-(1) values and proof data.
 \end{enumerate}
 
 The checker obligations, per verified inner (the leaf inventory; the
@@ -969,14 +969,28 @@ pure-element inner is the subset without the RS items):
   \item \emph{Zero-deltas}: the published identity deltas (zerocheck
         $g_0$ rows, the multipoint's $T_m = \text{anchor}.v$ and
         $\text{claim} = \text{expect}$, the merged boundary) are zero.
-  \item \emph{Advice seeds and chain ends}: the zerocheck seed equals the
-        skip-round interpolation at $z$; each published chain end equals
-        the native replay from bound data.
+  \item \emph{Chain ends}: each published chain end equals the native
+        replay from bound data. (The zerocheck's skip-round seed is no
+        longer advice: the interpolation is in-circuit — see below — and
+        its \code{rc} output additionally \emph{binds}
+        \code{final\_c\_eval}, which the transcript never absorbs; the
+        checker holds the published wire against the proof field.)
   \item \emph{The family-H batch} (boundary-first; the standing upgrade
         target): the RS transpose dots (a bit-matrix transpose), the
         linearized fold coefficients, the $V$ recombination's Frobenius
         squarings, and the twisted closed form $\hat g(\rho'')$ — all
-        $\F_2$-linear maps of bound words, recomputed natively.
+        $\F_2$-linear maps of bound words, recomputed natively. The
+        \emph{skip-round interpolation}, the batch's first item, is
+        landed in-circuit: the barycentric \emph{numerator} recurrence
+        $A' = A(z{+}\lambda)$, $B' = B(z{+}\lambda) + vA$ over the
+        $\Lambda$ nodes needs no inversions and no advice (and is exact
+        even at $z$ on a node, where the closed form branches), while the
+        $\varphi_8$ structure still pays through the linearized
+        $Z_S(z)$ — a 6-step squaring chain — and the shared subspace
+        denominators ($\mathrm{den} = c_0$, the formal derivative) baked
+        as gate constants. In-circuit, multiplications are cheap and
+        inversions are advice: the numerator form beats the
+        inverse-based closed form that wins natively.
   \item \emph{Assertion consumption}: the emitted
         \code{ElementAssertion}/\code{MatrixAssertion} fields (points as
         kind-(1) wires, matrix evaluations as advice bound by the
@@ -990,10 +1004,39 @@ operands are kind-(1) or proof scalars the transcript absorbed. Cost:
 the checker's native work is $O(q + \text{rounds} + 128R + P +
 \#\mathrm{pow})$ field operations plus tens of hashes — nothing
 $O(2^m)$, so the deferral discipline survives the boundary. The
-contract shrinks monotonically as items move in-circuit (the family-H
-batch is one coherent pass of boolean-class bit machinery), and it is
+contract shrinks monotonically as items move in-circuit, and it is
 part of the statement: a checker that skips an item verifies a weaker
 claim.
+
+\paragraph{The family-H batch is not one pass — it splits by cell-slot
+cost.} The cell space's $c$ bits count \emph{IO words} (one cell-slot
+per schema word of each gate type, plus one per $2^\nu$ block of
+publics), so a boolean bit-gadget table is charged by its wired words,
+not its live rows. That splits the batch:
+
+\begin{itemize}[nosep]
+  \item \emph{Element-tractable now}: the skip interpolation (landed);
+        $\hat g(\rho'')$ and the anchor expect. In characteristic 2 the
+        eq factor is \emph{affine} ($1+a+b$), so the existing
+        \code{PrefixGate} slot evaluates every $\mathrm{eq}(\rho^{2^{-j}},
+        \rho'')$ with zero-padding (padding pairs contribute 1); the
+        inverse-Frobenius points ride as advice verified by
+        \emph{forward} squaring deltas $y\cdot y + \mathrm{prev} = 0$ on
+        the existing spine slot; $\gamma$-powers are spine MACs. No new
+        cell-slots — cost is rows ($\approx 128$ prefix chains $+\ 127m$
+        advice checks) and $\approx 2 \cdot 127m$ publics.
+  \item \emph{Cell-slot-expensive}: the RS transpose dots and the $V$
+        recombination's Frobenius twists. A faithful transpose table
+        needs its 128 input words \emph{wired} (free-witness inputs are
+        unsound here — binding the inputs to the stream is the content)
+        plus outputs: $\geq 256$ new cell-slots, i.e.\ $c{+}1$ and a
+        verifier-cost step, or tiling into $32{\times}32$ blocks
+        (64 words) against whatever slot headroom remains. The clean fix
+        is per-slot row capacity (the ``jagged remainder''): a
+        transpose table with 2 live rows wants $\nu_{\mathrm{slot}} = 1$,
+        at which point its index space is trivial. Until that exists,
+        these two items \emph{stay boundary} deliberately.
+\end{itemize}
 
 % ===========================================================================
 \section{Cost accounting}\label{sec:costs}
