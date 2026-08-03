@@ -8793,7 +8793,7 @@ fn mvp10_leaf_outer_inner_tape() {
             v
         };
         let mut resid_slots: Vec<(usize, flock_core::circuit::builder::SlotId)> = Vec::new();
-        let (resid_pub, inner_w, _pf) = emit_residual_region(
+        let (resid_pub, inner_w, (pfslot, pf_w)) = emit_residual_region(
             &mut sb,
             &mut resid_slots,
             &levels,
@@ -9006,7 +9006,521 @@ fn mvp10_leaf_outer_inner_tape() {
             }
             t2
         };
-        let _ = (&mp_pws, &mp_rho2_w, &mp_sig_w);
+
+        // ---- the swap, step 7: the anchor EXPECT at real-inner scale ----
+        // The mvp10 machinery (RS statements with ĝ, P groups with e_at,
+        // general run weights, slot-prefix constants) plus ONE scale
+        // insight: every wiring GATHER claim's column point is ONE-HOT
+        // (the gate slot's constant address bits), so it binds through a
+        // SINGLE prefix row — eq at its own hot pattern — the in-circuit
+        // mirror of the native one-hot fast path. Only the element pair's
+        // random column points take the general per-run weights.
+        let m_mp2 = mp_i.rounds.len();
+        assert_eq!(mp_sig_w.len(), 2 * (m_mp2 + 1), "sigma spans the anchor layers");
+        assert_eq!(w_rounds.len(), m_mp2, "merged rho spans the dense domain");
+        let n_log_i = union_i.n_log();
+        let params_i = flock_core::pcs::jagged::JaggedParams::from_heights(
+            &union_i.jagged_heights(),
+            n_log_i,
+            m_mp2,
+        );
+        let k_cols_i = params_i.k;
+        let bounds_i = flock_core::pcs::jagged::assist_boundaries(&params_i);
+        let n_runs = bounds_i.len();
+        let run_y0: Vec<usize> = bounds_i
+            .iter()
+            .scan(0usize, |y, &(_, _, len)| {
+                let s = *y;
+                *y += len as usize;
+                Some(s)
+            })
+            .collect();
+        let comp_ix = (0..n_runs)
+            .max_by_key(|&r| bounds_i[r].2)
+            .expect("at least one run");
+        let run_of: Vec<usize> = {
+            let mut v = Vec::with_capacity(1usize << k_cols_i);
+            for (r, &(_, _, len)) in bounds_i.iter().enumerate() {
+                v.extend(std::iter::repeat_n(r, len as usize));
+            }
+            assert_eq!(v.len(), 1usize << k_cols_i, "runs partition the columns");
+            v
+        };
+        // The boolean PIOP's round ordinals, located with fins — the RS
+        // statements' points are its round challenges.
+        let (zc_rounds_b, (outer_ch_b, outer_fin_b), lc_rounds_b) = {
+            let mut i2 = zc_l[0] + 1;
+            assert!(matches!(ops[i2], Op::SqueezeSlice(_)), "r_skip slice");
+            i2 += 1;
+            assert!(matches!(ops[i2], Op::SqueezeSlice(_)), "r_outer slice");
+            let outer = (vc_at(i2).1, fin_at(i2));
+            i2 += 1;
+            assert!(matches!(ops[i2], Op::ObserveSlice(64)), "round1_ab");
+            i2 += 1;
+            assert!(matches!(ops[i2], Op::ObserveSlice(64)), "round1_c");
+            i2 += 1;
+            assert!(matches!(ops[i2], Op::SqueezeScalar), "z_skip");
+            i2 += 1;
+            let mut zc_r: Vec<(usize, usize)> = Vec::new();
+            while matches!(ops[i2], Op::ObserveScalar)
+                && matches!(ops[i2 + 1], Op::ObserveScalar)
+                && matches!(ops[i2 + 2], Op::SqueezeScalar)
+            {
+                zc_r.push((vc_at(i2 + 2).1, fin_at(i2 + 2)));
+                i2 += 3;
+            }
+            while matches!(ops[i2], Op::ObserveScalar) {
+                i2 += 1;
+            }
+            assert_eq!(i2, lc_l[0], "the zerocheck runs straight into the lincheck");
+            i2 += 1;
+            while matches!(ops[i2], Op::SqueezeScalar) {
+                i2 += 1;
+            }
+            let mut lc_r: Vec<(usize, usize)> = Vec::new();
+            while matches!(ops[i2], Op::ObserveScalar)
+                && matches!(ops[i2 + 1], Op::ObserveScalar)
+                && matches!(ops[i2 + 2], Op::SqueezeScalar)
+            {
+                lc_r.push((vc_at(i2 + 2).1, fin_at(i2 + 2)));
+                i2 += 3;
+            }
+            (zc_r, outer, lc_r)
+        };
+        use flock_core::zerocheck::univariate_skip_optimized::{
+            medium_challenges_ghash, small_challenges_ghash,
+        };
+        let mut t_vals_b: Vec<F128> = Vec::new();
+        t_vals_b.extend_from_slice(&small_challenges_ghash());
+        t_vals_b.extend_from_slice(&medium_challenges_ghash());
+        assert_eq!(t_vals_b.len(), 7, "the seven baked ghash weights");
+        assert!(lc_rounds_b.len() <= 1 + k_cols_i, "lc rounds fit the col bits");
+        let nat_b = claims.boolean.as_ref().expect("boolean claims");
+        let x_ab_n: Vec<F128> = {
+            let p = &nat_b.ab.point;
+            let mut v = p.x_inner_rest.clone();
+            v.extend_from_slice(&p.x_outer);
+            v
+        };
+        let x_c_n: Vec<F128> = {
+            let p = &nat_b.c.point;
+            let mut v = p.x_inner_rest.clone();
+            v.extend_from_slice(&p.x_outer);
+            v
+        };
+        assert_eq!(x_ab_n.len(), 1 + n_log_i + k_cols_i, "ab point split");
+        assert_eq!(x_c_n.len(), 1 + n_log_i + k_cols_i, "c point split");
+        let extend_const = |pw: &mut Vec<(F128, Wire)>, xn: &[F128]| {
+            for &cv2 in &xn[pw.len()..] {
+                let w = if cv2 == F128::ZERO {
+                    zw
+                } else {
+                    assert_eq!(cv2, F128::ONE, "constant point coord is a slot-prefix bit");
+                    ow
+                };
+                pw.push((cv2, w));
+            }
+        };
+        let mlv_pw: Vec<(F128, Wire)> = zc_rounds_b
+            .iter()
+            .map(|&(ch, fin)| (chals[ch], outs[trace.squeezes[fin][0]][0]))
+            .collect();
+        let lc_pw: Vec<(F128, Wire)> = lc_rounds_b
+            .iter()
+            .rev()
+            .map(|&(ch, fin)| (chals[ch], outs[trace.squeezes[fin][0]][0]))
+            .collect();
+        let mut xab_pw: Vec<(F128, Wire)> = vec![lc_pw[0]];
+        xab_pw.extend_from_slice(&mlv_pw[1..1 + n_log_i]);
+        xab_pw.extend_from_slice(&lc_pw[1..]);
+        extend_const(&mut xab_pw, &x_ab_n);
+        let mut xc_pw: Vec<(F128, Wire)> = (0..zc_rounds_b.len())
+            .map(|k2| {
+                if k2 < 7 {
+                    vals.push(t_vals_b[k2]);
+                    (t_vals_b[k2], sb.public_input())
+                } else {
+                    let j = k2 - 7;
+                    let sq2 = &trace.squeezes[outer_fin_b];
+                    (chals[outer_ch_b + j], outs[sq2[j / 4]][j % 4])
+                }
+            })
+            .collect();
+        extend_const(&mut xc_pw, &x_c_n);
+        for (i2, (&(nv, _), &xn)) in xab_pw.iter().zip(&x_ab_n).enumerate() {
+            assert_eq!(nv, xn, "ab point coord {i2} is the located wire");
+        }
+        for (i2, (&(nv, _), &xn)) in xc_pw.iter().zip(&x_c_n).enumerate() {
+            assert_eq!(nv, xn, "c point coord {i2} is the located wire");
+        }
+        let pd_pts_n: Vec<Vec<F128>> = gammas_i
+            .iter()
+            .map(|pd| vals_rec[pd.pt_v..pd.pt_v + pd.pt_len].to_vec())
+            .collect();
+        for pd in &gammas_i {
+            assert_eq!(pd.pt_len, n_log_i + k_cols_i, "pd point split");
+        }
+        let mut groups_ix: Vec<Vec<usize>> = Vec::new();
+        for (i2, pt) in pd_pts_n.iter().enumerate() {
+            match groups_ix
+                .iter_mut()
+                .find(|g2| pd_pts_n[g2[0]][..n_log_i] == pt[..n_log_i])
+            {
+                Some(g2) => g2.push(i2),
+                None => groups_ix.push(vec![i2]),
+            }
+        }
+        assert_eq!(groups_ix.len(), n_p, "P scalar groups by shared row");
+
+        // Native replica of the WHOLE expect — validated against the
+        // accepted proof before any gate exists.
+        let frob_inv_native = |x: F128| {
+            let mut y = x;
+            for _ in 0..127 {
+                y = y * y;
+            }
+            y
+        };
+        let gamma_n = chals[mp_i.gamma_ch];
+        let mut gpow_n = vec![F128::ONE];
+        for j in 1..257 + n_p {
+            gpow_n.push(gpow_n[j - 1] * gamma_n);
+        }
+        let rho_mrg_n: Vec<F128> = w_rounds.iter().map(|rr| chals[rr.ch]).collect();
+        let point_n: Vec<F128> = mp_i.rounds.iter().map(|rr| chals[rr.ch]).collect();
+        let sig_n: Vec<F128> = mp_i.anchor_rounds.iter().map(|rr| chals[rr.ch]).collect();
+        let bit = |b: bool| if b { F128::ONE } else { F128::ZERO };
+        let g_at_n = {
+            let mut rinv = rho_mrg_n.clone();
+            let mut acc = F128::ZERO;
+            for (j, &gp) in gpow_n.iter().enumerate().take(128) {
+                if j > 0 {
+                    for x in rinv.iter_mut() {
+                        *x = frob_inv_native(*x);
+                    }
+                }
+                let mut prod = gp;
+                for (t3, &x) in point_n.iter().enumerate() {
+                    prod *= F128::ONE + rinv[t3] + x;
+                }
+                acc += prod;
+            }
+            acc
+        };
+        let e_at_n = rho_mrg_n
+            .iter()
+            .zip(&point_n)
+            .fold(F128::ONE, |a, (&r3, &x)| a * (F128::ONE + r3 + x));
+        let eqc_n: Vec<F128> = bounds_i
+            .iter()
+            .map(|&(t_c, t_next, _)| {
+                let mut p = F128::ONE;
+                for l in 0..=m_mp2 {
+                    p *= F128::ONE + sig_n[2 * l] + bit((t_c >> l) & 1 == 1);
+                    p *= F128::ONE + sig_n[2 * l + 1] + bit((t_next >> l) & 1 == 1);
+                }
+                p
+            })
+            .collect();
+        let sparse_t = flock_core::pcs::jagged::assist_sparse_transitions();
+        let dp_native = |z_row: &[F128]| -> F128 {
+            let mut gdp = [F128::ZERO; 4];
+            gdp[flock_core::pcs::jagged::STATE_SUCCESS] = F128::ONE;
+            for layer in (0..=m_mp2).rev() {
+                let za = if layer < n_log_i { z_row[layer] } else { F128::ZERO };
+                let rb = if layer < m_mp2 { point_n[layer] } else { F128::ZERO };
+                let eq4 = flock_core::lincheck::build_eq_table(&[za, rb]);
+                let (rc, rd) = (sig_n[2 * layer], sig_n[2 * layer + 1]);
+                let e = [
+                    (F128::ONE + rc) * (F128::ONE + rd),
+                    rc * (F128::ONE + rd),
+                    (F128::ONE + rc) * rd,
+                    rc * rd,
+                ];
+                let mut prev = [F128::ZERO; 4];
+                for (cd, &ecd) in e.iter().enumerate() {
+                    for (s2, slot2) in prev.iter_mut().enumerate() {
+                        let (i0, o0) = sparse_t[cd][s2][0];
+                        let (i1, o1) = sparse_t[cd][s2][1];
+                        *slot2 += ecd * (eq4[i0] * gdp[o0] + eq4[i1] * gdp[o1]);
+                    }
+                }
+                gdp = prev;
+            }
+            gdp[flock_core::pcs::jagged::STATE_INITIAL]
+        };
+        let run_weights_n = |z_col: &[F128]| -> Vec<F128> {
+            let mut w_at = vec![F128::ZERO; n_runs];
+            let mut tot = F128::ONE;
+            for (r3, &(_, _, len)) in bounds_i.iter().enumerate() {
+                if r3 == comp_ix {
+                    continue;
+                }
+                let mut w = F128::ZERO;
+                for y in run_y0[r3]..run_y0[r3] + len as usize {
+                    let mut s = F128::ONE;
+                    for (jj, &zc2) in z_col.iter().enumerate() {
+                        s *= F128::ONE + zc2 + bit((y >> jj) & 1 == 1);
+                    }
+                    w += s;
+                }
+                w_at[r3] = w;
+                tot += w;
+            }
+            w_at[comp_ix] = tot;
+            w_at
+        };
+        let expect_n = {
+            let mut acc = F128::ZERO;
+            for (si, xs) in [&x_ab_n, &x_c_n].iter().enumerate() {
+                let z_row = &xs[1..1 + n_log_i];
+                let run_n = run_weights_n(&xs[1 + n_log_i..]);
+                let w_n = run_n
+                    .iter()
+                    .zip(&eqc_n)
+                    .fold(F128::ZERO, |a, (&x, &e)| a + x * e);
+                let coeff = if si == 0 { g_at_n } else { gpow_n[128] * g_at_n };
+                acc += coeff * (w_n * dp_native(z_row));
+            }
+            for (g_ix, members) in groups_ix.iter().enumerate() {
+                let mut run_n = vec![F128::ZERO; n_runs];
+                for &i2 in members {
+                    let pd = &gammas_i[i2];
+                    let gpd = chals[pd.ch];
+                    let w_at = run_weights_n(&pd_pts_n[i2][n_log_i..]);
+                    for r3 in 0..n_runs {
+                        run_n[r3] += gpd * w_at[r3];
+                    }
+                }
+                let w_n = run_n
+                    .iter()
+                    .zip(&eqc_n)
+                    .fold(F128::ZERO, |a, (&x, &e)| a + x * e);
+                let dp = dp_native(&pd_pts_n[members[0]][..n_log_i]);
+                acc += gpow_n[256 + g_ix] * e_at_n * (w_n * dp);
+            }
+            acc
+        };
+        assert_eq!(
+            expect_n, anc_end_n,
+            "the anchor expect replays natively at real-inner scale"
+        );
+
+        // The circuit side.
+        let prefix_product = |sb: &mut ShapeBuilder, factors: &[(Wire, Wire)]| -> Wire {
+            let mut seed = ow;
+            for chunk in factors.chunks(pf_w) {
+                let mut g_in = vec![seed];
+                for (a, _) in chunk {
+                    g_in.push(*a);
+                }
+                g_in.extend(std::iter::repeat_n(zw, pf_w - chunk.len()));
+                for (_, b) in chunk {
+                    g_in.push(*b);
+                }
+                g_in.extend(std::iter::repeat_n(zw, pf_w - chunk.len()));
+                g_in.push(ow);
+                seed = sb.gate(pfslot, &g_in)[0];
+            }
+            seed
+        };
+        let rho_mrg_w: Vec<Wire> = w_rounds
+            .iter()
+            .map(|rr| outs[trace.squeezes[rr.fin][0]][0])
+            .collect();
+        let mut rinv_n2: Vec<F128> = rho_mrg_n.clone();
+        let mut rinv_w: Vec<Wire> = rho_mrg_w.clone();
+        let mut sqrt_deltas: Vec<Wire> = Vec::new();
+        let mut ghat = zw;
+        for j in 0..128 {
+            if j > 0 {
+                let mut lvl_w = Vec::with_capacity(m_mp2);
+                for t3 in 0..m_mp2 {
+                    let y = frob_inv_native(rinv_n2[t3]);
+                    rinv_n2[t3] = y;
+                    vals.push(y);
+                    let yw = sb.public_input();
+                    sqrt_deltas
+                        .push(sb.gate(spine, &[zw, zw, zw, rinv_w[t3], zw, zw, yw, yw, zw])[3]);
+                    lvl_w.push(yw);
+                }
+                rinv_w = lvl_w;
+            }
+            let factors: Vec<(Wire, Wire)> = rinv_w
+                .iter()
+                .copied()
+                .zip(mp_rho2_w.iter().copied())
+                .collect();
+            let eqj = prefix_product(&mut sb, &factors);
+            ghat = sb.gate(spine, &[zw, zw, zw, ghat, zw, zw, mp_pws[j], eqj, zw])[3];
+        }
+        let e_at_w = {
+            let factors: Vec<(Wire, Wire)> = rho_mrg_w
+                .iter()
+                .copied()
+                .zip(mp_rho2_w.iter().copied())
+                .collect();
+            prefix_product(&mut sb, &factors)
+        };
+        let eqc_w: Vec<Wire> = bounds_i
+            .iter()
+            .map(|&(t_c, t_next, _)| {
+                let mut factors = Vec::with_capacity(2 * (m_mp2 + 1));
+                for l in 0..=m_mp2 {
+                    factors.push((mp_sig_w[2 * l], if (t_c >> l) & 1 == 1 { ow } else { zw }));
+                    factors
+                        .push((mp_sig_w[2 * l + 1], if (t_next >> l) & 1 == 1 { ow } else { zw }));
+                }
+                prefix_product(&mut sb, &factors)
+            })
+            .collect();
+        let alslot = sb.slot(AssistLayerGate::new());
+        let mut expect_w = zw;
+        for (si, xs) in [&xab_pw, &xc_pw].iter().enumerate() {
+            let z_row_w: Vec<Wire> = xs[1..1 + n_log_i].iter().map(|&(_, w)| w).collect();
+            let z_col_w: Vec<Wire> = xs[1 + n_log_i..].iter().map(|&(_, w)| w).collect();
+            let mut run_w: Vec<Wire> = vec![zw; n_runs];
+            let mut tot_w = ow;
+            for (r3, &(_, _, len)) in bounds_i.iter().enumerate() {
+                if r3 == comp_ix {
+                    continue;
+                }
+                let mut w: Option<Wire> = None;
+                for y in run_y0[r3]..run_y0[r3] + len as usize {
+                    let factors: Vec<(Wire, Wire)> = z_col_w
+                        .iter()
+                        .enumerate()
+                        .map(|(jj, &zc2)| (zc2, if (y >> jj) & 1 == 1 { ow } else { zw }))
+                        .collect();
+                    let s = prefix_product(&mut sb, &factors);
+                    w = Some(match w {
+                        None => s,
+                        Some(p) => sb.gate(spine, &[zw, zw, zw, p, zw, zw, s, ow, zw])[3],
+                    });
+                }
+                let w = w.expect("non-empty run");
+                run_w[r3] = w;
+                tot_w = sb.gate(spine, &[zw, zw, zw, tot_w, zw, zw, w, ow, zw])[3];
+            }
+            run_w[comp_ix] = tot_w;
+            let mut w_st = zw;
+            for (r3, &rw) in run_w.iter().enumerate() {
+                w_st = sb.gate(spine, &[zw, zw, zw, w_st, zw, zw, rw, eqc_w[r3], zw])[3];
+            }
+            let mut gdp = [zw, zw, ow, zw]; // STATE_SUCCESS seed
+            for layer in (0..=m_mp2).rev() {
+                let za = if layer < n_log_i { z_row_w[layer] } else { zw };
+                let rb = if layer < m_mp2 { mp_rho2_w[layer] } else { zw };
+                let mut a_in = gdp.to_vec();
+                a_in.extend_from_slice(&[
+                    za,
+                    rb,
+                    mp_sig_w[2 * layer],
+                    mp_sig_w[2 * layer + 1],
+                    ow,
+                ]);
+                let o = sb.gate(alslot, &a_in);
+                gdp = [o[0], o[1], o[2], o[3]];
+            }
+            let coeff = if si == 0 {
+                ghat
+            } else {
+                sb.gate(spine, &[zw, zw, zw, zw, zw, zw, mp_pws[128], ghat, zw])[3]
+            };
+            let wd = sb.gate(spine, &[zw, zw, zw, zw, zw, zw, w_st, gdp[0], zw])[3];
+            expect_w = sb.gate(spine, &[zw, zw, zw, expect_w, zw, zw, coeff, wd, zw])[3];
+        }
+        for (g_ix, members) in groups_ix.iter().enumerate() {
+            let mut run_w: Vec<Wire> = vec![zw; n_runs];
+            for &i2 in members {
+                let pd = &gammas_i[i2];
+                let gpd_w = outs[trace.squeezes[pd.fin][0]][0];
+                let z_col_n = &pd_pts_n[i2][n_log_i..];
+                let hot: Option<usize> =
+                    z_col_n.iter().enumerate().try_fold(0usize, |acc, (j, &x)| {
+                        if x == F128::ZERO {
+                            Some(acc)
+                        } else if x == F128::ONE {
+                            Some(acc | (1 << j))
+                        } else {
+                            None
+                        }
+                    });
+                if let Some(h) = hot {
+                    // One-hot: ONE prefix row binds the whole column point.
+                    let factors: Vec<(Wire, Wire)> = (0..k_cols_i)
+                        .map(|j| {
+                            (
+                                wv(pd.pt_v + n_log_i + j),
+                                if (h >> j) & 1 == 1 { ow } else { zw },
+                            )
+                        })
+                        .collect();
+                    let s = prefix_product(&mut sb, &factors);
+                    let r_hot = run_of[h];
+                    run_w[r_hot] = sb.gate(macs, &[run_w[r_hot], gpd_w, s])[0];
+                } else {
+                    // General weights (the element pair's random columns).
+                    let mut tot_w = ow;
+                    let mut w_at: Vec<Wire> = vec![zw; n_runs];
+                    for (r3, &(_, _, len)) in bounds_i.iter().enumerate() {
+                        if r3 == comp_ix {
+                            continue;
+                        }
+                        let mut w: Option<Wire> = None;
+                        for y in run_y0[r3]..run_y0[r3] + len as usize {
+                            let factors: Vec<(Wire, Wire)> = (0..k_cols_i)
+                                .map(|j| {
+                                    (
+                                        wv(pd.pt_v + n_log_i + j),
+                                        if (y >> j) & 1 == 1 { ow } else { zw },
+                                    )
+                                })
+                                .collect();
+                            let s = prefix_product(&mut sb, &factors);
+                            w = Some(match w {
+                                None => s,
+                                Some(p) => sb.gate(macs, &[p, s, ow])[0],
+                            });
+                        }
+                        let w = w.expect("non-empty run");
+                        w_at[r3] = w;
+                        tot_w = sb.gate(macs, &[tot_w, w, ow])[0];
+                    }
+                    w_at[comp_ix] = tot_w;
+                    for r3 in 0..n_runs {
+                        run_w[r3] = sb.gate(macs, &[run_w[r3], gpd_w, w_at[r3]])[0];
+                    }
+                }
+            }
+            let mut w_st = zw;
+            for (r3, &rw) in run_w.iter().enumerate() {
+                w_st = sb.gate(macs, &[w_st, rw, eqc_w[r3]])[0];
+            }
+            let mut gdp = [zw, zw, ow, zw]; // STATE_SUCCESS seed
+            for layer in (0..=m_mp2).rev() {
+                let za = if layer < n_log_i {
+                    wv(gammas_i[members[0]].pt_v + layer)
+                } else {
+                    zw
+                };
+                let rb = if layer < m_mp2 { mp_rho2_w[layer] } else { zw };
+                let mut a_in = gdp.to_vec();
+                a_in.extend_from_slice(&[
+                    za,
+                    rb,
+                    mp_sig_w[2 * layer],
+                    mp_sig_w[2 * layer + 1],
+                    ow,
+                ]);
+                let o = sb.gate(alslot, &a_in);
+                gdp = [o[0], o[1], o[2], o[3]];
+            }
+            let coeff = sb.gate(macs, &[zw, mp_pws[256 + g_ix], e_at_w])[0];
+            let wd = sb.gate(macs, &[zw, w_st, gdp[0]])[0];
+            expect_w = sb.gate(macs, &[expect_w, coeff, wd])[0];
+        }
+        let anchor_delta = sb.gate(macs, &[anc_w, expect_w, ow])[0];
 
         for (a_wires, opens) in &to_publish {
             for w in a_wires {
@@ -9049,15 +9563,20 @@ fn mvp10_leaf_outer_inner_tape() {
         sb.publish(el_lcw);
         sb.publish(mp_delta);
         sb.publish(anc_w);
+        for d in &sqrt_deltas {
+            sb.publish(*d);
+        }
+        sb.publish(anchor_delta);
         let shape2 = sb.finish().expect("the swap outer builds");
-        // Cell-slot budget: gate slots + public blocks must stay <= 256
-        // for mu 23 (every gate IO word is ALSO a wiring gather claim —
-        // schema words are the budget for both). 250/256 as of the
-        // prefix-width cap; the anchor expect's AssistLayerGate will
-        // spend ~13 of the next doubling unless paid by a consolidation.
+        // Cell-slot budget: every gate IO word is ALSO a wiring gather
+        // claim, so schema words are the budget for both mu and claims.
+        // The anchor expect's AssistLayerGate (+13 words) tipped the 256
+        // boundary to mu 24 — ACCEPTED per the sequencing decision (the
+        // per-class-nu layout redesign subsumes word-level consolidation;
+        // do not spend throwaway trims here).
         assert!(
-            shape2.circuit.cells().slots().len() <= 256,
-            "the swap outer's cell-slot budget regressed past mu 23 ({} slots)",
+            shape2.circuit.cells().slots().len() <= 512,
+            "the swap outer's cell-slot budget regressed past mu 24 ({} slots)",
             shape2.circuit.cells().slots().len()
         );
         let hint_refs: Vec<&dyn std::any::Any> =
@@ -9083,7 +9602,9 @@ fn mvp10_leaf_outer_inner_tape() {
             + mu_i
             + el_deltas.len()
             + 2
-            + 2;
+            + 2
+            + sqrt_deltas.len()
+            + 1;
         let mut at2 = built2.public.len() - n_tail - n_query_pub;
         for (li, lvl) in levels.iter().enumerate() {
             let g = &geo[li];
@@ -9232,6 +9753,20 @@ fn mvp10_leaf_outer_inner_tape() {
             anc_end_n,
             "the anchor rounds end at the native claim"
         );
+        // The anchor-expect tail: every sqrt-chain delta zero, and
+        // claim == expect closes at real-inner scale.
+        let axp_base = mp_base2 + 2;
+        for (k5, d) in built2.public[axp_base..axp_base + sqrt_deltas.len()]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(*d, F128::ZERO, "sqrt-chain delta {k5}");
+        }
+        assert_eq!(
+            built2.public[axp_base + sqrt_deltas.len()],
+            F128::ZERO,
+            "the anchor claim == expect zero-delta (real-inner scale)"
+        );
 
         // The outer-of-outer proves and verifies over the circuit path.
         let union2 = UnionInstance::new(&shape2.registry, shape2.counts.clone());
@@ -9284,7 +9819,7 @@ fn mvp10_leaf_outer_inner_tape() {
         ];
         bslots.sort_by_key(|(i, _)| *i);
         let mut el_all2: Vec<flock_core::circuit::builder::SlotId> =
-            vec![mrslot, spine, macs, zcr];
+            vec![mrslot, spine, macs, zcr, alslot];
         el_all2.extend(le_slots.iter().map(|(_, sl)| *sl));
         el_all2.extend(resid_slots.iter().map(|(_, sl)| *sl));
         let mut el_ord: Vec<(usize, Vec<F128>)> = el_all2
@@ -9377,7 +9912,8 @@ fn mvp10_leaf_outer_inner_tape() {
          carries: chain, QUERY PHASE, PoW, W-rounds (rho bound), SPINE\n  \
          (t_r bound), RESIDUAL (rotated; inner == t_r closes), WIRING\n  \
          GKR (21 layers) + sigma (emitted, discharges), the MULTI-SLOT\n  \
-         element PIOP (general strip), and the MULTIPOINT intake\n  \
+         element PIOP (general strip), the MULTIPOINT intake, and the\n  \
+         ANCHOR EXPECT (one-hot gathers; claim == expect closes)\n  \
          prove {:.0} ms | verify {:.0} ms | proof {:.1} KiB\n",
         lo.pcs.m,
         lo.shape.circuit.cells().mu(),
