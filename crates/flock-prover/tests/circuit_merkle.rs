@@ -3439,7 +3439,16 @@ fn parse_open_levels(
     ops: &[flock_core::transcript_record::TranscriptOp],
     cap0_bytes: usize,
     r: usize,
-) -> (usize, PiopRec, Vec<PdRec>, Vec<RoundRec>, MpRec, InnerPd, usize, Vec<OpenLevel>) {
+) -> (
+    usize,
+    Option<PiopRec>,
+    Vec<PdRec>,
+    Vec<RoundRec>,
+    MpRec,
+    InnerPd,
+    usize,
+    Vec<OpenLevel>,
+) {
     use flock_core::transcript_record::TranscriptOp as Op;
     struct Cur<'a> {
         ops: &'a [Op],
@@ -3550,6 +3559,21 @@ fn parse_open_levels(
             continue;
         }
         if in_pd {
+            // Ring-switched claims front the intake on boolean-bearing
+            // tapes: [label, s_hat_v slice, r_dprime slice] each, then the
+            // bare gamma squeezes — walk over them (mvp9 pins them
+            // separately).
+            if matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == b"flock-ring-switch-v0") {
+                cur.bump(); // label
+                cur.bump(); // s_hat_v slice
+                cur.bump(); // r_dprime slice
+                continue;
+            }
+            if matches!(ops[cur.i], Op::SqueezeScalar) {
+                // an rs gamma — bare squeeze, no absorb
+                cur.bump();
+                continue;
+            }
             if let Op::ObserveSlice(n) = ops[cur.i] {
                 let pt_v = cur.v;
                 cur.bump();
@@ -3568,14 +3592,16 @@ fn parse_open_levels(
             }
             in_pd = false;
             // The merged W-rounds follow the intake immediately: one
-            // [ObserveScalar x2, SqueezeScalar] triplet per dense variable
-            // (= the outer claims' point length).
-            let dense_log = gammas.last().expect("outer claims first").pt_len;
-            for _ in 0..dense_log {
+            // [ObserveScalar x2, SqueezeScalar] triplet per dense variable,
+            // running until the multipoint label — count-free, so boolean
+            // tapes (no packed-direct claims) parse identically.
+            while matches!(ops[cur.i], Op::ObserveScalar)
+                && matches!(ops[cur.i + 1], Op::ObserveScalar)
+                && matches!(ops[cur.i + 2], Op::SqueezeScalar)
+            {
                 let g_v = cur.v;
                 cur.expect_obs_scalar();
                 cur.expect_obs_scalar();
-                assert!(matches!(ops[cur.i], Op::SqueezeScalar), "rho");
                 rounds.push(RoundRec {
                     g_v,
                     fin: cur.fin,
@@ -3777,7 +3803,7 @@ fn parse_open_levels(
     }
     (
         start_v,
-        piop.expect("the element PIOP"),
+        piop,
         gammas,
         rounds,
         mp,
@@ -3955,6 +3981,7 @@ fn mvp7_real_query_phase() {
         .collect();
     let (start_v, piop, gammas, w_rounds, mp, inner_pd, yr_v, levels) =
         parse_open_levels(t_shape.ops(), 32 * lig.initial_cap.len(), r);
+    let piop = piop.expect("the element PIOP");
     assert_eq!(levels.len(), r + 1);
 
     // The multipoint region, validated field-for-field against the proof:
@@ -5941,9 +5968,14 @@ fn mvp9_boolean_leaf_tape() {
         blake3::generate_witness_batch_major(&inputs, setup.n_blocks_log()),
         circuit,
     );
+    // BLAKE3 for BOTH the Merkle trees and the FS chain — the circuit's
+    // opening gates and chain rows model blake3; the setup's defaults
+    // (SHA-256 Merkle) diverge silently otherwise.
+    let mut leaf_pcs = setup.pcs_params.clone();
+    leaf_pcs.merkle_hash = flock_core::merkle::HashKind::Blake3;
     let mut ch = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
     let (proof, commitment, _claim) =
-        prover::prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
+        prover::prove_fast_ligerito_union(&union, &leaf_pcs, vec![slot], &mut ch);
 
     let mut rec = RecordingChallenger::new(FsChallenger::with_hash(DOMAIN, HashKind::Blake3));
     verifier::verify_ligerito_union(
@@ -5951,7 +5983,7 @@ fn mvp9_boolean_leaf_tape() {
         &[circuit],
         &commitment,
         &proof,
-        &setup.pcs_params,
+        &leaf_pcs,
         &mut rec,
     )
     .expect("the leaf workload proof verifies");
@@ -6290,20 +6322,107 @@ fn mvp9_boolean_leaf_tape() {
         assert_eq!(running, q_eval * big_v, "the R = 2 merged boundary replays");
     }
 
-    // ---- phase 2a step 2: the leaf chain in-circuit (the skeleton) ----
-    // The leaf tape's whole FS chain replays through the blake3 slot; the
-    // multipoint gamma publishes and is checked against the recorded
-    // challenge — one squeeze validated end-to-end pins the replay, since
-    // every earlier row feeds it. The outer proves and verifies over the
-    // circuit path: the first outer proof OF a real workload proof's
-    // transcript.
+    // ---- phase 2a step 2 + the query-phase port: the leaf's chain AND
+    // query phase in-circuit — Merkle openings against the absorbed caps,
+    // FS-derived v, boundary-expanded alpha, per-level enforced sums
+    // published and checked against native replicas. The mvp7 machinery,
+    // instantiated on the boolean leaf tape.
     {
+        use flock_core::lincheck::build_eq_table;
+        use flock_prover::prover::UnionElementSlotInput;
         use flock_prover::r1cs_hashes::fs_chain::FsChain;
+
+        let lig = &proof.pcs_open.inner.ligerito;
+        assert_eq!(commitment.cap, lig.initial_cap, "commitment IS the L0 cap");
+        let r = lig.recursive_caps.len();
+        let lvl_src: Vec<(&[[u8; 32]], &Vec<Vec<F128>>, &Vec<[u8; 32]>)> = (0..=r)
+            .map(|li| {
+                if li == 0 {
+                    (
+                        lig.initial_cap.as_slice(),
+                        &lig.initial_proof.opened_rows,
+                        &lig.initial_proof.merkle_proof,
+                    )
+                } else if li < r {
+                    (
+                        lig.recursive_caps[li - 1].as_slice(),
+                        &lig.recursive_proofs[li - 1].opened_rows,
+                        &lig.recursive_proofs[li - 1].merkle_proof,
+                    )
+                } else {
+                    (
+                        lig.recursive_caps[r - 1].as_slice(),
+                        &lig.final_proof.opened_rows,
+                        &lig.final_proof.merkle_proof,
+                    )
+                }
+            })
+            .collect();
+        let (_start_v, piop_o, gammas_o, _w_rounds, _mp2, _inner_pd2, _yr_v2, levels) =
+            parse_open_levels(t_shape.ops(), 32 * lig.initial_cap.len(), r);
+        assert!(piop_o.is_none(), "a boolean tape has no element PIOP");
+        assert!(gammas_o.is_empty(), "no packed-direct claims at the leaf");
+        assert_eq!(levels.len(), r + 1);
+
+        struct Lvl {
+            q: usize,
+            c: usize,
+            path: usize,
+            depth: usize,
+            lanes: usize,
+        }
+        let mut geo: Vec<Lvl> = Vec::new();
+        let mut native_sums: Vec<F128> = Vec::new();
+        for (li, lvl) in levels.iter().enumerate() {
+            let (cap, rows, paths) = lvl_src[li];
+            let q = lvl.q_count;
+            assert_eq!(rows.len(), q, "L{li}: one opened row per query");
+            let c = cap.len().trailing_zeros() as usize;
+            let path = paths.len() / q;
+            let depth = path + c;
+            let lanes = rows[0].len();
+            assert_eq!(lanes, 1 << lvl.fold_fins.len(), "L{li}: lanes vs folds");
+            let fold_vals: Vec<F128> = lvl.fold_chs.iter().map(|&i| chals[i]).collect();
+            let alpha_vals: Vec<F128> = (0..lvl.a_count).map(|j| chals[lvl.a_ch + j]).collect();
+            let eqv = build_eq_table(&fold_vals);
+            let aw = build_eq_table(&alpha_vals);
+            let mut sum = F128::ZERO;
+            for (k, row) in rows.iter().enumerate() {
+                let pos = (chals[lvl.q_ch + k].lo as usize) & ((1usize << depth) - 1);
+                let mut leaf_bytes = Vec::with_capacity(16 * lanes);
+                for f in row {
+                    leaf_bytes.extend_from_slice(&f.lo.to_le_bytes());
+                    leaf_bytes.extend_from_slice(&f.hi.to_le_bytes());
+                }
+                let lh = core_merkle::hash_leaf(&leaf_bytes, HashKind::Blake3);
+                assert!(
+                    core_merkle::verify_merkle_proof_capped(
+                        cap,
+                        1 << depth,
+                        &lh,
+                        pos,
+                        &paths[k * path..(k + 1) * path],
+                        HashKind::Blake3,
+                    ),
+                    "L{li} query {k}: capped path verifies natively"
+                );
+                let dot = row
+                    .iter()
+                    .zip(eqv.iter())
+                    .map(|(&x, &e)| x * e)
+                    .fold(F128::ZERO, |a, vv| a + vv);
+                sum += aw[k] * dot;
+            }
+            native_sums.push(sum);
+            geo.push(Lvl { q, c, path, depth, lanes });
+        }
+
         let stream = t_shape.stream_words(DOMAIN);
         let bytes = stream.to_bytes(rec.values(), rec.payloads());
         let mut chain = FsChain::new();
         let mut at = 0usize;
         let fin_ops: Vec<_> = t_shape.ops().iter().filter(|o| o.finalizes()).collect();
+        assert_eq!(stream.finalize_after.len(), fin_ops.len(), "finalize alignment");
         for (k, &upto) in stream.finalize_after.iter().enumerate() {
             chain.absorb(&bytes[at * 16..upto * 16]);
             at = upto;
@@ -6311,53 +6430,141 @@ fn mvp9_boolean_leaf_tape() {
         }
         chain.absorb(&bytes[at * 16..]);
         let trace = chain.finish();
+        let b3_rows: usize = trace.rows.len()
+            + geo.iter().map(|g| (g.lanes / 4 + g.path) * g.q).sum::<usize>();
+        let nu = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(3);
+        let max_path = geo.iter().map(|g| g.path).max().unwrap().max(1);
 
-        let nu_o = 13usize;
-        let mut sb = ShapeBuilder::new(nu_o);
-        let b3slot = sb.slot(Blake3Gate { nu: nu_o });
+        let mut sb = ShapeBuilder::new(nu);
+        let slots = CollapsedSlots {
+            b3: sb.slot(Blake3Gate { nu }),
+            swap: sb.slot(SwapGate { nu }),
+            spread: sb.slot(BitSpreadGate {
+                ty: BitSpreadTable::new(max_path),
+                nu,
+            }),
+        };
+        let mut leaf_slot: Vec<(usize, flock_core::circuit::builder::SlotId)> = Vec::new();
+        let leafeval: Vec<_> = geo
+            .iter()
+            .map(|g| {
+                let lanes = g.lanes.min(8);
+                match leaf_slot.iter().find(|(n, _)| *n == lanes) {
+                    Some((_, sl)) => *sl,
+                    None => {
+                        let sl = sb.slot(LeafEvalGate::new(lanes));
+                        leaf_slot.push((lanes, sl));
+                        sl
+                    }
+                }
+            })
+            .collect();
         let mut vals: Vec<F128> = Vec::new();
         let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
         vals.extend_from_slice(&iv_w);
         let iv = [sb.public_input(), sb.public_input()];
-        assert_eq!(
-            stream.finalize_after.len(),
-            fin_ops.len(),
-            "every finalizing op has a stream finalize point"
-        );
-        // The gamma squeeze's finalize ordinal, from a full (fin, ch) walk.
-        let gamma_ch = chals
-            .iter()
-            .position(|&x| x == gamma)
-            .expect("gamma among the challenges");
-        let mut gamma_fin = None;
-        {
-            let (mut fin, mut cc) = (0usize, 0usize);
-            for op in t_shape.ops() {
-                if matches!(op, Op::SqueezeScalar) && cc == gamma_ch {
-                    gamma_fin = Some(fin);
-                    break;
-                }
-                if op.finalizes() {
-                    fin += 1;
-                }
-                match op {
-                    Op::SqueezeScalar => cc += 1,
-                    Op::SqueezeSlice(n) => cc += n,
-                    _ => {}
+        let (outs, _ww) = emit_fs_chain(&mut sb, slots.b3, iv, &trace, &stream, &bytes, &mut vals);
+
+        let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
+        let mut to_publish: Vec<(Vec<Wire>, Vec<(Wire, [Wire; 2])>)> = Vec::new();
+        let mut level_accs: Vec<Wire> = Vec::new();
+        for (li, lvl) in levels.iter().enumerate() {
+            let g = &geo[li];
+            let (_, rows, paths) = lvl_src[li];
+            let sqq = &trace.squeezes[lvl.q_fin];
+            let sqa = &trace.squeezes[lvl.a_fin];
+            let a_wires: Vec<Wire> = (0..lvl.a_count).map(|j| outs[sqa[j / 4]][j % 4]).collect();
+            let v_wires: Vec<Wire> = lvl
+                .fold_fins
+                .iter()
+                .map(|&f| outs[trace.squeezes[f][0]][0])
+                .collect();
+            let alpha_vals: Vec<F128> = (0..lvl.a_count).map(|j| chals[lvl.a_ch + j]).collect();
+            let aw = build_eq_table(&alpha_vals);
+            let le_vars = g.lanes.min(8).trailing_zeros() as usize;
+            let le_groups = g.lanes >> le_vars;
+            let hw = {
+                let v_hi: Vec<F128> = lvl.fold_chs[le_vars..].iter().map(|&i| chals[i]).collect();
+                build_eq_table(&v_hi)
+            };
+            vals.push(F128::ZERO);
+            let mut acc = sb.public_input();
+            let mut opens: Vec<(Wire, [Wire; 2])> = Vec::with_capacity(g.q);
+            for k in 0..g.q {
+                vals.extend_from_slice(&rows[k]);
+                let leaf_w: Vec<Wire> = (0..g.lanes).map(|_| sb.input()).collect();
+                let cw = outs[sqq[k / 4]][k % 4];
+                let cv = emit_opening(&mut sb, slots, iv, &leaf_w, cw, g.depth, g.c, &mut vals);
+                opens.push((cw, cv));
+                hints.extend(paths[k * g.path..(k + 1) * g.path].iter().map(hash_to_digest));
+                let lanes = g.lanes.min(8);
+                for h in 0..le_groups {
+                    let mut a_in: Vec<Wire> = leaf_w[lanes * h..lanes * (h + 1)].to_vec();
+                    a_in.extend_from_slice(&v_wires[..le_vars]);
+                    vals.push(aw[k] * hw[h]);
+                    a_in.push(sb.public_input());
+                    a_in.push(acc);
+                    acc = sb.gate(leafeval[li], &a_in)[0];
                 }
             }
+            to_publish.push((a_wires, opens));
+            level_accs.push(acc);
         }
-        let gamma_fin = gamma_fin.expect("gamma squeeze located");
-        let (outs, _ww) = emit_fs_chain(&mut sb, b3slot, iv, &trace, &stream, &bytes, &mut vals);
-        sb.publish(outs[trace.squeezes[gamma_fin][0]][0]);
-        let shape = sb.finish().expect("valid leaf-chain circuit");
-        let built = shape.run(&vals, &[]);
-        assert_eq!(
-            *built.public.last().unwrap(),
-            gamma,
-            "the chain derives the multipoint gamma"
-        );
+        for (a_wires, opens) in &to_publish {
+            for w in a_wires {
+                sb.publish(*w);
+            }
+            for (cw, cv) in opens {
+                sb.publish(*cw);
+                sb.publish(cv[0]);
+                sb.publish(cv[1]);
+            }
+        }
+        for w in &level_accs {
+            sb.publish(*w);
+        }
+        let shape = sb.finish().expect("valid leaf query-phase circuit");
+        let hint_refs: Vec<&dyn std::any::Any> =
+            hints.iter().map(|h| h as &dyn std::any::Any).collect();
+        let built = shape.run(&vals, &hint_refs);
 
+        // ---- boundary checks: alphas, cap selects, and the enforced sums.
+        let total_pub: usize = levels.len()
+            + levels
+                .iter()
+                .zip(&geo)
+                .map(|(l, g)| l.a_count + 3 * g.q)
+                .sum::<usize>();
+        let mut at2 = built.public.len() - total_pub;
+        for (li, lvl) in levels.iter().enumerate() {
+            let g = &geo[li];
+            let (cap, _, _) = lvl_src[li];
+            for j in 0..lvl.a_count {
+                assert_eq!(built.public[at2 + j], chals[lvl.a_ch + j], "L{li} alpha {j}");
+            }
+            at2 += lvl.a_count;
+            for k in 0..g.q {
+                let chal = chals[lvl.q_ch + k];
+                assert_eq!(built.public[at2], chal, "L{li} challenge {k}");
+                let pos = (chal.lo as usize) & ((1usize << g.depth) - 1);
+                let node = digest_words(&hash_to_digest(&cap[pos >> g.path]));
+                assert_eq!(
+                    [built.public[at2 + 1], built.public[at2 + 2]],
+                    node,
+                    "L{li} cap node {k}"
+                );
+                at2 += 3;
+            }
+        }
+        for (li, want) in native_sums.iter().enumerate() {
+            assert_eq!(
+                built.public[at2 + li],
+                *want,
+                "L{li} enforced sum matches the native replica"
+            );
+        }
+
+        // ---- prove / verify the leaf query-phase circuit ----
         let union_o = UnionInstance::new(&shape.registry, shape.counts.clone());
         let pcs_o = PcsParams {
             m: union_o.dense_m(),
@@ -6367,22 +6574,69 @@ fn mvp9_boolean_leaf_tape() {
             num_lanes: union_o.commit_lanes(6),
             merkle_hash: Default::default(),
         };
-        let b3_r1cs = blake3::build_block_r1cs(nu_o);
+        let b3_r1cs = blake3::build_block_r1cs(nu);
         let b3_lc = b3_r1cs.csc_lincheck_circuit();
+        let swap_r1cs = SwapTable::build_block_r1cs(nu);
+        let swap_lc = swap_r1cs.csc_lincheck_circuit();
+        let spread_ty = BitSpreadTable::new(max_path);
+        let spread_r1cs = spread_ty.build_block_r1cs(nu);
+        let spread_lc = spread_r1cs.csc_lincheck_circuit();
+        let b3_wit =
+            blake3::generate_witness_batch_major_partial(built.rows::<Blake3Gate>(slots.b3), nu);
+        let swap_wit =
+            SwapTable::generate_witness_batch_major(built.rows::<SwapGate>(slots.swap), nu);
+        let spread_wit =
+            spread_ty.generate_witness_batch_major(built.rows::<BitSpreadGate>(slots.spread), nu);
+        let els: Vec<Vec<F128>> = leaf_slot
+            .iter()
+            .map(|(_, sl)| match &built.witnesses[shape.registry_slot(*sl)] {
+                SlotWitness::Element(z) => z.clone(),
+                other => panic!("leaf-eval slot produced {other:?}"),
+            })
+            .collect();
+        let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
+            (shape.registry_slot(slots.b3), b3_lc),
+            (shape.registry_slot(slots.swap), swap_lc),
+            (shape.registry_slot(slots.spread), spread_lc),
+        ];
+        lcs_ord.sort_by_key(|(i, _)| *i);
+        let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
+            lcs_ord.into_iter().map(|(_, cc)| cc).collect();
+        let mut bool_slots: Vec<(usize, UnionSlotProverInput)> = vec![
+            (
+                shape.registry_slot(slots.b3),
+                UnionSlotProverInput::new(b3_wit, b3_lc),
+            ),
+            (
+                shape.registry_slot(slots.swap),
+                UnionSlotProverInput::new(swap_wit, swap_lc),
+            ),
+            (
+                shape.registry_slot(slots.spread),
+                UnionSlotProverInput::new(spread_wit, spread_lc),
+            ),
+        ];
+        bool_slots.sort_by_key(|(i, _)| *i);
+        let mut el_ord: Vec<(usize, Vec<F128>)> = leaf_slot
+            .iter()
+            .zip(els)
+            .map(|((_, sl), z)| (shape.registry_slot(*sl), z))
+            .collect();
+        el_ord.sort_by_key(|(i, _)| *i);
+        let el_inputs: Vec<UnionElementSlotInput> = el_ord
+            .into_iter()
+            .map(|(_, z)| {
+                UnionElementSlotInput::new(move |dst: &mut [F128]| dst.copy_from_slice(&z))
+            })
+            .collect();
         let mut ch = FsChallenger::new(DOMAIN);
         let (oproof, ocommit, _) = prover::prove_fast_ligerito_union_circuit(
             &union_o,
             &shape.circuit,
             &built.public,
             &pcs_o,
-            vec![UnionSlotProverInput::new(
-                blake3::generate_witness_batch_major_partial(
-                    built.rows::<Blake3Gate>(b3slot),
-                    nu_o,
-                ),
-                b3_lc,
-            )],
-            Vec::new(),
+            bool_slots.into_iter().map(|(_, x)| x).collect(),
+            el_inputs,
             &mut ch,
         );
         let mut ch = FsChallenger::new(DOMAIN);
@@ -6390,12 +6644,12 @@ fn mvp9_boolean_leaf_tape() {
             &union_o,
             &shape.circuit,
             &built.public,
-            &[b3_lc],
+            &lcs,
             &ocommit,
             &oproof,
             &pcs_o,
             &mut ch,
         )
-        .expect("the leaf chain circuit verifies");
+        .expect("the leaf query-phase circuit verifies");
     }
 }
