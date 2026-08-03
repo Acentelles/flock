@@ -194,7 +194,9 @@ fn mixed_blake3_sha256_roundtrip_and_tamper() {
             b_packed: b_b,
         },
     ]);
-    let q = union.compact_witness(&z_union);
+    // Row-major, as fancy jagged's stack is — the prover compacts the same way
+    // (`compact_witness_row_major`), so this independent commit must too.
+    let q = union.compact_witness_row_major(&z_union);
     assert_eq!(q.len(), union.committed_words());
     assert_ne!(
         q[..],
@@ -1112,12 +1114,10 @@ fn merged_transport_roundtrip_and_tamper() {
         let mut bad = proof.clone();
         bad.pcs_open.q_eval += F128::ONE;
         reject(&bad, "q_eval");
-        let mut bad = proof.clone();
-        bad.pcs_open.frobenius.v += F128::ONE;
-        reject(&bad, "frobenius V");
-        let mut bad = proof.clone();
-        bad.pcs_open.frobenius.rounds[5].1 += F128::ONE;
-        reject(&bad, "frobenius round");
+        // No Frobenius assist to tamper with since fancy jagged: the verifier
+        // evaluates Ŵ(ρ) itself from the aligned tables, so the transcript carries
+        // no assist rounds. What those cases covered is now caught by `q_eval` and
+        // the merged sumcheck rounds — Ŵ(ρ) is recomputed, not received.
         let mut bad = proof.clone();
         bad.pcs_open.inner.ligerito.initial_root = [0u8; 32].into();
         reject(&bad, "inner open initial root");

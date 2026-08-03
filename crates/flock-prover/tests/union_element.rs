@@ -315,25 +315,10 @@ fn element_claims_are_bound_by_the_opening() {
         }
     }
 
-    // The Frobenius assist — V and every round message — proves Ŵ(ρ), i.e.
-    // the element claims' weight evaluation.
-    let mut bad = proof.clone();
-    bad.pcs_open.frobenius.v += F128::ONE;
-    assert!(verify(&bad).is_err(), "tampered frobenius V");
-    for i in 0..proof.pcs_open.frobenius.rounds.len() {
-        for which in 0..2 {
-            let mut bad = proof.clone();
-            if which == 0 {
-                bad.pcs_open.frobenius.rounds[i].0 += F128::ONE;
-            } else {
-                bad.pcs_open.frobenius.rounds[i].1 += F128::ONE;
-            }
-            assert!(
-                verify(&bad).is_err(),
-                "tampered frobenius round {i} msg {which}"
-            );
-        }
-    }
+    // No Frobenius assist to tamper with since fancy jagged: the verifier
+    // evaluates Ŵ(ρ) itself from the aligned tables, so the transcript carries
+    // no assist rounds. What those cases covered is now caught by `q_eval` and
+    // the merged sumcheck rounds — Ŵ(ρ) is recomputed, not received.
 
     // The inner eq-basis opening of q̂(ρ).
     let mut bad = proof.clone();
@@ -1113,39 +1098,39 @@ fn mixed_class_merged_proof_bytes_pinned() {
         (
             "elem-merged-nu12-full",
             1 << 12,
-            "aac66716936f5d9c6e337e7c9c289b6695ec66e74776d149c5cf7a9e8f5d664e",
+            "51126ebffd04e4043186e4aee06edf53e427f80a74b1184415b83cbe49b4eadc",
         ),
         (
             "elem-merged-nu12-2731",
             2731,
-            "f3b484ba070ad5c1cbb8dd8dfb97a870d8ca47bb5059237379cbbfdea293c9ba",
+            "d7438877851719bd76538752691ef7ebc5d4d6e5a816287b563d39bfd309553c",
         ),
         (
             "elem-merged-nu12-0",
             0,
-            "28378d181bf578f370ae53b4ef8d013e9d00dab6556ef272253435ca852bd439",
+            "8508cb754ae702433ec8e3f326120c0c0d8e8e5ec9405d6b8b6a65cef2dc5c47",
         ),
     ];
     const MIXED: [(&str, [usize; 2], &str); 4] = [
         (
             "mix-merged-nu7-128-128",
             [128, 128],
-            "522edb70a0951e8b68365cb576a9425741b983a26706f3700a231321cfa93252",
+            "42611642c2fd61438ba7eb41dbcc3831b876d0eb6e70286ec534c09c1a0ab51e",
         ),
         (
             "mix-merged-nu7-100-90",
             [100, 90],
-            "edcde983e018d0b32b96e5a86fcf10a0a69f7cae5141e5e41cfbf8390a5361b7",
+            "eeff6a9c45967939d261ced7c985b9f08a1137c9405e254695f03fc50f72c4a5",
         ),
         (
             "mix-merged-nu7-0-90",
             [0, 90],
-            "f74d2cc433879afc036543e8fe70a4443e44f309e1aa1a757d4dae47d8c0f8e5",
+            "1fd2a768df688c628c07ef5328b18d50d095fe8a6a6d251ead394cd0cda29b23",
         ),
         (
             "mix-merged-nu7-100-0",
             [100, 0],
-            "3aaa194c91595c605abc3ce8cd3992657a7de27eefb96f1f24ad77e7739ab700",
+            "fce5ec98782ce91accfb0c8152e8806eee51c7003e075aa8e4f0e9720c6888b9",
         ),
     ];
 

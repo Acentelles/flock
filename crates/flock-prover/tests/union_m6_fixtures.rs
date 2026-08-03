@@ -121,22 +121,22 @@ fn m6_merged_union_proof_bytes_pinned() {
         (
             "merged-nu10-1024-1024",
             [1024, 1024],
-            "8433c864ee8652865ebd0c8515c35b92f9181593ca1a90b8fbdfd9eb2594a934",
+            "0f784684938e2c78c906a821d5814e91170453f6880d6186dc148645f52ce1b2",
         ),
         (
             "merged-nu10-50-37",
             [50, 37],
-            "01d9649bdb1089ac7b37a37fa2551ae443d4222c083a9e8b0c4292584d4bc71b",
+            "9e711a8f0b94c34c72807670f079b35ae43fba3141625397288269d4c2384e50",
         ),
         (
             "merged-nu10-8-8",
             [8, 8],
-            "6d29992db7b22abcad78a59eedd5963adaa5bdfe876e79fb480d44b11972771c",
+            "46b714b768a759cd002727cc90f8c16c62df4f2c1b6782bec13f090d80f84c36",
         ),
         (
             "merged-nu10-0-64",
             [0, 64],
-            "34bbecb1f003eb6da0e3d19b35c325af77a3bed55002b8a310d8456f3940d89b",
+            "3aff72f1302b7da833046ff97619d26ac8857fbbe354698f2ca3267f917709af",
         ),
     ];
 
@@ -212,7 +212,7 @@ fn m6_merged_union_proof_bytes_pinned() {
 fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
     // BLAKE3, 256 blocks (m = 22).
     {
-        const EXPECTED: &str = "4c2ec3a5625b4e5c9f6719b86b8d13747501dc036385a5392c3d3e06237f7a01";
+        const EXPECTED: &str = "449f58ae9d3269fde88062f2d7752f1a73c4200f451e4c9ac6a1b99efbbe0eee";
         let n_blocks = 256usize;
         let setup = blake3::Blake3Setup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_B3B3);
@@ -240,7 +240,7 @@ fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
 
     // SHA-256, 128 blocks (m = 22).
     {
-        const EXPECTED: &str = "2aa81599e41efd5b0d8f77ec10b309119d73c30f6df2cb1f0f17184060dbc904";
+        const EXPECTED: &str = "c9bf4dd6d4d6b72499cf69b6b3b3b1609d36b29945a1d4019b24ab798fca62ba";
         let n_blocks = 128usize;
         let setup = sha2::Sha256HybridSetup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_5252);

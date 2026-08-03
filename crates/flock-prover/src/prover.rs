@@ -626,18 +626,19 @@ fn prove_union_with_binding<Ch: Challenger>(
     // stack q — the declared n_t-row prefix of every used chunk-column;
     // dummy rows, useless columns and gaps dropped; padded to a power of
     // two with the m22 config floor. The stack is OWNED (the merged open
-    // consumes it for the inner eq-basis opening): identity compaction
-    // (single-slot registries at full utilization) copies — a prototype
-    // cost only. Under PooledDirty, dropped words are dirty by design —
-    // and never read — so the compaction skips the honest-zeros
-    // debug_assert.
+    // consumes it for the inner eq-basis opening). Under PooledDirty, dropped
+    // words are dirty by design — and never read — so the compaction skips the
+    // honest-zeros debug_assert.
     let t = std::time::Instant::now();
-    let q: Vec<F128> = if union.compaction_is_identity() {
-        z_packed.clone()
-    } else if buf_mode == flock_core::union::WitnessBufMode::PooledDirty {
-        union.compact_witness_unchecked(&z_packed)
+    // NO identity shortcut: fancy jagged's stack is row-major, which is a
+    // transpose of the BatchMajor buffer even when compaction drops nothing, so
+    // `compaction_is_identity()` no longer means "the padded buffer already IS
+    // q". (Dropping this branch is what `merged_padding_unread_poison_pool`
+    // catches if it is left in.)
+    let q: Vec<F128> = if buf_mode == flock_core::union::WitnessBufMode::PooledDirty {
+        union.compact_witness_row_major_unchecked(&z_packed)
     } else {
-        union.compact_witness(&z_packed)
+        union.compact_witness_row_major(&z_packed)
     };
     if trace {
         eprintln!(
@@ -829,7 +830,7 @@ fn prove_union_with_binding<Ch: Challenger>(
     // `EqPoint` claims, which the merged open carries unbuilt (it derives
     // its identity-fold weights from `point`/`value` alone and never reads
     // `eq_ind`).
-    let heights = union.jagged_heights();
+    let tables = union.aligned_tables();
     let (z_claims, pre): (Vec<ZClaim>, Vec<Option<&[F128]>>) = match &boolean {
         Some((_, claim, s_hat_v_ab, s_hat_v_c)) => (
             vec![claim.ab.clone(), claim.c.clone()],
@@ -856,7 +857,8 @@ fn prove_union_with_binding<Ch: Challenger>(
         &pre,
         &packed_direct,
         &padding,
-        &heights,
+        &tables,
+        union.col_log(),
         union.n_log(),
         &lig_config,
         challenger,

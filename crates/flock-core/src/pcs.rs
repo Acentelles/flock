@@ -957,7 +957,6 @@ pub struct MergedOpenProof {
     pub ring_switches: Vec<RingSwitchProof>,
     pub merged_rounds: Vec<(F128, F128)>,
     pub q_eval: F128,
-    pub frobenius: jagged::FrobeniusAssistProof,
     pub inner: BatchOpeningProofLigerito,
 }
 
@@ -971,7 +970,8 @@ pub fn open_batch_merged<Ch: Challenger>(
     precomputed_s_hat_v: &[Option<&[F128]>],
     packed_direct: &[PackedDirectClaim],
     padding: &PaddingSpec,
-    heights: &[u64],
+    tables: &[jagged_fancy::AlignedTable],
+    k_cols: usize,
     n_log: usize,
     lig_config: &ligerito::ProverConfig,
     challenger: &mut Ch,
@@ -1026,8 +1026,9 @@ pub fn open_batch_merged<Ch: Challenger>(
         1usize << dense_log,
         "q must be the committed stack"
     );
-    let params = jagged::JaggedParams::from_heights(heights, n_log, dense_log);
-    let k_cols = params.k;
+    // Fancy jagged (§6): one aligned table per power-of-two sub-block of each
+    // slot's used columns, over the ROW-MAJOR dense stack.
+    let params = jagged_fancy::AlignedParams::new(tables.to_vec(), n_log, k_cols, dense_log);
     // Ring-switched claims enter the weight builder with their F₂-linear
     // fold tables; packed-direct claims are γ-SCALAR maps (`x ↦ γ·x`), so
     // claims sharing a row point collapse into ONE Scalar group with a
@@ -1103,7 +1104,7 @@ pub fn open_batch_merged<Ch: Challenger>(
     // The twisted weight over the dense cube (count-proportional Φ-pass;
     // zero tail past the jagged area).
     let t = std::time::Instant::now();
-    let (w, (u0, u2)) = jagged::build_merged_weight_and_prime(&params, &weight_claims, &q);
+    let (w, (u0, u2)) = jagged_fancy::build_weight_row_major_twisted(&params, &weight_claims, &q);
     if trace {
         eprintln!(
             "  [open_merged] W build + round-0 prime (2^{} words): {:6.2} ms",
@@ -1207,7 +1208,6 @@ pub fn open_batch_merged<Ch: Challenger>(
             coeffs: co,
         });
     }
-    let frobenius = jagged::prove_frobenius_assist(&params, &fclaims, &rho, challenger);
     if trace {
         eprintln!(
             "    [frobenius] linearized_coefficients (x{}): {:6.2} ms",
@@ -1215,13 +1215,16 @@ pub fn open_batch_merged<Ch: Challenger>(
             t.elapsed().as_secs_f64() * 1e3
         );
     }
-    // No assist. The aligned tables make Ŵ(ρ) directly evaluable by the
-    // verifier (paper §6: "the verifier can compute the latter on its own, or
-    // employ a similar jagged assist" — per-table it does not need to), so the
-    // 128·K-statement delegation has nothing left to do.
+    // NO assist. Paper §6 notes the verifier "can compute the latter on its
+    // own, or employ a similar jagged assist" — per-table it does not need to,
+    // so the 128·K-statement delegation has nothing left to do and the
+    // transcript absorbs no assist rounds. The coefficients above are still
+    // built: they are the Frobenius decomposition the verifier's own
+    // evaluation uses.
     debug_assert_eq!(
-        frobenius.v, w_eval,
-        "assist V must equal the folded weight MLE"
+        jagged_fancy::twisted_weight_aligned_batched(&params, &fclaims, &rho),
+        w_eval,
+        "the verifier's Ŵ(ρ) must equal the merged sumcheck's folded weight"
     );
     let _ = w_eval;
 
@@ -1261,7 +1264,6 @@ pub fn open_batch_merged<Ch: Challenger>(
         ring_switches: rs_results.into_iter().map(|(p, _)| p).collect(),
         merged_rounds,
         q_eval,
-        frobenius,
         inner,
     }
 }
@@ -1273,7 +1275,8 @@ pub fn verify_batch_merged<Ch: Challenger>(
     z_skips: &[F128],
     x_outers: &[&[F128]],
     packed_direct: &[PackedDirectClaimRef<'_>],
-    heights: &[u64],
+    tables: &[jagged_fancy::AlignedTable],
+    k_cols: usize,
     n_log: usize,
     proof: &MergedOpenProof,
     lig_config: &ligerito::VerifierConfig,
@@ -1349,8 +1352,7 @@ pub fn verify_batch_merged<Ch: Challenger>(
         rho.push(r);
     }
 
-    let params = jagged::JaggedParams::from_heights(heights, n_log, dense_log);
-    let k_cols = params.k;
+    let params = jagged_fancy::AlignedParams::new(tables.to_vec(), n_log, k_cols, dense_log);
     // The claims' c_{i,j}: derived from the transcript (γ-scaled r''-eq
     // tensors → fold byte tables → linearized coefficients).
     let coeffs: Vec<Vec<F128>> = rs_outputs
@@ -1402,8 +1404,11 @@ pub fn verify_batch_merged<Ch: Challenger>(
             coeffs: co,
         });
     }
-    let v = jagged::verify_frobenius_assist(&params, &fclaims, &rho, &proof.frobenius, challenger)
-        .ok_or(VerifyErrorOpen::Assist)?;
+    // Ŵ(ρ) directly: Σ_i Σ_j c_{i,j}·f̂(z^{2^j}, ρ) over the aligned tables, with
+    // the ρ-side of the branching program hoisted out of the 128·K statements.
+    // No sub-protocol, so nothing is absorbed here. Packed-direct claims carry
+    // coefficients [γ, 0, …], so each costs exactly one evaluation.
+    let v = jagged_fancy::twisted_weight_aligned_batched(&params, &fclaims, &rho);
     if running != proof.q_eval * v {
         return Err(VerifyErrorOpen::VirtualOpen);
     }

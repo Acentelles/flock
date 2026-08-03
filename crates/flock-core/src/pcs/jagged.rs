@@ -1531,7 +1531,7 @@ pub fn verify_assist<C: Challenger>(
 /// comparison state, so prover table and verifier evaluation agree by
 /// construction). `claims` = `(z_row, z_col, γ-baked fold table)` views.
 /// One claim's (or claim group's) contribution to the merged weight.
-pub(crate) enum MergedWeightClaim<'a> {
+pub enum MergedWeightClaim<'a> {
     /// A ring-switched claim: its F₂-linear fold table applied to
     /// `eq_row ⊗ eq_col` — additive but not F128-homogeneous, so it cannot
     /// join a scalar group.
@@ -1552,6 +1552,10 @@ pub(crate) enum MergedWeightClaim<'a> {
     Scalar { z_row: &'a [F128], cols: Vec<F128> },
 }
 
+// Retained as the column-major reference: the merged path now builds the weight
+// row-major (`jagged_fancy::build_weight_row_major_twisted`), and
+// `jagged_fancy`'s timing probe measures the two against each other.
+#[allow(dead_code)]
 pub(crate) fn build_merged_weight_and_prime(
     params: &JaggedParams,
     claims: &[MergedWeightClaim<'_>],

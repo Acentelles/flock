@@ -248,6 +248,26 @@ fn shifted_row_bit(z_row: &[F128], layer: usize, u: usize) -> F128 {
     }
 }
 
+/// Pin factor for row coordinates the branching program never reads.
+///
+/// The `·2^u` shift means row bit `r` is read at layer `r + u`, and the program
+/// has layers `0..=m`. So any `r` with `r + u > m` is never read — and
+/// therefore never forced to zero by the addition — even though such a row
+/// cannot exist (it would put `i` past `2^m`). The MLE of a function vanishing
+/// on those bits carries a `(1 + z_row[r])` factor each, which this supplies.
+///
+/// Vacuous whenever `n + u ≤ m + 1`, which is the common case; it bites when a
+/// slot's declared count is small enough to shrink `m` below `n + u`.
+#[inline]
+fn unread_row_pin(z_row: &[F128], m: usize, u: usize) -> F128 {
+    let first_unread = if u > m { 0 } else { m - u + 1 };
+    let mut pin = F128::ONE;
+    for &z in z_row.iter().skip(first_unread) {
+        pin *= F128::ONE + z;
+    }
+    pin
+}
+
 /// Multilinear extension `ĝ_u(z_row, z_col, z_index, t_prev, t_next)` by the
 /// Holmgren–Rothblum layer DP over the 6 reachable states, with the boundary
 /// coordinates supplied per layer by `pn`. `O(m)` field ops.
@@ -300,7 +320,7 @@ fn g_hat_cd(
         }
         dp = new_dp;
     }
-    dp[STATE_INITIAL]
+    dp[STATE_INITIAL] * unread_row_pin(z_row, m, u)
 }
 
 /// [`g_hat_cd`] at boolean table boundaries.
@@ -573,12 +593,19 @@ pub fn twisted_weight_aligned(
 
 /// The **Φ-twisted** weight over the dense cube for the row-major stack, plus
 /// the merged sumcheck's round-0 prime — the row-major counterpart of
-/// `jagged::build_merged_weight_and_prime`.
+/// `jagged::build_merged_weight_and_prime`, over the same
+/// [`jagged::MergedWeightClaim`] intake.
 ///
-/// `W[d] = Σ_i Φ_i(eq(z_row_i, row(d))·eq(z_col_i, col(d)))`, zero past the
-/// area. Where the column-major builder hoists `eq_col` per column segment and
-/// streams rows, this hoists `eq_row` per row and streams the table's columns,
-/// because a run of `2^lw` consecutive dense indices now shares a row.
+/// Where the column-major builder hoists the COLUMN factor per column segment
+/// and streams rows, this hoists the ROW factor per row and streams the
+/// table's columns, because a run of `2^lw` consecutive dense indices now
+/// shares a row instead of a column.
+///
+/// Both claim arms carry over unchanged in meaning:
+/// * `Folded` — a ring-switched claim: `Φ(eq_row·eq_col)` via its byte table;
+/// * `Scalar` — a group of γ-scaled packed-direct claims sharing one row
+///   point, so the column side is the precombined `Σᵢ γᵢ·eq_colᵢ` and there is
+///   no `Φ` to apply (γ is already baked in).
 ///
 /// The prime is taken in a second pass rather than fused into the fill: under
 /// row-major a width-1 table's rows are single words, so element pairs
@@ -586,22 +613,39 @@ pub fn twisted_weight_aligned(
 /// wrong. One extra streaming pass is the cheap, safe trade.
 pub fn build_weight_row_major_twisted(
     params: &AlignedParams,
-    claims: &[(&[F128], &[F128], &[F128])],
+    claims: &[crate::pcs::jagged::MergedWeightClaim<'_>],
     q: &[F128],
 ) -> (Vec<F128>, (F128, F128)) {
+    use crate::pcs::jagged::MergedWeightClaim;
     use rayon::prelude::*;
 
+    enum ColSide<'a> {
+        Fold(Vec<F128>, &'a [F128]),
+        Combined(&'a [F128]),
+    }
     let n_total = 1usize << params.m;
     assert_eq!(q.len(), n_total, "q must be the committed stack");
-    let tabs: Vec<(Vec<F128>, Vec<F128>, &[F128])> = claims
+    let tabs: Vec<(Vec<F128>, ColSide<'_>)> = claims
         .iter()
-        .map(|&(zr, zc, t)| (build_eq_table(zr), build_eq_table(zc), t))
+        .map(|c| match c {
+            MergedWeightClaim::Folded {
+                z_row,
+                z_col,
+                table,
+            } => (
+                build_eq_table(z_row),
+                ColSide::Fold(build_eq_table(z_col), table),
+            ),
+            MergedWeightClaim::Scalar { z_row, cols } => {
+                (build_eq_table(z_row), ColSide::Combined(cols.as_slice()))
+            }
+        })
         .collect();
+
     // Pooled and dirty: the per-table fill writes every word of the area (the
     // first claim assigns, later claims accumulate) and the tail is filled
     // explicitly below.
     let mut w = crate::scratch::take_f128(n_total);
-
     let mut rest: &mut [F128] = &mut w;
     for (t, tab) in params.tables.iter().enumerate() {
         let width = 1usize << tab.log_width;
@@ -620,19 +664,35 @@ pub fn build_weight_row_major_twisted(
             .enumerate()
             .for_each(|(row, out)| {
                 let mut first = true;
-                for (eq_r, eq_c, fold) in tabs.iter() {
+                for (eq_r, side) in tabs.iter() {
                     let r = eq_r[row];
-                    let cols = &eq_c[c0..c0 + width];
-                    if first {
-                        for (slot, &c) in out.iter_mut().zip(cols) {
-                            *slot = crate::pcs::ring_switch::fold_one_slot(r * c, fold);
+                    match side {
+                        ColSide::Fold(eq_c, fold) => {
+                            let cols = &eq_c[c0..c0 + width];
+                            if first {
+                                for (slot, &c) in out.iter_mut().zip(cols) {
+                                    *slot = crate::pcs::ring_switch::fold_one_slot(r * c, fold);
+                                }
+                            } else {
+                                for (slot, &c) in out.iter_mut().zip(cols) {
+                                    *slot += crate::pcs::ring_switch::fold_one_slot(r * c, fold);
+                                }
+                            }
                         }
-                        first = false;
-                    } else {
-                        for (slot, &c) in out.iter_mut().zip(cols) {
-                            *slot += crate::pcs::ring_switch::fold_one_slot(r * c, fold);
+                        ColSide::Combined(all) => {
+                            let cols = &all[c0..c0 + width];
+                            if first {
+                                for (slot, &c) in out.iter_mut().zip(cols) {
+                                    *slot = r * c;
+                                }
+                            } else {
+                                for (slot, &c) in out.iter_mut().zip(cols) {
+                                    *slot += r * c;
+                                }
+                            }
                         }
                     }
+                    first = false;
                 }
             });
     }
@@ -743,7 +803,7 @@ fn g_hat_scheduled(sched: &Schedule, z_row: &[F128], z_col: &[F128], m: usize, u
         }
         dp = nd;
     }
-    dp[STATE_INITIAL]
+    dp[STATE_INITIAL] * unread_row_pin(z_row, m, u)
 }
 
 /// [`twisted_weight_aligned`] with the ρ-side hoisted out of the `128·K`
@@ -1369,9 +1429,13 @@ mod tests {
                 )
             })
             .collect();
-        let claims: Vec<(&[F128], &[F128], &[F128])> = data
+        let claims: Vec<MergedWeightClaim<'_>> = data
             .iter()
-            .map(|(zr, zc, t)| (zr.as_slice(), zc.as_slice(), t.as_slice()))
+            .map(|(zr, zc, t)| MergedWeightClaim::Folded {
+                z_row: zr,
+                z_col: zc,
+                table: t,
+            })
             .collect();
 
         let time = |f: &dyn Fn()| -> f64 {
@@ -1387,16 +1451,8 @@ mod tests {
         // Upstream's builder takes `MergedWeightClaim`; ring-switched claims are
         // the `Folded` arm (an F₂-linear fold table), which is what the
         // row-major builder still models.
-        let col_claims: Vec<MergedWeightClaim<'_>> = data
-            .iter()
-            .map(|(zr, zc, t)| MergedWeightClaim::Folded {
-                z_row: zr,
-                z_col: zc,
-                table: t,
-            })
-            .collect();
         let t_col = time(&|| {
-            let r = build_merged_weight_and_prime(&jp, &col_claims, &q);
+            let r = build_merged_weight_and_prime(&jp, &claims, &q);
             std::hint::black_box(&r.1);
             crate::scratch::give_f128(r.0);
         });
@@ -1426,6 +1482,7 @@ mod tests {
     #[test]
     fn twisted_row_major_folds_to_twisted_weight_aligned() {
         use crate::pcs::jagged::FrobeniusClaim;
+        use crate::pcs::jagged::MergedWeightClaim;
         use crate::pcs::ring_switch::{build_fold_byte_table, linearized_coefficients};
 
         let (nu, k_cols, dense_log) = (2usize, 3usize, 5usize);
@@ -1464,9 +1521,13 @@ mod tests {
                 )
             })
             .collect();
-        let claims: Vec<(&[F128], &[F128], &[F128])> = data
+        let claims: Vec<MergedWeightClaim<'_>> = data
             .iter()
-            .map(|(zr, zc, t)| (zr.as_slice(), zc.as_slice(), t.as_slice()))
+            .map(|(zr, zc, t)| MergedWeightClaim::Folded {
+                z_row: zr,
+                z_col: zc,
+                table: t,
+            })
             .collect();
 
         let (w, _) = build_weight_row_major_twisted(&p, &claims, &q);
@@ -1559,6 +1620,55 @@ mod tests {
                 twisted_weight_aligned(&p, &claims, &rho),
                 "trial {trial}"
             );
+        }
+    }
+
+    /// Regression: row coordinates the branching program never reads.
+    ///
+    /// Row bit `r` is read at layer `r + u`, so when `n + u > m + 1` the top
+    /// row coords fall off the end of the program and are never forced to zero
+    /// — but such rows cannot exist, so the MLE needs their `(1 + z_row[r])`
+    /// pin factors. Every other kernel test happens to have `n + u ≤ m + 1`,
+    /// which is why this escaped until `mixed_class_cost_probe` hit it at
+    /// nu=12 low utilization (n=12, u=6, m=15) as a `VirtualOpen` rejection.
+    #[test]
+    fn unread_row_coords_are_pinned() {
+        // n = 4 row vars but height 2, u = 2, m = 4: row bits 3 (and 2) are
+        // read at layers 5, 4 — layer 5 is past the program.
+        let p = AlignedParams::new(
+            vec![AlignedTable {
+                log_width: 2,
+                height: 2,
+                col_offset: 0,
+            }],
+            4,
+            2,
+            4,
+        );
+        assert!(
+            p.n + p.tables[0].log_width as usize > p.m + 1,
+            "this shape must actually exercise the unread-row case"
+        );
+
+        let mut rng = Rng(0x_04E_ADD01);
+        for trial in 0..4 {
+            let z_row = rng.vec(p.n);
+            let z_col = rng.vec(p.k_cols);
+            let z_idx = rng.vec(p.m);
+            let got = f_hat_aligned(&p, &z_row, &z_col, &z_idx);
+
+            // Brute force over the bijection's actual support.
+            let (er, ec, ei) = (
+                build_eq_table(&z_row),
+                build_eq_table(&z_col),
+                build_eq_table(&z_idx),
+            );
+            let mut want = F128::ZERO;
+            for i in 0..p.area() {
+                let (col, row) = p.unrank(i);
+                want += er[row as usize] * ec[col as usize] * ei[i as usize];
+            }
+            assert_eq!(got, want, "trial {trial}: unread row coords not pinned");
         }
     }
 }

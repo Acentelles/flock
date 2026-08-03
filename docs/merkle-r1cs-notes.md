@@ -42,6 +42,68 @@ columns), reversing what the open items below say. The bigger prover lever is th
 optimizations above), is tested against brute force, and is *not* wired into
 `verify_batch_merged` — integration is the unfinished part.
 
+## Re-wired after the multitable merge (wire v7)
+
+The merge had reverted fancy jagged from the proving path because upstream's
+interface had moved ahead of it. Re-applied against the new interface:
+
+* `build_weight_row_major_twisted` now takes `jagged::MergedWeightClaim` —
+  `Folded` applies `Φ` via the byte table, `Scalar` is `eq_r[row]·cols[col]`
+  with γ pre-baked (a group of packed-direct claims sharing a row point, whose
+  column side is the precombined `Σᵢ γᵢ·eq_colᵢ`).
+* **The verifier needed no change for packed-direct claims.** A γ-scalar map is
+  `Φ(x) = γ·x`, so its linearized coefficients are `[γ, 0, …]` — Frobenius index
+  0 only — and `twisted_weight_aligned_batched` already skips zero coefficients,
+  so each packed-direct claim costs exactly one `f_hat_aligned` evaluation.
+* `MergedWeightClaim` widened `pub(crate)` → `pub` so `jagged_fancy` can take it.
+
+**Measured, before → after on the merged tree:**
+
+| | hashes | prove/mt | prove/1t | verify |
+|---|---|---|---|---|
+| d26 | 1,664 | 2.08 → **1.31** | 3.49 → **1.19** | 2.03 → **1.45** |
+| d26 | 6,656 | 1.93 → **1.20** | 2.22 → **1.12** | 2.21 → **1.46** |
+| d26 | 26,624 | 1.58 → **1.20** | 1.40 → **1.06** | 2.15 → **1.54** |
+| d8 | 2,048 | 1.30 → **1.11** | 1.76 → **1.04** | 1.25 → **1.12** |
+| d8 | 8,192 | 1.37 → **0.95** | 1.34 → **1.03** | 1.29 → **1.18** |
+| d8 | 32,768 | 1.19 → **1.09** | 1.12 → **1.00** | 1.35 → **1.23** |
+
+At d26 26,624: prove/1t 628 vs 601 ms (was 812 vs 578), verify 23.3 vs 15.5 ms
+(was 32.0 vs 14.9).
+
+### A real bug the kernel tests had never exercised
+
+`unread_row_pin`. The `·2^u` shift means row bit `r` is read at layer `r + u`,
+and the program has layers `0..=m`. So row coords with `r + u > m` are **never
+read** — hence never forced to zero — even though those rows cannot exist. The
+MLE of a function vanishing on them needs a `(1 + z_row[r])` factor each.
+
+It surfaced as `PcsOpen(VirtualOpen)` at exactly one geometry of six, and the
+pattern confirmed the diagnosis before anything was changed:
+
+| | n | u | m | `r+u ≤ m`? | |
+|---|---|---|---|---|---|
+| nu=10 low | 10 | 6 | 15 | 15 ≤ 15 ✓ | passed |
+| nu=12 full | 12 | 6 | 19 | 17 ≤ 19 ✓ | passed |
+| nu=12 low | 12 | 6 | 15 | 17 > 15 ✗ | **failed** |
+
+Vacuous whenever `n + u ≤ m + 1`, which every prior kernel test satisfied by
+accident. `unread_row_coords_are_pinned` now covers a shape where it is not.
+
+### Other integration fixups
+
+* **The identity-compaction shortcut had to be removed again** — upstream's
+  rewrite reinstated it, and row-major is a transpose even when compaction drops
+  nothing. `merged_padding_unread_poison_pool` is what catches it.
+* `union_mixed`'s independent re-commit was still reconstructing column-major;
+  pointed at `compact_witness_row_major`.
+* Assist-tamper cases removed from `union_mixed` and `union_element` — there is
+  no assist to tamper with; `q_eval` and the merged sumcheck rounds cover it,
+  since `Ŵ(ρ)` is recomputed rather than received.
+* **Fixtures regenerated** — 4 m6 digests, 2 m6 anchors, 7 mixed-class digests.
+  Unlike the first attempt these genuinely do cover the merged path (upstream
+  retargeted them), so this was a real transcript change.
+
 ## Fancy jagged (paper §6): WIRED, wire v7
 
 `crates/flock-core/src/pcs/jagged_fancy.rs`. The paper is Hemo–Jue–Rabinovich–
