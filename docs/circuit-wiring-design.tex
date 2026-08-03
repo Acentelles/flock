@@ -977,20 +977,37 @@ pure-element inner is the subset without the RS items):
         checker holds the published wire against the proof field.)
   \item \emph{The family-H batch} (boundary-first; the standing upgrade
         target): the RS transpose dots (a bit-matrix transpose), the
-        linearized fold coefficients, the $V$ recombination's Frobenius
-        squarings, and the twisted closed form $\hat g(\rho'')$ — all
-        $\F_2$-linear maps of bound words, recomputed natively. The
-        \emph{skip-round interpolation}, the batch's first item, is
-        landed in-circuit: the barycentric \emph{numerator} recurrence
-        $A' = A(z{+}\lambda)$, $B' = B(z{+}\lambda) + vA$ over the
-        $\Lambda$ nodes needs no inversions and no advice (and is exact
-        even at $z$ on a node, where the closed form branches), while the
-        $\varphi_8$ structure still pays through the linearized
-        $Z_S(z)$ — a 6-step squaring chain — and the shared subspace
-        denominators ($\mathrm{den} = c_0$, the formal derivative) baked
-        as gate constants. In-circuit, multiplications are cheap and
-        inversions are advice: the numerator form beats the
-        inverse-based closed form that wins natively.
+        linearized fold coefficients, and the $V$ recombination's
+        Frobenius squarings — $\F_2$-linear maps of bound words,
+        recomputed natively. Two items have LEFT the batch, in-circuit:
+        \begin{itemize}[nosep]
+          \item The \emph{skip-round interpolation}: the barycentric
+                \emph{numerator} recurrence $A' = A(z{+}\lambda)$,
+                $B' = B(z{+}\lambda) + vA$ over the $\Lambda$ nodes needs
+                no inversions and no advice (and is exact even at $z$ on
+                a node, where the closed form branches), while the
+                $\varphi_8$ structure still pays through the linearized
+                $Z_S(z)$ — a 6-step squaring chain — and the shared
+                subspace denominators ($\mathrm{den} = c_0$, the formal
+                derivative) baked as gate constants. In-circuit,
+                multiplications are cheap and inversions are advice: the
+                numerator form beats the inverse-based closed form that
+                wins natively.
+          \item The \emph{R=2 anchor expect}, including
+                $\hat g(\rho'')$: the accept $\text{claim} =
+                \text{expect}$ is a published zero-delta. The two RS
+                statements sit at the \emph{unsquared} claim points (the
+                anchor coefficient vectors have only $c_0 \neq 0$),
+                located as chain wires; $\hat g(\rho'') = \sum_j
+                \gamma^j\,\mathrm{eq}(\rho^{2^{-j}}, \rho'')$ builds from
+                127 levels of inverse-Frobenius \emph{advice} bound by
+                forward squaring deltas $y \cdot y + \mathrm{prev} = 0$
+                (squaring is a bijection in characteristic 2, so the
+                deltas pin the advice exactly — no checker equation
+                remains), with every eq product on the existing prefix
+                slot and the boundary DP on the existing assist-layer
+                gate.
+        \end{itemize}
   \item \emph{Assertion consumption}: the emitted
         \code{ElementAssertion}/\code{MatrixAssertion} fields (points as
         kind-(1) wires, matrix evaluations as advice bound by the
@@ -1015,16 +1032,18 @@ publics), so a boolean bit-gadget table is charged by its wired words,
 not its live rows. That splits the batch:
 
 \begin{itemize}[nosep]
-  \item \emph{Element-tractable now}: the skip interpolation (landed);
-        $\hat g(\rho'')$ and the anchor expect. In characteristic 2 the
-        eq factor is \emph{affine} ($1+a+b$), so the existing
+  \item \emph{Element-tractable — both landed}: the skip interpolation
+        and the R=2 anchor expect including $\hat g(\rho'')$ (see the
+        family-H bullet above). The enabling facts: in characteristic 2
+        the eq factor is \emph{affine} ($1+a+b$), so the existing
         \code{PrefixGate} slot evaluates every $\mathrm{eq}(\rho^{2^{-j}},
         \rho'')$ with zero-padding (padding pairs contribute 1); the
         inverse-Frobenius points ride as advice verified by
-        \emph{forward} squaring deltas $y\cdot y + \mathrm{prev} = 0$ on
-        the existing spine slot; $\gamma$-powers are spine MACs. No new
-        cell-slots — cost is rows ($\approx 128$ prefix chains $+\ 127m$
-        advice checks) and $\approx 2 \cdot 127m$ publics.
+        \emph{forward} squaring deltas on the existing spine slot;
+        $\gamma$-powers are spine MACs. One new cell-slot group
+        (\code{AssistLayerGate}, 13 IO words) — $\mu$ held at 21; cost is
+        rows ($\approx 128$ prefix chains $+\ 127m$ advice checks) and
+        $\approx 2 \cdot 127m$ publics ($\approx$ 20 KiB of proof).
   \item \emph{Cell-slot-expensive}: the RS transpose dots and the $V$
         recombination's Frobenius twists. A faithful transpose table
         needs its 128 input words \emph{wired} (free-witness inputs are
