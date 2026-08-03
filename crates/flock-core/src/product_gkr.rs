@@ -142,7 +142,9 @@ pub enum VerifyError {
 
 /// Basis for the identity tag `s_id`: `basis[i]` is the field element with bit
 /// `i` set (requires `μ ≤ 128`).
-fn s_id_basis(mu: usize) -> Vec<F128> {
+/// `pub`: the recursion circuit's GKR replay computes `s_id(ρ)` from the same
+/// closed form the verifier uses, so the two cannot drift.
+pub fn s_id_basis(mu: usize) -> Vec<F128> {
     assert!(mu <= 128, "s_id needs μ ≤ 128 distinct bit positions");
     (0..mu)
         .map(|i| {
@@ -168,7 +170,8 @@ fn s_id_value(idx: usize, basis: &[F128]) -> F128 {
 }
 
 /// Closed-form MLE of `s_id` at `ρ`: `Σ_i basis_i · ρ_i`.
-fn s_id_eval(basis: &[F128], rho: &[F128]) -> F128 {
+/// `pub`: see [`s_id_basis`].
+pub fn s_id_eval(basis: &[F128], rho: &[F128]) -> F128 {
     let mut acc = F128::ZERO;
     for (b, r) in basis.iter().zip(rho) {
         acc += *b * *r;
