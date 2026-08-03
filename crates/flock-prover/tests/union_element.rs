@@ -178,7 +178,16 @@ fn element_only_union_roundtrip() {
             })
             .collect();
         let union = UnionInstance::new(&registry, counts.clone());
-        let pcs_params = union_pcs_params(&union);
+        let mut pcs_params = union_pcs_params(&union);
+        if counts == [2731] {
+            // One shape runs on BLAKE3 Merkle: the union entries route their
+            // Ligerito configs through the PcsParams merkle-hash stamp, and
+            // nothing else in the tree exercises a non-default hash
+            // end-to-end (found the hard way — the raw `*_config_for` calls
+            // silently dropped the hash and L0 verified against the wrong
+            // leaf function).
+            pcs_params.merkle_hash = flock_core::merkle::HashKind::Blake3;
+        }
 
         // Count-proportional committed area: Σ_t n_t · used_cols_t.
         let expected_dense: usize = slot_tys

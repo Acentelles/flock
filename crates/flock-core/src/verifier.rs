@@ -409,13 +409,9 @@ fn verify_merged_opening<Ch: Challenger>(
             value: *value,
         })
         .collect();
-    let log_n = pcs_params.m - pcs::LOG_PACKING;
-    let lig_v_config = crate::pcs::ligerito::verifier_config_for(
-        log_n,
-        pcs_params.log_batch_size,
-        pcs_params.profile,
-    )
-    .expect("Ligerito default verifier config");
+    let lig_v_config = pcs_params
+        .ligerito_verifier_config()
+        .expect("Ligerito default verifier config");
     verifier_pool()
         .install(|| {
             pcs::verify_batch_merged(
@@ -503,13 +499,9 @@ pub fn verify_ligerito_union_mixed_class<Ch: Challenger>(
             value: *value,
         })
         .collect();
-    let log_n = pcs_params.m - pcs::LOG_PACKING;
-    let lig_v_config = crate::pcs::ligerito::verifier_config_for(
-        log_n,
-        pcs_params.log_batch_size,
-        pcs_params.profile,
-    )
-    .expect("Ligerito default verifier config");
+    let lig_v_config = pcs_params
+        .ligerito_verifier_config()
+        .expect("Ligerito default verifier config");
     verifier_pool()
         .install(|| {
             pcs::verify_batch_merged(
@@ -596,13 +588,9 @@ pub fn verify_ligerito_union_mixed_class_deferred<Ch: Challenger>(
             value: *value,
         })
         .collect();
-    let log_n = pcs_params.m - pcs::LOG_PACKING;
-    let lig_v_config = crate::pcs::ligerito::verifier_config_for(
-        log_n,
-        pcs_params.log_batch_size,
-        pcs_params.profile,
-    )
-    .expect("Ligerito default verifier config");
+    let lig_v_config = pcs_params
+        .ligerito_verifier_config()
+        .expect("Ligerito default verifier config");
     verifier_pool()
         .install(|| {
             pcs::verify_batch_merged(

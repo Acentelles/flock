@@ -643,10 +643,9 @@ fn prove_union_with_binding<Ch: Challenger>(
         "need one element prover input per ELEMENT registry type"
     );
 
-    let log_n = union.dense_m() - pcs::LOG_PACKING;
-    let lig_config =
-        pcs::ligerito::prover_config_for(log_n, pcs_params.log_batch_size, pcs_params.profile)
-            .expect("Ligerito default config; bump m for tiny instances");
+    let lig_config = pcs_params
+        .ligerito_prover_config()
+        .expect("Ligerito default config; bump m for tiny instances");
 
     // Union witness assembly, in slot order (booleans first, then elements —
     // the class-major sort): in-place slots generate straight into the union
