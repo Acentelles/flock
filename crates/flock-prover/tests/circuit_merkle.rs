@@ -8044,27 +8044,46 @@ fn mvp10_circuit_inner_tape() {
     use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
     use flock_prover::prover::UnionElementSlotInput;
 
-    // nu 11 puts the blake3 slot alone at 2^22 dense bits — the Ligerito
-    // floor — with ONE live row (pay-per-live carries the capacity).
-    let nu = 11usize;
+    // A CHAIN of 256 compressions (mvp9's inner scale, so the Ligerito
+    // geometry is the real multi-level shape) whose outputs feed element
+    // rows across the class boundary — the mixed circuit this phase's
+    // outer must verify.
+    let n_blocks = 256usize;
+    let nu = n_blocks.trailing_zeros() as usize;
     let mut rng = Rng(0x4D51_0001);
     let mut b = CircuitBuilder::new(nu);
     let hash = b.slot(Blake3Gate { nu });
     let mac = b.slot(MacGate::new());
     let iv = pack8(&IV);
-    let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
-    let mut hash_in = vec![b.public_value(iv[0]), b.public_value(iv[1])];
-    for j in 0..4 {
-        hash_in.push(b.public_value(pack4(m[4 * j..4 * j + 4].try_into().unwrap())));
+    let mut cv = [b.public_value(iv[0]), b.public_value(iv[1])];
+    let mut outs_i: Vec<Vec<Wire>> = Vec::with_capacity(n_blocks);
+    for i in 0..n_blocks {
+        let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+        let mut hash_in = vec![cv[0], cv[1]];
+        for j in 0..4 {
+            hash_in.push(b.public_value(pack4(m[4 * j..4 * j + 4].try_into().unwrap())));
+        }
+        let mut flags = 0u32;
+        if i == 0 {
+            flags |= CHUNK_START;
+        }
+        if i + 1 == n_blocks {
+            flags |= CHUNK_END;
+        }
+        hash_in.push(b.public_value(pack_params(0, 64, flags)));
+        let out = b.gate(hash, &hash_in);
+        cv = [out[0], out[1]];
+        outs_i.push(out);
     }
-    hash_in.push(b.public_value(pack_params(0, 64, CHUNK_START | CHUNK_END)));
-    let out = b.gate(hash, &hash_in);
+    // The cross-class wiring: element rows consuming hash outputs.
     let zero = b.public_value(F128::ZERO);
     let mut acc = zero;
-    for j in 0..3 {
-        acc = b.gate(mac, &[acc, out[j], out[j + 1]])[0];
+    for out in outs_i.iter().take(32) {
+        acc = b.gate(mac, &[acc, out[2], out[3]])[0];
     }
     b.publish(acc);
+    b.publish(cv[0]);
+    b.publish(cv[1]);
     let built = b.finish().expect("the mixed inner builds");
 
     // ---- prove over the circuit path, verify natively ----
@@ -8569,6 +8588,45 @@ fn mvp10_circuit_inner_tape() {
         }
         chain.absorb(&bytes[at * 16..]);
         let trace = chain.finish();
+
+        // ---- the QUERY PHASE is BLOCKED, and the block is a finding ----
+        // A mixed CIRCUIT union commits `num_lanes` ACTIVE lanes, and that
+        // count is `dense_words.div_ceil(2^log_dim)` — an arbitrary
+        // integer. This inner's L0 opens rows of 61 words against a 2^6
+        // wide fold: the three missing lanes are structurally zero, so the
+        // NATIVE side is fine (the capped paths verify, and the
+        // enforced-sum dot truncates against the eq table). But the
+        // circuit's opening gate hashes a leaf as whole 64-BYTE BLOCKS,
+        // and 61 words is not a whole number of blocks — so the query
+        // phase of a mixed circuit inner cannot be expressed at all today.
+        // MVP-7 and MVP-9 never met this: their inners' `num_lanes` landed
+        // on a power of two by luck of `dense_words`.
+        //
+        // Two fixes, and the choice moves proof bytes, so it is a
+        // deliberate decision rather than something to paper over here:
+        //   (a) round `num_lanes` up to a multiple of 4 (or to a power of
+        //       two) in `dense_lanes` — a couple of lines, slightly more
+        //       committed padding, every leaf becomes whole blocks, and
+        //       every byte fixture re-pins;
+        //   (b) teach the opening gate a length-aware final block (blake3
+        //       hashes arbitrary lengths) — no wire change, more circuit.
+        {
+            let lig = &proof.pcs_open.inner.ligerito;
+            let lvl_src = level_sources(lig);
+            let l0_words = lvl_src[0].1[0].len();
+            assert_eq!(l0_words, 61, "the finding, pinned: L0 opens 61 lanes");
+            assert_ne!(l0_words % 4, 0, "61 words is not whole 64-byte blocks");
+            assert!(
+                lvl_src[1..].iter().all(|(_, rows, _)| rows[0].len() % 4 == 0),
+                "only L0 carries the active-lane count; deeper levels are clean"
+            );
+            assert_eq!(
+                union.commit_lanes(6),
+                Some(l0_words),
+                "the opened width IS the union's active lane count"
+            );
+        }
+
         let b3_rows = trace.rows.len();
         let nu2 = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(3);
         let mut sb = ShapeBuilder::new(nu2);
