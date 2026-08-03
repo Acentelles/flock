@@ -8202,7 +8202,7 @@ fn mvp10_leaf_outer_inner_tape() {
     // The DEFERRED verify of the same proof: the independent reference for
     // the sigma assertion and the element assertion — the method-note
     // discipline, verifier-exported over formulas-written-twice.
-    let (el_assert_i, sigma_native_i) = {
+    let (mat_assert_i, el_assert_i, sigma_native_i) = {
         let mut ch = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
         let (_, work, sigma) = verifier::verify_ligerito_union_circuit_deferred(
             &union_i,
@@ -8215,7 +8215,11 @@ fn mvp10_leaf_outer_inner_tape() {
             &mut ch,
         )
         .expect("the deferred verify accepts the leaf outer");
-        (work.element.expect("an element PIOP ran"), sigma)
+        (
+            work.boolean.expect("a boolean PIOP ran"),
+            work.element.expect("an element PIOP ran"),
+            sigma,
+        )
     };
     let t_shape = rec.shape();
     let chals: Vec<F128> = rec.challenges().to_vec();
@@ -9047,8 +9051,9 @@ fn mvp10_leaf_outer_inner_tape() {
             v
         };
         // The boolean PIOP's round ordinals, located with fins — the RS
-        // statements' points are its round challenges.
-        let (zc_rounds_b, (outer_ch_b, outer_fin_b), lc_rounds_b) = {
+        // statements' points are its round challenges (and the lincheck
+        // alpha, for the matrix-assertion emission).
+        let (zc_rounds_b, (outer_ch_b, outer_fin_b), (bl_alpha_ch, bl_alpha_fin), lc_rounds_b) = {
             let mut i2 = zc_l[0] + 1;
             assert!(matches!(ops[i2], Op::SqueezeSlice(_)), "r_skip slice");
             i2 += 1;
@@ -9074,6 +9079,8 @@ fn mvp10_leaf_outer_inner_tape() {
             }
             assert_eq!(i2, lc_l[0], "the zerocheck runs straight into the lincheck");
             i2 += 1;
+            assert!(matches!(ops[i2], Op::SqueezeScalar), "lc alpha");
+            let lc_alpha = (vc_at(i2).1, fin_at(i2));
             while matches!(ops[i2], Op::SqueezeScalar) {
                 i2 += 1;
             }
@@ -9085,7 +9092,7 @@ fn mvp10_leaf_outer_inner_tape() {
                 lc_r.push((vc_at(i2 + 2).1, fin_at(i2 + 2)));
                 i2 += 3;
             }
-            (zc_r, outer, lc_r)
+            (zc_r, outer, lc_alpha, lc_r)
         };
         use flock_core::zerocheck::univariate_skip_optimized::{
             medium_challenges_ghash, small_challenges_ghash,
@@ -9522,6 +9529,52 @@ fn mvp10_leaf_outer_inner_tape() {
         }
         let anchor_delta = sb.gate(macs, &[anc_w, expect_w, ow])[0];
 
+        // ---- the swap, step 8: assertion EMISSION ----
+        // The three claim families exit as bound publics — sigma already
+        // does — at the leaf's contract: point coords are CHAIN WIRES,
+        // proof-side values ride as advice checked against the DEFERRED
+        // verify's own assertions (matrix_evals and the per-slot element
+        // evals are not absorbed — deferral leaves them proof-side, bound
+        // by the final equations and the root discharge, checker-native).
+        assert_eq!(
+            mat_assert_i.alpha,
+            chals[bl_alpha_ch],
+            "the located boolean lc alpha is the matrix assertion's"
+        );
+        let bl_alpha_w = outs[trace.squeezes[bl_alpha_fin][0]][0];
+        let mut mat_pub: Vec<Wire> = vec![bl_alpha_w];
+        for &(_, fin) in &lc_rounds_b {
+            mat_pub.push(outs[trace.squeezes[fin][0]][0]);
+        }
+        let bp_i = lo.proof.boolean.as_ref().expect("boolean side present");
+        for &(a, b) in &bp_i.lincheck.matrix_evals {
+            vals.push(a);
+            mat_pub.push(sb.public_input());
+            vals.push(b);
+            mat_pub.push(sb.public_input());
+        }
+        // The element c claim's position among the pd claims varies with
+        // the tape (mvp7's inner had it first; the mixed tape's element
+        // pair order differs) — identify it by the assertion's own value.
+        let z_ix = gammas_i
+            .iter()
+            .position(|pd| vals_rec[pd.val_v] == el_assert_i.z_eval)
+            .expect("z_eval is one of the absorbed pd values");
+        let mut ela_pub: Vec<Wire> = vec![el_alpha_w];
+        for rr in &piop_i.zc_rounds {
+            ela_pub.push(outs[trace.squeezes[rr.fin][0]][0]);
+        }
+        for rr in &piop_i.lc_rounds {
+            ela_pub.push(outs[trace.squeezes[rr.fin][0]][0]);
+        }
+        ela_pub.extend_from_slice(&[va_w, vb_w, wv(gammas_i[z_ix].val_v)]);
+        for &(a, b) in &el_assert_i.evals {
+            vals.push(a);
+            ela_pub.push(sb.public_input());
+            vals.push(b);
+            ela_pub.push(sb.public_input());
+        }
+
         for (a_wires, opens) in &to_publish {
             for w in a_wires {
                 sb.publish(*w);
@@ -9567,6 +9620,12 @@ fn mvp10_leaf_outer_inner_tape() {
             sb.publish(*d);
         }
         sb.publish(anchor_delta);
+        for w in &mat_pub {
+            sb.publish(*w);
+        }
+        for w in &ela_pub {
+            sb.publish(*w);
+        }
         let shape2 = sb.finish().expect("the swap outer builds");
         // Cell-slot budget: every gate IO word is ALSO a wiring gather
         // claim, so schema words are the budget for both mu and claims.
@@ -9604,7 +9663,9 @@ fn mvp10_leaf_outer_inner_tape() {
             + 2
             + 2
             + sqrt_deltas.len()
-            + 1;
+            + 1
+            + mat_pub.len()
+            + ela_pub.len();
         let mut at2 = built2.public.len() - n_tail - n_query_pub;
         for (li, lvl) in levels.iter().enumerate() {
             let g = &geo[li];
@@ -9767,6 +9828,76 @@ fn mvp10_leaf_outer_inner_tape() {
             F128::ZERO,
             "the anchor claim == expect zero-delta (real-inner scale)"
         );
+        // The assertion emissions, held against the DEFERRED verify's own
+        // assertions — the same route-B posture as sigma: a parent reads
+        // the accumulator inputs off the public segment.
+        let mat_base = axp_base + sqrt_deltas.len() + 1;
+        assert_eq!(
+            built2.public[mat_base],
+            mat_assert_i.alpha,
+            "the emitted matrix alpha is the assertion's"
+        );
+        for (j, &(ch, _)) in lc_rounds_b.iter().enumerate() {
+            assert_eq!(
+                built2.public[mat_base + 1 + j],
+                chals[ch],
+                "matrix point coord {j} is the located round wire"
+            );
+        }
+        for (j, &(a, b)) in bp_i.lincheck.matrix_evals.iter().enumerate() {
+            assert_eq!(
+                (
+                    built2.public[mat_base + 1 + lc_rounds_b.len() + 2 * j],
+                    built2.public[mat_base + 1 + lc_rounds_b.len() + 2 * j + 1],
+                ),
+                (a, b),
+                "matrix_evals pair {j} rides as bound advice"
+            );
+        }
+        let ela_base = mat_base + 1 + lc_rounds_b.len() + 2 * bp_i.lincheck.matrix_evals.len();
+        assert_eq!(
+            built2.public[ela_base],
+            el_assert_i.alpha,
+            "the emitted element alpha is the assertion's"
+        );
+        let n_er = piop_i.zc_rounds.len() + piop_i.lc_rounds.len();
+        for (j, rr) in piop_i
+            .zc_rounds
+            .iter()
+            .chain(piop_i.lc_rounds.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                built2.public[ela_base + 1 + j],
+                chals[rr.ch],
+                "element point coord {j} is the located round wire"
+            );
+        }
+        assert_eq!(
+            built2.public[ela_base + 1 + n_er],
+            vals_rec[piop_i.eab_v] + a_sum_n,
+            "the emitted va is the strip-derived value"
+        );
+        assert_eq!(
+            built2.public[ela_base + 1 + n_er + 1],
+            vals_rec[piop_i.eab_v + 1] + b_sum_n,
+            "the emitted vb is the strip-derived value"
+        );
+        assert_eq!(
+            built2.public[ela_base + 1 + n_er + 2],
+            el_assert_i.z_eval,
+            "the emitted z_eval is the assertion's"
+        );
+        for (j, &(a, b)) in el_assert_i.evals.iter().enumerate() {
+            assert_eq!(
+                (
+                    built2.public[ela_base + 1 + n_er + 3 + 2 * j],
+                    built2.public[ela_base + 1 + n_er + 3 + 2 * j + 1],
+                ),
+                (a, b),
+                "per-slot eval pair {j} rides as bound advice"
+            );
+        }
 
         // The outer-of-outer proves and verifies over the circuit path.
         let union2 = UnionInstance::new(&shape2.registry, shape2.counts.clone());
@@ -9912,8 +10043,9 @@ fn mvp10_leaf_outer_inner_tape() {
          carries: chain, QUERY PHASE, PoW, W-rounds (rho bound), SPINE\n  \
          (t_r bound), RESIDUAL (rotated; inner == t_r closes), WIRING\n  \
          GKR (21 layers) + sigma (emitted, discharges), the MULTI-SLOT\n  \
-         element PIOP (general strip), the MULTIPOINT intake, and the\n  \
-         ANCHOR EXPECT (one-hot gathers; claim == expect closes)\n  \
+         element PIOP (general strip), the MULTIPOINT intake, the ANCHOR\n  \
+         EXPECT (one-hot gathers), and ALL THREE assertion emissions\n  \
+         (matrix + element + sigma — the parent folds from publics)\n  \
          prove {:.0} ms | verify {:.0} ms | proof {:.1} KiB\n",
         lo.pcs.m,
         lo.shape.circuit.cells().mu(),
