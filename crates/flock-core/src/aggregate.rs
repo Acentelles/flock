@@ -82,6 +82,11 @@ pub struct Accumulator {
     /// about different polynomials, which is meaningless — so the groups
     /// never mix, exactly as `A₀` and `B₀` never mix within a group.
     pub per_element: Vec<(MatrixClaim, MatrixClaim)>,
+    /// The wiring-sigma group (sigma v2 route B, wiring doc §sigma): ONE
+    /// folded claim on the circuit's sigma table, keyed by the circuit
+    /// digest — normalisation gives internal nodes one shape, hence one
+    /// key. `None` until a circuit proof's wiring assertion joins.
+    pub sigma: Option<([u8; 32], MatrixClaim)>,
 }
 
 impl Accumulator {
@@ -141,6 +146,22 @@ impl Accumulator {
                 .zip(mats)
                 .all(|((ca, cb), (a, b))| ca.check_direct(*a) && cb.check_direct(*b))
     }
+
+    /// The sigma group's root discharge: the folded claim against the real
+    /// sigma table — `O(2^mu)`, once. `true` when no sigma was accumulated.
+    pub fn discharge_sigma(&self, circuit: &crate::circuit::Circuit) -> bool {
+        match &self.sigma {
+            None => true,
+            Some((digest, claim)) => {
+                *digest == circuit.digest()
+                    && crate::matrix_fold::bilinear(
+                        &claim.row,
+                        &claim.col,
+                        &crate::circuit::SigmaAssertion::matrix(circuit),
+                    ) == claim.value
+            }
+        }
+    }
 }
 
 /// Per boolean type, the two folds `(A₀, B₀)`.
@@ -150,6 +171,8 @@ pub struct AggregateProof {
     pub folds: Vec<(FoldProof, FoldProof)>,
     /// Per element type, likewise.
     pub el_folds: Vec<(FoldProof, FoldProof)>,
+    /// The sigma group's fold, when a circuit's wiring assertion joins.
+    pub sigma_fold: Option<FoldProof>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -212,7 +235,7 @@ pub fn prove_aggregate<Ch: Challenger>(
     prior: Option<&Accumulator>,
     ch: &mut Ch,
 ) -> Result<(AggregateProof, Accumulator), AggregateError> {
-    prove_aggregate_classes(registry, mats, circuits, assertions, &[], &[], prior, ch)
+    prove_aggregate_classes(registry, mats, circuits, assertions, &[], &[], None, prior, ch)
 }
 
 /// [`prove_aggregate`] over BOTH classes: the boolean assertions against
@@ -227,9 +250,13 @@ pub fn prove_aggregate_classes<Ch: Challenger>(
     assertions: &[MatrixAssertion],
     el_mats: &[ElementMatrices<'_>],
     el_assertions: &[(&crate::union::UnionInstance<'_>, ElementAssertion)],
+    sigma: Option<(&crate::circuit::Circuit, &[crate::circuit::SigmaAssertion])>,
     prior: Option<&Accumulator>,
     ch: &mut Ch,
 ) -> Result<(AggregateProof, Accumulator), AggregateError> {
+    // Sigma never travels alone: a circuit proof's deferred verify yields
+    // the matrix assertions AND the sigma assertion together, so the
+    // boolean group always has work when the sigma group does.
     if assertions.is_empty() && prior.is_none() {
         return Err(AggregateError::Empty);
     }
@@ -295,14 +322,67 @@ pub fn prove_aggregate_classes<Ch: Challenger>(
         per_element.push((out_a, out_b));
     }
 
+    let (sigma_fold, sigma_out) =
+        fold_sigma_prove(sigma, prior, ch)?;
+
     Ok((
-        AggregateProof { folds, el_folds },
+        AggregateProof {
+            folds,
+            el_folds,
+            sigma_fold,
+        },
         Accumulator {
             registry_digest: registry.digest(),
             per_type,
             per_element,
+            sigma: sigma_out,
         },
     ))
+}
+
+/// The sigma group's fold (route B): the prior's folded claim first, then
+/// one claim per assertion — the same fixed order every group uses. All
+/// claims must name the SAME circuit (digest-keyed; normalisation).
+fn fold_sigma_prove<Ch: Challenger>(
+    sigma: Option<(&crate::circuit::Circuit, &[crate::circuit::SigmaAssertion])>,
+    prior: Option<&Accumulator>,
+    ch: &mut Ch,
+) -> Result<(Option<FoldProof>, Option<([u8; 32], MatrixClaim)>), AggregateError> {
+    let prior_sigma = prior.and_then(|p| p.sigma.as_ref());
+    let Some((circuit, asserts)) = sigma else {
+        // No circuit supplied: a prior sigma claim cannot be carried
+        // (it would leave the accumulator silently unfolded).
+        return if prior_sigma.is_some() {
+            Err(AggregateError::RegistryMismatch)
+        } else {
+            Ok((None, None))
+        };
+    };
+    let digest = circuit.digest();
+    let mut claims: Vec<MatrixClaim> = Vec::new();
+    if let Some((d, c)) = prior_sigma {
+        if *d != digest {
+            return Err(AggregateError::RegistryMismatch);
+        }
+        claims.push(c.clone());
+    }
+    for a in asserts {
+        if a.nu != circuit.cells().nu() || a.rho.len() != circuit.cells().mu() {
+            return Err(AggregateError::Malformed);
+        }
+        claims.push(a.claim());
+    }
+    if claims.is_empty() {
+        return Ok((None, None));
+    }
+    let m = crate::circuit::SigmaAssertion::matrix(circuit);
+    let n_cols = matrix_fold::FoldMatrix::n_cols(&m);
+    let combs: Vec<Vec<F128>> = claims
+        .iter()
+        .map(|q| matrix_fold::FoldMatrix::col_marginal(&m, &q.row.materialize(), n_cols))
+        .collect();
+    let (pf, out) = matrix_fold::prove_fold(&m, &combs, &claims, ch);
+    Ok((Some(pf), Some((digest, out))))
 }
 
 /// Element claims to fold for one type: the prior's first, then one per
@@ -370,7 +450,7 @@ pub fn verify_aggregate<Ch: Challenger>(
     proof: &AggregateProof,
     ch: &mut Ch,
 ) -> Result<Accumulator, AggregateError> {
-    verify_aggregate_classes(registry, assertions, &[], prior, proof, ch)
+    verify_aggregate_classes(registry, assertions, &[], None, prior, proof, ch)
 }
 
 /// [`verify_aggregate`] over BOTH classes. Reads no matrix of either kind.
@@ -378,10 +458,14 @@ pub fn verify_aggregate_classes<Ch: Challenger>(
     registry: &Registry,
     assertions: &[MatrixAssertion],
     el_assertions: &[(&crate::union::UnionInstance<'_>, ElementAssertion)],
+    sigma: Option<(&crate::circuit::Circuit, &[crate::circuit::SigmaAssertion])>,
     prior: Option<&Accumulator>,
     proof: &AggregateProof,
     ch: &mut Ch,
 ) -> Result<Accumulator, AggregateError> {
+    // Sigma never travels alone: a circuit proof's deferred verify yields
+    // the matrix assertions AND the sigma assertion together, so the
+    // boolean group always has work when the sigma group does.
     if assertions.is_empty() && prior.is_none() {
         return Err(AggregateError::Empty);
     }
@@ -428,9 +512,46 @@ pub fn verify_aggregate_classes<Ch: Challenger>(
         per_element.push((out_a, out_b));
     }
 
+    // The sigma group, replayed the same way — the verifier reads no
+    // sigma table here; the fold verifies against the CLAIMS alone, and
+    // the table is only touched at the root discharge.
+    let sigma_out = {
+        let prior_sigma = prior.and_then(|p| p.sigma.as_ref());
+        match (sigma, &proof.sigma_fold) {
+            (None, None) if prior_sigma.is_none() => None,
+            (Some((circuit, asserts)), pf_opt) => {
+                let digest = circuit.digest();
+                let mut claims: Vec<MatrixClaim> = Vec::new();
+                if let Some((d, c)) = prior_sigma {
+                    if *d != digest {
+                        return Err(AggregateError::RegistryMismatch);
+                    }
+                    claims.push(c.clone());
+                }
+                for a in asserts {
+                    if a.nu != circuit.cells().nu() || a.rho.len() != circuit.cells().mu() {
+                        return Err(AggregateError::Malformed);
+                    }
+                    claims.push(a.claim());
+                }
+                match (claims.is_empty(), pf_opt) {
+                    (true, None) => None,
+                    (false, Some(pf)) => {
+                        let out =
+                            matrix_fold::verify_fold(&claims, pf, ch).map_err(AggregateError::Fold)?;
+                        Some((digest, out))
+                    }
+                    _ => return Err(AggregateError::Malformed),
+                }
+            }
+            _ => return Err(AggregateError::Malformed),
+        }
+    };
+
     Ok(Accumulator {
         registry_digest: registry.digest(),
         per_type,
         per_element,
+        sigma: sigma_out,
     })
 }
