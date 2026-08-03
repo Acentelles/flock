@@ -8480,8 +8480,9 @@ fn mvp10_circuit_inner_tape() {
     };
 
     // ---- the merged open: rs x 2, then the packed-direct claims ----
-    let (pd_recs, mp_val_v) = {
+    let (pd_recs, mp_val_v, rs_recs, rs_gam_ch) = {
         let mut i = mo_l[0] + 1;
+        let mut rs_recs: Vec<(usize, usize)> = Vec::new(); // (s_hat_v index, r_dprime ch)
         for k in 0..2 {
             assert!(
                 matches!(&ops[i], Op::Label(l) if l.as_slice() == b"flock-ring-switch-v0"),
@@ -8497,8 +8498,10 @@ fn mvp10_circuit_inner_tape() {
             );
             i += 1;
             assert!(matches!(ops[i], Op::SqueezeSlice(7)), "r_dprime");
+            rs_recs.push((sv, vc_at(i).1));
             i += 1;
         }
+        let rs_gam_ch = vc_at(i).1;
         for _ in 0..2 {
             assert!(matches!(ops[i], Op::SqueezeScalar), "rs gamma");
             i += 1;
@@ -8535,7 +8538,7 @@ fn mvp10_circuit_inner_tape() {
         }
         i += 1;
         let (mv, _) = vc_at(i);
-        (pd_recs, mv)
+        (pd_recs, mv, rs_recs, rs_gam_ch)
     };
     // The pd claims are the element class's two (c, lc) plus one per wiring
     // GATHER; every gather value is absorbed, in proof order.
@@ -8646,7 +8649,7 @@ fn mvp10_circuit_inner_tape() {
         assert_eq!(commitment.cap, lig.initial_cap, "commitment IS the L0 cap");
         let r_lvl = lig.recursive_caps.len();
         let lvl_src = level_sources(lig);
-        let (start_v, piop_o, gammas_o, _w_rounds, mp_o, inner_pd2, _yr_v2, levels) =
+        let (start_v, piop_o, gammas_o, w_rounds, mp_o, inner_pd2, _yr_v2, levels) =
             parse_open_levels(ops, 32 * lig.initial_cap.len(), r_lvl);
         assert!(piop_o.is_some(), "a mixed tape carries the element PIOP");
         assert_eq!(
@@ -8858,6 +8861,75 @@ fn mvp10_circuit_inner_tape() {
             }
             t
         };
+
+        // ---- assembly step 7: the merged intake's W-ROUNDS ----
+        // The RS target is the gamma-combination of the two ring-switch
+        // succinct outputs, each a transpose dot — FAMILY H (the bit-matrix
+        // transpose), so it enters as checker-validated advice exactly as it
+        // does at the leaf. The W-rounds then fold it through the shared
+        // round gate, binding rho in-circuit, and `running` publishes; the
+        // checker closes `running == q_eval * V` natively, V being the R=2
+        // recombination over the same values the multipoint chain consumed.
+        let (native_target, native_running) = {
+            use flock_core::pcs::ring_switch as rs;
+            use flock_core::zerocheck::univariate_skip::build_eq;
+            let gs: Vec<F128> = (0..2).map(|k| chals[rs_gam_ch + k]).collect();
+            let mut target = F128::ZERO;
+            let mut coeffs: Vec<Vec<F128>> = Vec::new();
+            for (k, &(sv, rc)) in rs_recs.iter().enumerate() {
+                let shv = &vals_rec[sv..sv + 128];
+                let rdp: Vec<F128> = (0..7).map(|j| chals[rc + j]).collect();
+                let eq = build_eq(&rdp);
+                target += gs[k] * rs::inner_product(&rs::tensor_algebra_transpose(shv), &eq);
+                let scaled: Vec<F128> = eq.iter().map(|x| gs[k] * *x).collect();
+                coeffs.push(rs::linearized_coefficients(&rs::build_fold_byte_table(&scaled)));
+            }
+            // A MIXED tape's target carries the packed-direct claims too —
+            // each absorbed value against its own gamma squeeze. (mvp9's
+            // leaf had none; mvp8's element inner had only these.)
+            for pd in &gammas_o {
+                target += chals[pd.ch] * vals_rec[pd.val_v];
+            }
+            let mut running = target;
+            for rr in &w_rounds {
+                let (g1, gi) = (vals_rec[rr.g_v], vals_rec[rr.g_v + 1]);
+                let r = chals[rr.ch];
+                let g0 = running + g1;
+                running = g0 + (g1 + g0 + gi) * r + gi * r * r;
+            }
+            // The R = 2 recombination plus the P group values, against the
+            // same q_eval the spine starts from.
+            let fro = &proof.pcs_open.frobenius;
+            let mut big_v = F128::ZERO;
+            for (k, cs) in coeffs.iter().enumerate() {
+                for (j, &cj) in cs.iter().enumerate() {
+                    if cj.is_zero() {
+                        continue;
+                    }
+                    let mut x = fro.values[k][j];
+                    for _ in 0..j {
+                        x = x * x;
+                    }
+                    big_v += cj * x;
+                }
+            }
+            for &v in &fro.group_values {
+                big_v += v;
+            }
+            assert_eq!(
+                running,
+                vals_rec[inner_pd2.q_v] * big_v,
+                "the R=2 + P merged boundary replays"
+            );
+            (target, running)
+        };
+        vals.push(native_target);
+        let tgt_w = sb.public_input();
+        let mut runw = tgt_w;
+        for rr in &w_rounds {
+            let rho_w = outs[trace.squeezes[rr.fin][0]][0];
+            runw = sb.gate(mrs, &[runw, wv(rr.g_v), wv(rr.g_v + 1), rho_w])[0];
+        }
 
         // ---- assembly step 6: the LIGERITO SPINE ----
         // Start from gamma'*q_eval, then per level: eval the running quad at
@@ -9082,6 +9154,8 @@ fn mvp10_circuit_inner_tape() {
         sb.publish(mp_delta);
         sb.publish(anc_w);
         sb.publish(t_final);
+        sb.publish(tgt_w);
+        sb.publish(runw);
         // ---- the SIGMA ASSERTION emission (route B, in-circuit) ----
         // The claim exits as bound publics: the value is the deferred
         // s_sigma stream word — the SAME wire the rhs input check just
@@ -9092,7 +9166,7 @@ fn mvp10_circuit_inner_tape() {
         for w in &pt_w {
             sb.publish(*w);
         }
-        let n_tail = 2 + gkr_deltas.len() + el_deltas.len() + 2 + 3 + 1 + mu_i;
+        let n_tail = 2 + gkr_deltas.len() + el_deltas.len() + 2 + 5 + 1 + mu_i;
         let n_query_pub: usize = levels.len()
             + levels
                 .iter()
@@ -9200,9 +9274,21 @@ fn mvp10_circuit_inner_tape() {
             t_final_n,
             "the spine's final t_r matches the native replay"
         );
+        // The merged intake: the advice target and the in-circuit running,
+        // both against the native replay.
+        assert_eq!(
+            built2.public[mp_base + 3],
+            native_target,
+            "the RS target advice is the native gamma-combination"
+        );
+        assert_eq!(
+            built2.public[mp_base + 4],
+            native_running,
+            "the W-rounds fold the target to the native running claim"
+        );
         // The sigma assertion, as the accumulator would read it: the value
         // and the mu point coordinates, matched against the native claim.
-        let sig_base = mp_base + 3;
+        let sig_base = mp_base + 5;
         assert_eq!(
             built2.public[sig_base],
             proof.wiring.gkr.s_sigma_eval,
