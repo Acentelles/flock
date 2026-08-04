@@ -6571,6 +6571,14 @@ struct LeafOuter {
 /// silently otherwise; the two recorded hash gotchas). Every tape pin and
 /// native replica stays inside: the builder IS the mvp9 test.
 fn build_leaf_outer() -> LeafOuter {
+    build_leaf_outer_seeded(0x4D50_9B00)
+}
+
+/// [`build_leaf_outer`] with the workload seed exposed: the seed varies only
+/// the leaf's compression inputs (cv/message/counter words), so two seeds
+/// yield the SAME outer circuit — the 2→1 merge's foldability key — with
+/// claims at unrelated FS points, which is what a merge node actually sees.
+fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
     use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
     // Pin the perf pool BEFORE any rayon touch (the native leaf prove would
     // otherwise auto-initialize the global pool at all cores).
@@ -6578,7 +6586,7 @@ fn build_leaf_outer() -> LeafOuter {
 
     let n_blocks = 256usize;
     let setup = blake3::Blake3Setup::new_batch_major(n_blocks);
-    let mut rng = Rng(0x4D50_9B00);
+    let mut rng = Rng(seed);
     let inputs: Vec<blake3::Compression> = (0..n_blocks)
         .map(|_| {
             let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
