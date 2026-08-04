@@ -7421,8 +7421,12 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         leaf_slot.push((510, skslot));
         let (mut ska, mut skc, mut skab) = (ow, zw, zw);
         for i in 0..64 {
-            vals.push(flock_core::field::PHI_8_TABLE[64 + i]);
-            let lam_w = sb.public_input();
+            let lam_w = cw(
+                &mut sb,
+                &mut vals,
+                &mut consts,
+                flock_core::field::PHI_8_TABLE[64 + i],
+            );
             let g = sb.gate(
                 skslot,
                 &[ska, skc, skab, z_w, lam_w, wv(r1c_v + i), wv(r1ab_v + i)],
@@ -7445,8 +7449,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         let mut zc_t_w: Vec<Wire> = Vec::new();
         for (k2, &(g_v, _, fin)) in zc_rounds2.iter().enumerate() {
             let t_w = if k2 < 7 {
-                vals.push(t_vals[k2]);
-                sb.public_input()
+                cw(&mut sb, &mut vals, &mut consts, t_vals[k2])
             } else {
                 let j = k2 - 7;
                 let sq = &trace.squeezes[outer_fin];
@@ -7455,7 +7458,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             zc_t_w.push(t_w);
             let rho_w = outs[trace.squeezes[fin][0]][0];
             vals.push(g0_native[k2]);
-            let g0w = sb.public_input();
+            let g0w = sb.input();
             let g = sb.gate(zslot, &[zrw, wv(g_v), wv(g_v + 1), t_w, rho_w, g0w, ow]);
             zc_deltas2.push(g[0]);
             zrw = g[1];
@@ -7837,7 +7840,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
                     let y = frob_inv_native(rinv_n[t2]);
                     rinv_n[t2] = y;
                     vals.push(y);
-                    let yw = sb.public_input();
+                    let yw = sb.input();
                     sqrt_deltas
                         .push(sb.gate(spine, &[zw, zw, zw, rinv_w[t2], zw, zw, yw, yw, zw])[3]);
                     lvl_w.push(yw);
