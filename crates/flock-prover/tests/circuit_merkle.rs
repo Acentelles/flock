@@ -5501,7 +5501,7 @@ fn emit_query_phase(
                 let mut a_in: Vec<Wire> = fold_w[lanes * h..lanes * (h + 1)].to_vec();
                 a_in.extend_from_slice(&v_wires[..le_vars]);
                 vals.push(aw[k] * hw[h]);
-                a_in.push(sb.public_input());
+                a_in.push(sb.input());
                 a_in.push(acc);
                 acc = sb.gate(leafeval[li], &a_in)[0];
             }
@@ -5632,10 +5632,13 @@ fn emit_residual_region(
                     .collect()
             };
             for (h, &sph) in sp_hi.iter().enumerate() {
+                // WITNESS advice (the alpha-expansion tier): the checker
+                // recomputes aw·sp_hi natively and validates the published
+                // ACCS — these values were never read as publics.
                 vals.push(F128::new(pos as u64, 0));
-                let qf = sb.public_input();
+                let qf = sb.input();
                 vals.push(aw[k] * sph);
-                let awp = sb.public_input();
+                let awp = sb.input();
                 let mut g_in = vec![qf];
                 g_in.extend_from_slice(&ris_w);
                 g_in.push(awp);
@@ -9540,7 +9543,7 @@ fn emit_real_child_region(
         for (t2, &(gv, rfin)) in lr.rounds.iter().enumerate() {
             let rho_w = outs[trace.squeezes[rfin][0]][0];
             vals.push(lr.g0s[t2]);
-            let g0w = sb.public_input();
+            let g0w = sb.input();
             let o = sb.gate(zcr, &[run_w, wv(gv), wv(gv + 1), pt_w[t2], rho_w, g0w, ow]);
             gkr_deltas.push(o[0]);
             run_w = o[1];
@@ -9586,7 +9589,7 @@ fn emit_real_child_region(
         let t_w = outs[sqt[k / 4]][k % 4];
         let rho_w = outs[trace.squeezes[rr.fin][0]][0];
         vals.push(rt.el_g0[k]);
-        let g0w = sb.public_input();
+        let g0w = sb.input();
         let o = sb.gate(zcr, &[el_zr, wv(rr.g_v), wv(rr.g_v + 1), t_w, rho_w, g0w, ow]);
         el_deltas.push(o[0]);
         el_zr = o[1];
@@ -9673,8 +9676,7 @@ fn emit_real_child_region(
     let mut xc_pw: Vec<(F128, Wire)> = (0..rt.zc_rounds_b.len())
         .map(|k2| {
             if k2 < 7 {
-                vals.push(t_vals_b[k2]);
-                (t_vals_b[k2], sb.public_input())
+                (t_vals_b[k2], cw(sb, vals, &mut consts, t_vals_b[k2]))
             } else {
                 let j = k2 - 7;
                 let sq2 = &trace.squeezes[outer_fin_b];
@@ -9723,7 +9725,7 @@ fn emit_real_child_region(
                 let y = frob_inv_native(rinv_n2[t3]);
                 rinv_n2[t3] = y;
                 vals.push(y);
-                let yw = sb.public_input();
+                let yw = sb.input();
                 sqrt_deltas.push(sb.gate(spine, &[zw, zw, zw, rinv_w[t3], zw, zw, yw, yw, zw])[3]);
                 lvl_w.push(yw);
             }
@@ -11874,7 +11876,7 @@ fn emit_child_region(
         for (t2, &(gv, rfin)) in lr.rounds.iter().enumerate() {
             let rho_w = outs[trace.squeezes[rfin][0]][0];
             vals.push(lr.g0s[t2]);
-            let g0w = sb.public_input();
+            let g0w = sb.input();
             let o = sb.gate(zcr, &[run_w, wv(gv), wv(gv + 1), pt_w[t2], rho_w, g0w, ow]);
             gkr_deltas.push(o[0]);
             run_w = o[1];
@@ -12065,7 +12067,7 @@ fn emit_child_region(
         let t_w = outs[sqt[k / 4]][k % 4];
         let rho_w = outs[trace.squeezes[rfin][0]][0];
         vals.push(ct.el_g0[k]);
-        let g0w = sb.public_input();
+        let g0w = sb.input();
         let o = sb.gate(zcr, &[el_zr, wv(gv), wv(gv + 1), t_w, rho_w, g0w, ow]);
         el_deltas.push(o[0]);
         el_zr = o[1];
@@ -12131,8 +12133,7 @@ fn emit_child_region(
     let mut xc_pw: Vec<(F128, Wire)> = (0..ct.zc_rounds_b.len())
         .map(|k2| {
             if k2 < 7 {
-                vals.push(t_vals_b[k2]);
-                (t_vals_b[k2], sb.public_input())
+                (t_vals_b[k2], cw(sb, vals, &mut consts, t_vals_b[k2]))
             } else {
                 let j = k2 - 7;
                 let sq2 = &trace.squeezes[outer_fin_b];
@@ -12185,7 +12186,7 @@ fn emit_child_region(
                 let y = frob_inv_native(rinv_n2[t2]);
                 rinv_n2[t2] = y;
                 vals.push(y);
-                let yw = sb.public_input();
+                let yw = sb.input();
                 sqrt_deltas.push(sb.gate(spine, &[zw, zw, zw, rinv_w[t2], zw, zw, yw, yw, zw])[3]);
                 lvl_w.push(yw);
             }
