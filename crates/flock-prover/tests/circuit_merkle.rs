@@ -2323,22 +2323,32 @@ fn emit_fs_chain(
                         match word_wire[wi] {
                             Some(w) => w,
                             None => {
-                                vals.push(F128::new(
+                                let v = F128::new(
                                     u64::from_le_bytes(
                                         bytes[wi * 16..wi * 16 + 8].try_into().unwrap(),
                                     ),
                                     u64::from_le_bytes(
                                         bytes[wi * 16 + 8..wi * 16 + 16].try_into().unwrap(),
                                     ),
-                                ));
-                                let public = match &stream.words[wi] {
-                                    StreamWord::Bytes { payload, .. } => {
-                                        pub_payloads.get(*payload).copied().unwrap_or(true)
+                                );
+                                let w = match &stream.words[wi] {
+                                    // Domain labels are statement CONSTANTS
+                                    // that repeat with every region — one
+                                    // public per VALUE via the shared cache,
+                                    // not one per occurrence (the census
+                                    // found ~2.3k of the latter per child).
+                                    StreamWord::Const(_) => cw(sb, vals, consts, v),
+                                    StreamWord::Bytes { payload, .. }
+                                        if pub_payloads.get(*payload).copied().unwrap_or(true) =>
+                                    {
+                                        vals.push(v);
+                                        sb.public_input()
                                     }
-                                    StreamWord::Const(_) => true,
-                                    StreamWord::Value(_) => false,
+                                    _ => {
+                                        vals.push(v);
+                                        sb.input()
+                                    }
                                 };
-                                let w = if public { sb.public_input() } else { sb.input() };
                                 word_wire[wi] = Some(w);
                                 w
                             }
@@ -9344,6 +9354,9 @@ struct RealRegion {
     /// The family-H re-exposure block length (the tail past z_skip).
     n_fam_pub: usize,
     n_ela_pub: usize,
+    /// Labeled `public_len` checkpoints through the emission — the publics
+    /// census (`PUB_CENSUS=1` on the node test prints the block sizes).
+    census: Vec<(&'static str, usize)>,
     /// The z_skip squeeze wire — see [`ChildRegion::zskip_w`].
     zskip_w: Wire,
     /// sigma: the deferred s_sigma stream word + the GKR squeeze point.
@@ -9417,6 +9430,7 @@ fn emit_real_child_region(
             }
         })
         .collect();
+    let mut cen: Vec<(&'static str, usize)> = vec![("start", sb.public_len())];
     let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
     vals.extend_from_slice(&iv_w);
     let iv2 = [sb.public_input(), sb.public_input()];
@@ -9433,6 +9447,24 @@ fn emit_real_child_region(
         &rt.pub_payloads,
     );
 
+    cen.push(("chain payloads + shared consts", sb.public_len()));
+    if std::env::var("PUB_CENSUS").is_ok() {
+        let pay_pub: usize = stream
+            .words
+            .iter()
+            .enumerate()
+            .filter(|(wi, w)| {
+                matches!(w, flock_core::transcript_record::StreamWord::Bytes { payload, .. }
+                    if rt.pub_payloads[*payload])
+                    && ww[*wi].is_some()
+            })
+            .count();
+        println!(
+            "  [census probe] chain block: {} payload words public, {} cw consts",
+            pay_pub,
+            consts.len()
+        );
+    }
     // The PoW grinding wires: (digest word0, word1, nonce word) per op.
     let pow_pub: Vec<[Wire; 3]> = rt
         .pows
@@ -9462,6 +9494,7 @@ fn emit_real_child_region(
         ];
         emit_publics_hash(sb, cs.q, iv2, &rt.lo.public, dw, vals, &mut consts)
     };
+    cen.push(("H(publics) region", sb.public_len()));
     let cap_w = cap_wires(stream, &ww, &rt.cap_pays);
     let (to_publish, level_accs) = emit_query_phase(
         sb,
@@ -9480,6 +9513,7 @@ fn emit_real_child_region(
         hints,
     );
 
+    cen.push(("query phase decl", sb.public_len()));
     // ---- intake W-rounds, spine, residual ----
     let mut vmap: Vec<Option<usize>> = Vec::new();
     for (wi, w) in stream.words.iter().enumerate() {
@@ -9505,6 +9539,7 @@ fn emit_real_child_region(
     let zassert = sb.public_input();
 
 
+    cen.push(("zero/one/anchor consts", sb.public_len()));
     // The merged target's TWO HALVES, round-0 posture: the packed-direct
     // half is a MAC chain over absorbed value words × gamma squeeze wires
     // (fully in-circuit); only the RS half — the family-H transpose dots —
@@ -9536,6 +9571,7 @@ fn emit_real_child_region(
     let rhs_v_w = sb.gate(cs.macs, &[zw, wv(inner_pd_i.q_v), v_w])[0];
     sb.connect(runw, rhs_v_w);
 
+    cen.push(("merged target + family-H advice", sb.public_len()));
     // The ligerito SPINE: start gamma'·q_eval, eval/build per fold,
     // intro-folds consuming the query phase's accumulator wires.
     let gpw = outs[trace.squeezes[inner_pd_i.fin][0]][0];
@@ -9620,6 +9656,7 @@ fn emit_real_child_region(
     // THE CLOSURE, in-circuit: inner == t_r as a copy constraint.
     sb.connect(inner_w, t_final);
 
+    cen.push(("spine + residual advice", sb.public_len()));
     // ---- the WIRING GKR in-circuit + the sigma emission ----
     let macs = cs.macs;
     let zcr = cs.zcr;
@@ -9703,6 +9740,7 @@ fn emit_real_child_region(
         ow,
     );
 
+    cen.push(("GKR advice (g0s, mask)", sb.public_len()));
     // ---- the MULTI-SLOT element PIOP (general strip) ----
     let mut el_zr = zw;
     let sqt = &trace.squeezes[piop_i.tau_fin];
@@ -9730,6 +9768,7 @@ fn emit_real_child_region(
         el_lcw = sb.gate(mrslot, &[el_lcw, wv(rr.g_v), wv(rr.g_v + 1), rho_w])[0];
     }
 
+    cen.push(("element PIOP advice", sb.public_len()));
     // ---- the multipoint intake at R=2, P>0 ----
     let mp_gamma_w = outs[trace.squeezes[mp_i.gamma_fin][0]][0];
     let mut t0_w = zw;
@@ -9994,6 +10033,7 @@ fn emit_real_child_region(
     }
     sb.connect(anc_w, expect_w);
 
+    cen.push(("multipoint + anchor expect advice", sb.public_len()));
     // ---- the assertion EMISSIONS (all three families) ----
     let bl_alpha_w = outs[trace.squeezes[rt.bl_alpha.1][0]][0];
     let mut mat_pub: Vec<Wire> = vec![bl_alpha_w];
@@ -10063,6 +10103,7 @@ fn emit_real_child_region(
         el_eval_w.push((aw, bw));
     }
 
+    cen.push(("assertion eval advice", sb.public_len()));
     // ---- the publishes, in the swap's recorded order ----
     let pub_base = sb.public_len();
     for a_wires in &to_publish {
@@ -10078,6 +10119,7 @@ fn emit_real_child_region(
             sb.publish(*w);
         }
     }
+    cen.push(("TAIL: query alphas + native accs", sb.public_len()));
     sb.publish(t_final);
     sb.publish(tgt_w);
     sb.publish(runw);
@@ -10086,11 +10128,13 @@ fn emit_real_child_region(
             sb.publish(*w);
         }
     }
+    cen.push(("TAIL: chain ends + residual accs", sb.public_len()));
     sb.publish(inner_w);
     sb.publish(sig_w);
     for w in &pt_w {
         sb.publish(*w);
     }
+    cen.push(("TAIL: sigma + GKR point", sb.public_len()));
     sb.publish(el_zr);
     sb.publish(el_lcw);
     sb.publish(anc_w);
@@ -10100,6 +10144,7 @@ fn emit_real_child_region(
     for w in &ela_pub {
         sb.publish(*w);
     }
+    cen.push(("TAIL: el ends + assertion publics", sb.public_len()));
     // ROUND 0's family-H RE-EXPOSURE: the words the rs_half / V_rs advice
     // checks reference — s_hat_v (2×128), the r_dprime squeeze wires
     // (2×7), the two rs gammas, and the 256+P multipoint value words. All
@@ -10144,12 +10189,14 @@ fn emit_real_child_region(
         + mat_pub.len()
         + ela_pub.len()
         + n_fam_pub;
+    cen.push(("TAIL: family-H re-exposure", sb.public_len()));
     RealRegion {
         pub_base,
         n_query_pub,
         n_tail,
         n_mat_pub: mat_pub.len(),
         n_fam_pub,
+        census: cen,
         zskip_w: outs[trace.squeezes[rt.zskip_fin][0]][0],
         n_ela_pub: ela_pub.len(),
         sig_w,
@@ -16083,6 +16130,18 @@ fn build_node_outer(
             sb.publish(fp.value);
         }
 
+        if std::env::var("PUB_CENSUS").is_ok() {
+            println!("\nPUBLICS CENSUS (child 0; child 1 same shape):");
+            for w in r0.census.windows(2) {
+                println!("  {:38} {:6}", w[0].0, w[1].1 - w[0].1);
+            }
+            let child = r0.census.last().unwrap().1 - r0.census[0].1;
+            println!("  {:38} {:6}", "= CHILD TOTAL", child);
+            let tail_len: usize = locs.iter().map(|l| 1 + l.k_col + l.k_row).sum();
+            println!("  {:38} {:6}", "lagrange consts", 66usize);
+            println!("  {:38} {:6}", "fold region publics", tail_len);
+            println!("  {:38} {:6}", "TOTAL (2 children + shared)", sb.public_len());
+        }
         let build_ms = t_tapes.elapsed().as_secs_f64() * 1e3 - tapes_ms;
         let t_build2 = std::time::Instant::now();
         let shape2 = sb.finish().expect("the 2->1 node circuit builds");
