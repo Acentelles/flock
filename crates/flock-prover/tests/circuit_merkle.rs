@@ -155,7 +155,7 @@ impl GateType for Blake3Gate {
             .with_io_schema(blake3::io_schema())
     }
 
-    fn eval(&self, inputs: &[F128], _hint: &()) -> (Vec<F128>, Self::Row) {
+    fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> Self::Row {
         let cv: [u32; 8] = {
             let (a, b) = (unpack4(inputs[0]), unpack4(inputs[1]));
             [a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]]
@@ -168,10 +168,8 @@ impl GateType for Blake3Gate {
         let out = blake3::blake3_compress(&cv, &m, counter, block_len, flags);
         let lo = pack8(&out[0..8].try_into().unwrap());
         let hi = pack8(&out[8..16].try_into().unwrap());
-        (
-            vec![lo[0], lo[1], hi[0], hi[1]],
-            (cv, m, counter, block_len, flags),
-        )
+        outputs.extend_from_slice(&[lo[0], lo[1], hi[0], hi[1]]);
+        (cv, m, counter, block_len, flags)
     }
 
     fn witness(&self, _rows: &[Self::Row], _nu: usize) -> SlotWitness {
@@ -230,7 +228,8 @@ impl GateType for MerklePathGate {
             .with_io_schema(self.layout.io_schema())
     }
 
-    fn eval(&self, inputs: &[F128], hint: &Self::Hint) -> (Vec<F128>, Self::Row) {
+    fn eval(&self, inputs: &[F128], hint: &Self::Hint, outputs: &mut Vec<F128>) -> Self::Row {
+        let (o, row) = {
         assert_eq!(hint.len(), self.layout.depth, "one sibling per level");
         // Schema In-order: 4 words per chunk block, then the index word.
         let mut leaf_data = Vec::with_capacity(64 * self.layout.leaf_blocks);
@@ -249,6 +248,9 @@ impl GateType for MerklePathGate {
         };
         let root = self.layout.root_chunk(&row);
         (digest_words(&root).to_vec(), row)
+    };
+        outputs.extend_from_slice(&o);
+        row
     }
 
     fn witness(&self, _rows: &[Self::Row], _nu: usize) -> SlotWitness {
@@ -912,7 +914,8 @@ impl GateType for LeafEvalGate {
         TableType::element(self.ty.clone()).with_io_schema(schema)
     }
 
-    fn eval(&self, inputs: &[F128], _hint: &()) -> (Vec<F128>, Self::Row) {
+    fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> Self::Row {
+        
         let lay = self.lay;
         let mut z = vec![F128::ZERO; lay.k];
         z[..lay.n_in].copy_from_slice(&inputs[..lay.n_in]);
@@ -926,7 +929,8 @@ impl GateType for LeafEvalGate {
         }
         z[lay.t] = z[lay.alpha] * z[lay.y()];
         z[lay.acc] = z[lay.prev] + z[lay.t];
-        (vec![z[lay.acc]], z)
+        outputs.extend_from_slice(&[z[lay.acc]]);
+        z
     }
 
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
@@ -2413,7 +2417,8 @@ impl GateType for SpineGate {
         TableType::element(self.ty.clone()).with_io_schema(schema)
     }
 
-    fn eval(&self, inputs: &[F128], _hint: &()) -> (Vec<F128>, Self::Row) {
+    fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> Self::Row {
+        
         let mut z = vec![F128::ZERO; SP_K];
         z[..SP_IN].copy_from_slice(&inputs[..SP_IN]);
         let (c, b, a, tr, u0, u2, y, beta, r) =
@@ -2430,7 +2435,8 @@ impl GateType for SpineGate {
         z[18] = r * z[14];
         z[19] = z[17] * z[15];
         z[20] = z[13] + z[18] + z[19];
-        (vec![z[13], z[14], z[15], z[16], z[20]], z)
+        outputs.extend_from_slice(&[z[13], z[14], z[15], z[16], z[20]]);
+        z
     }
 
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
@@ -2604,7 +2610,7 @@ impl GateType for ResidualGate {
         TableType::element(self.ty.clone()).with_io_schema(schema)
     }
 
-    fn eval(&self, inputs: &[F128], _hint: &()) -> (Vec<F128>, Self::Row) {
+    fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> Self::Row {
         // A structural mirror of `new()`: same column cursor, same order.
         let inv = |v: F128| if v == F128::ZERO { F128::ZERO } else { v.inv() };
         let (lmc, pl) = (self.lmc, self.pl);
@@ -2670,7 +2676,8 @@ impl GateType for ResidualGate {
             outs.push(z[c]);
             c += 1;
         }
-        (outs, z)
+        outputs.extend_from_slice(&outs);
+        z
     }
 
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
@@ -2792,7 +2799,8 @@ impl GateType for PrefixGate {
         schema.push(IoWord::output(self.k - 1));
         TableType::element(self.ty.clone()).with_io_schema(schema)
     }
-    fn eval(&self, inputs: &[F128], _h: &()) -> (Vec<F128>, Self::Row) {
+    fn eval(&self, inputs: &[F128], _h: &(), outputs: &mut Vec<F128>) -> Self::Row {
+        
         let mut z = vec![F128::ZERO; self.k];
         z[..self.n_in].copy_from_slice(&inputs[..self.n_in]);
         let mut c = self.n_in;
@@ -2802,7 +2810,8 @@ impl GateType for PrefixGate {
             pr = z[c];
             c += 1;
         }
-        (vec![pr], z)
+        outputs.extend_from_slice(&[pr]);
+        z
     }
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
         let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
@@ -2851,14 +2860,16 @@ impl GateType for MergedRoundGate {
         schema.push(IoWord::output(7));
         TableType::element(self.ty.clone()).with_io_schema(schema)
     }
-    fn eval(&self, inputs: &[F128], _h: &()) -> (Vec<F128>, Self::Row) {
+    fn eval(&self, inputs: &[F128], _h: &(), outputs: &mut Vec<F128>) -> Self::Row {
+        
         let mut z = vec![F128::ZERO; 8];
         z[..4].copy_from_slice(&inputs[..4]);
         z[4] = (z[0] + z[2]) * z[3];
         z[5] = z[3] * z[3];
         z[6] = z[5] * z[2];
         z[7] = z[0] + z[1] + z[4] + z[6];
-        (vec![z[7]], z)
+        outputs.extend_from_slice(&[z[7]]);
+        z
     }
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
         let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
@@ -2904,12 +2915,14 @@ impl GateType for MacGate {
         schema.push(IoWord::output(4));
         TableType::element(self.ty.clone()).with_io_schema(schema)
     }
-    fn eval(&self, inputs: &[F128], _h: &()) -> (Vec<F128>, Self::Row) {
+    fn eval(&self, inputs: &[F128], _h: &(), outputs: &mut Vec<F128>) -> Self::Row {
+        
         let mut z = vec![F128::ZERO; 5];
         z[..3].copy_from_slice(&inputs[..3]);
         z[3] = z[1] * z[2];
         z[4] = z[0] + z[3];
-        (vec![z[4]], z)
+        outputs.extend_from_slice(&[z[4]]);
+        z
     }
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
         let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
@@ -2990,7 +3003,7 @@ impl GateType for AssistLayerGate {
         }
         TableType::element(self.ty.clone()).with_io_schema(schema)
     }
-    fn eval(&self, inputs: &[F128], _h: &()) -> (Vec<F128>, Self::Row) {
+    fn eval(&self, inputs: &[F128], _h: &(), outputs: &mut Vec<F128>) -> Self::Row {
         let sparse = flock_core::pcs::jagged::assist_sparse_transitions();
         let mut z = vec![F128::ZERO; 53];
         z[..AL_IN].copy_from_slice(&inputs[..AL_IN]);
@@ -3020,7 +3033,8 @@ impl GateType for AssistLayerGate {
         for s in 0..4 {
             z[AL_OUT0 + s] = z[33 + s] + z[37 + s] + z[41 + s] + z[45 + s];
         }
-        (z[AL_OUT0..AL_OUT0 + 4].to_vec(), z)
+        outputs.extend_from_slice(&z[AL_OUT0..AL_OUT0 + 4]);
+        z
     }
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
         let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
@@ -3076,7 +3090,8 @@ impl GateType for ZcRoundGate {
         schema.push(IoWord::output(14));
         TableType::element(self.ty.clone()).with_io_schema(schema)
     }
-    fn eval(&self, inputs: &[F128], _h: &()) -> (Vec<F128>, Self::Row) {
+    fn eval(&self, inputs: &[F128], _h: &(), outputs: &mut Vec<F128>) -> Self::Row {
+        
         let mut z = vec![F128::ZERO; 15];
         z[..7].copy_from_slice(&inputs[..7]);
         z[7] = z[5] * (z[6] + z[3]);
@@ -3087,7 +3102,8 @@ impl GateType for ZcRoundGate {
         z[12] = z[4] * (z[6] + z[4]);
         z[13] = z[2] * z[12];
         z[14] = z[10] + z[11] + z[13];
-        (vec![z[9], z[14]], z)
+        outputs.extend_from_slice(&[z[9], z[14]]);
+        z
     }
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
         let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
@@ -3147,7 +3163,8 @@ impl GateType for SkipNodeGate {
         schema.push(IoWord::output(13));
         TableType::element(self.ty.clone()).with_io_schema(schema)
     }
-    fn eval(&self, inputs: &[F128], _h: &()) -> (Vec<F128>, Self::Row) {
+    fn eval(&self, inputs: &[F128], _h: &(), outputs: &mut Vec<F128>) -> Self::Row {
+        
         let mut z = vec![F128::ZERO; 14];
         z[..7].copy_from_slice(&inputs[..7]);
         let zl = z[3] + z[4];
@@ -3158,7 +3175,8 @@ impl GateType for SkipNodeGate {
         z[11] = z[2] * zl;
         z[12] = (z[6] + z[5]) * z[0];
         z[13] = z[11] + z[12];
-        (vec![z[7], z[10], z[13]], z)
+        outputs.extend_from_slice(&[z[7], z[10], z[13]]);
+        z
     }
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
         let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
@@ -3265,7 +3283,8 @@ impl GateType for SkipCloseGate {
         schema.push(IoWord::output(11));
         TableType::element(self.ty.clone()).with_io_schema(schema)
     }
-    fn eval(&self, inputs: &[F128], _h: &()) -> (Vec<F128>, Self::Row) {
+    fn eval(&self, inputs: &[F128], _h: &(), outputs: &mut Vec<F128>) -> Self::Row {
+        
         use flock_core::field::PHI_8_TABLE;
         let c = Self::linearized_coeffs(6);
         let den6 = c[0];
@@ -3284,7 +3303,8 @@ impl GateType for SkipCloseGate {
         z[9] = (t6 * den6).inv() * z[1] * zs;
         z[10] = den6.inv() * z[0];
         z[11] = z[9] + z[10];
-        (vec![z[10], z[11]], z)
+        outputs.extend_from_slice(&[z[10], z[11]]);
+        z
     }
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
         let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
@@ -3357,7 +3377,8 @@ impl GateType for ZcJoinGate {
         }
         TableType::element(self.ty.clone()).with_io_schema(schema)
     }
-    fn eval(&self, inputs: &[F128], _h: &()) -> (Vec<F128>, Self::Row) {
+    fn eval(&self, inputs: &[F128], _h: &(), outputs: &mut Vec<F128>) -> Self::Row {
+        
         let mut z = vec![F128::ZERO; 15];
         z[..7].copy_from_slice(&inputs[..7]);
         z[7] = z[1] * z[2];
@@ -3376,7 +3397,8 @@ impl GateType for ZcJoinGate {
             + z[10] * self.bc[1]
             + z[11] * self.bc[2]
             + z[12] * self.bc[3];
-        (vec![z[8], z[13], z[14]], z)
+        outputs.extend_from_slice(&[z[8], z[13], z[14]]);
+        z
     }
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
         let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
@@ -4977,7 +4999,8 @@ impl GateType for SwapGate {
             .with_io_schema(SwapTable::io_schema())
     }
 
-    fn eval(&self, inputs: &[F128], hint: &Self::Hint) -> (Vec<F128>, Self::Row) {
+    fn eval(&self, inputs: &[F128], hint: &Self::Hint, outputs: &mut Vec<F128>) -> Self::Row {
+        
         let row = SwapInput {
             bit_word: (inputs[0].lo as u128) | ((inputs[0].hi as u128) << 64),
             prev: unpack8(inputs[1], inputs[2]),
@@ -4985,7 +5008,8 @@ impl GateType for SwapGate {
         };
         let (left, right) = SwapTable::outputs(&row);
         let (lw, rw) = (digest_words(&left), digest_words(&right));
-        (vec![lw[0], lw[1], rw[0], rw[1]], row)
+        outputs.extend_from_slice(&[lw[0], lw[1], rw[0], rw[1]]);
+        row
     }
 
     fn witness(&self, _rows: &[Self::Row], _nu: usize) -> SlotWitness {
@@ -5010,12 +5034,10 @@ impl GateType for BitSpreadGate {
             .with_io_schema(self.ty.io_schema())
     }
 
-    fn eval(&self, inputs: &[F128], _hint: &()) -> (Vec<F128>, u128) {
+    fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> u128 {
         let idx = (inputs[0].lo as u128) | ((inputs[0].hi as u128) << 64);
-        let outs = (0..self.ty.depth)
-            .map(|l| F128::new(((idx >> l) & 1) as u64, 0))
-            .collect();
-        (outs, idx)
+        outputs.extend((0..self.ty.depth).map(|l| F128::new(((idx >> l) & 1) as u64, 0)));
+        idx
     }
 
     fn witness(&self, _rows: &[Self::Row], _nu: usize) -> SlotWitness {

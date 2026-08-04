@@ -56,12 +56,16 @@ impl GateType for MultGate {
         ])
     }
 
-    fn eval(&self, _inputs: &[F128], _hint: &()) -> (Vec<F128>, ()) {
+    fn eval(&self, _inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> () {
+        let (o, row) = {
         // Values are irrelevant to the wiring cost — the grand product runs
         // over the cell space regardless of what the cells hold. All-zero is
         // a CONSISTENT assignment (every class holds 0, and 0·0 = 0), so the
         // circuit being timed is one a prover could honestly produce.
         (vec![F128::ZERO], ())
+    };
+        outputs.extend_from_slice(&o);
+        row
     }
 
     fn witness(&self, _rows: &[()], nu: usize) -> SlotWitness {

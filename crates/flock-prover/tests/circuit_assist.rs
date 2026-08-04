@@ -143,7 +143,8 @@ impl GateType for AssistLayerGate {
         flock_prover::schedule::TableType::element(self.ty.clone()).with_io_schema(schema)
     }
 
-    fn eval(&self, inputs: &[F128], _hint: &()) -> (Vec<F128>, Self::Row) {
+    fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> Self::Row {
+        let (o, row) = {
         let sparse = assist_sparse_transitions();
         let mut z = vec![F128::ZERO; AL_K];
         z[..AL_IN].copy_from_slice(&inputs[..AL_IN]);
@@ -174,6 +175,9 @@ impl GateType for AssistLayerGate {
             z[AL_OUT0 + s] = z[33 + s] + z[37 + s] + z[41 + s] + z[45 + s];
         }
         (z[AL_OUT0..AL_OUT0 + 4].to_vec(), z)
+    };
+        outputs.extend_from_slice(&o);
+        row
     }
 
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {

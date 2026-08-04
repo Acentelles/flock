@@ -104,7 +104,8 @@ impl GateType for Blake3Gate {
             .with_io_schema(blake3::io_schema())
     }
 
-    fn eval(&self, inputs: &[F128], _hint: &()) -> (Vec<F128>, Self::Row) {
+    fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> Self::Row {
+        let (o, row) = {
         // Schema In-order: cv0, cv1, m0..m3, params.
         let cv = unpack8(inputs[0], inputs[1]);
         let mut m = [0u32; 16];
@@ -122,6 +123,9 @@ impl GateType for Blake3Gate {
             vec![lo[0], lo[1], hi[0], hi[1]],
             (cv, m, counter, block_len, flags),
         )
+    };
+        outputs.extend_from_slice(&o);
+        row
     }
 
     fn witness(&self, _rows: &[Self::Row], _nu: usize) -> SlotWitness {
@@ -824,11 +828,15 @@ impl GateType for ArithGate {
         ])
     }
 
-    fn eval(&self, inputs: &[F128], _hint: &()) -> (Vec<F128>, Self::Row) {
+    fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> Self::Row {
+        let (o, row) = {
         let r: [F128; 4] = [inputs[0], inputs[1], inputs[2], inputs[3]];
         let prod = (r[0] + r[1]) * (r[2] + r[3]);
         let sum = r[0] + r[1] + r[2] + r[3];
         (vec![prod, sum], r)
+    };
+        outputs.extend_from_slice(&o);
+        row
     }
 
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {

@@ -111,9 +111,11 @@ pub trait GateType {
     fn table(&self) -> TableType;
 
     /// Evaluate one gate. `inputs` are the schema's `In` words in schema
-    /// order; returns the `Out` words in schema order, plus the row record.
-    /// `hint` is this instance's advice — see [`Hint`](GateType::Hint).
-    fn eval(&self, inputs: &[F128], hint: &Self::Hint) -> (Vec<F128>, Self::Row);
+    /// order; the `Out` words are PUSHED onto `outputs` in schema order (the
+    /// caller hands a cleared scratch — a fresh Vec per call was a measurable
+    /// slice of the online phase at ~10^5 calls per proof); returns the row
+    /// record. `hint` is this instance's advice — see [`Hint`](GateType::Hint).
+    fn eval(&self, inputs: &[F128], hint: &Self::Hint, outputs: &mut Vec<F128>) -> Self::Row;
 
     /// The slot's committed witness, given every row in instantiation order
     /// and the uniform capacity `nu`. Rows `[rows.len(), 2^nu)` are dummy and
@@ -136,8 +138,8 @@ trait SlotBuild: Any {
     fn n_out(&self) -> usize;
     /// A fresh, empty `Vec<G::Row>` for one online run.
     fn new_rows(&self) -> Box<dyn Any>;
-    /// Evaluate one gate, appending its row.
-    fn push(&self, rows: &mut dyn Any, inputs: &[F128], hint: &dyn Any) -> Vec<F128>;
+    /// Evaluate one gate, appending its row; outputs land on the scratch.
+    fn push(&self, rows: &mut dyn Any, inputs: &[F128], hint: &dyn Any, outputs: &mut Vec<F128>);
     fn witness(&self, rows: &dyn Any, nu: usize) -> SlotWitness;
 }
 
@@ -168,7 +170,7 @@ where
     fn new_rows(&self) -> Box<dyn Any> {
         Box::new(Vec::<G::Row>::new())
     }
-    fn push(&self, rows: &mut dyn Any, inputs: &[F128], hint: &dyn Any) -> Vec<F128> {
+    fn push(&self, rows: &mut dyn Any, inputs: &[F128], hint: &dyn Any, outputs: &mut Vec<F128>) {
         let rows = rows
             .downcast_mut::<Vec<G::Row>>()
             .expect("row store belongs to another slot");
@@ -178,7 +180,7 @@ where
                 std::any::type_name::<G::Hint>()
             )
         });
-        let (outputs, row) = self.gate.eval(inputs, hint);
+        let row = self.gate.eval(inputs, hint, outputs);
         assert_eq!(
             outputs.len(),
             self.n_out,
@@ -187,7 +189,6 @@ where
             self.n_out
         );
         rows.push(row);
-        outputs
     }
     fn witness(&self, rows: &dyn Any, nu: usize) -> SlotWitness {
         self.gate.witness(
@@ -634,6 +635,7 @@ impl CircuitShape {
         // gate call was a measurable slice of the online phase. Step wires
         // are pre-resolved to class roots by `finish`.
         let mut vals: Vec<F128> = Vec::with_capacity(16);
+        let mut outs: Vec<F128> = Vec::with_capacity(16);
         for step in &self.steps {
             vals.clear();
             for &r in &step.inputs {
@@ -651,8 +653,9 @@ impl CircuitShape {
             } else {
                 &unit
             };
-            let outs = self.slots[step.slot].push(rows[step.slot].as_mut(), &vals, hint);
-            for (&r, v) in step.outputs.iter().zip(outs) {
+            outs.clear();
+            self.slots[step.slot].push(rows[step.slot].as_mut(), &vals, hint, &mut outs);
+            for (&r, &v) in step.outputs.iter().zip(&outs) {
                 if set[r] {
                     assert_eq!(
                         values[r], v,
@@ -872,10 +875,11 @@ mod tests {
             ])
         }
 
-        fn eval(&self, inputs: &[F128], _hint: &()) -> (Vec<F128>, Self::Row) {
+        fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> Self::Row {
             let (a, b) = (inputs[0], inputs[1]);
             let c = a * b;
-            (vec![c], (a, b, c))
+            outputs.push(c);
+            (a, b, c)
         }
 
         fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
