@@ -1690,7 +1690,14 @@ fn bit_basis(t: usize) -> F128 {
 /// Inverse of the Moore matrix `M[t][j] = e_t^(2^j)` of the bit basis —
 /// universal (proof- and registry-independent), computed once per process by
 /// Gauss–Jordan over `F` (~2·128³ multiplies). Row-major, `inv[j·128 + t]`.
-fn moore_inverse() -> &'static [F128] {
+///
+/// `pub`: the recursion circuit's family-H arithmetization bakes row `j` as
+/// the constant lane table of its MooreFold gates — the linearized
+/// coefficient is `c_j = γ·Σ_t inv[j·128+t]·eq(r″, t)`, i.e. the MLE of row
+/// `j` at the fold challenge point (see
+/// [`linearized_coefficients_are_moore_row_mles`]) — so both sides must name
+/// the SAME matrix.
+pub fn moore_inverse() -> &'static [F128] {
     use std::sync::OnceLock;
     static MINV: OnceLock<Vec<F128>> = OnceLock::new();
     MINV.get_or_init(|| {
@@ -3038,6 +3045,48 @@ mod tests {
                 &eq_r_dprime,
             );
             assert_eq!(general, binary, "y={y} mismatch");
+        }
+    }
+
+    /// **The family-H closed form the recursion circuit builds on** (route A,
+    /// 2026-08-04): the linearized fold coefficients are MLEs of the constant
+    /// inverse-Moore rows at the fold challenge point,
+    /// `c_j = γ·Σ_t minv[j][t]·eq(r″, t) = γ·M̂inv_j(r″)`, because
+    /// `Φ(bit_basis(t)) = scaled_eq[t]` (a basis vector's fold picks exactly
+    /// one table entry). The circuit's MooreFold gates bake row `j` as
+    /// constant lanes and fold them at the wired `r″` — this test is the pin
+    /// that the native `linearized_coefficients` and that gate compute the
+    /// same values, and that the linearization identity
+    /// `fold_one_slot(x) = Σ_j c_j·x^{2^j}` holds (what V_rs's squaring
+    /// chains replay).
+    #[test]
+    fn linearized_coefficients_are_moore_row_mles() {
+        use crate::zerocheck::univariate_skip::build_eq;
+        let mut rng = Rng::new(0x4D4F_4F52);
+        for round in 0..3 {
+            let rdp: Vec<F128> = (0..7).map(|_| rng.f128()).collect();
+            let gamma = rng.f128();
+            let eq = build_eq(&rdp);
+            let scaled: Vec<F128> = eq.iter().map(|&x| gamma * x).collect();
+            let tables = build_fold_byte_table(&scaled);
+            let coeffs = linearized_coefficients(&tables);
+            let minv = moore_inverse();
+            for (j, &c) in coeffs.iter().enumerate() {
+                let mle = (0..128).fold(F128::ZERO, |a, t| a + minv[j * 128 + t] * eq[t]);
+                assert_eq!(c, gamma * mle, "round {round}: c_{j} is γ·M̂inv_j(r″)");
+            }
+            // The linearization identity on random points — the form the
+            // circuit's squaring chains consume.
+            for _ in 0..4 {
+                let x = rng.f128();
+                let mut acc = F128::ZERO;
+                let mut xp = x;
+                for &c in &coeffs {
+                    acc += c * xp;
+                    xp = xp * xp;
+                }
+                assert_eq!(acc, fold_one_slot(x, &tables), "Σ c_j·x^(2^j) = Φ(x)");
+            }
         }
     }
 
