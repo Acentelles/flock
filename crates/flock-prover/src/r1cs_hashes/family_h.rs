@@ -155,6 +155,94 @@ impl TransposeTable {
     }
 }
 
+impl TransposeTable {
+    /// The union witness for a batch of transpose rows (each row = its 128
+    /// input words), BatchMajor — the [`SwapTable`]-family driver contract.
+    ///
+    /// PREFER [`Self::generate_witness_into`]: this materializes the slot's
+    /// FULL capacity block (`512 · 2^ν` words per buffer — half a GiB at
+    /// ν 16) for a handful of live rows. Kept for shape tests.
+    ///
+    /// [`SwapTable`]: super::merkle_glue::SwapTable
+    pub fn generate_witness_batch_major(
+        rows: &[Vec<F128>],
+        nu: usize,
+    ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
+        use rayon::prelude::*;
+        let per: Vec<[Vec<bool>; 3]> = rows.par_iter().map(|v| Self::build_witness(v)).collect();
+        super::merkle_glue::scatter_zab(&per, Self::k(), Self::USEFUL_BITS, nu)
+    }
+
+    /// The in-place, LIVE-PROPORTIONAL driver: write only the live rows'
+    /// words into the slot's aligned union block
+    /// ([`UnionSlotProverInput::in_place`]'s contract) and return the
+    /// lincheck stripe. This slot's capacity block is `2^{16+ν−7}` words —
+    /// 32 M at ν 16 for TWO live rows — so the full-block paths above are
+    /// exactly the capacity tax this driver elides.
+    ///
+    /// When the destination's `elide_padding_writes` is false (the pooled
+    /// zeroed mode) the dead words must be written as honest zeros; that
+    /// path zero-fills first and is capacity-priced — the padding-dominant
+    /// shapes this slot ships in never take it.
+    ///
+    /// The stripe is allocated lazily (`vec![0u8; ..]` gets untouched zero
+    /// pages) and only the live groups are written; the union lincheck reads
+    /// declared counts only, so the tail stays untouched.
+    ///
+    /// [`UnionSlotProverInput::in_place`]: ../prover/struct.UnionSlotProverInput.html
+    pub fn generate_witness_into(
+        rows: &[Vec<F128>],
+        dst: flock_core::union::SlotWitnessDest<'_>,
+    ) -> Vec<u8> {
+        let k = Self::k();
+        let words_per_block = k / 128;
+        assert_eq!(dst.z.len() % words_per_block, 0, "aligned slot block");
+        let n_total = dst.z.len() / words_per_block;
+        assert!(rows.len() <= n_total, "live rows fit the capacity");
+        if !dst.elide_padding_writes {
+            use rayon::prelude::*;
+            for buf in [&mut *dst.z, &mut *dst.a, &mut *dst.b] {
+                buf.par_chunks_mut(1 << 16).for_each(|c| c.fill(F128::ZERO));
+            }
+        }
+        let nu = n_total.trailing_zeros() as usize;
+        let mut stripe = vec![0u8; (n_total / 8) * k];
+        for (i, v) in rows.iter().enumerate() {
+            let [pz, pa, pb] = Self::build_witness(v);
+            for w in 0..words_per_block {
+                let addr = (w << nu) + i;
+                dst.z[addr] = pack_bits(&pz, w * 128);
+                dst.a[addr] = pack_bits(&pa, w * 128);
+                dst.b[addr] = pack_bits(&pb, w * 128);
+            }
+            let chunk = &mut stripe[(i / 8) * k..(i / 8 + 1) * k];
+            for c in 0..Self::USEFUL_BITS {
+                if pz[c] {
+                    chunk[c] |= 1u8 << (i % 8);
+                }
+            }
+        }
+        stripe
+    }
+}
+
+/// The 128 bools at `[base, base+128)` as one `F128` (the
+/// `merkle_glue::pack_word` contract, local so the scatter helper stays
+/// private there).
+fn pack_bits(bits: &[bool], base: usize) -> F128 {
+    let mut lo = 0u64;
+    let mut hi = 0u64;
+    for t in 0..64 {
+        if bits[base + t] {
+            lo |= 1u64 << t;
+        }
+        if bits[base + 64 + t] {
+            hi |= 1u64 << t;
+        }
+    }
+    F128 { lo, hi }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

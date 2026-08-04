@@ -4959,7 +4959,37 @@ fn mvp7_real_query_phase() {
 
 // ---------------------------------------------------------------------------
 
+use flock_prover::r1cs_hashes::family_h::TransposeTable;
 use flock_prover::r1cs_hashes::merkle_glue::{BitSpreadTable, SwapInput, SwapTable};
+
+/// The 128×128 bit-matrix transpose of one RS region's absorbed `s_hat_v`
+/// words — family-H route A step (ii). All 256 words wired: binding the
+/// inputs to the stream words IS the content, and the outputs feed the
+/// element-side eq dot (cross-class copy is the identity).
+struct TransposeGate {
+    nu: usize,
+}
+
+impl GateType for TransposeGate {
+    type Row = Vec<F128>;
+    type Hint = ();
+
+    fn table(&self) -> TableType {
+        TableType::from_block_r1cs(&TransposeTable::build_block_r1cs(self.nu))
+            .with_io_schema(TransposeTable::io_schema())
+    }
+
+    fn eval(&self, inputs: &[F128], _hint: &()) -> (Vec<F128>, Vec<F128>) {
+        (
+            flock_core::pcs::ring_switch::tensor_algebra_transpose(inputs),
+            inputs.to_vec(),
+        )
+    }
+
+    fn witness(&self, _rows: &[Self::Row], _nu: usize) -> SlotWitness {
+        SlotWitness::DeferredToRows
+    }
+}
 
 /// One Merkle level's conditional swap. The sibling is a [`GateType::Hint`] —
 /// it is not word-aligned-wireable in the composite and nothing else reads it
@@ -6536,6 +6566,9 @@ struct LeafOuter {
     b3_slot: usize,
     swap_slot: usize,
     spread_slot: usize,
+    /// The family-H transpose type (registry slot, r1cs) — present on NODE
+    /// outers (their real-child emitters create it), absent on leaf outers.
+    trans: Option<(usize, flock_core::r1cs::BlockR1cs)>,
 }
 
 /// mvp9's WHOLE construction as the shared builder the swap consumes: the
@@ -8174,6 +8207,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             b3_slot,
             swap_slot,
             spread_slot,
+            trans: None,
         }
     }
 }
@@ -8303,6 +8337,9 @@ impl<'p> RealTape<'p> {
             (lo.swap_slot, lo.swap_r1cs.csc_lincheck_circuit()),
             (lo.spread_slot, lo.spread_r1cs.csc_lincheck_circuit()),
         ];
+        if let Some((sl, r)) = &lo.trans {
+            lcs_ord.push((*sl, r.csc_lincheck_circuit()));
+        }
         lcs_ord.sort_by_key(|(i, _)| *i);
         let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
             lcs_ord.into_iter().map(|(_, cc)| cc).collect();
@@ -9494,6 +9531,36 @@ fn emit_real_child_region(
     let rhs_v_w = sb.gate(cs.macs, &[zw, wv(inner_pd_i.q_v), v_w])[0];
     sb.connect(runw, rhs_v_w);
 
+    // ---- ROUTE A step (ii): rs_half IN-CIRCUIT via the transpose table ----
+    // Per RS region, one TransposeGate row turns the 128 absorbed s_hat_v
+    // stream words into their bit transpose (both sides wired — the binding
+    // IS the content); the dot against the eq(r″) doubling build and the
+    // γ-combination are MAC chains; the sum CONNECTS to the rs_half advice
+    // public, whose checker re-exposure step (iv) deletes.
+    let trans = match cs.trans {
+        Some(s) => s,
+        None => {
+            let s = sb.slot(TransposeGate { nu: cs.nu2 });
+            cs.trans = Some(s);
+            s
+        }
+    };
+    let mut rsh_derived = zw;
+    for (k, &(sv, rfin, _)) in rt.rs_recs.iter().enumerate() {
+        let v_in: Vec<Wire> = (0..128).map(|i| wv(sv + i)).collect();
+        let u_out = sb.gate(trans, &v_in);
+        let sqr = &trace.squeezes[rfin];
+        let rdp_w: Vec<Wire> = (0..7).map(|j| outs[sqr[j / 4]][j % 4]).collect();
+        let eq_w = emit_eq_prefix(sb, cs.macs, &rdp_w, 128, zw, ow);
+        let mut dot = zw;
+        for b in 0..128 {
+            dot = sb.gate(cs.macs, &[dot, eq_w[b], u_out[b]])[0];
+        }
+        let g_w = outs[trace.squeezes[rt.rs_gam_fin + k][0]][0];
+        rsh_derived = sb.gate(cs.macs, &[rsh_derived, g_w, dot])[0];
+    }
+    sb.connect(rsh_derived, rsh_w);
+
     // The ligerito SPINE: start gamma'·q_eval, eval/build per fold,
     // intro-folds consuming the query phase's accumulator wires.
     let gpw = outs[trace.squeezes[inner_pd_i.fin][0]][0];
@@ -10454,6 +10521,9 @@ fn mvp10_leaf_outer_inner_tape() {
     let spread_ty2 = BitSpreadTable::new(rt.spread_w);
     let spread_r1cs2 = spread_ty2.build_block_r1cs(nu2);
     let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
+    let trans_sl2 = cs.trans.expect("the real child emitter creates the transpose slot");
+    let trans_r1cs2 = TransposeTable::build_block_r1cs(nu2);
+    let trans_lc2 = trans_r1cs2.csc_lincheck_circuit();
     let mut bslots: Vec<(usize, UnionSlotProverInput)> = vec![
         (
             shape2.registry_slot(cs.q.b3),
@@ -10482,6 +10552,17 @@ fn mvp10_leaf_outer_inner_tape() {
                 spread_lc2,
             ),
         ),
+        (
+            shape2.registry_slot(trans_sl2),
+            {
+                let trans_rows: Vec<Vec<F128>> =
+                    built2.rows::<TransposeGate>(trans_sl2).to_vec();
+                UnionSlotProverInput::in_place(
+                    move |dst| TransposeTable::generate_witness_into(&trans_rows, dst),
+                    trans_lc2,
+                )
+            },
+        ),
     ];
     bslots.sort_by_key(|(i, _)| *i);
     let mut el_ord: Vec<(usize, Vec<F128>)> = cs
@@ -10504,6 +10585,7 @@ fn mvp10_leaf_outer_inner_tape() {
         (shape2.registry_slot(cs.q.b3), b3_lc2),
         (shape2.registry_slot(cs.q.swap), swap_lc2),
         (shape2.registry_slot(cs.q.spread), spread_lc2),
+        (shape2.registry_slot(trans_sl2), trans_lc2),
     ];
     lco.sort_by_key(|(i, _)| *i);
     let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
@@ -12054,6 +12136,12 @@ struct ChildSlots {
     alslot: flock_core::circuit::builder::SlotId,
     le: Vec<(usize, flock_core::circuit::builder::SlotId)>,
     resid: Vec<(usize, flock_core::circuit::builder::SlotId)>,
+    /// The row capacity the boolean gate constructors need (lazy slots).
+    nu2: usize,
+    /// The family-H transpose slot — LAZY (only the REAL child emitters
+    /// create it; minimal children keep the mvp10 checker posture), so
+    /// registries without it are unchanged.
+    trans: Option<flock_core::circuit::builder::SlotId>,
 }
 
 impl ChildSlots {
@@ -12078,6 +12166,8 @@ impl ChildSlots {
             // emit_residual_region's close-out rows land on the same slot
             // instead of registering a duplicate type.
             resid: vec![(600, macs)],
+            nu2,
+            trans: None,
         }
     }
 
@@ -15078,6 +15168,9 @@ fn mvp11_swap_children_fold_scale() {
         (lo.swap_slot, lo.swap_r1cs.csc_lincheck_circuit()),
         (lo.spread_slot, lo.spread_r1cs.csc_lincheck_circuit()),
     ];
+    if let Some((sl, r)) = &lo.trans {
+        lcs_ord.push((*sl, r.csc_lincheck_circuit()));
+    }
     lcs_ord.sort_by_key(|(i, _)| *i);
     let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
         lcs_ord.iter().map(|&(_, c)| c).collect();
@@ -15116,6 +15209,9 @@ fn mvp11_swap_children_fold_scale() {
         (lo.swap_slot, (&lo.swap_r1cs.a_0, &lo.swap_r1cs.b_0)),
         (lo.spread_slot, (&lo.spread_r1cs.a_0, &lo.spread_r1cs.b_0)),
     ];
+    if let Some((sl, r)) = &lo.trans {
+        mats_ord.push((*sl, (&r.a_0, &r.b_0)));
+    }
     mats_ord.sort_by_key(|&(i, _)| i);
     let mats: Vec<_> = mats_ord.iter().map(|&(_, m)| m).collect();
     let el_types: Vec<_> = registry
@@ -15513,6 +15609,9 @@ fn build_node_outer(
         (lo0.swap_slot, lo0.swap_r1cs.csc_lincheck_circuit()),
         (lo0.spread_slot, lo0.spread_r1cs.csc_lincheck_circuit()),
     ];
+    if let Some((sl, r)) = &lo0.trans {
+        lcs_ord.push((*sl, r.csc_lincheck_circuit()));
+    }
     lcs_ord.sort_by_key(|(i, _)| *i);
     let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
         lcs_ord.iter().map(|&(_, c)| c).collect();
@@ -15521,6 +15620,9 @@ fn build_node_outer(
         (lo0.swap_slot, (&lo0.swap_r1cs.a_0, &lo0.swap_r1cs.b_0)),
         (lo0.spread_slot, (&lo0.spread_r1cs.a_0, &lo0.spread_r1cs.b_0)),
     ];
+    if let Some((sl, r)) = &lo0.trans {
+        mats_ord.push((*sl, (&r.a_0, &r.b_0)));
+    }
     mats_ord.sort_by_key(|&(i, _)| i);
     let mats: Vec<_> = mats_ord.iter().map(|&(_, m)| m).collect();
     let el_types: Vec<_> = registry
@@ -16023,6 +16125,9 @@ fn build_node_outer(
         let spread_ty2 = BitSpreadTable::new(rt0.spread_w.max(rt1.spread_w));
         let spread_r1cs2 = spread_ty2.build_block_r1cs(nu2);
         let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
+        let trans_sl2 = cs.trans.expect("the real child emitter creates the transpose slot");
+        let trans_r1cs2 = TransposeTable::build_block_r1cs(nu2);
+        let trans_lc2 = trans_r1cs2.csc_lincheck_circuit();
         let mut bslots: Vec<(usize, UnionSlotProverInput)> = vec![
             (
                 shape2.registry_slot(cs.q.b3),
@@ -16054,6 +16159,17 @@ fn build_node_outer(
                     spread_lc2,
                 ),
             ),
+            (
+                shape2.registry_slot(trans_sl2),
+                {
+                    let trans_rows: Vec<Vec<F128>> =
+                        built2.rows::<TransposeGate>(trans_sl2).to_vec();
+                    UnionSlotProverInput::in_place(
+                        move |dst| TransposeTable::generate_witness_into(&trans_rows, dst),
+                        trans_lc2,
+                    )
+                },
+            ),
         ];
         bslots.sort_by_key(|(i, _)| *i);
         let mut el_ord: Vec<(usize, Vec<F128>)> = cs
@@ -16076,6 +16192,7 @@ fn build_node_outer(
             (shape2.registry_slot(cs.q.b3), b3_lc2),
             (shape2.registry_slot(cs.q.swap), swap_lc2),
             (shape2.registry_slot(cs.q.spread), spread_lc2),
+            (shape2.registry_slot(trans_sl2), trans_lc2),
         ];
         lco.sort_by_key(|(i, _)| *i);
         let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
@@ -16149,6 +16266,7 @@ fn build_node_outer(
             deferred_ms,
             bincode::serialize(&oproof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
         );
+        let trans_reg = shape2.registry_slot(trans_sl2);
         (
             LeafOuter {
                 public: built2.public.clone(),
@@ -16162,6 +16280,7 @@ fn build_node_outer(
                 b3_slot: b3_slot2,
                 swap_slot: swap_slot2,
                 spread_slot: spread_slot2,
+                trans: Some((trans_reg, trans_r1cs2)),
             },
             acc_v,
         )
@@ -16245,6 +16364,9 @@ fn mvp12_recursion_tower() {
             (l0.swap_slot, (&l0.swap_r1cs.a_0, &l0.swap_r1cs.b_0)),
             (l0.spread_slot, (&l0.spread_r1cs.a_0, &l0.spread_r1cs.b_0)),
         ];
+        if let Some((sl, r)) = &l0.trans {
+            v.push((*sl, (&r.a_0, &r.b_0)));
+        }
         v.sort_by_key(|&(i, _)| i);
         v.into_iter().map(|(_, m)| m).collect::<Vec<_>>()
     };
@@ -16275,6 +16397,9 @@ fn mvp12_recursion_tower() {
             (n0.swap_slot, (&n0.swap_r1cs.a_0, &n0.swap_r1cs.b_0)),
             (n0.spread_slot, (&n0.spread_r1cs.a_0, &n0.spread_r1cs.b_0)),
         ];
+        if let Some((sl, r)) = &n0.trans {
+            v.push((*sl, (&r.a_0, &r.b_0)));
+        }
         v.sort_by_key(|&(i, _)| i);
         v.into_iter().map(|(_, m)| m).collect::<Vec<_>>()
     };
