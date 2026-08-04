@@ -5489,6 +5489,73 @@ fn cap_wires(
         .collect()
 }
 
+/// ROUND 2 — the H(publics) region: re-derive the child's publics
+/// commitment ([`flock_core::union::publics_digest`]) from WITNESS wires
+/// and CONNECT it to the absorbed digest payload words.
+///
+/// Under the v2 statement binding the child's transcript absorbs 32 bytes,
+/// not the segment, so the child's public words enter the PARENT as
+/// witness; this region is what makes the digest binding structural: 1 KiB
+/// chunk chains per leaf (the emit_opening chunk shape, pinned == the
+/// native `hash_leaf`), LEFT-FOLDED through PARENT rows (== `hash_pair`) —
+/// exactly the `publics_digest` chain, ending in an output-output connect
+/// with no gate consumers (no cycles, no checker item). Returns the
+/// public-word wires — the future consumers' handle (the wiring
+/// recombination's publics-MLE evaluation is the recorded upgrade).
+fn emit_publics_hash(
+    sb: &mut ShapeBuilder,
+    s: CollapsedSlots,
+    iv: [Wire; 2],
+    child_public: &[F128],
+    digest_w: [Wire; 2],
+    vals: &mut Vec<F128>,
+    consts: &mut Vec<(F128, Wire)>,
+) -> Vec<Wire> {
+    assert!(!child_public.is_empty(), "a circuit child has publics");
+    let pw: Vec<Wire> = child_public
+        .iter()
+        .map(|v| {
+            vals.push(*v);
+            sb.input()
+        })
+        .collect();
+    let pad_w = cw(sb, vals, consts, F128::ZERO);
+    let mut cv: Option<[Wire; 2]> = None;
+    for leaf in pw.chunks(64) {
+        let blocks = leaf.len().div_ceil(4);
+        let mut lcv = iv;
+        for i in 0..blocks {
+            let mut flags = 0u32;
+            if i == 0 {
+                flags |= CHUNK_START;
+            }
+            if i + 1 == blocks {
+                flags |= CHUNK_END;
+            }
+            let words = (leaf.len() - 4 * i).min(4);
+            let params = cw(sb, vals, consts, pack_params(0, 16 * words as u32, flags));
+            let mw = |j: usize| if j < words { leaf[4 * i + j] } else { pad_w };
+            let out = sb.gate(s.b3, &[lcv[0], lcv[1], mw(0), mw(1), mw(2), mw(3), params]);
+            lcv = [out[0], out[1]];
+        }
+        cv = Some(match cv {
+            None => lcv,
+            Some(prev) => {
+                let params = cw(sb, vals, consts, pack_params(0, 64, PARENT));
+                let out = sb.gate(
+                    s.b3,
+                    &[iv[0], iv[1], prev[0], prev[1], lcv[0], lcv[1], params],
+                );
+                [out[0], out[1]]
+            }
+        });
+    }
+    let root = cv.expect("at least one leaf");
+    sb.connect(root[0], digest_w[0]);
+    sb.connect(root[1], digest_w[1]);
+    pw
+}
+
 /// Emit the whole QUERY PHASE — every level's Merkle openings against the
 /// absorbed caps, plus the leaf-eval accumulators — as circuit rows.
 ///
@@ -8765,6 +8832,9 @@ impl<'p> RealTape<'p> {
                 r_pt,
             }
         };
+        // ROUND 2: the H(publics) region's rows — a chunk chain per 1 KiB
+        // leaf of the child's public segment plus the left-fold parents.
+        let h_rows = lo.public.len().div_ceil(4) + 2 * lo.public.len().div_ceil(64);
 
         // ---- the chain materials ----
         let stream = t_shape.stream_words(domain);
@@ -8787,6 +8857,7 @@ impl<'p> RealTape<'p> {
             chain.finish()
         };
         let b3_rows = trace.rows.len()
+            + h_rows
             + geo
                 .iter()
                 .map(|g| (g.row_words.div_ceil(4) + g.depth) * g.q + (1usize << g.c) - 1)
@@ -9600,6 +9671,18 @@ fn emit_real_child_region(
         })
         .collect();
 
+    // ---- ROUND 2: the H(publics) region (v2 statement binding) ----
+    // Payload 4 of the circuit binding is the 32-byte publics digest; the
+    // child's public words themselves are witness, bound here.
+    {
+        let pays = payload_words(stream);
+        assert_eq!(pays[4].len(), 2, "the publics digest payload is 32 bytes");
+        let dw = [
+            ww[pays[4][0]].expect("digest word wired"),
+            ww[pays[4][1]].expect("digest word wired"),
+        ];
+        emit_publics_hash(sb, cs.q, iv2, &rt.lo.public, dw, vals, &mut consts);
+    }
     let cap_w = cap_wires(stream, &ww, &rt.cap_pays);
     let (to_publish, level_accs) = emit_query_phase(
         sb,
@@ -11413,6 +11496,10 @@ impl<'p> ChildTape<'p> {
         assert!(matches!(ops[mp_i], Op::SqueezeScalar), "mp gamma op");
         let mg_fin = fin_at(mp_i);
         let (_, mg_c) = vc_at(mp_i);
+        // ROUND 2: the H(publics) region's rows — a chunk chain per 1 KiB
+        // leaf of the child's public segment plus the left-fold parents.
+        let n_pub_i = inner.built.witness.public.len();
+        let h_rows = n_pub_i.div_ceil(4) + 2 * n_pub_i.div_ceil(64);
 
         // ---- the chain materials ----
         let stream = t_shape.stream_words(domain);
@@ -11453,6 +11540,7 @@ impl<'p> ChildTape<'p> {
         );
         let (geo, native_sums) = level_geometry(&levels, &lvl_src, &chals, HashKind::Blake3);
         let b3_rows = trace.rows.len()
+            + h_rows
             + geo
                 .iter()
                 .map(|g| (g.row_words.div_ceil(4) + g.depth) * g.q + (1usize << g.c) - 1)
@@ -12140,6 +12228,24 @@ fn emit_child_region(
         &mut consts,
         &ct.pub_payloads,
     );
+    // ---- ROUND 2: the H(publics) region (v2 statement binding) ----
+    {
+        let pays = payload_words(stream);
+        assert_eq!(pays[4].len(), 2, "the publics digest payload is 32 bytes");
+        let dw = [
+            ww[pays[4][0]].expect("digest word wired"),
+            ww[pays[4][1]].expect("digest word wired"),
+        ];
+        emit_publics_hash(
+            sb,
+            cs.q,
+            iv2,
+            &ct.inner.built.witness.public,
+            dw,
+            vals,
+            &mut consts,
+        );
+    }
     let cap_w = cap_wires(stream, &ww, &ct.cap_pays);
     let (to_publish, level_accs) = emit_query_phase(
         sb,

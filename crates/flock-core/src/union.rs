@@ -592,7 +592,13 @@ impl<'r> UnionInstance<'r> {
     /// [`Self::bind_statement`] plus the CIRCUIT half of the statement: the
     /// circuit digest ([`crate::circuit::Circuit::digest`], which covers the
     /// gate counts, the IO schemas through the registry digest, the wiring and
-    /// the public layout) and the public words themselves.
+    /// the public layout) and a 32-byte COMMITMENT to the public words
+    /// ([`publics_digest`]) — v2 absorbs the digest, not the words, so a
+    /// node's transcript (and hence its circuit shape) no longer scales with
+    /// its public segment. A recursion parent re-derives the digest
+    /// in-circuit from witness wires and connects it to the absorbed words;
+    /// the publics' length is fixed by the circuit digest (the shape's
+    /// public layout), so the digest binds content alone.
     ///
     /// Absorbed before any challenge, and in particular before the wiring
     /// GKR — which squeezes `α, β` at entry, so the multiset statement must
@@ -610,14 +616,9 @@ impl<'r> UnionInstance<'r> {
         public: &[F128],
     ) {
         self.bind_statement(challenger, commitment);
-        challenger.observe_label(b"flock-circuit-stmt-v1");
+        challenger.observe_label(b"flock-circuit-stmt-v2");
         challenger.observe_bytes(circuit_digest);
-        let mut words_le = Vec::with_capacity(16 * public.len());
-        for w in public {
-            words_le.extend_from_slice(&w.lo.to_le_bytes());
-            words_le.extend_from_slice(&w.hi.to_le_bytes());
-        }
-        challenger.observe_bytes(&words_le);
+        challenger.observe_bytes(&publics_digest(public));
     }
 
     // -----------------------------------------------------------------------
@@ -979,6 +980,41 @@ pub enum WitnessBufMode {
     /// NEVER read), so their contents are unobservable. Drivers elide
     /// all zero-valued writes; buffers return to the pool resident.
     PooledDirty,
+}
+
+/// The 32-byte commitment to a circuit's public segment that
+/// [`UnionInstance::bind_statement_circuit`] absorbs (v2): the words'
+/// 16-byte-LE byte string, split into 1 KiB chunks, each hashed as a
+/// BLAKE3 chunk leaf ([`crate::merkle::hash_leaf`] — one chunk, counter 0)
+/// and LEFT-FOLDED through [`crate::merkle::hash_pair`]:
+/// `cv = h(...h(h(L0, L1), L2)..., Ln)`. A chain, not a tree — nothing is
+/// ever opened, both sides recompute in full — and both pieces are exactly
+/// the compressions a circuit's BLAKE3 gate rows replay (the collapsed
+/// pins), so a recursion parent re-derives the digest from witness wires
+/// with no new gate types. The last chunk hashes at its TRUE byte length
+/// (publics are whole words, so a partial BLOCK at most — the gate's free
+/// `b` input); the length itself is bound by the circuit digest's public
+/// layout, absorbed alongside.
+pub fn publics_digest(public: &[F128]) -> [u8; 32] {
+    use crate::merkle::{HashKind, hash_leaf, hash_pair};
+    // An empty segment digests to the zero string: hash_leaf rejects empty
+    // input (a BLAKE3 empty message must be root-flagged), the length is
+    // statement-bound through the circuit digest, and equating it with a
+    // nonempty segment's digest would need a BLAKE3 preimage of zero.
+    if public.is_empty() {
+        return [0u8; 32];
+    }
+    let mut bytes = Vec::with_capacity(16 * public.len());
+    for w in public {
+        bytes.extend_from_slice(&w.lo.to_le_bytes());
+        bytes.extend_from_slice(&w.hi.to_le_bytes());
+    }
+    let mut chunks = bytes.chunks(1024);
+    let mut cv = hash_leaf(chunks.next().expect("nonempty"), HashKind::Blake3);
+    for chunk in chunks {
+        cv = hash_pair(&cv, &hash_leaf(chunk, HashKind::Blake3), HashKind::Blake3);
+    }
+    cv
 }
 
 /// A per-slot destination view into the padded union witness buffers: the
