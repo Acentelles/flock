@@ -2221,10 +2221,52 @@ fn mvp5_all_levels_query_phase() {
 // MVP-7: the query phase of a REAL inner proof
 // ---------------------------------------------------------------------------
 
-/// Replay a recorded transcript's FS chain into the blake3 slot: stream words
-/// become public inputs, squeeze rows chain off prior outputs. Returns the
-/// per-row output wires; `trace.squeezes[fin]` indexes into them. (The same
-/// block lives inline in `mvp6`; factored here for the real-transcript path.)
+/// A shared-constant public: one public input PER DISTINCT VALUE, wired to
+/// every use through copy constraints — the `zw`/`ow` pattern generalized.
+/// The per-row structural words (params, zero pads) collapse from one
+/// public per ROW to one per VALUE; being few and public they are also the
+/// auditable surface the checker contract pins (the fixed-shape statement).
+fn cw(sb: &mut ShapeBuilder, vals: &mut Vec<F128>, consts: &mut Vec<(F128, Wire)>, v: F128) -> Wire {
+    match consts.iter().find(|&&(x, _)| x == v) {
+        Some(&(_, w)) => w,
+        None => {
+            vals.push(v);
+            let w = sb.public_input();
+            consts.push((v, w));
+            w
+        }
+    }
+}
+
+/// Which byte payloads of a tape stay PUBLIC under the witness/public
+/// split: every `observe_bytes` payload — the STATEMENT surfaces (registry
+/// digest, counts, caps, a child's circuit digest + public words) and
+/// nothing else. PoW nonces share the payload counter but are witness (their
+/// wires publish separately where the grinding checker reads them).
+fn bytes_payload_mask(ops: &[flock_core::transcript_record::TranscriptOp]) -> Vec<bool> {
+    use flock_core::transcript_record::TranscriptOp as Op;
+    let mut v = Vec::new();
+    for op in ops {
+        match op {
+            Op::ObserveBytes(_) => v.push(true),
+            Op::Pow { .. } => v.push(false),
+            _ => {}
+        }
+    }
+    v
+}
+
+/// Replay a recorded transcript's FS chain into the blake3 slot; squeeze
+/// rows chain off prior outputs. Returns the per-row output wires
+/// (`trace.squeezes[fin]` indexes into them) and the per-stream-word wires.
+///
+/// **The witness/public split** (the recursion-composition fix): the child
+/// PROOF BODY is existentially quantified — its stream words enter as
+/// WITNESS inputs, bound in-circuit by the chain compressions and the
+/// region gates that consume them, never read natively. What stays public:
+/// the byte payloads `pub_payloads` selects (the STATEMENT: digests,
+/// counts, caps — caps stay checker-read until the in-circuit cap select),
+/// domain constants, and the shared structural constants through `consts`.
 fn emit_fs_chain(
     sb: &mut ShapeBuilder,
     b3: flock_core::circuit::builder::SlotId,
@@ -2233,7 +2275,10 @@ fn emit_fs_chain(
     stream: &flock_core::transcript_record::Stream,
     bytes: &[u8],
     vals: &mut Vec<F128>,
+    consts: &mut Vec<(F128, Wire)>,
+    pub_payloads: &[bool],
 ) -> (Vec<Vec<Wire>>, Vec<Option<Wire>>) {
+    use flock_core::transcript_record::StreamWord;
     use flock_prover::r1cs_hashes::fs_chain::CvSource;
     let mut word_wire: Vec<Option<Wire>> = vec![None; stream.words.len()];
     let mut outs: Vec<Vec<Wire>> = Vec::with_capacity(trace.rows.len());
@@ -2241,8 +2286,7 @@ fn emit_fs_chain(
     for (i, row) in trace.rows.iter().enumerate() {
         let (_, _, counter, blen, flags) = *row;
         let link = trace.links[i];
-        vals.push(pack_params(counter, blen, flags));
-        let params = sb.public_input();
+        let params = cw(sb, vals, consts, pack_params(counter, blen, flags));
         if let Some(root) = link.repeats {
             let s = gate_in[root];
             let g_in = [s[0], s[1], s[2], s[3], s[4], s[5], params];
@@ -2269,8 +2313,7 @@ fn emit_fs_chain(
                 for (j, slot) in m.iter_mut().enumerate() {
                     let wi = base + j;
                     *slot = if j >= real || wi >= stream.words.len() {
-                        vals.push(F128::ZERO);
-                        sb.public_input()
+                        cw(sb, vals, consts, F128::ZERO)
                     } else {
                         match word_wire[wi] {
                             Some(w) => w,
@@ -2283,7 +2326,14 @@ fn emit_fs_chain(
                                         bytes[wi * 16 + 8..wi * 16 + 16].try_into().unwrap(),
                                     ),
                                 ));
-                                let w = sb.public_input();
+                                let public = match &stream.words[wi] {
+                                    StreamWord::Bytes { payload, .. } => {
+                                        pub_payloads.get(*payload).copied().unwrap_or(true)
+                                    }
+                                    StreamWord::Const(_) => true,
+                                    StreamWord::Value(_) => false,
+                                };
+                                let w = if public { sb.public_input() } else { sb.input() };
                                 word_wire[wi] = Some(w);
                                 w
                             }
@@ -4376,7 +4426,19 @@ fn mvp7_real_query_phase() {
     let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
     vals.extend_from_slice(&iv_w);
     let iv = [sb.public_input(), sb.public_input()];
-    let (outs, word_wire) = emit_fs_chain(&mut sb, slots.b3, iv, &trace, &stream, &bytes, &mut vals);
+    let mut consts: Vec<(F128, Wire)> = Vec::new();
+    let pub_payloads = bytes_payload_mask(t_shape.ops());
+    let (outs, word_wire) = emit_fs_chain(
+        &mut sb,
+        slots.b3,
+        iv,
+        &trace,
+        &stream,
+        &bytes,
+        &mut vals,
+        &mut consts,
+        &pub_payloads,
+    );
     // Observed-value index -> absorbed-stream word index, for wiring the
     // sumcheck messages (they are absorbed proof scalars, so their wires
     // already exist as the chain's block inputs).
@@ -4407,6 +4469,7 @@ fn mvp7_real_query_phase() {
         &outs,
         &chals,
         &mut vals,
+        &mut consts,
         &mut hints,
     );
 
@@ -5388,6 +5451,7 @@ fn emit_query_phase(
     outs: &[Vec<Wire>],
     chals: &[F128],
     vals: &mut Vec<F128>,
+    consts: &mut Vec<(F128, Wire)>,
     hints: &mut Vec<[u32; SLOT_WORDS]>,
 ) -> (Vec<(Vec<Wire>, Vec<(Wire, [Wire; 2])>)>, Vec<Wire>) {
     use flock_core::lincheck::build_eq_table;
@@ -5412,13 +5476,11 @@ fn emit_query_phase(
             let v_hi: Vec<F128> = lvl.fold_chs[le_vars..].iter().map(|&i| chals[i]).collect();
             build_eq_table(&v_hi)
         };
-        vals.push(F128::ZERO);
-        let mut acc = sb.public_input();
+        let mut acc = cw(sb, vals, consts, F128::ZERO);
         // Zero wire for the fold's known-zero top lanes (only declared when
         // the committed row is narrower than the fold).
         let pad_w = if g.row_words < g.lanes {
-            vals.push(F128::ZERO);
-            Some(sb.public_input())
+            Some(cw(sb, vals, consts, F128::ZERO))
         } else {
             None
         };
@@ -5427,7 +5489,7 @@ fn emit_query_phase(
             vals.extend_from_slice(&rows[k]);
             let leaf_w: Vec<Wire> = (0..g.row_words).map(|_| sb.input()).collect();
             let cw = outs[sqq[k / 4]][k % 4];
-            let cv = emit_opening(sb, slots, iv, &leaf_w, cw, g.depth, g.c, vals);
+            let cv = emit_opening(sb, slots, iv, &leaf_w, cw, g.depth, g.c, Some(consts), vals);
             opens.push((cw, cv));
             hints.extend(paths[k * g.path..(k + 1) * g.path].iter().map(hash_to_digest));
             // The fold reads the full `2^folds` domain: the committed words
@@ -5875,6 +5937,7 @@ fn emit_opening(
     index_w: Wire,
     depth: usize,
     cap_depth: usize,
+    mut consts: Option<&mut Vec<(F128, Wire)>>,
     pubs: &mut Vec<F128>,
 ) -> [Wire; 2] {
     // A leaf need NOT be a whole number of 64-byte blocks: a mixed circuit
@@ -5889,11 +5952,19 @@ fn emit_opening(
     assert!(!leaf_w.is_empty(), "a leaf has data");
     let blocks = leaf_w.len().div_ceil(4);
     assert!(blocks <= 16, "a leaf is one BLAKE3 chunk (<= 1024 bytes)");
+    let mut shared = |sb: &mut ShapeBuilder, pubs: &mut Vec<F128>, v: F128| -> Wire {
+        match consts.as_deref_mut() {
+            Some(c) => cw(sb, pubs, c, v),
+            None => {
+                pubs.push(v);
+                sb.public_input()
+            }
+        }
+    };
     let pad_w = if leaf_w.len() % 4 == 0 {
         None
     } else {
-        pubs.push(F128::ZERO);
-        Some(sb.public_input())
+        Some(shared(sb, pubs, F128::ZERO))
     };
 
     // The index word's bits, one per level.
@@ -5911,8 +5982,7 @@ fn emit_opening(
         }
         // The final block carries only the bytes that remain.
         let words = (leaf_w.len() - 4 * i).min(4);
-        pubs.push(pack_params(0, 16 * words as u32, flags));
-        let params = sb.public_input();
+        let params = shared(sb, pubs, pack_params(0, 16 * words as u32, flags));
         let mw = |j: usize| -> Wire {
             if j < words {
                 leaf_w[4 * i + j]
@@ -5936,8 +6006,7 @@ fn emit_opening(
     // `cap_depth = 0` is the uncapped statement, terminal = root.
     for l in 0..(depth - cap_depth) {
         let sw = sb.gate_hinted(s.swap, &[bits[l], cv[0], cv[1]]);
-        pubs.push(pack_params(0, 64, PARENT));
-        let params = sb.public_input();
+        let params = shared(sb, pubs, pack_params(0, 64, PARENT));
         let out = sb.gate(s.b3, &[iv[0], iv[1], sw[0], sw[1], sw[2], sw[3], params]);
         cv = [out[0], out[1]];
     }
@@ -5988,7 +6057,7 @@ fn collapsed_opening_matches_the_composite() {
             let leaf_w: Vec<Wire> = (0..4 * blocks).map(|_| sb.input()).collect();
             let index_w = sb.input();
             roots.push(emit_opening(
-                &mut sb, slots, iv, &leaf_w, index_w, depth, 0, &mut pubs,
+                &mut sb, slots, iv, &leaf_w, index_w, depth, 0, None, &mut pubs,
             ));
             let leaf = tree.leaf(pos);
             leaf_vals.extend((0..4 * blocks).map(|w| leaf_word(leaf, 16 * w)));
@@ -6312,7 +6381,7 @@ fn mvp6_all_levels_collapsed() {
 
             // The challenge word IS the index word — no masking gadget.
             let cw = outs[sq[k / 4]][k % 4];
-            let cv = emit_opening(&mut sb, slots, iv, &leaf_w, cw, l.depth, c, &mut vals);
+            let cv = emit_opening(&mut sb, slots, iv, &leaf_w, cw, l.depth, c, None, &mut vals);
             opens.push((cw, cv));
             hints.extend(trees[li].siblings(pos).into_iter().take(l.depth - c));
 
@@ -7028,7 +7097,19 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
         vals.extend_from_slice(&iv_w);
         let iv = [sb.public_input(), sb.public_input()];
-        let (outs, ww) = emit_fs_chain(&mut sb, slots.b3, iv, &trace, &stream, &bytes, &mut vals);
+        let mut consts: Vec<(F128, Wire)> = Vec::new();
+        let pub_payloads = bytes_payload_mask(ops);
+        let (outs, ww) = emit_fs_chain(
+            &mut sb,
+            slots.b3,
+            iv,
+            &trace,
+            &stream,
+            &bytes,
+            &mut vals,
+            &mut consts,
+            &pub_payloads,
+        );
 
         // The PoW grinding ops, located and bound (the mvp7 machinery).
         struct PowRec {
@@ -7086,6 +7167,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             &outs,
             &chals,
             &mut vals,
+            &mut consts,
             &mut hints,
         );
         // ---- the intake W-rounds in-circuit: the RS target enters as
@@ -8249,6 +8331,8 @@ struct RealTape<'p> {
     // the recorded tape
     vals_rec: Vec<F128>,
     chals: Vec<F128>,
+    /// Which byte payloads stay PUBLIC under the witness/public split.
+    pub_payloads: Vec<bool>,
     // chain materials
     trace: flock_prover::r1cs_hashes::fs_chain::FsChainTrace,
     stream: flock_core::transcript_record::Stream,
@@ -8364,6 +8448,7 @@ impl<'p> RealTape<'p> {
         let chals: Vec<F128> = rec.challenges().to_vec();
         let vals_rec: Vec<F128> = rec.values().to_vec();
         let ops = t_shape.ops();
+        let pub_payloads = bytes_payload_mask(ops);
         let vc_at = |end: usize| -> (usize, usize) {
             let (mut v, mut c) = (0usize, 0usize);
             for op in &ops[..end] {
@@ -9142,6 +9227,7 @@ impl<'p> RealTape<'p> {
             lo,
             vals_rec,
             chals,
+            pub_payloads,
             trace,
             stream,
             bytes,
@@ -9284,7 +9370,18 @@ fn emit_real_child_region(
     let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
     vals.extend_from_slice(&iv_w);
     let iv2 = [sb.public_input(), sb.public_input()];
-    let (outs, ww) = emit_fs_chain(sb, cs.q.b3, iv2, trace, stream, &rt.bytes, vals);
+    let mut consts: Vec<(F128, Wire)> = Vec::new();
+    let (outs, ww) = emit_fs_chain(
+        sb,
+        cs.q.b3,
+        iv2,
+        trace,
+        stream,
+        &rt.bytes,
+        vals,
+        &mut consts,
+        &rt.pub_payloads,
+    );
 
     // The PoW grinding wires: (digest word0, word1, nonce word) per op.
     let pow_pub: Vec<[Wire; 3]> = rt
@@ -9314,6 +9411,7 @@ fn emit_real_child_region(
         &outs,
         chals,
         vals,
+        &mut consts,
         hints,
     );
 
@@ -10512,6 +10610,8 @@ struct ChildTape<'p> {
     // the recorded tape
     vals_rec: Vec<F128>,
     chals: Vec<F128>,
+    /// Which byte payloads stay PUBLIC under the witness/public split.
+    pub_payloads: Vec<bool>,
     // chain materials
     trace: flock_prover::r1cs_hashes::fs_chain::FsChainTrace,
     stream: flock_core::transcript_record::Stream,
@@ -10609,6 +10709,7 @@ impl<'p> ChildTape<'p> {
         let chals: Vec<F128> = rec.challenges().to_vec();
         let vals_rec: Vec<F128> = rec.values().to_vec();
         let ops: Vec<Op> = t_shape.ops().to_vec();
+        let pub_payloads = bytes_payload_mask(&ops);
 
         // ---- the label map: the region order the assembly builds against ----
         let find = |label: &[u8]| -> Vec<usize> {
@@ -11527,6 +11628,7 @@ impl<'p> ChildTape<'p> {
             inner,
             vals_rec,
             chals,
+            pub_payloads,
             trace,
             stream,
             bytes,
@@ -11709,7 +11811,18 @@ fn emit_child_region(
     let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
     vals.extend_from_slice(&iv_w);
     let iv2 = [sb.public_input(), sb.public_input()];
-    let (outs, ww) = emit_fs_chain(sb, cs.q.b3, iv2, trace, stream, &ct.bytes, vals);
+    let mut consts: Vec<(F128, Wire)> = Vec::new();
+    let (outs, ww) = emit_fs_chain(
+        sb,
+        cs.q.b3,
+        iv2,
+        trace,
+        stream,
+        &ct.bytes,
+        vals,
+        &mut consts,
+        &ct.pub_payloads,
+    );
     let (to_publish, level_accs) = emit_query_phase(
         sb,
         cs.q,
@@ -11722,6 +11835,7 @@ fn emit_child_region(
         &outs,
         chals,
         vals,
+        &mut consts,
         hints,
     );
     let ga_w = outs[trace.squeezes[ct.ga_fin][0]][0];
@@ -12716,7 +12830,7 @@ fn partial_block_leaves_hash_correctly() {
             .collect();
         vals.push(F128::new(pos as u64, 0));
         let idx_w = sb.public_input();
-        let root = emit_opening(&mut sb, slots, iv, &leaf_w, idx_w, depth, 0, &mut vals);
+        let root = emit_opening(&mut sb, slots, iv, &leaf_w, idx_w, depth, 0, None, &mut vals);
         sb.publish(root[0]);
         sb.publish(root[1]);
         let shape = sb.finish().expect("the opening circuit builds");
@@ -13001,7 +13115,19 @@ fn mvp11_sigma_fold_tape() {
         let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
         vals.extend_from_slice(&iv_w);
         let iv2 = [sb.public_input(), sb.public_input()];
-        let (outs, ww) = emit_fs_chain(&mut sb, b3s, iv2, &trace, &stream, &bytes, &mut vals);
+        let mut consts: Vec<(F128, Wire)> = Vec::new();
+        let pub_payloads = bytes_payload_mask(ops);
+        let (outs, ww) = emit_fs_chain(
+            &mut sb,
+            b3s,
+            iv2,
+            &trace,
+            &stream,
+            &bytes,
+            &mut vals,
+            &mut consts,
+            &pub_payloads,
+        );
         let mut vmap: Vec<Option<usize>> = Vec::new();
         for (wi, w) in stream.words.iter().enumerate() {
             if let flock_core::transcript_record::StreamWord::Value(vi) = *w {
@@ -14083,7 +14209,19 @@ fn mvp11_merge_fold_region() {
         let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
         vals.extend_from_slice(&iv_w);
         let iv2 = [sb.public_input(), sb.public_input()];
-        let (chain_outs, ww) = emit_fs_chain(&mut sb, b3s, iv2, &trace, &stream, &bytes, &mut vals);
+        let mut consts: Vec<(F128, Wire)> = Vec::new();
+        let pub_payloads = bytes_payload_mask(ops);
+        let (chain_outs, ww) = emit_fs_chain(
+            &mut sb,
+            b3s,
+            iv2,
+            &trace,
+            &stream,
+            &bytes,
+            &mut vals,
+            &mut consts,
+            &pub_payloads,
+        );
         let mut vmap: Vec<Option<usize>> = Vec::new();
         for (wi, w) in stream.words.iter().enumerate() {
             if let flock_core::transcript_record::StreamWord::Value(vi) = *w {
@@ -14790,7 +14928,19 @@ fn mvp11_swap_children_fold_scale() {
         let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
         vals.extend_from_slice(&iv_w);
         let iv2 = [sb.public_input(), sb.public_input()];
-        let (chain_outs, ww) = emit_fs_chain(&mut sb, b3s, iv2, &trace, &stream, &bytes, &mut vals);
+        let mut consts: Vec<(F128, Wire)> = Vec::new();
+        let pub_payloads = bytes_payload_mask(ops);
+        let (chain_outs, ww) = emit_fs_chain(
+            &mut sb,
+            b3s,
+            iv2,
+            &trace,
+            &stream,
+            &bytes,
+            &mut vals,
+            &mut consts,
+            &pub_payloads,
+        );
         let mut vmap: Vec<Option<usize>> = Vec::new();
         for (wi, w) in stream.words.iter().enumerate() {
             if let flock_core::transcript_record::StreamWord::Value(vi) = *w {
@@ -15192,7 +15342,19 @@ fn build_node_outer(
         let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
         vals.extend_from_slice(&iv_w);
         let iv2 = [sb.public_input(), sb.public_input()];
-        let (chain_outs, ww) = emit_fs_chain(&mut sb, cs.q.b3, iv2, &trace, &stream, &bytes, &mut vals);
+        let mut consts: Vec<(F128, Wire)> = Vec::new();
+        let pub_payloads = bytes_payload_mask(t_shape.ops());
+        let (chain_outs, ww) = emit_fs_chain(
+            &mut sb,
+            cs.q.b3,
+            iv2,
+            &trace,
+            &stream,
+            &bytes,
+            &mut vals,
+            &mut consts,
+            &pub_payloads,
+        );
         let mut vmap: Vec<Option<usize>> = Vec::new();
         for (wi, w) in stream.words.iter().enumerate() {
             if let flock_core::transcript_record::StreamWord::Value(vi) = *w {
