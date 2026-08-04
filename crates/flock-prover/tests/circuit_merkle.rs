@@ -2736,13 +2736,15 @@ fn sk_at_vks(log_n: usize) -> Vec<F128> {
     sks
 }
 
-/// 2b stage 2, split into kappa<=6 gates (kappa=7 breaks the union's
-/// column-split): PrefixGate computes `seed * prod_j (1 + a_j + b_j)` — the
+/// 2b stage 2: PrefixGate computes `seed * prod_j (1 + a_j + b_j)` — the
 /// char-2 eq prefix of a packed-direct claim (seed = gamma, a = point,
-/// b = fold challenges) or an OOD claim (seed = beta, a = z). SuffixGate
-/// tensors the point's tail over the 2^yr binary positions and accumulates;
-/// PartialCombineGate folds `beta * resid` into the running combined vector;
-/// FinalDotGate dots against the absorbed yr words.
+/// b = fold challenges) or an OOD claim (seed = beta, a = z), and the eq
+/// FACTORS of the close-out's per-position tensor (bit set → factor
+/// `coord`, clear → `1 + coord`, pad → 1). The former SuffixGate/
+/// PartialCombineGate/FinalDotGate close-out types are DISSOLVED (Round
+/// 3): their tensor/combine/dot work rides prefix rows + the shared
+/// MacGate — 51 schema words (each a cell slot AND a gather claim) for
+/// ~30 rows of work became ~250 cheap rows and zero types.
 struct PrefixGate {
     ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
     pl: usize,
@@ -2801,268 +2803,6 @@ impl GateType for PrefixGate {
             c += 1;
         }
         (vec![pr], z)
-    }
-    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = vec![F128::ZERO; self.ty.width() << nu];
-        for (j, row) in rows.iter().enumerate() {
-            for (col, &v) in row.iter().enumerate() {
-                z[(col << nu) + j] = v;
-            }
-        }
-        SlotWitness::Element(z)
-    }
-}
-
-struct SuffixGate {
-    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
-    acc_out: Vec<usize>,
-    yl: usize,
-    n_in: usize,
-    k: usize,
-}
-
-impl SuffixGate {
-    fn new(yl: usize) -> Self {
-        use flock_core::element_r1cs::ElementTableBuilder;
-        let o = F128::ONE;
-        let yr = 1usize << yl;
-        let n_in = 2 + yl + yr; // p, ptS[yl], one, acc[yr]
-        let (pt0, one, acc0) = (1, 1 + yl, 2 + yl);
-        let c_need = 2 * yl + 5 * yr;
-        let kappa = gate_kappa(c_need);
-        let mut c = n_in;
-        let mut bl = ElementTableBuilder::new(kappa);
-        for w in 0..n_in {
-            bl.free_wire(w);
-        }
-        let mut e = vec![one];
-        for j in 0..yl {
-            bl.linear(c, &[(one, o), (pt0 + j, o)]);
-            let neg = c;
-            c += 1;
-            let mut nx = Vec::new();
-            for &pv in &e {
-                bl.mult(c, pv, neg);
-                nx.push(c);
-                c += 1;
-            }
-            for &pv in &e {
-                bl.mult(c, pv, pt0 + j);
-                nx.push(c);
-                c += 1;
-            }
-            e = nx;
-        }
-        let mut acc_out = Vec::new();
-        for (y, &ey) in e.iter().enumerate() {
-            bl.mult(c, 0, ey);
-            c += 1;
-            bl.linear(c, &[(acc0 + y, o), (c - 1, o)]);
-            acc_out.push(c);
-            c += 1;
-        }
-        assert_eq!(c, c_need, "the suffix column count is the counted one");
-        Self {
-            ty: std::sync::Arc::new(bl.build().expect("suffix gate")),
-            acc_out,
-            yl,
-            n_in,
-            k: c,
-        }
-    }
-}
-
-impl GateType for SuffixGate {
-    type Row = Vec<F128>;
-    type Hint = ();
-    fn table(&self) -> TableType {
-        use flock_core::schedule::IoWord;
-        let mut schema: Vec<IoWord> = (0..self.n_in).map(IoWord::input).collect();
-        for &oc in &self.acc_out {
-            schema.push(IoWord::output(oc));
-        }
-        TableType::element(self.ty.clone()).with_io_schema(schema)
-    }
-    fn eval(&self, inputs: &[F128], _h: &()) -> (Vec<F128>, Self::Row) {
-        let yl = self.yl;
-        let (pt0, acc0) = (1, 2 + yl);
-        let mut z = vec![F128::ZERO; self.k];
-        z[..self.n_in].copy_from_slice(&inputs[..self.n_in]);
-        let mut c = self.n_in;
-        let mut e = vec![F128::ONE];
-        for j in 0..yl {
-            z[c] = F128::ONE + z[pt0 + j];
-            let neg = z[c];
-            c += 1;
-            let mut nx = Vec::new();
-            for &pv in &e {
-                z[c] = pv * neg;
-                nx.push(z[c]);
-                c += 1;
-            }
-            for &pv in &e {
-                z[c] = pv * z[pt0 + j];
-                nx.push(z[c]);
-                c += 1;
-            }
-            e = nx;
-        }
-        let mut outs = Vec::new();
-        for (y, &ey) in e.iter().enumerate() {
-            z[c] = z[0] * ey;
-            c += 1;
-            z[c] = z[acc0 + y] + z[c - 1];
-            outs.push(z[c]);
-            c += 1;
-        }
-        (outs, z)
-    }
-    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = vec![F128::ZERO; self.ty.width() << nu];
-        for (j, row) in rows.iter().enumerate() {
-            for (col, &v) in row.iter().enumerate() {
-                z[(col << nu) + j] = v;
-            }
-        }
-        SlotWitness::Element(z)
-    }
-}
-
-struct PartialCombineGate {
-    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
-    acc_out: Vec<usize>,
-    yr: usize,
-    n_in: usize,
-    k: usize,
-}
-
-impl PartialCombineGate {
-    fn new(yl: usize) -> Self {
-        use flock_core::element_r1cs::ElementTableBuilder;
-        let o = F128::ONE;
-        let yr = 1usize << yl;
-        let n_in = 1 + 2 * yr; // beta, acc[yr], resid[yr]
-        let c_need = 1 + 4 * yr;
-        let kappa = gate_kappa(c_need);
-        let mut c = n_in;
-        let mut bl = ElementTableBuilder::new(kappa);
-        for w in 0..n_in {
-            bl.free_wire(w);
-        }
-        let mut acc_out = Vec::new();
-        for y in 0..yr {
-            bl.mult(c, 0, 1 + yr + y);
-            c += 1;
-            bl.linear(c, &[(1 + y, o), (c - 1, o)]);
-            acc_out.push(c);
-            c += 1;
-        }
-        Self {
-            ty: std::sync::Arc::new(bl.build().expect("partial combine")),
-            acc_out,
-            yr,
-            n_in,
-            k: c,
-        }
-    }
-}
-
-impl GateType for PartialCombineGate {
-    type Row = Vec<F128>;
-    type Hint = ();
-    fn table(&self) -> TableType {
-        use flock_core::schedule::IoWord;
-        let mut schema: Vec<IoWord> = (0..self.n_in).map(IoWord::input).collect();
-        for &oc in &self.acc_out {
-            schema.push(IoWord::output(oc));
-        }
-        TableType::element(self.ty.clone()).with_io_schema(schema)
-    }
-    fn eval(&self, inputs: &[F128], _h: &()) -> (Vec<F128>, Self::Row) {
-        let yr = self.yr;
-        let mut z = vec![F128::ZERO; self.k];
-        z[..self.n_in].copy_from_slice(&inputs[..self.n_in]);
-        let mut c = self.n_in;
-        let mut outs = Vec::new();
-        for y in 0..yr {
-            z[c] = z[0] * z[1 + yr + y];
-            c += 1;
-            z[c] = z[1 + y] + z[c - 1];
-            outs.push(z[c]);
-            c += 1;
-        }
-        (outs, z)
-    }
-    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = vec![F128::ZERO; self.ty.width() << nu];
-        for (j, row) in rows.iter().enumerate() {
-            for (col, &v) in row.iter().enumerate() {
-                z[(col << nu) + j] = v;
-            }
-        }
-        SlotWitness::Element(z)
-    }
-}
-
-struct FinalDotGate {
-    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
-    yr: usize,
-    n_in: usize,
-    k: usize,
-}
-
-impl FinalDotGate {
-    fn new(yl: usize) -> Self {
-        use flock_core::element_r1cs::ElementTableBuilder;
-        let o = F128::ONE;
-        let yr = 1usize << yl;
-        let n_in = 2 * yr; // yr words, combined
-        let c_need = 3 * yr + 1;
-        let kappa = gate_kappa(c_need);
-        let mut c = n_in;
-        let mut bl = ElementTableBuilder::new(kappa);
-        for w in 0..n_in {
-            bl.free_wire(w);
-        }
-        let mut terms = Vec::new();
-        for y in 0..yr {
-            bl.mult(c, y, yr + y);
-            terms.push((c, o));
-            c += 1;
-        }
-        bl.linear(c, &terms);
-        c += 1;
-        Self {
-            ty: std::sync::Arc::new(bl.build().expect("final dot")),
-            yr,
-            n_in,
-            k: c,
-        }
-    }
-}
-
-impl GateType for FinalDotGate {
-    type Row = Vec<F128>;
-    type Hint = ();
-    fn table(&self) -> TableType {
-        use flock_core::schedule::IoWord;
-        let mut schema: Vec<IoWord> = (0..self.n_in).map(IoWord::input).collect();
-        schema.push(IoWord::output(self.k - 1));
-        TableType::element(self.ty.clone()).with_io_schema(schema)
-    }
-    fn eval(&self, inputs: &[F128], _h: &()) -> (Vec<F128>, Self::Row) {
-        let yr = self.yr;
-        let mut z = vec![F128::ZERO; self.k];
-        z[..self.n_in].copy_from_slice(&inputs[..self.n_in]);
-        let mut c = self.n_in;
-        let mut inner = F128::ZERO;
-        for y in 0..yr {
-            z[c] = z[y] * z[yr + y];
-            inner += z[c];
-            c += 1;
-        }
-        z[c] = inner;
-        (vec![inner], z)
     }
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
         let mut z = vec![F128::ZERO; self.ty.width() << nu];
@@ -4656,8 +4396,16 @@ fn mvp7_real_query_phase() {
     // to the anchor's claimed evaluation, and running_W == q_eval·V with
     // V = Σ B_k IN-CIRCUIT replaces the boundary's native v. The anchor's
     // own rounds + expect (the AssistLayerGate chains) are step 3.
-    let macslot = sb.slot(MacGate::new());
-    leaf_slot.push((600, macslot));
+    // Key 600: emit_residual_region's close-out already created the shared
+    // MacGate slot (Round 3) — reuse it.
+    let macslot = match leaf_slot.iter().find(|&&(k, _)| k == 600) {
+        Some(&(_, s)) => s,
+        None => {
+            let s = sb.slot(MacGate::new());
+            leaf_slot.push((600, s));
+            s
+        }
+    };
     let gamma_w = chw(&outs, &trace.squeezes, mp.gamma_fin);
     let mut t0 = zw;
     let mut vsum = zw;
@@ -5717,20 +5465,20 @@ fn emit_query_phase(
 /// gate cell-slot is also a wiring gather claim, so schema words are the
 /// μ AND claim-count budget.)
 ///
-/// **CHUNKING (the mu-25 fix).** Every gate instantiates at
+/// **CHUNKING (the mu-25 fix).** The ResidualGate instantiates at
 /// `chunk_log = min(yr_log, 3)` — kappa 6 REGARDLESS of the proof's yr.
-/// The real inner's yr = 32 otherwise pushed the close-out schemas to
-/// kappa 7-8 (~600 IO words, cell space c = 10, and every O(2^mu) pass
-/// paid 16x). A yr > 8 region runs as `2^(yr_log-3)` chunks of 8:
+/// The real inner's yr = 32 otherwise pushed its schema to kappa 7-8. A
+/// yr > 8 region runs as `2^(yr_log-3)` chunks of 8:
 /// - the close-out claims' HIGH-bit eq factors ride the PREFIX SLOT
 ///   (seed = the claim's prefix product, factors = high coords vs the
 ///   chunk bits) — wire-bound, no new trust;
 /// - the residual rows' high subset factor `sp_hi(h)` rides the CHECKER
 ///   tier (`awp = aw·sp_hi`, recomputed natively from the validated
 ///   position by `check_residual_publics` — the alpha-expansion trust
-///   class; a wrong value fails the published accumulators);
-/// - cross-chunk dots sum through a degenerate `SuffixGate(0)` adder.
+///   class; a wrong value fails the published accumulators).
 /// Shapes with yr <= 8 take the single-chunk path BIT-IDENTICALLY.
+/// The close-out itself (per-position eq tensors, the beta combines, the
+/// yr dot) is prefix + MacGate rows since Round 3 — no dedicated types.
 #[allow(clippy::too_many_arguments)]
 fn emit_residual_region(
     sb: &mut ShapeBuilder,
@@ -5842,11 +5590,17 @@ fn emit_residual_region(
         .iter()
         .flat_map(|l| l.fold_fins.iter().map(|&f| chw(f)))
         .collect();
-    let sxslot = match leaf_slot.iter().find(|&&(k, _)| k == 300) {
+    // ROUND 3: the close-out's suffix/combine/dot arithmetic rides the
+    // shared 4-word MacGate (cache key 600, the mvp8 convention) plus the
+    // prefix slot — the SuffixGate/PartialCombineGate/FinalDotGate types
+    // are DISSOLVED: 51 schema words (each a cell slot AND a gather claim)
+    // bought ~30 rows of work; as mac/prefix rows the same work is ~250
+    // live-prefix-cheap rows and zero types.
+    let macs = match leaf_slot.iter().find(|&&(k, _)| k == 600) {
         Some(&(_, s)) => s,
         None => {
-            let s = sb.slot(SuffixGate::new(chunk_log));
-            leaf_slot.push((300, s));
+            let s = sb.slot(MacGate::new());
+            leaf_slot.push((600, s));
             s
         }
     };
@@ -5879,8 +5633,9 @@ fn emit_residual_region(
     };
     let mut evb_accs: Vec<Wire> = (0..yr_len).map(|_| zw).collect();
     // Fold one claim (prefix product p at full-yl coord wires) into the
-    // accumulators: per chunk, the high-coord eq factor is a prefix row
-    // seeded by p (wire-bound), then a suffix row over the low coords.
+    // accumulators: per position, ONE prefix row computes p·eq(coords, y)
+    // (high bits chunk-shared, low bits per position; eq factor =
+    // 1 + coord + [bit] in char 2) and ONE MacGate row accumulates it.
     let apply_suffix =
         |sb: &mut ShapeBuilder, evb_accs: &mut [Wire], p: Wire, coords: &[Wire]| {
             assert_eq!(coords.len(), yr_log, "the claim tail spans yr");
@@ -5895,12 +5650,16 @@ fn emit_residual_region(
                         .collect();
                     prefix_chain(sb, p, &factors)
                 };
-                let mut s_in = vec![ph];
-                s_in.extend_from_slice(&coords[..chunk_log]);
-                s_in.push(ow);
-                s_in.extend_from_slice(&evb_accs[h * chunk..(h + 1) * chunk]);
-                let out = sb.gate(sxslot, &s_in);
-                evb_accs[h * chunk..(h + 1) * chunk].copy_from_slice(&out);
+                for y in 0..chunk {
+                    let factors: Vec<(Wire, Wire)> = coords[..chunk_log]
+                        .iter()
+                        .enumerate()
+                        .map(|(j, &cw2)| (cw2, if (y >> j) & 1 == 1 { ow } else { zw }))
+                        .collect();
+                    let py = prefix_chain(sb, ph, &factors);
+                    let at2 = h * chunk + y;
+                    evb_accs[at2] = sb.gate(macs, &[evb_accs[at2], py, ow])[0];
+                }
             }
         };
     {
@@ -5936,58 +5695,19 @@ fn emit_residual_region(
             apply_suffix(sb, &mut evb_accs, pw, &coords);
         }
     }
-    // beta-weighted residuals fold in per level, then the yr dot. The
-    // combine rows are pure accumulate — no cross-position structure — so
-    // they sub-chunk to 4-wide (17 cols, kappa 5): rows are live-prefix
-    // cheap, columns are the envelope.
-    let pc_log = chunk_log.min(2);
-    let pc = 1usize << pc_log;
-    let pcslot = match leaf_slot.iter().find(|&&(k, _)| k == 301) {
-        Some(&(_, s)) => s,
-        None => {
-            let s = sb.slot(PartialCombineGate::new(pc_log));
-            leaf_slot.push((301, s));
-            s
-        }
-    };
+    // beta-weighted residuals fold in per level (comb_y += beta·resid_y —
+    // one MacGate row each), then the yr dot as one MAC chain.
     let mut comb = evb_accs;
     for (li, lvl) in levels.iter().enumerate() {
-        for h in 0..(yr_len / pc) {
-            let mut g_in = vec![chw(lvl.beta_fin)];
-            g_in.extend_from_slice(&comb[h * pc..(h + 1) * pc]);
-            g_in.extend_from_slice(&resid_pub[li][h * pc..(h + 1) * pc]);
-            let out = sb.gate(pcslot, &g_in);
-            comb[h * pc..(h + 1) * pc].copy_from_slice(&out);
+        let beta_w = chw(lvl.beta_fin);
+        for y in 0..yr_len {
+            comb[y] = sb.gate(macs, &[comb[y], beta_w, resid_pub[li][y]])[0];
         }
     }
-    let fdslot = match leaf_slot.iter().find(|&&(k, _)| k == 302) {
-        Some(&(_, s)) => s,
-        None => {
-            let s = sb.slot(FinalDotGate::new(chunk_log));
-            leaf_slot.push((302, s));
-            s
-        }
-    };
-    let mut inner_w: Option<Wire> = None;
-    for h in 0..n_chunks {
-        let mut g_in: Vec<Wire> = yr_wires[h * chunk..(h + 1) * chunk].to_vec();
-        g_in.extend_from_slice(&comb[h * chunk..(h + 1) * chunk]);
-        let dot = sb.gate(fdslot, &g_in)[0];
-        inner_w = Some(match inner_w {
-            None => dot,
-            Some(acc) => {
-                // Cross-chunk adder as a SUFFIX row with a zero point:
-                // e = [1, 0, ..], so out[0] = acc + dot·1 — no extra type.
-                let mut s_in = vec![dot];
-                s_in.extend(std::iter::repeat_n(zw, chunk_log));
-                s_in.push(ow);
-                s_in.push(acc);
-                s_in.extend(std::iter::repeat_n(zw, chunk - 1));
-                sb.gate(sxslot, &s_in)[0]
-            }
-        });
+    let mut inner_w = zw;
+    for (yw, cb) in yr_wires.iter().zip(&comb) {
+        inner_w = sb.gate(macs, &[inner_w, *yw, *cb])[0];
     }
-    let inner_w = inner_w.expect("at least one chunk");
     (resid_pub, inner_w, (pfslot, pf_w))
 }
 
@@ -12115,6 +11835,7 @@ struct ChildSlots {
 
 impl ChildSlots {
     fn new(sb: &mut ShapeBuilder, nu2: usize, spread_w: usize) -> Self {
+        let macs = sb.slot(MacGate::new());
         ChildSlots {
             q: CollapsedSlots {
                 b3: sb.slot(Blake3Gate { nu: nu2 }),
@@ -12124,13 +11845,16 @@ impl ChildSlots {
                     nu: nu2,
                 }),
             },
-            macs: sb.slot(MacGate::new()),
+            macs,
             zcr: sb.slot(ZcRoundGate::new()),
             mrs: sb.slot(MergedRoundGate::new()),
             spine: sb.slot(SpineGate::new()),
             alslot: sb.slot(AssistLayerGate::new()),
             le: Vec::new(),
-            resid: Vec::new(),
+            // Key 600 pre-seeds the SHARED MacGate into the residual cache:
+            // emit_residual_region's close-out rows land on the same slot
+            // instead of registering a duplicate type.
+            resid: vec![(600, macs)],
         }
     }
 
@@ -12138,7 +11862,8 @@ impl ChildSlots {
     fn element_slot_ids(&self) -> Vec<flock_core::circuit::builder::SlotId> {
         let mut v = vec![self.macs, self.zcr, self.mrs, self.spine, self.alslot];
         v.extend(self.le.iter().map(|&(_, s)| s));
-        v.extend(self.resid.iter().map(|&(_, s)| s));
+        // Key 600 is the SHARED MacGate seed (already listed as `macs`).
+        v.extend(self.resid.iter().filter(|&&(k, _)| k != 600).map(|&(_, s)| s));
         v
     }
 }
@@ -15927,6 +15652,41 @@ fn build_node_outer(
             "the node's cell-slot budget regressed ({} slots)",
             shape2.circuit.cells().slots().len()
         );
+        // ROUND-3 DATA (NODE_CENSUS=1): per-type schema words — each one a
+        // cell slot AND a gather claim — plus live rows and utilization,
+        // the consolidation pass's worklist.
+        if std::env::var("NODE_CENSUS").is_ok() {
+            let mut lab: Vec<(usize, String)> = vec![
+                (shape2.registry_slot(cs.q.b3), "b3".to_string()),
+                (shape2.registry_slot(cs.q.swap), "swap".to_string()),
+                (shape2.registry_slot(cs.q.spread), "spread".to_string()),
+                (shape2.registry_slot(cs.macs), "mac".to_string()),
+                (shape2.registry_slot(cs.zcr), "zcr".to_string()),
+                (shape2.registry_slot(cs.mrs), "mrs".to_string()),
+                (shape2.registry_slot(cs.spine), "spine".to_string()),
+                (shape2.registry_slot(cs.alslot), "assist".to_string()),
+            ];
+            for &(n, s) in &cs.le {
+                lab.push((shape2.registry_slot(s), format!("le{n}")));
+            }
+            for &(k, s) in &cs.resid {
+                lab.push((shape2.registry_slot(s), format!("resid{k}")));
+            }
+            println!("  NODE TYPE CENSUS (io = cell slots = gather claims):");
+            for (t, ty) in shape2.registry.types().iter().enumerate() {
+                let name = lab
+                    .iter()
+                    .find(|(i, _)| *i == t)
+                    .map(|(_, s)| s.as_str())
+                    .unwrap_or("?");
+                println!(
+                    "    t{t:2} {name:>8} | io {:3} | rows {:6} ({:3}%)",
+                    ty.io_schema.len(),
+                    shape2.counts[t],
+                    (100 * shape2.counts[t]) >> nu2,
+                );
+            }
+        }
         let hint_refs: Vec<&dyn std::any::Any> =
             hints.iter().map(|h| h as &dyn std::any::Any).collect();
         let built2 = shape2.run(&vals, &hint_refs);
