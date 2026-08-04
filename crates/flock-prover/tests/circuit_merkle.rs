@@ -8346,11 +8346,27 @@ struct RealTape<'p> {
     // the boolean PIOP's round ordinals ((ch, fin) pairs) + surfaces
     zc_rounds_b: Vec<(usize, usize)>,
     outer_b: (usize, usize),
+    #[allow(dead_code)] // The r_outer slice length — wall-4 shape data.
+    outer_len: usize,
     bl_alpha: (usize, usize),
-    lc_rounds_b: Vec<(usize, usize)>,
+    /// The const-pin beta squeezes: (ch, fin) per pinned boolean type.
+    betas_b: Vec<(usize, usize)>,
+    /// The zerocheck finals' value ordinal (v_a at, v_b at +1).
+    zc_finals_v: usize,
+    /// Per pinned type, eq_prefix_sum(x_outer, n_t) — the count-derived
+    /// beta term (advice, checker-recomputable from published wires).
+    eps_n: Vec<F128>,
+    /// (g_v, ch, fin) per boolean lc round — messages feed the in-circuit
+    /// lincheck replay.
+    lc_rounds_b: Vec<(usize, usize, usize)>,
     zskip_ch: usize,
     zskip_fin: usize,
     zp_v: usize,
+    /// The rs regions: (s_hat_v ordinal, r_dprime fin, r_dprime ch), plus
+    /// the two rs gammas' first (fin, ch) — the family-H re-exposure set.
+    rs_recs: Vec<(usize, usize, usize)>,
+    rs_gam_fin: usize,
+    rs_gam_ch: usize,
     // native references + replicas
     mat_assert: flock_core::lincheck::MatrixAssertion,
     el_assert: flock_core::element_r1cs::union::ElementAssertion,
@@ -8361,6 +8377,8 @@ struct RealTape<'p> {
     el_run_n: F128,
     a_sum_n: F128,
     b_sum_n: F128,
+    native_rs_half: F128,
+    native_vrs: F128,
     native_target: F128,
     native_running: F128,
     t_final_n: F128,
@@ -8690,9 +8708,10 @@ impl<'p> RealTape<'p> {
         assert!(!pows.is_empty(), "the Fast profile grinds");
 
         // ---- the rs×2 regions + the two-halves target, natively ----
-        let (rs_recs2, rs_gam_ch2) = {
+        let (rs_recs2, rs_gam_ch2, rs_gam_fin2) = {
             let mut i2 = rs_l[0];
-            let mut recs: Vec<(usize, usize)> = Vec::new();
+            // (s_hat_v ordinal, r_dprime fin, r_dprime ch) per region.
+            let mut recs: Vec<(usize, usize, usize)> = Vec::new();
             for k in 0..2 {
                 assert!(
                     matches!(&ops[i2], Op::Label(l) if l.as_slice() == b"flock-ring-switch-v0"),
@@ -8708,31 +8727,37 @@ impl<'p> RealTape<'p> {
                 );
                 i2 += 1;
                 assert!(matches!(ops[i2], Op::SqueezeSlice(7)), "r_dprime");
-                recs.push((sv, vc_at(i2).1));
+                recs.push((sv, fin_at(i2), vc_at(i2).1));
                 i2 += 1;
             }
             let gch = vc_at(i2).1;
+            let gfin = fin_at(i2);
             for _ in 0..2 {
                 assert!(matches!(ops[i2], Op::SqueezeScalar), "rs gamma");
                 i2 += 1;
             }
-            (recs, gch)
+            (recs, gch, gfin)
         };
-        let (native_target, native_running) = {
+        // The two-halves target and V, split into their family-H (RS) and
+        // in-circuit-computable (packed-direct / group) parts — the round-0
+        // production posture: the pd/group halves become MAC chains in the
+        // circuit, the RS halves stay advice checked over RE-EXPOSED words.
+        let (native_rs_half, native_target, native_vrs, native_running) = {
             use flock_core::pcs::ring_switch as rsw;
             use flock_core::zerocheck::univariate_skip::build_eq;
             let gs: Vec<F128> = (0..2).map(|k| chals[rs_gam_ch2 + k]).collect();
-            let mut target = F128::ZERO;
+            let mut rs_half = F128::ZERO;
             let mut coeffs: Vec<Vec<F128>> = Vec::new();
-            for (k, &(sv, rc)) in rs_recs2.iter().enumerate() {
+            for (k, &(sv, _, rc)) in rs_recs2.iter().enumerate() {
                 let shv = &vals_rec[sv..sv + 128];
                 let rdp: Vec<F128> = (0..7).map(|j| chals[rc + j]).collect();
                 let eq = build_eq(&rdp);
-                target += gs[k] * rsw::inner_product(&rsw::tensor_algebra_transpose(shv), &eq);
+                rs_half += gs[k] * rsw::inner_product(&rsw::tensor_algebra_transpose(shv), &eq);
                 let scaled: Vec<F128> = eq.iter().map(|x| gs[k] * *x).collect();
                 coeffs
                     .push(rsw::linearized_coefficients(&rsw::build_fold_byte_table(&scaled)));
             }
+            let mut target = rs_half;
             for pd in &gammas_i {
                 target += chals[pd.ch] * vals_rec[pd.val_v];
             }
@@ -8744,7 +8769,7 @@ impl<'p> RealTape<'p> {
                 running = g0 + (g1 + g0 + gi) * rc + gi * rc * rc;
             }
             let fro = &lo.proof.pcs_open.frobenius;
-            let mut big_v = F128::ZERO;
+            let mut vrs = F128::ZERO;
             for (k, cs) in coeffs.iter().enumerate() {
                 for (j, &cj) in cs.iter().enumerate() {
                     if cj.is_zero() {
@@ -8754,9 +8779,10 @@ impl<'p> RealTape<'p> {
                     for _ in 0..j {
                         x = x * x;
                     }
-                    big_v += cj * x;
+                    vrs += cj * x;
                 }
             }
+            let mut big_v = vrs;
             for &v in &fro.group_values {
                 big_v += v;
             }
@@ -8765,7 +8791,7 @@ impl<'p> RealTape<'p> {
                 vals_rec[inner_pd_i.q_v] * big_v,
                 "the R=2 + P merged boundary replays at real-inner scale"
             );
-            (target, running)
+            (rs_half, target, vrs, running)
         };
 
         // ---- the spine's native quad replay ----
@@ -8935,12 +8961,24 @@ impl<'p> RealTape<'p> {
         // The boolean PIOP's round ordinals, located with fins — plus the
         // MatrixAssertion surfaces the 2→1 merge connects to (z_skip's
         // squeeze, z_partial's slice).
-        let (zc_rounds_b, (zskip_ch, zskip_fin), (outer_ch_b, outer_fin_b), bl_alpha, lc_rounds_b, zp_v) = {
+        let (
+            zc_rounds_b,
+            (zskip_ch, zskip_fin),
+            (outer_ch_b, outer_fin_b, outer_len),
+            bl_alpha,
+            betas_b,
+            zc_finals_v,
+            lc_rounds_b,
+            zp_v,
+        ) = {
             let mut i2 = zc_l[0] + 1;
             assert!(matches!(ops[i2], Op::SqueezeSlice(_)), "r_skip slice");
             i2 += 1;
-            assert!(matches!(ops[i2], Op::SqueezeSlice(_)), "r_outer slice");
-            let outer = (vc_at(i2).1, fin_at(i2));
+            let outer_len = match ops[i2] {
+                Op::SqueezeSlice(n) => n,
+                ref o => panic!("r_outer slice, got {o:?}"),
+            };
+            let outer = (vc_at(i2).1, fin_at(i2), outer_len);
             i2 += 1;
             assert!(matches!(ops[i2], Op::ObserveSlice(64)), "round1_ab");
             i2 += 1;
@@ -8957,6 +8995,9 @@ impl<'p> RealTape<'p> {
                 zc_r.push((vc_at(i2 + 2).1, fin_at(i2 + 2)));
                 i2 += 3;
             }
+            // The zerocheck finals (v_a, v_b, ...) — the lincheck entry's
+            // absorbed operands.
+            let (zcf, _) = vc_at(i2);
             while matches!(ops[i2], Op::ObserveScalar) {
                 i2 += 1;
             }
@@ -8964,20 +9005,26 @@ impl<'p> RealTape<'p> {
             i2 += 1;
             assert!(matches!(ops[i2], Op::SqueezeScalar), "lc alpha");
             let lc_alpha = (vc_at(i2).1, fin_at(i2));
+            i2 += 1;
+            // The const-pin beta squeezes, one per pinned boolean type.
+            let mut betas: Vec<(usize, usize)> = Vec::new();
             while matches!(ops[i2], Op::SqueezeScalar) {
+                betas.push((vc_at(i2).1, fin_at(i2)));
                 i2 += 1;
             }
-            let mut lc_r: Vec<(usize, usize)> = Vec::new();
+            // (g_v, ch, fin) per lc round — the message ordinals feed the
+            // round-0 in-circuit lincheck replay.
+            let mut lc_r: Vec<(usize, usize, usize)> = Vec::new();
             while matches!(ops[i2], Op::ObserveScalar)
                 && matches!(ops[i2 + 1], Op::ObserveScalar)
                 && matches!(ops[i2 + 2], Op::SqueezeScalar)
             {
-                lc_r.push((vc_at(i2 + 2).1, fin_at(i2 + 2)));
+                lc_r.push((vc_at(i2).0, vc_at(i2 + 2).1, fin_at(i2 + 2)));
                 i2 += 3;
             }
             assert!(matches!(ops[i2], Op::ObserveSlice(64)), "z_partial slice");
             let (zp, _) = vc_at(i2);
-            (zc_r, zskip, outer, lc_alpha, lc_r, zp)
+            (zc_r, zskip, outer, lc_alpha, betas, zcf, lc_r, zp)
         };
         // The surface→ordinal mapping asserts (the batch-major packing the
         // minimal child pinned): x_inner_rest[0] = mlv round 0, x_outer =
@@ -9001,7 +9048,7 @@ impl<'p> RealTape<'p> {
             assert_eq!(lc_rounds_b.len(), mat_assert.rr.len(), "lc round count");
             for (j, &x) in mat_assert.rr.iter().enumerate() {
                 assert_eq!(
-                    chals[lc_rounds_b[lc_rounds_b.len() - 1 - j].0],
+                    chals[lc_rounds_b[lc_rounds_b.len() - 1 - j].1],
                     x,
                     "rr {j} is the located lc round, reversed"
                 );
@@ -9045,6 +9092,53 @@ impl<'p> RealTape<'p> {
             }
         }
         assert!(lc_rounds_b.len() <= 1 + k_cols_i, "lc rounds fit the col bits");
+        // The boolean lincheck ENTRY, natively: target0 = α·v_a + v_b +
+        // Σ β_t·eq_prefix_sum(x_outer, n_t), with x_outer the zc mlv rows
+        // (batch-major: rounds 1..1+ν) — replayed through the located lc
+        // rounds it must end at the deferred MatrixAssertion's own target
+        // (the method-note discipline; this pre-assert is what licenses the
+        // in-circuit replay's wire map).
+        let (eps_n, entry_n) = {
+            let x_outer_n: Vec<F128> = (0..n_log_i)
+                .map(|j| chals[zc_rounds_b[1 + j].0])
+                .collect();
+            let pinned: Vec<usize> = mat_assert
+                .betas
+                .iter()
+                .enumerate()
+                .filter_map(|(t, b)| b.map(|_| t))
+                .collect();
+            assert_eq!(pinned.len(), betas_b.len(), "one squeeze per const pin");
+            let mut eps = Vec::with_capacity(betas_b.len());
+            let mut entry = mat_assert.alpha * vals_rec[zc_finals_v]
+                + vals_rec[zc_finals_v + 1];
+            for (k, &t) in pinned.iter().enumerate() {
+                assert_eq!(
+                    chals[betas_b[k].0],
+                    mat_assert.betas[t].expect("pinned"),
+                    "beta {k} is the located squeeze"
+                );
+                let e = flock_core::product_gkr::LiveMask::eq_prefix_sum(
+                    &x_outer_n,
+                    union_i.counts()[t],
+                );
+                entry += chals[betas_b[k].0] * e;
+                eps.push(e);
+            }
+            let mut run = entry;
+            for &(g_v, ch, _) in &lc_rounds_b {
+                let (e1, einf) = (vals_rec[g_v], vals_rec[g_v + 1]);
+                let r = chals[ch];
+                let q0 = run + e1;
+                run = einf * r * r + (q0 + e1 + einf) * r + q0;
+            }
+            assert_eq!(
+                run, mat_assert.target,
+                "the boolean lc entry replays to the assertion's target"
+            );
+            (eps, entry)
+        };
+        let _ = entry_n;
         let nat_b = claims.boolean.as_ref().expect("boolean claims");
         let x_ab_n: Vec<F128> = {
             let p = &nat_b.ab.point;
@@ -9237,11 +9331,18 @@ impl<'p> RealTape<'p> {
             n_gather,
             zc_rounds_b,
             outer_b: (outer_ch_b, outer_fin_b),
+            outer_len,
             bl_alpha,
+            betas_b,
+            zc_finals_v,
+            eps_n,
             lc_rounds_b,
             zskip_ch,
             zskip_fin,
             zp_v,
+            rs_recs: rs_recs2,
+            rs_gam_fin: rs_gam_fin2,
+            rs_gam_ch: rs_gam_ch2,
             mat_assert,
             el_assert,
             sigma_native,
@@ -9250,6 +9351,8 @@ impl<'p> RealTape<'p> {
             el_run_n,
             a_sum_n,
             b_sum_n,
+            native_rs_half,
+            native_vrs,
             native_target,
             native_running,
             t_final_n,
@@ -9277,6 +9380,8 @@ struct RealRegion {
     n_query_pub: usize,
     n_tail: usize,
     n_mat_pub: usize,
+    /// The family-H re-exposure block length (the tail past z_skip).
+    n_fam_pub: usize,
     n_ela_pub: usize,
     /// sigma: the deferred s_sigma stream word + the GKR squeeze point.
     #[allow(dead_code)]
@@ -9422,13 +9527,36 @@ fn emit_real_child_region(
     let zassert = sb.public_input();
 
 
-    vals.push(rt.native_target);
-    let tgt_w = sb.public_input();
+    // The merged target's TWO HALVES, round-0 posture: the packed-direct
+    // half is a MAC chain over absorbed value words × gamma squeeze wires
+    // (fully in-circuit); only the RS half — the family-H transpose dots —
+    // stays advice, production-checked over the RE-EXPOSED words below.
+    let mut pdh_w = zw;
+    for pd in gammas_i {
+        let gw = outs[trace.squeezes[pd.fin][0]][0];
+        pdh_w = sb.gate(cs.macs, &[pdh_w, gw, wv(pd.val_v)])[0];
+    }
+    vals.push(rt.native_rs_half);
+    let rsh_w = sb.public_input();
+    let tgt_w = sb.gate(cs.macs, &[rsh_w, ow, pdh_w])[0];
     let mut runw = tgt_w;
     for rr in w_rounds {
         let r_w = outs[trace.squeezes[rr.fin][0]][0];
         runw = sb.gate(mrslot, &[runw, wv(rr.g_v), wv(rr.g_v + 1), r_w])[0];
     }
+    // V, the other family-H item, same split: the group-value sum is a MAC
+    // chain over absorbed words; V_rs stays advice; and the boundary
+    // `running == q_eval·V` CLOSES IN-CIRCUIT as a copy constraint —
+    // q_eval needs no exposure at all.
+    let mut vgrp_w = zw;
+    for &vi in &mp_i.val_vs[256..] {
+        vgrp_w = sb.gate(cs.macs, &[vgrp_w, ow, wv(vi)])[0];
+    }
+    vals.push(rt.native_vrs);
+    let vrs_w = sb.public_input();
+    let v_w = sb.gate(cs.macs, &[vrs_w, ow, vgrp_w])[0];
+    let rhs_v_w = sb.gate(cs.macs, &[zw, wv(inner_pd_i.q_v), v_w])[0];
+    sb.connect(runw, rhs_v_w);
 
     // The ligerito SPINE: start gamma'·q_eval, eval/build per fold,
     // intro-folds consuming the query phase's accumulator wires.
@@ -9654,7 +9782,7 @@ fn emit_real_child_region(
         .lc_rounds_b
         .iter()
         .rev()
-        .map(|&(ch, fin)| (chals[ch], outs[trace.squeezes[fin][0]][0]))
+        .map(|&(_, ch, fin)| (chals[ch], outs[trace.squeezes[fin][0]][0]))
         .collect();
     let mut xab_pw: Vec<(F128, Wire)> = vec![lc_pw[0]];
     xab_pw.extend_from_slice(&mlv_pw[1..1 + n_log_i]);
@@ -9864,7 +9992,7 @@ fn emit_real_child_region(
     // ---- the assertion EMISSIONS (all three families) ----
     let bl_alpha_w = outs[trace.squeezes[rt.bl_alpha.1][0]][0];
     let mut mat_pub: Vec<Wire> = vec![bl_alpha_w];
-    for &(_, fin) in &rt.lc_rounds_b {
+    for &(_, _, fin) in &rt.lc_rounds_b {
         mat_pub.push(outs[trace.squeezes[fin][0]][0]);
     }
     let bp_i = rt.lo.proof.boolean.as_ref().expect("boolean side present");
@@ -9878,6 +10006,39 @@ fn emit_real_child_region(
         mat_pub.push(bw);
         mat_eval_w.push((aw, bw));
     }
+    // ROUND 0: the MatrixAssertion equation's remaining data, published —
+    // x_inner_rest (batch-major mlv map), x_outer (mlv rounds 1..1+ν),
+    // the const-pin betas + their count-derived eps advice, the z_partial
+    // words — and the ~20-row BOOLEAN LINCHECK REPLAY, so the published
+    // chain end IS the equation's bound target: entry = α·v_a + v_b +
+    // Σ β_t·eps_t from absorbed finals and squeeze wires, rounds through
+    // the shared MergedRoundGate slot.
+    let inner_b = rt.mat_assert.x_inner_rest.len();
+    for j in 0..inner_b {
+        let m = if j == 0 { 0 } else { n_log_i + j };
+        mat_pub.push(mlv_pw[m].1);
+    }
+    for j in 0..n_log_i {
+        mat_pub.push(mlv_pw[1 + j].1);
+    }
+    let zpartial_ws: Vec<Wire> = (0..64).map(|i| wv(rt.zp_v + i)).collect();
+    let va_b = wv(rt.zc_finals_v);
+    let vb_b = wv(rt.zc_finals_v + 1);
+    let mut lcb_w = sb.gate(cs.macs, &[vb_b, bl_alpha_w, va_b])[0];
+    for (k, &(_, bfin)) in rt.betas_b.iter().enumerate() {
+        let bw = outs[trace.squeezes[bfin][0]][0];
+        vals.push(rt.eps_n[k]);
+        let ew = sb.public_input();
+        lcb_w = sb.gate(cs.macs, &[lcb_w, bw, ew])[0];
+        mat_pub.push(bw);
+        mat_pub.push(ew);
+    }
+    for &(g_v, _, fin) in &rt.lc_rounds_b {
+        let rw = outs[trace.squeezes[fin][0]][0];
+        lcb_w = sb.gate(mrslot, &[lcb_w, wv(g_v), wv(g_v + 1), rw])[0];
+    }
+    mat_pub.extend_from_slice(&zpartial_ws);
+    mat_pub.push(lcb_w);
     let mut ela_pub: Vec<Wire> = vec![el_alpha_w];
     for rr in &piop_i.zc_rounds {
         ela_pub.push(outs[trace.squeezes[rr.fin][0]][0]);
@@ -9943,6 +10104,36 @@ fn emit_real_child_region(
     // lows derive from it — the 2→1 merge's checker rebuilds them from
     // THIS published value (the alpha-expansion trust class).
     sb.publish(outs[trace.squeezes[rt.zskip_fin][0]][0]);
+    // ROUND 0's family-H RE-EXPOSURE: the words the rs_half / V_rs advice
+    // checks reference — s_hat_v (2×128), the r_dprime squeeze wires
+    // (2×7), the two rs gammas, and the 256+P multipoint value words. All
+    // wires that already exist; published so the production checker can
+    // recompute the transpose dots and the linearized-coefficient
+    // combination from PUBLIC data alone. Removed again when the
+    // family-H arithmetization lands.
+    let mut n_fam_pub = 0usize;
+    for &(sv, rfin, _) in &rt.rs_recs {
+        for i in 0..128 {
+            sb.publish(wv(sv + i));
+        }
+        let sq = &trace.squeezes[rfin];
+        for j in 0..7 {
+            sb.publish(outs[sq[j / 4]][j % 4]);
+        }
+        n_fam_pub += 135;
+    }
+    for k in 0..2 {
+        sb.publish(outs[trace.squeezes[rt.rs_gam_fin + k][0]][0]);
+        n_fam_pub += 1;
+    }
+    for &vi in &mp_i.val_vs {
+        sb.publish(wv(vi));
+        n_fam_pub += 1;
+    }
+    // The two family-H advice values themselves, at known tail positions.
+    sb.publish(rsh_w);
+    sb.publish(vrs_w);
+    n_fam_pub += 2;
 
     let n_query_pub: usize = levels
         .iter()
@@ -9960,12 +10151,14 @@ fn emit_real_child_region(
         + 1
         + mat_pub.len()
         + ela_pub.len()
-        + 1;
+        + 1
+        + n_fam_pub;
     RealRegion {
         pub_base,
         n_query_pub,
         n_tail,
         n_mat_pub: mat_pub.len(),
+        n_fam_pub,
         n_ela_pub: ela_pub.len(),
         sig_w,
         pt_w,
@@ -9984,9 +10177,9 @@ fn emit_real_child_region(
         b_lc_w: rt
             .lc_rounds_b
             .iter()
-            .map(|&(_, fin)| outs[trace.squeezes[fin][0]][0])
+            .map(|&(_, _, fin)| outs[trace.squeezes[fin][0]][0])
             .collect(),
-        b_zpartial_w: (0..64).map(|i| wv(rt.zp_v + i)).collect(),
+        b_zpartial_w: zpartial_ws,
         mat_eval_w,
         pf: (pfslot, pf_w),
     }
@@ -10120,7 +10313,7 @@ fn check_real_child_region(public: &[F128], rt: &RealTape<'_>, r: &RealRegion) -
         rt.mat_assert.alpha,
         "the emitted matrix alpha is the assertion's"
     );
-    for (j, &(ch, _)) in rt.lc_rounds_b.iter().enumerate() {
+    for (j, &(_, ch, _)) in rt.lc_rounds_b.iter().enumerate() {
         assert_eq!(
             public[mat_base + 1 + j],
             chals[ch],
@@ -10138,6 +10331,36 @@ fn check_real_child_region(public: &[F128], rt: &RealTape<'_>, r: &RealRegion) -
             "matrix_evals pair {j} rides as bound advice"
         );
     }
+    // ROUND 0's extension: every remaining datum of the MatrixAssertion
+    // equation, published and held against the assertion itself.
+    let mut mq = mat_base + 1 + rt.lc_rounds_b.len() + 2 * bp_i.lincheck.matrix_evals.len();
+    for (j, &x) in rt.mat_assert.x_inner_rest.iter().enumerate() {
+        assert_eq!(public[mq + j], x, "x_inner_rest {j} published");
+    }
+    mq += rt.mat_assert.x_inner_rest.len();
+    for j in 0..rt.n_log_i {
+        assert_eq!(
+            public[mq + j],
+            chals[rt.zc_rounds_b[1 + j].0],
+            "x_outer {j} published"
+        );
+    }
+    mq += rt.n_log_i;
+    for (k, &(bch, _)) in rt.betas_b.iter().enumerate() {
+        assert_eq!(public[mq], chals[bch], "beta {k} published");
+        assert_eq!(public[mq + 1], rt.eps_n[k], "eps {k} advice");
+        mq += 2;
+    }
+    for (j, &z) in rt.mat_assert.z_partial.iter().enumerate() {
+        assert_eq!(public[mq + j], z, "z_partial {j} published");
+    }
+    mq += 64;
+    assert_eq!(
+        public[mq],
+        rt.mat_assert.target,
+        "the in-circuit boolean lc replay ends at the assertion's target"
+    );
+    assert_eq!(mq + 1, mat_base + r.n_mat_pub, "the mat block walk is complete");
     let ela_base = mat_base + r.n_mat_pub;
     assert_eq!(
         public[ela_base],
@@ -10187,6 +10410,42 @@ fn check_real_child_region(public: &[F128], rt: &RealTape<'_>, r: &RealRegion) -
         public[ela_base + r.n_ela_pub],
         chals[rt.zskip_ch],
         "the published z_skip is the located squeeze"
+    );
+    // The family-H re-exposure block: the words the rs_half / V_rs advice
+    // reference, all published — validated here against the proof's own
+    // fields and the located challenges.
+    let mut fq = ela_base + r.n_ela_pub + 1;
+    for (k, &(_, _, rc)) in rt.rs_recs.iter().enumerate() {
+        for (i, &w) in rt.lo.proof.pcs_open.ring_switches[k].s_hat_v.iter().enumerate() {
+            assert_eq!(public[fq + i], w, "s_hat_v[{k}][{i}] re-exposed");
+        }
+        fq += 128;
+        for j in 0..7 {
+            assert_eq!(public[fq + j], chals[rc + j], "r_dprime[{k}][{j}] re-exposed");
+        }
+        fq += 7;
+    }
+    for k in 0..2 {
+        assert_eq!(public[fq + k], chals[rt.rs_gam_ch + k], "rs gamma {k} re-exposed");
+    }
+    fq += 2;
+    let fro = &rt.lo.proof.pcs_open.frobenius;
+    for (k, &vi) in rt.mp_i.val_vs.iter().enumerate() {
+        let want = if k < 256 {
+            fro.values[k / 128][k % 128]
+        } else {
+            fro.group_values[k - 256]
+        };
+        assert_eq!(public[fq + k], want, "mp value {k} re-exposed");
+        let _ = vi;
+    }
+    fq += rt.mp_i.val_vs.len();
+    assert_eq!(public[fq], rt.native_rs_half, "the rs_half advice");
+    assert_eq!(public[fq + 1], rt.native_vrs, "the V_rs advice");
+    assert_eq!(
+        fq + 2,
+        r.pub_base + r.n_query_pub + r.n_tail,
+        "the family-H block is the very tail"
     );
     r.n_query_pub + r.n_tail
 }
@@ -15509,8 +15768,9 @@ fn build_node_outer(
             use flock_core::zerocheck::multilinear::lagrange_weights_naive;
             let mut q = fold_pub_base + tail_len;
             for (k, rk) in regions.iter().enumerate() {
-                let zskip_pub =
-                    built2.public[rk.pub_base + rk.n_query_pub + rk.n_tail - 1];
+                // z_skip sits just before the family-H re-exposure block.
+                let zskip_pub = built2.public
+                    [rk.pub_base + rk.n_query_pub + rk.n_tail - rk.n_fam_pub - 1];
                 let lam = lagrange_weights_naive(K_SKIP, zskip_pub);
                 for (j, &l) in lam.iter().enumerate() {
                     assert_eq!(
