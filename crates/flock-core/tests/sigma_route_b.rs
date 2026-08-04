@@ -46,9 +46,9 @@ fn sigma_claim(mu: usize, nu: usize, sigma: &[usize], domain: &[u8]) -> MatrixCl
     let n = 1usize << mu;
     let w = vec![F128::new(0xD00D, 7); n];
     let mut chp = FsChallenger::new(domain);
-    let (proof, _) = prove_batched(&w, &w, sigma, &mut chp);
+    let (proof, _) = prove_batched(&w, &w, sigma, None, &mut chp);
     let mut chv = FsChallenger::new(domain);
-    let claim = verify_batched(mu, &proof, &mut chv).expect("trusting verify accepts");
+    let claim = verify_batched(mu, &proof, None, &mut chv).expect("trusting verify accepts");
     MatrixClaim {
         row: Weight::eq(claim.rho[..nu].to_vec()),
         col: Weight::eq(claim.rho[nu..].to_vec()),

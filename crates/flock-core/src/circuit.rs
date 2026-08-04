@@ -200,6 +200,22 @@ impl CellSpace {
     pub fn nu(&self) -> usize {
         self.nu
     }
+
+    /// Per cell-slot LIVE row counts: gate slots live up to their type's
+    /// declared count, public slots up to the public segment's tail, pads
+    /// never. This is the wiring grand product's [`product_gkr::LiveMask`]
+    /// — dead cells become identity leaves and the prover skips them.
+    pub fn live_counts(&self, counts: &[usize], num_public: usize) -> Vec<usize> {
+        let rows = 1usize << self.nu;
+        self.slots
+            .iter()
+            .map(|s| match *s {
+                CellSlot::Gate { ty, .. } => counts[ty].min(rows),
+                CellSlot::Public { s } => rows.min(num_public.saturating_sub(s << self.nu)),
+                CellSlot::Pad => 0,
+            })
+            .collect()
+    }
     /// `c` — the cell-slot variables.
     pub fn c_bits(&self) -> usize {
         self.c
@@ -477,6 +493,17 @@ impl Circuit {
     pub fn counts(&self) -> &[usize] {
         &self.counts
     }
+
+    /// The wiring grand product's live mask — statement-derived (counts +
+    /// public length are part of the circuit encoding), shared by prover,
+    /// verifier, the in-circuit transcription's checker, and the sigma
+    /// discharge, so the mask cannot drift between them.
+    pub fn live_mask(&self) -> product_gkr::LiveMask {
+        product_gkr::LiveMask {
+            nu: self.cells.nu(),
+            counts: self.cells.live_counts(&self.counts, self.num_public),
+        }
+    }
     /// Number of public words.
     pub fn num_public(&self) -> usize {
         self.num_public
@@ -649,7 +676,8 @@ pub fn prove_wiring<C: Challenger>(
 
     // ---- One grand-product permutation check at f = g = w.
     let t = std::time::Instant::now();
-    let (gkr, claim) = product_gkr::prove_batched(&w, &w, circuit.sigma(), ch);
+    let mask = circuit.live_mask();
+    let (gkr, claim) = product_gkr::prove_batched(&w, &w, circuit.sigma(), Some(&mask), ch);
     crate::scratch::give_f128(w);
     if trace {
         eprintln!(
@@ -737,11 +765,20 @@ impl SigmaAssertion {
     }
 
     /// The sigma table in the accumulator's matrix shape, from the SAME
-    /// encoding the verifier evaluates ([`product_gkr::build_s_sigma_vec`]).
+    /// encoding the verifier evaluates ([`product_gkr::build_s_sigma_vec`])
+    /// — MASKED to the live cells, matching the deferred claim's table
+    /// `live ⊙ s_σ` under the live-identity padding.
     pub fn matrix(circuit: &Circuit) -> crate::matrix_fold::DenseMatrix {
         let cells = circuit.cells();
+        let mask = circuit.live_mask();
+        let mut vals = product_gkr::build_s_sigma_vec(cells.mu(), circuit.sigma());
+        for (x, v) in vals.iter_mut().enumerate() {
+            if !mask.is_live(x) {
+                *v = F128::ZERO;
+            }
+        }
         crate::matrix_fold::DenseMatrix {
-            vals: product_gkr::build_s_sigma_vec(cells.mu(), circuit.sigma()),
+            vals,
             n_rows_log: cells.nu(),
         }
     }
@@ -794,10 +831,11 @@ fn verify_wiring_core<C: Challenger>(
         return Err(WiringError::MalformedProof);
     }
 
+    let mask = circuit.live_mask();
     let claim = if defer_sigma {
-        product_gkr::verify_batched(mu, &proof.gkr, ch)
+        product_gkr::verify_batched(mu, &proof.gkr, Some(&mask), ch)
     } else {
-        product_gkr::verify_batched_with_sigma(mu, &proof.gkr, circuit.sigma(), ch)
+        product_gkr::verify_batched_with_sigma(mu, &proof.gkr, circuit.sigma(), Some(&mask), ch)
     }
     .map_err(WiringError::Gkr)?;
 

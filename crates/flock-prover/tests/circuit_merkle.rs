@@ -8336,6 +8336,7 @@ fn mvp10_leaf_outer_inner_tape() {
         top_v: usize,
         layers: Vec<GkrLayerRec>,
         fgs_v: usize, // f_eval, g_eval, s_sigma consecutive
+        r_pt: Vec<F128>,
     }
     let gkr_rec = {
         let gkr = &lo.proof.wiring.gkr;
@@ -8419,16 +8420,20 @@ fn mvp10_leaf_outer_inner_tape() {
         let alpha2 = chals[c_alpha];
         let beta2 = chals[c_alpha + 1];
         let basis = flock_core::product_gkr::s_id_basis(mu_i);
-        let s_id_rho = flock_core::product_gkr::s_id_eval(&basis, &r_pt);
+        // The LIVE-IDENTITY padding: leaves are w + α·(live⊙s_id) +
+        // (β+1)·live + 1 (dead cells = 1), so the input checks carry the
+        // masked closed forms.
+        let mask_w = lo.shape.circuit.live_mask();
+        let tail_w2 = (beta2 + F128::ONE) * mask_w.live_eval(&r_pt) + F128::ONE;
         assert_eq!(
             claim_l,
-            gkr.f_eval + alpha2 * s_id_rho + beta2,
-            "lhs input check replays"
+            gkr.f_eval + alpha2 * mask_w.masked_id_eval(&basis, &r_pt) + tail_w2,
+            "lhs input check replays (masked)"
         );
         assert_eq!(
             claim_r,
-            gkr.g_eval + alpha2 * gkr.s_sigma_eval + beta2,
-            "rhs input check replays with the DEFERRED sigma value"
+            gkr.g_eval + alpha2 * gkr.s_sigma_eval + tail_w2,
+            "rhs input check replays with the DEFERRED (masked) sigma value"
         );
         let (fv, _) = vc_at(i);
         assert!(matches!(ops[i], Op::ObserveScalar), "f_eval obs");
@@ -8441,6 +8446,7 @@ fn mvp10_leaf_outer_inner_tape() {
             top_v: tv,
             layers: lrecs,
             fgs_v: fv,
+            r_pt,
         }
     };
 
@@ -8862,20 +8868,30 @@ fn mvp10_leaf_outer_inner_tape() {
         }
         let mu_i = lo.shape.circuit.cells().mu();
         assert_eq!(pt_w.len(), mu_i, "the GKR point spans the inner cell space");
+        // The input checks under the LIVE-IDENTITY padding: leaves are
+        // w + α·(live⊙s_id) + (β+1)·live + 1, so the deltas consume M̂(ρ)
+        // and livê(ρ) — STRUCTURAL functions of the published point,
+        // riding as checker-validated advice (the alpha-expansion tier;
+        // both are pinned by the pair of zero-deltas given the bound
+        // claim chains, and the checker recomputes them from the
+        // circuit's own live mask).
         let basis_i = flock_core::product_gkr::s_id_basis(mu_i);
-        let mut sid_w = zw;
-        for (j, &bj) in basis_i.iter().enumerate() {
-            vals.push(bj);
-            let bw = sb.public_input();
-            sid_w = sb.gate(macs, &[sid_w, bw, pt_w[j]])[0];
-        }
+        let mask_i = lo.shape.circuit.live_mask();
+        vals.push(mask_i.masked_id_eval(&basis_i, &gr.r_pt));
+        let mid_w = sb.public_input();
+        vals.push(mask_i.live_eval(&gr.r_pt));
+        let live_w = sb.public_input();
         let (f_w, g_w, sig_w) = (wv(gr.fgs_v), wv(gr.fgs_v + 1), wv(gr.fgs_v + 2));
-        let l1 = sb.gate(macs, &[f_w, g_alpha_w, sid_w])[0];
-        let l2 = sb.gate(macs, &[l1, g_beta_w, ow])[0];
-        gkr_deltas.push(sb.gate(macs, &[l2, cl_w, ow])[0]);
+        let l1 = sb.gate(macs, &[f_w, g_alpha_w, mid_w])[0];
+        let l2 = sb.gate(macs, &[l1, g_beta_w, live_w])[0];
+        let l3 = sb.gate(macs, &[l2, ow, live_w])[0];
+        let l4 = sb.gate(macs, &[l3, ow, ow])[0];
+        gkr_deltas.push(sb.gate(macs, &[l4, cl_w, ow])[0]);
         let r1 = sb.gate(macs, &[g_w, g_alpha_w, sig_w])[0];
-        let r2 = sb.gate(macs, &[r1, g_beta_w, ow])[0];
-        gkr_deltas.push(sb.gate(macs, &[r2, cr_w, ow])[0]);
+        let r2 = sb.gate(macs, &[r1, g_beta_w, live_w])[0];
+        let r3 = sb.gate(macs, &[r2, ow, live_w])[0];
+        let r4 = sb.gate(macs, &[r3, ow, ow])[0];
+        gkr_deltas.push(sb.gate(macs, &[r4, cr_w, ow])[0]);
 
         // ---- the swap, step 5: the MULTI-SLOT element PIOP in-circuit ----
         // Type reuse only (zcr, macs, mrslot all exist): the zerocheck's
@@ -10302,6 +10318,7 @@ fn mvp10_circuit_inner_tape() {
         top_v: usize,
         layers: Vec<GkrLayerRec>,
         fgs_v: usize, // f_eval, g_eval, s_sigma consecutive
+        r_pt: Vec<F128>,
     }
     // fin ordinal of the op at `end` = finalizing ops strictly before it.
     let fin_at = |end: usize| ops[..end].iter().filter(|o| o.finalizes()).count();
@@ -10391,16 +10408,18 @@ fn mvp10_circuit_inner_tape() {
         let alpha2 = chals[c_alpha];
         let beta2 = chals[c_alpha + 1];
         let basis = flock_core::product_gkr::s_id_basis(mu2);
-        let s_id_rho = flock_core::product_gkr::s_id_eval(&basis, &r_pt);
+        // Masked input checks under the live-identity padding.
+        let mask_w = built.shape.circuit.live_mask();
+        let tail_w2 = (beta2 + F128::ONE) * mask_w.live_eval(&r_pt) + F128::ONE;
         assert_eq!(
             claim_l,
-            gkr.f_eval + alpha2 * s_id_rho + beta2,
-            "lhs input check replays"
+            gkr.f_eval + alpha2 * mask_w.masked_id_eval(&basis, &r_pt) + tail_w2,
+            "lhs input check replays (masked)"
         );
         assert_eq!(
             claim_r,
-            gkr.g_eval + alpha2 * gkr.s_sigma_eval + beta2,
-            "rhs input check replays with the DEFERRED sigma value"
+            gkr.g_eval + alpha2 * gkr.s_sigma_eval + tail_w2,
+            "rhs input check replays with the DEFERRED (masked) sigma value"
         );
         // The triple observed last — the assertion's value wire.
         let (fv, _) = vc_at(i);
@@ -10414,6 +10433,7 @@ fn mvp10_circuit_inner_tape() {
             top_v: tv,
             layers: lrecs,
             fgs_v: fv,
+            r_pt,
         }
     };
 
@@ -10796,22 +10816,26 @@ fn mvp10_circuit_inner_tape() {
         }
         let mu_i = built.shape.circuit.cells().mu();
         assert_eq!(pt_w.len(), mu_i, "the GKR point spans the inner cell space");
-        // s_id(rho) = sum basis_i · rho_i — constants from the shared helper.
+        // The input checks under the LIVE-IDENTITY padding (see the swap
+        // test): M̂(ρ) and livê(ρ) as checker-validated advice publics.
         let basis_i = flock_core::product_gkr::s_id_basis(mu_i);
-        let mut sid_w = zw;
-        for (j, &bj) in basis_i.iter().enumerate() {
-            vals.push(bj);
-            let bw = sb.public_input();
-            sid_w = sb.gate(macs, &[sid_w, bw, pt_w[j]])[0];
-        }
+        let mask_i = built.shape.circuit.live_mask();
+        vals.push(mask_i.masked_id_eval(&basis_i, &g.r_pt));
+        let mid_w = sb.public_input();
+        vals.push(mask_i.live_eval(&g.r_pt));
+        let live_w = sb.public_input();
         // The two input checks, as published-zero deltas.
         let (f_w, g_w, sig_w) = (wv(g.fgs_v), wv(g.fgs_v + 1), wv(g.fgs_v + 2));
-        let l1 = sb.gate(macs, &[f_w, alpha_w, sid_w])[0];
-        let l2 = sb.gate(macs, &[l1, beta_w, ow])[0];
-        gkr_deltas.push(sb.gate(macs, &[l2, cl_w, ow])[0]);
+        let l1 = sb.gate(macs, &[f_w, alpha_w, mid_w])[0];
+        let l2 = sb.gate(macs, &[l1, beta_w, live_w])[0];
+        let l3 = sb.gate(macs, &[l2, ow, live_w])[0];
+        let l4 = sb.gate(macs, &[l3, ow, ow])[0];
+        gkr_deltas.push(sb.gate(macs, &[l4, cl_w, ow])[0]);
         let r1 = sb.gate(macs, &[g_w, alpha_w, sig_w])[0];
-        let r2 = sb.gate(macs, &[r1, beta_w, ow])[0];
-        gkr_deltas.push(sb.gate(macs, &[r2, cr_w, ow])[0]);
+        let r2 = sb.gate(macs, &[r1, beta_w, live_w])[0];
+        let r3 = sb.gate(macs, &[r2, ow, live_w])[0];
+        let r4 = sb.gate(macs, &[r3, ow, ow])[0];
+        gkr_deltas.push(sb.gate(macs, &[r4, cr_w, ow])[0]);
 
         // ---- assembly step 5: the MULTIPOINT intake at R = 2 AND P > 0 ----
         // The first tape with both kinds of claim in one schedule: 2x128 RS

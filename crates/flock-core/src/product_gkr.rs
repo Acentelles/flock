@@ -435,6 +435,136 @@ fn mle_eval(table: &[F128], point: &[F128]) -> F128 {
 }
 
 // ---------------------------------------------------------------------------
+// The live mask: identity-padded dead cells (the SP1-style 0/1 padding)
+// ---------------------------------------------------------------------------
+
+/// The live-row structure of the batched product's leaf space: `counts[ι]`
+/// live rows in slot ι's aligned `2^ν`-row subtree (the cell space's row-low
+/// layout: leaf `x` lives in slot `x >> ν`, row `x & (2^ν − 1)`).
+///
+/// With a mask, a DEAD leaf becomes the multiplicative identity —
+/// `leaf = live·(w + α·s + β) + (1 − live)` — so the grand product ranges
+/// over the live fingerprint multiset only and the prover may skip dead
+/// regions outright (each slot subtree is a live prefix over an all-ones
+/// tail). σ must fix every dead cell (checked in debug). Soundness is the
+/// same permutation argument restricted to the live set; the mask is
+/// statement-derived (the declared counts), so no prover freedom enters.
+///
+/// The input checks stay CLOSED FORM because `w` is already zero on dead
+/// cells and the selector multiplies only structural terms (char 2,
+/// `−1 = +1`):
+///
+///   leaf = w + α·(live ⊙ s_id) + (β + 1)·live + 1
+///   v̂(ρ) = ŵ(ρ) + α·M̂(ρ) + (β + 1)·livê(ρ) + 1
+///
+/// with `livê` ([`Self::live_eval`]) and `M̂` ([`Self::masked_id_eval`])
+/// evaluated by O(#slots·ν) / O(#slots·ν²) prefix eq-sums over the aligned
+/// live prefixes. On the σ side the deferred table becomes `live ⊙ s_σ`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveMask {
+    pub nu: usize,
+    /// Live rows per slot, `counts.len() = 2^(μ − ν)`.
+    pub counts: Vec<usize>,
+}
+
+impl LiveMask {
+    pub fn is_live(&self, x: usize) -> bool {
+        (x & ((1usize << self.nu) - 1)) < self.counts[x >> self.nu]
+    }
+
+    /// `Σ_{i<n} eq(p, i)` over `|p|` LSB-first coordinates — the
+    /// count-binding prefix sum, O(|p|). The prefix `[0, n)` decomposes
+    /// into one aligned subcube per set bit of `n`; partition of unity
+    /// makes each subcube's low part contribute exactly 1.
+    pub fn eq_prefix_sum(p: &[F128], n: usize) -> F128 {
+        if n >= 1usize << p.len() {
+            return F128::ONE;
+        }
+        let mut acc = F128::ZERO;
+        let mut run = F128::ONE;
+        for j in (0..p.len()).rev() {
+            if (n >> j) & 1 == 1 {
+                acc += run * (F128::ONE + p[j]);
+                run *= p[j];
+            } else {
+                run *= F128::ONE + p[j];
+            }
+        }
+        acc
+    }
+
+    /// `Σ_{i<n} eq(p, i)·(Σ_j basis_j·i_j)` — the prefix eq-sum weighted by
+    /// the identity tag's ROW part. Per subcube `C_t` of the prefix
+    /// decomposition: bits above `t` are `n`'s (fixed), bit `t` is 0, bits
+    /// below are free (contributing `p_j` each by partition of unity).
+    fn eq_prefix_id_sum(p: &[F128], n: usize, basis: &[F128]) -> F128 {
+        let nv = p.len();
+        if n >= 1usize << nv {
+            return basis
+                .iter()
+                .zip(p)
+                .fold(F128::ZERO, |acc, (b, x)| acc + *b * *x);
+        }
+        let mut acc = F128::ZERO;
+        let mut run = F128::ONE;
+        for t in (0..nv).rev() {
+            if (n >> t) & 1 == 1 {
+                let cube = run * (F128::ONE + p[t]);
+                let mut idsum = F128::ZERO;
+                for (j, b) in basis.iter().enumerate().take(nv) {
+                    if j > t {
+                        if (n >> j) & 1 == 1 {
+                            idsum += *b;
+                        }
+                    } else if j < t {
+                        idsum += *b * p[j];
+                    }
+                }
+                acc += cube * idsum;
+                run *= p[t];
+            } else {
+                run *= F128::ONE + p[t];
+            }
+        }
+        acc
+    }
+
+    /// `livê(ρ)` — the MLE of the live indicator at `ρ` (`|ρ| = μ`).
+    pub fn live_eval(&self, rho: &[F128]) -> F128 {
+        let (lo, hi) = rho.split_at(self.nu);
+        let eq_hi = crate::zerocheck::univariate_skip::build_eq(hi);
+        self.counts
+            .iter()
+            .zip(&eq_hi)
+            .fold(F128::ZERO, |acc, (&n, &e)| {
+                acc + e * Self::eq_prefix_sum(lo, n)
+            })
+    }
+
+    /// `M̂(ρ)` — the MLE of `live ⊙ s_id` at `ρ`.
+    pub fn masked_id_eval(&self, basis: &[F128], rho: &[F128]) -> F128 {
+        let (lo, hi) = rho.split_at(self.nu);
+        let eq_hi = crate::zerocheck::univariate_skip::build_eq(hi);
+        let hi_basis = &basis[self.nu..];
+        self.counts
+            .iter()
+            .enumerate()
+            .zip(&eq_hi)
+            .map(|((iota, &n), &e)| {
+                let mut tag_hi = F128::ZERO;
+                for (j, b) in hi_basis.iter().enumerate() {
+                    if (iota >> j) & 1 == 1 {
+                        tag_hi += *b;
+                    }
+                }
+                e * (tag_hi * Self::eq_prefix_sum(lo, n)
+                    + Self::eq_prefix_id_sum(lo, n, &basis[..self.nu]))
+            })
+            .fold(F128::ZERO, |acc, v| acc + v)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Product circuit build + layer sumcheck round message
 // ---------------------------------------------------------------------------
 
@@ -845,6 +975,7 @@ pub fn prove_batched<C: Challenger>(
     f: &[F128],
     g: &[F128],
     sigma: &[usize],
+    live: Option<&LiveMask>,
     ch: &mut C,
 ) -> (ProductGkrBatchedProof, ProductGkrBatchedClaim) {
     let n = f.len();
@@ -852,6 +983,13 @@ pub fn prove_batched<C: Challenger>(
     assert_eq!(sigma.len(), n);
     assert!(n.is_power_of_two() && n >= 2, "need N = 2^μ ≥ 2");
     let mu = n.trailing_zeros() as usize;
+    if let Some(m) = live {
+        debug_assert_eq!(m.counts.len() << m.nu, n, "mask spans the leaf space");
+        debug_assert!(
+            (0..n).all(|x| m.is_live(x) || (sigma[x] == x && f[x].is_zero() && g[x].is_zero())),
+            "dead cells must be σ-fixed with zero witness"
+        );
+    }
 
     let mut t = std::time::Instant::now();
     ch.observe_label(DOMAIN_BATCHED);
@@ -872,23 +1010,36 @@ pub fn prove_batched<C: Challenger>(
     // check that is compiled out.)
     assert!(mu <= 64, "s_id-as-index needs μ ≤ 64");
     let tag = |i: usize| F128::new(i as u64, 0);
+    // With a mask: the deferred/opened σ table is the MASKED `live ⊙ s_σ`
+    // (dead entries zero), and dead LEAVES are the multiplicative identity.
     let s_sig_vec: Vec<F128> = sigma
         .par_iter()
+        .enumerate()
         .with_min_len(par_threshold())
-        .map(|&sx| tag(sx))
+        .map(|(x, &sx)| match live {
+            Some(m) if !m.is_live(x) => F128::ZERO,
+            _ => tag(sx),
+        })
         .collect();
     tp(&mut t, "  s_sigma");
     let lhs: Vec<F128> = f
         .par_iter()
         .enumerate()
         .with_min_len(par_threshold())
-        .map(|(x, fx)| *fx + alpha * tag(x) + beta)
+        .map(|(x, fx)| match live {
+            Some(m) if !m.is_live(x) => F128::ONE,
+            _ => *fx + alpha * tag(x) + beta,
+        })
         .collect();
     let rhs: Vec<F128> = g
         .par_iter()
         .zip(&s_sig_vec)
+        .enumerate()
         .with_min_len(par_threshold())
-        .map(|(gx, sx)| *gx + alpha * *sx + beta)
+        .map(|(x, (gx, sx))| match live {
+            Some(m) if !m.is_live(x) => F128::ONE,
+            _ => *gx + alpha * *sx + beta,
+        })
         .collect();
     tp(&mut t, "  lhs,rhs");
 
@@ -1046,8 +1197,23 @@ pub fn prove_batched<C: Challenger>(
     // table with no closed form — still needs an `O(N)` MLE evaluation, so this
     // is one such pass instead of three.
     let s_sigma_eval = mle_eval(&s_sig_vec, &rho);
-    let f_eval = claim_l + alpha * s_id_eval(&basis, &rho) + beta;
-    let g_eval = claim_r + alpha * s_sigma_eval + beta;
+    // Reconstruct the witness evals from the collapsed claims (char 2:
+    // subtraction is addition). With a mask, the leaf's affine form is
+    // `w + α·(live⊙s_id) + (β+1)·live + 1` — see [`LiveMask`].
+    let (f_eval, g_eval) = match live {
+        None => (
+            claim_l + alpha * s_id_eval(&basis, &rho) + beta,
+            claim_r + alpha * s_sigma_eval + beta,
+        ),
+        Some(m) => {
+            let lv = m.live_eval(&rho);
+            let tail = (beta + F128::ONE) * lv + F128::ONE;
+            (
+                claim_l + alpha * m.masked_id_eval(&basis, &rho) + tail,
+                claim_r + alpha * s_sigma_eval + tail,
+            )
+        }
+    };
     observe_evals(ch, &[f_eval, g_eval, s_sigma_eval]);
     // Hand the ping-pong buffers back so the next prove reuses resident pages.
     for u in cur.into_iter().chain(nxt) {
@@ -1079,9 +1245,10 @@ pub fn prove_batched<C: Challenger>(
 pub fn verify_batched<C: Challenger>(
     mu: usize,
     proof: &ProductGkrBatchedProof,
+    live: Option<&LiveMask>,
     ch: &mut C,
 ) -> Result<ProductGkrBatchedClaim, VerifyError> {
-    verify_batched_core(mu, proof, None, ch)
+    verify_batched_core(mu, proof, None, live, ch)
 }
 
 /// Verify a batched product-GKR proof where **σ is verifier-known**: the
@@ -1105,16 +1272,18 @@ pub fn verify_batched_with_sigma<C: Challenger>(
     mu: usize,
     proof: &ProductGkrBatchedProof,
     sigma: &[usize],
+    live: Option<&LiveMask>,
     ch: &mut C,
 ) -> Result<ProductGkrBatchedClaim, VerifyError> {
     assert_eq!(sigma.len(), 1usize << mu, "σ length must be 2^mu");
-    verify_batched_core(mu, proof, Some(sigma), ch)
+    verify_batched_core(mu, proof, Some(sigma), live, ch)
 }
 
 fn verify_batched_core<C: Challenger>(
     mu: usize,
     proof: &ProductGkrBatchedProof,
     sigma_opt: Option<&[usize]>,
+    live: Option<&LiveMask>,
     ch: &mut C,
 ) -> Result<ProductGkrBatchedClaim, VerifyError> {
     if proof.layers.len() != mu {
@@ -1169,21 +1338,41 @@ fn verify_batched_core<C: Challenger>(
     }
 
     // Input-layer checks at the shared ρ: both reconstructed affinely, sharing
-    // the single witness eval (f_eval = g_eval = w(ρ) when f = g = w).
+    // the single witness eval (f_eval = g_eval = w(ρ) when f = g = w). With a
+    // mask, the leaf's affine form is `w + α·(live⊙s_id) + (β+1)·live + 1`
+    // and the σ table is the MASKED `live ⊙ s_σ` — see [`LiveMask`].
     let basis = s_id_basis(mu);
-    let s_id_rho = s_id_eval(&basis, &r_pt);
     // s_σ(ρ): verifier-computed when σ is known (not trusting the proof), else
     // the proof's claimed value.
     let s_sigma = match sigma_opt {
         Some(sigma) => {
             let s_id_vec = build_s_id_vec(mu, &basis);
-            let s_sig: Vec<F128> = sigma.iter().map(|&sx| s_id_vec[sx]).collect();
+            let s_sig: Vec<F128> = sigma
+                .iter()
+                .enumerate()
+                .map(|(x, &sx)| match live {
+                    Some(m) if !m.is_live(x) => F128::ZERO,
+                    _ => s_id_vec[sx],
+                })
+                .collect();
             mle_eval(&s_sig, &r_pt)
         }
         None => proof.s_sigma_eval,
     };
-    let lhs_in = proof.f_eval + alpha * s_id_rho + beta;
-    let rhs_in = proof.g_eval + alpha * s_sigma + beta;
+    let (lhs_in, rhs_in) = match live {
+        None => (
+            proof.f_eval + alpha * s_id_eval(&basis, &r_pt) + beta,
+            proof.g_eval + alpha * s_sigma + beta,
+        ),
+        Some(m) => {
+            let lv = m.live_eval(&r_pt);
+            let tail = (beta + F128::ONE) * lv + F128::ONE;
+            (
+                proof.f_eval + alpha * m.masked_id_eval(&basis, &r_pt) + tail,
+                proof.g_eval + alpha * s_sigma + tail,
+            )
+        }
+    };
     if claim_l != lhs_in || claim_r != rhs_in {
         return Err(VerifyError::InputMismatch);
     }
@@ -1202,6 +1391,91 @@ fn verify_batched_core<C: Challenger>(
 mod tests {
     use super::*;
     use crate::challenger::FsChallenger;
+
+    /// The live mask's closed forms match the explicit tables, and a masked
+    /// batched roundtrip accepts on BOTH verify arms with dead cells as
+    /// identity leaves — the SP1-style padding contract.
+    #[test]
+    fn live_mask_closed_forms_and_masked_roundtrip() {
+        let mut rng = Rng::new(0x11FE_2026);
+        let (nu, c) = (4usize, 3usize);
+        let mu = nu + c;
+        let n = 1usize << mu;
+        let counts: Vec<usize> = vec![5, 16, 0, 9, 1, 13, 7, 3];
+        let mask = LiveMask {
+            nu,
+            counts: counts.clone(),
+        };
+        let basis = s_id_basis(mu);
+        let live_vec: Vec<F128> = (0..n)
+            .map(|x| {
+                if mask.is_live(x) {
+                    F128::ONE
+                } else {
+                    F128::ZERO
+                }
+            })
+            .collect();
+        let mid_vec: Vec<F128> = (0..n)
+            .map(|x| {
+                if mask.is_live(x) {
+                    s_id_value(x, &basis)
+                } else {
+                    F128::ZERO
+                }
+            })
+            .collect();
+        for _ in 0..4 {
+            let rho: Vec<F128> = (0..mu).map(|_| rng.f128()).collect();
+            assert_eq!(
+                mask.live_eval(&rho),
+                mle_eval(&live_vec, &rho),
+                "livê closed form"
+            );
+            assert_eq!(
+                mask.masked_id_eval(&basis, &rho),
+                mle_eval(&mid_vec, &rho),
+                "M̂ closed form"
+            );
+        }
+        // A live-only permutation (dead cells σ-fixed) over a witness that
+        // is constant on live cells and zero on dead — honest for f = g = w.
+        let live_ix: Vec<usize> = (0..n).filter(|&x| mask.is_live(x)).collect();
+        let perm = rng.permutation(live_ix.len());
+        let mut sigma: Vec<usize> = (0..n).collect();
+        for (a, &pb) in perm.iter().enumerate() {
+            sigma[live_ix[a]] = live_ix[pb];
+        }
+        let w: Vec<F128> = (0..n)
+            .map(|x| {
+                if mask.is_live(x) {
+                    F128::new(0xD00D, 7)
+                } else {
+                    F128::ZERO
+                }
+            })
+            .collect();
+        let mut chp = FsChallenger::new(b"live-mask-test");
+        let (proof, claim_p) = prove_batched(&w, &w, &sigma, Some(&mask), &mut chp);
+        // The top product covers ONLY the live multiset (dead leaves = 1).
+        let mut chv = FsChallenger::new(b"live-mask-test");
+        let claim_v = verify_batched_with_sigma(mu, &proof, &sigma, Some(&mask), &mut chv)
+            .expect("masked sigma-aware verify accepts");
+        assert_eq!(claim_p, claim_v, "prover and verifier agree on the claim");
+        let mut chv2 = FsChallenger::new(b"live-mask-test");
+        let claim_t = verify_batched(mu, &proof, Some(&mask), &mut chv2)
+            .expect("masked trusting verify accepts");
+        assert_eq!(claim_p, claim_t, "the trusting arm agrees");
+        // A mask disagreement is caught: verifying with a different count
+        // fails the input checks.
+        let mut wrong = mask.clone();
+        wrong.counts[0] += 1;
+        let mut chv3 = FsChallenger::new(b"live-mask-test");
+        assert!(
+            verify_batched_with_sigma(mu, &proof, &sigma, Some(&wrong), &mut chv3).is_err(),
+            "a drifted mask fails"
+        );
+    }
 
     struct Rng(u64);
     impl Rng {
@@ -1402,7 +1676,7 @@ mod tests {
             let (f, g, sigma) = honest_instance(mu, 0x5EED ^ mu as u64);
             let mut ch = FsChallenger::new(b"prod-gkr-batched-mle-test");
             bind(&mut ch, &f, &g, &sigma);
-            let (_proof, claim) = prove_batched(&f, &g, &sigma, &mut ch);
+            let (_proof, claim) = prove_batched(&f, &g, &sigma, None, &mut ch);
             let basis = s_id_basis(mu);
             let s_sig: Vec<F128> = (0..f.len()).map(|x| s_id_value(sigma[x], &basis)).collect();
             assert_eq!(claim.f_eval, mle_eval(&f, &claim.rho), "μ={mu}: f");
@@ -1474,11 +1748,11 @@ mod tests {
             let (f, g, sigma) = honest_instance(mu, 0xBA7C ^ mu as u64);
             let mut chp = FsChallenger::new(b"prod-gkr-batched-test");
             bind(&mut chp, &f, &g, &sigma);
-            let (proof, claim_p) = prove_batched(&f, &g, &sigma, &mut chp);
+            let (proof, claim_p) = prove_batched(&f, &g, &sigma, None, &mut chp);
             assert_eq!(proof.top_lhs, proof.top_rhs, "μ={mu}: ∏lhs ≠ ∏rhs");
             let mut chv = FsChallenger::new(b"prod-gkr-batched-test");
             bind(&mut chv, &f, &g, &sigma);
-            let claim_v = verify_batched(mu, &proof, &mut chv).expect("verify");
+            let claim_v = verify_batched(mu, &proof, None, &mut chv).expect("verify");
             assert_eq!(claim_p, claim_v, "μ={mu}");
             assert_eq!(claim_v.rho.len(), mu, "single shared reduction point");
         }
@@ -1495,12 +1769,12 @@ mod tests {
         let w = cycle_constant_witness(&sigma, 0xD00D);
         let mut chp = FsChallenger::new(b"prod-gkr-batched-test");
         bind(&mut chp, &w, &w, &sigma);
-        let (proof, claim) = prove_batched(&w, &w, &sigma, &mut chp);
+        let (proof, claim) = prove_batched(&w, &w, &sigma, None, &mut chp);
         assert_eq!(proof.top_lhs, proof.top_rhs);
         assert_eq!(claim.f_eval, claim.g_eval, "f=g=w ⇒ one witness eval at ρ");
         let mut chv = FsChallenger::new(b"prod-gkr-batched-test");
         bind(&mut chv, &w, &w, &sigma);
-        verify_batched(mu, &proof, &mut chv).expect("verify");
+        verify_batched(mu, &proof, None, &mut chv).expect("verify");
     }
 
     #[test]
@@ -1513,10 +1787,10 @@ mod tests {
         w[3] += F128::ONE; // break constancy on a cycle
         let mut chp = FsChallenger::new(b"prod-gkr-batched-test");
         bind(&mut chp, &w, &w, &sigma);
-        let (proof, _) = prove_batched(&w, &w, &sigma, &mut chp);
+        let (proof, _) = prove_batched(&w, &w, &sigma, None, &mut chp);
         let mut chv = FsChallenger::new(b"prod-gkr-batched-test");
         bind(&mut chv, &w, &w, &sigma);
-        assert!(verify_batched(mu, &proof, &mut chv).is_err());
+        assert!(verify_batched(mu, &proof, None, &mut chv).is_err());
     }
 
     /// A proof of the wrong shape must be rejected, not panicked on — matching
@@ -1529,12 +1803,12 @@ mod tests {
 
         let mut chp = FsChallenger::new(b"prod-gkr-shape");
         bind(&mut chp, &f, &g, &sigma);
-        let (batched, _) = prove_batched(&f, &g, &sigma, &mut chp);
+        let (batched, _) = prove_batched(&f, &g, &sigma, None, &mut chp);
 
         let verify_shape = |p: &ProductGkrBatchedProof, mu: usize| {
             let mut ch = FsChallenger::new(b"prod-gkr-shape");
             bind(&mut ch, &f, &g, &sigma);
-            verify_batched(mu, p, &mut ch)
+            verify_batched(mu, p, None, &mut ch)
         };
         // Wrong layer count (both directions).
         let mut short = batched.clone();
@@ -1581,12 +1855,12 @@ mod tests {
         let (f, g, sigma) = honest_instance(mu, 0x7A47);
         let mut chp = FsChallenger::new(DOMAIN_TEST);
         bind(&mut chp, &f, &g, &sigma);
-        let (proof, claim) = prove_batched(&f, &g, &sigma, &mut chp);
+        let (proof, claim) = prove_batched(&f, &g, &sigma, None, &mut chp);
 
         let check = |p: &ProductGkrBatchedProof| {
             let mut ch = FsChallenger::new(DOMAIN_TEST);
             bind(&mut ch, &f, &g, &sigma);
-            verify_batched_with_sigma(mu, p, &sigma, &mut ch)
+            verify_batched_with_sigma(mu, p, &sigma, None, &mut ch)
         };
         assert!(check(&proof).is_ok(), "the honest proof must verify");
 
@@ -1668,7 +1942,7 @@ mod tests {
         let (f, g, sigma) = honest_instance(mu, 0xD00D);
         let mut chp = FsChallenger::new(DOMAIN_TEST);
         bind(&mut chp, &f, &g, &sigma);
-        let (proof, _) = prove_batched(&f, &g, &sigma, &mut chp);
+        let (proof, _) = prove_batched(&f, &g, &sigma, None, &mut chp);
 
         // Replay the transcript prefix to recover α, exactly as a prover would.
         let mut cha = FsChallenger::new(DOMAIN_TEST);
@@ -1684,7 +1958,7 @@ mod tests {
         // Trusting verifier: accepts, and hands back the forged evals.
         let mut chv = FsChallenger::new(DOMAIN_TEST);
         bind(&mut chv, &f, &g, &sigma);
-        let claim = verify_batched(mu, &forged, &mut chv).expect("trusting verifier accepts");
+        let claim = verify_batched(mu, &forged, None, &mut chv).expect("trusting verifier accepts");
         assert_eq!(claim.g_eval, proof.g_eval + delta);
         assert_ne!(claim.g_eval, proof.g_eval, "forgery really did change g(ρ)");
 
@@ -1692,13 +1966,13 @@ mod tests {
         let mut chv = FsChallenger::new(DOMAIN_TEST);
         bind(&mut chv, &f, &g, &sigma);
         assert_eq!(
-            verify_batched_with_sigma(mu, &forged, &sigma, &mut chv),
+            verify_batched_with_sigma(mu, &forged, &sigma, None, &mut chv),
             Err(VerifyError::InputMismatch),
         );
 
         // ...and still accepts the honest proof.
         let mut chv = FsChallenger::new(DOMAIN_TEST);
         bind(&mut chv, &f, &g, &sigma);
-        verify_batched_with_sigma(mu, &proof, &sigma, &mut chv).expect("honest proof verifies");
+        verify_batched_with_sigma(mu, &proof, &sigma, None, &mut chv).expect("honest proof verifies");
     }
 }

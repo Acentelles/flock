@@ -556,7 +556,8 @@ fn g_side_forgery_is_rejected() {
     assert_ne!(g, w, "the witness must not already satisfy the wiring");
 
     let mut ch = FsChallenger::new(DOMAIN);
-    let (gkr, claim) = product_gkr::prove_batched(&w, &g, sigma, &mut ch);
+    let mask = circuit.live_mask();
+    let (gkr, claim) = product_gkr::prove_batched(&w, &g, sigma, Some(&mask), &mut ch);
     assert_eq!(
         gkr.top_lhs, gkr.top_rhs,
         "the forged products DO match — the multiset identity holds for g = w∘σ"
@@ -672,6 +673,7 @@ fn fabricated_witness_fails_recombination() {
         cells.mu(),
         &fake_proof.gkr,
         circuit.sigma(),
+        Some(&circuit.live_mask()),
         &mut ch,
     )
     .expect("the fabricated GKR is internally honest")
