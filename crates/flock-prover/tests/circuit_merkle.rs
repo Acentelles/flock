@@ -12920,6 +12920,13 @@ fn mvp11_sigma_fold_tape() {
 /// `z_partial` column weights), the one weight shape the sigma fold never
 /// exercised. The five outputs reassemble the verifier's `Accumulator`
 /// exactly, and all three groups discharge.
+///
+/// **Step 3 adds the CHILD-TAPE regions**: the same outer circuit now also
+/// carries each child's complete deferred verifier (mvp10's assembly via
+/// the extracted [`emit_child_region`], instantiated twice over shared
+/// slots), each checked by [`check_child_region`] against its own native
+/// replicas — so the merge node's statement and its children's statements
+/// live in ONE proof.
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn mvp11_merge_fold_region() {
@@ -12929,18 +12936,9 @@ fn mvp11_merge_fold_region() {
 
     const M11_MERGE_DOMAIN: &[u8] = b"flock-mvp11-merge-node-v0";
 
-    let MixedInner {
-        built: built0,
-        work: work0,
-        sigma: sig0,
-        ..
-    } = mvp11_child(0x4D32_0001);
-    let MixedInner {
-        built: built1,
-        work: work1,
-        sigma: sig1,
-        ..
-    } = mvp11_child(0x4D32_0002);
+    let c0 = mvp11_child(0x4D32_0001);
+    let c1 = mvp11_child(0x4D32_0002);
+    let (built0, built1) = (&c0.built, &c1.built);
     assert_eq!(
         built0.shape.circuit.digest(),
         built1.shape.circuit.digest(),
@@ -12952,14 +12950,14 @@ fn mvp11_merge_fold_region() {
     let union0 = UnionInstance::new(registry, built0.shape.counts.clone());
     let union1 = UnionInstance::new(&built1.shape.registry, built1.shape.counts.clone());
     let bool_asserts = [
-        work0.boolean.expect("child 0 boolean work"),
-        work1.boolean.expect("child 1 boolean work"),
+        c0.work.boolean.clone().expect("child 0 boolean work"),
+        c1.work.boolean.clone().expect("child 1 boolean work"),
     ];
     let el_asserts = [
-        (&union0, work0.element.expect("child 0 element work")),
-        (&union1, work1.element.expect("child 1 element work")),
+        (&union0, c0.work.element.clone().expect("child 0 element work")),
+        (&union1, c1.work.element.clone().expect("child 1 element work")),
     ];
-    let sigmas = [sig0, sig1];
+    let sigmas = [c0.sigma.clone(), c1.sigma.clone()];
 
     // The native merge: prove + verify the aggregate under one challenger
     // each, then discharge all three groups — matrix work read only here
@@ -13285,8 +13283,18 @@ fn mvp11_merge_fold_region() {
     assert_eq!(outs[4], *sig_claim, "sigma accumulator");
     assert_eq!(*sig_digest, built0.shape.circuit.digest(), "sigma key");
 
-    // ---- the in-circuit replay of the WHOLE fold region ----
-    // One b3 slot replays bind + all five folds; every λ/μ/ρ is a chain
+    // ---- the child tapes: each child's verification, recorded + parsed ----
+    // ChildTape::new runs each child's RECORDING verify and re-asserts
+    // mvp10's whole tape map on it; the regions below are mvp10's assembly
+    // instantiated twice over shared slots.
+    let t0 = ChildTape::new(&c0, DOMAIN);
+    let t1 = ChildTape::new(&c1, DOMAIN);
+
+    // ---- the in-circuit replay: TWO CHILD-TAPE REGIONS + the fold region,
+    // in ONE outer circuit ----
+    // Each child region is the complete deferred verifier of its child
+    // (mvp10's assembly via the shared emitter). The fold region then
+    // replays bind + all five folds on one b3 slot; every λ/μ/ρ is a chain
     // squeeze wire and every message/claim coordinate an absorbed stream
     // word. The rounds ride MergedRoundGate, the eq-point parts of the
     // weight evals ride PrefixGate, and the boolean claims' LENGTH-64 LOWS
@@ -13319,17 +13327,29 @@ fn mvp11_merge_fold_region() {
         chain.absorb(&bytes[at * 16..]);
         let trace = chain.finish();
 
-        let b3_rows = trace.rows.len();
+        // The b3 slot carries all three chains (child0, child1, fold) plus
+        // the children's query-phase openings — size the row capacity once.
+        let b3_rows = t0.b3_rows + t1.b3_rows + trace.rows.len();
         let nu2 = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7);
         let mut sb = ShapeBuilder::new(nu2);
-        let b3s = sb.slot(Blake3Gate { nu: nu2 });
-        let macs = sb.slot(MacGate::new());
-        let mrs = sb.slot(MergedRoundGate::new());
-        let pf_w = 8usize;
-        let pfslot = sb.slot(PrefixGate::new(pf_w));
-        let leslot = sb.slot(LeafEvalGate::new(8));
-
+        let mut cs = ChildSlots::new(&mut sb, nu2, t0.max_path.max(t1.max_path));
         let mut vals: Vec<F128> = Vec::new();
+        let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
+        let r0 = emit_child_region(&mut sb, &mut cs, &t0, &mut vals, &mut hints);
+        let r1 = emit_child_region(&mut sb, &mut cs, &t1, &mut vals, &mut hints);
+        // The fold region rides the SAME slots the child regions created:
+        // rows, not columns.
+        let b3s = cs.q.b3;
+        let macs = cs.macs;
+        let mrs = cs.mrs;
+        let (pfslot, pf_w) = r0.pf;
+        let leslot = cs
+            .le
+            .iter()
+            .find(|&&(n, _)| n == 8)
+            .map(|&(_, s)| s)
+            .expect("the child regions created the 8-lane leaf-eval slot");
+
         let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
         vals.extend_from_slice(&iv_w);
         let iv2 = [sb.public_input(), sb.public_input()];
@@ -13398,8 +13418,11 @@ fn mvp11_merge_fold_region() {
                         a *= if (h >> b) & 1 == 1 { r } else { F128::ONE + r };
                     }
                     vals.push(a);
+                    // Record the PUBLIC index (not the input ordinal): with
+                    // the child regions sharing the builder the two no
+                    // longer coincide.
+                    recs.push((sb.public_len(), fi, row_side, h));
                     let a_w = sb.public_input();
-                    recs.push((vals.len() - 1, fi, row_side, h));
                     let mut g_in: Vec<Wire> = (0..8).map(|j| wv(low_v + 8 * h + j)).collect();
                     g_in.extend([rho_w[0], rho_w[1], rho_w[2]]);
                     g_in.push(a_w);
@@ -13506,6 +13529,7 @@ fn mvp11_merge_fold_region() {
         }
         // Publishes AFTER every input is declared: per fold, the two
         // zero-deltas then the accumulator claim (ρ_col, ρ_row, value).
+        let fold_pub_base = sb.public_len();
         for fp in &fold_pubs {
             sb.publish(fp.deltas[0]);
             sb.publish(fp.deltas[1]);
@@ -13519,14 +13543,29 @@ fn mvp11_merge_fold_region() {
         }
 
         let shape2 = sb.finish().expect("the mvp11 merge circuit builds");
-        let built2 = shape2.run(&vals, &[]);
+        let hint_refs: Vec<&dyn std::any::Any> =
+            hints.iter().map(|h| h as &dyn std::any::Any).collect();
+        let built2 = shape2.run(&vals, &hint_refs);
 
-        // The checker: walk the five published fold blocks — deltas zero,
-        // claims rebuilt — then validate every boundary-expanded eq public
-        // against the PUBLISHED ρ coordinates, reassemble the Accumulator
-        // from the public segment alone, and discharge all three groups.
+        // The two child regions' checker walks — the SAME helper mvp10 runs,
+        // so each child's whole deferred-verifier statement (query phase,
+        // GKR, element PIOP, multipoint, spine, residual, sigma emission +
+        // discharge) is held against its own native replicas here too.
+        let consumed0 = check_child_region(&built2.public, &t0, &r0);
+        let consumed1 = check_child_region(&built2.public, &t1, &r1);
+        assert!(
+            r0.pub_base + consumed0 <= r1.pub_base && r1.pub_base + consumed1 <= fold_pub_base,
+            "the three regions' public blocks are disjoint and ordered"
+        );
+
+        // The fold checker: walk the five published fold blocks — deltas
+        // zero, claims rebuilt — then validate every boundary-expanded eq
+        // public against the PUBLISHED ρ coordinates, reassemble the
+        // Accumulator from the public segment alone, and discharge all
+        // three groups.
         let tail_len: usize = locs.iter().map(|l| 3 + l.k_col + l.k_row).sum();
         let tail0 = built2.public.len() - tail_len;
+        assert_eq!(tail0, fold_pub_base, "the fold's publics are the tail");
         let mut p = tail0;
         let mut rebuilt: Vec<MatrixClaim> = Vec::new();
         for loc in &locs {
@@ -13595,7 +13634,13 @@ fn mvp11_merge_fold_region() {
         };
         let b3_r1cs2 = blake3::build_block_r1cs(nu2);
         let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
-        let mut el_ord: Vec<(usize, Vec<F128>)> = [macs, mrs, pfslot, leslot]
+        let swap_r1cs2 = SwapTable::build_block_r1cs(nu2);
+        let swap_lc2 = swap_r1cs2.csc_lincheck_circuit();
+        let spread_ty2 = BitSpreadTable::new(t0.max_path.max(t1.max_path));
+        let spread_r1cs2 = spread_ty2.build_block_r1cs(nu2);
+        let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
+        let mut el_ord: Vec<(usize, Vec<F128>)> = cs
+            .element_slot_ids()
             .into_iter()
             .map(|sl| {
                 let z = match &built2.witnesses[shape2.registry_slot(sl)] {
@@ -13610,20 +13655,57 @@ fn mvp11_merge_fold_region() {
             .into_iter()
             .map(|(i, z)| live_element_input(z, shape2.counts[i], nu2))
             .collect();
+        let mut bslots: Vec<(usize, UnionSlotProverInput)> = vec![
+            (
+                shape2.registry_slot(cs.q.b3),
+                UnionSlotProverInput::new(
+                    blake3::generate_witness_batch_major_partial(
+                        built2.rows::<Blake3Gate>(cs.q.b3),
+                        nu2,
+                    ),
+                    b3_lc2,
+                ),
+            ),
+            (
+                shape2.registry_slot(cs.q.swap),
+                UnionSlotProverInput::new(
+                    SwapTable::generate_witness_batch_major(
+                        built2.rows::<SwapGate>(cs.q.swap),
+                        nu2,
+                    ),
+                    swap_lc2,
+                ),
+            ),
+            (
+                shape2.registry_slot(cs.q.spread),
+                UnionSlotProverInput::new(
+                    spread_ty2.generate_witness_batch_major(
+                        built2.rows::<BitSpreadGate>(cs.q.spread),
+                        nu2,
+                    ),
+                    spread_lc2,
+                ),
+            ),
+        ];
+        bslots.sort_by_key(|(i, _)| *i);
         let mut ch2 = FsChallenger::new(DOMAIN);
         let (oproof, ocommit, _) = prover::prove_fast_ligerito_union_circuit(
             &union2,
             &shape2.circuit,
             &built2.public,
             &pcs2,
-            vec![UnionSlotProverInput::new(
-                blake3::generate_witness_batch_major_partial(built2.rows::<Blake3Gate>(b3s), nu2),
-                b3_lc2,
-            )],
+            bslots.into_iter().map(|(_, x)| x).collect(),
             el_inputs,
             &mut ch2,
         );
-        let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![b3_lc2];
+        let mut lco: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
+            (shape2.registry_slot(cs.q.b3), b3_lc2),
+            (shape2.registry_slot(cs.q.swap), swap_lc2),
+            (shape2.registry_slot(cs.q.spread), spread_lc2),
+        ];
+        lco.sort_by_key(|(i, _)| *i);
+        let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
+            lco.into_iter().map(|(_, c)| c).collect();
         let mut ch2 = FsChallenger::new(DOMAIN);
         verifier::verify_ligerito_union_circuit(
             &union2,
@@ -13646,14 +13728,18 @@ fn mvp11_merge_fold_region() {
     };
 
     println!(
-        "\nMVP-11 MERGE FOLD REGION (bind + 5 folds under ONE challenger, IN-CIRCUIT)\n  \
+        "\nMVP-11 MERGE NODE (2 CHILD-TAPE REGIONS + bind + 5 folds, ONE outer circuit)\n  \
+         children: 2x the mvp10 assembly over SHARED slots (each the complete\n         \
+         deferred verifier of its child, b3 rows {} + {})\n  \
          folds: blake3 A/B ({} col + {} row rounds each, low-64 weights via LeafEval\n         \
          chains), mac A/B ({}+{} rounds, pure eq — FIRST element-group exercise),\n         \
          sigma ({}+{})\n  \
-         tape: {} ops | {} stream values | {} squeezes — all 10 endpoints close from\n  \
-         located words AND as published zero-deltas; the Accumulator reassembles from\n  \
-         the public segment alone and discharges all three groups\n  \
-         outer: chain b3 rows {} | nu {} | dense_m {} | mu {} | proof {:.1} KiB\n",
+         fold tape: {} ops | {} stream values | {} squeezes — all 10 endpoints close\n  \
+         from located words AND as published zero-deltas; the Accumulator reassembles\n  \
+         from the public segment alone and discharges all three groups\n  \
+         outer: total b3 rows {} | nu {} | dense_m {} | mu {} | proof {:.1} KiB\n",
+        t0.b3_rows,
+        t1.b3_rows,
         locs[0].k_col,
         locs[0].k_row,
         locs[2].k_col,
