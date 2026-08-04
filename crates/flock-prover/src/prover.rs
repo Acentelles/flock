@@ -812,9 +812,11 @@ fn prove_union_with_binding<Ch: Challenger>(
     // whole region, so the copy stays faithful — including whatever the
     // full derivation wrote on dead rows (the per-column constants).
     let t = std::time::Instant::now();
+    let mut live_arm = false;
     let element_ab: Option<(Vec<F128>, Vec<F128>)> = union.has_element().then(|| {
         let r = union.element_word_range();
         if flock_core::element_r1cs::union::dead_rows_unread(union) {
+            live_arm = true;
             flock_core::element_r1cs::union::copy_live_region(
                 union,
                 &a_packed_f128[r.clone()],
@@ -827,8 +829,9 @@ fn prove_union_with_binding<Ch: Challenger>(
 
     if trace && element_ab.is_some() {
         eprintln!(
-            "  [prove_union] element a/b copies (2^{} words): {:7.2} ms",
+            "  [prove_union] element a/b copies (2^{} words, {}): {:7.2} ms",
             union.m_elem() - 7,
+            if live_arm { "LIVE spans" } else { "DENSE" },
             t.elapsed().as_secs_f64() * 1e3
         );
     }
