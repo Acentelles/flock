@@ -9304,6 +9304,8 @@ struct RealRegion {
     /// The family-H re-exposure block length (the tail past z_skip).
     n_fam_pub: usize,
     n_ela_pub: usize,
+    /// The z_skip squeeze wire — see [`ChildRegion::zskip_w`].
+    zskip_w: Wire,
     /// sigma: the deferred s_sigma stream word + the GKR squeeze point.
     #[allow(dead_code)]
     sig_w: Wire,
@@ -10058,10 +10060,6 @@ fn emit_real_child_region(
     for w in &ela_pub {
         sb.publish(*w);
     }
-    // The z_skip squeeze wire, published: the boolean claims' lagrange row
-    // lows derive from it — the 2→1 merge's checker rebuilds them from
-    // THIS published value (the alpha-expansion trust class).
-    sb.publish(outs[trace.squeezes[rt.zskip_fin][0]][0]);
     // ROUND 0's family-H RE-EXPOSURE: the words the rs_half / V_rs advice
     // checks reference — s_hat_v (2×128), the r_dprime squeeze wires
     // (2×7), the two rs gammas, and the 256+P multipoint value words. All
@@ -10105,7 +10103,6 @@ fn emit_real_child_region(
         + 1
         + mat_pub.len()
         + ela_pub.len()
-        + 1
         + n_fam_pub;
     RealRegion {
         pub_base,
@@ -10113,6 +10110,7 @@ fn emit_real_child_region(
         n_tail,
         n_mat_pub: mat_pub.len(),
         n_fam_pub,
+        zskip_w: outs[trace.squeezes[rt.zskip_fin][0]][0],
         n_ela_pub: ela_pub.len(),
         sig_w,
         pt_w,
@@ -10352,15 +10350,10 @@ fn check_real_child_region(public: &[F128], rt: &RealTape<'_>, r: &RealRegion) -
             "per-slot eval pair {j} rides as bound advice"
         );
     }
-    assert_eq!(
-        public[ela_base + r.n_ela_pub],
-        chals[rt.zskip_ch],
-        "the published z_skip is the located squeeze"
-    );
     // The family-H re-exposure block: the words the rs_half / V_rs advice
     // reference, all published — validated here against the proof's own
     // fields and the located challenges.
-    let mut fq = ela_base + r.n_ela_pub + 1;
+    let mut fq = ela_base + r.n_ela_pub;
     for (k, &(_, _, rc)) in rt.rs_recs.iter().enumerate() {
         for (i, &w) in rt.lo.proof.pcs_open.ring_switches[k].s_hat_v.iter().enumerate() {
             assert_eq!(public[fq + i], w, "s_hat_v[{k}][{i}] re-exposed");
@@ -10840,6 +10833,57 @@ fn emit_eq_prefix(
         eq_w = next;
     }
     eq_w
+}
+
+/// **THE LAGRANGE ROW LOWS in-circuit (round 4).** The 64 weights
+/// `L_i(z_skip) = Z_N(z)·(z + λ_i)^{-1}·den^{-1}` a merge fold's boolean
+/// claims carry, derived from the child's z_skip WIRE instead of published
+/// and checker-rebuilt: `t_i = z + λ_i` against the shared λ const wires,
+/// `Z = Π t_i` (a MAC chain — no subspace recursion needed, the factors are
+/// already wires), the inverses as ADVICE bound by `t_i·y_i = 1` rows
+/// (witness, not publics), and `w_i = (Z·den^{-1})·y_i`. The caller connects
+/// each `w_i` to the fold's absorbed low word.
+///
+/// `z` on a node has no inverse witness — the ≈2^-121 completeness caveat a
+/// fixed-topology circuit carries in its soundness accounting instead of a
+/// branch (`lagrange_weights_on_coset`'s own posture, same constant).
+#[allow(clippy::too_many_arguments)]
+fn emit_lagrange_lows(
+    sb: &mut ShapeBuilder,
+    macs: flock_core::circuit::builder::SlotId,
+    lam_w: &[Wire],
+    deninv_w: Wire,
+    zskip_w: Wire,
+    z_native: F128,
+    vals: &mut Vec<F128>,
+    zw: Wire,
+    ow: Wire,
+    zassert: Wire,
+) -> Vec<Wire> {
+    use flock_core::field::PHI_8_TABLE;
+    let ell = lam_w.len();
+    let mut t_w = Vec::with_capacity(ell);
+    let mut z_acc = ow;
+    for &lw2 in lam_w {
+        let t = sb.gate(macs, &[zskip_w, lw2, ow])[0];
+        z_acc = sb.gate(macs, &[zw, z_acc, t])[0];
+        t_w.push(t);
+    }
+    let scale = sb.gate(macs, &[zw, z_acc, deninv_w])[0];
+    (0..ell)
+        .map(|i| {
+            let ti = z_native + PHI_8_TABLE[i];
+            assert!(!ti.is_zero(), "z_skip on a φ8 node (≈2^-121)");
+            vals.push(ti.inv());
+            let y = sb.input();
+            // 1 + t·y == 0 (char 2), into the dedicated assert-zero anchor —
+            // connecting a producer into the ubiquitous `ow` class is the
+            // recorded Cyclic trap.
+            let delta = sb.gate(macs, &[ow, t_w[i], y])[0];
+            sb.connect(delta, zassert);
+            sb.gate(macs, &[zw, scale, y])[0]
+        })
+        .collect()
 }
 
 /// **THE RECOMBINATION in-circuit (round 4).** Rebuild `ŵ(ρ)` from the
@@ -12113,6 +12157,9 @@ struct ChildRegion {
     b_mlv_w: Vec<Wire>,
     b_lc_w: Vec<Wire>,
     b_zpartial_w: Vec<Wire>,
+    /// The z_skip squeeze wire — the merge assemblies derive the lagrange
+    /// row lows from it IN-CIRCUIT (no publish, no checker rebuild).
+    zskip_w: Wire,
     /// The residual close-out's prefix slot (and width) — reusable by a
     /// caller emitting more prefix products into the same builder.
     pf: (flock_core::circuit::builder::SlotId, usize),
@@ -12786,12 +12833,7 @@ fn emit_child_region(
     for w in &pt_w {
         sb.publish(*w);
     }
-    // The z_skip squeeze wire, published: the boolean claims' lagrange row
-    // lows derive from it, and the merge node's checker rebuilds them from
-    // THIS published value (the alpha-expansion trust class — the
-    // SkipNodeGate/φ8 in-circuit derivation is the recorded upgrade).
-    sb.publish(outs[trace.squeezes[ct.zskip_fin][0]][0]);
-    let n_tail = 2 + 2 + 4 + levels.len() * ct.yr_len + 1 + 1 + ct.mu_i + 1;
+    let n_tail = 2 + 2 + 4 + levels.len() * ct.yr_len + 1 + 1 + ct.mu_i;
     let n_query_pub: usize =
         levels.len() + levels.iter().map(|l| l.a_count).sum::<usize>();
     ChildRegion {
@@ -12817,6 +12859,7 @@ fn emit_child_region(
             .map(|&(_, fin)| outs[trace.squeezes[fin][0]][0])
             .collect(),
         b_zpartial_w: (0..64).map(|i| wv(ct.zp_v + i)).collect(),
+        zskip_w: outs[trace.squeezes[ct.zskip_fin][0]][0],
         pf: (pfslot, pf_w),
     }
 }
@@ -12942,11 +12985,6 @@ fn check_child_region(public: &[F128], ct: &ChildTape<'_>, r: &ChildRegion) -> u
             "the emitted sigma assertion discharges against the inner circuit"
         );
     }
-    assert_eq!(
-        public[sig_base + 1 + ct.mu_i],
-        chals[ct.zskip_ch],
-        "the published z_skip is the located squeeze"
-    );
     r.n_query_pub + r.n_tail
 }
 
@@ -14614,9 +14652,54 @@ fn mvp11_merge_fold_region() {
         // lows (published below; the checker rebuilds them from each
         // child's PUBLISHED z_skip — the SkipNodeGate/φ8 in-circuit
         // derivation is the recorded upgrade).
+        // The lagrange-low constants, shared by both children: the 64 φ8
+        // nodes and the subspace denominator inverse — statement constants
+        // the checker validates below (the ONE public surface the
+        // in-circuit derivation adds).
+        use flock_core::field::PHI_8_TABLE;
+        use flock_core::zerocheck::K_SKIP;
+        use flock_core::zerocheck::multilinear::{
+            lagrange_weights_naive, subspace_denominator_pair,
+        };
+        let lam_base = sb.public_len();
+        let lam_w: Vec<Wire> = PHI_8_TABLE[..1 << K_SKIP]
+            .iter()
+            .map(|&v| {
+                vals.push(v);
+                sb.public_input()
+            })
+            .collect();
+        vals.push(subspace_denominator_pair(K_SKIP).1);
+        let deninv_w = sb.public_input();
+        // The lows' assert-zero anchor: producers only, no consumer edges.
+        vals.push(F128::ZERO);
+        let lag_zassert = sb.public_input();
         let tapes = [&t0, &t1];
         let regions = [&r0, &r1];
         for (k, (tk, rk)) in tapes.iter().zip(&regions).enumerate() {
+            // The lagrange row lows, IN-CIRCUIT from the child's z_skip wire
+            // (native pre-assert first: the fold's absorbed lows ARE the closed
+            // form at the located z_skip).
+            assert_eq!(
+                &fold_claims[0][n_priors + k].row.low[..],
+                &lagrange_weights_naive(K_SKIP, tk.chals[tk.zskip_ch])[..],
+                "child {k}: the fold's lagrange lows are the closed form"
+            );
+            let lows = emit_lagrange_lows(
+                &mut sb,
+                cs.macs,
+                &lam_w,
+                deninv_w,
+                rk.zskip_w,
+                tk.chals[tk.zskip_ch],
+                &mut vals,
+                zw,
+                ow,
+                lag_zassert,
+            );
+            for (j, &lw2) in lows.iter().enumerate() {
+                sb.connect(lw2, wv(locs[0].claims[n_priors + k].row_low_v + j));
+            }
             // Native pre-asserts (the method-note discipline): every wire
             // mapping below is first checked value-for-value against the
             // verifier's own assertion data.
@@ -14753,9 +14836,6 @@ fn mvp11_merge_fold_region() {
         // no child wire yet) and against each child's published z_skip
         // (the lagrange lows).
         for k in 0..2 {
-            for j in 0..locs[0].claims[n_priors + k].row_low_n {
-                sb.publish(wv(locs[0].claims[n_priors + k].row_low_v + j));
-            }
             sb.publish(wv(locs[0].claims[n_priors + k].value_v));
             sb.publish(wv(locs[1].claims[n_priors + k].value_v));
             sb.publish(wv(locs[2].claims[n_priors + k].value_v));
@@ -14826,21 +14906,21 @@ fn mvp11_merge_fold_region() {
         // the checker tier — then the four matrix-eval values held against
         // the children's assertions.
         {
-            use flock_core::zerocheck::K_SKIP;
-            use flock_core::zerocheck::multilinear::lagrange_weights_naive;
+            for (i, &v) in PHI_8_TABLE[..1 << K_SKIP].iter().enumerate() {
+                assert_eq!(built2.public[lam_base + i], v, "λ const {i}");
+            }
+            assert_eq!(
+                built2.public[lam_base + (1 << K_SKIP)],
+                subspace_denominator_pair(K_SKIP).1,
+                "the subspace denominator inverse const"
+            );
+            assert_eq!(
+                built2.public[lam_base + (1 << K_SKIP) + 1],
+                F128::ZERO,
+                "the lows' assert-zero anchor"
+            );
             let mut q = tail0 + tail_len;
-            for (k, (tk, rk)) in tapes.iter().zip(&regions).enumerate() {
-                let zskip_pub =
-                    built2.public[rk.pub_base + rk.n_query_pub + rk.n_tail - 1];
-                let lam = lagrange_weights_naive(K_SKIP, zskip_pub);
-                for (j, &l) in lam.iter().enumerate() {
-                    assert_eq!(
-                        built2.public[q + j],
-                        l,
-                        "child {k}: lagrange low {j} rebuilds from the published z_skip"
-                    );
-                }
-                q += 64;
+            for (k, tk) in tapes.iter().enumerate() {
                 assert_eq!(
                     built2.public[q],
                     tk.bool_assert.evals[0].0,
@@ -15747,9 +15827,54 @@ fn build_node_outer(
         // boundary pattern (published below, rebuilt by the checker from
         // each child's PUBLISHED z_skip; SkipNodeGate/φ8 is the recorded
         // upgrade).
+        // The lagrange-low constants, shared by both children: the 64 φ8
+        // nodes and the subspace denominator inverse — statement constants
+        // the checker validates below (the ONE public surface the
+        // in-circuit derivation adds).
+        use flock_core::field::PHI_8_TABLE;
+        use flock_core::zerocheck::K_SKIP;
+        use flock_core::zerocheck::multilinear::{
+            lagrange_weights_naive, subspace_denominator_pair,
+        };
+        let lam_base = sb.public_len();
+        let lam_w: Vec<Wire> = PHI_8_TABLE[..1 << K_SKIP]
+            .iter()
+            .map(|&v| {
+                vals.push(v);
+                sb.public_input()
+            })
+            .collect();
+        vals.push(subspace_denominator_pair(K_SKIP).1);
+        let deninv_w = sb.public_input();
+        // The lows' assert-zero anchor: producers only, no consumer edges.
+        vals.push(F128::ZERO);
+        let lag_zassert = sb.public_input();
         let tapes = [&rt0, &rt1];
         let regions = [&r0, &r1];
         for (k, (tk, rk)) in tapes.iter().zip(&regions).enumerate() {
+            // The lagrange row lows, IN-CIRCUIT from the child's z_skip wire
+            // (native pre-assert first: the fold's absorbed lows ARE the closed
+            // form at the located z_skip).
+            assert_eq!(
+                &fold_claims[0][k].row.low[..],
+                &lagrange_weights_naive(K_SKIP, tk.chals[tk.zskip_ch])[..],
+                "child {k}: the fold's lagrange lows are the closed form"
+            );
+            let lows = emit_lagrange_lows(
+                &mut sb,
+                cs.macs,
+                &lam_w,
+                deninv_w,
+                rk.zskip_w,
+                tk.chals[tk.zskip_ch],
+                &mut vals,
+                zw,
+                ow,
+                lag_zassert,
+            );
+            for (j, &lw2) in lows.iter().enumerate() {
+                sb.connect(lw2, wv(locs[0].claims[k].row_low_v + j));
+            }
             // Native pre-asserts (the method-note discipline).
             for t in 0..n_bool {
                 let inner_t = fold_claims[2 * t][k].row.point.len();
@@ -15892,11 +16017,6 @@ fn build_node_outer(
             }
             sb.publish(fp.value);
         }
-        for k in 0..2 {
-            for j in 0..locs[0].claims[k].row_low_n {
-                sb.publish(wv(locs[0].claims[k].row_low_v + j));
-            }
-        }
 
         let shape2 = sb.finish().expect("the 2->1 node circuit builds");
         assert!(
@@ -15979,27 +16099,27 @@ fn build_node_outer(
                 && acc_pub.discharge_sigma(&lo0.shape.circuit),
             "the public-segment accumulator discharges all three groups"
         );
-        // The lagrange-low publics: rebuilt from each child's PUBLISHED
-        // z_skip — the one connect left at the checker tier.
+        // The lagrange-low constants: the one public surface the in-circuit
+        // derivation adds — validated against the verifier's own values.
         {
-            use flock_core::zerocheck::K_SKIP;
-            use flock_core::zerocheck::multilinear::lagrange_weights_naive;
-            let mut q = fold_pub_base + tail_len;
-            for (k, rk) in regions.iter().enumerate() {
-                // z_skip sits just before the family-H re-exposure block.
-                let zskip_pub = built2.public
-                    [rk.pub_base + rk.n_query_pub + rk.n_tail - rk.n_fam_pub - 1];
-                let lam = lagrange_weights_naive(K_SKIP, zskip_pub);
-                for (j, &l) in lam.iter().enumerate() {
-                    assert_eq!(
-                        built2.public[q + j],
-                        l,
-                        "child {k}: lagrange low {j} rebuilds from the published z_skip"
-                    );
-                }
-                q += 64;
+            for (i, &v) in PHI_8_TABLE[..1 << K_SKIP].iter().enumerate() {
+                assert_eq!(built2.public[lam_base + i], v, "λ const {i}");
             }
-            assert_eq!(q, built2.public.len(), "the low publics are the very tail");
+            assert_eq!(
+                built2.public[lam_base + (1 << K_SKIP)],
+                subspace_denominator_pair(K_SKIP).1,
+                "the subspace denominator inverse const"
+            );
+            assert_eq!(
+                built2.public[lam_base + (1 << K_SKIP) + 1],
+                F128::ZERO,
+                "the lows' assert-zero anchor"
+            );
+            assert_eq!(
+                fold_pub_base + tail_len,
+                built2.public.len(),
+                "the fold blocks are the very tail"
+            );
         }
 
         // The node proves and verifies over the circuit path.

@@ -107,7 +107,12 @@ fn round2_pair_skip(run: &crate::zerocheck::PaddingRun, k_skip: usize) -> (usize
 /// inverting it per call cost one `inv` (255 native muls) every time for a
 /// value that never varies. In-circuit it is a public constant, so this takes
 /// it from one constraint to none.
-fn subspace_denominator_pair(dim: usize) -> (F128, F128) {
+/// `(den, den^{-1})` for the dimension-`dim` φ8 node subspace — the shared
+/// Lagrange denominator of [`lagrange_weights_on_coset`]'s closed form.
+/// `pub`: the recursion circuit's in-circuit lagrange lows bake `den^{-1}`
+/// as a statement constant and must name the SAME value the native weights
+/// use (verifier-exported references over formulas-written-twice).
+pub fn subspace_denominator_pair(dim: usize) -> (F128, F128) {
     use std::sync::OnceLock;
     static CACHE: OnceLock<[(F128, F128); 9]> = OnceLock::new();
     let table = CACHE.get_or_init(|| {
