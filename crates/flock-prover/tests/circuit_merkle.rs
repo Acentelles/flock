@@ -15579,8 +15579,10 @@ fn build_node_outer(
     let registry = &lo0.shape.registry;
     let union0 = UnionInstance::new(registry, lo0.shape.counts.clone());
     let union1 = UnionInstance::new(&lo1.shape.registry, lo1.shape.counts.clone());
+    let t_tapes = std::time::Instant::now();
     let rt0 = RealTape::new(&lo0, DOMAIN);
     let rt1 = RealTape::new(&lo1, DOMAIN);
+    let tapes_ms = t_tapes.elapsed().as_secs_f64() * 1e3;
     assert_ne!(
         rt0.sigma_native.rho, rt1.sigma_native.rho,
         "distinct witnesses, distinct FS points"
@@ -16018,6 +16020,8 @@ fn build_node_outer(
             sb.publish(fp.value);
         }
 
+        let build_ms = t_tapes.elapsed().as_secs_f64() * 1e3 - tapes_ms;
+        let t_build2 = std::time::Instant::now();
         let shape2 = sb.finish().expect("the 2->1 node circuit builds");
         assert!(
             shape2.circuit.cells().slots().len() <= 512,
@@ -16061,7 +16065,10 @@ fn build_node_outer(
         }
         let hint_refs: Vec<&dyn std::any::Any> =
             hints.iter().map(|h| h as &dyn std::any::Any).collect();
+        let build_ms = build_ms + t_build2.elapsed().as_secs_f64() * 1e3;
+        let t_trace = std::time::Instant::now();
         let built2 = shape2.run(&vals, &hint_refs);
+        let trace_ms = t_trace.elapsed().as_secs_f64() * 1e3;
 
         // The two child regions' checker walks — each child's whole
         // deferred-verifier statement held against its own replicas.
@@ -16251,10 +16258,12 @@ fn build_node_outer(
              regions: 2x the complete deferred verifier (swap assembly, shared slots)\n         \
              + the fold region; CONNECTED: all points, z_partial lows, sigma fully,\n         \
              and the matrix/element EVAL VALUES to the children's bound advice —\n         \
-             lagrange lows published, checker-rebuilt from each child's z_skip\n  \
+             lagrange lows DERIVED in-circuit from each child's z_skip wire\n  \
              outer: total b3 rows {} | nu {} | dense_m {} | mu {} \
              (cell slots: {} gate + {} public)\n  \
-             prove {:.0} ms | verify {:.0} ms (DEFERRED {:.0} ms) | proof {:.1} KiB\n",
+             PER PROOF: tapes {:.0} + trace {:.0} + prove {:.0} = {:.0} ms \
+             | verify {:.0} ms (DEFERRED {:.0} ms) | proof {:.1} KiB\n  \
+             circuit build (per SHAPE, cacheable): {:.0} ms\n",
             n_folds,
             lo0.pcs.m,
             rt0.mu_i,
@@ -16264,10 +16273,14 @@ fn build_node_outer(
             shape2.circuit.cells().mu(),
             shape2.circuit.cells().num_gate_slots(),
             shape2.circuit.cells().num_public_slots(),
+            tapes_ms,
+            trace_ms,
             prove_ms,
+            tapes_ms + trace_ms + prove_ms,
             verify_ms,
             deferred_ms,
             bincode::serialize(&oproof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
+            build_ms,
         );
         (
             LeafOuter {
