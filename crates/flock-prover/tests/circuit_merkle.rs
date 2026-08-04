@@ -12181,6 +12181,7 @@ fn mvp11_child(
     seed: u64,
 ) -> (
     flock_core::circuit::builder::BuiltCircuit,
+    flock_core::verifier::DeferredMatrixWork,
     flock_core::circuit::SigmaAssertion,
 ) {
     use flock_prover::prover::UnionElementSlotInput;
@@ -12271,7 +12272,11 @@ fn mvp11_child(
         work.boolean.is_some(),
         "sigma never travels alone: the boolean matrix work rides with it"
     );
-    (built, sigma)
+    assert!(
+        work.element.is_some(),
+        "the MacGate slot yields an element assertion"
+    );
+    (built, work, sigma)
 }
 
 /// **MVP-11 step 1: the merge node's sigma fold, tape-pinned.**
@@ -12299,8 +12304,8 @@ fn mvp11_sigma_fold_tape() {
 
     // Two children, one circuit: different witnesses put the sigma claims
     // at unrelated points; the shared digest is the foldability key.
-    let (built0, sig0) = mvp11_child(0x4D31_0001);
-    let (built1, sig1) = mvp11_child(0x4D31_0002);
+    let (built0, _, sig0) = mvp11_child(0x4D31_0001);
+    let (built1, _, sig1) = mvp11_child(0x4D31_0002);
     assert_eq!(
         built0.shape.circuit.digest(),
         built1.shape.circuit.digest(),
@@ -12732,5 +12737,393 @@ fn mvp11_sigma_fold_tape() {
         outer_stats.2,
         outer_stats.3,
         outer_stats.4 as f64 / 1024.0,
+    );
+}
+
+/// **MVP-11 step 2: the FULL fold region of a merge node, tape-pinned.**
+///
+/// `verify_aggregate_classes` for the two mixed children — bind, the
+/// boolean folds (A and B for the blake3 type), the element folds (A and B
+/// for the MacGate type — the first end-to-end exercise of the aggregate's
+/// ELEMENT group, `gather_element`/`el_folds`/`discharge_element` included),
+/// and the sigma fold, all under ONE challenger. The whole tape is pinned
+/// op-for-op against the gathered claims' own shapes, every fold's surfaces
+/// are held against the `AggregateProof` field-for-field, and every fold's
+/// two endpoint identities close from LOCATED words alone — including the
+/// boolean claims' LENGTH-64 LOW factors (the lagrange row weights and the
+/// `z_partial` column weights), the one weight shape the sigma fold never
+/// exercised. The five outputs reassemble the verifier's `Accumulator`
+/// exactly, and all three groups discharge.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn mvp11_merge_fold_region() {
+    use flock_core::aggregate;
+    use flock_core::matrix_fold::{FoldProof, MatrixClaim, Weight};
+    use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
+
+    const M11_MERGE_DOMAIN: &[u8] = b"flock-mvp11-merge-node-v0";
+
+    let (built0, work0, sig0) = mvp11_child(0x4D32_0001);
+    let (built1, work1, sig1) = mvp11_child(0x4D32_0002);
+    assert_eq!(
+        built0.shape.circuit.digest(),
+        built1.shape.circuit.digest(),
+        "the children share one circuit"
+    );
+    let registry = &built0.shape.registry;
+    assert_eq!(registry.num_boolean(), 1, "one boolean type (blake3)");
+    assert_eq!(registry.element_types().len(), 1, "one element type (mac)");
+    let union0 = UnionInstance::new(registry, built0.shape.counts.clone());
+    let union1 = UnionInstance::new(&built1.shape.registry, built1.shape.counts.clone());
+    let bool_asserts = [
+        work0.boolean.expect("child 0 boolean work"),
+        work1.boolean.expect("child 1 boolean work"),
+    ];
+    let el_asserts = [
+        (&union0, work0.element.expect("child 0 element work")),
+        (&union1, work1.element.expect("child 1 element work")),
+    ];
+    let sigmas = [sig0, sig1];
+
+    // The native merge: prove + verify the aggregate under one challenger
+    // each, then discharge all three groups — matrix work read only here
+    // (the fold prover) and in the discharges (the root), never by the
+    // verifier this test arithmetises.
+    let blake_r1cs = blake3::build_block_r1cs(7);
+    let blake_lc = blake_r1cs.csc_lincheck_circuit();
+    let mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
+    let el_ty = registry.element_types()[0]
+        .element_type()
+        .expect("the element slot's table");
+    let el_mats = [(el_ty.a_0(), el_ty.b_0())];
+    let circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
+    let mut chp = FsChallenger::with_hash(M11_MERGE_DOMAIN, HashKind::Blake3);
+    let (agg, acc_p) = aggregate::prove_aggregate_classes(
+        registry,
+        &mats,
+        &circs,
+        &bool_asserts,
+        &el_mats,
+        &el_asserts,
+        Some((&built0.shape.circuit, &sigmas)),
+        &[],
+        &mut chp,
+    )
+    .expect("the merge-node fold proves");
+    let mut rec =
+        RecordingChallenger::new(FsChallenger::with_hash(M11_MERGE_DOMAIN, HashKind::Blake3));
+    let acc_v = aggregate::verify_aggregate_classes(
+        registry,
+        &bool_asserts,
+        &el_asserts,
+        Some((&built0.shape.circuit, &sigmas)),
+        &[],
+        &agg,
+        &mut rec,
+    )
+    .expect("the merge-node fold verifies");
+    assert_eq!(acc_p, acc_v, "prover and verifier accumulators agree");
+    assert!(acc_v.discharge(&mats), "the boolean group discharges");
+    assert!(
+        acc_v.discharge_element(&el_mats),
+        "the element group discharges"
+    );
+    assert!(
+        acc_v.discharge_sigma(&built0.shape.circuit),
+        "the sigma group discharges"
+    );
+
+    // The five folds' claim lists, in the verifier's own gather order
+    // (no priors: one claim per child, child order). Built from the
+    // assertions' pub claim constructors — the same code the verifier runs.
+    let bc: Vec<_> = bool_asserts.iter().map(|a| a.claims(registry)).collect();
+    let ec: Vec<_> = el_asserts.iter().map(|(u, a)| a.claims(u)).collect();
+    let fold_claims: Vec<Vec<MatrixClaim>> = vec![
+        vec![bc[0][0].0.clone(), bc[1][0].0.clone()],
+        vec![bc[0][0].1.clone(), bc[1][0].1.clone()],
+        vec![ec[0][0].0.clone(), ec[1][0].0.clone()],
+        vec![ec[0][0].1.clone(), ec[1][0].1.clone()],
+        vec![sigmas[0].claim(), sigmas[1].claim()],
+    ];
+    let fold_proofs: Vec<&FoldProof> = vec![
+        &agg.folds[0].0,
+        &agg.folds[0].1,
+        &agg.el_folds[0].0,
+        &agg.el_folds[0].1,
+        agg.sigma_fold.as_ref().expect("the sigma fold rides along"),
+    ];
+    // The boolean weights carry the length-64 lows; element and sigma are
+    // pure eq. Pin the shapes the machinery below depends on.
+    assert_eq!(fold_claims[0][0].row.low.len(), 64, "lagrange low");
+    assert_eq!(fold_claims[0][0].col.low.len(), 64, "z_partial low");
+    assert_eq!(fold_claims[2][0].row.low.len(), 1, "element claims are eq");
+    assert_eq!(fold_claims[4][0].row.low.len(), 1, "sigma claims are eq");
+
+    // ---- the tape structure, pinned op-for-op ----
+    // bind = label + registry digest + prior count, then the five folds in
+    // aggregate order. Every finalizing op is a scalar squeeze, so the
+    // challenge ordinal is the finalization ordinal — same as step 1.
+    let t_shape = rec.shape();
+    let ops = t_shape.ops();
+    let vals_rec = rec.values();
+    let chals = rec.challenges();
+    let mut want: Vec<Op> = vec![
+        Op::Label(b"flock-aggregate-v0".to_vec()),
+        Op::ObserveBytes(32),
+        Op::ObserveBytes(1),
+    ];
+    for cs in &fold_claims {
+        want.push(Op::Label(b"flock-matrix-fold-v0".to_vec()));
+        for c in cs {
+            want.extend([
+                Op::ObserveSlice(c.row.low.len()),
+                Op::ObserveSlice(c.row.point.len()),
+                Op::ObserveSlice(c.col.low.len()),
+                Op::ObserveSlice(c.col.point.len()),
+                Op::ObserveScalar,
+            ]);
+        }
+        for _ in 0..cs.len() {
+            want.push(Op::SqueezeScalar); // lambdas
+        }
+        for _ in 0..cs[0].col.n_vars() {
+            want.extend([Op::ObserveScalar, Op::ObserveScalar, Op::SqueezeScalar]);
+        }
+        for _ in 0..cs.len() {
+            want.push(Op::ObserveScalar); // bridge
+        }
+        for _ in 0..cs.len() {
+            want.push(Op::SqueezeScalar); // mus
+        }
+        for _ in 0..cs[0].row.n_vars() {
+            want.extend([Op::ObserveScalar, Op::ObserveScalar, Op::SqueezeScalar]);
+        }
+        want.push(Op::ObserveScalar); // the output value
+    }
+    assert_eq!(ops, want.as_slice(), "the merge tape is the expected shape");
+    assert_eq!(rec.payloads()[0], registry.digest(), "bind: registry digest");
+    assert_eq!(rec.payloads()[1], vec![0u8], "bind: prior count 0");
+
+    // ---- locate every fold's surfaces, and pin them field-for-field ----
+    struct ClaimLoc {
+        row_low_v: usize,
+        row_low_n: usize,
+        row_pt_v: usize,
+        row_pt_n: usize,
+        col_low_v: usize,
+        col_low_n: usize,
+        col_pt_v: usize,
+        col_pt_n: usize,
+        value_v: usize,
+    }
+    struct FoldLoc {
+        claims: Vec<ClaimLoc>,
+        lam_ch0: usize,
+        col_v: usize,
+        col_ch0: usize,
+        k_col: usize,
+        bridge_v: usize,
+        mu_ch0: usize,
+        row_v: usize,
+        row_ch0: usize,
+        k_row: usize,
+        out_v: usize,
+    }
+    let (mut vcur, mut ccur) = (0usize, 0usize);
+    let locs: Vec<FoldLoc> = fold_claims
+        .iter()
+        .map(|cs| {
+            let claims = cs
+                .iter()
+                .map(|c| {
+                    let l = ClaimLoc {
+                        row_low_v: vcur,
+                        row_low_n: c.row.low.len(),
+                        row_pt_v: vcur + c.row.low.len(),
+                        row_pt_n: c.row.point.len(),
+                        col_low_v: vcur + c.row.low.len() + c.row.point.len(),
+                        col_low_n: c.col.low.len(),
+                        col_pt_v: vcur + c.row.low.len() + c.row.point.len() + c.col.low.len(),
+                        col_pt_n: c.col.point.len(),
+                        value_v: vcur
+                            + c.row.low.len()
+                            + c.row.point.len()
+                            + c.col.low.len()
+                            + c.col.point.len(),
+                    };
+                    vcur = l.value_v + 1;
+                    l
+                })
+                .collect::<Vec<_>>();
+            let (k_col, k_row) = (cs[0].col.n_vars(), cs[0].row.n_vars());
+            let lam_ch0 = ccur;
+            ccur += cs.len();
+            let col_v = vcur;
+            let col_ch0 = ccur;
+            vcur += 2 * k_col;
+            ccur += k_col;
+            let bridge_v = vcur;
+            vcur += cs.len();
+            let mu_ch0 = ccur;
+            ccur += cs.len();
+            let row_v = vcur;
+            let row_ch0 = ccur;
+            vcur += 2 * k_row;
+            ccur += k_row;
+            let out_v = vcur;
+            vcur += 1;
+            FoldLoc {
+                claims,
+                lam_ch0,
+                col_v,
+                col_ch0,
+                k_col,
+                bridge_v,
+                mu_ch0,
+                row_v,
+                row_ch0,
+                k_row,
+                out_v,
+            }
+        })
+        .collect();
+    assert_eq!(vals_rec.len(), vcur, "every stream value is accounted for");
+    assert_eq!(chals.len(), ccur, "every squeeze is accounted for");
+    for ((loc, cs), fp) in locs.iter().zip(&fold_claims).zip(&fold_proofs) {
+        for (cl, c) in loc.claims.iter().zip(cs) {
+            assert_eq!(
+                &vals_rec[cl.row_low_v..cl.row_low_v + cl.row_low_n],
+                &c.row.low[..],
+                "row low on the stream"
+            );
+            assert_eq!(
+                &vals_rec[cl.row_pt_v..cl.row_pt_v + cl.row_pt_n],
+                &c.row.point[..],
+                "row point on the stream"
+            );
+            assert_eq!(
+                &vals_rec[cl.col_low_v..cl.col_low_v + cl.col_low_n],
+                &c.col.low[..],
+                "col low on the stream"
+            );
+            assert_eq!(
+                &vals_rec[cl.col_pt_v..cl.col_pt_v + cl.col_pt_n],
+                &c.col.point[..],
+                "col point on the stream"
+            );
+            assert_eq!(vals_rec[cl.value_v], c.value, "claim value on the stream");
+        }
+        for (j, &(q1, qinf)) in fp.col_rounds.iter().enumerate() {
+            assert_eq!(vals_rec[loc.col_v + 2 * j], q1, "col round q(1)");
+            assert_eq!(vals_rec[loc.col_v + 2 * j + 1], qinf, "col round q(inf)");
+        }
+        assert_eq!(
+            &vals_rec[loc.bridge_v..loc.bridge_v + loc.claims.len()],
+            &fp.bridge[..],
+            "the bridge on the stream"
+        );
+        for (j, &(q1, qinf)) in fp.row_rounds.iter().enumerate() {
+            assert_eq!(vals_rec[loc.row_v + 2 * j], q1, "row round q(1)");
+            assert_eq!(vals_rec[loc.row_v + 2 * j + 1], qinf, "row round q(inf)");
+        }
+        assert_eq!(vals_rec[loc.out_v], fp.value, "output value on the stream");
+    }
+
+    // ---- every fold's endpoints, replayed from LOCATED words alone ----
+    // Weights are REBUILT from located stream words and evaluated through
+    // the verifier's own `Weight::eval` — the low fold included, which is
+    // what the boolean folds add over step 1's pure eq products.
+    let replay_rounds = |target: F128, base: usize, ch0: usize, n: usize| -> (F128, Vec<F128>) {
+        let mut run = target;
+        let mut rho = Vec::with_capacity(n);
+        for j in 0..n {
+            let (g1, gi) = (vals_rec[base + 2 * j], vals_rec[base + 2 * j + 1]);
+            let r = chals[ch0 + j];
+            let q0 = run + g1;
+            run = gi * r * r + (q0 + g1 + gi) * r + q0;
+            rho.push(r);
+        }
+        (run, rho)
+    };
+    let outs: Vec<MatrixClaim> = locs
+        .iter()
+        .map(|loc| {
+            let k = loc.claims.len();
+            let lam: Vec<F128> = (0..k).map(|i| chals[loc.lam_ch0 + i]).collect();
+            let target_c = loc
+                .claims
+                .iter()
+                .zip(&lam)
+                .fold(F128::ZERO, |acc, (cl, &l)| acc + l * vals_rec[cl.value_v]);
+            let (run_c, rho_col) = replay_rounds(target_c, loc.col_v, loc.col_ch0, loc.k_col);
+            let located = |low_v: usize, low_n: usize, pt_v: usize, pt_n: usize| -> Weight {
+                Weight::low_eq(
+                    vals_rec[low_v..low_v + low_n].to_vec(),
+                    vals_rec[pt_v..pt_v + pt_n].to_vec(),
+                )
+            };
+            let expect_c = loc
+                .claims
+                .iter()
+                .zip(&lam)
+                .enumerate()
+                .fold(F128::ZERO, |acc, (i, (cl, &l))| {
+                    let w = located(cl.col_low_v, cl.col_low_n, cl.col_pt_v, cl.col_pt_n);
+                    acc + l * w.eval(&rho_col) * vals_rec[loc.bridge_v + i]
+                });
+            assert_eq!(run_c, expect_c, "col endpoint closes from located words");
+
+            let mus: Vec<F128> = (0..k).map(|i| chals[loc.mu_ch0 + i]).collect();
+            let target_r = (0..k)
+                .zip(&mus)
+                .fold(F128::ZERO, |acc, (i, &m)| acc + m * vals_rec[loc.bridge_v + i]);
+            let (run_r, rho_row) = replay_rounds(target_r, loc.row_v, loc.row_ch0, loc.k_row);
+            let w_mu = loc
+                .claims
+                .iter()
+                .zip(&mus)
+                .fold(F128::ZERO, |acc, (cl, &m)| {
+                    let w = located(cl.row_low_v, cl.row_low_n, cl.row_pt_v, cl.row_pt_n);
+                    acc + m * w.eval(&rho_row)
+                });
+            assert_eq!(
+                run_r,
+                w_mu * vals_rec[loc.out_v],
+                "row endpoint closes from located words"
+            );
+            MatrixClaim {
+                row: Weight::eq(rho_row),
+                col: Weight::eq(rho_col),
+                value: vals_rec[loc.out_v],
+            }
+        })
+        .collect();
+
+    // The five located outputs ARE the verifier's accumulator — the merge
+    // node's public statement, reassembled surface by surface.
+    assert_eq!(outs[0], acc_v.per_type[0].0, "boolean A accumulator");
+    assert_eq!(outs[1], acc_v.per_type[0].1, "boolean B accumulator");
+    assert_eq!(outs[2], acc_v.per_element[0].0, "element A accumulator");
+    assert_eq!(outs[3], acc_v.per_element[0].1, "element B accumulator");
+    let (sig_digest, sig_claim) = acc_v.sigma.as_ref().expect("sigma accumulated");
+    assert_eq!(outs[4], *sig_claim, "sigma accumulator");
+    assert_eq!(*sig_digest, built0.shape.circuit.digest(), "sigma key");
+
+    println!(
+        "\nMVP-11 MERGE FOLD REGION (bind + 5 folds under ONE challenger)\n  \
+         folds: blake3 A/B ({} col + {} row rounds each, low-64 weights), mac A/B\n         \
+         ({}+{} rounds, pure eq — FIRST element-group exercise), sigma ({}+{})\n  \
+         tape: {} ops | {} stream values | {} squeezes — all 10 endpoints close\n  \
+         from located words; the 5 outputs reassemble the Accumulator; all\n  \
+         three groups discharge\n",
+        locs[0].k_col,
+        locs[0].k_row,
+        locs[2].k_col,
+        locs[2].k_row,
+        locs[4].k_col,
+        locs[4].k_row,
+        ops.len(),
+        vals_rec.len(),
+        chals.len(),
     );
 }
