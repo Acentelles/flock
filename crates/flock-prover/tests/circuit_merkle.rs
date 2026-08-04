@@ -9400,6 +9400,7 @@ fn emit_real_child_region(
     rt: &RealTape<'_>,
     vals: &mut Vec<F128>,
     hints: &mut Vec<[u32; SLOT_WORDS]>,
+    consts: &mut Vec<(F128, Wire)>,
 ) -> RealRegion {
     let trace = &rt.trace;
     let stream = &rt.stream;
@@ -9434,7 +9435,6 @@ fn emit_real_child_region(
     let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
     vals.extend_from_slice(&iv_w);
     let iv2 = [sb.public_input(), sb.public_input()];
-    let mut consts: Vec<(F128, Wire)> = Vec::new();
     let (outs, ww) = emit_fs_chain(
         sb,
         cs.q.b3,
@@ -9443,7 +9443,7 @@ fn emit_real_child_region(
         stream,
         &rt.bytes,
         vals,
-        &mut consts,
+        consts,
         &rt.pub_payloads,
     );
 
@@ -9492,7 +9492,7 @@ fn emit_real_child_region(
             ww[pays[4][0]].expect("digest word wired"),
             ww[pays[4][1]].expect("digest word wired"),
         ];
-        emit_publics_hash(sb, cs.q, iv2, &rt.lo.public, dw, vals, &mut consts)
+        emit_publics_hash(sb, cs.q, iv2, &rt.lo.public, dw, vals, consts)
     };
     cen.push(("H(publics) region", sb.public_len()));
     let cap_w = cap_wires(stream, &ww, &rt.cap_pays);
@@ -9509,7 +9509,7 @@ fn emit_real_child_region(
         chals,
         &cap_w,
         vals,
-        &mut consts,
+        consts,
         hints,
     );
 
@@ -9836,7 +9836,7 @@ fn emit_real_child_region(
     let mut xc_pw: Vec<(F128, Wire)> = (0..rt.zc_rounds_b.len())
         .map(|k2| {
             if k2 < 7 {
-                (t_vals_b[k2], cw(sb, vals, &mut consts, t_vals_b[k2]))
+                (t_vals_b[k2], cw(sb, vals, consts, t_vals_b[k2]))
             } else {
                 let j = k2 - 7;
                 let sq2 = &trace.squeezes[outer_fin_b];
@@ -10494,7 +10494,8 @@ fn mvp10_leaf_outer_inner_tape() {
     let mut cs = ChildSlots::new(&mut sb, nu2, rt.spread_w);
     let mut vals: Vec<F128> = Vec::new();
     let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
-    let region = emit_real_child_region(&mut sb, &mut cs, &rt, &mut vals, &mut hints);
+    let mut consts: Vec<(F128, Wire)> = Vec::new();
+    let region = emit_real_child_region(&mut sb, &mut cs, &rt, &mut vals, &mut hints, &mut consts);
     let shape2 = sb.finish().expect("the swap outer builds");
     // Cell-slot budget: every gate IO word is ALSO a wiring gather claim,
     // so schema words are the budget for both mu and claims. The anchor
@@ -12267,6 +12268,7 @@ fn emit_child_region(
     ct: &ChildTape<'_>,
     vals: &mut Vec<F128>,
     hints: &mut Vec<[u32; SLOT_WORDS]>,
+    consts: &mut Vec<(F128, Wire)>,
 ) -> ChildRegion {
     let trace = &ct.trace;
     let stream = &ct.stream;
@@ -12301,7 +12303,6 @@ fn emit_child_region(
     let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
     vals.extend_from_slice(&iv_w);
     let iv2 = [sb.public_input(), sb.public_input()];
-    let mut consts: Vec<(F128, Wire)> = Vec::new();
     let (outs, ww) = emit_fs_chain(
         sb,
         cs.q.b3,
@@ -12310,7 +12311,7 @@ fn emit_child_region(
         stream,
         &ct.bytes,
         vals,
-        &mut consts,
+        consts,
         &ct.pub_payloads,
     );
     // ---- ROUND 2: the H(publics) region (v2 statement binding) ----
@@ -12330,7 +12331,7 @@ fn emit_child_region(
             &ct.inner.built.witness.public,
             dw,
             vals,
-            &mut consts,
+            consts,
         )
     };
     let cap_w = cap_wires(stream, &ww, &ct.cap_pays);
@@ -12347,7 +12348,7 @@ fn emit_child_region(
         chals,
         &cap_w,
         vals,
-        &mut consts,
+        consts,
         hints,
     );
     let ga_w = outs[trace.squeezes[ct.ga_fin][0]][0];
@@ -12681,7 +12682,7 @@ fn emit_child_region(
     let mut xc_pw: Vec<(F128, Wire)> = (0..ct.zc_rounds_b.len())
         .map(|k2| {
             if k2 < 7 {
-                (t_vals_b[k2], cw(sb, vals, &mut consts, t_vals_b[k2]))
+                (t_vals_b[k2], cw(sb, vals, consts, t_vals_b[k2]))
             } else {
                 let j = k2 - 7;
                 let sq2 = &trace.squeezes[outer_fin_b];
@@ -13120,7 +13121,8 @@ fn mvp10_circuit_inner_tape() {
     let mut cs = ChildSlots::new(&mut sb, nu2, ct.spread_w);
     let mut vals: Vec<F128> = Vec::new();
     let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
-    let region = emit_child_region(&mut sb, &mut cs, &ct, &mut vals, &mut hints);
+    let mut consts: Vec<(F128, Wire)> = Vec::new();
+    let region = emit_child_region(&mut sb, &mut cs, &ct, &mut vals, &mut hints, &mut consts);
     let shape2 = sb.finish().expect("the mvp10 chain circuit builds");
     let hint_refs: Vec<&(dyn std::any::Any + Sync)> =
         hints.iter().map(|h| h as &(dyn std::any::Any + Sync)).collect();
@@ -14670,8 +14672,9 @@ fn mvp11_merge_fold_region() {
         let mut cs = ChildSlots::new(&mut sb, nu2, t0.spread_w.max(t1.spread_w));
         let mut vals: Vec<F128> = Vec::new();
         let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
-        let r0 = emit_child_region(&mut sb, &mut cs, &t0, &mut vals, &mut hints);
-        let r1 = emit_child_region(&mut sb, &mut cs, &t1, &mut vals, &mut hints);
+        let mut consts: Vec<(F128, Wire)> = Vec::new();
+        let r0 = emit_child_region(&mut sb, &mut cs, &t0, &mut vals, &mut hints, &mut consts);
+        let r1 = emit_child_region(&mut sb, &mut cs, &t1, &mut vals, &mut hints, &mut consts);
         // The fold region rides the SAME slots the child regions created:
         // rows, not columns.
         let b3s = cs.q.b3;
@@ -15866,11 +15869,12 @@ fn build_node_outer(
         // only its own tape's inputs; the fold region joins them AFTER) —
         // declared as islands so the online phase evaluates them in
         // parallel.
+        let mut consts: Vec<(F128, Wire)> = Vec::new();
         let isl0 = sb.begin_island();
-        let r0 = emit_real_child_region(&mut sb, &mut cs, &rt0, &mut vals, &mut hints);
+        let r0 = emit_real_child_region(&mut sb, &mut cs, &rt0, &mut vals, &mut hints, &mut consts);
         sb.end_island(isl0);
         let isl1 = sb.begin_island();
-        let r1 = emit_real_child_region(&mut sb, &mut cs, &rt1, &mut vals, &mut hints);
+        let r1 = emit_real_child_region(&mut sb, &mut cs, &rt1, &mut vals, &mut hints, &mut consts);
         sb.end_island(isl1);
         // The fold region rides the children's slots: rows, not columns.
         let (pfslot, pf_w) = r0.pf;
