@@ -8236,6 +8236,8 @@ struct RealTape<'p> {
     pows: Vec<(usize, usize, u32)>,
     n_p: usize,
     n_gather: usize,
+    /// The child cell space's public-slot count — the recombination's tail.
+    n_pub_slots_c: usize,
     // the boolean PIOP's round ordinals ((ch, fin) pairs) + surfaces
     zc_rounds_b: Vec<(usize, usize)>,
     outer_b: (usize, usize),
@@ -8841,6 +8843,19 @@ impl<'p> RealTape<'p> {
             m_mp2,
         );
         let k_cols_i = params_i.k;
+        // ROUND 4: the recombination + f == g, replayed from located words
+        // (the emitter binds these; until it landed they rode only this
+        // constructor's scaffolding verify).
+        let n_pub_slots_c = pin_recombination(
+            lo.shape.circuit.cells(),
+            n_log_i,
+            &lo.public,
+            &lo.proof.wiring.gather,
+            &gammas_i,
+            &vals_rec,
+            &gkr_rec.r_pt,
+            gkr_rec.fgs_v,
+        );
         let bounds_i = flock_core::pcs::jagged::assist_boundaries(&params_i);
         let n_runs = bounds_i.len();
         let run_y0: Vec<usize> = bounds_i
@@ -9234,6 +9249,7 @@ impl<'p> RealTape<'p> {
             pows,
             n_p,
             n_gather,
+            n_pub_slots_c,
             zc_rounds_b,
             outer_b: (outer_ch_b, outer_fin_b),
             outer_len,
@@ -9393,16 +9409,17 @@ fn emit_real_child_region(
 
     // ---- ROUND 2: the H(publics) region (v2 statement binding) ----
     // Payload 4 of the circuit binding is the 32-byte publics digest; the
-    // child's public words themselves are witness, bound here.
-    {
+    // child's public words themselves are witness, bound here. The returned
+    // wires ARE the child's public segment — the recombination folds them.
+    let pub_w = {
         let pays = payload_words(stream);
         assert_eq!(pays[4].len(), 2, "the publics digest payload is 32 bytes");
         let dw = [
             ww[pays[4][0]].expect("digest word wired"),
             ww[pays[4][1]].expect("digest word wired"),
         ];
-        emit_publics_hash(sb, cs.q, iv2, &rt.lo.public, dw, vals, &mut consts);
-    }
+        emit_publics_hash(sb, cs.q, iv2, &rt.lo.public, dw, vals, &mut consts)
+    };
     let cap_w = cap_wires(stream, &ww, &rt.cap_pays);
     let (to_publish, level_accs) = emit_query_phase(
         sb,
@@ -9616,6 +9633,33 @@ fn emit_real_child_region(
     let r3 = sb.gate(macs, &[r2, ow, live_w])[0];
     let r4 = sb.gate(macs, &[r3, ow, ow])[0];
     sb.connect(r4, cr_w);
+
+    // ---- ROUND 4: the recombination + f == g, in-circuit ----
+    let le8 = match cs.le.iter().find(|&&(n, _)| n == 8) {
+        Some(&(_, s)) => s,
+        None => {
+            let s = sb.slot(LeafEvalGate::new(8));
+            cs.le.push((8, s));
+            s
+        }
+    };
+    let gather_w: Vec<Wire> = (0..rt.n_gather)
+        .map(|i| wv(gammas_i[2 + i].val_v))
+        .collect();
+    emit_recombination(
+        sb,
+        macs,
+        le8,
+        &pub_w,
+        &gather_w,
+        &pt_w,
+        n_log_i,
+        rt.n_pub_slots_c,
+        f_w,
+        g_w,
+        zw,
+        ow,
+    );
 
     // ---- the MULTI-SLOT element PIOP (general strip) ----
     let mut el_zr = zw;
@@ -10694,6 +10738,169 @@ struct GkrRec {
     r_pt: Vec<F128>,
 }
 
+/// **THE RECOMBINATION (round 4), pinned natively.** The wiring verifier's
+/// `ŵ(ρ) = Σ_gate eq_slot[ι]·gather[ι] + Σ_public eq_slot[ι]·⟨eq_row, slot⟩`
+/// (`circuit.rs` verify_wiring_core) is the ONE check that reads the child's
+/// publics — and, with `f_eval == g_eval` beside it, was enforced only by the
+/// tape constructors' scaffolding-tier native verify, never by the parent's
+/// statement. This replica recomputes both from LOCATED tape words — the
+/// gather pd values, the child's public segment, the GKR squeeze point — so
+/// the emission has a pinned reference for every wire it binds. Also pins the
+/// pd-claim order the emitter indexes: `[element c, element lc, gathers in
+/// cell-slot enumeration order]`.
+///
+/// Returns `num_public_slots` (the emitters derive everything else from the
+/// gather count and `n_log_i`; `cells.nu()` is asserted against it here).
+fn pin_recombination(
+    cells: &flock_core::circuit::CellSpace,
+    n_log_i: usize,
+    public: &[F128],
+    gather: &[F128],
+    gammas: &[PdRec],
+    vals_rec: &[F128],
+    r_pt: &[F128],
+    fgs_v: usize,
+) -> usize {
+    use flock_core::circuit::CellSlot;
+    use flock_core::zerocheck::univariate_skip::build_eq;
+    let (nu_c, c_bits) = (cells.nu(), cells.c_bits());
+    assert_eq!(nu_c, n_log_i, "the cell space's row vars are the union's");
+    assert_eq!(r_pt.len(), nu_c + c_bits, "ρ spans the cell space");
+    assert_eq!(gather.len(), cells.num_gate_slots(), "one gather per gate slot");
+    assert_eq!(
+        gammas.len(),
+        2 + gather.len(),
+        "pd claims = the element (c, lc) pair + the gathers"
+    );
+    for (i, g) in gather.iter().enumerate() {
+        assert_eq!(
+            vals_rec[gammas[2 + i].val_v],
+            *g,
+            "gather {i} is pd claim {} on the stream",
+            2 + i
+        );
+    }
+    let eq_row = build_eq(&r_pt[..nu_c]);
+    let eq_slot = build_eq(&r_pt[nu_c..]);
+    let mut acc = F128::ZERO;
+    for (iota, slot) in cells.slots().iter().enumerate() {
+        match *slot {
+            CellSlot::Gate { .. } => acc += eq_slot[iota] * gather[iota],
+            CellSlot::Public { s } => {
+                let base = s << nu_c;
+                let hi = ((base + (1usize << nu_c)).min(public.len())).saturating_sub(base);
+                let mut v = F128::ZERO;
+                for j in 0..hi {
+                    v += eq_row[j] * public[base + j];
+                }
+                acc += eq_slot[iota] * v;
+            }
+            CellSlot::Pad => {}
+        }
+    }
+    assert_eq!(
+        acc,
+        vals_rec[fgs_v],
+        "the gathers + publics-MLE recombine to the absorbed f_eval"
+    );
+    assert_eq!(
+        vals_rec[fgs_v],
+        vals_rec[fgs_v + 1],
+        "f_eval == g_eval on the stream"
+    );
+    cells.num_public_slots()
+}
+
+/// The eq table's `live` prefix over `point_w` wires (LSB-first —
+/// `build_eq`'s convention), as MacGate rows: the DOUBLING build, one row
+/// per node — `e·ρ` is `0 + e·ρ` and `e·(1+ρ)` is `e + e·ρ`, so both
+/// children of a node are single MAC rows. Rows, not advice: every weight is
+/// wire-bound to its squeeze. Ancestors of the live prefix are themselves a
+/// prefix (low bits), so level `i` builds `min(2^i, live)` entries.
+fn emit_eq_prefix(
+    sb: &mut ShapeBuilder,
+    macs: flock_core::circuit::builder::SlotId,
+    point_w: &[Wire],
+    live: usize,
+    zw: Wire,
+    ow: Wire,
+) -> Vec<Wire> {
+    let live = live.max(1);
+    let mut eq_w: Vec<Wire> = vec![ow];
+    for (i, &rw) in point_w.iter().enumerate() {
+        let half = 1usize << i;
+        let width = (2 * half).min(live);
+        let mut next = Vec::with_capacity(width);
+        for x in 0..width.min(half) {
+            next.push(sb.gate(macs, &[eq_w[x], eq_w[x], rw])[0]);
+        }
+        for x in half..width {
+            next.push(sb.gate(macs, &[zw, eq_w[x - half], rw])[0]);
+        }
+        eq_w = next;
+    }
+    eq_w
+}
+
+/// **THE RECOMBINATION in-circuit (round 4).** Rebuild `ŵ(ρ)` from the
+/// absorbed gather pd wires and the H region's publics wires, CONNECT it to
+/// the absorbed `f_eval`, and connect `f == g` — the two `verify_wiring_core`
+/// checks that until now rode only the tape constructors' scaffolding
+/// verify. The publics half is the recorded design: the H region's wires
+/// feed 8-lane LeafEval folds at `ρ_row[..3]` (the "leaf arithmetic joins
+/// the openings" pattern) with hi-group eq weights from the doubling build;
+/// the gate half is an eq_slot-weighted MAC chain over the gather wires.
+/// Zero new publics, inputs, or slot types — the checker walks are
+/// untouched. Dataflow is acyclic: ρ wires come from chain rows BEFORE the
+/// `(f, g, s_σ)` absorb, and `f_w` feeds only LATER chain rows.
+#[allow(clippy::too_many_arguments)]
+fn emit_recombination(
+    sb: &mut ShapeBuilder,
+    macs: flock_core::circuit::builder::SlotId,
+    le8: flock_core::circuit::builder::SlotId,
+    pub_w: &[Wire],
+    gather_w: &[Wire],
+    pt_w: &[Wire],
+    nu_c: usize,
+    n_pub_slots: usize,
+    f_w: Wire,
+    g_w: Wire,
+    zw: Wire,
+    ow: Wire,
+) {
+    sb.connect(f_w, g_w);
+    let rows = 1usize << nu_c;
+    assert_eq!(
+        pub_w.chunks(rows).count(),
+        n_pub_slots,
+        "public slots tile the child's segment"
+    );
+    let eq_slot_w = emit_eq_prefix(sb, macs, &pt_w[nu_c..], gather_w.len() + n_pub_slots, zw, ow);
+    let max_chunks = pub_w
+        .chunks(rows)
+        .map(|s| s.len().div_ceil(8))
+        .max()
+        .expect("a circuit child has publics");
+    let eq_hi_w = emit_eq_prefix(sb, macs, &pt_w[3..nu_c], max_chunks, zw, ow);
+    let mut acc = zw;
+    for (i, &gw2) in gather_w.iter().enumerate() {
+        acc = sb.gate(macs, &[acc, eq_slot_w[i], gw2])[0];
+    }
+    for (s, spub) in pub_w.chunks(rows).enumerate() {
+        let mut v = zw;
+        for (h, chunk) in spub.chunks(8).enumerate() {
+            let mut a_in: Vec<Wire> = chunk.to_vec();
+            a_in.resize(8, zw);
+            a_in.extend_from_slice(&pt_w[..3]);
+            a_in.push(eq_hi_w[h]);
+            a_in.push(v);
+            v = sb.gate(le8, &a_in)[0];
+        }
+        acc = sb.gate(macs, &[acc, eq_slot_w[gather_w.len() + s], v])[0];
+    }
+    sb.connect(acc, f_w);
+}
+
 /// The ELEMENT PIOP region, located. Round tuples are `(g_v, fin, ch)`.
 struct ElPiopRec {
     tau_fin: usize,
@@ -10749,6 +10956,8 @@ struct ChildTape<'p> {
     geo: Vec<Lvl>,
     native_sums: Vec<F128>,
     n_pd: usize,
+    /// The child cell space's public-slot count — the recombination's tail.
+    n_pub_slots_c: usize,
     n_p: usize,
     // the boolean PIOP's round ordinals, located with fins ((ch, fin) pairs)
     zc_rounds_b: Vec<(usize, usize)>,
@@ -11432,6 +11641,19 @@ impl<'p> ChildTape<'p> {
         );
         assert_eq!(w_rounds.len(), m_mp2, "merged rho spans the dense domain");
         let n_log_i = union.n_log();
+        // ROUND 4: the recombination + f == g, replayed from located words
+        // (the emitter binds these; until it landed they rode only this
+        // constructor's scaffolding verify).
+        let n_pub_slots_c = pin_recombination(
+            inner.built.shape.circuit.cells(),
+            n_log_i,
+            &inner.built.witness.public,
+            &inner.proof.wiring.gather,
+            &gammas_o,
+            &vals_rec,
+            &gkr_rec.r_pt,
+            gkr_rec.fgs_v,
+        );
         let params_i = flock_core::pcs::jagged::JaggedParams::from_heights(
             &union.jagged_heights(),
             n_log_i,
@@ -11777,6 +11999,7 @@ impl<'p> ChildTape<'p> {
             geo,
             native_sums,
             n_pd: pd_recs.len(),
+            n_pub_slots_c,
             n_p,
             zc_rounds_b,
             outer_b: (outer_ch_b, outer_fin_b),
@@ -11954,7 +12177,9 @@ fn emit_child_region(
         &ct.pub_payloads,
     );
     // ---- ROUND 2: the H(publics) region (v2 statement binding) ----
-    {
+    // The returned wires ARE the child's public segment — the recombination
+    // folds them.
+    let pub_w = {
         let pays = payload_words(stream);
         assert_eq!(pays[4].len(), 2, "the publics digest payload is 32 bytes");
         let dw = [
@@ -11969,8 +12194,8 @@ fn emit_child_region(
             dw,
             vals,
             &mut consts,
-        );
-    }
+        )
+    };
     let cap_w = cap_wires(stream, &ww, &ct.cap_pays);
     let (to_publish, level_accs) = emit_query_phase(
         sb,
@@ -12073,6 +12298,33 @@ fn emit_child_region(
     let r3 = sb.gate(macs, &[r2, ow, live_w])[0];
     let r4 = sb.gate(macs, &[r3, ow, ow])[0];
     sb.connect(r4, cr_w);
+
+    // ---- ROUND 4: the recombination + f == g, in-circuit ----
+    let le8 = match cs.le.iter().find(|&&(n, _)| n == 8) {
+        Some(&(_, s)) => s,
+        None => {
+            let s = sb.slot(LeafEvalGate::new(8));
+            cs.le.push((8, s));
+            s
+        }
+    };
+    let gather_w: Vec<Wire> = (0..ct.n_pd - 2)
+        .map(|i| wv(ct.gammas_o[2 + i].val_v))
+        .collect();
+    emit_recombination(
+        sb,
+        macs,
+        le8,
+        &pub_w,
+        &gather_w,
+        &pt_w,
+        n_log_i,
+        ct.n_pub_slots_c,
+        f_w,
+        g_w,
+        zw,
+        ow,
+    );
 
     // ---- the MULTIPOINT intake at R = 2 AND P > 0 ----
     let mp_gamma_w = outs[trace.squeezes[mp_o.gamma_fin][0]][0];

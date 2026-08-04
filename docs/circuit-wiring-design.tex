@@ -1013,6 +1013,21 @@ pure-element inner is the subset without the RS items):
         kind-(1) wires, matrix evaluations as advice bound by the
         lincheck's one-equation final check) feed the accumulator from
         the public segment alone.
+  \item \emph{The wiring recombination — a connect since round 4}: for a
+        \emph{circuit} child, the two \code{verify\_wiring} closures that
+        read the child's publics — $\hat w(\rho) = \sum_\iota
+        \mathrm{eq}(\rho_{\mathrm{slot}}, \iota)\, v_\iota$ over the gate
+        gathers plus each public slot's row-MLE, and $f = g$ — had
+        never appeared in this ledger: they were enforced only by the
+        scaffolding-tier native verify inside the tape constructors, a
+        recorded soundness-tier gap. Both are now in-circuit: the
+        H(publics) region's wires feed 8-lane leaf-eval folds at
+        $\rho_{\mathrm{row}}$ with hi-group eq weights from a MAC
+        doubling build (rows, not advice — $e \cdot \rho$ and
+        $e \cdot (1{+}\rho)$ are each one MAC row), the gathers ride an
+        eq-slot-weighted MAC chain over their absorbed pd value wires,
+        and the sum \emph{connects} to the absorbed $f$; $f = g$ is a
+        second connect. Zero new publics, inputs, or slot types.
 \end{itemize}
 
 Two properties make this sound and cheap. Soundness: kind-(2) advice
