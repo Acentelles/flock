@@ -15688,6 +15688,14 @@ fn build_node_outer(
         let trace = chain.finish();
 
         let b3_rows = rt0.b3_rows + rt1.b3_rows + trace.rows.len();
+        // MEASURED AND REJECTED (2026-08-05): over-provisioning nu by one
+        // bit to re-engage the pay-per-live arms. Boolean committed area is
+        // CAPACITY-shaped (M_bool 31→32 doubled the boolean stack; the open
+        // went 84→190 ms and level-1 prove 260→390), and the level-2
+        // element arms STILL ran dense (copies 206→182 ms — the dominant
+        // slots sit above the 50% gate even at half utilization). The
+        // level-2 dense-arm cost is Round-3 work (dead_rows_unread's
+        // predicate + element live-row reduction), not a capacity knob.
         let nu2 = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7);
         let mut sb = ShapeBuilder::new(nu2);
         let mut cs = ChildSlots::new(&mut sb, nu2, rt0.spread_w.max(rt1.spread_w));
