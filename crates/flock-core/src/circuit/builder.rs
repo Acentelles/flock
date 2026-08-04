@@ -376,6 +376,15 @@ impl ShapeBuilder {
         self.public.push(w);
     }
 
+    /// How many public entries exist so far — the index the NEXT
+    /// [`Self::publish`] or [`Self::public_input`] will land at. Lets a
+    /// caller emitting several independent regions into one builder record
+    /// where each region's public block starts, instead of reconstructing
+    /// offsets from counts after the fact.
+    pub fn public_len(&self) -> usize {
+        self.public.len()
+    }
+
     /// Assert two wires carry the same value: merge their classes, so the
     /// wiring argument enforces it.
     ///
