@@ -13011,6 +13011,510 @@ fn mvp11_sigma_fold_tape() {
     );
 }
 
+/// One absorbed claim's stream ordinals on a fold tape: the four weight
+/// slices and the value, in absorb order.
+struct ClaimLoc {
+    row_low_v: usize,
+    row_low_n: usize,
+    row_pt_v: usize,
+    row_pt_n: usize,
+    col_low_v: usize,
+    col_low_n: usize,
+    col_pt_v: usize,
+    col_pt_n: usize,
+    value_v: usize,
+}
+
+/// One fold group's ordinals: its claims, then the lambdas, col rounds,
+/// bridge, mus, row rounds and output value.
+struct FoldLoc {
+    claims: Vec<ClaimLoc>,
+    lam_ch0: usize,
+    col_v: usize,
+    col_ch0: usize,
+    k_col: usize,
+    bridge_v: usize,
+    mu_ch0: usize,
+    row_v: usize,
+    row_ch0: usize,
+    k_row: usize,
+    out_v: usize,
+}
+
+/// (public index, fold, row side, h) of one boundary-expanded low-fold eq
+/// public — checker-validated against the fold's PUBLISHED ρ coordinates.
+type AlphaRec = (usize, usize, bool, usize);
+
+/// One emitted fold group's wires: the two endpoint zero-deltas and the
+/// accumulator claim (ρ_col, ρ_row, value) to publish.
+struct FoldPub {
+    deltas: [Wire; 2],
+    rho_col: Vec<Wire>,
+    rho_row: Vec<Wire>,
+    value: Wire,
+}
+
+/// The fold region's op tape for a claim-list set: per group, the
+/// matrix-fold label, every claim's four weight slices + value, the
+/// lambdas, col rounds, bridge, mus, row rounds, and the output value.
+/// Width-driven, so mixed low widths and any claim count pin themselves.
+fn fold_region_ops(
+    fold_claims: &[Vec<flock_core::matrix_fold::MatrixClaim>],
+) -> Vec<flock_core::transcript_record::TranscriptOp> {
+    use flock_core::transcript_record::TranscriptOp as Op;
+    let mut want: Vec<Op> = Vec::new();
+    for cs in fold_claims {
+        want.push(Op::Label(b"flock-matrix-fold-v0".to_vec()));
+        for c in cs {
+            want.extend([
+                Op::ObserveSlice(c.row.low.len()),
+                Op::ObserveSlice(c.row.point.len()),
+                Op::ObserveSlice(c.col.low.len()),
+                Op::ObserveSlice(c.col.point.len()),
+                Op::ObserveScalar,
+            ]);
+        }
+        for _ in 0..cs.len() {
+            want.push(Op::SqueezeScalar); // lambdas
+        }
+        for _ in 0..cs[0].col.n_vars() {
+            want.extend([Op::ObserveScalar, Op::ObserveScalar, Op::SqueezeScalar]);
+        }
+        for _ in 0..cs.len() {
+            want.push(Op::ObserveScalar); // bridge
+        }
+        for _ in 0..cs.len() {
+            want.push(Op::SqueezeScalar); // mus
+        }
+        for _ in 0..cs[0].row.n_vars() {
+            want.extend([Op::ObserveScalar, Op::ObserveScalar, Op::SqueezeScalar]);
+        }
+        want.push(Op::ObserveScalar); // the output value
+    }
+    want
+}
+
+/// Locate every fold's surfaces on the value/challenge streams (counters
+/// start at 0 — the bind prefix carries only byte payloads) and pin them
+/// field-for-field against the gathered claims and the `FoldProof`s.
+fn locate_and_pin_folds(
+    fold_claims: &[Vec<flock_core::matrix_fold::MatrixClaim>],
+    fold_proofs: &[&flock_core::matrix_fold::FoldProof],
+    vals_rec: &[F128],
+    chals: &[F128],
+) -> Vec<FoldLoc> {
+    let (mut vcur, mut ccur) = (0usize, 0usize);
+    let locs: Vec<FoldLoc> = fold_claims
+        .iter()
+        .map(|cs| {
+            let claims = cs
+                .iter()
+                .map(|c| {
+                    let l = ClaimLoc {
+                        row_low_v: vcur,
+                        row_low_n: c.row.low.len(),
+                        row_pt_v: vcur + c.row.low.len(),
+                        row_pt_n: c.row.point.len(),
+                        col_low_v: vcur + c.row.low.len() + c.row.point.len(),
+                        col_low_n: c.col.low.len(),
+                        col_pt_v: vcur + c.row.low.len() + c.row.point.len() + c.col.low.len(),
+                        col_pt_n: c.col.point.len(),
+                        value_v: vcur
+                            + c.row.low.len()
+                            + c.row.point.len()
+                            + c.col.low.len()
+                            + c.col.point.len(),
+                    };
+                    vcur = l.value_v + 1;
+                    l
+                })
+                .collect::<Vec<_>>();
+            let (k_col, k_row) = (cs[0].col.n_vars(), cs[0].row.n_vars());
+            let lam_ch0 = ccur;
+            ccur += cs.len();
+            let col_v = vcur;
+            let col_ch0 = ccur;
+            vcur += 2 * k_col;
+            ccur += k_col;
+            let bridge_v = vcur;
+            vcur += cs.len();
+            let mu_ch0 = ccur;
+            ccur += cs.len();
+            let row_v = vcur;
+            let row_ch0 = ccur;
+            vcur += 2 * k_row;
+            ccur += k_row;
+            let out_v = vcur;
+            vcur += 1;
+            FoldLoc {
+                claims,
+                lam_ch0,
+                col_v,
+                col_ch0,
+                k_col,
+                bridge_v,
+                mu_ch0,
+                row_v,
+                row_ch0,
+                k_row,
+                out_v,
+            }
+        })
+        .collect();
+    assert_eq!(vals_rec.len(), vcur, "every stream value is accounted for");
+    assert_eq!(chals.len(), ccur, "every squeeze is accounted for");
+    for ((loc, cs), fp) in locs.iter().zip(fold_claims).zip(fold_proofs) {
+        for (cl, c) in loc.claims.iter().zip(cs) {
+            assert_eq!(
+                &vals_rec[cl.row_low_v..cl.row_low_v + cl.row_low_n],
+                &c.row.low[..],
+                "row low on the stream"
+            );
+            assert_eq!(
+                &vals_rec[cl.row_pt_v..cl.row_pt_v + cl.row_pt_n],
+                &c.row.point[..],
+                "row point on the stream"
+            );
+            assert_eq!(
+                &vals_rec[cl.col_low_v..cl.col_low_v + cl.col_low_n],
+                &c.col.low[..],
+                "col low on the stream"
+            );
+            assert_eq!(
+                &vals_rec[cl.col_pt_v..cl.col_pt_v + cl.col_pt_n],
+                &c.col.point[..],
+                "col point on the stream"
+            );
+            assert_eq!(vals_rec[cl.value_v], c.value, "claim value on the stream");
+        }
+        for (j, &(q1, qinf)) in fp.col_rounds.iter().enumerate() {
+            assert_eq!(vals_rec[loc.col_v + 2 * j], q1, "col round q(1)");
+            assert_eq!(vals_rec[loc.col_v + 2 * j + 1], qinf, "col round q(inf)");
+        }
+        assert_eq!(
+            &vals_rec[loc.bridge_v..loc.bridge_v + loc.claims.len()],
+            &fp.bridge[..],
+            "the bridge on the stream"
+        );
+        for (j, &(q1, qinf)) in fp.row_rounds.iter().enumerate() {
+            assert_eq!(vals_rec[loc.row_v + 2 * j], q1, "row round q(1)");
+            assert_eq!(vals_rec[loc.row_v + 2 * j + 1], qinf, "row round q(inf)");
+        }
+        assert_eq!(vals_rec[loc.out_v], fp.value, "output value on the stream");
+    }
+    locs
+}
+
+/// Replay every fold's two endpoint identities from LOCATED words alone —
+/// weights rebuilt through the verifier's own `Weight::eval`, the low fold
+/// included — and return the located fold outputs (what the verifier's
+/// accumulator must equal, surface for surface).
+fn replay_fold_endpoints(
+    locs: &[FoldLoc],
+    vals_rec: &[F128],
+    chals: &[F128],
+) -> Vec<flock_core::matrix_fold::MatrixClaim> {
+    use flock_core::matrix_fold::{MatrixClaim, Weight};
+    let replay_rounds = |target: F128, base: usize, ch0: usize, n: usize| -> (F128, Vec<F128>) {
+        let mut run = target;
+        let mut rho = Vec::with_capacity(n);
+        for j in 0..n {
+            let (g1, gi) = (vals_rec[base + 2 * j], vals_rec[base + 2 * j + 1]);
+            let r = chals[ch0 + j];
+            let q0 = run + g1;
+            run = gi * r * r + (q0 + g1 + gi) * r + q0;
+            rho.push(r);
+        }
+        (run, rho)
+    };
+    locs.iter()
+        .map(|loc| {
+            let k = loc.claims.len();
+            let lam: Vec<F128> = (0..k).map(|i| chals[loc.lam_ch0 + i]).collect();
+            let target_c = loc
+                .claims
+                .iter()
+                .zip(&lam)
+                .fold(F128::ZERO, |acc, (cl, &l)| acc + l * vals_rec[cl.value_v]);
+            let (run_c, rho_col) = replay_rounds(target_c, loc.col_v, loc.col_ch0, loc.k_col);
+            let located = |low_v: usize, low_n: usize, pt_v: usize, pt_n: usize| -> Weight {
+                Weight::low_eq(
+                    vals_rec[low_v..low_v + low_n].to_vec(),
+                    vals_rec[pt_v..pt_v + pt_n].to_vec(),
+                )
+            };
+            let expect_c = loc
+                .claims
+                .iter()
+                .zip(&lam)
+                .enumerate()
+                .fold(F128::ZERO, |acc, (i, (cl, &l))| {
+                    let w = located(cl.col_low_v, cl.col_low_n, cl.col_pt_v, cl.col_pt_n);
+                    acc + l * w.eval(&rho_col) * vals_rec[loc.bridge_v + i]
+                });
+            assert_eq!(run_c, expect_c, "col endpoint closes from located words");
+
+            let mus: Vec<F128> = (0..k).map(|i| chals[loc.mu_ch0 + i]).collect();
+            let target_r = (0..k)
+                .zip(&mus)
+                .fold(F128::ZERO, |acc, (i, &m)| acc + m * vals_rec[loc.bridge_v + i]);
+            let (run_r, rho_row) = replay_rounds(target_r, loc.row_v, loc.row_ch0, loc.k_row);
+            let w_mu = loc
+                .claims
+                .iter()
+                .zip(&mus)
+                .fold(F128::ZERO, |acc, (cl, &m)| {
+                    let w = located(cl.row_low_v, cl.row_low_n, cl.row_pt_v, cl.row_pt_n);
+                    acc + m * w.eval(&rho_row)
+                });
+            assert_eq!(
+                run_r,
+                w_mu * vals_rec[loc.out_v],
+                "row endpoint closes from located words"
+            );
+            MatrixClaim {
+                row: Weight::eq(rho_row),
+                col: Weight::eq(rho_col),
+                value: vals_rec[loc.out_v],
+            }
+        })
+        .collect()
+}
+
+/// Emit the WHOLE fold region in-circuit: per group, the λ-combination of
+/// the absorbed claim values, the col rounds (MergedRoundGate), the col
+/// endpoint's weight evals (eq parts on the prefix slot; 64-wide lows
+/// through 8 chained LeafEvalGate(8) rows with boundary-public hi-group
+/// factors), then the μ side and the row endpoint — both endpoints as
+/// zero-delta wires. The LAST fold's output value sits in the transcript
+/// tail past the final squeeze (no chain wire) and enters as its own
+/// input, bound by the row endpoint delta. Returns the per-fold publish
+/// wires and the boundary-public records the checker validates.
+#[allow(clippy::too_many_arguments)]
+fn emit_fold_region(
+    sb: &mut ShapeBuilder,
+    macs: flock_core::circuit::builder::SlotId,
+    mrs: flock_core::circuit::builder::SlotId,
+    pfslot: flock_core::circuit::builder::SlotId,
+    pf_w: usize,
+    leslot: flock_core::circuit::builder::SlotId,
+    locs: &[FoldLoc],
+    sq: &[Vec<usize>],
+    outs: &[Vec<Wire>],
+    ww: &[Option<Wire>],
+    vmap: &[Option<usize>],
+    chals: &[F128],
+    vals_rec: &[F128],
+    vals: &mut Vec<F128>,
+    zw: Wire,
+    ow: Wire,
+) -> (Vec<FoldPub>, Vec<AlphaRec>) {
+    let wv = |vi: usize| -> Wire { ww[vmap[vi].expect("stream word")].expect("wired") };
+    let chw = |fin: usize| -> Wire { outs[sq[fin][0]][0] };
+    // seed · Π (1 + a_j + b_j) through the prefix slot, padded (zw, zw).
+    let prefix = |sb: &mut ShapeBuilder, seed: Wire, fs: &[(Wire, Wire)]| -> Wire {
+        let mut s = seed;
+        for chunk in fs.chunks(pf_w) {
+            let mut g_in = vec![s];
+            for (a, _) in chunk {
+                g_in.push(*a);
+            }
+            g_in.extend(std::iter::repeat_n(zw, pf_w - chunk.len()));
+            for (_, b) in chunk {
+                g_in.push(*b);
+            }
+            g_in.extend(std::iter::repeat_n(zw, pf_w - chunk.len()));
+            g_in.push(ow);
+            s = sb.gate(pfslot, &g_in)[0];
+        }
+        s
+    };
+    // One weight eval at ρ: the low factor's MLE (seeded by the single
+    // absorbed low word for eq weights, or folded through 8 LeafEval rows
+    // for the 64-entry lows), times the eq-point prefix product over the
+    // remaining coordinates.
+    let mut alpha_recs: Vec<AlphaRec> = Vec::new();
+    let emit_weight = |sb: &mut ShapeBuilder,
+                       vals: &mut Vec<F128>,
+                       recs: &mut Vec<AlphaRec>,
+                       fi: usize,
+                       row_side: bool,
+                       low_v: usize,
+                       low_n: usize,
+                       pt_v: usize,
+                       pt_n: usize,
+                       rho_w: &[Wire],
+                       rho_vals: &[F128]|
+     -> Wire {
+        let s = low_n.trailing_zeros() as usize;
+        let seed = if low_n == 1 {
+            wv(low_v)
+        } else {
+            assert_eq!(low_n, 64, "the lincheck low width");
+            let mut acc = zw;
+            for h in 0..8 {
+                let mut a = F128::ONE;
+                for b in 0..3 {
+                    let r = rho_vals[3 + b];
+                    a *= if (h >> b) & 1 == 1 { r } else { F128::ONE + r };
+                }
+                vals.push(a);
+                // Record the PUBLIC index (not the input ordinal): with
+                // other regions sharing the builder the two need not
+                // coincide.
+                recs.push((sb.public_len(), fi, row_side, h));
+                let a_w = sb.public_input();
+                let mut g_in: Vec<Wire> = (0..8).map(|j| wv(low_v + 8 * h + j)).collect();
+                g_in.extend([rho_w[0], rho_w[1], rho_w[2]]);
+                g_in.push(a_w);
+                g_in.push(acc);
+                acc = sb.gate(leslot, &g_in)[0];
+            }
+            acc
+        };
+        let fs: Vec<(Wire, Wire)> = (0..pt_n).map(|j| (wv(pt_v + j), rho_w[s + j])).collect();
+        prefix(sb, seed, &fs)
+    };
+
+    let mut fold_pubs: Vec<FoldPub> = Vec::new();
+    for (fi, loc) in locs.iter().enumerate() {
+        let k = loc.claims.len();
+        let lam_w: Vec<Wire> = (0..k).map(|i| chw(loc.lam_ch0 + i)).collect();
+        let mut run_w = zw;
+        for (i, cl) in loc.claims.iter().enumerate() {
+            run_w = sb.gate(macs, &[run_w, lam_w[i], wv(cl.value_v)])[0];
+        }
+        let mut rho_col_w: Vec<Wire> = Vec::with_capacity(loc.k_col);
+        for j in 0..loc.k_col {
+            let r_w = chw(loc.col_ch0 + j);
+            rho_col_w.push(r_w);
+            run_w =
+                sb.gate(mrs, &[run_w, wv(loc.col_v + 2 * j), wv(loc.col_v + 2 * j + 1), r_w])[0];
+        }
+        let rho_col_vals: Vec<F128> = (0..loc.k_col).map(|j| chals[loc.col_ch0 + j]).collect();
+        let mut exp_w = zw;
+        for (i, cl) in loc.claims.iter().enumerate() {
+            let w = emit_weight(
+                sb,
+                vals,
+                &mut alpha_recs,
+                fi,
+                false,
+                cl.col_low_v,
+                cl.col_low_n,
+                cl.col_pt_v,
+                cl.col_pt_n,
+                &rho_col_w,
+                &rho_col_vals,
+            );
+            let t = sb.gate(macs, &[zw, w, wv(loc.bridge_v + i)])[0];
+            exp_w = sb.gate(macs, &[exp_w, lam_w[i], t])[0];
+        }
+        let delta_col = sb.gate(macs, &[run_w, exp_w, ow])[0];
+
+        let mu_w: Vec<Wire> = (0..k).map(|i| chw(loc.mu_ch0 + i)).collect();
+        let mut run2_w = zw;
+        for i in 0..k {
+            run2_w = sb.gate(macs, &[run2_w, mu_w[i], wv(loc.bridge_v + i)])[0];
+        }
+        let mut rho_row_w: Vec<Wire> = Vec::with_capacity(loc.k_row);
+        for j in 0..loc.k_row {
+            let r_w = chw(loc.row_ch0 + j);
+            rho_row_w.push(r_w);
+            run2_w =
+                sb.gate(mrs, &[run2_w, wv(loc.row_v + 2 * j), wv(loc.row_v + 2 * j + 1), r_w])[0];
+        }
+        let rho_row_vals: Vec<F128> = (0..loc.k_row).map(|j| chals[loc.row_ch0 + j]).collect();
+        let mut wmu_w = zw;
+        for (i, cl) in loc.claims.iter().enumerate() {
+            let w = emit_weight(
+                sb,
+                vals,
+                &mut alpha_recs,
+                fi,
+                true,
+                cl.row_low_v,
+                cl.row_low_n,
+                cl.row_pt_v,
+                cl.row_pt_n,
+                &rho_row_w,
+                &rho_row_vals,
+            );
+            wmu_w = sb.gate(macs, &[wmu_w, mu_w[i], w])[0];
+        }
+        // The LAST fold's output value sits in the transcript tail past
+        // the final squeeze — no chain wire (step 1's shape fact); it
+        // enters as its own input, bound by the row endpoint delta.
+        let value = if fi + 1 == locs.len() {
+            vals.push(vals_rec[loc.out_v]);
+            sb.input()
+        } else {
+            wv(loc.out_v)
+        };
+        let rhs_w = sb.gate(macs, &[zw, wmu_w, value])[0];
+        let delta_row = sb.gate(macs, &[run2_w, rhs_w, ow])[0];
+        fold_pubs.push(FoldPub {
+            deltas: [delta_col, delta_row],
+            rho_col: rho_col_w,
+            rho_row: rho_row_w,
+            value,
+        });
+    }
+    (fold_pubs, alpha_recs)
+}
+
+/// Walk the published fold blocks from `tail0`: both endpoint deltas zero
+/// per fold, the accumulator claims rebuilt from the PUBLIC SEGMENT alone,
+/// and every boundary-expanded low-fold eq public validated against the
+/// PUBLISHED ρ coordinates. Returns the rebuilt claims for the caller's
+/// accumulator reassembly.
+fn check_fold_publics(
+    public: &[F128],
+    tail0: usize,
+    locs: &[FoldLoc],
+    alpha_recs: &[AlphaRec],
+) -> Vec<flock_core::matrix_fold::MatrixClaim> {
+    use flock_core::matrix_fold::{MatrixClaim, Weight};
+    let mut p = tail0;
+    let mut rebuilt: Vec<MatrixClaim> = Vec::new();
+    for loc in locs {
+        assert_eq!(public[p], F128::ZERO, "col endpoint zero-delta");
+        assert_eq!(public[p + 1], F128::ZERO, "row endpoint zero-delta");
+        let rho_col = public[p + 2..p + 2 + loc.k_col].to_vec();
+        let rho_row = public[p + 2 + loc.k_col..p + 2 + loc.k_col + loc.k_row].to_vec();
+        let value = public[p + 2 + loc.k_col + loc.k_row];
+        rebuilt.push(MatrixClaim {
+            row: Weight::eq(rho_row),
+            col: Weight::eq(rho_col),
+            value,
+        });
+        p += 3 + loc.k_col + loc.k_row;
+    }
+    for &(idx, fi, row_side, h) in alpha_recs {
+        let base: usize = tail0
+            + locs[..fi]
+                .iter()
+                .map(|l| 3 + l.k_col + l.k_row)
+                .sum::<usize>();
+        let rho = if row_side {
+            &public[base + 2 + locs[fi].k_col..base + 2 + locs[fi].k_col + locs[fi].k_row]
+        } else {
+            &public[base + 2..base + 2 + locs[fi].k_col]
+        };
+        let mut e = F128::ONE;
+        for b in 0..3 {
+            let r = rho[3 + b];
+            e *= if (h >> b) & 1 == 1 { r } else { F128::ONE + r };
+        }
+        assert_eq!(
+            public[idx],
+            e,
+            "boundary-expanded low-fold eq public (fold {fi}, h {h})"
+        );
+    }
+    rebuilt
+}
+
 /// **MVP-11 step 2: the FULL fold region of a merge node, tape-pinned.**
 ///
 /// `verify_aggregate_classes` for the two mixed children — bind, the
@@ -13056,7 +13560,7 @@ fn mvp11_sigma_fold_tape() {
 #[ignore] // Heavier — run with `-- --ignored`.
 fn mvp11_merge_fold_region() {
     use flock_core::aggregate;
-    use flock_core::matrix_fold::{FoldProof, MatrixClaim, Weight};
+    use flock_core::matrix_fold::{FoldProof, MatrixClaim};
     use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
 
     const M11_MERGE_DOMAIN: &[u8] = b"flock-mvp11-merge-node-v0";
@@ -13273,34 +13777,7 @@ fn mvp11_merge_fold_region() {
         Op::ObserveBytes(32),
         Op::ObserveBytes(1),
     ];
-    for cs in &fold_claims {
-        want.push(Op::Label(b"flock-matrix-fold-v0".to_vec()));
-        for c in cs {
-            want.extend([
-                Op::ObserveSlice(c.row.low.len()),
-                Op::ObserveSlice(c.row.point.len()),
-                Op::ObserveSlice(c.col.low.len()),
-                Op::ObserveSlice(c.col.point.len()),
-                Op::ObserveScalar,
-            ]);
-        }
-        for _ in 0..cs.len() {
-            want.push(Op::SqueezeScalar); // lambdas
-        }
-        for _ in 0..cs[0].col.n_vars() {
-            want.extend([Op::ObserveScalar, Op::ObserveScalar, Op::SqueezeScalar]);
-        }
-        for _ in 0..cs.len() {
-            want.push(Op::ObserveScalar); // bridge
-        }
-        for _ in 0..cs.len() {
-            want.push(Op::SqueezeScalar); // mus
-        }
-        for _ in 0..cs[0].row.n_vars() {
-            want.extend([Op::ObserveScalar, Op::ObserveScalar, Op::SqueezeScalar]);
-        }
-        want.push(Op::ObserveScalar); // the output value
-    }
+    want.extend(fold_region_ops(&fold_claims));
     assert_eq!(ops, want.as_slice(), "the merge tape is the expected shape");
     assert_eq!(rec.payloads()[0], registry.digest(), "bind: registry digest");
     assert_eq!(
@@ -13310,199 +13787,13 @@ fn mvp11_merge_fold_region() {
     );
 
     // ---- locate every fold's surfaces, and pin them field-for-field ----
-    struct ClaimLoc {
-        row_low_v: usize,
-        row_low_n: usize,
-        row_pt_v: usize,
-        row_pt_n: usize,
-        col_low_v: usize,
-        col_low_n: usize,
-        col_pt_v: usize,
-        col_pt_n: usize,
-        value_v: usize,
-    }
-    struct FoldLoc {
-        claims: Vec<ClaimLoc>,
-        lam_ch0: usize,
-        col_v: usize,
-        col_ch0: usize,
-        k_col: usize,
-        bridge_v: usize,
-        mu_ch0: usize,
-        row_v: usize,
-        row_ch0: usize,
-        k_row: usize,
-        out_v: usize,
-    }
-    let (mut vcur, mut ccur) = (0usize, 0usize);
-    let locs: Vec<FoldLoc> = fold_claims
-        .iter()
-        .map(|cs| {
-            let claims = cs
-                .iter()
-                .map(|c| {
-                    let l = ClaimLoc {
-                        row_low_v: vcur,
-                        row_low_n: c.row.low.len(),
-                        row_pt_v: vcur + c.row.low.len(),
-                        row_pt_n: c.row.point.len(),
-                        col_low_v: vcur + c.row.low.len() + c.row.point.len(),
-                        col_low_n: c.col.low.len(),
-                        col_pt_v: vcur + c.row.low.len() + c.row.point.len() + c.col.low.len(),
-                        col_pt_n: c.col.point.len(),
-                        value_v: vcur
-                            + c.row.low.len()
-                            + c.row.point.len()
-                            + c.col.low.len()
-                            + c.col.point.len(),
-                    };
-                    vcur = l.value_v + 1;
-                    l
-                })
-                .collect::<Vec<_>>();
-            let (k_col, k_row) = (cs[0].col.n_vars(), cs[0].row.n_vars());
-            let lam_ch0 = ccur;
-            ccur += cs.len();
-            let col_v = vcur;
-            let col_ch0 = ccur;
-            vcur += 2 * k_col;
-            ccur += k_col;
-            let bridge_v = vcur;
-            vcur += cs.len();
-            let mu_ch0 = ccur;
-            ccur += cs.len();
-            let row_v = vcur;
-            let row_ch0 = ccur;
-            vcur += 2 * k_row;
-            ccur += k_row;
-            let out_v = vcur;
-            vcur += 1;
-            FoldLoc {
-                claims,
-                lam_ch0,
-                col_v,
-                col_ch0,
-                k_col,
-                bridge_v,
-                mu_ch0,
-                row_v,
-                row_ch0,
-                k_row,
-                out_v,
-            }
-        })
-        .collect();
-    assert_eq!(vals_rec.len(), vcur, "every stream value is accounted for");
-    assert_eq!(chals.len(), ccur, "every squeeze is accounted for");
-    for ((loc, cs), fp) in locs.iter().zip(&fold_claims).zip(&fold_proofs) {
-        for (cl, c) in loc.claims.iter().zip(cs) {
-            assert_eq!(
-                &vals_rec[cl.row_low_v..cl.row_low_v + cl.row_low_n],
-                &c.row.low[..],
-                "row low on the stream"
-            );
-            assert_eq!(
-                &vals_rec[cl.row_pt_v..cl.row_pt_v + cl.row_pt_n],
-                &c.row.point[..],
-                "row point on the stream"
-            );
-            assert_eq!(
-                &vals_rec[cl.col_low_v..cl.col_low_v + cl.col_low_n],
-                &c.col.low[..],
-                "col low on the stream"
-            );
-            assert_eq!(
-                &vals_rec[cl.col_pt_v..cl.col_pt_v + cl.col_pt_n],
-                &c.col.point[..],
-                "col point on the stream"
-            );
-            assert_eq!(vals_rec[cl.value_v], c.value, "claim value on the stream");
-        }
-        for (j, &(q1, qinf)) in fp.col_rounds.iter().enumerate() {
-            assert_eq!(vals_rec[loc.col_v + 2 * j], q1, "col round q(1)");
-            assert_eq!(vals_rec[loc.col_v + 2 * j + 1], qinf, "col round q(inf)");
-        }
-        assert_eq!(
-            &vals_rec[loc.bridge_v..loc.bridge_v + loc.claims.len()],
-            &fp.bridge[..],
-            "the bridge on the stream"
-        );
-        for (j, &(q1, qinf)) in fp.row_rounds.iter().enumerate() {
-            assert_eq!(vals_rec[loc.row_v + 2 * j], q1, "row round q(1)");
-            assert_eq!(vals_rec[loc.row_v + 2 * j + 1], qinf, "row round q(inf)");
-        }
-        assert_eq!(vals_rec[loc.out_v], fp.value, "output value on the stream");
-    }
+    let locs = locate_and_pin_folds(&fold_claims, &fold_proofs, vals_rec, chals);
 
     // ---- every fold's endpoints, replayed from LOCATED words alone ----
     // Weights are REBUILT from located stream words and evaluated through
     // the verifier's own `Weight::eval` — the low fold included, which is
     // what the boolean folds add over step 1's pure eq products.
-    let replay_rounds = |target: F128, base: usize, ch0: usize, n: usize| -> (F128, Vec<F128>) {
-        let mut run = target;
-        let mut rho = Vec::with_capacity(n);
-        for j in 0..n {
-            let (g1, gi) = (vals_rec[base + 2 * j], vals_rec[base + 2 * j + 1]);
-            let r = chals[ch0 + j];
-            let q0 = run + g1;
-            run = gi * r * r + (q0 + g1 + gi) * r + q0;
-            rho.push(r);
-        }
-        (run, rho)
-    };
-    let outs: Vec<MatrixClaim> = locs
-        .iter()
-        .map(|loc| {
-            let k = loc.claims.len();
-            let lam: Vec<F128> = (0..k).map(|i| chals[loc.lam_ch0 + i]).collect();
-            let target_c = loc
-                .claims
-                .iter()
-                .zip(&lam)
-                .fold(F128::ZERO, |acc, (cl, &l)| acc + l * vals_rec[cl.value_v]);
-            let (run_c, rho_col) = replay_rounds(target_c, loc.col_v, loc.col_ch0, loc.k_col);
-            let located = |low_v: usize, low_n: usize, pt_v: usize, pt_n: usize| -> Weight {
-                Weight::low_eq(
-                    vals_rec[low_v..low_v + low_n].to_vec(),
-                    vals_rec[pt_v..pt_v + pt_n].to_vec(),
-                )
-            };
-            let expect_c = loc
-                .claims
-                .iter()
-                .zip(&lam)
-                .enumerate()
-                .fold(F128::ZERO, |acc, (i, (cl, &l))| {
-                    let w = located(cl.col_low_v, cl.col_low_n, cl.col_pt_v, cl.col_pt_n);
-                    acc + l * w.eval(&rho_col) * vals_rec[loc.bridge_v + i]
-                });
-            assert_eq!(run_c, expect_c, "col endpoint closes from located words");
-
-            let mus: Vec<F128> = (0..k).map(|i| chals[loc.mu_ch0 + i]).collect();
-            let target_r = (0..k)
-                .zip(&mus)
-                .fold(F128::ZERO, |acc, (i, &m)| acc + m * vals_rec[loc.bridge_v + i]);
-            let (run_r, rho_row) = replay_rounds(target_r, loc.row_v, loc.row_ch0, loc.k_row);
-            let w_mu = loc
-                .claims
-                .iter()
-                .zip(&mus)
-                .fold(F128::ZERO, |acc, (cl, &m)| {
-                    let w = located(cl.row_low_v, cl.row_low_n, cl.row_pt_v, cl.row_pt_n);
-                    acc + m * w.eval(&rho_row)
-                });
-            assert_eq!(
-                run_r,
-                w_mu * vals_rec[loc.out_v],
-                "row endpoint closes from located words"
-            );
-            MatrixClaim {
-                row: Weight::eq(rho_row),
-                col: Weight::eq(rho_col),
-                value: vals_rec[loc.out_v],
-            }
-        })
-        .collect();
+    let outs = replay_fold_endpoints(&locs, vals_rec, chals);
 
     // The five located outputs ARE the verifier's accumulator — the merge
     // node's public statement, reassembled surface by surface.
@@ -13595,169 +13886,29 @@ fn mvp11_merge_fold_region() {
             }
         }
         let wv = |vi: usize| -> Wire { ww[vmap[vi].expect("stream word")].expect("wired") };
-        let chw = |fin: usize| -> Wire { chain_outs[trace.squeezes[fin][0]][0] };
         vals.push(F128::ZERO);
         let zw = sb.public_input();
         vals.push(F128::ONE);
         let ow = sb.public_input();
 
-        // seed · Π (1 + a_j + b_j) through the prefix slot, padded (zw, zw).
-        let prefix = |sb: &mut ShapeBuilder, seed: Wire, fs: &[(Wire, Wire)]| -> Wire {
-            let mut s = seed;
-            for chunk in fs.chunks(pf_w) {
-                let mut g_in = vec![s];
-                for (a, _) in chunk {
-                    g_in.push(*a);
-                }
-                g_in.extend(std::iter::repeat_n(zw, pf_w - chunk.len()));
-                for (_, b) in chunk {
-                    g_in.push(*b);
-                }
-                g_in.extend(std::iter::repeat_n(zw, pf_w - chunk.len()));
-                g_in.push(ow);
-                s = sb.gate(pfslot, &g_in)[0];
-            }
-            s
-        };
-        // One weight eval at ρ: the low factor's MLE (seeded by the single
-        // absorbed low word for eq weights, or folded through 8 LeafEval
-        // rows for the 64-entry lows), times the eq-point prefix product
-        // over the remaining coordinates.
-        let mut alpha_recs: Vec<(usize, usize, bool, usize)> = Vec::new();
-        let emit_weight = |sb: &mut ShapeBuilder,
-                               vals: &mut Vec<F128>,
-                               recs: &mut Vec<(usize, usize, bool, usize)>,
-                               fi: usize,
-                               row_side: bool,
-                               low_v: usize,
-                               low_n: usize,
-                               pt_v: usize,
-                               pt_n: usize,
-                               rho_w: &[Wire],
-                               rho_vals: &[F128]|
-         -> Wire {
-            let s = low_n.trailing_zeros() as usize;
-            let seed = if low_n == 1 {
-                wv(low_v)
-            } else {
-                assert_eq!(low_n, 64, "the lincheck low width");
-                let mut acc = zw;
-                for h in 0..8 {
-                    let mut a = F128::ONE;
-                    for b in 0..3 {
-                        let r = rho_vals[3 + b];
-                        a *= if (h >> b) & 1 == 1 { r } else { F128::ONE + r };
-                    }
-                    vals.push(a);
-                    // Record the PUBLIC index (not the input ordinal): with
-                    // the child regions sharing the builder the two no
-                    // longer coincide.
-                    recs.push((sb.public_len(), fi, row_side, h));
-                    let a_w = sb.public_input();
-                    let mut g_in: Vec<Wire> = (0..8).map(|j| wv(low_v + 8 * h + j)).collect();
-                    g_in.extend([rho_w[0], rho_w[1], rho_w[2]]);
-                    g_in.push(a_w);
-                    g_in.push(acc);
-                    acc = sb.gate(leslot, &g_in)[0];
-                }
-                acc
-            };
-            let fs: Vec<(Wire, Wire)> = (0..pt_n).map(|j| (wv(pt_v + j), rho_w[s + j])).collect();
-            prefix(sb, seed, &fs)
-        };
-
-        struct FoldPub {
-            deltas: [Wire; 2],
-            rho_col: Vec<Wire>,
-            rho_row: Vec<Wire>,
-            value: Wire,
-        }
-        let mut fold_pubs: Vec<FoldPub> = Vec::new();
-        for (fi, loc) in locs.iter().enumerate() {
-            let k = loc.claims.len();
-            let lam_w: Vec<Wire> = (0..k).map(|i| chw(loc.lam_ch0 + i)).collect();
-            let mut run_w = zw;
-            for (i, cl) in loc.claims.iter().enumerate() {
-                run_w = sb.gate(macs, &[run_w, lam_w[i], wv(cl.value_v)])[0];
-            }
-            let mut rho_col_w: Vec<Wire> = Vec::with_capacity(loc.k_col);
-            for j in 0..loc.k_col {
-                let r_w = chw(loc.col_ch0 + j);
-                rho_col_w.push(r_w);
-                run_w =
-                    sb.gate(mrs, &[run_w, wv(loc.col_v + 2 * j), wv(loc.col_v + 2 * j + 1), r_w])[0];
-            }
-            let rho_col_vals: Vec<F128> =
-                (0..loc.k_col).map(|j| chals[loc.col_ch0 + j]).collect();
-            let mut exp_w = zw;
-            for (i, cl) in loc.claims.iter().enumerate() {
-                let w = emit_weight(
-                    &mut sb,
-                    &mut vals,
-                    &mut alpha_recs,
-                    fi,
-                    false,
-                    cl.col_low_v,
-                    cl.col_low_n,
-                    cl.col_pt_v,
-                    cl.col_pt_n,
-                    &rho_col_w,
-                    &rho_col_vals,
-                );
-                let t = sb.gate(macs, &[zw, w, wv(loc.bridge_v + i)])[0];
-                exp_w = sb.gate(macs, &[exp_w, lam_w[i], t])[0];
-            }
-            let delta_col = sb.gate(macs, &[run_w, exp_w, ow])[0];
-
-            let mu_w: Vec<Wire> = (0..k).map(|i| chw(loc.mu_ch0 + i)).collect();
-            let mut run2_w = zw;
-            for i in 0..k {
-                run2_w = sb.gate(macs, &[run2_w, mu_w[i], wv(loc.bridge_v + i)])[0];
-            }
-            let mut rho_row_w: Vec<Wire> = Vec::with_capacity(loc.k_row);
-            for j in 0..loc.k_row {
-                let r_w = chw(loc.row_ch0 + j);
-                rho_row_w.push(r_w);
-                run2_w =
-                    sb.gate(mrs, &[run2_w, wv(loc.row_v + 2 * j), wv(loc.row_v + 2 * j + 1), r_w])[0];
-            }
-            let rho_row_vals: Vec<F128> =
-                (0..loc.k_row).map(|j| chals[loc.row_ch0 + j]).collect();
-            let mut wmu_w = zw;
-            for (i, cl) in loc.claims.iter().enumerate() {
-                let w = emit_weight(
-                    &mut sb,
-                    &mut vals,
-                    &mut alpha_recs,
-                    fi,
-                    true,
-                    cl.row_low_v,
-                    cl.row_low_n,
-                    cl.row_pt_v,
-                    cl.row_pt_n,
-                    &rho_row_w,
-                    &rho_row_vals,
-                );
-                wmu_w = sb.gate(macs, &[wmu_w, mu_w[i], w])[0];
-            }
-            // The LAST fold's output value sits in the transcript tail past
-            // the final squeeze — no chain wire (step 1's shape fact); it
-            // enters as its own input, bound by the row endpoint delta.
-            let value = if fi + 1 == locs.len() {
-                vals.push(vals_rec[loc.out_v]);
-                sb.input()
-            } else {
-                wv(loc.out_v)
-            };
-            let rhs_w = sb.gate(macs, &[zw, wmu_w, value])[0];
-            let delta_row = sb.gate(macs, &[run2_w, rhs_w, ow])[0];
-            fold_pubs.push(FoldPub {
-                deltas: [delta_col, delta_row],
-                rho_col: rho_col_w,
-                rho_row: rho_row_w,
-                value,
-            });
-        }
+        let (fold_pubs, alpha_recs) = emit_fold_region(
+            &mut sb,
+            macs,
+            mrs,
+            pfslot,
+            pf_w,
+            leslot,
+            &locs,
+            &trace.squeezes,
+            &chain_outs,
+            &ww,
+            &vmap,
+            chals,
+            vals_rec,
+            &mut vals,
+            zw,
+            ow,
+        );
         // ---- STEP 3's CONNECTS: the fold's absorbed claim surfaces ARE
         // the child regions' assertion-emission wires ----
         // Every surface the child region carries as a WIRE is now
@@ -13960,42 +14111,7 @@ fn mvp11_merge_fold_region() {
         // three groups.
         let tail_len: usize = locs.iter().map(|l| 3 + l.k_col + l.k_row).sum();
         let tail0 = fold_pub_base;
-        let mut p = tail0;
-        let mut rebuilt: Vec<MatrixClaim> = Vec::new();
-        for loc in &locs {
-            assert_eq!(built2.public[p], F128::ZERO, "col endpoint zero-delta");
-            assert_eq!(built2.public[p + 1], F128::ZERO, "row endpoint zero-delta");
-            let rho_col = built2.public[p + 2..p + 2 + loc.k_col].to_vec();
-            let rho_row =
-                built2.public[p + 2 + loc.k_col..p + 2 + loc.k_col + loc.k_row].to_vec();
-            let value = built2.public[p + 2 + loc.k_col + loc.k_row];
-            rebuilt.push(MatrixClaim {
-                row: Weight::eq(rho_row),
-                col: Weight::eq(rho_col),
-                value,
-            });
-            p += 3 + loc.k_col + loc.k_row;
-        }
-        for &(idx, fi, row_side, h) in &alpha_recs {
-            let base: usize =
-                tail0 + locs[..fi].iter().map(|l| 3 + l.k_col + l.k_row).sum::<usize>();
-            let rho = if row_side {
-                &built2.public
-                    [base + 2 + locs[fi].k_col..base + 2 + locs[fi].k_col + locs[fi].k_row]
-            } else {
-                &built2.public[base + 2..base + 2 + locs[fi].k_col]
-            };
-            let mut e = F128::ONE;
-            for b in 0..3 {
-                let r = rho[3 + b];
-                e *= if (h >> b) & 1 == 1 { r } else { F128::ONE + r };
-            }
-            assert_eq!(
-                built2.public[idx],
-                e,
-                "boundary-expanded low-fold eq public (fold {fi}, h {h})"
-            );
-        }
+        let rebuilt = check_fold_publics(&built2.public, tail0, &locs, &alpha_recs);
         for (r, o) in rebuilt.iter().zip(&outs) {
             assert_eq!(r, o, "published fold output == located native output");
         }
@@ -14229,6 +14345,405 @@ fn mvp11_merge_fold_region() {
         ops.len(),
         vals_rec.len(),
         chals.len(),
+        outer_stats.0,
+        outer_stats.1,
+        outer_stats.2,
+        outer_stats.3,
+        outer_stats.4 as f64 / 1024.0,
+    );
+}
+
+/// **MVP-11 at the REAL registry — the ~35-fold "swap-children" scale.**
+///
+/// The merge children are the real recursion node (the leaf outer,
+/// [`build_leaf_outer`]): its registry carries the full gate-type census,
+/// so `verify_aggregate_classes` runs one A/B fold pair per boolean type
+/// and per element type, plus sigma — the merge node's fold region at its
+/// first honest size. The whole tape pins through the WIDTH-DRIVEN helpers
+/// unchanged, every endpoint closes from located words, and the region
+/// replays IN-CIRCUIT with zero new machinery — the scale is rows, not
+/// types. The accumulator (every group's A/B claims + sigma) reassembles
+/// from the public segment alone and discharges against the real node's
+/// own matrices and sigma table.
+///
+/// Scaffolding notes: the two children are the SAME leaf outer verified
+/// deferred twice — `build_leaf_outer` is deterministic, so a second build
+/// would yield byte-identical artifacts; claim distinctness adds nothing
+/// at this step (the 4→1 test covers mixed inherited/fresh claims), the
+/// registry scale is the content. The child-tape regions at this scale are
+/// the composition phase, not this test.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn mvp11_swap_children_fold_scale() {
+    use flock_core::aggregate;
+    use flock_core::matrix_fold::{FoldProof, MatrixClaim};
+    use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
+
+    const M11_SCALE_DOMAIN: &[u8] = b"flock-mvp11-merge-scale-v0";
+
+    let lo = build_leaf_outer();
+    let union_i = UnionInstance::new(&lo.shape.registry, lo.shape.counts.clone());
+    let registry = &lo.shape.registry;
+    let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
+        (lo.b3_slot, lo.b3_r1cs.csc_lincheck_circuit()),
+        (lo.swap_slot, lo.swap_r1cs.csc_lincheck_circuit()),
+        (lo.spread_slot, lo.spread_r1cs.csc_lincheck_circuit()),
+    ];
+    lcs_ord.sort_by_key(|(i, _)| *i);
+    let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
+        lcs_ord.iter().map(|&(_, c)| c).collect();
+
+    // The two children: the real node's deferred verify, run twice.
+    let deferred = || {
+        let mut ch = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
+        let (_, work, sigma) = verifier::verify_ligerito_union_circuit_deferred(
+            &union_i,
+            &lo.shape.circuit,
+            &lo.public,
+            &lcs,
+            &lo.commitment,
+            &lo.proof,
+            &lo.pcs,
+            &mut ch,
+        )
+        .expect("the deferred verify accepts the real node");
+        (
+            work.boolean.expect("the real node's boolean matrix work"),
+            work.element.expect("the real node's element matrix work"),
+            sigma,
+        )
+    };
+    let (ba0, ea0, sg0) = deferred();
+    let (ba1, ea1, sg1) = deferred();
+    let bool_asserts = [ba0, ba1];
+    let el_asserts = [(&union_i, ea0), (&union_i, ea1)];
+    let sigmas = [sg0, sg1];
+
+    // The matrices + lincheck circuits per BOOLEAN type in registry order
+    // (via the slot indices), and per ELEMENT type from the registry's own
+    // table entries — everything the fold prover and the discharges read.
+    let mut mats_ord = vec![
+        (lo.b3_slot, (&lo.b3_r1cs.a_0, &lo.b3_r1cs.b_0)),
+        (lo.swap_slot, (&lo.swap_r1cs.a_0, &lo.swap_r1cs.b_0)),
+        (lo.spread_slot, (&lo.spread_r1cs.a_0, &lo.spread_r1cs.b_0)),
+    ];
+    mats_ord.sort_by_key(|&(i, _)| i);
+    let mats: Vec<_> = mats_ord.iter().map(|&(_, m)| m).collect();
+    let el_types: Vec<_> = registry
+        .element_types()
+        .iter()
+        .map(|s| s.element_type().expect("an element slot's table"))
+        .collect();
+    let el_mats: Vec<_> = el_types.iter().map(|t| (t.a_0(), t.b_0())).collect();
+    let n_bool = registry.num_boolean();
+    let n_el = el_mats.len();
+    assert_eq!(n_bool, 3, "the real node's boolean census: b3, swap, spread");
+    assert!(n_el > 5, "the real node carries the element gate census");
+
+    // The native fold: prove + record-verify + discharge all three groups.
+    let mut chp = FsChallenger::with_hash(M11_SCALE_DOMAIN, HashKind::Blake3);
+    let (agg, acc_p) = aggregate::prove_aggregate_classes(
+        registry,
+        &mats,
+        &lcs,
+        &bool_asserts,
+        &el_mats,
+        &el_asserts,
+        Some((&lo.shape.circuit, &sigmas)),
+        &[],
+        &mut chp,
+    )
+    .expect("the scale fold proves");
+    let mut rec =
+        RecordingChallenger::new(FsChallenger::with_hash(M11_SCALE_DOMAIN, HashKind::Blake3));
+    let acc_v = aggregate::verify_aggregate_classes(
+        registry,
+        &bool_asserts,
+        &el_asserts,
+        Some((&lo.shape.circuit, &sigmas)),
+        &[],
+        &agg,
+        &mut rec,
+    )
+    .expect("the scale fold verifies");
+    assert_eq!(acc_p, acc_v, "prover and verifier accumulators agree");
+    assert!(acc_v.discharge(&mats), "the boolean group discharges");
+    assert!(
+        acc_v.discharge_element(&el_mats),
+        "the element group discharges"
+    );
+    assert!(
+        acc_v.discharge_sigma(&lo.shape.circuit),
+        "the sigma group discharges"
+    );
+
+    // The fold groups in aggregate order: per boolean type A then B, per
+    // element type A then B, then sigma.
+    let bc: Vec<_> = bool_asserts.iter().map(|a| a.claims(registry)).collect();
+    let ec: Vec<_> = el_asserts.iter().map(|(u, a)| a.claims(u)).collect();
+    let mut fold_claims: Vec<Vec<MatrixClaim>> = Vec::new();
+    for t in 0..n_bool {
+        fold_claims.push(vec![bc[0][t].0.clone(), bc[1][t].0.clone()]);
+        fold_claims.push(vec![bc[0][t].1.clone(), bc[1][t].1.clone()]);
+    }
+    for t in 0..n_el {
+        fold_claims.push(vec![ec[0][t].0.clone(), ec[1][t].0.clone()]);
+        fold_claims.push(vec![ec[0][t].1.clone(), ec[1][t].1.clone()]);
+    }
+    fold_claims.push(vec![sigmas[0].claim(), sigmas[1].claim()]);
+    let mut fold_proofs: Vec<&FoldProof> = Vec::new();
+    for t in 0..n_bool {
+        fold_proofs.push(&agg.folds[t].0);
+        fold_proofs.push(&agg.folds[t].1);
+    }
+    for t in 0..n_el {
+        fold_proofs.push(&agg.el_folds[t].0);
+        fold_proofs.push(&agg.el_folds[t].1);
+    }
+    fold_proofs.push(agg.sigma_fold.as_ref().expect("the sigma fold rides along"));
+    let n_folds = fold_claims.len();
+    let total_rounds: usize = fold_claims
+        .iter()
+        .map(|cs| cs[0].col.n_vars() + cs[0].row.n_vars())
+        .sum();
+
+    // ---- the tape, pinned through the width-driven helpers ----
+    let t_shape = rec.shape();
+    let ops = t_shape.ops();
+    let vals_rec = rec.values();
+    let chals = rec.challenges();
+    let mut want: Vec<Op> = vec![
+        Op::Label(b"flock-aggregate-v0".to_vec()),
+        Op::ObserveBytes(32),
+        Op::ObserveBytes(1),
+    ];
+    want.extend(fold_region_ops(&fold_claims));
+    assert_eq!(ops, want.as_slice(), "the scale tape is the expected shape");
+    assert_eq!(rec.payloads()[0], registry.digest(), "bind: registry digest");
+    assert_eq!(rec.payloads()[1], vec![0u8], "bind: prior count 0");
+    let locs = locate_and_pin_folds(&fold_claims, &fold_proofs, vals_rec, chals);
+    let outs = replay_fold_endpoints(&locs, vals_rec, chals);
+    // The located outputs ARE the verifier's accumulator, group for group.
+    for t in 0..n_bool {
+        assert_eq!(outs[2 * t], acc_v.per_type[t].0, "boolean type {t} A");
+        assert_eq!(outs[2 * t + 1], acc_v.per_type[t].1, "boolean type {t} B");
+    }
+    for t in 0..n_el {
+        assert_eq!(
+            outs[2 * n_bool + 2 * t],
+            acc_v.per_element[t].0,
+            "element type {t} A"
+        );
+        assert_eq!(
+            outs[2 * n_bool + 2 * t + 1],
+            acc_v.per_element[t].1,
+            "element type {t} B"
+        );
+    }
+    let (sig_digest, sig_claim) = acc_v.sigma.as_ref().expect("sigma accumulated");
+    assert_eq!(outs[n_folds - 1], *sig_claim, "sigma accumulator");
+    assert_eq!(*sig_digest, lo.shape.circuit.digest(), "sigma key");
+
+    // ---- the in-circuit replay: the whole ~35-fold region ----
+    let outer_stats = {
+        use flock_prover::prover::UnionElementSlotInput;
+        use flock_prover::r1cs_hashes::fs_chain::FsChain;
+
+        let stream = t_shape.stream_words(M11_SCALE_DOMAIN);
+        let bytes = stream.to_bytes(rec.values(), rec.payloads());
+        let mut chain = FsChain::new();
+        let mut at = 0usize;
+        let fin_ops: Vec<_> = t_shape.ops().iter().filter(|o| o.finalizes()).collect();
+        assert_eq!(
+            stream.finalize_after.len(),
+            fin_ops.len(),
+            "finalize alignment"
+        );
+        assert_eq!(fin_ops.len(), chals.len(), "every finalizer is a scalar squeeze");
+        for (k, &upto) in stream.finalize_after.iter().enumerate() {
+            chain.absorb(&bytes[at * 16..upto * 16]);
+            at = upto;
+            chain.finalize(fin_ops[k].squeezed_bytes());
+        }
+        chain.absorb(&bytes[at * 16..]);
+        let trace = chain.finish();
+
+        let b3_rows = trace.rows.len();
+        let nu2 = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7);
+        let mut sb = ShapeBuilder::new(nu2);
+        let b3s = sb.slot(Blake3Gate { nu: nu2 });
+        let macs = sb.slot(MacGate::new());
+        let mrs = sb.slot(MergedRoundGate::new());
+        let pf_w = 8usize;
+        let pfslot = sb.slot(PrefixGate::new(pf_w));
+        let leslot = sb.slot(LeafEvalGate::new(8));
+
+        let mut vals: Vec<F128> = Vec::new();
+        let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+        vals.extend_from_slice(&iv_w);
+        let iv2 = [sb.public_input(), sb.public_input()];
+        let (chain_outs, ww) = emit_fs_chain(&mut sb, b3s, iv2, &trace, &stream, &bytes, &mut vals);
+        let mut vmap: Vec<Option<usize>> = Vec::new();
+        for (wi, w) in stream.words.iter().enumerate() {
+            if let flock_core::transcript_record::StreamWord::Value(vi) = *w {
+                if vmap.len() <= vi {
+                    vmap.resize(vi + 1, None);
+                }
+                vmap[vi] = Some(wi);
+            }
+        }
+        vals.push(F128::ZERO);
+        let zw = sb.public_input();
+        vals.push(F128::ONE);
+        let ow = sb.public_input();
+        let (fold_pubs, alpha_recs) = emit_fold_region(
+            &mut sb,
+            macs,
+            mrs,
+            pfslot,
+            pf_w,
+            leslot,
+            &locs,
+            &trace.squeezes,
+            &chain_outs,
+            &ww,
+            &vmap,
+            chals,
+            vals_rec,
+            &mut vals,
+            zw,
+            ow,
+        );
+        let fold_pub_base = sb.public_len();
+        for fp in &fold_pubs {
+            sb.publish(fp.deltas[0]);
+            sb.publish(fp.deltas[1]);
+            for &w in &fp.rho_col {
+                sb.publish(w);
+            }
+            for &w in &fp.rho_row {
+                sb.publish(w);
+            }
+            sb.publish(fp.value);
+        }
+
+        let shape2 = sb.finish().expect("the scale fold circuit builds");
+        let built2 = shape2.run(&vals, &[]);
+
+        let rebuilt = check_fold_publics(&built2.public, fold_pub_base, &locs, &alpha_recs);
+        let tail_len: usize = locs.iter().map(|l| 3 + l.k_col + l.k_row).sum();
+        assert_eq!(
+            fold_pub_base + tail_len,
+            built2.public.len(),
+            "the fold publics are the tail"
+        );
+        let acc_pub = aggregate::Accumulator {
+            registry_digest: registry.digest(),
+            per_type: (0..n_bool)
+                .map(|t| (rebuilt[2 * t].clone(), rebuilt[2 * t + 1].clone()))
+                .collect(),
+            per_element: (0..n_el)
+                .map(|t| {
+                    (
+                        rebuilt[2 * n_bool + 2 * t].clone(),
+                        rebuilt[2 * n_bool + 2 * t + 1].clone(),
+                    )
+                })
+                .collect(),
+            sigma: Some((lo.shape.circuit.digest(), rebuilt[n_folds - 1].clone())),
+        };
+        assert_eq!(
+            acc_pub, acc_v,
+            "the Accumulator, reassembled from the public segment alone"
+        );
+        assert!(
+            acc_pub.discharge(&mats)
+                && acc_pub.discharge_element(&el_mats)
+                && acc_pub.discharge_sigma(&lo.shape.circuit),
+            "the public-segment accumulator discharges all three groups"
+        );
+
+        // The outer proves and verifies over the circuit path.
+        let union2 = UnionInstance::new(&shape2.registry, shape2.counts.clone());
+        let pcs2 = PcsParams {
+            m: union2.dense_m(),
+            log_inv_rate: 1,
+            log_batch_size: 6,
+            profile: LigeritoProfile::Fast,
+            num_lanes: union2.commit_lanes(6),
+            merkle_hash: Default::default(),
+        };
+        let b3_r1cs2 = blake3::build_block_r1cs(nu2);
+        let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
+        let mut el_ord: Vec<(usize, Vec<F128>)> = [macs, mrs, pfslot, leslot]
+            .into_iter()
+            .map(|sl| {
+                let z = match &built2.witnesses[shape2.registry_slot(sl)] {
+                    SlotWitness::Element(z) => z.clone(),
+                    other => panic!("element slot produced {other:?}"),
+                };
+                (shape2.registry_slot(sl), z)
+            })
+            .collect();
+        el_ord.sort_by_key(|(i, _)| *i);
+        let el_inputs: Vec<UnionElementSlotInput> = el_ord
+            .into_iter()
+            .map(|(i, z)| live_element_input(z, shape2.counts[i], nu2))
+            .collect();
+        let mut ch2 = FsChallenger::new(DOMAIN);
+        let (oproof, ocommit, _) = prover::prove_fast_ligerito_union_circuit(
+            &union2,
+            &shape2.circuit,
+            &built2.public,
+            &pcs2,
+            vec![UnionSlotProverInput::new(
+                blake3::generate_witness_batch_major_partial(built2.rows::<Blake3Gate>(b3s), nu2),
+                b3_lc2,
+            )],
+            el_inputs,
+            &mut ch2,
+        );
+        let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![b3_lc2];
+        let mut ch2 = FsChallenger::new(DOMAIN);
+        verifier::verify_ligerito_union_circuit(
+            &union2,
+            &shape2.circuit,
+            &built2.public,
+            &lcs2,
+            &ocommit,
+            &oproof,
+            &pcs2,
+            &mut ch2,
+        )
+        .expect("the scale fold circuit verifies");
+        (
+            b3_rows,
+            nu2,
+            union2.dense_m(),
+            shape2.circuit.cells().mu(),
+            bincode::serialize(&oproof).map(|b| b.len()).unwrap_or(0),
+        )
+    };
+
+    println!(
+        "\nMVP-11 SCALE — the fold region at the REAL registry ({} folds, IN-CIRCUIT)\n  \
+         children: the real recursion node (leaf outer, dense_m {} / mu {}) x2\n  \
+         groups: {} boolean types (A/B, 64-wide lagrange/z_partial lows) + {} element\n         \
+         types (A/B, pure eq) + sigma | {} sumcheck rounds total\n  \
+         tape: {} ops | {} stream values | {} squeezes — every endpoint closes from\n  \
+         located words AND as a published zero-delta; the {}-group Accumulator\n  \
+         reassembles from the public segment alone and discharges all three groups\n  \
+         outer: chain b3 rows {} | nu {} | dense_m {} | mu {} | proof {:.1} KiB\n",
+        n_folds,
+        lo.pcs.m,
+        lo.shape.circuit.cells().mu(),
+        n_bool,
+        n_el,
+        total_rounds,
+        ops.len(),
+        vals_rec.len(),
+        chals.len(),
+        n_folds,
         outer_stats.0,
         outer_stats.1,
         outer_stats.2,
