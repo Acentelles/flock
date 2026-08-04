@@ -13041,6 +13041,17 @@ fn mvp11_sigma_fold_tape() {
 /// (the SkipNodeGate/φ8 in-circuit derivation is the recorded upgrade).
 /// The merge node's statement and its children's statements live in ONE
 /// proof, and the fold no longer folds free inputs.
+///
+/// **PRIORS > 0 — the 4→1 shape.** Two more children's leaf folds become
+/// PRIOR accumulators, so every fold group folds [inherited, inherited,
+/// fresh, fresh] — the real merge arity, where each child arrives with its
+/// subtree's accumulator. The bind byte is the prior COUNT; a boolean fold
+/// group now MIXES low widths (inherited claims are pure eq, low [1]).
+/// The inherited surfaces' lows bind to the constant 1 in-circuit; their
+/// points and values publish and are checker-held against the priors' own
+/// accumulators — the wire-to-wire connection arrives when merge outers
+/// stack, since a prior's surface is exactly what a previous merge outer
+/// publishes as its accumulator claim.
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn mvp11_merge_fold_region() {
@@ -13052,11 +13063,27 @@ fn mvp11_merge_fold_region() {
 
     let c0 = mvp11_child(0x4D32_0001);
     let c1 = mvp11_child(0x4D32_0002);
+    // Two MORE children whose leaf folds become the PRIOR accumulators —
+    // the 4→1 shape: in the real tree every child arrives with the
+    // accumulator of its own subtree, so each fold group folds
+    // [inherited, inherited, fresh, fresh].
+    let c2 = mvp11_child(0x4D32_0003);
+    let c3 = mvp11_child(0x4D32_0004);
     let (built0, built1) = (&c0.built, &c1.built);
     assert_eq!(
         built0.shape.circuit.digest(),
         built1.shape.circuit.digest(),
         "the children share one circuit"
+    );
+    assert_eq!(
+        built0.shape.circuit.digest(),
+        c2.built.shape.circuit.digest(),
+        "the prior children share it too"
+    );
+    assert_eq!(
+        built0.shape.circuit.digest(),
+        c3.built.shape.circuit.digest(),
+        "all four children, one circuit"
     );
     let registry = &built0.shape.registry;
     assert_eq!(registry.num_boolean(), 1, "one boolean type (blake3)");
@@ -13085,6 +13112,50 @@ fn mvp11_merge_fold_region() {
         .expect("the element slot's table");
     let el_mats = [(el_ty.a_0(), el_ty.b_0())];
     let circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
+
+    // ---- the PRIOR accumulators: children 2 and 3's leaf folds ----
+    // Each is an honest single-child aggregate (its own challenger, no
+    // priors) — the accumulator a real child carries up from its subtree.
+    // Prove + verify each and require agreement, as a parent would.
+    const M11_LEAF_DOMAIN: &[u8] = b"flock-mvp11-leaf-fold-v0";
+    let union2 = UnionInstance::new(&c2.built.shape.registry, c2.built.shape.counts.clone());
+    let union3 = UnionInstance::new(&c3.built.shape.registry, c3.built.shape.counts.clone());
+    let leaf_fold = |c: &MixedInner, union: &UnionInstance<'_>| -> aggregate::Accumulator {
+        let ba = [c.work.boolean.clone().expect("leaf boolean work")];
+        let ea = [(union, c.work.element.clone().expect("leaf element work"))];
+        let sg = [c.sigma.clone()];
+        let mut ch = FsChallenger::with_hash(M11_LEAF_DOMAIN, HashKind::Blake3);
+        let (lp, la) = aggregate::prove_aggregate_classes(
+            registry,
+            &mats,
+            &circs,
+            &ba,
+            &el_mats,
+            &ea,
+            Some((&built0.shape.circuit, &sg)),
+            &[],
+            &mut ch,
+        )
+        .expect("the leaf fold proves");
+        let mut ch = FsChallenger::with_hash(M11_LEAF_DOMAIN, HashKind::Blake3);
+        let lv = aggregate::verify_aggregate_classes(
+            registry,
+            &ba,
+            &ea,
+            Some((&built0.shape.circuit, &sg)),
+            &[],
+            &lp,
+            &mut ch,
+        )
+        .expect("the leaf fold verifies");
+        assert_eq!(la, lv, "leaf prover and verifier accumulators agree");
+        lv
+    };
+    let acc_a = leaf_fold(&c2, &union2);
+    let acc_b = leaf_fold(&c3, &union3);
+    let priors = [&acc_a, &acc_b];
+    let n_priors = priors.len();
+
     let mut chp = FsChallenger::with_hash(M11_MERGE_DOMAIN, HashKind::Blake3);
     let (agg, acc_p) = aggregate::prove_aggregate_classes(
         registry,
@@ -13094,7 +13165,7 @@ fn mvp11_merge_fold_region() {
         &el_mats,
         &el_asserts,
         Some((&built0.shape.circuit, &sigmas)),
-        &[],
+        &priors,
         &mut chp,
     )
     .expect("the merge-node fold proves");
@@ -13105,7 +13176,7 @@ fn mvp11_merge_fold_region() {
         &bool_asserts,
         &el_asserts,
         Some((&built0.shape.circuit, &sigmas)),
-        &[],
+        &priors,
         &agg,
         &mut rec,
     )
@@ -13121,17 +13192,47 @@ fn mvp11_merge_fold_region() {
         "the sigma group discharges"
     );
 
-    // The five folds' claim lists, in the verifier's own gather order
-    // (no priors: one claim per child, child order). Built from the
-    // assertions' pub claim constructors — the same code the verifier runs.
+    // The five folds' claim lists, in the verifier's own gather order:
+    // the PRIORS' accumulator claims first (prior order), then one fresh
+    // claim per child (child order) — [inherited, inherited, fresh,
+    // fresh], the 4→1 shape. Built from the assertions' pub claim
+    // constructors and the priors' own surfaces — the same data the
+    // verifier gathers.
     let bc: Vec<_> = bool_asserts.iter().map(|a| a.claims(registry)).collect();
     let ec: Vec<_> = el_asserts.iter().map(|(u, a)| a.claims(u)).collect();
+    let sig_a = acc_a.sigma.as_ref().expect("prior A carries sigma");
+    let sig_b = acc_b.sigma.as_ref().expect("prior B carries sigma");
     let fold_claims: Vec<Vec<MatrixClaim>> = vec![
-        vec![bc[0][0].0.clone(), bc[1][0].0.clone()],
-        vec![bc[0][0].1.clone(), bc[1][0].1.clone()],
-        vec![ec[0][0].0.clone(), ec[1][0].0.clone()],
-        vec![ec[0][0].1.clone(), ec[1][0].1.clone()],
-        vec![sigmas[0].claim(), sigmas[1].claim()],
+        vec![
+            acc_a.per_type[0].0.clone(),
+            acc_b.per_type[0].0.clone(),
+            bc[0][0].0.clone(),
+            bc[1][0].0.clone(),
+        ],
+        vec![
+            acc_a.per_type[0].1.clone(),
+            acc_b.per_type[0].1.clone(),
+            bc[0][0].1.clone(),
+            bc[1][0].1.clone(),
+        ],
+        vec![
+            acc_a.per_element[0].0.clone(),
+            acc_b.per_element[0].0.clone(),
+            ec[0][0].0.clone(),
+            ec[1][0].0.clone(),
+        ],
+        vec![
+            acc_a.per_element[0].1.clone(),
+            acc_b.per_element[0].1.clone(),
+            ec[0][0].1.clone(),
+            ec[1][0].1.clone(),
+        ],
+        vec![
+            sig_a.1.clone(),
+            sig_b.1.clone(),
+            sigmas[0].claim(),
+            sigmas[1].claim(),
+        ],
     ];
     let fold_proofs: Vec<&FoldProof> = vec![
         &agg.folds[0].0,
@@ -13140,12 +13241,24 @@ fn mvp11_merge_fold_region() {
         &agg.el_folds[0].1,
         agg.sigma_fold.as_ref().expect("the sigma fold rides along"),
     ];
-    // The boolean weights carry the length-64 lows; element and sigma are
-    // pure eq. Pin the shapes the machinery below depends on.
-    assert_eq!(fold_claims[0][0].row.low.len(), 64, "lagrange low");
-    assert_eq!(fold_claims[0][0].col.low.len(), 64, "z_partial low");
+    // The fresh boolean weights carry the length-64 lows; the INHERITED
+    // claims are accumulator outputs — pure eq, low [1] — so a boolean
+    // fold group now MIXES low widths (the shape priors > 0 adds). Element
+    // and sigma are pure eq throughout. Pin what the machinery depends on.
+    assert_eq!(fold_claims[0][0].row.low.len(), 1, "inherited claims are eq");
+    assert_eq!(fold_claims[0][0].col.low.len(), 1, "inherited claims are eq");
+    assert_eq!(fold_claims[0][n_priors].row.low.len(), 64, "lagrange low");
+    assert_eq!(fold_claims[0][n_priors].col.low.len(), 64, "z_partial low");
     assert_eq!(fold_claims[2][0].row.low.len(), 1, "element claims are eq");
     assert_eq!(fold_claims[4][0].row.low.len(), 1, "sigma claims are eq");
+    // Every claim in a group folds over the same variable counts —
+    // inherited eq points span exactly what the fresh low⊗eq weights do.
+    for cs in &fold_claims {
+        for c in cs {
+            assert_eq!(c.row.n_vars(), cs[0].row.n_vars(), "row vars agree");
+            assert_eq!(c.col.n_vars(), cs[0].col.n_vars(), "col vars agree");
+        }
+    }
 
     // ---- the tape structure, pinned op-for-op ----
     // bind = label + registry digest + prior count, then the five folds in
@@ -13190,7 +13303,11 @@ fn mvp11_merge_fold_region() {
     }
     assert_eq!(ops, want.as_slice(), "the merge tape is the expected shape");
     assert_eq!(rec.payloads()[0], registry.digest(), "bind: registry digest");
-    assert_eq!(rec.payloads()[1], vec![0u8], "bind: prior count 0");
+    assert_eq!(
+        rec.payloads()[1],
+        vec![n_priors as u8],
+        "bind: the prior COUNT byte"
+    );
 
     // ---- locate every fold's surfaces, and pin them field-for-field ----
     struct ClaimLoc {
@@ -13663,53 +13780,53 @@ fn mvp11_merge_fold_region() {
             // verifier's own assertion data.
             let nu_c = tk.sigma_native.nu;
             assert_eq!(
-                &fold_claims[4][k].row.point[..],
+                &fold_claims[4][n_priors + k].row.point[..],
                 &tk.sigma_native.rho[..nu_c],
                 "sigma row point is the child's rho[..nu]"
             );
             assert_eq!(
-                &fold_claims[4][k].col.point[..],
+                &fold_claims[4][n_priors + k].col.point[..],
                 &tk.sigma_native.rho[nu_c..],
                 "sigma col point is the child's rho[nu..]"
             );
             assert_eq!(
-                fold_claims[4][k].value, tk.sigma_native.value,
+                fold_claims[4][n_priors + k].value, tk.sigma_native.value,
                 "sigma value is the child's deferred evaluation"
             );
-            let kappa = fold_claims[2][k].row.point.len();
+            let kappa = fold_claims[2][n_priors + k].row.point.len();
             assert_eq!(
-                &fold_claims[2][k].row.point[..],
+                &fold_claims[2][n_priors + k].row.point[..],
                 &tk.el_assert.r_con[..kappa],
                 "element row point is r_con's head"
             );
             assert_eq!(
-                &fold_claims[2][k].col.point[..],
+                &fold_claims[2][n_priors + k].col.point[..],
                 &tk.el_assert.r_col[..kappa],
                 "element col point is r_col's head"
             );
-            assert_eq!(fold_claims[2][k].value, tk.el_assert.evals[0].0);
-            assert_eq!(fold_claims[3][k].value, tk.el_assert.evals[0].1);
-            let inner_b = fold_claims[0][k].row.point.len();
+            assert_eq!(fold_claims[2][n_priors + k].value, tk.el_assert.evals[0].0);
+            assert_eq!(fold_claims[3][n_priors + k].value, tk.el_assert.evals[0].1);
+            let inner_b = fold_claims[0][n_priors + k].row.point.len();
             assert_eq!(
-                &fold_claims[0][k].row.point[..],
+                &fold_claims[0][n_priors + k].row.point[..],
                 &tk.bool_assert.x_inner_rest[..inner_b],
                 "boolean row point is x_inner_rest's head"
             );
             assert_eq!(
-                &fold_claims[0][k].col.point[..],
+                &fold_claims[0][n_priors + k].col.point[..],
                 &tk.bool_assert.rr[..inner_b],
                 "boolean col point is rr's head"
             );
             assert_eq!(
-                &fold_claims[0][k].col.low[..],
+                &fold_claims[0][n_priors + k].col.low[..],
                 &tk.bool_assert.z_partial[..],
                 "boolean col low is z_partial"
             );
-            assert_eq!(fold_claims[0][k].value, tk.bool_assert.evals[0].0);
-            assert_eq!(fold_claims[1][k].value, tk.bool_assert.evals[0].1);
+            assert_eq!(fold_claims[0][n_priors + k].value, tk.bool_assert.evals[0].0);
+            assert_eq!(fold_claims[1][n_priors + k].value, tk.bool_assert.evals[0].1);
 
             // sigma: fully wire-to-wire (the eq lows are the constant 1).
-            let cl = &locs[4].claims[k];
+            let cl = &locs[4].claims[n_priors + k];
             sb.connect(wv(cl.row_low_v), ow);
             sb.connect(wv(cl.col_low_v), ow);
             for j in 0..cl.row_pt_n {
@@ -13722,7 +13839,7 @@ fn mvp11_merge_fold_region() {
             // element A/B: r_con = zc.r[ν..] (round order), r_col = the lc
             // rounds REVERSED — both chains' squeeze wires.
             for fi in [2, 3] {
-                let cl = &locs[fi].claims[k];
+                let cl = &locs[fi].claims[n_priors + k];
                 sb.connect(wv(cl.row_low_v), ow);
                 sb.connect(wv(cl.col_low_v), ow);
                 for j in 0..cl.row_pt_n {
@@ -13738,7 +13855,7 @@ fn mvp11_merge_fold_region() {
             // = x_inner_rest[1..]), rr = the lc rounds REVERSED, and the
             // z_partial lows are the child's absorbed words.
             for fi in [0, 1] {
-                let cl = &locs[fi].claims[k];
+                let cl = &locs[fi].claims[n_priors + k];
                 for j in 0..cl.row_pt_n {
                     let m = if j == 0 { 0 } else { tk.n_log_i + j };
                     sb.connect(wv(cl.row_pt_v + j), rk.b_mlv_w[m]);
@@ -13754,11 +13871,25 @@ fn mvp11_merge_fold_region() {
             // The two boolean folds absorb ONE claim surface twice: fold
             // B's lagrange lows are the same words as fold A's — connected,
             // so the published copies below bind both.
-            for j in 0..locs[0].claims[k].row_low_n {
+            for j in 0..locs[0].claims[n_priors + k].row_low_n {
                 sb.connect(
-                    wv(locs[1].claims[k].row_low_v + j),
-                    wv(locs[0].claims[k].row_low_v + j),
+                    wv(locs[1].claims[n_priors + k].row_low_v + j),
+                    wv(locs[0].claims[n_priors + k].row_low_v + j),
                 );
+            }
+        }
+        // The INHERITED claims (the priors' accumulator surfaces): pure
+        // eq, so the low words bind to the constant 1 in-circuit; the
+        // points and values publish below and the checker holds them
+        // against the priors' own accumulators. The wire-to-wire
+        // connection arrives when merge outers STACK — a prior's surface
+        // is exactly what a previous merge outer PUBLISHES as its
+        // accumulator claim (the step-2 publics).
+        for p in 0..n_priors {
+            for loc in &locs {
+                let cl = &loc.claims[p];
+                sb.connect(wv(cl.row_low_v), ow);
+                sb.connect(wv(cl.col_low_v), ow);
             }
         }
 
@@ -13782,13 +13913,28 @@ fn mvp11_merge_fold_region() {
         // no child wire yet) and against each child's published z_skip
         // (the lagrange lows).
         for k in 0..2 {
-            for j in 0..locs[0].claims[k].row_low_n {
-                sb.publish(wv(locs[0].claims[k].row_low_v + j));
+            for j in 0..locs[0].claims[n_priors + k].row_low_n {
+                sb.publish(wv(locs[0].claims[n_priors + k].row_low_v + j));
             }
-            sb.publish(wv(locs[0].claims[k].value_v));
-            sb.publish(wv(locs[1].claims[k].value_v));
-            sb.publish(wv(locs[2].claims[k].value_v));
-            sb.publish(wv(locs[3].claims[k].value_v));
+            sb.publish(wv(locs[0].claims[n_priors + k].value_v));
+            sb.publish(wv(locs[1].claims[n_priors + k].value_v));
+            sb.publish(wv(locs[2].claims[n_priors + k].value_v));
+            sb.publish(wv(locs[3].claims[n_priors + k].value_v));
+        }
+        // The inherited surfaces: per prior, per fold, the row and col
+        // points then the value — published for the checker's walk against
+        // the priors' accumulators.
+        for p in 0..n_priors {
+            for loc in &locs {
+                let cl = &loc.claims[p];
+                for j in 0..cl.row_pt_n {
+                    sb.publish(wv(cl.row_pt_v + j));
+                }
+                for j in 0..cl.col_pt_n {
+                    sb.publish(wv(cl.col_pt_v + j));
+                }
+                sb.publish(wv(cl.value_v));
+            }
         }
 
         let shape2 = sb.finish().expect("the mvp11 merge circuit builds");
@@ -13912,6 +14058,36 @@ fn mvp11_merge_fold_region() {
                 );
                 q += 4;
             }
+            // The inherited surfaces against the priors' own accumulators
+            // (fold_claims[fi][p] IS the prior's claim, cloned from
+            // acc_a/acc_b above): row point, col point, value per fold.
+            for p in 0..n_priors {
+                for (fi, cs) in fold_claims.iter().enumerate() {
+                    let want = &cs[p];
+                    for (j, &x) in want.row.point.iter().enumerate() {
+                        assert_eq!(
+                            built2.public[q + j],
+                            x,
+                            "prior {p} fold {fi}: row coord {j}"
+                        );
+                    }
+                    q += want.row.point.len();
+                    for (j, &x) in want.col.point.iter().enumerate() {
+                        assert_eq!(
+                            built2.public[q + j],
+                            x,
+                            "prior {p} fold {fi}: col coord {j}"
+                        );
+                    }
+                    q += want.col.point.len();
+                    assert_eq!(
+                        built2.public[q],
+                        want.value,
+                        "prior {p} fold {fi}: value"
+                    );
+                    q += 1;
+                }
+            }
             assert_eq!(
                 q,
                 built2.public.len(),
@@ -14025,10 +14201,13 @@ fn mvp11_merge_fold_region() {
     };
 
     println!(
-        "\nMVP-11 MERGE NODE (2 CHILD-TAPE REGIONS + bind + 5 folds, ONE outer circuit)\n  \
+        "\nMVP-11 MERGE NODE (2 CHILD-TAPE REGIONS + bind + 5 folds at 4->1, ONE outer)\n  \
          children: 2x the mvp10 assembly over SHARED slots (each the complete\n         \
          deferred verifier of its child, b3 rows {} + {})\n  \
-         CONNECTED: every fold claim's points bound to child chain wires (sigma\n         \
+         PRIORS: 2 leaf-fold accumulators — every fold group folds [inherited,\n         \
+         inherited, fresh, fresh]; inherited eq lows bind to 1 in-circuit,\n         \
+         points + values published and checker-held vs the priors' accumulators\n  \
+         CONNECTED: every fresh claim's points bound to child chain wires (sigma\n         \
          fully, incl. its value = the child's s_sigma stream word; z_partial\n         \
          lows word-for-word); eval values + lagrange lows published, checker-\n         \
          held vs the children's assertions + each child's published z_skip\n  \
