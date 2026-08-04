@@ -9397,39 +9397,54 @@ fn mvp10_leaf_outer_inner_tape() {
                 prefix_product(&mut sb, &factors)
             })
             .collect();
+        // Column weights via EQ-TABLE DOUBLING (the committed-footprint
+        // fix): Σ_r run_w[r]·eqc[r] = Σ_y eq(z_col, y)·eqc[run(y)] — one
+        // dot of the statement's eq table against the statement-
+        // INDEPENDENT per-column eqc expansion (free: wire reuse). The
+        // table builds by doubling in 2·(2^lo + 2^hi) MAC rows and the
+        // dot is 2^k MACs — 8-word MAC rows instead of 64-word prefix
+        // rows, ~7x fewer committed words at this inner's k_cols = 11
+        // (2048 columns, 588 runs). The complement trick retires: the
+        // full dot includes the comp run by partition of unity, same
+        // value (the native replica is unchanged and the anchor delta
+        // still closes).
+        let col_eqc: Vec<Wire> = run_of.iter().map(|&r3| eqc_w[r3]).collect();
+        let lo_bits = k_cols_i / 2;
+        let eq_dot = |sb: &mut ShapeBuilder, z_col: &[Wire]| -> Wire {
+            let build = |sb: &mut ShapeBuilder, coords: &[Wire]| -> Vec<Wire> {
+                let mut t2 = vec![ow];
+                for &cw2 in coords {
+                    let mut lo_half = Vec::with_capacity(t2.len());
+                    let mut hi_half = Vec::with_capacity(t2.len());
+                    for &e in &t2 {
+                        let m2 = sb.gate(macs, &[zw, e, cw2])[0];
+                        lo_half.push(sb.gate(macs, &[e, e, cw2])[0]);
+                        hi_half.push(m2);
+                    }
+                    lo_half.extend(hi_half);
+                    t2 = lo_half;
+                }
+                t2
+            };
+            let lo_t = build(sb, &z_col[..lo_bits]);
+            let hi_t = build(sb, &z_col[lo_bits..]);
+            let block = lo_t.len();
+            let mut acc = zw;
+            for (h2, &hw2) in hi_t.iter().enumerate() {
+                let mut inner = zw;
+                for (l2, &lw2) in lo_t.iter().enumerate() {
+                    inner = sb.gate(macs, &[inner, lw2, col_eqc[h2 * block + l2]])[0];
+                }
+                acc = sb.gate(macs, &[acc, hw2, inner])[0];
+            }
+            acc
+        };
         let alslot = sb.slot(AssistLayerGate::new());
         let mut expect_w = zw;
         for (si, xs) in [&xab_pw, &xc_pw].iter().enumerate() {
             let z_row_w: Vec<Wire> = xs[1..1 + n_log_i].iter().map(|&(_, w)| w).collect();
             let z_col_w: Vec<Wire> = xs[1 + n_log_i..].iter().map(|&(_, w)| w).collect();
-            let mut run_w: Vec<Wire> = vec![zw; n_runs];
-            let mut tot_w = ow;
-            for (r3, &(_, _, len)) in bounds_i.iter().enumerate() {
-                if r3 == comp_ix {
-                    continue;
-                }
-                let mut w: Option<Wire> = None;
-                for y in run_y0[r3]..run_y0[r3] + len as usize {
-                    let factors: Vec<(Wire, Wire)> = z_col_w
-                        .iter()
-                        .enumerate()
-                        .map(|(jj, &zc2)| (zc2, if (y >> jj) & 1 == 1 { ow } else { zw }))
-                        .collect();
-                    let s = prefix_product(&mut sb, &factors);
-                    w = Some(match w {
-                        None => s,
-                        Some(p) => sb.gate(spine, &[zw, zw, zw, p, zw, zw, s, ow, zw])[3],
-                    });
-                }
-                let w = w.expect("non-empty run");
-                run_w[r3] = w;
-                tot_w = sb.gate(spine, &[zw, zw, zw, tot_w, zw, zw, w, ow, zw])[3];
-            }
-            run_w[comp_ix] = tot_w;
-            let mut w_st = zw;
-            for (r3, &rw) in run_w.iter().enumerate() {
-                w_st = sb.gate(spine, &[zw, zw, zw, w_st, zw, zw, rw, eqc_w[r3], zw])[3];
-            }
+            let w_st = eq_dot(&mut sb, &z_col_w);
             let mut gdp = [zw, zw, ow, zw]; // STATE_SUCCESS seed
             for layer in (0..=m_mp2).rev() {
                 let za = if layer < n_log_i { z_row_w[layer] } else { zw };
@@ -9454,7 +9469,13 @@ fn mvp10_leaf_outer_inner_tape() {
             expect_w = sb.gate(spine, &[zw, zw, zw, expect_w, zw, zw, coeff, wd, zw])[3];
         }
         for (g_ix, members) in groups_ix.iter().enumerate() {
-            let mut run_w: Vec<Wire> = vec![zw; n_runs];
+            // Bilinearity: the group weight Σ_r (Σ_m γ_m w_m[r])·eqc[r]
+            // equals Σ_m γ_m·(m's own eq⊗eqc dot) — each member folds in
+            // directly. One-hot members (every wiring gather: constant
+            // address bits) still bind through ONE prefix row and pick
+            // their run's eqc wire; the element pair's random columns
+            // take the eq-table dot.
+            let mut w_st = zw;
             for &i2 in members {
                 let pd = &gammas_i[i2];
                 let gpd_w = outs[trace.squeezes[pd.fin][0]][0];
@@ -9470,7 +9491,6 @@ fn mvp10_leaf_outer_inner_tape() {
                         }
                     });
                 if let Some(h) = hot {
-                    // One-hot: ONE prefix row binds the whole column point.
                     let factors: Vec<(Wire, Wire)> = (0..k_cols_i)
                         .map(|j| {
                             (
@@ -9480,45 +9500,15 @@ fn mvp10_leaf_outer_inner_tape() {
                         })
                         .collect();
                     let s = prefix_product(&mut sb, &factors);
-                    let r_hot = run_of[h];
-                    run_w[r_hot] = sb.gate(macs, &[run_w[r_hot], gpd_w, s])[0];
+                    let e = sb.gate(macs, &[zw, s, eqc_w[run_of[h]]])[0];
+                    w_st = sb.gate(macs, &[w_st, gpd_w, e])[0];
                 } else {
-                    // General weights (the element pair's random columns).
-                    let mut tot_w = ow;
-                    let mut w_at: Vec<Wire> = vec![zw; n_runs];
-                    for (r3, &(_, _, len)) in bounds_i.iter().enumerate() {
-                        if r3 == comp_ix {
-                            continue;
-                        }
-                        let mut w: Option<Wire> = None;
-                        for y in run_y0[r3]..run_y0[r3] + len as usize {
-                            let factors: Vec<(Wire, Wire)> = (0..k_cols_i)
-                                .map(|j| {
-                                    (
-                                        wv(pd.pt_v + n_log_i + j),
-                                        if (y >> j) & 1 == 1 { ow } else { zw },
-                                    )
-                                })
-                                .collect();
-                            let s = prefix_product(&mut sb, &factors);
-                            w = Some(match w {
-                                None => s,
-                                Some(p) => sb.gate(macs, &[p, s, ow])[0],
-                            });
-                        }
-                        let w = w.expect("non-empty run");
-                        w_at[r3] = w;
-                        tot_w = sb.gate(macs, &[tot_w, w, ow])[0];
-                    }
-                    w_at[comp_ix] = tot_w;
-                    for r3 in 0..n_runs {
-                        run_w[r3] = sb.gate(macs, &[run_w[r3], gpd_w, w_at[r3]])[0];
-                    }
+                    let z_col_w: Vec<Wire> = (0..k_cols_i)
+                        .map(|j| wv(pd.pt_v + n_log_i + j))
+                        .collect();
+                    let d = eq_dot(&mut sb, &z_col_w);
+                    w_st = sb.gate(macs, &[w_st, gpd_w, d])[0];
                 }
-            }
-            let mut w_st = zw;
-            for (r3, &rw) in run_w.iter().enumerate() {
-                w_st = sb.gate(macs, &[w_st, rw, eqc_w[r3]])[0];
             }
             let mut gdp = [zw, zw, ow, zw]; // STATE_SUCCESS seed
             for layer in (0..=m_mp2).rev() {
