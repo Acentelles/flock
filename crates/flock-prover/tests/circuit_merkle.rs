@@ -12166,3 +12166,320 @@ fn partial_block_leaves_hash_correctly() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// MVP-11: the merge node — step 1, the sigma fold
+// ---------------------------------------------------------------------------
+
+/// One MVP-11 merge child: the mvp10-style minimal mixed inner (a blake3
+/// chain feeding MacGate rows across the class boundary) proven over the
+/// circuit path and verified DEFERRED. The seed varies only the witness
+/// (message words), so two children share the CIRCUIT — and its digest, the
+/// key the accumulator folds sigma under — while their claims land at
+/// unrelated FS points, which is what a merge node actually sees.
+fn mvp11_child(
+    seed: u64,
+) -> (
+    flock_core::circuit::builder::BuiltCircuit,
+    flock_core::circuit::SigmaAssertion,
+) {
+    use flock_prover::prover::UnionElementSlotInput;
+
+    let n_blocks = 128usize;
+    let nu = n_blocks.trailing_zeros() as usize;
+    let mut rng = Rng(seed);
+    let mut b = CircuitBuilder::new(nu);
+    let hash = b.slot(Blake3Gate { nu });
+    let mac = b.slot(MacGate::new());
+    let iv = pack8(&IV);
+    let mut cv = [b.public_value(iv[0]), b.public_value(iv[1])];
+    let mut outs: Vec<Vec<Wire>> = Vec::with_capacity(n_blocks);
+    for i in 0..n_blocks {
+        let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+        let mut hash_in = vec![cv[0], cv[1]];
+        for j in 0..4 {
+            hash_in.push(b.public_value(pack4(m[4 * j..4 * j + 4].try_into().unwrap())));
+        }
+        let mut flags = 0u32;
+        if i == 0 {
+            flags |= CHUNK_START;
+        }
+        if i + 1 == n_blocks {
+            flags |= CHUNK_END;
+        }
+        hash_in.push(b.public_value(pack_params(0, 64, flags)));
+        let out = b.gate(hash, &hash_in);
+        cv = [out[0], out[1]];
+        outs.push(out);
+    }
+    let zero = b.public_value(F128::ZERO);
+    let mut acc = zero;
+    for out in outs.iter().take(16) {
+        acc = b.gate(mac, &[acc, out[2], out[3]])[0];
+    }
+    b.publish(acc);
+    b.publish(cv[0]);
+    b.publish(cv[1]);
+    let built = b.finish().expect("the mvp11 child builds");
+
+    let union = UnionInstance::new(&built.shape.registry, built.shape.counts.clone());
+    let pcs_params = PcsParams {
+        m: union.dense_m(),
+        log_inv_rate: 1,
+        log_batch_size: 6,
+        profile: LigeritoProfile::Fast,
+        num_lanes: union.commit_lanes(6),
+        // BLAKE3 for both Merkle and FS: the child stays recursable — the
+        // later child-tape regions replay this transcript in-circuit.
+        merkle_hash: HashKind::Blake3,
+    };
+    let blake_r1cs = blake3::build_block_r1cs(nu);
+    let blake_lc = blake_r1cs.csc_lincheck_circuit();
+    let el_z = match MacGate::new().witness(built.rows::<MacGate>(mac), nu) {
+        SlotWitness::Element(z) => z,
+        other => panic!("mac witness is {other:?}"),
+    };
+    let mut ch = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
+    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
+        &union,
+        &built.shape.circuit,
+        &built.witness.public,
+        &pcs_params,
+        vec![UnionSlotProverInput::new(
+            blake3::generate_witness_batch_major_partial(built.rows::<Blake3Gate>(hash), nu),
+            blake_lc,
+        )],
+        vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
+            dst.copy_from_slice(&el_z)
+        })],
+        &mut ch,
+    );
+    let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
+    let mut ch = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
+    let (_, work, sigma) = verifier::verify_ligerito_union_circuit_deferred(
+        &union,
+        &built.shape.circuit,
+        &built.witness.public,
+        &lcs,
+        &commitment,
+        &proof,
+        &pcs_params,
+        &mut ch,
+    )
+    .expect("the deferred verify accepts an honest child");
+    assert!(
+        work.boolean.is_some(),
+        "sigma never travels alone: the boolean matrix work rides with it"
+    );
+    (built, sigma)
+}
+
+/// **MVP-11 step 1: the merge node's sigma fold, tape-pinned.**
+///
+/// The merge node arithmetises `verify_aggregate_classes` — `verify_fold`
+/// replays that read NO matrix anywhere. This records the SMALLEST fold the
+/// native merge-node test performs (the sigma group: 2 claims, one per
+/// child) under a RecordingChallenger and pins its whole tape: the claims'
+/// weights and values absorbed field-for-field, the two Convention-A
+/// sumchecks' rounds and the bridge on the stream, and both endpoint
+/// identities closing from LOCATED words alone — exactly the wires the
+/// in-circuit replay consumes.
+///
+/// The fold runs under its own scaffolding domain; in the real merge node
+/// ONE challenger spans bind + every per-type fold, and the claims' stream
+/// words get CONNECTED to child-tape-derived wires. Both are later steps —
+/// the mvp8 fixed-start precedent.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn mvp11_sigma_fold_tape() {
+    use flock_core::matrix_fold::{self, FoldMatrix, MatrixClaim, Weight};
+    use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
+
+    const M11_DOMAIN: &[u8] = b"flock-mvp11-merge-fold-v0";
+
+    // Two children, one circuit: different witnesses put the sigma claims
+    // at unrelated points; the shared digest is the foldability key.
+    let (built0, sig0) = mvp11_child(0x4D31_0001);
+    let (built1, sig1) = mvp11_child(0x4D31_0002);
+    assert_eq!(
+        built0.shape.circuit.digest(),
+        built1.shape.circuit.digest(),
+        "the children share one circuit"
+    );
+    assert_ne!(sig0.rho, sig1.rho, "distinct witnesses, distinct FS points");
+    let sigmas = [sig0, sig1];
+    let (k_row, k_col) = (sigmas[0].nu, sigmas[0].rho.len() - sigmas[0].nu);
+
+    // The fold, exactly as aggregate's sigma group runs it: claims in the
+    // fixed order, per-claim column marginals (the k·nnz prover work,
+    // native forever), prove under one challenger, verify under a
+    // recording twin.
+    let m_sig = flock_core::circuit::SigmaAssertion::matrix(&built0.shape.circuit);
+    let claims: Vec<MatrixClaim> = sigmas.iter().map(|s| s.claim()).collect();
+    let n_cols = FoldMatrix::n_cols(&m_sig);
+    let combs: Vec<Vec<F128>> = claims
+        .iter()
+        .map(|c| FoldMatrix::col_marginal(&m_sig, &c.row.materialize(), n_cols))
+        .collect();
+    let mut chp = FsChallenger::with_hash(M11_DOMAIN, HashKind::Blake3);
+    let (fp, out_p) = matrix_fold::prove_fold(&m_sig, &combs, &claims, &mut chp);
+    let mut rec = RecordingChallenger::new(FsChallenger::with_hash(M11_DOMAIN, HashKind::Blake3));
+    let out_v =
+        matrix_fold::verify_fold(&claims, &fp, &mut rec).expect("the honest sigma fold verifies");
+    assert_eq!(out_p, out_v, "prover and verifier agree on the accumulator");
+    assert!(
+        out_v.check_direct(&m_sig),
+        "the folded sigma claim discharges at the root"
+    );
+
+    // ---- the tape structure, pinned op-for-op ----
+    // Everything the fold verifier touches is scalar squeezes and scalar /
+    // slice observes — no PoW, no vec squeezes — so the challenge ordinal
+    // IS the finalization ordinal, which is what wires the chain squeezes.
+    let t_shape = rec.shape();
+    let ops = t_shape.ops();
+    let vals_rec = rec.values();
+    let chals = rec.challenges();
+    let mut want: Vec<Op> = vec![Op::Label(b"flock-matrix-fold-v0".to_vec())];
+    for _ in 0..claims.len() {
+        want.extend([
+            Op::ObserveSlice(1),     // row.low — an eq weight's [1]
+            Op::ObserveSlice(k_row), // row.point = rho[..nu]
+            Op::ObserveSlice(1),     // col.low
+            Op::ObserveSlice(k_col), // col.point = rho[nu..]
+            Op::ObserveScalar,       // value
+        ]);
+    }
+    want.extend([Op::SqueezeScalar, Op::SqueezeScalar]); // lambdas
+    for _ in 0..k_col {
+        want.extend([Op::ObserveScalar, Op::ObserveScalar, Op::SqueezeScalar]);
+    }
+    want.extend([Op::ObserveScalar, Op::ObserveScalar]); // bridge
+    want.extend([Op::SqueezeScalar, Op::SqueezeScalar]); // mus
+    for _ in 0..k_row {
+        want.extend([Op::ObserveScalar, Op::ObserveScalar, Op::SqueezeScalar]);
+    }
+    want.push(Op::ObserveScalar); // the output value
+    assert_eq!(ops, want.as_slice(), "the fold tape is the expected shape");
+
+    // Value ordinals, by construction from the pinned shape — then held
+    // against the proof and the claims field-for-field, so the formulas
+    // below consume verified indices, not assumptions.
+    let blk = k_row + k_col + 3;
+    let v_cm = claims.len() * blk; // col-round messages
+    let v_br = v_cm + 2 * k_col; // bridge
+    let v_rm = v_br + 2; // row-round messages
+    let v_out = v_rm + 2 * k_row; // output value
+    assert_eq!(vals_rec.len(), v_out + 1, "nothing rides after the output");
+    assert_eq!(
+        chals.len(),
+        4 + k_col + k_row,
+        "lambdas, col rhos, mus, row rhos — all scalar squeezes"
+    );
+    for (k, c) in claims.iter().enumerate() {
+        let base = k * blk;
+        assert_eq!(vals_rec[base], F128::ONE, "claim {k}: row.low is eq's [1]");
+        assert_eq!(
+            &vals_rec[base + 1..base + 1 + k_row],
+            &c.row.point[..],
+            "claim {k}: row point on the stream"
+        );
+        assert_eq!(
+            vals_rec[base + 1 + k_row],
+            F128::ONE,
+            "claim {k}: col.low is eq's [1]"
+        );
+        assert_eq!(
+            &vals_rec[base + 2 + k_row..base + 2 + k_row + k_col],
+            &c.col.point[..],
+            "claim {k}: col point on the stream"
+        );
+        assert_eq!(
+            vals_rec[base + blk - 1],
+            c.value,
+            "claim {k}: value on the stream"
+        );
+    }
+    for (j, &(q1, qinf)) in fp.col_rounds.iter().enumerate() {
+        assert_eq!(vals_rec[v_cm + 2 * j], q1, "col round {j} q(1)");
+        assert_eq!(vals_rec[v_cm + 2 * j + 1], qinf, "col round {j} q(inf)");
+    }
+    assert_eq!(&vals_rec[v_br..v_br + 2], &fp.bridge[..], "the bridge");
+    for (j, &(q1, qinf)) in fp.row_rounds.iter().enumerate() {
+        assert_eq!(vals_rec[v_rm + 2 * j], q1, "row round {j} q(1)");
+        assert_eq!(vals_rec[v_rm + 2 * j + 1], qinf, "row round {j} q(inf)");
+    }
+    assert_eq!(vals_rec[v_out], fp.value, "the output value on the stream");
+
+    // ---- both endpoints, replayed from the LOCATED words alone ----
+    // The in-circuit dataflow run natively first: stream words + squeezes
+    // in, two zero-deltas out. Convention A: q(0) = running + q(1).
+    let replay = |target: F128, base: usize, ch0: usize, n: usize| -> (F128, Vec<F128>) {
+        let mut run = target;
+        let mut rho = Vec::with_capacity(n);
+        for j in 0..n {
+            let (g1, gi) = (vals_rec[base + 2 * j], vals_rec[base + 2 * j + 1]);
+            let r = chals[ch0 + j];
+            let q0 = run + g1;
+            run = gi * r * r + (q0 + g1 + gi) * r + q0;
+            rho.push(r);
+        }
+        (run, rho)
+    };
+    // An eq weight's eval is the char-2 product Π (1 + p_j + r_j), SEEDED
+    // by the absorbed low word — 1 here, but consumed from the stream so
+    // the wire is bound, not assumed.
+    let eq_prod = |low_v: usize, pt_base: usize, rho: &[F128]| -> F128 {
+        let mut w = vals_rec[low_v];
+        for (j, &r) in rho.iter().enumerate() {
+            w *= F128::ONE + vals_rec[pt_base + j] + r;
+        }
+        w
+    };
+    let lam = [chals[0], chals[1]];
+    let target_c = lam[0] * vals_rec[blk - 1] + lam[1] * vals_rec[2 * blk - 1];
+    let (run_c, rho_col) = replay(target_c, v_cm, 2, k_col);
+    let expect_c = (0..claims.len()).fold(F128::ZERO, |acc, k| {
+        acc + lam[k]
+            * eq_prod(k * blk + 1 + k_row, k * blk + 2 + k_row, &rho_col)
+            * vals_rec[v_br + k]
+    });
+    assert_eq!(run_c, expect_c, "the col endpoint closes from located words");
+
+    let mus = [chals[2 + k_col], chals[3 + k_col]];
+    let target_r = mus[0] * vals_rec[v_br] + mus[1] * vals_rec[v_br + 1];
+    let (run_r, rho_row) = replay(target_r, v_rm, 4 + k_col, k_row);
+    let w_mu = (0..claims.len()).fold(F128::ZERO, |acc, k| {
+        acc + mus[k] * eq_prod(k * blk, k * blk + 1, &rho_row)
+    });
+    assert_eq!(
+        run_r,
+        w_mu * vals_rec[v_out],
+        "the row endpoint closes from located words"
+    );
+
+    // The accumulator IS (eq(rho_row), eq(rho_col), value) — the merge
+    // node's public statement in miniature, every piece a located wire.
+    assert_eq!(
+        out_v,
+        MatrixClaim {
+            row: Weight::eq(rho_row),
+            col: Weight::eq(rho_col),
+            value: vals_rec[v_out],
+        },
+        "the accumulator is the located rho pair + the located value"
+    );
+
+    println!(
+        "\nMVP-11 SIGMA FOLD TAPE (2 circuit children, one digest)\n  \
+         child: nu {} | mu {} — fold: {} col rounds, {} row rounds, 2 bridge values\n  \
+         tape: {} ops | {} stream values | {} squeezes — both endpoints close from located words\n",
+        sigmas[0].nu,
+        sigmas[0].rho.len(),
+        k_col,
+        k_row,
+        ops.len(),
+        vals_rec.len(),
+        chals.len(),
+    );
+}
