@@ -128,7 +128,7 @@ pub trait GateType {
 ///
 /// **Stateless.** Rows accumulate in the online phase, not here, so one shape
 /// can be run many times concurrently — the whole point of the split.
-trait SlotBuild: Any {
+trait SlotBuild: Any + Send + Sync {
     /// MOVE the table out. Called once, by `finish`, on its way into the
     /// registry — which then owns it. Cloning here instead cost 2 deep copies
     /// of every table's matrices; BLAKE3's are ~21M nonzeros, so that was
@@ -137,10 +137,13 @@ trait SlotBuild: Any {
     fn n_in(&self) -> usize;
     fn n_out(&self) -> usize;
     /// A fresh, empty `Vec<G::Row>` for one online run.
-    fn new_rows(&self) -> Box<dyn Any>;
+    fn new_rows(&self) -> Box<dyn Any + Send>;
     /// Evaluate one gate, appending its row; outputs land on the scratch.
     fn push(&self, rows: &mut dyn Any, inputs: &[F128], hint: &dyn Any, outputs: &mut Vec<F128>);
     fn witness(&self, rows: &dyn Any, nu: usize) -> SlotWitness;
+    /// Append `src`'s rows (an island accumulator) onto `dst`, preserving
+    /// instantiation order.
+    fn merge_rows(&self, dst: &mut dyn Any, src: Box<dyn Any + Send>);
 }
 
 struct GateSlot<G: GateType> {
@@ -151,9 +154,9 @@ struct GateSlot<G: GateType> {
     n_out: usize,
 }
 
-impl<G: GateType + 'static> SlotBuild for GateSlot<G>
+impl<G: GateType + Send + Sync + 'static> SlotBuild for GateSlot<G>
 where
-    G::Row: 'static,
+    G::Row: Send + 'static,
     G::Hint: 'static,
 {
     fn take_table(&mut self) -> TableType {
@@ -167,7 +170,7 @@ where
     fn n_out(&self) -> usize {
         self.n_out
     }
-    fn new_rows(&self) -> Box<dyn Any> {
+    fn new_rows(&self) -> Box<dyn Any + Send> {
         Box::new(Vec::<G::Row>::new())
     }
     fn push(&self, rows: &mut dyn Any, inputs: &[F128], hint: &dyn Any, outputs: &mut Vec<F128>) {
@@ -196,6 +199,15 @@ where
                 .expect("row store belongs to another slot"),
             nu,
         )
+    }
+    fn merge_rows(&self, dst: &mut dyn Any, src: Box<dyn Any + Send>) {
+        let dst = dst
+            .downcast_mut::<Vec<G::Row>>()
+            .expect("row store belongs to another slot");
+        let mut src = src
+            .downcast::<Vec<G::Row>>()
+            .expect("row store belongs to another slot");
+        dst.append(&mut src);
     }
 }
 
@@ -232,6 +244,11 @@ pub struct ShapeBuilder {
     steps: Vec<Step>,
     rows_per_slot: Vec<usize>,
     n_hints: usize,
+    /// Step spans whose gate subgraphs are mutually independent (each reads
+    /// only wires written before the first island or inside itself) — the
+    /// online phase evaluates them in parallel. Declared by the caller via
+    /// [`ShapeBuilder::begin_island`]/[`ShapeBuilder::end_island`].
+    islands: Vec<(usize, usize)>,
 }
 
 impl ShapeBuilder {
@@ -247,6 +264,7 @@ impl ShapeBuilder {
             steps: Vec::new(),
             rows_per_slot: Vec::new(),
             n_hints: 0,
+            islands: Vec::new(),
         }
     }
 
@@ -274,8 +292,8 @@ impl ShapeBuilder {
     /// slot's row capacity is the registry's uniform `2^nu`.
     pub fn slot<G>(&mut self, gate: G) -> SlotId
     where
-        G: GateType + 'static,
-        G::Row: 'static,
+        G: GateType + Send + Sync + 'static,
+        G::Row: Send + 'static,
         G::Hint: 'static,
     {
         let table = gate.table();
@@ -405,6 +423,28 @@ impl ShapeBuilder {
         self.parent[rb] = ra;
     }
 
+    /// Open an independence island: the steps recorded until the matching
+    /// [`Self::end_island`] must read only wires valued BEFORE the first
+    /// island (inputs or earlier non-island gate outputs) or produced inside
+    /// this island. The online phase runs islands in parallel; a violated
+    /// contract fails loudly there (a missing value is a deterministic
+    /// assert, and conflicting writes are caught at the merge), never
+    /// silently.
+    pub fn begin_island(&mut self) -> usize {
+        self.steps.len()
+    }
+
+    /// Close the island opened at `start` (its value is what
+    /// [`Self::begin_island`] returned).
+    pub fn end_island(&mut self, start: usize) {
+        let end = self.steps.len();
+        if let Some(&(_, prev_end)) = self.islands.last() {
+            assert!(start >= prev_end, "islands must not overlap");
+        }
+        assert!(start <= end);
+        self.islands.push((start, end));
+    }
+
     pub fn finish(mut self) -> Result<CircuitShape, CircuitError> {
         // Registry::new sorts class-major, area-descending, with a STABLE sort
         // on `(is_element, Reverse(k_log))`. Replicate that key to learn where
@@ -525,6 +565,7 @@ impl ShapeBuilder {
             inputs: input_roots,
             publics: pubs,
             n_hints: self.n_hints,
+            islands: self.islands,
         })
     }
 }
@@ -566,6 +607,7 @@ pub struct CircuitShape {
     /// Class root per published cell, in publication order.
     publics: Vec<usize>,
     n_hints: usize,
+    islands: Vec<(usize, usize)>,
 }
 
 impl CircuitShape {
@@ -599,7 +641,7 @@ impl CircuitShape {
     /// needs) takes the supplied value, and the gate's output is then asserted
     /// equal to it rather than overwriting it. That assertion is what
     /// [`ShapeBuilder::connect`] promises.
-    pub fn run(&self, inputs: &[F128], hints: &[&dyn Any]) -> CircuitWitness {
+    pub fn run(&self, inputs: &[F128], hints: &[&(dyn Any + Sync)]) -> CircuitWitness {
         assert_eq!(
             inputs.len(),
             self.inputs.len(),
@@ -628,21 +670,124 @@ impl CircuitShape {
             set[root] = true;
         }
 
-        let mut rows: Vec<Box<dyn Any>> = self.slots.iter().map(|s| s.new_rows()).collect();
+        let mut rows: Vec<Box<dyn Any + Send>> = self.slots.iter().map(|s| s.new_rows()).collect();
+
+        if self.islands.len() >= 2 {
+            // Declared-independent islands run in PARALLEL, each on a COPY of
+            // the value state (a few MB — the safe alternative to shared
+            // mutation: a violated independence contract fails as a
+            // deterministic "no value yet" assert inside its island, and
+            // conflicting writes are caught at the merge, never a race).
+            use rayon::prelude::*;
+            let hinted_before = |at: usize| self.steps[..at].iter().filter(|s| s.hinted).count();
+            for w in self.islands.windows(2) {
+                assert_eq!(
+                    w[0].1, w[1].0,
+                    "islands must be contiguous (steps between islands have \
+                     no defined order against the parallel evaluation)"
+                );
+            }
+            let prefix_end = self.islands[0].0;
+            let suffix_start = self.islands.last().expect("nonempty").1;
+            self.exec_steps(0..prefix_end, &mut values, &mut set, &mut rows, hints, 0);
+            let results: Vec<(Vec<F128>, Vec<bool>, Vec<Box<dyn Any + Send>>)> = self
+                .islands
+                .par_iter()
+                .map(|&(a, b)| {
+                    let mut v = values.clone();
+                    let mut st = set.clone();
+                    let mut rw: Vec<Box<dyn Any + Send>> =
+                        self.slots.iter().map(|s| s.new_rows()).collect();
+                    self.exec_steps(a..b, &mut v, &mut st, &mut rw, hints, hinted_before(a));
+                    (v, st, rw)
+                })
+                .collect();
+            for (iv, ist, irw) in results {
+                for r in 0..self.n_wires {
+                    if ist[r] {
+                        if set[r] {
+                            assert_eq!(
+                                values[r], iv[r],
+                                "islands (or an island and the prefix) disagree on a wire"
+                            );
+                        } else {
+                            values[r] = iv[r];
+                            set[r] = true;
+                        }
+                    }
+                }
+                for (d, src) in irw.into_iter().enumerate() {
+                    self.slots[d].merge_rows(rows[d].as_mut(), src);
+                }
+            }
+            self.exec_steps(
+                suffix_start..self.steps.len(),
+                &mut values,
+                &mut set,
+                &mut rows,
+                hints,
+                hinted_before(suffix_start),
+            );
+        } else {
+            self.exec_steps(
+                0..self.steps.len(),
+                &mut values,
+                &mut set,
+                &mut rows,
+                hints,
+                0,
+            );
+        }
+
+        let public: Vec<F128> = self
+            .publics
+            .iter()
+            .map(|&r| {
+                assert!(set[r], "a published wire was never given a value");
+                values[r]
+            })
+            .collect();
+        let witnesses: Vec<SlotWitness> = self
+            .order
+            .iter()
+            .map(|&d| self.slots[d].witness(rows[d].as_ref(), self.nu))
+            .collect();
+
+        CircuitWitness {
+            public,
+            witnesses,
+            rows,
+            slot_types: self.slot_types.clone(),
+        }
+    }
+
+    /// Execute the steps in `range` against the given value state and row
+    /// accumulators. `hint_base` is the number of hinted steps before the
+    /// range (hints are consumed in absolute instantiation order).
+    fn exec_steps(
+        &self,
+        range: core::ops::Range<usize>,
+        values: &mut [F128],
+        set: &mut [bool],
+        rows: &mut [Box<dyn Any + Send>],
+        hints: &[&(dyn Any + Sync)],
+        hint_base: usize,
+    ) {
         let unit = ();
-        let mut next_hint = 0usize;
+        let mut next_hint = hint_base;
         // One scratch buffer for every step's input values — a fresh Vec per
         // gate call was a measurable slice of the online phase. Step wires
         // are pre-resolved to class roots by `finish`.
         let mut vals: Vec<F128> = Vec::with_capacity(16);
         let mut outs: Vec<F128> = Vec::with_capacity(16);
-        for step in &self.steps {
+        for step in &self.steps[range] {
             vals.clear();
             for &r in &step.inputs {
                 assert!(
                     set[r],
                     "gate input has no value yet: a gate was instantiated before \
-                     the gate producing one of its inputs"
+                     the gate producing one of its inputs (or an island read a \
+                     wire another island writes)"
                 );
                 vals.push(values[r]);
             }
@@ -667,27 +812,6 @@ impl CircuitShape {
                 }
             }
         }
-
-        let public: Vec<F128> = self
-            .publics
-            .iter()
-            .map(|&r| {
-                assert!(set[r], "a published wire was never given a value");
-                values[r]
-            })
-            .collect();
-        let witnesses: Vec<SlotWitness> = self
-            .order
-            .iter()
-            .map(|&d| self.slots[d].witness(rows[d].as_ref(), self.nu))
-            .collect();
-
-        CircuitWitness {
-            public,
-            witnesses,
-            rows,
-            slot_types: self.slot_types.clone(),
-        }
     }
 }
 
@@ -698,7 +822,7 @@ pub struct CircuitWitness {
     /// Per-slot witnesses, in REGISTRY order.
     pub witnesses: Vec<SlotWitness>,
     /// Per-slot rows, in DECLARED order.
-    rows: Vec<Box<dyn Any>>,
+    rows: Vec<Box<dyn Any + Send>>,
     slot_types: Vec<TypeId>,
 }
 
@@ -743,7 +867,7 @@ impl CircuitWitness {
 pub struct CircuitBuilder {
     shape: ShapeBuilder,
     values: Vec<F128>,
-    hints: Vec<Box<dyn Any>>,
+    hints: Vec<Box<dyn Any + Sync>>,
 }
 
 impl CircuitBuilder {
@@ -757,8 +881,8 @@ impl CircuitBuilder {
 
     pub fn slot<G>(&mut self, gate: G) -> SlotId
     where
-        G: GateType + 'static,
-        G::Row: 'static,
+        G: GateType + Send + Sync + 'static,
+        G::Row: Send + 'static,
         G::Hint: 'static,
     {
         self.shape.slot(gate)
@@ -784,7 +908,7 @@ impl CircuitBuilder {
 
     /// Instantiate a gate, supplying this instance's nondeterministic advice.
     /// See [`GateType::Hint`]; `hint` must be that exact type.
-    pub fn gate_with_hint<H: Any>(&mut self, slot: SlotId, inputs: &[Wire], hint: H) -> Vec<Wire> {
+    pub fn gate_with_hint<H: Any + Sync>(&mut self, slot: SlotId, inputs: &[Wire], hint: H) -> Vec<Wire> {
         self.hints.push(Box::new(hint));
         self.shape.gate_hinted(slot, inputs)
     }
@@ -801,7 +925,7 @@ impl CircuitBuilder {
 
     pub fn finish(self) -> Result<BuiltCircuit, CircuitError> {
         let shape = self.shape.finish()?;
-        let hints: Vec<&dyn Any> = self.hints.iter().map(|b| b.as_ref()).collect();
+        let hints: Vec<&(dyn Any + Sync)> = self.hints.iter().map(|b| b.as_ref()).collect();
         let witness = shape.run(&self.values, &hints);
         Ok(BuiltCircuit { shape, witness })
     }

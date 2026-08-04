@@ -599,8 +599,8 @@ fn l0_shape_circuit_cost() {
         (vals, hints)
     };
     let (vals, hints) = gather();
-    let hint_refs: Vec<&dyn std::any::Any> =
-        hints.iter().map(|h| h as &dyn std::any::Any).collect();
+    let hint_refs: Vec<&(dyn std::any::Any + Sync)> =
+        hints.iter().map(|h| h as &(dyn std::any::Any + Sync)).collect();
 
     std::hint::black_box(shape.run(&vals, &hint_refs)); // warm
     let t = Instant::now();
@@ -1021,8 +1021,8 @@ fn leaf_arithmetic_joins_the_merkle_openings() {
         vals.push(alpha[i]);
         hints.push(tree.siblings(pos));
     }
-    let hint_refs: Vec<&dyn std::any::Any> =
-        hints.iter().map(|h| h as &dyn std::any::Any).collect();
+    let hint_refs: Vec<&(dyn std::any::Any + Sync)> =
+        hints.iter().map(|h| h as &(dyn std::any::Any + Sync)).collect();
     let built = shape.run(&vals, &hint_refs);
 
     // ---- the join is structural, not incidental ----
@@ -1422,8 +1422,8 @@ fn mvp4_slice(depth: usize, n_queries: usize, nu: usize) {
         vals.push(alpha[k]);
         hints.push(tree.siblings(pos));
     }
-    let hint_refs: Vec<&dyn std::any::Any> =
-        hints.iter().map(|h| h as &dyn std::any::Any).collect();
+    let hint_refs: Vec<&(dyn std::any::Any + Sync)> =
+        hints.iter().map(|h| h as &(dyn std::any::Any + Sync)).collect();
     std::hint::black_box(shape.run(&vals, &hint_refs)); // warm
     let t = Instant::now();
     let built = shape.run(&vals, &hint_refs);
@@ -2024,8 +2024,8 @@ fn mvp5_all_levels_query_phase() {
             hints.push(trees[li].siblings(pos));
         }
     }
-    let hint_refs: Vec<&dyn std::any::Any> =
-        hints.iter().map(|h| h as &dyn std::any::Any).collect();
+    let hint_refs: Vec<&(dyn std::any::Any + Sync)> =
+        hints.iter().map(|h| h as &(dyn std::any::Any + Sync)).collect();
     let (built, online_t) = timed(REPS, || shape.run(&vals, &hint_refs));
 
     // Every level opened the queries its own squeeze determined, and every
@@ -4665,8 +4665,8 @@ fn mvp7_real_query_phase() {
     let shape = sb.finish().expect("valid real-query circuit");
     let setup_ms = t.elapsed().as_secs_f64() * 1e3;
 
-    let hint_refs: Vec<&dyn std::any::Any> =
-        hints.iter().map(|h| h as &dyn std::any::Any).collect();
+    let hint_refs: Vec<&(dyn std::any::Any + Sync)> =
+        hints.iter().map(|h| h as &(dyn std::any::Any + Sync)).collect();
     let (built, online_t) = timed(REPS, || shape.run(&vals, &hint_refs));
 
     // ---- the boundary checks ----
@@ -6022,8 +6022,8 @@ fn collapsed_opening_matches_the_composite() {
             }
             hints.extend(tree.siblings(pos));
         }
-        let hint_refs: Vec<&dyn std::any::Any> =
-            hints.iter().map(|h| h as &dyn std::any::Any).collect();
+        let hint_refs: Vec<&(dyn std::any::Any + Sync)> =
+            hints.iter().map(|h| h as &(dyn std::any::Any + Sync)).collect();
         let built = shape.run(&vals, &hint_refs);
 
         // Every opening's root is the tree's — i.e. the collapsed rows fold
@@ -6340,8 +6340,8 @@ fn mvp6_all_levels_collapsed() {
     let setup_ms = t.elapsed().as_secs_f64() * 1e3;
 
     // ---- online ----
-    let hint_refs: Vec<&dyn std::any::Any> =
-        hints.iter().map(|h| h as &dyn std::any::Any).collect();
+    let hint_refs: Vec<&(dyn std::any::Any + Sync)> =
+        hints.iter().map(|h| h as &(dyn std::any::Any + Sync)).collect();
     let (built, online_t) = timed(REPS, || shape.run(&vals, &hint_refs));
 
     // Every opening folds to its cap node, and the accumulator is
@@ -7903,8 +7903,8 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             sb.publish(*w);
         }
         let shape = sb.finish().expect("valid leaf query-phase circuit");
-        let hint_refs: Vec<&dyn std::any::Any> =
-            hints.iter().map(|h| h as &dyn std::any::Any).collect();
+        let hint_refs: Vec<&(dyn std::any::Any + Sync)> =
+            hints.iter().map(|h| h as &(dyn std::any::Any + Sync)).collect();
         let built = shape.run(&vals, &hint_refs);
 
         // ---- boundary checks: alphas and the enforced sums.
@@ -10460,8 +10460,8 @@ fn mvp10_leaf_outer_inner_tape() {
         "the swap outer's cell-slot budget regressed past mu 24 ({} slots)",
         shape2.circuit.cells().slots().len()
     );
-    let hint_refs: Vec<&dyn std::any::Any> =
-        hints.iter().map(|h| h as &dyn std::any::Any).collect();
+    let hint_refs: Vec<&(dyn std::any::Any + Sync)> =
+        hints.iter().map(|h| h as &(dyn std::any::Any + Sync)).collect();
     let mut built2 = shape2.run(&vals, &hint_refs);
     let consumed = check_real_child_region(&built2.public, &rt, &region);
     assert_eq!(
@@ -13075,8 +13075,8 @@ fn mvp10_circuit_inner_tape() {
     let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
     let region = emit_child_region(&mut sb, &mut cs, &ct, &mut vals, &mut hints);
     let shape2 = sb.finish().expect("the mvp10 chain circuit builds");
-    let hint_refs: Vec<&dyn std::any::Any> =
-        hints.iter().map(|h| h as &dyn std::any::Any).collect();
+    let hint_refs: Vec<&(dyn std::any::Any + Sync)> =
+        hints.iter().map(|h| h as &(dyn std::any::Any + Sync)).collect();
     let mut built2 = shape2.run(&vals, &hint_refs);
     let consumed = check_child_region(&built2.public, &ct, &region);
     assert_eq!(
@@ -13263,8 +13263,8 @@ fn partial_block_leaves_hash_correctly() {
         sb.publish(root[1]);
         let shape = sb.finish().expect("the opening circuit builds");
         let hints: Vec<[u32; SLOT_WORDS]> = tree.siblings(pos);
-        let hint_refs: Vec<&dyn std::any::Any> =
-            hints.iter().map(|h| h as &dyn std::any::Any).collect();
+        let hint_refs: Vec<&(dyn std::any::Any + Sync)> =
+            hints.iter().map(|h| h as &(dyn std::any::Any + Sync)).collect();
         let built = shape.run(&vals, &hint_refs);
 
         // The in-circuit chunk chain reproduces `hash_leaf` on a leaf that
@@ -14907,8 +14907,8 @@ fn mvp11_merge_fold_region() {
         }
 
         let shape2 = sb.finish().expect("the mvp11 merge circuit builds");
-        let hint_refs: Vec<&dyn std::any::Any> =
-            hints.iter().map(|h| h as &dyn std::any::Any).collect();
+        let hint_refs: Vec<&(dyn std::any::Any + Sync)> =
+            hints.iter().map(|h| h as &(dyn std::any::Any + Sync)).collect();
         let mut built2 = shape2.run(&vals, &hint_refs);
 
         // The two child regions' checker walks — the SAME helper mvp10 runs,
@@ -15815,8 +15815,16 @@ fn build_node_outer(
         let mut cs = ChildSlots::new(&mut sb, nu2, rt0.spread_w.max(rt1.spread_w));
         let mut vals: Vec<F128> = Vec::new();
         let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
+        // The two child regions are independent gate subgraphs (each reads
+        // only its own tape's inputs; the fold region joins them AFTER) —
+        // declared as islands so the online phase evaluates them in
+        // parallel.
+        let isl0 = sb.begin_island();
         let r0 = emit_real_child_region(&mut sb, &mut cs, &rt0, &mut vals, &mut hints);
+        sb.end_island(isl0);
+        let isl1 = sb.begin_island();
         let r1 = emit_real_child_region(&mut sb, &mut cs, &rt1, &mut vals, &mut hints);
+        sb.end_island(isl1);
         // The fold region rides the children's slots: rows, not columns.
         let (pfslot, pf_w) = r0.pf;
         let leslot = cs
@@ -16118,8 +16126,8 @@ fn build_node_outer(
                 );
             }
         }
-        let hint_refs: Vec<&dyn std::any::Any> =
-            hints.iter().map(|h| h as &dyn std::any::Any).collect();
+        let hint_refs: Vec<&(dyn std::any::Any + Sync)> =
+            hints.iter().map(|h| h as &(dyn std::any::Any + Sync)).collect();
         let build_ms = build_ms + t_build2.elapsed().as_secs_f64() * 1e3;
         let t_trace = std::time::Instant::now();
         let mut built2 = shape2.run(&vals, &hint_refs);
