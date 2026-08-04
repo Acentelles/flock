@@ -293,11 +293,7 @@ pub enum CircuitError {
     /// A cell appears in two classes, or twice in one.
     RepeatedCell(Cell),
     EmptyClass,
-    /// Two `out`-direction cells in one wire class — the single-producer rule.
-    MultipleProducers {
-        class: usize,
-    },
-    /// The gate dataflow (producer → consumer) has a cycle.
+    /// Two `out`-direction cells in one wire class — the single-producer ru    /// The gate dataflow (producer → consumer) has a cycle.
     Cyclic,
     /// σ is not a permutation. Unreachable given disjointness; checked anyway,
     /// because completeness (and the verifier's `s_σ`) rests on it.
@@ -394,17 +390,20 @@ impl Circuit {
             }
         }
 
-        // ---- Single producer per class.
-        let mut producer: Vec<Option<usize>> = vec![None; classes.len()];
+        // ---- Producers per class. MULTIPLE producers are allowed: the
+        // permutation argument forces every cell of a class equal, so a
+        // class holding two gate outputs IS the circuit's assert_eq between
+        // computed values (the zero-delta pattern without a published
+        // delta), and witness generation asserts the second producer agrees
+        // ([`builder::CircuitShape::run`]). The dataflow check below draws
+        // edges from EVERY producer to every consumer.
+        let mut producers: Vec<Vec<usize>> = vec![Vec::new(); classes.len()];
         for (ci, class) in classes.iter().enumerate() {
             for &idx in class {
                 if let CellSlot::Gate { word, .. } = cells.slots()[idx >> nu]
                     && word.dir == IoDirection::Out
                 {
-                    if producer[ci].is_some() {
-                        return Err(CircuitError::MultipleProducers { class: ci });
-                    }
-                    producer[ci] = Some(idx);
+                    producers[ci].push(idx);
                 }
             }
         }
@@ -428,21 +427,20 @@ impl Circuit {
         let mut succ: Vec<Vec<usize>> = vec![Vec::new(); total_gates];
         let mut indeg = vec![0usize; total_gates];
         for (ci, class) in classes.iter().enumerate() {
-            let Some(prod_idx) = producer[ci] else {
-                continue;
-            };
-            let from = gate_of(prod_idx).expect("a producer cell is a gate cell");
-            for &idx in class {
-                let iota = idx >> nu;
-                let CellSlot::Gate { word, .. } = cells.slots()[iota] else {
-                    continue;
-                };
-                if word.dir != IoDirection::In {
-                    continue;
+            for &prod_idx in &producers[ci] {
+                let from = gate_of(prod_idx).expect("a producer cell is a gate cell");
+                for &idx in class {
+                    let iota = idx >> nu;
+                    let CellSlot::Gate { word, .. } = cells.slots()[iota] else {
+                        continue;
+                    };
+                    if word.dir != IoDirection::In {
+                        continue;
+                    }
+                    let to = gate_of(idx).expect("gate cell");
+                    succ[from].push(to);
+                    indeg[to] += 1;
                 }
-                let to = gate_of(idx).expect("gate cell");
-                succ[from].push(to);
-                indeg[to] += 1;
             }
         }
         let mut queue: Vec<usize> = (0..total_gates).filter(|&g| indeg[g] == 0).collect();
@@ -1108,11 +1106,10 @@ mod tests {
             "classes must be disjoint"
         );
         assert_eq!(mk(vec![Vec::new()]), Some(CircuitError::EmptyClass));
-        assert_eq!(
-            mk(vec![vec![Cell::new(2, 0), Cell::new(2, 1)]]),
-            Some(CircuitError::MultipleProducers { class: 0 }),
-            "two producers in one class"
-        );
+        // Two producers in one class: ALLOWED — the class asserts the two
+        // outputs equal (the connect-as-assert_eq pattern); witgen checks
+        // the values agree.
+        assert_eq!(mk(vec![vec![Cell::new(2, 0), Cell::new(2, 1)]]), None);
         // Self-loop: gate 0's output feeds gate 0's own input.
         assert_eq!(
             mk(vec![vec![Cell::new(2, 0), Cell::new(0, 0)]]),

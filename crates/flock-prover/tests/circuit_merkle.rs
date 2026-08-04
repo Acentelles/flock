@@ -7208,6 +7208,12 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         let zw = sb.public_input();
         vals.push(F128::ONE);
         let ow = sb.public_input();
+        // The assert-zero anchor: a dedicated zero public NO gate consumes,
+        // so the zero-delta outputs connected into its class add no
+        // dataflow edges (connecting them to the ubiquitous `zw` creates
+        // cycles — the acyclicity check draws producer→consumer edges).
+        vals.push(F128::ZERO);
+        let zassert = sb.public_input();
         let spine = sb.slot(SpineGate::new());
         leaf_slot.push((0, spine));
         let gpw = outs[trace.squeezes[inner_pd2.fin][0]][0];
@@ -7442,7 +7448,6 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         let zslot = sb.slot(ZcRoundGate::new());
         leaf_slot.push((500, zslot));
         let mut zrw = seed_w;
-        let mut zc_deltas2: Vec<Wire> = Vec::new();
         // The eq-weight wires, kept in round order: they are exactly the
         // zerocheck's r_rest — the c claim's point — which the anchor
         // expect consumes below.
@@ -7460,7 +7465,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             vals.push(g0_native[k2]);
             let g0w = sb.input();
             let g = sb.gate(zslot, &[zrw, wv(g_v), wv(g_v + 1), t_w, rho_w, g0w, ow]);
-            zc_deltas2.push(g[0]);
+            sb.connect(g[0], zassert);
             zrw = g[1];
         }
 
@@ -7607,7 +7612,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             mp_rho2_w.push(r_w);
             mp_tm = sb.gate(mrslot, &[mp_tm, wv(g_v), wv(g_v + 1), r_w])[0];
         }
-        let mp_delta = sb.gate(spine, &[zw, zw, zw, mp_tm, zw, zw, wv(mp_anchor_v), ow, zw])[3];
+        sb.connect(mp_tm, wv(mp_anchor_v));
         let mut anc = wv(mp_anchor_v);
         let mut mp_sig_w: Vec<Wire> = Vec::new();
         for &(g_v, _, fin) in &mp_anchor_rounds3 {
@@ -7831,7 +7836,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             .iter()
             .map(|rr| outs[trace.squeezes[rr.fin][0]][0])
             .collect();
-        let mut sqrt_deltas: Vec<Wire> = Vec::new();
+
         let mut ghat = zw;
         for j in 0..128 {
             if j > 0 {
@@ -7841,8 +7846,8 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
                     rinv_n[t2] = y;
                     vals.push(y);
                     let yw = sb.input();
-                    sqrt_deltas
-                        .push(sb.gate(spine, &[zw, zw, zw, rinv_w[t2], zw, zw, yw, yw, zw])[3]);
+                    let d = sb.gate(spine, &[zw, zw, zw, rinv_w[t2], zw, zw, yw, yw, zw])[3];
+                    sb.connect(d, zassert);
                     lvl_w.push(yw);
                 }
                 rinv_w = lvl_w;
@@ -7912,7 +7917,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             expect_w = sb.gate(spine, &[zw, zw, zw, expect_w, zw, zw, coeff, wd, zw])[3];
         }
         // The join: the anchor's folded claim equals the in-circuit expect.
-        let anchor_delta2 = sb.gate(spine, &[zw, zw, zw, anc, zw, zw, expect_w, ow, zw])[3];
+        sb.connect(anc, expect_w);
 
         // ---- MatrixAssertion emission ----
         // The deferred matrix work exits as bound publics: alpha and the
@@ -7960,20 +7965,12 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         sb.publish(t_final);
         sb.publish(rc_w);
         sb.publish(seed_w);
-        for d in &zc_deltas2 {
-            sb.publish(*d);
-        }
         sb.publish(zrw);
         sb.publish(lcw);
-        sb.publish(mp_delta);
         sb.publish(anc);
         for w in &assert_pub {
             sb.publish(*w);
         }
-        for d in &sqrt_deltas {
-            sb.publish(*d);
-        }
-        sb.publish(anchor_delta2);
         let shape = sb.finish().expect("valid leaf query-phase circuit");
         let hint_refs: Vec<&dyn std::any::Any> =
             hints.iter().map(|h| h as &dyn std::any::Any).collect();
@@ -7983,24 +7980,16 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         // The anchor-expect tail (sqrt-chain deltas + the claim==expect
         // delta) is appended after everything else; `plen` is the public
         // length BEFORE it, so every older from-the-end offset holds.
-        let n_anchor_tail = sqrt_deltas.len() + 1;
-        let plen = built.public.len() - n_anchor_tail;
-        for (k5, d) in built.public[plen..plen + sqrt_deltas.len()].iter().enumerate() {
-            assert_eq!(*d, F128::ZERO, "sqrt-chain delta {k5}");
-        }
-        assert_eq!(
-            *built.public.last().unwrap(),
-            F128::ZERO,
-            "the anchor claim == expect zero-delta"
-        );
+        // The sqrt-chain, anchor-expect, zc-round and T_m == anchor.v
+        // identities are COPY CONSTRAINTS — no publics, no checker items.
+        let plen = built.public.len();
         let n_assert_pub = 1 + lc_rounds2.len() + 2 * proof.lincheck.matrix_evals.len();
         let total_pub: usize = levels.len()
             + levels.len() * yr_len
             + 1
             + 3
-            + 6
+            + 5
             + n_assert_pub
-            + zc_rounds2.len()
             + 3 * pows.len()
             + levels
                 .iter()
@@ -8051,7 +8040,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             );
             // THE CLOSURE, between circuit outputs: the residual side's
             // inner and the spine's t_r are the same statement scalar.
-            let zc_tail2 = n_assert_pub + 6 + zc_rounds2.len();
+            let zc_tail2 = n_assert_pub + 5;
             assert_eq!(
                 built.public[plen - zc_tail2 - 1],
                 inner_n,
@@ -8098,21 +8087,16 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         }
         let tail0 = plen - n_assert_pub;
         assert_eq!(
-            built.public[tail0 - 2],
-            F128::ZERO,
-            "T_m + anchor.v is the multipoint zero-delta"
-        );
-        assert_eq!(
             built.public[tail0 - 1],
             anc_end_native,
             "the anchor rounds end at the native claim"
         );
         assert_eq!(
-            built.public[tail0 - 3],
+            built.public[tail0 - 2],
             lc_end_native,
             "the lincheck chain ends at the native running claim"
         );
-        let zc_tail = n_assert_pub + 6 + zc_rounds2.len();
+        let zc_tail = n_assert_pub + 5;
         assert_eq!(
             built.public[plen - zc_tail],
             proof.zerocheck.final_c_eval,
@@ -8123,15 +8107,8 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             zc_seed,
             "the in-circuit skip seed equals the native interpolation"
         );
-        for k2 in 0..zc_rounds2.len() {
-            assert_eq!(
-                built.public[plen - zc_tail + 2 + k2],
-                F128::ZERO,
-                "zc delta {k2}"
-            );
-        }
         assert_eq!(
-            built.public[tail0 - 4],
+            built.public[tail0 - 3],
             zc_end_native,
             "the zc chain ends at the native running claim"
         );
@@ -9297,9 +9274,6 @@ struct RealRegion {
     pub_base: usize,
     n_query_pub: usize,
     n_tail: usize,
-    n_gkr_deltas: usize,
-    n_el_deltas: usize,
-    n_sqrt_deltas: usize,
     n_mat_pub: usize,
     n_ela_pub: usize,
     /// sigma: the deferred s_sigma stream word + the GKR squeeze point.
@@ -9438,6 +9412,13 @@ fn emit_real_child_region(
     let ow = sb.public_input();
     let mrslot = cs.mrs;
     let spine = cs.spine;
+    // The assert-zero anchor: a dedicated zero public NO gate consumes,
+    // so the zero-delta outputs connected into its class add no
+    // dataflow edges (connecting them to the ubiquitous `zw` creates
+    // cycles — the acyclicity check draws producer→consumer edges).
+    vals.push(F128::ZERO);
+    let zassert = sb.public_input();
+
 
     vals.push(rt.native_target);
     let tgt_w = sb.public_input();
@@ -9532,12 +9513,13 @@ fn emit_real_child_region(
     // ---- the WIRING GKR in-circuit + the sigma emission ----
     let macs = cs.macs;
     let zcr = cs.zcr;
-    let mut gkr_deltas: Vec<Wire> = Vec::new();
     let gr = &rt.gkr;
     let g_alpha_w = outs[trace.squeezes[gr.alpha_fin][0]][0];
     let g_beta_w = outs[trace.squeezes[gr.beta_fin][0]][0];
+    // Every former published-zero delta in this region is a COPY
+    // CONSTRAINT now — the proof itself fails on a broken identity.
     let (mut cl_w, mut cr_w) = (wv(gr.top_v), wv(gr.top_v + 1));
-    gkr_deltas.push(sb.gate(macs, &[cl_w, cr_w, ow])[0]);
+    sb.connect(cl_w, cr_w);
     let mut pt_w: Vec<Wire> = Vec::new();
     for lr in &gr.layers {
         let lam_w = outs[trace.squeezes[lr.lam_fin][0]][0];
@@ -9548,7 +9530,7 @@ fn emit_real_child_region(
             vals.push(lr.g0s[t2]);
             let g0w = sb.input();
             let o = sb.gate(zcr, &[run_w, wv(gv), wv(gv + 1), pt_w[t2], rho_w, g0w, ow]);
-            gkr_deltas.push(o[0]);
+            sb.connect(o[0], zassert);
             run_w = o[1];
             pt_next.push(rho_w);
         }
@@ -9557,7 +9539,7 @@ fn emit_real_child_region(
         let pl2 = sb.gate(macs, &[zw, vl0, vl1])[0];
         let pr2 = sb.gate(macs, &[zw, vr0, vr1])[0];
         let gate_w = sb.gate(macs, &[pl2, lam_w, pr2])[0];
-        gkr_deltas.push(sb.gate(macs, &[gate_w, run_w, ow])[0]);
+        sb.connect(gate_w, run_w);
         let ck_w = outs[trace.squeezes[lr.ck_fin][0]][0];
         let sl2 = sb.gate(macs, &[vl0, vl1, ow])[0];
         let sr2 = sb.gate(macs, &[vr0, vr1, ow])[0];
@@ -9577,16 +9559,15 @@ fn emit_real_child_region(
     let l2 = sb.gate(macs, &[l1, g_beta_w, live_w])[0];
     let l3 = sb.gate(macs, &[l2, ow, live_w])[0];
     let l4 = sb.gate(macs, &[l3, ow, ow])[0];
-    gkr_deltas.push(sb.gate(macs, &[l4, cl_w, ow])[0]);
+    sb.connect(l4, cl_w);
     let r1 = sb.gate(macs, &[g_w, g_alpha_w, sig_w])[0];
     let r2 = sb.gate(macs, &[r1, g_beta_w, live_w])[0];
     let r3 = sb.gate(macs, &[r2, ow, live_w])[0];
     let r4 = sb.gate(macs, &[r3, ow, ow])[0];
-    gkr_deltas.push(sb.gate(macs, &[r4, cr_w, ow])[0]);
+    sb.connect(r4, cr_w);
 
     // ---- the MULTI-SLOT element PIOP (general strip) ----
     let mut el_zr = zw;
-    let mut el_deltas: Vec<Wire> = Vec::new();
     let sqt = &trace.squeezes[piop_i.tau_fin];
     for (k, rr) in piop_i.zc_rounds.iter().enumerate() {
         let t_w = outs[sqt[k / 4]][k % 4];
@@ -9594,7 +9575,7 @@ fn emit_real_child_region(
         vals.push(rt.el_g0[k]);
         let g0w = sb.input();
         let o = sb.gate(zcr, &[el_zr, wv(rr.g_v), wv(rr.g_v + 1), t_w, rho_w, g0w, ow]);
-        el_deltas.push(o[0]);
+        sb.connect(o[0], zassert);
         el_zr = o[1];
     }
     let el_alpha_w = outs[trace.squeezes[piop_i.alpha_fin][0]][0];
@@ -9631,7 +9612,7 @@ fn emit_real_child_region(
         mp_rho2_w.push(rho_w);
         tm_w = sb.gate(mrslot, &[tm_w, wv(rr.g_v), wv(rr.g_v + 1), rho_w])[0];
     }
-    let mp_delta = sb.gate(macs, &[tm_w, wv(mp_i.anchor_v), ow])[0];
+    sb.connect(tm_w, wv(mp_i.anchor_v));
     let mut anc_w = wv(mp_i.anchor_v);
     let mut mp_sig_w: Vec<Wire> = Vec::new();
     for rr in &mp_i.anchor_rounds {
@@ -9719,7 +9700,6 @@ fn emit_real_child_region(
         .collect();
     let mut rinv_n2: Vec<F128> = rho_mrg_n.clone();
     let mut rinv_w: Vec<Wire> = rho_mrg_w.clone();
-    let mut sqrt_deltas: Vec<Wire> = Vec::new();
     let mut ghat = zw;
     for j in 0..128 {
         if j > 0 {
@@ -9729,7 +9709,8 @@ fn emit_real_child_region(
                 rinv_n2[t3] = y;
                 vals.push(y);
                 let yw = sb.input();
-                sqrt_deltas.push(sb.gate(spine, &[zw, zw, zw, rinv_w[t3], zw, zw, yw, yw, zw])[3]);
+                let d = sb.gate(spine, &[zw, zw, zw, rinv_w[t3], zw, zw, yw, yw, zw])[3];
+                sb.connect(d, zassert);
                 lvl_w.push(yw);
             }
             rinv_w = lvl_w;
@@ -9874,7 +9855,7 @@ fn emit_real_child_region(
         let wd = sb.gate(macs, &[zw, w_st, gdp[0]])[0];
         expect_w = sb.gate(macs, &[expect_w, coeff, wd])[0];
     }
-    let anchor_delta = sb.gate(macs, &[anc_w, expect_w, ow])[0];
+    sb.connect(anc_w, expect_w);
 
     // ---- the assertion EMISSIONS (all three families) ----
     let bl_alpha_w = outs[trace.squeezes[rt.bl_alpha.1][0]][0];
@@ -9941,24 +9922,13 @@ fn emit_real_child_region(
         }
     }
     sb.publish(inner_w);
-    for d in &gkr_deltas {
-        sb.publish(*d);
-    }
     sb.publish(sig_w);
     for w in &pt_w {
         sb.publish(*w);
     }
-    for d in &el_deltas {
-        sb.publish(*d);
-    }
     sb.publish(el_zr);
     sb.publish(el_lcw);
-    sb.publish(mp_delta);
     sb.publish(anc_w);
-    for d in &sqrt_deltas {
-        sb.publish(*d);
-    }
-    sb.publish(anchor_delta);
     for w in &mat_pub {
         sb.publish(*w);
     }
@@ -9980,13 +9950,9 @@ fn emit_real_child_region(
         + 3
         + levels.len() * rt.yr_len
         + 1
-        + gkr_deltas.len()
         + 1
         + rt.mu_i
-        + el_deltas.len()
         + 2
-        + 2
-        + sqrt_deltas.len()
         + 1
         + mat_pub.len()
         + ela_pub.len()
@@ -9995,9 +9961,6 @@ fn emit_real_child_region(
         pub_base,
         n_query_pub,
         n_tail,
-        n_gkr_deltas: gkr_deltas.len(),
-        n_el_deltas: el_deltas.len(),
-        n_sqrt_deltas: sqrt_deltas.len(),
         n_mat_pub: mat_pub.len(),
         n_ela_pub: ela_pub.len(),
         sig_w,
@@ -10109,11 +10072,9 @@ fn check_real_child_region(public: &[F128], rt: &RealTape<'_>, r: &RealRegion) -
         inner_n, rt.t_final_n,
         "inner == t_r: the real-inner statement closes"
     );
-    let gkr_base = sp_base + 3 + rt.levels.len() * rt.yr_len + 1;
-    for (k, d) in public[gkr_base..gkr_base + r.n_gkr_deltas].iter().enumerate() {
-        assert_eq!(*d, F128::ZERO, "gkr delta {k}");
-    }
-    let sig_base = gkr_base + r.n_gkr_deltas;
+    // The GKR/element/multipoint/anchor identities are COPY CONSTRAINTS —
+    // no publics, no checker items; the proof itself carries them.
+    let sig_base = sp_base + 3 + rt.levels.len() * rt.yr_len + 1;
     assert_eq!(
         public[sig_base],
         rt.lo.proof.wiring.gkr.s_sigma_eval,
@@ -10132,42 +10093,24 @@ fn check_real_child_region(public: &[F128], rt: &RealTape<'_>, r: &RealRegion) -
         "the emitted sigma assertion discharges against the real inner"
     );
     let el_base = sig_base + 1 + rt.mu_i;
-    for (k, d) in public[el_base..el_base + r.n_el_deltas].iter().enumerate() {
-        assert_eq!(*d, F128::ZERO, "element piop delta {k}");
-    }
     assert_eq!(
-        public[el_base + r.n_el_deltas],
+        public[el_base],
         rt.el_run_n,
         "the element zc chain ends at the native running claim"
     );
     assert_eq!(
-        public[el_base + r.n_el_deltas + 1],
+        public[el_base + 1],
         rt.el_assert.target,
         "the element lc chain ends at the native assertion's target"
     );
-    let mp_base2 = el_base + r.n_el_deltas + 2;
     assert_eq!(
-        public[mp_base2],
-        F128::ZERO,
-        "T_m + anchor.v is the multipoint zero-delta (R=2 and P>0)"
-    );
-    assert_eq!(
-        public[mp_base2 + 1],
+        public[el_base + 2],
         rt.anc_end_n,
         "the anchor rounds end at the native claim"
     );
-    let axp_base = mp_base2 + 2;
-    for (k5, d) in public[axp_base..axp_base + r.n_sqrt_deltas].iter().enumerate() {
-        assert_eq!(*d, F128::ZERO, "sqrt-chain delta {k5}");
-    }
-    assert_eq!(
-        public[axp_base + r.n_sqrt_deltas],
-        F128::ZERO,
-        "the anchor claim == expect zero-delta (real-inner scale)"
-    );
     // The assertion emissions, held against the DEFERRED verify's own
     // assertions — a parent reads the accumulator inputs off the segment.
-    let mat_base = axp_base + r.n_sqrt_deltas + 1;
+    let mat_base = el_base + 3;
     assert_eq!(
         public[mat_base],
         rt.mat_assert.alpha,
@@ -11747,9 +11690,6 @@ struct ChildRegion {
     pub_base: usize,
     n_query_pub: usize,
     n_tail: usize,
-    n_gkr_deltas: usize,
-    n_el_deltas: usize,
-    n_sqrt_deltas: usize,
     /// The sigma assertion's wires: the deferred s_sigma stream word and the
     /// GKR's accumulated squeeze point.
     sig_w: Wire,
@@ -11864,13 +11804,21 @@ fn emit_child_region(
     let macs = cs.macs;
     let zcr = cs.zcr;
     let mrs = cs.mrs;
-    let mut gkr_deltas: Vec<Wire> = Vec::new();
+    // The assert-zero anchor: a dedicated zero public NO gate consumes,
+    // so the zero-delta outputs connected into its class add no
+    // dataflow edges (connecting them to the ubiquitous `zw` creates
+    // cycles — the acyclicity check draws producer→consumer edges).
+    vals.push(F128::ZERO);
+    let zassert = sb.public_input();
+
     let g = &ct.gkr;
     let alpha_w = outs[trace.squeezes[g.alpha_fin][0]][0];
     let beta_w = outs[trace.squeezes[g.beta_fin][0]][0];
-    // The grand products agree: a published-zero delta on the tops.
+    // The grand products agree: a COPY CONSTRAINT on the tops (every
+    // former published-zero delta in this region is now a connect — the
+    // proof itself fails on a broken identity; no public, no checker item).
     let (mut cl_w, mut cr_w) = (wv(g.top_v), wv(g.top_v + 1));
-    gkr_deltas.push(sb.gate(macs, &[cl_w, cr_w, ow])[0]);
+    sb.connect(cl_w, cr_w);
     let mut pt_w: Vec<Wire> = Vec::new();
     for lr in &g.layers {
         let lam_w = outs[trace.squeezes[lr.lam_fin][0]][0];
@@ -11881,7 +11829,7 @@ fn emit_child_region(
             vals.push(lr.g0s[t2]);
             let g0w = sb.input();
             let o = sb.gate(zcr, &[run_w, wv(gv), wv(gv + 1), pt_w[t2], rho_w, g0w, ow]);
-            gkr_deltas.push(o[0]);
+            sb.connect(o[0], zassert);
             run_w = o[1];
             pt_next.push(rho_w);
         }
@@ -11891,7 +11839,7 @@ fn emit_child_region(
         let pl = sb.gate(macs, &[zw, vl0, vl1])[0];
         let pr = sb.gate(macs, &[zw, vr0, vr1])[0];
         let gate_w = sb.gate(macs, &[pl, lam_w, pr])[0];
-        gkr_deltas.push(sb.gate(macs, &[gate_w, run_w, ow])[0]);
+        sb.connect(gate_w, run_w);
         // The claim fold: claim' = v0 + c·(v0 + v1).
         let ck_w = outs[trace.squeezes[lr.ck_fin][0]][0];
         let sl = sb.gate(macs, &[vl0, vl1, ow])[0];
@@ -11914,12 +11862,12 @@ fn emit_child_region(
     let l2 = sb.gate(macs, &[l1, beta_w, live_w])[0];
     let l3 = sb.gate(macs, &[l2, ow, live_w])[0];
     let l4 = sb.gate(macs, &[l3, ow, ow])[0];
-    gkr_deltas.push(sb.gate(macs, &[l4, cl_w, ow])[0]);
+    sb.connect(l4, cl_w);
     let r1 = sb.gate(macs, &[g_w, alpha_w, sig_w])[0];
     let r2 = sb.gate(macs, &[r1, beta_w, live_w])[0];
     let r3 = sb.gate(macs, &[r2, ow, live_w])[0];
     let r4 = sb.gate(macs, &[r3, ow, ow])[0];
-    gkr_deltas.push(sb.gate(macs, &[r4, cr_w, ow])[0]);
+    sb.connect(r4, cr_w);
 
     // ---- the MULTIPOINT intake at R = 2 AND P > 0 ----
     let mp_gamma_w = outs[trace.squeezes[mp_o.gamma_fin][0]][0];
@@ -11948,7 +11896,7 @@ fn emit_child_region(
         mp_rho2_w.push(rho_w);
         tm_w = sb.gate(mrs, &[tm_w, wv(rr.g_v), wv(rr.g_v + 1), rho_w])[0];
     }
-    let mp_delta = sb.gate(macs, &[tm_w, wv(mp_o.anchor_v), ow])[0];
+    sb.connect(tm_w, wv(mp_o.anchor_v));
     // The anchor's own rounds fold its claimed v to an endpoint, which
     // publishes and is held against the native replay; the squeezes are the
     // sigma wires the expect consumes below.
@@ -12064,7 +12012,6 @@ fn emit_child_region(
     // The entry is DERIVED: va = ea + a_sum, vb = eb + b_sum, entry =
     // va + alpha·vb — only the two constant-strip sums are advice.
     let mut el_zr = zw;
-    let mut el_deltas: Vec<Wire> = Vec::new();
     for (k, &(gv, rfin, _)) in el_rec.zc_rounds.iter().enumerate() {
         let sqt = &trace.squeezes[el_rec.tau_fin];
         let t_w = outs[sqt[k / 4]][k % 4];
@@ -12072,7 +12019,7 @@ fn emit_child_region(
         vals.push(ct.el_g0[k]);
         let g0w = sb.input();
         let o = sb.gate(zcr, &[el_zr, wv(gv), wv(gv + 1), t_w, rho_w, g0w, ow]);
-        el_deltas.push(o[0]);
+        sb.connect(o[0], zassert);
         el_zr = o[1];
     }
     let el_alpha_w = outs[trace.squeezes[el_rec.alpha_fin][0]][0];
@@ -12180,7 +12127,6 @@ fn emit_child_region(
         .collect();
     let mut rinv_n2: Vec<F128> = rho_mrg_n.clone();
     let mut rinv_w: Vec<Wire> = rho_mrg_w.clone();
-    let mut sqrt_deltas: Vec<Wire> = Vec::new();
     let mut ghat = zw;
     for j in 0..128 {
         if j > 0 {
@@ -12190,7 +12136,8 @@ fn emit_child_region(
                 rinv_n2[t2] = y;
                 vals.push(y);
                 let yw = sb.input();
-                sqrt_deltas.push(sb.gate(spine, &[zw, zw, zw, rinv_w[t2], zw, zw, yw, yw, zw])[3]);
+                let d = sb.gate(spine, &[zw, zw, zw, rinv_w[t2], zw, zw, yw, yw, zw])[3];
+                sb.connect(d, zassert);
                 lvl_w.push(yw);
             }
             rinv_w = lvl_w;
@@ -12339,7 +12286,7 @@ fn emit_child_region(
         expect_w = sb.gate(macs, &[expect_w, coeff, wd])[0];
     }
     // The join: the anchor's folded claim equals the in-circuit expect.
-    let anchor_delta = sb.gate(macs, &[anc_w, expect_w, ow])[0];
+    sb.connect(anc_w, expect_w);
 
     // Everything publishes HERE, after every public input is declared
     // (`built.public` lists entries in DECLARATION order — the recorded
@@ -12363,15 +12310,8 @@ fn emit_child_region(
     }
     sb.publish(ga_w);
     sb.publish(mg_w);
-    for d in &gkr_deltas {
-        sb.publish(*d);
-    }
-    for d in &el_deltas {
-        sb.publish(*d);
-    }
     sb.publish(el_zr);
     sb.publish(el_lcw);
-    sb.publish(mp_delta);
     sb.publish(anc_w);
     sb.publish(t_final);
     sb.publish(tgt_w);
@@ -12390,27 +12330,12 @@ fn emit_child_region(
     for w in &pt_w {
         sb.publish(*w);
     }
-    for d in &sqrt_deltas {
-        sb.publish(*d);
-    }
-    sb.publish(anchor_delta);
     // The z_skip squeeze wire, published: the boolean claims' lagrange row
     // lows derive from it, and the merge node's checker rebuilds them from
     // THIS published value (the alpha-expansion trust class — the
     // SkipNodeGate/φ8 in-circuit derivation is the recorded upgrade).
     sb.publish(outs[trace.squeezes[ct.zskip_fin][0]][0]);
-    let n_tail = 2
-        + gkr_deltas.len()
-        + el_deltas.len()
-        + 2
-        + 5
-        + levels.len() * ct.yr_len
-        + 1
-        + 1
-        + ct.mu_i
-        + sqrt_deltas.len()
-        + 1
-        + 1;
+    let n_tail = 2 + 2 + 4 + levels.len() * ct.yr_len + 1 + 1 + ct.mu_i + 1;
     let n_query_pub: usize = levels.len()
         + levels
             .iter()
@@ -12421,9 +12346,6 @@ fn emit_child_region(
         pub_base,
         n_query_pub,
         n_tail,
-        n_gkr_deltas: gkr_deltas.len(),
-        n_el_deltas: el_deltas.len(),
-        n_sqrt_deltas: sqrt_deltas.len(),
         sig_w,
         pt_w,
         el_zc_rho_w: el_rec
@@ -12499,55 +12421,42 @@ fn check_child_region(public: &[F128], ct: &ChildTape<'_>, r: &ChildRegion) -> u
         chals[ct.mg_c],
         "the multipoint gamma derives in-circuit"
     );
-    // Every GKR delta is zero: the top pair, each layer round's g0 identity,
-    // each layer close, and both input checks.
-    for (k, d) in public[base2 + 2..base2 + 2 + r.n_gkr_deltas].iter().enumerate() {
-        assert_eq!(*d, F128::ZERO, "gkr delta {k}");
-    }
-    // The element PIOP's own deltas and chain ends.
-    let el_base = base2 + 2 + r.n_gkr_deltas;
-    for (k, d) in public[el_base..el_base + r.n_el_deltas].iter().enumerate() {
-        assert_eq!(*d, F128::ZERO, "element piop delta {k}");
-    }
+    // The GKR round/close/input identities, the element zc round deltas,
+    // T_m == anchor.v and claim == expect are COPY CONSTRAINTS now — no
+    // publics, no checker items; the proof itself carries them.
+    let el_base = base2 + 2;
     assert_eq!(
-        public[el_base + r.n_el_deltas],
+        public[el_base],
         ct.el_run_n,
         "the element zc chain ends at the native running claim"
     );
     // THE INDEPENDENT CLOSE: the in-circuit lincheck chain ends exactly at
     // the native ElementAssertion's target.
     assert_eq!(
-        public[el_base + r.n_el_deltas + 1],
+        public[el_base + 1],
         ct.el_assert.target,
         "the element lc chain ends at the native assertion's target"
     );
-    // The multipoint intake: T_m == anchor.v as a zero-delta, and the
-    // anchor chain's endpoint against the native replay.
-    let mp_base = el_base + r.n_el_deltas + 2;
+    let mp_base = el_base + 2;
     assert_eq!(
         public[mp_base],
-        F128::ZERO,
-        "T_m + anchor.v is the multipoint zero-delta (R=2 and P>0)"
-    );
-    assert_eq!(
-        public[mp_base + 1],
         ct.anc_end_n,
         "the anchor rounds end at the native claim"
     );
     // THE LIGERITO CLOSE: the in-circuit spine reaches the native t_r.
     assert_eq!(
-        public[mp_base + 2],
+        public[mp_base + 1],
         ct.t_final_n,
         "the spine's final t_r matches the native replay"
     );
     // The merged intake: the advice target and the in-circuit running.
     assert_eq!(
-        public[mp_base + 3],
+        public[mp_base + 2],
         ct.native_target,
         "the RS target advice is the native gamma-combination"
     );
     assert_eq!(
-        public[mp_base + 4],
+        public[mp_base + 3],
         ct.native_running,
         "the W-rounds fold the target to the native running claim"
     );
@@ -12556,7 +12465,7 @@ fn check_child_region(public: &[F128], ct: &ChildTape<'_>, r: &ChildRegion) -> u
     // statement scalar, both held against published circuit outputs.
     let inner_n = check_residual_publics(
         public,
-        mp_base + 5,
+        mp_base + 4,
         &ct.levels,
         &ct.geo,
         &ct.w_resid,
@@ -12567,7 +12476,7 @@ fn check_child_region(public: &[F128], ct: &ChildTape<'_>, r: &ChildRegion) -> u
     assert_eq!(inner_n, ct.t_final_n, "inner == t_r: the mixed statement closes");
     // The sigma assertion, as the accumulator would read it: the value and
     // the mu point coordinates, matched against the native claim.
-    let sig_base = mp_base + 5 + ct.levels.len() * ct.yr_len + 1;
+    let sig_base = mp_base + 4 + ct.levels.len() * ct.yr_len + 1;
     assert_eq!(
         public[sig_base],
         ct.inner.proof.wiring.gkr.s_sigma_eval,
@@ -12591,19 +12500,8 @@ fn check_child_region(public: &[F128], ct: &ChildTape<'_>, r: &ChildRegion) -> u
             "the emitted sigma assertion discharges against the inner circuit"
         );
     }
-    // The anchor-expect tail: every sqrt-chain delta is zero and the
-    // claim == expect delta closes.
-    let axp_base = sig_base + 1 + ct.mu_i;
-    for (k5, d) in public[axp_base..axp_base + r.n_sqrt_deltas].iter().enumerate() {
-        assert_eq!(*d, F128::ZERO, "sqrt-chain delta {k5}");
-    }
     assert_eq!(
-        public[axp_base + r.n_sqrt_deltas],
-        F128::ZERO,
-        "the anchor claim == expect zero-delta (R=2 and P>0)"
-    );
-    assert_eq!(
-        public[axp_base + r.n_sqrt_deltas + 1],
+        public[sig_base + 1 + ct.mu_i],
         chals[ct.zskip_ch],
         "the published z_skip is the located squeeze"
     );
@@ -12764,7 +12662,8 @@ fn mvp10_circuit_inner_tape() {
          inner: nu {} | dense_m {} | pd claims {} (2 element + {} gathers) | P {} | mu {}\n  \
          outer: chain b3 rows {} | nu {} | dense_m {} | mu {}\n  \
          outer carries: the chain, the QUERY PHASE (61-word leaves), the\n         \
-         WIRING GKR ({} layers, {} zero-deltas), the element PIOP, the\n         \
+         WIRING GKR ({} layers, identities as copy constraints), the\n         \
+         element PIOP, the\n         \
          MULTIPOINT intake (R=2 and P={}), the SPINE (t_r bound), the\n         \
          RESIDUAL region (rotated lane-major pairing; inner == t_r closes),\n         \
          the ANCHOR EXPECT (RS + group statements, claim == expect closes),\n         \
@@ -12781,7 +12680,6 @@ fn mvp10_circuit_inner_tape() {
         union2.dense_m(),
         shape2.circuit.cells().mu(),
         inner.proof.wiring.gkr.layers.len(),
-        region.n_gkr_deltas,
         ct.n_p,
         ct.mu_i,
         bincode::serialize(&oproof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
@@ -13383,10 +13281,11 @@ struct FoldLoc {
 /// public — checker-validated against the fold's PUBLISHED ρ coordinates.
 type AlphaRec = (usize, usize, bool, usize);
 
-/// One emitted fold group's wires: the two endpoint zero-deltas and the
-/// accumulator claim (ρ_col, ρ_row, value) to publish.
+/// One emitted fold group's wires: the accumulator claim (ρ_col, ρ_row,
+/// value) to publish. The two endpoint identities are COPY CONSTRAINTS
+/// (`connect`), not published zero-deltas — the proof itself fails on a
+/// broken endpoint, and no public or checker item exists for it.
 struct FoldPub {
-    deltas: [Wire; 2],
     rho_col: Vec<Wire>,
     rho_row: Vec<Wire>,
     value: Wire,
@@ -13748,7 +13647,8 @@ fn emit_fold_region(
             let t = sb.gate(macs, &[zw, w, wv(loc.bridge_v + i)])[0];
             exp_w = sb.gate(macs, &[exp_w, lam_w[i], t])[0];
         }
-        let delta_col = sb.gate(macs, &[run_w, exp_w, ow])[0];
+        // The col endpoint: running == expect, as a copy constraint.
+        sb.connect(run_w, exp_w);
 
         let mu_w: Vec<Wire> = (0..k).map(|i| chw(loc.mu_ch0 + i)).collect();
         let mut run2_w = zw;
@@ -13789,10 +13689,11 @@ fn emit_fold_region(
         } else {
             wv(loc.out_v)
         };
+        // The row endpoint: running == weight·value, as a copy constraint
+        // (this is also what binds the LAST fold's tail-input value).
         let rhs_w = sb.gate(macs, &[zw, wmu_w, value])[0];
-        let delta_row = sb.gate(macs, &[run2_w, rhs_w, ow])[0];
+        sb.connect(run2_w, rhs_w);
         fold_pubs.push(FoldPub {
-            deltas: [delta_col, delta_row],
             rho_col: rho_col_w,
             rho_row: rho_row_w,
             value,
@@ -13816,28 +13717,26 @@ fn check_fold_publics(
     let mut p = tail0;
     let mut rebuilt: Vec<MatrixClaim> = Vec::new();
     for loc in locs {
-        assert_eq!(public[p], F128::ZERO, "col endpoint zero-delta");
-        assert_eq!(public[p + 1], F128::ZERO, "row endpoint zero-delta");
-        let rho_col = public[p + 2..p + 2 + loc.k_col].to_vec();
-        let rho_row = public[p + 2 + loc.k_col..p + 2 + loc.k_col + loc.k_row].to_vec();
-        let value = public[p + 2 + loc.k_col + loc.k_row];
+        let rho_col = public[p..p + loc.k_col].to_vec();
+        let rho_row = public[p + loc.k_col..p + loc.k_col + loc.k_row].to_vec();
+        let value = public[p + loc.k_col + loc.k_row];
         rebuilt.push(MatrixClaim {
             row: Weight::eq(rho_row),
             col: Weight::eq(rho_col),
             value,
         });
-        p += 3 + loc.k_col + loc.k_row;
+        p += 1 + loc.k_col + loc.k_row;
     }
     for &(idx, fi, row_side, h) in alpha_recs {
         let base: usize = tail0
             + locs[..fi]
                 .iter()
-                .map(|l| 3 + l.k_col + l.k_row)
+                .map(|l| 1 + l.k_col + l.k_row)
                 .sum::<usize>();
         let rho = if row_side {
-            &public[base + 2 + locs[fi].k_col..base + 2 + locs[fi].k_col + locs[fi].k_row]
+            &public[base + locs[fi].k_col..base + locs[fi].k_col + locs[fi].k_row]
         } else {
-            &public[base + 2..base + 2 + locs[fi].k_col]
+            &public[base..base + locs[fi].k_col]
         };
         let mut e = F128::ONE;
         for b in 0..3 {
@@ -14398,8 +14297,6 @@ fn mvp11_merge_fold_region() {
         // zero-deltas then the accumulator claim (ρ_col, ρ_row, value).
         let fold_pub_base = sb.public_len();
         for fp in &fold_pubs {
-            sb.publish(fp.deltas[0]);
-            sb.publish(fp.deltas[1]);
             for &w in &fp.rho_col {
                 sb.publish(w);
             }
@@ -14459,7 +14356,7 @@ fn mvp11_merge_fold_region() {
         // public against the PUBLISHED ρ coordinates, reassemble the
         // Accumulator from the public segment alone, and discharge all
         // three groups.
-        let tail_len: usize = locs.iter().map(|l| 3 + l.k_col + l.k_row).sum();
+        let tail_len: usize = locs.iter().map(|l| 1 + l.k_col + l.k_row).sum();
         let tail0 = fold_pub_base;
         let rebuilt = check_fold_publics(&built2.public, tail0, &locs, &alpha_recs);
         for (r, o) in rebuilt.iter().zip(&outs) {
@@ -14978,8 +14875,6 @@ fn mvp11_swap_children_fold_scale() {
         );
         let fold_pub_base = sb.public_len();
         for fp in &fold_pubs {
-            sb.publish(fp.deltas[0]);
-            sb.publish(fp.deltas[1]);
             for &w in &fp.rho_col {
                 sb.publish(w);
             }
@@ -14993,7 +14888,7 @@ fn mvp11_swap_children_fold_scale() {
         let built2 = shape2.run(&vals, &[]);
 
         let rebuilt = check_fold_publics(&built2.public, fold_pub_base, &locs, &alpha_recs);
-        let tail_len: usize = locs.iter().map(|l| 3 + l.k_col + l.k_row).sum();
+        let tail_len: usize = locs.iter().map(|l| 1 + l.k_col + l.k_row).sum();
         assert_eq!(
             fold_pub_base + tail_len,
             built2.public.len(),
@@ -15539,8 +15434,6 @@ fn build_node_outer(
         // the lagrange-low surface (fold 0's words).
         let fold_pub_base = sb.public_len();
         for fp in &fold_pubs {
-            sb.publish(fp.deltas[0]);
-            sb.publish(fp.deltas[1]);
             for &w in &fp.rho_col {
                 sb.publish(w);
             }
@@ -15575,7 +15468,7 @@ fn build_node_outer(
         );
         // The fold checker + the accumulator, reassembled from publics.
         let rebuilt = check_fold_publics(&built2.public, fold_pub_base, &locs, &alpha_recs);
-        let tail_len: usize = locs.iter().map(|l| 3 + l.k_col + l.k_row).sum();
+        let tail_len: usize = locs.iter().map(|l| 1 + l.k_col + l.k_row).sum();
         let acc_pub = aggregate::Accumulator {
             registry_digest: registry.digest(),
             per_type: (0..n_bool)
