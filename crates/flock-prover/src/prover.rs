@@ -703,6 +703,8 @@ fn prove_union_with_binding<Ch: Challenger>(
         && union.m_total() - union.n_log() >= pcs::LOG_PACKING;
     let (z_packed, a_packed_f128, b_packed_f128, stripes, buf_mode) =
         build_union_witness(union, sources, padding_unread);
+    // Where the witness buffers return: the dirty scratch pool for the pooled
+    // modes, the ZERO pool (via `give_back_witness_buffer`) for FreshZeroed.
     let give_back = buf_mode != flock_core::union::WitnessBufMode::FreshZeroed;
     if trace {
         eprintln!(
@@ -930,17 +932,24 @@ fn prove_union_with_binding<Ch: Challenger>(
             t_bool.elapsed().as_secs_f64() * 1e3
         );
     }
-    // a/b are consumed; recycle the buffers as in `prove_fast_core`.
+    // a/b are consumed; recycle the buffers as in `prove_fast_core`. The
+    // FreshZeroed (all-zero) ones return to the ZERO pool with their slot
+    // areas re-zeroed rather than being dropped — unmapping multi-GiB per
+    // prove is what turned late-process `alloc_zeroed` into a real memset
+    // (level-2 witgen 35 → 590 ms before this).
     if give_back {
         flock_core::scratch::give_f128(a_packed_f128);
         flock_core::scratch::give_f128(b_packed_f128);
+    } else {
+        union.give_back_witness_buffer(a_packed_f128);
+        union.give_back_witness_buffer(b_packed_f128);
     }
     // Recycle the stripes (as large as the witness itself) rather than
-    // unmapping them — the drivers take them from the same pool.
+    // unmapping them — the drivers take them from the same pool. Mode-
+    // independent: the byte pool's write-or-zero-before-read contract does
+    // not care how the witness buffers were sourced.
     for (stripe, _) in linchecks {
-        if give_back {
-            flock_core::scratch::give_u8(stripe);
-        }
+        flock_core::scratch::give_u8(stripe);
     }
 
     // ---- The element class's PIOP pair, over the element region. Runs AFTER
@@ -1036,7 +1045,11 @@ fn prove_union_with_binding<Ch: Challenger>(
         &lig_config,
         challenger,
     );
-    flock_core::scratch::give_f128(z_packed);
+    if give_back {
+        flock_core::scratch::give_f128(z_packed);
+    } else {
+        union.give_back_witness_buffer(z_packed);
+    }
     if trace {
         eprintln!(
             "  [prove_union] open (rs×{}, pd×{}): {:7.2} ms",

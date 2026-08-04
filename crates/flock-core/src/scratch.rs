@@ -149,6 +149,99 @@ pub fn give_f128(v: Vec<F128>) {
 }
 
 // ---------------------------------------------------------------------------
+// Zero pool: buffers KNOWN to be all-zero, for the padding-dominant witness
+// shapes (every node-shaped circuit prove).
+//
+// `take_witness_buffers`' FreshZeroed branch used to `alloc_zeroed` fresh
+// multi-GiB buffers per prove and never pool them. Early in a process that is
+// lazy zero pages and nearly free; once the process has churned tens of GiB,
+// `alloc_zeroed` gets recycled arena memory back from the allocator and
+// memsets the whole request for real — measured as level-2 witgen going
+// 35 → 590 ms in the SAME buffer mode. This pool keeps such buffers alive
+// and ZERO: `give_zeroed_f128` re-zeros only the ranges the caller declares
+// dirty (untouched lazy pages are never faulted), so a pooled buffer's
+// zeroness is an invariant, not a per-take memset.
+//
+// Keyed by EXACT length: the prove shapes are stable per level, and exact
+// matching sidesteps every question about zeroness beyond `len`.
+// ---------------------------------------------------------------------------
+
+static ZERO_POOL: Mutex<Vec<Vec<F128>>> = Mutex::new(Vec::new());
+
+/// Max zero-pool buffers retained. A mixed prove cycles 5 per shape (witness
+/// z/a/b + the element region pa/pb); the recursion tower runs three shapes
+/// (leaf, level-1, level-2), but only the shape being proven cycles — the cap
+/// covers two shapes' sets so a level's children and the level itself coexist.
+const MAX_POOLED_ZERO: usize = 10;
+
+/// Take a length-`n` all-zero `F128` vector: a pooled buffer of EXACTLY this
+/// length when one exists (already zero — no memset, no faults), else a fresh
+/// [`crate::alloc_zeroed_vec`] (lazy OS zero pages).
+///
+/// Return it with [`give_zeroed_f128`], declaring every range that may have
+/// been written; the pool's invariant is that stored buffers are all-zero.
+pub fn take_zeroed_f128(n: usize) -> Vec<F128> {
+    let mut pool = ZERO_POOL.lock().unwrap();
+    if let Some(i) = pool.iter().position(|v| v.len() == n) {
+        let v = pool.swap_remove(i);
+        drop(pool);
+        if std::env::var_os("FLOCK_POOL_TRACE").is_some() {
+            eprintln!("      [pool] take_zeroed n=2^{:.1} HIT", (n as f64).log2());
+        }
+        return v;
+    }
+    drop(pool);
+    if std::env::var_os("FLOCK_POOL_TRACE").is_some() {
+        eprintln!(
+            "      [pool] take_zeroed n=2^{:.1} MISS (fresh lazy-zero)",
+            (n as f64).log2()
+        );
+    }
+    crate::alloc_zeroed_vec(n)
+}
+
+/// Return an all-zero-except-`dirty` buffer to the zero pool: re-zero exactly
+/// the declared `dirty` ranges (parallel memset — resident pages only, since
+/// a range that was written is resident and one that was not needs no write),
+/// then store the buffer with its zeroness remembered.
+///
+/// The caller CERTIFIES that every write since [`take_zeroed_f128`] fell
+/// inside `dirty`; a stray write outside them would poison the pool. The two
+/// callers make this structural rather than promised: the union witness
+/// buffers only ever hand out their slot blocks (`slot_dests` carves exactly
+/// those, borrow-checked), and `copy_live_region` writes exactly the live
+/// spans its give-back re-zeros. Debug builds verify the invariant outright.
+pub fn give_zeroed_f128(mut v: Vec<F128>, dirty: &[core::ops::Range<usize>]) {
+    use rayon::prelude::*;
+    if v.capacity() == 0 {
+        return;
+    }
+    for r in dirty {
+        v[r.start..r.end]
+            .par_chunks_mut(1 << 16)
+            .for_each(|c| c.fill(F128::ZERO));
+    }
+    debug_assert!(
+        v.iter().all(|w| w.is_zero()),
+        "a zero-pool give-back held nonzero words outside its declared dirty \
+         ranges — the caller's dirty accounting is unsound"
+    );
+    let mut pool = ZERO_POOL.lock().unwrap();
+    pool.push(v);
+    if pool.len() > MAX_POOLED_ZERO {
+        // Evict the smallest buffer: large ones are the expensive ones to
+        // re-fault and re-zero (same rationale as `give_f128`).
+        let victim = pool
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, b)| b.capacity())
+            .map(|(i, _)| i)
+            .expect("pool non-empty");
+        pool.swap_remove(victim);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Byte pool, for the lincheck stripe.
 //
 // The stripe is the drivers' fourth output and is as large as the packed
@@ -313,6 +406,7 @@ fn prewarm_sets(sets: &[(usize, usize, usize)]) {
 pub fn clear() {
     POOL.lock().unwrap().clear();
     U8_POOL.lock().unwrap().clear();
+    ZERO_POOL.lock().unwrap().clear();
 }
 
 #[cfg(test)]
@@ -332,6 +426,30 @@ mod tests {
         let v2 = take_f128(512);
         assert_eq!(v2.as_ptr(), ptr);
         assert_eq!(v2.len(), 512);
+        clear();
+    }
+
+    #[test]
+    fn zero_pool_round_trips_rezeroed_buffers() {
+        clear();
+        let mut v = take_zeroed_f128(1024);
+        assert!(v.iter().all(|w| w.is_zero()), "fresh take is zero");
+        // Dirty two disjoint ranges, declare them, and take the buffer back.
+        for i in 100..200 {
+            v[i] = F128 { lo: 1, hi: 2 };
+        }
+        for i in 700..1024 {
+            v[i] = F128 { lo: 3, hi: 4 };
+        }
+        let ptr = v.as_ptr();
+        give_zeroed_f128(v, &[100..200, 700..1024]);
+        let v2 = take_zeroed_f128(1024);
+        assert_eq!(v2.as_ptr(), ptr, "exact-length key returns the buffer");
+        assert!(v2.iter().all(|w| w.is_zero()), "give-back re-zeroed it");
+        // A different length misses and allocates fresh.
+        let v3 = take_zeroed_f128(512);
+        assert!(v3.iter().all(|w| w.is_zero()));
+        assert_ne!(v3.as_ptr(), ptr);
         clear();
     }
 

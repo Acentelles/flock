@@ -652,8 +652,9 @@ impl<'r> UnionInstance<'r> {
     /// zerocheck run-lists, count-proportional lincheck, declared-only
     /// compaction, precomputed-`s_hat_v` ring switch), so padding may stay
     /// dirty — pooled resident buffers with NO zeroing at any utilization.
-    /// Otherwise: pooled + zeroed at high utilization, fresh lazy-zero when
-    /// padding dominates (capacity ≥ 2× the declared dense area).
+    /// Otherwise: pooled + zeroed at high utilization; all-zero from the
+    /// ZERO pool (or fresh lazy-zero on a pool miss) when padding dominates
+    /// (capacity ≥ 2× the declared dense area).
     pub fn take_witness_buffers(
         &self,
         padding_unread: bool,
@@ -674,9 +675,9 @@ impl<'r> UnionInstance<'r> {
         }
         if self.dense_words() * 2 <= len {
             return (
-                crate::alloc_zeroed_vec(len),
-                crate::alloc_zeroed_vec(len),
-                crate::alloc_zeroed_vec(len),
+                crate::scratch::take_zeroed_f128(len),
+                crate::scratch::take_zeroed_f128(len),
+                crate::scratch::take_zeroed_f128(len),
                 crate::union::WitnessBufMode::FreshZeroed,
             );
         }
@@ -690,6 +691,23 @@ impl<'r> UnionInstance<'r> {
         }
         let [z, a, b] = bufs;
         (z, a, b, crate::union::WitnessBufMode::PooledZeroed)
+    }
+
+    /// Return a [`WitnessBufMode::FreshZeroed`] witness buffer to the zero
+    /// pool, re-zeroing only the slot block areas. That dirty accounting is
+    /// STRUCTURAL, not promised: [`Self::slot_dests`] carves exactly the slot
+    /// blocks out of the buffer (borrow-checked slices), so no driver can
+    /// have written a gap or the trailing tail — those stay zero, and their
+    /// lazy pages stay untouched. Prebuilt sources that write whole blocks
+    /// (padding zeros included) are covered by the same ranges; tightening to
+    /// live words only is the recorded v2 (needs the prebuilt copy sources
+    /// switched to in-place first).
+    pub fn give_back_witness_buffer(&self, buf: Vec<F128>) {
+        debug_assert_eq!(buf.len(), self.packed_len(), "padded buffer length");
+        let dirty: Vec<core::ops::Range<usize>> = (0..self.registry().num_types())
+            .map(|t| self.slot_word_range(t))
+            .collect();
+        crate::scratch::give_zeroed_f128(buf, &dirty);
     }
 
     /// A fully zeroed padded union buffer from the scratch pool — resident
@@ -970,10 +988,14 @@ pub enum WitnessBufMode {
     /// Pooled buffers, gaps zeroed here, drivers zero their padding —
     /// the classic contract: every dropped word IS zero.
     PooledZeroed,
-    /// Fresh `alloc_zeroed` buffers (lazy zero pages): every word is
-    /// zero without a single write; drivers elide all zero-valued
-    /// writes. NOT returned to the pool (they would come back dirty
-    /// and crowd it with capacity-sized allocations).
+    /// All-zero buffers without a memset: the ZERO pool when a same-length
+    /// buffer is pooled ([`crate::scratch::take_zeroed_f128`]), else fresh
+    /// `alloc_zeroed` lazy zero pages. Drivers elide all zero-valued
+    /// writes. Returned via [`UnionInstance::give_back_witness_buffer`],
+    /// which re-zeros the slot block areas — NOT to the dirty scratch pool
+    /// (a fresh multi-GiB `alloc_zeroed` per prove is nearly free early in
+    /// a process but memsets recycled arena memory for real once the
+    /// process has churned; a long-running prover is exactly that shape).
     FreshZeroed,
     /// Pooled buffers, nothing zeroed: the caller guarantees every
     /// consumer is support-gated (dummy rows, gaps, and padding are
