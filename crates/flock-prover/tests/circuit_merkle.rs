@@ -8071,12 +8071,9 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         let spread_ty = BitSpreadTable::new(spread_w);
         let spread_r1cs = spread_ty.build_block_r1cs(nu);
         let spread_lc = spread_r1cs.csc_lincheck_circuit();
-        let b3_wit =
-            blake3::generate_witness_batch_major_partial(built.rows::<Blake3Gate>(slots.b3), nu);
-        let swap_wit =
-            SwapTable::generate_witness_batch_major(built.rows::<SwapGate>(slots.swap), nu);
-        let spread_wit =
-            spread_ty.generate_witness_batch_major(built.rows::<BitSpreadGate>(slots.spread), nu);
+        let b3_rows_l = built.rows::<Blake3Gate>(slots.b3).to_vec();
+        let swap_rows_l = built.rows::<SwapGate>(slots.swap).to_vec();
+        let spread_rows_l = built.rows::<BitSpreadGate>(slots.spread).to_vec();
         let els: Vec<Vec<F128>> = leaf_slot
             .iter()
             .map(|(_, sl)| match &built.witnesses[shape.registry_slot(*sl)] {
@@ -8096,15 +8093,36 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             let mut bool_slots: Vec<(usize, UnionSlotProverInput)> = vec![
                 (
                     shape.registry_slot(slots.b3),
-                    UnionSlotProverInput::new(b3_wit.clone(), b3_lc),
+                    UnionSlotProverInput::in_place(
+                        {
+                            let r = b3_rows_l.clone();
+                            move |dst| {
+                                blake3::generate_witness_batch_major_partial_into(&r, nu, dst)
+                            }
+                        },
+                        b3_lc,
+                    ),
                 ),
                 (
                     shape.registry_slot(slots.swap),
-                    UnionSlotProverInput::new(swap_wit.clone(), swap_lc),
+                    UnionSlotProverInput::in_place(
+                        {
+                            let r = swap_rows_l.clone();
+                            move |dst| SwapTable::generate_witness_batch_major_into(&r, dst)
+                        },
+                        swap_lc,
+                    ),
                 ),
                 (
                     shape.registry_slot(slots.spread),
-                    UnionSlotProverInput::new(spread_wit.clone(), spread_lc),
+                    UnionSlotProverInput::in_place(
+                        {
+                            let r = spread_rows_l.clone();
+                            let ty = BitSpreadTable::new(spread_w);
+                            move |dst| ty.generate_witness_batch_major_into(&r, dst)
+                        },
+                        spread_lc,
+                    ),
                 ),
             ];
             bool_slots.sort_by_key(|(i, _)| *i);
@@ -16168,34 +16186,35 @@ fn build_node_outer(
         let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
         let build_ms = build_ms + t_r1cs.elapsed().as_secs_f64() * 1e3;
         let t_asm = std::time::Instant::now();
+        // The copy-free assembly path: the boolean drivers pack straight
+        // into the union slot blocks inside the prove (live rows only under
+        // elide) — no intermediate capacity-sized buffers, no memcpy. The
+        // rows are hoisted to owned Vecs because the closures must be Send
+        // and `built2.rows` hands out `dyn Any`-backed borrows.
+        let b3_rows2 = built2.rows::<Blake3Gate>(cs.q.b3).to_vec();
+        let swap_rows2 = built2.rows::<SwapGate>(cs.q.swap).to_vec();
+        let spread_rows2 = built2.rows::<BitSpreadGate>(cs.q.spread).to_vec();
         let mut bslots: Vec<(usize, UnionSlotProverInput)> = vec![
             (
                 shape2.registry_slot(cs.q.b3),
-                UnionSlotProverInput::new(
-                    blake3::generate_witness_batch_major_partial(
-                        built2.rows::<Blake3Gate>(cs.q.b3),
-                        nu2,
-                    ),
+                UnionSlotProverInput::in_place(
+                    move |dst| {
+                        blake3::generate_witness_batch_major_partial_into(&b3_rows2, nu2, dst)
+                    },
                     b3_lc2,
                 ),
             ),
             (
                 shape2.registry_slot(cs.q.swap),
-                UnionSlotProverInput::new(
-                    SwapTable::generate_witness_batch_major(
-                        built2.rows::<SwapGate>(cs.q.swap),
-                        nu2,
-                    ),
+                UnionSlotProverInput::in_place(
+                    move |dst| SwapTable::generate_witness_batch_major_into(&swap_rows2, dst),
                     swap_lc2,
                 ),
             ),
             (
                 shape2.registry_slot(cs.q.spread),
-                UnionSlotProverInput::new(
-                    spread_ty2.generate_witness_batch_major(
-                        built2.rows::<BitSpreadGate>(cs.q.spread),
-                        nu2,
-                    ),
+                UnionSlotProverInput::in_place(
+                    move |dst| spread_ty2.generate_witness_batch_major_into(&spread_rows2, dst),
                     spread_lc2,
                 ),
             ),

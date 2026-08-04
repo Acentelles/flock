@@ -122,6 +122,76 @@ fn scatter_zab(
     (z, a, b, stripe)
 }
 
+/// [`scatter_zab`] writing into a union slot's destination block — the
+/// copy-free assembly path ([`flock_core::union::SlotWitnessDest`]'s
+/// contract, mirroring `common::drive_witness_batch_major_partial_into`):
+/// live rows' words are written at their BatchMajor addresses; under
+/// `elide_padding_writes` the dummy remainder is skipped (already zero, or
+/// dirty-but-unread per the mode), otherwise the whole block is zero-filled
+/// first. The stripe is pooled; only the groups the count-proportional
+/// lincheck reads are cleared under elide.
+pub(crate) fn scatter_zab_into(
+    per_row: &[[Vec<bool>; 3]],
+    k: usize,
+    useful_bits: usize,
+    dst: flock_core::union::SlotWitnessDest<'_>,
+) -> Vec<u8> {
+    use rayon::prelude::*;
+    let words_per_block = k / 128;
+    let flock_core::union::SlotWitnessDest {
+        z,
+        a,
+        b,
+        elide_padding_writes,
+    } = dst;
+    assert_eq!(z.len() % words_per_block, 0, "aligned slot block");
+    let n_total = z.len() / words_per_block;
+    assert!(per_row.len() <= n_total, "live rows fit the capacity");
+    assert!(n_total.is_multiple_of(8), "the lincheck stripe needs nu >= 3");
+    let nu = n_total.trailing_zeros() as usize;
+    if !elide_padding_writes {
+        for buf in [&mut *z, &mut *a, &mut *b] {
+            buf.par_chunks_mut(1 << 16).for_each(|c| c.fill(F128::ZERO));
+        }
+    }
+    for (i, [pz, pa, pb]) in per_row.iter().enumerate() {
+        for w in 0..words_per_block {
+            let addr = (w << nu) + i;
+            z[addr] = pack_word(pz, w * 128);
+            a[addr] = pack_word(pa, w * 128);
+            b[addr] = pack_word(pb, w * 128);
+        }
+    }
+    let mut stripe = flock_core::scratch::take_u8((n_total / 8) * k);
+    let live_groups = per_row.len().div_ceil(8);
+    let zero_groups = if elide_padding_writes {
+        live_groups
+    } else {
+        n_total / 8
+    };
+    stripe
+        .par_chunks_mut(k)
+        .take(zero_groups)
+        .for_each(|g| g.fill(0));
+    stripe[..live_groups * k]
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(g, chunk)| {
+            for r in 0..8 {
+                let row = 8 * g + r;
+                if row >= per_row.len() {
+                    continue;
+                }
+                for c in 0..useful_bits {
+                    if per_row[row][0][c] {
+                        chunk[c] |= 1u8 << r;
+                    }
+                }
+            }
+        });
+    stripe
+}
+
 // ---------------------------------------------------------------------------
 // The conditional swap
 // ---------------------------------------------------------------------------
@@ -325,6 +395,17 @@ impl SwapTable {
         let per: Vec<[Vec<bool>; 3]> = rows.par_iter().map(Self::build_witness).collect();
         scatter_zab(&per, Self::k(), Self::USEFUL_BITS, nu)
     }
+
+    /// [`Self::generate_witness_batch_major`] writing into a union slot's
+    /// destination block — the copy-free union assembly path.
+    pub fn generate_witness_batch_major_into(
+        rows: &[SwapInput],
+        dst: flock_core::union::SlotWitnessDest<'_>,
+    ) -> Vec<u8> {
+        use rayon::prelude::*;
+        let per: Vec<[Vec<bool>; 3]> = rows.par_iter().map(Self::build_witness).collect();
+        scatter_zab_into(&per, Self::k(), Self::USEFUL_BITS, dst)
+    }
 }
 
 /// One swap's inputs. `bit_word` is a whole 128-bit word because it is wired;
@@ -475,5 +556,17 @@ impl BitSpreadTable {
         use rayon::prelude::*;
         let per: Vec<[Vec<bool>; 3]> = rows.par_iter().map(|&i| self.build_witness(i)).collect();
         scatter_zab(&per, self.k(), self.useful_bits(), nu)
+    }
+
+    /// [`Self::generate_witness_batch_major`] writing into a union slot's
+    /// destination block — the copy-free union assembly path.
+    pub fn generate_witness_batch_major_into(
+        &self,
+        rows: &[u128],
+        dst: flock_core::union::SlotWitnessDest<'_>,
+    ) -> Vec<u8> {
+        use rayon::prelude::*;
+        let per: Vec<[Vec<bool>; 3]> = rows.par_iter().map(|&i| self.build_witness(i)).collect();
+        scatter_zab_into(&per, self.k(), self.useful_bits(), dst)
     }
 }
