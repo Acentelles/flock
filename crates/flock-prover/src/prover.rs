@@ -958,7 +958,19 @@ fn prove_union_with_binding<Ch: Challenger>(
     let t = std::time::Instant::now();
     let element = element_ab.map(|(pa, pb)| {
         let r = union.element_word_range();
-        flock_core::element_r1cs::union::prove(union, &z_packed[r], pa, pb, challenger)
+        let out =
+            flock_core::element_r1cs::union::prove(union, &z_packed[r], &pa, &pb, challenger);
+        // Recycle the region pair (the PIOP borrows, never writes): the live
+        // arm's buffers came from the zero pool via `copy_live_region` and
+        // return there with only their live spans dirty; the dense arm's
+        // faithful full copies go to the dirty pool.
+        if live_arm {
+            flock_core::element_r1cs::union::give_back_live_region(union, pa, pb);
+        } else {
+            flock_core::scratch::give_f128(pa);
+            flock_core::scratch::give_f128(pb);
+        }
+        out
     });
     if trace && element.is_some() {
         eprintln!(

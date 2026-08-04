@@ -152,9 +152,10 @@ impl RowSupport {
 /// Prove the zerocheck for one element table.
 ///
 /// `pa`, `pb` are `(Az + a_const)` and `(Bz + b_const)` over the whole padded
-/// domain; both are consumed (folded in place). `z` is the committed witness,
-/// cloned into a working table so the caller keeps it for Phase 2 and the
-/// opening.
+/// domain; both are recycled into the scratch pool (round 0 reads them, the
+/// first fold already writes a pooled half — see [`prove_with_support`]). `z`
+/// is the committed witness, cloned into a working table so the caller keeps
+/// it for Phase 2 and the opening.
 ///
 /// All three tables are laid out `[(y or c) << n_log | j]`, i.e. rows low, which
 /// makes the sumcheck's low-bit-first binding walk the row variables first and
@@ -182,7 +183,12 @@ pub fn prove_with_label<C: Challenger>(
     m_words: usize,
     ch: &mut C,
 ) -> (Proof, Claim) {
-    prove_with_support(label, pa, pb, z, m_words, 0, None, ch)
+    let out = prove_with_support(label, &pa, &pb, z, m_words, 0, None, ch);
+    // The borrowed originals were never written; recycle them here, as the
+    // pre-borrow fold used to when it swapped them out at round 1.
+    crate::scratch::give_f128(pa);
+    crate::scratch::give_f128(pb);
+    out
 }
 
 /// [`prove_with_label`] with the declared row support, so the row rounds cost
@@ -198,10 +204,16 @@ pub fn prove_with_label<C: Challenger>(
 ///
 /// Requires the honest-witness contract the union already imposes: `z` is
 /// identically zero on dummy rows, padding columns and gaps. Debug-asserted.
+///
+/// `pa`/`pb` are BORROWED and never written: round 0's message reads them and
+/// the first fold writes a pooled half-size buffer ([`Table`]), so the caller
+/// keeps the untouched originals — which is what lets the union prover return
+/// a [`super::union::copy_live_region`] pair to the zero pool with only its
+/// live spans declared dirty.
 pub fn prove_with_support<C: Challenger>(
     label: &[u8],
-    pa: Vec<F128>,
-    pb: Vec<F128>,
+    pa: &[F128],
+    pb: &[F128],
     z: &[F128],
     m_words: usize,
     nu: usize,
@@ -234,7 +246,7 @@ pub fn prove_with_support<C: Challenger>(
         _ => None,
     };
 
-    let (mut wa, mut wb) = (pa, pb);
+    let (mut wa, mut wb) = (Table::Borrowed(pa), Table::Borrowed(pb));
     // The working copy of the witness. On the sparse path only the live
     // prefixes are ever read, so copying the dead tail (which is most of the
     // region at low utilization) would itself be O(2^m_words) — the one pass
@@ -257,8 +269,10 @@ pub fn prove_with_support<C: Challenger>(
         let row_vars = nu.saturating_sub(i);
         let use_sparse = sparse.is_some() && row_vars > 0;
         let (g1, g_inf) = match (&sparse, use_sparse) {
-            (Some(sup), true) => round_message_sparse(&wa, &wb, &wz, &eq, row_vars, sup),
-            _ => round_message(&wa, &wb, &wz, &eq),
+            (Some(sup), true) => {
+                round_message_sparse(wa.as_slice(), wb.as_slice(), &wz, &eq, row_vars, sup)
+            }
+            _ => round_message(wa.as_slice(), wb.as_slice(), &wz, &eq),
         };
         ch.observe_f128(g1);
         ch.observe_f128(g_inf);
@@ -267,8 +281,8 @@ pub fn prove_with_support<C: Challenger>(
         r.push(rho);
         match (&mut sparse, use_sparse) {
             (Some(sup), true) => {
-                fold_low_sparse(&mut wa, rho, row_vars, &sup.live, &sup.a_dead);
-                fold_low_sparse(&mut wb, rho, row_vars, &sup.live, &sup.b_dead);
+                wa.fold_sparse(rho, row_vars, &sup.live, &sup.a_dead);
+                wb.fold_sparse(rho, row_vars, &sup.live, &sup.b_dead);
                 fold_low_sparse_zero(&mut wz, rho, row_vars, &sup.live);
                 sup.halve();
                 if row_vars == 1 {
@@ -285,23 +299,23 @@ pub fn prove_with_support<C: Challenger>(
                     let done = std::mem::take(&mut sparse).expect("checked");
                     for (c, &n) in done.live.iter().enumerate() {
                         if n == 0 {
-                            wa[c] = done.a_dead[c];
-                            wb[c] = done.b_dead[c];
+                            wa.owned_mut()[c] = done.a_dead[c];
+                            wb.owned_mut()[c] = done.b_dead[c];
                             wz[c] = F128::ZERO;
                         }
                     }
                 }
             }
             _ => {
-                fold_low(&mut wa, rho);
-                fold_low(&mut wb, rho);
+                wa.fold(rho);
+                wb.fold(rho);
                 fold_low(&mut wz, rho);
             }
         }
     }
-    debug_assert_eq!(wa.len(), 1);
+    debug_assert_eq!(wa.as_slice().len(), 1);
 
-    let (ea, eb, ec) = (wa[0], wb[0], wz[0]);
+    let (ea, eb, ec) = (wa.as_slice()[0], wb.as_slice()[0], wz[0]);
     // Bind all three final claims BEFORE the next challenge is drawn (which is
     // Phase 2's α). The α-batched reduction of `ea`/`eb` is only sound if α
     // comes after them — a prover that knew α could pick a product-preserving
@@ -311,10 +325,14 @@ pub fn prove_with_support<C: Challenger>(
     ch.observe_f128(eb);
     ch.observe_f128(ec);
 
-    // Recycle the folded tables (each still owns its full round-1 capacity).
-    for v in [wa, wb, wz] {
-        crate::scratch::give_f128(v);
+    // Recycle the folded ping-pong tables (`m_words ≥ 1`, so both are owned
+    // by now); the borrowed originals stay with the caller.
+    for t in [wa, wb] {
+        if let Table::Owned(v) = t {
+            crate::scratch::give_f128(v);
+        }
     }
+    crate::scratch::give_f128(wz);
 
     let proof = Proof { rounds, ea, eb, ec };
     let claim = Claim { r, ea, eb, ec };
@@ -557,9 +575,87 @@ fn live_pairs_total(iv: &[(usize, usize)]) -> usize {
 ///
 /// Parallel over FLAT output chunks (not columns): element blocks are narrow
 /// and tall, so a column-parallel fold collapses to `2^kappa` threads.
+/// The prover's view of one of the caller's `pa`/`pb` tables: BORROWED until
+/// the first fold, OWNED (pooled ping-pong halves) after it. Every fold reads
+/// the current view and writes a fresh pooled buffer, so the borrowed
+/// original is never written — the caller keeps it whole for reuse (the union
+/// prover returns its `copy_live_region` pair to the zero pool with only the
+/// live spans declared dirty).
+enum Table<'a> {
+    Borrowed(&'a [F128]),
+    Owned(Vec<F128>),
+}
+
+impl Table<'_> {
+    fn as_slice(&self) -> &[F128] {
+        match self {
+            Self::Borrowed(s) => s,
+            Self::Owned(v) => v,
+        }
+    }
+
+    /// The owned buffer, for the last-row-round dead-column fixups — which
+    /// always follow a fold in the same iteration, so the table is owned.
+    fn owned_mut(&mut self) -> &mut Vec<F128> {
+        match self {
+            Self::Owned(v) => v,
+            Self::Borrowed(_) => unreachable!("a fold precedes every in-place write"),
+        }
+    }
+
+    /// Swap in a folded successor, recycling the previous OWNED buffer (a
+    /// borrowed predecessor is the caller's to keep).
+    fn replace_with(&mut self, out: Vec<F128>) {
+        if let Self::Owned(old) = std::mem::replace(self, Self::Owned(out)) {
+            crate::scratch::give_f128(old);
+        }
+    }
+
+    /// [`fold_low_sparse`] on the view.
+    fn fold_sparse(&mut self, rho: F128, row_vars: usize, live: &[usize], dead: &[F128]) {
+        let out = fold_low_sparse_out(self.as_slice(), rho, row_vars, live, dead);
+        self.replace_with(out);
+    }
+
+    /// [`fold_low`] on the view. The narrow serial arm folds in place when
+    /// owned; a borrowed narrow table (a tiny dense round 0) is copied into a
+    /// pooled buffer first — half-size regions there are below the parallel
+    /// threshold, so the copy is noise.
+    fn fold(&mut self, rho: F128) {
+        match crate::fold_min_len(self.as_slice().len() / 2) {
+            Some(min_len) => {
+                let out = fold_low_out(self.as_slice(), rho, min_len);
+                self.replace_with(out);
+            }
+            None => match self {
+                Self::Owned(v) => crate::zerocheck::multilinear::fold_in_place_single(v, rho),
+                Self::Borrowed(s) => {
+                    let mut v = crate::scratch::take_f128(s.len());
+                    v.copy_from_slice(s);
+                    crate::zerocheck::multilinear::fold_in_place_single(&mut v, rho);
+                    self.replace_with(v);
+                }
+            },
+        }
+    }
+}
+
 fn fold_low_sparse(u: &mut Vec<F128>, rho: F128, row_vars: usize, live: &[usize], dead: &[F128]) {
+    let out = fold_low_sparse_out(u, rho, row_vars, live, dead);
+    let old = std::mem::replace(u, out);
+    crate::scratch::give_f128(old);
+}
+
+/// [`fold_low_sparse`]'s kernel: read `src`, return the pooled folded half.
+fn fold_low_sparse_out(
+    src: &[F128],
+    rho: F128,
+    row_vars: usize,
+    live: &[usize],
+    dead: &[F128],
+) -> Vec<F128> {
     let pairs = 1usize << (row_vars - 1);
-    let half = u.len() / 2;
+    let half = src.len() / 2;
     let iv: Vec<(usize, usize)> = live
         .iter()
         .enumerate()
@@ -568,7 +664,6 @@ fn fold_low_sparse(u: &mut Vec<F128>, rho: F128, row_vars: usize, live: &[usize]
         .collect();
     let mut out = crate::scratch::take_f128(half);
     {
-        let src: &[F128] = u;
         let total = live_pairs_total(&iv);
         // Gate on LIVE work: `par_chunks_mut` over the full output would spawn
         // a task per chunk regardless of how few pairs are live, and at low
@@ -599,8 +694,7 @@ fn fold_low_sparse(u: &mut Vec<F128>, rho: F128, row_vars: usize, live: &[usize]
             }
         }
     }
-    let old = std::mem::replace(u, out);
-    crate::scratch::give_f128(old);
+    out
 }
 
 /// [`fold_low_sparse`] for the witness table, whose dead rows are genuinely
@@ -629,27 +723,29 @@ fn dead_words_are_zero(z: &[F128], nu: usize, sup: &RowSupport) -> bool {
 /// serial kernel. Gating is the crate's [`crate::fold_min_len`], the same rule
 /// the other sub-gate folds use.
 fn fold_low(u: &mut Vec<F128>, rho: F128) {
-    let half = u.len() / 2;
-    match crate::fold_min_len(half) {
+    match crate::fold_min_len(u.len() / 2) {
         Some(min_len) => {
-            // `take_f128(half)` returns a length-`half` buffer; the map writes
-            // every slot, satisfying the write-before-read contract.
-            let mut out = crate::scratch::take_f128(half);
-            {
-                let src: &[F128] = u;
-                out.par_iter_mut()
-                    .with_min_len(min_len)
-                    .enumerate()
-                    .for_each(|(x, o)| {
-                        let a0 = src[2 * x];
-                        *o = a0 + rho * (src[2 * x + 1] + a0);
-                    });
-            }
+            let out = fold_low_out(u, rho, min_len);
             let old = std::mem::replace(u, out);
             crate::scratch::give_f128(old);
         }
         None => crate::zerocheck::multilinear::fold_in_place_single(u, rho),
     }
+}
+
+/// [`fold_low`]'s wide kernel: read `src`, return the pooled folded half.
+/// `take_f128(half)` returns a length-`half` buffer; the map writes every
+/// slot, satisfying the write-before-read contract.
+fn fold_low_out(src: &[F128], rho: F128, min_len: usize) -> Vec<F128> {
+    let mut out = crate::scratch::take_f128(src.len() / 2);
+    out.par_iter_mut()
+        .with_min_len(min_len)
+        .enumerate()
+        .for_each(|(x, o)| {
+            let a0 = src[2 * x];
+            *o = a0 + rho * (src[2 * x + 1] + a0);
+        });
+    out
 }
 
 #[cfg(test)]

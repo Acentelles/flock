@@ -191,13 +191,15 @@ pub enum VerifyError {
 /// `z`, `pa`, `pb` are the element REGION's slices of the padded union
 /// buffers: the committed element words, `A_0·z + a_const`, and
 /// `B_0·z + b_const`, each `2^E` words, with gaps and dummy rows honestly
-/// zero. `pa`/`pb` are consumed (the zerocheck folds them in place); `z` stays
-/// borrowed for the lincheck and the opening.
+/// zero. All three stay borrowed and unwritten — the zerocheck ping-pongs
+/// pooled scratch halves instead of folding `pa`/`pb` in place, so a caller
+/// that built them with [`copy_live_region`] can hand them back to the zero
+/// pool afterwards ([`give_back_live_region`]).
 pub fn prove<C: Challenger>(
     union: &UnionInstance<'_>,
     z: &[F128],
-    pa: Vec<F128>,
-    pb: Vec<F128>,
+    pa: &[F128],
+    pb: &[F128],
     ch: &mut C,
 ) -> (Proof, Claims) {
     let slots = region_slots(union);
@@ -658,22 +660,46 @@ pub fn copy_live_region(
     a_region: &[F128],
     b_region: &[F128],
 ) -> (Vec<F128>, Vec<F128>) {
-    let (nu, e_vars) = (union.n_log(), union.m_elem() - 7);
-    let words = 1usize << e_vars;
+    let words = 1usize << (union.m_elem() - 7);
     assert_eq!(a_region.len(), words, "element region a length");
     assert_eq!(b_region.len(), words, "element region b length");
-    let mut pa = crate::alloc_zeroed_vec::<F128>(words);
-    let mut pb = crate::alloc_zeroed_vec::<F128>(words);
+    // Zero-pool buffers: all-zero without a memset, and — since [`prove`]
+    // never writes its inputs — returnable via [`give_back_live_region`]
+    // with exactly the spans below declared dirty.
+    let mut pa = crate::scratch::take_zeroed_f128(words);
+    let mut pb = crate::scratch::take_zeroed_f128(words);
+    for span in live_spans(union) {
+        pa[span.clone()].copy_from_slice(&a_region[span.clone()]);
+        pb[span.clone()].copy_from_slice(&b_region[span]);
+    }
+    (pa, pb)
+}
+
+/// The element region's live word spans — per slot, per used column, rows
+/// `[0, n_t)`: exactly what [`copy_live_region`] writes, and therefore the
+/// dirty ranges its give-back must re-zero.
+fn live_spans(union: &UnionInstance<'_>) -> Vec<core::ops::Range<usize>> {
+    let nu = union.n_log();
+    let mut spans = Vec::new();
     for s in region_slots(union) {
         let off = s.layout.column_offset(nu);
         let n_t = s.layout.n_t;
         for y in 0..s.ty.k() {
             let base = (off + y) << nu;
-            pa[base..base + n_t].copy_from_slice(&a_region[base..base + n_t]);
-            pb[base..base + n_t].copy_from_slice(&b_region[base..base + n_t]);
+            spans.push(base..base + n_t);
         }
     }
-    (pa, pb)
+    spans
+}
+
+/// Return a [`copy_live_region`] pair to the zero pool, re-zeroing exactly
+/// the live spans that function wrote. Only valid for buffers it produced
+/// (zero outside the spans) that [`prove`] borrowed — anything else would
+/// poison the pool's all-zero invariant (debug builds verify it outright).
+pub fn give_back_live_region(union: &UnionInstance<'_>, pa: Vec<F128>, pb: Vec<F128>) {
+    let spans = live_spans(union);
+    crate::scratch::give_zeroed_f128(pa, &spans);
+    crate::scratch::give_zeroed_f128(pb, &spans);
 }
 
 #[cfg(test)]
@@ -1032,7 +1058,7 @@ mod tests {
             let pa = region(&union, &h.pa).to_vec();
             let pb = region(&union, &h.pb).to_vec();
             let mut ch_p = FsChallenger::new(b"element-report-rt");
-            let (proof, _) = prove(&union, &z_region, pa, pb, &mut ch_p);
+            let (proof, _) = prove(&union, &z_region, &pa, &pb, &mut ch_p);
 
             let mut ch_v = FsChallenger::new(b"element-report-rt");
             let (_, assertion) =
@@ -1111,7 +1137,7 @@ mod tests {
             let pb = region(&union, &h.pb).to_vec();
 
             let mut ch_p = FsChallenger::new(b"element-region-rt");
-            let (proof, claims_p) = prove(&union, &z_region, pa, pb, &mut ch_p);
+            let (proof, claims_p) = prove(&union, &z_region, &pa, &pb, &mut ch_p);
             let mut ch_v = FsChallenger::new(b"element-region-rt");
             let claims_v = verify(&union, &proof, &mut ch_v)
                 .unwrap_or_else(|e| panic!("verify rejected counts {counts_elem:?}: {e:?}"));
@@ -1168,7 +1194,7 @@ mod tests {
             let pa = region(&union, &h.pa).to_vec();
             let pb = region(&union, &h.pb).to_vec();
             let mut ch_p = FsChallenger::new(b"element-region-bad");
-            let (proof, _) = prove(&union, &z_region, pa, pb, &mut ch_p);
+            let (proof, _) = prove(&union, &z_region, &pa, &pb, &mut ch_p);
             let mut ch_v = FsChallenger::new(b"element-region-bad");
             assert_eq!(
                 verify(&union, &proof, &mut ch_v),
@@ -1221,7 +1247,7 @@ mod tests {
             let pa = region(&union, &h.pa).to_vec();
             let pb = region(&union, &h.pb).to_vec();
             let mut ch_p = FsChallenger::new(b"element-region-pad");
-            let (proof, _) = prove(&union, &z_region, pa, pb, &mut ch_p);
+            let (proof, _) = prove(&union, &z_region, &pa, &pb, &mut ch_p);
             let mut ch_v = FsChallenger::new(b"element-region-pad");
             let rejected = verify(&union, &proof, &mut ch_v).is_err();
             assert_eq!(
@@ -1247,8 +1273,8 @@ mod tests {
         let (proof, _) = prove(
             &union,
             &z_region,
-            region(&union, &h.pa).to_vec(),
-            region(&union, &h.pb).to_vec(),
+            region(&union, &h.pa),
+            region(&union, &h.pb),
             &mut ch_p,
         );
         let mut ch = FsChallenger::new(b"element-region-mut");
@@ -1324,8 +1350,8 @@ mod tests {
         let (proof, _) = prove(
             &union,
             region(&union, &h.z),
-            region(&union, &h.pa).to_vec(),
-            region(&union, &h.pb).to_vec(),
+            region(&union, &h.pa),
+            region(&union, &h.pb),
             &mut ch_p,
         );
         // A registry with a WIDER element block has a bigger region, hence a
@@ -1381,8 +1407,8 @@ mod tests {
                 let t = Instant::now();
                 let (dense, dclaim) = zerocheck::prove_with_support(
                     zerocheck::LABEL,
-                    pa.clone(),
-                    pb.clone(),
+                    &pa,
+                    &pb,
                     &z,
                     e_vars,
                     nu,
@@ -1395,8 +1421,8 @@ mod tests {
                 let t = Instant::now();
                 let (sparse, sclaim) = zerocheck::prove_with_support(
                     zerocheck::LABEL,
-                    pa.clone(),
-                    pb.clone(),
+                    &pa,
+                    &pb,
                     &z,
                     e_vars,
                     nu,

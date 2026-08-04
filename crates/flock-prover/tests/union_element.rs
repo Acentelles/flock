@@ -1373,9 +1373,7 @@ fn mixed_class_cost_probe() {
                 );
                 let mut ch = FsChallenger::new(DOMAIN);
                 let t = Instant::now();
-                let _ = flock_core::element_r1cs::union::prove(
-                    &u_mixed, &zr, ar.clone(), brr.clone(), &mut ch,
-                );
+                let _ = flock_core::element_r1cs::union::prove(&u_mixed, &zr, &ar, &brr, &mut ch);
                 let ms_p = t.elapsed().as_secs_f64() * 1e3;
 
                 if rep > 0 {
