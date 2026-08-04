@@ -478,6 +478,18 @@ impl ShapeBuilder {
         let n_wires = self.wires.len();
         let root_of: Vec<usize> = (0..n_wires).map(|i| self.find(Wire(i))).collect();
         let input_roots: Vec<usize> = self.inputs.iter().map(|&w| root_of[w.0]).collect();
+        // Pre-resolve every step's wires to class roots: the online phase
+        // runs ~10^5 gate calls per proof, and the per-access root_of
+        // indirection was a measurable slice of its time.
+        let mut steps = self.steps;
+        for st in &mut steps {
+            for w in &mut st.inputs {
+                *w = root_of[*w];
+            }
+            for w in &mut st.outputs {
+                *w = root_of[*w];
+            }
+        }
 
         // A class of one cell needs no copy constraint.
         let mut wires: Vec<Vec<Cell>> = self
@@ -507,9 +519,8 @@ impl ShapeBuilder {
             registry_slot,
             slots: self.slots,
             slot_types: self.slot_types,
-            steps: self.steps,
+            steps,
             n_wires,
-            root_of,
             inputs: input_roots,
             publics: pubs,
             n_hints: self.n_hints,
@@ -549,7 +560,6 @@ pub struct CircuitShape {
     slot_types: Vec<TypeId>,
     steps: Vec<Step>,
     n_wires: usize,
-    root_of: Vec<usize>,
     /// Class root per declared input, in declaration order.
     inputs: Vec<usize>,
     /// Class root per published cell, in publication order.
@@ -620,20 +630,20 @@ impl CircuitShape {
         let mut rows: Vec<Box<dyn Any>> = self.slots.iter().map(|s| s.new_rows()).collect();
         let unit = ();
         let mut next_hint = 0usize;
+        // One scratch buffer for every step's input values — a fresh Vec per
+        // gate call was a measurable slice of the online phase. Step wires
+        // are pre-resolved to class roots by `finish`.
+        let mut vals: Vec<F128> = Vec::with_capacity(16);
         for step in &self.steps {
-            let vals: Vec<F128> = step
-                .inputs
-                .iter()
-                .map(|&w| {
-                    let r = self.root_of[w];
-                    assert!(
-                        set[r],
-                        "gate input has no value yet: a gate was instantiated before \
-                         the gate producing one of its inputs"
-                    );
-                    values[r]
-                })
-                .collect();
+            vals.clear();
+            for &r in &step.inputs {
+                assert!(
+                    set[r],
+                    "gate input has no value yet: a gate was instantiated before \
+                     the gate producing one of its inputs"
+                );
+                vals.push(values[r]);
+            }
             let hint: &dyn Any = if step.hinted {
                 let h = hints[next_hint];
                 next_hint += 1;
@@ -642,8 +652,7 @@ impl CircuitShape {
                 &unit
             };
             let outs = self.slots[step.slot].push(rows[step.slot].as_mut(), &vals, hint);
-            for (&w, v) in step.outputs.iter().zip(outs) {
-                let r = self.root_of[w];
+            for (&r, v) in step.outputs.iter().zip(outs) {
                 if set[r] {
                     assert_eq!(
                         values[r], v,

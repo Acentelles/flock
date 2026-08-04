@@ -202,7 +202,9 @@ pub(crate) fn fold_sqrt_rule() -> bool {
 /// the OS for large allocations, so untouched regions cost nothing.
 /// (`vec![T::ZERO; n]` does NOT get this for custom structs: the zero-value
 /// specialization only fires for built-in types, so it eagerly memsets.)
-pub(crate) fn alloc_zeroed_vec<T: Copy>(n: usize) -> Vec<T> {
+/// `pub`: capacity-sized, mostly-dead buffers (a circuit's element slot
+/// witnesses at 2^nu rows for a few hundred live) want the lazy pages too.
+pub fn alloc_zeroed_vec<T: Copy>(n: usize) -> Vec<T> {
     if n == 0 {
         return Vec::new();
     }

@@ -930,7 +930,7 @@ impl GateType for LeafEvalGate {
     }
 
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = vec![F128::ZERO; self.ty.width() << nu];
+        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
         for (j, row) in rows.iter().enumerate() {
             for (c, &v) in row.iter().enumerate() {
                 z[(c << nu) + j] = v;
@@ -2434,7 +2434,7 @@ impl GateType for SpineGate {
     }
 
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = vec![F128::ZERO; self.ty.width() << nu];
+        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
         for (j, row) in rows.iter().enumerate() {
             for (col, &v) in row.iter().enumerate() {
                 z[(col << nu) + j] = v;
@@ -2674,7 +2674,7 @@ impl GateType for ResidualGate {
     }
 
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = vec![F128::ZERO; self.ty.width() << nu];
+        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
         for (j, row) in rows.iter().enumerate() {
             for (col, &v) in row.iter().enumerate() {
                 z[(col << nu) + j] = v;
@@ -2805,7 +2805,7 @@ impl GateType for PrefixGate {
         (vec![pr], z)
     }
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = vec![F128::ZERO; self.ty.width() << nu];
+        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
         for (j, row) in rows.iter().enumerate() {
             for (col, &v) in row.iter().enumerate() {
                 z[(col << nu) + j] = v;
@@ -2861,7 +2861,7 @@ impl GateType for MergedRoundGate {
         (vec![z[7]], z)
     }
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = vec![F128::ZERO; self.ty.width() << nu];
+        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
         for (j, row) in rows.iter().enumerate() {
             for (col, &v) in row.iter().enumerate() {
                 z[(col << nu) + j] = v;
@@ -2912,7 +2912,7 @@ impl GateType for MacGate {
         (vec![z[4]], z)
     }
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = vec![F128::ZERO; self.ty.width() << nu];
+        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
         for (j, row) in rows.iter().enumerate() {
             for (col, &v) in row.iter().enumerate() {
                 z[(col << nu) + j] = v;
@@ -3023,7 +3023,7 @@ impl GateType for AssistLayerGate {
         (z[AL_OUT0..AL_OUT0 + 4].to_vec(), z)
     }
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = vec![F128::ZERO; self.ty.width() << nu];
+        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
         for (j, row) in rows.iter().enumerate() {
             for (col, &v) in row.iter().enumerate() {
                 z[(col << nu) + j] = v;
@@ -3090,7 +3090,7 @@ impl GateType for ZcRoundGate {
         (vec![z[9], z[14]], z)
     }
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = vec![F128::ZERO; self.ty.width() << nu];
+        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
         for (j, row) in rows.iter().enumerate() {
             for (col, &v) in row.iter().enumerate() {
                 z[(col << nu) + j] = v;
@@ -3161,7 +3161,7 @@ impl GateType for SkipNodeGate {
         (vec![z[7], z[10], z[13]], z)
     }
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = vec![F128::ZERO; self.ty.width() << nu];
+        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
         for (j, row) in rows.iter().enumerate() {
             for (col, &v) in row.iter().enumerate() {
                 z[(col << nu) + j] = v;
@@ -3287,7 +3287,7 @@ impl GateType for SkipCloseGate {
         (vec![z[10], z[11]], z)
     }
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = vec![F128::ZERO; self.ty.width() << nu];
+        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
         for (j, row) in rows.iter().enumerate() {
             for (col, &v) in row.iter().enumerate() {
                 z[(col << nu) + j] = v;
@@ -3379,7 +3379,7 @@ impl GateType for ZcJoinGate {
         (vec![z[8], z[13], z[14]], z)
     }
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = vec![F128::ZERO; self.ty.width() << nu];
+        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
         for (j, row) in rows.iter().enumerate() {
             for (col, &v) in row.iter().enumerate() {
                 z[(col << nu) + j] = v;
@@ -10422,7 +10422,7 @@ fn mvp10_leaf_outer_inner_tape() {
     );
     let hint_refs: Vec<&dyn std::any::Any> =
         hints.iter().map(|h| h as &dyn std::any::Any).collect();
-    let built2 = shape2.run(&vals, &hint_refs);
+    let mut built2 = shape2.run(&vals, &hint_refs);
     let consumed = check_real_child_region(&built2.public, &rt, &region);
     assert_eq!(
         region.pub_base + consumed,
@@ -10481,8 +10481,11 @@ fn mvp10_leaf_outer_inner_tape() {
         .element_slot_ids()
         .into_iter()
         .map(|sl| {
-            let z = match &built2.witnesses[shape2.registry_slot(sl)] {
-                SlotWitness::Element(z) => z.clone(),
+            let z = match std::mem::replace(
+                &mut built2.witnesses[shape2.registry_slot(sl)],
+                SlotWitness::DeferredToRows,
+            ) {
+                SlotWitness::Element(z) => z,
                 other => panic!("element slot produced {other:?}"),
             };
             (shape2.registry_slot(sl), z)
@@ -13034,7 +13037,7 @@ fn mvp10_circuit_inner_tape() {
     let shape2 = sb.finish().expect("the mvp10 chain circuit builds");
     let hint_refs: Vec<&dyn std::any::Any> =
         hints.iter().map(|h| h as &dyn std::any::Any).collect();
-    let built2 = shape2.run(&vals, &hint_refs);
+    let mut built2 = shape2.run(&vals, &hint_refs);
     let consumed = check_child_region(&built2.public, &ct, &region);
     assert_eq!(
         region.pub_base + consumed,
@@ -13063,8 +13066,11 @@ fn mvp10_circuit_inner_tape() {
         .element_slot_ids()
         .into_iter()
         .map(|sl| {
-            let z = match &built2.witnesses[shape2.registry_slot(sl)] {
-                SlotWitness::Element(z) => z.clone(),
+            let z = match std::mem::replace(
+                &mut built2.witnesses[shape2.registry_slot(sl)],
+                SlotWitness::DeferredToRows,
+            ) {
+                SlotWitness::Element(z) => z,
                 other => panic!("gkr slot produced {other:?}"),
             };
             (shape2.registry_slot(sl), z)
@@ -13617,7 +13623,7 @@ fn mvp11_sigma_fold_tape() {
         sb.publish(val_w);
 
         let shape2 = sb.finish().expect("the mvp11 fold circuit builds");
-        let built2 = shape2.run(&vals, &[]);
+        let mut built2 = shape2.run(&vals, &[]);
 
         // The checker: both endpoint deltas are zero, and the accumulator
         // rebuilt from the PUBLIC SEGMENT ALONE is the native fold output
@@ -13659,8 +13665,11 @@ fn mvp11_sigma_fold_tape() {
         let mut el_ord: Vec<(usize, Vec<F128>)> = [macs, mrs, pfslot]
             .into_iter()
             .map(|sl| {
-                let z = match &built2.witnesses[shape2.registry_slot(sl)] {
-                    SlotWitness::Element(z) => z.clone(),
+                let z = match std::mem::replace(
+                    &mut built2.witnesses[shape2.registry_slot(sl)],
+                    SlotWitness::DeferredToRows,
+                ) {
+                    SlotWitness::Element(z) => z,
                     other => panic!("element slot produced {other:?}"),
                 };
                 (shape2.registry_slot(sl), z)
@@ -14860,7 +14869,7 @@ fn mvp11_merge_fold_region() {
         let shape2 = sb.finish().expect("the mvp11 merge circuit builds");
         let hint_refs: Vec<&dyn std::any::Any> =
             hints.iter().map(|h| h as &dyn std::any::Any).collect();
-        let built2 = shape2.run(&vals, &hint_refs);
+        let mut built2 = shape2.run(&vals, &hint_refs);
 
         // The two child regions' checker walks — the SAME helper mvp10 runs,
         // so each child's whole deferred-verifier statement (query phase,
@@ -15001,8 +15010,11 @@ fn mvp11_merge_fold_region() {
             .element_slot_ids()
             .into_iter()
             .map(|sl| {
-                let z = match &built2.witnesses[shape2.registry_slot(sl)] {
-                    SlotWitness::Element(z) => z.clone(),
+                let z = match std::mem::replace(
+                    &mut built2.witnesses[shape2.registry_slot(sl)],
+                    SlotWitness::DeferredToRows,
+                ) {
+                    SlotWitness::Element(z) => z,
                     other => panic!("element slot produced {other:?}"),
                 };
                 (shape2.registry_slot(sl), z)
@@ -15407,7 +15419,7 @@ fn mvp11_swap_children_fold_scale() {
         }
 
         let shape2 = sb.finish().expect("the scale fold circuit builds");
-        let built2 = shape2.run(&vals, &[]);
+        let mut built2 = shape2.run(&vals, &[]);
 
         let rebuilt = check_fold_publics(&built2.public, fold_pub_base, &locs, &alpha_recs);
         let tail_len: usize = locs.iter().map(|l| 1 + l.k_col + l.k_row).sum();
@@ -15457,8 +15469,11 @@ fn mvp11_swap_children_fold_scale() {
         let mut el_ord: Vec<(usize, Vec<F128>)> = [macs, mrs, pfslot, leslot]
             .into_iter()
             .map(|sl| {
-                let z = match &built2.witnesses[shape2.registry_slot(sl)] {
-                    SlotWitness::Element(z) => z.clone(),
+                let z = match std::mem::replace(
+                    &mut built2.witnesses[shape2.registry_slot(sl)],
+                    SlotWitness::DeferredToRows,
+                ) {
+                    SlotWitness::Element(z) => z,
                     other => panic!("element slot produced {other:?}"),
                 };
                 (shape2.registry_slot(sl), z)
@@ -16067,7 +16082,7 @@ fn build_node_outer(
             hints.iter().map(|h| h as &dyn std::any::Any).collect();
         let build_ms = build_ms + t_build2.elapsed().as_secs_f64() * 1e3;
         let t_trace = std::time::Instant::now();
-        let built2 = shape2.run(&vals, &hint_refs);
+        let mut built2 = shape2.run(&vals, &hint_refs);
         let trace_ms = t_trace.elapsed().as_secs_f64() * 1e3;
 
         // The two child regions' checker walks — each child's whole
@@ -16143,6 +16158,7 @@ fn build_node_outer(
             // gotchas, third occurrence).
             merkle_hash: HashKind::Blake3,
         };
+        let t_r1cs = std::time::Instant::now();
         let b3_r1cs2 = blake3::build_block_r1cs(nu2);
         let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
         let swap_r1cs2 = SwapTable::build_block_r1cs(nu2);
@@ -16150,6 +16166,8 @@ fn build_node_outer(
         let spread_ty2 = BitSpreadTable::new(rt0.spread_w.max(rt1.spread_w));
         let spread_r1cs2 = spread_ty2.build_block_r1cs(nu2);
         let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
+        let build_ms = build_ms + t_r1cs.elapsed().as_secs_f64() * 1e3;
+        let t_asm = std::time::Instant::now();
         let mut bslots: Vec<(usize, UnionSlotProverInput)> = vec![
             (
                 shape2.registry_slot(cs.q.b3),
@@ -16187,8 +16205,11 @@ fn build_node_outer(
             .element_slot_ids()
             .into_iter()
             .map(|sl| {
-                let z = match &built2.witnesses[shape2.registry_slot(sl)] {
-                    SlotWitness::Element(z) => z.clone(),
+                let z = match std::mem::replace(
+                    &mut built2.witnesses[shape2.registry_slot(sl)],
+                    SlotWitness::DeferredToRows,
+                ) {
+                    SlotWitness::Element(z) => z,
                     other => panic!("element slot produced {other:?}"),
                 };
                 (shape2.registry_slot(sl), z)
@@ -16207,6 +16228,7 @@ fn build_node_outer(
         lco.sort_by_key(|(i, _)| *i);
         let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
             lco.into_iter().map(|(_, c)| c).collect();
+        let asm_ms = t_asm.elapsed().as_secs_f64() * 1e3;
         let t0p = std::time::Instant::now();
         let mut ch2 = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
         let (oproof, ocommit, _) = prover::prove_fast_ligerito_union_circuit(
@@ -16261,8 +16283,8 @@ fn build_node_outer(
              lagrange lows DERIVED in-circuit from each child's z_skip wire\n  \
              outer: total b3 rows {} | nu {} | dense_m {} | mu {} \
              (cell slots: {} gate + {} public)\n  \
-             PER PROOF: tapes {:.0} + trace {:.0} + prove {:.0} = {:.0} ms \
-             | verify {:.0} ms (DEFERRED {:.0} ms) | proof {:.1} KiB\n  \
+             PER PROOF: tapes {:.0} + trace {:.0} + witness asm {:.0} + prove {:.0} \
+             = {:.0} ms | verify {:.0} ms (DEFERRED {:.0} ms) | proof {:.1} KiB\n  \
              circuit build (per SHAPE, cacheable): {:.0} ms\n",
             n_folds,
             lo0.pcs.m,
@@ -16275,8 +16297,9 @@ fn build_node_outer(
             shape2.circuit.cells().num_public_slots(),
             tapes_ms,
             trace_ms,
+            asm_ms,
             prove_ms,
-            tapes_ms + trace_ms + prove_ms,
+            tapes_ms + trace_ms + asm_ms + prove_ms,
             verify_ms,
             deferred_ms,
             bincode::serialize(&oproof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
