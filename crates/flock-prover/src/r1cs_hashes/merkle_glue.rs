@@ -78,9 +78,7 @@ fn pack_word(bits: &[bool], base: usize) -> F128 {
 /// buffers plus the lincheck stripe. Same contract as
 /// `MerkleTreeLayout::scatter_zab_batch_major`; duplicated rather than shared
 /// because that one is a private method keyed to its own `k`.
-/// `pub(crate)`: the family-H [`super::family_h::TransposeTable`] scatters
-/// through the same contract.
-pub(crate) fn scatter_zab(
+fn scatter_zab(
     per_row: &[[Vec<bool>; 3]],
     k: usize,
     useful_bits: usize,
