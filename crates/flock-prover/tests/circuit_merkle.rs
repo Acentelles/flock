@@ -13109,13 +13109,375 @@ fn mvp11_merge_fold_region() {
     assert_eq!(outs[4], *sig_claim, "sigma accumulator");
     assert_eq!(*sig_digest, built0.shape.circuit.digest(), "sigma key");
 
+    // ---- the in-circuit replay of the WHOLE fold region ----
+    // One b3 slot replays bind + all five folds; every λ/μ/ρ is a chain
+    // squeeze wire and every message/claim coordinate an absorbed stream
+    // word. The rounds ride MergedRoundGate, the eq-point parts of the
+    // weight evals ride PrefixGate, and the boolean claims' LENGTH-64 LOWS
+    // fold through 8 chained LeafEvalGate(8) rows each — the group-
+    // expansion factors eq(ρ[3..6], h) enter as boundary publics, checker-
+    // validated against the PUBLISHED ρ coordinates (the alpha-expansion
+    // trust class, mvp7's query-phase precedent). Ten endpoint zero-deltas
+    // publish, and the five accumulator claims publish as the merge node's
+    // statement — rebuilt from the public segment alone and discharged.
+    let outer_stats = {
+        use flock_prover::prover::UnionElementSlotInput;
+        use flock_prover::r1cs_hashes::fs_chain::FsChain;
+
+        let stream = t_shape.stream_words(M11_MERGE_DOMAIN);
+        let bytes = stream.to_bytes(rec.values(), rec.payloads());
+        let mut chain = FsChain::new();
+        let mut at = 0usize;
+        let fin_ops: Vec<_> = t_shape.ops().iter().filter(|o| o.finalizes()).collect();
+        assert_eq!(
+            stream.finalize_after.len(),
+            fin_ops.len(),
+            "finalize alignment"
+        );
+        assert_eq!(fin_ops.len(), chals.len(), "every finalizer is a scalar squeeze");
+        for (k, &upto) in stream.finalize_after.iter().enumerate() {
+            chain.absorb(&bytes[at * 16..upto * 16]);
+            at = upto;
+            chain.finalize(fin_ops[k].squeezed_bytes());
+        }
+        chain.absorb(&bytes[at * 16..]);
+        let trace = chain.finish();
+
+        let b3_rows = trace.rows.len();
+        let nu2 = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7);
+        let mut sb = ShapeBuilder::new(nu2);
+        let b3s = sb.slot(Blake3Gate { nu: nu2 });
+        let macs = sb.slot(MacGate::new());
+        let mrs = sb.slot(MergedRoundGate::new());
+        let pf_w = 8usize;
+        let pfslot = sb.slot(PrefixGate::new(pf_w));
+        let leslot = sb.slot(LeafEvalGate::new(8));
+
+        let mut vals: Vec<F128> = Vec::new();
+        let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+        vals.extend_from_slice(&iv_w);
+        let iv2 = [sb.public_input(), sb.public_input()];
+        let (chain_outs, ww) = emit_fs_chain(&mut sb, b3s, iv2, &trace, &stream, &bytes, &mut vals);
+        let mut vmap: Vec<Option<usize>> = Vec::new();
+        for (wi, w) in stream.words.iter().enumerate() {
+            if let flock_core::transcript_record::StreamWord::Value(vi) = *w {
+                if vmap.len() <= vi {
+                    vmap.resize(vi + 1, None);
+                }
+                vmap[vi] = Some(wi);
+            }
+        }
+        let wv = |vi: usize| -> Wire { ww[vmap[vi].expect("stream word")].expect("wired") };
+        let chw = |fin: usize| -> Wire { chain_outs[trace.squeezes[fin][0]][0] };
+        vals.push(F128::ZERO);
+        let zw = sb.public_input();
+        vals.push(F128::ONE);
+        let ow = sb.public_input();
+
+        // seed · Π (1 + a_j + b_j) through the prefix slot, padded (zw, zw).
+        let prefix = |sb: &mut ShapeBuilder, seed: Wire, fs: &[(Wire, Wire)]| -> Wire {
+            let mut s = seed;
+            for chunk in fs.chunks(pf_w) {
+                let mut g_in = vec![s];
+                for (a, _) in chunk {
+                    g_in.push(*a);
+                }
+                g_in.extend(std::iter::repeat_n(zw, pf_w - chunk.len()));
+                for (_, b) in chunk {
+                    g_in.push(*b);
+                }
+                g_in.extend(std::iter::repeat_n(zw, pf_w - chunk.len()));
+                g_in.push(ow);
+                s = sb.gate(pfslot, &g_in)[0];
+            }
+            s
+        };
+        // One weight eval at ρ: the low factor's MLE (seeded by the single
+        // absorbed low word for eq weights, or folded through 8 LeafEval
+        // rows for the 64-entry lows), times the eq-point prefix product
+        // over the remaining coordinates.
+        let mut alpha_recs: Vec<(usize, usize, bool, usize)> = Vec::new();
+        let emit_weight = |sb: &mut ShapeBuilder,
+                               vals: &mut Vec<F128>,
+                               recs: &mut Vec<(usize, usize, bool, usize)>,
+                               fi: usize,
+                               row_side: bool,
+                               low_v: usize,
+                               low_n: usize,
+                               pt_v: usize,
+                               pt_n: usize,
+                               rho_w: &[Wire],
+                               rho_vals: &[F128]|
+         -> Wire {
+            let s = low_n.trailing_zeros() as usize;
+            let seed = if low_n == 1 {
+                wv(low_v)
+            } else {
+                assert_eq!(low_n, 64, "the lincheck low width");
+                let mut acc = zw;
+                for h in 0..8 {
+                    let mut a = F128::ONE;
+                    for b in 0..3 {
+                        let r = rho_vals[3 + b];
+                        a *= if (h >> b) & 1 == 1 { r } else { F128::ONE + r };
+                    }
+                    vals.push(a);
+                    let a_w = sb.public_input();
+                    recs.push((vals.len() - 1, fi, row_side, h));
+                    let mut g_in: Vec<Wire> = (0..8).map(|j| wv(low_v + 8 * h + j)).collect();
+                    g_in.extend([rho_w[0], rho_w[1], rho_w[2]]);
+                    g_in.push(a_w);
+                    g_in.push(acc);
+                    acc = sb.gate(leslot, &g_in)[0];
+                }
+                acc
+            };
+            let fs: Vec<(Wire, Wire)> = (0..pt_n).map(|j| (wv(pt_v + j), rho_w[s + j])).collect();
+            prefix(sb, seed, &fs)
+        };
+
+        struct FoldPub {
+            deltas: [Wire; 2],
+            rho_col: Vec<Wire>,
+            rho_row: Vec<Wire>,
+            value: Wire,
+        }
+        let mut fold_pubs: Vec<FoldPub> = Vec::new();
+        for (fi, loc) in locs.iter().enumerate() {
+            let k = loc.claims.len();
+            let lam_w: Vec<Wire> = (0..k).map(|i| chw(loc.lam_ch0 + i)).collect();
+            let mut run_w = zw;
+            for (i, cl) in loc.claims.iter().enumerate() {
+                run_w = sb.gate(macs, &[run_w, lam_w[i], wv(cl.value_v)])[0];
+            }
+            let mut rho_col_w: Vec<Wire> = Vec::with_capacity(loc.k_col);
+            for j in 0..loc.k_col {
+                let r_w = chw(loc.col_ch0 + j);
+                rho_col_w.push(r_w);
+                run_w =
+                    sb.gate(mrs, &[run_w, wv(loc.col_v + 2 * j), wv(loc.col_v + 2 * j + 1), r_w])[0];
+            }
+            let rho_col_vals: Vec<F128> =
+                (0..loc.k_col).map(|j| chals[loc.col_ch0 + j]).collect();
+            let mut exp_w = zw;
+            for (i, cl) in loc.claims.iter().enumerate() {
+                let w = emit_weight(
+                    &mut sb,
+                    &mut vals,
+                    &mut alpha_recs,
+                    fi,
+                    false,
+                    cl.col_low_v,
+                    cl.col_low_n,
+                    cl.col_pt_v,
+                    cl.col_pt_n,
+                    &rho_col_w,
+                    &rho_col_vals,
+                );
+                let t = sb.gate(macs, &[zw, w, wv(loc.bridge_v + i)])[0];
+                exp_w = sb.gate(macs, &[exp_w, lam_w[i], t])[0];
+            }
+            let delta_col = sb.gate(macs, &[run_w, exp_w, ow])[0];
+
+            let mu_w: Vec<Wire> = (0..k).map(|i| chw(loc.mu_ch0 + i)).collect();
+            let mut run2_w = zw;
+            for i in 0..k {
+                run2_w = sb.gate(macs, &[run2_w, mu_w[i], wv(loc.bridge_v + i)])[0];
+            }
+            let mut rho_row_w: Vec<Wire> = Vec::with_capacity(loc.k_row);
+            for j in 0..loc.k_row {
+                let r_w = chw(loc.row_ch0 + j);
+                rho_row_w.push(r_w);
+                run2_w =
+                    sb.gate(mrs, &[run2_w, wv(loc.row_v + 2 * j), wv(loc.row_v + 2 * j + 1), r_w])[0];
+            }
+            let rho_row_vals: Vec<F128> =
+                (0..loc.k_row).map(|j| chals[loc.row_ch0 + j]).collect();
+            let mut wmu_w = zw;
+            for (i, cl) in loc.claims.iter().enumerate() {
+                let w = emit_weight(
+                    &mut sb,
+                    &mut vals,
+                    &mut alpha_recs,
+                    fi,
+                    true,
+                    cl.row_low_v,
+                    cl.row_low_n,
+                    cl.row_pt_v,
+                    cl.row_pt_n,
+                    &rho_row_w,
+                    &rho_row_vals,
+                );
+                wmu_w = sb.gate(macs, &[wmu_w, mu_w[i], w])[0];
+            }
+            // The LAST fold's output value sits in the transcript tail past
+            // the final squeeze — no chain wire (step 1's shape fact); it
+            // enters as its own input, bound by the row endpoint delta.
+            let value = if fi + 1 == locs.len() {
+                vals.push(vals_rec[loc.out_v]);
+                sb.input()
+            } else {
+                wv(loc.out_v)
+            };
+            let rhs_w = sb.gate(macs, &[zw, wmu_w, value])[0];
+            let delta_row = sb.gate(macs, &[run2_w, rhs_w, ow])[0];
+            fold_pubs.push(FoldPub {
+                deltas: [delta_col, delta_row],
+                rho_col: rho_col_w,
+                rho_row: rho_row_w,
+                value,
+            });
+        }
+        // Publishes AFTER every input is declared: per fold, the two
+        // zero-deltas then the accumulator claim (ρ_col, ρ_row, value).
+        for fp in &fold_pubs {
+            sb.publish(fp.deltas[0]);
+            sb.publish(fp.deltas[1]);
+            for &w in &fp.rho_col {
+                sb.publish(w);
+            }
+            for &w in &fp.rho_row {
+                sb.publish(w);
+            }
+            sb.publish(fp.value);
+        }
+
+        let shape2 = sb.finish().expect("the mvp11 merge circuit builds");
+        let built2 = shape2.run(&vals, &[]);
+
+        // The checker: walk the five published fold blocks — deltas zero,
+        // claims rebuilt — then validate every boundary-expanded eq public
+        // against the PUBLISHED ρ coordinates, reassemble the Accumulator
+        // from the public segment alone, and discharge all three groups.
+        let tail_len: usize = locs.iter().map(|l| 3 + l.k_col + l.k_row).sum();
+        let tail0 = built2.public.len() - tail_len;
+        let mut p = tail0;
+        let mut rebuilt: Vec<MatrixClaim> = Vec::new();
+        for loc in &locs {
+            assert_eq!(built2.public[p], F128::ZERO, "col endpoint zero-delta");
+            assert_eq!(built2.public[p + 1], F128::ZERO, "row endpoint zero-delta");
+            let rho_col = built2.public[p + 2..p + 2 + loc.k_col].to_vec();
+            let rho_row =
+                built2.public[p + 2 + loc.k_col..p + 2 + loc.k_col + loc.k_row].to_vec();
+            let value = built2.public[p + 2 + loc.k_col + loc.k_row];
+            rebuilt.push(MatrixClaim {
+                row: Weight::eq(rho_row),
+                col: Weight::eq(rho_col),
+                value,
+            });
+            p += 3 + loc.k_col + loc.k_row;
+        }
+        for &(idx, fi, row_side, h) in &alpha_recs {
+            let base: usize =
+                tail0 + locs[..fi].iter().map(|l| 3 + l.k_col + l.k_row).sum::<usize>();
+            let rho = if row_side {
+                &built2.public
+                    [base + 2 + locs[fi].k_col..base + 2 + locs[fi].k_col + locs[fi].k_row]
+            } else {
+                &built2.public[base + 2..base + 2 + locs[fi].k_col]
+            };
+            let mut e = F128::ONE;
+            for b in 0..3 {
+                let r = rho[3 + b];
+                e *= if (h >> b) & 1 == 1 { r } else { F128::ONE + r };
+            }
+            assert_eq!(
+                built2.public[idx],
+                e,
+                "boundary-expanded low-fold eq public (fold {fi}, h {h})"
+            );
+        }
+        for (r, o) in rebuilt.iter().zip(&outs) {
+            assert_eq!(r, o, "published fold output == located native output");
+        }
+        let acc_pub = aggregate::Accumulator {
+            registry_digest: registry.digest(),
+            per_type: vec![(rebuilt[0].clone(), rebuilt[1].clone())],
+            per_element: vec![(rebuilt[2].clone(), rebuilt[3].clone())],
+            sigma: Some((built0.shape.circuit.digest(), rebuilt[4].clone())),
+        };
+        assert_eq!(
+            acc_pub, acc_v,
+            "the Accumulator, reassembled from the public segment alone"
+        );
+        assert!(
+            acc_pub.discharge(&mats)
+                && acc_pub.discharge_element(&el_mats)
+                && acc_pub.discharge_sigma(&built0.shape.circuit),
+            "the public-segment accumulator discharges all three groups"
+        );
+
+        // The outer proves and verifies over the circuit path.
+        let union2 = UnionInstance::new(&shape2.registry, shape2.counts.clone());
+        let pcs2 = PcsParams {
+            m: union2.dense_m(),
+            log_inv_rate: 1,
+            log_batch_size: 6,
+            profile: LigeritoProfile::Fast,
+            num_lanes: union2.commit_lanes(6),
+            merkle_hash: Default::default(),
+        };
+        let b3_r1cs2 = blake3::build_block_r1cs(nu2);
+        let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
+        let mut el_ord: Vec<(usize, Vec<F128>)> = [macs, mrs, pfslot, leslot]
+            .into_iter()
+            .map(|sl| {
+                let z = match &built2.witnesses[shape2.registry_slot(sl)] {
+                    SlotWitness::Element(z) => z.clone(),
+                    other => panic!("element slot produced {other:?}"),
+                };
+                (shape2.registry_slot(sl), z)
+            })
+            .collect();
+        el_ord.sort_by_key(|(i, _)| *i);
+        let el_inputs: Vec<UnionElementSlotInput> = el_ord
+            .into_iter()
+            .map(|(i, z)| live_element_input(z, shape2.counts[i], nu2))
+            .collect();
+        let mut ch2 = FsChallenger::new(DOMAIN);
+        let (oproof, ocommit, _) = prover::prove_fast_ligerito_union_circuit(
+            &union2,
+            &shape2.circuit,
+            &built2.public,
+            &pcs2,
+            vec![UnionSlotProverInput::new(
+                blake3::generate_witness_batch_major_partial(built2.rows::<Blake3Gate>(b3s), nu2),
+                b3_lc2,
+            )],
+            el_inputs,
+            &mut ch2,
+        );
+        let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![b3_lc2];
+        let mut ch2 = FsChallenger::new(DOMAIN);
+        verifier::verify_ligerito_union_circuit(
+            &union2,
+            &shape2.circuit,
+            &built2.public,
+            &lcs2,
+            &ocommit,
+            &oproof,
+            &pcs2,
+            &mut ch2,
+        )
+        .expect("the mvp11 merge circuit verifies");
+        (
+            b3_rows,
+            nu2,
+            union2.dense_m(),
+            shape2.circuit.cells().mu(),
+            bincode::serialize(&oproof).map(|b| b.len()).unwrap_or(0),
+        )
+    };
+
     println!(
-        "\nMVP-11 MERGE FOLD REGION (bind + 5 folds under ONE challenger)\n  \
-         folds: blake3 A/B ({} col + {} row rounds each, low-64 weights), mac A/B\n         \
-         ({}+{} rounds, pure eq — FIRST element-group exercise), sigma ({}+{})\n  \
-         tape: {} ops | {} stream values | {} squeezes — all 10 endpoints close\n  \
-         from located words; the 5 outputs reassemble the Accumulator; all\n  \
-         three groups discharge\n",
+        "\nMVP-11 MERGE FOLD REGION (bind + 5 folds under ONE challenger, IN-CIRCUIT)\n  \
+         folds: blake3 A/B ({} col + {} row rounds each, low-64 weights via LeafEval\n         \
+         chains), mac A/B ({}+{} rounds, pure eq — FIRST element-group exercise),\n         \
+         sigma ({}+{})\n  \
+         tape: {} ops | {} stream values | {} squeezes — all 10 endpoints close from\n  \
+         located words AND as published zero-deltas; the Accumulator reassembles from\n  \
+         the public segment alone and discharges all three groups\n  \
+         outer: chain b3 rows {} | nu {} | dense_m {} | mu {} | proof {:.1} KiB\n",
         locs[0].k_col,
         locs[0].k_row,
         locs[2].k_col,
@@ -13125,5 +13487,10 @@ fn mvp11_merge_fold_region() {
         ops.len(),
         vals_rec.len(),
         chals.len(),
+        outer_stats.0,
+        outer_stats.1,
+        outer_stats.2,
+        outer_stats.3,
+        outer_stats.4 as f64 / 1024.0,
     );
 }
