@@ -2265,8 +2265,9 @@ fn bytes_payload_mask(ops: &[flock_core::transcript_record::TranscriptOp]) -> Ve
 /// WITNESS inputs, bound in-circuit by the chain compressions and the
 /// region gates that consume them, never read natively. What stays public:
 /// the byte payloads `pub_payloads` selects (the STATEMENT: digests,
-/// counts, caps — caps stay checker-read until the in-circuit cap select),
-/// domain constants, and the shared structural constants through `consts`.
+/// counts, caps — the caps' wires also feed the in-circuit cap trees the
+/// openings connect to), domain constants, and the shared structural
+/// constants through `consts`.
 fn emit_fs_chain(
     sb: &mut ShapeBuilder,
     b3: flock_core::circuit::builder::SlotId,
@@ -4153,7 +4154,7 @@ fn parse_open_levels(
 /// intake lands (2c — now DONE, see below). **2b stage 1**: per-level `ResidualGate`s evaluate the
 /// induced-basis residuals (`next_s` chain, prefix over later fold
 /// challenges, suffix subset products) with `q_field` boundary-bound like
-/// the cap select; the `2^yr` accumulators publish and check against a
+/// the alpha expansion; the `2^yr` accumulators publish and check against a
 /// native replica. **2c (the merged intake)**: the outer target is the
 /// gamma-combination of the ABSORBED claim values (SpineGate tr-rows), the
 /// W-rounds fold it through `MergedRoundGate` binding rho, and the ligerito
@@ -4379,10 +4380,10 @@ fn mvp7_real_query_phase() {
     let b3_rows: usize = trace.rows.len()
         + geo
             .iter()
-            .map(|g| (g.lanes / 4 + g.path) * g.q)
+            .map(|g| (g.lanes / 4 + g.depth) * g.q + (1usize << g.c) - 1)
             .sum::<usize>();
     let nu = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(3);
-    let max_path = geo.iter().map(|g| g.path).max().unwrap().max(1);
+    let spread_w = geo.iter().map(|g| g.depth).max().unwrap().max(1);
 
     let t = Instant::now();
     let mut sb = ShapeBuilder::new(nu);
@@ -4390,7 +4391,7 @@ fn mvp7_real_query_phase() {
         b3: sb.slot(Blake3Gate { nu }),
         swap: sb.slot(SwapGate { nu }),
         spread: sb.slot(BitSpreadGate {
-            ty: BitSpreadTable::new(max_path),
+            ty: BitSpreadTable::new(spread_w),
             nu,
         }),
     };
@@ -4457,6 +4458,7 @@ fn mvp7_real_query_phase() {
     // AFTER every input is declared: `built.public` lists entries in
     // DECLARATION order, so publishing inside the loop would interleave with
     // the next level's public inputs and break the tail walk below.
+    let cap_w = cap_wires(&stream, &bytes, &word_wire, &lvl_src);
     let (to_publish, level_accs) = emit_query_phase(
         &mut sb,
         slots,
@@ -4468,6 +4470,7 @@ fn mvp7_real_query_phase() {
         &trace.squeezes,
         &outs,
         &chals,
+        &cap_w,
         &mut vals,
         &mut consts,
         &mut hints,
@@ -4821,7 +4824,7 @@ fn mvp7_real_query_phase() {
     // the chain finalize's first two output words, the nonce its aligned
     // stream word. The checker recomputes H(digest ‖ nonce) natively and
     // applies the leading-zero predicate — the same trust structure as the
-    // alpha expansion and the cap select.
+    // alpha expansion.
     let pow_pub: Vec<[Wire; 3]> = pows
         .iter()
         .map(|pr| {
@@ -4855,14 +4858,9 @@ fn mvp7_real_query_phase() {
     }
     assertion_pub.extend_from_slice(&[va_w, vb_w, wv(gammas[0].val_v)]);
 
-    for (a_wires, opens) in &to_publish {
+    for a_wires in &to_publish {
         for w in a_wires {
             sb.publish(*w);
-        }
-        for (cw, cv) in opens {
-            sb.publish(*cw);
-            sb.publish(cv[0]);
-            sb.publish(cv[1]);
         }
     }
     sb.publish(t_final);
@@ -4963,31 +4961,15 @@ fn mvp7_real_query_phase() {
         + 3 * pows.len()
         + n_assert;
     let total_pub: usize = 1 + yr_pub
-        + levels
-            .iter()
-            .zip(&geo)
-            .map(|(l, g)| l.a_count + 3 * g.q)
-            .sum::<usize>();
+        + levels.iter().map(|l| l.a_count).sum::<usize>();
     let mut at = built.public.len() - total_pub;
+    // The openings bind to the absorbed caps by COPY CONSTRAINT (the
+    // in-circuit cap tree) — no per-query publics, no checker walk.
     for (li, lvl) in levels.iter().enumerate() {
-        let g = &geo[li];
-        let (cap, _, _) = lvl_src[li];
         for j in 0..lvl.a_count {
             assert_eq!(built.public[at + j], chals[lvl.a_ch + j], "L{li} alpha {j}");
         }
         at += lvl.a_count;
-        for k in 0..g.q {
-            let chal = chals[lvl.q_ch + k];
-            assert_eq!(built.public[at], chal, "L{li} challenge {k}");
-            let pos = (chal.lo as usize) & ((1usize << g.depth) - 1);
-            let node = digest_words(&hash_to_digest(&cap[pos >> g.path]));
-            assert_eq!(
-                [built.public[at + 1], built.public[at + 2]],
-                node,
-                "L{li} cap node {k}"
-            );
-            at += 3;
-        }
     }
     // The spine, replayed natively over the recorded transcript: same quad
     // math, same start target, native enforced sums. Equality transitively
@@ -5119,7 +5101,7 @@ fn mvp7_real_query_phase() {
     let b3_lc = b3.csc_lincheck_circuit();
     let swap_r1cs = SwapTable::build_block_r1cs(nu);
     let swap_lc = swap_r1cs.csc_lincheck_circuit();
-    let spread_ty = BitSpreadTable::new(max_path);
+    let spread_ty = BitSpreadTable::new(spread_w);
     let spread_r1cs = spread_ty.build_block_r1cs(nu);
     let spread_lc = spread_r1cs.csc_lincheck_circuit();
 
@@ -5423,6 +5405,63 @@ fn level_geometry(
     (geo, native_sums)
 }
 
+/// Locate each level's absorbed cap in the stream and return its node
+/// wires: per level, `2^c` word-wire pairs in cap-layer order.
+///
+/// Payloads are CONTENT-matched — the flattened cap bytes must equal a
+/// whole `observe_bytes` payload — searching FORWARD (levels absorb their
+/// caps in transcript order: the statement's L0 cap first, then each
+/// recursion round's), so a size collision with another absorbed surface
+/// (the sigma V cap, a child's publics payload) cannot mislocate: a
+/// different tree's 32-byte digests never reproduce this cap's bytes.
+fn cap_wires(
+    stream: &flock_core::transcript_record::Stream,
+    bytes: &[u8],
+    word_wire: &[Option<Wire>],
+    lvl_src: &[(&[[u8; 32]], &Vec<Vec<F128>>, &Vec<[u8; 32]>)],
+) -> Vec<Vec<[Wire; 2]>> {
+    use flock_core::transcript_record::StreamWord;
+    // payload -> its stream-word indices, in payload-word order.
+    let mut pay_words: Vec<Vec<usize>> = Vec::new();
+    for (wi, w) in stream.words.iter().enumerate() {
+        if let StreamWord::Bytes { payload, word } = *w {
+            if pay_words.len() <= payload {
+                pay_words.resize(payload + 1, Vec::new());
+            }
+            assert_eq!(pay_words[payload].len(), word, "payload words in order");
+            pay_words[payload].push(wi);
+        }
+    }
+    let mut out = Vec::with_capacity(lvl_src.len());
+    let mut from = 0usize;
+    for (li, (cap, _, _)) in lvl_src.iter().enumerate() {
+        let flat: Vec<u8> = cap.iter().flatten().copied().collect();
+        let words = flat.len() / 16;
+        let p = (from..pay_words.len())
+            .find(|&p| {
+                pay_words[p].len() == words
+                    && pay_words[p]
+                        .iter()
+                        .enumerate()
+                        .all(|(j, &wi)| bytes[wi * 16..wi * 16 + 16] == flat[j * 16..j * 16 + 16])
+            })
+            .unwrap_or_else(|| panic!("L{li}: absorbed cap payload located"));
+        from = p + 1;
+        out.push(
+            pay_words[p]
+                .chunks(2)
+                .map(|c| {
+                    [
+                        word_wire[c[0]].expect("cap word wired"),
+                        word_wire[c[1]].expect("cap word wired"),
+                    ]
+                })
+                .collect(),
+        );
+    }
+    out
+}
+
 /// Emit the whole QUERY PHASE — every level's Merkle openings against the
 /// absorbed caps, plus the leaf-eval accumulators — as circuit rows.
 ///
@@ -5430,14 +5469,23 @@ fn level_geometry(
 /// proof's own rows and paths, wires each query's challenge word straight
 /// into the opening (no masking gadget — the relation reads the low `depth`
 /// columns), and folds the opened rows against the fold challenges into one
-/// accumulator per level. MVP-7, MVP-9 and MVP-10 all need exactly this, so
-/// it lives here once rather than three times.
+/// accumulator per level.
+///
+/// **ROUND 1 — the cap is hashed, not selected.** Per level, `2^c − 1`
+/// PARENT rows fold the ABSORBED cap wires (`cap_w`, from [`cap_wires`])
+/// to one root in fixed positional order — no swaps, the cap layer IS the
+/// tree's depth-`c` slice — and every opening runs FULL depth (path
+/// siblings from the proof, cap-internal siblings recomputed natively from
+/// the cap) and CONNECTS to that root. The absorbed cap is bound to the
+/// openings by copy constraint; the per-query boundary select — 3 publics
+/// per query and its checker tier — is gone. MVP-7, MVP-9 and MVP-10 all
+/// need exactly this, so it lives here once rather than three times.
 ///
 /// Appends the sibling `hints` and the public `vals` in declaration order;
-/// returns the per-level `(alpha wires, per-query (challenge, terminal
-/// digest))` to publish AFTER every input is declared — publishing inside
-/// the loop would interleave with the next level's inputs and misindex the
-/// public segment (the recorded MVP-7 gotcha) — and the accumulators.
+/// returns the per-level alpha wires to publish AFTER every input is
+/// declared — publishing inside the loop would interleave with the next
+/// level's inputs and misindex the public segment (the recorded MVP-7
+/// gotcha) — and the accumulators.
 #[allow(clippy::too_many_arguments)]
 fn emit_query_phase(
     sb: &mut ShapeBuilder,
@@ -5450,18 +5498,49 @@ fn emit_query_phase(
     sq: &[Vec<usize>],
     outs: &[Vec<Wire>],
     chals: &[F128],
+    cap_w: &[Vec<[Wire; 2]>],
     vals: &mut Vec<F128>,
     consts: &mut Vec<(F128, Wire)>,
     hints: &mut Vec<[u32; SLOT_WORDS]>,
-) -> (Vec<(Vec<Wire>, Vec<(Wire, [Wire; 2])>)>, Vec<Wire>) {
+) -> (Vec<Vec<Wire>>, Vec<Wire>) {
     use flock_core::lincheck::build_eq_table;
-    let mut to_publish: Vec<(Vec<Wire>, Vec<(Wire, [Wire; 2])>)> = Vec::new();
+    let mut to_publish: Vec<Vec<Wire>> = Vec::new();
     let mut level_accs: Vec<Wire> = Vec::new();
     for (li, lvl) in levels.iter().enumerate() {
         let g = &geo[li];
-        let (_, rows, paths) = lvl_src[li];
+        let (cap, rows, paths) = lvl_src[li];
         let sqq = &sq[lvl.q_fin];
         let sqa = &sq[lvl.a_fin];
+        // The cap-internal tree, natively: level 0 is the cap layer, each
+        // next level pairs — the openings' cap-side sibling hints and the
+        // in-circuit root's expected value both read from here.
+        let mut tree_lvls: Vec<Vec<[u8; 32]>> = vec![cap.to_vec()];
+        while tree_lvls.last().unwrap().len() > 1 {
+            let next: Vec<[u8; 32]> = tree_lvls
+                .last()
+                .unwrap()
+                .chunks(2)
+                .map(|p| core_merkle::hash_pair(&p[0], &p[1], HashKind::Blake3))
+                .collect();
+            tree_lvls.push(next);
+        }
+        // The cap tree, in-circuit: 2^c − 1 PARENT rows over the absorbed
+        // cap wires in fixed positional order — no swap gates.
+        let mut nodes: Vec<[Wire; 2]> = cap_w[li].clone();
+        while nodes.len() > 1 {
+            let params = cw(sb, vals, consts, pack_params(0, 64, PARENT));
+            nodes = nodes
+                .chunks(2)
+                .map(|p| {
+                    let out = sb.gate(
+                        slots.b3,
+                        &[iv[0], iv[1], p[0][0], p[0][1], p[1][0], p[1][1], params],
+                    );
+                    [out[0], out[1]]
+                })
+                .collect();
+        }
+        let cap_root = nodes[0];
         // alpha words: chain outputs, PUBLISHED for the checker's expansion.
         let a_wires: Vec<Wire> = (0..lvl.a_count).map(|j| outs[sqa[j / 4]][j % 4]).collect();
         // v: this level's fold challenges, chain outputs, wired straight in.
@@ -5484,14 +5563,24 @@ fn emit_query_phase(
         } else {
             None
         };
-        let mut opens: Vec<(Wire, [Wire; 2])> = Vec::with_capacity(g.q);
         for k in 0..g.q {
             vals.extend_from_slice(&rows[k]);
             let leaf_w: Vec<Wire> = (0..g.row_words).map(|_| sb.input()).collect();
             let cw = outs[sqq[k / 4]][k % 4];
-            let cv = emit_opening(sb, slots, iv, &leaf_w, cw, g.depth, g.c, Some(consts), vals);
-            opens.push((cw, cv));
+            let cv = emit_opening(sb, slots, iv, &leaf_w, cw, g.depth, 0, Some(consts), vals);
+            // Full-depth hints: the proof's path siblings, then the c
+            // cap-internal siblings from the native cap tree.
             hints.extend(paths[k * g.path..(k + 1) * g.path].iter().map(hash_to_digest));
+            let pos = (chals[lvl.q_ch + k].lo as usize) & ((1usize << g.depth) - 1);
+            let mut idx = pos >> g.path;
+            for i in 0..g.c {
+                hints.push(hash_to_digest(&tree_lvls[i][idx ^ 1]));
+                idx >>= 1;
+            }
+            // Output-output connects: a multi-producer class with no gate
+            // consumers — witgen asserts agreement, no dataflow cycle.
+            sb.connect(cv[0], cap_root[0]);
+            sb.connect(cv[1], cap_root[1]);
             // The fold reads the full `2^folds` domain: the committed words
             // then the definitionally-zero top lanes.
             let mut fold_w = leaf_w.clone();
@@ -5506,7 +5595,7 @@ fn emit_query_phase(
                 acc = sb.gate(leafeval[li], &a_in)[0];
             }
         }
-        to_publish.push((a_wires, opens));
+        to_publish.push(a_wires);
         level_accs.push(acc);
     }
     (to_publish, level_accs)
@@ -7068,16 +7157,19 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         chain.absorb(&bytes[at * 16..]);
         let trace = chain.finish();
         let b3_rows: usize = trace.rows.len()
-            + geo.iter().map(|g| (g.lanes / 4 + g.path) * g.q).sum::<usize>();
+            + geo
+                .iter()
+                .map(|g| (g.lanes / 4 + g.depth) * g.q + (1usize << g.c) - 1)
+                .sum::<usize>();
         let nu = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(3);
-        let max_path = geo.iter().map(|g| g.path).max().unwrap().max(1);
+        let spread_w = geo.iter().map(|g| g.depth).max().unwrap().max(1);
 
         let mut sb = ShapeBuilder::new(nu);
         let slots = CollapsedSlots {
             b3: sb.slot(Blake3Gate { nu }),
             swap: sb.slot(SwapGate { nu }),
             spread: sb.slot(BitSpreadGate {
-                ty: BitSpreadTable::new(max_path),
+                ty: BitSpreadTable::new(spread_w),
                 nu,
             }),
         };
@@ -7158,6 +7250,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             .collect();
 
         let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
+        let cap_w = cap_wires(&stream, &bytes, &ww, &lvl_src);
         let (to_publish, level_accs) = emit_query_phase(
             &mut sb,
             slots,
@@ -7169,6 +7262,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             &trace.squeezes,
             &outs,
             &chals,
+            &cap_w,
             &mut vals,
             &mut consts,
             &mut hints,
@@ -7938,14 +8032,9 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             assert_pub.push(sb.public_input());
         }
 
-        for (a_wires, opens) in &to_publish {
+        for a_wires in &to_publish {
             for w in a_wires {
                 sb.publish(*w);
-            }
-            for (cw, cv) in opens {
-                sb.publish(*cw);
-                sb.publish(cv[0]);
-                sb.publish(cv[1]);
             }
         }
         for w in &level_accs {
@@ -7978,7 +8067,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             hints.iter().map(|h| h as &dyn std::any::Any).collect();
         let built = shape.run(&vals, &hint_refs);
 
-        // ---- boundary checks: alphas, cap selects, and the enforced sums.
+        // ---- boundary checks: alphas and the enforced sums.
         // The anchor-expect tail (sqrt-chain deltas + the claim==expect
         // delta) is appended after everything else; `plen` is the public
         // length BEFORE it, so every older from-the-end offset holds.
@@ -7993,31 +8082,15 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             + 5
             + n_assert_pub
             + 3 * pows.len()
-            + levels
-                .iter()
-                .zip(&geo)
-                .map(|(l, g)| l.a_count + 3 * g.q)
-                .sum::<usize>();
+            + levels.iter().map(|l| l.a_count).sum::<usize>();
         let mut at2 = plen - total_pub;
+        // The openings bind to the absorbed caps by COPY CONSTRAINT (the
+        // in-circuit cap tree) — no per-query publics, no checker walk.
         for (li, lvl) in levels.iter().enumerate() {
-            let g = &geo[li];
-            let (cap, _, _) = lvl_src[li];
             for j in 0..lvl.a_count {
                 assert_eq!(built.public[at2 + j], chals[lvl.a_ch + j], "L{li} alpha {j}");
             }
             at2 += lvl.a_count;
-            for k in 0..g.q {
-                let chal = chals[lvl.q_ch + k];
-                assert_eq!(built.public[at2], chal, "L{li} challenge {k}");
-                let pos = (chal.lo as usize) & ((1usize << g.depth) - 1);
-                let node = digest_words(&hash_to_digest(&cap[pos >> g.path]));
-                assert_eq!(
-                    [built.public[at2 + 1], built.public[at2 + 2]],
-                    node,
-                    "L{li} cap node {k}"
-                );
-                at2 += 3;
-            }
         }
         for (li, want) in native_sums.iter().enumerate() {
             assert_eq!(
@@ -8177,7 +8250,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         let b3_lc = b3_r1cs.csc_lincheck_circuit();
         let swap_r1cs = SwapTable::build_block_r1cs(nu);
         let swap_lc = swap_r1cs.csc_lincheck_circuit();
-        let spread_ty = BitSpreadTable::new(max_path);
+        let spread_ty = BitSpreadTable::new(spread_w);
         let spread_r1cs = spread_ty.build_block_r1cs(nu);
         let spread_lc = spread_r1cs.csc_lincheck_circuit();
         let b3_wit =
@@ -8323,7 +8396,7 @@ struct RealTape<'p> {
     stream: flock_core::transcript_record::Stream,
     bytes: Vec<u8>,
     b3_rows: usize,
-    max_path: usize,
+    spread_w: usize,
     // located regions
     gkr: GkrRec,
     piop_i: PiopRec,
@@ -8683,9 +8756,9 @@ impl<'p> RealTape<'p> {
         let b3_rows = trace.rows.len()
             + geo
                 .iter()
-                .map(|g| (g.row_words.div_ceil(4) + g.path) * g.q)
+                .map(|g| (g.row_words.div_ceil(4) + g.depth) * g.q + (1usize << g.c) - 1)
                 .sum::<usize>();
-        let max_path = geo.iter().map(|g| g.path).max().unwrap().max(1);
+        let spread_w = geo.iter().map(|g| g.depth).max().unwrap().max(1);
 
         // The PoW grinding ops, located (the mvp7 machinery).
         let pows: Vec<(usize, usize, u32)> = {
@@ -9311,7 +9384,7 @@ impl<'p> RealTape<'p> {
             stream,
             bytes,
             b3_rows,
-            max_path,
+            spread_w,
             gkr: gkr_rec,
             piop_i,
             start_v_i,
@@ -9486,6 +9559,7 @@ fn emit_real_child_region(
         })
         .collect();
 
+    let cap_w = cap_wires(stream, &rt.bytes, &ww, &rt.lvl_src);
     let (to_publish, level_accs) = emit_query_phase(
         sb,
         cs.q,
@@ -9497,6 +9571,7 @@ fn emit_real_child_region(
         &trace.squeezes,
         &outs,
         chals,
+        &cap_w,
         vals,
         &mut consts,
         hints,
@@ -10060,14 +10135,9 @@ fn emit_real_child_region(
 
     // ---- the publishes, in the swap's recorded order ----
     let pub_base = sb.public_len();
-    for (a_wires, opens) in &to_publish {
+    for a_wires in &to_publish {
         for w in a_wires {
             sb.publish(*w);
-        }
-        for (cw, cv) in opens {
-            sb.publish(*cw);
-            sb.publish(cv[0]);
-            sb.publish(cv[1]);
         }
     }
     for w in &level_accs {
@@ -10135,11 +10205,7 @@ fn emit_real_child_region(
     sb.publish(vrs_w);
     n_fam_pub += 2;
 
-    let n_query_pub: usize = levels
-        .iter()
-        .zip(geo)
-        .map(|(l, g)| l.a_count + 3 * g.q)
-        .sum();
+    let n_query_pub: usize = levels.iter().map(|l| l.a_count).sum();
     let n_tail = levels.len()
         + 3 * rt.pows.len()
         + 3
@@ -10191,21 +10257,13 @@ fn emit_real_child_region(
 fn check_real_child_region(public: &[F128], rt: &RealTape<'_>, r: &RealRegion) -> usize {
     let chals = &rt.chals[..];
     let mut at2 = r.pub_base;
+    // The openings bind to the absorbed caps by COPY CONSTRAINT (the
+    // in-circuit cap tree) — no per-query publics, no checker walk.
     for (li, lvl) in rt.levels.iter().enumerate() {
-        let g = &rt.geo[li];
-        let (cap, _, _) = rt.lvl_src[li];
         for j in 0..lvl.a_count {
             assert_eq!(public[at2 + j], chals[lvl.a_ch + j], "L{li} alpha {j}");
         }
         at2 += lvl.a_count;
-        for k in 0..g.q {
-            let chal = chals[lvl.q_ch + k];
-            assert_eq!(public[at2], chal, "L{li} challenge {k}");
-            let pos = (chal.lo as usize) & ((1usize << g.depth) - 1);
-            let node = digest_words(&hash_to_digest(&cap[pos >> g.path]));
-            assert_eq!([public[at2 + 1], public[at2 + 2]], node, "L{li} cap node {k}");
-            at2 += 3;
-        }
     }
     for (li, want) in rt.native_sums.iter().enumerate() {
         assert_eq!(
@@ -10465,7 +10523,7 @@ fn mvp10_leaf_outer_inner_tape() {
     // this test keeping green is what makes the extraction faithful.
     let nu2 = (rt.b3_rows.next_power_of_two().trailing_zeros() as usize).max(3);
     let mut sb = ShapeBuilder::new(nu2);
-    let mut cs = ChildSlots::new(&mut sb, nu2, rt.max_path);
+    let mut cs = ChildSlots::new(&mut sb, nu2, rt.spread_w);
     let mut vals: Vec<F128> = Vec::new();
     let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
     let region = emit_real_child_region(&mut sb, &mut cs, &rt, &mut vals, &mut hints);
@@ -10505,7 +10563,7 @@ fn mvp10_leaf_outer_inner_tape() {
     let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
     let swap_r1cs2 = SwapTable::build_block_r1cs(nu2);
     let swap_lc2 = swap_r1cs2.csc_lincheck_circuit();
-    let spread_ty2 = BitSpreadTable::new(rt.max_path);
+    let spread_ty2 = BitSpreadTable::new(rt.spread_w);
     let spread_r1cs2 = spread_ty2.build_block_r1cs(nu2);
     let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
     let mut bslots: Vec<(usize, UnionSlotProverInput)> = vec![
@@ -10828,7 +10886,7 @@ struct ChildTape<'p> {
     stream: flock_core::transcript_record::Stream,
     bytes: Vec<u8>,
     b3_rows: usize,
-    max_path: usize,
+    spread_w: usize,
     // located regions
     gkr: GkrRec,
     el: ElPiopRec,
@@ -11354,9 +11412,9 @@ impl<'p> ChildTape<'p> {
         let b3_rows = trace.rows.len()
             + geo
                 .iter()
-                .map(|g| (g.row_words.div_ceil(4) + g.path) * g.q)
+                .map(|g| (g.row_words.div_ceil(4) + g.depth) * g.q + (1usize << g.c) - 1)
                 .sum::<usize>();
-        let max_path = geo.iter().map(|g| g.path).max().unwrap().max(1);
+        let spread_w = geo.iter().map(|g| g.depth).max().unwrap().max(1);
 
         // ---- the merged intake's natives (target, running, boundary) ----
         let (native_target, native_running) = {
@@ -11844,7 +11902,7 @@ impl<'p> ChildTape<'p> {
             stream,
             bytes,
             b3_rows,
-            max_path,
+            spread_w,
             gkr: gkr_rec,
             el: el_rec,
             start_v,
@@ -11917,13 +11975,13 @@ struct ChildSlots {
 }
 
 impl ChildSlots {
-    fn new(sb: &mut ShapeBuilder, nu2: usize, max_path: usize) -> Self {
+    fn new(sb: &mut ShapeBuilder, nu2: usize, spread_w: usize) -> Self {
         ChildSlots {
             q: CollapsedSlots {
                 b3: sb.slot(Blake3Gate { nu: nu2 }),
                 swap: sb.slot(SwapGate { nu: nu2 }),
                 spread: sb.slot(BitSpreadGate {
-                    ty: BitSpreadTable::new(max_path),
+                    ty: BitSpreadTable::new(spread_w),
                     nu: nu2,
                 }),
             },
@@ -12031,6 +12089,7 @@ fn emit_child_region(
         &mut consts,
         &ct.pub_payloads,
     );
+    let cap_w = cap_wires(stream, &ct.bytes, &ww, &ct.lvl_src);
     let (to_publish, level_accs) = emit_query_phase(
         sb,
         cs.q,
@@ -12042,6 +12101,7 @@ fn emit_child_region(
         &trace.squeezes,
         &outs,
         chals,
+        &cap_w,
         vals,
         &mut consts,
         hints,
@@ -12557,19 +12617,14 @@ fn emit_child_region(
 
     // Everything publishes HERE, after every public input is declared
     // (`built.public` lists entries in DECLARATION order — the recorded
-    // MVP-7 gotcha). Tail order: [query phase (alphas, per-query (cw, cv)),
-    // accs | ga, mg | gkr deltas | el deltas, el zc end, el lc end |
-    // mp_delta, anc, t_final, tgt, runw | resid | inner | s_sigma | rho... |
-    // sqrt deltas | anchor delta].
+    // MVP-7 gotcha). Tail order: [query phase (alphas), accs | ga, mg |
+    // gkr deltas | el deltas, el zc end, el lc end | mp_delta, anc,
+    // t_final, tgt, runw | resid | inner | s_sigma | rho... | sqrt deltas |
+    // anchor delta].
     let pub_base = sb.public_len();
-    for (a_wires, opens) in &to_publish {
+    for a_wires in &to_publish {
         for w in a_wires {
             sb.publish(*w);
-        }
-        for (cw, cv) in opens {
-            sb.publish(*cw);
-            sb.publish(cv[0]);
-            sb.publish(cv[1]);
         }
     }
     for w in &level_accs {
@@ -12603,12 +12658,8 @@ fn emit_child_region(
     // SkipNodeGate/φ8 in-circuit derivation is the recorded upgrade).
     sb.publish(outs[trace.squeezes[ct.zskip_fin][0]][0]);
     let n_tail = 2 + 2 + 4 + levels.len() * ct.yr_len + 1 + 1 + ct.mu_i + 1;
-    let n_query_pub: usize = levels.len()
-        + levels
-            .iter()
-            .zip(geo)
-            .map(|(l, g)| l.a_count + 3 * g.q)
-            .sum::<usize>();
+    let n_query_pub: usize =
+        levels.len() + levels.iter().map(|l| l.a_count).sum::<usize>();
     ChildRegion {
         pub_base,
         n_query_pub,
@@ -12643,26 +12694,16 @@ fn emit_child_region(
 fn check_child_region(public: &[F128], ct: &ChildTape<'_>, r: &ChildRegion) -> usize {
     let chals = &ct.chals[..];
     // The query-phase boundary: published alphas are the recorded
-    // challenges, each published terminal digest is the cap node the
-    // challenge selects, and each accumulator equals the native enforced
-    // sum.
+    // challenges and each accumulator equals the native enforced sum.
     {
         let mut at = r.pub_base;
+        // The openings bind to the absorbed caps by COPY CONSTRAINT (the
+        // in-circuit cap tree) — no per-query publics, no checker walk.
         for (li, lvl) in ct.levels.iter().enumerate() {
-            let g = &ct.geo[li];
-            let (cap, _, _) = ct.lvl_src[li];
             for j in 0..lvl.a_count {
                 assert_eq!(public[at + j], chals[lvl.a_ch + j], "L{li} alpha {j}");
             }
             at += lvl.a_count;
-            for k in 0..g.q {
-                let chal = chals[lvl.q_ch + k];
-                assert_eq!(public[at], chal, "L{li} challenge {k}");
-                let pos = (chal.lo as usize) & ((1usize << g.depth) - 1);
-                let node = digest_words(&hash_to_digest(&cap[pos >> g.path]));
-                assert_eq!([public[at + 1], public[at + 2]], node, "L{li} cap node {k}");
-                at += 3;
-            }
         }
         for (li, want) in ct.native_sums.iter().enumerate() {
             assert_eq!(
@@ -12814,7 +12855,7 @@ fn mvp10_circuit_inner_tape() {
     // ---- the outer: one child region in one builder ----
     let nu2 = (ct.b3_rows.next_power_of_two().trailing_zeros() as usize).max(3);
     let mut sb = ShapeBuilder::new(nu2);
-    let mut cs = ChildSlots::new(&mut sb, nu2, ct.max_path);
+    let mut cs = ChildSlots::new(&mut sb, nu2, ct.spread_w);
     let mut vals: Vec<F128> = Vec::new();
     let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
     let region = emit_child_region(&mut sb, &mut cs, &ct, &mut vals, &mut hints);
@@ -12843,7 +12884,7 @@ fn mvp10_circuit_inner_tape() {
     let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
     let swap_r1cs2 = SwapTable::build_block_r1cs(nu2);
     let swap_lc2 = swap_r1cs2.csc_lincheck_circuit();
-    let spread_ty2 = BitSpreadTable::new(ct.max_path);
+    let spread_ty2 = BitSpreadTable::new(ct.spread_w);
     let spread_r1cs2 = spread_ty2.build_block_r1cs(nu2);
     let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
     let mut el_ord: Vec<(usize, Vec<F128>)> = cs
@@ -14358,7 +14399,7 @@ fn mvp11_merge_fold_region() {
         let b3_rows = t0.b3_rows + t1.b3_rows + trace.rows.len();
         let nu2 = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7);
         let mut sb = ShapeBuilder::new(nu2);
-        let mut cs = ChildSlots::new(&mut sb, nu2, t0.max_path.max(t1.max_path));
+        let mut cs = ChildSlots::new(&mut sb, nu2, t0.spread_w.max(t1.spread_w));
         let mut vals: Vec<F128> = Vec::new();
         let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
         let r0 = emit_child_region(&mut sb, &mut cs, &t0, &mut vals, &mut hints);
@@ -14739,7 +14780,7 @@ fn mvp11_merge_fold_region() {
         let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
         let swap_r1cs2 = SwapTable::build_block_r1cs(nu2);
         let swap_lc2 = swap_r1cs2.csc_lincheck_circuit();
-        let spread_ty2 = BitSpreadTable::new(t0.max_path.max(t1.max_path));
+        let spread_ty2 = BitSpreadTable::new(t0.spread_w.max(t1.spread_w));
         let spread_r1cs2 = spread_ty2.build_block_r1cs(nu2);
         let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
         let mut el_ord: Vec<(usize, Vec<F128>)> = cs
@@ -15492,7 +15533,7 @@ fn build_node_outer(
         let b3_rows = rt0.b3_rows + rt1.b3_rows + trace.rows.len();
         let nu2 = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7);
         let mut sb = ShapeBuilder::new(nu2);
-        let mut cs = ChildSlots::new(&mut sb, nu2, rt0.max_path.max(rt1.max_path));
+        let mut cs = ChildSlots::new(&mut sb, nu2, rt0.spread_w.max(rt1.spread_w));
         let mut vals: Vec<F128> = Vec::new();
         let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
         let r0 = emit_real_child_region(&mut sb, &mut cs, &rt0, &mut vals, &mut hints);
@@ -15802,7 +15843,7 @@ fn build_node_outer(
         let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
         let swap_r1cs2 = SwapTable::build_block_r1cs(nu2);
         let swap_lc2 = swap_r1cs2.csc_lincheck_circuit();
-        let spread_ty2 = BitSpreadTable::new(rt0.max_path.max(rt1.max_path));
+        let spread_ty2 = BitSpreadTable::new(rt0.spread_w.max(rt1.spread_w));
         let spread_r1cs2 = spread_ty2.build_block_r1cs(nu2);
         let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
         let mut bslots: Vec<(usize, UnionSlotProverInput)> = vec![
