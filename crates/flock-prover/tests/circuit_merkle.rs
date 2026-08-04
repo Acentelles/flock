@@ -14959,3 +14959,646 @@ fn mvp11_swap_children_fold_scale() {
         outer_stats.4 as f64 / 1024.0,
     );
 }
+
+/// **THE 2→1 RECURSION NODE.** Two DISTINCT real recursion nodes (seeded
+/// leaf outers — one circuit, unrelated FS points) go in; ONE proof comes
+/// out, carrying everything a parent needs:
+///
+/// - TWO REAL CHILD-TAPE REGIONS — each child's complete deferred verifier
+///   (the swap assembly via [`emit_real_child_region`]) over SHARED slots,
+/// - the FOLD REGION at the real registry (~35 folds via the width-driven
+///   helpers), and
+/// - THE CONNECTS: every fold claim's surfaces are copy-constrained to the
+///   child regions' own assertion-emission wires — points to chain
+///   squeezes, z_partial lows word-for-word, and (richer than the minimal
+///   children) the matrix/element EVAL VALUES to the children's bound
+///   advice publics. The lagrange row lows stay the boundary pattern:
+///   published once per child, rebuilt by the checker from that child's
+///   PUBLISHED z_skip.
+///
+/// The accumulator reassembles from the public segment alone, equals the
+/// native verifier's, and discharges all three groups against the node
+/// circuit's own matrices and sigma table. This outer IS the merge node:
+/// its proof attests both children's verification AND the fold that
+/// combined their claims. (It is not yet SELF-similar — normalization is
+/// deliberately out of scope.)
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn mvp11_two_to_one_recursion_node() {
+    use flock_core::aggregate;
+    use flock_core::matrix_fold::{FoldProof, MatrixClaim};
+    use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
+
+    const M11_NODE_DOMAIN: &[u8] = b"flock-mvp11-two-to-one-v0";
+
+    // Two DISTINCT children: the seed varies only the leaf workload, so
+    // the node CIRCUIT is shared — the foldability key — while every claim
+    // lands at an unrelated FS point (index bugs in the connects cannot
+    // pass on equal values).
+    let lo0 = build_leaf_outer_seeded(0x4D50_9B00);
+    let lo1 = build_leaf_outer_seeded(0x4D50_9B01);
+    assert_eq!(
+        lo0.shape.circuit.digest(),
+        lo1.shape.circuit.digest(),
+        "two children, ONE node circuit"
+    );
+    let registry = &lo0.shape.registry;
+    let union0 = UnionInstance::new(registry, lo0.shape.counts.clone());
+    let union1 = UnionInstance::new(&lo1.shape.registry, lo1.shape.counts.clone());
+    let rt0 = RealTape::new(&lo0, DOMAIN);
+    let rt1 = RealTape::new(&lo1, DOMAIN);
+    assert_ne!(
+        rt0.sigma_native.rho, rt1.sigma_native.rho,
+        "distinct witnesses, distinct FS points"
+    );
+
+    // The matrices + lincheck circuits, registry order (lo0's copies —
+    // one circuit, one registry).
+    let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
+        (lo0.b3_slot, lo0.b3_r1cs.csc_lincheck_circuit()),
+        (lo0.swap_slot, lo0.swap_r1cs.csc_lincheck_circuit()),
+        (lo0.spread_slot, lo0.spread_r1cs.csc_lincheck_circuit()),
+    ];
+    lcs_ord.sort_by_key(|(i, _)| *i);
+    let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
+        lcs_ord.iter().map(|&(_, c)| c).collect();
+    let mut mats_ord = vec![
+        (lo0.b3_slot, (&lo0.b3_r1cs.a_0, &lo0.b3_r1cs.b_0)),
+        (lo0.swap_slot, (&lo0.swap_r1cs.a_0, &lo0.swap_r1cs.b_0)),
+        (lo0.spread_slot, (&lo0.spread_r1cs.a_0, &lo0.spread_r1cs.b_0)),
+    ];
+    mats_ord.sort_by_key(|&(i, _)| i);
+    let mats: Vec<_> = mats_ord.iter().map(|&(_, m)| m).collect();
+    let el_types: Vec<_> = registry
+        .element_types()
+        .iter()
+        .map(|s| s.element_type().expect("an element slot's table"))
+        .collect();
+    let el_mats: Vec<_> = el_types.iter().map(|t| (t.a_0(), t.b_0())).collect();
+    let n_bool = registry.num_boolean();
+    let n_el = el_mats.len();
+
+    // The native merge fold over the two children's assertions.
+    let bool_asserts = [rt0.mat_assert.clone(), rt1.mat_assert.clone()];
+    let el_asserts = [
+        (&union0, rt0.el_assert.clone()),
+        (&union1, rt1.el_assert.clone()),
+    ];
+    let sigmas = [rt0.sigma_native.clone(), rt1.sigma_native.clone()];
+    let mut chp = FsChallenger::with_hash(M11_NODE_DOMAIN, HashKind::Blake3);
+    let (agg, acc_p) = aggregate::prove_aggregate_classes(
+        registry,
+        &mats,
+        &lcs,
+        &bool_asserts,
+        &el_mats,
+        &el_asserts,
+        Some((&lo0.shape.circuit, &sigmas)),
+        &[],
+        &mut chp,
+    )
+    .expect("the node fold proves");
+    let mut rec =
+        RecordingChallenger::new(FsChallenger::with_hash(M11_NODE_DOMAIN, HashKind::Blake3));
+    let acc_v = aggregate::verify_aggregate_classes(
+        registry,
+        &bool_asserts,
+        &el_asserts,
+        Some((&lo0.shape.circuit, &sigmas)),
+        &[],
+        &agg,
+        &mut rec,
+    )
+    .expect("the node fold verifies");
+    assert_eq!(acc_p, acc_v, "prover and verifier accumulators agree");
+    assert!(acc_v.discharge(&mats), "the boolean group discharges");
+    assert!(
+        acc_v.discharge_element(&el_mats),
+        "the element group discharges"
+    );
+    assert!(
+        acc_v.discharge_sigma(&lo0.shape.circuit),
+        "the sigma group discharges"
+    );
+
+    // The fold groups in aggregate order, from the CHILDREN'S OWN
+    // assertion data (the same constructors the verifier gathers with).
+    let bc = [
+        rt0.mat_assert.claims(registry),
+        rt1.mat_assert.claims(registry),
+    ];
+    let ec = [rt0.el_assert.claims(&union0), rt1.el_assert.claims(&union1)];
+    let mut fold_claims: Vec<Vec<MatrixClaim>> = Vec::new();
+    for t in 0..n_bool {
+        fold_claims.push(vec![bc[0][t].0.clone(), bc[1][t].0.clone()]);
+        fold_claims.push(vec![bc[0][t].1.clone(), bc[1][t].1.clone()]);
+    }
+    for t in 0..n_el {
+        fold_claims.push(vec![ec[0][t].0.clone(), ec[1][t].0.clone()]);
+        fold_claims.push(vec![ec[0][t].1.clone(), ec[1][t].1.clone()]);
+    }
+    fold_claims.push(vec![sigmas[0].claim(), sigmas[1].claim()]);
+    let mut fold_proofs: Vec<&FoldProof> = Vec::new();
+    for t in 0..n_bool {
+        fold_proofs.push(&agg.folds[t].0);
+        fold_proofs.push(&agg.folds[t].1);
+    }
+    for t in 0..n_el {
+        fold_proofs.push(&agg.el_folds[t].0);
+        fold_proofs.push(&agg.el_folds[t].1);
+    }
+    fold_proofs.push(agg.sigma_fold.as_ref().expect("the sigma fold rides along"));
+    let n_folds = fold_claims.len();
+
+    // ---- the fold tape, pinned through the width-driven helpers ----
+    let t_shape = rec.shape();
+    let ops = t_shape.ops();
+    let vals_rec = rec.values();
+    let chals = rec.challenges();
+    let mut want: Vec<Op> = vec![
+        Op::Label(b"flock-aggregate-v0".to_vec()),
+        Op::ObserveBytes(32),
+        Op::ObserveBytes(1),
+    ];
+    want.extend(fold_region_ops(&fold_claims));
+    assert_eq!(ops, want.as_slice(), "the node tape is the expected shape");
+    assert_eq!(rec.payloads()[0], registry.digest(), "bind: registry digest");
+    assert_eq!(rec.payloads()[1], vec![0u8], "bind: prior count 0");
+    let locs = locate_and_pin_folds(&fold_claims, &fold_proofs, vals_rec, chals);
+    let outs = replay_fold_endpoints(&locs, vals_rec, chals);
+    for t in 0..n_bool {
+        assert_eq!(outs[2 * t], acc_v.per_type[t].0, "boolean type {t} A");
+        assert_eq!(outs[2 * t + 1], acc_v.per_type[t].1, "boolean type {t} B");
+    }
+    for t in 0..n_el {
+        assert_eq!(
+            outs[2 * n_bool + 2 * t],
+            acc_v.per_element[t].0,
+            "element type {t} A"
+        );
+        assert_eq!(
+            outs[2 * n_bool + 2 * t + 1],
+            acc_v.per_element[t].1,
+            "element type {t} B"
+        );
+    }
+    let (sig_digest, sig_claim) = acc_v.sigma.as_ref().expect("sigma accumulated");
+    assert_eq!(outs[n_folds - 1], *sig_claim, "sigma accumulator");
+    assert_eq!(*sig_digest, lo0.shape.circuit.digest(), "sigma key");
+
+    // ---- ONE outer: two REAL child regions + the fold region ----
+    let outer_stats = {
+        use flock_prover::prover::UnionElementSlotInput;
+        use flock_prover::r1cs_hashes::fs_chain::FsChain;
+
+        let stream = t_shape.stream_words(M11_NODE_DOMAIN);
+        let bytes = stream.to_bytes(rec.values(), rec.payloads());
+        let mut chain = FsChain::new();
+        let mut at = 0usize;
+        let fin_ops: Vec<_> = t_shape.ops().iter().filter(|o| o.finalizes()).collect();
+        assert_eq!(
+            stream.finalize_after.len(),
+            fin_ops.len(),
+            "finalize alignment"
+        );
+        assert_eq!(fin_ops.len(), chals.len(), "every finalizer is a scalar squeeze");
+        for (k, &upto) in stream.finalize_after.iter().enumerate() {
+            chain.absorb(&bytes[at * 16..upto * 16]);
+            at = upto;
+            chain.finalize(fin_ops[k].squeezed_bytes());
+        }
+        chain.absorb(&bytes[at * 16..]);
+        let trace = chain.finish();
+
+        let b3_rows = rt0.b3_rows + rt1.b3_rows + trace.rows.len();
+        let nu2 = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7);
+        let mut sb = ShapeBuilder::new(nu2);
+        let mut cs = ChildSlots::new(&mut sb, nu2, rt0.max_path.max(rt1.max_path));
+        let mut vals: Vec<F128> = Vec::new();
+        let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
+        let r0 = emit_real_child_region(&mut sb, &mut cs, &rt0, &mut vals, &mut hints);
+        let r1 = emit_real_child_region(&mut sb, &mut cs, &rt1, &mut vals, &mut hints);
+        // The fold region rides the children's slots: rows, not columns.
+        let (pfslot, pf_w) = r0.pf;
+        let leslot = cs
+            .le
+            .iter()
+            .find(|&&(n, _)| n == 8)
+            .map(|&(_, s)| s)
+            .expect("the child regions created the 8-lane leaf-eval slot");
+        let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+        vals.extend_from_slice(&iv_w);
+        let iv2 = [sb.public_input(), sb.public_input()];
+        let (chain_outs, ww) = emit_fs_chain(&mut sb, cs.q.b3, iv2, &trace, &stream, &bytes, &mut vals);
+        let mut vmap: Vec<Option<usize>> = Vec::new();
+        for (wi, w) in stream.words.iter().enumerate() {
+            if let flock_core::transcript_record::StreamWord::Value(vi) = *w {
+                if vmap.len() <= vi {
+                    vmap.resize(vi + 1, None);
+                }
+                vmap[vi] = Some(wi);
+            }
+        }
+        let wv = |vi: usize| -> Wire { ww[vmap[vi].expect("stream word")].expect("wired") };
+        vals.push(F128::ZERO);
+        let zw = sb.public_input();
+        vals.push(F128::ONE);
+        let ow = sb.public_input();
+        let (fold_pubs, alpha_recs) = emit_fold_region(
+            &mut sb,
+            cs.macs,
+            cs.mrs,
+            pfslot,
+            pf_w,
+            leslot,
+            &locs,
+            &trace.squeezes,
+            &chain_outs,
+            &ww,
+            &vmap,
+            chals,
+            vals_rec,
+            &mut vals,
+            zw,
+            ow,
+        );
+
+        // ---- THE 2→1 CONNECTS: the fold's absorbed claim surfaces ARE
+        // the real child regions' assertion-emission wires ----
+        // Per child, per family: points to chain squeeze wires, z_partial
+        // lows to absorbed child words, sigma fully (value = the child's
+        // deferred s_sigma stream word), and — richer than the minimal
+        // children — the matrix/element EVAL VALUES to the children's own
+        // bound advice publics. Only the lagrange row lows stay the
+        // boundary pattern (published below, rebuilt by the checker from
+        // each child's PUBLISHED z_skip; SkipNodeGate/φ8 is the recorded
+        // upgrade).
+        let tapes = [&rt0, &rt1];
+        let regions = [&r0, &r1];
+        for (k, (tk, rk)) in tapes.iter().zip(&regions).enumerate() {
+            // Native pre-asserts (the method-note discipline).
+            for t in 0..n_bool {
+                let inner_t = fold_claims[2 * t][k].row.point.len();
+                assert_eq!(
+                    &fold_claims[2 * t][k].row.point[..],
+                    &tk.mat_assert.x_inner_rest[..inner_t],
+                    "boolean type {t} row point is x_inner_rest's head"
+                );
+                assert_eq!(
+                    &fold_claims[2 * t][k].col.point[..],
+                    &tk.mat_assert.rr[..inner_t],
+                    "boolean type {t} col point is rr's head"
+                );
+                assert_eq!(
+                    &fold_claims[2 * t][k].col.low[..],
+                    &tk.mat_assert.z_partial[..],
+                    "boolean type {t} col low is z_partial"
+                );
+                assert_eq!(fold_claims[2 * t][k].value, tk.mat_assert.evals[t].0);
+                assert_eq!(fold_claims[2 * t + 1][k].value, tk.mat_assert.evals[t].1);
+            }
+            for t in 0..n_el {
+                let kappa = fold_claims[2 * n_bool + 2 * t][k].row.point.len();
+                assert_eq!(
+                    &fold_claims[2 * n_bool + 2 * t][k].row.point[..],
+                    &tk.el_assert.r_con[..kappa],
+                    "element type {t} row point is r_con's head"
+                );
+                assert_eq!(
+                    &fold_claims[2 * n_bool + 2 * t][k].col.point[..],
+                    &tk.el_assert.r_col[..kappa],
+                    "element type {t} col point is r_col's head"
+                );
+                assert_eq!(fold_claims[2 * n_bool + 2 * t][k].value, tk.el_assert.evals[t].0);
+                assert_eq!(
+                    fold_claims[2 * n_bool + 2 * t + 1][k].value,
+                    tk.el_assert.evals[t].1
+                );
+            }
+            let nu_c = tk.sigma_native.nu;
+            assert_eq!(
+                &fold_claims[n_folds - 1][k].row.point[..],
+                &tk.sigma_native.rho[..nu_c],
+                "sigma row point is the child's rho[..nu]"
+            );
+            assert_eq!(
+                &fold_claims[n_folds - 1][k].col.point[..],
+                &tk.sigma_native.rho[nu_c..],
+                "sigma col point is the child's rho[nu..]"
+            );
+            assert_eq!(fold_claims[n_folds - 1][k].value, tk.sigma_native.value);
+
+            // boolean A/B per type: batch-major mlv mapping for the row
+            // points, lc rounds REVERSED for the col points, z_partial
+            // word-for-word, values to the mat_eval advice wires.
+            for t in 0..n_bool {
+                for fi in [2 * t, 2 * t + 1] {
+                    let cl = &locs[fi].claims[k];
+                    for j in 0..cl.row_pt_n {
+                        let m = if j == 0 { 0 } else { tk.n_log_i + j };
+                        sb.connect(wv(cl.row_pt_v + j), rk.b_mlv_w[m]);
+                    }
+                    let n_lc = rk.b_lc_w.len();
+                    for j in 0..cl.col_pt_n {
+                        sb.connect(wv(cl.col_pt_v + j), rk.b_lc_w[n_lc - 1 - j]);
+                    }
+                    for j in 0..cl.col_low_n {
+                        sb.connect(wv(cl.col_low_v + j), rk.b_zpartial_w[j]);
+                    }
+                }
+                sb.connect(wv(locs[2 * t].claims[k].value_v), rk.mat_eval_w[t].0);
+                sb.connect(wv(locs[2 * t + 1].claims[k].value_v), rk.mat_eval_w[t].1);
+                // ONE lagrange-low surface per child (lagrange(z_skip) is
+                // type-independent): every boolean fold's lows connect to
+                // fold 0's, and fold 0's publish below.
+                if t > 0 {
+                    for fi in [2 * t, 2 * t + 1] {
+                        for j in 0..locs[0].claims[k].row_low_n {
+                            sb.connect(
+                                wv(locs[fi].claims[k].row_low_v + j),
+                                wv(locs[0].claims[k].row_low_v + j),
+                            );
+                        }
+                    }
+                } else {
+                    for j in 0..locs[0].claims[k].row_low_n {
+                        sb.connect(
+                            wv(locs[1].claims[k].row_low_v + j),
+                            wv(locs[0].claims[k].row_low_v + j),
+                        );
+                    }
+                }
+            }
+            // element A/B per type: r_con = zc.r[ν..] (round order), r_col
+            // = the lc rounds REVERSED, values to the per-slot eval advice.
+            for t in 0..n_el {
+                for fi in [2 * n_bool + 2 * t, 2 * n_bool + 2 * t + 1] {
+                    let cl = &locs[fi].claims[k];
+                    sb.connect(wv(cl.row_low_v), ow);
+                    sb.connect(wv(cl.col_low_v), ow);
+                    for j in 0..cl.row_pt_n {
+                        sb.connect(wv(cl.row_pt_v + j), rk.el_zc_rho_w[tk.n_log_i + j]);
+                    }
+                    let n_lc = rk.el_lc_rho_w.len();
+                    for j in 0..cl.col_pt_n {
+                        sb.connect(wv(cl.col_pt_v + j), rk.el_lc_rho_w[n_lc - 1 - j]);
+                    }
+                }
+                sb.connect(
+                    wv(locs[2 * n_bool + 2 * t].claims[k].value_v),
+                    rk.el_eval_w[t].0,
+                );
+                sb.connect(
+                    wv(locs[2 * n_bool + 2 * t + 1].claims[k].value_v),
+                    rk.el_eval_w[t].1,
+                );
+            }
+            // sigma: fully wire-to-wire.
+            let cl = &locs[n_folds - 1].claims[k];
+            sb.connect(wv(cl.row_low_v), ow);
+            sb.connect(wv(cl.col_low_v), ow);
+            for j in 0..cl.row_pt_n {
+                sb.connect(wv(cl.row_pt_v + j), rk.pt_w[j]);
+            }
+            for j in 0..cl.col_pt_n {
+                sb.connect(wv(cl.col_pt_v + j), rk.pt_w[cl.row_pt_n + j]);
+            }
+            sb.connect(wv(cl.value_v), rk.sig_w);
+        }
+
+        // Publishes: per fold, deltas + accumulator claim; then per child,
+        // the lagrange-low surface (fold 0's words).
+        let fold_pub_base = sb.public_len();
+        for fp in &fold_pubs {
+            sb.publish(fp.deltas[0]);
+            sb.publish(fp.deltas[1]);
+            for &w in &fp.rho_col {
+                sb.publish(w);
+            }
+            for &w in &fp.rho_row {
+                sb.publish(w);
+            }
+            sb.publish(fp.value);
+        }
+        for k in 0..2 {
+            for j in 0..locs[0].claims[k].row_low_n {
+                sb.publish(wv(locs[0].claims[k].row_low_v + j));
+            }
+        }
+
+        let shape2 = sb.finish().expect("the 2->1 node circuit builds");
+        assert!(
+            shape2.circuit.cells().slots().len() <= 512,
+            "the node's cell-slot budget regressed ({} slots)",
+            shape2.circuit.cells().slots().len()
+        );
+        let hint_refs: Vec<&dyn std::any::Any> =
+            hints.iter().map(|h| h as &dyn std::any::Any).collect();
+        let built2 = shape2.run(&vals, &hint_refs);
+
+        // The two child regions' checker walks — each child's whole
+        // deferred-verifier statement held against its own replicas.
+        let consumed0 = check_real_child_region(&built2.public, &rt0, &r0);
+        let consumed1 = check_real_child_region(&built2.public, &rt1, &r1);
+        assert!(
+            r0.pub_base + consumed0 <= r1.pub_base && r1.pub_base + consumed1 <= fold_pub_base,
+            "the three regions' public blocks are disjoint and ordered"
+        );
+        // The fold checker + the accumulator, reassembled from publics.
+        let rebuilt = check_fold_publics(&built2.public, fold_pub_base, &locs, &alpha_recs);
+        let tail_len: usize = locs.iter().map(|l| 3 + l.k_col + l.k_row).sum();
+        let acc_pub = aggregate::Accumulator {
+            registry_digest: registry.digest(),
+            per_type: (0..n_bool)
+                .map(|t| (rebuilt[2 * t].clone(), rebuilt[2 * t + 1].clone()))
+                .collect(),
+            per_element: (0..n_el)
+                .map(|t| {
+                    (
+                        rebuilt[2 * n_bool + 2 * t].clone(),
+                        rebuilt[2 * n_bool + 2 * t + 1].clone(),
+                    )
+                })
+                .collect(),
+            sigma: Some((lo0.shape.circuit.digest(), rebuilt[n_folds - 1].clone())),
+        };
+        assert_eq!(
+            acc_pub, acc_v,
+            "the Accumulator, reassembled from the public segment alone"
+        );
+        assert!(
+            acc_pub.discharge(&mats)
+                && acc_pub.discharge_element(&el_mats)
+                && acc_pub.discharge_sigma(&lo0.shape.circuit),
+            "the public-segment accumulator discharges all three groups"
+        );
+        // The lagrange-low publics: rebuilt from each child's PUBLISHED
+        // z_skip — the one connect left at the checker tier.
+        {
+            use flock_core::zerocheck::K_SKIP;
+            use flock_core::zerocheck::multilinear::lagrange_weights_naive;
+            let mut q = fold_pub_base + tail_len;
+            for (k, rk) in regions.iter().enumerate() {
+                let zskip_pub =
+                    built2.public[rk.pub_base + rk.n_query_pub + rk.n_tail - 1];
+                let lam = lagrange_weights_naive(K_SKIP, zskip_pub);
+                for (j, &l) in lam.iter().enumerate() {
+                    assert_eq!(
+                        built2.public[q + j],
+                        l,
+                        "child {k}: lagrange low {j} rebuilds from the published z_skip"
+                    );
+                }
+                q += 64;
+            }
+            assert_eq!(q, built2.public.len(), "the low publics are the very tail");
+        }
+
+        // The node proves and verifies over the circuit path.
+        let union2 = UnionInstance::new(&shape2.registry, shape2.counts.clone());
+        let pcs2 = PcsParams {
+            m: union2.dense_m(),
+            log_inv_rate: 1,
+            log_batch_size: 6,
+            profile: LigeritoProfile::Fast,
+            num_lanes: union2.commit_lanes(6),
+            merkle_hash: Default::default(),
+        };
+        let b3_r1cs2 = blake3::build_block_r1cs(nu2);
+        let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
+        let swap_r1cs2 = SwapTable::build_block_r1cs(nu2);
+        let swap_lc2 = swap_r1cs2.csc_lincheck_circuit();
+        let spread_ty2 = BitSpreadTable::new(rt0.max_path.max(rt1.max_path));
+        let spread_r1cs2 = spread_ty2.build_block_r1cs(nu2);
+        let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
+        let mut bslots: Vec<(usize, UnionSlotProverInput)> = vec![
+            (
+                shape2.registry_slot(cs.q.b3),
+                UnionSlotProverInput::new(
+                    blake3::generate_witness_batch_major_partial(
+                        built2.rows::<Blake3Gate>(cs.q.b3),
+                        nu2,
+                    ),
+                    b3_lc2,
+                ),
+            ),
+            (
+                shape2.registry_slot(cs.q.swap),
+                UnionSlotProverInput::new(
+                    SwapTable::generate_witness_batch_major(
+                        built2.rows::<SwapGate>(cs.q.swap),
+                        nu2,
+                    ),
+                    swap_lc2,
+                ),
+            ),
+            (
+                shape2.registry_slot(cs.q.spread),
+                UnionSlotProverInput::new(
+                    spread_ty2.generate_witness_batch_major(
+                        built2.rows::<BitSpreadGate>(cs.q.spread),
+                        nu2,
+                    ),
+                    spread_lc2,
+                ),
+            ),
+        ];
+        bslots.sort_by_key(|(i, _)| *i);
+        let mut el_ord: Vec<(usize, Vec<F128>)> = cs
+            .element_slot_ids()
+            .into_iter()
+            .map(|sl| {
+                let z = match &built2.witnesses[shape2.registry_slot(sl)] {
+                    SlotWitness::Element(z) => z.clone(),
+                    other => panic!("element slot produced {other:?}"),
+                };
+                (shape2.registry_slot(sl), z)
+            })
+            .collect();
+        el_ord.sort_by_key(|(i, _)| *i);
+        let el_inputs: Vec<UnionElementSlotInput> = el_ord
+            .into_iter()
+            .map(|(i, z)| live_element_input(z, shape2.counts[i], nu2))
+            .collect();
+        let mut lco: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
+            (shape2.registry_slot(cs.q.b3), b3_lc2),
+            (shape2.registry_slot(cs.q.swap), swap_lc2),
+            (shape2.registry_slot(cs.q.spread), spread_lc2),
+        ];
+        lco.sort_by_key(|(i, _)| *i);
+        let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
+            lco.into_iter().map(|(_, c)| c).collect();
+        let t0p = std::time::Instant::now();
+        let mut ch2 = FsChallenger::new(DOMAIN);
+        let (oproof, ocommit, _) = prover::prove_fast_ligerito_union_circuit(
+            &union2,
+            &shape2.circuit,
+            &built2.public,
+            &pcs2,
+            bslots.into_iter().map(|(_, x)| x).collect(),
+            el_inputs,
+            &mut ch2,
+        );
+        let prove_ms = t0p.elapsed().as_secs_f64() * 1e3;
+        let t0v = std::time::Instant::now();
+        let mut ch2 = FsChallenger::new(DOMAIN);
+        verifier::verify_ligerito_union_circuit(
+            &union2,
+            &shape2.circuit,
+            &built2.public,
+            &lcs2,
+            &ocommit,
+            &oproof,
+            &pcs2,
+            &mut ch2,
+        )
+        .expect("the 2->1 node verifies");
+        let verify_ms = t0v.elapsed().as_secs_f64() * 1e3;
+        let t0d = std::time::Instant::now();
+        let mut ch2 = FsChallenger::new(DOMAIN);
+        verifier::verify_ligerito_union_circuit_deferred(
+            &union2,
+            &shape2.circuit,
+            &built2.public,
+            &lcs2,
+            &ocommit,
+            &oproof,
+            &pcs2,
+            &mut ch2,
+        )
+        .expect("the 2->1 node verifies deferred");
+        let deferred_ms = t0d.elapsed().as_secs_f64() * 1e3;
+        (
+            b3_rows,
+            nu2,
+            union2.dense_m(),
+            shape2.circuit.cells().mu(),
+            prove_ms,
+            verify_ms,
+            deferred_ms,
+            bincode::serialize(&oproof).map(|b| b.len()).unwrap_or(0),
+        )
+    };
+
+    println!(
+        "\nTHE 2->1 RECURSION NODE (two REAL children + {} folds, ONE proof)\n  \
+         children: 2x the leaf outer (dense_m {} / mu {}), DISTINCT seeds, one circuit\n  \
+         regions: 2x the complete deferred verifier (swap assembly, shared slots)\n         \
+         + the fold region; CONNECTED: all points, z_partial lows, sigma fully,\n         \
+         and the matrix/element EVAL VALUES to the children's bound advice —\n         \
+         lagrange lows published, checker-rebuilt from each child's z_skip\n  \
+         outer: total b3 rows {} | nu {} | dense_m {} | mu {}\n  \
+         prove {:.0} ms | verify {:.0} ms (DEFERRED {:.0} ms) | proof {:.1} KiB\n",
+        n_folds,
+        lo0.pcs.m,
+        rt0.mu_i,
+        outer_stats.0,
+        outer_stats.1,
+        outer_stats.2,
+        outer_stats.3,
+        outer_stats.4,
+        outer_stats.5,
+        outer_stats.6,
+        outer_stats.7 as f64 / 1024.0,
+    );
+}
