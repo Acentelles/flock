@@ -1109,14 +1109,14 @@ fn aggregating_real_proofs_defers_all_matrix_work_to_one_discharge() {
     };
 
     let run = |asserts: &[lincheck::MatrixAssertion],
-               prior: Option<&aggregate::Accumulator>|
+               priors: &[&aggregate::Accumulator]|
      -> Result<aggregate::Accumulator, AggregateError> {
         let mut chp = FsChallenger::new(b"agg");
         let circs: Vec<&dyn LincheckCircuit> = vec![&agg_circ];
         let (proof, acc_p) =
-            aggregate::prove_aggregate(&registry, &mats, &circs, asserts, prior, &mut chp)?;
+            aggregate::prove_aggregate(&registry, &mats, &circs, asserts, priors, &mut chp)?;
         let mut chv = FsChallenger::new(b"agg");
-        let acc_v = aggregate::verify_aggregate(&registry, asserts, prior, &proof, &mut chv)?;
+        let acc_v = aggregate::verify_aggregate(&registry, asserts, priors, &proof, &mut chv)?;
         assert_eq!(acc_p, acc_v, "prover and verifier accumulators must agree");
         Ok(acc_v)
     };
@@ -1124,7 +1124,7 @@ fn aggregating_real_proofs_defers_all_matrix_work_to_one_discharge() {
     // Leaf: two proofs, 2 → 1 per accumulator.
     let a0 = assert_of(&slots[0], false);
     let a1 = assert_of(&slots[1], false);
-    let acc = run(&[a0, a1], None).expect("leaf aggregation verifies");
+    let acc = run(&[a0, a1], &[]).expect("leaf aggregation verifies");
     assert!(acc.discharge(&mats), "leaf accumulator must discharge");
     assert_eq!(acc.registry_digest, registry.digest());
 
@@ -1132,14 +1132,40 @@ fn aggregating_real_proofs_defers_all_matrix_work_to_one_discharge() {
     // inherited, two fresh). Still one discharge at the end.
     let a2 = assert_of(&slots[2], false);
     let a3 = assert_of(&slots[3], false);
-    let acc2 = run(&[a2, a3], Some(&acc)).expect("merge aggregation verifies");
+    let acc2 = run(&[a2, a3], &[&acc]).expect("merge aggregation verifies");
     assert!(acc2.discharge(&mats), "merged accumulator must discharge");
+
+    // The true merge-node shape: TWO priors — each child of a merge brings
+    // its own accumulator — plus fresh assertions, folding 4 → 1 per
+    // matrix (two inherited, two fresh).
+    let leaf = |i: usize, j: usize| {
+        run(&[assert_of(&slots[i], false), assert_of(&slots[j], false)], &[])
+            .expect("leaf aggregation verifies")
+    };
+    let (acc_l, acc_r) = (leaf(0, 1), leaf(2, 3));
+    let fresh = [assert_of(&slots[1], false), assert_of(&slots[2], false)];
+    let acc_m = run(&fresh, &[&acc_l, &acc_r]).expect("two-prior merge verifies");
+    assert!(acc_m.discharge(&mats), "the 4->1 accumulator must discharge");
+
+    // A tampered INHERITED claim must poison the merge: the fold verifier
+    // targets the claimed values, so the replay diverges from the honest
+    // prover's rounds — rejection or a false accumulator, both sound.
+    let mut bad_prior = acc_l.clone();
+    bad_prior.per_type[0].0.value += F128::ONE;
+    let fresh2 = [assert_of(&slots[1], false), assert_of(&slots[2], false)];
+    match run(&fresh2, &[&bad_prior, &acc_r]) {
+        Err(_) => {}
+        Ok(a) => assert!(
+            !a.discharge(&mats),
+            "a tampered inherited claim produced a true accumulator"
+        ),
+    }
 
     // A tampered report is caught by the equation check inside
     // `verify_aggregate` — a caller cannot forget it.
     let bad = assert_of(&slots[1], true);
     assert!(
-        matches!(run(&[bad], None), Err(AggregateError::Reported(_))),
+        matches!(run(&[bad], &[]), Err(AggregateError::Reported(_))),
         "a tampered matrix report must be rejected"
     );
 
@@ -1155,7 +1181,7 @@ fn aggregating_real_proofs_defers_all_matrix_work_to_one_discharge() {
     let a0b = assert_of(&slots[0], false);
     assert!(
         matches!(
-            run(&[a0b], Some(&alien)),
+            run(&[a0b], &[&alien]),
             Err(AggregateError::RegistryMismatch)
         ),
         "an accumulator from a different registry must be rejected"

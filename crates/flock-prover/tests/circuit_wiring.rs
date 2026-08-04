@@ -1487,7 +1487,7 @@ fn a_merge_node_folds_two_circuit_proofs() {
         &[],
         &[],
         Some((circuit0, &sigmas)),
-        None,
+        &[],
         &mut chp,
     )
     .expect("the fold proves");
@@ -1497,7 +1497,7 @@ fn a_merge_node_folds_two_circuit_proofs() {
         &assertions,
         &[],
         Some((circuit0, &sigmas)),
-        None,
+        &[],
         &agg,
         &mut chv,
     )
@@ -1544,14 +1544,76 @@ fn a_merge_node_folds_two_circuit_proofs() {
     let mut bad = assertions.clone();
     bad[1].evals[0].0 += F128::ONE;
     let mut chp = FsChallenger::new(b"merge");
-    let (bad_agg, _) = aggregate::prove_aggregate(&registry, &mats, &circs, &bad, None, &mut chp)
+    let (bad_agg, _) = aggregate::prove_aggregate(&registry, &mats, &circs, &bad, &[], &mut chp)
         .expect("the prover will happily fold false claims");
     let mut chv = FsChallenger::new(b"merge");
-    match aggregate::verify_aggregate(&registry, &bad, None, &bad_agg, &mut chv) {
+    match aggregate::verify_aggregate(&registry, &bad, &[], &bad_agg, &mut chv) {
         Err(_) => {}
         Ok(a) => assert!(
             !a.discharge(&mats),
             "a corrupted child produced a true accumulator"
         ),
     }
+
+    // The RECURSIVE merge shape: each child folded alone first (its own
+    // leaf accumulator, sigma included), then a merge over the TWO priors —
+    // the inherited claims fold 2 -> 1 per group with no fresh assertions,
+    // and the sigma group rides along keyed by the shared circuit digest.
+    let fold_one = |i: usize| -> aggregate::Accumulator {
+        let mut chp = FsChallenger::new(b"child-leaf");
+        let (agg1, _) = aggregate::prove_aggregate_classes(
+            &registry,
+            &mats,
+            &circs,
+            &assertions[i..i + 1],
+            &[],
+            &[],
+            Some((circuit0, &sigmas[i..i + 1])),
+            &[],
+            &mut chp,
+        )
+        .expect("the single-child fold proves");
+        let mut chv = FsChallenger::new(b"child-leaf");
+        aggregate::verify_aggregate_classes(
+            &registry,
+            &assertions[i..i + 1],
+            &[],
+            Some((circuit0, &sigmas[i..i + 1])),
+            &[],
+            &agg1,
+            &mut chv,
+        )
+        .expect("the single-child fold verifies")
+    };
+    let (acc_a, acc_b) = (fold_one(0), fold_one(1));
+    let mut chp = FsChallenger::new(b"merge-two-priors");
+    let (agg2, acc2_p) = aggregate::prove_aggregate_classes(
+        &registry,
+        &mats,
+        &circs,
+        &[],
+        &[],
+        &[],
+        Some((circuit0, &[])),
+        &[&acc_a, &acc_b],
+        &mut chp,
+    )
+    .expect("the two-prior merge proves");
+    let mut chv = FsChallenger::new(b"merge-two-priors");
+    let acc2_v = aggregate::verify_aggregate_classes(
+        &registry,
+        &[],
+        &[],
+        Some((circuit0, &[])),
+        &[&acc_a, &acc_b],
+        &agg2,
+        &mut chv,
+    )
+    .expect("the two-prior merge verifies");
+    assert_eq!(acc2_p, acc2_v, "prover and verifier accumulators must agree");
+    assert!(acc2_v.discharge(&mats), "the inherited-only merge discharges");
+    assert!(
+        acc2_v.discharge_sigma(circuit0),
+        "both children's sigma claims fold through the merge to one root discharge"
+    );
 }

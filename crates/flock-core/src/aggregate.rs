@@ -34,8 +34,9 @@
 //! per-proof, so a claim about `α·A₀ + B₀` names a different polynomial in
 //! every proof. Within one accumulator the fold takes
 //!
-//! * the claim each verified proof emitted (one per proof), plus
-//! * the one claim carried in by `prior`, if this is not a leaf.
+//! * the claim carried in by each prior accumulator (a merge node's
+//!   children each bring one), in order, then
+//! * the claim each verified proof emitted (one per proof).
 //!
 //! So a leaf over two proofs folds `2 → 1`, and a `2 → 1` merge of two
 //! recursive proofs folds `4 → 1` (two inherited, two fresh).
@@ -195,18 +196,18 @@ pub enum AggregateError {
     Discharge,
 }
 
-/// Claims to fold for one type, in a fixed order: the prior accumulator's
-/// first (if any), then one per assertion. Prover and verifier build this
-/// the same way, so the fold transcripts line up.
+/// Claims to fold for one type, in a fixed order: the prior accumulators'
+/// first (in the order given), then one per assertion. Prover and verifier
+/// build this the same way, so the fold transcripts line up.
 fn gather(
     registry: &Registry,
     assertions: &[MatrixAssertion],
-    prior: Option<&Accumulator>,
+    priors: &[&Accumulator],
     t: usize,
 ) -> (Vec<MatrixClaim>, Vec<MatrixClaim>) {
-    let mut a = Vec::with_capacity(assertions.len() + 1);
-    let mut b = Vec::with_capacity(assertions.len() + 1);
-    if let Some(p) = prior {
+    let mut a = Vec::with_capacity(assertions.len() + priors.len());
+    let mut b = Vec::with_capacity(assertions.len() + priors.len());
+    for p in priors {
         a.push(p.per_type[t].0.clone());
         b.push(p.per_type[t].1.clone());
     }
@@ -218,13 +219,34 @@ fn gather(
     (a, b)
 }
 
-fn bind<Ch: Challenger>(registry: &Registry, prior: Option<&Accumulator>, ch: &mut Ch) {
+/// The prior COUNT is one transcript byte — `0`/`1` coincide with the old
+/// `is_some` flag, so pre-existing transcripts are unchanged.
+fn bind<Ch: Challenger>(registry: &Registry, priors: &[&Accumulator], ch: &mut Ch) {
+    assert!(priors.len() < 256, "at most 255 prior accumulators");
     ch.observe_label(DOMAIN);
     ch.observe_bytes(&registry.digest());
-    ch.observe_bytes(&[u8::from(prior.is_some())]);
+    ch.observe_bytes(&[priors.len() as u8]);
 }
 
-/// Fold `assertions` (and `prior`, if this is not a leaf) into one
+/// The shape checks every entry runs on its priors: same registry, and a
+/// claim pair for every type of BOTH classes.
+fn check_priors(
+    registry: &Registry,
+    priors: &[&Accumulator],
+    n_element: usize,
+) -> Result<(), AggregateError> {
+    for p in priors {
+        if p.registry_digest != registry.digest()
+            || p.per_type.len() != registry.num_boolean()
+            || p.per_element.len() != n_element
+        {
+            return Err(AggregateError::RegistryMismatch);
+        }
+    }
+    Ok(())
+}
+
+/// Fold `assertions` (and `priors`, if this is not a leaf) into one
 /// accumulator. `O(k · Σ_t nnz_t)` — the matrices are read here, natively,
 /// so that no circuit ever has to.
 pub fn prove_aggregate<Ch: Challenger>(
@@ -232,10 +254,10 @@ pub fn prove_aggregate<Ch: Challenger>(
     mats: &[TypeMatrices<'_>],
     circuits: &[&dyn crate::lincheck::LincheckCircuit],
     assertions: &[MatrixAssertion],
-    prior: Option<&Accumulator>,
+    priors: &[&Accumulator],
     ch: &mut Ch,
 ) -> Result<(AggregateProof, Accumulator), AggregateError> {
-    prove_aggregate_classes(registry, mats, circuits, assertions, &[], &[], None, prior, ch)
+    prove_aggregate_classes(registry, mats, circuits, assertions, &[], &[], None, priors, ch)
 }
 
 /// [`prove_aggregate`] over BOTH classes: the boolean assertions against
@@ -251,29 +273,25 @@ pub fn prove_aggregate_classes<Ch: Challenger>(
     el_mats: &[ElementMatrices<'_>],
     el_assertions: &[(&crate::union::UnionInstance<'_>, ElementAssertion)],
     sigma: Option<(&crate::circuit::Circuit, &[crate::circuit::SigmaAssertion])>,
-    prior: Option<&Accumulator>,
+    priors: &[&Accumulator],
     ch: &mut Ch,
 ) -> Result<(AggregateProof, Accumulator), AggregateError> {
     // Sigma never travels alone: a circuit proof's deferred verify yields
     // the matrix assertions AND the sigma assertion together, so the
     // boolean group always has work when the sigma group does.
-    if assertions.is_empty() && prior.is_none() {
+    if assertions.is_empty() && priors.is_empty() {
         return Err(AggregateError::Empty);
     }
     if mats.len() != registry.num_boolean() {
         return Err(AggregateError::Malformed);
     }
-    if let Some(p) = prior {
-        if p.registry_digest != registry.digest() || p.per_type.len() != registry.num_boolean() {
-            return Err(AggregateError::RegistryMismatch);
-        }
-    }
+    check_priors(registry, priors, el_mats.len())?;
 
-    bind(registry, prior, ch);
+    bind(registry, priors, ch);
     let mut folds = Vec::with_capacity(registry.num_boolean());
     let mut per_type = Vec::with_capacity(registry.num_boolean());
     for (t, (ma, mb)) in mats.iter().enumerate() {
-        let (ca, cb) = gather(registry, assertions, prior, t);
+        let (ca, cb) = gather(registry, assertions, priors, t);
         // The k·nnz work. ONE `fold_split` per claim yields the column
         // marginals for BOTH matrices, so the A- and B-folds share it — and
         // it runs on the type's tuned kernel rather than a generic sparse
@@ -306,7 +324,7 @@ pub fn prove_aggregate_classes<Ch: Challenger>(
     let mut el_folds = Vec::with_capacity(el_mats.len());
     let mut per_element = Vec::with_capacity(el_mats.len());
     for (t, (ma, mb)) in el_mats.iter().enumerate() {
-        let (ca, cb) = gather_element(el_assertions, prior, t);
+        let (ca, cb) = gather_element(el_assertions, priors, t);
         let n_cols = ma.num_cols;
         let combs_a: Vec<Vec<F128>> = ca
             .iter()
@@ -323,7 +341,7 @@ pub fn prove_aggregate_classes<Ch: Challenger>(
     }
 
     let (sigma_fold, sigma_out) =
-        fold_sigma_prove(sigma, prior, ch)?;
+        fold_sigma_prove(sigma, priors, ch)?;
 
     Ok((
         AggregateProof {
@@ -340,27 +358,29 @@ pub fn prove_aggregate_classes<Ch: Challenger>(
     ))
 }
 
-/// The sigma group's fold (route B): the prior's folded claim first, then
-/// one claim per assertion — the same fixed order every group uses. All
-/// claims must name the SAME circuit (digest-keyed; normalisation).
+/// The sigma group's fold (route B): the priors' folded claims first (in
+/// order), then one claim per assertion — the same fixed order every group
+/// uses. All claims must name the SAME circuit (digest-keyed;
+/// normalisation).
 fn fold_sigma_prove<Ch: Challenger>(
     sigma: Option<(&crate::circuit::Circuit, &[crate::circuit::SigmaAssertion])>,
-    prior: Option<&Accumulator>,
+    priors: &[&Accumulator],
     ch: &mut Ch,
 ) -> Result<(Option<FoldProof>, Option<([u8; 32], MatrixClaim)>), AggregateError> {
-    let prior_sigma = prior.and_then(|p| p.sigma.as_ref());
+    let prior_sigmas: Vec<&([u8; 32], MatrixClaim)> =
+        priors.iter().filter_map(|p| p.sigma.as_ref()).collect();
     let Some((circuit, asserts)) = sigma else {
         // No circuit supplied: a prior sigma claim cannot be carried
         // (it would leave the accumulator silently unfolded).
-        return if prior_sigma.is_some() {
-            Err(AggregateError::RegistryMismatch)
-        } else {
+        return if prior_sigmas.is_empty() {
             Ok((None, None))
+        } else {
+            Err(AggregateError::RegistryMismatch)
         };
     };
     let digest = circuit.digest();
     let mut claims: Vec<MatrixClaim> = Vec::new();
-    if let Some((d, c)) = prior_sigma {
+    for (d, c) in prior_sigmas {
         if *d != digest {
             return Err(AggregateError::RegistryMismatch);
         }
@@ -385,16 +405,16 @@ fn fold_sigma_prove<Ch: Challenger>(
     Ok((Some(pf), Some((digest, out))))
 }
 
-/// Element claims to fold for one type: the prior's first, then one per
-/// assertion — the same fixed order the boolean side uses.
+/// Element claims to fold for one type: the priors' first (in order), then
+/// one per assertion — the same fixed order the boolean side uses.
 fn gather_element(
     assertions: &[(&crate::union::UnionInstance<'_>, ElementAssertion)],
-    prior: Option<&Accumulator>,
+    priors: &[&Accumulator],
     t: usize,
 ) -> (Vec<MatrixClaim>, Vec<MatrixClaim>) {
-    let mut a = Vec::with_capacity(assertions.len() + 1);
-    let mut b = Vec::with_capacity(assertions.len() + 1);
-    if let Some(p) = prior {
+    let mut a = Vec::with_capacity(assertions.len() + priors.len());
+    let mut b = Vec::with_capacity(assertions.len() + priors.len());
+    for p in priors {
         a.push(p.per_element[t].0.clone());
         b.push(p.per_element[t].1.clone());
     }
@@ -423,9 +443,9 @@ pub fn fold_and_discharge(
     assertions: &[MatrixAssertion],
 ) -> Result<(), AggregateError> {
     let mut chp = crate::challenger::FsChallenger::new(DOMAIN);
-    let (proof, _) = prove_aggregate(registry, mats, circuits, assertions, None, &mut chp)?;
+    let (proof, _) = prove_aggregate(registry, mats, circuits, assertions, &[], &mut chp)?;
     let mut chv = crate::challenger::FsChallenger::new(DOMAIN);
-    let acc = verify_aggregate(registry, assertions, None, &proof, &mut chv)?;
+    let acc = verify_aggregate(registry, assertions, &[], &proof, &mut chv)?;
     if acc.discharge(mats) {
         Ok(())
     } else {
@@ -446,11 +466,11 @@ pub fn fold_and_discharge(
 pub fn verify_aggregate<Ch: Challenger>(
     registry: &Registry,
     assertions: &[MatrixAssertion],
-    prior: Option<&Accumulator>,
+    priors: &[&Accumulator],
     proof: &AggregateProof,
     ch: &mut Ch,
 ) -> Result<Accumulator, AggregateError> {
-    verify_aggregate_classes(registry, assertions, &[], None, prior, proof, ch)
+    verify_aggregate_classes(registry, assertions, &[], None, priors, proof, ch)
 }
 
 /// [`verify_aggregate`] over BOTH classes. Reads no matrix of either kind.
@@ -459,46 +479,38 @@ pub fn verify_aggregate_classes<Ch: Challenger>(
     assertions: &[MatrixAssertion],
     el_assertions: &[(&crate::union::UnionInstance<'_>, ElementAssertion)],
     sigma: Option<(&crate::circuit::Circuit, &[crate::circuit::SigmaAssertion])>,
-    prior: Option<&Accumulator>,
+    priors: &[&Accumulator],
     proof: &AggregateProof,
     ch: &mut Ch,
 ) -> Result<Accumulator, AggregateError> {
     // Sigma never travels alone: a circuit proof's deferred verify yields
     // the matrix assertions AND the sigma assertion together, so the
     // boolean group always has work when the sigma group does.
-    if assertions.is_empty() && prior.is_none() {
+    if assertions.is_empty() && priors.is_empty() {
         return Err(AggregateError::Empty);
     }
     if proof.folds.len() != registry.num_boolean() {
         return Err(AggregateError::Malformed);
     }
-    if let Some(p) = prior {
-        if p.registry_digest != registry.digest() || p.per_type.len() != registry.num_boolean() {
-            return Err(AggregateError::RegistryMismatch);
-        }
-    }
+    check_priors(registry, priors, proof.el_folds.len())?;
     for assertion in assertions {
         assertion
             .check_reported(registry)
             .map_err(AggregateError::Reported)?;
     }
 
-    bind(registry, prior, ch);
+    bind(registry, priors, ch);
     let mut per_type = Vec::with_capacity(registry.num_boolean());
     for (t, (pa, pb)) in proof.folds.iter().enumerate() {
-        let (ca, cb) = gather(registry, assertions, prior, t);
+        let (ca, cb) = gather(registry, assertions, priors, t);
         let out_a = matrix_fold::verify_fold(&ca, pa, ch).map_err(AggregateError::Fold)?;
         let out_b = matrix_fold::verify_fold(&cb, pb, ch).map_err(AggregateError::Fold)?;
         per_type.push((out_a, out_b));
     }
 
-    // The element group, replayed the same way. Its fold count is the number
-    // of element types, which the accumulator (if any) must already agree on.
-    if let Some(p) = prior {
-        if p.per_element.len() != proof.el_folds.len() {
-            return Err(AggregateError::RegistryMismatch);
-        }
-    }
+    // The element group, replayed the same way. Its fold count is the
+    // number of element types, which `check_priors` already held every
+    // accumulator to.
     for (union, assertion) in el_assertions {
         assertion
             .check_reported(union)
@@ -506,7 +518,7 @@ pub fn verify_aggregate_classes<Ch: Challenger>(
     }
     let mut per_element = Vec::with_capacity(proof.el_folds.len());
     for (t, (pa, pb)) in proof.el_folds.iter().enumerate() {
-        let (ca, cb) = gather_element(el_assertions, prior, t);
+        let (ca, cb) = gather_element(el_assertions, priors, t);
         let out_a = matrix_fold::verify_fold(&ca, pa, ch).map_err(AggregateError::Fold)?;
         let out_b = matrix_fold::verify_fold(&cb, pb, ch).map_err(AggregateError::Fold)?;
         per_element.push((out_a, out_b));
@@ -516,13 +528,14 @@ pub fn verify_aggregate_classes<Ch: Challenger>(
     // sigma table here; the fold verifies against the CLAIMS alone, and
     // the table is only touched at the root discharge.
     let sigma_out = {
-        let prior_sigma = prior.and_then(|p| p.sigma.as_ref());
+        let prior_sigmas: Vec<&([u8; 32], MatrixClaim)> =
+            priors.iter().filter_map(|p| p.sigma.as_ref()).collect();
         match (sigma, &proof.sigma_fold) {
-            (None, None) if prior_sigma.is_none() => None,
+            (None, None) if prior_sigmas.is_empty() => None,
             (Some((circuit, asserts)), pf_opt) => {
                 let digest = circuit.digest();
                 let mut claims: Vec<MatrixClaim> = Vec::new();
-                if let Some((d, c)) = prior_sigma {
+                for (d, c) in prior_sigmas {
                     if *d != digest {
                         return Err(AggregateError::RegistryMismatch);
                     }
