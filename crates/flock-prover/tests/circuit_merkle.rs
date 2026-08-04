@@ -2408,13 +2408,13 @@ impl GateType for SpineGate {
 /// `q_field` is a public input, bound at the boundary: the checker masks the
 /// (already published) challenge word natively — same pattern as the cap
 /// select.
-/// Smallest kappa whose column budget holds `c_need`, floored at the
-/// region-friendly 6. Prior shapes stay at 6 (bit-identical); the real
-/// inner's yr=32 close-out pushes some gates to 7 or 8 — both licensed
-/// (the kappa-7 probe, and MVP-7's original kappa-8 leaf-eval table).
+/// Smallest kappa whose column budget holds `c_need` (floored at MacGate's
+/// 3). Tight envelopes matter: the element region's size is the sum of
+/// 2^kappa envelopes rounded to a power of two, and the union's column
+/// domain (claim-point lengths, the eq-dot loops, run counts) follows it.
 fn gate_kappa(c_need: usize) -> usize {
     assert!(c_need <= 256, "gate spills kappa=8 ({c_need} cols)");
-    (c_need.next_power_of_two().trailing_zeros() as usize).max(6)
+    (c_need.next_power_of_two().trailing_zeros() as usize).max(3)
 }
 
 struct ResidualGate {
@@ -2433,9 +2433,12 @@ impl ResidualGate {
     ///   q(0), ris(1..=pl), aw, one, acc_in[yr]          — inputs (n_in)
     ///   s_1..s_{lmc-1}                                   — the chain
     ///   pk_0..pk_{pl-1}, pr_1..pr_{pl-1}                 — prefix terms/products
-    ///   w_0..w_{yl-1}                                    — normalized suffix
     ///   sp for each y with >=2 bits                      — subset products
-    ///   t = aw*prefix, c_y (y>0), acc_out[yr]            — the contributions
+    ///   t = aw*prefix (pl>0 only), c_y (y>0), acc_out[yr] — the contributions
+    ///
+    /// The normalized suffix factors W_j = s_{pl+j}(q)/s_{pl+j}(v) have no
+    /// cells of their own: each use is fused into a product as a mult_lin
+    /// side `(s_col, inv)` — the envelope program.
     fn new(log_msg_cols: usize, prefix_len: usize, yr_log_n: usize, sks_vks: &[F128]) -> Self {
         use flock_core::element_r1cs::ElementTableBuilder;
         let one_w = F128::ONE;
@@ -2446,11 +2449,10 @@ impl ResidualGate {
         let n_in = 1 + pl + 1 + 1 + yr;
         let (q, aw, one, acc0) = (0usize, 1 + pl, 2 + pl, 3 + pl);
         // Total columns, counted up front so kappa ADAPTS: inputs, the
-        // chain (lmc−1), prefix (2·pl), suffix (yl), subset products
-        // (yr−1−yl), t, contributions (yr−1) and accumulators (yr).
-        // Real-inner shapes spill kappa 6; the kappa-7 probe licenses 7
-        // (prior shapes stay at 6, bit-identical).
-        let c_need = 1 + 4 * pl + yl + 4 * yr;
+        // chain (lmc−1), prefix (2·pl), multi-bit subset products
+        // (yr−1−yl), t only when pl>0, contributions (yr−1) and
+        // accumulators (yr). Sums to 4·pl + 4·yr + [pl>0].
+        let c_need = 4 * pl + 4 * yr + usize::from(pl > 0);
         let kappa = gate_kappa(c_need);
         let mut c = n_in; // next free column
         let mut b = ElementTableBuilder::new(kappa);
@@ -2479,39 +2481,46 @@ impl ResidualGate {
             pr = c;
             c += 1;
         }
-        // suffix W columns, normalized.
-        let mut w = Vec::with_capacity(yl);
-        for j in 0..yl {
-            b.linear(c, &[(s_col[pl + j], inv(sks_vks[pl + j]))]);
-            w.push(c);
-            c += 1;
-        }
-        // subset products; sp[y]: None = 1 (y=0), single bit = w[j].
+        // Suffix factor for bit j, as a fused mult_lin side (no cell).
+        let wf = |j: usize| (s_col[pl + j], inv(sks_vks[pl + j]));
+        // Subset products, multi-bit y only; y=0 is the empty product and
+        // single-bit y is a fused factor at the point of use.
         let mut sp: Vec<Option<usize>> = vec![None; yr];
-        for (j, &wc) in w.iter().enumerate() {
-            sp[1 << j] = Some(wc);
-        }
         for y in 1..yr {
-            if sp[y].is_none() {
+            if !y.is_power_of_two() {
                 let low = y & y.wrapping_neg();
-                b.mult(c, sp[y ^ low].unwrap(), sp[low].unwrap());
+                let jl = low.trailing_zeros() as usize;
+                let rest = y ^ low;
+                if rest.is_power_of_two() {
+                    b.mult_lin(c, &[wf(rest.trailing_zeros() as usize)], &[wf(jl)]);
+                } else {
+                    b.mult_lin(c, &[(sp[rest].unwrap(), one_w)], &[wf(jl)]);
+                }
                 sp[y] = Some(c);
                 c += 1;
             }
         }
-        // t = aw * prefix; contributions and accumulators.
-        b.mult(c, aw, pr);
-        let t = c;
-        c += 1;
+        // t = aw * prefix (aw itself when the prefix is empty);
+        // contributions and accumulators.
+        let t = if pl > 0 {
+            b.mult(c, aw, pr);
+            c += 1;
+            c - 1
+        } else {
+            aw
+        };
         let mut acc_out = Vec::with_capacity(yr);
-        for (y, spy) in sp.iter().enumerate() {
-            let cy = match spy {
-                None => t,
-                Some(spc) => {
-                    b.mult(c, t, *spc);
-                    c += 1;
-                    c - 1
-                }
+        for y in 0..yr {
+            let cy = if y == 0 {
+                t
+            } else if y.is_power_of_two() {
+                b.mult_lin(c, &[(t, one_w)], &[wf(y.trailing_zeros() as usize)]);
+                c += 1;
+                c - 1
+            } else {
+                b.mult(c, t, sp[y].unwrap());
+                c += 1;
+                c - 1
             };
             b.linear(c, &[(acc0 + y, one_w), (cy, one_w)]);
             acc_out.push(c);
@@ -2568,36 +2577,43 @@ impl GateType for ResidualGate {
             pr_v = z[c];
             c += 1;
         }
-        let mut w = Vec::with_capacity(yl);
-        for j in 0..yl {
-            z[c] = z[s_col[pl + j]] * inv(self.sks_vks[pl + j]);
-            w.push(c);
-            c += 1;
-        }
+        let w_v: Vec<F128> = (0..yl)
+            .map(|j| z[s_col[pl + j]] * inv(self.sks_vks[pl + j]))
+            .collect();
         let mut sp: Vec<Option<usize>> = vec![None; self.yr];
-        for (j, &wc) in w.iter().enumerate() {
-            sp[1 << j] = Some(wc);
-        }
         for y in 1..self.yr {
-            if sp[y].is_none() {
+            if !y.is_power_of_two() {
                 let low = y & y.wrapping_neg();
-                z[c] = z[sp[y ^ low].unwrap()] * z[sp[low].unwrap()];
+                let jl = low.trailing_zeros() as usize;
+                let rest = y ^ low;
+                z[c] = if rest.is_power_of_two() {
+                    w_v[rest.trailing_zeros() as usize] * w_v[jl]
+                } else {
+                    z[sp[rest].unwrap()] * w_v[jl]
+                };
                 sp[y] = Some(c);
                 c += 1;
             }
         }
-        z[c] = z[1 + pl] * pr_v;
-        let t = c;
-        c += 1;
+        let t_v = if pl > 0 {
+            z[c] = z[1 + pl] * pr_v;
+            c += 1;
+            z[c - 1]
+        } else {
+            z[1 + pl]
+        };
         let mut outs = Vec::with_capacity(self.yr);
-        for (y, spy) in sp.iter().enumerate() {
-            let cy = match spy {
-                None => z[t],
-                Some(spc) => {
-                    z[c] = z[t] * z[*spc];
-                    c += 1;
-                    z[c - 1]
-                }
+        for y in 0..self.yr {
+            let cy = if y == 0 {
+                t_v
+            } else {
+                z[c] = if y.is_power_of_two() {
+                    t_v * w_v[y.trailing_zeros() as usize]
+                } else {
+                    t_v * z[sp[y].unwrap()]
+                };
+                c += 1;
+                z[c - 1]
             };
             z[c] = z[acc0 + y] + cy;
             outs.push(z[c]);
@@ -2689,7 +2705,9 @@ impl PrefixGate {
         let o = F128::ONE;
         let n_in = 2 + 2 * pl; // seed, a[pl], b[pl], one
         let one = n_in - 1;
-        let c_need = 2 + 4 * pl;
+        // FUSED: each factor is ONE mult_lin cell, pr' = pr·(1 + a + b) —
+        // the B side is a linear combination (the envelope program).
+        let c_need = n_in + pl;
         let kappa = gate_kappa(c_need);
         let mut c = n_in;
         let mut bl = ElementTableBuilder::new(kappa);
@@ -2698,9 +2716,7 @@ impl PrefixGate {
         }
         let mut pr = 0;
         for j in 0..pl {
-            bl.linear(c, &[(one, o), (1 + j, o), (1 + pl + j, o)]);
-            c += 1;
-            bl.mult(c, pr, c - 1);
+            bl.mult_lin(c, &[(pr, o)], &[(one, o), (1 + j, o), (1 + pl + j, o)]);
             pr = c;
             c += 1;
         }
@@ -2729,9 +2745,7 @@ impl GateType for PrefixGate {
         let mut c = self.n_in;
         let mut pr = z[0];
         for j in 0..self.pl {
-            z[c] = F128::ONE + z[1 + j] + z[1 + self.pl + j];
-            c += 1;
-            z[c] = pr * z[c - 1];
+            z[c] = pr * (F128::ONE + z[1 + j] + z[1 + self.pl + j]);
             pr = z[c];
             c += 1;
         }
@@ -5652,17 +5666,22 @@ fn emit_residual_region(
             apply_suffix(sb, &mut evb_accs, pw, &coords);
         }
     }
-    // beta-weighted residuals fold in per level, then the yr dot.
-    let pcslot = sb.slot(PartialCombineGate::new(chunk_log));
+    // beta-weighted residuals fold in per level, then the yr dot. The
+    // combine rows are pure accumulate — no cross-position structure — so
+    // they sub-chunk to 4-wide (17 cols, kappa 5): rows are live-prefix
+    // cheap, columns are the envelope.
+    let pc_log = chunk_log.min(2);
+    let pc = 1usize << pc_log;
+    let pcslot = sb.slot(PartialCombineGate::new(pc_log));
     leaf_slot.push((301, pcslot));
     let mut comb = evb_accs;
     for (li, lvl) in levels.iter().enumerate() {
-        for h in 0..n_chunks {
+        for h in 0..(yr_len / pc) {
             let mut g_in = vec![chw(lvl.beta_fin)];
-            g_in.extend_from_slice(&comb[h * chunk..(h + 1) * chunk]);
-            g_in.extend_from_slice(&resid_pub[li][h * chunk..(h + 1) * chunk]);
+            g_in.extend_from_slice(&comb[h * pc..(h + 1) * pc]);
+            g_in.extend_from_slice(&resid_pub[li][h * pc..(h + 1) * pc]);
             let out = sb.gate(pcslot, &g_in);
-            comb[h * chunk..(h + 1) * chunk].copy_from_slice(&out);
+            comb[h * pc..(h + 1) * pc].copy_from_slice(&out);
         }
     }
     let fdslot = sb.slot(FinalDotGate::new(chunk_log));
