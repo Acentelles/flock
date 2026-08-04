@@ -10331,20 +10331,18 @@ struct ChildTape<'p> {
     zc_rounds_b: Vec<(usize, usize)>,
     outer_b: (usize, usize),
     lc_rounds_b: Vec<(usize, usize)>,
-    // z_skip's ordinals — the boolean claims' lagrange row lows derive from
-    // it; the mvp11 connect step publishes the wire and checker-validates.
-    #[allow(dead_code)]
+    // z_skip's ordinals (the boolean claims' lagrange row lows derive from
+    // it — published, checker-validated) and z_partial's value ordinal (the
+    // boolean claims' column lows — absorbed child words, connectable).
     zskip_ch: usize,
-    #[allow(dead_code)]
     zskip_fin: usize,
+    zp_v: usize,
     // published chain ordinals
     ga_c: usize,
     ga_fin: usize,
     mg_c: usize,
     mg_fin: usize,
-    // native references + replicas (bool_assert is the mvp11 connect step's
-    // reference for the boolean claims' advice surfaces)
-    #[allow(dead_code)]
+    // native references + replicas
     bool_assert: flock_core::lincheck::MatrixAssertion,
     el_assert: flock_core::element_r1cs::union::ElementAssertion,
     sigma_native: flock_core::circuit::SigmaAssertion,
@@ -11022,8 +11020,10 @@ impl<'p> ChildTape<'p> {
             .max_by_key(|&r| bounds_i[r].2)
             .expect("at least one run");
         // The boolean PIOP's round ordinals, located with fins: the RS
-        // statements sit at points made of its round challenges.
-        let (zc_rounds_b, (zskip_ch, zskip_fin), (outer_ch_b, outer_fin_b), lc_rounds_b) = {
+        // statements sit at points made of its round challenges, and the
+        // MatrixAssertion's surfaces (x_inner_rest, rr, z_skip, z_partial)
+        // map onto the same walk — the merge node's connects consume them.
+        let (zc_rounds_b, (zskip_ch, zskip_fin), (outer_ch_b, outer_fin_b), lc_rounds_b, zp_v) = {
             let mut i2 = zc_l[0] + 1;
             assert!(matches!(ops[i2], Op::SqueezeSlice(_)), "r_skip slice");
             i2 += 1;
@@ -11061,12 +11061,80 @@ impl<'p> ChildTape<'p> {
                 lc_r.push((vc_at(i2 + 2).1, fin_at(i2 + 2)));
                 i2 += 3;
             }
-            (zc_r, zskip, outer, lc_r)
+            assert!(matches!(ops[i2], Op::ObserveSlice(64)), "z_partial slice");
+            let (zp, _) = vc_at(i2);
+            (zc_r, zskip, outer, lc_r, zp)
         };
         assert!(
             lc_rounds_b.len() <= 1 + k_cols_i,
             "lc rounds fit the col bits"
         );
+        // The MatrixAssertion's surfaces map onto located ordinals — asserted
+        // value-for-value so the merge node's connects consume VERIFIED wire
+        // indices, not layout assumptions. The mlv rounds follow the
+        // BATCH-MAJOR packing [k_skip | dim6 | rows | high col vars]:
+        // round 0 binds x_inner_rest[0] (the dim-6 var), rounds 1..1+ν bind
+        // x_outer (the rows — what mvp10's RS-point composition uses), and
+        // the remaining rounds bind x_inner_rest[1..]. rr is the lc rounds
+        // REVERSED; z_skip is the located squeeze; z_partial the located
+        // slice. (Two wrong layout guesses died on these asserts before
+        // this mapping — the method-note discipline earning its keep.)
+        {
+            let inner_b = bool_assert.x_inner_rest.len();
+            assert_eq!(
+                zc_rounds_b.len(),
+                inner_b + n_log_i,
+                "zc mlv rounds = x_inner_rest + x_outer"
+            );
+            for (j, &x) in bool_assert.x_inner_rest.iter().enumerate() {
+                let m = if j == 0 { 0 } else { n_log_i + j };
+                assert_eq!(
+                    chals[zc_rounds_b[m].0],
+                    x,
+                    "x_inner_rest {j} is located zc round {m}"
+                );
+            }
+            assert_eq!(lc_rounds_b.len(), bool_assert.rr.len(), "lc round count");
+            for (j, &x) in bool_assert.rr.iter().enumerate() {
+                assert_eq!(
+                    chals[lc_rounds_b[lc_rounds_b.len() - 1 - j].0],
+                    x,
+                    "rr {j} is the located lc round, reversed"
+                );
+            }
+            assert_eq!(chals[zskip_ch], bool_assert.z_skip, "z_skip located");
+            assert_eq!(
+                &vals_rec[zp_v..zp_v + 64],
+                &bool_assert.z_partial[..],
+                "z_partial on the stream"
+            );
+            // The element assertion's points: r_con = zc.r[ν..] (round
+            // order), r_col = the lc bind order reversed.
+            assert_eq!(
+                el_rec.zc_rounds.len(),
+                n_log_i + el_assert.r_con.len(),
+                "element zc rounds = rows + r_con"
+            );
+            for (j, &x) in el_assert.r_con.iter().enumerate() {
+                assert_eq!(
+                    chals[el_rec.zc_rounds[n_log_i + j].2],
+                    x,
+                    "el r_con {j} is a located element zc round"
+                );
+            }
+            assert_eq!(
+                el_rec.lc_rounds.len(),
+                el_assert.r_col.len(),
+                "element lc round count"
+            );
+            for (j, &x) in el_assert.r_col.iter().enumerate() {
+                assert_eq!(
+                    chals[el_rec.lc_rounds[el_rec.lc_rounds.len() - 1 - j].2],
+                    x,
+                    "el r_col {j} is the located element lc round, reversed"
+                );
+            }
+        }
         let x_ab_n: Vec<F128> = {
             let p = &native_claims.ab.point;
             let mut v = p.x_inner_rest.clone();
@@ -11277,6 +11345,7 @@ impl<'p> ChildTape<'p> {
             lc_rounds_b,
             zskip_ch,
             zskip_fin,
+            zp_v,
             ga_c,
             ga_fin,
             mg_c,
@@ -11367,14 +11436,22 @@ struct ChildRegion {
     n_el_deltas: usize,
     n_sqrt_deltas: usize,
     /// The sigma assertion's wires: the deferred s_sigma stream word and the
-    /// GKR's accumulated squeeze point — the mvp11 connect step's targets.
-    #[allow(dead_code)]
+    /// GKR's accumulated squeeze point.
     sig_w: Wire,
-    #[allow(dead_code)]
     pt_w: Vec<Wire>,
+    /// The element assertion's point wires: every element zc round rho (in
+    /// round order — r_con = zc.r[ν..]) and every element lc round rho (in
+    /// round order — r_col is these reversed).
+    el_zc_rho_w: Vec<Wire>,
+    el_lc_rho_w: Vec<Wire>,
+    /// The boolean MatrixAssertion's wires: the zc mlv round rhos (round
+    /// order — [dim6 | x_outer | x_inner_rest]), the lc round rhos (round
+    /// order — rr is these reversed), and the absorbed z_partial words.
+    b_mlv_w: Vec<Wire>,
+    b_lc_w: Vec<Wire>,
+    b_zpartial_w: Vec<Wire>,
     /// The residual close-out's prefix slot (and width) — reusable by a
     /// caller emitting more prefix products into the same builder.
-    #[allow(dead_code)]
     pf: (flock_core::circuit::builder::SlotId, usize),
 }
 
@@ -11991,6 +12068,11 @@ fn emit_child_region(
         sb.publish(*d);
     }
     sb.publish(anchor_delta);
+    // The z_skip squeeze wire, published: the boolean claims' lagrange row
+    // lows derive from it, and the merge node's checker rebuilds them from
+    // THIS published value (the alpha-expansion trust class — the
+    // SkipNodeGate/φ8 in-circuit derivation is the recorded upgrade).
+    sb.publish(outs[trace.squeezes[ct.zskip_fin][0]][0]);
     let n_tail = 2
         + gkr_deltas.len()
         + el_deltas.len()
@@ -12001,6 +12083,7 @@ fn emit_child_region(
         + 1
         + ct.mu_i
         + sqrt_deltas.len()
+        + 1
         + 1;
     let n_query_pub: usize = levels.len()
         + levels
@@ -12017,6 +12100,23 @@ fn emit_child_region(
         n_sqrt_deltas: sqrt_deltas.len(),
         sig_w,
         pt_w,
+        el_zc_rho_w: el_rec
+            .zc_rounds
+            .iter()
+            .map(|&(_, rfin, _)| outs[trace.squeezes[rfin][0]][0])
+            .collect(),
+        el_lc_rho_w: el_rec
+            .lc_rounds
+            .iter()
+            .map(|&(_, rfin, _)| outs[trace.squeezes[rfin][0]][0])
+            .collect(),
+        b_mlv_w: mlv_pw.iter().map(|&(_, w)| w).collect(),
+        b_lc_w: ct
+            .lc_rounds_b
+            .iter()
+            .map(|&(_, fin)| outs[trace.squeezes[fin][0]][0])
+            .collect(),
+        b_zpartial_w: (0..64).map(|i| wv(ct.zp_v + i)).collect(),
         pf: (pfslot, pf_w),
     }
 }
@@ -12175,6 +12275,11 @@ fn check_child_region(public: &[F128], ct: &ChildTape<'_>, r: &ChildRegion) -> u
         public[axp_base + r.n_sqrt_deltas],
         F128::ZERO,
         "the anchor claim == expect zero-delta (R=2 and P>0)"
+    );
+    assert_eq!(
+        public[axp_base + r.n_sqrt_deltas + 1],
+        chals[ct.zskip_ch],
+        "the published z_skip is the located squeeze"
     );
     r.n_query_pub + r.n_tail
 }
@@ -12921,12 +13026,21 @@ fn mvp11_sigma_fold_tape() {
 /// exercised. The five outputs reassemble the verifier's `Accumulator`
 /// exactly, and all three groups discharge.
 ///
-/// **Step 3 adds the CHILD-TAPE regions**: the same outer circuit now also
-/// carries each child's complete deferred verifier (mvp10's assembly via
-/// the extracted [`emit_child_region`], instantiated twice over shared
-/// slots), each checked by [`check_child_region`] against its own native
-/// replicas — so the merge node's statement and its children's statements
-/// live in ONE proof.
+/// **Step 3 adds the CHILD-TAPE regions and CONNECTS them**: the same
+/// outer circuit also carries each child's complete deferred verifier
+/// (mvp10's assembly via the extracted [`emit_child_region`], instantiated
+/// twice over shared slots, each checked by [`check_child_region`] against
+/// its own native replicas), and the fold's absorbed claim surfaces are
+/// copy-constrained to the child regions' assertion-emission wires: the
+/// sigma claims fully (value = each child's deferred s_sigma stream word,
+/// point = its GKR squeezes), the element and boolean claims' points
+/// (chain squeeze wires) and the boolean z_partial lows (absorbed child
+/// words). The matrix-eval values and the lagrange row lows stay the
+/// boundary pattern — published, held by the checker against the
+/// children's own assertions and against each child's PUBLISHED z_skip
+/// (the SkipNodeGate/φ8 in-circuit derivation is the recorded upgrade).
+/// The merge node's statement and its children's statements live in ONE
+/// proof, and the fold no longer folds free inputs.
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn mvp11_merge_fold_region() {
@@ -13527,6 +13641,127 @@ fn mvp11_merge_fold_region() {
                 value,
             });
         }
+        // ---- STEP 3's CONNECTS: the fold's absorbed claim surfaces ARE
+        // the child regions' assertion-emission wires ----
+        // Every surface the child region carries as a WIRE is now
+        // copy-constrained to the fold's absorbed stream word: the sigma
+        // claims fully (value = the child's own deferred s_sigma stream
+        // word, point = its GKR squeezes), the element and boolean claims'
+        // POINTS (the children's chain squeeze wires), and the boolean
+        // claims' z_partial lows (absorbed child words, word for word).
+        // What has no child wire stays the boundary pattern: the
+        // matrix-eval VALUES (deferred proof fields — published below and
+        // held against the children's own assertions) and the lagrange row
+        // lows (published below; the checker rebuilds them from each
+        // child's PUBLISHED z_skip — the SkipNodeGate/φ8 in-circuit
+        // derivation is the recorded upgrade).
+        let tapes = [&t0, &t1];
+        let regions = [&r0, &r1];
+        for (k, (tk, rk)) in tapes.iter().zip(&regions).enumerate() {
+            // Native pre-asserts (the method-note discipline): every wire
+            // mapping below is first checked value-for-value against the
+            // verifier's own assertion data.
+            let nu_c = tk.sigma_native.nu;
+            assert_eq!(
+                &fold_claims[4][k].row.point[..],
+                &tk.sigma_native.rho[..nu_c],
+                "sigma row point is the child's rho[..nu]"
+            );
+            assert_eq!(
+                &fold_claims[4][k].col.point[..],
+                &tk.sigma_native.rho[nu_c..],
+                "sigma col point is the child's rho[nu..]"
+            );
+            assert_eq!(
+                fold_claims[4][k].value, tk.sigma_native.value,
+                "sigma value is the child's deferred evaluation"
+            );
+            let kappa = fold_claims[2][k].row.point.len();
+            assert_eq!(
+                &fold_claims[2][k].row.point[..],
+                &tk.el_assert.r_con[..kappa],
+                "element row point is r_con's head"
+            );
+            assert_eq!(
+                &fold_claims[2][k].col.point[..],
+                &tk.el_assert.r_col[..kappa],
+                "element col point is r_col's head"
+            );
+            assert_eq!(fold_claims[2][k].value, tk.el_assert.evals[0].0);
+            assert_eq!(fold_claims[3][k].value, tk.el_assert.evals[0].1);
+            let inner_b = fold_claims[0][k].row.point.len();
+            assert_eq!(
+                &fold_claims[0][k].row.point[..],
+                &tk.bool_assert.x_inner_rest[..inner_b],
+                "boolean row point is x_inner_rest's head"
+            );
+            assert_eq!(
+                &fold_claims[0][k].col.point[..],
+                &tk.bool_assert.rr[..inner_b],
+                "boolean col point is rr's head"
+            );
+            assert_eq!(
+                &fold_claims[0][k].col.low[..],
+                &tk.bool_assert.z_partial[..],
+                "boolean col low is z_partial"
+            );
+            assert_eq!(fold_claims[0][k].value, tk.bool_assert.evals[0].0);
+            assert_eq!(fold_claims[1][k].value, tk.bool_assert.evals[0].1);
+
+            // sigma: fully wire-to-wire (the eq lows are the constant 1).
+            let cl = &locs[4].claims[k];
+            sb.connect(wv(cl.row_low_v), ow);
+            sb.connect(wv(cl.col_low_v), ow);
+            for j in 0..cl.row_pt_n {
+                sb.connect(wv(cl.row_pt_v + j), rk.pt_w[j]);
+            }
+            for j in 0..cl.col_pt_n {
+                sb.connect(wv(cl.col_pt_v + j), rk.pt_w[cl.row_pt_n + j]);
+            }
+            sb.connect(wv(cl.value_v), rk.sig_w);
+            // element A/B: r_con = zc.r[ν..] (round order), r_col = the lc
+            // rounds REVERSED — both chains' squeeze wires.
+            for fi in [2, 3] {
+                let cl = &locs[fi].claims[k];
+                sb.connect(wv(cl.row_low_v), ow);
+                sb.connect(wv(cl.col_low_v), ow);
+                for j in 0..cl.row_pt_n {
+                    sb.connect(wv(cl.row_pt_v + j), rk.el_zc_rho_w[tk.n_log_i + j]);
+                }
+                let n_lc = rk.el_lc_rho_w.len();
+                for j in 0..cl.col_pt_n {
+                    sb.connect(wv(cl.col_pt_v + j), rk.el_lc_rho_w[n_lc - 1 - j]);
+                }
+            }
+            // boolean A/B: x_inner_rest follows the batch-major packing
+            // (round 0 = the dim-6 var, rounds 1..1+ν = x_outer, the rest
+            // = x_inner_rest[1..]), rr = the lc rounds REVERSED, and the
+            // z_partial lows are the child's absorbed words.
+            for fi in [0, 1] {
+                let cl = &locs[fi].claims[k];
+                for j in 0..cl.row_pt_n {
+                    let m = if j == 0 { 0 } else { tk.n_log_i + j };
+                    sb.connect(wv(cl.row_pt_v + j), rk.b_mlv_w[m]);
+                }
+                let n_lc = rk.b_lc_w.len();
+                for j in 0..cl.col_pt_n {
+                    sb.connect(wv(cl.col_pt_v + j), rk.b_lc_w[n_lc - 1 - j]);
+                }
+                for j in 0..cl.col_low_n {
+                    sb.connect(wv(cl.col_low_v + j), rk.b_zpartial_w[j]);
+                }
+            }
+            // The two boolean folds absorb ONE claim surface twice: fold
+            // B's lagrange lows are the same words as fold A's — connected,
+            // so the published copies below bind both.
+            for j in 0..locs[0].claims[k].row_low_n {
+                sb.connect(
+                    wv(locs[1].claims[k].row_low_v + j),
+                    wv(locs[0].claims[k].row_low_v + j),
+                );
+            }
+        }
+
         // Publishes AFTER every input is declared: per fold, the two
         // zero-deltas then the accumulator claim (ρ_col, ρ_row, value).
         let fold_pub_base = sb.public_len();
@@ -13540,6 +13775,20 @@ fn mvp11_merge_fold_region() {
                 sb.publish(w);
             }
             sb.publish(fp.value);
+        }
+        // The value-binding publics: the fold's own absorbed words,
+        // published so the checker can hold them against the children's
+        // assertions (the matrix-eval values are deferred proof fields with
+        // no child wire yet) and against each child's published z_skip
+        // (the lagrange lows).
+        for k in 0..2 {
+            for j in 0..locs[0].claims[k].row_low_n {
+                sb.publish(wv(locs[0].claims[k].row_low_v + j));
+            }
+            sb.publish(wv(locs[0].claims[k].value_v));
+            sb.publish(wv(locs[1].claims[k].value_v));
+            sb.publish(wv(locs[2].claims[k].value_v));
+            sb.publish(wv(locs[3].claims[k].value_v));
         }
 
         let shape2 = sb.finish().expect("the mvp11 merge circuit builds");
@@ -13564,8 +13813,7 @@ fn mvp11_merge_fold_region() {
         // Accumulator from the public segment alone, and discharge all
         // three groups.
         let tail_len: usize = locs.iter().map(|l| 3 + l.k_col + l.k_row).sum();
-        let tail0 = built2.public.len() - tail_len;
-        assert_eq!(tail0, fold_pub_base, "the fold's publics are the tail");
+        let tail0 = fold_pub_base;
         let mut p = tail0;
         let mut rebuilt: Vec<MatrixClaim> = Vec::new();
         for loc in &locs {
@@ -13621,6 +13869,55 @@ fn mvp11_merge_fold_region() {
                 && acc_pub.discharge_sigma(&built0.shape.circuit),
             "the public-segment accumulator discharges all three groups"
         );
+        // The value-binding publics past the fold blocks: per child, the
+        // boolean claims' 64 lagrange lows — rebuilt from the CHILD's own
+        // published z_skip, closing the one surface the connects left to
+        // the checker tier — then the four matrix-eval values held against
+        // the children's assertions.
+        {
+            use flock_core::zerocheck::K_SKIP;
+            use flock_core::zerocheck::multilinear::lagrange_weights_naive;
+            let mut q = tail0 + tail_len;
+            for (k, (tk, rk)) in tapes.iter().zip(&regions).enumerate() {
+                let zskip_pub =
+                    built2.public[rk.pub_base + rk.n_query_pub + rk.n_tail - 1];
+                let lam = lagrange_weights_naive(K_SKIP, zskip_pub);
+                for (j, &l) in lam.iter().enumerate() {
+                    assert_eq!(
+                        built2.public[q + j],
+                        l,
+                        "child {k}: lagrange low {j} rebuilds from the published z_skip"
+                    );
+                }
+                q += 64;
+                assert_eq!(
+                    built2.public[q],
+                    tk.bool_assert.evals[0].0,
+                    "child {k}: boolean A eval"
+                );
+                assert_eq!(
+                    built2.public[q + 1],
+                    tk.bool_assert.evals[0].1,
+                    "child {k}: boolean B eval"
+                );
+                assert_eq!(
+                    built2.public[q + 2],
+                    tk.el_assert.evals[0].0,
+                    "child {k}: element A eval"
+                );
+                assert_eq!(
+                    built2.public[q + 3],
+                    tk.el_assert.evals[0].1,
+                    "child {k}: element B eval"
+                );
+                q += 4;
+            }
+            assert_eq!(
+                q,
+                built2.public.len(),
+                "the value-binding publics are the very tail"
+            );
+        }
 
         // The outer proves and verifies over the circuit path.
         let union2 = UnionInstance::new(&shape2.registry, shape2.counts.clone());
@@ -13731,6 +14028,10 @@ fn mvp11_merge_fold_region() {
         "\nMVP-11 MERGE NODE (2 CHILD-TAPE REGIONS + bind + 5 folds, ONE outer circuit)\n  \
          children: 2x the mvp10 assembly over SHARED slots (each the complete\n         \
          deferred verifier of its child, b3 rows {} + {})\n  \
+         CONNECTED: every fold claim's points bound to child chain wires (sigma\n         \
+         fully, incl. its value = the child's s_sigma stream word; z_partial\n         \
+         lows word-for-word); eval values + lagrange lows published, checker-\n         \
+         held vs the children's assertions + each child's published z_skip\n  \
          folds: blake3 A/B ({} col + {} row rounds each, low-64 weights via LeafEval\n         \
          chains), mac A/B ({}+{} rounds, pure eq — FIRST element-group exercise),\n         \
          sigma ({}+{})\n  \
