@@ -14982,21 +14982,24 @@ fn mvp11_swap_children_fold_scale() {
 /// its proof attests both children's verification AND the fold that
 /// combined their claims. (It is not yet SELF-similar — normalization is
 /// deliberately out of scope.)
-#[test]
-#[ignore] // Heavier — run with `-- --ignored`.
-fn mvp11_two_to_one_recursion_node() {
+/// Build a 2→1 RECURSION NODE over two children and return its artifacts
+/// AS A [`LeafOuter`] (plus its output accumulator): the node's proof is
+/// BLAKE3/BLAKE3-recursable and shaped exactly like a child input, so the
+/// builder composes with ITSELF — `build_node_outer(&n0, &n1)` is the
+/// level-2 node consuming its own outputs. The children must share one
+/// circuit digest (the foldability key); their claims land at unrelated FS
+/// points. Every tape pin, connect, and checker walk of the 2→1 milestone
+/// lives inside — the builder IS the test.
+fn build_node_outer(
+    lo0: &LeafOuter,
+    lo1: &LeafOuter,
+) -> (LeafOuter, flock_core::aggregate::Accumulator) {
     use flock_core::aggregate;
     use flock_core::matrix_fold::{FoldProof, MatrixClaim};
     use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
 
     const M11_NODE_DOMAIN: &[u8] = b"flock-mvp11-two-to-one-v0";
 
-    // Two DISTINCT children: the seed varies only the leaf workload, so
-    // the node CIRCUIT is shared — the foldability key — while every claim
-    // lands at an unrelated FS point (index bugs in the connects cannot
-    // pass on equal values).
-    let lo0 = build_leaf_outer_seeded(0x4D50_9B00);
-    let lo1 = build_leaf_outer_seeded(0x4D50_9B01);
     assert_eq!(
         lo0.shape.circuit.digest(),
         lo1.shape.circuit.digest(),
@@ -15462,7 +15465,11 @@ fn mvp11_two_to_one_recursion_node() {
             log_batch_size: 6,
             profile: LigeritoProfile::Fast,
             num_lanes: union2.commit_lanes(6),
-            merkle_hash: Default::default(),
+            // BLAKE3 for BOTH Merkle and FS: the node's proof must be
+            // RECURSABLE — a parent replays this transcript in-circuit,
+            // and each default diverges silently (the two recorded
+            // gotchas, third occurrence).
+            merkle_hash: HashKind::Blake3,
         };
         let b3_r1cs2 = blake3::build_block_r1cs(nu2);
         let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
@@ -15529,7 +15536,7 @@ fn mvp11_two_to_one_recursion_node() {
         let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
             lco.into_iter().map(|(_, c)| c).collect();
         let t0p = std::time::Instant::now();
-        let mut ch2 = FsChallenger::new(DOMAIN);
+        let mut ch2 = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
         let (oproof, ocommit, _) = prover::prove_fast_ligerito_union_circuit(
             &union2,
             &shape2.circuit,
@@ -15541,7 +15548,7 @@ fn mvp11_two_to_one_recursion_node() {
         );
         let prove_ms = t0p.elapsed().as_secs_f64() * 1e3;
         let t0v = std::time::Instant::now();
-        let mut ch2 = FsChallenger::new(DOMAIN);
+        let mut ch2 = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
         verifier::verify_ligerito_union_circuit(
             &union2,
             &shape2.circuit,
@@ -15555,7 +15562,7 @@ fn mvp11_two_to_one_recursion_node() {
         .expect("the 2->1 node verifies");
         let verify_ms = t0v.elapsed().as_secs_f64() * 1e3;
         let t0d = std::time::Instant::now();
-        let mut ch2 = FsChallenger::new(DOMAIN);
+        let mut ch2 = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
         verifier::verify_ligerito_union_circuit_deferred(
             &union2,
             &shape2.circuit,
@@ -15568,7 +15575,23 @@ fn mvp11_two_to_one_recursion_node() {
         )
         .expect("the 2->1 node verifies deferred");
         let deferred_ms = t0d.elapsed().as_secs_f64() * 1e3;
-        (
+        let (b3_slot2, swap_slot2, spread_slot2) = (
+            shape2.registry_slot(cs.q.b3),
+            shape2.registry_slot(cs.q.swap),
+            shape2.registry_slot(cs.q.spread),
+        );
+        println!(
+            "\nTHE 2->1 RECURSION NODE (two children + {} folds, ONE proof)\n  \
+             children: dense_m {} / mu {}, one circuit, distinct FS points\n  \
+             regions: 2x the complete deferred verifier (swap assembly, shared slots)\n         \
+             + the fold region; CONNECTED: all points, z_partial lows, sigma fully,\n         \
+             and the matrix/element EVAL VALUES to the children's bound advice —\n         \
+             lagrange lows published, checker-rebuilt from each child's z_skip\n  \
+             outer: total b3 rows {} | nu {} | dense_m {} | mu {}\n  \
+             prove {:.0} ms | verify {:.0} ms (DEFERRED {:.0} ms) | proof {:.1} KiB\n",
+            n_folds,
+            lo0.pcs.m,
+            rt0.mu_i,
             b3_rows,
             nu2,
             union2.dense_m(),
@@ -15576,29 +15599,186 @@ fn mvp11_two_to_one_recursion_node() {
             prove_ms,
             verify_ms,
             deferred_ms,
-            bincode::serialize(&oproof).map(|b| b.len()).unwrap_or(0),
+            bincode::serialize(&oproof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
+        );
+        (
+            LeafOuter {
+                public: built2.public.clone(),
+                shape: shape2,
+                proof: oproof,
+                commitment: ocommit,
+                pcs: pcs2,
+                b3_r1cs: b3_r1cs2,
+                swap_r1cs: swap_r1cs2,
+                spread_r1cs: spread_r1cs2,
+                b3_slot: b3_slot2,
+                swap_slot: swap_slot2,
+                spread_slot: spread_slot2,
+            },
+            acc_v,
         )
     };
+    outer_stats
+}
 
+/// **THE 2→1 RECURSION NODE** — see [`build_node_outer`], which carries the
+/// whole milestone (two real children's deferred verifiers + the 35-fold
+/// region + the connects, one recursable proof out); this wrapper pins it
+/// over two distinct leaf children.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn mvp11_two_to_one_recursion_node() {
+    let lo0 = build_leaf_outer_seeded(0x4D50_9B00);
+    let lo1 = build_leaf_outer_seeded(0x4D50_9B01);
+    build_node_outer(&lo0, &lo1);
+}
+
+/// **MVP-12: the node consumes its own output — the recursion TOWER.**
+///
+/// Four leaves → two 2→1 nodes → ONE level-2 node, built by calling
+/// [`build_node_outer`] ON ITS OWN OUTPUTS. What this pins:
+///
+/// - The node circuit is SEED-INDEPENDENT (two nodes over different leaf
+///   pairs share one digest — the foldability key at node level), and
+/// - a node's proof PARSES AS A CHILD: `RealTape::new` re-asserts the
+///   whole swap map on a node proof, and the level-2 build runs the same
+///   emitters, connects and checkers over node-shaped children — 2→1
+///   recursion composes.
+/// - The SHAPE CENSUS (printed): level-2's outer vs level-1's — the
+///   convergence data for pinning the normalization envelope.
+///
+/// TWO WALLS, hit concretely and deliberately left native (the
+/// normalization worklist, recorded in the handoff):
+/// - REGISTRY: the leaf outer's tables sit at nu 13, the node's at nu 16
+///   (k_log differs), so a leaf-level accumulator cannot be a PRIOR of a
+///   node-level fold — the accumulator chain needs one registry across
+///   levels (pin nu*).
+/// - SIGMA is digest-keyed: leaf-circuit sigma claims and node-circuit
+///   sigma claims cannot fold together — the accumulator needs per-digest
+///   sigma entries (bounded at 2 for the leaf/node two-circuit tree), or
+///   full one-circuit normalization.
+/// Until those land, the tree's root discharges ONE accumulator PER LEVEL
+/// (all rebuilt from public segments): bounded-depth trees work today;
+/// the walls are what stand between this and one accumulator total.
+#[test]
+#[ignore] // Heaviest — run with `-- --ignored`.
+fn mvp12_recursion_tower() {
+    // Four DISTINCT leaves, two per node.
+    let l0 = build_leaf_outer_seeded(0x4D50_9B00);
+    let l1 = build_leaf_outer_seeded(0x4D50_9B01);
+    let l2 = build_leaf_outer_seeded(0x4D50_9B02);
+    let l3 = build_leaf_outer_seeded(0x4D50_9B03);
+
+    // Level 1: two 2→1 nodes.
+    let (n0, acc0) = build_node_outer(&l0, &l1);
+    let (n1, acc1) = build_node_outer(&l2, &l3);
+    assert_eq!(
+        n0.shape.circuit.digest(),
+        n1.shape.circuit.digest(),
+        "the NODE circuit is seed-independent — the tower's foldability key"
+    );
+    assert_ne!(
+        n0.shape.circuit.digest(),
+        l0.shape.circuit.digest(),
+        "the node circuit is NOT yet the leaf circuit (normalization pending)"
+    );
+
+    // Level 2: the node consumes ITS OWN OUTPUTS — the same builder, the
+    // same emitters, the same connects, over node-shaped children.
+    let (n2, acc2) = build_node_outer(&n0, &n1);
+
+    // The root's obligations, one accumulator per level (the walls above
+    // are what collapse these to one): the leaf-level accumulators against
+    // the LEAF registry's matrices + circuit, the node-level accumulator
+    // against the NODE registry's.
+    let leaf_mats = {
+        let mut v = vec![
+            (l0.b3_slot, (&l0.b3_r1cs.a_0, &l0.b3_r1cs.b_0)),
+            (l0.swap_slot, (&l0.swap_r1cs.a_0, &l0.swap_r1cs.b_0)),
+            (l0.spread_slot, (&l0.spread_r1cs.a_0, &l0.spread_r1cs.b_0)),
+        ];
+        v.sort_by_key(|&(i, _)| i);
+        v.into_iter().map(|(_, m)| m).collect::<Vec<_>>()
+    };
+    let leaf_el_mats: Vec<_> = l0
+        .shape
+        .registry
+        .element_types()
+        .iter()
+        .map(|s| {
+            let t = s.element_type().expect("an element slot's table");
+            (t.a_0(), t.b_0())
+        })
+        .collect();
+    for (k, acc) in [&acc0, &acc1].into_iter().enumerate() {
+        assert!(acc.discharge(&leaf_mats), "leaf-level acc {k}: boolean");
+        assert!(
+            acc.discharge_element(&leaf_el_mats),
+            "leaf-level acc {k}: element"
+        );
+        assert!(
+            acc.discharge_sigma(&l0.shape.circuit),
+            "leaf-level acc {k}: sigma (keyed by the LEAF circuit)"
+        );
+    }
+    let node_mats = {
+        let mut v = vec![
+            (n0.b3_slot, (&n0.b3_r1cs.a_0, &n0.b3_r1cs.b_0)),
+            (n0.swap_slot, (&n0.swap_r1cs.a_0, &n0.swap_r1cs.b_0)),
+            (n0.spread_slot, (&n0.spread_r1cs.a_0, &n0.spread_r1cs.b_0)),
+        ];
+        v.sort_by_key(|&(i, _)| i);
+        v.into_iter().map(|(_, m)| m).collect::<Vec<_>>()
+    };
+    let node_el_mats: Vec<_> = n0
+        .shape
+        .registry
+        .element_types()
+        .iter()
+        .map(|s| {
+            let t = s.element_type().expect("an element slot's table");
+            (t.a_0(), t.b_0())
+        })
+        .collect();
+    assert!(acc2.discharge(&node_mats), "node-level acc: boolean");
+    assert!(
+        acc2.discharge_element(&node_el_mats),
+        "node-level acc: element"
+    );
+    assert!(
+        acc2.discharge_sigma(&n0.shape.circuit),
+        "node-level acc: sigma (keyed by the NODE circuit)"
+    );
+
+    // ---- the SHAPE CENSUS: the convergence data for the envelope ----
+    // If level-2's outer shape equals level-1's, the tower is already at
+    // its fixed-point envelope and normalization is exact-shape pinning,
+    // not shrinking.
+    let (m1, mu1, pub1) = (
+        n0.pcs.m,
+        n0.shape.circuit.cells().mu(),
+        n0.public.len(),
+    );
+    let (m2, mu2, pub2) = (
+        n2.pcs.m,
+        n2.shape.circuit.cells().mu(),
+        n2.public.len(),
+    );
+    let converged = n2.shape.circuit.digest() == n0.shape.circuit.digest();
     println!(
-        "\nTHE 2->1 RECURSION NODE (two REAL children + {} folds, ONE proof)\n  \
-         children: 2x the leaf outer (dense_m {} / mu {}), DISTINCT seeds, one circuit\n  \
-         regions: 2x the complete deferred verifier (swap assembly, shared slots)\n         \
-         + the fold region; CONNECTED: all points, z_partial lows, sigma fully,\n         \
-         and the matrix/element EVAL VALUES to the children's bound advice —\n         \
-         lagrange lows published, checker-rebuilt from each child's z_skip\n  \
-         outer: total b3 rows {} | nu {} | dense_m {} | mu {}\n  \
-         prove {:.0} ms | verify {:.0} ms (DEFERRED {:.0} ms) | proof {:.1} KiB\n",
-        n_folds,
-        lo0.pcs.m,
-        rt0.mu_i,
-        outer_stats.0,
-        outer_stats.1,
-        outer_stats.2,
-        outer_stats.3,
-        outer_stats.4,
-        outer_stats.5,
-        outer_stats.6,
-        outer_stats.7 as f64 / 1024.0,
+        "\nMVP-12 RECURSION TOWER (4 leaves -> 2 nodes -> 1 level-2 node)\n  \
+         level-1 node: dense_m {} | mu {} | publics {} | proof {:.1} KiB\n  \
+         level-2 node: dense_m {} | mu {} | publics {} | proof {:.1} KiB\n  \
+         level-2 digest == level-1 digest: {} (the normalization target:\n  \
+         make this true — then ONE circuit serves every internal level)\n",
+        m1,
+        mu1,
+        pub1,
+        bincode::serialize(&n0.proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
+        m2,
+        mu2,
+        pub2,
+        bincode::serialize(&n2.proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
+        converged,
     );
 }
