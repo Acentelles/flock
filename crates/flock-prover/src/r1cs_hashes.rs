@@ -16,6 +16,7 @@ pub mod chain_common;
 pub mod common;
 /// The Fiat–Shamir chain: BLAKE3 over a transcript with a finalize forked at
 /// every squeeze — the FS chain's witness generator, over [`blake3`]'s rows.
+pub mod family_h;
 pub mod fs_chain;
 pub mod keccak;
 /// 3-wide Keccak-f[1600] R1CS (3 independent permutations per K_LOG=17 block)
