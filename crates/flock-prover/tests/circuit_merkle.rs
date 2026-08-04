@@ -4428,7 +4428,11 @@ fn mvp7_real_query_phase() {
     vals.extend_from_slice(&iv_w);
     let iv = [sb.public_input(), sb.public_input()];
     let mut consts: Vec<(F128, Wire)> = Vec::new();
-    let pub_payloads = bytes_payload_mask(t_shape.ops());
+    let mut pub_payloads = bytes_payload_mask(t_shape.ops());
+    let cap_pays = cap_payloads(&stream, &bytes, &lvl_src);
+    for &p in &cap_pays[1..] {
+        pub_payloads[p] = false;
+    }
     let (outs, word_wire) = emit_fs_chain(
         &mut sb,
         slots.b3,
@@ -4458,7 +4462,7 @@ fn mvp7_real_query_phase() {
     // AFTER every input is declared: `built.public` lists entries in
     // DECLARATION order, so publishing inside the loop would interleave with
     // the next level's public inputs and break the tail walk below.
-    let cap_w = cap_wires(&stream, &bytes, &word_wire, &lvl_src);
+    let cap_w = cap_wires(&stream, &word_wire, &cap_pays);
     let (to_publish, level_accs) = emit_query_phase(
         &mut sb,
         slots,
@@ -5405,23 +5409,9 @@ fn level_geometry(
     (geo, native_sums)
 }
 
-/// Locate each level's absorbed cap in the stream and return its node
-/// wires: per level, `2^c` word-wire pairs in cap-layer order.
-///
-/// Payloads are CONTENT-matched — the flattened cap bytes must equal a
-/// whole `observe_bytes` payload — searching FORWARD (levels absorb their
-/// caps in transcript order: the statement's L0 cap first, then each
-/// recursion round's), so a size collision with another absorbed surface
-/// (the sigma V cap, a child's publics payload) cannot mislocate: a
-/// different tree's 32-byte digests never reproduce this cap's bytes.
-fn cap_wires(
-    stream: &flock_core::transcript_record::Stream,
-    bytes: &[u8],
-    word_wire: &[Option<Wire>],
-    lvl_src: &[(&[[u8; 32]], &Vec<Vec<F128>>, &Vec<[u8; 32]>)],
-) -> Vec<Vec<[Wire; 2]>> {
+/// Stream-word indices per `observe_bytes` payload, in payload-word order.
+fn payload_words(stream: &flock_core::transcript_record::Stream) -> Vec<Vec<usize>> {
     use flock_core::transcript_record::StreamWord;
-    // payload -> its stream-word indices, in payload-word order.
     let mut pay_words: Vec<Vec<usize>> = Vec::new();
     for (wi, w) in stream.words.iter().enumerate() {
         if let StreamWord::Bytes { payload, word } = *w {
@@ -5432,6 +5422,29 @@ fn cap_wires(
             pay_words[payload].push(wi);
         }
     }
+    pay_words
+}
+
+/// Locate each level's absorbed cap payload in the stream: one payload
+/// index per level, in level order.
+///
+/// Payloads are CONTENT-matched — the flattened cap bytes must equal a
+/// whole `observe_bytes` payload — searching FORWARD (levels absorb their
+/// caps in transcript order: the statement's L0 cap first, then each
+/// recursion round's), so a size collision with another absorbed surface
+/// (the sigma V cap, a child's publics payload) cannot mislocate: a
+/// different tree's 32-byte digests never reproduce this cap's bytes.
+///
+/// Entry 0 is the L0 cap — the COMMITMENT, a statement surface that stays
+/// public. Entries 1.. are the recursive caps — PROOF BODY: since the
+/// in-circuit cap trees bind them (chain + root connects, nothing
+/// checker-read), their payloads demote to witness in `pub_payloads`.
+fn cap_payloads(
+    stream: &flock_core::transcript_record::Stream,
+    bytes: &[u8],
+    lvl_src: &[(&[[u8; 32]], &Vec<Vec<F128>>, &Vec<[u8; 32]>)],
+) -> Vec<usize> {
+    let pay_words = payload_words(stream);
     let mut out = Vec::with_capacity(lvl_src.len());
     let mut from = 0usize;
     for (li, (cap, _, _)) in lvl_src.iter().enumerate() {
@@ -5447,7 +5460,22 @@ fn cap_wires(
             })
             .unwrap_or_else(|| panic!("L{li}: absorbed cap payload located"));
         from = p + 1;
-        out.push(
+        out.push(p);
+    }
+    out
+}
+
+/// The absorbed caps' node wires: per level, `2^c` word-wire pairs in
+/// cap-layer order, read off the [`cap_payloads`]-located payloads.
+fn cap_wires(
+    stream: &flock_core::transcript_record::Stream,
+    word_wire: &[Option<Wire>],
+    cap_pays: &[usize],
+) -> Vec<Vec<[Wire; 2]>> {
+    let pay_words = payload_words(stream);
+    cap_pays
+        .iter()
+        .map(|&p| {
             pay_words[p]
                 .chunks(2)
                 .map(|c| {
@@ -5456,10 +5484,9 @@ fn cap_wires(
                         word_wire[c[1]].expect("cap word wired"),
                     ]
                 })
-                .collect(),
-        );
-    }
-    out
+                .collect()
+        })
+        .collect()
 }
 
 /// Emit the whole QUERY PHASE — every level's Merkle openings against the
@@ -7193,7 +7220,11 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         vals.extend_from_slice(&iv_w);
         let iv = [sb.public_input(), sb.public_input()];
         let mut consts: Vec<(F128, Wire)> = Vec::new();
-        let pub_payloads = bytes_payload_mask(ops);
+        let mut pub_payloads = bytes_payload_mask(ops);
+        let cap_pays = cap_payloads(&stream, &bytes, &lvl_src);
+        for &p in &cap_pays[1..] {
+            pub_payloads[p] = false;
+        }
         let (outs, ww) = emit_fs_chain(
             &mut sb,
             slots.b3,
@@ -7250,7 +7281,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             .collect();
 
         let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
-        let cap_w = cap_wires(&stream, &bytes, &ww, &lvl_src);
+        let cap_w = cap_wires(&stream, &ww, &cap_pays);
         let (to_publish, level_accs) = emit_query_phase(
             &mut sb,
             slots,
@@ -8391,6 +8422,8 @@ struct RealTape<'p> {
     chals: Vec<F128>,
     /// Which byte payloads stay PUBLIC under the witness/public split.
     pub_payloads: Vec<bool>,
+    /// Per level, the absorbed cap's payload index ([`cap_payloads`]).
+    cap_pays: Vec<usize>,
     // chain materials
     trace: flock_prover::r1cs_hashes::fs_chain::FsChainTrace,
     stream: flock_core::transcript_record::Stream,
@@ -8524,7 +8557,7 @@ impl<'p> RealTape<'p> {
         let chals: Vec<F128> = rec.challenges().to_vec();
         let vals_rec: Vec<F128> = rec.values().to_vec();
         let ops = t_shape.ops();
-        let pub_payloads = bytes_payload_mask(ops);
+        let mut pub_payloads = bytes_payload_mask(ops);
         let vc_at = |end: usize| -> (usize, usize) {
             let (mut v, mut c) = (0usize, 0usize);
             for op in &ops[..end] {
@@ -8759,6 +8792,13 @@ impl<'p> RealTape<'p> {
                 .map(|g| (g.row_words.div_ceil(4) + g.depth) * g.q + (1usize << g.c) - 1)
                 .sum::<usize>();
         let spread_w = geo.iter().map(|g| g.depth).max().unwrap().max(1);
+        // Recursive caps are PROOF BODY — the in-circuit cap trees bind them
+        // (chain + root connects, nothing checker-read); only the L0 cap —
+        // the commitment — stays a statement public.
+        let cap_pays = cap_payloads(&stream, &bytes, &lvl_src);
+        for &p in &cap_pays[1..] {
+            pub_payloads[p] = false;
+        }
 
         // The PoW grinding ops, located (the mvp7 machinery).
         let pows: Vec<(usize, usize, u32)> = {
@@ -9380,6 +9420,7 @@ impl<'p> RealTape<'p> {
             vals_rec,
             chals,
             pub_payloads,
+            cap_pays,
             trace,
             stream,
             bytes,
@@ -9559,7 +9600,7 @@ fn emit_real_child_region(
         })
         .collect();
 
-    let cap_w = cap_wires(stream, &rt.bytes, &ww, &rt.lvl_src);
+    let cap_w = cap_wires(stream, &ww, &rt.cap_pays);
     let (to_publish, level_accs) = emit_query_phase(
         sb,
         cs.q,
@@ -10881,6 +10922,8 @@ struct ChildTape<'p> {
     chals: Vec<F128>,
     /// Which byte payloads stay PUBLIC under the witness/public split.
     pub_payloads: Vec<bool>,
+    /// Per level, the absorbed cap's payload index ([`cap_payloads`]).
+    cap_pays: Vec<usize>,
     // chain materials
     trace: flock_prover::r1cs_hashes::fs_chain::FsChainTrace,
     stream: flock_core::transcript_record::Stream,
@@ -10978,7 +11021,7 @@ impl<'p> ChildTape<'p> {
         let chals: Vec<F128> = rec.challenges().to_vec();
         let vals_rec: Vec<F128> = rec.values().to_vec();
         let ops: Vec<Op> = t_shape.ops().to_vec();
-        let pub_payloads = bytes_payload_mask(&ops);
+        let mut pub_payloads = bytes_payload_mask(&ops);
 
         // ---- the label map: the region order the assembly builds against ----
         let find = |label: &[u8]| -> Vec<usize> {
@@ -11415,6 +11458,13 @@ impl<'p> ChildTape<'p> {
                 .map(|g| (g.row_words.div_ceil(4) + g.depth) * g.q + (1usize << g.c) - 1)
                 .sum::<usize>();
         let spread_w = geo.iter().map(|g| g.depth).max().unwrap().max(1);
+        // Recursive caps are PROOF BODY — the in-circuit cap trees bind them
+        // (chain + root connects, nothing checker-read); only the L0 cap —
+        // the commitment — stays a statement public.
+        let cap_pays = cap_payloads(&stream, &bytes, &lvl_src);
+        for &p in &cap_pays[1..] {
+            pub_payloads[p] = false;
+        }
 
         // ---- the merged intake's natives (target, running, boundary) ----
         let (native_target, native_running) = {
@@ -11898,6 +11948,7 @@ impl<'p> ChildTape<'p> {
             vals_rec,
             chals,
             pub_payloads,
+            cap_pays,
             trace,
             stream,
             bytes,
@@ -12089,7 +12140,7 @@ fn emit_child_region(
         &mut consts,
         &ct.pub_payloads,
     );
-    let cap_w = cap_wires(stream, &ct.bytes, &ww, &ct.lvl_src);
+    let cap_w = cap_wires(stream, &ww, &ct.cap_pays);
     let (to_publish, level_accs) = emit_query_phase(
         sb,
         cs.q,
@@ -15955,7 +16006,8 @@ fn build_node_outer(
              + the fold region; CONNECTED: all points, z_partial lows, sigma fully,\n         \
              and the matrix/element EVAL VALUES to the children's bound advice —\n         \
              lagrange lows published, checker-rebuilt from each child's z_skip\n  \
-             outer: total b3 rows {} | nu {} | dense_m {} | mu {}\n  \
+             outer: total b3 rows {} | nu {} | dense_m {} | mu {} \
+             (cell slots: {} gate + {} public)\n  \
              prove {:.0} ms | verify {:.0} ms (DEFERRED {:.0} ms) | proof {:.1} KiB\n",
             n_folds,
             lo0.pcs.m,
@@ -15964,6 +16016,8 @@ fn build_node_outer(
             nu2,
             union2.dense_m(),
             shape2.circuit.cells().mu(),
+            shape2.circuit.cells().num_gate_slots(),
+            shape2.circuit.cells().num_public_slots(),
             prove_ms,
             verify_ms,
             deferred_ms,
