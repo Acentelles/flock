@@ -7525,6 +7525,8 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             zw,
             ow,
         );
+        // THE CLOSURE, in-circuit: inner == t_r as a copy constraint.
+        sb.connect(inner_w, t_final);
 
         // ---- the R = 2 multipoint chains ----
         // T0 = Σ gamma^{128i+j}·A_ij over the 256 absorbed dual values
@@ -9509,6 +9511,8 @@ fn emit_real_child_region(
         zw,
         ow,
     );
+    // THE CLOSURE, in-circuit: inner == t_r as a copy constraint.
+    sb.connect(inner_w, t_final);
 
     // ---- the WIRING GKR in-circuit + the sigma emission ----
     let macs = cs.macs;
@@ -12005,6 +12009,10 @@ fn emit_child_region(
         zw,
         ow,
     );
+    // THE CLOSURE, in-circuit: the residual side's inner and the spine's
+    // t_r are the same statement scalar — a copy constraint, not a
+    // checker item (both stay published as test cross-checks).
+    sb.connect(inner_w, t_final);
 
     // ---- the ELEMENT PIOP rounds in-circuit ----
     // Zerocheck rounds are ZcRoundGate rows (tau slice wires as eq weights,
