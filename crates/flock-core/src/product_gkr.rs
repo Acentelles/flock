@@ -1010,17 +1010,19 @@ pub fn prove_batched<C: Challenger>(
     // check that is compiled out.)
     assert!(mu <= 64, "s_id-as-index needs μ ≤ 64");
     let tag = |i: usize| F128::new(i as u64, 0);
-    // With a mask: the deferred/opened σ table is the MASKED `live ⊙ s_σ`
-    // (dead entries zero), and dead LEAVES are the multiplicative identity.
-    let s_sig_vec: Vec<F128> = sigma
-        .par_iter()
-        .enumerate()
-        .with_min_len(par_threshold())
-        .map(|(x, &sx)| match live {
-            Some(m) if !m.is_live(x) => F128::ZERO,
-            _ => tag(sx),
-        })
-        .collect();
+    // With a mask, the σ fingerprint table is never MATERIALIZED: the rhs
+    // leaves read `tag(σ(x))` inline on live cells, and the deferred
+    // `live ⊙ s_σ` evaluation happens SPARSELY over the live cells after
+    // ρ is known (the dead entries are zero by definition).
+    let s_sig_vec: Vec<F128> = if live.is_some() {
+        Vec::new()
+    } else {
+        sigma
+            .par_iter()
+            .with_min_len(par_threshold())
+            .map(|&sx| tag(sx))
+            .collect()
+    };
     tp(&mut t, "  s_sigma");
     let lhs: Vec<F128> = f
         .par_iter()
@@ -1033,12 +1035,11 @@ pub fn prove_batched<C: Challenger>(
         .collect();
     let rhs: Vec<F128> = g
         .par_iter()
-        .zip(&s_sig_vec)
         .enumerate()
         .with_min_len(par_threshold())
-        .map(|(x, (gx, sx))| match live {
+        .map(|(x, gx)| match live {
             Some(m) if !m.is_live(x) => F128::ONE,
-            _ => *gx + alpha * *sx + beta,
+            _ => *gx + alpha * tag(sigma[x]) + beta,
         })
         .collect();
     tp(&mut t, "  lhs,rhs");
@@ -1196,7 +1197,29 @@ pub fn prove_batched<C: Challenger>(
     // subtraction is addition). Same for `g` via `s_σ`. Only `s_σ` — a permuted
     // table with no closed form — still needs an `O(N)` MLE evaluation, so this
     // is one such pass instead of three.
-    let s_sigma_eval = mle_eval(&s_sig_vec, &rho);
+    // The deferred σ evaluation: dense MLE without a mask; with one, the
+    // SPARSE sum over live cells only — `Σ_live eq(ρ,x)·tag(σ(x))` with
+    // the eq factored `eq_lo(row)·eq_hi(slot)` — O(live + 2^ν + 2^c).
+    let s_sigma_eval = match live {
+        None => mle_eval(&s_sig_vec, &rho),
+        Some(m) => {
+            let (lo, hi) = rho.split_at(m.nu);
+            let eq_lo = crate::zerocheck::univariate_skip::build_eq(lo);
+            let eq_hi = crate::zerocheck::univariate_skip::build_eq(hi);
+            m.counts
+                .par_iter()
+                .enumerate()
+                .map(|(iota, &cnt)| {
+                    let base = iota << m.nu;
+                    let mut acc = F128::ZERO;
+                    for row in 0..cnt {
+                        acc += eq_lo[row] * tag(sigma[base + row]);
+                    }
+                    eq_hi[iota] * acc
+                })
+                .reduce(|| F128::ZERO, |a, b| a + b)
+        }
+    };
     // Reconstruct the witness evals from the collapsed claims (char 2:
     // subtraction is addition). With a mask, the leaf's affine form is
     // `w + α·(live⊙s_id) + (β+1)·live + 1` — see [`LiveMask`].
@@ -1344,20 +1367,30 @@ fn verify_batched_core<C: Challenger>(
     let basis = s_id_basis(mu);
     // s_σ(ρ): verifier-computed when σ is known (not trusting the proof), else
     // the proof's claimed value.
-    let s_sigma = match sigma_opt {
-        Some(sigma) => {
+    let s_sigma = match (sigma_opt, live) {
+        (Some(sigma), Some(m)) => {
+            // Sparse masked evaluation over the live cells only — the same
+            // sum the prover computes, exact under XOR addition.
+            let (lo, hi) = r_pt.split_at(m.nu);
+            let eq_lo = crate::zerocheck::univariate_skip::build_eq(lo);
+            let eq_hi = crate::zerocheck::univariate_skip::build_eq(hi);
+            let mut acc = F128::ZERO;
+            for (iota, &cnt) in m.counts.iter().enumerate() {
+                let base = iota << m.nu;
+                let mut s = F128::ZERO;
+                for row in 0..cnt {
+                    s += eq_lo[row] * F128::new(sigma[base + row] as u64, 0);
+                }
+                acc += eq_hi[iota] * s;
+            }
+            acc
+        }
+        (Some(sigma), None) => {
             let s_id_vec = build_s_id_vec(mu, &basis);
-            let s_sig: Vec<F128> = sigma
-                .iter()
-                .enumerate()
-                .map(|(x, &sx)| match live {
-                    Some(m) if !m.is_live(x) => F128::ZERO,
-                    _ => s_id_vec[sx],
-                })
-                .collect();
+            let s_sig: Vec<F128> = sigma.iter().map(|&sx| s_id_vec[sx]).collect();
             mle_eval(&s_sig, &r_pt)
         }
-        None => proof.s_sigma_eval,
+        (None, _) => proof.s_sigma_eval,
     };
     let (lhs_in, rhs_in) = match live {
         None => (
