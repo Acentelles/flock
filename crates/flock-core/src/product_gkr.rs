@@ -1531,9 +1531,12 @@ fn prove_batched_impl<C: Challenger>(
     let mu = n.trailing_zeros() as usize;
     if let Some(m) = live {
         debug_assert_eq!(m.counts.len() << m.nu, n, "mask spans the leaf space");
+        // Dead cells must be σ-fixed. Their f/g entries are NEVER READ
+        // under a mask (semantically zero) — the caller may leave them
+        // unwritten in a pooled buffer, so no value check here.
         debug_assert!(
-            (0..n).all(|x| m.is_live(x) || (sigma[x] == x && f[x].is_zero() && g[x].is_zero())),
-            "dead cells must be σ-fixed with zero witness"
+            (0..n).all(|x| m.is_live(x) || sigma[x] == x),
+            "dead cells must be σ-fixed"
         );
     }
     let mut t = std::time::Instant::now();

@@ -72,6 +72,7 @@ pub mod builder;
 
 use std::sync::OnceLock;
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::challenger::Challenger;
@@ -649,34 +650,39 @@ pub fn prove_wiring<C: Challenger>(
     // ---- w over the cell space. Gate cells read the committed buffer; public
     // cells take the statement words; dummy cells are zero (pooled buffers come
     // back dirty, so every slot is written).
+    // LIVE PREFIXES ONLY: the grouped GKR's leaves and the live gather
+    // never read a dead cell, so the pooled buffer's dead regions stay
+    // untouched — they are SEMANTICALLY zero (the committed data's dead
+    // rows are honest zeros; the buffer's are simply never read). This
+    // makes the w materialization live-proportional.
+    let mask = circuit.live_mask();
     let mut w = crate::scratch::take_f128(1usize << mu);
-    for (iota, slot) in cells.slots().iter().enumerate() {
-        let dst = &mut w[iota << nu..(iota + 1) << nu];
-        match *slot {
-            CellSlot::Gate { .. } => {
-                let base = cells.gate_word_addr(iota, 0);
-                dst.copy_from_slice(&packed[base..base + rows]);
-            }
-            CellSlot::Public { s } => {
-                let base = s << nu;
-                for (j, d) in dst.iter_mut().enumerate() {
-                    *d = public.get(base + j).copied().unwrap_or(F128::ZERO);
+    w.par_chunks_mut(rows)
+        .enumerate()
+        .for_each(|(iota, dst)| {
+            let live = mask.counts[iota];
+            match cells.slots()[iota] {
+                CellSlot::Gate { .. } => {
+                    let base = cells.gate_word_addr(iota, 0);
+                    dst[..live].copy_from_slice(&packed[base..base + live]);
                 }
+                CellSlot::Public { s } => {
+                    let base = s << nu;
+                    dst[..live].copy_from_slice(&public[base..base + live]);
+                }
+                CellSlot::Pad => {}
             }
-            CellSlot::Pad => dst.fill(F128::ZERO),
-        }
-    }
+        });
 
     if trace {
         eprintln!(
-            "  [wiring] build w (2^{mu} cells): {:7.2} ms",
+            "  [wiring] build w (live cells of 2^{mu}): {:7.2} ms",
             t.elapsed().as_secs_f64() * 1e3
         );
     }
 
     // ---- One grand-product permutation check at f = g = w.
     let t = std::time::Instant::now();
-    let mask = circuit.live_mask();
     let (gkr, claim) = product_gkr::prove_batched(&w, &w, circuit.sigma(), Some(&mask), ch);
     crate::scratch::give_f128(w);
     if trace {
