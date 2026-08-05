@@ -336,20 +336,21 @@ pub const CHAIN_ABSORB: u32 = 1 << 6;
 /// Domain flag for sponge-chain squeeze/output compressions.
 pub const CHAIN_SQUEEZE: u32 = 1 << 7;
 
-/// The SPONGE-CHAINED transcript trace builder (transcript-v2): mirrors
-/// [`flock_core::challenger::FsChallenger::with_chained_blake3`] row for
-/// row — a sequential compression chain, no chunk tree, no per-squeeze
-/// root forks. Emits [`FsChainTrace`] rows whose links are always plain
-/// chaining (`right`/`repeats` never set); squeeze OUTPUT rows carry a
-/// ZERO message block (`block_offsets = None`) — the circuit feeds shared
-/// zero constants there.
+/// The SPONGE-CHAINED transcript trace builder (transcript-v3 DUPLEX):
+/// mirrors [`flock_core::challenger::FsChallenger::with_chained_blake3`]
+/// row for row — a sequential compression chain, no chunk tree, and
+/// squeezes that MUTATE the state. A squeeze's first row consumes the
+/// pending partial block as its message (`block_offsets = Some(..)` with a
+/// partial `blen` when bytes are pending, `None` with a zero message when
+/// not); further output rows are zero-message (`None`); EVERY row advances
+/// the cv, so the whole trace is one uniform chain (`right`/`repeats`
+/// never set, no fork rows, no per-squeeze flush).
 ///
 /// Drop-in for [`FsChain`] in the tape constructors: same `absorb` /
-/// `finalize` / `finish` surface, and `finalize` leaves the LIVE state
-/// untouched exactly as the challenger's immutable squeeze does (the
-/// pending partial block is flushed into a LOCAL fork row). Absorb rows
-/// run at counter 0 like the challenger — block order is bound by the cv
-/// chain, and every distinct counter value would cost a circuit public.
+/// `finalize` / `finish` surface. All rows run at counter 0 — block order
+/// is bound by the cv chain, and every distinct counter value would cost a
+/// circuit public; squeeze rows carry `CHAIN_SQUEEZE` and their pending
+/// byte count in `blen`.
 pub struct FsChainSponge {
     rows: Vec<Compression>,
     links: Vec<Link>,
@@ -417,44 +418,41 @@ impl FsChainSponge {
         }
     }
 
-    /// Fork a squeeze off the current state: flush the pending partial block
-    /// into a LOCAL row, then emit the 64-byte output rows (zero message,
-    /// output index as counter, requested length bound in `blen`). The live
-    /// chain keeps its pending bytes — the challenger's squeeze is an
-    /// immutable read, and every `sample_*` absorbs a header first, so
-    /// consecutive squeezes separate.
+    /// Duplex squeeze (transcript-v3): the FIRST output row consumes the
+    /// pending partial block as its message and every output row advances
+    /// the cv — the squeeze IS part of the chain, not a fork. Mirrors
+    /// `B3Chain::squeeze_into` exactly.
     pub fn finalize(&mut self, out_bytes: usize) -> Vec<u8> {
-        let (fcv, fcv_row) = if self.buf.is_empty() {
-            (self.cv, self.cv_row)
-        } else {
-            let m = words(&self.buf);
-            let out = blake3_compress(&self.cv, &m, 0, self.buf.len() as u32, CHAIN_ABSORB);
-            let link = self.cv_link();
-            let buf_for_row = (self.cv, m, 0, self.buf.len() as u32, CHAIN_ABSORB);
-            let row = self.emit(buf_for_row, link, Some(self.buf_offset));
-            (out[..8].try_into().expect("8 words"), Some(row))
-        };
-        let zero = [0u32; 16];
         let mut ids = Vec::new();
         let mut bytes = Vec::with_capacity(out_bytes.div_ceil(BLOCK_BYTES) * BLOCK_BYTES);
-        let mut j = 0u64;
+        let mut first = true;
         while bytes.len() < out_bytes {
-            let o = blake3_compress(&fcv, &zero, j, out_bytes as u32, CHAIN_SQUEEZE);
-            let row = self.emit(
-                (fcv, zero, j, out_bytes as u32, CHAIN_SQUEEZE),
-                Link {
-                    cv: fcv_row.map_or(CvSource::Iv, CvSource::Row),
-                    right: None,
-                    repeats: None,
-                },
-                None,
-            );
+            let (m, blen, offset) = if first {
+                (
+                    words(&self.buf),
+                    self.buf.len() as u32,
+                    // A pending partial block is stream content — the
+                    // emitter wires it exactly like a data block (the
+                    // partial-width zero-fill path already exists); an
+                    // empty pending block is the shared zero constant.
+                    (!self.buf.is_empty()).then_some(self.buf_offset),
+                )
+            } else {
+                ([0u32; 16], 0u32, None)
+            };
+            let o = blake3_compress(&self.cv, &m, 0, blen, CHAIN_SQUEEZE);
+            let link = self.cv_link();
+            let row = self.emit((self.cv, m, 0, blen, CHAIN_SQUEEZE), link, offset);
+            self.cv = o[..8].try_into().expect("8 words");
+            self.cv_row = Some(row);
             ids.push(row);
             for w in o.iter() {
                 bytes.extend_from_slice(&w.to_le_bytes());
             }
-            j += 1;
+            first = false;
         }
+        self.buf.clear();
+        self.buf_offset = self.absorbed;
         bytes.truncate(out_bytes);
         self.squeezes.push(ids);
         bytes
@@ -519,7 +517,7 @@ mod tests {
         // Replay the recorded byte stream through the sponge trace builder;
         // every finalize must reproduce the challenger's squeezed bytes.
         let shape = rec.shape();
-        let stream = shape.stream_words(b"sponge-diff");
+        let stream = shape.stream_words_duplex(b"sponge-diff");
         let bytes = stream.to_bytes(rec.values(), rec.payloads());
         let fin_ops: Vec<_> = shape.ops().iter().filter(|o| o.finalizes()).collect();
         let mut chain = FsChainSponge::new();

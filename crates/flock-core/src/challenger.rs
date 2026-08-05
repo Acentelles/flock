@@ -241,12 +241,20 @@ enum FsState {
 /// (invariant: `< 64` bytes after any absorb). Absorb compressions run at
 /// counter 0 — block order is bound by the cv chain itself, so a position
 /// counter would be BLAKE3-tree residue (and every distinct counter value
-/// costs a public in the recursion circuit). Squeezes do NOT mutate the
-/// state — every `sample_*` absorbs an `OP_SQUEEZE` header first, so
-/// consecutive squeezes separate through the pending bytes; the squeeze
-/// locally flushes the pending block and emits 64-byte output blocks
-/// `compress(cv', ZERO, j, out_len, CHAIN_SQUEEZE)`, where the output
-/// index `j` is what distinguishes blocks sharing one cv.
+/// costs a public in the recursion circuit).
+///
+/// **Squeezes are DUPLEX (transcript-v3)**: a squeeze's first output row is
+/// `compress(cv, m = pending partial block zero-padded, 0, buf.len(),
+/// CHAIN_SQUEEZE)` — it consumes the pending bytes as its message, its full
+/// 64 output bytes are the first output bytes, and `cv` advances to its
+/// chaining half. Further output rows are `compress(cv, ZERO, 0, 0,
+/// CHAIN_SQUEEZE)`, each advancing `cv` the same way. So squeezes MUTATE
+/// the state: no separate flush compression, no `OP_SQUEEZE` header absorb,
+/// no per-finalize block fragmentation — under transcript-v2's discipline
+/// those three were ~30% of every recursion child's chain rows. Counter
+/// stays 0 everywhere (sequential cv chaining binds order; no two rows
+/// share a cv, so the old output index `j` is dead too). Consecutive
+/// squeezes separate because each advances `cv`.
 #[derive(Clone)]
 struct B3Chain {
     cv: [u32; 8],
@@ -291,25 +299,20 @@ impl B3Chain {
         }
     }
 
-    /// The state with the pending partial block flushed — what squeezes and
-    /// digests read. Does not mutate (`sample_*` absorbs a header before
-    /// every squeeze, so the live pending bytes keep the chain moving).
-    fn flushed_cv(&self) -> [u32; 8] {
-        if self.buf.is_empty() {
-            return self.cv;
-        }
-        let m = Self::block_words(&self.buf);
-        let out = crate::hash::blake3_compress(&self.cv, &m, 0, self.buf.len() as u32, CHAIN_ABSORB);
-        out[..8].try_into().expect("8 words")
-    }
-
-    fn squeeze_into(&self, out: &mut [u8]) {
-        let cv = self.flushed_cv();
-        let zero = [0u32; 16];
+    /// Duplex squeeze: the first output compression eats the pending
+    /// partial block as its message and every output compression advances
+    /// `cv` — see the struct docs. Mutates.
+    fn squeeze_into(&mut self, out: &mut [u8]) {
         let mut off = 0usize;
-        let mut j = 0u64;
+        let mut first = true;
         while off < out.len() {
-            let ob = crate::hash::blake3_compress(&cv, &zero, j, out.len() as u32, CHAIN_SQUEEZE);
+            let (m, blen) = if first {
+                (Self::block_words(&self.buf), self.buf.len() as u32)
+            } else {
+                ([0u32; 16], 0u32)
+            };
+            let ob = crate::hash::blake3_compress(&self.cv, &m, 0, blen, CHAIN_SQUEEZE);
+            self.cv = ob[..8].try_into().expect("8 words");
             let mut bytes = [0u8; 64];
             for (i, w) in ob.iter().enumerate() {
                 bytes[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
@@ -317,8 +320,9 @@ impl B3Chain {
             let take = (out.len() - off).min(64);
             out[off..off + take].copy_from_slice(&bytes[..take]);
             off += take;
-            j += 1;
+            first = false;
         }
+        self.buf.clear();
     }
 }
 
@@ -450,14 +454,17 @@ impl FsChallenger {
     }
 
     /// Squeeze `out.len()` pseudorandom bytes from the current transcript
-    /// state without mutating it.
+    /// state. The SHA-256 and tree-BLAKE3 disciplines do not mutate; the
+    /// CHAINED discipline is a duplex sponge, so its squeeze advances the
+    /// state (which is also why the chain absorbs no `OP_SQUEEZE` header —
+    /// the squeeze itself separates consecutive samples).
     ///
     /// SHA-256 is not an XOF, so its stream is `SHA256(state ‖ ctr)` for
-    /// ctr = 0, 1, … (32 bytes each). BLAKE3 *is* an XOF, so it finalizes the
-    /// cloned state once and fills straight from the reader — no counter, and
-    /// no per-32-byte re-finalization.
-    fn squeeze_into(&self, out: &mut [u8]) {
-        match &self.state {
+    /// ctr = 0, 1, … (32 bytes each). Tree-BLAKE3 *is* an XOF, so it
+    /// finalizes the cloned state once and fills straight from the reader —
+    /// no counter, and no per-32-byte re-finalization.
+    fn squeeze_into(&mut self, out: &mut [u8]) {
+        match &mut self.state {
             FsState::Sha256(hasher) => {
                 let mut off = 0usize;
                 let mut ctr: u64 = 0;
@@ -477,16 +484,18 @@ impl FsChallenger {
     }
 
     /// 32-byte digest of the current transcript state, used as the PoW base.
-    /// Cloning + finalizing gives a state-bound digest without mutating the
-    /// live hasher.
+    /// SHA-256/tree-BLAKE3 clone + finalize without mutating; the chained
+    /// discipline's digest is a duplex squeeze and advances the state —
+    /// `grind_pow` and `verify_pow` each take exactly one digest per PoW op,
+    /// so both sides stay in lockstep.
     #[inline]
-    fn state_digest(&self) -> [u8; 32] {
+    fn state_digest(&mut self) -> [u8; 32] {
         #[cfg(feature = "hash-count")]
         {
             fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             fs_count::SQUEEZED_BYTES.fetch_add(32, std::sync::atomic::Ordering::Relaxed);
         }
-        match &self.state {
+        match &mut self.state {
             FsState::Sha256(h) => h.clone().finalize().into(),
             FsState::Blake3(h) => *h.finalize().as_bytes(),
             FsState::Blake3Chain(c) => {
@@ -535,7 +544,13 @@ impl Challenger for FsChallenger {
             fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             fs_count::SQUEEZED_BYTES.fetch_add(16, std::sync::atomic::Ordering::Relaxed);
         }
-        self.absorb_header(OP_SQUEEZE, KIND_SCALAR, 1);
+        // The duplex chain drops the OP_SQUEEZE header: its squeeze itself
+        // advances the state, so the header's only job (separating
+        // consecutive samples) is already done — and each header word was
+        // a recursion-circuit chain row.
+        if !matches!(self.state, FsState::Blake3Chain(_)) {
+            self.absorb_header(OP_SQUEEZE, KIND_SCALAR, 1);
+        }
         let mut buf = [0u8; 16];
         self.squeeze_into(&mut buf);
         let lo = u64::from_le_bytes(buf[..8].try_into().unwrap());
@@ -550,7 +565,9 @@ impl Challenger for FsChallenger {
             fs_count::SQUEEZED_BYTES
                 .fetch_add((n * 16) as u64, std::sync::atomic::Ordering::Relaxed);
         }
-        self.absorb_header(OP_SQUEEZE, KIND_SLICE, n as u64);
+        if !matches!(self.state, FsState::Blake3Chain(_)) {
+            self.absorb_header(OP_SQUEEZE, KIND_SLICE, n as u64);
+        }
         let mut buf = vec![0u8; n * 16];
         self.squeeze_into(&mut buf);
         buf.as_chunks::<16>()
@@ -1207,21 +1224,28 @@ mod b3_chain_tests {
         b.observe_f128(F128 { lo: 7, hi: 9 });
         let (x, y) = (a.sample_f128(), b.sample_f128());
         assert_eq!(x, y, "deterministic");
-        // Consecutive squeezes differ (the OP_SQUEEZE header advances the
-        // pending bytes between them).
+        // Consecutive squeezes differ: the DUPLEX squeeze advances cv, so
+        // no header is needed to separate them (transcript-v3).
         let x2 = a.sample_f128();
         assert_ne!(x, x2, "consecutive squeezes separate");
         // A different absorbed value moves the challenge.
         let mut c = mk();
         c.observe_f128(F128 { lo: 7, hi: 10 });
         assert_ne!(c.sample_f128(), x, "absorb-sensitive");
-        // Wide squeezes: the first 16 bytes of a wide squeeze equal the
-        // scalar squeeze at the same state ONLY if the header matches — a
-        // slice squeeze has its own header, so they must differ.
+        // The duplex is PREFIX-STABLE, the standard sponge property: with
+        // no per-kind squeeze header, a slice squeeze's first element at a
+        // given state equals the scalar squeeze there. The op sequence is
+        // protocol-fixed (never adversary-chosen), so this collides nothing
+        // an attacker controls — and it is precisely what the v2 header
+        // bought with one recursion-circuit chain row per sample.
         let mut d = mk();
         d.observe_f128(F128 { lo: 7, hi: 9 });
         let v = d.sample_f128_vec(2);
-        assert_ne!(v[0], x, "slice-squeeze domain-separates from scalar");
+        assert_eq!(v[0], x, "duplex squeezes are prefix-stable");
         assert_ne!(v[0], v[1], "output blocks differ");
+        // And the state after a slice squeeze differs from after a scalar
+        // one ONLY through subsequent output count — both advanced.
+        let (dn, an) = (d.sample_f128(), a.sample_f128());
+        assert_ne!(dn, an, "post-squeeze states advanced independently");
     }
 }

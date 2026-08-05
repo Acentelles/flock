@@ -84,6 +84,12 @@ impl TranscriptOp {
     /// This is the byte layout the circuit reproduces, which is why it is
     /// cross-checked against the live challenger's own counter rather than
     /// trusted.
+    ///
+    /// **v2 accounting.** The DUPLEX chain discipline (transcript-v3,
+    /// `with_chained_blake3`) absorbs no squeeze headers, so its per-op
+    /// byte count differs: squeezes absorb 0 there and a `Pow` absorbs only
+    /// its nonce 32. Chain consumers derive the layout from
+    /// [`TranscriptShape::stream_words_duplex`], never from this.
     pub fn absorbed_bytes(&self) -> usize {
         let pad16 = |n: usize| n.div_ceil(16) * 16;
         16 + match self {
@@ -475,6 +481,89 @@ impl TranscriptShape {
             finalize_after,
         }
     }
+
+    /// [`Self::stream_words`] for the DUPLEX chain discipline
+    /// (transcript-v3, [`crate::challenger::FsChallenger::with_chained_blake3`]):
+    /// squeeze ops absorb NOTHING — the squeeze compression itself advances
+    /// the state, so there is no `OP_SQUEEZE` header word. `finalize_after`
+    /// still marks where each squeeze falls. A `Pow` contributes only its
+    /// nonce (header + payload word); its state digest is a squeeze and
+    /// absorbs nothing.
+    ///
+    /// The v2 layout above stays the truth for the SHA-256 and tree-BLAKE3
+    /// transcripts, whose immutable squeezes DO absorb a separating header.
+    pub fn stream_words_duplex(&self, domain: &[u8]) -> Stream {
+        use crate::challenger::{KIND_NONE, KIND_SCALAR, KIND_SLICE, OP_BYTES, OP_DOMAIN, OP_LABEL, OP_OBSERVE};
+        let header = |op: u8, kind: u8, len: u64| {
+            StreamWord::Const(F128::new(op as u64 | ((kind as u64) << 8), len))
+        };
+        let padded = |b: &[u8], out: &mut Vec<StreamWord>| {
+            for c in b.chunks(16) {
+                let mut w = [0u8; 16];
+                w[..c.len()].copy_from_slice(c);
+                out.push(StreamWord::Const(F128::new(
+                    u64::from_le_bytes(w[..8].try_into().unwrap()),
+                    u64::from_le_bytes(w[8..].try_into().unwrap()),
+                )));
+            }
+        };
+
+        let mut out = Vec::new();
+        let mut finalize_after: Vec<usize> = Vec::new();
+        out.push(header(OP_DOMAIN, KIND_NONE, domain.len() as u64));
+        padded(domain, &mut out);
+
+        let (mut values, mut payloads) = (0usize, 0usize);
+        for op in &self.ops {
+            match op {
+                TranscriptOp::Label(l) => {
+                    out.push(header(OP_LABEL, KIND_NONE, l.len() as u64));
+                    padded(l, &mut out);
+                }
+                TranscriptOp::ObserveScalar => {
+                    out.push(header(OP_OBSERVE, KIND_SCALAR, 1));
+                    out.push(StreamWord::Value(values));
+                    values += 1;
+                }
+                TranscriptOp::ObserveSlice(n) => {
+                    out.push(header(OP_OBSERVE, KIND_SLICE, *n as u64));
+                    for _ in 0..*n {
+                        out.push(StreamWord::Value(values));
+                        values += 1;
+                    }
+                }
+                TranscriptOp::ObserveBytes(len) => {
+                    out.push(header(OP_BYTES, KIND_NONE, *len as u64));
+                    for w in 0..len.div_ceil(16) {
+                        out.push(StreamWord::Bytes {
+                            payload: payloads,
+                            word: w,
+                        });
+                    }
+                    payloads += 1;
+                }
+                // Duplex squeezes absorb nothing — only the split point.
+                TranscriptOp::SqueezeScalar | TranscriptOp::SqueezeSlice(_) => {
+                    finalize_after.push(out.len());
+                }
+                TranscriptOp::Pow { .. } => {
+                    // The state digest is a (duplex) squeeze; then the nonce
+                    // is absorbed exactly as in v2.
+                    finalize_after.push(out.len());
+                    out.push(header(OP_BYTES, KIND_NONE, 8));
+                    out.push(StreamWord::Bytes {
+                        payload: payloads,
+                        word: 0,
+                    });
+                    payloads += 1;
+                }
+            }
+        }
+        Stream {
+            words: out,
+            finalize_after,
+        }
+    }
 }
 
 /// The absorbed stream, plus where its finalizes fall.
@@ -764,6 +853,99 @@ mod tests {
         // Every word is whole: the stream is a multiple of 16 bytes, so each
         // BLAKE3 block is exactly four stream words and no value straddles one.
         assert_eq!(bytes.len() % 16, 0);
+    }
+
+    /// Duplex twin of the test above, against the CHAINED challenger
+    /// (transcript-v3): replay `stream_words_duplex`'s byte stream through
+    /// a local duplex sponge over the same compression primitive and check
+    /// every squeeze — a mid-stream scalar (partial-block message + state
+    /// advance) and a multi-block slice (extra zero-message output rows).
+    /// A drifted layout, a leftover OP_SQUEEZE header, or a non-mutating
+    /// squeeze all fail here.
+    #[test]
+    fn duplex_stream_words_reconstruct_the_chained_challenger() {
+        const CHAIN_ABSORB: u32 = 1 << 6;
+        const CHAIN_SQUEEZE: u32 = 1 << 7;
+        let domain: &[u8] = b"flock-duplex-model";
+        let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(domain));
+
+        let vals = [
+            F128::new(0x0123_4567_89AB_CDEF, 0xFEDC_BA98_7654_3210),
+            F128::new(1, 2),
+            F128::new(3, 4),
+            F128::new(5, 6),
+        ];
+        let mut expected: Vec<Vec<u8>> = Vec::new();
+        let push16 = |vs: &[F128], out: &mut Vec<Vec<u8>>| {
+            let mut b = Vec::new();
+            for v in vs {
+                b.extend_from_slice(&v.lo.to_le_bytes());
+                b.extend_from_slice(&v.hi.to_le_bytes());
+            }
+            out.push(b);
+        };
+        rec.observe_label(b"phase-one");
+        rec.observe_f128(vals[0]);
+        let c1 = rec.sample_f128(); // mid-stream: partial-block message
+        push16(&[c1], &mut expected);
+        rec.observe_f128_slice(&vals[1..4]);
+        let c2 = rec.sample_f128_vec(5); // 80 B: one extra zero-message row
+        push16(&c2, &mut expected);
+        let c3 = rec.sample_f128(); // back-to-back: empty-pending squeeze
+        push16(&[c3], &mut expected);
+
+        let shape = rec.shape();
+        let stream = shape.stream_words_duplex(domain);
+        let bytes = stream.to_bytes(rec.values(), rec.payloads());
+        assert_eq!(bytes.len() % 16, 0);
+        let fin_ops: Vec<_> = shape.ops().iter().filter(|o| o.finalizes()).collect();
+        assert_eq!(stream.finalize_after.len(), fin_ops.len());
+
+        // Local duplex replay over the same primitive.
+        let mut cv = crate::hash::BLAKE3_IV;
+        let mut pend: Vec<u8> = Vec::new();
+        let mut drain = |cv: &mut [u32; 8], pend: &mut Vec<u8>| {
+            while pend.len() >= 64 {
+                let mut m = [0u32; 16];
+                for (i, c) in pend[..64].chunks(4).enumerate() {
+                    m[i] = u32::from_le_bytes(c.try_into().unwrap());
+                }
+                let out = crate::hash::blake3_compress(cv, &m, 0, 64, CHAIN_ABSORB);
+                cv.copy_from_slice(&out[..8]);
+                pend.drain(..64);
+            }
+        };
+        let mut at = 0usize;
+        for (k, &upto) in stream.finalize_after.iter().enumerate() {
+            pend.extend_from_slice(&bytes[at * 16..upto * 16]);
+            at = upto;
+            drain(&mut cv, &mut pend);
+            let want_bytes = fin_ops[k].squeezed_bytes();
+            let mut got: Vec<u8> = Vec::new();
+            let mut first = true;
+            while got.len() < want_bytes {
+                let (mut m, blen) = ([0u32; 16], if first { pend.len() as u32 } else { 0 });
+                if first {
+                    for (i, c) in pend.chunks(4).enumerate() {
+                        let mut w = [0u8; 4];
+                        w[..c.len()].copy_from_slice(c);
+                        m[i] = u32::from_le_bytes(w);
+                    }
+                }
+                let out = crate::hash::blake3_compress(&cv, &m, 0, blen, CHAIN_SQUEEZE);
+                cv.copy_from_slice(&out[..8]);
+                for w in out.iter() {
+                    got.extend_from_slice(&w.to_le_bytes());
+                }
+                pend.clear();
+                first = false;
+            }
+            got.truncate(want_bytes);
+            // Pow squeezes (state digests) are not surfaced as challenges;
+            // every op in this schedule is a plain squeeze.
+            assert_eq!(got, expected[k], "squeeze {k}");
+        }
+        assert_eq!(at * 16, bytes.len(), "every stream word consumed");
     }
 
     #[test]
