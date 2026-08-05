@@ -691,7 +691,7 @@ fn mixed_boolean_element_roundtrip_and_tamper() {
     // Count-proportional dense area across BOTH classes.
     assert_eq!(
         union.dense_words(),
-        121 * n_bool + m.ty.k() * n_elem,
+        93 * n_bool + m.ty.k() * n_elem,
         "dense area is count-proportional over both classes"
     );
 
@@ -940,7 +940,7 @@ fn mixed_with_one_class_at_zero_count() {
         let pcs_params = union_pcs_params(&union);
         assert_eq!(
             union.dense_words(),
-            121 * n_bool + m.ty.k() * n_elem,
+            93 * n_bool + m.ty.k() * n_elem,
             "a zero count contributes no committed words"
         );
 
@@ -1127,6 +1127,9 @@ fn bundle_digest_merged(
 /// only since `open_batch_merged` learned to skip an empty ring-switch
 /// batch).
 ///
+/// Re-pinned 2026-08-05 (mix-* only): the BLAKE3 "Option E" lin-id drop
+/// narrowed the b3 table 121 -> 93 word-cols; element-only fixtures held
+/// byte-identical (the drop is blake3-local).
 /// Re-pinned on `recursion_circuit` 2026-08-02 at the jagged-removal merge:
 /// this branch has replacement sampling (`4e46b0a`), which `multitable`
 /// predates — the multitable-minted digests can never match here.
@@ -1145,10 +1148,10 @@ fn mixed_class_merged_proof_bytes_pinned() {
         ("elem-merged-nu12-0", 0, "bf3eeb3f2cb93fb44959c19fe408299a14135d8bc94762be9076312df50d8115"),
     ];
     const MIXED: [(&str, [usize; 2], &str); 4] = [
-        ("mix-merged-nu7-128-128", [128, 128], "567c6b282d004e7b2084de1a2042b1c32840c6c9d17cfc34a2c327175978420e"),
-        ("mix-merged-nu7-100-90", [100, 90], "266f07bf884152495613e1a0134cb80d0dd0b1c4cb6b4a93e0d1d98931ee7bf2"),
-        ("mix-merged-nu7-0-90", [0, 90], "a3b15039038b03830977a6323da399acc0635c2103a2bada2216db279c6775c5"),
-        ("mix-merged-nu7-100-0", [100, 0], "129ce42d88417f96f4b0dfaf2ae80f76e0d71b0798358bc74047b1eb437e3f37"),
+        ("mix-merged-nu7-128-128", [128, 128], "ed24b1bbd66c0ebd08c74e96e19697809d649e214da31ba7da6d3e778adc9b6f"),
+        ("mix-merged-nu7-100-90", [100, 90], "a1fdb387d9ba412a72fb2529c605a9e629993516cc4ebe62029b94dfa1ee7ccb"),
+        ("mix-merged-nu7-0-90", [0, 90], "a5e677252d5ac7b671e1898b869c7d174bab7cc6ba8a1afa696f854aa8228a41"),
+        ("mix-merged-nu7-100-0", [100, 0], "b93e4a3f1734d1ae173717b394f568817763049b34476416599eade540f2346c"),
     ];
 
     let (w0, w1) = (F128::new(0x51F0, 0), F128::new(0, 0x2C7E));

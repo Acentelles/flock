@@ -3,49 +3,45 @@
 //! the 16-word state init, all 7 rounds (8 G's per round + the message
 //! permutation), and the final output XORs in one big sparse system.
 //!
-//! ## Encoding choice — "Option D" (minimum-slot)
+//! ## Encoding choice — "Option E" (carry-only, full cascade)
 //!
 //! BLAKE3 has no AND-based Ch/Maj; the only nonlinear constraints are the
 //! carry_aux bits of 32-bit ADDs. Per compression: 7 rounds × 8 G × 6 ADDs
 //! × 31 carry_aux = **10,416 ANDs**. We materialize **only the irreducible
-//! slots**:
+//! slots** — the carry_aux bits and the I/O regions:
 //!
 //! - **No sum-bit slots**. Each ADD's 32 sum bits expand into lin_funcs at
 //!   the use site (`s[i] = X[i] ⊕ Y[i] ⊕ ⊕_{j<i} carry_aux[j]`).
-//! - **No `a_new` / `c_new` lin-id slots**. Lanes 0–3 ("a" positions) and
-//!   8–11 ("c" positions) cascade — every read of these lanes inlines the
-//!   full chain of carry_aux references from prior G's that touched the
-//!   lane. After 7 rounds this chain is deep, but the slot count stays
-//!   tight enough to fit `k_log = 14`.
-//! - **`b_new` / `d_new` lin-id slots only**. Lanes 4–7 ("b" positions) and
-//!   12–15 ("d" positions) are materialized as 32-bit lin-id slots per G,
-//!   so the next G's read of these lanes is a single-slot lookup. This
-//!   breaks the cascade for half the lanes — without it, `prove`-time
-//!   matrix density would blow up further.
+//! - **No lin-id slots for ANY lane.** All 16 state lanes cascade: every
+//!   read inlines the chain of carry_aux references from prior G's that
+//!   touched the lane. (Option D materialized per-G `b_new`/`d_new` lin-id
+//!   slots — 3,584 bits/compression — to break half the cascades, fearing
+//!   density blowup. Measured 2026-08-05: char-2 xor_dedup keeps the
+//!   cascade LINEAR — full drop is 48.3M nnz vs Option D's 21.0M (2.3×),
+//!   max row ~5.6k terms, while the row narrows 121 → 93 committed
+//!   word-cols (−23%). The CSC fold prices nnz at ~1 ms per 21M/prove, so
+//!   the area win dominates. See `tests/b3_width_audit.rs`.)
 //!
-//! Trade-off: matrix is **substantially denser** than a "materialize all
-//! sums" encoding, so the slow-path
-//! `apply_{a,b,c}_packed` and `sparse_row_fold` are slower per K-block.
-//! But K halves (2^15 → 2^14), which speeds up PCS commit/open and lets
-//! more instances fit at the same `m`. Picks favor `prove_fast` over `prove`.
+//! Trade-off: the matrix template is dense (48.3M nnz), so template build
+//! and any O(nnz) pass cost more — but those are per-shape/cacheable
+//! (`CscCircuit` build) or deferred to the folded matrix-claim discharge.
+//! Committed area is what every per-proof O(N) pass scales with, and it
+//! shrinks 23%. Picks favor `prove_fast` over `prove`.
 //!
 //! ## Witness layout per compression block (`k_log = 14`, `k = 16,384`)
 //!
 //! ```text
-//!   z[0]                       = 1                    (constant)
-//!   z[1     ..    257)         = cv[0..8]   (8 × 32-bit words)
-//!   z[257   ..    769)         = m[0..16]   (16 × 32-bit words)
-//!   z[769   ..    801)         = counter_lo
-//!   z[801   ..    833)         = counter_hi
-//!   z[833   ..    865)         = block_len
-//!   z[865   ..    897)         = flags
-//!   z[897   .. 14,897)         = 56 G blocks × 250 bits each
-//!   z[14,897 .. 15,153)        = out_lo[0..8] = state[0..8] ^ state[8..16]
-//!   z[15,153 .. 15,409)        = out_hi[0..8] = state[8..16] ^ cv[0..8]
-//!   z[15,409 .. 16,384)        = padding (forced to 0 by empty rows)
+//!   z[0     ..    256)         = cv[0..8]   (input chaining value)
+//!   z[256   ..    512)         = out_lo[0..8] = state[0..8] ^ state[8..16]
+//!   z[512   ..  1,024)         = m[0..16]   (16 × 32-bit words)
+//!   z[1,024 ..  1,152)         = counter_lo | counter_hi | block_len | flags
+//!   z[1,152 ..  1,408)         = out_hi[0..8] = state[8..16] ^ cv[0..8]
+//!   z[1,408 .. 11,824)         = 56 G blocks × 186 bits each
+//!   z[11,824]                  = 1                    (constant)
+//!   z[11,825 .. 16,384)        = padding (forced to 0 by empty rows)
 //! ```
 //!
-//! Per G block layout (250 bits):
+//! Per G block layout (186 bits):
 //! ```text
 //!   [0   .. 31)    carry_aux for ADD_TMP0  = a + b
 //!   [31  .. 62)    carry_aux for ADD_A1    = ADD_TMP0 + mx        (→ a_1)
@@ -53,13 +49,12 @@
 //!   [93  .. 124)   carry_aux for ADD_TMP1  = a_1 + b_1
 //!   [124 .. 155)   carry_aux for ADD_A2    = ADD_TMP1 + my        (→ a_new)
 //!   [155 .. 186)   carry_aux for ADD_C2    = c_1 + d_2            (→ c_new)
-//!   [186 .. 218)   b_new = rotr7(b_1 ^ c_2)                (lin-id)
-//!   [218 .. 250)   d_new = rotr8(d_1 ^ a_2)                (lin-id)
 //! ```
 //!
 //! `tmp_0`, `a_1`, `c_1`, `tmp_1`, `a_2 (a_new)`, `c_2 (c_new)`, `d_1`,
-//! `b_1`, `d_2` are NEVER materialized as slots — they're lin_funcs
-//! evaluated at row-build time and threaded forward in the state cascade.
+//! `b_1`, `d_2`, `b_new`, `d_new` are NEVER materialized as slots —
+//! they're lin_funcs evaluated at row-build time and threaded forward in
+//! the state cascade.
 //!
 //! ## Constraint shape (`C = I`)
 //!
@@ -69,7 +64,7 @@
 //! |---------------------|------------------|-----------------|--------------|
 //! | Constant `z[0]`     | `[0]`            | `[0]`           | `z[0]·z[0]`  |
 //! | Input slot          | `[slot]`         | `[Z_CONST]`     | `z[slot]·1`  |
-//! | lin-id slot         | lin_func         | `[Z_CONST]`     | lin_func·1   |
+//! | out_lo/out_hi slot  | lin_func         | `[Z_CONST]`     | lin_func·1   |
 //! | carry_aux           | lin_func_L       | lin_func_R      | (L)·(R)      |
 //! | Padding             | `[]`             | `[]`            | `0·0`        |
 //!
@@ -121,10 +116,9 @@ pub const WORD_BITS: usize = 32;
 pub const CARRY_BITS_PER_ADD: usize = WORD_BITS - 1; // 31
 /// ADDs per G.
 pub const ADDS_PER_G: usize = 6;
-/// Lin-id 32-bit words per G (b_new, d_new).
-pub const LIN_WORDS_PER_G: usize = 2;
-/// Bits per G block (no sum-bit slots — see module docs).
-pub const G_STRIDE: usize = ADDS_PER_G * CARRY_BITS_PER_ADD + LIN_WORDS_PER_G * WORD_BITS; // 250
+/// Bits per G block: carry_aux only — no sum-bit and no lin-id slots
+/// (see module docs).
+pub const G_STRIDE: usize = ADDS_PER_G * CARRY_BITS_PER_ADD; // 186
 
 /// BLAKE3 initial hash values (identical to SHA-256 IV).
 pub const BLAKE3_IV: [u32; 8] = [
@@ -188,8 +182,8 @@ pub const BLEN_BASE: usize = T_HI_BASE + WORD_BITS; // 1088
 pub const FLAGS_BASE: usize = BLEN_BASE + WORD_BITS; // 1120
 pub const OUT_HI_BASE: usize = FLAGS_BASE + WORD_BITS; // 1152, words 9-10
 pub const GS_BASE: usize = OUT_HI_BASE + 8 * WORD_BITS; // 1408
-pub const Z_CONST_POS: usize = GS_BASE + N_G * G_STRIDE; // 15,408
-pub const USEFUL_BITS: usize = Z_CONST_POS + 1; // 15,409
+pub const Z_CONST_POS: usize = GS_BASE + N_G * G_STRIDE; // 11,824
+pub const USEFUL_BITS: usize = Z_CONST_POS + 1; // 11,825
 
 // ---------------------------------------------------------------------------
 // Wiring IO schema
@@ -240,16 +234,13 @@ pub fn io_schema() -> Vec<flock_core::schedule::IoWord> {
     ]
 }
 
-// G sub-block: ADD `add_idx` ∈ 0..6 (carry_aux only), then lin-id
-// `which` ∈ 0..2.
+// G sub-block: ADD `add_idx` ∈ 0..6 (carry_aux only).
 const ADD_TMP0: usize = 0;
 const ADD_A1: usize = 1;
 const ADD_C1: usize = 2;
 const ADD_TMP1: usize = 3;
 const ADD_A2: usize = 4;
 const ADD_C2: usize = 5;
-const LIN_B_NEW: usize = 0;
-const LIN_D_NEW: usize = 1;
 
 #[inline]
 fn cv_bit(w: usize, b: usize) -> usize {
@@ -265,11 +256,6 @@ fn m_bit(i: usize, b: usize) -> usize {
 fn g_add_carry_bit(g: usize, add_idx: usize, b: usize) -> usize {
     debug_assert!(g < N_G && add_idx < ADDS_PER_G && b < CARRY_BITS_PER_ADD);
     GS_BASE + G_STRIDE * g + CARRY_BITS_PER_ADD * add_idx + b
-}
-#[inline]
-fn g_lin_bit(g: usize, which: usize, b: usize) -> usize {
-    debug_assert!(g < N_G && which < LIN_WORDS_PER_G && b < WORD_BITS);
-    GS_BASE + G_STRIDE * g + ADDS_PER_G * CARRY_BITS_PER_ADD + WORD_BITS * which + b
 }
 #[inline]
 fn out_lo_bit(w: usize, b: usize) -> usize {
@@ -560,26 +546,13 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
                 &d_2,
                 g_add_carry_bit(g, ADD_C2, 0),
             );
-            // b_new = rotr7(b_1 ^ c_2)    (materialized lin-id)
+            // b_new = rotr7(b_1 ^ c_2), d_new = d_2 — not materialized;
+            // all four lanes cascade (Option E).
             let b_new_word = b_1.xor(&c_2).dedup().rotr(7);
-            for i in 0..WORD_BITS {
-                let s = g_lin_bit(g, LIN_B_NEW, i);
-                a_rows[s] = b_new_word.bits[i].clone();
-                b_rows[s] = vec![Z_CONST_POS];
-            }
-            // d_new = d_2                  (materialized lin-id)
-            for i in 0..WORD_BITS {
-                let s = g_lin_bit(g, LIN_D_NEW, i);
-                a_rows[s] = d_2.bits[i].clone();
-                b_rows[s] = vec![Z_CONST_POS];
-            }
-
-            // Advance the symbolic state. `a_2` and `c_2` keep cascading;
-            // `b_new` and `d_new` reset to single-slot lookups.
             state[la] = a_2;
-            state[lb] = Word::from_slot_base(g_lin_bit(g, LIN_B_NEW, 0));
+            state[lb] = b_new_word;
             state[lc] = c_2;
-            state[ld] = Word::from_slot_base(g_lin_bit(g, LIN_D_NEW, 0));
+            state[ld] = d_2;
         }
     }
 
@@ -782,19 +755,10 @@ impl flock_core::lincheck::LincheckCircuit for Blake3LincheckCircuit {
                 );
 
                 let b_new_word = b_1.xor(&c_2).dedup().rotr(7);
-                for i in 0..WORD_BITS {
-                    let s = g_lin_bit(g, LIN_B_NEW, i);
-                    scatter_lin_id_row(&mut comb, alpha, eq_inner, s, &b_new_word.bits[i]);
-                }
-                for i in 0..WORD_BITS {
-                    let s = g_lin_bit(g, LIN_D_NEW, i);
-                    scatter_lin_id_row(&mut comb, alpha, eq_inner, s, &d_2.bits[i]);
-                }
-
                 state[la] = a_2;
-                state[lb] = Word::from_slot_base(g_lin_bit(g, LIN_B_NEW, 0));
+                state[lb] = b_new_word;
                 state[lc] = c_2;
-                state[ld] = Word::from_slot_base(g_lin_bit(g, LIN_D_NEW, 0));
+                state[ld] = d_2;
             }
         }
 
@@ -917,8 +881,6 @@ pub fn build_block_witness(
             let c_2 = add_with_witness_carry_only(c_1, d_2, &mut z, g_add_carry_bit(g, ADD_C2, 0));
             let b_new = (b_1 ^ c_2).rotate_right(7);
             let d_new = d_2;
-            write_word(&mut z, g_lin_bit(g, LIN_B_NEW, 0), b_new);
-            write_word(&mut z, g_lin_bit(g, LIN_D_NEW, 0), d_new);
 
             state[la] = a_2;
             state[lb] = b_new;
@@ -1000,15 +962,13 @@ pub fn generate_witness(blocks: &[Compression], n_blocks_log: usize) -> Vec<bool
 /// ```
 /// Bit 31 is the discarded mod-2³² carry-out and is masked off so the
 /// record push doesn't spill into the next slot.
-// Record-relative positions: carries at 31·i, lin words after all carries.
+// Record-relative positions: carries at 31·i (the whole 186-bit record).
 const REC_C0: usize = 0;
 const REC_C1: usize = CARRY_BITS_PER_ADD;
 const REC_C2: usize = 2 * CARRY_BITS_PER_ADD;
 const REC_C3: usize = 3 * CARRY_BITS_PER_ADD;
 const REC_C4: usize = 4 * CARRY_BITS_PER_ADD;
 const REC_C5: usize = 5 * CARRY_BITS_PER_ADD;
-const REC_LIN0: usize = ADDS_PER_G * CARRY_BITS_PER_ADD;
-const REC_LIN1: usize = REC_LIN0 + WORD_BITS;
 
 /// Write a 32-bit lin-id (or input) slot: (z, a) = val, b = all-ones.
 /// **c is not written** — same `c == z` aliasing trick as above.
@@ -1096,9 +1056,9 @@ pub(crate) fn build_block_witness_ab_packed_into(
             let c_val = state[lc];
             let d_val = state[ld];
 
-            let mut rz = BitRecord::<4>::new();
-            let mut ra = BitRecord::<4>::new();
-            let mut rb = BitRecord::<4>::new();
+            let mut rz = BitRecord::<3>::new();
+            let mut ra = BitRecord::<3>::new();
+            let mut rb = BitRecord::<3>::new();
 
             macro_rules! add_into {
                 ($pos:ident, $x:expr, $y:expr) => {{
@@ -1121,12 +1081,6 @@ pub(crate) fn build_block_witness_ab_packed_into(
             let c_2 = add_into!(REC_C5, c_1, d_2);
             let b_new = (b_1 ^ c_2).rotate_right(7);
             let d_new = d_2;
-            rz.push::<REC_LIN0>(b_new);
-            ra.push::<REC_LIN0>(b_new);
-            rb.push::<REC_LIN0>(0xFFFF_FFFF);
-            rz.push::<REC_LIN1>(d_new);
-            ra.push::<REC_LIN1>(d_new);
-            rb.push::<REC_LIN1>(0xFFFF_FFFF);
 
             let g_base = GS_BASE + G_STRIDE * g;
             rz.flush(z, g_base);
@@ -1691,8 +1645,6 @@ pub(crate) fn build_group_batch_major(
             let c_2 = bm_add_inline(&mut rows, &c_1, &d_2, g_add_carry_bit(g, ADD_C2, 0));
             let b_new = bm_xor_rotr(&b_1, &c_2, 7);
             let d_new = d_2;
-            bm_write_lin(&mut rows, g_lin_bit(g, LIN_B_NEW, 0), &b_new);
-            bm_write_lin(&mut rows, g_lin_bit(g, LIN_D_NEW, 0), &d_new);
 
             state[la] = a_2;
             state[lb] = b_new;
@@ -2011,10 +1963,10 @@ mod tests {
         assert_eq!(T_LO_BASE, 1024);
         assert_eq!(OUT_HI_BASE, 1152);
         assert_eq!(GS_BASE, 1408);
-        assert_eq!(G_STRIDE, 250);
+        assert_eq!(G_STRIDE, 186);
         assert_eq!(N_G, 56);
-        assert_eq!(Z_CONST_POS, 15_408);
-        assert_eq!(USEFUL_BITS, 15_409);
+        assert_eq!(Z_CONST_POS, 11_824);
+        assert_eq!(USEFUL_BITS, 11_825);
         assert!(USEFUL_BITS <= K);
         assert_eq!(CV_BASE % SLOT_BITS, 0);
         assert_eq!(OUT_LO_BASE % SLOT_BITS, 0);

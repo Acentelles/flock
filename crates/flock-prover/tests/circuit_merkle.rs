@@ -13279,9 +13279,10 @@ fn mvp10_circuit_inner_tape() {
 
     // Shape facts of THIS inner (the machinery is shared with the mvp11
     // children; these numbers are not): a mixed CIRCUIT union commits
-    // `num_lanes` ACTIVE lanes — an arbitrary integer (61 here), NOT a
-    // whole number of blocks, and narrower than the fold width.
-    assert_eq!(ct.geo[0].row_words, 61, "the mixed inner's active lane count");
+    // `num_lanes` ACTIVE lanes — an arbitrary integer (47 here; 61 before
+    // the b3 lin-id drop narrowed the stack), NOT a whole number of
+    // blocks, and narrower than the fold width.
+    assert_eq!(ct.geo[0].row_words, 47, "the mixed inner's active lane count");
     assert_ne!(ct.geo[0].row_words % 4, 0, "not a whole number of blocks");
     assert!(
         ct.geo[0].row_words < ct.geo[0].lanes,

@@ -89,6 +89,10 @@ fn random_sha2_inputs(rng: &mut Rng, n: usize) -> Vec<sha2::Compression> {
 // VALUE-ONLY (claim points are transcript-derived and verifier-recomputed,
 // never prover messages; ~92 KB of self-absorbed points deleted from the
 // recursion replay). Label flock-merged-open-v0 -> v1.
+// Re-pinned 2026-08-05: BLAKE3 R1CS "Option E" lin-id drop — the b3 table
+// narrowed 121 -> 93 word-cols (b_new/d_new slots dissolved into the
+// cascade), so every blake3-committed fixture's bytes move. The pure
+// SHA-256 anchor is untouched — the drop is blake3-local.
 // Re-pinned 2026-08-02: two-product multipoint grouping (proof_io v9) —
 // packed-direct claims collapse into merged-column scalar groups (one
 // dual value each); the multipoint label bumped to v1, so even the
@@ -137,22 +141,22 @@ fn m6_merged_union_proof_bytes_pinned() {
         (
             "merged-nu10-1024-1024",
             [1024, 1024],
-            "7dbae5971522ea39aa44677c8c4f2e6621041f84707fc287a18a78347e29c622",
+            "69a99f937906432f35c8c57107572b598f3a71d7dc0a0384daf9f0592c35ccb9",
         ),
         (
             "merged-nu10-50-37",
             [50, 37],
-            "f5ab24f7348f86dfb11243a1e9cd9319da6000b615e03b36d68cf533caf943bf",
+            "165a201a0f4f2dab325a067491fa45fd8dd57611a4f5b8fe87a427dca3647c8c",
         ),
         (
             "merged-nu10-8-8",
             [8, 8],
-            "77b3151998b85c4832c584ddd897d0479e55192d6126acc8788f5556e92b1986",
+            "47b36085c50d7665f44746944c068ea6b5db939c630c88348408fbbc52cf521c",
         ),
         (
             "merged-nu10-0-64",
             [0, 64],
-            "e4cf15095b9b72efe64a89463cba271116a03dfa7fd707f58a64c8b4f0b32d07",
+            "fc5969d72968503cdd382691ff00ef006a298b821471b44cd4b927e0d37ae53e",
         ),
     ];
 
@@ -228,7 +232,7 @@ fn m6_merged_union_proof_bytes_pinned() {
 fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
     // BLAKE3, 256 blocks (m = 22).
     {
-        const EXPECTED: &str = "05d1efd3acfd687f4b28f6970623702036034aeec82ea8d9ce0043d3fb4c20da";
+        const EXPECTED: &str = "c32a29eb870a9156d74b8b02b207fce05a69ce9c188f3e761560c046b596dccf";
         let n_blocks = 256usize;
         let setup = blake3::Blake3Setup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_B3B3);
