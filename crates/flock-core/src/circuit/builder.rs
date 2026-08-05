@@ -404,6 +404,13 @@ impl ShapeBuilder {
         self.public.len()
     }
 
+    /// Rows emitted so far into slot `s` — lets census instrumentation
+    /// attribute a SHARED slot's rows to the regions that emitted them,
+    /// the same way [`Self::public_len`] brackets public blocks.
+    pub fn rows_in_slot(&self, s: SlotId) -> usize {
+        self.rows_per_slot[s.0]
+    }
+
     /// Assert two wires carry the same value: merge their classes, so the
     /// wiring argument enforces it.
     ///

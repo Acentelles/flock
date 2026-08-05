@@ -9445,7 +9445,7 @@ struct RealRegion {
     n_ela_pub: usize,
     /// Labeled `public_len` checkpoints through the emission — the publics
     /// census (`PUB_CENSUS=1` on the node test prints the block sizes).
-    census: Vec<(&'static str, usize)>,
+    census: Vec<(&'static str, usize, usize)>,
     /// The z_skip squeeze wire — see [`ChildRegion::zskip_w`].
     zskip_w: Wire,
     /// sigma: the deferred s_sigma stream word + the GKR squeeze point.
@@ -9520,7 +9520,8 @@ fn emit_real_child_region(
             }
         })
         .collect();
-    let mut cen: Vec<(&'static str, usize)> = vec![("start", sb.public_len())];
+    let mut cen: Vec<(&'static str, usize, usize)> =
+        vec![("start", sb.public_len(), sb.rows_in_slot(cs.macs))];
     let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
     vals.extend_from_slice(&iv_w);
     let iv2 = [sb.public_input(), sb.public_input()];
@@ -9536,7 +9537,7 @@ fn emit_real_child_region(
         &rt.pub_payloads,
     );
 
-    cen.push(("chain payloads + shared consts", sb.public_len()));
+    cen.push(("chain payloads + shared consts", sb.public_len(), sb.rows_in_slot(cs.macs)));
     if std::env::var("PUB_CENSUS").is_ok() {
         let pay_pub: usize = stream
             .words
@@ -9583,7 +9584,7 @@ fn emit_real_child_region(
         ];
         emit_publics_hash(sb, cs.q, iv2, &rt.lo.public, dw, vals, consts)
     };
-    cen.push(("H(publics) region", sb.public_len()));
+    cen.push(("H(publics) region", sb.public_len(), sb.rows_in_slot(cs.macs)));
     let cap_w = cap_wires(stream, &ww, &rt.cap_pays);
     let (to_publish, level_accs) = emit_query_phase(
         sb,
@@ -9602,7 +9603,7 @@ fn emit_real_child_region(
         hints,
     );
 
-    cen.push(("query phase decl", sb.public_len()));
+    cen.push(("query phase decl", sb.public_len(), sb.rows_in_slot(cs.macs)));
     // ---- intake W-rounds, spine, residual ----
     let mut vmap: Vec<Option<usize>> = Vec::new();
     for (wi, w) in stream.words.iter().enumerate() {
@@ -9628,7 +9629,7 @@ fn emit_real_child_region(
     let zassert = sb.public_input();
 
 
-    cen.push(("zero/one/anchor consts", sb.public_len()));
+    cen.push(("zero/one/anchor consts", sb.public_len(), sb.rows_in_slot(cs.macs)));
     // The merged target's TWO HALVES, round-0 posture: the packed-direct
     // half is a MAC chain over absorbed value words × gamma squeeze wires
     // (fully in-circuit); only the RS half — the family-H transpose dots —
@@ -9660,7 +9661,7 @@ fn emit_real_child_region(
     let rhs_v_w = sb.gate(cs.macs, &[zw, wv(inner_pd_i.q_v), v_w])[0];
     sb.connect(runw, rhs_v_w);
 
-    cen.push(("merged target + family-H advice", sb.public_len()));
+    cen.push(("merged target + family-H advice", sb.public_len(), sb.rows_in_slot(cs.macs)));
     // The ligerito SPINE: start gamma'·q_eval, eval/build per fold,
     // intro-folds consuming the query phase's accumulator wires.
     let gpw = outs[trace.squeezes[inner_pd_i.fin][0]][0];
@@ -9745,7 +9746,7 @@ fn emit_real_child_region(
     // THE CLOSURE, in-circuit: inner == t_r as a copy constraint.
     sb.connect(inner_w, t_final);
 
-    cen.push(("spine + residual advice", sb.public_len()));
+    cen.push(("spine + residual advice", sb.public_len(), sb.rows_in_slot(cs.macs)));
     // ---- the WIRING GKR in-circuit + the sigma emission ----
     let macs = cs.macs;
     let zcr = cs.zcr;
@@ -9829,7 +9830,7 @@ fn emit_real_child_region(
         ow,
     );
 
-    cen.push(("GKR advice (g0s, mask)", sb.public_len()));
+    cen.push(("GKR advice (g0s, mask)", sb.public_len(), sb.rows_in_slot(cs.macs)));
     // ---- the MULTI-SLOT element PIOP (general strip) ----
     let mut el_zr = zw;
     let sqt = &trace.squeezes[piop_i.tau_fin];
@@ -9857,7 +9858,7 @@ fn emit_real_child_region(
         el_lcw = sb.gate(mrslot, &[el_lcw, wv(rr.g_v), wv(rr.g_v + 1), rho_w])[0];
     }
 
-    cen.push(("element PIOP advice", sb.public_len()));
+    cen.push(("element PIOP advice", sb.public_len(), sb.rows_in_slot(cs.macs)));
     // ---- the multipoint intake at R=2, P>0 ----
     let mp_gamma_w = outs[trace.squeezes[mp_i.gamma_fin][0]][0];
     let mut t0_w = zw;
@@ -10133,7 +10134,7 @@ fn emit_real_child_region(
     }
     sb.connect(anc_w, expect_w);
 
-    cen.push(("multipoint + anchor expect advice", sb.public_len()));
+    cen.push(("multipoint + anchor expect advice", sb.public_len(), sb.rows_in_slot(cs.macs)));
     // ---- the assertion EMISSIONS (all three families) ----
     let bl_alpha_w = outs[trace.squeezes[rt.bl_alpha.1][0]][0];
     let mut mat_pub: Vec<Wire> = vec![bl_alpha_w];
@@ -10203,7 +10204,7 @@ fn emit_real_child_region(
         el_eval_w.push((aw, bw));
     }
 
-    cen.push(("assertion eval advice", sb.public_len()));
+    cen.push(("assertion eval advice", sb.public_len(), sb.rows_in_slot(cs.macs)));
     // ---- the publishes, in the swap's recorded order ----
     let pub_base = sb.public_len();
     for a_wires in &to_publish {
@@ -10219,7 +10220,7 @@ fn emit_real_child_region(
             sb.publish(*w);
         }
     }
-    cen.push(("TAIL: query alphas + native accs", sb.public_len()));
+    cen.push(("TAIL: query alphas + native accs", sb.public_len(), sb.rows_in_slot(cs.macs)));
     sb.publish(t_final);
     sb.publish(tgt_w);
     sb.publish(runw);
@@ -10228,13 +10229,13 @@ fn emit_real_child_region(
             sb.publish(*w);
         }
     }
-    cen.push(("TAIL: chain ends + residual accs", sb.public_len()));
+    cen.push(("TAIL: chain ends + residual accs", sb.public_len(), sb.rows_in_slot(cs.macs)));
     sb.publish(inner_w);
     sb.publish(sig_w);
     for w in &pt_w {
         sb.publish(*w);
     }
-    cen.push(("TAIL: sigma + GKR point", sb.public_len()));
+    cen.push(("TAIL: sigma + GKR point", sb.public_len(), sb.rows_in_slot(cs.macs)));
     sb.publish(el_zr);
     sb.publish(el_lcw);
     sb.publish(anc_w);
@@ -10244,7 +10245,7 @@ fn emit_real_child_region(
     for w in &ela_pub {
         sb.publish(*w);
     }
-    cen.push(("TAIL: el ends + assertion publics", sb.public_len()));
+    cen.push(("TAIL: el ends + assertion publics", sb.public_len(), sb.rows_in_slot(cs.macs)));
     // ROUND 0's family-H RE-EXPOSURE: the words the rs_half / V_rs advice
     // checks reference — s_hat_v (2×128), the r_dprime squeeze wires
     // (2×7), the two rs gammas, and the 256+P multipoint value words. All
@@ -10289,7 +10290,7 @@ fn emit_real_child_region(
         + mat_pub.len()
         + ela_pub.len()
         + n_fam_pub;
-    cen.push(("TAIL: family-H re-exposure", sb.public_len()));
+    cen.push(("TAIL: family-H re-exposure", sb.public_len(), sb.rows_in_slot(cs.macs)));
     RealRegion {
         pub_base,
         n_query_pub,
@@ -16043,10 +16044,13 @@ fn build_node_outer(
         // parallel.
         let mut consts: Vec<(F128, Wire)> = Vec::new();
         let isl0 = sb.begin_island();
+        let mac_c0_start = sb.rows_in_slot(cs.macs);
         let r0 = emit_real_child_region(&mut sb, &mut cs, &rt0, &mut vals, &mut hints, &mut consts);
+        let mac_after_c0 = sb.rows_in_slot(cs.macs);
         sb.end_island(isl0);
         let isl1 = sb.begin_island();
         let r1 = emit_real_child_region(&mut sb, &mut cs, &rt1, &mut vals, &mut hints, &mut consts);
+        let mac_after_c1 = sb.rows_in_slot(cs.macs);
         sb.end_island(isl1);
         // The fold region rides the children's slots: rows, not columns.
         let (pfslot, pf_w) = r0.pf;
@@ -16104,6 +16108,7 @@ fn build_node_outer(
             zw,
             ow,
         );
+        let mac_after_fold = sb.rows_in_slot(cs.macs);
 
         // ---- THE 2→1 CONNECTS: the fold's absorbed claim surfaces ARE
         // the real child regions' assertion-emission wires ----
@@ -16306,10 +16311,24 @@ fn build_node_outer(
             sb.publish(fp.value);
         }
 
+        if std::env::var("MAC_CENSUS").is_ok() {
+            let mac_total = sb.rows_in_slot(cs.macs);
+            println!("\nMAC ROW CENSUS (shared mac slot; child 0 labels, child 1 same shape):");
+            for w in r0.census.windows(2) {
+                if w[1].2 != w[0].2 {
+                    println!("  {:42} {:6}", w[1].0, w[1].2 - w[0].2);
+                }
+            }
+            println!("  {:42} {:6}", "= child 0 region", mac_after_c0 - mac_c0_start);
+            println!("  {:42} {:6}", "child 1 region", mac_after_c1 - mac_after_c0);
+            println!("  {:42} {:6}", "fold region", mac_after_fold - mac_after_c1);
+            println!("  {:42} {:6}", "lagrange lows + tail", mac_total - mac_after_fold);
+            println!("  {:42} {:6}", "TOTAL", mac_total);
+        }
         if std::env::var("PUB_CENSUS").is_ok() {
             println!("\nPUBLICS CENSUS (child 0; child 1 same shape):");
             for w in r0.census.windows(2) {
-                println!("  {:38} {:6}", w[0].0, w[1].1 - w[0].1);
+                println!("  {:38} {:6}", w[1].0, w[1].1 - w[0].1);
             }
             let child = r0.census.last().unwrap().1 - r0.census[0].1;
             println!("  {:38} {:6}", "= CHILD TOTAL", child);
