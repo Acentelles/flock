@@ -347,7 +347,9 @@ pub const CHAIN_SQUEEZE: u32 = 1 << 7;
 /// Drop-in for [`FsChain`] in the tape constructors: same `absorb` /
 /// `finalize` / `finish` surface, and `finalize` leaves the LIVE state
 /// untouched exactly as the challenger's immutable squeeze does (the
-/// pending partial block is flushed into a LOCAL fork row).
+/// pending partial block is flushed into a LOCAL fork row). Absorb rows
+/// run at counter 0 like the challenger — block order is bound by the cv
+/// chain, and every distinct counter value would cost a circuit public.
 pub struct FsChainSponge {
     rows: Vec<Compression>,
     links: Vec<Link>,
@@ -355,7 +357,6 @@ pub struct FsChainSponge {
     block_offsets: Vec<Option<usize>>,
     cv: [u32; 8],
     cv_row: Option<usize>,
-    counter: u64,
     buf: Vec<u8>,
     buf_offset: usize,
     absorbed: usize,
@@ -376,7 +377,6 @@ impl FsChainSponge {
             block_offsets: Vec::new(),
             cv: IV,
             cv_row: None,
-            counter: 0,
             buf: Vec::with_capacity(BLOCK_BYTES),
             buf_offset: 0,
             absorbed: 0,
@@ -403,16 +403,15 @@ impl FsChainSponge {
         self.absorbed += bytes.len();
         while self.buf.len() >= BLOCK_BYTES {
             let m = words(&self.buf[..BLOCK_BYTES]);
-            let out = blake3_compress(&self.cv, &m, self.counter, BLOCK_BYTES as u32, CHAIN_ABSORB);
+            let out = blake3_compress(&self.cv, &m, 0, BLOCK_BYTES as u32, CHAIN_ABSORB);
             let link = self.cv_link();
             let row = self.emit(
-                (self.cv, m, self.counter, BLOCK_BYTES as u32, CHAIN_ABSORB),
+                (self.cv, m, 0, BLOCK_BYTES as u32, CHAIN_ABSORB),
                 link,
                 Some(self.buf_offset),
             );
             self.cv = out[..8].try_into().expect("8 words");
             self.cv_row = Some(row);
-            self.counter += 1;
             self.buf.drain(..BLOCK_BYTES);
             self.buf_offset += BLOCK_BYTES;
         }
@@ -429,15 +428,9 @@ impl FsChainSponge {
             (self.cv, self.cv_row)
         } else {
             let m = words(&self.buf);
-            let out = blake3_compress(
-                &self.cv,
-                &m,
-                self.counter,
-                self.buf.len() as u32,
-                CHAIN_ABSORB,
-            );
+            let out = blake3_compress(&self.cv, &m, 0, self.buf.len() as u32, CHAIN_ABSORB);
             let link = self.cv_link();
-            let buf_for_row = (self.cv, m, self.counter, self.buf.len() as u32, CHAIN_ABSORB);
+            let buf_for_row = (self.cv, m, 0, self.buf.len() as u32, CHAIN_ABSORB);
             let row = self.emit(buf_for_row, link, Some(self.buf_offset));
             (out[..8].try_into().expect("8 words"), Some(row))
         };

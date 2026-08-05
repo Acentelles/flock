@@ -238,17 +238,19 @@ enum FsState {
 
 /// Chained-MD state over [`crate::hash::blake3_compress`]: `cv` is the
 /// running 256-bit chaining value, `buf` the pending partial block
-/// (invariant: `< 64` bytes after any absorb), `counter` the number of full
-/// blocks compressed. Squeezes do NOT mutate the state — every `sample_*`
-/// absorbs an `OP_SQUEEZE` header first, so consecutive squeezes separate
-/// through the pending bytes; the squeeze locally flushes the pending block
-/// and emits 64-byte output blocks `compress(cv', ZERO, j, out_len,
-/// CHAIN_SQUEEZE)`.
+/// (invariant: `< 64` bytes after any absorb). Absorb compressions run at
+/// counter 0 — block order is bound by the cv chain itself, so a position
+/// counter would be BLAKE3-tree residue (and every distinct counter value
+/// costs a public in the recursion circuit). Squeezes do NOT mutate the
+/// state — every `sample_*` absorbs an `OP_SQUEEZE` header first, so
+/// consecutive squeezes separate through the pending bytes; the squeeze
+/// locally flushes the pending block and emits 64-byte output blocks
+/// `compress(cv', ZERO, j, out_len, CHAIN_SQUEEZE)`, where the output
+/// index `j` is what distinguishes blocks sharing one cv.
 #[derive(Clone)]
 struct B3Chain {
     cv: [u32; 8],
     buf: Vec<u8>,
-    counter: u64,
 }
 
 /// Domain flag for chain absorb compressions (disjoint from BLAKE3's
@@ -262,7 +264,6 @@ impl B3Chain {
         Self {
             cv: crate::hash::BLAKE3_IV,
             buf: Vec::with_capacity(64),
-            counter: 0,
         }
     }
 
@@ -284,9 +285,8 @@ impl B3Chain {
         self.buf.extend_from_slice(bytes);
         while self.buf.len() >= 64 {
             let m = Self::block_words(&self.buf[..64]);
-            let out = crate::hash::blake3_compress(&self.cv, &m, self.counter, 64, CHAIN_ABSORB);
+            let out = crate::hash::blake3_compress(&self.cv, &m, 0, 64, CHAIN_ABSORB);
             self.cv = out[..8].try_into().expect("8 words");
-            self.counter += 1;
             self.buf.drain(..64);
         }
     }
@@ -299,13 +299,7 @@ impl B3Chain {
             return self.cv;
         }
         let m = Self::block_words(&self.buf);
-        let out = crate::hash::blake3_compress(
-            &self.cv,
-            &m,
-            self.counter,
-            self.buf.len() as u32,
-            CHAIN_ABSORB,
-        );
+        let out = crate::hash::blake3_compress(&self.cv, &m, 0, self.buf.len() as u32, CHAIN_ABSORB);
         out[..8].try_into().expect("8 words")
     }
 
