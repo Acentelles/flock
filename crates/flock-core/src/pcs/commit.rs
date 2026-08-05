@@ -160,9 +160,18 @@ impl PcsParams {
         }
     }
 
-    /// Cap depth of the L0 commitment tree: `min(⌈log2 q₀⌉, k_code)`.
+    /// Cap depth of the L0 commitment tree — the opener config's own rule
+    /// ([`ligerito::ProverConfig::l0_cap_depth`]): the stratified schedule's
+    /// cap when the config opts in, else the legacy `min(⌈log2 q₀⌉,
+    /// k_code)`. The `udr_queries` fallback mirrors [`Self::l0_queries`].
     pub fn l0_cap_depth(&self) -> usize {
-        merkle::cap_depth(self.l0_queries(), self.k_code())
+        match self.ligerito_prover_config() {
+            Ok(cfg) => cfg.l0_cap_depth(self.k_code()),
+            Err(_) => merkle::cap_depth(
+                crate::pcs::ligerito::udr_queries(self.log_inv_rate),
+                self.k_code(),
+            ),
+        }
     }
 
     fn validate(&self) {

@@ -24,6 +24,7 @@ pub mod jagged;
 pub mod ligerito;
 pub mod pack;
 pub mod ring_switch;
+pub mod stratified;
 pub mod tensor_algebra;
 
 pub use commit::{
@@ -151,11 +152,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     // prove time instead of as a verifier reject.
     assert_eq!(
         commitment.cap.len(),
-        1usize
-            << crate::merkle::cap_depth(
-                lig_config.queries[0],
-                commitment.params.k_code(),
-            ),
+        1usize << lig_config.l0_cap_depth(commitment.params.k_code()),
         "commitment cap size disagrees with the opener config's L0 query count"
     );
     debug_assert_eq!(
@@ -163,7 +160,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
         crate::merkle::cap_layer(
             &prover_data.merkle_tree,
             commitment.params.n_leaves(),
-            crate::merkle::cap_depth(lig_config.queries[0], commitment.params.k_code()),
+            lig_config.l0_cap_depth(commitment.params.k_code()),
         ),
         "commitment cap is not the prover tree's cap layer"
     );
@@ -1060,11 +1057,7 @@ pub fn open_batch_merged<Ch: Challenger>(
     // prove time instead of as a verifier reject.
     assert_eq!(
         commitment.cap.len(),
-        1usize
-            << crate::merkle::cap_depth(
-                lig_config.queries[0],
-                commitment.params.k_code(),
-            ),
+        1usize << lig_config.l0_cap_depth(commitment.params.k_code()),
         "commitment cap size disagrees with the opener config's L0 query count"
     );
     debug_assert_eq!(
@@ -1072,7 +1065,7 @@ pub fn open_batch_merged<Ch: Challenger>(
         crate::merkle::cap_layer(
             &prover_data.merkle_tree,
             commitment.params.n_leaves(),
-            crate::merkle::cap_depth(lig_config.queries[0], commitment.params.k_code()),
+            lig_config.l0_cap_depth(commitment.params.k_code()),
         ),
         "commitment cap is not the prover tree's cap layer"
     );
@@ -1653,7 +1646,10 @@ mod tests {
             fold_grinding_bits: vec![0; n_levels],
             ood_samples: vec![0; n_levels],
             merkle_hash: Default::default(),
-        };
+            stratified_open: false,
+            stratified: vec![],
+        }
+        .with_default_stratified();
         let lig_v_cfg = crate::pcs::ligerito::VerifierConfig {
             log_inv_rates,
             recursive_steps: recursive_ks.len(),
@@ -1667,7 +1663,10 @@ mod tests {
             fold_grinding_bits: vec![0; n_levels],
             ood_samples: vec![0; n_levels],
             merkle_hash: Default::default(),
-        };
+            stratified_open: false,
+            stratified: vec![],
+        }
+        .with_default_stratified();
 
         let mut ch_p = FsChallenger::new(b"flock-test-lig-v0");
         let proof = open_batch_mixed_ligerito_with_precomputed_s_hat_v(
