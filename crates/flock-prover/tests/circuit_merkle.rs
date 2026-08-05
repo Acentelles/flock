@@ -16149,6 +16149,38 @@ fn mvp11_swap_children_fold_scale() {
 /// circuit digest (the foldability key); their claims land at unrelated FS
 /// points. Every tape pin, connect, and checker walk of the 2→1 milestone
 /// lives inside — the builder IS the test.
+/// The PRODUCTION per-proof tape cost of one child: the recorded deferred
+/// verify alone — the tape (op sequence + values + challenges) and the
+/// assertion references in one pass. Everything else `RealTape::new` does
+/// (pins, locates, native replicas) is SHAPE-STABLE index work a real node
+/// precomputes at setup; the value/hint fill from a fresh tape is index
+/// copies on top of this. Union + lcs construction is included
+/// (conservative — a node would cache both).
+fn record_child_verify(lo: &LeafOuter, domain: &'static [u8]) {
+    use flock_core::transcript_record::RecordingChallenger;
+    let union_i = UnionInstance::new(&lo.shape.registry, lo.shape.counts.clone());
+    let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
+        (lo.b3_slot, lo.b3_r1cs.csc_lincheck_circuit()),
+        (lo.swap_slot, lo.swap_r1cs.csc_lincheck_circuit()),
+        (lo.spread_slot, lo.spread_r1cs.csc_lincheck_circuit()),
+    ];
+    lcs_ord.sort_by_key(|(i, _)| *i);
+    let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
+        lcs_ord.into_iter().map(|(_, cc)| cc).collect();
+    let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(domain));
+    verifier::verify_ligerito_union_circuit_deferred(
+        &union_i,
+        &lo.shape.circuit,
+        &lo.public,
+        &lcs,
+        &lo.commitment,
+        &lo.proof,
+        &lo.pcs,
+        &mut rec,
+    )
+    .expect("the child verifies (recorded)");
+}
+
 /// Per-proof timing breakdown of one node build — the repeatable costs
 /// (the amortizable circuit-shape build is excluded; it's printed as
 /// `build` in the node's own breakdown line).
@@ -16182,7 +16214,7 @@ fn build_node_outer(
     // The two children's tapes are independent statement work — build them
     // concurrently (each is a recording verify + the region pins).
     let (rt0, rt1) = rayon::join(|| RealTape::new(&lo0, DOMAIN), || RealTape::new(&lo1, DOMAIN));
-    let tapes_ms = t_tapes.elapsed().as_secs_f64() * 1e3;
+    let tape_setup_ms = t_tapes.elapsed().as_secs_f64() * 1e3;
     assert_ne!(
         rt0.sigma_native.rho, rt1.sigma_native.rho,
         "distinct witnesses, distinct FS points"
@@ -16659,7 +16691,7 @@ fn build_node_outer(
             println!("  {:38} {:6}", "fold region publics", tail_len);
             println!("  {:38} {:6}", "TOTAL (2 children + shared)", sb.public_len());
         }
-        let build_ms = t_tapes.elapsed().as_secs_f64() * 1e3 - tapes_ms;
+        let build_ms = t_tapes.elapsed().as_secs_f64() * 1e3 - tape_setup_ms;
         let t_build2 = std::time::Instant::now();
         let shape2 = sb.finish().expect("the 2->1 node circuit builds");
         assert!(
@@ -16766,9 +16798,15 @@ fn build_node_outer(
         // Tapes are statement work: re-run them each online iteration
         // (results discarded — identical by determinism) so the printed
         // number is the steady-state cost, not the first-touch one.
+        // The ONLINE tape cost: two recorded deferred child verifies (the
+        // production statement work). The pin/locate scaffolding ran once
+        // above (tape_setup_ms) — its indices are shape-stable.
         let tapes_ms = {
             let t = std::time::Instant::now();
-            let _ = rayon::join(|| RealTape::new(&lo0, DOMAIN), || RealTape::new(&lo1, DOMAIN));
+            rayon::join(
+                || record_child_verify(&lo0, DOMAIN),
+                || record_child_verify(&lo1, DOMAIN),
+            );
             t.elapsed().as_secs_f64() * 1e3
         };
         let t_trace = std::time::Instant::now();
@@ -16948,9 +16986,9 @@ fn build_node_outer(
              lagrange lows DERIVED in-circuit from each child's z_skip wire\n  \
              outer: total b3 rows {} | nu {} | dense_m {} | mu {} \
              (cell slots: {} gate + {} public)\n  \
-             PER PROOF: tapes {:.0} + trace {:.0} + witness asm {:.0} + prove {:.0} \
+             PER PROOF (online): child tapes {:.0} + witgen/trace {:.0} + witness asm {:.0} + prove {:.0} \
              = {:.0} ms | verify {:.0} ms (DEFERRED {:.0} ms) | proof {:.1} KiB\n  \
-             circuit build (per SHAPE, cacheable): {:.0} ms\n",
+             SETUP: circuit build (per SHAPE, cacheable) {:.0} ms | tape pins+locates (shape-stable) {:.0} ms\n",
             n_folds,
             lo0.pcs.m,
             rt0.mu_i,
@@ -16969,6 +17007,7 @@ fn build_node_outer(
             deferred_ms,
             bincode::serialize(&oproof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
             build_ms,
+            tape_setup_ms,
         );
         if steady_left > 0 {
             steady_left -= 1;
