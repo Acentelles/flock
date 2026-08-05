@@ -50,6 +50,32 @@ use flock_prover::r1cs_hashes::merkle_r1cs::{
 use flock_prover::schedule::TableType;
 use flock_prover::union::UnionInstance;
 
+/// The L0 interleave for a content-sized commit: the embedded config's
+/// own `initial_k` (6 everywhere except m29 Fast/Slim = 5 — the
+/// recursion-node row-width choice). `prover_config_for` rejects a
+/// mismatched batch, so every params site whose `m` is content-derived
+/// must go through this.
+fn pcs_batch_for(union: &UnionInstance, profile: LigeritoProfile) -> usize {
+    flock_core::pcs::ligerito::embedded_initial_k_or_default(union.dense_m(), profile)
+}
+
+fn pcs_batch(union: &UnionInstance) -> usize {
+    pcs_batch_for(union, LigeritoProfile::Fast)
+}
+
+/// `TOWER_PROFILE=slim` flips the RECURSION-PATH commits (the leaf's
+/// workload inner, the leaf outer, the node outer) to Slim — rate 1/4,
+/// roughly HALF the queries (m29: Σq 262 vs Fast's 491), so the
+/// openings-dominated b3 trace shrinks with q while the doubled codeword
+/// lands on the native NTT+Merkle side. Default Fast; the legacy mvp
+/// tests stay Fast unconditionally.
+fn tower_profile() -> LigeritoProfile {
+    match std::env::var("TOWER_PROFILE").as_deref() {
+        Ok("slim") => LigeritoProfile::Slim,
+        _ => LigeritoProfile::Fast,
+    }
+}
+
 const DOMAIN: &[u8] = b"flock-circuit-merkle-v0";
 
 const CHUNK_START: u32 = 1 << 0;
@@ -450,9 +476,9 @@ fn merkle_index_wired_to_a_challenge() {
     let pcs_params = PcsParams {
         m: union.dense_m(),
         log_inv_rate: 1,
-        log_batch_size: 6,
+        log_batch_size: pcs_batch(&union),
         profile: LigeritoProfile::Fast,
-        num_lanes: union.commit_lanes(6),
+        num_lanes: union.commit_lanes(pcs_batch(&union)),
         merkle_hash: Default::default(),
     };
 
@@ -611,9 +637,9 @@ fn l0_shape_circuit_cost() {
     let pcs_params = PcsParams {
         m: union.dense_m(),
         log_inv_rate: 1,
-        log_batch_size: 6,
+        log_batch_size: pcs_batch(&union),
         profile: LigeritoProfile::Fast,
-        num_lanes: union.commit_lanes(6),
+        num_lanes: union.commit_lanes(pcs_batch(&union)),
         merkle_hash: Default::default(),
     };
     let layout = MerkleTreeLayout::with_blake3_chunk_leaf(depth, leaf_bytes, blake3_spec());
@@ -1085,9 +1111,9 @@ fn leaf_arithmetic_joins_the_merkle_openings() {
     let pcs_params = PcsParams {
         m: union.dense_m(),
         log_inv_rate: 1,
-        log_batch_size: 6,
+        log_batch_size: pcs_batch(&union),
         profile: LigeritoProfile::Fast,
-        num_lanes: union.commit_lanes(6),
+        num_lanes: union.commit_lanes(pcs_batch(&union)),
         merkle_hash: Default::default(),
     };
     let layout = MerkleTreeLayout::with_blake3_chunk_leaf(depth, leaf_bytes, blake3_spec());
@@ -1520,9 +1546,9 @@ fn mvp4_slice(depth: usize, n_queries: usize, nu: usize) {
     let pcs_params = PcsParams {
         m: union.dense_m(),
         log_inv_rate: 1,
-        log_batch_size: 6,
+        log_batch_size: pcs_batch(&union),
         profile: LigeritoProfile::Fast,
-        num_lanes: union.commit_lanes(6),
+        num_lanes: union.commit_lanes(pcs_batch(&union)),
         merkle_hash: Default::default(),
     };
     let layout = MerkleTreeLayout::with_blake3_chunk_leaf(depth, leaf_bytes, blake3_spec());
@@ -2072,9 +2098,9 @@ fn mvp5_all_levels_query_phase() {
     let pcs_params = PcsParams {
         m: union.dense_m(),
         log_inv_rate: 1,
-        log_batch_size: 6,
+        log_batch_size: pcs_batch(&union),
         profile: LigeritoProfile::Fast,
-        num_lanes: union.commit_lanes(6),
+        num_lanes: union.commit_lanes(pcs_batch(&union)),
         merkle_hash: Default::default(),
     };
     let layouts: Vec<MerkleTreeLayout> = levels
@@ -4012,9 +4038,9 @@ fn mvp7_real_query_phase() {
     let inner_params = PcsParams {
         m: inner_union.dense_m(),
         log_inv_rate: 1,
-        log_batch_size: 6,
+        log_batch_size: pcs_batch(&inner_union),
         profile: LigeritoProfile::Fast,
-        num_lanes: inner_union.commit_lanes(6), // = 64 at full utilization
+        num_lanes: inner_union.commit_lanes(pcs_batch(&inner_union)), // = 64 at full utilization
         merkle_hash: HashKind::Blake3,
     };
     let t = Instant::now();
@@ -4900,9 +4926,9 @@ fn mvp7_real_query_phase() {
     let pcs_params = PcsParams {
         m: union.dense_m(),
         log_inv_rate: 1,
-        log_batch_size: 6,
+        log_batch_size: pcs_batch(&union),
         profile: LigeritoProfile::Fast,
-        num_lanes: union.commit_lanes(6),
+        num_lanes: union.commit_lanes(pcs_batch(&union)),
         merkle_hash: Default::default(),
     };
     let b3 = blake3::build_block_r1cs(nu);
@@ -6417,9 +6443,9 @@ fn mvp6_all_levels_collapsed() {
     let pcs_params = PcsParams {
         m: union.dense_m(),
         log_inv_rate: 1,
-        log_batch_size: 6,
+        log_batch_size: pcs_batch(&union),
         profile: LigeritoProfile::Fast,
-        num_lanes: union.commit_lanes(6),
+        num_lanes: union.commit_lanes(pcs_batch(&union)),
         merkle_hash: Default::default(),
     };
     let b3 = blake3::build_block_r1cs(nu);
@@ -6616,7 +6642,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
     let threads = flock_core::init_perf_thread_pool().unwrap_or_else(rayon::current_num_threads);
 
     let n_blocks = 256usize;
-    let setup = blake3::Blake3Setup::new_batch_major(n_blocks);
+    let setup = blake3::Blake3Setup::batch_major_with_profile(n_blocks, tower_profile());
     let mut rng = Rng(seed);
     let inputs: Vec<blake3::Compression> = (0..n_blocks)
         .map(|_| {
@@ -7013,7 +7039,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         let (geo, native_sums) =
             level_geometry(&levels, &lvl_src, &chals, HashKind::Blake3);
 
-        let stream = t_shape.stream_words(DOMAIN);
+        let stream = t_shape.stream_words_duplex(DOMAIN);
         let bytes = stream.to_bytes(rec.values(), rec.payloads());
         let mut chain = FsChainSponge::new();
         let mut at = 0usize;
@@ -8112,12 +8138,13 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         // BLAKE3 for both hashes: the outer proof is the SWAP's inner, so
         // it must be recursable — the same two gotchas the leaf hit.
         let union_o = UnionInstance::new(&shape.registry, shape.counts.clone());
+        let pf = tower_profile();
         let pcs_o = PcsParams {
             m: union_o.dense_m(),
-            log_inv_rate: 1,
-            log_batch_size: 6,
-            profile: LigeritoProfile::Fast,
-            num_lanes: union_o.commit_lanes(6),
+            log_inv_rate: pf.log_inv_rate(),
+            log_batch_size: pcs_batch_for(&union_o, pf),
+            profile: pf,
+            num_lanes: union_o.commit_lanes(pcs_batch_for(&union_o, pf)),
             merkle_hash: HashKind::Blake3,
         };
         let b3_r1cs = blake3::build_block_r1cs(nu);
@@ -8636,7 +8663,7 @@ impl<'p> RealTape<'p> {
         let h_rows = lo.public.len().div_ceil(4) + 2 * lo.public.len().div_ceil(64);
 
         // ---- the chain materials ----
-        let stream = t_shape.stream_words(domain);
+        let stream = t_shape.stream_words_duplex(domain);
         let bytes = stream.to_bytes(rec.values(), rec.payloads());
         let trace = {
             let mut chain = FsChainSponge::new();
@@ -8684,6 +8711,78 @@ impl<'p> RealTape<'p> {
                     g.row_words.div_ceil(4) * g.q,
                     g.depth * g.q,
                     (1usize << g.c) - 1
+                );
+            }
+            // CHAIN DECOMPOSITION + an independent row-count model of the
+            // duplex discipline (transcript-v3), asserted against the
+            // sponge trace: a squeeze row absorbs the pending partial
+            // block as its MESSAGE, mutates cv, and has no header word.
+            {
+                let pad16 = |n: usize| n.div_ceil(16) * 16;
+                let (mut hdr_w, mut pay_w, mut n_obs, mut n_sq) = (0usize, 0usize, 0usize, 0usize);
+                // The domain header + padded domain are absorbed at
+                // construction, ahead of the recorded ops.
+                let (mut v3_rows, mut pend) = (0usize, 16 + pad16(domain.len()));
+                for op in ops.iter() {
+                    match op {
+                        Op::Label(l) => {
+                            hdr_w += 1;
+                            pay_w += pad16(l.len()) / 16;
+                            n_obs += 1;
+                            pend += 16 + pad16(l.len());
+                        }
+                        Op::ObserveScalar => {
+                            hdr_w += 1;
+                            pay_w += 1;
+                            n_obs += 1;
+                            pend += 32;
+                        }
+                        Op::ObserveSlice(n) => {
+                            hdr_w += 1;
+                            pay_w += n;
+                            n_obs += 1;
+                            pend += 16 + 16 * n;
+                        }
+                        Op::ObserveBytes(len) => {
+                            hdr_w += 1;
+                            pay_w += pad16(*len) / 16;
+                            n_obs += 1;
+                            pend += 16 + pad16(*len);
+                        }
+                        Op::SqueezeScalar | Op::SqueezeSlice(_) | Op::Pow { .. } => {
+                            n_sq += 1;
+                            // v3: the squeeze row eats the pending partial
+                            // block and emits output block 0; extra output
+                            // blocks follow.
+                            v3_rows += pend / 64;
+                            v3_rows += 1 + (op.squeezed_bytes().div_ceil(64) - 1);
+                            pend = 0;
+                            if let Op::Pow { .. } = op {
+                                // the nonce rides observe_bytes(8): header + word
+                                pend += 32;
+                            }
+                        }
+                    }
+                    v3_rows += pend / 64;
+                    pend %= 64;
+                }
+                if pend > 0 {
+                    v3_rows += 1;
+                }
+                eprintln!(
+                    "  [chain census] ops {} (obs {} / sq {}) | header words {} ({} B) | payload words {} | duplex rows {}",
+                    ops.len(),
+                    n_obs,
+                    n_sq,
+                    hdr_w,
+                    16 * hdr_w,
+                    pay_w,
+                    trace.rows.len(),
+                );
+                assert_eq!(
+                    v3_rows,
+                    trace.rows.len(),
+                    "the duplex row model diverged from the sponge trace"
                 );
             }
         }
@@ -8840,15 +8939,20 @@ impl<'p> RealTape<'p> {
             nt
         };
 
-        // ---- the residual pairing's rotation (lane-major, 56/64) ----
+        // ---- the residual pairing's rotation (lane-major inners) ----
+        // A pow2-lane inner (row_words == lanes — e.g. the m28-k4 slim node
+        // whose 16-of-16 lanes make the commit exactly full) takes the
+        // IDENTITY pairing, same as the native side's rotate gate and
+        // ChildTape's conditional.
         let yr_len = lo.proof.pcs_open.inner.ligerito.final_proof.yr.len();
         let lane_major = geo[0].row_words < geo[0].lanes;
-        assert!(lane_major, "the real inner commits integer lanes");
-        let w_resid: Vec<RoundRec> = {
+        let w_resid: Vec<RoundRec> = if lane_major {
             let k_rot = w_rounds.len() - levels[0].fold_fins.len();
             let mut v = w_rounds[k_rot..].to_vec();
             v.extend_from_slice(&w_rounds[..k_rot]);
             v
+        } else {
+            w_rounds.to_vec()
         };
 
         // ---- the element PIOP's natives: the GENERAL strip + g0 chain ----
@@ -10624,9 +10728,9 @@ fn mvp10_leaf_outer_inner_tape() {
     let pcs2 = PcsParams {
         m: union2.dense_m(),
         log_inv_rate: 1,
-        log_batch_size: 6,
+        log_batch_size: pcs_batch(&union2),
         profile: LigeritoProfile::Fast,
-        num_lanes: union2.commit_lanes(6),
+        num_lanes: union2.commit_lanes(pcs_batch(&union2)),
         merkle_hash: Default::default(),
     };
     let b3_r1cs2 = blake3::build_block_r1cs(nu2);
@@ -10840,9 +10944,9 @@ fn build_mixed_inner(n_blocks: usize, mac_take: usize, seed: u64) -> MixedInner 
     let pcs_params = PcsParams {
         m: union.dense_m(),
         log_inv_rate: 1,
-        log_batch_size: 6,
+        log_batch_size: pcs_batch(&union),
         profile: LigeritoProfile::Fast,
-        num_lanes: union.commit_lanes(6),
+        num_lanes: union.commit_lanes(pcs_batch(&union)),
         // BLAKE3 for BOTH Merkle and FS: the inner stays recursable — a
         // child-tape region replays this transcript in-circuit, and the
         // defaults diverge silently (both recorded gotchas).
@@ -11669,7 +11773,7 @@ impl<'p> ChildTape<'p> {
         let h_rows = n_pub_i.div_ceil(4) + 2 * n_pub_i.div_ceil(64);
 
         // ---- the chain materials ----
-        let stream = t_shape.stream_words(domain);
+        let stream = t_shape.stream_words_duplex(domain);
         let bytes = stream.to_bytes(rec.values(), rec.payloads());
         let trace = {
             let mut chain = FsChainSponge::new();
@@ -11735,6 +11839,78 @@ impl<'p> ChildTape<'p> {
                     g.row_words.div_ceil(4) * g.q,
                     g.depth * g.q,
                     (1usize << g.c) - 1
+                );
+            }
+            // CHAIN DECOMPOSITION + an independent row-count model of the
+            // duplex discipline (transcript-v3), asserted against the
+            // sponge trace: a squeeze row absorbs the pending partial
+            // block as its MESSAGE, mutates cv, and has no header word.
+            {
+                let pad16 = |n: usize| n.div_ceil(16) * 16;
+                let (mut hdr_w, mut pay_w, mut n_obs, mut n_sq) = (0usize, 0usize, 0usize, 0usize);
+                // The domain header + padded domain are absorbed at
+                // construction, ahead of the recorded ops.
+                let (mut v3_rows, mut pend) = (0usize, 16 + pad16(domain.len()));
+                for op in ops.iter() {
+                    match op {
+                        Op::Label(l) => {
+                            hdr_w += 1;
+                            pay_w += pad16(l.len()) / 16;
+                            n_obs += 1;
+                            pend += 16 + pad16(l.len());
+                        }
+                        Op::ObserveScalar => {
+                            hdr_w += 1;
+                            pay_w += 1;
+                            n_obs += 1;
+                            pend += 32;
+                        }
+                        Op::ObserveSlice(n) => {
+                            hdr_w += 1;
+                            pay_w += n;
+                            n_obs += 1;
+                            pend += 16 + 16 * n;
+                        }
+                        Op::ObserveBytes(len) => {
+                            hdr_w += 1;
+                            pay_w += pad16(*len) / 16;
+                            n_obs += 1;
+                            pend += 16 + pad16(*len);
+                        }
+                        Op::SqueezeScalar | Op::SqueezeSlice(_) | Op::Pow { .. } => {
+                            n_sq += 1;
+                            // v3: the squeeze row eats the pending partial
+                            // block and emits output block 0; extra output
+                            // blocks follow.
+                            v3_rows += pend / 64;
+                            v3_rows += 1 + (op.squeezed_bytes().div_ceil(64) - 1);
+                            pend = 0;
+                            if let Op::Pow { .. } = op {
+                                // the nonce rides observe_bytes(8): header + word
+                                pend += 32;
+                            }
+                        }
+                    }
+                    v3_rows += pend / 64;
+                    pend %= 64;
+                }
+                if pend > 0 {
+                    v3_rows += 1;
+                }
+                eprintln!(
+                    "  [chain census] ops {} (obs {} / sq {}) | header words {} ({} B) | payload words {} | duplex rows {}",
+                    ops.len(),
+                    n_obs,
+                    n_sq,
+                    hdr_w,
+                    16 * hdr_w,
+                    pay_w,
+                    trace.rows.len(),
+                );
+                assert_eq!(
+                    v3_rows,
+                    trace.rows.len(),
+                    "the duplex row model diverged from the sponge trace"
                 );
             }
         }
@@ -13313,9 +13489,9 @@ fn mvp10_circuit_inner_tape() {
     let pcs2 = PcsParams {
         m: union2.dense_m(),
         log_inv_rate: 1,
-        log_batch_size: 6,
+        log_batch_size: pcs_batch(&union2),
         profile: LigeritoProfile::Fast,
-        num_lanes: union2.commit_lanes(6),
+        num_lanes: union2.commit_lanes(pcs_batch(&union2)),
         merkle_hash: Default::default(),
     };
     let b3_r1cs2 = blake3::build_block_r1cs(nu2);
@@ -13732,7 +13908,7 @@ fn mvp11_sigma_fold_tape() {
         use flock_prover::prover::UnionElementSlotInput;
         use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
-        let stream = t_shape.stream_words(M11_DOMAIN);
+        let stream = t_shape.stream_words_duplex(M11_DOMAIN);
         let bytes = stream.to_bytes(rec.values(), rec.payloads());
         let mut chain = FsChainSponge::new();
         let mut at = 0usize;
@@ -13918,9 +14094,9 @@ fn mvp11_sigma_fold_tape() {
         let pcs2 = PcsParams {
             m: union2.dense_m(),
             log_inv_rate: 1,
-            log_batch_size: 6,
+            log_batch_size: pcs_batch(&union2),
             profile: LigeritoProfile::Fast,
-            num_lanes: union2.commit_lanes(6),
+            num_lanes: union2.commit_lanes(pcs_batch(&union2)),
             merkle_hash: Default::default(),
         };
         let b3_r1cs2 = blake3::build_block_r1cs(nu2);
@@ -14819,7 +14995,7 @@ fn mvp11_merge_fold_region() {
         use flock_prover::prover::UnionElementSlotInput;
         use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
-        let stream = t_shape.stream_words(M11_MERGE_DOMAIN);
+        let stream = t_shape.stream_words_duplex(M11_MERGE_DOMAIN);
         let bytes = stream.to_bytes(rec.values(), rec.payloads());
         let mut chain = FsChainSponge::new();
         let mut at = 0usize;
@@ -15258,9 +15434,9 @@ fn mvp11_merge_fold_region() {
         let pcs2 = PcsParams {
             m: union2.dense_m(),
             log_inv_rate: 1,
-            log_batch_size: 6,
+            log_batch_size: pcs_batch(&union2),
             profile: LigeritoProfile::Fast,
-            num_lanes: union2.commit_lanes(6),
+            num_lanes: union2.commit_lanes(pcs_batch(&union2)),
             merkle_hash: Default::default(),
         };
         let b3_r1cs2 = blake3::build_block_r1cs(nu2);
@@ -15594,7 +15770,7 @@ fn mvp11_swap_children_fold_scale() {
         use flock_prover::prover::UnionElementSlotInput;
         use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
-        let stream = t_shape.stream_words(M11_SCALE_DOMAIN);
+        let stream = t_shape.stream_words_duplex(M11_SCALE_DOMAIN);
         let bytes = stream.to_bytes(rec.values(), rec.payloads());
         let mut chain = FsChainSponge::new();
         let mut at = 0usize;
@@ -15723,9 +15899,9 @@ fn mvp11_swap_children_fold_scale() {
         let pcs2 = PcsParams {
             m: union2.dense_m(),
             log_inv_rate: 1,
-            log_batch_size: 6,
+            log_batch_size: pcs_batch(&union2),
             profile: LigeritoProfile::Fast,
-            num_lanes: union2.commit_lanes(6),
+            num_lanes: union2.commit_lanes(pcs_batch(&union2)),
             merkle_hash: Default::default(),
         };
         let b3_r1cs2 = blake3::build_block_r1cs(nu2);
@@ -16006,7 +16182,7 @@ fn build_node_outer(
         use flock_prover::prover::UnionElementSlotInput;
         use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
-        let stream = t_shape.stream_words(M11_NODE_DOMAIN);
+        let stream = t_shape.stream_words_duplex(M11_NODE_DOMAIN);
         let bytes = stream.to_bytes(rec.values(), rec.payloads());
         let mut chain = FsChainSponge::new();
         let mut at = 0usize;
@@ -16409,12 +16585,13 @@ fn build_node_outer(
         // params and the R1CS tables are per-SHAPE — offline, ahead of the
         // online loop.
         let union2 = UnionInstance::new(&shape2.registry, shape2.counts.clone());
+        let pf = tower_profile();
         let pcs2 = PcsParams {
             m: union2.dense_m(),
-            log_inv_rate: 1,
-            log_batch_size: 6,
-            profile: LigeritoProfile::Fast,
-            num_lanes: union2.commit_lanes(6),
+            log_inv_rate: pf.log_inv_rate(),
+            log_batch_size: pcs_batch_for(&union2, pf),
+            profile: pf,
+            num_lanes: union2.commit_lanes(pcs_batch_for(&union2, pf)),
             // BLAKE3 for BOTH Merkle and FS: the node's proof must be
             // RECURSABLE — a parent replays this transcript in-circuit,
             // and each default diverges silently (the two recorded
