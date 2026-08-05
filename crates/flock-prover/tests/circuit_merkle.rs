@@ -4179,7 +4179,7 @@ fn mvp7_real_query_phase() {
         &lvl_src,
         &chals,
         HashKind::Blake3,
-        strat_scheds(&inner_params).as_deref(),
+        &strat_scheds(&inner_params),
     );
 
     // ---- the FS chain over the real byte stream ----
@@ -5032,7 +5032,7 @@ fn mvp7_real_query_phase() {
          verifier side {verify_t} ms | proof {:.1} KiB | {threads} threads\n  \
          SETUP         {setup_ms:6.0} ms\n",
         geo.iter()
-            .map(|g| (g.q, g.depth, g.c, g.path))
+            .map(|g| (g.q, g.depth, g.c))
             .collect::<Vec<_>>(),
         shape.counts[shape.registry_slot(slots.b3)],
         trace.rows.len(),
@@ -5126,9 +5126,6 @@ struct CollapsedSlots {
 struct Lvl {
     q: usize,
     c: usize,
-    /// Uniform per-query sibling count — LEGACY ONLY (0 under a schedule;
-    /// per-query lengths come from [`Lvl::path_range`]).
-    path: usize,
     depth: usize,
     /// The FOLD width `2^folds` — the lane-weight domain.
     lanes: usize,
@@ -5137,55 +5134,41 @@ struct Lvl {
     /// definitionally zero and never encoded). Equal to `lanes` whenever
     /// the lane count happens to be a power of two.
     row_words: usize,
-    /// The stratified schedule this level's config mandates, or None for
-    /// the legacy uniform layout. Every consumer (emit, residual, checker)
-    /// maps query → (stratum depth, stratum, path slice) through this.
-    sched: Option<flock_core::pcs::stratified::LevelSchedule>,
+    /// The stratified schedule this level's config mandates. Every
+    /// consumer (emit, residual, checker) maps query → (stratum depth,
+    /// stratum, path slice) through this.
+    sched: flock_core::pcs::stratified::LevelSchedule,
 }
 
 impl Lvl {
-    /// Query `k`'s (terminal depth, stratum index). Legacy: the cap depth
-    /// (stratum index unused — the terminal index is position-derived).
+    /// Query `k`'s (terminal depth, stratum index).
     fn q_stratum(&self, k: usize) -> (usize, usize) {
-        match &self.sched {
-            None => (self.c, 0),
-            Some(s) => s
-                .query_strata()
-                .nth(k)
-                .expect("query index within schedule"),
-        }
+        self.sched
+            .query_strata()
+            .nth(k)
+            .expect("query index within schedule")
     }
 
     /// Query `k`'s siblings as a range into the level's flat path vec.
     fn path_range(&self, k: usize) -> std::ops::Range<usize> {
-        match &self.sched {
-            None => k * self.path..(k + 1) * self.path,
-            Some(s) => {
-                let mut off = 0usize;
-                for (i, (c, _)) in s.query_strata().enumerate() {
-                    let len = self.depth - c;
-                    if i == k {
-                        return off..off + len;
-                    }
-                    off += len;
-                }
-                unreachable!("query index within schedule")
+        let mut off = 0usize;
+        for (i, (c, _)) in self.sched.query_strata().enumerate() {
+            let len = self.depth - c;
+            if i == k {
+                return off..off + len;
             }
+            off += len;
         }
+        unreachable!("query index within schedule")
     }
 
-    /// The position query `k` opens, from its squeezed word's low half: all
-    /// `depth` bits are sampled in legacy; under a schedule the low
-    /// `depth − c_k` bits are sampled and the top bits ARE the stratum.
+    /// The position query `k` opens, from its squeezed word's low half:
+    /// the low `depth − c_k` bits are sampled, the top bits ARE the
+    /// stratum.
     fn q_pos(&self, k: usize, lo: u64) -> usize {
-        match &self.sched {
-            None => (lo as usize) & ((1usize << self.depth) - 1),
-            Some(_) => {
-                let (c, stratum) = self.q_stratum(k);
-                let lo_bits = self.depth - c;
-                (stratum << lo_bits) | ((lo as usize) & ((1usize << lo_bits) - 1))
-            }
-        }
+        let (c, stratum) = self.q_stratum(k);
+        let lo_bits = self.depth - c;
+        (stratum << lo_bits) | ((lo as usize) & ((1usize << lo_bits) - 1))
     }
 }
 
@@ -5193,9 +5176,11 @@ impl Lvl {
 /// STATEMENT side of the query-phase geometry (None while the inner's
 /// (m, profile) TOML is legacy). Derived from the same registry entry the
 /// inner was proven under; never from the proof.
-fn strat_scheds(params: &PcsParams) -> Option<Vec<flock_core::pcs::stratified::LevelSchedule>> {
-    let cfg = params.ligerito_verifier_config().ok()?;
-    cfg.stratified_open.then(|| cfg.stratified)
+fn strat_scheds(params: &PcsParams) -> Vec<flock_core::pcs::stratified::LevelSchedule> {
+    params
+        .ligerito_verifier_config()
+        .expect("registered config")
+        .stratified
 }
 
 /// The per-level `(cap, opened rows, flat sibling paths)` triples a Ligerito
@@ -5243,41 +5228,28 @@ fn level_geometry(
     lvl_src: &[(&[[u8; 32]], &Vec<Vec<F128>>, &Vec<[u8; 32]>)],
     chals: &[F128],
     hash: HashKind,
-    scheds: Option<&[flock_core::pcs::stratified::LevelSchedule]>,
+    scheds: &[flock_core::pcs::stratified::LevelSchedule],
 ) -> (Vec<Lvl>, Vec<F128>) {
     use flock_core::lincheck::build_eq_table;
-    if let Some(s) = scheds {
-        assert_eq!(s.len(), levels.len(), "one schedule per open level");
-    }
+    assert_eq!(scheds.len(), levels.len(), "one schedule per open level");
     let mut geo: Vec<Lvl> = Vec::new();
     let mut native_sums: Vec<F128> = Vec::new();
     for (li, lvl) in levels.iter().enumerate() {
         let (cap, rows, paths) = lvl_src[li];
         let q = lvl.q_count;
         assert_eq!(rows.len(), q, "L{li}: one opened row per query");
-        let sched = scheds.map(|s| &s[li]);
-        let (c, path, depth) = match sched {
-            None => {
-                let c = cap.len().trailing_zeros() as usize;
-                assert_eq!(cap.len(), 1 << c, "L{li}: cap is a power of two");
-                let path = paths.len() / q;
-                assert_eq!(paths.len(), q * path, "L{li}: flat paths divide evenly");
-                (c, path, path + c)
-            }
-            Some(s) => {
-                // The proof is VALIDATED against the statement's schedule —
-                // never the other way around.
-                assert_eq!(s.queries(), q, "L{li}: schedule owes the query count");
-                let c = s.cap_depth();
-                assert_eq!(cap.len(), 1 << c, "L{li}: cap is the schedule's top layer");
-                assert_eq!(
-                    paths.len(),
-                    s.total_path_siblings(),
-                    "L{li}: flat paths sum the per-summand walks"
-                );
-                (c, 0, s.log_block_len)
-            }
-        };
+        let sched = &scheds[li];
+        // The proof is VALIDATED against the statement's schedule — never
+        // the other way around.
+        assert_eq!(sched.queries(), q, "L{li}: schedule owes the query count");
+        let c = sched.cap_depth();
+        assert_eq!(cap.len(), 1 << c, "L{li}: cap is the schedule's top layer");
+        assert_eq!(
+            paths.len(),
+            sched.total_path_siblings(),
+            "L{li}: flat paths sum the per-summand walks"
+        );
+        let depth = sched.log_block_len;
         // The lane-fold weights are `2^folds` wide; the committed row may be
         // NARROWER (its top lanes are definitionally zero), and the dot below
         // zips — which IS the zero-fill, exactly as the native verifier does.
@@ -5294,19 +5266,15 @@ fn level_geometry(
         let lv = Lvl {
             q,
             c,
-            path,
             depth,
             lanes,
             row_words,
-            sched: sched.cloned(),
+            sched: sched.clone(),
         };
         // Terminal layers above the cap, natively: layers[0] = the cap;
         // layers[j] = depth c − j. Legacy strata all sit AT the cap, so
         // only layers[0] exists and this is the old direct-cap check.
-        let c_min = match sched {
-            None => c,
-            Some(s) => s.summand_depths.last().copied().unwrap_or(c),
-        };
+        let c_min = sched.summand_depths.last().copied().unwrap_or(c);
         let mut layers: Vec<Vec<[u8; 32]>> = vec![cap.to_vec()];
         for _ in 0..(c - c_min) {
             let next: Vec<[u8; 32]> = layers
@@ -5544,88 +5512,46 @@ fn emit_query_phase(
     let mut level_accs: Vec<Wire> = Vec::new();
     for (li, lvl) in levels.iter().enumerate() {
         let g = &geo[li];
-        let (cap, rows, paths) = lvl_src[li];
+        let (_cap, rows, paths) = lvl_src[li];
         let sqq = &sq[lvl.q_fin];
         let sqa = &sq[lvl.a_fin];
-        // Terminals. LEGACY: the cap-internal tree natively (for the
-        // openings' cap-side sibling hints) plus 2^c − 1 in-circuit PARENT
-        // rows folding the absorbed cap wires to ONE root — every full-depth
-        // opening connects there. STRATIFIED: the upper layers from the cap
-        // wires to the shallowest summand (2^c − 2^c_min rows, NO root) —
-        // each query's path stops at its stratum depth and connects to its
-        // schedule-constant terminal wire; no hints beyond the proof's own
-        // siblings, no native tree at all.
-        let mut tree_lvls: Vec<Vec<[u8; 32]>> = Vec::new();
-        let mut cap_root: Option<[Wire; 2]> = None;
-        let mut layers_w: Vec<Vec<[Wire; 2]>> = Vec::new();
-        match &g.sched {
-            None => {
-                tree_lvls.push(cap.to_vec());
-                while tree_lvls.last().unwrap().len() > 1 {
-                    let next: Vec<[u8; 32]> = tree_lvls
-                        .last()
-                        .unwrap()
-                        .chunks(2)
-                        .map(|p| core_merkle::hash_pair(&p[0], &p[1], HashKind::Blake3))
-                        .collect();
-                    tree_lvls.push(next);
-                }
-                let mut nodes: Vec<[Wire; 2]> = cap_w[li].clone();
-                while nodes.len() > 1 {
-                    let params = cw(sb, vals, consts, pack_params(0, 64, PARENT));
-                    nodes = nodes
-                        .chunks(2)
-                        .map(|p| {
-                            let out = sb.gate(
-                                slots.b3,
-                                &[iv[0], iv[1], p[0][0], p[0][1], p[1][0], p[1][1], params],
-                            );
-                            [out[0], out[1]]
-                        })
-                        .collect();
-                }
-                cap_root = Some(nodes[0]);
-            }
-            Some(s) => {
-                // A top-summand terminal is the ABSORBED cap layer, and a
-                // direct connect there puts a gate output into a class the
-                // FS chain's absorb row consumes — opening → chain →
-                // squeeze → opening: Cyclic. So the binding layer is
-                // layer 1: top-summand openings hash ONE level further
-                // (below, in the query loop) and connect to the DERIVED
-                // node, which collision resistance binds to the absorbed
-                // pair. Hence at least one layer is always built.
-                let c_min = s.summand_depths.last().copied().unwrap_or(g.c);
-                assert!(
-                    g.c > 0,
-                    "depth-0 top summand (q = 1) unsupported in-circuit"
-                );
-                let n_layers = (g.c - c_min).max(1);
-                layers_w.push(cap_w[li].clone());
-                for _ in 0..n_layers {
-                    let params = cw(sb, vals, consts, pack_params(0, 64, PARENT));
-                    let next: Vec<[Wire; 2]> = layers_w
-                        .last()
-                        .unwrap()
-                        .chunks(2)
-                        .map(|p| {
-                            let out = sb.gate(
-                                slots.b3,
-                                &[iv[0], iv[1], p[0][0], p[0][1], p[1][0], p[1][1], params],
-                            );
-                            [out[0], out[1]]
-                        })
-                        .collect();
-                    layers_w.push(next);
-                }
-            }
+        // Terminals: the upper layers from the cap wires to the shallowest
+        // summand (2^c − 2^c_min PARENT rows, NO root) — each query's path
+        // stops at its stratum depth and connects to its schedule-constant
+        // terminal wire; no hints beyond the proof's own siblings. A
+        // top-summand terminal is the ABSORBED cap layer, and a direct
+        // connect there puts a gate output into a class the FS chain's
+        // absorb row consumes — opening → chain → squeeze → opening:
+        // Cyclic. So the binding layer is layer 1: top-summand openings
+        // hash ONE level further (below, in the query loop) and connect to
+        // the DERIVED node, which collision resistance binds to the
+        // absorbed pair. Hence at least one layer is always built.
+        let c_min = g.sched.summand_depths.last().copied().unwrap_or(g.c);
+        assert!(
+            g.c > 0,
+            "depth-0 top summand (q = 1) unsupported in-circuit"
+        );
+        let n_layers = (g.c - c_min).max(1);
+        let mut layers_w: Vec<Vec<[Wire; 2]>> = vec![cap_w[li].clone()];
+        for _ in 0..n_layers {
+            let params = cw(sb, vals, consts, pack_params(0, 64, PARENT));
+            let next: Vec<[Wire; 2]> = layers_w
+                .last()
+                .unwrap()
+                .chunks(2)
+                .map(|p| {
+                    let out = sb.gate(
+                        slots.b3,
+                        &[iv[0], iv[1], p[0][0], p[0][1], p[1][0], p[1][1], params],
+                    );
+                    [out[0], out[1]]
+                })
+                .collect();
+            layers_w.push(next);
         }
         // One PARENT params wire for the top-summand extension rows (the
         // `cw` helper is shadowed by the challenge wire inside the loop).
-        let parent_params = g
-            .sched
-            .is_some()
-            .then(|| cw(sb, vals, consts, pack_params(0, 64, PARENT)));
+        let parent_params = cw(sb, vals, consts, pack_params(0, 64, PARENT));
         // alpha words: chain outputs, PUBLISHED for the checker's expansion.
         let a_wires: Vec<Wire> = (0..lvl.a_count).map(|j| outs[sqa[j / 4]][j % 4]).collect();
         // v: this level's fold challenges, chain outputs, wired straight in.
@@ -5653,10 +5579,7 @@ fn emit_query_phase(
             let leaf_w: Vec<Wire> = (0..g.row_words).map(|_| sb.input()).collect();
             let cw = outs[sqq[k / 4]][k % 4];
             let (ck, stratum) = g.q_stratum(k);
-            let open_depth = match &g.sched {
-                None => g.depth,
-                Some(_) => g.depth - ck,
-            };
+            let open_depth = g.depth - ck;
             let cv = emit_opening(
                 sb,
                 slots,
@@ -5671,47 +5594,26 @@ fn emit_query_phase(
             hints.extend(paths[g.path_range(k)].iter().map(hash_to_digest));
             // Output-output connects: a multi-producer class with no gate
             // consumers — witgen asserts agreement, no dataflow cycle.
-            let (bind, term) = match (&g.sched, &cap_root) {
-                (None, Some(root)) => {
-                    // Full-depth legacy: append the c cap-internal siblings
-                    // from the native cap tree; the terminal is the root.
-                    let pos = g.q_pos(k, chals[lvl.q_ch + k].lo);
-                    let mut idx = pos >> g.path;
-                    for i in 0..g.c {
-                        hints.push(hash_to_digest(&tree_lvls[i][idx ^ 1]));
-                        idx >>= 1;
-                    }
-                    (cv, *root)
-                }
-                (Some(_), _) if ck == g.c => {
-                    // Top summand: hash one level past the cap with the
-                    // NEIGHBOUR cap word at constant direction (the
-                    // stratum's parity — no swap gate), and bind the
-                    // DERIVED parent to layer 1. Equality of the two
-                    // layer-1 producers forces cv == cap[stratum] by
-                    // collision resistance, with every edge forward.
-                    let sib = cap_w[li][stratum ^ 1];
-                    let (l, r) = if stratum & 1 == 0 {
-                        (cv, sib)
-                    } else {
-                        (sib, cv)
-                    };
-                    let out = sb.gate(
-                        slots.b3,
-                        &[
-                            iv[0],
-                            iv[1],
-                            l[0],
-                            l[1],
-                            r[0],
-                            r[1],
-                            parent_params.expect("stratified level has parent params"),
-                        ],
-                    );
-                    ([out[0], out[1]], layers_w[1][stratum >> 1])
-                }
-                (Some(_), _) => (cv, layers_w[g.c - ck][stratum]),
-                (None, None) => unreachable!("legacy level always folds a root"),
+            let (bind, term) = if ck == g.c {
+                // Top summand: hash one level past the cap with the
+                // NEIGHBOUR cap word at constant direction (the stratum's
+                // parity — no swap gate), and bind the DERIVED parent to
+                // layer 1. Equality of the two layer-1 producers forces
+                // cv == cap[stratum] by collision resistance, with every
+                // edge forward.
+                let sib = cap_w[li][stratum ^ 1];
+                let (l, r) = if stratum & 1 == 0 {
+                    (cv, sib)
+                } else {
+                    (sib, cv)
+                };
+                let out = sb.gate(
+                    slots.b3,
+                    &[iv[0], iv[1], l[0], l[1], r[0], r[1], parent_params],
+                );
+                ([out[0], out[1]], layers_w[1][stratum >> 1])
+            } else {
+                (cv, layers_w[g.c - ck][stratum])
             };
             sb.connect(bind[0], term[0]);
             sb.connect(bind[1], term[1]);
@@ -7247,7 +7149,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         assert_eq!(levels.len(), r + 1);
 
         let (geo, native_sums) =
-            level_geometry(&levels, &lvl_src, &chals, HashKind::Blake3, strat_scheds(&leaf_pcs).as_deref());
+            level_geometry(&levels, &lvl_src, &chals, HashKind::Blake3, &strat_scheds(&leaf_pcs));
 
         let stream = t_shape.stream_words_duplex(DOMAIN);
         let bytes = stream.to_bytes(rec.values(), rec.payloads());
@@ -8727,7 +8629,7 @@ impl<'p> RealTape<'p> {
             &lvl_src,
             &chals,
             HashKind::Blake3,
-            strat_scheds(&lo.pcs).as_deref(),
+            &strat_scheds(&lo.pcs),
         );
         assert!(geo[0].row_words <= geo[0].lanes, "committed width fits the fold");
 
@@ -12030,7 +11932,7 @@ impl<'p> ChildTape<'p> {
             &lvl_src,
             &chals,
             HashKind::Blake3,
-            strat_scheds(&inner.pcs).as_deref(),
+            &strat_scheds(&inner.pcs),
         );
         let b3_rows = trace.rows.len()
             + h_rows

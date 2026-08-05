@@ -143,13 +143,6 @@ pub struct ProverConfig {
     /// (`docs/stratified-queries.tex`). Custom schedules are allowed but
     /// must pass [`stratified::validate_schedules`].
     pub stratified: Vec<stratified::LevelSchedule>,
-    /// TRANSITIONAL opt-in: `true` runs the stratified query phase (per-
-    /// summand sampling, `floor(lg q)` cap, `d − c_i` paths); `false` keeps
-    /// the legacy phase (global sampling, `ceil(lg q)` cap) so shipped byte
-    /// pins hold while the circuit side converts. Flipped + deleted (with
-    /// the legacy path) at the end of the circuit conversion, in the one
-    /// planned re-pin.
-    pub stratified_open: bool,
 }
 
 impl ProverConfig {
@@ -172,15 +165,6 @@ impl ProverConfig {
         self
     }
 
-    /// Opt in to the stratified query phase (fails fast on an invalid
-    /// stored schedule — the build-time end of the authority check).
-    pub fn with_stratified_open(mut self) -> Self {
-        self.stratified_open = true;
-        self.validate_stratified()
-            .expect("stratified schedules invalid at opt-in");
-        self
-    }
-
     /// Validate the stored schedules against the query counts and ladder
     /// shape (the load-time authority check).
     pub fn validate_stratified(&self) -> Result<(), String> {
@@ -192,12 +176,8 @@ impl ProverConfig {
     /// entries' belt-and-braces asserts, and the prover's own absorb must
     /// share: the schedule's cap (top set bit) when stratified, else the
     /// legacy `min(⌈log2 q₀⌉, d)`.
-    pub fn l0_cap_depth(&self, d: usize) -> usize {
-        if self.stratified_open {
-            self.stratified[0].cap_depth()
-        } else {
-            merkle::cap_depth(self.queries[0], d)
-        }
+    pub fn l0_cap_depth(&self, _d: usize) -> usize {
+        self.stratified[0].cap_depth()
     }
 }
 
@@ -228,10 +208,6 @@ pub struct VerifierConfig {
     /// [`ProverConfig::stratified`]: config-build-time data, never derived
     /// at proof time or from the proof.
     pub stratified: Vec<stratified::LevelSchedule>,
-    /// TRANSITIONAL opt-in mirroring [`ProverConfig::stratified_open`]; the
-    /// two sides must agree or every opening fails, which is the correct
-    /// outcome (the allocation is part of the statement).
-    pub stratified_open: bool,
 }
 
 impl VerifierConfig {
@@ -252,15 +228,6 @@ impl VerifierConfig {
         self
     }
 
-    /// Opt in to the stratified query phase; see
-    /// [`ProverConfig::with_stratified_open`].
-    pub fn with_stratified_open(mut self) -> Self {
-        self.stratified_open = true;
-        self.validate_stratified()
-            .expect("stratified schedules invalid at opt-in");
-        self
-    }
-
     /// Validate the stored schedules (the load-time authority check).
     pub fn validate_stratified(&self) -> Result<(), String> {
         stratified::validate_schedules(&self.stratified, &self.queries, &self.level_block_logs())
@@ -268,12 +235,8 @@ impl VerifierConfig {
 
     /// The L0 cap depth this config implies; see
     /// [`ProverConfig::l0_cap_depth`].
-    pub fn l0_cap_depth(&self, d: usize) -> usize {
-        if self.stratified_open {
-            self.stratified[0].cap_depth()
-        } else {
-            merkle::cap_depth(self.queries[0], d)
-        }
+    pub fn l0_cap_depth(&self, _d: usize) -> usize {
+        self.stratified[0].cap_depth()
     }
 }
 
@@ -399,11 +362,9 @@ pub fn default_config(
         fold_grinding_bits: vec![0usize; n_levels],
         ood_samples: vec![0usize; n_levels],
         merkle_hash: HashKind::default(),
-        stratified_open: false,
         stratified: vec![],
     }
-    .with_default_stratified()
-    .with_stratified_open())
+    .with_default_stratified())
 }
 
 /// Recursion-ladder shape: per-level dims (index 0 = L0) plus the residual.
@@ -613,11 +574,9 @@ pub fn default_verifier_config(
         fold_grinding_bits: p.fold_grinding_bits,
         ood_samples: p.ood_samples,
         merkle_hash: p.merkle_hash,
-        stratified_open: false,
         stratified: vec![],
     }
-    .with_default_stratified()
-    .with_stratified_open())
+    .with_default_stratified())
 }
 
 // ===================================================================
@@ -796,17 +755,6 @@ pub struct LigeritoSecurityConfig {
     pub hash: String,
     /// Where in the per-level FS transcript grinding is placed.
     pub grinding_step: GrindingStep,
-    /// Opt in to the STRATIFIED query phase (`docs/stratified-queries.tex`):
-    /// per-summand sampling under the binary decomposition of each level's
-    /// query count, cap at the top set bit, per-summand path lengths. The
-    /// TOML is the source of truth for the allocation mode exactly as it is
-    /// for the counts; derived prover/verifier configs get
-    /// `stratified_open` + validated schedules. Absent from a TOML =
-    /// `false` (the legacy query phase). Same soundness bound either way
-    /// (`(1−γ)^q` — the per-summand AM–GM is exact), so `validate()`'s
-    /// per-level bit accounting is mode-independent.
-    #[serde(default)]
-    pub stratified: bool,
     /// Per-level parameters, in order L0, L1, L2, ....
     pub levels: Vec<LigeritoLevelConfig>,
     /// Final residual block descriptor.
@@ -1389,7 +1337,6 @@ impl LigeritoSecurityConfig {
             field: "f128".into(),
             hash: "sha256".into(),
             grinding_step: GrindingStep::PostCommitPreQueries,
-            stratified: false,
             levels,
             final_block: FinalBlockConfig { yr_log_n },
         };
@@ -1576,7 +1523,6 @@ impl LigeritoSecurityConfig {
             field: "f128".into(),
             hash: "sha256".into(),
             grinding_step: GrindingStep::PostCommitPreQueries,
-            stratified: false,
             levels,
             final_block: FinalBlockConfig {
                 yr_log_n: shape.yr_log_n,
@@ -1640,7 +1586,6 @@ impl LigeritoSecurityConfig {
             fold_grinding_bits: fold_grinding_bits.clone(),
             ood_samples: ood_samples.clone(),
             merkle_hash,
-            stratified_open: false,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -1657,18 +1602,9 @@ impl LigeritoSecurityConfig {
             fold_grinding_bits,
             ood_samples,
             merkle_hash,
-            stratified_open: false,
             stratified: vec![],
         }
         .with_default_stratified();
-        if self.stratified {
-            // The TOML opted this shape into the stratified query phase;
-            // fail fast (panic = config-author error) on an invalid schedule.
-            return Ok((
-                prover.with_stratified_open(),
-                verifier.with_stratified_open(),
-            ));
-        }
         Ok((prover, verifier))
     }
 
@@ -3401,7 +3337,7 @@ fn sample_queries<Ch: Challenger>(
     challenger: &mut Ch,
     block_len: usize,
     count: usize,
-    sched: Option<&stratified::LevelSchedule>,
+    sched: &stratified::LevelSchedule,
 ) -> Vec<usize> {
     assert!(
         block_len.is_power_of_two(),
@@ -3410,30 +3346,23 @@ fn sample_queries<Ch: Challenger>(
     if count == 0 {
         return Vec::new();
     }
+    // STRATIFIED (docs/stratified-queries.tex): one F128 squeezed per query
+    // — but query j is confined to its schedule-constant stratum: the low
+    // `d − c_j` bits come from the squeeze, the top `c_j` bits ARE the
+    // stratum index.
     let d = block_len.trailing_zeros() as usize;
+    assert_eq!(sched.log_block_len, d, "sample_queries: schedule block log");
+    assert_eq!(sched.queries(), count, "sample_queries: schedule query count");
     let words = challenger.sample_f128_vec(count);
-    match sched {
-        None => {
-            let mask = block_len - 1;
-            words.iter().map(|v| (v.lo as usize) & mask).collect()
-        }
-        // STRATIFIED (docs/stratified-queries.tex): the squeeze is
-        // word-for-word the same — one F128 per query — but query j is
-        // confined to its schedule-constant stratum: the low `d − c_j` bits
-        // come from the squeeze, the top `c_j` bits ARE the stratum index.
-        Some(s) => {
-            assert_eq!(s.log_block_len, d, "sample_queries: schedule block log");
-            assert_eq!(s.queries(), count, "sample_queries: schedule query count");
-            s.query_strata()
-                .zip(&words)
-                .map(|((c, stratum), v)| {
-                    let lo_bits = d - c;
-                    let mask = (1usize << lo_bits) - 1;
-                    (stratum << lo_bits) | ((v.lo as usize) & mask)
-                })
-                .collect()
-        }
-    }
+    sched
+        .query_strata()
+        .zip(&words)
+        .map(|((c, stratum), v)| {
+            let lo_bits = d - c;
+            let mask = (1usize << lo_bits) - 1;
+            (stratum << lo_bits) | ((v.lo as usize) & mask)
+        })
+        .collect()
 }
 
 /// Per-query CAPPED Merkle paths for `queries` against `tree`, flat in
@@ -3446,28 +3375,16 @@ fn merkle_paths_for(
     tree: &[Hash],
     block_len: usize,
     queries: &[usize],
-    c: usize,
-    sched: Option<&stratified::LevelSchedule>,
+    sched: &stratified::LevelSchedule,
 ) -> Vec<Hash> {
     let d = block_len.trailing_zeros() as usize;
-    match sched {
-        None => {
-            let mut out = Vec::with_capacity(queries.len() * (d - c));
-            for &q in queries {
-                out.extend(merkle::merkle_proof_capped(tree, block_len, q, c));
-            }
-            out
-        }
-        Some(s) => {
-            assert_eq!(s.log_block_len, d, "merkle_paths_for: schedule block log");
-            assert_eq!(s.queries(), queries.len(), "merkle_paths_for: query count");
-            let mut out = Vec::with_capacity(s.total_path_siblings());
-            for ((cq, _), &q) in s.query_strata().zip(queries) {
-                out.extend(merkle::merkle_proof_capped(tree, block_len, q, cq));
-            }
-            out
-        }
+    assert_eq!(sched.log_block_len, d, "merkle_paths_for: schedule block log");
+    assert_eq!(sched.queries(), queries.len(), "merkle_paths_for: query count");
+    let mut out = Vec::with_capacity(sched.total_path_siblings());
+    for ((cq, _), &q) in sched.query_strata().zip(queries) {
+        out.extend(merkle::merkle_proof_capped(tree, block_len, q, cq));
     }
+    out
 }
 
 /// Drive the recursive Ligerito prover to prove `poly(eval_point) = claimed_value`.
@@ -3820,20 +3737,12 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let l0_block_len = block_len_0;
     // Every tree's cap depth is a config-static function of its query count
     // and depth — the FS shape must never depend on sampled data.
-    let cap_depth_of = |level: usize, q: usize, block_len: usize| -> usize {
-        if config.stratified_open {
-            config.stratified[level].cap_depth()
-        } else {
-            merkle::cap_depth(q, block_len.trailing_zeros() as usize)
-        }
-    };
-    let strat = |l: usize| config.stratified_open.then(|| &config.stratified[l]);
-    if config.stratified_open {
-        config
-            .validate_stratified()
-            .expect("stratified schedules invalid (prover entry)");
-    }
-    let c_0 = cap_depth_of(0, config.queries[0], l0_block_len);
+    let cap_depth_of = |level: usize| -> usize { config.stratified[level].cap_depth() };
+    let strat = |l: usize| &config.stratified[l];
+    config
+        .validate_stratified()
+        .expect("stratified schedules invalid (prover entry)");
+    let c_0 = cap_depth_of(0);
     let initial_cap: Vec<Hash> = merkle::cap_layer(l0_tree, l0_block_len, c_0).to_vec();
     let l0_num_interleaved = num_interleaved_0;
     let l0_row = |q: usize| -> &[F128] {
@@ -3925,7 +3834,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     }
     challenger.observe_bytes(
         wtns_1
-            .cap(cap_depth_of(1, config.queries[1], wtns_1.block_len))
+            .cap(cap_depth_of(1))
             .as_flattened(),
     );
 
@@ -3969,7 +3878,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     let _t = std::time::Instant::now();
     let opened_rows_0: Vec<Vec<F128>> = queries_0.iter().map(|&q| l0_row(q).to_vec()).collect();
-    let merkle_proof_0 = merkle_paths_for(l0_tree, l0_block_len, &queries_0, c_0, strat(0));
+    let merkle_proof_0 = merkle_paths_for(l0_tree, l0_block_len, &queries_0, strat(0));
     if trace {
         t_opens += _t.elapsed();
     }
@@ -4010,7 +3919,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     // Recursive levels — same as recursive_prover_inner from here.
     let mut wtns_prev = wtns_1;
     let mut recursive_caps: Vec<Vec<Hash>> =
-        vec![wtns_prev.cap(cap_depth_of(1, config.queries[1], wtns_prev.block_len)).to_vec()];
+        vec![wtns_prev.cap(cap_depth_of(1)).to_vec()];
     let mut recursive_proofs: Vec<RecursiveProof> = Vec::new();
     // All fold challenges in binding order (returned to the caller).
     let mut ris_all: Vec<F128> = r_lane_fold.clone();
@@ -4062,7 +3971,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 &wtns_prev.tree,
                 wtns_prev.block_len,
                 &queries_last,
-                cap_depth_of(i + 1, num_queries_last, wtns_prev.block_len),
                 strat(i + 1),
             );
             if trace {
@@ -4143,7 +4051,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             t_commits += _t.elapsed();
         }
         let cap_next = wtns_next
-            .cap(cap_depth_of(i + 2, config.queries[i + 2], wtns_next.block_len))
+            .cap(cap_depth_of(i + 2))
             .to_vec();
         challenger.observe_bytes(cap_next.as_flattened());
         recursive_caps.push(cap_next);
@@ -4183,7 +4091,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             &wtns_prev.tree,
             wtns_prev.block_len,
             &queries_i,
-            cap_depth_of(i + 1, num_queries_i, wtns_prev.block_len),
             strat(i + 1),
         );
         if trace {
@@ -4391,7 +4298,7 @@ where
     }
     nonce_idx += 1;
 
-    let strat = |l: usize| config.stratified_open.then(|| &config.stratified[l]);
+    let strat = |l: usize| &config.stratified[l];
     let num_queries_0 = config.queries[0];
     let _t = std::time::Instant::now();
     let queries_0 = sample_queries(challenger, block_len_0, num_queries_0, strat(0));
@@ -4940,7 +4847,7 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
     }
     nonce_idx += 1;
 
-    let strat = |l: usize| config.stratified_open.then(|| &config.stratified[l]);
+    let strat = |l: usize| &config.stratified[l];
     let num_queries_0 = config.queries[0];
     let queries_0 = sample_queries(challenger, block_len_0, num_queries_0, strat(0));
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
@@ -5276,20 +5183,12 @@ fn recursive_prover_inner<Ch: Challenger>(
 
     // Config-static cap depths (the legacy/UDR path derives its query
     // counts from `udr_queries`, so the caps do too).
-    let cap_depth_of = |level: usize, q: usize, block_len: usize| -> usize {
-        if config.stratified_open {
-            config.stratified[level].cap_depth()
-        } else {
-            merkle::cap_depth(q, block_len.trailing_zeros() as usize)
-        }
-    };
-    let strat = |l: usize| config.stratified_open.then(|| &config.stratified[l]);
-    if config.stratified_open {
-        config
-            .validate_stratified()
-            .expect("stratified schedules invalid (prover entry)");
-    }
-    let c_0 = cap_depth_of(0, udr_queries(log_inv_rate_0), wtns_0.block_len);
+    let cap_depth_of = |level: usize| -> usize { config.stratified[level].cap_depth() };
+    let strat = |l: usize| &config.stratified[l];
+    config
+        .validate_stratified()
+        .expect("stratified schedules invalid (prover entry)");
+    let c_0 = cap_depth_of(0);
     let initial_cap: Vec<Hash> = wtns_0.cap(c_0).to_vec();
     challenger.observe_bytes(initial_cap.as_flattened());
 
@@ -5316,7 +5215,7 @@ fn recursive_prover_inner<Ch: Challenger>(
     tlog!("  [ligerito]   L1 commit: {:.2?}", t_l1);
     challenger.observe_bytes(
         wtns_1
-            .cap(cap_depth_of(1, udr_queries(config.log_inv_rates[1]), wtns_1.block_len))
+            .cap(cap_depth_of(1))
             .as_flattened(),
     );
 
@@ -5327,7 +5226,7 @@ fn recursive_prover_inner<Ch: Challenger>(
     let t = std::time::Instant::now();
     let opened_rows_0: Vec<Vec<F128>> = queries_0.iter().map(|&q| wtns_0.row(q).to_vec()).collect();
     let merkle_proof_0 =
-        merkle_paths_for(&wtns_0.tree, wtns_0.block_len, &queries_0, c_0, strat(0));
+        merkle_paths_for(&wtns_0.tree, wtns_0.block_len, &queries_0, strat(0));
     t_opens += t.elapsed();
     let initial_proof = RecursiveProof {
         opened_rows: opened_rows_0.clone(),
@@ -5367,7 +5266,7 @@ fn recursive_prover_inner<Ch: Challenger>(
     let mut wtns_prev = wtns_1;
     let mut recursive_caps: Vec<Vec<Hash>> = vec![
         wtns_prev
-            .cap(cap_depth_of(1, udr_queries(config.log_inv_rates[1]), wtns_prev.block_len))
+            .cap(cap_depth_of(1))
             .to_vec(),
     ];
     let mut recursive_proofs: Vec<RecursiveProof> = Vec::new();
@@ -5415,7 +5314,6 @@ fn recursive_prover_inner<Ch: Challenger>(
                 &wtns_prev.tree,
                 wtns_prev.block_len,
                 &queries_last,
-                cap_depth_of(i + 1, num_queries_last, wtns_prev.block_len),
                 strat(i + 1),
             );
             return LigeritoProof {
@@ -5461,11 +5359,7 @@ fn recursive_prover_inner<Ch: Challenger>(
         t_commits += t_li;
         tlog!("  [ligerito]   L{} commit: {:.2?}", i + 2, t_li);
         let cap_next = wtns_next
-            .cap(cap_depth_of(
-                i + 2,
-                udr_queries(config.log_inv_rates[i + 2]),
-                wtns_next.block_len,
-            ))
+            .cap(cap_depth_of(i + 2))
             .to_vec();
         challenger.observe_bytes(cap_next.as_flattened());
         recursive_caps.push(cap_next);
@@ -5484,7 +5378,6 @@ fn recursive_prover_inner<Ch: Challenger>(
             &wtns_prev.tree,
             wtns_prev.block_len,
             &queries_i,
-            cap_depth_of(i + 1, num_queries_i, wtns_prev.block_len),
             strat(i + 1),
         );
         t_opens += t.elapsed();
@@ -5534,7 +5427,7 @@ fn verify_level_opens(
     expected_num_interleaved: usize,
     paths: &[Hash],
     kind: HashKind,
-    sched: Option<&stratified::LevelSchedule>,
+    sched: &stratified::LevelSchedule,
 ) -> bool {
     if queries.len() != opened_rows.len() {
         return false;
@@ -5549,33 +5442,7 @@ fn verify_level_opens(
         };
         merkle::hash_leaf(bytes, kind)
     };
-    let Some(s) = sched else {
-        let c = merkle::cap_depth(queries.len(), d);
-        if cap.len() != (1 << c) {
-            return false;
-        }
-        let path_len = d - c;
-        if paths.len() != queries.len() * path_len {
-            return false;
-        }
-        for (slot, (&q, row)) in queries.iter().zip(opened_rows).enumerate() {
-            if row.len() != expected_num_interleaved {
-                return false;
-            }
-            let leaf = leaf_of(row);
-            if !merkle::verify_merkle_proof_capped(
-                cap,
-                block_len,
-                &leaf,
-                q,
-                &paths[slot * path_len..][..path_len],
-                kind,
-            ) {
-                return false;
-            }
-        }
-        return true;
-    };
+    let s = sched;
 
     // STRATIFIED: the absorbed cap sits at the schedule's cap depth (the top
     // summand). Shallower summands' terminals are the cap's ancestors —
@@ -5665,7 +5532,7 @@ pub fn recursive_verifier<Ch: Challenger>(
     let log_msg_cols_0 = log_n - initial_k;
     let block_len_0 = 1usize << (log_msg_cols_0 + log_inv_rate_0);
     let num_interleaved_0 = 1usize << initial_k;
-    let strat = |l: usize| config.stratified_open.then(|| &config.stratified[l]);
+    let strat = |l: usize| &config.stratified[l];
     let num_queries_0 = udr_queries(log_inv_rate_0);
     let queries_0 = sample_queries(challenger, block_len_0, num_queries_0, strat(0));
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
@@ -6303,7 +6170,6 @@ mod tests {
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
-            stratified_open: false,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -6349,7 +6215,6 @@ mod tests {
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
-            stratified_open: false,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -6423,11 +6288,9 @@ mod tests {
                 fold_grinding_bits: vec![0; 2],
                 ood_samples: vec![0; 2],
                 merkle_hash: Default::default(),
-                stratified_open: false,
                 stratified: vec![],
             }
-            .with_default_stratified()
-            .with_stratified_open();
+            .with_default_stratified();
             let v = VerifierConfig {
                 log_inv_rates: vec![log_inv_rate, log_inv_rate],
                 recursive_steps: 1,
@@ -6441,11 +6304,9 @@ mod tests {
                 fold_grinding_bits: vec![0; 2],
                 ood_samples: vec![0; 2],
                 merkle_hash: Default::default(),
-                stratified_open: false,
                 stratified: vec![],
             }
-            .with_default_stratified()
-            .with_stratified_open();
+            .with_default_stratified();
             (p, v)
         };
 
@@ -6517,72 +6378,8 @@ mod tests {
             );
         }
 
-        // Mode mismatch = statement mismatch: a stratified proof against a
-        // legacy verifier (and vice versa) must reject — the two sides absorb
-        // different caps, so the FS chains diverge before the query phase.
-        let (cfg, v_cfg) = mk_cfgs(vec![90, 33]);
-        let mut legacy_v = v_cfg.clone();
-        legacy_v.stratified_open = false;
-        let sched0 = &cfg.stratified[0];
-        let mut p_ch = crate::challenger::FsChallenger::new(b"strat-mode");
-        let proof = recursive_prover_with_basis(
-            &cfg,
-            poly.clone(),
-            b.clone(),
-            target,
-            &wtns_0.mat,
-            &wtns_0.tree,
-            &mut p_ch,
-        );
-        let cap0 = wtns_0.cap(sched0.cap_depth()).to_vec();
-        let mut v_ch = crate::challenger::FsChallenger::new(b"strat-mode");
-        assert!(
-            !recursive_verifier_with_basis(&legacy_v, &proof, &b, target, &cap0, &mut v_ch),
-            "legacy verifier accepted a stratified proof"
-        );
     }
 
-    /// The `stratified` TOML flag is the source of truth for the allocation
-    /// mode, exactly as the counts are for `queries`: absent = legacy (every
-    /// shipped TOML today), present = both derived configs opt in with
-    /// validated schedules, and the ONE cap rule (`l0_cap_depth`) switches
-    /// from `ceil(lg q)` to the schedule's top set bit. This is the chain
-    /// `PcsParams::l0_cap_depth` and the open entries' asserts ride, so the
-    /// commit-time / open-time cap agreement is by construction.
-    #[test]
-    fn security_config_stratified_flag_drives_derived_configs() {
-        // Every shipped TOML is stratified since the 2026-08-05 flip; the
-        // legacy derivation is pinned here by clearing the flag.
-        let toml = embedded_security_config(22, LigeritoProfile::Slim).unwrap();
-        let mut sec = LigeritoSecurityConfig::from_toml_str(toml).unwrap();
-        assert!(sec.stratified, "shipped TOMLs are stratified");
-        sec.stratified = false;
-        let (p0, v0) = sec.to_prover_verifier_configs().unwrap();
-        assert!(!p0.stratified_open && !v0.stratified_open);
-
-        sec.stratified = true;
-        sec.validate()
-            .expect("bit accounting is mode-independent: (1-gamma)^q either way");
-        let (p, v) = sec.to_prover_verifier_configs().unwrap();
-        assert!(p.stratified_open && v.stratified_open);
-        p.validate_stratified().unwrap();
-        v.validate_stratified().unwrap();
-        assert_eq!(p.stratified, v.stratified, "one allocation, both sides");
-
-        let d = p.level_block_logs()[0];
-        assert_eq!(p.l0_cap_depth(d), p.stratified[0].cap_depth());
-        assert_eq!(v.l0_cap_depth(d), p.l0_cap_depth(d));
-        assert_eq!(v0.l0_cap_depth(d), merkle::cap_depth(v0.queries[0], d));
-        assert!(
-            p.l0_cap_depth(d) <= v0.l0_cap_depth(d),
-            "stratified cap (floor) never exceeds legacy (ceil)"
-        );
-
-        // The flag survives the TOML round-trip.
-        let s = sec.to_toml_string().unwrap();
-        let back = LigeritoSecurityConfig::from_toml_str(&s).unwrap();
-        assert!(back.stratified);
-    }
 
     /// The security config produces ProverConfig/VerifierConfig matching the
     /// existing `default_config(log_n=22, log_batch_size=6, log_inv_rate=1)`
@@ -7072,7 +6869,6 @@ mod tests {
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
-            stratified_open: false,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -7089,7 +6885,6 @@ mod tests {
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
-            stratified_open: false,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -7159,7 +6954,6 @@ mod tests {
             fold_grinding_bits: vec![0; r + 1],
             ood_samples: vec![0; r + 1],
             merkle_hash: Default::default(),
-            stratified_open: false,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -7176,7 +6970,6 @@ mod tests {
             fold_grinding_bits: vec![0; r + 1],
             ood_samples: vec![0; r + 1],
             merkle_hash: Default::default(),
-            stratified_open: false,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -7316,9 +7109,10 @@ mod tests {
             recursive_ks, log_inv_rates, queries_per_level
         );
 
-        // CLOSED FORM under capping: per tree, `q` capped paths of
-        // `d − c` siblings plus a `2^c`-node cap (the commitment),
-        // `c = cap_depth(q, d)` — deterministic, no sampling.
+        // CLOSED FORM under stratified capping: per tree, the schedule of
+        // `q` gives `Σ 2^{c_i}·(d − c_i)` path siblings plus the top-set-bit
+        // cap (the commitment) — deterministic, no sampling
+        // (docs/stratified-queries.tex).
         let mut total_opened = 0usize;
         let mut total_merkle = 0usize;
         let mut total_caps = 0usize;
@@ -7331,9 +7125,9 @@ mod tests {
                 );
                 return usize::MAX;
             }
-            let c = merkle::cap_depth(qn, log_block_len[i]);
-            let sib = qn * (log_block_len[i] - c);
-            let cap_b = (1usize << c) * 32;
+            let sched = stratified::LevelSchedule::decompose(qn, log_block_len[i]);
+            let sib = sched.total_path_siblings();
+            let cap_b = (1usize << sched.cap_depth()) * 32;
             let opened = qn * (1usize << log_num_interleaved[i]) * ELEM;
             let merkle = sib * 32;
             let label = if i == 0 {
@@ -7344,9 +7138,10 @@ mod tests {
                 "L{} (recursive)"
             };
             eprintln!(
-                "  {label} [bl=2^{}, lanes=2^{}, q={qn}, c={c}]: opened={}  merkle={} ({} sibs)  cap={}",
+                "  {label} [bl=2^{}, lanes=2^{}, q={qn}, summands={:?}]: opened={}  merkle={} ({} sibs)  cap={}",
                 log_block_len[i],
                 log_num_interleaved[i],
+                sched.summand_depths,
                 kb(opened),
                 kb(merkle),
                 sib,
@@ -7501,7 +7296,6 @@ mod tests {
             fold_grinding_bits: vec![0; 3],
             ood_samples: vec![0; 3],
             merkle_hash: Default::default(),
-            stratified_open: false,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -7518,7 +7312,6 @@ mod tests {
             fold_grinding_bits: vec![0; 3],
             ood_samples: vec![0; 3],
             merkle_hash: Default::default(),
-            stratified_open: false,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -7565,7 +7358,6 @@ mod tests {
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
-            stratified_open: false,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -7614,7 +7406,6 @@ mod tests {
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
-            stratified_open: false,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -7659,7 +7450,6 @@ mod tests {
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
-            stratified_open: false,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -7679,8 +7469,9 @@ mod tests {
         let block_len = 1usize << 13;
         let count = udr_queries(1); // 243 — the shipped L0 count at rate 1/2
 
+        let sched = stratified::LevelSchedule::decompose(count, 13);
         let mut ch = crate::challenger::FsChallenger::new(b"sample-queries-test");
-        let qs = sample_queries(&mut ch, block_len, count, None);
+        let qs = sample_queries(&mut ch, block_len, count, &sched);
 
         // Exactly `count` draws. The old sampler's draw count was data-
         // dependent (it redrew on a repeat); this one is not, which is the
@@ -7690,15 +7481,19 @@ mod tests {
 
         // Challenger-deterministic.
         let mut ch2 = crate::challenger::FsChallenger::new(b"sample-queries-test");
-        assert_eq!(sample_queries(&mut ch2, block_len, count, None), qs);
+        assert_eq!(sample_queries(&mut ch2, block_len, count, &sched), qs);
 
         // One `sample_f128_vec` squeeze plus a low-bit mask — nothing else.
         // This pins the transcript shape the FS chain table has to replay.
         let mut ch3 = crate::challenger::FsChallenger::new(b"sample-queries-test");
         let raw = ch3.sample_f128_vec(count);
-        let expected: Vec<usize> = raw
-            .iter()
-            .map(|v| (v.lo as usize) & (block_len - 1))
+        let expected: Vec<usize> = sched
+            .query_strata()
+            .zip(&raw)
+            .map(|((c, stratum), v)| {
+                let lo_bits = 13 - c;
+                (stratum << lo_bits) | ((v.lo as usize) & ((1usize << lo_bits) - 1))
+            })
             .collect();
         assert_eq!(qs, expected);
 
@@ -7744,11 +7539,17 @@ mod tests {
         // both verify — the tree has one leaf there. The statement this
         // test pins is unchanged; the mechanism moved from an explicit
         // comparison to per-path binding.
-        let queries = vec![9usize, 2, 9, 5];
-        let c = merkle::cap_depth(queries.len(), w.block_len.trailing_zeros() as usize);
+        // 5 queries = summands [2, 0]: four depth-2 strata plus one whole-
+        // block draw — the depth-0 query REPEATS position 9 across summands
+        // (within one summand strata are disjoint, so repeats only ever
+        // happen across summands).
+        let queries = vec![9usize, 17, 33, 49, 9];
+        let sched =
+            stratified::LevelSchedule::decompose(queries.len(), w.block_len.trailing_zeros() as usize);
+        let c = sched.cap_depth();
         let cap = w.cap(c).to_vec();
         let honest: Vec<Vec<F128>> = queries.iter().map(|&q| w.row(q).to_vec()).collect();
-        let proof = merkle_paths_for(&w.tree, w.block_len, &queries, c, None);
+        let proof = merkle_paths_for(&w.tree, w.block_len, &queries, &sched);
 
         assert!(
             verify_level_opens(
@@ -7759,15 +7560,15 @@ mod tests {
                 num_interleaved,
                 &proof,
                 HashKind::Sha256,
-                None
+                &sched
             ),
             "honest unsorted opening with a repeat must verify"
         );
 
-        // Slot 2 is the second occurrence of position 9. Tamper it: its own
+        // Slot 4 is the second occurrence of position 9. Tamper it: its own
         // path check fails (position 9's leaf is fixed by the cap).
         let mut forged = honest.clone();
-        forged[2][0] += F128::ONE;
+        forged[4][0] += F128::ONE;
         assert!(
             !verify_level_opens(
                 &cap,
@@ -7777,7 +7578,7 @@ mod tests {
                 num_interleaved,
                 &proof,
                 HashKind::Sha256,
-                None
+                &sched
             ),
             "disagreeing rows at a repeated position must be rejected"
         );
@@ -7795,7 +7596,7 @@ mod tests {
                 num_interleaved,
                 &proof,
                 HashKind::Sha256,
-                None
+                &sched
             ),
             "a tampered row at a unique position must fail its path check"
         );
@@ -7812,7 +7613,7 @@ mod tests {
             num_interleaved,
             &short,
             HashKind::Sha256,
-            None
+            &sched
         ));
         let mut long = proof.clone();
         long.push([0u8; 32]);
@@ -7824,7 +7625,7 @@ mod tests {
             num_interleaved,
             &long,
             HashKind::Sha256,
-            None
+            &sched
         ));
         let wrong_cap = w.cap(c + 1).to_vec();
         assert!(!verify_level_opens(
@@ -7835,7 +7636,7 @@ mod tests {
             num_interleaved,
             &proof,
             HashKind::Sha256,
-            None
+            &sched
         ));
 
         // Wrong-position binding: swap two slots' path segments (rows
@@ -7853,7 +7654,7 @@ mod tests {
             num_interleaved,
             &swapped,
             HashKind::Sha256,
-            None
+            &sched
         ));
     }
 
@@ -8046,7 +7847,6 @@ mod tests {
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
-            stratified_open: false,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -8091,7 +7891,6 @@ mod tests {
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
-            stratified_open: false,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -8168,7 +7967,6 @@ mod tests {
             fold_grinding_bits: fold_grinding_bits.clone(),
             ood_samples: ood_samples.clone(),
             merkle_hash: Default::default(),
-            stratified_open: false,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -8185,7 +7983,6 @@ mod tests {
             fold_grinding_bits,
             ood_samples,
             merkle_hash: Default::default(),
-            stratified_open: false,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -8587,7 +8384,6 @@ mod tests {
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
-            stratified_open: false,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -8632,7 +8428,6 @@ mod tests {
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
-            stratified_open: false,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -8677,7 +8472,6 @@ mod tests {
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
-            stratified_open: false,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -8738,7 +8532,6 @@ mod tests {
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
-            stratified_open: false,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -8781,7 +8574,6 @@ mod tests {
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
-            stratified_open: false,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -8798,7 +8590,6 @@ mod tests {
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
-            stratified_open: false,
             stratified: vec![],
         }
         .with_default_stratified();

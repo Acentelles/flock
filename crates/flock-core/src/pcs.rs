@@ -1646,7 +1646,6 @@ mod tests {
             fold_grinding_bits: vec![0; n_levels],
             ood_samples: vec![0; n_levels],
             merkle_hash: Default::default(),
-            stratified_open: false,
             stratified: vec![],
         }
         .with_default_stratified();
@@ -1663,7 +1662,6 @@ mod tests {
             fold_grinding_bits: vec![0; n_levels],
             ood_samples: vec![0; n_levels],
             merkle_hash: Default::default(),
-            stratified_open: false,
             stratified: vec![],
         }
         .with_default_stratified();
