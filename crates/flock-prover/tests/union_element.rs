@@ -1134,19 +1134,21 @@ fn bundle_digest_merged(
 /// Re-pinned 2026-08-02: two-product multipoint grouping (proof_io v9) —
 /// element/packed-direct claims enter as merged-column scalar groups, one
 /// dual value each; multipoint label v1, values absorb 128K -> 128R+P.
+// Re-pinned 2026-08-04: merged-open v1 — value-only packed-direct intake
+// (points are transcript-derived; label v0 -> v1).
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn mixed_class_merged_proof_bytes_pinned() {
     const ELEMENT_ONLY: [(&str, usize, &str); 3] = [
-        ("elem-merged-nu12-full", 1 << 12, "f8de0ecee28cb721807e8ee4e08d05ae5a1be6d8344106499c0148acb19514dc"),
-        ("elem-merged-nu12-2731", 2731, "742fda0fae0bb6cbc4f435dfb9e2dd5b3c0298dc395360d2b3102b07ed56fc94"),
-        ("elem-merged-nu12-0", 0, "7e67d3845c2293f9700df51b8ef0c2cc572ec6b4488caec93dc8c6575dc720f8"),
+        ("elem-merged-nu12-full", 1 << 12, "450067620bbd9c89c1c6b0f4e17117a98bf9d741a979bf3b3317df655c02b9a4"),
+        ("elem-merged-nu12-2731", 2731, "8b96208bd48bb4ed1de40771416820a18dc78faf61724230920250d6a10c731f"),
+        ("elem-merged-nu12-0", 0, "bf3eeb3f2cb93fb44959c19fe408299a14135d8bc94762be9076312df50d8115"),
     ];
     const MIXED: [(&str, [usize; 2], &str); 4] = [
-        ("mix-merged-nu7-128-128", [128, 128], "f4454462c5453208c29f7b18ddf062a38760f49507208b282f2fec06de722b6d"),
-        ("mix-merged-nu7-100-90", [100, 90], "7ab07aaae81259e9bf50070eab3adbafa0bed5c4e6e36bcf068a09c234f2fd46"),
-        ("mix-merged-nu7-0-90", [0, 90], "18041290acbd4146f81ce8d8be37659586805ddc11d59a3ed72045badc2a838a"),
-        ("mix-merged-nu7-100-0", [100, 0], "a301490e89d165bf8a3f7cbd6c4596a0227b3b4883a0262ffe1c1baade0ec0ea"),
+        ("mix-merged-nu7-128-128", [128, 128], "567c6b282d004e7b2084de1a2042b1c32840c6c9d17cfc34a2c327175978420e"),
+        ("mix-merged-nu7-100-90", [100, 90], "266f07bf884152495613e1a0134cb80d0dd0b1c4cb6b4a93e0d1d98931ee7bf2"),
+        ("mix-merged-nu7-0-90", [0, 90], "a3b15039038b03830977a6323da399acc0635c2103a2bada2216db279c6775c5"),
+        ("mix-merged-nu7-100-0", [100, 0], "129ce42d88417f96f4b0dfaf2ae80f76e0d71b0798358bc74047b1eb437e3f37"),
     ];
 
     let (w0, w1) = (F128::new(0x51F0, 0), F128::new(0, 0x2C7E));

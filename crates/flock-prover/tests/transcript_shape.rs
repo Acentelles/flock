@@ -265,7 +265,9 @@ fn element_only_transcript_shape_is_pinned() {
 // element-only claims are all packed-direct, so the values absorb shrinks
 // from 128·K to ONE word per merged-row group and the sumcheck is the
 // single untwisted product; multipoint label v1.
-    const EXPECTED: &str = "25a137909e6f2bbd3c92b16010ce0b2ef07307994b828889e52ce2c641944261";
+    // Re-pinned 2026-08-04: merged-open v1 — value-only packed-direct
+    // intake (points are transcript-derived; label v0 -> v1).
+    const EXPECTED: &str = "6c1348e364c5598e84411a85a3f57235504d8522adb7b0f9ca1b5763379d2592";
 
     let (_, shape) = record_element_only(12, &[3], &[1 << 12], 0xB0DD_1E01);
 

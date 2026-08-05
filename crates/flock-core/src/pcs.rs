@@ -1076,7 +1076,7 @@ pub fn open_batch_merged<Ch: Challenger>(
         ),
         "commitment cap is not the prover tree's cap layer"
     );
-    challenger.observe_label(b"flock-merged-open-v0");
+    challenger.observe_label(b"flock-merged-open-v1");
     let t = std::time::Instant::now();
     // Element-only registries produce no ring-switched claims; skip the batch
     // entirely (the callee asserts a non-empty batch). This branch DEFINES the
@@ -1101,10 +1101,21 @@ pub fn open_batch_merged<Ch: Challenger>(
     }
     // Packed-direct claims take their γ's from the same stream, AFTER the
     // ring-switched ones — the verifier draws them in the same order.
+    //
+    // VALUE-ONLY absorb (v1): a claim's POINT is never the prover's to choose
+    // — every packed-direct caller derives it from earlier transcript
+    // challenges plus statement constants (gather points from the wiring
+    // GKR's ρ and the cell space, element points from the region PIOP's own
+    // challenges and the frozen prefix), and the verifier RECOMPUTES it
+    // rather than reading it from the proof. Absorbing a deterministic
+    // public function of (statement, transcript-prefix) adds no binding, and
+    // at ~24 words × hundreds of claims it was ~92 KB of transcript the
+    // recursion circuit re-hashed per child. The γ's still bind the VALUES,
+    // which are genuine prover messages. (The non-merged `open_batch` has
+    // absorbed value-only since birth — this aligns the merged intake.)
     let gammas_pd: Vec<F128> = packed_direct
         .iter()
         .map(|c| {
-            challenger.observe_f128_slice(&c.point);
             challenger.observe_f128(c.value);
             challenger.sample_f128()
         })
@@ -1375,7 +1386,7 @@ pub fn verify_batch_merged<Ch: Challenger>(
             format!("{:>8.2} ms", ms)
         }
     };
-    challenger.observe_label(b"flock-merged-open-v0");
+    challenger.observe_label(b"flock-merged-open-v1");
     let t = std::time::Instant::now();
     let mut rs_outputs = Vec::with_capacity(n_rs);
     for i in 0..n_rs {
@@ -1397,10 +1408,12 @@ pub fn verify_batch_merged<Ch: Challenger>(
     }
     let gammas: Vec<F128> = (0..n_rs).map(|_| challenger.sample_f128()).collect();
     // Packed-direct γ's follow the ring-switched ones, in the prover's order.
+    // VALUE-ONLY absorb (v1) — see the prover-side intake for the argument:
+    // the points are transcript-derived and verifier-recomputed, never prover
+    // messages.
     let gammas_pd: Vec<F128> = packed_direct
         .iter()
         .map(|c| {
-            challenger.observe_f128_slice(c.point);
             challenger.observe_f128(c.value);
             challenger.sample_f128()
         })

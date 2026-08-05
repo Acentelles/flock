@@ -85,6 +85,10 @@ fn random_sha2_inputs(rng: &mut Rng, n: usize) -> Vec<sha2::Compression> {
 // Re-pinned 2026-08-02: multipoint-twisted assist (proof_io v8) — the
 // per-statement assist became 128K dual values + one product sumcheck +
 // one untwisted anchor; transcript + wire moved by design.
+// Re-pinned 2026-08-04: merged-open v1 — the packed-direct intake absorbs
+// VALUE-ONLY (claim points are transcript-derived and verifier-recomputed,
+// never prover messages; ~92 KB of self-absorbed points deleted from the
+// recursion replay). Label flock-merged-open-v0 -> v1.
 // Re-pinned 2026-08-02: two-product multipoint grouping (proof_io v9) —
 // packed-direct claims collapse into merged-column scalar groups (one
 // dual value each); the multipoint label bumped to v1, so even the
@@ -133,22 +137,22 @@ fn m6_merged_union_proof_bytes_pinned() {
         (
             "merged-nu10-1024-1024",
             [1024, 1024],
-            "f4effb7060f7f8f5fb7a914bc0ea5393dafd1af8ad5ae524141c4759ce386487",
+            "7dbae5971522ea39aa44677c8c4f2e6621041f84707fc287a18a78347e29c622",
         ),
         (
             "merged-nu10-50-37",
             [50, 37],
-            "682b7ea380d97e0186dd668d124d625cba281bb0ecefb55b403d20839e348ff8",
+            "f5ab24f7348f86dfb11243a1e9cd9319da6000b615e03b36d68cf533caf943bf",
         ),
         (
             "merged-nu10-8-8",
             [8, 8],
-            "2390d125d4a002b66650759fd47bca7a09dacf111287cd37385cbfaabec8e538",
+            "77b3151998b85c4832c584ddd897d0479e55192d6126acc8788f5556e92b1986",
         ),
         (
             "merged-nu10-0-64",
             [0, 64],
-            "e0d3d4d094431e8feb1450814e51f15173101526bcf3e564e3eb3b7582212c8f",
+            "e4cf15095b9b72efe64a89463cba271116a03dfa7fd707f58a64c8b4f0b32d07",
         ),
     ];
 
@@ -224,7 +228,7 @@ fn m6_merged_union_proof_bytes_pinned() {
 fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
     // BLAKE3, 256 blocks (m = 22).
     {
-        const EXPECTED: &str = "c8d1fd3dc58d497a9cd69df9e06335a7b585a91d48b78f2d58ff4a694ae3f96b";
+        const EXPECTED: &str = "05d1efd3acfd687f4b28f6970623702036034aeec82ea8d9ce0043d3fb4c20da";
         let n_blocks = 256usize;
         let setup = blake3::Blake3Setup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_B3B3);
@@ -256,7 +260,7 @@ fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
 
     // SHA-256, 128 blocks (m = 22).
     {
-        const EXPECTED: &str = "96204108483f72c006bede7f3706c63222b439e6f7e3b2e50440b400e29ed5bb";
+        const EXPECTED: &str = "186d6a5a5f172dfdcdd880397b1d467d8fed4452d9d239b565c24f928bb4bf0f";
         let n_blocks = 128usize;
         let setup = sha2::Sha256HybridSetup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_5252);
