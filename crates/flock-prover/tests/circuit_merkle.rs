@@ -8522,26 +8522,16 @@ impl<'p> RealTape<'p> {
         lcs_ord.sort_by_key(|(i, _)| *i);
         let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
             lcs_ord.into_iter().map(|(_, cc)| cc).collect();
+        // ONE recorded DEFERRED verify serves both needs: it is
+        // transcript-identical to the plain verify for honest proofs (so
+        // the tape is unchanged), it skips the sigma discharge the plain
+        // pass paid, and its exported assertions ARE the method-note
+        // references (verifier-exported over formulas-written-twice).
+        // This is also exactly what a production node runs per child —
+        // the tape cost halved when the second pass dissolved.
         let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(domain));
-        let claims = verifier::verify_ligerito_union_circuit(
-            &union_i,
-            &lo.shape.circuit,
-            &lo.public,
-            &lcs,
-            &lo.commitment,
-            &lo.proof,
-            &lo.pcs,
-            &mut rec,
-        )
-        .expect("the leaf outer verifies as the inner");
-        assert!(claims.boolean.is_some(), "boolean claims from the real inner");
-        assert!(claims.element.is_some(), "element claims from the real inner");
-        // The DEFERRED verify of the same proof: the independent reference
-        // for the three assertion families — the method-note discipline,
-        // verifier-exported over formulas-written-twice.
-        let (mat_assert, el_assert, sigma_native) = {
-            let mut ch = FsChallenger::with_chained_blake3(domain);
-            let (_, work, sigma) = verifier::verify_ligerito_union_circuit_deferred(
+        let (mat_assert, el_assert, sigma_native, claims) = {
+            let (claims, work, sigma) = verifier::verify_ligerito_union_circuit_deferred(
                 &union_i,
                 &lo.shape.circuit,
                 &lo.public,
@@ -8549,13 +8539,16 @@ impl<'p> RealTape<'p> {
                 &lo.commitment,
                 &lo.proof,
                 &lo.pcs,
-                &mut ch,
+                &mut rec,
             )
             .expect("the deferred verify accepts the leaf outer");
+        assert!(claims.boolean.is_some(), "boolean claims from the real inner");
+        assert!(claims.element.is_some(), "element claims from the real inner");
             (
                 work.boolean.expect("a boolean PIOP ran"),
                 work.element.expect("an element PIOP ran"),
                 sigma,
+                claims,
             )
         };
         let t_shape = rec.shape();
@@ -16170,8 +16163,9 @@ fn build_node_outer(
     let union0 = UnionInstance::new(registry, lo0.shape.counts.clone());
     let union1 = UnionInstance::new(&lo1.shape.registry, lo1.shape.counts.clone());
     let t_tapes = std::time::Instant::now();
-    let rt0 = RealTape::new(&lo0, DOMAIN);
-    let rt1 = RealTape::new(&lo1, DOMAIN);
+    // The two children's tapes are independent statement work — build them
+    // concurrently (each is a recording verify + the region pins).
+    let (rt0, rt1) = rayon::join(|| RealTape::new(&lo0, DOMAIN), || RealTape::new(&lo1, DOMAIN));
     let tapes_ms = t_tapes.elapsed().as_secs_f64() * 1e3;
     assert_ne!(
         rt0.sigma_native.rho, rt1.sigma_native.rho,
@@ -16758,8 +16752,7 @@ fn build_node_outer(
         // number is the steady-state cost, not the first-touch one.
         let tapes_ms = {
             let t = std::time::Instant::now();
-            let _ = RealTape::new(&lo0, DOMAIN);
-            let _ = RealTape::new(&lo1, DOMAIN);
+            let _ = rayon::join(|| RealTape::new(&lo0, DOMAIN), || RealTape::new(&lo1, DOMAIN));
             t.elapsed().as_secs_f64() * 1e3
         };
         let t_trace = std::time::Instant::now();
