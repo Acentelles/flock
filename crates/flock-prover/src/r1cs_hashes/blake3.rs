@@ -288,35 +288,8 @@ fn out_hi_bit(w: usize, b: usize) -> usize {
 // ---------------------------------------------------------------------------
 
 #[inline]
-fn g_fn(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my: u32) {
-    state[a] = state[a].wrapping_add(state[b]).wrapping_add(mx);
-    state[d] = (state[d] ^ state[a]).rotate_right(16);
-    state[c] = state[c].wrapping_add(state[d]);
-    state[b] = (state[b] ^ state[c]).rotate_right(12);
-    state[a] = state[a].wrapping_add(state[b]).wrapping_add(my);
-    state[d] = (state[d] ^ state[a]).rotate_right(8);
-    state[c] = state[c].wrapping_add(state[d]);
-    state[b] = (state[b] ^ state[c]).rotate_right(7);
-}
 
-fn round_fn(state: &mut [u32; 16], block: &[u32; 16]) {
-    g_fn(state, 0, 4, 8, 12, block[0], block[1]);
-    g_fn(state, 1, 5, 9, 13, block[2], block[3]);
-    g_fn(state, 2, 6, 10, 14, block[4], block[5]);
-    g_fn(state, 3, 7, 11, 15, block[6], block[7]);
-    g_fn(state, 0, 5, 10, 15, block[8], block[9]);
-    g_fn(state, 1, 6, 11, 12, block[10], block[11]);
-    g_fn(state, 2, 7, 8, 13, block[12], block[13]);
-    g_fn(state, 3, 4, 9, 14, block[14], block[15]);
-}
 
-fn permute(m: &mut [u32; 16]) {
-    let mut permuted = [0u32; 16];
-    for i in 0..16 {
-        permuted[i] = m[MSG_PERMUTATION[i]];
-    }
-    *m = permuted;
-}
 
 /// BLAKE3 compression function. Returns the full 16-word output state
 /// (post-finalization XOR). For chaining, the new CV is `out[0..8]`.
@@ -327,38 +300,9 @@ pub fn blake3_compress(
     block_len: u32,
     flags: u32,
 ) -> [u32; 16] {
-    let counter_low = counter as u32;
-    let counter_high = (counter >> 32) as u32;
-    let mut state = [
-        cv[0],
-        cv[1],
-        cv[2],
-        cv[3],
-        cv[4],
-        cv[5],
-        cv[6],
-        cv[7],
-        BLAKE3_IV[0],
-        BLAKE3_IV[1],
-        BLAKE3_IV[2],
-        BLAKE3_IV[3],
-        counter_low,
-        counter_high,
-        block_len,
-        flags,
-    ];
-    let mut block = *block_words;
-    for r in 0..N_ROUNDS {
-        round_fn(&mut state, &block);
-        if r + 1 < N_ROUNDS {
-            permute(&mut block);
-        }
-    }
-    for i in 0..8 {
-        state[i] ^= state[i + 8];
-        state[i + 8] ^= cv[i];
-    }
-    state
+    // Canonical copy lives in flock-core (the sponge-chained challenger
+    // builds on the same primitive this table proves) — one implementation.
+    flock_core::hash::blake3_compress(cv, block_words, counter, block_len, flags)
 }
 
 /// `per_round_msg_idx()[r][g] = (mx_idx, my_idx)` for round `r`, G index `g`
