@@ -224,13 +224,17 @@ impl MixedSetup {
     /// `PcsParams.m` cannot redirect verification.
     pub fn pcs_params(&self, counts: MixedCounts, profile: LigeritoProfile) -> PcsParams {
         let union = self.union(counts);
+        let lb = flock_core::pcs::ligerito::embedded_initial_k_or_default(
+            union.dense_m(),
+            profile,
+        );
         PcsParams {
             m: union.dense_m(),
             log_inv_rate: profile.log_inv_rate(),
-            log_batch_size: 6,
+            log_batch_size: lb,
             profile,
             // Integer-lane commit — see `UnionInstance::commit_lanes`.
-            num_lanes: union.commit_lanes(6),
+            num_lanes: union.commit_lanes(lb),
             // Default (SHA-256), matching the single-type setups. Both sides
             // derive this the same way, so it stays statement-derived; make it
             // a parameter here if the Mixed path ever needs BLAKE3.
@@ -381,12 +385,16 @@ impl MerkleMixedSetup {
     /// on both sides exactly as [`MixedSetup::pcs_params`].
     pub fn pcs_params(&self, counts: MerkleMixedCounts, profile: LigeritoProfile) -> PcsParams {
         let union = self.union(counts);
+        let lb = flock_core::pcs::ligerito::embedded_initial_k_or_default(
+            union.dense_m(),
+            profile,
+        );
         PcsParams {
             m: union.dense_m(),
             log_inv_rate: profile.log_inv_rate(),
-            log_batch_size: 6,
+            log_batch_size: lb,
             profile,
-            num_lanes: union.commit_lanes(6),
+            num_lanes: union.commit_lanes(lb),
             merkle_hash: Default::default(),
         }
     }

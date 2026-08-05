@@ -120,11 +120,19 @@ fn union_pcs_params(union: &UnionInstance<'_>) -> PcsParams {
     PcsParams {
         m: union.dense_m(),
         log_inv_rate: 1,
-        log_batch_size: 6,
+        log_batch_size: flock_core::pcs::ligerito::embedded_initial_k_or_default(
+            union.dense_m(),
+            LigeritoProfile::Fast,
+        ),
         profile: LigeritoProfile::Fast,
         // Integer-lane commit: skip the encode + hash of the whole zero lanes
         // the power-of-two rounding of the dense stack leaves behind.
-        num_lanes: union.commit_lanes(6),
+        num_lanes: union.commit_lanes(
+            flock_core::pcs::ligerito::embedded_initial_k_or_default(
+                union.dense_m(),
+                LigeritoProfile::Fast,
+            ),
+        ),
         merkle_hash: Default::default(),
     }
 }

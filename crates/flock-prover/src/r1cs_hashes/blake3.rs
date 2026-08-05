@@ -1228,6 +1228,17 @@ impl Blake3Setup {
         s
     }
 
+    /// [`Self::with_profile`] with the batch-major witness layout — the
+    /// profile-selectable twin of [`Self::new_batch_major`].
+    pub fn batch_major_with_profile(
+        n_blocks: usize,
+        profile: flock_core::pcs::ligerito::LigeritoProfile,
+    ) -> Self {
+        let mut s = Self::with_profile(n_blocks, profile);
+        s.r1cs.layout = flock_core::r1cs::WitnessLayout::BatchMajor;
+        s
+    }
+
     /// Fast-path witness generation dispatched on the r1cs's witness layout.
     fn generate_witness_ab(
         &self,
@@ -1288,7 +1299,12 @@ impl Blake3Setup {
         let pcs_params = PcsParams {
             m: r1cs.m,
             log_inv_rate,
-            log_batch_size: 6,
+            // The embedded config's initial_k is the source of truth for the
+            // L0 interleave (6 everywhere except m29 Fast = 5 — the
+            // recursion-node row-width choice).
+            log_batch_size: flock_core::pcs::ligerito::embedded_initial_k_or_default(
+                r1cs.m, profile,
+            ),
             profile,
             num_lanes: None,
             merkle_hash: Default::default(),

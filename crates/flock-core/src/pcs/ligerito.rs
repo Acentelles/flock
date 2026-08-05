@@ -386,6 +386,28 @@ pub fn embedded_security_config(m: usize, profile: LigeritoProfile) -> Option<&'
     })
 }
 
+/// The `initial_k` (L0 interleave = `log_batch_size`) the embedded config
+/// for `(m, profile)` was derived with. **The TOML is the source of truth**:
+/// callers building `PcsParams` at a content-derived `m` must use this as
+/// `log_batch_size` — `prover_config_for` rejects a mismatch. 6 everywhere
+/// except m29 Fast (5 — the recursion-node row-width choice; see
+/// `derive_profile`). Returns `None` when no config is registered.
+pub fn embedded_initial_k(m: usize, profile: LigeritoProfile) -> Option<usize> {
+    let toml = embedded_security_config(m, profile)?;
+    // Cheap scan — the TOML serializer always writes `initial_k = <n>` as
+    // its own line; full parse+validate happens at config load.
+    toml.lines().find_map(|l| {
+        l.strip_prefix("initial_k = ")
+            .and_then(|v| v.trim().parse().ok())
+    })
+}
+
+/// [`embedded_initial_k`] with the universal pre-m29 default for shapes
+/// without a registered config (ad-hoc/test geometries).
+pub fn embedded_initial_k_or_default(m: usize, profile: LigeritoProfile) -> usize {
+    embedded_initial_k(m, profile).unwrap_or(6)
+}
+
 /// Build a `ProverConfig` for `(log_n, log_batch_size, log_inv_rate)` from
 /// the embedded security TOML. **Strict**: returns `Err` if no security
 /// config has been derived for `(m, log_inv_rate)`. Use this as the
@@ -1262,7 +1284,27 @@ impl LigeritoSecurityConfig {
         let log_n = m
             .checked_sub(crate::pcs::LOG_PACKING)
             .ok_or_else(|| format!("m ({m}) < LOG_PACKING (7)"))?;
-        let initial_k = 6usize;
+        // `initial_k` (= L0 interleave; the committed row width is
+        // content_words / 2^(log_n − initial_k)) is 6 except where noted.
+        // m29 Fast AND Slim run initial_k = 5 (Ron, 2026-08-05): the
+        // recursion node lands on dense_m 29 since the BLAKE3 Option-E
+        // narrowing, and at initial_k 6 the identity log_msg_cols =
+        // log_n − initial_k halves the column count vs m30 while content
+        // shrank only ~21% — committed rows fatten 39 → 55 words and every
+        // node proof grows ~60 KiB. initial_k 5 restores 2^17 columns
+        // (rows ≈ 28-31 words). Soundness derives identically: Johnson
+        // per-query bits depend on rate/η only, so per-level query counts
+        // are unchanged; the Fast ladder re-derives as cols 17/14/11/8
+        // (yr 5, Σq 491) and the Slim ladder as cols 17/14/11/8/5
+        // (yr 5, Σq 262). Secure keeps 6 (unused by the recursion track).
+        // m28 joined 2026-08-05 when the transcript-v3 duplex pushed the
+        // slim L1 recursion node under 2^21 words: initial_k = 4 keeps the
+        // same 2^17 columns (cols = log_n − initial_k = 21 − 4).
+        let initial_k = match (m, profile) {
+            (29, LigeritoProfile::Fast | LigeritoProfile::Slim) => 5usize,
+            (28, LigeritoProfile::Fast | LigeritoProfile::Slim) => 4usize,
+            _ => 6usize,
+        };
 
         // Length-agnostic per-query estimate for ladder-shape feasibility
         // (the per-level codeword length `n` is not known until the shape is
@@ -5590,7 +5632,9 @@ mod tests {
             .expect("m29_fast.toml must parse and validate");
         assert_eq!(cfg.m, 29);
         assert_eq!(cfg.log_n, 22);
-        assert_eq!(cfg.initial_k, 6);
+        // m29 Fast is the one initial_k-5 config (the recursion-node
+        // row-width choice — see `derive_profile`).
+        assert_eq!(cfg.initial_k, 5);
         assert_eq!(cfg.hash, "sha256");
         assert_eq!(cfg.levels.len(), 5);
         // Fast = JohnsonOod profile: 218 L0 queries per-round at 100 bits (no
@@ -5603,7 +5647,7 @@ mod tests {
         assert_eq!(cfg.levels[0].ood_samples, 0); // L0: bound by eval claim
         assert!(cfg.levels[1].ood_samples >= 1);
         let (pv, _vc) = cfg.to_prover_verifier_configs().unwrap();
-        let default = default_config(22, 6, 1).unwrap();
+        let default = default_config(22, 5, 1).unwrap();
         assert_eq!(pv.log_inv_rates, default.log_inv_rates);
         assert_eq!(pv.recursive_ks, default.recursive_ks);
         assert_eq!(pv.queries[0], 218);
@@ -5616,8 +5660,10 @@ mod tests {
         // Slim = JohnsonOod at rate 1/4 with 16-bit query grinding.
         assert_eq!(cfg_slim.levels[0].queries, 90);
         assert_eq!(cfg_slim.levels[0].grinding_bits, 16);
+        // m29 Slim is initial_k 5 like Fast (the recursion-node choice).
+        assert_eq!(cfg_slim.initial_k, 5);
         let (pv_slim, _vc_slim) = cfg_slim.to_prover_verifier_configs().unwrap();
-        let default_slim = default_config(22, 6, 2).unwrap();
+        let default_slim = default_config(22, 5, 2).unwrap();
         assert_eq!(pv_slim.log_inv_rates, default_slim.log_inv_rates);
         assert_eq!(pv_slim.recursive_ks, default_slim.recursive_ks);
     }
@@ -5721,13 +5767,18 @@ mod tests {
     /// silently fall back to unaudited parameters.
     #[test]
     fn ligerito_prover_config_for_lookup() {
-        // m=29 fast: known → loads from TOML.
-        let pv = prover_config_for(22, 6, LigeritoProfile::Fast).expect("m29 fast must load");
+        // m=29 fast: known → loads from TOML at ITS initial_k (5 — the
+        // recursion-node row-width choice); a stale batch-6 request is a
+        // hard error, never a silent fallback.
+        let pv = prover_config_for(22, 5, LigeritoProfile::Fast).expect("m29 fast must load");
         assert_eq!(pv.queries[0], 218);
         assert_eq!(pv.fold_grinding_bits[0], 16);
+        assert_eq!(embedded_initial_k(29, LigeritoProfile::Fast), Some(5));
+        let err = prover_config_for(22, 6, LigeritoProfile::Fast).unwrap_err();
+        assert!(err.contains("initial_k=5"), "unexpected error: {err}");
 
-        // m=29 slim: known → loads from TOML.
-        let pv = prover_config_for(22, 6, LigeritoProfile::Slim).expect("m29 slim must load");
+        // m=29 slim: known → loads from TOML (initial_k 5, like Fast).
+        let pv = prover_config_for(22, 5, LigeritoProfile::Slim).expect("m29 slim must load");
         assert_eq!(pv.queries[0], 90);
         assert_eq!(pv.grinding_bits[0], 16);
 

@@ -1317,7 +1317,12 @@ impl Sha256HybridSetup {
         let pcs_params = flock_core::pcs::PcsParams {
             m: r1cs.m,
             log_inv_rate,
-            log_batch_size: 6,
+            // The embedded config's initial_k is the source of truth for the
+            // L0 interleave (6 everywhere except m29 Fast = 5 — the
+            // recursion-node row-width choice).
+            log_batch_size: flock_core::pcs::ligerito::embedded_initial_k_or_default(
+                r1cs.m, profile,
+            ),
             profile,
             num_lanes: None,
             merkle_hash: Default::default(),
