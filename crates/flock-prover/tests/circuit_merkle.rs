@@ -17008,6 +17008,68 @@ fn build_node_outer(
     outer_stats
 }
 
+/// Isolate the RecordingChallenger's overhead on the tape construction's
+/// exact workload: the deferred verify of an L1-node child, bare vs
+/// recorded, `L2_RUNS` runs each (default 10). The domain must be the
+/// node builder's own (the proof was proven under it).
+#[test]
+#[ignore] // Benchmark — run explicitly with `-- --ignored --nocapture`.
+fn recording_overhead_probe() {
+    use flock_core::transcript_record::RecordingChallenger;
+    let runs: usize = std::env::var("L2_RUNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let l0 = build_leaf_outer_seeded(0x4D50_9B00);
+    let l1 = build_leaf_outer_seeded(0x4D50_9B01);
+    let (n0, _acc, _) = build_node_outer(&l0, &l1);
+
+    let union_i = UnionInstance::new(&n0.shape.registry, n0.shape.counts.clone());
+    let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
+        (n0.b3_slot, n0.b3_r1cs.csc_lincheck_circuit()),
+        (n0.swap_slot, n0.swap_r1cs.csc_lincheck_circuit()),
+        (n0.spread_slot, n0.spread_r1cs.csc_lincheck_circuit()),
+    ];
+    lcs_ord.sort_by_key(|(i, _)| *i);
+    let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
+        lcs_ord.into_iter().map(|(_, cc)| cc).collect();
+
+    let mut bare_ms: Vec<f64> = Vec::new();
+    let mut rec_ms: Vec<f64> = Vec::new();
+    for _ in 0..runs {
+        let t = std::time::Instant::now();
+        let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
+        verifier::verify_ligerito_union_circuit_deferred(
+            &union_i, &n0.shape.circuit, &n0.public, &lcs, &n0.commitment, &n0.proof,
+            &n0.pcs, &mut ch,
+        )
+        .expect("bare deferred verify accepts");
+        bare_ms.push(t.elapsed().as_secs_f64() * 1e3);
+
+        let t = std::time::Instant::now();
+        let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(DOMAIN));
+        verifier::verify_ligerito_union_circuit_deferred(
+            &union_i, &n0.shape.circuit, &n0.public, &lcs, &n0.commitment, &n0.proof,
+            &n0.pcs, &mut rec,
+        )
+        .expect("recorded deferred verify accepts");
+        rec_ms.push(t.elapsed().as_secs_f64() * 1e3);
+    }
+    bare_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    rec_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    println!(
+        "deferred verify of an L1 node over {runs} runs: bare median {:.2} ms \
+         [{:.2}-{:.2}] | recorded median {:.2} ms [{:.2}-{:.2}] | wrapper {:.2} ms",
+        bare_ms[runs / 2],
+        bare_ms[0],
+        bare_ms[runs - 1],
+        rec_ms[runs / 2],
+        rec_ms[0],
+        rec_ms[runs - 1],
+        rec_ms[runs / 2] - bare_ms[runs / 2],
+    );
+}
+
 /// L2-ONLY BENCHMARK. Build the tower's scaffolding once — four leaves,
 /// two level-1 nodes, none of it timed or reported — then rebuild + prove
 /// the LEVEL-2 node `L2_RUNS` times (default 5). One machine-readable
