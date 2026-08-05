@@ -1229,6 +1229,13 @@ mod tests {
         let nu = 3usize;
         // kappa 2, k = 3: column 3 is padding.
         for (n_t, dense_path) in [(1usize << nu, true), (4, false)] {
+            // The delegation leg is release-only: a debug build's dead-word
+            // guard refuses the dirty witness before the sparse rounds can
+            // skip it (pinned by
+            // dirty_dead_word_trips_the_sparse_rounds_debug_guard).
+            if cfg!(debug_assertions) && !dense_path {
+                continue;
+            }
             let mut rng = Rng::new(0x9AD_0 + n_t as u64);
             let cases = vec![mult_case(2)];
             let mut h = build(vec![], &cases, nu, &[n_t], &mut rng);
@@ -1257,6 +1264,37 @@ mod tests {
                  transport"
             );
         }
+    }
+
+    /// Debug builds close the delegation window loudly instead: the sparse
+    /// rounds' dead-word guard scans the declared-dead region (affordable
+    /// only under `debug_assertions`) and refuses a dirty witness outright.
+    /// Release pins the delegation above; this pins the guard.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "zero on every dead word")]
+    fn dirty_dead_word_trips_the_sparse_rounds_debug_guard() {
+        let nu = 3usize;
+        let n_t = 4usize; // half utilization: the support-proportional path
+        let mut rng = Rng::new(0x9AD_0 + n_t as u64);
+        let cases = vec![mult_case(2)];
+        let mut h = build(vec![], &cases, nu, &[n_t], &mut rng);
+        let union = UnionInstance::new(&h.registry, h.counts.clone());
+        let range = union.slot_word_range(0);
+        h.z[range.start + 3 * (1 << nu)] = F128::ONE;
+        let zc = h.z[range.clone()].to_vec();
+        cases[0].ty.affine_products_into(
+            &zc,
+            nu,
+            None,
+            &mut h.pa[range.clone()],
+            &mut h.pb[range.clone()],
+        );
+        let z_region = region(&union, &h.z).to_vec();
+        let pa = region(&union, &h.pa).to_vec();
+        let pb = region(&union, &h.pb).to_vec();
+        let mut ch_p = FsChallenger::new(b"element-region-pad");
+        let _ = prove(&union, &z_region, &pa, &pb, &mut ch_p);
     }
 
     /// Tamper matrix on the region proof: every round message and both final
