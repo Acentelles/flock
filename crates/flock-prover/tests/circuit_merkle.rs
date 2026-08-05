@@ -16144,6 +16144,9 @@ fn mvp11_swap_children_fold_scale() {
 /// (the amortizable circuit-shape build is excluded; it's printed as
 /// `build` in the node's own breakdown line).
 struct NodeTimings {
+    tapes_ms: f64,
+    trace_ms: f64,
+    asm_ms: f64,
     prove_ms: f64,
     verify_ms: f64,
 }
@@ -16748,7 +16751,8 @@ fn build_node_outer(
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
         let mut steady_left = steady_reps;
-        let (built2, oproof, ocommit, prove_ms, verify_ms) = loop {
+        let (built2, oproof, ocommit, tapes_ms, trace_ms, asm_ms, prove_ms, verify_ms) =
+            loop {
         // Tapes are statement work: re-run them each online iteration
         // (results discarded — identical by determinism) so the printed
         // number is the steady-state cost, not the first-touch one.
@@ -16961,7 +16965,7 @@ fn build_node_outer(
             steady_left -= 1;
             continue;
         }
-        break (built2, oproof, ocommit, prove_ms, verify_ms);
+        break (built2, oproof, ocommit, tapes_ms, trace_ms, asm_ms, prove_ms, verify_ms);
         };
         let (b3_slot2, swap_slot2, spread_slot2) = (
             shape2.registry_slot(cs.q.b3),
@@ -16984,6 +16988,9 @@ fn build_node_outer(
             },
             acc_v,
             NodeTimings {
+                tapes_ms,
+                trace_ms,
+                asm_ms,
                 prove_ms,
                 verify_ms,
             },
@@ -17016,20 +17023,31 @@ fn l2_node_bench() {
     let (n1, _acc1, _) = build_node_outer(&l2, &l3);
 
     let mut proves: Vec<f64> = Vec::with_capacity(runs);
+    let mut totals: Vec<f64> = Vec::with_capacity(runs);
     let mut verifies: Vec<f64> = Vec::with_capacity(runs);
     for _ in 0..runs {
         let (_n2, _acc2, t) = build_node_outer(&n0, &n1);
-        println!("RUN l2_prove {:.1}", t.prove_ms);
+        let total = t.tapes_ms + t.trace_ms + t.asm_ms + t.prove_ms;
+        println!(
+            "RUN l2 prove {:.1} | tapes {:.1} + trace {:.1} + asm {:.1} = total {:.1}",
+            t.prove_ms, t.tapes_ms, t.trace_ms, t.asm_ms, total
+        );
         proves.push(t.prove_ms);
+        totals.push(total);
         verifies.push(t.verify_ms);
     }
     proves.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    totals.sort_by(|a, b| a.partial_cmp(b).unwrap());
     verifies.sort_by(|a, b| a.partial_cmp(b).unwrap());
     println!(
-        "l2_node over {runs} runs: prove median {:.1} ms [{:.1}-{:.1}] | verify median {:.1} ms",
+        "l2_node over {runs} runs: prove median {:.1} ms [{:.1}-{:.1}] | \
+         per-proof total median {:.1} ms [{:.1}-{:.1}] | verify median {:.1} ms",
         proves[runs / 2],
         proves[0],
         proves[runs - 1],
+        totals[runs / 2],
+        totals[0],
+        totals[runs - 1],
         verifies[runs / 2],
     );
 }
