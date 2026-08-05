@@ -229,6 +229,103 @@ pub mod fs_count {
 enum FsState {
     Sha256(Sha256),
     Blake3(Box<blake3::Hasher>),
+    /// The sponge-chained BLAKE3 discipline (transcript-v2): a sequential
+    /// compression chain — no chunk tree, no per-squeeze root forks. A
+    /// recursion circuit replays one row per 64-byte block plus ~two per
+    /// squeeze, instead of the tree discipline's O(log) fork parents.
+    Blake3Chain(B3Chain),
+}
+
+/// Chained-MD state over [`crate::hash::blake3_compress`]: `cv` is the
+/// running 256-bit chaining value, `buf` the pending partial block
+/// (invariant: `< 64` bytes after any absorb), `counter` the number of full
+/// blocks compressed. Squeezes do NOT mutate the state — every `sample_*`
+/// absorbs an `OP_SQUEEZE` header first, so consecutive squeezes separate
+/// through the pending bytes; the squeeze locally flushes the pending block
+/// and emits 64-byte output blocks `compress(cv', ZERO, j, out_len,
+/// CHAIN_SQUEEZE)`.
+#[derive(Clone)]
+struct B3Chain {
+    cv: [u32; 8],
+    buf: Vec<u8>,
+    counter: u64,
+}
+
+/// Domain flag for chain absorb compressions (disjoint from BLAKE3's
+/// CHUNK_START/END/PARENT/ROOT bits, which occupy the low bits).
+const CHAIN_ABSORB: u32 = 1 << 6;
+/// Domain flag for squeeze/output compressions.
+const CHAIN_SQUEEZE: u32 = 1 << 7;
+
+impl B3Chain {
+    fn new() -> Self {
+        Self {
+            cv: crate::hash::BLAKE3_IV,
+            buf: Vec::with_capacity(64),
+            counter: 0,
+        }
+    }
+
+    fn block_words(bytes: &[u8]) -> [u32; 16] {
+        let mut m = [0u32; 16];
+        for (i, w) in m.iter_mut().enumerate() {
+            let mut b = [0u8; 4];
+            let at = 4 * i;
+            if at < bytes.len() {
+                let n = (bytes.len() - at).min(4);
+                b[..n].copy_from_slice(&bytes[at..at + n]);
+            }
+            *w = u32::from_le_bytes(b);
+        }
+        m
+    }
+
+    fn absorb(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+        while self.buf.len() >= 64 {
+            let m = Self::block_words(&self.buf[..64]);
+            let out = crate::hash::blake3_compress(&self.cv, &m, self.counter, 64, CHAIN_ABSORB);
+            self.cv = out[..8].try_into().expect("8 words");
+            self.counter += 1;
+            self.buf.drain(..64);
+        }
+    }
+
+    /// The state with the pending partial block flushed — what squeezes and
+    /// digests read. Does not mutate (`sample_*` absorbs a header before
+    /// every squeeze, so the live pending bytes keep the chain moving).
+    fn flushed_cv(&self) -> [u32; 8] {
+        if self.buf.is_empty() {
+            return self.cv;
+        }
+        let m = Self::block_words(&self.buf);
+        let out = crate::hash::blake3_compress(
+            &self.cv,
+            &m,
+            self.counter,
+            self.buf.len() as u32,
+            CHAIN_ABSORB,
+        );
+        out[..8].try_into().expect("8 words")
+    }
+
+    fn squeeze_into(&self, out: &mut [u8]) {
+        let cv = self.flushed_cv();
+        let zero = [0u32; 16];
+        let mut off = 0usize;
+        let mut j = 0u64;
+        while off < out.len() {
+            let ob = crate::hash::blake3_compress(&cv, &zero, j, out.len() as u32, CHAIN_SQUEEZE);
+            let mut bytes = [0u8; 64];
+            for (i, w) in ob.iter().enumerate() {
+                bytes[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+            }
+            let take = (out.len() - off).min(64);
+            out[off..off + take].copy_from_slice(&bytes[..take]);
+            off += take;
+            j += 1;
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -270,11 +367,29 @@ impl FsChallenger {
         c
     }
 
+    /// New challenger over the sponge-CHAINED BLAKE3 discipline
+    /// (transcript-v2): a sequential compression chain in place of the
+    /// BLAKE3 chunk tree, so a recursion circuit replaying the transcript
+    /// pays ~one row per 64 absorbed bytes plus ~two per squeeze — the tree
+    /// discipline's per-squeeze root forks (O(log absorbed) parents each)
+    /// were more than half of every child's chain rows.
+    pub fn with_chained_blake3(domain: &[u8]) -> Self {
+        let mut c = Self {
+            state: FsState::Blake3Chain(B3Chain::new()),
+            n_absorbed: 0,
+        };
+        c.absorb_header(OP_DOMAIN, 0, domain.len() as u64);
+        c.absorb_padded(domain);
+        c
+    }
+
     /// Which hash backs this transcript.
     pub fn hash_kind(&self) -> HashKind {
         match self.state {
             FsState::Sha256(_) => HashKind::Sha256,
-            FsState::Blake3(_) => HashKind::Blake3,
+            // The chained discipline reports Blake3: PoW grinding and every
+            // other kind-keyed helper hash the same primitive.
+            FsState::Blake3(_) | FsState::Blake3Chain(_) => HashKind::Blake3,
         }
     }
 
@@ -287,6 +402,9 @@ impl FsChallenger {
             }
             FsState::Blake3(h) => {
                 h.update(bytes);
+            }
+            FsState::Blake3Chain(c) => {
+                c.absorb(bytes);
             }
         }
         self.n_absorbed = self.n_absorbed.wrapping_add(bytes.len() as u64);
@@ -360,6 +478,7 @@ impl FsChallenger {
                 }
             }
             FsState::Blake3(hasher) => hasher.finalize_xof().fill(out),
+            FsState::Blake3Chain(c) => c.squeeze_into(out),
         }
     }
 
@@ -376,6 +495,11 @@ impl FsChallenger {
         match &self.state {
             FsState::Sha256(h) => h.clone().finalize().into(),
             FsState::Blake3(h) => *h.finalize().as_bytes(),
+            FsState::Blake3Chain(c) => {
+                let mut d = [0u8; 32];
+                c.squeeze_into(&mut d);
+                d
+            }
         }
     }
 
@@ -1073,5 +1197,37 @@ mod tests {
             c2.observe_f128(F128::ONE);
             assert_ne!(c1.sample_f128(), c2.sample_f128());
         }
+    }
+}
+
+#[cfg(test)]
+mod b3_chain_tests {
+    use super::*;
+
+    #[test]
+    fn chained_blake3_is_deterministic_and_binding() {
+        let mk = || FsChallenger::with_chained_blake3(b"flock-chain-test");
+        let mut a = mk();
+        let mut b = mk();
+        a.observe_f128(F128 { lo: 7, hi: 9 });
+        b.observe_f128(F128 { lo: 7, hi: 9 });
+        let (x, y) = (a.sample_f128(), b.sample_f128());
+        assert_eq!(x, y, "deterministic");
+        // Consecutive squeezes differ (the OP_SQUEEZE header advances the
+        // pending bytes between them).
+        let x2 = a.sample_f128();
+        assert_ne!(x, x2, "consecutive squeezes separate");
+        // A different absorbed value moves the challenge.
+        let mut c = mk();
+        c.observe_f128(F128 { lo: 7, hi: 10 });
+        assert_ne!(c.sample_f128(), x, "absorb-sensitive");
+        // Wide squeezes: the first 16 bytes of a wide squeeze equal the
+        // scalar squeeze at the same state ONLY if the header matches — a
+        // slice squeeze has its own header, so they must differ.
+        let mut d = mk();
+        d.observe_f128(F128 { lo: 7, hi: 9 });
+        let v = d.sample_f128_vec(2);
+        assert_ne!(v[0], x, "slice-squeeze domain-separates from scalar");
+        assert_ne!(v[0], v[1], "output blocks differ");
     }
 }
