@@ -402,7 +402,8 @@ pub fn default_config(
         stratified_open: false,
         stratified: vec![],
     }
-    .with_default_stratified())
+    .with_default_stratified()
+    .with_stratified_open())
 }
 
 /// Recursion-ladder shape: per-level dims (index 0 = L0) plus the residual.
@@ -615,7 +616,8 @@ pub fn default_verifier_config(
         stratified_open: false,
         stratified: vec![],
     }
-    .with_default_stratified())
+    .with_default_stratified()
+    .with_stratified_open())
 }
 
 // ===================================================================

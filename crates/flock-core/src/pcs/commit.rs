@@ -167,10 +167,13 @@ impl PcsParams {
     pub fn l0_cap_depth(&self) -> usize {
         match self.ligerito_prover_config() {
             Ok(cfg) => cfg.l0_cap_depth(self.k_code()),
-            Err(_) => merkle::cap_depth(
+            // The fallback mirrors `default_config`, which is stratified
+            // since the flip: the schedule of the udr count.
+            Err(_) => crate::pcs::stratified::LevelSchedule::decompose(
                 crate::pcs::ligerito::udr_queries(self.log_inv_rate),
                 self.k_code(),
-            ),
+            )
+            .cap_depth(),
         }
     }
 
