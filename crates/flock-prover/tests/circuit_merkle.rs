@@ -8556,9 +8556,18 @@ impl<'p> RealTape<'p> {
         let vals_rec: Vec<F128> = rec.values().to_vec();
         let ops = t_shape.ops();
         let mut pub_payloads = bytes_payload_mask(ops);
-        let vc_at = |end: usize| -> (usize, usize) {
-            let (mut v, mut c) = (0usize, 0usize);
-            for op in &ops[..end] {
+        // Prefix sums over the op tape — the locate walks below call these
+        // per feature and per ROUND (437 rounds at node scale), so a
+        // rescan-per-call is quadratic in practice. One pass, O(1) lookups.
+        let (pre_v, pre_c, pre_f) = {
+            let mut pre_v = Vec::with_capacity(ops.len() + 1);
+            let mut pre_c = Vec::with_capacity(ops.len() + 1);
+            let mut pre_f = Vec::with_capacity(ops.len() + 1);
+            let (mut v, mut c, mut f) = (0usize, 0usize, 0usize);
+            pre_v.push(0);
+            pre_c.push(0);
+            pre_f.push(0);
+            for op in ops {
                 match op {
                     Op::SqueezeScalar => c += 1,
                     Op::SqueezeSlice(n) => c += n,
@@ -8566,10 +8575,17 @@ impl<'p> RealTape<'p> {
                     Op::ObserveSlice(n) => v += n,
                     _ => {}
                 }
+                if op.finalizes() {
+                    f += 1;
+                }
+                pre_v.push(v);
+                pre_c.push(c);
+                pre_f.push(f);
             }
-            (v, c)
+            (pre_v, pre_c, pre_f)
         };
-        let fin_at = |end: usize| ops[..end].iter().filter(|o| o.finalizes()).count();
+        let vc_at = |end: usize| -> (usize, usize) { (pre_v[end], pre_c[end]) };
+        let fin_at = |end: usize| pre_f[end];
 
         // The region order, by label — identical to the minimal mixed inner's.
         let find = |label: &[u8]| -> Vec<usize> {
