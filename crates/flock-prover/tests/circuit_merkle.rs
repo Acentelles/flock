@@ -16364,6 +16364,50 @@ fn build_node_outer(
         let hint_refs: Vec<&(dyn std::any::Any + Sync)> =
             hints.iter().map(|h| h as &(dyn std::any::Any + Sync)).collect();
         let build_ms = build_ms + t_build2.elapsed().as_secs_f64() * 1e3;
+        // The node proves and verifies over the circuit path. Union, PCS
+        // params and the R1CS tables are per-SHAPE — offline, ahead of the
+        // online loop.
+        let union2 = UnionInstance::new(&shape2.registry, shape2.counts.clone());
+        let pcs2 = PcsParams {
+            m: union2.dense_m(),
+            log_inv_rate: 1,
+            log_batch_size: 6,
+            profile: LigeritoProfile::Fast,
+            num_lanes: union2.commit_lanes(6),
+            // BLAKE3 for BOTH Merkle and FS: the node's proof must be
+            // RECURSABLE — a parent replays this transcript in-circuit,
+            // and each default diverges silently (the two recorded
+            // gotchas, third occurrence).
+            merkle_hash: HashKind::Blake3,
+        };
+        let t_r1cs = std::time::Instant::now();
+        let b3_r1cs2 = blake3::build_block_r1cs(nu2);
+        let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
+        let swap_r1cs2 = SwapTable::build_block_r1cs(nu2);
+        let swap_lc2 = swap_r1cs2.csc_lincheck_circuit();
+        let spread_w2 = rt0.spread_w.max(rt1.spread_w);
+        let spread_r1cs2 = BitSpreadTable::new(spread_w2).build_block_r1cs(nu2);
+        let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
+        let build_ms = build_ms + t_r1cs.elapsed().as_secs_f64() * 1e3;
+        // TOWER_STEADY=N re-runs the ONLINE phases (trace + asm + prove +
+        // verify) N extra times over the SAME built shape: the offline
+        // setup (circuit, R1CS, PCS params, warmed pools) is paid once, so
+        // iterations after the first print the steady-state online cost.
+        let steady_reps: usize = std::env::var("TOWER_STEADY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let mut steady_left = steady_reps;
+        let (built2, oproof, ocommit) = loop {
+        // Tapes are statement work: re-run them each online iteration
+        // (results discarded — identical by determinism) so the printed
+        // number is the steady-state cost, not the first-touch one.
+        let tapes_ms = {
+            let t = std::time::Instant::now();
+            let _ = RealTape::new(&lo0, DOMAIN);
+            let _ = RealTape::new(&lo1, DOMAIN);
+            t.elapsed().as_secs_f64() * 1e3
+        };
         let t_trace = std::time::Instant::now();
         let mut built2 = shape2.run(&vals, &hint_refs);
         let trace_ms = t_trace.elapsed().as_secs_f64() * 1e3;
@@ -16427,30 +16471,9 @@ fn build_node_outer(
             );
         }
 
-        // The node proves and verifies over the circuit path.
-        let union2 = UnionInstance::new(&shape2.registry, shape2.counts.clone());
-        let pcs2 = PcsParams {
-            m: union2.dense_m(),
-            log_inv_rate: 1,
-            log_batch_size: 6,
-            profile: LigeritoProfile::Fast,
-            num_lanes: union2.commit_lanes(6),
-            // BLAKE3 for BOTH Merkle and FS: the node's proof must be
-            // RECURSABLE — a parent replays this transcript in-circuit,
-            // and each default diverges silently (the two recorded
-            // gotchas, third occurrence).
-            merkle_hash: HashKind::Blake3,
-        };
-        let t_r1cs = std::time::Instant::now();
-        let b3_r1cs2 = blake3::build_block_r1cs(nu2);
-        let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
-        let swap_r1cs2 = SwapTable::build_block_r1cs(nu2);
-        let swap_lc2 = swap_r1cs2.csc_lincheck_circuit();
-        let spread_ty2 = BitSpreadTable::new(rt0.spread_w.max(rt1.spread_w));
-        let spread_r1cs2 = spread_ty2.build_block_r1cs(nu2);
-        let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
-        let build_ms = build_ms + t_r1cs.elapsed().as_secs_f64() * 1e3;
         let t_asm = std::time::Instant::now();
+        // Recreated per online iteration — the spread closure consumes it.
+        let spread_ty2 = BitSpreadTable::new(spread_w2);
         // The copy-free assembly path: the boolean drivers pack straight
         // into the union slot blocks inside the prove (live rows only under
         // elide) — no intermediate capacity-sized buffers, no memcpy. The
@@ -16553,11 +16576,6 @@ fn build_node_outer(
         )
         .expect("the 2->1 node verifies deferred");
         let deferred_ms = t0d.elapsed().as_secs_f64() * 1e3;
-        let (b3_slot2, swap_slot2, spread_slot2) = (
-            shape2.registry_slot(cs.q.b3),
-            shape2.registry_slot(cs.q.swap),
-            shape2.registry_slot(cs.q.spread),
-        );
         println!(
             "\nTHE 2->1 RECURSION NODE (two children + {} folds, ONE proof)\n  \
              children: dense_m {} / mu {}, one circuit, distinct FS points\n  \
@@ -16588,6 +16606,17 @@ fn build_node_outer(
             deferred_ms,
             bincode::serialize(&oproof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
             build_ms,
+        );
+        if steady_left > 0 {
+            steady_left -= 1;
+            continue;
+        }
+        break (built2, oproof, ocommit);
+        };
+        let (b3_slot2, swap_slot2, spread_slot2) = (
+            shape2.registry_slot(cs.q.b3),
+            shape2.registry_slot(cs.q.swap),
+            shape2.registry_slot(cs.q.spread),
         );
         (
             LeafOuter {
