@@ -60,6 +60,13 @@ pub const MAGIC: [u8; 5] = *b"FLOCK";
 /// the values' absorb + gamma squeeze and loses the per-statement assist
 /// rounds. Soundness: docs/multipoint-twisted-assist.tex.
 ///
+/// v10: stratified queries (docs/stratified-queries.tex) — every level's
+/// query count decomposes into power-of-two summands, one query per
+/// depth-c subtree; the absorbed cap moves to the TOP SET BIT of the
+/// count (from ⌈log2 q⌉) and openings carry per-summand path lengths.
+/// No struct changed — the vectors are self-describing — but v9 proofs
+/// can never verify under the stratified statement, so versioning stays
+/// strict.
 /// v7: Merkle capping — `Commitment.root`, `LigeritoProof.
 /// initial_root`, and `recursive_roots` become cap-node VECTORS (the
 /// commitment is the cap layer at depth ⌈log2 q⌉; the transcript absorbs
@@ -77,7 +84,7 @@ pub const MAGIC: [u8; 5] = *b"FLOCK";
 /// v3 restructured `BaseFoldProof`: per-query Merkle paths were replaced by
 /// shared octopus multi-proofs (one per Merkle tree). v2 added `HashKind`
 /// to [`ChainProofBundle`].
-pub const VERSION: u8 = 9;
+pub const VERSION: u8 = 10;
 
 /// Which hash function a chain proof is over. Carried in
 /// [`ChainProofBundle`] so the verifier (e.g. the CLI) can pick the right

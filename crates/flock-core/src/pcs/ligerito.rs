@@ -6316,9 +6316,9 @@ mod tests {
             &ntt_0,
             HashKind::Sha256,
         );
-        let initial_cap = |q0: usize| -> Vec<Hash> {
+        let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
             wtns_0
-                .cap(merkle::cap_depth(q0, wtns_0.block_len.trailing_zeros() as usize))
+                .cap(cfg.l0_cap_depth(wtns_0.block_len.trailing_zeros() as usize))
                 .to_vec()
         };
 
@@ -6353,7 +6353,7 @@ mod tests {
         .with_default_stratified();
         let mut v_ch = crate::challenger::FsChallenger::new(b"pow-test");
         let ok =
-            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_cap(v_cfg.queries[0]), &mut v_ch);
+            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_cap(&v_cfg), &mut v_ch);
         assert!(
             ok,
             "verifier should accept proof with valid grinding nonces"
@@ -6364,7 +6364,7 @@ mod tests {
         bad_proof.grinding_nonces[0] = bad_proof.grinding_nonces[0].wrapping_add(1);
         let mut v_ch = crate::challenger::FsChallenger::new(b"pow-test");
         let ok =
-            recursive_verifier_with_basis(&v_cfg, &bad_proof, &b, target, &initial_cap(v_cfg.queries[0]), &mut v_ch);
+            recursive_verifier_with_basis(&v_cfg, &bad_proof, &b, target, &initial_cap(&v_cfg), &mut v_ch);
         assert!(
             !ok,
             "verifier must reject proof with tampered grinding nonce"
@@ -6549,9 +6549,12 @@ mod tests {
     /// commit-time / open-time cap agreement is by construction.
     #[test]
     fn security_config_stratified_flag_drives_derived_configs() {
-        let toml = embedded_security_config(22, LigeritoProfile::Fast).unwrap();
+        // Every shipped TOML is stratified since the 2026-08-05 flip; the
+        // legacy derivation is pinned here by clearing the flag.
+        let toml = embedded_security_config(22, LigeritoProfile::Slim).unwrap();
         let mut sec = LigeritoSecurityConfig::from_toml_str(toml).unwrap();
-        assert!(!sec.stratified, "shipped TOMLs are legacy until the flip");
+        assert!(sec.stratified, "shipped TOMLs are stratified");
+        sec.stratified = false;
         let (p0, v0) = sec.to_prover_verifier_configs().unwrap();
         assert!(!p0.stratified_open && !v0.stratified_open);
 
@@ -7624,9 +7627,9 @@ mod tests {
             &ntt_0,
             HashKind::Sha256,
         );
-        let initial_cap = |q0: usize| -> Vec<Hash> {
+        let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
             wtns_0
-                .cap(merkle::cap_depth(q0, wtns_0.block_len.trailing_zeros() as usize))
+                .cap(cfg.l0_cap_depth(wtns_0.block_len.trailing_zeros() as usize))
                 .to_vec()
         };
 
@@ -7660,7 +7663,7 @@ mod tests {
         .with_default_stratified();
         let mut v_ch = crate::challenger::FsChallenger::new(b"basis-test");
         let ok =
-            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_cap(v_cfg.queries[0]), &mut v_ch);
+            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_cap(&v_cfg), &mut v_ch);
         assert!(ok, "basis-based verifier rejected valid proof");
     }
 
@@ -8056,9 +8059,9 @@ mod tests {
             &ntt_0,
             HashKind::Sha256,
         );
-        let initial_cap = |q0: usize| -> Vec<Hash> {
+        let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
             wtns_0
-                .cap(merkle::cap_depth(q0, wtns_0.block_len.trailing_zeros() as usize))
+                .cap(cfg.l0_cap_depth(wtns_0.block_len.trailing_zeros() as usize))
                 .to_vec()
         };
 
@@ -8094,7 +8097,7 @@ mod tests {
         // Dense verifier
         let mut v_ch = crate::challenger::FsChallenger::new(b"succ-cmp");
         let dense_ok =
-            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_cap(v_cfg.queries[0]), &mut v_ch);
+            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_cap(&v_cfg), &mut v_ch);
         assert!(dense_ok, "dense verifier must accept");
 
         // Succinct verifier — batch eval_b is just eq(z, ris ++ y_bits) by construction
@@ -8121,7 +8124,7 @@ mod tests {
             &proof,
             log_n,
             target,
-            &initial_cap(v_cfg.queries[0]),
+            &initial_cap(&v_cfg),
             1usize << v_cfg.initial_k,
             eval_b_residual,
             &mut v_ch2,
@@ -8221,9 +8224,9 @@ mod tests {
             &ntt_0,
             HashKind::Sha256,
         );
-        let initial_cap = |q0: usize| -> Vec<Hash> {
+        let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
             wtns_0
-                .cap(merkle::cap_depth(q0, wtns_0.block_len.trailing_zeros() as usize))
+                .cap(cfg.l0_cap_depth(wtns_0.block_len.trailing_zeros() as usize))
                 .to_vec()
         };
 
@@ -8245,7 +8248,7 @@ mod tests {
 
         let dense = |proof: &LigeritoProof| {
             let mut ch = crate::challenger::FsChallenger::new(b"ood-test");
-            recursive_verifier_with_basis(&v_cfg, proof, &b, target, &initial_cap(v_cfg.queries[0]), &mut ch)
+            recursive_verifier_with_basis(&v_cfg, proof, &b, target, &initial_cap(&v_cfg), &mut ch)
         };
         let eval_b_residual = {
             let z = z.clone();
@@ -8274,7 +8277,7 @@ mod tests {
                 proof,
                 log_n,
                 target,
-                &initial_cap(v_cfg.queries[0]),
+                &initial_cap(&v_cfg),
                 1usize << v_cfg.initial_k,
                 &eval_b_residual,
                 &mut ch,
@@ -8342,9 +8345,9 @@ mod tests {
             &ntt_0,
             HashKind::Sha256,
         );
-        let initial_cap = |q0: usize| -> Vec<Hash> {
+        let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
             wtns_0
-                .cap(merkle::cap_depth(q0, wtns_0.block_len.trailing_zeros() as usize))
+                .cap(cfg.l0_cap_depth(wtns_0.block_len.trailing_zeros() as usize))
                 .to_vec()
         };
 
@@ -8361,7 +8364,7 @@ mod tests {
 
         let mut v_ch = crate::challenger::FsChallenger::new(b"m22-fast");
         assert!(
-            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_cap(v_cfg.queries[0]), &mut v_ch),
+            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_cap(&v_cfg), &mut v_ch),
             "m22 fast profile proof must verify"
         );
     }
@@ -8406,9 +8409,9 @@ mod tests {
             &ntt_0,
             HashKind::Blake3,
         );
-        let initial_cap = |q0: usize| -> Vec<Hash> {
+        let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
             wtns_0
-                .cap(merkle::cap_depth(q0, wtns_0.block_len.trailing_zeros() as usize))
+                .cap(cfg.l0_cap_depth(wtns_0.block_len.trailing_zeros() as usize))
                 .to_vec()
         };
 
@@ -8425,7 +8428,7 @@ mod tests {
 
         let mut v_ch = crate::challenger::FsChallenger::new(b"m22-blake3");
         assert!(
-            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_cap(v_cfg.queries[0]), &mut v_ch),
+            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_cap(&v_cfg), &mut v_ch),
             "blake3 Merkle proof must verify"
         );
 
@@ -8440,7 +8443,7 @@ mod tests {
                 &proof,
                 &b,
                 target,
-                &initial_cap(v_cfg.queries[0]),
+                &initial_cap(&v_cfg),
                 &mut w_ch
             ),
             "a sha256-configured verifier must reject a blake3 proof"
@@ -8480,9 +8483,9 @@ mod tests {
                 let ntt_0 = AdditiveNttF128::standard(log_msg_cols_0 + 1);
                 let wtns_0 =
                     ligero_commit(&poly, log_msg_cols_0, initial_k, 1, &ntt_0, merkle_hash);
-                let initial_cap = |q0: usize| -> Vec<Hash> {
+                let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
             wtns_0
-                .cap(merkle::cap_depth(q0, wtns_0.block_len.trailing_zeros() as usize))
+                .cap(cfg.l0_cap_depth(wtns_0.block_len.trailing_zeros() as usize))
                 .to_vec()
         };
 
@@ -8504,7 +8507,7 @@ mod tests {
                         &proof,
                         &b,
                         target,
-                        &initial_cap(v_cfg.queries[0]),
+                        &initial_cap(&v_cfg),
                         &mut v_ch
                     ),
                     "merkle={merkle_hash} fs={fs_hash} must verify"
@@ -8523,7 +8526,7 @@ mod tests {
                         &proof,
                         &b,
                         target,
-                        &initial_cap(v_cfg.queries[0]),
+                        &initial_cap(&v_cfg),
                         &mut w_ch
                     ),
                     "merkle={merkle_hash}: an {other_fs} transcript must reject an {fs_hash} proof"
@@ -8597,9 +8600,9 @@ mod tests {
             &ntt_0,
             HashKind::Sha256,
         );
-        let initial_cap = |q0: usize| -> Vec<Hash> {
+        let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
             wtns_0
-                .cap(merkle::cap_depth(q0, wtns_0.block_len.trailing_zeros() as usize))
+                .cap(cfg.l0_cap_depth(wtns_0.block_len.trailing_zeros() as usize))
                 .to_vec()
         };
 
@@ -8633,7 +8636,7 @@ mod tests {
         .with_default_stratified();
         let mut v_ch = crate::challenger::FsChallenger::new(b"batched");
         let ok =
-            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_cap(v_cfg.queries[0]), &mut v_ch);
+            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_cap(&v_cfg), &mut v_ch);
         assert!(ok, "batched-basis verifier rejected valid proof");
     }
 

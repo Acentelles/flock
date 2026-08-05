@@ -1147,19 +1147,22 @@ fn bundle_digest_merged(
 /// dual value each; multipoint label v1, values absorb 128K -> 128R+P.
 // Re-pinned 2026-08-04: merged-open v1 — value-only packed-direct intake
 // (points are transcript-derived; label v0 -> v1).
+// Re-pinned 2026-08-05: stratified queries (m22_fast stratified = true) —
+// per-summand sampling, cap at the top set bit, per-summand path lengths
+// (docs/stratified-queries.tex); same (1-gamma)^q bound, smaller proofs.
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn mixed_class_merged_proof_bytes_pinned() {
     const ELEMENT_ONLY: [(&str, usize, &str); 3] = [
-        ("elem-merged-nu12-full", 1 << 12, "450067620bbd9c89c1c6b0f4e17117a98bf9d741a979bf3b3317df655c02b9a4"),
-        ("elem-merged-nu12-2731", 2731, "8b96208bd48bb4ed1de40771416820a18dc78faf61724230920250d6a10c731f"),
-        ("elem-merged-nu12-0", 0, "bf3eeb3f2cb93fb44959c19fe408299a14135d8bc94762be9076312df50d8115"),
+        ("elem-merged-nu12-full", 1 << 12, "8497fd5f322e437edaec6f37e2c9ca75bd3b1c61fca72f4bedcbcdb8e88875a8"),
+        ("elem-merged-nu12-2731", 2731, "347f0ba0e8c2f3f916abc95a535e49c2755236853d8307b3f055c0c26ae2facf"),
+        ("elem-merged-nu12-0", 0, "9137099a923860ac601cc536dce45bc0fcb1384e3ca3898e01698ed8c130fab2"),
     ];
     const MIXED: [(&str, [usize; 2], &str); 4] = [
-        ("mix-merged-nu7-128-128", [128, 128], "ed24b1bbd66c0ebd08c74e96e19697809d649e214da31ba7da6d3e778adc9b6f"),
-        ("mix-merged-nu7-100-90", [100, 90], "a1fdb387d9ba412a72fb2529c605a9e629993516cc4ebe62029b94dfa1ee7ccb"),
-        ("mix-merged-nu7-0-90", [0, 90], "a5e677252d5ac7b671e1898b869c7d174bab7cc6ba8a1afa696f854aa8228a41"),
-        ("mix-merged-nu7-100-0", [100, 0], "b93e4a3f1734d1ae173717b394f568817763049b34476416599eade540f2346c"),
+        ("mix-merged-nu7-128-128", [128, 128], "55936fce308d01921bfe2bc3326f72d1ea4165d32d3876f6e1b4f8cee7241ab6"),
+        ("mix-merged-nu7-100-90", [100, 90], "d0ea5ad27ea9bb8b9ee62c03bc411458a54b9155020cf0e1aa011bebf4160133"),
+        ("mix-merged-nu7-0-90", [0, 90], "505bca14231561d6041d99d60357d6c3709ec388ced9fe28c23b6324c94288ef"),
+        ("mix-merged-nu7-100-0", [100, 0], "cb75c694e8cbb9a2912c02dde2ac6afee619f733410d8f952bbdb698a4f19a96"),
     ];
 
     let (w0, w1) = (F128::new(0x51F0, 0), F128::new(0, 0x2C7E));

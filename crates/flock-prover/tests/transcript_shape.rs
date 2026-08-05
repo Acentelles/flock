@@ -275,7 +275,12 @@ fn element_only_transcript_shape_is_pinned() {
 // single untwisted product; multipoint label v1.
     // Re-pinned 2026-08-04: merged-open v1 — value-only packed-direct
     // intake (points are transcript-derived; label v0 -> v1).
-    const EXPECTED: &str = "6c1348e364c5598e84411a85a3f57235504d8522adb7b0f9ca1b5763379d2592";
+    // Re-pinned 2026-08-05: stratified queries (all TOMLs stratified = true)
+    // — the absorbed cap moves to the top set bit of each level's query
+    // count and openings carry per-summand path lengths
+    // (docs/stratified-queries.tex). The squeeze widths are UNCHANGED (one
+    // F128 per query); only the cap payload sizes move the shape.
+    const EXPECTED: &str = "4982a38e4020ed04355e49a5a4d4a59d56c250a10d742bbc6aad65f101462ee0";
 
     let (_, shape) = record_element_only(12, &[3], &[1 << 12], 0xB0DD_1E01);
 

@@ -5587,9 +5587,22 @@ fn emit_query_phase(
                 cap_root = Some(nodes[0]);
             }
             Some(s) => {
+                // A top-summand terminal is the ABSORBED cap layer, and a
+                // direct connect there puts a gate output into a class the
+                // FS chain's absorb row consumes — opening → chain →
+                // squeeze → opening: Cyclic. So the binding layer is
+                // layer 1: top-summand openings hash ONE level further
+                // (below, in the query loop) and connect to the DERIVED
+                // node, which collision resistance binds to the absorbed
+                // pair. Hence at least one layer is always built.
                 let c_min = s.summand_depths.last().copied().unwrap_or(g.c);
+                assert!(
+                    g.c > 0,
+                    "depth-0 top summand (q = 1) unsupported in-circuit"
+                );
+                let n_layers = (g.c - c_min).max(1);
                 layers_w.push(cap_w[li].clone());
-                for _ in 0..(g.c - c_min) {
+                for _ in 0..n_layers {
                     let params = cw(sb, vals, consts, pack_params(0, 64, PARENT));
                     let next: Vec<[Wire; 2]> = layers_w
                         .last()
@@ -5607,6 +5620,12 @@ fn emit_query_phase(
                 }
             }
         }
+        // One PARENT params wire for the top-summand extension rows (the
+        // `cw` helper is shadowed by the challenge wire inside the loop).
+        let parent_params = g
+            .sched
+            .is_some()
+            .then(|| cw(sb, vals, consts, pack_params(0, 64, PARENT)));
         // alpha words: chain outputs, PUBLISHED for the checker's expansion.
         let a_wires: Vec<Wire> = (0..lvl.a_count).map(|j| outs[sqa[j / 4]][j % 4]).collect();
         // v: this level's fold challenges, chain outputs, wired straight in.
@@ -5652,7 +5671,7 @@ fn emit_query_phase(
             hints.extend(paths[g.path_range(k)].iter().map(hash_to_digest));
             // Output-output connects: a multi-producer class with no gate
             // consumers — witgen asserts agreement, no dataflow cycle.
-            let term = match (&g.sched, &cap_root) {
+            let (bind, term) = match (&g.sched, &cap_root) {
                 (None, Some(root)) => {
                     // Full-depth legacy: append the c cap-internal siblings
                     // from the native cap tree; the terminal is the root.
@@ -5662,13 +5681,40 @@ fn emit_query_phase(
                         hints.push(hash_to_digest(&tree_lvls[i][idx ^ 1]));
                         idx >>= 1;
                     }
-                    *root
+                    (cv, *root)
                 }
-                (Some(_), _) => layers_w[g.c - ck][stratum],
+                (Some(_), _) if ck == g.c => {
+                    // Top summand: hash one level past the cap with the
+                    // NEIGHBOUR cap word at constant direction (the
+                    // stratum's parity — no swap gate), and bind the
+                    // DERIVED parent to layer 1. Equality of the two
+                    // layer-1 producers forces cv == cap[stratum] by
+                    // collision resistance, with every edge forward.
+                    let sib = cap_w[li][stratum ^ 1];
+                    let (l, r) = if stratum & 1 == 0 {
+                        (cv, sib)
+                    } else {
+                        (sib, cv)
+                    };
+                    let out = sb.gate(
+                        slots.b3,
+                        &[
+                            iv[0],
+                            iv[1],
+                            l[0],
+                            l[1],
+                            r[0],
+                            r[1],
+                            parent_params.expect("stratified level has parent params"),
+                        ],
+                    );
+                    ([out[0], out[1]], layers_w[1][stratum >> 1])
+                }
+                (Some(_), _) => (cv, layers_w[g.c - ck][stratum]),
                 (None, None) => unreachable!("legacy level always folds a root"),
             };
-            sb.connect(cv[0], term[0]);
-            sb.connect(cv[1], term[1]);
+            sb.connect(bind[0], term[0]);
+            sb.connect(bind[1], term[1]);
             // The fold reads the full `2^folds` domain: the committed words
             // then the definitionally-zero top lanes.
             let mut fold_w = leaf_w.clone();
