@@ -2307,6 +2307,17 @@ fn emit_fs_chain(
                 };
                 (iv, [outs[l][0], outs[l][1], outs[right][0], outs[right][1]])
             }
+            None if trace.block_offsets[i].is_none() => {
+                // A sponge-chain SQUEEZE output row (transcript-v2): zero
+                // message block via the shared constant, chaining value
+                // from the link.
+                let cv_in = match link.cv {
+                    CvSource::Iv => iv,
+                    CvSource::Row(r) => [outs[r][0], outs[r][1]],
+                };
+                let z4 = cw(sb, vals, consts, F128::ZERO);
+                (cv_in, [z4, z4, z4, z4])
+            }
             None => {
                 let cv_in = match link.cv {
                     CvSource::Iv => iv,
@@ -6630,11 +6641,11 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
     // (SHA-256 Merkle) diverge silently otherwise.
     let mut leaf_pcs = setup.pcs_params.clone();
     leaf_pcs.merkle_hash = flock_core::merkle::HashKind::Blake3;
-    let mut ch = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
+    let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
     let (proof, commitment, _claim) =
         prover::prove_fast_ligerito_union(&union, &leaf_pcs, vec![slot], &mut ch);
 
-    let mut rec = RecordingChallenger::new(FsChallenger::with_hash(DOMAIN, HashKind::Blake3));
+    let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(DOMAIN));
     let native_claims = verifier::verify_ligerito_union(
         &union,
         &[circuit],
@@ -6987,7 +6998,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
     {
         use flock_core::lincheck::build_eq_table;
         use flock_prover::prover::UnionElementSlotInput;
-        use flock_prover::r1cs_hashes::fs_chain::FsChain;
+        use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
         let lig = &proof.pcs_open.inner.ligerito;
         assert_eq!(commitment.cap, lig.initial_cap, "commitment IS the L0 cap");
@@ -7004,7 +7015,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
 
         let stream = t_shape.stream_words(DOMAIN);
         let bytes = stream.to_bytes(rec.values(), rec.payloads());
-        let mut chain = FsChain::new();
+        let mut chain = FsChainSponge::new();
         let mut at = 0usize;
         let fin_ops: Vec<_> = t_shape.ops().iter().filter(|o| o.finalizes()).collect();
         assert_eq!(stream.finalize_after.len(), fin_ops.len(), "finalize alignment");
@@ -8181,7 +8192,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
                 .into_iter()
                 .map(|(i, z)| live_element_input(z, shape.counts[i], nu))
                 .collect();
-            let mut ch = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
+            let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
             let (p, c, _) = prover::prove_fast_ligerito_union_circuit(
                 &union_o,
                 &shape.circuit,
@@ -8194,7 +8205,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             (p, c)
         });
         let (_, verify_t) = timed(REPS, || {
-            let mut ch = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
+            let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
             verifier::verify_ligerito_union_circuit(
                 &union_o,
                 &shape.circuit,
@@ -8361,7 +8372,7 @@ struct RealTape<'p> {
 impl<'p> RealTape<'p> {
     fn new(lo: &'p LeafOuter, domain: &'static [u8]) -> Self {
         use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
-        use flock_prover::r1cs_hashes::fs_chain::FsChain;
+        use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
         let union_i = UnionInstance::new(&lo.shape.registry, lo.shape.counts.clone());
         let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
@@ -8372,7 +8383,7 @@ impl<'p> RealTape<'p> {
         lcs_ord.sort_by_key(|(i, _)| *i);
         let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
             lcs_ord.into_iter().map(|(_, cc)| cc).collect();
-        let mut rec = RecordingChallenger::new(FsChallenger::with_hash(domain, HashKind::Blake3));
+        let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(domain));
         let claims = verifier::verify_ligerito_union_circuit(
             &union_i,
             &lo.shape.circuit,
@@ -8390,7 +8401,7 @@ impl<'p> RealTape<'p> {
         // for the three assertion families — the method-note discipline,
         // verifier-exported over formulas-written-twice.
         let (mat_assert, el_assert, sigma_native) = {
-            let mut ch = FsChallenger::with_hash(domain, HashKind::Blake3);
+            let mut ch = FsChallenger::with_chained_blake3(domain);
             let (_, work, sigma) = verifier::verify_ligerito_union_circuit_deferred(
                 &union_i,
                 &lo.shape.circuit,
@@ -8628,7 +8639,7 @@ impl<'p> RealTape<'p> {
         let stream = t_shape.stream_words(domain);
         let bytes = stream.to_bytes(rec.values(), rec.payloads());
         let trace = {
-            let mut chain = FsChain::new();
+            let mut chain = FsChainSponge::new();
             let mut at = 0usize;
             let fin_ops: Vec<_> = ops.iter().filter(|o| o.finalizes()).collect();
             assert_eq!(
@@ -10842,7 +10853,7 @@ fn build_mixed_inner(n_blocks: usize, mac_take: usize, seed: u64) -> MixedInner 
         SlotWitness::Element(z) => z,
         other => panic!("mac witness is {other:?}"),
     };
-    let mut ch = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
+    let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
     let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
         &union,
         &built.shape.circuit,
@@ -10863,7 +10874,7 @@ fn build_mixed_inner(n_blocks: usize, mac_take: usize, seed: u64) -> MixedInner 
     // so assemblies are checked against the verifier's own data rather than
     // against a formula this file also wrote.
     let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
-    let mut ch = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
+    let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
     let (_, work, sigma) = verifier::verify_ligerito_union_circuit_deferred(
         &union,
         &built.shape.circuit,
@@ -11230,7 +11241,7 @@ struct ChildTape<'p> {
 impl<'p> ChildTape<'p> {
     fn new(inner: &'p MixedInner, domain: &'static [u8]) -> Self {
         use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
-        use flock_prover::r1cs_hashes::fs_chain::FsChain;
+        use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
         let built = &inner.built;
         let proof = &inner.proof;
@@ -11238,7 +11249,7 @@ impl<'p> ChildTape<'p> {
         let blake_r1cs = blake3::build_block_r1cs(inner.nu);
         let blake_lc = blake_r1cs.csc_lincheck_circuit();
         let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
-        let mut rec = RecordingChallenger::new(FsChallenger::with_hash(domain, HashKind::Blake3));
+        let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(domain));
         let all_claims = verifier::verify_ligerito_union_circuit(
             &union,
             &built.shape.circuit,
@@ -11660,7 +11671,7 @@ impl<'p> ChildTape<'p> {
         let stream = t_shape.stream_words(domain);
         let bytes = stream.to_bytes(rec.values(), rec.payloads());
         let trace = {
-            let mut chain = FsChain::new();
+            let mut chain = FsChainSponge::new();
             let mut at = 0usize;
             let fin_ops: Vec<_> = t_shape.ops().iter().filter(|o| o.finalizes()).collect();
             assert_eq!(
@@ -13557,9 +13568,9 @@ fn mvp11_sigma_fold_tape() {
         .iter()
         .map(|c| FoldMatrix::col_marginal(&m_sig, &c.row.materialize(), n_cols))
         .collect();
-    let mut chp = FsChallenger::with_hash(M11_DOMAIN, HashKind::Blake3);
+    let mut chp = FsChallenger::with_chained_blake3(M11_DOMAIN);
     let (fp, out_p) = matrix_fold::prove_fold(&m_sig, &combs, &claims, &mut chp);
-    let mut rec = RecordingChallenger::new(FsChallenger::with_hash(M11_DOMAIN, HashKind::Blake3));
+    let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(M11_DOMAIN));
     let out_v =
         matrix_fold::verify_fold(&claims, &fp, &mut rec).expect("the honest sigma fold verifies");
     assert_eq!(out_p, out_v, "prover and verifier agree on the accumulator");
@@ -13717,11 +13728,11 @@ fn mvp11_sigma_fold_tape() {
     // rebuilt from the public segment alone and discharged at the root.
     let outer_stats = {
         use flock_prover::prover::UnionElementSlotInput;
-        use flock_prover::r1cs_hashes::fs_chain::FsChain;
+        use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
         let stream = t_shape.stream_words(M11_DOMAIN);
         let bytes = stream.to_bytes(rec.values(), rec.payloads());
-        let mut chain = FsChain::new();
+        let mut chain = FsChainSponge::new();
         let mut at = 0usize;
         let fin_ops: Vec<_> = t_shape.ops().iter().filter(|o| o.finalizes()).collect();
         assert_eq!(
@@ -14604,7 +14615,7 @@ fn mvp11_merge_fold_region() {
         let ba = [c.work.boolean.clone().expect("leaf boolean work")];
         let ea = [(union, c.work.element.clone().expect("leaf element work"))];
         let sg = [c.sigma.clone()];
-        let mut ch = FsChallenger::with_hash(M11_LEAF_DOMAIN, HashKind::Blake3);
+        let mut ch = FsChallenger::with_chained_blake3(M11_LEAF_DOMAIN);
         let (lp, la) = aggregate::prove_aggregate_classes(
             registry,
             &mats,
@@ -14617,7 +14628,7 @@ fn mvp11_merge_fold_region() {
             &mut ch,
         )
         .expect("the leaf fold proves");
-        let mut ch = FsChallenger::with_hash(M11_LEAF_DOMAIN, HashKind::Blake3);
+        let mut ch = FsChallenger::with_chained_blake3(M11_LEAF_DOMAIN);
         let lv = aggregate::verify_aggregate_classes(
             registry,
             &ba,
@@ -14636,7 +14647,7 @@ fn mvp11_merge_fold_region() {
     let priors = [&acc_a, &acc_b];
     let n_priors = priors.len();
 
-    let mut chp = FsChallenger::with_hash(M11_MERGE_DOMAIN, HashKind::Blake3);
+    let mut chp = FsChallenger::with_chained_blake3(M11_MERGE_DOMAIN);
     let (agg, acc_p) = aggregate::prove_aggregate_classes(
         registry,
         &mats,
@@ -14650,7 +14661,7 @@ fn mvp11_merge_fold_region() {
     )
     .expect("the merge-node fold proves");
     let mut rec =
-        RecordingChallenger::new(FsChallenger::with_hash(M11_MERGE_DOMAIN, HashKind::Blake3));
+        RecordingChallenger::new(FsChallenger::with_chained_blake3(M11_MERGE_DOMAIN));
     let acc_v = aggregate::verify_aggregate_classes(
         registry,
         &bool_asserts,
@@ -14804,11 +14815,11 @@ fn mvp11_merge_fold_region() {
     // statement — rebuilt from the public segment alone and discharged.
     let outer_stats = {
         use flock_prover::prover::UnionElementSlotInput;
-        use flock_prover::r1cs_hashes::fs_chain::FsChain;
+        use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
         let stream = t_shape.stream_words(M11_MERGE_DOMAIN);
         let bytes = stream.to_bytes(rec.values(), rec.payloads());
-        let mut chain = FsChain::new();
+        let mut chain = FsChainSponge::new();
         let mut at = 0usize;
         let fin_ops: Vec<_> = t_shape.ops().iter().filter(|o| o.finalizes()).collect();
         assert_eq!(
@@ -15427,7 +15438,7 @@ fn mvp11_swap_children_fold_scale() {
 
     // The two children: the real node's deferred verify, run twice.
     let deferred = || {
-        let mut ch = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
+        let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
         let (_, work, sigma) = verifier::verify_ligerito_union_circuit_deferred(
             &union_i,
             &lo.shape.circuit,
@@ -15473,7 +15484,7 @@ fn mvp11_swap_children_fold_scale() {
     assert!(n_el > 5, "the real node carries the element gate census");
 
     // The native fold: prove + record-verify + discharge all three groups.
-    let mut chp = FsChallenger::with_hash(M11_SCALE_DOMAIN, HashKind::Blake3);
+    let mut chp = FsChallenger::with_chained_blake3(M11_SCALE_DOMAIN);
     let (agg, acc_p) = aggregate::prove_aggregate_classes(
         registry,
         &mats,
@@ -15487,7 +15498,7 @@ fn mvp11_swap_children_fold_scale() {
     )
     .expect("the scale fold proves");
     let mut rec =
-        RecordingChallenger::new(FsChallenger::with_hash(M11_SCALE_DOMAIN, HashKind::Blake3));
+        RecordingChallenger::new(FsChallenger::with_chained_blake3(M11_SCALE_DOMAIN));
     let acc_v = aggregate::verify_aggregate_classes(
         registry,
         &bool_asserts,
@@ -15579,11 +15590,11 @@ fn mvp11_swap_children_fold_scale() {
     // ---- the in-circuit replay: the whole ~35-fold region ----
     let outer_stats = {
         use flock_prover::prover::UnionElementSlotInput;
-        use flock_prover::r1cs_hashes::fs_chain::FsChain;
+        use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
         let stream = t_shape.stream_words(M11_SCALE_DOMAIN);
         let bytes = stream.to_bytes(rec.values(), rec.payloads());
-        let mut chain = FsChain::new();
+        let mut chain = FsChainSponge::new();
         let mut at = 0usize;
         let fin_ops: Vec<_> = t_shape.ops().iter().filter(|o| o.finalizes()).collect();
         assert_eq!(
@@ -15887,7 +15898,7 @@ fn build_node_outer(
         (&union1, rt1.el_assert.clone()),
     ];
     let sigmas = [rt0.sigma_native.clone(), rt1.sigma_native.clone()];
-    let mut chp = FsChallenger::with_hash(M11_NODE_DOMAIN, HashKind::Blake3);
+    let mut chp = FsChallenger::with_chained_blake3(M11_NODE_DOMAIN);
     let (agg, acc_p) = aggregate::prove_aggregate_classes(
         registry,
         &mats,
@@ -15901,7 +15912,7 @@ fn build_node_outer(
     )
     .expect("the node fold proves");
     let mut rec =
-        RecordingChallenger::new(FsChallenger::with_hash(M11_NODE_DOMAIN, HashKind::Blake3));
+        RecordingChallenger::new(FsChallenger::with_chained_blake3(M11_NODE_DOMAIN));
     let acc_v = aggregate::verify_aggregate_classes(
         registry,
         &bool_asserts,
@@ -15991,11 +16002,11 @@ fn build_node_outer(
     // ---- ONE outer: two REAL child regions + the fold region ----
     let outer_stats = {
         use flock_prover::prover::UnionElementSlotInput;
-        use flock_prover::r1cs_hashes::fs_chain::FsChain;
+        use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
         let stream = t_shape.stream_words(M11_NODE_DOMAIN);
         let bytes = stream.to_bytes(rec.values(), rec.payloads());
-        let mut chain = FsChain::new();
+        let mut chain = FsChainSponge::new();
         let mut at = 0usize;
         let fin_ops: Vec<_> = t_shape.ops().iter().filter(|o| o.finalizes()).collect();
         assert_eq!(
@@ -16503,7 +16514,7 @@ fn build_node_outer(
             lco.into_iter().map(|(_, c)| c).collect();
         let asm_ms = t_asm.elapsed().as_secs_f64() * 1e3;
         let t0p = std::time::Instant::now();
-        let mut ch2 = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
+        let mut ch2 = FsChallenger::with_chained_blake3(DOMAIN);
         let (oproof, ocommit, _) = prover::prove_fast_ligerito_union_circuit(
             &union2,
             &shape2.circuit,
@@ -16515,7 +16526,7 @@ fn build_node_outer(
         );
         let prove_ms = t0p.elapsed().as_secs_f64() * 1e3;
         let t0v = std::time::Instant::now();
-        let mut ch2 = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
+        let mut ch2 = FsChallenger::with_chained_blake3(DOMAIN);
         verifier::verify_ligerito_union_circuit(
             &union2,
             &shape2.circuit,
@@ -16529,7 +16540,7 @@ fn build_node_outer(
         .expect("the 2->1 node verifies");
         let verify_ms = t0v.elapsed().as_secs_f64() * 1e3;
         let t0d = std::time::Instant::now();
-        let mut ch2 = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
+        let mut ch2 = FsChallenger::with_chained_blake3(DOMAIN);
         verifier::verify_ligerito_union_circuit_deferred(
             &union2,
             &shape2.circuit,

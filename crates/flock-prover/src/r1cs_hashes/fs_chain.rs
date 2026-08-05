@@ -330,9 +330,220 @@ impl FsChain {
     }
 }
 
+/// Domain flag for sponge-chain absorb compressions (transcript-v2; sits
+/// above BLAKE3's chunk bits). MUST equal the challenger's constant.
+pub const CHAIN_ABSORB: u32 = 1 << 6;
+/// Domain flag for sponge-chain squeeze/output compressions.
+pub const CHAIN_SQUEEZE: u32 = 1 << 7;
+
+/// The SPONGE-CHAINED transcript trace builder (transcript-v2): mirrors
+/// [`flock_core::challenger::FsChallenger::with_chained_blake3`] row for
+/// row — a sequential compression chain, no chunk tree, no per-squeeze
+/// root forks. Emits [`FsChainTrace`] rows whose links are always plain
+/// chaining (`right`/`repeats` never set); squeeze OUTPUT rows carry a
+/// ZERO message block (`block_offsets = None`) — the circuit feeds shared
+/// zero constants there.
+///
+/// Drop-in for [`FsChain`] in the tape constructors: same `absorb` /
+/// `finalize` / `finish` surface, and `finalize` leaves the LIVE state
+/// untouched exactly as the challenger's immutable squeeze does (the
+/// pending partial block is flushed into a LOCAL fork row).
+pub struct FsChainSponge {
+    rows: Vec<Compression>,
+    links: Vec<Link>,
+    squeezes: Vec<Vec<usize>>,
+    block_offsets: Vec<Option<usize>>,
+    cv: [u32; 8],
+    cv_row: Option<usize>,
+    counter: u64,
+    buf: Vec<u8>,
+    buf_offset: usize,
+    absorbed: usize,
+}
+
+impl Default for FsChainSponge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FsChainSponge {
+    pub fn new() -> Self {
+        Self {
+            rows: Vec::new(),
+            links: Vec::new(),
+            squeezes: Vec::new(),
+            block_offsets: Vec::new(),
+            cv: IV,
+            cv_row: None,
+            counter: 0,
+            buf: Vec::with_capacity(BLOCK_BYTES),
+            buf_offset: 0,
+            absorbed: 0,
+        }
+    }
+
+    fn emit(&mut self, c: Compression, link: Link, offset: Option<usize>) -> usize {
+        self.rows.push(c);
+        self.links.push(link);
+        self.block_offsets.push(offset);
+        self.rows.len() - 1
+    }
+
+    fn cv_link(&self) -> Link {
+        Link {
+            cv: self.cv_row.map_or(CvSource::Iv, CvSource::Row),
+            right: None,
+            repeats: None,
+        }
+    }
+
+    pub fn absorb(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+        self.absorbed += bytes.len();
+        while self.buf.len() >= BLOCK_BYTES {
+            let m = words(&self.buf[..BLOCK_BYTES]);
+            let out = blake3_compress(&self.cv, &m, self.counter, BLOCK_BYTES as u32, CHAIN_ABSORB);
+            let link = self.cv_link();
+            let row = self.emit(
+                (self.cv, m, self.counter, BLOCK_BYTES as u32, CHAIN_ABSORB),
+                link,
+                Some(self.buf_offset),
+            );
+            self.cv = out[..8].try_into().expect("8 words");
+            self.cv_row = Some(row);
+            self.counter += 1;
+            self.buf.drain(..BLOCK_BYTES);
+            self.buf_offset += BLOCK_BYTES;
+        }
+    }
+
+    /// Fork a squeeze off the current state: flush the pending partial block
+    /// into a LOCAL row, then emit the 64-byte output rows (zero message,
+    /// output index as counter, requested length bound in `blen`). The live
+    /// chain keeps its pending bytes — the challenger's squeeze is an
+    /// immutable read, and every `sample_*` absorbs a header first, so
+    /// consecutive squeezes separate.
+    pub fn finalize(&mut self, out_bytes: usize) -> Vec<u8> {
+        let (fcv, fcv_row) = if self.buf.is_empty() {
+            (self.cv, self.cv_row)
+        } else {
+            let m = words(&self.buf);
+            let out = blake3_compress(
+                &self.cv,
+                &m,
+                self.counter,
+                self.buf.len() as u32,
+                CHAIN_ABSORB,
+            );
+            let link = self.cv_link();
+            let buf_for_row = (self.cv, m, self.counter, self.buf.len() as u32, CHAIN_ABSORB);
+            let row = self.emit(buf_for_row, link, Some(self.buf_offset));
+            (out[..8].try_into().expect("8 words"), Some(row))
+        };
+        let zero = [0u32; 16];
+        let mut ids = Vec::new();
+        let mut bytes = Vec::with_capacity(out_bytes.div_ceil(BLOCK_BYTES) * BLOCK_BYTES);
+        let mut j = 0u64;
+        while bytes.len() < out_bytes {
+            let o = blake3_compress(&fcv, &zero, j, out_bytes as u32, CHAIN_SQUEEZE);
+            let row = self.emit(
+                (fcv, zero, j, out_bytes as u32, CHAIN_SQUEEZE),
+                Link {
+                    cv: fcv_row.map_or(CvSource::Iv, CvSource::Row),
+                    right: None,
+                    repeats: None,
+                },
+                None,
+            );
+            ids.push(row);
+            for w in o.iter() {
+                bytes.extend_from_slice(&w.to_le_bytes());
+            }
+            j += 1;
+        }
+        bytes.truncate(out_bytes);
+        self.squeezes.push(ids);
+        bytes
+    }
+
+    pub fn finish(self) -> FsChainTrace {
+        FsChainTrace {
+            rows: self.rows,
+            links: self.links,
+            squeezes: self.squeezes,
+            block_offsets: self.block_offsets,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The SPONGE trace builder must equal the chained challenger byte for
+    /// byte: same absorb schedule, same squeeze outputs. The challenger is
+    /// the protocol; a divergent trace builder proves a transcript nobody
+    /// hashes.
+    #[test]
+    fn sponge_finalize_matches_the_chained_challenger() {
+        use flock_core::challenger::{Challenger, FsChallenger};
+        use flock_core::field::F128;
+        // Drive both through the SAME op schedule via the recording layer:
+        // absorb framed values exactly as the challenger frames them.
+        let mut ch = FsChallenger::with_chained_blake3(b"sponge-diff");
+        let mut rec_bytes: Vec<u8> = Vec::new();
+        // Reproduce the challenger's framing byte-for-byte using the
+        // recording of a twin transcript.
+        use flock_core::transcript_record::RecordingChallenger;
+        let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(b"sponge-diff"));
+        let mut squeezed_ch: Vec<Vec<u8>> = Vec::new();
+        for i in 0..40u64 {
+            let v = F128 { lo: i, hi: i.wrapping_mul(77) };
+            ch.observe_f128(v);
+            rec.observe_f128(v);
+            if i % 3 == 0 {
+                let a = ch.sample_f128();
+                let b = rec.sample_f128();
+                assert_eq!(a, b);
+                let mut bs = Vec::new();
+                bs.extend_from_slice(&a.lo.to_le_bytes());
+                bs.extend_from_slice(&a.hi.to_le_bytes());
+                squeezed_ch.push(bs);
+            }
+            if i % 7 == 0 {
+                let vs_a = ch.sample_f128_vec(3);
+                let vs_b = rec.sample_f128_vec(3);
+                assert_eq!(vs_a, vs_b);
+                let mut bs = Vec::new();
+                for v2 in &vs_a {
+                    bs.extend_from_slice(&v2.lo.to_le_bytes());
+                    bs.extend_from_slice(&v2.hi.to_le_bytes());
+                }
+                squeezed_ch.push(bs);
+            }
+        }
+        // Replay the recorded byte stream through the sponge trace builder;
+        // every finalize must reproduce the challenger's squeezed bytes.
+        let shape = rec.shape();
+        let stream = shape.stream_words(b"sponge-diff");
+        let bytes = stream.to_bytes(rec.values(), rec.payloads());
+        let fin_ops: Vec<_> = shape.ops().iter().filter(|o| o.finalizes()).collect();
+        let mut chain = FsChainSponge::new();
+        let mut at = 0usize;
+        for (k, &upto) in stream.finalize_after.iter().enumerate() {
+            chain.absorb(&bytes[at * 16..upto * 16]);
+            at = upto;
+            let got = chain.finalize(fin_ops[k].squeezed_bytes());
+            assert_eq!(got, squeezed_ch[k], "squeeze {k}");
+        }
+        assert_eq!(
+            stream.finalize_after.len(),
+            squeezed_ch.len(),
+            "every squeeze checked"
+        );
+        let _ = rec_bytes;
+    }
 
     /// Every finalize must equal reference BLAKE3's XOF of the same prefix.
     ///
