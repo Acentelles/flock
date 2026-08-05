@@ -16347,19 +16347,40 @@ fn build_node_outer(
                 lab.push((shape2.registry_slot(s), format!("resid{k}")));
             }
             println!("  NODE TYPE CENSUS (io = cell slots = gather claims):");
+            let (mut area_b, mut area_e) = (0usize, 0usize);
             for (t, ty) in shape2.registry.types().iter().enumerate() {
                 let name = lab
                     .iter()
                     .find(|(i, _)| *i == t)
                     .map(|(_, s)| s.as_str())
                     .unwrap_or("?");
+                // Mirrors UnionInstance::used_cols: word-columns that carry
+                // data (a boolean type's GF(2) columns bit-pack 128/word; an
+                // element type's useful_bits is element_cols * 128).
+                let used_cols = ty.useful_bits.div_ceil(128).min(1usize << (ty.k_log - 7));
+                let area = shape2.counts[t] * used_cols;
+                let native = match ty.class {
+                    flock_core::schedule::TableClass::Boolean => {
+                        area_b += area;
+                        format!("GF(2)     {:6} bit-cols", ty.useful_bits)
+                    }
+                    _ => {
+                        area_e += area;
+                        format!("GF(2^128) {:6} el-cols ", ty.useful_bits / 128)
+                    }
+                };
                 println!(
-                    "    t{t:2} {name:>8} | io {:3} | rows {:6} ({:3}%)",
+                    "    t{t:2} {name:>8} | {native} = {used_cols:3} word-cols | io {:3} | \
+                     rows {:6} ({:3}%) | area {area:9} words",
                     ty.io_schema.len(),
                     shape2.counts[t],
                     (100 * shape2.counts[t]) >> nu2,
                 );
             }
+            println!(
+                "    class areas: GF(2) {area_b} + GF(2^128) {area_e} = dense {} words",
+                area_b + area_e,
+            );
         }
         let hint_refs: Vec<&(dyn std::any::Any + Sync)> =
             hints.iter().map(|h| h as &(dyn std::any::Any + Sync)).collect();
