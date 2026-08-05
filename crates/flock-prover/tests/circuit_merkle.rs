@@ -16140,10 +16140,18 @@ fn mvp11_swap_children_fold_scale() {
 /// circuit digest (the foldability key); their claims land at unrelated FS
 /// points. Every tape pin, connect, and checker walk of the 2→1 milestone
 /// lives inside — the builder IS the test.
+/// Per-proof timing breakdown of one node build — the repeatable costs
+/// (the amortizable circuit-shape build is excluded; it's printed as
+/// `build` in the node's own breakdown line).
+struct NodeTimings {
+    prove_ms: f64,
+    verify_ms: f64,
+}
+
 fn build_node_outer(
     lo0: &LeafOuter,
     lo1: &LeafOuter,
-) -> (LeafOuter, flock_core::aggregate::Accumulator) {
+) -> (LeafOuter, flock_core::aggregate::Accumulator, NodeTimings) {
     use flock_core::aggregate;
     use flock_core::matrix_fold::{FoldProof, MatrixClaim};
     use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
@@ -16740,7 +16748,7 @@ fn build_node_outer(
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
         let mut steady_left = steady_reps;
-        let (built2, oproof, ocommit) = loop {
+        let (built2, oproof, ocommit, prove_ms, verify_ms) = loop {
         // Tapes are statement work: re-run them each online iteration
         // (results discarded — identical by determinism) so the printed
         // number is the steady-state cost, not the first-touch one.
@@ -16953,7 +16961,7 @@ fn build_node_outer(
             steady_left -= 1;
             continue;
         }
-        break (built2, oproof, ocommit);
+        break (built2, oproof, ocommit, prove_ms, verify_ms);
         };
         let (b3_slot2, swap_slot2, spread_slot2) = (
             shape2.registry_slot(cs.q.b3),
@@ -16975,9 +16983,55 @@ fn build_node_outer(
                 spread_slot: spread_slot2,
             },
             acc_v,
+            NodeTimings {
+                prove_ms,
+                verify_ms,
+            },
         )
     };
     outer_stats
+}
+
+/// L2-ONLY BENCHMARK. Build the tower's scaffolding once — four leaves,
+/// two level-1 nodes, none of it timed or reported — then rebuild + prove
+/// the LEVEL-2 node `L2_RUNS` times (default 5). One machine-readable
+/// `RUN l2_prove <ms>` line per run (stability_probe's convention) plus a
+/// median summary; the node's own breakdown lines above each RUN carry
+/// tapes/trace/witness splits. Profile via `TOWER_PROFILE` as usual:
+///
+///   L2_RUNS=10 TOWER_PROFILE=slim cargo test --release -p flock-prover \
+///     --test circuit_merkle l2_node_bench -- --ignored --nocapture
+#[test]
+#[ignore] // Benchmark — run explicitly with `-- --ignored --nocapture`.
+fn l2_node_bench() {
+    let runs: usize = std::env::var("L2_RUNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let l0 = build_leaf_outer_seeded(0x4D50_9B00);
+    let l1 = build_leaf_outer_seeded(0x4D50_9B01);
+    let l2 = build_leaf_outer_seeded(0x4D50_9B02);
+    let l3 = build_leaf_outer_seeded(0x4D50_9B03);
+    let (n0, _acc0, _) = build_node_outer(&l0, &l1);
+    let (n1, _acc1, _) = build_node_outer(&l2, &l3);
+
+    let mut proves: Vec<f64> = Vec::with_capacity(runs);
+    let mut verifies: Vec<f64> = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        let (_n2, _acc2, t) = build_node_outer(&n0, &n1);
+        println!("RUN l2_prove {:.1}", t.prove_ms);
+        proves.push(t.prove_ms);
+        verifies.push(t.verify_ms);
+    }
+    proves.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    verifies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    println!(
+        "l2_node over {runs} runs: prove median {:.1} ms [{:.1}-{:.1}] | verify median {:.1} ms",
+        proves[runs / 2],
+        proves[0],
+        proves[runs - 1],
+        verifies[runs / 2],
+    );
 }
 
 /// **THE 2→1 RECURSION NODE** — see [`build_node_outer`], which carries the
@@ -17029,8 +17083,8 @@ fn mvp12_recursion_tower() {
     let l3 = build_leaf_outer_seeded(0x4D50_9B03);
 
     // Level 1: two 2→1 nodes.
-    let (n0, acc0) = build_node_outer(&l0, &l1);
-    let (n1, acc1) = build_node_outer(&l2, &l3);
+    let (n0, acc0, _) = build_node_outer(&l0, &l1);
+    let (n1, acc1, _) = build_node_outer(&l2, &l3);
     assert_eq!(
         n0.shape.circuit.digest(),
         n1.shape.circuit.digest(),
@@ -17044,7 +17098,7 @@ fn mvp12_recursion_tower() {
 
     // Level 2: the node consumes ITS OWN OUTPUTS — the same builder, the
     // same emitters, the same connects, over node-shaped children.
-    let (n2, acc2) = build_node_outer(&n0, &n1);
+    let (n2, acc2, _) = build_node_outer(&n0, &n1);
 
     // The root's obligations, one accumulator per level (the walls above
     // are what collapse these to one): the leaf-level accumulators against
