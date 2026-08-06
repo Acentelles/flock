@@ -122,10 +122,13 @@ fn outer_union<'r>(
 /// envelope maxima. Measured at the m29 fixed point (envelope_registry_diff
 /// + the tower census, 2026-08-06):
 ///
-/// - `spread_w` 20 = the m29 child ladder's max tree depth. The leaf's own
-///   m22 inner needs only 12; it declares the envelope width and leaves the
-///   high outputs unread (the node already runs its shallow levels over the
-///   one wide slot, so the emitters are width-generic by existing use).
+/// - `spread_w` 19 = the max tree depth over the ENVELOPE's child ladders
+///   (the m29 outer proof's L0; the registry shows it as io 20 — the
+///   BitSpread schema is w+1 words). The leaf's own m22 inner needs only
+///   12; every builder declares the envelope width and shallower ladders
+///   leave the high outputs unread (the node already runs its shallow
+///   levels over the one wide slot, so the emitters are width-generic by
+///   existing use).
 /// - `resid_pls` {12, 9, 6, 3, 0} = the m29 node ladder's suffix-fold
 ///   counts, chunk_log 3 throughout; the leaf's own {6, 3, 0} is a subset
 ///   and its two deep variants carry count 0.
@@ -155,7 +158,7 @@ struct EnvShape {
 fn envelope_shape() -> Option<EnvShape> {
     (envelope_floor_m() == Some(29)).then(|| EnvShape {
         nu: 15,
-        spread_w: 20,
+        spread_w: 19,
         resid_pls: [12, 9, 6, 3, 0],
         pf_w: 8,
     })
@@ -7355,19 +7358,44 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
                 .iter()
                 .map(|g| (g.lanes / 4 + g.depth) * g.q + (1usize << g.c) - 1)
                 .sum::<usize>();
-        let nu = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(3);
-        let spread_w = geo.iter().map(|g| g.depth).max().unwrap().max(1);
+        let nu_content = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(3);
+        let spread_own = geo.iter().map(|g| g.depth).max().unwrap().max(1);
+        // Under the envelope the leaf takes the ENVELOPE geometry — nu*,
+        // the node's spread width (its own trees are shallower; the high
+        // outputs go unread) and, below, the full canonical type set with
+        // the node-only types at count 0 — so its registry digest-equals
+        // the node's (wall 2).
+        let env = envelope_shape();
+        let (nu, spread_w) = match &env {
+            Some(e) => {
+                assert!(
+                    nu_content <= e.nu,
+                    "leaf content nu {nu_content} exceeds the envelope nu* {}",
+                    e.nu
+                );
+                assert!(
+                    spread_own <= e.spread_w,
+                    "leaf spread width {spread_own} exceeds the envelope's {}",
+                    e.spread_w
+                );
+                (e.nu, e.spread_w)
+            }
+            None => (nu_content, spread_own),
+        };
 
         let mut sb = ShapeBuilder::new(nu);
-        let slots = CollapsedSlots {
-            b3: sb.slot(Blake3Gate { nu }),
-            swap: sb.slot(SwapGate { nu }),
-            spread: sb.slot(BitSpreadGate {
-                ty: BitSpreadTable::new(spread_w),
-                nu,
-            }),
-        };
         let mut leaf_slot: Vec<(usize, flock_core::circuit::builder::SlotId)> = Vec::new();
+        let slots = match &env {
+            Some(e) => declare_envelope_slots(&mut sb, nu, &mut leaf_slot, e),
+            None => CollapsedSlots {
+                b3: sb.slot(Blake3Gate { nu }),
+                swap: sb.slot(SwapGate { nu }),
+                spread: sb.slot(BitSpreadGate {
+                    ty: BitSpreadTable::new(spread_w),
+                    nu,
+                }),
+            },
+        };
         let leafeval: Vec<_> = geo
             .iter()
             .map(|g| {
@@ -7481,8 +7509,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             }
         }
         let wv = |vi: usize| -> Wire { ww[vmap[vi].expect("stream word")].expect("wired") };
-        let mrslot = sb.slot(MergedRoundGate::new());
-        leaf_slot.push((400, mrslot));
+        let mrslot = slot_cached(&mut sb, &mut leaf_slot, 400, MergedRoundGate::new);
         vals.push(native_target);
         let tw = sb.public_input();
         let mut runw = tw;
@@ -7506,8 +7533,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         // cycles — the acyclicity check draws producer→consumer edges).
         vals.push(F128::ZERO);
         let zassert = sb.public_input();
-        let spine = sb.slot(SpineGate::new());
-        leaf_slot.push((0, spine));
+        let spine = slot_cached(&mut sb, &mut leaf_slot, 0, SpineGate::new);
         let gpw = outs[trace.squeezes[inner_pd2.fin][0]][0];
         let tw0 = sb.gate(spine, &[zw, zw, zw, zw, zw, zw, wv(inner_pd2.q_v), gpw, zw]);
         let mut tsp = tw0[3];
@@ -7715,8 +7741,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             let p = zpw[j - 1];
             zpw.push(sb.gate(spine, &[zw, zw, zw, zw, zw, zw, p, p, zw])[3]);
         }
-        let skslot = sb.slot(SkipNodeGate::new());
-        leaf_slot.push((510, skslot));
+        let skslot = slot_cached(&mut sb, &mut leaf_slot, 510, SkipNodeGate::new);
         let (mut ska, mut skc, mut skab) = (ow, zw, zw);
         for i in 0..64 {
             let lam_w = cw(
@@ -7731,14 +7756,12 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             );
             (ska, skc, skab) = (g[0], g[1], g[2]);
         }
-        let scslot = sb.slot(SkipCloseGate::new());
-        leaf_slot.push((511, scslot));
+        let scslot = slot_cached(&mut sb, &mut leaf_slot, 511, SkipCloseGate::new);
         let mut cin = vec![skc, skab];
         cin.extend_from_slice(&zpw);
         let cl = sb.gate(scslot, &cin);
         let (rc_w, seed_w) = (cl[0], cl[1]);
-        let zslot = sb.slot(ZcRoundGate::new());
-        leaf_slot.push((500, zslot));
+        let zslot = slot_cached(&mut sb, &mut leaf_slot, 500, ZcRoundGate::new);
         let mut zrw = seed_w;
         // The eq-weight wires, kept in round order: they are exactly the
         // zerocheck's r_rest — the c claim's point — which the anchor
@@ -8168,8 +8191,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             })
             .collect();
         // Per statement: run weights, the w dot, the DP, the coefficient.
-        let alslot = sb.slot(AssistLayerGate::new());
-        leaf_slot.push((601, alslot));
+        let alslot = slot_cached(&mut sb, &mut leaf_slot, 601, AssistLayerGate::new);
         let mut expect_w = zw;
         for (si, xs) in [&xab_pw, &xc_pw].iter().enumerate() {
             let z_row_w: Vec<Wire> = xs[1..1 + n_log_i].iter().map(|&(_, w)| w).collect();
@@ -12848,6 +12870,11 @@ struct ChildSlots {
     /// = the shared PrefixGate at that width (the eq/prefix-product rows —
     /// NOT a residual gate, it merely lives in this cache).
     resid: Vec<(usize, flock_core::circuit::builder::SlotId)>,
+    /// The leaf-only skip types the ENVELOPE cross-declares at count 0
+    /// (wall 2) — no node emission touches them, but the element prover
+    /// input assembly must still cover their registry slots. Empty
+    /// off-envelope.
+    skips: Vec<flock_core::circuit::builder::SlotId>,
 }
 
 impl ChildSlots {
@@ -12872,6 +12899,44 @@ impl ChildSlots {
             // emit_residual_region's close-out rows land on the same slot
             // instead of registering a duplicate type.
             resid: vec![(600, macs)],
+            skips: Vec::new(),
+        }
+    }
+
+    /// The ENVELOPE constructor (wall 2): the same canonical declaration
+    /// order [`declare_envelope_slots`] gives the leaf builder — including
+    /// the leaf-only SkipNode/SkipClose types this node never rows (count
+    /// 0) — so the node's registry digest-equals the leaf's. Every keyed
+    /// entry pre-seeds the demand caches; emission that would need a slot
+    /// OUTSIDE the envelope set creates a new type and fails the digest
+    /// pin loudly.
+    fn new_env(sb: &mut ShapeBuilder, nu2: usize, env: &EnvShape) -> Self {
+        let mut cache: Vec<(usize, flock_core::circuit::builder::SlotId)> = Vec::new();
+        let q = declare_envelope_slots(sb, nu2, &mut cache, env);
+        let take = |k: usize| {
+            cache
+                .iter()
+                .find(|&&(c, _)| c == k)
+                .expect("an envelope slot")
+                .1
+        };
+        ChildSlots {
+            q,
+            macs: take(600),
+            zcr: take(500),
+            mrs: take(400),
+            spine: take(0),
+            alslot: take(601),
+            le: vec![(8, take(8))],
+            // The residual-region cache inherits every entry in its key
+            // namespaces: the shared mac (600), the five resid variants
+            // (100 + pl) and the prefix slot (310 + w).
+            resid: cache
+                .iter()
+                .filter(|&&(k, _)| k == 600 || (100..200).contains(&k) || (310..400).contains(&k))
+                .cloned()
+                .collect(),
+            skips: vec![take(510), take(511)],
         }
     }
 
@@ -12881,6 +12946,7 @@ impl ChildSlots {
         v.extend(self.le.iter().map(|&(_, s)| s));
         // Key 600 is the SHARED MacGate seed (already listed as `macs`).
         v.extend(self.resid.iter().filter(|&&(k, _)| k != 600).map(|&(_, s)| s));
+        v.extend(self.skips.iter().copied());
         v
     }
 }
@@ -16583,13 +16649,44 @@ fn build_node_outer(
         // — the old doubling no longer reproduces, so a nu-14 squeeze buys
         // only ~5-7 ms and no proof bytes. The knob stays as the capacity-
         // sensitivity probe.
-        let nu2 = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7)
+        let nu2_content = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7)
             + std::env::var("TOWER_NU_BUMP")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(0);
+        // Under the envelope the node pins nu* and the canonical type set
+        // (wall 2); the TOWER_NU_BUMP capacity probe is an off-envelope
+        // knob — the pin wins.
+        let env = envelope_shape();
+        let nu2 = match &env {
+            Some(e) => {
+                assert!(
+                    nu2_content <= e.nu,
+                    "node content nu {nu2_content} exceeds the envelope nu* {}",
+                    e.nu
+                );
+                e.nu
+            }
+            None => nu2_content,
+        };
         let mut sb = ShapeBuilder::new(nu2);
-        let mut cs = ChildSlots::new(&mut sb, nu2, rt0.spread_w.max(rt1.spread_w));
+        // Under the envelope the DECLARED width is the envelope's (the max
+        // over child kinds at the fixed point); a shallower child ladder
+        // rides the wide slot with its high outputs unread, and one that
+        // exceeds it fails here. The witness tables below build at
+        // `spread_w2`, so it must be the DECLARED width.
+        let spread_own2 = rt0.spread_w.max(rt1.spread_w);
+        let (spread_w2, mut cs) = match &env {
+            Some(e) => {
+                assert!(
+                    spread_own2 <= e.spread_w,
+                    "child ladder depth {spread_own2} exceeds the envelope spread width {}",
+                    e.spread_w
+                );
+                (e.spread_w, ChildSlots::new_env(&mut sb, nu2, e))
+            }
+            None => (spread_own2, ChildSlots::new(&mut sb, nu2, spread_own2)),
+        };
         let mut vals: Vec<F128> = Vec::new();
         let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
         // The two child regions are independent gate subgraphs (each reads
@@ -17016,7 +17113,6 @@ fn build_node_outer(
         let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
         let swap_r1cs2 = SwapTable::build_block_r1cs(nu2);
         let swap_lc2 = swap_r1cs2.csc_lincheck_circuit();
-        let spread_w2 = rt0.spread_w.max(rt1.spread_w);
         let spread_r1cs2 = BitSpreadTable::new(spread_w2).build_block_r1cs(nu2);
         let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
         let build_ms = build_ms + t_r1cs.elapsed().as_secs_f64() * 1e3;
@@ -17612,5 +17708,150 @@ fn envelope_registry_diff() {
                 shape.counts[t],
             );
         }
+    }
+
+    // ---- WALL 2, the pin: under the envelope the two registries are ONE ----
+    if envelope_shape().is_some() {
+        assert_eq!(
+            lo.shape.registry.digest(),
+            n0.shape.registry.digest(),
+            "WALL 2: the leaf-outer and node registries digest-equal under the envelope"
+        );
+        println!("\nWALL 2 PIN: leaf and node registry digests are EQUAL");
+
+        // ---- the payoff: a LEAF-level accumulator is a valid PRIOR of a
+        // NODE-level fold. check_priors demands exactly the registry digest
+        // and both groups' widths, so wall 2 is what lets an accumulator
+        // cross levels. Sigma stays per-level here: wall 3 keys sigma by
+        // CIRCUIT digest and the leaf/node circuits still differ — the
+        // leaf-level fold carries the matrix + element groups only (the
+        // sigma-free shape the aggregate supports), and the node fold adds
+        // its own sigma fresh. The count-0 element types ride BOTH folds:
+        // the leaf's assertions cover its two count-0 deep resids, the
+        // node's cover its count-0 skips — this is the zero-count pin in
+        // the fold/assertion machinery.
+        use flock_core::aggregate;
+        const PRIOR_DOMAIN: &[u8] = b"flock-envelope-prior-probe-v0";
+        let registry = &lo.shape.registry;
+        let (rt0, rt1) = (RealTape::new(&lo, DOMAIN), RealTape::new(&l1, DOMAIN));
+        let u0 = outer_union(registry, lo.shape.counts.clone());
+        let u1 = outer_union(&l1.shape.registry, l1.shape.counts.clone());
+        let mut mats_ord = vec![
+            (lo.b3_slot, (&lo.b3_r1cs.a_0, &lo.b3_r1cs.b_0)),
+            (lo.swap_slot, (&lo.swap_r1cs.a_0, &lo.swap_r1cs.b_0)),
+            (lo.spread_slot, (&lo.spread_r1cs.a_0, &lo.spread_r1cs.b_0)),
+        ];
+        mats_ord.sort_by_key(|&(i, _)| i);
+        let mats: Vec<_> = mats_ord.iter().map(|&(_, m)| m).collect();
+        let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
+            (lo.b3_slot, lo.b3_r1cs.csc_lincheck_circuit()),
+            (lo.swap_slot, lo.swap_r1cs.csc_lincheck_circuit()),
+            (lo.spread_slot, lo.spread_r1cs.csc_lincheck_circuit()),
+        ];
+        lcs_ord.sort_by_key(|(i, _)| *i);
+        let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
+            lcs_ord.iter().map(|&(_, c)| c).collect();
+        let el_types: Vec<_> = registry
+            .element_types()
+            .iter()
+            .map(|s| s.element_type().expect("an element slot's table"))
+            .collect();
+        let el_mats: Vec<_> = el_types.iter().map(|t| (t.a_0(), t.b_0())).collect();
+
+        // The leaf-level fold: both leaves' assertions, no sigma, no priors.
+        let bool_asserts = [rt0.mat_assert.clone(), rt1.mat_assert.clone()];
+        let el_asserts = [(&u0, rt0.el_assert.clone()), (&u1, rt1.el_assert.clone())];
+        let mut chp = FsChallenger::with_chained_blake3(PRIOR_DOMAIN);
+        let (agg_l, acc_leaf) = aggregate::prove_aggregate_classes(
+            registry,
+            &mats,
+            &lcs,
+            &bool_asserts,
+            &el_mats,
+            &el_asserts,
+            None,
+            &[],
+            &mut chp,
+        )
+        .expect("the leaf-level fold proves");
+        let mut chv = FsChallenger::with_chained_blake3(PRIOR_DOMAIN);
+        let acc_leaf_v = aggregate::verify_aggregate_classes(
+            registry,
+            &bool_asserts,
+            &el_asserts,
+            None,
+            &[],
+            &agg_l,
+            &mut chv,
+        )
+        .expect("the leaf-level fold verifies");
+        assert_eq!(acc_leaf, acc_leaf_v, "leaf fold accumulators agree");
+
+        // The node-level fold: n0's own assertions + the leaf accumulator
+        // as a PRIOR — accepted precisely because the registries digest-
+        // equal, then folded and discharged against ONE set of matrices.
+        let rtn = RealTape::new(&n0, DOMAIN);
+        let un = outer_union(&n0.shape.registry, n0.shape.counts.clone());
+        let n_bool = [rtn.mat_assert.clone()];
+        let n_el = [(&un, rtn.el_assert.clone())];
+        let n_sigmas = [rtn.sigma_native.clone()];
+        let mut chp2 = FsChallenger::with_chained_blake3(PRIOR_DOMAIN);
+        let (agg_n, acc_node) = aggregate::prove_aggregate_classes(
+            registry,
+            &mats,
+            &lcs,
+            &n_bool,
+            &el_mats,
+            &n_el,
+            Some((&n0.shape.circuit, &n_sigmas)),
+            &[&acc_leaf],
+            &mut chp2,
+        )
+        .expect("a leaf accumulator is a valid node-fold prior (wall 2)");
+        let mut chv2 = FsChallenger::with_chained_blake3(PRIOR_DOMAIN);
+        let acc_node_v = aggregate::verify_aggregate_classes(
+            registry,
+            &n_bool,
+            &n_el,
+            Some((&n0.shape.circuit, &n_sigmas)),
+            &[&acc_leaf],
+            &agg_n,
+            &mut chv2,
+        )
+        .expect("the cross-level fold verifies");
+        assert_eq!(acc_node, acc_node_v, "cross-level accumulators agree");
+        assert!(acc_node.discharge(&mats), "cross-level boolean discharge");
+        assert!(
+            acc_node.discharge_element(&el_mats),
+            "cross-level element discharge"
+        );
+        assert!(
+            acc_node.discharge_sigma(&n0.shape.circuit),
+            "the node's own sigma discharges"
+        );
+        // Negative control: a tampered prior digest is rejected by
+        // check_priors before any fold work runs.
+        let mut bad = acc_leaf.clone();
+        bad.registry_digest[0] ^= 1;
+        let mut chb = FsChallenger::with_chained_blake3(PRIOR_DOMAIN);
+        assert!(
+            aggregate::prove_aggregate_classes(
+                registry,
+                &mats,
+                &lcs,
+                &n_bool,
+                &el_mats,
+                &n_el,
+                Some((&n0.shape.circuit, &n_sigmas)),
+                &[&bad],
+                &mut chb,
+            )
+            .is_err(),
+            "a mismatched prior registry digest is rejected"
+        );
+        println!(
+            "WALL 2 PRIOR: a leaf accumulator crossed into a node fold, \
+             folded with fresh node claims and discharged; tampered digest rejected"
+        );
     }
 }
