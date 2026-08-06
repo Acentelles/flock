@@ -1132,6 +1132,35 @@ impl CircuitShape {
         inputs: &[F128],
         hints: &[&(dyn Any + Sync)],
     ) -> CircuitWitness {
+        let mut w = self.run_filled_deferred(plan, inputs, hints);
+        let t_pack = std::time::Instant::now();
+        self.pack_witnesses(&mut w);
+        if std::env::var("FILL_TRACE").is_ok() {
+            eprintln!(
+                "  [run_filled] pack_witnesses {:.2} ms",
+                t_pack.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        w
+    }
+
+    /// [`run_filled`](Self::run_filled) without the witness packing: every
+    /// slot's entry is left [`SlotWitness::DeferredToRows`] and only the
+    /// rows and publics are produced.
+    ///
+    /// This is the fast path for a caller that feeds the prover in place
+    /// from the typed rows ([`CircuitWitness::take_rows_of`]): a packed
+    /// element witness is a full-capacity column-major buffer whose live
+    /// cells are copied again immediately after, so materializing it is
+    /// pure overhead there. Call [`pack_witnesses`](Self::pack_witnesses)
+    /// to get the eager result later; the two paths are value-identical by
+    /// construction (packing is a pure function of the rows).
+    pub fn run_filled_deferred(
+        &self,
+        plan: &FillPlan,
+        inputs: &[F128],
+        hints: &[&(dyn Any + Sync)],
+    ) -> CircuitWitness {
         assert_eq!(
             (plan.n_steps, plan.n_wires),
             (self.steps.len(), self.n_wires),
@@ -1276,25 +1305,32 @@ impl CircuitShape {
             }
         }
 
-        let t_wit = std::time::Instant::now();
         let public: Vec<F128> = self.publics.iter().map(|&r| values[r]).collect();
-        let witnesses: Vec<SlotWitness> = self
-            .order
-            .iter()
-            .map(|&d| self.slots[d].witness(rows[d].as_ref(), self.nu))
-            .collect();
         if std::env::var("FILL_TRACE").is_ok() {
             eprintln!(
-                "  [run_filled] batches+islands {:.2} ms | publics+witness {:.2} ms",
-                t_wit.duration_since(t_run).as_secs_f64() * 1e3,
-                t_wit.elapsed().as_secs_f64() * 1e3,
+                "  [run_filled] batches+islands+publics {:.2} ms",
+                t_run.elapsed().as_secs_f64() * 1e3,
             );
         }
         CircuitWitness {
             public,
-            witnesses,
+            witnesses: vec![SlotWitness::DeferredToRows; self.order.len()],
             rows,
             slot_types: self.slot_types.clone(),
+        }
+    }
+
+    /// Pack every slot's committed witness from its rows, in registry order —
+    /// the eager half [`run_filled_deferred`](Self::run_filled_deferred)
+    /// skips. Idempotent; a pure function of the rows.
+    pub fn pack_witnesses(&self, w: &mut CircuitWitness) {
+        assert_eq!(
+            w.witnesses.len(),
+            self.order.len(),
+            "witness produced by a different shape"
+        );
+        for (reg, &d) in self.order.iter().enumerate() {
+            w.witnesses[reg] = self.slots[d].witness(w.rows[d].as_ref(), self.nu);
         }
     }
 
@@ -1420,6 +1456,21 @@ impl CircuitWitness {
         self.rows[s.0]
             .downcast_ref::<Vec<G::Row>>()
             .expect("slot type matched but its rows did not")
+    }
+
+    /// MOVE a slot's rows out, keyed by their ROW type rather than the gate
+    /// type — the element-assembly escape for feeding the prover in place
+    /// (with [`CircuitShape::run_filled_deferred`]) without the packed
+    /// intermediate. Every element gate in a harness shares one row shape,
+    /// and the assembly loops over its element slots generically, so a
+    /// gate-typed accessor cannot serve it. A wrong `R` still fails loudly
+    /// on the downcast.
+    pub fn take_rows_of<R: Send + 'static>(&mut self, s: SlotId) -> Vec<R> {
+        std::mem::take(
+            self.rows[s.0]
+                .downcast_mut::<Vec<R>>()
+                .expect("slot rows are not of this row type"),
+        )
     }
 }
 
@@ -1804,6 +1855,27 @@ mod tests {
             "hinted mult rows"
         );
         assert_eq!(walk.public.last(), Some(&acc_v), "the chain closed");
+
+        // The deferred path: rows and publics only, packing after the fact
+        // — value-identical to the eager run — and `take_rows_of` moves a
+        // slot's rows out by ROW type.
+        let mut deferred = shape.run_filled_deferred(&plan, &vals, &hint_refs);
+        assert!(
+            deferred
+                .witnesses
+                .iter()
+                .all(|w| *w == SlotWitness::DeferredToRows),
+            "deferred run packs nothing"
+        );
+        assert_eq!(deferred.public, walk.public, "deferred publics");
+        shape.pack_witnesses(&mut deferred);
+        assert_eq!(deferred.witnesses, walk.witnesses, "packed after the fact");
+        let taken = deferred.take_rows_of::<(F128, F128, F128)>(mult);
+        assert_eq!(
+            taken.as_slice(),
+            walk.rows::<MultGate>(mult),
+            "taken rows are the slot's rows"
+        );
     }
 
     /// Islands under the plan: two parallel mult chains off a shared prefix
