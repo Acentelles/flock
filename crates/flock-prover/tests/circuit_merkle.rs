@@ -17398,3 +17398,35 @@ fn mvp12_recursion_tower() {
         converged,
     );
 }
+
+/// RECONNAISSANCE for the envelope's registry convergence (wall 2): the
+/// leaf outer's registry vs the node's, type by type — the exact diff the
+/// shared envelope registry must union. Informational; run with
+/// `-- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn envelope_registry_diff() {
+    let lo = build_leaf_outer_seeded(0x4D50_9B00);
+    let l1 = build_leaf_outer_seeded(0x4D50_9B01);
+    let (n0, _acc, _) = build_node_outer(&lo, &l1);
+    for (name, shape) in [("LEAF OUTER", &lo.shape), ("NODE", &n0.shape)] {
+        println!(
+            "\n{name}: nu {} | m_total {} | dense_m {} | mu {} | {} types",
+            shape.registry.nu(),
+            shape.registry.m_total(),
+            UnionInstance::new(&shape.registry, shape.counts.clone()).dense_m(),
+            shape.circuit.cells().mu(),
+            shape.registry.types().len(),
+        );
+        for (t, ty) in shape.registry.types().iter().enumerate() {
+            println!(
+                "  t{t:2} | {} | k_log {:2} | useful_bits {:6} | io {:3} | count {:6}",
+                if ty.is_element() { "el  " } else { "bool" },
+                ty.k_log,
+                ty.useful_bits,
+                ty.io_schema.len(),
+                shape.counts[t],
+            );
+        }
+    }
+}
