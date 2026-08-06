@@ -300,7 +300,8 @@ struct Step {
 const FILL_CHECK: u32 = 1 << 31;
 
 /// A maximal run of consecutive same-slot, same-hintedness steps — one
-/// monomorphic [`SlotBuild::run_batch`] call.
+/// monomorphic [`SlotBuild::run_batch`] call. Batches never straddle an
+/// island boundary.
 struct FillBatch {
     slot: u32,
     n: u32,
@@ -309,6 +310,25 @@ struct FillBatch {
     /// Hinted steps before this batch: the ordinal of the batch's first hint.
     hint_base: u32,
     hinted: bool,
+}
+
+/// One declared island, compiled for parallel execution on a COMPACT tape of
+/// its own: every root the island touches gets a local index, its batches'
+/// `in_idx`/`out_idx` entries are rewritten to those, and the global tape is
+/// only touched by the gather before and the scatter after. This replaces the
+/// walk's full value-state clone and full-width merge scan with copies
+/// proportional to what the island actually reads and writes — and the
+/// independence contract moves to compile time: an island reading (or
+/// checking against) a wire another island writes fails `fill_plan`, not the
+/// proof.
+struct FillIsland {
+    /// This island's batches: `batches[range.0..range.1]`.
+    batches: (u32, u32),
+    /// Pre-island values copied onto the local tape: `(local, global)`.
+    gather: Vec<(u32, u32)>,
+    /// The island's writes, copied back after: `(local, global)`.
+    scatter: Vec<(u32, u32)>,
+    tape_len: u32,
 }
 
 /// **The index-fill runner's program**: one shape's wire traffic, resolved to
@@ -332,6 +352,7 @@ struct FillBatch {
 pub struct FillPlan {
     batches: Vec<FillBatch>,
     /// Concatenated input-cell tape indices, `n_in` per gate, batch-major.
+    /// Island batches address their island's LOCAL tape.
     in_idx: Vec<u32>,
     /// Concatenated output tape indices, `n_out` per gate; see [`FILL_CHECK`].
     out_idx: Vec<u32>,
@@ -340,6 +361,9 @@ pub struct FillPlan {
     /// Later supplies of an already-filled class — the walk's "connected
     /// inputs" equality, precomputed to just the duplicated pairs.
     input_checks: Vec<(u32, u32)>,
+    /// Compiled islands, run in parallel like the walk's. Empty when fewer
+    /// than two were declared (the walk runs those sequentially too).
+    islands: Vec<FillIsland>,
     /// Fingerprint of the shape this plan was compiled from.
     n_steps: usize,
     n_wires: usize,
@@ -896,35 +920,70 @@ impl CircuitShape {
     /// Compile the shape's [`FillPlan`].
     ///
     /// Setup work, once per shape. Walks the steps in instantiation order —
-    /// the order [`run`](Self::run) evaluates them (its island mode is
-    /// asserted equivalent to this order, so the plan needs no island
-    /// machinery to be row-identical) — resolving every read and write to a
-    /// tape index and proving definedness as it goes.
+    /// the order [`run`](Self::run)'s island mode is asserted equivalent to —
+    /// resolving every read and write to a tape index and proving definedness
+    /// as it goes; then compiles each declared island onto a compact local
+    /// tape of its own so [`run_filled`](Self::run_filled) can execute them
+    /// in parallel without cloning the value state.
     pub fn fill_plan(&self) -> FillPlan {
         assert!(
             self.n_wires < FILL_CHECK as usize,
             "the fill plan packs its check flag into bit 31 of a wire index"
         );
-        let mut defined = vec![false; self.n_wires];
+        // Definition order per class: inputs precede every step.
+        const UNDEF: u32 = u32::MAX;
+        const DEF_INPUT: u32 = u32::MAX - 1;
+        assert!(self.steps.len() < DEF_INPUT as usize);
+        let mut def_at = vec![UNDEF; self.n_wires];
         let mut input_fills = Vec::new();
         let mut input_checks = Vec::new();
         for (ord, &root) in self.inputs.iter().enumerate() {
-            if defined[root] {
-                input_checks.push((root as u32, ord as u32));
-            } else {
-                defined[root] = true;
+            if def_at[root] == UNDEF {
+                def_at[root] = DEF_INPUT;
                 input_fills.push((root as u32, ord as u32));
+            } else {
+                input_checks.push((root as u32, ord as u32));
             }
         }
 
+        // Islands compile to parallel execution exactly when the walk would
+        // parallelize them, under the same contiguity contract.
+        let par_islands = self.islands.len() >= 2;
+        if par_islands {
+            for w in self.islands.windows(2) {
+                assert_eq!(
+                    w[0].1, w[1].0,
+                    "islands must be contiguous (steps between islands have \
+                     no defined order against the parallel evaluation)"
+                );
+            }
+        }
+        // Step ordinals where a batch must break, descending so `pop`
+        // consumes them in step order. Contiguity makes starts + final end
+        // the complete boundary set.
+        let mut boundaries: Vec<usize> = if par_islands {
+            let mut b: Vec<usize> = self.islands.iter().map(|&(a, _)| a).collect();
+            b.push(self.islands.last().expect("nonempty").1);
+            b.reverse();
+            b
+        } else {
+            Vec::new()
+        };
+
         let mut batches: Vec<FillBatch> = Vec::new();
+        let mut batch_step0: Vec<usize> = Vec::new();
         let mut in_idx = Vec::new();
         let mut out_idx = Vec::new();
         let mut n_hinted = 0usize;
-        for step in &self.steps {
-            let coalesce = batches
-                .last()
-                .is_some_and(|b| b.slot as usize == step.slot && b.hinted == step.hinted);
+        for (s, step) in self.steps.iter().enumerate() {
+            let boundary = boundaries.last() == Some(&s);
+            if boundary {
+                boundaries.pop();
+            }
+            let coalesce = !boundary
+                && batches
+                    .last()
+                    .is_some_and(|b| b.slot as usize == step.slot && b.hinted == step.hinted);
             if !coalesce {
                 batches.push(FillBatch {
                     slot: step.slot as u32,
@@ -934,6 +993,7 @@ impl CircuitShape {
                     hint_base: n_hinted as u32,
                     hinted: step.hinted,
                 });
+                batch_step0.push(s);
             }
             batches.last_mut().expect("just pushed").n += 1;
             if step.hinted {
@@ -941,30 +1001,122 @@ impl CircuitShape {
             }
             for &r in &step.inputs {
                 assert!(
-                    defined[r],
+                    def_at[r] != UNDEF,
                     "gate input has no value yet: a gate was instantiated before \
                      the gate producing one of its inputs"
                 );
                 in_idx.push(r as u32);
             }
             for &r in &step.outputs {
-                if defined[r] {
-                    out_idx.push(r as u32 | FILL_CHECK);
-                } else {
-                    defined[r] = true;
+                if def_at[r] == UNDEF {
+                    def_at[r] = s as u32;
                     out_idx.push(r as u32);
+                } else {
+                    out_idx.push(r as u32 | FILL_CHECK);
                 }
             }
         }
         for &r in &self.publics {
-            assert!(defined[r], "a published wire was never given a value");
+            assert!(def_at[r] != UNDEF, "a published wire was never given a value");
         }
+
+        // Compile each island onto its own compact tape: intern every root
+        // the island touches in first-touch order, rewriting its batches'
+        // indices in place. A root defined before the islands is a GATHER; a
+        // root this island defines is a SCATTER; anything else is another
+        // island's value, and reading or checking against it is the
+        // independence violation the walk catches at run time — here it
+        // fails compilation.
+        let mut islands: Vec<FillIsland> = Vec::new();
+        if par_islands {
+            let first_start = self.islands[0].0;
+            let batch_at = |step: usize| batch_step0.partition_point(|&s0| s0 < step);
+            let mut local_of = vec![UNDEF; self.n_wires];
+            for &(a, b) in &self.islands {
+                let (ba, bb) = (batch_at(a), batch_at(b));
+                let mut touched: Vec<usize> = Vec::new();
+                let mut gather: Vec<(u32, u32)> = Vec::new();
+                let mut scatter: Vec<(u32, u32)> = Vec::new();
+                let mut tape_len = 0u32;
+                let intern_read =
+                    |r: usize,
+                     local_of: &mut Vec<u32>,
+                     touched: &mut Vec<usize>,
+                     gather: &mut Vec<(u32, u32)>,
+                     tape_len: &mut u32| {
+                        if local_of[r] != UNDEF {
+                            return local_of[r];
+                        }
+                        assert!(
+                            def_at[r] == DEF_INPUT || (def_at[r] as usize) < first_start,
+                            "an island reads a wire another island writes"
+                        );
+                        let l = *tape_len;
+                        *tape_len += 1;
+                        local_of[r] = l;
+                        touched.push(r);
+                        gather.push((l, r as u32));
+                        l
+                    };
+                for bi in ba..bb {
+                    let bt = &batches[bi];
+                    let slot = bt.slot as usize;
+                    let (n_in, n_out) = (self.slots[slot].n_in(), self.slots[slot].n_out());
+                    for g in 0..bt.n as usize {
+                        let i0 = bt.in_off as usize + g * n_in;
+                        for e in &mut in_idx[i0..i0 + n_in] {
+                            *e = intern_read(
+                                *e as usize,
+                                &mut local_of,
+                                &mut touched,
+                                &mut gather,
+                                &mut tape_len,
+                            );
+                        }
+                        let o0 = bt.out_off as usize + g * n_out;
+                        for e in &mut out_idx[o0..o0 + n_out] {
+                            let check = *e & FILL_CHECK != 0;
+                            let r = (*e & !FILL_CHECK) as usize;
+                            let l = if check {
+                                intern_read(
+                                    r,
+                                    &mut local_of,
+                                    &mut touched,
+                                    &mut gather,
+                                    &mut tape_len,
+                                )
+                            } else {
+                                debug_assert_eq!(local_of[r], UNDEF, "a write is a first def");
+                                let l = tape_len;
+                                tape_len += 1;
+                                local_of[r] = l;
+                                touched.push(r);
+                                scatter.push((l, r as u32));
+                                l
+                            };
+                            *e = if check { l | FILL_CHECK } else { l };
+                        }
+                    }
+                }
+                for r in touched {
+                    local_of[r] = UNDEF;
+                }
+                islands.push(FillIsland {
+                    batches: (ba as u32, bb as u32),
+                    gather,
+                    scatter,
+                    tape_len,
+                });
+            }
+        }
+
         FillPlan {
             batches,
             in_idx,
             out_idx,
             input_fills,
             input_checks,
+            islands,
             n_steps: self.steps.len(),
             n_wires: self.n_wires,
         }
@@ -1000,6 +1152,7 @@ impl CircuitShape {
             hints.len()
         );
 
+        let t_run = std::time::Instant::now();
         let mut values = vec![F128::ZERO; self.n_wires];
         for &(r, ord) in &plan.input_fills {
             values[r as usize] = inputs[ord as usize];
@@ -1014,36 +1167,167 @@ impl CircuitShape {
         let mut rows: Vec<Box<dyn Any + Send>> = self.slots.iter().map(|s| s.new_rows()).collect();
         let mut scratch_in: Vec<F128> = Vec::with_capacity(16);
         let mut scratch_out: Vec<F128> = Vec::with_capacity(16);
-        for b in &plan.batches {
-            let slot = b.slot as usize;
-            let s = &self.slots[slot];
-            let n = b.n as usize;
-            let (i0, o0) = (b.in_off as usize, b.out_off as usize);
-            s.run_batch(
-                rows[slot].as_mut(),
+        if plan.islands.is_empty() {
+            self.exec_batches(
+                plan,
+                0..plan.batches.len(),
                 &mut values,
-                n,
-                &plan.in_idx[i0..i0 + n * s.n_in()],
-                &plan.out_idx[o0..o0 + n * s.n_out()],
+                &mut rows,
                 hints,
-                b.hint_base as usize,
-                b.hinted,
                 &mut scratch_in,
                 &mut scratch_out,
             );
+        } else {
+            // The islands run in parallel, each on its compact local tape:
+            // gather in, evaluate, scatter back — no value-state clones, no
+            // full-width merges; disjointness was proven at compile time.
+            use rayon::prelude::*;
+            let pre = plan.islands[0].batches.0 as usize;
+            let suf = plan.islands.last().expect("nonempty").batches.1 as usize;
+            self.exec_batches(
+                plan,
+                0..pre,
+                &mut values,
+                &mut rows,
+                hints,
+                &mut scratch_in,
+                &mut scratch_out,
+            );
+            let t_isl = std::time::Instant::now();
+            let results: Vec<(Vec<F128>, Vec<Box<dyn Any + Send>>)> = plan
+                .islands
+                .par_iter()
+                .map(|isl| {
+                    let mut local = vec![F128::ZERO; isl.tape_len as usize];
+                    for &(l, g) in &isl.gather {
+                        local[l as usize] = values[g as usize];
+                    }
+                    let mut irows: Vec<Box<dyn Any + Send>> =
+                        self.slots.iter().map(|s| s.new_rows()).collect();
+                    let mut si: Vec<F128> = Vec::with_capacity(16);
+                    let mut so: Vec<F128> = Vec::with_capacity(16);
+                    if std::env::var("FILL_CENSUS").is_ok() {
+                        // Per-slot time attribution inside this island,
+                        // batch-serial so the numbers are exact. DECLARED
+                        // slot indices — map them with the harness's own
+                        // census (e.g. NODE_CENSUS). This is what caught the
+                        // residual gates' per-row constant inversions.
+                        let mut per_slot = vec![(0f64, 0usize); self.slots.len()];
+                        for bi in isl.batches.0 as usize..isl.batches.1 as usize {
+                            let t = std::time::Instant::now();
+                            self.exec_batches(
+                                plan, bi..bi + 1, &mut local, &mut irows, hints, &mut si,
+                                &mut so,
+                            );
+                            let b = &plan.batches[bi];
+                            per_slot[b.slot as usize].0 += t.elapsed().as_secs_f64() * 1e3;
+                            per_slot[b.slot as usize].1 += b.n as usize;
+                        }
+                        let mut v: Vec<(usize, f64, usize)> = per_slot
+                            .iter()
+                            .enumerate()
+                            .map(|(s, &(ms, n))| (s, ms, n))
+                            .collect();
+                        v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                        for (s, ms, n) in v.iter().take(12) {
+                            eprintln!("    [census] declared slot {s:3}: {ms:7.2} ms over {n:6} rows");
+                        }
+                    } else {
+                        self.exec_batches(
+                            plan,
+                            isl.batches.0 as usize..isl.batches.1 as usize,
+                            &mut local,
+                            &mut irows,
+                            hints,
+                            &mut si,
+                            &mut so,
+                        );
+                    }
+                    (local, irows)
+                })
+                .collect();
+            let t_merge = std::time::Instant::now();
+            for (isl, (local, irows)) in plan.islands.iter().zip(results) {
+                for &(l, g) in &isl.scatter {
+                    values[g as usize] = local[l as usize];
+                }
+                for (d, src) in irows.into_iter().enumerate() {
+                    self.slots[d].merge_rows(rows[d].as_mut(), src);
+                }
+            }
+            let t_suf = std::time::Instant::now();
+            self.exec_batches(
+                plan,
+                suf..plan.batches.len(),
+                &mut values,
+                &mut rows,
+                hints,
+                &mut scratch_in,
+                &mut scratch_out,
+            );
+            if std::env::var("FILL_TRACE").is_ok() {
+                eprintln!(
+                    "  [run_filled] prefix {:.2} | islands {:.2} | merge {:.2} | suffix {:.2} ms",
+                    t_isl.duration_since(t_run).as_secs_f64() * 1e3,
+                    t_merge.duration_since(t_isl).as_secs_f64() * 1e3,
+                    t_suf.duration_since(t_merge).as_secs_f64() * 1e3,
+                    t_suf.elapsed().as_secs_f64() * 1e3,
+                );
+            }
         }
 
+        let t_wit = std::time::Instant::now();
         let public: Vec<F128> = self.publics.iter().map(|&r| values[r]).collect();
         let witnesses: Vec<SlotWitness> = self
             .order
             .iter()
             .map(|&d| self.slots[d].witness(rows[d].as_ref(), self.nu))
             .collect();
+        if std::env::var("FILL_TRACE").is_ok() {
+            eprintln!(
+                "  [run_filled] batches+islands {:.2} ms | publics+witness {:.2} ms",
+                t_wit.duration_since(t_run).as_secs_f64() * 1e3,
+                t_wit.elapsed().as_secs_f64() * 1e3,
+            );
+        }
         CircuitWitness {
             public,
             witnesses,
             rows,
             slot_types: self.slot_types.clone(),
+        }
+    }
+
+    /// Run the plan's batches in `range` against one value tape — global for
+    /// the prefix/suffix, an island's local tape inside one.
+    #[allow(clippy::too_many_arguments)]
+    fn exec_batches(
+        &self,
+        plan: &FillPlan,
+        range: core::ops::Range<usize>,
+        values: &mut [F128],
+        rows: &mut [Box<dyn Any + Send>],
+        hints: &[&(dyn Any + Sync)],
+        scratch_in: &mut Vec<F128>,
+        scratch_out: &mut Vec<F128>,
+    ) {
+        for b in &plan.batches[range] {
+            let slot = b.slot as usize;
+            let s = &self.slots[slot];
+            let n = b.n as usize;
+            let (i0, o0) = (b.in_off as usize, b.out_off as usize);
+            s.run_batch(
+                rows[slot].as_mut(),
+                values,
+                n,
+                &plan.in_idx[i0..i0 + n * s.n_in()],
+                &plan.out_idx[o0..o0 + n * s.n_out()],
+                hints,
+                b.hint_base as usize,
+                b.hinted,
+                scratch_in,
+                scratch_out,
+            );
         }
     }
 
@@ -1520,5 +1804,102 @@ mod tests {
             "hinted mult rows"
         );
         assert_eq!(walk.public.last(), Some(&acc_v), "the chain closed");
+    }
+
+    /// Islands under the plan: two parallel mult chains off a shared prefix
+    /// product, a forward-referenced check INSIDE an island (gathered, then
+    /// asserted), and a suffix joining both islands' ends — identical to the
+    /// walk's parallel island mode, without its value-state clones.
+    #[test]
+    fn fill_plan_matches_the_walk_across_islands() {
+        let (nu, kappa, n) = (6usize, 3usize, 8usize);
+        let mut state = 0x15_1A_4D_5EEDu64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let hi = state;
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            F128::new(hi, state)
+        };
+        let (a_v, b_v) = (next(), next());
+        let xs: Vec<F128> = (0..2 * n).map(|_| next()).collect();
+
+        let mut b = ShapeBuilder::new(nu);
+        let mult = b.slot(MultGate::new(kappa));
+        let mut vals: Vec<F128> = Vec::new();
+        let mut chains: Vec<F128> = Vec::new();
+
+        vals.push(a_v);
+        let a = b.public_input();
+        vals.push(b_v);
+        let bw = b.public_input();
+        let p = b.gate(mult, &[a, bw])[0];
+        let p_v = a_v * b_v;
+
+        let mut accs = Vec::new();
+        for isl in 0..2 {
+            let start = b.begin_island();
+            let mut acc = p;
+            let mut acc_v = p_v;
+            for &x in &xs[isl * n..(isl + 1) * n] {
+                vals.push(x);
+                let xw = b.public_input();
+                acc = b.gate(mult, &[xw, acc])[0];
+                acc_v = x * acc_v;
+            }
+            b.end_island(start);
+            accs.push(acc);
+            chains.push(acc_v);
+        }
+        // The in-island forward reference: island 1's end is ALSO supplied
+        // as an input (a pre-island value), so its producing gate's output
+        // is a check against a gathered cell.
+        vals.push(chains[1]);
+        let fwd = b.input();
+        b.connect(accs[1], fwd);
+        let joined = b.gate(mult, &[accs[0], accs[1]])[0];
+        b.publish(joined);
+
+        let shape = b.finish().expect("the island shape builds");
+        let plan = shape.fill_plan();
+        let walk = shape.run(&vals, &[]);
+        let fill = shape.run_filled(&plan, &vals, &[]);
+
+        assert_eq!(walk.public, fill.public, "public segment");
+        assert_eq!(walk.witnesses, fill.witnesses, "slot witnesses");
+        assert_eq!(
+            walk.rows::<MultGate>(mult),
+            fill.rows::<MultGate>(mult),
+            "mult rows in prefix + island + suffix order"
+        );
+        assert_eq!(
+            walk.public.last(),
+            Some(&(chains[0] * chains[1])),
+            "the join closed"
+        );
+    }
+
+    /// The independence contract moves to compile time: an island consuming
+    /// another island's output fails `fill_plan`, where the walk would only
+    /// fail once run.
+    #[test]
+    #[should_panic(expected = "an island reads a wire another island writes")]
+    fn fill_plan_rejects_a_cross_island_read() {
+        let (nu, kappa) = (6usize, 3usize);
+        let mut b = ShapeBuilder::new(nu);
+        let mult = b.slot(MultGate::new(kappa));
+        let a = b.public_input();
+        let s0 = b.begin_island();
+        let x = b.gate(mult, &[a, a])[0];
+        b.end_island(s0);
+        let s1 = b.begin_island();
+        let y = b.gate(mult, &[x, a])[0];
+        b.end_island(s1);
+        b.publish(y);
+        let shape = b.finish().expect("the shape builds");
+        let _ = shape.fill_plan();
     }
 }
