@@ -140,6 +140,26 @@ trait SlotBuild: Any + Send + Sync {
     fn new_rows(&self) -> Box<dyn Any + Send>;
     /// Evaluate one gate, appending its row; outputs land on the scratch.
     fn push(&self, rows: &mut dyn Any, inputs: &[F128], hint: &dyn Any, outputs: &mut Vec<F128>);
+    /// Evaluate `n` gates of this slot against the value tape in one
+    /// monomorphic loop — the [`FillPlan`] runner. `in_idx`/`out_idx` are the
+    /// gates' pre-resolved tape indices (`n_in`/`n_out` per gate, gate-major);
+    /// an output index with [`FILL_CHECK`] set addresses a class that already
+    /// has a value, and is asserted against instead of written. Hinted slots
+    /// consume `hints[hint_base..hint_base + n]`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_batch(
+        &self,
+        rows: &mut dyn Any,
+        values: &mut [F128],
+        n: usize,
+        in_idx: &[u32],
+        out_idx: &[u32],
+        hints: &[&(dyn Any + Sync)],
+        hint_base: usize,
+        hinted: bool,
+        scratch_in: &mut Vec<F128>,
+        scratch_out: &mut Vec<F128>,
+    );
     fn witness(&self, rows: &dyn Any, nu: usize) -> SlotWitness;
     /// Append `src`'s rows (an island accumulator) onto `dst`, preserving
     /// instantiation order.
@@ -193,6 +213,59 @@ where
         );
         rows.push(row);
     }
+    fn run_batch(
+        &self,
+        rows: &mut dyn Any,
+        values: &mut [F128],
+        n: usize,
+        in_idx: &[u32],
+        out_idx: &[u32],
+        hints: &[&(dyn Any + Sync)],
+        hint_base: usize,
+        hinted: bool,
+        scratch_in: &mut Vec<F128>,
+        scratch_out: &mut Vec<F128>,
+    ) {
+        let rows = rows
+            .downcast_mut::<Vec<G::Row>>()
+            .expect("row store belongs to another slot");
+        let unit = ();
+        for g in 0..n {
+            scratch_in.clear();
+            for &i in &in_idx[g * self.n_in..(g + 1) * self.n_in] {
+                scratch_in.push(values[i as usize]);
+            }
+            let hint_any: &dyn Any = if hinted { hints[hint_base + g] } else { &unit };
+            let hint = hint_any.downcast_ref::<G::Hint>().unwrap_or_else(|| {
+                panic!(
+                    "gate expects a hint of type {}; use gate_hinted and supply one",
+                    std::any::type_name::<G::Hint>()
+                )
+            });
+            scratch_out.clear();
+            let row = self.gate.eval(scratch_in, hint, scratch_out);
+            assert_eq!(
+                scratch_out.len(),
+                self.n_out,
+                "gate returned {} outputs, schema declares {}",
+                scratch_out.len(),
+                self.n_out
+            );
+            for (k, &v) in scratch_out.iter().enumerate() {
+                let oi = out_idx[g * self.n_out + k];
+                let r = (oi & !FILL_CHECK) as usize;
+                if oi & FILL_CHECK != 0 {
+                    assert_eq!(
+                        values[r], v,
+                        "a connected wire disagrees with the gate output that produces it"
+                    );
+                } else {
+                    values[r] = v;
+                }
+            }
+            rows.push(row);
+        }
+    }
     fn witness(&self, rows: &dyn Any, nu: usize) -> SlotWitness {
         self.gate.witness(
             rows.downcast_ref::<Vec<G::Row>>()
@@ -218,6 +291,58 @@ struct Step {
     inputs: Vec<usize>,
     outputs: Vec<usize>,
     hinted: bool,
+}
+
+/// Marks a [`FillPlan`] output index whose class already holds a value at
+/// that point in the program (the Fiat–Shamir forward reference, or a
+/// [`ShapeBuilder::connect`] between two producers): the runner asserts
+/// equality instead of writing.
+const FILL_CHECK: u32 = 1 << 31;
+
+/// A maximal run of consecutive same-slot, same-hintedness steps — one
+/// monomorphic [`SlotBuild::run_batch`] call.
+struct FillBatch {
+    slot: u32,
+    n: u32,
+    in_off: u32,
+    out_off: u32,
+    /// Hinted steps before this batch: the ordinal of the batch's first hint.
+    hint_base: u32,
+    hinted: bool,
+}
+
+/// **The index-fill runner's program**: one shape's wire traffic, resolved to
+/// value-tape indices at setup.
+///
+/// The generic walk ([`CircuitShape::run`]) pays value-independent work per
+/// gate per proof — resolving wires, tracking definedness, downcasting the
+/// row store and hint, checking output arity. All of it is a function of the
+/// shape alone, so [`CircuitShape::fill_plan`] pays it once: inputs become
+/// `(root, ordinal)` copy pairs, every gate's reads and writes become flat
+/// index arrays, and consecutive same-slot gates coalesce into batches that
+/// [`CircuitShape::run_filled`] streams through one monomorphic loop each.
+/// Definedness moves entirely to compile time — a read before any write
+/// fails `fill_plan`, not the proof, and an output cell whose class is
+/// already valued is marked [`FILL_CHECK`] so the runner asserts equality
+/// exactly where the walk would.
+///
+/// The plan is data about the shape, not a second semantics: `run` stays as
+/// the differential oracle, and the two produce identical
+/// [`CircuitWitness`]es — publics, rows and witnesses.
+pub struct FillPlan {
+    batches: Vec<FillBatch>,
+    /// Concatenated input-cell tape indices, `n_in` per gate, batch-major.
+    in_idx: Vec<u32>,
+    /// Concatenated output tape indices, `n_out` per gate; see [`FILL_CHECK`].
+    out_idx: Vec<u32>,
+    /// First supply of each input class: `(root, input ordinal)`.
+    input_fills: Vec<(u32, u32)>,
+    /// Later supplies of an already-filled class — the walk's "connected
+    /// inputs" equality, precomputed to just the duplicated pairs.
+    input_checks: Vec<(u32, u32)>,
+    /// Fingerprint of the shape this plan was compiled from.
+    n_steps: usize,
+    n_wires: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -768,6 +893,160 @@ impl CircuitShape {
         }
     }
 
+    /// Compile the shape's [`FillPlan`].
+    ///
+    /// Setup work, once per shape. Walks the steps in instantiation order —
+    /// the order [`run`](Self::run) evaluates them (its island mode is
+    /// asserted equivalent to this order, so the plan needs no island
+    /// machinery to be row-identical) — resolving every read and write to a
+    /// tape index and proving definedness as it goes.
+    pub fn fill_plan(&self) -> FillPlan {
+        assert!(
+            self.n_wires < FILL_CHECK as usize,
+            "the fill plan packs its check flag into bit 31 of a wire index"
+        );
+        let mut defined = vec![false; self.n_wires];
+        let mut input_fills = Vec::new();
+        let mut input_checks = Vec::new();
+        for (ord, &root) in self.inputs.iter().enumerate() {
+            if defined[root] {
+                input_checks.push((root as u32, ord as u32));
+            } else {
+                defined[root] = true;
+                input_fills.push((root as u32, ord as u32));
+            }
+        }
+
+        let mut batches: Vec<FillBatch> = Vec::new();
+        let mut in_idx = Vec::new();
+        let mut out_idx = Vec::new();
+        let mut n_hinted = 0usize;
+        for step in &self.steps {
+            let coalesce = batches
+                .last()
+                .is_some_and(|b| b.slot as usize == step.slot && b.hinted == step.hinted);
+            if !coalesce {
+                batches.push(FillBatch {
+                    slot: step.slot as u32,
+                    n: 0,
+                    in_off: in_idx.len() as u32,
+                    out_off: out_idx.len() as u32,
+                    hint_base: n_hinted as u32,
+                    hinted: step.hinted,
+                });
+            }
+            batches.last_mut().expect("just pushed").n += 1;
+            if step.hinted {
+                n_hinted += 1;
+            }
+            for &r in &step.inputs {
+                assert!(
+                    defined[r],
+                    "gate input has no value yet: a gate was instantiated before \
+                     the gate producing one of its inputs"
+                );
+                in_idx.push(r as u32);
+            }
+            for &r in &step.outputs {
+                if defined[r] {
+                    out_idx.push(r as u32 | FILL_CHECK);
+                } else {
+                    defined[r] = true;
+                    out_idx.push(r as u32);
+                }
+            }
+        }
+        for &r in &self.publics {
+            assert!(defined[r], "a published wire was never given a value");
+        }
+        FillPlan {
+            batches,
+            in_idx,
+            out_idx,
+            input_fills,
+            input_checks,
+            n_steps: self.steps.len(),
+            n_wires: self.n_wires,
+        }
+    }
+
+    /// **The online phase, plan-driven.** Same contract and same output as
+    /// [`run`](Self::run) — `run` is the differential oracle for this — with
+    /// the walk's per-gate bookkeeping replaced by the plan's index copies
+    /// and per-slot batch loops.
+    pub fn run_filled(
+        &self,
+        plan: &FillPlan,
+        inputs: &[F128],
+        hints: &[&(dyn Any + Sync)],
+    ) -> CircuitWitness {
+        assert_eq!(
+            (plan.n_steps, plan.n_wires),
+            (self.steps.len(), self.n_wires),
+            "the plan was compiled from a different shape"
+        );
+        assert_eq!(
+            inputs.len(),
+            self.inputs.len(),
+            "circuit takes {} inputs, got {}",
+            self.inputs.len(),
+            inputs.len()
+        );
+        assert_eq!(
+            hints.len(),
+            self.n_hints,
+            "circuit takes {} hints, got {}",
+            self.n_hints,
+            hints.len()
+        );
+
+        let mut values = vec![F128::ZERO; self.n_wires];
+        for &(r, ord) in &plan.input_fills {
+            values[r as usize] = inputs[ord as usize];
+        }
+        for &(r, ord) in &plan.input_checks {
+            assert_eq!(
+                values[r as usize], inputs[ord as usize],
+                "connected inputs were given different values"
+            );
+        }
+
+        let mut rows: Vec<Box<dyn Any + Send>> = self.slots.iter().map(|s| s.new_rows()).collect();
+        let mut scratch_in: Vec<F128> = Vec::with_capacity(16);
+        let mut scratch_out: Vec<F128> = Vec::with_capacity(16);
+        for b in &plan.batches {
+            let slot = b.slot as usize;
+            let s = &self.slots[slot];
+            let n = b.n as usize;
+            let (i0, o0) = (b.in_off as usize, b.out_off as usize);
+            s.run_batch(
+                rows[slot].as_mut(),
+                &mut values,
+                n,
+                &plan.in_idx[i0..i0 + n * s.n_in()],
+                &plan.out_idx[o0..o0 + n * s.n_out()],
+                hints,
+                b.hint_base as usize,
+                b.hinted,
+                &mut scratch_in,
+                &mut scratch_out,
+            );
+        }
+
+        let public: Vec<F128> = self.publics.iter().map(|&r| values[r]).collect();
+        let witnesses: Vec<SlotWitness> = self
+            .order
+            .iter()
+            .map(|&d| self.slots[d].witness(rows[d].as_ref(), self.nu))
+            .collect();
+        CircuitWitness {
+            public,
+            witnesses,
+            rows,
+            slot_types: self.slot_types.clone(),
+        }
+    }
+
     /// Execute the steps in `range` against the given value state and row
     /// accumulators. `hint_base` is the number of hinted steps before the
     /// range (hints are consumed in absolute instantiation order).
@@ -1111,5 +1390,135 @@ mod tests {
             ),
             "built witness must satisfy the relation"
         );
+    }
+
+    /// `MultGate` with advice: the hint rides into the row but touches no
+    /// wire — exercises the plan's hint-ordinal bookkeeping.
+    struct HintedMultGate {
+        ty: Arc<ElementTableType>,
+    }
+
+    impl HintedMultGate {
+        fn new(kappa: usize) -> Self {
+            let mut b = ElementTableBuilder::new(kappa);
+            b.free_wire(0).free_wire(1).mult(2, 0, 1);
+            Self {
+                ty: Arc::new(b.build().expect("mult block is valid")),
+            }
+        }
+    }
+
+    impl GateType for HintedMultGate {
+        type Row = (F128, F128, F128, F128);
+        type Hint = F128;
+
+        fn table(&self) -> TableType {
+            TableType::element(self.ty.clone()).with_io_schema(vec![
+                IoWord::input(0),
+                IoWord::input(1),
+                IoWord::output(2),
+            ])
+        }
+
+        fn eval(&self, inputs: &[F128], hint: &F128, outputs: &mut Vec<F128>) -> Self::Row {
+            let (a, b) = (inputs[0], inputs[1]);
+            let c = a * b;
+            outputs.push(c);
+            (a, b, c, *hint)
+        }
+
+        fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
+            let at = |c: usize, j: usize| (c << nu) + j;
+            let mut z = vec![F128::ZERO; self.ty.width() << nu];
+            for (j, &(a, b, c, _)) in rows.iter().enumerate() {
+                z[at(0, j)] = a;
+                z[at(1, j)] = b;
+                z[at(2, j)] = c;
+            }
+            SlotWitness::Element(z)
+        }
+    }
+
+    /// The fill plan against the walk, on a shape that hits every plan path:
+    /// alternating slots (length-1 batches), hinted gates, connected
+    /// duplicate inputs (the `input_checks` arm), and a gate output connected
+    /// to an already-supplied input (the `FILL_CHECK` arm — the Fiat–Shamir
+    /// forward reference). Identical `CircuitWitness`, field for field.
+    #[test]
+    fn fill_plan_matches_the_walk() {
+        let (nu, kappa, n) = (6usize, 3usize, 12usize);
+        let mut state = 0xF177_C4A1_0007_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let hi = state;
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            F128::new(hi, state)
+        };
+        let seed = next();
+        let a: Vec<F128> = (0..n).map(|_| next()).collect();
+        let hints_v: Vec<F128> = (0..n / 2).map(|_| next()).collect();
+
+        let mut b = ShapeBuilder::new(nu);
+        let mult = b.slot(MultGate::new(kappa));
+        let hmult = b.slot(HintedMultGate::new(kappa));
+
+        let mut vals: Vec<F128> = Vec::new();
+        let input = |b: &mut ShapeBuilder, v: F128, vals: &mut Vec<F128>| {
+            vals.push(v);
+            b.public_input()
+        };
+        let seed_w = input(&mut b, seed, &mut vals);
+        // Two connected inputs supplied the same value: the duplicate arm.
+        let dup0 = input(&mut b, a[0], &mut vals);
+        let dup1 = input(&mut b, a[0], &mut vals);
+        b.connect(dup0, dup1);
+        // Alternate slots so no batch coalesces past its neighbor.
+        let mut acc = seed_w;
+        let mut acc_v = seed;
+        for (i, &ai) in a.iter().enumerate() {
+            let aw = if i == 0 {
+                dup1
+            } else {
+                input(&mut b, ai, &mut vals)
+            };
+            acc = if i % 2 == 0 {
+                b.gate(mult, &[aw, acc])[0]
+            } else {
+                b.gate_hinted(hmult, &[aw, acc])[0]
+            };
+            acc_v = ai * acc_v;
+        }
+        // The forward reference: the final product is ALSO supplied as an
+        // input, and the producing gate's output is checked against it.
+        vals.push(acc_v);
+        let fwd = b.input();
+        b.connect(acc, fwd);
+        b.publish(acc);
+
+        let shape = b.finish().expect("the shape builds");
+        let hint_refs: Vec<&(dyn Any + Sync)> =
+            hints_v.iter().map(|h| h as &(dyn Any + Sync)).collect();
+        let plan = shape.fill_plan();
+
+        let walk = shape.run(&vals, &hint_refs);
+        let fill = shape.run_filled(&plan, &vals, &hint_refs);
+
+        assert_eq!(walk.public, fill.public, "public segment");
+        assert_eq!(walk.witnesses, fill.witnesses, "slot witnesses");
+        assert_eq!(
+            walk.rows::<MultGate>(mult),
+            fill.rows::<MultGate>(mult),
+            "mult rows"
+        );
+        assert_eq!(
+            walk.rows::<HintedMultGate>(hmult),
+            fill.rows::<HintedMultGate>(hmult),
+            "hinted mult rows"
+        );
+        assert_eq!(walk.public.last(), Some(&acc_v), "the chain closed");
     }
 }
