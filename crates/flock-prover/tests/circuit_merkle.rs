@@ -2524,6 +2524,11 @@ fn gate_kappa(c_need: usize) -> usize {
 struct ResidualGate {
     ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
     sks_vks: Vec<F128>,
+    /// `1/sks_vks[k]` (0 for 0), once per SLOT: `eval` used to invert these
+    /// per ROW, and ~10 GF(2^128) inversions/row was ~85% of the whole
+    /// online fill (measured 12 µs/row; the five residual slots were 9.2 of
+    /// a child region's 10.8 ms).
+    inv_sks: Vec<F128>,
     acc_out: Vec<usize>,
     lmc: usize,
     pl: usize,
@@ -2633,6 +2638,7 @@ impl ResidualGate {
         assert_eq!(c, c_need, "the residual column count is the counted one");
         Self {
             ty: std::sync::Arc::new(b.build().expect("residual gate is valid")),
+            inv_sks: sks_vks.iter().map(|&v| inv(v)).collect(),
             sks_vks: sks_vks.to_vec(),
             acc_out,
             lmc,
@@ -2659,7 +2665,6 @@ impl GateType for ResidualGate {
 
     fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> Self::Row {
         // A structural mirror of `new()`: same column cursor, same order.
-        let inv = |v: F128| if v == F128::ZERO { F128::ZERO } else { v.inv() };
         let (lmc, pl) = (self.lmc, self.pl);
         let yl = lmc - pl;
         let acc0 = 3 + pl;
@@ -2674,7 +2679,7 @@ impl GateType for ResidualGate {
         }
         let mut pr_v = F128::ONE;
         for k in 0..pl {
-            z[c] = z[1 + k] * (F128::ONE + z[s_col[k]] * inv(self.sks_vks[k]));
+            z[c] = z[1 + k] * (F128::ONE + z[s_col[k]] * self.inv_sks[k]);
             let pk = z[c];
             c += 1;
             z[c] = pr_v * (F128::ONE + pk);
@@ -2682,7 +2687,7 @@ impl GateType for ResidualGate {
             c += 1;
         }
         let w_v: Vec<F128> = (0..yl)
-            .map(|j| z[s_col[pl + j]] * inv(self.sks_vks[pl + j]))
+            .map(|j| z[s_col[pl + j]] * self.inv_sks[pl + j])
             .collect();
         let mut sp: Vec<Option<usize>> = vec![None; self.yr];
         for y in 1..self.yr {
