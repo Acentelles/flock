@@ -51,6 +51,10 @@ pub const MIN_DENSE_M: usize = 22;
 #[derive(Clone, Debug)]
 pub struct UnionInstance<'r> {
     instance: Instance<'r>,
+    /// Optional dense floor `m*`: [`Self::committed_words`] commits at least
+    /// `2^(m*−7)` words regardless of content. See
+    /// [`Self::set_dense_floor`].
+    dense_floor_m: Option<usize>,
 }
 
 impl<'r> UnionInstance<'r> {
@@ -61,7 +65,34 @@ impl<'r> UnionInstance<'r> {
     }
 
     pub fn from_instance(instance: Instance<'r>) -> Self {
-        Self { instance }
+        Self {
+            instance,
+            dense_floor_m: None,
+        }
+    }
+
+    /// Pin the committed size from below: commit `max(next_pow2(content),
+    /// 2^(m−7))` words. The envelope capability — shapes whose CONTENT
+    /// differs commit (and therefore open, query and absorb) at ONE size, so
+    /// a verifier of their proofs has one geometry. The floor only extends
+    /// the zero tail the pow2 rounding already commits (see
+    /// [`Self::commit_lanes`]: the tail is whole zero lanes, never encoded);
+    /// content above the floor commits exactly as without one.
+    ///
+    /// The floor is STATEMENT data, like the counts: prover and verifier
+    /// must construct their instances with the same value or the config
+    /// lookup diverges loudly. Panics if the floor exceeds the padded
+    /// virtual domain (the committed domain may never outgrow the address
+    /// space) — raise `nu` first.
+    pub fn set_dense_floor(&mut self, m: usize) {
+        assert!(m >= MIN_DENSE_M, "the config floor already commits 2^{MIN_DENSE_M}");
+        assert!(
+            1usize << (m - 7) <= self.packed_len(),
+            "dense floor m={m} exceeds the padded virtual domain (m_total {}); \
+             raise nu before flooring",
+            self.m_total()
+        );
+        self.dense_floor_m = Some(m);
     }
 
     pub fn instance(&self) -> &Instance<'r> {
@@ -314,6 +345,10 @@ impl<'r> UnionInstance<'r> {
     /// committed length is simply the padded length.
     pub fn committed_words(&self) -> usize {
         let floor = 1usize << (MIN_DENSE_M - 7);
+        // The instance floor ([`Self::set_dense_floor`]) composes with the
+        // config floor the same way; its setter already asserted it fits the
+        // padded domain, so the clamp below cannot silently shave it.
+        let floor = floor.max(self.dense_floor_m.map_or(0, |m| 1usize << (m - 7)));
         self.dense_words()
             .next_power_of_two()
             .max(floor)

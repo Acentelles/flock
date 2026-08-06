@@ -434,6 +434,115 @@ fn mixed_partial_counts_roundtrip_and_tamper() {
     }
 }
 
+/// THE DENSE FLOOR (envelope wall 2's capability): the same content commits
+/// at a PINNED size above its natural one — `max(next_pow2(content),
+/// 2^(m*−7))` — extending the zero tail the pow2 rounding already pays. At
+/// ν = 7, counts (32, 32) naturally commit 2^15 words (the m22 config
+/// floor); floored to m* = 23 they commit 2^16 with a ~6× content gap, so
+/// the high-bit-lane commit carries only the few active lanes — the seam's
+/// recorded care point, exercised at a gap the rounding tax alone never
+/// produces. The floor is STATEMENT data like the counts: a verifier
+/// without it sizes the m22 config and must reject the m23 proof.
+#[test]
+#[ignore] // Heavier — run with `cargo test -p flock-prover --test union_mixed -- --ignored`
+fn dense_floor_roundtrip_and_statement_binding() {
+    let nu = 7usize;
+    let (registry, sha2_r1cs, blake3_r1cs) = mixed_registry(nu);
+    let sha2_circuit = sha2_r1cs.csc_lincheck_circuit();
+    let blake3_circuit = blake3_r1cs.csc_lincheck_circuit();
+    let circuits: [&dyn LincheckCircuit; 2] = [sha2_circuit, blake3_circuit];
+    let mut rng = Rng::new(0x_F1_00_12_28);
+    let counts = vec![32usize, 32];
+    let sha2_inputs = random_sha2_inputs(&mut rng, 32);
+    let blake3_inputs = random_blake3_inputs(&mut rng, 32);
+    let slots = || {
+        vec![
+            UnionSlotProverInput::new(
+                sha2::generate_witness_batch_major_partial(&sha2_inputs, nu),
+                sha2_circuit,
+            ),
+            UnionSlotProverInput::new(
+                blake3::generate_witness_batch_major_partial(&blake3_inputs, nu),
+                blake3_circuit,
+            ),
+        ]
+    };
+
+    let natural = UnionInstance::new(&registry, counts.clone());
+    assert_eq!(natural.dense_m(), 22, "the natural size is the config floor");
+
+    let mut floored = UnionInstance::new(&registry, counts.clone());
+    floored.set_dense_floor(23);
+    assert_eq!(floored.dense_m(), 23, "the floor binds");
+    assert_eq!(floored.committed_words(), 1 << 16);
+    assert_eq!(
+        floored.dense_words(),
+        natural.dense_words(),
+        "content is floor-independent"
+    );
+    let params_f = union_pcs_params(&floored);
+    assert_eq!(params_f.m, 23);
+    let lanes = params_f
+        .num_lanes
+        .expect("a 6x content gap leaves whole zero lanes");
+    assert_eq!(
+        lanes,
+        floored
+            .dense_words()
+            .div_ceil(1 << (23 - 7 - params_f.log_batch_size)),
+        "active lanes stay CONTENT-derived under the floor"
+    );
+
+    // The floored proof roundtrips at the pinned size.
+    let mut ch_p = FsChallenger::new(DOMAIN);
+    let (proof_f, commitment_f, claim_f) =
+        prover::prove_fast_ligerito_union(&floored, &params_f, slots(), &mut ch_p);
+    let mut ch_v = FsChallenger::new(DOMAIN);
+    let claim_v = verifier::verify_ligerito_union(
+        &floored,
+        &circuits,
+        &commitment_f,
+        &proof_f,
+        &params_f,
+        &mut ch_v,
+    )
+    .expect("the floored proof verifies at the floored size");
+    assert_eq!(claim_v, claim_f);
+
+    // The SAME content still roundtrips naturally — the floor is opt-in.
+    let params_n = union_pcs_params(&natural);
+    assert_eq!(params_n.m, 22);
+    let mut ch_p = FsChallenger::new(DOMAIN);
+    let (proof_n, commitment_n, _) =
+        prover::prove_fast_ligerito_union(&natural, &params_n, slots(), &mut ch_p);
+    let mut ch_v = FsChallenger::new(DOMAIN);
+    verifier::verify_ligerito_union(
+        &natural,
+        &circuits,
+        &commitment_n,
+        &proof_n,
+        &params_n,
+        &mut ch_v,
+    )
+    .expect("the natural proof still verifies");
+
+    // Statement binding: a verifier WITHOUT the floor sizes the m22 config
+    // against the m23 proof — reject, never accept-with-different-statement.
+    let mut ch_v = FsChallenger::new(DOMAIN);
+    assert!(
+        verifier::verify_ligerito_union(
+            &natural,
+            &circuits,
+            &commitment_f,
+            &proof_f,
+            &params_n,
+            &mut ch_v,
+        )
+        .is_err(),
+        "the floor is statement data: verifying without it must reject"
+    );
+}
+
 /// M5 — THE area gate, end to end: at ν = 7 (M = 23, padded 2^16 words) a
 /// partial-utilization mix at counts (32, 32) commits the height-`n_t`
 /// dense stack of 32·(246 + 93) = 10 848 words → 2^15 committed words
