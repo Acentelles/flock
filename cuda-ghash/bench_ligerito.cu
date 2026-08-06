@@ -163,7 +163,7 @@ static void msg(const F128*A,const F128*B,long long len,F128*p0,F128*p2,F128*du0
     F128 u[2]; CK(cudaMemcpy(u,du0,2*sizeof(F128),cudaMemcpyDeviceToHost)); u0=u[0]; u2=u[1];   // du2 = du0+1
 }
 
-struct Phase { double commit=0, fold=0, ood=0, open=0, induce=0, intro=0, lincheck=0, witness=0, zerocheck=0, l0commit=0; };
+struct Phase { double commit=0, fold=0, ood=0, open=0, induce=0, intro=0, lincheck=0, witness=0, zerocheck=0, l0commit=0, host_side_eq=0; };
 
 // Full zerocheck prove_packed orchestration, resident on the witness products
 // a=A·z, b=B·z (c=z=df), threading the shared challenger `ch`. Times into
@@ -464,8 +464,10 @@ static void lincheck_phase(const uint8_t* d_zlin, int m, int k_log, int k_skip,
     long long n_outer = 1LL << n_log, n_stripes = n_outer / 8;
 
     F128 alpha{0x9abc, 0xdef0};
+    auto w = Clock::now();
     std::vector<F128> eq_inner = build_quirky_eq_table_host(z_skip, x_inner_rest, k_skip);
     std::vector<F128> eq_outer = build_eq_table_host(x_outer);
+    ph.host_side_eq += ms_since(w);
 
     // --- REAL BLAKE3 R1CS base matrices (A_0, B_0), GF(2) CSC, loaded once.
     const B3LincheckMatrices& M = load_b3_lincheck_matrices();
@@ -485,12 +487,24 @@ static void lincheck_phase(const uint8_t* d_zlin, int m, int k_log, int k_skip,
     CK(cudaMalloc(&d_bcp,(k+1)*sizeof(uint32_t))); CK(cudaMalloc(&d_br,b_rows.size()*sizeof(uint32_t)));
     CK(cudaMalloc(&d_p1,LC_MAX_BLOCKS*sizeof(F128))); CK(cudaMalloc(&d_pinf,LC_MAX_BLOCKS*sizeof(F128)));
     CK(cudaMalloc(&d_e1,sizeof(F128))); CK(cudaMalloc(&d_einf,sizeof(F128)));
+    auto t_de_eq = Clock::now();
     CK(cudaMemcpy(d_eq_inner, eq_inner.data(), k*sizeof(F128), cudaMemcpyHostToDevice));
+    printf("Memcpy d_eq_inner %.2f ms", ms_since(t_de_eq));
+    auto t_de_outer = Clock::now();
     CK(cudaMemcpy(d_eq_outer, eq_outer.data(), n_outer*sizeof(F128), cudaMemcpyHostToDevice));
+    printf("Memcpy d_eq_outer %.2f ms", ms_since(t_de_outer));
+    auto t_de_acp = Clock::now();
     CK(cudaMemcpy(d_acp,a_col_ptr.data(),(k+1)*sizeof(uint32_t),cudaMemcpyHostToDevice));
+    printf("Memcpy d_acp %.2f ms", ms_since(t_de_acp));
+    auto t_de_ar = Clock::now();
     CK(cudaMemcpy(d_ar,a_rows.data(),a_rows.size()*sizeof(uint32_t),cudaMemcpyHostToDevice));
+    printf("Memcpy d_ar %.2f ms", ms_since(t_de_ar));
+    auto t_de_bcp = Clock::now();
     CK(cudaMemcpy(d_bcp,b_col_ptr.data(),(k+1)*sizeof(uint32_t),cudaMemcpyHostToDevice));
+    printf("Memcpy d_bcp %.2f ms", ms_since(t_de_bcp));
+    auto t_de_br = Clock::now();
     CK(cudaMemcpy(d_br,b_rows.data(),b_rows.size()*sizeof(uint32_t),cudaMemcpyHostToDevice));
+    printf("Memcpy d_br %.2f ms", ms_since(t_de_br));
 
     std::vector<F128> chal(inner_rest_len);
     for (int r = 0; r < inner_rest_len; r++) chal[r] = F128{(u64)(r*2654435761ull+1), (u64)(r*40503+7)};
@@ -765,8 +779,8 @@ int main(int argc,char**argv){
     Phase ph; double best=1e30;
     for(int it=0;it<iters;it++){ Phase p2; double t=prove(log_n,ik,r0,nq0,r1,ood1,r,k,oodr,rec_rates,rec_queries,p2); if(t<best){best=t;ph=p2;} }
     printf("  open total %.2f ms | commit %.2f  fold %.2f  ood %.2f  open(multiproof+gather) %.2f  induce %.2f  introduce/glue %.2f\n"
-           "  resident chain: witness-gen %.2f  l0-commit %.2f  zerocheck %.2f  lincheck %.2f ms\n",
-           best,ph.commit,ph.fold,ph.ood,ph.open,ph.induce,ph.intro,ph.witness,ph.l0commit,ph.zerocheck,ph.lincheck);
+           "  resident chain: witness-gen %.2f  l0-commit %.2f  zerocheck %.2f  lincheck %.2f ms  host-side eq %.2f ms\n",
+           best,ph.commit,ph.fold,ph.ood,ph.open,ph.induce,ph.intro,ph.witness,ph.l0commit,ph.zerocheck,ph.lincheck,ph.host_side_eq);
     double e2e = ph.witness + ph.l0commit + ph.zerocheck + ph.lincheck + best;
     printf("  >>> e2e prove total %.2f ms  (witness %.2f + l0-commit %.2f + zerocheck %.2f + lincheck %.2f + open %.2f)\n",
            e2e, ph.witness, ph.l0commit, ph.zerocheck, ph.lincheck, best);
