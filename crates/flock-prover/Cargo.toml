@@ -166,6 +166,10 @@ name = "native_hash"
 harness = false
 
 [[bench]]
+name = "hash_throughput"
+harness = false
+
+[[bench]]
 name = "ecore_offload_probe"
 harness = false
 
@@ -204,3 +208,11 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "blake3_node_probe"
+harness = false
+
+[[bench]]
+name = "fs_challenger"
+harness = false
