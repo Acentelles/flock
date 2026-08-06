@@ -12679,6 +12679,12 @@ struct ChildSlots {
     spine: flock_core::circuit::builder::SlotId,
     alslot: flock_core::circuit::builder::SlotId,
     le: Vec<(usize, flock_core::circuit::builder::SlotId)>,
+    /// The residual region's keyed slot cache (`emit_residual_region`'s
+    /// `leaf_slot`). Key scheme: `600` = the shared MacGate (pre-seeded,
+    /// so close-out rows land on `macs` instead of a duplicate type);
+    /// `100 + level` = that opened level's ResidualGate; `310 + width` =
+    /// the shared PrefixGate at that width (the eq/prefix-product rows —
+    /// NOT a residual gate, it merely lives in this cache).
     resid: Vec<(usize, flock_core::circuit::builder::SlotId)>,
 }
 
@@ -16749,7 +16755,14 @@ fn build_node_outer(
                 lab.push((shape2.registry_slot(s), format!("le{n}")));
             }
             for &(k, s) in &cs.resid {
-                lab.push((shape2.registry_slot(s), format!("resid{k}")));
+                // Decode the cache's key scheme (see ChildSlots::resid);
+                // the shared mac (600) is already labeled above.
+                let name = match k {
+                    600 => continue,
+                    k if k >= 310 => format!("pf{}", k - 310),
+                    k => format!("resid{}", k - 100),
+                };
+                lab.push((shape2.registry_slot(s), name));
             }
             println!("  NODE TYPE CENSUS (io = cell slots = gather claims):");
             let (mut area_b, mut area_e) = (0usize, 0usize);
