@@ -163,6 +163,13 @@ struct EnvShape {
     /// the registry print order), then the element types by cache key.
     counts_bool: [usize; 3],
     counts_el: [(usize, usize); 14],
+    /// publics* — the ONE public-segment length every envelope outer pads
+    /// to (published zeros appended after all real publics). The child's
+    /// publics count is what a PARENT's walk consumes — H(publics) chain
+    /// rows and the recombination's 8-lane folds both scale with it — so
+    /// one count is what makes the L1 walk (leaf children) and the L2
+    /// walk (node children) row-identical.
+    publics: usize,
 }
 
 /// `Some` exactly when the DEFAULT envelope is active: the registry
@@ -181,14 +188,14 @@ fn envelope_shape() -> Option<EnvShape> {
         // cap exactly (registry-shaped) and skn/skc are the leaf's.
         counts_bool: [15700, 6052, 524],
         counts_el: [
-            (600, 29113), // mac — the nu* driver; watch the 2^15 ceiling
+            (600, 29137), // mac — the nu* driver; watch the 2^15 ceiling
             (500, 602),   // zcr
             (400, 674),   // mrs
             (0, 5944),    // spine
             (601, 184),   // assist
             (510, 64),    // skip-node (leaf-only usage)
             (511, 1),     // skip-close (leaf-only usage)
-            (8, 2130),    // leaf-eval 8-lane
+            (8, 2136),    // leaf-eval 8-lane
             (112, 720),   // resid pl 12
             (109, 480),   // resid pl 9
             (106, 360),   // resid pl 6
@@ -196,6 +203,7 @@ fn envelope_shape() -> Option<EnvShape> {
             (100, 248),   // resid pl 0
             (318, 8604),  // prefix w 8
         ],
+        publics: 3520,
     })
 }
 
@@ -288,6 +296,7 @@ fn pad_envelope_counts(
     env: &EnvShape,
     zw: Wire,
     hints: &mut Vec<[u32; SLOT_WORDS]>,
+    vals: &mut Vec<F128>,
 ) {
     let mut report: Vec<String> = Vec::new();
     let mut over: Vec<String> = Vec::new();
@@ -323,6 +332,21 @@ fn pad_envelope_counts(
             .find(|&&(k, _)| k == key)
             .unwrap_or_else(|| panic!("envelope slot key {key} missing from the cache"));
         pad(sb, hints, &mut over, &format!("el{key}"), s, count, false);
+    }
+    // publics* (wall 4): the public segment pads to ONE length with
+    // published zeros, appended after every real public — tail publics
+    // shift no recorded block base, and a parent's walk (H(publics)
+    // rows, recombination folds) sees the same segment length at every
+    // level.
+    let live_pub = sb.public_len();
+    report.push(format!("publics {live_pub}/{}", env.publics));
+    if live_pub > env.publics {
+        over.push(format!("publics {live_pub} > {}", env.publics));
+    } else {
+        for _ in live_pub..env.publics {
+            vals.push(F128::ZERO);
+            sb.public_input();
+        }
     }
     // The live/cap census — the fixed-point iteration's data. One line per
     // build, so the tower prints leaf and node usage side by side.
@@ -8390,10 +8414,14 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         for w in &assert_pub {
             sb.publish(*w);
         }
-        // counts*: every envelope outer declares the ONE count vector —
-        // shape.counts and every union cloned from it carry it onward.
+        // counts* + publics*: every envelope outer declares the ONE count
+        // vector and the ONE public-segment length — shape.counts and
+        // every union cloned from it carry them onward. The boundary
+        // checks below walk the REAL segment end, so its pre-pad length
+        // is recorded first.
+        let prepad_publics = sb.public_len();
         if let Some(e) = &env {
-            pad_envelope_counts(&mut sb, &slots, &leaf_slot, e, zw, &mut hints);
+            pad_envelope_counts(&mut sb, &slots, &leaf_slot, e, zw, &mut hints, &mut vals);
         }
         let shape = sb.finish().expect("valid leaf query-phase circuit");
         let hint_refs: Vec<&(dyn std::any::Any + Sync)> =
@@ -8406,7 +8434,9 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         // length BEFORE it, so every older from-the-end offset holds.
         // The sqrt-chain, anchor-expect, zc-round and T_m == anchor.v
         // identities are COPY CONSTRAINTS — no publics, no checker items.
-        let plen = built.public.len();
+        // The REAL segment's end: publics* zeros sit past it (envelope
+        // only; equal to the full length otherwise).
+        let plen = prepad_publics;
         let n_assert_pub = 1 + lc_rounds2.len() + 2 * proof.lincheck.matrix_evals.len();
         let total_pub: usize = levels.len()
             + levels.len() * yr_len
@@ -17137,9 +17167,12 @@ fn build_node_outer(
         }
         let build_ms = t_tapes.elapsed().as_secs_f64() * 1e3 - tape_setup_ms;
         let t_build2 = std::time::Instant::now();
-        // counts*: the node declares the same vector the leaf does.
+        // counts* + publics*: the node declares the same count vector and
+        // segment length the leaf does. The tail-anchor assert below walks
+        // the REAL segment end, recorded pre-pad.
+        let prepad_publics2 = sb.public_len();
         if let Some(e) = &env {
-            pad_envelope_counts(&mut sb, &cs.q, &cs.env_cache(), e, zw, &mut hints);
+            pad_envelope_counts(&mut sb, &cs.q, &cs.env_cache(), e, zw, &mut hints, &mut vals);
         }
         let shape2 = sb.finish().expect("the 2->1 node circuit builds");
         assert!(
@@ -17352,8 +17385,8 @@ fn build_node_outer(
             );
             assert_eq!(
                 fold_pub_base + tail_len,
-                built2.public.len(),
-                "the fold blocks are the very tail"
+                prepad_publics2,
+                "the fold blocks end the REAL segment (publics* zeros sit past it)"
             );
         }
 
