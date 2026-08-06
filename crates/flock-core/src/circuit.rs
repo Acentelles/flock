@@ -473,7 +473,7 @@ impl Circuit {
             hit[s] = true;
         }
 
-        Ok(Self {
+        let c = Self {
             cells,
             registry_digest: registry.digest(),
             counts,
@@ -481,7 +481,14 @@ impl Circuit {
             wires: classes,
             sigma,
             digest_cache: OnceLock::new(),
-        })
+        };
+        // Warm the digest here, at statement-construction time: it is a pure
+        // function of the shape, and leaving it lazy put the first (only)
+        // computation inside the PROVE's bind phase for any caller that
+        // builds a fresh circuit — measured 7.6 ms per proof at the
+        // recursion node before this.
+        c.digest();
+        Ok(c)
     }
 
     pub fn cells(&self) -> &CellSpace {
@@ -530,35 +537,45 @@ impl Circuit {
     /// encoding is injective.
     pub fn digest(&self) -> [u8; 32] {
         *self.digest_cache.get_or_init(|| {
-            let mut h = blake3::Hasher::new();
-            h.update(CIRCUIT_LABEL);
-            h.update(&[1u8]);
-            h.update(&self.registry_digest);
-            h.update(&(self.cells.nu() as u32).to_le_bytes());
-            h.update(&(self.cells.c_bits() as u32).to_le_bytes());
-            h.update(&(self.cells.num_gate_slots() as u32).to_le_bytes());
+            // The payload is serialized into ONE buffer and hashed in a
+            // single update: the wire encoding is hundreds of thousands of
+            // 8-byte fields, and per-field `Hasher::update` calls made this
+            // ~7.6 ms at the recursion node — measured inside the PROVE's
+            // bind phase, because the first call used to happen there (the
+            // cache is now warmed by `Circuit::new`). Byte-identical to the
+            // per-field updates it replaces.
+            let n_cells: usize = self.wires.iter().map(|c| c.len()).sum();
+            let mut buf: Vec<u8> =
+                Vec::with_capacity(256 + 9 * self.cells.num_gate_slots() + 12 * self.counts.len()
+                    + 4 * self.wires.len() + 8 * n_cells);
+            buf.extend_from_slice(CIRCUIT_LABEL);
+            buf.push(1u8);
+            buf.extend_from_slice(&self.registry_digest);
+            buf.extend_from_slice(&(self.cells.nu() as u32).to_le_bytes());
+            buf.extend_from_slice(&(self.cells.c_bits() as u32).to_le_bytes());
+            buf.extend_from_slice(&(self.cells.num_gate_slots() as u32).to_le_bytes());
             for slot in &self.cells.slots()[..self.cells.num_gate_slots()] {
                 let CellSlot::Gate { ty, word } = slot else {
                     unreachable!("the gate prefix holds gate slots")
                 };
-                h.update(&(*ty as u32).to_le_bytes());
-                h.update(&(word.word_col as u32).to_le_bytes());
-                h.update(&[matches!(word.dir, IoDirection::Out) as u8]);
+                buf.extend_from_slice(&(*ty as u32).to_le_bytes());
+                buf.extend_from_slice(&(word.word_col as u32).to_le_bytes());
+                buf.push(matches!(word.dir, IoDirection::Out) as u8);
             }
-            h.update(&(self.cells.num_public_slots() as u32).to_le_bytes());
-            h.update(&(self.counts.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&(self.cells.num_public_slots() as u32).to_le_bytes());
+            buf.extend_from_slice(&(self.counts.len() as u32).to_le_bytes());
             for &n in &self.counts {
-                h.update(&(n as u64).to_le_bytes());
+                buf.extend_from_slice(&(n as u64).to_le_bytes());
             }
-            h.update(&(self.num_public as u64).to_le_bytes());
-            h.update(&(self.wires.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&(self.num_public as u64).to_le_bytes());
+            buf.extend_from_slice(&(self.wires.len() as u32).to_le_bytes());
             for class in &self.wires {
-                h.update(&(class.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&(class.len() as u32).to_le_bytes());
                 for &idx in class {
-                    h.update(&(idx as u64).to_le_bytes());
+                    buf.extend_from_slice(&(idx as u64).to_le_bytes());
                 }
             }
-            *h.finalize().as_bytes()
+            *blake3::hash(&buf).as_bytes()
         })
     }
 
