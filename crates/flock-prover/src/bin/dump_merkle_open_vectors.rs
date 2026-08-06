@@ -21,6 +21,7 @@ use std::env;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
+use flock_prover::hash::HashKind;
 use flock_prover::merkle::{merkle_multi_proof, merkle_tree};
 
 struct Rng(u64);
@@ -59,7 +60,7 @@ fn main() -> std::io::Result<()> {
         let n = chunk.len();
         chunk.copy_from_slice(&v[..n]);
     }
-    let tree = merkle_tree(&data, num_leaves);
+    let tree = merkle_tree(&data, num_leaves, HashKind::Sha256);
     assert_eq!(tree.len(), 2 * num_leaves - 1);
 
     // Distinct query positions, deliberately unsorted (tests the C++ sort/dedup).

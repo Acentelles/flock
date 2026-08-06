@@ -20,6 +20,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 
 use flock_prover::challenger::{Challenger, FsChallenger};
+use flock_prover::hash::HashKind;
 use flock_prover::field::F128;
 use flock_prover::lincheck::build_eq_table;
 use flock_prover::merkle::merkle_multi_proof;
@@ -122,7 +123,7 @@ fn main() -> std::io::Result<()> {
     // ---- L0 commit (the upstream witness commit) ----
     let log_msg_cols_0 = log_n - initial_k;
     let ntt_0 = AdditiveNttF128::standard(log_msg_cols_0 + log_inv_rate_0);
-    let wtns_0 = ligero_commit(&f, log_msg_cols_0, initial_k, log_inv_rate_0, &ntt_0);
+    let wtns_0 = ligero_commit(&f, log_msg_cols_0, initial_k, log_inv_rate_0, &ntt_0, HashKind::Sha256);
     let l0_block_len = wtns_0.block_len;
 
     let mut ch = FsChallenger::new(domain);
@@ -176,7 +177,7 @@ fn main() -> std::io::Result<()> {
     let log_msg_cols_1 = n1 - log_ni1;
     let ntt_1 = AdditiveNttF128::standard(log_msg_cols_1 + log_inv_rate_1);
     let f1 = sc.f().to_vec();
-    let wtns_1 = ligero_commit(&f1, log_msg_cols_1, log_ni1, log_inv_rate_1, &ntt_1);
+    let wtns_1 = ligero_commit(&f1, log_msg_cols_1, log_ni1, log_inv_rate_1, &ntt_1, HashKind::Sha256);
     ch.observe_bytes(&wtns_1.root());
     w.write_all(&(log_ni1 as u32).to_le_bytes())?;
     w.write_all(&(log_inv_rate_1 as u32).to_le_bytes())?;
@@ -309,7 +310,7 @@ fn main() -> std::io::Result<()> {
             let log_msg_cols_next = n_next - k_rec;
             let ntt_next = AdditiveNttF128::standard(log_msg_cols_next + rate_rec);
             let f_evals = sc.f().to_vec();
-            let wtns_next = ligero_commit(&f_evals, log_msg_cols_next, k_rec, rate_rec, &ntt_next);
+            let wtns_next = ligero_commit(&f_evals, log_msg_cols_next, k_rec, rate_rec, &ntt_next, HashKind::Sha256);
             ch.observe_bytes(&wtns_next.root());
             w.write_all(&wtns_next.root())?;
             for _ in 0..ood_rec {

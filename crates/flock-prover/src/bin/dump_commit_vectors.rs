@@ -36,6 +36,7 @@ use std::env;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
+use flock_prover::hash::HashKind;
 use flock_prover::pcs::{PcsParams, commit, pack_witness};
 
 /// SplitMix64 — same constants as `dump_ghash_vectors` / the in-tree unit
@@ -82,6 +83,8 @@ fn main() -> std::io::Result<()> {
         log_inv_rate,
         log_batch_size,
         profile: Default::default(),
+        // Pin SHA-256: the CUDA Merkle kernels (cuda-ghash/merkle.cuh) implement it.
+        merkle_hash: HashKind::Sha256,
     };
 
     // Reproducible Boolean witness → packed F128 message, then the real commit.
