@@ -76,6 +76,40 @@ fn tower_profile() -> LigeritoProfile {
     }
 }
 
+/// The ENVELOPE dense floor `m*` (wall 2): every recursion-path OUTER —
+/// leaf and node alike — commits at this size, so a node's children look
+/// ONE shape regardless of level (an L1 node's leaf children carry the
+/// same query geometry as an L2 node's node children).
+///
+/// OPT-IN via `TOWER_ENV_M` while the m* fork is open (measured
+/// 2026-08-06 at slim): `TOWER_ENV_M=28` converges leaf+L1 geometry
+/// (leaf prove 50→58, L1 = m28/nu 14/174.2 KiB, all green) but the
+/// grown child proofs push L2's content over its 98%-full 2^21 boundary
+/// → L2 dense_m 29, prove ~123→~157. The fork: m* = 29 (simple, slack,
+/// ~+30 ms/node) vs m* = 28 (tight; needs the mac shave −8k words +
+/// publics arithmetization −40k+ at the fixed point). No default until
+/// the call is made.
+fn envelope_floor_m() -> Option<usize> {
+    std::env::var("TOWER_ENV_M")
+        .ok()
+        .and_then(|v| v.parse().ok())
+}
+
+/// A recursion-path OUTER's union instance, with the envelope floor
+/// applied. Every instance over a leaf/node OUTER shape must come from
+/// here — prover, verifier and tape recorder alike: the floor is
+/// STATEMENT data, like the counts.
+fn outer_union<'r>(
+    registry: &'r flock_prover::schedule::Registry,
+    counts: Vec<usize>,
+) -> UnionInstance<'r> {
+    let mut u = UnionInstance::new(registry, counts);
+    if let Some(m) = envelope_floor_m() {
+        u.set_dense_floor(m);
+    }
+    u
+}
+
 const DOMAIN: &[u8] = b"flock-circuit-merkle-v0";
 
 const CHUNK_START: u32 = 1 << 0;
@@ -8274,7 +8308,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         // ---- prove / verify the leaf query-phase circuit ----
         // BLAKE3 for both hashes: the outer proof is the SWAP's inner, so
         // it must be recursable — the same two gotchas the leaf hit.
-        let union_o = UnionInstance::new(&shape.registry, shape.counts.clone());
+        let union_o = outer_union(&shape.registry, shape.counts.clone());
         let pf = tower_profile();
         let pcs_o = PcsParams {
             m: union_o.dense_m(),
@@ -8538,7 +8572,7 @@ impl<'p> RealTape<'p> {
         use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
         use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
-        let union_i = UnionInstance::new(&lo.shape.registry, lo.shape.counts.clone());
+        let union_i = outer_union(&lo.shape.registry, lo.shape.counts.clone());
         let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
             (lo.b3_slot, lo.b3_r1cs.csc_lincheck_circuit()),
             (lo.swap_slot, lo.swap_r1cs.csc_lincheck_circuit()),
@@ -15767,7 +15801,7 @@ fn mvp11_swap_children_fold_scale() {
     const M11_SCALE_DOMAIN: &[u8] = b"flock-mvp11-merge-scale-v0";
 
     let lo = build_leaf_outer();
-    let union_i = UnionInstance::new(&lo.shape.registry, lo.shape.counts.clone());
+    let union_i = outer_union(&lo.shape.registry, lo.shape.counts.clone());
     let registry = &lo.shape.registry;
     let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
         (lo.b3_slot, lo.b3_r1cs.csc_lincheck_circuit()),
@@ -16189,7 +16223,7 @@ fn mvp11_swap_children_fold_scale() {
 /// (conservative — a node would cache both).
 fn record_child_verify(lo: &LeafOuter, domain: &'static [u8]) {
     use flock_core::transcript_record::RecordingChallenger;
-    let union_i = UnionInstance::new(&lo.shape.registry, lo.shape.counts.clone());
+    let union_i = outer_union(&lo.shape.registry, lo.shape.counts.clone());
     let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
         (lo.b3_slot, lo.b3_r1cs.csc_lincheck_circuit()),
         (lo.swap_slot, lo.swap_r1cs.csc_lincheck_circuit()),
@@ -16239,8 +16273,8 @@ fn build_node_outer(
         "two children, ONE node circuit"
     );
     let registry = &lo0.shape.registry;
-    let union0 = UnionInstance::new(registry, lo0.shape.counts.clone());
-    let union1 = UnionInstance::new(&lo1.shape.registry, lo1.shape.counts.clone());
+    let union0 = outer_union(registry, lo0.shape.counts.clone());
+    let union1 = outer_union(&lo1.shape.registry, lo1.shape.counts.clone());
     let t_tapes = std::time::Instant::now();
     // The two children's tapes are independent statement work — build them
     // concurrently (each is a recording verify + the region pins).
@@ -16835,7 +16869,7 @@ fn build_node_outer(
         // The node proves and verifies over the circuit path. Union, PCS
         // params and the R1CS tables are per-SHAPE — offline, ahead of the
         // online loop.
-        let union2 = UnionInstance::new(&shape2.registry, shape2.counts.clone());
+        let union2 = outer_union(&shape2.registry, shape2.counts.clone());
         let pf = tower_profile();
         let pcs2 = PcsParams {
             m: union2.dense_m(),
@@ -17138,7 +17172,7 @@ fn recording_overhead_probe() {
     let l1 = build_leaf_outer_seeded(0x4D50_9B01);
     let (n0, _acc, _) = build_node_outer(&l0, &l1);
 
-    let union_i = UnionInstance::new(&n0.shape.registry, n0.shape.counts.clone());
+    let union_i = outer_union(&n0.shape.registry, n0.shape.counts.clone());
     let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
         (n0.b3_slot, n0.b3_r1cs.csc_lincheck_circuit()),
         (n0.swap_slot, n0.swap_r1cs.csc_lincheck_circuit()),
@@ -17414,7 +17448,7 @@ fn envelope_registry_diff() {
             "\n{name}: nu {} | m_total {} | dense_m {} | mu {} | {} types",
             shape.registry.nu(),
             shape.registry.m_total(),
-            UnionInstance::new(&shape.registry, shape.counts.clone()).dense_m(),
+            outer_union(&shape.registry, shape.counts.clone()).dense_m(),
             shape.circuit.cells().mu(),
             shape.registry.types().len(),
         );
