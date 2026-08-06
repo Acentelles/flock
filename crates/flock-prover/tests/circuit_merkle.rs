@@ -2769,6 +2769,26 @@ fn live_element_input(
     })
 }
 
+/// [`live_element_input`] without the packed intermediate: the slot's rows
+/// (from a DEFERRED run, [`CircuitWitness::take_rows_of`]) scatter straight
+/// into the union block — the same `dst[(col << nu) + j] = row[col]` write
+/// every element gate's `witness()` makes, minus the full-capacity buffer it
+/// makes it into. `dst` arrives zeroed and a row shorter than the slot's
+/// width leaves implicit zero columns, exactly as the packed path did.
+fn live_element_input_from_rows(
+    rows: Vec<Vec<F128>>,
+    nu: usize,
+) -> flock_prover::prover::UnionElementSlotInput<'static> {
+    flock_prover::prover::UnionElementSlotInput::new(move |dst: &mut [F128]| {
+        debug_assert!(rows.len() <= 1usize << nu);
+        for (j, row) in rows.iter().enumerate() {
+            for (col, &v) in row.iter().enumerate() {
+                dst[(col << nu) + j] = v;
+            }
+        }
+    })
+}
+
 /// `s_{k+1}(x) = s_k(x)^2 + s_k(v_k) s_k(x)` — the subspace-polynomial chain,
 /// and its `s_k(v_k)` constants (a replica of ligerito's pub(crate)
 /// `eval_sk_at_vks`, pinned by the residual boundary check below).
@@ -16844,7 +16864,9 @@ fn build_node_outer(
             t.elapsed().as_secs_f64() * 1e3
         };
         let t_trace = std::time::Instant::now();
-        let mut built2 = shape2.run_filled(&fill_plan, &vals, &hint_refs);
+        // DEFERRED: rows and publics only — the element witnesses are never
+        // packed; the assembly below feeds the prover from the rows.
+        let mut built2 = shape2.run_filled_deferred(&fill_plan, &vals, &hint_refs);
         let trace_ms = t_trace.elapsed().as_secs_f64() * 1e3;
 
         // The two child regions' checker walks — each child's whole
@@ -16943,24 +16965,23 @@ fn build_node_outer(
             ),
         ];
         bslots.sort_by_key(|(i, _)| *i);
-        let mut el_ord: Vec<(usize, Vec<F128>)> = cs
+        // Element inputs straight from the slots' rows: the run was
+        // DEFERRED, so the full-capacity packed intermediate never exists —
+        // the prove's in_place closure scatters the live rows directly.
+        let mut el_ord: Vec<(usize, Vec<Vec<F128>>)> = cs
             .element_slot_ids()
             .into_iter()
             .map(|sl| {
-                let z = match std::mem::replace(
-                    &mut built2.witnesses[shape2.registry_slot(sl)],
-                    SlotWitness::DeferredToRows,
-                ) {
-                    SlotWitness::Element(z) => z,
-                    other => panic!("element slot produced {other:?}"),
-                };
-                (shape2.registry_slot(sl), z)
+                (
+                    shape2.registry_slot(sl),
+                    built2.take_rows_of::<Vec<F128>>(sl),
+                )
             })
             .collect();
         el_ord.sort_by_key(|(i, _)| *i);
         let el_inputs: Vec<UnionElementSlotInput> = el_ord
             .into_iter()
-            .map(|(i, z)| live_element_input(z, shape2.counts[i], nu2))
+            .map(|(_, rows)| live_element_input_from_rows(rows, nu2))
             .collect();
         let mut lco: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
             (shape2.registry_slot(cs.q.b3), b3_lc2),
