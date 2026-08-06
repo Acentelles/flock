@@ -149,6 +149,20 @@ struct EnvShape {
     spread_w: usize,
     resid_pls: [usize; 5],
     pf_w: usize,
+    /// counts* — the ONE declared-count vector every envelope outer pads
+    /// to (`ShapeBuilder::pad_slot_rows` before finish, so `shape.counts`
+    /// and every union built from it carry counts* automatically). This is
+    /// what makes the child's content — and hence num_lanes, the ladder,
+    /// and the whole tape geometry a parent walks — LEVEL-INDEPENDENT.
+    /// EXACT fixed-point values (Ron's framework: determinism over
+    /// margin): elementwise max of the leaf/L1/L2 usage measured AT the
+    /// padded envelope, iterated to closure. A usage that outgrows its cap
+    /// fails the pad assert or the digest pin — loud, and the re-pin is
+    /// deliberate. Boolean trio first (b3, swap, spread — NOTE: swap
+    /// before spread here, matching the builders' declaration fields, NOT
+    /// the registry print order), then the element types by cache key.
+    counts_bool: [usize; 3],
+    counts_el: [(usize, usize); 14],
 }
 
 /// `Some` exactly when the DEFAULT envelope is active: the registry
@@ -161,6 +175,27 @@ fn envelope_shape() -> Option<EnvShape> {
         spread_w: 19,
         resid_pls: [12, 9, 6, 3, 0],
         pf_w: 8,
+        // Iterated at the padded envelope 2026-08-06 (probe + tower
+        // census, elementwise max of leaf/node usage). Only b3, le8, pf8
+        // and mac are content-geometry-sensitive; everything else hits its
+        // cap exactly (registry-shaped) and skn/skc are the leaf's.
+        counts_bool: [15700, 6052, 524],
+        counts_el: [
+            (600, 29113), // mac — the nu* driver; watch the 2^15 ceiling
+            (500, 602),   // zcr
+            (400, 674),   // mrs
+            (0, 5944),    // spine
+            (601, 184),   // assist
+            (510, 64),    // skip-node (leaf-only usage)
+            (511, 1),     // skip-close (leaf-only usage)
+            (8, 2130),    // leaf-eval 8-lane
+            (112, 720),   // resid pl 12
+            (109, 480),   // resid pl 9
+            (106, 360),   // resid pl 6
+            (103, 288),   // resid pl 3
+            (100, 248),   // resid pl 0
+            (318, 8604),  // prefix w 8
+        ],
     })
 }
 
@@ -232,6 +267,71 @@ fn declare_envelope_slots(
     }
     slot_cached(sb, cache, 310 + env.pf_w, || PrefixGate::new(env.pf_w));
     q
+}
+
+/// Pad every envelope slot's declared count up to counts* (the counts pin:
+/// one declared-count vector for every envelope outer, so the union content
+/// a parent walks is level-independent). Call once per builder, AFTER all
+/// emission, immediately before `finish()`.
+///
+/// A padding row is a REAL GATE with all-`zw` inputs (and a zero hint for
+/// the hinted swap slot), so every mechanism sees an ordinary row by
+/// construction: the boolean witness generators set the const bit the
+/// lincheck's count binding demands (all-zero rows fail exactly there —
+/// found the hard way), the element rows come out all-zero (the builder
+/// tables are homogeneous), and the wiring covers the cells with genuine
+/// gather-claimed gates. The outputs are deliberately unconsumed.
+fn pad_envelope_counts(
+    sb: &mut ShapeBuilder,
+    q: &CollapsedSlots,
+    cache: &[(usize, flock_core::circuit::builder::SlotId)],
+    env: &EnvShape,
+    zw: Wire,
+    hints: &mut Vec<[u32; SLOT_WORDS]>,
+) {
+    let mut report: Vec<String> = Vec::new();
+    let mut over: Vec<String> = Vec::new();
+    let mut pad = |sb: &mut ShapeBuilder,
+                   hints: &mut Vec<[u32; SLOT_WORDS]>,
+                   over: &mut Vec<String>,
+                   name: &str,
+                   s: flock_core::circuit::builder::SlotId,
+                   target: usize,
+                   hinted: bool| {
+        let live = sb.rows_in_slot(s);
+        report.push(format!("{name} {live}/{target}"));
+        if live > target {
+            over.push(format!("{name} {live} > {target}"));
+            return;
+        }
+        let ins = vec![zw; sb.slot_inputs(s)];
+        for _ in live..target {
+            if hinted {
+                hints.push([0u32; SLOT_WORDS]);
+                sb.gate_hinted(s, &ins);
+            } else {
+                sb.gate(s, &ins);
+            }
+        }
+    };
+    pad(sb, hints, &mut over, "b3", q.b3, env.counts_bool[0], false);
+    pad(sb, hints, &mut over, "swap", q.swap, env.counts_bool[1], true);
+    pad(sb, hints, &mut over, "spread", q.spread, env.counts_bool[2], false);
+    for &(key, count) in &env.counts_el {
+        let &(_, s) = cache
+            .iter()
+            .find(|&&(k, _)| k == key)
+            .unwrap_or_else(|| panic!("envelope slot key {key} missing from the cache"));
+        pad(sb, hints, &mut over, &format!("el{key}"), s, count, false);
+    }
+    // The live/cap census — the fixed-point iteration's data. One line per
+    // build, so the tower prints leaf and node usage side by side.
+    println!("  [counts* live/cap] {}", report.join(" | "));
+    // An overshoot must be LOUD: a silent no-op would leave this outer's
+    // counts above counts* and quietly break the level independence the
+    // pin exists for. Growing usage re-pins counts* deliberately — the
+    // full census above is the data for that re-pin.
+    assert!(over.is_empty(), "counts* overshoot: {}", over.join(", "));
 }
 
 const DOMAIN: &[u8] = b"flock-circuit-merkle-v0";
@@ -2835,12 +2935,17 @@ impl GateType for ResidualGate {
             s_col.push(c);
             c += 1;
         }
-        let mut pr_v = F128::ONE;
+        // The table's prefix rows read the ONE input wire (column 2 + pl,
+        // which is also the empty-product seed) — eval mirrors the
+        // constraint rather than shortcutting with literal ones, so the
+        // counts* padding's all-zero inputs yield all-zero satisfying rows.
+        let one_col = 2 + pl;
+        let mut pr_v = z[one_col];
         for k in 0..pl {
-            z[c] = z[1 + k] * (F128::ONE + z[s_col[k]] * self.inv_sks[k]);
+            z[c] = z[1 + k] * (z[one_col] + z[s_col[k]] * self.inv_sks[k]);
             let pk = z[c];
             c += 1;
-            z[c] = pr_v * (F128::ONE + pk);
+            z[c] = pr_v * (z[one_col] + pk);
             pr_v = z[c];
             c += 1;
         }
@@ -3237,14 +3342,17 @@ impl GateType for AssistLayerGate {
         let sparse = flock_core::pcs::jagged::assist_sparse_transitions();
         let mut z = vec![F128::ZERO; 53];
         z[..AL_IN].copy_from_slice(&inputs[..AL_IN]);
-        let one = F128::ONE;
+        // z[8] is the ONE input wire the table's linear rows read — eval
+        // must mirror the constraint, not shortcut it with a literal one:
+        // the counts* padding rows run this eval on all-zero inputs, and a
+        // literal would produce a row the zerocheck rejects.
         z[9] = z[4] * z[5];
-        z[10] = one + z[4] + z[5] + z[9];
+        z[10] = z[8] + z[4] + z[5] + z[9];
         z[11] = z[4] + z[9];
         z[12] = z[5] + z[9];
         let eq4 = [10usize, 11, 12, 9];
         z[13] = z[6] * z[7];
-        z[14] = one + z[6] + z[7] + z[13];
+        z[14] = z[8] + z[6] + z[7] + z[13];
         z[15] = z[6] + z[13];
         z[16] = z[7] + z[13];
         let e = [14usize, 15, 16, 13];
@@ -8282,6 +8390,11 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         for w in &assert_pub {
             sb.publish(*w);
         }
+        // counts*: every envelope outer declares the ONE count vector —
+        // shape.counts and every union cloned from it carry it onward.
+        if let Some(e) = &env {
+            pad_envelope_counts(&mut sb, &slots, &leaf_slot, e, zw, &mut hints);
+        }
         let shape = sb.finish().expect("valid leaf query-phase circuit");
         let hint_refs: Vec<&(dyn std::any::Any + Sync)> =
             hints.iter().map(|h| h as &(dyn std::any::Any + Sync)).collect();
@@ -8484,6 +8597,23 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
                 other => panic!("leaf-eval slot produced {other:?}"),
             })
             .collect();
+        // Every element slot's block satisfies its table at the DECLARED
+        // count — the earliest, name-carrying catch for an eval/table
+        // drift (a literal where the table reads a wire — the counts*
+        // padding found two; the zerocheck only says "the region sum is
+        // off"). Cheap: one satisfies() pass per slot at build time.
+        {
+            let mut bad = Vec::new();
+            for ((key, sl), z) in leaf_slot.iter().zip(&els) {
+                let t = shape.registry_slot(*sl);
+                if let Some(el) = shape.registry.types()[t].element_type() {
+                    if !el.satisfies(z, nu, shape.counts[t]) {
+                        bad.push(format!("key {key} (t{t}, count {})", shape.counts[t]));
+                    }
+                }
+            }
+            assert!(bad.is_empty(), "element slot unsatisfied at its declared count: {}", bad.join(", "));
+        }
         let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
             (shape.registry_slot(slots.b3), b3_lc),
             (shape.registry_slot(slots.swap), swap_lc),
@@ -12940,6 +13070,23 @@ impl ChildSlots {
         }
     }
 
+    /// The keyed cache view `pad_envelope_counts` consumes — envelope path
+    /// only (`new_env`; the skips are positional [skn, skc]).
+    fn env_cache(&self) -> Vec<(usize, flock_core::circuit::builder::SlotId)> {
+        let mut v = vec![
+            (600, self.macs),
+            (500, self.zcr),
+            (400, self.mrs),
+            (0, self.spine),
+            (601, self.alslot),
+            (510, self.skips[0]),
+            (511, self.skips[1]),
+        ];
+        v.extend(self.le.iter().map(|&(n, s)| (n, s)));
+        v.extend(self.resid.iter().filter(|&&(k, _)| k != 600).cloned());
+        v
+    }
+
     /// Every element-class slot, for the outer prover's slot inputs.
     fn element_slot_ids(&self) -> Vec<flock_core::circuit::builder::SlotId> {
         let mut v = vec![self.macs, self.zcr, self.mrs, self.spine, self.alslot];
@@ -16990,6 +17137,10 @@ fn build_node_outer(
         }
         let build_ms = t_tapes.elapsed().as_secs_f64() * 1e3 - tape_setup_ms;
         let t_build2 = std::time::Instant::now();
+        // counts*: the node declares the same vector the leaf does.
+        if let Some(e) = &env {
+            pad_envelope_counts(&mut sb, &cs.q, &cs.env_cache(), e, zw, &mut hints);
+        }
         let shape2 = sb.finish().expect("the 2->1 node circuit builds");
         assert!(
             shape2.circuit.cells().slots().len() <= 512,

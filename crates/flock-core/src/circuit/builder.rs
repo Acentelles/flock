@@ -467,6 +467,13 @@ impl ShapeBuilder {
         SlotId(self.slots.len() - 1)
     }
 
+    /// A declared slot's input arity — what a caller emitting gates
+    /// generically (e.g. count padding: fixed declared counts reached by
+    /// emitting zero-input gates) needs to size the input list.
+    pub fn slot_inputs(&self, s: SlotId) -> usize {
+        self.slots[s.0].n_in()
+    }
+
     /// A free value entering the circuit. It gets no producing cell, so it
     /// must be constrained by something — published, or consumed by a gate
     /// whose relation pins it.
