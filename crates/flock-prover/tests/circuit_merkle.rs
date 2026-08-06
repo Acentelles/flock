@@ -16405,14 +16405,21 @@ fn build_node_outer(
 
         let b3_rows = rt0.b3_rows + rt1.b3_rows + trace.rows.len();
         // MEASURED AND REJECTED (2026-08-05): over-provisioning nu by one
-        // bit to re-engage the pay-per-live arms. Boolean committed area is
-        // CAPACITY-shaped (M_bool 31→32 doubled the boolean stack; the open
-        // went 84→190 ms and level-1 prove 260→390), and the level-2
-        // element arms STILL ran dense (copies 206→182 ms — the dominant
-        // slots sit above the 50% gate even at half utilization). The
-        // level-2 dense-arm cost is Round-3 work (dead_rows_unread's
-        // predicate + element live-row reduction), not a capacity knob.
-        let nu2 = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7);
+        // bit to re-engage the pay-per-live arms. Boolean committed area was
+        // then CAPACITY-shaped (M_bool 31→32 doubled the boolean stack; the
+        // open went 84→190 ms and level-1 prove 260→390). RE-MEASURED
+        // 2026-08-05 post-stratified/slim/live via TOWER_NU_BUMP=1 (slim L2,
+        // steady): +1 nu costs only +7.3 ms prove (wiring +2.0 at μ+1, open
+        // +2.4, element PIOP +0.7, witgen +0.4; commit and boolean zc+lc
+        // FLAT, dense_m HELD at 28 — the committed stack is content-derived)
+        // — the old doubling no longer reproduces, so a nu-14 squeeze buys
+        // only ~5-7 ms and no proof bytes. The knob stays as the capacity-
+        // sensitivity probe.
+        let nu2 = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7)
+            + std::env::var("TOWER_NU_BUMP")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
         let mut sb = ShapeBuilder::new(nu2);
         let mut cs = ChildSlots::new(&mut sb, nu2, rt0.spread_w.max(rt1.spread_w));
         let mut vals: Vec<F128> = Vec::new();
