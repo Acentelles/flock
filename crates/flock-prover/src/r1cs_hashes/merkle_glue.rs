@@ -410,7 +410,7 @@ impl SwapTable {
 
 /// One swap's inputs. `bit_word` is a whole 128-bit word because it is wired;
 /// only bit 0 is read.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SwapInput {
     pub bit_word: u128,
     pub prev: [u32; SLOT_WORDS],

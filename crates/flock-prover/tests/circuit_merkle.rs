@@ -16758,6 +16758,35 @@ fn build_node_outer(
         let hint_refs: Vec<&(dyn std::any::Any + Sync)> =
             hints.iter().map(|h| h as &(dyn std::any::Any + Sync)).collect();
         let build_ms = build_ms + t_build2.elapsed().as_secs_f64() * 1e3;
+        // THE INDEX-FILL RUNNER (setup): compile the fill plan, then pin it
+        // row-identical against the generic walk before the online loop
+        // trusts it — publics, the three boolean row stores, and every
+        // element slot's packed witness, field for field. The walk stays the
+        // differential oracle; only the plan runs in the timed loop.
+        let t_plan = std::time::Instant::now();
+        let fill_plan = shape2.fill_plan();
+        let build_ms = build_ms + t_plan.elapsed().as_secs_f64() * 1e3;
+        {
+            let walk = shape2.run(&vals, &hint_refs);
+            let fill = shape2.run_filled(&fill_plan, &vals, &hint_refs);
+            assert_eq!(walk.public, fill.public, "fill plan: public segment");
+            assert_eq!(walk.witnesses, fill.witnesses, "fill plan: slot witnesses");
+            assert_eq!(
+                walk.rows::<Blake3Gate>(cs.q.b3),
+                fill.rows::<Blake3Gate>(cs.q.b3),
+                "fill plan: b3 rows"
+            );
+            assert_eq!(
+                walk.rows::<SwapGate>(cs.q.swap),
+                fill.rows::<SwapGate>(cs.q.swap),
+                "fill plan: swap rows"
+            );
+            assert_eq!(
+                walk.rows::<BitSpreadGate>(cs.q.spread),
+                fill.rows::<BitSpreadGate>(cs.q.spread),
+                "fill plan: spread rows"
+            );
+        }
         // The node proves and verifies over the circuit path. Union, PCS
         // params and the R1CS tables are per-SHAPE — offline, ahead of the
         // online loop.
@@ -16810,7 +16839,7 @@ fn build_node_outer(
             t.elapsed().as_secs_f64() * 1e3
         };
         let t_trace = std::time::Instant::now();
-        let mut built2 = shape2.run(&vals, &hint_refs);
+        let mut built2 = shape2.run_filled(&fill_plan, &vals, &hint_refs);
         let trace_ms = t_trace.elapsed().as_secs_f64() * 1e3;
 
         // The two child regions' checker walks — each child's whole
