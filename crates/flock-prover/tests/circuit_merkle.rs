@@ -90,9 +90,16 @@ fn tower_profile() -> LigeritoProfile {
 /// publics arithmetization −40k+ at the fixed point). No default until
 /// the call is made.
 fn envelope_floor_m() -> Option<usize> {
-    std::env::var("TOWER_ENV_M")
-        .ok()
-        .and_then(|v| v.parse().ok())
+    if let Ok(v) = std::env::var("TOWER_ENV_M") {
+        return v.parse().ok();
+    }
+    // Ron's call 2026-08-06: m* = 29 FIRST (the fixed point closes with
+    // ~2x slack; every slim level commits m29), re-target the tight 28
+    // later via the mac shave + publics diet — one deliberate re-pin.
+    match tower_profile() {
+        LigeritoProfile::Slim => Some(29),
+        _ => None,
+    }
 }
 
 /// A recursion-path OUTER's union instance, with the envelope floor
