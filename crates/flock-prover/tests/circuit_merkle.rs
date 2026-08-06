@@ -117,6 +117,120 @@ fn outer_union<'r>(
     u
 }
 
+/// Wall 2's registry-geometry constants at the settled envelope (slim,
+/// m* = 29): the UNION of the leaf-outer's and the node's type sets, at the
+/// envelope maxima. Measured at the m29 fixed point (envelope_registry_diff
+/// + the tower census, 2026-08-06):
+///
+/// - `spread_w` 20 = the m29 child ladder's max tree depth. The leaf's own
+///   m22 inner needs only 12; it declares the envelope width and leaves the
+///   high outputs unread (the node already runs its shallow levels over the
+///   one wide slot, so the emitters are width-generic by existing use).
+/// - `resid_pls` {12, 9, 6, 3, 0} = the m29 node ladder's suffix-fold
+///   counts, chunk_log 3 throughout; the leaf's own {6, 3, 0} is a subset
+///   and its two deep variants carry count 0.
+/// - `nu` 15: the L2 mac slot MEASURED 27,405 rows at m29 (the recorded
+///   17,975 was stale) — past 2^14, and the ~1.6k fused-dot shave cannot
+///   close an 11k gap, so nu* = 14 waits for the mac diet and rides the
+///   m* = 28 re-pin event.
+/// - 17 types / 262 io words cross the 256 cell-slot boundary → c = 9,
+///   mu = nu* + 9 = 24 tower-wide (measured ~+2 ms/node per mu step; the
+///   chunked spread (−4 words) plus a resid-family consolidation are the
+///   recorded way back under 256).
+///
+/// A ladder that drifts off these constants surfaces as a NEW slot at
+/// emission time and hence a registry-digest mismatch — the failure is
+/// loud, never silent.
+struct EnvShape {
+    nu: usize,
+    spread_w: usize,
+    resid_pls: [usize; 5],
+    pf_w: usize,
+}
+
+/// `Some` exactly when the DEFAULT envelope is active: the registry
+/// convergence below is pinned to m* = 29's measured geometry, so a
+/// `TOWER_ENV_M` override other than 29 gets the dense floor only (an
+/// experiment, not the envelope).
+fn envelope_shape() -> Option<EnvShape> {
+    (envelope_floor_m() == Some(29)).then(|| EnvShape {
+        nu: 15,
+        spread_w: 20,
+        resid_pls: [12, 9, 6, 3, 0],
+        pf_w: 8,
+    })
+}
+
+/// Find-or-create a slot under this file's keyed-cache scheme (lanes /
+/// 0 spine / 400 mrs / 500 zcr / 510 skn / 511 skc / 600 mac / 601 assist /
+/// 100+pl resid / 310+w prefix). Every element-slot declaration on the
+/// recursion path routes through this, so the envelope can pre-seed the
+/// cache (fixing the declaration order registry-wide) while the
+/// off-envelope path creates on first use, in the historical order,
+/// byte-identically.
+fn slot_cached<G>(
+    sb: &mut ShapeBuilder,
+    cache: &mut Vec<(usize, flock_core::circuit::builder::SlotId)>,
+    key: usize,
+    mk: impl FnOnce() -> G,
+) -> flock_core::circuit::builder::SlotId
+where
+    G: GateType + Send + Sync + 'static,
+    G::Row: Send + 'static,
+    G::Hint: 'static,
+{
+    match cache.iter().find(|&&(k, _)| k == key) {
+        Some(&(_, s)) => s,
+        None => {
+            let s = sb.slot(mk());
+            cache.push((key, s));
+            s
+        }
+    }
+}
+
+/// Declare the envelope's 17 table types in the ONE canonical order (wall
+/// 2). `Registry::new` sorts class-major then k_log-descending with a
+/// STABLE sort, so the declaration order here fixes every same-k_log
+/// tie-break — the leaf-outer and node registries become the same sorted
+/// type list, which together with nu* is registry-digest equality. Returns
+/// the boolean trio; every element type pre-seeds `cache` under the keyed
+/// scheme so both builders' demand sites hit the cache instead of
+/// declaring. The order is the node's historical one with the leaf-only
+/// types (SkipNode/SkipClose) appended inside their k_log group.
+fn declare_envelope_slots(
+    sb: &mut ShapeBuilder,
+    nu: usize,
+    cache: &mut Vec<(usize, flock_core::circuit::builder::SlotId)>,
+    env: &EnvShape,
+) -> CollapsedSlots {
+    debug_assert_eq!(nu, env.nu, "the envelope declares at nu*");
+    let q = CollapsedSlots {
+        b3: sb.slot(Blake3Gate { nu }),
+        swap: sb.slot(SwapGate { nu }),
+        spread: sb.slot(BitSpreadGate {
+            ty: BitSpreadTable::new(env.spread_w),
+            nu,
+        }),
+    };
+    slot_cached(sb, cache, 600, MacGate::new);
+    slot_cached(sb, cache, 500, ZcRoundGate::new);
+    slot_cached(sb, cache, 400, MergedRoundGate::new);
+    slot_cached(sb, cache, 0, SpineGate::new);
+    slot_cached(sb, cache, 601, AssistLayerGate::new);
+    slot_cached(sb, cache, 510, SkipNodeGate::new);
+    slot_cached(sb, cache, 511, SkipCloseGate::new);
+    slot_cached(sb, cache, 8, || LeafEvalGate::new(8));
+    for &pl in &env.resid_pls {
+        let lmc = pl + 3; // chunk_log 3 — both ladders' yr_log >= 3
+        slot_cached(sb, cache, 100 + pl, || {
+            ResidualGate::new(lmc, pl, 3, &sk_at_vks(lmc))
+        });
+    }
+    slot_cached(sb, cache, 310 + env.pf_w, || PrefixGate::new(env.pf_w));
+    q
+}
+
 const DOMAIN: &[u8] = b"flock-circuit-merkle-v0";
 
 const CHUNK_START: u32 = 1 << 0;
@@ -5778,13 +5892,19 @@ fn emit_residual_region(
         debug_assert_eq!(&sks[..], &sks_full[..lmc + 1], "sk_at_vks is prefix-stable");
         // Cache-keyed so a SECOND same-shape region (the mvp11 merge node's
         // two children) reuses the slot instead of duplicating its columns.
-        // Reuse is sound exactly when the constructor parameters match —
-        // per-level keys, so same-shape callers only.
-        let rslot = match leaf_slot.iter().find(|&&(k, _)| k == 100 + li) {
+        // Reuse is sound exactly when the constructor parameters match, and
+        // `pl` IS the parameter (`lmc = pl + chunk_log`, `sks` a function of
+        // `lmc`; `chunk_log` is region-wide) — so the key is `100 + pl`, not
+        // the level ordinal: two ladders of different depth land their
+        // same-pl levels on ONE slot, which is what the envelope's
+        // cross-side pre-seeding needs. Distinct per level within a ladder
+        // (pl strictly decreases), so off-envelope this keys identically to
+        // the old per-level scheme.
+        let rslot = match leaf_slot.iter().find(|&&(k, _)| k == 100 + pl) {
             Some(&(_, s)) => s,
             None => {
                 let s = sb.slot(ResidualGate::new(lmc, pl, chunk_log, &sks));
-                leaf_slot.push((100 + li, s));
+                leaf_slot.push((100 + pl, s));
                 s
             }
         };
@@ -12723,8 +12843,9 @@ struct ChildSlots {
     /// The residual region's keyed slot cache (`emit_residual_region`'s
     /// `leaf_slot`). Key scheme: `600` = the shared MacGate (pre-seeded,
     /// so close-out rows land on `macs` instead of a duplicate type);
-    /// `100 + level` = that opened level's ResidualGate; `310 + width` =
-    /// the shared PrefixGate at that width (the eq/prefix-product rows —
+    /// `100 + pl` = the ResidualGate at that suffix-fold count (pl is the
+    /// type's real parameter — see `emit_residual_region`); `310 + width`
+    /// = the shared PrefixGate at that width (the eq/prefix-product rows —
     /// NOT a residual gate, it merely lives in this cache).
     resid: Vec<(usize, flock_core::circuit::builder::SlotId)>,
 }
@@ -17438,6 +17559,28 @@ fn mvp12_recursion_tower() {
         bincode::serialize(&n2.proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
         converged,
     );
+    // The envelope's nu* driver: per-level max type count (nu must cover
+    // the largest slot at EVERY level, so the tower's nu* = the max here).
+    for (name, n) in [("level-1", &n0), ("level-2", &n2)] {
+        let (t_max, c_max) = n
+            .shape
+            .counts
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, c)| *c)
+            .map(|(t, c)| (t, *c))
+            .unwrap();
+        println!(
+            "  {name} nu {} | max count {} at t{} ({}/{} io {}) | counts {:?}",
+            n.shape.registry.nu(),
+            c_max,
+            t_max,
+            n.shape.registry.types()[t_max].useful_bits,
+            if n.shape.registry.types()[t_max].is_element() { "el" } else { "bool" },
+            n.shape.registry.types()[t_max].io_schema.len(),
+            n.shape.counts,
+        );
+    }
 }
 
 /// RECONNAISSANCE for the envelope's registry convergence (wall 2): the
