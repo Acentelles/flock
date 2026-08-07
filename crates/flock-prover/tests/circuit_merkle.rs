@@ -20057,6 +20057,57 @@ fn chain_tower_three_levels_one_internal_digest() {
             n0.pcs.num_lanes,
             n2.pcs.num_lanes,
         );
+        // Rows and publics equal but digests differ ⇒ the WIRING differs.
+        // wires() is the class list (each a set of cell indices), so the
+        // first differing class names the emission site.
+        let (w0, w2) = (n0.shape.circuit.wires(), n2.shape.circuit.wires());
+        println!("    wire classes: {} vs {}", w0.len(), w2.len());
+        let mut shown = 0;
+        for (i, (a, b)) in w0.iter().zip(w2).enumerate() {
+            if a != b {
+                println!(
+                    "    class {i}: len {} vs {}\n      L2 {:?}\n      L3 {:?}",
+                    a.len(),
+                    b.len(),
+                    &a[..a.len().min(6)],
+                    &b[..b.len().min(6)],
+                );
+                shown += 1;
+                if shown >= 3 {
+                    break;
+                }
+            }
+        }
+        let n_diff = w0.iter().zip(w2).filter(|(a, b)| a != b).count();
+        println!("    {n_diff} of {} classes differ", w0.len().min(w2.len()));
+        // Decode the differing cells: cell_index = (cell_slot << nu) | row.
+        let cs = n0.shape.circuit.cells();
+        let nu = cs.nu();
+        let mut seen: Vec<usize> = Vec::new();
+        for (a, b) in w0.iter().zip(w2) {
+            if a != b {
+                for &c in a.iter().take(4) {
+                    let sl = c >> nu;
+                    if !seen.contains(&sl) {
+                        seen.push(sl);
+                    }
+                }
+            }
+        }
+        for sl in seen {
+            let d = cs.slots()[sl];
+            let extra = match d {
+                flock_core::circuit::CellSlot::Gate { ty, .. } => {
+                    let t = &n0.shape.registry.types()[ty];
+                    format!(
+                        " -> registry type {ty}: {} useful_bits, k_log {}",
+                        t.useful_bits, t.k_log
+                    )
+                }
+                _ => String::new(),
+            };
+            println!("    cell-slot {sl}: {d:?}{extra}");
+        }
     }
     assert_eq!(
         n2.shape.circuit.digest(),
