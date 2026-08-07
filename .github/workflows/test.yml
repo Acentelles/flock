@@ -2,10 +2,20 @@
 # scheme follows succinctlabs/sp1 (.github/workflows/pr.yml `test-*` jobs).
 #
 # Both architecture legs matter: arm64 exercises the NEON kernels the crates
-# are tuned for, while the x86_64 leg pins znver4 so the AVX-512 kernels
-# compile and their tests run. Tests run --release (the field/NTT paths are
-# too slow under the dev profile) but with debug assertions and overflow
+# are tuned for, while the x86_64 leg pins a target-cpu with AVX-512 so those
+# kernels compile and their tests run. Tests run --release (the field/NTT paths
+# are too slow under the dev profile) but with debug assertions and overflow
 # checks re-enabled, matching sp1's test RUSTFLAGS.
+#
+# The x86_64 target-cpu must match the instance family runs-on gives us for
+# `16cpu-linux-x64`, currently Intel c7i-flex (Sapphire Rapids). znver4 is
+# wrong here: it enables sse4a, LLVM emits INSERTQ in ntt::compute_twiddles,
+# and the test binary dies with SIGILL on an Intel CPU. sapphirerapids keeps
+# avx512f/avx512bw/gfni/vpclmulqdq -- everything the kernel cfgs gate on --
+# without the AMD-only extensions. Note x86-64-v4 is not a substitute: it has
+# no gfni or vpclmulqdq, so those kernels would fall back to portable code and
+# go untested. Kernel dispatch is compile-time cfg with no runtime detection,
+# so any target-cpu/runner mismatch fails as a hard crash, not a fallback.
 
 name: Test
 
@@ -31,7 +41,7 @@ jobs:
             rustflags: -C target-cpu=native
           - arch: x86_64-avx512
             runner: 16cpu-linux-x64
-            rustflags: -C target-cpu=znver4
+            rustflags: -C target-cpu=sapphirerapids
     runs-on:
       [
         runs-on,
