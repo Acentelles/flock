@@ -12017,6 +12017,10 @@ struct FlNode {
     lo: LeafOuter,
     acc: flock_core::aggregate::Accumulator,
     stmt_base: usize,
+    /// The published fold blocks' base: per group `[rho_col | rho_row |
+    /// value]` — the accumulator claims a PARENT's lane fold connects to
+    /// wire-to-wire (a prior's surface IS this published block).
+    fold_pub_base: usize,
     h_start: [u32; 16],
     h_end: [u32; 16],
 }
@@ -12575,6 +12579,7 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
             },
             acc: acc_pub,
             stmt_base,
+            fold_pub_base,
             h_start: cp0.h_start,
             h_end: cp1.h_end,
         }
@@ -17826,8 +17831,27 @@ fn build_node_outer(
     lo0: &LeafOuter,
     lo1: &LeafOuter,
 ) -> (LeafOuter, flock_core::aggregate::Accumulator, NodeTimings) {
-    let (lo, acc, t, _) = build_node_outer_app(lo0, lo1, None);
+    let (lo, acc, t, _, _) = build_node_outer_app(lo0, lo1, None, None);
     (lo, acc, t)
+}
+
+/// A LOWER-registry accumulator lane riding through an internal node
+/// (task 6): the two children each carry an accumulator over a registry
+/// that is NOT the fold's own (the chain registry at the first level), so
+/// it cannot join the node's fold as a prior — it folds in its OWN
+/// priors-only aggregate, whose prior surfaces connect WIRE-TO-WIRE to
+/// the children's published accumulator claims (`claims_base` locates
+/// them; a prior's surface IS what the child published).
+struct ChainLane<'a> {
+    registry: &'a flock_prover::schedule::Registry,
+    mats: &'a [flock_core::aggregate::TypeMatrices<'a>],
+    circs: &'a [&'a dyn flock_core::lincheck::LincheckCircuit],
+    /// The lane's sigma table owner (the chain circuit).
+    circuit: &'a flock_core::circuit::Circuit,
+    priors: [&'a flock_core::aggregate::Accumulator; 2],
+    /// The published `[rho_col | rho_row | value]` fold blocks' base in
+    /// EACH child's public segment (both children share the layout).
+    claims_base: usize,
 }
 
 /// [`build_node_outer`] with the APPLICATION-STATEMENT plumbing: when the
@@ -17840,11 +17864,13 @@ fn build_node_outer_app(
     lo0: &LeafOuter,
     lo1: &LeafOuter,
     app_stmt: Option<usize>,
+    lane: Option<ChainLane<'_>>,
 ) -> (
     LeafOuter,
     flock_core::aggregate::Accumulator,
     NodeTimings,
     Option<usize>,
+    Option<flock_core::aggregate::Accumulator>,
 ) {
     use flock_core::aggregate;
     use flock_core::matrix_fold::{FoldProof, MatrixClaim};
@@ -18003,6 +18029,84 @@ fn build_node_outer_app(
     let (sig_digest, sig_claim) = acc_v.sigma.as_ref().expect("sigma accumulated");
     assert_eq!(outs[n_folds - 1], *sig_claim, "sigma accumulator");
     assert_eq!(*sig_digest, lo0.shape.circuit.digest(), "sigma key");
+
+    // ---- the LANE (task 6): the children's LOWER-registry accumulators
+    // fold PRIORS-ONLY — natively here, in-circuit below. 3 groups
+    // (bool A/B + sigma) × [priorL, priorR], no fresh claims. ----
+    const LANE_DOMAIN: &[u8] = b"flock-chain-lane-v0";
+    let lane_native = lane.as_ref().map(|ln| {
+        let el_asserts_l: [(
+            &UnionInstance<'_>,
+            flock_core::element_r1cs::union::ElementAssertion,
+        ); 0] = [];
+        let mut chp = FsChallenger::with_chained_blake3(LANE_DOMAIN);
+        let (lagg, lacc_p) = aggregate::prove_aggregate_classes(
+            ln.registry,
+            ln.mats,
+            ln.circs,
+            &[],
+            &[],
+            &el_asserts_l,
+            Some((ln.circuit, &[])),
+            &ln.priors,
+            &mut chp,
+        )
+        .expect("the lane fold proves");
+        let mut lrec =
+            RecordingChallenger::new(FsChallenger::with_chained_blake3(LANE_DOMAIN));
+        let lacc_v = aggregate::verify_aggregate_classes(
+            ln.registry,
+            &[],
+            &el_asserts_l,
+            Some((ln.circuit, &[])),
+            &ln.priors,
+            &lagg,
+            &mut lrec,
+        )
+        .expect("the lane fold verifies");
+        assert_eq!(lacc_p, lacc_v, "lane prover and verifier agree");
+        let lclaims: Vec<Vec<MatrixClaim>> = vec![
+            vec![
+                ln.priors[0].per_type[0].0.clone(),
+                ln.priors[1].per_type[0].0.clone(),
+            ],
+            vec![
+                ln.priors[0].per_type[0].1.clone(),
+                ln.priors[1].per_type[0].1.clone(),
+            ],
+            vec![
+                ln.priors[0].sigma.as_ref().expect("lane prior sigma").1.clone(),
+                ln.priors[1].sigma.as_ref().expect("lane prior sigma").1.clone(),
+            ],
+        ];
+        let lproofs: Vec<&FoldProof> = vec![
+            &lagg.folds[0].0,
+            &lagg.folds[0].1,
+            lagg.sigma_fold.as_ref().expect("lane sigma fold"),
+        ];
+        let lops: Vec<Op> = lrec.shape().ops().to_vec();
+        let lvals: Vec<F128> = lrec.values().to_vec();
+        let lchals: Vec<F128> = lrec.challenges().to_vec();
+        let mut want: Vec<Op> = vec![
+            Op::Label(b"flock-aggregate-v0".to_vec()),
+            Op::ObserveBytes(32),
+            Op::ObserveBytes(1),
+        ];
+        want.extend(fold_region_ops(&lclaims));
+        assert_eq!(lops, want, "the lane tape shape");
+        assert_eq!(lrec.payloads()[0], ln.registry.digest(), "lane registry digest");
+        assert_eq!(lrec.payloads()[1], vec![2u8], "lane prior count 2");
+        let llocs = locate_and_pin_folds(&lclaims, &lproofs, &lvals, &lchals);
+        let louts = replay_fold_endpoints(&llocs, &lvals, &lchals);
+        assert_eq!(louts[0], lacc_v.per_type[0].0, "lane boolean A");
+        assert_eq!(louts[1], lacc_v.per_type[0].1, "lane boolean B");
+        let (ld, lc2) = lacc_v.sigma.as_ref().expect("lane sigma out");
+        assert_eq!(louts[2], *lc2, "lane sigma accumulator");
+        assert_eq!(*ld, ln.circuit.digest(), "lane sigma keys by the chain circuit");
+        let lstream = lrec.shape().stream_words_duplex(LANE_DOMAIN);
+        let lbytes = lstream.to_bytes(lrec.values(), lrec.payloads());
+        (lacc_v, llocs, lstream, lbytes, lops, lchals, lvals)
+    });
 
     // ---- ONE outer: two REAL child regions + the fold region ----
     let outer_stats = {
@@ -18372,6 +18476,99 @@ fn build_node_outer_app(
             }
             base
         });
+        // ---- the LANE fold region, in-circuit: priors-only, every prior
+        // surface WIRED to the child's published accumulator claim (a
+        // prior's surface IS what the child published — the child_pub_w
+        // words at claims_base, layout [rho_col | rho_row | value] per
+        // group), lows to the constant 1. Its own chain block rides the
+        // shared b3 slot; the fold rows the shared mac/mrs/prefix slots.
+        let lane_pub = lane_native.as_ref().map(|ln2| {
+            let (_, llocs, lstream, lbytes, lops, lchals, lvals) = ln2;
+            let lane_ref = lane.as_ref().expect("lane native implies lane");
+            let mut lchain = FsChainSponge::new();
+            let mut at = 0usize;
+            let lfin: Vec<_> = lops.iter().filter(|o| o.finalizes()).collect();
+            assert_eq!(lstream.finalize_after.len(), lfin.len(), "lane finalize alignment");
+            for (k, &upto) in lstream.finalize_after.iter().enumerate() {
+                lchain.absorb(&lbytes[at * 16..upto * 16]);
+                at = upto;
+                lchain.finalize(lfin[k].squeezed_bytes());
+            }
+            lchain.absorb(&lbytes[at * 16..]);
+            let ltrace = lchain.finish();
+            let lpub_payloads = bytes_payload_mask(lops);
+            let (lchain_outs, lww) = emit_fs_chain(
+                &mut sb,
+                cs.q.b3,
+                iv2,
+                &ltrace,
+                lstream,
+                lbytes,
+                &mut vals,
+                &mut consts,
+                &lpub_payloads,
+            );
+            let mut lvmap: Vec<Option<usize>> = Vec::new();
+            for (wi, w) in lstream.words.iter().enumerate() {
+                if let flock_core::transcript_record::StreamWord::Value(vi) = *w {
+                    if lvmap.len() <= vi {
+                        lvmap.resize(vi + 1, None);
+                    }
+                    lvmap[vi] = Some(wi);
+                }
+            }
+            let lwv =
+                |vi: usize| -> Wire { lww[lvmap[vi].expect("lane word")].expect("lane wired") };
+            let (lfold_pubs, lalpha_recs) = emit_fold_region(
+                &mut sb,
+                cs.macs,
+                cs.mrs,
+                pfslot,
+                pf_w,
+                leslot,
+                llocs,
+                &ltrace.squeezes,
+                &lchain_outs,
+                &lww,
+                &lvmap,
+                lchals,
+                lvals,
+                &mut vals,
+                zw,
+                ow,
+            );
+            for (k, rk) in [&r0, &r1].into_iter().enumerate() {
+                let mut off = lane_ref.claims_base;
+                for loc in llocs {
+                    let cl = &loc.claims[k];
+                    for j in 0..cl.col_pt_n {
+                        sb.connect(lwv(cl.col_pt_v + j), rk.child_pub_w[off + j]);
+                    }
+                    for j in 0..cl.row_pt_n {
+                        sb.connect(lwv(cl.row_pt_v + j), rk.child_pub_w[off + loc.k_col + j]);
+                    }
+                    sb.connect(
+                        lwv(cl.value_v),
+                        rk.child_pub_w[off + loc.k_col + loc.k_row],
+                    );
+                    sb.connect(lwv(cl.row_low_v), ow);
+                    sb.connect(lwv(cl.col_low_v), ow);
+                    off += loc.k_col + loc.k_row + 1;
+                }
+            }
+            let lane_pub_base = sb.public_len();
+            for fp in &lfold_pubs {
+                for &w in &fp.rho_col {
+                    sb.publish(w);
+                }
+                for &w in &fp.rho_row {
+                    sb.publish(w);
+                }
+                sb.publish(fp.value);
+            }
+            let lane_words = sb.public_len() - lane_pub_base;
+            (lane_pub_base, lane_words, lalpha_recs)
+        });
 
         if std::env::var("MAC_CENSUS").is_ok() {
             let mac_total = sb.rows_in_slot(cs.macs);
@@ -18617,11 +18814,38 @@ fn build_node_outer_app(
                 F128::ZERO,
                 "the lows' assert-zero anchor"
             );
+            // The REAL segment ends at the last publish block: the lane's
+            // fold blocks when a lane rides (its emitter also declares its
+            // own boundary publics before them), else the node's fold
+            // blocks + the app block.
+            let seg_end = lane_pub
+                .as_ref()
+                .map(|&(b, w, _)| b + w)
+                .unwrap_or(
+                    fold_pub_base + tail_len + if app_base.is_some() { 8 } else { 0 },
+                );
             assert_eq!(
-                fold_pub_base + tail_len + if app_base.is_some() { 8 } else { 0 },
-                prepad_publics2,
-                "the fold blocks (+ app block) end the REAL segment"
+                seg_end, prepad_publics2,
+                "the last publish block ends the REAL segment"
             );
+            // The LANE accumulator, reassembled from the public segment
+            // alone — the parent-facing statement of the lower registry.
+            if let (Some((lpb, _, lar)), Some((lacc_n, llocs, ..))) =
+                (lane_pub.as_ref(), lane_native.as_ref())
+            {
+                let lrebuilt = check_fold_publics(&built2.public, *lpb, llocs, lar);
+                let lane_ref = lane.as_ref().expect("lane");
+                let lacc_pub2 = aggregate::Accumulator {
+                    registry_digest: lane_ref.registry.digest(),
+                    per_type: vec![(lrebuilt[0].clone(), lrebuilt[1].clone())],
+                    per_element: Vec::new(),
+                    sigma: Some((lane_ref.circuit.digest(), lrebuilt[2].clone())),
+                };
+                assert_eq!(
+                    &lacc_pub2, lacc_n,
+                    "the LANE accumulator, reassembled from publics alone"
+                );
+            }
         }
 
         let t_asm = std::time::Instant::now();
@@ -18794,6 +19018,7 @@ fn build_node_outer_app(
                 verify_ms,
             },
             app_base,
+            lane_native.map(|(a, ..)| a),
         )
     };
     outer_stats
@@ -18829,7 +19054,8 @@ fn internal_node_over_two_fl_nodes() {
     assert_eq!(fl0.stmt_base, fl1.stmt_base, "one statement offset");
     assert_eq!(fl1.h_start, fl0.h_end, "the FL spans are adjacent");
 
-    let (node, acc, _t, app) = build_node_outer_app(&fl0.lo, &fl1.lo, Some(fl0.stmt_base));
+    let (node, acc, _t, app, _lane) =
+        build_node_outer_app(&fl0.lo, &fl1.lo, Some(fl0.stmt_base), None);
     let app = app.expect("the internal node carries the app block");
     for j in 0..4 {
         assert_eq!(
@@ -18860,6 +19086,221 @@ fn internal_node_over_two_fl_nodes() {
     println!(
         "\nINTERNAL NODE over two first-level nodes (app-statement plumbed)\n  \
          span: H^{}(h_start) | internal outer: nu {} | mu {} | publics {} | proof {:.1} KiB\n",
+        4 * n_blocks,
+        node.shape.circuit.cells().nu(),
+        node.shape.circuit.cells().mu(),
+        node.public.len(),
+        bincode::serialize(&node.proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
+    );
+}
+
+/// **Task 6: THE CHAIN TOWER, END TO END, WITH THE LANE.** Four chain
+/// segments → two first-level nodes → one internal node; the chain-level
+/// accumulators ride the internal node as a PRIORS-ONLY LANE (their
+/// registry differs from the FL fold's, so they cannot join it), with the
+/// prior surfaces connected WIRE-TO-WIRE to the children's published
+/// accumulator claims — mvp11's recorded prediction ("a prior's surface
+/// IS what a previous outer publishes") landing. The ROOT then discharges
+/// BOTH lanes — the chain lane against the chain b3 matrices + the chain
+/// circuit's sigma table, the FL lane against the FL mats/element
+/// types/digest — and reads the statement h_end == H^1024(h_start). Plus
+/// the tamper matrix: a tampered FL statement word, a tampered lane
+/// prior, and a tampered internal app word all die.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn chain_tower_e2e_with_lane() {
+    use flock_core::aggregate;
+
+    let n_blocks = 256usize;
+    let mut rng = Rng(0xC4A1_0007);
+    let h0: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let cp0 = build_chain_proof(h0, n_blocks);
+    let cp1 = build_chain_proof(cp0.h_end, n_blocks);
+    let cp2 = build_chain_proof(cp1.h_end, n_blocks);
+    let cp3 = build_chain_proof(cp2.h_end, n_blocks);
+    let fl0 = build_fl_node(&cp0, &cp1);
+    let fl1 = build_fl_node(&cp2, &cp3);
+    assert_eq!(fl0.fold_pub_base, fl1.fold_pub_base, "one fold-block layout");
+
+    // The lane's registry materials — the CHAIN side.
+    let chain_registry = &cp0.inner.built.shape.registry;
+    let blake_r1cs = blake3::build_block_r1cs(cp0.inner.nu);
+    let blake_lc = blake_r1cs.csc_lincheck_circuit();
+    let chain_mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
+    let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
+    let lane = ChainLane {
+        registry: chain_registry,
+        mats: &chain_mats,
+        circs: &chain_circs,
+        circuit: &cp0.inner.built.shape.circuit,
+        priors: [&fl0.acc, &fl1.acc],
+        claims_base: fl0.fold_pub_base,
+    };
+    let (node, acc, _t, app, lane_acc) =
+        build_node_outer_app(&fl0.lo, &fl1.lo, Some(fl0.stmt_base), Some(lane));
+    let app = app.expect("the app block rode");
+    let lane_acc = lane_acc.expect("the lane rode");
+
+    // ---- THE ROOT ----
+    // (1) The statement: the whole span, out of the internal node's publics.
+    for j in 0..4 {
+        assert_eq!(
+            node.public[app + j],
+            pack4(cp0.h_start[4 * j..4 * j + 4].try_into().unwrap()),
+        );
+        assert_eq!(
+            node.public[app + 4 + j],
+            pack4(cp3.h_end[4 * j..4 * j + 4].try_into().unwrap()),
+        );
+    }
+    assert_eq!(cp3.h_end, native_chain(&cp0.h_start, 4 * n_blocks));
+    // (2) The CHAIN lane discharges: boolean vs the chain b3 matrices,
+    // sigma vs the chain circuit's own (masked) sigma table.
+    assert!(lane_acc.discharge(&chain_mats), "chain-lane boolean discharges");
+    assert!(lane_acc.per_element.is_empty(), "the chain lane has no element group");
+    assert!(
+        lane_acc.discharge_sigma(&cp0.inner.built.shape.circuit),
+        "chain-lane sigma discharges against the chain circuit"
+    );
+    // (3) The FL lane discharges: boolean vs the FL b3/swap/spread mats
+    // (registry order), element vs the FL element types, sigma vs the FL
+    // circuit digest's table.
+    let mut mats_ord = vec![
+        (fl0.lo.b3_slot, (&fl0.lo.b3_r1cs.a_0, &fl0.lo.b3_r1cs.b_0)),
+        (
+            fl0.lo.swap_slot,
+            (&fl0.lo.swap_r1cs.a_0, &fl0.lo.swap_r1cs.b_0),
+        ),
+        (
+            fl0.lo.spread_slot,
+            (&fl0.lo.spread_r1cs.a_0, &fl0.lo.spread_r1cs.b_0),
+        ),
+    ];
+    mats_ord.sort_by_key(|&(i, _)| i);
+    let fl_mats: Vec<_> = mats_ord.iter().map(|&(_, m)| m).collect();
+    assert!(acc.discharge(&fl_mats), "FL-lane boolean discharges");
+    let fl_el_mats: Vec<_> = fl0
+        .lo
+        .shape
+        .registry
+        .element_types()
+        .iter()
+        .map(|t| {
+            let e = t.element_type().expect("element table");
+            (e.a_0(), e.b_0())
+        })
+        .collect();
+    assert!(
+        acc.discharge_element(&fl_el_mats),
+        "FL-lane element discharges"
+    );
+    assert!(
+        acc.discharge_sigma(&fl0.lo.shape.circuit),
+        "FL-lane sigma discharges"
+    );
+
+    // ---- the tamper matrix ----
+    // (a) A tampered FL STATEMENT word (its h_end): the FL proof must not
+    //     verify against it — the adjacency data is statement-bound.
+    {
+        let union_f = outer_union(&fl0.lo.shape.registry, fl0.lo.shape.counts.clone());
+        let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
+            (fl0.lo.b3_slot, fl0.lo.b3_r1cs.csc_lincheck_circuit()),
+            (fl0.lo.swap_slot, fl0.lo.swap_r1cs.csc_lincheck_circuit()),
+            (fl0.lo.spread_slot, fl0.lo.spread_r1cs.csc_lincheck_circuit()),
+        ];
+        lcs_ord.sort_by_key(|(i, _)| *i);
+        let lcs_f: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
+            lcs_ord.into_iter().map(|(_, c)| c).collect();
+        let mut bad = fl0.lo.public.clone();
+        bad[fl0.stmt_base + 4] += F128::ONE;
+        let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
+        assert!(
+            verifier::verify_ligerito_union_circuit(
+                &union_f,
+                &fl0.lo.shape.circuit,
+                &bad,
+                &lcs_f,
+                &fl0.lo.commitment,
+                &fl0.lo.proof,
+                &fl0.lo.pcs,
+                &mut ch,
+            )
+            .is_err(),
+            "a tampered FL h_end must be rejected"
+        );
+    }
+    // (b) A tampered LANE PRIOR: the fold proof no longer matches.
+    {
+        let mut bad_acc = fl0.acc.clone();
+        bad_acc.per_type[0].0.value += F128::ONE;
+        let el_asserts_l: [(
+            &UnionInstance<'_>,
+            flock_core::element_r1cs::union::ElementAssertion,
+        ); 0] = [];
+        let mut chp = FsChallenger::with_chained_blake3(b"flock-chain-lane-tamper");
+        let (lagg, _) = aggregate::prove_aggregate_classes(
+            chain_registry,
+            &chain_mats,
+            &chain_circs,
+            &[],
+            &[],
+            &el_asserts_l,
+            Some((&cp0.inner.built.shape.circuit, &[])),
+            &[&fl0.acc, &fl1.acc],
+            &mut chp,
+        )
+        .expect("honest lane fold proves");
+        let mut ch = FsChallenger::with_chained_blake3(b"flock-chain-lane-tamper");
+        assert!(
+            aggregate::verify_aggregate_classes(
+                chain_registry,
+                &[],
+                &el_asserts_l,
+                Some((&cp0.inner.built.shape.circuit, &[])),
+                &[&bad_acc, &fl1.acc],
+                &lagg,
+                &mut ch,
+            )
+            .is_err(),
+            "a tampered inherited claim must be rejected by the lane fold"
+        );
+    }
+    // (c) A tampered INTERNAL app word: the internal proof's statement is
+    //     bound the same way.
+    {
+        let union_n = outer_union(&node.shape.registry, node.shape.counts.clone());
+        let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
+            (node.b3_slot, node.b3_r1cs.csc_lincheck_circuit()),
+            (node.swap_slot, node.swap_r1cs.csc_lincheck_circuit()),
+            (node.spread_slot, node.spread_r1cs.csc_lincheck_circuit()),
+        ];
+        lcs_ord.sort_by_key(|(i, _)| *i);
+        let lcs_n: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
+            lcs_ord.into_iter().map(|(_, c)| c).collect();
+        let mut bad = node.public.clone();
+        bad[app + 7] += F128::ONE;
+        let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
+        assert!(
+            verifier::verify_ligerito_union_circuit(
+                &union_n,
+                &node.shape.circuit,
+                &bad,
+                &lcs_n,
+                &node.commitment,
+                &node.proof,
+                &node.pcs,
+                &mut ch,
+            )
+            .is_err(),
+            "a tampered internal h_end must be rejected"
+        );
+    }
+
+    println!(
+        "\nCHAIN TOWER E2E (4 chains -> 2 FL -> 1 internal, lane threaded)\n  \
+         root statement: h_end == H^{}(h_start) | both lanes discharge | tampers die\n  \
+         internal outer: nu {} | mu {} | publics {} | proof {:.1} KiB\n",
         4 * n_blocks,
         node.shape.circuit.cells().nu(),
         node.shape.circuit.cells().mu(),
