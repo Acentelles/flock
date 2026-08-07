@@ -21,6 +21,9 @@
 // is shared-load-throughput bound (L1/LDS pipe 71%, 111M LDS instructions), so the
 // 768 B log/antilog tables beat both the 64 KB L2 f8mul gather (1.59) and deferred
 // clmad (-DZC_CS_CLMAD, 1.16). Define ZC_CS_F8MUL to get the L2-table path back.
+// Re-confirmed on cpustyle3 at m=33: log 15.78, clmad 16.62, clmul 16.76, f8mul
+// 24.70 ms. Staging the columns through s_scol also still pays (-DZC_CS_NOSCOL,
+// which reads them straight from global, costs +9%).
 #if !defined(ZC_CS_LOG) && !defined(ZC_CS_CLMUL) && !defined(ZC_CS_CLMAD) && !defined(ZC_CS_F8MUL)
 #define ZC_CS_LOG
 #endif
@@ -589,8 +592,14 @@ inline void launch_zc_round1_cpustyle3(const uint8_t* d_a, const uint8_t* d_b, c
                                        const F128* d_eq_out, long long n_out,
                                        const F128* d_convert, F128 scale,
                                        F128* d_round1_ab, F128* d_round1_c) {
+// Warps per block. 14, not the 16 that fits the 48 KB static-shared ceiling: at 72
+// registers/thread a second block per SM needs 2·W·32·72 <= 65536, i.e. W <= 14.22.
+// W=16 clears the shared limit but misses the register file, so it runs ONE block
+// per SM (16 warps) where W=14 runs two (28 warps) — measured -8% round-1 at m=29,
+// 32 and 33 alike, and W=15 falls straight back to W=16's time. Re-derive this if
+// the kernel's register count moves; the cliff is sharp on both sides.
 #ifndef ZC_CS3_W
-#define ZC_CS3_W 16
+#define ZC_CS3_W 14
 #endif
     constexpr int W = ZC_CS3_W;
 #ifdef ZC_CS_LOG
