@@ -10831,12 +10831,36 @@ fn emit_real_child_region(
         .iter()
         .map(|&(t_c, t_next, _)| {
             let mut factors = Vec::with_capacity(2 * (m_mp2 + 1));
+            // THE ONE SITE WHERE THE CHILD'S COUNTS ENTER THE PARENT'S
+            // CIRCUIT AS STRUCTURE. `rt.bounds_i` is the assist boundary
+            // list — the JAGGED RUN BOUNDARIES, i.e. the prefix sums of the
+            // child's per-type heights — and its bits are baked here as
+            // `ow`/`zw`. SP1 carries exactly these (`col_prefix_sums` as
+            // `Point<Felt>`, <=30 prover-supplied bits) and binds them by
+            // hashing the counts into the commitment.
+            //
+            // ENV_BITS_ADVICE=1 supplies them as advice wires instead —
+            // DELIBERATELY UNBOUND, a measurement of the STRUCTURAL claim
+            // only (does the leak close, and is it cell-neutral?). Shipping
+            // this needs the bits bound: the counts into the statement
+            // binding, then an in-circuit reconstruction, which is what
+            // SP1's PrefixSumChecks precompile does.
+            let bit_advice = std::env::var("ENV_BITS_ADVICE").is_ok();
+            let mut bit_w = |sb: &mut ShapeBuilder, vals: &mut Vec<F128>, set: bool| -> Wire {
+                if bit_advice {
+                    vals.push(if set { F128::ONE } else { F128::ZERO });
+                    sb.input()
+                } else if set {
+                    ow
+                } else {
+                    zw
+                }
+            };
             for l in 0..=m_mp2 {
-                factors.push((mp_sig_w[2 * l], if (t_c >> l) & 1 == 1 { ow } else { zw }));
-                factors.push((
-                    mp_sig_w[2 * l + 1],
-                    if (t_next >> l) & 1 == 1 { ow } else { zw },
-                ));
+                let b0 = bit_w(sb, vals, (t_c >> l) & 1 == 1);
+                let b1 = bit_w(sb, vals, (t_next >> l) & 1 == 1);
+                factors.push((mp_sig_w[2 * l], b0));
+                factors.push((mp_sig_w[2 * l + 1], b1));
             }
             prefix_product(sb, &factors)
         })
@@ -15265,12 +15289,36 @@ fn emit_child_region(
         .iter()
         .map(|&(t_c, t_next, _)| {
             let mut factors = Vec::with_capacity(2 * (m_mp2 + 1));
+            // THE ONE SITE WHERE THE CHILD'S COUNTS ENTER THE PARENT'S
+            // CIRCUIT AS STRUCTURE. `rt.bounds_i` is the assist boundary
+            // list — the JAGGED RUN BOUNDARIES, i.e. the prefix sums of the
+            // child's per-type heights — and its bits are baked here as
+            // `ow`/`zw`. SP1 carries exactly these (`col_prefix_sums` as
+            // `Point<Felt>`, <=30 prover-supplied bits) and binds them by
+            // hashing the counts into the commitment.
+            //
+            // ENV_BITS_ADVICE=1 supplies them as advice wires instead —
+            // DELIBERATELY UNBOUND, a measurement of the STRUCTURAL claim
+            // only (does the leak close, and is it cell-neutral?). Shipping
+            // this needs the bits bound: the counts into the statement
+            // binding, then an in-circuit reconstruction, which is what
+            // SP1's PrefixSumChecks precompile does.
+            let bit_advice = std::env::var("ENV_BITS_ADVICE").is_ok();
+            let mut bit_w = |sb: &mut ShapeBuilder, vals: &mut Vec<F128>, set: bool| -> Wire {
+                if bit_advice {
+                    vals.push(if set { F128::ONE } else { F128::ZERO });
+                    sb.input()
+                } else if set {
+                    ow
+                } else {
+                    zw
+                }
+            };
             for l in 0..=m_mp2 {
-                factors.push((mp_sig_w[2 * l], if (t_c >> l) & 1 == 1 { ow } else { zw }));
-                factors.push((
-                    mp_sig_w[2 * l + 1],
-                    if (t_next >> l) & 1 == 1 { ow } else { zw },
-                ));
+                let b0 = bit_w(sb, vals, (t_c >> l) & 1 == 1);
+                let b1 = bit_w(sb, vals, (t_next >> l) & 1 == 1);
+                factors.push((mp_sig_w[2 * l], b0));
+                factors.push((mp_sig_w[2 * l + 1], b1));
             }
             prefix_product(sb, &factors)
         })
@@ -20112,6 +20160,27 @@ fn chain_tower_three_levels_one_internal_digest() {
                 for &c in sb2.difference(&sa) {
                     hist.entry(c >> nu).or_default().1 += 1;
                 }
+            }
+            // Row ranges of the differing cells: the emit site's fingerprint.
+            {
+                let mut rmin = usize::MAX;
+                let mut rmax = 0usize;
+                let mut n = 0usize;
+                let mask = (1usize << nu) - 1;
+                for (a, b) in w0.iter().zip(w2) {
+                    if a == b {
+                        continue;
+                    }
+                    let (sa, sb2): (HashSet<usize>, HashSet<usize>) =
+                        (a.iter().copied().collect(), b.iter().copied().collect());
+                    for &c in sa.symmetric_difference(&sb2) {
+                        let r = c & mask;
+                        rmin = rmin.min(r);
+                        rmax = rmax.max(r);
+                        n += 1;
+                    }
+                }
+                println!("    differing cells span pf8 rows [{rmin}, {rmax}] ({n} cells)");
             }
             let mut rows: Vec<_> = hist.into_iter().collect();
             rows.sort_by_key(|&(sl, _)| sl);
