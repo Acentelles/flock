@@ -10075,6 +10075,9 @@ struct RealRegion {
     /// The residual close-out's prefix slot (and width).
     #[allow(dead_code)]
     pf: (flock_core::circuit::builder::SlotId, usize),
+    /// The child's PUBLIC SEGMENT as witness wires — the app-statement
+    /// plumbing (hash-chain adjacency) reads through these.
+    child_pub_w: Vec<Wire>,
 }
 
 /// Emit ONE real child's complete deferred-verifier region — the swap
@@ -10923,6 +10926,7 @@ fn emit_real_child_region(
         b_zpartial_w: zpartial_ws,
         mat_eval_w,
         pf: (pfslot, pf_w),
+        child_pub_w: pub_w,
     }
 }
 
@@ -12003,31 +12007,40 @@ fn chain_child_region_emits_alone() {
     );
 }
 
-/// **Task 4: THE FIRST-LEVEL NODE.** Two ADJACENT chain proofs (the right
-/// segment starts at the left's h_end) verified deferred in ONE outer
-/// circuit — two chain-tape regions on shared slots — with their boolean +
-/// sigma assertions folded 2→1 in-circuit (THREE fold groups; the chain
-/// class has no element side), THE ADJACENCY as a wire-to-wire copy
-/// constraint between the children's endpoint publics, and the combined
-/// span (h_start_left, h_end_right) published as the node's own
-/// application statement. The accumulator reassembles from the public
-/// segment alone and discharges both groups. Envelope snapping is the
-/// scale step's job — this pins the assembly at the m22 dev shape.
-#[test]
-#[ignore] // Heavier — run with `-- --ignored`.
-fn first_level_node_two_chains_fold_and_adjacency() {
+/// The first-level node as a BUILDER: [`build_fl_node`]'s output. `lo` is
+/// a real, RECURSABLE [`LeafOuter`] (BLAKE3 for both the FS chain and the
+/// Merkle trees), so the internal-node machinery ([`RealTape`],
+/// [`build_node_outer`]) consumes it exactly like a leaf outer; `acc` is
+/// the folded chain accumulator the node carries up; `stmt_base` locates
+/// the 8-word application-statement block (h_start, h_end) in `lo.public`.
+struct FlNode {
+    lo: LeafOuter,
+    acc: flock_core::aggregate::Accumulator,
+    stmt_base: usize,
+    h_start: [u32; 16],
+    h_end: [u32; 16],
+}
+
+/// **THE FIRST-LEVEL NODE.** Two ADJACENT chain proofs (the right segment
+/// starts at the left's h_end) verified deferred in ONE outer circuit —
+/// two chain-tape regions on shared slots — with their boolean + sigma
+/// assertions folded 2→1 in-circuit (THREE fold groups; the chain class
+/// has no element side), THE ADJACENCY as a wire-to-wire copy constraint
+/// between the children's endpoint publics, and the combined span
+/// (h_start_left, h_end_right) published as the node's own application
+/// statement. The accumulator reassembles from the public segment alone
+/// and discharges both groups. Every pin stays inside the builder (the
+/// mvp9 precedent: the builder IS the test). Envelope snapping is the
+/// scale step's job — this is the m22 dev shape.
+fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
     use flock_core::aggregate;
     use flock_core::matrix_fold::{FoldProof, MatrixClaim};
     use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
 
     const FL_DOMAIN: &[u8] = b"flock-chain-fl-node-v0";
 
-    let n_blocks = 256usize;
-    let mut rng = Rng(0xC4A1_0004);
-    let h0: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
-    let cp0 = build_chain_proof(h0, n_blocks);
     // The right child CONTINUES the chain: its h_start IS the left's h_end.
-    let cp1 = build_chain_proof(cp0.h_end, n_blocks);
+    assert_eq!(cp1.h_start, cp0.h_end, "the segments are adjacent");
     assert_eq!(
         cp0.inner.built.shape.circuit.digest(),
         cp1.inner.built.shape.circuit.digest(),
@@ -12137,7 +12150,7 @@ fn first_level_node_two_chains_fold_and_adjacency() {
     assert!(t0.el.is_none() && t1.el.is_none(), "chain children");
 
     // ---- the outer: TWO chain-tape regions + the fold region + adjacency ----
-    let (b3_rows_used, nu2, mu2, proof_kib) = {
+    {
         use flock_prover::prover::UnionElementSlotInput;
         use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
@@ -12431,11 +12444,17 @@ fn first_level_node_two_chains_fold_and_adjacency() {
         }
         assert_eq!(
             cp1.h_end,
-            native_chain(&cp0.h_start, 2 * n_blocks),
-            "the combined span IS the 512-step chain"
+            native_chain(
+                &cp0.h_start,
+                cp0.inner.built.shape.counts[0] + cp1.inner.built.shape.counts[0]
+            ),
+            "the combined span IS the concatenated chain"
         );
 
-        // The outer proves and verifies over the circuit path.
+        // The outer proves and verifies over the circuit path — BLAKE3 for
+        // BOTH the Merkle trees and the FS chain, so the node is RECURSABLE
+        // (an internal node's RealTape walks this transcript in-circuit;
+        // the defaults diverge silently — both recorded gotchas).
         let union2 = UnionInstance::new(&shape2.registry, shape2.counts.clone());
         let pcs2 = PcsParams {
             m: union2.dense_m(),
@@ -12443,7 +12462,7 @@ fn first_level_node_two_chains_fold_and_adjacency() {
             log_batch_size: pcs_batch(&union2),
             profile: LigeritoProfile::Fast,
             num_lanes: union2.commit_lanes(pcs_batch(&union2)),
-            merkle_hash: Default::default(),
+            merkle_hash: HashKind::Blake3,
         };
         let b3_r1cs2 = blake3::build_block_r1cs(nu2);
         let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
@@ -12513,7 +12532,7 @@ fn first_level_node_two_chains_fold_and_adjacency() {
         lco.sort_by_key(|(i, _)| *i);
         let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
             lco.into_iter().map(|(_, c)| c).collect();
-        let mut ch2 = FsChallenger::new(DOMAIN);
+        let mut ch2 = FsChallenger::with_chained_blake3(DOMAIN);
         let (oproof, ocommit, _) = prover::prove_fast_ligerito_union_circuit(
             &union2,
             &shape2.circuit,
@@ -12523,7 +12542,7 @@ fn first_level_node_two_chains_fold_and_adjacency() {
             el_inputs,
             &mut ch2,
         );
-        let mut ch2 = FsChallenger::new(DOMAIN);
+        let mut ch2 = FsChallenger::with_chained_blake3(DOMAIN);
         verifier::verify_ligerito_union_circuit(
             &union2,
             &shape2.circuit,
@@ -12535,25 +12554,70 @@ fn first_level_node_two_chains_fold_and_adjacency() {
             &mut ch2,
         )
         .expect("the first-level node verifies over the circuit path");
-        (
-            b3_rows,
-            nu2,
-            shape2.circuit.cells().mu(),
-            bincode::serialize(&oproof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
-        )
-    };
+        let (b3_ri, swap_ri, spread_ri) = (
+            shape2.registry_slot(cs.q.b3),
+            shape2.registry_slot(cs.q.swap),
+            shape2.registry_slot(cs.q.spread),
+        );
+        FlNode {
+            lo: LeafOuter {
+                shape: shape2,
+                public: built2.public,
+                proof: oproof,
+                commitment: ocommit,
+                pcs: pcs2,
+                b3_r1cs: b3_r1cs2,
+                swap_r1cs: swap_r1cs2,
+                spread_r1cs: spread_r1cs2,
+                b3_slot: b3_ri,
+                swap_slot: swap_ri,
+                spread_slot: spread_ri,
+            },
+            acc: acc_pub,
+            stmt_base,
+            h_start: cp0.h_start,
+            h_end: cp1.h_end,
+        }
+    }
+}
 
+/// **The first-level node's pin, through the builder** (converted-first:
+/// the test IS [`build_fl_node`]'s original body; every assert lives inside
+/// the builder now, the wrapper re-checks the statement surface).
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn first_level_node_two_chains_fold_and_adjacency() {
+    let n_blocks = 256usize;
+    let mut rng = Rng(0xC4A1_0004);
+    let h0: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let cp0 = build_chain_proof(h0, n_blocks);
+    let cp1 = build_chain_proof(cp0.h_end, n_blocks);
+    let fl = build_fl_node(&cp0, &cp1);
+    assert_eq!(fl.h_start, cp0.h_start);
+    assert_eq!(fl.h_end, cp1.h_end);
+    for j in 0..4 {
+        assert_eq!(
+            fl.lo.public[fl.stmt_base + j],
+            pack4(fl.h_start[4 * j..4 * j + 4].try_into().unwrap()),
+            "the statement block reads h_start out of the public segment"
+        );
+        assert_eq!(
+            fl.lo.public[fl.stmt_base + 4 + j],
+            pack4(fl.h_end[4 * j..4 * j + 4].try_into().unwrap()),
+            "the statement block reads h_end out of the public segment"
+        );
+    }
     println!(
         "\nFIRST-LEVEL NODE (two adjacent chain proofs, fold + adjacency)\n  \
          chain: {} + {} compressions | node statement: h_start .. H^{}(h_start)\n  \
-         outer: b3 rows {} | nu {} | mu {} | proof {:.1} KiB\n",
+         outer: nu {} | mu {} | publics {} | proof {:.1} KiB\n",
         n_blocks,
         n_blocks,
         2 * n_blocks,
-        b3_rows_used,
-        nu2,
-        mu2,
-        proof_kib,
+        fl.lo.shape.circuit.cells().nu(),
+        fl.lo.shape.circuit.cells().mu(),
+        fl.lo.public.len(),
+        bincode::serialize(&fl.lo.proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
     );
 }
 
@@ -17762,6 +17826,26 @@ fn build_node_outer(
     lo0: &LeafOuter,
     lo1: &LeafOuter,
 ) -> (LeafOuter, flock_core::aggregate::Accumulator, NodeTimings) {
+    let (lo, acc, t, _) = build_node_outer_app(lo0, lo1, None);
+    (lo, acc, t)
+}
+
+/// [`build_node_outer`] with the APPLICATION-STATEMENT plumbing: when the
+/// children carry an app block (`app_stmt` = its offset in their public
+/// segments — the hash-chain span (h_start, h_end), 8 words), the node
+/// connects left.h_end == right.h_start wire-to-wire and publishes the
+/// combined span as its OWN app block, returning that block's offset — so
+/// the output feeds the next level with the same plumbing.
+fn build_node_outer_app(
+    lo0: &LeafOuter,
+    lo1: &LeafOuter,
+    app_stmt: Option<usize>,
+) -> (
+    LeafOuter,
+    flock_core::aggregate::Accumulator,
+    NodeTimings,
+    Option<usize>,
+) {
     use flock_core::aggregate;
     use flock_core::matrix_fold::{FoldProof, MatrixClaim};
     use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
@@ -18268,6 +18352,26 @@ fn build_node_outer(
             }
             sb.publish(fp.value);
         }
+        // ---- the APPLICATION STATEMENT (hash-chain adjacency) ----
+        // When the children carry an app block: left.h_end == right.h_start
+        // as four copy constraints (both children's publics are witness
+        // wires here), and the combined span publishes as THIS node's block.
+        let app_base = app_stmt.map(|off| {
+            for j in 0..4 {
+                sb.connect(
+                    r0.child_pub_w[off + 4 + j],
+                    r1.child_pub_w[off + j],
+                );
+            }
+            let base = sb.public_len();
+            for j in 0..4 {
+                sb.publish(r0.child_pub_w[off + j]);
+            }
+            for j in 0..4 {
+                sb.publish(r1.child_pub_w[off + 4 + j]);
+            }
+            base
+        });
 
         if std::env::var("MAC_CENSUS").is_ok() {
             let mac_total = sb.rows_in_slot(cs.macs);
@@ -18514,9 +18618,9 @@ fn build_node_outer(
                 "the lows' assert-zero anchor"
             );
             assert_eq!(
-                fold_pub_base + tail_len,
+                fold_pub_base + tail_len + if app_base.is_some() { 8 } else { 0 },
                 prepad_publics2,
-                "the fold blocks end the REAL segment (publics* zeros sit past it)"
+                "the fold blocks (+ app block) end the REAL segment"
             );
         }
 
@@ -18689,9 +18793,79 @@ fn build_node_outer(
                 prove_ms,
                 verify_ms,
             },
+            app_base,
         )
     };
     outer_stats
+}
+
+/// **Task 5: THE INTERNAL NODE carries the chain statement.** Four chain
+/// segments → two first-level nodes → ONE internal node, built by
+/// [`build_node_outer_app`]'s own machinery over the FL [`LeafOuter`]s
+/// (RealTape walks an FL tape here for the first time): the FL-level
+/// adjacency (fl0.h_end == fl1.h_start) is checked wire-to-wire at the
+/// internal level through the children's witness publics, and the combined
+/// span publishes as the internal node's own app block == the native
+/// H^1024(h_start). Accumulators are per-level at the dev shape — the
+/// cross-level threading (chain accs as PRIORS of the internal fold) is
+/// task 6.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn internal_node_over_two_fl_nodes() {
+    let n_blocks = 256usize;
+    let mut rng = Rng(0xC4A1_0006);
+    let h0: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let cp0 = build_chain_proof(h0, n_blocks);
+    let cp1 = build_chain_proof(cp0.h_end, n_blocks);
+    let cp2 = build_chain_proof(cp1.h_end, n_blocks);
+    let cp3 = build_chain_proof(cp2.h_end, n_blocks);
+    let fl0 = build_fl_node(&cp0, &cp1);
+    let fl1 = build_fl_node(&cp2, &cp3);
+    assert_eq!(
+        fl0.lo.shape.circuit.digest(),
+        fl1.lo.shape.circuit.digest(),
+        "one first-level circuit digest — the FL shape is data-independent"
+    );
+    assert_eq!(fl0.stmt_base, fl1.stmt_base, "one statement offset");
+    assert_eq!(fl1.h_start, fl0.h_end, "the FL spans are adjacent");
+
+    let (node, acc, _t, app) = build_node_outer_app(&fl0.lo, &fl1.lo, Some(fl0.stmt_base));
+    let app = app.expect("the internal node carries the app block");
+    for j in 0..4 {
+        assert_eq!(
+            node.public[app + j],
+            pack4(cp0.h_start[4 * j..4 * j + 4].try_into().unwrap()),
+            "internal statement: h_start is the whole span's start"
+        );
+        assert_eq!(
+            node.public[app + 4 + j],
+            pack4(cp3.h_end[4 * j..4 * j + 4].try_into().unwrap()),
+            "internal statement: h_end is the whole span's end"
+        );
+    }
+    assert_eq!(
+        cp3.h_end,
+        native_chain(&cp0.h_start, 4 * n_blocks),
+        "the internal span IS the 1024-step chain"
+    );
+    // Per-level accumulators at the dev shape: the internal node's own acc
+    // keys sigma by the FL circuit digest; the chain-level accs live in the
+    // FlNodes. (Task 6 threads them as priors.)
+    let (sig_digest, _) = acc.sigma.as_ref().expect("the node accumulated sigma");
+    assert_eq!(
+        *sig_digest,
+        fl0.lo.shape.circuit.digest(),
+        "the internal accumulator keys by the FL circuit"
+    );
+    println!(
+        "\nINTERNAL NODE over two first-level nodes (app-statement plumbed)\n  \
+         span: H^{}(h_start) | internal outer: nu {} | mu {} | publics {} | proof {:.1} KiB\n",
+        4 * n_blocks,
+        node.shape.circuit.cells().nu(),
+        node.shape.circuit.cells().mu(),
+        node.public.len(),
+        bincode::serialize(&node.proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
+    );
 }
 
 /// Isolate the RecordingChallenger's overhead on the tape construction's
