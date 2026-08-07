@@ -19583,6 +19583,10 @@ fn internal_node_over_two_fl_nodes() {
             "FL and internal declare ONE count vector"
         );
         assert_eq!(
+            fl0.lo.pcs.num_lanes, node.pcs.num_lanes,
+            "and therefore ONE lane count"
+        );
+        assert_eq!(
             fl0.lo.public.len(),
             node.public.len(),
             "FL and internal share ONE public-segment length"
@@ -19646,9 +19650,30 @@ fn child_tape_ops(lo: &LeafOuter) -> Vec<flock_core::transcript_record::Transcri
 /// whether ~35 ms per node of padding is necessary or merely inherited.
 ///
 /// Run under `ENV_NO_PAD=1`, which skips the row padding so the FL and the
-/// internal node carry their TRUE counts, then diff the op sequences a
-/// parent would replay. If they differ only where lane width enters, the
-/// counts pin is over-constraint and pinning `num_lanes` is the whole fix.
+/// internal node carry their TRUE counts, then diff what a parent replays.
+///
+/// **ANSWER (2026-08-07), and it took two tries.** Counts reach a parent
+/// through TWO channels, not one:
+///
+/// 1. **Lane width** — a leaf is `num_lanes` words wide and the parent
+///    hashes every opened leaf. Worth 180 of 8,401 b3 rows, 2.1%. This
+///    probe measures it.
+/// 2. **The anchor-expect RUN WEIGHTS** — the prefix machinery is built
+///    over the child's jagged height profile, so a different profile means
+///    a different number of prefix rows. `pf8` measured 6,484 rows walking
+///    an FL child against 8,308 walking an internal child: +28%, and a
+///    different circuit. This probe does NOT see it, because the element
+///    side is not in the transcript or in `b3_rows` —
+///    `chain_tower_three_levels_one_internal_digest` is what catches it
+///    (its per-slot diff on digest mismatch is the instrument).
+///
+/// So the recorded justification for `counts*` was wrong about WHY, but
+/// right that something is needed: `m_bool`/`m_el` are registry-derived
+/// and the whole transcript is count-independent, yet the counts are still
+/// load-bearing through channel 2. Pinning `num_lanes` is NECESSARY BUT NOT
+/// SUFFICIENT — closing channel 2 needs the prefix emission made
+/// run-count-independent (pad the run list to a fixed length), which is the
+/// smaller pin that would actually retire counts*.
 #[test]
 #[ignore] // Diagnostic — run with ENV_NO_PAD=1 TOWER_PROFILE=slim --nocapture.
 fn envelope_counts_dependency_probe() {
@@ -19717,8 +19742,10 @@ fn envelope_counts_dependency_probe() {
     let ops_node = child_tape_ops(&node);
     if ops_fl == ops_node {
         println!(
-            "  OP SEQUENCES ARE IDENTICAL ({} ops) — a parent cannot tell these\n  \
-             children apart despite different counts.\n",
+            "  OP SEQUENCES ARE IDENTICAL ({} ops) — the TRANSCRIPT is\n  \
+             count-independent. Channel 2 (the anchor-expect run weights over\n  \
+             the child's jagged profile) is NOT visible here: see\n  \
+             chain_tower_three_levels_one_internal_digest's per-slot diff.\n",
             ops_fl.len()
         );
         return;
@@ -19990,6 +20017,21 @@ fn chain_tower_three_levels_one_internal_digest() {
         "the level-3 chain lane discharges against the chain tables — \
          eight leaves' claims in one accumulator"
     );
+    if n2.shape.circuit.digest() != n0.shape.circuit.digest() {
+        println!("  DIGEST MISMATCH — per-slot rows (L2 over FLs vs L3 over nodes):");
+        for (t, (a, b)) in n0.shape.counts.iter().zip(&n2.shape.counts).enumerate() {
+            if a != b {
+                println!("    type {t}: L2 {a} vs L3 {b}");
+            }
+        }
+        println!(
+            "    publics {} vs {} | lanes {:?} vs {:?}",
+            n0.public.len(),
+            n2.public.len(),
+            n0.pcs.num_lanes,
+            n2.pcs.num_lanes,
+        );
+    }
     assert_eq!(
         n2.shape.circuit.digest(),
         n0.shape.circuit.digest(),
