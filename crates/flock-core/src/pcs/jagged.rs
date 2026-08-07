@@ -2685,7 +2685,7 @@ pub fn prove_multipoint_twisted<C: Challenger>(
     // one byte-table pass (the RS partner), and the two combined weights.
     let t = std::time::Instant::now();
     let eq_rho = super::ring_switch::build_eq_parallel(rho);
-    let mut pairs: Vec<ProductPair> = Vec::with_capacity(2);
+    let mut pairs: Vec<Pair> = Vec::with_capacity(2);
     let mut msg0 = (F128::ZERO, F128::ZERO);
     if n_rs > 0 {
         let basis = inv_frob_basis();
@@ -2709,22 +2709,38 @@ pub fn prove_multipoint_twisted<C: Challenger>(
             .collect();
         let (av, msg) = build_combined_weight_and_msg(params, &sides, &gv);
         msg0 = (msg0.0 + msg.0, msg0.1 + msg.1);
-        pairs.push(ProductPair::new(av, gv));
+        pairs.push(Pair::Dense(ProductPair::new(av, gv)));
     }
+    let mut sparse_support: Option<u64> = None;
     if n_g > 0 {
         let sides: Vec<(F128, Vec<F128>, &[F128])> = groups
             .iter()
             .enumerate()
             .map(|(k, g)| (gpow[128 * n_rs + k], build_eq_table(g.z_row), g.cols))
             .collect();
-        let (bv, msg) = build_combined_weight_and_msg(params, &sides, &eq_rho);
-        msg0 = (msg0.0 + msg.0, msg0.1 + msg.1);
-        pairs.push(ProductPair::new(bv, eq_rho));
+        // The gather-shaped groups are supported on a few columns: fold them
+        // segment-sparse instead of materializing b̄ and an e copy over 2^m.
+        let support = SparseGroupPair::support_area(params, groups);
+        if (support as usize).saturating_mul(SPARSE_DENSIFY_FACTOR) <= (1usize << m) {
+            let (sp, msg) = SparseGroupPair::build(params, &sides, &eq_rho, rho);
+            drop(eq_rho);
+            msg0 = (msg0.0 + msg.0, msg0.1 + msg.1);
+            pairs.push(Pair::Sparse(sp));
+            sparse_support = Some(support);
+        } else {
+            let (bv, msg) = build_combined_weight_and_msg(params, &sides, &eq_rho);
+            msg0 = (msg0.0 + msg.0, msg0.1 + msg.1);
+            pairs.push(Pair::Dense(ProductPair::new(bv, eq_rho)));
+        }
     }
     if trace {
         eprintln!(
-            "    [multipoint] dense weight passes (2^{m}, {} products, round-0 fused): {:6.2} ms",
+            "    [multipoint] weight passes (2^{m}, {} products{}, round-0 fused): {:6.2} ms",
             pairs.len(),
+            match sparse_support {
+                Some(s) => format!(" — group sparse, support {s} words"),
+                None => String::new(),
+            },
             t.elapsed().as_secs_f64() * 1e3
         );
     }
@@ -2861,6 +2877,261 @@ impl ProductPair {
         };
         self.flip = !self.flip;
         msg
+    }
+}
+
+/// One live run of the sparse group product: `x` holds the combined group
+/// weights `b̄` over dense indices `[start, start + x.len())`, `y` the
+/// partner `e = eq(ρ,·)` values at the same indices. `start` and the length
+/// stay EVEN, so the sumcheck's `(2t, 2t+1)` pairs never straddle a segment
+/// boundary; the padding entries this costs carry `x = 0` (outside b̄'s
+/// support) and TRUE `e` values.
+struct SparseSeg {
+    start: usize,
+    x: Vec<F128>,
+    y: Vec<F128>,
+}
+
+/// Segment-sparse fold state for the group product of the two-product
+/// sumcheck. The gather-shaped groups are supported on a few columns'
+/// live ranges (~9% of the dense area for the wired hash tables), yet the
+/// dense [`ProductPair`] materializes and folds `b̄` and a copy of `e`
+/// over the full `2^m`: this state stores only the support runs and folds
+/// them locally, so the group product costs O(support) per round instead
+/// of O(2^m). Exactness: every message equals the dense path's — `b̄` is
+/// zero off-support (off-support pairs contribute nothing to either
+/// message sum), and `e` stays a scaled eq tensor under low-bit folding
+/// (`e⁽ⁱ⁾ = Πⱼ eq(ρⱼ, rⱼ) · eq(ρ[i..], ·)`, exact in F128), so boundary
+/// padding entries are recomputable pointwise at any round. Once the
+/// support stops paying (`4·stored > cur`, reached in the tail rounds)
+/// the state densifies into a [`ProductPair`] and proceeds as before.
+struct SparseGroupPair {
+    /// Sorted by `start`; disjoint (overlaps from boundary padding are
+    /// merged after each fold — `x` adds, `y` values agree).
+    segs: Vec<SparseSeg>,
+    /// The full ρ (all `m` coordinates), for pointwise `e` recomputation.
+    rho: Vec<F128>,
+    /// `Π_{j<round} eq(ρ_j, r_j)` — the folded-away prefix's scalar.
+    c: F128,
+    /// Rounds folded so far.
+    round: usize,
+}
+
+impl SparseGroupPair {
+    /// Dense-domain words under the groups' nonzero columns — the sparse
+    /// path's cost driver, to compare against the `2^m` the dense path
+    /// walks.
+    fn support_area(params: &JaggedParams, groups: &[ScalarGroupClaim<'_>]) -> u64 {
+        let pfx = &params.col_prefix_sums;
+        (0..pfx.len() - 1)
+            .filter(|&y| groups.iter().any(|g| g.cols[y] != F128::ZERO))
+            .map(|y| pfx[y + 1] - pfx[y])
+            .sum()
+    }
+
+    /// Build the support segments and the round-0 message. `sides` are the
+    /// per-group `(γ-power, eq(z_row,·) table, cols)` triples — the same
+    /// shape [`build_combined_weight_and_msg`] takes; `eq_rho` is the full
+    /// `eq(ρ,·)` tensor (borrowed — the sparse path never keeps it).
+    fn build(
+        params: &JaggedParams,
+        sides: &[(F128, Vec<F128>, &[F128])],
+        eq_rho: &[F128],
+        rho: &[F128],
+    ) -> (Self, (F128, F128)) {
+        use rayon::prelude::*;
+        let pfx = &params.col_prefix_sums;
+        let n_cols = pfx.len() - 1;
+        // Even-extended [start, end) ranges of the support columns; touching
+        // ranges merge (adjacent live columns share a boundary word).
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        for y in 0..n_cols {
+            if sides.iter().all(|(_, _, cols)| cols[y] == F128::ZERO) {
+                continue;
+            }
+            let (t0, t1) = (pfx[y] as usize, pfx[y + 1] as usize);
+            if t0 == t1 {
+                continue;
+            }
+            let (s, e) = (t0 & !1, (t1 + 1) & !1);
+            match ranges.last_mut() {
+                Some(last) if s <= last.1 => last.1 = last.1.max(e),
+                _ => ranges.push((s, e)),
+            }
+        }
+        let segs: Vec<SparseSeg> = ranges
+            .par_iter()
+            .map(|&(s, e)| {
+                let mut x = vec![F128::ZERO; e - s];
+                // The dense fill's cursor walk, restricted to [s, e): only
+                // live words get weights (padding words keep x = 0).
+                let live_end = e.min(params.area() as usize);
+                for (scale, eq_r, cols) in sides {
+                    let mut ycol = pfx.partition_point(|&t| t <= s as u64).saturating_sub(1);
+                    let mut d = s;
+                    while d < live_end && ycol < n_cols {
+                        let (t_c, t_next) = (pfx[ycol] as usize, pfx[ycol + 1] as usize);
+                        if t_next <= d {
+                            ycol += 1;
+                            continue;
+                        }
+                        let w = *scale * cols[ycol];
+                        let stop = live_end.min(t_next);
+                        if w != F128::ZERO {
+                            for dd in d..stop {
+                                x[dd - s] += w * eq_r[dd - t_c];
+                            }
+                        }
+                        d = stop;
+                    }
+                }
+                let y = eq_rho[s..e].to_vec();
+                SparseSeg { start: s, x, y }
+            })
+            .collect();
+        let pair = Self {
+            segs,
+            rho: rho.to_vec(),
+            c: F128::ONE,
+            round: 0,
+        };
+        let msg = pair.message();
+        (pair, msg)
+    }
+
+    /// Words currently stored (the densify predicate's input).
+    fn stored(&self) -> usize {
+        self.segs.iter().map(|s| s.x.len()).sum()
+    }
+
+    /// `e⁽ʳᵒᵘⁿᵈ⁾[d]` recomputed pointwise: `c · Π_b eq(ρ_{round+b}, bit_b(d))`.
+    /// Only boundary-padding entries need this (O(1) per segment per round).
+    fn e_at(&self, d: usize) -> F128 {
+        let mut v = self.c;
+        for (b, &z) in self.rho[self.round..].iter().enumerate() {
+            v *= if (d >> b) & 1 == 1 { z } else { F128::ONE + z };
+        }
+        v
+    }
+
+    /// The current message — same pair convention as the dense path:
+    /// `g(1) = Σ_t x[2t+1]·y[2t+1]`, `g(∞) = Σ_t (x[2t]+x[2t+1])·(y[2t]+y[2t+1])`.
+    /// Off-support pairs have `x = 0` on both legs and contribute nothing.
+    fn message(&self) -> (F128, F128) {
+        use rayon::prelude::*;
+        self.segs
+            .par_iter()
+            .map(|seg| {
+                let mut p1 = F128::ZERO;
+                let mut pi = F128::ZERO;
+                for (xp, yp) in seg.x.chunks_exact(2).zip(seg.y.chunks_exact(2)) {
+                    p1 += xp[1] * yp[1];
+                    pi += (xp[0] + xp[1]) * (yp[0] + yp[1]);
+                }
+                (p1, pi)
+            })
+            .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1))
+    }
+
+    /// Fold every segment at `r` and return the next round's message.
+    fn fold_round(&mut self, cur: usize, r: F128) -> (F128, F128) {
+        debug_assert_eq!(cur, 1usize << (self.rho.len() - self.round));
+        debug_assert!(cur >= 4);
+        // In char 2 the multilinear eq(z, r) = 1 + z + r.
+        self.c *= F128::ONE + self.rho[self.round] + r;
+        self.round += 1;
+        let this = &*self;
+        let folded: Vec<SparseSeg> = {
+            use rayon::prelude::*;
+            this.segs
+                .par_iter()
+                .map(|seg| {
+                    let half = seg.x.len() / 2;
+                    let mut s = seg.start / 2;
+                    let mut x = Vec::with_capacity(half + 2);
+                    let mut y = Vec::with_capacity(half + 2);
+                    if s & 1 == 1 {
+                        s -= 1;
+                        x.push(F128::ZERO);
+                        y.push(this.e_at(s));
+                    }
+                    for q in 0..half {
+                        x.push(seg.x[2 * q] + r * (seg.x[2 * q] + seg.x[2 * q + 1]));
+                        y.push(seg.y[2 * q] + r * (seg.y[2 * q] + seg.y[2 * q + 1]));
+                    }
+                    if (s + x.len()) & 1 == 1 {
+                        let d = s + x.len();
+                        x.push(F128::ZERO);
+                        y.push(this.e_at(d));
+                    }
+                    SparseSeg { start: s, x, y }
+                })
+                .collect()
+        };
+        // Boundary padding can make neighbors overlap by up to two entries:
+        // merge them. x adds (the true weights are disjointly supported and
+        // padding is zero — folding is linear in x); y values agree (every
+        // stored e entry is the true folded tensor value).
+        let mut segs: Vec<SparseSeg> = Vec::with_capacity(folded.len());
+        for seg in folded {
+            match segs.last_mut() {
+                Some(prev) if seg.start < prev.start + prev.x.len() => {
+                    let off = seg.start - prev.start;
+                    for (i, (&xv, &yv)) in seg.x.iter().zip(&seg.y).enumerate() {
+                        let j = off + i;
+                        if j < prev.x.len() {
+                            prev.x[j] += xv;
+                        } else {
+                            prev.x.push(xv);
+                            prev.y.push(yv);
+                        }
+                    }
+                }
+                _ => segs.push(seg),
+            }
+        }
+        self.segs = segs;
+        self.message()
+    }
+
+    /// Materialize the dense [`ProductPair`] for the tail rounds: scatter
+    /// the stored weights, rebuild the partner as the scaled eq tensor —
+    /// both exactly equal to what the dense path would hold at this round.
+    fn densify(&self, cur: usize) -> ProductPair {
+        debug_assert_eq!(cur, 1usize << (self.rho.len() - self.round));
+        let mut x = vec![F128::ZERO; cur];
+        for seg in &self.segs {
+            for (i, &v) in seg.x.iter().enumerate() {
+                x[seg.start + i] += v;
+            }
+        }
+        let y = super::ring_switch::build_eq_scaled_parallel(&self.rho[self.round..], self.c);
+        ProductPair::new(x, y)
+    }
+}
+
+/// Densify once the stored support stops paying against the live length.
+const SPARSE_DENSIFY_FACTOR: usize = 4;
+
+/// A product of the two-product sumcheck: dense ping-pong buffers, or the
+/// group product's segment-sparse state (which densifies itself for the
+/// tail rounds).
+enum Pair {
+    Dense(ProductPair),
+    Sparse(SparseGroupPair),
+}
+
+impl Pair {
+    fn fold_round(&mut self, cur: usize, r: F128) -> (F128, F128) {
+        if let Pair::Sparse(sp) = self
+            && sp.stored() * SPARSE_DENSIFY_FACTOR > cur
+        {
+            *self = Pair::Dense(sp.densify(cur));
+        }
+        match self {
+            Pair::Dense(p) => p.fold_round(cur, r),
+            Pair::Sparse(p) => p.fold_round(cur, r),
+        }
     }
 }
 
@@ -3510,6 +3781,126 @@ mod tests {
             }
         }
         assert_eq!(vg, expect_g, "groups-only {label}");
+    }
+
+    /// Sparse-group variant of [`check_multipoint`]: groups supported on
+    /// `hot` columns only, so the prover takes the [`SparseGroupPair`]
+    /// path (with RS claims and groups-only), against the same brute
+    /// force, plus a tampered-value rejection.
+    fn check_multipoint_sparse(
+        params: &JaggedParams,
+        ch: &mut RandomChallenger,
+        hot: &[usize],
+        label: &str,
+    ) {
+        let (n, k, m) = (params.n, params.k, params.m);
+        let z1r = sample_vec(ch, n);
+        let z1c = sample_vec(ch, k);
+        let c1 = sample_vec(ch, 128);
+        let g1r = sample_vec(ch, n);
+        let g2r = sample_vec(ch, n);
+        let mut g1cols = vec![F128::ZERO; 1 << k];
+        let mut g2cols = vec![F128::ZERO; 1 << k];
+        for &y in hot {
+            g1cols[y] = ch.sample_f128();
+        }
+        // The second group is hot on a subset — segments must merge
+        // identically whether one or both groups weight a column.
+        for &y in hot.iter().step_by(2) {
+            g2cols[y] = ch.sample_f128();
+        }
+        let rho = sample_vec(ch, m);
+        let claims = [FrobeniusClaim {
+            z_row: &z1r,
+            z_col: &z1c,
+            coeffs: &c1,
+        }];
+        let groups = [
+            ScalarGroupClaim {
+                z_row: &g1r,
+                cols: &g1cols,
+            },
+            ScalarGroupClaim {
+                z_row: &g2r,
+                cols: &g2cols,
+            },
+        ];
+        let support = SparseGroupPair::support_area(params, &groups);
+        assert!(
+            (support as usize) * SPARSE_DENSIFY_FACTOR <= (1usize << m),
+            "test shape must engage the sparse path ({label})"
+        );
+        let mut chp = FsChallenger::new(b"multipoint-sparse-test");
+        let proof = prove_multipoint_twisted(params, &claims, &groups, &rho, &mut chp);
+        let mut chv = FsChallenger::new(b"multipoint-sparse-test");
+        let v = verify_multipoint_twisted(params, &claims, &groups, &rho, &proof, &mut chv)
+            .expect("honest sparse-group multipoint proof verifies");
+
+        let eq_idx = build_eq_table(&rho);
+        let (eq_z1r, eq_z1c) = (build_eq_table(&z1r), build_eq_table(&z1c));
+        let gsides = [
+            (build_eq_table(&g1r), &g1cols),
+            (build_eq_table(&g2r), &g2cols),
+        ];
+        let mut expect = F128::ZERO;
+        let mut expect_g = F128::ZERO;
+        for e in 0..params.area() {
+            let (row, col) = params.unrank(e);
+            let mut x = eq_z1r[row] * eq_z1c[col];
+            for &cj in c1.iter() {
+                if !cj.is_zero() {
+                    expect += eq_idx[e as usize] * cj * x;
+                }
+                x = x * x;
+            }
+            for (eq_r, cols) in &gsides {
+                expect_g += eq_idx[e as usize] * eq_r[row] * cols[col];
+            }
+        }
+        assert_eq!(v, expect + expect_g, "{label}");
+
+        let mut bad = proof.clone();
+        bad.group_values[0] += F128::ONE;
+        let mut chb = FsChallenger::new(b"multipoint-sparse-test");
+        assert!(
+            verify_multipoint_twisted(params, &claims, &groups, &rho, &bad, &mut chb).is_none(),
+            "tampered sparse group value accepted ({label})"
+        );
+
+        // Groups-only: the sparse pair is the sumcheck's ONLY product.
+        let mut chp = FsChallenger::new(b"multipoint-sparse-test-go");
+        let go = prove_multipoint_twisted(params, &[], &groups, &rho, &mut chp);
+        let mut chv = FsChallenger::new(b"multipoint-sparse-test-go");
+        let vg = verify_multipoint_twisted(params, &[], &groups, &rho, &go, &mut chv)
+            .expect("groups-only sparse multipoint proof verifies");
+        assert_eq!(vg, expect_g, "groups-only {label}");
+    }
+
+    /// The segment-sparse group path against the brute force. Odd column
+    /// heights put every segment boundary at an odd word (build-time even
+    /// extension, fold-time boundary padding and overlap merge, mid-loop
+    /// densify all fire); the all-hot tiny-height shape merges the whole
+    /// support into one run; hot columns sit at both table edges.
+    #[test]
+    fn multipoint_twisted_sparse_groups_matches_bruteforce() {
+        let mut ch = RandomChallenger::new(0x4D50_59A5);
+        // 64 columns of height 37: support 5·37 = 185 ≪ 2^12/4, segments
+        // stay sparse for ~7 folds before densifying.
+        let heights = vec![37u64; 64];
+        let params = JaggedParams::from_heights(&heights, 6, 12);
+        for rep in 0..3 {
+            check_multipoint_sparse(
+                &params,
+                &mut ch,
+                &[0, 1, 5, 37, 63],
+                &format!("odd heights rep={rep}"),
+            );
+        }
+        // Every column hot at height 2: one merged support run of 128.
+        let heights = vec![2u64; 64];
+        let params = JaggedParams::from_heights(&heights, 6, 12);
+        let hot: Vec<usize> = (0..64).collect();
+        check_multipoint_sparse(&params, &mut ch, &hot, "all-hot tiny heights");
     }
 
     /// The multipoint twisted evaluation returns the brute-force twisted
