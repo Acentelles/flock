@@ -11708,10 +11708,16 @@ struct ChainProof {
     inner: MixedInner,
     h_start: [u32; 16],
     h_end: [u32; 16],
+    /// (circuit build ms — per SHAPE, cacheable; witgen ms; prove ms) —
+    /// the ONLINE leaf cost is witgen + prove (+ the sequential chain
+    /// compute itself, which the builder's eval walk performs).
+    t: (f64, f64, f64),
 }
 
 fn build_chain_proof(h_start: [u32; 16], n_blocks: usize) -> ChainProof {
+    let t0 = std::time::Instant::now();
     let (built, hash) = build_chain_circuit(&h_start, n_blocks);
+    let build_ms = t0.elapsed().as_secs_f64() * 1e3;
     let nu = n_blocks.trailing_zeros() as usize;
 
     let union = UnionInstance::new(&built.shape.registry, built.shape.counts.clone());
@@ -11726,19 +11732,21 @@ fn build_chain_proof(h_start: [u32; 16], n_blocks: usize) -> ChainProof {
     };
     let blake_r1cs = blake3::build_block_r1cs(nu);
     let blake_lc = blake_r1cs.csc_lincheck_circuit();
+    let t1 = std::time::Instant::now();
+    let wit = blake3::generate_witness_batch_major_partial(built.rows::<Blake3Gate>(hash), nu);
+    let witgen_ms = t1.elapsed().as_secs_f64() * 1e3;
+    let t2 = std::time::Instant::now();
     let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
     let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
         &union,
         &built.shape.circuit,
         &built.witness.public,
         &pcs_params,
-        vec![UnionSlotProverInput::new(
-            blake3::generate_witness_batch_major_partial(built.rows::<Blake3Gate>(hash), nu),
-            blake_lc,
-        )],
+        vec![UnionSlotProverInput::new(wit, blake_lc)],
         Vec::new(),
         &mut ch,
     );
+    let prove_ms = t2.elapsed().as_secs_f64() * 1e3;
 
     let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
     let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
@@ -11792,6 +11800,7 @@ fn build_chain_proof(h_start: [u32; 16], n_blocks: usize) -> ChainProof {
         },
         h_start,
         h_end,
+        t: (build_ms, witgen_ms, prove_ms),
     }
 }
 
@@ -12023,6 +12032,10 @@ struct FlNode {
     fold_pub_base: usize,
     h_start: [u32; 16],
     h_end: [u32; 16],
+    /// (tape-source verifies ms — ONLINE; circuit emit+finish ms — per
+    /// SHAPE; witgen/run ms — ONLINE; prove ms — ONLINE; verify ms).
+    /// Everything else in the builder is pin/check scaffolding.
+    t: (f64, f64, f64, f64, f64),
 }
 
 /// **THE FIRST-LEVEL NODE.** Two ADJACENT chain proofs (the right segment
@@ -12152,6 +12165,7 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
     let t0 = ChildTape::new(&cp0.inner, DOMAIN);
     let t1 = ChildTape::new(&cp1.inner, DOMAIN);
     assert!(t0.el.is_none() && t1.el.is_none(), "chain children");
+    let tape_verify_ms = t0.verify_ms + t1.verify_ms;
 
     // ---- the outer: TWO chain-tape regions + the fold region + adjacency ----
     {
@@ -12174,6 +12188,7 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
 
         let b3_rows = t0.b3_rows + t1.b3_rows + trace.rows.len();
         let nu2 = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7);
+        let t_build = std::time::Instant::now();
         let mut sb = ShapeBuilder::new(nu2);
         let mut cs = ChildSlots::new(&mut sb, nu2, t0.spread_w.max(t1.spread_w));
         let mut vals: Vec<F128> = Vec::new();
@@ -12394,9 +12409,12 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         }
 
         let shape2 = sb.finish().expect("the first-level node circuit builds");
+        let build_ms = t_build.elapsed().as_secs_f64() * 1e3;
         let hint_refs: Vec<&(dyn std::any::Any + Sync)> =
             hints.iter().map(|h| h as &(dyn std::any::Any + Sync)).collect();
+        let t_run = std::time::Instant::now();
         let mut built2 = shape2.run(&vals, &hint_refs);
+        let run_ms = t_run.elapsed().as_secs_f64() * 1e3;
 
         // Child checkers (each child's whole deferred-verifier statement
         // against its own native replicas), then the fold checker + the
@@ -12536,6 +12554,7 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         lco.sort_by_key(|(i, _)| *i);
         let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
             lco.into_iter().map(|(_, c)| c).collect();
+        let t_prove = std::time::Instant::now();
         let mut ch2 = FsChallenger::with_chained_blake3(DOMAIN);
         let (oproof, ocommit, _) = prover::prove_fast_ligerito_union_circuit(
             &union2,
@@ -12546,6 +12565,8 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
             el_inputs,
             &mut ch2,
         );
+        let prove_ms = t_prove.elapsed().as_secs_f64() * 1e3;
+        let t_ver = std::time::Instant::now();
         let mut ch2 = FsChallenger::with_chained_blake3(DOMAIN);
         verifier::verify_ligerito_union_circuit(
             &union2,
@@ -12558,6 +12579,7 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
             &mut ch2,
         )
         .expect("the first-level node verifies over the circuit path");
+        let verify_ms2 = t_ver.elapsed().as_secs_f64() * 1e3;
         let (b3_ri, swap_ri, spread_ri) = (
             shape2.registry_slot(cs.q.b3),
             shape2.registry_slot(cs.q.swap),
@@ -12582,6 +12604,7 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
             fold_pub_base,
             h_start: cp0.h_start,
             h_end: cp1.h_end,
+            t: (tape_verify_ms, build_ms, run_ms, prove_ms, verify_ms2),
         }
     }
 }
@@ -12897,6 +12920,9 @@ struct ChildTape<'p> {
     bytes: Vec<u8>,
     b3_rows: usize,
     spread_w: usize,
+    /// The recording verify's wall time — the ONLINE tape-source cost (the
+    /// pins/locates around it are per-shape scaffolding).
+    verify_ms: f64,
     // located regions. `el` is `None` for a BOOLEAN-ONLY circuit inner
     // (the hash-chain leaf) — the element PIOP region does not exist on
     // its tape, and the `el_*`/`a_sum_n`/`b_sum_n` natives below are
@@ -12975,6 +13001,7 @@ impl<'p> ChildTape<'p> {
         let blake_lc = blake_r1cs.csc_lincheck_circuit();
         let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
         let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(domain));
+        let t_v = std::time::Instant::now();
         let all_claims = verifier::verify_ligerito_union_circuit(
             &union,
             &built.shape.circuit,
@@ -12986,6 +13013,7 @@ impl<'p> ChildTape<'p> {
             &mut rec,
         )
         .expect("the mixed circuit inner verifies");
+        let verify_ms = t_v.elapsed().as_secs_f64() * 1e3;
         let native_claims = all_claims
             .boolean
             .clone()
@@ -14118,6 +14146,7 @@ impl<'p> ChildTape<'p> {
             bytes,
             b3_rows,
             spread_w,
+            verify_ms,
             gkr: gkr_rec,
             el: el_rec,
             start_v,
@@ -19320,8 +19349,6 @@ fn chain_tower_e2e_with_lane() {
 #[test]
 #[ignore] // The headline measurement — run explicitly with --nocapture.
 fn chain_tower_m32_headline() {
-    use flock_core::aggregate;
-
     let n_blocks: usize = std::env::var("CHAIN_BLOCKS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -19335,11 +19362,11 @@ fn chain_tower_m32_headline() {
     let chain_ms = t0.elapsed().as_secs_f64() * 1e3;
 
     // The leaves, timed individually (parallelizable in deployment).
-    let mut leaf_ms: Vec<f64> = Vec::new();
+    let mut _leaf_ms: Vec<f64> = Vec::new();
     let mut mk = |start: [u32; 16]| -> ChainProof {
         let t = std::time::Instant::now();
         let cp = build_chain_proof(start, n_blocks);
-        leaf_ms.push(t.elapsed().as_secs_f64() * 1e3);
+        _leaf_ms.push(t.elapsed().as_secs_f64() * 1e3);
         cp
     };
     let cp0 = mk(h0);
@@ -19351,7 +19378,7 @@ fn chain_tower_m32_headline() {
     let t_fl = std::time::Instant::now();
     let fl0 = build_fl_node(&cp0, &cp1);
     let fl1 = build_fl_node(&cp2, &cp3);
-    let fl_ms = t_fl.elapsed().as_secs_f64() * 1e3 / 2.0;
+    let _fl_ms = t_fl.elapsed().as_secs_f64() * 1e3 / 2.0;
 
     let chain_registry = &cp0.inner.built.shape.registry;
     let blake_r1cs = blake3::build_block_r1cs(cp0.inner.nu);
@@ -19369,7 +19396,7 @@ fn chain_tower_m32_headline() {
     let t_in = std::time::Instant::now();
     let (node, acc, nt, app, lane_acc) =
         build_node_outer_app(&fl0.lo, &fl1.lo, Some(fl0.stmt_base), Some(lane));
-    let internal_ms = t_in.elapsed().as_secs_f64() * 1e3;
+    let _internal_ms = t_in.elapsed().as_secs_f64() * 1e3;
     let app = app.expect("app block");
     let lane_acc = lane_acc.expect("lane");
 
@@ -19412,36 +19439,61 @@ fn chain_tower_m32_headline() {
     let root_ms = t_root.elapsed().as_secs_f64() * 1e3;
 
     let total_compr = 4 * n_blocks;
-    let leaf_med = {
-        let mut v = leaf_ms.clone();
-        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        v[v.len() / 2]
-    };
-    // Recursion cost per leaf ≈ half an FL node + a quarter internal (this
-    // 2-level tree); deployment amortizes ~1 node per leaf.
-    let per_leaf = leaf_med + fl_ms / 2.0 + internal_ms / 4.0;
+    // ---- the SETUP / ONLINE split (the honest accounting) ----
+    // SETUP = per-SHAPE, cacheable: circuit builds (statement-independent,
+    // digest-pinned) + the builders' pin/check scaffolding (everything not
+    // itemized below). ONLINE = per proof: leaf witgen + prove; FL
+    // tape-source verifies + witgen/run + prove; internal per NodeTimings
+    // (its tapes item is RealTape's constructor — scaffolding-inclusive,
+    // production is ~verify + parse per the recorded probe).
+    let mut leaf_online: Vec<f64> = [&cp0, &cp1, &cp2, &cp3]
+        .iter()
+        .map(|c| c.t.1 + c.t.2)
+        .collect();
+    leaf_online.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let leaf_on = leaf_online[leaf_online.len() / 2];
+    let leaf_prove = cp0.t.2.min(cp1.t.2).min(cp2.t.2).min(cp3.t.2);
+    let fl_online = (fl0.t.0 + fl0.t.2 + fl0.t.3 + fl1.t.0 + fl1.t.2 + fl1.t.3) / 2.0;
+    let internal_online = nt.tapes_ms + nt.trace_ms + nt.asm_ms + nt.prove_ms;
+    let per_leaf_online = leaf_on + fl_online / 2.0 + internal_online / 4.0;
     println!(
         "\nCHAIN TOWER M32 HEADLINE (warm box — cold cert. owed post-reboot)\n  \
          {} compressions/leaf x 4 leaves = {} total ({:.1} MB hashed)\n  \
-         sequential chain compute (the VDF delay): {:.0} ms\n  \
-         leaf proves: {:?} ms (median {:.0})\n  \
-         FL node (incl. tapes+build+prove, per node): {:.0} ms\n  \
-         internal node (incl. tapes+build+prove): {:.0} ms | prove alone {:.0} ms\n  \
-         root (discharges + statement): {:.1} ms\n  \
-         PER-LEAF amortized (leaf + fl/2 + internal/4): {:.0} ms -> {:.0}k compressions/sec system\n  \
+         sequential chain compute (the VDF delay, inherent): {:.0} ms\n  \
+         SETUP (per shape, cacheable):\n    \
+         chain circuit build {:.0} ms (incl. the eval walk = the chain compute)\n    \
+         FL circuit emit+finish {:.0} ms | builder scaffolding = the rest of the wall time\n  \
+         ONLINE (per proof):\n    \
+         leaf: witgen {:.0} + prove {:.0} = {:.0} ms (best prove {:.0})\n    \
+         FL node: tape-source verifies {:.0} + witgen/run {:.0} + prove {:.0} = {:.0} ms | verify {:.1}\n    \
+         internal: tapes {:.0} + trace {:.0} + asm {:.0} + prove {:.0} = {:.0} ms | verify {:.1}\n    \
+         root (both lanes + statement): {:.1} ms\n  \
+         PER-LEAF ONLINE (leaf + fl/2 + internal/4): {:.0} ms -> {:.0}k compressions/sec system\n  \
          internal outer: nu {} | mu {} | proof {:.1} KiB\n",
         n_blocks,
         total_compr,
         (total_compr * 64) as f64 / 1e6,
         chain_ms,
-        leaf_ms.iter().map(|v| v.round()).collect::<Vec<_>>(),
-        leaf_med,
-        fl_ms,
-        internal_ms,
+        cp0.t.0,
+        (fl0.t.1 + fl1.t.1) / 2.0,
+        cp0.t.1,
+        cp0.t.2,
+        leaf_on,
+        leaf_prove,
+        (fl0.t.0 + fl1.t.0) / 2.0,
+        (fl0.t.2 + fl1.t.2) / 2.0,
+        (fl0.t.3 + fl1.t.3) / 2.0,
+        fl_online,
+        (fl0.t.4 + fl1.t.4) / 2.0,
+        nt.tapes_ms,
+        nt.trace_ms,
+        nt.asm_ms,
         nt.prove_ms,
+        internal_online,
+        nt.verify_ms,
         root_ms,
-        per_leaf,
-        n_blocks as f64 / per_leaf,
+        per_leaf_online,
+        n_blocks as f64 / per_leaf_online,
         node.shape.circuit.cells().nu(),
         node.shape.circuit.cells().mu(),
         bincode::serialize(&node.proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
