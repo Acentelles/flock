@@ -17,8 +17,10 @@
 //   5. z_partial = z_vec (len 2^k_skip); r_inner_skip sampled;
 //      w = Σ lagrange(k_skip, r_inner_skip)·z_partial.
 //
-// Eq-table / lagrange builds are tiny and run on the HOST (f128_*_hd from
-// ntt_host.hpp) so this header is self-contained and reusable by bench_ligerito.
+// Eq-table / lagrange builds come in a HOST form (f128_*_hd from ntt_host.hpp,
+// the reference the tests check against) and a device form. Prefer the device
+// form in provers: host GF(2^128) mul is ~350 ns, so a 2^18 eq table costs
+// ~100 ms on the host and is free on hardware clmul.
 #pragma once
 #include "f128.cuh"
 #include "ntt_host.hpp"
@@ -105,6 +107,37 @@ inline std::vector<F128> build_quirky_eq_table_host(F128 z_skip,
     return out;
 }
 
+// Device build of the same quirky eq table, one thread per output element (no
+// doubling): out[i_skip + i_rest·2^k_skip] = lambda[i_skip]·Π_j(bit_j(i_rest) ? c_j : 1+c_j).
+// GF(2^128) mul is associative and commutative, so this is bit-identical to
+// build_quirky_eq_table_host. The host builder is ~350 ns per mul (software
+// carry-less mul); at k=2^14 that alone was milliseconds, and the whole table
+// then had to be copied H2D. The lagrange weights stay on the host: 2^k_skip <=
+// 256 entries and they need a field inversion.
+__constant__ F128 g_qeq_lambda[256];
+__constant__ F128 g_qeq_chal[64];
+__global__ void quirky_eq_build_k(int k_skip, int d_rest, long long n, F128* __restrict__ out) {
+    long long x = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (x >= n) return;
+    long long i_rest = x >> k_skip;
+    F128 acc = g_qeq_lambda[x & ((1LL << k_skip) - 1)];
+    for (int j = 0; j < d_rest; j++) {
+        F128 c = g_qeq_chal[j];
+        F128 f = ((i_rest >> j) & 1) ? c : F128{c.lo ^ 1ull, c.hi};
+        acc = ghash_mul_karatsuba(acc, f);
+    }
+    out[x] = acc;
+}
+inline void build_quirky_eq_device(F128* d_out, F128 z_skip,
+                                   const std::vector<F128>& x_inner_rest, int k_skip, int tpb = 256) {
+    std::vector<F128> lambda = lagrange_weights_host(k_skip, z_skip);
+    cudaMemcpyToSymbol(g_qeq_lambda, lambda.data(), lambda.size() * sizeof(F128));
+    if (!x_inner_rest.empty())
+        cudaMemcpyToSymbol(g_qeq_chal, x_inner_rest.data(), x_inner_rest.size() * sizeof(F128));
+    long long n = (long long)lambda.size() << x_inner_rest.size();
+    quirky_eq_build_k<<<(unsigned)((n + tpb - 1) / tpb), tpb>>>(k_skip, (int)x_inner_rest.size(), n, d_out);
+}
+
 // inner_product over equal-length F128 slices (for the final w on the host).
 inline F128 inner_product_host(const std::vector<F128>& a, const std::vector<F128>& b) {
     F128 acc{0ull, 0ull};
@@ -113,30 +146,50 @@ inline F128 inner_product_host(const std::vector<F128>& a, const std::vector<F12
 }
 
 // ---------------------------------------------------------------------------
-// Step 2: α-batched CSC column-marginal fold → comb_vec (one thread / column).
+// Step 2: α-batched CSC column-marginal fold → comb_vec (one WARP / column).
 // ---------------------------------------------------------------------------
+// One WARP per column. The obvious thread-per-column shape loses three ways at
+// BLAKE3's dimensions (16384 columns, 21M nonzeros, mean 1283/col):
+//   - the grid is 16384 threads = 64 blocks, so 106 of a 170-SM GPU's SMs idle.
+//     Per-SM theoretical occupancy is 100% and cannot see this.
+//   - each lane walks its own column, so a warp touches 32 scattered 4-byte
+//     row indices per step instead of one coalesced 128-byte line.
+//   - column lengths are ragged (median 916, max 13869); a warp runs at its
+//     slowest lane, measured at 1.36x the useful work.
+// Striding the lanes across ONE column's nonzeros fixes all three: reads
+// coalesce, every lane in a warp does equal work, and the grid becomes 2048
+// blocks. XOR-sum is order-independent, so the shuffle reduction is bit-identical.
 __global__ void lincheck_csc_fold(const F128* __restrict__ eq_inner,
                                   const uint32_t* __restrict__ a_col_ptr,
                                   const uint32_t* __restrict__ a_rows,
                                   const uint32_t* __restrict__ b_col_ptr,
                                   const uint32_t* __restrict__ b_rows,
                                   F128 alpha, int n_cols, F128* __restrict__ comb) {
-    int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= n_cols) return;
+    int c = (int)((blockIdx.x * blockDim.x + threadIdx.x) >> 5);   // one column per warp
+    int lane = threadIdx.x & 31;
+    if (c >= n_cols) return;              // whole warp exits together: shfl mask stays full
     F128 sa{0, 0};
-    for (uint32_t j = a_col_ptr[c]; j < a_col_ptr[c + 1]; j++)
+    for (uint32_t j = a_col_ptr[c] + lane; j < a_col_ptr[c + 1]; j += 32)
         sa = f128_add(sa, eq_inner[a_rows[j]]);
     F128 sb{0, 0};
-    for (uint32_t j = b_col_ptr[c]; j < b_col_ptr[c + 1]; j++)
+    for (uint32_t j = b_col_ptr[c] + lane; j < b_col_ptr[c + 1]; j += 32)
         sb = f128_add(sb, eq_inner[b_rows[j]]);
-    comb[c] = f128_add(ghash_mul_karatsuba(alpha, sa), sb);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        sa.lo ^= __shfl_down_sync(0xffffffffu, sa.lo, off);
+        sa.hi ^= __shfl_down_sync(0xffffffffu, sa.hi, off);
+        sb.lo ^= __shfl_down_sync(0xffffffffu, sb.lo, off);
+        sb.hi ^= __shfl_down_sync(0xffffffffu, sb.hi, off);
+    }
+    if (lane == 0) comb[c] = f128_add(ghash_mul_karatsuba(alpha, sa), sb);
 }
 
 inline void launch_lincheck_csc_fold(const F128* d_eq_inner,
                                      const uint32_t* d_a_col_ptr, const uint32_t* d_a_rows,
                                      const uint32_t* d_b_col_ptr, const uint32_t* d_b_rows,
                                      F128 alpha, int n_cols, F128* d_comb) {
-    int blocks = (n_cols + LC_TPB - 1) / LC_TPB;
+    long long threads = (long long)n_cols * 32;            // one warp per column
+    int blocks = (int)((threads + LC_TPB - 1) / LC_TPB);
     lincheck_csc_fold<<<blocks, LC_TPB>>>(d_eq_inner, d_a_col_ptr, d_a_rows,
                                           d_b_col_ptr, d_b_rows, alpha, n_cols, d_comb);
 }

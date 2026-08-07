@@ -120,6 +120,124 @@ __global__ void sumcheck_fold_msg_partial(const F128* __restrict__ A, const F128
 }
 
 // Host driver for one round's message: returns (u_0, u_2) on device. `d_p0`,
+// ---- TWO-ROUND LOOKAHEAD ----
+//
+// Same idea as zerocheck_tail.cuh: one pass yields two rounds' messages. Round
+// k's is the usual (u_0, u_2); round k+1's is a quadratic in rho_k, so three
+// evaluations at rho_k in {0, 1, inf} pin it down and the host interpolates.
+//
+// This sumcheck has no eq weighting, so the lookahead is strictly cheaper on
+// BOTH axes than one round per pass: over two rounds of a length-L array it
+// moves 2.5L instead of 4.5L, and costs 2L multiplies instead of 2.25L. The
+// measured fold phase runs at 1.33 TB/s (~92% of this GPU's ceiling) and only
+// 41 G muls/s, so it is bandwidth-bound with ample compute headroom.
+//
+// Slots: 0,1 = round k (u_0, u_2); 2,3,4 = round k+1's u_0 at rho_k in
+// {0, 1, inf}; 5,6,7 = its u_2 likewise. Accumulators are plain F128 — every
+// product here is already reduced, so there is nothing to defer.
+static __device__ __forceinline__ void sc_accum_quad(F128* acc, const F128* v, const F128* w) {
+    F128 P00  = ghash_mul_karatsuba(v[0], w[0]);
+    F128 P11  = ghash_mul_karatsuba(v[1], w[1]);
+    F128 P22  = ghash_mul_karatsuba(v[2], w[2]);
+    F128 P01  = ghash_mul_karatsuba(f128_add(v[0], v[1]), f128_add(w[0], w[1]));
+    F128 P23  = ghash_mul_karatsuba(f128_add(v[2], v[3]), f128_add(w[2], w[3]));
+    F128 P02  = ghash_mul_karatsuba(f128_add(v[0], v[2]), f128_add(w[0], w[2]));
+    F128 P13  = ghash_mul_karatsuba(f128_add(v[1], v[3]), f128_add(w[1], w[3]));
+    F128 Pall = ghash_mul_karatsuba(f128_add(f128_add(v[0], v[1]), f128_add(v[2], v[3])),
+                                    f128_add(f128_add(w[0], w[1]), f128_add(w[2], w[3])));
+    acc[0] = f128_add(acc[0], f128_add(P00, P22));   // u_0 over pairs 2z, 2z+1
+    acc[1] = f128_add(acc[1], f128_add(P01, P23));   // u_2 over pairs 2z, 2z+1
+    acc[2] = f128_add(acc[2], P00);
+    acc[3] = f128_add(acc[3], P11);
+    acc[4] = f128_add(acc[4], P01);
+    acc[5] = f128_add(acc[5], P02);
+    acc[6] = f128_add(acc[6], P13);
+    acc[7] = f128_add(acc[7], Pall);
+}
+
+// Block-reduce the eight slots into part[8][gridDim.x], reusing one shared buffer.
+static __device__ __forceinline__ void sc_reduce8(F128* acc, F128* sh, F128* __restrict__ part) {
+    for (int j = 0; j < 8; j++) {
+        sh[threadIdx.x] = acc[j];
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if ((int)threadIdx.x < s) sh[threadIdx.x] = f128_add(sh[threadIdx.x], sh[threadIdx.x + s]);
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) part[(long long)j * gridDim.x + blockIdx.x] = sh[0];
+        __syncthreads();
+    }
+}
+
+// No fold: accumulate both rounds' data straight off (A, B). This is the chunk
+// bootstrap — it runs on the side stream under the l0 commit, where the first
+// message was already being precomputed, so the extra slots ride along for free
+// and the first real pass can then fold TWICE.
+__global__ void sumcheck_msg2_partial(const F128* __restrict__ A, const F128* __restrict__ B,
+                                      long long quads, F128* __restrict__ part) {
+    __shared__ F128 sh[SMC_TPB];
+    F128 acc[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++) acc[j] = F128{0, 0};
+    long long t = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long z = t; z < quads; z += stride) {
+        long long i = 4 * z;
+        F128 v[4] = {A[i], A[i + 1], A[i + 2], A[i + 3]};
+        F128 w[4] = {B[i], B[i + 1], B[i + 2], B[i + 3]};
+        sc_accum_quad(acc, v, w);
+    }
+    sc_reduce8(acc, sh, part);
+}
+
+// Fold twice by (r1, r2) and accumulate both rounds' data over the result.
+// out_quads = (folded length) / 4; each thread owns 16 input elements per array.
+__global__ void sumcheck_fold2_msg2_partial(const F128* __restrict__ A, const F128* __restrict__ B,
+                                            F128* __restrict__ Ao, F128* __restrict__ Bo,
+                                            long long out_quads, F128 r1, F128 r2,
+                                            F128* __restrict__ part) {
+    __shared__ F128 sh[SMC_TPB];
+    F128 acc[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++) acc[j] = F128{0, 0};
+    long long t = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long z = t; z < out_quads; z += stride) {
+        long long o = 4 * z;
+        F128 v[4], w[4];
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            long long b = 4 * (o + j);
+            F128 va = f128_add(A[b],     ghash_mul_karatsuba(r1, f128_add(A[b],     A[b + 1])));
+            F128 vb = f128_add(A[b + 2], ghash_mul_karatsuba(r1, f128_add(A[b + 2], A[b + 3])));
+            F128 wa = f128_add(B[b],     ghash_mul_karatsuba(r1, f128_add(B[b],     B[b + 1])));
+            F128 wb = f128_add(B[b + 2], ghash_mul_karatsuba(r1, f128_add(B[b + 2], B[b + 3])));
+            v[j] = f128_add(va, ghash_mul_karatsuba(r2, f128_add(va, vb)));
+            w[j] = f128_add(wa, ghash_mul_karatsuba(r2, f128_add(wa, wb)));
+            Ao[o + j] = v[j]; Bo[o + j] = w[j];
+        }
+        sc_accum_quad(acc, v, w);
+    }
+    sc_reduce8(acc, sh, part);
+}
+
+// Reduce the eight partial rows into d_out[8]; block j owns slot j.
+__global__ void sumcheck_msg2_combine(const F128* __restrict__ part, int blocks,
+                                      F128* __restrict__ out) {
+    __shared__ F128 sh[SMC_TPB];
+    int j = blockIdx.x;
+    F128 a{0, 0};
+    for (int b = threadIdx.x; b < blocks; b += blockDim.x)
+        a = f128_add(a, part[(long long)j * blocks + b]);
+    sh[threadIdx.x] = a;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s) sh[threadIdx.x] = f128_add(sh[threadIdx.x], sh[threadIdx.x + s]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[j] = sh[0];
+}
+
 // `d_p2` are scratch of length >= SMC_MAX_BLOCKS.
 #ifndef SMC_MAX_BLOCKS
 #define SMC_MAX_BLOCKS 2048
@@ -160,4 +278,13 @@ inline void launch_sumcheck_fold_msg(const F128* dA, const F128* dB, F128* dAo, 
     int blocks = sumcheck_blocks(out_pairs);
     sumcheck_fold_msg_partial<<<blocks, SMC_TPB>>>(dA, dB, dAo, dBo, out_pairs, r, d_p0, d_p2);
     sumcheck_msg_combine<<<1, SMC_TPB>>>(d_p0, d_p2, blocks, d_u0, d_u2);
+}
+
+// d_part needs 8 * SMC_MAX_BLOCKS entries; d_out receives the 8 slots.
+inline void launch_sumcheck_fold2_msg2(const F128* dA, const F128* dB, F128* dAo, F128* dBo,
+                                       long long out_quads, F128 r1, F128 r2,
+                                       F128* d_part, F128* d_out) {
+    int blocks = sumcheck_blocks(out_quads);
+    sumcheck_fold2_msg2_partial<<<blocks, SMC_TPB>>>(dA, dB, dAo, dBo, out_quads, r1, r2, d_part);
+    sumcheck_msg2_combine<<<8, SMC_TPB>>>(d_part, blocks, d_out);
 }

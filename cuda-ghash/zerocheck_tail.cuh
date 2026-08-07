@@ -451,6 +451,148 @@ __global__ void zt_fold_msg_partial_split_hib_dev(const F128* __restrict__ A, co
     }
 }
 
+// ---- TWO-ROUND LOOKAHEAD ----
+//
+// One pass produces TWO rounds' messages. Round k's message is the usual
+// (g_one, g_inf) over the folded array. Round k+1's message cannot be evaluated
+// yet — it depends on rho_k, which Fiat-Shamir only yields after round k is
+// observed — but as a function of rho_k each of its two components is a
+// QUADRATIC (a product of two rho_k-linear folds), so three evaluations pin it
+// down exactly. The kernel accumulates those at rho_k in {0, 1, inf} and the
+// host interpolates once rho_k is known.
+//
+// Costed against the one-round-per-pass loop it replaces, over two rounds of an
+// array of length L (both arrays, 16 B/elem): that loop moves 2L read + L
+// written, then L read + L/2 written = 4.5L. Folding twice per pass moves
+// 2L read + L/2 written = 2.5L, and the geometric series over the whole tail
+// falls from 6L to 3.33L. Mul count drops too (42 per output quad vs 48).
+//
+// NFOLD is the number of folds applied on the way in: 1 for the bootstrap pass
+// (only rho_0 is in hand), 2 once the previous pass has left two rhos pending.
+static __device__ __forceinline__ F128 zt_fold1(F128 a0, F128 a1, F128 r) {
+    return f128_add(a0, ghash_mul_karatsuba(r, f128_add(a0, a1)));
+}
+static __device__ __forceinline__ F128 zt_fold_elem2(const F128* __restrict__ X, long long t,
+                                                     F128 r1, F128 r2) {
+    long long b = 4 * t;
+    return zt_fold1(zt_fold1(X[b], X[b + 1], r1), zt_fold1(X[b + 2], X[b + 3], r1), r2);
+}
+
+// Accumulate one output quad into the eight lookahead slots. w/x are the quad's
+// four folded A/B values; e0 and e1 are the split-eq values of round k's message
+// pairs 2z and 2z+1. Round k+1's pair z has split-eq index z << (shift+1) ==
+// (2z) << shift, so it reuses e0 and differs only in the host scale.
+// Slots: 0,1 = round k (g_one, g_inf); 2,3,4 = round k+1 g_one at rho_k in
+// {0, 1, inf}; 5,6,7 = round k+1 g_inf likewise.
+// Accumulators are unreduced F256: ghash_reduce is F2-linear, so the eq-weighted
+// products can be XOR-summed unreduced and reduced once at the end. That drops 10
+// reductions per quad, which matters because the round-2 fold is otherwise pure
+// table lookups and the added mul work pushes it off the bandwidth roof.
+static __device__ __forceinline__ void zt_accum_quad(F256* acc, const F128* w, const F128* x,
+                                                     F128 e0, F128 e1) {
+    F128 p_1   = ghash_mul_karatsuba(w[1], x[1]);
+    F128 p_2   = ghash_mul_karatsuba(w[2], x[2]);
+    F128 p_3   = ghash_mul_karatsuba(w[3], x[3]);
+    F128 p_01  = ghash_mul_karatsuba(f128_add(w[0], w[1]), f128_add(x[0], x[1]));
+    F128 p_23  = ghash_mul_karatsuba(f128_add(w[2], w[3]), f128_add(x[2], x[3]));
+    F128 p_02  = ghash_mul_karatsuba(f128_add(w[0], w[2]), f128_add(x[0], x[2]));
+    F128 p_13  = ghash_mul_karatsuba(f128_add(w[1], w[3]), f128_add(x[1], x[3]));
+    F128 p_all = ghash_mul_karatsuba(f128_add(f128_add(w[0], w[1]), f128_add(w[2], w[3])),
+                                     f128_add(f128_add(x[0], x[1]), f128_add(x[2], x[3])));
+    f256_xor(acc[0], mul_unreduced_karatsuba(e0, p_1));
+    f256_xor(acc[0], mul_unreduced_karatsuba(e1, p_3));
+    f256_xor(acc[1], mul_unreduced_karatsuba(e0, p_01));
+    f256_xor(acc[1], mul_unreduced_karatsuba(e1, p_23));
+    f256_xor(acc[2], mul_unreduced_karatsuba(e0, p_2));
+    f256_xor(acc[3], mul_unreduced_karatsuba(e0, p_3));
+    f256_xor(acc[4], mul_unreduced_karatsuba(e0, p_23));
+    f256_xor(acc[5], mul_unreduced_karatsuba(e0, p_02));
+    f256_xor(acc[6], mul_unreduced_karatsuba(e0, p_13));
+    f256_xor(acc[7], mul_unreduced_karatsuba(e0, p_all));
+}
+
+// Block-reduce the eight slots into part[8][gridDim.x], scaling each by blockmul.
+// Hi-factored callers pass their block's single eqhi value (see zt_hib_plan);
+// per-point callers pass ONE. One shared buffer reused eight times: 8 x ZT_TPB
+// F128 at once is 32 KB per block and would gut occupancy.
+static __device__ __forceinline__ void zt_reduce8(F256* acc, F128* sh, F128* __restrict__ part,
+                                                  F128 blockmul) {
+    for (int j = 0; j < 8; j++) {
+        sh[threadIdx.x] = f256_reduce(acc[j]);
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if ((int)threadIdx.x < s) sh[threadIdx.x] = f128_add(sh[threadIdx.x], sh[threadIdx.x + s]);
+            __syncthreads();
+        }
+        if (threadIdx.x == 0)
+            part[(long long)j * gridDim.x + blockIdx.x] = ghash_mul_karatsuba(sh[0], blockmul);
+        __syncthreads();
+    }
+}
+
+// Fold twice by (r1, r2) and accumulate both rounds' message data in one pass.
+// out_quads = (folded array length) / 4; each thread owns one output quad, i.e.
+// 16 input elements per array. The round-2 kernel supplies both pending rhos, so
+// there is no single-fold bootstrap: measured end-to-end, a fold-once first pass
+// costs more in tail bandwidth than it saves in round-2 multiplies.
+__global__ void zt_fold_msg2_k(const F128* __restrict__ A, const F128* __restrict__ B,
+                               F128* __restrict__ Ao, F128* __restrict__ Bo,
+                               const F128* __restrict__ eqlo, const F128* __restrict__ eqhi,
+                               int shift, int lobits, long long out_quads,
+                               F128 r1, F128 r2, F128* __restrict__ part) {
+    __shared__ F128 sh[ZT_TPB];
+    F256 acc[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++) acc[j] = F256{0, 0, 0, 0};
+
+    long long t = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long z = t; z < out_quads; z += stride) {
+        long long o = 4 * z;
+        F128 w[4], x[4];
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            w[j] = zt_fold_elem2(A, o + j, r1, r2);
+            x[j] = zt_fold_elem2(B, o + j, r1, r2);
+            Ao[o + j] = w[j]; Bo[o + j] = x[j];
+        }
+        zt_accum_quad(acc, w, x,
+                      zt_split_eq(eqlo, eqhi, (z << 1) << shift, lobits),
+                      zt_split_eq(eqlo, eqhi, ((z << 1) + 1) << shift, lobits));
+    }
+    zt_reduce8(acc, sh, part, F128{1, 0});
+}
+
+// Block j reduces accumulator j and applies its round's scale: slots 0,1 belong to
+// round k, slots 2..7 to round k+1.
+__global__ void zt_msg2_combine(const F128* __restrict__ part, int blocks,
+                                F128 scale_k, F128 scale_k1, F128* __restrict__ out) {
+    __shared__ F128 sh[ZT_TPB];
+    int j = blockIdx.x;
+    F128 a{0, 0};
+    for (int b = threadIdx.x; b < blocks; b += blockDim.x)
+        a = f128_add(a, part[(long long)j * blocks + b]);
+    sh[threadIdx.x] = a;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s) sh[threadIdx.x] = f128_add(sh[threadIdx.x], sh[threadIdx.x + s]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[j] = ghash_mul_karatsuba(sh[0], j < 2 ? scale_k : scale_k1);
+}
+
+// d_out receives 8 F128 (see the slot layout on zt_accum_quad).
+// d_part needs 8 * ZT_MAX_BLOCKS entries.
+inline void launch_zt_fold_msg2(const F128* dA, const F128* dB, F128* dAo, F128* dBo,
+                                const F128* dEqLo, const F128* dEqHi, int shift, int lobits,
+                                long long out_quads, F128 r1, F128 r2,
+                                F128 scale_k, F128 scale_k1, F128* d_part, F128* d_out) {
+    int blocks = zt_blocks(out_quads);
+    zt_fold_msg2_k<<<blocks, ZT_TPB>>>(dA, dB, dAo, dBo, dEqLo, dEqHi, shift, lobits,
+                                       out_quads, r1, r2, d_part);
+    zt_msg2_combine<<<8, ZT_TPB>>>(d_part, blocks, scale_k, scale_k1, d_out);
+}
+
 inline void launch_zt_msg_split(const F128* dA, const F128* dB,
                                 const F128* dEqLo, const F128* dEqHi, int shift, int lobits,
                                 long long half, F128 scale,
