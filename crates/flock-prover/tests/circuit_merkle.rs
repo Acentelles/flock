@@ -20094,6 +20094,41 @@ fn chain_tower_three_levels_one_internal_digest() {
                 }
             }
         }
+        // WHERE the differing cells actually are: classes span many slots,
+        // so diff the CONTENTS and histogram the symmetric difference by
+        // cell-slot. The first members of a class only say where it starts.
+        {
+            use std::collections::{HashMap, HashSet};
+            let mut hist: HashMap<usize, (usize, usize)> = HashMap::new();
+            for (a, b) in w0.iter().zip(w2) {
+                if a == b {
+                    continue;
+                }
+                let (sa, sb2): (HashSet<usize>, HashSet<usize>) =
+                    (a.iter().copied().collect(), b.iter().copied().collect());
+                for &c in sa.difference(&sb2) {
+                    hist.entry(c >> nu).or_default().0 += 1;
+                }
+                for &c in sb2.difference(&sa) {
+                    hist.entry(c >> nu).or_default().1 += 1;
+                }
+            }
+            let mut rows: Vec<_> = hist.into_iter().collect();
+            rows.sort_by_key(|&(sl, _)| sl);
+            println!("    symmetric difference by cell-slot (L2-only, L3-only):");
+            for (sl, (x, y)) in rows {
+                let d = cs.slots()[sl];
+                let name = match d {
+                    flock_core::circuit::CellSlot::Gate { ty, word } => format!(
+                        "ty {ty} ({} bits) word {:?}",
+                        n0.shape.registry.types()[ty].useful_bits,
+                        word
+                    ),
+                    other => format!("{other:?}"),
+                };
+                println!("      slot {sl:4}: L2-only {x:5} L3-only {y:5}  {name}");
+            }
+        }
         for sl in seen {
             let d = cs.slots()[sl];
             let extra = match d {
