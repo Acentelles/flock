@@ -177,13 +177,50 @@ struct EnvShape {
 /// hash-chain PoC's span `(h_start, h_end)`, eight 128-bit words.
 const ENV_APP_WORDS: usize = 8;
 
-/// The application block's offset — the envelope's public TAIL, hence a
-/// CONSTANT rather than a function of an outer's live public usage. That
-/// is what lets a parent read a child's app block at the same index no
-/// matter which level (or which kind) of child it is walking; an outer with
-/// no application publishes zeros there, exactly as the padding does.
+/// The INHERITABLE ACCUMULATOR blocks. An outer publishes the accumulator
+/// claims its parent will fold as PRIORS, and the parent connects to them
+/// WIRE-TO-WIRE (`child_pub_w[base + ..]`) — so, exactly like the app
+/// block, they have to sit where live public usage cannot move them.
+/// Otherwise a first-level child and an internal child expose their claims
+/// at different indices and no single parent circuit can read both.
+///
+/// TWO blocks, keyed by REGISTRY ROLE rather than by which fold produced
+/// them — that is the distinction a parent actually cares about: MAIN
+/// carries the ENVELOPE-registry claims (an internal node's own 2→1 fold),
+/// CHAIN the LOWER-registry ones (a first-level node's chain fold; an
+/// internal node's chain LANE). An outer with no claims of a role fills
+/// that block with zeros. Each block is `[claims | zero padding]`, so a
+/// shorter shape — a dev-size chain, a fold with fewer groups — rides the
+/// same layout and a reader simply stops at its own group widths.
+const ENV_ACC_CHAIN_WORDS: usize = 160;
+const ENV_ACC_MAIN_WORDS: usize = 600;
+
+/// The envelope's public TAIL, in order: `[.. body .. | pad | ACC_CHAIN |
+/// ACC_MAIN | APP]`. Every base here is a CONSTANT of the envelope.
 fn env_app_base(env: &EnvShape) -> usize {
     env.publics - ENV_APP_WORDS
+}
+
+fn env_acc_main_base(env: &EnvShape) -> usize {
+    env_app_base(env) - ENV_ACC_MAIN_WORDS
+}
+
+fn env_acc_chain_base(env: &EnvShape) -> usize {
+    env_acc_main_base(env) - ENV_ACC_CHAIN_WORDS
+}
+
+/// The reserved tail blocks an envelope outer hands to
+/// [`pad_envelope_counts`] — published after the padding, each zero-filled
+/// to its fixed width. Everything empty is the leaf/node outer's case.
+#[derive(Default)]
+struct EnvTail<'w> {
+    /// Envelope-registry accumulator claims: this outer's own 2→1 fold.
+    acc_main: &'w [Wire],
+    /// Lower-registry accumulator claims: the FL's chain fold, or an
+    /// internal node's chain LANE.
+    acc_chain: &'w [Wire],
+    /// The application statement.
+    app: &'w [Wire],
 }
 
 /// `Some` exactly when the DEFAULT envelope is active: the registry
@@ -210,7 +247,7 @@ fn envelope_shape() -> Option<EnvShape> {
         // cap exactly (registry-shaped) and skn/skc are the leaf's.
         counts_bool: [23700, 12250, 1060],
         counts_el: [
-            (600, 29700), // mac — the nu* driver; watch the 2^15 ceiling
+            (600, 30000), // mac — the nu* driver; watch the 2^15 ceiling
             (500, 620),   // zcr
             (400, 800),   // mrs
             (0, 7500),    // spine
@@ -226,7 +263,7 @@ fn envelope_shape() -> Option<EnvShape> {
             (100, 260),   // resid pl 0
             (318, 10000), // prefix w 8
         ],
-        publics: 3660,
+        publics: 3820,
     })
 }
 
@@ -320,7 +357,7 @@ fn pad_envelope_counts(
     zw: Wire,
     hints: &mut Vec<[u32; SLOT_WORDS]>,
     vals: &mut Vec<F128>,
-    app: Option<&[Wire]>,
+    tail: &EnvTail,
 ) {
     let mut report: Vec<String> = Vec::new();
     let mut over: Vec<String> = Vec::new();
@@ -376,15 +413,16 @@ fn pad_envelope_counts(
     // shift no recorded block base, and a parent's walk (H(publics)
     // rows, recombination folds) sees the same segment length at every
     // level.
-    // The last ENV_APP_WORDS are the APPLICATION BLOCK, published AFTER the
-    // padding — so its offset is `env_app_base`, a constant of the envelope
-    // rather than of this outer's live usage, and a parent reads a child's
-    // app statement at one index whatever kind of child it walks. An outer
-    // with no application fills the block with zeros, exactly as the
-    // padding does.
-    let body = env.publics - ENV_APP_WORDS;
+    // The TAIL blocks — the inheritable accumulator claims, then the
+    // application statement — are published AFTER the padding, so each sits
+    // at a constant of the envelope rather than at a function of this
+    // outer's live usage. That is what lets a parent read a child's claims
+    // and statement at ONE index whatever kind of child it walks. A block
+    // this outer has no content for is zeros, built exactly as the padding
+    // is.
+    let body = env.publics - ENV_ACC_CHAIN_WORDS - ENV_ACC_MAIN_WORDS - ENV_APP_WORDS;
     let live_pub = sb.public_len();
-    report.push(format!("publics {live_pub}/{body}+app{ENV_APP_WORDS}"));
+    report.push(format!("publics {live_pub}/{body}"));
     if live_pub > body {
         over.push(format!("publics {live_pub} > {body}"));
     } else {
@@ -392,18 +430,22 @@ fn pad_envelope_counts(
             vals.push(F128::ZERO);
             sb.public_input();
         }
-        match app {
-            Some(w) => {
-                assert_eq!(w.len(), ENV_APP_WORDS, "the app block is the envelope's tail");
-                for &x in w {
-                    sb.publish(x);
-                }
+        for (name, w, width) in [
+            ("acc_chain", tail.acc_chain, ENV_ACC_CHAIN_WORDS),
+            ("acc_main", tail.acc_main, ENV_ACC_MAIN_WORDS),
+            ("app", tail.app, ENV_APP_WORDS),
+        ] {
+            report.push(format!("{name} {}/{width}", w.len()));
+            if w.len() > width {
+                over.push(format!("{name} {} > {width}", w.len()));
+                continue;
             }
-            None => {
-                for _ in 0..ENV_APP_WORDS {
-                    vals.push(F128::ZERO);
-                    sb.public_input();
-                }
+            for &x in w {
+                sb.publish(x);
+            }
+            for _ in w.len()..width {
+                vals.push(F128::ZERO);
+                sb.public_input();
             }
         }
     }
@@ -8481,7 +8523,19 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         // is recorded first.
         let prepad_publics = sb.public_len();
         if let Some(e) = &env {
-            pad_envelope_counts(&mut sb, &slots, &leaf_slot, e, zw, &mut hints, &mut vals, None);
+            // A leaf outer folds nothing and carries no application, so
+            // every reserved tail block is zeros — the layout is the
+            // envelope's, not this builder's.
+            pad_envelope_counts(
+                &mut sb,
+                &slots,
+                &leaf_slot,
+                e,
+                zw,
+                &mut hints,
+                &mut vals,
+                &EnvTail::default(),
+            );
         }
         let shape = sb.finish().expect("valid leaf query-phase circuit");
         let hint_refs: Vec<&(dyn std::any::Any + Sync)> =
@@ -12472,18 +12526,31 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
             sb.connect(r0.child_pub_w[p0 - 4 + j], r1.child_pub_w[3 + j]);
         }
 
-        // Publishes: per fold the deltas + accumulator claim, then the
-        // value-binding publics, then THE NODE'S APPLICATION STATEMENT.
-        let fold_pub_base = sb.public_len();
+        // THE INHERITABLE ACCUMULATOR: per fold the deltas + the claim
+        // `[rho_col | rho_row | value]`. This is the surface a PARENT's
+        // chain lane connects to as its priors, so under the envelope it
+        // rides the reserved ACC_CHAIN block (the FL folds the CHAIN
+        // registry) — a constant index, the same one at which an internal
+        // child exposes its own lane's claims. Off-envelope it publishes
+        // inline, as before.
+        let mut acc_chain_w: Vec<Wire> = Vec::new();
         for fp in &fold_pubs {
-            for &w in &fp.rho_col {
-                sb.publish(w);
-            }
-            for &w in &fp.rho_row {
-                sb.publish(w);
-            }
-            sb.publish(fp.value);
+            acc_chain_w.extend_from_slice(&fp.rho_col);
+            acc_chain_w.extend_from_slice(&fp.rho_row);
+            acc_chain_w.push(fp.value);
         }
+        let fold_pub_base = match &env {
+            Some(e) => env_acc_chain_base(e),
+            None => {
+                let b = sb.public_len();
+                for &w in &acc_chain_w {
+                    sb.publish(w);
+                }
+                b
+            }
+        };
+        // The value-binding publics stay in the BODY: nothing above reads
+        // them, they only bind the claim values this outer folded.
         for k in 0..2 {
             sb.publish(wv(locs[0].claims[n_priors + k].value_v));
             sb.publish(wv(locs[1].claims[n_priors + k].value_v));
@@ -12491,9 +12558,8 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         // THE APPLICATION STATEMENT: the combined span (the left child's
         // h_start, the right child's h_end). counts* + publics*: an FL node
         // declares the same count vector and segment length every other
-        // envelope outer does, and the app block rides the envelope's fixed
-        // TAIL so a parent reads it at `env_app_base` — the same index it
-        // reads an internal child's at. Off-envelope it publishes inline.
+        // envelope outer does, and both the app block and the accumulator
+        // claims ride the envelope's fixed TAIL.
         let app_w: Vec<Wire> = (0..4)
             .map(|j| r0.child_pub_w[3 + j])
             .chain((0..4).map(|j| r1.child_pub_w[p1 - 4 + j]))
@@ -12508,7 +12574,11 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
                     zw,
                     &mut hints,
                     &mut vals,
-                    Some(&app_w),
+                    &EnvTail {
+                        acc_chain: &acc_chain_w,
+                        app: &app_w,
+                        ..EnvTail::default()
+                    },
                 );
                 env_app_base(e)
             }
@@ -18585,18 +18655,26 @@ fn build_node_outer_app(
             sb.connect(wv(cl.value_v), rk.sig_w);
         }
 
-        // Publishes: per fold, deltas + accumulator claim; then per child,
-        // the lagrange-low surface (fold 0's words).
-        let fold_pub_base = sb.public_len();
+        // Publishes: per fold, deltas + accumulator claim. This is the
+        // ENVELOPE-registry surface a parent inherits, so under the
+        // envelope it rides the reserved ACC_MAIN block at a constant
+        // index; off-envelope it publishes inline, as before.
+        let mut acc_main_w: Vec<Wire> = Vec::new();
         for fp in &fold_pubs {
-            for &w in &fp.rho_col {
-                sb.publish(w);
-            }
-            for &w in &fp.rho_row {
-                sb.publish(w);
-            }
-            sb.publish(fp.value);
+            acc_main_w.extend_from_slice(&fp.rho_col);
+            acc_main_w.extend_from_slice(&fp.rho_row);
+            acc_main_w.push(fp.value);
         }
+        let fold_pub_base = match &env {
+            Some(e) => env_acc_main_base(e),
+            None => {
+                let b = sb.public_len();
+                for &w in &acc_main_w {
+                    sb.publish(w);
+                }
+                b
+            }
+        };
         // ---- the APPLICATION STATEMENT (hash-chain adjacency) ----
         // When the children carry an app block: left.h_end == right.h_start
         // as four copy constraints (both children's publics are witness
@@ -18707,18 +18785,28 @@ fn build_node_outer_app(
                     off += loc.k_col + loc.k_row + 1;
                 }
             }
-            let lane_pub_base = sb.public_len();
+            // The lane's claims are the LOWER-registry surface a parent
+            // inherits: under the envelope they ride the reserved
+            // ACC_CHAIN block — the same constant index at which an FL
+            // child exposes its own chain fold.
+            let mut lane_w: Vec<Wire> = Vec::new();
             for fp in &lfold_pubs {
-                for &w in &fp.rho_col {
-                    sb.publish(w);
-                }
-                for &w in &fp.rho_row {
-                    sb.publish(w);
-                }
-                sb.publish(fp.value);
+                lane_w.extend_from_slice(&fp.rho_col);
+                lane_w.extend_from_slice(&fp.rho_row);
+                lane_w.push(fp.value);
             }
-            let lane_words = sb.public_len() - lane_pub_base;
-            (lane_pub_base, lane_words, lalpha_recs)
+            let lane_words = lane_w.len();
+            let lane_pub_base = match &env {
+                Some(e) => env_acc_chain_base(e),
+                None => {
+                    let b = sb.public_len();
+                    for &w in &lane_w {
+                        sb.publish(w);
+                    }
+                    b
+                }
+            };
+            (lane_pub_base, lane_words, lalpha_recs, lane_w)
         });
 
         if std::env::var("MAC_CENSUS").is_ok() {
@@ -18755,6 +18843,7 @@ fn build_node_outer_app(
         let prepad_publics2 = sb.public_len();
         let app_base = match &env {
             Some(e) => {
+                let empty: Vec<Wire> = Vec::new();
                 pad_envelope_counts(
                     &mut sb,
                     &cs.q,
@@ -18763,7 +18852,11 @@ fn build_node_outer_app(
                     zw,
                     &mut hints,
                     &mut vals,
-                    app_w.as_deref(),
+                    &EnvTail {
+                        acc_main: &acc_main_w,
+                        acc_chain: lane_pub.as_ref().map(|(_, _, _, w)| w).unwrap_or(&empty),
+                        app: app_w.as_deref().unwrap_or(&empty),
+                    },
                 );
                 app_w.as_ref().map(|_| env_app_base(e))
             }
@@ -18978,25 +19071,31 @@ fn build_node_outer_app(
                 F128::ZERO,
                 "the lows' assert-zero anchor"
             );
-            // The REAL segment ends at the last publish block: the lane's
-            // fold blocks when a lane rides (its emitter also declares its
-            // own boundary publics before them), else the node's fold
-            // blocks + the app block.
-            let seg_end = lane_pub
-                .as_ref()
-                .map(|&(b, w, _)| b + w)
-                .unwrap_or(
-                    fold_pub_base
-                        + tail_len
-                        + if app_inline.is_some() { ENV_APP_WORDS } else { 0 },
+            // OFF-ENVELOPE the REAL segment ends at the last publish block:
+            // the lane's fold blocks when a lane rides (its emitter also
+            // declares its own boundary publics before them), else the
+            // node's fold blocks + the app block. UNDER the envelope those
+            // blocks moved to the reserved tail, so the body simply has to
+            // fit — which `pad_envelope_counts` asserts — and the tail
+            // layout is checked where it matters, by rebuilding both
+            // accumulators at their CONSTANT bases below.
+            if env.is_none() {
+                let seg_end = lane_pub
+                    .as_ref()
+                    .map(|&(b, w, _, _)| b + w)
+                    .unwrap_or(
+                        fold_pub_base
+                            + tail_len
+                            + if app_inline.is_some() { ENV_APP_WORDS } else { 0 },
+                    );
+                assert_eq!(
+                    seg_end, prepad_publics2,
+                    "the last publish block ends the REAL segment"
                 );
-            assert_eq!(
-                seg_end, prepad_publics2,
-                "the last publish block ends the REAL segment"
-            );
+            }
             // The LANE accumulator, reassembled from the public segment
             // alone — the parent-facing statement of the lower registry.
-            if let (Some((lpb, _, lar)), Some((lacc_n, llocs, ..))) =
+            if let (Some((lpb, _, lar, _)), Some((lacc_n, llocs, ..))) =
                 (lane_pub.as_ref(), lane_native.as_ref())
             {
                 let lrebuilt = check_fold_publics(&built2.public, *lpb, llocs, lar);
@@ -19295,14 +19394,35 @@ fn internal_node_over_two_fl_nodes() {
 /// child, so the same circuit serves both — the tower is depth-unbounded in
 /// SHAPE.
 ///
-/// The accumulator LANES are deliberately out of scope here (`lane: None`):
-/// threading them across levels needs the children's published accumulator
-/// claims at a FIXED envelope offset too (the app block's treatment applied
-/// to the fold blocks), plus the FL-vs-internal sigma key pair. This test
-/// isolates the shape claim, which is what the envelope is for.
+/// **The chain LANE is threaded across BOTH levels here**, which is the
+/// point of the reserved `ACC_CHAIN` block: a first-level child publishes
+/// its own chain fold there and an internal child publishes its LANE's fold
+/// there, at the SAME constant index — so the level-3 lane connects to its
+/// internal children exactly as the level-2 lane connects to its FL
+/// children, and the two circuits stay identical.
+///
+/// STILL OPEN (the fork in the handoff): each internal node's MAIN
+/// (envelope-registry) accumulator is not yet inherited by its parent, so a
+/// tower deeper than two levels is not yet sound end to end — the level-2
+/// main accumulators would have to be folded as priors of the level-3 main
+/// fold, which needs the FL-vs-internal sigma key pair. Their claims now
+/// have a fixed home (`ACC_MAIN`) waiting for it. This test pins the SHAPE
+/// and the lane mechanism.
 #[test]
 #[ignore] // Heavy — eight chain proofs and seven outers.
 fn chain_tower_three_levels_one_internal_digest() {
+    // The cross-level connects read the children's claims and statement at
+    // CONSTANT indices, and those constants exist only under the envelope —
+    // off-envelope every builder publishes inline, where the offsets depend
+    // on live usage and an FL child and an internal child genuinely differ.
+    let Some(env) = envelope_shape() else {
+        println!(
+            "\nTHREE-LEVEL CHAIN TOWER: skipped — the fixed-offset tail blocks the \
+             cross-level\n  connects need exist only under the envelope \
+             (TOWER_PROFILE=slim)\n"
+        );
+        return;
+    };
     // 256: the registered Ligerito configs floor at m22, and a 128-block
     // chain commits at m21.
     let n_blocks = 256usize;
@@ -19325,10 +19445,48 @@ fn chain_tower_three_levels_one_internal_digest() {
             "one FL circuit digest"
         );
     }
-    let (n0, _a0, _t0, app0, _) =
-        build_node_outer_app(&fls[0].lo, &fls[1].lo, Some(app_fl), None);
-    let (n1, _a1, _t1, app1, _) =
-        build_node_outer_app(&fls[2].lo, &fls[3].lo, Some(app_fl), None);
+    // The lane's registry materials — the CHAIN side, shared by every level.
+    let chain_registry = &cps[0].inner.built.shape.registry;
+    let blake_r1cs = blake3::build_block_r1cs(cps[0].inner.nu);
+    let blake_lc = blake_r1cs.csc_lincheck_circuit();
+    let chain_mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
+    let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
+    let chain_circuit = &cps[0].inner.built.shape.circuit;
+    let acc_base = fls[0].fold_pub_base;
+    assert_eq!(
+        acc_base,
+        env_acc_chain_base(&env),
+        "an FL publishes its chain claims in the reserved ACC_CHAIN block"
+    );
+
+    // Level 2: the chain lane's priors are the FL children's chain
+    // accumulators, read at the FL's ACC_CHAIN block.
+    let (n0, _a0, _t0, app0, lane0) = build_node_outer_app(
+        &fls[0].lo,
+        &fls[1].lo,
+        Some(app_fl),
+        Some(ChainLane {
+            registry: chain_registry,
+            mats: &chain_mats,
+            circs: &chain_circs,
+            circuit: chain_circuit,
+            priors: [&fls[0].acc, &fls[1].acc],
+            claims_base: acc_base,
+        }),
+    );
+    let (n1, _a1, _t1, app1, lane1) = build_node_outer_app(
+        &fls[2].lo,
+        &fls[3].lo,
+        Some(app_fl),
+        Some(ChainLane {
+            registry: chain_registry,
+            mats: &chain_mats,
+            circs: &chain_circs,
+            circuit: chain_circuit,
+            priors: [&fls[2].acc, &fls[3].acc],
+            claims_base: acc_base,
+        }),
+    );
     let app0 = app0.expect("level-2 app block");
     assert_eq!(app0, app1.expect("level-2 app block"), "one L2 app offset");
     assert_eq!(
@@ -19336,16 +19494,39 @@ fn chain_tower_three_levels_one_internal_digest() {
         n1.shape.circuit.digest(),
         "one level-2 circuit digest"
     );
+    let (lane0, lane1) = (lane0.expect("L2 lane"), lane1.expect("L2 lane"));
 
-    // THE STEP THAT MATTERS: an internal node over two INTERNAL children.
-    let (n2, _a2, _t2, app2, _) = build_node_outer_app(&n0, &n1, Some(app0), None);
+    // THE STEP THAT MATTERS: an internal node over two INTERNAL children,
+    // its lane inheriting THEIR lane accumulators — published at the same
+    // ACC_CHAIN index the FL children used, which is why one circuit reads
+    // both kinds.
+    let (n2, _a2, _t2, app2, lane2) = build_node_outer_app(
+        &n0,
+        &n1,
+        Some(app0),
+        Some(ChainLane {
+            registry: chain_registry,
+            mats: &chain_mats,
+            circs: &chain_circs,
+            circuit: chain_circuit,
+            priors: [&lane0, &lane1],
+            claims_base: acc_base,
+        }),
+    );
     let app2 = app2.expect("level-3 app block");
+    let lane2 = lane2.expect("L3 lane");
+    assert!(
+        lane2.discharge(&chain_mats) && lane2.discharge_sigma(chain_circuit),
+        "the level-3 chain lane discharges against the chain tables — \
+         eight leaves' claims in one accumulator"
+    );
     assert_eq!(
         n2.shape.circuit.digest(),
         n0.shape.circuit.digest(),
         "ONE internal circuit digest at level 3 as at level 2 — depth-unbounded shape"
     );
     assert_eq!(app2, app0, "the app block never moves");
+    assert_eq!(app2, env_app_base(&env), "and it is the envelope's own tail");
 
     // The statement rode all three levels: the root span is the whole chain.
     let h_end = native_chain(&h0, 8 * n_blocks);
