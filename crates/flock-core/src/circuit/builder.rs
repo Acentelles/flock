@@ -1393,7 +1393,7 @@ impl CircuitShape {
         // are pre-resolved to class roots by `finish`.
         let mut vals: Vec<F128> = Vec::with_capacity(16);
         let mut outs: Vec<F128> = Vec::with_capacity(16);
-        for step in &self.steps[range] {
+        for (step_i, step) in self.steps[range].iter().enumerate() {
             vals.clear();
             for &r in &step.inputs {
                 assert!(
@@ -1417,7 +1417,9 @@ impl CircuitShape {
                 if set[r] {
                     assert_eq!(
                         values[r], v,
-                        "a connected wire disagrees with the gate output that produces it"
+                        "a connected wire disagrees with the gate output that produces it \
+                         (slot {}, class root {r}, step {step_i})",
+                        step.slot
                     );
                 } else {
                     values[r] = v;

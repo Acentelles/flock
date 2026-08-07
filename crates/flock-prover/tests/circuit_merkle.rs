@@ -363,6 +363,7 @@ const DOMAIN: &[u8] = b"flock-circuit-merkle-v0";
 const CHUNK_START: u32 = 1 << 0;
 const CHUNK_END: u32 = 1 << 1;
 const PARENT: u32 = 1 << 2;
+const ROOT: u32 = 1 << 3;
 
 const IV: [u32; 8] = [
     0x6A09_E667,
@@ -9554,6 +9555,7 @@ impl<'p> RealTape<'p> {
             &lo.public,
             &lo.proof.wiring.gather,
             &gammas_i,
+            2,
             &vals_rec,
             &gkr_rec.r_pt,
             gkr_rec.fgs_v,
@@ -11505,6 +11507,1056 @@ fn build_mixed_inner(n_blocks: usize, mac_take: usize, seed: u64) -> MixedInner 
     }
 }
 
+/// **Chain-PoC step 0: a SINGLE-SLOT BOOLEAN union takes wiring.** The
+/// hash-chain application's leaf is one b3 slot whose rows chain
+/// cv_out(i) → cv_in(i+1) by copy constraints — no element slot anywhere.
+/// mvp10's minimal wired inner carried a MacGate, leaving open whether the
+/// circuit transport NEEDS an element presence; `sha256_binary_tree_circuit`
+/// (circuit_wiring.rs) already answers "no" for the PLAIN verify. This probe
+/// pins the recursion-relevant remainder on the chain shape itself:
+/// blake3/blake3 (the recursable config), the DEFERRED verify — boolean
+/// matrix work + sigma assertion out, element work `None` — both discharging
+/// natively, and the chain-link tamper dying on the wiring product rather
+/// than anything softer.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn chain_probe_boolean_only_wired_union() {
+    let n_blocks = 256usize;
+    let nu = 8usize;
+    let mut rng = Rng(0xC4A1_0001);
+    let mut b = CircuitBuilder::new(nu);
+    let hash = b.slot(Blake3Gate { nu });
+    let iv = pack8(&IV);
+    let mut cv = [b.public_value(iv[0]), b.public_value(iv[1])];
+    for i in 0..n_blocks {
+        let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+        let mut hash_in = vec![cv[0], cv[1]];
+        for j in 0..4 {
+            hash_in.push(b.public_value(pack4(m[4 * j..4 * j + 4].try_into().unwrap())));
+        }
+        let mut flags = 0u32;
+        if i == 0 {
+            flags |= CHUNK_START;
+        }
+        if i + 1 == n_blocks {
+            flags |= CHUNK_END;
+        }
+        hash_in.push(b.public_value(pack_params(0, 64, flags)));
+        let out = b.gate(hash, &hash_in);
+        cv = [out[0], out[1]];
+    }
+    b.publish(cv[0]);
+    b.publish(cv[1]);
+    let built = b.finish().expect("the chain circuit builds");
+
+    let union = UnionInstance::new(&built.shape.registry, built.shape.counts.clone());
+    assert!(!union.has_element(), "one boolean slot, no element class");
+    let pcs_params = PcsParams {
+        m: union.dense_m(),
+        log_inv_rate: 1,
+        log_batch_size: pcs_batch(&union),
+        profile: LigeritoProfile::Fast,
+        num_lanes: union.commit_lanes(pcs_batch(&union)),
+        merkle_hash: HashKind::Blake3,
+    };
+    let blake_r1cs = blake3::build_block_r1cs(nu);
+    let blake_lc = blake_r1cs.csc_lincheck_circuit();
+    let prove = |rows: &[blake3::Compression]| {
+        let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
+        prover::prove_fast_ligerito_union_circuit(
+            &union,
+            &built.shape.circuit,
+            &built.witness.public,
+            &pcs_params,
+            vec![UnionSlotProverInput::new(
+                blake3::generate_witness_batch_major_partial(rows, nu),
+                blake_lc,
+            )],
+            Vec::new(),
+            &mut ch,
+        )
+    };
+    let (proof, commitment, _) = prove(built.rows::<Blake3Gate>(hash));
+
+    // The deferred verify — what a first-level node runs per chain child.
+    let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
+    let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
+    let (_claims, work, sigma) = verifier::verify_ligerito_union_circuit_deferred(
+        &union,
+        &built.shape.circuit,
+        &built.witness.public,
+        &lcs,
+        &commitment,
+        &proof,
+        &pcs_params,
+        &mut ch,
+    )
+    .expect("the deferred verify accepts an honest boolean-only chain");
+    let matrix = work
+        .boolean
+        .expect("the b3 slot yields boolean matrix work");
+    assert!(work.element.is_none(), "no element class, no element work");
+    matrix
+        .check(&union, &lcs)
+        .expect("the boolean matrix work discharges against the b3 matrices");
+    assert!(
+        sigma.check(&built.shape.circuit),
+        "the sigma assertion discharges against the chain's own sigma table"
+    );
+
+    // The chain-link tamper: row 17 re-witnessed from a cv one bit off.
+    // Every gate still satisfies the b3 relation on its own row; only the
+    // copy constraints around row 17 break — the wiring product must be
+    // what catches it.
+    let mut bad: Vec<blake3::Compression> = built.rows::<Blake3Gate>(hash).to_vec();
+    bad[17].0[0] ^= 1;
+    let (p, cm, _) = prove(&bad);
+    let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
+    assert!(
+        matches!(
+            verifier::verify_ligerito_union_circuit(
+                &union,
+                &built.shape.circuit,
+                &built.witness.public,
+                &lcs,
+                &cm,
+                &p,
+                &pcs_params,
+                &mut ch,
+            ),
+            Err(flock_core::verifier::VerifyError::Wiring(
+                flock_core::circuit::WiringError::Gkr(
+                    flock_core::product_gkr::VerifyError::ProductMismatch
+                )
+            ))
+        ),
+        "a broken chain link must die on the wiring product"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The hash-chain PoC's LEAF (task 2): the message-chain proof.
+//
+// h_{i+1} = compress(IV, h_i, counter = 0, block_len = 64,
+//                    CHUNK_START | CHUNK_END | ROOT)
+//
+// — the full 64-byte output fed back as the next MESSAGE block (Ron's call:
+// no truncation to a 32-byte cv between steps), cv pinned to the IV, the
+// single-block-root flag flavor, so one step reads as a standalone
+// blake3-of-64-bytes. One b3 slot, rows chained out(i) → m(i+1) by copy
+// constraints (task 1 pinned that boolean-only unions take wiring); the
+// statement is 11 words: iv (2) + params (1) + h_start (4) declared, h_end
+// (4) published last — DECLARATION-ordered, so the public tail IS h_end.
+
+/// The chain statement's flag word: a standalone single-block root.
+const CHAIN_FLAGS: u32 = CHUNK_START | CHUNK_END | ROOT;
+
+/// The native reference: `n_blocks` message-chain steps from `h_start`.
+fn native_chain(h_start: &[u32; 16], n_blocks: usize) -> [u32; 16] {
+    let mut h = *h_start;
+    for _ in 0..n_blocks {
+        h = blake3::blake3_compress(&IV, &h, 0, 64, CHAIN_FLAGS);
+    }
+    h
+}
+
+/// The chain circuit alone (shared by the honest builder and the tamper
+/// legs): one b3 slot, message-chain wiring, the 11-word statement.
+fn build_chain_circuit(
+    h_start: &[u32; 16],
+    n_blocks: usize,
+) -> (
+    flock_core::circuit::builder::BuiltCircuit,
+    flock_core::circuit::builder::SlotId,
+) {
+    let nu = n_blocks.trailing_zeros() as usize;
+    assert_eq!(1usize << nu, n_blocks, "block count is a power of two");
+    let mut b = CircuitBuilder::new(nu);
+    let hash = b.slot(Blake3Gate { nu });
+    let iv = pack8(&IV);
+    let cv = [b.public_value(iv[0]), b.public_value(iv[1])];
+    let params = b.public_value(pack_params(0, 64, CHAIN_FLAGS));
+    let mut m: Vec<Wire> = (0..4)
+        .map(|j| b.public_value(pack4(h_start[4 * j..4 * j + 4].try_into().unwrap())))
+        .collect();
+    let mut out = Vec::new();
+    for _ in 0..n_blocks {
+        let mut hash_in = vec![cv[0], cv[1]];
+        hash_in.extend_from_slice(&m);
+        hash_in.push(params);
+        out = b.gate(hash, &hash_in);
+        m = out.clone();
+    }
+    for w in &out {
+        b.publish(*w);
+    }
+    let built = b.finish().expect("the chain circuit builds");
+    (built, hash)
+}
+
+/// The chain-PoC leaf, end to end: FAST profile (the B-fast decision),
+/// BLAKE3 for Merkle and FS (recursable), proven over the circuit path
+/// with NO element slots, deferred-verified with both assertion families
+/// discharged, and h_end cross-checked against the native chain. The
+/// [`MixedInner`] embedding is deliberate: a chain proof is a circuit
+/// proof, so [`ChildTape`] consumes it directly (element side `None`).
+struct ChainProof {
+    inner: MixedInner,
+    h_start: [u32; 16],
+    h_end: [u32; 16],
+}
+
+fn build_chain_proof(h_start: [u32; 16], n_blocks: usize) -> ChainProof {
+    let (built, hash) = build_chain_circuit(&h_start, n_blocks);
+    let nu = n_blocks.trailing_zeros() as usize;
+
+    let union = UnionInstance::new(&built.shape.registry, built.shape.counts.clone());
+    assert!(!union.has_element(), "a chain proof is boolean-only");
+    let pcs_params = PcsParams {
+        m: union.dense_m(),
+        log_inv_rate: 1,
+        log_batch_size: pcs_batch(&union),
+        profile: LigeritoProfile::Fast,
+        num_lanes: union.commit_lanes(pcs_batch(&union)),
+        merkle_hash: HashKind::Blake3,
+    };
+    let blake_r1cs = blake3::build_block_r1cs(nu);
+    let blake_lc = blake_r1cs.csc_lincheck_circuit();
+    let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
+    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
+        &union,
+        &built.shape.circuit,
+        &built.witness.public,
+        &pcs_params,
+        vec![UnionSlotProverInput::new(
+            blake3::generate_witness_batch_major_partial(built.rows::<Blake3Gate>(hash), nu),
+            blake_lc,
+        )],
+        Vec::new(),
+        &mut ch,
+    );
+
+    let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
+    let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
+    let (_claims, work, sigma) = verifier::verify_ligerito_union_circuit_deferred(
+        &union,
+        &built.shape.circuit,
+        &built.witness.public,
+        &lcs,
+        &commitment,
+        &proof,
+        &pcs_params,
+        &mut ch,
+    )
+    .expect("the deferred verify accepts an honest chain proof");
+    work.boolean
+        .as_ref()
+        .expect("the b3 slot yields boolean matrix work")
+        .check(&union, &lcs)
+        .expect("the boolean matrix work discharges");
+    assert!(work.element.is_none(), "no element class, no element work");
+    assert!(sigma.check(&built.shape.circuit), "sigma discharges");
+
+    // The statement is bound end to end: publics[3..7] are h_start, the
+    // published tail is h_end, and h_end equals the native chain.
+    let h_end = native_chain(&h_start, n_blocks);
+    let public = &built.witness.public;
+    for j in 0..4 {
+        assert_eq!(
+            public[3 + j],
+            pack4(h_start[4 * j..4 * j + 4].try_into().unwrap()),
+            "public word {} is h_start[{}]",
+            3 + j,
+            j
+        );
+        assert_eq!(
+            public[public.len() - 4 + j],
+            pack4(h_end[4 * j..4 * j + 4].try_into().unwrap()),
+            "the published tail is the native h_end"
+        );
+    }
+
+    ChainProof {
+        inner: MixedInner {
+            nu,
+            built,
+            proof,
+            commitment,
+            pcs: pcs_params,
+            work,
+            sigma,
+        },
+        h_start,
+        h_end,
+    }
+}
+
+/// **Task 2's pin: the message-chain leaf, honest + the tamper matrix.**
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn chain_proof_message_chain_roundtrip_and_tampers() {
+    let n_blocks = 256usize;
+    let mut rng = Rng(0xC4A1_0002);
+    let h_start: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+
+    // Honest: build_chain_proof internally deferred-verifies, discharges
+    // both assertion families and cross-checks h_end against the native
+    // chain. Determinism of the statement: a second build from the same
+    // h_start yields the same h_end.
+    let cp = build_chain_proof(h_start, n_blocks);
+    assert_eq!(cp.h_end, native_chain(&h_start, n_blocks));
+    assert_eq!(cp.inner.nu, 8);
+
+    // The tamper legs run on a fresh circuit build (the honest one's rows,
+    // modified), against the PLAIN verifier so every check is in force.
+    let (built, hash) = build_chain_circuit(&h_start, n_blocks);
+    let union = UnionInstance::new(&built.shape.registry, built.shape.counts.clone());
+    let blake_r1cs = blake3::build_block_r1cs(cp.inner.nu);
+    let blake_lc = blake_r1cs.csc_lincheck_circuit();
+    let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
+    let prove = |rows: &[blake3::Compression], public: &[F128]| {
+        let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
+        prover::prove_fast_ligerito_union_circuit(
+            &union,
+            &built.shape.circuit,
+            public,
+            &cp.inner.pcs,
+            vec![UnionSlotProverInput::new(
+                blake3::generate_witness_batch_major_partial(rows, cp.inner.nu),
+                blake_lc,
+            )],
+            Vec::new(),
+            &mut ch,
+        )
+    };
+    let verify = |public: &[F128],
+                  cm: &flock_core::pcs::commit::Commitment,
+                  p: &flock_core::proof::R1csProofCircuitMerged| {
+        let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
+        verifier::verify_ligerito_union_circuit(
+            &union,
+            &built.shape.circuit,
+            public,
+            &lcs,
+            cm,
+            p,
+            &cp.inner.pcs,
+            &mut ch,
+        )
+    };
+
+    // (a) A broken chain link: row 100 re-witnessed from a message one bit
+    //     off. Its own b3 relation holds; the copy constraint out(99) ==
+    //     m(100) breaks, and the wiring product is what must catch it.
+    {
+        let mut bad: Vec<blake3::Compression> = built.rows::<Blake3Gate>(hash).to_vec();
+        bad[100].1[0] ^= 1;
+        let (p, cm, _) = prove(&bad, &built.witness.public);
+        assert!(
+            matches!(
+                verify(&built.witness.public, &cm, &p),
+                Err(flock_core::verifier::VerifyError::Wiring(
+                    flock_core::circuit::WiringError::Gkr(
+                        flock_core::product_gkr::VerifyError::ProductMismatch
+                    )
+                ))
+            ),
+            "a broken chain link must die on the wiring product"
+        );
+    }
+
+    // (b) A tampered STATEMENT word — h_start (public 3) and h_end (the
+    //     tail): the honest proof must not verify against it, and a prover
+    //     honestly proving the tampered statement must be rejected too.
+    let plen = built.witness.public.len();
+    for i in [3usize, plen - 1] {
+        let mut bad = built.witness.public.clone();
+        bad[i] += F128::ONE;
+        assert!(
+            verify(&bad, &cp.inner.commitment, &cp.inner.proof).is_err(),
+            "statement word {i} must be bound to the transcript"
+        );
+        let (p, cm, _) = prove(built.rows::<Blake3Gate>(hash), &bad);
+        assert!(
+            verify(&bad, &cm, &p).is_err(),
+            "statement word {i} must be enforced by the wiring"
+        );
+    }
+
+    // (c') see chain_tape_regions_pinned for the tape-side continuation.
+    // (c) Shape determinism — the foldability key. The chain circuit is
+    //     h_start-INDEPENDENT (h_start only moves public VALUES), so every
+    //     segment of a long chain proves against ONE circuit digest, and
+    //     the accumulator folds their assertions under one sigma key.
+    assert_eq!(cp.h_start, h_start);
+    assert_eq!(
+        cp.inner.built.shape.circuit.digest(),
+        built.shape.circuit.digest(),
+        "two builds from the same h_start agree"
+    );
+    let other_start: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let (other, _) = build_chain_circuit(&other_start, n_blocks);
+    assert_eq!(
+        cp.inner.built.shape.circuit.digest(),
+        other.shape.circuit.digest(),
+        "a DIFFERENT segment's chain circuit is digest-equal"
+    );
+    // The deferred work/sigma are verifier-exported references: both must
+    // discharge against the REBUILT circuit too (same digest, same tables).
+    cp.inner.work
+        .boolean
+        .as_ref()
+        .expect("boolean matrix work travels with the chain proof")
+        .check(&union, &lcs)
+        .expect("the exported matrix work discharges against the rebuild");
+    assert!(
+        cp.inner.sigma.check(&built.shape.circuit),
+        "the exported sigma discharges against the rebuild's sigma table"
+    );
+}
+
+/// **Task 3: the chain tape.** [`ChildTape::new`] — the SAME constructor the
+/// merge machinery instantiates per mixed child — walks the hash-chain
+/// leaf's tape with the element side `None`. Its class-agnostic pins all
+/// re-assert on the boolean-only shape: the duplex chain trace, the GKR
+/// walk + masked input checks, rs×2, the pd census, the R=2+P schedule
+/// replaying to anchor.v, the W rounds, the stratified query geometry, the
+/// spine/residual natives, the recombination, and the full anchor-expect
+/// replica. This test adds the chain-shape facts on top.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn chain_tape_regions_pinned() {
+    let mut rng = Rng(0xC4A1_0003);
+    let h_start: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let n_blocks = 256usize;
+    let cp = build_chain_proof(h_start, n_blocks);
+    let ct = ChildTape::new(&cp.inner, DOMAIN);
+
+    // The boolean-only shape facts.
+    assert!(ct.el.is_none(), "no element PIOP region on a chain tape");
+    assert!(ct.el_assert.is_none(), "no element assertion travels");
+    assert_eq!(
+        ct.n_pd,
+        cp.inner.proof.wiring.gather.len(),
+        "the pd claims are the wiring gathers ONLY"
+    );
+    assert!(ct.n_p > 0, "the gathers form scalar groups");
+    assert_eq!(
+        ct.sigma_native.value, cp.inner.sigma.value,
+        "the tape's sigma reference is the deferred verify's"
+    );
+    assert_eq!(
+        ct.bool_assert.target,
+        cp.inner
+            .work
+            .boolean
+            .as_ref()
+            .expect("boolean work")
+            .target,
+        "the tape's boolean reference is the deferred verify's"
+    );
+
+    let union = UnionInstance::new(
+        &cp.inner.built.shape.registry,
+        cp.inner.built.shape.counts.clone(),
+    );
+    println!(
+        "\nCHAIN TAPE (boolean-only wired leaf, message-chain)\n  \
+         inner: nu {} | dense_m {} | pd claims {} (ALL gathers) | P {} | mu {}\n  \
+         GKR layers {} | b3 rows (tape model) {} | L0 lanes {} x {} words\n",
+        cp.inner.nu,
+        union.dense_m(),
+        ct.n_pd,
+        ct.n_p,
+        ct.mu_i,
+        cp.inner.proof.wiring.gkr.layers.len(),
+        ct.b3_rows,
+        ct.geo[0].lanes,
+        ct.geo[0].row_words,
+    );
+}
+
+/// Bisect probe: ONE chain child region alone — emit, run, check.
+#[test]
+#[ignore]
+fn chain_child_region_emits_alone() {
+    let mut rng = Rng(0xC4A1_0005);
+    let h_start: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let cp = build_chain_proof(h_start, 256);
+    let ct = ChildTape::new(&cp.inner, DOMAIN);
+    let nu2 = (ct.b3_rows.next_power_of_two().trailing_zeros() as usize).max(3);
+    let mut sb = ShapeBuilder::new(nu2);
+    let mut cs = ChildSlots::new(&mut sb, nu2, ct.spread_w);
+    let mut vals: Vec<F128> = Vec::new();
+    let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
+    let mut consts: Vec<(F128, Wire)> = Vec::new();
+    let region = emit_child_region(&mut sb, &mut cs, &ct, &mut vals, &mut hints, &mut consts);
+    let shape2 = sb.finish().expect("the chain child circuit builds");
+    let hint_refs: Vec<&(dyn std::any::Any + Sync)> =
+        hints.iter().map(|h| h as &(dyn std::any::Any + Sync)).collect();
+    let built2 = shape2.run(&vals, &hint_refs);
+    let consumed = check_child_region(&built2.public, &ct, &region);
+    assert_eq!(
+        region.pub_base + consumed,
+        built2.public.len(),
+        "the region's publics are the whole tail"
+    );
+}
+
+/// **Task 4: THE FIRST-LEVEL NODE.** Two ADJACENT chain proofs (the right
+/// segment starts at the left's h_end) verified deferred in ONE outer
+/// circuit — two chain-tape regions on shared slots — with their boolean +
+/// sigma assertions folded 2→1 in-circuit (THREE fold groups; the chain
+/// class has no element side), THE ADJACENCY as a wire-to-wire copy
+/// constraint between the children's endpoint publics, and the combined
+/// span (h_start_left, h_end_right) published as the node's own
+/// application statement. The accumulator reassembles from the public
+/// segment alone and discharges both groups. Envelope snapping is the
+/// scale step's job — this pins the assembly at the m22 dev shape.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn first_level_node_two_chains_fold_and_adjacency() {
+    use flock_core::aggregate;
+    use flock_core::matrix_fold::{FoldProof, MatrixClaim};
+    use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
+
+    const FL_DOMAIN: &[u8] = b"flock-chain-fl-node-v0";
+
+    let n_blocks = 256usize;
+    let mut rng = Rng(0xC4A1_0004);
+    let h0: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let cp0 = build_chain_proof(h0, n_blocks);
+    // The right child CONTINUES the chain: its h_start IS the left's h_end.
+    let cp1 = build_chain_proof(cp0.h_end, n_blocks);
+    assert_eq!(
+        cp0.inner.built.shape.circuit.digest(),
+        cp1.inner.built.shape.circuit.digest(),
+        "one chain circuit digest, every segment"
+    );
+
+    let registry = &cp0.inner.built.shape.registry;
+    assert_eq!(registry.num_boolean(), 1, "one boolean type (blake3)");
+    assert!(
+        registry.element_types().is_empty(),
+        "the chain class has no element side"
+    );
+    let bool_asserts = [
+        cp0.inner.work.boolean.clone().expect("left boolean work"),
+        cp1.inner.work.boolean.clone().expect("right boolean work"),
+    ];
+    let sigmas = [cp0.inner.sigma.clone(), cp1.inner.sigma.clone()];
+
+    // ---- the native fold: boolean + sigma, NO element groups, NO priors ----
+    let blake_r1cs = blake3::build_block_r1cs(cp0.inner.nu);
+    let blake_lc = blake_r1cs.csc_lincheck_circuit();
+    let mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
+    let el_mats: [flock_core::aggregate::ElementMatrices; 0] = [];
+    let el_asserts: [(
+        &UnionInstance<'_>,
+        flock_core::element_r1cs::union::ElementAssertion,
+    ); 0] = [];
+    let circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
+    let mut chp = FsChallenger::with_chained_blake3(FL_DOMAIN);
+    let (agg, acc_p) = aggregate::prove_aggregate_classes(
+        registry,
+        &mats,
+        &circs,
+        &bool_asserts,
+        &el_mats,
+        &el_asserts,
+        Some((&cp0.inner.built.shape.circuit, &sigmas)),
+        &[],
+        &mut chp,
+    )
+    .expect("the first-level fold proves");
+    let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(FL_DOMAIN));
+    let acc_v = aggregate::verify_aggregate_classes(
+        registry,
+        &bool_asserts,
+        &el_asserts,
+        Some((&cp0.inner.built.shape.circuit, &sigmas)),
+        &[],
+        &agg,
+        &mut rec,
+    )
+    .expect("the first-level fold verifies");
+    assert_eq!(acc_p, acc_v, "prover and verifier accumulators agree");
+    assert!(acc_v.per_element.is_empty(), "no element group accumulated");
+    assert!(acc_v.discharge(&mats), "the boolean group discharges");
+    assert!(
+        acc_v.discharge_sigma(&cp0.inner.built.shape.circuit),
+        "the sigma group discharges against the ONE chain circuit"
+    );
+
+    // The three folds' claim lists — no priors, so [fresh, fresh] each.
+    let n_priors = 0usize;
+    let bc: Vec<_> = bool_asserts.iter().map(|a| a.claims(registry)).collect();
+    let fold_claims: Vec<Vec<MatrixClaim>> = vec![
+        vec![bc[0][0].0.clone(), bc[1][0].0.clone()],
+        vec![bc[0][0].1.clone(), bc[1][0].1.clone()],
+        vec![sigmas[0].claim(), sigmas[1].claim()],
+    ];
+    let fold_proofs: Vec<&FoldProof> = vec![
+        &agg.folds[0].0,
+        &agg.folds[0].1,
+        agg.sigma_fold.as_ref().expect("the sigma fold rides along"),
+    ];
+    assert_eq!(fold_claims[0][0].row.low.len(), 64, "fresh lagrange low");
+    assert_eq!(fold_claims[0][0].col.low.len(), 64, "fresh z_partial low");
+    assert_eq!(fold_claims[2][0].row.low.len(), 1, "sigma claims are eq");
+
+    // ---- the fold tape, pinned op-for-op ----
+    let t_shape = rec.shape();
+    let ops = t_shape.ops();
+    let vals_rec = rec.values();
+    let chals = rec.challenges();
+    let mut want: Vec<Op> = vec![
+        Op::Label(b"flock-aggregate-v0".to_vec()),
+        Op::ObserveBytes(32),
+        Op::ObserveBytes(1),
+    ];
+    want.extend(fold_region_ops(&fold_claims));
+    assert_eq!(ops, want.as_slice(), "the first-level fold tape shape");
+    assert_eq!(rec.payloads()[0], registry.digest(), "bind: registry digest");
+    assert_eq!(rec.payloads()[1], vec![0u8], "bind: prior count 0");
+    let locs = locate_and_pin_folds(&fold_claims, &fold_proofs, vals_rec, chals);
+    let outs = replay_fold_endpoints(&locs, vals_rec, chals);
+    assert_eq!(outs[0], acc_v.per_type[0].0, "boolean A accumulator");
+    assert_eq!(outs[1], acc_v.per_type[0].1, "boolean B accumulator");
+    let (sig_digest, sig_claim) = acc_v.sigma.as_ref().expect("sigma accumulated");
+    assert_eq!(outs[2], *sig_claim, "sigma accumulator");
+    assert_eq!(
+        *sig_digest,
+        cp0.inner.built.shape.circuit.digest(),
+        "sigma keys by the chain circuit digest"
+    );
+
+    // ---- the child tapes ----
+    let t0 = ChildTape::new(&cp0.inner, DOMAIN);
+    let t1 = ChildTape::new(&cp1.inner, DOMAIN);
+    assert!(t0.el.is_none() && t1.el.is_none(), "chain children");
+
+    // ---- the outer: TWO chain-tape regions + the fold region + adjacency ----
+    let (b3_rows_used, nu2, mu2, proof_kib) = {
+        use flock_prover::prover::UnionElementSlotInput;
+        use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
+
+        let stream = t_shape.stream_words_duplex(FL_DOMAIN);
+        let bytes = stream.to_bytes(rec.values(), rec.payloads());
+        let mut chain = FsChainSponge::new();
+        let mut at = 0usize;
+        let fin_ops: Vec<_> = t_shape.ops().iter().filter(|o| o.finalizes()).collect();
+        assert_eq!(stream.finalize_after.len(), fin_ops.len(), "finalize alignment");
+        for (k, &upto) in stream.finalize_after.iter().enumerate() {
+            chain.absorb(&bytes[at * 16..upto * 16]);
+            at = upto;
+            chain.finalize(fin_ops[k].squeezed_bytes());
+        }
+        chain.absorb(&bytes[at * 16..]);
+        let trace = chain.finish();
+
+        let b3_rows = t0.b3_rows + t1.b3_rows + trace.rows.len();
+        let nu2 = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7);
+        let mut sb = ShapeBuilder::new(nu2);
+        let mut cs = ChildSlots::new(&mut sb, nu2, t0.spread_w.max(t1.spread_w));
+        let mut vals: Vec<F128> = Vec::new();
+        let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
+        let mut consts: Vec<(F128, Wire)> = Vec::new();
+        let r0 = emit_child_region(&mut sb, &mut cs, &t0, &mut vals, &mut hints, &mut consts);
+        let r1 = emit_child_region(&mut sb, &mut cs, &t1, &mut vals, &mut hints, &mut consts);
+        let b3s = cs.q.b3;
+        let macs = cs.macs;
+        let mrs = cs.mrs;
+        let (pfslot, pf_w) = r0.pf;
+        let leslot = cs
+            .le
+            .iter()
+            .find(|&&(n, _)| n == 8)
+            .map(|&(_, s)| s)
+            .expect("the child regions created the 8-lane leaf-eval slot");
+
+        let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+        vals.extend_from_slice(&iv_w);
+        let iv2 = [sb.public_input(), sb.public_input()];
+        let mut consts: Vec<(F128, Wire)> = Vec::new();
+        let pub_payloads = bytes_payload_mask(ops);
+        let (chain_outs, ww) = emit_fs_chain(
+            &mut sb,
+            b3s,
+            iv2,
+            &trace,
+            &stream,
+            &bytes,
+            &mut vals,
+            &mut consts,
+            &pub_payloads,
+        );
+        let mut vmap: Vec<Option<usize>> = Vec::new();
+        for (wi, w) in stream.words.iter().enumerate() {
+            if let flock_core::transcript_record::StreamWord::Value(vi) = *w {
+                if vmap.len() <= vi {
+                    vmap.resize(vi + 1, None);
+                }
+                vmap[vi] = Some(wi);
+            }
+        }
+        let wv = |vi: usize| -> Wire { ww[vmap[vi].expect("stream word")].expect("wired") };
+        vals.push(F128::ZERO);
+        let zw = sb.public_input();
+        vals.push(F128::ONE);
+        let ow = sb.public_input();
+
+        let (fold_pubs, alpha_recs) = emit_fold_region(
+            &mut sb,
+            macs,
+            mrs,
+            pfslot,
+            pf_w,
+            leslot,
+            &locs,
+            &trace.squeezes,
+            &chain_outs,
+            &ww,
+            &vmap,
+            chals,
+            vals_rec,
+            &mut vals,
+            zw,
+            ow,
+        );
+
+        // ---- the connects: fold surfaces == child-region wires ----
+        use flock_core::field::PHI_8_TABLE;
+        use flock_core::zerocheck::K_SKIP;
+        use flock_core::zerocheck::multilinear::{
+            lagrange_weights_naive, subspace_denominator_pair,
+        };
+        let lam_base = sb.public_len();
+        let lam_w: Vec<Wire> = PHI_8_TABLE[..1 << K_SKIP]
+            .iter()
+            .map(|&v| {
+                vals.push(v);
+                sb.public_input()
+            })
+            .collect();
+        vals.push(subspace_denominator_pair(K_SKIP).1);
+        let deninv_w = sb.public_input();
+        vals.push(F128::ZERO);
+        let lag_zassert = sb.public_input();
+        let tapes = [&t0, &t1];
+        let regions = [&r0, &r1];
+        for (k, (tk, rk)) in tapes.iter().zip(&regions).enumerate() {
+            assert_eq!(
+                &fold_claims[0][n_priors + k].row.low[..],
+                &lagrange_weights_naive(K_SKIP, tk.chals[tk.zskip_ch])[..],
+                "child {k}: the fold's lagrange lows are the closed form"
+            );
+            let lows = emit_lagrange_lows(
+                &mut sb,
+                cs.macs,
+                &lam_w,
+                deninv_w,
+                rk.zskip_w,
+                tk.chals[tk.zskip_ch],
+                &mut vals,
+                zw,
+                ow,
+                lag_zassert,
+            );
+            for (j, &lw2) in lows.iter().enumerate() {
+                sb.connect(lw2, wv(locs[0].claims[n_priors + k].row_low_v + j));
+            }
+            // Native pre-asserts, then the wire connects — sigma fully,
+            // boolean points + z_partial lows.
+            let nu_c = tk.sigma_native.nu;
+            assert_eq!(
+                &fold_claims[2][n_priors + k].row.point[..],
+                &tk.sigma_native.rho[..nu_c],
+                "sigma row point is the child's rho[..nu]"
+            );
+            assert_eq!(
+                &fold_claims[2][n_priors + k].col.point[..],
+                &tk.sigma_native.rho[nu_c..],
+                "sigma col point is the child's rho[nu..]"
+            );
+            assert_eq!(
+                fold_claims[2][n_priors + k].value, tk.sigma_native.value,
+                "sigma value is the child's deferred evaluation"
+            );
+            let inner_b = fold_claims[0][n_priors + k].row.point.len();
+            assert_eq!(
+                &fold_claims[0][n_priors + k].row.point[..],
+                &tk.bool_assert.x_inner_rest[..inner_b],
+                "boolean row point is x_inner_rest's head"
+            );
+            assert_eq!(
+                &fold_claims[0][n_priors + k].col.point[..],
+                &tk.bool_assert.rr[..inner_b],
+                "boolean col point is rr's head"
+            );
+            assert_eq!(
+                &fold_claims[0][n_priors + k].col.low[..],
+                &tk.bool_assert.z_partial[..],
+                "boolean col low is z_partial"
+            );
+            assert_eq!(fold_claims[0][n_priors + k].value, tk.bool_assert.evals[0].0);
+            assert_eq!(fold_claims[1][n_priors + k].value, tk.bool_assert.evals[0].1);
+
+            // sigma: fully wire-to-wire (the eq lows are the constant 1).
+            let cl = &locs[2].claims[n_priors + k];
+            sb.connect(wv(cl.row_low_v), ow);
+            sb.connect(wv(cl.col_low_v), ow);
+            for j in 0..cl.row_pt_n {
+                sb.connect(wv(cl.row_pt_v + j), rk.pt_w[j]);
+            }
+            for j in 0..cl.col_pt_n {
+                sb.connect(wv(cl.col_pt_v + j), rk.pt_w[cl.row_pt_n + j]);
+            }
+            sb.connect(wv(cl.value_v), rk.sig_w);
+            // boolean A/B: batch-major x_inner_rest mapping, rr reversed,
+            // z_partial word-for-word.
+            for fi in [0, 1] {
+                let cl = &locs[fi].claims[n_priors + k];
+                for j in 0..cl.row_pt_n {
+                    let m = if j == 0 { 0 } else { tk.n_log_i + j };
+                    sb.connect(wv(cl.row_pt_v + j), rk.b_mlv_w[m]);
+                }
+                let n_lc = rk.b_lc_w.len();
+                for j in 0..cl.col_pt_n {
+                    sb.connect(wv(cl.col_pt_v + j), rk.b_lc_w[n_lc - 1 - j]);
+                }
+                for j in 0..cl.col_low_n {
+                    sb.connect(wv(cl.col_low_v + j), rk.b_zpartial_w[j]);
+                }
+            }
+            // Fold B's lagrange lows are fold A's — one published copy
+            // binds both.
+            for j in 0..locs[0].claims[n_priors + k].row_low_n {
+                sb.connect(
+                    wv(locs[1].claims[n_priors + k].row_low_v + j),
+                    wv(locs[0].claims[n_priors + k].row_low_v + j),
+                );
+            }
+        }
+
+        // ---- THE ADJACENCY: left h_end == right h_start, wire to wire ----
+        // The chain statement is 11 words: [iv0, iv1, params, h_start x4 |
+        // h_end x4 published last]. Both children's publics are witness
+        // wires here, so adjacency is four copy constraints, and the node's
+        // own application statement is the combined span.
+        let p0 = r0.child_pub_w.len();
+        let p1 = r1.child_pub_w.len();
+        assert_eq!(p0, 11, "the chain statement is 11 words");
+        assert_eq!(p1, 11, "both children share the statement shape");
+        for j in 0..4 {
+            sb.connect(r0.child_pub_w[p0 - 4 + j], r1.child_pub_w[3 + j]);
+        }
+
+        // Publishes: per fold the deltas + accumulator claim, then the
+        // value-binding publics, then THE NODE'S APPLICATION STATEMENT.
+        let fold_pub_base = sb.public_len();
+        for fp in &fold_pubs {
+            for &w in &fp.rho_col {
+                sb.publish(w);
+            }
+            for &w in &fp.rho_row {
+                sb.publish(w);
+            }
+            sb.publish(fp.value);
+        }
+        for k in 0..2 {
+            sb.publish(wv(locs[0].claims[n_priors + k].value_v));
+            sb.publish(wv(locs[1].claims[n_priors + k].value_v));
+        }
+        let stmt_base = sb.public_len();
+        for j in 0..4 {
+            sb.publish(r0.child_pub_w[3 + j]);
+        }
+        for j in 0..4 {
+            sb.publish(r1.child_pub_w[p1 - 4 + j]);
+        }
+
+        let shape2 = sb.finish().expect("the first-level node circuit builds");
+        let hint_refs: Vec<&(dyn std::any::Any + Sync)> =
+            hints.iter().map(|h| h as &(dyn std::any::Any + Sync)).collect();
+        let mut built2 = shape2.run(&vals, &hint_refs);
+
+        // Child checkers (each child's whole deferred-verifier statement
+        // against its own native replicas), then the fold checker + the
+        // accumulator reassembled from publics, then the app statement.
+        let consumed0 = check_child_region(&built2.public, &t0, &r0);
+        let consumed1 = check_child_region(&built2.public, &t1, &r1);
+        assert!(
+            r0.pub_base + consumed0 <= r1.pub_base && r1.pub_base + consumed1 <= fold_pub_base,
+            "the regions' public blocks are disjoint and ordered"
+        );
+        let rebuilt = check_fold_publics(&built2.public, fold_pub_base, &locs, &alpha_recs);
+        for (r, o) in rebuilt.iter().zip(&outs) {
+            assert_eq!(r, o, "published fold output == located native output");
+        }
+        let acc_pub = aggregate::Accumulator {
+            registry_digest: registry.digest(),
+            per_type: vec![(rebuilt[0].clone(), rebuilt[1].clone())],
+            per_element: Vec::new(),
+            sigma: Some((
+                cp0.inner.built.shape.circuit.digest(),
+                rebuilt[2].clone(),
+            )),
+        };
+        assert_eq!(
+            acc_pub, acc_v,
+            "the Accumulator, reassembled from the public segment alone"
+        );
+        assert!(
+            acc_pub.discharge(&mats)
+                && acc_pub.discharge_sigma(&cp0.inner.built.shape.circuit),
+            "the public-segment accumulator discharges both groups"
+        );
+        for (i, &v) in PHI_8_TABLE[..1 << K_SKIP].iter().enumerate() {
+            assert_eq!(built2.public[lam_base + i], v, "λ const {i}");
+        }
+        // THE APPLICATION STATEMENT: the published span is (h_start of the
+        // left chain, h_end of the right) — the 512-step combined segment.
+        for j in 0..4 {
+            assert_eq!(
+                built2.public[stmt_base + j],
+                pack4(cp0.h_start[4 * j..4 * j + 4].try_into().unwrap()),
+                "node statement: h_start is the left child's"
+            );
+            assert_eq!(
+                built2.public[stmt_base + 4 + j],
+                pack4(cp1.h_end[4 * j..4 * j + 4].try_into().unwrap()),
+                "node statement: h_end is the right child's"
+            );
+        }
+        assert_eq!(
+            cp1.h_end,
+            native_chain(&cp0.h_start, 2 * n_blocks),
+            "the combined span IS the 512-step chain"
+        );
+
+        // The outer proves and verifies over the circuit path.
+        let union2 = UnionInstance::new(&shape2.registry, shape2.counts.clone());
+        let pcs2 = PcsParams {
+            m: union2.dense_m(),
+            log_inv_rate: 1,
+            log_batch_size: pcs_batch(&union2),
+            profile: LigeritoProfile::Fast,
+            num_lanes: union2.commit_lanes(pcs_batch(&union2)),
+            merkle_hash: Default::default(),
+        };
+        let b3_r1cs2 = blake3::build_block_r1cs(nu2);
+        let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
+        let swap_r1cs2 = SwapTable::build_block_r1cs(nu2);
+        let swap_lc2 = swap_r1cs2.csc_lincheck_circuit();
+        let spread_w2 = t0.spread_w.max(t1.spread_w);
+        let spread_ty2 = BitSpreadTable::new(spread_w2);
+        let spread_r1cs2 = spread_ty2.build_block_r1cs(nu2);
+        let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
+        let mut el_ord: Vec<(usize, Vec<F128>)> = cs
+            .element_slot_ids()
+            .into_iter()
+            .map(|sl| {
+                let z = match std::mem::replace(
+                    &mut built2.witnesses[shape2.registry_slot(sl)],
+                    SlotWitness::DeferredToRows,
+                ) {
+                    SlotWitness::Element(z) => z,
+                    other => panic!("element slot produced {other:?}"),
+                };
+                (shape2.registry_slot(sl), z)
+            })
+            .collect();
+        el_ord.sort_by_key(|(i, _)| *i);
+        let el_inputs: Vec<UnionElementSlotInput> = el_ord
+            .into_iter()
+            .map(|(i, z)| live_element_input(z, shape2.counts[i], nu2))
+            .collect();
+        let mut bslots: Vec<(usize, UnionSlotProverInput)> = vec![
+            (
+                shape2.registry_slot(cs.q.b3),
+                UnionSlotProverInput::new(
+                    blake3::generate_witness_batch_major_partial(
+                        built2.rows::<Blake3Gate>(cs.q.b3),
+                        nu2,
+                    ),
+                    b3_lc2,
+                ),
+            ),
+            (
+                shape2.registry_slot(cs.q.swap),
+                UnionSlotProverInput::new(
+                    SwapTable::generate_witness_batch_major(
+                        built2.rows::<SwapGate>(cs.q.swap),
+                        nu2,
+                    ),
+                    swap_lc2,
+                ),
+            ),
+            (
+                shape2.registry_slot(cs.q.spread),
+                UnionSlotProverInput::new(
+                    spread_ty2.generate_witness_batch_major(
+                        built2.rows::<BitSpreadGate>(cs.q.spread),
+                        nu2,
+                    ),
+                    spread_lc2,
+                ),
+            ),
+        ];
+        bslots.sort_by_key(|(i, _)| *i);
+        let mut lco: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
+            (shape2.registry_slot(cs.q.b3), b3_lc2),
+            (shape2.registry_slot(cs.q.swap), swap_lc2),
+            (shape2.registry_slot(cs.q.spread), spread_lc2),
+        ];
+        lco.sort_by_key(|(i, _)| *i);
+        let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
+            lco.into_iter().map(|(_, c)| c).collect();
+        let mut ch2 = FsChallenger::new(DOMAIN);
+        let (oproof, ocommit, _) = prover::prove_fast_ligerito_union_circuit(
+            &union2,
+            &shape2.circuit,
+            &built2.public,
+            &pcs2,
+            bslots.into_iter().map(|(_, x)| x).collect(),
+            el_inputs,
+            &mut ch2,
+        );
+        let mut ch2 = FsChallenger::new(DOMAIN);
+        verifier::verify_ligerito_union_circuit(
+            &union2,
+            &shape2.circuit,
+            &built2.public,
+            &lcs2,
+            &ocommit,
+            &oproof,
+            &pcs2,
+            &mut ch2,
+        )
+        .expect("the first-level node verifies over the circuit path");
+        (
+            b3_rows,
+            nu2,
+            shape2.circuit.cells().mu(),
+            bincode::serialize(&oproof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
+        )
+    };
+
+    println!(
+        "\nFIRST-LEVEL NODE (two adjacent chain proofs, fold + adjacency)\n  \
+         chain: {} + {} compressions | node statement: h_start .. H^{}(h_start)\n  \
+         outer: b3 rows {} | nu {} | mu {} | proof {:.1} KiB\n",
+        n_blocks,
+        n_blocks,
+        2 * n_blocks,
+        b3_rows_used,
+        nu2,
+        mu2,
+        proof_kib,
+    );
+}
+
 /// One wiring-GKR layer, located on the tape (the assembly's wire map).
 struct GkrLayerRec {
     lam_fin: usize,
@@ -11541,6 +12593,7 @@ fn pin_recombination(
     public: &[F128],
     gather: &[F128],
     gammas: &[PdRec],
+    n_el_pd: usize,
     vals_rec: &[F128],
     r_pt: &[F128],
     fgs_v: usize,
@@ -11553,15 +12606,15 @@ fn pin_recombination(
     assert_eq!(gather.len(), cells.num_gate_slots(), "one gather per gate slot");
     assert_eq!(
         gammas.len(),
-        2 + gather.len(),
-        "pd claims = the element (c, lc) pair + the gathers"
+        n_el_pd + gather.len(),
+        "pd claims = the element (c, lc) pair, when the class exists, + the gathers"
     );
     for (i, g) in gather.iter().enumerate() {
         assert_eq!(
-            vals_rec[gammas[2 + i].val_v],
+            vals_rec[gammas[n_el_pd + i].val_v],
             *g,
             "gather {i} is pd claim {} on the stream",
-            2 + i
+            n_el_pd + i
         );
     }
     let eq_row = build_eq(&r_pt[..nu_c]);
@@ -11775,9 +12828,12 @@ struct ChildTape<'p> {
     bytes: Vec<u8>,
     b3_rows: usize,
     spread_w: usize,
-    // located regions
+    // located regions. `el` is `None` for a BOOLEAN-ONLY circuit inner
+    // (the hash-chain leaf) — the element PIOP region does not exist on
+    // its tape, and the `el_*`/`a_sum_n`/`b_sum_n` natives below are
+    // meaningful iff `el.is_some()`.
     gkr: GkrRec,
-    el: ElPiopRec,
+    el: Option<ElPiopRec>,
     start_v: usize,
     gammas_o: Vec<PdRec>,
     w_rounds: Vec<RoundRec>,
@@ -11811,7 +12867,7 @@ struct ChildTape<'p> {
     mg_fin: usize,
     // native references + replicas
     bool_assert: flock_core::lincheck::MatrixAssertion,
-    el_assert: flock_core::element_r1cs::union::ElementAssertion,
+    el_assert: Option<flock_core::element_r1cs::union::ElementAssertion>,
     sigma_native: flock_core::circuit::SigmaAssertion,
     el_g0: Vec<F128>,
     el_run_n: F128,
@@ -11866,7 +12922,16 @@ impl<'p> ChildTape<'p> {
             .clone()
             .expect("the boolean class yields the RS (ab, c) claims");
         let bool_assert = inner.work.boolean.clone().expect("boolean matrix work");
-        let el_assert = inner.work.element.clone().expect("an element PIOP ran");
+        // The element side is OPTIONAL: a boolean-only circuit inner (the
+        // hash-chain leaf) has no element class, and its tape carries no
+        // element PIOP region. The union is the authority.
+        let has_el = union.has_element();
+        let el_assert = inner.work.element.clone();
+        assert_eq!(
+            el_assert.is_some(),
+            has_el,
+            "element work travels iff the union has an element class"
+        );
         let sigma_native = inner.sigma.clone();
         let t_shape = rec.shape();
         let chals: Vec<F128> = rec.challenges().to_vec();
@@ -11888,7 +12953,6 @@ impl<'p> ChildTape<'p> {
         let lc_l = find(b"flock-lincheck-v0");
         let elzc_l = find(b"flock-element-union-zc-v0");
         let el_l = find(b"flock-element-union-lc-v0");
-        assert_eq!(elzc_l.len(), 1, "one element zerocheck");
         let gkr_l = find(b"flock-product-gkr-batched-v0");
         let mo_l = find(b"flock-merged-open-v1");
         let rs_l = find(b"flock-ring-switch-v0");
@@ -11896,16 +12960,25 @@ impl<'p> ChildTape<'p> {
         let fa_l = find(b"flock-frobenius-assist-v0");
         assert_eq!(zc_l.len(), 1, "one boolean zerocheck");
         assert_eq!(lc_l.len(), 1, "one boolean lincheck");
-        assert_eq!(el_l.len(), 1, "one element lincheck region");
-        assert!(elzc_l[0] < el_l[0], "element zc before element lc");
+        if has_el {
+            assert_eq!(elzc_l.len(), 1, "one element zerocheck");
+            assert_eq!(el_l.len(), 1, "one element lincheck region");
+            assert!(elzc_l[0] < el_l[0], "element zc before element lc");
+            assert!(lc_l[0] < el_l[0], "boolean PIOP before element PIOP");
+            assert!(el_l[0] < gkr_l[0], "element PIOP before the wiring GKR");
+        } else {
+            assert!(
+                elzc_l.is_empty() && el_l.is_empty(),
+                "a boolean-only tape carries NO element region"
+            );
+            assert!(lc_l[0] < gkr_l[0], "boolean PIOP before the wiring GKR");
+        }
         assert_eq!(gkr_l.len(), 1, "one batched wiring GKR");
         assert_eq!(mo_l.len(), 1, "one merged open");
         assert_eq!(rs_l.len(), 2, "rs x 2 — one ab/c pair for the boolean class");
         assert_eq!(mp_l.len(), 1, "one multipoint region");
         assert_eq!(fa_l.len(), 1, "one anchor region");
         assert!(zc_l[0] < lc_l[0], "boolean zc before boolean lc");
-        assert!(lc_l[0] < el_l[0], "boolean PIOP before element PIOP");
-        assert!(el_l[0] < gkr_l[0], "element PIOP before the wiring GKR");
         assert!(gkr_l[0] < mo_l[0], "wiring GKR before the merged open");
         assert!(mo_l[0] < rs_l[0] && rs_l[1] < mp_l[0] && mp_l[0] < fa_l[0]);
 
@@ -11928,7 +13001,11 @@ impl<'p> ChildTape<'p> {
 
         // ---- the boolean zerocheck slices, same shape as the leaf ----
         let bp = proof.boolean.as_ref().expect("boolean side present");
-        assert!(proof.element.is_some(), "element side present");
+        assert_eq!(
+            proof.element.is_some(),
+            has_el,
+            "the element proof section mirrors the union's classes"
+        );
         {
             let mut i = zc_l[0] + 1;
             assert!(matches!(ops[i], Op::SqueezeSlice(_)), "zc tau lo");
@@ -12073,10 +13150,10 @@ impl<'p> ChildTape<'p> {
             }
         };
 
-        // ---- the ELEMENT PIOP region, located ----
+        // ---- the ELEMENT PIOP region, located (mixed inners only) ----
         // Shape, per `parse_open_levels`' element branch: [tau slice |
         // tau_len rounds | ea, eb, ec | lc label | alpha | lc rounds].
-        let el_rec = {
+        let el_rec = has_el.then(|| {
             let mut i = elzc_l[0] + 1;
             let (tau_fin, tau_ch, tau_len) = match ops[i] {
                 Op::SqueezeSlice(n) => (fin_at(i), vc_at(i).1, n),
@@ -12121,7 +13198,7 @@ impl<'p> ChildTape<'p> {
                 alpha_ch,
                 lc_rounds,
             }
-        };
+        });
 
         // ---- the merged open: rs x 2, then the packed-direct claims ----
         let (pd_recs, mp_val_v, rs_recs, rs_gam_ch) = {
@@ -12182,11 +13259,13 @@ impl<'p> ChildTape<'p> {
             let (mv, _) = vc_at(i);
             (pd_recs, mv, rs_recs, rs_gam_ch)
         };
-        // The pd claims are the element class's two (c, lc) plus one per
-        // wiring GATHER; every gather value is absorbed, in proof order.
+        // The pd claims are the element class's two (c, lc) — when the
+        // class exists — plus one per wiring GATHER; every gather value is
+        // absorbed, in proof order.
+        let n_el_pd = if has_el { 2 } else { 0 };
         assert_eq!(
             pd_recs.len(),
-            2 + proof.wiring.gather.len(),
+            n_el_pd + proof.wiring.gather.len(),
             "pd claims = element (c, lc) + the wiring gathers"
         );
         let pd_vals: Vec<F128> = pd_recs.iter().map(|&pv| vals_rec[pv]).collect();
@@ -12298,7 +13377,11 @@ impl<'p> ChildTape<'p> {
         let lvl_src = level_sources(lig);
         let (start_v, piop_o, gammas_o, w_rounds, mp_o, inner_pd2, yr_v2, levels) =
             parse_open_levels(&ops, 32 * lig.initial_cap.len(), r_lvl);
-        assert!(piop_o.is_some(), "a mixed tape carries the element PIOP");
+        assert_eq!(
+            piop_o.is_some(),
+            has_el,
+            "the parser sees the element PIOP iff the class exists"
+        );
         assert_eq!(
             gammas_o.len(),
             pd_recs.len(),
@@ -12528,38 +13611,44 @@ impl<'p> ChildTape<'p> {
             t
         };
 
-        // ---- the element PIOP's native chain + strip sums ----
-        let mut el_g0: Vec<F128> = Vec::new();
-        let mut el_run_n = F128::ZERO;
-        for (k, &(gv, _, ch)) in el_rec.zc_rounds.iter().enumerate() {
-            let (g1, gi) = (vals_rec[gv], vals_rec[gv + 1]);
-            let t = chals[el_rec.tau_ch + k];
-            let rho = chals[ch];
-            let g0 = (el_run_n + t * g1) * (F128::ONE + t).inv();
-            el_g0.push(g0);
-            el_run_n = g0 * (F128::ONE + rho) + g1 * rho + gi * rho * (F128::ONE + rho);
-        }
-        assert_eq!(
-            el_assert.alpha, chals[el_rec.alpha_ch],
-            "the located alpha is the assertion's"
-        );
-        let (a_sum_n, b_sum_n) = {
-            let mt = MacGate::new();
-            let kappa = mt.ty.kappa();
-            let eq_con =
-                flock_core::zerocheck::univariate_skip::build_eq(&el_assert.r_con[..kappa]);
-            // Single slot at the region start: the prefix bits are all
-            // zero, so the region weight is the all-zero eq pattern.
-            let w = el_assert.r_con[kappa..]
-                .iter()
-                .fold(F128::ONE, |acc, &x| acc * (F128::ONE + x));
-            let dot = |c: &[F128]| -> F128 {
-                eq_con
+        // ---- the element PIOP's native chain + strip sums (mixed only) ----
+        let (el_g0, el_run_n, a_sum_n, b_sum_n) = if let Some(el_rec) = &el_rec {
+            let el_assert = el_assert.as_ref().expect("element assertion");
+            let mut el_g0: Vec<F128> = Vec::new();
+            let mut el_run_n = F128::ZERO;
+            for (k, &(gv, _, ch)) in el_rec.zc_rounds.iter().enumerate() {
+                let (g1, gi) = (vals_rec[gv], vals_rec[gv + 1]);
+                let t = chals[el_rec.tau_ch + k];
+                let rho = chals[ch];
+                let g0 = (el_run_n + t * g1) * (F128::ONE + t).inv();
+                el_g0.push(g0);
+                el_run_n = g0 * (F128::ONE + rho) + g1 * rho + gi * rho * (F128::ONE + rho);
+            }
+            assert_eq!(
+                el_assert.alpha, chals[el_rec.alpha_ch],
+                "the located alpha is the assertion's"
+            );
+            let (a_sum_n, b_sum_n) = {
+                let mt = MacGate::new();
+                let kappa = mt.ty.kappa();
+                let eq_con =
+                    flock_core::zerocheck::univariate_skip::build_eq(&el_assert.r_con[..kappa]);
+                // Single slot at the region start: the prefix bits are all
+                // zero, so the region weight is the all-zero eq pattern.
+                let w = el_assert.r_con[kappa..]
                     .iter()
-                    .zip(c)
-                    .fold(F128::ZERO, |acc, (e, v)| acc + *e * *v)
+                    .fold(F128::ONE, |acc, &x| acc * (F128::ONE + x));
+                let dot = |c: &[F128]| -> F128 {
+                    eq_con
+                        .iter()
+                        .zip(c)
+                        .fold(F128::ZERO, |acc, (e, v)| acc + *e * *v)
+                };
+                (w * dot(mt.ty.a_const()), w * dot(mt.ty.b_const()))
             };
-            (w * dot(mt.ty.a_const()), w * dot(mt.ty.b_const()))
+            (el_g0, el_run_n, a_sum_n, b_sum_n)
+        } else {
+            (Vec::new(), F128::ZERO, F128::ZERO, F128::ZERO)
         };
 
         // ---- the GKR input-check advice (masked M̂ and livê) ----
@@ -12591,6 +13680,7 @@ impl<'p> ChildTape<'p> {
             &inner.built.witness.public,
             &inner.proof.wiring.gather,
             &gammas_o,
+            n_el_pd,
             &vals_rec,
             &gkr_rec.r_pt,
             gkr_rec.fgs_v,
@@ -12709,29 +13799,32 @@ impl<'p> ChildTape<'p> {
             );
             // The element assertion's points: r_con = zc.r[ν..] (round
             // order), r_col = the lc bind order reversed.
-            assert_eq!(
-                el_rec.zc_rounds.len(),
-                n_log_i + el_assert.r_con.len(),
-                "element zc rounds = rows + r_con"
-            );
-            for (j, &x) in el_assert.r_con.iter().enumerate() {
+            if let Some(el_rec) = &el_rec {
+                let el_assert = el_assert.as_ref().expect("element assertion");
                 assert_eq!(
-                    chals[el_rec.zc_rounds[n_log_i + j].2],
-                    x,
-                    "el r_con {j} is a located element zc round"
+                    el_rec.zc_rounds.len(),
+                    n_log_i + el_assert.r_con.len(),
+                    "element zc rounds = rows + r_con"
                 );
-            }
-            assert_eq!(
-                el_rec.lc_rounds.len(),
-                el_assert.r_col.len(),
-                "element lc round count"
-            );
-            for (j, &x) in el_assert.r_col.iter().enumerate() {
+                for (j, &x) in el_assert.r_con.iter().enumerate() {
+                    assert_eq!(
+                        chals[el_rec.zc_rounds[n_log_i + j].2],
+                        x,
+                        "el r_con {j} is a located element zc round"
+                    );
+                }
                 assert_eq!(
-                    chals[el_rec.lc_rounds[el_rec.lc_rounds.len() - 1 - j].2],
-                    x,
-                    "el r_col {j} is the located element lc round, reversed"
+                    el_rec.lc_rounds.len(),
+                    el_assert.r_col.len(),
+                    "element lc round count"
                 );
+                for (j, &x) in el_assert.r_col.iter().enumerate() {
+                    assert_eq!(
+                        chals[el_rec.lc_rounds[el_rec.lc_rounds.len() - 1 - j].2],
+                        x,
+                        "el r_col {j} is the located element lc round, reversed"
+                    );
+                }
             }
         }
         let x_ab_n: Vec<F128> = {
@@ -12753,9 +13846,13 @@ impl<'p> ChildTape<'p> {
         // Derived pd points (merged-open v1) — see RealTape's twin.
         let pd_pts_n: Vec<Vec<F128>> = {
             let cells = inner.built.shape.circuit.cells();
-            let el = all_claims.element.as_ref().expect("element claims");
-            let mut v = vec![el.c_point.clone(), el.lc_point.clone()];
-            for i2 in 0..gammas_o.len() - 2 {
+            let mut v: Vec<Vec<F128>> = if has_el {
+                let el = all_claims.element.as_ref().expect("element claims");
+                vec![el.c_point.clone(), el.lc_point.clone()]
+            } else {
+                Vec::new()
+            };
+            for i2 in 0..gammas_o.len() - n_el_pd {
                 v.push(cells.gate_claim_point(i2, &gkr_rec.r_pt[..cells.nu()]));
             }
             v
@@ -12763,7 +13860,7 @@ impl<'p> ChildTape<'p> {
         for pt in &pd_pts_n {
             assert_eq!(pt.len(), n_log_i + k_cols_i, "pd point split");
         }
-        {
+        if let Some(el_rec) = &el_rec {
             let e_rounds = el_rec.zc_rounds.len();
             for j in 0..n_log_i {
                 assert_eq!(pd_pts_n[0][j], chals[el_rec.zc_rounds[j].2], "c row {j}");
@@ -13156,6 +14253,10 @@ struct ChildRegion {
     /// The residual close-out's prefix slot (and width) — reusable by a
     /// caller emitting more prefix products into the same builder.
     pf: (flock_core::circuit::builder::SlotId, usize),
+    /// The child's PUBLIC SEGMENT as witness wires (the H(publics) region's
+    /// inputs, in the child's declaration order). Application-statement
+    /// plumbing — the hash-chain adjacency connect — reads through these.
+    child_pub_w: Vec<Wire>,
 }
 
 /// Emit ONE child's complete deferred-verifier region — chain, query phase,
@@ -13180,7 +14281,10 @@ fn emit_child_region(
     let w_rounds = &ct.w_rounds[..];
     let mp_o = &ct.mp_o;
     let inner_pd2 = &ct.inner_pd2;
-    let el_rec = &ct.el;
+    // `None` for a boolean-only (chain) child: the element PIOP emission,
+    // its two publics and its ChildRegion wires all vanish together.
+    let el_rec = ct.el.as_ref();
+    let n_el_pd = if el_rec.is_some() { 2 } else { 0 };
     let r_lvl = levels.len() - 1;
     let n_p = ct.n_p;
     let m_mp2 = ct.m_mp2;
@@ -13348,8 +14452,8 @@ fn emit_child_region(
             s
         }
     };
-    let gather_w: Vec<Wire> = (0..ct.n_pd - 2)
-        .map(|i| wv(ct.gammas_o[2 + i].val_v))
+    let gather_w: Vec<Wire> = (0..ct.n_pd - n_el_pd)
+        .map(|i| wv(ct.gammas_o[n_el_pd + i].val_v))
         .collect();
     emit_recombination(
         sb,
@@ -13507,36 +14611,39 @@ fn emit_child_region(
     // checker item (both stay published as test cross-checks).
     sb.connect(inner_w, t_final);
 
-    // ---- the ELEMENT PIOP rounds in-circuit ----
+    // ---- the ELEMENT PIOP rounds in-circuit (mixed children only) ----
     // Zerocheck rounds are ZcRoundGate rows (tau slice wires as eq weights,
     // g0 advice + zero deltas); lincheck rounds are MergedRoundGate rows.
     // The entry is DERIVED: va = ea + a_sum, vb = eb + b_sum, entry =
     // va + alpha·vb — only the two constant-strip sums are advice.
-    let mut el_zr = zw;
-    for (k, &(gv, rfin, _)) in el_rec.zc_rounds.iter().enumerate() {
-        let sqt = &trace.squeezes[el_rec.tau_fin];
-        let t_w = outs[sqt[k / 4]][k % 4];
-        let rho_w = outs[trace.squeezes[rfin][0]][0];
-        vals.push(ct.el_g0[k]);
-        let g0w = sb.input();
-        let o = sb.gate(zcr, &[el_zr, wv(gv), wv(gv + 1), t_w, rho_w, g0w, ow]);
-        sb.connect(o[0], zassert);
-        el_zr = o[1];
-    }
-    let el_alpha_w = outs[trace.squeezes[el_rec.alpha_fin][0]][0];
-    let ea_w = wv(el_rec.eab_v);
-    let eb_w = wv(el_rec.eab_v + 1);
-    vals.push(ct.a_sum_n);
-    let asum_w = sb.public_input();
-    vals.push(ct.b_sum_n);
-    let bsum_w = sb.public_input();
-    let va_w = sb.gate(macs, &[ea_w, asum_w, ow])[0];
-    let vb_w = sb.gate(macs, &[eb_w, bsum_w, ow])[0];
-    let mut el_lcw = sb.gate(macs, &[va_w, el_alpha_w, vb_w])[0];
-    for &(gv, rfin, _) in &el_rec.lc_rounds {
-        let rho_w = outs[trace.squeezes[rfin][0]][0];
-        el_lcw = sb.gate(mrs, &[el_lcw, wv(gv), wv(gv + 1), rho_w])[0];
-    }
+    let el_pub = el_rec.map(|el_rec| {
+        let mut el_zr = zw;
+        for (k, &(gv, rfin, _)) in el_rec.zc_rounds.iter().enumerate() {
+            let sqt = &trace.squeezes[el_rec.tau_fin];
+            let t_w = outs[sqt[k / 4]][k % 4];
+            let rho_w = outs[trace.squeezes[rfin][0]][0];
+            vals.push(ct.el_g0[k]);
+            let g0w = sb.input();
+            let o = sb.gate(zcr, &[el_zr, wv(gv), wv(gv + 1), t_w, rho_w, g0w, ow]);
+            sb.connect(o[0], zassert);
+            el_zr = o[1];
+        }
+        let el_alpha_w = outs[trace.squeezes[el_rec.alpha_fin][0]][0];
+        let ea_w = wv(el_rec.eab_v);
+        let eb_w = wv(el_rec.eab_v + 1);
+        vals.push(ct.a_sum_n);
+        let asum_w = sb.public_input();
+        vals.push(ct.b_sum_n);
+        let bsum_w = sb.public_input();
+        let va_w = sb.gate(macs, &[ea_w, asum_w, ow])[0];
+        let vb_w = sb.gate(macs, &[eb_w, bsum_w, ow])[0];
+        let mut el_lcw = sb.gate(macs, &[va_w, el_alpha_w, vb_w])[0];
+        for &(gv, rfin, _) in &el_rec.lc_rounds {
+            let rho_w = outs[trace.squeezes[rfin][0]][0];
+            el_lcw = sb.gate(mrs, &[el_lcw, wv(gv), wv(gv + 1), rho_w])[0];
+        }
+        (el_zr, el_lcw)
+    });
 
     // ---- the anchor EXPECT in-circuit, at R = 2 AND P > 0 ----
     // expect = Σ_i γ^{128i}·ĝ(ρ″)·(w_i·DP_i) over the RS statements + Σ_k
@@ -13753,11 +14860,18 @@ fn emit_child_region(
                                 zw
                             } else if coord == F128::ONE {
                                 ow
-                            } else if i2 == 0 {
-                                outs[trace.squeezes[el_rec.zc_rounds[n_log_i + jj].1][0]][0]
                             } else {
-                                let n_lc = el_rec.lc_rounds.len();
-                                outs[trace.squeezes[el_rec.lc_rounds[n_lc - 1 - jj].1][0]][0]
+                                // Non-constant col coords occur only on the
+                                // element pair (gather coords are address
+                                // bits) — a boolean-only child never lands
+                                // here.
+                                let el_rec = el_rec.expect("element pd claim");
+                                if i2 == 0 {
+                                    outs[trace.squeezes[el_rec.zc_rounds[n_log_i + jj].1][0]][0]
+                                } else {
+                                    let n_lc = el_rec.lc_rounds.len();
+                                    outs[trace.squeezes[el_rec.lc_rounds[n_lc - 1 - jj].1][0]][0]
+                                }
                             };
                             (cw2, if (y >> jj) & 1 == 1 { ow } else { zw })
                         })
@@ -13784,9 +14898,10 @@ fn emit_child_region(
         let mut gdp = [zw, zw, ow, zw]; // STATE_SUCCESS seed
         for layer in (0..=m_mp2).rev() {
             let za = if layer < n_log_i {
-                if members[0] >= 2 {
+                if members[0] >= n_el_pd {
                     pt_w[layer]
                 } else {
+                    let el_rec = el_rec.expect("element pd claim");
                     outs[trace.squeezes[el_rec.zc_rounds[layer].1][0]][0]
                 }
             } else {
@@ -13822,8 +14937,10 @@ fn emit_child_region(
     }
     sb.publish(ga_w);
     sb.publish(mg_w);
-    sb.publish(el_zr);
-    sb.publish(el_lcw);
+    if let Some((el_zr, el_lcw)) = el_pub {
+        sb.publish(el_zr);
+        sb.publish(el_lcw);
+    }
     sb.publish(anc_w);
     sb.publish(t_final);
     sb.publish(tgt_w);
@@ -13842,7 +14959,7 @@ fn emit_child_region(
     for w in &pt_w {
         sb.publish(*w);
     }
-    let n_tail = 2 + 2 + 4 + levels.len() * ct.yr_len + 1 + 1 + ct.mu_i;
+    let n_tail = 2 + n_el_pd + 4 + levels.len() * ct.yr_len + 1 + 1 + ct.mu_i;
     let n_query_pub: usize =
         levels.len() + levels.iter().map(|l| l.a_count).sum::<usize>();
     ChildRegion {
@@ -13852,15 +14969,23 @@ fn emit_child_region(
         sig_w,
         pt_w,
         el_zc_rho_w: el_rec
-            .zc_rounds
-            .iter()
-            .map(|&(_, rfin, _)| outs[trace.squeezes[rfin][0]][0])
-            .collect(),
+            .map(|el_rec| {
+                el_rec
+                    .zc_rounds
+                    .iter()
+                    .map(|&(_, rfin, _)| outs[trace.squeezes[rfin][0]][0])
+                    .collect()
+            })
+            .unwrap_or_default(),
         el_lc_rho_w: el_rec
-            .lc_rounds
-            .iter()
-            .map(|&(_, rfin, _)| outs[trace.squeezes[rfin][0]][0])
-            .collect(),
+            .map(|el_rec| {
+                el_rec
+                    .lc_rounds
+                    .iter()
+                    .map(|&(_, rfin, _)| outs[trace.squeezes[rfin][0]][0])
+                    .collect()
+            })
+            .unwrap_or_default(),
         b_mlv_w: mlv_pw.iter().map(|&(_, w)| w).collect(),
         b_lc_w: ct
             .lc_rounds_b
@@ -13870,6 +14995,7 @@ fn emit_child_region(
         b_zpartial_w: (0..64).map(|i| wv(ct.zp_v + i)).collect(),
         zskip_w: outs[trace.squeezes[ct.zskip_fin][0]][0],
         pf: (pfslot, pf_w),
+        child_pub_w: pub_w,
     }
 }
 
@@ -13919,19 +15045,23 @@ fn check_child_region(public: &[F128], ct: &ChildTape<'_>, r: &ChildRegion) -> u
     // T_m == anchor.v and claim == expect are COPY CONSTRAINTS now — no
     // publics, no checker items; the proof itself carries them.
     let el_base = base2 + 2;
-    assert_eq!(
-        public[el_base],
-        ct.el_run_n,
-        "the element zc chain ends at the native running claim"
-    );
-    // THE INDEPENDENT CLOSE: the in-circuit lincheck chain ends exactly at
-    // the native ElementAssertion's target.
-    assert_eq!(
-        public[el_base + 1],
-        ct.el_assert.target,
-        "the element lc chain ends at the native assertion's target"
-    );
-    let mp_base = el_base + 2;
+    let mp_base = if let Some(el_assert) = &ct.el_assert {
+        assert_eq!(
+            public[el_base],
+            ct.el_run_n,
+            "the element zc chain ends at the native running claim"
+        );
+        // THE INDEPENDENT CLOSE: the in-circuit lincheck chain ends exactly
+        // at the native ElementAssertion's target.
+        assert_eq!(
+            public[el_base + 1],
+            el_assert.target,
+            "the element lc chain ends at the native assertion's target"
+        );
+        el_base + 2
+    } else {
+        el_base
+    };
     assert_eq!(
         public[mp_base],
         ct.anc_end_n,
@@ -15739,16 +16869,16 @@ fn mvp11_merge_fold_region() {
             let kappa = fold_claims[2][n_priors + k].row.point.len();
             assert_eq!(
                 &fold_claims[2][n_priors + k].row.point[..],
-                &tk.el_assert.r_con[..kappa],
+                &tk.el_assert.as_ref().expect("mixed child").r_con[..kappa],
                 "element row point is r_con's head"
             );
             assert_eq!(
                 &fold_claims[2][n_priors + k].col.point[..],
-                &tk.el_assert.r_col[..kappa],
+                &tk.el_assert.as_ref().expect("mixed child").r_col[..kappa],
                 "element col point is r_col's head"
             );
-            assert_eq!(fold_claims[2][n_priors + k].value, tk.el_assert.evals[0].0);
-            assert_eq!(fold_claims[3][n_priors + k].value, tk.el_assert.evals[0].1);
+            assert_eq!(fold_claims[2][n_priors + k].value, tk.el_assert.as_ref().expect("mixed child").evals[0].0);
+            assert_eq!(fold_claims[3][n_priors + k].value, tk.el_assert.as_ref().expect("mixed child").evals[0].1);
             let inner_b = fold_claims[0][n_priors + k].row.point.len();
             assert_eq!(
                 &fold_claims[0][n_priors + k].row.point[..],
@@ -15951,12 +17081,12 @@ fn mvp11_merge_fold_region() {
                 );
                 assert_eq!(
                     built2.public[q + 2],
-                    tk.el_assert.evals[0].0,
+                    tk.el_assert.as_ref().expect("mixed child").evals[0].0,
                     "child {k}: element A eval"
                 );
                 assert_eq!(
                     built2.public[q + 3],
-                    tk.el_assert.evals[0].1,
+                    tk.el_assert.as_ref().expect("mixed child").evals[0].1,
                     "child {k}: element B eval"
                 );
                 q += 4;
