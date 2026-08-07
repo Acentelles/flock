@@ -20129,6 +20129,36 @@ fn chain_tower_three_levels_one_internal_digest() {
                 println!("      slot {sl:4}: L2-only {x:5} L3-only {y:5}  {name}");
             }
         }
+        // How many of pf8's b-side cells are CONSTANTS at all (in the
+        // classes the diff implicates, i.e. zw/ow), versus wires? That is
+        // the population a bit-supply table would have to feed.
+        {
+            use std::collections::HashSet;
+            let diff_idx: HashSet<usize> =
+                (0..w0.len()).filter(|&i| w0[i] != w2[i]).collect();
+            let mut b_cells = 0usize;
+            let mut b_const = 0usize;
+            for (ci, cls) in w0.iter().enumerate() {
+                for &c in cls {
+                    let sl = c >> nu;
+                    if let flock_core::circuit::CellSlot::Gate { ty, word } = cs.slots()[sl] {
+                        // pf8 = the type carrying the differing words; b side
+                        // is the upper half of the 2+2pl input block.
+                        if ty == 12 && word.dir == flock_core::schedule::IoDirection::In {
+                            b_cells += 1;
+                            if diff_idx.contains(&ci) {
+                                b_const += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            println!(
+                "    pf8 input cells in wire classes: {b_cells} total, {b_const} in the \n      \
+                 implicated (constant) classes = {:.0}%",
+                100.0 * b_const as f64 / b_cells.max(1) as f64
+            );
+        }
         for sl in seen {
             let d = cs.slots()[sl];
             let extra = match d {
