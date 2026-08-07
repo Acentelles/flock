@@ -27,6 +27,13 @@
 #include "phi8_table.cuh"
 #include <vector>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+
+// Headers can't use each translation unit's own CK macro, and a silently failed
+// setup call here would show up as a wrong z_vec, not as an error.
+#define CK_LC(call) do { cudaError_t e_ = (call); if (e_ != cudaSuccess) { \
+    printf("FATAL %s @ %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); exit(1); } } while (0)
 
 #ifndef LC_TPB
 #define LC_TPB 256
@@ -199,41 +206,67 @@ inline void launch_lincheck_csc_fold(const F128* d_eq_inner,
 // built in SHARED memory (the CPU's strategy). No giant global sum-table: each
 // block builds a stripe's 256-entry table in shared mem once, then all its
 // i_inner threads do a shared-mem lookup. The witness is the only large buffer
-// read, and it's read once, coalesced.
+// read, and it's read once, coalesced — nothing else touches DRAM.
 //
 // Decomposition: a block owns a tile of LC_PF_BK = 2048 i_inner (256 threads ×
-// 8 each) and a slice of spg stripes (grid.y = G stripe-groups for parallelism
+// 8 each) and a share of the stripes (grid.y = G stripe-groups for parallelism
 // when k is small). Per stripe: build tbl[256] from the 8 eq_outer values, then
-// each thread folds its (up to 8) bytes. Partials[g·k + i] are reduced in pass 2.
+// each thread folds its (up to 8) bytes.
+//
+// This kernel is L1TEX-bound (~87% of peak; DRAM only ~42%) and the tbl[byte]
+// gather is most of that. Over half those wavefronts are bank conflicts, and they
+// are not removable by re-laying-out the table: a random gather always puts as
+// many lanes in a phase as there are bank groups to hit (8 lanes / 8 quads at 16 B
+// per entry, 16/16 at 8 B, 32/32 at 4 B), so every element width pays the same
+// ~3x. Fewer, wider lookups would need a 12-bit table, whose per-stripe build
+// costs an order of magnitude more than it saves.
+//
+// Stripe-groups merge into z_vec with atomicXor, not a G·k partials buffer and a
+// reduce pass. XOR is associative and commutative and the field add is exact, so
+// the result is bit-identical whatever order the groups land in. z_vec is 256 KB
+// — the whole atomic working set stays L2-resident, so the merge costs no DRAM
+// traffic, whereas the partials buffer cost G·k·16 bytes written and read again
+// (256 MB each way at m=33, a fifth of this kernel's total traffic).
 #define LC_PF_THREADS 256
-#define LC_PF_ACC 8
+#define LC_PF_ACC 8                            // measured best; 4 and 16 both lose
 #define LC_PF_BK (LC_PF_THREADS * LC_PF_ACC)   // i_inner per block = 2048
 
 __global__ void __launch_bounds__(LC_PF_THREADS)
 lincheck_partial_fold_shared(const uint8_t* __restrict__ z_packed,
                              const F128* __restrict__ eq_outer,
                              long long n_stripes, int k, int useful_bits,
-                             long long spg, F128* __restrict__ partials) {
+                             F128* __restrict__ z_vec) {
     __shared__ F128 tbl[256];
-    __shared__ F128 eq8[8];
+    __shared__ F128 nib[32];        // [0,16) low-nibble sums, [16,32) high-nibble
     int tx = threadIdx.x;
-    long long g = blockIdx.y;
     int i0 = blockIdx.x * LC_PF_BK;
     F128 acc[LC_PF_ACC];
 #pragma unroll
     for (int j = 0; j < LC_PF_ACC; j++) acc[j] = F128{0, 0};
 
-    long long s0 = g * spg, s1 = s0 + spg;
-    if (s1 > n_stripes) s1 = n_stripes;
-    for (long long s = s0; s < s1; s++) {
-        if (tx < 8) eq8[tx] = eq_outer[8 * s + tx];
-        __syncthreads();
-        // Build entry tx of the stripe's 256-entry sum table (one entry/thread):
-        // tbl[e] = Σ_{r: bit r of e set} eq8[r].
-        F128 v{0, 0};
+    // Interleaved, not blocked: group g takes stripes g, g+G, g+2G, ... Every group
+    // then gets the same stripe count to within one, with no tail group and no
+    // start/end bookkeeping, and concurrent groups read neighbouring stripes rather
+    // than addresses a fixed large stride apart.
+    for (long long s = blockIdx.y; s < n_stripes; s += gridDim.y) {
+        // Build the stripe's 256-entry sum table, tbl[e] = Σ_{r: bit r of e set}
+        // eq_outer[8s+r], one entry per thread. Going via nibble halves rather than
+        // having all 256 threads read all 8 eq values: a broadcast LDS.128 still
+        // has to deliver 16 B to each of 32 lanes, so those 8 reads cost as much as
+        // 8 wavefronts per warp — a quarter of this kernel's shared traffic. The two
+        // nib[] lookups replacing them are indexed by tx, not by data, so each phase
+        // of 8 lanes hits 8 distinct bank quads and they run conflict-free.
+        __syncthreads();                     // previous stripe's tbl readers are done
+        if (tx < 32) {
+            int base = (tx < 16) ? 0 : 4, n = tx & 15;
+            F128 v{0, 0};
 #pragma unroll
-        for (int r = 0; r < 8; r++) if ((tx >> r) & 1) v = f128_add(v, eq8[r]);
-        tbl[tx] = v;
+            for (int r = 0; r < 4; r++)
+                if ((n >> r) & 1) v = f128_add(v, eq_outer[8 * s + base + r]);
+            nib[tx] = v;
+        }
+        __syncthreads();
+        tbl[tx] = f128_add(nib[tx & 15], nib[16 + (tx >> 4)]);
         __syncthreads();
 #pragma unroll
         for (int j = 0; j < LC_PF_ACC; j++) {
@@ -243,73 +276,39 @@ lincheck_partial_fold_shared(const uint8_t* __restrict__ z_packed,
                 acc[j] = f128_add(acc[j], tbl[byte]);
             }
         }
-        __syncthreads();
     }
 #pragma unroll
     for (int j = 0; j < LC_PF_ACC; j++) {
         int i_inner = i0 + tx + j * LC_PF_THREADS;
-        if (i_inner < k)
-            partials[g * (long long)k + i_inner] = (i_inner < useful_bits) ? acc[j] : F128{0, 0};
+        if (i_inner < useful_bits) {
+            atomicXor((unsigned long long*)&z_vec[i_inner].lo, (unsigned long long)acc[j].lo);
+            atomicXor((unsigned long long*)&z_vec[i_inner].hi, (unsigned long long)acc[j].hi);
+        }
     }
 }
 
-// Reduce the G per-group partials → z_vec (pass 2). G is small, so a plain loop.
-__global__ void lincheck_partial_fold_reduce(const F128* __restrict__ partials,
-                                             long long G, int k, int useful_bits,
-                                             F128* __restrict__ z_vec) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= k) return;
-    if (i >= useful_bits) { z_vec[i] = F128{0, 0}; return; }
-    F128 acc{0, 0};
-    for (long long g = 0; g < G; g++) acc = f128_add(acc, partials[g * (long long)k + i]);
-    z_vec[i] = acc;
-}
-
-// d_eq_outer holds 2^n_log = 8*n_stripes. A grow-only static scratch holds the
-// G·k per-group partials (capped at 256 MB). No global sum-table buffer needed.
+// d_eq_outer holds 2^n_log = 8*n_stripes. z_vec is the accumulator, so it is
+// zeroed first — which also supplies the zeros for i_inner in [useful_bits, k).
 inline void launch_lincheck_partial_fold(const uint8_t* d_z_packed, const F128* d_eq_outer,
                                          long long n_stripes, int k, int useful_bits,
                                          F128* d_z_vec) {
     int x_tiles = (k + LC_PF_BK - 1) / LC_PF_BK;     // i_inner tiles per stripe-group
 
-    // Stripe-groups G: enough blocks to fill the GPU when k is small. Each block
-    // does spg stripes serially; ~SPG_TARGET keeps per-block work bounded. More
-    // groups = more parallelism but more partials read/write traffic in pass 2,
-    // so target enough blocks (x_tiles·G) to fill the SMs, no more.
-#ifndef LC_SPG_TARGET
-#define LC_SPG_TARGET 64
-#endif
-    long long G = (n_stripes + LC_SPG_TARGET - 1) / LC_SPG_TARGET;
-    if (G < 1) G = 1;
+    // Stripe-groups G: each block walks its stripes serially, so G only has to make
+    // x_tiles·G fill the SMs. Runtime is flat from 4 to 64 blocks/SM, so aim for 32
+    // — deep enough that a partial last wave is a rounding error, shallow enough to
+    // keep atomic contention on z_vec low. x_tiles is a power of two, so this comes
+    // out an exact multiple of the SM count; a grid that misses by a fraction of a
+    // block per SM leaves one straggler wave holding up all the others (~15% at 6).
+    static int s_sms = 0;
+    if (!s_sms) CK_LC(cudaDeviceGetAttribute(&s_sms, cudaDevAttrMultiProcessorCount, 0));
+    long long G = ((long long)s_sms * 32 + x_tiles - 1) / x_tiles;
     if (G > n_stripes) G = n_stripes;
-    long long maxG = ((long long)256 << 20) / ((long long)k * (long long)sizeof(F128));
-    if (maxG < 1) maxG = 1;
-    if (G > maxG) G = maxG;
-    long long spg = (n_stripes + G - 1) / G;
-    G = (n_stripes + spg - 1) / spg;                 // tighten: no empty groups
 
-    // One stripe-group → no cross-group reduction needed: the pass-1 kernel can
-    // write z_vec directly, skipping the partials buffer and pass 2 entirely.
-    if (G == 1) {
-        dim3 grid1((unsigned)x_tiles, 1u);
-        lincheck_partial_fold_shared<<<grid1, LC_PF_THREADS>>>(d_z_packed, d_eq_outer, n_stripes,
-                                                               k, useful_bits, spg, d_z_vec);
-        return;
-    }
-
-    static F128* s_part = nullptr;
-    static long long s_cap = 0;
-    long long need = G * (long long)k;
-    if (need > s_cap) {
-        if (s_part) cudaFree(s_part);
-        cudaMalloc(&s_part, need * sizeof(F128));
-        s_cap = need;
-    }
+    CK_LC(cudaMemsetAsync(d_z_vec, 0, (size_t)k * sizeof(F128)));
     dim3 grid((unsigned)x_tiles, (unsigned)G);
     lincheck_partial_fold_shared<<<grid, LC_PF_THREADS>>>(d_z_packed, d_eq_outer, n_stripes,
-                                                          k, useful_bits, spg, s_part);
-    int rb = (k + LC_TPB - 1) / LC_TPB;
-    lincheck_partial_fold_reduce<<<rb, LC_TPB>>>(s_part, G, k, useful_bits, d_z_vec);
+                                                          k, useful_bits, d_z_vec);
 }
 
 // ---------------------------------------------------------------------------
