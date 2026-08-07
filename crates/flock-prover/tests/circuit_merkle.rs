@@ -197,6 +197,25 @@ const ENV_ACC_MAIN_WORDS: usize = 600;
 
 /// The envelope's public TAIL, in order: `[.. body .. | pad | ACC_CHAIN |
 /// ACC_MAIN | APP]`. Every base here is a CONSTANT of the envelope.
+/// The committed lane count on the recursion path. With `counts*` retired
+/// (`ENV_NO_PAD`) it must be PINNED: a leaf is `num_lanes` words wide and
+/// the parent hashes every opened leaf, so it is the one aggregate a
+/// parent's circuit is compiled against. 24 covers every envelope member's
+/// content-derived count at min-one-row (FL 12 at dev / 23 at m32,
+/// internal 18) and stays below `2^initial_k = 32`, so children remain
+/// lane-major.
+const ENV_LANES: usize = 24;
+
+fn outer_lanes(union: &UnionInstance, log_batch_size: usize) -> Option<usize> {
+    let content = union.commit_lanes(log_batch_size);
+    if envelope_shape().is_none() || std::env::var("ENV_NO_PAD").is_err() {
+        return content;
+    }
+    let c = content.unwrap_or(1usize << log_batch_size);
+    assert!(c <= ENV_LANES, "content lanes {c} exceed the lane pin {ENV_LANES}");
+    Some(ENV_LANES)
+}
+
 fn env_app_base(env: &EnvShape) -> usize {
     env.publics - ENV_APP_WORDS
 }
@@ -398,9 +417,16 @@ fn pad_envelope_counts(
     };
     // Under ENV_NO_PAD a slot's target IS its live count, so nothing pads
     // and nothing overshoots.
-    let t_b3 = if no_pad { sb.rows_in_slot(q.b3) } else { env.counts_bool[0] };
-    let t_swap = if no_pad { sb.rows_in_slot(q.swap) } else { env.counts_bool[1] };
-    let t_spread = if no_pad { sb.rows_in_slot(q.spread) } else { env.counts_bool[2] };
+    // Under ENV_NO_PAD a slot pads only to ONE ROW — never to the cap.
+    // That is the whole pin the run structure needs: `assist_boundaries`
+    // merges columns only when they are EMPTY, so every non-empty column is
+    // a singleton run and the run count is registry-derived EXCEPT through
+    // the predicate `n_t > 0`. Keep every type non-empty and the counts
+    // become pure values.
+    let floor1 = |sb: &ShapeBuilder, s| sb.rows_in_slot(s).max(1);
+    let t_b3 = if no_pad { floor1(sb, q.b3) } else { env.counts_bool[0] };
+    let t_swap = if no_pad { floor1(sb, q.swap) } else { env.counts_bool[1] };
+    let t_spread = if no_pad { floor1(sb, q.spread) } else { env.counts_bool[2] };
     pad(sb, hints, &mut over, "b3", q.b3, t_b3, false);
     pad(sb, hints, &mut over, "swap", q.swap, t_swap, true);
     pad(sb, hints, &mut over, "spread", q.spread, t_spread, false);
@@ -409,7 +435,7 @@ fn pad_envelope_counts(
             .iter()
             .find(|&&(k, _)| k == key)
             .unwrap_or_else(|| panic!("envelope slot key {key} missing from the cache"));
-        let target = if no_pad { sb.rows_in_slot(s) } else { count };
+        let target = if no_pad { floor1(sb, s) } else { count };
         pad(sb, hints, &mut over, &format!("el{key}"), s, target, false);
     }
     // A slot the emission demanded but the envelope never declared: the
@@ -8807,7 +8833,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             log_inv_rate: pf.log_inv_rate(),
             log_batch_size: pcs_batch_for(&union_o, pf),
             profile: pf,
-            num_lanes: union_o.commit_lanes(pcs_batch_for(&union_o, pf)),
+            num_lanes: outer_lanes(&union_o, pcs_batch_for(&union_o, pf)),
             merkle_hash: HashKind::Blake3,
         };
         let b3_r1cs = blake3::build_block_r1cs(nu);
@@ -12839,7 +12865,7 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
             log_inv_rate: pf.log_inv_rate(),
             log_batch_size: pcs_batch_for(&union2, pf),
             profile: pf,
-            num_lanes: union2.commit_lanes(pcs_batch_for(&union2, pf)),
+            num_lanes: outer_lanes(&union2, pcs_batch_for(&union2, pf)),
             merkle_hash: HashKind::Blake3,
         };
         let b3_r1cs2 = blake3::build_block_r1cs(nu2);
@@ -19179,7 +19205,7 @@ fn build_node_outer_app(
             log_inv_rate: pf.log_inv_rate(),
             log_batch_size: pcs_batch_for(&union2, pf),
             profile: pf,
-            num_lanes: union2.commit_lanes(pcs_batch_for(&union2, pf)),
+            num_lanes: outer_lanes(&union2, pcs_batch_for(&union2, pf)),
             // BLAKE3 for BOTH Merkle and FS: the node's proof must be
             // RECURSABLE — a parent replays this transcript in-circuit,
             // and each default diverges silently (the two recorded
