@@ -365,6 +365,12 @@ fn pad_envelope_counts(
     vals: &mut Vec<F128>,
     tail: &EnvTail,
 ) {
+    // ENV_NO_PAD=1 skips the ROW padding (the tail blocks and the public
+    // segment still pad, so only the declared counts differ). It exists for
+    // `envelope_counts_dependency_probe`, which asks the question the
+    // counts pin never answered: does a parent's walk actually depend on a
+    // child's per-type counts, or only on what they sum to?
+    let no_pad = std::env::var("ENV_NO_PAD").is_ok();
     let mut report: Vec<String> = Vec::new();
     let mut over: Vec<String> = Vec::new();
     let mut pad = |sb: &mut ShapeBuilder,
@@ -390,15 +396,21 @@ fn pad_envelope_counts(
             }
         }
     };
-    pad(sb, hints, &mut over, "b3", q.b3, env.counts_bool[0], false);
-    pad(sb, hints, &mut over, "swap", q.swap, env.counts_bool[1], true);
-    pad(sb, hints, &mut over, "spread", q.spread, env.counts_bool[2], false);
+    // Under ENV_NO_PAD a slot's target IS its live count, so nothing pads
+    // and nothing overshoots.
+    let t_b3 = if no_pad { sb.rows_in_slot(q.b3) } else { env.counts_bool[0] };
+    let t_swap = if no_pad { sb.rows_in_slot(q.swap) } else { env.counts_bool[1] };
+    let t_spread = if no_pad { sb.rows_in_slot(q.spread) } else { env.counts_bool[2] };
+    pad(sb, hints, &mut over, "b3", q.b3, t_b3, false);
+    pad(sb, hints, &mut over, "swap", q.swap, t_swap, true);
+    pad(sb, hints, &mut over, "spread", q.spread, t_spread, false);
     for &(key, count) in &env.counts_el {
         let &(_, s) = cache
             .iter()
             .find(|&&(k, _)| k == key)
             .unwrap_or_else(|| panic!("envelope slot key {key} missing from the cache"));
-        pad(sb, hints, &mut over, &format!("el{key}"), s, count, false);
+        let target = if no_pad { sb.rows_in_slot(s) } else { count };
+        pad(sb, hints, &mut over, &format!("el{key}"), s, target, false);
     }
     // A slot the emission demanded but the envelope never declared: the
     // keyed cache created it on the fly, so this builder's registry carries
@@ -19589,6 +19601,152 @@ fn internal_node_over_two_fl_nodes() {
         node.shape.circuit.cells().mu(),
         node.public.len(),
         bincode::serialize(&node.proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
+    );
+}
+
+/// The op sequence a parent replays for one child: a recorded DEFERRED
+/// verify, shape only. Two children whose op sequences are equal are
+/// indistinguishable to a parent's circuit — same gates, different values.
+fn child_tape_ops(lo: &LeafOuter) -> Vec<flock_core::transcript_record::TranscriptOp> {
+    use flock_core::transcript_record::RecordingChallenger;
+    let union_i = outer_union(&lo.shape.registry, lo.shape.counts.clone());
+    let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
+        (lo.b3_slot, lo.b3_r1cs.csc_lincheck_circuit()),
+        (lo.swap_slot, lo.swap_r1cs.csc_lincheck_circuit()),
+        (lo.spread_slot, lo.spread_r1cs.csc_lincheck_circuit()),
+    ];
+    lcs_ord.sort_by_key(|(i, _)| *i);
+    let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
+        lcs_ord.into_iter().map(|(_, c)| c).collect();
+    let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(DOMAIN));
+    verifier::verify_ligerito_union_circuit_deferred(
+        &union_i,
+        &lo.shape.circuit,
+        &lo.public,
+        &lcs,
+        &lo.commitment,
+        &lo.proof,
+        &lo.pcs,
+        &mut rec,
+    )
+    .expect("the child verifies (recorded)");
+    rec.shape().ops().to_vec()
+}
+
+/// **DOES A PARENT'S WALK ACTUALLY DEPEND ON A CHILD'S PER-TYPE COUNTS?**
+///
+/// `counts*` pins every type's height across the envelope, which is a
+/// blunt instrument: reading the code, the only count-derived quantity a
+/// parent's CIRCUIT is compiled against looks to be `num_lanes` (the L0
+/// leaf width, hence compressions per opening) — `m_bool`/`m_el` come from
+/// `Registry::new(types, nu)`, which takes no counts, and `dense_m` is
+/// equalised by the floor. But the counts pin was justified in the handoff
+/// by "child M_bool/M_el round counts are count-derived", which
+/// contradicts that. One of the two is wrong, and the answer decides
+/// whether ~35 ms per node of padding is necessary or merely inherited.
+///
+/// Run under `ENV_NO_PAD=1`, which skips the row padding so the FL and the
+/// internal node carry their TRUE counts, then diff the op sequences a
+/// parent would replay. If they differ only where lane width enters, the
+/// counts pin is over-constraint and pinning `num_lanes` is the whole fix.
+#[test]
+#[ignore] // Diagnostic — run with ENV_NO_PAD=1 TOWER_PROFILE=slim --nocapture.
+fn envelope_counts_dependency_probe() {
+    let Some(_env) = envelope_shape() else {
+        println!("\nCOUNTS-DEPENDENCY PROBE: skipped — needs the envelope (TOWER_PROFILE=slim)\n");
+        return;
+    };
+    let n_blocks = 256usize;
+    let mut rng = Rng(0xC4A1_00DE);
+    let h0: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let cp0 = build_chain_proof(h0, n_blocks);
+    let cp1 = build_chain_proof(cp0.h_end, n_blocks);
+    let cp2 = build_chain_proof(cp1.h_end, n_blocks);
+    let cp3 = build_chain_proof(cp2.h_end, n_blocks);
+    let fl0 = build_fl_node(&cp0, &cp1);
+    let fl1 = build_fl_node(&cp2, &cp3);
+    let (node, _acc, _t, _app, _lane) =
+        build_node_outer_app(&[&fl0.lo, &fl1.lo], Some(fl0.stmt_base), None);
+
+    // The derived quantities, side by side — this is the attribution.
+    let describe = |name: &str, lo: &LeafOuter| {
+        let u = outer_union(&lo.shape.registry, lo.shape.counts.clone());
+        let pf = tower_profile();
+        let lb = pcs_batch_for(&u, pf);
+        println!(
+            "  {name:9} dense_words {:>9} | dense_m {} | m_bool {} | m_el {} | lanes {:?} | publics {}",
+            u.dense_words(),
+            u.dense_m(),
+            u.m_bool(),
+            u.registry().m_elem(),
+            u.commit_lanes(lb),
+            lo.public.len(),
+        );
+        u.dense_words()
+    };
+    println!("\nCOUNTS-DEPENDENCY PROBE (ENV_NO_PAD skips row padding)");
+    let w_fl = describe("FL", &fl0.lo);
+    let w_node = describe("internal", &node);
+    println!(
+        "  counts equal: {} | dense_words equal: {}",
+        fl0.lo.shape.counts == node.shape.counts,
+        w_fl == w_node
+    );
+
+    // THE OTHER HALF OF THE PARENT'S CIRCUIT. Merkle openings are NOT
+    // absorbed — the transcript sees the caps, not the leaves — so the op
+    // sequence cannot show leaf width. The query phase can: a parent hashes
+    // every opened leaf in-circuit, and the leaf IS `num_lanes` words wide.
+    // `RealTape.b3_rows` is exactly the parent's modelled compression count
+    // for walking this child.
+    let rt_fl = RealTape::new(&fl0.lo, DOMAIN);
+    let rt_node = RealTape::new(&node, DOMAIN);
+    println!(
+        "  parent b3 rows to walk this child: FL {} vs internal {} ({})",
+        rt_fl.b3_rows,
+        rt_node.b3_rows,
+        if rt_fl.b3_rows == rt_node.b3_rows {
+            "EQUAL — the query phase does not see the difference either"
+        } else {
+            "DIFFER — the query phase is where counts reach the parent"
+        },
+    );
+
+    // THE DIFF: the op sequences a parent would replay.
+    let ops_fl = child_tape_ops(&fl0.lo);
+    let ops_node = child_tape_ops(&node);
+    if ops_fl == ops_node {
+        println!(
+            "  OP SEQUENCES ARE IDENTICAL ({} ops) — a parent cannot tell these\n  \
+             children apart despite different counts.\n",
+            ops_fl.len()
+        );
+        return;
+    }
+    println!(
+        "  op counts: FL {} vs internal {}",
+        ops_fl.len(),
+        ops_node.len()
+    );
+    let mut shown = 0usize;
+    for (i, (a, b)) in ops_fl.iter().zip(&ops_node).enumerate() {
+        if a != b {
+            println!("    first divergence at op {i}:\n      FL       {a:?}\n      internal {b:?}");
+            shown += 1;
+            if shown >= 5 {
+                break;
+            }
+        }
+    }
+    // Classify: how many ops differ, and do the sequences realign?
+    let n_diff = ops_fl
+        .iter()
+        .zip(&ops_node)
+        .filter(|(a, b)| a != b)
+        .count();
+    println!(
+        "  {n_diff} of {} paired ops differ\n",
+        ops_fl.len().min(ops_node.len())
     );
 }
 
