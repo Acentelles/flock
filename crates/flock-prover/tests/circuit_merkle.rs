@@ -12453,8 +12453,17 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         let mut vals: Vec<F128> = Vec::new();
         let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
         let mut consts: Vec<(F128, Wire)> = Vec::new();
+        // The two chain-child regions are independent gate subgraphs (each
+        // reads only its own tape's inputs; the fold region joins them
+        // AFTER), so they are declared as islands and the fill plan
+        // evaluates them concurrently. A cross-island read fails plan
+        // compilation — the independence is checked, not assumed.
+        let isl0 = sb.begin_island();
         let r0 = emit_child_region(&mut sb, &mut cs, &t0, &mut vals, &mut hints, &mut consts);
+        sb.end_island(isl0);
+        let isl1 = sb.begin_island();
         let r1 = emit_child_region(&mut sb, &mut cs, &t1, &mut vals, &mut hints, &mut consts);
+        sb.end_island(isl1);
         let b3s = cs.q.b3;
         let macs = cs.macs;
         let mrs = cs.mrs;
@@ -12708,11 +12717,40 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
             }
         };
         let shape2 = sb.finish().expect("the first-level node circuit builds");
-        let build_ms = t_build.elapsed().as_secs_f64() * 1e3;
         let hint_refs: Vec<&(dyn std::any::Any + Sync)> =
             hints.iter().map(|h| h as &(dyn std::any::Any + Sync)).collect();
+        // THE INDEX-FILL RUNNER (setup), the node's path: compile the plan,
+        // then pin it row-identical against the generic walk before the
+        // online run trusts it. run() stays the differential oracle — this
+        // pin is what keeps it one, now that the FL no longer walks in the
+        // timed path either.
+        let fill_plan = shape2.fill_plan();
+        {
+            let walk = shape2.run(&vals, &hint_refs);
+            let fill = shape2.run_filled(&fill_plan, &vals, &hint_refs);
+            assert_eq!(walk.public, fill.public, "fill plan: public segment");
+            assert_eq!(walk.witnesses, fill.witnesses, "fill plan: slot witnesses");
+            assert_eq!(
+                walk.rows::<Blake3Gate>(cs.q.b3),
+                fill.rows::<Blake3Gate>(cs.q.b3),
+                "fill plan: b3 rows"
+            );
+            assert_eq!(
+                walk.rows::<SwapGate>(cs.q.swap),
+                fill.rows::<SwapGate>(cs.q.swap),
+                "fill plan: swap rows"
+            );
+            assert_eq!(
+                walk.rows::<BitSpreadGate>(cs.q.spread),
+                fill.rows::<BitSpreadGate>(cs.q.spread),
+                "fill plan: spread rows"
+            );
+        }
+        let build_ms = t_build.elapsed().as_secs_f64() * 1e3;
         let t_run = std::time::Instant::now();
-        let mut built2 = shape2.run(&vals, &hint_refs);
+        // DEFERRED: rows and publics only — the element witnesses are never
+        // packed, and the assembly below feeds the prover from the rows.
+        let mut built2 = shape2.run_filled_deferred(&fill_plan, &vals, &hint_refs);
         let run_ms = t_run.elapsed().as_secs_f64() * 1e3;
 
         // Child checkers (each child's whole deferred-verifier statement
@@ -12798,58 +12836,58 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         // (online), so it gets its own timer rather than hiding inside the
         // shape build or the prove.
         let t_asm = std::time::Instant::now();
-        let mut el_ord: Vec<(usize, Vec<F128>)> = cs
-            .element_slot_ids()
-            .into_iter()
-            .map(|sl| {
-                let z = match std::mem::replace(
-                    &mut built2.witnesses[shape2.registry_slot(sl)],
-                    SlotWitness::DeferredToRows,
-                ) {
-                    SlotWitness::Element(z) => z,
-                    other => panic!("element slot produced {other:?}"),
-                };
-                (shape2.registry_slot(sl), z)
-            })
-            .collect();
-        el_ord.sort_by_key(|(i, _)| *i);
-        let el_inputs: Vec<UnionElementSlotInput> = el_ord
-            .into_iter()
-            .map(|(i, z)| live_element_input(z, shape2.counts[i], nu2))
-            .collect();
+        // THE COPY-FREE ASSEMBLY, the node's path: the boolean drivers pack
+        // straight into the union's slot blocks inside the prove (live rows
+        // only under elide) — no capacity-sized intermediates, no memcpy.
+        // The rows are hoisted to owned Vecs because the closures must be
+        // Send and `built2.rows` hands out `dyn Any`-backed borrows.
+        let b3_rows2 = built2.rows::<Blake3Gate>(cs.q.b3).to_vec();
+        let swap_rows2 = built2.rows::<SwapGate>(cs.q.swap).to_vec();
+        let spread_rows2 = built2.rows::<BitSpreadGate>(cs.q.spread).to_vec();
         let mut bslots: Vec<(usize, UnionSlotProverInput)> = vec![
             (
                 shape2.registry_slot(cs.q.b3),
-                UnionSlotProverInput::new(
-                    blake3::generate_witness_batch_major_partial(
-                        built2.rows::<Blake3Gate>(cs.q.b3),
-                        nu2,
-                    ),
+                UnionSlotProverInput::in_place(
+                    move |dst| {
+                        blake3::generate_witness_batch_major_partial_into(&b3_rows2, nu2, dst)
+                    },
                     b3_lc2,
                 ),
             ),
             (
                 shape2.registry_slot(cs.q.swap),
-                UnionSlotProverInput::new(
-                    SwapTable::generate_witness_batch_major(
-                        built2.rows::<SwapGate>(cs.q.swap),
-                        nu2,
-                    ),
+                UnionSlotProverInput::in_place(
+                    move |dst| SwapTable::generate_witness_batch_major_into(&swap_rows2, dst),
                     swap_lc2,
                 ),
             ),
             (
                 shape2.registry_slot(cs.q.spread),
-                UnionSlotProverInput::new(
-                    spread_ty2.generate_witness_batch_major(
-                        built2.rows::<BitSpreadGate>(cs.q.spread),
-                        nu2,
-                    ),
+                UnionSlotProverInput::in_place(
+                    move |dst| spread_ty2.generate_witness_batch_major_into(&spread_rows2, dst),
                     spread_lc2,
                 ),
             ),
         ];
         bslots.sort_by_key(|(i, _)| *i);
+        // Element inputs straight from the slots' rows: the run was
+        // DEFERRED, so the full-capacity packed intermediate never exists —
+        // the prove's in_place closure scatters the live rows directly.
+        let mut el_ord: Vec<(usize, Vec<Vec<F128>>)> = cs
+            .element_slot_ids()
+            .into_iter()
+            .map(|sl| {
+                (
+                    shape2.registry_slot(sl),
+                    built2.take_rows_of::<Vec<F128>>(sl),
+                )
+            })
+            .collect();
+        el_ord.sort_by_key(|(i, _)| *i);
+        let el_inputs: Vec<UnionElementSlotInput> = el_ord
+            .into_iter()
+            .map(|(_, rows)| live_element_input_from_rows(rows, nu2))
+            .collect();
         let mut lco: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
             (shape2.registry_slot(cs.q.b3), b3_lc2),
             (shape2.registry_slot(cs.q.swap), swap_lc2),
