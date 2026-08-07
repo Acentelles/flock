@@ -147,7 +147,7 @@ fn outer_union<'r>(
 struct EnvShape {
     nu: usize,
     spread_w: usize,
-    resid_pls: [usize; 5],
+    resid_pls: [usize; 6],
     pf_w: usize,
     /// counts* — the ONE declared-count vector every envelope outer pads
     /// to (`ShapeBuilder::pad_slot_rows` before finish, so `shape.counts`
@@ -162,14 +162,28 @@ struct EnvShape {
     /// before spread here, matching the builders' declaration fields, NOT
     /// the registry print order), then the element types by cache key.
     counts_bool: [usize; 3],
-    counts_el: [(usize, usize); 14],
+    counts_el: [(usize, usize); 15],
     /// publics* — the ONE public-segment length every envelope outer pads
     /// to (published zeros appended after all real publics). The child's
     /// publics count is what a PARENT's walk consumes — H(publics) chain
     /// rows and the recombination's 8-lane folds both scale with it — so
     /// one count is what makes the L1 walk (leaf children) and the L2
-    /// walk (node children) row-identical.
+    /// walk (node children) row-identical. The last [`ENV_APP_WORDS`] of
+    /// them are the APPLICATION BLOCK (see [`env_app_base`]).
     publics: usize,
+}
+
+/// The APPLICATION STATEMENT's width in the envelope's public segment: the
+/// hash-chain PoC's span `(h_start, h_end)`, eight 128-bit words.
+const ENV_APP_WORDS: usize = 8;
+
+/// The application block's offset — the envelope's public TAIL, hence a
+/// CONSTANT rather than a function of an outer's live public usage. That
+/// is what lets a parent read a child's app block at the same index no
+/// matter which level (or which kind) of child it is walking; an outer with
+/// no application publishes zeros there, exactly as the padding does.
+fn env_app_base(env: &EnvShape) -> usize {
+    env.publics - ENV_APP_WORDS
 }
 
 /// `Some` exactly when the DEFAULT envelope is active: the registry
@@ -179,31 +193,40 @@ struct EnvShape {
 fn envelope_shape() -> Option<EnvShape> {
     (envelope_floor_m() == Some(29)).then(|| EnvShape {
         nu: 15,
-        spread_w: 19,
-        resid_pls: [12, 9, 6, 3, 0],
+        // 20 = the m32 FAST chain leaf's L0 depth (log_msg_cols 19 +
+        // log_inv_rate 1), which the B-fast PoC's first-level node walks;
+        // the m29 slim outer ladder needs only 19 and leaves the top
+        // output unread.
+        spread_w: 20,
+        // Six variants: pl = Σ_{levels above} fold count, so the deepest is
+        // the m32 FAST chain ladder's level-0 (six levels, 5×3 folds above
+        // it) — the m29 slim outer ladder's five stop at 12 and ride the
+        // rest at count 0.
+        resid_pls: [15, 12, 9, 6, 3, 0],
         pf_w: 8,
         // Iterated at the padded envelope 2026-08-06 (probe + tower
         // census, elementwise max of leaf/node usage). Only b3, le8, pf8
         // and mac are content-geometry-sensitive; everything else hits its
         // cap exactly (registry-shaped) and skn/skc are the leaf's.
-        counts_bool: [15700, 6052, 524],
+        counts_bool: [23700, 12250, 1060],
         counts_el: [
-            (600, 29137), // mac — the nu* driver; watch the 2^15 ceiling
-            (500, 602),   // zcr
-            (400, 674),   // mrs
-            (0, 5944),    // spine
-            (601, 184),   // assist
+            (600, 29700), // mac — the nu* driver; watch the 2^15 ceiling
+            (500, 620),   // zcr
+            (400, 800),   // mrs
+            (0, 7500),    // spine
+            (601, 200),   // assist
             (510, 64),    // skip-node (leaf-only usage)
             (511, 1),     // skip-close (leaf-only usage)
-            (8, 2136),    // leaf-eval 8-lane
-            (112, 720),   // resid pl 12
-            (109, 480),   // resid pl 9
-            (106, 360),   // resid pl 6
-            (103, 288),   // resid pl 3
-            (100, 248),   // resid pl 0
-            (318, 8604),  // prefix w 8
+            (8, 4200),    // leaf-eval 8-lane
+            (115, 900),   // resid pl 15 (the m32 chain ladder's level 0)
+            (112, 740),   // resid pl 12
+            (109, 500),   // resid pl 9
+            (106, 436),   // resid pl 6
+            (103, 300),   // resid pl 3
+            (100, 260),   // resid pl 0
+            (318, 10000), // prefix w 8
         ],
-        publics: 3520,
+        publics: 3660,
     })
 }
 
@@ -297,6 +320,7 @@ fn pad_envelope_counts(
     zw: Wire,
     hints: &mut Vec<[u32; SLOT_WORDS]>,
     vals: &mut Vec<F128>,
+    app: Option<&[Wire]>,
 ) {
     let mut report: Vec<String> = Vec::new();
     let mut over: Vec<String> = Vec::new();
@@ -333,19 +357,54 @@ fn pad_envelope_counts(
             .unwrap_or_else(|| panic!("envelope slot key {key} missing from the cache"));
         pad(sb, hints, &mut over, &format!("el{key}"), s, count, false);
     }
+    // A slot the emission demanded but the envelope never declared: the
+    // keyed cache created it on the fly, so this builder's registry carries
+    // a type the other envelope outers do not — the digest diverges and
+    // nothing else here would say so. Name it (the key IS the parameter:
+    // 100 + pl for a residual variant, 310 + w for a prefix width).
+    let stray: Vec<usize> = cache
+        .iter()
+        .map(|&(k, _)| k)
+        .filter(|k| !env.counts_el.iter().any(|&(c, _)| c == *k))
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "off-envelope slot keys {stray:?} — the emission needs types counts* does not declare"
+    );
     // publics* (wall 4): the public segment pads to ONE length with
     // published zeros, appended after every real public — tail publics
     // shift no recorded block base, and a parent's walk (H(publics)
     // rows, recombination folds) sees the same segment length at every
     // level.
+    // The last ENV_APP_WORDS are the APPLICATION BLOCK, published AFTER the
+    // padding — so its offset is `env_app_base`, a constant of the envelope
+    // rather than of this outer's live usage, and a parent reads a child's
+    // app statement at one index whatever kind of child it walks. An outer
+    // with no application fills the block with zeros, exactly as the
+    // padding does.
+    let body = env.publics - ENV_APP_WORDS;
     let live_pub = sb.public_len();
-    report.push(format!("publics {live_pub}/{}", env.publics));
-    if live_pub > env.publics {
-        over.push(format!("publics {live_pub} > {}", env.publics));
+    report.push(format!("publics {live_pub}/{body}+app{ENV_APP_WORDS}"));
+    if live_pub > body {
+        over.push(format!("publics {live_pub} > {body}"));
     } else {
-        for _ in live_pub..env.publics {
+        for _ in live_pub..body {
             vals.push(F128::ZERO);
             sb.public_input();
+        }
+        match app {
+            Some(w) => {
+                assert_eq!(w.len(), ENV_APP_WORDS, "the app block is the envelope's tail");
+                for &x in w {
+                    sb.publish(x);
+                }
+            }
+            None => {
+                for _ in 0..ENV_APP_WORDS {
+                    vals.push(F128::ZERO);
+                    sb.public_input();
+                }
+            }
         }
     }
     // The live/cap census — the fixed-point iteration's data. One line per
@@ -8422,7 +8481,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         // is recorded first.
         let prepad_publics = sb.public_len();
         if let Some(e) = &env {
-            pad_envelope_counts(&mut sb, &slots, &leaf_slot, e, zw, &mut hints, &mut vals);
+            pad_envelope_counts(&mut sb, &slots, &leaf_slot, e, zw, &mut hints, &mut vals, None);
         }
         let shape = sb.finish().expect("valid leaf query-phase circuit");
         let hint_refs: Vec<&(dyn std::any::Any + Sync)> =
@@ -12187,10 +12246,39 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         let trace = chain.finish();
 
         let b3_rows = t0.b3_rows + t1.b3_rows + trace.rows.len();
-        let nu2 = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7);
+        let nu2_content = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7);
+        // THE ENVELOPE (task 7b): a first-level node is an internal node's
+        // CHILD, so its proof must carry the same geometry every other
+        // envelope outer does — nu*, the canonical type set at counts*, the
+        // padded public segment and the m* dense floor. Then a parent's walk
+        // over an FL child is row-identical to its walk over an internal
+        // child, which is what makes ONE internal circuit serve every level.
+        let env = envelope_shape();
+        let nu2 = match &env {
+            Some(e) => {
+                assert!(
+                    nu2_content <= e.nu,
+                    "FL content nu {nu2_content} exceeds the envelope nu* {}",
+                    e.nu
+                );
+                e.nu
+            }
+            None => nu2_content,
+        };
         let t_build = std::time::Instant::now();
         let mut sb = ShapeBuilder::new(nu2);
-        let mut cs = ChildSlots::new(&mut sb, nu2, t0.spread_w.max(t1.spread_w));
+        let spread_own2 = t0.spread_w.max(t1.spread_w);
+        let (spread_w2, mut cs) = match &env {
+            Some(e) => {
+                assert!(
+                    spread_own2 <= e.spread_w,
+                    "chain-child ladder depth {spread_own2} exceeds the envelope spread width {}",
+                    e.spread_w
+                );
+                (e.spread_w, ChildSlots::new_env(&mut sb, nu2, e))
+            }
+            None => (spread_own2, ChildSlots::new(&mut sb, nu2, spread_own2)),
+        };
         let mut vals: Vec<F128> = Vec::new();
         let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
         let mut consts: Vec<(F128, Wire)> = Vec::new();
@@ -12400,14 +12488,38 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
             sb.publish(wv(locs[0].claims[n_priors + k].value_v));
             sb.publish(wv(locs[1].claims[n_priors + k].value_v));
         }
-        let stmt_base = sb.public_len();
-        for j in 0..4 {
-            sb.publish(r0.child_pub_w[3 + j]);
-        }
-        for j in 0..4 {
-            sb.publish(r1.child_pub_w[p1 - 4 + j]);
-        }
-
+        // THE APPLICATION STATEMENT: the combined span (the left child's
+        // h_start, the right child's h_end). counts* + publics*: an FL node
+        // declares the same count vector and segment length every other
+        // envelope outer does, and the app block rides the envelope's fixed
+        // TAIL so a parent reads it at `env_app_base` — the same index it
+        // reads an internal child's at. Off-envelope it publishes inline.
+        let app_w: Vec<Wire> = (0..4)
+            .map(|j| r0.child_pub_w[3 + j])
+            .chain((0..4).map(|j| r1.child_pub_w[p1 - 4 + j]))
+            .collect();
+        let stmt_base = match &env {
+            Some(e) => {
+                pad_envelope_counts(
+                    &mut sb,
+                    &cs.q,
+                    &cs.env_cache(),
+                    e,
+                    zw,
+                    &mut hints,
+                    &mut vals,
+                    Some(&app_w),
+                );
+                env_app_base(e)
+            }
+            None => {
+                let b = sb.public_len();
+                for &w in &app_w {
+                    sb.publish(w);
+                }
+                b
+            }
+        };
         let shape2 = sb.finish().expect("the first-level node circuit builds");
         let build_ms = t_build.elapsed().as_secs_f64() * 1e3;
         let hint_refs: Vec<&(dyn std::any::Any + Sync)> =
@@ -12477,20 +12589,20 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         // BOTH the Merkle trees and the FS chain, so the node is RECURSABLE
         // (an internal node's RealTape walks this transcript in-circuit;
         // the defaults diverge silently — both recorded gotchas).
-        let union2 = UnionInstance::new(&shape2.registry, shape2.counts.clone());
+        let union2 = outer_union(&shape2.registry, shape2.counts.clone());
+        let pf = tower_profile();
         let pcs2 = PcsParams {
             m: union2.dense_m(),
-            log_inv_rate: 1,
-            log_batch_size: pcs_batch(&union2),
-            profile: LigeritoProfile::Fast,
-            num_lanes: union2.commit_lanes(pcs_batch(&union2)),
+            log_inv_rate: pf.log_inv_rate(),
+            log_batch_size: pcs_batch_for(&union2, pf),
+            profile: pf,
+            num_lanes: union2.commit_lanes(pcs_batch_for(&union2, pf)),
             merkle_hash: HashKind::Blake3,
         };
         let b3_r1cs2 = blake3::build_block_r1cs(nu2);
         let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
         let swap_r1cs2 = SwapTable::build_block_r1cs(nu2);
         let swap_lc2 = swap_r1cs2.csc_lincheck_circuit();
-        let spread_w2 = t0.spread_w.max(t1.spread_w);
         let spread_ty2 = BitSpreadTable::new(spread_w2);
         let spread_r1cs2 = spread_ty2.build_block_r1cs(nu2);
         let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
@@ -18489,22 +18601,32 @@ fn build_node_outer_app(
         // When the children carry an app block: left.h_end == right.h_start
         // as four copy constraints (both children's publics are witness
         // wires here), and the combined span publishes as THIS node's block.
-        let app_base = app_stmt.map(|off| {
+        // The adjacency connects happen here; the PUBLISH of the combined
+        // span moves to the envelope's fixed tail block (below, with the
+        // padding) so its offset is level-independent. Off-envelope it
+        // publishes inline, exactly as before.
+        let app_w: Option<Vec<Wire>> = app_stmt.map(|off| {
             for j in 0..4 {
                 sb.connect(
                     r0.child_pub_w[off + 4 + j],
                     r1.child_pub_w[off + j],
                 );
             }
-            let base = sb.public_len();
-            for j in 0..4 {
-                sb.publish(r0.child_pub_w[off + j]);
-            }
-            for j in 0..4 {
-                sb.publish(r1.child_pub_w[off + 4 + j]);
-            }
-            base
+            (0..4)
+                .map(|j| r0.child_pub_w[off + j])
+                .chain((0..4).map(|j| r1.child_pub_w[off + 4 + j]))
+                .collect()
         });
+        let app_inline = match &env {
+            Some(_) => None,
+            None => app_w.as_ref().map(|v| {
+                let base = sb.public_len();
+                for &w in v {
+                    sb.publish(w);
+                }
+                base
+            }),
+        };
         // ---- the LANE fold region, in-circuit: priors-only, every prior
         // surface WIRED to the child's published accumulator claim (a
         // prior's surface IS what the child published — the child_pub_w
@@ -18631,9 +18753,22 @@ fn build_node_outer_app(
         // segment length the leaf does. The tail-anchor assert below walks
         // the REAL segment end, recorded pre-pad.
         let prepad_publics2 = sb.public_len();
-        if let Some(e) = &env {
-            pad_envelope_counts(&mut sb, &cs.q, &cs.env_cache(), e, zw, &mut hints, &mut vals);
-        }
+        let app_base = match &env {
+            Some(e) => {
+                pad_envelope_counts(
+                    &mut sb,
+                    &cs.q,
+                    &cs.env_cache(),
+                    e,
+                    zw,
+                    &mut hints,
+                    &mut vals,
+                    app_w.as_deref(),
+                );
+                app_w.as_ref().map(|_| env_app_base(e))
+            }
+            None => app_inline,
+        };
         let shape2 = sb.finish().expect("the 2->1 node circuit builds");
         assert!(
             shape2.circuit.cells().slots().len() <= 512,
@@ -18851,7 +18986,9 @@ fn build_node_outer_app(
                 .as_ref()
                 .map(|&(b, w, _)| b + w)
                 .unwrap_or(
-                    fold_pub_base + tail_len + if app_base.is_some() { 8 } else { 0 },
+                    fold_pub_base
+                        + tail_len
+                        + if app_inline.is_some() { ENV_APP_WORDS } else { 0 },
                 );
             assert_eq!(
                 seg_end, prepad_publics2,
@@ -19112,6 +19249,33 @@ fn internal_node_over_two_fl_nodes() {
         fl0.lo.shape.circuit.digest(),
         "the internal accumulator keys by the FL circuit"
     );
+    // **TASK 7b's PIN: an FL node and an internal node are ONE ENVELOPE.**
+    // Same registry digest (wall 2), same declared count vector (counts*),
+    // same public-segment length with the app block at the same fixed
+    // offset (publics*) — so a parent's walk cannot tell an FL child from an
+    // internal child, which is what makes one internal circuit serve every
+    // level above the first.
+    if envelope_shape().is_some() {
+        assert_eq!(
+            fl0.lo.shape.registry.digest(),
+            node.shape.registry.digest(),
+            "FL and internal share ONE envelope registry"
+        );
+        assert_eq!(
+            fl0.lo.shape.counts, node.shape.counts,
+            "FL and internal declare ONE count vector"
+        );
+        assert_eq!(
+            fl0.lo.public.len(),
+            node.public.len(),
+            "FL and internal share ONE public-segment length"
+        );
+        assert_eq!(
+            app, fl0.stmt_base,
+            "the app block sits at the envelope's fixed offset for BOTH child kinds"
+        );
+        assert_eq!(fl0.lo.pcs.m, node.pcs.m, "one dense floor m*");
+    }
     println!(
         "\nINTERNAL NODE over two first-level nodes (app-statement plumbed)\n  \
          span: H^{}(h_start) | internal outer: nu {} | mu {} | publics {} | proof {:.1} KiB\n",
@@ -19120,6 +19284,93 @@ fn internal_node_over_two_fl_nodes() {
         node.shape.circuit.cells().mu(),
         node.public.len(),
         bincode::serialize(&node.proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
+    );
+}
+
+/// **TASK 7b's HEADLINE: ONE INTERNAL CIRCUIT, EVERY LEVEL.** Eight chain
+/// segments → four first-level nodes → two internal nodes → one THIRD-level
+/// node, and the level-3 circuit digest EQUALS the level-2 one: once the FL
+/// node is envelope-shaped (nu*, counts*, publics*, m*, the app block at
+/// `env_app_base`), a parent's walk cannot tell an FL child from an internal
+/// child, so the same circuit serves both — the tower is depth-unbounded in
+/// SHAPE.
+///
+/// The accumulator LANES are deliberately out of scope here (`lane: None`):
+/// threading them across levels needs the children's published accumulator
+/// claims at a FIXED envelope offset too (the app block's treatment applied
+/// to the fold blocks), plus the FL-vs-internal sigma key pair. This test
+/// isolates the shape claim, which is what the envelope is for.
+#[test]
+#[ignore] // Heavy — eight chain proofs and seven outers.
+fn chain_tower_three_levels_one_internal_digest() {
+    // 256: the registered Ligerito configs floor at m22, and a 128-block
+    // chain commits at m21.
+    let n_blocks = 256usize;
+    let mut rng = Rng(0xC4A1_000B);
+    let h0: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let mut cps = Vec::new();
+    let mut h = h0;
+    for _ in 0..8 {
+        let cp = build_chain_proof(h, n_blocks);
+        h = cp.h_end;
+        cps.push(cp);
+    }
+    let fls: Vec<FlNode> = (0..4).map(|i| build_fl_node(&cps[2 * i], &cps[2 * i + 1])).collect();
+    let app_fl = fls[0].stmt_base;
+    for f in &fls {
+        assert_eq!(f.stmt_base, app_fl, "one FL app offset");
+        assert_eq!(
+            f.lo.shape.circuit.digest(),
+            fls[0].lo.shape.circuit.digest(),
+            "one FL circuit digest"
+        );
+    }
+    let (n0, _a0, _t0, app0, _) =
+        build_node_outer_app(&fls[0].lo, &fls[1].lo, Some(app_fl), None);
+    let (n1, _a1, _t1, app1, _) =
+        build_node_outer_app(&fls[2].lo, &fls[3].lo, Some(app_fl), None);
+    let app0 = app0.expect("level-2 app block");
+    assert_eq!(app0, app1.expect("level-2 app block"), "one L2 app offset");
+    assert_eq!(
+        n0.shape.circuit.digest(),
+        n1.shape.circuit.digest(),
+        "one level-2 circuit digest"
+    );
+
+    // THE STEP THAT MATTERS: an internal node over two INTERNAL children.
+    let (n2, _a2, _t2, app2, _) = build_node_outer_app(&n0, &n1, Some(app0), None);
+    let app2 = app2.expect("level-3 app block");
+    assert_eq!(
+        n2.shape.circuit.digest(),
+        n0.shape.circuit.digest(),
+        "ONE internal circuit digest at level 3 as at level 2 — depth-unbounded shape"
+    );
+    assert_eq!(app2, app0, "the app block never moves");
+
+    // The statement rode all three levels: the root span is the whole chain.
+    let h_end = native_chain(&h0, 8 * n_blocks);
+    for j in 0..4 {
+        assert_eq!(
+            n2.public[app2 + j],
+            pack4(h0[4 * j..4 * j + 4].try_into().unwrap()),
+            "root h_start"
+        );
+        assert_eq!(
+            n2.public[app2 + 4 + j],
+            pack4(h_end[4 * j..4 * j + 4].try_into().unwrap()),
+            "root h_end == H^N(h_start)"
+        );
+    }
+    println!(
+        "\nTHREE-LEVEL CHAIN TOWER (8 chains -> 4 FL -> 2 internal -> 1)\n  \
+         span H^{}(h_start) | L2 digest == L3 digest | app at fixed offset {}\n  \
+         internal outer: nu {} | mu {} | publics {} | proof {:.1} KiB\n",
+        8 * n_blocks,
+        app2,
+        n2.shape.circuit.cells().nu(),
+        n2.shape.circuit.cells().mu(),
+        n2.public.len(),
+        bincode::serialize(&n2.proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
     );
 }
 
