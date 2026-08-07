@@ -19309,6 +19309,145 @@ fn chain_tower_e2e_with_lane() {
     );
 }
 
+/// **Task 7a: THE M32 HEADLINE.** The chain tower at the THROUGHPUT-OPTIMAL
+/// leaf size: 4 chain segments of `CHAIN_BLOCKS` (default 2^18 = 262,144)
+/// compressions each — fast profile, ~16.8 MB hashed per leaf — through
+/// two first-level nodes and one internal node with the lane, timed per
+/// phase. The statement: h_end == H^(4·2^18)(h_start) ≈ one million
+/// sequential compressions, proven and folded to one recursable proof.
+/// Warm-box numbers; the cold certification wants the reboot + probe
+/// ritual first (the recorded discipline).
+#[test]
+#[ignore] // The headline measurement — run explicitly with --nocapture.
+fn chain_tower_m32_headline() {
+    use flock_core::aggregate;
+
+    let n_blocks: usize = std::env::var("CHAIN_BLOCKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1 << 18);
+    let mut rng = Rng(0xC4A1_0008);
+    let h0: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+
+    // The sequential phase (the VDF delay): the chain values themselves.
+    let t0 = std::time::Instant::now();
+    let h_all = native_chain(&h0, 4 * n_blocks);
+    let chain_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+    // The leaves, timed individually (parallelizable in deployment).
+    let mut leaf_ms: Vec<f64> = Vec::new();
+    let mut mk = |start: [u32; 16]| -> ChainProof {
+        let t = std::time::Instant::now();
+        let cp = build_chain_proof(start, n_blocks);
+        leaf_ms.push(t.elapsed().as_secs_f64() * 1e3);
+        cp
+    };
+    let cp0 = mk(h0);
+    let cp1 = mk(cp0.h_end);
+    let cp2 = mk(cp1.h_end);
+    let cp3 = mk(cp2.h_end);
+    assert_eq!(cp3.h_end, h_all, "the four segments ARE the chain");
+
+    let t_fl = std::time::Instant::now();
+    let fl0 = build_fl_node(&cp0, &cp1);
+    let fl1 = build_fl_node(&cp2, &cp3);
+    let fl_ms = t_fl.elapsed().as_secs_f64() * 1e3 / 2.0;
+
+    let chain_registry = &cp0.inner.built.shape.registry;
+    let blake_r1cs = blake3::build_block_r1cs(cp0.inner.nu);
+    let blake_lc = blake_r1cs.csc_lincheck_circuit();
+    let chain_mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
+    let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
+    let lane = ChainLane {
+        registry: chain_registry,
+        mats: &chain_mats,
+        circs: &chain_circs,
+        circuit: &cp0.inner.built.shape.circuit,
+        priors: [&fl0.acc, &fl1.acc],
+        claims_base: fl0.fold_pub_base,
+    };
+    let t_in = std::time::Instant::now();
+    let (node, acc, nt, app, lane_acc) =
+        build_node_outer_app(&fl0.lo, &fl1.lo, Some(fl0.stmt_base), Some(lane));
+    let internal_ms = t_in.elapsed().as_secs_f64() * 1e3;
+    let app = app.expect("app block");
+    let lane_acc = lane_acc.expect("lane");
+
+    // The root.
+    let t_root = std::time::Instant::now();
+    for j in 0..4 {
+        assert_eq!(
+            node.public[app + 4 + j],
+            pack4(h_all[4 * j..4 * j + 4].try_into().unwrap()),
+            "root statement: h_end == H^(4·{n_blocks})(h_start)"
+        );
+    }
+    assert!(lane_acc.discharge(&chain_mats) && lane_acc.discharge_sigma(&cp0.inner.built.shape.circuit));
+    let mut mats_ord = vec![
+        (fl0.lo.b3_slot, (&fl0.lo.b3_r1cs.a_0, &fl0.lo.b3_r1cs.b_0)),
+        (fl0.lo.swap_slot, (&fl0.lo.swap_r1cs.a_0, &fl0.lo.swap_r1cs.b_0)),
+        (
+            fl0.lo.spread_slot,
+            (&fl0.lo.spread_r1cs.a_0, &fl0.lo.spread_r1cs.b_0),
+        ),
+    ];
+    mats_ord.sort_by_key(|&(i, _)| i);
+    let fl_mats: Vec<_> = mats_ord.iter().map(|&(_, m)| m).collect();
+    let fl_el_mats: Vec<_> = fl0
+        .lo
+        .shape
+        .registry
+        .element_types()
+        .iter()
+        .map(|t| {
+            let e = t.element_type().expect("element table");
+            (e.a_0(), e.b_0())
+        })
+        .collect();
+    assert!(
+        acc.discharge(&fl_mats)
+            && acc.discharge_element(&fl_el_mats)
+            && acc.discharge_sigma(&fl0.lo.shape.circuit)
+    );
+    let root_ms = t_root.elapsed().as_secs_f64() * 1e3;
+
+    let total_compr = 4 * n_blocks;
+    let leaf_med = {
+        let mut v = leaf_ms.clone();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
+    // Recursion cost per leaf ≈ half an FL node + a quarter internal (this
+    // 2-level tree); deployment amortizes ~1 node per leaf.
+    let per_leaf = leaf_med + fl_ms / 2.0 + internal_ms / 4.0;
+    println!(
+        "\nCHAIN TOWER M32 HEADLINE (warm box — cold cert. owed post-reboot)\n  \
+         {} compressions/leaf x 4 leaves = {} total ({:.1} MB hashed)\n  \
+         sequential chain compute (the VDF delay): {:.0} ms\n  \
+         leaf proves: {:?} ms (median {:.0})\n  \
+         FL node (incl. tapes+build+prove, per node): {:.0} ms\n  \
+         internal node (incl. tapes+build+prove): {:.0} ms | prove alone {:.0} ms\n  \
+         root (discharges + statement): {:.1} ms\n  \
+         PER-LEAF amortized (leaf + fl/2 + internal/4): {:.0} ms -> {:.0}k compressions/sec system\n  \
+         internal outer: nu {} | mu {} | proof {:.1} KiB\n",
+        n_blocks,
+        total_compr,
+        (total_compr * 64) as f64 / 1e6,
+        chain_ms,
+        leaf_ms.iter().map(|v| v.round()).collect::<Vec<_>>(),
+        leaf_med,
+        fl_ms,
+        internal_ms,
+        nt.prove_ms,
+        root_ms,
+        per_leaf,
+        n_blocks as f64 / per_leaf,
+        node.shape.circuit.cells().nu(),
+        node.shape.circuit.cells().mu(),
+        bincode::serialize(&node.proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
+    );
+}
+
 /// Isolate the RecordingChallenger's overhead on the tape construction's
 /// exact workload: the deferred verify of an L1-node child, bare vs
 /// recorded, `L2_RUNS` runs each (default 10). The domain must be the
