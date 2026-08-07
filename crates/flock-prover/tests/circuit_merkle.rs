@@ -19338,6 +19338,77 @@ fn chain_tower_e2e_with_lane() {
     );
 }
 
+/// Attribution probe for the chain leaf's prove: build the SAME m32 leaf
+/// `LEAF_RUNS` times (fresh statement each run) and print the phase split;
+/// run with `PCS_TRACE=1` for the prover's own internal breakdown. The
+/// batch bench (`blake3_proof`, no wiring) is the comparison floor.
+#[test]
+#[ignore] // Measurement probe — run explicitly with --nocapture.
+fn chain_leaf_prove_probe() {
+    let n_blocks: usize = std::env::var("CHAIN_BLOCKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1 << 18);
+    let runs: usize = std::env::var("LEAF_RUNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    let mut rng = Rng(0xC4A1_0009);
+    for r in 0..runs {
+        let h: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+        let cp = build_chain_proof(h, n_blocks);
+        println!(
+            "RUN {r}: build {:.0} ms | witgen {:.0} ms | prove {:.0} ms",
+            cp.t.0, cp.t.1, cp.t.2
+        );
+    }
+    // The CONTROL: a UNION batch proof (same table, same size, NO wiring)
+    // — separates the union-transport tax from the wiring tax. Same
+    // blake3/blake3 config as the chain leaf. CAVEAT: the control's prove
+    // TOTAL includes a ~570 ms prebuilt-witness copy (this probe hands the
+    // union a materialized batch witness — the recorded prebuilt-driver
+    // lesson); compare the PCS_TRACE ITEMIZED phases, not the total.
+    let nu = n_blocks.trailing_zeros() as usize;
+    let blake_r1cs = blake3::build_block_r1cs(nu);
+    let blake_lc = blake_r1cs.csc_lincheck_circuit();
+    let registry = flock_prover::schedule::Registry::new(
+        vec![TableType::from_block_r1cs(&blake_r1cs).with_io_schema(blake3::io_schema())],
+        nu,
+    );
+    let union = UnionInstance::new(&registry, vec![n_blocks]);
+    let pcs = PcsParams {
+        m: union.dense_m(),
+        log_inv_rate: 1,
+        log_batch_size: pcs_batch(&union),
+        profile: LigeritoProfile::Fast,
+        num_lanes: union.commit_lanes(pcs_batch(&union)),
+        merkle_hash: HashKind::Blake3,
+    };
+    for r in 0..runs {
+        let inputs: Vec<blake3::Compression> = (0..n_blocks)
+            .map(|_| {
+                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                (cv, m, 0u64, 64u32, CHAIN_FLAGS)
+            })
+            .collect();
+        let wit = blake3::generate_witness_batch_major(&inputs, nu);
+        let t = std::time::Instant::now();
+        let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
+        let (p, _, _) = prover::prove_fast_ligerito_union(
+            &union,
+            &pcs,
+            vec![UnionSlotProverInput::new(wit, blake_lc)],
+            &mut ch,
+        );
+        println!(
+            "CONTROL {r} (union batch, no wiring): prove {:.0} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+        std::hint::black_box(&p);
+    }
+}
+
 /// **Task 7a: THE M32 HEADLINE.** The chain tower at the THROUGHPUT-OPTIMAL
 /// leaf size: 4 chain segments of `CHAIN_BLOCKS` (default 2^18 = 262,144)
 /// compressions each — fast profile, ~16.8 MB hashed per leaf — through
