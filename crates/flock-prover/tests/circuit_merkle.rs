@@ -459,6 +459,74 @@ fn pad_envelope_counts(
     assert!(over.is_empty(), "counts* overshoot: {}", over.join(", "));
 }
 
+// ---------------------------------------------------------------------------
+// THE BENCHMARK CONTRACT: what a proof costs ONLINE.
+//
+// ONLINE is per-STATEMENT work — everything a prover pays again for the
+// next segment of the chain, the next pair of children:
+//
+//   walk    the circuit's evaluation over this statement (for a chain leaf
+//           this IS the sequential hashing; reported apart from proving)
+//   tapes   the child tape sources: recorded DEFERRED child verifies, the
+//           production statement work (the pin/locate/replica scaffolding
+//           around them in these tests is not this — it is per shape)
+//   witgen  witness/trace generation and packing into the union's blocks
+//   prove
+//
+// SETUP is per-SHAPE and cacheable, so it is timed separately and never
+// folded into a per-proof number: the circuit emit+finish, the R1CS tables,
+// the union and PCS params, the fill plan, the tape pins. A shape is
+// statement-independent (the digest pins say so), so a production prover
+// pays it once per level and then never again.
+#[derive(Clone, Copy, Default)]
+struct Online {
+    setup_ms: f64,
+    walk_ms: f64,
+    tapes_ms: f64,
+    witgen_ms: f64,
+    prove_ms: f64,
+    verify_ms: f64,
+}
+
+impl Online {
+    /// The per-proof online total: the prover's cost, walk included.
+    fn total(&self) -> f64 {
+        self.walk_ms + self.tapes_ms + self.witgen_ms + self.prove_ms
+    }
+}
+
+fn median_of(runs: &[Online], f: impl Fn(&Online) -> f64) -> f64 {
+    let mut v: Vec<f64> = runs.iter().map(&f).collect();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v[v.len() / 2]
+}
+
+fn median_total(runs: &[Online]) -> f64 {
+    median_of(runs, |o| o.total())
+}
+
+/// One stage's ONLINE line: per-phase medians, the total's median and
+/// range, then the per-SHAPE setup for reference. Medians, not means —
+/// the first run of any stage pays first-touch allocator costs that are
+/// warmup, not marginal cost (the recorded L2 lesson).
+fn report_stage(name: &str, runs: &[Online]) {
+    let mut tot: Vec<f64> = runs.iter().map(|o| o.total()).collect();
+    tot.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    println!(
+        "    {name:9} walk {:6.1} + tapes {:5.1} + witgen {:5.1} + prove {:7.1} \
+         = {:7.1} ms [{:.1}-{:.1}] | verify {:4.1} | (setup {:.0})",
+        median_of(runs, |o| o.walk_ms),
+        median_of(runs, |o| o.tapes_ms),
+        median_of(runs, |o| o.witgen_ms),
+        median_of(runs, |o| o.prove_ms),
+        tot[tot.len() / 2],
+        tot[0],
+        tot[tot.len() - 1],
+        median_of(runs, |o| o.verify_ms),
+        median_of(runs, |o| o.setup_ms),
+    );
+}
+
 const DOMAIN: &[u8] = b"flock-circuit-merkle-v0";
 
 const CHUNK_START: u32 = 1 << 0;
@@ -11779,6 +11847,54 @@ fn native_chain(h_start: &[u32; 16], n_blocks: usize) -> [u32; 16] {
 
 /// The chain circuit alone (shared by the honest builder and the tamper
 /// legs): one b3 slot, message-chain wiring, the 11-word statement.
+/// The chain circuit's SHAPE, separated from the statement it runs on.
+/// The shape does not depend on `h_start` — that is the digest-determinism
+/// pin — so a chain prover builds this ONCE and pays only the per-segment
+/// walk afterwards. The split is also what makes a leaf's ONLINE cost
+/// measurable: the walk is per-statement (it computes the chain and
+/// materialises the rows), the shape is not.
+struct ChainShape {
+    shape: flock_core::circuit::builder::CircuitShape,
+    hash: flock_core::circuit::builder::SlotId,
+    nu: usize,
+}
+
+fn build_chain_shape(n_blocks: usize) -> ChainShape {
+    let nu = n_blocks.trailing_zeros() as usize;
+    assert_eq!(1usize << nu, n_blocks, "block count is a power of two");
+    let mut sb = ShapeBuilder::new(nu);
+    let hash = sb.slot(Blake3Gate { nu });
+    let cv = [sb.public_input(), sb.public_input()];
+    let params = sb.public_input();
+    let mut m: Vec<Wire> = (0..4).map(|_| sb.public_input()).collect();
+    let mut out = Vec::new();
+    for _ in 0..n_blocks {
+        let mut hash_in = vec![cv[0], cv[1]];
+        hash_in.extend_from_slice(&m);
+        hash_in.push(params);
+        out = sb.gate(hash, &hash_in);
+        m = out.clone();
+    }
+    for w in &out {
+        sb.publish(*w);
+    }
+    ChainShape {
+        shape: sb.finish().expect("the chain circuit builds"),
+        hash,
+        nu,
+    }
+}
+
+/// The statement a chain shape runs on, in declaration order: the IV pair,
+/// the params word, then `h_start`. (`h_end` is PUBLISHED, so it is the
+/// walk's output, not an input.)
+fn chain_vals(h_start: &[u32; 16]) -> Vec<F128> {
+    let iv = pack8(&IV);
+    let mut v = vec![iv[0], iv[1], pack_params(0, 64, CHAIN_FLAGS)];
+    v.extend((0..4).map(|j| pack4(h_start[4 * j..4 * j + 4].try_into().unwrap())));
+    v
+}
+
 fn build_chain_circuit(
     h_start: &[u32; 16],
     n_blocks: usize,
@@ -11786,29 +11902,15 @@ fn build_chain_circuit(
     flock_core::circuit::builder::BuiltCircuit,
     flock_core::circuit::builder::SlotId,
 ) {
-    let nu = n_blocks.trailing_zeros() as usize;
-    assert_eq!(1usize << nu, n_blocks, "block count is a power of two");
-    let mut b = CircuitBuilder::new(nu);
-    let hash = b.slot(Blake3Gate { nu });
-    let iv = pack8(&IV);
-    let cv = [b.public_value(iv[0]), b.public_value(iv[1])];
-    let params = b.public_value(pack_params(0, 64, CHAIN_FLAGS));
-    let mut m: Vec<Wire> = (0..4)
-        .map(|j| b.public_value(pack4(h_start[4 * j..4 * j + 4].try_into().unwrap())))
-        .collect();
-    let mut out = Vec::new();
-    for _ in 0..n_blocks {
-        let mut hash_in = vec![cv[0], cv[1]];
-        hash_in.extend_from_slice(&m);
-        hash_in.push(params);
-        out = b.gate(hash, &hash_in);
-        m = out.clone();
-    }
-    for w in &out {
-        b.publish(*w);
-    }
-    let built = b.finish().expect("the chain circuit builds");
-    (built, hash)
+    let cs = build_chain_shape(n_blocks);
+    let witness = cs.shape.run(&chain_vals(h_start), &[]);
+    (
+        flock_core::circuit::builder::BuiltCircuit {
+            shape: cs.shape,
+            witness,
+        },
+        cs.hash,
+    )
 }
 
 /// The chain-PoC leaf, end to end: FAST profile (the B-fast decision),
@@ -11821,18 +11923,27 @@ struct ChainProof {
     inner: MixedInner,
     h_start: [u32; 16],
     h_end: [u32; 16],
-    /// (circuit build ms — per SHAPE, cacheable; witgen ms; prove ms) —
-    /// the ONLINE leaf cost is witgen + prove (+ the sequential chain
-    /// compute itself, which the builder's eval walk performs).
-    t: (f64, f64, f64),
+    /// What the leaf cost, split SETUP vs ONLINE — see [`Online`].
+    t: Online,
 }
 
+/// A chain leaf. The SHAPE build is per-shape setup (statement-independent
+/// — the digest pin), the WALK is per-statement and is the chain compute
+/// itself, so it is reported apart from the proving phases.
 fn build_chain_proof(h_start: [u32; 16], n_blocks: usize) -> ChainProof {
+    let t_shape = std::time::Instant::now();
+    let cs = build_chain_shape(n_blocks);
+    let shape_ms = t_shape.elapsed().as_secs_f64() * 1e3;
+    let (nu, hash) = (cs.nu, cs.hash);
     let t0 = std::time::Instant::now();
-    let (built, hash) = build_chain_circuit(&h_start, n_blocks);
-    let build_ms = t0.elapsed().as_secs_f64() * 1e3;
-    let nu = n_blocks.trailing_zeros() as usize;
+    let witness = cs.shape.run(&chain_vals(&h_start), &[]);
+    let walk_ms = t0.elapsed().as_secs_f64() * 1e3;
+    let built = flock_core::circuit::builder::BuiltCircuit {
+        shape: cs.shape,
+        witness,
+    };
 
+    let t_setup = std::time::Instant::now();
     let union = UnionInstance::new(&built.shape.registry, built.shape.counts.clone());
     assert!(!union.has_element(), "a chain proof is boolean-only");
     let pcs_params = PcsParams {
@@ -11845,6 +11956,7 @@ fn build_chain_proof(h_start: [u32; 16], n_blocks: usize) -> ChainProof {
     };
     let blake_r1cs = blake3::build_block_r1cs(nu);
     let blake_lc = blake_r1cs.csc_lincheck_circuit();
+    let setup_ms = shape_ms + t_setup.elapsed().as_secs_f64() * 1e3;
     let t1 = std::time::Instant::now();
     let wit = blake3::generate_witness_batch_major_partial(built.rows::<Blake3Gate>(hash), nu);
     let witgen_ms = t1.elapsed().as_secs_f64() * 1e3;
@@ -11913,7 +12025,13 @@ fn build_chain_proof(h_start: [u32; 16], n_blocks: usize) -> ChainProof {
         },
         h_start,
         h_end,
-        t: (build_ms, witgen_ms, prove_ms),
+        t: Online {
+            setup_ms,
+            walk_ms,
+            witgen_ms,
+            prove_ms,
+            ..Online::default()
+        },
     }
 }
 
@@ -12145,10 +12263,9 @@ struct FlNode {
     fold_pub_base: usize,
     h_start: [u32; 16],
     h_end: [u32; 16],
-    /// (tape-source verifies ms — ONLINE; circuit emit+finish ms — per
-    /// SHAPE; witgen/run ms — ONLINE; prove ms — ONLINE; verify ms).
+    /// What the FL cost, split SETUP vs ONLINE — see [`Online`].
     /// Everything else in the builder is pin/check scaffolding.
-    t: (f64, f64, f64, f64, f64),
+    t: Online,
 }
 
 /// **THE FIRST-LEVEL NODE.** Two ADJACENT chain proofs (the right segment
@@ -12676,6 +12793,11 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         let spread_ty2 = BitSpreadTable::new(spread_w2);
         let spread_r1cs2 = spread_ty2.build_block_r1cs(nu2);
         let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
+        // Everything from here to the prove is WITNESS ASSEMBLY — packing
+        // the walk's rows into the union's slot inputs. It is per-statement
+        // (online), so it gets its own timer rather than hiding inside the
+        // shape build or the prove.
+        let t_asm = std::time::Instant::now();
         let mut el_ord: Vec<(usize, Vec<F128>)> = cs
             .element_slot_ids()
             .into_iter()
@@ -12736,6 +12858,7 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         lco.sort_by_key(|(i, _)| *i);
         let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
             lco.into_iter().map(|(_, c)| c).collect();
+        let asm_ms = t_asm.elapsed().as_secs_f64() * 1e3;
         let t_prove = std::time::Instant::now();
         let mut ch2 = FsChallenger::with_chained_blake3(DOMAIN);
         let (oproof, ocommit, _) = prover::prove_fast_ligerito_union_circuit(
@@ -12786,7 +12909,14 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
             fold_pub_base,
             h_start: cp0.h_start,
             h_end: cp1.h_end,
-            t: (tape_verify_ms, build_ms, run_ms, prove_ms, verify_ms2),
+            t: Online {
+                setup_ms: build_ms,
+                tapes_ms: tape_verify_ms,
+                walk_ms: run_ms,
+                witgen_ms: asm_ms,
+                prove_ms,
+                verify_ms: verify_ms2,
+            },
         }
     }
 }
@@ -18027,21 +18157,11 @@ fn record_child_verify(lo: &LeafOuter, domain: &'static [u8]) {
     .expect("the child verifies (recorded)");
 }
 
-/// Per-proof timing breakdown of one node build — the repeatable costs
-/// (the amortizable circuit-shape build is excluded; it's printed as
-/// `build` in the node's own breakdown line).
-struct NodeTimings {
-    tapes_ms: f64,
-    trace_ms: f64,
-    asm_ms: f64,
-    prove_ms: f64,
-    verify_ms: f64,
-}
 
 fn build_node_outer(
     lo0: &LeafOuter,
     lo1: &LeafOuter,
-) -> (LeafOuter, flock_core::aggregate::Accumulator, NodeTimings) {
+) -> (LeafOuter, flock_core::aggregate::Accumulator, Online) {
     let (lo, acc, t, _, _) = build_node_outer_app(lo0, lo1, None, None);
     (lo, acc, t)
 }
@@ -18079,7 +18199,7 @@ fn build_node_outer_app(
 ) -> (
     LeafOuter,
     flock_core::aggregate::Accumulator,
-    NodeTimings,
+    Online,
     Option<usize>,
     Option<flock_core::aggregate::Accumulator>,
 ) {
@@ -19275,10 +19395,11 @@ fn build_node_outer_app(
                 spread_slot: spread_slot2,
             },
             acc_v,
-            NodeTimings {
+            Online {
+                setup_ms: build_ms,
+                walk_ms: trace_ms,
                 tapes_ms,
-                trace_ms,
-                asm_ms,
+                witgen_ms: asm_ms,
                 prove_ms,
                 verify_ms,
             },
@@ -19790,8 +19911,8 @@ fn chain_leaf_prove_probe() {
         let h: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
         let cp = build_chain_proof(h, n_blocks);
         println!(
-            "RUN {r}: build {:.0} ms | witgen {:.0} ms | prove {:.0} ms",
-            cp.t.0, cp.t.1, cp.t.2
+            "RUN {r}: setup {:.0} ms | walk {:.0} | witgen {:.0} | prove {:.0} ms",
+            cp.t.setup_ms, cp.t.walk_ms, cp.t.witgen_ms, cp.t.prove_ms
         );
     }
     // The CONTROL: a UNION batch proof (same table, same size, NO wiring)
@@ -19942,64 +20063,152 @@ fn chain_tower_m32_headline() {
     let root_ms = t_root.elapsed().as_secs_f64() * 1e3;
 
     let total_compr = 4 * n_blocks;
-    // ---- the SETUP / ONLINE split (the honest accounting) ----
-    // SETUP = per-SHAPE, cacheable: circuit builds (statement-independent,
-    // digest-pinned) + the builders' pin/check scaffolding (everything not
-    // itemized below). ONLINE = per proof: leaf witgen + prove; FL
-    // tape-source verifies + witgen/run + prove; internal per NodeTimings
-    // (its tapes item is RealTape's constructor — scaffolding-inclusive,
-    // production is ~verify + parse per the recorded probe).
-    let mut leaf_online: Vec<f64> = [&cp0, &cp1, &cp2, &cp3]
-        .iter()
-        .map(|c| c.t.1 + c.t.2)
-        .collect();
-    leaf_online.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let leaf_on = leaf_online[leaf_online.len() / 2];
-    let leaf_prove = cp0.t.2.min(cp1.t.2).min(cp2.t.2).min(cp3.t.2);
-    let fl_online = (fl0.t.0 + fl0.t.2 + fl0.t.3 + fl1.t.0 + fl1.t.2 + fl1.t.3) / 2.0;
-    let internal_online = nt.tapes_ms + nt.trace_ms + nt.asm_ms + nt.prove_ms;
-    let per_leaf_online = leaf_on + fl_online / 2.0 + internal_online / 4.0;
+    // ---- SETUP vs ONLINE, per the contract on `Online` ----
+    let leaves: Vec<Online> = [&cp0, &cp1, &cp2, &cp3].iter().map(|c| c.t).collect();
+    let fl_t: Vec<Online> = [&fl0, &fl1].iter().map(|f| f.t).collect();
+    let leaf_on = median_total(&leaves);
+    let fl_on = median_total(&fl_t);
+    let internal_on = nt.total();
+    // A balanced tree over L leaves carries L/2 first-level nodes and
+    // L/2 − 1 internal ones, so a leaf's amortised share tends to
+    // leaf + FL/2 + internal/2; at four leaves the internal share is /4.
+    let per_leaf_online = leaf_on + fl_on / 2.0 + internal_on / 4.0;
     println!(
         "\nCHAIN TOWER M32 HEADLINE (warm box — cold cert. owed post-reboot)\n  \
          {} compressions/leaf x 4 leaves = {} total ({:.1} MB hashed)\n  \
          sequential chain compute (the VDF delay, inherent): {:.0} ms\n  \
-         SETUP (per shape, cacheable):\n    \
-         chain circuit build {:.0} ms (incl. the eval walk = the chain compute)\n    \
-         FL circuit emit+finish {:.0} ms | builder scaffolding = the rest of the wall time\n  \
-         ONLINE (per proof):\n    \
-         leaf: witgen {:.0} + prove {:.0} = {:.0} ms (best prove {:.0})\n    \
-         FL node: tape-source verifies {:.0} + witgen/run {:.0} + prove {:.0} = {:.0} ms | verify {:.1}\n    \
-         internal: tapes {:.0} + trace {:.0} + asm {:.0} + prove {:.0} = {:.0} ms | verify {:.1}\n    \
-         root (both lanes + statement): {:.1} ms\n  \
-         PER-LEAF ONLINE (leaf + fl/2 + internal/4): {:.0} ms -> {:.0}k compressions/sec system\n  \
-         internal outer: nu {} | mu {} | proof {:.1} KiB\n",
+         ONLINE per proof (setup is per-SHAPE and excluded — see `Online`):",
         n_blocks,
         total_compr,
         (total_compr * 64) as f64 / 1e6,
         chain_ms,
-        cp0.t.0,
-        (fl0.t.1 + fl1.t.1) / 2.0,
-        cp0.t.1,
-        cp0.t.2,
-        leaf_on,
-        leaf_prove,
-        (fl0.t.0 + fl1.t.0) / 2.0,
-        (fl0.t.2 + fl1.t.2) / 2.0,
-        (fl0.t.3 + fl1.t.3) / 2.0,
-        fl_online,
-        (fl0.t.4 + fl1.t.4) / 2.0,
-        nt.tapes_ms,
-        nt.trace_ms,
-        nt.asm_ms,
-        nt.prove_ms,
-        internal_online,
-        nt.verify_ms,
+    );
+    report_stage("leaf", &leaves);
+    report_stage("FL", &fl_t);
+    report_stage("internal", std::slice::from_ref(&nt));
+    println!(
+        "    root (both lanes + statement): {:.1} ms\n  \
+         PER-LEAF ONLINE (leaf + FL/2 + internal/4): {:.0} ms -> {:.0}k compressions/sec\n  \
+         internal outer: nu {} | mu {} | proof {:.1} KiB\n",
         root_ms,
         per_leaf_online,
         n_blocks as f64 / per_leaf_online,
         node.shape.circuit.cells().nu(),
         node.shape.circuit.cells().mu(),
         bincode::serialize(&node.proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
+    );
+}
+
+/// **THE ONLINE BENCH: leaf, first-level node, internal node.** One number
+/// per stage, measuring only what a prover pays PER STATEMENT — the walk,
+/// the child tape sources, witness assembly, and the prove. Per-SHAPE setup
+/// (circuit emit+finish, R1CS tables, PCS params, the fill plan, the tape
+/// pins) is timed but reported apart and never folded into a per-proof
+/// number: a shape is statement-independent, so a production prover builds
+/// it once per level and reuses it for every segment.
+///
+/// Each stage is measured by re-running its builder `BENCH_RUNS` times over
+/// FIXED inputs and taking per-phase MEDIANS — the first run of any stage
+/// pays first-touch allocator costs that are warmup, not marginal cost.
+/// The builders' pin/locate/replica scaffolding runs on every iteration and
+/// costs wall time, but it is not inside any timer here.
+///
+/// Knobs: `BENCH_RUNS` (default 3), `CHAIN_BLOCKS` (default 256 — set
+/// 262144 for the m32 production leaf), `TOWER_PROFILE=slim` for the
+/// envelope. BOX DISCIPLINE: run the stability probe first and reboot if it
+/// is far out of band — this box's benchmarks self-corrupt under sustained
+/// load, and nothing here can tell you that happened.
+#[test]
+#[ignore] // Benchmark — run explicitly with --nocapture.
+fn tower_online_bench() {
+    let runs: usize = std::env::var("BENCH_RUNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    let n_blocks: usize = std::env::var("CHAIN_BLOCKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256);
+    let mut rng = Rng(0xC4A1_00BE);
+    let h0: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+
+    // MEASUREMENT HYGIENE: each stage runs with only ITS OWN inputs
+    // resident. An m32 chain proof and an FL node are both large, and
+    // holding the whole tower alive while timing one stage inflates it
+    // through allocator and pool pressure — the leaf's spread read
+    // 639-1183 ms when the bench built everything up front. A production
+    // prover drops a child once it has been folded, so the stages are
+    // ordered to do the same.
+
+    // ---- LEAF: nothing else is alive yet ----
+    let leaf: Vec<Online> = (0..runs)
+        .map(|_| build_chain_proof(h0, n_blocks).t)
+        .collect();
+
+    // ---- FL: two chain children and nothing more ----
+    let cp0 = build_chain_proof(h0, n_blocks);
+    let cp1 = build_chain_proof(cp0.h_end, n_blocks);
+    let fl: Vec<Online> = (0..runs).map(|_| build_fl_node(&cp0, &cp1).t).collect();
+
+    // ---- INTERNAL: two FL children plus cp0 (the lane's chain materials).
+    // The right pair is built in a scope so it is dropped before timing.
+    let fl0 = build_fl_node(&cp0, &cp1);
+    let fl1 = {
+        let cp2 = build_chain_proof(cp1.h_end, n_blocks);
+        let cp3 = build_chain_proof(cp2.h_end, n_blocks);
+        build_fl_node(&cp2, &cp3)
+    };
+    drop(cp1);
+    // The lane is what production carries: the children's chain
+    // accumulators fold in a priors-only aggregate of their own.
+    let chain_registry = &cp0.inner.built.shape.registry;
+    let blake_r1cs = blake3::build_block_r1cs(cp0.inner.nu);
+    let blake_lc = blake_r1cs.csc_lincheck_circuit();
+    let chain_mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
+    let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
+    let internal: Vec<Online> = (0..runs)
+        .map(|_| {
+            build_node_outer_app(
+                &fl0.lo,
+                &fl1.lo,
+                Some(fl0.stmt_base),
+                Some(ChainLane {
+                    registry: chain_registry,
+                    mats: &chain_mats,
+                    circs: &chain_circs,
+                    circuit: &cp0.inner.built.shape.circuit,
+                    priors: [&fl0.acc, &fl1.acc],
+                    claims_base: fl0.fold_pub_base,
+                }),
+            )
+            .2
+        })
+        .collect();
+
+    let (leaf_on, fl_on, int_on) = (
+        median_total(&leaf),
+        median_total(&fl),
+        median_total(&internal),
+    );
+    // A balanced tree over L leaves carries L/2 first-level nodes and
+    // L/2 − 1 internal ones, so a leaf's amortised share tends to
+    // leaf + FL/2 + internal/2 as the tree deepens.
+    let per_leaf = leaf_on + fl_on / 2.0 + int_on / 2.0;
+    println!(
+        "\nONLINE BENCH — {n_blocks} compressions/leaf, {runs} runs/stage, profile {:?}\n  \
+         per-proof ONLINE (setup is per-SHAPE, shown for reference only):",
+        tower_profile(),
+    );
+    report_stage("leaf", &leaf);
+    report_stage("FL", &fl);
+    report_stage("internal", &internal);
+    println!(
+        "  AMORTISED per leaf (leaf + FL/2 + internal/2): {:.0} ms \
+         -> {:.0}k compressions/sec\n  \
+         the leaf's walk IS the chain compute — the application's own \
+         sequential work, not proving\n",
+        per_leaf,
+        n_blocks as f64 / per_leaf,
     );
 }
 
@@ -20088,34 +20297,14 @@ fn l2_node_bench() {
     let (n0, _acc0, _) = build_node_outer(&l0, &l1);
     let (n1, _acc1, _) = build_node_outer(&l2, &l3);
 
-    let mut proves: Vec<f64> = Vec::with_capacity(runs);
-    let mut totals: Vec<f64> = Vec::with_capacity(runs);
-    let mut verifies: Vec<f64> = Vec::with_capacity(runs);
-    for _ in 0..runs {
-        let (_n2, _acc2, t) = build_node_outer(&n0, &n1);
-        let total = t.tapes_ms + t.trace_ms + t.asm_ms + t.prove_ms;
-        println!(
-            "RUN l2 prove {:.1} | tapes {:.1} + trace {:.1} + asm {:.1} = total {:.1}",
-            t.prove_ms, t.tapes_ms, t.trace_ms, t.asm_ms, total
-        );
-        proves.push(t.prove_ms);
-        totals.push(total);
-        verifies.push(t.verify_ms);
-    }
-    proves.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    totals.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    verifies.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    println!(
-        "l2_node over {runs} runs: prove median {:.1} ms [{:.1}-{:.1}] | \
-         per-proof total median {:.1} ms [{:.1}-{:.1}] | verify median {:.1} ms",
-        proves[runs / 2],
-        proves[0],
-        proves[runs - 1],
-        totals[runs / 2],
-        totals[0],
-        totals[runs - 1],
-        verifies[runs / 2],
-    );
+    let runs_t: Vec<Online> = (0..runs)
+        .map(|_| {
+            let (_n2, _acc2, t) = build_node_outer(&n0, &n1);
+            t
+        })
+        .collect();
+    println!("\nL2 NODE — {runs} runs, per-proof ONLINE (setup is per-SHAPE):");
+    report_stage("l2 node", &runs_t);
 }
 
 /// **THE 2→1 RECURSION NODE** — see [`build_node_outer`], which carries the
