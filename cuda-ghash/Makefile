@@ -45,6 +45,20 @@ bench_sumcheck_ab: bench_sumcheck_ab.cu sumcheck_ab.cuh f128.cuh
 test_lincheck: test_lincheck.cu lincheck.cuh phi8_table.cuh ntt_host.hpp f128.cuh challenger.hpp
 	$(NVCC) $(NVCCFLAGS) test_lincheck.cu -o $@
 
+# Device eq builders vs the host reference builders (no Rust oracle: the host
+# builders are the reference the vector tests already check against).
+test_eq_builders: test_eq_builders.cu lincheck.cuh induce_sumcheck.cuh phi8_table.cuh ntt_host.hpp f128.cuh
+	$(NVCC) $(NVCCFLAGS) test_eq_builders.cu -o $@
+
+# Two-round lookahead vs one-round-per-pass, zerocheck multilinear chain.
+test_zerocheck_lookahead: test_zerocheck_lookahead.cu zerocheck_tail.cuh zerocheck_round2.cuh \
+                          sumcheck_ab.cuh zc_challenger_device.cuh sha256.cuh ntt_host.hpp f128.cuh
+	$(NVCC) $(NVCCFLAGS) test_zerocheck_lookahead.cu -o $@
+
+# Two-round lookahead vs one-round-per-pass, the open's fold chunk.
+test_fold_lookahead: test_fold_lookahead.cu sumcheck_ab.cuh ntt_host.hpp f128.cuh
+	$(NVCC) $(NVCCFLAGS) test_fold_lookahead.cu -o $@
+
 # Throughput for the lincheck kernels (on-device inputs, no oracle).
 bench_lincheck: bench_lincheck.cu lincheck.cuh phi8_table.cuh ntt_host.hpp f128.cuh
 	$(NVCC) $(NVCCFLAGS) bench_lincheck.cu -o $@
@@ -307,7 +321,8 @@ TEST_BINS = test_f128 test_commit_ntt test_sumcheck_ab test_lincheck \
             test_zerocheck_round2 test_zerocheck_full test_induce \
             test_introduce_glue test_commit_merkle test_sumcheck_prover \
             test_challenger test_merkle_open test_ligerito_l0 \
-            test_transpose_induce
+            test_transpose_induce test_eq_builders test_zerocheck_lookahead \
+            test_fold_lookahead
 
 .PHONY: build-tests run-tests
 build-tests: $(TEST_BINS)
@@ -319,4 +334,16 @@ build-tests: $(TEST_BINS)
 run-tests: test commit_ntt sumcheck_ab sumcheck_ab_ligerito lincheck \
            blake3_witness zerocheck_round1 zerocheck_tail zerocheck_round2 \
            zerocheck_full induce introduce_glue sumcheck_prover challenger \
-           merkle_open ligerito_l0
+           merkle_open ligerito_l0 eq_builders zerocheck_lookahead fold_lookahead
+
+# Self-checking equivalence tests: no Rust oracle to dump, they pin a fast path
+# to the slower reference path that the vector tests above already validate.
+.PHONY: eq_builders zerocheck_lookahead fold_lookahead
+eq_builders: test_eq_builders
+	./test_eq_builders
+
+zerocheck_lookahead: test_zerocheck_lookahead
+	./test_zerocheck_lookahead
+
+fold_lookahead: test_fold_lookahead
+	./test_fold_lookahead
