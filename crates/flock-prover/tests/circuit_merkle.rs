@@ -229,7 +229,13 @@ struct EnvTail<'w> {
 /// experiment, not the envelope).
 fn envelope_shape() -> Option<EnvShape> {
     (envelope_floor_m() == Some(29)).then(|| EnvShape {
-        nu: 15,
+        // 16, not 15: mac is ~97% per-child work (14,411 rows per child
+        // against 921 shared, measured by MAC_CENSUS) and already sat at
+        // 91% of 2^15 with two children, so any arity above 2 overflows it.
+        // 2^16 fits three children (44k) and four (59k). Measured cost of
+        // the step: +7.3 ms prove, zero proof bytes — the committed stack
+        // is content-derived, so dense_m does not move.
+        nu: 16,
         // 20 = the m32 FAST chain leaf's L0 depth (log_msg_cols 19 +
         // log_inv_rate 1), which the B-fast PoC's first-level node walks;
         // the m29 slim outer ladder needs only 19 and leaves the top
@@ -245,25 +251,25 @@ fn envelope_shape() -> Option<EnvShape> {
         // census, elementwise max of leaf/node usage). Only b3, le8, pf8
         // and mac are content-geometry-sensitive; everything else hits its
         // cap exactly (registry-shaped) and skn/skc are the leaf's.
-        counts_bool: [23700, 12250, 1060],
+        counts_bool: [26200, 12250, 1060],
         counts_el: [
-            (600, 30000), // mac — the nu* driver; watch the 2^15 ceiling
-            (500, 620),   // zcr
-            (400, 800),   // mrs
-            (0, 7500),    // spine
-            (601, 200),   // assist
+            (600, 49000), // mac — the nu* driver; watch the 2^15 ceiling
+            (500, 1000),  // zcr
+            (400, 900),   // mrs
+            (0, 9000),    // spine
+            (601, 300),   // assist
             (510, 64),    // skip-node (leaf-only usage)
             (511, 1),     // skip-close (leaf-only usage)
             (8, 4200),    // leaf-eval 8-lane
             (115, 900),   // resid pl 15 (the m32 chain ladder's level 0)
-            (112, 740),   // resid pl 12
-            (109, 500),   // resid pl 9
-            (106, 436),   // resid pl 6
-            (103, 300),   // resid pl 3
-            (100, 260),   // resid pl 0
-            (318, 10000), // prefix w 8
+            (112, 1100),  // resid pl 12
+            (109, 740),   // resid pl 9
+            (106, 560),   // resid pl 6
+            (103, 450),   // resid pl 3
+            (100, 400),   // resid pl 0
+            (318, 15000), // prefix w 8
         ],
-        publics: 3820,
+        publics: 5300,
     })
 }
 
@@ -18200,7 +18206,7 @@ fn build_node_outer(
     lo0: &LeafOuter,
     lo1: &LeafOuter,
 ) -> (LeafOuter, flock_core::aggregate::Accumulator, Online) {
-    let (lo, acc, t, _, _) = build_node_outer_app(lo0, lo1, None, None);
+    let (lo, acc, t, _, _) = build_node_outer_app(&[lo0, lo1], None, None);
     (lo, acc, t)
 }
 
@@ -18217,9 +18223,9 @@ struct ChainLane<'a> {
     circs: &'a [&'a dyn flock_core::lincheck::LincheckCircuit],
     /// The lane's sigma table owner (the chain circuit).
     circuit: &'a flock_core::circuit::Circuit,
-    priors: [&'a flock_core::aggregate::Accumulator; 2],
+    priors: &'a [&'a flock_core::aggregate::Accumulator],
     /// The published `[rho_col | rho_row | value]` fold blocks' base in
-    /// EACH child's public segment (both children share the layout).
+    /// EACH child's public segment (every child shares the layout).
     claims_base: usize,
 }
 
@@ -18230,8 +18236,7 @@ struct ChainLane<'a> {
 /// combined span as its OWN app block, returning that block's offset — so
 /// the output feeds the next level with the same plumbing.
 fn build_node_outer_app(
-    lo0: &LeafOuter,
-    lo1: &LeafOuter,
+    los: &[&LeafOuter],
     app_stmt: Option<usize>,
     lane: Option<ChainLane<'_>>,
 ) -> (
@@ -18247,23 +18252,41 @@ fn build_node_outer_app(
 
     const M11_NODE_DOMAIN: &[u8] = b"flock-mvp11-two-to-one-v0";
 
-    assert_eq!(
-        lo0.shape.circuit.digest(),
-        lo1.shape.circuit.digest(),
-        "two children, ONE node circuit"
-    );
+    // ARITY IS A KNOB: the node folds `k = los.len()` children in one
+    // proof. Commit and open are FLOOR-bound — they cost the same whatever
+    // k is, as long as the content stays under 2^(m*-7) — so every child
+    // past the first rides that toll for free, and a k-ary layer needs
+    // 1/(k-1) as many nodes. What does scale with k is the per-child
+    // region: mac is ~97% per-child work, which is why nu* is 16.
+    let n_kids = los.len();
+    assert!(n_kids >= 2, "a node folds at least two children");
+    let lo0 = los[0];
+    for lo in los {
+        assert_eq!(
+            lo.shape.circuit.digest(),
+            lo0.shape.circuit.digest(),
+            "every child, ONE node circuit"
+        );
+    }
     let registry = &lo0.shape.registry;
-    let union0 = outer_union(registry, lo0.shape.counts.clone());
-    let union1 = outer_union(&lo1.shape.registry, lo1.shape.counts.clone());
+    let unions: Vec<UnionInstance> = los
+        .iter()
+        .map(|lo| outer_union(&lo.shape.registry, lo.shape.counts.clone()))
+        .collect();
     let t_tapes = std::time::Instant::now();
-    // The two children's tapes are independent statement work — build them
+    // The children's tapes are independent statement work — build them
     // concurrently (each is a recording verify + the region pins).
-    let (rt0, rt1) = rayon::join(|| RealTape::new(&lo0, DOMAIN), || RealTape::new(&lo1, DOMAIN));
+    let rts: Vec<RealTape> = {
+        use rayon::prelude::*;
+        los.par_iter().map(|lo| RealTape::new(lo, DOMAIN)).collect()
+    };
     let tape_setup_ms = t_tapes.elapsed().as_secs_f64() * 1e3;
-    assert_ne!(
-        rt0.sigma_native.rho, rt1.sigma_native.rho,
-        "distinct witnesses, distinct FS points"
-    );
+    for i in 1..n_kids {
+        assert_ne!(
+            rts[0].sigma_native.rho, rts[i].sigma_native.rho,
+            "distinct witnesses, distinct FS points"
+        );
+    }
 
     // The matrices + lincheck circuits, registry order (lo0's copies —
     // one circuit, one registry).
@@ -18291,13 +18314,14 @@ fn build_node_outer_app(
     let n_bool = registry.num_boolean();
     let n_el = el_mats.len();
 
-    // The native merge fold over the two children's assertions.
-    let bool_asserts = [rt0.mat_assert.clone(), rt1.mat_assert.clone()];
-    let el_asserts = [
-        (&union0, rt0.el_assert.clone()),
-        (&union1, rt1.el_assert.clone()),
-    ];
-    let sigmas = [rt0.sigma_native.clone(), rt1.sigma_native.clone()];
+    // The native merge fold over every child's assertions.
+    let bool_asserts: Vec<_> = rts.iter().map(|rt| rt.mat_assert.clone()).collect();
+    let el_asserts: Vec<_> = rts
+        .iter()
+        .zip(&unions)
+        .map(|(rt, u)| (u, rt.el_assert.clone()))
+        .collect();
+    let sigmas: Vec<_> = rts.iter().map(|rt| rt.sigma_native.clone()).collect();
     let mut chp = FsChallenger::with_chained_blake3(M11_NODE_DOMAIN);
     let (agg, acc_p) = aggregate::prove_aggregate_classes(
         registry,
@@ -18336,21 +18360,25 @@ fn build_node_outer_app(
 
     // The fold groups in aggregate order, from the CHILDREN'S OWN
     // assertion data (the same constructors the verifier gathers with).
-    let bc = [
-        rt0.mat_assert.claims(registry),
-        rt1.mat_assert.claims(registry),
-    ];
-    let ec = [rt0.el_assert.claims(&union0), rt1.el_assert.claims(&union1)];
+    let bc: Vec<_> = rts.iter().map(|rt| rt.mat_assert.claims(registry)).collect();
+    let ec: Vec<_> = rts
+        .iter()
+        .zip(&unions)
+        .map(|(rt, u)| rt.el_assert.claims(u))
+        .collect();
+    // One group per (type, side), each carrying ONE claim per child — the
+    // fold machinery is claim-count-generic, so arity enters here only as
+    // the length of these vectors.
     let mut fold_claims: Vec<Vec<MatrixClaim>> = Vec::new();
     for t in 0..n_bool {
-        fold_claims.push(vec![bc[0][t].0.clone(), bc[1][t].0.clone()]);
-        fold_claims.push(vec![bc[0][t].1.clone(), bc[1][t].1.clone()]);
+        fold_claims.push((0..n_kids).map(|i| bc[i][t].0.clone()).collect());
+        fold_claims.push((0..n_kids).map(|i| bc[i][t].1.clone()).collect());
     }
     for t in 0..n_el {
-        fold_claims.push(vec![ec[0][t].0.clone(), ec[1][t].0.clone()]);
-        fold_claims.push(vec![ec[0][t].1.clone(), ec[1][t].1.clone()]);
+        fold_claims.push((0..n_kids).map(|i| ec[i][t].0.clone()).collect());
+        fold_claims.push((0..n_kids).map(|i| ec[i][t].1.clone()).collect());
     }
-    fold_claims.push(vec![sigmas[0].claim(), sigmas[1].claim()]);
+    fold_claims.push(sigmas.iter().map(|s| s.claim()).collect());
     let mut fold_proofs: Vec<&FoldProof> = Vec::new();
     for t in 0..n_bool {
         fold_proofs.push(&agg.folds[t].0);
@@ -18417,7 +18445,7 @@ fn build_node_outer_app(
             &[],
             &el_asserts_l,
             Some((ln.circuit, &[])),
-            &ln.priors,
+            ln.priors,
             &mut chp,
         )
         .expect("the lane fold proves");
@@ -18428,25 +18456,19 @@ fn build_node_outer_app(
             &[],
             &el_asserts_l,
             Some((ln.circuit, &[])),
-            &ln.priors,
+            ln.priors,
             &lagg,
             &mut lrec,
         )
         .expect("the lane fold verifies");
         assert_eq!(lacc_p, lacc_v, "lane prover and verifier agree");
         let lclaims: Vec<Vec<MatrixClaim>> = vec![
-            vec![
-                ln.priors[0].per_type[0].0.clone(),
-                ln.priors[1].per_type[0].0.clone(),
-            ],
-            vec![
-                ln.priors[0].per_type[0].1.clone(),
-                ln.priors[1].per_type[0].1.clone(),
-            ],
-            vec![
-                ln.priors[0].sigma.as_ref().expect("lane prior sigma").1.clone(),
-                ln.priors[1].sigma.as_ref().expect("lane prior sigma").1.clone(),
-            ],
+            ln.priors.iter().map(|p| p.per_type[0].0.clone()).collect(),
+            ln.priors.iter().map(|p| p.per_type[0].1.clone()).collect(),
+            ln.priors
+                .iter()
+                .map(|p| p.sigma.as_ref().expect("lane prior sigma").1.clone())
+                .collect(),
         ];
         let lproofs: Vec<&FoldProof> = vec![
             &lagg.folds[0].0,
@@ -18464,7 +18486,11 @@ fn build_node_outer_app(
         want.extend(fold_region_ops(&lclaims));
         assert_eq!(lops, want, "the lane tape shape");
         assert_eq!(lrec.payloads()[0], ln.registry.digest(), "lane registry digest");
-        assert_eq!(lrec.payloads()[1], vec![2u8], "lane prior count 2");
+        assert_eq!(
+            lrec.payloads()[1],
+            vec![ln.priors.len() as u8],
+            "lane prior count"
+        );
         let llocs = locate_and_pin_folds(&lclaims, &lproofs, &lvals, &lchals);
         let louts = replay_fold_endpoints(&llocs, &lvals, &lchals);
         assert_eq!(louts[0], lacc_v.per_type[0].0, "lane boolean A");
@@ -18501,7 +18527,7 @@ fn build_node_outer_app(
         chain.absorb(&bytes[at * 16..]);
         let trace = chain.finish();
 
-        let b3_rows = rt0.b3_rows + rt1.b3_rows + trace.rows.len();
+        let b3_rows = rts.iter().map(|rt| rt.b3_rows).sum::<usize>() + trace.rows.len();
         // MEASURED AND REJECTED (2026-08-05): over-provisioning nu by one
         // bit to re-engage the pay-per-live arms. Boolean committed area was
         // then CAPACITY-shaped (M_bool 31→32 doubled the boolean stack; the
@@ -18539,7 +18565,7 @@ fn build_node_outer_app(
         // rides the wide slot with its high outputs unread, and one that
         // exceeds it fails here. The witness tables below build at
         // `spread_w2`, so it must be the DECLARED width.
-        let spread_own2 = rt0.spread_w.max(rt1.spread_w);
+        let spread_own2 = rts.iter().map(|rt| rt.spread_w).max().expect("a child");
         let (spread_w2, mut cs) = match &env {
             Some(e) => {
                 assert!(
@@ -18558,15 +18584,20 @@ fn build_node_outer_app(
         // declared as islands so the online phase evaluates them in
         // parallel.
         let mut consts: Vec<(F128, Wire)> = Vec::new();
-        let isl0 = sb.begin_island();
         let mac_c0_start = sb.rows_in_slot(cs.macs);
-        let r0 = emit_real_child_region(&mut sb, &mut cs, &rt0, &mut vals, &mut hints, &mut consts);
-        let mac_after_c0 = sb.rows_in_slot(cs.macs);
-        sb.end_island(isl0);
-        let isl1 = sb.begin_island();
-        let r1 = emit_real_child_region(&mut sb, &mut cs, &rt1, &mut vals, &mut hints, &mut consts);
-        let mac_after_c1 = sb.rows_in_slot(cs.macs);
-        sb.end_island(isl1);
+        let mut mac_marks: Vec<usize> = Vec::with_capacity(n_kids);
+        let regions: Vec<RealRegion> = rts
+            .iter()
+            .map(|rt| {
+                let isl = sb.begin_island();
+                let r =
+                    emit_real_child_region(&mut sb, &mut cs, rt, &mut vals, &mut hints, &mut consts);
+                sb.end_island(isl);
+                mac_marks.push(sb.rows_in_slot(cs.macs));
+                r
+            })
+            .collect();
+        let r0 = &regions[0];
         // The fold region rides the children's slots: rows, not columns.
         let (pfslot, pf_w) = r0.pf;
         let leslot = cs
@@ -18657,9 +18688,7 @@ fn build_node_outer_app(
         // The lows' assert-zero anchor: producers only, no consumer edges.
         vals.push(F128::ZERO);
         let lag_zassert = sb.public_input();
-        let tapes = [&rt0, &rt1];
-        let regions = [&r0, &r1];
-        for (k, (tk, rk)) in tapes.iter().zip(&regions).enumerate() {
+        for (k, (tk, rk)) in rts.iter().zip(&regions).enumerate() {
             // The lagrange row lows, IN-CIRCUIT from the child's z_skip wire
             // (native pre-assert first: the fold's absorbed lows ARE the closed
             // form at the located z_skip).
@@ -18841,16 +18870,20 @@ fn build_node_outer_app(
         // span moves to the envelope's fixed tail block (below, with the
         // padding) so its offset is level-independent. Off-envelope it
         // publishes inline, exactly as before.
+        // ADJACENCY CHAINS ACROSS EVERY CONSECUTIVE PAIR: child i's h_end
+        // is child i+1's h_start, so the node's own span is the first
+        // child's h_start and the last child's h_end — the same statement
+        // whatever the arity.
         let app_w: Option<Vec<Wire>> = app_stmt.map(|off| {
-            for j in 0..4 {
-                sb.connect(
-                    r0.child_pub_w[off + 4 + j],
-                    r1.child_pub_w[off + j],
-                );
+            for w in regions.windows(2) {
+                for j in 0..4 {
+                    sb.connect(w[0].child_pub_w[off + 4 + j], w[1].child_pub_w[off + j]);
+                }
             }
+            let last = &regions[n_kids - 1];
             (0..4)
-                .map(|j| r0.child_pub_w[off + j])
-                .chain((0..4).map(|j| r1.child_pub_w[off + 4 + j]))
+                .map(|j| regions[0].child_pub_w[off + j])
+                .chain((0..4).map(|j| last.child_pub_w[off + 4 + j]))
                 .collect()
         });
         let app_inline = match &env {
@@ -18924,7 +18957,7 @@ fn build_node_outer_app(
                 zw,
                 ow,
             );
-            for (k, rk) in [&r0, &r1].into_iter().enumerate() {
+            for (k, rk) in regions.iter().enumerate() {
                 let mut off = lane_ref.claims_base;
                 for loc in llocs {
                     let cl = &loc.claims[k];
@@ -18975,9 +19008,12 @@ fn build_node_outer_app(
                     println!("  {:42} {:6}", w[1].0, w[1].2 - w[0].2);
                 }
             }
-            println!("  {:42} {:6}", "= child 0 region", mac_after_c0 - mac_c0_start);
-            println!("  {:42} {:6}", "child 1 region", mac_after_c1 - mac_after_c0);
-            println!("  {:42} {:6}", "fold region", mac_after_fold - mac_after_c1);
+            let mut prev = mac_c0_start;
+            for (i, &mk) in mac_marks.iter().enumerate() {
+                println!("  {:42} {:6}", format!("= child {i} region"), mk - prev);
+                prev = mk;
+            }
+            println!("  {:42} {:6}", "fold region", mac_after_fold - prev);
             println!("  {:42} {:6}", "lagrange lows + tail", mac_total - mac_after_fold);
             println!("  {:42} {:6}", "TOTAL", mac_total);
         }
@@ -19165,10 +19201,10 @@ fn build_node_outer_app(
         // above (tape_setup_ms) — its indices are shape-stable.
         let tapes_ms = {
             let t = std::time::Instant::now();
-            rayon::join(
-                || record_child_verify(&lo0, DOMAIN),
-                || record_child_verify(&lo1, DOMAIN),
-            );
+            {
+                use rayon::prelude::*;
+                los.par_iter().for_each(|lo| record_child_verify(lo, DOMAIN));
+            }
             t.elapsed().as_secs_f64() * 1e3
         };
         let t_trace = std::time::Instant::now();
@@ -19179,12 +19215,23 @@ fn build_node_outer_app(
 
         // The two child regions' checker walks — each child's whole
         // deferred-verifier statement held against its own replicas.
-        let consumed0 = check_real_child_region(&built2.public, &rt0, &r0);
-        let consumed1 = check_real_child_region(&built2.public, &rt1, &r1);
-        assert!(
-            r0.pub_base + consumed0 <= r1.pub_base && r1.pub_base + consumed1 <= fold_pub_base,
-            "the three regions' public blocks are disjoint and ordered"
-        );
+        let consumed: Vec<usize> = rts
+            .iter()
+            .zip(&regions)
+            .map(|(rt, r)| check_real_child_region(&built2.public, rt, r))
+            .collect();
+        for i in 0..n_kids {
+            let end = regions[i].pub_base + consumed[i];
+            let next = if i + 1 < n_kids {
+                regions[i + 1].pub_base
+            } else {
+                fold_pub_base
+            };
+            assert!(
+                end <= next,
+                "child {i}'s public block overruns the next region"
+            );
+        }
         // The fold checker + the accumulator, reassembled from publics.
         let rebuilt = check_fold_publics(&built2.public, fold_pub_base, &locs, &alpha_recs);
         let tail_len: usize = locs.iter().map(|l| 1 + l.k_col + l.k_row).sum();
@@ -19389,7 +19436,7 @@ fn build_node_outer_app(
              SETUP: circuit build (per SHAPE, cacheable) {:.0} ms | tape pins+locates (shape-stable) {:.0} ms\n",
             n_folds,
             lo0.pcs.m,
-            rt0.mu_i,
+            rts[0].mu_i,
             b3_rows,
             nu2,
             union2.dense_m(),
@@ -19479,7 +19526,7 @@ fn internal_node_over_two_fl_nodes() {
     assert_eq!(fl1.h_start, fl0.h_end, "the FL spans are adjacent");
 
     let (node, acc, _t, app, _lane) =
-        build_node_outer_app(&fl0.lo, &fl1.lo, Some(fl0.stmt_base), None);
+        build_node_outer_app(&[&fl0.lo, &fl1.lo], Some(fl0.stmt_base), None);
     let app = app.expect("the internal node carries the app block");
     for j in 0..4 {
         assert_eq!(
@@ -19542,6 +19589,115 @@ fn internal_node_over_two_fl_nodes() {
         node.shape.circuit.cells().mu(),
         node.public.len(),
         bincode::serialize(&node.proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
+    );
+}
+
+/// **THE 3-ARY INTERNAL NODE.** Commit and open are FLOOR-bound — they
+/// cost the same whatever the arity, as long as content stays under
+/// `2^(m*-7)` — so they are a per-node toll that every child past the first
+/// rides for free, and a k-ary layer needs `1/(k-1)` as many nodes. Six
+/// chain segments → three first-level nodes → ONE internal node folding all
+/// three, lane included (three priors, not two).
+///
+/// The prerequisite is `nu* = 16`: mac is ~97% per-child work (14,411 rows
+/// per child against 921 shared), so three children need ~44k rows against
+/// 2^15's 32,768.
+#[test]
+#[ignore] // Heavy — six chain proofs, three FLs, one 3-ary node.
+fn internal_node_three_ary() {
+    let n_blocks = 256usize;
+    let mut rng = Rng(0xC4A1_000C);
+    let h0: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let mut cps = Vec::new();
+    let mut h = h0;
+    for _ in 0..6 {
+        let cp = build_chain_proof(h, n_blocks);
+        h = cp.h_end;
+        cps.push(cp);
+    }
+    let fls: Vec<FlNode> = (0..3).map(|i| build_fl_node(&cps[2 * i], &cps[2 * i + 1])).collect();
+    let chain_registry = &cps[0].inner.built.shape.registry;
+    let blake_r1cs = blake3::build_block_r1cs(cps[0].inner.nu);
+    let blake_lc = blake_r1cs.csc_lincheck_circuit();
+    let chain_mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
+    let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
+    let priors: Vec<&flock_core::aggregate::Accumulator> = fls.iter().map(|f| &f.acc).collect();
+    let kids: Vec<&LeafOuter> = fls.iter().map(|f| &f.lo).collect();
+
+    let (node, acc, t, app, lane_acc) = build_node_outer_app(
+        &kids,
+        Some(fls[0].stmt_base),
+        Some(ChainLane {
+            registry: chain_registry,
+            mats: &chain_mats,
+            circs: &chain_circs,
+            circuit: &cps[0].inner.built.shape.circuit,
+            priors: &priors,
+            claims_base: fls[0].fold_pub_base,
+        }),
+    );
+    let app = app.expect("the app block rode");
+    let lane_acc = lane_acc.expect("the lane rode");
+
+    // The statement spans all six segments, and both accumulators discharge.
+    let h_end = native_chain(&h0, 6 * n_blocks);
+    for j in 0..4 {
+        assert_eq!(
+            node.public[app + j],
+            pack4(h0[4 * j..4 * j + 4].try_into().unwrap()),
+            "3-ary node h_start"
+        );
+        assert_eq!(
+            node.public[app + 4 + j],
+            pack4(h_end[4 * j..4 * j + 4].try_into().unwrap()),
+            "3-ary node h_end == H^N(h_start)"
+        );
+    }
+    assert!(
+        lane_acc.discharge(&chain_mats) && lane_acc.discharge_sigma(&cps[0].inner.built.shape.circuit),
+        "the 3-prior chain lane discharges"
+    );
+    // The accumulator holds claims about the CHILDREN's tables, so it
+    // discharges against THEIR matrices — which are the node's own only
+    // because the envelope pins one nu and one registry.
+    let ch = &fls[0].lo;
+    let el_types: Vec<_> = ch
+        .shape
+        .registry
+        .element_types()
+        .iter()
+        .map(|s| s.element_type().expect("an element slot's table"))
+        .collect();
+    let el_mats: Vec<_> = el_types.iter().map(|ty| (ty.a_0(), ty.b_0())).collect();
+    let mut mats_ord = vec![
+        (ch.b3_slot, (&ch.b3_r1cs.a_0, &ch.b3_r1cs.b_0)),
+        (ch.swap_slot, (&ch.swap_r1cs.a_0, &ch.swap_r1cs.b_0)),
+        (ch.spread_slot, (&ch.spread_r1cs.a_0, &ch.spread_r1cs.b_0)),
+    ];
+    mats_ord.sort_by_key(|&(i, _)| i);
+    let mats: Vec<_> = mats_ord.iter().map(|&(_, m)| m).collect();
+    assert!(
+        acc.discharge(&mats) && acc.discharge_element(&el_mats)
+            && acc.discharge_sigma(&fls[0].lo.shape.circuit),
+        "the 3-ary node's own accumulator discharges all three groups"
+    );
+    println!(
+        "\n3-ARY INTERNAL NODE (three FL children in ONE proof)\n  \
+         span H^{}(h_start) | nu {} | mu {} | publics {} | proof {:.1} KiB\n  \
+         ONLINE: walk {:.1} + tapes {:.1} + witgen {:.1} + prove {:.1} = {:.1} ms | verify {:.1}\n  \
+         per-leaf internal share (k=3): {:.1} ms vs 2-ary's C/2\n",
+        6 * n_blocks,
+        node.shape.circuit.cells().nu(),
+        node.shape.circuit.cells().mu(),
+        node.public.len(),
+        bincode::serialize(&node.proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
+        t.walk_ms,
+        t.tapes_ms,
+        t.witgen_ms,
+        t.prove_ms,
+        t.total(),
+        t.verify_ms,
+        t.total() / 4.0,
     );
 }
 
@@ -19621,28 +19777,26 @@ fn chain_tower_three_levels_one_internal_digest() {
     // Level 2: the chain lane's priors are the FL children's chain
     // accumulators, read at the FL's ACC_CHAIN block.
     let (n0, _a0, _t0, app0, lane0) = build_node_outer_app(
-        &fls[0].lo,
-        &fls[1].lo,
+        &[&fls[0].lo, &fls[1].lo],
         Some(app_fl),
         Some(ChainLane {
             registry: chain_registry,
             mats: &chain_mats,
             circs: &chain_circs,
             circuit: chain_circuit,
-            priors: [&fls[0].acc, &fls[1].acc],
+            priors: &[&fls[0].acc, &fls[1].acc],
             claims_base: acc_base,
         }),
     );
     let (n1, _a1, _t1, app1, lane1) = build_node_outer_app(
-        &fls[2].lo,
-        &fls[3].lo,
+        &[&fls[2].lo, &fls[3].lo],
         Some(app_fl),
         Some(ChainLane {
             registry: chain_registry,
             mats: &chain_mats,
             circs: &chain_circs,
             circuit: chain_circuit,
-            priors: [&fls[2].acc, &fls[3].acc],
+            priors: &[&fls[2].acc, &fls[3].acc],
             claims_base: acc_base,
         }),
     );
@@ -19660,15 +19814,14 @@ fn chain_tower_three_levels_one_internal_digest() {
     // ACC_CHAIN index the FL children used, which is why one circuit reads
     // both kinds.
     let (n2, _a2, _t2, app2, lane2) = build_node_outer_app(
-        &n0,
-        &n1,
+        &[&n0, &n1],
         Some(app0),
         Some(ChainLane {
             registry: chain_registry,
             mats: &chain_mats,
             circs: &chain_circs,
             circuit: chain_circuit,
-            priors: [&lane0, &lane1],
+            priors: &[&lane0, &lane1],
             claims_base: acc_base,
         }),
     );
@@ -19753,11 +19906,11 @@ fn chain_tower_e2e_with_lane() {
         mats: &chain_mats,
         circs: &chain_circs,
         circuit: &cp0.inner.built.shape.circuit,
-        priors: [&fl0.acc, &fl1.acc],
+        priors: &[&fl0.acc, &fl1.acc],
         claims_base: fl0.fold_pub_base,
     };
     let (node, acc, _t, app, lane_acc) =
-        build_node_outer_app(&fl0.lo, &fl1.lo, Some(fl0.stmt_base), Some(lane));
+        build_node_outer_app(&[&fl0.lo, &fl1.lo], Some(fl0.stmt_base), Some(lane));
     let app = app.expect("the app block rode");
     let lane_acc = lane_acc.expect("the lane rode");
 
@@ -20052,12 +20205,12 @@ fn chain_tower_m32_headline() {
         mats: &chain_mats,
         circs: &chain_circs,
         circuit: &cp0.inner.built.shape.circuit,
-        priors: [&fl0.acc, &fl1.acc],
+        priors: &[&fl0.acc, &fl1.acc],
         claims_base: fl0.fold_pub_base,
     };
     let t_in = std::time::Instant::now();
     let (node, acc, nt, app, lane_acc) =
-        build_node_outer_app(&fl0.lo, &fl1.lo, Some(fl0.stmt_base), Some(lane));
+        build_node_outer_app(&[&fl0.lo, &fl1.lo], Some(fl0.stmt_base), Some(lane));
     let _internal_ms = t_in.elapsed().as_secs_f64() * 1e3;
     let app = app.expect("app block");
     let lane_acc = lane_acc.expect("lane");
@@ -20207,15 +20360,14 @@ fn tower_online_bench() {
     let internal: Vec<Online> = (0..runs)
         .map(|_| {
             build_node_outer_app(
-                &fl0.lo,
-                &fl1.lo,
+                &[&fl0.lo, &fl1.lo],
                 Some(fl0.stmt_base),
                 Some(ChainLane {
                     registry: chain_registry,
                     mats: &chain_mats,
                     circs: &chain_circs,
                     circuit: &cp0.inner.built.shape.circuit,
-                    priors: [&fl0.acc, &fl1.acc],
+                    priors: &[&fl0.acc, &fl1.acc],
                     claims_base: fl0.fold_pub_base,
                 }),
             )
