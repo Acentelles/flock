@@ -50,7 +50,12 @@ pub const K_SKIP: usize = 6;
 /// full-utilization zerocheck), so the gate engages at half utilization.
 /// Full utilization itself stays dense (live · 2 > n): it is the anchor
 /// configuration and the dense kernels are the calibrated choice there.
-pub const SPARSE_TAIL_GATE: usize = 1;
+/// (The constant briefly read 1, which made the inequality vacuous —
+/// `live ≤ n` holds by construction — so EVERY multi-run spec took the
+/// scalar-gather sparse tail regardless of utilization, the opposite of
+/// the calibration above: the m32 chain leaf's zerocheck ran 3.1× slower
+/// multi-threaded than the workload-identical single-table path.)
+pub const SPARSE_TAIL_GATE: usize = 2;
 
 /// [`SPARSE_TAIL_GATE`] with an env override (`FLOCK_SPARSE_GATE`) — a
 /// tuning knob for A/B experiments; the constant above is the default.
@@ -127,8 +132,25 @@ impl PaddingSpec {
         }])
     }
 
-    /// General run-list constructor. Runs with `n_blocks = 0` cover no address
-    /// space and are dropped (canonical form, so `as_single_run` is reliable).
+    /// General run-list constructor. Canonicalizes, so `as_single_run` is
+    /// reliable:
+    /// - runs with `n_blocks = 0` cover no address space and are dropped;
+    /// - adjacent runs of identical shape coalesce;
+    /// - a **prefix-shaped** list — every live run fully useful except
+    ///   possibly a final single partial block, followed only by all-padding
+    ///   runs, with a power-of-two total extent — collapses to the
+    ///   equivalent one-giant-block single run (useful prefix + implicit
+    ///   gap). That is byte-for-byte the encoding the BatchMajor
+    ///   [`crate::r1cs::BlockR1cs::padding_spec`] emits, so a fully-utilized
+    ///   single-slot union spec reaches the same `as_single_run` kernel fast
+    ///   paths as the single-table prover instead of the run-list arms
+    ///   (measured 3.1× slower multi-threaded on the m32 chain leaf's
+    ///   zerocheck). `useful_intervals()` is invariant under all three
+    ///   rewrites — classification cannot change, only kernel dispatch.
+    ///
+    /// Non-prefix lists (partial counts, interior gaps) are preserved
+    /// verbatim: their run-list encoding is what keeps the
+    /// count-proportional sparse paths engaged.
     pub fn from_runs(runs: Vec<PaddingRun>) -> Self {
         for run in &runs {
             assert!(
@@ -138,9 +160,46 @@ impl PaddingSpec {
                 run.k_log
             );
         }
-        Self {
-            runs: runs.into_iter().filter(|r| r.n_blocks > 0).collect(),
+        let mut canon: Vec<PaddingRun> = Vec::with_capacity(runs.len());
+        for run in runs.into_iter().filter(|r| r.n_blocks > 0) {
+            match canon.last_mut() {
+                Some(prev)
+                    if prev.k_log == run.k_log
+                        && prev.useful_bits_per_block == run.useful_bits_per_block =>
+                {
+                    prev.n_blocks += run.n_blocks;
+                }
+                _ => canon.push(run),
+            }
         }
+        // Prefix collapse. The extent includes the trailing padding runs:
+        // they are address space the collapsed block must still cover, and
+        // requiring the total to be a power of two keeps the rewrite exact
+        // (the callers' specs tile their full domain; a hypothetical short
+        // prefix spec in a larger domain stays a run list rather than gamble
+        // on the single-run path's periodic tiling).
+        let extent: usize = canon.iter().map(|r| r.extent_bits()).sum();
+        if extent.is_power_of_two()
+            && let Some(last_live) = canon.iter().rposition(|r| r.useful_bits_per_block > 0)
+            && canon[..last_live]
+                .iter()
+                .all(|r| r.useful_bits_per_block == 1usize << r.k_log)
+            && (canon[last_live].useful_bits_per_block == 1usize << canon[last_live].k_log
+                || canon[last_live].n_blocks == 1)
+        {
+            // Contiguous useful prefix [0, U): full blocks merge across run
+            // boundaries and the last (single) partial block extends them.
+            let useful_bits: usize = canon[..=last_live]
+                .iter()
+                .map(|r| r.n_blocks * r.useful_bits_per_block)
+                .sum();
+            canon = vec![PaddingRun {
+                k_log: extent.trailing_zeros() as usize,
+                useful_bits_per_block: useful_bits,
+                n_blocks: 1,
+            }];
+        }
+        Self { runs: canon }
     }
 
     /// The runs, in address order.
@@ -1356,6 +1415,114 @@ mod tests {
         assert!(canon.as_single_run().is_some());
         assert_eq!(canon.covered_bits(), 16);
         assert_eq!(canon.useful_intervals(), Vec::<(usize, usize)>::new());
+    }
+
+    /// Prefix collapse: a fully-useful run followed by trailing padding —
+    /// the fully-utilized single-slot union shape — canonicalizes to the
+    /// one-giant-block single run (the BatchMajor `BlockR1cs::padding_spec`
+    /// encoding), with `useful_intervals` invariant. Non-prefix shapes are
+    /// preserved verbatim.
+    #[test]
+    fn padding_spec_prefix_collapse() {
+        // The m32 chain-leaf shape, scaled down: 93 of 128 columns live.
+        let full = PaddingRun {
+            k_log: 10,
+            useful_bits_per_block: 1 << 10,
+            n_blocks: 93,
+        };
+        let gap = PaddingRun {
+            k_log: 10,
+            useful_bits_per_block: 0,
+            n_blocks: 35,
+        };
+        let spec = PaddingSpec::from_runs(vec![full, gap]);
+        assert_eq!(
+            spec.as_single_run(),
+            Some(PaddingRun {
+                k_log: 17,
+                useful_bits_per_block: 93 << 10,
+                n_blocks: 1
+            }),
+            "full-count union spec collapses to the one-giant-block form"
+        );
+        assert_eq!(spec.useful_intervals(), vec![(0, 93 << 10)]);
+
+        // A final SINGLE partial block extends the prefix and still collapses.
+        let spec = PaddingSpec::from_runs(vec![
+            PaddingRun {
+                k_log: 4,
+                useful_bits_per_block: 16,
+                n_blocks: 3,
+            },
+            PaddingRun {
+                k_log: 4,
+                useful_bits_per_block: 5,
+                n_blocks: 1,
+            },
+        ]);
+        assert_eq!(
+            spec.as_single_run(),
+            Some(PaddingRun {
+                k_log: 6,
+                useful_bits_per_block: 53,
+                n_blocks: 1
+            })
+        );
+        assert_eq!(spec.useful_intervals(), vec![(0, 53)]);
+
+        // Adjacent identical runs coalesce, but a non-power-of-two extent
+        // (32 + 35·1024) blocks the collapse: the list stays multi-run.
+        let half = PaddingRun {
+            k_log: 4,
+            useful_bits_per_block: 16,
+            n_blocks: 1,
+        };
+        let spec = PaddingSpec::from_runs(vec![half, half, gap]);
+        assert_eq!(spec.runs().len(), 2, "the two identical runs coalesced");
+        assert!(spec.as_single_run().is_none());
+
+        // Partial-per-block runs (a partial count) do NOT collapse: the
+        // run-list encoding is what engages the sparse count-proportional
+        // kernels.
+        let spec = PaddingSpec::from_runs(vec![
+            PaddingRun {
+                k_log: 10,
+                useful_bits_per_block: 640,
+                n_blocks: 93,
+            },
+            gap,
+        ]);
+        assert!(spec.as_single_run().is_none());
+
+        // Interior gaps (multi-slot schedules) do NOT collapse.
+        let spec = PaddingSpec::from_runs(vec![
+            PaddingRun {
+                k_log: 10,
+                useful_bits_per_block: 1 << 10,
+                n_blocks: 3,
+            },
+            PaddingRun {
+                k_log: 10,
+                useful_bits_per_block: 0,
+                n_blocks: 1,
+            },
+            PaddingRun {
+                k_log: 10,
+                useful_bits_per_block: 1 << 10,
+                n_blocks: 2,
+            },
+            PaddingRun {
+                k_log: 10,
+                useful_bits_per_block: 0,
+                n_blocks: 2,
+            },
+        ]);
+        assert!(spec.as_single_run().is_none());
+
+        // All-padding lists stay as-is (the empty-instance shape).
+        let spec = PaddingSpec::from_runs(vec![gap]);
+        assert_eq!(spec.runs().len(), 1);
+        assert_eq!(spec.covered_bits(), 35 << 10);
     }
 
     /// A run whose useful prefix exceeds its block size is malformed.
