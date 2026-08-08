@@ -910,11 +910,19 @@ where
     // the XOR accumulation is exact (`reduce` is XOR-linear, so reducing a
     // hi-run in pieces and adding equals adding then reducing).
     if let Some(iv) = live_pairs {
-        // ~2^16 live pairs per task: matches the live work the dense
+        // Task size: at most ~2^16 live pairs (the live work the dense
         // dispatch gives one chunk at the anchor shape, so per-task fold
-        // cost and thread count stay in the measured-good regime.
+        // cost stays in the measured-good regime), but never so coarse that
+        // the pool starves — a small support otherwise cuts into fewer
+        // tasks than threads and the round runs on one or two cores. Any
+        // task partition is byte-identical (the note above: reduction is
+        // XOR-linear, regrouping is exact), so the target only moves work,
+        // never values.
         const LIVE_PAIRS_PER_TASK: usize = 1 << 16;
-        let (pieces, tasks) = balanced_interval_tasks(iv, LIVE_PAIRS_PER_TASK);
+        let live_total: usize = iv.iter().map(|&(s, e)| e - s).sum();
+        let threads = rayon::current_num_threads().max(1);
+        let target = (live_total / (4 * threads)).clamp(1 << 10, LIVE_PAIRS_PER_TASK);
+        let (pieces, tasks) = balanced_interval_tasks(iv, target);
 
         // Each task owns the COMPACTED output span of its pieces — 2 slots per
         // live pair, disjoint and in address order, so the buffers carve by
@@ -1612,8 +1620,17 @@ pub fn fold_and_round_pair_sparse_into(
     // once, and eq_hi multiplies the run total — pure reassociation of exact
     // field algebra (reduction commutes with XOR), so the message stays
     // byte-identical to the scalar loop and to the dense kernel.
+    //
+    // Task size: at most 2^12 covered pairs, but thread-aware below that —
+    // the tail's live set halves every round, and a fixed absolute target
+    // starves the pool (fewer tasks than threads) rounds before the work
+    // itself is small. Regrouping is exact (above), so the target only
+    // moves work between tasks, never values.
     const CHUNK: usize = 1 << 12;
-    let (pieces, tasks) = balanced_interval_tasks(&pair_cover, CHUNK);
+    let live_total: usize = pair_cover.iter().map(|&(s, e)| e - s).sum();
+    let threads = rayon::current_num_threads().max(1);
+    let target = (live_total / (4 * threads)).clamp(1 << 8, CHUNK);
+    let (pieces, tasks) = balanced_interval_tasks(&pair_cover, target);
     let mut work: Vec<(&[(usize, usize)], &mut [F128], &mut [F128])> =
         Vec::with_capacity(tasks.len());
     {
@@ -1659,24 +1676,64 @@ pub fn fold_and_round_pair_sparse_into(
                     let run_end = (((t >> eq.n_lo) + 1) << eq.n_lo).min(piece_e);
                     let mut p1 = F256Unreduced::ZERO;
                     let mut p_inf = F256Unreduced::ZERO;
-                    for tt in t..run_end {
-                        let y = 4 * tt;
-                        let (a00, b00) = read2(&mut cur, y);
-                        let (a01, b01) = read2(&mut cur, y + 1);
-                        let (a10, b10) = read2(&mut cur, y + 2);
-                        let (a11, b11) = read2(&mut cur, y + 3);
-                        let a0 = a00 + r_fold * (a01 + a00);
-                        let a1 = a10 + r_fold * (a11 + a10);
-                        let b0 = b00 + r_fold * (b01 + b00);
-                        let b1 = b10 + r_fold * (b11 + b10);
-                        let o = piece_base + 2 * (tt - piece_s);
-                        a_task[o] = a0;
-                        a_task[o + 1] = a1;
-                        b_task[o] = b0;
-                        b_task[o + 1] = b1;
-                        let eq_l = eq.lo[tt & lo_mask];
-                        p1 ^= eq_l.mul_unreduced(a1 * b1);
-                        p_inf ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+                    // Advance the cursor exactly as the first `rank` of this
+                    // run would; when the run's whole read span then sits in
+                    // ONE stored interval — the common case away from
+                    // live/dead boundaries — the reads are contiguous in the
+                    // compacted buffer, so index directly instead of paying
+                    // four cursor gathers per pair. Same positions read in
+                    // the same order (and no dead position is in the span,
+                    // so the fallback's zero-substitution never fires here):
+                    // byte-identical by construction.
+                    let (y0, y1) = (4 * t, 4 * run_end);
+                    while cur < store_in.intervals().len() && store_in.intervals()[cur].1 <= y0 {
+                        cur += 1;
+                    }
+                    let contig = store_in
+                        .intervals()
+                        .get(cur)
+                        .is_some_and(|&(s, e)| s <= y0 && y1 <= e);
+                    if contig {
+                        let base = store_in.offset_of(cur) + (y0 - store_in.intervals()[cur].0);
+                        for tt in t..run_end {
+                            let i = base + 4 * (tt - t);
+                            let (a00, b00) = (a[i], b[i]);
+                            let (a01, b01) = (a[i + 1], b[i + 1]);
+                            let (a10, b10) = (a[i + 2], b[i + 2]);
+                            let (a11, b11) = (a[i + 3], b[i + 3]);
+                            let a0 = a00 + r_fold * (a01 + a00);
+                            let a1 = a10 + r_fold * (a11 + a10);
+                            let b0 = b00 + r_fold * (b01 + b00);
+                            let b1 = b10 + r_fold * (b11 + b10);
+                            let o = piece_base + 2 * (tt - piece_s);
+                            a_task[o] = a0;
+                            a_task[o + 1] = a1;
+                            b_task[o] = b0;
+                            b_task[o + 1] = b1;
+                            let eq_l = eq.lo[tt & lo_mask];
+                            p1 ^= eq_l.mul_unreduced(a1 * b1);
+                            p_inf ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+                        }
+                    } else {
+                        for tt in t..run_end {
+                            let y = 4 * tt;
+                            let (a00, b00) = read2(&mut cur, y);
+                            let (a01, b01) = read2(&mut cur, y + 1);
+                            let (a10, b10) = read2(&mut cur, y + 2);
+                            let (a11, b11) = read2(&mut cur, y + 3);
+                            let a0 = a00 + r_fold * (a01 + a00);
+                            let a1 = a10 + r_fold * (a11 + a10);
+                            let b0 = b00 + r_fold * (b01 + b00);
+                            let b1 = b10 + r_fold * (b11 + b10);
+                            let o = piece_base + 2 * (tt - piece_s);
+                            a_task[o] = a0;
+                            a_task[o + 1] = a1;
+                            b_task[o] = b0;
+                            b_task[o + 1] = b1;
+                            let eq_l = eq.lo[tt & lo_mask];
+                            p1 ^= eq_l.mul_unreduced(a1 * b1);
+                            p_inf ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+                        }
                     }
                     let eq_h = eq.hi[t >> eq.n_lo];
                     s1 += eq_h * p1.reduce();
