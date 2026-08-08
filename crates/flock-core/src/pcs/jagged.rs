@@ -2551,6 +2551,110 @@ fn multipoint_group_values(
         .collect()
 }
 
+/// The F128 basis element `2^b` (as an F₂-vector coordinate).
+#[inline]
+fn basis_elem(b: usize) -> F128 {
+    if b < 64 {
+        F128::new(1u64 << b, 0)
+    } else {
+        F128::new(0, 1u64 << (b - 64))
+    }
+}
+
+/// Split-eq evaluator over the REMAINING coordinates of a low-bit-first
+/// fold: after `i` rounds the un-bound tensor is `eq(ρ[i..], ·)`, and two
+/// half-size tables give any point in one multiply — `Σ_i 2^((m−i)/2)`
+/// total build cost over all rounds, O(√domain), instead of a materialized
+/// (and re-folded) `2^(m−i)` vector per round.
+struct SplitEq {
+    lo: Vec<F128>,
+    hi: Vec<F128>,
+    n_lo: usize,
+    mask: usize,
+}
+
+impl SplitEq {
+    fn new(coords: &[F128]) -> Self {
+        let n_lo = coords.len() / 2;
+        Self {
+            lo: build_eq_table(&coords[..n_lo]),
+            hi: build_eq_table(&coords[n_lo..]),
+            n_lo,
+            mask: (1usize << n_lo) - 1,
+        }
+    }
+
+    /// `eq(coords, u)` — exact: the split product is the same field element
+    /// as the materialized tensor entry (field ops are exact, so any
+    /// correct parenthesization is bitwise identical).
+    #[inline]
+    fn at(&self, u: usize) -> F128 {
+        self.lo[u & self.mask] * self.hi[u >> self.n_lo]
+    }
+}
+
+/// The VIRTUAL partner side of a two-product pair — never materialized,
+/// never folded; evaluated pointwise from [`SplitEq`] tables at whatever
+/// positions the messages need. Both closed forms survive low-bit-first
+/// folding EXACTLY (docs/multipoint-twisted-assist.tex):
+///
+/// - `Scaled`: e = eq(ρ,·) folds to `s·eq(ρ[i..], ·)` with
+///   `s ← s·(1+ρ_i+r_i)` (char-2 `eq(z,r) = 1+z+r`) — the identity the
+///   segment-sparse group pair already exploits for its boundary paddings.
+/// - `Twisted`: g = L_γ(eq(ρ,·)) has no tensor factorization (L_γ is
+///   F₂-linear, not multiplicative), but multiplication-by-constant IS
+///   F₂-linear, so the fold stays "linear map of the remaining tensor":
+///   `g_{i+1}[t] = L(c₀·E) + r·L((c₀+c₁)·E) = (M∘mult_{c₀} + mult_r∘M)(E)`
+///   with `c₀+c₁ = 1`. The map is carried as its 128 basis images plus the
+///   byte-sliced tables, updated per round for ~a few µs.
+///
+/// This is what makes the ā-side area trim sound where trimming a
+/// MATERIALIZED partner was not: a stored partner's tail feeds its own
+/// folds (the straddling live block mixes tail values, and the anchor pins
+/// the endpoint to the closed form of the FULL vector), but a virtual
+/// partner has no stored tail — every evaluation IS the closed form.
+enum Partner {
+    Twisted {
+        images: Box<[F128; 128]>,
+        tables: Vec<[F128; 256]>,
+    },
+    Scaled {
+        s: F128,
+    },
+}
+
+impl Partner {
+    fn twisted(images: Box<[F128; 128]>) -> Self {
+        let tables = linear_byte_tables(&images);
+        Partner::Twisted { images, tables }
+    }
+
+    /// The partner's value at position `u` of the current round's domain.
+    #[inline]
+    fn at(&self, eq: &SplitEq, u: usize) -> F128 {
+        match self {
+            Partner::Twisted { tables, .. } => apply_linear_tables(tables, eq.at(u)),
+            Partner::Scaled { s } => *s * eq.at(u),
+        }
+    }
+
+    /// Advance past one fold: bind the round's coordinate `rho_i` at `r`.
+    fn advance(&mut self, rho_i: F128, r: F128) {
+        match self {
+            Partner::Twisted { images, tables } => {
+                let c = F128::ONE + rho_i;
+                let mut nxt = Box::new([F128::ZERO; 128]);
+                for (b, slot) in nxt.iter_mut().enumerate() {
+                    *slot = apply_linear_tables(tables, c * basis_elem(b)) + r * images[b];
+                }
+                *tables = linear_byte_tables(&nxt);
+                *images = nxt;
+            }
+            Partner::Scaled { s } => *s *= F128::ONE + rho_i + r,
+        }
+    }
+}
+
 /// The combined weight vector of ONE product of the two-product sumcheck —
 /// `Σ_s scale_s·eq(z_{s,r}, row(d))·w_s(col(d))`, zero past the area,
 /// segmented parallel fill from the prefix sums — AND that product's
@@ -2563,7 +2667,8 @@ fn multipoint_group_values(
 fn build_combined_weight_and_msg(
     params: &JaggedParams,
     sides: &[(F128, Vec<F128>, &[F128])],
-    partner: &[F128],
+    partner: &Partner,
+    eq: &SplitEq,
 ) -> (Vec<F128>, (F128, F128)) {
     use rayon::prelude::*;
     let mut a = vec![F128::ZERO; 1usize << params.m];
@@ -2573,14 +2678,13 @@ fn build_combined_weight_and_msg(
     const CH: usize = 1 << 14;
     let msg = a
         .par_chunks_mut(CH)
-        .zip(partner.par_chunks(CH))
         .enumerate()
-        .map(|(ci, (chunk, gc))| {
+        .map(|(ci, chunk)| {
             let start = (ci * CH) as u64;
             // Chunks past the jagged area: the weight is identically zero
             // there (the fill below never reaches them — calloc zeros), so
-            // every round-0 message term is zero and the partner chunk
-            // need not even be read.
+            // every round-0 message term is zero and the (virtual) partner
+            // is never evaluated.
             if start >= area {
                 return (F128::ZERO, F128::ZERO);
             }
@@ -2604,9 +2708,12 @@ fn build_combined_weight_and_msg(
             }
             let mut p1 = F128::ZERO;
             let mut pi = F128::ZERO;
-            for (ap, gp) in chunk.chunks_exact(2).zip(gc.chunks_exact(2)) {
-                p1 += ap[1] * gp[1];
-                pi += (ap[0] + ap[1]) * (gp[0] + gp[1]);
+            for (j, ap) in chunk.chunks_exact(2).enumerate() {
+                let u = start as usize + 2 * j;
+                let q0 = partner.at(eq, u);
+                let q1 = partner.at(eq, u + 1);
+                p1 += ap[1] * q1;
+                pi += (ap[0] + ap[1]) * (q0 + q1);
             }
             (p1, pi)
         })
@@ -2644,7 +2751,6 @@ pub fn prove_multipoint_twisted<C: Challenger>(
     rho: &[F128],
     challenger: &mut C,
 ) -> MultipointTwistedProof {
-    use rayon::prelude::*;
     let m = params.m;
     assert_eq!(rho.len(), m);
     for claim in claims {
@@ -2692,32 +2798,26 @@ pub fn prove_multipoint_twisted<C: Challenger>(
         p *= gamma;
     }
 
-    // The dense vectors: e = eq(ρ,·) (the groups' partner), g = L_γ(e) via
-    // one byte-table pass (the RS partner), and the two combined weights.
+    // The partner sides — e = eq(ρ,·) for the groups, g = L_γ(e) for the RS
+    // claims — are VIRTUAL: never materialized, never folded. Their closed
+    // forms survive low-bit-first folding exactly (see [`Partner`]), so
+    // messages evaluate them pointwise from √n split-eq tables. Only the
+    // combined jagged weights (no tensor structure) get buffers, and those
+    // fold on the area-trimmed live prefix.
     let t = std::time::Instant::now();
-    let eq_rho = super::ring_switch::build_eq_parallel(rho);
+    let eq0 = SplitEq::new(rho);
+    let area = params.area() as usize;
     let mut pairs: Vec<Pair> = Vec::with_capacity(2);
     let mut msg0 = (F128::ZERO, F128::ZERO);
     if n_rs > 0 {
         let basis = inv_frob_basis();
-        let mut images = [F128::ZERO; 128];
+        let mut images = Box::new([F128::ZERO; 128]);
         for j in 0..128 {
             for (b, img) in images.iter_mut().enumerate() {
                 *img += gpow[j] * basis[j][b];
             }
         }
-        let tables = linear_byte_tables(&images);
-        // The twist map runs over the FULL domain: unlike the combined
-        // weight, g's tail is load-bearing — folding mixes tail positions
-        // into the straddling live block round by round, and the anchor
-        // checks the endpoint against the closed form of the full twisted
-        // eq. (An area-trimmed g was tried and breaks the late round
-        // messages; only products whose BOTH sides vanish past the area —
-        // the merged sumcheck's (q, W) — admit the live-prefix fold.)
-        let mut gv = vec![F128::ZERO; 1usize << m];
-        gv.par_iter_mut()
-            .zip(eq_rho.par_iter())
-            .for_each(|(g, &e)| *g = apply_linear_tables(&tables, e));
+        let partner = Partner::twisted(images);
         let eq_cs: Vec<Vec<F128>> = claims.iter().map(|c| build_eq_table(c.z_col)).collect();
         let sides: Vec<(F128, Vec<F128>, &[F128])> = claims
             .iter()
@@ -2725,9 +2825,9 @@ pub fn prove_multipoint_twisted<C: Challenger>(
             .enumerate()
             .map(|(i, (c, eq_c))| (gpow[128 * i], build_eq_table(c.z_row), eq_c.as_slice()))
             .collect();
-        let (av, msg) = build_combined_weight_and_msg(params, &sides, &gv);
+        let (av, msg) = build_combined_weight_and_msg(params, &sides, &partner, &eq0);
         msg0 = (msg0.0 + msg.0, msg0.1 + msg.1);
-        pairs.push(Pair::Dense(ProductPair::new(av, gv)));
+        pairs.push(Pair::Virtual(VirtualPair::new(av, partner, rho, 0, area)));
     }
     let mut sparse_support: Option<u64> = None;
     if n_g > 0 {
@@ -2737,18 +2837,18 @@ pub fn prove_multipoint_twisted<C: Challenger>(
             .map(|(k, g)| (gpow[128 * n_rs + k], build_eq_table(g.z_row), g.cols))
             .collect();
         // The gather-shaped groups are supported on a few columns: fold them
-        // segment-sparse instead of materializing b̄ and an e copy over 2^m.
+        // segment-sparse instead of materializing b̄ over 2^m.
         let support = SparseGroupPair::support_area(params, groups);
         if (support as usize).saturating_mul(SPARSE_DENSIFY_FACTOR) <= (1usize << m) {
-            let (sp, msg) = SparseGroupPair::build(params, &sides, &eq_rho, rho);
-            drop(eq_rho);
+            let (sp, msg) = SparseGroupPair::build(params, &sides, &eq0, rho);
             msg0 = (msg0.0 + msg.0, msg0.1 + msg.1);
             pairs.push(Pair::Sparse(sp));
             sparse_support = Some(support);
         } else {
-            let (bv, msg) = build_combined_weight_and_msg(params, &sides, &eq_rho);
+            let partner = Partner::Scaled { s: F128::ONE };
+            let (bv, msg) = build_combined_weight_and_msg(params, &sides, &partner, &eq0);
             msg0 = (msg0.0 + msg.0, msg0.1 + msg.1);
-            pairs.push(Pair::Dense(ProductPair::new(bv, eq_rho)));
+            pairs.push(Pair::Virtual(VirtualPair::new(bv, partner, rho, 0, area)));
         }
     }
     if trace {
@@ -2791,11 +2891,11 @@ pub fn prove_multipoint_twisted<C: Challenger>(
         (g_one, g_inf) = nxt;
         cur /= 2;
     }
-    // The dense pairs' four buffers go back to the scratch pool (the two
-    // half-size ping-pong halves came from it; the full-size vectors seed
-    // it for the next prove).
+    // The virtual pairs' buffers go back to the scratch pool (the half-size
+    // ping-pong halves came from it; the full-size weight vectors seed it
+    // for the next prove).
     for pair in pairs {
-        if let Pair::Dense(p) = pair {
+        if let Pair::Virtual(p) = pair {
             p.reclaim();
         }
     }
@@ -2859,65 +2959,136 @@ pub fn prove_multipoint_twisted<C: Challenger>(
 /// One product's ping-pong fold state for the two-product sumcheck: the
 /// full-size pair, half-size scratch, and which half currently holds the
 /// live data.
-struct ProductPair {
+struct VirtualPair {
     x: Vec<F128>,
-    y: Vec<F128>,
     sx: Vec<F128>,
-    sy: Vec<F128>,
     flip: bool,
+    partner: Partner,
+    rho: Vec<F128>,
+    round: usize,
+    /// `x`'s zero-tail bound: folds and messages run on the live prefix
+    /// only. EXACT here (unlike for a materialized partner): every skipped
+    /// message term carries a folded-`x` factor of zero, folding maps `x`'s
+    /// zero tail to a zero tail, and the partner — the only thing with
+    /// nonzero tail values — is evaluated in closed form, so it has no
+    /// stored tail to go stale. Kept a multiple of 4 (the kernel's exact
+    /// chunk width) with zeroed guard slots (the scratch half is
+    /// pool-dirty).
+    live: usize,
 }
 
-impl ProductPair {
-    fn new(x: Vec<F128>, y: Vec<F128>) -> Self {
-        debug_assert_eq!(x.len(), y.len());
-        let half = x.len() / 2;
-        // The ping-pong halves come from the (dirty) scratch pool: every
-        // round fully writes `[..cur/2]` before the next round reads it,
-        // so no zeroing is needed — this drops a fresh zeroed allocation
-        // of `x.len()` words per prove. NOT live-prefix trimmed: the
-        // partner side's tail is load-bearing (see the twist-map note in
-        // `prove_multipoint_twisted`), so folds run the full domain.
+impl VirtualPair {
+    /// `live`: prefix outside of which the caller guarantees `x` is zero
+    /// (jagged weights vanish past the area; every call site hands a vec
+    /// whose tail is calloc-zero, which also covers the initial guards).
+    fn new(x: Vec<F128>, partner: Partner, rho: &[F128], round: usize, live: usize) -> Self {
+        debug_assert!(live <= x.len());
+        debug_assert_eq!(x.len(), 1usize << (rho.len() - round));
+        let n = x.len();
+        // Dirty scratch half: each round fully writes its live prefix and
+        // zeroes the guard slots before the next round reads them.
         Self {
-            sx: crate::scratch::take_f128(half),
-            sy: crate::scratch::take_f128(half),
+            sx: crate::scratch::take_f128(n / 2),
+            live: live.next_multiple_of(4).clamp(4, n),
             x,
-            y,
             flip: false,
+            partner,
+            rho: rho.to_vec(),
+            round,
         }
     }
 
-    /// Fold the live pair of length `cur` at `r` into the other half and
-    /// return the next round's message for this product.
+    /// Fold `x` at `r` into the other half, advance the partner's closed
+    /// form, and return the next round's message.
     fn fold_round(&mut self, cur: usize, r: F128) -> (F128, F128) {
+        debug_assert_eq!(cur, 1usize << (self.rho.len() - self.round));
         let half = cur / 2;
+        self.partner.advance(self.rho[self.round], r);
+        self.round += 1;
+        let eq = SplitEq::new(&self.rho[self.round..]);
+        let live = self.live.min(cur);
+        let lhalf = live / 2;
         let msg = if self.flip {
-            fold_and_round_oop_par(
-                &self.sx[..cur],
-                &self.sy[..cur],
+            fold_and_round_virtual_par(
+                &self.sx[..live],
                 r,
-                &mut self.x[..half],
-                &mut self.y[..half],
+                &mut self.x[..lhalf],
+                &self.partner,
+                &eq,
             )
         } else {
-            fold_and_round_oop_par(
-                &self.x[..cur],
-                &self.y[..cur],
+            fold_and_round_virtual_par(
+                &self.x[..live],
                 r,
-                &mut self.sx[..half],
-                &mut self.sy[..half],
+                &mut self.sx[..lhalf],
+                &self.partner,
+                &eq,
             )
         };
+        // Guard slots for the NEXT fold's 4-wide reads over dirty scratch.
+        let next = lhalf.next_multiple_of(4).min(half);
+        {
+            let gx = if self.flip { &mut self.x } else { &mut self.sx };
+            for slot in &mut gx[lhalf..next] {
+                *slot = F128::ZERO;
+            }
+        }
+        self.live = next;
         self.flip = !self.flip;
         msg
     }
 
-    /// Return all four buffers to the scratch pool.
+    /// Return both buffers to the scratch pool.
     fn reclaim(self) {
         crate::scratch::give_f128(self.x);
-        crate::scratch::give_f128(self.y);
         crate::scratch::give_f128(self.sx);
-        crate::scratch::give_f128(self.sy);
     }
+}
+
+/// Fused fold + next-round message for a [`VirtualPair`]: out-of-place fold
+/// of the materialized side at `r`, with the message accumulated against
+/// the partner's closed form evaluated at the OUTPUT positions (which live
+/// in the post-fold domain — the caller advances the partner and builds the
+/// post-fold [`SplitEq`] before calling). `a` is the live prefix (multiple
+/// of 4); positions are absolute since the prefix starts at 0.
+fn fold_and_round_virtual_par(
+    a: &[F128],
+    r: F128,
+    ao: &mut [F128],
+    partner: &Partner,
+    eq: &SplitEq,
+) -> (F128, F128) {
+    use rayon::prelude::*;
+    debug_assert_eq!(a.len(), 2 * ao.len());
+    debug_assert!(a.len() >= 4 && a.len().is_multiple_of(4));
+    const CO: usize = 1 << 13;
+    ao.par_chunks_mut(CO)
+        .zip(a.par_chunks(2 * CO))
+        .enumerate()
+        .map(|(ci, (oa, ain))| {
+            let base = ci * CO;
+            let mut g1 = F128::ZERO;
+            let mut gi = F128::ZERO;
+            for (j, (op, aq)) in oa
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(ain.as_chunks::<4>().0.iter())
+                .enumerate()
+            {
+                let na0 = aq[0] + r * (aq[1] + aq[0]);
+                let na1 = aq[2] + r * (aq[3] + aq[2]);
+                op[0] = na0;
+                op[1] = na1;
+                let u = base + 2 * j;
+                let p0 = partner.at(eq, u);
+                let p1 = partner.at(eq, u + 1);
+                g1 += na1 * p1;
+                gi += (na0 + na1) * (p0 + p1);
+            }
+            (g1, gi)
+        })
+        .reduce(|| (F128::ZERO, F128::ZERO), |(p, q), (s, t)| (p + s, q + t))
 }
 
 /// One live run of the sparse group product: `x` holds the combined group
@@ -2971,12 +3142,13 @@ impl SparseGroupPair {
 
     /// Build the support segments and the round-0 message. `sides` are the
     /// per-group `(γ-power, eq(z_row,·) table, cols)` triples — the same
-    /// shape [`build_combined_weight_and_msg`] takes; `eq_rho` is the full
-    /// `eq(ρ,·)` tensor (borrowed — the sparse path never keeps it).
+    /// shape [`build_combined_weight_and_msg`] takes; `eq0` evaluates the
+    /// round-0 `eq(ρ,·)` tensor pointwise (the full vector is never
+    /// materialized — support-proportional fills only).
     fn build(
         params: &JaggedParams,
         sides: &[(F128, Vec<F128>, &[F128])],
-        eq_rho: &[F128],
+        eq0: &SplitEq,
         rho: &[F128],
     ) -> (Self, (F128, F128)) {
         use rayon::prelude::*;
@@ -3025,7 +3197,7 @@ impl SparseGroupPair {
                         d = stop;
                     }
                 }
-                let y = eq_rho[s..e].to_vec();
+                let y = (s..e).map(|d| eq0.at(d)).collect();
                 SparseSeg { start: s, x, y }
             })
             .collect();
@@ -3137,27 +3309,36 @@ impl SparseGroupPair {
     /// Materialize the dense [`ProductPair`] for the tail rounds: scatter
     /// the stored weights, rebuild the partner as the scaled eq tensor —
     /// both exactly equal to what the dense path would hold at this round.
-    fn densify(&self, cur: usize) -> ProductPair {
+    fn densify(&self, cur: usize) -> VirtualPair {
         debug_assert_eq!(cur, 1usize << (self.rho.len() - self.round));
         let mut x = vec![F128::ZERO; cur];
+        let mut live = 0usize;
         for seg in &self.segs {
             for (i, &v) in seg.x.iter().enumerate() {
                 x[seg.start + i] += v;
             }
+            live = live.max(seg.start + seg.x.len());
         }
-        let y = super::ring_switch::build_eq_scaled_parallel(&self.rho[self.round..], self.c);
-        ProductPair::new(x, y)
+        // The e partner continues virtually: the accumulated scalar `c` IS
+        // its closed form's coefficient at this round.
+        VirtualPair::new(
+            x,
+            Partner::Scaled { s: self.c },
+            &self.rho,
+            self.round,
+            live,
+        )
     }
 }
 
 /// Densify once the stored support stops paying against the live length.
 const SPARSE_DENSIFY_FACTOR: usize = 4;
 
-/// A product of the two-product sumcheck: dense ping-pong buffers, or the
-/// group product's segment-sparse state (which densifies itself for the
-/// tail rounds).
+/// A product of the two-product sumcheck: a materialized weight with a
+/// virtual partner, or the group product's segment-sparse state (which
+/// densifies itself into the former for the tail rounds).
 enum Pair {
-    Dense(ProductPair),
+    Virtual(VirtualPair),
     Sparse(SparseGroupPair),
 }
 
@@ -3166,10 +3347,10 @@ impl Pair {
         if let Pair::Sparse(sp) = self
             && sp.stored() * SPARSE_DENSIFY_FACTOR > cur
         {
-            *self = Pair::Dense(sp.densify(cur));
+            *self = Pair::Virtual(sp.densify(cur));
         }
         match self {
-            Pair::Dense(p) => p.fold_round(cur, r),
+            Pair::Virtual(p) => p.fold_round(cur, r),
             Pair::Sparse(p) => p.fold_round(cur, r),
         }
     }
