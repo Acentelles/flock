@@ -1624,7 +1624,10 @@ pub(crate) fn build_merged_weight_and_prime(
             let base = (ci * CHUNK) as u64;
             let end = base + out.len() as u64;
             if base >= area as u64 {
-                out.fill(F128::ZERO);
+                // Wholly past the jagged area: W is identically zero there
+                // and the merged sumcheck's trimmed folds never read it —
+                // leave the scratch chunk dirty (the caller zeroes the few
+                // guard slots its rounded-up round-0 read can touch).
                 return (F128::ZERO, F128::ZERO);
             }
             let live_end = end.min(area as u64);
@@ -2566,6 +2569,7 @@ fn build_combined_weight_and_msg(
     let mut a = vec![F128::ZERO; 1usize << params.m];
     let pfx = &params.col_prefix_sums;
     let n_cols = pfx.len() - 1;
+    let area = pfx[n_cols];
     const CH: usize = 1 << 14;
     let msg = a
         .par_chunks_mut(CH)
@@ -2573,6 +2577,13 @@ fn build_combined_weight_and_msg(
         .enumerate()
         .map(|(ci, (chunk, gc))| {
             let start = (ci * CH) as u64;
+            // Chunks past the jagged area: the weight is identically zero
+            // there (the fill below never reaches them — calloc zeros), so
+            // every round-0 message term is zero and the partner chunk
+            // need not even be read.
+            if start >= area {
+                return (F128::ZERO, F128::ZERO);
+            }
             let end = start + chunk.len() as u64;
             for (scale, eq_r, cols) in sides {
                 let mut y = pfx.partition_point(|&t| t <= start).saturating_sub(1);
@@ -2696,6 +2707,13 @@ pub fn prove_multipoint_twisted<C: Challenger>(
             }
         }
         let tables = linear_byte_tables(&images);
+        // The twist map runs over the FULL domain: unlike the combined
+        // weight, g's tail is load-bearing — folding mixes tail positions
+        // into the straddling live block round by round, and the anchor
+        // checks the endpoint against the closed form of the full twisted
+        // eq. (An area-trimmed g was tried and breaks the late round
+        // messages; only products whose BOTH sides vanish past the area —
+        // the merged sumcheck's (q, W) — admit the live-prefix fold.)
         let mut gv = vec![F128::ZERO; 1usize << m];
         gv.par_iter_mut()
             .zip(eq_rho.par_iter())
@@ -2773,6 +2791,14 @@ pub fn prove_multipoint_twisted<C: Challenger>(
         (g_one, g_inf) = nxt;
         cur /= 2;
     }
+    // The dense pairs' four buffers go back to the scratch pool (the two
+    // half-size ping-pong halves came from it; the full-size vectors seed
+    // it for the next prove).
+    for pair in pairs {
+        if let Pair::Dense(p) = pair {
+            p.reclaim();
+        }
+    }
     if trace {
         eprintln!(
             "    [multipoint] two-product sumcheck ({m} rounds): {:6.2} ms",
@@ -2845,9 +2871,15 @@ impl ProductPair {
     fn new(x: Vec<F128>, y: Vec<F128>) -> Self {
         debug_assert_eq!(x.len(), y.len());
         let half = x.len() / 2;
+        // The ping-pong halves come from the (dirty) scratch pool: every
+        // round fully writes `[..cur/2]` before the next round reads it,
+        // so no zeroing is needed — this drops a fresh zeroed allocation
+        // of `x.len()` words per prove. NOT live-prefix trimmed: the
+        // partner side's tail is load-bearing (see the twist-map note in
+        // `prove_multipoint_twisted`), so folds run the full domain.
         Self {
-            sx: vec![F128::ZERO; half],
-            sy: vec![F128::ZERO; half],
+            sx: crate::scratch::take_f128(half),
+            sy: crate::scratch::take_f128(half),
             x,
             y,
             flip: false,
@@ -2877,6 +2909,14 @@ impl ProductPair {
         };
         self.flip = !self.flip;
         msg
+    }
+
+    /// Return all four buffers to the scratch pool.
+    fn reclaim(self) {
+        crate::scratch::give_f128(self.x);
+        crate::scratch::give_f128(self.y);
+        crate::scratch::give_f128(self.sx);
+        crate::scratch::give_f128(self.sy);
     }
 }
 

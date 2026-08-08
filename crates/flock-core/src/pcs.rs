@@ -1172,7 +1172,7 @@ pub fn open_batch_merged<Ch: Challenger>(
     // The twisted weight over the dense cube (count-proportional Φ-pass;
     // zero tail past the jagged area).
     let t = std::time::Instant::now();
-    let (w, (u0, u2)) = jagged::build_merged_weight_and_prime(&params, &weight_claims, &q);
+    let (mut w, (u0, u2)) = jagged::build_merged_weight_and_prime(&params, &weight_claims, &q);
     if trace {
         eprintln!(
             "  [open_merged] W build + round-0 prime (2^{} words): {:6.2} ms",
@@ -1183,11 +1183,25 @@ pub fn open_batch_merged<Ch: Challenger>(
 
     // ---- Merged sumcheck: Σ_d q[d]·W[d] = target, dense_log rounds, same
     // message/fold conventions as the virtual-opening sumcheck.
+    //
+    // LIVE-PREFIX folds: both q (the committed stack, honestly zero-padded)
+    // and W (zero past the jagged area by construction) vanish past the
+    // area, every skipped message term carries one of them as a factor, and
+    // folding maps a zero tail to a zero tail — so each round folds only
+    // the live prefix, rounded to the fused kernel's 4-wide chunking with
+    // explicitly zeroed guard slots (the scratch halves are pool-dirty).
     let t = std::time::Instant::now();
     let (mut g_one, mut g_inf) = (target + u0, u2);
     let mut merged_rounds = Vec::with_capacity(dense_log);
     let mut rho = Vec::with_capacity(dense_log);
     let l = q.len();
+    let area = (params.area() as usize).min(l);
+    let mut live = area.next_multiple_of(4).clamp(4, l);
+    // W's guard slots may sit past its (in-chunk-zeroed) straddle tail in a
+    // wholly-dirty scratch chunk; q's are honest zeros already.
+    for slot in &mut w[area..live] {
+        *slot = F128::ZERO;
+    }
     let mut sa = crate::scratch::take_f128(l / 2);
     let mut sb = crate::scratch::take_f128(l / 2);
     let mut a = crate::scratch::take_f128(l / 4);
@@ -1206,13 +1220,21 @@ pub fn open_batch_merged<Ch: Challenger>(
             (&a, &bb)
         };
         if cur > 2 {
+            let lv = live.min(cur);
+            let lhalf = lv / 2;
             (g_one, g_inf) = jagged::fold_and_round_oop_par(
-                &a_src[..cur],
-                &b_src[..cur],
+                &a_src[..lv],
+                &b_src[..lv],
                 r,
-                &mut sa[..half],
-                &mut sb[..half],
+                &mut sa[..lhalf],
+                &mut sb[..lhalf],
             );
+            let next = lhalf.next_multiple_of(4).min(half).max(lhalf);
+            for i in lhalf..next {
+                sa[i] = F128::ZERO;
+                sb[i] = F128::ZERO;
+            }
+            live = next;
         } else {
             jagged::fold_oop_par(
                 &a_src[..cur],
