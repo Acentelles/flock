@@ -2624,6 +2624,7 @@ impl SplitEq {
 /// folds (the straddling live block mixes tail values, and the anchor pins
 /// the endpoint to the closed form of the FULL vector), but a virtual
 /// partner has no stored tail — every evaluation IS the closed form.
+#[derive(Clone)]
 enum Partner {
     Twisted {
         images: Box<[F128; 128]>,
@@ -2829,16 +2830,49 @@ pub fn prove_multipoint_twisted<C: Challenger>(
             }
         }
         let partner = Partner::twisted(images);
-        let eq_cs: Vec<Vec<F128>> = claims.iter().map(|c| build_eq_table(c.z_col)).collect();
-        let sides: Vec<(F128, Vec<F128>, &[F128])> = claims
-            .iter()
-            .zip(&eq_cs)
-            .enumerate()
-            .map(|(i, (c, eq_c))| (gpow[128 * i], build_eq_table(c.z_row), eq_c.as_slice()))
-            .collect();
-        let (av, msg) = build_combined_weight_and_msg(params, &sides, &partner, &eq0);
-        msg0 = (msg0.0 + msg.0, msg0.1 + msg.1);
-        pairs.push(Pair::Virtual(VirtualPair::new(av, partner, rho, 0, area)));
+        if let Some(used) = aligned_full_columns(params) {
+            // Aligned full-count shape: the RS combined weight is, per used
+            // column, a sum of plain scaled row-eq tensors — no fold tables
+            // (they live in the dual values and the g partner) — so it runs
+            // the row rounds in CLOSED FORM: no 2^m fill, no fold traffic,
+            // no ping-pong scratch. Same field elements as the materialized
+            // path (exact algebra), pinned by the aligned oracle test.
+            let coltabs: Vec<Vec<F128>> = claims
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let eq_c = build_eq_table(c.z_col);
+                    used.iter().map(|&y| gpow[128 * i] * eq_c[y]).collect()
+                })
+                .collect();
+            let rows: Vec<(Vec<F128>, F128)> = claims
+                .iter()
+                .map(|c| (c.z_row.to_vec(), F128::ONE))
+                .collect();
+            let ar = AlignedRsPair {
+                coltabs,
+                rows,
+                partner,
+                rho: rho.to_vec(),
+                round: 0,
+                nu: params.n,
+                n_used: used.len(),
+            };
+            let msg = ar.round0_msg(&eq0);
+            msg0 = (msg0.0 + msg.0, msg0.1 + msg.1);
+            pairs.push(Pair::AlignedRs(ar));
+        } else {
+            let eq_cs: Vec<Vec<F128>> = claims.iter().map(|c| build_eq_table(c.z_col)).collect();
+            let sides: Vec<(F128, Vec<F128>, &[F128])> = claims
+                .iter()
+                .zip(&eq_cs)
+                .enumerate()
+                .map(|(i, (c, eq_c))| (gpow[128 * i], build_eq_table(c.z_row), eq_c.as_slice()))
+                .collect();
+            let (av, msg) = build_combined_weight_and_msg(params, &sides, &partner, &eq0);
+            msg0 = (msg0.0 + msg.0, msg0.1 + msg.1);
+            pairs.push(Pair::Virtual(VirtualPair::new(av, partner, rho, 0, area)));
+        }
     }
     let mut sparse_support: Option<u64> = None;
     if n_g > 0 {
@@ -3053,6 +3087,208 @@ impl VirtualPair {
     fn reclaim(self) {
         crate::scratch::give_f128(self.x);
         crate::scratch::give_f128(self.sx);
+    }
+}
+
+/// One column's message contribution for the aligned RS closed form:
+/// pairs over the column's `b` positions of
+/// `ā = Σ_i a_i·row_eq_i(row)` against the partner. The row-eq hi factor
+/// is constant across each `2^n_lo` run, so `a_i·hi` hoists per run and
+/// each position pays one multiply per claim — exact (field algebra), the
+/// same field elements as the unhoisted product.
+#[inline]
+fn column_pair_msg(
+    a: &[F128],
+    row_eqs: &[SplitEq],
+    partner: &Partner,
+    eq: &SplitEq,
+    base: usize,
+    b: usize,
+) -> (F128, F128) {
+    let mut g1 = F128::ZERO;
+    let mut gi = F128::ZERO;
+    let n_lo = row_eqs[0].n_lo;
+    debug_assert!(row_eqs.iter().all(|e| e.n_lo == n_lo));
+    if n_lo >= 1 {
+        let mask = (1usize << n_lo) - 1;
+        let mut ah: Vec<F128> = vec![F128::ZERO; a.len()];
+        let mut cur_hi = usize::MAX;
+        for t2 in (0..b).step_by(2) {
+            let h = t2 >> n_lo;
+            if h != cur_hi {
+                cur_hi = h;
+                for (dst, (&ai, e)) in ah.iter_mut().zip(a.iter().zip(row_eqs)) {
+                    *dst = ai * e.hi[h];
+                }
+            }
+            let mut a0 = F128::ZERO;
+            let mut a1 = F128::ZERO;
+            for (&ahi, e) in ah.iter().zip(row_eqs) {
+                a0 += ahi * e.lo[t2 & mask];
+                a1 += ahi * e.lo[(t2 + 1) & mask];
+            }
+            let p0 = partner.at(eq, base + t2);
+            let p1 = partner.at(eq, base + t2 + 1);
+            g1 += a1 * p1;
+            gi += (a0 + a1) * (p0 + p1);
+        }
+    } else {
+        // One (or zero) remaining row bits: runs are single positions, no
+        // hoist — fall back to direct evaluation.
+        for t2 in (0..b).step_by(2) {
+            let mut a0 = F128::ZERO;
+            let mut a1 = F128::ZERO;
+            for (&ai, e) in a.iter().zip(row_eqs) {
+                a0 += ai * e.at(t2);
+                a1 += ai * e.at(t2 + 1);
+            }
+            let p0 = partner.at(eq, base + t2);
+            let p1 = partner.at(eq, base + t2 + 1);
+            g1 += a1 * p1;
+            gi += (a0 + a1) * (p0 + p1);
+        }
+    }
+    (g1, gi)
+}
+
+/// The used-column list when EVERY used column is FULL (height `2^n`) — the
+/// full-count shape whose dense stack is column-aligned at `2^n`
+/// boundaries: position `d` splits as `(rank j, row) = (d >> n, d & mask)`
+/// with `j` indexing the used columns in order.
+fn aligned_full_columns(params: &JaggedParams) -> Option<Vec<usize>> {
+    let full = 1u64 << params.n;
+    let pfx = &params.col_prefix_sums;
+    let mut used = Vec::new();
+    for y in 0..pfx.len() - 1 {
+        match pfx[y + 1] - pfx[y] {
+            0 => {}
+            h if h == full => used.push(y),
+            _ => return None,
+        }
+    }
+    (!used.is_empty() && params.n >= 1).then_some(used)
+}
+
+/// The RS product of the two-product sumcheck in CLOSED FORM, for the
+/// aligned full-count shape: the combined weight is, per used column `j`,
+/// a sum of R plain scaled row-eq tensors —
+/// `ā(j, row) = Σ_i coltab_i[j]·s_i·eq(z_row_i[round..], row)` — with NO
+/// fold tables (the twisted assist moved the Frobenius structure into the
+/// dual values and the g partner), so pointwise evaluation is a couple of
+/// multiplies. Column alignment makes the form survive the row-bit folds:
+/// each round updates the per-claim scalar `s_i ← s_i·(1+z_row_i[k]+r_k)`
+/// exactly like the partners. Nothing is materialized until the row bits
+/// are exhausted, at which point the state densifies into a [`VirtualPair`]
+/// over the tiny per-column domain. Unaligned shapes (partial counts) keep
+/// the materialized path — their column boundaries straddle fold blocks.
+struct AlignedRsPair {
+    /// Per claim: γ-baked column factors in used-rank order
+    /// (`gpow[128 i]·eq_col_i[y_j]`).
+    coltabs: Vec<Vec<F128>>,
+    /// Per claim: the row point and its running fold scalar.
+    rows: Vec<(Vec<F128>, F128)>,
+    partner: Partner,
+    rho: Vec<F128>,
+    round: usize,
+    nu: usize,
+    n_used: usize,
+}
+
+impl AlignedRsPair {
+    /// The round-0 message — the weight-pass replacement: no fill, no
+    /// 2^m buffer, pure closed-form evaluation against the partner.
+    fn round0_msg(&self, eq0: &SplitEq) -> (F128, F128) {
+        use rayon::prelude::*;
+        debug_assert_eq!(self.round, 0);
+        let row_eqs: Vec<SplitEq> = self
+            .rows
+            .iter()
+            .map(|(z, _)| SplitEq::new(&z[..self.nu]))
+            .collect();
+        let b = 1usize << self.nu;
+        (0..self.n_used)
+            .into_par_iter()
+            .map(|j| {
+                let a: Vec<F128> = self.coltabs.iter().map(|ct| ct[j]).collect();
+                let base = j * b;
+                column_pair_msg(&a, &row_eqs, &self.partner, eq0, base, b)
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(x1, xi), (y1, yi)| (x1 + y1, xi + yi),
+            )
+    }
+
+    /// Fold (in closed form: advance the scalars) and return the next
+    /// round's message. Only called while `round + 1 < nu` — the dispatch
+    /// densifies before the last row fold.
+    fn fold_round(&mut self, cur: usize, r: F128) -> (F128, F128) {
+        use rayon::prelude::*;
+        debug_assert_eq!(cur, 1usize << (self.rho.len() - self.round));
+        self.partner.advance(self.rho[self.round], r);
+        for (z, s) in self.rows.iter_mut() {
+            *s *= F128::ONE + z[self.round] + r;
+        }
+        self.round += 1;
+        let s_rem = self.nu - self.round;
+        debug_assert!(
+            s_rem >= 1,
+            "the dispatch densifies before the columns collapse"
+        );
+        let eq = SplitEq::new(&self.rho[self.round..]);
+        let row_eqs: Vec<SplitEq> = self
+            .rows
+            .iter()
+            .map(|(z, _)| SplitEq::new(&z[self.round..self.nu]))
+            .collect();
+        let b = 1usize << s_rem;
+        (0..self.n_used)
+            .into_par_iter()
+            .map(|j| {
+                let a: Vec<F128> = self
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, s))| self.coltabs[i][j] * *s)
+                    .collect();
+                let base = j * b;
+                column_pair_msg(&a, &row_eqs, &self.partner, &eq, base, b)
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(x1, xi), (y1, yi)| (x1 + y1, xi + yi),
+            )
+    }
+
+    /// Materialize the (by now tiny) per-column state into a
+    /// [`VirtualPair`] at the current round — `2^(m−round)` entries, the
+    /// last one or two row bits still unexpanded.
+    fn densify(&self) -> VirtualPair {
+        let s_rem = self.nu - self.round;
+        let n = 1usize << (self.rho.len() - self.round);
+        let b = 1usize << s_rem;
+        let row_eqs: Vec<Vec<F128>> = self
+            .rows
+            .iter()
+            .map(|(z, _)| build_eq_table(&z[self.round..self.nu]))
+            .collect();
+        let mut x = vec![F128::ZERO; n];
+        for j in 0..self.n_used {
+            for rb in 0..b {
+                let mut v = F128::ZERO;
+                for (i, (_, s)) in self.rows.iter().enumerate() {
+                    v += self.coltabs[i][j] * *s * row_eqs[i][rb];
+                }
+                x[j * b + rb] = v;
+            }
+        }
+        VirtualPair::new(
+            x,
+            self.partner.clone(),
+            &self.rho,
+            self.round,
+            self.n_used * b,
+        )
     }
 }
 
@@ -3346,11 +3582,13 @@ impl SparseGroupPair {
 const SPARSE_DENSIFY_FACTOR: usize = 4;
 
 /// A product of the two-product sumcheck: a materialized weight with a
-/// virtual partner, or the group product's segment-sparse state (which
-/// densifies itself into the former for the tail rounds).
+/// virtual partner, the group product's segment-sparse state, or the RS
+/// product's aligned closed form — the latter two densify themselves into
+/// the first for the tail rounds.
 enum Pair {
     Virtual(VirtualPair),
     Sparse(SparseGroupPair),
+    AlignedRs(AlignedRsPair),
 }
 
 impl Pair {
@@ -3360,9 +3598,18 @@ impl Pair {
         {
             *self = Pair::Virtual(sp.densify(cur));
         }
+        // The aligned RS form holds only while at least one row bit remains
+        // AFTER the fold (its per-column message kernel needs both legs of
+        // a pair inside one column): densify at 2·2^k_cols entries.
+        if let Pair::AlignedRs(a) = self
+            && a.round + 1 >= a.nu
+        {
+            *self = Pair::Virtual(a.densify());
+        }
         match self {
             Pair::Virtual(p) => p.fold_round(cur, r),
             Pair::Sparse(p) => p.fold_round(cur, r),
+            Pair::AlignedRs(p) => p.fold_round(cur, r),
         }
     }
 }
@@ -4146,6 +4393,38 @@ mod tests {
                 let (params, _q) = random_instance(&mut ch, n, k, m);
                 check_multipoint(&params, &mut ch, &format!("n={n} k={k} m={m} rep={rep}"));
             }
+        }
+    }
+
+    /// Full-count shapes — every used column FULL (height `2^n`) — drive
+    /// the `AlignedRsPair` closed-form path (the sibling tests' random
+    /// heights keep the materialized fallback covered). Patterns: all
+    /// columns full, a used-prefix with a dead tail, and scattered dead
+    /// columns; `n = 1` exercises the immediate-densify degenerate.
+    #[test]
+    fn multipoint_twisted_aligned_columns_matches_bruteforce() {
+        let mut ch = RandomChallenger::new(0xA119_ED01);
+        let cases: &[(usize, usize, usize, &[usize])] = &[
+            (3, 2, 5, &[0, 1, 2, 3]),        // all 4 columns full: area == 2^m
+            (4, 3, 7, &[0, 1, 2, 3, 4]),     // used prefix, dead tail
+            (3, 4, 8, &[0, 2, 3, 7, 9, 12]), // scattered dead columns
+            (1, 3, 4, &[1, 4, 6]),           // n = 1: densify at round 0
+        ];
+        for &(n, k, m, used) in cases {
+            let mut heights = vec![0u64; 1 << k];
+            for &y in used {
+                heights[y] = 1 << n;
+            }
+            let params = JaggedParams::from_heights(&heights, n, m);
+            assert!(
+                aligned_full_columns(&params).is_some(),
+                "case must drive the aligned path"
+            );
+            check_multipoint(
+                &params,
+                &mut ch,
+                &format!("aligned n={n} k={k} m={m} used={}", used.len()),
+            );
         }
     }
 
