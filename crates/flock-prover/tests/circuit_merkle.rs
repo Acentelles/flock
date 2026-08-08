@@ -10826,6 +10826,15 @@ fn emit_real_child_region(
             .collect();
         prefix_product(sb, &factors)
     };
+    // ASSIST_CENSUS=1 — what the JAGGED LAYOUT costs this region. Everything
+    // from here to `connect(anc_w, expect_w)` is the W side of the anchor
+    // expect: the per-run boundary eq products (`eqc_w`, the one site where
+    // the child's counts are baked as circuit structure) and the column-eq
+    // dots that consume them. The census reports the two slots' rows across
+    // that span, so the prize of BINDING W instead of REBUILDING it is a
+    // measured number rather than a formula.
+    let census = std::env::var("ASSIST_CENSUS").is_ok();
+    let (pf0, mac0) = (sb.rows_in_slot(pfslot), sb.rows_in_slot(cs.macs));
     let eqc_w: Vec<Wire> = rt
         .bounds_i
         .iter()
@@ -10865,6 +10874,8 @@ fn emit_real_child_region(
             prefix_product(sb, &factors)
         })
         .collect();
+    let pf_eqc = sb.rows_in_slot(pfslot) - pf0;
+    let (mut n_hot, mut n_gen) = (0usize, 0usize);
     // Column weights via EQ-TABLE DOUBLING (the committed-footprint fix).
     let col_eqc: Vec<Wire> = rt.run_of.iter().map(|&r3| eqc_w[r3]).collect();
     let lo_bits = k_cols_i / 2;
@@ -10957,10 +10968,12 @@ fn emit_real_child_region(
             if let Some(h) = hot {
                 assert!(i2 >= 2, "one-hot columns are gather claims");
                 let e = eqc_w[rt.run_of[h]];
+                n_hot += 1;
                 w_st = sb.gate(macs, &[w_st, gpd_w, e])[0];
             } else {
                 let z_col_w: Vec<Wire> = (0..k_cols_i).map(|j| el_col_w(j, i2)).collect();
                 let d = eq_dot(sb, &z_col_w);
+                n_gen += 1;
                 w_st = sb.gate(macs, &[w_st, gpd_w, d])[0];
             }
         }
@@ -10986,6 +10999,22 @@ fn emit_real_child_region(
         expect_w = sb.gate(macs, &[expect_w, coeff, wd])[0];
     }
     sb.connect(anc_w, expect_w);
+    if census {
+        let (pf_w_side, mac_w_side) = (
+            sb.rows_in_slot(pfslot) - pf0,
+            sb.rows_in_slot(cs.macs) - mac0,
+        );
+        eprintln!(
+            "ASSIST CENSUS  runs {} of {} cols (k {}), m+1 {}, statements {} one-hot + {} general\n\
+             \x20              eqc_w prefix rows {pf_eqc}; W side total: pf {pf_w_side} + mac {mac_w_side} rows",
+            rt.bounds_i.len(),
+            1usize << k_cols_i,
+            k_cols_i,
+            m_mp2 + 1,
+            n_hot + 2,
+            n_gen,
+        );
+    }
 
     cen.push(("multipoint + anchor expect advice", sb.public_len(), sb.rows_in_slot(cs.macs)));
     // ---- the assertion EMISSIONS (all three families) ----
