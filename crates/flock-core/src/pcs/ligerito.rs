@@ -3638,6 +3638,7 @@ pub(crate) fn recursive_prover_with_basis_precomputed_round0_lanes<Ch: Challenge
     l0_num_lanes: usize,
     l0_lane_major: bool,
     round0_uv: (F128, F128),
+    l0_jit_basis: Option<BasisWindowFn<'_>>,
     challenger: &mut Ch,
 ) -> LigeritoProof {
     recursive_prover_with_basis_impl(
@@ -3650,7 +3651,7 @@ pub(crate) fn recursive_prover_with_basis_precomputed_round0_lanes<Ch: Challenge
         l0_num_lanes,
         l0_lane_major,
         usize::MAX,
-        None,
+        l0_jit_basis,
         Some(SumcheckMessage {
             u_0: round0_uv.0,
             u_2: round0_uv.1,

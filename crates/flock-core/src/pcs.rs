@@ -210,16 +210,42 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     );
 
     let t = std::time::Instant::now();
+    let CombinedClaim {
+        ring_switches,
+        b_combined,
+        eq_basis,
+        target_combined,
+        round0_prime,
+    } = combined;
+    // Factored EqPoint basis: the L0 first fold sources b's windows
+    // just-in-time from the split tables instead of streaming (and ever
+    // building) the full-domain array.
+    let jit_fill;
+    let jit: Option<ligerito::BasisWindowFn<'_>> = match &eq_basis {
+        Some((lo, hi, n_lo)) => {
+            let mask = (1usize << n_lo) - 1;
+            let n_lo = *n_lo;
+            jit_fill = move |out: &mut [F128], g0: usize| {
+                for (i, slot) in out.iter_mut().enumerate() {
+                    let u = g0 + i;
+                    *slot = lo[u & mask] * hi[u >> n_lo];
+                }
+            };
+            Some(&jit_fill)
+        }
+        None => None,
+    };
     let ligerito_proof = ligerito::recursive_prover_with_basis_precomputed_round0_lanes(
         lig_config,
         packed_witness,
-        combined.b_combined,
-        combined.target_combined,
+        b_combined,
+        target_combined,
         &prover_data.codeword,
         &prover_data.merkle_tree,
         l0_num_lanes,
         lane_major,
-        combined.round0_prime,
+        round0_prime,
+        jit,
         challenger,
     );
     if trace {
@@ -234,7 +260,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     }
 
     BatchOpeningProofLigerito {
-        ring_switches: combined.ring_switches,
+        ring_switches,
         ligerito: ligerito_proof,
     }
 }
@@ -242,9 +268,17 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
 /// What ring_switch + claim-combination produces, fed to the Ligerito backend.
 struct CombinedClaim {
     ring_switches: Vec<RingSwitchProof>,
-    /// The materialized γ-combined basis — EMPTY when `deferred` is `Some`
-    /// (the streaming path never writes the full-domain array).
+    /// The materialized γ-combined basis — EMPTY when `eq_basis` is `Some`
+    /// (the factored path never writes the full-domain array).
     b_combined: Vec<F128>,
+    /// The single-EqPoint fast path's FACTORED basis: `(γ-scaled eq_lo,
+    /// eq_hi, n_lo)` with `b[u] = lo[u & mask]·hi[u >> n_lo]`. γ is one
+    /// fixed transcript scalar (exactly one packed-direct claim), so the
+    /// whole basis is a scaled eq tensor — two √L tables instead of a
+    /// 2^(m−7)-word array. The L0 first fold sources windows from it
+    /// just-in-time ([`ligerito::BasisWindowFn`]); later folds carry the
+    /// half-size folded basis as before.
+    eq_basis: Option<(Vec<F128>, Vec<F128>, usize)>,
     target_combined: F128,
     /// Round-0 sumcheck `(u_0, u_2)` prime over `packed_witness · b_combined`,
     /// consumed by `recursive_prover_with_basis_precomputed_round0`.
@@ -385,24 +419,30 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         && let DirectEqInd::EqPoint(point) = &packed_direct[0].eq_ind
     {
         assert_eq!(1usize << point.len(), l, "EqPoint length mismatch");
-        let b_combined = ring_switch::build_eq_scaled_parallel(point, gammas_pd[0]);
+        // FACTORED basis: b = γ·eq(point,·) is one fixed γ times an eq
+        // tensor, so two √L tables replace the 2^(m−7)-word array — γ baked
+        // into the lo half. Exact: field ops are exact, so the split
+        // product is bitwise the materialized entry.
+        let n_lo = point.len() / 2;
+        let lo = ring_switch::build_eq_scaled_parallel(&point[..n_lo], gammas_pd[0]);
+        let hi = ring_switch::build_eq_scaled_parallel(&point[n_lo..], F128::ONE);
+        let mask = (1usize << n_lo) - 1;
+        let bs = |u: usize| lo[u & mask] * hi[u >> n_lo];
         let blk = eqpoint_round0_block;
         let (round0_u0, round0_u2) = if blk == 1 {
             const C: usize = 1 << 13;
             packed_witness
                 .par_chunks(C)
-                .zip(b_combined.par_chunks(C))
-                .map(|(qc, wc)| {
+                .enumerate()
+                .map(|(ci, qc)| {
+                    let base = ci * C;
                     let mut a = F128::ZERO;
                     let mut b = F128::ZERO;
-                    for (qp, wp) in qc
-                        .as_chunks::<2>()
-                        .0
-                        .iter()
-                        .zip(wc.as_chunks::<2>().0.iter())
-                    {
-                        a += qp[0] * wp[0];
-                        b += (qp[0] + qp[1]) * (wp[0] + wp[1]);
+                    for (j, qp) in qc.as_chunks::<2>().0.iter().enumerate() {
+                        let u = base + 2 * j;
+                        let (w0, w1) = (bs(u), bs(u + 1));
+                        a += qp[0] * w0;
+                        b += (qp[0] + qp[1]) * (w0 + w1);
                     }
                     (a, b)
                 })
@@ -424,7 +464,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                     let mut u2 = F128::ZERO;
                     for t in 0..blk {
                         let (q0, q1) = (packed_witness[b0 + t], packed_witness[b1 + t]);
-                        let (w0, w1) = (b_combined[b0 + t], b_combined[b1 + t]);
+                        let (w0, w1) = (bs(b0 + t), bs(b1 + t));
                         u0 += q0 * w0;
                         u2 += (q0 + q1) * (w0 + w1);
                     }
@@ -443,7 +483,8 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         }
         return CombinedClaim {
             ring_switches: Vec::new(),
-            b_combined,
+            b_combined: Vec::new(),
+            eq_basis: Some((lo, hi, n_lo)),
             target_combined,
             round0_prime: (round0_u0, round0_u2),
         };
@@ -659,6 +700,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     CombinedClaim {
         ring_switches,
         b_combined,
+        eq_basis: None,
         target_combined,
         round0_prime: (round0_u0, round0_u2),
     }
