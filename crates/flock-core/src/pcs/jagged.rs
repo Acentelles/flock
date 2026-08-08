@@ -1615,6 +1615,17 @@ pub(crate) fn build_merged_weight_and_prime(
     // The merged sumcheck's round-0 prime `(u0, u2)` is fused into the same
     // pass (CHUNK is even, so element pairs never straddle chunks); the
     // dead tail past the area contributes zero on both sides.
+    //
+    // W stays MATERIALIZED, measured, not by omission: this pass is
+    // evaluation-bound, not store-bound — a store-skipping probe at m32
+    // (2 RS claims + 1 scalar group) timed 266 ms ST / 39 ms MT against
+    // ~240-290 / ~50 with the store, i.e. the fold-table applications
+    // dominate and the DRAM write-back is ≤20 ms ST / ~10 MT. Both the
+    // "recompute W in a fused prime+fold pass" idea and a virtual W (the
+    // assist partners' treatment) re-pay that evaluation — once more per
+    // pass or once per round — for a saving bounded by the store + one
+    // fold read. Net negative at this claim mix; r_0's Fiat-Shamir
+    // dependence on the full prime rules out any single-pass scheme.
     const CHUNK: usize = 1 << 14;
     let ps = &params.col_prefix_sums;
     let prime = w
