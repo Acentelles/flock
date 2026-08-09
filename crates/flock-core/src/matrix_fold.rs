@@ -626,6 +626,486 @@ pub fn verify_fold<Ch: Challenger>(
     })
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// The jagged layout table J and its structure-aware fold
+// ───────────────────────────────────────────────────────────────────────────
+//
+// The assist verifier's count-dependent scalar `W(ρ) = Σ_y w_y ·
+// Π_ℓ eq(t_{y-1}[ℓ], ρ_{c,ℓ})·eq(t_y[ℓ], ρ_{d,ℓ})` is a bilinear form on the
+// LAYOUT: rows indexed by layout column `y`, columns by the interleaved
+// boundary-pair space, content the cumulative heights alone. Deferring it
+// gives the layout the same treatment the constraint matrices and the wiring
+// sigma already get — a claim family folded down the tree and discharged once
+// at the root, so no count reaches any circuit's structure.
+//
+// [`prove_fold`] cannot serve it: the pair space has `2(m+1)` variables
+// (`2^44`-sized in real shapes) and the dense column phase would materialize
+// it. J has at most one nonzero per row — at most `2^k` distinct pairs — so
+// this fold walks the runs instead: a sparse column phase (per-round messages
+// from the surviving nonzeros, the claims' eq tensors handled analytically)
+// and a dense row phase over the small `2^k` side, reusing the round
+// machinery above. Proof shape, transcript conventions and the output claim
+// are [`FoldProof`]/[`MatrixClaim`] verbatim, so the folded claim inherits
+// onward through either fold path.
+
+const DOMAIN_JAGGED: &[u8] = b"flock-jagged-fold-v0";
+
+/// The jagged layout as a matrix: row `y` (a column of the union's jagged
+/// layout) has its single 1 at the INTERLEAVED boundary-pair index of
+/// `(t_{y-1}, t_y)` — column-index bit `2ℓ` is `t_{y-1}[ℓ]`, bit `2ℓ+1` is
+/// `t_y[ℓ]`, matching the assist point's `(c_0, d_0, c_1, d_1, …)` order.
+/// Content is the cumulative heights alone, so the table is a constant of
+/// the child circuit's SHAPE — same digest, same heights, same `J` — which
+/// is what lets claims key by child digest and fold across a tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JaggedTable {
+    /// Distinct boundary pairs `(t_{y-1}, t_y)` with run lengths, in column
+    /// order — [`crate::pcs::jagged::assist_boundaries`]'s output, covering
+    /// all `2^k` columns including zero-height runs and the padded tail.
+    pub bounds: Vec<(u64, u64, u32)>,
+    /// `log2` of the number of layout columns — J's ROW space.
+    pub k: usize,
+    /// Boundary values span `0..=2^m`: `m+1` bits each, `2(m+1)` pair-space
+    /// variables.
+    pub m: usize,
+}
+
+impl JaggedTable {
+    /// The table of a concrete layout. Everything is derived from
+    /// `col_prefix_sums`, the same source the assist verifier reads.
+    pub fn from_params(params: &crate::pcs::jagged::JaggedParams) -> Self {
+        let bounds = crate::pcs::jagged::assist_boundaries(params);
+        let covered: u64 = bounds.iter().map(|&(_, _, run)| run as u64).sum();
+        assert_eq!(covered, 1u64 << params.k, "runs must cover every column");
+        Self {
+            bounds,
+            k: params.k,
+            m: params.m,
+        }
+    }
+
+    /// Number of pair-space variables (J's column arity).
+    pub fn n_col_vars(&self) -> usize {
+        2 * (self.m + 1)
+    }
+
+    /// The interleaved pair index: bit `2ℓ` from `t_c`, bit `2ℓ+1` from
+    /// `t_next`.
+    fn pair_index(&self, t_c: u64, t_next: u64) -> u64 {
+        let mut idx = 0u64;
+        for l in 0..=self.m {
+            idx |= ((t_c >> l) & 1) << (2 * l);
+            idx |= ((t_next >> l) & 1) << (2 * l + 1);
+        }
+        idx
+    }
+
+    /// `Π_ℓ eq(t_c[ℓ], rho[2ℓ]) · eq(t_next[ℓ], rho[2ℓ+1])` — one pair's eq
+    /// factor at a pair-space point.
+    fn eq_at_pair(&self, t_c: u64, t_next: u64, rho: &[F128]) -> F128 {
+        debug_assert_eq!(rho.len(), self.n_col_vars());
+        let mut acc = F128::ONE;
+        for l in 0..=self.m {
+            let (rc, rd) = (rho[2 * l], rho[2 * l + 1]);
+            acc *= if (t_c >> l) & 1 == 1 { rc } else { F128::ONE + rc };
+            acc *= if (t_next >> l) & 1 == 1 {
+                rd
+            } else {
+                F128::ONE + rd
+            };
+        }
+        acc
+    }
+}
+
+/// A fresh jagged claim's row weight — over the `2^k` layout columns.
+///
+/// [`Weight`]'s `low ⊗ eq(point)` cannot express a γ-combination of one-hots
+/// at scattered addresses, which is exactly the shape a scalar group's
+/// statement has; inherited (already-folded) claims are plain `eq` and use
+/// [`JaggedRowWeight::Eq`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JaggedRowWeight {
+    /// `eq(point, ·)` — a general statement's `z_col`, and every inherited
+    /// folded claim.
+    Eq(Vec<F128>),
+    /// `Σ_j coeff_j · e(addr_j)` — a scalar group's γ-baked one-hot columns
+    /// at build-time-constant addresses (registry-derived, not
+    /// count-derived).
+    Combo(Vec<(F128, u32)>),
+}
+
+impl JaggedRowWeight {
+    /// The weight's MLE at `rho` (`rho.len() == k`).
+    pub fn eval(&self, rho: &[F128]) -> F128 {
+        match self {
+            Self::Eq(point) => {
+                assert_eq!(point.len(), rho.len(), "point/arity mismatch");
+                point
+                    .iter()
+                    .zip(rho)
+                    .fold(F128::ONE, |acc, (&p, &r)| {
+                        acc * (p * r + (F128::ONE + p) * (F128::ONE + r))
+                    })
+            }
+            Self::Combo(terms) => terms.iter().fold(F128::ZERO, |acc, &(c, addr)| {
+                let e = rho.iter().enumerate().fold(F128::ONE, |e, (l, &r)| {
+                    e * if (addr >> l) & 1 == 1 { r } else { F128::ONE + r }
+                });
+                acc + c * e
+            }),
+        }
+    }
+
+    /// The full `2^k` vector — prover side only.
+    pub fn materialize(&self, k: usize) -> Vec<F128> {
+        match self {
+            Self::Eq(point) => {
+                assert_eq!(point.len(), k, "point/arity mismatch");
+                Weight::eq(point.clone()).materialize()
+            }
+            Self::Combo(terms) => {
+                let mut out = vec![F128::ZERO; 1usize << k];
+                for &(c, addr) in terms {
+                    out[addr as usize] += c;
+                }
+                out
+            }
+        }
+    }
+
+    /// Canonical transcript binding: a tagged header, then the payload.
+    fn observe<Ch: Challenger>(&self, ch: &mut Ch) {
+        match self {
+            Self::Eq(point) => {
+                ch.observe_f128(F128::new(0, point.len() as u64));
+                ch.observe_f128_slice(point);
+            }
+            Self::Combo(terms) => {
+                ch.observe_f128(F128::new(1, terms.len() as u64));
+                for &(c, addr) in terms {
+                    ch.observe_f128(c);
+                    ch.observe_f128(F128::new(addr as u64, 0));
+                }
+            }
+        }
+    }
+
+    /// `true` when every address fits the row space — [`JaggedRowWeight::Eq`]
+    /// checks arity instead.
+    fn well_formed(&self, k: usize) -> bool {
+        match self {
+            Self::Eq(point) => point.len() == k,
+            Self::Combo(terms) => terms.iter().all(|&(_, addr)| (addr as usize) < (1 << k)),
+        }
+    }
+}
+
+/// `Σ_y row(y) · Ĵ(y, col) = value` — one assist statement's `W`-value as a
+/// claim on the layout table.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JaggedClaim {
+    pub row: JaggedRowWeight,
+    /// The assist's final point, interleaved — `2(m+1)` coordinates.
+    pub col: Vec<F128>,
+    pub value: F128,
+}
+
+impl JaggedClaim {
+    /// An honest claim about the table at the given weights.
+    pub fn honest(row: JaggedRowWeight, col: Vec<F128>, t: &JaggedTable) -> Self {
+        let value = jagged_bilinear(&row, &col, t);
+        Self { row, col, value }
+    }
+
+    /// Discharge directly — the root check, `O(2^k + runs·m)`.
+    pub fn check_direct(&self, t: &JaggedTable) -> bool {
+        jagged_bilinear(&self.row, &self.col, t) == self.value
+    }
+
+    /// An inherited claim: a previous fold's plain-eq output re-enters the
+    /// next fold. `None` if the claim is not the plain shape a fold emits.
+    pub fn from_folded(c: &MatrixClaim) -> Option<Self> {
+        (c.row.low == [F128::ONE] && c.col.low == [F128::ONE]).then(|| Self {
+            row: JaggedRowWeight::Eq(c.row.point.clone()),
+            col: c.col.point.clone(),
+            value: c.value,
+        })
+    }
+}
+
+/// `Σ_y row(y)·col_eq(pair(y))` over the runs — the honest value of a jagged
+/// claim, and the root discharge's evaluator. Never touches the `2^{2(m+1)}`
+/// pair space densely.
+pub fn jagged_bilinear(row: &JaggedRowWeight, col: &[F128], t: &JaggedTable) -> F128 {
+    assert_eq!(col.len(), t.n_col_vars(), "pair-space arity mismatch");
+    let rw = row.materialize(t.k);
+    let mut acc = F128::ZERO;
+    let mut y = 0usize;
+    for &(t_c, t_next, run) in &t.bounds {
+        let w = rw[y..y + run as usize]
+            .iter()
+            .fold(F128::ZERO, |a, &x| a + x);
+        y += run as usize;
+        if w != F128::ZERO {
+            acc += w * t.eq_at_pair(t_c, t_next, col);
+        }
+    }
+    debug_assert_eq!(y, 1usize << t.k);
+    acc
+}
+
+/// Discharge a FOLDED jagged claim (plain eq/eq, the shape
+/// [`verify_fold_jagged`] emits) against the real layout — the root's single
+/// evaluation for this table.
+pub fn discharge_jagged(claim: &MatrixClaim, t: &JaggedTable) -> bool {
+    let Some(j) = JaggedClaim::from_folded(claim) else {
+        return false;
+    };
+    j.row.well_formed(t.k) && j.col.len() == t.n_col_vars() && j.check_direct(t)
+}
+
+/// Bind the jagged claims into the transcript — weights included, exactly as
+/// [`observe_claims`] does for the dense fold, plus a shape header so two
+/// claim sets differing only in arity cannot collide.
+fn observe_jagged_claims<Ch: Challenger>(k: usize, claims: &[JaggedClaim], ch: &mut Ch) {
+    ch.observe_label(DOMAIN_JAGGED);
+    ch.observe_f128(F128::new(k as u64, claims.len() as u64));
+    for c in claims {
+        c.row.observe(ch);
+        ch.observe_f128_slice(&c.col);
+        ch.observe_f128(c.value);
+    }
+}
+
+/// Fold `k` jagged claims into one plain evaluation claim on the layout
+/// table. The jagged analogue of [`prove_fold`]: same two-phase reduction,
+/// same transcript conventions, but the column phase walks J's nonzero pairs
+/// instead of materializing the pair space, and the claims' eq tensors enter
+/// the round messages analytically. The caller must have bound whatever pins
+/// the claims (the table's key — the child circuit digest) into `ch`.
+pub fn prove_fold_jagged<Ch: Challenger>(
+    t: &JaggedTable,
+    claims: &[JaggedClaim],
+    ch: &mut Ch,
+) -> (FoldProof, MatrixClaim) {
+    assert!(!claims.is_empty(), "nothing to fold");
+    let n_col = t.n_col_vars();
+    for c in claims {
+        assert!(c.row.well_formed(t.k), "row weight outside the layout");
+        assert_eq!(c.col.len(), n_col, "claims must share the column arity");
+    }
+
+    observe_jagged_claims(t.k, claims, ch);
+    let lambdas: Vec<F128> = (0..claims.len()).map(|_| ch.sample_f128()).collect();
+
+    // Column phase, sparse: per claim, `comb_i` has one entry per run with a
+    // nonzero row-weight mass. The claim's own eq tensor over the pair space
+    // stays factored: its bound prefix accumulates into `cur`, its unbound
+    // suffix is walked per entry (`rest`), and char-2 collapses the `q(∞)`
+    // side's tensor factor to 1.
+    struct ColState {
+        /// λ_i times the bound prefix `Π_{ℓ<j} eq(p_ℓ, r_ℓ)`.
+        cur: F128,
+        /// Surviving nonzeros of `comb_i`, indices in the unbound suffix.
+        entries: Vec<(u64, F128)>,
+    }
+    let mut states: Vec<ColState> = claims
+        .iter()
+        .zip(&lambdas)
+        .map(|(c, &lam)| {
+            let rw = c.row.materialize(t.k);
+            let mut y = 0usize;
+            let mut entries = Vec::with_capacity(t.bounds.len());
+            for &(t_c, t_next, run) in &t.bounds {
+                let w = rw[y..y + run as usize]
+                    .iter()
+                    .fold(F128::ZERO, |a, &x| a + x);
+                y += run as usize;
+                if w != F128::ZERO {
+                    entries.push((t.pair_index(t_c, t_next), w));
+                }
+            }
+            ColState { cur: lam, entries }
+        })
+        .collect();
+
+    let mut col_rounds = Vec::with_capacity(n_col);
+    let mut rho_col = Vec::with_capacity(n_col);
+    for j in 0..n_col {
+        let (mut q1, mut qinf) = (F128::ZERO, F128::ZERO);
+        for (st, c) in states.iter().zip(claims) {
+            let p_j = c.col[j];
+            let (mut s1, mut sinf) = (F128::ZERO, F128::ZERO);
+            for &(idx, v) in &st.entries {
+                // The unbound eq suffix at this entry's remaining bits.
+                let mut rest = F128::ONE;
+                for (l, &p) in c.col.iter().enumerate().skip(j + 1) {
+                    rest *= if (idx >> (l - j)) & 1 == 1 {
+                        p
+                    } else {
+                        F128::ONE + p
+                    };
+                }
+                let vr = v * rest;
+                if idx & 1 == 1 {
+                    s1 += vr;
+                }
+                sinf += vr;
+            }
+            q1 += st.cur * p_j * s1;
+            qinf += st.cur * sinf;
+        }
+        ch.observe_f128(q1);
+        ch.observe_f128(qinf);
+        let r = ch.sample_f128();
+        col_rounds.push((q1, qinf));
+        rho_col.push(r);
+        for (st, c) in states.iter_mut().zip(claims) {
+            let p_j = c.col[j];
+            st.cur *= p_j * r + (F128::ONE + p_j) * (F128::ONE + r);
+            let mut merged: std::collections::BTreeMap<u64, F128> =
+                std::collections::BTreeMap::new();
+            for &(idx, v) in &st.entries {
+                let f = if idx & 1 == 1 { r } else { F128::ONE + r };
+                *merged.entry(idx >> 1).or_insert(F128::ZERO) += v * f;
+            }
+            st.entries = merged.into_iter().collect();
+        }
+    }
+    let bridge: Vec<F128> = states
+        .iter()
+        .map(|st| st.entries.first().map_or(F128::ZERO, |&(_, v)| v))
+        .collect();
+    for &v in &bridge {
+        ch.observe_f128(v);
+    }
+
+    // Row phase — dense over the small `2^k` side, the machinery above
+    // verbatim. `h(y) = Ĵ(y, ρ_col)` is one eq factor per run, broadcast.
+    let mus: Vec<F128> = (0..claims.len()).map(|_| ch.sample_f128()).collect();
+    let mut h = vec![F128::ZERO; 1usize << t.k];
+    let mut y = 0usize;
+    for &(t_c, t_next, run) in &t.bounds {
+        let e = t.eq_at_pair(t_c, t_next, &rho_col);
+        h[y..y + run as usize].fill(e);
+        y += run as usize;
+    }
+    let mut w_mu = vec![F128::ZERO; 1usize << t.k];
+    for (claim, &mu) in claims.iter().zip(&mus) {
+        for (dst, src) in w_mu.iter_mut().zip(claim.row.materialize(t.k)) {
+            *dst += mu * src;
+        }
+    }
+
+    let mut row_pairs = vec![(w_mu, h)];
+    let one = [F128::ONE];
+    let mut row_rounds = Vec::with_capacity(t.k);
+    let mut rho_row = Vec::with_capacity(t.k);
+    for _ in 0..t.k {
+        let msg = round_message(&row_pairs, &one);
+        ch.observe_f128(msg.0);
+        ch.observe_f128(msg.1);
+        let r = ch.sample_f128();
+        row_rounds.push(msg);
+        rho_row.push(r);
+        for (a, b) in &mut row_pairs {
+            fold_low(a, r);
+            fold_low(b, r);
+        }
+    }
+    let value = row_pairs[0].1[0];
+    ch.observe_f128(value);
+
+    (
+        FoldProof {
+            col_rounds,
+            bridge,
+            row_rounds,
+            value,
+        },
+        MatrixClaim {
+            row: Weight::eq(rho_row),
+            col: Weight::eq(rho_col),
+            value,
+        },
+    )
+}
+
+/// Replay a jagged fold — `O(k·κ)`, no table access, which is what a merge
+/// node's circuit replays. `k_row` is the layout's column count log, known to
+/// the caller from the table's key.
+pub fn verify_fold_jagged<Ch: Challenger>(
+    k_row: usize,
+    claims: &[JaggedClaim],
+    proof: &FoldProof,
+    ch: &mut Ch,
+) -> Result<MatrixClaim, FoldError> {
+    if claims.is_empty() || proof.bridge.len() != claims.len() {
+        return Err(FoldError::Malformed);
+    }
+    let n_col = claims[0].col.len();
+    if claims
+        .iter()
+        .any(|c| c.col.len() != n_col || !c.row.well_formed(k_row))
+        || proof.row_rounds.len() != k_row
+        || proof.col_rounds.len() != n_col
+    {
+        return Err(FoldError::Malformed);
+    }
+
+    observe_jagged_claims(k_row, claims, ch);
+    let lambdas: Vec<F128> = (0..claims.len()).map(|_| ch.sample_f128()).collect();
+
+    let target = claims
+        .iter()
+        .zip(&lambdas)
+        .fold(F128::ZERO, |acc, (c, &l)| acc + l * c.value);
+    let (running, rho_col) = replay_rounds(&proof.col_rounds, target, ch);
+    for &v in &proof.bridge {
+        ch.observe_f128(v);
+    }
+    let expect = claims
+        .iter()
+        .zip(&lambdas)
+        .zip(&proof.bridge)
+        .fold(F128::ZERO, |acc, ((c, &l), &g)| {
+            let col_eval = c
+                .col
+                .iter()
+                .zip(&rho_col)
+                .fold(F128::ONE, |e, (&p, &r)| {
+                    e * (p * r + (F128::ONE + p) * (F128::ONE + r))
+                });
+            acc + l * col_eval * g
+        });
+    if running != expect {
+        return Err(FoldError::ConsistencyFailed { which: "col" });
+    }
+
+    let mus: Vec<F128> = (0..claims.len()).map(|_| ch.sample_f128()).collect();
+    let target = proof
+        .bridge
+        .iter()
+        .zip(&mus)
+        .fold(F128::ZERO, |acc, (&g, &m)| acc + m * g);
+    let (running, rho_row) = replay_rounds(&proof.row_rounds, target, ch);
+    let w_mu = claims
+        .iter()
+        .zip(&mus)
+        .fold(F128::ZERO, |acc, (c, &m)| acc + m * c.row.eval(&rho_row));
+    if running != w_mu * proof.value {
+        return Err(FoldError::ConsistencyFailed { which: "row" });
+    }
+    ch.observe_f128(proof.value);
+
+    Ok(MatrixClaim {
+        row: Weight::eq(rho_row),
+        col: Weight::eq(rho_col),
+        value: proof.value,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
