@@ -10330,8 +10330,14 @@ struct RealRegion {
     /// The jagged assertion's value wires (the count win), in emission
     /// order: rs claims, then per group the combo and its dense members —
     /// the fresh-claim surfaces a merge fold connects to.
-    #[allow(dead_code)]
     jag_w: Vec<Wire>,
+    /// The claims' IDENTITY wires (the points-connect): σ shared, and per
+    /// claim (jag_w order) the row wires — Eq: z_col coordinate wires
+    /// (constant coords ride zw/ow); Combo: the γ_pd coefficient wires in
+    /// term order (addresses are registry constants, bound by the fold
+    /// side's shared constant publics).
+    jag_sig_w: Vec<Wire>,
+    jag_row_w: Vec<Vec<Wire>>,
     /// The z_skip squeeze wire — see [`ChildRegion::zskip_w`].
     zskip_w: Wire,
     /// sigma: the deferred s_sigma stream word + the GKR squeeze point.
@@ -10899,6 +10905,10 @@ fn emit_real_child_region(
     // squeezes, z_cols = statement point wires, γ_pd = squeezes); nothing
     // count-shaped remains in the circuit.
     let mut jag_w: Vec<Wire> = Vec::new();
+    // The claims' IDENTITY wires (the points-connect): per claim, in
+    // jag_w order, the row wires the merge fold's absorbed words connect
+    // to; σ is mp_sig_w, shared.
+    let mut jag_row_w: Vec<Vec<Wire>> = Vec::new();
     let alslot = cs.alslot;
     let mut expect_w = zw;
     for (si, xs) in [&xab_pw, &xc_pw].iter().enumerate() {
@@ -10906,6 +10916,7 @@ fn emit_real_child_region(
         vals.push(rt.jag.rs[si].value);
         let w_st = sb.input();
         jag_w.push(w_st);
+        jag_row_w.push(xs[1 + n_log_i..].iter().map(|&(_, w)| w).collect());
         let mut gdp = [zw, zw, ow, zw]; // STATE_SUCCESS seed
         for layer in (0..=m_mp2).rev() {
             let za = if layer < n_log_i { z_row_w[layer] } else { zw };
@@ -10929,21 +10940,37 @@ fn emit_real_child_region(
         // value with γ_pd applied by a MAC on the squeeze wire — the
         // exported decomposition reassembled in wires.
         let (combo, dense) = &rt.jag.groups[g_ix];
+        let hots: Vec<bool> = members
+            .iter()
+            .map(|&i2| {
+                rt.pd_pts[i2][n_log_i..n_log_i + k_cols_i]
+                    .iter()
+                    .all(|&x| x == F128::ZERO || x == F128::ONE)
+            })
+            .collect();
         let mut w_st = match combo {
             Some(c) => {
                 vals.push(c.value);
                 let w = sb.input();
                 jag_w.push(w);
+                // The combo's identity: the hot members' γ_pd squeeze
+                // wires, member order == the assertion's term order.
+                let gws: Vec<Wire> = members
+                    .iter()
+                    .zip(&hots)
+                    .filter(|&(_, &h)| h)
+                    .map(|(&i2, _)| outs[trace.squeezes[gammas_i[i2].fin][0]][0])
+                    .collect();
+                if let flock_core::matrix_fold::JaggedRowWeight::Combo(t) = &c.row {
+                    assert_eq!(t.len(), gws.len(), "combo terms == hot members");
+                }
+                jag_row_w.push(gws);
                 w
             }
             None => zw,
         };
         let mut d_it = dense.iter();
-        for &i2 in members {
-            let z_col_n = &rt.pd_pts[i2][n_log_i..n_log_i + k_cols_i];
-            let hot = z_col_n
-                .iter()
-                .all(|&x| x == F128::ZERO || x == F128::ONE);
+        for (&i2, &hot) in members.iter().zip(&hots) {
             if hot {
                 assert!(i2 >= 2, "one-hot columns are gather claims");
                 continue;
@@ -10954,6 +10981,26 @@ fn emit_real_child_region(
             vals.push(c.value);
             let d_w = sb.input();
             jag_w.push(d_w);
+            // The dense claim's identity: its z_col coordinate wires —
+            // constant coords ride zw/ow, the rest the element PIOP's own
+            // squeeze wires (the mapping the constructor pinned).
+            jag_row_w.push(
+                (0..k_cols_i)
+                    .map(|jj| {
+                        let coord = rt.pd_pts[i2][n_log_i + jj];
+                        if coord == F128::ZERO {
+                            zw
+                        } else if coord == F128::ONE {
+                            ow
+                        } else if i2 == 0 {
+                            outs[trace.squeezes[piop_i.zc_rounds[n_log_i + jj].fin][0]][0]
+                        } else {
+                            let n_lc = piop_i.lc_rounds.len();
+                            outs[trace.squeezes[piop_i.lc_rounds[n_lc - 1 - jj].fin][0]][0]
+                        }
+                    })
+                    .collect(),
+            );
             w_st = sb.gate(macs, &[w_st, gpd_w, d_w])[0];
         }
         assert!(d_it.next().is_none(), "every dense entry consumed");
@@ -11165,6 +11212,8 @@ fn emit_real_child_region(
         n_fam_pub,
         census: cen,
         jag_w,
+        jag_sig_w: mp_sig_w.clone(),
+        jag_row_w,
         zskip_w: outs[trace.squeezes[rt.zskip_fin][0]][0],
         n_ela_pub: ela_pub.len(),
         sig_w,
@@ -12702,21 +12751,84 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
             zw,
             ow,
         );
-        // THE VALUE CONNECTS (the count win's load-bearing bind): each
-        // absorbed jagged claim VALUE is the SAME wire the child region
-        // published — the one its anchor expect consumed. Claim order in
-        // the fold (per child: rs, then per group combo + dense) is
-        // exactly the region's jag_w emission order.
+        // THE POINTS-CONNECT (the count win's identity bind): every
+        // absorbed claim surface in the jagged fold is a child-region
+        // wire — the VALUE (the wire the anchor expect consumed), σ (the
+        // child's anchor round squeezes), the row identities (z_col
+        // wires / γ_pd squeezes / zw-ow constants), and the structural
+        // words (tags, the shape header, Combo addresses) pinned to
+        // shared constant publics the checker validates. With identity
+        // AND value bound, the folded entry provably says "Ĵ at the
+        // identity the child's verification determined equals the value
+        // its anchor expect consumed" — a cooked-identity substitution
+        // has nowhere to live.
+        let mut jag_const_rec: Vec<(F128, usize)> = Vec::new();
         {
+            let mut jag_consts: Vec<(F128, Wire)> = Vec::new();
+            let mut cw_j = |sb: &mut ShapeBuilder,
+                            vals: &mut Vec<F128>,
+                            rec2: &mut Vec<(F128, usize)>,
+                            v: F128|
+             -> Wire {
+                if let Some(&(_, w)) = jag_consts.iter().find(|&&(x, _)| x == v) {
+                    return w;
+                }
+                vals.push(v);
+                rec2.push((v, sb.public_len()));
+                let w = sb.public_input();
+                jag_consts.push((v, w));
+                w
+            };
+            let loc = &jlocs[0];
             let regions0 = [&r0, &r1];
             let mut ci = 0usize;
             for rk in regions0 {
-                for &jw in &rk.jag_w {
-                    sb.connect(wv(jlocs[0].claims[ci].val_v), jw);
+                for (li, &jw) in rk.jag_w.iter().enumerate() {
+                    let cl = &loc.claims[ci];
+                    sb.connect(wv(cl.val_v), jw);
+                    for j in 0..loc.n_col {
+                        sb.connect(wv(cl.col_v + j), rk.jag_sig_w[j]);
+                    }
+                    if cl.terms.is_empty() {
+                        let tag =
+                            cw_j(&mut sb, &mut vals, &mut jag_const_rec, F128::new(0, cl.row_pt.1 as u64));
+                        sb.connect(wv(cl.row_pt.0 - 1), tag);
+                        for j in 0..cl.row_pt.1 {
+                            sb.connect(wv(cl.row_pt.0 + j), rk.jag_row_w[li][j]);
+                        }
+                    } else {
+                        let tag = cw_j(
+                            &mut sb,
+                            &mut vals,
+                            &mut jag_const_rec,
+                            F128::new(1, cl.terms.len() as u64),
+                        );
+                        sb.connect(wv(cl.terms[0].0 - 1), tag);
+                        for (tj, &(cv, addr)) in cl.terms.iter().enumerate() {
+                            sb.connect(wv(cv), rk.jag_row_w[li][tj]);
+                            let aw = cw_j(
+                                &mut sb,
+                                &mut vals,
+                                &mut jag_const_rec,
+                                F128::new(addr as u64, 0),
+                            );
+                            sb.connect(wv(cv + 1), aw);
+                        }
+                    }
                     ci += 1;
                 }
             }
-            assert_eq!(ci, jlocs[0].claims.len(), "every jagged claim connected");
+            assert_eq!(ci, loc.claims.len(), "every jagged claim connected");
+            // The group's shape header word binds too (it precedes the
+            // first claim's tag; claim 0 is an RS Eq claim).
+            let header_v = loc.claims[0].row_pt.0 - 2;
+            let hw = cw_j(
+                &mut sb,
+                &mut vals,
+                &mut jag_const_rec,
+                F128::new(loc.k_row as u64, loc.claims.len() as u64),
+            );
+            sb.connect(wv(header_v), hw);
         }
 
         // ---- the connects: fold surfaces == child-region wires ----
@@ -12986,6 +13098,9 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         );
         for (i, &v) in PHI_8_TABLE[..1 << K_SKIP].iter().enumerate() {
             assert_eq!(built2.public[lam_base + i], v, "λ const {i}");
+        }
+        for &(v, idx) in &jag_const_rec {
+            assert_eq!(built2.public[idx], v, "jagged shared constant public");
         }
         // THE APPLICATION STATEMENT: the published span is (h_start of the
         // left chain, h_end of the right) — the 512-step combined segment.
@@ -14925,8 +15040,15 @@ struct ChildRegion {
     /// The jagged assertion's value wires (the count win), in emission
     /// order: rs claims, then per group the combo and its dense members —
     /// the fresh-claim surfaces a merge fold connects to.
-    #[allow(dead_code)]
     jag_w: Vec<Wire>,
+    /// The claims' IDENTITY wires (the points-connect): σ — the anchor
+    /// round squeezes, shared by every claim of the region — and per claim
+    /// (jag_w order) the row wires: Eq claims carry z_col coordinate wires
+    /// (constant coords ride zw/ow), Combo claims carry the γ_pd
+    /// coefficient wires in term order (addresses are registry constants,
+    /// bound by the fold side's shared constant publics).
+    jag_sig_w: Vec<Wire>,
+    jag_row_w: Vec<Vec<Wire>>,
     /// The element assertion's point wires: every element zc round rho (in
     /// round order — r_con = zc.r[ν..]) and every element lc round rho (in
     /// round order — r_col is these reversed).
@@ -14980,7 +15102,7 @@ fn emit_child_region(
     let n_p = ct.n_p;
     let m_mp2 = ct.m_mp2;
     let n_log_i = ct.n_log_i;
-    let _k_cols_i = ct.k_cols_i;
+    let k_cols_i = ct.k_cols_i;
     let _n_runs = ct.bounds_i.len();
 
     let leafeval: Vec<_> = geo
@@ -15470,6 +15592,10 @@ fn emit_child_region(
     // squeezes, z_cols = statement point wires, γ_pd = squeezes); nothing
     // count-shaped remains in the circuit.
     let mut jag_w: Vec<Wire> = Vec::new();
+    // The claims' IDENTITY wires (the points-connect): σ shared per
+    // region, and per claim — in jag_w order — the row-identity wires the
+    // merge fold's absorbed words connect to.
+    let mut jag_row_w: Vec<Vec<Wire>> = Vec::new();
     // Per RS statement: the published w, the DP, the coefficient.
     let alslot = cs.alslot;
     let mut expect_w = zw;
@@ -15478,6 +15604,7 @@ fn emit_child_region(
         vals.push(ct.jag.rs[si].value);
         let w_st = sb.input();
         jag_w.push(w_st);
+        jag_row_w.push(xs[1 + n_log_i..].iter().map(|&(_, w)| w).collect());
         let mut gdp = [zw, zw, ow, zw]; // STATE_SUCCESS seed
         for layer in (0..=m_mp2).rev() {
             let za = if layer < n_log_i { z_row_w[layer] } else { zw };
@@ -15501,20 +15628,37 @@ fn emit_child_region(
     // reassembled in wires. Coefficient γ^{256+k}·e_at as before.
     for (g_ix, members) in ct.groups_ix.iter().enumerate() {
         let (combo, dense) = &ct.jag.groups[g_ix];
+        let hots: Vec<bool> = members
+            .iter()
+            .map(|&i2| {
+                ct.pd_pts[i2][n_log_i..]
+                    .iter()
+                    .all(|&x| x == F128::ZERO || x == F128::ONE)
+            })
+            .collect();
         let mut w_st = match combo {
             Some(c) => {
                 vals.push(c.value);
                 let w = sb.input();
                 jag_w.push(w);
+                // The combo's identity: the hot members' γ_pd squeeze
+                // wires, in member order == the assertion's term order.
+                let gws: Vec<Wire> = members
+                    .iter()
+                    .zip(&hots)
+                    .filter(|&(_, &h)| h)
+                    .map(|(&i2, _)| outs[trace.squeezes[ct.gammas_o[i2].fin][0]][0])
+                    .collect();
+                if let flock_core::matrix_fold::JaggedRowWeight::Combo(t) = &c.row {
+                    assert_eq!(t.len(), gws.len(), "combo terms == hot members");
+                }
+                jag_row_w.push(gws);
                 w
             }
             None => zw,
         };
         let mut d_it = dense.iter();
-        for &i2 in members {
-            let hot = ct.pd_pts[i2][n_log_i..]
-                .iter()
-                .all(|&x| x == F128::ZERO || x == F128::ONE);
+        for (&i2, &hot) in members.iter().zip(&hots) {
             if hot {
                 continue;
             }
@@ -15524,6 +15668,29 @@ fn emit_child_region(
             vals.push(c.value);
             let d_w = sb.input();
             jag_w.push(d_w);
+            // The dense claim's identity: its z_col coordinate wires —
+            // constant coords ride zw/ow, the rest are the element PIOP's
+            // own squeeze wires (the mapping the constructor pinned).
+            jag_row_w.push(
+                (0..k_cols_i)
+                    .map(|jj| {
+                        let coord = ct.pd_pts[i2][n_log_i + jj];
+                        if coord == F128::ZERO {
+                            zw
+                        } else if coord == F128::ONE {
+                            ow
+                        } else {
+                            let el_rec = el_rec.expect("element pd claim");
+                            if i2 == 0 {
+                                outs[trace.squeezes[el_rec.zc_rounds[n_log_i + jj].1][0]][0]
+                            } else {
+                                let n_lc = el_rec.lc_rounds.len();
+                                outs[trace.squeezes[el_rec.lc_rounds[n_lc - 1 - jj].1][0]][0]
+                            }
+                        }
+                    })
+                    .collect(),
+            );
             w_st = sb.gate(macs, &[w_st, gpd_w, d_w])[0];
         }
         assert!(d_it.next().is_none(), "every dense entry consumed");
@@ -15608,6 +15775,8 @@ fn emit_child_region(
         sig_w,
         pt_w,
         jag_w,
+        jag_sig_w: mp_sig_w.clone(),
+        jag_row_w,
         el_zc_rho_w: el_rec
             .map(|el_rec| {
                 el_rec
@@ -20021,20 +20190,77 @@ fn build_node_outer_app(
             zw,
             ow,
         );
-        // THE JAGGED VALUE CONNECTS (the count win's load-bearing bind):
-        // each absorbed claim value is the SAME wire the child region
-        // published — the one its anchor expect consumed. Claim order in
-        // the fold (per child: rs, then per group combo + dense) is
-        // exactly the region's jag_w emission order.
+        // THE POINTS-CONNECT (the count win's identity bind): value, σ,
+        // row identities, and the structural words — see build_fl_node's
+        // block for the argument; this is the same bind at node scale.
+        let mut jag_const_rec: Vec<(F128, usize)> = Vec::new();
         {
+            let mut jag_consts: Vec<(F128, Wire)> = Vec::new();
+            let mut cw_j = |sb: &mut ShapeBuilder,
+                            vals: &mut Vec<F128>,
+                            rec2: &mut Vec<(F128, usize)>,
+                            v: F128|
+             -> Wire {
+                if let Some(&(_, w)) = jag_consts.iter().find(|&&(x, _)| x == v) {
+                    return w;
+                }
+                vals.push(v);
+                rec2.push((v, sb.public_len()));
+                let w = sb.public_input();
+                jag_consts.push((v, w));
+                w
+            };
+            let loc = &jlocs[0];
             let mut ci = 0usize;
             for rk in &regions {
-                for &jw in &rk.jag_w {
-                    sb.connect(wv(jlocs[0].claims[ci].val_v), jw);
+                for (li, &jw) in rk.jag_w.iter().enumerate() {
+                    let cl = &loc.claims[ci];
+                    sb.connect(wv(cl.val_v), jw);
+                    for j in 0..loc.n_col {
+                        sb.connect(wv(cl.col_v + j), rk.jag_sig_w[j]);
+                    }
+                    if cl.terms.is_empty() {
+                        let tag = cw_j(
+                            &mut sb,
+                            &mut vals,
+                            &mut jag_const_rec,
+                            F128::new(0, cl.row_pt.1 as u64),
+                        );
+                        sb.connect(wv(cl.row_pt.0 - 1), tag);
+                        for j in 0..cl.row_pt.1 {
+                            sb.connect(wv(cl.row_pt.0 + j), rk.jag_row_w[li][j]);
+                        }
+                    } else {
+                        let tag = cw_j(
+                            &mut sb,
+                            &mut vals,
+                            &mut jag_const_rec,
+                            F128::new(1, cl.terms.len() as u64),
+                        );
+                        sb.connect(wv(cl.terms[0].0 - 1), tag);
+                        for (tj, &(cv, addr)) in cl.terms.iter().enumerate() {
+                            sb.connect(wv(cv), rk.jag_row_w[li][tj]);
+                            let aw = cw_j(
+                                &mut sb,
+                                &mut vals,
+                                &mut jag_const_rec,
+                                F128::new(addr as u64, 0),
+                            );
+                            sb.connect(wv(cv + 1), aw);
+                        }
+                    }
                     ci += 1;
                 }
             }
-            assert_eq!(ci, jlocs[0].claims.len(), "every jagged claim connected");
+            assert_eq!(ci, loc.claims.len(), "every jagged claim connected");
+            let header_v = loc.claims[0].row_pt.0 - 2;
+            let hw = cw_j(
+                &mut sb,
+                &mut vals,
+                &mut jag_const_rec,
+                F128::new(loc.k_row as u64, loc.claims.len() as u64),
+            );
+            sb.connect(wv(header_v), hw);
         }
         let mac_after_fold = sb.rows_in_slot(cs.macs);
 
@@ -20394,6 +20620,46 @@ fn build_node_outer_app(
                     off += loc.n_col + loc.k_row + 1;
                 }
             }
+            // The lane's structural words (claim tags + the shape header)
+            // pin to shared constant publics, like the main fold's — the
+            // identities themselves are wire-bound above.
+            let mut lane_const_rec: Vec<(F128, usize)> = Vec::new();
+            {
+                let mut jc: Vec<(F128, Wire)> = Vec::new();
+                let mut cw_j = |sb: &mut ShapeBuilder,
+                                vals: &mut Vec<F128>,
+                                rec2: &mut Vec<(F128, usize)>,
+                                v: F128|
+                 -> Wire {
+                    if let Some(&(_, w)) = jc.iter().find(|&&(x, _)| x == v) {
+                        return w;
+                    }
+                    vals.push(v);
+                    rec2.push((v, sb.public_len()));
+                    let w = sb.public_input();
+                    jc.push((v, w));
+                    w
+                };
+                for loc in ljlocs {
+                    for cl in &loc.claims {
+                        let tag = cw_j(
+                            &mut sb,
+                            &mut vals,
+                            &mut lane_const_rec,
+                            F128::new(0, cl.row_pt.1 as u64),
+                        );
+                        sb.connect(lwv(cl.row_pt.0 - 1), tag);
+                    }
+                    let header_v = loc.claims[0].row_pt.0 - 2;
+                    let hw = cw_j(
+                        &mut sb,
+                        &mut vals,
+                        &mut lane_const_rec,
+                        F128::new(loc.k_row as u64, loc.claims.len() as u64),
+                    );
+                    sb.connect(lwv(header_v), hw);
+                }
+            }
             // The lane's claims are the LOWER-registry surface a parent
             // inherits: under the envelope they ride the reserved
             // ACC_CHAIN block — the same constant index at which an FL
@@ -20415,7 +20681,7 @@ fn build_node_outer_app(
                     b
                 }
             };
-            (lane_pub_base, lane_words, lalpha_recs, lane_w)
+            (lane_pub_base, lane_words, lalpha_recs, lane_w, lane_const_rec)
         });
 
         if std::env::var("MAC_CENSUS").is_ok() {
@@ -20466,7 +20732,7 @@ fn build_node_outer_app(
                     &mut vals,
                     &EnvTail {
                         acc_main: &acc_main_w,
-                        acc_chain: lane_pub.as_ref().map(|(_, _, _, w)| w).unwrap_or(&empty),
+                        acc_chain: lane_pub.as_ref().map(|(_, _, _, w, _)| w).unwrap_or(&empty),
                         app: app_w.as_deref().unwrap_or(&empty),
                     },
                 );
@@ -20691,6 +20957,9 @@ fn build_node_outer_app(
             for (i, &v) in PHI_8_TABLE[..1 << K_SKIP].iter().enumerate() {
                 assert_eq!(built2.public[lam_base + i], v, "λ const {i}");
             }
+            for &(v, idx) in &jag_const_rec {
+                assert_eq!(built2.public[idx], v, "jagged shared constant public");
+            }
             assert_eq!(
                 built2.public[lam_base + (1 << K_SKIP)],
                 subspace_denominator_pair(K_SKIP).1,
@@ -20712,7 +20981,7 @@ fn build_node_outer_app(
             if env.is_none() {
                 let seg_end = lane_pub
                     .as_ref()
-                    .map(|&(b, w, _, _)| b + w)
+                    .map(|&(b, w, _, _, _)| b + w)
                     .unwrap_or(
                         fold_pub_base
                             + tail_len
@@ -20725,7 +20994,7 @@ fn build_node_outer_app(
             }
             // The LANE accumulator, reassembled from the public segment
             // alone — the parent-facing statement of the lower registry.
-            if let (Some((lpb, _, lar, _)), Some((lacc_n, llocs, ljlocs, ..))) =
+            if let (Some((lpb, _, lar, _, lrec)), Some((lacc_n, llocs, ljlocs, ..))) =
                 (lane_pub.as_ref(), lane_native.as_ref())
             {
                 let lrebuilt = check_fold_publics(&built2.public, *lpb, llocs, lar);
@@ -20744,6 +21013,9 @@ fn build_node_outer_app(
                     &lacc_pub2, lacc_n,
                     "the LANE accumulator, reassembled from publics alone"
                 );
+                for &(v, idx) in lrec {
+                    assert_eq!(built2.public[idx], v, "lane jagged constant public");
+                }
             }
         }
 
