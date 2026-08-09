@@ -691,10 +691,30 @@ fn gv_build_prev(v: &GVec) -> GVec {
             out[lo..hi].copy_from_slice(&longer[lo..hi]);
         };
         if work >= par_threshold() {
+            // WITHIN-group chunking too — the group axis collapses to one a
+            // few layers up, and the widest merges must not run one-core.
+            const CH: usize = 1 << 14;
             buf[..gh * rows]
                 .par_chunks_mut(rows)
                 .enumerate()
-                .for_each(|(g, out)| body(g, out));
+                .for_each(|(g, out)| {
+                    let (la, lb) = (v.lens[g], v.lens[g + gh]);
+                    let (lo, hi) = (la.min(lb), la.max(lb));
+                    let a = &v.buf[g * rows..g * rows + la];
+                    let b = &v.buf[(g + gh) * rows..(g + gh) * rows + lb];
+                    out[..lo]
+                        .par_chunks_mut(CH)
+                        .enumerate()
+                        .for_each(|(ci, oc)| {
+                            let base = ci * CH;
+                            for (i, o) in oc.iter_mut().enumerate() {
+                                let x = base + i;
+                                *o = a[x] * b[x];
+                            }
+                        });
+                    let longer = if la >= lb { a } else { b };
+                    out[lo..hi].copy_from_slice(&longer[lo..hi]);
+                });
         } else {
             for (g, out) in buf[..gh * rows].chunks_mut(rows).enumerate() {
                 body(g, out);
@@ -702,14 +722,28 @@ fn gv_build_prev(v: &GVec) -> GVec {
         }
         GVec { buf, lens, rows }
     } else {
-        // Single group: pair row i with row i + h.
+        // Single group: pair row i with row i + h. The product prefix
+        // parallelizes above the gate — this arm carries the whole build
+        // once the groups have merged.
         let h = v.rows / 2;
         let len = v.lens[0];
         let lp = len.min(h);
         let over = len.saturating_sub(h); // rows with BOTH factors real
         let mut buf = crate::scratch::take_f128(h);
-        for i in 0..over {
-            buf[i] = v.buf[i] * v.buf[i + h];
+        let (head, src) = (&mut buf[..over], &v.buf);
+        if over >= par_threshold() {
+            const CH: usize = 1 << 14;
+            head.par_chunks_mut(CH).enumerate().for_each(|(ci, oc)| {
+                let base = ci * CH;
+                for (i, o) in oc.iter_mut().enumerate() {
+                    let x = base + i;
+                    *o = src[x] * src[x + h];
+                }
+            });
+        } else {
+            for (i, o) in head.iter_mut().enumerate() {
+                *o = src[i] * src[i + h];
+            }
         }
         buf[over..lp].copy_from_slice(&v.buf[over..lp]);
         GVec {
@@ -744,10 +778,31 @@ fn gv_fold(v: &GView<'_>, rho: F128) -> GVec {
             }
         };
         if work >= par_threshold() {
+            // WITHIN-group chunking too: the group axis collapses to one a
+            // few layers up (16 → 1 on the wired-leaf shape), so the widest
+            // layers would otherwise fold on a single core.
+            const CH: usize = 1 << 14;
             buf[..ng * rows]
                 .par_chunks_mut(rows)
                 .enumerate()
-                .for_each(|(g, out)| body(g, out));
+                .for_each(|(g, out)| {
+                    let len = v.lens[g];
+                    let full = len / 2;
+                    let src = &v.buf[g * v.rows..g * v.rows + len];
+                    out[..full]
+                        .par_chunks_mut(CH)
+                        .enumerate()
+                        .for_each(|(ci, oc)| {
+                            let base = ci * CH;
+                            for (i, o) in oc.iter_mut().enumerate() {
+                                let x = base + i;
+                                *o = src[2 * x] * one_minus + src[2 * x + 1] * rho;
+                            }
+                        });
+                    if len % 2 == 1 {
+                        out[full] = src[len - 1] * one_minus + rho;
+                    }
+                });
         } else {
             for (g, out) in buf[..ng * rows].chunks_mut(rows).enumerate() {
                 body(g, out);
@@ -859,9 +914,46 @@ fn gv_message(
             .map(|g| vs.iter().map(|v| v.lens[g]).max().unwrap() / 2)
             .sum();
         if work >= par_threshold() {
+            // Parallel over (group, sub-chunk): group-only parallelism
+            // starves once the group axis collapses (the widest layers are
+            // single-group on the wired-leaf shape). Partial sums per chunk
+            // reduce exactly (XOR reassociation); the O(1) all-ones tail
+            // mass is added once per group.
+            const CH: usize = 1 << 14;
             (0..ng)
                 .into_par_iter()
-                .map(body)
+                .map(|g| {
+                    let lmax = vs.iter().map(|v| v.lens[g]).max().unwrap();
+                    let lp = lmax.div_ceil(2).min(pr);
+                    let s0 = &vs[0].buf[g * rows..g * rows + vs[0].lens[g]];
+                    let s1 = &vs[1].buf[g * rows..g * rows + vs[1].lens[g]];
+                    let s2 = &vs[2].buf[g * rows..g * rows + vs[2].lens[g]];
+                    let s3 = &vs[3].buf[g * rows..g * rows + vs[3].lens[g]];
+                    let (g_one, g_inf) = (0..lp.div_ceil(CH))
+                        .into_par_iter()
+                        .map(|ci| {
+                            let (a, b) = (ci * CH, ((ci + 1) * CH).min(lp));
+                            let (mut p_one, mut p_inf) = (F128::ZERO, F128::ZERO);
+                            for x in a..b {
+                                let (r0, r1) = (2 * x, 2 * x + 1);
+                                let (a0, a1) = (rd(s0, r0), rd(s0, r1));
+                                let (b0, b1) = (rd(s1, r0), rd(s1, r1));
+                                let (c0, c1) = (rd(s2, r0), rd(s2, r1));
+                                let (d0, d1) = (rd(s3, r0), rd(s3, r1));
+                                let v_one = a1 * b1 + lambda * (c1 * d1);
+                                let v_inf =
+                                    (a0 + a1) * (b0 + b1) + lambda * ((c0 + c1) * (d0 + d1));
+                                let flat = g * pr + x;
+                                let el = lo[flat & bmask] * hi[flat >> bshift];
+                                p_one += el * v_one;
+                                p_inf += el * v_inf;
+                            }
+                            (p_one, p_inf)
+                        })
+                        .reduce(|| (F128::ZERO, F128::ZERO), |(a, b), (c, d)| (a + c, b + d));
+                    let mass = range_eq_sum(lo, hi, plo, phi, g * pr + lp, (g + 1) * pr);
+                    (g_one + one_plus_lambda * mass, g_inf)
+                })
                 .reduce(|| (F128::ZERO, F128::ZERO), |(a, b), (c, d)| (a + c, b + d))
         } else {
             let (mut g_one, mut g_inf) = (F128::ZERO, F128::ZERO);
@@ -1362,15 +1454,32 @@ fn prove_batched_grouped<C: Challenger>(
     let mut t = std::time::Instant::now();
 
     // Leaves: live prefixes only (tails are implicit 1s, never written).
+    // Parallel over (group, sub-chunk): the σ gather is read-only and the
+    // writes are disjoint — this pass was the GKR's single largest line
+    // multi-threaded (~2.9M live entries, serial).
     let mut lhs_buf = crate::scratch::take_f128(n);
     let mut rhs_buf = crate::scratch::take_f128(n);
-    for (iota, &cnt) in m.counts.iter().enumerate() {
-        let base = iota * rows;
-        for x in base..base + cnt {
-            lhs_buf[x] = f[x] + alpha * tag(x) + beta;
-            rhs_buf[x] = g[x] + alpha * tag(sigma[x]) + beta;
-        }
-    }
+    const LEAF_CH: usize = 1 << 14;
+    lhs_buf[..n]
+        .par_chunks_mut(rows)
+        .zip(rhs_buf[..n].par_chunks_mut(rows))
+        .enumerate()
+        .for_each(|(iota, (lg, rg))| {
+            let cnt = m.counts[iota];
+            let base = iota * rows;
+            lg[..cnt]
+                .par_chunks_mut(LEAF_CH)
+                .zip(rg[..cnt].par_chunks_mut(LEAF_CH))
+                .enumerate()
+                .for_each(|(ci, (lc, rc))| {
+                    let start = base + ci * LEAF_CH;
+                    for (i, (l, r)) in lc.iter_mut().zip(rc.iter_mut()).enumerate() {
+                        let x = start + i;
+                        *l = f[x] + alpha * tag(x) + beta;
+                        *r = g[x] + alpha * tag(sigma[x]) + beta;
+                    }
+                });
+        });
     let lhs = GVec {
         buf: lhs_buf,
         lens: m.counts.clone(),
