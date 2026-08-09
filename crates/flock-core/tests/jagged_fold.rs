@@ -261,14 +261,28 @@ fn distinct_heights_are_distinct_tables() {
         "the same statement about different heights has different W-values"
     );
 
-    // And a claim built against table A cannot ride a fold over table B:
-    // the fold's own output then fails B's discharge.
+    // And a claim built against table A cannot ride a fold over table B.
+    // The gate is the VERIFIER, not the discharge: the prover's output is
+    // derived from B and the claims' POINTS alone (values enter only through
+    // the transcript), so it is an honest B-statement and rightly
+    // discharges — but the foreign VALUE is bound into the fold's target,
+    // and the replay diverges at the first column round. That replay is
+    // exactly what a merge node's circuit runs, so a foreign claim cannot
+    // enter an accumulator; if a cheating prover instead forced the replay
+    // through, sumcheck soundness lands the lie in the output claim, where
+    // the root discharge catches it.
     let claims = vec![ca];
     let mut chp = FsChallenger::new(b"jagged-cross");
-    let (_, folded) = matrix_fold::prove_fold_jagged(&tb, &claims, &mut chp);
+    let (fproof, folded) = matrix_fold::prove_fold_jagged(&tb, &claims, &mut chp);
     let _: &MatrixClaim = &folded;
     assert!(
-        !matrix_fold::discharge_jagged(&folded, &tb),
-        "folding a foreign claim poisons the output — the accumulation property"
+        matrix_fold::discharge_jagged(&folded, &tb),
+        "the honest prover's output is an honest B-statement"
+    );
+    let mut chv = FsChallenger::new(b"jagged-cross");
+    assert_eq!(
+        matrix_fold::verify_fold_jagged(tb.k, &claims, &fproof, &mut chv),
+        Err(matrix_fold::FoldError::ConsistencyFailed { which: "col" }),
+        "the foreign value diverges the replay — the accumulation gate"
     );
 }
