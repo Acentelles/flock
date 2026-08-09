@@ -171,6 +171,10 @@ struct EnvShape {
     /// walk (node children) row-identical. The last [`ENV_APP_WORDS`] of
     /// them are the APPLICATION BLOCK (see [`env_app_base`]).
     publics: usize,
+    /// lanes* — the pinned committed lane count (see [`outer_lanes`]): the
+    /// one aggregate of a child's layout that stays circuit structure
+    /// under FREE COUNTS.
+    lanes: usize,
 }
 
 /// The APPLICATION STATEMENT's width in the envelope's public segment: the
@@ -195,25 +199,33 @@ const ENV_APP_WORDS: usize = 8;
 const ENV_ACC_CHAIN_WORDS: usize = 160;
 const ENV_ACC_MAIN_WORDS: usize = 600;
 
-/// The envelope's public TAIL, in order: `[.. body .. | pad | ACC_CHAIN |
-/// ACC_MAIN | APP]`. Every base here is a CONSTANT of the envelope.
-/// The committed lane count on the recursion path. With `counts*` retired
-/// (`ENV_NO_PAD`) it must be PINNED: a leaf is `num_lanes` words wide and
-/// the parent hashes every opened leaf, so it is the one aggregate a
-/// parent's circuit is compiled against. 24 covers every envelope member's
-/// content-derived count at min-one-row (FL 12 at dev / 23 at m32,
-/// internal 18) and stays below `2^initial_k = 32`, so children remain
-/// lane-major.
-const ENV_LANES: usize = 24;
+/// FREE COUNTS ARE THE DEFAULT (the count win shipped, 2026-08-09): under
+/// the envelope, children declare their own per-type row counts — the
+/// heights reach a parent only as folded claims on the jagged layout,
+/// discharged at the root — and only the LANE COUNT stays pinned
+/// (`EnvShape::lanes`). `ENV_PAD=1` restores the counts* row padding as
+/// the DIFFERENTIAL ORACLE until the measurement pass concludes;
+/// `ENV_NO_PAD=1` forces free counts even then (kept for the probe's
+/// documented invocations).
+fn env_free_counts() -> bool {
+    std::env::var("ENV_PAD").is_err() || std::env::var("ENV_NO_PAD").is_ok()
+}
 
 fn outer_lanes(union: &UnionInstance, log_batch_size: usize) -> Option<usize> {
     let content = union.commit_lanes(log_batch_size);
-    if envelope_shape().is_none() || std::env::var("ENV_NO_PAD").is_err() {
+    let Some(env) = envelope_shape() else {
+        return content;
+    };
+    if !env_free_counts() {
         return content;
     }
     let c = content.unwrap_or(1usize << log_batch_size);
-    assert!(c <= ENV_LANES, "content lanes {c} exceed the lane pin {ENV_LANES}");
-    Some(ENV_LANES)
+    assert!(
+        c <= env.lanes,
+        "content lanes {c} exceed the lane pin {}",
+        env.lanes
+    );
+    Some(env.lanes)
 }
 
 fn env_app_base(env: &EnvShape) -> usize {
@@ -289,6 +301,13 @@ fn envelope_shape() -> Option<EnvShape> {
             (318, 15000), // prefix w 8
         ],
         publics: 5300,
+        // The committed lane count — the ONE piece of a child's layout that
+        // stays circuit structure (the parent hashes `num_lanes`-word
+        // leaves), so it is pinned while everything count-shaped rides the
+        // jagged claims. 24 covers every envelope member's content-derived
+        // count at min-one-row (FL 12 at dev / 23 at m32, internal 18) and
+        // stays below `2^initial_k = 32`, so children remain lane-major.
+        lanes: 24,
     })
 }
 
@@ -384,12 +403,13 @@ fn pad_envelope_counts(
     vals: &mut Vec<F128>,
     tail: &EnvTail,
 ) {
-    // ENV_NO_PAD=1 skips the ROW padding (the tail blocks and the public
-    // segment still pad, so only the declared counts differ). It exists for
-    // `envelope_counts_dependency_probe`, which asks the question the
-    // counts pin never answered: does a parent's walk actually depend on a
-    // child's per-type counts, or only on what they sum to?
-    let no_pad = std::env::var("ENV_NO_PAD").is_ok();
+    // FREE COUNTS ARE THE DEFAULT (the count win): the ROW padding is
+    // skipped — children declare their own counts, min-one-row keeps every
+    // type live, and the heights reach a parent only as jagged claims.
+    // The tail blocks and the public segment still pad, so the layout a
+    // parent reads is unchanged. `ENV_PAD=1` restores the counts* row
+    // padding — the differential oracle (`env_free_counts`).
+    let no_pad = env_free_counts();
     let mut report: Vec<String> = Vec::new();
     let mut over: Vec<String> = Vec::new();
     let mut pad = |sb: &mut ShapeBuilder,
@@ -21255,25 +21275,35 @@ fn internal_node_over_two_fl_nodes() {
         fl0.lo.shape.circuit.digest(),
         "the internal accumulator keys by the FL circuit"
     );
-    // **TASK 7b's PIN: an FL node and an internal node are ONE ENVELOPE.**
-    // Same registry digest (wall 2), same declared count vector (counts*),
+    // **TASK 7b's PIN, amended by the COUNT WIN: an FL node and an
+    // internal node are ONE ENVELOPE.** Same registry digest (wall 2),
     // same public-segment length with the app block at the same fixed
-    // offset (publics*) — so a parent's walk cannot tell an FL child from an
-    // internal child, which is what makes one internal circuit serve every
-    // level above the first.
+    // offset (publics*), same PINNED lane count (lanes*) — so a parent's
+    // walk cannot tell an FL child from an internal child. Under FREE
+    // COUNTS (the default) the declared count vectors deliberately
+    // DIFFER: the heights are data now, reaching a parent only as jagged
+    // claims, and the parent's circuit never reads them. Under the
+    // `ENV_PAD=1` oracle the old counts* equality still holds.
     if envelope_shape().is_some() {
         assert_eq!(
             fl0.lo.shape.registry.digest(),
             node.shape.registry.digest(),
             "FL and internal share ONE envelope registry"
         );
-        assert_eq!(
-            fl0.lo.shape.counts, node.shape.counts,
-            "FL and internal declare ONE count vector"
-        );
+        if env_free_counts() {
+            assert_ne!(
+                fl0.lo.shape.counts, node.shape.counts,
+                "free counts: the FL and internal declare their OWN counts"
+            );
+        } else {
+            assert_eq!(
+                fl0.lo.shape.counts, node.shape.counts,
+                "counts* oracle: FL and internal declare ONE count vector"
+            );
+        }
         assert_eq!(
             fl0.lo.pcs.num_lanes, node.pcs.num_lanes,
-            "and therefore ONE lane count"
+            "ONE lane count (lanes* — pinned, the layout's structural residue)"
         );
         assert_eq!(
             fl0.lo.public.len(),
@@ -21338,7 +21368,7 @@ fn child_tape_ops(lo: &LeafOuter) -> Vec<flock_core::transcript_record::Transcri
 /// contradicts that. One of the two is wrong, and the answer decides
 /// whether ~35 ms per node of padding is necessary or merely inherited.
 ///
-/// Run under `ENV_NO_PAD=1`, which skips the row padding so the FL and the
+/// FREE COUNTS are the default now, so the FL and the
 /// internal node carry their TRUE counts, then diff what a parent replays.
 ///
 /// **ANSWER (2026-08-07), and it took two tries.** Counts reach a parent
@@ -21364,7 +21394,7 @@ fn child_tape_ops(lo: &LeafOuter) -> Vec<flock_core::transcript_record::Transcri
 /// run-count-independent (pad the run list to a fixed length), which is the
 /// smaller pin that would actually retire counts*.
 #[test]
-#[ignore] // Diagnostic — run with ENV_NO_PAD=1 TOWER_PROFILE=slim --nocapture.
+#[ignore] // Diagnostic — run with TOWER_PROFILE=slim --nocapture.
 fn envelope_counts_dependency_probe() {
     let Some(_env) = envelope_shape() else {
         println!("\nCOUNTS-DEPENDENCY PROBE: skipped — needs the envelope (TOWER_PROFILE=slim)\n");
@@ -21398,7 +21428,7 @@ fn envelope_counts_dependency_probe() {
         );
         u.dense_words()
     };
-    println!("\nCOUNTS-DEPENDENCY PROBE (ENV_NO_PAD skips row padding)");
+    println!("\nCOUNTS-DEPENDENCY PROBE (free counts — the default)");
     let w_fl = describe("FL", &fl0.lo);
     let w_node = describe("internal", &node);
     println!(
