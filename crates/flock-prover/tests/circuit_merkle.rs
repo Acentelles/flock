@@ -23569,10 +23569,36 @@ fn tower_online_bench() {
     let chain_mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
     let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
     let chain_jp = chain_jagged_params(&cp0);
-    let internal: Vec<Online> = (0..runs)
-        .map(|_| {
+    // ---- INTERNAL vs SPINE, ALTERNATED IN ONE PROCESS ----
+    // The A/B discipline this box demands (sustained proving corrupts its
+    // own measurements within a process): both node shapes are built from
+    // materials that are ALL resident, and the runs interleave, so drift
+    // hits both arms equally. Running five of one then five of the other
+    // gave +3.0% at the dev size and -4.3% at m32 — the box, not a signal.
+    //
+    // The SPINE's steady node is a fresh FL plus a NODE child whose
+    // accumulator it inherits, built exactly as the convergence test
+    // builds node_2. It needs its OWN chain: a spine grows by PREPENDING,
+    // so the fresh FL covers the segments BEFORE the node child's, and
+    // the pair alive above starts at h0 with nothing before it.
+    let spine_mats = envelope_shape().is_some().then(|| {
+        let (fresh, h_mid) = {
+            let s0 = build_chain_proof(h0, n_blocks);
+            let s1 = build_chain_proof(s0.h_end, n_blocks);
+            let h_mid = s1.h_end;
+            (build_fl_node(&s0, &s1), h_mid)
+        };
+        // The base's own children are scoped away — once it is built only
+        // its outputs matter, which is what production carries.
+        let base = {
+            let s2 = build_chain_proof(h_mid, n_blocks);
+            let s3 = build_chain_proof(s2.h_end, n_blocks);
+            let b0 = build_fl_node(&s2, &s3);
+            let s4 = build_chain_proof(s3.h_end, n_blocks);
+            let s5 = build_chain_proof(s4.h_end, n_blocks);
+            let b1 = build_fl_node(&s4, &s5);
             build_node_outer_app(
-                &[&fl0.lo, &fl1.lo],
+                &[&b0.lo, &b1.lo],
                 Some(fl0.stmt_base),
                 Some(ChainLane {
                     registry: chain_registry,
@@ -23580,24 +23606,80 @@ fn tower_online_bench() {
                     circs: &chain_circs,
                     circuit: &cp0.inner.built.shape.circuit,
                     params: &chain_jp,
-                    priors: &[&fl0.acc, &fl1.acc],
+                    priors: &[&b0.acc, &b1.acc],
                     claims_base: fl0.fold_pub_base,
                 }),
                 None,
             )
-            .online
-        })
-        .collect();
+        };
+        let lane = base.lane_acc.clone().expect("the base's lane");
+        (fresh, base, lane)
+    });
+    let mut internal: Vec<Online> = Vec::new();
+    let mut spine: Vec<Online> = Vec::new();
+    for i in 0..runs {
+        // Alternate the ORDER too, so a warm-up bias cannot settle on one
+        // arm: even runs lead with internal, odd runs with the spine.
+        for arm in if i % 2 == 0 { [0, 1] } else { [1, 0] } {
+            if arm == 0 {
+                internal.push(
+                    build_node_outer_app(
+                        &[&fl0.lo, &fl1.lo],
+                        Some(fl0.stmt_base),
+                        Some(ChainLane {
+                            registry: chain_registry,
+                            mats: &chain_mats,
+                            circs: &chain_circs,
+                            circuit: &cp0.inner.built.shape.circuit,
+                            params: &chain_jp,
+                            priors: &[&fl0.acc, &fl1.acc],
+                            claims_base: fl0.fold_pub_base,
+                        }),
+                        None,
+                    )
+                    .online,
+                );
+            } else if let Some((fresh, base, lane)) = &spine_mats {
+                spine.push(
+                    build_node_outer_app(
+                        &[&fresh.lo, &base.lo],
+                        Some(fl0.stmt_base),
+                        Some(ChainLane {
+                            registry: chain_registry,
+                            mats: &chain_mats,
+                            circs: &chain_circs,
+                            circuit: &cp0.inner.built.shape.circuit,
+                            params: &chain_jp,
+                            priors: &[&fresh.acc, lane],
+                            claims_base: fl0.fold_pub_base,
+                        }),
+                        Some(SpineIn {
+                            node_child: 1,
+                            prior: &base.block,
+                        }),
+                    )
+                    .online,
+                );
+            }
+        }
+    }
 
     let (leaf_on, fl_on, int_on) = (
         median_total(&leaf),
         median_total(&fl),
         median_total(&internal),
     );
-    // A balanced tree over L leaves carries L/2 first-level nodes and
-    // L/2 − 1 internal ones, so a leaf's amortised share tends to
-    // leaf + FL/2 + internal/2 as the tree deepens.
-    let per_leaf = leaf_on + fl_on / 2.0 + int_on / 2.0;
+    // ANY binary tree over L leaves carries L/2 first-level nodes and
+    // L/2 − 1 nodes above them — the count is tree-shape-indifferent — so
+    // a leaf's amortised share tends to leaf + FL/2 + node/2 whichever
+    // shape the tower uses. The SPINE's node is the honest one to divide
+    // by: it is what every level above 2 runs.
+    let node_on = if spine.is_empty() {
+        int_on
+    } else {
+        median_total(&spine)
+    };
+    let per_leaf = leaf_on + fl_on / 2.0 + node_on / 2.0;
     println!(
         "\nONLINE BENCH — {n_blocks} compressions/leaf, {runs} runs/stage, profile {:?}\n  \
          per-proof ONLINE (setup is per-SHAPE, shown for reference only):",
@@ -23606,8 +23688,17 @@ fn tower_online_bench() {
     report_stage("leaf", &leaf);
     report_stage("FL", &fl);
     report_stage("internal", &internal);
+    if !spine.is_empty() {
+        report_stage("spine (steady)", &spine);
+        println!(
+            "  the spine's node costs {:+.1}% against the fresh-only \
+             internal — the tree's node COUNT is unchanged, so this delta \
+             IS wall 3's whole price",
+            100.0 * (node_on - int_on) / int_on,
+        );
+    }
     println!(
-        "  AMORTISED per leaf (leaf + FL/2 + internal/2): {:.0} ms \
+        "  AMORTISED per leaf (leaf + FL/2 + node/2): {:.0} ms \
          -> {:.0}k compressions/sec\n  \
          the leaf's walk IS the chain compute — the application's own \
          sequential work, not proving\n",
