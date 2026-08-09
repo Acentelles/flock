@@ -12423,6 +12423,7 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         &el_asserts,
         Some((&cp0.inner.built.shape.circuit, &sigmas)),
         &[],
+        &[],
         &mut chp,
     )
     .expect("the first-level fold proves");
@@ -12432,6 +12433,7 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         &bool_asserts,
         &el_asserts,
         Some((&cp0.inner.built.shape.circuit, &sigmas)),
+        &[],
         &[],
         &agg,
         &mut rec,
@@ -12871,6 +12873,7 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
                 cp0.inner.built.shape.circuit.digest(),
                 rebuilt[2].clone(),
             )),
+            jagged: Vec::new(),
         };
         assert_eq!(
             acc_pub, acc_v,
@@ -17071,6 +17074,7 @@ fn mvp11_merge_fold_region() {
             &ea,
             Some((&built0.shape.circuit, &sg)),
             &[],
+            &[],
             &mut ch,
         )
         .expect("the leaf fold proves");
@@ -17080,6 +17084,7 @@ fn mvp11_merge_fold_region() {
             &ba,
             &ea,
             Some((&built0.shape.circuit, &sg)),
+            &[],
             &[],
             &lp,
             &mut ch,
@@ -17102,6 +17107,7 @@ fn mvp11_merge_fold_region() {
         &el_mats,
         &el_asserts,
         Some((&built0.shape.circuit, &sigmas)),
+        &[],
         &priors,
         &mut chp,
     )
@@ -17113,6 +17119,7 @@ fn mvp11_merge_fold_region() {
         &bool_asserts,
         &el_asserts,
         Some((&built0.shape.circuit, &sigmas)),
+        &[],
         &priors,
         &agg,
         &mut rec,
@@ -17606,6 +17613,7 @@ fn mvp11_merge_fold_region() {
             per_type: vec![(rebuilt[0].clone(), rebuilt[1].clone())],
             per_element: vec![(rebuilt[2].clone(), rebuilt[3].clone())],
             sigma: Some((built0.shape.circuit.digest(), rebuilt[4].clone())),
+            jagged: Vec::new(),
         };
         assert_eq!(
             acc_pub, acc_v,
@@ -17940,6 +17948,7 @@ fn mvp11_swap_children_fold_scale() {
         &el_asserts,
         Some((&lo.shape.circuit, &sigmas)),
         &[],
+        &[],
         &mut chp,
     )
     .expect("the scale fold proves");
@@ -17950,6 +17959,7 @@ fn mvp11_swap_children_fold_scale() {
         &bool_asserts,
         &el_asserts,
         Some((&lo.shape.circuit, &sigmas)),
+        &[],
         &[],
         &agg,
         &mut rec,
@@ -18150,6 +18160,7 @@ fn mvp11_swap_children_fold_scale() {
                 })
                 .collect(),
             sigma: Some((lo.shape.circuit.digest(), rebuilt[n_folds - 1].clone())),
+            jagged: Vec::new(),
         };
         assert_eq!(
             acc_pub, acc_v,
@@ -18447,6 +18458,7 @@ fn build_node_outer_app(
         &el_asserts,
         Some((&lo0.shape.circuit, &sigmas)),
         &[],
+        &[],
         &mut chp,
     )
     .expect("the node fold proves");
@@ -18457,6 +18469,7 @@ fn build_node_outer_app(
         &bool_asserts,
         &el_asserts,
         Some((&lo0.shape.circuit, &sigmas)),
+        &[],
         &[],
         &agg,
         &mut rec,
@@ -18560,6 +18573,7 @@ fn build_node_outer_app(
             &[],
             &el_asserts_l,
             Some((ln.circuit, &[])),
+            &[],
             ln.priors,
             &mut chp,
         )
@@ -18571,6 +18585,7 @@ fn build_node_outer_app(
             &[],
             &el_asserts_l,
             Some((ln.circuit, &[])),
+            &[],
             ln.priors,
             &lagg,
             &mut lrec,
@@ -19364,6 +19379,7 @@ fn build_node_outer_app(
                 })
                 .collect(),
             sigma: Some((lo0.shape.circuit.digest(), rebuilt[n_folds - 1].clone())),
+            jagged: Vec::new(),
         };
         assert_eq!(
             acc_pub, acc_v,
@@ -19425,6 +19441,7 @@ fn build_node_outer_app(
                     per_type: vec![(lrebuilt[0].clone(), lrebuilt[1].clone())],
                     per_element: Vec::new(),
                     sigma: Some((lane_ref.circuit.digest(), lrebuilt[2].clone())),
+                    jagged: Vec::new(),
                 };
                 assert_eq!(
                     &lacc_pub2, lacc_n,
@@ -20460,6 +20477,7 @@ fn chain_tower_e2e_with_lane() {
             &[],
             &el_asserts_l,
             Some((&cp0.inner.built.shape.circuit, &[])),
+            &[],
             &[&fl0.acc, &fl1.acc],
             &mut chp,
         )
@@ -20471,6 +20489,7 @@ fn chain_tower_e2e_with_lane() {
                 &[],
                 &el_asserts_l,
                 Some((&cp0.inner.built.shape.circuit, &[])),
+                &[],
                 &[&bad_acc, &fl1.acc],
                 &lagg,
                 &mut ch,
@@ -21213,6 +21232,7 @@ fn envelope_registry_diff() {
             &el_asserts,
             None,
             &[],
+            &[],
             &mut chp,
         )
         .expect("the leaf-level fold proves");
@@ -21222,6 +21242,7 @@ fn envelope_registry_diff() {
             &bool_asserts,
             &el_asserts,
             None,
+            &[],
             &[],
             &agg_l,
             &mut chv,
@@ -21246,6 +21267,7 @@ fn envelope_registry_diff() {
             &el_mats,
             &n_el,
             Some((&n0.shape.circuit, &n_sigmas)),
+            &[],
             &[&acc_leaf],
             &mut chp2,
         )
@@ -21256,6 +21278,7 @@ fn envelope_registry_diff() {
             &n_bool,
             &n_el,
             Some((&n0.shape.circuit, &n_sigmas)),
+            &[],
             &[&acc_leaf],
             &agg_n,
             &mut chv2,
@@ -21285,6 +21308,7 @@ fn envelope_registry_diff() {
                 &el_mats,
                 &n_el,
                 Some((&n0.shape.circuit, &n_sigmas)),
+                &[],
                 &[&bad],
                 &mut chb,
             )

@@ -2034,6 +2034,18 @@ pub fn prove_frobenius_assist<C: Challenger>(
     FrobeniusAssistProof { v, rounds }
 }
 
+/// What the DEFERRED verify exports from the assist: the final point `σ`
+/// (every jagged-layout claim's column point) and each merged statement's
+/// count-dependent factor `w_st` (anchor coefficients baked), in statement
+/// order — [`frobenius_statements`]'s merge order, which is deterministic:
+/// claims in claim order, then groups in group order, specs sharing a row
+/// point collapsed into the first occurrence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssistDefer {
+    pub sigma: Vec<F128>,
+    pub statement_ws: Vec<F128>,
+}
+
 /// Verifier for the batched Frobenius assist: replays the rounds against
 /// `proof.v` and checks the final relation
 /// `claim == Σ_stmt U_stmt(σ)·ĝ_stmt(σ)`. On success returns the verified
@@ -2045,6 +2057,42 @@ pub fn verify_frobenius_assist<C: Challenger>(
     rho: &[F128],
     proof: &FrobeniusAssistProof,
     challenger: &mut C,
+) -> Option<F128> {
+    verify_frobenius_assist_core(params, claims, groups, rho, proof, challenger, None)
+}
+
+/// [`verify_frobenius_assist`] plus the deferred export — transcript-
+/// identical, since the export only copies values the plain path already
+/// computes.
+pub fn verify_frobenius_assist_deferred<C: Challenger>(
+    params: &JaggedParams,
+    claims: &[FrobeniusClaim<'_>],
+    groups: &[(ScalarGroupClaim<'_>, F128)],
+    rho: &[F128],
+    proof: &FrobeniusAssistProof,
+    challenger: &mut C,
+) -> Option<(F128, AssistDefer)> {
+    let mut out = None;
+    let v = verify_frobenius_assist_core(
+        params,
+        claims,
+        groups,
+        rho,
+        proof,
+        challenger,
+        Some(&mut out),
+    )?;
+    Some((v, out.expect("the deferred core fills the export")))
+}
+
+fn verify_frobenius_assist_core<C: Challenger>(
+    params: &JaggedParams,
+    claims: &[FrobeniusClaim<'_>],
+    groups: &[(ScalarGroupClaim<'_>, F128)],
+    rho: &[F128],
+    proof: &FrobeniusAssistProof,
+    challenger: &mut C,
+    defer: Option<&mut Option<AssistDefer>>,
 ) -> Option<F128> {
     use rayon::prelude::*;
     let m = params.m;
@@ -2112,7 +2160,10 @@ pub fn verify_frobenius_assist<C: Challenger>(
         );
     }
     let t = std::time::Instant::now();
-    let expect = sts
+    // Per statement: (contribution, w) — `w` is the count-dependent factor
+    // the deferred path exports; the sequential re-sum is the same XOR fold
+    // the parallel reduce performed, so the check is value-identical.
+    let parts: Vec<(F128, F128)> = sts
         .par_iter()
         .map(|st| {
             let w = st
@@ -2143,15 +2194,22 @@ pub fn verify_frobenius_assist<C: Challenger>(
                 }
                 g = prev;
             }
-            w * g[STATE_INITIAL]
+            (w * g[STATE_INITIAL], w)
         })
-        .reduce(|| F128::ZERO, |a, b| a + b);
+        .collect();
+    let expect = parts.iter().fold(F128::ZERO, |a, &(c, _)| a + c);
     if trace {
         eprintln!(
             "          [fro-v] per-statement dot + boundary DP (x{}): {}",
             sts.len(),
             tfmt(t.elapsed().as_secs_f64())
         );
+    }
+    if let Some(out) = defer {
+        *out = Some(AssistDefer {
+            sigma,
+            statement_ws: parts.iter().map(|&(_, w)| w).collect(),
+        });
     }
     (claim == expect).then_some(proof.v)
 }
@@ -3625,6 +3683,64 @@ pub fn verify_multipoint_twisted<C: Challenger>(
     proof: &MultipointTwistedProof,
     challenger: &mut C,
 ) -> Option<F128> {
+    verify_multipoint_twisted_core(params, claims, groups, rho, proof, challenger, None)
+}
+
+/// The deferred export of the whole multipoint anchor: the assist's final
+/// point and per-statement factors, plus the anchor-level coefficients the
+/// expect recombination applies — everything a parent needs to re-express
+/// the count-dependent side as claims on the jagged layout
+/// ([`crate::matrix_fold::JaggedClaim`]) instead of evaluating it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MultipointDefer {
+    /// The anchor sumcheck's bound point `ρ″` (length `m`).
+    pub point: Vec<F128>,
+    /// The assist's final point `σ` — every jagged claim's column point.
+    pub sigma: Vec<F128>,
+    /// Merged-statement factors `w_st`, in [`frobenius_statements`]'s
+    /// deterministic order (claims first, then groups, row-point merged).
+    pub statement_ws: Vec<F128>,
+    /// Per RS claim: the anchor's single nonzero coefficient
+    /// `γ^{128i}·ĝ(ρ″)`.
+    pub rs_coeffs: Vec<F128>,
+    /// Per scalar group: the statement-level coefficient
+    /// `γ^{128·n_rs+k}·eq(ρ, ρ″)`.
+    pub group_coeffs: Vec<F128>,
+}
+
+/// [`verify_multipoint_twisted`] plus the deferred export —
+/// transcript-identical, the export only copies what the plain path
+/// computes.
+pub fn verify_multipoint_twisted_deferred<C: Challenger>(
+    params: &JaggedParams,
+    claims: &[FrobeniusClaim<'_>],
+    groups: &[ScalarGroupClaim<'_>],
+    rho: &[F128],
+    proof: &MultipointTwistedProof,
+    challenger: &mut C,
+) -> Option<(F128, MultipointDefer)> {
+    let mut out = None;
+    let v = verify_multipoint_twisted_core(
+        params,
+        claims,
+        groups,
+        rho,
+        proof,
+        challenger,
+        Some(&mut out),
+    )?;
+    Some((v, out.expect("the deferred core fills the export")))
+}
+
+fn verify_multipoint_twisted_core<C: Challenger>(
+    params: &JaggedParams,
+    claims: &[FrobeniusClaim<'_>],
+    groups: &[ScalarGroupClaim<'_>],
+    rho: &[F128],
+    proof: &MultipointTwistedProof,
+    challenger: &mut C,
+    defer: Option<&mut Option<MultipointDefer>>,
+) -> Option<F128> {
     let m = params.m;
     if proof.values.len() != claims.len()
         || proof.group_values.len() != groups.len()
@@ -3708,16 +3824,28 @@ pub fn verify_multipoint_twisted<C: Challenger>(
         .enumerate()
         .map(|(k, g)| (*g, gpow[128 * n_rs + k] * e_at))
         .collect();
-    let s_at = verify_frobenius_assist(
+    let mut assist_out: Option<AssistDefer> = None;
+    let s_at = verify_frobenius_assist_core(
         params,
         &anchor_claims,
         &anchor_groups,
         &point,
         &proof.anchor,
         challenger,
+        defer.is_some().then_some(&mut assist_out),
     )?;
     if running != s_at {
         return None;
+    }
+    if let Some(out) = defer {
+        let a = assist_out.expect("the assist core fills the export when asked");
+        *out = Some(MultipointDefer {
+            point: point.clone(),
+            sigma: a.sigma,
+            statement_ws: a.statement_ws,
+            rs_coeffs: (0..n_rs).map(|i| gpow[128 * i] * g_at).collect(),
+            group_coeffs: (0..n_g).map(|k| gpow[128 * n_rs + k] * e_at).collect(),
+        });
     }
 
     // Recombine the verified values:

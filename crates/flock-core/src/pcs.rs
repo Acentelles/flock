@@ -1413,6 +1413,159 @@ pub fn open_batch_merged<Ch: Challenger>(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Rebuild the member decomposition [`scalar_claim_groups`] packed, express
+/// every count-dependent `W`-value as a RAW claim on the layout table, and
+/// tie the decomposition to the anchor's own statement factors — exactly,
+/// since bilinear forms are linear in their weights and `GF(2^128)` sums
+/// reassociate. Panics on any mismatch: an export that does not recombine
+/// to what the verifier itself checked must never leave the process.
+fn assemble_jagged_assertion(
+    params: &jagged::JaggedParams,
+    x_outers: &[&[F128]],
+    packed_direct: &[PackedDirectClaimRef<'_>],
+    gammas_pd: &[F128],
+    pd_groups: &[(&[F128], Vec<F128>)],
+    n_log: usize,
+    mp: &jagged::MultipointDefer,
+) -> crate::matrix_fold::JaggedAssertion {
+    use crate::matrix_fold::{JaggedClaim, JaggedRowWeight, JaggedTable};
+    let table = JaggedTable::from_params(params);
+
+    // RS claims: raw eq(z_col) at σ, claim order.
+    let rs: Vec<JaggedClaim> = x_outers
+        .iter()
+        .map(|x| {
+            JaggedClaim::honest(
+                JaggedRowWeight::Eq(x[1 + n_log..].to_vec()),
+                mp.sigma.clone(),
+                &table,
+            )
+        })
+        .collect();
+
+    // The pd members re-grouped by row point in scalar_claim_groups' exact
+    // order: boolean columns are one-hot addresses, everything else stays a
+    // dense member. The regrouping must mirror the groups the anchor saw.
+    struct G<'a> {
+        z_row: &'a [F128],
+        combo: Vec<(F128, u32)>,
+        dense: Vec<(F128, &'a [F128])>,
+    }
+    let mut gs: Vec<G<'_>> = Vec::new();
+    for (c, &g) in packed_direct.iter().zip(gammas_pd) {
+        let (zr, zc) = (&c.point[..n_log], &c.point[n_log..]);
+        let hot: Option<usize> = zc.iter().enumerate().try_fold(0usize, |acc, (i, &x)| {
+            if x == F128::ZERO {
+                Some(acc)
+            } else if x == F128::ONE {
+                Some(acc | (1 << i))
+            } else {
+                None
+            }
+        });
+        let slot = match gs.iter_mut().find(|m| m.z_row == zr) {
+            Some(m) => m,
+            None => {
+                gs.push(G {
+                    z_row: zr,
+                    combo: Vec::new(),
+                    dense: Vec::new(),
+                });
+                gs.last_mut().unwrap()
+            }
+        };
+        match hot {
+            Some(h) => slot.combo.push((g, h as u32)),
+            None => slot.dense.push((g, zc)),
+        }
+    }
+    assert_eq!(
+        gs.len(),
+        pd_groups.len(),
+        "the regrouping must mirror scalar_claim_groups"
+    );
+    for (m, (zr, _)) in gs.iter().zip(pd_groups) {
+        assert_eq!(m.z_row, *zr, "group order must mirror scalar_claim_groups");
+    }
+
+    let groups: Vec<(Option<JaggedClaim>, Vec<(F128, JaggedClaim)>)> = gs
+        .iter()
+        .map(|m| {
+            let combo = (!m.combo.is_empty()).then(|| {
+                JaggedClaim::honest(
+                    JaggedRowWeight::Combo(m.combo.clone()),
+                    mp.sigma.clone(),
+                    &table,
+                )
+            });
+            let dense = m
+                .dense
+                .iter()
+                .map(|&(g, zc)| {
+                    (
+                        g,
+                        JaggedClaim::honest(
+                            JaggedRowWeight::Eq(zc.to_vec()),
+                            mp.sigma.clone(),
+                            &table,
+                        ),
+                    )
+                })
+                .collect();
+            (combo, dense)
+        })
+        .collect();
+
+    // THE TIE: the decomposition recombines to the anchor's own statement
+    // factors. Statement order is frobenius_statements' — RS claims with a
+    // live coefficient first, then the groups. A row-point collision would
+    // merge statements and break the mapping, so its absence is asserted.
+    for (i, xa) in x_outers.iter().enumerate() {
+        for xb in &x_outers[i + 1..] {
+            assert!(
+                xa[1..1 + n_log] != xb[1..1 + n_log],
+                "RS row points must be distinct"
+            );
+        }
+        for (zr, _) in pd_groups {
+            assert!(
+                xa[1..1 + n_log] != **zr,
+                "an RS row point collides with a group's"
+            );
+        }
+    }
+    let mut ws = mp.statement_ws.iter();
+    for (rc, &coeff) in rs.iter().zip(&mp.rs_coeffs) {
+        if coeff.is_zero() {
+            continue;
+        }
+        assert_eq!(
+            *ws.next().expect("a statement per live RS claim"),
+            coeff * rc.value,
+            "RS statement recombination"
+        );
+    }
+    for ((combo, dense), &coeff) in groups.iter().zip(&mp.group_coeffs) {
+        let raw = combo.as_ref().map_or(F128::ZERO, |c| c.value)
+            + dense
+                .iter()
+                .fold(F128::ZERO, |a, &(g, ref c)| a + g * c.value);
+        assert_eq!(
+            *ws.next().expect("a statement per group"),
+            coeff * raw,
+            "group statement recombination"
+        );
+    }
+    assert!(ws.next().is_none(), "every statement accounted for");
+
+    crate::matrix_fold::JaggedAssertion {
+        k: params.k,
+        m: params.m,
+        rs,
+        groups,
+    }
+}
+
 pub fn verify_batch_merged<Ch: Challenger>(
     commitment: &Commitment,
     claims: &[F128],
@@ -1424,6 +1577,71 @@ pub fn verify_batch_merged<Ch: Challenger>(
     proof: &MergedOpenProof,
     lig_config: &ligerito::VerifierConfig,
     challenger: &mut Ch,
+) -> Result<(), VerifyErrorOpen> {
+    verify_batch_merged_core(
+        commitment,
+        claims,
+        z_skips,
+        x_outers,
+        packed_direct,
+        heights,
+        n_log,
+        proof,
+        lig_config,
+        challenger,
+        None,
+    )
+}
+
+/// [`verify_batch_merged`] plus the jagged-layout export — the count win's
+/// deferral seam. The anchor's count-dependent `W`-values come back as RAW
+/// claims on the layout table ([`crate::matrix_fold::JaggedAssertion`]),
+/// each tied to the verifier's own expect by an EXACT recombination assert
+/// (field sums and products distribute, so the tie is equality, not
+/// tolerance). Transcript-identical to the plain entry.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_batch_merged_deferred<Ch: Challenger>(
+    commitment: &Commitment,
+    claims: &[F128],
+    z_skips: &[F128],
+    x_outers: &[&[F128]],
+    packed_direct: &[PackedDirectClaimRef<'_>],
+    heights: &[u64],
+    n_log: usize,
+    proof: &MergedOpenProof,
+    lig_config: &ligerito::VerifierConfig,
+    challenger: &mut Ch,
+) -> Result<crate::matrix_fold::JaggedAssertion, VerifyErrorOpen> {
+    let mut out = None;
+    verify_batch_merged_core(
+        commitment,
+        claims,
+        z_skips,
+        x_outers,
+        packed_direct,
+        heights,
+        n_log,
+        proof,
+        lig_config,
+        challenger,
+        Some(&mut out),
+    )?;
+    Ok(out.expect("the deferred core fills the export"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_batch_merged_core<Ch: Challenger>(
+    commitment: &Commitment,
+    claims: &[F128],
+    z_skips: &[F128],
+    x_outers: &[&[F128]],
+    packed_direct: &[PackedDirectClaimRef<'_>],
+    heights: &[u64],
+    n_log: usize,
+    proof: &MergedOpenProof,
+    lig_config: &ligerito::VerifierConfig,
+    challenger: &mut Ch,
+    defer: Option<&mut Option<crate::matrix_fold::JaggedAssertion>>,
 ) -> Result<(), VerifyErrorOpen> {
     let n_rs = claims.len();
     assert_eq!(z_skips.len(), n_rs);
@@ -1558,15 +1776,41 @@ pub fn verify_batch_merged<Ch: Challenger>(
     let t = std::time::Instant::now();
     #[cfg(feature = "mul-count")]
     let assist_start = crate::field::gf2_128::op_count::snapshot();
-    let v = jagged::verify_multipoint_twisted(
-        &params,
-        &fclaims,
-        &gclaims,
-        &rho,
-        &proof.frobenius,
-        challenger,
-    )
-    .ok_or(VerifyErrorOpen::Assist)?;
+    let mut mp_defer = None;
+    let v = if defer.is_some() {
+        let (v, mp) = jagged::verify_multipoint_twisted_deferred(
+            &params,
+            &fclaims,
+            &gclaims,
+            &rho,
+            &proof.frobenius,
+            challenger,
+        )
+        .ok_or(VerifyErrorOpen::Assist)?;
+        mp_defer = Some(mp);
+        v
+    } else {
+        jagged::verify_multipoint_twisted(
+            &params,
+            &fclaims,
+            &gclaims,
+            &rho,
+            &proof.frobenius,
+            challenger,
+        )
+        .ok_or(VerifyErrorOpen::Assist)?
+    };
+    if let (Some(out), Some(mp)) = (defer, mp_defer) {
+        *out = Some(assemble_jagged_assertion(
+            &params,
+            x_outers,
+            packed_direct,
+            &gammas_pd,
+            &pd_groups,
+            n_log,
+            &mp,
+        ));
+    }
     #[cfg(feature = "mul-count")]
     if std::env::var("MUL_TRACE").is_ok() {
         let e = crate::field::gf2_128::op_count::snapshot();

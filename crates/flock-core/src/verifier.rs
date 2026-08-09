@@ -310,6 +310,7 @@ pub fn verify_ligerito_union_circuit<Ch: Challenger>(
         &proof.pcs_open,
         pcs_params,
         challenger,
+        None,
     )
 }
 
@@ -371,6 +372,7 @@ pub fn verify_ligerito_union_circuit_deferred<Ch: Challenger>(
         pcs_params,
         challenger,
     )?;
+    let mut jagged = None;
     let claims = verify_merged_opening(
         union,
         commitment,
@@ -379,12 +381,14 @@ pub fn verify_ligerito_union_circuit_deferred<Ch: Challenger>(
         &proof.pcs_open,
         pcs_params,
         challenger,
+        Some(&mut jagged),
     )?;
     Ok((
         claims,
         DeferredMatrixWork {
             boolean: matrix,
             element: el_matrix,
+            jagged: jagged.expect("the deferred opening fills the export"),
         },
         sigma.expect("a circuit binding always verifies wiring"),
     ))
@@ -400,6 +404,7 @@ fn verify_merged_opening<Ch: Challenger>(
     pcs_open: &crate::pcs::MergedOpenProof,
     pcs_params: &crate::pcs::PcsParams,
     challenger: &mut Ch,
+    defer: Option<&mut Option<crate::matrix_fold::JaggedAssertion>>,
 ) -> Result<crate::proof::UnionClassClaims, VerifyError> {
     let cl: Vec<ZClaim> = match &claims.boolean {
         Some(c) => vec![c.ab.clone(), c.c.clone()],
@@ -427,8 +432,8 @@ fn verify_merged_opening<Ch: Challenger>(
         .ligerito_verifier_config()
         .expect("Ligerito default verifier config");
     verifier_pool()
-        .install(|| {
-            pcs::verify_batch_merged(
+        .install(|| match defer {
+            Some(out) => pcs::verify_batch_merged_deferred(
                 commitment,
                 &values,
                 &z_skips,
@@ -440,6 +445,19 @@ fn verify_merged_opening<Ch: Challenger>(
                 &lig_v_config,
                 challenger,
             )
+            .map(|a| *out = Some(a)),
+            None => pcs::verify_batch_merged(
+                commitment,
+                &values,
+                &z_skips,
+                &x_refs,
+                &pd,
+                &union.jagged_heights(),
+                union.n_log(),
+                pcs_open,
+                &lig_v_config,
+                challenger,
+            ),
         })
         .map_err(VerifyError::PcsOpen)?;
     Ok(claims.clone())
@@ -571,14 +589,6 @@ pub fn verify_ligerito_union_mixed_class_deferred<Ch: Challenger>(
         pcs_params,
         challenger,
     )?;
-    // DEFERRED: both classes' matrix work rides out undischarged for the
-    // caller to check or accumulate (`crate::aggregate`). The returned
-    // claims are CONDITIONAL on the assertions.
-    let deferred = DeferredMatrixWork {
-        boolean: matrix,
-        element: el_matrix,
-    };
-
     // Same construction as the boolean-only merged verifier: the PCS point
     // is `x_inner_rest ‖ x_outer`, with the skip coordinate carried
     // separately in `z_skip`.
@@ -607,9 +617,13 @@ pub fn verify_ligerito_union_mixed_class_deferred<Ch: Challenger>(
     let lig_v_config = pcs_params
         .ligerito_verifier_config()
         .expect("Ligerito default verifier config");
-    verifier_pool()
+    // DEFERRED: both classes' matrix work rides out undischarged for the
+    // caller to check or accumulate (`crate::aggregate`), the layout's
+    // W-claims beside them. The returned claims are CONDITIONAL on the
+    // assertions.
+    let jagged = verifier_pool()
         .install(|| {
-            pcs::verify_batch_merged(
+            pcs::verify_batch_merged_deferred(
                 commitment,
                 &values,
                 &z_skips,
@@ -623,7 +637,14 @@ pub fn verify_ligerito_union_mixed_class_deferred<Ch: Challenger>(
             )
         })
         .map_err(VerifyError::PcsOpen)?;
-    Ok((claims, deferred))
+    Ok((
+        claims,
+        DeferredMatrixWork {
+            boolean: matrix,
+            element: el_matrix,
+            jagged,
+        },
+    ))
 }
 
 /// Shared PIOP replay for both union verify shapes: statement binding, the
@@ -813,6 +834,11 @@ type UnionPiopOut = (
 pub struct DeferredMatrixWork {
     pub boolean: Option<lincheck::MatrixAssertion>,
     pub element: Option<crate::element_r1cs::union::ElementAssertion>,
+    /// The layout's count-dependent `W`-values as raw foldable claims on the
+    /// jagged table (the count win). Always present — every merged opening
+    /// runs the multipoint anchor — and tied to the verifier's own expect by
+    /// the export's exact recombination assert.
+    pub jagged: crate::matrix_fold::JaggedAssertion,
 }
 
 /// Verify a batched PCS opening over an arbitrary list of `ẑ`-claims — the

@@ -88,6 +88,14 @@ pub struct Accumulator {
     /// digest — normalisation gives internal nodes one shape, hence one
     /// key. `None` until a circuit proof's wiring assertion joins.
     pub sigma: Option<([u8; 32], MatrixClaim)>,
+    /// The jagged-layout group (the count win): per child SHAPE, one folded
+    /// claim on that shape's layout table `J`, keyed by the digest whose
+    /// circuit determines the heights. PER-DIGEST entries, unlike sigma —
+    /// a tree mixes child shapes (chain, first-level, internal), and each
+    /// key's claims fold only among themselves because they name different
+    /// height vectors. Empty until a deferred verify's jagged assertion
+    /// joins.
+    pub jagged: Vec<([u8; 32], MatrixClaim)>,
 }
 
 impl Accumulator {
@@ -148,6 +156,22 @@ impl Accumulator {
                 .all(|((ca, cb), (a, b))| ca.check_direct(*a) && cb.check_direct(*b))
     }
 
+    /// The jagged group's root discharge: each entry's folded claim against
+    /// its own layout — `O(2^k + runs·m)` per key, once. The caller supplies
+    /// the layout per digest (the heights are shape constants of that
+    /// digest's circuit). `true` when nothing jagged was accumulated; an
+    /// entry whose key is missing from `tables` fails, never skips.
+    pub fn discharge_jagged(
+        &self,
+        tables: &[([u8; 32], &crate::pcs::jagged::JaggedParams)],
+    ) -> bool {
+        self.jagged.iter().all(|(d, c)| {
+            tables.iter().find(|(k, _)| k == d).is_some_and(|(_, p)| {
+                matrix_fold::discharge_jagged(c, &matrix_fold::JaggedTable::from_params(p))
+            })
+        })
+    }
+
     /// The sigma group's root discharge: the folded claim against the real
     /// sigma table — `O(2^mu)`, once. `true` when no sigma was accumulated.
     pub fn discharge_sigma(&self, circuit: &crate::circuit::Circuit) -> bool {
@@ -174,6 +198,9 @@ pub struct AggregateProof {
     pub el_folds: Vec<(FoldProof, FoldProof)>,
     /// The sigma group's fold, when a circuit's wiring assertion joins.
     pub sigma_fold: Option<FoldProof>,
+    /// The jagged group's folds, one per digest key, in the caller's key
+    /// order.
+    pub jagged_folds: Vec<FoldProof>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -257,7 +284,9 @@ pub fn prove_aggregate<Ch: Challenger>(
     priors: &[&Accumulator],
     ch: &mut Ch,
 ) -> Result<(AggregateProof, Accumulator), AggregateError> {
-    prove_aggregate_classes(registry, mats, circuits, assertions, &[], &[], None, priors, ch)
+    prove_aggregate_classes(
+        registry, mats, circuits, assertions, &[], &[], None, &[], priors, ch,
+    )
 }
 
 /// [`prove_aggregate`] over BOTH classes: the boolean assertions against
@@ -273,6 +302,7 @@ pub fn prove_aggregate_classes<Ch: Challenger>(
     el_mats: &[ElementMatrices<'_>],
     el_assertions: &[(&crate::union::UnionInstance<'_>, ElementAssertion)],
     sigma: Option<(&crate::circuit::Circuit, &[crate::circuit::SigmaAssertion])>,
+    jagged: &[JaggedKeyProve<'_>],
     priors: &[&Accumulator],
     ch: &mut Ch,
 ) -> Result<(AggregateProof, Accumulator), AggregateError> {
@@ -340,20 +370,22 @@ pub fn prove_aggregate_classes<Ch: Challenger>(
         per_element.push((out_a, out_b));
     }
 
-    let (sigma_fold, sigma_out) =
-        fold_sigma_prove(sigma, priors, ch)?;
+    let (sigma_fold, sigma_out) = fold_sigma_prove(sigma, priors, ch)?;
+    let (jagged_folds, jagged_out) = fold_jagged_prove(jagged, priors, ch)?;
 
     Ok((
         AggregateProof {
             folds,
             el_folds,
             sigma_fold,
+            jagged_folds,
         },
         Accumulator {
             registry_digest: registry.digest(),
             per_type,
             per_element,
             sigma: sigma_out,
+            jagged: jagged_out,
         },
     ))
 }
@@ -403,6 +435,136 @@ fn fold_sigma_prove<Ch: Challenger>(
         .collect();
     let (pf, out) = matrix_fold::prove_fold(&m, &combs, &claims, ch);
     Ok((Some(pf), Some((digest, out))))
+}
+
+/// The jagged group's per-key key list entry, prover side: the digest, the
+/// layout it names, and the fresh assertions carrying claims about it.
+pub type JaggedKeyProve<'a> = (
+    [u8; 32],
+    &'a crate::pcs::jagged::JaggedParams,
+    Vec<&'a matrix_fold::JaggedAssertion>,
+);
+
+/// The verifier's view of a key: digest and fresh assertions — no layout
+/// anywhere, which is what lets a circuit replay this half.
+pub type JaggedKeyVerify<'a> = ([u8; 32], Vec<&'a matrix_fold::JaggedAssertion>);
+
+/// The jagged group's fold, prover side: for each key in the caller's order,
+/// [priors' entries with that key, in prior order | fresh claims, in
+/// assertion order] fold to one claim through the structure-aware jagged
+/// fold. The caller's key list must cover every prior entry's key — a prior
+/// claim that cannot fold must fail loudly, exactly as sigma's rule reads.
+fn fold_jagged_prove<Ch: Challenger>(
+    jagged: &[JaggedKeyProve<'_>],
+    priors: &[&Accumulator],
+    ch: &mut Ch,
+) -> Result<(Vec<FoldProof>, Vec<([u8; 32], MatrixClaim)>), AggregateError> {
+    for p in priors {
+        for (d, _) in &p.jagged {
+            if !jagged.iter().any(|(k, _, _)| k == d) {
+                return Err(AggregateError::RegistryMismatch);
+            }
+        }
+    }
+    let mut folds = Vec::with_capacity(jagged.len());
+    let mut out = Vec::with_capacity(jagged.len());
+    for (i, (digest, params, asserts)) in jagged.iter().enumerate() {
+        if jagged[..i].iter().any(|(k, _, _)| k == digest) {
+            return Err(AggregateError::Malformed);
+        }
+        let table = matrix_fold::JaggedTable::from_params(params);
+        let claims = gather_jagged(digest, asserts, priors, table.k, table.m)?;
+        ch.observe_label(DOMAIN_JAGGED_GROUP);
+        ch.observe_bytes(digest);
+        let (pf, folded) = matrix_fold::prove_fold_jagged(&table, &claims, ch);
+        folds.push(pf);
+        out.push((*digest, folded));
+    }
+    Ok((folds, out))
+}
+
+/// The claims of one jagged key, in the fixed order every group uses.
+/// `k`/`m` hold fresh assertions to the key's layout shape; inherited
+/// claims are plain-eq by construction and their arity is checked by the
+/// fold itself.
+fn gather_jagged(
+    digest: &[u8; 32],
+    asserts: &[&matrix_fold::JaggedAssertion],
+    priors: &[&Accumulator],
+    k: usize,
+    m: usize,
+) -> Result<Vec<matrix_fold::JaggedClaim>, AggregateError> {
+    let mut claims: Vec<matrix_fold::JaggedClaim> = Vec::new();
+    for p in priors {
+        for (d, c) in &p.jagged {
+            if d == digest {
+                claims
+                    .push(matrix_fold::JaggedClaim::from_folded(c).ok_or(AggregateError::Malformed)?);
+            }
+        }
+    }
+    for a in asserts {
+        if a.k != k || a.m != m {
+            return Err(AggregateError::Malformed);
+        }
+        claims.extend(a.claims().into_iter().cloned());
+    }
+    if claims.is_empty() {
+        return Err(AggregateError::Malformed);
+    }
+    Ok(claims)
+}
+
+const DOMAIN_JAGGED_GROUP: &[u8] = b"flock-aggregate-jagged-v0";
+
+/// The jagged group's replay — no layout read anywhere.
+fn fold_jagged_verify<Ch: Challenger>(
+    jagged: &[JaggedKeyVerify<'_>],
+    priors: &[&Accumulator],
+    proofs: &[FoldProof],
+    ch: &mut Ch,
+) -> Result<Vec<([u8; 32], MatrixClaim)>, AggregateError> {
+    for p in priors {
+        for (d, _) in &p.jagged {
+            if !jagged.iter().any(|(k, _)| k == d) {
+                return Err(AggregateError::RegistryMismatch);
+            }
+        }
+    }
+    if proofs.len() != jagged.len() {
+        return Err(AggregateError::Malformed);
+    }
+    let mut out = Vec::with_capacity(jagged.len());
+    for (i, ((digest, asserts), pf)) in jagged.iter().zip(proofs).enumerate() {
+        if jagged[..i].iter().any(|(k, _)| k == digest) {
+            return Err(AggregateError::Malformed);
+        }
+        // The key's shape: from a fresh assertion, else from an inherited
+        // claim's own arity (folded claims are plain eq).
+        let (k, m) = match asserts.first() {
+            Some(a) => (a.k, a.m),
+            None => {
+                let c = priors
+                    .iter()
+                    .flat_map(|p| p.jagged.iter())
+                    .find(|(d, _)| d == digest)
+                    .ok_or(AggregateError::Malformed)?;
+                let k = c.1.row.point.len();
+                let n_col = c.1.col.point.len();
+                if n_col < 2 || n_col % 2 != 0 {
+                    return Err(AggregateError::Malformed);
+                }
+                (k, n_col / 2 - 1)
+            }
+        };
+        let claims = gather_jagged(digest, asserts, priors, k, m)?;
+        ch.observe_label(DOMAIN_JAGGED_GROUP);
+        ch.observe_bytes(digest);
+        let folded =
+            matrix_fold::verify_fold_jagged(k, &claims, pf, ch).map_err(AggregateError::Fold)?;
+        out.push((*digest, folded));
+    }
+    Ok(out)
 }
 
 /// Element claims to fold for one type: the priors' first (in order), then
@@ -470,15 +632,17 @@ pub fn verify_aggregate<Ch: Challenger>(
     proof: &AggregateProof,
     ch: &mut Ch,
 ) -> Result<Accumulator, AggregateError> {
-    verify_aggregate_classes(registry, assertions, &[], None, priors, proof, ch)
+    verify_aggregate_classes(registry, assertions, &[], None, &[], priors, proof, ch)
 }
 
 /// [`verify_aggregate`] over BOTH classes. Reads no matrix of either kind.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_aggregate_classes<Ch: Challenger>(
     registry: &Registry,
     assertions: &[MatrixAssertion],
     el_assertions: &[(&crate::union::UnionInstance<'_>, ElementAssertion)],
     sigma: Option<(&crate::circuit::Circuit, &[crate::circuit::SigmaAssertion])>,
+    jagged: &[JaggedKeyVerify<'_>],
     priors: &[&Accumulator],
     proof: &AggregateProof,
     ch: &mut Ch,
@@ -561,10 +725,13 @@ pub fn verify_aggregate_classes<Ch: Challenger>(
         }
     };
 
+    let jagged_out = fold_jagged_verify(jagged, priors, &proof.jagged_folds, ch)?;
+
     Ok(Accumulator {
         registry_digest: registry.digest(),
         per_type,
         per_element,
         sigma: sigma_out,
+        jagged: jagged_out,
     })
 }

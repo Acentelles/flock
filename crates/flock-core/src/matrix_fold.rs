@@ -834,6 +834,45 @@ impl JaggedClaim {
     }
 }
 
+/// One deferred verify's jagged-layout export: every count-dependent
+/// `W`-value of the multipoint anchor as a RAW claim on the layout table,
+/// structured the way the expect recombination consumes them. The flat
+/// [`Self::claims`] view is what a merge node folds; the structure is what
+/// a circuit publishes and the recombination assert reads. Coefficients
+/// (`γ^{128i}·ĝ(ρ″)`, `γ^{…}·eq(ρ,ρ″)`, the dense members' `γ_pd`) stay
+/// OUTSIDE the family — they are transcript-derived, so baking them into a
+/// claim identity would make the weights unfoldable.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JaggedAssertion {
+    /// Layout shape: `k` layout-column bits; boundary values in `0..=2^m`.
+    pub k: usize,
+    pub m: usize,
+    /// Per ring-switch claim, in claim order: the raw `eq(z_col)` claim.
+    pub rs: Vec<JaggedClaim>,
+    /// Per scalar group, in group order: the γ-baked one-hot combo (absent
+    /// when the group has no boolean-column members) and the dense members
+    /// as `(γ_pd, raw eq claim)` pairs.
+    pub groups: Vec<(Option<JaggedClaim>, Vec<(F128, JaggedClaim)>)>,
+}
+
+impl JaggedAssertion {
+    /// Every claim, flattened — the fold's fresh-claim view.
+    pub fn claims(&self) -> Vec<&JaggedClaim> {
+        let mut out: Vec<&JaggedClaim> = self.rs.iter().collect();
+        for (combo, dense) in &self.groups {
+            out.extend(combo.iter());
+            out.extend(dense.iter().map(|(_, c)| c));
+        }
+        out
+    }
+
+    /// Root discharge: every claim against the real layout.
+    pub fn check(&self, params: &crate::pcs::jagged::JaggedParams) -> bool {
+        let t = JaggedTable::from_params(params);
+        t.k == self.k && t.m == self.m && self.claims().into_iter().all(|c| c.check_direct(&t))
+    }
+}
+
 /// `Σ_y row(y)·col_eq(pair(y))` over the runs — the honest value of a jagged
 /// claim, and the root discharge's evaluator. Never touches the `2^{2(m+1)}`
 /// pair space densely.

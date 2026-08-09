@@ -1452,6 +1452,8 @@ fn a_merge_node_folds_two_circuit_proofs() {
     // discharge).
     let mut assertions = Vec::new();
     let mut sigmas = Vec::new();
+    let mut jaggeds = Vec::new();
+    let mut jagged_params = None;
     for ((proof, commitment, pcs_params, circuit), tree) in proofs.iter().zip(&trees) {
         let union = UnionInstance::new(&registry, vec![tree.n_gates]);
         let mut ch = FsChallenger::new(DOMAIN);
@@ -1472,7 +1474,22 @@ fn a_merge_node_folds_two_circuit_proofs() {
         );
         assertions.push(work.boolean.expect("a boolean PIOP ran"));
         sigmas.push(sigma);
+        // The layout's W-claims (the count win). The layout is a shape
+        // constant — same circuit, same heights — so both children's claims
+        // name ONE table, rebuilt here exactly as the opening verifier did.
+        let params = flock_core::pcs::jagged::JaggedParams::from_heights(
+            &union.jagged_heights(),
+            union.n_log(),
+            commitment.params.m - flock_core::pcs::LOG_PACKING,
+        );
+        assert!(
+            work.jagged.check(&params),
+            "the exported jagged claims discharge against the child's own layout"
+        );
+        jaggeds.push(work.jagged);
+        jagged_params.get_or_insert(params);
     }
+    let jagged_params = jagged_params.expect("two children ran");
     // Both children prove the SAME circuit, which is what makes their sigma
     // claims foldable (the accumulator is digest-keyed).
     assert_eq!(
@@ -1486,6 +1503,14 @@ fn a_merge_node_folds_two_circuit_proofs() {
     let mats = [(&r1cs.a_0, &r1cs.b_0)];
     let circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![circuit_lc];
     let circuit0 = &proofs[0].3;
+    let digest = circuit0.digest();
+    let jagged_p: Vec<aggregate::JaggedKeyProve<'_>> = vec![(
+        digest,
+        &jagged_params,
+        jaggeds.iter().collect(),
+    )];
+    let jagged_v: Vec<aggregate::JaggedKeyVerify<'_>> =
+        vec![(digest, jaggeds.iter().collect())];
     let mut chp = FsChallenger::new(b"merge");
     let (agg, acc) = aggregate::prove_aggregate_classes(
         &registry,
@@ -1495,6 +1520,7 @@ fn a_merge_node_folds_two_circuit_proofs() {
         &[],
         &[],
         Some((circuit0, &sigmas)),
+        &jagged_p,
         &[],
         &mut chp,
     )
@@ -1505,6 +1531,7 @@ fn a_merge_node_folds_two_circuit_proofs() {
         &assertions,
         &[],
         Some((circuit0, &sigmas)),
+        &jagged_v,
         &[],
         &agg,
         &mut chv,
@@ -1524,6 +1551,28 @@ fn a_merge_node_folds_two_circuit_proofs() {
     assert!(
         acc.discharge_sigma(circuit0),
         "the folded sigma claim discharges at the root"
+    );
+    // The jagged group: both children's W-claims folded to ONE claim on the
+    // shared layout, discharged once at the root — the count win's native
+    // chain, end to end.
+    assert_eq!(
+        acc.jagged.len(),
+        1,
+        "one folded jagged claim per child shape"
+    );
+    assert!(
+        acc.discharge_jagged(&[(digest, &jagged_params)]),
+        "the folded jagged claim discharges at the root"
+    );
+    let mut bad = acc.clone();
+    bad.jagged[0].1.value += flock_core::field::F128::ONE;
+    assert!(
+        !bad.discharge_jagged(&[(digest, &jagged_params)]),
+        "a tampered jagged fold fails the root discharge"
+    );
+    assert!(
+        !acc.discharge_jagged(&[]),
+        "a jagged entry with no table to discharge against must fail, not skip"
     );
     assert_eq!(acc.registry_digest, registry.digest());
     // A tampered folded sigma value must fail the root discharge.
@@ -1578,6 +1627,7 @@ fn a_merge_node_folds_two_circuit_proofs() {
             &[],
             Some((circuit0, &sigmas[i..i + 1])),
             &[],
+            &[],
             &mut chp,
         )
         .expect("the single-child fold proves");
@@ -1587,6 +1637,7 @@ fn a_merge_node_folds_two_circuit_proofs() {
             &assertions[i..i + 1],
             &[],
             Some((circuit0, &sigmas[i..i + 1])),
+            &[],
             &[],
             &agg1,
             &mut chv,
@@ -1603,6 +1654,7 @@ fn a_merge_node_folds_two_circuit_proofs() {
         &[],
         &[],
         Some((circuit0, &[])),
+        &[],
         &[&acc_a, &acc_b],
         &mut chp,
     )
@@ -1613,6 +1665,7 @@ fn a_merge_node_folds_two_circuit_proofs() {
         &[],
         &[],
         Some((circuit0, &[])),
+        &[],
         &[&acc_a, &acc_b],
         &agg2,
         &mut chv,
