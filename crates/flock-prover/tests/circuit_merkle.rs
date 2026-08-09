@@ -7319,15 +7319,37 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         prover::prove_fast_ligerito_union(&union, &leaf_pcs, vec![slot], &mut ch);
 
     let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(DOMAIN));
-    let native_claims = verifier::verify_ligerito_union(
+    // ONE recorded DEFERRED verify, transcript-identical to the plain entry
+    // (the RealTape precedent): its jagged export is the W-value source for
+    // the anchor expect, and the matrix work it defers is discharged
+    // natively right below — the leaf stays FULLY verified.
+    let mixed_repack = flock_core::proof::R1csProofMixedClassMerged {
+        boolean: Some(flock_core::proof::BooleanPiopProof {
+            zerocheck: proof.zerocheck.clone(),
+            lincheck: proof.lincheck.clone(),
+        }),
+        element: None,
+        pcs_open: proof.pcs_open.clone(),
+    };
+    let (all_claims, leaf_work) = verifier::verify_ligerito_union_mixed_class_deferred(
         &union,
         &[circuit],
         &commitment,
-        &proof,
+        &mixed_repack,
         &leaf_pcs,
         &mut rec,
     )
     .expect("the leaf workload proof verifies");
+    let native_claims = all_claims.boolean.expect("boolean-only leaf claims");
+    leaf_work
+        .boolean
+        .as_ref()
+        .expect("boolean matrix work")
+        .check(&union, &[circuit])
+        .expect("the leaf's deferred matrix work discharges natively");
+    let jag_leaf = leaf_work.jagged;
+    assert_eq!(jag_leaf.rs.len(), 2, "two RS claims at the leaf");
+    assert!(jag_leaf.groups.is_empty(), "no pd groups at the leaf (P = 0)");
     let t_shape = rec.shape();
     let chals: Vec<F128> = rec.challenges().to_vec();
     let vals_rec = rec.values();
@@ -8443,6 +8465,12 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
                     .iter()
                     .zip(&eqc_n)
                     .fold(F128::ZERO, |a, (&x, &e)| a + x * e);
+                // The count win's tie: the RS raw W the leaf now publishes
+                // equals the deferred export's claim value.
+                assert_eq!(
+                    jag_leaf.rs[si].value, w_n,
+                    "RS raw W == exported jagged claim {si}"
+                );
                 let mut g = [F128::ZERO; 4];
                 g[flock_core::pcs::jagged::STATE_SUCCESS] = F128::ONE;
                 for layer in (0..=m_mp2).rev() {
@@ -8523,44 +8551,19 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             let eqj = prefix_product(&mut sb, &factors);
             ghat = sb.gate(spine, &[zw, zw, zw, ghat, zw, zw, mp_pws[j], eqj, zw])[3];
         }
-        // Per-run boundary eq products at sigma (statement-independent).
-        let eqc_w: Vec<Wire> = bounds_i
-            .iter()
-            .map(|&(t_c, t_next, _)| {
-                let mut factors = Vec::with_capacity(2 * (m_mp2 + 1));
-                for l in 0..=m_mp2 {
-                    factors.push((mp_sig_w[2 * l], if (t_c >> l) & 1 == 1 { ow } else { zw }));
-                    factors
-                        .push((mp_sig_w[2 * l + 1], if (t_next >> l) & 1 == 1 { ow } else { zw }));
-                }
-                prefix_product(&mut sb, &factors)
-            })
-            .collect();
-        // Per statement: run weights, the w dot, the DP, the coefficient.
+        // THE COUNT WIN at the leaf: the per-run boundary products and the
+        // run-weight enumeration are gone — each RS statement's raw W is a
+        // PUBLISHED CLAIM VALUE on the jagged layout (the deferred verify's
+        // own export), checker-held and discharged at the accumulation
+        // tree's root. Nothing count-shaped remains in the circuit.
         let alslot = slot_cached(&mut sb, &mut leaf_slot, 601, AssistLayerGate::new);
+        let mut leaf_jag_w: Vec<Wire> = Vec::new();
         let mut expect_w = zw;
         for (si, xs) in [&xab_pw, &xc_pw].iter().enumerate() {
             let z_row_w: Vec<Wire> = xs[1..1 + n_log_i].iter().map(|&(_, w)| w).collect();
-            let z_col_w: Vec<Wire> = xs[1 + n_log_i..].iter().map(|&(_, w)| w).collect();
-            let mut run_w: Vec<Wire> = vec![zw; n_runs];
-            let mut tail_w = ow;
-            for (r, slot2) in run_w.iter_mut().take(n_single).enumerate() {
-                let factors: Vec<(Wire, Wire)> = z_col_w
-                    .iter()
-                    .enumerate()
-                    .map(|(jj, &zc)| (zc, if (r >> jj) & 1 == 1 { ow } else { zw }))
-                    .collect();
-                let s = prefix_product(&mut sb, &factors);
-                *slot2 = s;
-                tail_w = sb.gate(spine, &[zw, zw, zw, tail_w, zw, zw, s, ow, zw])[3];
-            }
-            if has_tail {
-                run_w[n_runs - 1] = tail_w;
-            }
-            let mut w_st = zw;
-            for (r, &rw) in run_w.iter().enumerate() {
-                w_st = sb.gate(spine, &[zw, zw, zw, w_st, zw, zw, rw, eqc_w[r], zw])[3];
-            }
+            vals.push(jag_leaf.rs[si].value);
+            let w_st = sb.input();
+            leaf_jag_w.push(w_st);
             let mut g = [zw, zw, ow, zw]; // STATE_SUCCESS seed
             for layer in (0..=m_mp2).rev() {
                 let za = if layer < n_log_i { z_row_w[layer] } else { zw };
@@ -8628,6 +8631,12 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         for w in &assert_pub {
             sb.publish(*w);
         }
+        // ---- the JAGGED ASSERTION emission (the count win) ----
+        // The two RS raw W claim values, checker-held against the deferred
+        // export; their points are chain wires already on the region.
+        for w in &leaf_jag_w {
+            sb.publish(*w);
+        }
         // counts* + publics*: every envelope outer declares the ONE count
         // vector and the ONE public-segment length — shape.counts and
         // every union cloned from it carry them onward. The boundary
@@ -8661,8 +8670,18 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         // The sqrt-chain, anchor-expect, zc-round and T_m == anchor.v
         // identities are COPY CONSTRAINTS — no publics, no checker items.
         // The REAL segment's end: publics* zeros sit past it (envelope
-        // only; equal to the full length otherwise).
-        let plen = prepad_publics;
+        // only; equal to the full length otherwise). The jagged claim
+        // values are the segment's LAST block; every older from-the-end
+        // offset holds against the boundary just before them.
+        let n_jag_pub = jag_leaf.rs.len();
+        for (j, c) in jag_leaf.rs.iter().enumerate() {
+            assert_eq!(
+                built.public[prepad_publics - n_jag_pub + j],
+                c.value,
+                "jagged claim value {j} matches the deferred export"
+            );
+        }
+        let plen = prepad_publics - n_jag_pub;
         let n_assert_pub = 1 + lc_rounds2.len() + 2 * proof.lincheck.matrix_evals.len();
         let total_pub: usize = levels.len()
             + levels.len() * yr_len
@@ -9093,6 +9112,7 @@ struct RealTape<'p> {
     k_cols_i: usize,
     m_mp2: usize,
     bounds_i: Vec<(u64, u64, u32)>,
+    #[allow(dead_code)] // The layout's run→column map — the eqc_w era's consumer; kept as shape data.
     run_of: Vec<usize>,
     x_ab_n: Vec<F128>,
     x_c_n: Vec<F128>,
@@ -9100,6 +9120,10 @@ struct RealTape<'p> {
     /// Derived pd claim points (merged-open v1), pinned order
     /// [element c, element lc, gathers in cell-slot order].
     pd_pts: Vec<Vec<F128>>,
+    /// The deferred verify's jagged-layout export (the count win) — the
+    /// independent reference for the W-value publics, tied to the native
+    /// expect replica in the constructor.
+    jag: flock_core::matrix_fold::JaggedAssertion,
 }
 
 impl<'p> RealTape<'p> {
@@ -9124,7 +9148,7 @@ impl<'p> RealTape<'p> {
         // This is also exactly what a production node runs per child —
         // the tape cost halved when the second pass dissolved.
         let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(domain));
-        let (mat_assert, el_assert, sigma_native, claims) = {
+        let (mat_assert, el_assert, sigma_native, jag_assert, claims) = {
             let (claims, work, sigma) = verifier::verify_ligerito_union_circuit_deferred(
                 &union_i,
                 &lo.shape.circuit,
@@ -9142,6 +9166,7 @@ impl<'p> RealTape<'p> {
                 work.boolean.expect("a boolean PIOP ran"),
                 work.element.expect("an element PIOP ran"),
                 sigma,
+                work.jagged,
                 claims,
             )
         };
@@ -10157,6 +10182,13 @@ impl<'p> RealTape<'p> {
                         .iter()
                         .zip(&eqc_n)
                         .fold(F128::ZERO, |a, (&x, &e)| a + x * e);
+                    // The count win's tie at real-inner scale: the RS raw W
+                    // the region now publishes equals the deferred export's
+                    // claim value.
+                    assert_eq!(
+                        jag_assert.rs[si].value, w_n,
+                        "RS raw W == exported jagged claim {si}"
+                    );
                     let coeff = if si == 0 { g_at_n } else { gpow_n[128] * g_at_n };
                     acc += coeff * (w_n * dp_native(z_row));
                 }
@@ -10174,6 +10206,27 @@ impl<'p> RealTape<'p> {
                         .iter()
                         .zip(&eqc_n)
                         .fold(F128::ZERO, |a, (&x, &e)| a + x * e);
+                    // The group's exported decomposition recombines to the
+                    // same raw group W, member for member.
+                    let (combo, dense) = &jag_assert.groups[g_ix];
+                    let mut raw = combo.as_ref().map_or(F128::ZERO, |c| c.value);
+                    let mut d_it = dense.iter();
+                    for &i2 in members {
+                        let hot = pd_pts_n[i2][n_log_i..]
+                            .iter()
+                            .all(|&x| x == F128::ZERO || x == F128::ONE);
+                        if hot {
+                            continue;
+                        }
+                        let (g, c) = d_it.next().expect("a dense entry per non-hot member");
+                        assert_eq!(*g, chals[gammas_i[i2].ch], "dense member γ_pd");
+                        raw += *g * c.value;
+                    }
+                    assert!(d_it.next().is_none(), "every dense entry consumed");
+                    assert_eq!(
+                        raw, w_n,
+                        "group {g_ix} raw W == exported jagged decomposition"
+                    );
                     let dp = dp_native(&pd_pts_n[members[0]][..n_log_i]);
                     acc += gpow_n[256 + g_ix] * e_at_n * (w_n * dp);
                 }
@@ -10254,6 +10307,7 @@ impl<'p> RealTape<'p> {
             x_c_n,
             groups_ix,
             pd_pts: pd_pts_n,
+            jag: jag_assert,
         }
     }
 }
@@ -10267,11 +10321,17 @@ struct RealRegion {
     n_tail: usize,
     n_mat_pub: usize,
     /// The family-H re-exposure block length (the tail past z_skip).
+    #[allow(dead_code)]
     n_fam_pub: usize,
     n_ela_pub: usize,
     /// Labeled `public_len` checkpoints through the emission — the publics
     /// census (`PUB_CENSUS=1` on the node test prints the block sizes).
     census: Vec<(&'static str, usize, usize)>,
+    /// The jagged assertion's value wires (the count win), in emission
+    /// order: rs claims, then per group the combo and its dense members —
+    /// the fresh-claim surfaces a merge fold connects to.
+    #[allow(dead_code)]
+    jag_w: Vec<Wire>,
     /// The z_skip squeeze wire — see [`ChildRegion::zskip_w`].
     zskip_w: Wire,
     /// sigma: the deferred s_sigma stream word + the GKR squeeze point.
@@ -10826,94 +10886,26 @@ fn emit_real_child_region(
             .collect();
         prefix_product(sb, &factors)
     };
-    // ASSIST_CENSUS=1 — what the JAGGED LAYOUT costs this region. Everything
-    // from here to `connect(anc_w, expect_w)` is the W side of the anchor
-    // expect: the per-run boundary eq products (`eqc_w`, the one site where
-    // the child's counts are baked as circuit structure) and the column-eq
-    // dots that consume them. The census reports the two slots' rows across
-    // that span, so the prize of BINDING W instead of REBUILDING it is a
-    // measured number rather than a formula.
-    let census = std::env::var("ASSIST_CENSUS").is_ok();
-    let (pf0, mac0) = (sb.rows_in_slot(pfslot), sb.rows_in_slot(cs.macs));
-    let eqc_w: Vec<Wire> = rt
-        .bounds_i
-        .iter()
-        .map(|&(t_c, t_next, _)| {
-            let mut factors = Vec::with_capacity(2 * (m_mp2 + 1));
-            // THE ONE SITE WHERE THE CHILD'S COUNTS ENTER THE PARENT'S
-            // CIRCUIT AS STRUCTURE. `rt.bounds_i` is the assist boundary
-            // list — the JAGGED RUN BOUNDARIES, i.e. the prefix sums of the
-            // child's per-type heights — and its bits are baked here as
-            // `ow`/`zw`. SP1 carries exactly these (`col_prefix_sums` as
-            // `Point<Felt>`, <=30 prover-supplied bits) and binds them by
-            // hashing the counts into the commitment.
-            //
-            // ENV_BITS_ADVICE=1 supplies them as advice wires instead —
-            // DELIBERATELY UNBOUND, a measurement of the STRUCTURAL claim
-            // only (does the leak close, and is it cell-neutral?). Shipping
-            // this needs the bits bound: the counts into the statement
-            // binding, then an in-circuit reconstruction, which is what
-            // SP1's PrefixSumChecks precompile does.
-            let bit_advice = std::env::var("ENV_BITS_ADVICE").is_ok();
-            let mut bit_w = |sb: &mut ShapeBuilder, vals: &mut Vec<F128>, set: bool| -> Wire {
-                if bit_advice {
-                    vals.push(if set { F128::ONE } else { F128::ZERO });
-                    sb.input()
-                } else if set {
-                    ow
-                } else {
-                    zw
-                }
-            };
-            for l in 0..=m_mp2 {
-                let b0 = bit_w(sb, vals, (t_c >> l) & 1 == 1);
-                let b1 = bit_w(sb, vals, (t_next >> l) & 1 == 1);
-                factors.push((mp_sig_w[2 * l], b0));
-                factors.push((mp_sig_w[2 * l + 1], b1));
-            }
-            prefix_product(sb, &factors)
-        })
-        .collect();
-    let pf_eqc = sb.rows_in_slot(pfslot) - pf0;
-    let (mut n_hot, mut n_gen) = (0usize, 0usize);
-    // Column weights via EQ-TABLE DOUBLING (the committed-footprint fix).
-    let col_eqc: Vec<Wire> = rt.run_of.iter().map(|&r3| eqc_w[r3]).collect();
-    let lo_bits = k_cols_i / 2;
-    let eq_dot = |sb: &mut ShapeBuilder, z_col: &[Wire]| -> Wire {
-        let build = |sb: &mut ShapeBuilder, coords: &[Wire]| -> Vec<Wire> {
-            let mut t2 = vec![ow];
-            for &cw2 in coords {
-                let mut lo_half = Vec::with_capacity(t2.len());
-                let mut hi_half = Vec::with_capacity(t2.len());
-                for &e in &t2 {
-                    let m2 = sb.gate(macs, &[zw, e, cw2])[0];
-                    lo_half.push(sb.gate(macs, &[e, e, cw2])[0]);
-                    hi_half.push(m2);
-                }
-                lo_half.extend(hi_half);
-                t2 = lo_half;
-            }
-            t2
-        };
-        let lo_t = build(sb, &z_col[..lo_bits]);
-        let hi_t = build(sb, &z_col[lo_bits..]);
-        let block = lo_t.len();
-        let mut acc = zw;
-        for (h2, &hw2) in hi_t.iter().enumerate() {
-            let mut inner = zw;
-            for (l2, &lw2) in lo_t.iter().enumerate() {
-                inner = sb.gate(macs, &[inner, lw2, col_eqc[h2 * block + l2]])[0];
-            }
-            acc = sb.gate(macs, &[acc, hw2, inner])[0];
-        }
-        acc
-    };
+    // THE COUNT WIN: everything from here to `connect(anc_w, expect_w)`
+    // used to be the W side of the anchor expect — per-run boundary eq
+    // products with the child's jagged run boundaries baked as ow/zw
+    // (`eqc_w`, THE one site where counts were circuit structure) plus the
+    // eq-table dots consuming them (~7.4k rows per region, 6.8% of a
+    // node's committed words). All deleted: each statement's raw W arrives
+    // as a PUBLISHED CLAIM VALUE on the jagged layout table — the deferred
+    // verify's own export, keyed by the child digest — checker-held here
+    // and discharged at the ROOT of the accumulation tree. The claim's
+    // points are wires this region already carries (σ = the anchor round
+    // squeezes, z_cols = statement point wires, γ_pd = squeezes); nothing
+    // count-shaped remains in the circuit.
+    let mut jag_w: Vec<Wire> = Vec::new();
     let alslot = cs.alslot;
     let mut expect_w = zw;
     for (si, xs) in [&xab_pw, &xc_pw].iter().enumerate() {
         let z_row_w: Vec<Wire> = xs[1..1 + n_log_i].iter().map(|&(_, w)| w).collect();
-        let z_col_w: Vec<Wire> = xs[1 + n_log_i..].iter().map(|&(_, w)| w).collect();
-        let w_st = eq_dot(sb, &z_col_w);
+        vals.push(rt.jag.rs[si].value);
+        let w_st = sb.input();
+        jag_w.push(w_st);
         let mut gdp = [zw, zw, ow, zw]; // STATE_SUCCESS seed
         for layer in (0..=m_mp2).rev() {
             let za = if layer < n_log_i { z_row_w[layer] } else { zw };
@@ -10932,51 +10924,39 @@ fn emit_real_child_region(
         expect_w = sb.gate(spine, &[zw, zw, zw, expect_w, zw, zw, coeff, wd, zw])[3];
     }
     for (g_ix, members) in rt.groups_ix.iter().enumerate() {
-        // Bilinearity. Since merged-open v1 the pd points are DERIVED, not
-        // absorbed: a gather's column point is constant address bits (the
-        // one-hot statement data — nothing to bind in-circuit), and the
-        // element pair's coordinates are the region PIOP's own squeeze
-        // wires, pinned against rt.pd_pts in the constructor.
-        let mut w_st = zw;
-        let el_col_w = |j: usize, i2: usize| -> Wire {
-            let coord = rt.pd_pts[i2][n_log_i + j];
-            if coord == F128::ZERO {
-                zw
-            } else if coord == F128::ONE {
-                ow
-            } else if i2 == 0 {
-                outs[trace.squeezes[piop_i.zc_rounds[n_log_i + j].fin][0]][0]
-            } else {
-                let n_lc = piop_i.lc_rounds.len();
-                outs[trace.squeezes[piop_i.lc_rounds[n_lc - 1 - j].fin][0]][0]
+        // The γ-baked one-hot combo (all this group's gather claims) is ONE
+        // published value; each dense (element) member publishes its raw eq
+        // value with γ_pd applied by a MAC on the squeeze wire — the
+        // exported decomposition reassembled in wires.
+        let (combo, dense) = &rt.jag.groups[g_ix];
+        let mut w_st = match combo {
+            Some(c) => {
+                vals.push(c.value);
+                let w = sb.input();
+                jag_w.push(w);
+                w
             }
+            None => zw,
         };
+        let mut d_it = dense.iter();
         for &i2 in members {
+            let z_col_n = &rt.pd_pts[i2][n_log_i..n_log_i + k_cols_i];
+            let hot = z_col_n
+                .iter()
+                .all(|&x| x == F128::ZERO || x == F128::ONE);
+            if hot {
+                assert!(i2 >= 2, "one-hot columns are gather claims");
+                continue;
+            }
+            let (_, c) = d_it.next().expect("a dense entry per non-hot member");
             let pd = &gammas_i[i2];
             let gpd_w = outs[trace.squeezes[pd.fin][0]][0];
-            let z_col_n = &rt.pd_pts[i2][n_log_i..n_log_i + k_cols_i];
-            let hot: Option<usize> =
-                z_col_n.iter().enumerate().try_fold(0usize, |acc, (j, &x)| {
-                    if x == F128::ZERO {
-                        Some(acc)
-                    } else if x == F128::ONE {
-                        Some(acc | (1 << j))
-                    } else {
-                        None
-                    }
-                });
-            if let Some(h) = hot {
-                assert!(i2 >= 2, "one-hot columns are gather claims");
-                let e = eqc_w[rt.run_of[h]];
-                n_hot += 1;
-                w_st = sb.gate(macs, &[w_st, gpd_w, e])[0];
-            } else {
-                let z_col_w: Vec<Wire> = (0..k_cols_i).map(|j| el_col_w(j, i2)).collect();
-                let d = eq_dot(sb, &z_col_w);
-                n_gen += 1;
-                w_st = sb.gate(macs, &[w_st, gpd_w, d])[0];
-            }
+            vals.push(c.value);
+            let d_w = sb.input();
+            jag_w.push(d_w);
+            w_st = sb.gate(macs, &[w_st, gpd_w, d_w])[0];
         }
+        assert!(d_it.next().is_none(), "every dense entry consumed");
         let mut gdp = [zw, zw, ow, zw]; // STATE_SUCCESS seed
         for layer in (0..=m_mp2).rev() {
             let za = if layer < n_log_i {
@@ -10999,20 +10979,15 @@ fn emit_real_child_region(
         expect_w = sb.gate(macs, &[expect_w, coeff, wd])[0];
     }
     sb.connect(anc_w, expect_w);
-    if census {
-        let (pf_w_side, mac_w_side) = (
-            sb.rows_in_slot(pfslot) - pf0,
-            sb.rows_in_slot(cs.macs) - mac0,
-        );
+    if std::env::var("ASSIST_CENSUS").is_ok() {
         eprintln!(
-            "ASSIST CENSUS  runs {} of {} cols (k {}), m+1 {}, statements {} one-hot + {} general\n\
-             \x20              eqc_w prefix rows {pf_eqc}; W side total: pf {pf_w_side} + mac {mac_w_side} rows",
+            "ASSIST CENSUS  runs {} of {} cols (k {}), m+1 {} — W side is {} PUBLISHED \
+             claim values (the count win); the eqc_w/eq_dot machinery is gone",
             rt.bounds_i.len(),
             1usize << k_cols_i,
             k_cols_i,
             m_mp2 + 1,
-            n_hot + 2,
-            n_gen,
+            jag_w.len(),
         );
     }
 
@@ -11158,6 +11133,15 @@ fn emit_real_child_region(
     sb.publish(rsh_w);
     sb.publish(vrs_w);
     n_fam_pub += 2;
+    cen.push(("TAIL: family-H re-exposure", sb.public_len(), sb.rows_in_slot(cs.macs)));
+    // ---- the JAGGED ASSERTION emission (the count win) ----
+    // Raw W claim values in emission order (rs, then per group combo +
+    // dense members), checker-held against the deferred export — the
+    // fresh-claim surfaces a merge fold connects to.
+    for w in &jag_w {
+        sb.publish(*w);
+    }
+    cen.push(("TAIL: jagged claim values", sb.public_len(), sb.rows_in_slot(cs.macs)));
 
     let n_query_pub: usize = levels.iter().map(|l| l.a_count).sum();
     let n_tail = levels.len()
@@ -11171,8 +11155,8 @@ fn emit_real_child_region(
         + 1
         + mat_pub.len()
         + ela_pub.len()
-        + n_fam_pub;
-    cen.push(("TAIL: family-H re-exposure", sb.public_len(), sb.rows_in_slot(cs.macs)));
+        + n_fam_pub
+        + jag_w.len();
     RealRegion {
         pub_base,
         n_query_pub,
@@ -11180,6 +11164,7 @@ fn emit_real_child_region(
         n_mat_pub: mat_pub.len(),
         n_fam_pub,
         census: cen,
+        jag_w,
         zskip_w: outs[trace.squeezes[rt.zskip_fin][0]][0],
         n_ela_pub: ela_pub.len(),
         sig_w,
@@ -11452,10 +11437,33 @@ fn check_real_child_region(public: &[F128], rt: &RealTape<'_>, r: &RealRegion) -
     fq += rt.mp_i.val_vs.len();
     assert_eq!(public[fq], rt.native_rs_half, "the rs_half advice");
     assert_eq!(public[fq + 1], rt.native_vrs, "the V_rs advice");
+    fq += 2;
+    // The jagged assertion's value surfaces (the count win), in emission
+    // order — each the deferred export's own raw claim value; the full
+    // claims discharge against the child's layout at the root.
+    {
+        let mut expect_vals: Vec<F128> = rt.jag.rs.iter().map(|c| c.value).collect();
+        for (combo, dense) in &rt.jag.groups {
+            if let Some(c) = combo {
+                expect_vals.push(c.value);
+            }
+            for (_, c) in dense {
+                expect_vals.push(c.value);
+            }
+        }
+        for (j, want) in expect_vals.iter().enumerate() {
+            assert_eq!(
+                public[fq + j],
+                *want,
+                "jagged claim value {j} matches the deferred export"
+            );
+        }
+        fq += expect_vals.len();
+    }
     assert_eq!(
-        fq + 2,
+        fq,
         r.pub_base + r.n_query_pub + r.n_tail,
-        "the family-H block is the very tail"
+        "the jagged publics close the region's tail"
     );
     r.n_query_pub + r.n_tail
 }
@@ -13430,13 +13438,20 @@ struct ChildTape<'p> {
     k_cols_i: usize,
     m_mp2: usize,
     bounds_i: Vec<(u64, u64, u32)>,
+    #[allow(dead_code)] // Run start columns — the run-weight era's consumer; kept as shape data.
     run_y0: Vec<usize>,
+    #[allow(dead_code)] // The complement run — likewise.
     comp_ix: usize,
     x_ab_n: Vec<F128>,
     x_c_n: Vec<F128>,
     groups_ix: Vec<Vec<usize>>,
     /// Derived pd claim points (merged-open v1) — see [`RealTape::pd_pts`].
     pd_pts: Vec<Vec<F128>>,
+    /// The deferred verify's jagged-layout export (the count win): the
+    /// independent reference for the W-value publics the region publishes
+    /// instead of rebuilding — tied member-for-member to the native expect
+    /// replica in the constructor.
+    jag: flock_core::matrix_fold::JaggedAssertion,
 }
 
 impl<'p> ChildTape<'p> {
@@ -14545,6 +14560,14 @@ impl<'p> ChildTape<'p> {
                         .iter()
                         .zip(&eqc_n)
                         .fold(F128::ZERO, |a, (&x, &e)| a + x * e);
+                    // The count win's tie: the RAW per-statement W the
+                    // region now PUBLISHES equals the deferred export's
+                    // claim value — the verifier-exported reference, not a
+                    // formula written twice.
+                    assert_eq!(
+                        inner.work.jagged.rs[si].value, w_n,
+                        "RS raw W == exported jagged claim {si}"
+                    );
                     let coeff = if si == 0 { g_at_n } else { gpow_n[128] * g_at_n };
                     acc += coeff * (w_n * dp_native(z_row));
                 }
@@ -14562,6 +14585,28 @@ impl<'p> ChildTape<'p> {
                         .iter()
                         .zip(&eqc_n)
                         .fold(F128::ZERO, |a, (&x, &e)| a + x * e);
+                    // The group's exported decomposition — the γ-baked
+                    // one-hot combo plus γ-outside dense members — must
+                    // recombine to the same raw group W, member for member.
+                    let (combo, dense) = &inner.work.jagged.groups[g_ix];
+                    let mut raw = combo.as_ref().map_or(F128::ZERO, |c| c.value);
+                    let mut d_it = dense.iter();
+                    for &i2 in members {
+                        let hot = pd_pts_n[i2][n_log_i..]
+                            .iter()
+                            .all(|&x| x == F128::ZERO || x == F128::ONE);
+                        if hot {
+                            continue;
+                        }
+                        let (g, c) = d_it.next().expect("a dense entry per non-hot member");
+                        assert_eq!(*g, chals[gammas_o[i2].ch], "dense member γ_pd");
+                        raw += *g * c.value;
+                    }
+                    assert!(d_it.next().is_none(), "every dense entry consumed");
+                    assert_eq!(
+                        raw, w_n,
+                        "group {g_ix} raw W == exported jagged decomposition"
+                    );
                     let dp = dp_native(&pd_pts_n[members[0]][..n_log_i]);
                     acc += gpow_n[256 + g_ix] * e_at_n * (w_n * dp);
                 }
@@ -14648,6 +14693,7 @@ impl<'p> ChildTape<'p> {
             x_c_n,
             groups_ix,
             pd_pts: pd_pts_n,
+            jag: inner.work.jagged.clone(),
         }
     }
 }
@@ -14784,6 +14830,11 @@ struct ChildRegion {
     /// GKR's accumulated squeeze point.
     sig_w: Wire,
     pt_w: Vec<Wire>,
+    /// The jagged assertion's value wires (the count win), in emission
+    /// order: rs claims, then per group the combo and its dense members —
+    /// the fresh-claim surfaces a merge fold connects to.
+    #[allow(dead_code)]
+    jag_w: Vec<Wire>,
     /// The element assertion's point wires: every element zc round rho (in
     /// round order — r_con = zc.r[ν..]) and every element lc round rho (in
     /// round order — r_col is these reversed).
@@ -14837,8 +14888,8 @@ fn emit_child_region(
     let n_p = ct.n_p;
     let m_mp2 = ct.m_mp2;
     let n_log_i = ct.n_log_i;
-    let k_cols_i = ct.k_cols_i;
-    let n_runs = ct.bounds_i.len();
+    let _k_cols_i = ct.k_cols_i;
+    let _n_runs = ct.bounds_i.len();
 
     let leafeval: Vec<_> = geo
         .iter()
@@ -15315,80 +15366,26 @@ fn emit_child_region(
             .collect();
         prefix_product(sb, &factors)
     };
-    // Per-run boundary eq products at sigma (statement-independent).
-    let eqc_w: Vec<Wire> = ct
-        .bounds_i
-        .iter()
-        .map(|&(t_c, t_next, _)| {
-            let mut factors = Vec::with_capacity(2 * (m_mp2 + 1));
-            // THE ONE SITE WHERE THE CHILD'S COUNTS ENTER THE PARENT'S
-            // CIRCUIT AS STRUCTURE. `rt.bounds_i` is the assist boundary
-            // list — the JAGGED RUN BOUNDARIES, i.e. the prefix sums of the
-            // child's per-type heights — and its bits are baked here as
-            // `ow`/`zw`. SP1 carries exactly these (`col_prefix_sums` as
-            // `Point<Felt>`, <=30 prover-supplied bits) and binds them by
-            // hashing the counts into the commitment.
-            //
-            // ENV_BITS_ADVICE=1 supplies them as advice wires instead —
-            // DELIBERATELY UNBOUND, a measurement of the STRUCTURAL claim
-            // only (does the leak close, and is it cell-neutral?). Shipping
-            // this needs the bits bound: the counts into the statement
-            // binding, then an in-circuit reconstruction, which is what
-            // SP1's PrefixSumChecks precompile does.
-            let bit_advice = std::env::var("ENV_BITS_ADVICE").is_ok();
-            let mut bit_w = |sb: &mut ShapeBuilder, vals: &mut Vec<F128>, set: bool| -> Wire {
-                if bit_advice {
-                    vals.push(if set { F128::ONE } else { F128::ZERO });
-                    sb.input()
-                } else if set {
-                    ow
-                } else {
-                    zw
-                }
-            };
-            for l in 0..=m_mp2 {
-                let b0 = bit_w(sb, vals, (t_c >> l) & 1 == 1);
-                let b1 = bit_w(sb, vals, (t_next >> l) & 1 == 1);
-                factors.push((mp_sig_w[2 * l], b0));
-                factors.push((mp_sig_w[2 * l + 1], b1));
-            }
-            prefix_product(sb, &factors)
-        })
-        .collect();
-    // Per RS statement: run weights, the w dot, the DP, the coefficient.
+    // THE COUNT WIN: the counts used to enter the parent's circuit HERE —
+    // per-run boundary eq products with the jagged run boundaries (the
+    // prefix sums of the child's per-type heights) baked as ow/zw, then
+    // per-statement run-weight enumerations consuming them. All of it is
+    // gone: each statement's raw W arrives as a PUBLISHED CLAIM VALUE on
+    // the jagged layout table (the deferred verify's own export, keyed by
+    // the child digest), checker-held here and discharged at the ROOT of
+    // the accumulation tree — the eps discipline, ported. The claim's
+    // points are wires this region already carries (σ = the anchor round
+    // squeezes, z_cols = statement point wires, γ_pd = squeezes); nothing
+    // count-shaped remains in the circuit.
+    let mut jag_w: Vec<Wire> = Vec::new();
+    // Per RS statement: the published w, the DP, the coefficient.
     let alslot = cs.alslot;
     let mut expect_w = zw;
     for (si, xs) in [&xab_pw, &xc_pw].iter().enumerate() {
         let z_row_w: Vec<Wire> = xs[1..1 + n_log_i].iter().map(|&(_, w)| w).collect();
-        let z_col_w: Vec<Wire> = xs[1 + n_log_i..].iter().map(|&(_, w)| w).collect();
-        let mut run_w: Vec<Wire> = vec![zw; n_runs];
-        let mut tot_w = ow;
-        for (r, &(_, _, len)) in ct.bounds_i.iter().enumerate() {
-            if r == ct.comp_ix {
-                continue;
-            }
-            let mut w: Option<Wire> = None;
-            for y in ct.run_y0[r]..ct.run_y0[r] + len as usize {
-                let factors: Vec<(Wire, Wire)> = z_col_w
-                    .iter()
-                    .enumerate()
-                    .map(|(jj, &zc2)| (zc2, if (y >> jj) & 1 == 1 { ow } else { zw }))
-                    .collect();
-                let s = prefix_product(sb, &factors);
-                w = Some(match w {
-                    None => s,
-                    Some(p) => sb.gate(spine, &[zw, zw, zw, p, zw, zw, s, ow, zw])[3],
-                });
-            }
-            let w = w.expect("non-empty run");
-            run_w[r] = w;
-            tot_w = sb.gate(spine, &[zw, zw, zw, tot_w, zw, zw, w, ow, zw])[3];
-        }
-        run_w[ct.comp_ix] = tot_w;
-        let mut w_st = zw;
-        for (r, &rw) in run_w.iter().enumerate() {
-            w_st = sb.gate(spine, &[zw, zw, zw, w_st, zw, zw, rw, eqc_w[r], zw])[3];
-        }
+        vals.push(ct.jag.rs[si].value);
+        let w_st = sb.input();
+        jag_w.push(w_st);
         let mut gdp = [zw, zw, ow, zw]; // STATE_SUCCESS seed
         for layer in (0..=m_mp2).rev() {
             let za = if layer < n_log_i { z_row_w[layer] } else { zw };
@@ -15406,67 +15403,38 @@ fn emit_child_region(
         let wd = sb.gate(spine, &[zw, zw, zw, zw, zw, zw, w_st, gdp[0], zw])[3];
         expect_w = sb.gate(spine, &[zw, zw, zw, expect_w, zw, zw, coeff, wd, zw])[3];
     }
-    // Per group: γ_pd-combined run weights over the absorbed claim points,
-    // coefficient γ^{256+k}·e_at.
+    // Per group: the γ-baked one-hot combo publishes as ONE value; each
+    // dense (element) member publishes its raw eq value with its γ_pd
+    // applied by a MAC on the squeeze wire — the exported decomposition,
+    // reassembled in wires. Coefficient γ^{256+k}·e_at as before.
     for (g_ix, members) in ct.groups_ix.iter().enumerate() {
-        let mut run_w: Vec<Wire> = vec![zw; n_runs];
+        let (combo, dense) = &ct.jag.groups[g_ix];
+        let mut w_st = match combo {
+            Some(c) => {
+                vals.push(c.value);
+                let w = sb.input();
+                jag_w.push(w);
+                w
+            }
+            None => zw,
+        };
+        let mut d_it = dense.iter();
         for &i2 in members {
+            let hot = ct.pd_pts[i2][n_log_i..]
+                .iter()
+                .all(|&x| x == F128::ZERO || x == F128::ONE);
+            if hot {
+                continue;
+            }
+            let (_, c) = d_it.next().expect("a dense entry per non-hot member");
             let pd = &ct.gammas_o[i2];
             let gpd_w = outs[trace.squeezes[pd.fin][0]][0];
-            let mut tot_w = ow;
-            let mut w_at: Vec<Wire> = vec![zw; n_runs];
-            for (r, &(_, _, len)) in ct.bounds_i.iter().enumerate() {
-                if r == ct.comp_ix {
-                    continue;
-                }
-                let mut w: Option<Wire> = None;
-                for y in ct.run_y0[r]..ct.run_y0[r] + len as usize {
-                    let factors: Vec<(Wire, Wire)> = (0..k_cols_i)
-                        .map(|jj| {
-                            // merged-open v1: derived coordinates — element
-                            // claims wire from the region PIOP's squeezes
-                            // (pinned in ChildTape::new), gather coords are
-                            // constant address bits.
-                            let coord = ct.pd_pts[i2][n_log_i + jj];
-                            let cw2 = if coord == F128::ZERO {
-                                zw
-                            } else if coord == F128::ONE {
-                                ow
-                            } else {
-                                // Non-constant col coords occur only on the
-                                // element pair (gather coords are address
-                                // bits) — a boolean-only child never lands
-                                // here.
-                                let el_rec = el_rec.expect("element pd claim");
-                                if i2 == 0 {
-                                    outs[trace.squeezes[el_rec.zc_rounds[n_log_i + jj].1][0]][0]
-                                } else {
-                                    let n_lc = el_rec.lc_rounds.len();
-                                    outs[trace.squeezes[el_rec.lc_rounds[n_lc - 1 - jj].1][0]][0]
-                                }
-                            };
-                            (cw2, if (y >> jj) & 1 == 1 { ow } else { zw })
-                        })
-                        .collect();
-                    let s = prefix_product(sb, &factors);
-                    w = Some(match w {
-                        None => s,
-                        Some(p) => sb.gate(macs, &[p, s, ow])[0],
-                    });
-                }
-                let w = w.expect("non-empty run");
-                w_at[r] = w;
-                tot_w = sb.gate(macs, &[tot_w, w, ow])[0];
-            }
-            w_at[ct.comp_ix] = tot_w;
-            for r in 0..n_runs {
-                run_w[r] = sb.gate(macs, &[run_w[r], gpd_w, w_at[r]])[0];
-            }
+            vals.push(c.value);
+            let d_w = sb.input();
+            jag_w.push(d_w);
+            w_st = sb.gate(macs, &[w_st, gpd_w, d_w])[0];
         }
-        let mut w_st = zw;
-        for (r, &rw) in run_w.iter().enumerate() {
-            w_st = sb.gate(macs, &[w_st, rw, eqc_w[r]])[0];
-        }
+        assert!(d_it.next().is_none(), "every dense entry consumed");
         let mut gdp = [zw, zw, ow, zw]; // STATE_SUCCESS seed
         for layer in (0..=m_mp2).rev() {
             let za = if layer < n_log_i {
@@ -15531,7 +15499,14 @@ fn emit_child_region(
     for w in &pt_w {
         sb.publish(*w);
     }
-    let n_tail = 2 + n_el_pd + 4 + levels.len() * ct.yr_len + 1 + 1 + ct.mu_i;
+    // ---- the JAGGED ASSERTION emission (the count win) ----
+    // Raw W claim values in emission order (rs, then per group combo +
+    // dense members), checker-held against the deferred export.
+    for w in &jag_w {
+        sb.publish(*w);
+    }
+    let n_tail =
+        2 + n_el_pd + 4 + levels.len() * ct.yr_len + 1 + 1 + ct.mu_i + jag_w.len();
     let n_query_pub: usize =
         levels.len() + levels.iter().map(|l| l.a_count).sum::<usize>();
     ChildRegion {
@@ -15540,6 +15515,7 @@ fn emit_child_region(
         n_tail,
         sig_w,
         pt_w,
+        jag_w,
         el_zc_rho_w: el_rec
             .map(|el_rec| {
                 el_rec
@@ -15694,6 +15670,36 @@ fn check_child_region(public: &[F128], ct: &ChildTape<'_>, r: &ChildRegion) -> u
         assert!(
             sa.check(&ct.inner.built.shape.circuit),
             "the emitted sigma assertion discharges against the inner circuit"
+        );
+    }
+    // The jagged assertion's value surfaces (the count win), in emission
+    // order — rs claims, then per group the combo and its dense members —
+    // each the deferred export's own raw claim value. The full claims
+    // (points included) discharge against the child's layout, so the
+    // published values are exactly what a merge fold's fresh-claim
+    // surfaces connect to.
+    {
+        let jag_base = sig_base + 1 + ct.mu_i;
+        let mut expect_vals: Vec<F128> = ct.jag.rs.iter().map(|c| c.value).collect();
+        for (combo, dense) in &ct.jag.groups {
+            if let Some(c) = combo {
+                expect_vals.push(c.value);
+            }
+            for (_, c) in dense {
+                expect_vals.push(c.value);
+            }
+        }
+        for (j, want) in expect_vals.iter().enumerate() {
+            assert_eq!(
+                public[jag_base + j],
+                *want,
+                "jagged claim value {j} matches the deferred export"
+            );
+        }
+        assert_eq!(
+            jag_base + expect_vals.len(),
+            r.pub_base + r.n_query_pub + r.n_tail,
+            "the jagged publics close the region's tail"
         );
     }
     r.n_query_pub + r.n_tail
