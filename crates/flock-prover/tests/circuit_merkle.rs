@@ -12384,6 +12384,20 @@ struct FlNode {
 /// and discharges both groups. Every pin stays inside the builder (the
 /// mvp9 precedent: the builder IS the test). Envelope snapping is the
 /// scale step's job — this is the m22 dev shape.
+/// The chain layout's jagged params — the count win's per-digest table
+/// owner for the lane, rebuilt exactly as the opening verifier reads it.
+fn chain_jagged_params(cp: &ChainProof) -> flock_core::pcs::jagged::JaggedParams {
+    let u = UnionInstance::new(
+        &cp.inner.built.shape.registry,
+        cp.inner.built.shape.counts.clone(),
+    );
+    flock_core::pcs::jagged::JaggedParams::from_heights(
+        &u.jagged_heights(),
+        u.n_log(),
+        cp.inner.commitment.params.m - flock_core::pcs::LOG_PACKING,
+    )
+}
+
 fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
     use flock_core::aggregate;
     use flock_core::matrix_fold::{FoldProof, MatrixClaim};
@@ -12421,6 +12435,20 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         flock_core::element_r1cs::union::ElementAssertion,
     ); 0] = [];
     let circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
+    // THE JAGGED GROUP (the count win): the chain children's W-claims fold
+    // under the chain digest — the layout is a shape constant of the ONE
+    // chain circuit, rebuilt here exactly as the opening verifier reads it.
+    let chain_digest = cp0.inner.built.shape.circuit.digest();
+    let chain_union_j = UnionInstance::new(registry, cp0.inner.built.shape.counts.clone());
+    let chain_params_j = flock_core::pcs::jagged::JaggedParams::from_heights(
+        &chain_union_j.jagged_heights(),
+        chain_union_j.n_log(),
+        cp0.inner.commitment.params.m - flock_core::pcs::LOG_PACKING,
+    );
+    let jags = [&cp0.inner.work.jagged, &cp1.inner.work.jagged];
+    let jagged_p: Vec<aggregate::JaggedKeyProve<'_>> =
+        vec![(chain_digest, &chain_params_j, jags.to_vec())];
+    let jagged_v: Vec<aggregate::JaggedKeyVerify<'_>> = vec![(chain_digest, jags.to_vec())];
     let mut chp = FsChallenger::with_chained_blake3(FL_DOMAIN);
     let (agg, acc_p) = aggregate::prove_aggregate_classes(
         registry,
@@ -12430,7 +12458,7 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         &el_mats,
         &el_asserts,
         Some((&cp0.inner.built.shape.circuit, &sigmas)),
-        &[],
+        &jagged_p,
         &[],
         &mut chp,
     )
@@ -12441,7 +12469,7 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         &bool_asserts,
         &el_asserts,
         Some((&cp0.inner.built.shape.circuit, &sigmas)),
-        &[],
+        &jagged_v,
         &[],
         &agg,
         &mut rec,
@@ -12453,6 +12481,11 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
     assert!(
         acc_v.discharge_sigma(&cp0.inner.built.shape.circuit),
         "the sigma group discharges against the ONE chain circuit"
+    );
+    assert_eq!(acc_v.jagged.len(), 1, "one jagged key: the chain layout");
+    assert!(
+        acc_v.discharge_jagged(&[(chain_digest, &chain_params_j)]),
+        "the folded jagged entry discharges against the chain layout"
     );
 
     // The three folds' claim lists — no priors, so [fresh, fresh] each.
@@ -12483,10 +12516,29 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         Op::ObserveBytes(1),
     ];
     want.extend(fold_region_ops(&fold_claims));
+    // The jagged group rides the SAME tape after the uniform folds.
+    let jagged_keys: Vec<([u8; 32], Vec<flock_core::matrix_fold::JaggedClaim>)> = vec![(
+        chain_digest,
+        jags.iter()
+            .flat_map(|a| a.claims().into_iter().cloned())
+            .collect(),
+    )];
+    want.extend(jagged_fold_region_ops(&jagged_keys));
     assert_eq!(ops, want.as_slice(), "the first-level fold tape shape");
     assert_eq!(rec.payloads()[0], registry.digest(), "bind: registry digest");
     assert_eq!(rec.payloads()[1], vec![0u8], "bind: prior count 0");
-    let locs = locate_and_pin_folds(&fold_claims, &fold_proofs, vals_rec, chals);
+    let (locs, vcur, ccur) = locate_and_pin_folds(&fold_claims, &fold_proofs, vals_rec, chals);
+    let jfps: Vec<&flock_core::matrix_fold::FoldProof> = agg.jagged_folds.iter().collect();
+    let jlocs = locate_and_pin_jagged_folds(
+        &jagged_keys,
+        &jfps,
+        vals_rec,
+        chals,
+        rec.payloads(),
+        2,
+        vcur,
+        ccur,
+    );
     let outs = replay_fold_endpoints(&locs, vals_rec, chals);
     assert_eq!(outs[0], acc_v.per_type[0].0, "boolean A accumulator");
     assert_eq!(outs[1], acc_v.per_type[0].1, "boolean B accumulator");
@@ -12497,6 +12549,8 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         cp0.inner.built.shape.circuit.digest(),
         "sigma keys by the chain circuit digest"
     );
+    let jouts = replay_jagged_fold_endpoints(&jlocs, vals_rec, chals);
+    assert_eq!(jouts[0], acc_v.jagged[0].1, "the jagged entry from located words");
 
     // ---- the child tapes ----
     let t0 = ChildTape::new(&cp0.inner, DOMAIN);
@@ -12630,7 +12684,40 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
             &mut vals,
             zw,
             ow,
+            false, // the jagged group follows on the same tape
         );
+        let jfold_pubs = emit_jagged_fold_region(
+            &mut sb,
+            macs,
+            mrs,
+            pfslot,
+            pf_w,
+            &jlocs,
+            &trace.squeezes,
+            &chain_outs,
+            &ww,
+            &vmap,
+            vals_rec,
+            &mut vals,
+            zw,
+            ow,
+        );
+        // THE VALUE CONNECTS (the count win's load-bearing bind): each
+        // absorbed jagged claim VALUE is the SAME wire the child region
+        // published — the one its anchor expect consumed. Claim order in
+        // the fold (per child: rs, then per group combo + dense) is
+        // exactly the region's jag_w emission order.
+        {
+            let regions0 = [&r0, &r1];
+            let mut ci = 0usize;
+            for rk in regions0 {
+                for &jw in &rk.jag_w {
+                    sb.connect(wv(jlocs[0].claims[ci].val_v), jw);
+                    ci += 1;
+                }
+            }
+            assert_eq!(ci, jlocs[0].claims.len(), "every jagged claim connected");
+        }
 
         // ---- the connects: fold surfaces == child-region wires ----
         use flock_core::field::PHI_8_TABLE;
@@ -12767,7 +12854,7 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         // child exposes its own lane's claims. Off-envelope it publishes
         // inline, as before.
         let mut acc_chain_w: Vec<Wire> = Vec::new();
-        for fp in &fold_pubs {
+        for fp in fold_pubs.iter().chain(&jfold_pubs) {
             acc_chain_w.extend_from_slice(&fp.rho_col);
             acc_chain_w.extend_from_slice(&fp.rho_row);
             acc_chain_w.push(fp.value);
@@ -12873,6 +12960,10 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         for (r, o) in rebuilt.iter().zip(&outs) {
             assert_eq!(r, o, "published fold output == located native output");
         }
+        let jag_pub_at = fold_pub_base
+            + locs.iter().map(|l| 1 + l.k_col + l.k_row).sum::<usize>();
+        let jrebuilt = check_jagged_fold_publics(&built2.public, jag_pub_at, &jlocs);
+        assert_eq!(jrebuilt[0], jouts[0], "published jagged entry == located native");
         let acc_pub = aggregate::Accumulator {
             registry_digest: registry.digest(),
             per_type: vec![(rebuilt[0].clone(), rebuilt[1].clone())],
@@ -12881,7 +12972,7 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
                 cp0.inner.built.shape.circuit.digest(),
                 rebuilt[2].clone(),
             )),
-            jagged: Vec::new(),
+            jagged: vec![(chain_digest, jrebuilt[0].clone())],
         };
         assert_eq!(
             acc_pub, acc_v,
@@ -12889,8 +12980,9 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         );
         assert!(
             acc_pub.discharge(&mats)
-                && acc_pub.discharge_sigma(&cp0.inner.built.shape.circuit),
-            "the public-segment accumulator discharges both groups"
+                && acc_pub.discharge_sigma(&cp0.inner.built.shape.circuit)
+                && acc_pub.discharge_jagged(&[(chain_digest, &chain_params_j)]),
+            "the public-segment accumulator discharges all three groups"
         );
         for (i, &v) in PHI_8_TABLE[..1 << K_SKIP].iter().enumerate() {
             assert_eq!(built2.public[lam_base + i], v, "λ const {i}");
@@ -17103,12 +17195,16 @@ fn fold_region_ops(
 /// Locate every fold's surfaces on the value/challenge streams (counters
 /// start at 0 — the bind prefix carries only byte payloads) and pin them
 /// field-for-field against the gathered claims and the `FoldProof`s.
+/// Returns the counters alongside, so JAGGED groups on the same tape can
+/// continue the walk ([`locate_and_pin_jagged_folds`]); callers with no
+/// jagged groups assert exhaustion themselves via
+/// [`assert_fold_tape_exhausted`].
 fn locate_and_pin_folds(
     fold_claims: &[Vec<flock_core::matrix_fold::MatrixClaim>],
     fold_proofs: &[&flock_core::matrix_fold::FoldProof],
     vals_rec: &[F128],
     chals: &[F128],
-) -> Vec<FoldLoc> {
+) -> (Vec<FoldLoc>, usize, usize) {
     let (mut vcur, mut ccur) = (0usize, 0usize);
     let locs: Vec<FoldLoc> = fold_claims
         .iter()
@@ -17167,8 +17263,6 @@ fn locate_and_pin_folds(
             }
         })
         .collect();
-    assert_eq!(vals_rec.len(), vcur, "every stream value is accounted for");
-    assert_eq!(chals.len(), ccur, "every squeeze is accounted for");
     for ((loc, cs), fp) in locs.iter().zip(fold_claims).zip(fold_proofs) {
         for (cl, c) in loc.claims.iter().zip(cs) {
             assert_eq!(
@@ -17208,7 +17302,14 @@ fn locate_and_pin_folds(
         }
         assert_eq!(vals_rec[loc.out_v], fp.value, "output value on the stream");
     }
-    locs
+    (locs, vcur, ccur)
+}
+
+/// The no-jagged caller's closing assert: the uniform folds consumed the
+/// whole tape.
+fn assert_fold_tape_exhausted(vals_rec: &[F128], chals: &[F128], vcur: usize, ccur: usize) {
+    assert_eq!(vals_rec.len(), vcur, "every stream value is accounted for");
+    assert_eq!(chals.len(), ccur, "every squeeze is accounted for");
 }
 
 /// Replay every fold's two endpoint identities from LOCATED words alone —
@@ -17314,6 +17415,7 @@ fn emit_fold_region(
     vals: &mut Vec<F128>,
     zw: Wire,
     ow: Wire,
+    tail_input_last: bool,
 ) -> (Vec<FoldPub>, Vec<AlphaRec>) {
     let wv = |vi: usize| -> Wire { ww[vmap[vi].expect("stream word")].expect("wired") };
     let chw = |fin: usize| -> Wire { outs[sq[fin][0]][0] };
@@ -17451,8 +17553,12 @@ fn emit_fold_region(
         }
         // The LAST fold's output value sits in the transcript tail past
         // the final squeeze — no chain wire (step 1's shape fact); it
-        // enters as its own input, bound by the row endpoint delta.
-        let value = if fi + 1 == locs.len() {
+        // enters as its own input, bound by the row endpoint delta. When
+        // JAGGED groups follow on the same tape (`tail_input_last =
+        // false`), their absorbs flush this word and it has a chain wire
+        // like any other — the tail treatment moves to the last jagged
+        // group.
+        let value = if tail_input_last && fi + 1 == locs.len() {
             vals.push(vals_rec[loc.out_v]);
             sb.input()
         } else {
@@ -17519,6 +17625,463 @@ fn check_fold_publics(
         );
     }
     rebuilt
+}
+
+// ---------------------------------------------------------------------------
+// The JAGGED fold groups on the merge tape (the count win) — the five
+// helpers' siblings for the layout-table folds, which ride the SAME
+// aggregate challenger AFTER the uniform folds (option a, Ron's call).
+// mvp11_jagged_fold_tape is the standalone template these extract.
+// ---------------------------------------------------------------------------
+
+/// One absorbed JAGGED claim's stream ordinals: the tagged row weight and
+/// the col point + value. `terms` empty ⇔ an Eq row (the tag pins which).
+struct JClaimLoc {
+    /// Eq rows: (point ordinal, len). Combo rows: unused (0, 0).
+    row_pt: (usize, usize),
+    /// Combo rows: (coeff ordinal, address) per term — the address WORD
+    /// sits at coeff ordinal + 1, pinned to its REGISTRY constant.
+    terms: Vec<(usize, u32)>,
+    col_v: usize,
+    val_v: usize,
+}
+
+/// One jagged fold group's located surfaces — [`FoldLoc`]'s sibling.
+struct JaggedFoldLoc {
+    claims: Vec<JClaimLoc>,
+    lam_ch0: usize,
+    col_v: usize,
+    col_ch0: usize,
+    n_col: usize,
+    bridge_v: usize,
+    mu_ch0: usize,
+    row_v: usize,
+    row_ch0: usize,
+    k_row: usize,
+    out_v: usize,
+}
+
+/// The jagged groups' op tape: per key, the group label + digest payload,
+/// then the jagged fold's ops — the label, the shape header, the tagged
+/// variable-width claim blocks, and the two sumchecks. Width-driven.
+fn jagged_fold_region_ops(
+    keys: &[([u8; 32], Vec<flock_core::matrix_fold::JaggedClaim>)],
+) -> Vec<flock_core::transcript_record::TranscriptOp> {
+    use flock_core::matrix_fold::JaggedRowWeight;
+    use flock_core::transcript_record::TranscriptOp as Op;
+    let mut want: Vec<Op> = Vec::new();
+    for (_, cs) in keys {
+        let n_col = cs[0].col.len();
+        let k_row = cs
+            .iter()
+            .find_map(|c| match &c.row {
+                JaggedRowWeight::Eq(p) => Some(p.len()),
+                JaggedRowWeight::Combo(_) => None,
+            })
+            .expect("every jagged key carries at least one Eq claim");
+        want.push(Op::Label(b"flock-aggregate-jagged-v0".to_vec()));
+        want.push(Op::ObserveBytes(32));
+        want.push(Op::Label(b"flock-jagged-fold-v0".to_vec()));
+        want.push(Op::ObserveScalar); // the (k_row, n_claims) shape header
+        for c in cs {
+            match &c.row {
+                JaggedRowWeight::Eq(p) => {
+                    want.push(Op::ObserveScalar);
+                    want.push(Op::ObserveSlice(p.len()));
+                }
+                JaggedRowWeight::Combo(t) => {
+                    want.push(Op::ObserveScalar);
+                    for _ in t {
+                        want.extend([Op::ObserveScalar, Op::ObserveScalar]);
+                    }
+                }
+            }
+            want.push(Op::ObserveSlice(n_col));
+            want.push(Op::ObserveScalar);
+        }
+        want.extend(std::iter::repeat_n(Op::SqueezeScalar, cs.len()));
+        for _ in 0..n_col {
+            want.extend([Op::ObserveScalar, Op::ObserveScalar, Op::SqueezeScalar]);
+        }
+        want.extend(std::iter::repeat_n(Op::ObserveScalar, cs.len()));
+        want.extend(std::iter::repeat_n(Op::SqueezeScalar, cs.len()));
+        for _ in 0..k_row {
+            want.extend([Op::ObserveScalar, Op::ObserveScalar, Op::SqueezeScalar]);
+        }
+        want.push(Op::ObserveScalar);
+    }
+    want
+}
+
+/// Locate + pin the jagged groups AFTER the uniform folds — the value and
+/// challenge counters CONTINUE from the callers' (which is why
+/// [`locate_and_pin_folds`] hands its counters back), and the digest
+/// payloads continue after bind's two. Everything pins field-for-field:
+/// the shape header, every tagged weight (Combo ADDRESS words against
+/// their registry constants), col points, values, rounds, bridge, output.
+#[allow(clippy::too_many_arguments)]
+fn locate_and_pin_jagged_folds(
+    keys: &[([u8; 32], Vec<flock_core::matrix_fold::JaggedClaim>)],
+    fps: &[&flock_core::matrix_fold::FoldProof],
+    vals_rec: &[F128],
+    chals: &[F128],
+    payloads: &[Vec<u8>],
+    mut pcur: usize,
+    mut vcur: usize,
+    mut ccur: usize,
+) -> Vec<JaggedFoldLoc> {
+    use flock_core::matrix_fold::JaggedRowWeight;
+    assert_eq!(keys.len(), fps.len(), "one fold per jagged key");
+    let locs: Vec<JaggedFoldLoc> = keys
+        .iter()
+        .zip(fps)
+        .map(|((digest, cs), fp)| {
+            assert_eq!(payloads[pcur], digest.to_vec(), "the group's digest payload");
+            pcur += 1;
+            let n_col = cs[0].col.len();
+            let k_row = cs
+                .iter()
+                .find_map(|c| match &c.row {
+                    JaggedRowWeight::Eq(p) => Some(p.len()),
+                    JaggedRowWeight::Combo(_) => None,
+                })
+                .expect("every jagged key carries at least one Eq claim");
+            assert_eq!(
+                vals_rec[vcur],
+                F128::new(k_row as u64, cs.len() as u64),
+                "the group's shape header word"
+            );
+            vcur += 1;
+            let claims: Vec<JClaimLoc> = cs
+                .iter()
+                .map(|c| {
+                    let tag_v = vcur;
+                    let (row_pt, terms) = match &c.row {
+                        JaggedRowWeight::Eq(p) => {
+                            assert_eq!(
+                                vals_rec[tag_v],
+                                F128::new(0, p.len() as u64),
+                                "eq row tag"
+                            );
+                            assert_eq!(
+                                &vals_rec[tag_v + 1..tag_v + 1 + p.len()],
+                                &p[..],
+                                "eq row point on the stream"
+                            );
+                            vcur = tag_v + 1 + p.len();
+                            ((tag_v + 1, p.len()), Vec::new())
+                        }
+                        JaggedRowWeight::Combo(t) => {
+                            assert_eq!(
+                                vals_rec[tag_v],
+                                F128::new(1, t.len() as u64),
+                                "combo row tag"
+                            );
+                            let mut terms = Vec::with_capacity(t.len());
+                            for (j, &(coeff, addr)) in t.iter().enumerate() {
+                                let cv = tag_v + 1 + 2 * j;
+                                assert_eq!(vals_rec[cv], coeff, "combo coeff on the stream");
+                                assert_eq!(
+                                    vals_rec[cv + 1],
+                                    F128::new(addr as u64, 0),
+                                    "combo ADDRESS word == the registry constant"
+                                );
+                                terms.push((cv, addr));
+                            }
+                            vcur = tag_v + 1 + 2 * t.len();
+                            ((0, 0), terms)
+                        }
+                    };
+                    let col_v = vcur;
+                    assert_eq!(
+                        &vals_rec[col_v..col_v + n_col],
+                        &c.col[..],
+                        "col point (σ) on the stream"
+                    );
+                    let val_v = col_v + n_col;
+                    assert_eq!(vals_rec[val_v], c.value, "claim value on the stream");
+                    vcur = val_v + 1;
+                    JClaimLoc {
+                        row_pt,
+                        terms,
+                        col_v,
+                        val_v,
+                    }
+                })
+                .collect();
+            let lam_ch0 = ccur;
+            ccur += cs.len();
+            let col_v = vcur;
+            let col_ch0 = ccur;
+            vcur += 2 * n_col;
+            ccur += n_col;
+            let bridge_v = vcur;
+            vcur += cs.len();
+            let mu_ch0 = ccur;
+            ccur += cs.len();
+            let row_v = vcur;
+            let row_ch0 = ccur;
+            vcur += 2 * k_row;
+            ccur += k_row;
+            let out_v = vcur;
+            vcur += 1;
+            for (j, &(q1, qinf)) in fp.col_rounds.iter().enumerate() {
+                assert_eq!(vals_rec[col_v + 2 * j], q1, "jagged col round q(1)");
+                assert_eq!(vals_rec[col_v + 2 * j + 1], qinf, "jagged col round q(inf)");
+            }
+            assert_eq!(
+                &vals_rec[bridge_v..bridge_v + cs.len()],
+                &fp.bridge[..],
+                "the jagged bridge on the stream"
+            );
+            for (j, &(q1, qinf)) in fp.row_rounds.iter().enumerate() {
+                assert_eq!(vals_rec[row_v + 2 * j], q1, "jagged row round q(1)");
+                assert_eq!(vals_rec[row_v + 2 * j + 1], qinf, "jagged row round q(inf)");
+            }
+            assert_eq!(vals_rec[out_v], fp.value, "jagged output value on the stream");
+            JaggedFoldLoc {
+                claims,
+                lam_ch0,
+                col_v,
+                col_ch0,
+                n_col,
+                bridge_v,
+                mu_ch0,
+                row_v,
+                row_ch0,
+                k_row,
+                out_v,
+            }
+        })
+        .collect();
+    assert_eq!(vals_rec.len(), vcur, "every stream value is accounted for");
+    assert_eq!(chals.len(), ccur, "every squeeze is accounted for");
+    assert_eq!(payloads.len(), pcur, "every payload is accounted for");
+    locs
+}
+
+/// Replay the jagged folds' endpoint identities from LOCATED words alone
+/// and return the located entries — [`replay_fold_endpoints`]'s sibling.
+fn replay_jagged_fold_endpoints(
+    locs: &[JaggedFoldLoc],
+    vals_rec: &[F128],
+    chals: &[F128],
+) -> Vec<flock_core::matrix_fold::MatrixClaim> {
+    use flock_core::matrix_fold::{MatrixClaim, Weight};
+    let replay_rounds = |target: F128, base: usize, ch0: usize, n: usize| -> (F128, Vec<F128>) {
+        let mut run = target;
+        let mut rho = Vec::with_capacity(n);
+        for j in 0..n {
+            let (g1, gi) = (vals_rec[base + 2 * j], vals_rec[base + 2 * j + 1]);
+            let r = chals[ch0 + j];
+            let q0 = run + g1;
+            run = gi * r * r + (q0 + g1 + gi) * r + q0;
+            rho.push(r);
+        }
+        (run, rho)
+    };
+    let bit = |b: bool| if b { F128::ONE } else { F128::ZERO };
+    locs.iter()
+        .map(|loc| {
+            let k = loc.claims.len();
+            let lam: Vec<F128> = (0..k).map(|i| chals[loc.lam_ch0 + i]).collect();
+            let target_c = loc
+                .claims
+                .iter()
+                .zip(&lam)
+                .fold(F128::ZERO, |acc, (cl, &l)| acc + l * vals_rec[cl.val_v]);
+            let (run_c, rho_col) = replay_rounds(target_c, loc.col_v, loc.col_ch0, loc.n_col);
+            let expect_c = loc
+                .claims
+                .iter()
+                .zip(&lam)
+                .enumerate()
+                .fold(F128::ZERO, |acc, (i, (cl, &l))| {
+                    let w = (0..loc.n_col).fold(F128::ONE, |w, j| {
+                        w * (F128::ONE + vals_rec[cl.col_v + j] + rho_col[j])
+                    });
+                    acc + l * w * vals_rec[loc.bridge_v + i]
+                });
+            assert_eq!(run_c, expect_c, "jagged col endpoint closes from located words");
+
+            let mus: Vec<F128> = (0..k).map(|i| chals[loc.mu_ch0 + i]).collect();
+            let target_r = (0..k)
+                .zip(&mus)
+                .fold(F128::ZERO, |acc, (i, &m)| acc + m * vals_rec[loc.bridge_v + i]);
+            let (run_r, rho_row) = replay_rounds(target_r, loc.row_v, loc.row_ch0, loc.k_row);
+            let w_mu = loc.claims.iter().zip(&mus).fold(F128::ZERO, |acc, (cl, &m)| {
+                let rw = if cl.terms.is_empty() {
+                    (0..cl.row_pt.1).fold(F128::ONE, |w, j| {
+                        w * (F128::ONE + vals_rec[cl.row_pt.0 + j] + rho_row[j])
+                    })
+                } else {
+                    cl.terms.iter().fold(F128::ZERO, |a, &(cv, addr)| {
+                        let e = rho_row.iter().enumerate().fold(F128::ONE, |e, (l, &r)| {
+                            e * (F128::ONE + bit((addr >> l) & 1 == 1) + r)
+                        });
+                        a + vals_rec[cv] * e
+                    })
+                };
+                acc + m * rw
+            });
+            assert_eq!(
+                run_r,
+                w_mu * vals_rec[loc.out_v],
+                "jagged row endpoint closes from located words"
+            );
+            MatrixClaim {
+                row: Weight::eq(rho_row),
+                col: Weight::eq(rho_col),
+                value: vals_rec[loc.out_v],
+            }
+        })
+        .collect()
+}
+
+/// Emit the jagged fold groups in-circuit — [`emit_fold_region`]'s sibling
+/// (mvp11_jagged_fold_tape's replay, extracted): MergedRoundGate rounds,
+/// PrefixGate eq products for the weight evals (a Combo row's ADDRESS bits
+/// bake as ow/zw — registry constants, count-independent — with its
+/// coefficients as absorbed stream wires), both endpoints as COPY
+/// CONSTRAINTS, the entries returned for publishing. The LAST group's
+/// output value takes the tail-input treatment ([`emit_fold_region`] must
+/// then run with `tail_input_last = false`).
+#[allow(clippy::too_many_arguments)]
+fn emit_jagged_fold_region(
+    sb: &mut ShapeBuilder,
+    macs: flock_core::circuit::builder::SlotId,
+    mrs: flock_core::circuit::builder::SlotId,
+    pfslot: flock_core::circuit::builder::SlotId,
+    pf_w: usize,
+    locs: &[JaggedFoldLoc],
+    sq: &[Vec<usize>],
+    outs: &[Vec<Wire>],
+    ww: &[Option<Wire>],
+    vmap: &[Option<usize>],
+    vals_rec: &[F128],
+    vals: &mut Vec<F128>,
+    zw: Wire,
+    ow: Wire,
+) -> Vec<FoldPub> {
+    let wv = |vi: usize| -> Wire { ww[vmap[vi].expect("stream word")].expect("wired") };
+    let chw = |fin: usize| -> Wire { outs[sq[fin][0]][0] };
+    let prefix = |sb: &mut ShapeBuilder, seed: Wire, fs: &[(Wire, Wire)]| -> Wire {
+        let mut s = seed;
+        for chunk in fs.chunks(pf_w) {
+            let mut g_in = vec![s];
+            for (a, _) in chunk {
+                g_in.push(*a);
+            }
+            g_in.extend(std::iter::repeat_n(zw, pf_w - chunk.len()));
+            for (_, b) in chunk {
+                g_in.push(*b);
+            }
+            g_in.extend(std::iter::repeat_n(zw, pf_w - chunk.len()));
+            g_in.push(ow);
+            s = sb.gate(pfslot, &g_in)[0];
+        }
+        s
+    };
+    let mut fold_pubs: Vec<FoldPub> = Vec::new();
+    for (fi, loc) in locs.iter().enumerate() {
+        let k = loc.claims.len();
+        let lam_w: Vec<Wire> = (0..k).map(|i| chw(loc.lam_ch0 + i)).collect();
+        let mut run_w = zw;
+        for (i, cl) in loc.claims.iter().enumerate() {
+            run_w = sb.gate(macs, &[run_w, lam_w[i], wv(cl.val_v)])[0];
+        }
+        let mut rho_col_w: Vec<Wire> = Vec::with_capacity(loc.n_col);
+        for j in 0..loc.n_col {
+            let r_w = chw(loc.col_ch0 + j);
+            rho_col_w.push(r_w);
+            run_w =
+                sb.gate(mrs, &[run_w, wv(loc.col_v + 2 * j), wv(loc.col_v + 2 * j + 1), r_w])[0];
+        }
+        let mut exp_w = zw;
+        for (i, cl) in loc.claims.iter().enumerate() {
+            let fs: Vec<(Wire, Wire)> = (0..loc.n_col)
+                .map(|j| (wv(cl.col_v + j), rho_col_w[j]))
+                .collect();
+            let cw = prefix(sb, ow, &fs);
+            let t = sb.gate(macs, &[zw, cw, wv(loc.bridge_v + i)])[0];
+            exp_w = sb.gate(macs, &[exp_w, lam_w[i], t])[0];
+        }
+        sb.connect(run_w, exp_w);
+
+        let mu_w: Vec<Wire> = (0..k).map(|i| chw(loc.mu_ch0 + i)).collect();
+        let mut run2_w = zw;
+        for i in 0..k {
+            run2_w = sb.gate(macs, &[run2_w, mu_w[i], wv(loc.bridge_v + i)])[0];
+        }
+        let mut rho_row_w: Vec<Wire> = Vec::with_capacity(loc.k_row);
+        for j in 0..loc.k_row {
+            let r_w = chw(loc.row_ch0 + j);
+            rho_row_w.push(r_w);
+            run2_w =
+                sb.gate(mrs, &[run2_w, wv(loc.row_v + 2 * j), wv(loc.row_v + 2 * j + 1), r_w])[0];
+        }
+        let mut wmu_w = zw;
+        for (i, cl) in loc.claims.iter().enumerate() {
+            let rw = if cl.terms.is_empty() {
+                let fs: Vec<(Wire, Wire)> = (0..cl.row_pt.1)
+                    .map(|j| (wv(cl.row_pt.0 + j), rho_row_w[j]))
+                    .collect();
+                prefix(sb, ow, &fs)
+            } else {
+                let mut acc = zw;
+                for &(cv, addr) in &cl.terms {
+                    let fs: Vec<(Wire, Wire)> = rho_row_w
+                        .iter()
+                        .enumerate()
+                        .map(|(l, &r)| (r, if (addr >> l) & 1 == 1 { ow } else { zw }))
+                        .collect();
+                    let e = prefix(sb, ow, &fs);
+                    acc = sb.gate(macs, &[acc, wv(cv), e])[0];
+                }
+                acc
+            };
+            wmu_w = sb.gate(macs, &[wmu_w, mu_w[i], rw])[0];
+        }
+        let value = if fi + 1 == locs.len() {
+            vals.push(vals_rec[loc.out_v]);
+            sb.input()
+        } else {
+            wv(loc.out_v)
+        };
+        let rhs_w = sb.gate(macs, &[zw, wmu_w, value])[0];
+        sb.connect(run2_w, rhs_w);
+        fold_pubs.push(FoldPub {
+            rho_col: rho_col_w,
+            rho_row: rho_row_w,
+            value,
+        });
+    }
+    fold_pubs
+}
+
+/// Walk the published jagged entries from `at` — [`check_fold_publics`]'s
+/// sibling (no boundary publics: jagged lows are trivially 1). Returns the
+/// rebuilt entries for the caller's accumulator reassembly.
+fn check_jagged_fold_publics(
+    public: &[F128],
+    at: usize,
+    locs: &[JaggedFoldLoc],
+) -> Vec<flock_core::matrix_fold::MatrixClaim> {
+    use flock_core::matrix_fold::{MatrixClaim, Weight};
+    let mut p = at;
+    locs.iter()
+        .map(|loc| {
+            let rho_col = public[p..p + loc.n_col].to_vec();
+            let rho_row = public[p + loc.n_col..p + loc.n_col + loc.k_row].to_vec();
+            let value = public[p + loc.n_col + loc.k_row];
+            p += 1 + loc.n_col + loc.k_row;
+            MatrixClaim {
+                row: Weight::eq(rho_row),
+                col: Weight::eq(rho_col),
+                value,
+            }
+        })
+        .collect()
 }
 
 /// **MVP-11 step 2: the FULL fold region of a merge node, tape-pinned.**
@@ -17797,7 +18360,8 @@ fn mvp11_merge_fold_region() {
     );
 
     // ---- locate every fold's surfaces, and pin them field-for-field ----
-    let locs = locate_and_pin_folds(&fold_claims, &fold_proofs, vals_rec, chals);
+    let (locs, vcur, ccur) = locate_and_pin_folds(&fold_claims, &fold_proofs, vals_rec, chals);
+    assert_fold_tape_exhausted(vals_rec, chals, vcur, ccur);
 
     // ---- every fold's endpoints, replayed from LOCATED words alone ----
     // Weights are REBUILT from located stream words and evaluated through
@@ -17931,6 +18495,7 @@ fn mvp11_merge_fold_region() {
             &mut vals,
             zw,
             ow,
+            true,
         );
         // ---- STEP 3's CONNECTS: the fold's absorbed claim surfaces ARE
         // the child regions' assertion-emission wires ----
@@ -18590,7 +19155,8 @@ fn mvp11_swap_children_fold_scale() {
     assert_eq!(ops, want.as_slice(), "the scale tape is the expected shape");
     assert_eq!(rec.payloads()[0], registry.digest(), "bind: registry digest");
     assert_eq!(rec.payloads()[1], vec![0u8], "bind: prior count 0");
-    let locs = locate_and_pin_folds(&fold_claims, &fold_proofs, vals_rec, chals);
+    let (locs, vcur, ccur) = locate_and_pin_folds(&fold_claims, &fold_proofs, vals_rec, chals);
+    assert_fold_tape_exhausted(vals_rec, chals, vcur, ccur);
     let outs = replay_fold_endpoints(&locs, vals_rec, chals);
     // The located outputs ARE the verifier's accumulator, group for group.
     for t in 0..n_bool {
@@ -18694,6 +19260,7 @@ fn mvp11_swap_children_fold_scale() {
             &mut vals,
             zw,
             ow,
+            true,
         );
         let fold_pub_base = sb.public_len();
         for fp in &fold_pubs {
@@ -18919,6 +19486,9 @@ struct ChainLane<'a> {
     circs: &'a [&'a dyn flock_core::lincheck::LincheckCircuit],
     /// The lane's sigma table owner (the chain circuit).
     circuit: &'a flock_core::circuit::Circuit,
+    /// The lane's jagged table owner (the chain LAYOUT — the count win's
+    /// per-digest key, inherited priors-only through internal nodes).
+    params: &'a flock_core::pcs::jagged::JaggedParams,
     priors: &'a [&'a flock_core::aggregate::Accumulator],
     /// The published `[rho_col | rho_row | value]` fold blocks' base in
     /// EACH child's public segment (every child shares the layout).
@@ -19018,6 +19588,20 @@ fn build_node_outer_app(
         .map(|(rt, u)| (u, rt.el_assert.clone()))
         .collect();
     let sigmas: Vec<_> = rts.iter().map(|rt| rt.sigma_native.clone()).collect();
+    // THE JAGGED GROUP (the count win): every child's W-claims fold under
+    // the ONE child digest (asserted above) — the layout is a shape
+    // constant of the child circuit.
+    let child_digest = lo0.shape.circuit.digest();
+    let child_params_j = flock_core::pcs::jagged::JaggedParams::from_heights(
+        &unions[0].jagged_heights(),
+        unions[0].n_log(),
+        lo0.commitment.params.m - flock_core::pcs::LOG_PACKING,
+    );
+    let jags: Vec<&flock_core::matrix_fold::JaggedAssertion> =
+        rts.iter().map(|rt| &rt.jag).collect();
+    let jagged_p: Vec<aggregate::JaggedKeyProve<'_>> =
+        vec![(child_digest, &child_params_j, jags.clone())];
+    let jagged_v: Vec<aggregate::JaggedKeyVerify<'_>> = vec![(child_digest, jags.clone())];
     let mut chp = FsChallenger::with_chained_blake3(M11_NODE_DOMAIN);
     let (agg, acc_p) = aggregate::prove_aggregate_classes(
         registry,
@@ -19027,7 +19611,7 @@ fn build_node_outer_app(
         &el_mats,
         &el_asserts,
         Some((&lo0.shape.circuit, &sigmas)),
-        &[],
+        &jagged_p,
         &[],
         &mut chp,
     )
@@ -19039,7 +19623,7 @@ fn build_node_outer_app(
         &bool_asserts,
         &el_asserts,
         Some((&lo0.shape.circuit, &sigmas)),
-        &[],
+        &jagged_v,
         &[],
         &agg,
         &mut rec,
@@ -19054,6 +19638,11 @@ fn build_node_outer_app(
     assert!(
         acc_v.discharge_sigma(&lo0.shape.circuit),
         "the sigma group discharges"
+    );
+    assert_eq!(acc_v.jagged.len(), 1, "one jagged key: the child layout");
+    assert!(
+        acc_v.discharge_jagged(&[(child_digest, &child_params_j)]),
+        "the folded jagged entry discharges against the child layout"
     );
 
     // The fold groups in aggregate order, from the CHILDREN'S OWN
@@ -19100,10 +19689,29 @@ fn build_node_outer_app(
         Op::ObserveBytes(1),
     ];
     want.extend(fold_region_ops(&fold_claims));
+    // The jagged group rides the SAME tape after the uniform folds.
+    let jagged_keys: Vec<([u8; 32], Vec<flock_core::matrix_fold::JaggedClaim>)> = vec![(
+        child_digest,
+        jags.iter()
+            .flat_map(|a| a.claims().into_iter().cloned())
+            .collect(),
+    )];
+    want.extend(jagged_fold_region_ops(&jagged_keys));
     assert_eq!(ops, want.as_slice(), "the node tape is the expected shape");
     assert_eq!(rec.payloads()[0], registry.digest(), "bind: registry digest");
     assert_eq!(rec.payloads()[1], vec![0u8], "bind: prior count 0");
-    let locs = locate_and_pin_folds(&fold_claims, &fold_proofs, vals_rec, chals);
+    let (locs, vcur, ccur) = locate_and_pin_folds(&fold_claims, &fold_proofs, vals_rec, chals);
+    let jfps: Vec<&FoldProof> = agg.jagged_folds.iter().collect();
+    let jlocs = locate_and_pin_jagged_folds(
+        &jagged_keys,
+        &jfps,
+        vals_rec,
+        chals,
+        rec.payloads(),
+        2,
+        vcur,
+        ccur,
+    );
     let outs = replay_fold_endpoints(&locs, vals_rec, chals);
     for t in 0..n_bool {
         assert_eq!(outs[2 * t], acc_v.per_type[t].0, "boolean type {t} A");
@@ -19124,6 +19732,8 @@ fn build_node_outer_app(
     let (sig_digest, sig_claim) = acc_v.sigma.as_ref().expect("sigma accumulated");
     assert_eq!(outs[n_folds - 1], *sig_claim, "sigma accumulator");
     assert_eq!(*sig_digest, lo0.shape.circuit.digest(), "sigma key");
+    let jouts = replay_jagged_fold_endpoints(&jlocs, vals_rec, chals);
+    assert_eq!(jouts[0], acc_v.jagged[0].1, "the jagged entry from located words");
 
     // ---- the LANE (task 6): the children's LOWER-registry accumulators
     // fold PRIORS-ONLY — natively here, in-circuit below. 3 groups
@@ -19134,6 +19744,13 @@ fn build_node_outer_app(
             &UnionInstance<'_>,
             flock_core::element_r1cs::union::ElementAssertion,
         ); 0] = [];
+        // The jagged key rides PRIORS-ONLY through the lane, exactly like
+        // the lane's other groups: the FL children's chain-keyed entries
+        // fold with no fresh claims.
+        let ljagged_p: Vec<aggregate::JaggedKeyProve<'_>> =
+            vec![(ln.circuit.digest(), ln.params, Vec::new())];
+        let ljagged_v: Vec<aggregate::JaggedKeyVerify<'_>> =
+            vec![(ln.circuit.digest(), Vec::new())];
         let mut chp = FsChallenger::with_chained_blake3(LANE_DOMAIN);
         let (lagg, lacc_p) = aggregate::prove_aggregate_classes(
             ln.registry,
@@ -19143,7 +19760,7 @@ fn build_node_outer_app(
             &[],
             &el_asserts_l,
             Some((ln.circuit, &[])),
-            &[],
+            &ljagged_p,
             ln.priors,
             &mut chp,
         )
@@ -19155,13 +19772,18 @@ fn build_node_outer_app(
             &[],
             &el_asserts_l,
             Some((ln.circuit, &[])),
-            &[],
+            &ljagged_v,
             ln.priors,
             &lagg,
             &mut lrec,
         )
         .expect("the lane fold verifies");
         assert_eq!(lacc_p, lacc_v, "lane prover and verifier agree");
+        assert_eq!(lacc_v.jagged.len(), 1, "the lane carries the chain jagged key");
+        assert!(
+            lacc_v.discharge_jagged(&[(ln.circuit.digest(), ln.params)]),
+            "the lane's folded jagged entry discharges against the chain layout"
+        );
         let lclaims: Vec<Vec<MatrixClaim>> = vec![
             ln.priors.iter().map(|p| p.per_type[0].0.clone()).collect(),
             ln.priors.iter().map(|p| p.per_type[0].1.clone()).collect(),
@@ -19184,6 +19806,21 @@ fn build_node_outer_app(
             Op::ObserveBytes(1),
         ];
         want.extend(fold_region_ops(&lclaims));
+        // The inherited jagged claims (the priors' chain-keyed entries,
+        // plain eq by construction) ride the same tape after.
+        let ljagged_keys: Vec<([u8; 32], Vec<flock_core::matrix_fold::JaggedClaim>)> = vec![(
+            ln.circuit.digest(),
+            ln.priors
+                .iter()
+                .flat_map(|p| p.jagged.iter())
+                .filter(|(d, _)| *d == ln.circuit.digest())
+                .map(|(_, c)| {
+                    flock_core::matrix_fold::JaggedClaim::from_folded(c)
+                        .expect("prior jagged entries are plain eq")
+                })
+                .collect(),
+        )];
+        want.extend(jagged_fold_region_ops(&ljagged_keys));
         assert_eq!(lops, want, "the lane tape shape");
         assert_eq!(lrec.payloads()[0], ln.registry.digest(), "lane registry digest");
         assert_eq!(
@@ -19191,16 +19828,29 @@ fn build_node_outer_app(
             vec![ln.priors.len() as u8],
             "lane prior count"
         );
-        let llocs = locate_and_pin_folds(&lclaims, &lproofs, &lvals, &lchals);
+        let (llocs, lvcur, lccur) = locate_and_pin_folds(&lclaims, &lproofs, &lvals, &lchals);
+        let ljfps: Vec<&FoldProof> = lagg.jagged_folds.iter().collect();
+        let ljlocs = locate_and_pin_jagged_folds(
+            &ljagged_keys,
+            &ljfps,
+            &lvals,
+            &lchals,
+            lrec.payloads(),
+            2,
+            lvcur,
+            lccur,
+        );
         let louts = replay_fold_endpoints(&llocs, &lvals, &lchals);
         assert_eq!(louts[0], lacc_v.per_type[0].0, "lane boolean A");
         assert_eq!(louts[1], lacc_v.per_type[0].1, "lane boolean B");
         let (ld, lc2) = lacc_v.sigma.as_ref().expect("lane sigma out");
         assert_eq!(louts[2], *lc2, "lane sigma accumulator");
         assert_eq!(*ld, ln.circuit.digest(), "lane sigma keys by the chain circuit");
+        let ljouts = replay_jagged_fold_endpoints(&ljlocs, &lvals, &lchals);
+        assert_eq!(ljouts[0], lacc_v.jagged[0].1, "lane jagged entry from located words");
         let lstream = lrec.shape().stream_words_duplex(LANE_DOMAIN);
         let lbytes = lstream.to_bytes(lrec.values(), lrec.payloads());
-        (lacc_v, llocs, lstream, lbytes, lops, lchals, lvals)
+        (lacc_v, llocs, ljlocs, lstream, lbytes, lops, lchals, lvals)
     });
 
     // ---- ONE outer: two REAL child regions + the fold region ----
@@ -19353,7 +20003,39 @@ fn build_node_outer_app(
             &mut vals,
             zw,
             ow,
+            false, // the jagged group follows on the same tape
         );
+        let jfold_pubs = emit_jagged_fold_region(
+            &mut sb,
+            cs.macs,
+            cs.mrs,
+            pfslot,
+            pf_w,
+            &jlocs,
+            &trace.squeezes,
+            &chain_outs,
+            &ww,
+            &vmap,
+            vals_rec,
+            &mut vals,
+            zw,
+            ow,
+        );
+        // THE JAGGED VALUE CONNECTS (the count win's load-bearing bind):
+        // each absorbed claim value is the SAME wire the child region
+        // published — the one its anchor expect consumed. Claim order in
+        // the fold (per child: rs, then per group combo + dense) is
+        // exactly the region's jag_w emission order.
+        {
+            let mut ci = 0usize;
+            for rk in &regions {
+                for &jw in &rk.jag_w {
+                    sb.connect(wv(jlocs[0].claims[ci].val_v), jw);
+                    ci += 1;
+                }
+            }
+            assert_eq!(ci, jlocs[0].claims.len(), "every jagged claim connected");
+        }
         let mac_after_fold = sb.rows_in_slot(cs.macs);
 
         // ---- THE 2→1 CONNECTS: the fold's absorbed claim surfaces ARE
@@ -19547,7 +20229,7 @@ fn build_node_outer_app(
         // envelope it rides the reserved ACC_MAIN block at a constant
         // index; off-envelope it publishes inline, as before.
         let mut acc_main_w: Vec<Wire> = Vec::new();
-        for fp in &fold_pubs {
+        for fp in fold_pubs.iter().chain(&jfold_pubs) {
             acc_main_w.extend_from_slice(&fp.rho_col);
             acc_main_w.extend_from_slice(&fp.rho_row);
             acc_main_w.push(fp.value);
@@ -19603,7 +20285,7 @@ fn build_node_outer_app(
         // group), lows to the constant 1. Its own chain block rides the
         // shared b3 slot; the fold rows the shared mac/mrs/prefix slots.
         let lane_pub = lane_native.as_ref().map(|ln2| {
-            let (_, llocs, lstream, lbytes, lops, lchals, lvals) = ln2;
+            let (_, llocs, ljlocs, lstream, lbytes, lops, lchals, lvals) = ln2;
             let lane_ref = lane.as_ref().expect("lane native implies lane");
             let mut lchain = FsChainSponge::new();
             let mut at = 0usize;
@@ -19656,6 +20338,23 @@ fn build_node_outer_app(
                 &mut vals,
                 zw,
                 ow,
+                false, // the jagged group follows on the lane tape
+            );
+            let ljfold_pubs = emit_jagged_fold_region(
+                &mut sb,
+                cs.macs,
+                cs.mrs,
+                pfslot,
+                pf_w,
+                ljlocs,
+                &ltrace.squeezes,
+                &lchain_outs,
+                &lww,
+                &lvmap,
+                lvals,
+                &mut vals,
+                zw,
+                ow,
             );
             for (k, rk) in regions.iter().enumerate() {
                 let mut off = lane_ref.claims_base;
@@ -19675,13 +20374,32 @@ fn build_node_outer_app(
                     sb.connect(lwv(cl.col_low_v), ow);
                     off += loc.k_col + loc.k_row + 1;
                 }
+                // The inherited JAGGED prior: child k's published entry —
+                // the block right after the uniform groups in its
+                // ACC_CHAIN layout — connects to the lane's absorbed claim
+                // surfaces wire-to-wire, exactly like the groups above.
+                for loc in ljlocs {
+                    let cl = &loc.claims[k];
+                    assert!(cl.terms.is_empty(), "inherited jagged claims are plain eq");
+                    for j in 0..loc.n_col {
+                        sb.connect(lwv(cl.col_v + j), rk.child_pub_w[off + j]);
+                    }
+                    for j in 0..cl.row_pt.1 {
+                        sb.connect(lwv(cl.row_pt.0 + j), rk.child_pub_w[off + loc.n_col + j]);
+                    }
+                    sb.connect(
+                        lwv(cl.val_v),
+                        rk.child_pub_w[off + loc.n_col + loc.k_row],
+                    );
+                    off += loc.n_col + loc.k_row + 1;
+                }
             }
             // The lane's claims are the LOWER-registry surface a parent
             // inherits: under the envelope they ride the reserved
             // ACC_CHAIN block — the same constant index at which an FL
             // child exposes its own chain fold.
             let mut lane_w: Vec<Wire> = Vec::new();
-            for fp in &lfold_pubs {
+            for fp in lfold_pubs.iter().chain(&ljfold_pubs) {
                 lane_w.extend_from_slice(&fp.rho_col);
                 lane_w.extend_from_slice(&fp.rho_row);
                 lane_w.push(fp.value);
@@ -19934,7 +20652,12 @@ fn build_node_outer_app(
         }
         // The fold checker + the accumulator, reassembled from publics.
         let rebuilt = check_fold_publics(&built2.public, fold_pub_base, &locs, &alpha_recs);
-        let tail_len: usize = locs.iter().map(|l| 1 + l.k_col + l.k_row).sum();
+        let uniform_len: usize = locs.iter().map(|l| 1 + l.k_col + l.k_row).sum();
+        let jrebuilt =
+            check_jagged_fold_publics(&built2.public, fold_pub_base + uniform_len, &jlocs);
+        assert_eq!(jrebuilt[0], jouts[0], "published jagged entry == located native");
+        let tail_len: usize = uniform_len
+            + jlocs.iter().map(|l| 1 + l.n_col + l.k_row).sum::<usize>();
         let acc_pub = aggregate::Accumulator {
             registry_digest: registry.digest(),
             per_type: (0..n_bool)
@@ -19949,7 +20672,7 @@ fn build_node_outer_app(
                 })
                 .collect(),
             sigma: Some((lo0.shape.circuit.digest(), rebuilt[n_folds - 1].clone())),
-            jagged: Vec::new(),
+            jagged: vec![(child_digest, jrebuilt[0].clone())],
         };
         assert_eq!(
             acc_pub, acc_v,
@@ -19958,8 +20681,9 @@ fn build_node_outer_app(
         assert!(
             acc_pub.discharge(&mats)
                 && acc_pub.discharge_element(&el_mats)
-                && acc_pub.discharge_sigma(&lo0.shape.circuit),
-            "the public-segment accumulator discharges all three groups"
+                && acc_pub.discharge_sigma(&lo0.shape.circuit)
+                && acc_pub.discharge_jagged(&[(child_digest, &child_params_j)]),
+            "the public-segment accumulator discharges all four groups"
         );
         // The lagrange-low constants: the one public surface the in-circuit
         // derivation adds — validated against the verifier's own values.
@@ -20001,17 +20725,20 @@ fn build_node_outer_app(
             }
             // The LANE accumulator, reassembled from the public segment
             // alone — the parent-facing statement of the lower registry.
-            if let (Some((lpb, _, lar, _)), Some((lacc_n, llocs, ..))) =
+            if let (Some((lpb, _, lar, _)), Some((lacc_n, llocs, ljlocs, ..))) =
                 (lane_pub.as_ref(), lane_native.as_ref())
             {
                 let lrebuilt = check_fold_publics(&built2.public, *lpb, llocs, lar);
+                let lu_len: usize = llocs.iter().map(|l| 1 + l.k_col + l.k_row).sum();
+                let ljrebuilt =
+                    check_jagged_fold_publics(&built2.public, *lpb + lu_len, ljlocs);
                 let lane_ref = lane.as_ref().expect("lane");
                 let lacc_pub2 = aggregate::Accumulator {
                     registry_digest: lane_ref.registry.digest(),
                     per_type: vec![(lrebuilt[0].clone(), lrebuilt[1].clone())],
                     per_element: Vec::new(),
                     sigma: Some((lane_ref.circuit.digest(), lrebuilt[2].clone())),
-                    jagged: Vec::new(),
+                    jagged: vec![(lane_ref.circuit.digest(), ljrebuilt[0].clone())],
                 };
                 assert_eq!(
                     &lacc_pub2, lacc_n,
@@ -20498,6 +21225,7 @@ fn internal_node_three_ary() {
     let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
     let priors: Vec<&flock_core::aggregate::Accumulator> = fls.iter().map(|f| &f.acc).collect();
     let kids: Vec<&LeafOuter> = fls.iter().map(|f| &f.lo).collect();
+    let chain_jp = chain_jagged_params(&cps[0]);
 
     let (node, acc, t, app, lane_acc) = build_node_outer_app(
         &kids,
@@ -20507,6 +21235,7 @@ fn internal_node_three_ary() {
             mats: &chain_mats,
             circs: &chain_circs,
             circuit: &cps[0].inner.built.shape.circuit,
+            params: &chain_jp,
             priors: &priors,
             claims_base: fls[0].fold_pub_base,
         }),
@@ -20642,6 +21371,7 @@ fn chain_tower_three_levels_one_internal_digest() {
     let chain_mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
     let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
     let chain_circuit = &cps[0].inner.built.shape.circuit;
+    let chain_jp = chain_jagged_params(&cps[0]);
     let acc_base = fls[0].fold_pub_base;
     assert_eq!(
         acc_base,
@@ -20659,6 +21389,7 @@ fn chain_tower_three_levels_one_internal_digest() {
             mats: &chain_mats,
             circs: &chain_circs,
             circuit: chain_circuit,
+            params: &chain_jp,
             priors: &[&fls[0].acc, &fls[1].acc],
             claims_base: acc_base,
         }),
@@ -20671,6 +21402,7 @@ fn chain_tower_three_levels_one_internal_digest() {
             mats: &chain_mats,
             circs: &chain_circs,
             circuit: chain_circuit,
+            params: &chain_jp,
             priors: &[&fls[2].acc, &fls[3].acc],
             claims_base: acc_base,
         }),
@@ -20696,6 +21428,7 @@ fn chain_tower_three_levels_one_internal_digest() {
             mats: &chain_mats,
             circs: &chain_circs,
             circuit: chain_circuit,
+            params: &chain_jp,
             priors: &[&lane0, &lane1],
             claims_base: acc_base,
         }),
@@ -20928,11 +21661,13 @@ fn chain_tower_e2e_with_lane() {
     let blake_lc = blake_r1cs.csc_lincheck_circuit();
     let chain_mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
     let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
+    let chain_jp = chain_jagged_params(&cp0);
     let lane = ChainLane {
         registry: chain_registry,
         mats: &chain_mats,
         circs: &chain_circs,
         circuit: &cp0.inner.built.shape.circuit,
+        params: &chain_jp,
         priors: &[&fl0.acc, &fl1.acc],
         claims_base: fl0.fold_pub_base,
     };
@@ -21038,6 +21773,10 @@ fn chain_tower_e2e_with_lane() {
             &UnionInstance<'_>,
             flock_core::element_r1cs::union::ElementAssertion,
         ); 0] = [];
+        let jagged_pt: Vec<aggregate::JaggedKeyProve<'_>> =
+            vec![(cp0.inner.built.shape.circuit.digest(), &chain_jp, Vec::new())];
+        let jagged_vt: Vec<aggregate::JaggedKeyVerify<'_>> =
+            vec![(cp0.inner.built.shape.circuit.digest(), Vec::new())];
         let mut chp = FsChallenger::with_chained_blake3(b"flock-chain-lane-tamper");
         let (lagg, _) = aggregate::prove_aggregate_classes(
             chain_registry,
@@ -21047,7 +21786,7 @@ fn chain_tower_e2e_with_lane() {
             &[],
             &el_asserts_l,
             Some((&cp0.inner.built.shape.circuit, &[])),
-            &[],
+            &jagged_pt,
             &[&fl0.acc, &fl1.acc],
             &mut chp,
         )
@@ -21059,7 +21798,7 @@ fn chain_tower_e2e_with_lane() {
                 &[],
                 &el_asserts_l,
                 Some((&cp0.inner.built.shape.circuit, &[])),
-                &[],
+                &jagged_vt,
                 &[&bad_acc, &fl1.acc],
                 &lagg,
                 &mut ch,
@@ -21229,11 +21968,13 @@ fn chain_tower_m32_headline() {
     let blake_lc = blake_r1cs.csc_lincheck_circuit();
     let chain_mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
     let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
+    let chain_jp = chain_jagged_params(&cp0);
     let lane = ChainLane {
         registry: chain_registry,
         mats: &chain_mats,
         circs: &chain_circs,
         circuit: &cp0.inner.built.shape.circuit,
+        params: &chain_jp,
         priors: &[&fl0.acc, &fl1.acc],
         claims_base: fl0.fold_pub_base,
     };
@@ -21386,6 +22127,7 @@ fn tower_online_bench() {
     let blake_lc = blake_r1cs.csc_lincheck_circuit();
     let chain_mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
     let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
+    let chain_jp = chain_jagged_params(&cp0);
     let internal: Vec<Online> = (0..runs)
         .map(|_| {
             build_node_outer_app(
@@ -21396,6 +22138,7 @@ fn tower_online_bench() {
                     mats: &chain_mats,
                     circs: &chain_circs,
                     circuit: &cp0.inner.built.shape.circuit,
+                    params: &chain_jp,
                     priors: &[&fl0.acc, &fl1.acc],
                     claims_base: fl0.fold_pub_base,
                 }),
