@@ -1221,15 +1221,10 @@ mod tests {
     }
 
     /// The union padding spec delegates to `Instance::padding_spec` and, at
-    /// full utilization, IS `BlockR1cs::padding_spec` — the run encodings
-    /// used to differ (multi-run vs one giant block, classifying the same
-    /// bits), but `PaddingSpec::from_runs` now canonicalizes the
-    /// prefix-shaped full-count list to the one-giant-block form, so the
-    /// fully-utilized single-slot union drives the zerocheck through the
-    /// SAME single-run kernel fast paths as the single-table prover (the
-    /// multi-run arms had cost it 3.1× multi-threaded at m32). The
-    /// schedule.rs Phase 0 tests still prove genuinely multi-run encodings
-    /// (partial counts, interior gaps) drive the kernels byte-identically.
+    /// full utilization, classifies exactly the bits `BlockR1cs::padding_spec`
+    /// does (run encodings differ — multi-run vs one giant block — the
+    /// classification must not; the schedule.rs Phase 0 tests prove the
+    /// multi-run encoding drives the zerocheck kernels byte-identically).
     #[test]
     fn single_slot_padding_spec_classifies_like_block_r1cs() {
         let (k_log, useful_bits, nu) = (14usize, 15_409usize, 3usize);
@@ -1245,19 +1240,6 @@ mod tests {
             union.padding_spec().useful_intervals(),
             r1cs.padding_spec().useful_intervals(),
             "count-derived spec must classify the same bits useful as today's"
-        );
-        assert_eq!(
-            union.padding_spec(),
-            r1cs.padding_spec(),
-            "at full utilization the canonical encodings coincide — the \
-             union takes the single-run kernel fast paths"
-        );
-        // A PARTIAL count must stay a run list: the sparse count-proportional
-        // paths key off the multi-run encoding.
-        let partial = UnionInstance::new(&reg, vec![(1 << nu) - 3]);
-        assert!(
-            partial.padding_spec().as_single_run().is_none(),
-            "partial counts keep the run-list encoding"
         );
     }
 
@@ -1818,9 +1800,7 @@ mod tests {
         );
 
         // The padding run-list: an explicit zero run for the class gap, and
-        // the element slot's two runs exactly like a boolean slot's. Slot
-        // B's useless column and the class gap are shape-identical
-        // neighbors, so the canonical form coalesces them into one run.
+        // the element slot's two runs exactly like a boolean slot's.
         let runs = union.padding_spec();
         let cols = |n_blocks, useful| crate::zerocheck::PaddingRun {
             k_log: 7 + 3,
@@ -1833,7 +1813,8 @@ mod tests {
                 cols(6, 5 << 7),
                 cols(2, 0),
                 cols(3, 3 << 7),
-                cols(5, 0),      // B's useless column + class gap [0x3000, 0x4000)
+                cols(1, 0),
+                cols(4, 0),      // class gap [0x3000, 0x4000)
                 cols(5, 7 << 7), // element: 5 used columns at n = 7
                 cols(3, 0),
             ]
