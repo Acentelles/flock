@@ -10391,6 +10391,12 @@ struct RealRegion {
     /// The child's PUBLIC SEGMENT as witness wires — the app-statement
     /// plumbing (hash-chain adjacency) reads through these.
     child_pub_w: Vec<Wire>,
+    /// The child's own CIRCUIT DIGEST, absorbed by its statement binding
+    /// (payload 3) — two public words. This is the KEY its sigma and
+    /// jagged claims fold under, and the spine's match-gate compares it
+    /// against the key an inherited entry was published with.
+    #[allow(dead_code)]
+    cd_w: [Wire; 2],
 }
 
 /// Emit ONE real child's complete deferred-verifier region — the swap
@@ -10492,8 +10498,17 @@ fn emit_real_child_region(
     // Payload 4 of the circuit binding is the 32-byte publics digest; the
     // child's public words themselves are witness, bound here. The returned
     // wires ARE the child's public segment — the recombination folds them.
+    // Payload 3 is the child's CIRCUIT DIGEST (`bind_statement_circuit`'s
+    // order: registry, counts, cap, circuit, publics) — the FOLD KEY this
+    // child's claims belong under (wall 3), exported so the fold region's
+    // absorbed group digest binds to the circuit actually verified here.
+    let pays = payload_words(stream);
+    assert_eq!(pays[3].len(), 2, "the circuit digest payload is 32 bytes");
+    let cd_w = [
+        ww[pays[3][0]].expect("circuit digest word wired"),
+        ww[pays[3][1]].expect("circuit digest word wired"),
+    ];
     let pub_w = {
-        let pays = payload_words(stream);
         assert_eq!(pays[4].len(), 2, "the publics digest payload is 32 bytes");
         let dw = [
             ww[pays[4][0]].expect("digest word wired"),
@@ -11261,6 +11276,7 @@ fn emit_real_child_region(
         mat_eval_w,
         pf: (pfslot, pf_w),
         child_pub_w: pub_w,
+        cd_w,
     }
 }
 
@@ -12820,7 +12836,9 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
                     if cl.terms.is_empty() {
                         let tag =
                             cw_j(&mut sb, &mut vals, &mut jag_const_rec, F128::new(0, cl.row_pt.1 as u64));
-                        sb.connect(wv(cl.row_pt.0 - 1), tag);
+                        sb.connect(wv(cl.row_scale_v - 1), tag);
+                        // A FRESH claim is live: its zero-claim scale is 1.
+                        sb.connect(wv(cl.row_scale_v), ow);
                         for j in 0..cl.row_pt.1 {
                             sb.connect(wv(cl.row_pt.0 + j), rk.jag_row_w[li][j]);
                         }
@@ -12847,9 +12865,8 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
                 }
             }
             assert_eq!(ci, loc.claims.len(), "every jagged claim connected");
-            // The group's shape header word binds too (it precedes the
-            // first claim's tag; claim 0 is an RS Eq claim).
-            let header_v = loc.claims[0].row_pt.0 - 2;
+            // The group's shape header word binds too.
+            let header_v = loc.hdr_v;
             let hw = cw_j(
                 &mut sb,
                 &mut vals,
@@ -16849,8 +16866,9 @@ fn mvp11_jagged_fold_tape() {
     ];
     for c in &claims {
         match &c.row {
-            JaggedRowWeight::Eq(p) => {
+            JaggedRowWeight::Eq(_, p) => {
                 want.push(Op::ObserveScalar); // the (0, len) tag
+                want.push(Op::ObserveScalar); // the zero-claim SCALE
                 want.push(Op::ObserveSlice(p.len()));
             }
             JaggedRowWeight::Combo(t) => {
@@ -16878,6 +16896,8 @@ fn mvp11_jagged_fold_tape() {
     // Value ordinals, per claim (variable-width blocks) — then held
     // field-for-field, so the replays below consume verified indices.
     struct JLoc {
+        /// Eq: the zero-claim SCALE word's ordinal. Combo: unused.
+        row_scale_v: usize,
         /// Eq: (point ordinal, len). Combo: unused.
         row_pt: (usize, usize),
         /// Combo: (coeff ordinal, address, address-word ordinal) per term.
@@ -16896,19 +16916,20 @@ fn mvp11_jagged_fold_tape() {
         .map(|c| {
             let tag_v = v_at;
             let (row_pt, terms) = match &c.row {
-                JaggedRowWeight::Eq(p) => {
+                JaggedRowWeight::Eq(scale, p) => {
                     assert_eq!(
                         vals_rec[tag_v],
                         F128::new(0, p.len() as u64),
                         "eq row tag"
                     );
+                    assert_eq!(vals_rec[tag_v + 1], *scale, "eq row SCALE on the stream");
                     assert_eq!(
-                        &vals_rec[tag_v + 1..tag_v + 1 + p.len()],
+                        &vals_rec[tag_v + 2..tag_v + 2 + p.len()],
                         &p[..],
                         "eq row point on the stream"
                     );
-                    v_at = tag_v + 1 + p.len();
-                    ((tag_v + 1, p.len()), Vec::new())
+                    v_at = tag_v + 2 + p.len();
+                    ((tag_v + 2, p.len()), Vec::new())
                 }
                 JaggedRowWeight::Combo(t) => {
                     assert_eq!(
@@ -16941,6 +16962,7 @@ fn mvp11_jagged_fold_tape() {
             assert_eq!(vals_rec[val_v], c.value, "claim value on the stream");
             v_at = val_v + 1;
             JLoc {
+                row_scale_v: tag_v + 1,
                 row_pt,
                 terms,
                 col_v,
@@ -17002,7 +17024,10 @@ fn mvp11_jagged_fold_tape() {
     let (run_r, rho_row) = replay(target_r, v_rm, mu0 + n_cl, k_row);
     let w_mu = (0..n_cl).fold(F128::ZERO, |acc, k| {
         let rw = match &claims[k].row {
-            JaggedRowWeight::Eq(_) => eq_prod(locs[k].row_pt.0, locs[k].row_pt.1, &rho_row),
+            JaggedRowWeight::Eq(_, _) => {
+                vals_rec[locs[k].row_scale_v]
+                    * eq_prod(locs[k].row_pt.0, locs[k].row_pt.1, &rho_row)
+            }
             JaggedRowWeight::Combo(_) => locs[k].terms.iter().fold(F128::ZERO, |a, &(cv, addr, _)| {
                 let e = rho_row.iter().enumerate().fold(F128::ONE, |e, (l, &r)| {
                     e * (F128::ONE + bit((addr >> l) & 1 == 1) + r)
@@ -17159,11 +17184,12 @@ fn mvp11_jagged_fold_tape() {
         let mut wmu_w = zw;
         for k in 0..n_cl {
             let rw = match &claims[k].row {
-                JaggedRowWeight::Eq(_) => {
+                JaggedRowWeight::Eq(_, _) => {
                     let fs: Vec<(Wire, Wire)> = (0..locs[k].row_pt.1)
                         .map(|j| (wv(locs[k].row_pt.0 + j), rho_row_w[j]))
                         .collect();
-                    prefix(&mut sb, ow, &fs)
+                    // Seeded by the SCALE wire (the zero-claim form).
+                    prefix(&mut sb, wv(locs[k].row_scale_v), &fs)
                 }
                 JaggedRowWeight::Combo(_) => {
                     let mut acc = zw;
@@ -17846,6 +17872,10 @@ fn check_fold_publics(
 /// One absorbed JAGGED claim's stream ordinals: the tagged row weight and
 /// the col point + value. `terms` empty ⇔ an Eq row (the tag pins which).
 struct JClaimLoc {
+    /// Eq rows: the SCALE word's ordinal (the zero-claim scale — `1` for a
+    /// fresh claim, the inherited entry's live word otherwise). Combo rows:
+    /// unused (0).
+    row_scale_v: usize,
     /// Eq rows: (point ordinal, len). Combo rows: unused (0, 0).
     row_pt: (usize, usize),
     /// Combo rows: (coeff ordinal, address) per term — the address WORD
@@ -17857,6 +17887,8 @@ struct JClaimLoc {
 
 /// One jagged fold group's located surfaces — [`FoldLoc`]'s sibling.
 struct JaggedFoldLoc {
+    /// The group's `(k_row, n_claims)` shape header word.
+    hdr_v: usize,
     claims: Vec<JClaimLoc>,
     lam_ch0: usize,
     col_v: usize,
@@ -17884,7 +17916,7 @@ fn jagged_fold_region_ops(
         let k_row = cs
             .iter()
             .find_map(|c| match &c.row {
-                JaggedRowWeight::Eq(p) => Some(p.len()),
+                JaggedRowWeight::Eq(_, p) => Some(p.len()),
                 JaggedRowWeight::Combo(_) => None,
             })
             .expect("every jagged key carries at least one Eq claim");
@@ -17894,7 +17926,9 @@ fn jagged_fold_region_ops(
         want.push(Op::ObserveScalar); // the (k_row, n_claims) shape header
         for c in cs {
             match &c.row {
-                JaggedRowWeight::Eq(p) => {
+                JaggedRowWeight::Eq(_, p) => {
+                    // tag, then the zero-claim SCALE, then the point.
+                    want.push(Op::ObserveScalar);
                     want.push(Op::ObserveScalar);
                     want.push(Op::ObserveSlice(p.len()));
                 }
@@ -17951,7 +17985,7 @@ fn locate_and_pin_jagged_folds(
             let k_row = cs
                 .iter()
                 .find_map(|c| match &c.row {
-                    JaggedRowWeight::Eq(p) => Some(p.len()),
+                    JaggedRowWeight::Eq(_, p) => Some(p.len()),
                     JaggedRowWeight::Combo(_) => None,
                 })
                 .expect("every jagged key carries at least one Eq claim");
@@ -17960,25 +17994,27 @@ fn locate_and_pin_jagged_folds(
                 F128::new(k_row as u64, cs.len() as u64),
                 "the group's shape header word"
             );
+            let hdr_v = vcur;
             vcur += 1;
             let claims: Vec<JClaimLoc> = cs
                 .iter()
                 .map(|c| {
                     let tag_v = vcur;
                     let (row_pt, terms) = match &c.row {
-                        JaggedRowWeight::Eq(p) => {
+                        JaggedRowWeight::Eq(scale, p) => {
                             assert_eq!(
                                 vals_rec[tag_v],
                                 F128::new(0, p.len() as u64),
                                 "eq row tag"
                             );
+                            assert_eq!(vals_rec[tag_v + 1], *scale, "eq row SCALE on the stream");
                             assert_eq!(
-                                &vals_rec[tag_v + 1..tag_v + 1 + p.len()],
+                                &vals_rec[tag_v + 2..tag_v + 2 + p.len()],
                                 &p[..],
                                 "eq row point on the stream"
                             );
-                            vcur = tag_v + 1 + p.len();
-                            ((tag_v + 1, p.len()), Vec::new())
+                            vcur = tag_v + 2 + p.len();
+                            ((tag_v + 2, p.len()), Vec::new())
                         }
                         JaggedRowWeight::Combo(t) => {
                             assert_eq!(
@@ -18011,6 +18047,7 @@ fn locate_and_pin_jagged_folds(
                     assert_eq!(vals_rec[val_v], c.value, "claim value on the stream");
                     vcur = val_v + 1;
                     JClaimLoc {
+                        row_scale_v: tag_v + 1,
                         row_pt,
                         terms,
                         col_v,
@@ -18049,6 +18086,7 @@ fn locate_and_pin_jagged_folds(
             }
             assert_eq!(vals_rec[out_v], fp.value, "jagged output value on the stream");
             JaggedFoldLoc {
+                hdr_v,
                 claims,
                 lam_ch0,
                 col_v,
@@ -18120,7 +18158,8 @@ fn replay_jagged_fold_endpoints(
             let (run_r, rho_row) = replay_rounds(target_r, loc.row_v, loc.row_ch0, loc.k_row);
             let w_mu = loc.claims.iter().zip(&mus).fold(F128::ZERO, |acc, (cl, &m)| {
                 let rw = if cl.terms.is_empty() {
-                    (0..cl.row_pt.1).fold(F128::ONE, |w, j| {
+                    // The eq product SEEDED by the zero-claim scale.
+                    (0..cl.row_pt.1).fold(vals_rec[cl.row_scale_v], |w, j| {
                         w * (F128::ONE + vals_rec[cl.row_pt.0 + j] + rho_row[j])
                     })
                 } else {
@@ -18235,7 +18274,10 @@ fn emit_jagged_fold_region(
                 let fs: Vec<(Wire, Wire)> = (0..cl.row_pt.1)
                     .map(|j| (wv(cl.row_pt.0 + j), rho_row_w[j]))
                     .collect();
-                prefix(sb, ow, &fs)
+                // SEEDED by the claim's own scale wire (the zero-claim
+                // form) rather than the constant 1 — free, the prefix
+                // chain already takes a seed.
+                prefix(sb, wv(cl.row_scale_v), &fs)
             } else {
                 let mut acc = zw;
                 for &(cv, addr) in &cl.terms {
@@ -20293,7 +20335,9 @@ fn build_node_outer_app(
                             &mut jag_const_rec,
                             F128::new(0, cl.row_pt.1 as u64),
                         );
-                        sb.connect(wv(cl.row_pt.0 - 1), tag);
+                        sb.connect(wv(cl.row_scale_v - 1), tag);
+                        // A FRESH claim is live: its zero-claim scale is 1.
+                        sb.connect(wv(cl.row_scale_v), ow);
                         for j in 0..cl.row_pt.1 {
                             sb.connect(wv(cl.row_pt.0 + j), rk.jag_row_w[li][j]);
                         }
@@ -20320,7 +20364,7 @@ fn build_node_outer_app(
                 }
             }
             assert_eq!(ci, loc.claims.len(), "every jagged claim connected");
-            let header_v = loc.claims[0].row_pt.0 - 2;
+            let header_v = loc.hdr_v;
             let hw = cw_j(
                 &mut sb,
                 &mut vals,
@@ -20681,9 +20725,10 @@ fn build_node_outer_app(
                 for loc in ljlocs {
                     let cl = &loc.claims[k];
                     assert!(cl.terms.is_empty(), "inherited jagged claims are plain eq");
-                    // The jagged entry's live word: pinned real (== 1) by
-                    // the tape pin for now; the jagged zero-claim scale
-                    // (the Eq-scale variant) is the spine builder's step.
+                    // The Eq-SCALE: an inherited jagged claim's scale IS the
+                    // child's live word, exactly as the uniform groups' lows
+                    // are — the zero-claim gate, in the wiring.
+                    sb.connect(lwv(cl.row_scale_v), rk.child_pub_w[off]);
                     for j in 0..loc.n_col {
                         sb.connect(lwv(cl.col_v + j), rk.child_pub_w[off + 1 + j]);
                     }
@@ -20728,9 +20773,9 @@ fn build_node_outer_app(
                             &mut lane_const_rec,
                             F128::new(0, cl.row_pt.1 as u64),
                         );
-                        sb.connect(lwv(cl.row_pt.0 - 1), tag);
+                        sb.connect(lwv(cl.row_scale_v - 1), tag);
                     }
-                    let header_v = loc.claims[0].row_pt.0 - 2;
+                    let header_v = loc.hdr_v;
                     let hw = cw_j(
                         &mut sb,
                         &mut vals,

@@ -109,7 +109,7 @@ fn jagged_claims_match_the_direct_formula() {
 
     // The general statement's shape: row weight eq(z_col).
     let z_col = rng.f128_vec(params.k);
-    let eq_claim = JaggedClaim::honest(JaggedRowWeight::Eq(z_col.clone()), rho.clone(), &table);
+    let eq_claim = JaggedClaim::honest(JaggedRowWeight::eq(z_col.clone()), rho.clone(), &table);
     assert_eq!(
         eq_claim.value,
         w_reference(&dense_eq(&z_col), &params.col_prefix_sums, M, &rho),
@@ -158,7 +158,7 @@ fn proof_claims(table: &JaggedTable, rng: &mut Rng) -> Vec<JaggedClaim> {
         })
         .collect();
     vec![
-        JaggedClaim::honest(JaggedRowWeight::Eq(z_col), rho.clone(), table),
+        JaggedClaim::honest(JaggedRowWeight::eq(z_col), rho.clone(), table),
         JaggedClaim::honest(JaggedRowWeight::Combo(terms), rho, table),
     ]
 }
@@ -254,8 +254,8 @@ fn distinct_heights_are_distinct_tables() {
     let mut rng = Rng(0x1A66_0003);
     let rho = rng.f128_vec(ta.n_col_vars());
     let z = rng.f128_vec(ta.k);
-    let ca = JaggedClaim::honest(JaggedRowWeight::Eq(z.clone()), rho.clone(), &ta);
-    let cb = JaggedClaim::honest(JaggedRowWeight::Eq(z), rho, &tb);
+    let ca = JaggedClaim::honest(JaggedRowWeight::eq(z.clone()), rho.clone(), &ta);
+    let cb = JaggedClaim::honest(JaggedRowWeight::eq(z), rho, &tb);
     assert_ne!(
         ca.value, cb.value,
         "the same statement about different heights has different W-values"

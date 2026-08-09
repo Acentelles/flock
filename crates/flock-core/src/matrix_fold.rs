@@ -726,25 +726,40 @@ impl JaggedTable {
 /// [`JaggedRowWeight::Eq`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JaggedRowWeight {
-    /// `eq(point, ·)` — a general statement's `z_col`, and every inherited
-    /// folded claim.
-    Eq(Vec<F128>),
+    /// `scale · eq(point, ·)` — a general statement's `z_col` (scale `1`),
+    /// and every inherited folded claim, whose scale is the accumulator
+    /// entry's LIVE word.
+    ///
+    /// The SCALE is the jagged family's ZERO-CLAIM form (wall 3). The
+    /// uniform folds get it for free — a `Weight`'s length-1 `low` already
+    /// scales `eq` — but a jagged row weight had no such slot, so an
+    /// inherited entry could only ever be live. With the scale, a dead
+    /// entry (`scale = 0`, value `0`) is a claim that is TRUE about every
+    /// layout and costs the fold nothing, which is what lets one spine
+    /// node shape serve every level.
+    Eq(F128, Vec<F128>),
     /// `Σ_j coeff_j · e(addr_j)` — a scalar group's γ-baked one-hot columns
     /// at build-time-constant addresses (registry-derived, not
-    /// count-derived).
+    /// count-derived). Fresh only, so no scale: a Combo never rides in as
+    /// an inherited claim.
     Combo(Vec<(F128, u32)>),
 }
 
 impl JaggedRowWeight {
+    /// A live `eq(point, ·)` — scale `1`, the shape every FRESH claim has.
+    pub fn eq(point: Vec<F128>) -> Self {
+        Self::Eq(F128::ONE, point)
+    }
+
     /// The weight's MLE at `rho` (`rho.len() == k`).
     pub fn eval(&self, rho: &[F128]) -> F128 {
         match self {
-            Self::Eq(point) => {
+            Self::Eq(scale, point) => {
                 assert_eq!(point.len(), rho.len(), "point/arity mismatch");
                 point
                     .iter()
                     .zip(rho)
-                    .fold(F128::ONE, |acc, (&p, &r)| {
+                    .fold(*scale, |acc, (&p, &r)| {
                         acc * (p * r + (F128::ONE + p) * (F128::ONE + r))
                     })
             }
@@ -760,9 +775,15 @@ impl JaggedRowWeight {
     /// The full `2^k` vector — prover side only.
     pub fn materialize(&self, k: usize) -> Vec<F128> {
         match self {
-            Self::Eq(point) => {
+            Self::Eq(scale, point) => {
                 assert_eq!(point.len(), k, "point/arity mismatch");
-                Weight::eq(point.clone()).materialize()
+                let mut out = Weight::eq(point.clone()).materialize();
+                if *scale != F128::ONE {
+                    for x in &mut out {
+                        *x *= *scale;
+                    }
+                }
+                out
             }
             Self::Combo(terms) => {
                 let mut out = vec![F128::ZERO; 1usize << k];
@@ -777,8 +798,9 @@ impl JaggedRowWeight {
     /// Canonical transcript binding: a tagged header, then the payload.
     fn observe<Ch: Challenger>(&self, ch: &mut Ch) {
         match self {
-            Self::Eq(point) => {
+            Self::Eq(scale, point) => {
                 ch.observe_f128(F128::new(0, point.len() as u64));
+                ch.observe_f128(*scale);
                 ch.observe_f128_slice(point);
             }
             Self::Combo(terms) => {
@@ -795,7 +817,7 @@ impl JaggedRowWeight {
     /// checks arity instead.
     fn well_formed(&self, k: usize) -> bool {
         match self {
-            Self::Eq(point) => point.len() == k,
+            Self::Eq(_, point) => point.len() == k,
             Self::Combo(terms) => terms.iter().all(|&(_, addr)| (addr as usize) < (1 << k)),
         }
     }
@@ -825,9 +847,14 @@ impl JaggedClaim {
 
     /// An inherited claim: a previous fold's plain-eq output re-enters the
     /// next fold. `None` if the claim is not the plain shape a fold emits.
+    ///
+    /// A published accumulator entry carries its LIVE word as BOTH weights'
+    /// length-1 low (wall 3), so the two must agree and their common value
+    /// becomes the row weight's scale — `low = [1]` reproduces the old
+    /// plain-eq claim exactly, `low = [0]` is the zero claim.
     pub fn from_folded(c: &MatrixClaim) -> Option<Self> {
-        (c.row.low == [F128::ONE] && c.col.low == [F128::ONE]).then(|| Self {
-            row: JaggedRowWeight::Eq(c.row.point.clone()),
+        (c.row.low.len() == 1 && c.col.low == c.row.low).then(|| Self {
+            row: JaggedRowWeight::Eq(c.row.low[0], c.row.point.clone()),
             col: c.col.point.clone(),
             value: c.value,
         })

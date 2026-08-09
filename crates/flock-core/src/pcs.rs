@@ -1436,7 +1436,7 @@ fn assemble_jagged_assertion(
         .iter()
         .map(|x| {
             JaggedClaim::honest(
-                JaggedRowWeight::Eq(x[1 + n_log..].to_vec()),
+                JaggedRowWeight::eq(x[1 + n_log..].to_vec()),
                 mp.sigma.clone(),
                 &table,
             )
@@ -1505,7 +1505,7 @@ fn assemble_jagged_assertion(
                     (
                         g,
                         JaggedClaim::honest(
-                            JaggedRowWeight::Eq(zc.to_vec()),
+                            JaggedRowWeight::eq(zc.to_vec()),
                             mp.sigma.clone(),
                             &table,
                         ),
