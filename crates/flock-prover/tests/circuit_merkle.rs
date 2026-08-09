@@ -12993,6 +12993,7 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         // inline, as before.
         let mut acc_chain_w: Vec<Wire> = Vec::new();
         for fp in fold_pubs.iter().chain(&jfold_pubs) {
+            acc_chain_w.push(fp.live);
             acc_chain_w.extend_from_slice(&fp.rho_col);
             acc_chain_w.extend_from_slice(&fp.rho_row);
             acc_chain_w.push(fp.value);
@@ -13099,7 +13100,7 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
             assert_eq!(r, o, "published fold output == located native output");
         }
         let jag_pub_at = fold_pub_base
-            + locs.iter().map(|l| 1 + l.k_col + l.k_row).sum::<usize>();
+            + locs.iter().map(|l| 2 + l.k_col + l.k_row).sum::<usize>();
         let jrebuilt = check_jagged_fold_publics(&built2.public, jag_pub_at, &jlocs);
         assert_eq!(jrebuilt[0], jouts[0], "published jagged entry == located native");
         let acc_pub = aggregate::Accumulator {
@@ -17342,6 +17343,10 @@ type AlphaRec = (usize, usize, bool, usize);
 /// (`connect`), not published zero-deltas — the proof itself fails on a
 /// broken endpoint, and no public or checker item exists for it.
 struct FoldPub {
+    /// The entry's LIVE word — the zero-claim scale (wall 3): a real
+    /// entry publishes 1 (ow); an absent one is all zeros, which decodes
+    /// as the zero claim. Fold outputs are always real.
+    live: Wire,
     rho_col: Vec<Wire>,
     rho_row: Vec<Wire>,
     value: Wire,
@@ -17764,6 +17769,7 @@ fn emit_fold_region(
         let rhs_w = sb.gate(macs, &[zw, wmu_w, value])[0];
         sb.connect(run2_w, rhs_w);
         fold_pubs.push(FoldPub {
+            live: ow,
             rho_col: rho_col_w,
             rho_row: rho_row_w,
             value,
@@ -17787,22 +17793,28 @@ fn check_fold_publics(
     let mut p = tail0;
     let mut rebuilt: Vec<MatrixClaim> = Vec::new();
     for loc in locs {
-        let rho_col = public[p..p + loc.k_col].to_vec();
-        let rho_row = public[p + loc.k_col..p + loc.k_col + loc.k_row].to_vec();
-        let value = public[p + loc.k_col + loc.k_row];
+        // Entry layout (wall 3): [live | rho_col | rho_row | value]; the
+        // live word is the zero-claim scale — a fold output is real, so
+        // the rebuilt low [live] equals eq's [1].
+        let live = public[p];
+        let rho_col = public[p + 1..p + 1 + loc.k_col].to_vec();
+        let rho_row =
+            public[p + 1 + loc.k_col..p + 1 + loc.k_col + loc.k_row].to_vec();
+        let value = public[p + 1 + loc.k_col + loc.k_row];
         rebuilt.push(MatrixClaim {
-            row: Weight::eq(rho_row),
-            col: Weight::eq(rho_col),
+            row: Weight::low_eq(vec![live], rho_row),
+            col: Weight::low_eq(vec![live], rho_col),
             value,
         });
-        p += 1 + loc.k_col + loc.k_row;
+        p += 2 + loc.k_col + loc.k_row;
     }
     for &(idx, fi, row_side, h) in alpha_recs {
         let base: usize = tail0
             + locs[..fi]
                 .iter()
-                .map(|l| 1 + l.k_col + l.k_row)
-                .sum::<usize>();
+                .map(|l| 2 + l.k_col + l.k_row)
+                .sum::<usize>()
+            + 1; // past this fold's live word
         let rho = if row_side {
             &public[base + locs[fi].k_col..base + locs[fi].k_col + locs[fi].k_row]
         } else {
@@ -18246,6 +18258,7 @@ fn emit_jagged_fold_region(
         let rhs_w = sb.gate(macs, &[zw, wmu_w, value])[0];
         sb.connect(run2_w, rhs_w);
         fold_pubs.push(FoldPub {
+            live: ow,
             rho_col: rho_col_w,
             rho_row: rho_row_w,
             value,
@@ -18266,13 +18279,15 @@ fn check_jagged_fold_publics(
     let mut p = at;
     locs.iter()
         .map(|loc| {
-            let rho_col = public[p..p + loc.n_col].to_vec();
-            let rho_row = public[p + loc.n_col..p + loc.n_col + loc.k_row].to_vec();
-            let value = public[p + loc.n_col + loc.k_row];
-            p += 1 + loc.n_col + loc.k_row;
+            let live = public[p];
+            let rho_col = public[p + 1..p + 1 + loc.n_col].to_vec();
+            let rho_row =
+                public[p + 1 + loc.n_col..p + 1 + loc.n_col + loc.k_row].to_vec();
+            let value = public[p + 1 + loc.n_col + loc.k_row];
+            p += 2 + loc.n_col + loc.k_row;
             MatrixClaim {
-                row: Weight::eq(rho_row),
-                col: Weight::eq(rho_col),
+                row: Weight::low_eq(vec![live], rho_row),
+                col: Weight::low_eq(vec![live], rho_col),
                 value,
             }
         })
@@ -18882,6 +18897,7 @@ fn mvp11_merge_fold_region() {
         // zero-deltas then the accumulator claim (ρ_col, ρ_row, value).
         let fold_pub_base = sb.public_len();
         for fp in &fold_pubs {
+            sb.publish(fp.live);
             for &w in &fp.rho_col {
                 sb.publish(w);
             }
@@ -18938,7 +18954,7 @@ fn mvp11_merge_fold_region() {
         // public against the PUBLISHED ρ coordinates, reassemble the
         // Accumulator from the public segment alone, and discharge all
         // three groups.
-        let tail_len: usize = locs.iter().map(|l| 1 + l.k_col + l.k_row).sum();
+        let tail_len: usize = locs.iter().map(|l| 2 + l.k_col + l.k_row).sum();
         let tail0 = fold_pub_base;
         let rebuilt = check_fold_publics(&built2.public, tail0, &locs, &alpha_recs);
         for (r, o) in rebuilt.iter().zip(&outs) {
@@ -19471,6 +19487,7 @@ fn mvp11_swap_children_fold_scale() {
         );
         let fold_pub_base = sb.public_len();
         for fp in &fold_pubs {
+            sb.publish(fp.live);
             for &w in &fp.rho_col {
                 sb.publish(w);
             }
@@ -19484,7 +19501,7 @@ fn mvp11_swap_children_fold_scale() {
         let mut built2 = shape2.run(&vals, &[]);
 
         let rebuilt = check_fold_publics(&built2.public, fold_pub_base, &locs, &alpha_recs);
-        let tail_len: usize = locs.iter().map(|l| 1 + l.k_col + l.k_row).sum();
+        let tail_len: usize = locs.iter().map(|l| 2 + l.k_col + l.k_row).sum();
         assert_eq!(
             fold_pub_base + tail_len,
             built2.public.len(),
@@ -20504,6 +20521,7 @@ fn build_node_outer_app(
         // index; off-envelope it publishes inline, as before.
         let mut acc_main_w: Vec<Wire> = Vec::new();
         for fp in fold_pubs.iter().chain(&jfold_pubs) {
+            acc_main_w.push(fp.live);
             acc_main_w.extend_from_slice(&fp.rho_col);
             acc_main_w.extend_from_slice(&fp.rho_row);
             acc_main_w.push(fp.value);
@@ -20634,19 +20652,25 @@ fn build_node_outer_app(
                 let mut off = lane_ref.claims_base;
                 for loc in llocs {
                     let cl = &loc.claims[k];
+                    // [live | rho_col | rho_row | value]: the LOWS connect
+                    // to the child's LIVE word (the zero-claim scale) —
+                    // a real entry carries 1, an absent one decodes zero.
+                    sb.connect(lwv(cl.row_low_v), rk.child_pub_w[off]);
+                    sb.connect(lwv(cl.col_low_v), rk.child_pub_w[off]);
                     for j in 0..cl.col_pt_n {
-                        sb.connect(lwv(cl.col_pt_v + j), rk.child_pub_w[off + j]);
+                        sb.connect(lwv(cl.col_pt_v + j), rk.child_pub_w[off + 1 + j]);
                     }
                     for j in 0..cl.row_pt_n {
-                        sb.connect(lwv(cl.row_pt_v + j), rk.child_pub_w[off + loc.k_col + j]);
+                        sb.connect(
+                            lwv(cl.row_pt_v + j),
+                            rk.child_pub_w[off + 1 + loc.k_col + j],
+                        );
                     }
                     sb.connect(
                         lwv(cl.value_v),
-                        rk.child_pub_w[off + loc.k_col + loc.k_row],
+                        rk.child_pub_w[off + 1 + loc.k_col + loc.k_row],
                     );
-                    sb.connect(lwv(cl.row_low_v), ow);
-                    sb.connect(lwv(cl.col_low_v), ow);
-                    off += loc.k_col + loc.k_row + 1;
+                    off += loc.k_col + loc.k_row + 2;
                 }
                 // The inherited JAGGED prior: child k's published entry —
                 // the block right after the uniform groups in its
@@ -20655,17 +20679,23 @@ fn build_node_outer_app(
                 for loc in ljlocs {
                     let cl = &loc.claims[k];
                     assert!(cl.terms.is_empty(), "inherited jagged claims are plain eq");
+                    // The jagged entry's live word: pinned real (== 1) by
+                    // the tape pin for now; the jagged zero-claim scale
+                    // (the Eq-scale variant) is the spine builder's step.
                     for j in 0..loc.n_col {
-                        sb.connect(lwv(cl.col_v + j), rk.child_pub_w[off + j]);
+                        sb.connect(lwv(cl.col_v + j), rk.child_pub_w[off + 1 + j]);
                     }
                     for j in 0..cl.row_pt.1 {
-                        sb.connect(lwv(cl.row_pt.0 + j), rk.child_pub_w[off + loc.n_col + j]);
+                        sb.connect(
+                            lwv(cl.row_pt.0 + j),
+                            rk.child_pub_w[off + 1 + loc.n_col + j],
+                        );
                     }
                     sb.connect(
                         lwv(cl.val_v),
-                        rk.child_pub_w[off + loc.n_col + loc.k_row],
+                        rk.child_pub_w[off + 1 + loc.n_col + loc.k_row],
                     );
-                    off += loc.n_col + loc.k_row + 1;
+                    off += loc.n_col + loc.k_row + 2;
                 }
             }
             // The lane's structural words (claim tags + the shape header)
@@ -20714,6 +20744,7 @@ fn build_node_outer_app(
             // child exposes its own chain fold.
             let mut lane_w: Vec<Wire> = Vec::new();
             for fp in lfold_pubs.iter().chain(&ljfold_pubs) {
+                lane_w.push(fp.live);
                 lane_w.extend_from_slice(&fp.rho_col);
                 lane_w.extend_from_slice(&fp.rho_row);
                 lane_w.push(fp.value);
@@ -20756,7 +20787,7 @@ fn build_node_outer_app(
             }
             let child = r0.census.last().unwrap().1 - r0.census[0].1;
             println!("  {:38} {:6}", "= CHILD TOTAL", child);
-            let tail_len: usize = locs.iter().map(|l| 1 + l.k_col + l.k_row).sum();
+            let tail_len: usize = locs.iter().map(|l| 2 + l.k_col + l.k_row).sum();
             println!("  {:38} {:6}", "lagrange consts", 66usize);
             println!("  {:38} {:6}", "fold region publics", tail_len);
             println!("  {:38} {:6}", "TOTAL (2 children + shared)", sb.public_len());
@@ -20966,12 +20997,12 @@ fn build_node_outer_app(
         }
         // The fold checker + the accumulator, reassembled from publics.
         let rebuilt = check_fold_publics(&built2.public, fold_pub_base, &locs, &alpha_recs);
-        let uniform_len: usize = locs.iter().map(|l| 1 + l.k_col + l.k_row).sum();
+        let uniform_len: usize = locs.iter().map(|l| 2 + l.k_col + l.k_row).sum();
         let jrebuilt =
             check_jagged_fold_publics(&built2.public, fold_pub_base + uniform_len, &jlocs);
         assert_eq!(jrebuilt[0], jouts[0], "published jagged entry == located native");
         let tail_len: usize = uniform_len
-            + jlocs.iter().map(|l| 1 + l.n_col + l.k_row).sum::<usize>();
+            + jlocs.iter().map(|l| 2 + l.n_col + l.k_row).sum::<usize>();
         let acc_pub = aggregate::Accumulator {
             registry_digest: registry.digest(),
             per_type: (0..n_bool)
@@ -21046,7 +21077,7 @@ fn build_node_outer_app(
                 (lane_pub.as_ref(), lane_native.as_ref())
             {
                 let lrebuilt = check_fold_publics(&built2.public, *lpb, llocs, lar);
-                let lu_len: usize = llocs.iter().map(|l| 1 + l.k_col + l.k_row).sum();
+                let lu_len: usize = llocs.iter().map(|l| 2 + l.k_col + l.k_row).sum();
                 let ljrebuilt =
                     check_jagged_fold_publics(&built2.public, *lpb + lu_len, ljlocs);
                 let lane_ref = lane.as_ref().expect("lane");
