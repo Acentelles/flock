@@ -37,6 +37,7 @@
 
 use flock_core::circuit::builder::{CircuitBuilder, GateType, ShapeBuilder, SlotWitness, Wire};
 use flock_core::field::F128;
+use flock_core::matrix_fold::{MatrixClaim, Weight};
 use flock_core::merkle::{self as core_merkle, HashKind};
 use flock_core::pcs::PcsParams;
 use flock_core::pcs::ligerito::LigeritoProfile;
@@ -197,9 +198,23 @@ const ENV_APP_WORDS: usize = 8;
 /// shorter shape — a dev-size chain, a fold with fewer groups — rides the
 /// same layout and a reader simply stops at its own group widths.
 const ENV_ACC_CHAIN_WORDS: usize = 160;
-// 640, was 600: the wall-3 live word (one per entry, the zero-claim
-// scale) grew the internal node's 38-entry block to 618.
-const ENV_ACC_MAIN_WORDS: usize = 640;
+// 768, was 640 (was 600): the wall-3 live word grew every entry by one,
+// and the SPINE layout adds, to the keyed groups, a published KEY (two
+// words per entry) and a second SLOT — the node-child slot, dead in a
+// fresh-only node, which is what lets a base node and a steady node be
+// read at the same offsets.
+const ENV_ACC_MAIN_WORDS: usize = 768;
+
+/// THE PASSENGER (wall 3): one sigma-shaped and one jagged-shaped entry,
+/// same layout as the ACC_MAIN keyed slots. A spine node's node-slot
+/// inherits an entry keyed by its child's OWN child — which matches at
+/// every steady level but once, at the first steady node over a base
+/// node. That single ORPHAN cannot fold (its key names a circuit no slot
+/// of this node names), so it rides here, re-published child to parent by
+/// a gated copy, until the root discharges it against the base circuit's
+/// own tables. Zeros when empty, which is every node but that one and its
+/// ancestors.
+const ENV_PASS_WORDS: usize = 96;
 
 /// FREE COUNTS ARE THE DEFAULT (the count win shipped, 2026-08-09): under
 /// the envelope, children declare their own per-type row counts — the
@@ -234,8 +249,12 @@ fn env_app_base(env: &EnvShape) -> usize {
     env.publics - ENV_APP_WORDS
 }
 
+fn env_pass_base(env: &EnvShape) -> usize {
+    env_app_base(env) - ENV_PASS_WORDS
+}
+
 fn env_acc_main_base(env: &EnvShape) -> usize {
-    env_app_base(env) - ENV_ACC_MAIN_WORDS
+    env_pass_base(env) - ENV_ACC_MAIN_WORDS
 }
 
 fn env_acc_chain_base(env: &EnvShape) -> usize {
@@ -252,6 +271,8 @@ struct EnvTail<'w> {
     /// Lower-registry accumulator claims: the FL's chain fold, or an
     /// internal node's chain LANE.
     acc_chain: &'w [Wire],
+    /// The PASSENGER: entries this node could not fold and did not drop.
+    pass: &'w [Wire],
     /// The application statement.
     app: &'w [Wire],
 }
@@ -288,7 +309,9 @@ fn envelope_shape() -> Option<EnvShape> {
         counts_el: [
             (600, 49000), // mac — the nu* driver; watch the 2^15 ceiling
             (500, 1000),  // zcr
-            (400, 900),   // mrs
+            // mrs — 1000, was 900: wall 3's steady spine node runs the
+            // extra keyed slot's rounds (measured 949 live).
+            (400, 1000),
             (0, 9000),    // spine
             (601, 300),   // assist
             (510, 64),    // skip-node (leaf-only usage)
@@ -486,7 +509,11 @@ fn pad_envelope_counts(
     // and statement at ONE index whatever kind of child it walks. A block
     // this outer has no content for is zeros, built exactly as the padding
     // is.
-    let body = env.publics - ENV_ACC_CHAIN_WORDS - ENV_ACC_MAIN_WORDS - ENV_APP_WORDS;
+    let body = env.publics
+        - ENV_ACC_CHAIN_WORDS
+        - ENV_ACC_MAIN_WORDS
+        - ENV_PASS_WORDS
+        - ENV_APP_WORDS;
     let live_pub = sb.public_len();
     report.push(format!("publics {live_pub}/{body}"));
     if live_pub > body {
@@ -499,6 +526,7 @@ fn pad_envelope_counts(
         for (name, w, width) in [
             ("acc_chain", tail.acc_chain, ENV_ACC_CHAIN_WORDS),
             ("acc_main", tail.acc_main, ENV_ACC_MAIN_WORDS),
+            ("pass", tail.pass, ENV_PASS_WORDS),
             ("app", tail.app, ENV_APP_WORDS),
         ] {
             report.push(format!("{name} {}/{width}", w.len()));
@@ -13114,13 +13142,17 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
             r0.pub_base + consumed0 <= r1.pub_base && r1.pub_base + consumed1 <= fold_pub_base,
             "the regions' public blocks are disjoint and ordered"
         );
-        let rebuilt = check_fold_publics(&built2.public, fold_pub_base, &locs, &alpha_recs);
+        // ACC_CHAIN keeps the un-keyed entry layout: the lane's registry
+        // role has ONE key (the chain circuit), so nothing to disambiguate.
+        let (rebuilt, _, _) =
+            check_fold_publics(&built2.public, fold_pub_base, &locs, &alpha_recs, locs.len());
         for (r, o) in rebuilt.iter().zip(&outs) {
             assert_eq!(r, o, "published fold output == located native output");
         }
         let jag_pub_at = fold_pub_base
             + locs.iter().map(|l| 2 + l.k_col + l.k_row).sum::<usize>();
-        let jrebuilt = check_jagged_fold_publics(&built2.public, jag_pub_at, &jlocs);
+        let (jrebuilt, _, _) =
+            check_jagged_fold_publics(&built2.public, jag_pub_at, &jlocs, false);
         assert_eq!(jrebuilt[0], jouts[0], "published jagged entry == located native");
         let acc_pub = aggregate::Accumulator {
             registry_digest: registry.digest(),
@@ -17806,43 +17838,83 @@ fn emit_fold_region(
     (fold_pubs, alpha_recs)
 }
 
+/// Read ONE published accumulator entry at `p`, advancing it.
+///
+/// Entry layout (wall 3): `[key | live | rho_col | rho_row | value]` — the
+/// two KEY words only for the keyed groups (sigma, jagged), where the
+/// entry names the circuit whose table it is about; the registry-keyed
+/// matrix groups carry none. The LIVE word is the zero-claim scale, so a
+/// block of zeros decodes as the zero claim: weights identically zero,
+/// value zero, true about every table. That is what a DEAD SLOT is, and
+/// why a base node and a steady node can be read at the same offsets.
+fn read_acc_entry(
+    public: &[F128],
+    p: &mut usize,
+    keyed: bool,
+    k_col: usize,
+    k_row: usize,
+) -> ([F128; 2], flock_core::matrix_fold::MatrixClaim) {
+    use flock_core::matrix_fold::{MatrixClaim, Weight};
+    let key = if keyed {
+        *p += 2;
+        [public[*p - 2], public[*p - 1]]
+    } else {
+        [F128::ZERO; 2]
+    };
+    let live = public[*p];
+    let rho_col = public[*p + 1..*p + 1 + k_col].to_vec();
+    let rho_row = public[*p + 1 + k_col..*p + 1 + k_col + k_row].to_vec();
+    let value = public[*p + 1 + k_col + k_row];
+    *p += 2 + k_col + k_row;
+    (
+        key,
+        MatrixClaim {
+            row: Weight::low_eq(vec![live], rho_row),
+            col: Weight::low_eq(vec![live], rho_col),
+            value,
+        },
+    )
+}
+
 /// Walk the published fold blocks from `tail0`: both endpoint deltas zero
 /// per fold, the accumulator claims rebuilt from the PUBLIC SEGMENT alone,
 /// and every boundary-expanded low-fold eq public validated against the
-/// PUBLISHED ρ coordinates. Returns the rebuilt claims for the caller's
-/// accumulator reassembly.
+/// PUBLISHED ρ coordinates. `locs[keyed_from..]` are the KEYED groups (the
+/// sigma slots ride the uniform tape's tail). Returns the rebuilt claims,
+/// their keys, and the offset just past the last entry.
 fn check_fold_publics(
     public: &[F128],
     tail0: usize,
     locs: &[FoldLoc],
     alpha_recs: &[AlphaRec],
-) -> Vec<flock_core::matrix_fold::MatrixClaim> {
-    use flock_core::matrix_fold::{MatrixClaim, Weight};
+    keyed_from: usize,
+) -> (
+    Vec<flock_core::matrix_fold::MatrixClaim>,
+    Vec<[F128; 2]>,
+    usize,
+) {
+    use flock_core::matrix_fold::MatrixClaim;
+    let width = |i: usize, l: &FoldLoc| {
+        2 + l.k_col + l.k_row + if i >= keyed_from { 2 } else { 0 }
+    };
     let mut p = tail0;
     let mut rebuilt: Vec<MatrixClaim> = Vec::new();
-    for loc in locs {
-        // Entry layout (wall 3): [live | rho_col | rho_row | value]; the
-        // live word is the zero-claim scale — a fold output is real, so
-        // the rebuilt low [live] equals eq's [1].
-        let live = public[p];
-        let rho_col = public[p + 1..p + 1 + loc.k_col].to_vec();
-        let rho_row =
-            public[p + 1 + loc.k_col..p + 1 + loc.k_col + loc.k_row].to_vec();
-        let value = public[p + 1 + loc.k_col + loc.k_row];
-        rebuilt.push(MatrixClaim {
-            row: Weight::low_eq(vec![live], rho_row),
-            col: Weight::low_eq(vec![live], rho_col),
-            value,
-        });
-        p += 2 + loc.k_col + loc.k_row;
+    let mut keys: Vec<[F128; 2]> = Vec::new();
+    for (i, loc) in locs.iter().enumerate() {
+        let (k, c) = read_acc_entry(public, &mut p, i >= keyed_from, loc.k_col, loc.k_row);
+        if i >= keyed_from {
+            keys.push(k);
+        }
+        rebuilt.push(c);
     }
     for &(idx, fi, row_side, h) in alpha_recs {
         let base: usize = tail0
             + locs[..fi]
                 .iter()
-                .map(|l| 2 + l.k_col + l.k_row)
+                .enumerate()
+                .map(|(i, l)| width(i, l))
                 .sum::<usize>()
-            + 1; // past this fold's live word
+            + if fi >= keyed_from { 3 } else { 1 }; // past key + live
         let rho = if row_side {
             &public[base + locs[fi].k_col..base + locs[fi].k_col + locs[fi].k_row]
         } else {
@@ -17859,7 +17931,7 @@ fn check_fold_publics(
             "boundary-expanded low-fold eq public (fold {fi}, h {h})"
         );
     }
-    rebuilt
+    (rebuilt, keys, p)
 }
 
 // ---------------------------------------------------------------------------
@@ -18312,30 +18384,32 @@ fn emit_jagged_fold_region(
 }
 
 /// Walk the published jagged entries from `at` — [`check_fold_publics`]'s
-/// sibling (no boundary publics: jagged lows are trivially 1). Returns the
-/// rebuilt entries for the caller's accumulator reassembly.
+/// sibling (no boundary publics: jagged lows are trivially 1). The jagged
+/// group is KEYED, so under the spine layout every entry leads with its
+/// key; `keyed = false` is the ACC_CHAIN layout, which the lane's
+/// single-key registry role leaves as it was. Returns the rebuilt entries,
+/// their keys, and the offset just past the last one.
 fn check_jagged_fold_publics(
     public: &[F128],
     at: usize,
     locs: &[JaggedFoldLoc],
-) -> Vec<flock_core::matrix_fold::MatrixClaim> {
-    use flock_core::matrix_fold::{MatrixClaim, Weight};
+    keyed: bool,
+) -> (
+    Vec<flock_core::matrix_fold::MatrixClaim>,
+    Vec<[F128; 2]>,
+    usize,
+) {
     let mut p = at;
-    locs.iter()
-        .map(|loc| {
-            let live = public[p];
-            let rho_col = public[p + 1..p + 1 + loc.n_col].to_vec();
-            let rho_row =
-                public[p + 1 + loc.n_col..p + 1 + loc.n_col + loc.k_row].to_vec();
-            let value = public[p + 1 + loc.n_col + loc.k_row];
-            p += 2 + loc.n_col + loc.k_row;
-            MatrixClaim {
-                row: Weight::low_eq(vec![live], rho_row),
-                col: Weight::low_eq(vec![live], rho_col),
-                value,
-            }
-        })
-        .collect()
+    let mut out = Vec::with_capacity(locs.len());
+    let mut keys = Vec::new();
+    for loc in locs {
+        let (k, c) = read_acc_entry(public, &mut p, keyed, loc.n_col, loc.k_row);
+        if keyed {
+            keys.push(k);
+        }
+        out.push(c);
+    }
+    (out, keys, p)
 }
 
 /// **MVP-11 step 2: the FULL fold region of a merge node, tape-pinned.**
@@ -19000,7 +19074,8 @@ fn mvp11_merge_fold_region() {
         // three groups.
         let tail_len: usize = locs.iter().map(|l| 2 + l.k_col + l.k_row).sum();
         let tail0 = fold_pub_base;
-        let rebuilt = check_fold_publics(&built2.public, tail0, &locs, &alpha_recs);
+        let (rebuilt, _, _) =
+            check_fold_publics(&built2.public, tail0, &locs, &alpha_recs, locs.len());
         for (r, o) in rebuilt.iter().zip(&outs) {
             assert_eq!(r, o, "published fold output == located native output");
         }
@@ -19544,7 +19619,8 @@ fn mvp11_swap_children_fold_scale() {
         let shape2 = sb.finish().expect("the scale fold circuit builds");
         let mut built2 = shape2.run(&vals, &[]);
 
-        let rebuilt = check_fold_publics(&built2.public, fold_pub_base, &locs, &alpha_recs);
+        let (rebuilt, _, _) =
+            check_fold_publics(&built2.public, fold_pub_base, &locs, &alpha_recs, locs.len());
         let tail_len: usize = locs.iter().map(|l| 2 + l.k_col + l.k_row).sum();
         assert_eq!(
             fold_pub_base + tail_len,
@@ -19737,8 +19813,85 @@ fn build_node_outer(
     lo0: &LeafOuter,
     lo1: &LeafOuter,
 ) -> (LeafOuter, flock_core::aggregate::Accumulator, Online) {
-    let (lo, acc, t, _, _) = build_node_outer_app(&[lo0, lo1], None, None);
-    (lo, acc, t)
+    let out = build_node_outer_app(&[lo0, lo1], None, None, None);
+    (out.lo, out.acc, out.online)
+}
+
+/// A node's PUBLISHED ACC_MAIN block, entry for entry — the surface a
+/// spine parent inherits, which is not quite the accumulator the fold
+/// returns: the keyed groups have a fixed number of SLOTS (one per child
+/// role), and a slot this node had no fold for is present as a DEAD entry
+/// (zero key, zero claim). That fixed shape is the whole point — a base
+/// node and a steady node publish the same layout, so ONE parent circuit
+/// reads either.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MainBlock {
+    per_type: Vec<(MatrixClaim, MatrixClaim)>,
+    per_element: Vec<(MatrixClaim, MatrixClaim)>,
+    /// Slot order: 0 is the FL-child slot, 1 the NODE-child slot.
+    sigma: Vec<([F128; 2], MatrixClaim)>,
+    jagged: Vec<([F128; 2], MatrixClaim)>,
+    /// The PASSENGER, same two slots: (sigma-shaped, jagged-shaped).
+    passenger: Vec<([F128; 2], MatrixClaim)>,
+}
+
+/// The two keyed slots every node publishes: the fresh FL child's, then
+/// the node child's.
+const N_KEY_SLOTS: usize = 2;
+
+/// A circuit digest as the two field words a transcript absorbs it as —
+/// the form the published keys and the match-gate compare in.
+fn digest_f128(d: &[u8; 32]) -> [F128; 2] {
+    let w = |o: usize| {
+        F128::new(
+            u64::from_le_bytes(d[o..o + 8].try_into().unwrap()),
+            u64::from_le_bytes(d[o + 8..o + 16].try_into().unwrap()),
+        )
+    };
+    [w(0), w(16)]
+}
+
+/// A claim scaled by a BIT: `1` returns it unchanged, `0` returns the zero
+/// claim at the same POINTS — weights identically zero, value zero. The
+/// points stay because in-circuit they are the child's published words and
+/// only the lows and the value pass through the gate.
+fn gate_claim(c: &MatrixClaim, live: bool) -> MatrixClaim {
+    if live {
+        return c.clone();
+    }
+    MatrixClaim {
+        row: Weight::low_eq(vec![F128::ZERO], c.row.point.clone()),
+        col: Weight::low_eq(vec![F128::ZERO], c.col.point.clone()),
+        value: F128::ZERO,
+    }
+}
+
+/// `true` when an entry's LIVE word is nonzero — a claim that is about
+/// something.
+fn entry_live(c: &MatrixClaim) -> bool {
+    c.row.low[0] != F128::ZERO
+}
+
+/// THE SPINE (wall 3): the node child's published block riding in as this
+/// node's MAIN-fold prior. `node_child` is that child's index in `los`
+/// (the steady shape: 1 — child 0 is the fresh FL).
+struct SpineIn<'a> {
+    node_child: usize,
+    prior: &'a MainBlock,
+}
+
+/// Everything [`build_node_outer_app`] hands back.
+struct NodeOut {
+    lo: LeafOuter,
+    /// The MAIN fold's accumulator — LIVE entries only, the thing a root
+    /// discharges.
+    acc: flock_core::aggregate::Accumulator,
+    online: Online,
+    app_base: Option<usize>,
+    lane_acc: Option<flock_core::aggregate::Accumulator>,
+    /// The published ACC_MAIN + passenger blocks — what a spine parent
+    /// inherits.
+    block: MainBlock,
 }
 
 /// A LOWER-registry accumulator lane riding through an internal node
@@ -19773,15 +19926,10 @@ fn build_node_outer_app(
     los: &[&LeafOuter],
     app_stmt: Option<usize>,
     lane: Option<ChainLane<'_>>,
-) -> (
-    LeafOuter,
-    flock_core::aggregate::Accumulator,
-    Online,
-    Option<usize>,
-    Option<flock_core::aggregate::Accumulator>,
-) {
+    spine: Option<SpineIn<'_>>,
+) -> NodeOut {
     use flock_core::aggregate;
-    use flock_core::matrix_fold::{FoldProof, MatrixClaim};
+    use flock_core::matrix_fold::FoldProof;
     use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
 
     const M11_NODE_DOMAIN: &[u8] = b"flock-mvp11-two-to-one-v0";
@@ -19795,11 +19943,28 @@ fn build_node_outer_app(
     let n_kids = los.len();
     assert!(n_kids >= 2, "a node folds at least two children");
     let lo0 = los[0];
+    // MIXED DIGESTS ARE THE SPINE (wall 3): a steady node's children are a
+    // FRESH FL and the PREVIOUS NODE, which are different circuits. They
+    // still share the registry, the publics length and the lane count (the
+    // wall-2 envelope), which is what makes ONE child region walk either —
+    // only the fold KEYS differ, one slot per child. Without a spine the
+    // old rule stands: one key, so one digest.
+    if spine.is_none() {
+        for lo in los {
+            assert_eq!(
+                lo.shape.circuit.digest(),
+                lo0.shape.circuit.digest(),
+                "a fresh-only node folds every child under ONE key"
+            );
+        }
+    } else {
+        assert_eq!(n_kids, 2, "the spine's steady node is 2->1");
+    }
     for lo in los {
         assert_eq!(
-            lo.shape.circuit.digest(),
-            lo0.shape.circuit.digest(),
-            "every child, ONE node circuit"
+            lo.shape.registry.digest(),
+            lo0.shape.registry.digest(),
+            "every child, ONE envelope registry"
         );
     }
     let registry = &lo0.shape.registry;
@@ -19856,20 +20021,89 @@ fn build_node_outer_app(
         .map(|(rt, u)| (u, rt.el_assert.clone()))
         .collect();
     let sigmas: Vec<_> = rts.iter().map(|rt| rt.sigma_native.clone()).collect();
-    // THE JAGGED GROUP (the count win): every child's W-claims fold under
-    // the ONE child digest (asserted above) — the layout is a shape
-    // constant of the child circuit.
-    let child_digest = lo0.shape.circuit.digest();
-    let child_params_j = flock_core::pcs::jagged::JaggedParams::from_heights(
-        &unions[0].jagged_heights(),
-        unions[0].n_log(),
-        lo0.commitment.params.m - flock_core::pcs::LOG_PACKING,
-    );
+    // THE KEYED GROUPS, per child SHAPE (wall 3): a fresh-only node has ONE
+    // key (every child is the same circuit); the SPINE has one SLOT PER
+    // CHILD, because its children are different circuits and claims about
+    // different permutations — different layouts — cannot fold together.
+    // The layout is a shape constant of the child circuit, so the key that
+    // names the circuit names the table.
+    let key_circuits: Vec<&flock_core::circuit::Circuit> = match &spine {
+        None => vec![&lo0.shape.circuit],
+        Some(_) => los.iter().map(|lo| &lo.shape.circuit).collect(),
+    };
+    let n_keys = key_circuits.len();
+    let key_digests: Vec<[u8; 32]> = key_circuits.iter().map(|c| c.digest()).collect();
+    // Which children's FRESH claims ride each key: all of them under one
+    // key, or child j under slot j.
+    let key_kids: Vec<Vec<usize>> = match &spine {
+        None => vec![(0..n_kids).collect()],
+        Some(_) => (0..n_kids).map(|i| vec![i]).collect(),
+    };
+    let params_j: Vec<flock_core::pcs::jagged::JaggedParams> = (0..n_keys)
+        .map(|j| {
+            let i = key_kids[j][0];
+            flock_core::pcs::jagged::JaggedParams::from_heights(
+                &unions[i].jagged_heights(),
+                unions[i].n_log(),
+                los[i].commitment.params.m - flock_core::pcs::LOG_PACKING,
+            )
+        })
+        .collect();
     let jags: Vec<&flock_core::matrix_fold::JaggedAssertion> =
         rts.iter().map(|rt| &rt.jag).collect();
-    let jagged_p: Vec<aggregate::JaggedKeyProve<'_>> =
-        vec![(child_digest, &child_params_j, jags.clone())];
-    let jagged_v: Vec<aggregate::JaggedKeyVerify<'_>> = vec![(child_digest, jags.clone())];
+    let jagged_p: Vec<aggregate::JaggedKeyProve<'_>> = (0..n_keys)
+        .map(|j| {
+            (
+                key_digests[j],
+                &params_j[j],
+                key_kids[j].iter().map(|&i| jags[i]).collect(),
+            )
+        })
+        .collect();
+    let jagged_v: Vec<aggregate::JaggedKeyVerify<'_>> = (0..n_keys)
+        .map(|j| (key_digests[j], key_kids[j].iter().map(|&i| jags[i]).collect()))
+        .collect();
+    let sigma_keys: Vec<aggregate::SigmaKey<'_>> = (0..n_keys)
+        .map(|j| {
+            (
+                key_circuits[j],
+                key_kids[j].iter().map(|&i| &sigmas[i]).collect(),
+            )
+        })
+        .collect();
+    // THE PRIOR (the spine): the node child's published block, normalized
+    // to this node's slots — an inherited entry whose published key names
+    // the slot's circuit folds; one that does not is GATED to the zero
+    // claim and its live original becomes an ORPHAN, which the passenger
+    // carries rather than drops.
+    let prior_acc: Option<aggregate::Accumulator> = spine.as_ref().map(|sp| {
+        let p = sp.prior;
+        assert_eq!(p.sigma.len(), N_KEY_SLOTS, "the prior's sigma slots");
+        assert_eq!(p.jagged.len(), N_KEY_SLOTS, "the prior's jagged slots");
+        let want: Vec<[F128; 2]> = key_digests.iter().map(digest_f128).collect();
+        let norm = |slots: &[([F128; 2], MatrixClaim)]| -> Vec<([u8; 32], MatrixClaim)> {
+            slots
+                .iter()
+                .enumerate()
+                .map(|(j, (k, c))| {
+                    let hit = *k == want[j];
+                    // The FL slot is the SAME shape at every level — its
+                    // key is wired equal in-circuit, so a miss here is a
+                    // broken spine, not a case the passenger covers.
+                    assert!(j > 0 || hit, "the FL slot's inherited key must match");
+                    (key_digests[j], gate_claim(c, hit))
+                })
+                .collect()
+        };
+        aggregate::Accumulator {
+            registry_digest: registry.digest(),
+            per_type: p.per_type.clone(),
+            per_element: p.per_element.clone(),
+            sigma: norm(&p.sigma),
+            jagged: norm(&p.jagged),
+        }
+    });
+    let priors: Vec<&aggregate::Accumulator> = prior_acc.iter().collect();
     let mut chp = FsChallenger::with_chained_blake3(M11_NODE_DOMAIN);
     let (agg, acc_p) = aggregate::prove_aggregate_classes(
         registry,
@@ -19878,9 +20112,9 @@ fn build_node_outer_app(
         &bool_asserts,
         &el_mats,
         &el_asserts,
-        &[(&lo0.shape.circuit, sigmas.iter().collect())],
+        &sigma_keys,
         &jagged_p,
-        &[],
+        &priors,
         &mut chp,
     )
     .expect("the node fold proves");
@@ -19890,9 +20124,9 @@ fn build_node_outer_app(
         registry,
         &bool_asserts,
         &el_asserts,
-        &[(&lo0.shape.circuit, sigmas.iter().collect())],
+        &sigma_keys,
         &jagged_v,
-        &[],
+        &priors,
         &agg,
         &mut rec,
     )
@@ -19904,13 +20138,16 @@ fn build_node_outer_app(
         "the element group discharges"
     );
     assert!(
-        acc_v.discharge_sigma(&[&lo0.shape.circuit]),
+        acc_v.discharge_sigma(&key_circuits),
         "the sigma group discharges"
     );
-    assert_eq!(acc_v.jagged.len(), 1, "one jagged key: the child layout");
+    assert_eq!(acc_v.jagged.len(), n_keys, "one jagged entry per key");
+    let jag_tables: Vec<([u8; 32], &flock_core::pcs::jagged::JaggedParams)> = (0..n_keys)
+        .map(|j| (key_digests[j], &params_j[j]))
+        .collect();
     assert!(
-        acc_v.discharge_jagged(&[(child_digest, &child_params_j)]),
-        "the folded jagged entry discharges against the child layout"
+        acc_v.discharge_jagged(&jag_tables),
+        "the folded jagged entries discharge against their children's layouts"
     );
 
     // The fold groups in aggregate order, from the CHILDREN'S OWN
@@ -19921,19 +20158,63 @@ fn build_node_outer_app(
         .zip(&unions)
         .map(|(rt, u)| rt.el_assert.claims(u))
         .collect();
-    // One group per (type, side), each carrying ONE claim per child — the
-    // fold machinery is claim-count-generic, so arity enters here only as
-    // the length of these vectors.
+    // One group per (type, side): the PRIOR's claim first when a spine
+    // rides (`gather`'s order — priors, then assertions), then one per
+    // child. The fold machinery is claim-count-generic, so both arity and
+    // the prior enter here only as the length of these vectors.
+    let pri = prior_acc.as_ref();
     let mut fold_claims: Vec<Vec<MatrixClaim>> = Vec::new();
     for t in 0..n_bool {
-        fold_claims.push((0..n_kids).map(|i| bc[i][t].0.clone()).collect());
-        fold_claims.push((0..n_kids).map(|i| bc[i][t].1.clone()).collect());
+        for side in 0..2 {
+            let mut g: Vec<MatrixClaim> = pri
+                .map(|p| {
+                    if side == 0 {
+                        p.per_type[t].0.clone()
+                    } else {
+                        p.per_type[t].1.clone()
+                    }
+                })
+                .into_iter()
+                .collect();
+            g.extend((0..n_kids).map(|i| {
+                if side == 0 {
+                    bc[i][t].0.clone()
+                } else {
+                    bc[i][t].1.clone()
+                }
+            }));
+            fold_claims.push(g);
+        }
     }
     for t in 0..n_el {
-        fold_claims.push((0..n_kids).map(|i| ec[i][t].0.clone()).collect());
-        fold_claims.push((0..n_kids).map(|i| ec[i][t].1.clone()).collect());
+        for side in 0..2 {
+            let mut g: Vec<MatrixClaim> = pri
+                .map(|p| {
+                    if side == 0 {
+                        p.per_element[t].0.clone()
+                    } else {
+                        p.per_element[t].1.clone()
+                    }
+                })
+                .into_iter()
+                .collect();
+            g.extend((0..n_kids).map(|i| {
+                if side == 0 {
+                    ec[i][t].0.clone()
+                } else {
+                    ec[i][t].1.clone()
+                }
+            }));
+            fold_claims.push(g);
+        }
     }
-    fold_claims.push(sigmas.iter().map(|s| s.claim()).collect());
+    // The SIGMA slots close the uniform tape, one per key.
+    let n_uni = fold_claims.len();
+    for j in 0..n_keys {
+        let mut g: Vec<MatrixClaim> = pri.map(|p| p.sigma[j].1.clone()).into_iter().collect();
+        g.extend(key_kids[j].iter().map(|&i| sigmas[i].claim()));
+        fold_claims.push(g);
+    }
     let mut fold_proofs: Vec<&FoldProof> = Vec::new();
     for t in 0..n_bool {
         fold_proofs.push(&agg.folds[t].0);
@@ -19943,7 +20224,7 @@ fn build_node_outer_app(
         fold_proofs.push(&agg.el_folds[t].0);
         fold_proofs.push(&agg.el_folds[t].1);
     }
-    fold_proofs.push(&agg.sigma_folds[0]);
+    fold_proofs.extend(agg.sigma_folds.iter());
     let n_folds = fold_claims.len();
 
     // ---- the fold tape, pinned through the width-driven helpers ----
@@ -19956,24 +20237,48 @@ fn build_node_outer_app(
         Op::ObserveBytes(32),
         Op::ObserveBytes(1),
     ];
-    let n_uni = fold_claims.len() - 1;
     want.extend(fold_region_ops(&fold_claims[..n_uni]));
-    // The sigma group binds per key now (wall 3): its label + digest
-    // precede the fold, exactly as the jagged groups bind.
-    want.push(Op::Label(b"flock-aggregate-sigma-v1".to_vec()));
-    want.push(Op::ObserveBytes(32));
-    want.extend(fold_region_ops(&fold_claims[n_uni..]));
-    // The jagged group rides the SAME tape after the uniform folds.
-    let jagged_keys: Vec<([u8; 32], Vec<flock_core::matrix_fold::JaggedClaim>)> = vec![(
-        child_digest,
-        jags.iter()
-            .flat_map(|a| a.claims().into_iter().cloned())
-            .collect(),
-    )];
+    // The sigma group binds per key (wall 3): its label + digest precede
+    // each key's fold, exactly as the jagged groups bind.
+    for j in 0..n_keys {
+        want.push(Op::Label(b"flock-aggregate-sigma-v1".to_vec()));
+        want.push(Op::ObserveBytes(32));
+        want.extend(fold_region_ops(&fold_claims[n_uni + j..n_uni + j + 1]));
+    }
+    // The jagged groups ride the SAME tape after the uniform folds — the
+    // prior's (gated) entry first, then that key's children's claims.
+    let jagged_keys: Vec<([u8; 32], Vec<flock_core::matrix_fold::JaggedClaim>)> = (0..n_keys)
+        .map(|j| {
+            let mut cs: Vec<flock_core::matrix_fold::JaggedClaim> = pri
+                .map(|p| {
+                    flock_core::matrix_fold::JaggedClaim::from_folded(&p.jagged[j].1)
+                        .expect("an inherited jagged entry is scaled plain eq")
+                })
+                .into_iter()
+                .collect();
+            cs.extend(
+                key_kids[j]
+                    .iter()
+                    .flat_map(|&i| jags[i].claims().into_iter().cloned()),
+            );
+            (key_digests[j], cs)
+        })
+        .collect();
     want.extend(jagged_fold_region_ops(&jagged_keys));
     assert_eq!(ops, want.as_slice(), "the node tape is the expected shape");
     assert_eq!(rec.payloads()[0], registry.digest(), "bind: registry digest");
-    assert_eq!(rec.payloads()[1], vec![0u8], "bind: prior count 0");
+    assert_eq!(
+        rec.payloads()[1],
+        vec![priors.len() as u8],
+        "bind: prior count"
+    );
+    for j in 0..n_keys {
+        assert_eq!(
+            rec.payloads()[2 + j],
+            key_digests[j].to_vec(),
+            "the sigma slot {j} key payload"
+        );
+    }
     let (locs, vcur, ccur) = locate_and_pin_folds(&fold_claims, &fold_proofs, vals_rec, chals);
     let jfps: Vec<&FoldProof> = agg.jagged_folds.iter().collect();
     let jlocs = locate_and_pin_jagged_folds(
@@ -19982,7 +20287,7 @@ fn build_node_outer_app(
         vals_rec,
         chals,
         rec.payloads(),
-        3, // bind's two + the sigma key's digest payload
+        2 + n_keys, // bind's two + one digest payload per sigma key
         vcur,
         ccur,
     );
@@ -20003,11 +20308,18 @@ fn build_node_outer_app(
             "element type {t} B"
         );
     }
-    let (sig_digest, sig_claim) = acc_v.sigma.first().expect("sigma accumulated");
-    assert_eq!(outs[n_folds - 1], *sig_claim, "sigma accumulator");
-    assert_eq!(*sig_digest, lo0.shape.circuit.digest(), "sigma key");
+    for j in 0..n_keys {
+        let (d, c) = &acc_v.sigma[j];
+        assert_eq!(outs[n_uni + j], *c, "sigma slot {j} accumulator");
+        assert_eq!(*d, key_digests[j], "sigma slot {j} key");
+    }
     let jouts = replay_jagged_fold_endpoints(&jlocs, vals_rec, chals);
-    assert_eq!(jouts[0], acc_v.jagged[0].1, "the jagged entry from located words");
+    for j in 0..n_keys {
+        assert_eq!(
+            jouts[j], acc_v.jagged[j].1,
+            "the jagged slot {j} entry from located words"
+        );
+    }
 
     // ---- the LANE (task 6): the children's LOWER-registry accumulators
     // fold PRIORS-ONLY — natively here, in-circuit below. 3 groups
@@ -20299,6 +20611,142 @@ fn build_node_outer_app(
             zw,
             ow,
         );
+        // ---- THE SPINE (wall 3): the node child's published ACC_MAIN
+        // block IS this node's prior, read wire-to-wire out of that
+        // child's public segment at the envelope's constant offset — the
+        // lane's `claims_base` machinery, now on the MAIN fold. ----
+        //
+        // The registry-keyed matrix entries ride straight in (lows to the
+        // child's live word, piece 1's wiring). The KEYED slots go through
+        // the MATCH-GATE: slot `j` folds claims about child `j`'s tables,
+        // and the entry inherited at slot `j` names whatever circuit the
+        // CHILD's own slot `j` was about. Slot 0 (the fresh FL slot) is the
+        // same FL shape at every level, so its key is a hard CONNECT — a
+        // mismatch is a broken spine, not a case. Slot 1 (the node slot)
+        // genuinely mismatches exactly once, at the first steady node over
+        // a base node, and there the entry is gated to the zero claim and
+        // its live original rides the PASSENGER instead of being dropped.
+        //
+        // `g = live · match` scales the claim's lows AND its value: a
+        // gated-off entry must claim ZERO, not its old value about a
+        // weight that is now zero.
+        // The keyed slots' entry widths — the same for a live slot and a
+        // dead one, which is what makes the layout readable at a constant
+        // offset. `[key(2) | live | rho_col | rho_row | value]`.
+        let sig_ent = 4 + locs[n_uni].k_col + locs[n_uni].k_row;
+        let jag_ent = 4 + jlocs[0].n_col + jlocs[0].k_row;
+        let spine_w = spine.as_ref().map(|sp| {
+            let e = env.as_ref().expect("the spine needs the envelope's offsets");
+            let rk = &regions[sp.node_child];
+            let cp = |i: usize| rk.child_pub_w[i];
+            // The assert-zero anchor for the gadget below: producers only,
+            // no consumer edges (the lagrange lows' pattern).
+            vals.push(F128::ZERO);
+            let za = sb.public_input();
+            // eq(a, b) as a BIT: d = a + b, an advice inverse w, and
+            // z = 1 + d·w with z·d == 0 — z is 1 exactly when d is 0 (to
+            // claim z = 1 with d ≠ 0 a prover needs w = 0, and then
+            // z·d = d ≠ 0 fails the assert).
+            let mut is_eq =
+                |sb: &mut ShapeBuilder, vals: &mut Vec<F128>, a: Wire, b: Wire, d: F128| -> Wire {
+                    let d_w = sb.gate(cs.macs, &[a, b, ow])[0];
+                    vals.push(d.inv());
+                    let inv_w = sb.input();
+                    let p_w = sb.gate(cs.macs, &[zw, d_w, inv_w])[0];
+                    let z_w = sb.gate(cs.macs, &[ow, p_w, ow])[0];
+                    let chk = sb.gate(cs.macs, &[zw, z_w, d_w])[0];
+                    sb.connect(chk, za);
+                    z_w
+                };
+            // Walk the child's block exactly as this node publishes its
+            // own — the layouts coincide, which is the shape fact the
+            // whole spine rests on.
+            let mut off = env_acc_main_base(e);
+            let uni_off: Vec<usize> = (0..n_uni)
+                .map(|i| {
+                    let o = off;
+                    off += 2 + locs[i].k_col + locs[i].k_row;
+                    o
+                })
+                .collect();
+            let sig_off: Vec<usize> = (0..N_KEY_SLOTS)
+                .map(|_| {
+                    let o = off;
+                    off += sig_ent;
+                    o
+                })
+                .collect();
+            let jag_off: Vec<usize> = (0..N_KEY_SLOTS)
+                .map(|_| {
+                    let o = off;
+                    off += jag_ent;
+                    o
+                })
+                .collect();
+            assert!(
+                off - env_acc_main_base(e) <= ENV_ACC_MAIN_WORDS,
+                "the prior's ACC_MAIN block overruns its reserved width"
+            );
+            // One keyed slot: the published key against this node's own,
+            // then the gate. Returns (g, gated value, orphan gate h).
+            let mut slot = |sb: &mut ShapeBuilder,
+                            vals: &mut Vec<F128>,
+                            o: usize,
+                            j: usize,
+                            ent: &([F128; 2], MatrixClaim),
+                            k_col: usize,
+                            k_row: usize|
+             -> (Wire, Wire, Wire) {
+                let live_w = cp(o + 2);
+                let val_w = cp(o + 3 + k_col + k_row);
+                let want = digest_f128(&key_digests[j]);
+                if j == 0 {
+                    // The FL slot: one shape at every level, so the key is
+                    // an EQUALITY, wired, not a case.
+                    sb.connect(cp(o), regions[j].cd_w[0]);
+                    sb.connect(cp(o + 1), regions[j].cd_w[1]);
+                    assert_eq!(ent.0, want, "the FL slot's inherited key is the FL circuit");
+                    return (live_w, val_w, zw);
+                }
+                let m0 = is_eq(sb, vals, cp(o), regions[j].cd_w[0], ent.0[0] + want[0]);
+                let m1 = is_eq(sb, vals, cp(o + 1), regions[j].cd_w[1], ent.0[1] + want[1]);
+                let m_w = sb.gate(cs.macs, &[zw, m0, m1])[0];
+                let g_w = sb.gate(cs.macs, &[zw, live_w, m_w])[0];
+                let gv_w = sb.gate(cs.macs, &[zw, g_w, val_w])[0];
+                // h = live · (1 + match) — the ORPHAN gate: live exactly
+                // when this entry could not fold and must ride on.
+                let nm_w = sb.gate(cs.macs, &[ow, m_w, ow])[0];
+                let h_w = sb.gate(cs.macs, &[zw, live_w, nm_w])[0];
+                (g_w, gv_w, h_w)
+            };
+            let sig: Vec<(Wire, Wire, Wire)> = (0..N_KEY_SLOTS)
+                .map(|j| {
+                    slot(
+                        &mut sb,
+                        &mut vals,
+                        sig_off[j],
+                        j,
+                        &sp.prior.sigma[j],
+                        locs[n_uni].k_col,
+                        locs[n_uni].k_row,
+                    )
+                })
+                .collect();
+            let jag: Vec<(Wire, Wire, Wire)> = (0..N_KEY_SLOTS)
+                .map(|j| {
+                    slot(
+                        &mut sb,
+                        &mut vals,
+                        jag_off[j],
+                        j,
+                        &sp.prior.jagged[j],
+                        jlocs[0].n_col,
+                        jlocs[0].k_row,
+                    )
+                })
+                .collect();
+            (uni_off, sig_off, jag_off, sig, jag)
+        });
         // THE POINTS-CONNECT (the count win's identity bind): value, σ,
         // row identities, and the structural words — see build_fl_node's
         // block for the argument; this is the same bind at node scale.
@@ -20319,59 +20767,103 @@ fn build_node_outer_app(
                 jag_consts.push((v, w));
                 w
             };
-            let loc = &jlocs[0];
-            let mut ci = 0usize;
-            for rk in &regions {
-                for (li, &jw) in rk.jag_w.iter().enumerate() {
-                    let cl = &loc.claims[ci];
-                    sb.connect(wv(cl.val_v), jw);
+            for (gi, loc) in jlocs.iter().enumerate() {
+                let mut ci = 0usize;
+                // The INHERITED claim leads the group (aggregate's gather
+                // order): its scale is the gate, its value the gated one,
+                // and its points are the child's published words.
+                if let Some((_, _, jag_off, _, jag)) = &spine_w {
+                    let cl = &loc.claims[0];
+                    let o = jag_off[gi];
+                    let rk = &regions[spine.as_ref().unwrap().node_child];
+                    let tag = cw_j(
+                        &mut sb,
+                        &mut vals,
+                        &mut jag_const_rec,
+                        F128::new(0, cl.row_pt.1 as u64),
+                    );
+                    sb.connect(wv(cl.row_scale_v - 1), tag);
+                    sb.connect(wv(cl.row_scale_v), jag[gi].0);
                     for j in 0..loc.n_col {
-                        sb.connect(wv(cl.col_v + j), rk.jag_sig_w[j]);
+                        sb.connect(wv(cl.col_v + j), rk.child_pub_w[o + 3 + j]);
                     }
-                    if cl.terms.is_empty() {
-                        let tag = cw_j(
-                            &mut sb,
-                            &mut vals,
-                            &mut jag_const_rec,
-                            F128::new(0, cl.row_pt.1 as u64),
+                    for j in 0..cl.row_pt.1 {
+                        sb.connect(
+                            wv(cl.row_pt.0 + j),
+                            rk.child_pub_w[o + 3 + loc.n_col + j],
                         );
-                        sb.connect(wv(cl.row_scale_v - 1), tag);
-                        // A FRESH claim is live: its zero-claim scale is 1.
-                        sb.connect(wv(cl.row_scale_v), ow);
-                        for j in 0..cl.row_pt.1 {
-                            sb.connect(wv(cl.row_pt.0 + j), rk.jag_row_w[li][j]);
+                    }
+                    sb.connect(wv(cl.val_v), jag[gi].1);
+                    ci = 1;
+                }
+                for &ki in &key_kids[gi] {
+                    let rk = &regions[ki];
+                    for (li, &jw) in rk.jag_w.iter().enumerate() {
+                        let cl = &loc.claims[ci];
+                        sb.connect(wv(cl.val_v), jw);
+                        for j in 0..loc.n_col {
+                            sb.connect(wv(cl.col_v + j), rk.jag_sig_w[j]);
                         }
-                    } else {
-                        let tag = cw_j(
-                            &mut sb,
-                            &mut vals,
-                            &mut jag_const_rec,
-                            F128::new(1, cl.terms.len() as u64),
-                        );
-                        sb.connect(wv(cl.terms[0].0 - 1), tag);
-                        for (tj, &(cv, addr)) in cl.terms.iter().enumerate() {
-                            sb.connect(wv(cv), rk.jag_row_w[li][tj]);
-                            let aw = cw_j(
+                        if cl.terms.is_empty() {
+                            let tag = cw_j(
                                 &mut sb,
                                 &mut vals,
                                 &mut jag_const_rec,
-                                F128::new(addr as u64, 0),
+                                F128::new(0, cl.row_pt.1 as u64),
                             );
-                            sb.connect(wv(cv + 1), aw);
+                            sb.connect(wv(cl.row_scale_v - 1), tag);
+                            // A FRESH claim is live: its scale is 1.
+                            sb.connect(wv(cl.row_scale_v), ow);
+                            for j in 0..cl.row_pt.1 {
+                                sb.connect(wv(cl.row_pt.0 + j), rk.jag_row_w[li][j]);
+                            }
+                        } else {
+                            let tag = cw_j(
+                                &mut sb,
+                                &mut vals,
+                                &mut jag_const_rec,
+                                F128::new(1, cl.terms.len() as u64),
+                            );
+                            sb.connect(wv(cl.terms[0].0 - 1), tag);
+                            for (tj, &(cv, addr)) in cl.terms.iter().enumerate() {
+                                sb.connect(wv(cv), rk.jag_row_w[li][tj]);
+                                let aw = cw_j(
+                                    &mut sb,
+                                    &mut vals,
+                                    &mut jag_const_rec,
+                                    F128::new(addr as u64, 0),
+                                );
+                                sb.connect(wv(cv + 1), aw);
+                            }
                         }
+                        ci += 1;
                     }
-                    ci += 1;
+                }
+                assert_eq!(ci, loc.claims.len(), "every jagged claim connected");
+                let header_v = loc.hdr_v;
+                let hw = cw_j(
+                    &mut sb,
+                    &mut vals,
+                    &mut jag_const_rec,
+                    F128::new(loc.k_row as u64, loc.claims.len() as u64),
+                );
+                sb.connect(wv(header_v), hw);
+            }
+            // THE FOLD KEY IS THE CIRCUIT VERIFIED: each group's absorbed
+            // digest payload connects to the child region's own statement
+            // digest, so a slot cannot fold claims about a circuit this
+            // node did not verify.
+            let pays_n = payload_words(&stream);
+            for j in 0..n_keys {
+                // The sigma slots' payloads follow bind's two; the jagged
+                // slots' follow those.
+                for p in [2 + j, 2 + n_keys + j] {
+                    assert_eq!(pays_n[p].len(), 2, "a group key payload is 32 bytes");
+                    for (b, &kw) in pays_n[p].iter().enumerate() {
+                        sb.connect(ww[kw].expect("key payload wired"), regions[j].cd_w[b]);
+                    }
                 }
             }
-            assert_eq!(ci, loc.claims.len(), "every jagged claim connected");
-            let header_v = loc.hdr_v;
-            let hw = cw_j(
-                &mut sb,
-                &mut vals,
-                &mut jag_const_rec,
-                F128::new(loc.k_row as u64, loc.claims.len() as u64),
-            );
-            sb.connect(wv(header_v), hw);
         }
         let mac_after_fold = sb.rows_in_slot(cs.macs);
 
@@ -20407,12 +20899,57 @@ fn build_node_outer_app(
         // The lows' assert-zero anchor: producers only, no consumer edges.
         vals.push(F128::ZERO);
         let lag_zassert = sb.public_input();
+        // THE PRIOR's uniform surfaces (the spine): claim 0 of every group.
+        // The registry-keyed matrix entries ride in exactly as the lane's
+        // priors do — LOWS to the child's live word, points and value
+        // straight through — and the sigma slots ride the same wiring with
+        // the MATCH-GATE's outputs in place of live and value.
+        let cj = if let Some((uni_off, _, _, sig, _)) = &spine_w {
+            let rk = &regions[spine.as_ref().unwrap().node_child];
+            for (i, loc) in locs.iter().enumerate().take(n_uni) {
+                let cl = &loc.claims[0];
+                let o = uni_off[i];
+                assert_eq!(cl.row_low_n, 1, "an inherited claim's lows are its live word");
+                sb.connect(wv(cl.row_low_v), rk.child_pub_w[o]);
+                sb.connect(wv(cl.col_low_v), rk.child_pub_w[o]);
+                for j in 0..cl.col_pt_n {
+                    sb.connect(wv(cl.col_pt_v + j), rk.child_pub_w[o + 1 + j]);
+                }
+                for j in 0..cl.row_pt_n {
+                    sb.connect(wv(cl.row_pt_v + j), rk.child_pub_w[o + 1 + loc.k_col + j]);
+                }
+                sb.connect(
+                    wv(cl.value_v),
+                    rk.child_pub_w[o + 1 + loc.k_col + loc.k_row],
+                );
+            }
+            for j in 0..n_keys {
+                let loc = &locs[n_uni + j];
+                let cl = &loc.claims[0];
+                let o = spine_w.as_ref().unwrap().1[j];
+                sb.connect(wv(cl.row_low_v), sig[j].0);
+                sb.connect(wv(cl.col_low_v), sig[j].0);
+                for i2 in 0..cl.col_pt_n {
+                    sb.connect(wv(cl.col_pt_v + i2), rk.child_pub_w[o + 3 + i2]);
+                }
+                for i2 in 0..cl.row_pt_n {
+                    sb.connect(
+                        wv(cl.row_pt_v + i2),
+                        rk.child_pub_w[o + 3 + loc.k_col + i2],
+                    );
+                }
+                sb.connect(wv(cl.value_v), sig[j].1);
+            }
+            1
+        } else {
+            0
+        };
         for (k, (tk, rk)) in rts.iter().zip(&regions).enumerate() {
             // The lagrange row lows, IN-CIRCUIT from the child's z_skip wire
             // (native pre-assert first: the fold's absorbed lows ARE the closed
             // form at the located z_skip).
             assert_eq!(
-                &fold_claims[0][k].row.low[..],
+                &fold_claims[0][cj + k].row.low[..],
                 &lagrange_weights_naive(K_SKIP, tk.chals[tk.zskip_ch])[..],
                 "child {k}: the fold's lagrange lows are the closed form"
             );
@@ -20429,66 +20966,68 @@ fn build_node_outer_app(
                 lag_zassert,
             );
             for (j, &lw2) in lows.iter().enumerate() {
-                sb.connect(lw2, wv(locs[0].claims[k].row_low_v + j));
+                sb.connect(lw2, wv(locs[0].claims[cj + k].row_low_v + j));
             }
             // Native pre-asserts (the method-note discipline).
             for t in 0..n_bool {
-                let inner_t = fold_claims[2 * t][k].row.point.len();
+                let inner_t = fold_claims[2 * t][cj + k].row.point.len();
                 assert_eq!(
-                    &fold_claims[2 * t][k].row.point[..],
+                    &fold_claims[2 * t][cj + k].row.point[..],
                     &tk.mat_assert.x_inner_rest[..inner_t],
                     "boolean type {t} row point is x_inner_rest's head"
                 );
                 assert_eq!(
-                    &fold_claims[2 * t][k].col.point[..],
+                    &fold_claims[2 * t][cj + k].col.point[..],
                     &tk.mat_assert.rr[..inner_t],
                     "boolean type {t} col point is rr's head"
                 );
                 assert_eq!(
-                    &fold_claims[2 * t][k].col.low[..],
+                    &fold_claims[2 * t][cj + k].col.low[..],
                     &tk.mat_assert.z_partial[..],
                     "boolean type {t} col low is z_partial"
                 );
-                assert_eq!(fold_claims[2 * t][k].value, tk.mat_assert.evals[t].0);
-                assert_eq!(fold_claims[2 * t + 1][k].value, tk.mat_assert.evals[t].1);
+                assert_eq!(fold_claims[2 * t][cj + k].value, tk.mat_assert.evals[t].0);
+                assert_eq!(fold_claims[2 * t + 1][cj + k].value, tk.mat_assert.evals[t].1);
             }
             for t in 0..n_el {
-                let kappa = fold_claims[2 * n_bool + 2 * t][k].row.point.len();
+                let kappa = fold_claims[2 * n_bool + 2 * t][cj + k].row.point.len();
                 assert_eq!(
-                    &fold_claims[2 * n_bool + 2 * t][k].row.point[..],
+                    &fold_claims[2 * n_bool + 2 * t][cj + k].row.point[..],
                     &tk.el_assert.r_con[..kappa],
                     "element type {t} row point is r_con's head"
                 );
                 assert_eq!(
-                    &fold_claims[2 * n_bool + 2 * t][k].col.point[..],
+                    &fold_claims[2 * n_bool + 2 * t][cj + k].col.point[..],
                     &tk.el_assert.r_col[..kappa],
                     "element type {t} col point is r_col's head"
                 );
-                assert_eq!(fold_claims[2 * n_bool + 2 * t][k].value, tk.el_assert.evals[t].0);
+                assert_eq!(fold_claims[2 * n_bool + 2 * t][cj + k].value, tk.el_assert.evals[t].0);
                 assert_eq!(
-                    fold_claims[2 * n_bool + 2 * t + 1][k].value,
+                    fold_claims[2 * n_bool + 2 * t + 1][cj + k].value,
                     tk.el_assert.evals[t].1
                 );
             }
             let nu_c = tk.sigma_native.nu;
+            let sfi0 = if spine.is_some() { n_uni + k } else { n_uni };
+            let sk0 = if spine.is_some() { cj } else { cj + k };
             assert_eq!(
-                &fold_claims[n_folds - 1][k].row.point[..],
+                &fold_claims[sfi0][sk0].row.point[..],
                 &tk.sigma_native.rho[..nu_c],
                 "sigma row point is the child's rho[..nu]"
             );
             assert_eq!(
-                &fold_claims[n_folds - 1][k].col.point[..],
+                &fold_claims[sfi0][sk0].col.point[..],
                 &tk.sigma_native.rho[nu_c..],
                 "sigma col point is the child's rho[nu..]"
             );
-            assert_eq!(fold_claims[n_folds - 1][k].value, tk.sigma_native.value);
+            assert_eq!(fold_claims[sfi0][sk0].value, tk.sigma_native.value);
 
             // boolean A/B per type: batch-major mlv mapping for the row
             // points, lc rounds REVERSED for the col points, z_partial
             // word-for-word, values to the mat_eval advice wires.
             for t in 0..n_bool {
                 for fi in [2 * t, 2 * t + 1] {
-                    let cl = &locs[fi].claims[k];
+                    let cl = &locs[fi].claims[cj + k];
                     for j in 0..cl.row_pt_n {
                         let m = if j == 0 { 0 } else { tk.n_log_i + j };
                         sb.connect(wv(cl.row_pt_v + j), rk.b_mlv_w[m]);
@@ -20501,25 +21040,25 @@ fn build_node_outer_app(
                         sb.connect(wv(cl.col_low_v + j), rk.b_zpartial_w[j]);
                     }
                 }
-                sb.connect(wv(locs[2 * t].claims[k].value_v), rk.mat_eval_w[t].0);
-                sb.connect(wv(locs[2 * t + 1].claims[k].value_v), rk.mat_eval_w[t].1);
+                sb.connect(wv(locs[2 * t].claims[cj + k].value_v), rk.mat_eval_w[t].0);
+                sb.connect(wv(locs[2 * t + 1].claims[cj + k].value_v), rk.mat_eval_w[t].1);
                 // ONE lagrange-low surface per child (lagrange(z_skip) is
                 // type-independent): every boolean fold's lows connect to
                 // fold 0's, and fold 0's publish below.
                 if t > 0 {
                     for fi in [2 * t, 2 * t + 1] {
-                        for j in 0..locs[0].claims[k].row_low_n {
+                        for j in 0..locs[0].claims[cj + k].row_low_n {
                             sb.connect(
-                                wv(locs[fi].claims[k].row_low_v + j),
-                                wv(locs[0].claims[k].row_low_v + j),
+                                wv(locs[fi].claims[cj + k].row_low_v + j),
+                                wv(locs[0].claims[cj + k].row_low_v + j),
                             );
                         }
                     }
                 } else {
-                    for j in 0..locs[0].claims[k].row_low_n {
+                    for j in 0..locs[0].claims[cj + k].row_low_n {
                         sb.connect(
-                            wv(locs[1].claims[k].row_low_v + j),
-                            wv(locs[0].claims[k].row_low_v + j),
+                            wv(locs[1].claims[cj + k].row_low_v + j),
+                            wv(locs[0].claims[cj + k].row_low_v + j),
                         );
                     }
                 }
@@ -20528,7 +21067,7 @@ fn build_node_outer_app(
             // = the lc rounds REVERSED, values to the per-slot eval advice.
             for t in 0..n_el {
                 for fi in [2 * n_bool + 2 * t, 2 * n_bool + 2 * t + 1] {
-                    let cl = &locs[fi].claims[k];
+                    let cl = &locs[fi].claims[cj + k];
                     sb.connect(wv(cl.row_low_v), ow);
                     sb.connect(wv(cl.col_low_v), ow);
                     for j in 0..cl.row_pt_n {
@@ -20540,16 +21079,20 @@ fn build_node_outer_app(
                     }
                 }
                 sb.connect(
-                    wv(locs[2 * n_bool + 2 * t].claims[k].value_v),
+                    wv(locs[2 * n_bool + 2 * t].claims[cj + k].value_v),
                     rk.el_eval_w[t].0,
                 );
                 sb.connect(
-                    wv(locs[2 * n_bool + 2 * t + 1].claims[k].value_v),
+                    wv(locs[2 * n_bool + 2 * t + 1].claims[cj + k].value_v),
                     rk.el_eval_w[t].1,
                 );
             }
-            // sigma: fully wire-to-wire.
-            let cl = &locs[n_folds - 1].claims[k];
+            // sigma: fully wire-to-wire. Under the spine child k's
+            // assertion rides ITS OWN key slot (one slot per child); a
+            // fresh-only node folds every child under slot 0.
+            let sfi = if spine.is_some() { n_uni + k } else { n_uni };
+            let sk = if spine.is_some() { cj } else { cj + k };
+            let cl = &locs[sfi].claims[sk];
             sb.connect(wv(cl.row_low_v), ow);
             sb.connect(wv(cl.col_low_v), ow);
             for j in 0..cl.row_pt_n {
@@ -20565,13 +21108,87 @@ fn build_node_outer_app(
         // ENVELOPE-registry surface a parent inherits, so under the
         // envelope it rides the reserved ACC_MAIN block at a constant
         // index; off-envelope it publishes inline, as before.
+        // THE SPINE LAYOUT: the registry-keyed matrix entries, then the
+        // sigma SLOTS, then the jagged SLOTS — `N_KEY_SLOTS` of each,
+        // whatever this node's fold actually had, each leading with the
+        // KEY it is about. A fresh-only node has one live slot per family
+        // and publishes the other DEAD (all zeros), which decodes as the
+        // zero claim, so a base node and a steady node are read at the
+        // same offsets by one parent circuit.
+        let key_pay = payload_words(&stream);
+        let key_wires = |p: usize| -> [Wire; 2] {
+            [
+                ww[key_pay[p][0]].expect("key payload wired"),
+                ww[key_pay[p][1]].expect("key payload wired"),
+            ]
+        };
         let mut acc_main_w: Vec<Wire> = Vec::new();
-        for fp in fold_pubs.iter().chain(&jfold_pubs) {
-            acc_main_w.push(fp.live);
-            acc_main_w.extend_from_slice(&fp.rho_col);
-            acc_main_w.extend_from_slice(&fp.rho_row);
-            acc_main_w.push(fp.value);
+        let mut push_entry = |w: &mut Vec<Wire>, key: Option<[Wire; 2]>, fp: Option<&FoldPub>,
+                              k_col: usize, k_row: usize| {
+            if let Some(k) = key {
+                w.extend_from_slice(&k);
+            }
+            match fp {
+                Some(fp) => {
+                    w.push(fp.live);
+                    w.extend_from_slice(&fp.rho_col);
+                    w.extend_from_slice(&fp.rho_row);
+                    w.push(fp.value);
+                }
+                None => w.extend(std::iter::repeat_n(zw, 2 + k_col + k_row)),
+            }
+        };
+        for fp in fold_pubs.iter().take(n_uni) {
+            push_entry(&mut acc_main_w, None, Some(fp), 0, 0);
         }
+        for j in 0..N_KEY_SLOTS {
+            let live = (j < n_keys).then(|| (key_wires(2 + j), &fold_pubs[n_uni + j]));
+            push_entry(
+                &mut acc_main_w,
+                Some(live.map(|(k, _)| k).unwrap_or([zw, zw])),
+                live.map(|(_, fp)| fp),
+                locs[n_uni].k_col,
+                locs[n_uni].k_row,
+            );
+        }
+        for j in 0..N_KEY_SLOTS {
+            let live = (j < n_keys).then(|| (key_wires(2 + n_keys + j), &jfold_pubs[j]));
+            push_entry(
+                &mut acc_main_w,
+                Some(live.map(|(k, _)| k).unwrap_or([zw, zw])),
+                live.map(|(_, fp)| fp),
+                jlocs[0].n_col,
+                jlocs[0].k_row,
+            );
+        }
+        // THE PASSENGER: `out = child's passenger + h · (the orphaned
+        // entry)`, word for word. `h` is live for exactly one node of a
+        // spine (the first steady one over a base), and there the child's
+        // own passenger is empty — so the sum is a SELECT that can never
+        // silently drop a live claim: two live terms garble each other and
+        // the root's discharge rejects, which is the safe direction.
+        let pass_w: Vec<Wire> = match (&spine_w, &env) {
+            (Some((_, sig_off, jag_off, sig, jag)), Some(e)) => {
+                let rk = &regions[spine.as_ref().unwrap().node_child];
+                let pb = env_pass_base(e);
+                let mut out = Vec::with_capacity(sig_ent + jag_ent);
+                for (base, o, h, width) in [
+                    (pb, sig_off[1], sig[1].2, sig_ent),
+                    (pb + sig_ent, jag_off[1], jag[1].2, jag_ent),
+                ] {
+                    for w in 0..width {
+                        out.push(
+                            sb.gate(
+                                cs.macs,
+                                &[rk.child_pub_w[base + w], h, rk.child_pub_w[o + w]],
+                            )[0],
+                        );
+                    }
+                }
+                out
+            }
+            _ => Vec::new(),
+        };
         let fold_pub_base = match &env {
             Some(e) => env_acc_main_base(e),
             None => {
@@ -20859,6 +21476,7 @@ fn build_node_outer_app(
                     &EnvTail {
                         acc_main: &acc_main_w,
                         acc_chain: lane_pub.as_ref().map(|(_, _, _, w, _)| w).unwrap_or(&empty),
+                        pass: &pass_w,
                         app: app_w.as_deref().unwrap_or(&empty),
                     },
                 );
@@ -21001,7 +21619,17 @@ fn build_node_outer_app(
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
         let mut steady_left = steady_reps;
-        let (built2, oproof, ocommit, tapes_ms, trace_ms, asm_ms, prove_ms, verify_ms) =
+        let (
+            built2,
+            oproof,
+            ocommit,
+            block_pub,
+            tapes_ms,
+            trace_ms,
+            asm_ms,
+            prove_ms,
+            verify_ms,
+        ) =
             loop {
         // Tapes are statement work: re-run them each online iteration
         // (results discarded — identical by determinism) so the printed
@@ -21042,14 +21670,74 @@ fn build_node_outer_app(
                 "child {i}'s public block overruns the next region"
             );
         }
-        // The fold checker + the accumulator, reassembled from publics.
-        let rebuilt = check_fold_publics(&built2.public, fold_pub_base, &locs, &alpha_recs);
-        let uniform_len: usize = locs.iter().map(|l| 2 + l.k_col + l.k_row).sum();
-        let jrebuilt =
-            check_jagged_fold_publics(&built2.public, fold_pub_base + uniform_len, &jlocs);
-        assert_eq!(jrebuilt[0], jouts[0], "published jagged entry == located native");
-        let tail_len: usize = uniform_len
-            + jlocs.iter().map(|l| 2 + l.n_col + l.k_row).sum::<usize>();
+        // The fold checker + the accumulator, reassembled from publics —
+        // and THE BLOCK, which is the accumulator plus the dead slots and
+        // the passenger: what a spine parent reads.
+        let (rebuilt, sig_keys, mut p_at) =
+            check_fold_publics(&built2.public, fold_pub_base, &locs, &alpha_recs, n_uni);
+        let mut sigma_slots: Vec<([F128; 2], MatrixClaim)> = sig_keys
+            .iter()
+            .zip(&rebuilt[n_uni..])
+            .map(|(k, c)| (*k, c.clone()))
+            .collect();
+        for _ in n_keys..N_KEY_SLOTS {
+            sigma_slots.push(read_acc_entry(
+                &built2.public,
+                &mut p_at,
+                true,
+                locs[n_uni].k_col,
+                locs[n_uni].k_row,
+            ));
+        }
+        let (jrebuilt, jag_keys, mut p_at) =
+            check_jagged_fold_publics(&built2.public, p_at, &jlocs, true);
+        let mut jagged_slots: Vec<([F128; 2], MatrixClaim)> = jag_keys
+            .iter()
+            .zip(&jrebuilt)
+            .map(|(k, c)| (*k, c.clone()))
+            .collect();
+        for _ in n_keys..N_KEY_SLOTS {
+            jagged_slots.push(read_acc_entry(
+                &built2.public,
+                &mut p_at,
+                true,
+                jlocs[0].n_col,
+                jlocs[0].k_row,
+            ));
+        }
+        for j in 0..n_keys {
+            assert_eq!(
+                jrebuilt[j], jouts[j],
+                "published jagged slot {j} == located native"
+            );
+            assert_eq!(
+                sigma_slots[j].0,
+                digest_f128(&key_digests[j]),
+                "the published sigma key names child {j}'s circuit"
+            );
+            assert_eq!(
+                jagged_slots[j].0,
+                digest_f128(&key_digests[j]),
+                "the published jagged key names child {j}'s layout"
+            );
+        }
+        let tail_len = p_at - fold_pub_base;
+        let passenger: Vec<([F128; 2], MatrixClaim)> = match &env {
+            Some(e) => {
+                let mut q = env_pass_base(e);
+                vec![
+                    read_acc_entry(
+                        &built2.public,
+                        &mut q,
+                        true,
+                        locs[n_uni].k_col,
+                        locs[n_uni].k_row,
+                    ),
+                    read_acc_entry(&built2.public, &mut q, true, jlocs[0].n_col, jlocs[0].k_row),
+                ]
+            }
+            None => Vec::new(),
+        };
         let acc_pub = aggregate::Accumulator {
             registry_digest: registry.digest(),
             per_type: (0..n_bool)
@@ -21063,8 +21751,12 @@ fn build_node_outer_app(
                     )
                 })
                 .collect(),
-            sigma: vec![(lo0.shape.circuit.digest(), rebuilt[n_folds - 1].clone())],
-            jagged: vec![(child_digest, jrebuilt[0].clone())],
+            sigma: (0..n_keys)
+                .map(|j| (key_digests[j], rebuilt[n_uni + j].clone()))
+                .collect(),
+            jagged: (0..n_keys)
+                .map(|j| (key_digests[j], jrebuilt[j].clone()))
+                .collect(),
         };
         assert_eq!(
             acc_pub, acc_v,
@@ -21073,10 +21765,62 @@ fn build_node_outer_app(
         assert!(
             acc_pub.discharge(&mats)
                 && acc_pub.discharge_element(&el_mats)
-                && acc_pub.discharge_sigma(&[&lo0.shape.circuit])
-                && acc_pub.discharge_jagged(&[(child_digest, &child_params_j)]),
+                && acc_pub.discharge_sigma(&key_circuits)
+                && acc_pub.discharge_jagged(&jag_tables),
             "the public-segment accumulator discharges all four groups"
         );
+        // THE PASSENGER, natively: the child's own, unless this node is
+        // the one whose node slot could not fold — then the orphan itself.
+        // The two are never both live in a spine, and the in-circuit form
+        // is their SUM, so this select and that sum agree.
+        if !passenger.is_empty() {
+            let dead = |k_col: usize, k_row: usize| {
+                (
+                    [F128::ZERO; 2],
+                    MatrixClaim {
+                        row: Weight::low_eq(vec![F128::ZERO], vec![F128::ZERO; k_row]),
+                        col: Weight::low_eq(vec![F128::ZERO], vec![F128::ZERO; k_col]),
+                        value: F128::ZERO,
+                    },
+                )
+            };
+            let want: Vec<([F128; 2], MatrixClaim)> = match &spine {
+                None => vec![
+                    dead(locs[n_uni].k_col, locs[n_uni].k_row),
+                    dead(jlocs[0].n_col, jlocs[0].k_row),
+                ],
+                Some(sp) => {
+                    let slot1 = digest_f128(&key_digests[1]);
+                    [&sp.prior.sigma[1], &sp.prior.jagged[1]]
+                        .iter()
+                        .enumerate()
+                        .map(|(t, ent)| {
+                            let carried = sp.prior.passenger[t].clone();
+                            if ent.0 != slot1 && entry_live(&ent.1) {
+                                assert!(
+                                    !entry_live(&carried.1),
+                                    "a spine orphans ONCE: the passenger was already full"
+                                );
+                                (*ent).clone()
+                            } else {
+                                carried
+                            }
+                        })
+                        .collect()
+                }
+            };
+            assert_eq!(
+                passenger, want,
+                "the published passenger is the child's, plus this node's orphan"
+            );
+        }
+        let block_pub = MainBlock {
+            per_type: acc_pub.per_type.clone(),
+            per_element: acc_pub.per_element.clone(),
+            sigma: sigma_slots,
+            jagged: jagged_slots,
+            passenger,
+        };
         // The lagrange-low constants: the one public surface the in-circuit
         // derivation adds — validated against the verifier's own values.
         {
@@ -21123,10 +21867,11 @@ fn build_node_outer_app(
             if let (Some((lpb, _, lar, _, lrec)), Some((lacc_n, llocs, ljlocs, ..))) =
                 (lane_pub.as_ref(), lane_native.as_ref())
             {
-                let lrebuilt = check_fold_publics(&built2.public, *lpb, llocs, lar);
+                let (lrebuilt, _, _) =
+                    check_fold_publics(&built2.public, *lpb, llocs, lar, llocs.len());
                 let lu_len: usize = llocs.iter().map(|l| 2 + l.k_col + l.k_row).sum();
-                let ljrebuilt =
-                    check_jagged_fold_publics(&built2.public, *lpb + lu_len, ljlocs);
+                let (ljrebuilt, _, _) =
+                    check_jagged_fold_publics(&built2.public, *lpb + lu_len, ljlocs, false);
                 let lane_ref = lane.as_ref().expect("lane");
                 let lacc_pub2 = aggregate::Accumulator {
                     registry_digest: lane_ref.registry.digest(),
@@ -21285,15 +22030,18 @@ fn build_node_outer_app(
             steady_left -= 1;
             continue;
         }
-        break (built2, oproof, ocommit, tapes_ms, trace_ms, asm_ms, prove_ms, verify_ms);
+        break (
+            built2, oproof, ocommit, block_pub, tapes_ms, trace_ms, asm_ms, prove_ms,
+            verify_ms,
+        );
         };
         let (b3_slot2, swap_slot2, spread_slot2) = (
             shape2.registry_slot(cs.q.b3),
             shape2.registry_slot(cs.q.swap),
             shape2.registry_slot(cs.q.spread),
         );
-        (
-            LeafOuter {
+        NodeOut {
+            lo: LeafOuter {
                 public: built2.public.clone(),
                 shape: shape2,
                 proof: oproof,
@@ -21306,8 +22054,8 @@ fn build_node_outer_app(
                 swap_slot: swap_slot2,
                 spread_slot: spread_slot2,
             },
-            acc_v,
-            Online {
+            acc: acc_v,
+            online: Online {
                 setup_ms: build_ms,
                 walk_ms: trace_ms,
                 tapes_ms,
@@ -21316,8 +22064,9 @@ fn build_node_outer_app(
                 verify_ms,
             },
             app_base,
-            lane_native.map(|(a, ..)| a),
-        )
+            lane_acc: lane_native.map(|(a, ..)| a),
+            block: block_pub,
+        }
     };
     outer_stats
 }
@@ -21352,8 +22101,8 @@ fn internal_node_over_two_fl_nodes() {
     assert_eq!(fl0.stmt_base, fl1.stmt_base, "one statement offset");
     assert_eq!(fl1.h_start, fl0.h_end, "the FL spans are adjacent");
 
-    let (node, acc, _t, app, _lane) =
-        build_node_outer_app(&[&fl0.lo, &fl1.lo], Some(fl0.stmt_base), None);
+    let out = build_node_outer_app(&[&fl0.lo, &fl1.lo], Some(fl0.stmt_base), None, None);
+    let (node, acc, app) = (out.lo, out.acc, out.app_base);
     let app = app.expect("the internal node carries the app block");
     for j in 0..4 {
         assert_eq!(
@@ -21515,8 +22264,7 @@ fn envelope_counts_dependency_probe() {
     let cp3 = build_chain_proof(cp2.h_end, n_blocks);
     let fl0 = build_fl_node(&cp0, &cp1);
     let fl1 = build_fl_node(&cp2, &cp3);
-    let (node, _acc, _t, _app, _lane) =
-        build_node_outer_app(&[&fl0.lo, &fl1.lo], Some(fl0.stmt_base), None);
+    let node = build_node_outer_app(&[&fl0.lo, &fl1.lo], Some(fl0.stmt_base), None, None).lo;
 
     // The derived quantities, side by side — this is the attribution.
     let describe = |name: &str, lo: &LeafOuter| {
@@ -21635,7 +22383,7 @@ fn internal_node_three_ary() {
     let kids: Vec<&LeafOuter> = fls.iter().map(|f| &f.lo).collect();
     let chain_jp = chain_jagged_params(&cps[0]);
 
-    let (node, acc, t, app, lane_acc) = build_node_outer_app(
+    let out = build_node_outer_app(
         &kids,
         Some(fls[0].stmt_base),
         Some(ChainLane {
@@ -21647,9 +22395,11 @@ fn internal_node_three_ary() {
             priors: &priors,
             claims_base: fls[0].fold_pub_base,
         }),
+        None,
     );
-    let app = app.expect("the app block rode");
-    let lane_acc = lane_acc.expect("the lane rode");
+    let (node, acc, t) = (out.lo, out.acc, out.online);
+    let app = out.app_base.expect("the app block rode");
+    let lane_acc = out.lane_acc.expect("the lane rode");
 
     // The statement spans all six segments, and both accumulators discharge.
     let h_end = native_chain(&h0, 6 * n_blocks);
@@ -21789,7 +22539,7 @@ fn chain_tower_three_levels_one_internal_digest() {
 
     // Level 2: the chain lane's priors are the FL children's chain
     // accumulators, read at the FL's ACC_CHAIN block.
-    let (n0, _a0, _t0, app0, lane0) = build_node_outer_app(
+    let o0 = build_node_outer_app(
         &[&fls[0].lo, &fls[1].lo],
         Some(app_fl),
         Some(ChainLane {
@@ -21801,8 +22551,9 @@ fn chain_tower_three_levels_one_internal_digest() {
             priors: &[&fls[0].acc, &fls[1].acc],
             claims_base: acc_base,
         }),
+        None,
     );
-    let (n1, _a1, _t1, app1, lane1) = build_node_outer_app(
+    let o1 = build_node_outer_app(
         &[&fls[2].lo, &fls[3].lo],
         Some(app_fl),
         Some(ChainLane {
@@ -21814,21 +22565,30 @@ fn chain_tower_three_levels_one_internal_digest() {
             priors: &[&fls[2].acc, &fls[3].acc],
             claims_base: acc_base,
         }),
+        None,
     );
-    let app0 = app0.expect("level-2 app block");
-    assert_eq!(app0, app1.expect("level-2 app block"), "one L2 app offset");
+    let (n0, n1) = (&o0.lo, &o1.lo);
+    let app0 = o0.app_base.expect("level-2 app block");
+    assert_eq!(
+        app0,
+        o1.app_base.expect("level-2 app block"),
+        "one L2 app offset"
+    );
     assert_eq!(
         n0.shape.circuit.digest(),
         n1.shape.circuit.digest(),
         "one level-2 circuit digest"
     );
-    let (lane0, lane1) = (lane0.expect("L2 lane"), lane1.expect("L2 lane"));
+    let (lane0, lane1) = (
+        o0.lane_acc.clone().expect("L2 lane"),
+        o1.lane_acc.clone().expect("L2 lane"),
+    );
 
     // THE STEP THAT MATTERS: an internal node over two INTERNAL children,
     // its lane inheriting THEIR lane accumulators — published at the same
     // ACC_CHAIN index the FL children used, which is why one circuit reads
     // both kinds.
-    let (n2, _a2, _t2, app2, lane2) = build_node_outer_app(
+    let o2 = build_node_outer_app(
         &[&n0, &n1],
         Some(app0),
         Some(ChainLane {
@@ -21840,9 +22600,11 @@ fn chain_tower_three_levels_one_internal_digest() {
             priors: &[&lane0, &lane1],
             claims_base: acc_base,
         }),
+        None,
     );
-    let app2 = app2.expect("level-3 app block");
-    let lane2 = lane2.expect("L3 lane");
+    let n2 = &o2.lo;
+    let app2 = o2.app_base.expect("level-3 app block");
+    let lane2 = o2.lane_acc.clone().expect("L3 lane");
     assert!(
         lane2.discharge(&chain_mats) && lane2.discharge_sigma(&[chain_circuit]),
         "the level-3 chain lane discharges against the chain tables — \
@@ -22035,6 +22797,277 @@ fn chain_tower_three_levels_one_internal_digest() {
     );
 }
 
+/// One node's own JAGGED LAYOUT — the table its published claims are
+/// about, keyed by its circuit digest. Heights are a shape constant of
+/// that circuit, which is why the key names the table.
+fn node_jagged_params(lo: &LeafOuter) -> flock_core::pcs::jagged::JaggedParams {
+    let u = outer_union(&lo.shape.registry, lo.shape.counts.clone());
+    flock_core::pcs::jagged::JaggedParams::from_heights(
+        &u.jagged_heights(),
+        u.n_log(),
+        lo.commitment.params.m - flock_core::pcs::LOG_PACKING,
+    )
+}
+
+/// **WALL 3: THE SPINE CONVERGES.** Eight chain segments → four FLs → a
+/// BASE node (two FLs, fresh-only) → node_2 (a fresh FL + the base) →
+/// node_3 (a fresh FL + node_2) — and `D(node_2) == D(node_3)`: ONE steady
+/// shape from level 3 on, at any depth. That is the completeness wall
+/// coming down. What makes it work:
+///
+/// * every node's MAIN fold inherits its node child's published
+///   accumulator as a PRIOR, so nothing is dropped at depth > 2 (the gap
+///   this arc opened against);
+/// * the keyed groups have one SLOT PER CHILD ROLE — the FL slot and the
+///   node slot — so a base node (one live key) and a steady node (two)
+///   publish the SAME layout, dead slots being zeros that decode as the
+///   zero claim;
+/// * the node slot's inherited entry is MATCH-GATED against the key it was
+///   published with. It matches at every steady level but one: node_3's
+///   node slot inherits node_2's, which is keyed by the BASE circuit. That
+///   single orphan is gated to zero in the fold and rides the PASSENGER to
+///   the root, where it discharges against the base's own tables.
+///
+/// The chain LANE rides all three levels unchanged, and the app statement
+/// spans the whole chain: the spine grows by prepending a fresh FL, so the
+/// fresh child is always the earlier segment.
+#[test]
+#[ignore] // Heavy — eight chain proofs and seven outers.
+fn chain_spine_converges() {
+    use flock_core::aggregate;
+
+    let Some(env) = envelope_shape() else {
+        println!(
+            "\nSPINE CONVERGENCE: skipped — the fixed-offset tail blocks the \
+             inheritance reads need\n  exist only under the envelope \
+             (TOWER_PROFILE=slim)\n"
+        );
+        return;
+    };
+    let n_blocks = 256usize;
+    let mut rng = Rng(0xC4A1_5B1E);
+    let h0: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let mut cps = Vec::new();
+    let mut h = h0;
+    for _ in 0..8 {
+        let cp = build_chain_proof(h, n_blocks);
+        h = cp.h_end;
+        cps.push(cp);
+    }
+    let fls: Vec<FlNode> = (0..4).map(|i| build_fl_node(&cps[2 * i], &cps[2 * i + 1])).collect();
+    let app_fl = fls[0].stmt_base;
+    assert_eq!(app_fl, env_app_base(&env), "the FL's app block is the envelope's");
+    for f in &fls {
+        assert_eq!(f.stmt_base, app_fl, "one FL app offset");
+        assert_eq!(
+            f.lo.shape.circuit.digest(),
+            fls[0].lo.shape.circuit.digest(),
+            "one FL circuit digest"
+        );
+    }
+    // The lane's chain-side materials, shared by every level.
+    let chain_registry = &cps[0].inner.built.shape.registry;
+    let blake_r1cs = blake3::build_block_r1cs(cps[0].inner.nu);
+    let blake_lc = blake_r1cs.csc_lincheck_circuit();
+    let chain_mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
+    let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
+    let chain_circuit = &cps[0].inner.built.shape.circuit;
+    let chain_jp = chain_jagged_params(&cps[0]);
+    let acc_base = fls[0].fold_pub_base;
+    assert_eq!(acc_base, env_acc_chain_base(&env), "the FL's ACC_CHAIN block");
+
+    // THE BASE: fresh-only over the LAST two FLs. The spine grows by
+    // prepending, so the base covers the tail of the chain.
+    let base = build_node_outer_app(
+        &[&fls[2].lo, &fls[3].lo],
+        Some(app_fl),
+        Some(ChainLane {
+            registry: chain_registry,
+            mats: &chain_mats,
+            circs: &chain_circs,
+            circuit: chain_circuit,
+            params: &chain_jp,
+            priors: &[&fls[2].acc, &fls[3].acc],
+            claims_base: acc_base,
+        }),
+        None,
+    );
+    let app_n = base.app_base.expect("the base's app block");
+    assert_eq!(app_n, app_fl, "one app offset, FL and node alike");
+    let base_lane = base.lane_acc.clone().expect("the base's lane");
+    assert_eq!(base.block.sigma.len(), N_KEY_SLOTS, "the base publishes both slots");
+    assert!(
+        !entry_live(&base.block.sigma[1].1) && !entry_live(&base.block.jagged[1].1),
+        "a fresh-only node's NODE slot is dead"
+    );
+    assert!(
+        base.block.passenger.iter().all(|(_, c)| !entry_live(c)),
+        "the base carries no passenger"
+    );
+
+    // node_2: a fresh FL + the base. Its node slot's inherited entry is
+    // the base's DEAD one, and its own node-slot output is keyed by the
+    // BASE circuit — the entry that will orphan one level up.
+    let n2 = build_node_outer_app(
+        &[&fls[1].lo, &base.lo],
+        Some(app_fl),
+        Some(ChainLane {
+            registry: chain_registry,
+            mats: &chain_mats,
+            circs: &chain_circs,
+            circuit: chain_circuit,
+            params: &chain_jp,
+            priors: &[&fls[1].acc, &base_lane],
+            claims_base: acc_base,
+        }),
+        Some(SpineIn {
+            node_child: 1,
+            prior: &base.block,
+        }),
+    );
+    let n2_lane = n2.lane_acc.clone().expect("node_2's lane");
+    assert!(
+        n2.block.passenger.iter().all(|(_, c)| !entry_live(c)),
+        "node_2 orphans nothing — the base's node slot was already dead"
+    );
+    assert_eq!(
+        n2.block.sigma[1].0,
+        digest_f128(&base.lo.shape.circuit.digest()),
+        "node_2's node slot is keyed by the BASE circuit"
+    );
+    assert_ne!(
+        base.lo.shape.circuit.digest(),
+        n2.lo.shape.circuit.digest(),
+        "THE transitional mismatch: the base and the steady node are \
+         different shapes, so node_3's node slot cannot fold what node_2 \
+         published there"
+    );
+
+    // node_3: a fresh FL + node_2 — the STEADY node, and the one that
+    // orphans. Its node slot names node_2's circuit, so the entry it
+    // inherits (keyed by the base's) cannot fold and rides the passenger.
+    let n3 = build_node_outer_app(
+        &[&fls[0].lo, &n2.lo],
+        Some(app_fl),
+        Some(ChainLane {
+            registry: chain_registry,
+            mats: &chain_mats,
+            circs: &chain_circs,
+            circuit: chain_circuit,
+            params: &chain_jp,
+            priors: &[&fls[0].acc, &n2_lane],
+            claims_base: acc_base,
+        }),
+        Some(SpineIn {
+            node_child: 1,
+            prior: &n2.block,
+        }),
+    );
+
+    // ---- THE CONVERGENCE ----
+    if n3.lo.shape.circuit.digest() != n2.lo.shape.circuit.digest() {
+        println!("  SPINE DIGEST MISMATCH — per-slot rows (node_2 vs node_3):");
+        for (t, (a, b)) in n2
+            .lo
+            .shape
+            .counts
+            .iter()
+            .zip(&n3.lo.shape.counts)
+            .enumerate()
+        {
+            if a != b {
+                println!("    type {t}: n2 {a} vs n3 {b}");
+            }
+        }
+        println!(
+            "    publics {} vs {} | lanes {:?} vs {:?} | dense_m {} vs {}",
+            n2.lo.public.len(),
+            n3.lo.public.len(),
+            n2.lo.pcs.num_lanes,
+            n3.lo.pcs.num_lanes,
+            n2.lo.pcs.m,
+            n3.lo.pcs.m,
+        );
+        let (w2, w3) = (n2.lo.shape.circuit.wires(), n3.lo.shape.circuit.wires());
+        println!(
+            "    wire classes: {} vs {} ({} differ)",
+            w2.len(),
+            w3.len(),
+            w2.iter().zip(w3).filter(|(a, b)| a != b).count()
+        );
+    }
+    assert_eq!(
+        n3.lo.shape.circuit.digest(),
+        n2.lo.shape.circuit.digest(),
+        "ONE steady spine shape: node_2 == node_3, at any depth"
+    );
+
+    // ---- THE ROOT ----
+    // (1) the steady accumulator: two keyed slots, the FL's and node_2's.
+    assert_eq!(n3.acc.sigma.len(), N_KEY_SLOTS, "the root's sigma slots");
+    assert_eq!(n3.acc.sigma[0].0, fls[0].lo.shape.circuit.digest(), "FL slot key");
+    assert_eq!(n3.acc.sigma[1].0, n2.lo.shape.circuit.digest(), "node slot key");
+    // (2) THE PASSENGER: node_2's node-slot entries, keyed by the BASE
+    // circuit — the only orphan a spine ever makes — against the base's
+    // own tables.
+    let pass = &n3.block.passenger;
+    let base_d = base.lo.shape.circuit.digest();
+    assert_eq!(pass[0].0, digest_f128(&base_d), "the passenger names the base");
+    assert_eq!(pass[1].0, digest_f128(&base_d), "the passenger names the base");
+    assert!(
+        entry_live(&pass[0].1) && entry_live(&pass[1].1),
+        "the orphan boarded"
+    );
+    let base_jp = node_jagged_params(&base.lo);
+    let pass_acc = aggregate::Accumulator {
+        registry_digest: n3.acc.registry_digest,
+        per_type: Vec::new(),
+        per_element: Vec::new(),
+        sigma: vec![(base_d, pass[0].1.clone())],
+        jagged: vec![(base_d, pass[1].1.clone())],
+    };
+    assert!(
+        pass_acc.discharge_sigma(&[&base.lo.shape.circuit]),
+        "the passenger's sigma claim discharges against the BASE circuit's wiring"
+    );
+    assert!(
+        pass_acc.discharge_jagged(&[(base_d, &base_jp)]),
+        "the passenger's jagged claim discharges against the BASE circuit's layout"
+    );
+    // (3) the chain lane: eight leaves' claims in one accumulator.
+    let lane3 = n3.lane_acc.clone().expect("the root's lane");
+    assert!(
+        lane3.discharge(&chain_mats) && lane3.discharge_sigma(&[chain_circuit]),
+        "the root chain lane discharges against the chain tables"
+    );
+    // (4) the statement: the span is the whole chain.
+    let h_end = native_chain(&h0, 8 * n_blocks);
+    for j in 0..4 {
+        assert_eq!(
+            n3.lo.public[app_fl + j],
+            pack4(h0[4 * j..4 * j + 4].try_into().unwrap()),
+            "root h_start"
+        );
+        assert_eq!(
+            n3.lo.public[app_fl + 4 + j],
+            pack4(h_end[4 * j..4 * j + 4].try_into().unwrap()),
+            "root h_end == H^N(h_start)"
+        );
+    }
+    println!(
+        "\nTHE SPINE CONVERGES (8 chains -> 4 FL -> base -> node_2 -> node_3)\n  \
+         span H^{}(h_start) | D(node_2) == D(node_3) | 4 shapes total\n  \
+         ONE steady accumulator (sigma+jagged x 2 slots) + a 2-entry passenger\n  \
+         + the chain lane, all discharged at the root\n  \
+         steady outer: nu {} | mu {} | publics {} | proof {:.1} KiB\n",
+        8 * n_blocks,
+        n3.lo.shape.circuit.cells().nu(),
+        n3.lo.shape.circuit.cells().mu(),
+        n3.lo.public.len(),
+        bincode::serialize(&n3.lo.proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
+    );
+}
+
 /// **Task 6: THE CHAIN TOWER, END TO END, WITH THE LANE.** Four chain
 /// segments → two first-level nodes → one internal node; the chain-level
 /// accumulators ride the internal node as a PRIORS-ONLY LANE (their
@@ -22079,10 +23112,10 @@ fn chain_tower_e2e_with_lane() {
         priors: &[&fl0.acc, &fl1.acc],
         claims_base: fl0.fold_pub_base,
     };
-    let (node, acc, _t, app, lane_acc) =
-        build_node_outer_app(&[&fl0.lo, &fl1.lo], Some(fl0.stmt_base), Some(lane));
-    let app = app.expect("the app block rode");
-    let lane_acc = lane_acc.expect("the lane rode");
+    let out = build_node_outer_app(&[&fl0.lo, &fl1.lo], Some(fl0.stmt_base), Some(lane), None);
+    let (node, acc) = (out.lo, out.acc);
+    let app = out.app_base.expect("the app block rode");
+    let lane_acc = out.lane_acc.expect("the lane rode");
 
     // ---- THE ROOT ----
     // (1) The statement: the whole span, out of the internal node's publics.
@@ -22387,11 +23420,11 @@ fn chain_tower_m32_headline() {
         claims_base: fl0.fold_pub_base,
     };
     let t_in = std::time::Instant::now();
-    let (node, acc, nt, app, lane_acc) =
-        build_node_outer_app(&[&fl0.lo, &fl1.lo], Some(fl0.stmt_base), Some(lane));
+    let out = build_node_outer_app(&[&fl0.lo, &fl1.lo], Some(fl0.stmt_base), Some(lane), None);
+    let (node, acc, nt) = (out.lo, out.acc, out.online);
     let _internal_ms = t_in.elapsed().as_secs_f64() * 1e3;
-    let app = app.expect("app block");
-    let lane_acc = lane_acc.expect("lane");
+    let app = out.app_base.expect("app block");
+    let lane_acc = out.lane_acc.expect("lane");
 
     // The root.
     let t_root = std::time::Instant::now();
@@ -22550,8 +23583,9 @@ fn tower_online_bench() {
                     priors: &[&fl0.acc, &fl1.acc],
                     claims_base: fl0.fold_pub_base,
                 }),
+                None,
             )
-            .2
+            .online
         })
         .collect();
 

@@ -404,52 +404,14 @@ pub type SigmaKey<'a> = (
     Vec<&'a crate::circuit::SigmaAssertion>,
 );
 
-/// Pinned claim capacities per fold family — the CLASS-INTERFACE
-/// normalization (wall 3). A fold's transcript shape is its claim count,
-/// so a count that depends on how many real claims arrived (2 fresh at a
-/// boundary node, 2 fresh + 1 inherited at a steady one) makes every
-/// tree level a distinct circuit and the accumulator's key set grow
-/// without bound. With capacities pinned, every group pads its claim
-/// list to the family's constant with the ZERO-WEIGHT claim — weights
-/// identically zero, value zero: canonically TRUE for every table, no
-/// table access, and transcript-visible like any claim — so the fold
-/// region is one shape at every level. `None` = no padding (the
-/// historical transcripts, byte-identical).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FoldCaps {
-    /// Claims per boolean/element fold (each type's A and B alike).
-    pub matrix: usize,
-    /// Claims per sigma key slot.
-    pub sigma: usize,
-    /// Claims per jagged key slot.
-    pub jagged: usize,
-}
-
-/// The zero-weight filler for `Weight`-shaped claims, at the arities of
-/// the group it pads: `low = [0]` (zero vars) with a zero eq-point, so
-/// the weight is identically zero and the claimed value 0 is true about
-/// EVERY table.
-fn zero_matrix_claim(row_vars: usize, col_vars: usize) -> MatrixClaim {
-    MatrixClaim {
-        row: matrix_fold::Weight::low_eq(vec![F128::ZERO], vec![F128::ZERO; row_vars]),
-        col: matrix_fold::Weight::low_eq(vec![F128::ZERO], vec![F128::ZERO; col_vars]),
-        value: F128::ZERO,
-    }
-}
-
-/// Pad a gathered claim list to the family capacity with zero-weight
-/// fillers matching the group's arities. A group that OVERFLOWS its
-/// capacity is a shape bug, not data — fail loudly.
-fn pad_matrix_claims(claims: &mut Vec<MatrixClaim>, cap: usize) -> Result<(), AggregateError> {
-    if claims.len() > cap {
-        return Err(AggregateError::Malformed);
-    }
-    let (rv, cv) = (claims[0].row.n_vars(), claims[0].col.n_vars());
-    while claims.len() < cap {
-        claims.push(zero_matrix_claim(rv, cv));
-    }
-    Ok(())
-}
+// THE ZERO CLAIM lives in the PUBLISHED BLOCK, not here (wall 3, the
+// spine): an accumulator entry carries its own LIVE word as both weights'
+// length-1 low, so a slot a node had no fold for is published as zeros and
+// decodes as a claim with weights identically zero and value zero — true
+// about every table, no table access, transcript-visible like any claim.
+// That is what pins a fold group's claim COUNT without any capacity
+// parameter here; an earlier `FoldCaps` sketch that padded claim lists
+// inside this module was superseded by it and removed.
 
 const DOMAIN_SIGMA_GROUP: &[u8] = b"flock-aggregate-sigma-v1";
 
