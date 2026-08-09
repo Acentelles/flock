@@ -12526,7 +12526,7 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         &bool_asserts,
         &el_mats,
         &el_asserts,
-        Some((&cp0.inner.built.shape.circuit, &sigmas)),
+        &[(&cp0.inner.built.shape.circuit, sigmas.iter().collect())],
         &jagged_p,
         &[],
         &mut chp,
@@ -12537,7 +12537,7 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         registry,
         &bool_asserts,
         &el_asserts,
-        Some((&cp0.inner.built.shape.circuit, &sigmas)),
+        &[(&cp0.inner.built.shape.circuit, sigmas.iter().collect())],
         &jagged_v,
         &[],
         &agg,
@@ -12548,7 +12548,7 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
     assert!(acc_v.per_element.is_empty(), "no element group accumulated");
     assert!(acc_v.discharge(&mats), "the boolean group discharges");
     assert!(
-        acc_v.discharge_sigma(&cp0.inner.built.shape.circuit),
+        acc_v.discharge_sigma(&[&cp0.inner.built.shape.circuit]),
         "the sigma group discharges against the ONE chain circuit"
     );
     assert_eq!(acc_v.jagged.len(), 1, "one jagged key: the chain layout");
@@ -12568,7 +12568,7 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
     let fold_proofs: Vec<&FoldProof> = vec![
         &agg.folds[0].0,
         &agg.folds[0].1,
-        agg.sigma_fold.as_ref().expect("the sigma fold rides along"),
+        &agg.sigma_folds[0],
     ];
     assert_eq!(fold_claims[0][0].row.low.len(), 64, "fresh lagrange low");
     assert_eq!(fold_claims[0][0].col.low.len(), 64, "fresh z_partial low");
@@ -12584,7 +12584,13 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         Op::ObserveBytes(32),
         Op::ObserveBytes(1),
     ];
-    want.extend(fold_region_ops(&fold_claims));
+    let n_uni = fold_claims.len() - 1;
+    want.extend(fold_region_ops(&fold_claims[..n_uni]));
+    // The sigma group binds per key now (wall 3): its label + digest
+    // precede the fold, exactly as the jagged groups bind.
+    want.push(Op::Label(b"flock-aggregate-sigma-v1".to_vec()));
+    want.push(Op::ObserveBytes(32));
+    want.extend(fold_region_ops(&fold_claims[n_uni..]));
     // The jagged group rides the SAME tape after the uniform folds.
     let jagged_keys: Vec<([u8; 32], Vec<flock_core::matrix_fold::JaggedClaim>)> = vec![(
         chain_digest,
@@ -12604,14 +12610,14 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         vals_rec,
         chals,
         rec.payloads(),
-        2,
+        3, // bind's two + the sigma key's digest payload
         vcur,
         ccur,
     );
     let outs = replay_fold_endpoints(&locs, vals_rec, chals);
     assert_eq!(outs[0], acc_v.per_type[0].0, "boolean A accumulator");
     assert_eq!(outs[1], acc_v.per_type[0].1, "boolean B accumulator");
-    let (sig_digest, sig_claim) = acc_v.sigma.as_ref().expect("sigma accumulated");
+    let (sig_digest, sig_claim) = acc_v.sigma.first().expect("sigma accumulated");
     assert_eq!(outs[2], *sig_claim, "sigma accumulator");
     assert_eq!(
         *sig_digest,
@@ -13100,10 +13106,10 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
             registry_digest: registry.digest(),
             per_type: vec![(rebuilt[0].clone(), rebuilt[1].clone())],
             per_element: Vec::new(),
-            sigma: Some((
+            sigma: vec![(
                 cp0.inner.built.shape.circuit.digest(),
                 rebuilt[2].clone(),
-            )),
+            )],
             jagged: vec![(chain_digest, jrebuilt[0].clone())],
         };
         assert_eq!(
@@ -13112,7 +13118,7 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         );
         assert!(
             acc_pub.discharge(&mats)
-                && acc_pub.discharge_sigma(&cp0.inner.built.shape.circuit)
+                && acc_pub.discharge_sigma(&[&cp0.inner.built.shape.circuit])
                 && acc_pub.discharge_jagged(&[(chain_digest, &chain_params_j)]),
             "the public-segment accumulator discharges all three groups"
         );
@@ -18394,7 +18400,7 @@ fn mvp11_merge_fold_region() {
             &ba,
             &el_mats,
             &ea,
-            Some((&built0.shape.circuit, &sg)),
+            &[(&built0.shape.circuit, sg.iter().collect())],
             &[],
             &[],
             &mut ch,
@@ -18405,7 +18411,7 @@ fn mvp11_merge_fold_region() {
             registry,
             &ba,
             &ea,
-            Some((&built0.shape.circuit, &sg)),
+            &[(&built0.shape.circuit, sg.iter().collect())],
             &[],
             &[],
             &lp,
@@ -18428,7 +18434,7 @@ fn mvp11_merge_fold_region() {
         &bool_asserts,
         &el_mats,
         &el_asserts,
-        Some((&built0.shape.circuit, &sigmas)),
+        &[(&built0.shape.circuit, sigmas.iter().collect())],
         &[],
         &priors,
         &mut chp,
@@ -18440,7 +18446,7 @@ fn mvp11_merge_fold_region() {
         registry,
         &bool_asserts,
         &el_asserts,
-        Some((&built0.shape.circuit, &sigmas)),
+        &[(&built0.shape.circuit, sigmas.iter().collect())],
         &[],
         &priors,
         &agg,
@@ -18454,7 +18460,7 @@ fn mvp11_merge_fold_region() {
         "the element group discharges"
     );
     assert!(
-        acc_v.discharge_sigma(&built0.shape.circuit),
+        acc_v.discharge_sigma(&[&built0.shape.circuit]),
         "the sigma group discharges"
     );
 
@@ -18466,8 +18472,8 @@ fn mvp11_merge_fold_region() {
     // verifier gathers.
     let bc: Vec<_> = bool_asserts.iter().map(|a| a.claims(registry)).collect();
     let ec: Vec<_> = el_asserts.iter().map(|(u, a)| a.claims(u)).collect();
-    let sig_a = acc_a.sigma.as_ref().expect("prior A carries sigma");
-    let sig_b = acc_b.sigma.as_ref().expect("prior B carries sigma");
+    let sig_a = acc_a.sigma.first().expect("prior A carries sigma");
+    let sig_b = acc_b.sigma.first().expect("prior B carries sigma");
     let fold_claims: Vec<Vec<MatrixClaim>> = vec![
         vec![
             acc_a.per_type[0].0.clone(),
@@ -18505,7 +18511,7 @@ fn mvp11_merge_fold_region() {
         &agg.folds[0].1,
         &agg.el_folds[0].0,
         &agg.el_folds[0].1,
-        agg.sigma_fold.as_ref().expect("the sigma fold rides along"),
+        &agg.sigma_folds[0],
     ];
     // The fresh boolean weights carry the length-64 lows; the INHERITED
     // claims are accumulator outputs — pure eq, low [1] — so a boolean
@@ -18539,7 +18545,13 @@ fn mvp11_merge_fold_region() {
         Op::ObserveBytes(32),
         Op::ObserveBytes(1),
     ];
-    want.extend(fold_region_ops(&fold_claims));
+    let n_uni = fold_claims.len() - 1;
+    want.extend(fold_region_ops(&fold_claims[..n_uni]));
+    // The sigma group binds per key now (wall 3): its label + digest
+    // precede the fold, exactly as the jagged groups bind.
+    want.push(Op::Label(b"flock-aggregate-sigma-v1".to_vec()));
+    want.push(Op::ObserveBytes(32));
+    want.extend(fold_region_ops(&fold_claims[n_uni..]));
     assert_eq!(ops, want.as_slice(), "the merge tape is the expected shape");
     assert_eq!(rec.payloads()[0], registry.digest(), "bind: registry digest");
     assert_eq!(
@@ -18564,7 +18576,7 @@ fn mvp11_merge_fold_region() {
     assert_eq!(outs[1], acc_v.per_type[0].1, "boolean B accumulator");
     assert_eq!(outs[2], acc_v.per_element[0].0, "element A accumulator");
     assert_eq!(outs[3], acc_v.per_element[0].1, "element B accumulator");
-    let (sig_digest, sig_claim) = acc_v.sigma.as_ref().expect("sigma accumulated");
+    let (sig_digest, sig_claim) = acc_v.sigma.first().expect("sigma accumulated");
     assert_eq!(outs[4], *sig_claim, "sigma accumulator");
     assert_eq!(*sig_digest, built0.shape.circuit.digest(), "sigma key");
 
@@ -18936,7 +18948,7 @@ fn mvp11_merge_fold_region() {
             registry_digest: registry.digest(),
             per_type: vec![(rebuilt[0].clone(), rebuilt[1].clone())],
             per_element: vec![(rebuilt[2].clone(), rebuilt[3].clone())],
-            sigma: Some((built0.shape.circuit.digest(), rebuilt[4].clone())),
+            sigma: vec![(built0.shape.circuit.digest(), rebuilt[4].clone())],
             jagged: Vec::new(),
         };
         assert_eq!(
@@ -18946,7 +18958,7 @@ fn mvp11_merge_fold_region() {
         assert!(
             acc_pub.discharge(&mats)
                 && acc_pub.discharge_element(&el_mats)
-                && acc_pub.discharge_sigma(&built0.shape.circuit),
+                && acc_pub.discharge_sigma(&[&built0.shape.circuit]),
             "the public-segment accumulator discharges all three groups"
         );
         // The value-binding publics past the fold blocks: per child, the
@@ -19270,7 +19282,7 @@ fn mvp11_swap_children_fold_scale() {
         &bool_asserts,
         &el_mats,
         &el_asserts,
-        Some((&lo.shape.circuit, &sigmas)),
+        &[(&lo.shape.circuit, sigmas.iter().collect())],
         &[],
         &[],
         &mut chp,
@@ -19282,7 +19294,7 @@ fn mvp11_swap_children_fold_scale() {
         registry,
         &bool_asserts,
         &el_asserts,
-        Some((&lo.shape.circuit, &sigmas)),
+        &[(&lo.shape.circuit, sigmas.iter().collect())],
         &[],
         &[],
         &agg,
@@ -19296,7 +19308,7 @@ fn mvp11_swap_children_fold_scale() {
         "the element group discharges"
     );
     assert!(
-        acc_v.discharge_sigma(&lo.shape.circuit),
+        acc_v.discharge_sigma(&[&lo.shape.circuit]),
         "the sigma group discharges"
     );
 
@@ -19323,7 +19335,7 @@ fn mvp11_swap_children_fold_scale() {
         fold_proofs.push(&agg.el_folds[t].0);
         fold_proofs.push(&agg.el_folds[t].1);
     }
-    fold_proofs.push(agg.sigma_fold.as_ref().expect("the sigma fold rides along"));
+    fold_proofs.push(&agg.sigma_folds[0]);
     let n_folds = fold_claims.len();
     let total_rounds: usize = fold_claims
         .iter()
@@ -19340,7 +19352,13 @@ fn mvp11_swap_children_fold_scale() {
         Op::ObserveBytes(32),
         Op::ObserveBytes(1),
     ];
-    want.extend(fold_region_ops(&fold_claims));
+    let n_uni = fold_claims.len() - 1;
+    want.extend(fold_region_ops(&fold_claims[..n_uni]));
+    // The sigma group binds per key now (wall 3): its label + digest
+    // precede the fold, exactly as the jagged groups bind.
+    want.push(Op::Label(b"flock-aggregate-sigma-v1".to_vec()));
+    want.push(Op::ObserveBytes(32));
+    want.extend(fold_region_ops(&fold_claims[n_uni..]));
     assert_eq!(ops, want.as_slice(), "the scale tape is the expected shape");
     assert_eq!(rec.payloads()[0], registry.digest(), "bind: registry digest");
     assert_eq!(rec.payloads()[1], vec![0u8], "bind: prior count 0");
@@ -19364,7 +19382,7 @@ fn mvp11_swap_children_fold_scale() {
             "element type {t} B"
         );
     }
-    let (sig_digest, sig_claim) = acc_v.sigma.as_ref().expect("sigma accumulated");
+    let (sig_digest, sig_claim) = acc_v.sigma.first().expect("sigma accumulated");
     assert_eq!(outs[n_folds - 1], *sig_claim, "sigma accumulator");
     assert_eq!(*sig_digest, lo.shape.circuit.digest(), "sigma key");
 
@@ -19485,7 +19503,7 @@ fn mvp11_swap_children_fold_scale() {
                     )
                 })
                 .collect(),
-            sigma: Some((lo.shape.circuit.digest(), rebuilt[n_folds - 1].clone())),
+            sigma: vec![(lo.shape.circuit.digest(), rebuilt[n_folds - 1].clone())],
             jagged: Vec::new(),
         };
         assert_eq!(
@@ -19495,7 +19513,7 @@ fn mvp11_swap_children_fold_scale() {
         assert!(
             acc_pub.discharge(&mats)
                 && acc_pub.discharge_element(&el_mats)
-                && acc_pub.discharge_sigma(&lo.shape.circuit),
+                && acc_pub.discharge_sigma(&[&lo.shape.circuit]),
             "the public-segment accumulator discharges all three groups"
         );
 
@@ -19799,7 +19817,7 @@ fn build_node_outer_app(
         &bool_asserts,
         &el_mats,
         &el_asserts,
-        Some((&lo0.shape.circuit, &sigmas)),
+        &[(&lo0.shape.circuit, sigmas.iter().collect())],
         &jagged_p,
         &[],
         &mut chp,
@@ -19811,7 +19829,7 @@ fn build_node_outer_app(
         registry,
         &bool_asserts,
         &el_asserts,
-        Some((&lo0.shape.circuit, &sigmas)),
+        &[(&lo0.shape.circuit, sigmas.iter().collect())],
         &jagged_v,
         &[],
         &agg,
@@ -19825,7 +19843,7 @@ fn build_node_outer_app(
         "the element group discharges"
     );
     assert!(
-        acc_v.discharge_sigma(&lo0.shape.circuit),
+        acc_v.discharge_sigma(&[&lo0.shape.circuit]),
         "the sigma group discharges"
     );
     assert_eq!(acc_v.jagged.len(), 1, "one jagged key: the child layout");
@@ -19864,7 +19882,7 @@ fn build_node_outer_app(
         fold_proofs.push(&agg.el_folds[t].0);
         fold_proofs.push(&agg.el_folds[t].1);
     }
-    fold_proofs.push(agg.sigma_fold.as_ref().expect("the sigma fold rides along"));
+    fold_proofs.push(&agg.sigma_folds[0]);
     let n_folds = fold_claims.len();
 
     // ---- the fold tape, pinned through the width-driven helpers ----
@@ -19877,7 +19895,13 @@ fn build_node_outer_app(
         Op::ObserveBytes(32),
         Op::ObserveBytes(1),
     ];
-    want.extend(fold_region_ops(&fold_claims));
+    let n_uni = fold_claims.len() - 1;
+    want.extend(fold_region_ops(&fold_claims[..n_uni]));
+    // The sigma group binds per key now (wall 3): its label + digest
+    // precede the fold, exactly as the jagged groups bind.
+    want.push(Op::Label(b"flock-aggregate-sigma-v1".to_vec()));
+    want.push(Op::ObserveBytes(32));
+    want.extend(fold_region_ops(&fold_claims[n_uni..]));
     // The jagged group rides the SAME tape after the uniform folds.
     let jagged_keys: Vec<([u8; 32], Vec<flock_core::matrix_fold::JaggedClaim>)> = vec![(
         child_digest,
@@ -19897,7 +19921,7 @@ fn build_node_outer_app(
         vals_rec,
         chals,
         rec.payloads(),
-        2,
+        3, // bind's two + the sigma key's digest payload
         vcur,
         ccur,
     );
@@ -19918,7 +19942,7 @@ fn build_node_outer_app(
             "element type {t} B"
         );
     }
-    let (sig_digest, sig_claim) = acc_v.sigma.as_ref().expect("sigma accumulated");
+    let (sig_digest, sig_claim) = acc_v.sigma.first().expect("sigma accumulated");
     assert_eq!(outs[n_folds - 1], *sig_claim, "sigma accumulator");
     assert_eq!(*sig_digest, lo0.shape.circuit.digest(), "sigma key");
     let jouts = replay_jagged_fold_endpoints(&jlocs, vals_rec, chals);
@@ -19948,7 +19972,7 @@ fn build_node_outer_app(
             &[],
             &[],
             &el_asserts_l,
-            Some((ln.circuit, &[])),
+            &[(ln.circuit, Vec::new())],
             &ljagged_p,
             ln.priors,
             &mut chp,
@@ -19960,7 +19984,7 @@ fn build_node_outer_app(
             ln.registry,
             &[],
             &el_asserts_l,
-            Some((ln.circuit, &[])),
+            &[(ln.circuit, Vec::new())],
             &ljagged_v,
             ln.priors,
             &lagg,
@@ -19978,13 +20002,13 @@ fn build_node_outer_app(
             ln.priors.iter().map(|p| p.per_type[0].1.clone()).collect(),
             ln.priors
                 .iter()
-                .map(|p| p.sigma.as_ref().expect("lane prior sigma").1.clone())
+                .map(|p| p.sigma.first().expect("lane prior sigma").1.clone())
                 .collect(),
         ];
         let lproofs: Vec<&FoldProof> = vec![
             &lagg.folds[0].0,
             &lagg.folds[0].1,
-            lagg.sigma_fold.as_ref().expect("lane sigma fold"),
+            &lagg.sigma_folds[0],
         ];
         let lops: Vec<Op> = lrec.shape().ops().to_vec();
         let lvals: Vec<F128> = lrec.values().to_vec();
@@ -19994,7 +20018,11 @@ fn build_node_outer_app(
             Op::ObserveBytes(32),
             Op::ObserveBytes(1),
         ];
-        want.extend(fold_region_ops(&lclaims));
+        let n_uni_l = lclaims.len() - 1;
+        want.extend(fold_region_ops(&lclaims[..n_uni_l]));
+        want.push(Op::Label(b"flock-aggregate-sigma-v1".to_vec()));
+        want.push(Op::ObserveBytes(32));
+        want.extend(fold_region_ops(&lclaims[n_uni_l..]));
         // The inherited jagged claims (the priors' chain-keyed entries,
         // plain eq by construction) ride the same tape after.
         let ljagged_keys: Vec<([u8; 32], Vec<flock_core::matrix_fold::JaggedClaim>)> = vec![(
@@ -20025,14 +20053,14 @@ fn build_node_outer_app(
             &lvals,
             &lchals,
             lrec.payloads(),
-            2,
+            3, // bind's two + the sigma key's digest payload
             lvcur,
             lccur,
         );
         let louts = replay_fold_endpoints(&llocs, &lvals, &lchals);
         assert_eq!(louts[0], lacc_v.per_type[0].0, "lane boolean A");
         assert_eq!(louts[1], lacc_v.per_type[0].1, "lane boolean B");
-        let (ld, lc2) = lacc_v.sigma.as_ref().expect("lane sigma out");
+        let (ld, lc2) = lacc_v.sigma.first().expect("lane sigma out");
         assert_eq!(louts[2], *lc2, "lane sigma accumulator");
         assert_eq!(*ld, ln.circuit.digest(), "lane sigma keys by the chain circuit");
         let ljouts = replay_jagged_fold_endpoints(&ljlocs, &lvals, &lchals);
@@ -20957,7 +20985,7 @@ fn build_node_outer_app(
                     )
                 })
                 .collect(),
-            sigma: Some((lo0.shape.circuit.digest(), rebuilt[n_folds - 1].clone())),
+            sigma: vec![(lo0.shape.circuit.digest(), rebuilt[n_folds - 1].clone())],
             jagged: vec![(child_digest, jrebuilt[0].clone())],
         };
         assert_eq!(
@@ -20967,7 +20995,7 @@ fn build_node_outer_app(
         assert!(
             acc_pub.discharge(&mats)
                 && acc_pub.discharge_element(&el_mats)
-                && acc_pub.discharge_sigma(&lo0.shape.circuit)
+                && acc_pub.discharge_sigma(&[&lo0.shape.circuit])
                 && acc_pub.discharge_jagged(&[(child_digest, &child_params_j)]),
             "the public-segment accumulator discharges all four groups"
         );
@@ -21026,7 +21054,7 @@ fn build_node_outer_app(
                     registry_digest: lane_ref.registry.digest(),
                     per_type: vec![(lrebuilt[0].clone(), lrebuilt[1].clone())],
                     per_element: Vec::new(),
-                    sigma: Some((lane_ref.circuit.digest(), lrebuilt[2].clone())),
+                    sigma: vec![(lane_ref.circuit.digest(), lrebuilt[2].clone())],
                     jagged: vec![(lane_ref.circuit.digest(), ljrebuilt[0].clone())],
                 };
                 assert_eq!(
@@ -21269,7 +21297,7 @@ fn internal_node_over_two_fl_nodes() {
     // Per-level accumulators at the dev shape: the internal node's own acc
     // keys sigma by the FL circuit digest; the chain-level accs live in the
     // FlNodes. (Task 6 threads them as priors.)
-    let (sig_digest, _) = acc.sigma.as_ref().expect("the node accumulated sigma");
+    let (sig_digest, _) = acc.sigma.first().expect("the node accumulated sigma");
     assert_eq!(
         *sig_digest,
         fl0.lo.shape.circuit.digest(),
@@ -21560,7 +21588,7 @@ fn internal_node_three_ary() {
         );
     }
     assert!(
-        lane_acc.discharge(&chain_mats) && lane_acc.discharge_sigma(&cps[0].inner.built.shape.circuit),
+        lane_acc.discharge(&chain_mats) && lane_acc.discharge_sigma(&[&cps[0].inner.built.shape.circuit]),
         "the 3-prior chain lane discharges"
     );
     // The accumulator holds claims about the CHILDREN's tables, so it
@@ -21584,7 +21612,7 @@ fn internal_node_three_ary() {
     let mats: Vec<_> = mats_ord.iter().map(|&(_, m)| m).collect();
     assert!(
         acc.discharge(&mats) && acc.discharge_element(&el_mats)
-            && acc.discharge_sigma(&fls[0].lo.shape.circuit),
+            && acc.discharge_sigma(&[&fls[0].lo.shape.circuit]),
         "the 3-ary node's own accumulator discharges all three groups"
     );
     println!(
@@ -21738,7 +21766,7 @@ fn chain_tower_three_levels_one_internal_digest() {
     let app2 = app2.expect("level-3 app block");
     let lane2 = lane2.expect("L3 lane");
     assert!(
-        lane2.discharge(&chain_mats) && lane2.discharge_sigma(chain_circuit),
+        lane2.discharge(&chain_mats) && lane2.discharge_sigma(&[chain_circuit]),
         "the level-3 chain lane discharges against the chain tables — \
          eight leaves' claims in one accumulator"
     );
@@ -21996,7 +22024,7 @@ fn chain_tower_e2e_with_lane() {
     assert!(lane_acc.discharge(&chain_mats), "chain-lane boolean discharges");
     assert!(lane_acc.per_element.is_empty(), "the chain lane has no element group");
     assert!(
-        lane_acc.discharge_sigma(&cp0.inner.built.shape.circuit),
+        lane_acc.discharge_sigma(&[&cp0.inner.built.shape.circuit]),
         "chain-lane sigma discharges against the chain circuit"
     );
     // (3) The FL lane discharges: boolean vs the FL b3/swap/spread mats
@@ -22032,7 +22060,7 @@ fn chain_tower_e2e_with_lane() {
         "FL-lane element discharges"
     );
     assert!(
-        acc.discharge_sigma(&fl0.lo.shape.circuit),
+        acc.discharge_sigma(&[&fl0.lo.shape.circuit]),
         "FL-lane sigma discharges"
     );
 
@@ -22087,7 +22115,7 @@ fn chain_tower_e2e_with_lane() {
             &[],
             &[],
             &el_asserts_l,
-            Some((&cp0.inner.built.shape.circuit, &[])),
+            &[(&cp0.inner.built.shape.circuit, Vec::new())],
             &jagged_pt,
             &[&fl0.acc, &fl1.acc],
             &mut chp,
@@ -22099,7 +22127,7 @@ fn chain_tower_e2e_with_lane() {
                 chain_registry,
                 &[],
                 &el_asserts_l,
-                Some((&cp0.inner.built.shape.circuit, &[])),
+                &[(&cp0.inner.built.shape.circuit, Vec::new())],
                 &jagged_vt,
                 &[&bad_acc, &fl1.acc],
                 &lagg,
@@ -22296,7 +22324,7 @@ fn chain_tower_m32_headline() {
             "root statement: h_end == H^(4·{n_blocks})(h_start)"
         );
     }
-    assert!(lane_acc.discharge(&chain_mats) && lane_acc.discharge_sigma(&cp0.inner.built.shape.circuit));
+    assert!(lane_acc.discharge(&chain_mats) && lane_acc.discharge_sigma(&[&cp0.inner.built.shape.circuit]));
     let mut mats_ord = vec![
         (fl0.lo.b3_slot, (&fl0.lo.b3_r1cs.a_0, &fl0.lo.b3_r1cs.b_0)),
         (fl0.lo.swap_slot, (&fl0.lo.swap_r1cs.a_0, &fl0.lo.swap_r1cs.b_0)),
@@ -22321,7 +22349,7 @@ fn chain_tower_m32_headline() {
     assert!(
         acc.discharge(&fl_mats)
             && acc.discharge_element(&fl_el_mats)
-            && acc.discharge_sigma(&fl0.lo.shape.circuit)
+            && acc.discharge_sigma(&[&fl0.lo.shape.circuit])
     );
     let root_ms = t_root.elapsed().as_secs_f64() * 1e3;
 
@@ -22667,7 +22695,7 @@ fn mvp12_recursion_tower() {
             "leaf-level acc {k}: element"
         );
         assert!(
-            acc.discharge_sigma(&l0.shape.circuit),
+            acc.discharge_sigma(&[&l0.shape.circuit]),
             "leaf-level acc {k}: sigma (keyed by the LEAF circuit)"
         );
     }
@@ -22696,7 +22724,7 @@ fn mvp12_recursion_tower() {
         "node-level acc: element"
     );
     assert!(
-        acc2.discharge_sigma(&n0.shape.circuit),
+        acc2.discharge_sigma(&[&n0.shape.circuit]),
         "node-level acc: sigma (keyed by the NODE circuit)"
     );
 
@@ -22845,7 +22873,7 @@ fn envelope_registry_diff() {
             &bool_asserts,
             &el_mats,
             &el_asserts,
-            None,
+            &[],
             &[],
             &[],
             &mut chp,
@@ -22856,7 +22884,7 @@ fn envelope_registry_diff() {
             registry,
             &bool_asserts,
             &el_asserts,
-            None,
+            &[],
             &[],
             &[],
             &agg_l,
@@ -22881,7 +22909,7 @@ fn envelope_registry_diff() {
             &n_bool,
             &el_mats,
             &n_el,
-            Some((&n0.shape.circuit, &n_sigmas)),
+            &[(&n0.shape.circuit, n_sigmas.iter().collect())],
             &[],
             &[&acc_leaf],
             &mut chp2,
@@ -22892,7 +22920,7 @@ fn envelope_registry_diff() {
             registry,
             &n_bool,
             &n_el,
-            Some((&n0.shape.circuit, &n_sigmas)),
+            &[(&n0.shape.circuit, n_sigmas.iter().collect())],
             &[],
             &[&acc_leaf],
             &agg_n,
@@ -22906,7 +22934,7 @@ fn envelope_registry_diff() {
             "cross-level element discharge"
         );
         assert!(
-            acc_node.discharge_sigma(&n0.shape.circuit),
+            acc_node.discharge_sigma(&[&n0.shape.circuit]),
             "the node's own sigma discharges"
         );
         // Negative control: a tampered prior digest is rejected by
@@ -22922,7 +22950,7 @@ fn envelope_registry_diff() {
                 &n_bool,
                 &el_mats,
                 &n_el,
-                Some((&n0.shape.circuit, &n_sigmas)),
+                &[(&n0.shape.circuit, n_sigmas.iter().collect())],
                 &[],
                 &[&bad],
                 &mut chb,

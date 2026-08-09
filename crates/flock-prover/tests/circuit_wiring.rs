@@ -1519,7 +1519,7 @@ fn a_merge_node_folds_two_circuit_proofs() {
         &assertions,
         &[],
         &[],
-        Some((circuit0, &sigmas)),
+        &[(circuit0, sigmas.iter().collect())],
         &jagged_p,
         &[],
         &mut chp,
@@ -1530,7 +1530,7 @@ fn a_merge_node_folds_two_circuit_proofs() {
         &registry,
         &assertions,
         &[],
-        Some((circuit0, &sigmas)),
+        &[(circuit0, sigmas.iter().collect())],
         &jagged_v,
         &[],
         &agg,
@@ -1545,11 +1545,11 @@ fn a_merge_node_folds_two_circuit_proofs() {
     // root's single O(2^mu) evaluation, once for the whole tree.
     assert!(acc.discharge(&mats), "the merged accumulator must be true");
     assert!(
-        acc.sigma.is_some(),
+        !acc.sigma.is_empty(),
         "the sigma group carries the folded claim"
     );
     assert!(
-        acc.discharge_sigma(circuit0),
+        acc.discharge_sigma(&[circuit0]),
         "the folded sigma claim discharges at the root"
     );
     // The jagged group: both children's W-claims folded to ONE claim on the
@@ -1578,11 +1578,11 @@ fn a_merge_node_folds_two_circuit_proofs() {
     // A tampered folded sigma value must fail the root discharge.
     {
         let mut bad_acc = acc.clone();
-        if let Some((_, claim)) = bad_acc.sigma.as_mut() {
+        if let Some((_, claim)) = bad_acc.sigma.first_mut() {
             claim.value += F128::ONE;
         }
         assert!(
-            !bad_acc.discharge_sigma(circuit0),
+            !bad_acc.discharge_sigma(&[circuit0]),
             "a tampered sigma claim fails the root discharge"
         );
     }
@@ -1625,7 +1625,7 @@ fn a_merge_node_folds_two_circuit_proofs() {
             &assertions[i..i + 1],
             &[],
             &[],
-            Some((circuit0, &sigmas[i..i + 1])),
+            &[(circuit0, sigmas[i..i + 1].iter().collect())],
             &[],
             &[],
             &mut chp,
@@ -1636,7 +1636,7 @@ fn a_merge_node_folds_two_circuit_proofs() {
             &registry,
             &assertions[i..i + 1],
             &[],
-            Some((circuit0, &sigmas[i..i + 1])),
+            &[(circuit0, sigmas[i..i + 1].iter().collect())],
             &[],
             &[],
             &agg1,
@@ -1653,7 +1653,7 @@ fn a_merge_node_folds_two_circuit_proofs() {
         &[],
         &[],
         &[],
-        Some((circuit0, &[])),
+        &[(circuit0, Vec::new())],
         &[],
         &[&acc_a, &acc_b],
         &mut chp,
@@ -1664,7 +1664,7 @@ fn a_merge_node_folds_two_circuit_proofs() {
         &registry,
         &[],
         &[],
-        Some((circuit0, &[])),
+        &[(circuit0, Vec::new())],
         &[],
         &[&acc_a, &acc_b],
         &agg2,
@@ -1674,7 +1674,7 @@ fn a_merge_node_folds_two_circuit_proofs() {
     assert_eq!(acc2_p, acc2_v, "prover and verifier accumulators must agree");
     assert!(acc2_v.discharge(&mats), "the inherited-only merge discharges");
     assert!(
-        acc2_v.discharge_sigma(circuit0),
+        acc2_v.discharge_sigma(&[circuit0]),
         "both children's sigma claims fold through the merge to one root discharge"
     );
 }

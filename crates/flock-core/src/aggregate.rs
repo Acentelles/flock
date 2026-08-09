@@ -83,18 +83,19 @@ pub struct Accumulator {
     /// about different polynomials, which is meaningless — so the groups
     /// never mix, exactly as `A₀` and `B₀` never mix within a group.
     pub per_element: Vec<(MatrixClaim, MatrixClaim)>,
-    /// The wiring-sigma group (sigma v2 route B, wiring doc §sigma): ONE
-    /// folded claim on the circuit's sigma table, keyed by the circuit
-    /// digest — normalisation gives internal nodes one shape, hence one
-    /// key. `None` until a circuit proof's wiring assertion joins.
-    pub sigma: Option<([u8; 32], MatrixClaim)>,
+    /// The wiring-sigma group (sigma v2 route B, wiring doc §sigma):
+    /// per circuit SHAPE, one folded claim on that circuit's sigma table,
+    /// keyed by the circuit digest. PER-DIGEST entries (wall 3): a tree
+    /// mixes circuit shapes — a spine node's main fold inherits an
+    /// FL-keyed prior entry beside its internal-keyed fresh claims — and
+    /// each key's claims fold only among themselves because they name
+    /// different permutations. Empty until a circuit proof's wiring
+    /// assertion joins.
+    pub sigma: Vec<([u8; 32], MatrixClaim)>,
     /// The jagged-layout group (the count win): per child SHAPE, one folded
     /// claim on that shape's layout table `J`, keyed by the digest whose
-    /// circuit determines the heights. PER-DIGEST entries, unlike sigma —
-    /// a tree mixes child shapes (chain, first-level, internal), and each
-    /// key's claims fold only among themselves because they name different
-    /// height vectors. Empty until a deferred verify's jagged assertion
-    /// joins.
+    /// circuit determines the heights — the same per-digest discipline as
+    /// sigma. Empty until a deferred verify's jagged assertion joins.
     pub jagged: Vec<([u8; 32], MatrixClaim)>,
 }
 
@@ -172,20 +173,23 @@ impl Accumulator {
         })
     }
 
-    /// The sigma group's root discharge: the folded claim against the real
-    /// sigma table — `O(2^mu)`, once. `true` when no sigma was accumulated.
-    pub fn discharge_sigma(&self, circuit: &crate::circuit::Circuit) -> bool {
-        match &self.sigma {
-            None => true,
-            Some((digest, claim)) => {
-                *digest == circuit.digest()
-                    && crate::matrix_fold::bilinear(
+    /// The sigma group's root discharge: each entry's folded claim against
+    /// its own circuit's sigma table — `O(2^mu)` per key, once. The caller
+    /// supplies the circuits; an entry whose digest is missing FAILS,
+    /// never skips. `true` when nothing sigma was accumulated.
+    pub fn discharge_sigma(&self, circuits: &[&crate::circuit::Circuit]) -> bool {
+        self.sigma.iter().all(|(d, claim)| {
+            circuits
+                .iter()
+                .find(|c| c.digest() == *d)
+                .is_some_and(|c| {
+                    crate::matrix_fold::bilinear(
                         &claim.row,
                         &claim.col,
-                        &crate::circuit::SigmaAssertion::matrix(circuit),
+                        &crate::circuit::SigmaAssertion::matrix(c),
                     ) == claim.value
-            }
-        }
+                })
+        })
     }
 }
 
@@ -196,8 +200,9 @@ pub struct AggregateProof {
     pub folds: Vec<(FoldProof, FoldProof)>,
     /// Per element type, likewise.
     pub el_folds: Vec<(FoldProof, FoldProof)>,
-    /// The sigma group's fold, when a circuit's wiring assertion joins.
-    pub sigma_fold: Option<FoldProof>,
+    /// The sigma group's folds, one per digest key, in the caller's key
+    /// order.
+    pub sigma_folds: Vec<FoldProof>,
     /// The jagged group's folds, one per digest key, in the caller's key
     /// order.
     pub jagged_folds: Vec<FoldProof>,
@@ -285,7 +290,7 @@ pub fn prove_aggregate<Ch: Challenger>(
     ch: &mut Ch,
 ) -> Result<(AggregateProof, Accumulator), AggregateError> {
     prove_aggregate_classes(
-        registry, mats, circuits, assertions, &[], &[], None, &[], priors, ch,
+        registry, mats, circuits, assertions, &[], &[], &[], &[], priors, ch,
     )
 }
 
@@ -301,7 +306,7 @@ pub fn prove_aggregate_classes<Ch: Challenger>(
     assertions: &[MatrixAssertion],
     el_mats: &[ElementMatrices<'_>],
     el_assertions: &[(&crate::union::UnionInstance<'_>, ElementAssertion)],
-    sigma: Option<(&crate::circuit::Circuit, &[crate::circuit::SigmaAssertion])>,
+    sigma: &[SigmaKey<'_>],
     jagged: &[JaggedKeyProve<'_>],
     priors: &[&Accumulator],
     ch: &mut Ch,
@@ -370,14 +375,14 @@ pub fn prove_aggregate_classes<Ch: Challenger>(
         per_element.push((out_a, out_b));
     }
 
-    let (sigma_fold, sigma_out) = fold_sigma_prove(sigma, priors, ch)?;
+    let (sigma_folds, sigma_out) = fold_sigma_prove(sigma, priors, ch)?;
     let (jagged_folds, jagged_out) = fold_jagged_prove(jagged, priors, ch)?;
 
     Ok((
         AggregateProof {
             folds,
             el_folds,
-            sigma_fold,
+            sigma_folds,
             jagged_folds,
         },
         Accumulator {
@@ -390,33 +395,33 @@ pub fn prove_aggregate_classes<Ch: Challenger>(
     ))
 }
 
-/// The sigma group's fold (route B): the priors' folded claims first (in
-/// order), then one claim per assertion — the same fixed order every group
-/// uses. All claims must name the SAME circuit (digest-keyed;
-/// normalisation).
-fn fold_sigma_prove<Ch: Challenger>(
-    sigma: Option<(&crate::circuit::Circuit, &[crate::circuit::SigmaAssertion])>,
+/// One sigma key: the circuit whose digest keys the group and whose table
+/// the fold's prover reads, plus the fresh assertions about it. The
+/// verifier's replay reads NO table — it needs the circuit only for the
+/// digest and the shape checks.
+pub type SigmaKey<'a> = (
+    &'a crate::circuit::Circuit,
+    Vec<&'a crate::circuit::SigmaAssertion>,
+);
+
+const DOMAIN_SIGMA_GROUP: &[u8] = b"flock-aggregate-sigma-v1";
+
+/// The claims of one sigma key, in the fixed order every group uses: the
+/// priors' entries with this digest first (in prior order), then one claim
+/// per assertion (shape-checked against the circuit).
+fn gather_sigma(
+    circuit: &crate::circuit::Circuit,
+    asserts: &[&crate::circuit::SigmaAssertion],
     priors: &[&Accumulator],
-    ch: &mut Ch,
-) -> Result<(Option<FoldProof>, Option<([u8; 32], MatrixClaim)>), AggregateError> {
-    let prior_sigmas: Vec<&([u8; 32], MatrixClaim)> =
-        priors.iter().filter_map(|p| p.sigma.as_ref()).collect();
-    let Some((circuit, asserts)) = sigma else {
-        // No circuit supplied: a prior sigma claim cannot be carried
-        // (it would leave the accumulator silently unfolded).
-        return if prior_sigmas.is_empty() {
-            Ok((None, None))
-        } else {
-            Err(AggregateError::RegistryMismatch)
-        };
-    };
+) -> Result<Vec<MatrixClaim>, AggregateError> {
     let digest = circuit.digest();
     let mut claims: Vec<MatrixClaim> = Vec::new();
-    for (d, c) in prior_sigmas {
-        if *d != digest {
-            return Err(AggregateError::RegistryMismatch);
+    for p in priors {
+        for (d, c) in &p.sigma {
+            if *d == digest {
+                claims.push(c.clone());
+            }
         }
-        claims.push(c.clone());
     }
     for a in asserts {
         if a.nu != circuit.cells().nu() || a.rho.len() != circuit.cells().mu() {
@@ -425,16 +430,82 @@ fn fold_sigma_prove<Ch: Challenger>(
         claims.push(a.claim());
     }
     if claims.is_empty() {
-        return Ok((None, None));
+        return Err(AggregateError::Malformed);
     }
-    let m = crate::circuit::SigmaAssertion::matrix(circuit);
-    let n_cols = matrix_fold::FoldMatrix::n_cols(&m);
-    let combs: Vec<Vec<F128>> = claims
-        .iter()
-        .map(|q| matrix_fold::FoldMatrix::col_marginal(&m, &q.row.materialize(), n_cols))
-        .collect();
-    let (pf, out) = matrix_fold::prove_fold(&m, &combs, &claims, ch);
-    Ok((Some(pf), Some((digest, out))))
+    Ok(claims)
+}
+
+/// The sigma group's fold, prover side (route B, PER-DIGEST — wall 3): for
+/// each key in the caller's order, [priors' entries with that digest |
+/// fresh assertions] fold to one claim, the group bound by its label +
+/// digest exactly as the jagged group binds. The caller's key list must
+/// cover every prior entry's digest — a prior claim that cannot fold must
+/// fail loudly, the rule every keyed group shares.
+fn fold_sigma_prove<Ch: Challenger>(
+    sigma: &[SigmaKey<'_>],
+    priors: &[&Accumulator],
+    ch: &mut Ch,
+) -> Result<(Vec<FoldProof>, Vec<([u8; 32], MatrixClaim)>), AggregateError> {
+    for p in priors {
+        for (d, _) in &p.sigma {
+            if !sigma.iter().any(|(c, _)| c.digest() == *d) {
+                return Err(AggregateError::RegistryMismatch);
+            }
+        }
+    }
+    let mut folds = Vec::with_capacity(sigma.len());
+    let mut out = Vec::with_capacity(sigma.len());
+    for (i, (circuit, asserts)) in sigma.iter().enumerate() {
+        let digest = circuit.digest();
+        if sigma[..i].iter().any(|(c, _)| c.digest() == digest) {
+            return Err(AggregateError::Malformed);
+        }
+        let claims = gather_sigma(circuit, asserts, priors)?;
+        ch.observe_label(DOMAIN_SIGMA_GROUP);
+        ch.observe_bytes(&digest);
+        let m = crate::circuit::SigmaAssertion::matrix(circuit);
+        let n_cols = matrix_fold::FoldMatrix::n_cols(&m);
+        let combs: Vec<Vec<F128>> = claims
+            .iter()
+            .map(|q| matrix_fold::FoldMatrix::col_marginal(&m, &q.row.materialize(), n_cols))
+            .collect();
+        let (pf, folded) = matrix_fold::prove_fold(&m, &combs, &claims, ch);
+        folds.push(pf);
+        out.push((digest, folded));
+    }
+    Ok((folds, out))
+}
+
+/// The sigma group's replay — no table read anywhere.
+fn fold_sigma_verify<Ch: Challenger>(
+    sigma: &[SigmaKey<'_>],
+    priors: &[&Accumulator],
+    proofs: &[FoldProof],
+    ch: &mut Ch,
+) -> Result<Vec<([u8; 32], MatrixClaim)>, AggregateError> {
+    for p in priors {
+        for (d, _) in &p.sigma {
+            if !sigma.iter().any(|(c, _)| c.digest() == *d) {
+                return Err(AggregateError::RegistryMismatch);
+            }
+        }
+    }
+    if proofs.len() != sigma.len() {
+        return Err(AggregateError::Malformed);
+    }
+    let mut out = Vec::with_capacity(sigma.len());
+    for (i, ((circuit, asserts), pf)) in sigma.iter().zip(proofs).enumerate() {
+        let digest = circuit.digest();
+        if sigma[..i].iter().any(|(c, _)| c.digest() == digest) {
+            return Err(AggregateError::Malformed);
+        }
+        let claims = gather_sigma(circuit, asserts, priors)?;
+        ch.observe_label(DOMAIN_SIGMA_GROUP);
+        ch.observe_bytes(&digest);
+        let folded = matrix_fold::verify_fold(&claims, pf, ch).map_err(AggregateError::Fold)?;
+        out.push((digest, folded));
+    }
+    Ok(out)
 }
 
 /// The jagged group's per-key key list entry, prover side: the digest, the
@@ -632,7 +703,7 @@ pub fn verify_aggregate<Ch: Challenger>(
     proof: &AggregateProof,
     ch: &mut Ch,
 ) -> Result<Accumulator, AggregateError> {
-    verify_aggregate_classes(registry, assertions, &[], None, &[], priors, proof, ch)
+    verify_aggregate_classes(registry, assertions, &[], &[], &[], priors, proof, ch)
 }
 
 /// [`verify_aggregate`] over BOTH classes. Reads no matrix of either kind.
@@ -641,7 +712,7 @@ pub fn verify_aggregate_classes<Ch: Challenger>(
     registry: &Registry,
     assertions: &[MatrixAssertion],
     el_assertions: &[(&crate::union::UnionInstance<'_>, ElementAssertion)],
-    sigma: Option<(&crate::circuit::Circuit, &[crate::circuit::SigmaAssertion])>,
+    sigma: &[SigmaKey<'_>],
     jagged: &[JaggedKeyVerify<'_>],
     priors: &[&Accumulator],
     proof: &AggregateProof,
@@ -691,39 +762,7 @@ pub fn verify_aggregate_classes<Ch: Challenger>(
     // The sigma group, replayed the same way — the verifier reads no
     // sigma table here; the fold verifies against the CLAIMS alone, and
     // the table is only touched at the root discharge.
-    let sigma_out = {
-        let prior_sigmas: Vec<&([u8; 32], MatrixClaim)> =
-            priors.iter().filter_map(|p| p.sigma.as_ref()).collect();
-        match (sigma, &proof.sigma_fold) {
-            (None, None) if prior_sigmas.is_empty() => None,
-            (Some((circuit, asserts)), pf_opt) => {
-                let digest = circuit.digest();
-                let mut claims: Vec<MatrixClaim> = Vec::new();
-                for (d, c) in prior_sigmas {
-                    if *d != digest {
-                        return Err(AggregateError::RegistryMismatch);
-                    }
-                    claims.push(c.clone());
-                }
-                for a in asserts {
-                    if a.nu != circuit.cells().nu() || a.rho.len() != circuit.cells().mu() {
-                        return Err(AggregateError::Malformed);
-                    }
-                    claims.push(a.claim());
-                }
-                match (claims.is_empty(), pf_opt) {
-                    (true, None) => None,
-                    (false, Some(pf)) => {
-                        let out =
-                            matrix_fold::verify_fold(&claims, pf, ch).map_err(AggregateError::Fold)?;
-                        Some((digest, out))
-                    }
-                    _ => return Err(AggregateError::Malformed),
-                }
-            }
-            _ => return Err(AggregateError::Malformed),
-        }
-    };
+    let sigma_out = fold_sigma_verify(sigma, priors, &proof.sigma_folds, ch)?;
 
     let jagged_out = fold_jagged_verify(jagged, priors, &proof.jagged_folds, ch)?;
 
