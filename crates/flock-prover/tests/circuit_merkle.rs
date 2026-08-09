@@ -16452,6 +16452,570 @@ fn mvp11_sigma_fold_tape() {
     );
 }
 
+/// **The jagged group's fold, tape-pinned + replayed in-circuit** — the
+/// count win's merge-node step, [`mvp11_sigma_fold_tape`]'s sibling on the
+/// LAYOUT table. Two children (one digest, hence ONE layout — heights are
+/// shape constants), their deferred verifies' jagged exports folded exactly
+/// as aggregate's jagged group runs it (group label + digest binding, then
+/// the structure-aware fold), the tape pinned op-for-op with its
+/// VARIABLE-WIDTH claim blocks (Eq rows absorb a point slice, Combo rows
+/// absorb (coeff, address) pairs), both endpoints closing from located
+/// words, and the WHOLE replay in-circuit with ZERO new gate types: λ/μ/ρ
+/// chain squeezes, MergedRoundGate rounds, PrefixGate eq products for the
+/// col/row weight evals — a Combo weight's address bits are REGISTRY
+/// constants, so they bake as ow/zw sides exactly like the gather
+/// addresses always did (count-INDEPENDENT), while its coefficients are
+/// absorbed stream wires. The entry (ρ_col, ρ_row, value) publishes,
+/// rebuilds from the public segment alone, and discharges against the
+/// children's own layout. The absorbed address words are pinned to their
+/// constants natively here; the merge outer's assembly additionally
+/// connects them to constant wires — the same later-step note the sigma
+/// tape recorded for its claim words.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn mvp11_jagged_fold_tape() {
+    use flock_core::challenger::Challenger as _;
+    use flock_core::matrix_fold::{
+        self, JaggedClaim, JaggedRowWeight, JaggedTable, MatrixClaim, Weight,
+    };
+    use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
+
+    const M11J_DOMAIN: &[u8] = b"flock-mvp11-jagged-fold-v0";
+
+    let in0 = mvp11_child(0x4D31_0011);
+    let in1 = mvp11_child(0x4D31_0012);
+    let digest = in0.built.shape.circuit.digest();
+    assert_eq!(
+        digest,
+        in1.built.shape.circuit.digest(),
+        "the children share one circuit"
+    );
+
+    // ONE layout: the heights are shape constants of the shared circuit.
+    let union0 = UnionInstance::new(&in0.built.shape.registry, in0.built.shape.counts.clone());
+    let params = flock_core::pcs::jagged::JaggedParams::from_heights(
+        &union0.jagged_heights(),
+        union0.n_log(),
+        in0.commitment.params.m - flock_core::pcs::LOG_PACKING,
+    );
+    {
+        let union1 =
+            UnionInstance::new(&in1.built.shape.registry, in1.built.shape.counts.clone());
+        let p1 = flock_core::pcs::jagged::JaggedParams::from_heights(
+            &union1.jagged_heights(),
+            union1.n_log(),
+            in1.commitment.params.m - flock_core::pcs::LOG_PACKING,
+        );
+        assert_eq!(
+            params.col_prefix_sums, p1.col_prefix_sums,
+            "same digest, same heights"
+        );
+        assert_eq!((params.k, params.m), (p1.k, p1.m), "same layout shape");
+    }
+    let table = JaggedTable::from_params(&params);
+    let (k_row, n_col) = (table.k, table.n_col_vars());
+
+    // The fresh claims in aggregate's gather order: child 0's assertion
+    // flattened, then child 1's. Both exports discharge before folding.
+    let asserts = [&in0.work.jagged, &in1.work.jagged];
+    assert!(
+        asserts.iter().all(|x| x.check(&params)),
+        "the exports discharge against the layout"
+    );
+    let claims: Vec<JaggedClaim> = asserts
+        .iter()
+        .flat_map(|x| x.claims().into_iter().cloned())
+        .collect();
+    let n_cl = claims.len();
+
+    // The fold, exactly as aggregate's jagged group runs it: the group's
+    // label + digest binding, then the structure-aware fold; verify under
+    // a recording twin.
+    let mut chp = FsChallenger::with_chained_blake3(M11J_DOMAIN);
+    chp.observe_label(b"flock-aggregate-jagged-v0");
+    chp.observe_bytes(&digest);
+    let (fp, out_p) = matrix_fold::prove_fold_jagged(&table, &claims, &mut chp);
+    let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(M11J_DOMAIN));
+    rec.observe_label(b"flock-aggregate-jagged-v0");
+    rec.observe_bytes(&digest);
+    let out_v = matrix_fold::verify_fold_jagged(table.k, &claims, &fp, &mut rec)
+        .expect("the honest jagged fold verifies");
+    assert_eq!(out_p, out_v, "prover and verifier agree on the entry");
+    assert!(
+        matrix_fold::discharge_jagged(&out_v, &table),
+        "the folded entry discharges at the root"
+    );
+
+    // ---- the tape structure, pinned op-for-op ----
+    let t_shape = rec.shape();
+    let ops = t_shape.ops();
+    let vals_rec = rec.values();
+    let chals = rec.challenges();
+    let mut want: Vec<Op> = vec![
+        Op::Label(b"flock-aggregate-jagged-v0".to_vec()),
+        Op::ObserveBytes(32),
+        Op::Label(b"flock-jagged-fold-v0".to_vec()),
+        Op::ObserveScalar, // the (k_row, n_claims) shape header
+    ];
+    for c in &claims {
+        match &c.row {
+            JaggedRowWeight::Eq(p) => {
+                want.push(Op::ObserveScalar); // the (0, len) tag
+                want.push(Op::ObserveSlice(p.len()));
+            }
+            JaggedRowWeight::Combo(t) => {
+                want.push(Op::ObserveScalar); // the (1, len) tag
+                for _ in t {
+                    want.extend([Op::ObserveScalar, Op::ObserveScalar]);
+                }
+            }
+        }
+        want.push(Op::ObserveSlice(n_col)); // the col point (σ)
+        want.push(Op::ObserveScalar); // the value
+    }
+    want.extend(std::iter::repeat_n(Op::SqueezeScalar, n_cl)); // λ
+    for _ in 0..n_col {
+        want.extend([Op::ObserveScalar, Op::ObserveScalar, Op::SqueezeScalar]);
+    }
+    want.extend(std::iter::repeat_n(Op::ObserveScalar, n_cl)); // bridge
+    want.extend(std::iter::repeat_n(Op::SqueezeScalar, n_cl)); // μ
+    for _ in 0..k_row {
+        want.extend([Op::ObserveScalar, Op::ObserveScalar, Op::SqueezeScalar]);
+    }
+    want.push(Op::ObserveScalar); // the output value
+    assert_eq!(ops, want.as_slice(), "the jagged fold tape is the expected shape");
+
+    // Value ordinals, per claim (variable-width blocks) — then held
+    // field-for-field, so the replays below consume verified indices.
+    struct JLoc {
+        /// Eq: (point ordinal, len). Combo: unused.
+        row_pt: (usize, usize),
+        /// Combo: (coeff ordinal, address, address-word ordinal) per term.
+        terms: Vec<(usize, u32, usize)>,
+        col_v: usize,
+        val_v: usize,
+    }
+    let mut v_at = 1usize; // past the shape header
+    assert_eq!(
+        vals_rec[0],
+        F128::new(k_row as u64, n_cl as u64),
+        "the shape header word"
+    );
+    let locs: Vec<JLoc> = claims
+        .iter()
+        .map(|c| {
+            let tag_v = v_at;
+            let (row_pt, terms) = match &c.row {
+                JaggedRowWeight::Eq(p) => {
+                    assert_eq!(
+                        vals_rec[tag_v],
+                        F128::new(0, p.len() as u64),
+                        "eq row tag"
+                    );
+                    assert_eq!(
+                        &vals_rec[tag_v + 1..tag_v + 1 + p.len()],
+                        &p[..],
+                        "eq row point on the stream"
+                    );
+                    v_at = tag_v + 1 + p.len();
+                    ((tag_v + 1, p.len()), Vec::new())
+                }
+                JaggedRowWeight::Combo(t) => {
+                    assert_eq!(
+                        vals_rec[tag_v],
+                        F128::new(1, t.len() as u64),
+                        "combo row tag"
+                    );
+                    let mut terms = Vec::with_capacity(t.len());
+                    for (j, &(coeff, addr)) in t.iter().enumerate() {
+                        let cv = tag_v + 1 + 2 * j;
+                        assert_eq!(vals_rec[cv], coeff, "combo coeff on the stream");
+                        assert_eq!(
+                            vals_rec[cv + 1],
+                            F128::new(addr as u64, 0),
+                            "combo ADDRESS word on the stream == the registry constant"
+                        );
+                        terms.push((cv, addr, cv + 1));
+                    }
+                    v_at = tag_v + 1 + 2 * t.len();
+                    ((0, 0), terms)
+                }
+            };
+            let col_v = v_at;
+            assert_eq!(
+                &vals_rec[col_v..col_v + n_col],
+                &c.col[..],
+                "col point (σ) on the stream"
+            );
+            let val_v = col_v + n_col;
+            assert_eq!(vals_rec[val_v], c.value, "claim value on the stream");
+            v_at = val_v + 1;
+            JLoc {
+                row_pt,
+                terms,
+                col_v,
+                val_v,
+            }
+        })
+        .collect();
+    let v_cm = v_at;
+    let v_br = v_cm + 2 * n_col;
+    let v_rm = v_br + n_cl;
+    let v_out = v_rm + 2 * k_row;
+    assert_eq!(vals_rec.len(), v_out + 1, "nothing rides after the output");
+    assert_eq!(
+        chals.len(),
+        2 * n_cl + n_col + k_row,
+        "λs, col rhos, μs, row rhos — all scalar squeezes"
+    );
+    for (j, &(q1, qinf)) in fp.col_rounds.iter().enumerate() {
+        assert_eq!(vals_rec[v_cm + 2 * j], q1, "col round {j} q(1)");
+        assert_eq!(vals_rec[v_cm + 2 * j + 1], qinf, "col round {j} q(inf)");
+    }
+    assert_eq!(&vals_rec[v_br..v_br + n_cl], &fp.bridge[..], "the bridge");
+    for (j, &(q1, qinf)) in fp.row_rounds.iter().enumerate() {
+        assert_eq!(vals_rec[v_rm + 2 * j], q1, "row round {j} q(1)");
+        assert_eq!(vals_rec[v_rm + 2 * j + 1], qinf, "row round {j} q(inf)");
+    }
+    assert_eq!(vals_rec[v_out], fp.value, "the output value on the stream");
+
+    // ---- both endpoints, replayed from the LOCATED words alone ----
+    let replay = |target: F128, base: usize, ch0: usize, n: usize| -> (F128, Vec<F128>) {
+        let mut run = target;
+        let mut rho = Vec::with_capacity(n);
+        for j in 0..n {
+            let (g1, gi) = (vals_rec[base + 2 * j], vals_rec[base + 2 * j + 1]);
+            let r = chals[ch0 + j];
+            let q0 = run + g1;
+            run = gi * r * r + (q0 + g1 + gi) * r + q0;
+            rho.push(r);
+        }
+        (run, rho)
+    };
+    let eq_prod = |pt_base: usize, n: usize, rho: &[F128]| -> F128 {
+        (0..n).fold(F128::ONE, |w, j| {
+            w * (F128::ONE + vals_rec[pt_base + j] + rho[j])
+        })
+    };
+    let bit = |b: bool| if b { F128::ONE } else { F128::ZERO };
+    let target_c = (0..n_cl).fold(F128::ZERO, |acc, k| acc + chals[k] * vals_rec[locs[k].val_v]);
+    let (run_c, rho_col) = replay(target_c, v_cm, n_cl, n_col);
+    let expect_c = (0..n_cl).fold(F128::ZERO, |acc, k| {
+        acc + chals[k] * eq_prod(locs[k].col_v, n_col, &rho_col) * vals_rec[v_br + k]
+    });
+    assert_eq!(run_c, expect_c, "the col endpoint closes from located words");
+
+    let mu0 = n_cl + n_col;
+    let target_r = (0..n_cl).fold(F128::ZERO, |acc, k| {
+        acc + chals[mu0 + k] * vals_rec[v_br + k]
+    });
+    let (run_r, rho_row) = replay(target_r, v_rm, mu0 + n_cl, k_row);
+    let w_mu = (0..n_cl).fold(F128::ZERO, |acc, k| {
+        let rw = match &claims[k].row {
+            JaggedRowWeight::Eq(_) => eq_prod(locs[k].row_pt.0, locs[k].row_pt.1, &rho_row),
+            JaggedRowWeight::Combo(_) => locs[k].terms.iter().fold(F128::ZERO, |a, &(cv, addr, _)| {
+                let e = rho_row.iter().enumerate().fold(F128::ONE, |e, (l, &r)| {
+                    e * (F128::ONE + bit((addr >> l) & 1 == 1) + r)
+                });
+                a + vals_rec[cv] * e
+            }),
+        };
+        acc + chals[mu0 + k] * rw
+    });
+    assert_eq!(
+        run_r,
+        w_mu * vals_rec[v_out],
+        "the row endpoint closes from located words"
+    );
+    assert_eq!(
+        out_v,
+        MatrixClaim {
+            row: Weight::eq(rho_row),
+            col: Weight::eq(rho_col),
+            value: vals_rec[v_out],
+        },
+        "the entry is the located rho pair + the located value"
+    );
+
+    // ---- the in-circuit replay ----
+    let outer_stats = {
+        use flock_prover::prover::UnionElementSlotInput;
+        use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
+
+        let stream = t_shape.stream_words_duplex(M11J_DOMAIN);
+        let bytes = stream.to_bytes(rec.values(), rec.payloads());
+        let mut chain = FsChainSponge::new();
+        let mut at = 0usize;
+        let fin_ops: Vec<_> = t_shape.ops().iter().filter(|o| o.finalizes()).collect();
+        assert_eq!(
+            stream.finalize_after.len(),
+            fin_ops.len(),
+            "finalize alignment"
+        );
+        for (k, &upto) in stream.finalize_after.iter().enumerate() {
+            chain.absorb(&bytes[at * 16..upto * 16]);
+            at = upto;
+            chain.finalize(fin_ops[k].squeezed_bytes());
+        }
+        chain.absorb(&bytes[at * 16..]);
+        let trace = chain.finish();
+
+        let b3_rows = trace.rows.len();
+        let nu2 = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7);
+        let mut sb = ShapeBuilder::new(nu2);
+        let b3s = sb.slot(Blake3Gate { nu: nu2 });
+        let macs = sb.slot(MacGate::new());
+        let mrs = sb.slot(MergedRoundGate::new());
+        let pf_w = k_row.max(n_col).min(8);
+        let pfslot = sb.slot(PrefixGate::new(pf_w));
+
+        let mut vals: Vec<F128> = Vec::new();
+        let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+        vals.extend_from_slice(&iv_w);
+        let iv2 = [sb.public_input(), sb.public_input()];
+        let mut consts: Vec<(F128, Wire)> = Vec::new();
+        let pub_payloads = bytes_payload_mask(ops);
+        let (outs, ww) = emit_fs_chain(
+            &mut sb,
+            b3s,
+            iv2,
+            &trace,
+            &stream,
+            &bytes,
+            &mut vals,
+            &mut consts,
+            &pub_payloads,
+        );
+        let mut vmap: Vec<Option<usize>> = Vec::new();
+        for (wi, w) in stream.words.iter().enumerate() {
+            if let flock_core::transcript_record::StreamWord::Value(vi) = *w {
+                if vmap.len() <= vi {
+                    vmap.resize(vi + 1, None);
+                }
+                vmap[vi] = Some(wi);
+            }
+        }
+        let wv = |vi: usize| -> Wire { ww[vmap[vi].expect("stream word")].expect("wired") };
+        let chw = |fin: usize| -> Wire { outs[trace.squeezes[fin][0]][0] };
+        vals.push(F128::ZERO);
+        let zw = sb.public_input();
+        vals.push(F128::ONE);
+        let ow = sb.public_input();
+        // The transcript tail past the last squeeze — the output value —
+        // has no chain wire; it enters as its own input, bound by the row
+        // endpoint identity, and publishes as the entry's value.
+        vals.push(vals_rec[v_out]);
+        let val_w = sb.input();
+
+        let prefix = |sb: &mut ShapeBuilder, seed: Wire, fs: &[(Wire, Wire)]| -> Wire {
+            let mut s = seed;
+            for chunk in fs.chunks(pf_w) {
+                let mut g_in = vec![s];
+                for (a, _) in chunk {
+                    g_in.push(*a);
+                }
+                g_in.extend(std::iter::repeat_n(zw, pf_w - chunk.len()));
+                for (_, b) in chunk {
+                    g_in.push(*b);
+                }
+                g_in.extend(std::iter::repeat_n(zw, pf_w - chunk.len()));
+                g_in.push(ow);
+                s = sb.gate(pfslot, &g_in)[0];
+            }
+            s
+        };
+
+        // Col phase: target = Σ λ_k·value_k, the rounds, expect =
+        // Σ λ_k·colw_k·bridge_k — every piece a chain wire.
+        let lam_w: Vec<Wire> = (0..n_cl).map(&chw).collect();
+        let mut run_w = zw;
+        for k in 0..n_cl {
+            run_w = sb.gate(macs, &[run_w, lam_w[k], wv(locs[k].val_v)])[0];
+        }
+        let mut rho_col_w: Vec<Wire> = Vec::new();
+        for j in 0..n_col {
+            let r_w = chw(n_cl + j);
+            rho_col_w.push(r_w);
+            run_w = sb.gate(mrs, &[run_w, wv(v_cm + 2 * j), wv(v_cm + 2 * j + 1), r_w])[0];
+        }
+        let mut exp_w = zw;
+        for k in 0..n_cl {
+            let fs: Vec<(Wire, Wire)> = (0..n_col)
+                .map(|j| (wv(locs[k].col_v + j), rho_col_w[j]))
+                .collect();
+            let cw = prefix(&mut sb, ow, &fs);
+            let t = sb.gate(macs, &[zw, cw, wv(v_br + k)])[0];
+            exp_w = sb.gate(macs, &[exp_w, lam_w[k], t])[0];
+        }
+        let delta_col = sb.gate(macs, &[run_w, exp_w, ow])[0];
+
+        // Row phase: target = Σ μ_k·bridge_k, the rounds, and
+        // running == (Σ μ_k·roww_k)·value. An Eq row's eval is a prefix
+        // product over its absorbed point words; a Combo row's is
+        // Σ coeff·eq(addr, ρ_row) with the ADDRESS BITS baked as ow/zw
+        // (registry constants — the gather addresses, count-independent)
+        // and the coefficients as absorbed stream wires.
+        let mu_w: Vec<Wire> = (0..n_cl).map(|k| chw(mu0 + k)).collect();
+        let mut run2_w = zw;
+        for k in 0..n_cl {
+            run2_w = sb.gate(macs, &[run2_w, mu_w[k], wv(v_br + k)])[0];
+        }
+        let mut rho_row_w: Vec<Wire> = Vec::new();
+        for j in 0..k_row {
+            let r_w = chw(mu0 + n_cl + j);
+            rho_row_w.push(r_w);
+            run2_w = sb.gate(mrs, &[run2_w, wv(v_rm + 2 * j), wv(v_rm + 2 * j + 1), r_w])[0];
+        }
+        let mut wmu_w = zw;
+        for k in 0..n_cl {
+            let rw = match &claims[k].row {
+                JaggedRowWeight::Eq(_) => {
+                    let fs: Vec<(Wire, Wire)> = (0..locs[k].row_pt.1)
+                        .map(|j| (wv(locs[k].row_pt.0 + j), rho_row_w[j]))
+                        .collect();
+                    prefix(&mut sb, ow, &fs)
+                }
+                JaggedRowWeight::Combo(_) => {
+                    let mut acc = zw;
+                    for &(cv, addr, _) in &locs[k].terms {
+                        let fs: Vec<(Wire, Wire)> = rho_row_w
+                            .iter()
+                            .enumerate()
+                            .map(|(l, &r)| (r, if (addr >> l) & 1 == 1 { ow } else { zw }))
+                            .collect();
+                        let e = prefix(&mut sb, ow, &fs);
+                        acc = sb.gate(macs, &[acc, wv(cv), e])[0];
+                    }
+                    acc
+                }
+            };
+            wmu_w = sb.gate(macs, &[wmu_w, mu_w[k], rw])[0];
+        }
+        let rhs_w = sb.gate(macs, &[zw, wmu_w, val_w])[0];
+        let delta_row = sb.gate(macs, &[run2_w, rhs_w, ow])[0];
+
+        sb.publish(delta_col);
+        sb.publish(delta_row);
+        for &w in &rho_col_w {
+            sb.publish(w);
+        }
+        for &w in &rho_row_w {
+            sb.publish(w);
+        }
+        sb.publish(val_w);
+
+        let shape2 = sb.finish().expect("the jagged fold circuit builds");
+        let mut built2 = shape2.run(&vals, &[]);
+
+        let tail = built2.public.len() - (2 + n_col + k_row + 1);
+        assert_eq!(built2.public[tail], F128::ZERO, "the col endpoint zero-delta");
+        assert_eq!(
+            built2.public[tail + 1],
+            F128::ZERO,
+            "the row endpoint zero-delta"
+        );
+        let rebuilt = MatrixClaim {
+            row: Weight::eq(
+                built2.public[tail + 2 + n_col..tail + 2 + n_col + k_row].to_vec(),
+            ),
+            col: Weight::eq(built2.public[tail + 2..tail + 2 + n_col].to_vec()),
+            value: built2.public[tail + 2 + n_col + k_row],
+        };
+        assert_eq!(
+            rebuilt, out_v,
+            "the entry, rebuilt from the public segment alone"
+        );
+        assert!(
+            matrix_fold::discharge_jagged(&rebuilt, &table),
+            "and it discharges against the children's own layout"
+        );
+
+        let union2 = UnionInstance::new(&shape2.registry, shape2.counts.clone());
+        let pcs2 = PcsParams {
+            m: union2.dense_m(),
+            log_inv_rate: 1,
+            log_batch_size: pcs_batch(&union2),
+            profile: LigeritoProfile::Fast,
+            num_lanes: union2.commit_lanes(pcs_batch(&union2)),
+            merkle_hash: Default::default(),
+        };
+        let b3_r1cs2 = blake3::build_block_r1cs(nu2);
+        let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
+        let mut el_ord: Vec<(usize, Vec<F128>)> = [macs, mrs, pfslot]
+            .into_iter()
+            .map(|sl| {
+                let z = match std::mem::replace(
+                    &mut built2.witnesses[shape2.registry_slot(sl)],
+                    SlotWitness::DeferredToRows,
+                ) {
+                    SlotWitness::Element(z) => z,
+                    other => panic!("element slot produced {other:?}"),
+                };
+                (shape2.registry_slot(sl), z)
+            })
+            .collect();
+        el_ord.sort_by_key(|(i, _)| *i);
+        let el_inputs: Vec<UnionElementSlotInput> = el_ord
+            .into_iter()
+            .map(|(i, z)| live_element_input(z, shape2.counts[i], nu2))
+            .collect();
+        let mut ch2 = FsChallenger::new(DOMAIN);
+        let (oproof, ocommit, _) = prover::prove_fast_ligerito_union_circuit(
+            &union2,
+            &shape2.circuit,
+            &built2.public,
+            &pcs2,
+            vec![UnionSlotProverInput::new(
+                blake3::generate_witness_batch_major_partial(built2.rows::<Blake3Gate>(b3s), nu2),
+                b3_lc2,
+            )],
+            el_inputs,
+            &mut ch2,
+        );
+        let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![b3_lc2];
+        let mut ch2 = FsChallenger::new(DOMAIN);
+        verifier::verify_ligerito_union_circuit(
+            &union2,
+            &shape2.circuit,
+            &built2.public,
+            &lcs2,
+            &ocommit,
+            &oproof,
+            &pcs2,
+            &mut ch2,
+        )
+        .expect("the jagged fold circuit verifies");
+        (
+            b3_rows,
+            nu2,
+            union2.dense_m(),
+            shape2.circuit.cells().mu(),
+            bincode::serialize(&oproof).map(|b| b.len()).unwrap_or(0),
+        )
+    };
+
+    println!(
+        "\nMVP-11 JAGGED FOLD TAPE + IN-CIRCUIT REPLAY (2 circuit children, one layout)\n  \
+         layout: k {} | pair vars {} — {} claims fold ({} col rounds, {} row rounds)\n  \
+         tape: {} ops | {} stream values | {} squeezes — endpoints close from located words\n  \
+         outer: chain b3 rows {} | nu {} | dense_m {} | mu {} — both deltas published zero,\n         \
+         the entry rebuilt from the public segment discharges | proof {:.1} KiB\n",
+        k_row,
+        n_col,
+        n_cl,
+        n_col,
+        k_row,
+        ops.len(),
+        vals_rec.len(),
+        chals.len(),
+        outer_stats.0,
+        outer_stats.1,
+        outer_stats.2,
+        outer_stats.3,
+        outer_stats.4 as f64 / 1024.0,
+    );
+}
+
 /// One absorbed claim's stream ordinals on a fold tape: the four weight
 /// slices and the value, in absorb order.
 struct ClaimLoc {
