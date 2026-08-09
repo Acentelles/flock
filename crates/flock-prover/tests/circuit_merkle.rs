@@ -197,7 +197,9 @@ const ENV_APP_WORDS: usize = 8;
 /// shorter shape — a dev-size chain, a fold with fewer groups — rides the
 /// same layout and a reader simply stops at its own group widths.
 const ENV_ACC_CHAIN_WORDS: usize = 160;
-const ENV_ACC_MAIN_WORDS: usize = 600;
+// 640, was 600: the wall-3 live word (one per entry, the zero-claim
+// scale) grew the internal node's 38-entry block to 618.
+const ENV_ACC_MAIN_WORDS: usize = 640;
 
 /// FREE COUNTS ARE THE DEFAULT (the count win shipped, 2026-08-09): under
 /// the envelope, children declare their own per-type row counts — the
