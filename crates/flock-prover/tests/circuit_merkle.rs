@@ -22337,7 +22337,7 @@ fn chain_tower_m32_headline() {
     // leaf + FL/2 + internal/2; at four leaves the internal share is /4.
     let per_leaf_online = leaf_on + fl_on / 2.0 + internal_on / 4.0;
     println!(
-        "\nCHAIN TOWER M32 HEADLINE (warm box — cold cert. owed post-reboot)\n  \
+        "\nCHAIN TOWER M32 HEADLINE (warm box; per-stage timing lives in tower_online_bench)\n  \
          {} compressions/leaf x 4 leaves = {} total ({:.1} MB hashed)\n  \
          sequential chain compute (the VDF delay, inherent): {:.0} ms\n  \
          ONLINE per proof (setup is per-SHAPE and excluded — see `Online`):",
