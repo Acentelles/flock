@@ -13687,6 +13687,77 @@ fn envelope_content_probe() {
     }
 }
 
+/// **THE DEAD-LANE SKIP, isolated.** Alternating calls in ONE process on
+/// the same commit geometry (the internal's: m29, slim rate 1/4, 24
+/// committed lanes): `q_live` has 18 live lanes (the skip engages) and
+/// `q_full` all 24 (the skip finds nothing to skip — flop-identical to
+/// the disabled path), so the A/B difference is EXACTLY the six dead
+/// lanes' transform. Fill writes and Merkle byte counts are equal in both
+/// arms; blake3 is data-independent. This is the instrument the
+/// process-level A/B could not be: many back-to-back samples, no churn
+/// between them. Knob: `MICRO_RUNS` (default 11 per arm).
+#[test]
+#[ignore] // Benchmark — run explicitly with --nocapture.
+fn dead_lane_ntt_microbench() {
+    use flock_core::pcs::commit_lane_major;
+    let runs: usize = std::env::var("MICRO_RUNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(11);
+    let params = PcsParams {
+        m: 29,
+        log_inv_rate: 2,
+        log_batch_size: 5,
+        profile: LigeritoProfile::Slim,
+        num_lanes: Some(24),
+        merkle_hash: HashKind::Blake3,
+    };
+    let words = 1usize << (29 - 7);
+    let d = words >> 5;
+    let mut rng = Rng(0xDEAD_11A5);
+    let mut q_full = vec![F128::ZERO; words];
+    for w in q_full[..24 * d].iter_mut() {
+        *w = F128::new(rng.next_u32() as u64, rng.next_u32() as u64);
+    }
+    let mut q_live = q_full.clone();
+    for w in q_live[18 * d..24 * d].iter_mut() {
+        *w = F128::ZERO;
+    }
+    // Warm both paths (first-touch pages, scratch pools) before timing.
+    let _ = commit_lane_major(&q_live, &params);
+    let _ = commit_lane_major(&q_full, &params);
+    let (mut on, mut off) = (Vec::new(), Vec::new());
+    for i in 0..runs {
+        for arm in if i % 2 == 0 { [0, 1] } else { [1, 0] } {
+            let q = if arm == 0 { &q_live } else { &q_full };
+            let t = std::time::Instant::now();
+            let (c, pd) = commit_lane_major(q, &params);
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            std::hint::black_box(&c);
+            drop(pd);
+            if arm == 0 {
+                on.push(ms);
+            } else {
+                off.push(ms);
+            }
+        }
+    }
+    let stat = |v: &mut Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        (v[v.len() / 2], v[0], v[v.len() - 1])
+    };
+    let (on_med, on_min, on_max) = stat(&mut on);
+    let (off_med, off_min, off_max) = stat(&mut off);
+    println!(
+        "\nDEAD-LANE NTT MICRO-BENCH — m29 slim, 24 lanes, {runs} alternating runs/arm\n  \
+         skip ENGAGED (18 live):  median {on_med:6.2} ms  [{on_min:.2}-{on_max:.2}]\n  \
+         skip IDLE   (24 live):   median {off_med:6.2} ms  [{off_min:.2}-{off_max:.2}]\n  \
+         delta (the 6 dead lanes' transform): {:+.2} ms median, {:+.2} ms min-vs-min\n",
+        on_med - off_med,
+        on_min - off_min,
+    );
+}
+
 /// **FL-ARITY A/B** — the 17% lever, priced in one process. A spine node
 /// consumes ONE fresh FL, so FL arity `k` divides BOTH the FL share and the
 /// node share of the amortised per-leaf cost by `k/2`; what it buys back is
