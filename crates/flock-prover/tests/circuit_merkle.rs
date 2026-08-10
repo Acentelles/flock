@@ -24003,6 +24003,56 @@ fn chain_tower_e2e_with_lane() {
     );
 }
 
+/// Inter-proof OVERLAP probe. Within ONE proof, Fiat-Shamir serializes
+/// zerocheck → GKR → open (the GKR's α/β are squeezed only after the whole
+/// boolean PIOP's transcript prefix), so the GKR's poorly-scaling rounds
+/// cannot overlap the same proof's zerocheck. Across proofs the transcripts
+/// are independent — the tower proves 4-6 chain segments per FL — so PAIRS
+/// of leaves prove concurrently on the shared pool, one proof's parallel
+/// phases filling the other's serial gaps (GKR round-trips, transcript,
+/// claim assembly). Prints serial vs paired wall time for the same four
+/// statements. `CHAIN_BLOCKS` sizes the leaf (default 2^16 = m30 — two
+/// concurrent m32 working sets swap on a 32 GB box).
+#[test]
+#[ignore] // Measurement probe — run explicitly with --nocapture.
+fn leaf_overlap_probe() {
+    let n_blocks: usize = std::env::var("CHAIN_BLOCKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1 << 16);
+    let mut rng = Rng(0xC4A1_00A7);
+    let hs: Vec<[u32; 16]> = (0..4)
+        .map(|_| std::array::from_fn(|_| rng.next_u32()))
+        .collect();
+    // Warm: shape cache, scratch pools, page cache.
+    std::hint::black_box(build_chain_proof(hs[0], n_blocks));
+
+    let t = std::time::Instant::now();
+    for &h in &hs {
+        std::hint::black_box(build_chain_proof(h, n_blocks));
+    }
+    let serial_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    let t = std::time::Instant::now();
+    for pair in hs.chunks(2) {
+        let (a, b) = (pair[0], pair[1]);
+        rayon::join(
+            || std::hint::black_box(build_chain_proof(a, n_blocks)),
+            || std::hint::black_box(build_chain_proof(b, n_blocks)),
+        );
+    }
+    let paired_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    println!(
+        "leaf overlap probe ({n_blocks} blocks, {} threads): 4 proofs serial {serial_ms:.0} ms \
+         ({:.0} ms/proof) | paired 2x2 {paired_ms:.0} ms ({:.0} ms/proof) | speedup {:.2}x",
+        rayon::current_num_threads(),
+        serial_ms / 4.0,
+        paired_ms / 4.0,
+        serial_ms / paired_ms,
+    );
+}
+
 /// Attribution probe for the chain leaf's prove: build the SAME m32 leaf
 /// `LEAF_RUNS` times (fresh statement each run) and print the phase split;
 /// run with `PCS_TRACE=1` for the prover's own internal breakdown. The
