@@ -251,7 +251,13 @@ const ENV_PASS_WORDS: usize = 96;
 /// `ENV_NO_PAD=1` forces free counts even then (kept for the probe's
 /// documented invocations).
 fn env_free_counts() -> bool {
-    std::env::var("ENV_PAD").is_err() || std::env::var("ENV_NO_PAD").is_ok()
+    // THE ORACLE IS RETIRED (2026-08-10): its charter was "until the
+    // measurement pass concludes", the pass concluded 2026-08-09, and
+    // nu* 16→15 (the arity-closure dividend) is incompatible with the
+    // counts* caps (mac 49,000 > 2^15). Free counts are unconditional;
+    // the counts_el vector remains as the slot-declaration KEY LIST and
+    // the historical cap record. ENV_PAD/ENV_NO_PAD no longer read.
+    true
 }
 
 fn outer_lanes(union: &UnionInstance, log_batch_size: usize) -> Option<usize> {
@@ -309,13 +315,14 @@ struct EnvTail<'w> {
 /// experiment, not the envelope).
 fn envelope_shape() -> Option<EnvShape> {
     (envelope_floor_m() == Some(29)).then(|| EnvShape {
-        // 16, not 15: mac is ~97% per-child work (14,411 rows per child
-        // against 921 shared, measured by MAC_CENSUS) and already sat at
-        // 91% of 2^15 with two children, so any arity above 2 overflows it.
-        // 2^16 fits three children (44k) and four (59k). Measured cost of
-        // the step: +7.3 ms prove, zero proof bytes — the committed stack
-        // is content-derived, so dense_m does not move.
-        nu: 16,
+        // 15 again (2026-08-10): 16 existed solely so 3+-ary nodes' mac
+        // rows (~44k) would fit — Ron closed arity at 2, so the insurance
+        // is moot and the +7.3 ms it measured comes back, along with
+        // halved witness buffers (packed_len 2^27 → 2^26) and mu 25 → 24
+        // (mu = nu* + 9). Live rows at m32 free counts: b3 23.9k (FL,
+        // the max) of 2^15 = 73%. The counts* ORACLE could not run at 15
+        // (mac cap 49k) — retired with this step, see env_free_counts.
+        nu: 15,
         // 20 = the m32 FAST chain leaf's L0 depth (log_msg_cols 19 +
         // log_inv_rate 1), which the B-fast PoC's first-level node walks;
         // the m29 slim outer ladder needs only 19 and leaves the top
