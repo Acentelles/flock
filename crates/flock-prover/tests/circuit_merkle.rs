@@ -182,6 +182,12 @@ struct EnvShape {
 /// hash-chain PoC's span `(h_start, h_end)`, eight 128-bit words.
 const ENV_APP_WORDS: usize = 8;
 
+/// Per-arm lane-pin override for experiments that need TWO pins in one
+/// process (the FL-arity A/B: the 2-ary arm at the shipped 24, the wide
+/// arm at its own content). 0 = unset — `ENV_LANES` / the default apply.
+static ENV_LANES_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// The INHERITABLE ACCUMULATOR blocks. An outer publishes the accumulator
 /// claims its parent will fold as PRIORS, and the parent connects to them
 /// WIRE-TO-WIRE (`child_pub_w[base + ..]`) — so, exactly like the app
@@ -332,7 +338,23 @@ fn envelope_shape() -> Option<EnvShape> {
         // jagged claims. 24 covers every envelope member's content-derived
         // count at min-one-row (FL 12 at dev / 23 at m32, internal 18) and
         // stays below `2^initial_k = 32`, so children remain lane-major.
-        lanes: 24,
+        // `ENV_LANES=n` re-pins it for EXPERIMENTS (the FL-arity pricing
+        // runs: a wider FL's content overflows 24) — a mixed-pin tower dies
+        // on the digest asserts, so misuse is loud, never silent. The
+        // atomic override serves the SAME experiments when two pins must
+        // coexist in one process (per-arm in the arity A/B; `set_var` is
+        // unsafe in edition 2024).
+        lanes: {
+            let ov = ENV_LANES_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+            if ov != 0 {
+                ov
+            } else {
+                std::env::var("ENV_LANES")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(24)
+            }
+        },
     })
 }
 
@@ -12488,13 +12510,13 @@ struct FlNode {
     t: Online,
 }
 
-/// **THE FIRST-LEVEL NODE.** Two ADJACENT chain proofs (the right segment
-/// starts at the left's h_end) verified deferred in ONE outer circuit —
-/// two chain-tape regions on shared slots — with their boolean + sigma
-/// assertions folded 2→1 in-circuit (THREE fold groups; the chain class
+/// **THE FIRST-LEVEL NODE.** k ADJACENT chain proofs (each segment starts
+/// at the previous one's h_end) verified deferred in ONE outer circuit —
+/// k chain-tape regions on shared slots — with their boolean + sigma
+/// assertions folded k→1 in-circuit (THREE fold groups; the chain class
 /// has no element side), THE ADJACENCY as a wire-to-wire copy constraint
-/// between the children's endpoint publics, and the combined span
-/// (h_start_left, h_end_right) published as the node's own application
+/// per seam between the children's endpoint publics, and the combined span
+/// (first h_start, last h_end) published as the node's own application
 /// statement. The accumulator reassembles from the public segment alone
 /// and discharges both groups. Every pin stays inside the builder (the
 /// mvp9 precedent: the builder IS the test). Envelope snapping is the
@@ -12514,19 +12536,36 @@ fn chain_jagged_params(cp: &ChainProof) -> flock_core::pcs::jagged::JaggedParams
 }
 
 fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
+    build_fl_node_k(&[cp0, cp1])
+}
+
+/// The k-ARY first-level node (the FL-arity lever): `k` adjacent chain
+/// proofs verified deferred in ONE outer, their assertions folded k→1 per
+/// group, adjacency as k−1 four-word seams, the app statement the combined
+/// span. `k = 2` emits in exactly the historical two-child order — every
+/// existing gate rides the wrapper above unchanged.
+fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
     use flock_core::aggregate;
     use flock_core::matrix_fold::{FoldProof, MatrixClaim};
     use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
 
     const FL_DOMAIN: &[u8] = b"flock-chain-fl-node-v0";
 
-    // The right child CONTINUES the chain: its h_start IS the left's h_end.
-    assert_eq!(cp1.h_start, cp0.h_end, "the segments are adjacent");
-    assert_eq!(
-        cp0.inner.built.shape.circuit.digest(),
-        cp1.inner.built.shape.circuit.digest(),
-        "one chain circuit digest, every segment"
-    );
+    let k_ary = cps.len();
+    assert!(k_ary >= 2, "an FL folds at least two chain segments");
+    let cp0 = cps[0];
+    let cp_last = cps[k_ary - 1];
+    // Each child CONTINUES the chain: its h_start IS the previous h_end.
+    for pair in cps.windows(2) {
+        assert_eq!(pair[1].h_start, pair[0].h_end, "the segments are adjacent");
+    }
+    for cp in &cps[1..] {
+        assert_eq!(
+            cp0.inner.built.shape.circuit.digest(),
+            cp.inner.built.shape.circuit.digest(),
+            "one chain circuit digest, every segment"
+        );
+    }
 
     let registry = &cp0.inner.built.shape.registry;
     assert_eq!(registry.num_boolean(), 1, "one boolean type (blake3)");
@@ -12534,11 +12573,11 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         registry.element_types().is_empty(),
         "the chain class has no element side"
     );
-    let bool_asserts = [
-        cp0.inner.work.boolean.clone().expect("left boolean work"),
-        cp1.inner.work.boolean.clone().expect("right boolean work"),
-    ];
-    let sigmas = [cp0.inner.sigma.clone(), cp1.inner.sigma.clone()];
+    let bool_asserts: Vec<_> = cps
+        .iter()
+        .map(|cp| cp.inner.work.boolean.clone().expect("child boolean work"))
+        .collect();
+    let sigmas: Vec<_> = cps.iter().map(|cp| cp.inner.sigma.clone()).collect();
 
     // ---- the native fold: boolean + sigma, NO element groups, NO priors ----
     let blake_r1cs = blake3::build_block_r1cs(cp0.inner.nu);
@@ -12560,7 +12599,7 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         chain_union_j.n_log(),
         cp0.inner.commitment.params.m - flock_core::pcs::LOG_PACKING,
     );
-    let jags = [&cp0.inner.work.jagged, &cp1.inner.work.jagged];
+    let jags: Vec<_> = cps.iter().map(|cp| &cp.inner.work.jagged).collect();
     let jagged_p: Vec<aggregate::JaggedKeyProve<'_>> =
         vec![(chain_digest, &chain_params_j, jags.to_vec())];
     let jagged_v: Vec<aggregate::JaggedKeyVerify<'_>> = vec![(chain_digest, jags.to_vec())];
@@ -12603,13 +12642,13 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         "the folded jagged entry discharges against the chain layout"
     );
 
-    // The three folds' claim lists — no priors, so [fresh, fresh] each.
+    // The three folds' claim lists — no priors, so [fresh; k] each.
     let n_priors = 0usize;
     let bc: Vec<_> = bool_asserts.iter().map(|a| a.claims(registry)).collect();
     let fold_claims: Vec<Vec<MatrixClaim>> = vec![
-        vec![bc[0][0].0.clone(), bc[1][0].0.clone()],
-        vec![bc[0][0].1.clone(), bc[1][0].1.clone()],
-        vec![sigmas[0].claim(), sigmas[1].claim()],
+        bc.iter().map(|c| c[0].0.clone()).collect(),
+        bc.iter().map(|c| c[0].1.clone()).collect(),
+        sigmas.iter().map(|s| s.claim()).collect(),
     ];
     let fold_proofs: Vec<&FoldProof> = vec![
         &agg.folds[0].0,
@@ -12674,12 +12713,14 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
     assert_eq!(jouts[0], acc_v.jagged[0].1, "the jagged entry from located words");
 
     // ---- the child tapes ----
-    let t0 = ChildTape::new(&cp0.inner, DOMAIN);
-    let t1 = ChildTape::new(&cp1.inner, DOMAIN);
-    assert!(t0.el.is_none() && t1.el.is_none(), "chain children");
-    let tape_verify_ms = t0.verify_ms + t1.verify_ms;
+    let tapes: Vec<ChildTape> = cps
+        .iter()
+        .map(|cp| ChildTape::new(&cp.inner, DOMAIN))
+        .collect();
+    assert!(tapes.iter().all(|t| t.el.is_none()), "chain children");
+    let tape_verify_ms: f64 = tapes.iter().map(|t| t.verify_ms).sum();
 
-    // ---- the outer: TWO chain-tape regions + the fold region + adjacency ----
+    // ---- the outer: k chain-tape regions + the fold region + adjacency ----
     {
         use flock_prover::prover::UnionElementSlotInput;
         use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
@@ -12698,7 +12739,7 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         chain.absorb(&bytes[at * 16..]);
         let trace = chain.finish();
 
-        let b3_rows = t0.b3_rows + t1.b3_rows + trace.rows.len();
+        let b3_rows = tapes.iter().map(|t| t.b3_rows).sum::<usize>() + trace.rows.len();
         let nu2_content = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7);
         // THE ENVELOPE (task 7b): a first-level node is an internal node's
         // CHILD, so its proof must carry the same geometry every other
@@ -12720,7 +12761,7 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         };
         let t_build = std::time::Instant::now();
         let mut sb = ShapeBuilder::new(nu2);
-        let spread_own2 = t0.spread_w.max(t1.spread_w);
+        let spread_own2 = tapes.iter().map(|t| t.spread_w).max().expect("children");
         let (spread_w2, mut cs) = match &env {
             Some(e) => {
                 assert!(
@@ -12735,21 +12776,24 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         let mut vals: Vec<F128> = Vec::new();
         let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
         let mut consts: Vec<(F128, Wire)> = Vec::new();
-        // The two chain-child regions are independent gate subgraphs (each
+        // The chain-child regions are independent gate subgraphs (each
         // reads only its own tape's inputs; the fold region joins them
         // AFTER), so they are declared as islands and the fill plan
         // evaluates them concurrently. A cross-island read fails plan
         // compilation — the independence is checked, not assumed.
-        let isl0 = sb.begin_island();
-        let r0 = emit_child_region(&mut sb, &mut cs, &t0, &mut vals, &mut hints, &mut consts);
-        sb.end_island(isl0);
-        let isl1 = sb.begin_island();
-        let r1 = emit_child_region(&mut sb, &mut cs, &t1, &mut vals, &mut hints, &mut consts);
-        sb.end_island(isl1);
+        let regions: Vec<_> = tapes
+            .iter()
+            .map(|t| {
+                let isl = sb.begin_island();
+                let r = emit_child_region(&mut sb, &mut cs, t, &mut vals, &mut hints, &mut consts);
+                sb.end_island(isl);
+                r
+            })
+            .collect();
         let b3s = cs.q.b3;
         let macs = cs.macs;
         let mrs = cs.mrs;
-        let (pfslot, pf_w) = r0.pf;
+        let (pfslot, pf_w) = regions[0].pf;
         let leslot = cs
             .le
             .iter()
@@ -12852,9 +12896,8 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
                 w
             };
             let loc = &jlocs[0];
-            let regions0 = [&r0, &r1];
             let mut ci = 0usize;
-            for rk in regions0 {
+            for rk in &regions {
                 for (li, &jw) in rk.jag_w.iter().enumerate() {
                     let cl = &loc.claims[ci];
                     sb.connect(wv(cl.val_v), jw);
@@ -12922,8 +12965,6 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         let deninv_w = sb.public_input();
         vals.push(F128::ZERO);
         let lag_zassert = sb.public_input();
-        let tapes = [&t0, &t1];
-        let regions = [&r0, &r1];
         for (k, (tk, rk)) in tapes.iter().zip(&regions).enumerate() {
             assert_eq!(
                 &fold_claims[0][n_priors + k].row.low[..],
@@ -13018,17 +13059,18 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
             }
         }
 
-        // ---- THE ADJACENCY: left h_end == right h_start, wire to wire ----
+        // ---- THE ADJACENCY: each h_end == the next h_start, wire to wire ----
         // The chain statement is 11 words: [iv0, iv1, params, h_start x4 |
-        // h_end x4 published last]. Both children's publics are witness
-        // wires here, so adjacency is four copy constraints, and the node's
-        // own application statement is the combined span.
-        let p0 = r0.child_pub_w.len();
-        let p1 = r1.child_pub_w.len();
-        assert_eq!(p0, 11, "the chain statement is 11 words");
-        assert_eq!(p1, 11, "both children share the statement shape");
-        for j in 0..4 {
-            sb.connect(r0.child_pub_w[p0 - 4 + j], r1.child_pub_w[3 + j]);
+        // h_end x4 published last]. The children's publics are witness
+        // wires here, so adjacency is four copy constraints per seam, and
+        // the node's own application statement is the combined span.
+        for rk in &regions {
+            assert_eq!(rk.child_pub_w.len(), 11, "the chain statement is 11 words");
+        }
+        for pair in regions.windows(2) {
+            for j in 0..4 {
+                sb.connect(pair[0].child_pub_w[11 - 4 + j], pair[1].child_pub_w[3 + j]);
+            }
         }
 
         // THE INHERITABLE ACCUMULATOR: per fold the deltas + the claim
@@ -13057,18 +13099,18 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         };
         // The value-binding publics stay in the BODY: nothing above reads
         // them, they only bind the claim values this outer folded.
-        for k in 0..2 {
+        for k in 0..k_ary {
             sb.publish(wv(locs[0].claims[n_priors + k].value_v));
             sb.publish(wv(locs[1].claims[n_priors + k].value_v));
         }
-        // THE APPLICATION STATEMENT: the combined span (the left child's
-        // h_start, the right child's h_end). counts* + publics*: an FL node
+        // THE APPLICATION STATEMENT: the combined span (the first child's
+        // h_start, the last child's h_end). counts* + publics*: an FL node
         // declares the same count vector and segment length every other
         // envelope outer does, and both the app block and the accumulator
         // claims ride the envelope's fixed TAIL.
         let app_w: Vec<Wire> = (0..4)
-            .map(|j| r0.child_pub_w[3 + j])
-            .chain((0..4).map(|j| r1.child_pub_w[p1 - 4 + j]))
+            .map(|j| regions[0].child_pub_w[3 + j])
+            .chain((0..4).map(|j| regions[k_ary - 1].child_pub_w[11 - 4 + j]))
             .collect();
         let stmt_base = match &env {
             Some(e) => {
@@ -13136,12 +13178,15 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
         // Child checkers (each child's whole deferred-verifier statement
         // against its own native replicas), then the fold checker + the
         // accumulator reassembled from publics, then the app statement.
-        let consumed0 = check_child_region(&built2.public, &t0, &r0);
-        let consumed1 = check_child_region(&built2.public, &t1, &r1);
-        assert!(
-            r0.pub_base + consumed0 <= r1.pub_base && r1.pub_base + consumed1 <= fold_pub_base,
-            "the regions' public blocks are disjoint and ordered"
-        );
+        let mut region_end = 0usize;
+        for (tk, rk) in tapes.iter().zip(&regions) {
+            let consumed = check_child_region(&built2.public, tk, rk);
+            assert!(
+                region_end <= rk.pub_base && rk.pub_base + consumed <= fold_pub_base,
+                "the regions' public blocks are disjoint and ordered"
+            );
+            region_end = rk.pub_base + consumed;
+        }
         // ACC_CHAIN keeps the un-keyed entry layout: the lane's registry
         // role has ONE key (the chain circuit), so nothing to disambiguate.
         let (rebuilt, _, _) =
@@ -13181,24 +13226,24 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
             assert_eq!(built2.public[idx], v, "jagged shared constant public");
         }
         // THE APPLICATION STATEMENT: the published span is (h_start of the
-        // left chain, h_end of the right) — the 512-step combined segment.
+        // first chain, h_end of the last) — the combined segment.
         for j in 0..4 {
             assert_eq!(
                 built2.public[stmt_base + j],
                 pack4(cp0.h_start[4 * j..4 * j + 4].try_into().unwrap()),
-                "node statement: h_start is the left child's"
+                "node statement: h_start is the first child's"
             );
             assert_eq!(
                 built2.public[stmt_base + 4 + j],
-                pack4(cp1.h_end[4 * j..4 * j + 4].try_into().unwrap()),
-                "node statement: h_end is the right child's"
+                pack4(cp_last.h_end[4 * j..4 * j + 4].try_into().unwrap()),
+                "node statement: h_end is the last child's"
             );
         }
         assert_eq!(
-            cp1.h_end,
+            cp_last.h_end,
             native_chain(
                 &cp0.h_start,
-                cp0.inner.built.shape.counts[0] + cp1.inner.built.shape.counts[0]
+                cps.iter().map(|cp| cp.inner.built.shape.counts[0]).sum(),
             ),
             "the combined span IS the concatenated chain"
         );
@@ -13339,7 +13384,7 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
             stmt_base,
             fold_pub_base,
             h_start: cp0.h_start,
-            h_end: cp1.h_end,
+            h_end: cp_last.h_end,
             t: Online {
                 setup_ms: build_ms,
                 tapes_ms: tape_verify_ms,
@@ -13389,6 +13434,147 @@ fn first_level_node_two_chains_fold_and_adjacency() {
         fl.lo.shape.circuit.cells().mu(),
         fl.lo.public.len(),
         bincode::serialize(&fl.lo.proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
+    );
+}
+
+/// **The k-ARY FL, dev-size gate** (the FL-arity lever's correctness leg):
+/// three adjacent chain segments verified deferred in ONE first-level node —
+/// every discharge/adjacency/statement assert lives inside
+/// [`build_fl_node_k`]; this wrapper re-checks the surface and prints the
+/// arity ledger (publics vs the envelope body, content lanes vs lanes*,
+/// dense_m vs the m* floor — the three budgets arity spends).
+#[test]
+#[ignore] // Heavy — three chain proofs + one outer.
+fn fl_node_three_ary() {
+    let n_blocks: usize = std::env::var("CHAIN_BLOCKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256);
+    let mut rng = Rng(0xC4A1_00F3);
+    let h0: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let mut cps_own = Vec::new();
+    let mut h = h0;
+    for _ in 0..3 {
+        let cp = build_chain_proof(h, n_blocks);
+        h = cp.h_end;
+        cps_own.push(cp);
+    }
+    let cps: Vec<&ChainProof> = cps_own.iter().collect();
+    let fl = build_fl_node_k(&cps);
+    assert_eq!(fl.h_start, h0);
+    assert_eq!(fl.h_end, native_chain(&h0, 3 * n_blocks), "span H^(3N)");
+    for j in 0..4 {
+        assert_eq!(
+            fl.lo.public[fl.stmt_base + j],
+            pack4(fl.h_start[4 * j..4 * j + 4].try_into().unwrap()),
+            "statement h_start"
+        );
+        assert_eq!(
+            fl.lo.public[fl.stmt_base + 4 + j],
+            pack4(fl.h_end[4 * j..4 * j + 4].try_into().unwrap()),
+            "statement h_end"
+        );
+    }
+    // The arity ledger: what a third child spends of each pinned budget.
+    let u = outer_union(&fl.lo.shape.registry, fl.lo.shape.counts.clone());
+    let content_u = UnionInstance::new(&fl.lo.shape.registry, fl.lo.shape.counts.clone());
+    let batch = pcs_batch_for(&u, tower_profile());
+    println!(
+        "\n3-ARY FIRST-LEVEL NODE (three adjacent chain proofs in ONE fold)\n  \
+         span H^{}(h_start) | nu {} | mu {} | proof {:.1} KiB\n  \
+         publics {} | dense_m {} (content {}) | lanes content {:?} vs pin {:?}\n  \
+         ONLINE: walk {:.1} + tapes {:.1} + witgen {:.1} + prove {:.1} = {:.1} ms | verify {:.1}\n",
+        3 * n_blocks,
+        fl.lo.shape.circuit.cells().nu(),
+        fl.lo.shape.circuit.cells().mu(),
+        bincode::serialize(&fl.lo.proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
+        fl.lo.public.len(),
+        u.dense_m(),
+        content_u.dense_m(),
+        content_u.commit_lanes(batch),
+        fl.lo.pcs.num_lanes,
+        fl.t.walk_ms,
+        fl.t.tapes_ms,
+        fl.t.witgen_ms,
+        fl.t.prove_ms,
+        fl.t.total(),
+        fl.t.verify_ms,
+    );
+}
+
+/// **FL-ARITY A/B** — the 17% lever, priced in one process. A spine node
+/// consumes ONE fresh FL, so FL arity `k` divides BOTH the FL share and the
+/// node share of the amortised per-leaf cost by `k/2`; what it buys back is
+/// the k-ary FL's own growth, which is what this measures. The arms
+/// alternate run by run with flipping order (the box discipline: sustained
+/// proving drifts within a process, and the drift must hit both arms
+/// equally). Knobs: `FL_ARITY` (default 3), `BENCH_RUNS` (default 3),
+/// `CHAIN_BLOCKS` (default 256), `TOWER_PROFILE`, and `ENV_LANES` when the
+/// wider FL's content overflows the 24-lane pin at m32.
+#[test]
+#[ignore] // Benchmark — run explicitly with `-- --ignored --nocapture`.
+fn fl_arity_bench() {
+    let runs: usize = std::env::var("BENCH_RUNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    let k: usize = std::env::var("FL_ARITY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    assert!(k > 2, "the A/B compares 2-ary against a wider k");
+    let n_blocks: usize = std::env::var("CHAIN_BLOCKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256);
+    let mut rng = Rng(0xC4A1_00AB);
+    let h0: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    // k adjacent chain proofs, all resident for BOTH arms (equal allocator
+    // pressure); the 2-ary arm folds the first two.
+    let mut cps_own = Vec::new();
+    let mut h = h0;
+    for _ in 0..k {
+        let cp = build_chain_proof(h, n_blocks);
+        h = cp.h_end;
+        cps_own.push(cp);
+    }
+    let cps: Vec<&ChainProof> = cps_own.iter().collect();
+    // Each arm ships under ITS OWN lane pin (the pin is per-shape
+    // structure): the 2-ary arm at the default, the wide arm at
+    // `FL_LANES_WIDE` when its content overflows 24 (33 at m32).
+    let lanes_wide: usize = std::env::var("FL_LANES_WIDE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    use std::sync::atomic::Ordering;
+    let mut two: Vec<Online> = Vec::new();
+    let mut wide: Vec<Online> = Vec::new();
+    for i in 0..runs {
+        for arm in if i % 2 == 0 { [0, 1] } else { [1, 0] } {
+            if arm == 0 {
+                ENV_LANES_OVERRIDE.store(0, Ordering::Relaxed);
+                two.push(build_fl_node_k(&cps[..2]).t);
+            } else {
+                ENV_LANES_OVERRIDE.store(lanes_wide, Ordering::Relaxed);
+                wide.push(build_fl_node_k(&cps).t);
+            }
+        }
+    }
+    ENV_LANES_OVERRIDE.store(0, Ordering::Relaxed);
+    let (t2, tk) = (median_total(&two), median_total(&wide));
+    println!(
+        "\nFL-ARITY A/B — {n_blocks} compressions/chain, {runs} runs/arm, profile {:?}",
+        tower_profile(),
+    );
+    report_stage("FL 2-ary", &two);
+    report_stage(&format!("FL {k}-ary"), &wide);
+    println!(
+        "  per-leaf FL share: {:.1} ms (2-ary) -> {:.1} ms ({k}-ary), {:+.1}%\n  \
+         the node share divides by the same k/2 (a spine node consumes ONE fresh FL);\n  \
+         amortised per leaf = leaf + FL_k/k + node/k — fold in the recorded leaf/node medians\n",
+        t2 / 2.0,
+        tk / k as f64,
+        100.0 * (tk / k as f64 - t2 / 2.0) / (t2 / 2.0),
     );
 }
 
