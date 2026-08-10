@@ -629,11 +629,27 @@ struct Online {
     witgen_ms: f64,
     prove_ms: f64,
     verify_ms: f64,
+    /// ONE timer around the whole online span (walk through prove), not the
+    /// phase sum: everything between the phases — the union/PCS param
+    /// construction, buffer drops, allocator work — lands here and nowhere
+    /// else. `0.0` where a stage has not been wired for it.
+    wall_ms: f64,
 }
 
 impl Online {
-    /// The per-proof online total: the prover's cost, walk included.
+    /// The per-proof online total. The MEASURED wall where a stage supplies
+    /// it, the phase sum otherwise — a sum can only be a lower bound.
     fn total(&self) -> f64 {
+        if self.wall_ms > 0.0 {
+            self.wall_ms
+        } else {
+            self.walk_ms + self.tapes_ms + self.witgen_ms + self.prove_ms
+        }
+    }
+
+    /// What the phases add up to — printed beside the wall so the gap between
+    /// them is visible rather than assumed away.
+    fn summed(&self) -> f64 {
         self.walk_ms + self.tapes_ms + self.witgen_ms + self.prove_ms
     }
 }
@@ -668,6 +684,19 @@ fn report_stage(name: &str, runs: &[Online]) {
         median_of(runs, |o| o.verify_ms),
         median_of(runs, |o| o.setup_ms),
     );
+    // Where a stage measures its wall directly, print what the phases add up
+    // to beside it: the difference is real per-proof cost that no phase timer
+    // owns, and quoting the sum alone hides it.
+    if runs.iter().any(|o| o.wall_ms > 0.0) {
+        let (wall, summed) = (
+            median_of(runs, |o| o.wall_ms),
+            median_of(runs, |o| o.summed()),
+        );
+        println!(
+            "    {:9} MEASURED wall {:7.1} ms vs phase sum {:7.1} ({:+.1} unaccounted)",
+            "", wall, summed, wall - summed,
+        );
+    }
 }
 
 const DOMAIN: &[u8] = b"flock-circuit-merkle-v0";
@@ -12268,11 +12297,16 @@ fn build_chain_proof(h_start: [u32; 16], n_blocks: usize) -> ChainProof {
             &mut ch,
         );
         let prove_ms = t2.elapsed().as_secs_f64() * 1e3;
+        // `t0` opened before the walk, so this is the whole online span in
+        // ONE timer — the honest per-leaf number, against which the phase
+        // sum is only a lower bound.
+        let wall_ms = t0.elapsed().as_secs_f64() * 1e3;
         onlines.push(Online {
             setup_ms,
             walk_ms,
             witgen_ms,
             prove_ms,
+            wall_ms,
             ..Online::default()
         });
         fin = Some((witness, proof, commitment, pcs_params));
@@ -13492,6 +13526,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
             witgen_ms: asm_ms,
             prove_ms,
             verify_ms: verify_ms2,
+            wall_ms: 0.0,
         });
         fin = Some((built2, oproof, ocommit, acc_pub));
         }
@@ -22634,6 +22669,7 @@ fn build_node_outer_app(
             witgen_ms: asm_ms,
             prove_ms,
             verify_ms,
+            wall_ms: 0.0,
         });
         if steady_left > 0 {
             steady_left -= 1;
@@ -22671,6 +22707,7 @@ fn build_node_outer_app(
                 witgen_ms: asm_ms,
                 prove_ms,
                 verify_ms,
+                wall_ms: 0.0,
             },
             onlines,
             app_base,
