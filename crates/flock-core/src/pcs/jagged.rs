@@ -2879,6 +2879,8 @@ pub fn prove_multipoint_twisted<C: Challenger>(
     let area = params.area() as usize;
     let mut pairs: Vec<Pair> = Vec::with_capacity(2);
     let mut msg0 = (F128::ZERO, F128::ZERO);
+    // The aligned full-count shape serves BOTH products' closed forms.
+    let aligned = aligned_full_columns(params);
     if n_rs > 0 {
         let basis = inv_frob_basis();
         let mut images = Box::new([F128::ZERO; 128]);
@@ -2888,7 +2890,7 @@ pub fn prove_multipoint_twisted<C: Challenger>(
             }
         }
         let partner = Partner::twisted(images);
-        if let Some(used) = aligned_full_columns(params) {
+        if let Some(used) = aligned.clone() {
             // Aligned full-count shape: the RS combined weight is, per used
             // column, a sum of plain scaled row-eq tensors — no fold tables
             // (they live in the dual values and the g partner) — so it runs
@@ -2988,7 +2990,42 @@ pub fn prove_multipoint_twisted<C: Challenger>(
         );
     }
     let mut sparse_support: Option<u64> = None;
-    if n_g > 0 {
+    if n_g > 0 && closed_rs_on() && let Some(used) = aligned.as_ref() {
+        // THE SAME CLOSED FORM, one conjugate. A group's weight is
+        // `scale·cols[y]·eq(z_row, row)` — the RS side's shape exactly — and
+        // its partner is a SINGLE scaled `eq(ρ,·)` rather than 128 twisted
+        // tensors, so [`ClosedRs`] serves it with `pts = [ρ]`, `coef = [1]`
+        // and the scale riding the column table. No support scan, no
+        // densify, no 2^m weight: the group product's rounds cost
+        // `O(#groups)` multiplies.
+        let coltabs: Vec<Vec<F128>> = groups
+            .iter()
+            .enumerate()
+            .map(|(k, g)| {
+                let scale = gpow[128 * n_rs + k];
+                used.iter().map(|&y| scale * g.cols[y]).collect()
+            })
+            .collect();
+        let rows: Vec<(Vec<F128>, F128)> = groups
+            .iter()
+            .map(|g| (g.z_row.to_vec(), F128::ONE))
+            .collect();
+        let pts = [rho.to_vec()];
+        let closed = ClosedRs::build(&coltabs, &rows, &[F128::ONE], &pts, params.n, used.len());
+        let ar = AlignedRsPair {
+            coltabs,
+            rows,
+            partner: Partner::Scaled { s: F128::ONE },
+            rho: rho.to_vec(),
+            round: 0,
+            nu: params.n,
+            n_used: used.len(),
+            closed: Some(closed),
+        };
+        let msg = ar.round0_msg(&eq0);
+        msg0 = (msg0.0 + msg.0, msg0.1 + msg.1);
+        pairs.push(Pair::AlignedRs(ar));
+    } else if n_g > 0 {
         let sides: Vec<(F128, Vec<F128>, &[F128])> = groups
             .iter()
             .enumerate()
