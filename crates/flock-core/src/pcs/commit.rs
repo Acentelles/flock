@@ -294,7 +294,7 @@ pub fn commit_into(
     // layers' full-buffer reads and multiplies.
     replicate_message_fill(&mut codeword, z_packed);
 
-    finalize_commit(codeword, params)
+    finalize_commit(codeword, params.num_ntts(), params)
 }
 
 // ---------------------------------------------------------------------------
@@ -387,10 +387,22 @@ pub fn commit_lane_major(q: &[F128], params: &PcsParams) -> (Commitment, ProverD
         "lanes >= num_lanes must be identically zero"
     );
     let _ = lanes;
+    // THE DEAD-LANE NTT SKIP: trailing all-zero lanes UNDER the committed
+    // count — a pinned lane count (the envelope's `lanes*`) covering members
+    // whose content needs fewer — are fixed points of every butterfly, so
+    // the transform runs on the live prefix only. Value-identical: the fill
+    // below still writes the dead slots as zeros and the Merkle hashes the
+    // same bytes; only the dead lanes' arithmetic and traffic are skipped.
+    // The scan reads only the dead lanes plus the first live one from the
+    // top (early-exit on the first nonzero word).
+    let mut live = t;
+    while live > 0 && q[(live - 1) * d..live * d].iter().all(|w| w.is_zero()) {
+        live -= 1;
+    }
     let codeword_len = params.n_positions() * t;
     let mut codeword = crate::scratch::take_f128(codeword_len);
     replicate_lane_major_fill(&mut codeword, q, t, d);
-    finalize_commit(codeword, params)
+    finalize_commit(codeword, live, params)
 }
 
 /// [`replicate_message_fill`] for a lane-major message: fill `codeword` with
@@ -453,17 +465,25 @@ pub(crate) fn replicate_message_fill(codeword: &mut [F128], msg: &[F128]) {
 
 /// Shared tail of [`commit`] / [`commit_into`]: interleaved forward additive
 /// NTT (RS-encode every lane) then the initial Merkle tree over codeword rows.
-fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
+fn finalize_commit(
+    mut codeword: Vec<F128>,
+    live_lanes: usize,
+    params: &PcsParams,
+) -> (Commitment, ProverData) {
     let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
     let t_ntt = std::time::Instant::now();
     // ---- Interleaved forward additive NTT: 2^log_batch_size independent
     // sub-NTTs with shared twiddles. Each sub-NTT operates on its lane of the
     // SoA buffer. The first `log_inv_rate` layers were pre-applied by the
-    // caller's replicate-fill (commit_into), so start past them.
+    // caller's replicate-fill (commit_into), so start past them. Lanes
+    // `live_lanes..num_ntts` are identically zero (the caller's contract) and
+    // ride through untouched — zero lanes encode to zero codewords, so the
+    // buffer the Merkle hashes is byte-identical to the full transform's.
     let ntt = AdditiveNttF128::standard(params.k_code());
-    ntt.forward_transform_interleaved_from_layer(
+    ntt.forward_transform_interleaved_live_from_layer(
         &mut codeword,
         params.num_ntts(),
+        live_lanes,
         params.log_inv_rate,
     );
     if timing {
@@ -719,6 +739,55 @@ mod tests {
             assert_eq!(c_none.cap, c_full.cap, "cap diverged (m={m})");
             assert_eq!(pd_none.codeword, pd_full.codeword, "codeword diverged");
             assert_eq!(pd_none.merkle_tree, pd_full.merkle_tree, "tree diverged");
+        }
+    }
+
+    /// THE DEAD-LANE NTT SKIP is invisible at the commit level: a lane-major
+    /// commit whose top CONTENT lanes are zero (a pinned lane count above the
+    /// content's — the envelope's `lanes*` covering a smaller member)
+    /// produces the byte-identical (Commitment, ProverData) that the full
+    /// transform does — codeword, Merkle tree and cap alike.
+    #[test]
+    fn commit_lane_major_dead_lane_skip_byte_identical() {
+        let mut rng = Rng::new(0xDEAD_1A6E);
+        for (m, log_inv_rate, log_batch_size) in [(12, 1, 3), (14, 2, 3), (15, 1, 4)] {
+            let full = 1usize << log_batch_size;
+            let log_dim = (m - LOG_PACKING) - log_batch_size;
+            let d = 1usize << log_dim;
+            // Committed lanes t (the pin), content lanes c ≤ t (the member).
+            for (t, c) in [
+                (full - 1, full / 2),
+                (full - 1, full - 2),
+                (full / 2 + 1, 1),
+                (full - 1, 0),
+            ] {
+                let params = PcsParams {
+                    m,
+                    log_inv_rate,
+                    log_batch_size,
+                    profile: Default::default(),
+                    num_lanes: Some(t),
+                    merkle_hash: Default::default(),
+                };
+                // Lane-major full stack: the content lanes are exactly the
+                // first c·d words; lanes c..t are the dead-but-committed
+                // region, lanes t.. never commit.
+                let mut q = vec![F128::ZERO; 1usize << (m - LOG_PACKING)];
+                let content = rng.f128_vec(c * d);
+                q[..c * d].copy_from_slice(&content);
+
+                let (c_skip, pd_skip) = commit_lane_major(&q, &params);
+                // The full-transform reference: the same fill, live = t.
+                let mut codeword = crate::scratch::take_f128(params.codeword_len_f128());
+                replicate_lane_major_fill(&mut codeword, &q, t, d);
+                let (c_ref, pd_ref) = finalize_commit(codeword, t, &params);
+                assert_eq!(c_skip.cap, c_ref.cap, "cap (m={m}, t={t}, c={c})");
+                assert_eq!(pd_skip.codeword, pd_ref.codeword, "codeword (m={m}, t={t}, c={c})");
+                assert_eq!(
+                    pd_skip.merkle_tree, pd_ref.merkle_tree,
+                    "tree (m={m}, t={t}, c={c})"
+                );
+            }
         }
     }
 
