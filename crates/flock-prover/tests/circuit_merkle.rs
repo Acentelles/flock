@@ -188,6 +188,26 @@ const ENV_APP_WORDS: usize = 8;
 static ENV_LANES_OVERRIDE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Steady-repetition override: how many EXTRA times a builder re-runs its
+/// ONLINE phases (tapes + walk + witgen + prove + verify) over the
+/// once-built shape, collecting one [`Online`] record per iteration. The
+/// bench sets this per stage so a 5-run median costs ONE ~3-5 s setup
+/// instead of five — the per-shape setup was ~96% of the bench's wall
+/// clock. `usize::MAX` = unset (the `TOWER_STEADY` env knob applies).
+static STEADY_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+fn steady_reps() -> usize {
+    let ov = STEADY_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if ov != usize::MAX {
+        return ov;
+    }
+    std::env::var("TOWER_STEADY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
 /// The INHERITABLE ACCUMULATOR blocks. An outer publishes the accumulator
 /// claims its parent will fold as PRIORS, and the parent connects to them
 /// WIRE-TO-WIRE (`child_pub_w[base + ..]`) — so, exactly like the app
@@ -12165,8 +12185,11 @@ struct ChainProof {
     inner: MixedInner,
     h_start: [u32; 16],
     h_end: [u32; 16],
-    /// What the leaf cost, split SETUP vs ONLINE — see [`Online`].
+    /// What the leaf cost, split SETUP vs ONLINE — see [`Online`]. The
+    /// LAST online iteration under steady repetition.
     t: Online,
+    /// One record per online iteration (1 + steady_reps of them).
+    onlines: Vec<Online>,
 }
 
 /// A chain leaf. The SHAPE build is per-shape setup (statement-independent
@@ -12177,43 +12200,62 @@ fn build_chain_proof(h_start: [u32; 16], n_blocks: usize) -> ChainProof {
     let cs = build_chain_shape(n_blocks);
     let shape_ms = t_shape.elapsed().as_secs_f64() * 1e3;
     let (nu, hash) = (cs.nu, cs.hash);
-    let t0 = std::time::Instant::now();
-    let witness = cs.shape.run(&chain_vals(&h_start), &[]);
-    let walk_ms = t0.elapsed().as_secs_f64() * 1e3;
+    let t_setup = std::time::Instant::now();
+    let blake_r1cs = blake3::build_block_r1cs(nu);
+    let blake_lc = blake_r1cs.csc_lincheck_circuit();
+    let setup_ms = shape_ms + t_setup.elapsed().as_secs_f64() * 1e3;
+
+    // ONLINE, `1 + steady_reps()` iterations over the ONE shape: walk (the
+    // chain compute itself), witgen, prove. Identical inputs, so every
+    // iteration's outputs match and the last one ships.
+    let reps = 1 + steady_reps();
+    let mut onlines: Vec<Online> = Vec::with_capacity(reps);
+    let mut fin = None;
+    for _ in 0..reps {
+        let t0 = std::time::Instant::now();
+        let witness = cs.shape.run(&chain_vals(&h_start), &[]);
+        let walk_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let union = UnionInstance::new(&cs.shape.registry, cs.shape.counts.clone());
+        assert!(!union.has_element(), "a chain proof is boolean-only");
+        let pcs_params = PcsParams {
+            m: union.dense_m(),
+            log_inv_rate: 1,
+            log_batch_size: pcs_batch(&union),
+            profile: LigeritoProfile::Fast,
+            num_lanes: union.commit_lanes(pcs_batch(&union)),
+            merkle_hash: HashKind::Blake3,
+        };
+        let t1 = std::time::Instant::now();
+        let wit =
+            blake3::generate_witness_batch_major_partial(witness.rows::<Blake3Gate>(hash), nu);
+        let witgen_ms = t1.elapsed().as_secs_f64() * 1e3;
+        let t2 = std::time::Instant::now();
+        let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
+        let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
+            &union,
+            &cs.shape.circuit,
+            &witness.public,
+            &pcs_params,
+            vec![UnionSlotProverInput::new(wit, blake_lc)],
+            Vec::new(),
+            &mut ch,
+        );
+        let prove_ms = t2.elapsed().as_secs_f64() * 1e3;
+        onlines.push(Online {
+            setup_ms,
+            walk_ms,
+            witgen_ms,
+            prove_ms,
+            ..Online::default()
+        });
+        fin = Some((witness, proof, commitment, pcs_params));
+    }
+    let (witness, proof, commitment, pcs_params) = fin.expect("one online iteration at least");
     let built = flock_core::circuit::builder::BuiltCircuit {
         shape: cs.shape,
         witness,
     };
-
-    let t_setup = std::time::Instant::now();
     let union = UnionInstance::new(&built.shape.registry, built.shape.counts.clone());
-    assert!(!union.has_element(), "a chain proof is boolean-only");
-    let pcs_params = PcsParams {
-        m: union.dense_m(),
-        log_inv_rate: 1,
-        log_batch_size: pcs_batch(&union),
-        profile: LigeritoProfile::Fast,
-        num_lanes: union.commit_lanes(pcs_batch(&union)),
-        merkle_hash: HashKind::Blake3,
-    };
-    let blake_r1cs = blake3::build_block_r1cs(nu);
-    let blake_lc = blake_r1cs.csc_lincheck_circuit();
-    let setup_ms = shape_ms + t_setup.elapsed().as_secs_f64() * 1e3;
-    let t1 = std::time::Instant::now();
-    let wit = blake3::generate_witness_batch_major_partial(built.rows::<Blake3Gate>(hash), nu);
-    let witgen_ms = t1.elapsed().as_secs_f64() * 1e3;
-    let t2 = std::time::Instant::now();
-    let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
-        &union,
-        &built.shape.circuit,
-        &built.witness.public,
-        &pcs_params,
-        vec![UnionSlotProverInput::new(wit, blake_lc)],
-        Vec::new(),
-        &mut ch,
-    );
-    let prove_ms = t2.elapsed().as_secs_f64() * 1e3;
 
     let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
     let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
@@ -12267,13 +12309,8 @@ fn build_chain_proof(h_start: [u32; 16], n_blocks: usize) -> ChainProof {
         },
         h_start,
         h_end,
-        t: Online {
-            setup_ms,
-            walk_ms,
-            witgen_ms,
-            prove_ms,
-            ..Online::default()
-        },
+        t: *onlines.last().expect("one online iteration"),
+        onlines,
     }
 }
 
@@ -12505,9 +12542,12 @@ struct FlNode {
     fold_pub_base: usize,
     h_start: [u32; 16],
     h_end: [u32; 16],
-    /// What the FL cost, split SETUP vs ONLINE — see [`Online`].
-    /// Everything else in the builder is pin/check scaffolding.
+    /// What the FL cost, split SETUP vs ONLINE — see [`Online`]. The LAST
+    /// online iteration under steady repetition; everything else in the
+    /// builder is pin/check scaffolding.
     t: Online,
+    /// One record per online iteration (1 + steady_reps of them).
+    onlines: Vec<Online>,
 }
 
 /// **THE FIRST-LEVEL NODE.** k ADJACENT chain proofs (each segment starts
@@ -12533,6 +12573,32 @@ fn chain_jagged_params(cp: &ChainProof) -> flock_core::pcs::jagged::JaggedParams
         u.n_log(),
         cp.inner.commitment.params.m - flock_core::pcs::LOG_PACKING,
     )
+}
+
+/// The FL's per-statement tape source, bare: ONE recording deferred verify
+/// of a chain child. The pin/locate scaffolding is per-shape and lives in
+/// [`ChildTape::new`]; this is what an online iteration re-pays (results
+/// discarded — identical by determinism).
+fn record_chain_child_verify(
+    cp: &ChainProof,
+    blake_lc: &dyn flock_core::lincheck::LincheckCircuit,
+) {
+    use flock_core::transcript_record::RecordingChallenger;
+    let inner = &cp.inner;
+    let union = UnionInstance::new(&inner.built.shape.registry, inner.built.shape.counts.clone());
+    let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
+    let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(DOMAIN));
+    verifier::verify_ligerito_union_circuit_deferred(
+        &union,
+        &inner.built.shape.circuit,
+        &inner.built.witness.public,
+        &lcs,
+        &inner.commitment,
+        &inner.proof,
+        &inner.pcs,
+        &mut rec,
+    )
+    .expect("the chain child verifies (recorded)");
 }
 
 fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
@@ -12718,7 +12784,6 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
         .map(|cp| ChildTape::new(&cp.inner, DOMAIN))
         .collect();
     assert!(tapes.iter().all(|t| t.el.is_none()), "chain children");
-    let tape_verify_ms: f64 = tapes.iter().map(|t| t.verify_ms).sum();
 
     // ---- the outer: k chain-tape regions + the fold region + adjacency ----
     {
@@ -13169,6 +13234,38 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
             );
         }
         let build_ms = t_build.elapsed().as_secs_f64() * 1e3;
+        // Per-SHAPE prover materials, hoisted above the online loop — BLAKE3
+        // for BOTH the Merkle trees and the FS chain, so the node is
+        // RECURSABLE (both recorded gotchas).
+        let union2 = outer_union(&shape2.registry, shape2.counts.clone());
+        let pf = tower_profile();
+        let pcs2 = PcsParams {
+            m: union2.dense_m(),
+            log_inv_rate: pf.log_inv_rate(),
+            log_batch_size: pcs_batch_for(&union2, pf),
+            profile: pf,
+            num_lanes: outer_lanes(&union2, pcs_batch_for(&union2, pf)),
+            merkle_hash: HashKind::Blake3,
+        };
+        let b3_r1cs2 = blake3::build_block_r1cs(nu2);
+        let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
+        let swap_r1cs2 = SwapTable::build_block_r1cs(nu2);
+        let swap_lc2 = swap_r1cs2.csc_lincheck_circuit();
+        let spread_r1cs2 = BitSpreadTable::new(spread_w2).build_block_r1cs(nu2);
+        let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
+        // ONLINE, `1 + steady_reps()` iterations over the ONE shape: tapes
+        // (the recording verifies, re-run with results discarded — identical
+        // by determinism), the walk (fill plan), witness assembly, prove,
+        // verify. The checker asserts re-run too — they read publics only.
+        let reps = 1 + steady_reps();
+        let mut onlines: Vec<Online> = Vec::with_capacity(reps);
+        let mut fin = None;
+        for _ in 0..reps {
+        let t_tapes = std::time::Instant::now();
+        for cp in cps {
+            record_chain_child_verify(cp, blake_lc);
+        }
+        let tapes_ms_i = t_tapes.elapsed().as_secs_f64() * 1e3;
         let t_run = std::time::Instant::now();
         // DEFERRED: rows and publics only — the element witnesses are never
         // packed, and the assembly below feeds the prover from the rows.
@@ -13248,31 +13345,12 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
             "the combined span IS the concatenated chain"
         );
 
-        // The outer proves and verifies over the circuit path — BLAKE3 for
-        // BOTH the Merkle trees and the FS chain, so the node is RECURSABLE
-        // (an internal node's RealTape walks this transcript in-circuit;
-        // the defaults diverge silently — both recorded gotchas).
-        let union2 = outer_union(&shape2.registry, shape2.counts.clone());
-        let pf = tower_profile();
-        let pcs2 = PcsParams {
-            m: union2.dense_m(),
-            log_inv_rate: pf.log_inv_rate(),
-            log_batch_size: pcs_batch_for(&union2, pf),
-            profile: pf,
-            num_lanes: outer_lanes(&union2, pcs_batch_for(&union2, pf)),
-            merkle_hash: HashKind::Blake3,
-        };
-        let b3_r1cs2 = blake3::build_block_r1cs(nu2);
-        let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
-        let swap_r1cs2 = SwapTable::build_block_r1cs(nu2);
-        let swap_lc2 = swap_r1cs2.csc_lincheck_circuit();
-        let spread_ty2 = BitSpreadTable::new(spread_w2);
-        let spread_r1cs2 = spread_ty2.build_block_r1cs(nu2);
-        let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
         // Everything from here to the prove is WITNESS ASSEMBLY — packing
         // the walk's rows into the union's slot inputs. It is per-statement
         // (online), so it gets its own timer rather than hiding inside the
         // shape build or the prove.
+        // Recreated per online iteration — the spread closure consumes it.
+        let spread_ty2 = BitSpreadTable::new(spread_w2);
         let t_asm = std::time::Instant::now();
         // THE COPY-FREE ASSEMBLY, the node's path: the boolean drivers pack
         // straight into the union's slot blocks inside the prove (live rows
@@ -13361,6 +13439,17 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
         )
         .expect("the first-level node verifies over the circuit path");
         let verify_ms2 = t_ver.elapsed().as_secs_f64() * 1e3;
+        onlines.push(Online {
+            setup_ms: build_ms,
+            tapes_ms: tapes_ms_i,
+            walk_ms: run_ms,
+            witgen_ms: asm_ms,
+            prove_ms,
+            verify_ms: verify_ms2,
+        });
+        fin = Some((built2, oproof, ocommit, acc_pub));
+        }
+        let (built2, oproof, ocommit, acc_pub) = fin.expect("one online iteration");
         let (b3_ri, swap_ri, spread_ri) = (
             shape2.registry_slot(cs.q.b3),
             shape2.registry_slot(cs.q.swap),
@@ -13385,14 +13474,8 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
             fold_pub_base,
             h_start: cp0.h_start,
             h_end: cp_last.h_end,
-            t: Online {
-                setup_ms: build_ms,
-                tapes_ms: tape_verify_ms,
-                walk_ms: run_ms,
-                witgen_ms: asm_ms,
-                prove_ms,
-                verify_ms: verify_ms2,
-            },
+            t: *onlines.last().expect("one online iteration"),
+            onlines,
         }
     }
 }
@@ -20161,7 +20244,11 @@ struct NodeOut {
     /// The MAIN fold's accumulator — LIVE entries only, the thing a root
     /// discharges.
     acc: flock_core::aggregate::Accumulator,
+    /// The LAST online iteration (steady state under repetition).
     online: Online,
+    /// One record per online iteration (1 + steady_reps of them) — the
+    /// bench's medians come from here, one setup for all of them.
+    onlines: Vec<Online>,
     app_base: Option<usize>,
     lane_acc: Option<flock_core::aggregate::Accumulator>,
     /// The published ACC_MAIN + passenger blocks — what a spine parent
@@ -21898,15 +21985,14 @@ fn build_node_outer_app(
         let spread_r1cs2 = BitSpreadTable::new(spread_w2).build_block_r1cs(nu2);
         let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
         let build_ms = build_ms + t_r1cs.elapsed().as_secs_f64() * 1e3;
-        // TOWER_STEADY=N re-runs the ONLINE phases (trace + asm + prove +
-        // verify) N extra times over the SAME built shape: the offline
-        // setup (circuit, R1CS, PCS params, warmed pools) is paid once, so
-        // iterations after the first print the steady-state online cost.
-        let steady_reps: usize = std::env::var("TOWER_STEADY")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        let mut steady_left = steady_reps;
+        // TOWER_STEADY=N (or the bench's STEADY_OVERRIDE) re-runs the ONLINE
+        // phases (tapes + trace + asm + prove + verify) N extra times over
+        // the SAME built shape: the offline setup (circuit, R1CS, PCS
+        // params, warmed pools) is paid once, so iterations after the first
+        // give the steady-state online cost. Every iteration's record lands
+        // in `onlines` (NodeOut carries them; `online` stays the last).
+        let mut steady_left = steady_reps();
+        let mut onlines: Vec<Online> = Vec::with_capacity(steady_left + 1);
         let (
             built2,
             oproof,
@@ -22377,6 +22463,14 @@ fn build_node_outer_app(
             build_ms,
             tape_setup_ms,
         );
+        onlines.push(Online {
+            setup_ms: build_ms,
+            walk_ms: trace_ms,
+            tapes_ms,
+            witgen_ms: asm_ms,
+            prove_ms,
+            verify_ms,
+        });
         if steady_left > 0 {
             steady_left -= 1;
             continue;
@@ -22414,6 +22508,7 @@ fn build_node_outer_app(
                 prove_ms,
                 verify_ms,
             },
+            onlines,
             app_base,
             lane_acc: lane_native.map(|(a, ..)| a),
             block: block_pub,
@@ -23962,11 +24057,10 @@ fn chain_tower_m32_headline() {
 /// number: a shape is statement-independent, so a production prover builds
 /// it once per level and reuses it for every segment.
 ///
-/// Each stage is measured by re-running its builder `BENCH_RUNS` times over
-/// FIXED inputs and taking per-phase MEDIANS — the first run of any stage
-/// pays first-touch allocator costs that are warmup, not marginal cost.
-/// The builders' pin/locate/replica scaffolding runs on every iteration and
-/// costs wall time, but it is not inside any timer here.
+/// Each stage is measured by ONE builder call whose online phases repeat
+/// `BENCH_RUNS` times over FIXED inputs (STEADY_OVERRIDE — the setup is
+/// paid once), taking per-phase MEDIANS — the first iteration pays
+/// first-touch allocator costs that are warmup, not marginal cost.
 ///
 /// Knobs: `BENCH_RUNS` (default 3), `CHAIN_BLOCKS` (default 256 — set
 /// 262144 for the m32 production leaf), `TOWER_PROFILE=slim` for the
@@ -23994,20 +24088,31 @@ fn tower_online_bench() {
     // 639-1183 ms when the bench built everything up front. A production
     // prover drops a child once it has been folded, so the stages are
     // ordered to do the same.
+    //
+    // ONE BUILDER CALL PER STAGE (STEADY_OVERRIDE): the per-shape setup —
+    // circuit emission, tape pins, R1CS, PCS params — is paid once and the
+    // online phases repeat `runs` times inside the builder. The old
+    // per-iteration rebuild spent ~96% of the bench's wall clock re-doing
+    // byte-identical setup. The node arms therefore run as BLOCKS seconds
+    // apart instead of the old minutes-apart interleave; box drift over
+    // seconds is far below what the interleave guarded against.
+    use std::sync::atomic::Ordering;
+    STEADY_OVERRIDE.store(runs - 1, Ordering::Relaxed);
 
-    // ---- LEAF: nothing else is alive yet ----
-    let leaf: Vec<Online> = (0..runs)
-        .map(|_| build_chain_proof(h0, n_blocks).t)
-        .collect();
-
-    // ---- FL: two chain children and nothing more ----
+    // ---- LEAF: nothing else is alive; the measured proof BECOMES cp0 ----
     let cp0 = build_chain_proof(h0, n_blocks);
+    let leaf = cp0.onlines.clone();
+    STEADY_OVERRIDE.store(0, Ordering::Relaxed);
     let cp1 = build_chain_proof(cp0.h_end, n_blocks);
-    let fl: Vec<Online> = (0..runs).map(|_| build_fl_node(&cp0, &cp1).t).collect();
+
+    // ---- FL: two chain children and nothing more; the measured FL is fl0 ----
+    STEADY_OVERRIDE.store(runs - 1, Ordering::Relaxed);
+    let fl0 = build_fl_node(&cp0, &cp1);
+    let fl = fl0.onlines.clone();
+    STEADY_OVERRIDE.store(0, Ordering::Relaxed);
 
     // ---- INTERNAL: two FL children plus cp0 (the lane's chain materials).
     // The right pair is built in a scope so it is dropped before timing.
-    let fl0 = build_fl_node(&cp0, &cp1);
     let fl1 = {
         let cp2 = build_chain_proof(cp1.h_end, n_blocks);
         let cp3 = build_chain_proof(cp2.h_end, n_blocks);
@@ -24022,12 +24127,10 @@ fn tower_online_bench() {
     let chain_mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
     let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
     let chain_jp = chain_jagged_params(&cp0);
-    // ---- INTERNAL vs SPINE, ALTERNATED IN ONE PROCESS ----
-    // The A/B discipline this box demands (sustained proving corrupts its
-    // own measurements within a process): both node shapes are built from
-    // materials that are ALL resident, and the runs interleave, so drift
-    // hits both arms equally. Running five of one then five of the other
-    // gave +3.0% at the dev size and -4.3% at m32 — the box, not a signal.
+    // ---- INTERNAL vs SPINE, one call each ----
+    // Both arms' online iterations run back to back inside their builder
+    // call (seconds apart, not the old minutes-apart interleave), from
+    // materials that are ALL resident before either starts.
     //
     // The SPINE's steady node is a fresh FL plus a NODE child whose
     // accumulator it inherits, built exactly as the convergence test
@@ -24068,55 +24171,47 @@ fn tower_online_bench() {
         let lane = base.lane_acc.clone().expect("the base's lane");
         (fresh, base, lane)
     });
-    let mut internal: Vec<Online> = Vec::new();
-    let mut spine: Vec<Online> = Vec::new();
-    for i in 0..runs {
-        // Alternate the ORDER too, so a warm-up bias cannot settle on one
-        // arm: even runs lead with internal, odd runs with the spine.
-        for arm in if i % 2 == 0 { [0, 1] } else { [1, 0] } {
-            if arm == 0 {
-                internal.push(
-                    build_node_outer_app(
-                        &[&fl0.lo, &fl1.lo],
-                        Some(fl0.stmt_base),
-                        Some(ChainLane {
-                            registry: chain_registry,
-                            mats: &chain_mats,
-                            circs: &chain_circs,
-                            circuit: &cp0.inner.built.shape.circuit,
-                            params: &chain_jp,
-                            priors: &[&fl0.acc, &fl1.acc],
-                            claims_base: fl0.fold_pub_base,
-                        }),
-                        None,
-                    )
-                    .online,
-                );
-            } else if let Some((fresh, base, lane)) = &spine_mats {
-                spine.push(
-                    build_node_outer_app(
-                        &[&fresh.lo, &base.lo],
-                        Some(fl0.stmt_base),
-                        Some(ChainLane {
-                            registry: chain_registry,
-                            mats: &chain_mats,
-                            circs: &chain_circs,
-                            circuit: &cp0.inner.built.shape.circuit,
-                            params: &chain_jp,
-                            priors: &[&fresh.acc, lane],
-                            claims_base: fl0.fold_pub_base,
-                        }),
-                        Some(SpineIn {
-                            node_child: 1,
-                            prior: &base.block,
-                            forge: false,
-                        }),
-                    )
-                    .online,
-                );
-            }
+    STEADY_OVERRIDE.store(runs - 1, Ordering::Relaxed);
+    let internal: Vec<Online> = build_node_outer_app(
+        &[&fl0.lo, &fl1.lo],
+        Some(fl0.stmt_base),
+        Some(ChainLane {
+            registry: chain_registry,
+            mats: &chain_mats,
+            circs: &chain_circs,
+            circuit: &cp0.inner.built.shape.circuit,
+            params: &chain_jp,
+            priors: &[&fl0.acc, &fl1.acc],
+            claims_base: fl0.fold_pub_base,
+        }),
+        None,
+    )
+    .onlines;
+    let spine: Vec<Online> = match &spine_mats {
+        Some((fresh, base, lane)) => {
+            build_node_outer_app(
+                &[&fresh.lo, &base.lo],
+                Some(fl0.stmt_base),
+                Some(ChainLane {
+                    registry: chain_registry,
+                    mats: &chain_mats,
+                    circs: &chain_circs,
+                    circuit: &cp0.inner.built.shape.circuit,
+                    params: &chain_jp,
+                    priors: &[&fresh.acc, lane],
+                    claims_base: fl0.fold_pub_base,
+                }),
+                Some(SpineIn {
+                    node_child: 1,
+                    prior: &base.block,
+                    forge: false,
+                }),
+            )
+            .onlines
         }
-    }
+        None => Vec::new(),
+    };
+    STEADY_OVERRIDE.store(usize::MAX, Ordering::Relaxed);
 
     let (leaf_on, fl_on, int_on) = (
         median_total(&leaf),
