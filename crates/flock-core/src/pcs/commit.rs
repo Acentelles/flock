@@ -394,10 +394,15 @@ pub fn commit_lane_major(q: &[F128], params: &PcsParams) -> (Commitment, ProverD
     // below still writes the dead slots as zeros and the Merkle hashes the
     // same bytes; only the dead lanes' arithmetic and traffic are skipped.
     // The scan reads only the dead lanes plus the first live one from the
-    // top (early-exit on the first nonzero word).
+    // top (early-exit on the first nonzero word). `FLOCK_NTT_NO_SKIP=1`
+    // disables the skip (live = t, the pre-skip behavior) — the
+    // CERTIFICATION knob for alternating A/B benches; the byte-identity
+    // oracles pin that both settings produce the same commitment.
     let mut live = t;
-    while live > 0 && q[(live - 1) * d..live * d].iter().all(|w| w.is_zero()) {
-        live -= 1;
+    if std::env::var_os("FLOCK_NTT_NO_SKIP").is_none() {
+        while live > 0 && q[(live - 1) * d..live * d].iter().all(|w| w.is_zero()) {
+            live -= 1;
+        }
     }
     let codeword_len = params.n_positions() * t;
     let mut codeword = crate::scratch::take_f128(codeword_len);
