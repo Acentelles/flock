@@ -13502,6 +13502,89 @@ fn fl_node_three_ary() {
     );
 }
 
+/// **THE ENVELOPE CONTENT PROBE** — the m\* headroom question: the FL's and
+/// the internal node's UNFLOORED content (dense_words / content dense_m)
+/// under free counts, against the m\*28 cap (2^21 packed words). The
+/// per-type breakdown (used_cols × rows, descending) is the diet map if the
+/// gap needs closing. `CHAIN_BLOCKS` sizes the leaves (the real question is
+/// 262144 = m32); `TOWER_PROFILE=slim` for the envelope.
+#[test]
+#[ignore] // Heavy at m32 — four chain proofs, two FLs, one node.
+fn envelope_content_probe() {
+    let n_blocks: usize = std::env::var("CHAIN_BLOCKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256);
+    let mut rng = Rng(0xC4A1_00CE);
+    let h0: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+    let mut cps = Vec::new();
+    let mut h = h0;
+    for _ in 0..4 {
+        let cp = build_chain_proof(h, n_blocks);
+        h = cp.h_end;
+        cps.push(cp);
+    }
+    let fl0 = build_fl_node(&cps[0], &cps[1]);
+    let fl1 = build_fl_node(&cps[2], &cps[3]);
+    let chain_registry = &cps[0].inner.built.shape.registry;
+    let blake_r1cs = blake3::build_block_r1cs(cps[0].inner.nu);
+    let blake_lc = blake_r1cs.csc_lincheck_circuit();
+    let chain_mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
+    let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
+    let chain_jp = chain_jagged_params(&cps[0]);
+    let node = build_node_outer_app(
+        &[&fl0.lo, &fl1.lo],
+        Some(fl0.stmt_base),
+        Some(ChainLane {
+            registry: chain_registry,
+            mats: &chain_mats,
+            circs: &chain_circs,
+            circuit: &cps[0].inner.built.shape.circuit,
+            params: &chain_jp,
+            priors: &[&fl0.acc, &fl1.acc],
+            claims_base: fl0.fold_pub_base,
+        }),
+        None,
+    );
+    println!(
+        "\nENVELOPE CONTENT PROBE — {n_blocks} compressions/leaf, profile {:?}\n  \
+         m28 cap = {} words | m29 cap = {} words",
+        tower_profile(),
+        1usize << (28 - 7),
+        1usize << (29 - 7),
+    );
+    for (name, lo) in [("FL", &fl0.lo), ("internal", &node.lo)] {
+        let u = UnionInstance::new(&lo.shape.registry, lo.shape.counts.clone());
+        let dw = u.dense_words();
+        println!(
+            "  {name}: dense_words {dw} = {:.1}% of m28 cap | content dense_m {} | floored m {}",
+            100.0 * dw as f64 / (1u64 << 21) as f64,
+            u.dense_m(),
+            outer_union(&lo.shape.registry, lo.shape.counts.clone()).dense_m(),
+        );
+        // The diet map: per-type committed words, descending.
+        let mut per: Vec<(usize, usize, usize, usize)> = lo
+            .shape
+            .registry
+            .types()
+            .iter()
+            .zip(&lo.shape.counts)
+            .enumerate()
+            .map(|(i, (ty, &n_t))| {
+                let cols = ty.useful_bits.div_ceil(128).min(1usize << (ty.k_log - 7));
+                (cols * n_t, i, cols, n_t)
+            })
+            .collect();
+        per.sort_by(|a, b| b.0.cmp(&a.0));
+        for &(words, i, cols, rows) in per.iter().take(8) {
+            println!(
+                "    type {i:2}: {words:>8} words ({cols:3} cols x {rows:6} rows) = {:.1}%",
+                100.0 * words as f64 / dw as f64
+            );
+        }
+    }
+}
+
 /// **FL-ARITY A/B** — the 17% lever, priced in one process. A spine node
 /// consumes ONE fresh FL, so FL arity `k` divides BOTH the FL share and the
 /// node share of the amortised per-leaf cost by `k/2`; what it buys back is
