@@ -2907,6 +2907,16 @@ pub fn prove_multipoint_twisted<C: Challenger>(
                 .iter()
                 .map(|c| (c.z_row.to_vec(), F128::ONE))
                 .collect();
+            let closed = closed_rs_on().then(|| {
+                ClosedRs::build(
+                    &coltabs,
+                    &rows,
+                    &gpow,
+                    rho_pows.as_ref().expect("RS claims carry the conjugates"),
+                    params.n,
+                    used.len(),
+                )
+            });
             let ar = AlignedRsPair {
                 coltabs,
                 rows,
@@ -2915,6 +2925,7 @@ pub fn prove_multipoint_twisted<C: Challenger>(
                 round: 0,
                 nu: params.n,
                 n_used: used.len(),
+                closed,
             };
             let msg = ar.round0_msg(&eq0);
             msg0 = (msg0.0 + msg.0, msg0.1 + msg.1);
@@ -2933,6 +2944,18 @@ pub fn prove_multipoint_twisted<C: Challenger>(
         }
     }
     let t_rs_weight = t.elapsed();
+    if trace && n_rs > 0 {
+        eprintln!(
+            "    [multipoint] rs path: {} (n={} k={} area={} of 2^{m})",
+            match pairs.first() {
+                Some(Pair::AlignedRs(_)) => "ALIGNED closed-form weight",
+                _ => "dense materialized weight",
+            },
+            params.n,
+            params.k,
+            params.area(),
+        );
+    }
     let mut sparse_support: Option<u64> = None;
     if n_g > 0 {
         let sides: Vec<(F128, Vec<F128>, &[F128])> = groups
@@ -3262,6 +3285,134 @@ fn aligned_full_columns(params: &JaggedParams) -> Option<Vec<usize>> {
 /// are exhausted, at which point the state densifies into a [`VirtualPair`]
 /// over the tiny per-column domain. Unaligned shapes (partial counts) keep
 /// the materialized path — their column boundaries straddle fold blocks.
+/// The twisted partner's CONJUGATE EXPANSION, precomputed — what turns the
+/// aligned RS product's round message from a sweep into a handful of
+/// multiplies.
+///
+/// `g = Σ_j γ^j·eq(ρ^{2^{-j}}, ·)` is 128 eq tensors BY DEFINITION (the same
+/// form [`twisted_eq_at`] evaluates for the anchor), and on the aligned
+/// layout a position splits as `u = rank·2^ν + row`, so every eq factor
+/// splits with it. With the weight already in closed form
+/// (`ā(rank,row) = Σ_i coltab_i[rank]·s_i·eq(z_row_i, row)`) each message
+/// term separates into a COLUMN dot and a ROW product:
+///
+/// ```text
+///   Σ_u ā(u)·eq(ρ⁽ʲ⁾,u) = Σ_i s_i·[Σ_rank coltab_i·eq(ρ⁽ʲ⁾_hi, rank)]
+///                                 ·[Π_b (1 + z_i,b + ρ⁽ʲ⁾_b)]
+/// ```
+///
+/// The column dot is CONSTANT across every row round — the folds only ever
+/// bind row bits, so `ρ⁽ʲ⁾_hi` never moves — and the row product is a
+/// suffix product, so both precompute once. A round then costs `O(128·R)`
+/// multiplies instead of one linearized-map application per position
+/// (~58M of them at the m32 leaf).
+///
+/// Char 2 does the rest: `g(∞)`'s bit-0 factors are `(1+x) + x = 1` on both
+/// sides, so the infinity leg drops them entirely, and `g(1)` keeps just
+/// `z_i,round·ρ⁽ʲ⁾_round`.
+struct ClosedRs {
+    /// `γ^j` times the accumulated fold factors `Π_{b<round}(1 + ρ⁽ʲ⁾_b + r_b)`
+    /// — the same `(1 + point + r)` the weight scalars and
+    /// [`Partner::advance`] use.
+    coef: Vec<F128>,
+    /// The conjugate points `ρ^{2^{-j}}`, full length `m`.
+    pts: Vec<Vec<F128>>,
+    /// `coldot[i][j] = Σ_rank coltab_i[rank]·eq(ρ⁽ʲ⁾[ν..], rank)`.
+    coldot: Vec<Vec<F128>>,
+    /// `suf[i][j][b] = Π_{b ≤ b' < ν} (1 + z_row_i[b'] + ρ⁽ʲ⁾[b'])`.
+    suf: Vec<Vec<Vec<F128>>>,
+}
+
+impl ClosedRs {
+    fn build(
+        coltabs: &[Vec<F128>],
+        rows: &[(Vec<F128>, F128)],
+        gpow: &[F128],
+        rho_pows: &[Vec<F128>],
+        nu: usize,
+        n_used: usize,
+    ) -> Self {
+        let n_j = rho_pows.len();
+        let coldot: Vec<Vec<F128>> = coltabs
+            .iter()
+            .map(|ct| {
+                (0..n_j)
+                    .map(|j| {
+                        let hi = &rho_pows[j][nu..];
+                        (0..n_used)
+                            .map(|rank| {
+                                let mut e = ct[rank];
+                                for (b, &p) in hi.iter().enumerate() {
+                                    e *= if (rank >> b) & 1 == 1 {
+                                        p
+                                    } else {
+                                        F128::ONE + p
+                                    };
+                                }
+                                e
+                            })
+                            .fold(F128::ZERO, |a, x| a + x)
+                    })
+                    .collect()
+            })
+            .collect();
+        let suf: Vec<Vec<Vec<F128>>> = rows
+            .iter()
+            .map(|(z, _)| {
+                (0..n_j)
+                    .map(|j| {
+                        let mut s = vec![F128::ONE; nu + 1];
+                        for b in (0..nu).rev() {
+                            s[b] = s[b + 1] * (F128::ONE + z[b] + rho_pows[j][b]);
+                        }
+                        s
+                    })
+                    .collect()
+            })
+            .collect();
+        Self {
+            coef: gpow[..n_j].to_vec(),
+            pts: rho_pows.to_vec(),
+            coldot,
+            suf,
+        }
+    }
+
+    /// Bind the round's row bit at `r`: every conjugate tensor drops that
+    /// coordinate and scales, exactly as the weight's own scalars do.
+    fn advance(&mut self, round: usize, r: F128) {
+        for (c, p) in self.coef.iter_mut().zip(&self.pts) {
+            *c *= F128::ONE + p[round] + r;
+        }
+    }
+
+    /// `(g(1), g(∞))` for the state at `round`, given the weight's running
+    /// per-claim scalars.
+    fn msg(&self, round: usize, rows: &[(Vec<F128>, F128)]) -> (F128, F128) {
+        let (mut g1, mut gi) = (F128::ZERO, F128::ZERO);
+        for (j, &c) in self.coef.iter().enumerate() {
+            let p_r = self.pts[j][round];
+            let (mut s1, mut si) = (F128::ZERO, F128::ZERO);
+            for (i, (z, s)) in rows.iter().enumerate() {
+                let t = self.coldot[i][j] * *s * self.suf[i][j][round + 1];
+                si += t;
+                s1 += t * z[round] * p_r;
+            }
+            g1 += c * s1;
+            gi += c * si;
+        }
+        (g1, gi)
+    }
+}
+
+/// `FLOCK_NO_CLOSED_RS=1` restores the pointwise message (one partner
+/// evaluation per position) — the certification knob for the byte-identity
+/// A/B, since the two paths must produce the same field elements.
+fn closed_rs_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_CLOSED_RS").is_none())
+}
+
 struct AlignedRsPair {
     /// Per claim: γ-baked column factors in used-rank order
     /// (`gpow[128 i]·eq_col_i[y_j]`).
@@ -3273,6 +3424,8 @@ struct AlignedRsPair {
     round: usize,
     nu: usize,
     n_used: usize,
+    /// The closed-form message state. `None` under `FLOCK_NO_CLOSED_RS`.
+    closed: Option<ClosedRs>,
 }
 
 impl AlignedRsPair {
@@ -3281,6 +3434,9 @@ impl AlignedRsPair {
     fn round0_msg(&self, eq0: &SplitEq) -> (F128, F128) {
         use rayon::prelude::*;
         debug_assert_eq!(self.round, 0);
+        if let Some(c) = &self.closed {
+            return c.msg(0, &self.rows);
+        }
         let row_eqs: Vec<SplitEq> = self
             .rows
             .iter()
@@ -3310,7 +3466,13 @@ impl AlignedRsPair {
         for (z, s) in self.rows.iter_mut() {
             *s *= F128::ONE + z[self.round] + r;
         }
+        if let Some(c) = &mut self.closed {
+            c.advance(self.round, r);
+        }
         self.round += 1;
+        if let Some(c) = &self.closed {
+            return c.msg(self.round, &self.rows);
+        }
         let s_rem = self.nu - self.round;
         debug_assert!(
             s_rem >= 1,
