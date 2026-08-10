@@ -2932,6 +2932,7 @@ pub fn prove_multipoint_twisted<C: Challenger>(
             pairs.push(Pair::Virtual(VirtualPair::new(av, partner, rho, 0, area)));
         }
     }
+    let t_rs_weight = t.elapsed();
     let mut sparse_support: Option<u64> = None;
     if n_g > 0 {
         let sides: Vec<(F128, Vec<F128>, &[F128])> = groups
@@ -2956,13 +2957,16 @@ pub fn prove_multipoint_twisted<C: Challenger>(
     }
     if trace {
         eprintln!(
-            "    [multipoint] weight passes (2^{m}, {} products{}, round-0 fused): {:6.2} ms",
+            "    [multipoint] weight passes (2^{m}, {} products{}, round-0 fused): {:6.2} ms  \
+             (rs {:.2} | group {:.2})",
             pairs.len(),
             match sparse_support {
                 Some(s) => format!(" — group sparse, support {s} words"),
                 None => String::new(),
             },
-            t.elapsed().as_secs_f64() * 1e3
+            t.elapsed().as_secs_f64() * 1e3,
+            t_rs_weight.as_secs_f64() * 1e3,
+            (t.elapsed() - t_rs_weight).as_secs_f64() * 1e3,
         );
     }
 
@@ -2975,6 +2979,12 @@ pub fn prove_multipoint_twisted<C: Challenger>(
     let t = std::time::Instant::now();
     let mut rounds = Vec::with_capacity(m);
     let mut point = Vec::with_capacity(m);
+    // Per-PAIR fold attribution: which product's rounds cost what. The two
+    // products are not comparable — the RS side folds the whole area against
+    // a TWISTED partner (a linearized-map application per element), the group
+    // side a sparse support against a scaled `eq` — so the aggregate hides
+    // which one any optimisation would actually reach.
+    let mut per_pair = vec![std::time::Duration::ZERO; pairs.len()];
     let (mut g_one, mut g_inf) = msg0;
     let mut cur = 1usize << m;
     for i in 0..m {
@@ -2987,8 +2997,12 @@ pub fn prove_multipoint_twisted<C: Challenger>(
             break;
         }
         let mut nxt = (F128::ZERO, F128::ZERO);
-        for pair in pairs.iter_mut() {
+        for (pi, pair) in pairs.iter_mut().enumerate() {
+            let t_pair = trace.then(std::time::Instant::now);
             let msg = pair.fold_round(cur, r);
+            if let Some(t0) = t_pair {
+                per_pair[pi] += t0.elapsed();
+            }
             nxt = (nxt.0 + msg.0, nxt.1 + msg.1);
         }
         (g_one, g_inf) = nxt;
@@ -3003,9 +3017,18 @@ pub fn prove_multipoint_twisted<C: Challenger>(
         }
     }
     if trace {
+        let split: Vec<String> = per_pair
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                let side = if i == 0 && n_rs > 0 { "rs" } else { "group" };
+                format!("{side} {:.2}", d.as_secs_f64() * 1e3)
+            })
+            .collect();
         eprintln!(
-            "    [multipoint] two-product sumcheck ({m} rounds): {:6.2} ms",
-            t.elapsed().as_secs_f64() * 1e3
+            "    [multipoint] two-product sumcheck ({m} rounds): {:6.2} ms  (folds: {})",
+            t.elapsed().as_secs_f64() * 1e3,
+            split.join(" | "),
         );
     }
 
