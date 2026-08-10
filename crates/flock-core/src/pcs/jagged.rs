@@ -2945,8 +2945,37 @@ pub fn prove_multipoint_twisted<C: Challenger>(
     }
     let t_rs_weight = t.elapsed();
     if trace && n_rs > 0 {
+        // Which columns could take a closed form, and which cannot: the
+        // height histogram is what decides whether the aligned kernel
+        // generalizes to this shape at all.
+        let pfx = &params.col_prefix_sums;
+        let full = 1u64 << params.n;
+        let mut hist: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
+        for y in 0..pfx.len() - 1 {
+            let h = pfx[y + 1] - pfx[y];
+            if h > 0 {
+                *hist.entry(h).or_default() += 1;
+            }
+        }
+        let n_full: usize = hist.get(&full).copied().unwrap_or(0);
+        let n_pow2: usize = hist
+            .iter()
+            .filter(|(h, _)| h.is_power_of_two())
+            .map(|(_, c)| *c)
+            .sum();
+        let used: usize = hist.values().sum();
+        let mut shape: Vec<String> = hist
+            .iter()
+            .rev()
+            .take(6)
+            .map(|(h, c)| format!("{h}x{c}"))
+            .collect();
+        if hist.len() > 6 {
+            shape.push(format!("+{} more", hist.len() - 6));
+        }
         eprintln!(
-            "    [multipoint] rs path: {} (n={} k={} area={} of 2^{m})",
+            "    [multipoint] rs path: {} (n={} k={} area={} of 2^{m}); columns {used} used, \
+             {n_full} full(2^{}), {n_pow2} pow2; heights {}",
             match pairs.first() {
                 Some(Pair::AlignedRs(_)) => "ALIGNED closed-form weight",
                 _ => "dense materialized weight",
@@ -2954,6 +2983,8 @@ pub fn prove_multipoint_twisted<C: Challenger>(
             params.n,
             params.k,
             params.area(),
+            params.n,
+            shape.join(" "),
         );
     }
     let mut sparse_support: Option<u64> = None;
