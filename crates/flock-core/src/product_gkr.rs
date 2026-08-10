@@ -758,6 +758,94 @@ fn gv_build_prev(v: &GVec) -> GVec {
 /// per-group prefixes (the odd boundary pair mixes in a 1); once
 /// `rows == 1`, folds pair adjacent GROUPS (both-ones pairs stay 1
 /// without a write).
+/// Fold all FOUR grouped views at `rho` in one dispatch. Fold-only — each
+/// (vector, group) task walks its OWN live length, so none of the
+/// max-length interleaving that made the fold+message fusion net-negative
+/// (see the rejection note in the round loop) applies here. Two wins over
+/// four [`gv_fold`] calls: one rayon dispatch per round instead of four,
+/// and the parallel gate sees the four vectors' COMBINED work, so layers
+/// whose single-vector folds sat just below the gate parallelize.
+/// Byte-identical: the per-vector fold bodies are `gv_fold`'s verbatim.
+fn gv_fold4(vs: [&GView<'_>; 4], rho: F128) -> [GVec; 4] {
+    let rows = vs[0].rows;
+    debug_assert!(rows >= 2 && vs.iter().all(|v| v.rows == rows));
+    let one_minus = F128::ONE + rho;
+    let rows_out = rows / 2;
+    let ng = vs[0].lens.len();
+    let lens_out: [Vec<usize>; 4] =
+        std::array::from_fn(|j| vs[j].lens.iter().map(|l| l.div_ceil(2)).collect());
+    let mut bufs: [Vec<F128>; 4] =
+        std::array::from_fn(|_| crate::scratch::take_f128(ng * rows_out));
+    let body = |j: usize, g: usize, out: &mut [F128]| {
+        let len = vs[j].lens[g];
+        let full = len / 2;
+        let src = &vs[j].buf[g * rows..g * rows + len];
+        for i in 0..full {
+            out[i] = src[2 * i] * one_minus + src[2 * i + 1] * rho;
+        }
+        if len % 2 == 1 {
+            out[full] = src[len - 1] * one_minus + rho;
+        }
+    };
+    let work: usize = (0..4).map(|j| lens_out[j].iter().sum::<usize>()).sum();
+    if work >= par_threshold() {
+        const CH: usize = 1 << 14;
+        bufs.par_iter_mut().enumerate().for_each(|(j, buf)| {
+            buf[..ng * rows_out]
+                .par_chunks_mut(rows_out)
+                .enumerate()
+                .for_each(|(g, out)| {
+                    let len = vs[j].lens[g];
+                    let full = len / 2;
+                    let src = &vs[j].buf[g * rows..g * rows + len];
+                    out[..full]
+                        .par_chunks_mut(CH)
+                        .enumerate()
+                        .for_each(|(ci, oc)| {
+                            let base = ci * CH;
+                            for (i, o) in oc.iter_mut().enumerate() {
+                                let x = base + i;
+                                *o = src[2 * x] * one_minus + src[2 * x + 1] * rho;
+                            }
+                        });
+                    if len % 2 == 1 {
+                        out[full] = src[len - 1] * one_minus + rho;
+                    }
+                });
+        });
+    } else {
+        for (j, buf) in bufs.iter_mut().enumerate() {
+            for (g, out) in buf[..ng * rows_out].chunks_mut(rows_out).enumerate() {
+                body(j, g, out);
+            }
+        }
+    }
+    let [b0, b1, b2, b3] = bufs;
+    let [l0, l1, l2, l3] = lens_out;
+    [
+        GVec {
+            buf: b0,
+            lens: l0,
+            rows: rows_out,
+        },
+        GVec {
+            buf: b1,
+            lens: l1,
+            rows: rows_out,
+        },
+        GVec {
+            buf: b2,
+            lens: l2,
+            rows: rows_out,
+        },
+        GVec {
+            buf: b3,
+            lens: l3,
+            rows: rows_out,
+        },
+    ]
+}
+
 fn gv_fold(v: &GView<'_>, rho: F128) -> GVec {
     let one_minus = F128::ONE + rho;
     if v.rows >= 2 {
@@ -1578,19 +1666,32 @@ fn prove_batched_grouped<C: Challenger>(
             let rho = ch.sample_f128();
             rounds.push(msg);
             r_prime.push(rho);
-            let next = match &cur {
-                None => [
-                    gv_fold(&l0v, rho),
-                    gv_fold(&l1v, rho),
-                    gv_fold(&r0v, rho),
-                    gv_fold(&r1v, rho),
-                ],
-                Some([a, b, c, d]) => [
-                    gv_fold(&a.view(), rho),
-                    gv_fold(&b.view(), rho),
-                    gv_fold(&c.view(), rho),
-                    gv_fold(&d.view(), rho),
-                ],
+            let cur_rows = match &cur {
+                None => l0v.rows,
+                Some([a, ..]) => a.rows,
+            };
+            let next = if cur_rows >= 2 {
+                match &cur {
+                    None => gv_fold4([&l0v, &l1v, &r0v, &r1v], rho),
+                    Some([a, b, c, d]) => {
+                        gv_fold4([&a.view(), &b.view(), &c.view(), &d.view()], rho)
+                    }
+                }
+            } else {
+                match &cur {
+                    None => [
+                        gv_fold(&l0v, rho),
+                        gv_fold(&l1v, rho),
+                        gv_fold(&r0v, rho),
+                        gv_fold(&r1v, rho),
+                    ],
+                    Some([a, b, c, d]) => [
+                        gv_fold(&a.view(), rho),
+                        gv_fold(&b.view(), rho),
+                        gv_fold(&c.view(), rho),
+                        gv_fold(&d.view(), rho),
+                    ],
+                }
             };
             if let Some(old) = cur.take() {
                 for v in old {
