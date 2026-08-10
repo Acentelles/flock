@@ -2569,14 +2569,26 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
             .map(|s| build_eq_parallel(s))
             .collect()
     };
-    let sparse_supports: Vec<SparseEqTensor> =
-        sparse_suffixes.iter().map(|s| build_eq_sparse(s)).collect();
+    // A sparse tensor exists to feed `fold_1b_rows_sparse`; a claim whose
+    // `s_hat_v` is PRECOMPUTED never folds, and the shipped merged
+    // transport's rs_eq_ind re-derives eq from the claim point
+    // (DeferredDense, below) — so for a precomputed claim the tensor would
+    // be built and never read. The envelope outers hit exactly that: a
+    // mixed union's rs claims are Sparse-classified (the element region
+    // freezes ≥3 suffix zeros) AND precomputed, and the unread build
+    // measured ~19 ms of a ~66 ms open. Build only what will fold.
+    let sparse_supports: Vec<Option<SparseEqTensor>> = sparse_suffixes
+        .iter()
+        .enumerate()
+        .map(|(s, sfx)| (!has_precomputed(sparse_to_orig[s])).then(|| build_eq_sparse(sfx)))
+        .collect();
     if trace {
         eprintln!(
-            "    [rs::prove_batched] build_eq dense×{} ({}) + sparse×{}: {:6.2} ms",
+            "    [rs::prove_batched] build_eq dense×{} ({}) + sparse×{} ({} built): {:6.2} ms",
             dense_suffixes.len(),
             if use_split { "split" } else { "full" },
-            sparse_supports.len(),
+            sparse_suffixes.len(),
+            sparse_supports.iter().flatten().count(),
             t.elapsed().as_secs_f64() * 1e3
         );
     }
@@ -2646,7 +2658,10 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
         }
     }
     for &s in &sparse_needs_fold {
-        sparse_s_hat_v[s] = fold_1b_rows_sparse(packed_witness, &sparse_supports[s]);
+        let support = sparse_supports[s]
+            .as_ref()
+            .expect("a needs-fold sparse claim has its tensor built");
+        sparse_s_hat_v[s] = fold_1b_rows_sparse(packed_witness, support);
     }
     if trace {
         eprintln!(
