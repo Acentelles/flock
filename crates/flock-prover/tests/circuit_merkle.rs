@@ -12115,10 +12115,30 @@ fn native_chain(h_start: &[u32; 16], n_blocks: usize) -> [u32; 16] {
 /// walk afterwards. The split is also what makes a leaf's ONLINE cost
 /// measurable: the walk is per-statement (it computes the chain and
 /// materialises the rows), the shape is not.
+#[derive(Clone)]
 struct ChainShape {
     shape: flock_core::circuit::builder::CircuitShape,
     hash: flock_core::circuit::builder::SlotId,
     nu: usize,
+}
+
+/// The chain SHAPE per n_blocks, cached process-wide: the emission+finish
+/// (~1.4 s at m32) is statement-independent — that is the digest pin — so
+/// the tower's material proofs CLONE the cached shape (Registry + Circuit
+/// memcpy, ~an order of magnitude cheaper) instead of re-emitting it.
+/// `build_chain_proof`'s setup_ms honestly reflects whichever it paid.
+fn chain_shape_cached(n_blocks: usize) -> std::sync::Arc<ChainShape> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Cache = Mutex<Vec<(usize, Arc<ChainShape>)>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let mut g = cache.lock().unwrap();
+    if let Some((_, s)) = g.iter().find(|(k, _)| *k == n_blocks) {
+        return s.clone();
+    }
+    let s = Arc::new(build_chain_shape(n_blocks));
+    g.push((n_blocks, s.clone()));
+    s
 }
 
 fn build_chain_shape(n_blocks: usize) -> ChainShape {
@@ -12197,7 +12217,7 @@ struct ChainProof {
 /// itself, so it is reported apart from the proving phases.
 fn build_chain_proof(h_start: [u32; 16], n_blocks: usize) -> ChainProof {
     let t_shape = std::time::Instant::now();
-    let cs = build_chain_shape(n_blocks);
+    let cs: ChainShape = chain_shape_cached(n_blocks).as_ref().clone();
     let shape_ms = t_shape.elapsed().as_secs_f64() * 1e3;
     let (nu, hash) = (cs.nu, cs.hash);
     let t_setup = std::time::Instant::now();

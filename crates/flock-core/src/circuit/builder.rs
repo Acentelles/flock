@@ -286,6 +286,7 @@ where
 
 /// One recorded gate instantiation. Wire indices, not values — this is the
 /// value-independent half.
+#[derive(Clone)]
 struct Step {
     slot: usize,
     inputs: Vec<usize>,
@@ -721,7 +722,7 @@ impl ShapeBuilder {
             nu: self.nu,
             order,
             registry_slot,
-            slots: self.slots,
+            slots: self.slots.into_iter().map(std::sync::Arc::from).collect(),
             slot_types: self.slot_types,
             steps,
             n_wires,
@@ -750,6 +751,7 @@ impl ShapeBuilder {
 ///
 /// The shape is immutable and [`run`](Self::run) takes `&self`, so one shape
 /// serves any number of concurrent proofs.
+#[derive(Clone)]
 pub struct CircuitShape {
     pub registry: Registry,
     pub circuit: Circuit,
@@ -761,7 +763,12 @@ pub struct CircuitShape {
     order: Vec<usize>,
     /// `registry_slot[declared] = registry index`.
     registry_slot: Vec<usize>,
-    slots: Vec<Box<dyn SlotBuild>>,
+    /// `Arc`, not `Box`: the finished shape only ever reads its slots
+    /// (`run` takes `&self`; `take_table`'s `&mut` happened in the builder,
+    /// before `finish` moved them here) — and shared slots are what makes
+    /// the shape `Clone`, so a statement-independent shape can be built
+    /// once and reused across proofs.
+    slots: Vec<std::sync::Arc<dyn SlotBuild>>,
     slot_types: Vec<TypeId>,
     steps: Vec<Step>,
     n_wires: usize,
