@@ -12201,7 +12201,7 @@ fn build_chain_proof(h_start: [u32; 16], n_blocks: usize) -> ChainProof {
     let shape_ms = t_shape.elapsed().as_secs_f64() * 1e3;
     let (nu, hash) = (cs.nu, cs.hash);
     let t_setup = std::time::Instant::now();
-    let blake_r1cs = blake3::build_block_r1cs(nu);
+    let blake_r1cs = chain_blake_r1cs(nu);
     let blake_lc = blake_r1cs.csc_lincheck_circuit();
     let setup_ms = shape_ms + t_setup.elapsed().as_secs_f64() * 1e3;
 
@@ -12575,6 +12575,25 @@ fn chain_jagged_params(cp: &ChainProof) -> flock_core::pcs::jagged::JaggedParams
     )
 }
 
+/// The chain BLAKE3 block R1CS per nu, cached process-wide: the ~21M-nnz
+/// base is identical for every chain proof and every FL's chain-side fold
+/// materials, and the tower bench used to build ten of them. Serves the
+/// borrow-only sites; callers that STORE an R1CS (LeafOuter) still build
+/// their own.
+fn chain_blake_r1cs(nu: usize) -> std::sync::Arc<flock_core::r1cs::BlockR1cs> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Cache = Mutex<Vec<(usize, Arc<flock_core::r1cs::BlockR1cs>)>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let mut g = cache.lock().unwrap();
+    if let Some((_, r)) = g.iter().find(|(k, _)| *k == nu) {
+        return r.clone();
+    }
+    let r = Arc::new(blake3::build_block_r1cs(nu));
+    g.push((nu, r.clone()));
+    r
+}
+
 /// The FL's per-statement tape source, bare: ONE recording deferred verify
 /// of a chain child. The pin/locate scaffolding is per-shape and lives in
 /// [`ChildTape::new`]; this is what an online iteration re-pays (results
@@ -12646,7 +12665,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
     let sigmas: Vec<_> = cps.iter().map(|cp| cp.inner.sigma.clone()).collect();
 
     // ---- the native fold: boolean + sigma, NO element groups, NO priors ----
-    let blake_r1cs = blake3::build_block_r1cs(cp0.inner.nu);
+    let blake_r1cs = chain_blake_r1cs(cp0.inner.nu);
     let blake_lc = blake_r1cs.csc_lincheck_circuit();
     let mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
     let el_mats: [flock_core::aggregate::ElementMatrices; 0] = [];
@@ -24105,76 +24124,44 @@ fn tower_online_bench() {
     STEADY_OVERRIDE.store(0, Ordering::Relaxed);
     let cp1 = build_chain_proof(cp0.h_end, n_blocks);
 
-    // ---- FL: two chain children and nothing more; the measured FL is fl0 ----
+    // ---- FL: two chain children and nothing more. The measured FL is the
+    // spine's FRESH child — the EARLIEST segments, since a spine PREPENDS —
+    // so the measured leaf and FL become the tower's own materials. ----
     STEADY_OVERRIDE.store(runs - 1, Ordering::Relaxed);
-    let fl0 = build_fl_node(&cp0, &cp1);
-    let fl = fl0.onlines.clone();
+    let fresh = build_fl_node(&cp0, &cp1);
+    let fl = fresh.onlines.clone();
     STEADY_OVERRIDE.store(0, Ordering::Relaxed);
 
-    // ---- INTERNAL: two FL children plus cp0 (the lane's chain materials).
-    // The right pair is built in a scope so it is dropped before timing.
-    let fl1 = {
+    // ---- the rest of the tower: four more segments, two more FLs. The
+    // INTERNAL arm's node doubles as the spine's BASE child (identical
+    // children shape — the old separate base build was pure waste), so the
+    // whole tower is 6 chain proofs, 3 FLs and 2 node builds where it was
+    // 10, 5 and 3. The segment pairs are scoped so they drop once folded —
+    // what production carries.
+    let (fl0, fl1) = {
         let cp2 = build_chain_proof(cp1.h_end, n_blocks);
         let cp3 = build_chain_proof(cp2.h_end, n_blocks);
-        build_fl_node(&cp2, &cp3)
+        let cp4 = build_chain_proof(cp3.h_end, n_blocks);
+        let cp5 = build_chain_proof(cp4.h_end, n_blocks);
+        (build_fl_node(&cp2, &cp3), build_fl_node(&cp4, &cp5))
     };
     drop(cp1);
     // The lane is what production carries: the children's chain
     // accumulators fold in a priors-only aggregate of their own.
     let chain_registry = &cp0.inner.built.shape.registry;
-    let blake_r1cs = blake3::build_block_r1cs(cp0.inner.nu);
+    let blake_r1cs = chain_blake_r1cs(cp0.inner.nu);
     let blake_lc = blake_r1cs.csc_lincheck_circuit();
     let chain_mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
     let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
     let chain_jp = chain_jagged_params(&cp0);
-    // ---- INTERNAL vs SPINE, one call each ----
+    // ---- INTERNAL (= the spine's base) then SPINE, one call each ----
     // Both arms' online iterations run back to back inside their builder
     // call (seconds apart, not the old minutes-apart interleave), from
     // materials that are ALL resident before either starts.
-    //
-    // The SPINE's steady node is a fresh FL plus a NODE child whose
-    // accumulator it inherits, built exactly as the convergence test
-    // builds node_2. It needs its OWN chain: a spine grows by PREPENDING,
-    // so the fresh FL covers the segments BEFORE the node child's, and
-    // the pair alive above starts at h0 with nothing before it.
-    let spine_mats = envelope_shape().is_some().then(|| {
-        let (fresh, h_mid) = {
-            let s0 = build_chain_proof(h0, n_blocks);
-            let s1 = build_chain_proof(s0.h_end, n_blocks);
-            let h_mid = s1.h_end;
-            (build_fl_node(&s0, &s1), h_mid)
-        };
-        // The base's own children are scoped away — once it is built only
-        // its outputs matter, which is what production carries.
-        let base = {
-            let s2 = build_chain_proof(h_mid, n_blocks);
-            let s3 = build_chain_proof(s2.h_end, n_blocks);
-            let b0 = build_fl_node(&s2, &s3);
-            let s4 = build_chain_proof(s3.h_end, n_blocks);
-            let s5 = build_chain_proof(s4.h_end, n_blocks);
-            let b1 = build_fl_node(&s4, &s5);
-            build_node_outer_app(
-                &[&b0.lo, &b1.lo],
-                Some(fl0.stmt_base),
-                Some(ChainLane {
-                    registry: chain_registry,
-                    mats: &chain_mats,
-                    circs: &chain_circs,
-                    circuit: &cp0.inner.built.shape.circuit,
-                    params: &chain_jp,
-                    priors: &[&b0.acc, &b1.acc],
-                    claims_base: fl0.fold_pub_base,
-                }),
-                None,
-            )
-        };
-        let lane = base.lane_acc.clone().expect("the base's lane");
-        (fresh, base, lane)
-    });
     STEADY_OVERRIDE.store(runs - 1, Ordering::Relaxed);
-    let internal: Vec<Online> = build_node_outer_app(
+    let base = build_node_outer_app(
         &[&fl0.lo, &fl1.lo],
-        Some(fl0.stmt_base),
+        Some(fresh.stmt_base),
         Some(ChainLane {
             registry: chain_registry,
             mats: &chain_mats,
@@ -24182,34 +24169,37 @@ fn tower_online_bench() {
             circuit: &cp0.inner.built.shape.circuit,
             params: &chain_jp,
             priors: &[&fl0.acc, &fl1.acc],
-            claims_base: fl0.fold_pub_base,
+            claims_base: fresh.fold_pub_base,
         }),
         None,
-    )
-    .onlines;
-    let spine: Vec<Online> = match &spine_mats {
-        Some((fresh, base, lane)) => {
-            build_node_outer_app(
-                &[&fresh.lo, &base.lo],
-                Some(fl0.stmt_base),
-                Some(ChainLane {
-                    registry: chain_registry,
-                    mats: &chain_mats,
-                    circs: &chain_circs,
-                    circuit: &cp0.inner.built.shape.circuit,
-                    params: &chain_jp,
-                    priors: &[&fresh.acc, lane],
-                    claims_base: fl0.fold_pub_base,
-                }),
-                Some(SpineIn {
-                    node_child: 1,
-                    prior: &base.block,
-                    forge: false,
-                }),
-            )
-            .onlines
-        }
-        None => Vec::new(),
+    );
+    let internal = base.onlines.clone();
+    // The steady spine node: the fresh FL (the segments BEFORE the base's)
+    // plus the base as the node child whose accumulator it inherits —
+    // built exactly as the convergence test builds node_2.
+    let spine: Vec<Online> = if envelope_shape().is_some() {
+        let lane = base.lane_acc.clone().expect("the base's lane");
+        build_node_outer_app(
+            &[&fresh.lo, &base.lo],
+            Some(fresh.stmt_base),
+            Some(ChainLane {
+                registry: chain_registry,
+                mats: &chain_mats,
+                circs: &chain_circs,
+                circuit: &cp0.inner.built.shape.circuit,
+                params: &chain_jp,
+                priors: &[&fresh.acc, &lane],
+                claims_base: fresh.fold_pub_base,
+            }),
+            Some(SpineIn {
+                node_child: 1,
+                prior: &base.block,
+                forge: false,
+            }),
+        )
+        .onlines
+    } else {
+        Vec::new()
     };
     STEADY_OVERRIDE.store(usize::MAX, Ordering::Relaxed);
 
