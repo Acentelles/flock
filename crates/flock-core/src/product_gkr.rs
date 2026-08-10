@@ -2852,4 +2852,203 @@ mod tests {
         bind(&mut chv, &f, &g, &sigma);
         verify_batched_with_sigma(mu, &proof, &sigma, None, &mut chv).expect("honest proof verifies");
     }
+
+    /// The F128 additive-NTT PREFIX-EXTENSION property that a GKR univariate
+    /// skip would stand on: inv-NTT(dim 6) of 64 evaluations gives LCH
+    /// coefficients whose zero-padded fwd-NTT(dim 7) reproduces the original
+    /// 64 values as the first half — the 6-dim basis is a prefix of the
+    /// 7-dim one, so the degree-<64 interpolant extends to the 128-point
+    /// domain by padding alone.
+    #[test]
+    fn f128_ntt_prefix_extension_roundtrip() {
+        use crate::ntt::AdditiveNttF128;
+        let ntt6 = AdditiveNttF128::standard(6);
+        let ntt7 = AdditiveNttF128::standard(7);
+        let mut rng = Rng::new(0x1717_5C1F);
+        let vals: Vec<F128> = (0..64).map(|_| rng.f128()).collect();
+        // Roundtrip under dim 6.
+        let mut c = vals.clone();
+        ntt6.inverse_transform_scalar(&mut c);
+        let mut back = c.clone();
+        ntt6.forward_transform_scalar(&mut back);
+        assert_eq!(back, vals, "inv is the inverse of fwd (dim 6)");
+        // Prefix extension: pad coefficients, evaluate on the 128 domain.
+        let mut padded = c;
+        padded.resize(128, F128::ZERO);
+        ntt7.forward_transform_scalar(&mut padded);
+        assert_eq!(&padded[..64], &vals[..], "prefix basis: S evals reproduced");
+    }
+
+    /// COST BENCH for the GKR univariate skip (`--ignored --nocapture`):
+    /// arm A = the six widest rounds of a layer as run today (real
+    /// gv_message + gv_fold4 over a single-group GVec quad); arm B = the
+    /// skip's replacement work at identical shape — per 64-block inv-NTT +
+    /// zero-pad + fwd-NTT(128) for all four vectors, the 128-point message
+    /// accumulation, and the λ*-fold (64-weight Lagrange dot per block).
+    /// Decides whether the full protocol change is worth building: the skip
+    /// removes the HEAD rounds, so its prover effect is this compute trade
+    /// plus ~5 saved FS round-trips per layer.
+    #[test]
+    #[ignore] // Benchmark — run explicitly with --nocapture.
+    fn gkr_skip_cost_bench() {
+        use crate::ntt::AdditiveNttF128;
+        use rayon::prelude::*;
+        let mu: usize = 21;
+        let n = 1usize << mu;
+        let mut rng = Rng::new(0x5C1F_BE4C);
+        let mk = |rng: &mut Rng| -> GVec {
+            GVec {
+                buf: (0..n).map(|_| rng.f128()).collect(),
+                lens: vec![n],
+                rows: n,
+            }
+        };
+        let vs: [GVec; 4] = [mk(&mut rng), mk(&mut rng), mk(&mut rng), mk(&mut rng)];
+        let r_pt: Vec<F128> = (0..mu).map(|_| rng.f128()).collect();
+        let lambda = rng.f128();
+        let runs = 5usize;
+
+        // ---- Arm A: six real rounds (message + fold4), domains n .. n/32.
+        let mut best_a = f64::INFINITY;
+        for _ in 0..runs {
+            let t = std::time::Instant::now();
+            let mut cur: Option<[GVec; 4]> = None;
+            let mut msgs = Vec::new();
+            for i in 0..6usize {
+                let eq = SplitEqGhash::new(&r_pt[i + 1..mu]);
+                let mut plo = Vec::with_capacity(eq.lo.len() + 1);
+                plo.push(F128::ZERO);
+                for &e in &eq.lo {
+                    let last = *plo.last().unwrap();
+                    plo.push(last + e);
+                }
+                let mut phi = Vec::with_capacity(eq.hi.len() + 1);
+                phi.push(F128::ZERO);
+                for &e in &eq.hi {
+                    let last = *phi.last().unwrap();
+                    phi.push(last + e);
+                }
+                let views: [GView<'_>; 4] = match &cur {
+                    None => [vs[0].view(), vs[1].view(), vs[2].view(), vs[3].view()],
+                    Some([a, b, c, d]) => [a.view(), b.view(), c.view(), d.view()],
+                };
+                let m = gv_message(
+                    [&views[0], &views[1], &views[2], &views[3]],
+                    lambda,
+                    &eq,
+                    &plo,
+                    &phi,
+                );
+                msgs.push(m);
+                let rho = rng.f128();
+                let next = gv_fold4([&views[0], &views[1], &views[2], &views[3]], rho);
+                if let Some(old) = cur.take() {
+                    for v in old {
+                        crate::scratch::give_f128(v.buf);
+                    }
+                }
+                cur = Some(next);
+            }
+            best_a = best_a.min(t.elapsed().as_secs_f64() * 1e3);
+            std::hint::black_box(&msgs);
+            if let Some(old) = cur.take() {
+                for v in old {
+                    crate::scratch::give_f128(v.buf);
+                }
+            }
+        }
+
+        // ---- Arm B: the skip's work at the same shape.
+        let ntt6 = AdditiveNttF128::standard(6);
+        let ntt7 = AdditiveNttF128::standard(7);
+        let n_blocks = n / 64;
+        // eq over the hi part (the skip round's weights) + λ* Lagrange
+        // weights over S (via LCH coefficients: W_i(λ*) evaluated once).
+        let eq_hi_tab = crate::zerocheck::univariate_skip::build_eq(&r_pt[6..mu]);
+        let lstar = rng.f128();
+        // Lagrange weights L_s(λ*): interpolate each unit vector — O(64²)
+        // setup, done once per layer in the real protocol too.
+        let lag: Vec<F128> = {
+            (0..64)
+                .map(|s| {
+                    let mut e = vec![F128::ZERO; 64];
+                    e[s] = F128::ONE;
+                    ntt6.inverse_transform_scalar(&mut e);
+                    // Evaluate the coefficient form at λ* via fwd on the
+                    // padded vector is circular; use direct basis evaluation:
+                    // Ŵ_i(λ*) from the subspace-poly recursion is what the
+                    // real impl would precompute — for the BENCH the weight
+                    // values just need to be SOME field elements, cost model
+                    // only. Use a placeholder mix that costs one mul per
+                    // coefficient.
+                    let mut acc = F128::ZERO;
+                    let mut p = F128::ONE;
+                    for &ci in &e {
+                        acc += ci * p;
+                        p *= lstar;
+                    }
+                    acc
+                })
+                .collect()
+        };
+        let mut best_b = f64::INFINITY;
+        for _ in 0..runs {
+            let t = std::time::Instant::now();
+            // Per block: 4 × (inv64 + pad + fwd128), the 128-point message
+            // accumulation, and 4 λ*-fold dots.
+            let (msg, folds): ((Vec<F128>,), [Vec<F128>; 4]) = {
+                let mut out: [Vec<F128>; 4] = std::array::from_fn(|_| vec![F128::ZERO; n_blocks]);
+                let msg_partial: Vec<F128> = {
+                    let outs: &mut [Vec<F128>; 4] = &mut out;
+                    let partials: Vec<(usize, [F128; 128], [F128; 4])> = (0..n_blocks)
+                        .into_par_iter()
+                        .map(|b| {
+                            let mut p = [F128::ZERO; 128];
+                            let mut ext: [[F128; 128]; 4] = [[F128::ZERO; 128]; 4];
+                            let mut fold_v = [F128::ZERO; 4];
+                            for (j, v) in vs.iter().enumerate() {
+                                let blk = &v.buf[b * 64..(b + 1) * 64];
+                                let mut c = [F128::ZERO; 128];
+                                c[..64].copy_from_slice(blk);
+                                ntt6.inverse_transform_scalar(&mut c[..64]);
+                                // λ*-fold: Lagrange dot on the ORIGINAL evals.
+                                let mut acc = F128::ZERO;
+                                for (s, &w) in lag.iter().enumerate() {
+                                    acc += w * blk[s];
+                                }
+                                fold_v[j] = acc;
+                                ntt7.forward_transform_scalar(&mut c);
+                                ext[j] = c;
+                            }
+                            let w = eq_hi_tab[b];
+                            for jj in 0..128 {
+                                p[jj] = w
+                                    * (ext[0][jj] * ext[1][jj]
+                                        + lambda * (ext[2][jj] * ext[3][jj]));
+                            }
+                            (b, p, fold_v)
+                        })
+                        .collect();
+                    let mut msg = vec![F128::ZERO; 128];
+                    for (b, p, fv) in partials {
+                        for jj in 0..128 {
+                            msg[jj] += p[jj];
+                        }
+                        for j in 0..4 {
+                            outs[j][b] = fv[j];
+                        }
+                    }
+                    msg
+                };
+                ((msg_partial,), out)
+            };
+            best_b = best_b.min(t.elapsed().as_secs_f64() * 1e3);
+            std::hint::black_box((&msg, &folds));
+        }
+        println!(
+            "GKR skip cost bench (mu = {mu}, 4 vectors, {} threads): \n  arm A (6 real rounds: msg + fold4): {best_a:.2} ms\n  arm B (skip: 4x inv64+fwd128 per block + 128-pt msg + lambda-fold): {best_b:.2} ms\n  B/A = {:.2}x",
+            rayon::current_num_threads(),
+            best_b / best_a
+        );
+    }
 }

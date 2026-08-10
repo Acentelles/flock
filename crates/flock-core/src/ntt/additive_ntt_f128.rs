@@ -570,6 +570,32 @@ impl AdditiveNttF128 {
         }
     }
 
+    /// Inverse of [`Self::forward_transform_scalar`]: evaluations back to
+    /// LCH-basis coefficients. Layers run in reverse with the same twiddles;
+    /// each butterfly inverts as `v = v' + u'; u = u' + v·twiddle`. In char 2
+    /// the additive butterfly is involutive up to this reordering, so no
+    /// scaling pass is needed.
+    pub fn inverse_transform_scalar(&self, data: &mut [F128]) {
+        let log_d = log2_pow2(data.len());
+        assert!(log_d <= self.log_domain_size());
+
+        for layer in (0..log_d).rev() {
+            let num_blocks = 1usize << layer;
+            let block_size_half = 1usize << (log_d - layer - 1);
+            for block in 0..num_blocks {
+                let twiddle = self.twiddle(layer, block);
+                let block_start = block << (log_d - layer);
+                for idx0 in block_start..(block_start + block_size_half) {
+                    let idx1 = idx0 | block_size_half;
+                    let u = data[idx0];
+                    let v = data[idx1] + u;
+                    data[idx0] = u + v * twiddle;
+                    data[idx1] = v;
+                }
+            }
+        }
+    }
+
     /// Single-threaded NEON forward transform (uses `ghash_mul_vec2_neon` to
     /// batch 2 butterflies per PMULL pair).
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
