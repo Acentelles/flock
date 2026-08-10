@@ -125,6 +125,15 @@ pub struct PackedDirectClaim {
     pub eq_ind: DirectEqInd,
 }
 
+/// In-process A/B override for the VIRTUAL BASIS (see
+/// [`ligerito::VirtualEqBasis`]): `0` follows the `FLOCK_NO_VIRTUAL_B` env
+/// knob, `1` forces the virtual basis on, `2` forces the pre-virtualization
+/// path (round-0-only JIT fill). A few-ms effect only resolves under an
+/// ALTERNATING in-process instrument over identical inputs — process-level
+/// arms on this box carry ±4-8 ms of interference per sample.
+pub static VIRTUAL_B_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
 /// Mixed-claim batched open: supports both **ring-switched** claims (bit-MLE
 /// openings reduced via `ring_switch::prove_batched`, with optional per-claim
 /// precomputed `s_hat_v`) and **packed-direct** claims (packed-MLE openings
@@ -214,15 +223,44 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
         ring_switches,
         b_combined,
         eq_basis,
+        eq_gamma,
         target_combined,
         round0_prime,
     } = combined;
-    // Factored EqPoint basis: the L0 first fold sources b's windows
-    // just-in-time from the split tables instead of streaming (and ever
-    // building) the full-domain array.
+    // Factored EqPoint basis. DEFAULT (virtual): the basis stays factored
+    // across EVERY L0 fold — an eq tensor folds to an eq tensor, so no round
+    // writes or reads a half-size basis array; it materializes once, at the
+    // last L0 round, at the size the recursion takes over
+    // ([`ligerito::VirtualEqBasis`]). `FLOCK_NO_VIRTUAL_B=1` falls back to
+    // the round-0-only JIT fill (the pre-virtualization behavior) — the
+    // CERTIFICATION knob for alternating A/B runs; both settings produce the
+    // same b values, hence byte-identical proofs.
+    // Lane-major only: the virtual basis rides the BLOCKED L0 fold, which is
+    // what every shipped merged-transport open runs (a pow2-lane inner keeps
+    // the tuned element-pairing kernel and its round-0 JIT).
+    let virtual_b = eq_basis.is_some()
+        && lane_major
+        && match VIRTUAL_B_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => std::env::var_os("FLOCK_NO_VIRTUAL_B").is_none(),
+        };
+    let vbasis = if virtual_b {
+        // The point IS the claim's, and γ is its single transcript scalar —
+        // the same (γ, ρ) the split tables above were seeded with.
+        Some(ligerito::VirtualEqBasis::new(
+            match &packed_direct[0].eq_ind {
+                DirectEqInd::EqPoint(point) => point.clone(),
+                _ => unreachable!("the factored basis is built only for EqPoint"),
+            },
+            eq_gamma.expect("an eq basis carries its γ"),
+        ))
+    } else {
+        None
+    };
     let jit_fill;
-    let jit: Option<ligerito::BasisWindowFn<'_>> = match &eq_basis {
-        Some((lo, hi, n_lo)) => {
+    let jit: Option<ligerito::BasisWindowFn<'_>> = match (&eq_basis, virtual_b) {
+        (Some((lo, hi, n_lo)), false) => {
             let mask = (1usize << n_lo) - 1;
             let n_lo = *n_lo;
             jit_fill = move |out: &mut [F128], g0: usize| {
@@ -233,7 +271,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
             };
             Some(&jit_fill)
         }
-        None => None,
+        _ => None,
     };
     let ligerito_proof = ligerito::recursive_prover_with_basis_precomputed_round0_lanes(
         lig_config,
@@ -246,6 +284,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
         lane_major,
         round0_prime,
         jit,
+        vbasis,
         challenger,
     );
     if trace {
@@ -279,6 +318,9 @@ struct CombinedClaim {
     /// just-in-time ([`ligerito::BasisWindowFn`]); later folds carry the
     /// half-size folded basis as before.
     eq_basis: Option<(Vec<F128>, Vec<F128>, usize)>,
+    /// The single γ behind `eq_basis` — the virtual basis re-seeds its own
+    /// tables from `(γ, point)` as it folds.
+    eq_gamma: Option<F128>,
     target_combined: F128,
     /// Round-0 sumcheck `(u_0, u_2)` prime over `packed_witness · b_combined`,
     /// consumed by `recursive_prover_with_basis_precomputed_round0`.
@@ -485,6 +527,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             ring_switches: Vec::new(),
             b_combined: Vec::new(),
             eq_basis: Some((lo, hi, n_lo)),
+            eq_gamma: Some(gammas_pd[0]),
             target_combined,
             round0_prime: (round0_u0, round0_u2),
         };
@@ -701,6 +744,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         ring_switches,
         b_combined,
         eq_basis: None,
+        eq_gamma: None,
         target_combined,
         round0_prime: (round0_u0, round0_u2),
     }

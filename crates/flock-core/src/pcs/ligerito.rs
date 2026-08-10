@@ -3122,6 +3122,202 @@ fn fold_and_msg_blocked_jit(
     (nf, nb, SumcheckMessage { u_0, u_2 })
 }
 
+/// The merged transport's inner-open basis kept FACTORED across ALL of L0's
+/// folds. `b[u] = γ·eq(ρ, u)` is a rank-1 tensor, and binding one index bit
+/// keeps it rank-1 — folding bit `p` at challenge `r` drops coordinate `p`
+/// and scales the whole basis by `(1 + ρ_p + r)`:
+///
+/// ```text
+///   b'[u'] = (1+r)·b|_{u_p=0} + r·b|_{u_p=1}
+///          = [(1+r)(1+ρ_p) + r·ρ_p] · Π_{j≠p} f_j(u_j)
+///          = (1 + ρ_p + r) · Π_{j≠p} f_j(u_j)            (char 2)
+/// ```
+///
+/// So no L0 round needs a materialized basis: each round rebuilds two √L eq
+/// tables (a few thousand words, L1-resident) from the surviving coordinates
+/// and fills the message's b-windows from them. That removes the half-size
+/// basis WRITE of every round and its READ in the next — the b-side is ~40%
+/// of the initial sumcheck's traffic — at the price of one multiply per
+/// b-word (`lo[i]·e_hi`, the hi factor hoisted per run), the same trade the
+/// round-0 JIT fill ([`fold_and_msg_blocked_jit`]) already measured as a win.
+/// Value-identical BY CONSTRUCTION: same b values, same message arithmetic.
+///
+/// The basis is materialized exactly once, at the LAST L0 round (where
+/// `blocks_out == 1` and the next round pairs elements anyway), at the
+/// handoff size `2^(log_n − initial_k)` the recursion needs.
+pub(crate) struct VirtualEqBasis {
+    /// Surviving point coordinates; coordinate `j` ↔ index bit `j` (the
+    /// [`build_eq_table`] convention the caller's tensor was built under).
+    coords: Vec<F128>,
+    /// γ times every fold factor absorbed so far. Baked into `lo`.
+    scale: F128,
+    lo: Vec<F128>,
+    hi: Vec<F128>,
+    n_lo: usize,
+}
+
+impl VirtualEqBasis {
+    pub(crate) fn new(point: Vec<F128>, gamma: F128) -> Self {
+        let mut vb = Self {
+            coords: point,
+            scale: gamma,
+            lo: Vec::new(),
+            hi: Vec::new(),
+            n_lo: 0,
+        };
+        vb.rebuild();
+        vb
+    }
+
+    fn rebuild(&mut self) {
+        self.n_lo = self.coords.len() / 2;
+        self.lo = crate::pcs::ring_switch::build_eq_scaled_parallel(
+            &self.coords[..self.n_lo],
+            self.scale,
+        );
+        self.hi =
+            crate::pcs::ring_switch::build_eq_scaled_parallel(&self.coords[self.n_lo..], F128::ONE);
+    }
+
+    /// Bind index bit `p` at challenge `r`: the coordinate leaves, its fold
+    /// factor joins the scale, and the split tables re-form over what is left.
+    fn fold_coord(&mut self, p: usize, r: F128) {
+        self.scale = self.scale * (F128::ONE + self.coords[p] + r);
+        self.coords.remove(p);
+        self.rebuild();
+    }
+
+    fn len(&self) -> usize {
+        1usize << self.coords.len()
+    }
+
+    /// `out = b[g0 .. g0 + out.len()]`. Walked in runs where the `hi` factor
+    /// is constant, so the inner loop is one multiply per word.
+    fn fill(&self, out: &mut [F128], g0: usize) {
+        let span = 1usize << self.n_lo;
+        let mask = span - 1;
+        let mut i = 0;
+        while i < out.len() {
+            let u = g0 + i;
+            let e_hi = self.hi[u >> self.n_lo];
+            let off = u & mask;
+            let n = (out.len() - i).min(span - off);
+            for (k, s) in out[i..i + n].iter_mut().enumerate() {
+                *s = self.lo[off + k] * e_hi;
+            }
+            i += n;
+        }
+    }
+
+    /// The full basis, for the handoff into the recursive levels.
+    fn materialize(&self) -> Vec<F128> {
+        use rayon::prelude::*;
+        let n = self.len();
+        let mut out = crate::scratch::take_f128(n);
+        const CH: usize = 1 << 13;
+        out.par_chunks_mut(CH)
+            .enumerate()
+            .for_each(|(ci, c)| self.fill(c, ci * CH));
+        out
+    }
+}
+
+/// Fold `f` only, at block granularity `d` (the [`fold_and_msg_blocked`]
+/// pairing). The basis side is supplied by [`VirtualEqBasis`], so nothing
+/// here reads or writes a `2^m` basis array.
+fn fold_f_blocked(f: &[F128], r: F128, d: usize) -> Vec<F128> {
+    use rayon::prelude::*;
+    let half = f.len() / 2;
+    let mut nf = crate::scratch::take_f128(half);
+    // Powers of two throughout, so a chunk never straddles a block.
+    let ch = 2048usize.min(d);
+    nf.par_chunks_mut(ch).enumerate().for_each(|(ci, out)| {
+        let o = ci * ch;
+        let (c, p) = (o / d, o % d);
+        let (lo, hi) = (2 * c * d + p, (2 * c + 1) * d + p);
+        for (k, s) in out.iter_mut().enumerate() {
+            let (l, h) = (f[lo + k], f[hi + k]);
+            *s = l + r * (h + l);
+        }
+    });
+    nf
+}
+
+/// [`fold_and_msg_blocked`] with the basis VIRTUAL: `vb` is the basis ALREADY
+/// folded at `r` (its values are what a materialized `nb` would hold), so the
+/// fused pass folds `f`, fills two L1-resident b-windows per task, and emits
+/// the next-round message — never allocating, writing, or reading a
+/// half-size basis. Requires the blocked pairing (`d > 1`), more than one
+/// output block, and no dead-block skip (the eq basis is nonzero on the
+/// padding lanes, which is exactly why the lanes entry disables it).
+fn fold_and_msg_blocked_virtual(
+    f: &[F128],
+    vb: &VirtualEqBasis,
+    r: F128,
+    d: usize,
+) -> (Vec<F128>, SumcheckMessage) {
+    use rayon::prelude::*;
+
+    let n = f.len();
+    let half = n / 2;
+    let blocks_out = half / d;
+    debug_assert!(d > 1 && n.is_power_of_two() && n >= 2 * d);
+    debug_assert!(blocks_out > 1);
+    debug_assert_eq!(vb.len(), half, "the basis must be folded before the pass");
+
+    let mut nf = crate::scratch::take_f128(half);
+    const CH: usize = 2048;
+
+    let comb = |out: &mut [F128], lo: &[F128], hi: &[F128]| {
+        for ((o, &l), &h) in out.iter_mut().zip(lo).zip(hi) {
+            *o = l + r * (h + l);
+        }
+    };
+
+    // One task per PAIR of output blocks — the unit the next round's message
+    // pairs over — exactly as in the materialized kernel.
+    let (u_0, u_2) = nf
+        .par_chunks_mut(2 * d)
+        .enumerate()
+        .map(|(q, nfc)| {
+            let (nf0, nf1) = nfc.split_at_mut(d);
+            nf0.par_chunks_mut(CH)
+                .zip(nf1.par_chunks_mut(CH))
+                .enumerate()
+                // Window scratch once per worker, not once per window.
+                .map_init(
+                    || (vec![F128::ZERO; CH], vec![F128::ZERO; CH]),
+                    |(w0, w1), (ci, (f0, f1))| {
+                        let o = ci * CH;
+                        let len = f0.len();
+                        let one_side = |c: usize, fo: &mut [F128], bo: &mut [F128]| {
+                            let (lo, hi) = (2 * c * d + o, (2 * c + 1) * d + o);
+                            comb(fo, &f[lo..lo + len], &f[hi..hi + len]);
+                            vb.fill(&mut bo[..len], c * d + o);
+                        };
+                        one_side(2 * q, f0, &mut w0[..len]);
+                        one_side(2 * q + 1, f1, &mut w1[..len]);
+                        let mut u0 = F256Unreduced::ZERO;
+                        let mut u2 = F256Unreduced::ZERO;
+                        for i in 0..len {
+                            u0 ^= f0[i].mul_unreduced(w0[i]);
+                            u2 ^= (f0[i] + f1[i]).mul_unreduced(w0[i] + w1[i]);
+                        }
+                        (u0.reduce(), u2.reduce())
+                    },
+                )
+                .reduce(
+                    || (F128::ZERO, F128::ZERO),
+                    |(a0, a2), (c0, c2)| (a0 + c0, a2 + c2),
+                )
+        })
+        .reduce(
+            || (F128::ZERO, F128::ZERO),
+            |(a0, a2), (c0, c2)| (a0 + c0, a2 + c2),
+        );
+    (nf, SumcheckMessage { u_0, u_2 })
+}
+
 pub struct SumcheckProver {
     f: Vec<F128>,
     /// Single combined basis poly. After every `glue(β)`, the introduced
@@ -3203,6 +3399,48 @@ impl SumcheckProver {
             "the JIT basis is only available for the first fold"
         );
         let (nf, nb, msg) = fold_and_msg_blocked_jit(&self.f, fill, r, d, live_in);
+        self.f = nf;
+        self.combined_basis = nb;
+        self.transcript.push(msg);
+        msg
+    }
+
+    /// [`Self::fold_blocked`] with the basis VIRTUAL: `vb` must ALREADY be
+    /// folded at `r`. Only `f` is folded; the basis stays factored, so this
+    /// round writes nothing basis-shaped. Valid while more than one output
+    /// block remains — the last blocked round takes
+    /// [`Self::fold_blocked_final_virtual`] instead.
+    pub(crate) fn fold_blocked_virtual(
+        &mut self,
+        r: F128,
+        d: usize,
+        vb: &VirtualEqBasis,
+    ) -> SumcheckMessage {
+        debug_assert!(
+            self.combined_basis.is_empty(),
+            "the virtual basis and a materialized one are exclusive"
+        );
+        let (nf, msg) = fold_and_msg_blocked_virtual(&self.f, vb, r, d);
+        self.f = nf;
+        self.transcript.push(msg);
+        msg
+    }
+
+    /// The LAST blocked round on the virtual path: one output block remains,
+    /// so the next round pairs elements and the recursion needs a real basis
+    /// array from here on. Fold `f`, materialize the (already folded) basis
+    /// at its handoff size, and emit the ordinary LSB message — identical to
+    /// what [`Self::fold_blocked`]'s `blocks_out == 1` branch produces.
+    pub(crate) fn fold_blocked_final_virtual(
+        &mut self,
+        r: F128,
+        d: usize,
+        vb: &VirtualEqBasis,
+    ) -> SumcheckMessage {
+        debug_assert!(self.combined_basis.is_empty());
+        let nf = fold_f_blocked(&self.f, r, d);
+        let nb = vb.materialize();
+        let msg = round_msg_lsb(&nf, &nb);
         self.f = nf;
         self.combined_basis = nb;
         self.transcript.push(msg);
@@ -3578,6 +3816,7 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
         usize::MAX,
         None,
         None,
+        None,
         challenger,
     )
     .0
@@ -3610,6 +3849,7 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
         false,
         usize::MAX,
         None,
+        None,
         Some(SumcheckMessage {
             u_0: round0_uv.0,
             u_2: round0_uv.1,
@@ -3621,7 +3861,9 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
 
 /// Lane-aware variant of [`recursive_prover_with_basis_precomputed_round0`]
 /// for the merged transport's inner open: the commitment may be lane-major
-/// (integer lanes, high-bit blocks), the basis is MATERIALIZED, and — unlike
+/// (integer lanes, high-bit blocks), the basis is VIRTUAL (`l0_virtual_basis`
+/// — factored across every L0 fold), JIT for the first fold only
+/// (`l0_jit_basis`), or MATERIALIZED, and — unlike
 /// the jagged fused entry — the live-block skip is DISABLED
 /// (`l0_live_blocks = full`): the eq basis is nonzero on the zero-padding
 /// lanes, so the b-side must be folded honestly there (the f-side terms are
@@ -3639,6 +3881,7 @@ pub(crate) fn recursive_prover_with_basis_precomputed_round0_lanes<Ch: Challenge
     l0_lane_major: bool,
     round0_uv: (F128, F128),
     l0_jit_basis: Option<BasisWindowFn<'_>>,
+    l0_virtual_basis: Option<VirtualEqBasis>,
     challenger: &mut Ch,
 ) -> LigeritoProof {
     recursive_prover_with_basis_impl(
@@ -3652,6 +3895,7 @@ pub(crate) fn recursive_prover_with_basis_precomputed_round0_lanes<Ch: Challenge
         l0_lane_major,
         usize::MAX,
         l0_jit_basis,
+        l0_virtual_basis,
         Some(SumcheckMessage {
             u_0: round0_uv.0,
             u_2: round0_uv.1,
@@ -3677,6 +3921,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     l0_lane_major: bool,
     l0_live_blocks_in: usize,
     l0_jit_basis: Option<BasisWindowFn<'_>>,
+    l0_virtual_basis: Option<VirtualEqBasis>,
     first_msg: Option<SumcheckMessage>,
     challenger: &mut Ch,
 ) -> (LigeritoProof, Vec<F128>) {
@@ -3685,8 +3930,10 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let initial_k = config.initial_k;
 
     assert_eq!(packed_witness.len(), 1usize << log_n);
-    // A JIT basis has no array; it is filled per window during the first fold.
-    assert!(b_initial.len() == 1usize << log_n || (l0_jit_basis.is_some() && b_initial.is_empty()));
+    // A JIT/virtual basis has no array; it is filled per window during the
+    // first fold (JIT) or every L0 fold (virtual).
+    let factored_basis = l0_jit_basis.is_some() || l0_virtual_basis.is_some();
+    assert!(b_initial.len() == 1usize << log_n || (factored_basis && b_initial.is_empty()));
     assert_eq!(config.recursive_ks.len(), r);
     assert_eq!(config.log_inv_rates.len(), r + 1);
     assert!(r >= 1);
@@ -3768,19 +4015,22 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let ood_count = |lvl: usize| -> usize { config.ood_samples.get(lvl).copied().unwrap_or(0) };
 
     let _t = std::time::Instant::now();
-    let (mut sc_prover, start_msg) = match (first_msg, l0_jit_basis) {
-        // JIT basis: no `2^log_n` array exists; the first fold builds the
-        // half-size folded basis directly from the factored form.
-        (Some(msg), Some(_)) => {
+    let (mut sc_prover, start_msg) = match first_msg {
+        // Factored basis: no `2^log_n` array exists; the folds source it from
+        // the compact form (JIT for the first fold, virtual for all of them).
+        Some(msg) if factored_basis => {
             debug_assert!(b_initial.is_empty());
             SumcheckProver::new_jit(packed_witness, target, msg)
         }
-        (Some(msg), None) => {
-            SumcheckProver::new_with_first_msg(packed_witness, b_initial, target, msg)
-        }
-        (None, _) => SumcheckProver::new(packed_witness, b_initial, target),
+        Some(msg) => SumcheckProver::new_with_first_msg(packed_witness, b_initial, target, msg),
+        None => SumcheckProver::new(packed_witness, b_initial, target),
     };
     let mut jit = l0_jit_basis;
+    let mut vbasis = l0_virtual_basis;
+    debug_assert!(
+        vbasis.is_none() || l0_fold_block > 1,
+        "the virtual basis rides the BLOCKED fold (the lane-major L0)"
+    );
     challenger.observe_f128(start_msg.u_0);
     challenger.observe_f128(start_msg.u_2);
 
@@ -3800,9 +4050,23 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             fold_grinding_nonces.push(challenger.grind_pow(bits));
         }
         let r = challenger.sample_f128();
-        let msg = match jit.take() {
-            Some(fill) => sc_prover.fold_blocked_jit(r, l0_fold_block, l0_live_blocks, fill),
-            None => sc_prover.fold_blocked(r, l0_fold_block, l0_live_blocks),
+        let msg = match vbasis.as_mut() {
+            Some(vb) => {
+                // The blocked fold binds the LOW bit of the block index —
+                // index bit `log₂ d` of the CURRENT space, which is the
+                // coordinate the basis drops. The bits above it shift down,
+                // so every round drops the same position.
+                vb.fold_coord(l0_fold_block.trailing_zeros() as usize, r);
+                if sc_prover.f().len() / 2 > l0_fold_block {
+                    sc_prover.fold_blocked_virtual(r, l0_fold_block, vb)
+                } else {
+                    sc_prover.fold_blocked_final_virtual(r, l0_fold_block, vb)
+                }
+            }
+            None => match jit.take() {
+                Some(fill) => sc_prover.fold_blocked_jit(r, l0_fold_block, l0_live_blocks, fill),
+                None => sc_prover.fold_blocked(r, l0_fold_block, l0_live_blocks),
+            },
         };
         l0_live_blocks = l0_live_blocks.div_ceil(2);
         challenger.observe_f128(msg.u_0);
