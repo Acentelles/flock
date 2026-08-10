@@ -13785,6 +13785,53 @@ fn dead_lane_ntt_microbench() {
     );
 }
 
+/// **FUSED-3 NTT A/B.** Times the interleaved forward transform on the two
+/// production codeword shapes — the leaf's (64 lanes × 2^20 positions,
+/// from layer 1 = rate 1/2's replicate-fill entry) and the envelope's
+/// (24 × 2^19, from layer 2 = rate 1/4's) — `MICRO_RUNS` reps each in one
+/// process. Run twice, default vs `FLOCK_NTT_NO_FUSED3=1`, for the arm
+/// comparison (the knob is read per transform call; byte-identity is
+/// pinned by the ntt oracle tests, so this measures schedule only).
+#[test]
+#[ignore] // Benchmark — run explicitly with --nocapture.
+fn ntt_fused3_microbench() {
+    use flock_core::ntt::AdditiveNttF128;
+    let runs: usize = std::env::var("MICRO_RUNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9);
+    let fused3 = std::env::var_os("FLOCK_NTT_NO_FUSED3").is_none();
+    println!("\nFUSED-3 NTT MICRO-BENCH — fused3 {}", if fused3 { "ON" } else { "OFF" });
+    for (name, lanes, log_d, start_layer) in [
+        ("leaf-shape    (64 x 2^20, from layer 1)", 64usize, 20usize, 1usize),
+        ("envelope-shape (24 x 2^19, from layer 2)", 24, 19, 2),
+    ] {
+        let ntt = AdditiveNttF128::standard(log_d);
+        let mut rng = Rng(0xF053_0003);
+        let n = lanes << log_d;
+        let mut data: Vec<F128> = (0..n)
+            .map(|_| F128::new(rng.next_u32() as u64, rng.next_u32() as u64))
+            .collect();
+        // Warm (first-touch, pools), then time re-transforms — the values
+        // are irrelevant, only the schedule is.
+        ntt.forward_transform_interleaved_from_layer(&mut data, lanes, start_layer);
+        let mut ms: Vec<f64> = (0..runs)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                ntt.forward_transform_interleaved_from_layer(&mut data, lanes, start_layer);
+                t.elapsed().as_secs_f64() * 1e3
+            })
+            .collect();
+        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!(
+            "  {name}: median {:6.2} ms  [{:.2}-{:.2}]",
+            ms[ms.len() / 2],
+            ms[0],
+            ms[ms.len() - 1]
+        );
+    }
+}
+
 /// **FL-ARITY A/B** — the 17% lever, priced in one process. A spine node
 /// consumes ONE fresh FL, so FL arity `k` divides BOTH the FL share and the
 /// node share of the amortised per-leaf cost by `k/2`; what it buys back is

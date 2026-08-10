@@ -413,13 +413,19 @@ impl AdditiveNttF128 {
         // there. NEON fused-4 is a future addition.
         // The fused-4 kernel walks rows through raw pointers with its own
         // offset math; the dead-lane skip keeps to the slice-based kernels,
-        // so a bounded transform takes the fused-2/block route instead.
+        // so a bounded transform takes the fused-3/2/block route instead.
         let fused4_ok = live == num_ntts
             && cfg!(all(
                 target_arch = "x86_64",
                 target_feature = "avx512f",
                 target_feature = "vpclmulqdq"
             ));
+        // Fused-3 (8-point): the aarch64 middle tier — a third fewer full-
+        // buffer passes than fused-2 on the layers it covers, with 8 values
+        // + 7 twiddles in flight (the 16-point kernel's register pressure is
+        // what lost on this target). `FLOCK_NTT_NO_FUSED3=1` disables — the
+        // A/B knob.
+        let fused3_ok = std::env::var_os("FLOCK_NTT_NO_FUSED3").is_none();
         let mut layer = start_layer.min(n_top);
         while layer < n_top {
             let num_blocks = 1usize << layer;
@@ -451,6 +457,34 @@ impl AdditiveNttF128 {
                     );
                 }
                 layer += 4;
+            } else if fused3_ok && layer + 2 < n_top && block_size >= 8 {
+                // Fuse three layers (layer..layer+3): 8-point butterflies,
+                // one read+write pass where fused-2 alternation needs 1.5.
+                let eighth = block_size >> 3;
+                for block in 0..num_blocks {
+                    let t0 = self.twiddle(layer, block);
+                    let t1 = [
+                        self.twiddle(layer + 1, 2 * block),
+                        self.twiddle(layer + 1, 2 * block + 1),
+                    ];
+                    let t2 = [
+                        self.twiddle(layer + 2, 4 * block),
+                        self.twiddle(layer + 2, 4 * block + 1),
+                        self.twiddle(layer + 2, 4 * block + 2),
+                        self.twiddle(layer + 2, 4 * block + 3),
+                    ];
+                    let start = block * block_bytes;
+                    butterfly_interleaved_fused_3layer_par_rows(
+                        &mut data[start..start + block_bytes],
+                        t0,
+                        t1,
+                        t2,
+                        eighth,
+                        num_ntts,
+                        live,
+                    );
+                }
+                layer += 3;
             } else if layer + 1 < n_top && block_size >= 4 {
                 // Fuse layers (layer, layer+1).
                 let quarter = block_size >> 2;
@@ -804,6 +838,84 @@ fn butterfly_interleaved_block_par_rows(
         .for_each(|(top_row, bot_row)| {
             kernels::butterfly_row_pair(&mut top_row[..live], &mut bot_row[..live], twiddle);
         });
+}
+
+/// Fused 3-layer butterfly over one layer-L block: 8-point sub-butterflies,
+/// rows `r + k·eighth` for `k ∈ 0..8` per group. Layer L pairs at distance
+/// `4·eighth` (@ `t0`), L+1 at `2·eighth` (@ `t1[half]`), L+2 at `eighth`
+/// (@ `t2[quarter]`). One read+write pass over the block for three layers.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn butterfly_interleaved_fused_3layer_par_rows(
+    block: &mut [F128],
+    t0: F128,
+    t1: [F128; 2],
+    t2: [F128; 4],
+    eighth: usize,
+    num_ntts: usize,
+    live: usize,
+) {
+    use rayon::prelude::*;
+    const PARALLEL_ROW_THRESHOLD: usize = 256;
+    let stride = eighth * num_ntts;
+    debug_assert_eq!(block.len(), 8 * stride);
+
+    // Split the block into eight eighths, then zip row-wise: each task is
+    // one row-group index = 8 logical rows of work.
+    let (q0, rest) = block.split_at_mut(stride);
+    let (q1, rest) = rest.split_at_mut(stride);
+    let (q2, rest) = rest.split_at_mut(stride);
+    let (q3, rest) = rest.split_at_mut(stride);
+    let (q4, rest) = rest.split_at_mut(stride);
+    let (q5, rest) = rest.split_at_mut(stride);
+    let (q6, q7) = rest.split_at_mut(stride);
+
+    if eighth < PARALLEL_ROW_THRESHOLD {
+        for r in 0..eighth {
+            let o = r * num_ntts;
+            kernels::butterfly_fused_3layer(
+                [
+                    &mut q0[o..o + live],
+                    &mut q1[o..o + live],
+                    &mut q2[o..o + live],
+                    &mut q3[o..o + live],
+                    &mut q4[o..o + live],
+                    &mut q5[o..o + live],
+                    &mut q6[o..o + live],
+                    &mut q7[o..o + live],
+                ],
+                t0,
+                &t1,
+                &t2,
+            );
+        }
+    } else {
+        q0.par_chunks_mut(num_ntts)
+            .zip(q1.par_chunks_mut(num_ntts))
+            .zip(q2.par_chunks_mut(num_ntts))
+            .zip(q3.par_chunks_mut(num_ntts))
+            .zip(q4.par_chunks_mut(num_ntts))
+            .zip(q5.par_chunks_mut(num_ntts))
+            .zip(q6.par_chunks_mut(num_ntts))
+            .zip(q7.par_chunks_mut(num_ntts))
+            .for_each(|(((((((r0, r1), r2), r3), r4), r5), r6), r7)| {
+                kernels::butterfly_fused_3layer(
+                    [
+                        &mut r0[..live],
+                        &mut r1[..live],
+                        &mut r2[..live],
+                        &mut r3[..live],
+                        &mut r4[..live],
+                        &mut r5[..live],
+                        &mut r6[..live],
+                        &mut r7[..live],
+                    ],
+                    t0,
+                    &t1,
+                    &t2,
+                );
+            });
+    }
 }
 
 /// Fused 2-layer butterfly: combines layer L (twiddle `t_outer`, shared by
