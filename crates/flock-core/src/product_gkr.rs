@@ -1510,6 +1510,29 @@ fn prove_batched_grouped<C: Challenger>(
     let mut r_pt: Vec<F128> = Vec::new();
     let mut layers = Vec::with_capacity(mu);
     let (mut claim_l, mut claim_r) = (F128::ZERO, F128::ZERO);
+    // Sub-phase attribution for the layer sumchecks (GKR_TRACE): eq-prep
+    // (SplitEqGhash + prefix sums, serial per round), messages, folds+FS,
+    // and the per-layer remainder.
+    //
+    // The message and fold passes stay SEPARATE, measured, not by
+    // omission: the zerocheck-style fold-and-round fusion (round i's fold
+    // also emitting round i+1's message — valid here because a layer's
+    // round weights are eq over suffixes of the PREVIOUS layer's point,
+    // known before ρ_i) was built and benchmarked at m32, with a
+    // branch-free hot region for the all-live prefix. It measured a WASH
+    // multi-threaded (54.8-63.8 vs ~54-60 ms GKR total) and +16 ms
+    // single-threaded: the split passes each walk their OWN vector's live
+    // length — a fold never visits an empty or short partner at all —
+    // while a fused pass walks the MAX length across all four views for
+    // the message, dragging fold logic through the implicit-ones regions.
+    // On the grouped shapes (live groups split-paired with empty ones)
+    // that tax exceeds the saved traversal.
+    let (mut d_eq, mut d_msg, mut d_fold) = (
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+    );
+    let t_sc_total = std::time::Instant::now();
     for k in 0..mu {
         let lambda = ch.sample_f128();
         let mut rounds = Vec::with_capacity(k);
@@ -1518,6 +1541,7 @@ fn prove_batched_grouped<C: Challenger>(
         let (r0v, r1v) = r_layers[mu - (k + 1)].split();
         let mut cur: Option<[GVec; 4]> = None;
         for i in 0..k {
+            let t_ph = std::time::Instant::now();
             let eq = SplitEqGhash::new(&r_pt[i + 1..k]);
             let mut plo = Vec::with_capacity(eq.lo.len() + 1);
             plo.push(F128::ZERO);
@@ -1531,6 +1555,10 @@ fn prove_batched_grouped<C: Challenger>(
                 let last = *phi.last().unwrap();
                 phi.push(last + e);
             }
+            let t_ph = {
+                d_eq += t_ph.elapsed();
+                std::time::Instant::now()
+            };
             let msg = match &cur {
                 None => gv_message([&l0v, &l1v, &r0v, &r1v], lambda, &eq, &plo, &phi),
                 Some([a, b, c, d]) => gv_message(
@@ -1540,6 +1568,10 @@ fn prove_batched_grouped<C: Challenger>(
                     &plo,
                     &phi,
                 ),
+            };
+            let t_ph = {
+                d_msg += t_ph.elapsed();
+                std::time::Instant::now()
             };
             ch.observe_f128(msg.0);
             ch.observe_f128(msg.1);
@@ -1566,6 +1598,7 @@ fn prove_batched_grouped<C: Challenger>(
                 }
             }
             cur = Some(next);
+            d_fold += t_ph.elapsed();
         }
         let (vl0, vl1, vr0, vr1) = match &cur {
             None => (l0v.val(0), l1v.val(0), r0v.val(0), r1v.val(0)),
@@ -1595,6 +1628,17 @@ fn prove_batched_grouped<C: Challenger>(
     }
     for v in l_layers.into_iter().chain(r_layers) {
         crate::scratch::give_f128(v.buf);
+    }
+    if trace_on() {
+        let tot = t_sc_total.elapsed();
+        eprintln!(
+            "  [prod-gkr]     sumcheck split: eq-prep {:7.3} ms | messages {:7.3} | \
+             folds+fs {:7.3} | layer misc {:7.3}",
+            d_eq.as_secs_f64() * 1e3,
+            d_msg.as_secs_f64() * 1e3,
+            d_fold.as_secs_f64() * 1e3,
+            (tot.saturating_sub(d_eq + d_msg + d_fold)).as_secs_f64() * 1e3,
+        );
     }
     tp(&mut t, "layer-sumchecks(grouped)");
 
