@@ -20064,6 +20064,12 @@ fn entry_live(c: &MatrixClaim) -> bool {
 struct SpineIn<'a> {
     node_child: usize,
     prior: &'a MainBlock,
+    /// THE ADVERSARIAL LEG: re-witness the match-gate's mac rows as a
+    /// cheating prover's world — the mismatched slot CLAIMS its digests
+    /// match and folds the orphan live — with every row self-satisfying,
+    /// then assert the proof dies on exactly the wiring product. The
+    /// builder's honest asserts all still run (the publics are untouched).
+    forge: bool,
 }
 
 /// Everything [`build_node_outer_app`] hands back.
@@ -20128,6 +20134,7 @@ fn build_node_outer_app(
     // region: mac is ~97% per-child work, which is why nu* is 16.
     let n_kids = los.len();
     assert!(n_kids >= 2, "a node folds at least two children");
+    let forge_match = spine.as_ref().is_some_and(|sp| sp.forge);
     let lo0 = los[0];
     // MIXED DIGESTS ARE THE SPINE (wall 3): a steady node's children are a
     // FRESH FL and the PREVIOUS NODE, which are different circuits. They
@@ -20821,6 +20828,11 @@ fn build_node_outer_app(
         // offset. `[key(2) | live | rho_col | rho_row | value]`.
         let sig_ent = 4 + locs[n_uni].k_col + locs[n_uni].k_row;
         let jag_ent = 4 + jlocs[0].n_col + jlocs[0].k_row;
+        // The spine gadget's mac rows, bracketed for the ADVERSARIAL leg:
+        // 26 rows exactly — 13 per keyed slot-1 gate (two is-eq gadgets of
+        // 4 rows + m, g, gv, nm, h), the FL slot emitting none (its key is
+        // a hard connect).
+        let mac_spine0 = sb.rows_in_slot(cs.macs);
         let spine_w = spine.as_ref().map(|sp| {
             let e = env.as_ref().expect("the spine needs the envelope's offsets");
             let rk = &regions[sp.node_child];
@@ -20933,6 +20945,13 @@ fn build_node_outer_app(
                 .collect();
             (uni_off, sig_off, jag_off, sig, jag)
         });
+        if spine.is_some() {
+            assert_eq!(
+                sb.rows_in_slot(cs.macs) - mac_spine0,
+                26,
+                "the spine gadget's mac-row census"
+            );
+        }
         // THE POINTS-CONNECT (the count win's identity bind): value, σ,
         // row identities, and the structural words — see build_fl_node's
         // block for the argument; this is the same bind at node scale.
@@ -22127,6 +22146,49 @@ fn build_node_outer_app(
             })
             .collect();
         el_ord.sort_by_key(|(i, _)| *i);
+        // THE MATCH-GATE FORGERY (the adversarial leg): re-witness the
+        // spine gadget's 26 mac rows as the world a cheating prover wants —
+        // the advice inverse set to 0 so both is-eq gadgets CLAIM the
+        // mismatched digests are equal (z = 1), the gate then folding the
+        // orphan LIVE (m = 1, g = live, gv = value) and waving the
+        // passenger off (h = 0). Every forged row still satisfies the mac
+        // relation (t = x·y, out = acc + t), so the element PIOP holds;
+        // what cannot be reconciled are the COPY CONSTRAINTS — chk = z·d =
+        // d ≠ 0 sits in the assert-zero anchor's class, and g/gv/h sit in
+        // the classes of the fold tape's honest absorbed words (the native
+        // fold folded the ZERO claim) and the passenger sum. The wiring
+        // product is what must kill it — the same tier the chain-link
+        // tamper pinned.
+        if forge_match {
+            let mac_ri = shape2.registry_slot(cs.macs);
+            let rows = &mut el_ord
+                .iter_mut()
+                .find(|(i, _)| *i == mac_ri)
+                .expect("the mac slot's rows")
+                .1;
+            let (zero, one) = (F128::ZERO, F128::ONE);
+            for blk in 0..2 {
+                // sigma's node-slot gate, then jagged's — 13 rows each:
+                // [d p z chk] x2 digest words, then m, g, gv, nm, h.
+                let s = mac_spine0 + 13 * blk;
+                for w in 0..2 {
+                    let b = s + 4 * w;
+                    let d = rows[b][4];
+                    assert_ne!(d, zero, "the forged slot genuinely mismatches");
+                    rows[b + 1] = vec![zero, d, zero, zero, zero];
+                    rows[b + 2] = vec![one, zero, one, zero, one];
+                    rows[b + 3] = vec![zero, one, d, d, d];
+                }
+                let live = rows[s + 9][1];
+                let val = rows[s + 10][2];
+                assert_eq!(live, one, "the orphaned entry is live");
+                rows[s + 8] = vec![zero, one, one, one, one];
+                rows[s + 9] = vec![zero, live, one, live, live];
+                rows[s + 10] = vec![zero, live, val, live * val, live * val];
+                rows[s + 11] = vec![one, one, one, one, zero];
+                rows[s + 12] = vec![zero, live, zero, zero, zero];
+            }
+        }
         let el_inputs: Vec<UnionElementSlotInput> = el_ord
             .into_iter()
             .map(|(_, rows)| live_element_input_from_rows(rows, nu2))
@@ -22154,7 +22216,7 @@ fn build_node_outer_app(
         let prove_ms = t0p.elapsed().as_secs_f64() * 1e3;
         let t0v = std::time::Instant::now();
         let mut ch2 = FsChallenger::with_chained_blake3(DOMAIN);
-        verifier::verify_ligerito_union_circuit(
+        let vres = verifier::verify_ligerito_union_circuit(
             &union2,
             &shape2.circuit,
             &built2.public,
@@ -22163,23 +22225,43 @@ fn build_node_outer_app(
             &oproof,
             &pcs2,
             &mut ch2,
-        )
-        .expect("the 2->1 node verifies");
+        );
+        if forge_match {
+            // The forged world's rows all satisfy their relations — only
+            // the wiring product can object, and it MUST.
+            assert!(
+                matches!(
+                    vres,
+                    Err(flock_core::verifier::VerifyError::Wiring(
+                        flock_core::circuit::WiringError::Gkr(
+                            flock_core::product_gkr::VerifyError::ProductMismatch
+                        )
+                    ))
+                ),
+                "a forged live fold of a mismatched entry must die on the wiring product"
+            );
+        } else {
+            vres.expect("the 2->1 node verifies");
+        }
         let verify_ms = t0v.elapsed().as_secs_f64() * 1e3;
-        let t0d = std::time::Instant::now();
-        let mut ch2 = FsChallenger::with_chained_blake3(DOMAIN);
-        verifier::verify_ligerito_union_circuit_deferred(
-            &union2,
-            &shape2.circuit,
-            &built2.public,
-            &lcs2,
-            &ocommit,
-            &oproof,
-            &pcs2,
-            &mut ch2,
-        )
-        .expect("the 2->1 node verifies deferred");
-        let deferred_ms = t0d.elapsed().as_secs_f64() * 1e3;
+        let deferred_ms = if forge_match {
+            0.0
+        } else {
+            let t0d = std::time::Instant::now();
+            let mut ch2 = FsChallenger::with_chained_blake3(DOMAIN);
+            verifier::verify_ligerito_union_circuit_deferred(
+                &union2,
+                &shape2.circuit,
+                &built2.public,
+                &lcs2,
+                &ocommit,
+                &oproof,
+                &pcs2,
+                &mut ch2,
+            )
+            .expect("the 2->1 node verifies deferred");
+            t0d.elapsed().as_secs_f64() * 1e3
+        };
         println!(
             "\nTHE 2->1 RECURSION NODE (two children + {} folds, ONE proof)\n  \
              children: dense_m {} / mu {}, one circuit, distinct FS points\n  \
@@ -23017,8 +23099,14 @@ fn node_jagged_params(lo: &LeafOuter) -> flock_core::pcs::jagged::JaggedParams {
 /// The chain LANE rides all three levels unchanged, and the app statement
 /// spans the whole chain: the spine grows by prepending a fresh FL, so the
 /// fresh child is always the earlier segment.
+///
+/// Ends with the MATCH-GATE ADVERSARIAL MATRIX: (a) a forged node_3 whose
+/// gadget rows claim the mismatched digests match and fold the orphan live
+/// — self-satisfying rows, so it must die on exactly the wiring product;
+/// (b) a dropped passenger and (c) a forged entry key, both statement
+/// tampers the proofs refuse.
 #[test]
-#[ignore] // Heavy — eight chain proofs and seven outers.
+#[ignore] // Heavy — eight chain proofs and eight outers.
 fn chain_spine_converges() {
     use flock_core::aggregate;
 
@@ -23109,6 +23197,7 @@ fn chain_spine_converges() {
         Some(SpineIn {
             node_child: 1,
             prior: &base.block,
+            forge: false,
         }),
     );
     let n2_lane = n2.lane_acc.clone().expect("node_2's lane");
@@ -23147,6 +23236,7 @@ fn chain_spine_converges() {
         Some(SpineIn {
             node_child: 1,
             prior: &n2.block,
+            forge: false,
         }),
     );
 
@@ -23240,11 +23330,105 @@ fn chain_spine_converges() {
             "root h_end == H^N(h_start)"
         );
     }
+    // ---- THE MATCH-GATE ADVERSARIAL MATRIX (the owed soundness leg) ----
+    // A statement-tier verify helper, the e2e tamper legs' assembly.
+    let verify_with = |lo: &LeafOuter, publics: &[F128]| -> bool {
+        let u = outer_union(&lo.shape.registry, lo.shape.counts.clone());
+        let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
+            (lo.b3_slot, lo.b3_r1cs.csc_lincheck_circuit()),
+            (lo.swap_slot, lo.swap_r1cs.csc_lincheck_circuit()),
+            (lo.spread_slot, lo.spread_r1cs.csc_lincheck_circuit()),
+        ];
+        lcs_ord.sort_by_key(|(i, _)| *i);
+        let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
+            lcs_ord.into_iter().map(|(_, c)| c).collect();
+        let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
+        verifier::verify_ligerito_union_circuit(
+            &u,
+            &lo.shape.circuit,
+            publics,
+            &lcs,
+            &lo.commitment,
+            &lo.proof,
+            &lo.pcs,
+            &mut ch,
+        )
+        .is_ok()
+    };
+    // (a) THE FORGED LIVE FOLD — the load-bearing leg. A cheating node_3
+    // re-witnesses the match-gate to claim the D_base entry MATCHES and
+    // folds the orphan live (no passenger). Every forged gate row is
+    // self-satisfying, so only the copy constraints can object; the
+    // builder asserts the proof dies on exactly Wiring/Gkr/ProductMismatch
+    // (the assert lives inside build_node_outer_app, forge: true).
+    build_node_outer_app(
+        &[&fls[0].lo, &n2.lo],
+        Some(app_fl),
+        Some(ChainLane {
+            registry: chain_registry,
+            mats: &chain_mats,
+            circs: &chain_circs,
+            circuit: chain_circuit,
+            params: &chain_jp,
+            priors: &[&fls[0].acc, &n2_lane],
+            claims_base: acc_base,
+        }),
+        Some(SpineIn {
+            node_child: 1,
+            prior: &n2.block,
+            forge: true,
+        }),
+    );
+    // (b) THE PASSENGER DROP: zero the boarded orphan's live word — "no
+    // orphan ever rode". The passenger is STATEMENT, so the honest proof
+    // refuses the doctored segment.
+    {
+        let pass_base = env_pass_base(&env);
+        assert_eq!(
+            n3.lo.public[pass_base + 2],
+            F128::ONE,
+            "the orphan's sigma entry rides live"
+        );
+        let mut bad = n3.lo.public.clone();
+        bad[pass_base + 2] = F128::ZERO;
+        assert!(
+            !verify_with(&n3.lo, &bad),
+            "a dropped passenger must be rejected"
+        );
+    }
+    // (c) THE FORGED CHILD KEY: node_2's published node-slot entry claims
+    // to be keyed by the STEADY circuit instead of the base's — the lie
+    // that would let node_3 fold it without a mismatch. The key words are
+    // statement, so node_2's own proof refuses.
+    {
+        let uni_w = |c: &flock_core::matrix_fold::MatrixClaim| {
+            2 + c.col.point.len() + c.row.point.len()
+        };
+        let mut key_at = env_acc_main_base(&env);
+        for (a, b) in n2.block.per_type.iter().chain(n2.block.per_element.iter()) {
+            key_at += uni_w(a) + uni_w(b);
+        }
+        let s0 = &n2.block.sigma[0].1;
+        key_at += 4 + s0.col.point.len() + s0.row.point.len(); // past the FL slot
+        assert_eq!(
+            n2.lo.public[key_at],
+            digest_f128(&base_d)[0],
+            "the offset arithmetic found the node slot's key"
+        );
+        let mut bad = n2.lo.public.clone();
+        bad[key_at] = digest_f128(&n2.lo.shape.circuit.digest())[0];
+        assert!(
+            !verify_with(&n2.lo, &bad),
+            "a forged entry key must be rejected"
+        );
+    }
     println!(
         "\nTHE SPINE CONVERGES (8 chains -> 4 FL -> base -> node_2 -> node_3)\n  \
          span H^{}(h_start) | D(node_2) == D(node_3) | 4 shapes total\n  \
          ONE steady accumulator (sigma+jagged x 2 slots) + a 2-entry passenger\n  \
          + the chain lane, all discharged at the root\n  \
+         MATCH-GATE ADVERSARIAL MATRIX: forged live fold dies on the wiring\n  \
+         product; a dropped passenger and a forged entry key die on the statement\n  \
          steady outer: nu {} | mu {} | publics {} | proof {:.1} KiB\n",
         8 * n_blocks,
         n3.lo.shape.circuit.cells().nu(),
@@ -23842,6 +24026,7 @@ fn tower_online_bench() {
                         Some(SpineIn {
                             node_child: 1,
                             prior: &base.block,
+                            forge: false,
                         }),
                     )
                     .online,
