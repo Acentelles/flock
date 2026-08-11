@@ -35,8 +35,11 @@ pub struct Summand {
     pub depth: usize,
     /// Query count `2^c`.
     pub count: usize,
-    /// Squeeze bits per query = opening path length = `d − c` siblings.
-    pub path_sibs: usize,
+    /// Squeeze bits per query: the low `d − c` index bits are sampled, the
+    /// top `c` ARE the stratum. NOT the opening path length — paths
+    /// truncate at the schedule's cap depth ([`LevelSchedule::cap_depth`]),
+    /// which for shallower summands is deeper than their stratum.
+    pub squeeze_bits: usize,
 }
 
 /// The stratified query schedule of one commit level: the depths of its
@@ -63,9 +66,10 @@ impl LevelSchedule {
     /// The canonical schedule for `queries` draws from a `2^log_block_len`
     /// block: greedily take the largest power-of-two summand that fits,
     /// clamped at the leaf layer. For `queries ≤ block_len` this is exactly
-    /// the binary representation of `queries` — the path-row-optimal
-    /// decomposition (merging `2^c + 2^c → 2^{c+1}` always saves `2^{c+1}`
-    /// path siblings).
+    /// the binary representation of `queries`; it puts the cap at
+    /// `floor(lg q)` — the deepest any summand can sit — which is what
+    /// every truncated path's length `d − c_1` and the absorbed cap's size
+    /// trade against.
     pub fn decompose(queries: usize, log_block_len: usize) -> Self {
         let mut summand_depths = Vec::new();
         let mut rem = queries;
@@ -100,7 +104,7 @@ impl LevelSchedule {
         self.summand_depths.iter().map(move |&c| Summand {
             depth: c,
             count: 1usize << c,
-            path_sibs: d - c,
+            squeeze_bits: d - c,
         })
     }
 
@@ -113,10 +117,14 @@ impl LevelSchedule {
             .flat_map(|&c| (0..1usize << c).map(move |s| (c, s)))
     }
 
-    /// Total opening cost `Σ 2^{c_i}·(d − c_i)` in path siblings (equally:
-    /// per-level squeeze bits at one bit per sibling-level index bit).
+    /// Total opening cost `q·(d − c_1)` in path siblings: every path
+    /// truncates at the cap layer, since all nodes above it are folds of
+    /// the absorbed cap — a shallower summand's remaining `c_1 − c_j`
+    /// levels are verifier-derivable, never proof bytes. NOT the squeeze
+    /// accounting: a query still draws its own `d − c_j` low index bits
+    /// ([`Summand::squeeze_bits`]).
     pub fn total_path_siblings(&self) -> usize {
-        self.summands().map(|s| s.count * s.path_sibs).sum()
+        self.queries() * (self.log_block_len - self.cap_depth())
     }
 
     /// Check the soundness-critical canonical form against the query count
@@ -239,8 +247,10 @@ mod tests {
         assert_eq!(s.summand_depths, vec![6, 4, 3, 1]);
         assert_eq!(s.queries(), 90);
         assert_eq!(s.cap_depth(), 6);
-        // 64·13 + 16·15 + 8·16 + 2·18 = 1,236 (the doc's worked example).
-        assert_eq!(s.total_path_siblings(), 1236);
+        // Paths truncate at the cap: 90·(19 − 6) = 1,170 — not the
+        // per-summand 64·13 + 16·15 + 8·16 + 2·18 = 1,236, whose extra 66
+        // siblings the absorbed cap already determines.
+        assert_eq!(s.total_path_siblings(), 1170);
         assert!(s.validate(90).is_ok());
     }
 
@@ -279,8 +289,8 @@ mod tests {
         assert_eq!(strata.len(), 11);
         assert_eq!(&strata[..3], &[(3, 0), (3, 1), (3, 2)]);
         assert_eq!(&strata[8..], &[(1, 0), (1, 1), (0, 0)]);
-        let sibs: Vec<usize> = s.summands().map(|m| m.path_sibs).collect();
-        assert_eq!(sibs, vec![2, 4, 5]);
+        let bits: Vec<usize> = s.summands().map(|m| m.squeeze_bits).collect();
+        assert_eq!(bits, vec![2, 4, 5]);
     }
 
     #[test]

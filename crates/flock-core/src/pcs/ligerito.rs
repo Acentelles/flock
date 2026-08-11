@@ -3604,11 +3604,11 @@ fn sample_queries<Ch: Challenger>(
 }
 
 /// Per-query CAPPED Merkle paths for `queries` against `tree`, flat in
-/// sample order. Legacy (`sched = None`): `queries.len()` paths of
-/// `log2(block_len) − c` siblings each. Stratified: query `j`'s path stops
-/// at its stratum depth `c_j`, so paths are `d − c_j` siblings in schedule
-/// order (`total_path_siblings` in all). Duplicates repeat their path — no
-/// sorting, no dedup.
+/// sample order: every path stops at the schedule's cap depth `c_1`, so
+/// paths are uniformly `d − c_1` siblings (`total_path_siblings` in all).
+/// A shallower summand's remaining `c_1 − c_j` levels are folds of the
+/// absorbed cap — verifier-derivable, never emitted. Duplicates repeat
+/// their path — no sorting, no dedup.
 fn merkle_paths_for(
     tree: &[Hash],
     block_len: usize,
@@ -3618,9 +3618,10 @@ fn merkle_paths_for(
     let d = block_len.trailing_zeros() as usize;
     assert_eq!(sched.log_block_len, d, "merkle_paths_for: schedule block log");
     assert_eq!(sched.queries(), queries.len(), "merkle_paths_for: query count");
+    let c1 = sched.cap_depth();
     let mut out = Vec::with_capacity(sched.total_path_siblings());
-    for ((cq, _), &q) in sched.query_strata().zip(queries) {
-        out.extend(merkle::merkle_proof_capped(tree, block_len, q, cq));
+    for &q in queries {
+        out.extend(merkle::merkle_proof_capped(tree, block_len, q, c1));
     }
     out
 }
@@ -5709,42 +5710,32 @@ fn verify_level_opens(
     };
     let s = sched;
 
-    // STRATIFIED: the absorbed cap sits at the schedule's cap depth (the top
-    // summand). Shallower summands' terminals are the cap's ancestors —
-    // rebuilt once per level here (≤ 2^c_max hashes), then each query
-    // verifies with the ordinary capped walk against the layer at its own
-    // stratum depth: its terminal index is exactly its schedule-constant
-    // stratum, so a path that wanders out of stratum fails the compare.
+    // STRATIFIED: the absorbed cap sits at the schedule's cap depth (the
+    // top summand), and every path truncates there — all nodes above the
+    // cap are its own folds, so siblings past `c_1` could never carry
+    // evidence. Each query verifies with the ordinary capped walk against
+    // the cap itself; stratum membership needs no enforcement here because
+    // the verifier derived the index (`sample_queries` puts the stratum in
+    // the top bits), and the compare pins all `c_1 ≥ c_j` of them.
     if s.log_block_len != d || s.queries() != queries.len() {
         return false;
     }
-    let c_max = s.cap_depth();
-    if cap.len() != (1 << c_max) {
+    let c1 = s.cap_depth();
+    if cap.len() != (1 << c1) {
         return false;
     }
     if paths.len() != s.total_path_siblings() {
         return false;
     }
-    // layers[k] = the 2^(c_max − k) nodes at depth c_max − k; layers[0] = cap.
-    let c_min = s.summand_depths.last().copied().unwrap_or(c_max);
-    let mut layers: Vec<Vec<Hash>> = vec![cap.to_vec()];
-    for k in 1..=(c_max - c_min) {
-        let prev = &layers[k - 1];
-        let parents: Vec<Hash> = prev
-            .chunks_exact(2)
-            .map(|pair| merkle::hash_pair(&pair[0], &pair[1], kind))
-            .collect();
-        layers.push(parents);
-    }
+    let path_len = d - c1;
     let mut off = 0usize;
-    for ((cq, _stratum), (&q, row)) in s.query_strata().zip(queries.iter().zip(opened_rows)) {
+    for (&q, row) in queries.iter().zip(opened_rows) {
         if row.len() != expected_num_interleaved {
             return false;
         }
-        let path_len = d - cq;
         let leaf = leaf_of(row);
         if !merkle::verify_merkle_proof_capped(
-            &layers[c_max - cq],
+            cap,
             block_len,
             &leaf,
             q,
@@ -6640,6 +6631,18 @@ mod tests {
             assert!(
                 !recursive_verifier_with_basis(&v_cfg, &bad, &b, target, &cap0, &mut v_ch),
                 "truncated paths accepted (q0={q0})"
+            );
+
+            // Padded path vec — a prover re-emitting the pre-truncation
+            // above-cap siblings: rejected on the same shape check. Paths
+            // are exactly q·(d − c1) since the cap-truncation landed.
+            let mut bad = proof.clone();
+            let extra = bad.initial_proof.merkle_proof[0];
+            bad.initial_proof.merkle_proof.push(extra);
+            let mut v_ch = crate::challenger::FsChallenger::new(b"strat-sweep");
+            assert!(
+                !recursive_verifier_with_basis(&v_cfg, &bad, &b, target, &cap0, &mut v_ch),
+                "padded paths accepted (q0={q0})"
             );
         }
 

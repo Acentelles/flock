@@ -682,21 +682,31 @@ fn proof_census(
     p: &flock_core::proof::R1csProofCircuitMerged,
     pcs: &PcsParams,
 ) {
-    // Per-level stratified schedules, and the siblings a path emits ABOVE the
-    // cap layer. The cap is the whole layer at the DEEPEST summand's depth
-    // c1, so every query can be checked with d - c1 siblings; a query from a
-    // shallower summand emits d - c_j, and the extra c1 - c_j siblings are
-    // nodes the absorbed cap already determines.
+    // Per-level stratified schedules, and the siblings a path emits ABOVE
+    // the cap layer. The cap is the whole layer at the DEEPEST summand's
+    // depth c1, so every query can be checked with d - c1 siblings — since
+    // truncation, that is all the prover emits. MEASURED from the proof
+    // (not recomputed from the schedule), so `redundant` certifies the
+    // truncation stays landed: anything past q·(d − c1) is waste.
     if let Ok(cfg) = pcs.ligerito_prover_config() {
+        let lig = &p.pcs_open.inner.ligerito;
+        let r = lig.recursive_caps.len();
+        assert_eq!(cfg.stratified.len(), r + 1, "one schedule per open level");
+        let level_paths = |lvl: usize| -> usize {
+            if lvl == 0 {
+                lig.initial_proof.merkle_proof.len()
+            } else if lvl < r {
+                lig.recursive_proofs[lvl - 1].merkle_proof.len()
+            } else {
+                lig.final_proof.merkle_proof.len()
+            }
+        };
         let (mut waste, mut emitted) = (0usize, 0usize);
         let mut per_level: Vec<String> = Vec::new();
         for (lvl, sch) in cfg.stratified.iter().enumerate() {
             let c1 = sch.cap_depth();
-            let (mut w, mut e) = (0usize, 0usize);
-            for s in sch.summands() {
-                e += s.count * s.path_sibs;
-                w += s.count * (c1 - s.depth);
-            }
+            let e = level_paths(lvl);
+            let w = e - sch.queries() * (sch.log_block_len - c1);
             per_level.push(format!(
                 "L{lvl}: q={} depths={:?} cap={c1} sibs={e} redundant={w}",
                 sch.queries(),
@@ -5899,6 +5909,10 @@ struct Lvl {
     /// consumer (emit, residual, checker) maps query → (stratum depth,
     /// stratum, path slice) through this.
     sched: flock_core::pcs::stratified::LevelSchedule,
+    /// The tree's layers from the cap upward, folded natively by
+    /// `level_geometry`: entry `i` is the depth-`(c − i)` layer, entry 0
+    /// the cap itself — [`Self::full_path`]'s sibling sources.
+    cap_layers: Vec<Vec<[u8; 32]>>,
 }
 
 impl Lvl {
@@ -5910,17 +5924,34 @@ impl Lvl {
             .expect("query index within schedule")
     }
 
-    /// Query `k`'s siblings as a range into the level's flat path vec.
+    /// Query `k`'s PROOF siblings as a range into the level's flat path
+    /// vec — uniformly `d − c` per query since paths truncate at the cap.
+    /// The climb to a shallower summand's stratum terminal needs `c − c_k`
+    /// more siblings, all folds of the cap: [`Self::full_path`] synthesizes
+    /// them.
     fn path_range(&self, k: usize) -> std::ops::Range<usize> {
-        let mut off = 0usize;
-        for (i, (c, _)) in self.sched.query_strata().enumerate() {
-            let len = self.depth - c;
-            if i == k {
-                return off..off + len;
-            }
-            off += len;
+        let len = self.depth - self.c;
+        k * len..(k + 1) * len
+    }
+
+    /// Query `k`'s FULL climb siblings — the truncated proof slice extended
+    /// up to its stratum terminal at depth `c_k` with the cap-fold siblings
+    /// the proof no longer carries (`self.cap_layers`, folded natively by
+    /// `level_geometry`). Advice either way: the synthesized entries feed
+    /// the same hint stream, and the constant-stratum terminal connect is
+    /// what binds the climb.
+    fn full_path(&self, k: usize, pos: usize, paths: &[[u8; 32]]) -> Vec<[u8; 32]> {
+        let (ck, _) = self.q_stratum(k);
+        let mut sibs: Vec<[u8; 32]> = paths[self.path_range(k)].to_vec();
+        // Path entry j is the sibling at depth d − j; the proof stops at
+        // the cap (j < d − c), the tail (depths c down to c_k + 1) folds
+        // out of the cap. Its indices carry SQUEEZED bits below the
+        // stratum, so this is witgen data, never circuit wiring.
+        for j in (self.depth - self.c)..(self.depth - ck) {
+            let m = self.depth - j;
+            sibs.push(self.cap_layers[self.c - m][(pos >> j) ^ 1]);
         }
-        unreachable!("query index within schedule")
+        sibs
     }
 
     /// The position query `k` opens, from its squeezed word's low half:
@@ -5931,6 +5962,29 @@ impl Lvl {
         let lo_bits = self.depth - c;
         (stratum << lo_bits) | ((lo as usize) & ((1usize << lo_bits) - 1))
     }
+}
+
+/// The tree's layers from the cap upward, natively: entry `i` is the
+/// depth-`(c − i)` layer, entry 0 the cap itself — the sibling sources for
+/// [`Lvl::full_path`]'s synthesized tail. `n_layers` is clamped to at
+/// least 1 so entry 0 exists even for a single-summand schedule (which
+/// never indexes past it).
+fn native_cap_layers(
+    cap: &[[u8; 32]],
+    n_layers: usize,
+    hash: HashKind,
+) -> Vec<Vec<[u8; 32]>> {
+    let mut layers: Vec<Vec<[u8; 32]>> = vec![cap.to_vec()];
+    for _ in 1..n_layers.max(1) {
+        let next: Vec<[u8; 32]> = layers
+            .last()
+            .unwrap()
+            .chunks_exact(2)
+            .map(|p| core_merkle::hash_pair(&p[0], &p[1], hash))
+            .collect();
+        layers.push(next);
+    }
+    layers
 }
 
 /// The stratified schedules the inner proof's own config mandates — the
@@ -6024,6 +6078,7 @@ fn level_geometry(
         let alpha_vals: Vec<F128> = (0..lvl.a_count).map(|j| chals[lvl.a_ch + j]).collect();
         let eqv = build_eq_table(&fold_vals);
         let aw = build_eq_table(&alpha_vals);
+        let c_min = sched.summand_depths.last().copied().unwrap_or(c);
         let lv = Lvl {
             q,
             c,
@@ -6031,25 +6086,15 @@ fn level_geometry(
             lanes,
             row_words,
             sched: sched.clone(),
+            cap_layers: native_cap_layers(cap, c - c_min, hash),
         };
-        // Terminal layers above the cap, natively: layers[0] = the cap;
-        // layers[j] = depth c − j. Legacy strata all sit AT the cap, so
-        // only layers[0] exists and this is the old direct-cap check.
-        let c_min = sched.summand_depths.last().copied().unwrap_or(c);
-        let mut layers: Vec<Vec<[u8; 32]>> = vec![cap.to_vec()];
-        for _ in 0..(c - c_min) {
-            let next: Vec<[u8; 32]> = layers
-                .last()
-                .unwrap()
-                .chunks_exact(2)
-                .map(|p| core_merkle::hash_pair(&p[0], &p[1], hash))
-                .collect();
-            layers.push(next);
-        }
+        // Paths truncate at the cap, so every query verifies directly
+        // against the absorbed layer — no terminal-layer rebuild; the
+        // stratum needs no enforcement because `q_pos` derives the index
+        // itself with the stratum in the top bits.
         let mut sum = F128::ZERO;
         for (k, row) in rows.iter().enumerate() {
             let pos = lv.q_pos(k, chals[lvl.q_ch + k].lo);
-            let (ck, _) = lv.q_stratum(k);
             let mut leaf_bytes = Vec::with_capacity(16 * lanes);
             for f in row {
                 leaf_bytes.extend_from_slice(&f.lo.to_le_bytes());
@@ -6058,7 +6103,7 @@ fn level_geometry(
             let lh = core_merkle::hash_leaf(&leaf_bytes, hash);
             assert!(
                 core_merkle::verify_merkle_proof_capped(
-                    &layers[c - ck],
+                    cap,
                     1 << depth,
                     &lh,
                     pos,
@@ -6352,7 +6397,11 @@ fn emit_query_phase(
                 Some(consts),
                 vals,
             );
-            hints.extend(paths[g.path_range(k)].iter().map(hash_to_digest));
+            // The proof's siblings truncate at the cap; the climb to the
+            // stratum terminal still runs the full `d − c_k` rows, so
+            // witgen reconstitutes the cap-fold tail as extra hints.
+            let pos = g.q_pos(k, chals[lvl.q_ch + k].lo);
+            hints.extend(g.full_path(k, pos, paths).iter().map(hash_to_digest));
             // Output-output connects: a multi-producer class with no gate
             // consumers — witgen asserts agreement, no dataflow cycle.
             let (bind, term) = if ck == g.c {
