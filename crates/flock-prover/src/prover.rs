@@ -950,6 +950,16 @@ fn prove_union_with_binding<Ch: Challenger>(
         // the circuit-side cost of this shape is ~one compression row: the
         // child chain can continue from the fork-point CV under a domain
         // byte, and the merge absorbs its 256-bit final CV in one block.
+        //
+        // The ZERO-row alternative — one shared chain interleaving both
+        // protocols' absorbs, each shared point squeezing both challenges —
+        // is equally sound (challenges bind a superset) but trades the one
+        // row for a SCHEDULE: the GKR keeps one squeeze point per message
+        // (~231) against the zerocheck's ~26, naive alignment overlaps only
+        // the GKR's tiny layers, and a work-balanced interleave becomes
+        // part of the protocol (tape + circuit, per (m, μ) shape) with a
+        // rendezvous at every shared point. One row buys free-running and
+        // two clean tape segments.
         let mut ch_w = challenger.fork(b"flock-par-wiring-v1");
         let (boolean, w) = rayon::join(
             || run_boolean(challenger),
