@@ -73,3 +73,6 @@ docs/local/
 !/cuda-ghash/test_*.cu
 !/cuda-ghash/test_*.cpp
 !/cuda-ghash/bench_*.cu
+
+# Agent checkpoints are local-only.
+/agents/
