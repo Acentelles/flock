@@ -45,6 +45,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchOpeningProofLigerito {
     pub ring_switches: Vec<RingSwitchProof>,
+    /// Fiat--Shamir PoW witnesses for the random-linear-combination
+    /// coefficients, in claim order (ring-switched claims first, then packed
+    /// direct claims). Empty when opening grinding is disabled or when the
+    /// batch has only one claim.
+    #[serde(default)]
+    pub batching_nonces: Vec<u64>,
     pub ligerito: ligerito::LigeritoProof,
 }
 
@@ -134,6 +140,59 @@ pub struct PackedDirectClaim {
 pub static VIRTUAL_B_OVERRIDE: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
 
+/// Fiat--Shamir grinding policy for the PCS transport that sits before the
+/// Ligerito opening.  Each nonzero field is applied immediately after its
+/// prover message(s) are bound and immediately before the challenge it
+/// protects is sampled.
+///
+/// The Secure schedule turns a degree-/numerator-`D` algebraic event over
+/// `F128` into a computational work-factor term of about
+/// `D * 2^-bits / 2^128` at that site:
+///
+/// * ring switching has degree at most seven;
+/// * each random linear-combination coefficient has numerator one;
+/// * the merged, multipoint, and anchor sumchecks have quadratic rounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpeningGrinding {
+    /// Seven-coordinate ring-switch point `r''`.
+    pub ring_switch_bits: u32,
+    /// Random coefficients used to batch independent opening claims.
+    pub claim_batch_bits: u32,
+    /// Each quadratic round of the dense merged sumcheck.
+    pub merged_round_bits: u32,
+    /// The multipoint dual-value batching coefficient and its sumcheck /
+    /// anchor-round policies.
+    pub multipoint: jagged::MultipointGrinding,
+}
+
+impl OpeningGrinding {
+    pub const fn disabled() -> Self {
+        Self {
+            ring_switch_bits: 0,
+            claim_batch_bits: 0,
+            merged_round_bits: 0,
+            multipoint: jagged::MultipointGrinding::disabled(),
+        }
+    }
+
+    pub const fn per_challenge_128() -> Self {
+        Self {
+            // 7 / 2^128, then a 2^-3 PoW filter.
+            ring_switch_bits: 3,
+            // 1 / 2^128, then a 2^-1 PoW filter.
+            claim_batch_bits: 1,
+            // Quadratic sumcheck rounds: 2 / 2^128, then 2^-2.
+            merged_round_bits: 2,
+            multipoint: jagged::MultipointGrinding::per_challenge_128(),
+        }
+    }
+
+    #[inline]
+    fn claim_batch_bits_for(self, claim_count: usize) -> u32 {
+        (claim_count > 1).then_some(self.claim_batch_bits).unwrap_or(0)
+    }
+}
+
 /// Mixed-claim batched open: supports both **ring-switched** claims (bit-MLE
 /// openings reduced via `ring_switch::prove_batched`, with optional per-claim
 /// precomputed `s_hat_v`) and **packed-direct** claims (packed-MLE openings
@@ -153,6 +212,35 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     packed_direct: &[PackedDirectClaim],
     padding: &PaddingSpec,
     lig_config: &ligerito::ProverConfig,
+    challenger: &mut Ch,
+) -> BatchOpeningProofLigerito {
+    open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding(
+        packed_witness,
+        prover_data,
+        commitment,
+        x_outers,
+        precomputed_s_hat_v,
+        packed_direct,
+        padding,
+        lig_config,
+        OpeningGrinding::disabled(),
+        challenger,
+    )
+}
+
+/// [`open_batch_mixed_ligerito_with_precomputed_s_hat_v`] with PoW witnesses
+/// for ring switching and nontrivial claim batching.
+#[allow(clippy::too_many_arguments)]
+pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding<Ch: Challenger>(
+    packed_witness: Vec<F128>,
+    prover_data: &ProverData,
+    commitment: &Commitment,
+    x_outers: &[&[F128]],
+    precomputed_s_hat_v: &[Option<&[F128]>],
+    packed_direct: &[PackedDirectClaim],
+    padding: &PaddingSpec,
+    lig_config: &ligerito::ProverConfig,
+    grinding: OpeningGrinding,
     challenger: &mut Ch,
 ) -> BatchOpeningProofLigerito {
     // Belt-and-braces on the cap-depth derivation: the commit-time cap
@@ -214,6 +302,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
         packed_direct,
         padding,
         round0_block,
+        grinding,
         challenger,
         trace,
     );
@@ -221,6 +310,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     let t = std::time::Instant::now();
     let CombinedClaim {
         ring_switches,
+        batching_nonces,
         b_combined,
         eq_basis,
         eq_gamma,
@@ -300,6 +390,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
 
     BatchOpeningProofLigerito {
         ring_switches,
+        batching_nonces,
         ligerito: ligerito_proof,
     }
 }
@@ -307,6 +398,8 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
 /// What ring_switch + claim-combination produces, fed to the Ligerito backend.
 struct CombinedClaim {
     ring_switches: Vec<RingSwitchProof>,
+    /// PoW witnesses for random linear-combination coefficients.
+    batching_nonces: Vec<u64>,
     /// The materialized γ-combined basis — EMPTY when `eq_basis` is `Some`
     /// (the factored path never writes the full-domain array).
     b_combined: Vec<F128>,
@@ -349,6 +442,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     // (their primes are adjacent-paired; the jagged path re-derives its
     // blocked prime downstream).
     eqpoint_round0_block: usize,
+    grinding: OpeningGrinding,
     challenger: &mut Ch,
     trace: bool,
 ) -> CombinedClaim {
@@ -365,19 +459,18 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
 
     // 1. Ring-switching for all x_outers.
     let t = std::time::Instant::now();
-    let (rs_results, gammas_rs): (
-        Vec<(RingSwitchProof, ring_switch::RingSwitchBatchOutput)>,
-        Vec<F128>,
-    ) = if n_rs > 0 {
-        ring_switch::prove_batched_padded_with_precomputed(
+    let batch_bits = grinding.claim_batch_bits_for(n_rs + n_pd);
+    let mut rs_results = if n_rs > 0 {
+        ring_switch::prove_batched_padded_with_precomputed_unbatched_and_grinding(
             packed_witness,
             x_outers,
             precomputed_s_hat_v,
             padding,
+            grinding.ring_switch_bits,
             challenger,
         )
     } else {
-        (Vec::new(), Vec::new())
+        Vec::new()
     };
     if trace {
         eprintln!(
@@ -392,7 +485,15 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         challenger.observe_label(b"flock-pcs-packed-direct-v0");
         challenger.observe_f128(pd.value);
     }
-    let gammas_pd: Vec<F128> = (0..n_pd).map(|_| challenger.sample_f128()).collect();
+    let mut batching_nonces = Vec::with_capacity(usize::from(batch_bits != 0));
+    if batch_bits != 0 {
+        batching_nonces.push(challenger.grind_pow(batch_bits));
+    }
+    let gammas = challenger.sample_f128_vec(n_rs + n_pd);
+    let (gammas_rs, gammas_pd) = gammas.split_at(n_rs);
+    for ((_, output), &gamma) in rs_results.iter_mut().zip(gammas_rs) {
+        output.rs_eq_ind.scale_in_place(gamma);
+    }
 
     let t = std::time::Instant::now();
     use rayon::prelude::*;
@@ -525,6 +626,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         }
         return CombinedClaim {
             ring_switches: Vec::new(),
+            batching_nonces,
             b_combined: Vec::new(),
             eq_basis: Some((lo, hi, n_lo)),
             eq_gamma: Some(gammas_pd[0]),
@@ -742,6 +844,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         .collect();
     CombinedClaim {
         ring_switches,
+        batching_nonces,
         b_combined,
         eq_basis: None,
         eq_gamma: None,
@@ -867,12 +970,44 @@ pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
     lig_config: &ligerito::VerifierConfig,
     challenger: &mut Ch,
 ) -> Result<(), VerifyError> {
+    verify_opening_batch_ligerito_mixed_with_grinding(
+        commitment,
+        claims,
+        z_skips,
+        x_outers,
+        packed_direct,
+        proof,
+        lig_config,
+        OpeningGrinding::disabled(),
+        challenger,
+    )
+}
+
+/// [`verify_opening_batch_ligerito_mixed`] with the matching PCS-transport
+/// PoW checks.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_opening_batch_ligerito_mixed_with_grinding<Ch: Challenger>(
+    commitment: &Commitment,
+    claims: &[F128],
+    z_skips: &[F128],
+    x_outers: &[&[F128]],
+    packed_direct: &[PackedDirectClaimRef<'_>],
+    proof: &BatchOpeningProofLigerito,
+    lig_config: &ligerito::VerifierConfig,
+    grinding: OpeningGrinding,
+    challenger: &mut Ch,
+) -> Result<(), VerifyError> {
     let n_rs = claims.len();
     let n_pd = packed_direct.len();
     assert_eq!(z_skips.len(), n_rs);
     assert_eq!(x_outers.len(), n_rs);
     assert_eq!(proof.ring_switches.len(), n_rs);
     assert!(n_rs + n_pd > 0);
+    let batch_bits = grinding.claim_batch_bits_for(n_rs + n_pd);
+    let expected_batch_nonces = usize::from(batch_bits != 0);
+    if proof.batching_nonces.len() != expected_batch_nonces {
+        return Err(VerifyError::RingSwitch(ring_switch::VerifyError::InvalidGrinding));
+    }
     // Lane-major (integer-lane) commitments: supported only for the merged
     // inner-open configuration (packed-direct claims only). The RS claims'
     // residual machinery has no rotated-point path; reject rather than
@@ -891,24 +1026,32 @@ pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
     //    ~16 MB allocation at m=29.
     let mut rs_outputs = Vec::with_capacity(n_rs);
     for i in 0..n_rs {
-        let out = ring_switch::verify_succinct(
+        let out = ring_switch::verify_succinct_with_grinding(
             claims[i],
             z_skips[i],
             x_outers[i],
             &proof.ring_switches[i],
+            grinding.ring_switch_bits,
             challenger,
         )
         .map_err(VerifyError::RingSwitch)?;
         rs_outputs.push(out);
     }
-    let gammas_rs: Vec<F128> = (0..n_rs).map(|_| challenger.sample_f128()).collect();
-
-    // 2. PD claim values + γ_pd.
+    // 2. Bind every PD value, then protect the whole mixed linear batching
+    // vector with one PoW. A discrepancy is total-degree one in this vector.
     for pd in packed_direct {
         challenger.observe_label(b"flock-pcs-packed-direct-v0");
         challenger.observe_f128(pd.value);
     }
-    let gammas_pd: Vec<F128> = (0..n_pd).map(|_| challenger.sample_f128()).collect();
+    if batch_bits != 0
+        && !challenger.verify_pow(proof.batching_nonces[0], batch_bits)
+    {
+        return Err(VerifyError::RingSwitch(
+            ring_switch::VerifyError::InvalidGrinding,
+        ));
+    }
+    let gammas = challenger.sample_f128_vec(n_rs + n_pd);
+    let (gammas_rs, gammas_pd) = gammas.split_at(n_rs);
 
     // 3. target_combined from succinct rs claims + PD values.
     let mut target_combined = F128::ZERO;
@@ -1059,7 +1202,14 @@ fn rotate_lane_point(point: &[F128], k: usize) -> Vec<F128> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergedOpenProof {
     pub ring_switches: Vec<RingSwitchProof>,
+    /// PoW witnesses for the outer opening-claim batching coefficients:
+    /// ring-switched claims first, then packed-direct claims.
+    #[serde(default)]
+    pub batching_nonces: Vec<u64>,
     pub merged_rounds: Vec<(F128, F128)>,
+    /// PoW witnesses for the dense merged sumcheck, in round order.
+    #[serde(default)]
+    pub merged_round_nonces: Vec<u64>,
     pub q_eval: F128,
     pub frobenius: jagged::MultipointTwistedProof,
     pub inner: BatchOpeningProofLigerito,
@@ -1136,6 +1286,7 @@ pub fn open_batch_merged<Ch: Challenger>(
     heights: &[u64],
     n_log: usize,
     lig_config: &ligerito::ProverConfig,
+    grinding: OpeningGrinding,
     challenger: &mut Ch,
 ) -> MergedOpenProof {
     let trace = std::env::var("PCS_TRACE").is_ok();
@@ -1165,16 +1316,18 @@ pub fn open_batch_merged<Ch: Challenger>(
     // element-only merged transcript: nothing is absorbed for the empty batch,
     // exactly as in the mixed open's `n_rs > 0` guard.
     let padded_witness = padded_witness.unwrap_or(&q);
-    let (rs_results, gammas_rs) = if !x_outers.is_empty() {
-        ring_switch::prove_batched_padded_with_precomputed(
+    let batch_bits = grinding.claim_batch_bits_for(x_outers.len() + packed_direct.len());
+    let mut rs_results = if !x_outers.is_empty() {
+        ring_switch::prove_batched_padded_with_precomputed_unbatched_and_grinding(
             padded_witness,
             x_outers,
             precomputed_s_hat_v,
             padding,
+            grinding.ring_switch_bits,
             challenger,
         )
     } else {
-        (Vec::new(), Vec::new())
+        Vec::new()
     };
     if trace {
         eprintln!(
@@ -1196,19 +1349,24 @@ pub fn open_batch_merged<Ch: Challenger>(
     // recursion circuit re-hashed per child. The γ's still bind the VALUES,
     // which are genuine prover messages. (The non-merged `open_batch` has
     // absorbed value-only since birth — this aligns the merged intake.)
-    let gammas_pd: Vec<F128> = packed_direct
-        .iter()
-        .map(|c| {
-            challenger.observe_f128(c.value);
-            challenger.sample_f128()
-        })
-        .collect();
+    for c in packed_direct {
+        challenger.observe_f128(c.value);
+    }
+    let mut batching_nonces = Vec::with_capacity(usize::from(batch_bits != 0));
+    if batch_bits != 0 {
+        batching_nonces.push(challenger.grind_pow(batch_bits));
+    }
+    let gammas = challenger.sample_f128_vec(x_outers.len() + packed_direct.len());
+    let (gammas_rs, gammas_pd) = gammas.split_at(x_outers.len());
+    for ((_, output), &gamma) in rs_results.iter_mut().zip(gammas_rs) {
+        output.rs_eq_ind.scale_in_place(gamma);
+    }
 
     let mut target = F128::ZERO;
-    for ((_, o), g) in rs_results.iter().zip(&gammas_rs) {
+    for ((_, o), g) in rs_results.iter().zip(gammas_rs.iter()) {
         target += *g * o.sumcheck_claim;
     }
-    for (c, g) in packed_direct.iter().zip(&gammas_pd) {
+    for (c, g) in packed_direct.iter().zip(gammas_pd.iter()) {
         target += *g * c.value;
     }
 
@@ -1283,6 +1441,8 @@ pub fn open_batch_merged<Ch: Challenger>(
     let t = std::time::Instant::now();
     let (mut g_one, mut g_inf) = (target + u0, u2);
     let mut merged_rounds = Vec::with_capacity(dense_log);
+    let mut merged_round_nonces =
+        Vec::with_capacity((grinding.merged_round_bits != 0) as usize * dense_log);
     let mut rho = Vec::with_capacity(dense_log);
     let l = q.len();
     let area = (params.area() as usize).min(l);
@@ -1301,6 +1461,9 @@ pub fn open_batch_merged<Ch: Challenger>(
         let half = cur / 2;
         challenger.observe_f128(g_one);
         challenger.observe_f128(g_inf);
+        if grinding.merged_round_bits != 0 {
+            merged_round_nonces.push(challenger.grind_pow(grinding.merged_round_bits));
+        }
         let r = challenger.sample_f128();
         merged_rounds.push((g_one, g_inf));
         rho.push(r);
@@ -1414,9 +1577,18 @@ pub fn open_batch_merged<Ch: Challenger>(
     // per-statement assist — family K collapses, and every verifier piece
     // is a shape the recursion circuit already has.
     let (frobenius, inner) = rayon::join(
-        || jagged::prove_multipoint_twisted(&params, &fclaims, &gclaims, &rho, &mut ch_a),
         || {
-            open_batch_mixed_ligerito_with_precomputed_s_hat_v(
+            jagged::prove_multipoint_twisted_with_grinding(
+                &params,
+                &fclaims,
+                &gclaims,
+                &rho,
+                grinding.multipoint,
+                &mut ch_a,
+            )
+        },
+        || {
+            open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding(
                 q,
                 prover_data,
                 commitment,
@@ -1425,6 +1597,7 @@ pub fn open_batch_merged<Ch: Challenger>(
                 &[pd],
                 &PaddingSpec::dense(commitment.params.m),
                 lig_config,
+                grinding,
                 challenger,
             )
         },
@@ -1466,7 +1639,9 @@ pub fn open_batch_merged<Ch: Challenger>(
     drop(fclaims);
     MergedOpenProof {
         ring_switches: rs_results.into_iter().map(|(p, _)| p).collect(),
+        batching_nonces,
         merged_rounds,
+        merged_round_nonces,
         q_eval,
         frobenius,
         inner,
@@ -1637,6 +1812,7 @@ pub fn verify_batch_merged<Ch: Challenger>(
     n_log: usize,
     proof: &MergedOpenProof,
     lig_config: &ligerito::VerifierConfig,
+    grinding: OpeningGrinding,
     challenger: &mut Ch,
 ) -> Result<(), VerifyErrorOpen> {
     verify_batch_merged_core(
@@ -1649,6 +1825,7 @@ pub fn verify_batch_merged<Ch: Challenger>(
         n_log,
         proof,
         lig_config,
+        grinding,
         challenger,
         None,
     )
@@ -1671,6 +1848,7 @@ pub fn verify_batch_merged_deferred<Ch: Challenger>(
     n_log: usize,
     proof: &MergedOpenProof,
     lig_config: &ligerito::VerifierConfig,
+    grinding: OpeningGrinding,
     challenger: &mut Ch,
 ) -> Result<crate::matrix_fold::JaggedAssertion, VerifyErrorOpen> {
     let mut out = None;
@@ -1684,6 +1862,7 @@ pub fn verify_batch_merged_deferred<Ch: Challenger>(
         n_log,
         proof,
         lig_config,
+        grinding,
         challenger,
         Some(&mut out),
     )?;
@@ -1701,13 +1880,20 @@ fn verify_batch_merged_core<Ch: Challenger>(
     n_log: usize,
     proof: &MergedOpenProof,
     lig_config: &ligerito::VerifierConfig,
+    grinding: OpeningGrinding,
     challenger: &mut Ch,
     defer: Option<&mut Option<crate::matrix_fold::JaggedAssertion>>,
 ) -> Result<(), VerifyErrorOpen> {
     let n_rs = claims.len();
+    let n_pd = packed_direct.len();
     assert_eq!(z_skips.len(), n_rs);
     assert_eq!(x_outers.len(), n_rs);
     if proof.ring_switches.len() != n_rs {
+        return Err(VerifyErrorOpen::Assist);
+    }
+    let batch_bits = grinding.claim_batch_bits_for(n_rs + n_pd);
+    let expected_batch_nonces = usize::from(batch_bits != 0);
+    if proof.batching_nonces.len() != expected_batch_nonces {
         return Err(VerifyErrorOpen::Assist);
     }
     // `VERIFY_TRACE` phase split. The Ligerito inner verify has its own
@@ -1726,11 +1912,12 @@ fn verify_batch_merged_core<Ch: Challenger>(
     let t = std::time::Instant::now();
     let mut rs_outputs = Vec::with_capacity(n_rs);
     for i in 0..n_rs {
-        let out = ring_switch::verify_succinct(
+        let out = ring_switch::verify_succinct_with_grinding(
             claims[i],
             z_skips[i],
             x_outers[i],
             &proof.ring_switches[i],
+            grinding.ring_switch_bits,
             challenger,
         )
         .map_err(VerifyErrorOpen::RingSwitch)?;
@@ -1742,23 +1929,24 @@ fn verify_batch_merged_core<Ch: Challenger>(
             tfmt(t.elapsed().as_secs_f64())
         );
     }
-    let gammas: Vec<F128> = (0..n_rs).map(|_| challenger.sample_f128()).collect();
-    // Packed-direct γ's follow the ring-switched ones, in the prover's order.
+    // Packed-direct values are bound before one PoW protects the entire mixed
+    // coefficient vector (total discrepancy degree one).
     // VALUE-ONLY absorb (v1) — see the prover-side intake for the argument:
     // the points are transcript-derived and verifier-recomputed, never prover
     // messages.
-    let gammas_pd: Vec<F128> = packed_direct
-        .iter()
-        .map(|c| {
-            challenger.observe_f128(c.value);
-            challenger.sample_f128()
-        })
-        .collect();
+    for c in packed_direct {
+        challenger.observe_f128(c.value);
+    }
+    if batch_bits != 0 && !challenger.verify_pow(proof.batching_nonces[0], batch_bits) {
+        return Err(VerifyErrorOpen::Assist);
+    }
+    let gammas_all = challenger.sample_f128_vec(n_rs + n_pd);
+    let (gammas, gammas_pd) = gammas_all.split_at(n_rs);
     let mut target = F128::ZERO;
-    for (out, g) in rs_outputs.iter().zip(&gammas) {
+    for (out, g) in rs_outputs.iter().zip(gammas.iter()) {
         target += *g * out.sumcheck_claim;
     }
-    for (c, g) in packed_direct.iter().zip(&gammas_pd) {
+    for (c, g) in packed_direct.iter().zip(gammas_pd.iter()) {
         target += *g * c.value;
     }
 
@@ -1766,11 +1954,27 @@ fn verify_batch_merged_core<Ch: Challenger>(
     if proof.merged_rounds.len() != dense_log {
         return Err(VerifyErrorOpen::VirtualOpen);
     }
+    let expected_merged_nonces = if grinding.merged_round_bits == 0 {
+        0
+    } else {
+        dense_log
+    };
+    if proof.merged_round_nonces.len() != expected_merged_nonces {
+        return Err(VerifyErrorOpen::VirtualOpen);
+    }
     let mut running = target;
     let mut rho = Vec::with_capacity(dense_log);
-    for &(g_one, g_inf) in &proof.merged_rounds {
+    for (round, &(g_one, g_inf)) in proof.merged_rounds.iter().enumerate() {
         challenger.observe_f128(g_one);
         challenger.observe_f128(g_inf);
+        if grinding.merged_round_bits != 0
+            && !challenger.verify_pow(
+                proof.merged_round_nonces[round],
+                grinding.merged_round_bits,
+            )
+        {
+            return Err(VerifyErrorOpen::VirtualOpen);
+        }
         let r = challenger.sample_f128();
         running = jagged::fold_round_claim(running, g_one, g_inf, r);
         rho.push(r);
@@ -1790,7 +1994,7 @@ fn verify_batch_merged_core<Ch: Challenger>(
     // tensors → fold byte tables → linearized coefficients).
     let coeffs: Vec<Vec<F128>> = rs_outputs
         .iter()
-        .zip(&gammas)
+        .zip(gammas.iter())
         .map(|(o, g)| {
             let scaled: Vec<F128> = o.eq_r_dprime.iter().map(|x| *g * *x).collect();
             ring_switch::linearized_coefficients(&ring_switch::build_fold_byte_table(&scaled))
@@ -1845,24 +2049,26 @@ fn verify_batch_merged_core<Ch: Challenger>(
     let mut ch_a = challenger.fork(b"flock-par-assist-v1");
     let mut mp_defer = None;
     let v = if defer.is_some() {
-        let (v, mp) = jagged::verify_multipoint_twisted_deferred(
+        let (v, mp) = jagged::verify_multipoint_twisted_deferred_with_grinding(
             &params,
             &fclaims,
             &gclaims,
             &rho,
             &proof.frobenius,
+            grinding.multipoint,
             &mut ch_a,
         )
         .ok_or(VerifyErrorOpen::Assist)?;
         mp_defer = Some(mp);
         v
     } else {
-        jagged::verify_multipoint_twisted(
+        jagged::verify_multipoint_twisted_with_grinding(
             &params,
             &fclaims,
             &gclaims,
             &rho,
             &proof.frobenius,
+            grinding.multipoint,
             &mut ch_a,
         )
         .ok_or(VerifyErrorOpen::Assist)?
@@ -1901,7 +2107,7 @@ fn verify_batch_merged_core<Ch: Challenger>(
         point: &rho,
         value: proof.q_eval,
     };
-    verify_opening_batch_ligerito_mixed(
+    verify_opening_batch_ligerito_mixed_with_grinding(
         commitment,
         &[],
         &[],
@@ -1909,6 +2115,7 @@ fn verify_batch_merged_core<Ch: Challenger>(
         &[pd],
         &proof.inner,
         lig_config,
+        grinding,
         challenger,
     )
     .map_err(|_| VerifyErrorOpen::Ligerito)?;

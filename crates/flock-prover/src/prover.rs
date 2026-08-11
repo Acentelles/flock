@@ -63,6 +63,7 @@ pub(crate) fn open_claims_with_precomputed_ligerito<Ch: Challenger>(
     precomputed_s_hat_v: &[Option<&[F128]>],
     padding: &zerocheck::PaddingSpec,
     lig_config: &pcs::ligerito::ProverConfig,
+    opening_grinding: pcs::OpeningGrinding,
     challenger: &mut Ch,
 ) -> pcs::BatchOpeningProofLigerito {
     let x_fulls: Vec<Vec<F128>> = claims
@@ -70,7 +71,7 @@ pub(crate) fn open_claims_with_precomputed_ligerito<Ch: Challenger>(
         .map(|c| quirky_x_outer_full(&c.point))
         .collect();
     let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
-    pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
+    pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding(
         z_packed,
         prover_data,
         commitment,
@@ -79,6 +80,7 @@ pub(crate) fn open_claims_with_precomputed_ligerito<Ch: Challenger>(
         &[],
         padding,
         lig_config,
+        opening_grinding,
         challenger,
     )
 }
@@ -136,15 +138,22 @@ pub fn prove_ligerito<Ch: Challenger>(
     let z_packed_lincheck = pack_z_lincheck_from_packed(&z_packed, r1cs.m, r1cs.k_log);
 
     let padding = r1cs.padding_spec();
-    let (zc_proof, zc_claim, s_hat_v_c) = zerocheck::prove_packed_padded_capture_s_hat_v_c(
-        a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
-    );
+    let (zc_proof, zc_claim, s_hat_v_c) =
+        zerocheck::prove_packed_padded_capture_s_hat_v_c_with_grinding(
+            a_packed,
+            b_packed,
+            c_packed,
+            r1cs.m,
+            &padding,
+            pcs_params.zerocheck_grinding(),
+            challenger,
+        );
 
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
 
     let lc_circuit =
         lincheck::SparseMatrixCircuit::new(&r1cs.a_0, &r1cs.b_0).with_const_pin(r1cs.const_pin);
-    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
+    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec_with_grinding(
         &z_packed_lincheck,
         r1cs.m,
         r1cs.k_log,
@@ -152,6 +161,7 @@ pub fn prove_ligerito<Ch: Challenger>(
         r1cs.useful_bits,
         &lc_circuit,
         &x_ab,
+        pcs_params.lincheck_grinding(),
         challenger,
     );
 
@@ -182,6 +192,7 @@ pub fn prove_ligerito<Ch: Challenger>(
         &[pre_ab, pre_c],
         &padding,
         &lig_config,
+        pcs_params.opening_grinding(),
         challenger,
     );
 
@@ -247,6 +258,7 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
         &[pre_ab, pre_c],
         &padding,
         &lig_config,
+        pcs_params.opening_grinding(),
         challenger,
     );
 
@@ -881,12 +893,13 @@ fn prove_union_with_binding<Ch: Challenger>(
                 let a_packed = view(&a_packed_f128);
                 let b_packed = view(&b_packed_f128);
                 let c_packed = view(&z_packed);
-                zerocheck::prove_packed_padded_capture_s_hat_v_c(
+                zerocheck::prove_packed_padded_capture_s_hat_v_c_with_grinding(
                     a_packed,
                     b_packed,
                     c_packed,
                     m_bool,
                     &bool_padding,
+                    pcs_params.zerocheck_grinding(),
                     challenger,
                 )
             };
@@ -905,7 +918,13 @@ fn prove_union_with_binding<Ch: Challenger>(
                         circuit: *circuit,
                     })
                     .collect();
-                lincheck::prove_union_capture_z_vec(union, &lc_slots, &x_ab, challenger)
+                lincheck::prove_union_capture_z_vec_with_grinding(
+                    union,
+                    &lc_slots,
+                    &x_ab,
+                    pcs_params.lincheck_grinding(),
+                    challenger,
+                )
             };
 
             let ab = ZClaim {
@@ -989,8 +1008,13 @@ fn prove_union_with_binding<Ch: Challenger>(
         let (boolean, w) = rayon::join(
             || run_boolean(challenger),
             || {
-                let r =
-                    flock_core::circuit::prove_wiring(ci.circuit, &z_packed, ci.public, &mut ch_w);
+                let r = flock_core::circuit::prove_wiring_with_grinding(
+                    ci.circuit,
+                    &z_packed,
+                    ci.public,
+                    pcs_params.product_gkr_grinding(),
+                    &mut ch_w,
+                );
                 (r, ch_w)
             },
         );
@@ -1033,12 +1057,13 @@ fn prove_union_with_binding<Ch: Challenger>(
                         )
                     }
                 };
-                let (zc_proof, zc_claim, _shv) = zerocheck::prove_packed_padded_capture_s_hat_v_c(
+                let (zc_proof, zc_claim, _shv) = zerocheck::prove_packed_padded_capture_s_hat_v_c_with_grinding(
                     view(&a_packed_f128),
                     view(&b_packed_f128),
                     view(&z_packed),
                     m_bool,
                     &bool_padding,
+                    pcs_params.zerocheck_grinding(),
                     &mut ch,
                 );
                 let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
@@ -1096,7 +1121,14 @@ fn prove_union_with_binding<Ch: Challenger>(
     let t = std::time::Instant::now();
     let element = element_ab.map(|(pa, pb)| {
         let r = union.element_word_range();
-        let out = flock_core::element_r1cs::union::prove(union, &z_packed[r], &pa, &pb, challenger);
+        let out = flock_core::element_r1cs::union::prove_with_grinding(
+            union,
+            &z_packed[r],
+            &pa,
+            &pb,
+            pcs_params.element_grinding(),
+            challenger,
+        );
         // Recycle the region pair (the PIOP borrows, never writes): the live
         // arm's buffers came from the zero pool via `copy_live_region` and
         // return there with only their live spans dirty; the dense arm's
@@ -1129,9 +1161,15 @@ fn prove_union_with_binding<Ch: Challenger>(
         // FORK/JOIN variant: the wiring already ran concurrently with the
         // boolean PIOP on its own child transcript; only the claims flow on.
         (Some(w), _) => Some(w),
-        (None, UnionProveBinding::Circuit(ci)) => Some(flock_core::circuit::prove_wiring(
-            ci.circuit, &z_packed, ci.public, challenger,
-        )),
+        (None, UnionProveBinding::Circuit(ci)) => {
+            Some(flock_core::circuit::prove_wiring_with_grinding(
+                ci.circuit,
+                &z_packed,
+                ci.public,
+                pcs_params.product_gkr_grinding(),
+                challenger,
+            ))
+        }
         (None, _) => None,
     };
     if trace && let Some((_, claims)) = &wiring {
@@ -1205,6 +1243,7 @@ fn prove_union_with_binding<Ch: Challenger>(
         &heights,
         union.n_log(),
         &lig_config,
+        pcs_params.opening_grinding(),
         challenger,
     );
     let t_gb = std::time::Instant::now();
@@ -1384,8 +1423,14 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
                 z_packed.len() * core::mem::size_of::<F128>(),
             )
         };
-        zerocheck::prove_packed_padded_capture_s_hat_v_c(
-            a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
+        zerocheck::prove_packed_padded_capture_s_hat_v_c_with_grinding(
+            a_packed,
+            b_packed,
+            c_packed,
+            r1cs.m,
+            &padding,
+            pcs_params.zerocheck_grinding(),
+            challenger,
         )
     };
     // Nothing downstream reads a/b (zerocheck consumed them in rounds 1–2);
@@ -1398,7 +1443,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
 
     // Capture lincheck's pre-sumcheck z_vec so the PCS open can derive the
     // AB-claim's `s_hat_v` from it (skips fold_1b_rows for AB).
-    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
+    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec_with_grinding(
         &z_packed_lincheck,
         r1cs.m,
         r1cs.k_log,
@@ -1406,6 +1451,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         r1cs.useful_bits,
         lincheck_circuit,
         &x_ab,
+        pcs_params.lincheck_grinding(),
         challenger,
     );
     // The lincheck stripe copy of z is dead from here on; free it before the
@@ -1528,8 +1574,14 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
                 z_packed.len() * core::mem::size_of::<F128>(),
             )
         };
-        zerocheck::prove_packed_padded_capture_s_hat_v_c(
-            a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
+        zerocheck::prove_packed_padded_capture_s_hat_v_c_with_grinding(
+            a_packed,
+            b_packed,
+            c_packed,
+            r1cs.m,
+            &padding,
+            pcs_params.zerocheck_grinding(),
+            challenger,
         )
     };
     t.zerocheck_s = t0.elapsed().as_secs_f64();
@@ -1540,7 +1592,7 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
 
     // --- lincheck + base-claim / s_hat_v setup ---
     let t0 = Instant::now();
-    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
+    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec_with_grinding(
         &z_packed_lincheck,
         r1cs.m,
         r1cs.k_log,
@@ -1548,6 +1600,7 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
         r1cs.useful_bits,
         lincheck_circuit,
         &x_ab,
+        pcs_params.lincheck_grinding(),
         challenger,
     );
     flock_core::scratch::give_u8(z_packed_lincheck);
@@ -1581,6 +1634,7 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
         &[pre_ab, pre_c],
         &padding,
         &lig_config,
+        pcs_params.opening_grinding(),
         challenger,
     );
     t.open_s = t0.elapsed().as_secs_f64();

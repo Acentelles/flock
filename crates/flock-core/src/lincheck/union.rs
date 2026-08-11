@@ -68,8 +68,9 @@ use crate::zerocheck::K_SKIP;
 use crate::zerocheck::multilinear::lagrange_weights_naive;
 
 use super::{
-    LincheckCircuit, LincheckClaim, LincheckProof, QuirkyPoint, VerifyError, build_eq_table,
-    build_quirky_eq_table, column_sumcheck_prove, inner_product, partial_fold_packed_z_rows_best,
+    LincheckCircuit, LincheckClaim, LincheckProof, LincheckGrinding, QuirkyPoint, VerifyError,
+    build_eq_table, build_quirky_eq_table, column_sumcheck_prove, inner_product,
+    partial_fold_packed_z_rows_best,
 };
 
 /// One slot's lincheck inputs, in slot order — the union counterpart of the
@@ -189,6 +190,24 @@ pub fn prove_union_capture_z_vec<Ch: Challenger>(
     x_ab: &QuirkyPoint,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Vec<F128>) {
+    prove_union_capture_z_vec_with_grinding(
+        union,
+        slots,
+        x_ab,
+        LincheckGrinding::disabled(),
+        challenger,
+    )
+}
+
+/// [`prove_union_capture_z_vec`] with an explicit Fiat--Shamir grinding
+/// policy.
+pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
+    union: &UnionInstance<'_>,
+    slots: &[UnionLincheckSlot<'_>],
+    x_ab: &QuirkyPoint,
+    grinding: LincheckGrinding,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Vec<F128>) {
     let registry = union.registry();
     let k_skip = K_SKIP;
     let nu = union.n_log();
@@ -222,11 +241,22 @@ pub fn prove_union_capture_z_vec<Ch: Challenger>(
 
     challenger.observe_label(b"flock-lincheck-v0");
     let trace = std::env::var("LINCHECK_TRACE").is_ok();
+    let mut grinding_nonces = Vec::with_capacity(grinding.nonce_count(
+        inner_rest_len,
+        slots
+            .iter()
+            .filter(|slot| slot.circuit.const_pin_col().is_some())
+            .count(),
+        k_skip,
+    ));
 
     // 1. Sample α (matches verifier's order). ONE α batches the A- and
     //    B-claims for every slot (doc §"The B-claim, and batching the two
     //    sumchecks"); the cross-slot weights w_t(r) are fixed scalars, not
     //    randomness.
+    if let Some(bits) = grinding.alpha_bits() {
+        grinding_nonces.push(challenger.grind_pow(bits));
+    }
     let alpha = challenger.sample_f128();
 
     // 2. Per-type α-batched combs via each type's quirky table — the slot's
@@ -285,6 +315,9 @@ pub fn prove_union_capture_z_vec<Ch: Challenger>(
     //     `verify_union` and the module docs.
     for (slot, slot_in) in registry.slots().iter().zip(slots) {
         if let Some(col) = slot_in.circuit.const_pin_col() {
+            if let Some(bits) = grinding.beta_bits() {
+                grinding_nonces.push(challenger.grind_pow(bits));
+            }
             let beta = challenger.sample_f128();
             let off = slot.prefix << (slot.m_slot - nu);
             comb_vec[off + col] += beta;
@@ -352,7 +385,15 @@ pub fn prove_union_capture_z_vec<Ch: Challenger>(
 
     // 4.–9. The existing sumcheck core, over the (longer) union column
     //       domain.
-    let (mut proof, claim) = column_sumcheck_prove(comb_vec, z_vec, k_skip, trace, challenger);
+    let (mut proof, claim) = column_sumcheck_prove(
+        comb_vec,
+        z_vec,
+        k_skip,
+        trace,
+        grinding,
+        &mut grinding_nonces,
+        challenger,
+    );
 
     // 10. The matrix work, reported rather than folded into the target: for
     //     each type the UNSCALED pair (⟨W_t, A_0⟩, ⟨W_t, B_0⟩) with the
@@ -585,8 +626,32 @@ pub fn verify_union<Ch: Challenger>(
     proof: &LincheckProof,
     challenger: &mut Ch,
 ) -> Result<LincheckClaim, VerifyError> {
-    let (claim, assertion) =
-        verify_union_deferred(union, circuits, x_ab, v_a, v_b, proof, challenger)?;
+    verify_union_with_grinding(
+        union,
+        circuits,
+        x_ab,
+        v_a,
+        v_b,
+        proof,
+        LincheckGrinding::disabled(),
+        challenger,
+    )
+}
+
+/// [`verify_union`] with an explicit Fiat--Shamir grinding policy.
+pub fn verify_union_with_grinding<Ch: Challenger>(
+    union: &UnionInstance<'_>,
+    circuits: &[&dyn LincheckCircuit],
+    x_ab: &QuirkyPoint,
+    v_a: F128,
+    v_b: F128,
+    proof: &LincheckProof,
+    grinding: LincheckGrinding,
+    challenger: &mut Ch,
+) -> Result<LincheckClaim, VerifyError> {
+    let (claim, assertion) = verify_union_deferred_with_grinding(
+        union, circuits, x_ab, v_a, v_b, proof, grinding, challenger,
+    )?;
     assertion.check(union, circuits)?;
     Ok(claim)
 }
@@ -608,6 +673,29 @@ pub fn verify_union_deferred<Ch: Challenger>(
     v_a: F128,
     v_b: F128,
     proof: &LincheckProof,
+    challenger: &mut Ch,
+) -> Result<(LincheckClaim, MatrixAssertion), VerifyError> {
+    verify_union_deferred_with_grinding(
+        union,
+        circuits,
+        x_ab,
+        v_a,
+        v_b,
+        proof,
+        LincheckGrinding::disabled(),
+        challenger,
+    )
+}
+
+/// [`verify_union_deferred`] with an explicit Fiat--Shamir grinding policy.
+pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
+    union: &UnionInstance<'_>,
+    circuits: &[&dyn LincheckCircuit],
+    x_ab: &QuirkyPoint,
+    v_a: F128,
+    v_b: F128,
+    proof: &LincheckProof,
+    grinding: LincheckGrinding,
     challenger: &mut Ch,
 ) -> Result<(LincheckClaim, MatrixAssertion), VerifyError> {
     let registry = union.registry();
@@ -666,10 +754,31 @@ pub fn verify_union_deferred<Ch: Challenger>(
             got: proof.z_partial.len(),
         });
     }
+    let expected_nonces = grinding.nonce_count(
+        inner_rest_len,
+        circuits
+            .iter()
+            .filter(|circuit| circuit.const_pin_col().is_some())
+            .count(),
+        k_skip,
+    );
+    if proof.grinding_nonces.len() != expected_nonces {
+        return Err(VerifyError::BadGrindingNonceCount {
+            expected: expected_nonces,
+            got: proof.grinding_nonces.len(),
+        });
+    }
 
     challenger.observe_label(b"flock-lincheck-v0");
+    let mut nonce_idx = 0;
 
     // 1. Sample α (matches prover's order).
+    if let Some(bits) = grinding.alpha_bits() {
+        if !challenger.verify_pow(proof.grinding_nonces[nonce_idx], bits) {
+            return Err(VerifyError::InvalidGrindingNonce { which: "alpha" });
+        }
+        nonce_idx += 1;
+    }
     let alpha = challenger.sample_f128();
 
     // 2. The per-type α-batched combs are NOT built here — they are the
@@ -696,6 +805,12 @@ pub fn verify_union_deferred<Ch: Challenger>(
     let mut betas: Vec<Option<F128>> = Vec::with_capacity(circuits.len());
     for (circuit, &n_t) in circuits.iter().zip(union.counts()) {
         if circuit.const_pin_col().is_some() {
+            if let Some(bits) = grinding.beta_bits() {
+                if !challenger.verify_pow(proof.grinding_nonces[nonce_idx], bits) {
+                    return Err(VerifyError::InvalidGrindingNonce { which: "beta" });
+                }
+                nonce_idx += 1;
+            }
             let beta = challenger.sample_f128();
             betas.push(Some(beta));
             target += beta * eq_prefix_sum(&x_ab.x_outer, n_t);
@@ -712,6 +827,14 @@ pub fn verify_union_deferred<Ch: Challenger>(
     for &(e1, einf) in &proof.rounds {
         challenger.observe_f128(e1);
         challenger.observe_f128(einf);
+        if let Some(bits) = grinding.multilinear_round_bits() {
+            if !challenger.verify_pow(proof.grinding_nonces[nonce_idx], bits) {
+                return Err(VerifyError::InvalidGrindingNonce {
+                    which: "sumcheck-round",
+                });
+            }
+            nonce_idx += 1;
+        }
         let r = challenger.sample_f128();
         // q(0) = claim + q(1) in char 2; q(X) = einf·X² + c1·X + e0.
         let e0 = running + e1;
@@ -742,6 +865,15 @@ pub fn verify_union_deferred<Ch: Challenger>(
 
     // 6.–7. Fresh skip challenge after z_partial; claim value via φ8
     //       Lagrange (identical to the single-table verifier).
+    if let Some(bits) = grinding.skip_bits(k_skip) {
+        if !challenger.verify_pow(proof.grinding_nonces[nonce_idx], bits) {
+            return Err(VerifyError::InvalidGrindingNonce {
+                which: "inner-skip",
+            });
+        }
+        nonce_idx += 1;
+    }
+    debug_assert_eq!(nonce_idx, proof.grinding_nonces.len());
     let r_inner_skip = challenger.sample_f128();
     let lambda = lagrange_weights_naive(k_skip, r_inner_skip);
     let w = inner_product(&lambda, &proof.z_partial);

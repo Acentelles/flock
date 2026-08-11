@@ -421,18 +421,34 @@ pub struct SwapInput {
 // The bit spread
 // ---------------------------------------------------------------------------
 
-/// Relocate the bits of one index word into `depth` separate words, each
-/// carrying its bit in position 0.
+/// Relocate the bits of one word into `depth` separate words, each carrying
+/// its bit in position 0, and optionally require selected input bits to be
+/// zero.
 ///
 /// Needed only because a table's relation is uniform across rows — see the
 /// module docs. It proves nothing about bit-ness: the input is already a
 /// boolean table's committed word, so its bits are bits. It only moves them.
 ///
 /// ```text
-///   0                  .. 128            the index word
+///   0                  .. 128            the input word
 ///   128 + 128·l        .. +128           output l  (bit 0 = index bit l, rest 0)
-///   128·(depth+1)                        the constant-one column
+///   128·(depth+1)       .. +128           zero mask
+///   128·(depth+2)       .. +128           check word (pinned zero)
+///   128·(depth+3)                         the constant-one column
 /// ```
+///
+/// In addition to the relocation constraints, every input bit satisfies
+///
+/// ```text
+///   input_j · zero_mask_j = 0.
+/// ```
+///
+/// Merkle index spreading uses the all-zero mask, so its historical relation
+/// is unchanged.  The recursive verifier reuses the SAME small table to check
+/// the leading-zero mask on a BLAKE3 PoW digest and to pin a nonce's unused
+/// high 64 bits to zero.  Keeping this in the existing table avoids adding a
+/// new boolean table (and hence another full lincheck family) solely for a
+/// handful of grinding rows.
 pub struct BitSpreadTable {
     pub depth: usize,
 }
@@ -444,7 +460,7 @@ impl BitSpreadTable {
     }
 
     pub fn k_log(&self) -> usize {
-        (128 * (self.depth + 1) + 1)
+        (128 * (self.depth + 3) + 1)
             .next_power_of_two()
             .trailing_zeros() as usize
     }
@@ -459,16 +475,25 @@ impl BitSpreadTable {
     }
 
     pub fn const_pos(&self) -> usize {
+        self.check_pos() + 128
+    }
+
+    pub fn mask_pos(&self) -> usize {
         128 * (self.depth + 1)
+    }
+
+    pub fn check_pos(&self) -> usize {
+        self.mask_pos() + 128
     }
 
     pub fn useful_bits(&self) -> usize {
         self.const_pos() + 1
     }
 
-    /// Input: the index word. Outputs: one single-bit word per level.
+    /// Inputs: the word and its zero mask. Outputs: one single-bit word per
+    /// level.
     pub fn io_schema(&self) -> Vec<IoWord> {
-        let mut s = vec![IoWord::input(0)];
+        let mut s = vec![IoWord::input(0), IoWord::input(self.mask_pos() / 128)];
         s.extend((0..self.depth).map(|l| IoWord::output(self.out(l) / 128)));
         s
     }
@@ -482,6 +507,17 @@ impl BitSpreadTable {
         for j in 0..128 {
             a[j] = vec![j];
             b[j] = vec![gc];
+
+            // The mask is an ordinary wired input, so first give its bit the
+            // usual free assignment equation mask_j * 1 = mask_j.
+            a[self.mask_pos() + j] = vec![self.mask_pos() + j];
+            b[self.mask_pos() + j] = vec![gc];
+
+            // The optimized boolean prover uses the C=I convention.  Put
+            // the selected-zero predicate in a dedicated auxiliary bit that
+            // the witness pins to zero: input_j * mask_j = check_j = 0.
+            a[self.check_pos() + j] = vec![j];
+            b[self.check_pos() + j] = vec![self.mask_pos() + j];
         }
         for l in 0..self.depth {
             // Bit 0 of output `l` IS index bit `l`.
@@ -523,17 +559,35 @@ impl BitSpreadTable {
         }
     }
 
-    pub fn build_witness(&self, index_word: u128) -> [Vec<bool>; 3] {
+    pub fn build_witness(&self, input_word: u128) -> [Vec<bool>; 3] {
+        self.build_masked_witness(BitSpreadInput {
+            word: input_word,
+            zero_mask: 0,
+        })
+    }
+
+    /// The row witness including the optional zero-mask constraint.
+    pub fn build_masked_witness(&self, input: BitSpreadInput) -> [Vec<bool>; 3] {
         let k = self.k();
         let (mut z, mut a, mut b) = (vec![false; k], vec![false; k], vec![false; k]);
         for j in 0..128 {
-            let v = (index_word >> j) & 1 == 1;
+            let v = (input.word >> j) & 1 == 1;
             z[j] = v;
             a[j] = v;
             b[j] = true;
+
+            let mask = (input.zero_mask >> j) & 1 == 1;
+            z[self.mask_pos() + j] = mask;
+            a[self.mask_pos() + j] = mask;
+            b[self.mask_pos() + j] = true;
+
+            // z/check stays zero.  A/B carry the product inputs so an
+            // overlapping bit makes A*B != z exactly where zerocheck reads.
+            a[self.check_pos() + j] = v;
+            b[self.check_pos() + j] = mask;
         }
         for l in 0..self.depth {
-            let v = (index_word >> l) & 1 == 1;
+            let v = (input.word >> l) & 1 == 1;
             z[self.out(l)] = v;
             a[self.out(l)] = v;
             b[self.out(l)] = true;
@@ -550,11 +604,14 @@ impl BitSpreadTable {
 
     pub fn generate_witness_batch_major(
         &self,
-        rows: &[u128],
+        rows: &[BitSpreadInput],
         nu: usize,
     ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
         use rayon::prelude::*;
-        let per: Vec<[Vec<bool>; 3]> = rows.par_iter().map(|&i| self.build_witness(i)).collect();
+        let per: Vec<[Vec<bool>; 3]> = rows
+            .par_iter()
+            .map(|&i| self.build_masked_witness(i))
+            .collect();
         scatter_zab(&per, self.k(), self.useful_bits(), nu)
     }
 
@@ -562,11 +619,22 @@ impl BitSpreadTable {
     /// destination block — the copy-free union assembly path.
     pub fn generate_witness_batch_major_into(
         &self,
-        rows: &[u128],
+        rows: &[BitSpreadInput],
         dst: flock_core::union::SlotWitnessDest<'_>,
     ) -> Vec<u8> {
         use rayon::prelude::*;
-        let per: Vec<[Vec<bool>; 3]> = rows.par_iter().map(|&i| self.build_witness(i)).collect();
+        let per: Vec<[Vec<bool>; 3]> = rows
+            .par_iter()
+            .map(|&i| self.build_masked_witness(i))
+            .collect();
         scatter_zab_into(&per, self.k(), self.useful_bits(), dst)
     }
+}
+
+/// One row of [`BitSpreadTable`].  `zero_mask` is statement data: every set
+/// bit requires the corresponding bit of `word` to be zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BitSpreadInput {
+    pub word: u128,
+    pub zero_mask: u128,
 }

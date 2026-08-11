@@ -134,6 +134,9 @@ pub enum VerifyError {
     /// carrying the wrong number of sumcheck rounds. Returned rather than
     /// panicked so an untrusted proof cannot take the verifier down.
     MalformedProof,
+    /// A Fiat--Shamir grinding witness was missing, superfluous, or did not
+    /// satisfy the configured leading-zero predicate.
+    InvalidGrinding,
 }
 
 // ---------------------------------------------------------------------------
@@ -1408,6 +1411,70 @@ pub struct ProductGkrBatchedProof {
     pub f_eval: F128,       // f(ρ)
     pub g_eval: F128,       // g(ρ)
     pub s_sigma_eval: F128, // s_σ(ρ)
+    /// PoW witnesses in transcript order: the initial product fingerprint,
+    /// then for every layer its lambda, round, and closing challenges.
+    #[serde(default)]
+    pub grinding_nonces: Vec<u64>,
+}
+
+/// Fiat--Shamir grinding for the batched product-GKR permutation argument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BatchedGrinding {
+    /// Nonzero enables the initial `(alpha, beta)` product fingerprint grind.
+    /// Its actual bit count is raised to cover the live product degree.
+    pub fingerprint_bits: u32,
+    /// Linear batching challenge combining the two product circuits.
+    pub lambda_bits: u32,
+    /// Quadratic sumcheck challenge in each layer round.
+    pub round_bits: u32,
+    /// Linear challenge that collapses a layer's two boundary values.
+    pub close_bits: u32,
+}
+
+impl BatchedGrinding {
+    pub const fn disabled() -> Self {
+        Self {
+            fingerprint_bits: 0,
+            lambda_bits: 0,
+            round_bits: 0,
+            close_bits: 0,
+        }
+    }
+
+    pub const fn per_challenge_128() -> Self {
+        Self {
+            fingerprint_bits: 1,
+            lambda_bits: 1,
+            round_bits: 2,
+            close_bits: 1,
+        }
+    }
+
+    #[inline]
+    fn fingerprint_bits_for(self, live_entries: usize) -> u32 {
+        if self.fingerprint_bits == 0 {
+            0
+        } else {
+            self.fingerprint_bits.max(crate::challenger::grinding_bits_for_degree(
+                live_entries.saturating_sub(1),
+            ))
+        }
+    }
+
+    #[inline]
+    fn nonce_count(self, mu: usize, live_entries: usize) -> usize {
+        usize::from(self.fingerprint_bits_for(live_entries) != 0)
+            + mu * usize::from(self.lambda_bits != 0)
+            + (mu * mu.saturating_sub(1) / 2) * usize::from(self.round_bits != 0)
+            + mu * usize::from(self.close_bits != 0)
+    }
+}
+
+#[inline]
+fn grind_if<C: Challenger>(ch: &mut C, nonces: &mut Vec<u64>, bits: u32) {
+    if bits != 0 {
+        nonces.push(ch.grind_pow(bits));
+    }
 }
 
 /// Evaluation claims at the SINGLE shared point `ρ`.
@@ -1484,7 +1551,19 @@ pub fn prove_batched<C: Challenger>(
     live: Option<&LiveMask>,
     ch: &mut C,
 ) -> (ProductGkrBatchedProof, ProductGkrBatchedClaim) {
-    prove_batched_impl(f, g, sigma, live, false, ch)
+    prove_batched_with_grinding(f, g, sigma, live, BatchedGrinding::disabled(), ch)
+}
+
+/// [`prove_batched`] with an explicit Fiat--Shamir grinding policy.
+pub fn prove_batched_with_grinding<C: Challenger>(
+    f: &[F128],
+    g: &[F128],
+    sigma: &[usize],
+    live: Option<&LiveMask>,
+    grinding: BatchedGrinding,
+    ch: &mut C,
+) -> (ProductGkrBatchedProof, ProductGkrBatchedClaim) {
+    prove_batched_impl(f, g, sigma, live, false, grinding, ch)
 }
 
 /// The DENSE pipeline forced under a mask — the grouped pipeline's
@@ -1497,7 +1576,15 @@ pub(crate) fn prove_batched_dense_masked_for_tests<C: Challenger>(
     live: Option<&LiveMask>,
     ch: &mut C,
 ) -> (ProductGkrBatchedProof, ProductGkrBatchedClaim) {
-    prove_batched_impl(f, g, sigma, live, true, ch)
+    prove_batched_impl(
+        f,
+        g,
+        sigma,
+        live,
+        true,
+        BatchedGrinding::disabled(),
+        ch,
+    )
 }
 
 /// The sparse masked σ evaluation: `Σ_live eq_lo(row)·eq_hi(slot)·tag(σ(x))`
@@ -1532,6 +1619,8 @@ fn prove_batched_grouped<C: Challenger>(
     m: &LiveMask,
     alpha: F128,
     beta: F128,
+    grinding: BatchedGrinding,
+    grinding_nonces: &mut Vec<u64>,
     ch: &mut C,
 ) -> (ProductGkrBatchedProof, ProductGkrBatchedClaim) {
     let n = f.len();
@@ -1622,6 +1711,7 @@ fn prove_batched_grouped<C: Challenger>(
     );
     let t_sc_total = std::time::Instant::now();
     for k in 0..mu {
+        grind_if(ch, grinding_nonces, grinding.lambda_bits);
         let lambda = ch.sample_f128();
         let mut rounds = Vec::with_capacity(k);
         let mut r_prime = Vec::with_capacity(k + 1);
@@ -1663,6 +1753,7 @@ fn prove_batched_grouped<C: Challenger>(
             };
             ch.observe_f128(msg.0);
             ch.observe_f128(msg.1);
+            grind_if(ch, grinding_nonces, grinding.round_bits);
             let rho = ch.sample_f128();
             rounds.push(msg);
             r_prime.push(rho);
@@ -1720,6 +1811,7 @@ fn prove_batched_grouped<C: Challenger>(
             vr0,
             vr1,
         });
+        grind_if(ch, grinding_nonces, grinding.close_bits);
         let c_k = ch.sample_f128();
         let one_plus_c = F128::ONE + c_k;
         claim_l = one_plus_c * vl0 + c_k * vl1;
@@ -1760,6 +1852,7 @@ fn prove_batched_grouped<C: Challenger>(
         f_eval,
         g_eval,
         s_sigma_eval,
+        grinding_nonces: std::mem::take(grinding_nonces),
     };
     let claim = ProductGkrBatchedClaim {
         rho,
@@ -1776,6 +1869,7 @@ fn prove_batched_impl<C: Challenger>(
     sigma: &[usize],
     live: Option<&LiveMask>,
     force_dense: bool,
+    grinding: BatchedGrinding,
     ch: &mut C,
 ) -> (ProductGkrBatchedProof, ProductGkrBatchedClaim) {
     let n = f.len();
@@ -1795,12 +1889,29 @@ fn prove_batched_impl<C: Challenger>(
     }
     let mut t = std::time::Instant::now();
     ch.observe_label(DOMAIN_BATCHED);
+    let live_entries = live.map_or(n, |m| m.counts.iter().sum());
+    let mut grinding_nonces = Vec::with_capacity(grinding.nonce_count(mu, live_entries));
+    grind_if(
+        ch,
+        &mut grinding_nonces,
+        grinding.fingerprint_bits_for(live_entries),
+    );
     let alpha = ch.sample_f128();
     let beta = ch.sample_f128();
 
     if !force_dense {
         if let Some(m) = live {
-            return prove_batched_grouped(f, g, sigma, m, alpha, beta, ch);
+            return prove_batched_grouped(
+                f,
+                g,
+                sigma,
+                m,
+                alpha,
+                beta,
+                grinding,
+                &mut grinding_nonces,
+                ch,
+            );
         }
     }
 
@@ -1884,6 +1995,7 @@ fn prove_batched_impl<C: Challenger>(
     let mut cur: [Vec<F128>; 4] = std::array::from_fn(|_| crate::scratch::take_f128(cap));
     let mut nxt: [Vec<F128>; 4] = std::array::from_fn(|_| crate::scratch::take_f128(cap));
     for k in 0..mu {
+        grind_if(ch, &mut grinding_nonces, grinding.lambda_bits);
         let lambda = ch.sample_f128();
         let h = 1usize << k;
         // Live prefix length of each `cur` buffer; set at round 0, halved after.
@@ -1911,6 +2023,7 @@ fn prove_batched_impl<C: Challenger>(
             let (g1, g_inf) = pending.expect("round i's message was produced already");
             ch.observe_f128(g1);
             ch.observe_f128(g_inf);
+            grind_if(ch, &mut grinding_nonces, grinding.round_bits);
             let rho = ch.sample_f128();
             rounds.push((g1, g_inf));
             r_prime.push(rho);
@@ -1978,6 +2091,7 @@ fn prove_batched_impl<C: Challenger>(
             vr0,
             vr1,
         });
+        grind_if(ch, &mut grinding_nonces, grinding.close_bits);
         let c_k = ch.sample_f128();
         let one_plus_c = F128::ONE + c_k;
         claim_l = one_plus_c * vl0 + c_k * vl1;
@@ -2042,6 +2156,7 @@ fn prove_batched_impl<C: Challenger>(
         f_eval,
         g_eval,
         s_sigma_eval,
+        grinding_nonces,
     };
     let claim = ProductGkrBatchedClaim {
         rho,
@@ -2062,7 +2177,18 @@ pub fn verify_batched<C: Challenger>(
     live: Option<&LiveMask>,
     ch: &mut C,
 ) -> Result<ProductGkrBatchedClaim, VerifyError> {
-    verify_batched_core(mu, proof, None, live, ch)
+    verify_batched_with_grinding(mu, proof, live, BatchedGrinding::disabled(), ch)
+}
+
+/// [`verify_batched`] with an explicit Fiat--Shamir grinding policy.
+pub fn verify_batched_with_grinding<C: Challenger>(
+    mu: usize,
+    proof: &ProductGkrBatchedProof,
+    live: Option<&LiveMask>,
+    grinding: BatchedGrinding,
+    ch: &mut C,
+) -> Result<ProductGkrBatchedClaim, VerifyError> {
+    verify_batched_core(mu, proof, None, live, grinding, ch)
 }
 
 /// Verify a batched product-GKR proof where **σ is verifier-known**: the
@@ -2090,7 +2216,27 @@ pub fn verify_batched_with_sigma<C: Challenger>(
     ch: &mut C,
 ) -> Result<ProductGkrBatchedClaim, VerifyError> {
     assert_eq!(sigma.len(), 1usize << mu, "σ length must be 2^mu");
-    verify_batched_core(mu, proof, Some(sigma), live, ch)
+    verify_batched_with_sigma_and_grinding(
+        mu,
+        proof,
+        sigma,
+        live,
+        BatchedGrinding::disabled(),
+        ch,
+    )
+}
+
+/// [`verify_batched_with_sigma`] with an explicit grinding policy.
+pub fn verify_batched_with_sigma_and_grinding<C: Challenger>(
+    mu: usize,
+    proof: &ProductGkrBatchedProof,
+    sigma: &[usize],
+    live: Option<&LiveMask>,
+    grinding: BatchedGrinding,
+    ch: &mut C,
+) -> Result<ProductGkrBatchedClaim, VerifyError> {
+    assert_eq!(sigma.len(), 1usize << mu, "σ length must be 2^mu");
+    verify_batched_core(mu, proof, Some(sigma), live, grinding, ch)
 }
 
 fn verify_batched_core<C: Challenger>(
@@ -2098,12 +2244,31 @@ fn verify_batched_core<C: Challenger>(
     proof: &ProductGkrBatchedProof,
     sigma_opt: Option<&[usize]>,
     live: Option<&LiveMask>,
+    grinding: BatchedGrinding,
     ch: &mut C,
 ) -> Result<ProductGkrBatchedClaim, VerifyError> {
     if proof.layers.len() != mu {
         return Err(VerifyError::MalformedProof);
     }
+    let n = 1usize << mu;
+    let live_entries = live.map_or(n, |m| m.counts.iter().sum());
+    if proof.grinding_nonces.len() != grinding.nonce_count(mu, live_entries) {
+        return Err(VerifyError::InvalidGrinding);
+    }
+    let mut nonce_idx = 0usize;
+    let mut verify_grind = |ch: &mut C, bits: u32| -> Result<(), VerifyError> {
+        if bits != 0 {
+            let nonce = proof.grinding_nonces[nonce_idx];
+            nonce_idx += 1;
+            if !ch.verify_pow(nonce, bits) {
+                return Err(VerifyError::InvalidGrinding);
+            }
+        }
+        Ok(())
+    };
+
     ch.observe_label(DOMAIN_BATCHED);
+    verify_grind(ch, grinding.fingerprint_bits_for(live_entries))?;
     let alpha = ch.sample_f128();
     let beta = ch.sample_f128();
 
@@ -2120,6 +2285,7 @@ fn verify_batched_core<C: Challenger>(
         if layer.rounds.len() != k {
             return Err(VerifyError::MalformedProof);
         }
+        verify_grind(ch, grinding.lambda_bits)?;
         let lambda = ch.sample_f128();
         let mut c_run = claim_l + lambda * claim_r;
         let mut r_prime = Vec::with_capacity(k + 1);
@@ -2130,6 +2296,7 @@ fn verify_batched_core<C: Challenger>(
             let g0 = (c_run + r_eq * g1) * one_plus_r_eq.inv();
             ch.observe_f128(g1);
             ch.observe_f128(g_inf);
+            verify_grind(ch, grinding.round_bits)?;
             let rho = ch.sample_f128();
             r_prime.push(rho);
             let one_plus_rho = F128::ONE + rho;
@@ -2143,6 +2310,7 @@ fn verify_batched_core<C: Challenger>(
         if c_run != gate {
             return Err(VerifyError::LayerCheckFailed);
         }
+        verify_grind(ch, grinding.close_bits)?;
         let c_k = ch.sample_f128();
         let one_plus_c = F128::ONE + c_k;
         claim_l = one_plus_c * vl0 + c_k * vl1;
@@ -2202,6 +2370,7 @@ fn verify_batched_core<C: Challenger>(
     }
 
     observe_evals(ch, &[proof.f_eval, proof.g_eval, s_sigma]);
+    debug_assert_eq!(nonce_idx, proof.grinding_nonces.len());
 
     Ok(ProductGkrBatchedClaim {
         rho: r_pt,
@@ -2633,6 +2802,33 @@ mod tests {
             assert_eq!(claim_p, claim_v, "μ={mu}");
             assert_eq!(claim_v.rho.len(), mu, "single shared reduction point");
         }
+    }
+
+    #[test]
+    fn batched_grinding_roundtrip_and_rejects_bad_nonce_shape() {
+        let mu = 5;
+        let (f, g, sigma) = honest_instance(mu, 0x1280_B17);
+        let policy = BatchedGrinding::per_challenge_128();
+        let mut chp = FsChallenger::new(b"prod-gkr-batched-grinding-test");
+        bind(&mut chp, &f, &g, &sigma);
+        let (proof, claim_p) =
+            prove_batched_with_grinding(&f, &g, &sigma, None, policy, &mut chp);
+        assert_eq!(proof.grinding_nonces.len(), policy.nonce_count(mu, 1 << mu));
+
+        let mut chv = FsChallenger::new(b"prod-gkr-batched-grinding-test");
+        bind(&mut chv, &f, &g, &sigma);
+        let claim_v = verify_batched_with_grinding(mu, &proof, None, policy, &mut chv)
+            .expect("grinded product-GKR verifies");
+        assert_eq!(claim_p, claim_v);
+
+        let mut missing = proof;
+        missing.grinding_nonces.pop();
+        let mut chv = FsChallenger::new(b"prod-gkr-batched-grinding-test");
+        bind(&mut chv, &f, &g, &sigma);
+        assert_eq!(
+            verify_batched_with_grinding(mu, &missing, None, policy, &mut chv),
+            Err(VerifyError::InvalidGrinding)
+        );
     }
 
     #[test]

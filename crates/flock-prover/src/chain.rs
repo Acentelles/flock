@@ -110,6 +110,71 @@ pub struct ChainShiftProof {
     pub rounds: Vec<(F128, F128)>,
     /// `g(τ', s₀*) = ẑ(τ', (0⁵,s₀*), r)` — the single folded opening value.
     pub g_at_point: F128,
+    /// PoW witnesses in transcript order: initial `(tau, alpha)`, then one
+    /// for every quadratic sumcheck round.
+    #[serde(default)]
+    pub grinding_nonces: Vec<u64>,
+}
+
+/// Grinding schedule for the packed-position and chain-shift challenges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainGrinding {
+    /// Nonzero enables the packed-position vector grind; the actual schedule
+    /// is derived from its dimension.
+    pub packed_position_bits: u32,
+    /// Nonzero enables the initial `(tau, alpha)` grind; its actual schedule
+    /// is derived from `max(n, 1)`.
+    pub initial_bits: u32,
+    /// Each shift sumcheck round is quadratic.
+    pub round_bits: u32,
+}
+
+impl ChainGrinding {
+    pub const fn disabled() -> Self {
+        Self {
+            packed_position_bits: 0,
+            initial_bits: 0,
+            round_bits: 0,
+        }
+    }
+
+    pub const fn per_challenge_128() -> Self {
+        Self {
+            packed_position_bits: 1,
+            initial_bits: 1,
+            round_bits: 2,
+        }
+    }
+
+    pub fn for_profile(profile: flock_core::pcs::ligerito::LigeritoProfile) -> Self {
+        match profile {
+            flock_core::pcs::ligerito::LigeritoProfile::Secure => Self::per_challenge_128(),
+            flock_core::pcs::ligerito::LigeritoProfile::Fast
+            | flock_core::pcs::ligerito::LigeritoProfile::Slim => Self::disabled(),
+        }
+    }
+
+    pub fn packed_position_bits_for(self, dimension: usize) -> u32 {
+        if self.packed_position_bits == 0 || dimension == 0 {
+            0
+        } else {
+            self.packed_position_bits
+                .max(flock_core::challenger::grinding_bits_for_degree(dimension))
+        }
+    }
+
+    fn initial_bits_for(self, n: usize) -> u32 {
+        if self.initial_bits == 0 {
+            0
+        } else {
+            self.initial_bits.max(flock_core::challenger::grinding_bits_for_degree(n.max(1)))
+        }
+    }
+
+    fn nonce_count(self, n: usize) -> usize {
+        usize::from(self.initial_bits_for(n) != 0)
+            + (n + 1) * usize::from(self.round_bits != 0)
+    }
 }
 
 /// The single `ẑ`-evaluation claim the shift argument reduces to, for the PCS
@@ -135,6 +200,8 @@ pub enum ChainError {
     /// Final sumcheck claim `≠ W(τ',s₀*)·g(τ',s₀*)` (covers the glue and both
     /// endpoints, since they are batched into the single claim `C`).
     SumcheckFinal,
+    /// Grinding witnesses were malformed or failed their PoW predicate.
+    InvalidGrinding,
 }
 
 /// Inner product `Σ eq[i]·vals[i]` — used to spot-check claims in tests.
@@ -157,11 +224,31 @@ pub fn prove_chain_shift<Ch: Challenger>(
     out_vals: &[F128],
     challenger: &mut Ch,
 ) -> (ChainShiftProof, ChainClaims) {
+    prove_chain_shift_with_grinding(
+        in_vals,
+        out_vals,
+        ChainGrinding::disabled(),
+        challenger,
+    )
+}
+
+/// [`prove_chain_shift`] with explicit Fiat--Shamir grinding.
+pub fn prove_chain_shift_with_grinding<Ch: Challenger>(
+    in_vals: &[F128],
+    out_vals: &[F128],
+    grinding: ChainGrinding,
+    challenger: &mut Ch,
+) -> (ChainShiftProof, ChainClaims) {
     let n_total = in_vals.len();
     assert!(n_total.is_power_of_two(), "n_total must be a power of two");
     assert_eq!(out_vals.len(), n_total, "In/Out length mismatch");
     let n = n_total.trailing_zeros() as usize;
 
+    let mut grinding_nonces = Vec::with_capacity(grinding.nonce_count(n));
+    let initial_bits = grinding.initial_bits_for(n);
+    if initial_bits != 0 {
+        grinding_nonces.push(challenger.grind_pow(initial_bits));
+    }
     // τ ∈ Fⁿ, then α — both before the sumcheck (mirrored by the verifier).
     let tau = challenger.sample_f128_vec(n);
     let alpha = challenger.sample_f128();
@@ -199,6 +286,9 @@ pub fn prove_chain_shift<Ch: Challenger>(
         }
         challenger.observe_f128(e1);
         challenger.observe_f128(einf);
+        if grinding.round_bits != 0 {
+            grinding_nonces.push(challenger.grind_pow(grinding.round_bits));
+        }
         let r = challenger.sample_f128();
         // Fold (bind the top remaining variable): lo + r·(hi+lo).
         for i in 0..half {
@@ -227,6 +317,7 @@ pub fn prove_chain_shift<Ch: Challenger>(
         ChainShiftProof {
             rounds,
             g_at_point: g[0],
+            grinding_nonces,
         },
         claims,
     )
@@ -242,13 +333,43 @@ pub fn verify_chain_shift<Ch: Challenger>(
     n: usize,
     challenger: &mut Ch,
 ) -> Result<ChainClaims, ChainError> {
+    verify_chain_shift_with_grinding(
+        proof,
+        x0_r,
+        xlast_r,
+        n,
+        ChainGrinding::disabled(),
+        challenger,
+    )
+}
+
+/// [`verify_chain_shift`] with explicit Fiat--Shamir grinding.
+pub fn verify_chain_shift_with_grinding<Ch: Challenger>(
+    proof: &ChainShiftProof,
+    x0_r: F128,
+    xlast_r: F128,
+    n: usize,
+    grinding: ChainGrinding,
+    challenger: &mut Ch,
+) -> Result<ChainClaims, ChainError> {
     let d = n + 1;
     if proof.rounds.len() != d {
         return Err(ChainError::MalformedProof);
     }
+    if proof.grinding_nonces.len() != grinding.nonce_count(n) {
+        return Err(ChainError::InvalidGrinding);
+    }
+    let mut nonce_idx = 0usize;
 
     // Resample τ, α. The initial claim is the *public* scalar
     //   C = eq(τ,1ⁿ)·x_last + α·x_0(r),     eq(τ,1ⁿ) = Π_j τ_j.
+    let initial_bits = grinding.initial_bits_for(n);
+    if initial_bits != 0 {
+        if !challenger.verify_pow(proof.grinding_nonces[nonce_idx], initial_bits) {
+            return Err(ChainError::InvalidGrinding);
+        }
+        nonce_idx += 1;
+    }
     let tau = challenger.sample_f128_vec(n);
     let alpha = challenger.sample_f128();
     let eq_tau_ones = tau.iter().copied().fold(F128::ONE, |acc, t| acc * t);
@@ -259,6 +380,12 @@ pub fn verify_chain_shift<Ch: Challenger>(
     for &(e1, einf) in &proof.rounds {
         challenger.observe_f128(e1);
         challenger.observe_f128(einf);
+        if grinding.round_bits != 0 {
+            if !challenger.verify_pow(proof.grinding_nonces[nonce_idx], grinding.round_bits) {
+                return Err(ChainError::InvalidGrinding);
+            }
+            nonce_idx += 1;
+        }
         let r = challenger.sample_f128();
         // q(0) = claim − q(1) = claim + e1 (char 2). Degree-2 poly through
         // (0,e0),(1,e1),(∞→einf): q(X) = einf·X² + c1·X + e0, c1 = e0+e1+einf.
@@ -288,6 +415,7 @@ pub fn verify_chain_shift<Ch: Challenger>(
     if claim != w_final * proof.g_at_point {
         return Err(ChainError::SumcheckFinal);
     }
+    debug_assert_eq!(nonce_idx, proof.grinding_nonces.len());
 
     Ok(ChainClaims {
         instance_point: taup,
@@ -441,7 +569,7 @@ pub fn fold_contiguous_regions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flock_core::challenger::RandomChallenger;
+    use flock_core::challenger::{FsChallenger, RandomChallenger};
 
     /// SplitMix64-ish RNG for test data.
     struct Rng(u64);
@@ -634,6 +762,46 @@ mod tests {
             let g_true = (F128::ONE + claims.sel0) * in_true + claims.sel0 * out_true;
             assert_eq!(claims.value, g_true, "merged claim n={n}");
         }
+    }
+
+    #[test]
+    fn grinding_roundtrip_and_rejects_bad_nonce_shape() {
+        let n = 5;
+        let n_total = 1usize << n;
+        let mut rng = Rng::new(0x1280_C4A1);
+        let chain: Vec<F128> = rng.f128_vec(n_total + 1);
+        let in_vals = &chain[..n_total];
+        let out_vals = &chain[1..];
+        let policy = ChainGrinding::per_challenge_128();
+        let mut chp = FsChallenger::new(b"chain-shift-grinding-test");
+        let (proof, claim_p) =
+            prove_chain_shift_with_grinding(in_vals, out_vals, policy, &mut chp);
+        let mut chv = FsChallenger::new(b"chain-shift-grinding-test");
+        let claim_v = verify_chain_shift_with_grinding(
+            &proof,
+            chain[0],
+            chain[n_total],
+            n,
+            policy,
+            &mut chv,
+        )
+        .expect("grinded chain shift verifies");
+        assert_eq!(claim_p, claim_v);
+
+        let mut missing = proof;
+        missing.grinding_nonces.pop();
+        let mut chv = FsChallenger::new(b"chain-shift-grinding-test");
+        assert_eq!(
+            verify_chain_shift_with_grinding(
+                &missing,
+                chain[0],
+                chain[n_total],
+                n,
+                policy,
+                &mut chv,
+            ),
+            Err(ChainError::InvalidGrinding)
+        );
     }
 
     /// Breaking the chain at one index makes the sumcheck reject.

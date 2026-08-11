@@ -8,7 +8,9 @@
 
 use flock_core::r1cs::BlockR1cs;
 use flock_prover::r1cs_hashes::blake3;
-use flock_prover::r1cs_hashes::merkle_glue::{BitSpreadTable, SwapInput, SwapTable};
+use flock_prover::r1cs_hashes::merkle_glue::{
+    BitSpreadInput, BitSpreadTable, SwapInput, SwapTable,
+};
 use flock_prover::r1cs_hashes::merkle_r1cs::{
     BLAKE3_FLAG_CHUNK_END, BLAKE3_FLAG_CHUNK_START, BLAKE3_FLAG_PARENT, ChunkPathInput,
     MerkleTreeLayout, NODE_BLOCK_LEN, NODE_COUNTER, SLOT_WORDS, blake3_spec,
@@ -204,6 +206,34 @@ fn bit_spread_relocates_and_is_tight() {
             }
         }
     }
+}
+
+/// The optional mask is a constraint, not an unchecked witness annotation:
+/// selected zero bits pass, while any selected one bit makes the row fail.
+#[test]
+fn bit_spread_zero_mask_is_enforced() {
+    let ty = BitSpreadTable::new(8);
+    let r1cs = ty.build_block_r1cs(0);
+    let word = 0xA55A_0F0Fu128;
+
+    let allowed = BitSpreadInput {
+        word,
+        zero_mask: !word,
+    };
+    let [z, a, b] = ty.build_masked_witness(allowed);
+    assert!(r1cs.satisfies(&z), "a disjoint zero mask must pass");
+    assert_eq!(a, r1cs.apply_a(&z));
+    assert_eq!(b, r1cs.apply_b(&z));
+
+    let forbidden_bit = word & word.wrapping_neg();
+    let rejected = BitSpreadInput {
+        word,
+        zero_mask: forbidden_bit,
+    };
+    let [z, a, b] = ty.build_masked_witness(rejected);
+    assert!(!r1cs.satisfies(&z), "a masked one bit must be rejected");
+    assert_eq!(a, r1cs.apply_a(&z));
+    assert_eq!(b, r1cs.apply_b(&z));
 }
 
 /// The reason the glue exists: both tables are negligible against the BLAKE3

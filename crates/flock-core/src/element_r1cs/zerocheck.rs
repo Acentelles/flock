@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::zerocheck::univariate_skip::SplitEqGhash;
+use super::Grinding;
 
 /// Domain label of the standalone single-table zerocheck. The union's
 /// element-region zerocheck runs the same protocol under its own label — see
@@ -53,6 +54,9 @@ pub struct Proof {
     pub eb: F128,
     /// `ẑ(r)` — the C-claim.
     pub ec: F128,
+    /// Initial-equality-point then per-round PoW nonces, in transcript order.
+    #[serde(default)]
+    pub grinding_nonces: Vec<u64>,
 }
 
 /// What a verified zerocheck leaves for Phase 2 and the opening.
@@ -69,6 +73,8 @@ pub struct Claim {
 pub enum VerifyError {
     /// Wrong number of round messages.
     BadRoundCount { expected: usize, got: usize },
+    BadGrindingNonceCount { expected: usize, got: usize },
+    InvalidGrindingNonce { which: &'static str },
     /// The final consistency check `running == ea·eb + ec` failed. Any
     /// inconsistency in a round message or in the three final evaluations
     /// propagates here.
@@ -167,7 +173,19 @@ pub fn prove<C: Challenger>(
     m_words: usize,
     ch: &mut C,
 ) -> (Proof, Claim) {
-    prove_with_label(LABEL, pa, pb, z, m_words, ch)
+    prove_with_grinding(pa, pb, z, m_words, Grinding::disabled(), ch)
+}
+
+/// [`prove`] with an explicit Fiat--Shamir grinding policy.
+pub fn prove_with_grinding<C: Challenger>(
+    pa: Vec<F128>,
+    pb: Vec<F128>,
+    z: &[F128],
+    m_words: usize,
+    grinding: Grinding,
+    ch: &mut C,
+) -> (Proof, Claim) {
+    prove_with_label_and_grinding(LABEL, pa, pb, z, m_words, grinding, ch)
 }
 
 /// [`prove`] under a caller-chosen domain label. The union's element-region
@@ -183,7 +201,22 @@ pub fn prove_with_label<C: Challenger>(
     m_words: usize,
     ch: &mut C,
 ) -> (Proof, Claim) {
-    let out = prove_with_support(label, &pa, &pb, z, m_words, 0, None, ch);
+    prove_with_label_and_grinding(label, pa, pb, z, m_words, Grinding::disabled(), ch)
+}
+
+/// [`prove_with_label`] with an explicit Fiat--Shamir grinding policy.
+pub fn prove_with_label_and_grinding<C: Challenger>(
+    label: &[u8],
+    pa: Vec<F128>,
+    pb: Vec<F128>,
+    z: &[F128],
+    m_words: usize,
+    grinding: Grinding,
+    ch: &mut C,
+) -> (Proof, Claim) {
+    let out = prove_with_support_with_grinding(
+        label, &pa, &pb, z, m_words, 0, None, grinding, ch,
+    );
     // The borrowed originals were never written; recycle them here, as the
     // pre-borrow fold used to when it swapped them out at round 1.
     crate::scratch::give_f128(pa);
@@ -220,6 +253,32 @@ pub fn prove_with_support<C: Challenger>(
     support: Option<&RowSupport>,
     ch: &mut C,
 ) -> (Proof, Claim) {
+    prove_with_support_with_grinding(
+        label,
+        pa,
+        pb,
+        z,
+        m_words,
+        nu,
+        support,
+        Grinding::disabled(),
+        ch,
+    )
+}
+
+/// [`prove_with_support`] with an explicit element grinding policy.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_with_support_with_grinding<C: Challenger>(
+    label: &[u8],
+    pa: &[F128],
+    pb: &[F128],
+    z: &[F128],
+    m_words: usize,
+    nu: usize,
+    support: Option<&RowSupport>,
+    grinding: Grinding,
+    ch: &mut C,
+) -> (Proof, Claim) {
     let n_words = 1usize << m_words;
     assert_eq!(pa.len(), n_words, "pa length");
     assert_eq!(pb.len(), n_words, "pb length");
@@ -227,6 +286,10 @@ pub fn prove_with_support<C: Challenger>(
     assert!(m_words >= 1, "need at least one variable");
 
     ch.observe_label(label);
+    let mut grinding_nonces = Vec::with_capacity(grinding.zerocheck_nonce_count(m_words));
+    if let Some(bits) = grinding.initial_bits(m_words) {
+        grinding_nonces.push(ch.grind_pow(bits));
+    }
     let tau = ch.sample_f128_vec(m_words);
 
     // Support-proportional row rounds, or all-dense. Decided ONCE: a mid-loop
@@ -276,6 +339,9 @@ pub fn prove_with_support<C: Challenger>(
         };
         ch.observe_f128(g1);
         ch.observe_f128(g_inf);
+        if let Some(bits) = grinding.round_bits() {
+            grinding_nonces.push(ch.grind_pow(bits));
+        }
         let rho = ch.sample_f128();
         rounds.push((g1, g_inf));
         r.push(rho);
@@ -334,7 +400,13 @@ pub fn prove_with_support<C: Challenger>(
     }
     crate::scratch::give_f128(wz);
 
-    let proof = Proof { rounds, ea, eb, ec };
+    let proof = Proof {
+        rounds,
+        ea,
+        eb,
+        ec,
+        grinding_nonces,
+    };
     let claim = Claim { r, ea, eb, ec };
     (proof, claim)
 }
@@ -346,7 +418,17 @@ pub fn verify<C: Challenger>(
     proof: &Proof,
     ch: &mut C,
 ) -> Result<Claim, VerifyError> {
-    verify_with_label(LABEL, m_words, proof, ch)
+    verify_with_grinding(m_words, proof, Grinding::disabled(), ch)
+}
+
+/// [`verify`] with an explicit Fiat--Shamir grinding policy.
+pub fn verify_with_grinding<C: Challenger>(
+    m_words: usize,
+    proof: &Proof,
+    grinding: Grinding,
+    ch: &mut C,
+) -> Result<Claim, VerifyError> {
+    verify_with_label_and_grinding(LABEL, m_words, proof, grinding, ch)
 }
 
 /// [`verify`] under a caller-chosen domain label — mirror of
@@ -357,14 +439,38 @@ pub fn verify_with_label<C: Challenger>(
     proof: &Proof,
     ch: &mut C,
 ) -> Result<Claim, VerifyError> {
+    verify_with_label_and_grinding(label, m_words, proof, Grinding::disabled(), ch)
+}
+
+/// [`verify_with_label`] with an explicit element grinding policy.
+pub fn verify_with_label_and_grinding<C: Challenger>(
+    label: &[u8],
+    m_words: usize,
+    proof: &Proof,
+    grinding: Grinding,
+    ch: &mut C,
+) -> Result<Claim, VerifyError> {
     if proof.rounds.len() != m_words {
         return Err(VerifyError::BadRoundCount {
             expected: m_words,
             got: proof.rounds.len(),
         });
     }
+    if proof.grinding_nonces.len() != grinding.zerocheck_nonce_count(m_words) {
+        return Err(VerifyError::BadGrindingNonceCount {
+            expected: grinding.zerocheck_nonce_count(m_words),
+            got: proof.grinding_nonces.len(),
+        });
+    }
 
     ch.observe_label(label);
+    let mut nonce_idx = 0;
+    if let Some(bits) = grinding.initial_bits(m_words) {
+        if !ch.verify_pow(proof.grinding_nonces[nonce_idx], bits) {
+            return Err(VerifyError::InvalidGrindingNonce { which: "initial" });
+        }
+        nonce_idx += 1;
+    }
     let tau = ch.sample_f128_vec(m_words);
 
     // Convention A chain, identical in shape to `crate::zerocheck::verify`: the
@@ -380,6 +486,12 @@ pub fn verify_with_label<C: Challenger>(
 
         ch.observe_f128(g1);
         ch.observe_f128(g_inf);
+        if let Some(bits) = grinding.round_bits() {
+            if !ch.verify_pow(proof.grinding_nonces[nonce_idx], bits) {
+                return Err(VerifyError::InvalidGrindingNonce { which: "round" });
+            }
+            nonce_idx += 1;
+        }
         let rho = ch.sample_f128();
         r.push(rho);
 
@@ -398,6 +510,7 @@ pub fn verify_with_label<C: Challenger>(
     ch.observe_f128(proof.ea);
     ch.observe_f128(proof.eb);
     ch.observe_f128(proof.ec);
+    debug_assert_eq!(nonce_idx, proof.grinding_nonces.len());
 
     Ok(Claim {
         r,

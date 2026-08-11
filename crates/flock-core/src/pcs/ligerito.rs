@@ -3011,9 +3011,10 @@ pub type BasisWindowFn<'a> = &'a (dyn Fn(&mut [F128], usize) + Sync);
 /// and the 134 MB read of it, and measures FASTER than the read (see
 /// `tests/jit_fold.rs`).
 ///
-/// Blocked pairing only (`d > 1`): that is the lane-major L0 fold, the one on
-/// the integer-lane opening path. The power-of-two path keeps the materialized
-/// kernel, so its byte-identity anchors are untouched.
+/// `d = 1` is the ordinary adjacent/LSB pairing; `d > 1` is the blocked
+/// pairing used by a lane-major L0 fold.  The same task decomposition covers
+/// both cases: at `d = 1`, one task folds four adjacent input entries into
+/// two output entries and accumulates exactly one next-round message pair.
 #[allow(clippy::too_many_arguments)]
 fn fold_and_msg_blocked_jit(
     f: &[F128],
@@ -3025,7 +3026,7 @@ fn fold_and_msg_blocked_jit(
     use rayon::prelude::*;
 
     let n = f.len();
-    debug_assert!(d > 1 && n.is_power_of_two() && n >= 2 * d);
+    debug_assert!(d.is_power_of_two() && n.is_power_of_two() && n >= 2 * d);
     let half = n / 2;
     let blocks_out = half / d;
     let live_in = live_in.min(2 * blocks_out).max(1);
@@ -6040,6 +6041,37 @@ pub fn recursive_verifier<Ch: Challenger>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The factored EqPoint opening uses the JIT basis on both commitment
+    /// layouts.  A full/power-of-two lane grid has `d = 1`, so pin that the
+    /// JIT fold is byte-for-byte identical to the ordinary materialized LSB
+    /// fold: folded witness, folded basis, and the next sumcheck message.
+    #[test]
+    fn jit_fold_matches_materialized_lsb_pairing() {
+        use crate::challenger::Challenger;
+
+        for log_n in [4usize, 5, 10, 13] {
+            let n = 1usize << log_n;
+            let mut rng = crate::challenger::RandomChallenger::new(
+                0xD100_0000_u64.wrapping_add(log_n as u64),
+            );
+            let f: Vec<F128> = (0..n).map(|_| rng.sample_f128()).collect();
+            let b: Vec<F128> = (0..n).map(|_| rng.sample_f128()).collect();
+            let r = rng.sample_f128();
+            let fill = |out: &mut [F128], g0: usize| {
+                out.copy_from_slice(&b[g0..g0 + out.len()]);
+            };
+
+            let (want_f, want_b, want_msg) =
+                fold_and_msg_blocked(&f, &b, r, 1, usize::MAX);
+            let (got_f, got_b, got_msg) =
+                fold_and_msg_blocked_jit(&f, &fill, r, 1, usize::MAX);
+
+            assert_eq!(got_f, want_f, "folded witness at log_n={log_n}");
+            assert_eq!(got_b, want_b, "folded basis at log_n={log_n}");
+            assert_eq!(got_msg, want_msg, "next message at log_n={log_n}");
+        }
+    }
 
     /// Worked example: `LigeritoSecurityConfig` for BLAKE3 m=29 at rate 1/2.
     /// Paper-compatible m=29 fast example, mechanically derived in the

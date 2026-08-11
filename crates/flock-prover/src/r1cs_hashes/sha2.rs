@@ -2680,6 +2680,49 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Heavier — Secure Ligerito plus all Merkle-path grinding families.
+    fn merkle_paths_secure_grinding_roundtrip_and_rejects_missing_shift_nonce() {
+        use flock_core::challenger::FsChallenger;
+        use flock_core::pcs::ligerito::LigeritoProfile;
+
+        let setup = Sha256HybridSetup::with_profile(128, LigeritoProfile::Secure);
+        let path_log = 2;
+        let (blocks, leaves, root, b) =
+            honest_merkle_paths_identical(setup.n_compressions, path_log, 0x1280_4D50);
+        let mut chp = FsChallenger::new(b"sha2-merkle-secure-grinding");
+        let (proof, commitment) =
+            setup.prove_merkle_paths_ligerito(path_log, &blocks, &b, &mut chp);
+        assert!(!proof.shift.grinding_nonces.is_empty());
+        let mut chv = FsChallenger::new(b"sha2-merkle-secure-grinding");
+        setup
+            .verify_merkle_paths_ligerito(
+                path_log,
+                &commitment,
+                &proof,
+                &leaves,
+                &root,
+                &b,
+                &mut chv,
+            )
+            .expect("Secure grinded Merkle-path proof verifies");
+
+        let mut missing = proof;
+        missing.shift.grinding_nonces.pop();
+        let mut chv = FsChallenger::new(b"sha2-merkle-secure-grinding");
+        assert!(setup
+            .verify_merkle_paths_ligerito(
+                path_log,
+                &commitment,
+                &missing,
+                &leaves,
+                &root,
+                &b,
+                &mut chv,
+            )
+            .is_err());
+    }
+
+    #[test]
     fn prove_merkle_path_ligerito_roundtrip() {
         use flock_core::challenger::FsChallenger;
         // n=128 → m=22 with K_LOG=15 (smallest m with a Ligerito config).

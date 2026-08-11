@@ -110,12 +110,14 @@ pub fn verify_ligerito<Ch: Challenger>(
     pcs_params: &crate::pcs::PcsParams,
     challenger: &mut Ch,
 ) -> Result<R1csClaim, VerifyError> {
-    let (ab, c) = verify_core(
+    let (ab, c) = verify_core_with_grinding(
         r1cs,
         &proof.zerocheck,
         &proof.lincheck,
         commitment,
         lincheck_circuit,
+        pcs_params.zerocheck_grinding(),
+        pcs_params.lincheck_grinding(),
         challenger,
     )?;
     verify_claims_ligerito(
@@ -149,12 +151,17 @@ pub fn verify_ligerito_timed<Ch: Challenger>(
         verifier_pool().install(|| -> Result<(ZClaim, ZClaim, f64, f64), VerifyError> {
             crate::proof::bind_statement(challenger, r1cs, commitment);
             let t0 = Instant::now();
-            let zc_claim = zerocheck::verify(r1cs.m, &proof.zerocheck, challenger)
-                .map_err(VerifyError::Zerocheck)?;
+            let zc_claim = zerocheck::verify_with_grinding(
+                r1cs.m,
+                &proof.zerocheck,
+                pcs_params.zerocheck_grinding(),
+                challenger,
+            )
+            .map_err(VerifyError::Zerocheck)?;
             let zerocheck_s = t0.elapsed().as_secs_f64();
             let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
             let t0 = Instant::now();
-            let lc_claim = lincheck::verify(
+            let lc_claim = lincheck::verify_with_grinding(
                 r1cs.m,
                 r1cs.k_log,
                 r1cs.k_skip,
@@ -163,6 +170,7 @@ pub fn verify_ligerito_timed<Ch: Challenger>(
                 zc_claim.a_eval,
                 zc_claim.b_eval,
                 &proof.lincheck,
+                pcs_params.lincheck_grinding(),
                 challenger,
             )
             .map_err(VerifyError::Lincheck)?;
@@ -443,6 +451,7 @@ fn verify_merged_opening<Ch: Challenger>(
                 union.n_log(),
                 pcs_open,
                 &lig_v_config,
+                pcs_params.opening_grinding(),
                 challenger,
             )
             .map(|a| *out = Some(a)),
@@ -456,6 +465,7 @@ fn verify_merged_opening<Ch: Challenger>(
                 union.n_log(),
                 pcs_open,
                 &lig_v_config,
+                pcs_params.opening_grinding(),
                 challenger,
             ),
         })
@@ -547,6 +557,7 @@ pub fn verify_ligerito_union_mixed_class<Ch: Challenger>(
                 union.n_log(),
                 &proof.pcs_open,
                 &lig_v_config,
+                pcs_params.opening_grinding(),
                 challenger,
             )
         })
@@ -633,6 +644,7 @@ pub fn verify_ligerito_union_mixed_class_deferred<Ch: Challenger>(
                 union.n_log(),
                 &proof.pcs_open,
                 &lig_v_config,
+                pcs_params.opening_grinding(),
                 challenger,
             )
         })
@@ -718,8 +730,13 @@ fn verify_union_piops<Ch: Challenger>(
                 // prefix subcube `[0, 2^M_bool)`, `M_bool = M` for a
                 // boolean-only registry. (The element region cannot join this
                 // sum: `c = z` there.)
-                let zc_claim = zerocheck::verify(union.m_bool(), &piop.zerocheck, challenger)
-                    .map_err(VerifyError::Zerocheck)?;
+                let zc_claim = zerocheck::verify_with_grinding(
+                    union.m_bool(),
+                    &piop.zerocheck,
+                    pcs_params.zerocheck_grinding(),
+                    challenger,
+                )
+                .map_err(VerifyError::Zerocheck)?;
                 let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
                 // The union-column lincheck (one circuit per BOOLEAN slot, in
                 // slot order); the declared counts additionally bind through
@@ -727,13 +744,14 @@ fn verify_union_piops<Ch: Challenger>(
                 // DEFERRED: the matrix work leaves as an assertion instead of
                 // being discharged here. Callers that are not accumulating get
                 // it discharged for them by the wrappers below.
-                let (lc_claim, assertion) = lincheck::verify_union_deferred(
+                let (lc_claim, assertion) = lincheck::verify_union_deferred_with_grinding(
                     union,
                     circuits,
                     &x_ab,
                     zc_claim.a_eval,
                     zc_claim.b_eval,
                     &piop.lincheck,
+                    pcs_params.lincheck_grinding(),
                     challenger,
                 )
                 .map_err(VerifyError::Lincheck)?;
@@ -771,14 +789,25 @@ fn verify_union_piops<Ch: Challenger>(
             let proof = wiring.ok_or(VerifyError::CircuitMismatch)?;
             let ch = ch_w.as_mut().expect("forked above");
             let gather = if defer_sigma {
-                let (gather, sig) =
-                    crate::circuit::verify_wiring_deferred(circuit, public, proof, ch)
-                        .map_err(VerifyError::Wiring)?;
+                let (gather, sig) = crate::circuit::verify_wiring_deferred_with_grinding(
+                    circuit,
+                    public,
+                    proof,
+                    pcs_params.product_gkr_grinding(),
+                    ch,
+                )
+                .map_err(VerifyError::Wiring)?;
                 sigma = Some(sig);
                 gather
             } else {
-                crate::circuit::verify_wiring(circuit, public, proof, ch)
-                    .map_err(VerifyError::Wiring)?
+                crate::circuit::verify_wiring_with_grinding(
+                    circuit,
+                    public,
+                    proof,
+                    pcs_params.product_gkr_grinding(),
+                    ch,
+                )
+                .map_err(VerifyError::Wiring)?
             };
             par_gather = Some(gather);
             challenger.merge_child(ch_w.take().expect("forked above"));
@@ -789,8 +818,13 @@ fn verify_union_piops<Ch: Challenger>(
         // `*_deferred` entry really does defer BOTH classes.
         let el_claim = match element {
             Some(p) => {
-                let (c, a) = crate::element_r1cs::union::verify_deferred(union, p, challenger)
-                    .map_err(VerifyError::Element)?;
+                let (c, a) = crate::element_r1cs::union::verify_deferred_with_grinding(
+                    union,
+                    p,
+                    pcs_params.element_grinding(),
+                    challenger,
+                )
+                .map_err(VerifyError::Element)?;
                 el_matrix = Some(a);
                 Some(c)
             }
@@ -818,14 +852,25 @@ fn verify_union_piops<Ch: Challenger>(
             #[cfg(feature = "mul-count")]
             let wiring_start = crate::field::gf2_128::op_count::snapshot();
             let gather = if defer_sigma {
-                let (gather, sig) =
-                    crate::circuit::verify_wiring_deferred(circuit, public, proof, challenger)
-                        .map_err(VerifyError::Wiring)?;
+                let (gather, sig) = crate::circuit::verify_wiring_deferred_with_grinding(
+                    circuit,
+                    public,
+                    proof,
+                    pcs_params.product_gkr_grinding(),
+                    challenger,
+                )
+                .map_err(VerifyError::Wiring)?;
                 sigma = Some(sig);
                 gather
             } else {
-                crate::circuit::verify_wiring(circuit, public, proof, challenger)
-                    .map_err(VerifyError::Wiring)?
+                crate::circuit::verify_wiring_with_grinding(
+                    circuit,
+                    public,
+                    proof,
+                    pcs_params.product_gkr_grinding(),
+                    challenger,
+                )
+                .map_err(VerifyError::Wiring)?
             };
             #[cfg(feature = "mul-count")]
             if std::env::var("MUL_TRACE").is_ok() {
@@ -918,7 +963,7 @@ fn verify_claims_ligerito_inner<Ch: Challenger>(
     let lig_v_config = pcs_params
         .ligerito_verifier_config()
         .expect("Ligerito default verifier config");
-    pcs::verify_opening_batch_ligerito_mixed(
+    pcs::verify_opening_batch_ligerito_mixed_with_grinding(
         commitment,
         &values,
         &z_skips,
@@ -926,6 +971,7 @@ fn verify_claims_ligerito_inner<Ch: Challenger>(
         &[],
         pcs_open,
         &lig_v_config,
+        pcs_params.opening_grinding(),
         challenger,
     )
 }
@@ -942,6 +988,34 @@ pub fn verify_core<Ch: Challenger>(
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     challenger: &mut Ch,
 ) -> Result<(ZClaim, ZClaim), VerifyError> {
+    verify_core_with_grinding(
+        r1cs,
+        zerocheck_proof,
+        lincheck_proof,
+        commitment,
+        lincheck_circuit,
+        zerocheck::ZerocheckGrinding::disabled(),
+        lincheck::LincheckGrinding::disabled(),
+        challenger,
+    )
+}
+
+/// [`verify_core`] with explicit Boolean zerocheck and lincheck grinding
+/// policies.
+///
+/// Relation-specific callers that do not carry [`crate::pcs::PcsParams`]
+/// retain the legacy wrapper above.  The standard proof entries pass the
+/// policy selected by their PCS profile.
+pub fn verify_core_with_grinding<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    zerocheck_proof: &zerocheck::ZerocheckProof,
+    lincheck_proof: &lincheck::LincheckProof,
+    commitment: &Commitment,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    zerocheck_grinding: zerocheck::ZerocheckGrinding,
+    lincheck_grinding: lincheck::LincheckGrinding,
+    challenger: &mut Ch,
+) -> Result<(ZClaim, ZClaim), VerifyError> {
     // Verification is single-threaded; run the body on the dedicated 1-thread pool.
     verifier_pool().install(move || {
         verify_core_inner(
@@ -950,6 +1024,8 @@ pub fn verify_core<Ch: Challenger>(
             lincheck_proof,
             commitment,
             lincheck_circuit,
+            zerocheck_grinding,
+            lincheck_grinding,
             challenger,
         )
     })
@@ -961,6 +1037,8 @@ fn verify_core_inner<Ch: Challenger>(
     lincheck_proof: &lincheck::LincheckProof,
     commitment: &Commitment,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    zerocheck_grinding: zerocheck::ZerocheckGrinding,
+    lincheck_grinding: lincheck::LincheckGrinding,
     challenger: &mut Ch,
 ) -> Result<(ZClaim, ZClaim), VerifyError> {
     let trace = std::env::var("VERIFY_TRACE").is_ok();
@@ -985,8 +1063,13 @@ fn verify_core_inner<Ch: Challenger>(
 
     // ---- Zerocheck.
     let t = std::time::Instant::now();
-    let zc_claim =
-        zerocheck::verify(r1cs.m, zerocheck_proof, challenger).map_err(VerifyError::Zerocheck)?;
+    let zc_claim = zerocheck::verify_with_grinding(
+        r1cs.m,
+        zerocheck_proof,
+        zerocheck_grinding,
+        challenger,
+    )
+    .map_err(VerifyError::Zerocheck)?;
     if trace {
         eprintln!(
             "      [vco] zerocheck::verify: {}",
@@ -1000,7 +1083,7 @@ fn verify_core_inner<Ch: Challenger>(
 
     // ---- Lincheck. v_a, v_b come from the zerocheck's final â, b̂ evals.
     let t = std::time::Instant::now();
-    let lc_claim = lincheck::verify(
+    let lc_claim = lincheck::verify_with_grinding(
         r1cs.m,
         r1cs.k_log,
         r1cs.k_skip,
@@ -1009,6 +1092,7 @@ fn verify_core_inner<Ch: Challenger>(
         zc_claim.a_eval,
         zc_claim.b_eval,
         lincheck_proof,
+        lincheck_grinding,
         challenger,
     )
     .map_err(VerifyError::Lincheck)?;

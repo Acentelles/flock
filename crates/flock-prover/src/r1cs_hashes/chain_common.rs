@@ -247,6 +247,9 @@ fn build_chain_claim_point(
 pub struct ChainProofLigerito {
     pub zerocheck: flock_core::zerocheck::ZerocheckProof,
     pub lincheck: flock_core::lincheck::LincheckProof,
+    /// PoW witness protecting the packed-position fold vector.
+    #[serde(default)]
+    pub tau_pos_grinding_nonce: u64,
     pub shift: crate::chain::ChainShiftProof,
     pub pcs_open: flock_core::pcs::BatchOpeningProofLigerito,
 }
@@ -294,11 +297,23 @@ pub fn prove_chain_ligerito_generic<Ch: Challenger>(
         challenger,
     );
 
+    let grinding = crate::chain::ChainGrinding::for_profile(pcs_params.profile);
+    let tau_pos_bits = grinding.packed_position_bits_for(layout.tau_pos_len());
+    let tau_pos_grinding_nonce = if tau_pos_bits == 0 {
+        0
+    } else {
+        challenger.grind_pow(tau_pos_bits)
+    };
     let tau_pos = challenger.sample_f128_vec(layout.tau_pos_len());
     let fold = ChainFold::new(layout, tau_pos);
     let (in_vals, out_vals) = fold_in_out(layout, r1cs.layout, &core.z_packed, &fold);
 
-    let (shift, claims) = crate::chain::prove_chain_shift(&in_vals, &out_vals, challenger);
+    let (shift, claims) = crate::chain::prove_chain_shift_with_grinding(
+        &in_vals,
+        &out_vals,
+        grinding,
+        challenger,
+    );
     let chain_claim = assemble_chain_claim(layout, r1cs.layout, &fold, &claims);
 
     let padding = r1cs.padding_spec();
@@ -318,7 +333,7 @@ pub fn prove_chain_ligerito_generic<Ch: Challenger>(
     } = core;
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
-    let pcs_open = flock_core::pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
+    let pcs_open = flock_core::pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding(
         z_packed,
         &prover_data,
         &commitment,
@@ -327,6 +342,7 @@ pub fn prove_chain_ligerito_generic<Ch: Challenger>(
         std::slice::from_ref(&chain_claim),
         &padding,
         &lig_config,
+        pcs_params.opening_grinding(),
         challenger,
     );
 
@@ -334,6 +350,7 @@ pub fn prove_chain_ligerito_generic<Ch: Challenger>(
         ChainProofLigerito {
             zerocheck: zc_proof,
             lincheck: lc_proof,
+            tau_pos_grinding_nonce,
             shift,
             pcs_open,
         },
@@ -357,23 +374,40 @@ pub fn verify_chain_ligerito_generic<Ch: Challenger>(
     pcs_params: &PcsParams,
     challenger: &mut Ch,
 ) -> Result<(), ChainVerifyError> {
-    let (ab, c) = flock_core::verifier::verify_core(
+    let (ab, c) = flock_core::verifier::verify_core_with_grinding(
         r1cs,
         &proof.zerocheck,
         &proof.lincheck,
         commitment,
         lincheck_circuit,
+        pcs_params.zerocheck_grinding(),
+        pcs_params.lincheck_grinding(),
         challenger,
     )
     .map_err(ChainVerifyError::R1cs)?;
 
+    let grinding = crate::chain::ChainGrinding::for_profile(pcs_params.profile);
+    let tau_pos_bits = grinding.packed_position_bits_for(layout.tau_pos_len());
+    if (tau_pos_bits == 0 && proof.tau_pos_grinding_nonce != 0)
+        || (tau_pos_bits != 0
+            && !challenger.verify_pow(proof.tau_pos_grinding_nonce, tau_pos_bits))
+    {
+        return Err(ChainVerifyError::Shift(crate::chain::ChainError::InvalidGrinding));
+    }
     let tau_pos = challenger.sample_f128_vec(layout.tau_pos_len());
     let fold = ChainFold::new(layout, tau_pos);
 
     let x0_r = fold.fold_public_phys(x0_phys);
     let xlast_r = fold.fold_public_phys(xlast_phys);
-    let claims = crate::chain::verify_chain_shift(&proof.shift, x0_r, xlast_r, n_log, challenger)
-        .map_err(ChainVerifyError::Shift)?;
+    let claims = crate::chain::verify_chain_shift_with_grinding(
+        &proof.shift,
+        x0_r,
+        xlast_r,
+        n_log,
+        grinding,
+        challenger,
+    )
+    .map_err(ChainVerifyError::Shift)?;
 
     let chain_point = build_chain_claim_point(layout, r1cs.layout, &fold, &claims);
     let ab_x_outer = crate::prover::quirky_x_outer_full(&ab.point);
@@ -387,7 +421,7 @@ pub fn verify_chain_ligerito_generic<Ch: Challenger>(
         .ligerito_verifier_config()
         .expect("Ligerito default verifier config for chain verify");
 
-    flock_core::pcs::verify_opening_batch_ligerito_mixed(
+    flock_core::pcs::verify_opening_batch_ligerito_mixed_with_grinding(
         commitment,
         &[ab.value, c.value],
         &[ab.point.z_skip, c.point.z_skip],
@@ -395,6 +429,7 @@ pub fn verify_chain_ligerito_generic<Ch: Challenger>(
         std::slice::from_ref(&pd_ref),
         &proof.pcs_open,
         &lig_v_config,
+        pcs_params.opening_grinding(),
         challenger,
     )
     .map_err(ChainVerifyError::Pcs)?;

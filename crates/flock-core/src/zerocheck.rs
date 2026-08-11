@@ -41,6 +41,99 @@ use univariate_skip_optimized::{
 /// vectors of F128.
 pub const K_SKIP: usize = 6;
 
+/// Fiat--Shamir grinding policy for this zerocheck.
+///
+/// Zerocheck has three independently sampled challenge families:
+///
+/// 1. the initial point used to turn a Boolean-cube identity into an
+///    eq-weighted claim;
+/// 2. the univariate-skip point `z`; and
+/// 3. one challenge for every quadratic multilinear sumcheck round.
+///
+/// [`Self::per_challenge_128`] chooses enough leading-zero PoW bits that an
+/// error term of the form `degree / |F_{2^128}|`, after a prover's trial and
+/// error over the challenge, is *strictly* below `2^-128`.  In particular,
+/// `degree = 2` needs two bits, not one: `2 / 2 = 1` would only meet the
+/// bound, not beat it.
+///
+/// The policy is intentionally local to zerocheck.  The other sumcheck
+/// families have different degrees and proof formats and will receive their
+/// own schedules as the 128-bit roadmap is implemented.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ZerocheckGrinding {
+    enabled: bool,
+}
+
+impl ZerocheckGrinding {
+    /// Legacy/default behaviour: no PoW operations and no nonce payload in
+    /// the transcript.
+    pub const fn disabled() -> Self {
+        Self { enabled: false }
+    }
+
+    /// Grind every zerocheck challenge whose soundness is being used.
+    pub const fn per_challenge_128() -> Self {
+        Self { enabled: true }
+    }
+
+    /// Whether this policy inserts PoW operations into the transcript.
+    pub const fn is_enabled(self) -> bool {
+        self.enabled
+    }
+
+    /// Number of leading-zero bits which strictly turns
+    /// `numerator / 2^128` into a value below `2^-128`.
+    ///
+    /// Equivalently this is `floor(log2(numerator)) + 1`.  Keeping the
+    /// strict inequality explicit prevents an accidental one-bit
+    /// under-provisioning at powers of two.
+    const fn bits_for_numerator(numerator: usize) -> u32 {
+        debug_assert!(numerator > 0);
+        usize::BITS - numerator.leading_zeros()
+    }
+
+    /// PoW before sampling the initial eq-weighted identity point.  A
+    /// nonzero multilinear polynomial in `m` variables has total degree at
+    /// most `m`, so Schwartz--Zippel contributes at most `m / |F|` here.
+    pub const fn initial_bits(self, m: usize) -> Option<u32> {
+        if self.enabled {
+            Some(Self::bits_for_numerator(m))
+        } else {
+            None
+        }
+    }
+
+    /// PoW before sampling the univariate-skip point.  The combined round-1
+    /// polynomial has degree `< 2^(K_SKIP + 1)`, hence degree at most
+    /// `2^(K_SKIP + 1) - 1`.
+    pub const fn skip_bits(self) -> Option<u32> {
+        if self.enabled {
+            Some(Self::bits_for_numerator((1usize << (K_SKIP + 1)) - 1))
+        } else {
+            None
+        }
+    }
+
+    /// PoW before a standard degree-two tail-round challenge.
+    pub const fn multilinear_round_bits(self) -> Option<u32> {
+        if self.enabled {
+            Some(Self::bits_for_numerator(2))
+        } else {
+            None
+        }
+    }
+
+    /// Number of nonce words carried by one proof at domain dimension `m`.
+    pub const fn nonce_count(self, m: usize) -> usize {
+        if self.enabled {
+            // initial point, skip point, and one nonce per tail round
+            2 + m - K_SKIP
+        } else {
+            0
+        }
+    }
+}
+
 /// Sparse-support gate for round 2 and the tail: the support-proportional
 /// kernels engage while `live · SPARSE_TAIL_GATE ≤ n`. Set to 16 when the
 /// sparse tail was a sequential scalar walk; after its parallelization
@@ -262,6 +355,11 @@ pub struct ZerocheckProof {
     pub final_a_eval: F128,
     pub final_b_eval: F128,
     pub final_c_eval: F128,
+    /// PoW nonces in transcript order: initial eq point, skip point, then
+    /// one nonce per multilinear round.  Empty under
+    /// [`ZerocheckGrinding::disabled`].
+    #[serde(default)]
+    pub grinding_nonces: Vec<u64>,
 }
 
 /// Reasons the verifier may reject a proof.
@@ -273,6 +371,13 @@ pub enum VerifyError {
     BadRound1Length { expected: usize, got: usize },
     /// Wrong number of multilinear-round messages (expected `log_n - K_SKIP`).
     BadMultilinearRoundsLength { expected: usize, got: usize },
+    /// The supplied nonce vector does not match the configured grinding
+    /// schedule.  This is checked before replaying the transcript so a
+    /// malformed proof cannot shift nonce-to-challenge alignment.
+    BadGrindingNonceCount { expected: usize, got: usize },
+    /// A nonce does not satisfy the PoW at the transcript position where its
+    /// corresponding challenge is sampled.
+    InvalidGrindingNonce { which: &'static str },
     /// `proof.final_c_eval` doesn't match the verifier's reconstruction
     /// `C_s · interpolate_at_z_on_lambda(round1_c, k_skip, z)`. Catches
     /// dishonesty in the round-1 C message or in the final c-eval claim.
@@ -307,12 +412,33 @@ pub fn prove_packed<C: Challenger>(
     m: usize,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim) {
-    prove_packed_padded(
+    prove_packed_padded_with_grinding(
         a_packed,
         b_packed,
         c_packed,
         m,
         &PaddingSpec::dense(m),
+        ZerocheckGrinding::disabled(),
+        challenger,
+    )
+}
+
+/// [`prove_packed`] with an explicit Fiat--Shamir grinding policy.
+pub fn prove_packed_with_grinding<C: Challenger>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    grinding: ZerocheckGrinding,
+    challenger: &mut C,
+) -> (ZerocheckProof, ZerocheckClaim) {
+    prove_packed_padded_with_grinding(
+        a_packed,
+        b_packed,
+        c_packed,
+        m,
+        &PaddingSpec::dense(m),
+        grinding,
         challenger,
     )
 }
@@ -329,8 +455,38 @@ pub fn prove_packed_padded<C: Challenger>(
     padding: &PaddingSpec,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim) {
+    prove_packed_padded_with_grinding(
+        a_packed,
+        b_packed,
+        c_packed,
+        m,
+        padding,
+        ZerocheckGrinding::disabled(),
+        challenger,
+    )
+}
+
+/// [`prove_packed_padded`] with an explicit Fiat--Shamir grinding policy.
+pub fn prove_packed_padded_with_grinding<C: Challenger>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    padding: &PaddingSpec,
+    grinding: ZerocheckGrinding,
+    challenger: &mut C,
+) -> (ZerocheckProof, ZerocheckClaim) {
     let (proof, claim, _) =
-        prove_packed_padded_inner(a_packed, b_packed, c_packed, m, padding, false, challenger);
+        prove_packed_padded_inner(
+            a_packed,
+            b_packed,
+            c_packed,
+            m,
+            padding,
+            grinding,
+            false,
+            challenger,
+        );
     (proof, claim)
 }
 
@@ -349,8 +505,40 @@ pub fn prove_packed_padded_capture_s_hat_v_c<C: Challenger>(
     padding: &PaddingSpec,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
+    prove_packed_padded_capture_s_hat_v_c_with_grinding(
+        a_packed,
+        b_packed,
+        c_packed,
+        m,
+        padding,
+        ZerocheckGrinding::disabled(),
+        challenger,
+    )
+}
+
+/// [`prove_packed_padded_capture_s_hat_v_c`] with an explicit grinding
+/// policy.  The returned `s_hat_v_c` is unchanged; only the Fiat--Shamir
+/// transcript and nonce payload differ when grinding is enabled.
+pub fn prove_packed_padded_capture_s_hat_v_c_with_grinding<C: Challenger>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    padding: &PaddingSpec,
+    grinding: ZerocheckGrinding,
+    challenger: &mut C,
+) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
     let (proof, claim, captured) =
-        prove_packed_padded_inner(a_packed, b_packed, c_packed, m, padding, true, challenger);
+        prove_packed_padded_inner(
+            a_packed,
+            b_packed,
+            c_packed,
+            m,
+            padding,
+            grinding,
+            true,
+            challenger,
+        );
     (
         proof,
         claim,
@@ -365,6 +553,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     c_packed: &[u8],
     m: usize,
     padding: &PaddingSpec,
+    grinding: ZerocheckGrinding,
     capture_s_hat_v_c: bool,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Option<Vec<F128>>) {
@@ -380,6 +569,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     assert_eq!(b_packed.len(), expected_bytes);
     assert_eq!(c_packed.len(), expected_bytes);
     let n_mlv = m - k_skip;
+    let mut grinding_nonces = Vec::with_capacity(grinding.nonce_count(m));
 
     challenger.observe_label(b"flock-zerocheck-v0");
 
@@ -392,6 +582,9 @@ fn prove_packed_padded_inner<C: Challenger>(
     //   r[k_skip+3..k_skip+7]       — protocol medium-eq constants β_i
     //   r[k_skip+7..m]              — sampled (the "outer" eq weights for
     //                                  the URM and multilinear rounds)
+    if let Some(bits) = grinding.initial_bits(m) {
+        grinding_nonces.push(challenger.grind_pow(bits));
+    }
     let r_skip = challenger.sample_f128_vec(k_skip);
     let r_outer = challenger.sample_f128_vec(m - k_skip - N_INNER);
     let mut r = vec![F128::ZERO; m];
@@ -448,6 +641,9 @@ fn prove_packed_padded_inner<C: Challenger>(
     // ---- 4. Observe round-1 message, sample z (URM fold point) ----
     challenger.observe_f128_slice(&round1_ab);
     challenger.observe_f128_slice(&round1_c);
+    if let Some(bits) = grinding.skip_bits() {
+        grinding_nonces.push(challenger.grind_pow(bits));
+    }
     let z = challenger.sample_f128();
 
     // ---- 5. c_eval = ĉ(z, r_rest) via interpolation of round1_c at z ----
@@ -529,6 +725,9 @@ fn prove_packed_padded_inner<C: Challenger>(
     challenger.observe_f128(msg_1);
     challenger.observe_f128(msg_inf);
     let mut mlv_rhos: Vec<F128> = Vec::with_capacity(n_mlv);
+    if let Some(bits) = grinding.multilinear_round_bits() {
+        grinding_nonces.push(challenger.grind_pow(bits));
+    }
     mlv_rhos.push(challenger.sample_f128());
 
     // ---- 7. Rounds 3..(n_mlv + 1) — AB only (c is done) ----
@@ -659,6 +858,9 @@ fn prove_packed_padded_inner<C: Challenger>(
         multilinear_msgs.push((m1, mi));
         challenger.observe_f128(m1);
         challenger.observe_f128(mi);
+        if let Some(bits) = grinding.multilinear_round_bits() {
+            grinding_nonces.push(challenger.grind_pow(bits));
+        }
         mlv_rhos.push(challenger.sample_f128());
     }
     debug_assert!(
@@ -713,6 +915,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         final_a_eval,
         final_b_eval,
         final_c_eval,
+        grinding_nonces,
     };
     let claim = ZerocheckClaim {
         z,
@@ -736,6 +939,23 @@ fn prove_packed_padded_inner<C: Challenger>(
 pub fn verify<C: Challenger>(
     log_n: usize,
     proof: &ZerocheckProof,
+    challenger: &mut C,
+) -> Result<ZerocheckClaim, VerifyError> {
+    verify_with_grinding(
+        log_n,
+        proof,
+        ZerocheckGrinding::disabled(),
+        challenger,
+    )
+}
+
+/// [`verify`] with an explicit Fiat--Shamir grinding policy.  The policy is
+/// a verifier parameter, not prover-controlled proof metadata: it is part of
+/// the security configuration agreed before verification starts.
+pub fn verify_with_grinding<C: Challenger>(
+    log_n: usize,
+    proof: &ZerocheckProof,
+    grinding: ZerocheckGrinding,
     challenger: &mut C,
 ) -> Result<ZerocheckClaim, VerifyError> {
     let m = log_n;
@@ -767,10 +987,25 @@ pub fn verify<C: Challenger>(
             got: proof.multilinear_rounds.len(),
         });
     }
+    if proof.grinding_nonces.len() != grinding.nonce_count(m) {
+        return Err(VerifyError::BadGrindingNonceCount {
+            expected: grinding.nonce_count(m),
+            got: proof.grinding_nonces.len(),
+        });
+    }
 
     challenger.observe_label(b"flock-zerocheck-v0");
+    let mut nonce_idx = 0usize;
 
     // ---- Re-derive r (in lockstep with prove_packed) ----
+    if let Some(bits) = grinding.initial_bits(m) {
+        if !challenger.verify_pow(proof.grinding_nonces[nonce_idx], bits) {
+            return Err(VerifyError::InvalidGrindingNonce {
+                which: "initial",
+            });
+        }
+        nonce_idx += 1;
+    }
     let r_skip = challenger.sample_f128_vec(k_skip);
     let r_outer = challenger.sample_f128_vec(m - k_skip - N_INNER);
     let mut r = vec![F128::ZERO; m];
@@ -786,6 +1021,12 @@ pub fn verify<C: Challenger>(
     // ---- Observe round-1 messages, sample z ----
     challenger.observe_f128_slice(&proof.round1_ab);
     challenger.observe_f128_slice(&proof.round1_c);
+    if let Some(bits) = grinding.skip_bits() {
+        if !challenger.verify_pow(proof.grinding_nonces[nonce_idx], bits) {
+            return Err(VerifyError::InvalidGrindingNonce { which: "skip" });
+        }
+        nonce_idx += 1;
+    }
     let z = challenger.sample_f128();
 
     // ---- Reconstruct ĉ(z, r_rest) from round1_c ----
@@ -854,6 +1095,14 @@ pub fn verify<C: Challenger>(
 
         challenger.observe_f128(msg_1);
         challenger.observe_f128(msg_inf);
+        if let Some(bits) = grinding.multilinear_round_bits() {
+            if !challenger.verify_pow(proof.grinding_nonces[nonce_idx], bits) {
+                return Err(VerifyError::InvalidGrindingNonce {
+                    which: "multilinear",
+                });
+            }
+            nonce_idx += 1;
+        }
         let rho = challenger.sample_f128();
         mlv_rhos.push(rho);
 
@@ -861,6 +1110,7 @@ pub fn verify<C: Challenger>(
         // G(ρ) = G(0)·(1+ρ) + G(1)·ρ + G(∞)·ρ·(1+ρ).
         c_running = g0 * one_plus_rho + g1 * rho + g_inf * rho * one_plus_rho;
     }
+    debug_assert_eq!(nonce_idx, proof.grinding_nonces.len());
 
     // ---- AB sumcheck final consistency ----
     //
@@ -979,6 +1229,108 @@ mod tests {
 
             assert_eq!(claim_p, claim_v, "claim mismatch at m={m}");
         }
+    }
+
+    /// The 128-bit-per-error grinding schedule is carried on the proof,
+    /// checked before every challenge it protects, and recorded as ordinary
+    /// `Pow` operations for the recursion transcript tape.
+    #[test]
+    fn per_challenge_grinding_roundtrip_and_tape() {
+        use crate::transcript_record::{RecordingChallenger, TranscriptOp};
+
+        let m = 13;
+        let mut rng = Rng::new(0x1280_0001);
+        let a = rng.bits(1 << m);
+        let b = rng.bits(1 << m);
+        let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
+        let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+        let grinding = ZerocheckGrinding::per_challenge_128();
+
+        let mut ch_prove = FsChallenger::new(b"flock-zc-grinding-v0");
+        let (proof, claim_p) =
+            prove_packed_with_grinding(&a_p, &b_p, &c_p, m, grinding, &mut ch_prove);
+        assert_eq!(proof.grinding_nonces.len(), grinding.nonce_count(m));
+        assert_eq!(grinding.initial_bits(m), Some(4));
+        assert_eq!(grinding.skip_bits(), Some(7));
+        assert_eq!(grinding.multilinear_round_bits(), Some(2));
+
+        let mut rec = RecordingChallenger::new(FsChallenger::new(b"flock-zc-grinding-v0"));
+        let claim_v = verify_with_grinding(m, &proof, grinding, &mut rec)
+            .expect("grinded honest proof must verify");
+        assert_eq!(claim_p, claim_v);
+
+        let pow_bits: Vec<u32> = rec
+            .shape()
+            .ops()
+            .iter()
+            .filter_map(|op| match op {
+                TranscriptOp::Pow { bits } => Some(*bits),
+                _ => None,
+            })
+            .collect();
+        let mut expected = vec![4, 7];
+        expected.extend(std::iter::repeat_n(2, m - K_SKIP));
+        assert_eq!(pow_bits, expected, "one PoW immediately precedes each protected challenge");
+
+        let mut missing = proof.clone();
+        missing.grinding_nonces.pop();
+        let mut ch_bad = FsChallenger::new(b"flock-zc-grinding-v0");
+        assert!(matches!(
+            verify_with_grinding(m, &missing, grinding, &mut ch_bad),
+            Err(VerifyError::BadGrindingNonceCount { .. })
+        ));
+    }
+
+    /// A deliberately small, opt-in overhead probe.  It isolates zerocheck's
+    /// PoW work from PCS query/profile differences; use a release build for a
+    /// meaningful number:
+    ///
+    /// `cargo test --release -p flock-core zerocheck_grinding_overhead_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn zerocheck_grinding_overhead_probe() {
+        use std::time::Instant;
+
+        let m = 17;
+        let mut rng = Rng::new(0x1280_BEEF);
+        let a = rng.bits(1 << m);
+        let b = rng.bits(1 << m);
+        let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
+        let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+        let run = |grinding: ZerocheckGrinding| {
+            let t = Instant::now();
+            let mut ch = FsChallenger::new(b"flock-zc-grinding-probe-v0");
+            let (proof, _) = prove_packed_with_grinding(&a_p, &b_p, &c_p, m, grinding, &mut ch);
+            let elapsed = t.elapsed();
+            (elapsed, proof.grinding_nonces.len())
+        };
+        const REPS: usize = 5;
+        let mut plain = Vec::with_capacity(REPS);
+        let mut grinded = Vec::with_capacity(REPS);
+        let mut plain_nonces = 0;
+        let mut grinded_nonces = 0;
+        for _ in 0..REPS {
+            let (t, n) = run(ZerocheckGrinding::disabled());
+            plain.push(t);
+            plain_nonces = n;
+            let (t, n) = run(ZerocheckGrinding::per_challenge_128());
+            grinded.push(t);
+            grinded_nonces = n;
+        }
+        plain.sort_unstable();
+        grinded.sort_unstable();
+        let plain = plain[REPS / 2];
+        let grinded = grinded[REPS / 2];
+        println!(
+            "zerocheck grinding (m={m}, median of {REPS}): plain {:.2} ms | \
+             grinded {:.2} ms | delta {:.2} ms | {} PoW nonces",
+            plain.as_secs_f64() * 1e3,
+            grinded.as_secs_f64() * 1e3,
+            grinded.saturating_sub(plain).as_secs_f64() * 1e3,
+            grinded_nonces,
+        );
+        assert_eq!(plain_nonces, 0);
+        assert_eq!(grinded_nonces, 2 + m - K_SKIP);
     }
 
     /// **Verify rejects byte-mutated proofs.** Walk each component of the
