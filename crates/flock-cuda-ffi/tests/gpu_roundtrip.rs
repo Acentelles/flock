@@ -1,9 +1,12 @@
-//! GPU prove -> Rust verify roundtrip. Needs a Blackwell GPU (sm_120):
+//! GPU prove -> Rust verify roundtrips. Needs a Blackwell GPU (sm_120):
 //!   cargo test -p flock-cuda-ffi --release --features gpu -- --ignored --nocapture
 //!
 //! The CUDA prover (cuda-ghash/prove_ffi.cu) returns a flat little-endian
-//! stream; `parse_proof` mirrors its FfiWriter layout exactly and rebuilds the
-//! typed `R1csProofLigerito`, which the ordinary Rust verifier then checks.
+//! stream; `parse_and_verify` mirrors its FfiWriter layout exactly, rebuilds
+//! the typed `R1csProofLigerito`, and runs the ordinary Rust verifier.
+//! One roundtrip per proof size: m = 14 + n_blocks_log, gated on a ligerito
+//! config existing for that m. `FLOCK_GPU_M=<m> cargo test ... gpu_roundtrip_env`
+//! proves any other size.
 #![cfg(feature = "gpu")]
 
 use flock_prover::challenger::FsChallenger;
@@ -47,6 +50,7 @@ struct ProveParams {
     fold_grinding_bits: *const i32,
     ood_samples: *const i32,
     recursive_steps: i32,
+    dump_z_path: *const std::ffi::c_char,
 }
 
 unsafe extern "C" {
@@ -143,10 +147,17 @@ impl<'a> Reader<'a> {
     }
 }
 
-#[test]
-#[ignore] // needs an sm_120 GPU; run explicitly with --ignored
-fn gpu_prove_rust_verify_roundtrip() {
-    let n_blocks_log = 8usize; // m = 22: the smallest fast config
+struct GpuArtifacts {
+    r1cs: flock_prover::r1cs::BlockR1cs,
+    pcs_params: PcsParams,
+    proof: R1csProofLigerito,
+    commitment: Commitment,
+    prove_secs: f64,
+}
+
+/// Prove on the GPU at `m = 14 + n_blocks_log`, parse the flat stream into the
+/// typed proof. `dump_z` optionally writes the packed witness for host replay.
+fn gpu_prove(n_blocks_log: usize, dump_z: Option<&str>) -> GpuArtifacts {
     let r1cs = b3::build_block_r1cs(n_blocks_log);
     let m = r1cs.m;
     let pcs_params = PcsParams {
@@ -158,7 +169,7 @@ fn gpu_prove_rust_verify_roundtrip() {
     };
     let cfg = pcs_params
         .ligerito_prover_config()
-        .expect("m22 fast ligerito config");
+        .unwrap_or_else(|_| panic!("no fast ligerito config for m={m}"));
 
     let digest = r1cs.statement_digest();
     let (a_cp, a_rw) = csc_from_rows(&r1cs.a_0);
@@ -172,9 +183,9 @@ fn gpu_prove_rust_verify_roundtrip() {
     let grinding_bits = to_i32(&cfg.grinding_bits);
     let fold_grinding_bits = to_i32(&cfg.fold_grinding_bits);
     let ood_samples = to_i32(&cfg.ood_samples);
-    let num_levels = log_inv_rates.len() as i32;
     let r_steps = cfg.recursive_steps;
 
+    let dump_c = dump_z.map(|p| std::ffi::CString::new(p).unwrap());
     let params = ProveParams {
         m: m as i32,
         statement_digest: digest.as_ptr(),
@@ -192,7 +203,7 @@ fn gpu_prove_rust_verify_roundtrip() {
         zc_mcol: mcol.as_ptr(),
         zc_f8mul: f8mul.as_ptr(),
         initial_k: cfg.initial_k as i32,
-        num_levels,
+        num_levels: log_inv_rates.len() as i32,
         log_inv_rates: log_inv_rates.as_ptr(),
         recursive_ks: recursive_ks.as_ptr(),
         queries: queries.as_ptr(),
@@ -200,14 +211,17 @@ fn gpu_prove_rust_verify_roundtrip() {
         fold_grinding_bits: fold_grinding_bits.as_ptr(),
         ood_samples: ood_samples.as_ptr(),
         recursive_steps: r_steps as i32,
+        dump_z_path: dump_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
     };
 
+    let t0 = std::time::Instant::now();
     let mut out: *mut u8 = std::ptr::null_mut();
     let mut out_len: usize = 0;
     let rc = unsafe { flock_cuda_prove_blake3(&params, &mut out, &mut out_len) };
-    assert_eq!(rc, 0, "CUDA prover returned error {rc}");
+    assert_eq!(rc, 0, "CUDA prover returned error {rc} at m={m}");
     let bytes = unsafe { std::slice::from_raw_parts(out, out_len) }.to_vec();
     unsafe { flock_cuda_free(out) };
+    let t_prove = t0.elapsed();
 
     // ---- parse the flat stream (must mirror prove_ffi.cu::FfiWriter) ----
     let mut r = Reader { b: &bytes, o: 0 };
@@ -295,13 +309,24 @@ fn gpu_prove_rust_verify_roundtrip() {
             },
         },
     };
-    let commitment = Commitment {
-        root,
-        params: pcs_params.clone(),
-    };
+    GpuArtifacts {
+        r1cs,
+        pcs_params: pcs_params.clone(),
+        proof,
+        commitment: Commitment { root, params: pcs_params },
+        prove_secs: t_prove.as_secs_f64(),
+    }
+}
 
+/// Full roundtrip: GPU prove, Rust verify; with `tamper`, also check that two
+/// corrupted variants are rejected.
+fn roundtrip(n_blocks_log: usize, tamper: bool) {
+    let GpuArtifacts { r1cs, pcs_params, proof, commitment, prove_secs } =
+        gpu_prove(n_blocks_log, None);
+    let m = r1cs.m;
     let lc_circuit =
         lincheck::SparseMatrixCircuit::new(&r1cs.a_0, &r1cs.b_0).with_const_pin(r1cs.const_pin);
+    let t1 = std::time::Instant::now();
     let mut ch_v = FsChallenger::new(DOMAIN);
     let claim = verifier::verify_ligerito(
         &r1cs,
@@ -311,29 +336,153 @@ fn gpu_prove_rust_verify_roundtrip() {
         &pcs_params,
         &mut ch_v,
     )
-    .unwrap_or_else(|e| panic!("Rust verifier rejected the GPU proof: {e:?}"));
+    .unwrap_or_else(|e| panic!("Rust verifier rejected the GPU proof at m={m}: {e:?}"));
     println!(
-        "GPU proof verified: m={m}, ab claim value {:016x}:{:016x}",
-        claim.ab.value.hi, claim.ab.value.lo
+        "GPU proof verified: m={m}, prove(+glue) {:.2}s, verify {:.2}s, ab claim {:016x}:{:016x}",
+        prove_secs,
+        t1.elapsed().as_secs_f64(),
+        claim.ab.value.hi,
+        claim.ab.value.lo
     );
 
-    // Tamper: flip one bit of the final-level clear polynomial -> reject.
-    let mut bad = proof.clone();
-    bad.pcs_open.ligerito.final_proof.yr[0].lo ^= 1;
-    let mut ch_t = FsChallenger::new(DOMAIN);
-    assert!(
-        verifier::verify_ligerito(&r1cs, &commitment, &bad, &lc_circuit, &pcs_params, &mut ch_t)
-            .is_err(),
-        "verifier accepted a tampered GPU proof"
-    );
+    if tamper {
+        // Flip one bit of the final-level clear polynomial -> reject.
+        let mut bad = proof.clone();
+        bad.pcs_open.ligerito.final_proof.yr[0].lo ^= 1;
+        let mut ch_t = FsChallenger::new(DOMAIN);
+        assert!(
+            verifier::verify_ligerito(&r1cs, &commitment, &bad, &lc_circuit, &pcs_params, &mut ch_t)
+                .is_err(),
+            "verifier accepted a tampered GPU proof"
+        );
+        // Corrupt one zerocheck round message -> transcript replay rejects.
+        let mut bad = proof.clone();
+        bad.zerocheck.multilinear_rounds[0].0.hi ^= 1;
+        let mut ch_t = FsChallenger::new(DOMAIN);
+        assert!(
+            verifier::verify_ligerito(&r1cs, &commitment, &bad, &lc_circuit, &pcs_params, &mut ch_t)
+                .is_err(),
+            "verifier accepted a zerocheck-tampered GPU proof"
+        );
+    }
+}
 
-    // Tamper: corrupt one zerocheck round message -> transcript replay rejects.
-    let mut bad = proof.clone();
-    bad.zerocheck.multilinear_rounds[0].0.hi ^= 1;
-    let mut ch_t = FsChallenger::new(DOMAIN);
-    assert!(
-        verifier::verify_ligerito(&r1cs, &commitment, &bad, &lc_circuit, &pcs_params, &mut ch_t)
-            .is_err(),
-        "verifier accepted a zerocheck-tampered GPU proof"
+#[test]
+#[ignore] // needs an sm_120 GPU; run explicitly with --ignored
+fn gpu_roundtrip_m22() {
+    roundtrip(8, true);
+}
+
+#[test]
+#[ignore] // needs an sm_120 GPU; run explicitly with --ignored
+fn gpu_roundtrip_m32() {
+    roundtrip(18, false);
+}
+
+#[test]
+#[ignore] // needs an sm_120 GPU; run explicitly with --ignored
+fn gpu_roundtrip_m33() {
+    roundtrip(19, false);
+}
+
+/// Arbitrary size: `FLOCK_GPU_M=30 cargo test -p flock-cuda-ffi --release \
+///   --features gpu -- --ignored gpu_roundtrip_env --nocapture`
+#[test]
+#[ignore] // needs an sm_120 GPU; run explicitly with --ignored
+fn gpu_roundtrip_env() {
+    let Ok(mv) = std::env::var("FLOCK_GPU_M") else {
+        println!("FLOCK_GPU_M not set; skipping");
+        return;
+    };
+    let m: usize = mv.parse().expect("FLOCK_GPU_M must be an integer m");
+    assert!(m >= 17, "need m >= 17 (n_blocks_log >= 3)");
+    roundtrip(m - 14, true);
+}
+
+/// Debug harness: prove the SAME witness on the GPU and in Rust, then report
+/// the first divergent proof field. Size from `FLOCK_GPU_M` (default 33).
+#[test]
+#[ignore] // needs an sm_120 GPU; run explicitly with --ignored
+fn gpu_debug_diff() {
+    let m: usize = std::env::var("FLOCK_GPU_M")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(33);
+    let zpath = format!("/tmp/ffi_z_m{m}.bin");
+    let art = gpu_prove(m - 14, Some(&zpath));
+    let zb = std::fs::read(&zpath).expect("witness dump missing");
+    assert_eq!(zb.len(), (1usize << (m - 7)) * 16, "witness dump size");
+    let z: Vec<F128> = zb
+        .chunks_exact(16)
+        .map(|c| F128 {
+            lo: u64::from_le_bytes(c[0..8].try_into().unwrap()),
+            hi: u64::from_le_bytes(c[8..16].try_into().unwrap()),
+        })
+        .collect();
+
+    let mut ch = FsChallenger::new(DOMAIN);
+    let (rp, rcomm, _claim) =
+        flock_prover::prover::prove_ligerito(&art.r1cs, z, &art.pcs_params, &mut ch);
+    let gp = &art.proof;
+
+    fn first_diff<T: PartialEq + std::fmt::Debug>(name: &str, r: &[T], g: &[T]) {
+        if r.len() != g.len() {
+            panic!("{name}: len rust {} vs gpu {}", r.len(), g.len());
+        }
+        for (i, (a, b)) in r.iter().zip(g.iter()).enumerate() {
+            if a != b {
+                panic!("{name}[{i}]: rust {a:?} vs gpu {b:?}");
+            }
+        }
+        println!("  {name}: OK ({} entries)", r.len());
+    }
+
+    assert_eq!(rcomm.root, art.commitment.root, "commitment root");
+    first_diff("zc.round1_ab", &rp.zerocheck.round1_ab, &gp.zerocheck.round1_ab);
+    first_diff("zc.round1_c", &rp.zerocheck.round1_c, &gp.zerocheck.round1_c);
+    first_diff(
+        "zc.multilinear_rounds",
+        &rp.zerocheck.multilinear_rounds,
+        &gp.zerocheck.multilinear_rounds,
     );
+    assert_eq!(rp.zerocheck.final_a_eval, gp.zerocheck.final_a_eval, "zc.final_a");
+    assert_eq!(rp.zerocheck.final_b_eval, gp.zerocheck.final_b_eval, "zc.final_b");
+    assert_eq!(rp.zerocheck.final_c_eval, gp.zerocheck.final_c_eval, "zc.final_c");
+    first_diff("lc.rounds", &rp.lincheck.rounds, &gp.lincheck.rounds);
+    first_diff("lc.z_partial", &rp.lincheck.z_partial, &gp.lincheck.z_partial);
+    for (i, (r, g)) in rp
+        .pcs_open
+        .ring_switches
+        .iter()
+        .zip(gp.pcs_open.ring_switches.iter())
+        .enumerate()
+    {
+        first_diff(&format!("rs[{i}].s_hat_v"), &r.s_hat_v, &g.s_hat_v);
+    }
+    let (rl, gl) = (&rp.pcs_open.ligerito, &gp.pcs_open.ligerito);
+    assert_eq!(rl.initial_root, gl.initial_root, "lig.initial_root");
+    first_diff("lig.sumcheck_transcript", &rl.sumcheck_transcript, &gl.sumcheck_transcript);
+    first_diff("lig.ood_values", &rl.ood_values, &gl.ood_values);
+    first_diff(
+        "lig.fold_grinding_nonces",
+        &rl.fold_grinding_nonces,
+        &gl.fold_grinding_nonces,
+    );
+    first_diff("lig.grinding_nonces", &rl.grinding_nonces, &gl.grinding_nonces);
+    first_diff("lig.recursive_roots", &rl.recursive_roots, &gl.recursive_roots);
+    first_diff("lig.initial.rows", &rl.initial_proof.opened_rows, &gl.initial_proof.opened_rows);
+    first_diff("lig.initial.mp", &rl.initial_proof.merkle_proof, &gl.initial_proof.merkle_proof);
+    assert_eq!(
+        rl.recursive_proofs.len(),
+        gl.recursive_proofs.len(),
+        "recursive_proofs count"
+    );
+    for (i, (r, g)) in rl.recursive_proofs.iter().zip(gl.recursive_proofs.iter()).enumerate() {
+        first_diff(&format!("lig.rec[{i}].rows"), &r.opened_rows, &g.opened_rows);
+        first_diff(&format!("lig.rec[{i}].mp"), &r.merkle_proof, &g.merkle_proof);
+    }
+    first_diff("lig.final.yr", &rl.final_proof.yr, &gl.final_proof.yr);
+    first_diff("lig.final.rows", &rl.final_proof.opened_rows, &gl.final_proof.opened_rows);
+    first_diff("lig.final.mp", &rl.final_proof.merkle_proof, &gl.final_proof.merkle_proof);
+    println!("no divergence found (proofs identical at m={m})");
 }

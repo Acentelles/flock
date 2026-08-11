@@ -324,8 +324,16 @@ TEST_BINS = test_f128 test_commit_ntt test_sumcheck_ab test_lincheck \
             test_transpose_induce test_eq_builders test_zerocheck_lookahead \
             test_fold_lookahead
 
+# FFI prover TU (linked into Rust by crates/flock-cuda-ffi's build.rs; the
+# object build here is the hosted compile leg's bit-rot check — no GPU needed).
+prove_ffi.o: prove_ffi.cu ntt_f128.cuh merkle.cuh merkle_open.hpp induce_sumcheck.cuh \
+             ntt_transpose.cuh introduce_glue.cuh sumcheck_ab.cuh lincheck.cuh \
+             blake3_witness.cuh zerocheck_round1.cuh zerocheck_round1_cpustyle.cuh \
+             zerocheck_round2.cuh zerocheck_tail.cuh phi8_table.cuh challenger.hpp f128.cuh
+	$(NVCC) $(NVCCFLAGS) -Xcompiler -fPIC -c prove_ffi.cu -o $@
+
 .PHONY: build-tests run-tests
-build-tests: $(TEST_BINS)
+build-tests: $(TEST_BINS) prove_ffi.o
 
 # Every vector-validated end-to-end target: dump the oracle via the Rust
 # dump_* bin, then replay it on device. Needs a Blackwell GPU (clmad) plus

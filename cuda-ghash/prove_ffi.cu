@@ -187,6 +187,9 @@ typedef struct {
     const int* fold_grinding_bits; // [num_levels]
     const int* ood_samples;       // [num_levels]
     int recursive_steps;
+    // Optional: dump the generated packed witness (len F128, raw LE) here so a
+    // host-side Rust prover can replay the identical instance. NULL = no dump.
+    const char* dump_z_path;
 } FlockCudaProveParams;
 
 int flock_cuda_device_count() {
@@ -229,6 +232,12 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
     }
     vector<F128> z_host(len);   // host witness copy for ring-switch folds
     CK(cudaMemcpy(z_host.data(), df, len * sizeof(F128), cudaMemcpyDeviceToHost));
+    if (P->dump_z_path && P->dump_z_path[0]) {
+        FILE* zf = fopen(P->dump_z_path, "wb");
+        if (!zf) { printf("FFI: cannot open dump path %s\n", P->dump_z_path); return 103; }
+        fwrite(z_host.data(), sizeof(F128), z_host.size(), zf);
+        fclose(zf);
+    }
 
     // ================= L0 commit ============================================
     F128* d_cw0; uint8_t* d_tree0; long long l0_bl; int l0_ni; uint8_t l0root[32];
@@ -294,9 +303,8 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
         for (int i = 0; i < 4; i++) zc_r[9 + i] = MUL(gm[i], f128_inv_host(ADD(ONE, gm[i])));
         for (int i = 0; i < m - 13; i++) zc_r[13 + i] = frch(ro[i]);
 
-        // round 1 over the full eq(r[6..]) table
-        vector<F128> eqf6 = build_eq_host(&zc_r[6], m - 6);
-        CK(cudaMemcpy(d_eq, eqf6.data(), n_out * sizeof(F128), cudaMemcpyHostToDevice));
+        // round 1 over the full eq(r[6..]) table (built on device: 2^(m-6) entries)
+        build_eq_device(d_eq, &zc_r[6], m - 6);
         launch_zc_round1_fast((const uint8_t*)d_a, (const uint8_t*)d_b, (const uint8_t*)df,
                               d_eq, n_out, d_r1ab, d_r1c);
         CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
@@ -474,8 +482,17 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
       for (size_t k = 0; k < eq_tail.size(); k++)
           for (int b = 0; b < 128; b++)
               shat_ab[b] = ADD(shat_ab[b], MUL(eq_tail[k], z_vec[k * 128 + b])); }
-    // s_hat_v_c from the packed witness against eq(xfull_c[1..])
-    vector<F128> suffix_c = build_eq_host(xfull_c.data() + 1, (int)xfull_c.size() - 1);
+    // Suffix tensors for both claims, built on device (2^(m-7) entries each)
+    // and copied down for the host-side ring-switch folds.
+    vector<F128> suffix_ab(len), suffix_c(len);
+    {
+        F128* d_scr; CK(cudaMalloc(&d_scr, len * sizeof(F128)));
+        build_eq_device(d_scr, xfull_ab.data() + 1, (int)xfull_ab.size() - 1);
+        CK(cudaMemcpy(suffix_ab.data(), d_scr, len * sizeof(F128), cudaMemcpyDeviceToHost));
+        build_eq_device(d_scr, xfull_c.data() + 1, (int)xfull_c.size() - 1);
+        CK(cudaMemcpy(suffix_c.data(), d_scr, len * sizeof(F128), cudaMemcpyDeviceToHost));
+        cudaFree(d_scr);
+    }
     vector<F128> shat_c = fold_1b_rows_host(z_host, suffix_c);
 
     ch.observe_label((const uint8_t*)"flock-pcs-open-batch-v0", 23);
@@ -501,9 +518,7 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
     // b_combined + round-0 prime
     vector<F128> b_comb(len, F128{0, 0});
     {
-        const vector<F128>* sufs[2] = { nullptr, &suffix_c };
-        vector<F128> suffix_ab = build_eq_host(xfull_ab.data() + 1, (int)xfull_ab.size() - 1);
-        sufs[0] = &suffix_ab;
+        const vector<F128>* sufs[2] = { &suffix_ab, &suffix_c };
         for (int i = 0; i < 2; i++) {
             vector<F128> wscaled(128);
             for (int j = 0; j < 128; j++) wscaled[j] = MUL(gam[i], rsw[i].eq_rd[j]);
@@ -641,9 +656,11 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
                 CK(cudaMalloc(&d_tw, tt.data.size() * sizeof(F128)));
                 CK(cudaMemcpy(d_tw, tt.data.data(), tt.data.size() * sizeof(F128), cudaMemcpyHostToDevice));
                 CK(cudaMalloc(&d_treen, (size_t)(2 * bln - 1) * 32));
-                if (ntt_can_fuse_src(k_code - rate_next)) {
-                    launch_ntt(d_cwn, d_tw, tt, rate_next, k_code, num_ntts, 256, false, cf, nn_len - 1);
-                } else {
+                // Always the replicate path here: the recursive codewords are
+                // tiny, and the fused src read diverges from the Rust commit at
+                // (k_code - rate) == 8 (first hit at m=33's L4; L0 at every
+                // tested m is fine, so L0 keeps the fusion for the big buffer).
+                {
                     int tpb = 256;
                     replicate_fill_ffi<<<(unsigned)((cw_len + tpb - 1) / tpb), tpb>>>(cf, d_cwn, cw_len, nn_len);
                     launch_ntt(d_cwn, d_tw, tt, rate_next, k_code, num_ntts);

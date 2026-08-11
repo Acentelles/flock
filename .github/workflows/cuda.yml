@@ -72,3 +72,10 @@ jobs:
       - name: Run vector-validated CUDA tests
         # Serial on purpose — see the run-tests note in cuda-ghash/Makefile.
         run: make -C cuda-ghash run-tests
+
+      - name: GPU prove -> Rust verify roundtrips (m=22/32/33)
+        # The name filter selects exactly the fixed-size roundtrips; the
+        # debug-diff and env-parameterized harness stay manual-only.
+        run: >
+          cargo test -p flock-cuda-ffi --release --features gpu --
+          --ignored gpu_roundtrip_m --nocapture
