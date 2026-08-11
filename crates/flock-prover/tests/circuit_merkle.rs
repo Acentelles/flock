@@ -977,6 +977,69 @@ impl MerklePathGate {
     }
 }
 
+/// One whole chunk chain — the leaf half of an L0 opening — as ONE row:
+/// `leaf_words` words of leaf data in, the chunk's non-root chaining value
+/// out (= `merkle::hash_leaf`), the climb untouched. Replaces the
+/// `ceil(words/4)` per-block b3 rows `emit_opening` otherwise spends on a
+/// leaf (`docs/local/chunk-leaf-l0-table.md`).
+///
+/// Each distinct leaf width is its own row shape — the block count, the
+/// final block's byte count and the `CHUNK_END` position are all
+/// width-derived constants of the relation — so instantiations are
+/// per-width, demand-cached like the [`LeafEvalGate`] lane variants.
+///
+/// Stub matrices + walker, the `MerkleMixedSetup` precedent: materialized,
+/// a 16-block composite is ~340M nonzeros; the walker keeps one stripped
+/// base copy, and its lincheck fold factors the eq table across the aligned
+/// block subcubes (O(base nnz) per proof, not O(blocks · base nnz)). The
+/// registry digest binds `k_log`, `useful_bits` and `const_pin` — hence the
+/// width — but NOT the constraint system: the verifier constructs the
+/// matching walker out of band.
+struct ChunkLeafGate {
+    layout: MerkleTreeLayout,
+    nu: usize,
+}
+
+impl ChunkLeafGate {
+    fn new(leaf_words: usize, nu: usize) -> Self {
+        Self {
+            layout: MerkleTreeLayout::with_blake3_chunk_only(leaf_words, blake3_spec()),
+            nu,
+        }
+    }
+}
+
+impl GateType for ChunkLeafGate {
+    type Row = ChunkPathInput;
+    type Hint = ();
+
+    fn table(&self) -> TableType {
+        TableType::from_block_r1cs(&self.layout.build_block_r1cs_stub(self.nu))
+            .with_io_schema(self.layout.io_schema())
+    }
+
+    fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> Self::Row {
+        assert_eq!(inputs.len(), self.layout.leaf_words, "one wire per leaf word");
+        let mut leaf_data = Vec::with_capacity(16 * inputs.len());
+        for w in inputs {
+            leaf_data.extend_from_slice(&w.lo.to_le_bytes());
+            leaf_data.extend_from_slice(&w.hi.to_le_bytes());
+        }
+        let row = ChunkPathInput {
+            leaf_data,
+            index: 0,
+            siblings: Vec::new(),
+        };
+        let cv = self.layout.root_chunk(&row);
+        outputs.extend_from_slice(&digest_words(&cv));
+        row
+    }
+
+    fn witness(&self, _rows: &[Self::Row], _nu: usize) -> SlotWitness {
+        SlotWitness::DeferredToRows
+    }
+}
+
 impl GateType for MerklePathGate {
     type Row = ChunkPathInput;
     /// The sibling path, level 0 closest to the leaf. Unwireable by
@@ -5051,11 +5114,13 @@ fn mvp7_real_query_phase() {
     // DECLARATION order, so publishing inside the loop would interleave with
     // the next level's public inputs and break the tail walk below.
     let cap_w = cap_wires(&stream, &word_wire, &cap_pays);
+    let chunk_none: Vec<Option<flock_core::circuit::builder::SlotId>> = vec![None; geo.len()];
     let (to_publish, level_accs) = emit_query_phase(
         &mut sb,
         slots,
         iv,
         &leafeval,
+        &chunk_none,
         &levels,
         &geo,
         &lvl_src,
@@ -6302,6 +6367,7 @@ fn emit_query_phase(
     slots: CollapsedSlots,
     iv: [Wire; 2],
     leafeval: &[flock_core::circuit::builder::SlotId],
+    chunk: &[Option<flock_core::circuit::builder::SlotId>],
     levels: &[OpenLevel],
     geo: &[Lvl],
     lvl_src: &[(&[[u8; 32]], &Vec<Vec<F128>>, &Vec<[u8; 32]>)],
@@ -6389,6 +6455,7 @@ fn emit_query_phase(
             let cv = emit_opening(
                 sb,
                 slots,
+                chunk[li],
                 iv,
                 &leaf_w,
                 cw,
@@ -6844,10 +6911,17 @@ fn check_residual_publics(
 /// and before it, the chunk chain: `leaf_blocks` BLAKE3 rows whose out_lo
 /// threads row to row, seeded by the IV, `CHUNK_START` on the first and
 /// `CHUNK_END` on the last. Every arrow is a copy constraint on whole words.
+///
+/// With `chunk = Some(slot)` — a [`ChunkLeafGate`] instantiated at EXACTLY
+/// `leaf_w.len()` words — the whole chain is ONE row of that slot instead:
+/// same leaf wires in (the leaf-eval fold gates keep consuming them), the
+/// chunk CV out, no pad wire and no per-block params. The climb is
+/// untouched either way.
 #[allow(clippy::too_many_arguments)]
 fn emit_opening(
     sb: &mut ShapeBuilder,
     s: CollapsedSlots,
+    chunk: Option<flock_core::circuit::builder::SlotId>,
     iv: [Wire; 2],
     leaf_w: &[Wire],
     index_w: Wire,
@@ -6877,7 +6951,7 @@ fn emit_opening(
             }
         }
     };
-    let pad_w = if leaf_w.len() % 4 == 0 {
+    let pad_w = if chunk.is_some() || leaf_w.len() % 4 == 0 {
         None
     } else {
         Some(shared(sb, pubs, F128::ZERO))
@@ -6886,32 +6960,42 @@ fn emit_opening(
     // The index word's bits, one per level.
     let bits = sb.gate(s.spread, &[index_w]);
 
-    // Chunk chain: the leaf hashed as a BLAKE3 chunk.
-    let mut cv = iv;
-    for i in 0..blocks {
-        let mut flags = 0u32;
-        if i == 0 {
-            flags |= CHUNK_START;
-        }
-        if i + 1 == blocks {
-            flags |= CHUNK_END;
-        }
-        // The final block carries only the bytes that remain.
-        let words = (leaf_w.len() - 4 * i).min(4);
-        let params = shared(sb, pubs, pack_params(0, 16 * words as u32, flags));
-        let mw = |j: usize| -> Wire {
-            if j < words {
-                leaf_w[4 * i + j]
-            } else {
-                pad_w.expect("a short block needs the zero pad")
+    // Chunk chain: the leaf hashed as a BLAKE3 chunk — one ChunkLeafGate
+    // row when the caller instantiated the width, else one b3 row per
+    // 64-byte block. The gate bakes the IV, the per-block byte counts and
+    // the flags into its relation, so no params or pad wires exist on that
+    // path.
+    let mut cv = if let Some(cl) = chunk {
+        let out = sb.gate(cl, leaf_w);
+        [out[0], out[1]]
+    } else {
+        let mut cv = iv;
+        for i in 0..blocks {
+            let mut flags = 0u32;
+            if i == 0 {
+                flags |= CHUNK_START;
             }
-        };
-        let out = sb.gate(
-            s.b3,
-            &[cv[0], cv[1], mw(0), mw(1), mw(2), mw(3), params],
-        );
-        cv = [out[0], out[1]];
-    }
+            if i + 1 == blocks {
+                flags |= CHUNK_END;
+            }
+            // The final block carries only the bytes that remain.
+            let words = (leaf_w.len() - 4 * i).min(4);
+            let params = shared(sb, pubs, pack_params(0, 16 * words as u32, flags));
+            let mw = |j: usize| -> Wire {
+                if j < words {
+                    leaf_w[4 * i + j]
+                } else {
+                    pad_w.expect("a short block needs the zero pad")
+                }
+            };
+            let out = sb.gate(
+                s.b3,
+                &[cv[0], cv[1], mw(0), mw(1), mw(2), mw(3), params],
+            );
+            cv = [out[0], out[1]];
+        }
+        cv
+    };
 
     // Node levels: swap, then a PARENT compression over the swapped pair.
     // The sibling is the swap's hint, supplied at `run` time in this call
@@ -6973,7 +7057,7 @@ fn collapsed_opening_matches_the_composite() {
             let leaf_w: Vec<Wire> = (0..4 * blocks).map(|_| sb.input()).collect();
             let index_w = sb.input();
             roots.push(emit_opening(
-                &mut sb, slots, iv, &leaf_w, index_w, depth, 0, None, &mut pubs,
+                &mut sb, slots, None, iv, &leaf_w, index_w, depth, 0, None, &mut pubs,
             ));
             let leaf = tree.leaf(pos);
             leaf_vals.extend((0..4 * blocks).map(|w| leaf_word(leaf, 16 * w)));
@@ -7297,7 +7381,8 @@ fn mvp6_all_levels_collapsed() {
 
             // The challenge word IS the index word — no masking gadget.
             let cw = outs[sq[k / 4]][k % 4];
-            let cv = emit_opening(&mut sb, slots, iv, &leaf_w, cw, l.depth, c, None, &mut vals);
+            let cv =
+                emit_opening(&mut sb, slots, None, iv, &leaf_w, cw, l.depth, c, None, &mut vals);
             opens.push((cw, cv));
             hints.extend(trees[li].siblings(pos).into_iter().take(l.depth - c));
 
@@ -8126,11 +8211,14 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
 
         let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
         let cap_w = cap_wires(&stream, &ww, &cap_pays);
+        let chunk_none: Vec<Option<flock_core::circuit::builder::SlotId>> =
+            vec![None; geo.len()];
         let (to_publish, level_accs) = emit_query_phase(
             &mut sb,
             slots,
             iv,
             &leafeval,
+            &chunk_none,
             &levels,
             &geo,
             &lvl_src,
@@ -10777,11 +10865,13 @@ fn emit_real_child_region(
     };
     cen.push(("H(publics) region", sb.public_len(), sb.rows_in_slot(cs.macs)));
     let cap_w = cap_wires(stream, &ww, &rt.cap_pays);
+    let chunk_none: Vec<Option<flock_core::circuit::builder::SlotId>> = vec![None; geo.len()];
     let (to_publish, level_accs) = emit_query_phase(
         sb,
         cs.q,
         iv2,
         &leafeval,
+        &chunk_none,
         levels,
         geo,
         &rt.lvl_src,
@@ -15936,11 +16026,13 @@ fn emit_child_region(
         )
     };
     let cap_w = cap_wires(stream, &ww, &ct.cap_pays);
+    let chunk_none: Vec<Option<flock_core::circuit::builder::SlotId>> = vec![None; geo.len()];
     let (to_publish, level_accs) = emit_query_phase(
         sb,
         cs.q,
         iv2,
         &leafeval,
+        &chunk_none,
         levels,
         geo,
         &ct.lvl_src,
@@ -16977,7 +17069,8 @@ fn partial_block_leaves_hash_correctly() {
             .collect();
         vals.push(F128::new(pos as u64, 0));
         let idx_w = sb.public_input();
-        let root = emit_opening(&mut sb, slots, iv, &leaf_w, idx_w, depth, 0, None, &mut vals);
+        let root =
+            emit_opening(&mut sb, slots, None, iv, &leaf_w, idx_w, depth, 0, None, &mut vals);
         sb.publish(root[0]);
         sb.publish(root[1]);
         let shape = sb.finish().expect("the opening circuit builds");
@@ -16994,7 +17087,261 @@ fn partial_block_leaves_hash_correctly() {
             digest_words(&hash_to_digest(&tree.root)),
             "width {words}: the opening folds to the tree root"
         );
+
+        // The same opening with the chunk chain as ONE ChunkLeafGate row —
+        // same leaf wires, no pad wire, no per-block params — folds to the
+        // same root, at every width. This is the collapsed loop's
+        // replacement and its width sweep in one.
+        let mut sb = ShapeBuilder::new(nu);
+        let slots = CollapsedSlots {
+            b3: sb.slot(Blake3Gate { nu }),
+            swap: sb.slot(SwapGate { nu }),
+            spread: sb.slot(BitSpreadGate {
+                ty: BitSpreadTable::new(depth),
+                nu,
+            }),
+        };
+        let cl = sb.slot(ChunkLeafGate::new(words, nu));
+        let mut vals: Vec<F128> = Vec::new();
+        vals.extend_from_slice(&iv_w);
+        let iv = [sb.public_input(), sb.public_input()];
+        let leaf_w: Vec<Wire> = (0..words)
+            .map(|w| {
+                vals.push(leaf_word(leaf, 16 * w));
+                sb.public_input()
+            })
+            .collect();
+        vals.push(F128::new(pos as u64, 0));
+        let idx_w = sb.public_input();
+        let root =
+            emit_opening(&mut sb, slots, Some(cl), iv, &leaf_w, idx_w, depth, 0, None, &mut vals);
+        sb.publish(root[0]);
+        sb.publish(root[1]);
+        let shape = sb.finish().expect("the chunk-gate opening circuit builds");
+        let built = shape.run(&vals, &hint_refs);
+        let n = built.public.len();
+        assert_eq!(
+            [built.public[n - 2], built.public[n - 1]],
+            digest_words(&hash_to_digest(&tree.root)),
+            "width {words}: the chunk-gate opening folds to the tree root"
+        );
+        assert_eq!(
+            shape.counts[shape.registry_slot(cl)],
+            1,
+            "width {words}: one chunk row per opening"
+        );
+        assert_eq!(
+            shape.counts[shape.registry_slot(slots.b3)],
+            depth,
+            "width {words}: only the climb stays on b3 rows"
+        );
     }
+}
+
+/// **The chunk-leaf table, proven end to end in a union**: openings over two
+/// leaf widths (a partial final block and whole blocks) each ride ONE row of
+/// a per-width [`ChunkLeafGate`], wired to the same climb the collapsed path
+/// keeps; the union proves with the walkers carrying the chunk types'
+/// lincheck (stub matrices — the `MerkleMixedSetup` precedent) and verifies;
+/// a tampered root public is rejected.
+#[test]
+fn chunk_leaf_rows_prove_in_the_union() {
+    let nu = 5usize;
+    let shapes = [(3usize, 5usize), (2, 12)]; // (depth, leaf words)
+    let n_open = 4usize;
+    let mut rng = Rng(0x_C1_0C_5E_ED);
+    let trees: Vec<Tree> = shapes
+        .iter()
+        .map(|&(depth, words)| Tree::new(depth, 16 * words, &mut rng))
+        .collect();
+
+    let mut sb = ShapeBuilder::new(nu);
+    let max_depth = shapes.iter().map(|&(d, _)| d).max().unwrap();
+    let slots = CollapsedSlots {
+        b3: sb.slot(Blake3Gate { nu }),
+        swap: sb.slot(SwapGate { nu }),
+        spread: sb.slot(BitSpreadGate {
+            ty: BitSpreadTable::new(max_depth),
+            nu,
+        }),
+    };
+    let chunk_gates: Vec<_> = shapes.iter().map(|&(_, w)| ChunkLeafGate::new(w, nu)).collect();
+    let chunk_slots: Vec<_> = shapes
+        .iter()
+        .map(|&(_, w)| sb.slot(ChunkLeafGate::new(w, nu)))
+        .collect();
+
+    let mut vals: Vec<F128> = Vec::new();
+    let iv_w = pack8(&IV);
+    vals.extend_from_slice(&iv_w);
+    let iv = [sb.public_input(), sb.public_input()];
+    let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
+    let mut roots = Vec::new();
+    for (si, &(depth, words)) in shapes.iter().enumerate() {
+        for k in 0..n_open {
+            let pos = (k * 3 + si) % (1 << depth);
+            let leaf = trees[si].leaf(pos);
+            let leaf_w: Vec<Wire> = (0..words)
+                .map(|w| {
+                    vals.push(leaf_word(leaf, 16 * w));
+                    sb.input()
+                })
+                .collect();
+            vals.push(F128::new(pos as u64, 0));
+            let idx_w = sb.input();
+            roots.push(emit_opening(
+                &mut sb,
+                slots,
+                Some(chunk_slots[si]),
+                iv,
+                &leaf_w,
+                idx_w,
+                depth,
+                0,
+                None,
+                &mut vals,
+            ));
+            hints.extend(trees[si].siblings(pos));
+        }
+    }
+    for r in &roots {
+        sb.publish(r[0]);
+        sb.publish(r[1]);
+    }
+    let shape = sb.finish().expect("the chunk-leaf union circuit builds");
+
+    let hint_refs: Vec<&(dyn std::any::Any + Sync)> =
+        hints.iter().map(|h| h as &(dyn std::any::Any + Sync)).collect();
+    let built = shape.run(&vals, &hint_refs);
+
+    // Every opening folds to its tree's root through the one-row leaf hash.
+    for (si, &(depth, _)) in shapes.iter().enumerate() {
+        let want = digest_words(&hash_to_digest(&trees[si].root));
+        for k in 0..n_open {
+            let r = &roots[si * n_open + k];
+            let _ = (r, depth);
+            let base = 2 * (si * n_open + k);
+            let n = built.public.len() - 2 * shapes.len() * n_open;
+            assert_eq!(
+                [built.public[n + base], built.public[n + base + 1]],
+                want,
+                "shape {si} opening {k} root"
+            );
+        }
+    }
+
+    // ---- prove / verify ----
+    let union = UnionInstance::new(&shape.registry, shape.counts.clone());
+    let pcs_params = PcsParams {
+        m: union.dense_m(),
+        log_inv_rate: 1,
+        log_batch_size: pcs_batch(&union),
+        profile: LigeritoProfile::Fast,
+        num_lanes: union.commit_lanes(pcs_batch(&union)),
+        merkle_hash: Default::default(),
+    };
+    let b3 = blake3::build_block_r1cs(nu);
+    let b3_lc = b3.csc_lincheck_circuit();
+    let swap_r1cs = SwapTable::build_block_r1cs(nu);
+    let swap_lc = swap_r1cs.csc_lincheck_circuit();
+    let spread_ty = BitSpreadTable::new(max_depth);
+    let spread_r1cs = spread_ty.build_block_r1cs(nu);
+    let spread_lc = spread_r1cs.csc_lincheck_circuit();
+    let walkers: Vec<_> = chunk_gates.iter().map(|g| g.layout.build_walker()).collect();
+
+    let mut slot_inputs: Vec<(usize, UnionSlotProverInput)> = vec![
+        (
+            shape.registry_slot(slots.b3),
+            UnionSlotProverInput::new(
+                blake3::generate_witness_batch_major_partial(built.rows::<Blake3Gate>(slots.b3), nu),
+                b3_lc,
+            ),
+        ),
+        (
+            shape.registry_slot(slots.swap),
+            UnionSlotProverInput::new(
+                SwapTable::generate_witness_batch_major(built.rows::<SwapGate>(slots.swap), nu),
+                swap_lc,
+            ),
+        ),
+        (
+            shape.registry_slot(slots.spread),
+            UnionSlotProverInput::new(
+                spread_ty.generate_witness_batch_major(
+                    built.rows::<BitSpreadGate>(slots.spread),
+                    nu,
+                ),
+                spread_lc,
+            ),
+        ),
+    ];
+    let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
+        (shape.registry_slot(slots.b3), b3_lc),
+        (shape.registry_slot(slots.swap), swap_lc),
+        (shape.registry_slot(slots.spread), spread_lc),
+    ];
+    for (si, (g, w)) in chunk_gates.iter().zip(&walkers).enumerate() {
+        let rs = shape.registry_slot(chunk_slots[si]);
+        slot_inputs.push((
+            rs,
+            UnionSlotProverInput::new(
+                g.layout.generate_witness_batch_major_partial_chunk(
+                    built.rows::<ChunkLeafGate>(chunk_slots[si]),
+                    nu,
+                ),
+                w,
+            ),
+        ));
+        lcs_ord.push((rs, w));
+    }
+    slot_inputs.sort_by_key(|(i, _)| *i);
+    lcs_ord.sort_by_key(|(i, _)| *i);
+    let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
+        lcs_ord.into_iter().map(|(_, c)| c).collect();
+
+    let mut ch = FsChallenger::new(DOMAIN);
+    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
+        &union,
+        &shape.circuit,
+        &built.public,
+        &pcs_params,
+        slot_inputs.into_iter().map(|(_, s)| s).collect(),
+        Vec::new(),
+        &mut ch,
+    );
+
+    let mut ch = FsChallenger::new(DOMAIN);
+    verifier::verify_ligerito_union_circuit(
+        &union,
+        &shape.circuit,
+        &built.public,
+        &lcs,
+        &commitment,
+        &proof,
+        &pcs_params,
+        &mut ch,
+    )
+    .expect("chunk-leaf openings verify in the union");
+
+    // A tampered root public must be rejected.
+    let mut bad = built.public.clone();
+    let last = bad.len() - 1;
+    bad[last] += F128::ONE;
+    let mut ch = FsChallenger::new(DOMAIN);
+    assert!(
+        verifier::verify_ligerito_union_circuit(
+            &union,
+            &shape.circuit,
+            &bad,
+            &lcs,
+            &commitment,
+            &proof,
+            &pcs_params,
+            &mut ch,
+        )
+        .is_err(),
+        "a tampered root must be rejected"
+    );
 }
 
 // ---------------------------------------------------------------------------
