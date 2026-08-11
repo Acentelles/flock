@@ -10,7 +10,7 @@
 //! On-disk format:
 //! ```text
 //!   bytes 0..5    "FLOCK"                  (5-byte magic)
-//!   byte  5       VERSION                  (currently 5)
+//!   byte  5       VERSION                  (currently 15)
 //!   bytes 6..7    flavor: 2 = R1cs, 3 = Chain, 4 = Mixed
 //!                 (0/1 reserved: legacy BaseFold)
 //!   bytes 7..     bincode-serialized payload
@@ -44,7 +44,33 @@ use flock_core::pcs::Commitment;
 pub const MAGIC: [u8; 5] = *b"FLOCK";
 
 /// Format version. Bumped on incompatible serialization changes.
-/// v9 (current): the two-product multipoint grouping — packed-direct
+/// v15: remaining non-Ligerito algebraic grinding. Product-GKR, dense and
+/// jagged aggregation folds, chain shift, and Merkle-path shift proofs carry
+/// transcript-ordered PoW witnesses. Opening batching now protects all
+/// ring-switched and packed-direct coefficients with one PoW and samples the
+/// coefficients in one vector squeeze; the multipoint gamma schedule is
+/// derived from its actual `K - 1` degree. These proof and transcript changes
+/// are incompatible with v14.
+/// v14: PCS-transport grinding. Ring-switch proofs carry the PoW witness for
+/// their seven-coordinate point; opening proofs carry claim-batching and
+/// merged-sumcheck witnesses; the multipoint and Frobenius-anchor proofs
+/// carry their protected challenge witnesses. Old payloads cannot be
+/// interpreted under the Secure opening policy.
+/// v13: Element/dense PIOP grinding. Both the element zerocheck and element
+/// lincheck subproofs now carry their transcript-ordered nonce vectors; the
+/// Secure profile verifies them before tau, alpha, and every protected round
+/// challenge. Old mixed payloads therefore cannot be interpreted safely.
+/// v12: Boolean lincheck grinding. `LincheckProof` carries the nonce vector
+/// for α batching, every constant-wire β, every degree-two sumcheck round,
+/// and the final φ8 skip evaluation. Secure profiles select the schedule from
+/// the public PCS profile; old payloads cannot be interpreted safely.
+/// v11: Boolean zerocheck grinding. `ZerocheckProof` carries the nonce vector
+/// for the initial eq-weighted identity challenge, the univariate-skip
+/// challenge, and every multilinear sumcheck round. The verifier selects the
+/// required schedule from the public PCS profile, so an old payload could not
+/// be interpreted safely even when its nonce vector would be empty.
+///
+/// v9: the two-product multipoint grouping — packed-direct
 /// claims collapse by shared row point into merged-column scalar groups
 /// carrying ONE untwisted dual value each
 /// (`MultipointTwistedProof.group_values`); ring-switched claims keep 128.
@@ -84,7 +110,7 @@ pub const MAGIC: [u8; 5] = *b"FLOCK";
 /// v3 restructured `BaseFoldProof`: per-query Merkle paths were replaced by
 /// shared octopus multi-proofs (one per Merkle tree). v2 added `HashKind`
 /// to [`ChainProofBundle`].
-pub const VERSION: u8 = 10;
+pub const VERSION: u8 = 15;
 
 /// Which hash function a chain proof is over. Carried in
 /// [`ChainProofBundle`] so the verifier (e.g. the CLI) can pick the right

@@ -105,23 +105,24 @@ fn gate_witness(
 }
 
 /// PCS params over the committed dense stack — same shape as `union_mixed`'s.
-fn union_pcs_params(union: &UnionInstance<'_>) -> PcsParams {
+fn union_pcs_params_with_profile(
+    union: &UnionInstance<'_>,
+    profile: LigeritoProfile,
+) -> PcsParams {
+    let log_batch_size =
+        flock_core::pcs::ligerito::embedded_initial_k_or_default(union.dense_m(), profile);
     PcsParams {
         m: union.dense_m(),
-        log_inv_rate: 1,
-        log_batch_size: flock_core::pcs::ligerito::embedded_initial_k_or_default(
-            union.dense_m(),
-            LigeritoProfile::Fast,
-        ),
-        profile: LigeritoProfile::Fast,
-        num_lanes: union.commit_lanes(
-            flock_core::pcs::ligerito::embedded_initial_k_or_default(
-                union.dense_m(),
-                LigeritoProfile::Fast,
-            ),
-        ),
+        log_inv_rate: profile.log_inv_rate(),
+        log_batch_size,
+        profile,
+        num_lanes: union.commit_lanes(log_batch_size),
         merkle_hash: Default::default(),
     }
+}
+
+fn union_pcs_params(union: &UnionInstance<'_>) -> PcsParams {
+    union_pcs_params_with_profile(union, LigeritoProfile::Fast)
 }
 
 fn random_blake3_inputs(rng: &mut Rng, n: usize) -> Vec<blake3::Compression> {
@@ -258,6 +259,134 @@ fn element_only_union_roundtrip() {
         assert_eq!(&c.c_point[..nu], &c.lc_point[..nu]);
         assert_eq!(c.c_point.len(), registry.m_total() - 7);
     }
+}
+
+/// The production element path under `Secure`: native proving, native
+/// verification, and the merged opening all see the element PIOP's PoW
+/// witnesses.  The recursive-node test separately consumes this same proof
+/// shape inside its Boolean R1CS verifier.
+#[test]
+#[ignore] // Run with `cargo test --release -p flock-prover --test union_element secure_profile_grinds_element_piops -- --ignored`.
+fn secure_profile_grinds_element_piops() {
+    let (nu, kappa, n) = (12usize, 3usize, 2731usize);
+    let (w0, w1) = (F128::new(0x128, 0), F128::new(0, 0xE1E));
+    let ty = gate_block(kappa, w0, w1);
+    let registry = Registry::new(vec![TableType::element(ty.clone())], nu);
+    let union = UnionInstance::new(&registry, vec![n]);
+    let pcs_params = union_pcs_params_with_profile(&union, LigeritoProfile::Secure);
+    let mut rng = Rng::new(0x128_E1E_0002);
+    let z = gate_witness(&ty, nu, n, w0, w1, &mut rng);
+
+    let mut ch_p = FsChallenger::new(DOMAIN);
+    let (proof, commitment, claims_p) = prover::prove_fast_ligerito_union_mixed_class(
+        &union,
+        &pcs_params,
+        Vec::new(),
+        vec![UnionElementSlotInput::new(move |dst: &mut [F128]| {
+            dst.copy_from_slice(&z)
+        })],
+        &mut ch_p,
+    );
+    let el = proof.element.as_ref().expect("element proof");
+    let grinding = pcs_params.element_grinding();
+    let e_vars = union.m_elem() - 7;
+    assert_eq!(
+        el.zerocheck.grinding_nonces.len(),
+        grinding.zerocheck_nonce_count(e_vars)
+    );
+    assert_eq!(
+        el.lincheck.grinding_nonces.len(),
+        grinding.lincheck_nonce_count(e_vars - nu)
+    );
+    // The merged PCS transport contributes its own independent grinding
+    // witnesses: one PoW gates the vector squeeze for both packed-direct
+    // claim-batching coefficients in this element-only proof, followed by one
+    // dense sumcheck witness per round and the multipoint
+    // batching/round/anchor witnesses.  This keeps the test from only
+    // exercising the element PIOP half of Secure.
+    let open = &proof.pcs_open;
+    let opening_grinding = pcs_params.opening_grinding();
+    assert!(open.ring_switches.is_empty(), "element-only has no RS claims");
+    assert_eq!(
+        open.batching_nonces.len(),
+        1,
+        "one PoW gates the c/lincheck coefficient-vector squeeze"
+    );
+    assert_eq!(
+        open.merged_round_nonces.len(),
+        open.merged_rounds.len(),
+        "one PoW before every dense quadratic-round challenge"
+    );
+    assert_eq!(
+        open.frobenius.round_grinding_nonces.len(),
+        open.frobenius.rounds.len(),
+        "one PoW before every multipoint quadratic-round challenge"
+    );
+    assert_eq!(
+        open.frobenius.anchor.grinding_nonces.len(),
+        open.frobenius.anchor.rounds.len(),
+        "one PoW before every Frobenius-anchor quadratic-round challenge"
+    );
+    assert!(opening_grinding.claim_batch_bits > 0);
+    assert!(opening_grinding.merged_round_bits > 0);
+    assert!(opening_grinding.multipoint.gamma_bits > 0);
+
+    let verify = |p: &R1csProofMixedClassMerged| {
+        let mut ch = FsChallenger::new(DOMAIN);
+        verifier::verify_ligerito_union_mixed_class(
+            &union,
+            &[],
+            &commitment,
+            p,
+            &pcs_params,
+            &mut ch,
+        )
+    };
+    assert_eq!(verify(&proof).expect("honest proof"), claims_p);
+
+    let mut missing = proof.clone();
+    missing
+        .element
+        .as_mut()
+        .expect("element proof")
+        .lincheck
+        .grinding_nonces
+        .pop();
+    assert!(verify(&missing).is_err(), "missing element PoW must reject");
+
+    let mut missing_batch = proof.clone();
+    missing_batch.pcs_open.batching_nonces.pop();
+    assert!(verify(&missing_batch).is_err(), "missing PCS batching PoW must reject");
+
+    let mut missing_merged = proof.clone();
+    missing_merged.pcs_open.merged_round_nonces.pop();
+    assert!(
+        verify(&missing_merged).is_err(),
+        "missing dense-sumcheck PoW must reject"
+    );
+
+    let mut missing_multipoint = proof.clone();
+    missing_multipoint
+        .pcs_open
+        .frobenius
+        .round_grinding_nonces
+        .pop();
+    assert!(
+        verify(&missing_multipoint).is_err(),
+        "missing multipoint-sumcheck PoW must reject"
+    );
+
+    let mut missing_anchor = proof.clone();
+    missing_anchor
+        .pcs_open
+        .frobenius
+        .anchor
+        .grinding_nonces
+        .pop();
+    assert!(
+        verify(&missing_anchor).is_err(),
+        "missing Frobenius-anchor PoW must reject"
+    );
 }
 
 /// The element claims are discharged by the **opening**, not just by the PIOP.

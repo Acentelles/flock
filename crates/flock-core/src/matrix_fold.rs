@@ -200,6 +200,42 @@ pub struct FoldProof {
     /// Row phase (second): one sumcheck against the shared marginal.
     pub row_rounds: Vec<(F128, F128)>,
     pub value: F128,
+    /// PoW witnesses in transcript order: lambda-vector, column rounds,
+    /// mu-vector, then row rounds.
+    #[serde(default)]
+    pub grinding_nonces: Vec<u64>,
+}
+
+/// Fiat--Shamir grinding schedule shared by dense, sigma, and jagged folds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FoldGrinding {
+    /// One grind protects each whole vector of independent linear batching
+    /// coefficients (lambda, then mu).
+    pub combination_bits: u32,
+    /// Each column/row sumcheck challenge evaluates a quadratic polynomial.
+    pub round_bits: u32,
+}
+
+impl FoldGrinding {
+    pub const fn disabled() -> Self {
+        Self {
+            combination_bits: 0,
+            round_bits: 0,
+        }
+    }
+
+    pub const fn per_challenge_128() -> Self {
+        Self {
+            combination_bits: 1,
+            round_bits: 2,
+        }
+    }
+
+    #[inline]
+    fn nonce_count(self, k_row: usize, k_col: usize) -> usize {
+        2 * usize::from(self.combination_bits != 0)
+            + (k_row + k_col) * usize::from(self.round_bits != 0)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -208,6 +244,8 @@ pub enum FoldError {
     Malformed,
     /// A sumcheck's final value disagreed with the claimed factors.
     ConsistencyFailed { which: &'static str },
+    /// Grinding witnesses did not have the configured shape or failed PoW.
+    InvalidGrinding,
 }
 
 /// One degree-2 round over `k` pairs, λ-combined: returns `(q(1), q(∞))` for
@@ -244,12 +282,21 @@ fn fold_low(v: &mut Vec<F128>, r: F128) {
 fn replay_rounds<Ch: Challenger>(
     rounds: &[(F128, F128)],
     mut running: F128,
+    proof_nonces: &[u64],
+    nonce_idx: &mut usize,
+    round_bits: u32,
     ch: &mut Ch,
-) -> (F128, Vec<F128>) {
+) -> Result<(F128, Vec<F128>), FoldError> {
     let mut rho = Vec::with_capacity(rounds.len());
     for &(q1, qinf) in rounds {
         ch.observe_f128(q1);
         ch.observe_f128(qinf);
+        if round_bits != 0 {
+            if !ch.verify_pow(proof_nonces[*nonce_idx], round_bits) {
+                return Err(FoldError::InvalidGrinding);
+            }
+            *nonce_idx += 1;
+        }
         let r = ch.sample_f128();
         // char 2: q(0) = running + q(1); q(X) = qinf·X² + c1·X + q(0).
         let q0 = running + q1;
@@ -257,7 +304,30 @@ fn replay_rounds<Ch: Challenger>(
         running = qinf * r * r + c1 * r + q0;
         rho.push(r);
     }
-    (running, rho)
+    Ok((running, rho))
+}
+
+#[inline]
+fn grind_if<Ch: Challenger>(ch: &mut Ch, nonces: &mut Vec<u64>, bits: u32) {
+    if bits != 0 {
+        nonces.push(ch.grind_pow(bits));
+    }
+}
+
+#[inline]
+fn verify_grind<Ch: Challenger>(
+    ch: &mut Ch,
+    nonces: &[u64],
+    nonce_idx: &mut usize,
+    bits: u32,
+) -> Result<(), FoldError> {
+    if bits != 0 {
+        if !ch.verify_pow(nonces[*nonce_idx], bits) {
+            return Err(FoldError::InvalidGrinding);
+        }
+        *nonce_idx += 1;
+    }
+    Ok(())
 }
 
 /// Bind the claims into the transcript — weights included, not just values.
@@ -285,6 +355,17 @@ pub fn prove_fold<Ch: Challenger>(
     claims: &[MatrixClaim],
     ch: &mut Ch,
 ) -> (FoldProof, MatrixClaim) {
+    prove_fold_with_grinding(m, combs, claims, FoldGrinding::disabled(), ch)
+}
+
+/// [`prove_fold`] with an explicit Fiat--Shamir grinding policy.
+pub fn prove_fold_with_grinding<Ch: Challenger>(
+    m: &dyn FoldMatrix,
+    combs: &[Vec<F128>],
+    claims: &[MatrixClaim],
+    grinding: FoldGrinding,
+    ch: &mut Ch,
+) -> (FoldProof, MatrixClaim) {
     assert!(!claims.is_empty(), "nothing to fold");
     assert_eq!(combs.len(), claims.len(), "one column marginal per claim");
     let k_row = claims[0].row.n_vars();
@@ -294,8 +375,10 @@ pub fn prove_fold<Ch: Challenger>(
         assert_eq!(c.col.n_vars(), k_col, "claims must share the column arity");
     }
 
+    let mut grinding_nonces = Vec::with_capacity(grinding.nonce_count(k_row, k_col));
     observe_claims(claims, ch);
-    let lambdas: Vec<F128> = (0..claims.len()).map(|_| ch.sample_f128()).collect();
+    grind_if(ch, &mut grinding_nonces, grinding.combination_bits);
+    let lambdas = ch.sample_f128_vec(claims.len());
 
     // Column phase: Σ_c Σ_i λ_i·col_i(c)·comb_i(c). `combs` is the k·nnz
     // work, done by the caller with the type's tuned kernel.
@@ -315,6 +398,7 @@ pub fn prove_fold<Ch: Challenger>(
         let msg = round_message(&pairs, &lambdas);
         ch.observe_f128(msg.0);
         ch.observe_f128(msg.1);
+        grind_if(ch, &mut grinding_nonces, grinding.round_bits);
         let r = ch.sample_f128();
         col_rounds.push(msg);
         rho_col.push(r);
@@ -331,7 +415,8 @@ pub fn prove_fold<Ch: Challenger>(
     // Row phase. Every bridge value reads against the same h(r) = M̂(r, ρ_col),
     // so ONE marginal serves all k — the only pass this function makes over
     // the matrix itself.
-    let mus: Vec<F128> = (0..claims.len()).map(|_| ch.sample_f128()).collect();
+    grind_if(ch, &mut grinding_nonces, grinding.combination_bits);
+    let mus = ch.sample_f128_vec(claims.len());
     let eq_col = Weight::eq(rho_col.clone()).materialize();
     let h = m.row_marginal(&eq_col, 1usize << k_row);
     let mut w_mu = vec![F128::ZERO; 1usize << k_row];
@@ -349,6 +434,7 @@ pub fn prove_fold<Ch: Challenger>(
         let msg = round_message(&row_pairs, &one);
         ch.observe_f128(msg.0);
         ch.observe_f128(msg.1);
+        grind_if(ch, &mut grinding_nonces, grinding.round_bits);
         let r = ch.sample_f128();
         row_rounds.push(msg);
         rho_row.push(r);
@@ -366,6 +452,7 @@ pub fn prove_fold<Ch: Challenger>(
             bridge,
             row_rounds,
             value,
+            grinding_nonces,
         },
         MatrixClaim {
             row: Weight::eq(rho_row),
@@ -565,6 +652,16 @@ pub fn verify_fold<Ch: Challenger>(
     proof: &FoldProof,
     ch: &mut Ch,
 ) -> Result<MatrixClaim, FoldError> {
+    verify_fold_with_grinding(claims, proof, FoldGrinding::disabled(), ch)
+}
+
+/// [`verify_fold`] with an explicit Fiat--Shamir grinding policy.
+pub fn verify_fold_with_grinding<Ch: Challenger>(
+    claims: &[MatrixClaim],
+    proof: &FoldProof,
+    grinding: FoldGrinding,
+    ch: &mut Ch,
+) -> Result<MatrixClaim, FoldError> {
     if claims.is_empty() || proof.bridge.len() != claims.len() {
         return Err(FoldError::Malformed);
     }
@@ -579,15 +676,33 @@ pub fn verify_fold<Ch: Challenger>(
         return Err(FoldError::Malformed);
     }
 
+    if proof.grinding_nonces.len() != grinding.nonce_count(k_row, k_col) {
+        return Err(FoldError::InvalidGrinding);
+    }
+    let mut nonce_idx = 0usize;
+
     observe_claims(claims, ch);
-    let lambdas: Vec<F128> = (0..claims.len()).map(|_| ch.sample_f128()).collect();
+    verify_grind(
+        ch,
+        &proof.grinding_nonces,
+        &mut nonce_idx,
+        grinding.combination_bits,
+    )?;
+    let lambdas = ch.sample_f128_vec(claims.len());
 
     // Column sumcheck: target is the λ-combination of the claimed values.
     let target = claims
         .iter()
         .zip(&lambdas)
         .fold(F128::ZERO, |acc, (c, &l)| acc + l * c.value);
-    let (running, rho_col) = replay_rounds(&proof.col_rounds, target, ch);
+    let (running, rho_col) = replay_rounds(
+        &proof.col_rounds,
+        target,
+        &proof.grinding_nonces,
+        &mut nonce_idx,
+        grinding.round_bits,
+        ch,
+    )?;
     for &v in &proof.bridge {
         ch.observe_f128(v);
     }
@@ -603,13 +718,26 @@ pub fn verify_fold<Ch: Challenger>(
     }
 
     // Row sumcheck: target is the μ-combination of the bridge values.
-    let mus: Vec<F128> = (0..claims.len()).map(|_| ch.sample_f128()).collect();
+    verify_grind(
+        ch,
+        &proof.grinding_nonces,
+        &mut nonce_idx,
+        grinding.combination_bits,
+    )?;
+    let mus = ch.sample_f128_vec(claims.len());
     let target = proof
         .bridge
         .iter()
         .zip(&mus)
         .fold(F128::ZERO, |acc, (&g, &m)| acc + m * g);
-    let (running, rho_row) = replay_rounds(&proof.row_rounds, target, ch);
+    let (running, rho_row) = replay_rounds(
+        &proof.row_rounds,
+        target,
+        &proof.grinding_nonces,
+        &mut nonce_idx,
+        grinding.round_bits,
+        ch,
+    )?;
     let w_mu = claims
         .iter()
         .zip(&mus)
@@ -618,6 +746,7 @@ pub fn verify_fold<Ch: Challenger>(
         return Err(FoldError::ConsistencyFailed { which: "row" });
     }
     ch.observe_f128(proof.value);
+    debug_assert_eq!(nonce_idx, proof.grinding_nonces.len());
 
     Ok(MatrixClaim {
         row: Weight::eq(rho_row),
@@ -955,6 +1084,16 @@ pub fn prove_fold_jagged<Ch: Challenger>(
     claims: &[JaggedClaim],
     ch: &mut Ch,
 ) -> (FoldProof, MatrixClaim) {
+    prove_fold_jagged_with_grinding(t, claims, FoldGrinding::disabled(), ch)
+}
+
+/// [`prove_fold_jagged`] with an explicit Fiat--Shamir grinding policy.
+pub fn prove_fold_jagged_with_grinding<Ch: Challenger>(
+    t: &JaggedTable,
+    claims: &[JaggedClaim],
+    grinding: FoldGrinding,
+    ch: &mut Ch,
+) -> (FoldProof, MatrixClaim) {
     assert!(!claims.is_empty(), "nothing to fold");
     let n_col = t.n_col_vars();
     for c in claims {
@@ -962,8 +1101,10 @@ pub fn prove_fold_jagged<Ch: Challenger>(
         assert_eq!(c.col.len(), n_col, "claims must share the column arity");
     }
 
+    let mut grinding_nonces = Vec::with_capacity(grinding.nonce_count(t.k, n_col));
     observe_jagged_claims(t.k, claims, ch);
-    let lambdas: Vec<F128> = (0..claims.len()).map(|_| ch.sample_f128()).collect();
+    grind_if(ch, &mut grinding_nonces, grinding.combination_bits);
+    let lambdas = ch.sample_f128_vec(claims.len());
 
     // Column phase, sparse: per claim, `comb_i` has one entry per run with a
     // nonzero row-weight mass. The claim's own eq tensor over the pair space
@@ -1024,6 +1165,7 @@ pub fn prove_fold_jagged<Ch: Challenger>(
         }
         ch.observe_f128(q1);
         ch.observe_f128(qinf);
+        grind_if(ch, &mut grinding_nonces, grinding.round_bits);
         let r = ch.sample_f128();
         col_rounds.push((q1, qinf));
         rho_col.push(r);
@@ -1049,7 +1191,8 @@ pub fn prove_fold_jagged<Ch: Challenger>(
 
     // Row phase — dense over the small `2^k` side, the machinery above
     // verbatim. `h(y) = Ĵ(y, ρ_col)` is one eq factor per run, broadcast.
-    let mus: Vec<F128> = (0..claims.len()).map(|_| ch.sample_f128()).collect();
+    grind_if(ch, &mut grinding_nonces, grinding.combination_bits);
+    let mus = ch.sample_f128_vec(claims.len());
     let mut h = vec![F128::ZERO; 1usize << t.k];
     let mut y = 0usize;
     for &(t_c, t_next, run) in &t.bounds {
@@ -1072,6 +1215,7 @@ pub fn prove_fold_jagged<Ch: Challenger>(
         let msg = round_message(&row_pairs, &one);
         ch.observe_f128(msg.0);
         ch.observe_f128(msg.1);
+        grind_if(ch, &mut grinding_nonces, grinding.round_bits);
         let r = ch.sample_f128();
         row_rounds.push(msg);
         rho_row.push(r);
@@ -1089,6 +1233,7 @@ pub fn prove_fold_jagged<Ch: Challenger>(
             bridge,
             row_rounds,
             value,
+            grinding_nonces,
         },
         MatrixClaim {
             row: Weight::eq(rho_row),
@@ -1107,6 +1252,17 @@ pub fn verify_fold_jagged<Ch: Challenger>(
     proof: &FoldProof,
     ch: &mut Ch,
 ) -> Result<MatrixClaim, FoldError> {
+    verify_fold_jagged_with_grinding(k_row, claims, proof, FoldGrinding::disabled(), ch)
+}
+
+/// [`verify_fold_jagged`] with an explicit Fiat--Shamir grinding policy.
+pub fn verify_fold_jagged_with_grinding<Ch: Challenger>(
+    k_row: usize,
+    claims: &[JaggedClaim],
+    proof: &FoldProof,
+    grinding: FoldGrinding,
+    ch: &mut Ch,
+) -> Result<MatrixClaim, FoldError> {
     if claims.is_empty() || proof.bridge.len() != claims.len() {
         return Err(FoldError::Malformed);
     }
@@ -1120,14 +1276,32 @@ pub fn verify_fold_jagged<Ch: Challenger>(
         return Err(FoldError::Malformed);
     }
 
+    if proof.grinding_nonces.len() != grinding.nonce_count(k_row, n_col) {
+        return Err(FoldError::InvalidGrinding);
+    }
+    let mut nonce_idx = 0usize;
+
     observe_jagged_claims(k_row, claims, ch);
-    let lambdas: Vec<F128> = (0..claims.len()).map(|_| ch.sample_f128()).collect();
+    verify_grind(
+        ch,
+        &proof.grinding_nonces,
+        &mut nonce_idx,
+        grinding.combination_bits,
+    )?;
+    let lambdas = ch.sample_f128_vec(claims.len());
 
     let target = claims
         .iter()
         .zip(&lambdas)
         .fold(F128::ZERO, |acc, (c, &l)| acc + l * c.value);
-    let (running, rho_col) = replay_rounds(&proof.col_rounds, target, ch);
+    let (running, rho_col) = replay_rounds(
+        &proof.col_rounds,
+        target,
+        &proof.grinding_nonces,
+        &mut nonce_idx,
+        grinding.round_bits,
+        ch,
+    )?;
     for &v in &proof.bridge {
         ch.observe_f128(v);
     }
@@ -1149,13 +1323,26 @@ pub fn verify_fold_jagged<Ch: Challenger>(
         return Err(FoldError::ConsistencyFailed { which: "col" });
     }
 
-    let mus: Vec<F128> = (0..claims.len()).map(|_| ch.sample_f128()).collect();
+    verify_grind(
+        ch,
+        &proof.grinding_nonces,
+        &mut nonce_idx,
+        grinding.combination_bits,
+    )?;
+    let mus = ch.sample_f128_vec(claims.len());
     let target = proof
         .bridge
         .iter()
         .zip(&mus)
         .fold(F128::ZERO, |acc, (&g, &m)| acc + m * g);
-    let (running, rho_row) = replay_rounds(&proof.row_rounds, target, ch);
+    let (running, rho_row) = replay_rounds(
+        &proof.row_rounds,
+        target,
+        &proof.grinding_nonces,
+        &mut nonce_idx,
+        grinding.round_bits,
+        ch,
+    )?;
     let w_mu = claims
         .iter()
         .zip(&mus)
@@ -1164,6 +1351,7 @@ pub fn verify_fold_jagged<Ch: Challenger>(
         return Err(FoldError::ConsistencyFailed { which: "row" });
     }
     ch.observe_f128(proof.value);
+    debug_assert_eq!(nonce_idx, proof.grinding_nonces.len());
 
     Ok(MatrixClaim {
         row: Weight::eq(rho_row),
@@ -1332,6 +1520,70 @@ mod tests {
         let mut chv = FsChallenger::new(D);
         let root = verify_fold(&acc, &proof, &mut chv).expect("level-1 fold");
         assert!(root.check_direct(&m), "the root claim must be true");
+    }
+
+    #[test]
+    fn dense_grinding_roundtrip_and_rejects_bad_nonce_shape() {
+        let k = 5;
+        let m = matrix(k, 4, 0x1280_D35E);
+        let mut rng = Rng(0x1280_F01D);
+        let claims: Vec<MatrixClaim> =
+            (0..3).map(|_| honest_claim(&m, k, 3, &mut rng)).collect();
+        let combs = gen_combs(&m, &claims);
+        let policy = FoldGrinding::per_challenge_128();
+        let mut chp = FsChallenger::new(b"matrix-fold-grinding-test");
+        let (proof, out_p) = prove_fold_with_grinding(&m, &combs, &claims, policy, &mut chp);
+        assert_eq!(proof.grinding_nonces.len(), policy.nonce_count(k, k));
+
+        let mut chv = FsChallenger::new(b"matrix-fold-grinding-test");
+        let out_v = verify_fold_with_grinding(&claims, &proof, policy, &mut chv)
+            .expect("grinded dense fold verifies");
+        assert_eq!(out_p, out_v);
+        assert!(out_v.check_direct(&m));
+
+        let mut missing = proof;
+        missing.grinding_nonces.pop();
+        let mut chv = FsChallenger::new(b"matrix-fold-grinding-test");
+        assert_eq!(
+            verify_fold_with_grinding(&claims, &missing, policy, &mut chv),
+            Err(FoldError::InvalidGrinding)
+        );
+    }
+
+    #[test]
+    fn jagged_grinding_roundtrip_and_rejects_bad_nonce_shape() {
+        let params = crate::pcs::jagged::JaggedParams::from_heights(&[2, 3, 1, 2], 2, 4);
+        let table = JaggedTable::from_params(&params);
+        let mut rng = Rng(0x1280_1A66);
+        let claims = vec![
+            JaggedClaim::honest(
+                JaggedRowWeight::eq((0..table.k).map(|_| rng.f128()).collect()),
+                (0..table.n_col_vars()).map(|_| rng.f128()).collect(),
+                &table,
+            ),
+            JaggedClaim::honest(
+                JaggedRowWeight::Combo(vec![(rng.f128(), 0), (rng.f128(), 3)]),
+                (0..table.n_col_vars()).map(|_| rng.f128()).collect(),
+                &table,
+            ),
+        ];
+        let policy = FoldGrinding::per_challenge_128();
+        let mut chp = FsChallenger::new(b"jagged-fold-grinding-test");
+        let (proof, out_p) =
+            prove_fold_jagged_with_grinding(&table, &claims, policy, &mut chp);
+        let mut chv = FsChallenger::new(b"jagged-fold-grinding-test");
+        let out_v = verify_fold_jagged_with_grinding(table.k, &claims, &proof, policy, &mut chv)
+            .expect("grinded jagged fold verifies");
+        assert_eq!(out_p, out_v);
+        assert!(discharge_jagged(&out_v, &table));
+
+        let mut missing = proof;
+        missing.grinding_nonces.pop();
+        let mut chv = FsChallenger::new(b"jagged-fold-grinding-test");
+        assert_eq!(
+            verify_fold_jagged_with_grinding(table.k, &claims, &missing, policy, &mut chv),
+            Err(FoldError::InvalidGrinding)
+        );
     }
 
     /// A false input claim must not survive: the fold either rejects, or emits

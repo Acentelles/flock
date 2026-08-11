@@ -549,6 +549,70 @@ fn two_type_union_lincheck_matches_brute_force() {
         ),
         "corrupted pinned-slot count must be rejected"
     );
+
+    // The grinded multi-table path has the same relation but a different
+    // transcript: α, the one pinned table's β, every sumcheck round, then
+    // the φ8 skip point are all preceded by a PoW witness.
+    let grinding = lincheck::LincheckGrinding::per_challenge_128();
+    let mut ch_p_secure = FsChallenger::new(b"flock-union-lincheck-secure-v0");
+    let (zc_proof_secure, zc_claim_secure) =
+        zerocheck::prove_packed_padded(&a_p, &b_p, &c_p, m, &padding, &mut ch_p_secure);
+    let x_ab_secure = union.x_ab_from_mlv(
+        zc_claim_secure.z,
+        &zc_claim_secure.mlv_challenges,
+    );
+    let (lc_proof_secure, lc_claim_secure, _) =
+        lincheck::prove_union_capture_z_vec_with_grinding(
+            &union,
+            &lc_slots,
+            &x_ab_secure,
+            grinding,
+            &mut ch_p_secure,
+        );
+    assert_eq!(
+        lc_proof_secure.grinding_nonces.len(),
+        grinding.nonce_count(registry.m_bool() - nu - K_SKIP, 1, K_SKIP),
+    );
+
+    let mut ch_v_secure = FsChallenger::new(b"flock-union-lincheck-secure-v0");
+    let zc_claim_secure_v = zerocheck::verify(m, &zc_proof_secure, &mut ch_v_secure)
+        .expect("ungrinded zerocheck side must verify");
+    let x_ab_secure_v = union.x_ab_from_mlv(
+        zc_claim_secure_v.z,
+        &zc_claim_secure_v.mlv_challenges,
+    );
+    let lc_claim_secure_v = lincheck::verify_union_with_grinding(
+        &union,
+        &circuits,
+        &x_ab_secure_v,
+        zc_claim_secure_v.a_eval,
+        zc_claim_secure_v.b_eval,
+        &lc_proof_secure,
+        grinding,
+        &mut ch_v_secure,
+    )
+    .expect("grinded union lincheck must verify");
+    assert_eq!(lc_claim_secure_v, lc_claim_secure);
+
+    let mut missing_nonce = lc_proof_secure.clone();
+    missing_nonce.grinding_nonces.pop();
+    let mut ch_missing = FsChallenger::new(b"flock-union-lincheck-secure-v0");
+    let zc_missing = zerocheck::verify(m, &zc_proof_secure, &mut ch_missing)
+        .expect("ungrinded zerocheck side must verify");
+    let x_missing = union.x_ab_from_mlv(zc_missing.z, &zc_missing.mlv_challenges);
+    assert!(matches!(
+        lincheck::verify_union_with_grinding(
+            &union,
+            &circuits,
+            &x_missing,
+            zc_missing.a_eval,
+            zc_missing.b_eval,
+            &missing_nonce,
+            grinding,
+            &mut ch_missing,
+        ),
+        Err(lincheck::VerifyError::BadGrindingNonceCount { .. })
+    ));
 }
 
 /// The deferred split is behaviour-preserving, and the deferred half really

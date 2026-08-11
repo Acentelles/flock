@@ -82,7 +82,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use super::lincheck::{column_sumcheck_prove, column_sumcheck_replay};
-use super::{ElementTableType, zerocheck};
+use super::{ElementTableType, Grinding, zerocheck};
 use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::matrix_fold::MatrixClaim;
@@ -181,6 +181,15 @@ pub enum VerifyError {
         expected: usize,
         got: usize,
     },
+    /// The element lincheck's α/round PoW witness vector has the wrong
+    /// transcript-determined length.
+    LincheckGrindingNonceCount {
+        expected: usize,
+        got: usize,
+    },
+    /// A lincheck PoW witness did not satisfy the difficulty that protects
+    /// its following Fiat--Shamir challenge.
+    LincheckGrindingInvalid { which: &'static str },
     /// The lincheck's final consistency check `running == Ĉomb(r'_col)·z_eval`
     /// failed.
     LincheckFinalFailed,
@@ -202,6 +211,17 @@ pub fn prove<C: Challenger>(
     pb: &[F128],
     ch: &mut C,
 ) -> (Proof, Claims) {
+    prove_with_grinding(union, z, pa, pb, Grinding::disabled(), ch)
+}
+
+pub fn prove_with_grinding<C: Challenger>(
+    union: &UnionInstance<'_>,
+    z: &[F128],
+    pa: &[F128],
+    pb: &[F128],
+    grinding: Grinding,
+    ch: &mut C,
+) -> (Proof, Claims) {
     let slots = region_slots(union);
     let (nu, e_vars) = (union.n_log(), union.m_elem() - 7);
     assert!(
@@ -214,12 +234,17 @@ pub fn prove<C: Challenger>(
     // support so the row rounds cost `O(Σ n_t · used_cols)` instead of
     // `O(2^E)`. Bit-identical to the dense path — see `zerocheck::RowSupport`.
     let support = row_support(&slots, nu, e_vars);
-    let (zc_proof, zc) =
-        zerocheck::prove_with_support(ZC_LABEL, pa, pb, z, e_vars, nu, Some(&support), ch);
+    let (zc_proof, zc) = zerocheck::prove_with_support_with_grinding(
+        ZC_LABEL, pa, pb, z, e_vars, nu, Some(&support), grinding, ch,
+    );
     let (va, vb) = strip_constants(&slots, nu, &zc);
 
     // ---- Phase 2: the column-domain lincheck with the per-slot collapse.
     ch.observe_label(LC_LABEL);
+    let mut grinding_nonces = Vec::with_capacity(grinding.lincheck_nonce_count(e_vars - nu));
+    if let Some(bits) = grinding.alpha_bits() {
+        grinding_nonces.push(ch.grind_pow(bits));
+    }
     let alpha = ch.sample_f128();
     let mut comb = region_comb(&slots, nu, e_vars, alpha, &zc.r);
     let mut g = collapse_rows(z, &zc.r[..nu], Some(&support.live));
@@ -230,7 +255,8 @@ pub fn prove<C: Challenger>(
         va + alpha * vb,
         "region lincheck target must be the honest weighted inner product"
     );
-    let (lc_rounds, bind_order) = column_sumcheck_prove(&mut comb, &mut g, ch);
+    let (lc_rounds, bind_order) =
+        column_sumcheck_prove(&mut comb, &mut g, grinding, &mut grinding_nonces, ch);
     debug_assert_eq!(g.len(), 1);
     // The matrix work, reported rather than left for the verifier to redo:
     // per slot the UNSCALED pair (⟨W,A_0⟩, ⟨W,B_0⟩) at the row point the
@@ -243,6 +269,7 @@ pub fn prove<C: Challenger>(
         rounds: lc_rounds,
         z_eval: g[0],
         matrix_evals,
+        grinding_nonces,
     };
 
     let claims = assemble_claims(union, &zc, &bind_order, g[0]);
@@ -261,7 +288,16 @@ pub fn verify<C: Challenger>(
     proof: &Proof,
     ch: &mut C,
 ) -> Result<Claims, VerifyError> {
-    let (claims, assertion) = verify_deferred(union, proof, ch)?;
+    verify_with_grinding(union, proof, Grinding::disabled(), ch)
+}
+
+pub fn verify_with_grinding<C: Challenger>(
+    union: &UnionInstance<'_>,
+    proof: &Proof,
+    grinding: Grinding,
+    ch: &mut C,
+) -> Result<Claims, VerifyError> {
+    let (claims, assertion) = verify_deferred_with_grinding(union, proof, grinding, ch)?;
     assertion.check_reported(union)?;
     Ok(claims)
 }
@@ -271,6 +307,15 @@ pub fn verify<C: Challenger>(
 pub fn verify_deferred<C: Challenger>(
     union: &UnionInstance<'_>,
     proof: &Proof,
+    ch: &mut C,
+) -> Result<(Claims, ElementAssertion), VerifyError> {
+    verify_deferred_with_grinding(union, proof, Grinding::disabled(), ch)
+}
+
+pub fn verify_deferred_with_grinding<C: Challenger>(
+    union: &UnionInstance<'_>,
+    proof: &Proof,
+    grinding: Grinding,
     ch: &mut C,
 ) -> Result<(Claims, ElementAssertion), VerifyError> {
     let slots = region_slots(union);
@@ -287,13 +332,47 @@ pub fn verify_deferred<C: Challenger>(
         });
     }
 
-    let zc = zerocheck::verify_with_label(ZC_LABEL, e_vars, &proof.zerocheck, ch)
+    let zc = zerocheck::verify_with_label_and_grinding(
+        ZC_LABEL,
+        e_vars,
+        &proof.zerocheck,
+        grinding,
+        ch,
+    )
         .map_err(VerifyError::Zerocheck)?;
     let (va, vb) = strip_constants(&slots, nu, &zc);
 
     ch.observe_label(LC_LABEL);
+    let expected_nonces = grinding.lincheck_nonce_count(lc_rounds);
+    if proof.lincheck.grinding_nonces.len() != expected_nonces {
+        return Err(VerifyError::LincheckGrindingNonceCount {
+            expected: expected_nonces,
+            got: proof.lincheck.grinding_nonces.len(),
+        });
+    }
+    let mut nonce_idx = 0;
+    if let Some(bits) = grinding.alpha_bits() {
+        if !ch.verify_pow(proof.lincheck.grinding_nonces[nonce_idx], bits) {
+            return Err(VerifyError::LincheckGrindingInvalid { which: "alpha" });
+        }
+        nonce_idx += 1;
+    }
     let alpha = ch.sample_f128();
-    let (running, bind_order) = column_sumcheck_replay(va + alpha * vb, &proof.lincheck.rounds, ch);
+    let (running, bind_order) = column_sumcheck_replay(
+        va + alpha * vb,
+        &proof.lincheck.rounds,
+        grinding,
+        &proof.lincheck.grinding_nonces,
+        &mut nonce_idx,
+        ch,
+    )
+    .map_err(|err| match err {
+        super::lincheck::VerifyError::InvalidGrindingNonce { which } => {
+            VerifyError::LincheckGrindingInvalid { which }
+        }
+        _ => VerifyError::LincheckFinalFailed,
+    })?;
+    debug_assert_eq!(nonce_idx, proof.lincheck.grinding_nonces.len());
 
     // Final check: `Ĉomb(r'_col) · z_eval`. Evaluated by the closed form —
     // per-slot comb MLE times the "the bound point addresses slot t" prefix-eq
@@ -1162,6 +1241,71 @@ mod tests {
             let lo = m_words - prefix.len();
             assert_eq!(&claims_v.c_point[lo..], &prefix[..]);
         }
+    }
+
+    /// The union-region path is what the production mixed prover uses.  Pin
+    /// its Secure policy separately from the standalone API: the element
+    /// zerocheck protects tau and every round, while the lincheck protects
+    /// alpha and every column sumcheck round.
+    #[test]
+    fn grinded_region_roundtrip_and_rejects_missing_nonce() {
+        let mut rng = Rng::new(0x128_E1E_2044);
+        let nu = 3usize;
+        let cases = vec![mixed_case(&mut rng), mult_case(2)];
+        let h = build(vec![(10, 700)], &cases, nu, &[5, 6], &mut rng);
+        let union = UnionInstance::new(&h.registry, h.counts.clone());
+        let z = region(&union, &h.z).to_vec();
+        let pa = region(&union, &h.pa).to_vec();
+        let pb = region(&union, &h.pb).to_vec();
+        let grinding = Grinding::per_challenge_128();
+        let e_vars = union.m_elem() - 7;
+        let lc_rounds = e_vars - nu;
+
+        let mut ch_p = FsChallenger::new(b"element-region-grinding");
+        let (proof, claims_p) = prove_with_grinding(
+            &union, &z, &pa, &pb, grinding, &mut ch_p,
+        );
+        assert_eq!(
+            proof.zerocheck.grinding_nonces.len(),
+            grinding.zerocheck_nonce_count(e_vars)
+        );
+        assert_eq!(
+            proof.lincheck.grinding_nonces.len(),
+            grinding.lincheck_nonce_count(lc_rounds)
+        );
+
+        let mut ch_v = FsChallenger::new(b"element-region-grinding");
+        assert_eq!(
+            verify_with_grinding(&union, &proof, grinding, &mut ch_v).expect("honest proof"),
+            claims_p
+        );
+
+        let mut bad = proof.clone();
+        bad.lincheck.grinding_nonces.pop();
+        let mut ch_v = FsChallenger::new(b"element-region-grinding");
+        assert!(matches!(
+            verify_with_grinding(&union, &bad, grinding, &mut ch_v),
+            Err(VerifyError::LincheckGrindingNonceCount { .. })
+        ));
+
+        // The α nonce is checked before alpha is squeezed.  The scan finds a
+        // nonce that fails that 1-bit predicate without relying on a lucky
+        // hard-coded value for this transcript state.
+        let original = proof.lincheck.grinding_nonces[0];
+        let mut rejected_bad_nonce = false;
+        for delta in 1..=64u64 {
+            let mut bad = proof.clone();
+            bad.lincheck.grinding_nonces[0] = original.wrapping_add(delta);
+            let mut ch_v = FsChallenger::new(b"element-region-grinding");
+            if matches!(
+                verify_with_grinding(&union, &bad, grinding, &mut ch_v),
+                Err(VerifyError::LincheckGrindingInvalid { which: "alpha" })
+            ) {
+                rejected_bad_nonce = true;
+                break;
+            }
+        }
+        assert!(rejected_bad_nonce, "a changed alpha PoW nonce must reject");
     }
 
     /// A witness violating ONE constraint in ONE row of ONE slot is rejected —

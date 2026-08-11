@@ -648,6 +648,23 @@ pub fn prove_wiring<C: Challenger>(
     public: &[F128],
     ch: &mut C,
 ) -> (WiringProof, Vec<PackedDirectClaim>) {
+    prove_wiring_with_grinding(
+        circuit,
+        packed,
+        public,
+        product_gkr::BatchedGrinding::disabled(),
+        ch,
+    )
+}
+
+/// [`prove_wiring`] with explicit Product-GKR Fiat--Shamir grinding.
+pub fn prove_wiring_with_grinding<C: Challenger>(
+    circuit: &Circuit,
+    packed: &[F128],
+    public: &[F128],
+    grinding: product_gkr::BatchedGrinding,
+    ch: &mut C,
+) -> (WiringProof, Vec<PackedDirectClaim>) {
     assert_eq!(
         public.len(),
         circuit.num_public(),
@@ -698,7 +715,14 @@ pub fn prove_wiring<C: Challenger>(
 
     // ---- One grand-product permutation check at f = g = w.
     let t = std::time::Instant::now();
-    let (gkr, claim) = product_gkr::prove_batched(&w, &w, circuit.sigma(), Some(&mask), ch);
+    let (gkr, claim) = product_gkr::prove_batched_with_grinding(
+        &w,
+        &w,
+        circuit.sigma(),
+        Some(&mask),
+        grinding,
+        ch,
+    );
     crate::scratch::give_f128(w);
     if trace {
         eprintln!(
@@ -824,7 +848,24 @@ pub fn verify_wiring_deferred<C: Challenger>(
     proof: &WiringProof,
     ch: &mut C,
 ) -> Result<(Vec<(Vec<F128>, F128)>, SigmaAssertion), WiringError> {
-    verify_wiring_core(circuit, public, proof, true, ch)
+    verify_wiring_deferred_with_grinding(
+        circuit,
+        public,
+        proof,
+        product_gkr::BatchedGrinding::disabled(),
+        ch,
+    )
+}
+
+/// [`verify_wiring_deferred`] with explicit Product-GKR grinding.
+pub fn verify_wiring_deferred_with_grinding<C: Challenger>(
+    circuit: &Circuit,
+    public: &[F128],
+    proof: &WiringProof,
+    grinding: product_gkr::BatchedGrinding,
+    ch: &mut C,
+) -> Result<(Vec<(Vec<F128>, F128)>, SigmaAssertion), WiringError> {
+    verify_wiring_core(circuit, public, proof, true, grinding, ch)
 }
 
 pub fn verify_wiring<C: Challenger>(
@@ -833,7 +874,24 @@ pub fn verify_wiring<C: Challenger>(
     proof: &WiringProof,
     ch: &mut C,
 ) -> Result<Vec<(Vec<F128>, F128)>, WiringError> {
-    verify_wiring_core(circuit, public, proof, false, ch).map(|(g, _)| g)
+    verify_wiring_with_grinding(
+        circuit,
+        public,
+        proof,
+        product_gkr::BatchedGrinding::disabled(),
+        ch,
+    )
+}
+
+/// [`verify_wiring`] with explicit Product-GKR grinding.
+pub fn verify_wiring_with_grinding<C: Challenger>(
+    circuit: &Circuit,
+    public: &[F128],
+    proof: &WiringProof,
+    grinding: product_gkr::BatchedGrinding,
+    ch: &mut C,
+) -> Result<Vec<(Vec<F128>, F128)>, WiringError> {
+    verify_wiring_core(circuit, public, proof, false, grinding, ch).map(|(g, _)| g)
 }
 
 fn verify_wiring_core<C: Challenger>(
@@ -841,6 +899,7 @@ fn verify_wiring_core<C: Challenger>(
     public: &[F128],
     proof: &WiringProof,
     defer_sigma: bool,
+    grinding: product_gkr::BatchedGrinding,
     ch: &mut C,
 ) -> Result<(Vec<(Vec<F128>, F128)>, SigmaAssertion), WiringError> {
     if public.len() != circuit.num_public() {
@@ -854,9 +913,16 @@ fn verify_wiring_core<C: Challenger>(
 
     let mask = circuit.live_mask();
     let claim = if defer_sigma {
-        product_gkr::verify_batched(mu, &proof.gkr, Some(&mask), ch)
+        product_gkr::verify_batched_with_grinding(mu, &proof.gkr, Some(&mask), grinding, ch)
     } else {
-        product_gkr::verify_batched_with_sigma(mu, &proof.gkr, circuit.sigma(), Some(&mask), ch)
+        product_gkr::verify_batched_with_sigma_and_grinding(
+            mu,
+            &proof.gkr,
+            circuit.sigma(),
+            Some(&mask),
+            grinding,
+            ch,
+        )
     }
     .map_err(WiringError::Gkr)?;
 

@@ -34,6 +34,22 @@ use crate::field::F128;
 use crate::hash::HashKind;
 use sha2::{Digest, Sha256};
 
+/// Number of grinding bits needed to turn a Schwartz--Zippel event of
+/// degree at most `degree` over `F_{2^128}` into a *strictly* sub-`2^-128`
+/// event at this site.
+///
+/// After a `bits`-bit Fiat--Shamir grind, the usual bound is
+/// `degree / 2^(128 + bits)`.  Thus non-constant events need
+/// `floor(log2(degree)) + 1` bits; degree zero needs none.
+#[inline]
+pub const fn grinding_bits_for_degree(degree: usize) -> u32 {
+    if degree == 0 {
+        0
+    } else {
+        usize::BITS - degree.leading_zeros()
+    }
+}
+
 // `Send` supertrait: the verifier runs its PIOP/PCS replay inside a dedicated
 // single-thread rayon pool (see `verifier::verifier_pool`), so the challenger
 // it threads through must be able to cross into that pool. Both concrete
@@ -797,9 +813,9 @@ fn has_leading_zero_bits(h: &[u8], bits: u32) -> bool {
 /// the transcript's own hash keeps the whole protocol resting on one primitive
 /// rather than pulling in a second.
 #[inline]
-/// `pub`: the recursion circuit's boundary checker applies the SAME
-/// predicate to the published (state digest, nonce) wires — sourced from
-/// here so the grinding convention cannot drift.
+/// `pub`: recursion tests use this as the native differential oracle for the
+/// in-circuit BLAKE3 + leading-zero relation, so the grinding convention
+/// cannot drift.
 pub fn pow_has_leading_zero_bits(
     state_digest: &[u8; 32],
     nonce: u64,

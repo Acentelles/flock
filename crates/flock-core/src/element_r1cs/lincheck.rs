@@ -65,6 +65,7 @@ use crate::lincheck::{
     sumcheck_bind_both_and_eval_next, sumcheck_bind_top_in_place_par, sumcheck_round_eval_par,
 };
 use crate::zerocheck::univariate_skip::build_eq;
+use super::Grinding;
 
 /// Domain label of the standalone single-table lincheck. The union's
 /// element-region lincheck runs the same sumcheck core under its own label
@@ -89,6 +90,8 @@ pub const LABEL: &[u8] = b"flock-element-lc-v0";
 pub(crate) fn column_sumcheck_prove<C: Challenger>(
     comb: &mut Vec<F128>,
     g: &mut Vec<F128>,
+    grinding: Grinding,
+    grinding_nonces: &mut Vec<u64>,
     ch: &mut C,
 ) -> (Vec<(F128, F128)>, Vec<F128>) {
     debug_assert_eq!(comb.len(), g.len());
@@ -105,6 +108,9 @@ pub(crate) fn column_sumcheck_prove<C: Challenger>(
     for t in 0..rounds {
         ch.observe_f128(e1);
         ch.observe_f128(einf);
+        if let Some(bits) = grinding.round_bits() {
+            grinding_nonces.push(ch.grind_pow(bits));
+        }
         let rho = ch.sample_f128();
         msgs.push((e1, einf));
         challenges.push(rho);
@@ -126,20 +132,29 @@ pub(crate) fn column_sumcheck_prove<C: Challenger>(
 pub(crate) fn column_sumcheck_replay<C: Challenger>(
     target: F128,
     rounds: &[(F128, F128)],
+    grinding: Grinding,
+    grinding_nonces: &[u64],
+    nonce_idx: &mut usize,
     ch: &mut C,
-) -> (F128, Vec<F128>) {
+) -> Result<(F128, Vec<F128>), VerifyError> {
     let mut running = target;
     let mut challenges = Vec::with_capacity(rounds.len());
     for &(e1, einf) in rounds {
         ch.observe_f128(e1);
         ch.observe_f128(einf);
+        if let Some(bits) = grinding.round_bits() {
+            if !ch.verify_pow(grinding_nonces[*nonce_idx], bits) {
+                return Err(VerifyError::InvalidGrindingNonce { which: "round" });
+            }
+            *nonce_idx += 1;
+        }
         let rho = ch.sample_f128();
         let e0 = running + e1;
         let c1 = e0 + e1 + einf;
         running = einf * rho * rho + c1 * rho + e0;
         challenges.push(rho);
     }
-    (running, challenges)
+    Ok((running, challenges))
 }
 
 /// Round messages plus the output witness claim value.
@@ -161,6 +176,9 @@ pub struct Proof {
     /// regardless of size. Same treatment as the boolean class's
     /// `lincheck::LincheckProof::matrix_evals`.
     pub matrix_evals: Vec<(F128, F128)>,
+    /// α batching then one PoW nonce per product-sumcheck round.
+    #[serde(default)]
+    pub grinding_nonces: Vec<u64>,
 }
 
 /// What a verified lincheck leaves for the opening.
@@ -179,6 +197,8 @@ pub enum VerifyError {
     BadRoundCount { expected: usize, got: usize },
     /// `r` (the zerocheck point) has the wrong length for this statement.
     BadPointLength { expected: usize, got: usize },
+    BadGrindingNonceCount { expected: usize, got: usize },
+    InvalidGrindingNonce { which: &'static str },
     /// The final consistency check
     /// `running == (Â_0 + α·B̂_0)(r_con, r'_col) · z_eval` failed.
     SumcheckFinalFailed,
@@ -198,12 +218,30 @@ pub fn prove<C: Challenger>(
     vb: F128,
     ch: &mut C,
 ) -> (Proof, Claim) {
+    prove_with_grinding(ty, z, n_log, r, va, vb, Grinding::disabled(), ch)
+}
+
+/// [`prove`] with an explicit element grinding policy.
+pub fn prove_with_grinding<C: Challenger>(
+    ty: &ElementTableType,
+    z: &[F128],
+    n_log: usize,
+    r: &[F128],
+    va: F128,
+    vb: F128,
+    grinding: Grinding,
+    ch: &mut C,
+) -> (Proof, Claim) {
     let kappa = ty.kappa();
     let m_words = kappa + n_log;
     assert_eq!(r.len(), m_words, "zerocheck point length");
     assert_eq!(z.len(), 1usize << m_words, "witness length");
 
     ch.observe_label(LABEL);
+    let mut grinding_nonces = Vec::with_capacity(grinding.lincheck_nonce_count(kappa));
+    if let Some(bits) = grinding.alpha_bits() {
+        grinding_nonces.push(ch.grind_pow(bits));
+    }
     let alpha = ch.sample_f128();
 
     // Rows live in the LOW coordinates of the point, columns in the high ones.
@@ -220,7 +258,8 @@ pub fn prove<C: Challenger>(
     );
 
     // The shared product sumcheck over the column variables, top first.
-    let (rounds, r_rounds) = column_sumcheck_prove(&mut comb, &mut zc, ch);
+    let (rounds, r_rounds) =
+        column_sumcheck_prove(&mut comb, &mut zc, grinding, &mut grinding_nonces, ch);
     debug_assert_eq!(r_rounds.len(), kappa);
     debug_assert_eq!(zc.len(), 1);
     let z_eval = zc[0];
@@ -231,6 +270,7 @@ pub fn prove<C: Challenger>(
         rounds,
         z_eval,
         matrix_evals: Vec::new(),
+        grinding_nonces,
     };
     let claim = Claim {
         r_prime: claim_point(r_row, r_rounds),
@@ -249,6 +289,20 @@ pub fn verify<C: Challenger>(
     proof: &Proof,
     ch: &mut C,
 ) -> Result<Claim, VerifyError> {
+    verify_with_grinding(ty, n_log, r, va, vb, proof, Grinding::disabled(), ch)
+}
+
+/// [`verify`] with an explicit element grinding policy.
+pub fn verify_with_grinding<C: Challenger>(
+    ty: &ElementTableType,
+    n_log: usize,
+    r: &[F128],
+    va: F128,
+    vb: F128,
+    proof: &Proof,
+    grinding: Grinding,
+    ch: &mut C,
+) -> Result<Claim, VerifyError> {
     let kappa = ty.kappa();
     let m_words = kappa + n_log;
     if r.len() != m_words {
@@ -263,12 +317,33 @@ pub fn verify<C: Challenger>(
             got: proof.rounds.len(),
         });
     }
+    if proof.grinding_nonces.len() != grinding.lincheck_nonce_count(kappa) {
+        return Err(VerifyError::BadGrindingNonceCount {
+            expected: grinding.lincheck_nonce_count(kappa),
+            got: proof.grinding_nonces.len(),
+        });
+    }
 
     ch.observe_label(LABEL);
+    let mut nonce_idx = 0;
+    if let Some(bits) = grinding.alpha_bits() {
+        if !ch.verify_pow(proof.grinding_nonces[nonce_idx], bits) {
+            return Err(VerifyError::InvalidGrindingNonce { which: "alpha" });
+        }
+        nonce_idx += 1;
+    }
     let alpha = ch.sample_f128();
 
     // Replay the shared product sumcheck.
-    let (running, r_rounds) = column_sumcheck_replay(va + alpha * vb, &proof.rounds, ch);
+    let (running, r_rounds) = column_sumcheck_replay(
+        va + alpha * vb,
+        &proof.rounds,
+        grinding,
+        &proof.grinding_nonces,
+        &mut nonce_idx,
+        ch,
+    )?;
+    debug_assert_eq!(nonce_idx, proof.grinding_nonces.len());
     let (r_row, r_con) = r.split_at(n_log);
     let r_prime = claim_point(r_row, r_rounds);
 

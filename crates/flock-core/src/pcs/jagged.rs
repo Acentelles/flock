@@ -1738,6 +1738,9 @@ pub struct ScalarGroupClaim<'a> {
 pub struct FrobeniusAssistProof {
     pub v: F128,
     pub rounds: Vec<(F128, F128)>,
+    /// PoW witnesses in round order. Empty when grinding is disabled.
+    #[serde(default)]
+    pub grinding_nonces: Vec<u64>,
 }
 
 /// Per-statement prover state: one (claim, Frobenius power) pair, with the
@@ -1908,6 +1911,19 @@ pub fn prove_frobenius_assist<C: Challenger>(
     rho: &[F128],
     challenger: &mut C,
 ) -> FrobeniusAssistProof {
+    prove_frobenius_assist_with_grinding(params, claims, groups, rho, 0, challenger)
+}
+
+/// [`prove_frobenius_assist`] with a PoW witness before every quadratic
+/// sumcheck challenge.
+pub fn prove_frobenius_assist_with_grinding<C: Challenger>(
+    params: &JaggedParams,
+    claims: &[FrobeniusClaim<'_>],
+    groups: &[(ScalarGroupClaim<'_>, F128)],
+    rho: &[F128],
+    round_grinding_bits: u32,
+    challenger: &mut C,
+) -> FrobeniusAssistProof {
     use rayon::prelude::*;
     let m = params.m;
     assert_eq!(rho.len(), m);
@@ -1950,6 +1966,9 @@ pub fn prove_frobenius_assist<C: Challenger>(
 
     let mut ch4: Option<[F128; 4]> = None;
     let mut rounds = Vec::with_capacity(2 * (m + 1));
+    let mut grinding_nonces = Vec::with_capacity(
+        (round_grinding_bits != 0) as usize * 2 * (m + 1),
+    );
     for layer in 0..=m {
         // Per-statement block pass: ascend one layer with the previous layer's
         // challenges, bucket the weight partials against their parents' suffix
@@ -1993,6 +2012,9 @@ pub fn prove_frobenius_assist<C: Challenger>(
         }
         challenger.observe_f128(g_one);
         challenger.observe_f128(g_inf);
+        if round_grinding_bits != 0 {
+            grinding_nonces.push(challenger.grind_pow(round_grinding_bits));
+        }
         let rc = challenger.sample_f128();
         rounds.push((g_one, g_inf));
 
@@ -2012,6 +2034,9 @@ pub fn prove_frobenius_assist<C: Challenger>(
         }
         challenger.observe_f128(g_one);
         challenger.observe_f128(g_inf);
+        if round_grinding_bits != 0 {
+            grinding_nonces.push(challenger.grind_pow(round_grinding_bits));
+        }
         let rd = challenger.sample_f128();
         rounds.push((g_one, g_inf));
 
@@ -2031,7 +2056,11 @@ pub fn prove_frobenius_assist<C: Challenger>(
             t.elapsed().as_secs_f64() * 1e3
         );
     }
-    FrobeniusAssistProof { v, rounds }
+    FrobeniusAssistProof {
+        v,
+        rounds,
+        grinding_nonces,
+    }
 }
 
 /// What the DEFERRED verify exports from the assist: the final point `σ`
@@ -2058,7 +2087,30 @@ pub fn verify_frobenius_assist<C: Challenger>(
     proof: &FrobeniusAssistProof,
     challenger: &mut C,
 ) -> Option<F128> {
-    verify_frobenius_assist_core(params, claims, groups, rho, proof, challenger, None)
+    verify_frobenius_assist_with_grinding(params, claims, groups, rho, proof, 0, challenger)
+}
+
+/// [`verify_frobenius_assist`] with a PoW check before every quadratic
+/// sumcheck challenge.
+pub fn verify_frobenius_assist_with_grinding<C: Challenger>(
+    params: &JaggedParams,
+    claims: &[FrobeniusClaim<'_>],
+    groups: &[(ScalarGroupClaim<'_>, F128)],
+    rho: &[F128],
+    proof: &FrobeniusAssistProof,
+    round_grinding_bits: u32,
+    challenger: &mut C,
+) -> Option<F128> {
+    verify_frobenius_assist_core(
+        params,
+        claims,
+        groups,
+        rho,
+        proof,
+        round_grinding_bits,
+        challenger,
+        None,
+    )
 }
 
 /// [`verify_frobenius_assist`] plus the deferred export — transcript-
@@ -2079,6 +2131,7 @@ pub fn verify_frobenius_assist_deferred<C: Challenger>(
         groups,
         rho,
         proof,
+        0,
         challenger,
         Some(&mut out),
     )?;
@@ -2091,12 +2144,21 @@ fn verify_frobenius_assist_core<C: Challenger>(
     groups: &[(ScalarGroupClaim<'_>, F128)],
     rho: &[F128],
     proof: &FrobeniusAssistProof,
+    round_grinding_bits: u32,
     challenger: &mut C,
     defer: Option<&mut Option<AssistDefer>>,
 ) -> Option<F128> {
     use rayon::prelude::*;
     let m = params.m;
     if proof.rounds.len() != 2 * (m + 1) {
+        return None;
+    }
+    let expected_nonces = if round_grinding_bits == 0 {
+        0
+    } else {
+        proof.rounds.len()
+    };
+    if proof.grinding_nonces.len() != expected_nonces {
         return None;
     }
     // `VERIFY_TRACE` sub-split of the assist — it dominates the Merkle-table
@@ -2118,9 +2180,14 @@ fn verify_frobenius_assist_core<C: Challenger>(
     let t = std::time::Instant::now();
     let mut claim = proof.v;
     let mut sigma = Vec::with_capacity(2 * (m + 1));
-    for &(g_one, g_inf) in &proof.rounds {
+    for (round, &(g_one, g_inf)) in proof.rounds.iter().enumerate() {
         challenger.observe_f128(g_one);
         challenger.observe_f128(g_inf);
+        if round_grinding_bits != 0
+            && !challenger.verify_pow(proof.grinding_nonces[round], round_grinding_bits)
+        {
+            return None;
+        }
         let r = challenger.sample_f128();
         claim = fold_round_claim(claim, g_one, g_inf, r);
         sigma.push(r);
@@ -2798,8 +2865,64 @@ fn build_combined_weight_and_msg(
 pub struct MultipointTwistedProof {
     pub values: Vec<Vec<F128>>,
     pub group_values: Vec<F128>,
+    /// PoW witness after all dual values are bound and before their random
+    /// linear-combination coefficient is sampled.
+    #[serde(default)]
+    pub gamma_grinding_nonce: u64,
     pub rounds: Vec<(F128, F128)>,
+    /// PoW witnesses for the two-product quadratic sumcheck, in round order.
+    #[serde(default)]
+    pub round_grinding_nonces: Vec<u64>,
     pub anchor: FrobeniusAssistProof,
+}
+
+/// Grinding policy for the multipoint-twisted transport.  The first field
+/// protects the random linear combination of the dual-value claims; the other
+/// two protect degree-two sumcheck rounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MultipointGrinding {
+    /// Enables grinding for the gamma batching challenge.  When nonzero this
+    /// is a lower bound: the actual schedule is derived from the number `K`
+    /// of batched values, whose discrepancy polynomial has degree `K - 1`.
+    pub gamma_bits: u32,
+    pub round_bits: u32,
+    pub anchor_round_bits: u32,
+}
+
+impl MultipointGrinding {
+    pub const fn disabled() -> Self {
+        Self {
+            gamma_bits: 0,
+            round_bits: 0,
+            anchor_round_bits: 0,
+        }
+    }
+
+    pub const fn per_challenge_128() -> Self {
+        Self {
+            gamma_bits: 1,
+            round_bits: 2,
+            anchor_round_bits: 2,
+        }
+    }
+
+    /// The gamma powers batch `K = 128 * n_rs + n_groups` values, so a false
+    /// vector is hidden by a nonzero polynomial of degree at most `K - 1`.
+    /// Derive the strict per-site schedule from that degree rather than using
+    /// the old fixed one-bit setting (which was insufficient once `K > 2`).
+    #[inline]
+    pub fn gamma_bits_for(self, n_rs: usize, n_groups: usize) -> u32 {
+        if self.gamma_bits == 0 {
+            return 0;
+        }
+        let degree = 128usize
+            .checked_mul(n_rs)
+            .and_then(|n| n.checked_add(n_groups))
+            .and_then(|k| k.checked_sub(1))
+            .expect("multipoint batch size must be nonzero and fit usize");
+        self.gamma_bits
+            .max(crate::challenger::grinding_bits_for_degree(degree))
+    }
 }
 
 /// Prover for the multipoint twisted evaluation, two-product form
@@ -2819,6 +2942,26 @@ pub fn prove_multipoint_twisted<C: Challenger>(
     claims: &[FrobeniusClaim<'_>],
     groups: &[ScalarGroupClaim<'_>],
     rho: &[F128],
+    challenger: &mut C,
+) -> MultipointTwistedProof {
+    prove_multipoint_twisted_with_grinding(
+        params,
+        claims,
+        groups,
+        rho,
+        MultipointGrinding::disabled(),
+        challenger,
+    )
+}
+
+/// [`prove_multipoint_twisted`] with PoW witnesses at its random-linear
+/// batching and quadratic sumcheck sites.
+pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
+    params: &JaggedParams,
+    claims: &[FrobeniusClaim<'_>],
+    groups: &[ScalarGroupClaim<'_>],
+    rho: &[F128],
+    grinding: MultipointGrinding,
     challenger: &mut C,
 ) -> MultipointTwistedProof {
     let m = params.m;
@@ -2860,6 +3003,10 @@ pub fn prove_multipoint_twisted<C: Challenger>(
     for &v in &group_values {
         challenger.observe_f128(v);
     }
+    let gamma_bits = grinding.gamma_bits_for(n_rs, n_g);
+    let gamma_grinding_nonce = (gamma_bits != 0)
+        .then(|| challenger.grind_pow(gamma_bits))
+        .unwrap_or(0);
     let gamma = challenger.sample_f128();
     let mut gpow = Vec::with_capacity(128 * n_rs + n_g);
     let mut p = F128::ONE;
@@ -3078,6 +3225,8 @@ pub fn prove_multipoint_twisted<C: Challenger>(
     // endpoint.
     let t = std::time::Instant::now();
     let mut rounds = Vec::with_capacity(m);
+    let mut round_grinding_nonces =
+        Vec::with_capacity((grinding.round_bits != 0) as usize * m);
     let mut point = Vec::with_capacity(m);
     // Per-PAIR fold attribution: which product's rounds cost what. The two
     // products are not comparable — the RS side folds the whole area against
@@ -3090,6 +3239,9 @@ pub fn prove_multipoint_twisted<C: Challenger>(
     for i in 0..m {
         challenger.observe_f128(g_one);
         challenger.observe_f128(g_inf);
+        if grinding.round_bits != 0 {
+            round_grinding_nonces.push(challenger.grind_pow(grinding.round_bits));
+        }
         let r = challenger.sample_f128();
         rounds.push((g_one, g_inf));
         point.push(r);
@@ -3169,8 +3321,14 @@ pub fn prove_multipoint_twisted<C: Challenger>(
         .enumerate()
         .map(|(k, g)| (*g, gpow[128 * n_rs + k] * e_at))
         .collect();
-    let anchor =
-        prove_frobenius_assist(params, &anchor_claims, &anchor_groups, &point, challenger);
+    let anchor = prove_frobenius_assist_with_grinding(
+        params,
+        &anchor_claims,
+        &anchor_groups,
+        &point,
+        grinding.anchor_round_bits,
+        challenger,
+    );
     if trace {
         eprintln!(
             "    [multipoint] anchor assist (x{} + x{}): {:6.2} ms",
@@ -3182,7 +3340,9 @@ pub fn prove_multipoint_twisted<C: Challenger>(
     MultipointTwistedProof {
         values,
         group_values,
+        gamma_grinding_nonce,
         rounds,
+        round_grinding_nonces,
         anchor,
     }
 }
@@ -4223,7 +4383,29 @@ pub fn verify_multipoint_twisted<C: Challenger>(
     proof: &MultipointTwistedProof,
     challenger: &mut C,
 ) -> Option<F128> {
-    verify_multipoint_twisted_core(params, claims, groups, rho, proof, challenger, None)
+    verify_multipoint_twisted_with_grinding(
+        params,
+        claims,
+        groups,
+        rho,
+        proof,
+        MultipointGrinding::disabled(),
+        challenger,
+    )
+}
+
+/// [`verify_multipoint_twisted`] with the matching PoW checks for its
+/// batching coefficient, every two-product round, and the anchor rounds.
+pub fn verify_multipoint_twisted_with_grinding<C: Challenger>(
+    params: &JaggedParams,
+    claims: &[FrobeniusClaim<'_>],
+    groups: &[ScalarGroupClaim<'_>],
+    rho: &[F128],
+    proof: &MultipointTwistedProof,
+    grinding: MultipointGrinding,
+    challenger: &mut C,
+) -> Option<F128> {
+    verify_multipoint_twisted_core(params, claims, groups, rho, proof, grinding, challenger, None)
 }
 
 /// The deferred export of the whole multipoint anchor: the assist's final
@@ -4259,6 +4441,27 @@ pub fn verify_multipoint_twisted_deferred<C: Challenger>(
     proof: &MultipointTwistedProof,
     challenger: &mut C,
 ) -> Option<(F128, MultipointDefer)> {
+    verify_multipoint_twisted_deferred_with_grinding(
+        params,
+        claims,
+        groups,
+        rho,
+        proof,
+        MultipointGrinding::disabled(),
+        challenger,
+    )
+}
+
+/// Deferred counterpart to [`verify_multipoint_twisted_with_grinding`].
+pub fn verify_multipoint_twisted_deferred_with_grinding<C: Challenger>(
+    params: &JaggedParams,
+    claims: &[FrobeniusClaim<'_>],
+    groups: &[ScalarGroupClaim<'_>],
+    rho: &[F128],
+    proof: &MultipointTwistedProof,
+    grinding: MultipointGrinding,
+    challenger: &mut C,
+) -> Option<(F128, MultipointDefer)> {
     let mut out = None;
     let v = verify_multipoint_twisted_core(
         params,
@@ -4266,6 +4469,7 @@ pub fn verify_multipoint_twisted_deferred<C: Challenger>(
         groups,
         rho,
         proof,
+        grinding,
         challenger,
         Some(&mut out),
     )?;
@@ -4278,6 +4482,7 @@ fn verify_multipoint_twisted_core<C: Challenger>(
     groups: &[ScalarGroupClaim<'_>],
     rho: &[F128],
     proof: &MultipointTwistedProof,
+    grinding: MultipointGrinding,
     challenger: &mut C,
     defer: Option<&mut Option<MultipointDefer>>,
 ) -> Option<F128> {
@@ -4289,6 +4494,10 @@ fn verify_multipoint_twisted_core<C: Challenger>(
         return None;
     }
     if proof.values.iter().any(|vs| vs.len() != 128) {
+        return None;
+    }
+    let expected_round_nonces = if grinding.round_bits == 0 { 0 } else { m };
+    if proof.round_grinding_nonces.len() != expected_round_nonces {
         return None;
     }
     for g in groups {
@@ -4304,6 +4513,14 @@ fn verify_multipoint_twisted_core<C: Challenger>(
     }
     for &v in &proof.group_values {
         challenger.observe_f128(v);
+    }
+    // As with ring switching, this optional operation is absent from a
+    // disabled transcript, so check canonical zero without absorbing it.
+    let gamma_bits = grinding.gamma_bits_for(n_rs, n_g);
+    if (gamma_bits == 0 && proof.gamma_grinding_nonce != 0)
+        || (gamma_bits != 0 && !challenger.verify_pow(proof.gamma_grinding_nonce, gamma_bits))
+    {
+        return None;
     }
     let gamma = challenger.sample_f128();
     let mut gpow = Vec::with_capacity(128 * n_rs + n_g);
@@ -4324,9 +4541,14 @@ fn verify_multipoint_twisted_core<C: Challenger>(
         running += gpow[128 * n_rs + k] * v;
     }
     let mut point = Vec::with_capacity(m);
-    for &(g_one, g_inf) in &proof.rounds {
+    for (round, &(g_one, g_inf)) in proof.rounds.iter().enumerate() {
         challenger.observe_f128(g_one);
         challenger.observe_f128(g_inf);
+        if grinding.round_bits != 0
+            && !challenger.verify_pow(proof.round_grinding_nonces[round], grinding.round_bits)
+        {
+            return None;
+        }
         let r = challenger.sample_f128();
         running = fold_round_claim(running, g_one, g_inf, r);
         point.push(r);
@@ -4371,6 +4593,7 @@ fn verify_multipoint_twisted_core<C: Challenger>(
         &anchor_groups,
         &point,
         &proof.anchor,
+        grinding.anchor_round_bits,
         challenger,
         defer.is_some().then_some(&mut assist_out),
     )?;
@@ -4928,6 +5151,139 @@ mod tests {
             }
         }
         assert_eq!(vg, expect_g, "groups-only {label}");
+    }
+
+    /// The secure multipoint transport has three independent grinding
+    /// families: the dual-value batching scalar, each main quadratic round,
+    /// and each quadratic anchor round.  Check their transcript placement and
+    /// exact proof shapes directly, in addition to the full merged-opening
+    /// and recursive-node end-to-end tests.
+    #[test]
+    fn multipoint_twisted_grinding_roundtrip_and_rejects_malformed_nonces() {
+        let mut rng = RandomChallenger::new(0x4D50_4752_494E_44);
+        let params = JaggedParams::from_heights(&[8; 4], 3, 5);
+        let z_row = sample_vec(&mut rng, params.n);
+        let z_col = sample_vec(&mut rng, params.k);
+        let coeffs = sample_vec(&mut rng, 128);
+        let group_row = sample_vec(&mut rng, params.n);
+        let group_cols = sample_vec(&mut rng, 1 << params.k);
+        let rho = sample_vec(&mut rng, params.m);
+        let claims = [FrobeniusClaim {
+            z_row: &z_row,
+            z_col: &z_col,
+            coeffs: &coeffs,
+        }];
+        let groups = [ScalarGroupClaim {
+            z_row: &group_row,
+            cols: &group_cols,
+        }];
+        let grinding = MultipointGrinding::per_challenge_128();
+
+        let mut ch_p = FsChallenger::new(b"multipoint-grinding-test");
+        let proof = prove_multipoint_twisted_with_grinding(
+            &params, &claims, &groups, &rho, grinding, &mut ch_p,
+        );
+        assert_eq!(proof.round_grinding_nonces.len(), params.m);
+        assert_eq!(proof.anchor.grinding_nonces.len(), 2 * (params.m + 1));
+
+        let mut ch_v = FsChallenger::new(b"multipoint-grinding-test");
+        assert!(
+            verify_multipoint_twisted_with_grinding(
+                &params, &claims, &groups, &rho, &proof, grinding, &mut ch_v,
+            )
+            .is_some(),
+            "honest grinded multipoint proof verifies"
+        );
+
+        let mut missing_round = proof.clone();
+        missing_round.round_grinding_nonces.pop();
+        let mut ch_v = FsChallenger::new(b"multipoint-grinding-test");
+        assert!(
+            verify_multipoint_twisted_with_grinding(
+                &params,
+                &claims,
+                &groups,
+                &rho,
+                &missing_round,
+                grinding,
+                &mut ch_v,
+            )
+            .is_none(),
+            "a missing main-round PoW must reject"
+        );
+
+        let mut missing_anchor = proof.clone();
+        missing_anchor.anchor.grinding_nonces.pop();
+        let mut ch_v = FsChallenger::new(b"multipoint-grinding-test");
+        assert!(
+            verify_multipoint_twisted_with_grinding(
+                &params,
+                &claims,
+                &groups,
+                &rho,
+                &missing_anchor,
+                grinding,
+                &mut ch_v,
+            )
+            .is_none(),
+            "a missing anchor-round PoW must reject"
+        );
+
+        // Find a deterministic invalid witness at the gamma position against
+        // the exact transcript prefix.  This pin specifically covers the
+        // batching PoW rather than a later sumcheck rejection after gamma.
+        let bad_gamma = (0..256u64)
+            .find(|&nonce| {
+                if nonce == proof.gamma_grinding_nonce {
+                    return false;
+                }
+                let mut ch = FsChallenger::new(b"multipoint-grinding-test");
+                ch.observe_label(b"flock-multipoint-twisted-v1");
+                for vs in &proof.values {
+                    for &v in vs {
+                        ch.observe_f128(v);
+                    }
+                }
+                for &v in &proof.group_values {
+                    ch.observe_f128(v);
+                }
+                !ch.verify_pow(nonce, grinding.gamma_bits_for(1, 1))
+            })
+            .expect("a fixed nonce window contains an invalid gamma PoW witness");
+        let mut bad = proof.clone();
+        bad.gamma_grinding_nonce = bad_gamma;
+        let mut ch_v = FsChallenger::new(b"multipoint-grinding-test");
+        assert!(
+            verify_multipoint_twisted_with_grinding(
+                &params, &claims, &groups, &rho, &bad, grinding, &mut ch_v,
+            )
+            .is_none(),
+            "an invalid multipoint-batching PoW must reject"
+        );
+
+        // The gamma PoW is absent, not a zero-bit transcript operation, in a
+        // legacy proof.  Its carried optional field must nevertheless stay
+        // canonical and therefore cannot become a free proof-malleability
+        // knob.
+        let mut ch_p = FsChallenger::new(b"multipoint-no-grinding-test");
+        let mut legacy = prove_multipoint_twisted(&params, &claims, &groups, &rho, &mut ch_p);
+        legacy.gamma_grinding_nonce = 1;
+        let mut ch_v = FsChallenger::new(b"multipoint-no-grinding-test");
+        assert!(
+            verify_multipoint_twisted(&params, &claims, &groups, &rho, &legacy, &mut ch_v)
+                .is_none(),
+            "disabled optional gamma nonce must be canonical zero"
+        );
+    }
+
+    #[test]
+    fn multipoint_gamma_schedule_tracks_power_boundaries() {
+        let grinding = MultipointGrinding::per_challenge_128();
+        // K=256 gives degree 255 and needs 8 bits; K=257 gives degree 256
+        // and needs 9 under the strict local `< 2^-128` rule.
+        assert_eq!(grinding.gamma_bits_for(2, 0), 8);
+        assert_eq!(grinding.gamma_bits_for(2, 1), 9);
+        assert_eq!(MultipointGrinding::disabled().gamma_bits_for(2, 1), 0);
     }
 
     /// Sparse-group variant of [`check_multipoint`]: groups supported on

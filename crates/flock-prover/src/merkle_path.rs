@@ -91,6 +91,69 @@ pub struct RoundMsg {
 pub struct MerklePathShiftProof {
     pub rounds: Vec<RoundMsg>, // length n + 2
     pub g_at_point: F128,
+    /// PoW witnesses in transcript order: initial `(tau, alpha)`, then one
+    /// for each verifier-interpolated round.
+    #[serde(default)]
+    pub grinding_nonces: Vec<u64>,
+}
+
+/// Grinding schedule for packed-position and Merkle-path shift challenges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MerklePathGrinding {
+    pub packed_position_bits: u32,
+    pub initial_bits: u32,
+    /// The verifier accepts a degree-three interpolation in every round.
+    pub round_bits: u32,
+}
+
+impl MerklePathGrinding {
+    pub const fn disabled() -> Self {
+        Self {
+            packed_position_bits: 0,
+            initial_bits: 0,
+            round_bits: 0,
+        }
+    }
+
+    pub const fn per_challenge_128() -> Self {
+        Self {
+            packed_position_bits: 1,
+            initial_bits: 1,
+            round_bits: 2,
+        }
+    }
+
+    pub fn for_profile(profile: flock_core::pcs::ligerito::LigeritoProfile) -> Self {
+        match profile {
+            flock_core::pcs::ligerito::LigeritoProfile::Secure => Self::per_challenge_128(),
+            flock_core::pcs::ligerito::LigeritoProfile::Fast
+            | flock_core::pcs::ligerito::LigeritoProfile::Slim => Self::disabled(),
+        }
+    }
+
+    pub fn packed_position_bits_for(self, dimension: usize) -> u32 {
+        if self.packed_position_bits == 0 || dimension == 0 {
+            0
+        } else {
+            self.packed_position_bits
+                .max(flock_core::challenger::grinding_bits_for_degree(dimension))
+        }
+    }
+
+    fn initial_bits_for(self, n: usize, path_log: usize) -> u32 {
+        if self.initial_bits == 0 {
+            0
+        } else {
+            self.initial_bits.max(flock_core::challenger::grinding_bits_for_degree(
+                n.max(path_log + 1),
+            ))
+        }
+    }
+
+    fn nonce_count(self, n: usize, path_log: usize) -> usize {
+        usize::from(self.initial_bits_for(n, path_log) != 0)
+            + (n + 2) * usize::from(self.round_bits != 0)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,6 +168,7 @@ pub struct MerklePathClaims {
 pub enum MerklePathError {
     MalformedProof,
     SumcheckFinal,
+    InvalidGrinding,
 }
 
 // ---------------------------------------------------------------------------
@@ -233,6 +297,32 @@ pub fn prove_merkle_path_shift<Ch: Challenger>(
     layout: SlotLayout,
     challenger: &mut Ch,
 ) -> (MerklePathShiftProof, MerklePathClaims) {
+    prove_merkle_path_shift_with_grinding(
+        path_log,
+        x_l_vals,
+        x_r_vals,
+        z_vals,
+        iv_vals,
+        b_bits,
+        layout,
+        MerklePathGrinding::disabled(),
+        challenger,
+    )
+}
+
+/// [`prove_merkle_path_shift`] with explicit Fiat--Shamir grinding.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_merkle_path_shift_with_grinding<Ch: Challenger>(
+    path_log: usize,
+    x_l_vals: &[F128],
+    x_r_vals: &[F128],
+    z_vals: &[F128],
+    iv_vals: &[F128],
+    b_bits: &[bool],
+    layout: SlotLayout,
+    grinding: MerklePathGrinding,
+    challenger: &mut Ch,
+) -> (MerklePathShiftProof, MerklePathClaims) {
     layout.validate();
     let n_total = z_vals.len();
     assert!(n_total.is_power_of_two(), "N must be a power of two");
@@ -246,6 +336,11 @@ pub fn prove_merkle_path_shift<Ch: Challenger>(
     let n_paths = 1usize << path_log;
     let n_pos = 1usize << pos_log;
 
+    let mut grinding_nonces = Vec::with_capacity(grinding.nonce_count(n, path_log));
+    let initial_bits = grinding.initial_bits_for(n, path_log);
+    if initial_bits != 0 {
+        grinding_nonces.push(challenger.grind_pow(initial_bits));
+    }
     // τ, α (transcript-driven, mirrored by verifier).
     let tau = challenger.sample_f128_vec(n);
     let alpha = challenger.sample_f128();
@@ -341,6 +436,9 @@ pub fn prove_merkle_path_shift<Ch: Challenger>(
         challenger.observe_f128(msg.q_1);
         challenger.observe_f128(msg.q_omega);
         challenger.observe_f128(msg.q_omega_plus_1);
+        if grinding.round_bits != 0 {
+            grinding_nonces.push(challenger.grind_pow(grinding.round_bits));
+        }
         let r = challenger.sample_f128();
         rounds.push(msg);
         r_pts.push(r);
@@ -420,6 +518,9 @@ pub fn prove_merkle_path_shift<Ch: Challenger>(
         challenger.observe_f128(msg.q_1);
         challenger.observe_f128(msg.q_omega);
         challenger.observe_f128(msg.q_omega_plus_1);
+        if grinding.round_bits != 0 {
+            grinding_nonces.push(challenger.grind_pow(grinding.round_bits));
+        }
         let r = challenger.sample_f128();
         rounds.push(msg);
         r_pts.push(r);
@@ -447,7 +548,11 @@ pub fn prove_merkle_path_shift<Ch: Challenger>(
     let sel_slot = r_pts[n + 1];
 
     (
-        MerklePathShiftProof { rounds, g_at_point },
+        MerklePathShiftProof {
+            rounds,
+            g_at_point,
+            grinding_nonces,
+        },
         MerklePathClaims {
             instance_point,
             sel_slot,
@@ -476,11 +581,41 @@ pub fn verify_merkle_path_shift<Ch: Challenger>(
     layout: SlotLayout,
     challenger: &mut Ch,
 ) -> Result<MerklePathClaims, MerklePathError> {
+    verify_merkle_path_shift_with_grinding(
+        path_log,
+        proof,
+        leaf_evals,
+        root_r,
+        b_bits,
+        n,
+        layout,
+        MerklePathGrinding::disabled(),
+        challenger,
+    )
+}
+
+/// [`verify_merkle_path_shift`] with explicit Fiat--Shamir grinding.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_merkle_path_shift_with_grinding<Ch: Challenger>(
+    path_log: usize,
+    proof: &MerklePathShiftProof,
+    leaf_evals: &[F128],
+    root_r: F128,
+    b_bits: &[bool],
+    n: usize,
+    layout: SlotLayout,
+    grinding: MerklePathGrinding,
+    challenger: &mut Ch,
+) -> Result<MerklePathClaims, MerklePathError> {
     layout.validate();
     let d = n + 2;
     if proof.rounds.len() != d {
         return Err(MerklePathError::MalformedProof);
     }
+    if proof.grinding_nonces.len() != grinding.nonce_count(n, path_log) {
+        return Err(MerklePathError::InvalidGrinding);
+    }
+    let mut nonce_idx = 0usize;
     assert!(path_log <= n, "path_log must be ≤ n");
     let pos_log = n - path_log;
     let n_paths = 1usize << path_log;
@@ -492,6 +627,13 @@ pub fn verify_merkle_path_shift<Ch: Challenger>(
     );
 
     // Resample τ, α (mirror prover).
+    let initial_bits = grinding.initial_bits_for(n, path_log);
+    if initial_bits != 0 {
+        if !challenger.verify_pow(proof.grinding_nonces[nonce_idx], initial_bits) {
+            return Err(MerklePathError::InvalidGrinding);
+        }
+        nonce_idx += 1;
+    }
     let tau = challenger.sample_f128_vec(n);
     let alpha = challenger.sample_f128();
     let tau_q = &tau[..pos_log];
@@ -517,6 +659,12 @@ pub fn verify_merkle_path_shift<Ch: Challenger>(
         challenger.observe_f128(msg.q_1);
         challenger.observe_f128(msg.q_omega);
         challenger.observe_f128(msg.q_omega_plus_1);
+        if grinding.round_bits != 0 {
+            if !challenger.verify_pow(proof.grinding_nonces[nonce_idx], grinding.round_bits) {
+                return Err(MerklePathError::InvalidGrinding);
+            }
+            nonce_idx += 1;
+        }
         let r = challenger.sample_f128();
         // q(0) = claim + q(1) (char 2 == subtraction).
         let q_0 = claim + msg.q_1;
@@ -574,6 +722,7 @@ pub fn verify_merkle_path_shift<Ch: Challenger>(
     if claim != w_final * proof.g_at_point {
         return Err(MerklePathError::SumcheckFinal);
     }
+    debug_assert_eq!(nonce_idx, proof.grinding_nonces.len());
 
     Ok(MerklePathClaims {
         instance_point,
@@ -688,6 +837,60 @@ mod tests {
 
             assert_eq!(claims_v, claims_p, "claims must match at n={n}");
         }
+    }
+
+    #[test]
+    fn grinding_roundtrip_and_rejects_bad_nonce_shape() {
+        let n = 4;
+        let path_log = 0;
+        let (x_l, x_r, z, iv, b, leaf, root) = build_honest_scenario(n, 0x1280_4D50);
+        let layout = canonical_layout();
+        let policy = MerklePathGrinding::per_challenge_128();
+        let mut chp = FsChallenger::new(b"merkle-path-grinding-test");
+        let (proof, claims_p) = prove_merkle_path_shift_with_grinding(
+            path_log,
+            &x_l,
+            &x_r,
+            &z,
+            &iv,
+            &b,
+            layout,
+            policy,
+            &mut chp,
+        );
+        let leaves = vec![leaf; 1 << path_log];
+        let mut chv = FsChallenger::new(b"merkle-path-grinding-test");
+        let claims_v = verify_merkle_path_shift_with_grinding(
+            path_log,
+            &proof,
+            &leaves,
+            root,
+            &b,
+            n,
+            layout,
+            policy,
+            &mut chv,
+        )
+        .expect("grinded Merkle-path shift verifies");
+        assert_eq!(claims_p, claims_v);
+
+        let mut missing = proof;
+        missing.grinding_nonces.pop();
+        let mut chv = FsChallenger::new(b"merkle-path-grinding-test");
+        assert_eq!(
+            verify_merkle_path_shift_with_grinding(
+                path_log,
+                &missing,
+                &leaves,
+                root,
+                &b,
+                n,
+                layout,
+                policy,
+                &mut chv,
+            ),
+            Err(MerklePathError::InvalidGrinding)
+        );
     }
 
     #[test]

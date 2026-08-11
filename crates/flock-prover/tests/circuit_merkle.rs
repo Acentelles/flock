@@ -68,12 +68,25 @@ fn pcs_batch(union: &UnionInstance) -> usize {
 /// workload inner, the leaf outer, the node outer) to Slim — rate 1/4,
 /// roughly HALF the queries (m29: Σq 262 vs Fast's 491), so the
 /// openings-dominated b3 trace shrinks with q while the doubled codeword
-/// lands on the native NTT+Merkle side. Default Fast; the legacy mvp
-/// tests stay Fast unconditionally.
+/// lands on the native NTT+Merkle side. `TOWER_PROFILE=secure` selects the
+/// Secure PCS schedules and the Boolean-zerocheck per-challenge grinding
+/// policy. Default Fast; the legacy mvp tests stay Fast unconditionally.
 fn tower_profile() -> LigeritoProfile {
     match std::env::var("TOWER_PROFILE").as_deref() {
         Ok("slim") => LigeritoProfile::Slim,
+        Ok("secure") => LigeritoProfile::Secure,
         _ => LigeritoProfile::Fast,
+    }
+}
+
+fn tower_fold_grinding() -> flock_core::matrix_fold::FoldGrinding {
+    match tower_profile() {
+        LigeritoProfile::Secure => {
+            flock_core::matrix_fold::FoldGrinding::per_challenge_128()
+        }
+        LigeritoProfile::Fast | LigeritoProfile::Slim => {
+            flock_core::matrix_fold::FoldGrinding::disabled()
+        }
     }
 }
 
@@ -4565,6 +4578,19 @@ struct PdRec {
     val_v: usize,
     fin: usize,
     ch: usize,
+    /// Word offset inside the vector squeeze shared by all batch coefficients.
+    squeeze_offset: usize,
+}
+
+#[inline]
+fn squeeze_word_wire(
+    outs: &[Vec<Wire>],
+    squeezes: &[Vec<usize>],
+    fin: usize,
+    offset: usize,
+) -> Wire {
+    let rows = &squeezes[fin];
+    outs[rows[offset / 4]][offset % 4]
 }
 
 /// One merged W-round: the (G(1), G(inf)) value index and the rho squeeze.
@@ -4701,6 +4727,16 @@ fn parse_open_levels(
             );
             self.bump();
         }
+
+        /// PoW finalizes the transcript and absorbs a nonce but creates no
+        /// field challenge or scalar message.  PIOP locators call this before
+        /// every protected squeeze; the generic circuit relation constrains
+        /// the skipped operation separately.
+        fn skip_pows(&mut self) {
+            while matches!(self.ops[self.i], Op::Pow { .. }) {
+                self.bump();
+            }
+        }
     }
 
     // Open start: the LAST ObserveBytes of the L0 cap's size —
@@ -4713,9 +4749,10 @@ fn parse_open_levels(
         .collect();
     assert!(starts.len() >= 2, "expected bind + open cap absorbs");
     let start = *starts.last().unwrap();
-    // The merged intake absorbs, per packed-direct claim, [point slice,
-    // value, gamma squeeze] right after the merged-open label — so the claim
-    // POINTS are stream words (wireable), and each gamma is a scalar squeeze.
+    // The merged intake runs every ring switch, absorbs every packed-direct
+    // value, then protects and samples ONE coefficient vector in claim order
+    // (RS first, PD second).  Consequently every PD coefficient below names
+    // both a challenge ordinal and a word offset in that shared finalization.
     let mut cur = Cur { ops, i: 0, fin: 0, ch: 0, v: 0 };
     let mut gammas: Vec<PdRec> = Vec::new();
     let mut rounds: Vec<RoundRec> = Vec::new();
@@ -4723,9 +4760,12 @@ fn parse_open_levels(
     let mut inner_pd: Option<InnerPd> = None;
     let mut piop: Option<PiopRec> = None;
     let mut in_pd = false;
+    let mut intake_rs = 0usize;
+    let mut intake_pd_vals: Vec<usize> = Vec::new();
     while cur.i < start {
         if matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == b"flock-element-union-zc-v0") {
             cur.bump();
+            cur.skip_pows();
             let (tau_fin, tau_ch, tau_len) = match ops[cur.i] {
                 Op::SqueezeSlice(n) => (cur.fin, cur.ch, n),
                 ref o => panic!("tau, got {o:?}"),
@@ -4736,6 +4776,7 @@ fn parse_open_levels(
                 let g_v = cur.v;
                 cur.expect_obs_scalar();
                 cur.expect_obs_scalar();
+                cur.skip_pows();
                 assert!(matches!(ops[cur.i], Op::SqueezeScalar), "zc rho");
                 zc_rounds.push(RoundRec { g_v, fin: cur.fin, ch: cur.ch });
                 cur.bump();
@@ -4749,6 +4790,7 @@ fn parse_open_levels(
                 "lc label"
             );
             cur.bump();
+            cur.skip_pows();
             assert!(matches!(ops[cur.i], Op::SqueezeScalar), "alpha");
             let (alpha_fin, alpha_ch) = (cur.fin, cur.ch);
             cur.bump();
@@ -4757,6 +4799,7 @@ fn parse_open_levels(
                 let g_v = cur.v;
                 cur.expect_obs_scalar();
                 cur.expect_obs_scalar();
+                cur.skip_pows();
                 assert!(matches!(ops[cur.i], Op::SqueezeScalar), "lc rho");
                 lc_rounds.push(RoundRec { g_v, fin: cur.fin, ch: cur.ch });
                 cur.bump();
@@ -4775,6 +4818,8 @@ fn parse_open_levels(
         }
         if matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == b"flock-merged-open-v1") {
             in_pd = true;
+            intake_rs = 0;
+            intake_pd_vals.clear();
             cur.bump();
             continue;
         }
@@ -4784,31 +4829,38 @@ fn parse_open_levels(
             // bare gamma squeezes — walk over them (mvp9 pins them
             // separately).
             if matches!(&ops[cur.i], Op::Label(l) if l.as_slice() == b"flock-ring-switch-v0") {
+                intake_rs += 1;
                 cur.bump(); // label
                 cur.bump(); // s_hat_v slice
+                cur.skip_pows();
                 cur.bump(); // r_dprime slice
                 continue;
             }
-            if matches!(ops[cur.i], Op::SqueezeScalar) {
-                // an rs gamma — bare squeeze, no absorb
+            if matches!(ops[cur.i], Op::Pow { .. }) {
+                // A ring-switch or packed-direct batch-coefficient witness.
                 cur.bump();
                 continue;
             }
-            if matches!(ops[cur.i], Op::ObserveScalar)
-                && matches!(ops[cur.i + 1], Op::SqueezeScalar)
-            {
-                // A pd claim absorbs its VALUE only (merged-open v1); the
-                // W-rounds that follow are [Obs, Obs, Squeeze] triplets, so
-                // the lookahead disambiguates.
-                let val_v = cur.v;
+            if matches!(ops[cur.i], Op::ObserveScalar) {
+                intake_pd_vals.push(cur.v);
                 cur.expect_obs_scalar();
-                gammas.push(PdRec {
+                continue;
+            }
+            if let Op::SqueezeSlice(n) = ops[cur.i] {
+                assert_eq!(
+                    n,
+                    intake_rs + intake_pd_vals.len(),
+                    "one coefficient per merged claim"
+                );
+                gammas.extend(intake_pd_vals.iter().enumerate().map(|(j, &val_v)| PdRec {
                     val_v,
                     fin: cur.fin,
-                    ch: cur.ch,
-                });
+                    ch: cur.ch + intake_rs + j,
+                    squeeze_offset: intake_rs + j,
+                }));
                 cur.bump();
-                continue;
+            } else {
+                panic!("merged batching vector, got {:?}", ops[cur.i]);
             }
             in_pd = false;
             // The merged W-rounds follow the intake immediately: one
@@ -4817,11 +4869,18 @@ fn parse_open_levels(
             // tapes (no packed-direct claims) parse identically.
             while matches!(ops[cur.i], Op::ObserveScalar)
                 && matches!(ops[cur.i + 1], Op::ObserveScalar)
-                && matches!(ops[cur.i + 2], Op::SqueezeScalar)
             {
+                let mut squeeze_i = cur.i + 2;
+                while matches!(ops[squeeze_i], Op::Pow { .. }) {
+                    squeeze_i += 1;
+                }
+                if !matches!(ops[squeeze_i], Op::SqueezeScalar) {
+                    break;
+                }
                 let g_v = cur.v;
                 cur.expect_obs_scalar();
                 cur.expect_obs_scalar();
+                cur.skip_pows();
                 rounds.push(RoundRec {
                     g_v,
                     fin: cur.fin,
@@ -4842,6 +4901,7 @@ fn parse_open_levels(
                 val_vs.push(cur.v);
                 cur.bump();
             }
+            cur.skip_pows();
             assert!(matches!(ops[cur.i], Op::SqueezeScalar), "multipoint gamma");
             let (gamma_fin, gamma_ch) = (cur.fin, cur.ch);
             cur.bump();
@@ -4850,6 +4910,7 @@ fn parse_open_levels(
                 let g_v = cur.v;
                 cur.expect_obs_scalar();
                 cur.expect_obs_scalar();
+                cur.skip_pows();
                 assert!(matches!(ops[cur.i], Op::SqueezeScalar), "multipoint round");
                 mp_rounds.push(RoundRec {
                     g_v,
@@ -4872,6 +4933,7 @@ fn parse_open_levels(
                 let g_v = cur.v;
                 cur.expect_obs_scalar();
                 cur.expect_obs_scalar();
+                cur.skip_pows();
                 assert!(matches!(ops[cur.i], Op::SqueezeScalar), "anchor round");
                 anchor_rounds.push(RoundRec {
                     g_v,
@@ -4894,7 +4956,7 @@ fn parse_open_levels(
             cur.bump();
             let q_v = cur.v;
             cur.expect_obs_scalar(); // q_eval
-            assert!(matches!(ops[cur.i], Op::SqueezeScalar), "inner gamma");
+            assert!(matches!(ops[cur.i], Op::SqueezeSlice(1)), "inner gamma vector");
             inner_pd = Some(InnerPd {
                 q_v,
                 fin: cur.fin,
@@ -5079,8 +5141,9 @@ fn parse_open_levels(
 /// (2026-08-03) closed the rest**: the multipoint region is fully
 /// in-circuit (MacGate T0/V chains, mrslot rounds, the AssistLayerGate
 /// anchor DP with claim-POINT joins load-bearing, three tail zero-deltas —
-/// the native `v` is gone), the PoW bit predicate binds through published
-/// digest/nonce wires, and the ElementAssertion exits as bound publics.
+/// the native `v` is gone), the PoW bit predicate is fully arithmetized
+/// (one shared BLAKE3 row plus selected-zero rows of the bit-spread table),
+/// and the ElementAssertion exits as bound publics.
 /// Nothing in the pure-element verifier is native. The inner proof commits with
 /// the lane grid at full utilization — count 2^13 x 4 cols = 2^15 words =
 /// exactly 2^22 dense bits, t = 64 — so L0 is the real 64-lane / 1 KiB-leaf
@@ -5289,6 +5352,7 @@ fn mvp7_real_query_phase() {
     chain.absorb(&bytes[at * 16..]);
     let trace = chain.finish();
     let b3_rows: usize = trace.rows.len()
+        + pows.iter().filter(|pr| pr.bits != 0).count()
         + geo
             .iter()
             .map(|g| (g.lanes / 4 + g.depth) * g.q + (1usize << g.c) - 1)
@@ -5484,7 +5548,7 @@ fn mvp7_real_query_phase() {
     // Outer target: SpineGate tr-rows accumulate gamma_k * value_k.
     let mut mt = zw;
     for pd in &gammas {
-        let gw = chw(&outs, &trace.squeezes, pd.fin);
+        let gw = squeeze_word_wire(&outs, &trace.squeezes, pd.fin, pd.squeeze_offset);
         let f = sb.gate(spine, &[zw, zw, zw, mt, zw, zw, wv(pd.val_v), gw, zw]);
         mt = f[3];
     }
@@ -5708,7 +5772,7 @@ fn mvp7_real_query_phase() {
         };
         for &i in members {
             let pd = &gammas[i];
-            let gpd_w = chw(&outs, &trace.squeezes, pd.fin);
+            let gpd_w = squeeze_word_wire(&outs, &trace.squeezes, pd.fin, pd.squeeze_offset);
             let mut tail = ow;
             for r in 0..n_single {
                 let y = r as u64;
@@ -5754,12 +5818,12 @@ fn mvp7_real_query_phase() {
     // 3d: the join — the anchor's folded claim equals the expect.
     let delta_anchor = sb.gate(macslot, &[acl, expect, ow])[0];
 
-    // ---- the PoW bit predicate (boundary pattern) ----
-    // Per Pow op, publish (state-digest words, nonce word): the digest is
-    // the chain finalize's first two output words, the nonce its aligned
-    // stream word. The checker recomputes H(digest ‖ nonce) natively and
-    // applies the leading-zero predicate — the same trust structure as the
-    // alpha expansion.
+    // ---- the PoW bit predicate ----
+    // Per Pow op, retain (state-digest words, nonce word): the digest is the
+    // chain finalize's first two output words, the nonce its aligned stream
+    // word. `emit_pow_checks` below hashes and checks these wires INSIDE the
+    // relation.  They remain published only as a native differential oracle;
+    // recursive soundness no longer depends on that boundary check.
     let pow_pub: Vec<[Wire; 3]> = pows
         .iter()
         .map(|pr| {
@@ -5773,6 +5837,20 @@ fn mvp7_real_query_phase() {
             [outs[sq[0]][0], outs[sq[0]][1], nw]
         })
         .collect();
+    let pow_checks: Vec<([Wire; 3], u32)> = pow_pub
+        .iter()
+        .zip(&pows)
+        .map(|(&w, pr)| (w, pr.bits))
+        .collect();
+    emit_pow_checks(
+        &mut sb,
+        slots.b3,
+        slots.spread,
+        iv,
+        &pow_checks,
+        &mut vals,
+        &mut consts,
+    );
 
     // ---- ASSERTION EMISSION: the ElementAssertion exits as bound publics.
     // For this one-slot inner every field is already a wire: alpha (chain),
@@ -5833,8 +5911,9 @@ fn mvp7_real_query_phase() {
     // ---- the boundary checks ----
     // The tail publics: three multipoint zero-deltas (T_m == anchor.v,
     // running_W == q_eval·V, claim == expect), per-Pow (digest word0,
-    // digest word1, nonce word) triples the checker validates natively,
-    // then the emitted ElementAssertion fields.
+    // digest word1, nonce word) triples the checker re-validates as a
+    // differential oracle (the relation already enforces them), then the
+    // emitted ElementAssertion fields.
     let n_assert = 1 + piop.zc_rounds.len() + piop.lc_rounds.len() + 3;
     let assert_base = built.public.len() - n_assert;
     {
@@ -6040,6 +6119,14 @@ fn mvp7_real_query_phase() {
     let spread_r1cs = spread_ty.build_block_r1cs(nu);
     let spread_lc = spread_r1cs.csc_lincheck_circuit();
 
+    for (i, row) in built.rows::<BitSpreadGate>(slots.spread).iter().enumerate() {
+        assert_eq!(
+            row.word & row.zero_mask,
+            0,
+            "bit-spread row {i} violates its selected-zero mask"
+        );
+    }
+
     let (b3_wit, wit_t) = timed(3, || {
         blake3::generate_witness_batch_major_partial(built.rows::<Blake3Gate>(slots.b3), nu)
     });
@@ -6142,7 +6229,9 @@ fn mvp7_real_query_phase() {
 
 // ---------------------------------------------------------------------------
 
-use flock_prover::r1cs_hashes::merkle_glue::{BitSpreadTable, SwapInput, SwapTable};
+use flock_prover::r1cs_hashes::merkle_glue::{
+    BitSpreadInput, BitSpreadTable, SwapInput, SwapTable,
+};
 
 /// One Merkle level's conditional swap. The sibling is a [`GateType::Hint`] —
 /// it is not word-aligned-wireable in the composite and nothing else reads it
@@ -6187,7 +6276,7 @@ struct BitSpreadGate {
 }
 
 impl GateType for BitSpreadGate {
-    type Row = u128;
+    type Row = BitSpreadInput;
     type Hint = ();
 
     fn table(&self) -> TableType {
@@ -6195,10 +6284,11 @@ impl GateType for BitSpreadGate {
             .with_io_schema(self.ty.io_schema())
     }
 
-    fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> u128 {
-        let idx = (inputs[0].lo as u128) | ((inputs[0].hi as u128) << 64);
-        outputs.extend((0..self.ty.depth).map(|l| F128::new(((idx >> l) & 1) as u64, 0)));
-        idx
+    fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> BitSpreadInput {
+        let word = (inputs[0].lo as u128) | ((inputs[0].hi as u128) << 64);
+        let zero_mask = (inputs[1].lo as u128) | ((inputs[1].hi as u128) << 64);
+        outputs.extend((0..self.ty.depth).map(|l| F128::new(((word >> l) & 1) as u64, 0)));
+        BitSpreadInput { word, zero_mask }
     }
 
     fn witness(&self, _rows: &[Self::Row], _nu: usize) -> SlotWitness {
@@ -7156,6 +7246,379 @@ fn check_residual_publics(
     inner_n
 }
 
+/// BLAKE3 serializes its output words little-endian, while "leading bits"
+/// means most-significant-bit first within each serialized byte.  Return the
+/// two circuit-word masks whose set bits are exactly that prefix.
+fn pow_leading_zero_masks(bits: u32) -> [F128; 2] {
+    assert!(bits <= 256, "a BLAKE3 digest has only 256 bits");
+    let mut masks = [0u128; 2];
+    for k in 0..bits as usize {
+        let serialized_bit = 8 * (k / 8) + (7 - k % 8);
+        masks[serialized_bit / 128] |= 1u128 << (serialized_bit % 128);
+    }
+    masks.map(|m| F128::new(m as u64, (m >> 64) as u64))
+}
+
+/// Arithmetize every grinding operation in a recorded verifier transcript.
+///
+/// For a nonzero target this emits the exact native predicate
+///
+/// ```text
+/// h = BLAKE3(state_digest || nonce_le || 0^192)
+/// prefix_bits(h, lambda) = 0^lambda
+/// nonce[64..128] = 0.
+/// ```
+///
+/// The one-block hash is a normal row of the shared BLAKE3 table.  The
+/// selected-zero equations are rows of the shared bit-spread table, whose
+/// mask input is a statement constant.  A zero-bit operation performs no
+/// hash (matching `verify_pow`) and instead enforces the canonical nonce 0.
+fn emit_pow_checks(
+    sb: &mut ShapeBuilder,
+    b3: flock_core::circuit::builder::SlotId,
+    spread: flock_core::circuit::builder::SlotId,
+    iv: [Wire; 2],
+    pows: &[([Wire; 3], u32)],
+    vals: &mut Vec<F128>,
+    consts: &mut Vec<(F128, Wire)>,
+) {
+    let zero = cw(sb, vals, consts, F128::ZERO);
+    let params = cw(
+        sb,
+        vals,
+        consts,
+        pack_params(0, 64, CHUNK_START | CHUNK_END | ROOT),
+    );
+    let nonce_hi_mask = F128::new(0, u64::MAX);
+
+    for &([d0, d1, nonce], bits) in pows {
+        // The transcript stream allocates a whole F128 word to the 8-byte
+        // nonce.  This constraint is what makes the remaining eight bytes
+        // padding rather than an extra grinding knob available to a
+        // malicious recursive prover.
+        let nonce_mask = if bits == 0 {
+            F128::new(u64::MAX, u64::MAX)
+        } else {
+            nonce_hi_mask
+        };
+        let nonce_mask_w = cw(sb, vals, consts, nonce_mask);
+        let _ = sb.gate(spread, &[nonce, nonce_mask_w]);
+
+        if bits == 0 {
+            continue;
+        }
+
+        // `blake3_pow_preimage` is exactly four circuit words:
+        // digest[0..32], nonce[0..8] plus the now-constrained zero high
+        // half, and one final all-zero word.
+        let h = sb.gate(
+            b3,
+            &[iv[0], iv[1], d0, d1, nonce, zero, params],
+        );
+        let masks = pow_leading_zero_masks(bits);
+        for (digest_word, mask) in [h[0], h[1]].into_iter().zip(masks) {
+            if mask != F128::ZERO {
+                let mask_w = cw(sb, vals, consts, mask);
+                let _ = sb.gate(spread, &[digest_word, mask_w]);
+            }
+        }
+    }
+}
+
+/// Locate the PoW state-digest finalization and nonce payloads on an
+/// arbitrary recorded tape, turn them into wires from its emitted FS chain,
+/// and constrain every native `verify_pow` call in-circuit.
+#[allow(clippy::too_many_arguments)]
+fn emit_recorded_pow_checks(
+    sb: &mut ShapeBuilder,
+    b3: flock_core::circuit::builder::SlotId,
+    spread: flock_core::circuit::builder::SlotId,
+    iv: [Wire; 2],
+    ops: &[flock_core::transcript_record::TranscriptOp],
+    trace: &flock_prover::r1cs_hashes::fs_chain::FsChainTrace,
+    stream: &flock_core::transcript_record::Stream,
+    outs: &[Vec<Wire>],
+    ww: &[Option<Wire>],
+    vals: &mut Vec<F128>,
+    consts: &mut Vec<(F128, Wire)>,
+) {
+    use flock_core::transcript_record::TranscriptOp as Op;
+    let (mut fin, mut pay) = (0usize, 0usize);
+    let mut pows = Vec::new();
+    for op in ops {
+        if let Op::Pow { bits } = op {
+            pows.push((fin, pay, *bits));
+        }
+        if op.finalizes() {
+            fin += 1;
+        }
+        if matches!(op, Op::ObserveBytes(_) | Op::Pow { .. }) {
+            pay += 1;
+        }
+    }
+    let checks: Vec<([Wire; 3], u32)> = pows
+        .into_iter()
+        .map(|(fin, pay, bits)| {
+            let sq = &trace.squeezes[fin];
+            let wi = stream
+                .words
+                .iter()
+                .position(|w| matches!(w, flock_core::transcript_record::StreamWord::Bytes { payload, .. } if *payload == pay))
+                .expect("pow nonce stream word");
+            (
+                [outs[sq[0]][0], outs[sq[0]][1], ww[wi].expect("pow nonce wired")],
+                bits,
+            )
+        })
+        .collect();
+    emit_pow_checks(sb, b3, spread, iv, &checks, vals, consts);
+}
+
+#[test]
+fn recursive_pow_hash_and_masks_match_native() {
+    let mut state_digest = [0u8; 32];
+    for (i, b) in state_digest.iter_mut().enumerate() {
+        *b = (17 * i + 9) as u8;
+    }
+
+    for nonce in 0..64u64 {
+        let mut preimage = [0u8; 64];
+        preimage[..32].copy_from_slice(&state_digest);
+        preimage[32..40].copy_from_slice(&nonce.to_le_bytes());
+        let native_hash = ::blake3::hash(&preimage);
+
+        // Pin the exact single-row BLAKE3 construction used by
+        // `emit_pow_checks`, including ROOT (without it this would only be a
+        // chaining value, not `blake3::hash`).
+        let message: [u32; 16] = std::array::from_fn(|i| {
+            u32::from_le_bytes(preimage[4 * i..4 * i + 4].try_into().unwrap())
+        });
+        let compressed = blake3::blake3_compress(
+            &IV,
+            &message,
+            0,
+            64,
+            CHUNK_START | CHUNK_END | ROOT,
+        );
+        let mut circuit_hash = [0u8; 32];
+        for (i, w) in compressed[..8].iter().enumerate() {
+            circuit_hash[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        assert_eq!(circuit_hash, *native_hash.as_bytes());
+
+        let digest_words = [
+            u128::from_le_bytes(circuit_hash[..16].try_into().unwrap()),
+            u128::from_le_bytes(circuit_hash[16..].try_into().unwrap()),
+        ];
+        for bits in [1u32, 2, 7, 8, 9, 13, 16, 17, 31, 64, 127, 128, 129, 255, 256] {
+            let masks = pow_leading_zero_masks(bits).map(|m| {
+                (m.lo as u128) | ((m.hi as u128) << 64)
+            });
+            let circuit_accepts = (digest_words[0] & masks[0]) == 0
+                && (digest_words[1] & masks[1]) == 0;
+            assert_eq!(
+                circuit_accepts,
+                flock_core::challenger::pow_has_leading_zero_bits(
+                    &state_digest,
+                    nonce,
+                    bits,
+                    HashKind::Blake3,
+                ),
+                "nonce {nonce}, lambda {bits}"
+            );
+        }
+    }
+
+    // Pin the other half of the gadget: nonzero-bit PoW permits only a
+    // 64-bit nonce, and a zero-bit site permits only canonical nonce zero.
+    let ty = BitSpreadTable::new(1);
+    let r1cs = ty.build_block_r1cs(0);
+    let satisfies = |word: u128, zero_mask: u128| {
+        let [z, _, _] = ty.build_masked_witness(BitSpreadInput { word, zero_mask });
+        r1cs.satisfies(&z)
+    };
+    assert!(satisfies(42, (u128::MAX) << 64));
+    assert!(!satisfies((1u128 << 100) | 42, (u128::MAX) << 64));
+    assert!(satisfies(0, u128::MAX));
+    assert!(!satisfies(1, u128::MAX));
+}
+
+#[test]
+fn recursive_pow_relation_accepts_valid_and_rejects_invalid_nonce() {
+    let bits = 6u32;
+    let mut state_digest = [0u8; 32];
+    for (i, b) in state_digest.iter_mut().enumerate() {
+        *b = (29 * i + 3) as u8;
+    }
+    let good = (0..u64::MAX)
+        .find(|&n| {
+            flock_core::challenger::pow_has_leading_zero_bits(
+                &state_digest,
+                n,
+                bits,
+                HashKind::Blake3,
+            )
+        })
+        .expect("a six-bit nonce exists");
+    let bad = (good + 1..u64::MAX)
+        .find(|&n| {
+            !flock_core::challenger::pow_has_leading_zero_bits(
+                &state_digest,
+                n,
+                bits,
+                HashKind::Blake3,
+            )
+        })
+        .expect("a neighboring invalid nonce exists");
+
+    let build = |nonce: u64| {
+        // BLAKE3 has k_log=15; nu=7 places this focused union at the
+        // smallest embedded security-config size m=22.
+        let nu = 7usize;
+        let mut sb = ShapeBuilder::new(nu);
+        let b3 = sb.slot(Blake3Gate { nu });
+        let spread = sb.slot(BitSpreadGate {
+            ty: BitSpreadTable::new(1),
+            nu,
+        });
+        let mut vals = Vec::new();
+        let iv_v = pack8(&IV);
+        vals.extend_from_slice(&iv_v);
+        let iv = [sb.public_input(), sb.public_input()];
+        let digest_v = [
+            F128::new(
+                u64::from_le_bytes(state_digest[..8].try_into().unwrap()),
+                u64::from_le_bytes(state_digest[8..16].try_into().unwrap()),
+            ),
+            F128::new(
+                u64::from_le_bytes(state_digest[16..24].try_into().unwrap()),
+                u64::from_le_bytes(state_digest[24..].try_into().unwrap()),
+            ),
+        ];
+        vals.extend_from_slice(&[digest_v[0], digest_v[1], F128::new(nonce, 0)]);
+        let digest_w = [sb.input(), sb.input()];
+        let nonce_w = sb.input();
+        let mut consts = Vec::new();
+        emit_pow_checks(
+            &mut sb,
+            b3,
+            spread,
+            iv,
+            &[([digest_w[0], digest_w[1], nonce_w], bits)],
+            &mut vals,
+            &mut consts,
+        );
+        let shape = sb.finish().expect("the focused PoW circuit builds");
+        let built = shape.run(&vals, &[]);
+        (nu, b3, spread, shape, built)
+    };
+
+    let (nu, good_b3, good_spread, good_shape, good_built) = build(good);
+    let (_, bad_b3, bad_spread, bad_shape, bad_built) = build(bad);
+    assert_eq!(good_shape.circuit.digest(), bad_shape.circuit.digest());
+    assert!(
+        good_built
+            .rows::<BitSpreadGate>(good_spread)
+            .iter()
+            .all(|r| r.word & r.zero_mask == 0),
+        "the valid witness satisfies every selected-zero row"
+    );
+    assert!(
+        bad_built
+            .rows::<BitSpreadGate>(bad_spread)
+            .iter()
+            .any(|r| r.word & r.zero_mask != 0),
+        "the invalid nonce reaches a failing in-circuit prefix row"
+    );
+
+    let prove = |shape: &flock_core::circuit::builder::CircuitShape,
+                 built: &flock_core::circuit::builder::CircuitWitness,
+                 b3_slot,
+                 spread_slot| {
+        let mut union = UnionInstance::new(&shape.registry, shape.counts.clone());
+        union.set_dense_floor(22);
+        let pcs = PcsParams {
+            m: union.dense_m(),
+            log_inv_rate: 1,
+            log_batch_size: pcs_batch(&union),
+            profile: LigeritoProfile::Fast,
+            num_lanes: union.commit_lanes(pcs_batch(&union)),
+            merkle_hash: HashKind::Blake3,
+        };
+        let b3_r1cs = blake3::build_block_r1cs(nu);
+        let b3_lc = b3_r1cs.csc_lincheck_circuit();
+        let spread_ty = BitSpreadTable::new(1);
+        let spread_r1cs = spread_ty.build_block_r1cs(nu);
+        let spread_lc = spread_r1cs.csc_lincheck_circuit();
+        let mut slots = vec![
+            (
+                shape.registry_slot(b3_slot),
+                UnionSlotProverInput::new(
+                    blake3::generate_witness_batch_major_partial(
+                        built.rows::<Blake3Gate>(b3_slot),
+                        nu,
+                    ),
+                    b3_lc,
+                ),
+            ),
+            (
+                shape.registry_slot(spread_slot),
+                UnionSlotProverInput::new(
+                    spread_ty.generate_witness_batch_major(
+                        built.rows::<BitSpreadGate>(spread_slot),
+                        nu,
+                    ),
+                    spread_lc,
+                ),
+            ),
+        ];
+        slots.sort_by_key(|(i, _)| *i);
+        let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
+        let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
+            &union,
+            &shape.circuit,
+            &built.public,
+            &pcs,
+            slots.into_iter().map(|(_, s)| s).collect(),
+            Vec::new(),
+            &mut ch,
+        );
+        let mut lcs = vec![
+            (shape.registry_slot(b3_slot), b3_lc),
+            (shape.registry_slot(spread_slot), spread_lc),
+        ];
+        lcs.sort_by_key(|(i, _)| *i);
+        let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
+            lcs.into_iter()
+                .map(|(_, lc)| lc as &dyn flock_core::lincheck::LincheckCircuit)
+                .collect();
+        let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
+        verifier::verify_ligerito_union_circuit(
+            &union,
+            &shape.circuit,
+            &built.public,
+            &lcs,
+            &commitment,
+            &proof,
+            &pcs,
+            &mut ch,
+        )
+    };
+
+    prove(&good_shape, &good_built, good_b3, good_spread)
+        .expect("a valid grinding witness proves and verifies");
+    let bad_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        prove(&bad_shape, &bad_built, bad_b3, bad_spread)
+    }));
+    assert!(
+        match bad_result {
+            Ok(result) => result.is_err(),
+            Err(_) => true,
+        },
+        "an invalid grinding witness must not yield an accepted recursive proof"
+    );
+}
+
 /// Emit one Merkle opening as rows of the shipped BLAKE3 table plus glue,
 /// wired together. Returns the two words of the root.
 ///
@@ -7201,14 +7664,17 @@ fn emit_opening(
             }
         }
     };
+    let zero_w = shared(sb, pubs, F128::ZERO);
     let pad_w = if leaf_w.len() % 4 == 0 {
         None
     } else {
-        Some(shared(sb, pubs, F128::ZERO))
+        Some(zero_w)
     };
 
     // The index word's bits, one per level.
-    let bits = sb.gate(s.spread, &[index_w]);
+    // Its zero mask is empty: this row only relocates bits.  Grinding rows
+    // below reuse the same table with nonzero masks to enforce predicates.
+    let bits = sb.gate(s.spread, &[index_w, zero_w]);
 
     // Chunk chain: the leaf hashed as a BLAKE3 chunk.
     let mut cv = iv;
@@ -7837,7 +8303,8 @@ fn mvp6_all_levels_collapsed() {
 /// - IN-CIRCUIT: the full FS chain; the full query phase (collapsed
 ///   openings against the absorbed caps, FS-derived v, boundary-
 ///   expanded alpha, per-level enforced sums == native replicas); the
-///   PoW bit predicate (published digest/nonce wires, checker-applied);
+///   PoW bit predicate (BLAKE3 + selected-zero constraints in-circuit;
+///   published digest/nonce wires retained as a differential oracle);
 ///   and the intake W-rounds (target as checker-validated advice — the
 ///   sc dots are family-H, the bit-matrix transpose — with rho BOUND
 ///   in-circuit and running published). The outer proves and verifies
@@ -7986,6 +8453,10 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             i += 1;
         }
         i += 1;
+        while matches!(ops[i], Op2::Pow { .. }) {
+            bump(&ops[i], &mut v, &mut c);
+            i += 1;
+        }
         assert!(matches!(ops[i], Op2::SqueezeSlice(_)), "zc tau lo");
         bump(&ops[i], &mut v, &mut c);
         i += 1;
@@ -8000,6 +8471,10 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         assert!(matches!(ops[i], Op2::ObserveSlice(64)), "round1_c");
         bump(&ops[i], &mut v, &mut c);
         i += 1;
+        while matches!(ops[i], Op2::Pow { .. }) {
+            bump(&ops[i], &mut v, &mut c);
+            i += 1;
+        }
         assert!(matches!(ops[i], Op2::SqueezeScalar), "z_skip");
         bump(&ops[i], &mut v, &mut c);
         i += 1;
@@ -8007,14 +8482,18 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         assert_eq!(&vals_rec[r1c_v..r1c_v + 64], &proof.zerocheck.round1_c[..], "round1_c words");
         let mut zc_rounds = Vec::new();
         loop {
-            // rounds are [obs, obs, squeeze]; the finals are obs NOT
-            // followed by a squeeze.
-            if matches!(ops[i], Op2::ObserveScalar)
-                && matches!(ops[i + 1], Op2::ObserveScalar)
-                && matches!(ops[i + 2], Op2::SqueezeScalar)
-            {
+            // Rounds are [obs, obs, Pow*, squeeze]; the finals are obs NOT
+            // followed by a (possibly grinded) squeeze.
+            if matches!(ops[i], Op2::ObserveScalar) && matches!(ops[i + 1], Op2::ObserveScalar) {
+                let mut squeeze_i = i + 2;
+                while matches!(ops[squeeze_i], Op2::Pow { .. }) {
+                    squeeze_i += 1;
+                }
+                if !matches!(ops[squeeze_i], Op2::SqueezeScalar) {
+                    break;
+                }
                 zc_rounds.push((v, c + 1));
-                for _ in 0..3 {
+                while i <= squeeze_i {
                     bump(&ops[i], &mut v, &mut c);
                     i += 1;
                 }
@@ -8045,19 +8524,33 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         );
         i += 1;
         let mut lc_pre_squeezes = 0usize;
-        while matches!(ops[i], Op2::SqueezeScalar) {
+        loop {
+            // Secure profiles put a PoW witness immediately before alpha and
+            // every const-pin beta.  It changes the transcript chain but not
+            // this parser's scalar/challenge ordinals.
+            while matches!(ops[i], Op2::Pow { .. }) {
+                bump(&ops[i], &mut v, &mut c);
+                i += 1;
+            }
+            if !matches!(ops[i], Op2::SqueezeScalar) {
+                break;
+            }
             lc_pre_squeezes += 1;
             bump(&ops[i], &mut v, &mut c);
             i += 1;
         }
         assert!(lc_pre_squeezes >= 1, "lc alpha");
         let mut lc_rounds = Vec::new();
-        while matches!(ops[i], Op2::ObserveScalar)
-            && matches!(ops[i + 1], Op2::ObserveScalar)
-            && matches!(ops[i + 2], Op2::SqueezeScalar)
-        {
+        while matches!(ops[i], Op2::ObserveScalar) && matches!(ops[i + 1], Op2::ObserveScalar) {
+            let mut squeeze_i = i + 2;
+            while matches!(ops[squeeze_i], Op2::Pow { .. }) {
+                squeeze_i += 1;
+            }
+            if !matches!(ops[squeeze_i], Op2::SqueezeScalar) {
+                break;
+            }
             lc_rounds.push((v, c + 1));
-            for _ in 0..3 {
+            while i <= squeeze_i {
                 bump(&ops[i], &mut v, &mut c);
                 i += 1;
             }
@@ -8131,6 +8624,10 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         i += 1;
     }
     assert_eq!(val_vs.len(), 256, "2×128 RS dual values absorbed");
+    while matches!(ops[i], Op::Pow { .. }) {
+        bump(&ops[i], &mut v, &mut c);
+        i += 1;
+    }
     assert!(matches!(ops[i], Op::SqueezeScalar), "multipoint gamma");
     let gamma = chals[c];
     bump(&ops[i], &mut v, &mut c);
@@ -8140,6 +8637,10 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         let g_v = v;
         for _ in 0..2 {
             assert!(matches!(ops[i], Op::ObserveScalar));
+            bump(&ops[i], &mut v, &mut c);
+            i += 1;
+        }
+        while matches!(ops[i], Op::Pow { .. }) {
             bump(&ops[i], &mut v, &mut c);
             i += 1;
         }
@@ -8160,6 +8661,10 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
     let mut anchor_rounds = 0usize;
     while matches!(ops[i], Op::ObserveScalar) {
         for _ in 0..2 {
+            bump(&ops[i], &mut v, &mut c);
+            i += 1;
+        }
+        while matches!(ops[i], Op::Pow { .. }) {
             bump(&ops[i], &mut v, &mut c);
             i += 1;
         }
@@ -8223,6 +8728,10 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             let sv = v;
             bump(&ops[i], &mut v, &mut c);
             i += 1;
+            while matches!(ops[i], Op::Pow { .. }) {
+                bump(&ops[i], &mut v, &mut c);
+                i += 1;
+            }
             assert!(matches!(ops[i], Op::SqueezeSlice(7)), "r_dprime");
             let rc = c;
             bump(&ops[i], &mut v, &mut c);
@@ -8230,13 +8739,14 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             rs_recs.push((sv, rc));
         }
         assert_eq!(rs_recs.len(), 2, "rs×2 at the leaf");
-        let mut gs = Vec::new();
-        for _ in 0..2 {
-            assert!(matches!(ops[i], Op::SqueezeScalar), "rs gamma");
-            gs.push(chals[c]);
+        while matches!(ops[i], Op::Pow { .. }) {
             bump(&ops[i], &mut v, &mut c);
             i += 1;
         }
+        assert!(matches!(ops[i], Op::SqueezeSlice(2)), "rs coefficient vector");
+        let gs = vec![chals[c], chals[c + 1]];
+        bump(&ops[i], &mut v, &mut c);
+        i += 1;
         let mut target = F128::ZERO;
         let mut coeffs: Vec<Vec<F128>> = Vec::new();
         for (k, &(sv, rc)) in rs_recs.iter().enumerate() {
@@ -8253,12 +8763,20 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             coeffs.push(rs::linearized_coefficients(&rs::build_fold_byte_table(&scaled)));
         }
         let mut running = target;
-        while matches!(ops[i], Op::ObserveScalar)
-            && matches!(ops[i + 1], Op::ObserveScalar)
-            && matches!(ops[i + 2], Op::SqueezeScalar)
-        {
+        while matches!(ops[i], Op::ObserveScalar) && matches!(ops[i + 1], Op::ObserveScalar) {
+            let mut squeeze_i = i + 2;
+            while matches!(ops[squeeze_i], Op::Pow { .. }) {
+                squeeze_i += 1;
+            }
+            if !matches!(ops[squeeze_i], Op::SqueezeScalar) {
+                break;
+            }
             let (g1, gi) = (vals_rec[v], vals_rec[v + 1]);
             for _ in 0..2 {
+                bump(&ops[i], &mut v, &mut c);
+                i += 1;
+            }
+            while i < squeeze_i {
                 bump(&ops[i], &mut v, &mut c);
                 i += 1;
             }
@@ -8329,7 +8847,12 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             rec.payloads(),
         );
         assert_chain_replays(&ops, &trace, &chals);
+        let pow_hash_rows = ops
+            .iter()
+            .filter(|op| matches!(op, Op::Pow { bits } if *bits != 0))
+            .count();
         let b3_rows: usize = trace.rows.len()
+            + pow_hash_rows
             + geo
                 .iter()
                 .map(|g| (g.lanes / 4 + g.depth) * g.q + (1usize << g.c) - 1)
@@ -8447,6 +8970,20 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
                 [outs[sq[0]][0], outs[sq[0]][1], nw]
             })
             .collect();
+        let pow_checks: Vec<([Wire; 3], u32)> = pow_pub
+            .iter()
+            .zip(&pows)
+            .map(|(&w, pr)| (w, pr.bits))
+            .collect();
+        emit_pow_checks(
+            &mut sb,
+            slots.b3,
+            slots.spread,
+            iv,
+            &pow_checks,
+            &mut vals,
+            &mut consts,
+        );
 
         let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
         let cap_w = cap_wires(&stream, &ww, &cap_pays);
@@ -8601,6 +9138,10 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
                 i2 += 1;
             }
             i2 += 1;
+            while matches!(ops2[i2], Op4::Pow { .. }) {
+                bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
+                i2 += 1;
+            }
             // r_skip: SqueezeSlice(6)
             bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
             i2 += 1;
@@ -8614,21 +9155,37 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             let r1c_v = v2;
             bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
             i2 += 1;
+            while matches!(ops2[i2], Op4::Pow { .. }) {
+                bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
+                i2 += 1;
+            }
             let (z_ch, z_fin) = (c2, f2);
             bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
             i2 += 1;
             let mut rounds2 = Vec::new();
             while matches!(ops2[i2], Op4::ObserveScalar)
                 && matches!(ops2[i2 + 1], Op4::ObserveScalar)
-                && matches!(ops2[i2 + 2], Op4::SqueezeScalar)
             {
+                let mut squeeze_i = i2 + 2;
+                while matches!(ops2[squeeze_i], Op4::Pow { .. }) {
+                    squeeze_i += 1;
+                }
+                if !matches!(ops2[squeeze_i], Op4::SqueezeScalar) {
+                    break;
+                }
                 let g_v = v2;
                 bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
-                bump2(&ops2[i2 + 1], &mut v2, &mut c2, &mut f2);
+                i2 += 1;
+                bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
+                i2 += 1;
+                while matches!(ops2[i2], Op4::Pow { .. }) {
+                    bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
+                    i2 += 1;
+                }
                 let (ch, fin) = (c2, f2);
-                bump2(&ops2[i2 + 2], &mut v2, &mut c2, &mut f2);
+                bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
+                i2 += 1;
                 rounds2.push((g_v, ch, fin));
-                i2 += 3;
             }
             // the zc finals (v_a, v_b — the lincheck's entry values)
             let mut finals_v = Vec::new();
@@ -8642,26 +9199,44 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
                 "lincheck label"
             );
             i2 += 1;
+            while matches!(ops2[i2], Op4::Pow { .. }) {
+                bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
+                i2 += 1;
+            }
             let (alpha_ch2, alpha_fin2) = (c2, f2);
             assert!(matches!(ops2[i2], Op4::SqueezeScalar), "lc alpha");
             bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
             i2 += 1;
+            while matches!(ops2[i2], Op4::Pow { .. }) {
+                bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
+                i2 += 1;
+            }
             let (beta_ch2, beta_fin2) = (c2, f2);
             assert!(matches!(ops2[i2], Op4::SqueezeScalar), "lc beta (const pin)");
             bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
             i2 += 1;
             let mut lc_rounds2 = Vec::new();
-            while matches!(ops2[i2], Op4::ObserveScalar)
-                && matches!(ops2[i2 + 1], Op4::ObserveScalar)
-                && matches!(ops2[i2 + 2], Op4::SqueezeScalar)
-            {
+            while matches!(ops2[i2], Op4::ObserveScalar) && matches!(ops2[i2 + 1], Op4::ObserveScalar) {
+                let mut squeeze_i = i2 + 2;
+                while matches!(ops2[squeeze_i], Op4::Pow { .. }) {
+                    squeeze_i += 1;
+                }
+                if !matches!(ops2[squeeze_i], Op4::SqueezeScalar) {
+                    break;
+                }
                 let g_v = v2;
                 bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
-                bump2(&ops2[i2 + 1], &mut v2, &mut c2, &mut f2);
+                i2 += 1;
+                bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
+                i2 += 1;
+                while matches!(ops2[i2], Op4::Pow { .. }) {
+                    bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
+                    i2 += 1;
+                }
                 let (ch, fin) = (c2, f2);
-                bump2(&ops2[i2 + 2], &mut v2, &mut c2, &mut f2);
+                bump2(&ops2[i2], &mut v2, &mut c2, &mut f2);
                 lc_rounds2.push((g_v, ch, fin));
-                i2 += 3;
+                i2 += 1;
             }
             (
                 (outer_ch, outer_fin, r1ab_v, r1c_v, z_ch, z_fin),
@@ -8849,21 +9424,33 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
                 bump3(&ops3[i3], &mut v3, &mut c3, &mut f3);
                 i3 += 1;
             }
+            while matches!(ops3[i3], Op5::Pow { .. }) {
+                bump3(&ops3[i3], &mut v3, &mut c3, &mut f3);
+                i3 += 1;
+            }
             let (gch, gfin) = (c3, f3);
             bump3(&ops3[i3], &mut v3, &mut c3, &mut f3);
             i3 += 1;
             let mut rds = Vec::new();
             while matches!(ops3[i3], Op5::ObserveScalar) && !matches!(ops3[i3], Op5::Label(_)) {
-                if !matches!(ops3[i3 + 2], Op5::SqueezeScalar) {
+                let mut squeeze_i = i3 + 2;
+                while matches!(ops3[squeeze_i], Op5::Pow { .. }) {
+                    squeeze_i += 1;
+                }
+                if !matches!(ops3[squeeze_i], Op5::SqueezeScalar) {
                     break;
                 }
                 let g_v = v3;
                 bump3(&ops3[i3], &mut v3, &mut c3, &mut f3);
                 bump3(&ops3[i3 + 1], &mut v3, &mut c3, &mut f3);
+                while i3 + 2 < squeeze_i {
+                    bump3(&ops3[i3 + 2], &mut v3, &mut c3, &mut f3);
+                    i3 += 1;
+                }
                 let (ch, fin) = (c3, f3);
-                bump3(&ops3[i3 + 2], &mut v3, &mut c3, &mut f3);
+                bump3(&ops3[squeeze_i], &mut v3, &mut c3, &mut f3);
                 rds.push((g_v, ch, fin));
-                i3 += 3;
+                i3 = squeeze_i + 1;
             }
             assert!(
                 matches!(&ops3[i3], Op5::Label(l) if l.as_slice() == b"flock-frobenius-assist-v0")
@@ -8877,10 +9464,18 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
                 let g_v = v3;
                 bump3(&ops3[i3], &mut v3, &mut c3, &mut f3);
                 bump3(&ops3[i3 + 1], &mut v3, &mut c3, &mut f3);
+                let mut squeeze_i = i3 + 2;
+                while matches!(ops3[squeeze_i], Op5::Pow { .. }) {
+                    squeeze_i += 1;
+                }
+                while i3 + 2 < squeeze_i {
+                    bump3(&ops3[i3 + 2], &mut v3, &mut c3, &mut f3);
+                    i3 += 1;
+                }
                 let (ch, fin) = (c3, f3);
-                bump3(&ops3[i3 + 2], &mut v3, &mut c3, &mut f3);
+                bump3(&ops3[squeeze_i], &mut v3, &mut c3, &mut f3);
                 ards.push((g_v, ch, fin));
-                i3 += 3;
+                i3 = squeeze_i + 1;
             }
             (gch, gfin, rds, av, ards)
         };
@@ -9691,10 +10286,11 @@ struct RealTape<'p> {
     zskip_fin: usize,
     zp_v: usize,
     /// The rs regions: (s_hat_v ordinal, r_dprime fin, r_dprime ch), plus
-    /// the two rs gammas' first (fin, ch) — the family-H re-exposure set.
+    /// the two rs gammas' `(fin, word offset)` and challenge ordinals — the
+    /// family-H re-exposure set.  Both coefficients share one vector squeeze.
     rs_recs: Vec<(usize, usize, usize)>,
-    rs_gam_fin: usize,
-    rs_gam_ch: usize,
+    rs_gam_fins: Vec<(usize, usize)>,
+    rs_gam_chs: Vec<usize>,
     // native references + replicas
     mat_assert: flock_core::lincheck::MatrixAssertion,
     el_assert: flock_core::element_r1cs::union::ElementAssertion,
@@ -9911,6 +10507,9 @@ impl<'p> RealTape<'p> {
         let gkr_rec = {
             let gkr = &lo.proof.wiring.gkr;
             let mut i = gkr_l[0] + 1;
+            while matches!(ops[i], Op::Pow { .. }) {
+                i += 1;
+            }
             assert!(matches!(ops[i], Op::SqueezeScalar), "gkr alpha");
             let (_, c_alpha) = vc_at(i);
             let alpha_fin = fin_at(i);
@@ -9929,6 +10528,9 @@ impl<'p> RealTape<'p> {
             let mut lrecs: Vec<GkrLayerRec> = Vec::new();
             for (k, layer) in gkr.layers.iter().enumerate() {
                 assert_eq!(layer.rounds.len(), k, "layer {k} has k rounds");
+                while matches!(ops[i], Op::Pow { .. }) {
+                    i += 1;
+                }
                 assert!(matches!(ops[i], Op::SqueezeScalar), "layer {k} lambda");
                 let (_, lc2) = vc_at(i);
                 let lambda = chals[lc2];
@@ -9943,11 +10545,15 @@ impl<'p> RealTape<'p> {
                     let (gv, _) = vc_at(i);
                     assert_eq!(vals_rec[gv], g1, "layer {k} round {t2} g1");
                     assert_eq!(vals_rec[gv + 1], gi, "layer {k} round {t2} g_inf");
-                    assert!(matches!(ops[i + 2], Op::SqueezeScalar), "round rho");
-                    let (_, rc2) = vc_at(i + 2);
+                    let mut rho_i = i + 2;
+                    while matches!(ops[rho_i], Op::Pow { .. }) {
+                        rho_i += 1;
+                    }
+                    assert!(matches!(ops[rho_i], Op::SqueezeScalar), "round rho");
+                    let (_, rc2) = vc_at(rho_i);
                     let rho = chals[rc2];
-                    rrecs.push((gv, fin_at(i + 2)));
-                    i += 3;
+                    rrecs.push((gv, fin_at(rho_i)));
+                    i = rho_i + 1;
                     let r_eq = r_pt[t2];
                     let g0 = (c_run + r_eq * g1) * (F128::ONE + r_eq).inv();
                     g0s.push(g0);
@@ -9968,6 +10574,9 @@ impl<'p> RealTape<'p> {
                     layer.vl0 * layer.vl1 + lambda * (layer.vr0 * layer.vr1),
                     "layer {k} closes"
                 );
+                while matches!(ops[i], Op::Pow { .. }) {
+                    i += 1;
+                }
                 assert!(matches!(ops[i], Op::SqueezeScalar), "layer {k} c_k");
                 let (_, cc2) = vc_at(i);
                 let c_k = chals[cc2];
@@ -10041,6 +10650,10 @@ impl<'p> RealTape<'p> {
         );
         assert_chain_replays(&ops, &trace, &chals);
         let b3_rows = trace.rows.len()
+            + ops
+                .iter()
+                .filter(|op| matches!(op, Op::Pow { bits } if *bits != 0))
+                .count()
             + h_rows
             + geo
                 .iter()
@@ -10049,6 +10662,12 @@ impl<'p> RealTape<'p> {
         if std::env::var("B3_CENSUS").is_ok() {
             let parents = trace.block_offsets.iter().filter(|o| o.is_none()).count();
             let blocks = trace.rows.len() - parents;
+            let mut pow_by_bits = std::collections::BTreeMap::<u32, usize>::new();
+            for op in &ops {
+                if let Op::Pow { bits } = op {
+                    *pow_by_bits.entry(*bits).or_default() += 1;
+                }
+            }
             eprintln!(
                 "  [b3 census] chain {} (data blocks {} | parent/fork {}; absorbed {} B, {} squeezes) | H(publics) {} | openings+caps {} = {}",
                 trace.rows.len(),
@@ -10059,6 +10678,11 @@ impl<'p> RealTape<'p> {
                 h_rows,
                 b3_rows - trace.rows.len() - h_rows,
                 b3_rows
+            );
+            eprintln!(
+                "  [pow census] {} checks by bits {:?}",
+                pow_by_bits.values().sum::<usize>(),
+                pow_by_bits
             );
             for g in geo.iter() {
                 eprintln!(
@@ -10196,17 +10820,32 @@ impl<'p> RealTape<'p> {
                     "s_hat_v {k} on the stream"
                 );
                 i2 += 1;
+                while matches!(ops[i2], Op::Pow { .. }) {
+                    i2 += 1;
+                }
                 assert!(matches!(ops[i2], Op::SqueezeSlice(7)), "r_dprime");
                 recs.push((sv, fin_at(i2), vc_at(i2).1));
                 i2 += 1;
             }
-            let gch = vc_at(i2).1;
-            let gfin = fin_at(i2);
-            for _ in 0..2 {
-                assert!(matches!(ops[i2], Op::SqueezeScalar), "rs gamma");
+            // All PD values follow the RS regions. One PoW then protects one
+            // vector squeeze in claim order: RS[0..2], PD[0..P].
+            for pd in &gammas_i {
+                assert!(matches!(ops[i2], Op::ObserveScalar), "pd value before batch vector");
+                assert_eq!(vc_at(i2).0, pd.val_v, "pd intake order");
                 i2 += 1;
             }
-            (recs, gch, gfin)
+            while matches!(ops[i2], Op::Pow { .. }) {
+                i2 += 1;
+            }
+            assert!(
+                matches!(ops[i2], Op::SqueezeSlice(n) if n == 2 + gammas_i.len()),
+                "mixed coefficient vector"
+            );
+            let base_ch = vc_at(i2).1;
+            let fin = fin_at(i2);
+            let gchs = vec![base_ch, base_ch + 1];
+            let gfins = vec![(fin, 0), (fin, 1)];
+            (recs, gchs, gfins)
         };
         // The two-halves target and V, split into their family-H (RS) and
         // in-circuit-computable (packed-direct / group) parts — the round-0
@@ -10215,7 +10854,7 @@ impl<'p> RealTape<'p> {
         let (native_rs_half, native_target, native_vrs, native_running) = {
             use flock_core::pcs::ring_switch as rsw;
             use flock_core::zerocheck::univariate_skip::build_eq;
-            let gs: Vec<F128> = (0..2).map(|k| chals[rs_gam_ch2 + k]).collect();
+            let gs: Vec<F128> = rs_gam_ch2.iter().map(|&ch| chals[ch]).collect();
             let mut rs_half = F128::ZERO;
             let mut coeffs: Vec<Vec<F128>> = Vec::new();
             for (k, &(sv, _, rc)) in rs_recs2.iter().enumerate() {
@@ -10461,6 +11100,14 @@ impl<'p> RealTape<'p> {
             zp_v,
         ) = {
             let mut i2 = zc_l[0] + 1;
+            // A grinded zerocheck inserts one `Pow` immediately before each
+            // protected squeeze.  The generic PoW locator below emits and
+            // binds its BLAKE3 predicate for *every* such op; this PIOP
+            // locator only needs to step past them before naming the squeeze
+            // wires which feed the arithmetic replay.
+            while matches!(ops[i2], Op::Pow { .. }) {
+                i2 += 1;
+            }
             assert!(matches!(ops[i2], Op::SqueezeSlice(_)), "r_skip slice");
             i2 += 1;
             let outer_len = match ops[i2] {
@@ -10473,16 +11120,24 @@ impl<'p> RealTape<'p> {
             i2 += 1;
             assert!(matches!(ops[i2], Op::ObserveSlice(64)), "round1_c");
             i2 += 1;
+            while matches!(ops[i2], Op::Pow { .. }) {
+                i2 += 1;
+            }
             assert!(matches!(ops[i2], Op::SqueezeScalar), "z_skip");
             let zskip = (vc_at(i2).1, fin_at(i2));
             i2 += 1;
             let mut zc_r: Vec<(usize, usize)> = Vec::new();
-            while matches!(ops[i2], Op::ObserveScalar)
-                && matches!(ops[i2 + 1], Op::ObserveScalar)
-                && matches!(ops[i2 + 2], Op::SqueezeScalar)
+            while matches!(ops[i2], Op::ObserveScalar) && matches!(ops[i2 + 1], Op::ObserveScalar)
             {
-                zc_r.push((vc_at(i2 + 2).1, fin_at(i2 + 2)));
-                i2 += 3;
+                let mut squeeze_i = i2 + 2;
+                while matches!(ops[squeeze_i], Op::Pow { .. }) {
+                    squeeze_i += 1;
+                }
+                if !matches!(ops[squeeze_i], Op::SqueezeScalar) {
+                    break;
+                }
+                zc_r.push((vc_at(squeeze_i).1, fin_at(squeeze_i)));
+                i2 = squeeze_i + 1;
             }
             // The zerocheck finals (v_a, v_b, ...) — the lincheck entry's
             // absorbed operands.
@@ -10492,24 +11147,37 @@ impl<'p> RealTape<'p> {
             }
             assert_eq!(i2, lc_l[0], "the zerocheck runs straight into the lincheck");
             i2 += 1;
+            while matches!(ops[i2], Op::Pow { .. }) {
+                i2 += 1;
+            }
             assert!(matches!(ops[i2], Op::SqueezeScalar), "lc alpha");
             let lc_alpha = (vc_at(i2).1, fin_at(i2));
             i2 += 1;
             // The const-pin beta squeezes, one per pinned boolean type.
             let mut betas: Vec<(usize, usize)> = Vec::new();
-            while matches!(ops[i2], Op::SqueezeScalar) {
+            loop {
+                while matches!(ops[i2], Op::Pow { .. }) {
+                    i2 += 1;
+                }
+                if !matches!(ops[i2], Op::SqueezeScalar) {
+                    break;
+                }
                 betas.push((vc_at(i2).1, fin_at(i2)));
                 i2 += 1;
             }
             // (g_v, ch, fin) per lc round — the message ordinals feed the
             // round-0 in-circuit lincheck replay.
             let mut lc_r: Vec<(usize, usize, usize)> = Vec::new();
-            while matches!(ops[i2], Op::ObserveScalar)
-                && matches!(ops[i2 + 1], Op::ObserveScalar)
-                && matches!(ops[i2 + 2], Op::SqueezeScalar)
-            {
-                lc_r.push((vc_at(i2).0, vc_at(i2 + 2).1, fin_at(i2 + 2)));
-                i2 += 3;
+            while matches!(ops[i2], Op::ObserveScalar) && matches!(ops[i2 + 1], Op::ObserveScalar) {
+                let mut squeeze_i = i2 + 2;
+                while matches!(ops[squeeze_i], Op::Pow { .. }) {
+                    squeeze_i += 1;
+                }
+                if !matches!(ops[squeeze_i], Op::SqueezeScalar) {
+                    break;
+                }
+                lc_r.push((vc_at(i2).0, vc_at(squeeze_i).1, fin_at(squeeze_i)));
+                i2 = squeeze_i + 1;
             }
             assert!(matches!(ops[i2], Op::ObserveSlice(64)), "z_partial slice");
             let (zp, _) = vc_at(i2);
@@ -10896,8 +11564,8 @@ impl<'p> RealTape<'p> {
             zskip_fin,
             zp_v,
             rs_recs: rs_recs2,
-            rs_gam_fin: rs_gam_fin2,
-            rs_gam_ch: rs_gam_ch2,
+            rs_gam_fins: rs_gam_fin2,
+            rs_gam_chs: rs_gam_ch2,
             mat_assert,
             el_assert,
             sigma_native,
@@ -11089,6 +11757,20 @@ fn emit_real_child_region(
             [outs[sq[0]][0], outs[sq[0]][1], nw]
         })
         .collect();
+    let pow_checks: Vec<([Wire; 3], u32)> = pow_pub
+        .iter()
+        .zip(&rt.pows)
+        .map(|(&w, &(_, _, bits))| (w, bits))
+        .collect();
+    emit_pow_checks(
+        sb,
+        cs.q.b3,
+        cs.q.spread,
+        iv2,
+        &pow_checks,
+        vals,
+        consts,
+    );
 
     // ---- ROUND 2: the H(publics) region (v2 statement binding) ----
     // Payload 4 of the circuit binding is the 32-byte publics digest; the
@@ -11164,7 +11846,7 @@ fn emit_real_child_region(
     // stays advice, production-checked over the RE-EXPOSED words below.
     let mut pdh_w = zw;
     for pd in gammas_i {
-        let gw = outs[trace.squeezes[pd.fin][0]][0];
+        let gw = squeeze_word_wire(&outs, &trace.squeezes, pd.fin, pd.squeeze_offset);
         pdh_w = sb.gate(cs.macs, &[pdh_w, gw, wv(pd.val_v)])[0];
     }
     vals.push(rt.native_rs_half);
@@ -11592,7 +12274,10 @@ fn emit_real_child_region(
                     .iter()
                     .zip(&hots)
                     .filter(|&(_, &h)| h)
-                    .map(|(&i2, _)| outs[trace.squeezes[gammas_i[i2].fin][0]][0])
+                    .map(|(&i2, _)| {
+                        let pd = &gammas_i[i2];
+                        squeeze_word_wire(&outs, &trace.squeezes, pd.fin, pd.squeeze_offset)
+                    })
                     .collect();
                 if let flock_core::matrix_fold::JaggedRowWeight::Combo(t) = &c.row {
                     assert_eq!(t.len(), gws.len(), "combo terms == hot members");
@@ -11610,7 +12295,7 @@ fn emit_real_child_region(
             }
             let (_, c) = d_it.next().expect("a dense entry per non-hot member");
             let pd = &gammas_i[i2];
-            let gpd_w = outs[trace.squeezes[pd.fin][0]][0];
+            let gpd_w = squeeze_word_wire(&outs, &trace.squeezes, pd.fin, pd.squeeze_offset);
             vals.push(c.value);
             let d_w = sb.input();
             jag_w.push(d_w);
@@ -11802,7 +12487,8 @@ fn emit_real_child_region(
         n_fam_pub += 135;
     }
     for k in 0..2 {
-        sb.publish(outs[trace.squeezes[rt.rs_gam_fin + k][0]][0]);
+        let (fin, offset) = rt.rs_gam_fins[k];
+        sb.publish(squeeze_word_wire(&outs, &trace.squeezes, fin, offset));
         n_fam_pub += 1;
     }
     for &vi in &mp_i.val_vs {
@@ -11898,6 +12584,8 @@ fn check_real_child_region(public: &[F128], rt: &RealTape<'_>, r: &RealRegion) -
         );
     }
     let pow_base = at2 + rt.native_sums.len();
+    // Differential oracle only: `emit_pow_checks` already constrains these
+    // same wires inside this child region.
     for (k, &(_, _, bits)) in rt.pows.iter().enumerate() {
         let d0 = public[pow_base + 3 * k];
         let d1 = public[pow_base + 3 * k + 1];
@@ -12104,7 +12792,7 @@ fn check_real_child_region(public: &[F128], rt: &RealTape<'_>, r: &RealRegion) -
         fq += 7;
     }
     for k in 0..2 {
-        assert_eq!(public[fq + k], chals[rt.rs_gam_ch + k], "rs gamma {k} re-exposed");
+        assert_eq!(public[fq + k], chals[rt.rs_gam_chs[k]], "rs gamma {k} re-exposed");
     }
     fq += 2;
     let fro = &rt.lo.proof.pcs_open.frobenius;
@@ -13240,7 +13928,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
         vec![(chain_digest, &chain_params_j, jags.to_vec())];
     let jagged_v: Vec<aggregate::JaggedKeyVerify<'_>> = vec![(chain_digest, jags.to_vec())];
     let mut chp = FsChallenger::with_chained_blake3(FL_DOMAIN);
-    let (agg, acc_p) = aggregate::prove_aggregate_classes(
+    let (agg, acc_p) = aggregate::prove_aggregate_classes_with_grinding(
         registry,
         &mats,
         &circs,
@@ -13250,11 +13938,12 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
         &[(&cp0.inner.built.shape.circuit, sigmas.iter().collect())],
         &jagged_p,
         &[],
+        tower_fold_grinding(),
         &mut chp,
     )
     .expect("the first-level fold proves");
     let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(FL_DOMAIN));
-    let acc_v = aggregate::verify_aggregate_classes(
+    let acc_v = aggregate::verify_aggregate_classes_with_grinding(
         registry,
         &bool_asserts,
         &el_asserts,
@@ -13262,6 +13951,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
         &jagged_v,
         &[],
         &agg,
+        tower_fold_grinding(),
         &mut rec,
     )
     .expect("the first-level fold verifies");
@@ -13331,7 +14021,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
         vals_rec,
         chals,
         rec.payloads(),
-        3, // bind's two + the sigma key's digest payload
+        &labeled_bytes_payloads(&ops, b"flock-aggregate-jagged-v0"),
         vcur,
         ccur,
     );
@@ -13377,7 +14067,12 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
         );
         assert_chain_replays(&ops, &trace, &chals);
 
-        let b3_rows = tapes.iter().map(|t| t.b3_rows).sum::<usize>() + trace.rows.len();
+        let b3_rows = tapes.iter().map(|t| t.b3_rows).sum::<usize>()
+            + trace.rows.len()
+            + ops
+                .iter()
+                .filter(|op| matches!(op, Op::Pow { bits } if *bits != 0))
+                .count();
         let nu2_content = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7);
         // THE ENVELOPE (task 7b): a first-level node is an internal node's
         // CHILD, so its proof must carry the same geometry every other
@@ -13456,6 +14151,19 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
             &pub_payloads,
             &cross,
         );
+        emit_recorded_pow_checks(
+            &mut sb,
+            b3s,
+            cs.q.spread,
+            iv2,
+            &ops,
+            &trace,
+            &stream,
+            &chain_outs,
+            &ww,
+            &mut vals,
+            &mut consts,
+        );
         let mut vmap: Vec<Option<usize>> = Vec::new();
         for (wi, w) in stream.words.iter().enumerate() {
             if let flock_core::transcript_record::StreamWord::Value(vi) = *w {
@@ -13480,6 +14188,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
             leslot,
             &locs,
             &trace.squeezes,
+            &challenge_word_locs(t_shape.ops()),
             &chain_outs,
             &ww,
             &vmap,
@@ -13498,6 +14207,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
             pf_w,
             &jlocs,
             &trace.squeezes,
+            &challenge_word_locs(t_shape.ops()),
             &chain_outs,
             &ww,
             &vmap,
@@ -14710,9 +15420,6 @@ struct ChildTape<'p> {
     cross: Vec<Option<(usize, usize)>>,
     b3_rows: usize,
     spread_w: usize,
-    /// The recording verify's wall time — the ONLINE tape-source cost (the
-    /// pins/locates around it are per-shape scaffolding).
-    verify_ms: f64,
     // located regions. `el` is `None` for a BOOLEAN-ONLY circuit inner
     // (the hash-chain leaf) — the element PIOP region does not exist on
     // its tape, and the `el_*`/`a_sum_n`/`b_sum_n` natives below are
@@ -14798,7 +15505,6 @@ impl<'p> ChildTape<'p> {
         let blake_lc = blake_r1cs.csc_lincheck_circuit();
         let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
         let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(domain));
-        let t_v = std::time::Instant::now();
         let all_claims = verifier::verify_ligerito_union_circuit(
             &union,
             &built.shape.circuit,
@@ -14810,7 +15516,6 @@ impl<'p> ChildTape<'p> {
             &mut rec,
         )
         .expect("the mixed circuit inner verifies");
-        let verify_ms = t_v.elapsed().as_secs_f64() * 1e3;
         let native_claims = all_claims
             .boolean
             .clone()
@@ -14937,6 +15642,9 @@ impl<'p> ChildTape<'p> {
         let gkr_rec = {
             let gkr = &proof.wiring.gkr;
             let mut i = gkr_l[0] + 1;
+            while matches!(ops[i], Op::Pow { .. }) {
+                i += 1;
+            }
             assert!(matches!(ops[i], Op::SqueezeScalar), "gkr alpha");
             let (_, c_alpha) = vc_at(i);
             let alpha_fin = fin_at(i);
@@ -14956,6 +15664,9 @@ impl<'p> ChildTape<'p> {
             let mut lrecs: Vec<GkrLayerRec> = Vec::new();
             for (k, layer) in gkr.layers.iter().enumerate() {
                 assert_eq!(layer.rounds.len(), k, "layer {k} has k rounds");
+                while matches!(ops[i], Op::Pow { .. }) {
+                    i += 1;
+                }
                 assert!(matches!(ops[i], Op::SqueezeScalar), "layer {k} lambda");
                 let (_, lc2) = vc_at(i);
                 let lambda = chals[lc2];
@@ -14970,11 +15681,15 @@ impl<'p> ChildTape<'p> {
                     let (gv, _) = vc_at(i);
                     assert_eq!(vals_rec[gv], g1, "layer {k} round {t2} g1");
                     assert_eq!(vals_rec[gv + 1], gi, "layer {k} round {t2} g_inf");
-                    assert!(matches!(ops[i + 2], Op::SqueezeScalar), "round rho");
-                    let (_, rc2) = vc_at(i + 2);
+                    let mut rho_i = i + 2;
+                    while matches!(ops[rho_i], Op::Pow { .. }) {
+                        rho_i += 1;
+                    }
+                    assert!(matches!(ops[rho_i], Op::SqueezeScalar), "round rho");
+                    let (_, rc2) = vc_at(rho_i);
                     let rho = chals[rc2];
-                    rrecs.push((gv, fin_at(i + 2)));
-                    i += 3;
+                    rrecs.push((gv, fin_at(rho_i)));
+                    i = rho_i + 1;
                     let r_eq = r_pt[t2];
                     let g0 = (c_run + r_eq * g1) * (F128::ONE + r_eq).inv();
                     g0s.push(g0);
@@ -14995,6 +15710,9 @@ impl<'p> ChildTape<'p> {
                     layer.vl0 * layer.vl1 + lambda * (layer.vr0 * layer.vr1),
                     "layer {k} closes"
                 );
+                while matches!(ops[i], Op::Pow { .. }) {
+                    i += 1;
+                }
                 assert!(matches!(ops[i], Op::SqueezeScalar), "layer {k} c_k");
                 let (_, cc2) = vc_at(i);
                 let c_k = chals[cc2];
@@ -15053,6 +15771,9 @@ impl<'p> ChildTape<'p> {
         // tau_len rounds | ea, eb, ec | lc label | alpha | lc rounds].
         let el_rec = has_el.then(|| {
             let mut i = elzc_l[0] + 1;
+            while matches!(ops[i], Op::Pow { .. }) {
+                i += 1;
+            }
             let (tau_fin, tau_ch, tau_len) = match ops[i] {
                 Op::SqueezeSlice(n) => (fin_at(i), vc_at(i).1, n),
                 ref o => panic!("element tau, got {o:?}"),
@@ -15063,9 +15784,13 @@ impl<'p> ChildTape<'p> {
                 let (gv, _) = vc_at(i);
                 assert!(matches!(ops[i], Op::ObserveScalar), "el zc msg");
                 assert!(matches!(ops[i + 1], Op::ObserveScalar), "el zc msg");
-                assert!(matches!(ops[i + 2], Op::SqueezeScalar), "el zc rho");
-                zc_rounds.push((gv, fin_at(i + 2), vc_at(i + 2).1));
-                i += 3;
+                let mut squeeze_i = i + 2;
+                while matches!(ops[squeeze_i], Op::Pow { .. }) {
+                    squeeze_i += 1;
+                }
+                assert!(matches!(ops[squeeze_i], Op::SqueezeScalar), "el zc rho");
+                zc_rounds.push((gv, fin_at(squeeze_i), vc_at(squeeze_i).1));
+                i = squeeze_i + 1;
             }
             let (eab_v, _) = vc_at(i);
             for _ in 0..3 {
@@ -15074,17 +15799,24 @@ impl<'p> ChildTape<'p> {
             }
             assert_eq!(i, el_l[0], "the lc label follows the finals");
             i += 1;
+            while matches!(ops[i], Op::Pow { .. }) {
+                i += 1;
+            }
             assert!(matches!(ops[i], Op::SqueezeScalar), "el lc alpha");
             let (alpha_fin, alpha_ch) = (fin_at(i), vc_at(i).1);
             i += 1;
             let mut lc_rounds = Vec::new();
-            while matches!(ops[i], Op::ObserveScalar)
-                && matches!(ops[i + 1], Op::ObserveScalar)
-                && matches!(ops[i + 2], Op::SqueezeScalar)
-            {
+            while matches!(ops[i], Op::ObserveScalar) && matches!(ops[i + 1], Op::ObserveScalar) {
+                let mut squeeze_i = i + 2;
+                while matches!(ops[squeeze_i], Op::Pow { .. }) {
+                    squeeze_i += 1;
+                }
+                if !matches!(ops[squeeze_i], Op::SqueezeScalar) {
+                    break;
+                }
                 let (gv, _) = vc_at(i);
-                lc_rounds.push((gv, fin_at(i + 2), vc_at(i + 2).1));
-                i += 3;
+                lc_rounds.push((gv, fin_at(squeeze_i), vc_at(squeeze_i).1));
+                i = squeeze_i + 1;
             }
             assert!(!zc_rounds.is_empty() && !lc_rounds.is_empty(), "el rounds");
             ElPiopRec {
@@ -15098,7 +15830,7 @@ impl<'p> ChildTape<'p> {
             }
         });
 
-        // ---- the merged open: rs x 2, then the packed-direct claims ----
+        // ---- the merged open: rs x 2, then PD values, then one coefficient vector ----
         let (pd_recs, mp_val_v, rs_recs, rs_gam_ch) = {
             let mut i = mo_l[0] + 1;
             let mut rs_recs: Vec<(usize, usize)> = Vec::new(); // (s_hat_v index, r_dprime ch)
@@ -15116,32 +15848,40 @@ impl<'p> ChildTape<'p> {
                     "s_hat_v {k} on the stream"
                 );
                 i += 1;
+                while matches!(ops[i], Op::Pow { .. }) {
+                    i += 1;
+                }
                 assert!(matches!(ops[i], Op::SqueezeSlice(7)), "r_dprime");
                 rs_recs.push((sv, vc_at(i).1));
                 i += 1;
             }
-            let rs_gam_ch = vc_at(i).1;
-            for _ in 0..2 {
-                assert!(matches!(ops[i], Op::SqueezeScalar), "rs gamma");
-                i += 1;
-            }
-            // Packed-direct claims (merged-open v1): [ObserveScalar(value),
-            // SqueezeScalar(gamma)] each — the W rounds that follow are
-            // [Obs, Obs, Squeeze] triplets, so the lookahead disambiguates.
+            // Packed-direct claims contribute just their values.  Their
+            // coefficients share the vector squeeze with both RS claims.
             let mut pd_recs: Vec<usize> = Vec::new(); // value index
-            while matches!(ops[i], Op::ObserveScalar)
-                && matches!(ops[i + 1], Op::SqueezeScalar)
-            {
+            while matches!(ops[i], Op::ObserveScalar) {
                 let (pv, _) = vc_at(i);
-                i += 2;
+                i += 1;
                 pd_recs.push(pv);
             }
+            while matches!(ops[i], Op::Pow { .. }) {
+                i += 1;
+            }
+            assert!(
+                matches!(ops[i], Op::SqueezeSlice(n) if n == 2 + pd_recs.len()),
+                "mixed coefficient vector"
+            );
+            let rs_gam_ch = vc_at(i).1;
+            i += 1;
             // W rounds until the multipoint label.
             let mut w_rounds = 0usize;
             while matches!(ops[i], Op::ObserveScalar) {
                 assert!(matches!(ops[i + 1], Op::ObserveScalar), "w round pair");
-                assert!(matches!(ops[i + 2], Op::SqueezeScalar), "w round squeeze");
-                i += 3;
+                i += 2;
+                while matches!(ops[i], Op::Pow { .. }) {
+                    i += 1;
+                }
+                assert!(matches!(ops[i], Op::SqueezeScalar), "w round squeeze");
+                i += 1;
                 w_rounds += 1;
             }
             assert_eq!(
@@ -15186,6 +15926,9 @@ impl<'p> ChildTape<'p> {
                 i += 1;
             }
             assert_eq!(n_vals, 256 + n_p, "2x128 RS dual values + P group values");
+            while matches!(ops[i], Op::Pow { .. }) {
+                i += 1;
+            }
             assert!(matches!(ops[i], Op::SqueezeScalar), "multipoint gamma");
             let (_, gc) = vc_at(i);
             let gamma = chals[gc];
@@ -15210,15 +15953,21 @@ impl<'p> ChildTape<'p> {
             let mut rounds = 0usize;
             while matches!(ops[i], Op::ObserveScalar)
                 && matches!(ops[i + 1], Op::ObserveScalar)
-                && matches!(ops[i + 2], Op::SqueezeScalar)
             {
                 let (gv, _) = vc_at(i);
-                let (_, rc) = vc_at(i + 2);
+                i += 2;
+                while matches!(ops[i], Op::Pow { .. }) {
+                    i += 1;
+                }
+                if !matches!(ops[i], Op::SqueezeScalar) {
+                    break;
+                }
+                let (_, rc) = vc_at(i);
                 let (g1, gi) = (vals_rec[gv], vals_rec[gv + 1]);
                 let r = chals[rc];
                 let g0 = t + g1;
                 t = g0 + (g1 + g0 + gi) * r + gi * r * r;
-                i += 3;
+                i += 1;
                 rounds += 1;
             }
             assert_eq!(rounds, fro.rounds.len(), "mp round count");
@@ -15230,10 +15979,18 @@ impl<'p> ChildTape<'p> {
         }
 
         // ---- the published chain ordinals (GKR alpha, multipoint gamma) ----
-        let ga_fin = fin_at(gkr_l[0] + 1);
-        let (_, ga_c) = vc_at(gkr_l[0] + 1);
+        let mut ga_i = gkr_l[0] + 1;
+        while matches!(ops[ga_i], Op::Pow { .. }) {
+            ga_i += 1;
+        }
+        assert!(matches!(ops[ga_i], Op::SqueezeScalar), "GKR fingerprint");
+        let ga_fin = fin_at(ga_i);
+        let (_, ga_c) = vc_at(ga_i);
         let mut mp_i = mp_l[0] + 1;
         while matches!(ops[mp_i], Op::ObserveScalar) {
+            mp_i += 1;
+        }
+        while matches!(ops[mp_i], Op::Pow { .. }) {
             mp_i += 1;
         }
         assert!(matches!(ops[mp_i], Op::SqueezeScalar), "mp gamma op");
@@ -15613,6 +16370,9 @@ impl<'p> ChildTape<'p> {
         // map onto the same walk — the merge node's connects consume them.
         let (zc_rounds_b, (zskip_ch, zskip_fin), (outer_ch_b, outer_fin_b), lc_rounds_b, zp_v) = {
             let mut i2 = zc_l[0] + 1;
+            while matches!(ops[i2], Op::Pow { .. }) {
+                i2 += 1;
+            }
             assert!(matches!(ops[i2], Op::SqueezeSlice(_)), "r_skip slice");
             i2 += 1;
             assert!(matches!(ops[i2], Op::SqueezeSlice(_)), "r_outer slice");
@@ -15622,32 +16382,49 @@ impl<'p> ChildTape<'p> {
             i2 += 1;
             assert!(matches!(ops[i2], Op::ObserveSlice(64)), "round1_c");
             i2 += 1;
+            while matches!(ops[i2], Op::Pow { .. }) {
+                i2 += 1;
+            }
             assert!(matches!(ops[i2], Op::SqueezeScalar), "z_skip");
             let zskip = (vc_at(i2).1, fin_at(i2));
             i2 += 1;
             let mut zc_r: Vec<(usize, usize)> = Vec::new();
-            while matches!(ops[i2], Op::ObserveScalar)
-                && matches!(ops[i2 + 1], Op::ObserveScalar)
-                && matches!(ops[i2 + 2], Op::SqueezeScalar)
-            {
-                zc_r.push((vc_at(i2 + 2).1, fin_at(i2 + 2)));
-                i2 += 3;
+            while matches!(ops[i2], Op::ObserveScalar) && matches!(ops[i2 + 1], Op::ObserveScalar) {
+                let mut squeeze_i = i2 + 2;
+                while matches!(ops[squeeze_i], Op::Pow { .. }) {
+                    squeeze_i += 1;
+                }
+                if !matches!(ops[squeeze_i], Op::SqueezeScalar) {
+                    break;
+                }
+                zc_r.push((vc_at(squeeze_i).1, fin_at(squeeze_i)));
+                i2 = squeeze_i + 1;
             }
             while matches!(ops[i2], Op::ObserveScalar) {
                 i2 += 1;
             }
             assert_eq!(i2, lc_l[0], "the zerocheck runs straight into the lincheck");
             i2 += 1;
-            while matches!(ops[i2], Op::SqueezeScalar) {
+            loop {
+                while matches!(ops[i2], Op::Pow { .. }) {
+                    i2 += 1;
+                }
+                if !matches!(ops[i2], Op::SqueezeScalar) {
+                    break;
+                }
                 i2 += 1;
             }
             let mut lc_r: Vec<(usize, usize)> = Vec::new();
-            while matches!(ops[i2], Op::ObserveScalar)
-                && matches!(ops[i2 + 1], Op::ObserveScalar)
-                && matches!(ops[i2 + 2], Op::SqueezeScalar)
-            {
-                lc_r.push((vc_at(i2 + 2).1, fin_at(i2 + 2)));
-                i2 += 3;
+            while matches!(ops[i2], Op::ObserveScalar) && matches!(ops[i2 + 1], Op::ObserveScalar) {
+                let mut squeeze_i = i2 + 2;
+                while matches!(ops[squeeze_i], Op::Pow { .. }) {
+                    squeeze_i += 1;
+                }
+                if !matches!(ops[squeeze_i], Op::SqueezeScalar) {
+                    break;
+                }
+                lc_r.push((vc_at(squeeze_i).1, fin_at(squeeze_i)));
+                i2 = squeeze_i + 1;
             }
             assert!(matches!(ops[i2], Op::ObserveSlice(64)), "z_partial slice");
             let (zp, _) = vc_at(i2);
@@ -15979,7 +16756,6 @@ impl<'p> ChildTape<'p> {
             cross,
             b3_rows,
             spread_w,
-            verify_ms,
             gkr: gkr_rec,
             el: el_rec,
             start_v,
@@ -16779,7 +17555,10 @@ fn emit_child_region(
                     .iter()
                     .zip(&hots)
                     .filter(|&(_, &h)| h)
-                    .map(|(&i2, _)| outs[trace.squeezes[ct.gammas_o[i2].fin][0]][0])
+                    .map(|(&i2, _)| {
+                        let pd = &ct.gammas_o[i2];
+                        squeeze_word_wire(&outs, &trace.squeezes, pd.fin, pd.squeeze_offset)
+                    })
                     .collect();
                 if let flock_core::matrix_fold::JaggedRowWeight::Combo(t) = &c.row {
                     assert_eq!(t.len(), gws.len(), "combo terms == hot members");
@@ -16796,7 +17575,7 @@ fn emit_child_region(
             }
             let (_, c) = d_it.next().expect("a dense entry per non-hot member");
             let pd = &ct.gammas_o[i2];
-            let gpd_w = outs[trace.squeezes[pd.fin][0]][0];
+            let gpd_w = squeeze_word_wire(&outs, &trace.squeezes, pd.fin, pd.squeeze_offset);
             vals.push(c.value);
             let d_w = sb.input();
             jag_w.push(d_w);
@@ -17428,9 +18207,9 @@ fn mvp11_sigma_fold_tape() {
     );
 
     // ---- the tape structure, pinned op-for-op ----
-    // Everything the fold verifier touches is scalar squeezes and scalar /
-    // slice observes — no PoW, no vec squeezes — so the challenge ordinal
-    // IS the finalization ordinal, which is what wires the chain squeezes.
+    // The coefficient batches are vector squeezes; round challenges remain
+    // scalar squeezes. The challenge-to-(finalization, word) map below is the
+    // authority used by the circuit wiring.
     let t_shape = rec.shape();
     let ops = flatten_ops(t_shape.ops());
     let vals_rec = rec.values();
@@ -17445,12 +18224,12 @@ fn mvp11_sigma_fold_tape() {
             Op::ObserveScalar,       // value
         ]);
     }
-    want.extend([Op::SqueezeScalar, Op::SqueezeScalar]); // lambdas
+    want.push(Op::SqueezeSlice(2)); // lambdas
     for _ in 0..k_col {
         want.extend([Op::ObserveScalar, Op::ObserveScalar, Op::SqueezeScalar]);
     }
     want.extend([Op::ObserveScalar, Op::ObserveScalar]); // bridge
-    want.extend([Op::SqueezeScalar, Op::SqueezeScalar]); // mus
+    want.push(Op::SqueezeSlice(2)); // mus
     for _ in 0..k_row {
         want.extend([Op::ObserveScalar, Op::ObserveScalar, Op::SqueezeScalar]);
     }
@@ -17469,7 +18248,7 @@ fn mvp11_sigma_fold_tape() {
     assert_eq!(
         chals.len(),
         4 + k_col + k_row,
-        "lambdas, col rhos, mus, row rhos — all scalar squeezes"
+        "lambdas, col rhos, mus, row rhos"
     );
     for (k, c) in claims.iter().enumerate() {
         let base = k * blk;
@@ -17635,9 +18414,11 @@ fn mvp11_sigma_fold_tape() {
             }
         }
         let wv = |vi: usize| -> Wire { ww[vmap[vi].expect("stream word")].expect("wired") };
-        // Every finalizing op is a scalar squeeze (pinned above), so the
-        // challenge ordinal addresses the chain squeeze directly.
-        let chw = |fin: usize| -> Wire { outs[trace.squeezes[fin][0]][0] };
+        let challenge_locs = challenge_word_locs(&ops);
+        let chw = |ch: usize| -> Wire {
+            let (fin, offset) = challenge_locs[ch];
+            squeeze_word_wire(&outs, &trace.squeezes, fin, offset)
+        };
         vals.push(F128::ZERO);
         let zw = sb.public_input();
         vals.push(F128::ONE);
@@ -17967,12 +18748,12 @@ fn mvp11_jagged_fold_tape() {
         want.push(Op::ObserveSlice(n_col)); // the col point (σ)
         want.push(Op::ObserveScalar); // the value
     }
-    want.extend(std::iter::repeat_n(Op::SqueezeScalar, n_cl)); // λ
+    want.push(Op::SqueezeSlice(n_cl)); // λ
     for _ in 0..n_col {
         want.extend([Op::ObserveScalar, Op::ObserveScalar, Op::SqueezeScalar]);
     }
     want.extend(std::iter::repeat_n(Op::ObserveScalar, n_cl)); // bridge
-    want.extend(std::iter::repeat_n(Op::SqueezeScalar, n_cl)); // μ
+    want.push(Op::SqueezeSlice(n_cl)); // μ
     for _ in 0..k_row {
         want.extend([Op::ObserveScalar, Op::ObserveScalar, Op::SqueezeScalar]);
     }
@@ -18064,7 +18845,7 @@ fn mvp11_jagged_fold_tape() {
     assert_eq!(
         chals.len(),
         2 * n_cl + n_col + k_row,
-        "λs, col rhos, μs, row rhos — all scalar squeezes"
+        "λs, col rhos, μs, row rhos"
     );
     for (j, &(q1, qinf)) in fp.col_rounds.iter().enumerate() {
         assert_eq!(vals_rec[v_cm + 2 * j], q1, "col round {j} q(1)");
@@ -18197,7 +18978,11 @@ fn mvp11_jagged_fold_tape() {
             }
         }
         let wv = |vi: usize| -> Wire { ww[vmap[vi].expect("stream word")].expect("wired") };
-        let chw = |fin: usize| -> Wire { outs[trace.squeezes[fin][0]][0] };
+        let challenge_locs = challenge_word_locs(&ops);
+        let chw = |ch: usize| -> Wire {
+            let (fin, offset) = challenge_locs[ch];
+            squeeze_word_wire(&outs, &trace.squeezes, fin, offset)
+        };
         vals.push(F128::ZERO);
         let zw = sb.public_input();
         vals.push(F128::ONE);
@@ -18475,6 +19260,7 @@ fn fold_region_ops(
 ) -> Vec<flock_core::transcript_record::TranscriptOp> {
     use flock_core::transcript_record::TranscriptOp as Op;
     let mut want: Vec<Op> = Vec::new();
+    let grinding = tower_fold_grinding();
     for cs in fold_claims {
         want.push(Op::Label(b"flock-matrix-fold-v0".to_vec()));
         for c in cs {
@@ -18486,20 +19272,38 @@ fn fold_region_ops(
                 Op::ObserveScalar,
             ]);
         }
-        for _ in 0..cs.len() {
-            want.push(Op::SqueezeScalar); // lambdas
+        if grinding.combination_bits != 0 {
+            want.push(Op::Pow {
+                bits: grinding.combination_bits,
+            });
         }
+        want.push(Op::SqueezeSlice(cs.len())); // lambdas
         for _ in 0..cs[0].col.n_vars() {
-            want.extend([Op::ObserveScalar, Op::ObserveScalar, Op::SqueezeScalar]);
+            want.extend([Op::ObserveScalar, Op::ObserveScalar]);
+            if grinding.round_bits != 0 {
+                want.push(Op::Pow {
+                    bits: grinding.round_bits,
+                });
+            }
+            want.push(Op::SqueezeScalar);
         }
         for _ in 0..cs.len() {
             want.push(Op::ObserveScalar); // bridge
         }
-        for _ in 0..cs.len() {
-            want.push(Op::SqueezeScalar); // mus
+        if grinding.combination_bits != 0 {
+            want.push(Op::Pow {
+                bits: grinding.combination_bits,
+            });
         }
+        want.push(Op::SqueezeSlice(cs.len())); // mus
         for _ in 0..cs[0].row.n_vars() {
-            want.extend([Op::ObserveScalar, Op::ObserveScalar, Op::SqueezeScalar]);
+            want.extend([Op::ObserveScalar, Op::ObserveScalar]);
+            if grinding.round_bits != 0 {
+                want.push(Op::Pow {
+                    bits: grinding.round_bits,
+                });
+            }
+            want.push(Op::SqueezeScalar);
         }
         want.push(Op::ObserveScalar); // the output value
     }
@@ -18517,7 +19321,7 @@ fn locate_and_pin_folds(
     fold_claims: &[Vec<flock_core::matrix_fold::MatrixClaim>],
     fold_proofs: &[&flock_core::matrix_fold::FoldProof],
     vals_rec: &[F128],
-    chals: &[F128],
+    _chals: &[F128],
 ) -> (Vec<FoldLoc>, usize, usize) {
     let (mut vcur, mut ccur) = (0usize, 0usize);
     let locs: Vec<FoldLoc> = fold_claims
@@ -18626,6 +19430,28 @@ fn assert_fold_tape_exhausted(vals_rec: &[F128], chals: &[F128], vcur: usize, cc
     assert_eq!(chals.len(), ccur, "every squeeze is accounted for");
 }
 
+/// Map every challenge ordinal to the transcript finalization and output-word
+/// offset that emitted it. Grinding adds finalizations without challenges,
+/// while vector squeezes emit several challenge words from one finalization.
+fn challenge_word_locs(
+    ops: &[flock_core::transcript_record::TranscriptOp],
+) -> Vec<(usize, usize)> {
+    use flock_core::transcript_record::TranscriptOp as Op;
+    let mut out = Vec::new();
+    let mut fin = 0usize;
+    for op in ops {
+        match op {
+            Op::SqueezeScalar => out.push((fin, 0)),
+            Op::SqueezeSlice(n) => out.extend((0..*n).map(|offset| (fin, offset))),
+            _ => {}
+        }
+        if op.finalizes() {
+            fin += 1;
+        }
+    }
+    out
+}
+
 /// Replay every fold's two endpoint identities from LOCATED words alone —
 /// weights rebuilt through the verifier's own `Weight::eval`, the low fold
 /// included — and return the located fold outputs (what the verifier's
@@ -18721,6 +19547,7 @@ fn emit_fold_region(
     leslot: flock_core::circuit::builder::SlotId,
     locs: &[FoldLoc],
     sq: &[Vec<usize>],
+    challenge_locs: &[(usize, usize)],
     outs: &[Vec<Wire>],
     ww: &[Option<Wire>],
     vmap: &[Option<usize>],
@@ -18732,7 +19559,10 @@ fn emit_fold_region(
     tail_input_last: bool,
 ) -> (Vec<FoldPub>, Vec<AlphaRec>) {
     let wv = |vi: usize| -> Wire { ww[vmap[vi].expect("stream word")].expect("wired") };
-    let chw = |fin: usize| -> Wire { outs[sq[fin][0]][0] };
+    let chw = |ch: usize| -> Wire {
+        let (fin, offset) = challenge_locs[ch];
+        squeeze_word_wire(outs, sq, fin, offset)
+    };
     // seed · Π (1 + a_j + b_j) through the prefix slot, padded (zw, zw).
     let prefix = |sb: &mut ShapeBuilder, seed: Wire, fs: &[(Wire, Wire)]| -> Wire {
         let mut s = seed;
@@ -19037,6 +19867,7 @@ fn jagged_fold_region_ops(
     use flock_core::matrix_fold::JaggedRowWeight;
     use flock_core::transcript_record::TranscriptOp as Op;
     let mut want: Vec<Op> = Vec::new();
+    let grinding = tower_fold_grinding();
     for (_, cs) in keys {
         let n_col = cs[0].col.len();
         let k_row = cs
@@ -19068,18 +19899,64 @@ fn jagged_fold_region_ops(
             want.push(Op::ObserveSlice(n_col));
             want.push(Op::ObserveScalar);
         }
-        want.extend(std::iter::repeat_n(Op::SqueezeScalar, cs.len()));
+        if grinding.combination_bits != 0 {
+            want.push(Op::Pow {
+                bits: grinding.combination_bits,
+            });
+        }
+        want.push(Op::SqueezeSlice(cs.len()));
         for _ in 0..n_col {
-            want.extend([Op::ObserveScalar, Op::ObserveScalar, Op::SqueezeScalar]);
+            want.extend([Op::ObserveScalar, Op::ObserveScalar]);
+            if grinding.round_bits != 0 {
+                want.push(Op::Pow {
+                    bits: grinding.round_bits,
+                });
+            }
+            want.push(Op::SqueezeScalar);
         }
         want.extend(std::iter::repeat_n(Op::ObserveScalar, cs.len()));
-        want.extend(std::iter::repeat_n(Op::SqueezeScalar, cs.len()));
+        if grinding.combination_bits != 0 {
+            want.push(Op::Pow {
+                bits: grinding.combination_bits,
+            });
+        }
+        want.push(Op::SqueezeSlice(cs.len()));
         for _ in 0..k_row {
-            want.extend([Op::ObserveScalar, Op::ObserveScalar, Op::SqueezeScalar]);
+            want.extend([Op::ObserveScalar, Op::ObserveScalar]);
+            if grinding.round_bits != 0 {
+                want.push(Op::Pow {
+                    bits: grinding.round_bits,
+                });
+            }
+            want.push(Op::SqueezeScalar);
         }
         want.push(Op::ObserveScalar);
     }
     want
+}
+
+/// Payload ordinals of `ObserveBytes` operations immediately following a
+/// particular label. `Pow` also contributes one payload (its nonce), so fixed
+/// payload offsets are invalid as soon as grinding is enabled.
+fn labeled_bytes_payloads(
+    ops: &[flock_core::transcript_record::TranscriptOp],
+    label: &[u8],
+) -> Vec<usize> {
+    use flock_core::transcript_record::TranscriptOp as Op;
+    let mut out = Vec::new();
+    let mut payload = 0usize;
+    for (i, op) in ops.iter().enumerate() {
+        if matches!(op, Op::ObserveBytes(_))
+            && i > 0
+            && matches!(&ops[i - 1], Op::Label(l) if l.as_slice() == label)
+        {
+            out.push(payload);
+        }
+        if matches!(op, Op::ObserveBytes(_) | Op::Pow { .. }) {
+            payload += 1;
+        }
+    }
+    out
 }
 
 /// Locate + pin the jagged groups AFTER the uniform folds — the value and
@@ -19095,18 +19972,23 @@ fn locate_and_pin_jagged_folds(
     vals_rec: &[F128],
     chals: &[F128],
     payloads: &[Vec<u8>],
-    mut pcur: usize,
+    digest_payloads: &[usize],
     mut vcur: usize,
     mut ccur: usize,
 ) -> Vec<JaggedFoldLoc> {
     use flock_core::matrix_fold::JaggedRowWeight;
     assert_eq!(keys.len(), fps.len(), "one fold per jagged key");
+    assert_eq!(keys.len(), digest_payloads.len(), "one digest payload per jagged key");
     let locs: Vec<JaggedFoldLoc> = keys
         .iter()
         .zip(fps)
-        .map(|((digest, cs), fp)| {
-            assert_eq!(payloads[pcur], digest.to_vec(), "the group's digest payload");
-            pcur += 1;
+        .zip(digest_payloads)
+        .map(|(((digest, cs), fp), &digest_payload)| {
+            assert_eq!(
+                payloads[digest_payload],
+                digest.to_vec(),
+                "the group's digest payload"
+            );
             let n_col = cs[0].col.len();
             let k_row = cs
                 .iter()
@@ -19229,7 +20111,6 @@ fn locate_and_pin_jagged_folds(
         .collect();
     assert_eq!(vals_rec.len(), vcur, "every stream value is accounted for");
     assert_eq!(chals.len(), ccur, "every squeeze is accounted for");
-    assert_eq!(payloads.len(), pcur, "every payload is accounted for");
     locs
 }
 
@@ -19329,6 +20210,7 @@ fn emit_jagged_fold_region(
     pf_w: usize,
     locs: &[JaggedFoldLoc],
     sq: &[Vec<usize>],
+    challenge_locs: &[(usize, usize)],
     outs: &[Vec<Wire>],
     ww: &[Option<Wire>],
     vmap: &[Option<usize>],
@@ -19338,7 +20220,10 @@ fn emit_jagged_fold_region(
     ow: Wire,
 ) -> Vec<FoldPub> {
     let wv = |vi: usize| -> Wire { ww[vmap[vi].expect("stream word")].expect("wired") };
-    let chw = |fin: usize| -> Wire { outs[sq[fin][0]][0] };
+    let chw = |ch: usize| -> Wire {
+        let (fin, offset) = challenge_locs[ch];
+        squeeze_word_wire(outs, sq, fin, offset)
+    };
     let prefix = |sb: &mut ShapeBuilder, seed: Wire, fs: &[(Wire, Wire)]| -> Wire {
         let mut s = seed;
         for chunk in fs.chunks(pf_w) {
@@ -19580,7 +20465,7 @@ fn mvp11_merge_fold_region() {
         let ea = [(union, c.work.element.clone().expect("leaf element work"))];
         let sg = [c.sigma.clone()];
         let mut ch = FsChallenger::with_chained_blake3(M11_LEAF_DOMAIN);
-        let (lp, la) = aggregate::prove_aggregate_classes(
+        let (lp, la) = aggregate::prove_aggregate_classes_with_grinding(
             registry,
             &mats,
             &circs,
@@ -19590,11 +20475,12 @@ fn mvp11_merge_fold_region() {
             &[(&built0.shape.circuit, sg.iter().collect())],
             &[],
             &[],
+            tower_fold_grinding(),
             &mut ch,
         )
         .expect("the leaf fold proves");
         let mut ch = FsChallenger::with_chained_blake3(M11_LEAF_DOMAIN);
-        let lv = aggregate::verify_aggregate_classes(
+        let lv = aggregate::verify_aggregate_classes_with_grinding(
             registry,
             &ba,
             &ea,
@@ -19602,6 +20488,7 @@ fn mvp11_merge_fold_region() {
             &[],
             &[],
             &lp,
+            tower_fold_grinding(),
             &mut ch,
         )
         .expect("the leaf fold verifies");
@@ -19614,7 +20501,7 @@ fn mvp11_merge_fold_region() {
     let n_priors = priors.len();
 
     let mut chp = FsChallenger::with_chained_blake3(M11_MERGE_DOMAIN);
-    let (agg, acc_p) = aggregate::prove_aggregate_classes(
+    let (agg, acc_p) = aggregate::prove_aggregate_classes_with_grinding(
         registry,
         &mats,
         &circs,
@@ -19624,12 +20511,13 @@ fn mvp11_merge_fold_region() {
         &[(&built0.shape.circuit, sigmas.iter().collect())],
         &[],
         &priors,
+        tower_fold_grinding(),
         &mut chp,
     )
     .expect("the merge-node fold proves");
     let mut rec =
         RecordingChallenger::new(FsChallenger::with_chained_blake3(M11_MERGE_DOMAIN));
-    let acc_v = aggregate::verify_aggregate_classes(
+    let acc_v = aggregate::verify_aggregate_classes_with_grinding(
         registry,
         &bool_asserts,
         &el_asserts,
@@ -19637,6 +20525,7 @@ fn mvp11_merge_fold_region() {
         &[],
         &priors,
         &agg,
+        tower_fold_grinding(),
         &mut rec,
     )
     .expect("the merge-node fold verifies");
@@ -19721,8 +20610,8 @@ fn mvp11_merge_fold_region() {
 
     // ---- the tape structure, pinned op-for-op ----
     // bind = label + registry digest + prior count, then the five folds in
-    // aggregate order. Every finalizing op is a scalar squeeze, so the
-    // challenge ordinal is the finalization ordinal — same as step 1.
+    // aggregate order. Coefficient vectors share finalizations; the emitters
+    // use `challenge_word_locs` to recover each output word exactly.
     let t_shape = rec.shape();
     let ops = flatten_ops(t_shape.ops());
     let vals_rec = rec.values();
@@ -19811,7 +20700,13 @@ fn mvp11_merge_fold_region() {
 
         // The b3 slot carries all three chains (child0, child1, fold) plus
         // the children's query-phase openings — size the row capacity once.
-        let b3_rows = t0.b3_rows + t1.b3_rows + trace.rows.len();
+        let b3_rows = t0.b3_rows
+            + t1.b3_rows
+            + trace.rows.len()
+            + ops
+                .iter()
+                .filter(|op| matches!(op, Op::Pow { bits } if *bits != 0))
+                .count();
         let nu2 = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7);
         let mut sb = ShapeBuilder::new(nu2);
         let mut cs = ChildSlots::new(&mut sb, nu2, t0.spread_w.max(t1.spread_w));
@@ -19850,6 +20745,19 @@ fn mvp11_merge_fold_region() {
             &pub_payloads,
             &cross,
         );
+        emit_recorded_pow_checks(
+            &mut sb,
+            b3s,
+            cs.q.spread,
+            iv2,
+            &ops,
+            &trace,
+            &stream,
+            &chain_outs,
+            &ww,
+            &mut vals,
+            &mut consts,
+        );
         let mut vmap: Vec<Option<usize>> = Vec::new();
         for (wi, w) in stream.words.iter().enumerate() {
             if let flock_core::transcript_record::StreamWord::Value(vi) = *w {
@@ -19874,6 +20782,7 @@ fn mvp11_merge_fold_region() {
             leslot,
             &locs,
             &trace.squeezes,
+            &challenge_word_locs(t_shape.ops()),
             &chain_outs,
             &ww,
             &vmap,
@@ -20463,7 +21372,7 @@ fn mvp11_swap_children_fold_scale() {
 
     // The native fold: prove + record-verify + discharge all three groups.
     let mut chp = FsChallenger::with_chained_blake3(M11_SCALE_DOMAIN);
-    let (agg, acc_p) = aggregate::prove_aggregate_classes(
+    let (agg, acc_p) = aggregate::prove_aggregate_classes_with_grinding(
         registry,
         &mats,
         &lcs,
@@ -20473,12 +21382,13 @@ fn mvp11_swap_children_fold_scale() {
         &[(&lo.shape.circuit, sigmas.iter().collect())],
         &[],
         &[],
+        tower_fold_grinding(),
         &mut chp,
     )
     .expect("the scale fold proves");
     let mut rec =
         RecordingChallenger::new(FsChallenger::with_chained_blake3(M11_SCALE_DOMAIN));
-    let acc_v = aggregate::verify_aggregate_classes(
+    let acc_v = aggregate::verify_aggregate_classes_with_grinding(
         registry,
         &bool_asserts,
         &el_asserts,
@@ -20486,6 +21396,7 @@ fn mvp11_swap_children_fold_scale() {
         &[],
         &[],
         &agg,
+        tower_fold_grinding(),
         &mut rec,
     )
     .expect("the scale fold verifies");
@@ -20596,13 +21507,22 @@ fn mvp11_swap_children_fold_scale() {
         );
         assert_chain_replays(&ops, &trace, &chals);
 
-        let b3_rows = trace.rows.len();
+        let b3_rows = trace.rows.len()
+            + ops
+                .iter()
+                .filter(|op| matches!(op, Op::Pow { bits } if *bits != 0))
+                .count();
         let nu2 = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7);
         let mut sb = ShapeBuilder::new(nu2);
         let b3s = sb.slot(Blake3Gate { nu: nu2 });
         let macs = sb.slot(MacGate::new());
         let mrs = sb.slot(MergedRoundGate::new());
         let pf_w = 8usize;
+        let spread_w = tower_fold_grinding().round_bits.max(1) as usize;
+        let spreads = sb.slot(BitSpreadGate {
+            ty: BitSpreadTable::new(spread_w),
+            nu: nu2,
+        });
         let pfslot = sb.slot(PrefixGate::new(pf_w));
         let leslot = sb.slot(LeafEvalGate::new(8));
 
@@ -20623,6 +21543,19 @@ fn mvp11_swap_children_fold_scale() {
             &mut consts,
             &pub_payloads,
             &cross,
+        );
+        emit_recorded_pow_checks(
+            &mut sb,
+            b3s,
+            spreads,
+            iv2,
+            &ops,
+            &trace,
+            &stream,
+            &chain_outs,
+            &ww,
+            &mut vals,
+            &mut consts,
         );
         let mut vmap: Vec<Option<usize>> = Vec::new();
         for (wi, w) in stream.words.iter().enumerate() {
@@ -20646,6 +21579,7 @@ fn mvp11_swap_children_fold_scale() {
             leslot,
             &locs,
             &trace.squeezes,
+            &challenge_word_locs(t_shape.ops()),
             &chain_outs,
             &ww,
             &vmap,
@@ -20718,6 +21652,9 @@ fn mvp11_swap_children_fold_scale() {
         };
         let b3_r1cs2 = blake3::build_block_r1cs(nu2);
         let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
+        let spread_ty2 = BitSpreadTable::new(spread_w);
+        let spread_r1cs2 = spread_ty2.build_block_r1cs(nu2);
+        let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
         let mut el_ord: Vec<(usize, Vec<F128>)> = [macs, mrs, pfslot, leslot]
             .into_iter()
             .map(|sl| {
@@ -20736,20 +21673,46 @@ fn mvp11_swap_children_fold_scale() {
             .into_iter()
             .map(|(i, z)| live_element_input(z, shape2.counts[i], nu2))
             .collect();
+        let mut bool_inputs: Vec<(usize, UnionSlotProverInput<'_>)> = vec![
+            (
+                shape2.registry_slot(b3s),
+                UnionSlotProverInput::new(
+                    blake3::generate_witness_batch_major_partial(
+                        built2.rows::<Blake3Gate>(b3s),
+                        nu2,
+                    ),
+                    b3_lc2,
+                ),
+            ),
+            (
+                shape2.registry_slot(spreads),
+                UnionSlotProverInput::new(
+                    spread_ty2.generate_witness_batch_major(
+                        built2.rows::<BitSpreadGate>(spreads),
+                        nu2,
+                    ),
+                    spread_lc2,
+                ),
+            ),
+        ];
+        bool_inputs.sort_by_key(|(i, _)| *i);
         let mut ch2 = FsChallenger::new(DOMAIN);
         let (oproof, ocommit, _) = prover::prove_fast_ligerito_union_circuit(
             &union2,
             &shape2.circuit,
             &built2.public,
             &pcs2,
-            vec![UnionSlotProverInput::new(
-                blake3::generate_witness_batch_major_partial(built2.rows::<Blake3Gate>(b3s), nu2),
-                b3_lc2,
-            )],
+            bool_inputs.into_iter().map(|(_, x)| x).collect(),
             el_inputs,
             &mut ch2,
         );
-        let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![b3_lc2];
+        let mut lcs2: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
+            (shape2.registry_slot(b3s), b3_lc2),
+            (shape2.registry_slot(spreads), spread_lc2),
+        ];
+        lcs2.sort_by_key(|(i, _)| *i);
+        let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
+            lcs2.into_iter().map(|(_, c)| c).collect();
         let mut ch2 = FsChallenger::new(DOMAIN);
         verifier::verify_ligerito_union_circuit(
             &union2,
@@ -21168,7 +22131,7 @@ fn build_node_outer_app(
     });
     let priors: Vec<&aggregate::Accumulator> = prior_acc.iter().collect();
     let mut chp = FsChallenger::with_chained_blake3(M11_NODE_DOMAIN);
-    let (agg, acc_p) = aggregate::prove_aggregate_classes(
+    let (agg, acc_p) = aggregate::prove_aggregate_classes_with_grinding(
         registry,
         &mats,
         &lcs,
@@ -21178,12 +22141,13 @@ fn build_node_outer_app(
         &sigma_keys,
         &jagged_p,
         &priors,
+        tower_fold_grinding(),
         &mut chp,
     )
     .expect("the node fold proves");
     let mut rec =
         RecordingChallenger::new(FsChallenger::with_chained_blake3(M11_NODE_DOMAIN));
-    let acc_v = aggregate::verify_aggregate_classes(
+    let acc_v = aggregate::verify_aggregate_classes_with_grinding(
         registry,
         &bool_asserts,
         &el_asserts,
@@ -21191,6 +22155,7 @@ fn build_node_outer_app(
         &jagged_v,
         &priors,
         &agg,
+        tower_fold_grinding(),
         &mut rec,
     )
     .expect("the node fold verifies");
@@ -21335,9 +22300,13 @@ fn build_node_outer_app(
         vec![priors.len() as u8],
         "bind: prior count"
     );
+    let sigma_payloads = labeled_bytes_payloads(&ops, b"flock-aggregate-sigma-v1");
+    let jagged_payloads = labeled_bytes_payloads(&ops, b"flock-aggregate-jagged-v0");
+    assert_eq!(sigma_payloads.len(), n_keys, "one sigma digest payload per key");
+    assert_eq!(jagged_payloads.len(), n_keys, "one jagged digest payload per key");
     for j in 0..n_keys {
         assert_eq!(
-            rec.payloads()[2 + j],
+            rec.payloads()[sigma_payloads[j]],
             key_digests[j].to_vec(),
             "the sigma slot {j} key payload"
         );
@@ -21350,7 +22319,7 @@ fn build_node_outer_app(
         vals_rec,
         chals,
         rec.payloads(),
-        2 + n_keys, // bind's two + one digest payload per sigma key
+        &jagged_payloads,
         vcur,
         ccur,
     );
@@ -21401,7 +22370,7 @@ fn build_node_outer_app(
         let ljagged_v: Vec<aggregate::JaggedKeyVerify<'_>> =
             vec![(ln.circuit.digest(), Vec::new())];
         let mut chp = FsChallenger::with_chained_blake3(LANE_DOMAIN);
-        let (lagg, lacc_p) = aggregate::prove_aggregate_classes(
+        let (lagg, lacc_p) = aggregate::prove_aggregate_classes_with_grinding(
             ln.registry,
             ln.mats,
             ln.circs,
@@ -21411,12 +22380,13 @@ fn build_node_outer_app(
             &[(ln.circuit, Vec::new())],
             &ljagged_p,
             ln.priors,
+            tower_fold_grinding(),
             &mut chp,
         )
         .expect("the lane fold proves");
         let mut lrec =
             RecordingChallenger::new(FsChallenger::with_chained_blake3(LANE_DOMAIN));
-        let lacc_v = aggregate::verify_aggregate_classes(
+        let lacc_v = aggregate::verify_aggregate_classes_with_grinding(
             ln.registry,
             &[],
             &el_asserts_l,
@@ -21424,6 +22394,7 @@ fn build_node_outer_app(
             &ljagged_v,
             ln.priors,
             &lagg,
+            tower_fold_grinding(),
             &mut lrec,
         )
         .expect("the lane fold verifies");
@@ -21489,7 +22460,7 @@ fn build_node_outer_app(
             &lvals,
             &lchals,
             lrec.payloads(),
-            3, // bind's two + the sigma key's digest payload
+            &labeled_bytes_payloads(&lops, b"flock-aggregate-jagged-v0"),
             lvcur,
             lccur,
         );
@@ -21528,7 +22499,27 @@ fn build_node_outer_app(
         );
         assert_chain_replays(&ops, &trace, &chals);
 
-        let b3_rows = rts.iter().map(|rt| rt.b3_rows).sum::<usize>() + trace.rows.len();
+        let b3_rows = rts.iter().map(|rt| rt.b3_rows).sum::<usize>()
+            + trace.rows.len()
+            + ops
+                .iter()
+                .filter(|op| matches!(op, Op::Pow { bits } if *bits != 0))
+                .count();
+        if std::env::var("B3_CENSUS").is_ok() {
+            let fold_pows = ops
+                .iter()
+                .filter(|op| matches!(op, Op::Pow { bits } if *bits != 0))
+                .count();
+            eprintln!(
+                "  [node pow census] child checks {:?} | fold checks {} | standalone BLAKE rows {}",
+                rts.iter().map(|rt| rt.pows.len()).collect::<Vec<_>>(),
+                fold_pows,
+                rts.iter()
+                    .map(|rt| rt.pows.iter().filter(|(_, _, bits)| *bits != 0).count())
+                    .sum::<usize>()
+                    + fold_pows,
+            );
+        }
         // MEASURED AND REJECTED (2026-08-05): over-provisioning nu by one
         // bit to re-engage the pay-per-live arms. Boolean committed area was
         // then CAPACITY-shaped (M_bool 31→32 doubled the boolean stack; the
@@ -21624,6 +22615,19 @@ fn build_node_outer_app(
             &pub_payloads,
             &cross,
         );
+        emit_recorded_pow_checks(
+            &mut sb,
+            cs.q.b3,
+            cs.q.spread,
+            iv2,
+            &ops,
+            &trace,
+            &stream,
+            &chain_outs,
+            &ww,
+            &mut vals,
+            &mut consts,
+        );
         let mut vmap: Vec<Option<usize>> = Vec::new();
         for (wi, w) in stream.words.iter().enumerate() {
             if let flock_core::transcript_record::StreamWord::Value(vi) = *w {
@@ -21647,6 +22651,7 @@ fn build_node_outer_app(
             leslot,
             &locs,
             &trace.squeezes,
+            &challenge_word_locs(t_shape.ops()),
             &chain_outs,
             &ww,
             &vmap,
@@ -21665,6 +22670,7 @@ fn build_node_outer_app(
             pf_w,
             &jlocs,
             &trace.squeezes,
+            &challenge_word_locs(t_shape.ops()),
             &chain_outs,
             &ww,
             &vmap,
@@ -21714,7 +22720,7 @@ fn build_node_outer_app(
             // z = 1 + d·w with z·d == 0 — z is 1 exactly when d is 0 (to
             // claim z = 1 with d ≠ 0 a prover needs w = 0, and then
             // z·d = d ≠ 0 fails the assert).
-            let mut is_eq =
+            let is_eq =
                 |sb: &mut ShapeBuilder, vals: &mut Vec<F128>, a: Wire, b: Wire, d: F128| -> Wire {
                     let d_w = sb.gate(cs.macs, &[a, b, ow])[0];
                     vals.push(d.inv());
@@ -21756,7 +22762,7 @@ fn build_node_outer_app(
             );
             // One keyed slot: the published key against this node's own,
             // then the gate. Returns (g, gated value, orphan gate h).
-            let mut slot = |sb: &mut ShapeBuilder,
+            let slot = |sb: &mut ShapeBuilder,
                             vals: &mut Vec<F128>,
                             o: usize,
                             j: usize,
@@ -21929,9 +22935,7 @@ fn build_node_outer_app(
             // node did not verify.
             let pays_n = payload_words(&stream);
             for j in 0..n_keys {
-                // The sigma slots' payloads follow bind's two; the jagged
-                // slots' follow those.
-                for p in [2 + j, 2 + n_keys + j] {
+                for p in [sigma_payloads[j], jagged_payloads[j]] {
                     assert_eq!(pays_n[p].len(), 2, "a group key payload is 32 bytes");
                     for (b, &kw) in pays_n[p].iter().enumerate() {
                         sb.connect(ww[kw].expect("key payload wired"), regions[j].cd_w[b]);
@@ -22197,8 +23201,8 @@ fn build_node_outer_app(
             ]
         };
         let mut acc_main_w: Vec<Wire> = Vec::new();
-        let mut push_entry = |w: &mut Vec<Wire>, key: Option<[Wire; 2]>, fp: Option<&FoldPub>,
-                              k_col: usize, k_row: usize| {
+        let push_entry = |w: &mut Vec<Wire>, key: Option<[Wire; 2]>, fp: Option<&FoldPub>,
+                          k_col: usize, k_row: usize| {
             if let Some(k) = key {
                 w.extend_from_slice(&k);
             }
@@ -22216,7 +23220,8 @@ fn build_node_outer_app(
             push_entry(&mut acc_main_w, None, Some(fp), 0, 0);
         }
         for j in 0..N_KEY_SLOTS {
-            let live = (j < n_keys).then(|| (key_wires(2 + j), &fold_pubs[n_uni + j]));
+            let live =
+                (j < n_keys).then(|| (key_wires(sigma_payloads[j]), &fold_pubs[n_uni + j]));
             push_entry(
                 &mut acc_main_w,
                 Some(live.map(|(k, _)| k).unwrap_or([zw, zw])),
@@ -22226,7 +23231,8 @@ fn build_node_outer_app(
             );
         }
         for j in 0..N_KEY_SLOTS {
-            let live = (j < n_keys).then(|| (key_wires(2 + n_keys + j), &jfold_pubs[j]));
+            let live =
+                (j < n_keys).then(|| (key_wires(jagged_payloads[j]), &jfold_pubs[j]));
             push_entry(
                 &mut acc_main_w,
                 Some(live.map(|(k, _)| k).unwrap_or([zw, zw])),
@@ -22340,6 +23346,19 @@ fn build_node_outer_app(
                 &lpub_payloads,
                 &[],
             );
+            emit_recorded_pow_checks(
+                &mut sb,
+                cs.q.b3,
+                cs.q.spread,
+                iv2,
+                lops,
+                &ltrace,
+                lstream,
+                &lchain_outs,
+                &lww,
+                &mut vals,
+                &mut consts,
+            );
             let mut lvmap: Vec<Option<usize>> = Vec::new();
             for (wi, w) in lstream.words.iter().enumerate() {
                 if let flock_core::transcript_record::StreamWord::Value(vi) = *w {
@@ -22360,6 +23379,7 @@ fn build_node_outer_app(
                 leslot,
                 llocs,
                 &ltrace.squeezes,
+                &challenge_word_locs(lops),
                 &lchain_outs,
                 &lww,
                 &lvmap,
@@ -22378,6 +23398,7 @@ fn build_node_outer_app(
                 pf_w,
                 ljlocs,
                 &ltrace.squeezes,
+                &challenge_word_locs(lops),
                 &lchain_outs,
                 &lww,
                 &lvmap,
@@ -24469,7 +25490,7 @@ fn chain_tower_e2e_with_lane() {
         let jagged_vt: Vec<aggregate::JaggedKeyVerify<'_>> =
             vec![(cp0.inner.built.shape.circuit.digest(), Vec::new())];
         let mut chp = FsChallenger::with_chained_blake3(b"flock-chain-lane-tamper");
-        let (lagg, _) = aggregate::prove_aggregate_classes(
+        let (lagg, _) = aggregate::prove_aggregate_classes_with_grinding(
             chain_registry,
             &chain_mats,
             &chain_circs,
@@ -24479,12 +25500,13 @@ fn chain_tower_e2e_with_lane() {
             &[(&cp0.inner.built.shape.circuit, Vec::new())],
             &jagged_pt,
             &[&fl0.acc, &fl1.acc],
+            tower_fold_grinding(),
             &mut chp,
         )
         .expect("honest lane fold proves");
         let mut ch = FsChallenger::with_chained_blake3(b"flock-chain-lane-tamper");
         assert!(
-            aggregate::verify_aggregate_classes(
+            aggregate::verify_aggregate_classes_with_grinding(
                 chain_registry,
                 &[],
                 &el_asserts_l,
@@ -24492,6 +25514,7 @@ fn chain_tower_e2e_with_lane() {
                 &jagged_vt,
                 &[&bad_acc, &fl1.acc],
                 &lagg,
+                tower_fold_grinding(),
                 &mut ch,
             )
             .is_err(),
@@ -25086,7 +26109,37 @@ fn l2_node_bench() {
 fn mvp11_two_to_one_recursion_node() {
     let lo0 = build_leaf_outer_seeded(0x4D50_9B00);
     let lo1 = build_leaf_outer_seeded(0x4D50_9B01);
-    build_node_outer(&lo0, &lo1);
+    let (node, _acc, _) = build_node_outer(&lo0, &lo1);
+
+    if tower_profile() == LigeritoProfile::Secure {
+        for (name, proof) in [
+            ("left child", &lo0.proof),
+            ("right child", &lo1.proof),
+            ("recursive outer", &node.proof),
+        ] {
+            let zc = &proof
+                .boolean
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name}: boolean proof present"))
+                .zerocheck;
+            assert!(
+                !zc.grinding_nonces.is_empty(),
+                "{name}: Secure recursion must carry zerocheck PoW nonces"
+            );
+            let el = proof
+                .element
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name}: element proof present"));
+            assert!(
+                !el.zerocheck.grinding_nonces.is_empty(),
+                "{name}: Secure recursion must carry element-zerocheck PoW nonces"
+            );
+            assert!(
+                !el.lincheck.grinding_nonces.is_empty(),
+                "{name}: Secure recursion must carry element-lincheck PoW nonces"
+            );
+        }
+    }
 }
 
 /// **MVP-12: the node consumes its own output — the recursion TOWER.**
@@ -25344,7 +26397,7 @@ fn envelope_registry_diff() {
         let bool_asserts = [rt0.mat_assert.clone(), rt1.mat_assert.clone()];
         let el_asserts = [(&u0, rt0.el_assert.clone()), (&u1, rt1.el_assert.clone())];
         let mut chp = FsChallenger::with_chained_blake3(PRIOR_DOMAIN);
-        let (agg_l, acc_leaf) = aggregate::prove_aggregate_classes(
+        let (agg_l, acc_leaf) = aggregate::prove_aggregate_classes_with_grinding(
             registry,
             &mats,
             &lcs,
@@ -25354,11 +26407,12 @@ fn envelope_registry_diff() {
             &[],
             &[],
             &[],
+            tower_fold_grinding(),
             &mut chp,
         )
         .expect("the leaf-level fold proves");
         let mut chv = FsChallenger::with_chained_blake3(PRIOR_DOMAIN);
-        let acc_leaf_v = aggregate::verify_aggregate_classes(
+        let acc_leaf_v = aggregate::verify_aggregate_classes_with_grinding(
             registry,
             &bool_asserts,
             &el_asserts,
@@ -25366,6 +26420,7 @@ fn envelope_registry_diff() {
             &[],
             &[],
             &agg_l,
+            tower_fold_grinding(),
             &mut chv,
         )
         .expect("the leaf-level fold verifies");
@@ -25380,7 +26435,7 @@ fn envelope_registry_diff() {
         let n_el = [(&un, rtn.el_assert.clone())];
         let n_sigmas = [rtn.sigma_native.clone()];
         let mut chp2 = FsChallenger::with_chained_blake3(PRIOR_DOMAIN);
-        let (agg_n, acc_node) = aggregate::prove_aggregate_classes(
+        let (agg_n, acc_node) = aggregate::prove_aggregate_classes_with_grinding(
             registry,
             &mats,
             &lcs,
@@ -25390,11 +26445,12 @@ fn envelope_registry_diff() {
             &[(&n0.shape.circuit, n_sigmas.iter().collect())],
             &[],
             &[&acc_leaf],
+            tower_fold_grinding(),
             &mut chp2,
         )
         .expect("a leaf accumulator is a valid node-fold prior (wall 2)");
         let mut chv2 = FsChallenger::with_chained_blake3(PRIOR_DOMAIN);
-        let acc_node_v = aggregate::verify_aggregate_classes(
+        let acc_node_v = aggregate::verify_aggregate_classes_with_grinding(
             registry,
             &n_bool,
             &n_el,
@@ -25402,6 +26458,7 @@ fn envelope_registry_diff() {
             &[],
             &[&acc_leaf],
             &agg_n,
+            tower_fold_grinding(),
             &mut chv2,
         )
         .expect("the cross-level fold verifies");
@@ -25421,7 +26478,7 @@ fn envelope_registry_diff() {
         bad.registry_digest[0] ^= 1;
         let mut chb = FsChallenger::with_chained_blake3(PRIOR_DOMAIN);
         assert!(
-            aggregate::prove_aggregate_classes(
+            aggregate::prove_aggregate_classes_with_grinding(
                 registry,
                 &mats,
                 &lcs,
@@ -25431,6 +26488,7 @@ fn envelope_registry_diff() {
                 &[(&n0.shape.circuit, n_sigmas.iter().collect())],
                 &[],
                 &[&bad],
+                tower_fold_grinding(),
                 &mut chb,
             )
             .is_err(),

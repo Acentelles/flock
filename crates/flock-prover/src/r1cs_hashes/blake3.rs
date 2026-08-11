@@ -2449,6 +2449,30 @@ mod chain_e2e_tests {
     }
 
     #[test]
+    #[ignore] // Heavier — Secure Ligerito plus all chain grinding families.
+    fn chain_secure_grinding_roundtrip_and_rejects_missing_shift_nonce() {
+        use flock_core::pcs::ligerito::LigeritoProfile;
+
+        let setup = Blake3Setup::with_profile(256, LigeritoProfile::Secure);
+        let n = setup.n_block_slots();
+        let (blocks, cv0, cv_last) = honest_chain(n, 0x1280_C4A1);
+        let mut chp = FsChallenger::new(b"b3-chain-secure-grinding");
+        let (proof, comm) = setup.prove_chain(&blocks, &mut chp);
+        assert!(!proof.shift.grinding_nonces.is_empty());
+        let mut chv = FsChallenger::new(b"b3-chain-secure-grinding");
+        setup
+            .verify_chain(&comm, &proof, &cv0, &cv_last, &mut chv)
+            .expect("Secure grinded chain proof verifies");
+
+        let mut missing = proof;
+        missing.shift.grinding_nonces.pop();
+        let mut chv = FsChallenger::new(b"b3-chain-secure-grinding");
+        assert!(setup
+            .verify_chain(&comm, &missing, &cv0, &cv_last, &mut chv)
+            .is_err());
+    }
+
+    #[test]
     #[ignore] // Heavier — Ligerito needs m=22
     fn chain_wrong_endpoint_rejects() {
         let setup = Blake3Setup::new(256);

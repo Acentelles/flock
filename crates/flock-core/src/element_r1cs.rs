@@ -689,6 +689,51 @@ fn ligerito_verifier_config(m_words: usize) -> VerifierConfig {
 // End-to-end proof
 // ---------------------------------------------------------------------------
 
+/// Fiat--Shamir grinding policy for the element/dense PIOP.
+///
+/// The initial equality point is a polynomial of total degree at most the
+/// number of word variables. Each Convention-A zerocheck and product-lincheck
+/// round is degree two, while the lincheck batching scalar is linear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Grinding {
+    enabled: bool,
+}
+
+impl Grinding {
+    pub const fn disabled() -> Self {
+        Self { enabled: false }
+    }
+
+    pub const fn per_challenge_128() -> Self {
+        Self { enabled: true }
+    }
+
+    /// `ceil(log2(m_words + 1))`, enough that
+    /// `m_words / (2^bits |F|) < 2^-128` for `m_words >= 1`.
+    pub fn initial_bits(self, m_words: usize) -> Option<u32> {
+        self.enabled
+            .then_some((usize::BITS - m_words.leading_zeros()) as u32)
+    }
+
+    pub fn round_bits(self) -> Option<u32> {
+        self.enabled.then_some(2)
+    }
+
+    pub fn alpha_bits(self) -> Option<u32> {
+        self.enabled.then_some(1)
+    }
+
+    pub fn zerocheck_nonce_count(self, m_words: usize) -> usize {
+        usize::from(self.initial_bits(m_words).is_some())
+            + usize::from(self.round_bits().is_some()) * m_words
+    }
+
+    pub fn lincheck_nonce_count(self, rounds: usize) -> usize {
+        usize::from(self.alpha_bits().is_some())
+            + usize::from(self.round_bits().is_some()) * rounds
+    }
+}
+
 /// A standalone single-table element proof: the witness commitment root, the two
 /// PIOP phases, and one batched opening of both output claims.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -746,6 +791,19 @@ pub fn prove<C: Challenger>(
     z: &[F128],
     ch: &mut C,
 ) -> (ElementProof, ElementClaim) {
+    prove_with_grinding(stmt, z, Grinding::disabled(), ch)
+}
+
+/// [`prove`] with an explicit Fiat--Shamir grinding policy for both element
+/// PIOP phases.  The normal mixed-table prover selects this from
+/// [`PcsParams::element_grinding`]; this entry point gives standalone users
+/// the same protection without changing the legacy transcript by default.
+pub fn prove_with_grinding<C: Challenger>(
+    stmt: &ElementStatement<'_>,
+    z: &[F128],
+    grinding: Grinding,
+    ch: &mut C,
+) -> (ElementProof, ElementClaim) {
     let m_words = stmt.m_words();
     assert!(
         m_words >= MIN_M_WORDS,
@@ -766,7 +824,9 @@ pub fn prove<C: Challenger>(
     let (mut pa, mut pb) = stmt.ty.apply(z, stmt.n_log);
     broadcast_add(&mut pa, stmt.ty.a_const(), stmt.n_log);
     broadcast_add(&mut pb, stmt.ty.b_const(), stmt.n_log);
-    let (zc_proof, zc_claim) = zerocheck::prove(pa, pb, z, m_words, ch);
+    let (zc_proof, zc_claim) = zerocheck::prove_with_grinding(
+        pa, pb, z, m_words, grinding, ch,
+    );
 
     // ---- 3. Phase 2: batched lincheck. ----
     //
@@ -775,7 +835,16 @@ pub fn prove<C: Challenger>(
     // no row dependence, so subtracting them (char 2: adding) leaves the pure
     // `Âz(r)` / `B̂z(r)` claims the lincheck reduces.
     let (va, vb) = strip_constants(stmt.ty, &zc_claim);
-    let (lc_proof, lc_claim) = lincheck::prove(stmt.ty, z, stmt.n_log, &zc_claim.r, va, vb, ch);
+    let (lc_proof, lc_claim) = lincheck::prove_with_grinding(
+        stmt.ty,
+        z,
+        stmt.n_log,
+        &zc_claim.r,
+        va,
+        vb,
+        grinding,
+        ch,
+    );
 
     // ---- 4. Open both witness claims, packed-direct, no ring-switch. ----
     let claims = packed_direct_claims(&zc_claim.r, zc_claim.ec, &lc_claim.r_prime, lc_claim.z_eval);
@@ -813,6 +882,17 @@ pub fn verify<C: Challenger>(
     proof: &ElementProof,
     ch: &mut C,
 ) -> Result<ElementClaim, VerifyError> {
+    verify_with_grinding(stmt, proof, Grinding::disabled(), ch)
+}
+
+/// [`verify`] with an explicit Fiat--Shamir grinding policy.  The verifier
+/// checks every nonce before the challenge it protects is sampled.
+pub fn verify_with_grinding<C: Challenger>(
+    stmt: &ElementStatement<'_>,
+    proof: &ElementProof,
+    grinding: Grinding,
+    ch: &mut C,
+) -> Result<ElementClaim, VerifyError> {
     let m_words = stmt.m_words();
     if m_words < MIN_M_WORDS {
         return Err(VerifyError::TooSmall {
@@ -835,16 +915,17 @@ pub fn verify<C: Challenger>(
     };
     stmt.bind(&commitment.cap, ch);
 
-    let zc_claim =
-        zerocheck::verify(m_words, &proof.zerocheck, ch).map_err(VerifyError::Zerocheck)?;
+    let zc_claim = zerocheck::verify_with_grinding(m_words, &proof.zerocheck, grinding, ch)
+        .map_err(VerifyError::Zerocheck)?;
     let (va, vb) = strip_constants(stmt.ty, &zc_claim);
-    let lc_claim = lincheck::verify(
+    let lc_claim = lincheck::verify_with_grinding(
         stmt.ty,
         stmt.n_log,
         &zc_claim.r,
         va,
         vb,
         &proof.lincheck,
+        grinding,
         ch,
     )
     .map_err(VerifyError::Lincheck)?;
@@ -1265,6 +1346,76 @@ mod e2e_tests {
     ) -> Result<ElementClaim, VerifyError> {
         let mut ch = FsChallenger::new(TRANSCRIPT);
         verify(stmt, proof, &mut ch)
+    }
+
+    /// The standalone API exposes the same secure PIOP schedule as the union
+    /// profile path.  This pins nonce placement (before the protected squeeze),
+    /// exact proof shape, and verifier rejection of a missing witness.
+    #[test]
+    fn grinded_prove_verify_roundtrip_and_rejects_missing_nonce() {
+        let mut rng = Rng::new(0x128_E1E);
+        let (n_log, n) = (6usize, 37usize); // κ=2, so m_words=8.
+        let ty = mult_gate(2);
+        let z = mult_witness(&ty, n_log, n, &mut rng);
+        let stmt = ElementStatement { ty: &ty, n_log, n };
+        let grinding = Grinding::per_challenge_128();
+
+        let mut ch_p = FsChallenger::new(TRANSCRIPT);
+        let (proof, claim_p) = prove_with_grinding(&stmt, &z, grinding, &mut ch_p);
+        assert_eq!(
+            proof.zerocheck.grinding_nonces.len(),
+            grinding.zerocheck_nonce_count(stmt.m_words())
+        );
+        assert_eq!(
+            proof.lincheck.grinding_nonces.len(),
+            grinding.lincheck_nonce_count(ty.kappa())
+        );
+
+        let mut ch_v = FsChallenger::new(TRANSCRIPT);
+        assert_eq!(
+            verify_with_grinding(&stmt, &proof, grinding, &mut ch_v).expect("honest proof"),
+            claim_p
+        );
+
+        let mut missing_zc = proof.clone();
+        missing_zc.zerocheck.grinding_nonces.pop();
+        let mut ch_v = FsChallenger::new(TRANSCRIPT);
+        assert!(matches!(
+            verify_with_grinding(&stmt, &missing_zc, grinding, &mut ch_v),
+            Err(VerifyError::Zerocheck(
+                zerocheck::VerifyError::BadGrindingNonceCount { .. }
+            ))
+        ));
+
+        // Pick a different nonce that fails the *initial* PoW predicate.
+        // (The 4-bit initial difficulty at m_words=8 makes the scan tiny.)
+        let original = proof.zerocheck.grinding_nonces[0];
+        let mut rejected_bad_nonce = false;
+        for delta in 1..=64u64 {
+            let mut bad = proof.clone();
+            bad.zerocheck.grinding_nonces[0] = original.wrapping_add(delta);
+            let mut ch_v = FsChallenger::new(TRANSCRIPT);
+            if matches!(
+                verify_with_grinding(&stmt, &bad, grinding, &mut ch_v),
+                Err(VerifyError::Zerocheck(
+                    zerocheck::VerifyError::InvalidGrindingNonce { which: "initial" }
+                ))
+            ) {
+                rejected_bad_nonce = true;
+                break;
+            }
+        }
+        assert!(rejected_bad_nonce, "a changed initial PoW nonce must reject");
+
+        let mut missing_lc = proof;
+        missing_lc.lincheck.grinding_nonces.pop();
+        let mut ch_v = FsChallenger::new(TRANSCRIPT);
+        assert!(matches!(
+            verify_with_grinding(&stmt, &missing_lc, grinding, &mut ch_v),
+            Err(VerifyError::Lincheck(
+                lincheck::VerifyError::BadGrindingNonceCount { .. }
+            ))
+        ));
     }
 
     /// Round-trip a mult-gate table at several `(n_log, kappa, n)` shapes —

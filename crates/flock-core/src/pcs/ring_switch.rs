@@ -2214,6 +2214,10 @@ pub fn fold_b128_elems_sparse(len: usize, eq: &SparseEqTensor, eq_r_dprime: &[F1
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RingSwitchProof {
     pub s_hat_v: Vec<F128>,
+    /// PoW witness bound after `s_hat_v` and before the sampled seven-word
+    /// ring-switch point. Zero when the selected policy disables grinding.
+    #[serde(default)]
+    pub grinding_nonce: u64,
 }
 
 /// What both prover and verifier compute as a result of the reduction:
@@ -2273,6 +2277,17 @@ impl RsEqInd {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Multiply the represented vector by one scalar without materializing a
+    /// deferred or sparse representation. Used when a caller samples a whole
+    /// batching vector only after every claim value has been absorbed.
+    pub fn scale_in_place(&mut self, gamma: F128) {
+        match self {
+            Self::Dense(v) => v.iter_mut().for_each(|x| *x *= gamma),
+            Self::DeferredDense { table, .. } => table.iter_mut().for_each(|x| *x *= gamma),
+            Self::Sparse { entries, .. } => entries.iter_mut().for_each(|(_, x)| *x *= gamma),
+        }
     }
 
     /// Accumulate `gamma * self[j]` into `out[j]` for all `j`. Sparse variants
@@ -2348,6 +2363,7 @@ impl RsEqInd {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VerifyError {
     ClaimMismatch,
+    InvalidGrinding,
 }
 
 /// Prover side of the ring-switching reduction.
@@ -2362,6 +2378,18 @@ pub enum VerifyError {
 pub fn prove<Ch: Challenger>(
     packed_witness: &[F128],
     x_outer: &[F128],
+    challenger: &mut Ch,
+) -> (RingSwitchProof, RingSwitchOutput) {
+    prove_with_grinding(packed_witness, x_outer, 0, challenger)
+}
+
+/// [`prove`] with a PoW witness immediately before the seven-coordinate
+/// ring-switch point `r''`.  A nonzero `grinding_bits` protects the degree at
+/// most seven random-linear reduction; zero preserves the legacy transcript.
+pub fn prove_with_grinding<Ch: Challenger>(
+    packed_witness: &[F128],
+    x_outer: &[F128],
+    grinding_bits: u32,
     challenger: &mut Ch,
 ) -> (RingSwitchProof, RingSwitchOutput) {
     assert!(
@@ -2402,7 +2430,11 @@ pub fn prove<Ch: Challenger>(
     }
     challenger.observe_f128_slice(&s_hat_v);
 
-    // Sample row-batching r''.
+    // The s_hat_v message is fixed. Bind a PoW witness before sampling the
+    // seven-coordinate row-batching point r''.
+    let grinding_nonce = (grinding_bits != 0)
+        .then(|| challenger.grind_pow(grinding_bits))
+        .unwrap_or(0);
     let r_dprime = challenger.sample_f128_vec(LOG_PACKING);
     let eq_r_dprime = build_eq(&r_dprime);
 
@@ -2421,7 +2453,10 @@ pub fn prove<Ch: Challenger>(
     }
 
     (
-        RingSwitchProof { s_hat_v },
+        RingSwitchProof {
+            s_hat_v,
+            grinding_nonce,
+        },
         RingSwitchOutput {
             rs_eq_ind,
             sumcheck_claim,
@@ -2483,6 +2518,75 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     padding: &PaddingSpec,
     challenger: &mut Ch,
 ) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>) {
+    let (results, gammas, _) = prove_batched_padded_with_precomputed_and_grinding(
+        packed_witness,
+        x_outers,
+        precomputed_s_hat_v,
+        padding,
+        0,
+        0,
+        challenger,
+    );
+    (results, gammas)
+}
+
+/// [`prove_batched_padded_with_precomputed`] with PoW witnesses for each
+/// ring-switch point and each nontrivial batch coefficient.  The returned
+/// nonce vector is in the gamma order used by the PCS caller.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_batched_padded_with_precomputed_and_grinding<Ch: Challenger>(
+    packed_witness: &[F128],
+    x_outers: &[&[F128]],
+    precomputed_s_hat_v: &[Option<&[F128]>],
+    padding: &PaddingSpec,
+    ring_switch_bits: u32,
+    claim_batch_bits: u32,
+    challenger: &mut Ch,
+) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>, Vec<u64>) {
+    prove_batched_padded_with_precomputed_and_grinding_impl(
+        packed_witness,
+        x_outers,
+        precomputed_s_hat_v,
+        padding,
+        ring_switch_bits,
+        Some(claim_batch_bits),
+        challenger,
+    )
+}
+
+/// Prepare every ring-switch claim and absorb its messages without sampling
+/// batching coefficients. The PCS uses this to absorb packed-direct values as
+/// well, perform one PoW, and then squeeze the entire mixed coefficient vector.
+pub(crate) fn prove_batched_padded_with_precomputed_unbatched_and_grinding<Ch: Challenger>(
+    packed_witness: &[F128],
+    x_outers: &[&[F128]],
+    precomputed_s_hat_v: &[Option<&[F128]>],
+    padding: &PaddingSpec,
+    ring_switch_bits: u32,
+    challenger: &mut Ch,
+) -> Vec<(RingSwitchProof, RingSwitchBatchOutput)> {
+    prove_batched_padded_with_precomputed_and_grinding_impl(
+        packed_witness,
+        x_outers,
+        precomputed_s_hat_v,
+        padding,
+        ring_switch_bits,
+        None,
+        challenger,
+    )
+    .0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_batched_padded_with_precomputed_and_grinding_impl<Ch: Challenger>(
+    packed_witness: &[F128],
+    x_outers: &[&[F128]],
+    precomputed_s_hat_v: &[Option<&[F128]>],
+    padding: &PaddingSpec,
+    ring_switch_bits: u32,
+    claim_batch_bits: Option<u32>,
+    challenger: &mut Ch,
+) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>, Vec<u64>) {
     assert!(!x_outers.is_empty());
     let trace = std::env::var("PCS_TRACE").is_ok();
     let n = x_outers.len();
@@ -2682,6 +2786,7 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
 
     struct ClaimWork {
         s_hat_v: Vec<F128>,
+        grinding_nonce: u64,
         sumcheck_claim: F128,
         eq_r_dprime: Vec<F128>,
     }
@@ -2693,6 +2798,9 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
             Kind::Sparse(s) => sparse_s_hat_v[s].clone(),
         };
         challenger.observe_f128_slice(&s_hat_v);
+        let grinding_nonce = (ring_switch_bits != 0)
+            .then(|| challenger.grind_pow(ring_switch_bits))
+            .unwrap_or(0);
         let r_dprime = challenger.sample_f128_vec(LOG_PACKING);
         let eq_r_dprime = build_eq(&r_dprime);
 
@@ -2701,6 +2809,7 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
 
         work.push(ClaimWork {
             s_hat_v,
+            grinding_nonce,
             sumcheck_claim,
             eq_r_dprime,
         });
@@ -2709,7 +2818,20 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     // γ_rs sampled after all RS observations — sound. Each γ_rs[k] is then
     // baked into eq_r_dprime[k] before building the Φ byte table, so the
     // fold output is γ_k · B_k directly. pcs combine just adds.
-    let gammas_rs: Vec<F128> = (0..n).map(|_| challenger.sample_f128()).collect();
+    let batch_bits = claim_batch_bits.unwrap_or(0);
+    let mut gamma_nonces = Vec::with_capacity((batch_bits != 0) as usize * n);
+    let gammas_rs: Vec<F128> = (0..n)
+        .map(|_| {
+            if batch_bits != 0 {
+                gamma_nonces.push(challenger.grind_pow(batch_bits));
+            }
+            if claim_batch_bits.is_some() {
+                challenger.sample_f128()
+            } else {
+                F128::ONE
+            }
+        })
+        .collect();
 
     let results: Vec<(RingSwitchProof, RingSwitchBatchOutput)> = work
         .into_iter()
@@ -2768,7 +2890,10 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                 }
             };
             (
-                RingSwitchProof { s_hat_v: w.s_hat_v },
+                RingSwitchProof {
+                    s_hat_v: w.s_hat_v,
+                    grinding_nonce: w.grinding_nonce,
+                },
                 RingSwitchBatchOutput {
                     rs_eq_ind,
                     sumcheck_claim: w.sumcheck_claim,
@@ -2785,7 +2910,7 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
         );
     }
 
-    (results, gammas_rs)
+    (results, gammas_rs, gamma_nonces)
 }
 
 /// Verifier side of the ring-switching reduction.
@@ -2806,6 +2931,18 @@ pub fn verify<Ch: Challenger>(
     proof: &RingSwitchProof,
     challenger: &mut Ch,
 ) -> Result<RingSwitchOutput, VerifyError> {
+    verify_with_grinding(claim, z_skip, x_outer, proof, 0, challenger)
+}
+
+/// [`verify`] with the matching PoW check before the ring-switch point.
+pub fn verify_with_grinding<Ch: Challenger>(
+    claim: F128,
+    z_skip: F128,
+    x_outer: &[F128],
+    proof: &RingSwitchProof,
+    grinding_bits: u32,
+    challenger: &mut Ch,
+) -> Result<RingSwitchOutput, VerifyError> {
     assert!(!x_outer.is_empty());
     let l = 1usize << (x_outer.len() - 1);
     assert_eq!(proof.s_hat_v.len(), 1 << LOG_PACKING);
@@ -2821,7 +2958,15 @@ pub fn verify<Ch: Challenger>(
         return Err(VerifyError::ClaimMismatch);
     }
 
-    // Sample r''.
+    // This PoW operation is omitted entirely when disabled, unlike a
+    // zero-bit `Pow` operation elsewhere in the transcript.  Keep its carried
+    // field canonical without calling `verify_pow` (which would absorb a
+    // nonce and incorrectly change the legacy transcript).
+    if (grinding_bits == 0 && proof.grinding_nonce != 0)
+        || (grinding_bits != 0 && !challenger.verify_pow(proof.grinding_nonce, grinding_bits))
+    {
+        return Err(VerifyError::InvalidGrinding);
+    }
     let r_dprime = challenger.sample_f128_vec(LOG_PACKING);
     let eq_r_dprime = build_eq(&r_dprime);
 
@@ -2866,6 +3011,19 @@ pub fn verify_succinct<Ch: Challenger>(
     proof: &RingSwitchProof,
     challenger: &mut Ch,
 ) -> Result<RingSwitchVerifierOutput, VerifyError> {
+    verify_succinct_with_grinding(claim, z_skip, x_outer, proof, 0, challenger)
+}
+
+/// [`verify_succinct`] with the matching PoW check before the ring-switch
+/// point `r''`.
+pub fn verify_succinct_with_grinding<Ch: Challenger>(
+    claim: F128,
+    z_skip: F128,
+    x_outer: &[F128],
+    proof: &RingSwitchProof,
+    grinding_bits: u32,
+    challenger: &mut Ch,
+) -> Result<RingSwitchVerifierOutput, VerifyError> {
     assert!(!x_outer.is_empty());
     assert_eq!(proof.s_hat_v.len(), 1 << LOG_PACKING);
 
@@ -2877,6 +3035,11 @@ pub fn verify_succinct<Ch: Challenger>(
         return Err(VerifyError::ClaimMismatch);
     }
 
+    if (grinding_bits == 0 && proof.grinding_nonce != 0)
+        || (grinding_bits != 0 && !challenger.verify_pow(proof.grinding_nonce, grinding_bits))
+    {
+        return Err(VerifyError::InvalidGrinding);
+    }
     let r_dprime = challenger.sample_f128_vec(LOG_PACKING);
     let eq_r_dprime = build_eq(&r_dprime);
 
@@ -3234,6 +3397,65 @@ mod tests {
                 "rs_eq_ind mismatch at m={m}"
             );
         }
+    }
+
+    /// The ring-switch point is a seven-coordinate random-linear reduction.
+    /// Its secure transport policy inserts the PoW *after* `s_hat_v` is bound
+    /// and before that point is sampled; both native verifier paths must
+    /// reject a malformed witness before deriving the point.
+    #[test]
+    fn prove_verify_roundtrip_with_grinding() {
+        use crate::challenger::FsChallenger;
+
+        let m = 10usize;
+        let mut rng = Rng::new(0x4752_494E_44);
+        let z = rng.bits(1 << m);
+        let z_skip = rng.f128();
+        let x_outer: Vec<F128> = (0..(m - 6)).map(|_| rng.f128()).collect();
+        let claim = zhat_skip_reference(&z, m, z_skip, &x_outer);
+        let packed = pack_witness(&z, m);
+
+        let mut ch_p = FsChallenger::new(b"flock-ring-grinding-test");
+        let (proof, out_p) = prove_with_grinding(&packed, &x_outer, 3, &mut ch_p);
+
+        let mut ch_v = FsChallenger::new(b"flock-ring-grinding-test");
+        let out_v = verify_with_grinding(claim, z_skip, &x_outer, &proof, 3, &mut ch_v)
+            .expect("honest grinded ring-switch proof verifies");
+        assert_eq!(out_p.sumcheck_claim, out_v.sumcheck_claim);
+        assert_eq!(out_p.rs_eq_ind, out_v.rs_eq_ind);
+
+        // Search a short fixed window against the exact transcript prefix;
+        // this establishes that the replacement is an invalid *PoW* witness,
+        // rather than merely a nonce that makes a later algebraic check fail.
+        let mut bad = proof.clone();
+        let bad_nonce = (0..256u64)
+            .find(|&nonce| {
+                if nonce == proof.grinding_nonce {
+                    return false;
+                }
+                let mut ch = FsChallenger::new(b"flock-ring-grinding-test");
+                ch.observe_label(b"flock-ring-switch-v0");
+                ch.observe_f128_slice(&proof.s_hat_v);
+                !ch.verify_pow(nonce, 3)
+            })
+            .expect("a fixed nonce window contains an invalid 3-bit PoW witness");
+        bad.grinding_nonce = bad_nonce;
+        let mut ch_bad = FsChallenger::new(b"flock-ring-grinding-test");
+        assert!(matches!(
+            verify_with_grinding(claim, z_skip, &x_outer, &bad, 3, &mut ch_bad),
+            Err(VerifyError::InvalidGrinding)
+        ));
+
+        // Disabled ring-switch grinding emits no `Pow` transcript operation,
+        // but its optional proof field is still canonical.
+        let mut ch_p = FsChallenger::new(b"flock-ring-no-grinding-test");
+        let (mut legacy, _) = prove(&packed, &x_outer, &mut ch_p);
+        legacy.grinding_nonce = 1;
+        let mut ch_v = FsChallenger::new(b"flock-ring-no-grinding-test");
+        assert!(matches!(
+            verify(claim, z_skip, &x_outer, &legacy, &mut ch_v),
+            Err(VerifyError::InvalidGrinding)
+        ));
     }
 
     /// DP24 identity: `⟨packed_witness, rs_eq_ind⟩ = sumcheck_claim`.

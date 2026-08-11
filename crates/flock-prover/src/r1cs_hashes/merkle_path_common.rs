@@ -283,6 +283,9 @@ fn build_merkle_claim_point(
 pub struct MerklePathProofLigerito {
     pub zerocheck: flock_core::zerocheck::ZerocheckProof,
     pub lincheck: flock_core::lincheck::LincheckProof,
+    /// PoW witness protecting the packed-position fold vector.
+    #[serde(default)]
+    pub tau_pos_grinding_nonce: u64,
     pub shift: MerklePathShiftProof,
     pub pcs_open: flock_core::pcs::BatchOpeningProofLigerito,
 }
@@ -360,6 +363,13 @@ pub fn prove_merkle_paths_ligerito_generic<Ch: Challenger>(
     } else {
         None
     };
+    let grinding = crate::merkle_path::MerklePathGrinding::for_profile(pcs_params.profile);
+    let tau_pos_bits = grinding.packed_position_bits_for(layout.tau_pos_len());
+    let tau_pos_grinding_nonce = if tau_pos_bits == 0 {
+        0
+    } else {
+        challenger.grind_pow(tau_pos_bits)
+    };
     let tau_pos = challenger.sample_f128_vec(layout.tau_pos_len());
     let fold = MerklePathFold::new(layout, tau_pos);
     let slot_vals = fold_all_slots(layout, r1cs.layout, &core.z_packed, &fold);
@@ -381,7 +391,7 @@ pub fn prove_merkle_paths_ligerito_generic<Ch: Challenger>(
     let x_r_vals = &slot_vals[layout.x_r_slot as usize];
     let z_vals = &slot_vals[layout.z_slot as usize];
     let iv_vals = &slot_vals[layout.other_slot() as usize];
-    let (shift, claims) = crate::merkle_path::prove_merkle_path_shift(
+    let (shift, claims) = crate::merkle_path::prove_merkle_path_shift_with_grinding(
         path_log,
         x_l_vals,
         x_r_vals,
@@ -389,6 +399,7 @@ pub fn prove_merkle_paths_ligerito_generic<Ch: Challenger>(
         iv_vals,
         b_bits,
         layout.slot_layout(),
+        grinding,
         challenger,
     );
     let merkle_claim = assemble_merkle_path_claim(layout, r1cs.layout, &fold, &claims);
@@ -423,7 +434,7 @@ pub fn prove_merkle_paths_ligerito_generic<Ch: Challenger>(
     } = core;
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
-    let pcs_open = flock_core::pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
+    let pcs_open = flock_core::pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding(
         z_packed,
         &prover_data,
         &commitment,
@@ -432,6 +443,7 @@ pub fn prove_merkle_paths_ligerito_generic<Ch: Challenger>(
         std::slice::from_ref(&merkle_claim),
         &padding,
         &lig_config,
+        pcs_params.opening_grinding(),
         challenger,
     );
     if let Some(t) = t {
@@ -446,6 +458,7 @@ pub fn prove_merkle_paths_ligerito_generic<Ch: Challenger>(
         MerklePathProofLigerito {
             zerocheck: zc_proof,
             lincheck: lc_proof,
+            tau_pos_grinding_nonce,
             shift,
             pcs_open,
         },
@@ -478,16 +491,28 @@ pub fn verify_merkle_paths_ligerito_generic<Ch: Challenger>(
         "leaves_phys must have length 2^path_log"
     );
 
-    let (ab, c) = flock_core::verifier::verify_core(
+    let (ab, c) = flock_core::verifier::verify_core_with_grinding(
         r1cs,
         &proof.zerocheck,
         &proof.lincheck,
         commitment,
         lincheck_circuit,
+        pcs_params.zerocheck_grinding(),
+        pcs_params.lincheck_grinding(),
         challenger,
     )
     .map_err(MerklePathVerifyError::R1cs)?;
 
+    let grinding = crate::merkle_path::MerklePathGrinding::for_profile(pcs_params.profile);
+    let tau_pos_bits = grinding.packed_position_bits_for(layout.tau_pos_len());
+    if (tau_pos_bits == 0 && proof.tau_pos_grinding_nonce != 0)
+        || (tau_pos_bits != 0
+            && !challenger.verify_pow(proof.tau_pos_grinding_nonce, tau_pos_bits))
+    {
+        return Err(MerklePathVerifyError::Shift(
+            crate::merkle_path::MerklePathError::InvalidGrinding,
+        ));
+    }
     let tau_pos = challenger.sample_f128_vec(layout.tau_pos_len());
     let fold = MerklePathFold::new(layout, tau_pos);
 
@@ -497,7 +522,7 @@ pub fn verify_merkle_paths_ligerito_generic<Ch: Challenger>(
         .collect();
     let root_r = fold.fold_public_phys(root_phys);
 
-    let claims = crate::merkle_path::verify_merkle_path_shift(
+    let claims = crate::merkle_path::verify_merkle_path_shift_with_grinding(
         path_log,
         &proof.shift,
         &leaf_evals,
@@ -505,6 +530,7 @@ pub fn verify_merkle_paths_ligerito_generic<Ch: Challenger>(
         b_bits,
         n_log,
         layout.slot_layout(),
+        grinding,
         challenger,
     )
     .map_err(MerklePathVerifyError::Shift)?;
@@ -521,7 +547,7 @@ pub fn verify_merkle_paths_ligerito_generic<Ch: Challenger>(
         .ligerito_verifier_config()
         .expect("Ligerito verifier config for merkle-path verify");
 
-    flock_core::pcs::verify_opening_batch_ligerito_mixed(
+    flock_core::pcs::verify_opening_batch_ligerito_mixed_with_grinding(
         commitment,
         &[ab.value, c.value],
         &[ab.point.z_skip, c.point.z_skip],
@@ -529,6 +555,7 @@ pub fn verify_merkle_paths_ligerito_generic<Ch: Challenger>(
         std::slice::from_ref(&pd_ref),
         &proof.pcs_open,
         &lig_v_config,
+        pcs_params.opening_grinding(),
         challenger,
     )
     .map_err(MerklePathVerifyError::Pcs)?;

@@ -65,6 +65,100 @@ pub struct PcsParams {
 }
 
 impl PcsParams {
+    /// Grinding policy for the Boolean zerocheck PIOP.
+    ///
+    /// `Secure` is the opt-in profile for the roadmap's first 128-bit
+    /// grinding milestone.  The Boolean, element, and pre-Ligerito PCS
+    /// transport policies are selected independently because they protect
+    /// different Fiat--Shamir challenges.  Ligerito's list-decoding / OOD /
+    /// query-soundness work remains a later roadmap milestone.
+    pub fn zerocheck_grinding(&self) -> crate::zerocheck::ZerocheckGrinding {
+        match self.profile {
+            crate::pcs::ligerito::LigeritoProfile::Secure => {
+                crate::zerocheck::ZerocheckGrinding::per_challenge_128()
+            }
+            crate::pcs::ligerito::LigeritoProfile::Fast
+            | crate::pcs::ligerito::LigeritoProfile::Slim => {
+                crate::zerocheck::ZerocheckGrinding::disabled()
+            }
+        }
+    }
+
+    /// Grinding policy for the Boolean lincheck PIOP.
+    ///
+    /// Kept separate from [`Self::zerocheck_grinding`] because the two
+    /// protocols have different challenge degrees and therefore different
+    /// schedules. Secure enables both; Fast and Slim retain their legacy
+    /// transcript shape.
+    pub fn lincheck_grinding(&self) -> crate::lincheck::LincheckGrinding {
+        match self.profile {
+            crate::pcs::ligerito::LigeritoProfile::Secure => {
+                crate::lincheck::LincheckGrinding::per_challenge_128()
+            }
+            crate::pcs::ligerito::LigeritoProfile::Fast
+            | crate::pcs::ligerito::LigeritoProfile::Slim => {
+                crate::lincheck::LincheckGrinding::disabled()
+            }
+        }
+    }
+
+    /// Grinding policy for the large-field element/dense PIOP.
+    pub fn element_grinding(&self) -> crate::element_r1cs::Grinding {
+        match self.profile {
+            crate::pcs::ligerito::LigeritoProfile::Secure => {
+                crate::element_r1cs::Grinding::per_challenge_128()
+            }
+            crate::pcs::ligerito::LigeritoProfile::Fast
+            | crate::pcs::ligerito::LigeritoProfile::Slim => {
+                crate::element_r1cs::Grinding::disabled()
+            }
+        }
+    }
+
+    /// Grinding policy for the ring-switch / merged-jagged PCS transport.
+    ///
+    /// This is deliberately separate from Ligerito's own query and fold
+    /// policy: the challenges here are sampled before the recursive PCS is
+    /// entered, and their algebraic degrees come from the ring-switch and
+    /// jagged reductions rather than the proximity protocol.
+    pub fn opening_grinding(&self) -> crate::pcs::OpeningGrinding {
+        match self.profile {
+            crate::pcs::ligerito::LigeritoProfile::Secure => {
+                crate::pcs::OpeningGrinding::per_challenge_128()
+            }
+            crate::pcs::ligerito::LigeritoProfile::Fast
+            | crate::pcs::ligerito::LigeritoProfile::Slim => {
+                crate::pcs::OpeningGrinding::disabled()
+            }
+        }
+    }
+
+    /// Grinding policy for the circuit-wiring Product-GKR permutation check.
+    pub fn product_gkr_grinding(&self) -> crate::product_gkr::BatchedGrinding {
+        match self.profile {
+            crate::pcs::ligerito::LigeritoProfile::Secure => {
+                crate::product_gkr::BatchedGrinding::per_challenge_128()
+            }
+            crate::pcs::ligerito::LigeritoProfile::Fast
+            | crate::pcs::ligerito::LigeritoProfile::Slim => {
+                crate::product_gkr::BatchedGrinding::disabled()
+            }
+        }
+    }
+
+    /// Grinding policy for recursive dense/sigma/jagged accumulation folds.
+    pub fn matrix_fold_grinding(&self) -> crate::matrix_fold::FoldGrinding {
+        match self.profile {
+            crate::pcs::ligerito::LigeritoProfile::Secure => {
+                crate::matrix_fold::FoldGrinding::per_challenge_128()
+            }
+            crate::pcs::ligerito::LigeritoProfile::Fast
+            | crate::pcs::ligerito::LigeritoProfile::Slim => {
+                crate::matrix_fold::FoldGrinding::disabled()
+            }
+        }
+    }
+
     /// Total log message length (= log2 packed witness length).
     pub fn log_msg_len(&self) -> usize {
         self.m - LOG_PACKING
