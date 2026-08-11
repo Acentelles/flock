@@ -43,14 +43,6 @@
 //! is oblivious — chunk blocks embed the same stripped base at their subcube
 //! offset, and everything flavor-specific rides in the extras.
 //!
-//! [`MerkleTreeLayout::with_blake3_chunk_only`] is the leaf half alone: the
-//! chunk chain with NO node levels, width in 128-bit words (partial final
-//! blocks allowed — the union commits `num_lanes` active lanes, an arbitrary
-//! integer), output = the chunk's non-root chaining value. One row then
-//! replaces the `ceil(words/4)` per-block rows a circuit spends hashing an
-//! opened leaf, while the climb keeps its per-level rows (the stratified
-//! schedules' terminals are per-summand — a fixed row cannot absorb them).
-//!
 //! ## The swap gadget under `C = I`
 //!
 //! The R1CS is the circuit shape `(A·z) ⊙ (B·z) = z`: every witness column
@@ -181,10 +173,6 @@ pub struct HashSpec {
     /// varies across the chunk-leaf segment (see
     /// [`MerkleTreeLayout::with_blake3_chunk_leaf`]).
     pub flags_base: usize,
-    /// Base offset of the 32-bit block-length word. Pinned to
-    /// [`NODE_BLOCK_LEN`] everywhere except a chunk-only layout's partial
-    /// final block (see [`MerkleTreeLayout::with_blake3_chunk_only`]).
-    pub blen_base: usize,
     /// Domain flags passed to every node compression.
     pub flags: u32,
     /// The base encoder's sparse `(A_0, B_0)`.
@@ -265,7 +253,6 @@ pub fn blake3_spec() -> HashSpec {
         out_cv_base: blake3::OUT_LO_BASE,
         msg_base: blake3::M_BASE,
         flags_base: blake3::FLAGS_BASE,
-        blen_base: blake3::BLEN_BASE,
         flags: BLAKE3_FLAG_PARENT,
         build_matrices: blake3::build_matrices,
         compress: blake3_compress_cv,
@@ -405,11 +392,6 @@ pub struct MerkleTreeLayout {
     /// Chunk-leaf blocks preceding the node levels, or 0 for the plain
     /// digest-leaf path. See [`Self::with_blake3_chunk_leaf`].
     pub leaf_blocks: usize,
-    /// 128-bit leaf-data words: `4 · leaf_blocks` on the whole-block chunk
-    /// layout ([`Self::with_blake3_chunk_leaf`]), possibly leaving the last
-    /// block partial on the chunk-only layout
-    /// ([`Self::with_blake3_chunk_only`]), 0 on the digest-leaf path.
-    pub leaf_words: usize,
     /// log2 of the composite block width: `spec.k_log + log2(blocks rounded
     /// up to a power of two)` where `blocks = leaf_blocks + depth`.
     pub k_log: usize,
@@ -451,7 +433,6 @@ impl MerkleTreeLayout {
             spec,
             depth,
             leaf_blocks: 0,
-            leaf_words: 0,
             k_log,
             useful_bits,
         }
@@ -510,55 +491,6 @@ impl MerkleTreeLayout {
             spec,
             depth,
             leaf_blocks,
-            leaf_words: 4 * leaf_blocks,
-            k_log,
-            useful_bits,
-        }
-    }
-
-    /// Lay out a **chunk-only** row: the leaf-hash HALF of a PCS L0 opening —
-    /// `leaf_words` 128-bit words of leaf data hashed as one BLAKE3 chunk —
-    /// with NO node levels. The row's output is the chunk's non-root chaining
-    /// value (= `flock_core::merkle::hash_leaf`'s BLAKE3 mode); the climb to
-    /// the cap stays wherever the caller keeps it (in-circuit: generic
-    /// per-level rows with the swap gadget).
-    ///
-    /// Unlike [`Self::with_blake3_chunk_leaf`], the width is in WORDS and
-    /// need not fill whole 64-byte blocks: a mixed union commits `num_lanes`
-    /// active lanes — an arbitrary integer — so an opened row can be e.g. 61
-    /// words = 976 bytes. The final block then compresses with
-    /// `block_len = 16 · (words in the block)` and its message tail is
-    /// PINNED to zero: BLAKE3 compresses the block buffer zero-padded past
-    /// `block_len`, so bit-compatibility requires those columns be 0 — the
-    /// same convention the circuit's collapsed chunk chain expresses with a
-    /// shared zero-pad wire.
-    ///
-    /// No index word exists (no level reads an index), so the wiring schema
-    /// is `leaf_words` inputs and the two output halves.
-    pub fn with_blake3_chunk_only(leaf_words: usize, spec: HashSpec) -> Self {
-        assert!(
-            (1..=64).contains(&leaf_words),
-            "leaf_words {leaf_words} must be in [1, 64] (one chunk)"
-        );
-        let leaf_blocks = leaf_words.div_ceil(4);
-        let k_log = spec.k_log + leaf_blocks.next_power_of_two().trailing_zeros() as usize;
-        assert!(
-            spec.k_log >= 7,
-            "the union's BatchMajor chunking requires k_log ≥ 7"
-        );
-        // The only global is the constant-one column, in block 0's padding.
-        assert!(spec.useful_bits < 1usize << spec.k_log);
-        // The last nonzero column: the last chunk block's useful end (chunk
-        // blocks have no gadget columns), or the constant when one block's
-        // padding IS the tail.
-        let useful_bits =
-            (((leaf_blocks - 1) << spec.k_log) + spec.useful_bits).max(spec.useful_bits + 1);
-        debug_assert!(useful_bits <= 1usize << k_log);
-        Self {
-            spec,
-            depth: 0,
-            leaf_blocks,
-            leaf_words,
             k_log,
             useful_bits,
         }
@@ -653,21 +585,6 @@ impl MerkleTreeLayout {
         self.block_base(block) + self.spec.out_cv_base + j
     }
 
-    /// 128-bit leaf-data words in chunk block `i`: 4 for every block except
-    /// possibly the last — `leaf_words` need not fill whole blocks on the
-    /// chunk-only layout.
-    fn chunk_words(&self, block: usize) -> usize {
-        debug_assert!(block < self.leaf_blocks);
-        (self.leaf_words - 4 * block).min(4)
-    }
-
-    /// `block_len` of chunk block `i`: 64 for full blocks, `16 · words` for
-    /// a partial final block. Whole-block layouts get 64 everywhere — the
-    /// same value the node fixed set pins, so their matrices are unchanged.
-    fn chunk_blen(&self, block: usize) -> u32 {
-        16 * self.chunk_words(block) as u32
-    }
-
     /// Domain flags of chunk block `i`: `CHUNK_START` on the first block,
     /// `CHUNK_END` on the last (both on a single-block leaf), non-root.
     fn chunk_flags(&self, block: usize) -> u32 {
@@ -689,29 +606,24 @@ impl MerkleTreeLayout {
     /// Schema position of word `w` (`< 4`) of chunk block `block`'s leaf data.
     pub fn io_leaf(&self, block: usize, w: usize) -> usize {
         debug_assert!(block < self.leaf_blocks && w < 4);
-        debug_assert!(4 * block + w < self.leaf_words, "past the leaf's words");
         4 * block + w
     }
 
-    /// Schema position of the index word — layouts with node levels only
-    /// (the chunk-only layout has no index word at all).
+    /// Schema position of the index word.
     pub fn io_index(&self) -> usize {
-        debug_assert!(self.depth > 0, "a chunk-only row has no index word");
-        self.leaf_words
+        4 * self.leaf_blocks
     }
 
     /// Schema position of root half `h` (`0` = bits `[0,128)`).
     pub fn io_root(&self, h: usize) -> usize {
         debug_assert!(h < 2);
-        self.leaf_words + usize::from(self.depth > 0) + h
+        4 * self.leaf_blocks + 1 + h
     }
 
     /// The wireable words of one opening — chunk-leaf layouts only.
     ///
-    /// Inputs: the leaf data (`leaf_words` words, in block order) then — on
-    /// layouts with node levels — the index word (the chunk-only layout has
-    /// none). Outputs: the two halves of the root (chunk-only: the chunk's
-    /// chaining value).
+    /// Inputs: the leaf data (`4` words per chunk block, in block order) then
+    /// the index word. Outputs: the two halves of the root.
     ///
     /// **What is deliberately absent is the sibling path.** Each level's
     /// sibling digest sits at [`sibling_bit`](Self::sibling_bit) — inside that
@@ -738,15 +650,13 @@ impl MerkleTreeLayout {
             debug_assert_eq!(bit % 128, 0, "schema word {bit} is not 128-aligned");
             bit / 128
         };
-        let mut schema = Vec::with_capacity(self.leaf_words + 3);
-        for word in 0..self.leaf_words {
-            schema.push(IoWord::input(w(
-                self.leaf_data_bit(word / 4, 128 * (word % 4))
-            )));
+        let mut schema = Vec::with_capacity(4 * self.leaf_blocks + 3);
+        for block in 0..self.leaf_blocks {
+            for j in 0..4 {
+                schema.push(IoWord::input(w(self.leaf_data_bit(block, 128 * j))));
+            }
         }
-        if self.depth > 0 {
-            schema.push(IoWord::input(w(self.index_word_base())));
-        }
+        schema.push(IoWord::input(w(self.index_word_base())));
         schema.push(IoWord::output(w(self.root_bit(0))));
         schema.push(IoWord::output(w(self.root_bit(128))));
         schema
@@ -786,14 +696,9 @@ impl MerkleTreeLayout {
         }
     }
 
-    /// Bit `j` of the root — the last level's output chaining value, or on a
-    /// chunk-only layout (no levels) the last chunk block's.
+    /// Bit `j` of the root — the last level's output chaining value.
     pub fn root_bit(&self, j: usize) -> usize {
-        if self.depth == 0 {
-            self.chunk_out_cv_bit(self.leaf_blocks - 1, j)
-        } else {
-            self.hash_bit(self.depth - 1, self.spec.out_cv_base + j)
-        }
+        self.hash_bit(self.depth - 1, self.spec.out_cv_base + j)
     }
 
     fn left_bit(&self, level: usize, j: usize) -> usize {
@@ -859,7 +764,7 @@ impl MerkleTreeLayout {
             for l in 0..self.depth {
                 free(&mut a, &mut b, self.index_bit(l));
             }
-        } else if self.depth > 0 {
+        } else {
             // The whole index WORD is free, not just its `depth` index bits.
             // A zero-pinned remainder would make the committed word equal the
             // bare index, and wiring that to a Fiat–Shamir challenge would
@@ -869,8 +774,6 @@ impl MerkleTreeLayout {
                 free(&mut a, &mut b, self.index_word_base() + j);
             }
         }
-        // (A chunk-only layout — leaf blocks, depth 0 — has no index word:
-        // no level reads one, so its columns stay ordinary padding.)
 
         let fixed = (self.spec.fixed_bits)();
 
@@ -887,30 +790,15 @@ impl MerkleTreeLayout {
             a[r] = vec![gc];
             b[r] = vec![gc];
 
-            // Override 2: the message region is the leaf data — free inputs
-            // up to the block's real words, ZERO pins past them. A partial
-            // final block (chunk-only layouts) compresses the block buffer
-            // zero-padded past `block_len`, so bit-compatibility requires
-            // the tail columns be 0 — and they sit inside the block's useful
-            // span, so unlike the layout's padding they need explicit rows.
-            let free_bits = 128 * self.chunk_words(i);
+            // Override 2: the message region is the leaf data — free inputs.
             for j in 0..2 * SLOT_BITS {
-                let r = base + self.spec.msg_base + j;
-                if j < free_bits {
-                    free(&mut a, &mut b, r);
-                } else {
-                    a[r] = Vec::new();
-                    b[r] = vec![gc];
-                }
+                free(&mut a, &mut b, base + self.spec.msg_base + j);
             }
 
-            // Override 3: the pins, from the node fixed set with the three
-            // chunk-specific substitutions (flags per block, block_len on a
-            // partial final block, and the chunk chain's cv copies).
+            // Override 3: the pins, from the node fixed set with the two
+            // chunk-specific substitutions.
             let flags = self.chunk_flags(i);
-            let blen = self.chunk_blen(i);
             let fb = self.spec.flags_base;
-            let lb = self.spec.blen_base;
             let cvb = self.spec.in_cv_base;
             for &(c, v) in &fixed {
                 let r = base + c;
@@ -921,8 +809,6 @@ impl MerkleTreeLayout {
                 }
                 let v = if c >= fb && c < fb + 32 {
                     (flags >> (c - fb)) & 1 == 1
-                } else if c >= lb && c < lb + 32 {
-                    (blen >> (c - lb)) & 1 == 1
                 } else {
                     v
                 };
@@ -1139,42 +1025,6 @@ impl MerkleTreeLayout {
             extras,
             const_pin: Some(self.const_pos()),
         }
-    }
-
-    /// The composite's two [`FoldMatrix`] views — `(A₀, B₀)` — walked, not
-    /// materialized: one stripped base side each, plus the extras. What the
-    /// matrix-claim fold ([`flock_core::aggregate`]) and the root discharge
-    /// consume for a stub-matrix table type, exactly as
-    /// [`Self::build_walker`] serves its lincheck.
-    pub fn fold_matrices(&self) -> (ChunkFoldMatrix, ChunkFoldMatrix) {
-        let (base_a, base_b) = (self.spec.build_matrices)();
-        let ovr = self.base_overridden();
-        let strip = |m: &SparseBinaryMatrix| -> SparseBinaryMatrix {
-            let mut rows = m.rows.clone();
-            for (c, o) in ovr.iter().enumerate() {
-                if *o {
-                    rows[c].clear();
-                }
-            }
-            SparseBinaryMatrix {
-                num_rows: m.num_rows,
-                num_cols: m.num_cols,
-                rows,
-            }
-        };
-        let k = self.k();
-        let (xa, xb) = self.extras();
-        let mk = |base: SparseBinaryMatrix, rows: Vec<Vec<usize>>| ChunkFoldMatrix {
-            base,
-            extras: SparseBinaryMatrix {
-                num_rows: k,
-                num_cols: k,
-                rows,
-            },
-            blocks: self.total_blocks(),
-            base_k_log: self.spec.k_log,
-        };
-        (mk(strip(&base_a), xa), mk(strip(&base_b), xb))
     }
 
     // -----------------------------------------------------------------------
@@ -1598,9 +1448,9 @@ impl MerkleTreeLayout {
         );
         assert_eq!(
             input.leaf_data.len(),
-            16 * self.leaf_words,
+            64 * self.leaf_blocks,
             "leaf data must be {} bytes",
-            16 * self.leaf_words
+            64 * self.leaf_blocks
         );
         assert_eq!(
             input.siblings.len(),
@@ -1609,9 +1459,6 @@ impl MerkleTreeLayout {
         );
         // No bound on `index`: the word's high bits are free by construction
         // (see `ChunkPathInput::index`). Only the low `depth` are read.
-        if self.depth == 0 {
-            assert_eq!(input.index, 0, "a chunk-only row has no index word");
-        }
     }
 
     /// The input chaining value the fixed set pins — chunk block 0 starts
@@ -1637,12 +1484,8 @@ impl MerkleTreeLayout {
         z[self.const_pos()] = true;
         // The whole index WORD, not just the `depth` bits the fold reads — the
         // columns above are free and carry the wired challenge's high bits.
-        // (Chunk-only layouts have no index word; its would-be columns are
-        // padding.)
-        if self.depth > 0 {
-            for j in 0..128 {
-                z[self.index_word_base() + j] = (input.index >> j) & 1 == 1;
-            }
+        for j in 0..128 {
+            z[self.index_word_base() + j] = (input.index >> j) & 1 == 1;
         }
 
         // The chunk chain: h_in of block 0 is the IV, then each block's
@@ -1654,7 +1497,7 @@ impl MerkleTreeLayout {
                 &prev,
                 &m,
                 NODE_COUNTER,
-                self.chunk_blen(i),
+                NODE_BLOCK_LEN,
                 self.chunk_flags(i),
             );
             let dst = self.block_base(i);
@@ -1706,13 +1549,10 @@ impl MerkleTreeLayout {
         // The whole index word is free, so every one of its 128 columns needs
         // its `z·1 = z` witness — not just the `depth` index bits. The bits at
         // or above `depth` are read by no row; they carry whatever the wired
-        // Fiat-Shamir challenge put there. (Chunk-only layouts have no index
-        // word; its would-be columns are padding and must stay `0·0 = 0`.)
-        if self.depth > 0 {
-            for j in 0..128 {
-                let bit = (input.index >> j) & 1 == 1;
-                free(&mut z, &mut a, &mut b, self.index_word_base() + j, bit);
-            }
+        // Fiat-Shamir challenge put there.
+        for j in 0..128 {
+            let bit = (input.index >> j) & 1 == 1;
+            free(&mut z, &mut a, &mut b, self.index_word_base() + j, bit);
         }
 
         let base_words = (1usize << self.spec.k_log) / 64;
@@ -1730,7 +1570,7 @@ impl MerkleTreeLayout {
                 &prev,
                 &m,
                 NODE_COUNTER,
-                self.chunk_blen(i),
+                NODE_BLOCK_LEN,
                 self.chunk_flags(i),
                 &mut wz,
                 &mut wa,
@@ -1844,16 +1684,14 @@ impl MerkleTreeLayout {
         let out_word = spec.out_cv_base / 64;
         let depth = self.depth;
         let leaf_blocks = self.leaf_blocks;
-        let leaf_words = self.leaf_words;
         let iv = self.pinned_in_cv();
 
         let sib_off = spec.useful_bits;
         let t_off = spec.useful_bits + SLOT_BITS;
         let const_off = self.const_pos();
         // The index is a word-aligned 128-bit WORD, not a tight run after the
-        // constant — see `index_word_base`. Chunk-only layouts have none: the
-        // would-be columns are padding and must stay untouched.
-        let index_off = if depth > 0 { self.index_word_base() } else { 0 };
+        // constant — see `index_word_base`.
+        let index_off = self.index_word_base();
 
         super::common::drive_witness_batch_major_partial_into(
             paths,
@@ -1881,14 +1719,13 @@ impl MerkleTreeLayout {
                         }
                         f
                     };
-                    let blen = 16 * (leaf_words - 4 * i).min(4) as u32;
                     let blocks: [([u32; SLOT_WORDS], [u32; 16], u64, u32, u32); BM_V] =
                         std::array::from_fn(|j| {
                             (
                                 prev[j],
                                 leaf_msg_words(&group[j].leaf_data, i),
                                 NODE_COUNTER,
-                                blen,
+                                NODE_BLOCK_LEN,
                                 flags,
                             )
                         });
@@ -1902,16 +1739,13 @@ impl MerkleTreeLayout {
                         // The whole index WORD is free, so all 128 columns
                         // need their `z·1 = z` witness. Columns at or above
                         // `depth` are read by no row; they carry whatever the
-                        // wired Fiat-Shamir challenge put there. (Chunk-only
-                        // layouts have no index word — see `index_off`.)
-                        if depth > 0 {
-                            for l in 0..128 {
-                                let v: [u32; BM_V] =
-                                    std::array::from_fn(|j| ((group[j].index >> l) & 1) as u32);
-                                or_u32_row(wz, index_off + l, &v);
-                                or_u32_row(wa, index_off + l, &v);
-                                or_bit_row(wb, index_off + l);
-                            }
+                        // wired Fiat-Shamir challenge put there.
+                        for l in 0..128 {
+                            let v: [u32; BM_V] =
+                                std::array::from_fn(|j| ((group[j].index >> l) & 1) as u32);
+                            or_u32_row(wz, index_off + l, &v);
+                            or_u32_row(wa, index_off + l, &v);
+                            or_bit_row(wb, index_off + l);
                         }
                     }
 
@@ -2006,7 +1840,7 @@ impl MerkleTreeLayout {
         let mut prev = self.pinned_in_cv();
         for i in 0..self.leaf_blocks {
             let m = leaf_msg_words(&input.leaf_data, i);
-            prev = compress(&prev, &m, NODE_COUNTER, self.chunk_blen(i), self.chunk_flags(i));
+            prev = compress(&prev, &m, NODE_COUNTER, NODE_BLOCK_LEN, self.chunk_flags(i));
         }
         for (l, sib) in input.siblings.iter().enumerate() {
             let bit = (input.index >> l) & 1 == 1;
@@ -2036,7 +1870,7 @@ impl MerkleTreeLayout {
                 &prev,
                 &m,
                 NODE_COUNTER,
-                self.chunk_blen(i),
+                NODE_BLOCK_LEN,
                 self.chunk_flags(i),
             );
             prev = read_digest(&block, self.spec.out_cv_base);
@@ -2051,10 +1885,9 @@ impl MerkleTreeLayout {
     }
 }
 
-/// One chunk-leaf opening: the raw leaf bytes (`16 · leaf_words` of them),
+/// One chunk-leaf opening: the raw leaf bytes (`64 · leaf_blocks` of them),
 /// the leaf's index word, and one sibling chaining value per level (level 0 =
-/// closest to the leaf). A chunk-only row (no levels) passes `index: 0` and
-/// empty `siblings`.
+/// closest to the leaf).
 #[derive(Clone, Debug)]
 pub struct ChunkPathInput {
     pub leaf_data: Vec<u8>,
@@ -2072,144 +1905,11 @@ pub struct ChunkPathInput {
     pub siblings: Vec<[u32; SLOT_WORDS]>,
 }
 
-// ---------------------------------------------------------------------------
-// The composite as a FoldMatrix (matrix-claim folds, root discharge)
-// ---------------------------------------------------------------------------
-
-/// One side (`A₀` or `B₀`) of a composite layout as a
-/// [`flock_core::matrix_fold::FoldMatrix`], walked instead of materialized:
-/// the stripped base side applied per aligned subcube, plus the extras —
-/// the same decomposition as [`MerkleWalkerCircuit`], in the fold's two
-/// marginal directions.
-///
-/// A weight that factors across the subcubes collapses to ONE base pass
-/// (every eq tensor the fold produces does — `prove_fold`'s `eq(ρ_col)`,
-/// `bilinear`'s materialized claim weights); the factorization is verified,
-/// not assumed, and a non-factoring weight takes the general per-subcube
-/// walk — a slower answer, never a wrong one.
-pub struct ChunkFoldMatrix {
-    /// The base block's side with overridden rows EMPTIED (their
-    /// replacements are in `extras`) — `2^κ` square, row-major.
-    base: SparseBinaryMatrix,
-    /// The composite's extra rows at global indices — `2^k` square.
-    extras: SparseBinaryMatrix,
-    blocks: usize,
-    base_k_log: usize,
-}
-
-/// Factor `w` across `windows` aligned `sub`-sized windows: find
-/// `(w_base, ρ)` with `w[t·sub + r] == ρ_t · w_base[r]`, or `None`. The
-/// mirror of [`MerkleWalkerCircuit::factor_eq`], on a bare slice.
-fn factor_windows(w: &[F128], sub: usize, windows: usize) -> Option<(Vec<F128>, Vec<F128>)> {
-    let slice = |t: usize| &w[t * sub..(t + 1) * sub];
-    let Some((t_ref, r0)) = (0..windows)
-        .find_map(|t| slice(t).iter().position(|v| *v != F128::ZERO).map(|r| (t, r)))
-    else {
-        // Every window is zero: the trivial factorization is exact.
-        return Some((vec![F128::ZERO; sub], vec![F128::ZERO; windows]));
-    };
-    let w_base = slice(t_ref).to_vec();
-    let inv = w_base[r0].inv();
-    let rho: Vec<F128> = (0..windows).map(|t| w[t * sub + r0] * inv).collect();
-    let exact = (0..windows).all(|t| {
-        let rho_t = rho[t];
-        slice(t).iter().zip(&w_base).all(|(&e, &b)| e == rho_t * b)
-    });
-    exact.then_some((w_base, rho))
-}
-
-impl flock_core::matrix_fold::FoldMatrix for ChunkFoldMatrix {
-    fn row_marginal(&self, w: &[F128], n_rows: usize) -> Vec<F128> {
-        let sub = 1usize << self.base_k_log;
-        let mut out = vec![F128::ZERO; n_rows];
-        match factor_windows(w, sub, self.blocks) {
-            Some((w_base, rho)) => {
-                let h = self.base.row_marginal(&w_base, sub);
-                for (t, &rho_t) in rho.iter().enumerate() {
-                    if rho_t == F128::ZERO {
-                        continue;
-                    }
-                    for (o, &v) in out[t * sub..(t + 1) * sub].iter_mut().zip(&h) {
-                        *o = rho_t * v;
-                    }
-                }
-            }
-            None => {
-                for t in 0..self.blocks {
-                    let h = self.base.row_marginal(&w[t * sub..(t + 1) * sub], sub);
-                    out[t * sub..(t + 1) * sub].copy_from_slice(&h);
-                }
-            }
-        }
-        // The extras reference global columns; their rows were stripped
-        // from the base, so `+=` writes each row exactly once.
-        for (r, cols) in self.extras.rows.iter().enumerate() {
-            if cols.is_empty() {
-                continue;
-            }
-            let mut acc = F128::ZERO;
-            for &c in cols {
-                acc += w[c];
-            }
-            out[r] += acc;
-        }
-        out
-    }
-
-    fn col_marginal(&self, w: &[F128], n_cols: usize) -> Vec<F128> {
-        let sub = 1usize << self.base_k_log;
-        let mut out = vec![F128::ZERO; n_cols];
-        match factor_windows(w, sub, self.blocks) {
-            Some((w_base, rho)) => {
-                let x = self.base.col_marginal(&w_base, sub);
-                for (t, &rho_t) in rho.iter().enumerate() {
-                    if rho_t == F128::ZERO {
-                        continue;
-                    }
-                    for (o, &v) in out[t * sub..(t + 1) * sub].iter_mut().zip(&x) {
-                        *o = rho_t * v;
-                    }
-                }
-            }
-            None => {
-                for t in 0..self.blocks {
-                    let x = self.base.col_marginal(&w[t * sub..(t + 1) * sub], sub);
-                    out[t * sub..(t + 1) * sub].copy_from_slice(&x);
-                }
-            }
-        }
-        for (r, cols) in self.extras.rows.iter().enumerate() {
-            let wr = w[r];
-            if wr == F128::ZERO || cols.is_empty() {
-                continue;
-            }
-            for &c in cols {
-                out[c] += wr;
-            }
-        }
-        out
-    }
-
-    fn n_rows(&self) -> usize {
-        self.extras.num_rows
-    }
-
-    fn n_cols(&self) -> usize {
-        self.extras.num_cols
-    }
-}
-
 /// Chunk block `i`'s 16-word message: bytes `[64i, 64(i+1))` of the leaf
-/// data as little-endian words, zero-padded past the data's end — per the
-/// BLAKE3 spec, a partial final block compresses with the buffer tail zero.
-/// (Leaf data is always whole 16-byte words, so a message u32 is either
-/// fully present or fully absent.)
+/// data as little-endian words, per the BLAKE3 spec.
 fn leaf_msg_words(data: &[u8], block: usize) -> [u32; 16] {
     std::array::from_fn(|w| {
         let o = block * 64 + 4 * w;
-        if o >= data.len() {
-            return 0;
-        }
         u32::from_le_bytes(data[o..o + 4].try_into().unwrap())
     })
 }

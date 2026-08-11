@@ -46,8 +46,7 @@ use flock_prover::challenger::FsChallenger;
 use flock_prover::prover::{self, UnionSlotProverInput};
 use flock_prover::r1cs_hashes::blake3;
 use flock_prover::r1cs_hashes::merkle_r1cs::{
-    ChunkFoldMatrix, ChunkPathInput, MerkleTreeLayout, MerkleWalkerCircuit, SLOT_WORDS,
-    blake3_spec,
+    ChunkPathInput, MerkleTreeLayout, SLOT_WORDS, blake3_spec,
 };
 use flock_prover::schedule::TableType;
 use flock_prover::union::UnionInstance;
@@ -177,9 +176,6 @@ struct EnvShape {
     /// one aggregate of a child's layout that stays circuit structure
     /// under FREE COUNTS.
     lanes: usize,
-    /// The chunk-leaf width set (words, usage record) — see the
-    /// constructor's comment. Slot keys are `700 + width`.
-    counts_chunk: [(usize, usize); 4],
 }
 
 /// The APPLICATION STATEMENT's width in the envelope's public segment: the
@@ -233,9 +229,7 @@ const ENV_ACC_CHAIN_WORDS: usize = 160;
 // words per entry) and a second SLOT — the node-child slot, dead in a
 // fresh-only node, which is what lets a base node and a steady node be
 // read at the same offsets.
-// 1024, was 768: the chunk-leaf table adds FOUR boolean types (widths
-// 56/47/24/8), each an (A, B) claim pair in the keyed MAIN groups.
-const ENV_ACC_MAIN_WORDS: usize = 1024;
+const ENV_ACC_MAIN_WORDS: usize = 768;
 
 /// THE PASSENGER (wall 3): one sigma-shaped and one jagged-shaped entry,
 /// same layout as the ACC_MAIN keyed slots. A spine node's node-slot
@@ -364,15 +358,6 @@ fn envelope_shape() -> Option<EnvShape> {
             (100, 400),   // resid pl 0
             (318, 15000), // prefix w 8
         ],
-        // The chunk-leaf widths (words) every envelope outer declares —
-        // an opened leaf's whole chunk chain is ONE row of the width's
-        // ChunkLeafGate. 64 = the mvp9 leaf's m22 workload L0 (a full
-        // chunk); 47 = the m32 FAST chain L0 the FL walks; 24 = lanes*
-        // (an envelope child's own L0); 8 = every recursive level's 128 B
-        // leaves. Declaration order (descending width) breaks the 64/47
-        // k_log-18 sort tie. Counts are the free-counts-era usage record
-        // (elementwise max of leaf/FL/node), not a pad target.
-        counts_chunk: [(64, 90), (47, 436), (24, 180), (8, 344)],
         publics: 5300,
         // The committed lane count — the ONE piece of a child's layout that
         // stays circuit structure (the parent hashes `num_lanes`-word
@@ -452,9 +437,6 @@ fn declare_envelope_slots(
             nu,
         }),
     };
-    for &(w, _) in &env.counts_chunk {
-        slot_cached(sb, cache, 700 + w, || ChunkLeafGate::new(w, nu));
-    }
     slot_cached(sb, cache, 600, MacGate::new);
     slot_cached(sb, cache, 500, ZcRoundGate::new);
     slot_cached(sb, cache, 400, MergedRoundGate::new);
@@ -550,15 +532,6 @@ fn pad_envelope_counts(
         let target = if no_pad { floor1(sb, s) } else { count };
         pad(sb, hints, &mut over, &format!("el{key}"), s, target, false);
     }
-    for &(w, count) in &env.counts_chunk {
-        let key = 700 + w;
-        let &(_, s) = cache
-            .iter()
-            .find(|&&(k, _)| k == key)
-            .unwrap_or_else(|| panic!("envelope chunk slot {w} words missing from the cache"));
-        let target = if no_pad { floor1(sb, s) } else { count };
-        pad(sb, hints, &mut over, &format!("chunk{w}"), s, target, false);
-    }
     // A slot the emission demanded but the envelope never declared: the
     // keyed cache created it on the fly, so this builder's registry carries
     // a type the other envelope outers do not — the digest diverges and
@@ -567,10 +540,7 @@ fn pad_envelope_counts(
     let stray: Vec<usize> = cache
         .iter()
         .map(|&(k, _)| k)
-        .filter(|k| {
-            !env.counts_el.iter().any(|&(c, _)| c == *k)
-                && !env.counts_chunk.iter().any(|&(w, _)| 700 + w == *k)
-        })
+        .filter(|k| !env.counts_el.iter().any(|&(c, _)| c == *k))
         .collect();
     assert!(
         stray.is_empty(),
@@ -1004,69 +974,6 @@ impl MerklePathGate {
             layout: MerkleTreeLayout::with_blake3_chunk_leaf(depth, leaf_bytes, blake3_spec()),
             nu,
         }
-    }
-}
-
-/// One whole chunk chain — the leaf half of an L0 opening — as ONE row:
-/// `leaf_words` words of leaf data in, the chunk's non-root chaining value
-/// out (= `merkle::hash_leaf`), the climb untouched. Replaces the
-/// `ceil(words/4)` per-block b3 rows `emit_opening` otherwise spends on a
-/// leaf (`docs/local/chunk-leaf-l0-table.md`).
-///
-/// Each distinct leaf width is its own row shape — the block count, the
-/// final block's byte count and the `CHUNK_END` position are all
-/// width-derived constants of the relation — so instantiations are
-/// per-width, demand-cached like the [`LeafEvalGate`] lane variants.
-///
-/// Stub matrices + walker, the `MerkleMixedSetup` precedent: materialized,
-/// a 16-block composite is ~340M nonzeros; the walker keeps one stripped
-/// base copy, and its lincheck fold factors the eq table across the aligned
-/// block subcubes (O(base nnz) per proof, not O(blocks · base nnz)). The
-/// registry digest binds `k_log`, `useful_bits` and `const_pin` — hence the
-/// width — but NOT the constraint system: the verifier constructs the
-/// matching walker out of band.
-struct ChunkLeafGate {
-    layout: MerkleTreeLayout,
-    nu: usize,
-}
-
-impl ChunkLeafGate {
-    fn new(leaf_words: usize, nu: usize) -> Self {
-        Self {
-            layout: MerkleTreeLayout::with_blake3_chunk_only(leaf_words, blake3_spec()),
-            nu,
-        }
-    }
-}
-
-impl GateType for ChunkLeafGate {
-    type Row = ChunkPathInput;
-    type Hint = ();
-
-    fn table(&self) -> TableType {
-        TableType::from_block_r1cs(&self.layout.build_block_r1cs_stub(self.nu))
-            .with_io_schema(self.layout.io_schema())
-    }
-
-    fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> Self::Row {
-        assert_eq!(inputs.len(), self.layout.leaf_words, "one wire per leaf word");
-        let mut leaf_data = Vec::with_capacity(16 * inputs.len());
-        for w in inputs {
-            leaf_data.extend_from_slice(&w.lo.to_le_bytes());
-            leaf_data.extend_from_slice(&w.hi.to_le_bytes());
-        }
-        let row = ChunkPathInput {
-            leaf_data,
-            index: 0,
-            siblings: Vec::new(),
-        };
-        let cv = self.layout.root_chunk(&row);
-        outputs.extend_from_slice(&digest_words(&cv));
-        row
-    }
-
-    fn witness(&self, _rows: &[Self::Row], _nu: usize) -> SlotWitness {
-        SlotWitness::DeferredToRows
     }
 }
 
@@ -5144,16 +5051,11 @@ fn mvp7_real_query_phase() {
     // DECLARATION order, so publishing inside the loop would interleave with
     // the next level's public inputs and break the tail walk below.
     let cap_w = cap_wires(&stream, &word_wire, &cap_pays);
-    // The chunk-leaf table: every opened leaf's chunk chain is ONE row of a
-    // per-width ChunkLeafGate; only the climb stays on b3 rows.
-    let mut chunk_cache: Vec<(usize, flock_core::circuit::builder::SlotId)> = Vec::new();
-    let chunk = chunk_slots_for(&mut sb, &mut chunk_cache, &geo, nu);
     let (to_publish, level_accs) = emit_query_phase(
         &mut sb,
         slots,
         iv,
         &leafeval,
-        &chunk,
         &levels,
         &geo,
         &lvl_src,
@@ -5827,23 +5729,12 @@ fn mvp7_real_query_phase() {
             other => panic!("leaf-eval slot produced {other:?}"),
         })
         .collect();
-    let walkers = chunk_walkers(&chunk_cache);
-    let chunk_wits: Vec<_> = chunk_cache
-        .iter()
-        .map(|&(w, s)| {
-            MerkleTreeLayout::with_blake3_chunk_only(w, blake3_spec())
-                .generate_witness_batch_major_partial_chunk(built.rows::<ChunkLeafGate>(s), nu)
-        })
-        .collect();
 
     let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
         (shape.registry_slot(slots.b3), b3_lc),
         (shape.registry_slot(slots.swap), swap_lc),
         (shape.registry_slot(slots.spread), spread_lc),
     ];
-    for (&(_, s), w) in chunk_cache.iter().zip(&walkers) {
-        lcs_ord.push((shape.registry_slot(s), &**w));
-    }
     lcs_ord.sort_by_key(|(i, _)| *i);
     let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
         lcs_ord.into_iter().map(|(_, c)| c).collect();
@@ -5863,12 +5754,6 @@ fn mvp7_real_query_phase() {
                 UnionSlotProverInput::new(spread_wit.clone(), spread_lc),
             ),
         ];
-        for ((&(_, s), w), wit) in chunk_cache.iter().zip(&walkers).zip(&chunk_wits) {
-            bool_slots.push((
-                shape.registry_slot(s),
-                UnionSlotProverInput::new(wit.clone(), &**w),
-            ));
-        }
         bool_slots.sort_by_key(|(i, _)| *i);
         let mut el_ord: Vec<(usize, Vec<F128>)> = leaf_slot
             .iter()
@@ -6411,86 +6296,12 @@ fn emit_publics_hash(
 /// declared — publishing inside the loop would interleave with the next
 /// level's inputs and misindex the public segment (the recorded MVP-7
 /// gotcha) — and the accumulators.
-/// Demand-cache one [`ChunkLeafGate`] per distinct opened-leaf width and
-/// hand back the per-level slots [`emit_query_phase`] consumes. The cache is
-/// keyed by the width in WORDS (`Lvl::row_words` — the committed lane
-/// count); levels sharing a width share the slot, so e.g. every recursive
-/// level's 8-word leaves land on one type.
-fn chunk_slots_for(
-    sb: &mut ShapeBuilder,
-    cache: &mut Vec<(usize, flock_core::circuit::builder::SlotId)>,
-    geo: &[Lvl],
-    nu: usize,
-) -> Vec<Option<flock_core::circuit::builder::SlotId>> {
-    geo.iter()
-        .map(|g| {
-            Some(match cache.iter().find(|(w, _)| *w == g.row_words) {
-                Some(&(_, s)) => s,
-                None => {
-                    let s = sb.slot(ChunkLeafGate::new(g.row_words, nu));
-                    cache.push((g.row_words, s));
-                    s
-                }
-            })
-        })
-        .collect()
-}
-
-/// The width-keyed walker/fold-matrix caches. A walker (and likewise the
-/// fold-matrix pair) is a pure function of the WIDTH, and constructing one
-/// rebuilds the ~21M-nonzero blake3 base — seconds of work that must never
-/// sit on an ONLINE path (a tape build, a prove-time slot assembly). Build
-/// once per process, hand out Arcs.
-static CHUNK_WALKER_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<MerkleWalkerCircuit>>>,
-> = std::sync::OnceLock::new();
-static CHUNK_FOLD_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<
-        std::collections::HashMap<usize, std::sync::Arc<(ChunkFoldMatrix, ChunkFoldMatrix)>>,
-    >,
-> = std::sync::OnceLock::new();
-
-fn chunk_walker_cached(w: usize) -> std::sync::Arc<MerkleWalkerCircuit> {
-    let m = CHUNK_WALKER_CACHE.get_or_init(Default::default);
-    let mut g = m.lock().unwrap();
-    g.entry(w)
-        .or_insert_with(|| {
-            std::sync::Arc::new(
-                MerkleTreeLayout::with_blake3_chunk_only(w, blake3_spec()).build_walker(),
-            )
-        })
-        .clone()
-}
-
-fn chunk_fold_mats_cached(w: usize) -> std::sync::Arc<(ChunkFoldMatrix, ChunkFoldMatrix)> {
-    let m = CHUNK_FOLD_CACHE.get_or_init(Default::default);
-    let mut g = m.lock().unwrap();
-    g.entry(w)
-        .or_insert_with(|| {
-            std::sync::Arc::new(
-                MerkleTreeLayout::with_blake3_chunk_only(w, blake3_spec()).fold_matrices(),
-            )
-        })
-        .clone()
-}
-
-/// The prove/verify-side counterpart of [`chunk_slots_for`]: one walker per
-/// instantiated width, in cache order. The walkers back both the prover's
-/// slot inputs and the verifier's lincheck-circuit list — cached per width,
-/// borrow everywhere.
-fn chunk_walkers(
-    cache: &[(usize, flock_core::circuit::builder::SlotId)],
-) -> Vec<std::sync::Arc<MerkleWalkerCircuit>> {
-    cache.iter().map(|&(w, _)| chunk_walker_cached(w)).collect()
-}
-
 #[allow(clippy::too_many_arguments)]
 fn emit_query_phase(
     sb: &mut ShapeBuilder,
     slots: CollapsedSlots,
     iv: [Wire; 2],
     leafeval: &[flock_core::circuit::builder::SlotId],
-    chunk: &[Option<flock_core::circuit::builder::SlotId>],
     levels: &[OpenLevel],
     geo: &[Lvl],
     lvl_src: &[(&[[u8; 32]], &Vec<Vec<F128>>, &Vec<[u8; 32]>)],
@@ -6578,7 +6389,6 @@ fn emit_query_phase(
             let cv = emit_opening(
                 sb,
                 slots,
-                chunk[li],
                 iv,
                 &leaf_w,
                 cw,
@@ -7034,17 +6844,10 @@ fn check_residual_publics(
 /// and before it, the chunk chain: `leaf_blocks` BLAKE3 rows whose out_lo
 /// threads row to row, seeded by the IV, `CHUNK_START` on the first and
 /// `CHUNK_END` on the last. Every arrow is a copy constraint on whole words.
-///
-/// With `chunk = Some(slot)` — a [`ChunkLeafGate`] instantiated at EXACTLY
-/// `leaf_w.len()` words — the whole chain is ONE row of that slot instead:
-/// same leaf wires in (the leaf-eval fold gates keep consuming them), the
-/// chunk CV out, no pad wire and no per-block params. The climb is
-/// untouched either way.
 #[allow(clippy::too_many_arguments)]
 fn emit_opening(
     sb: &mut ShapeBuilder,
     s: CollapsedSlots,
-    chunk: Option<flock_core::circuit::builder::SlotId>,
     iv: [Wire; 2],
     leaf_w: &[Wire],
     index_w: Wire,
@@ -7074,7 +6877,7 @@ fn emit_opening(
             }
         }
     };
-    let pad_w = if chunk.is_some() || leaf_w.len() % 4 == 0 {
+    let pad_w = if leaf_w.len() % 4 == 0 {
         None
     } else {
         Some(shared(sb, pubs, F128::ZERO))
@@ -7083,42 +6886,32 @@ fn emit_opening(
     // The index word's bits, one per level.
     let bits = sb.gate(s.spread, &[index_w]);
 
-    // Chunk chain: the leaf hashed as a BLAKE3 chunk — one ChunkLeafGate
-    // row when the caller instantiated the width, else one b3 row per
-    // 64-byte block. The gate bakes the IV, the per-block byte counts and
-    // the flags into its relation, so no params or pad wires exist on that
-    // path.
-    let mut cv = if let Some(cl) = chunk {
-        let out = sb.gate(cl, leaf_w);
-        [out[0], out[1]]
-    } else {
-        let mut cv = iv;
-        for i in 0..blocks {
-            let mut flags = 0u32;
-            if i == 0 {
-                flags |= CHUNK_START;
-            }
-            if i + 1 == blocks {
-                flags |= CHUNK_END;
-            }
-            // The final block carries only the bytes that remain.
-            let words = (leaf_w.len() - 4 * i).min(4);
-            let params = shared(sb, pubs, pack_params(0, 16 * words as u32, flags));
-            let mw = |j: usize| -> Wire {
-                if j < words {
-                    leaf_w[4 * i + j]
-                } else {
-                    pad_w.expect("a short block needs the zero pad")
-                }
-            };
-            let out = sb.gate(
-                s.b3,
-                &[cv[0], cv[1], mw(0), mw(1), mw(2), mw(3), params],
-            );
-            cv = [out[0], out[1]];
+    // Chunk chain: the leaf hashed as a BLAKE3 chunk.
+    let mut cv = iv;
+    for i in 0..blocks {
+        let mut flags = 0u32;
+        if i == 0 {
+            flags |= CHUNK_START;
         }
-        cv
-    };
+        if i + 1 == blocks {
+            flags |= CHUNK_END;
+        }
+        // The final block carries only the bytes that remain.
+        let words = (leaf_w.len() - 4 * i).min(4);
+        let params = shared(sb, pubs, pack_params(0, 16 * words as u32, flags));
+        let mw = |j: usize| -> Wire {
+            if j < words {
+                leaf_w[4 * i + j]
+            } else {
+                pad_w.expect("a short block needs the zero pad")
+            }
+        };
+        let out = sb.gate(
+            s.b3,
+            &[cv[0], cv[1], mw(0), mw(1), mw(2), mw(3), params],
+        );
+        cv = [out[0], out[1]];
+    }
 
     // Node levels: swap, then a PARENT compression over the swapped pair.
     // The sibling is the swap's hint, supplied at `run` time in this call
@@ -7180,7 +6973,7 @@ fn collapsed_opening_matches_the_composite() {
             let leaf_w: Vec<Wire> = (0..4 * blocks).map(|_| sb.input()).collect();
             let index_w = sb.input();
             roots.push(emit_opening(
-                &mut sb, slots, None, iv, &leaf_w, index_w, depth, 0, None, &mut pubs,
+                &mut sb, slots, iv, &leaf_w, index_w, depth, 0, None, &mut pubs,
             ));
             let leaf = tree.leaf(pos);
             leaf_vals.extend((0..4 * blocks).map(|w| leaf_word(leaf, 16 * w)));
@@ -7504,8 +7297,7 @@ fn mvp6_all_levels_collapsed() {
 
             // The challenge word IS the index word — no masking gadget.
             let cw = outs[sq[k / 4]][k % 4];
-            let cv =
-                emit_opening(&mut sb, slots, None, iv, &leaf_w, cw, l.depth, c, None, &mut vals);
+            let cv = emit_opening(&mut sb, slots, iv, &leaf_w, cw, l.depth, c, None, &mut vals);
             opens.push((cw, cv));
             hints.extend(trees[li].siblings(pos).into_iter().take(l.depth - c));
 
@@ -7754,25 +7546,6 @@ struct LeafOuter {
     b3_slot: usize,
     swap_slot: usize,
     spread_slot: usize,
-    /// The chunk-leaf types: (leaf width in words, registry slot), in
-    /// declaration order. Consumers rebuild the walkers from the widths
-    /// (`chunk_only_walkers`) — the layout is width-determined.
-    chunk: Vec<(usize, usize)>,
-}
-
-/// The chunk-leaf walkers a [`LeafOuter`]-style `chunk` list needs for
-/// verify — one per width, in list order, from the process-wide cache.
-fn chunk_only_walkers(chunk: &[(usize, usize)]) -> Vec<std::sync::Arc<MerkleWalkerCircuit>> {
-    chunk.iter().map(|&(w, _)| chunk_walker_cached(w)).collect()
-}
-
-/// The walked fold-matrix views a `chunk` list hands the matrix-claim fold
-/// and the root discharge — (registry slot, (A₀, B₀)) per width, cached
-/// per width; the aggregate's `mats` list borrows through the Arcs.
-fn chunk_only_fold_mats(
-    chunk: &[(usize, usize)],
-) -> Vec<(usize, std::sync::Arc<(ChunkFoldMatrix, ChunkFoldMatrix)>)> {
-    chunk.iter().map(|&(w, s)| (s, chunk_fold_mats_cached(w))).collect()
 }
 
 /// mvp9's WHOLE construction as the shared builder the swap consumes: the
@@ -8353,23 +8126,11 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
 
         let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
         let cap_w = cap_wires(&stream, &ww, &cap_pays);
-        // The chunk-leaf table: every opened leaf's chunk chain is ONE row
-        // of a per-width ChunkLeafGate; only the climb stays on b3 rows.
-        // Under the envelope the widths are pre-declared (keys 700 + w in
-        // the canonical order), so demand hits the cache — off-envelope
-        // they declare on first use.
-        let mut chunk_cache: Vec<(usize, flock_core::circuit::builder::SlotId)> = leaf_slot
-            .iter()
-            .filter(|&&(k, _)| (700..800).contains(&k))
-            .map(|&(k, s)| (k - 700, s))
-            .collect();
-        let chunk = chunk_slots_for(&mut sb, &mut chunk_cache, &geo, nu);
         let (to_publish, level_accs) = emit_query_phase(
             &mut sb,
             slots,
             iv,
             &leafeval,
-            &chunk,
             &levels,
             &geo,
             &lvl_src,
@@ -9385,14 +9146,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         let b3_rows_l = built.rows::<Blake3Gate>(slots.b3).to_vec();
         let swap_rows_l = built.rows::<SwapGate>(slots.swap).to_vec();
         let spread_rows_l = built.rows::<BitSpreadGate>(slots.spread).to_vec();
-        // Keys 700+ are the envelope's BOOLEAN chunk-leaf slots — not
-        // element slots; their witnesses ride the bslots assembly.
-        let el_keys: Vec<(usize, flock_core::circuit::builder::SlotId)> = leaf_slot
-            .iter()
-            .filter(|&&(k, _)| !(700..800).contains(&k))
-            .cloned()
-            .collect();
-        let els: Vec<Vec<F128>> = el_keys
+        let els: Vec<Vec<F128>> = leaf_slot
             .iter()
             .map(|(_, sl)| match &built.witnesses[shape.registry_slot(*sl)] {
                 SlotWitness::Element(z) => z.clone(),
@@ -9406,7 +9160,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         // off"). Cheap: one satisfies() pass per slot at build time.
         {
             let mut bad = Vec::new();
-            for ((key, sl), z) in el_keys.iter().zip(&els) {
+            for ((key, sl), z) in leaf_slot.iter().zip(&els) {
                 let t = shape.registry_slot(*sl);
                 if let Some(el) = shape.registry.types()[t].element_type() {
                     if !el.satisfies(z, nu, shape.counts[t]) {
@@ -9416,15 +9170,11 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             }
             assert!(bad.is_empty(), "element slot unsatisfied at its declared count: {}", bad.join(", "));
         }
-        let chunk_wks = chunk_walkers(&chunk_cache);
         let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
             (shape.registry_slot(slots.b3), b3_lc),
             (shape.registry_slot(slots.swap), swap_lc),
             (shape.registry_slot(slots.spread), spread_lc),
         ];
-        for (&(_, s), w) in chunk_cache.iter().zip(&chunk_wks) {
-            lcs_ord.push((shape.registry_slot(s), &**w));
-        }
         lcs_ord.sort_by_key(|(i, _)| *i);
         let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
             lcs_ord.into_iter().map(|(_, cc)| cc).collect();
@@ -9464,23 +9214,8 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
                     ),
                 ),
             ];
-            for (&(cw_words, s), w) in chunk_cache.iter().zip(&chunk_wks) {
-                bool_slots.push((
-                    shape.registry_slot(s),
-                    UnionSlotProverInput::in_place(
-                        {
-                            let r = built.rows::<ChunkLeafGate>(s).to_vec();
-                            move |dst| {
-                                MerkleTreeLayout::with_blake3_chunk_only(cw_words, blake3_spec())
-                                    .generate_witness_batch_major_partial_into_chunk(&r, nu, dst)
-                            }
-                        },
-                        &**w,
-                    ),
-                ));
-            }
             bool_slots.sort_by_key(|(i, _)| *i);
-            let mut el_ord: Vec<(usize, Vec<F128>)> = el_keys
+            let mut el_ord: Vec<(usize, Vec<F128>)> = leaf_slot
                 .iter()
                 .zip(els.clone())
                 .map(|((_, sl), z)| (shape.registry_slot(*sl), z))
@@ -9534,10 +9269,6 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             shape.registry_slot(slots.swap),
             shape.registry_slot(slots.spread),
         );
-        let chunk = chunk_cache
-            .iter()
-            .map(|&(w, s)| (w, shape.registry_slot(s)))
-            .collect();
         LeafOuter {
             public: built.public.clone(),
             shape,
@@ -9550,7 +9281,6 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             b3_slot,
             swap_slot,
             spread_slot,
-            chunk,
         }
     }
 }
@@ -9683,15 +9413,11 @@ impl<'p> RealTape<'p> {
         use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
         let union_i = outer_union(&lo.shape.registry, lo.shape.counts.clone());
-        let lo_chunk_wks = chunk_only_walkers(&lo.chunk);
         let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
             (lo.b3_slot, lo.b3_r1cs.csc_lincheck_circuit()),
             (lo.swap_slot, lo.swap_r1cs.csc_lincheck_circuit()),
             (lo.spread_slot, lo.spread_r1cs.csc_lincheck_circuit()),
         ];
-        for ((_, rs), w) in lo.chunk.iter().zip(&lo_chunk_wks) {
-            lcs_ord.push((*rs, &**w));
-        }
         lcs_ord.sort_by_key(|(i, _)| *i);
         let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
             lcs_ord.into_iter().map(|(_, cc)| cc).collect();
@@ -11051,15 +10777,11 @@ fn emit_real_child_region(
     };
     cen.push(("H(publics) region", sb.public_len(), sb.rows_in_slot(cs.macs)));
     let cap_w = cap_wires(stream, &ww, &rt.cap_pays);
-    // The chunk-leaf table: every opened leaf's chunk chain is ONE row of a
-    // per-width ChunkLeafGate; only the climb stays on b3 rows.
-    let chunk = chunk_slots_for(sb, &mut cs.chunk, geo, cs.nu);
     let (to_publish, level_accs) = emit_query_phase(
         sb,
         cs.q,
         iv2,
         &leafeval,
-        &chunk,
         levels,
         geo,
         &rt.lvl_src,
@@ -12151,7 +11873,6 @@ fn mvp10_leaf_outer_inner_tape() {
     let spread_ty2 = BitSpreadTable::new(rt.spread_w);
     let spread_r1cs2 = spread_ty2.build_block_r1cs(nu2);
     let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
-    let cs_chunk_wks = chunk_walkers(&cs.chunk);
     let mut bslots: Vec<(usize, UnionSlotProverInput)> = vec![
         (
             shape2.registry_slot(cs.q.b3),
@@ -12181,21 +11902,6 @@ fn mvp10_leaf_outer_inner_tape() {
             ),
         ),
     ];
-    for (&(w, sl), wk) in cs.chunk.iter().zip(&cs_chunk_wks) {
-        bslots.push((
-            shape2.registry_slot(sl),
-            UnionSlotProverInput::in_place(
-                {
-                    let r = built2.rows::<ChunkLeafGate>(sl).to_vec();
-                    move |dst| {
-                        MerkleTreeLayout::with_blake3_chunk_only(w, blake3_spec())
-                            .generate_witness_batch_major_partial_into_chunk(&r, nu2, dst)
-                    }
-                },
-                &**wk,
-            ),
-        ));
-    }
     bslots.sort_by_key(|(i, _)| *i);
     let mut el_ord: Vec<(usize, Vec<F128>)> = cs
         .element_slot_ids()
@@ -12221,9 +11927,6 @@ fn mvp10_leaf_outer_inner_tape() {
         (shape2.registry_slot(cs.q.swap), swap_lc2),
         (shape2.registry_slot(cs.q.spread), spread_lc2),
     ];
-    for (&(_, sl), wk) in cs.chunk.iter().zip(&cs_chunk_wks) {
-        lco.push((shape2.registry_slot(sl), &**wk));
-    }
     lco.sort_by_key(|(i, _)| *i);
     let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
         lco.into_iter().map(|(_, c)| c).collect();
@@ -13178,7 +12881,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
     // ---- the native fold: boolean + sigma, NO element groups, NO priors ----
     let blake_r1cs = chain_blake_r1cs(cp0.inner.nu);
     let blake_lc = blake_r1cs.csc_lincheck_circuit();
-    let mats: [flock_core::aggregate::TypeMatrices; 1] = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
+    let mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
     let el_mats: [flock_core::aggregate::ElementMatrices; 0] = [];
     let el_asserts: [(
         &UnionInstance<'_>,
@@ -13890,7 +13593,6 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
         let b3_rows2 = built2.rows::<Blake3Gate>(cs.q.b3).to_vec();
         let swap_rows2 = built2.rows::<SwapGate>(cs.q.swap).to_vec();
         let spread_rows2 = built2.rows::<BitSpreadGate>(cs.q.spread).to_vec();
-        let cs_chunk_wks = chunk_walkers(&cs.chunk);
         let mut bslots: Vec<(usize, UnionSlotProverInput)> = vec![
             (
                 shape2.registry_slot(cs.q.b3),
@@ -13916,21 +13618,6 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
                 ),
             ),
         ];
-        for (&(w, sl), wk) in cs.chunk.iter().zip(&cs_chunk_wks) {
-            bslots.push((
-                shape2.registry_slot(sl),
-                UnionSlotProverInput::in_place(
-                    {
-                        let r = built2.rows::<ChunkLeafGate>(sl).to_vec();
-                        move |dst| {
-                            MerkleTreeLayout::with_blake3_chunk_only(w, blake3_spec())
-                                .generate_witness_batch_major_partial_into_chunk(&r, nu2, dst)
-                        }
-                    },
-                    &**wk,
-                ),
-            ));
-        }
         bslots.sort_by_key(|(i, _)| *i);
         // Element inputs straight from the slots' rows: the run was
         // DEFERRED, so the full-capacity packed intermediate never exists —
@@ -13955,9 +13642,6 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
             (shape2.registry_slot(cs.q.swap), swap_lc2),
             (shape2.registry_slot(cs.q.spread), spread_lc2),
         ];
-        for (&(_, sl), wk) in cs.chunk.iter().zip(&cs_chunk_wks) {
-            lco.push((shape2.registry_slot(sl), &**wk));
-        }
         lco.sort_by_key(|(i, _)| *i);
         let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
             lco.into_iter().map(|(_, c)| c).collect();
@@ -14005,11 +13689,6 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
             shape2.registry_slot(cs.q.swap),
             shape2.registry_slot(cs.q.spread),
         );
-        let chunk_ri: Vec<(usize, usize)> = cs
-            .chunk
-            .iter()
-            .map(|&(w, sl)| (w, shape2.registry_slot(sl)))
-            .collect();
         FlNode {
             lo: LeafOuter {
                 shape: shape2,
@@ -14023,7 +13702,6 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
                 b3_slot: b3_ri,
                 swap_slot: swap_ri,
                 spread_slot: spread_ri,
-                chunk: chunk_ri,
             },
             acc: acc_pub,
             stmt_base,
@@ -14168,8 +13846,7 @@ fn envelope_content_probe() {
     let chain_registry = &cps[0].inner.built.shape.registry;
     let blake_r1cs = blake3::build_block_r1cs(cps[0].inner.nu);
     let blake_lc = blake_r1cs.csc_lincheck_circuit();
-    let chain_mats: [flock_core::aggregate::TypeMatrices; 1] =
-        [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
+    let chain_mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
     let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
     let chain_jp = chain_jagged_params(&cps[0]);
     let node = build_node_outer_app(
@@ -16038,11 +15715,6 @@ struct ChildSlots {
     /// input assembly must still cover their registry slots. Empty
     /// off-envelope.
     skips: Vec<flock_core::circuit::builder::SlotId>,
-    /// The chunk-leaf demand cache (width in words -> slot), shared across
-    /// regions exactly like `le`. The builder's `nu` rides along because
-    /// [`ChunkLeafGate::new`] needs it at demand time.
-    nu: usize,
-    chunk: Vec<(usize, flock_core::circuit::builder::SlotId)>,
 }
 
 impl ChildSlots {
@@ -16068,8 +15740,6 @@ impl ChildSlots {
             // instead of registering a duplicate type.
             resid: vec![(600, macs)],
             skips: Vec::new(),
-            nu: nu2,
-            chunk: Vec::new(),
         }
     }
 
@@ -16107,15 +15777,6 @@ impl ChildSlots {
                 .cloned()
                 .collect(),
             skips: vec![take(510), take(511)],
-            nu: nu2,
-            // The envelope's chunk-leaf widths, pre-seeded from the keyed
-            // cache (700 + width) so demand sites hit them instead of
-            // declaring — the digest-pin discipline.
-            chunk: cache
-                .iter()
-                .filter(|&&(k, _)| (700..800).contains(&k))
-                .map(|&(k, s)| (k - 700, s))
-                .collect(),
         }
     }
 
@@ -16133,7 +15794,6 @@ impl ChildSlots {
         ];
         v.extend(self.le.iter().map(|&(n, s)| (n, s)));
         v.extend(self.resid.iter().filter(|&&(k, _)| k != 600).cloned());
-        v.extend(self.chunk.iter().map(|&(w, s)| (700 + w, s)));
         v
     }
 
@@ -16276,14 +15936,11 @@ fn emit_child_region(
         )
     };
     let cap_w = cap_wires(stream, &ww, &ct.cap_pays);
-    // The chunk-leaf table, as in the real-child region.
-    let chunk = chunk_slots_for(sb, &mut cs.chunk, geo, cs.nu);
     let (to_publish, level_accs) = emit_query_phase(
         sb,
         cs.q,
         iv2,
         &leafeval,
-        &chunk,
         levels,
         geo,
         &ct.lvl_src,
@@ -17183,7 +16840,6 @@ fn mvp10_circuit_inner_tape() {
         .into_iter()
         .map(|(i, z)| live_element_input(z, shape2.counts[i], nu2))
         .collect();
-    let cs_chunk_wks = chunk_walkers(&cs.chunk);
     let mut bslots: Vec<(usize, UnionSlotProverInput)> = vec![
         (
             shape2.registry_slot(cs.q.b3),
@@ -17213,30 +16869,12 @@ fn mvp10_circuit_inner_tape() {
             ),
         ),
     ];
-    for (&(w, sl), wk) in cs.chunk.iter().zip(&cs_chunk_wks) {
-        bslots.push((
-            shape2.registry_slot(sl),
-            UnionSlotProverInput::in_place(
-                {
-                    let r = built2.rows::<ChunkLeafGate>(sl).to_vec();
-                    move |dst| {
-                        MerkleTreeLayout::with_blake3_chunk_only(w, blake3_spec())
-                            .generate_witness_batch_major_partial_into_chunk(&r, nu2, dst)
-                    }
-                },
-                &**wk,
-            ),
-        ));
-    }
     bslots.sort_by_key(|(i, _)| *i);
     let mut lco: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
         (shape2.registry_slot(cs.q.b3), b3_lc2),
         (shape2.registry_slot(cs.q.swap), swap_lc2),
         (shape2.registry_slot(cs.q.spread), spread_lc2),
     ];
-    for (&(_, sl), wk) in cs.chunk.iter().zip(&cs_chunk_wks) {
-        lco.push((shape2.registry_slot(sl), &**wk));
-    }
     lco.sort_by_key(|(i, _)| *i);
     let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
         lco.into_iter().map(|(_, c)| c).collect();
@@ -17339,8 +16977,7 @@ fn partial_block_leaves_hash_correctly() {
             .collect();
         vals.push(F128::new(pos as u64, 0));
         let idx_w = sb.public_input();
-        let root =
-            emit_opening(&mut sb, slots, None, iv, &leaf_w, idx_w, depth, 0, None, &mut vals);
+        let root = emit_opening(&mut sb, slots, iv, &leaf_w, idx_w, depth, 0, None, &mut vals);
         sb.publish(root[0]);
         sb.publish(root[1]);
         let shape = sb.finish().expect("the opening circuit builds");
@@ -17357,261 +16994,7 @@ fn partial_block_leaves_hash_correctly() {
             digest_words(&hash_to_digest(&tree.root)),
             "width {words}: the opening folds to the tree root"
         );
-
-        // The same opening with the chunk chain as ONE ChunkLeafGate row —
-        // same leaf wires, no pad wire, no per-block params — folds to the
-        // same root, at every width. This is the collapsed loop's
-        // replacement and its width sweep in one.
-        let mut sb = ShapeBuilder::new(nu);
-        let slots = CollapsedSlots {
-            b3: sb.slot(Blake3Gate { nu }),
-            swap: sb.slot(SwapGate { nu }),
-            spread: sb.slot(BitSpreadGate {
-                ty: BitSpreadTable::new(depth),
-                nu,
-            }),
-        };
-        let cl = sb.slot(ChunkLeafGate::new(words, nu));
-        let mut vals: Vec<F128> = Vec::new();
-        vals.extend_from_slice(&iv_w);
-        let iv = [sb.public_input(), sb.public_input()];
-        let leaf_w: Vec<Wire> = (0..words)
-            .map(|w| {
-                vals.push(leaf_word(leaf, 16 * w));
-                sb.public_input()
-            })
-            .collect();
-        vals.push(F128::new(pos as u64, 0));
-        let idx_w = sb.public_input();
-        let root =
-            emit_opening(&mut sb, slots, Some(cl), iv, &leaf_w, idx_w, depth, 0, None, &mut vals);
-        sb.publish(root[0]);
-        sb.publish(root[1]);
-        let shape = sb.finish().expect("the chunk-gate opening circuit builds");
-        let built = shape.run(&vals, &hint_refs);
-        let n = built.public.len();
-        assert_eq!(
-            [built.public[n - 2], built.public[n - 1]],
-            digest_words(&hash_to_digest(&tree.root)),
-            "width {words}: the chunk-gate opening folds to the tree root"
-        );
-        assert_eq!(
-            shape.counts[shape.registry_slot(cl)],
-            1,
-            "width {words}: one chunk row per opening"
-        );
-        assert_eq!(
-            shape.counts[shape.registry_slot(slots.b3)],
-            depth,
-            "width {words}: only the climb stays on b3 rows"
-        );
     }
-}
-
-/// **The chunk-leaf table, proven end to end in a union**: openings over two
-/// leaf widths (a partial final block and whole blocks) each ride ONE row of
-/// a per-width [`ChunkLeafGate`], wired to the same climb the collapsed path
-/// keeps; the union proves with the walkers carrying the chunk types'
-/// lincheck (stub matrices — the `MerkleMixedSetup` precedent) and verifies;
-/// a tampered root public is rejected.
-#[test]
-fn chunk_leaf_rows_prove_in_the_union() {
-    let nu = 5usize;
-    let shapes = [(3usize, 5usize), (2, 12)]; // (depth, leaf words)
-    let n_open = 4usize;
-    let mut rng = Rng(0x_C1_0C_5E_ED);
-    let trees: Vec<Tree> = shapes
-        .iter()
-        .map(|&(depth, words)| Tree::new(depth, 16 * words, &mut rng))
-        .collect();
-
-    let mut sb = ShapeBuilder::new(nu);
-    let max_depth = shapes.iter().map(|&(d, _)| d).max().unwrap();
-    let slots = CollapsedSlots {
-        b3: sb.slot(Blake3Gate { nu }),
-        swap: sb.slot(SwapGate { nu }),
-        spread: sb.slot(BitSpreadGate {
-            ty: BitSpreadTable::new(max_depth),
-            nu,
-        }),
-    };
-    let chunk_gates: Vec<_> = shapes.iter().map(|&(_, w)| ChunkLeafGate::new(w, nu)).collect();
-    let chunk_slots: Vec<_> = shapes
-        .iter()
-        .map(|&(_, w)| sb.slot(ChunkLeafGate::new(w, nu)))
-        .collect();
-
-    let mut vals: Vec<F128> = Vec::new();
-    let iv_w = pack8(&IV);
-    vals.extend_from_slice(&iv_w);
-    let iv = [sb.public_input(), sb.public_input()];
-    let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
-    let mut roots = Vec::new();
-    for (si, &(depth, words)) in shapes.iter().enumerate() {
-        for k in 0..n_open {
-            let pos = (k * 3 + si) % (1 << depth);
-            let leaf = trees[si].leaf(pos);
-            let leaf_w: Vec<Wire> = (0..words)
-                .map(|w| {
-                    vals.push(leaf_word(leaf, 16 * w));
-                    sb.input()
-                })
-                .collect();
-            vals.push(F128::new(pos as u64, 0));
-            let idx_w = sb.input();
-            roots.push(emit_opening(
-                &mut sb,
-                slots,
-                Some(chunk_slots[si]),
-                iv,
-                &leaf_w,
-                idx_w,
-                depth,
-                0,
-                None,
-                &mut vals,
-            ));
-            hints.extend(trees[si].siblings(pos));
-        }
-    }
-    for r in &roots {
-        sb.publish(r[0]);
-        sb.publish(r[1]);
-    }
-    let shape = sb.finish().expect("the chunk-leaf union circuit builds");
-
-    let hint_refs: Vec<&(dyn std::any::Any + Sync)> =
-        hints.iter().map(|h| h as &(dyn std::any::Any + Sync)).collect();
-    let built = shape.run(&vals, &hint_refs);
-
-    // Every opening folds to its tree's root through the one-row leaf hash.
-    for (si, &(depth, _)) in shapes.iter().enumerate() {
-        let want = digest_words(&hash_to_digest(&trees[si].root));
-        for k in 0..n_open {
-            let r = &roots[si * n_open + k];
-            let _ = (r, depth);
-            let base = 2 * (si * n_open + k);
-            let n = built.public.len() - 2 * shapes.len() * n_open;
-            assert_eq!(
-                [built.public[n + base], built.public[n + base + 1]],
-                want,
-                "shape {si} opening {k} root"
-            );
-        }
-    }
-
-    // ---- prove / verify ----
-    let union = UnionInstance::new(&shape.registry, shape.counts.clone());
-    let pcs_params = PcsParams {
-        m: union.dense_m(),
-        log_inv_rate: 1,
-        log_batch_size: pcs_batch(&union),
-        profile: LigeritoProfile::Fast,
-        num_lanes: union.commit_lanes(pcs_batch(&union)),
-        merkle_hash: Default::default(),
-    };
-    let b3 = blake3::build_block_r1cs(nu);
-    let b3_lc = b3.csc_lincheck_circuit();
-    let swap_r1cs = SwapTable::build_block_r1cs(nu);
-    let swap_lc = swap_r1cs.csc_lincheck_circuit();
-    let spread_ty = BitSpreadTable::new(max_depth);
-    let spread_r1cs = spread_ty.build_block_r1cs(nu);
-    let spread_lc = spread_r1cs.csc_lincheck_circuit();
-    let walkers: Vec<_> = chunk_gates.iter().map(|g| g.layout.build_walker()).collect();
-
-    let mut slot_inputs: Vec<(usize, UnionSlotProverInput)> = vec![
-        (
-            shape.registry_slot(slots.b3),
-            UnionSlotProverInput::new(
-                blake3::generate_witness_batch_major_partial(built.rows::<Blake3Gate>(slots.b3), nu),
-                b3_lc,
-            ),
-        ),
-        (
-            shape.registry_slot(slots.swap),
-            UnionSlotProverInput::new(
-                SwapTable::generate_witness_batch_major(built.rows::<SwapGate>(slots.swap), nu),
-                swap_lc,
-            ),
-        ),
-        (
-            shape.registry_slot(slots.spread),
-            UnionSlotProverInput::new(
-                spread_ty.generate_witness_batch_major(
-                    built.rows::<BitSpreadGate>(slots.spread),
-                    nu,
-                ),
-                spread_lc,
-            ),
-        ),
-    ];
-    let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
-        (shape.registry_slot(slots.b3), b3_lc),
-        (shape.registry_slot(slots.swap), swap_lc),
-        (shape.registry_slot(slots.spread), spread_lc),
-    ];
-    for (si, (g, w)) in chunk_gates.iter().zip(&walkers).enumerate() {
-        let rs = shape.registry_slot(chunk_slots[si]);
-        slot_inputs.push((
-            rs,
-            UnionSlotProverInput::new(
-                g.layout.generate_witness_batch_major_partial_chunk(
-                    built.rows::<ChunkLeafGate>(chunk_slots[si]),
-                    nu,
-                ),
-                w,
-            ),
-        ));
-        lcs_ord.push((rs, w));
-    }
-    slot_inputs.sort_by_key(|(i, _)| *i);
-    lcs_ord.sort_by_key(|(i, _)| *i);
-    let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
-        lcs_ord.into_iter().map(|(_, c)| c).collect();
-
-    let mut ch = FsChallenger::new(DOMAIN);
-    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
-        &union,
-        &shape.circuit,
-        &built.public,
-        &pcs_params,
-        slot_inputs.into_iter().map(|(_, s)| s).collect(),
-        Vec::new(),
-        &mut ch,
-    );
-
-    let mut ch = FsChallenger::new(DOMAIN);
-    verifier::verify_ligerito_union_circuit(
-        &union,
-        &shape.circuit,
-        &built.public,
-        &lcs,
-        &commitment,
-        &proof,
-        &pcs_params,
-        &mut ch,
-    )
-    .expect("chunk-leaf openings verify in the union");
-
-    // A tampered root public must be rejected.
-    let mut bad = built.public.clone();
-    let last = bad.len() - 1;
-    bad[last] += F128::ONE;
-    let mut ch = FsChallenger::new(DOMAIN);
-    assert!(
-        verifier::verify_ligerito_union_circuit(
-            &union,
-            &shape.circuit,
-            &bad,
-            &lcs,
-            &commitment,
-            &proof,
-            &pcs_params,
-            &mut ch,
-        )
-        .is_err(),
-        "a tampered root must be rejected"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -19828,7 +19211,7 @@ fn mvp11_merge_fold_region() {
     // verifier this test arithmetises.
     let blake_r1cs = blake3::build_block_r1cs(7);
     let blake_lc = blake_r1cs.csc_lincheck_circuit();
-    let mats: [flock_core::aggregate::TypeMatrices; 1] = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
+    let mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
     let el_ty = registry.element_types()[0]
         .element_type()
         .expect("the element slot's table");
@@ -20533,7 +19916,6 @@ fn mvp11_merge_fold_region() {
             .into_iter()
             .map(|(i, z)| live_element_input(z, shape2.counts[i], nu2))
             .collect();
-        let cs_chunk_wks = chunk_walkers(&cs.chunk);
         let mut bslots: Vec<(usize, UnionSlotProverInput)> = vec![
             (
                 shape2.registry_slot(cs.q.b3),
@@ -20566,21 +19948,6 @@ fn mvp11_merge_fold_region() {
                 ),
             ),
         ];
-        for (&(w, sl), wk) in cs.chunk.iter().zip(&cs_chunk_wks) {
-            bslots.push((
-                shape2.registry_slot(sl),
-                UnionSlotProverInput::in_place(
-                    {
-                        let r = built2.rows::<ChunkLeafGate>(sl).to_vec();
-                        move |dst| {
-                            MerkleTreeLayout::with_blake3_chunk_only(w, blake3_spec())
-                                .generate_witness_batch_major_partial_into_chunk(&r, nu2, dst)
-                        }
-                    },
-                    &**wk,
-                ),
-            ));
-        }
         bslots.sort_by_key(|(i, _)| *i);
         let mut ch2 = FsChallenger::new(DOMAIN);
         let (oproof, ocommit, _) = prover::prove_fast_ligerito_union_circuit(
@@ -20597,9 +19964,6 @@ fn mvp11_merge_fold_region() {
             (shape2.registry_slot(cs.q.swap), swap_lc2),
             (shape2.registry_slot(cs.q.spread), spread_lc2),
         ];
-        for (&(_, sl), wk) in cs.chunk.iter().zip(&cs_chunk_wks) {
-            lco.push((shape2.registry_slot(sl), &**wk));
-        }
         lco.sort_by_key(|(i, _)| *i);
         let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
             lco.into_iter().map(|(_, c)| c).collect();
@@ -20692,15 +20056,11 @@ fn mvp11_swap_children_fold_scale() {
     let lo = build_leaf_outer();
     let union_i = outer_union(&lo.shape.registry, lo.shape.counts.clone());
     let registry = &lo.shape.registry;
-    let lo_chunk_wks = chunk_only_walkers(&lo.chunk);
     let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
         (lo.b3_slot, lo.b3_r1cs.csc_lincheck_circuit()),
         (lo.swap_slot, lo.swap_r1cs.csc_lincheck_circuit()),
         (lo.spread_slot, lo.spread_r1cs.csc_lincheck_circuit()),
     ];
-    for ((_, rs), w) in lo.chunk.iter().zip(&lo_chunk_wks) {
-        lcs_ord.push((*rs, &**w));
-    }
     lcs_ord.sort_by_key(|(i, _)| *i);
     let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
         lcs_ord.iter().map(|&(_, c)| c).collect();
@@ -20734,15 +20094,11 @@ fn mvp11_swap_children_fold_scale() {
     // The matrices + lincheck circuits per BOOLEAN type in registry order
     // (via the slot indices), and per ELEMENT type from the registry's own
     // table entries — everything the fold prover and the discharges read.
-    let lo_chunk_fm = chunk_only_fold_mats(&lo.chunk);
-    let mut mats_ord: Vec<(usize, flock_core::aggregate::TypeMatrices)> = vec![
+    let mut mats_ord = vec![
         (lo.b3_slot, (&lo.b3_r1cs.a_0, &lo.b3_r1cs.b_0)),
         (lo.swap_slot, (&lo.swap_r1cs.a_0, &lo.swap_r1cs.b_0)),
         (lo.spread_slot, (&lo.spread_r1cs.a_0, &lo.spread_r1cs.b_0)),
     ];
-    for (rs, fm) in &lo_chunk_fm {
-        mats_ord.push((*rs, (&fm.0, &fm.1)));
-    }
     mats_ord.sort_by_key(|&(i, _)| i);
     let mats: Vec<_> = mats_ord.iter().map(|&(_, m)| m).collect();
     let el_types: Vec<_> = registry
@@ -20753,11 +20109,7 @@ fn mvp11_swap_children_fold_scale() {
     let el_mats: Vec<_> = el_types.iter().map(|t| (t.a_0(), t.b_0())).collect();
     let n_bool = registry.num_boolean();
     let n_el = el_mats.len();
-    assert_eq!(
-        n_bool,
-        3 + lo.chunk.len(),
-        "the real node's boolean census: b3, swap, spread + the chunk-leaf widths"
-    );
+    assert_eq!(n_bool, 3, "the real node's boolean census: b3, swap, spread");
     assert!(n_el > 5, "the real node carries the element gate census");
 
     // The native fold: prove + record-verify + discharge all three groups.
@@ -21138,15 +20490,11 @@ fn mvp11_swap_children_fold_scale() {
 fn record_child_verify(lo: &LeafOuter, domain: &'static [u8]) {
     use flock_core::transcript_record::RecordingChallenger;
     let union_i = outer_union(&lo.shape.registry, lo.shape.counts.clone());
-    let lo_chunk_wks = chunk_only_walkers(&lo.chunk);
     let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
         (lo.b3_slot, lo.b3_r1cs.csc_lincheck_circuit()),
         (lo.swap_slot, lo.swap_r1cs.csc_lincheck_circuit()),
         (lo.spread_slot, lo.spread_r1cs.csc_lincheck_circuit()),
     ];
-    for ((_, rs), w) in lo.chunk.iter().zip(&lo_chunk_wks) {
-        lcs_ord.push((*rs, &**w));
-    }
     lcs_ord.sort_by_key(|(i, _)| *i);
     let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
         lcs_ord.into_iter().map(|(_, cc)| cc).collect();
@@ -21356,27 +20704,19 @@ fn build_node_outer_app(
 
     // The matrices + lincheck circuits, registry order (lo0's copies —
     // one circuit, one registry).
-    let lo0_chunk_wks = chunk_only_walkers(&lo0.chunk);
     let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
         (lo0.b3_slot, lo0.b3_r1cs.csc_lincheck_circuit()),
         (lo0.swap_slot, lo0.swap_r1cs.csc_lincheck_circuit()),
         (lo0.spread_slot, lo0.spread_r1cs.csc_lincheck_circuit()),
     ];
-    for ((_, rs), w) in lo0.chunk.iter().zip(&lo0_chunk_wks) {
-        lcs_ord.push((*rs, &**w));
-    }
     lcs_ord.sort_by_key(|(i, _)| *i);
     let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
         lcs_ord.iter().map(|&(_, c)| c).collect();
-    let lo0_chunk_fm = chunk_only_fold_mats(&lo0.chunk);
-    let mut mats_ord: Vec<(usize, flock_core::aggregate::TypeMatrices)> = vec![
+    let mut mats_ord = vec![
         (lo0.b3_slot, (&lo0.b3_r1cs.a_0, &lo0.b3_r1cs.b_0)),
         (lo0.swap_slot, (&lo0.swap_r1cs.a_0, &lo0.swap_r1cs.b_0)),
         (lo0.spread_slot, (&lo0.spread_r1cs.a_0, &lo0.spread_r1cs.b_0)),
     ];
-    for (rs, fm) in &lo0_chunk_fm {
-        mats_ord.push((*rs, (&fm.0, &fm.1)));
-    }
     mats_ord.sort_by_key(|&(i, _)| i);
     let mats: Vec<_> = mats_ord.iter().map(|&(_, m)| m).collect();
     let el_types: Vec<_> = registry
@@ -23287,7 +22627,6 @@ fn build_node_outer_app(
         let b3_rows2 = built2.rows::<Blake3Gate>(cs.q.b3).to_vec();
         let swap_rows2 = built2.rows::<SwapGate>(cs.q.swap).to_vec();
         let spread_rows2 = built2.rows::<BitSpreadGate>(cs.q.spread).to_vec();
-        let cs_chunk_wks = chunk_walkers(&cs.chunk);
         let mut bslots: Vec<(usize, UnionSlotProverInput)> = vec![
             (
                 shape2.registry_slot(cs.q.b3),
@@ -23313,21 +22652,6 @@ fn build_node_outer_app(
                 ),
             ),
         ];
-        for (&(w, sl), wk) in cs.chunk.iter().zip(&cs_chunk_wks) {
-            bslots.push((
-                shape2.registry_slot(sl),
-                UnionSlotProverInput::in_place(
-                    {
-                        let r = built2.rows::<ChunkLeafGate>(sl).to_vec();
-                        move |dst| {
-                            MerkleTreeLayout::with_blake3_chunk_only(w, blake3_spec())
-                                .generate_witness_batch_major_partial_into_chunk(&r, nu2, dst)
-                        }
-                    },
-                    &**wk,
-                ),
-            ));
-        }
         bslots.sort_by_key(|(i, _)| *i);
         // Element inputs straight from the slots' rows: the run was
         // DEFERRED, so the full-capacity packed intermediate never exists —
@@ -23395,9 +22719,6 @@ fn build_node_outer_app(
             (shape2.registry_slot(cs.q.swap), swap_lc2),
             (shape2.registry_slot(cs.q.spread), spread_lc2),
         ];
-        for (&(_, sl), wk) in cs.chunk.iter().zip(&cs_chunk_wks) {
-            lco.push((shape2.registry_slot(sl), &**wk));
-        }
         lco.sort_by_key(|(i, _)| *i);
         let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
             lco.into_iter().map(|(_, c)| c).collect();
@@ -23517,11 +22838,6 @@ fn build_node_outer_app(
             shape2.registry_slot(cs.q.swap),
             shape2.registry_slot(cs.q.spread),
         );
-        let chunk_ri: Vec<(usize, usize)> = cs
-            .chunk
-            .iter()
-            .map(|&(w, sl)| (w, shape2.registry_slot(sl)))
-            .collect();
         NodeOut {
             lo: LeafOuter {
                 public: built2.public.clone(),
@@ -23535,7 +22851,6 @@ fn build_node_outer_app(
                 b3_slot: b3_slot2,
                 swap_slot: swap_slot2,
                 spread_slot: spread_slot2,
-                chunk: chunk_ri,
             },
             acc: acc_v,
             online: Online {
@@ -23673,15 +22988,11 @@ fn internal_node_over_two_fl_nodes() {
 fn child_tape_ops(lo: &LeafOuter) -> Vec<flock_core::transcript_record::TranscriptOp> {
     use flock_core::transcript_record::RecordingChallenger;
     let union_i = outer_union(&lo.shape.registry, lo.shape.counts.clone());
-    let lo_chunk_wks = chunk_only_walkers(&lo.chunk);
     let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
         (lo.b3_slot, lo.b3_r1cs.csc_lincheck_circuit()),
         (lo.swap_slot, lo.swap_r1cs.csc_lincheck_circuit()),
         (lo.spread_slot, lo.spread_r1cs.csc_lincheck_circuit()),
     ];
-    for ((_, rs), w) in lo.chunk.iter().zip(&lo_chunk_wks) {
-        lcs_ord.push((*rs, &**w));
-    }
     lcs_ord.sort_by_key(|(i, _)| *i);
     let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
         lcs_ord.into_iter().map(|(_, c)| c).collect();
@@ -23866,8 +23177,7 @@ fn internal_node_three_ary() {
     let chain_registry = &cps[0].inner.built.shape.registry;
     let blake_r1cs = blake3::build_block_r1cs(cps[0].inner.nu);
     let blake_lc = blake_r1cs.csc_lincheck_circuit();
-    let chain_mats: [flock_core::aggregate::TypeMatrices; 1] =
-        [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
+    let chain_mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
     let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
     let priors: Vec<&flock_core::aggregate::Accumulator> = fls.iter().map(|f| &f.acc).collect();
     let kids: Vec<&LeafOuter> = fls.iter().map(|f| &f.lo).collect();
@@ -23921,15 +23231,11 @@ fn internal_node_three_ary() {
         .map(|s| s.element_type().expect("an element slot's table"))
         .collect();
     let el_mats: Vec<_> = el_types.iter().map(|ty| (ty.a_0(), ty.b_0())).collect();
-    let ch_chunk_fm = chunk_only_fold_mats(&ch.chunk);
-    let mut mats_ord: Vec<(usize, flock_core::aggregate::TypeMatrices)> = vec![
+    let mut mats_ord = vec![
         (ch.b3_slot, (&ch.b3_r1cs.a_0, &ch.b3_r1cs.b_0)),
         (ch.swap_slot, (&ch.swap_r1cs.a_0, &ch.swap_r1cs.b_0)),
         (ch.spread_slot, (&ch.spread_r1cs.a_0, &ch.spread_r1cs.b_0)),
     ];
-    for (rs, fm) in &ch_chunk_fm {
-        mats_ord.push((*rs, (&fm.0, &fm.1)));
-    }
     mats_ord.sort_by_key(|&(i, _)| i);
     let mats: Vec<_> = mats_ord.iter().map(|&(_, m)| m).collect();
     assert!(
@@ -24020,8 +23326,7 @@ fn chain_tower_three_levels_one_internal_digest() {
     let chain_registry = &cps[0].inner.built.shape.registry;
     let blake_r1cs = blake3::build_block_r1cs(cps[0].inner.nu);
     let blake_lc = blake_r1cs.csc_lincheck_circuit();
-    let chain_mats: [flock_core::aggregate::TypeMatrices; 1] =
-        [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
+    let chain_mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
     let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
     let chain_circuit = &cps[0].inner.built.shape.circuit;
     let chain_jp = chain_jagged_params(&cps[0]);
@@ -24370,8 +23675,7 @@ fn chain_spine_converges() {
     let chain_registry = &cps[0].inner.built.shape.registry;
     let blake_r1cs = blake3::build_block_r1cs(cps[0].inner.nu);
     let blake_lc = blake_r1cs.csc_lincheck_circuit();
-    let chain_mats: [flock_core::aggregate::TypeMatrices; 1] =
-        [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
+    let chain_mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
     let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
     let chain_circuit = &cps[0].inner.built.shape.circuit;
     let chain_jp = chain_jagged_params(&cps[0]);
@@ -24562,15 +23866,11 @@ fn chain_spine_converges() {
     // A statement-tier verify helper, the e2e tamper legs' assembly.
     let verify_with = |lo: &LeafOuter, publics: &[F128]| -> bool {
         let u = outer_union(&lo.shape.registry, lo.shape.counts.clone());
-        let lo_chunk_wks = chunk_only_walkers(&lo.chunk);
         let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
             (lo.b3_slot, lo.b3_r1cs.csc_lincheck_circuit()),
             (lo.swap_slot, lo.swap_r1cs.csc_lincheck_circuit()),
             (lo.spread_slot, lo.spread_r1cs.csc_lincheck_circuit()),
         ];
-        for ((_, rs), w) in lo.chunk.iter().zip(&lo_chunk_wks) {
-            lcs_ord.push((*rs, &**w));
-        }
         lcs_ord.sort_by_key(|(i, _)| *i);
         let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
             lcs_ord.into_iter().map(|(_, c)| c).collect();
@@ -24702,8 +24002,7 @@ fn chain_tower_e2e_with_lane() {
     let chain_registry = &cp0.inner.built.shape.registry;
     let blake_r1cs = blake3::build_block_r1cs(cp0.inner.nu);
     let blake_lc = blake_r1cs.csc_lincheck_circuit();
-    let chain_mats: [flock_core::aggregate::TypeMatrices; 1] =
-        [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
+    let chain_mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
     let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
     let chain_jp = chain_jagged_params(&cp0);
     let lane = ChainLane {
@@ -24744,8 +24043,7 @@ fn chain_tower_e2e_with_lane() {
     // (3) The FL lane discharges: boolean vs the FL b3/swap/spread mats
     // (registry order), element vs the FL element types, sigma vs the FL
     // circuit digest's table.
-    let fl0_lo_chunk_fm = chunk_only_fold_mats(&fl0.lo.chunk);
-    let mut mats_ord: Vec<(usize, flock_core::aggregate::TypeMatrices)> = vec![
+    let mut mats_ord = vec![
         (fl0.lo.b3_slot, (&fl0.lo.b3_r1cs.a_0, &fl0.lo.b3_r1cs.b_0)),
         (
             fl0.lo.swap_slot,
@@ -24756,9 +24054,6 @@ fn chain_tower_e2e_with_lane() {
             (&fl0.lo.spread_r1cs.a_0, &fl0.lo.spread_r1cs.b_0),
         ),
     ];
-    for (rs, fm) in &fl0_lo_chunk_fm {
-        mats_ord.push((*rs, (&fm.0, &fm.1)));
-    }
     mats_ord.sort_by_key(|&(i, _)| i);
     let fl_mats: Vec<_> = mats_ord.iter().map(|&(_, m)| m).collect();
     assert!(acc.discharge(&fl_mats), "FL-lane boolean discharges");
@@ -24787,15 +24082,11 @@ fn chain_tower_e2e_with_lane() {
     //     verify against it — the adjacency data is statement-bound.
     {
         let union_f = outer_union(&fl0.lo.shape.registry, fl0.lo.shape.counts.clone());
-        let fl0_lo_chunk_wks = chunk_only_walkers(&fl0.lo.chunk);
         let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
             (fl0.lo.b3_slot, fl0.lo.b3_r1cs.csc_lincheck_circuit()),
             (fl0.lo.swap_slot, fl0.lo.swap_r1cs.csc_lincheck_circuit()),
             (fl0.lo.spread_slot, fl0.lo.spread_r1cs.csc_lincheck_circuit()),
         ];
-        for ((_, rs), w) in fl0.lo.chunk.iter().zip(&fl0_lo_chunk_wks) {
-            lcs_ord.push((*rs, &**w));
-        }
         lcs_ord.sort_by_key(|(i, _)| *i);
         let lcs_f: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
             lcs_ord.into_iter().map(|(_, c)| c).collect();
@@ -24863,15 +24154,11 @@ fn chain_tower_e2e_with_lane() {
     //     bound the same way.
     {
         let union_n = outer_union(&node.shape.registry, node.shape.counts.clone());
-        let node_chunk_wks = chunk_only_walkers(&node.chunk);
         let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
             (node.b3_slot, node.b3_r1cs.csc_lincheck_circuit()),
             (node.swap_slot, node.swap_r1cs.csc_lincheck_circuit()),
             (node.spread_slot, node.spread_r1cs.csc_lincheck_circuit()),
         ];
-        for ((_, rs), w) in node.chunk.iter().zip(&node_chunk_wks) {
-            lcs_ord.push((*rs, &**w));
-        }
         lcs_ord.sort_by_key(|(i, _)| *i);
         let lcs_n: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
             lcs_ord.into_iter().map(|(_, c)| c).collect();
@@ -25072,8 +24359,7 @@ fn chain_tower_m32_headline() {
     let chain_registry = &cp0.inner.built.shape.registry;
     let blake_r1cs = blake3::build_block_r1cs(cp0.inner.nu);
     let blake_lc = blake_r1cs.csc_lincheck_circuit();
-    let chain_mats: [flock_core::aggregate::TypeMatrices; 1] =
-        [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
+    let chain_mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
     let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
     let chain_jp = chain_jagged_params(&cp0);
     let lane = ChainLane {
@@ -25102,8 +24388,7 @@ fn chain_tower_m32_headline() {
         );
     }
     assert!(lane_acc.discharge(&chain_mats) && lane_acc.discharge_sigma(&[&cp0.inner.built.shape.circuit]));
-    let fl0_lo_chunk_fm = chunk_only_fold_mats(&fl0.lo.chunk);
-    let mut mats_ord: Vec<(usize, flock_core::aggregate::TypeMatrices)> = vec![
+    let mut mats_ord = vec![
         (fl0.lo.b3_slot, (&fl0.lo.b3_r1cs.a_0, &fl0.lo.b3_r1cs.b_0)),
         (fl0.lo.swap_slot, (&fl0.lo.swap_r1cs.a_0, &fl0.lo.swap_r1cs.b_0)),
         (
@@ -25111,9 +24396,6 @@ fn chain_tower_m32_headline() {
             (&fl0.lo.spread_r1cs.a_0, &fl0.lo.spread_r1cs.b_0),
         ),
     ];
-    for (rs, fm) in &fl0_lo_chunk_fm {
-        mats_ord.push((*rs, (&fm.0, &fm.1)));
-    }
     mats_ord.sort_by_key(|&(i, _)| i);
     let fl_mats: Vec<_> = mats_ord.iter().map(|&(_, m)| m).collect();
     let fl_el_mats: Vec<_> = fl0
@@ -25257,8 +24539,7 @@ fn tower_online_bench() {
     let chain_registry = &cp0.inner.built.shape.registry;
     let blake_r1cs = chain_blake_r1cs(cp0.inner.nu);
     let blake_lc = blake_r1cs.csc_lincheck_circuit();
-    let chain_mats: [flock_core::aggregate::TypeMatrices; 1] =
-        [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
+    let chain_mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
     let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
     let chain_jp = chain_jagged_params(&cp0);
     // ---- INTERNAL (= the spine's base) then SPINE, one call each ----
@@ -25370,15 +24651,11 @@ fn recording_overhead_probe() {
     let (n0, _acc, _) = build_node_outer(&l0, &l1);
 
     let union_i = outer_union(&n0.shape.registry, n0.shape.counts.clone());
-    let n0_chunk_wks = chunk_only_walkers(&n0.chunk);
     let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
         (n0.b3_slot, n0.b3_r1cs.csc_lincheck_circuit()),
         (n0.swap_slot, n0.swap_r1cs.csc_lincheck_circuit()),
         (n0.spread_slot, n0.spread_r1cs.csc_lincheck_circuit()),
     ];
-    for ((_, rs), w) in n0.chunk.iter().zip(&n0_chunk_wks) {
-        lcs_ord.push((*rs, &**w));
-    }
     lcs_ord.sort_by_key(|(i, _)| *i);
     let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
         lcs_ord.into_iter().map(|(_, cc)| cc).collect();
@@ -25522,16 +24799,12 @@ fn mvp12_recursion_tower() {
     // are what collapse these to one): the leaf-level accumulators against
     // the LEAF registry's matrices + circuit, the node-level accumulator
     // against the NODE registry's.
-    let l0_chunk_fm = chunk_only_fold_mats(&l0.chunk);
     let leaf_mats = {
-        let mut v: Vec<(usize, flock_core::aggregate::TypeMatrices)> = vec![
+        let mut v = vec![
             (l0.b3_slot, (&l0.b3_r1cs.a_0, &l0.b3_r1cs.b_0)),
             (l0.swap_slot, (&l0.swap_r1cs.a_0, &l0.swap_r1cs.b_0)),
             (l0.spread_slot, (&l0.spread_r1cs.a_0, &l0.spread_r1cs.b_0)),
         ];
-        for (rs, fm) in &l0_chunk_fm {
-            v.push((*rs, (&fm.0, &fm.1)));
-        }
         v.sort_by_key(|&(i, _)| i);
         v.into_iter().map(|(_, m)| m).collect::<Vec<_>>()
     };
@@ -25556,16 +24829,12 @@ fn mvp12_recursion_tower() {
             "leaf-level acc {k}: sigma (keyed by the LEAF circuit)"
         );
     }
-    let n0_chunk_fm = chunk_only_fold_mats(&n0.chunk);
     let node_mats = {
-        let mut v: Vec<(usize, flock_core::aggregate::TypeMatrices)> = vec![
+        let mut v = vec![
             (n0.b3_slot, (&n0.b3_r1cs.a_0, &n0.b3_r1cs.b_0)),
             (n0.swap_slot, (&n0.swap_r1cs.a_0, &n0.swap_r1cs.b_0)),
             (n0.spread_slot, (&n0.spread_r1cs.a_0, &n0.spread_r1cs.b_0)),
         ];
-        for (rs, fm) in &n0_chunk_fm {
-            v.push((*rs, (&fm.0, &fm.1)));
-        }
         v.sort_by_key(|&(i, _)| i);
         v.into_iter().map(|(_, m)| m).collect::<Vec<_>>()
     };
@@ -25701,26 +24970,18 @@ fn envelope_registry_diff() {
         let (rt0, rt1) = (RealTape::new(&lo, DOMAIN), RealTape::new(&l1, DOMAIN));
         let u0 = outer_union(registry, lo.shape.counts.clone());
         let u1 = outer_union(&l1.shape.registry, l1.shape.counts.clone());
-        let lo_chunk_fm = chunk_only_fold_mats(&lo.chunk);
-        let mut mats_ord: Vec<(usize, flock_core::aggregate::TypeMatrices)> = vec![
+        let mut mats_ord = vec![
             (lo.b3_slot, (&lo.b3_r1cs.a_0, &lo.b3_r1cs.b_0)),
             (lo.swap_slot, (&lo.swap_r1cs.a_0, &lo.swap_r1cs.b_0)),
             (lo.spread_slot, (&lo.spread_r1cs.a_0, &lo.spread_r1cs.b_0)),
         ];
-        for (rs, fm) in &lo_chunk_fm {
-            mats_ord.push((*rs, (&fm.0, &fm.1)));
-        }
         mats_ord.sort_by_key(|&(i, _)| i);
         let mats: Vec<_> = mats_ord.iter().map(|&(_, m)| m).collect();
-        let lo_chunk_wks = chunk_only_walkers(&lo.chunk);
         let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
             (lo.b3_slot, lo.b3_r1cs.csc_lincheck_circuit()),
             (lo.swap_slot, lo.swap_r1cs.csc_lincheck_circuit()),
             (lo.spread_slot, lo.spread_r1cs.csc_lincheck_circuit()),
         ];
-        for ((_, rs), w) in lo.chunk.iter().zip(&lo_chunk_wks) {
-            lcs_ord.push((*rs, &**w));
-        }
         lcs_ord.sort_by_key(|(i, _)| *i);
         let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
             lcs_ord.iter().map(|&(_, c)| c).collect();

@@ -48,18 +48,13 @@ use crate::element_r1cs::union::ElementAssertion;
 use crate::field::F128;
 use crate::lincheck::{MatrixAssertion, VerifyError};
 use crate::matrix_fold::{self, FoldProof, MatrixClaim};
+use crate::r1cs::SparseBinaryMatrix;
 use crate::schedule::Registry;
 
 const DOMAIN: &[u8] = b"flock-aggregate-v0";
 
-/// The base matrices of one boolean type, `(A₀, B₀)` — any [`FoldMatrix`]
-/// pair. Materialized `SparseBinaryMatrix` refs coerce directly; walker
-/// types (stub matrices in the registry) supply a walked view instead, so
-/// the fold and the root discharge never need the composite materialized.
-pub type TypeMatrices<'a> = (
-    &'a dyn matrix_fold::FoldMatrix,
-    &'a dyn matrix_fold::FoldMatrix,
-);
+/// The base matrices of one boolean type, `(A₀, B₀)`.
+pub type TypeMatrices<'a> = (&'a SparseBinaryMatrix, &'a SparseBinaryMatrix);
 
 /// The base matrices of one element type, `(A₀, B₀)` — `F128` coefficients,
 /// not `GF(2)` supports.
@@ -345,8 +340,8 @@ pub fn prove_aggregate_classes<Ch: Challenger>(
                 circuits[t].fold_split(&qa.row.materialize())
             } else {
                 (
-                    ma.col_marginal(&qa.row.materialize(), n_cols),
-                    mb.col_marginal(&qb.row.materialize(), n_cols),
+                    matrix_fold::col_marginal(ma, &qa.row.materialize(), n_cols),
+                    matrix_fold::col_marginal(mb, &qb.row.materialize(), n_cols),
                 )
             };
             combs_a.push(xa);
