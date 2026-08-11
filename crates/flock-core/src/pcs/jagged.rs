@@ -3087,6 +3087,11 @@ pub fn prove_multipoint_twisted<C: Challenger>(
         if i + 1 == m {
             break;
         }
+        // NOT parallelized across pairs: measured on the node arm, a
+        // par_iter_mut here moved the round wall from 5.10 to 4.93 ms —
+        // rayon's work stealing already interleaves the two pairs' inner
+        // parallelism, so the join bought nothing but murkier per-pair
+        // attribution.
         let mut nxt = (F128::ZERO, F128::ZERO);
         for (pi, pair) in pairs.iter_mut().enumerate() {
             let t_pair = trace.then(std::time::Instant::now);
@@ -3729,6 +3734,28 @@ impl SparseGroupPair {
                 _ => ranges.push((s, e)),
             }
         }
+        // Segments are the PARALLEL GRAIN — build fill, message, and folds
+        // are serial within one — and gather support clusters into a few
+        // contiguous ranges (measured on the node arm: ~737k support words
+        // whose group folds ran SLOWER at 10 threads than 1). Split each
+        // range at aligned power-of-two cuts: aligned boundaries stay even
+        // under the fold's halving, so chunks never overlap-merge back into
+        // one serial segment before densify takes over. Same windows, same
+        // per-word fills, char-2 sums — bit-identical messages.
+        const SEG_CHUNK: usize = 1 << 14;
+        let ranges: Vec<(usize, usize)> = ranges
+            .into_iter()
+            .flat_map(|(s, e)| {
+                let mut cuts = Vec::with_capacity((e - s).div_ceil(SEG_CHUNK));
+                let mut a = s;
+                while a < e {
+                    let b = ((a / SEG_CHUNK + 1) * SEG_CHUNK).min(e);
+                    cuts.push((a, b));
+                    a = b;
+                }
+                cuts
+            })
+            .collect();
         let segs: Vec<SparseSeg> = ranges
             .par_iter()
             .map(|&(s, e)| {
