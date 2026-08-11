@@ -846,9 +846,8 @@ fn prove_union_with_binding<Ch: Challenger>(
     // and gather-after-GKR are data orderings WITHIN their own forks. The
     // verifier mirrors the forks under the same flag — an experimental
     // protocol VARIANT (different transcript), default off.
-    let par_transcript = std::env::var("FLOCK_PAR_TRANSCRIPT").is_ok()
-        && matches!(&binding, UnionProveBinding::Circuit(_))
-        && union.num_boolean() > 0;
+    let par_transcript =
+        matches!(&binding, UnionProveBinding::Circuit(_)) && union.num_boolean() > 0;
     let t_bool = std::time::Instant::now();
     let run_boolean = |challenger: &mut Ch| {
         (union.num_boolean() > 0).then(|| {

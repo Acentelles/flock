@@ -707,9 +707,8 @@ fn verify_union_piops<Ch: Challenger>(
         // on the other (run before the element class so both children's
         // closing digests merge at the prover's position). Same flag, same
         // labels, same order; an experimental protocol VARIANT, default off.
-        let par_transcript = std::env::var("FLOCK_PAR_TRANSCRIPT").is_ok()
-            && matches!(binding, UnionVerifyBinding::Circuit { .. })
-            && boolean.is_some();
+        let par_transcript =
+            matches!(binding, UnionVerifyBinding::Circuit { .. }) && boolean.is_some();
         // ONE-SIDED fork (the prover's shape): the boolean PIOP replays on
         // the PARENT transcript; only the wiring gets a child, forked
         // before the zerocheck and merged after it.

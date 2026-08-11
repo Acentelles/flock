@@ -3094,6 +3094,7 @@ fn emit_fs_chain(
     vals: &mut Vec<F128>,
     consts: &mut Vec<(F128, Wire)>,
     pub_payloads: &[bool],
+    cross: &[Option<(usize, usize)>],
 ) -> (Vec<Vec<Wire>>, Vec<Option<Wire>>) {
     use flock_core::transcript_record::StreamWord;
     use flock_prover::r1cs_hashes::fs_chain::CvSource;
@@ -3145,6 +3146,21 @@ fn emit_fs_chain(
                     } else {
                         match word_wire[wi] {
                             Some(w) => w,
+                            // A CROSS-LINK word is not an input at all: it IS
+                            // an earlier squeeze's output (the fork's seed on
+                            // the child side, the child's closing digest on
+                            // the parent's). Aliasing the wire is the whole
+                            // in-circuit cost of the fork — zero extra rows,
+                            // and the link is unforgeable because the row that
+                            // produced it is the same row the challenge came
+                            // from.
+                            None if cross.get(wi).copied().flatten().is_some() => {
+                                let (row, half) = cross[wi].unwrap();
+                                assert!(row < i, "cross-link word {wi} reads row {row} >= {i}");
+                                let w = outs[row][half];
+                                word_wire[wi] = Some(w);
+                                w
+                            }
                             None => {
                                 let v = F128::new(
                                     u64::from_le_bytes(
@@ -3188,6 +3204,184 @@ fn emit_fs_chain(
         outs.push(sb.gate(b3, &g_in));
     }
     (outs, word_wire)
+}
+
+/// Splice every fork's ops inline at its fork position and drop the `Merge`
+/// markers — the FLAT view of a forked transcript.
+///
+/// This is the whole locator story. Every region walker in this file resolves
+/// its position by `find(label)` over a flat op list and by counting
+/// value/challenge/finalize ops up to an index; a fork's ops sit inline at the
+/// fork slot (the recorder splices values, payloads and challenges at the
+/// fork-time bases for exactly this reason), so on the flattened view every
+/// label is found and every ordinal is the GLOBAL one. No walker changes, no
+/// chain index anywhere.
+fn flatten_ops(
+    ops: &[flock_core::transcript_record::TranscriptOp],
+) -> Vec<flock_core::transcript_record::TranscriptOp> {
+    use flock_core::transcript_record::TranscriptOp as Op;
+    let mut out = Vec::with_capacity(ops.len());
+    for op in ops {
+        match op {
+            Op::Forked { ops: child, .. } => out.extend(flatten_ops(child)),
+            Op::Merge { .. } => {}
+            other => out.push(other.clone()),
+        }
+    }
+    out
+}
+
+/// A forked transcript presented to the circuit as ONE chain.
+///
+/// The fork is two independent BLAKE3 chains, but the emitter, the region
+/// locators and every `trace.squeezes[fin]` site want a single linear
+/// numbering. So the child's rows are SPLICED into the parent's at the fork
+/// point — after the two seed squeezes, before the parent's post-fork absorbs
+/// — and every row index is remapped. The result is indistinguishable from an
+/// unforked trace except for four wires:
+///
+/// - the child's two opening seed words ARE the parent's two seed-squeeze
+///   outputs, and
+/// - the parent's two merge words ARE the child's two closing-squeeze outputs.
+///
+/// [`MergedChain::cross`] carries those four as (row, half) aliases, so they
+/// cost no gates and no rows: the emitter wires them instead of declaring
+/// inputs. Splicing at the fork point is what makes that possible — both
+/// sources are already emitted when their consumer's row comes up.
+struct MergedChain {
+    /// [`flatten_ops`] of the recorded ops — what every locator should walk.
+    ops: Vec<flock_core::transcript_record::TranscriptOp>,
+    /// Parent words then child words, in the same order as `trace`'s rows.
+    stream: flock_core::transcript_record::Stream,
+    bytes: Vec<u8>,
+    trace: flock_prover::r1cs_hashes::fs_chain::FsChainTrace,
+    /// Per merged word: `Some((row, half))` iff the word is a cross-link.
+    cross: Vec<Option<(usize, usize)>>,
+}
+
+/// Build the merged view from a recorded shape's ops and its parent stream.
+/// With no fork this is the identity (the trace the sites built by hand).
+fn merge_chain(
+    ops: &[flock_core::transcript_record::TranscriptOp],
+    stream: &flock_core::transcript_record::Stream,
+    values: &[F128],
+    payloads: &[Vec<u8>],
+) -> MergedChain {
+    use flock_core::transcript_record::StreamWord;
+    use flock_prover::r1cs_hashes::fs_chain::{CvSource, Link, trace_duplex_forked};
+    let chains = trace_duplex_forked(ops, stream, values, payloads);
+    let flat = flatten_ops(ops);
+    let parent_bytes = stream.to_bytes(values, payloads);
+    if chains.children.is_empty() {
+        let cross = vec![None; stream.words.len()];
+        return MergedChain {
+            ops: flat,
+            stream: stream.clone(),
+            bytes: parent_bytes,
+            trace: chains.parent,
+            cross,
+        };
+    }
+    assert_eq!(
+        chains.children.len(),
+        1,
+        "the one-sided fork has exactly one child"
+    );
+    let c = &chains.children[0];
+    let p = &chains.parent;
+    let cstream = &stream.forks[0].stream;
+    let cbytes = cstream.to_bytes(values, payloads);
+
+    // The splice point: after BOTH seed squeezes (`seed_squeeze` names the
+    // first of the pair), which is where the flattened ops put the child.
+    let last_seed = c.seed_squeeze + 1;
+    let p_split = p.squeezes[last_seed].iter().copied().max().unwrap() + 1;
+    let nc = c.trace.rows.len();
+    let pmap = |r: usize| if r < p_split { r } else { r + nc };
+    let cmap = |r: usize| p_split + r;
+    let remap = |l: &Link, f: &dyn Fn(usize) -> usize| Link {
+        cv: match l.cv {
+            CvSource::Iv => CvSource::Iv,
+            CvSource::Row(r) => CvSource::Row(f(r)),
+        },
+        right: l.right.map(&*f),
+        repeats: l.repeats.map(&*f),
+    };
+
+    let woff = stream.words.len();
+    let boff = parent_bytes.len();
+    debug_assert_eq!(boff, woff * 16, "words are 16 bytes");
+
+    let mut rows = p.rows[..p_split].to_vec();
+    rows.extend_from_slice(&c.trace.rows);
+    rows.extend_from_slice(&p.rows[p_split..]);
+    let mut links: Vec<Link> = p.links[..p_split].iter().map(|l| remap(l, &pmap)).collect();
+    links.extend(c.trace.links.iter().map(|l| remap(l, &cmap)));
+    links.extend(p.links[p_split..].iter().map(|l| remap(l, &pmap)));
+    let mut block_offsets = p.block_offsets[..p_split].to_vec();
+    block_offsets.extend(c.trace.block_offsets.iter().map(|o| o.map(|b| b + boff)));
+    block_offsets.extend_from_slice(&p.block_offsets[p_split..]);
+    let mut squeezes: Vec<Vec<usize>> = p.squeezes[..=last_seed]
+        .iter()
+        .map(|s| s.iter().copied().map(pmap).collect())
+        .collect();
+    squeezes.extend(
+        c.trace
+            .squeezes
+            .iter()
+            .map(|s| s.iter().copied().map(cmap).collect::<Vec<_>>()),
+    );
+    squeezes.extend(
+        p.squeezes[last_seed + 1..]
+            .iter()
+            .map(|s| s.iter().copied().map(pmap).collect::<Vec<_>>()),
+    );
+
+    let mut words = stream.words.clone();
+    words.extend(cstream.words.iter().cloned());
+    let mut finalize_after: Vec<usize> = stream.finalize_after[..=last_seed].to_vec();
+    finalize_after.extend(cstream.finalize_after.iter().map(|w| w + woff));
+    finalize_after.extend_from_slice(&stream.finalize_after[last_seed + 1..]);
+    let mut bytes = parent_bytes;
+    bytes.extend_from_slice(&cbytes);
+
+    // The four cross-links. Each side's pair is two CONSECUTIVE
+    // `ObserveScalar`s, and the walk emits [header, value] per observe — so
+    // the second word sits two after the first.
+    let mut cross = vec![None; words.len()];
+    let mut link_word = |wi: usize, row: usize| {
+        assert!(
+            matches!(words[wi], StreamWord::Value(_)),
+            "cross-link word {wi} is not an observed value"
+        );
+        cross[wi] = Some((row, 0));
+    };
+    for (k, half) in [(c.seed_squeeze, 0usize), (c.seed_squeeze + 1, 1)] {
+        link_word(woff + c.child_seed_word + 2 * half, pmap(p.squeezes[k][0]));
+    }
+    for (k, half) in [(c.digest_squeeze, 0usize), (c.digest_squeeze + 1, 1)] {
+        link_word(
+            c.parent_digest_word + 2 * half,
+            cmap(c.trace.squeezes[k][0]),
+        );
+    }
+
+    MergedChain {
+        ops: flat,
+        stream: flock_core::transcript_record::Stream {
+            words,
+            finalize_after,
+            forks: Vec::new(),
+        },
+        bytes,
+        trace: flock_prover::r1cs_hashes::fs_chain::FsChainTrace {
+            rows,
+            links,
+            squeezes,
+            block_offsets,
+        },
+        cross,
+    }
 }
 
 /// The sumcheck-spine gate: one fold-and-eval step of the verifier's running
@@ -4901,7 +5095,7 @@ fn mvp7_real_query_phase() {
     assert_eq!(lig.recursive_proofs.len(), r - 1, "levels with opens = r + 1");
     let lvl_src = level_sources(lig);
     let (start_v, piop, gammas, w_rounds, mp, inner_pd, yr_v, levels) =
-        parse_open_levels(t_shape.ops(), 32 * lig.initial_cap.len(), r);
+        parse_open_levels(&flatten_ops(t_shape.ops()), 32 * lig.initial_cap.len(), r);
     let piop = piop.expect("the element PIOP");
     assert_eq!(levels.len(), r + 1);
 
@@ -4969,13 +5163,9 @@ fn mvp7_real_query_phase() {
         use flock_core::transcript_record::TranscriptOp as Op;
         let mut out = Vec::new();
         let (mut fin, mut pay) = (0usize, 0usize);
-        for op in t_shape.ops() {
+        for op in flatten_ops(t_shape.ops()) {
             if let Op::Pow { bits } = op {
-                out.push(PowRec {
-                    fin,
-                    pay,
-                    bits: *bits,
-                });
+                out.push(PowRec { fin, pay, bits });
             }
             if op.finalizes() {
                 fin += 1;
@@ -5064,7 +5254,7 @@ fn mvp7_real_query_phase() {
     vals.extend_from_slice(&iv_w);
     let iv = [sb.public_input(), sb.public_input()];
     let mut consts: Vec<(F128, Wire)> = Vec::new();
-    let mut pub_payloads = bytes_payload_mask(t_shape.ops());
+    let mut pub_payloads = bytes_payload_mask(&flatten_ops(t_shape.ops()));
     let cap_pays = cap_payloads(&stream, &bytes, &lvl_src);
     for &p in &cap_pays[1..] {
         pub_payloads[p] = false;
@@ -5079,6 +5269,7 @@ fn mvp7_real_query_phase() {
         &mut vals,
         &mut consts,
         &pub_payloads,
+        &[],
     );
     // Observed-value index -> absorbed-stream word index, for wiring the
     // sumcheck messages (they are absorbed proof scalars, so their wires
@@ -7696,7 +7887,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
     // wires have named indices — the MVP-8-step-1 pattern.
     {
         use flock_core::transcript_record::TranscriptOp as Op2;
-        let ops = t_shape.ops();
+        let ops = flatten_ops(t_shape.ops());
         let (mut v, mut c, mut i) = (0usize, 0usize, 0usize);
         let bump = |op: &Op2, v: &mut usize, c: &mut usize| match op {
             Op2::SqueezeScalar => *c += 1,
@@ -7832,7 +8023,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
 
     // Locate the multipoint region with a minimal cursor (value/challenge
     // ordinals), exactly as parse_open_levels does for the element inner.
-    let ops = t_shape.ops();
+    let ops = flatten_ops(t_shape.ops());
     let (mut v, mut c, mut i) = (0usize, 0usize, 0usize);
     let bump = |op: &Op, v: &mut usize, c: &mut usize| {
         match op {
@@ -8029,7 +8220,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         let r = lig.recursive_caps.len();
         let lvl_src = level_sources(lig);
         let (start_v, piop_o, gammas_o, w_rounds, _mp2, inner_pd2, yr_v2, levels) =
-            parse_open_levels(t_shape.ops(), 32 * lig.initial_cap.len(), r);
+            parse_open_levels(&flatten_ops(t_shape.ops()), 32 * lig.initial_cap.len(), r);
         assert!(piop_o.is_none(), "a boolean tape has no element PIOP");
         assert!(gammas_o.is_empty(), "no packed-direct claims at the leaf");
         assert_eq!(levels.len(), r + 1);
@@ -8037,19 +8228,21 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         let (geo, native_sums) =
             level_geometry(&levels, &lvl_src, &chals, HashKind::Blake3, &strat_scheds(&leaf_pcs));
 
-        let stream = t_shape.stream_words_duplex(DOMAIN);
-        let bytes = stream.to_bytes(rec.values(), rec.payloads());
-        let mut chain = FsChainSponge::new();
-        let mut at = 0usize;
-        let fin_ops: Vec<_> = t_shape.ops().iter().filter(|o| o.finalizes()).collect();
-        assert_eq!(stream.finalize_after.len(), fin_ops.len(), "finalize alignment");
-        for (k, &upto) in stream.finalize_after.iter().enumerate() {
-            chain.absorb(&bytes[at * 16..upto * 16]);
-            at = upto;
-            chain.finalize(fin_ops[k].squeezed_bytes());
-        }
-        chain.absorb(&bytes[at * 16..]);
-        let trace = chain.finish();
+        // The transcript is FORKED (the wiring runs on its own chain);
+        // `merge_chain` splices the child's rows in at the fork point and
+        // hands back one linear numbering plus the four cross-link wires.
+        let MergedChain {
+            stream,
+            bytes,
+            trace,
+            cross,
+            ..
+        } = merge_chain(
+            t_shape.ops(),
+            &t_shape.stream_words_duplex(DOMAIN),
+            rec.values(),
+            rec.payloads(),
+        );
         let b3_rows: usize = trace.rows.len()
             + geo
                 .iter()
@@ -8112,7 +8305,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         vals.extend_from_slice(&iv_w);
         let iv = [sb.public_input(), sb.public_input()];
         let mut consts: Vec<(F128, Wire)> = Vec::new();
-        let mut pub_payloads = bytes_payload_mask(ops);
+        let mut pub_payloads = bytes_payload_mask(&ops);
         let cap_pays = cap_payloads(&stream, &bytes, &lvl_src);
         for &p in &cap_pays[1..] {
             pub_payloads[p] = false;
@@ -8127,6 +8320,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             &mut vals,
             &mut consts,
             &pub_payloads,
+            &cross,
         );
 
         // The PoW grinding ops, located and bound (the mvp7 machinery).
@@ -8139,13 +8333,9 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             use flock_core::transcript_record::TranscriptOp as Op3;
             let mut out = Vec::new();
             let (mut fin, mut pay) = (0usize, 0usize);
-            for op in t_shape.ops() {
+            for op in flatten_ops(t_shape.ops()) {
                 if let Op3::Pow { bits } = op {
-                    out.push(PowRec {
-                        fin,
-                        pay,
-                        bits: *bits,
-                    });
+                    out.push(PowRec { fin, pay, bits });
                 }
                 if op.finalizes() {
                     fin += 1;
@@ -8306,7 +8496,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         // with published-zero deltas — family I, no in-circuit inversion.
         let zc0 = {
             use flock_core::transcript_record::TranscriptOp as Op4;
-            let ops2 = t_shape.ops();
+            let ops2 = flatten_ops(t_shape.ops());
             let (mut v2, mut c2, mut f2, mut i2) = (0usize, 0usize, 0usize, 0usize);
             let bump2 = |op: &Op4, v: &mut usize, c: &mut usize, f: &mut usize| {
                 if op.finalizes() {
@@ -8549,7 +8739,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         // checker-native with the family-H batch.
         let (mp_gamma_ch, mp_gamma_fin, mp_rounds3, mp_anchor_v, mp_anchor_rounds3) = {
             use flock_core::transcript_record::TranscriptOp as Op5;
-            let ops3 = t_shape.ops();
+            let ops3 = flatten_ops(t_shape.ops());
             let (mut v3, mut c3, mut f3, mut i3) = (0usize, 0usize, 0usize, 0usize);
             let bump3 = |op: &Op5, v: &mut usize, c: &mut usize, f: &mut usize| {
                 if op.finalizes() {
@@ -9370,6 +9560,8 @@ struct RealTape<'p> {
     trace: flock_prover::r1cs_hashes::fs_chain::FsChainTrace,
     stream: flock_core::transcript_record::Stream,
     bytes: Vec<u8>,
+    /// The fork's four cross-link wires ([`MergedChain::cross`]).
+    cross: Vec<Option<(usize, usize)>>,
     b3_rows: usize,
     spread_w: usize,
     // located regions
@@ -9502,8 +9694,8 @@ impl<'p> RealTape<'p> {
         let t_shape = rec.shape();
         let chals: Vec<F128> = rec.challenges().to_vec();
         let vals_rec: Vec<F128> = rec.values().to_vec();
-        let ops = t_shape.ops();
-        let mut pub_payloads = bytes_payload_mask(ops);
+        let ops = flatten_ops(t_shape.ops());
+        let mut pub_payloads = bytes_payload_mask(&ops);
         // Prefix sums over the op tape — the locate walks below call these
         // per feature and per ROUND (437 rounds at node scale), so a
         // rescan-per-call is quadratic in practice. One pass, O(1) lookups.
@@ -9515,7 +9707,7 @@ impl<'p> RealTape<'p> {
             pre_v.push(0);
             pre_c.push(0);
             pre_f.push(0);
-            for op in ops {
+            for op in &ops {
                 match op {
                     Op::SqueezeScalar => c += 1,
                     Op::SqueezeSlice(n) => c += n,
@@ -9560,8 +9752,16 @@ impl<'p> RealTape<'p> {
             "one region each"
         );
         assert_eq!((mo_l.len(), rs_l.len(), mp_l.len(), fa_l.len()), (1, 2, 1, 1));
+        // THE FORKED ORDER. The wiring argument runs on its own chain, and
+        // the flattened view splices it in at the fork point — so the GKR
+        // region now PRECEDES the boolean PIOP instead of following the
+        // element's. Everything downstream of the merge is unmoved.
+        assert!(
+            gkr_l[0] < zc_l[0],
+            "the wiring fork precedes the boolean PIOP"
+        );
         assert!(zc_l[0] < lc_l[0] && lc_l[0] < elzc_l[0] && elzc_l[0] < el_l[0]);
-        assert!(el_l[0] < gkr_l[0] && gkr_l[0] < mo_l[0]);
+        assert!(el_l[0] < mo_l[0]);
         assert!(mo_l[0] < rs_l[0] && rs_l[1] < mp_l[0] && mp_l[0] < fa_l[0]);
 
         // parse_open_levels + level_geometry — the assembly's own walkers,
@@ -9570,7 +9770,7 @@ impl<'p> RealTape<'p> {
         let r = lig.recursive_caps.len();
         let lvl_src = level_sources(lig);
         let (start_v_i, piop_i, gammas_i, w_rounds, mp_i, inner_pd_i, yr_v_i, levels) =
-            parse_open_levels(ops, 32 * lig.initial_cap.len(), r);
+            parse_open_levels(&ops, 32 * lig.initial_cap.len(), r);
         assert_eq!(levels.len(), r + 1);
         let piop_i = piop_i.expect("the real inner HAS an element PIOP");
         assert!(!piop_i.zc_rounds.is_empty() && !piop_i.lc_rounds.is_empty());
@@ -9738,25 +9938,21 @@ impl<'p> RealTape<'p> {
         let h_rows = lo.public.len().div_ceil(4) + 2 * lo.public.len().div_ceil(64);
 
         // ---- the chain materials ----
-        let stream = t_shape.stream_words_duplex(domain);
-        let bytes = stream.to_bytes(rec.values(), rec.payloads());
-        let trace = {
-            let mut chain = FsChainSponge::new();
-            let mut at = 0usize;
-            let fin_ops: Vec<_> = ops.iter().filter(|o| o.finalizes()).collect();
-            assert_eq!(
-                stream.finalize_after.len(),
-                fin_ops.len(),
-                "finalize alignment"
-            );
-            for (k, &upto) in stream.finalize_after.iter().enumerate() {
-                chain.absorb(&bytes[at * 16..upto * 16]);
-                at = upto;
-                chain.finalize(fin_ops[k].squeezed_bytes());
-            }
-            chain.absorb(&bytes[at * 16..]);
-            chain.finish()
-        };
+        // The transcript is FORKED (the wiring runs on its own chain);
+        // `merge_chain` splices the child's rows in at the fork point and
+        // hands back one linear numbering plus the four cross-link wires.
+        let MergedChain {
+            stream,
+            bytes,
+            trace,
+            cross,
+            ..
+        } = merge_chain(
+            t_shape.ops(),
+            &t_shape.stream_words_duplex(domain),
+            rec.values(),
+            rec.payloads(),
+        );
         let b3_rows = trace.rows.len()
             + h_rows
             + geo
@@ -9878,7 +10074,7 @@ impl<'p> RealTape<'p> {
         let pows: Vec<(usize, usize, u32)> = {
             let mut out = Vec::new();
             let (mut fin, mut pay) = (0usize, 0usize);
-            for op in ops {
+            for op in &ops {
                 if let Op::Pow { bits } = op {
                     out.push((fin, pay, *bits));
                 }
@@ -10580,6 +10776,7 @@ impl<'p> RealTape<'p> {
             trace,
             stream,
             bytes,
+            cross,
             b3_rows,
             spread_w,
             gkr: gkr_rec,
@@ -10769,6 +10966,7 @@ fn emit_real_child_region(
         vals,
         consts,
         &rt.pub_payloads,
+        &rt.cross,
     );
 
     cen.push(("chain payloads + shared consts", sb.public_len(), sb.rows_in_slot(cs.macs)));
@@ -13012,7 +13210,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
 
     // ---- the fold tape, pinned op-for-op ----
     let t_shape = rec.shape();
-    let ops = t_shape.ops();
+    let ops = flatten_ops(t_shape.ops());
     let vals_rec = rec.values();
     let chals = rec.challenges();
     let mut want: Vec<Op> = vec![
@@ -13075,19 +13273,21 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
         use flock_prover::prover::UnionElementSlotInput;
         use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
-        let stream = t_shape.stream_words_duplex(FL_DOMAIN);
-        let bytes = stream.to_bytes(rec.values(), rec.payloads());
-        let mut chain = FsChainSponge::new();
-        let mut at = 0usize;
-        let fin_ops: Vec<_> = t_shape.ops().iter().filter(|o| o.finalizes()).collect();
-        assert_eq!(stream.finalize_after.len(), fin_ops.len(), "finalize alignment");
-        for (k, &upto) in stream.finalize_after.iter().enumerate() {
-            chain.absorb(&bytes[at * 16..upto * 16]);
-            at = upto;
-            chain.finalize(fin_ops[k].squeezed_bytes());
-        }
-        chain.absorb(&bytes[at * 16..]);
-        let trace = chain.finish();
+        // The transcript is FORKED (the wiring runs on its own chain);
+        // `merge_chain` splices the child's rows in at the fork point and
+        // hands back one linear numbering plus the four cross-link wires.
+        let MergedChain {
+            stream,
+            bytes,
+            trace,
+            cross,
+            ..
+        } = merge_chain(
+            t_shape.ops(),
+            &t_shape.stream_words_duplex(FL_DOMAIN),
+            rec.values(),
+            rec.payloads(),
+        );
 
         let b3_rows = tapes.iter().map(|t| t.b3_rows).sum::<usize>() + trace.rows.len();
         let nu2_content = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7);
@@ -13155,7 +13355,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
         vals.extend_from_slice(&iv_w);
         let iv2 = [sb.public_input(), sb.public_input()];
         let mut consts: Vec<(F128, Wire)> = Vec::new();
-        let pub_payloads = bytes_payload_mask(ops);
+        let pub_payloads = bytes_payload_mask(&ops);
         let (chain_outs, ww) = emit_fs_chain(
             &mut sb,
             b3s,
@@ -13166,6 +13366,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
             &mut vals,
             &mut consts,
             &pub_payloads,
+            &cross,
         );
         let mut vmap: Vec<Option<usize>> = Vec::new();
         for (wi, w) in stream.words.iter().enumerate() {
@@ -14417,6 +14618,8 @@ struct ChildTape<'p> {
     trace: flock_prover::r1cs_hashes::fs_chain::FsChainTrace,
     stream: flock_core::transcript_record::Stream,
     bytes: Vec<u8>,
+    /// The fork's four cross-link wires ([`MergedChain::cross`]).
+    cross: Vec<Option<(usize, usize)>>,
     b3_rows: usize,
     spread_w: usize,
     /// The recording verify's wall time — the ONLINE tape-source cost (the
@@ -14539,7 +14742,7 @@ impl<'p> ChildTape<'p> {
         let t_shape = rec.shape();
         let chals: Vec<F128> = rec.challenges().to_vec();
         let vals_rec: Vec<F128> = rec.values().to_vec();
-        let ops: Vec<Op> = t_shape.ops().to_vec();
+        let ops: Vec<Op> = flatten_ops(t_shape.ops()).to_vec();
         let mut pub_payloads = bytes_payload_mask(&ops);
 
         // ---- the label map: the region order the assembly builds against ----
@@ -14568,14 +14771,18 @@ impl<'p> ChildTape<'p> {
             assert_eq!(el_l.len(), 1, "one element lincheck region");
             assert!(elzc_l[0] < el_l[0], "element zc before element lc");
             assert!(lc_l[0] < el_l[0], "boolean PIOP before element PIOP");
-            assert!(el_l[0] < gkr_l[0], "element PIOP before the wiring GKR");
         } else {
             assert!(
                 elzc_l.is_empty() && el_l.is_empty(),
                 "a boolean-only tape carries NO element region"
             );
-            assert!(lc_l[0] < gkr_l[0], "boolean PIOP before the wiring GKR");
         }
+        // THE FORKED ORDER: the wiring argument's chain is spliced in at the
+        // fork point, so its region precedes the boolean PIOP's.
+        assert!(
+            gkr_l[0] < zc_l[0],
+            "the wiring fork precedes the boolean PIOP"
+        );
         assert_eq!(gkr_l.len(), 1, "one batched wiring GKR");
         assert_eq!(mo_l.len(), 1, "one merged open");
         assert_eq!(rs_l.len(), 2, "rs x 2 — one ab/c pair for the boolean class");
@@ -14950,25 +15157,21 @@ impl<'p> ChildTape<'p> {
         let h_rows = n_pub_i.div_ceil(4) + 2 * n_pub_i.div_ceil(64);
 
         // ---- the chain materials ----
-        let stream = t_shape.stream_words_duplex(domain);
-        let bytes = stream.to_bytes(rec.values(), rec.payloads());
-        let trace = {
-            let mut chain = FsChainSponge::new();
-            let mut at = 0usize;
-            let fin_ops: Vec<_> = t_shape.ops().iter().filter(|o| o.finalizes()).collect();
-            assert_eq!(
-                stream.finalize_after.len(),
-                fin_ops.len(),
-                "finalize alignment"
-            );
-            for (k, &upto) in stream.finalize_after.iter().enumerate() {
-                chain.absorb(&bytes[at * 16..upto * 16]);
-                at = upto;
-                chain.finalize(fin_ops[k].squeezed_bytes());
-            }
-            chain.absorb(&bytes[at * 16..]);
-            chain.finish()
-        };
+        // The transcript is FORKED (the wiring runs on its own chain);
+        // `merge_chain` splices the child's rows in at the fork point and
+        // hands back one linear numbering plus the four cross-link wires.
+        let MergedChain {
+            stream,
+            bytes,
+            trace,
+            cross,
+            ..
+        } = merge_chain(
+            t_shape.ops(),
+            &t_shape.stream_words_duplex(domain),
+            rec.values(),
+            rec.payloads(),
+        );
 
         // ---- the open-phase walk + geometry ----
         let lig = &proof.pcs_open.inner.ligerito;
@@ -15684,6 +15887,7 @@ impl<'p> ChildTape<'p> {
             trace,
             stream,
             bytes,
+            cross,
             b3_rows,
             spread_w,
             verify_ms,
@@ -15970,6 +16174,7 @@ fn emit_child_region(
         vals,
         consts,
         &ct.pub_payloads,
+        &ct.cross,
     );
     // ---- ROUND 2: the H(publics) region (v2 statement binding) ----
     // The returned wires ARE the child's public segment — the recombination
@@ -17138,7 +17343,7 @@ fn mvp11_sigma_fold_tape() {
     // slice observes — no PoW, no vec squeezes — so the challenge ordinal
     // IS the finalization ordinal, which is what wires the chain squeezes.
     let t_shape = rec.shape();
-    let ops = t_shape.ops();
+    let ops = flatten_ops(t_shape.ops());
     let vals_rec = rec.values();
     let chals = rec.challenges();
     let mut want: Vec<Op> = vec![Op::Label(b"flock-matrix-fold-v0".to_vec())];
@@ -17284,23 +17489,21 @@ fn mvp11_sigma_fold_tape() {
         use flock_prover::prover::UnionElementSlotInput;
         use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
-        let stream = t_shape.stream_words_duplex(M11_DOMAIN);
-        let bytes = stream.to_bytes(rec.values(), rec.payloads());
-        let mut chain = FsChainSponge::new();
-        let mut at = 0usize;
-        let fin_ops: Vec<_> = t_shape.ops().iter().filter(|o| o.finalizes()).collect();
-        assert_eq!(
-            stream.finalize_after.len(),
-            fin_ops.len(),
-            "finalize alignment"
+        // The transcript is FORKED (the wiring runs on its own chain);
+        // `merge_chain` splices the child's rows in at the fork point and
+        // hands back one linear numbering plus the four cross-link wires.
+        let MergedChain {
+            stream,
+            bytes,
+            trace,
+            cross,
+            ..
+        } = merge_chain(
+            t_shape.ops(),
+            &t_shape.stream_words_duplex(M11_DOMAIN),
+            rec.values(),
+            rec.payloads(),
         );
-        for (k, &upto) in stream.finalize_after.iter().enumerate() {
-            chain.absorb(&bytes[at * 16..upto * 16]);
-            at = upto;
-            chain.finalize(fin_ops[k].squeezed_bytes());
-        }
-        chain.absorb(&bytes[at * 16..]);
-        let trace = chain.finish();
 
         let b3_rows = trace.rows.len();
         // Floor the capacity at 2^7 rows: the registered Ligerito configs
@@ -17319,7 +17522,7 @@ fn mvp11_sigma_fold_tape() {
         vals.extend_from_slice(&iv_w);
         let iv2 = [sb.public_input(), sb.public_input()];
         let mut consts: Vec<(F128, Wire)> = Vec::new();
-        let pub_payloads = bytes_payload_mask(ops);
+        let pub_payloads = bytes_payload_mask(&ops);
         let (outs, ww) = emit_fs_chain(
             &mut sb,
             b3s,
@@ -17330,6 +17533,7 @@ fn mvp11_sigma_fold_tape() {
             &mut vals,
             &mut consts,
             &pub_payloads,
+            &cross,
         );
         let mut vmap: Vec<Option<usize>> = Vec::new();
         for (wi, w) in stream.words.iter().enumerate() {
@@ -17647,7 +17851,7 @@ fn mvp11_jagged_fold_tape() {
 
     // ---- the tape structure, pinned op-for-op ----
     let t_shape = rec.shape();
-    let ops = t_shape.ops();
+    let ops = flatten_ops(t_shape.ops());
     let vals_rec = rec.values();
     let chals = rec.challenges();
     let mut want: Vec<Op> = vec![
@@ -17849,23 +18053,21 @@ fn mvp11_jagged_fold_tape() {
         use flock_prover::prover::UnionElementSlotInput;
         use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
-        let stream = t_shape.stream_words_duplex(M11J_DOMAIN);
-        let bytes = stream.to_bytes(rec.values(), rec.payloads());
-        let mut chain = FsChainSponge::new();
-        let mut at = 0usize;
-        let fin_ops: Vec<_> = t_shape.ops().iter().filter(|o| o.finalizes()).collect();
-        assert_eq!(
-            stream.finalize_after.len(),
-            fin_ops.len(),
-            "finalize alignment"
+        // The transcript is FORKED (the wiring runs on its own chain);
+        // `merge_chain` splices the child's rows in at the fork point and
+        // hands back one linear numbering plus the four cross-link wires.
+        let MergedChain {
+            stream,
+            bytes,
+            trace,
+            cross,
+            ..
+        } = merge_chain(
+            t_shape.ops(),
+            &t_shape.stream_words_duplex(M11J_DOMAIN),
+            rec.values(),
+            rec.payloads(),
         );
-        for (k, &upto) in stream.finalize_after.iter().enumerate() {
-            chain.absorb(&bytes[at * 16..upto * 16]);
-            at = upto;
-            chain.finalize(fin_ops[k].squeezed_bytes());
-        }
-        chain.absorb(&bytes[at * 16..]);
-        let trace = chain.finish();
 
         let b3_rows = trace.rows.len();
         let nu2 = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7);
@@ -17881,7 +18083,7 @@ fn mvp11_jagged_fold_tape() {
         vals.extend_from_slice(&iv_w);
         let iv2 = [sb.public_input(), sb.public_input()];
         let mut consts: Vec<(F128, Wire)> = Vec::new();
-        let pub_payloads = bytes_payload_mask(ops);
+        let pub_payloads = bytes_payload_mask(&ops);
         let (outs, ww) = emit_fs_chain(
             &mut sb,
             b3s,
@@ -17892,6 +18094,7 @@ fn mvp11_jagged_fold_tape() {
             &mut vals,
             &mut consts,
             &pub_payloads,
+            &cross,
         );
         let mut vmap: Vec<Option<usize>> = Vec::new();
         for (wi, w) in stream.words.iter().enumerate() {
@@ -19430,7 +19633,7 @@ fn mvp11_merge_fold_region() {
     // aggregate order. Every finalizing op is a scalar squeeze, so the
     // challenge ordinal is the finalization ordinal — same as step 1.
     let t_shape = rec.shape();
-    let ops = t_shape.ops();
+    let ops = flatten_ops(t_shape.ops());
     let vals_rec = rec.values();
     let chals = rec.challenges();
     let mut want: Vec<Op> = vec![
@@ -19498,24 +19701,21 @@ fn mvp11_merge_fold_region() {
         use flock_prover::prover::UnionElementSlotInput;
         use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
-        let stream = t_shape.stream_words_duplex(M11_MERGE_DOMAIN);
-        let bytes = stream.to_bytes(rec.values(), rec.payloads());
-        let mut chain = FsChainSponge::new();
-        let mut at = 0usize;
-        let fin_ops: Vec<_> = t_shape.ops().iter().filter(|o| o.finalizes()).collect();
-        assert_eq!(
-            stream.finalize_after.len(),
-            fin_ops.len(),
-            "finalize alignment"
+        // The transcript is FORKED (the wiring runs on its own chain);
+        // `merge_chain` splices the child's rows in at the fork point and
+        // hands back one linear numbering plus the four cross-link wires.
+        let MergedChain {
+            stream,
+            bytes,
+            trace,
+            cross,
+            ..
+        } = merge_chain(
+            t_shape.ops(),
+            &t_shape.stream_words_duplex(M11_MERGE_DOMAIN),
+            rec.values(),
+            rec.payloads(),
         );
-        assert_eq!(fin_ops.len(), chals.len(), "every finalizer is a scalar squeeze");
-        for (k, &upto) in stream.finalize_after.iter().enumerate() {
-            chain.absorb(&bytes[at * 16..upto * 16]);
-            at = upto;
-            chain.finalize(fin_ops[k].squeezed_bytes());
-        }
-        chain.absorb(&bytes[at * 16..]);
-        let trace = chain.finish();
 
         // The b3 slot carries all three chains (child0, child1, fold) plus
         // the children's query-phase openings — size the row capacity once.
@@ -19545,7 +19745,7 @@ fn mvp11_merge_fold_region() {
         vals.extend_from_slice(&iv_w);
         let iv2 = [sb.public_input(), sb.public_input()];
         let mut consts: Vec<(F128, Wire)> = Vec::new();
-        let pub_payloads = bytes_payload_mask(ops);
+        let pub_payloads = bytes_payload_mask(&ops);
         let (chain_outs, ww) = emit_fs_chain(
             &mut sb,
             b3s,
@@ -19556,6 +19756,7 @@ fn mvp11_merge_fold_region() {
             &mut vals,
             &mut consts,
             &pub_payloads,
+            &cross,
         );
         let mut vmap: Vec<Option<usize>> = Vec::new();
         for (wi, w) in stream.words.iter().enumerate() {
@@ -20239,7 +20440,7 @@ fn mvp11_swap_children_fold_scale() {
 
     // ---- the tape, pinned through the width-driven helpers ----
     let t_shape = rec.shape();
-    let ops = t_shape.ops();
+    let ops = flatten_ops(t_shape.ops());
     let vals_rec = rec.values();
     let chals = rec.challenges();
     let mut want: Vec<Op> = vec![
@@ -20286,24 +20487,21 @@ fn mvp11_swap_children_fold_scale() {
         use flock_prover::prover::UnionElementSlotInput;
         use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
-        let stream = t_shape.stream_words_duplex(M11_SCALE_DOMAIN);
-        let bytes = stream.to_bytes(rec.values(), rec.payloads());
-        let mut chain = FsChainSponge::new();
-        let mut at = 0usize;
-        let fin_ops: Vec<_> = t_shape.ops().iter().filter(|o| o.finalizes()).collect();
-        assert_eq!(
-            stream.finalize_after.len(),
-            fin_ops.len(),
-            "finalize alignment"
+        // The transcript is FORKED (the wiring runs on its own chain);
+        // `merge_chain` splices the child's rows in at the fork point and
+        // hands back one linear numbering plus the four cross-link wires.
+        let MergedChain {
+            stream,
+            bytes,
+            trace,
+            cross,
+            ..
+        } = merge_chain(
+            t_shape.ops(),
+            &t_shape.stream_words_duplex(M11_SCALE_DOMAIN),
+            rec.values(),
+            rec.payloads(),
         );
-        assert_eq!(fin_ops.len(), chals.len(), "every finalizer is a scalar squeeze");
-        for (k, &upto) in stream.finalize_after.iter().enumerate() {
-            chain.absorb(&bytes[at * 16..upto * 16]);
-            at = upto;
-            chain.finalize(fin_ops[k].squeezed_bytes());
-        }
-        chain.absorb(&bytes[at * 16..]);
-        let trace = chain.finish();
 
         let b3_rows = trace.rows.len();
         let nu2 = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7);
@@ -20320,7 +20518,7 @@ fn mvp11_swap_children_fold_scale() {
         vals.extend_from_slice(&iv_w);
         let iv2 = [sb.public_input(), sb.public_input()];
         let mut consts: Vec<(F128, Wire)> = Vec::new();
-        let pub_payloads = bytes_payload_mask(ops);
+        let pub_payloads = bytes_payload_mask(&ops);
         let (chain_outs, ww) = emit_fs_chain(
             &mut sb,
             b3s,
@@ -20331,6 +20529,7 @@ fn mvp11_swap_children_fold_scale() {
             &mut vals,
             &mut consts,
             &pub_payloads,
+            &cross,
         );
         let mut vmap: Vec<Option<usize>> = Vec::new();
         for (wi, w) in stream.words.iter().enumerate() {
@@ -21000,7 +21199,7 @@ fn build_node_outer_app(
 
     // ---- the fold tape, pinned through the width-driven helpers ----
     let t_shape = rec.shape();
-    let ops = t_shape.ops();
+    let ops = flatten_ops(t_shape.ops());
     let vals_rec = rec.values();
     let chals = rec.challenges();
     let mut want: Vec<Op> = vec![
@@ -21154,7 +21353,7 @@ fn build_node_outer_app(
             &lagg.folds[0].1,
             &lagg.sigma_folds[0],
         ];
-        let lops: Vec<Op> = lrec.shape().ops().to_vec();
+        let lops: Vec<Op> = flatten_ops(lrec.shape().ops());
         let lvals: Vec<F128> = lrec.values().to_vec();
         let lchals: Vec<F128> = lrec.challenges().to_vec();
         let mut want: Vec<Op> = vec![
@@ -21219,24 +21418,21 @@ fn build_node_outer_app(
         use flock_prover::prover::UnionElementSlotInput;
         use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
-        let stream = t_shape.stream_words_duplex(M11_NODE_DOMAIN);
-        let bytes = stream.to_bytes(rec.values(), rec.payloads());
-        let mut chain = FsChainSponge::new();
-        let mut at = 0usize;
-        let fin_ops: Vec<_> = t_shape.ops().iter().filter(|o| o.finalizes()).collect();
-        assert_eq!(
-            stream.finalize_after.len(),
-            fin_ops.len(),
-            "finalize alignment"
+        // The transcript is FORKED (the wiring runs on its own chain);
+        // `merge_chain` splices the child's rows in at the fork point and
+        // hands back one linear numbering plus the four cross-link wires.
+        let MergedChain {
+            stream,
+            bytes,
+            trace,
+            cross,
+            ..
+        } = merge_chain(
+            t_shape.ops(),
+            &t_shape.stream_words_duplex(M11_NODE_DOMAIN),
+            rec.values(),
+            rec.payloads(),
         );
-        assert_eq!(fin_ops.len(), chals.len(), "every finalizer is a scalar squeeze");
-        for (k, &upto) in stream.finalize_after.iter().enumerate() {
-            chain.absorb(&bytes[at * 16..upto * 16]);
-            at = upto;
-            chain.finalize(fin_ops[k].squeezed_bytes());
-        }
-        chain.absorb(&bytes[at * 16..]);
-        let trace = chain.finish();
 
         let b3_rows = rts.iter().map(|rt| rt.b3_rows).sum::<usize>() + trace.rows.len();
         // MEASURED AND REJECTED (2026-08-05): over-provisioning nu by one
@@ -21321,7 +21517,7 @@ fn build_node_outer_app(
         vals.extend_from_slice(&iv_w);
         let iv2 = [sb.public_input(), sb.public_input()];
         let mut consts: Vec<(F128, Wire)> = Vec::new();
-        let pub_payloads = bytes_payload_mask(t_shape.ops());
+        let pub_payloads = bytes_payload_mask(&flatten_ops(t_shape.ops()));
         let (chain_outs, ww) = emit_fs_chain(
             &mut sb,
             cs.q.b3,
@@ -21332,6 +21528,7 @@ fn build_node_outer_app(
             &mut vals,
             &mut consts,
             &pub_payloads,
+            &cross,
         );
         let mut vmap: Vec<Option<usize>> = Vec::new();
         for (wi, w) in stream.words.iter().enumerate() {
@@ -22036,7 +22233,7 @@ fn build_node_outer_app(
             }
             lchain.absorb(&lbytes[at * 16..]);
             let ltrace = lchain.finish();
-            let lpub_payloads = bytes_payload_mask(lops);
+            let lpub_payloads = bytes_payload_mask(&lops);
             let (lchain_outs, lww) = emit_fs_chain(
                 &mut sb,
                 cs.q.b3,
@@ -22047,6 +22244,7 @@ fn build_node_outer_app(
                 &mut vals,
                 &mut consts,
                 &lpub_payloads,
+                &[],
             );
             let mut lvmap: Vec<Option<usize>> = Vec::new();
             for (wi, w) in lstream.words.iter().enumerate() {
