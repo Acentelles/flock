@@ -646,6 +646,15 @@ impl<Ch: Challenger> RecordingChallenger<Ch> {
 }
 
 impl<Ch: Challenger> Challenger for RecordingChallenger<Ch> {
+    fn fork(&mut self, _label: &'static [u8]) -> Self {
+        // The fork/join transcript variant (FLOCK_PAR_TRANSCRIPT) has no
+        // tape encoding yet: recording a forked transcript needs fork/merge
+        // ops in `TranscriptShape` and matching circuit regions. Until that
+        // lands, the flag and the recorded (tower) paths are mutually
+        // exclusive — a recorded prove must run the sequential transcript.
+        unimplemented!("RecordingChallenger does not support transcript forks (no tape format yet)")
+    }
+
     fn observe_label(&mut self, label: &[u8]) {
         self.ops.push(TranscriptOp::Label(label.to_vec()));
         self.inner.observe_label(label);

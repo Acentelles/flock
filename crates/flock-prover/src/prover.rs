@@ -29,9 +29,7 @@ use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 use flock_core::lincheck::{self, QuirkyPoint, pack_z_lincheck_from_packed};
 use flock_core::pcs::{self, Commitment, PcsParams};
-use flock_core::proof::{
-    R1csClaim, R1csProofLigerito, ZClaim, bind_statement,
-};
+use flock_core::proof::{R1csClaim, R1csProofLigerito, ZClaim, bind_statement};
 use flock_core::r1cs::BlockR1cs;
 use flock_core::zerocheck;
 
@@ -433,8 +431,7 @@ fn build_union_witness(
     // values are substituted analytically), so the gather skips them — the
     // same pay-per-live discipline the boolean side's run-lists apply. Gated
     // by the zerocheck's OWN predicate so the two cannot drift.
-    let elem_live = union.has_element()
-        && flock_core::element_r1cs::union::dead_rows_unread(union);
+    let elem_live = union.has_element() && flock_core::element_r1cs::union::dead_rows_unread(union);
     let stripes = union
         .slot_dests(&mut z, &mut a, &mut b, elide)
         .into_iter()
@@ -839,96 +836,137 @@ fn prove_union_with_binding<Ch: Challenger>(
     }
 
     // ---- The boolean class's PIOP pair, over the prefix subcube.
+    //
+    // FLOCK_PAR_TRANSCRIPT=1 (circuit bindings): FORK/JOIN transcript — the
+    // boolean PIOP and the wiring argument run CONCURRENTLY on
+    // domain-separated child transcripts, merged before anything downstream
+    // samples (the element PIOP, the opening's γ's). Sound because both the
+    // zerocheck's r and the wiring's α/β bind only the commitment+statement
+    // prefix, which the fork point already covers; lincheck-after-zerocheck
+    // and gather-after-GKR are data orderings WITHIN their own forks. The
+    // verifier mirrors the forks under the same flag — an experimental
+    // protocol VARIANT (different transcript), default off.
+    let par_transcript = std::env::var("FLOCK_PAR_TRANSCRIPT").is_ok()
+        && matches!(&binding, UnionProveBinding::Circuit(_))
+        && union.num_boolean() > 0;
     let t_bool = std::time::Instant::now();
-    let boolean = (union.num_boolean() > 0).then(|| {
-        let (zc_proof, zc_claim, s_hat_v_c) = {
-            // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
-            let view = |v: &[F128]| -> &[u8] {
-                unsafe {
-                    std::slice::from_raw_parts(
-                        v.as_ptr() as *const u8,
-                        bool_words * core::mem::size_of::<F128>(),
-                    )
-                }
+    let run_boolean = |challenger: &mut Ch| {
+        (union.num_boolean() > 0).then(|| {
+            let (zc_proof, zc_claim, s_hat_v_c) = {
+                // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
+                let view = |v: &[F128]| -> &[u8] {
+                    unsafe {
+                        std::slice::from_raw_parts(
+                            v.as_ptr() as *const u8,
+                            bool_words * core::mem::size_of::<F128>(),
+                        )
+                    }
+                };
+                let a_packed = view(&a_packed_f128);
+                let b_packed = view(&b_packed_f128);
+                let c_packed = view(&z_packed);
+                zerocheck::prove_packed_padded_capture_s_hat_v_c(
+                    a_packed,
+                    b_packed,
+                    c_packed,
+                    m_bool,
+                    &bool_padding,
+                    challenger,
+                )
             };
-            let a_packed = view(&a_packed_f128);
-            let b_packed = view(&b_packed_f128);
-            let c_packed = view(&z_packed);
-            zerocheck::prove_packed_padded_capture_s_hat_v_c(
-                a_packed,
-                b_packed,
-                c_packed,
-                m_bool,
-                &bool_padding,
-                challenger,
+
+            let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
+
+            // M2: the union-column lincheck — one sumcheck over the boolean
+            // column domain against the per-slot stripes and circuits. On the M1
+            // single-type registries it is byte-identical to invoking the slot's
+            // own lincheck (the union of one slot has m = M_bool = M).
+            let (lc_proof, lc_claim, z_vec_pre) = {
+                let lc_slots: Vec<lincheck::UnionLincheckSlot<'_>> = linchecks
+                    .iter()
+                    .map(|(stripe, circuit)| lincheck::UnionLincheckSlot {
+                        z_lincheck: stripe,
+                        circuit: *circuit,
+                    })
+                    .collect();
+                lincheck::prove_union_capture_z_vec(union, &lc_slots, &x_ab, challenger)
+            };
+
+            let ab = ZClaim {
+                point: union.ab_claim_point(
+                    lc_claim.r_inner_skip,
+                    &lc_claim.r_inner_rest,
+                    &x_ab.x_outer,
+                ),
+                value: lc_claim.w,
+            };
+            let c = ZClaim {
+                point: union.c_claim_point(zc_claim.z, &zc_claim.r_rest),
+                value: zc_claim.c_eval,
+            };
+
+            // `s_hat_v_from_z_vec` needs `z_vec.len() = 2^LOG_PACKING · 2^tail`;
+            // the boolean fold has `len = 2^(M_bool−ν)` and
+            // `tail = M_bool−ν−LOG_PACKING`, so the condition is
+            // `M_bool−ν ≥ LOG_PACKING` — for a single-type registry exactly the
+            // old `k_log ≥ LOG_PACKING`, and always true for real registries
+            // (every `k_log ≥ 7`).
+            //
+            // The precomputed value stays honest even though the AB claim's point
+            // now carries `M − M_bool` frozen ZERO high coordinates:
+            // `s_hat_v[b] = Σ_j eq(suffix, j)·bit_b(w[j])` and those zeros kill
+            // every `j` outside the boolean region, so the full-buffer fold equals
+            // this boolean-region one term for term.
+            let s_hat_v_ab = if m_bool - union.n_log() >= pcs::LOG_PACKING {
+                Some(pcs::ring_switch::s_hat_v_from_z_vec(
+                    &z_vec_pre,
+                    &lc_claim.r_inner_rest[1..],
+                ))
+            } else {
+                None
+            };
+            (
+                flock_core::proof::BooleanPiopProof {
+                    zerocheck: zc_proof,
+                    lincheck: lc_proof,
+                },
+                R1csClaim { ab, c },
+                s_hat_v_ab,
+                s_hat_v_c,
             )
+        })
+    };
+    let (boolean, wiring_pre) = if par_transcript {
+        let UnionProveBinding::Circuit(ci) = &binding else {
+            unreachable!("par_transcript requires a circuit binding");
         };
-
-        let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
-
-        // M2: the union-column lincheck — one sumcheck over the boolean
-        // column domain against the per-slot stripes and circuits. On the M1
-        // single-type registries it is byte-identical to invoking the slot's
-        // own lincheck (the union of one slot has m = M_bool = M).
-        let (lc_proof, lc_claim, z_vec_pre) = {
-            let lc_slots: Vec<lincheck::UnionLincheckSlot<'_>> = linchecks
-                .iter()
-                .map(|(stripe, circuit)| lincheck::UnionLincheckSlot {
-                    z_lincheck: stripe,
-                    circuit: *circuit,
-                })
-                .collect();
-            lincheck::prove_union_capture_z_vec(union, &lc_slots, &x_ab, challenger)
-        };
-
-        let ab = ZClaim {
-            point: union.ab_claim_point(
-                lc_claim.r_inner_skip,
-                &lc_claim.r_inner_rest,
-                &x_ab.x_outer,
-            ),
-            value: lc_claim.w,
-        };
-        let c = ZClaim {
-            point: union.c_claim_point(zc_claim.z, &zc_claim.r_rest),
-            value: zc_claim.c_eval,
-        };
-
-        // `s_hat_v_from_z_vec` needs `z_vec.len() = 2^LOG_PACKING · 2^tail`;
-        // the boolean fold has `len = 2^(M_bool−ν)` and
-        // `tail = M_bool−ν−LOG_PACKING`, so the condition is
-        // `M_bool−ν ≥ LOG_PACKING` — for a single-type registry exactly the
-        // old `k_log ≥ LOG_PACKING`, and always true for real registries
-        // (every `k_log ≥ 7`).
-        //
-        // The precomputed value stays honest even though the AB claim's point
-        // now carries `M − M_bool` frozen ZERO high coordinates:
-        // `s_hat_v[b] = Σ_j eq(suffix, j)·bit_b(w[j])` and those zeros kill
-        // every `j` outside the boolean region, so the full-buffer fold equals
-        // this boolean-region one term for term.
-        let s_hat_v_ab = if m_bool - union.n_log() >= pcs::LOG_PACKING {
-            Some(pcs::ring_switch::s_hat_v_from_z_vec(
-                &z_vec_pre,
-                &lc_claim.r_inner_rest[1..],
-            ))
-        } else {
-            None
-        };
-        (
-            flock_core::proof::BooleanPiopProof {
-                zerocheck: zc_proof,
-                lincheck: lc_proof,
+        let mut ch_zc = challenger.fork(b"flock-par-zc-v1");
+        let mut ch_w = challenger.fork(b"flock-par-wiring-v1");
+        let (b, w) = rayon::join(
+            || {
+                let r = run_boolean(&mut ch_zc);
+                (r, ch_zc)
             },
-            R1csClaim { ab, c },
-            s_hat_v_ab,
-            s_hat_v_c,
-        )
-    });
+            || {
+                let r =
+                    flock_core::circuit::prove_wiring(ci.circuit, &z_packed, ci.public, &mut ch_w);
+                (r, ch_w)
+            },
+        );
+        let (boolean, ch_zc) = b;
+        let (wiring, ch_w) = w;
+        challenger.merge_child(ch_zc);
+        challenger.merge_child(ch_w);
+        (boolean, Some(wiring))
+    } else {
+        (run_boolean(challenger), None)
+    };
 
     if trace && union.num_boolean() > 0 {
         eprintln!(
-            "  [prove_union] boolean zerocheck + lincheck (M_bool = {}): {:7.2} ms",
+            "  [prove_union] boolean zerocheck + lincheck (M_bool = {}){}: {:7.2} ms",
             union.m_bool(),
+            if par_transcript { " ∥ wiring" } else { "" },
             t_bool.elapsed().as_secs_f64() * 1e3
         );
     }
@@ -1019,8 +1057,7 @@ fn prove_union_with_binding<Ch: Challenger>(
     let t = std::time::Instant::now();
     let element = element_ab.map(|(pa, pb)| {
         let r = union.element_word_range();
-        let out =
-            flock_core::element_r1cs::union::prove(union, &z_packed[r], &pa, &pb, challenger);
+        let out = flock_core::element_r1cs::union::prove(union, &z_packed[r], &pa, &pb, challenger);
         // Recycle the region pair (the PIOP borrows, never writes): the live
         // arm's buffers came from the zero pool via `copy_live_region` and
         // return there with only their live spans dirty; the dense arm's
@@ -1049,11 +1086,14 @@ fn prove_union_with_binding<Ch: Challenger>(
     // whose dummy rows are zero by the union's witness contract, which is what
     // makes the dummy cells' `w = 0` honest.
     let t = std::time::Instant::now();
-    let wiring = match &binding {
-        UnionProveBinding::Circuit(ci) => Some(flock_core::circuit::prove_wiring(
+    let wiring = match (wiring_pre, &binding) {
+        // FORK/JOIN variant: the wiring already ran concurrently with the
+        // boolean PIOP on its own child transcript; only the claims flow on.
+        (Some(w), _) => Some(w),
+        (None, UnionProveBinding::Circuit(ci)) => Some(flock_core::circuit::prove_wiring(
             ci.circuit, &z_packed, ci.public, challenger,
         )),
-        _ => None,
+        (None, _) => None,
     };
     if trace && let Some((_, claims)) = &wiring {
         eprintln!(
@@ -1101,8 +1141,10 @@ fn prove_union_with_binding<Ch: Challenger>(
         );
     }
     let t = std::time::Instant::now();
-    let x_fulls: Vec<Vec<F128>> =
-        z_claims.iter().map(|cl| quirky_x_outer_full(&cl.point)).collect();
+    let x_fulls: Vec<Vec<F128>> = z_claims
+        .iter()
+        .map(|cl| quirky_x_outer_full(&cl.point))
+        .collect();
     let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
     let pcs_open = pcs::open_batch_merged(
         q,

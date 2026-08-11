@@ -702,8 +702,22 @@ fn verify_union_piops<Ch: Challenger>(
 
         let mut matrix: Option<lincheck::MatrixAssertion> = None;
         let mut el_matrix: Option<crate::element_r1cs::union::ElementAssertion> = None;
+        // FLOCK_PAR_TRANSCRIPT: mirror the prover's FORK/JOIN transcript —
+        // the boolean PIOP replays on one domain-separated child, the wiring
+        // on the other (run before the element class so both children's
+        // closing digests merge at the prover's position). Same flag, same
+        // labels, same order; an experimental protocol VARIANT, default off.
+        let par_transcript = std::env::var("FLOCK_PAR_TRANSCRIPT").is_ok()
+            && matches!(binding, UnionVerifyBinding::Circuit { .. })
+            && boolean.is_some();
+        let mut ch_zc = par_transcript.then(|| challenger.fork(b"flock-par-zc-v1"));
+        let mut ch_w = par_transcript.then(|| challenger.fork(b"flock-par-wiring-v1"));
         let bool_claim = match boolean {
             Some(piop) => {
+                let challenger: &mut Ch = match ch_zc.as_mut() {
+                    Some(c) => c,
+                    None => challenger,
+                };
                 // The boolean PIOP runs over the BOOLEAN REGION only — the
                 // prefix subcube `[0, 2^M_bool)`, `M_bool = M` for a
                 // boolean-only registry. (The element region cannot join this
@@ -746,6 +760,35 @@ fn verify_union_piops<Ch: Challenger>(
             None => None,
         };
 
+        // FORK/JOIN variant: the wiring replays NOW on its child (its
+        // transcript is independent of the boolean's), then both children's
+        // closing digests merge before the element class — the prover's
+        // exact positions. The gather claims are held and appended at the
+        // sequential position below, so the packed-direct order is
+        // unchanged.
+        let mut par_gather: Option<Vec<(Vec<F128>, F128)>> = None;
+        let mut sigma: Option<crate::circuit::SigmaAssertion> = None;
+        if par_transcript {
+            let UnionVerifyBinding::Circuit { circuit, public } = binding else {
+                unreachable!("par_transcript requires a circuit binding");
+            };
+            let proof = wiring.ok_or(VerifyError::CircuitMismatch)?;
+            let ch = ch_w.as_mut().expect("forked above");
+            let gather = if defer_sigma {
+                let (gather, sig) =
+                    crate::circuit::verify_wiring_deferred(circuit, public, proof, ch)
+                        .map_err(VerifyError::Wiring)?;
+                sigma = Some(sig);
+                gather
+            } else {
+                crate::circuit::verify_wiring(circuit, public, proof, ch)
+                    .map_err(VerifyError::Wiring)?
+            };
+            par_gather = Some(gather);
+            challenger.merge_child(ch_zc.take().expect("forked above"));
+            challenger.merge_child(ch_w.take().expect("forked above"));
+        }
+
         // DEFERRED on this side too: the element class's matrix work leaves
         // as its own assertion rather than being evaluated here, so a
         // `*_deferred` entry really does defer BOTH classes.
@@ -773,8 +816,9 @@ fn verify_union_piops<Ch: Challenger>(
         // packed-direct intake the element claims ride. Deferred callers
         // get the sigma evaluation back as a claim (route B) instead of
         // paying its O(2^mu) discharge here — same transcript either way.
-        let mut sigma: Option<crate::circuit::SigmaAssertion> = None;
-        if let UnionVerifyBinding::Circuit { circuit, public } = binding {
+        if let Some(gather) = par_gather {
+            packed_direct.extend(gather);
+        } else if let UnionVerifyBinding::Circuit { circuit, public } = binding {
             let proof = wiring.ok_or(VerifyError::CircuitMismatch)?;
             #[cfg(feature = "mul-count")]
             let wiring_start = crate::field::gf2_128::op_count::snapshot();
