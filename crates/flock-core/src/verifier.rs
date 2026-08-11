@@ -710,14 +710,12 @@ fn verify_union_piops<Ch: Challenger>(
         let par_transcript = std::env::var("FLOCK_PAR_TRANSCRIPT").is_ok()
             && matches!(binding, UnionVerifyBinding::Circuit { .. })
             && boolean.is_some();
-        let mut ch_zc = par_transcript.then(|| challenger.fork(b"flock-par-zc-v1"));
+        // ONE-SIDED fork (the prover's shape): the boolean PIOP replays on
+        // the PARENT transcript; only the wiring gets a child, forked
+        // before the zerocheck and merged after it.
         let mut ch_w = par_transcript.then(|| challenger.fork(b"flock-par-wiring-v1"));
         let bool_claim = match boolean {
             Some(piop) => {
-                let challenger: &mut Ch = match ch_zc.as_mut() {
-                    Some(c) => c,
-                    None => challenger,
-                };
                 // The boolean PIOP runs over the BOOLEAN REGION only — the
                 // prefix subcube `[0, 2^M_bool)`, `M_bool = M` for a
                 // boolean-only registry. (The element region cannot join this
@@ -785,7 +783,6 @@ fn verify_union_piops<Ch: Challenger>(
                     .map_err(VerifyError::Wiring)?
             };
             par_gather = Some(gather);
-            challenger.merge_child(ch_zc.take().expect("forked above"));
             challenger.merge_child(ch_w.take().expect("forked above"));
         }
 

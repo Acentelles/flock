@@ -940,22 +940,26 @@ fn prove_union_with_binding<Ch: Challenger>(
         let UnionProveBinding::Circuit(ci) = &binding else {
             unreachable!("par_transcript requires a circuit binding");
         };
-        let mut ch_zc = challenger.fork(b"flock-par-zc-v1");
+        // ONE-SIDED fork: only the wiring leaves the main chain — the
+        // boolean PIOP continues on the parent transcript exactly as in
+        // the sequential protocol. The child's seed sample advances the
+        // parent BEFORE the zerocheck begins, so both branches bind the
+        // same commitment+statement prefix; the merge (the child's closing
+        // digest) lands after the boolean PIOP, before anything samples
+        // against the wiring's messages. In the chained-BLAKE3 discipline
+        // the circuit-side cost of this shape is ~one compression row: the
+        // child chain can continue from the fork-point CV under a domain
+        // byte, and the merge absorbs its 256-bit final CV in one block.
         let mut ch_w = challenger.fork(b"flock-par-wiring-v1");
-        let (b, w) = rayon::join(
-            || {
-                let r = run_boolean(&mut ch_zc);
-                (r, ch_zc)
-            },
+        let (boolean, w) = rayon::join(
+            || run_boolean(challenger),
             || {
                 let r =
                     flock_core::circuit::prove_wiring(ci.circuit, &z_packed, ci.public, &mut ch_w);
                 (r, ch_w)
             },
         );
-        let (boolean, ch_zc) = b;
         let (wiring, ch_w) = w;
-        challenger.merge_child(ch_zc);
         challenger.merge_child(ch_w);
         (boolean, Some(wiring))
     } else {
