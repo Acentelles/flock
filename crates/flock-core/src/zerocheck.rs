@@ -587,6 +587,19 @@ fn prove_packed_padded_inner<C: Challenger>(
             let b_full = multilinear::expand_to_dense(&b_mlv, &st, domain);
             crate::scratch::give_f128(std::mem::replace(&mut a_mlv, a_full));
             crate::scratch::give_f128(std::mem::replace(&mut b_mlv, b_full));
+            // The ping-pong scratch shrank toward the compacted cap while
+            // the tail ran sparse; the dense fold below slices
+            // `a_nxt[..domain/2]`, so the scratch must re-grow with the
+            // buffers (the recorded gate=4 panic: range end 1024 out of
+            // range for slice of length 678). A fragmented near-full spec
+            // can force this exit at `domain >= 1024` even at gate = 1 —
+            // interval ends round `st.len()` outward past the domain.
+            if a_nxt.len() < domain / 2 {
+                crate::scratch::give_f128(a_nxt);
+                crate::scratch::give_f128(b_nxt);
+                a_nxt = crate::scratch::take_f128(domain / 2);
+                b_nxt = crate::scratch::take_f128(domain / 2);
+            }
             sparse_dirty = false;
         }
 
