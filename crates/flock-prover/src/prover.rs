@@ -918,10 +918,19 @@ fn prove_union_with_binding<Ch: Challenger>(
             // every `j` outside the boolean region, so the full-buffer fold equals
             // this boolean-region one term for term.
             let s_hat_v_ab = if m_bool - union.n_log() >= pcs::LOG_PACKING {
-                Some(pcs::ring_switch::s_hat_v_from_z_vec(
+                let t_sv = std::time::Instant::now();
+                let sv = Some(pcs::ring_switch::s_hat_v_from_z_vec(
                     &z_vec_pre,
                     &lc_claim.r_inner_rest[1..],
-                ))
+                ));
+                if std::env::var("PCS_TRACE").is_ok() {
+                    eprintln!(
+                        "  [prove_union] s_hat_v_ab fold (z_vec 2^{}): {:6.2} ms",
+                        m_bool - union.n_log(),
+                        t_sv.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+                sv
             } else {
                 None
             };
@@ -1164,12 +1173,19 @@ fn prove_union_with_binding<Ch: Challenger>(
         &lig_config,
         challenger,
     );
+    let t_gb = std::time::Instant::now();
+    let gb_words = z_packed.len();
     if give_back {
         flock_core::scratch::give_f128(z_packed);
     } else {
         union.give_back_witness_buffer(z_packed);
     }
     if trace {
+        eprintln!(
+            "  [prove_union] witness buffer give-back (2^{} words, zero dirty spans): {:6.2} ms",
+            gb_words.trailing_zeros(),
+            t_gb.elapsed().as_secs_f64() * 1e3
+        );
         eprintln!(
             "  [prove_union] open (rs×{}, pd×{}): {:7.2} ms",
             z_claims.len(),
