@@ -837,15 +837,15 @@ fn prove_union_with_binding<Ch: Challenger>(
 
     // ---- The boolean class's PIOP pair, over the prefix subcube.
     //
-    // FLOCK_PAR_TRANSCRIPT=1 (circuit bindings): FORK/JOIN transcript — the
-    // boolean PIOP and the wiring argument run CONCURRENTLY on
-    // domain-separated child transcripts, merged before anything downstream
-    // samples (the element PIOP, the opening's γ's). Sound because both the
-    // zerocheck's r and the wiring's α/β bind only the commitment+statement
-    // prefix, which the fork point already covers; lincheck-after-zerocheck
-    // and gather-after-GKR are data orderings WITHIN their own forks. The
-    // verifier mirrors the forks under the same flag — an experimental
-    // protocol VARIANT (different transcript), default off.
+    // FORK/JOIN transcript — THE protocol for a circuit binding, not an
+    // option: the boolean PIOP and the wiring argument run CONCURRENTLY on
+    // domain-separated chains, merged before anything downstream samples (the
+    // element PIOP, the opening's γ's). Sound because both the zerocheck's r
+    // and the wiring's α/β bind only the commitment+statement prefix, which
+    // the fork point already covers; lincheck-after-zerocheck and
+    // gather-after-GKR are data orderings WITHIN their own forks. The
+    // verifier forks identically, and the recursion circuit binds both chains
+    // (`merge_chain` in the circuit_merkle tape tests).
     let par_transcript =
         matches!(&binding, UnionProveBinding::Circuit(_)) && union.num_boolean() > 0;
     let t_bool = std::time::Instant::now();

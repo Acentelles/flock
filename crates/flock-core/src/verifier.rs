@@ -702,11 +702,10 @@ fn verify_union_piops<Ch: Challenger>(
 
         let mut matrix: Option<lincheck::MatrixAssertion> = None;
         let mut el_matrix: Option<crate::element_r1cs::union::ElementAssertion> = None;
-        // FLOCK_PAR_TRANSCRIPT: mirror the prover's FORK/JOIN transcript —
-        // the boolean PIOP replays on one domain-separated child, the wiring
-        // on the other (run before the element class so both children's
-        // closing digests merge at the prover's position). Same flag, same
-        // labels, same order; an experimental protocol VARIANT, default off.
+        // Mirror the prover's FORK/JOIN transcript, which every circuit
+        // binding uses: the wiring replays on a domain-separated child, run
+        // before the element class so its closing digest merges at the
+        // prover's position. Same labels, same order.
         let par_transcript =
             matches!(binding, UnionVerifyBinding::Circuit { .. }) && boolean.is_some();
         // ONE-SIDED fork (the prover's shape): the boolean PIOP replays on
