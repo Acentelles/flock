@@ -668,6 +668,110 @@ fn median_total(runs: &[Online]) -> f64 {
 /// range, then the per-SHAPE setup for reference. Medians, not means —
 /// the first run of any stage pays first-touch allocator costs that are
 /// warmup, not marginal cost (the recorded L2 lesson).
+/// **WHERE A PROOF'S BYTES ARE.** Serialized size per component, so that any
+/// shrinking effort is steered by the census rather than by intuition about
+/// which piece looks big. Sizes are `bincode` lengths of the sub-structures;
+/// they sum to slightly less than the whole (the outer struct's own tags).
+///
+/// The interesting ratio is proof bytes vs what they cost a PARENT: the
+/// parent replays the child's transcript through its b3 slot at one
+/// compression per 64 bytes, so at the measured ~6.1 µs per b3 row a KiB of
+/// child proof is ~0.1 ms of parent per child.
+fn proof_census(
+    label: &str,
+    p: &flock_core::proof::R1csProofCircuitMerged,
+    pcs: &PcsParams,
+) {
+    // Per-level stratified schedules, and the siblings a path emits ABOVE the
+    // cap layer. The cap is the whole layer at the DEEPEST summand's depth
+    // c1, so every query can be checked with d - c1 siblings; a query from a
+    // shallower summand emits d - c_j, and the extra c1 - c_j siblings are
+    // nodes the absorbed cap already determines.
+    if let Ok(cfg) = pcs.ligerito_prover_config() {
+        let (mut waste, mut emitted) = (0usize, 0usize);
+        let mut per_level: Vec<String> = Vec::new();
+        for (lvl, sch) in cfg.stratified.iter().enumerate() {
+            let c1 = sch.cap_depth();
+            let (mut w, mut e) = (0usize, 0usize);
+            for s in sch.summands() {
+                e += s.count * s.path_sibs;
+                w += s.count * (c1 - s.depth);
+            }
+            per_level.push(format!(
+                "L{lvl}: q={} depths={:?} cap={c1} sibs={e} redundant={w}",
+                sch.queries(),
+                sch.summand_depths,
+            ));
+            waste += w;
+            emitted += e;
+        }
+        println!(
+            "\n  STRATIFIED PATHS — {label}\n    {}\n    \
+             emitted {emitted} siblings, {waste} redundant above the cap \
+             ({:.1} KiB of {:.1} KiB, {:.0}%)",
+            per_level.join("\n    "),
+            waste as f64 * 32.0 / 1024.0,
+            emitted as f64 * 32.0 / 1024.0,
+            100.0 * waste as f64 / emitted as f64,
+        );
+    }
+    proof_census_inner(label, p)
+}
+
+fn proof_census_inner(label: &str, p: &flock_core::proof::R1csProofCircuitMerged) {
+    let sz = |b: Result<Vec<u8>, _>| b.map(|v| v.len()).unwrap_or(0) as f64 / 1024.0;
+    let total = sz(bincode::serialize(p));
+    let lig = &p.pcs_open.inner.ligerito;
+    let rows = |v: &Vec<flock_core::pcs::ligerito::RecursiveProof>| -> (f64, f64) {
+        (
+            v.iter()
+                .map(|r| sz(bincode::serialize(&r.opened_rows)))
+                .sum(),
+            v.iter()
+                .map(|r| sz(bincode::serialize(&r.merkle_proof)))
+                .sum(),
+        )
+    };
+    let (rec_rows, rec_paths) = rows(&lig.recursive_proofs);
+    let l0_rows = sz(bincode::serialize(&lig.initial_proof.opened_rows));
+    let l0_paths = sz(bincode::serialize(&lig.initial_proof.merkle_proof));
+    println!(
+        "\n  PROOF CENSUS — {label}: {total:.1} KiB\n\
+         \x20   boolean PIOP        {:6.1}\n\
+         \x20   element PIOP        {:6.1}\n\
+         \x20   wiring              {:6.1}\n\
+         \x20   merged rounds       {:6.1}\n\
+         \x20   ring switches       {:6.1}\n\
+         \x20   multipoint values   {:6.1}   (128 per rs claim)\n\
+         \x20   multipoint rounds   {:6.1}\n\
+         \x20   multipoint anchor   {:6.1}\n\
+         \x20   inner: L0 rows      {:6.1}\n\
+         \x20   inner: L0 paths     {:6.1}\n\
+         \x20   inner: rec rows     {:6.1}\n\
+         \x20   inner: rec paths    {:6.1}\n\
+         \x20   inner: caps         {:6.1}   (L0 {:.1} + rec {:.1})\n\
+         \x20   inner: final block  {:6.1}\n\
+         \x20   inner: sumcheck     {:6.1}",
+        sz(bincode::serialize(&p.boolean)),
+        sz(bincode::serialize(&p.element)),
+        sz(bincode::serialize(&p.wiring)),
+        sz(bincode::serialize(&p.pcs_open.merged_rounds)),
+        sz(bincode::serialize(&p.pcs_open.ring_switches)),
+        sz(bincode::serialize(&p.pcs_open.frobenius.values)),
+        sz(bincode::serialize(&p.pcs_open.frobenius.rounds)),
+        sz(bincode::serialize(&p.pcs_open.frobenius.anchor)),
+        l0_rows,
+        l0_paths,
+        rec_rows,
+        rec_paths,
+        sz(bincode::serialize(&lig.initial_cap)) + sz(bincode::serialize(&lig.recursive_caps)),
+        sz(bincode::serialize(&lig.initial_cap)),
+        sz(bincode::serialize(&lig.recursive_caps)),
+        sz(bincode::serialize(&lig.final_proof)),
+        sz(bincode::serialize(&lig.sumcheck_transcript)),
+    );
+}
+
 fn report_stage(name: &str, runs: &[Online]) {
     let mut tot: Vec<f64> = runs.iter().map(|o| o.total()).collect();
     tot.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -24298,6 +24402,7 @@ fn chain_tower_m32_headline() {
         node.shape.circuit.cells().mu(),
         bincode::serialize(&node.proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
     );
+    proof_census("internal node", &node.proof, &node.pcs);
 }
 
 /// **THE ONLINE BENCH: leaf, first-level node, internal node.** One number
