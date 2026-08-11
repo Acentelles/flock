@@ -3036,6 +3036,48 @@ fn bytes_payload_mask(ops: &[flock_core::transcript_record::TranscriptOp]) -> Ve
 /// counts, caps — the caps' wires also feed the in-circuit cap trees the
 /// openings connect to), domain constants, and the shared structural
 /// constants through `consts`.
+///
+/// ## Extending this to the FORKED transcript (the remaining step)
+///
+/// The fork/join protocol (`FLOCK_PAR_TRANSCRIPT`, prover + native verifier
+/// landed; `fs_chain::trace_duplex_forked` builds the two chains) needs this
+/// emitter to place a SECOND chain. The tractable shape, from tracing how
+/// `Cur` (the op-walking cursor that assigns `fin`/`ch`/`v` to every region)
+/// reaches `trace.squeezes[fin]`:
+///
+/// **Unify on the INLINE WALK, do not thread a chain index.** A naive port
+/// would give every region record a `chain` field and turn ~100
+/// `trace.squeezes[k]` sites into `chains[c].squeezes[k]`. Unnecessary: a
+/// fork's ops sit inline in the parent op list at the fork position, so if
+/// BOTH the cursor and the emitter descend into `TranscriptOp::Forked` in
+/// the same order, one linear `fin` numbering covers both chains and every
+/// existing index site keeps working unchanged. Concretely:
+///
+/// 1. `emit_fs_chain_forked(.., chains: &ForkedChains, ..)` emits the parent
+///    rows then each child's rows into the same b3 slot (a child's first row
+///    links `CvSource::Iv` — its own lineage — which this loop already
+///    handles), and returns:
+///    - `outs`: parent row outputs followed by child row outputs;
+///    - `squeezes`: the finalize list in INLINE-WALK order, child row
+///      indices offset by the parent row count;
+///    - `vmap: Vec<Option<Wire>>` keyed by GLOBAL value index (the recorder
+///      numbers values across both chains), replacing the per-site
+///      `value -> word index` map so callers never see the chain split.
+/// 2. `Cur::bump` descends into `Forked { ops }` (recursing for `fin`/`ch`/
+///    `v`) and treats `Merge` as a no-op — one arm each.
+/// 3. The four cross-links per fork (`ChildChain::{seed_squeeze,
+///    child_seed_word, digest_squeeze, parent_digest_word}`) are ALIASES,
+///    not gates: point the child's two seed word wires at the parent's
+///    seed-squeeze output wires, and the parent's two merge word wires at
+///    the child's closing-squeeze outputs. Zero extra rows — the same
+///    squeeze-output wiring the sponge chain already does.
+/// 4. Region emission order mirrors the verifier's (wiring before element,
+///    merge before element), then re-derive the tape pins.
+///
+/// The cheap-fork optimization (child chain CONTINUING from the fork-point
+/// CV under a domain byte, instead of seed-squeeze + absorb) belongs here
+/// too: it drops steps 1's seed rows and takes the in-circuit cost of the
+/// whole feature to ~one compression row.
 fn emit_fs_chain(
     sb: &mut ShapeBuilder,
     b3: flock_core::circuit::builder::SlotId,
