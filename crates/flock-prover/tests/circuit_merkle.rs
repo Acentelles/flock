@@ -3037,53 +3037,16 @@ fn bytes_payload_mask(ops: &[flock_core::transcript_record::TranscriptOp]) -> Ve
 /// openings connect to), domain constants, and the shared structural
 /// constants through `consts`.
 ///
-/// ## Extending this to the FORKED transcript (the remaining step)
+/// **The FORKED transcript needs nothing from this function.** A circuit-bound
+/// union proof always forks (the wiring argument runs on its own chain), but
+/// [`merge_chain`] presents both chains as ONE — rows spliced at the fork
+/// point, indices remapped — so this loop only ever sees a linear trace. The
+/// fork's whole in-circuit footprint arrives through `cross`: four words that
+/// are ALIASES of earlier squeeze outputs rather than declared inputs.
 ///
-/// The fork/join protocol (`FLOCK_PAR_TRANSCRIPT`, prover + native verifier
-/// landed; `fs_chain::trace_duplex_forked` builds the two chains) needs this
-/// emitter to place a SECOND chain. The tractable shape, from tracing how
-/// `Cur` (the op-walking cursor that assigns `fin`/`ch`/`v` to every region)
-/// reaches `trace.squeezes[fin]`:
-///
-/// **Unify on the INLINE WALK, do not thread a chain index.** A naive port
-/// would give every region record a `chain` field and turn ~100
-/// `trace.squeezes[k]` sites into `chains[c].squeezes[k]`. Unnecessary: a
-/// fork's ops sit inline in the parent op list at the fork position, so if
-/// BOTH the cursor and the emitter descend into `TranscriptOp::Forked` in
-/// the same order, one linear `fin` numbering covers both chains and every
-/// existing index site keeps working unchanged. Concretely:
-///
-/// 1. `flatten_ops(ops) -> Vec<Op>`: splice each `Forked`'s ops inline at
-///    its fork position (recursively), drop `Merge`. THIS IS THE WHOLE
-///    LOCATOR STORY — `find(label)` and `Cur` both walk a flat list, so on
-///    the flattened view every label is found and every `fin`/`ch`/`v`
-///    lands in inline-walk order with no cursor change at all. Only the
-///    region ORDER assertions move (the wiring/GKR labels now precede the
-///    zerocheck's, since the fork sits before it).
-/// 2. `emit_fs_chain_forked(.., chains: &ForkedChains, ..)` emits the parent
-///    rows then each child's rows into the same b3 slot (a child's first row
-///    links `CvSource::Iv` — its own lineage — which this loop already
-///    handles), and returns:
-///    - `outs`: parent row outputs followed by child row outputs;
-///    - `squeezes` in the SAME inline-walk order the flattened ops imply:
-///      `parent[..=seed_squeeze] ++ child (rows offset by parent row count)
-///      ++ parent[seed_squeeze+1..]`;
-///    - `vmap: Vec<Option<Wire>>` keyed by GLOBAL value index (the recorder
-///      numbers values across both chains), replacing the per-site
-///      `value -> word index` map so callers never see the chain split.
-/// 3. The four cross-links per fork (`ChildChain::{seed_squeeze,
-///    child_seed_word, digest_squeeze, parent_digest_word}`) are ALIASES,
-///    not gates: point the child's two seed word wires at the parent's
-///    seed-squeeze output wires, and the parent's two merge word wires at
-///    the child's closing-squeeze outputs. Zero extra rows — the same
-///    squeeze-output wiring the sponge chain already does.
-/// 4. Region emission order mirrors the verifier's (wiring before element,
-///    merge before element), then re-derive the tape pins.
-///
-/// The cheap-fork optimization (child chain CONTINUING from the fork-point
-/// CV under a domain byte, instead of seed-squeeze + absorb) belongs here
-/// too: it drops steps 1's seed rows and takes the in-circuit cost of the
-/// whole feature to ~one compression row.
+/// Still open, and cheaper still: the child chain could CONTINUE from the
+/// fork-point CV under a domain byte instead of seed-squeeze-then-absorb.
+/// That drops the two seed rows and takes the fork's cost to ~one row.
 fn emit_fs_chain(
     sb: &mut ShapeBuilder,
     b3: flock_core::circuit::builder::SlotId,
@@ -3348,11 +3311,32 @@ fn merge_chain(
     // The four cross-links. Each side's pair is two CONSECUTIVE
     // `ObserveScalar`s, and the walk emits [header, value] per observe — so
     // the second word sits two after the first.
+    //
+    // Each link is CHECKED, not just placed. Getting a cross index wrong is
+    // the one mistake nothing downstream would notice: challenges replay
+    // identically whether a word is aliased to its squeeze or declared as a
+    // witness input that happens to hold the same value — and the second is a
+    // soundness hole, because it leaves the wiring's chain unbound. So the
+    // row is compressed here and matched against the recorded value.
     let mut cross = vec![None; words.len()];
     let mut link_word = |wi: usize, row: usize| {
-        assert!(
-            matches!(words[wi], StreamWord::Value(_)),
-            "cross-link word {wi} is not an observed value"
+        let StreamWord::Value(vi) = words[wi] else {
+            panic!("cross-link word {wi} is not an observed value");
+        };
+        let (cv, m, counter, blen, flags) = rows[row];
+        let out =
+            flock_prover::r1cs_hashes::blake3::blake3_compress(&cv, &m, counter, blen, flags);
+        let mut b = [0u8; 16];
+        for (i, w) in out[..4].iter().enumerate() {
+            b[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        assert_eq!(
+            F128::new(
+                u64::from_le_bytes(b[..8].try_into().unwrap()),
+                u64::from_le_bytes(b[8..].try_into().unwrap()),
+            ),
+            values[vi],
+            "cross-link word {wi} does not carry row {row}'s squeeze output"
         );
         cross[wi] = Some((row, 0));
     };
@@ -3366,6 +3350,11 @@ fn merge_chain(
         );
     }
 
+    assert_eq!(
+        cross.iter().filter(|c| c.is_some()).count(),
+        4,
+        "a fork contributes exactly four cross-link words"
+    );
     MergedChain {
         ops: flat,
         stream: flock_core::transcript_record::Stream {
@@ -3382,6 +3371,55 @@ fn merge_chain(
         },
         cross,
     }
+}
+
+/// THE SPLICE DIFFERENTIAL: every scalar challenge the recorder produced must
+/// fall back out of the merged chain at its flattened finalize ordinal.
+///
+/// This is what makes [`merge_chain`] trustworthy rather than merely
+/// plausible. A single match requires the row order, the index remapping, the
+/// squeeze ordering AND the byte-offset shift to all be right at once, and the
+/// child's own challenges sit in the middle of the sequence — the run walks
+/// straight through the fork. Cheap enough to leave on at every real shape.
+fn assert_chain_replays(
+    ops: &[flock_core::transcript_record::TranscriptOp],
+    trace: &flock_prover::r1cs_hashes::fs_chain::FsChainTrace,
+    chals: &[F128],
+) {
+    use flock_core::transcript_record::TranscriptOp as Op;
+    let (mut fin, mut ch, mut checked) = (0usize, 0usize, 0usize);
+    for op in ops {
+        if matches!(op, Op::SqueezeScalar) {
+            let (cv, m, counter, blen, flags) = trace.rows[trace.squeezes[fin][0]];
+            let out = flock_prover::r1cs_hashes::blake3::blake3_compress(
+                &cv, &m, counter, blen, flags,
+            );
+            let mut b = [0u8; 16];
+            for (i, w) in out[..4].iter().enumerate() {
+                b[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+            }
+            assert_eq!(
+                F128::new(
+                    u64::from_le_bytes(b[..8].try_into().unwrap()),
+                    u64::from_le_bytes(b[8..].try_into().unwrap()),
+                ),
+                chals[ch],
+                "the merged chain diverges at finalize {fin} (challenge {ch})"
+            );
+            checked += 1;
+        }
+        if op.finalizes() {
+            fin += 1;
+        }
+        match op {
+            Op::SqueezeScalar => ch += 1,
+            Op::SqueezeSlice(n) => ch += n,
+            _ => {}
+        }
+    }
+    assert!(checked > 0, "no scalar squeezes to replay");
+    assert_eq!(fin, trace.squeezes.len(), "finalize count vs squeeze rows");
+    assert_eq!(ch, chals.len(), "challenge count vs the recorded list");
 }
 
 /// The sumcheck-spine gate: one fold-and-eval step of the verifier's running
@@ -8243,6 +8281,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             rec.values(),
             rec.payloads(),
         );
+        assert_chain_replays(&ops, &trace, &chals);
         let b3_rows: usize = trace.rows.len()
             + geo
                 .iter()
@@ -9953,6 +9992,7 @@ impl<'p> RealTape<'p> {
             rec.values(),
             rec.payloads(),
         );
+        assert_chain_replays(&ops, &trace, &chals);
         let b3_rows = trace.rows.len()
             + h_rows
             + geo
@@ -13288,6 +13328,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
             rec.values(),
             rec.payloads(),
         );
+        assert_chain_replays(&ops, &trace, &chals);
 
         let b3_rows = tapes.iter().map(|t| t.b3_rows).sum::<usize>() + trace.rows.len();
         let nu2_content = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7);
@@ -15172,6 +15213,7 @@ impl<'p> ChildTape<'p> {
             rec.values(),
             rec.payloads(),
         );
+        assert_chain_replays(&ops, &trace, &chals);
 
         // ---- the open-phase walk + geometry ----
         let lig = &proof.pcs_open.inner.ligerito;
@@ -17504,6 +17546,7 @@ fn mvp11_sigma_fold_tape() {
             rec.values(),
             rec.payloads(),
         );
+        assert_chain_replays(&ops, &trace, &chals);
 
         let b3_rows = trace.rows.len();
         // Floor the capacity at 2^7 rows: the registered Ligerito configs
@@ -18068,6 +18111,7 @@ fn mvp11_jagged_fold_tape() {
             rec.values(),
             rec.payloads(),
         );
+        assert_chain_replays(&ops, &trace, &chals);
 
         let b3_rows = trace.rows.len();
         let nu2 = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7);
@@ -19716,6 +19760,7 @@ fn mvp11_merge_fold_region() {
             rec.values(),
             rec.payloads(),
         );
+        assert_chain_replays(&ops, &trace, &chals);
 
         // The b3 slot carries all three chains (child0, child1, fold) plus
         // the children's query-phase openings — size the row capacity once.
@@ -20502,6 +20547,7 @@ fn mvp11_swap_children_fold_scale() {
             rec.values(),
             rec.payloads(),
         );
+        assert_chain_replays(&ops, &trace, &chals);
 
         let b3_rows = trace.rows.len();
         let nu2 = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7);
@@ -21433,6 +21479,7 @@ fn build_node_outer_app(
             rec.values(),
             rec.payloads(),
         );
+        assert_chain_replays(&ops, &trace, &chals);
 
         let b3_rows = rts.iter().map(|rt| rt.b3_rows).sum::<usize>() + trace.rows.len();
         // MEASURED AND REJECTED (2026-08-05): over-provisioning nu by one
