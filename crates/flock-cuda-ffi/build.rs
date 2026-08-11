@@ -24,7 +24,9 @@ fn main() {
     println!("cargo:rerun-if-changed={}", src.display());
     for entry in std::fs::read_dir(&cuda_dir).unwrap().flatten() {
         let p = entry.path();
-        if p.extension().is_some_and(|e| e == "cuh" || e == "hpp" || e == "h") {
+        if p.extension()
+            .is_some_and(|e| e == "cuh" || e == "hpp" || e == "h")
+        {
             println!("cargo:rerun-if-changed={}", p.display());
         }
     }

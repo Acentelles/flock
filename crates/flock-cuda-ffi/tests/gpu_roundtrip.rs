@@ -20,7 +20,7 @@ use flock_prover::proof::R1csProofLigerito;
 use flock_prover::r1cs::SparseBinaryMatrix;
 use flock_prover::r1cs_hashes::blake3 as b3;
 use flock_prover::verifier;
-use flock_prover::zerocheck::{ZerocheckProof, K_SKIP};
+use flock_prover::zerocheck::{K_SKIP, ZerocheckProof};
 
 const DOMAIN: &[u8] = b"flock-lig-r1cs-v0";
 
@@ -54,7 +54,11 @@ struct ProveParams {
 }
 
 unsafe extern "C" {
-    fn flock_cuda_prove_blake3(p: *const ProveParams, out: *mut *mut u8, out_len: *mut usize) -> i32;
+    fn flock_cuda_prove_blake3(
+        p: *const ProveParams,
+        out: *mut *mut u8,
+        out_len: *mut usize,
+    ) -> i32;
     fn flock_cuda_free(p: *mut u8);
 }
 
@@ -257,8 +261,14 @@ fn gpu_prove(n_blocks_log: usize, dump_z: Option<&str>) -> GpuArtifacts {
         })
         .collect();
     let ood_values = r.f128s();
-    let grinding_nonces: Vec<u64> = { let n = r.u64() as usize; (0..n).map(|_| r.u64()).collect() };
-    let fold_grinding_nonces: Vec<u64> = { let n = r.u64() as usize; (0..n).map(|_| r.u64()).collect() };
+    let grinding_nonces: Vec<u64> = {
+        let n = r.u64() as usize;
+        (0..n).map(|_| r.u64()).collect()
+    };
+    let fold_grinding_nonces: Vec<u64> = {
+        let n = r.u64() as usize;
+        (0..n).map(|_| r.u64()).collect()
+    };
     assert_eq!(r.o, bytes.len(), "trailing bytes in FFI stream");
 
     let (initial_rows, initial_mp) = opens.remove(0);
@@ -313,7 +323,10 @@ fn gpu_prove(n_blocks_log: usize, dump_z: Option<&str>) -> GpuArtifacts {
         r1cs,
         pcs_params: pcs_params.clone(),
         proof,
-        commitment: Commitment { root, params: pcs_params },
+        commitment: Commitment {
+            root,
+            params: pcs_params,
+        },
         prove_secs: t_prove.as_secs_f64(),
     }
 }
@@ -321,8 +334,13 @@ fn gpu_prove(n_blocks_log: usize, dump_z: Option<&str>) -> GpuArtifacts {
 /// Full roundtrip: GPU prove, Rust verify; with `tamper`, also check that two
 /// corrupted variants are rejected.
 fn roundtrip(n_blocks_log: usize, tamper: bool) {
-    let GpuArtifacts { r1cs, pcs_params, proof, commitment, prove_secs } =
-        gpu_prove(n_blocks_log, None);
+    let GpuArtifacts {
+        r1cs,
+        pcs_params,
+        proof,
+        commitment,
+        prove_secs,
+    } = gpu_prove(n_blocks_log, None);
     let m = r1cs.m;
     let lc_circuit =
         lincheck::SparseMatrixCircuit::new(&r1cs.a_0, &r1cs.b_0).with_const_pin(r1cs.const_pin);
@@ -351,8 +369,15 @@ fn roundtrip(n_blocks_log: usize, tamper: bool) {
         bad.pcs_open.ligerito.final_proof.yr[0].lo ^= 1;
         let mut ch_t = FsChallenger::new(DOMAIN);
         assert!(
-            verifier::verify_ligerito(&r1cs, &commitment, &bad, &lc_circuit, &pcs_params, &mut ch_t)
-                .is_err(),
+            verifier::verify_ligerito(
+                &r1cs,
+                &commitment,
+                &bad,
+                &lc_circuit,
+                &pcs_params,
+                &mut ch_t
+            )
+            .is_err(),
             "verifier accepted a tampered GPU proof"
         );
         // Corrupt one zerocheck round message -> transcript replay rejects.
@@ -360,8 +385,15 @@ fn roundtrip(n_blocks_log: usize, tamper: bool) {
         bad.zerocheck.multilinear_rounds[0].0.hi ^= 1;
         let mut ch_t = FsChallenger::new(DOMAIN);
         assert!(
-            verifier::verify_ligerito(&r1cs, &commitment, &bad, &lc_circuit, &pcs_params, &mut ch_t)
-                .is_err(),
+            verifier::verify_ligerito(
+                &r1cs,
+                &commitment,
+                &bad,
+                &lc_circuit,
+                &pcs_params,
+                &mut ch_t
+            )
+            .is_err(),
             "verifier accepted a zerocheck-tampered GPU proof"
         );
     }
@@ -438,18 +470,39 @@ fn gpu_debug_diff() {
     }
 
     assert_eq!(rcomm.root, art.commitment.root, "commitment root");
-    first_diff("zc.round1_ab", &rp.zerocheck.round1_ab, &gp.zerocheck.round1_ab);
-    first_diff("zc.round1_c", &rp.zerocheck.round1_c, &gp.zerocheck.round1_c);
+    first_diff(
+        "zc.round1_ab",
+        &rp.zerocheck.round1_ab,
+        &gp.zerocheck.round1_ab,
+    );
+    first_diff(
+        "zc.round1_c",
+        &rp.zerocheck.round1_c,
+        &gp.zerocheck.round1_c,
+    );
     first_diff(
         "zc.multilinear_rounds",
         &rp.zerocheck.multilinear_rounds,
         &gp.zerocheck.multilinear_rounds,
     );
-    assert_eq!(rp.zerocheck.final_a_eval, gp.zerocheck.final_a_eval, "zc.final_a");
-    assert_eq!(rp.zerocheck.final_b_eval, gp.zerocheck.final_b_eval, "zc.final_b");
-    assert_eq!(rp.zerocheck.final_c_eval, gp.zerocheck.final_c_eval, "zc.final_c");
+    assert_eq!(
+        rp.zerocheck.final_a_eval, gp.zerocheck.final_a_eval,
+        "zc.final_a"
+    );
+    assert_eq!(
+        rp.zerocheck.final_b_eval, gp.zerocheck.final_b_eval,
+        "zc.final_b"
+    );
+    assert_eq!(
+        rp.zerocheck.final_c_eval, gp.zerocheck.final_c_eval,
+        "zc.final_c"
+    );
     first_diff("lc.rounds", &rp.lincheck.rounds, &gp.lincheck.rounds);
-    first_diff("lc.z_partial", &rp.lincheck.z_partial, &gp.lincheck.z_partial);
+    first_diff(
+        "lc.z_partial",
+        &rp.lincheck.z_partial,
+        &gp.lincheck.z_partial,
+    );
     for (i, (r, g)) in rp
         .pcs_open
         .ring_switches
@@ -461,28 +514,69 @@ fn gpu_debug_diff() {
     }
     let (rl, gl) = (&rp.pcs_open.ligerito, &gp.pcs_open.ligerito);
     assert_eq!(rl.initial_root, gl.initial_root, "lig.initial_root");
-    first_diff("lig.sumcheck_transcript", &rl.sumcheck_transcript, &gl.sumcheck_transcript);
+    first_diff(
+        "lig.sumcheck_transcript",
+        &rl.sumcheck_transcript,
+        &gl.sumcheck_transcript,
+    );
     first_diff("lig.ood_values", &rl.ood_values, &gl.ood_values);
     first_diff(
         "lig.fold_grinding_nonces",
         &rl.fold_grinding_nonces,
         &gl.fold_grinding_nonces,
     );
-    first_diff("lig.grinding_nonces", &rl.grinding_nonces, &gl.grinding_nonces);
-    first_diff("lig.recursive_roots", &rl.recursive_roots, &gl.recursive_roots);
-    first_diff("lig.initial.rows", &rl.initial_proof.opened_rows, &gl.initial_proof.opened_rows);
-    first_diff("lig.initial.mp", &rl.initial_proof.merkle_proof, &gl.initial_proof.merkle_proof);
+    first_diff(
+        "lig.grinding_nonces",
+        &rl.grinding_nonces,
+        &gl.grinding_nonces,
+    );
+    first_diff(
+        "lig.recursive_roots",
+        &rl.recursive_roots,
+        &gl.recursive_roots,
+    );
+    first_diff(
+        "lig.initial.rows",
+        &rl.initial_proof.opened_rows,
+        &gl.initial_proof.opened_rows,
+    );
+    first_diff(
+        "lig.initial.mp",
+        &rl.initial_proof.merkle_proof,
+        &gl.initial_proof.merkle_proof,
+    );
     assert_eq!(
         rl.recursive_proofs.len(),
         gl.recursive_proofs.len(),
         "recursive_proofs count"
     );
-    for (i, (r, g)) in rl.recursive_proofs.iter().zip(gl.recursive_proofs.iter()).enumerate() {
-        first_diff(&format!("lig.rec[{i}].rows"), &r.opened_rows, &g.opened_rows);
-        first_diff(&format!("lig.rec[{i}].mp"), &r.merkle_proof, &g.merkle_proof);
+    for (i, (r, g)) in rl
+        .recursive_proofs
+        .iter()
+        .zip(gl.recursive_proofs.iter())
+        .enumerate()
+    {
+        first_diff(
+            &format!("lig.rec[{i}].rows"),
+            &r.opened_rows,
+            &g.opened_rows,
+        );
+        first_diff(
+            &format!("lig.rec[{i}].mp"),
+            &r.merkle_proof,
+            &g.merkle_proof,
+        );
     }
     first_diff("lig.final.yr", &rl.final_proof.yr, &gl.final_proof.yr);
-    first_diff("lig.final.rows", &rl.final_proof.opened_rows, &gl.final_proof.opened_rows);
-    first_diff("lig.final.mp", &rl.final_proof.merkle_proof, &gl.final_proof.merkle_proof);
+    first_diff(
+        "lig.final.rows",
+        &rl.final_proof.opened_rows,
+        &gl.final_proof.opened_rows,
+    );
+    first_diff(
+        "lig.final.mp",
+        &rl.final_proof.merkle_proof,
+        &gl.final_proof.merkle_proof,
+    );
     println!("no divergence found (proofs identical at m={m})");
 }
