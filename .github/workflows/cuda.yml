@@ -15,8 +15,7 @@
 name: CUDA
 
 on:
-  push:
-    branches: [cuda-port-rebased]
+  pull_request:
   workflow_dispatch:
 
 concurrency:
