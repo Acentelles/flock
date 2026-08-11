@@ -44,8 +44,10 @@ jobs:
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update -q
           # nvcc + cudart headers are all the test binaries need (they only
-          # include <cuda_runtime.h>). Full toolkit would be ~3 GB.
-          sudo apt-get install -y -q cuda-nvcc-13-0 cuda-cudart-dev-13-0
+          # include <cuda_runtime.h>). Full toolkit would be ~3 GB. Pinned to
+          # 13.3: the 13.0 ptxas does not know the Blackwell clmad mnemonic
+          # the f128 kernels emit (13.3 is the locally validated toolchain).
+          sudo apt-get install -y -q cuda-nvcc-13-3 cuda-cudart-dev-13-3
           echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
 
       - name: Build all CUDA test binaries
