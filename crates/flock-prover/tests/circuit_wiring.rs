@@ -1500,7 +1500,7 @@ fn a_merge_node_folds_two_circuit_proofs() {
 
     // Its second job: fold both children's claims into ONE accumulator —
     // matrix work and sigma together (sigma never travels alone).
-    let mats = [(&r1cs.a_0, &r1cs.b_0)];
+    let mats: [flock_core::aggregate::TypeMatrices; 1] = [(&r1cs.a_0, &r1cs.b_0)];
     let circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![circuit_lc];
     let circuit0 = &proofs[0].3;
     let digest = circuit0.digest();

@@ -1061,7 +1061,7 @@ fn aggregating_real_proofs_defers_all_matrix_work_to_one_discharge() {
         .collect();
     let registry = Registry::new(vec![table_type(&slots[0])], nu);
     let m = registry.m_total();
-    let mats: Vec<(&SparseBinaryMatrix, &SparseBinaryMatrix)> = vec![(&slots[0].a0, &slots[0].b0)];
+    let mats: Vec<aggregate::TypeMatrices> = vec![(&slots[0].a0, &slots[0].b0)];
     // The tuned column-marginal path the fold uses for its k·nnz work.
     let agg_circ =
         SparseMatrixCircuit::new(&slots[0].a0, &slots[0].b0).with_const_pin(slots[0].pin);

@@ -1226,3 +1226,59 @@ fn chunk_only_packed_driver_matches_bool_reference() {
         assert_eq!(packed.3, reference.3, "stripe ({words} words)");
     }
 }
+
+/// The walked [`ChunkFoldMatrix`] must agree with the materialized
+/// composite in BOTH marginal directions, on factoring (eq-tensor) and
+/// non-factoring (random) weights alike, and discharge the same bilinear
+/// claims — the license for handing stub-matrix chunk types to the
+/// matrix-claim fold and the root discharge.
+#[test]
+fn chunk_only_fold_matrices_match_materialized() {
+    use flock_core::matrix_fold::{FoldMatrix, MatrixClaim, Weight};
+    for words in [4usize, 5, 13] {
+        let layout = MerkleTreeLayout::with_blake3_chunk_only(words, blake3_spec());
+        let (a_0, b_0) = layout.build_matrices();
+        let (fa, fb) = layout.fold_matrices();
+        let k = 1usize << layout.k_log;
+        assert_eq!(fa.n_rows(), k, "{words} words n_rows");
+        assert_eq!(fa.n_cols(), k, "{words} words n_cols");
+
+        let mut rng = Rng::new(0x_F0_1D_00_07 ^ words as u64);
+        // A rank-1 eq tensor (factors across subcubes) and a random vector
+        // (does not, at >1 block) — both must agree with the sparse form.
+        let eq_pt: Vec<F128> = (0..layout.k_log).map(|_| rng.f128()).collect();
+        let eq_w = Weight::eq(eq_pt).materialize();
+        let rand_w: Vec<F128> = (0..k).map(|_| rng.f128()).collect();
+        for (m, f, name) in [(&a_0, &fa, "A"), (&b_0, &fb, "B")] {
+            for (w, wname) in [(&eq_w, "eq"), (&rand_w, "random")] {
+                assert_eq!(
+                    f.row_marginal(w, k),
+                    m.row_marginal(w, k),
+                    "{words} words {name} row_marginal ({wname})"
+                );
+                assert_eq!(
+                    f.col_marginal(w, k),
+                    m.col_marginal(w, k),
+                    "{words} words {name} col_marginal ({wname})"
+                );
+            }
+            // An honest claim about the sparse form discharges against the
+            // walked form, and a perturbed one does not.
+            let row = Weight::eq((0..layout.k_log).map(|_| rng.f128()).collect::<Vec<_>>());
+            let col = Weight::eq((0..layout.k_log).map(|_| rng.f128()).collect::<Vec<_>>());
+            let claim = MatrixClaim::honest(row.clone(), col.clone(), m);
+            assert!(
+                claim.check_direct(f),
+                "{words} words {name}: honest claim discharges walked"
+            );
+            let bad = MatrixClaim {
+                value: claim.value + F128::ONE,
+                ..claim
+            };
+            assert!(
+                !bad.check_direct(f),
+                "{words} words {name}: perturbed claim rejected"
+            );
+        }
+    }
+}

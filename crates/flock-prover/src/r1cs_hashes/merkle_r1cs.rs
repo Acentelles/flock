@@ -1141,6 +1141,42 @@ impl MerkleTreeLayout {
         }
     }
 
+    /// The composite's two [`FoldMatrix`] views — `(A₀, B₀)` — walked, not
+    /// materialized: one stripped base side each, plus the extras. What the
+    /// matrix-claim fold ([`flock_core::aggregate`]) and the root discharge
+    /// consume for a stub-matrix table type, exactly as
+    /// [`Self::build_walker`] serves its lincheck.
+    pub fn fold_matrices(&self) -> (ChunkFoldMatrix, ChunkFoldMatrix) {
+        let (base_a, base_b) = (self.spec.build_matrices)();
+        let ovr = self.base_overridden();
+        let strip = |m: &SparseBinaryMatrix| -> SparseBinaryMatrix {
+            let mut rows = m.rows.clone();
+            for (c, o) in ovr.iter().enumerate() {
+                if *o {
+                    rows[c].clear();
+                }
+            }
+            SparseBinaryMatrix {
+                num_rows: m.num_rows,
+                num_cols: m.num_cols,
+                rows,
+            }
+        };
+        let k = self.k();
+        let (xa, xb) = self.extras();
+        let mk = |base: SparseBinaryMatrix, rows: Vec<Vec<usize>>| ChunkFoldMatrix {
+            base,
+            extras: SparseBinaryMatrix {
+                num_rows: k,
+                num_cols: k,
+                rows,
+            },
+            blocks: self.total_blocks(),
+            base_k_log: self.spec.k_log,
+        };
+        (mk(strip(&base_a), xa), mk(strip(&base_b), xb))
+    }
+
     // -----------------------------------------------------------------------
     // Witness
     // -----------------------------------------------------------------------
@@ -2034,6 +2070,133 @@ pub struct ChunkPathInput {
     /// gadget. A caller that only has a position passes `pos as u128`.
     pub index: u128,
     pub siblings: Vec<[u32; SLOT_WORDS]>,
+}
+
+// ---------------------------------------------------------------------------
+// The composite as a FoldMatrix (matrix-claim folds, root discharge)
+// ---------------------------------------------------------------------------
+
+/// One side (`A₀` or `B₀`) of a composite layout as a
+/// [`flock_core::matrix_fold::FoldMatrix`], walked instead of materialized:
+/// the stripped base side applied per aligned subcube, plus the extras —
+/// the same decomposition as [`MerkleWalkerCircuit`], in the fold's two
+/// marginal directions.
+///
+/// A weight that factors across the subcubes collapses to ONE base pass
+/// (every eq tensor the fold produces does — `prove_fold`'s `eq(ρ_col)`,
+/// `bilinear`'s materialized claim weights); the factorization is verified,
+/// not assumed, and a non-factoring weight takes the general per-subcube
+/// walk — a slower answer, never a wrong one.
+pub struct ChunkFoldMatrix {
+    /// The base block's side with overridden rows EMPTIED (their
+    /// replacements are in `extras`) — `2^κ` square, row-major.
+    base: SparseBinaryMatrix,
+    /// The composite's extra rows at global indices — `2^k` square.
+    extras: SparseBinaryMatrix,
+    blocks: usize,
+    base_k_log: usize,
+}
+
+/// Factor `w` across `windows` aligned `sub`-sized windows: find
+/// `(w_base, ρ)` with `w[t·sub + r] == ρ_t · w_base[r]`, or `None`. The
+/// mirror of [`MerkleWalkerCircuit::factor_eq`], on a bare slice.
+fn factor_windows(w: &[F128], sub: usize, windows: usize) -> Option<(Vec<F128>, Vec<F128>)> {
+    let slice = |t: usize| &w[t * sub..(t + 1) * sub];
+    let Some((t_ref, r0)) = (0..windows)
+        .find_map(|t| slice(t).iter().position(|v| *v != F128::ZERO).map(|r| (t, r)))
+    else {
+        // Every window is zero: the trivial factorization is exact.
+        return Some((vec![F128::ZERO; sub], vec![F128::ZERO; windows]));
+    };
+    let w_base = slice(t_ref).to_vec();
+    let inv = w_base[r0].inv();
+    let rho: Vec<F128> = (0..windows).map(|t| w[t * sub + r0] * inv).collect();
+    let exact = (0..windows).all(|t| {
+        let rho_t = rho[t];
+        slice(t).iter().zip(&w_base).all(|(&e, &b)| e == rho_t * b)
+    });
+    exact.then_some((w_base, rho))
+}
+
+impl flock_core::matrix_fold::FoldMatrix for ChunkFoldMatrix {
+    fn row_marginal(&self, w: &[F128], n_rows: usize) -> Vec<F128> {
+        let sub = 1usize << self.base_k_log;
+        let mut out = vec![F128::ZERO; n_rows];
+        match factor_windows(w, sub, self.blocks) {
+            Some((w_base, rho)) => {
+                let h = self.base.row_marginal(&w_base, sub);
+                for (t, &rho_t) in rho.iter().enumerate() {
+                    if rho_t == F128::ZERO {
+                        continue;
+                    }
+                    for (o, &v) in out[t * sub..(t + 1) * sub].iter_mut().zip(&h) {
+                        *o = rho_t * v;
+                    }
+                }
+            }
+            None => {
+                for t in 0..self.blocks {
+                    let h = self.base.row_marginal(&w[t * sub..(t + 1) * sub], sub);
+                    out[t * sub..(t + 1) * sub].copy_from_slice(&h);
+                }
+            }
+        }
+        // The extras reference global columns; their rows were stripped
+        // from the base, so `+=` writes each row exactly once.
+        for (r, cols) in self.extras.rows.iter().enumerate() {
+            if cols.is_empty() {
+                continue;
+            }
+            let mut acc = F128::ZERO;
+            for &c in cols {
+                acc += w[c];
+            }
+            out[r] += acc;
+        }
+        out
+    }
+
+    fn col_marginal(&self, w: &[F128], n_cols: usize) -> Vec<F128> {
+        let sub = 1usize << self.base_k_log;
+        let mut out = vec![F128::ZERO; n_cols];
+        match factor_windows(w, sub, self.blocks) {
+            Some((w_base, rho)) => {
+                let x = self.base.col_marginal(&w_base, sub);
+                for (t, &rho_t) in rho.iter().enumerate() {
+                    if rho_t == F128::ZERO {
+                        continue;
+                    }
+                    for (o, &v) in out[t * sub..(t + 1) * sub].iter_mut().zip(&x) {
+                        *o = rho_t * v;
+                    }
+                }
+            }
+            None => {
+                for t in 0..self.blocks {
+                    let x = self.base.col_marginal(&w[t * sub..(t + 1) * sub], sub);
+                    out[t * sub..(t + 1) * sub].copy_from_slice(&x);
+                }
+            }
+        }
+        for (r, cols) in self.extras.rows.iter().enumerate() {
+            let wr = w[r];
+            if wr == F128::ZERO || cols.is_empty() {
+                continue;
+            }
+            for &c in cols {
+                out[c] += wr;
+            }
+        }
+        out
+    }
+
+    fn n_rows(&self) -> usize {
+        self.extras.num_rows
+    }
+
+    fn n_cols(&self) -> usize {
+        self.extras.num_cols
+    }
 }
 
 /// Chunk block `i`'s 16-word message: bytes `[64i, 64(i+1))` of the leaf
