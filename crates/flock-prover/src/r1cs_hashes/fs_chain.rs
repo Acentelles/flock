@@ -26,7 +26,127 @@
 //! circuit — one proving a hash nobody computes — so this is differential
 //! rather than structural.
 
+use flock_core::field::F128;
+use flock_core::transcript_record::{Stream, TranscriptOp};
+
 use super::blake3::{Compression, blake3_compress};
+
+/// One forked child chain: its own trace plus the four cross-chain links
+/// that connect it to its parent. The child is an INDEPENDENT chain (own
+/// IV lineage, own domain), so its rows carry no parent dependency — the
+/// only coupling is the seed it absorbs and the digest it hands back.
+pub struct ChildChain {
+    pub trace: FsChainTrace,
+    /// The child's domain (the fork label).
+    pub label: Vec<u8>,
+    /// PARENT squeeze index whose two output halves seed the child.
+    pub seed_squeeze: usize,
+    /// Word index in the CHILD stream of the first seed word.
+    pub child_seed_word: usize,
+    /// CHILD squeeze index whose two output halves the parent absorbs.
+    pub digest_squeeze: usize,
+    /// Word index in the PARENT stream of the first merge-digest word.
+    pub parent_digest_word: usize,
+}
+
+impl ChildChain {
+    /// The child chain's absorbed bytes, for cross-link inspection.
+    pub fn trace_stream_bytes(
+        &self,
+        parent_stream: &Stream,
+        values: &[F128],
+        payloads: &[Vec<u8>],
+    ) -> Vec<u8> {
+        parent_stream
+            .forks
+            .iter()
+            .find(|f| f.label == self.label)
+            .expect("child belongs to this parent")
+            .stream
+            .to_bytes(values, payloads)
+    }
+}
+
+/// A parent chain and every chain forked from it.
+pub struct ForkedChains {
+    pub parent: FsChainTrace,
+    pub children: Vec<ChildChain>,
+}
+
+/// Drive ONE duplex chain from its stream: absorb up to each finalize
+/// point, squeeze that op's output width, repeat, then absorb the tail.
+///
+/// This is the canonical stream→trace driver (it was open-coded at every
+/// tower emission site). `ops` are THIS chain's ops: a `Forked` op does not
+/// finalize and its child's squeezes belong to the child's chain, so the
+/// top-level filter aligns with the parent stream's `finalize_after` by
+/// construction.
+pub fn trace_duplex(stream: &Stream, bytes: &[u8], ops: &[TranscriptOp]) -> FsChainTrace {
+    let mut chain = FsChainSponge::new();
+    let mut at = 0usize;
+    let fin_ops: Vec<&TranscriptOp> = ops.iter().filter(|o| o.finalizes()).collect();
+    assert_eq!(
+        stream.finalize_after.len(),
+        fin_ops.len(),
+        "finalize alignment: {} stream points vs {} finalizing ops",
+        stream.finalize_after.len(),
+        fin_ops.len()
+    );
+    for (k, &upto) in stream.finalize_after.iter().enumerate() {
+        chain.absorb(&bytes[at * 16..upto * 16]);
+        at = upto;
+        chain.finalize(fin_ops[k].squeezed_bytes());
+    }
+    chain.absorb(&bytes[at * 16..]);
+    chain.finish()
+}
+
+/// [`trace_duplex`] over a FORKED transcript: the parent chain plus one
+/// independent chain per fork, each with its cross-links.
+///
+/// Values and payloads are shared (the recorder numbers them globally
+/// across both chains), so one table feeds every stream.
+pub fn trace_duplex_forked(
+    ops: &[TranscriptOp],
+    stream: &Stream,
+    values: &[F128],
+    payloads: &[Vec<u8>],
+) -> ForkedChains {
+    let parent_bytes = stream.to_bytes(values, payloads);
+    let parent = trace_duplex(stream, &parent_bytes, ops);
+    let child_ops: Vec<&Vec<TranscriptOp>> = ops
+        .iter()
+        .filter_map(|o| match o {
+            TranscriptOp::Forked { ops, .. } => Some(ops),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        child_ops.len(),
+        stream.forks.len(),
+        "fork count: {} ops vs {} streams",
+        child_ops.len(),
+        stream.forks.len()
+    );
+    let children = stream
+        .forks
+        .iter()
+        .zip(child_ops)
+        .map(|(f, cops)| {
+            let bytes = f.stream.to_bytes(values, payloads);
+            ChildChain {
+                trace: trace_duplex(&f.stream, &bytes, cops),
+                label: f.label.clone(),
+                seed_squeeze: f.seed_squeeze,
+                child_seed_word: f.child_seed_word,
+                digest_squeeze: f.digest_squeeze,
+                parent_digest_word: f.parent_digest_word,
+            }
+        })
+        .collect();
+    ForkedChains { parent, children }
+}
+
 
 const CHUNK_START: u32 = 1 << 0;
 const CHUNK_END: u32 = 1 << 1;
@@ -610,5 +730,120 @@ mod tests {
         let chunk_parents = complete_chunks - complete_chunks.count_ones() as usize;
         let finalize = 1 + complete_chunks.count_ones() as usize;
         assert_eq!(t.rows.len(), absorb + chunk_parents + finalize);
+    }
+
+    /// THE DIFFERENTIAL for the forked transcript: a recorded fork/merge
+    /// protocol, replayed as two independent chains, must reproduce the
+    /// NATIVE challenger's challenges — parent and child alike — and the
+    /// four cross-links must carry the exact seed/digest bytes.
+    ///
+    /// This is what makes the fork safe to emit as circuit rows: getting
+    /// the child's lineage or the cross-wiring subtly wrong would still
+    /// produce a self-consistent circuit, one proving a transcript nobody
+    /// computes.
+    #[test]
+    fn forked_chains_reproduce_the_native_transcript() {
+        use flock_core::challenger::{Challenger, FsChallenger};
+        use flock_core::transcript_record::RecordingChallenger;
+
+        // Parent absorbs, forks, both sides run, merge, parent continues —
+        // the union prover's one-sided wiring branch in miniature.
+        fn drive<C: Challenger + Sized>(ch: &mut C) -> Vec<F128> {
+            let mut out = Vec::new();
+            ch.observe_label(b"parent");
+            for i in 0..40u64 {
+                ch.observe_f128(F128::new(i, i * 7));
+            }
+            out.push(ch.sample_f128());
+            let mut child = ch.fork(b"wiring-branch");
+            child.observe_label(b"child");
+            for i in 0..90u64 {
+                child.observe_f128(F128::new(i * 3, i));
+                if i % 16 == 15 {
+                    out.push(child.sample_f128());
+                }
+            }
+            out.push(child.sample_f128());
+            for i in 0..30u64 {
+                ch.observe_f128(F128::new(i, 0));
+            }
+            out.push(ch.sample_f128());
+            ch.merge_child(child);
+            out.push(ch.sample_f128());
+            out.push(ch.sample_f128());
+            out
+        }
+
+        const DOMAIN: &[u8] = b"fork-differential";
+        let native = drive(&mut FsChallenger::with_chained_blake3(DOMAIN));
+
+        let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(DOMAIN));
+        let recorded = drive(&mut rec);
+        assert_eq!(recorded, native, "recording must be transparent");
+
+        let shape = rec.shape();
+        let stream = shape.stream_words_duplex(DOMAIN);
+        let chains = trace_duplex_forked(shape.ops(), &stream, rec.values(), rec.payloads());
+        assert_eq!(chains.children.len(), 1);
+        let child = &chains.children[0];
+        assert_eq!(child.label, b"wiring-branch".to_vec());
+
+        // Squeeze outputs, chain by chain, as 16-byte challenges. A squeeze
+        // row's output words carry the XOF bytes; `squeezes[k]` lists the
+        // rows for finalize `k` (first is the ROOT).
+        let chal = |t: &FsChainTrace, k: usize| -> F128 {
+            let row = t.squeezes[k][0];
+            let (cv, m, counter, blen, flags) = t.rows[row];
+            let out = blake3_compress(&cv, &m, counter, blen, flags);
+            let mut b = [0u8; 16];
+            for (i, w) in out[..4].iter().enumerate() {
+                b[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+            }
+            F128::new(
+                u64::from_le_bytes(b[..8].try_into().unwrap()),
+                u64::from_le_bytes(b[8..].try_into().unwrap()),
+            )
+        };
+
+        // Parent challenge order: [0] pre-fork, then the two SEED squeezes,
+        // then the post-fork sample, then the two after the merge.
+        assert_eq!(chal(&chains.parent, 0), native[0], "pre-fork challenge");
+        // native[1..=6] are the child's (5 mid + 1 closing) — check the
+        // child chain reproduces them in its own order.
+        for (i, k) in (0..6).enumerate() {
+            assert_eq!(
+                chal(&child.trace, k),
+                native[1 + i],
+                "child challenge {k} diverged"
+            );
+        }
+        // The parent's own post-fork samples: after [0] came 2 seed squeezes,
+        // so the next parent finalize is index 3.
+        assert_eq!(chal(&chains.parent, 3), native[7], "post-fork parent");
+        assert_eq!(chal(&chains.parent, 4), native[8], "post-merge parent");
+        assert_eq!(chal(&chains.parent, 5), native[9], "post-merge parent 2");
+
+        // The CROSS-LINKS carry real bytes: the child's seed words equal the
+        // parent's seed-squeeze halves, and the parent's merge words equal
+        // the child's closing-squeeze halves. Checked through the recorded
+        // value table the streams index.
+        let parent_bytes = stream.to_bytes(rec.values(), rec.payloads());
+        let child_bytes = child.trace_stream_bytes(&stream, rec.values(), rec.payloads());
+        let word = |b: &[u8], i: usize| -> F128 {
+            F128::new(
+                u64::from_le_bytes(b[i * 16..i * 16 + 8].try_into().unwrap()),
+                u64::from_le_bytes(b[i * 16 + 8..i * 16 + 16].try_into().unwrap()),
+            )
+        };
+        assert_eq!(
+            word(&child_bytes, child.child_seed_word),
+            chal(&chains.parent, child.seed_squeeze),
+            "the child's first seed word is the parent's seed-squeeze output"
+        );
+        assert_eq!(
+            word(&parent_bytes, child.parent_digest_word),
+            chal(&child.trace, child.digest_squeeze),
+            "the parent's merge word is the child's closing-squeeze output"
+        );
     }
 }

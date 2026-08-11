@@ -61,6 +61,25 @@ pub enum TranscriptOp {
     SqueezeScalar,
     /// `sample_f128_vec` of `n` elements.
     SqueezeSlice(usize),
+    /// A forked child transcript (the parallel-composition branch): its
+    /// complete op sequence, run on its own chain under `label` as domain.
+    /// SITS AT THE FORK POSITION in the parent list; by convention the two
+    /// `SqueezeScalar` ops immediately preceding it are the child's seed,
+    /// the child's first two `ObserveScalar`s absorb that seed, and the
+    /// child's last two `SqueezeScalar`s are its closing digest — which the
+    /// two parent `ObserveScalar`s after the matching [`Self::Merge`] marker
+    /// absorb. Value/payload indices are GLOBAL: the walk descends into the
+    /// child inline at the fork position.
+    Forked {
+        label: Vec<u8>,
+        ops: Vec<TranscriptOp>,
+    },
+    /// Marks the merge of fork number `fork` (index among `Forked` ops, in
+    /// order): the two parent `ObserveScalar`s that follow absorb that
+    /// child's closing digest. Contributes no words itself.
+    Merge {
+        fork: usize,
+    },
     /// `grind_pow` / `verify_pow` at `bits`. Both sides absorb the nonce as
     /// `observe_bytes(8)` and take one state digest, so they share an op.
     Pow { bits: u32 },
@@ -92,6 +111,15 @@ impl TranscriptOp {
     /// [`TranscriptShape::stream_words_duplex`], never from this.
     pub fn absorbed_bytes(&self) -> usize {
         let pad16 = |n: usize| n.div_ceil(16) * 16;
+        // Fork bookkeeping absorbs nothing on THIS chain: the child runs on
+        // its own (its bytes are the child's), and `Merge` only marks that
+        // the following `ObserveScalar`s carry the digest.
+        if matches!(
+            self,
+            TranscriptOp::Forked { .. } | TranscriptOp::Merge { .. }
+        ) {
+            return 0;
+        }
         16 + match self {
             TranscriptOp::Label(l) => pad16(l.len()),
             TranscriptOp::ObserveScalar => 16,
@@ -101,6 +129,7 @@ impl TranscriptOp {
             TranscriptOp::SqueezeScalar | TranscriptOp::SqueezeSlice(_) => 0,
             // The PoW nonce rides `observe_bytes(8)`.
             TranscriptOp::Pow { .. } => 16,
+            TranscriptOp::Forked { .. } | TranscriptOp::Merge { .. } => unreachable!("early return"),
         }
     }
 
@@ -235,6 +264,23 @@ impl TranscriptShape {
                 TranscriptOp::Pow { bits } => {
                     h.update([6u8]);
                     h.update(bits.to_le_bytes());
+                }
+                // The child's shape is part of the parent's: a fork whose
+                // branch changed must move this digest.
+                TranscriptOp::Forked { label, ops } => {
+                    h.update([7u8]);
+                    h.update((label.len() as u64).to_le_bytes());
+                    h.update(label);
+                    h.update(
+                        TranscriptShape {
+                            ops: ops.clone(),
+                        }
+                        .digest(),
+                    );
+                }
+                TranscriptOp::Merge { fork } => {
+                    h.update([8u8]);
+                    h.update((*fork as u64).to_le_bytes());
                 }
             }
         }
@@ -399,87 +445,8 @@ impl TranscriptShape {
     /// framing constants in [`crate::challenger`], so there is one definition
     /// of the encoding, not two.
     pub fn stream_words(&self, domain: &[u8]) -> Stream {
-        use crate::challenger::{
-            KIND_NONE, KIND_SCALAR, KIND_SLICE, OP_BYTES, OP_DOMAIN, OP_LABEL, OP_OBSERVE,
-            OP_SQUEEZE,
-        };
-        let header = |op: u8, kind: u8, len: u64| {
-            StreamWord::Const(F128::new(op as u64 | ((kind as u64) << 8), len))
-        };
-        // Bytes, zero-padded to a multiple of 16, as little-endian words.
-        let padded = |b: &[u8], out: &mut Vec<StreamWord>| {
-            for c in b.chunks(16) {
-                let mut w = [0u8; 16];
-                w[..c.len()].copy_from_slice(c);
-                out.push(StreamWord::Const(F128::new(
-                    u64::from_le_bytes(w[..8].try_into().unwrap()),
-                    u64::from_le_bytes(w[8..].try_into().unwrap()),
-                )));
-            }
-        };
-
-        let mut out = Vec::new();
-        let mut finalize_after: Vec<usize> = Vec::new();
-        // The domain is absorbed at construction, before recording starts.
-        out.push(header(OP_DOMAIN, KIND_NONE, domain.len() as u64));
-        padded(domain, &mut out);
-
         let (mut values, mut payloads) = (0usize, 0usize);
-        for op in &self.ops {
-            match op {
-                TranscriptOp::Label(l) => {
-                    out.push(header(OP_LABEL, KIND_NONE, l.len() as u64));
-                    padded(l, &mut out);
-                }
-                TranscriptOp::ObserveScalar => {
-                    out.push(header(OP_OBSERVE, KIND_SCALAR, 1));
-                    out.push(StreamWord::Value(values));
-                    values += 1;
-                }
-                TranscriptOp::ObserveSlice(n) => {
-                    out.push(header(OP_OBSERVE, KIND_SLICE, *n as u64));
-                    for _ in 0..*n {
-                        out.push(StreamWord::Value(values));
-                        values += 1;
-                    }
-                }
-                TranscriptOp::ObserveBytes(len) => {
-                    out.push(header(OP_BYTES, KIND_NONE, *len as u64));
-                    for w in 0..len.div_ceil(16) {
-                        out.push(StreamWord::Bytes {
-                            payload: payloads,
-                            word: w,
-                        });
-                    }
-                    payloads += 1;
-                }
-                // Only the header: the squeezed output is not absorbed. The
-                // finalize happens right after it, so record the split point —
-                // without a re-absorbed word there is nothing else marking it.
-                TranscriptOp::SqueezeScalar => {
-                    out.push(header(OP_SQUEEZE, KIND_SCALAR, 1));
-                    finalize_after.push(out.len());
-                }
-                TranscriptOp::SqueezeSlice(n) => {
-                    out.push(header(OP_SQUEEZE, KIND_SLICE, *n as u64));
-                    finalize_after.push(out.len());
-                }
-                TranscriptOp::Pow { .. } => {
-                    // `grind_pow` digests the state BEFORE absorbing the nonce.
-                    finalize_after.push(out.len());
-                    out.push(header(OP_BYTES, KIND_NONE, 8));
-                    out.push(StreamWord::Bytes {
-                        payload: payloads,
-                        word: 0,
-                    });
-                    payloads += 1;
-                }
-            }
-        }
-        Stream {
-            words: out,
-            finalize_after,
-        }
+        Self::walk(&self.ops, domain, false, &mut values, &mut payloads)
     }
 
     /// [`Self::stream_words`] for the DUPLEX chain discipline
@@ -490,10 +457,29 @@ impl TranscriptShape {
     /// nonce (header + payload word); its state digest is a squeeze and
     /// absorbs nothing.
     ///
-    /// The v2 layout above stays the truth for the SHA-256 and tree-BLAKE3
+    /// The v2 layout stays the truth for the SHA-256 and tree-BLAKE3
     /// transcripts, whose immutable squeezes DO absorb a separating header.
     pub fn stream_words_duplex(&self, domain: &[u8]) -> Stream {
-        use crate::challenger::{KIND_NONE, KIND_SCALAR, KIND_SLICE, OP_BYTES, OP_DOMAIN, OP_LABEL, OP_OBSERVE};
+        let (mut values, mut payloads) = (0usize, 0usize);
+        Self::walk(&self.ops, domain, true, &mut values, &mut payloads)
+    }
+
+    /// The shared stream walk. `duplex` selects the v3 squeeze framing (no
+    /// `OP_SQUEEZE` header word). A [`TranscriptOp::Forked`] descends into
+    /// its own chain — contributing no words here — while `values` and
+    /// `payloads` keep counting GLOBALLY, matching the recorder's inline
+    /// splice.
+    fn walk(
+        ops: &[TranscriptOp],
+        domain: &[u8],
+        duplex: bool,
+        values: &mut usize,
+        payloads: &mut usize,
+    ) -> Stream {
+        use crate::challenger::{
+            KIND_NONE, KIND_SCALAR, KIND_SLICE, OP_BYTES, OP_DOMAIN, OP_LABEL, OP_OBSERVE,
+            OP_SQUEEZE,
+        };
         let header = |op: u8, kind: u8, len: u64| {
             StreamWord::Const(F128::new(op as u64 | ((kind as u64) << 8), len))
         };
@@ -510,11 +496,12 @@ impl TranscriptShape {
 
         let mut out = Vec::new();
         let mut finalize_after: Vec<usize> = Vec::new();
+        let mut forks: Vec<ForkStream> = Vec::new();
+        // The domain is absorbed at construction, before recording starts.
         out.push(header(OP_DOMAIN, KIND_NONE, domain.len() as u64));
         padded(domain, &mut out);
 
-        let (mut values, mut payloads) = (0usize, 0usize);
-        for op in &self.ops {
+        for op in ops {
             match op {
                 TranscriptOp::Label(l) => {
                     out.push(header(OP_LABEL, KIND_NONE, l.len() as u64));
@@ -522,46 +509,100 @@ impl TranscriptShape {
                 }
                 TranscriptOp::ObserveScalar => {
                     out.push(header(OP_OBSERVE, KIND_SCALAR, 1));
-                    out.push(StreamWord::Value(values));
-                    values += 1;
+                    out.push(StreamWord::Value(*values));
+                    *values += 1;
                 }
                 TranscriptOp::ObserveSlice(n) => {
                     out.push(header(OP_OBSERVE, KIND_SLICE, *n as u64));
                     for _ in 0..*n {
-                        out.push(StreamWord::Value(values));
-                        values += 1;
+                        out.push(StreamWord::Value(*values));
+                        *values += 1;
                     }
                 }
                 TranscriptOp::ObserveBytes(len) => {
                     out.push(header(OP_BYTES, KIND_NONE, *len as u64));
                     for w in 0..len.div_ceil(16) {
                         out.push(StreamWord::Bytes {
-                            payload: payloads,
+                            payload: *payloads,
                             word: w,
                         });
                     }
-                    payloads += 1;
+                    *payloads += 1;
                 }
-                // Duplex squeezes absorb nothing — only the split point.
-                TranscriptOp::SqueezeScalar | TranscriptOp::SqueezeSlice(_) => {
+                TranscriptOp::SqueezeScalar => {
+                    if !duplex {
+                        out.push(header(OP_SQUEEZE, KIND_SCALAR, 1));
+                    }
                     finalize_after.push(out.len());
                 }
+                TranscriptOp::SqueezeSlice(n) => {
+                    if !duplex {
+                        out.push(header(OP_SQUEEZE, KIND_SLICE, *n as u64));
+                    }
+                    finalize_after.push(out.len());
+                }
+                // A fork adds NO words to this chain: the child is its own
+                // stream. The two squeezes immediately before are its seed;
+                // the child's first two absorbed words are those halves.
+                TranscriptOp::Forked { label, ops: child } => {
+                    assert!(
+                        finalize_after.len() >= 2,
+                        "a fork must follow its two seed squeezes"
+                    );
+                    let seed_squeeze = finalize_after.len() - 2;
+                    let stream = Self::walk(child, label, duplex, values, payloads);
+                    // The child's first ObserveScalar value word: after its
+                    // domain header + padded label, plus the observe header.
+                    let child_seed_word = 1 + label.len().div_ceil(16) + 1;
+                    assert!(
+                        matches!(stream.words.get(child_seed_word), Some(StreamWord::Value(_))),
+                        "child chain must open by absorbing its seed"
+                    );
+                    assert!(
+                        stream.finalize_after.len() >= 2,
+                        "child chain must close with its digest squeezes"
+                    );
+                    let digest_squeeze = stream.finalize_after.len() - 2;
+                    forks.push(ForkStream {
+                        label: label.clone(),
+                        stream,
+                        seed_squeeze,
+                        child_seed_word,
+                        digest_squeeze,
+                        // Filled by the matching `Merge` below.
+                        parent_digest_word: usize::MAX,
+                    });
+                }
+                // No words of its own: it marks that the next two
+                // ObserveScalars carry fork `fork`'s closing digest.
+                TranscriptOp::Merge { fork } => {
+                    let f = forks
+                        .get_mut(*fork)
+                        .expect("Merge names a fork that was not recorded");
+                    // The next op is an ObserveScalar: header at `out.len()`,
+                    // its value word immediately after.
+                    f.parent_digest_word = out.len() + 1;
+                }
                 TranscriptOp::Pow { .. } => {
-                    // The state digest is a (duplex) squeeze; then the nonce
-                    // is absorbed exactly as in v2.
+                    // `grind_pow` digests the state BEFORE absorbing the nonce.
                     finalize_after.push(out.len());
                     out.push(header(OP_BYTES, KIND_NONE, 8));
                     out.push(StreamWord::Bytes {
-                        payload: payloads,
+                        payload: *payloads,
                         word: 0,
                     });
-                    payloads += 1;
+                    *payloads += 1;
                 }
             }
         }
+        debug_assert!(
+            forks.iter().all(|f| f.parent_digest_word != usize::MAX),
+            "every fork must be merged"
+        );
         Stream {
             words: out,
             finalize_after,
+            forks,
         }
     }
 }
@@ -577,6 +618,34 @@ pub struct Stream {
     /// Needed because squeezed output is no longer fed back, so nothing in the
     /// stream itself marks a squeeze's position any more.
     pub finalize_after: Vec<usize>,
+    /// Child chains forked from this one, in fork order. A fork contributes
+    /// NO words to this stream — the child is an independent chain — so a
+    /// consumer emits one row set per stream and connects them through the
+    /// four cross-links each [`ForkStream`] names.
+    pub forks: Vec<ForkStream>,
+}
+
+/// A forked child chain and its four cross-chain word links.
+///
+/// The child is a complete independent stream (own domain = the fork label,
+/// own IV lineage). Its `Value`/`Bytes` indices share the parent's GLOBAL
+/// numbering — the recorder splices child values in at the fork position, so
+/// a single value table serves both chains.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForkStream {
+    pub label: Vec<u8>,
+    pub stream: Stream,
+    /// Index into the PARENT's `finalize_after` of the seed squeeze: its two
+    /// output halves are the child's first two absorbed words.
+    pub seed_squeeze: usize,
+    /// Word index in the CHILD stream of the first seed word (the second is
+    /// the next `Value` word after it).
+    pub child_seed_word: usize,
+    /// Index into the CHILD's `finalize_after` of the closing digest squeeze:
+    /// its two output halves are what the parent absorbs at merge.
+    pub digest_squeeze: usize,
+    /// Word index in the PARENT stream of the first merge-digest word.
+    pub parent_digest_word: usize,
 }
 
 /// A [`Challenger`] decorator that records the transcript's shape while
@@ -592,6 +661,19 @@ pub struct RecordingChallenger<Ch: Challenger> {
     values: Vec<F128>,
     payloads: Vec<Vec<u8>>,
     challenges: Vec<F128>,
+    /// Set on a FORKED child recorder: the placeholder slot in the parent's
+    /// `ops` this child's recording splices into at merge, its label, and
+    /// the parent's value/payload/challenge counts at fork time (the splice
+    /// offsets that keep GLOBAL indices consistent with the inline walk).
+    fork: Option<ForkedAt>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ForkedAt {
+    slot: usize,
+    value_base: usize,
+    payload_base: usize,
+    challenge_base: usize,
 }
 
 impl<Ch: Challenger> RecordingChallenger<Ch> {
@@ -602,6 +684,7 @@ impl<Ch: Challenger> RecordingChallenger<Ch> {
             values: Vec::new(),
             payloads: Vec::new(),
             challenges: Vec::new(),
+            fork: None,
         }
     }
 
@@ -646,13 +729,74 @@ impl<Ch: Challenger> RecordingChallenger<Ch> {
 }
 
 impl<Ch: Challenger> Challenger for RecordingChallenger<Ch> {
-    fn fork(&mut self, _label: &'static [u8]) -> Self {
-        // The fork/join transcript variant (FLOCK_PAR_TRANSCRIPT) has no
-        // tape encoding yet: recording a forked transcript needs fork/merge
-        // ops in `TranscriptShape` and matching circuit regions. Until that
-        // lands, the flag and the recorded (tower) paths are mutually
-        // exclusive — a recorded prove must run the sequential transcript.
-        unimplemented!("RecordingChallenger does not support transcript forks (no tape format yet)")
+    fn fork_from_seed(&self, _seed: [F128; 2], _label: &'static [u8]) -> Self {
+        // `fork` (below) is the recorded entry: it samples the seed THROUGH
+        // the recorder so the two seed squeezes land on the tape, then
+        // splices via the placeholder. A bare `fork_from_seed` would leave
+        // the seed extraction unrecorded and the replay would diverge.
+        unimplemented!("use fork() on a RecordingChallenger — the seed must be recorded")
+    }
+
+    fn fork(&mut self, label: &'static [u8]) -> Self {
+        // Recorded fork: the two seed squeezes go on the parent tape as
+        // ordinary ops (the convention consumers rely on: the two
+        // SqueezeScalar immediately before the Forked slot are the seed),
+        // then a placeholder Forked op reserves the fork position; the
+        // child recorder splices into it at merge.
+        let seed = [self.sample_f128(), self.sample_f128()];
+        let slot = self.ops.len();
+        self.ops.push(TranscriptOp::Forked {
+            label: label.to_vec(),
+            ops: Vec::new(),
+        });
+        RecordingChallenger {
+            inner: self.inner.fork_from_seed(seed, label),
+            ops: vec![
+                TranscriptOp::ObserveScalar,
+                TranscriptOp::ObserveScalar,
+            ],
+            values: vec![seed[0], seed[1]],
+            payloads: Vec::new(),
+            challenges: Vec::new(),
+            fork: Some(ForkedAt {
+                slot,
+                value_base: self.values.len(),
+                payload_base: self.payloads.len(),
+                challenge_base: self.challenges.len(),
+            }),
+        }
+    }
+
+    fn merge_child(&mut self, mut child: Self) {
+        // The child's closing digest, squeezed THROUGH the child recorder
+        // (landing on its tape as its final two ops).
+        let d0 = child.sample_f128();
+        let d1 = child.sample_f128();
+        let at = child
+            .fork
+            .expect("merge_child on a recorder that was not forked from this one");
+        // Splice the child's recording into the fork position: its ops fill
+        // the placeholder; its values/payloads/challenges insert at the
+        // fork-time offsets, so GLOBAL indices match the inline walk
+        // (pre-fork, child, post-fork).
+        let fork_count = self.ops[..at.slot]
+            .iter()
+            .filter(|op| matches!(op, TranscriptOp::Forked { .. }))
+            .count();
+        match &mut self.ops[at.slot] {
+            TranscriptOp::Forked { ops, .. } => *ops = child.ops,
+            _ => panic!("fork slot does not hold a Forked placeholder"),
+        }
+        self.values
+            .splice(at.value_base..at.value_base, child.values);
+        self.payloads
+            .splice(at.payload_base..at.payload_base, child.payloads);
+        self.challenges
+            .splice(at.challenge_base..at.challenge_base, child.challenges);
+        // The merge marker, then the digest absorbs on the parent.
+        self.ops.push(TranscriptOp::Merge { fork: fork_count });
+        self.observe_f128(d0);
+        self.observe_f128(d1);
     }
 
     fn observe_label(&mut self, label: &[u8]) {
@@ -749,6 +893,113 @@ mod tests {
                 "recording changed the challenge stream under {kind:?}"
             );
         }
+    }
+
+    /// A FORK recorded through the decorator is transparent (identical
+    /// challenges to the bare challenger driving the same fork/merge), and
+    /// the recorded shape yields a well-formed two-chain stream: the parent
+    /// contributes no words for the fork, the child is its own stream under
+    /// the fork label, and the four cross-links land on `Value` words.
+    #[test]
+    fn recording_a_fork_is_transparent_and_yields_two_chains() {
+        // The protocol under test: absorb, fork, drive the child, merge,
+        // then sample on the parent — the one-sided shape of the union
+        // prover's wiring branch.
+        fn drive_forked<C: Challenger + Sized>(ch: &mut C) -> Vec<F128> {
+            let mut out = Vec::new();
+            ch.observe_label(b"parent-phase");
+            ch.observe_f128(F128::new(11, 0));
+            out.push(ch.sample_f128());
+            let mut child = ch.fork(b"child-domain");
+            child.observe_label(b"child-phase");
+            child.observe_f128(F128::new(22, 0));
+            out.push(child.sample_f128());
+            child.observe_f128(F128::new(33, 0));
+            out.push(child.sample_f128());
+            // Parent work concurrent with the child, in transcript terms.
+            ch.observe_f128(F128::new(44, 0));
+            out.push(ch.sample_f128());
+            ch.merge_child(child);
+            out.push(ch.sample_f128());
+            out
+        }
+
+        for kind in [HashKind::Sha256, HashKind::Blake3] {
+            let mut bare = FsChallenger::with_hash(b"forked", kind);
+            let expected = drive_forked(&mut bare);
+            let mut rec = RecordingChallenger::new(FsChallenger::with_hash(b"forked", kind));
+            let got = drive_forked(&mut rec);
+            assert_eq!(
+                got, expected,
+                "recording changed the challenge stream across a fork under {kind:?}"
+            );
+        }
+
+        let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(b"forked"));
+        let _ = drive_forked(&mut rec);
+        let shape = rec.shape();
+
+        // The fork sits inline, preceded by its two seed squeezes and
+        // followed (later) by its merge marker.
+        let fork_at = shape
+            .ops()
+            .iter()
+            .position(|o| matches!(o, TranscriptOp::Forked { .. }))
+            .expect("a fork was recorded");
+        assert!(
+            matches!(shape.ops()[fork_at - 1], TranscriptOp::SqueezeScalar)
+                && matches!(shape.ops()[fork_at - 2], TranscriptOp::SqueezeScalar),
+            "the two seed squeezes must immediately precede the fork"
+        );
+        let merge_at = shape
+            .ops()
+            .iter()
+            .position(|o| matches!(o, TranscriptOp::Merge { fork: 0 }))
+            .expect("the fork was merged");
+        assert!(merge_at > fork_at, "merge follows its fork");
+        assert!(
+            matches!(shape.ops()[merge_at + 1], TranscriptOp::ObserveScalar)
+                && matches!(shape.ops()[merge_at + 2], TranscriptOp::ObserveScalar),
+            "the merge digest absorbs two scalars on the parent"
+        );
+
+        let stream = shape.stream_words_duplex(b"forked");
+        assert_eq!(stream.forks.len(), 1, "one child chain");
+        let f = &stream.forks[0];
+        assert_eq!(f.label, b"child-domain".to_vec());
+        // The child is its own chain: its stream opens with its own domain
+        // header, and none of its words leaked into the parent's.
+        assert!(matches!(f.stream.words[0], StreamWord::Const(_)));
+        // The four cross-links point at real value words.
+        assert!(matches!(
+            f.stream.words[f.child_seed_word],
+            StreamWord::Value(_)
+        ));
+        assert!(matches!(
+            stream.words[f.parent_digest_word],
+            StreamWord::Value(_)
+        ));
+        assert!(f.seed_squeeze + 2 <= stream.finalize_after.len());
+        assert!(f.digest_squeeze + 2 <= f.stream.finalize_after.len());
+
+        // GLOBAL value numbering: the child's values are spliced in at the
+        // fork position, so every `Value(i)` across BOTH chains indexes the
+        // one table, each exactly once.
+        let mut seen: Vec<usize> = stream
+            .words
+            .iter()
+            .chain(f.stream.words.iter())
+            .filter_map(|w| match w {
+                StreamWord::Value(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            (0..rec.values().len()).collect::<Vec<_>>(),
+            "every recorded value is placed exactly once across the two chains"
+        );
     }
 
     #[test]

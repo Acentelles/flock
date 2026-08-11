@@ -94,6 +94,15 @@ pub trait Challenger: Send {
         true
     }
 
+    /// Construct the DOMAIN-SEPARATED child transcript from an
+    /// externally-supplied 256-bit seed. The building block of
+    /// [`Self::fork`]; split out so wrappers that must RECORD the seed
+    /// extraction (the tape recorder) can sample through themselves and
+    /// then delegate here.
+    fn fork_from_seed(&self, seed: [F128; 2], label: &'static [u8]) -> Self
+    where
+        Self: Sized;
+
     /// Fork a DOMAIN-SEPARATED child transcript for parallel sub-protocol
     /// composition. The child is deterministically derived from a seed
     /// SAMPLED from the parent (which advances the parent's state, so the
@@ -105,7 +114,11 @@ pub trait Challenger: Send {
     /// at identical transcript positions with identical labels.
     fn fork(&mut self, label: &'static [u8]) -> Self
     where
-        Self: Sized;
+        Self: Sized,
+    {
+        let seed = [self.sample_f128(), self.sample_f128()];
+        self.fork_from_seed(seed, label)
+    }
 
     /// Absorb a child transcript's closing digest (two squeezed field
     /// elements — 256 state-binding bits) into this transcript. See
@@ -158,15 +171,14 @@ impl Challenger for RandomChallenger {
         F128 { lo, hi }
     }
 
-    fn fork(&mut self, label: &'static [u8]) -> Self {
-        // Seed the child from a parent sample + a label mix; binding is
-        // irrelevant here (this challenger ignores messages by design).
-        let s = self.sample_f128();
+    fn fork_from_seed(&self, seed: [F128; 2], label: &'static [u8]) -> Self {
+        // Binding is irrelevant here (this challenger ignores messages by
+        // design); mix the seed with the label for distinct streams.
         let mut l = 0u64;
         for &b in label {
             l = l.wrapping_mul(0x100_0000_01B3).wrapping_add(b as u64);
         }
-        RandomChallenger::new(s.lo ^ l)
+        RandomChallenger::new(seed[0].lo ^ l)
     }
 }
 
@@ -595,10 +607,10 @@ impl Challenger for FsChallenger {
         F128 { lo, hi }
     }
 
-    fn fork(&mut self, label: &'static [u8]) -> Self {
-        // 256 bits of parent state seed the child under its own domain; the
-        // sampling advances the parent, binding the fork point.
-        let seed = [self.sample_f128(), self.sample_f128()];
+    fn fork_from_seed(&self, seed: [F128; 2], label: &'static [u8]) -> Self {
+        // 256 bits of parent state (sampled by `fork`'s default body, which
+        // advances the parent and binds the fork point) seed the child under
+        // its own domain.
         let mut child = match &self.state {
             FsState::Sha256(_) => Self::with_hash(label, HashKind::Sha256),
             FsState::Blake3(_) => Self::with_hash(label, HashKind::Blake3),

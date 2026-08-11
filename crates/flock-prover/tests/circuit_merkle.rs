@@ -9776,6 +9776,10 @@ impl<'p> RealTape<'p> {
                             n_obs += 1;
                             pend += 16 + pad16(*len);
                         }
+                        // Fork bookkeeping contributes nothing to THIS
+                        // chain: the child is an independent chain and its
+                        // rows are counted from its own stream.
+                        Op::Forked { .. } | Op::Merge { .. } => {}
                         Op::SqueezeScalar | Op::SqueezeSlice(_) | Op::Pow { .. } => {
                             n_sq += 1;
                             // v3: the squeeze row eats the pending partial
@@ -15012,6 +15016,10 @@ impl<'p> ChildTape<'p> {
                             n_obs += 1;
                             pend += 16 + pad16(*len);
                         }
+                        // Fork bookkeeping contributes nothing to THIS
+                        // chain: the child is an independent chain and its
+                        // rows are counted from its own stream.
+                        Op::Forked { .. } | Op::Merge { .. } => {}
                         Op::SqueezeScalar | Op::SqueezeSlice(_) | Op::Pow { .. } => {
                             n_sq += 1;
                             // v3: the squeeze row eats the pending partial
