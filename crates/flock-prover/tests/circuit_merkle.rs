@@ -24404,6 +24404,7 @@ fn chain_tower_m32_headline() {
     );
     proof_census("internal node", &node.proof, &node.pcs);
     proof_census("chain leaf (m32 Fast)", &cp0.inner.proof, &cp0.inner.pcs);
+    proof_census("FL node", &fl0.lo.proof, &fl0.lo.pcs);
 }
 
 /// **THE ONLINE BENCH: leaf, first-level node, internal node.** One number
