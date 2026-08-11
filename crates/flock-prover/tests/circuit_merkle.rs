@@ -24403,6 +24403,7 @@ fn chain_tower_m32_headline() {
         bincode::serialize(&node.proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
     );
     proof_census("internal node", &node.proof, &node.pcs);
+    proof_census("chain leaf (m32 Fast)", &cp0.inner.proof, &cp0.inner.pcs);
 }
 
 /// **THE ONLINE BENCH: leaf, first-level node, internal node.** One number
