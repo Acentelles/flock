@@ -3053,18 +3053,24 @@ fn bytes_payload_mask(ops: &[flock_core::transcript_record::TranscriptOp]) -> Ve
 /// the same order, one linear `fin` numbering covers both chains and every
 /// existing index site keeps working unchanged. Concretely:
 ///
-/// 1. `emit_fs_chain_forked(.., chains: &ForkedChains, ..)` emits the parent
+/// 1. `flatten_ops(ops) -> Vec<Op>`: splice each `Forked`'s ops inline at
+///    its fork position (recursively), drop `Merge`. THIS IS THE WHOLE
+///    LOCATOR STORY — `find(label)` and `Cur` both walk a flat list, so on
+///    the flattened view every label is found and every `fin`/`ch`/`v`
+///    lands in inline-walk order with no cursor change at all. Only the
+///    region ORDER assertions move (the wiring/GKR labels now precede the
+///    zerocheck's, since the fork sits before it).
+/// 2. `emit_fs_chain_forked(.., chains: &ForkedChains, ..)` emits the parent
 ///    rows then each child's rows into the same b3 slot (a child's first row
 ///    links `CvSource::Iv` — its own lineage — which this loop already
 ///    handles), and returns:
 ///    - `outs`: parent row outputs followed by child row outputs;
-///    - `squeezes`: the finalize list in INLINE-WALK order, child row
-///      indices offset by the parent row count;
+///    - `squeezes` in the SAME inline-walk order the flattened ops imply:
+///      `parent[..=seed_squeeze] ++ child (rows offset by parent row count)
+///      ++ parent[seed_squeeze+1..]`;
 ///    - `vmap: Vec<Option<Wire>>` keyed by GLOBAL value index (the recorder
 ///      numbers values across both chains), replacing the per-site
 ///      `value -> word index` map so callers never see the chain split.
-/// 2. `Cur::bump` descends into `Forked { ops }` (recursing for `fin`/`ch`/
-///    `v`) and treats `Merge` as a no-op — one arm each.
 /// 3. The four cross-links per fork (`ChildChain::{seed_squeeze,
 ///    child_seed_word, digest_squeeze, parent_digest_word}`) are ALIASES,
 ///    not gates: point the child's two seed word wires at the parent's
