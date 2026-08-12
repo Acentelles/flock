@@ -127,6 +127,7 @@ impl MerklePathGrinding {
         match profile {
             flock_core::pcs::ligerito::LigeritoProfile::Secure => Self::per_challenge_128(),
             flock_core::pcs::ligerito::LigeritoProfile::Fast
+            | flock_core::pcs::ligerito::LigeritoProfile::Fast100
             | flock_core::pcs::ligerito::LigeritoProfile::Slim => Self::disabled(),
         }
     }

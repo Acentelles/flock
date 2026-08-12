@@ -78,6 +78,7 @@ impl PcsParams {
                 crate::zerocheck::ZerocheckGrinding::per_challenge_128()
             }
             crate::pcs::ligerito::LigeritoProfile::Fast
+            | crate::pcs::ligerito::LigeritoProfile::Fast100
             | crate::pcs::ligerito::LigeritoProfile::Slim => {
                 crate::zerocheck::ZerocheckGrinding::disabled()
             }
@@ -96,6 +97,7 @@ impl PcsParams {
                 crate::lincheck::LincheckGrinding::per_challenge_128()
             }
             crate::pcs::ligerito::LigeritoProfile::Fast
+            | crate::pcs::ligerito::LigeritoProfile::Fast100
             | crate::pcs::ligerito::LigeritoProfile::Slim => {
                 crate::lincheck::LincheckGrinding::disabled()
             }
@@ -109,6 +111,7 @@ impl PcsParams {
                 crate::element_r1cs::Grinding::per_challenge_128()
             }
             crate::pcs::ligerito::LigeritoProfile::Fast
+            | crate::pcs::ligerito::LigeritoProfile::Fast100
             | crate::pcs::ligerito::LigeritoProfile::Slim => {
                 crate::element_r1cs::Grinding::disabled()
             }
@@ -127,6 +130,7 @@ impl PcsParams {
                 crate::pcs::OpeningGrinding::per_challenge_128()
             }
             crate::pcs::ligerito::LigeritoProfile::Fast
+            | crate::pcs::ligerito::LigeritoProfile::Fast100
             | crate::pcs::ligerito::LigeritoProfile::Slim => {
                 crate::pcs::OpeningGrinding::disabled()
             }
@@ -140,6 +144,7 @@ impl PcsParams {
                 crate::product_gkr::BatchedGrinding::per_challenge_128()
             }
             crate::pcs::ligerito::LigeritoProfile::Fast
+            | crate::pcs::ligerito::LigeritoProfile::Fast100
             | crate::pcs::ligerito::LigeritoProfile::Slim => {
                 crate::product_gkr::BatchedGrinding::disabled()
             }
@@ -153,6 +158,7 @@ impl PcsParams {
                 crate::matrix_fold::FoldGrinding::per_challenge_128()
             }
             crate::pcs::ligerito::LigeritoProfile::Fast
+            | crate::pcs::ligerito::LigeritoProfile::Fast100
             | crate::pcs::ligerito::LigeritoProfile::Slim => {
                 crate::matrix_fold::FoldGrinding::disabled()
             }

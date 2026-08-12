@@ -22,6 +22,7 @@ use flock_prover::pcs::ligerito::{LigeritoProfile, LigeritoSecurityConfig};
 fn main() {
     let profiles = [
         LigeritoProfile::Fast,
+        LigeritoProfile::Fast100,
         LigeritoProfile::Slim,
         LigeritoProfile::Secure,
     ];
