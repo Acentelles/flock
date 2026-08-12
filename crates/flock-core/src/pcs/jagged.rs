@@ -2932,6 +2932,14 @@ pub fn prove_multipoint_twisted<C: Challenger>(
             let msg = ar.round0_msg(&eq0);
             msg0 = (msg0.0 + msg.0, msg0.1 + msg.1);
             pairs.push(Pair::AlignedRs(ar));
+        } else if virtual_a_on() && claims.len() <= LAZY_RS_MAX_SIDES {
+            // Jagged shape, ā VIRTUAL: no 2^m weight buffer — round 0
+            // streams the column walk, the first fold materializes at half
+            // size ([`LazyRsPair`]; byte-identical by char-2 reassociation).
+            let lz = LazyRsPair::new(params, claims, &gpow, partner, rho);
+            let msg = lz.round0_msg(&eq0);
+            msg0 = (msg0.0 + msg.0, msg0.1 + msg.1);
+            pairs.push(Pair::LazyRs(lz));
         } else {
             let eq_cs: Vec<Vec<F128>> = claims.iter().map(|c| build_eq_table(c.z_col)).collect();
             let sides: Vec<(F128, Vec<F128>, &[F128])> = claims
@@ -2980,6 +2988,7 @@ pub fn prove_multipoint_twisted<C: Challenger>(
              {n_full} full(2^{}), {n_pow2} pow2; heights {}",
             match pairs.first() {
                 Some(Pair::AlignedRs(_)) => "ALIGNED closed-form weight",
+                Some(Pair::LazyRs(_)) => "dense VIRTUAL weight (half materializes at fold 0)",
                 _ => "dense materialized weight",
             },
             params.n,
@@ -3923,14 +3932,237 @@ const SPARSE_DENSIFY_FACTOR: usize = 4;
 /// virtual partner, the group product's segment-sparse state, or the RS
 /// product's aligned closed form — the latter two densify themselves into
 /// the first for the tail rounds.
+/// Cap on the RS claim count the lazy pair's per-position side loop hoists
+/// for (a fixed-width array). Real proofs carry R = 2; anything wider falls
+/// back to the materialized path.
+const LAZY_RS_MAX_SIDES: usize = 8;
+
+/// In-process override for the lazy (virtual-ā) dense RS pair: 0 = env
+/// (`FLOCK_NO_VIRTUAL_A` disables), 1 = force on, 2 = force off — the
+/// alternating-arm contract of [`crate::pcs::VIRTUAL_B_OVERRIDE`].
+pub static VIRTUAL_A_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+fn virtual_a_on() -> bool {
+    match VIRTUAL_A_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => std::env::var_os("FLOCK_NO_VIRTUAL_A").is_none(),
+    }
+}
+
+/// The dense RS product with its full-size combined weight NEVER
+/// materialized. Per column `y` the weight is a scaled prefix of each
+/// claim's row-eq table — `ā(t_y + row) = Σ_i w_i[y]·eq_i[row]`, `row <
+/// h_y`, and the columns tile the area contiguously — so any position is a
+/// few-multiply read. Round 0's message streams those reads, and the FIRST
+/// fold writes the HALF-SIZE folded vector straight from the same walk:
+/// the `2^m` buffer's allocation, its fill traffic and the first fold's
+/// re-read of it never happen. From round 1 on this IS the materialized
+/// [`VirtualPair`], at half size, on pool memory.
+///
+/// EXACT: every difference from the materialized path is a reassociation
+/// of char-2 sums (skipped terms all carry a zero `ā` factor), so round
+/// messages — and proof bytes — are bit-identical. Pinned by
+/// `virtual_a_dense_rs_byte_oracle`.
+struct LazyRsPair {
+    /// Per claim: (per-column weights `γ-power·eq(z_col, y)` over the `2^k`
+    /// columns, row-eq table over `2^n`).
+    sides: Vec<(Vec<F128>, Vec<F128>)>,
+    partner: Partner,
+    rho: Vec<F128>,
+    pfx: Vec<u64>,
+    area: u64,
+}
+
+impl LazyRsPair {
+    fn new(
+        params: &JaggedParams,
+        claims: &[FrobeniusClaim<'_>],
+        gpow: &[F128],
+        partner: Partner,
+        rho: &[F128],
+    ) -> Self {
+        debug_assert!(claims.len() <= LAZY_RS_MAX_SIDES);
+        let sides = claims
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let eq_c = build_eq_table(c.z_col);
+                // Same grouping as the materialized fill's `w = scale·cols[y]`.
+                let cols = eq_c.iter().map(|&e| gpow[128 * i] * e).collect();
+                (cols, build_eq_table(c.z_row))
+            })
+            .collect();
+        Self {
+            sides,
+            partner,
+            rho: rho.to_vec(),
+            pfx: params.col_prefix_sums.clone(),
+            area: params.area(),
+        }
+    }
+
+    /// `emit(d, ā(d))` for every `d` in `[d0, min(d1, area))`, strictly in
+    /// order — the prefix sums are contiguous, so emission has no gaps.
+    #[inline]
+    fn walk(&self, d0: u64, d1: u64, mut emit: impl FnMut(u64, F128)) {
+        let pfx = &self.pfx;
+        let n_cols = pfx.len() - 1;
+        let d1 = d1.min(self.area);
+        if d0 >= d1 {
+            return;
+        }
+        let mut y = pfx.partition_point(|&t| t <= d0).saturating_sub(1);
+        let mut d = d0;
+        let mut ws = [F128::ZERO; LAZY_RS_MAX_SIDES];
+        while d < d1 && y < n_cols {
+            let (t_c, t_next) = (pfx[y], pfx[y + 1]);
+            if t_next <= d {
+                y += 1;
+                continue;
+            }
+            for (w, (cw, _)) in ws.iter_mut().zip(&self.sides) {
+                *w = cw[y];
+            }
+            let stop = d1.min(t_next);
+            for dd in d..stop {
+                let row = (dd - t_c) as usize;
+                let mut v = F128::ZERO;
+                for (s, (_, eq_r)) in self.sides.iter().enumerate() {
+                    v += ws[s] * eq_r[row];
+                }
+                emit(dd, v);
+            }
+            d = stop;
+        }
+    }
+
+    /// Round 0's message, streamed — the materialized fill's fused message
+    /// pass without the fill: pairs whose `ā` members are both zero (past
+    /// the area) contribute nothing and are skipped; an odd area's last
+    /// pair carries a zero odd member, exactly as the calloc tail did.
+    fn round0_msg(&self, eq: &SplitEq) -> (F128, F128) {
+        use rayon::prelude::*;
+        const CH: u64 = 1 << 14;
+        let n_chunks = self.area.div_ceil(CH) as usize;
+        (0..n_chunks)
+            .into_par_iter()
+            .map(|ci| {
+                let start = ci as u64 * CH;
+                let end = start + CH;
+                let mut p1 = F128::ZERO;
+                let mut pi = F128::ZERO;
+                let mut even = F128::ZERO;
+                self.walk(start, end, |d, v| {
+                    if d & 1 == 0 {
+                        even = v;
+                    } else {
+                        let q0 = self.partner.at(eq, (d - 1) as usize);
+                        let q1 = self.partner.at(eq, d as usize);
+                        p1 += v * q1;
+                        pi += (even + v) * (q0 + q1);
+                    }
+                });
+                let stop = end.min(self.area);
+                if stop > start && stop & 1 == 1 {
+                    let d = (stop - 1) as usize;
+                    let q0 = self.partner.at(eq, d);
+                    let q1 = self.partner.at(eq, d + 1);
+                    pi += even * (q0 + q1);
+                }
+                (p1, pi)
+            })
+            .reduce(|| (F128::ZERO, F128::ZERO), |(a, b), (c, d)| (a + c, b + d))
+    }
+
+    /// Round 0's fold: advance the partner past `ρ₀`, write the half-size
+    /// folded vector straight from the walk (pool memory, guard-zeroed to
+    /// the kernel's 4-wide reads), fuse round 1's message over the freshly
+    /// written chunks, and hand the result over as a round-1
+    /// [`VirtualPair`] — its `fold_round` contract, without the full-size
+    /// vector ever existing.
+    fn fold0(&mut self, cur: usize, r: F128) -> (VirtualPair, (F128, F128)) {
+        use rayon::prelude::*;
+        debug_assert_eq!(cur, 1usize << self.rho.len());
+        let half = cur / 2;
+        self.partner.advance(self.rho[0], r);
+        let eq = SplitEq::new(&self.rho[1..]);
+        let mut out = crate::scratch::take_f128(half);
+        let written = (self.area as usize).div_ceil(2).min(half);
+        const CO: usize = 1 << 13;
+        let msg = out[..written]
+            .par_chunks_mut(CO)
+            .enumerate()
+            .map(|(ci, oc)| {
+                let t0 = ci * CO;
+                let d0 = 2 * t0 as u64;
+                let d1 = d0 + 2 * oc.len() as u64;
+                let mut even = F128::ZERO;
+                self.walk(d0, d1, |d, v| {
+                    if d & 1 == 0 {
+                        even = v;
+                    } else {
+                        oc[((d - d0) / 2) as usize] = even + r * (v + even);
+                    }
+                });
+                let dstop = d1.min(self.area);
+                if dstop > d0 && dstop & 1 == 1 {
+                    // Odd area: the pair's odd member is zero — the fold of
+                    // (a0, 0) is a0 + r·a0, as the calloc tail produced.
+                    oc[((dstop - d0) / 2) as usize] = even + r * even;
+                }
+                // Fused round-1 message over this chunk's folded pairs —
+                // the kernel's exact term order and position convention.
+                let mut g1 = F128::ZERO;
+                let mut gi = F128::ZERO;
+                for (j, op) in oc.as_chunks::<2>().0.iter().enumerate() {
+                    let u = t0 + 2 * j;
+                    let p0 = self.partner.at(&eq, u);
+                    let p1 = self.partner.at(&eq, u + 1);
+                    g1 += op[1] * p1;
+                    gi += (op[0] + op[1]) * (p0 + p1);
+                }
+                if oc.len() & 1 == 1 {
+                    // `written` odd: the pair's never-materialized odd
+                    // member is zero — only the G(∞) term survives.
+                    let na0 = oc[oc.len() - 1];
+                    let u = t0 + oc.len() - 1;
+                    let p0 = self.partner.at(&eq, u);
+                    let p1 = self.partner.at(&eq, u + 1);
+                    gi += na0 * (p0 + p1);
+                }
+                (g1, gi)
+            })
+            .reduce(|| (F128::ZERO, F128::ZERO), |(a, b), (c, d)| (a + c, b + d));
+        // Guard slots: the pool half is dirty past `written`, and the
+        // rounds read the live prefix rounded to the kernel's 4-wide
+        // chunks — mirror [`VirtualPair::new`]'s rounding exactly.
+        let live_end = written.next_multiple_of(4).max(4).min(half);
+        for slot in &mut out[written..live_end] {
+            *slot = F128::ZERO;
+        }
+        let partner = std::mem::replace(&mut self.partner, Partner::Scaled { s: F128::ZERO });
+        (VirtualPair::new(out, partner, &self.rho, 1, written), msg)
+    }
+}
+
 enum Pair {
     Virtual(VirtualPair),
     Sparse(SparseGroupPair),
     AlignedRs(AlignedRsPair),
+    LazyRs(LazyRsPair),
 }
 
 impl Pair {
     fn fold_round(&mut self, cur: usize, r: F128) -> (F128, F128) {
+        // The lazy RS pair materializes at its first fold — half-size,
+        // with round 1's message fused into the materializing pass.
+        if let Pair::LazyRs(l) = self {
+            let (vp, msg) = l.fold0(cur, r);
+            *self = Pair::Virtual(vp);
+            return msg;
+        }
         if let Pair::Sparse(sp) = self
             && sp.stored() * SPARSE_DENSIFY_FACTOR > cur
         {
@@ -3948,6 +4180,7 @@ impl Pair {
             Pair::Virtual(p) => p.fold_round(cur, r),
             Pair::Sparse(p) => p.fold_round(cur, r),
             Pair::AlignedRs(p) => p.fold_round(cur, r),
+            Pair::LazyRs(_) => unreachable!("materialized by the early return above"),
         }
     }
 }
@@ -4801,6 +5034,135 @@ mod tests {
                 let (params, _q) = random_instance(&mut ch, n, k, m);
                 check_multipoint(&params, &mut ch, &format!("n={n} k={k} m={m} rep={rep}"));
             }
+        }
+    }
+
+    /// THE VIRTUAL-ā ORACLE: the lazy dense RS pair (no `2^m` weight
+    /// buffer, half-size materialization at fold 0) must produce proofs
+    /// EQUAL to the materialized path's — the same round messages by exact
+    /// char-2 reassociation — across random jagged shapes (odd areas
+    /// included), R ∈ {1, 2}, with and without groups. Arms forced via
+    /// [`VIRTUAL_A_OVERRIDE`], the alternating in-process pattern.
+    #[test]
+    fn virtual_a_dense_rs_byte_oracle() {
+        use std::sync::atomic::Ordering;
+        let mut ch = RandomChallenger::new(0xA11A_5EED);
+        for &(n, k, m) in &[(3usize, 2usize, 5usize), (4, 3, 7), (5, 2, 8), (2, 4, 6)] {
+            for rep in 0..3 {
+                let (params, _q) = random_instance(&mut ch, n, k, m);
+                let z1r = sample_vec(&mut ch, n);
+                let z1c = sample_vec(&mut ch, k);
+                let z2r = sample_vec(&mut ch, n);
+                let z2c = sample_vec(&mut ch, k);
+                let c1 = sample_vec(&mut ch, 128);
+                let c2 = sample_vec(&mut ch, 128);
+                let g1r = sample_vec(&mut ch, n);
+                let g1cols = sample_vec(&mut ch, 1 << k);
+                let rho = sample_vec(&mut ch, m);
+                let claims_all = [
+                    FrobeniusClaim { z_row: &z1r, z_col: &z1c, coeffs: &c1 },
+                    FrobeniusClaim { z_row: &z2r, z_col: &z2c, coeffs: &c2 },
+                ];
+                let groups_all = [ScalarGroupClaim { z_row: &g1r, cols: &g1cols }];
+                for (n_claims, n_groups) in [(2usize, 1usize), (1, 1), (2, 0)] {
+                    let claims = &claims_all[..n_claims];
+                    let groups = &groups_all[..n_groups];
+                    let arm = |force: u8| {
+                        VIRTUAL_A_OVERRIDE.store(force, Ordering::Relaxed);
+                        let mut chp = FsChallenger::new(b"virtual-a-oracle");
+                        prove_multipoint_twisted(&params, claims, groups, &rho, &mut chp)
+                    };
+                    let lazy = arm(1);
+                    let dense = arm(2);
+                    VIRTUAL_A_OVERRIDE.store(0, Ordering::Relaxed);
+                    assert_eq!(
+                        lazy, dense,
+                        "n={n} k={k} m={m} rep={rep} R={n_claims} G={n_groups} area={}",
+                        params.area()
+                    );
+                    let mut chv = FsChallenger::new(b"virtual-a-oracle");
+                    verify_multipoint_twisted(&params, claims, groups, &rho, &lazy, &mut chv)
+                        .expect("lazy-arm proof verifies");
+                }
+            }
+        }
+    }
+
+    /// Alternating-arm instrument on the SPINE NODE's jagged geometry (687
+    /// used columns of 2^11, area ≈2.31M of 2^22, R = 2 + two groups):
+    /// lazy vs materialized medians over `MICRO_RUNS` (default 5), byte
+    /// equality asserted every run — oracle and instrument in one (the
+    /// virtual_b pattern; in-process alternation is the only way to
+    /// resolve a few-ms effect on this box).
+    #[test]
+    #[ignore] // Benchmark + oracle at real scale — run with --nocapture.
+    fn virtual_a_node_shape_bench() {
+        use std::sync::atomic::Ordering;
+        let runs: usize = std::env::var("MICRO_RUNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
+        // The spine arm's measured height histogram (top runs verbatim, a
+        // filler class for the tail) — 687 used columns, 0 full-height.
+        let mut heights: Vec<u64> = Vec::new();
+        for &(h, c) in &[
+            (18640u64, 93usize),
+            (12933, 5),
+            (6052, 12),
+            (5944, 21),
+            (2706, 26),
+            (2582, 29),
+        ] {
+            heights.extend(std::iter::repeat(h).take(c));
+        }
+        while heights.len() < 687 {
+            heights.push(341);
+        }
+        heights.resize(1 << 11, 0);
+        let params = JaggedParams::from_heights(&heights, 15, 22);
+        let mut ch = RandomChallenger::new(0xA11A_BE4C);
+        let z1r = sample_vec(&mut ch, 15);
+        let z1c = sample_vec(&mut ch, 11);
+        let z2r = sample_vec(&mut ch, 15);
+        let z2c = sample_vec(&mut ch, 11);
+        let c1 = sample_vec(&mut ch, 128);
+        let c2 = sample_vec(&mut ch, 128);
+        let g1r = sample_vec(&mut ch, 15);
+        let g1cols = sample_vec(&mut ch, 1 << 11);
+        let g2r = sample_vec(&mut ch, 15);
+        let g2cols = sample_vec(&mut ch, 1 << 11);
+        let rho = sample_vec(&mut ch, 22);
+        let claims = [
+            FrobeniusClaim { z_row: &z1r, z_col: &z1c, coeffs: &c1 },
+            FrobeniusClaim { z_row: &z2r, z_col: &z2c, coeffs: &c2 },
+        ];
+        let groups = [
+            ScalarGroupClaim { z_row: &g1r, cols: &g1cols },
+            ScalarGroupClaim { z_row: &g2r, cols: &g2cols },
+        ];
+        let mut times: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+        let mut reference: Option<MultipointTwistedProof> = None;
+        for _ in 0..runs {
+            for (slot, force) in [(0usize, 2u8), (1, 1)] {
+                VIRTUAL_A_OVERRIDE.store(force, Ordering::Relaxed);
+                let t = std::time::Instant::now();
+                let mut chp = FsChallenger::new(b"virtual-a-bench");
+                let proof = prove_multipoint_twisted(&params, &claims, &groups, &rho, &mut chp);
+                times[slot].push(t.elapsed().as_secs_f64() * 1e3);
+                match &reference {
+                    None => reference = Some(proof),
+                    Some(rf) => assert_eq!(*rf, proof, "arm divergence (force={force})"),
+                }
+            }
+        }
+        VIRTUAL_A_OVERRIDE.store(0, Ordering::Relaxed);
+        for (name, ts) in ["dense", "lazy "].iter().zip(times.iter_mut()) {
+            ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let med = ts[ts.len() / 2];
+            println!(
+                "virtual_a node-shape {name}: median {med:6.2} ms  (runs {:?})",
+                ts.iter().map(|t| (t * 100.0).round() / 100.0).collect::<Vec<_>>()
+            );
         }
     }
 
