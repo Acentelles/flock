@@ -5091,7 +5091,6 @@ fn mvp7_real_query_phase() {
     use flock_core::element_r1cs::ElementTableBuilder;
     use flock_core::transcript_record::RecordingChallenger;
     use flock_prover::prover::UnionElementSlotInput;
-    use flock_prover::r1cs_hashes::fs_chain::FsChain;
     use flock_prover::schedule::Registry;
     use std::sync::Arc;
     use std::time::Instant;
@@ -5149,12 +5148,12 @@ fn mvp7_real_query_phase() {
         vec![UnionElementSlotInput::new(|dst: &mut [F128]| {
             dst.copy_from_slice(&witness)
         })],
-        &mut FsChallenger::with_hash(DOMAIN7, HashKind::Blake3),
+        &mut FsChallenger::with_chained_blake3(DOMAIN7),
     );
     let inner_prove_ms = t.elapsed().as_secs_f64() * 1e3;
 
     // ---- record the REAL verifier transcript ----
-    let mut rec = RecordingChallenger::new(FsChallenger::with_hash(DOMAIN7, HashKind::Blake3));
+    let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(DOMAIN7));
     let claims_v = verifier::verify_ligerito_union_mixed_class(
         &inner_union,
         &[],
@@ -5169,9 +5168,25 @@ fn mvp7_real_query_phase() {
     // (lc_point, lc_value)].
     let pd_pts: Vec<Vec<F128>> = vec![el_claims.c_point.clone(), el_claims.lc_point.clone()];
     let t_shape = rec.shape();
-    let stream = t_shape.stream_words(DOMAIN7);
-    let bytes = stream.to_bytes(rec.values(), rec.payloads());
     let chals: Vec<F128> = rec.challenges().to_vec();
+    // The transcript is FORKED (the assist runs on its own chain — protocol
+    // for every merged open); `merge_chain` splices the child's rows in at
+    // the fork point and hands back one linear numbering plus the cross-link
+    // wires, so the flattened finalize ordinals the locators use index
+    // straight into `trace.squeezes`.
+    let MergedChain {
+        stream,
+        bytes,
+        trace,
+        cross,
+        ..
+    } = merge_chain(
+        t_shape.ops(),
+        &t_shape.stream_words_duplex(DOMAIN7),
+        rec.values(),
+        rec.payloads(),
+    );
+    assert_chain_replays(&flatten_ops(t_shape.ops()), &trace, &chals);
 
     // ---- level geometry, from the proof alone ----
     let lig = &proof.pcs_open.inner.ligerito;
@@ -5276,18 +5291,6 @@ fn mvp7_real_query_phase() {
         &strat_scheds(&inner_params),
     );
 
-    // ---- the FS chain over the real byte stream ----
-    let mut chain = FsChain::new();
-    let mut at = 0usize;
-    let fin_ops: Vec<&flock_core::transcript_record::TranscriptOp> =
-        t_shape.ops().iter().filter(|o| o.finalizes()).collect();
-    for (i, &upto) in stream.finalize_after.iter().enumerate() {
-        chain.absorb(&bytes[at * 16..upto * 16]);
-        at = upto;
-        chain.finalize(fin_ops[i].squeezed_bytes());
-    }
-    chain.absorb(&bytes[at * 16..]);
-    let trace = chain.finish();
     let b3_rows: usize = trace.rows.len()
         + geo
             .iter()
@@ -5354,7 +5357,7 @@ fn mvp7_real_query_phase() {
         &mut vals,
         &mut consts,
         &pub_payloads,
-        &[],
+        &cross,
     );
     // Observed-value index -> absorbed-stream word index, for wiring the
     // sumcheck messages (they are absorbed proof scalars, so their wires
