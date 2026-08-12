@@ -338,11 +338,14 @@ pub fn prove_merkle_path_shift_with_grinding<Ch: Challenger>(
 
     let mut grinding_nonces = Vec::with_capacity(grinding.nonce_count(n, path_log));
     let initial_bits = grinding.initial_bits_for(n, path_log);
-    if initial_bits != 0 {
-        grinding_nonces.push(challenger.grind_pow(initial_bits));
-    }
     // τ, α (transcript-driven, mirrored by verifier).
-    let tau = challenger.sample_f128_vec(n);
+    let tau = if initial_bits != 0 {
+        let (nonce, tau) = challenger.grind_pow_and_sample_f128_vec(initial_bits, n);
+        grinding_nonces.push(nonce);
+        tau
+    } else {
+        challenger.sample_f128_vec(n)
+    };
     let alpha = challenger.sample_f128();
     // LSB-first split: τ = (τ_q ‖ τ_p) where bits 0..pos_log are the position
     // (within-path) coordinates and bits pos_log..n are the path-id coordinates.
@@ -436,10 +439,13 @@ pub fn prove_merkle_path_shift_with_grinding<Ch: Challenger>(
         challenger.observe_f128(msg.q_1);
         challenger.observe_f128(msg.q_omega);
         challenger.observe_f128(msg.q_omega_plus_1);
-        if grinding.round_bits != 0 {
-            grinding_nonces.push(challenger.grind_pow(grinding.round_bits));
-        }
-        let r = challenger.sample_f128();
+        let r = if grinding.round_bits != 0 {
+            let (nonce, r) = challenger.grind_pow_and_sample_f128(grinding.round_bits);
+            grinding_nonces.push(nonce);
+            r
+        } else {
+            challenger.sample_f128()
+        };
         rounds.push(msg);
         r_pts.push(r);
 
@@ -518,10 +524,13 @@ pub fn prove_merkle_path_shift_with_grinding<Ch: Challenger>(
         challenger.observe_f128(msg.q_1);
         challenger.observe_f128(msg.q_omega);
         challenger.observe_f128(msg.q_omega_plus_1);
-        if grinding.round_bits != 0 {
-            grinding_nonces.push(challenger.grind_pow(grinding.round_bits));
-        }
-        let r = challenger.sample_f128();
+        let r = if grinding.round_bits != 0 {
+            let (nonce, r) = challenger.grind_pow_and_sample_f128(grinding.round_bits);
+            grinding_nonces.push(nonce);
+            r
+        } else {
+            challenger.sample_f128()
+        };
         rounds.push(msg);
         r_pts.push(r);
         for i in 0..half {
@@ -628,13 +637,15 @@ pub fn verify_merkle_path_shift_with_grinding<Ch: Challenger>(
 
     // Resample τ, α (mirror prover).
     let initial_bits = grinding.initial_bits_for(n, path_log);
-    if initial_bits != 0 {
-        if !challenger.verify_pow(proof.grinding_nonces[nonce_idx], initial_bits) {
-            return Err(MerklePathError::InvalidGrinding);
-        }
+    let tau = if initial_bits != 0 {
+        let tau = challenger
+            .verify_pow_and_sample_f128_vec(proof.grinding_nonces[nonce_idx], initial_bits, n)
+            .ok_or(MerklePathError::InvalidGrinding)?;
         nonce_idx += 1;
-    }
-    let tau = challenger.sample_f128_vec(n);
+        tau
+    } else {
+        challenger.sample_f128_vec(n)
+    };
     let alpha = challenger.sample_f128();
     let tau_q = &tau[..pos_log];
     let tau_p = &tau[pos_log..n];
@@ -659,13 +670,15 @@ pub fn verify_merkle_path_shift_with_grinding<Ch: Challenger>(
         challenger.observe_f128(msg.q_1);
         challenger.observe_f128(msg.q_omega);
         challenger.observe_f128(msg.q_omega_plus_1);
-        if grinding.round_bits != 0 {
-            if !challenger.verify_pow(proof.grinding_nonces[nonce_idx], grinding.round_bits) {
-                return Err(MerklePathError::InvalidGrinding);
-            }
+        let r = if grinding.round_bits != 0 {
+            let r = challenger
+                .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], grinding.round_bits)
+                .ok_or(MerklePathError::InvalidGrinding)?;
             nonce_idx += 1;
-        }
-        let r = challenger.sample_f128();
+            r
+        } else {
+            challenger.sample_f128()
+        };
         // q(0) = claim + q(1) (char 2 == subtraction).
         let q_0 = claim + msg.q_1;
         // Evaluate q(r) via Lagrange over {0, 1, ω, ω+1}.

@@ -246,11 +246,14 @@ pub fn prove_chain_shift_with_grinding<Ch: Challenger>(
 
     let mut grinding_nonces = Vec::with_capacity(grinding.nonce_count(n));
     let initial_bits = grinding.initial_bits_for(n);
-    if initial_bits != 0 {
-        grinding_nonces.push(challenger.grind_pow(initial_bits));
-    }
     // τ ∈ Fⁿ, then α — both before the sumcheck (mirrored by the verifier).
-    let tau = challenger.sample_f128_vec(n);
+    let tau = if initial_bits != 0 {
+        let (nonce, tau) = challenger.grind_pow_and_sample_f128_vec(initial_bits, n);
+        grinding_nonces.push(nonce);
+        tau
+    } else {
+        challenger.sample_f128_vec(n)
+    };
     let alpha = challenger.sample_f128();
     let eqtau = build_eq_table(&tau); // eqtau[y] = eq(τ, y)
 
@@ -286,10 +289,13 @@ pub fn prove_chain_shift_with_grinding<Ch: Challenger>(
         }
         challenger.observe_f128(e1);
         challenger.observe_f128(einf);
-        if grinding.round_bits != 0 {
-            grinding_nonces.push(challenger.grind_pow(grinding.round_bits));
-        }
-        let r = challenger.sample_f128();
+        let r = if grinding.round_bits != 0 {
+            let (nonce, r) = challenger.grind_pow_and_sample_f128(grinding.round_bits);
+            grinding_nonces.push(nonce);
+            r
+        } else {
+            challenger.sample_f128()
+        };
         // Fold (bind the top remaining variable): lo + r·(hi+lo).
         for i in 0..half {
             wt[i] = wt[i] + r * (wt[i + half] + wt[i]);
@@ -364,13 +370,15 @@ pub fn verify_chain_shift_with_grinding<Ch: Challenger>(
     // Resample τ, α. The initial claim is the *public* scalar
     //   C = eq(τ,1ⁿ)·x_last + α·x_0(r),     eq(τ,1ⁿ) = Π_j τ_j.
     let initial_bits = grinding.initial_bits_for(n);
-    if initial_bits != 0 {
-        if !challenger.verify_pow(proof.grinding_nonces[nonce_idx], initial_bits) {
-            return Err(ChainError::InvalidGrinding);
-        }
+    let tau = if initial_bits != 0 {
+        let tau = challenger
+            .verify_pow_and_sample_f128_vec(proof.grinding_nonces[nonce_idx], initial_bits, n)
+            .ok_or(ChainError::InvalidGrinding)?;
         nonce_idx += 1;
-    }
-    let tau = challenger.sample_f128_vec(n);
+        tau
+    } else {
+        challenger.sample_f128_vec(n)
+    };
     let alpha = challenger.sample_f128();
     let eq_tau_ones = tau.iter().copied().fold(F128::ONE, |acc, t| acc * t);
     let mut claim = eq_tau_ones * xlast_r + alpha * x0_r;
@@ -380,13 +388,15 @@ pub fn verify_chain_shift_with_grinding<Ch: Challenger>(
     for &(e1, einf) in &proof.rounds {
         challenger.observe_f128(e1);
         challenger.observe_f128(einf);
-        if grinding.round_bits != 0 {
-            if !challenger.verify_pow(proof.grinding_nonces[nonce_idx], grinding.round_bits) {
-                return Err(ChainError::InvalidGrinding);
-            }
+        let r = if grinding.round_bits != 0 {
+            let r = challenger
+                .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], grinding.round_bits)
+                .ok_or(ChainError::InvalidGrinding)?;
             nonce_idx += 1;
-        }
-        let r = challenger.sample_f128();
+            r
+        } else {
+            challenger.sample_f128()
+        };
         // q(0) = claim − q(1) = claim + e1 (char 2). Degree-2 poly through
         // (0,e0),(1,e1),(∞→einf): q(X) = einf·X² + c1·X + e0, c1 = e0+e1+einf.
         let e0 = claim + e1;

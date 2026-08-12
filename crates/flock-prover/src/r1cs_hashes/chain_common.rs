@@ -299,12 +299,11 @@ pub fn prove_chain_ligerito_generic<Ch: Challenger>(
 
     let grinding = crate::chain::ChainGrinding::for_profile(pcs_params.profile);
     let tau_pos_bits = grinding.packed_position_bits_for(layout.tau_pos_len());
-    let tau_pos_grinding_nonce = if tau_pos_bits == 0 {
-        0
+    let (tau_pos_grinding_nonce, tau_pos) = if tau_pos_bits == 0 {
+        (0, challenger.sample_f128_vec(layout.tau_pos_len()))
     } else {
-        challenger.grind_pow(tau_pos_bits)
+        challenger.grind_pow_and_sample_f128_vec(tau_pos_bits, layout.tau_pos_len())
     };
-    let tau_pos = challenger.sample_f128_vec(layout.tau_pos_len());
     let fold = ChainFold::new(layout, tau_pos);
     let (in_vals, out_vals) = fold_in_out(layout, r1cs.layout, &core.z_packed, &fold);
 
@@ -388,13 +387,20 @@ pub fn verify_chain_ligerito_generic<Ch: Challenger>(
 
     let grinding = crate::chain::ChainGrinding::for_profile(pcs_params.profile);
     let tau_pos_bits = grinding.packed_position_bits_for(layout.tau_pos_len());
-    if (tau_pos_bits == 0 && proof.tau_pos_grinding_nonce != 0)
-        || (tau_pos_bits != 0
-            && !challenger.verify_pow(proof.tau_pos_grinding_nonce, tau_pos_bits))
-    {
-        return Err(ChainVerifyError::Shift(crate::chain::ChainError::InvalidGrinding));
-    }
-    let tau_pos = challenger.sample_f128_vec(layout.tau_pos_len());
+    let tau_pos = if tau_pos_bits != 0 {
+        challenger
+            .verify_pow_and_sample_f128_vec(
+                proof.tau_pos_grinding_nonce,
+                tau_pos_bits,
+                layout.tau_pos_len(),
+            )
+            .ok_or(ChainVerifyError::Shift(crate::chain::ChainError::InvalidGrinding))?
+    } else {
+        if proof.tau_pos_grinding_nonce != 0 {
+            return Err(ChainVerifyError::Shift(crate::chain::ChainError::InvalidGrinding));
+        }
+        challenger.sample_f128_vec(layout.tau_pos_len())
+    };
     let fold = ChainFold::new(layout, tau_pos);
 
     let x0_r = fold.fold_public_phys(x0_phys);

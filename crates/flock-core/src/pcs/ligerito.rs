@@ -3593,15 +3593,50 @@ fn sample_queries<Ch: Challenger>(
     assert_eq!(sched.log_block_len, d, "sample_queries: schedule block log");
     assert_eq!(sched.queries(), count, "sample_queries: schedule query count");
     let words = challenger.sample_f128_vec(count);
+    queries_from_words(block_len, count, sched, &words)
+}
+
+fn queries_from_words(
+    block_len: usize,
+    count: usize,
+    sched: &stratified::LevelSchedule,
+    words: &[F128],
+) -> Vec<usize> {
+    let d = block_len.trailing_zeros() as usize;
+    assert_eq!(words.len(), count, "one challenge word per query");
     sched
         .query_strata()
-        .zip(&words)
+        .zip(words)
         .map(|((c, stratum), v)| {
             let lo_bits = d - c;
             let mask = (1usize << lo_bits) - 1;
             (stratum << lo_bits) | ((v.lo as usize) & mask)
         })
         .collect()
+}
+
+fn grind_and_sample_queries<Ch: Challenger>(
+    challenger: &mut Ch,
+    bits: u32,
+    block_len: usize,
+    count: usize,
+    sched: &stratified::LevelSchedule,
+) -> (u64, Vec<usize>) {
+    assert!(count != 0, "a grinded query phase must sample at least one query");
+    let (nonce, words) = challenger.grind_pow_and_sample_f128_vec(bits, count);
+    (nonce, queries_from_words(block_len, count, sched, &words))
+}
+
+fn verify_and_sample_queries<Ch: Challenger>(
+    challenger: &mut Ch,
+    nonce: u64,
+    bits: u32,
+    block_len: usize,
+    count: usize,
+    sched: &stratified::LevelSchedule,
+) -> Option<Vec<usize>> {
+    let words = challenger.verify_pow_and_sample_f128_vec(nonce, bits, count)?;
+    Some(queries_from_words(block_len, count, sched, &words))
 }
 
 /// Per-query CAPPED Merkle paths for `queries` against `tree`, flat in
@@ -4048,10 +4083,13 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         // round than the worst (j=0) round `fold_grinding_bits` is sized for.
         // Derived from fold_grinding_bits + round index; not stored.
         let bits = fold_bits(0).saturating_sub(j as u32);
-        if bits > 0 {
-            fold_grinding_nonces.push(challenger.grind_pow(bits));
-        }
-        let r = challenger.sample_f128();
+        let r = if bits > 0 {
+            let (nonce, r) = challenger.grind_pow_and_sample_f128(bits);
+            fold_grinding_nonces.push(nonce);
+            r
+        } else {
+            challenger.sample_f128()
+        };
         let msg = match vbasis.as_mut() {
             Some(vb) => {
                 // The blocked fold binds the LOW bit of the block index —
@@ -4136,12 +4174,16 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     // bits here). Verifier mirror checks the nonce; both then proceed to
     // sample query positions. (The proximity-gap shortfall is covered
     // separately by the fold-challenge grinds above.)
-    let pow_nonce_0 = challenger.grind_pow(config.grinding_bits[0] as u32);
-    let mut grinding_nonces: Vec<u64> = vec![pow_nonce_0];
-
     // Open L0; lane-fold weights = r_lane_fold.
     let num_queries_0 = config.queries[0];
-    let queries_0 = sample_queries(challenger, l0_block_len, num_queries_0, strat(0));
+    let (pow_nonce_0, queries_0) = grind_and_sample_queries(
+        challenger,
+        config.grinding_bits[0] as u32,
+        l0_block_len,
+        num_queries_0,
+        strat(0),
+    );
+    let mut grinding_nonces: Vec<u64> = vec![pow_nonce_0];
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     let _t = std::time::Instant::now();
     let opened_rows_0: Vec<Vec<F128>> = queries_0.iter().map(|&q| l0_row(q).to_vec()).collect();
@@ -4200,10 +4242,13 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             // grinding guards its proximity-gap term. Tapered per round:
             // round j needs (fold_bits − j) bits (see L0 loop).
             let bits = fold_bits(i + 1).saturating_sub(j as u32);
-            if bits > 0 {
-                fold_grinding_nonces.push(challenger.grind_pow(bits));
-            }
-            let ri = challenger.sample_f128();
+            let ri = if bits > 0 {
+                let (nonce, ri) = challenger.grind_pow_and_sample_f128(bits);
+                fold_grinding_nonces.push(nonce);
+                ri
+            } else {
+                challenger.sample_f128()
+            };
             let msg = sc_prover.fold(ri);
             challenger.observe_f128(msg.u_0);
             challenger.observe_f128(msg.u_2);
@@ -4220,15 +4265,15 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 challenger.observe_f128(*v);
             }
             // PoW grinding for the last level before sampling its queries.
-            let nonce_last = challenger.grind_pow(config.grinding_bits[i + 1] as u32);
-            grinding_nonces.push(nonce_last);
             let num_queries_last = config.queries[i + 1];
-            let queries_last = sample_queries(
+            let (nonce_last, queries_last) = grind_and_sample_queries(
                 challenger,
+                config.grinding_bits[i + 1] as u32,
                 wtns_prev.block_len,
                 num_queries_last,
                 strat(i + 1),
             );
+            grinding_nonces.push(nonce_last);
             let _t = std::time::Instant::now();
             let opened_rows_last: Vec<Vec<F128>> = queries_last
                 .iter()
@@ -4343,11 +4388,15 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         }
 
         // PoW grinding for this iteration's query phase.
-        let nonce_i = challenger.grind_pow(config.grinding_bits[i + 1] as u32);
-        grinding_nonces.push(nonce_i);
         let num_queries_i = config.queries[i + 1];
-        let queries_i =
-            sample_queries(challenger, wtns_prev.block_len, num_queries_i, strat(i + 1));
+        let (nonce_i, queries_i) = grind_and_sample_queries(
+            challenger,
+            config.grinding_bits[i + 1] as u32,
+            wtns_prev.block_len,
+            num_queries_i,
+            strat(i + 1),
+        );
+        grinding_nonces.push(nonce_i);
         let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
         let _t = std::time::Instant::now();
         let opened_rows_i: Vec<Vec<F128>> = queries_i
@@ -4493,16 +4542,20 @@ where
         // Fold-challenge PoW mirror (L0's lane folds), tapered per round to
         // (fold_bits − j) — see the prover's L0 loop.
         let bits = fold_bits(0).saturating_sub(j as u32);
-        if bits > 0 {
+        let ri = if bits > 0 {
             if fold_nonce_idx >= proof.fold_grinding_nonces.len() {
                 return false;
             }
-            if !challenger.verify_pow(proof.fold_grinding_nonces[fold_nonce_idx], bits) {
+            let Some(ri) = challenger
+                .verify_pow_and_sample_f128(proof.fold_grinding_nonces[fold_nonce_idx], bits)
+            else {
                 return false;
-            }
+            };
             fold_nonce_idx += 1;
-        }
-        let ri = challenger.sample_f128();
+            ri
+        } else {
+            challenger.sample_f128()
+        };
         r_lane_fold.push(ri);
         t_r = running_quad.eval(ri);
         if tx_idx >= proof.sumcheck_transcript.len() {
@@ -4557,18 +4610,20 @@ where
     if nonce_idx >= proof.grinding_nonces.len() {
         return false;
     }
-    if !challenger.verify_pow(
-        proof.grinding_nonces[nonce_idx],
-        config.grinding_bits[0] as u32,
-    ) {
-        return false;
-    }
-    nonce_idx += 1;
-
     let strat = |l: usize| &config.stratified[l];
     let num_queries_0 = config.queries[0];
     let _t = std::time::Instant::now();
-    let queries_0 = sample_queries(challenger, block_len_0, num_queries_0, strat(0));
+    let Some(queries_0) = verify_and_sample_queries(
+        challenger,
+        proof.grinding_nonces[nonce_idx],
+        config.grinding_bits[0] as u32,
+        block_len_0,
+        num_queries_0,
+        strat(0),
+    ) else {
+        return false;
+    };
+    nonce_idx += 1;
     if trace {
         t_sample_q += _t.elapsed();
     }
@@ -4652,16 +4707,20 @@ where
             // Fold-challenge PoW mirror (level i+1's folds), tapered per round
             // to (fold_bits − j) — see the prover's L0 loop.
             let bits = fold_bits(i + 1).saturating_sub(j as u32);
-            if bits > 0 {
+            let ri = if bits > 0 {
                 if fold_nonce_idx >= proof.fold_grinding_nonces.len() {
                     return false;
                 }
-                if !challenger.verify_pow(proof.fold_grinding_nonces[fold_nonce_idx], bits) {
+                let Some(ri) = challenger
+                    .verify_pow_and_sample_f128(proof.fold_grinding_nonces[fold_nonce_idx], bits)
+                else {
                     return false;
-                }
+                };
                 fold_nonce_idx += 1;
-            }
-            let ri = challenger.sample_f128();
+                ri
+            } else {
+                challenger.sample_f128()
+            };
             ris.push(ri);
             level_rs.push(ri);
             t_r = running_quad.eval(ri);
@@ -4696,20 +4755,21 @@ where
             if nonce_idx >= proof.grinding_nonces.len() {
                 return false;
             }
-            if !challenger.verify_pow(
-                proof.grinding_nonces[nonce_idx],
-                config.grinding_bits[i + 1] as u32,
-            ) {
-                return false;
-            }
-            // (last nonce — nonce_idx is not advanced past it)
-
             let prev_block_len = 1usize << (prev_log_msg_cols + prev_log_inv_rate);
             let prev_num_interleaved = 1usize << prev_log_num_interleaved;
             let num_queries_last = config.queries[i + 1];
             let _t = std::time::Instant::now();
-            let queries_last =
-                sample_queries(challenger, prev_block_len, num_queries_last, strat(i + 1));
+            let Some(queries_last) = verify_and_sample_queries(
+                challenger,
+                proof.grinding_nonces[nonce_idx],
+                config.grinding_bits[i + 1] as u32,
+                prev_block_len,
+                num_queries_last,
+                strat(i + 1),
+            ) else {
+                return false;
+            };
+            // Last nonce: nonce_idx is intentionally not advanced past it.
             // Basis-induction challenge for the LAST commitment. Sampled here —
             // after `yr` was observed (top of this branch) and the queries are
             // fixed — so a forged `yr` cannot be adapted to it. Mirrors `alpha_i`
@@ -4906,19 +4966,21 @@ where
         if nonce_idx >= proof.grinding_nonces.len() {
             return false;
         }
-        if !challenger.verify_pow(
-            proof.grinding_nonces[nonce_idx],
-            config.grinding_bits[i + 1] as u32,
-        ) {
-            return false;
-        }
-        nonce_idx += 1;
-
         let prev_block_len = 1usize << (prev_log_msg_cols + prev_log_inv_rate);
         let prev_num_interleaved = 1usize << prev_log_num_interleaved;
         let num_queries_i = config.queries[i + 1];
         let _t = std::time::Instant::now();
-        let queries_i = sample_queries(challenger, prev_block_len, num_queries_i, strat(i + 1));
+        let Some(queries_i) = verify_and_sample_queries(
+            challenger,
+            proof.grinding_nonces[nonce_idx],
+            config.grinding_bits[i + 1] as u32,
+            prev_block_len,
+            num_queries_i,
+            strat(i + 1),
+        ) else {
+            return false;
+        };
+        nonce_idx += 1;
         if trace {
             t_sample_q += _t.elapsed();
         }
@@ -5048,16 +5110,20 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
         // Fold-challenge PoW mirror (L0's lane folds), tapered per round to
         // (fold_bits − j) — see the prover's L0 loop.
         let bits = fold_bits(0).saturating_sub(j as u32);
-        if bits > 0 {
+        let ri = if bits > 0 {
             if fold_nonce_idx >= proof.fold_grinding_nonces.len() {
                 return false;
             }
-            if !challenger.verify_pow(proof.fold_grinding_nonces[fold_nonce_idx], bits) {
+            let Some(ri) = challenger
+                .verify_pow_and_sample_f128(proof.fold_grinding_nonces[fold_nonce_idx], bits)
+            else {
                 return false;
-            }
+            };
             fold_nonce_idx += 1;
-        }
-        let ri = challenger.sample_f128();
+            ri
+        } else {
+            challenger.sample_f128()
+        };
         r_lane_fold.push(ri);
         t_r = running_quad.eval(ri);
         if tx_idx >= proof.sumcheck_transcript.len() {
@@ -5106,17 +5172,19 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
     if nonce_idx >= proof.grinding_nonces.len() {
         return false;
     }
-    if !challenger.verify_pow(
-        proof.grinding_nonces[nonce_idx],
-        config.grinding_bits[0] as u32,
-    ) {
-        return false;
-    }
-    nonce_idx += 1;
-
     let strat = |l: usize| &config.stratified[l];
     let num_queries_0 = config.queries[0];
-    let queries_0 = sample_queries(challenger, block_len_0, num_queries_0, strat(0));
+    let Some(queries_0) = verify_and_sample_queries(
+        challenger,
+        proof.grinding_nonces[nonce_idx],
+        config.grinding_bits[0] as u32,
+        block_len_0,
+        num_queries_0,
+        strat(0),
+    ) else {
+        return false;
+    };
+    nonce_idx += 1;
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     if !verify_level_opens(
         &proof.initial_cap,
@@ -5182,16 +5250,20 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
             // Fold-challenge PoW mirror (level i+1's folds), tapered per round
             // to (fold_bits − j) — see the prover's L0 loop.
             let bits = fold_bits(i + 1).saturating_sub(j as u32);
-            if bits > 0 {
+            let ri = if bits > 0 {
                 if fold_nonce_idx >= proof.fold_grinding_nonces.len() {
                     return false;
                 }
-                if !challenger.verify_pow(proof.fold_grinding_nonces[fold_nonce_idx], bits) {
+                let Some(ri) = challenger
+                    .verify_pow_and_sample_f128(proof.fold_grinding_nonces[fold_nonce_idx], bits)
+                else {
                     return false;
-                }
+                };
                 fold_nonce_idx += 1;
-            }
-            let ri = challenger.sample_f128();
+                ri
+            } else {
+                challenger.sample_f128()
+            };
             ris.push(ri);
             level_rs.push(ri);
             t_r = running_quad.eval(ri);
@@ -5226,19 +5298,20 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
             if nonce_idx >= proof.grinding_nonces.len() {
                 return false;
             }
-            if !challenger.verify_pow(
-                proof.grinding_nonces[nonce_idx],
-                config.grinding_bits[i + 1] as u32,
-            ) {
-                return false;
-            }
-            // (last nonce — nonce_idx is not advanced past it)
-
             let prev_block_len = 1usize << (prev_log_msg_cols + prev_log_inv_rate);
             let prev_num_interleaved = 1usize << prev_log_num_interleaved;
             let num_queries_last = config.queries[i + 1];
-            let queries_last =
-                sample_queries(challenger, prev_block_len, num_queries_last, strat(i + 1));
+            let Some(queries_last) = verify_and_sample_queries(
+                challenger,
+                proof.grinding_nonces[nonce_idx],
+                config.grinding_bits[i + 1] as u32,
+                prev_block_len,
+                num_queries_last,
+                strat(i + 1),
+            ) else {
+                return false;
+            };
+            // Last nonce: nonce_idx is intentionally not advanced past it.
             // Final-level basis-induction challenge — sampled after `yr` and the
             // queries are fixed. Same position as the succinct verifier
             // (recursive_verifier_with_basis_succinct), which verifies the same
@@ -5347,18 +5420,20 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
         if nonce_idx >= proof.grinding_nonces.len() {
             return false;
         }
-        if !challenger.verify_pow(
-            proof.grinding_nonces[nonce_idx],
-            config.grinding_bits[i + 1] as u32,
-        ) {
-            return false;
-        }
-        nonce_idx += 1;
-
         let prev_block_len = 1usize << (prev_log_msg_cols + prev_log_inv_rate);
         let prev_num_interleaved = 1usize << prev_log_num_interleaved;
         let num_queries_i = config.queries[i + 1];
-        let queries_i = sample_queries(challenger, prev_block_len, num_queries_i, strat(i + 1));
+        let Some(queries_i) = verify_and_sample_queries(
+            challenger,
+            proof.grinding_nonces[nonce_idx],
+            config.grinding_bits[i + 1] as u32,
+            prev_block_len,
+            num_queries_i,
+            strat(i + 1),
+        ) else {
+            return false;
+        };
+        nonce_idx += 1;
         let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
         if recursive_proof_idx >= proof.recursive_proofs.len() {
             return false;

@@ -287,10 +287,13 @@ pub fn prove_with_support_with_grinding<C: Challenger>(
 
     ch.observe_label(label);
     let mut grinding_nonces = Vec::with_capacity(grinding.zerocheck_nonce_count(m_words));
-    if let Some(bits) = grinding.initial_bits(m_words) {
-        grinding_nonces.push(ch.grind_pow(bits));
-    }
-    let tau = ch.sample_f128_vec(m_words);
+    let tau = if let Some(bits) = grinding.initial_bits(m_words) {
+        let (nonce, tau) = ch.grind_pow_and_sample_f128_vec(bits, m_words);
+        grinding_nonces.push(nonce);
+        tau
+    } else {
+        ch.sample_f128_vec(m_words)
+    };
 
     // Support-proportional row rounds, or all-dense. Decided ONCE: a mid-loop
     // switch would have to reconcile the sparse path's unwritten dead slots
@@ -339,10 +342,13 @@ pub fn prove_with_support_with_grinding<C: Challenger>(
         };
         ch.observe_f128(g1);
         ch.observe_f128(g_inf);
-        if let Some(bits) = grinding.round_bits() {
-            grinding_nonces.push(ch.grind_pow(bits));
-        }
-        let rho = ch.sample_f128();
+        let rho = if let Some(bits) = grinding.round_bits() {
+            let (nonce, rho) = ch.grind_pow_and_sample_f128(bits);
+            grinding_nonces.push(nonce);
+            rho
+        } else {
+            ch.sample_f128()
+        };
         rounds.push((g1, g_inf));
         r.push(rho);
         match (&mut sparse, use_sparse) {
@@ -465,13 +471,15 @@ pub fn verify_with_label_and_grinding<C: Challenger>(
 
     ch.observe_label(label);
     let mut nonce_idx = 0;
-    if let Some(bits) = grinding.initial_bits(m_words) {
-        if !ch.verify_pow(proof.grinding_nonces[nonce_idx], bits) {
-            return Err(VerifyError::InvalidGrindingNonce { which: "initial" });
-        }
+    let tau = if let Some(bits) = grinding.initial_bits(m_words) {
+        let tau = ch
+            .verify_pow_and_sample_f128_vec(proof.grinding_nonces[nonce_idx], bits, m_words)
+            .ok_or(VerifyError::InvalidGrindingNonce { which: "initial" })?;
         nonce_idx += 1;
-    }
-    let tau = ch.sample_f128_vec(m_words);
+        tau
+    } else {
+        ch.sample_f128_vec(m_words)
+    };
 
     // Convention A chain, identical in shape to `crate::zerocheck::verify`: the
     // running claim is the bare inner value `G(ρ)`; the just-bound variable's eq
@@ -486,13 +494,15 @@ pub fn verify_with_label_and_grinding<C: Challenger>(
 
         ch.observe_f128(g1);
         ch.observe_f128(g_inf);
-        if let Some(bits) = grinding.round_bits() {
-            if !ch.verify_pow(proof.grinding_nonces[nonce_idx], bits) {
-                return Err(VerifyError::InvalidGrindingNonce { which: "round" });
-            }
+        let rho = if let Some(bits) = grinding.round_bits() {
+            let rho = ch
+                .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
+                .ok_or(VerifyError::InvalidGrindingNonce { which: "round" })?;
             nonce_idx += 1;
-        }
-        let rho = ch.sample_f128();
+            rho
+        } else {
+            ch.sample_f128()
+        };
         r.push(rho);
 
         let one_plus_rho = F128::ONE + rho;

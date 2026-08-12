@@ -242,10 +242,13 @@ pub fn prove_with_grinding<C: Challenger>(
     // ---- Phase 2: the column-domain lincheck with the per-slot collapse.
     ch.observe_label(LC_LABEL);
     let mut grinding_nonces = Vec::with_capacity(grinding.lincheck_nonce_count(e_vars - nu));
-    if let Some(bits) = grinding.alpha_bits() {
-        grinding_nonces.push(ch.grind_pow(bits));
-    }
-    let alpha = ch.sample_f128();
+    let alpha = if let Some(bits) = grinding.alpha_bits() {
+        let (nonce, alpha) = ch.grind_pow_and_sample_f128(bits);
+        grinding_nonces.push(nonce);
+        alpha
+    } else {
+        ch.sample_f128()
+    };
     let mut comb = region_comb(&slots, nu, e_vars, alpha, &zc.r);
     let mut g = collapse_rows(z, &zc.r[..nu], Some(&support.live));
     debug_assert_eq!(
@@ -351,13 +354,15 @@ pub fn verify_deferred_with_grinding<C: Challenger>(
         });
     }
     let mut nonce_idx = 0;
-    if let Some(bits) = grinding.alpha_bits() {
-        if !ch.verify_pow(proof.lincheck.grinding_nonces[nonce_idx], bits) {
-            return Err(VerifyError::LincheckGrindingInvalid { which: "alpha" });
-        }
+    let alpha = if let Some(bits) = grinding.alpha_bits() {
+        let alpha = ch
+            .verify_pow_and_sample_f128(proof.lincheck.grinding_nonces[nonce_idx], bits)
+            .ok_or(VerifyError::LincheckGrindingInvalid { which: "alpha" })?;
         nonce_idx += 1;
-    }
-    let alpha = ch.sample_f128();
+        alpha
+    } else {
+        ch.sample_f128()
+    };
     let (running, bind_order) = column_sumcheck_replay(
         va + alpha * vb,
         &proof.lincheck.rounds,

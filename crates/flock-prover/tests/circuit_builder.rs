@@ -389,6 +389,7 @@ fn fs_chain_circuit_derives_the_challenges() {
             Some(right) => {
                 let l = &outs[match link.cv {
                     CvSource::Row(r) => r,
+                    CvSource::RowHi(r) => r,
                     CvSource::Iv => unreachable!("a parent's left input is a row"),
                 }];
                 let r = &outs[right];
@@ -399,6 +400,7 @@ fn fs_chain_circuit_derives_the_challenges() {
                 let cv_in = match link.cv {
                     CvSource::Iv => iv,
                     CvSource::Row(r) => [outs[r][0], outs[r][1]],
+                    CvSource::RowHi(r) => [outs[r][2], outs[r][3]],
                 };
                 let base = trace.block_offsets[i].expect("a stream block has an offset") / 16;
                 // `block_len` bounds how much of this block is real stream. A
@@ -666,6 +668,7 @@ fn mvp_fs_chain_of_a_real_proof() {
             Some(right) => {
                 let l = match link.cv {
                     CvSource::Row(r) => r,
+                    CvSource::RowHi(r) => r,
                     CvSource::Iv => unreachable!(),
                 };
                 (iv, [outs[l][0], outs[l][1], outs[right][0], outs[right][1]])
@@ -674,6 +677,7 @@ fn mvp_fs_chain_of_a_real_proof() {
                 let cv_in = match link.cv {
                     CvSource::Iv => iv,
                     CvSource::Row(r) => [outs[r][0], outs[r][1]],
+                    CvSource::RowHi(r) => [outs[r][2], outs[r][3]],
                 };
                 let base = trace.block_offsets[i].expect("stream block") / 16;
                 let real = (blen as usize) / 16;
@@ -940,6 +944,7 @@ fn mvp2_sumcheck_round_consumes_a_derived_challenge() {
             Some(right) => {
                 let l = match link.cv {
                     CvSource::Row(r) => r,
+                    CvSource::RowHi(r) => r,
                     CvSource::Iv => unreachable!(),
                 };
                 (iv, [outs[l][0], outs[l][1], outs[right][0], outs[right][1]])
@@ -948,6 +953,7 @@ fn mvp2_sumcheck_round_consumes_a_derived_challenge() {
                 let cv_in = match link.cv {
                     CvSource::Iv => iv,
                     CvSource::Row(r) => [outs[r][0], outs[r][1]],
+                    CvSource::RowHi(r) => [outs[r][2], outs[r][3]],
                 };
                 let base = trace.block_offsets[i].expect("stream block") / 16;
                 let real = (blen as usize) / 16;
@@ -1254,6 +1260,7 @@ fn mvp2b_full_element_zerocheck_replayed() {
             Some(right) => {
                 let l = match link.cv {
                     CvSource::Row(r) => r,
+                    CvSource::RowHi(r) => r,
                     CvSource::Iv => unreachable!(),
                 };
                 (iv, [outs[l][0], outs[l][1], outs[right][0], outs[right][1]])
@@ -1262,6 +1269,7 @@ fn mvp2b_full_element_zerocheck_replayed() {
                 let cv_in = match link.cv {
                     CvSource::Iv => iv,
                     CvSource::Row(r) => [outs[r][0], outs[r][1]],
+                    CvSource::RowHi(r) => [outs[r][2], outs[r][3]],
                 };
                 let base = trace.block_offsets[i].expect("stream block") / 16;
                 let real = (blen as usize) / 16;

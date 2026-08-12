@@ -582,10 +582,13 @@ fn prove_packed_padded_inner<C: Challenger>(
     //   r[k_skip+3..k_skip+7]       — protocol medium-eq constants β_i
     //   r[k_skip+7..m]              — sampled (the "outer" eq weights for
     //                                  the URM and multilinear rounds)
-    if let Some(bits) = grinding.initial_bits(m) {
-        grinding_nonces.push(challenger.grind_pow(bits));
-    }
-    let r_skip = challenger.sample_f128_vec(k_skip);
+    let r_skip = if let Some(bits) = grinding.initial_bits(m) {
+        let (nonce, r_skip) = challenger.grind_pow_and_sample_f128_vec(bits, k_skip);
+        grinding_nonces.push(nonce);
+        r_skip
+    } else {
+        challenger.sample_f128_vec(k_skip)
+    };
     let r_outer = challenger.sample_f128_vec(m - k_skip - N_INNER);
     let mut r = vec![F128::ZERO; m];
     r[..k_skip].copy_from_slice(&r_skip);
@@ -641,10 +644,13 @@ fn prove_packed_padded_inner<C: Challenger>(
     // ---- 4. Observe round-1 message, sample z (URM fold point) ----
     challenger.observe_f128_slice(&round1_ab);
     challenger.observe_f128_slice(&round1_c);
-    if let Some(bits) = grinding.skip_bits() {
-        grinding_nonces.push(challenger.grind_pow(bits));
-    }
-    let z = challenger.sample_f128();
+    let z = if let Some(bits) = grinding.skip_bits() {
+        let (nonce, z) = challenger.grind_pow_and_sample_f128(bits);
+        grinding_nonces.push(nonce);
+        z
+    } else {
+        challenger.sample_f128()
+    };
 
     // ---- 5. c_eval = ĉ(z, r_rest) via interpolation of round1_c at z ----
     //
@@ -725,10 +731,14 @@ fn prove_packed_padded_inner<C: Challenger>(
     challenger.observe_f128(msg_1);
     challenger.observe_f128(msg_inf);
     let mut mlv_rhos: Vec<F128> = Vec::with_capacity(n_mlv);
-    if let Some(bits) = grinding.multilinear_round_bits() {
-        grinding_nonces.push(challenger.grind_pow(bits));
-    }
-    mlv_rhos.push(challenger.sample_f128());
+    let rho = if let Some(bits) = grinding.multilinear_round_bits() {
+        let (nonce, rho) = challenger.grind_pow_and_sample_f128(bits);
+        grinding_nonces.push(nonce);
+        rho
+    } else {
+        challenger.sample_f128()
+    };
+    mlv_rhos.push(rho);
 
     // ---- 7. Rounds 3..(n_mlv + 1) — AB only (c is done) ----
     //
@@ -858,10 +868,14 @@ fn prove_packed_padded_inner<C: Challenger>(
         multilinear_msgs.push((m1, mi));
         challenger.observe_f128(m1);
         challenger.observe_f128(mi);
-        if let Some(bits) = grinding.multilinear_round_bits() {
-            grinding_nonces.push(challenger.grind_pow(bits));
-        }
-        mlv_rhos.push(challenger.sample_f128());
+        let rho = if let Some(bits) = grinding.multilinear_round_bits() {
+            let (nonce, rho) = challenger.grind_pow_and_sample_f128(bits);
+            grinding_nonces.push(nonce);
+            rho
+        } else {
+            challenger.sample_f128()
+        };
+        mlv_rhos.push(rho);
     }
     debug_assert!(
         store.is_none(),
@@ -998,15 +1012,15 @@ pub fn verify_with_grinding<C: Challenger>(
     let mut nonce_idx = 0usize;
 
     // ---- Re-derive r (in lockstep with prove_packed) ----
-    if let Some(bits) = grinding.initial_bits(m) {
-        if !challenger.verify_pow(proof.grinding_nonces[nonce_idx], bits) {
-            return Err(VerifyError::InvalidGrindingNonce {
-                which: "initial",
-            });
-        }
+    let r_skip = if let Some(bits) = grinding.initial_bits(m) {
+        let r_skip = challenger
+            .verify_pow_and_sample_f128_vec(proof.grinding_nonces[nonce_idx], bits, k_skip)
+            .ok_or(VerifyError::InvalidGrindingNonce { which: "initial" })?;
         nonce_idx += 1;
-    }
-    let r_skip = challenger.sample_f128_vec(k_skip);
+        r_skip
+    } else {
+        challenger.sample_f128_vec(k_skip)
+    };
     let r_outer = challenger.sample_f128_vec(m - k_skip - N_INNER);
     let mut r = vec![F128::ZERO; m];
     r[..k_skip].copy_from_slice(&r_skip);
@@ -1021,13 +1035,15 @@ pub fn verify_with_grinding<C: Challenger>(
     // ---- Observe round-1 messages, sample z ----
     challenger.observe_f128_slice(&proof.round1_ab);
     challenger.observe_f128_slice(&proof.round1_c);
-    if let Some(bits) = grinding.skip_bits() {
-        if !challenger.verify_pow(proof.grinding_nonces[nonce_idx], bits) {
-            return Err(VerifyError::InvalidGrindingNonce { which: "skip" });
-        }
+    let z = if let Some(bits) = grinding.skip_bits() {
+        let z = challenger
+            .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
+            .ok_or(VerifyError::InvalidGrindingNonce { which: "skip" })?;
         nonce_idx += 1;
-    }
-    let z = challenger.sample_f128();
+        z
+    } else {
+        challenger.sample_f128()
+    };
 
     // ---- Reconstruct ĉ(z, r_rest) from round1_c ----
     //
@@ -1095,15 +1111,17 @@ pub fn verify_with_grinding<C: Challenger>(
 
         challenger.observe_f128(msg_1);
         challenger.observe_f128(msg_inf);
-        if let Some(bits) = grinding.multilinear_round_bits() {
-            if !challenger.verify_pow(proof.grinding_nonces[nonce_idx], bits) {
-                return Err(VerifyError::InvalidGrindingNonce {
+        let rho = if let Some(bits) = grinding.multilinear_round_bits() {
+            let rho = challenger
+                .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
+                .ok_or(VerifyError::InvalidGrindingNonce {
                     which: "multilinear",
-                });
-            }
+                })?;
             nonce_idx += 1;
-        }
-        let rho = challenger.sample_f128();
+            rho
+        } else {
+            challenger.sample_f128()
+        };
         mlv_rhos.push(rho);
 
         let one_plus_rho = F128::ONE + rho;
@@ -1264,7 +1282,7 @@ mod tests {
             .ops()
             .iter()
             .filter_map(|op| match op {
-                TranscriptOp::Pow { bits } => Some(*bits),
+                TranscriptOp::Pow { bits } | TranscriptOp::LegacyPow { bits } => Some(*bits),
                 _ => None,
             })
             .collect();
