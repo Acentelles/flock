@@ -24,6 +24,7 @@ fn main() {
         LigeritoProfile::Fast,
         LigeritoProfile::Fast100,
         LigeritoProfile::Slim,
+        LigeritoProfile::Slim100,
         LigeritoProfile::Secure,
     ];
     // Configs live in the flock-core crate (which embeds them via include_str!).
