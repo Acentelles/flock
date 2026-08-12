@@ -69,8 +69,9 @@ fn pcs_batch(union: &UnionInstance) -> usize {
 /// roughly HALF the queries (m29: Σq 262 vs Fast's 491), so the
 /// openings-dominated b3 trace shrinks with q while the doubled codeword
 /// lands on the native NTT+Merkle side. `TOWER_PROFILE=secure` selects the
-/// Secure PCS schedules and the Boolean-zerocheck per-challenge grinding
-/// policy. Default Fast; the legacy mvp tests stay Fast unconditionally.
+/// Secure PCS schedules and every Secure algebraic-grinding policy exercised
+/// by the recursive path (Boolean, element, opening, and fold families).
+/// Default Fast; the legacy mvp tests stay Fast unconditionally.
 fn tower_profile() -> LigeritoProfile {
     match std::env::var("TOWER_PROFILE").as_deref() {
         Ok("slim") => LigeritoProfile::Slim,
@@ -4763,6 +4764,9 @@ struct MpRec {
 /// ordinals (indices into `FsChainTrace::squeezes`); `*_ch` index into
 /// `RecordingChallenger::challenges()`.
 struct OpenLevel {
+    /// Additional L0 OOD claims batched into the initial sumcheck before its
+    /// first message. Nonempty only on level 0.
+    initial_ood: Vec<InitialOodRec>,
     fold_fins: Vec<usize>,
     fold_chs: Vec<usize>,
     /// Value index of each fold round's message `u_0` (`u_2` is `+1`).
@@ -4780,6 +4784,17 @@ struct OpenLevel {
     a_fin: usize,
     a_ch: usize,
     a_count: usize,
+}
+
+/// An L0 OOD claim has no separate intro quadratic: its equality basis and
+/// target are combined before the initial sumcheck message is emitted.
+struct InitialOodRec {
+    z_fin: usize,
+    z_ch: usize,
+    z_len: usize,
+    y_v: usize,
+    beta_fin: usize,
+    beta_ch: usize,
 }
 
 /// Walk the recorded transcript ops and locate every open-phase squeeze the
@@ -5077,6 +5092,27 @@ fn parse_open_levels(
     let inner_pd = inner_pd.expect("the inner ligerito intake");
     let mp = mp.expect("the multipoint region");
     cur.bump(); // the open-phase initial cap absorb
+    let mut initial_ood = Vec::new();
+    while matches!(cur.ops[cur.i], Op::SqueezeSlice(_)) {
+        let z_len = match cur.ops[cur.i] {
+            Op::SqueezeSlice(n) => n,
+            _ => unreachable!(),
+        };
+        let (z_fin, z_ch) = (cur.fin, cur.ch);
+        cur.bump();
+        let y_v = cur.v;
+        cur.expect_obs_scalar();
+        assert!(matches!(cur.ops[cur.i], Op::SqueezeScalar), "L0 OOD beta");
+        initial_ood.push(InitialOodRec {
+            z_fin,
+            z_ch,
+            z_len,
+            y_v,
+            beta_fin: cur.fin,
+            beta_ch: cur.ch,
+        });
+        cur.bump();
+    }
     let start_v = cur.v;
     cur.expect_obs_scalar(); // sumcheck start msg u_0
     cur.expect_obs_scalar(); // ... u_2
@@ -5175,6 +5211,11 @@ fn parse_open_levels(
         let (beta_fin, beta_ch) = (cur.fin, cur.ch);
         cur.bump();
         levels.push(OpenLevel {
+            initial_ood: if li == 0 {
+                std::mem::take(&mut initial_ood)
+            } else {
+                Vec::new()
+            },
             fold_fins,
             fold_chs,
             fold_msg_vs,
@@ -5668,6 +5709,10 @@ fn mvp7_real_query_phase() {
     let gpw = chw(&outs, &trace.squeezes, inner_pd.fin);
     let tw0 = sb.gate(spine, &[zw, zw, zw, zw, zw, zw, wv(inner_pd.q_v), gpw, zw]);
     let mut tw = tw0[3];
+    for od in &levels[0].initial_ood {
+        let bw = chw(&outs, &trace.squeezes, od.beta_fin);
+        tw = sb.gate(spine, &[zw, zw, zw, tw, zw, zw, wv(od.y_v), bw, zw])[3];
+    }
     let st = sb.gate(spine, &[zw, zw, zw, zw, wv(start_v), wv(start_v + 1), tw, ow, zw]);
     let (mut qc, mut qb, mut qa) = (st[0], st[1], st[2]);
     for (li, lvl) in levels.iter().enumerate() {
@@ -6064,6 +6109,9 @@ fn mvp7_real_query_phase() {
     let evalq = |q: (F128, F128, F128), x: F128| q.0 + x * q.1 + x * x * q.2;
     // The bound start target: gamma' * q_eval.
     let mut nt = chals[inner_pd.ch] * vals_rec[inner_pd.q_v];
+    for od in &levels[0].initial_ood {
+        nt += chals[od.beta_ch] * vals_rec[od.y_v];
+    }
     let mut nq = quad(vals_rec[start_v], vals_rec[start_v + 1], nt);
     for (li, lvl) in levels.iter().enumerate() {
         for (j, &mv) in lvl.fold_msg_vs.iter().enumerate() {
@@ -6398,6 +6446,27 @@ struct Lvl {
     /// `level_geometry`: entry `i` is the depth-`(c − i)` layer, entry 0
     /// the cap itself — [`Self::full_path`]'s sibling sources.
     cap_layers: Vec<Vec<[u8; 32]>>,
+}
+
+/// Map actual sumcheck-fold order back to the transcript point's natural
+/// coordinate order. Partial L0 lane grids bind the high lane coordinates
+/// first; full grids and every later level use ordinary low-to-high order.
+fn l0_ood_z_index(
+    z_len: usize,
+    initial_k: usize,
+    committed_row_words: usize,
+    fold_order: usize,
+) -> usize {
+    if committed_row_words == 1usize << initial_k {
+        fold_order
+    } else {
+        let log_msg_cols = z_len - initial_k;
+        if fold_order < initial_k {
+            log_msg_cols + fold_order
+        } else {
+            fold_order - initial_k
+        }
+    }
 }
 
 impl Lvl {
@@ -7172,6 +7241,25 @@ fn emit_residual_region(
         let coords: Vec<Wire> = w_rounds[pl_full..].iter().map(|rr| chw(rr.fin)).collect();
         apply_suffix(sb, &mut evb_accs, pw, &coords);
     }
+    for od in &levels[0].initial_ood {
+        let folded = od.z_len - yr_log;
+        assert_eq!(folded, ris_full.len(), "L0 OOD spans every fold");
+        let initial_k = levels[0].fold_fins.len();
+        let z_index = |j| l0_ood_z_index(od.z_len, initial_k, geo[0].row_words, j);
+        let factors: Vec<(Wire, Wire)> = (0..folded)
+            .map(|j| {
+                (
+                    squeeze_word_wire(outs, trace, od.z_fin, z_index(j)),
+                    ris_full[j],
+                )
+            })
+            .collect();
+        let pw = prefix_chain(sb, chw(od.beta_fin), &factors);
+        let coords: Vec<Wire> = (0..yr_log)
+            .map(|j| squeeze_word_wire(outs, trace, od.z_fin, z_index(folded + j)))
+            .collect();
+        apply_suffix(sb, &mut evb_accs, pw, &coords);
+    }
     for (li, lvl) in levels.iter().enumerate() {
         for od in &lvl.ood {
             let folded = od.z_len - yr_log;
@@ -7292,6 +7380,24 @@ fn check_residual_publics(
             };
         }
         let mut comb = evb;
+        for od in &levels[0].initial_ood {
+            let folded = od.z_len - yr_log;
+            assert_eq!(folded, pl_full, "L0 OOD spans every fold");
+            let initial_k = levels[0].fold_chs.len();
+            let z_index = |j| l0_ood_z_index(od.z_len, initial_k, geo[0].row_words, j);
+            let mut t = chals[od.beta_ch];
+            for j in 0..folded {
+                t *= F128::ONE + chals[od.z_ch + z_index(j)] + ris_v[j];
+            }
+            for j in 0..yr_log {
+                t *= if (y >> j) & 1 == 1 {
+                    chals[od.z_ch + z_index(folded + j)]
+                } else {
+                    F128::ONE + chals[od.z_ch + z_index(folded + j)]
+                };
+            }
+            comb += t;
+        }
         for (li, lvl) in levels.iter().enumerate() {
             comb += chals[lvl.beta_ch] * resid_native[li][y];
             for od in &lvl.ood {
@@ -9110,6 +9216,10 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         let gpw = outs[trace.squeezes[inner_pd2.fin][0]][0];
         let tw0 = sb.gate(spine, &[zw, zw, zw, zw, zw, zw, wv(inner_pd2.q_v), gpw, zw]);
         let mut tsp = tw0[3];
+        for od in &levels[0].initial_ood {
+            let bw = outs[trace.squeezes[od.beta_fin][0]][0];
+            tsp = sb.gate(spine, &[zw, zw, zw, tsp, zw, zw, wv(od.y_v), bw, zw])[3];
+        }
         let st = sb.gate(
             spine,
             &[zw, zw, zw, zw, wv(start_v), wv(start_v + 1), tsp, ow, zw],
@@ -10043,6 +10153,9 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             let quad = |u0: F128, u2: F128, t: F128| (u0, t + u2, u2);
             let evalq = |q: (F128, F128, F128), x: F128| q.0 + x * q.1 + x * x * q.2;
             let mut nt = chals[inner_pd2.ch] * vals_rec[inner_pd2.q_v];
+            for od in &levels[0].initial_ood {
+                nt += chals[od.beta_ch] * vals_rec[od.y_v];
+            }
             let mut nq = quad(vals_rec[start_v], vals_rec[start_v + 1], nt);
             for (li, lvl) in levels.iter().enumerate() {
                 for (j, &mv) in lvl.fold_msg_vs.iter().enumerate() {
@@ -10918,6 +11031,9 @@ impl<'p> RealTape<'p> {
             let quad = |u0: F128, u2: F128, t: F128| (u0, t + u2, u2);
             let evalq = |q: (F128, F128, F128), x: F128| q.0 + x * q.1 + x * x * q.2;
             let mut nt = chals[inner_pd_i.ch] * vals_rec[inner_pd_i.q_v];
+            for od in &levels[0].initial_ood {
+                nt += chals[od.beta_ch] * vals_rec[od.y_v];
+            }
             let mut nq = quad(vals_rec[start_v_i], vals_rec[start_v_i + 1], nt);
             for (li, lvl) in levels.iter().enumerate() {
                 for (j, &mv) in lvl.fold_msg_vs.iter().enumerate() {
@@ -11890,6 +12006,10 @@ fn emit_real_child_region(
         &[zw, zw, zw, zw, zw, zw, wv(inner_pd_i.q_v), gpw, zw],
     );
     let mut tsp = tw0[3];
+    for od in &levels[0].initial_ood {
+        let bw = outs[trace.squeezes[od.beta_fin][0]][0];
+        tsp = sb.gate(spine, &[zw, zw, zw, tsp, zw, zw, wv(od.y_v), bw, zw])[3];
+    }
     let st = sb.gate(
         spine,
         &[zw, zw, zw, zw, wv(rt.start_v_i), wv(rt.start_v_i + 1), tsp, ow, zw],
@@ -16176,6 +16296,9 @@ impl<'p> ChildTape<'p> {
             let quad = |u0: F128, u2: F128, t: F128| (u0, t + u2, u2);
             let evalq = |q: (F128, F128, F128), x: F128| q.0 + x * q.1 + x * x * q.2;
             let mut nt = chals[inner_pd2.ch] * vals_rec[inner_pd2.q_v];
+            for od in &levels[0].initial_ood {
+                nt += chals[od.beta_ch] * vals_rec[od.y_v];
+            }
             let mut nq = quad(vals_rec[start_v], vals_rec[start_v + 1], nt);
             for (li, lvl) in levels.iter().enumerate() {
                 for (j, &mv) in lvl.fold_msg_vs.iter().enumerate() {
@@ -17207,6 +17330,10 @@ fn emit_child_region(
         &[zw, zw, zw, zw, zw, zw, wv(inner_pd2.q_v), gpw, zw],
     );
     let mut tsp = tw0[3];
+    for od in &levels[0].initial_ood {
+        let bw = outs[trace.squeezes[od.beta_fin][0]][0];
+        tsp = sb.gate(spine, &[zw, zw, zw, tsp, zw, zw, wv(od.y_v), bw, zw])[3];
+    }
     let st = sb.gate(
         spine,
         &[zw, zw, zw, zw, wv(ct.start_v), wv(ct.start_v + 1), tsp, ow, zw],

@@ -8,8 +8,8 @@
 //!             100-bit overall.
 //! - `secure`: Udr, rate 1/2, ε* = 1e-3, 120-bit overall.
 //!
-//! Each derived config is validated (including the whole-protocol union
-//! bound), serialized, round-trip checked, and written to
+//! Each derived config is validated against its per-component, round-by-round
+//! targets, serialized, round-trip checked, and written to
 //! `crates/flock-core/configs/ligerito/m<m>_<profile>.toml` (these are the
 //! configs `flock-core` embeds via `include_str!`).
 //!

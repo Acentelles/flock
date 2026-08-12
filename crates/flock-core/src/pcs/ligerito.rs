@@ -607,9 +607,9 @@ pub enum SoundnessRegime {
     /// proximity-gap exceptional set `a = O_ρ(n / η^5)`; the level's
     /// `fold_grinding_bits` should be ≥ (target_bits − log₂(q/a)).
     /// Binding to a single codeword of the (Johnson-bounded) interleaved list
-    /// is via `ood_samples` explicit multilinear OOD evaluations — except at
-    /// L0, where the opening's own post-commit random evaluation claim plays
-    /// the OOD role (union over the list, `L·μ/q`), so `ood_samples = 0`.
+    /// uses two independent post-commit multilinear evaluations. At L0 the
+    /// opening's ordinary evaluation supplies the first and `ood_samples = 1`
+    /// supplies the second; deeper levels use `ood_samples = 2`.
     ///
     /// Note there is deliberately no plain `Johnson` variant: without OOD
     /// binding the query phase pays a union bound over the interleaved list
@@ -672,11 +672,10 @@ pub struct LigeritoLevelConfig {
     /// `eps_pg + fold_grinding_bits ≥ target`.
     #[serde(default)]
     pub fold_grinding_bits: usize,
-    /// Out-of-domain samples taken right after this level's commit enters
-    /// the transcript (`JohnsonOod` only). Each binds the prover to a single
-    /// codeword of the interleaved list via a multilinear evaluation claim.
-    /// Must be 0 at L0 (bound by the opening's own post-commit evaluation
-    /// claim) and ≥ 1 at deeper `JohnsonOod` levels.
+    /// Additional out-of-domain samples taken right after this level's commit
+    /// enters the transcript (`JohnsonOod` only). Two total binding points are
+    /// required: exactly 1 explicit sample at L0 (whose opening claim is the
+    /// other point), and exactly 2 at every deeper level.
     #[serde(default)]
     pub ood_samples: usize,
     /// Security target this level guarantees, post-grinding.
@@ -687,10 +686,10 @@ pub struct LigeritoLevelConfig {
     /// Diagnostic — `Q · log₂(1/(1−γ))`. Should be ≥
     /// `target_security_bits − grinding_bits`.
     pub expected_eps_query_bits: f64,
-    /// Diagnostic — OOD binding bits (`JohnsonOod` only):
-    /// `s·(128 − log₂μ) − (2·log₂L − 1)` for explicit samples, or
-    /// `128 − log₂L − log₂μ` for the implicit L0 binding, where `L` is the
-    /// Johnson interleaved list size and `μ` the level's variable count.
+    /// Diagnostic — OOD collision-binding bits (`JohnsonOod` only):
+    /// `s·(128 − log₂μ) − (2·log₂L − 1)`, where `s = 2` counts
+    /// total independent points (including L0's ordinary opening point), `L`
+    /// is the Johnson interleaved list size, and `μ` the variable count.
     #[serde(default)]
     pub expected_eps_ood_bits: Option<f64>,
 }
@@ -763,6 +762,9 @@ pub struct LigeritoSecurityConfig {
 
 /// Default field size used for soundness analysis: `q = 2^128` (our F128).
 const ANALYSIS_LOG_Q: f64 = 128.0;
+/// OOD list binding is a 128-bit component even while the legacy Fast/Slim
+/// query/proximity profiles still carry their original 100-bit target.
+const OOD_BINDING_TARGET_BITS: f64 = 128.0;
 
 /// Round a float to one decimal place. Used to round paper-predicted
 /// soundness diagnostics so the generated TOMLs stay readable.
@@ -930,25 +932,26 @@ fn johnson_interleaved_list_log2(log_inv_rate: usize, eta: f64) -> f64 {
     l_base.log2()
 }
 
-/// OOD binding bits for a `JohnsonOod` level. `mu_vars` is the level's
-/// multilinear variable count (`log_msg_cols + log_num_interleaved`).
+/// OOD collision-binding bits for a `JohnsonOod` level with
+/// `total_samples` independently sampled post-commit evaluation points.
+/// `mu_vars` is the level's multilinear variable count
+/// (`log_msg_cols + log_num_interleaved`).
 ///
-/// - `ood_samples ≥ 1` (explicit samples): the bad event is two distinct
-///   list elements agreeing on all `s` random points of `F^μ`
-///   (Schwartz–Zippel, total degree ≤ μ), union over pairs:
-///       bits = s·(128 − log₂ μ) − (2·log₂ L_int − 1).
-/// - `ood_samples = 0` (L0's implicit binding): the opening's own evaluation
-///   claim at a post-commit random point pins the prover to one claimed
-///   value, so the union is over the list (not pairs):
-///       bits = 128 − log₂ L_int − log₂ μ.
-fn paper_ood_bits(log_inv_rate: usize, eta: f64, mu_vars: usize, ood_samples: usize) -> f64 {
+/// For two distinct list elements, their difference has total degree at most
+/// `μ`, hence Schwartz–Zippel gives agreement probability at most
+/// `(μ/2^128)^s` at `s` independent points. Union bounding over unordered
+/// pairs in the Johnson list gives
+///
+///   bits = s·(128 − log₂ μ) − (2·log₂ L_int − 1).
+///
+/// L0 already has one post-commit point: the opening claim's evaluation
+/// point. Its configured `ood_samples` are therefore *additional* points;
+/// callers pass `1 + ood_samples` for L0 and `ood_samples` elsewhere.
+fn paper_ood_bits(log_inv_rate: usize, eta: f64, mu_vars: usize, total_samples: usize) -> f64 {
+    debug_assert!(total_samples >= 1);
     let log2_l = johnson_interleaved_list_log2(log_inv_rate, eta);
     let log2_mu = (mu_vars as f64).log2();
-    if ood_samples == 0 {
-        ANALYSIS_LOG_Q - log2_l - log2_mu
-    } else {
-        ood_samples as f64 * (ANALYSIS_LOG_Q - log2_mu) - (2.0 * log2_l - 1.0)
-    }
+    total_samples as f64 * (ANALYSIS_LOG_Q - log2_mu) - (2.0 * log2_l - 1.0)
 }
 
 impl LigeritoLevelConfig {
@@ -1007,12 +1010,17 @@ impl LigeritoLevelConfig {
     /// OOD binding bits this level is expected to deliver (`JohnsonOod`
     /// only; `None` for `Udr`, where the unique-decoding list has size 1 and
     /// no binding step exists). See [`paper_ood_bits`].
-    pub fn paper_predicted_ood_bits(&self) -> Option<f64> {
+    pub fn paper_predicted_ood_bits(&self, implicit_samples: usize) -> Option<f64> {
         match self.regime {
             SoundnessRegime::JohnsonOod => {
                 let eta = self.eta.expect("JohnsonOod must have eta");
                 let mu = self.log_msg_cols + self.log_num_interleaved;
-                Some(paper_ood_bits(self.log_inv_rate, eta, mu, self.ood_samples))
+                Some(paper_ood_bits(
+                    self.log_inv_rate,
+                    eta,
+                    mu,
+                    implicit_samples + self.ood_samples,
+                ))
             }
             SoundnessRegime::Udr => None,
         }
@@ -1102,9 +1110,11 @@ impl LigeritoSecurityConfig {
                 _ => {}
             }
 
-            // OOD samples match regime: UDR has no list, so no OOD; under
-            // JohnsonOod every level past L0 needs explicit samples, while
-            // L0 is bound by the opening's own post-commit evaluation claim.
+            // OOD samples match regime: UDR has no list, so no OOD. In the
+            // Johnson regime every commitment is bound at two independent
+            // post-commit points. L0's opening evaluation is the first, so it
+            // carries one additional explicit OOD sample; later levels carry
+            // two explicit samples.
             match lv.regime {
                 SoundnessRegime::Udr if lv.ood_samples != 0 => {
                     return Err(format!(
@@ -1113,18 +1123,18 @@ impl LigeritoSecurityConfig {
                         lv.ood_samples
                     ));
                 }
-                SoundnessRegime::JohnsonOod if i == 0 && lv.ood_samples != 0 => {
+                SoundnessRegime::JohnsonOod if i == 0 && lv.ood_samples != 1 => {
                     return Err(format!(
-                        "L0: ood_samples={} but L0 is bound by the opening's \
-                         own evaluation claim (must be 0)",
+                        "L0: ood_samples={} but two-point binding requires one \
+                         explicit sample in addition to the opening claim",
                         lv.ood_samples
                     ));
                 }
-                SoundnessRegime::JohnsonOod if i > 0 && lv.ood_samples == 0 => {
+                SoundnessRegime::JohnsonOod if i > 0 && lv.ood_samples != 2 => {
                     return Err(format!(
-                        "L{i}: regime=johnson_ood requires ood_samples ≥ 1 \
-                         past L0 (the query counts assume single-codeword \
-                         binding)"
+                        "L{i}: two-point Johnson binding requires exactly two \
+                         explicit OOD samples, got {}",
+                        lv.ood_samples
                     ));
                 }
                 _ => {}
@@ -1142,7 +1152,7 @@ impl LigeritoSecurityConfig {
                 }
                 (SoundnessRegime::JohnsonOod, Some(declared)) => {
                     let pred = lv
-                        .paper_predicted_ood_bits()
+                        .paper_predicted_ood_bits(usize::from(i == 0))
                         .expect("JohnsonOod has an OOD prediction");
                     if (declared - pred).abs() > PAPER_COMPAT_TOL_BITS {
                         return Err(format!(
@@ -1210,15 +1220,14 @@ impl LigeritoSecurityConfig {
                 ));
             }
 
-            // OOD binding must reach target on its own (no grind covers it;
-            // escalate ood_samples instead).
+            // OOD binding is already a 128-bit component even though the
+            // legacy Johnson query/proximity profile still targets 100 bits.
             if let Some(ood) = lv.expected_eps_ood_bits
-                && ood + 1e-3 < lv.target_security_bits as f64
+                && ood + 1e-3 < OOD_BINDING_TARGET_BITS
             {
                 return Err(format!(
-                    "L{i}: expected_eps_ood_bits ({ood:.2}) < target ({}); \
-                         increase ood_samples",
-                    lv.target_security_bits
+                    "L{i}: expected_eps_ood_bits ({ood:.2}) < OOD target \
+                     ({OOD_BINDING_TARGET_BITS}); increase ood_samples"
                 ));
             }
 
@@ -1467,16 +1476,13 @@ impl LigeritoSecurityConfig {
                 LigeritoProfile::Fast | LigeritoProfile::Slim => {
                     let eps_pg = ANALYSIS_LOG_Q - paper_johnson_log_a(rate, JOHNSON_ETA, cols, ilv);
                     let mu = cols + ilv;
-                    let ood_samples = if i == 0 {
-                        0 // bound by the opening's own evaluation claim
-                    } else {
-                        (1..=8usize)
-                            .find(|&s| paper_ood_bits(rate, JOHNSON_ETA, mu, s) >= t)
-                            .ok_or_else(|| {
-                                format!("L{i}: no OOD sample count reaches {t:.1} bits")
-                            })?
-                    };
-                    let eps_ood = paper_ood_bits(rate, JOHNSON_ETA, mu, ood_samples);
+                    // Two independent binding points at every commitment.
+                    // L0's ordinary opening point is already post-commit and
+                    // supplies the first; all later points are explicit.
+                    let implicit_samples = usize::from(i == 0);
+                    let total_samples = 2usize;
+                    let ood_samples = total_samples - implicit_samples;
+                    let eps_ood = paper_ood_bits(rate, JOHNSON_ETA, mu, total_samples);
                     (
                         SoundnessRegime::JohnsonOod,
                         Some(JOHNSON_ETA),
@@ -1511,7 +1517,7 @@ impl LigeritoSecurityConfig {
         let analysis_version = match profile {
             LigeritoProfile::Secure => "no_row_union_over_ben_sasson_2025_cor_1_4",
             LigeritoProfile::Fast | LigeritoProfile::Slim => {
-                "johnson_ood_row_union_over_bchks25_thm_4_6"
+                "johnson_two_point_ood_row_union_over_bchks25_thm_4_6"
             }
         };
         let cfg = Self {
@@ -1664,8 +1670,8 @@ pub struct LigeritoProof {
     #[serde(default)]
     pub grinding_nonces: Vec<u64>,
     /// Claimed multilinear OOD evaluations, flattened in transcript order
-    /// (level 1's `ood_samples[1]` values, then level 2's, ...). Empty when
-    /// the config takes no OOD samples (UDR profiles, legacy paths).
+    /// (L0's additional `ood_samples[0]` values, then level 1's, ...). Empty
+    /// when the config takes no OOD samples (UDR profiles, legacy paths).
     #[serde(default)]
     pub ood_values: Vec<F128>,
     /// Fold-challenge PoW nonces, flattened in transcript order — one per
@@ -2707,6 +2713,40 @@ fn round_msg_and_eval_lsb(f: &[F128], b: &[F128]) -> (SumcheckMessage, F128) {
     (SumcheckMessage { u_0, u_2 }, y)
 }
 
+/// Block-pairing counterpart of [`round_msg_and_eval_lsb`]. `d = 1` is the
+/// ordinary LSB order; `d > 1` pairs corresponding entries in adjacent
+/// `d`-word blocks, as required by a lane-major L0 fold.
+fn round_msg_and_eval_blocked(f: &[F128], b: &[F128], d: usize) -> (SumcheckMessage, F128) {
+    use rayon::prelude::*;
+    debug_assert!(d.is_power_of_two());
+    debug_assert_eq!(f.len(), b.len());
+    debug_assert!(f.len().is_multiple_of(2 * d));
+    if d == 1 {
+        return round_msg_and_eval_lsb(f, b);
+    }
+    let (u_0, u_2, y) = (0..f.len() / (2 * d))
+        .into_par_iter()
+        .map(|j| {
+            let (mut u0, mut u2, mut eval) = (F128::ZERO, F128::ZERO, F128::ZERO);
+            let b0 = 2 * j * d;
+            let b1 = b0 + d;
+            for k in 0..d {
+                let (f0, f1) = (f[b0 + k], f[b1 + k]);
+                let (e0, e1) = (b[b0 + k], b[b1 + k]);
+                let f0e0 = f0 * e0;
+                u0 += f0e0;
+                u2 += (f0 + f1) * (e0 + e1);
+                eval += f0e0 + f1 * e1;
+            }
+            (u0, u2, eval)
+        })
+        .reduce(
+            || (F128::ZERO, F128::ZERO, F128::ZERO),
+            |(a0, a2, ae), (b0, b2, be)| (a0 + b0, a2 + b2, ae + be),
+        );
+    (SumcheckMessage { u_0, u_2 }, y)
+}
+
 /// Partially evaluate `evals` at LSB variable = `r`, in place. Halves length.
 /// Parallel for large arrays. Test oracle for the fused fold below; the
 /// production path uses `fold_and_msg_lsb` instead.
@@ -3146,7 +3186,7 @@ fn fold_and_msg_blocked_jit(
 /// The basis is materialized exactly once, at the LAST L0 round (where
 /// `blocks_out == 1` and the next round pairs elements anyway), at the
 /// handoff size `2^(log_n − initial_k)` the recursion needs.
-pub(crate) struct VirtualEqBasis {
+struct VirtualEqTerm {
     /// Surviving point coordinates; coordinate `j` ↔ index bit `j` (the
     /// [`build_eq_table`] convention the caller's tensor was built under).
     coords: Vec<F128>,
@@ -3157,17 +3197,17 @@ pub(crate) struct VirtualEqBasis {
     n_lo: usize,
 }
 
-impl VirtualEqBasis {
-    pub(crate) fn new(point: Vec<F128>, gamma: F128) -> Self {
-        let mut vb = Self {
+impl VirtualEqTerm {
+    fn new(point: Vec<F128>, gamma: F128) -> Self {
+        let mut term = Self {
             coords: point,
             scale: gamma,
             lo: Vec::new(),
             hi: Vec::new(),
             n_lo: 0,
         };
-        vb.rebuild();
-        vb
+        term.rebuild();
+        term
     }
 
     fn rebuild(&mut self) {
@@ -3192,6 +3232,12 @@ impl VirtualEqBasis {
         1usize << self.coords.len()
     }
 
+    #[inline]
+    fn value_at(&self, u: usize) -> F128 {
+        let mask = (1usize << self.n_lo) - 1;
+        self.lo[u & mask] * self.hi[u >> self.n_lo]
+    }
+
     /// `out = b[g0 .. g0 + out.len()]`. Walked in runs where the `hi` factor
     /// is constant, so the inner loop is one multiply per word.
     fn fill(&self, out: &mut [F128], g0: usize) {
@@ -3210,6 +3256,65 @@ impl VirtualEqBasis {
         }
     }
 
+    fn add_to(&self, out: &mut [F128], g0: usize) {
+        let span = 1usize << self.n_lo;
+        let mask = span - 1;
+        let mut i = 0;
+        while i < out.len() {
+            let u = g0 + i;
+            let e_hi = self.hi[u >> self.n_lo];
+            let off = u & mask;
+            let n = (out.len() - i).min(span - off);
+            for (k, s) in out[i..i + n].iter_mut().enumerate() {
+                *s += self.lo[off + k] * e_hi;
+            }
+            i += n;
+        }
+    }
+}
+
+/// A factored sum of scaled equality tensors. It starts with the opening's
+/// basis and can absorb L0's additional OOD term without materializing a
+/// `2^log_n` vector.
+pub(crate) struct VirtualEqBasis {
+    terms: Vec<VirtualEqTerm>,
+}
+
+impl VirtualEqBasis {
+    pub(crate) fn new(point: Vec<F128>, gamma: F128) -> Self {
+        Self {
+            terms: vec![VirtualEqTerm::new(point, gamma)],
+        }
+    }
+
+    fn add_term(&mut self, point: Vec<F128>, scale: F128) {
+        assert_eq!(point.len(), self.terms[0].coords.len());
+        self.terms.push(VirtualEqTerm::new(point, scale));
+    }
+
+    fn fold_coord(&mut self, p: usize, r: F128) {
+        for term in &mut self.terms {
+            term.fold_coord(p, r);
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.terms[0].len()
+    }
+
+    fn fill(&self, out: &mut [F128], g0: usize) {
+        self.terms[0].fill(out, g0);
+        for term in &self.terms[1..] {
+            term.add_to(out, g0);
+        }
+    }
+
+    fn add_to(&self, out: &mut [F128], g0: usize) {
+        for term in &self.terms {
+            term.add_to(out, g0);
+        }
+    }
+
     /// The full basis, for the handoff into the recursive levels.
     fn materialize(&self) -> Vec<F128> {
         use rayon::prelude::*;
@@ -3221,6 +3326,40 @@ impl VirtualEqBasis {
             .for_each(|(ci, c)| self.fill(c, ci * CH));
         out
     }
+}
+
+/// Round-0 message and MLE evaluation for an unscaled equality tensor,
+/// retaining its square-root factorization throughout the pass.
+fn round_msg_and_eval_eq_point_blocked(
+    f: &[F128],
+    point: &[F128],
+    d: usize,
+) -> (SumcheckMessage, F128) {
+    use rayon::prelude::*;
+    debug_assert_eq!(f.len(), 1usize << point.len());
+    debug_assert!(f.len().is_multiple_of(2 * d));
+    let eq = VirtualEqTerm::new(point.to_vec(), F128::ONE);
+    let (u_0, u_2, y) = (0..f.len() / (2 * d))
+        .into_par_iter()
+        .map(|j| {
+            let (mut u0, mut u2, mut eval) = (F128::ZERO, F128::ZERO, F128::ZERO);
+            let i0 = 2 * j * d;
+            let i1 = i0 + d;
+            for k in 0..d {
+                let (f0, f1) = (f[i0 + k], f[i1 + k]);
+                let (e0, e1) = (eq.value_at(i0 + k), eq.value_at(i1 + k));
+                let f0e0 = f0 * e0;
+                u0 += f0e0;
+                u2 += (f0 + f1) * (e0 + e1);
+                eval += f0e0 + f1 * e1;
+            }
+            (u0, u2, eval)
+        })
+        .reduce(
+            || (F128::ZERO, F128::ZERO, F128::ZERO),
+            |(a0, a2, ae), (b0, b2, be)| (a0 + b0, a2 + b2, ae + be),
+        );
+    (SumcheckMessage { u_0, u_2 }, y)
 }
 
 /// Fold `f` only, at block granularity `d` (the [`fold_and_msg_blocked`]
@@ -3950,8 +4089,8 @@ pub(crate) fn recursive_prover_with_basis_precomputed_round0_lanes<Ch: Challenge
 fn recursive_prover_with_basis_impl<Ch: Challenger>(
     config: &ProverConfig,
     packed_witness: Vec<F128>,
-    b_initial: Vec<F128>,
-    target: F128,
+    mut b_initial: Vec<F128>,
+    mut target: F128,
     l0_codeword: &[F128],
     l0_tree: &[Hash],
     l0_num_lanes: usize,
@@ -3959,7 +4098,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     l0_live_blocks_in: usize,
     l0_jit_basis: Option<BasisWindowFn<'_>>,
     l0_virtual_basis: Option<VirtualEqBasis>,
-    first_msg: Option<SumcheckMessage>,
+    mut first_msg: Option<SumcheckMessage>,
     challenger: &mut Ch,
 ) -> (LigeritoProof, Vec<F128>) {
     let log_n = packed_witness.len().trailing_zeros() as usize;
@@ -4036,20 +4175,61 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     };
     challenger.observe_bytes(initial_cap.as_flattened());
 
-    // L0 takes no explicit OOD samples: it is bound by the opening's own
-    // evaluation claim (`target` at the post-commit random point behind
-    // `b_initial`), which plays the OOD role with a union over the list
-    // instead of over pairs. See `paper_ood_bits`.
-    assert_eq!(
-        config.ood_samples.first().copied().unwrap_or(0),
-        0,
-        "L0 must not take explicit OOD samples"
-    );
     let mut ood_values: Vec<F128> = Vec::new();
     let mut fold_grinding_nonces: Vec<u64> = Vec::new();
     let fold_bits =
         |lvl: usize| -> u32 { config.fold_grinding_bits.get(lvl).copied().unwrap_or(0) as u32 };
     let ood_count = |lvl: usize| -> usize { config.ood_samples.get(lvl).copied().unwrap_or(0) };
+
+    // L0's ordinary opening evaluation is the first post-commit binding
+    // point. Batch each configured additional OOD claim into the INITIAL
+    // sumcheck before its first message. For the production factored-eq path,
+    // retain the new equality tensor in factored form as well: the second
+    // point must not regress the inner open to a 2^log_n basis allocation.
+    let mut vbasis = l0_virtual_basis;
+    let mut jit_ood_basis: Option<VirtualEqBasis> = None;
+    {
+        use rayon::prelude::*;
+        let _t = std::time::Instant::now();
+        for _ in 0..ood_count(0) {
+            let z = challenger.sample_f128_vec(log_n);
+            let (ood_msg, y, eq_z) = if factored_basis {
+                let (msg, y) =
+                    round_msg_and_eval_eq_point_blocked(&packed_witness, &z, l0_fold_block);
+                (msg, y, None)
+            } else {
+                let eq = build_eq_table(&z);
+                let (msg, y) = round_msg_and_eval_blocked(&packed_witness, &eq, l0_fold_block);
+                (msg, y, Some(eq))
+            };
+            challenger.observe_f128(y);
+            ood_values.push(y);
+            let beta = challenger.sample_f128();
+            target += beta * y;
+            if let Some(msg) = first_msg.as_mut() {
+                msg.u_0 += beta * ood_msg.u_0;
+                msg.u_2 += beta * ood_msg.u_2;
+            }
+            if factored_basis {
+                if let Some(vb) = vbasis.as_mut() {
+                    vb.add_term(z, beta);
+                } else if let Some(vb) = jit_ood_basis.as_mut() {
+                    vb.add_term(z, beta);
+                } else {
+                    jit_ood_basis = Some(VirtualEqBasis::new(z, beta));
+                }
+            } else {
+                let eq = eq_z.expect("materialized L0 basis has materialized OOD eq");
+                b_initial
+                    .par_iter_mut()
+                    .zip(eq.par_iter())
+                    .for_each(|(b, &e)| *b += beta * e);
+            }
+        }
+        if trace {
+            t_ood += _t.elapsed();
+        }
+    }
 
     let _t = std::time::Instant::now();
     let (mut sc_prover, start_msg) = match first_msg {
@@ -4063,11 +4243,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         None => SumcheckProver::new(packed_witness, b_initial, target),
     };
     let mut jit = l0_jit_basis;
-    let mut vbasis = l0_virtual_basis;
-    debug_assert!(
-        vbasis.is_none() || l0_fold_block > 1,
-        "the virtual basis rides the BLOCKED fold (the lane-major L0)"
-    );
     challenger.observe_f128(start_msg.u_0);
     challenger.observe_f128(start_msg.u_2);
 
@@ -4104,7 +4279,23 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 }
             }
             None => match jit.take() {
-                Some(fill) => sc_prover.fold_blocked_jit(r, l0_fold_block, l0_live_blocks, fill),
+                Some(fill) => match jit_ood_basis.as_ref() {
+                    Some(ood) => {
+                        let combined_fill = |out: &mut [F128], g0: usize| {
+                            fill(out, g0);
+                            ood.add_to(out, g0);
+                        };
+                        sc_prover.fold_blocked_jit(
+                            r,
+                            l0_fold_block,
+                            l0_live_blocks,
+                            &combined_fill,
+                        )
+                    }
+                    None => {
+                        sc_prover.fold_blocked_jit(r, l0_fold_block, l0_live_blocks, fill)
+                    }
+                },
                 None => sc_prover.fold_blocked(r, l0_fold_block, l0_live_blocks),
             },
         };
@@ -4509,23 +4700,9 @@ where
         return false;
     }
 
-    let mut t_r = target;
-    let mut tx_idx = 0usize;
-    if tx_idx >= proof.sumcheck_transcript.len() {
-        return false;
-    }
-    let start_msg = proof.sumcheck_transcript[tx_idx];
-    tx_idx += 1;
-    challenger.observe_f128(start_msg.u_0);
-    challenger.observe_f128(start_msg.u_2);
-    let mut running_quad = RoundQuad::from_msg(start_msg, t_r);
-
     let fold_bits =
         |lvl: usize| -> u32 { config.fold_grinding_bits.get(lvl).copied().unwrap_or(0) as u32 };
     let ood_count = |lvl: usize| -> usize { config.ood_samples.get(lvl).copied().unwrap_or(0) };
-    if config.ood_samples.first().copied().unwrap_or(0) != 0 {
-        return false; // L0 must be bound by the opening's own eval claim
-    }
     let mut fold_nonce_idx = 0usize;
     let mut ood_idx = 0usize;
     // OOD claims glued into the running sumcheck: each contributes
@@ -4536,6 +4713,41 @@ where
         beta: F128,
     }
     let mut ood_ctxs: Vec<OodCtx> = Vec::new();
+
+    let mut t_r = target;
+    // L0's extra binding point is batched before the initial sumcheck
+    // message. The ordinary opening evaluation is its first point.
+    for _ in 0..ood_count(0) {
+        let mut z = challenger.sample_f128_vec(log_n);
+        if ood_idx >= proof.ood_values.len() {
+            return false;
+        }
+        let y = proof.ood_values[ood_idx];
+        ood_idx += 1;
+        challenger.observe_f128(y);
+        let beta = challenger.sample_f128();
+        t_r += beta * y;
+        // A partial lane grid folds the HIGH lane coordinates first. Store
+        // the point in actual sumcheck-fold order so the generic residual
+        // prefix formula pairs every challenge with the coordinate it bound.
+        if l0_num_lanes < 1usize << initial_k {
+            z.rotate_left(log_msg_cols_0);
+        }
+        ood_ctxs.push(OodCtx {
+            z,
+            ris_start: 0,
+            beta,
+        });
+    }
+    let mut tx_idx = 0usize;
+    if tx_idx >= proof.sumcheck_transcript.len() {
+        return false;
+    }
+    let start_msg = proof.sumcheck_transcript[tx_idx];
+    tx_idx += 1;
+    challenger.observe_f128(start_msg.u_0);
+    challenger.observe_f128(start_msg.u_2);
+    let mut running_quad = RoundQuad::from_msg(start_msg, t_r);
 
     let mut r_lane_fold = Vec::with_capacity(initial_k);
     for j in 0..initial_k {
@@ -4925,6 +5137,9 @@ where
                     t_evalb.as_secs_f64() * 1e3
                 );
             }
+            if trace && inner != t_r {
+                eprintln!("  residual mismatch: inner={inner:?}, t_r={t_r:?}");
+            }
             return inner == t_r;
         }
 
@@ -5081,8 +5296,30 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
     let block_len_0 = 1usize << (log_msg_cols_0 + log_inv_rate_0);
     let num_interleaved_0 = 1usize << initial_k;
 
-    // Replay sumcheck: start msg → initial_k folds.
+    let fold_bits =
+        |lvl: usize| -> u32 { config.fold_grinding_bits.get(lvl).copied().unwrap_or(0) as u32 };
+    let ood_count = |lvl: usize| -> usize { config.ood_samples.get(lvl).copied().unwrap_or(0) };
+    let mut fold_nonce_idx = 0usize;
+    let mut ood_idx = 0usize;
+    // OOD eq bases glued into the running sumcheck, accumulated as
+    // (dense eq table, ris_start, beta) and added at the residual check.
+    let mut ood_bases: Vec<(Vec<F128>, usize, F128)> = Vec::new();
+
+    // Replay sumcheck: L0's extra binding claim is batched into the initial
+    // target/basis, then start msg → initial_k folds.
     let mut t_r = target;
+    for _ in 0..ood_count(0) {
+        let z = challenger.sample_f128_vec(log_n);
+        if ood_idx >= proof.ood_values.len() {
+            return false;
+        }
+        let y = proof.ood_values[ood_idx];
+        ood_idx += 1;
+        challenger.observe_f128(y);
+        let beta = challenger.sample_f128();
+        t_r += beta * y;
+        ood_bases.push((build_eq_table(&z), 0, beta));
+    }
     let mut tx_idx = 0usize;
     if tx_idx >= proof.sumcheck_transcript.len() {
         return false;
@@ -5092,18 +5329,6 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
     challenger.observe_f128(start_msg.u_0);
     challenger.observe_f128(start_msg.u_2);
     let mut running_quad = RoundQuad::from_msg(start_msg, t_r);
-
-    let fold_bits =
-        |lvl: usize| -> u32 { config.fold_grinding_bits.get(lvl).copied().unwrap_or(0) as u32 };
-    let ood_count = |lvl: usize| -> usize { config.ood_samples.get(lvl).copied().unwrap_or(0) };
-    if config.ood_samples.first().copied().unwrap_or(0) != 0 {
-        return false; // L0 must be bound by the opening's own eval claim
-    }
-    let mut fold_nonce_idx = 0usize;
-    let mut ood_idx = 0usize;
-    // OOD eq bases glued into the running sumcheck, accumulated as
-    // (dense eq table, ris_start, beta) and added at the residual check.
-    let mut ood_bases: Vec<(Vec<F128>, usize, F128)> = Vec::new();
 
     let mut r_lane_fold = Vec::with_capacity(initial_k);
     for j in 0..initial_k {
@@ -6148,6 +6373,26 @@ mod tests {
         }
     }
 
+    /// L0 OOD batching computes its first message directly from a factored
+    /// equality tensor. Pin both natural and lane-major block pairings against
+    /// the materialized equality-table oracle, including the claimed MLE.
+    #[test]
+    fn factored_ood_round_message_matches_materialized() {
+        use crate::challenger::Challenger;
+
+        let log_n = 10usize;
+        let n = 1usize << log_n;
+        let mut rng = crate::challenger::RandomChallenger::new(0x00D0_0D00);
+        let f: Vec<F128> = (0..n).map(|_| rng.sample_f128()).collect();
+        let z: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
+        let eq = build_eq_table(&z);
+        for d in [1usize, 1 << 6] {
+            let factored = round_msg_and_eval_eq_point_blocked(&f, &z, d);
+            let dense = round_msg_and_eval_blocked(&f, &eq, d);
+            assert_eq!(factored, dense, "round-0 OOD batch at block size {d}");
+        }
+    }
+
     /// Worked example: `LigeritoSecurityConfig` for BLAKE3 m=29 at rate 1/2.
     /// Paper-compatible m=29 fast example, mechanically derived in the
     /// unique-decoding regime (Theorem 1.4, ε* = 10⁻³) targeting 100-bit
@@ -6178,8 +6423,8 @@ mod tests {
         assert_eq!(cfg.levels[0].queries, 218);
         assert_eq!(cfg.levels[0].grinding_bits, 0);
         assert!(cfg.levels[0].fold_grinding_bits > 0);
-        assert_eq!(cfg.levels[0].ood_samples, 0); // L0: bound by eval claim
-        assert!(cfg.levels[1].ood_samples >= 1);
+        assert_eq!(cfg.levels[0].ood_samples, 1); // plus L0's opening point
+        assert!(cfg.levels.iter().skip(1).all(|lv| lv.ood_samples == 2));
         let (pv, _vc) = cfg.to_prover_verifier_configs().unwrap();
         let default = default_config(22, 5, 1).unwrap();
         assert_eq!(pv.log_inv_rates, default.log_inv_rates);
@@ -6255,8 +6500,8 @@ mod tests {
         );
     }
 
-    /// All 6 embedded configs validate strictly (i.e. each is paper-compat
-    /// AND satisfies the security target).
+    /// Every embedded config validates strictly (i.e. each is paper-compatible
+    /// and satisfies its declared component targets).
     #[test]
     fn ligerito_all_embedded_configs_validate() {
         for &(key, toml) in EMBEDDED_CONFIGS {
@@ -6267,6 +6512,26 @@ mod tests {
                     key.1.as_str()
                 )
             });
+        }
+    }
+
+    /// Checked-in TOMLs are exactly the canonical output of the profile
+    /// derivation. Validation alone would allow a hand-edited but internally
+    /// consistent file to drift away from the generator.
+    #[test]
+    fn ligerito_all_embedded_configs_match_derivation() {
+        for &((m, profile), toml) in EMBEDDED_CONFIGS {
+            let derived = LigeritoSecurityConfig::derive_profile(m, profile)
+                .unwrap_or_else(|e| panic!("derive m={m} profile={}: {e}", profile.as_str()));
+            let canonical = derived
+                .to_toml_string()
+                .unwrap_or_else(|e| panic!("serialize m={m} profile={}: {e}", profile.as_str()));
+            assert_eq!(
+                toml,
+                canonical,
+                "embedded m={m} profile={} differs from generator output",
+                profile.as_str()
+            );
         }
     }
 
@@ -6407,6 +6672,23 @@ mod tests {
         cfg.levels[0].expected_eps_query_bits = 50.0; // < target 100 (grinding 0)
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("expected_eps_query_bits"), "err = {err}");
+    }
+
+    /// The old one-point Johnson schedule must not remain loadable after the
+    /// collision analysis moved to two independent points.
+    #[test]
+    fn ligerito_security_config_rejects_one_point_ood() {
+        let mut cfg = LigeritoSecurityConfig::derive_profile(29, LigeritoProfile::Fast)
+            .expect("derive m29 Fast");
+        cfg.levels[0].ood_samples = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("two-point"), "err = {err}");
+
+        let mut cfg = LigeritoSecurityConfig::derive_profile(29, LigeritoProfile::Fast)
+            .expect("derive m29 Fast");
+        cfg.levels[1].ood_samples = 1;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("two-point"), "err = {err}");
     }
 
     /// UDR regime must not carry an `eta` value.
@@ -8365,8 +8647,8 @@ mod tests {
     }
 
     /// End-to-end OOD binding + fold-challenge grinding: a JohnsonOod-shaped
-    /// config (explicit OOD samples at L1/L2, a few fold-grind bits at every
-    /// level) round-trips through BOTH the dense and succinct verifiers, and
+    /// config (one extra OOD at L0 and two at L1/L2, a few fold-grind bits at
+    /// every level) round-trips through BOTH the dense and succinct verifiers, and
     /// tampering with either an OOD value or a fold-grinding nonce makes both
     /// reject. Exercises every new prover/verifier code path.
     #[test]
@@ -8375,8 +8657,8 @@ mod tests {
         let log_n = 12;
         let initial_k = 2;
         let ks = [2usize, 2];
-        // OOD at L1 and L2 (L0 must be 0); 3 fold-grind bits at each level.
-        let (p_cfg, v_cfg) = ood_test_configs(log_n, initial_k, &ks, vec![0, 2, 2], vec![3, 3, 3]);
+        // L0 opening point + one extra, and two explicit points at L1/L2.
+        let (p_cfg, v_cfg) = ood_test_configs(log_n, initial_k, &ks, vec![1, 2, 2], vec![3, 3, 3]);
 
         let mut rng = crate::challenger::RandomChallenger::new(0x00D_7E57);
         let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
@@ -8416,7 +8698,7 @@ mod tests {
         );
 
         // Sanity: the new proof fields are populated.
-        assert_eq!(proof.ood_values.len(), 4, "2 OOD samples each at L1 and L2");
+        assert_eq!(proof.ood_values.len(), 5, "1 + 2 + 2 explicit OOD samples");
         // 2 lane folds (L0) + 2 + 2 recursive folds, each with 3 grind bits.
         assert_eq!(proof.fold_grinding_nonces.len(), initial_k + ks[0] + ks[1]);
 
@@ -8461,13 +8743,36 @@ mod tests {
         assert!(dense(&proof), "dense verifier must accept OOD proof");
         assert!(succinct(&proof), "succinct verifier must accept OOD proof");
 
-        // Tamper an OOD value → both verifiers reject.
-        let mut bad_ood = proof.clone();
-        bad_ood.ood_values[0] += F128::ONE;
-        assert!(!dense(&bad_ood), "dense must reject tampered OOD value");
+        // Tamper every OOD value in turn → both verifiers reject. Iterating
+        // all five positions certifies L0 and both explicit points at L1/L2,
+        // rather than only the first flattened proof entry.
+        for idx in 0..proof.ood_values.len() {
+            let mut bad_ood = proof.clone();
+            bad_ood.ood_values[idx] += F128::ONE;
+            assert!(
+                !dense(&bad_ood),
+                "dense must reject tampered OOD value {idx}"
+            );
+            assert!(
+                !succinct(&bad_ood),
+                "succinct must reject tampered OOD value {idx}"
+            );
+        }
+
+        let mut missing_ood = proof.clone();
+        missing_ood.ood_values.pop();
+        assert!(!dense(&missing_ood), "dense must reject a missing OOD value");
         assert!(
-            !succinct(&bad_ood),
-            "succinct must reject tampered OOD value"
+            !succinct(&missing_ood),
+            "succinct must reject a missing OOD value"
+        );
+
+        let mut extra_ood = proof.clone();
+        extra_ood.ood_values.push(F128::ZERO);
+        assert!(!dense(&extra_ood), "dense must reject an extra OOD value");
+        assert!(
+            !succinct(&extra_ood),
+            "succinct must reject an extra OOD value"
         );
 
         // Tamper a fold-grinding nonce → both verifiers reject (PoW fails or

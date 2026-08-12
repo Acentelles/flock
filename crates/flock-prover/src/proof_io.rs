@@ -10,7 +10,7 @@
 //! On-disk format:
 //! ```text
 //!   bytes 0..5    "FLOCK"                  (5-byte magic)
-//!   byte  5       VERSION                  (currently 15)
+//!   byte  5       VERSION                  (currently 16)
 //!   bytes 6..7    flavor: 2 = R1cs, 3 = Chain, 4 = Mixed
 //!                 (0/1 reserved: legacy BaseFold)
 //!   bytes 7..     bincode-serialized payload
@@ -44,6 +44,10 @@ use flock_core::pcs::Commitment;
 pub const MAGIC: [u8; 5] = *b"FLOCK";
 
 /// Format version. Bumped on incompatible serialization changes.
+/// v16 changes the Johnson/Ligerito transcript: L0 batches one additional OOD
+/// evaluation before the initial sumcheck message, and every deeper level now
+/// carries two OOD evaluations. The proof structs are unchanged, but v15
+/// proof bytes cannot be replayed under the two-point transcript.
 /// v15: remaining non-Ligerito algebraic grinding. Product-GKR, dense and
 /// jagged aggregation folds, chain shift, and Merkle-path shift proofs carry
 /// transcript-ordered PoW witnesses. Opening batching now protects all
@@ -110,7 +114,7 @@ pub const MAGIC: [u8; 5] = *b"FLOCK";
 /// v3 restructured `BaseFoldProof`: per-query Merkle paths were replaced by
 /// shared octopus multi-proofs (one per Merkle tree). v2 added `HashKind`
 /// to [`ChainProofBundle`].
-pub const VERSION: u8 = 15;
+pub const VERSION: u8 = 16;
 
 /// Which hash function a chain proof is over. Carried in
 /// [`ChainProofBundle`] so the verifier (e.g. the CLI) can pick the right

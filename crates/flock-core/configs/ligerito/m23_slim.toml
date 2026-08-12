@@ -2,7 +2,7 @@ m = 23
 log_n = 16
 initial_k = 6
 target_security_bits = 100
-analysis_version = "johnson_ood_row_union_over_bchks25_thm_4_6"
+analysis_version = "johnson_two_point_ood_row_union_over_bchks25_thm_4_6"
 field = "f128"
 hash = "sha256"
 grinding_step = "post_commit_pre_queries"
@@ -17,11 +17,11 @@ eta = 0.02
 queries = 90
 grinding_bits = 16
 fold_grinding_bits = 11
-ood_samples = 0
+ood_samples = 1
 target_security_bits = 100
 expected_eps_pg_bits = 89.8
 expected_eps_query_bits = 84.9
-expected_eps_ood_bits = 118.4
+expected_eps_ood_bits = 237.7
 
 [[levels]]
 log_inv_rate = 3
@@ -33,11 +33,11 @@ eta = 0.02
 queries = 60
 grinding_bits = 16
 fold_grinding_bits = 5
-ood_samples = 1
+ood_samples = 2
 target_security_bits = 100
 expected_eps_pg_bits = 95.8
 expected_eps_query_bits = 85.2
-expected_eps_ood_bits = 113.4
+expected_eps_ood_bits = 238.1
 
 [[levels]]
 log_inv_rate = 4
@@ -49,11 +49,11 @@ eta = 0.02
 queries = 45
 grinding_bits = 16
 fold_grinding_bits = 2
-ood_samples = 1
+ood_samples = 2
 target_security_bits = 100
 expected_eps_pg_bits = 98.1
 expected_eps_query_bits = 85.0
-expected_eps_ood_bits = 112.9
+expected_eps_ood_bits = 238.1
 
 [final_block]
 yr_log_n = 4

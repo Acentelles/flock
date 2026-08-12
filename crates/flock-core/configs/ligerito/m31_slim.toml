@@ -2,7 +2,7 @@ m = 31
 log_n = 24
 initial_k = 6
 target_security_bits = 100
-analysis_version = "johnson_ood_row_union_over_bchks25_thm_4_6"
+analysis_version = "johnson_two_point_ood_row_union_over_bchks25_thm_4_6"
 field = "f128"
 hash = "sha256"
 grinding_step = "post_commit_pre_queries"
@@ -17,11 +17,11 @@ eta = 0.02
 queries = 90
 grinding_bits = 16
 fold_grinding_bits = 19
-ood_samples = 0
+ood_samples = 1
 target_security_bits = 100
 expected_eps_pg_bits = 81.8
 expected_eps_query_bits = 84.9
-expected_eps_ood_bits = 117.8
+expected_eps_ood_bits = 236.5
 
 [[levels]]
 log_inv_rate = 3
@@ -33,11 +33,11 @@ eta = 0.02
 queries = 60
 grinding_bits = 16
 fold_grinding_bits = 13
-ood_samples = 1
+ood_samples = 2
 target_security_bits = 100
 expected_eps_pg_bits = 87.8
 expected_eps_query_bits = 85.2
-expected_eps_ood_bits = 112.5
+expected_eps_ood_bits = 236.4
 
 [[levels]]
 log_inv_rate = 4
@@ -49,11 +49,11 @@ eta = 0.02
 queries = 45
 grinding_bits = 16
 fold_grinding_bits = 10
-ood_samples = 1
+ood_samples = 2
 target_security_bits = 100
 expected_eps_pg_bits = 90.1
 expected_eps_query_bits = 85.0
-expected_eps_ood_bits = 111.8
+expected_eps_ood_bits = 235.9
 
 [[levels]]
 log_inv_rate = 5
@@ -65,11 +65,11 @@ eta = 0.02
 queries = 36
 grinding_bits = 16
 fold_grinding_bits = 8
-ood_samples = 1
+ood_samples = 2
 target_security_bits = 100
 expected_eps_pg_bits = 92.8
 expected_eps_query_bits = 84.4
-expected_eps_ood_bits = 111.1
+expected_eps_ood_bits = 235.5
 
 [[levels]]
 log_inv_rate = 6
@@ -81,11 +81,11 @@ eta = 0.02
 queries = 31
 grinding_bits = 16
 fold_grinding_bits = 6
-ood_samples = 1
+ood_samples = 2
 target_security_bits = 100
 expected_eps_pg_bits = 94.7
 expected_eps_query_bits = 86.4
-expected_eps_ood_bits = 110.5
+expected_eps_ood_bits = 235.4
 
 [[levels]]
 log_inv_rate = 7
@@ -97,11 +97,11 @@ eta = 0.02
 queries = 27
 grinding_bits = 16
 fold_grinding_bits = 3
-ood_samples = 1
+ood_samples = 2
 target_security_bits = 100
 expected_eps_pg_bits = 97.0
 expected_eps_query_bits = 86.6
-expected_eps_ood_bits = 110.1
+expected_eps_ood_bits = 235.5
 
 [final_block]
 yr_log_n = 3
