@@ -258,7 +258,8 @@ static void zerocheck_phase(F128* da, F128* db, F128* dc, int m, FsChallenger& c
     static int zc_call = 0; zc_call++; const bool zc_det = (zc_call == 2);
     cudaEvent_t ev0, ev1, evk; CK(cudaEventCreate(&ev0)); CK(cudaEventCreate(&ev1)); CK(cudaEventCreate(&evk));
     float det_r1k=0, det_r2k=0, det_eqb=0;
-    double det_r2host=0, tr_wall[40]={0}; float tr_gpu[40]={0}; int tr_n=0; long long tr_op[40]={0};
+    double det_r2host=0, tr_wall[40]={0}; float tr_gpu[40]={0}; int tr_n=0, tr_round[40]={0};
+    long long tr_op[40]={0};
     // round-1 URM. cpustyle3 only needs eq_out = eq(r[13..m]) (the stride-128 subsample),
     // NOT the full eq(r[6..m]) — build the small one directly (128x less) + the C_s.C_med
     // scale = prod_{i=6..12}(1+r[i]), and call cpustyle3 directly (skip launch_zc_round1_fast's
@@ -389,8 +390,9 @@ static void zerocheck_phase(F128* da, F128* db, F128* dc, int m, FsChallenger& c
           CK(cudaMemcpy(&mi, d_minf, sizeof(F128), cudaMemcpyDeviceToHost));
           ch.observe_f128(ChF128{m1.lo, m1.hi}); ch.observe_f128(ChF128{mi.lo, mi.hi});
           ChF128 rr = ch.sample_f128();
-          tr_wall[i] = ms_wall(_rw);
-          cudaEventElapsedTime(&tr_gpu[i], ev0, evk); tr_op[i] = op; tr_n = i + 1;
+          tr_round[tr_n] = i;
+          tr_wall[tr_n] = ms_wall(_rw);
+          cudaEventElapsedTime(&tr_gpu[tr_n], ev0, evk); tr_op[tr_n] = op; tr_n++;
           mlv_rhos.push_back(F128{rr.lo, rr.hi});
           L /= 2; }
       // ...then ONE fused finisher launch for the latency-floor rounds: fold +
@@ -435,7 +437,8 @@ static void zerocheck_phase(F128* da, F128* db, F128* dc, int m, FsChallenger& c
         for (int i = 0; i < tr_n; i++) {
             wsum += tr_wall[i]; gsum += tr_gpu[i];
             printf("    r%-2d op=2^%-2d wall %6.3f  gpu %6.3f  host/launch %6.3f ms\n",
-                   i, (int)(63 - __builtin_clzll(tr_op[i])), tr_wall[i], tr_gpu[i], tr_wall[i] - tr_gpu[i]);
+                   tr_round[i], (int)(63 - __builtin_clzll(tr_op[i])), tr_wall[i], tr_gpu[i],
+                   tr_wall[i] - tr_gpu[i]);
         }
         if (fin_rem) {
             wsum += fin_wall; gsum += fin_gpu;
