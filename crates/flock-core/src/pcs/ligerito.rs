@@ -53,10 +53,13 @@ use serde::{Deserialize, Serialize};
 /// config" from the raw code rate: `Fast` and `Secure` share rate 1/2 but
 /// differ in regime/target, so the rate alone cannot key the config lookup.
 ///
-/// - `Fast`:   rate 1/2, Johnson list-decoding regime with OOD binding,
-///             100-bit overall soundness. Default.
-/// - `Slim`:   rate 1/4, Johnson + OOD + 16-bit query grinding, 100-bit
-///             overall. Roughly half the proof, ~2x the L0 encoding work.
+/// - `Fast`:   rate 1/2, Johnson list-decoding regime with OOD binding. Its
+///             query component is 128-bit; MCA remains at the 100-bit profile
+///             target until it is evaluated over the intended F256 field.
+///             Default.
+/// - `Slim`:   rate 1/4, Johnson + OOD + 16-bit query grinding. Its combined
+///             query work factor is 128-bit; MCA remains at the 100-bit
+///             profile target. Roughly half the proof, ~2x L0 encoding work.
 /// - `Secure`: rate 1/2, unique-decoding regime (list size 1, no OOD),
 ///             120-bit overall soundness. Largest proof, most conservative
 ///             analysis.
@@ -688,7 +691,8 @@ pub struct LigeritoLevelConfig {
     #[serde(default)]
     pub fold_grinding_bits: usize,
     /// PoW bits on every scalar coefficient that batches evaluation claims at
-    /// this level. Appendix C.3 bounds the bad event by `L_max / |F|`.
+    /// this level. The Flock paper's Appendix C.3 bounds the bad event by
+    /// `L_max / |F|`.
     #[serde(default)]
     pub claim_batch_grinding_bits: usize,
     /// PoW bits on the multilinear challenge used to batch this level's
@@ -717,11 +721,11 @@ pub struct LigeritoLevelConfig {
     #[serde(default)]
     pub expected_eps_ood_bits: Option<f64>,
     /// Diagnostic -- unground claim-batching bits
-    /// `128 - log2(L_max)` from Appendix C.3.
+    /// `128 - log2(L_max)` from the Flock paper's Appendix C.3.
     #[serde(default)]
     pub expected_eps_claim_batch_bits: f64,
     /// Diagnostic -- unground per-round sumcheck bits
-    /// `128 - log2(2 * L_max)` from Appendix C.3.
+    /// `128 - log2(2 * L_max)` from the Flock paper's Appendix C.3.
     #[serde(default)]
     pub expected_eps_sumcheck_bits: f64,
     /// Diagnostic -- unground queried-consistency batching bits
@@ -798,12 +802,16 @@ pub struct LigeritoSecurityConfig {
 
 /// Default field size used for soundness analysis: `q = 2^128` (our F128).
 const ANALYSIS_LOG_Q: f64 = 128.0;
-/// OOD list binding is a 128-bit component even while the legacy Fast/Slim
-/// query/proximity profiles still carry their original 100-bit target.
+/// OOD list binding is a 128-bit component even while the Fast/Slim MCA
+/// profiles still carry their original 100-bit target.
 const OOD_BINDING_TARGET_BITS: f64 = 128.0;
-/// Algebraic error terms in Appendix C.3 are required to be strictly below
-/// 2^-128, independently of the legacy query/MCA targets.
+/// Algebraic error terms in Appendix C.3 of "Flock: Fast Proving for Batch
+/// Boolean Computations" are required to be strictly below 2^-128,
+/// independently of the legacy MCA target.
 const ALGEBRAIC_TARGET_BITS: f64 = 128.0;
+/// Every Johnson consistency-query component, including optional query-phase
+/// grinding, must have a work-normalized error below 2^-128.
+const LIST_DECODING_QUERY_TARGET_BITS: f64 = 128.0;
 
 /// Round a float to one decimal place. Used to round paper-predicted
 /// soundness diagnostics so the generated TOMLs stay readable.
@@ -821,10 +829,21 @@ fn strict_grinding_bits(log2_numerator: f64) -> usize {
     }
 }
 
+/// Smallest positive Q such that
+/// `Q * per_query_bits + grinding_bits > target_bits`.
+///
+/// The floor-plus-one form deliberately implements a strict inequality, even
+/// when the quotient lands exactly on an integer boundary.
+fn strict_query_count(target_bits: f64, grinding_bits: usize, per_query_bits: f64) -> usize {
+    debug_assert!(per_query_bits > 0.0);
+    let remaining = (target_bits - grinding_bits as f64).max(0.0);
+    (remaining / per_query_bits).floor() as usize + 1
+}
+
 /// Effective PoW bits for fold round `j`. The MCA term tapers by one bit per
 /// round, whereas the independent sumcheck term `2*L_max/|F|` does not.
 /// `claim_batch_bits + 1` is exactly the strict requirement for `2*L_max`
-/// whenever the Appendix C.3 algebraic schedule is enabled.
+/// whenever the Flock paper's Appendix C.3 algebraic schedule is enabled.
 fn fold_round_grinding_bits(fold_bits: u32, claim_batch_bits: u32, j: usize) -> u32 {
     let sumcheck_floor = if claim_batch_bits == 0 {
         0
@@ -837,7 +856,8 @@ fn fold_round_grinding_bits(fold_bits: u32, claim_batch_bits: u32, j: usize) -> 
 }
 
 /// Return `(claim_bits, sumcheck_bits, consistency_bits, raw diagnostics)` for
-/// the Appendix C.3 algebraic terms. `eta = None` denotes the UDR list `L=1`.
+/// the Flock paper's Appendix C.3 algebraic terms. `eta = None` denotes the
+/// UDR list `L=1`.
 fn algebraic_grinding_schedule(
     log_inv_rate: usize,
     eta: Option<f64>,
@@ -1048,7 +1068,7 @@ fn paper_ood_bits(log_inv_rate: usize, eta: f64, mu_vars: usize, total_samples: 
 }
 
 impl LigeritoLevelConfig {
-    /// Appendix C.3 algebraic terms for this level, before grinding:
+    /// Algebraic terms from the Flock paper's Appendix C.3, before grinding:
     /// `(claim batching, one sumcheck round, queried-consistency batching)`.
     fn paper_predicted_algebraic_bits(&self) -> (f64, f64, f64) {
         let log2_l = match self.regime {
@@ -1337,9 +1357,10 @@ impl LigeritoSecurityConfig {
                 }
             }
 
-            // Part 2 of the 128-bit roadmap: the list-unioned algebraic terms
-            // must be STRICTLY below 2^-128. Check the exact (unrounded)
-            // numerators so a power-of-two boundary cannot pass by rounding.
+            // The list-unioned algebraic terms from the Flock paper's
+            // Appendix C.3 must be STRICTLY below 2^-128. Check the exact
+            // (unrounded) numerators so a power-of-two boundary cannot pass by
+            // rounding.
             let claim_log_numerator = ALGEBRAIC_TARGET_BITS - claim_pred;
             let sumcheck_log_numerator = ALGEBRAIC_TARGET_BITS - sumcheck_pred;
             let consistency_log_numerator = ALGEBRAIC_TARGET_BITS - consistency_pred;
@@ -1381,6 +1402,23 @@ impl LigeritoSecurityConfig {
                 ));
             }
 
+            // Johnson/list-decoding consistency queries are an independently
+            // 128-bit component. Use the exact prediction, not the one-decimal
+            // TOML diagnostic, and require a strict bound:
+            //   (1-gamma)^Q * 2^-lambda_query < 2^-128
+            // iff Q*log2(1/(1-gamma)) + lambda_query > 128.
+            if lv.regime == SoundnessRegime::JohnsonOod {
+                let delivered = q_pred + lv.grinding_bits as f64;
+                if delivered <= LIST_DECODING_QUERY_TARGET_BITS {
+                    return Err(format!(
+                        "L{i}: query soundness ({q_pred:.6} + {} grinding = \
+                         {delivered:.6} bits) must be strictly above the \
+                         {LIST_DECODING_QUERY_TARGET_BITS}-bit list-decoding target",
+                        lv.grinding_bits
+                    ));
+                }
+            }
+
             // Per-application proximity gap + fold-challenge grinding must
             // reach target. (The pg bad event lives on the fold challenges,
             // so only the fold grind — done before each fold challenge —
@@ -1394,8 +1432,8 @@ impl LigeritoSecurityConfig {
                 ));
             }
 
-            // OOD binding is already a 128-bit component even though the
-            // legacy Johnson query/proximity profile still targets 100 bits.
+            // OOD binding is independently a 128-bit component even though
+            // the Johnson MCA/proximity profile still targets 100 bits.
             if let Some(ood) = lv.expected_eps_ood_bits
                 && ood + 1e-3 < OOD_BINDING_TARGET_BITS
             {
@@ -1549,9 +1587,11 @@ impl LigeritoSecurityConfig {
     /// Fiat-Shamir security (cf. Ethereum's `soundcalc`), not a whole-protocol
     /// union bound over terms. The three shipped profiles:
     ///
-    /// - `Fast`:   JohnsonOod, rate 1/2, η = 0.02, 100 bits per round.
+    /// - `Fast`:   JohnsonOod, rate 1/2, η = 0.02, 128-bit query component;
+    ///             the deferred MCA component retains its 100-bit target.
     /// - `Slim`:   JohnsonOod, rate 1/4, η = 0.02, 16-bit query grinding at
-    ///             every level, 100 bits per round.
+    ///             every level, 128-bit combined query work factor; the
+    ///             deferred MCA component retains its 100-bit target.
     /// - `Secure`: Udr, rate 1/2, ε* = 1e-3, 120 bits per round.
     pub fn derive_profile(m: usize, profile: LigeritoProfile) -> Result<Self, String> {
         /// Johnson slack below the Johnson radius, flat across levels.
@@ -1561,6 +1601,10 @@ impl LigeritoSecurityConfig {
         let query_grind: usize = match profile {
             LigeritoProfile::Slim => 16,
             LigeritoProfile::Fast | LigeritoProfile::Secure => 0,
+        };
+        let query_target_bits = match profile {
+            LigeritoProfile::Fast | LigeritoProfile::Slim => LIST_DECODING_QUERY_TARGET_BITS,
+            LigeritoProfile::Secure => target_bits as f64,
         };
         let log_n = m
             .checked_sub(crate::pcs::LOG_PACKING)
@@ -1576,8 +1620,8 @@ impl LigeritoSecurityConfig {
         // (rows ≈ 28-31 words). Soundness derives identically: Johnson
         // per-query bits depend on rate/η only, so per-level query counts
         // are unchanged; the Fast ladder re-derives as cols 17/14/11/8
-        // (yr 5, Σq 491) and the Slim ladder as cols 17/14/11/8/5
-        // (yr 5, Σq 262). Secure keeps 6 (unused by the recursion track).
+        // (yr 5, Σq 629) and the Slim ladder as cols 17/14/11/8/5
+        // (yr 5, Σq 347). Secure keeps 6 (unused by the recursion track).
         // m28 joined 2026-08-05 when the transcript-v3 duplex pushed the
         // slim L1 recursion node under 2^21 words: initial_k = 4 keeps the
         // same 2^17 columns (cols = log_n − initial_k = 21 − 4).
@@ -1602,11 +1646,11 @@ impl LigeritoSecurityConfig {
 
         // Shape derivation needs per-level query counts for block-length
         // feasibility before the level count (and hence the exact per-term
-        // target) is known. Use a conservative target of target_bits + 5
+        // target) is known. Use a conservative target of query_target_bits + 5
         // (≥ log₂(3 terms · 10 levels)); the final counts are ≤ this.
-        let t_feas = target_bits as f64 + 5.0;
+        let t_feas = query_target_bits + 5.0;
         let queries_feas = |rate: usize| -> usize {
-            ((t_feas - query_grind as f64).max(1.0) / per_query_bits_feas(rate)).ceil() as usize
+            strict_query_count(t_feas, query_grind, per_query_bits_feas(rate))
         };
         let shape = derive_ladder_shape(log_n, initial_k, log_inv_rate, &queries_feas)?;
         let n_levels = shape.log_inv_rates.len();
@@ -1636,7 +1680,7 @@ impl LigeritoSecurityConfig {
                     paper_per_query_bits(rate, JOHNSON_ETA)
                 }
             };
-            let queries = ((t - query_grind as f64).max(1.0) / per_q).ceil() as usize;
+            let queries = strict_query_count(query_target_bits, query_grind, per_q);
             if queries > (1usize << (cols + rate)) {
                 return Err(format!(
                     "L{i}: {queries} queries exceed block length 2^{}",
@@ -1690,10 +1734,11 @@ impl LigeritoSecurityConfig {
                 eps_sumcheck,
                 eps_consistency_batch,
             ) = algebraic_grinding_schedule(rate, eta, queries);
-            // One fold challenge carries both Appendix C.3 bad events. A
-            // single PoW therefore protects both, at the larger requirement.
-            // The MCA target remains profile-local here; its 128-bit repair is
-            // the separately deferred F256 roadmap step.
+            // One fold challenge carries both bad events from the Flock
+            // paper's Appendix C.3. A single PoW therefore protects both, at
+            // the larger requirement.
+            // The MCA target remains profile-local here; its stronger
+            // configuration uses arithmetic over the intended F256 field.
             let fold_grinding_bits = proximity_fold_grinding_bits.max(sumcheck_grinding_bits);
 
             levels.push(LigeritoLevelConfig {
@@ -1723,7 +1768,7 @@ impl LigeritoSecurityConfig {
         let analysis_version = match profile {
             LigeritoProfile::Secure => "no_row_union_over_ben_sasson_2025_cor_1_4",
             LigeritoProfile::Fast | LigeritoProfile::Slim => {
-                "johnson_two_point_ood_row_union_over_bchks25_thm_4_6"
+                "johnson_two_point_ood_query128_c3_algebraic_row_union_over_bchks25_thm_4_6"
             }
         };
         let cfg = Self {
@@ -4693,7 +4738,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         for j in 0..k_i {
             // These folds fold level i+1's commitment — fold-challenge
             // grinding guards both its tapered proximity-gap term and its
-            // untapered Appendix C.3 sumcheck term (see the L0 loop).
+            // untapered sumcheck term from the Flock paper's Appendix C.3
+            // (see the L0 loop).
             let bits = fold_round_grinding_bits(
                 fold_bits(i + 1),
                 claim_batch_bits(i + 1),
@@ -6953,11 +6999,12 @@ mod tests {
         assert_eq!(cfg.initial_k, 5);
         assert_eq!(cfg.hash, "sha256");
         assert_eq!(cfg.levels.len(), 5);
-        // Fast = JohnsonOod profile: 218 L0 queries per-round at 100 bits (no
-        // list union bound — single-codeword binding via the opening claim /
-        // OOD samples), proximity-gap shortfall covered by fold-challenge grinding.
+        // Fast = JohnsonOod profile: 279 L0 queries put the query term
+        // strictly below 2^-128 (no list union bound — single-codeword
+        // binding via the opening claim / OOD samples). The MCA/proximity
+        // shortfall remains covered separately by fold-challenge grinding.
         assert_eq!(cfg.levels[0].regime, SoundnessRegime::JohnsonOod);
-        assert_eq!(cfg.levels[0].queries, 218);
+        assert_eq!(cfg.levels[0].queries, 279);
         assert_eq!(cfg.levels[0].grinding_bits, 0);
         assert!(cfg.levels[0].fold_grinding_bits > 0);
         assert_eq!(cfg.levels[0].ood_samples, 1); // plus L0's opening point
@@ -6966,7 +7013,7 @@ mod tests {
         let default = default_config(22, 5, 1).unwrap();
         assert_eq!(pv.log_inv_rates, default.log_inv_rates);
         assert_eq!(pv.recursive_ks, default.recursive_ks);
-        assert_eq!(pv.queries[0], 218);
+        assert_eq!(pv.queries[0], 279);
 
         // Slim mode: rates start at 1/4.
         let toml_str = include_str!("../../configs/ligerito/m29_slim.toml");
@@ -6974,7 +7021,7 @@ mod tests {
             .expect("m29_slim.toml must parse and validate");
         assert_eq!(cfg_slim.levels[0].log_inv_rate, 2);
         // Slim = JohnsonOod at rate 1/4 with 16-bit query grinding.
-        assert_eq!(cfg_slim.levels[0].queries, 90);
+        assert_eq!(cfg_slim.levels[0].queries, 119);
         assert_eq!(cfg_slim.levels[0].grinding_bits, 16);
         // m29 Slim is initial_k 5 like Fast (the recursion-node choice).
         assert_eq!(cfg_slim.initial_k, 5);
@@ -7107,7 +7154,7 @@ mod tests {
         // recursion-node row-width choice); a stale batch-6 request is a
         // hard error, never a silent fallback.
         let pv = prover_config_for(22, 5, LigeritoProfile::Fast).expect("m29 fast must load");
-        assert_eq!(pv.queries[0], 218);
+        assert_eq!(pv.queries[0], 279);
         assert_eq!(pv.fold_grinding_bits[0], 16);
         assert_eq!(embedded_initial_k(29, LigeritoProfile::Fast), Some(5));
         let err = prover_config_for(22, 6, LigeritoProfile::Fast).unwrap_err();
@@ -7115,7 +7162,7 @@ mod tests {
 
         // m=29 slim: known → loads from TOML (initial_k 5, like Fast).
         let pv = prover_config_for(22, 5, LigeritoProfile::Slim).expect("m29 slim must load");
-        assert_eq!(pv.queries[0], 90);
+        assert_eq!(pv.queries[0], 119);
         assert_eq!(pv.grinding_bits[0], 16);
 
         // m=29 secure: known → loads from TOML (UDR, 120-bit).
@@ -7211,9 +7258,53 @@ mod tests {
         assert!(err.contains("expected_eps_query_bits"), "err = {err}");
     }
 
-    /// Appendix C.3's algebraic schedule is enforced independently of the
-    /// profile-local query/MCA target. Lowering any one of its three active
-    /// PoW families must make an otherwise canonical config invalid.
+    /// Generated Johnson schedules are minimal: the configured query count
+    /// plus optional query grinding is strictly above 128 bits, while removing
+    /// one query is at or below 128 bits.
+    #[test]
+    fn ligerito_list_decoding_queries_strictly_clear_128_bits() {
+        for m in 22..=35 {
+            for profile in [LigeritoProfile::Fast, LigeritoProfile::Slim] {
+                let cfg = LigeritoSecurityConfig::derive_profile(m, profile)
+                    .unwrap_or_else(|e| panic!("derive m{m} {profile:?}: {e}"));
+                for (i, lv) in cfg.levels.iter().enumerate() {
+                    let per_q = paper_per_query_bits(
+                        lv.log_inv_rate,
+                        lv.eta.expect("Johnson profile has eta"),
+                    );
+                    let delivered = lv.queries as f64 * per_q + lv.grinding_bits as f64;
+                    let one_fewer = (lv.queries - 1) as f64 * per_q + lv.grinding_bits as f64;
+                    assert!(
+                        delivered > LIST_DECODING_QUERY_TARGET_BITS,
+                        "m{m} {profile:?} L{i}: delivered {delivered}"
+                    );
+                    assert!(
+                        one_fewer <= LIST_DECODING_QUERY_TARGET_BITS,
+                        "m{m} {profile:?} L{i}: non-minimal ({one_fewer})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Validation uses the exact query formula rather than trusting the
+    /// rounded diagnostic in the TOML.
+    #[test]
+    fn ligerito_security_config_rejects_sub_128_list_query_schedule() {
+        let mut cfg = LigeritoSecurityConfig::derive_profile(29, LigeritoProfile::Fast)
+            .expect("derive m29 Fast");
+        let lv = &mut cfg.levels[0];
+        lv.queries -= 1;
+        let per_q = paper_per_query_bits(lv.log_inv_rate, lv.eta.expect("Johnson eta"));
+        lv.expected_eps_query_bits = round1(lv.queries as f64 * per_q);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("list-decoding target"), "err = {err}");
+    }
+
+    /// The Flock paper's Appendix C.3 algebraic schedule is enforced
+    /// independently of the profile-local query/MCA target. Lowering any one
+    /// of its three active PoW families must make an otherwise canonical
+    /// config invalid.
     #[test]
     fn ligerito_security_config_rejects_insufficient_algebraic_grinding() {
         let baseline = LigeritoSecurityConfig::derive_profile(29, LigeritoProfile::Fast)
