@@ -498,7 +498,7 @@ pub struct LincheckProof {
 /// * α and each β batch one linear identity, so one PoW bit turns
 ///   `1 / |F|` into `2^-129`;
 /// * each ordinary sumcheck round has degree two, so two bits turn
-///   `2 / |F|` into `2^-130`;
+///   `2 / |F|` into `2^-129`;
 /// * the final φ8 interpolation has degree `2^k_skip - 1`, so `k_skip`
 ///   bits give `(2^k_skip - 1) / (2^k_skip |F|) < 2^-128`.
 ///
