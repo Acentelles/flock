@@ -17,10 +17,15 @@ proximity_loss = 0.0
 queries = 290
 grinding_bits = 0
 fold_grinding_bits = 5
+claim_batch_grinding_bits = 1
+consistency_batch_grinding_bits = 4
 ood_samples = 0
 target_security_bits = 120
 expected_eps_pg_bits = 115.0
 expected_eps_query_bits = 120.3
+expected_eps_claim_batch_bits = 128.0
+expected_eps_sumcheck_bits = 127.0
+expected_eps_consistency_batch_bits = 124.8
 
 [[levels]]
 log_inv_rate = 2
@@ -32,10 +37,15 @@ proximity_loss = 0.0
 queries = 178
 grinding_bits = 0
 fold_grinding_bits = 4
+claim_batch_grinding_bits = 1
+consistency_batch_grinding_bits = 4
 ood_samples = 0
 target_security_bits = 120
 expected_eps_pg_bits = 116.4
 expected_eps_query_bits = 120.5
+expected_eps_claim_batch_bits = 128.0
+expected_eps_sumcheck_bits = 127.0
+expected_eps_consistency_batch_bits = 125.0
 
 [[levels]]
 log_inv_rate = 3
@@ -47,10 +57,15 @@ proximity_loss = 0.0
 queries = 146
 grinding_bits = 0
 fold_grinding_bits = 2
+claim_batch_grinding_bits = 1
+consistency_batch_grinding_bits = 4
 ood_samples = 0
 target_security_bits = 120
 expected_eps_pg_bits = 118.2
 expected_eps_query_bits = 120.6
+expected_eps_claim_batch_bits = 128.0
+expected_eps_sumcheck_bits = 127.0
+expected_eps_consistency_batch_bits = 125.0
 
 [[levels]]
 log_inv_rate = 4
@@ -61,11 +76,16 @@ regime = "udr"
 proximity_loss = 0.0
 queries = 134
 grinding_bits = 0
-fold_grinding_bits = 0
+fold_grinding_bits = 2
+claim_batch_grinding_bits = 1
+consistency_batch_grinding_bits = 4
 ood_samples = 0
 target_security_bits = 120
 expected_eps_pg_bits = 120.1
 expected_eps_query_bits = 120.0
+expected_eps_claim_batch_bits = 128.0
+expected_eps_sumcheck_bits = 127.0
+expected_eps_consistency_batch_bits = 125.0
 
 [final_block]
 yr_log_n = 5

@@ -5102,6 +5102,7 @@ fn parse_open_levels(
         cur.bump();
         let y_v = cur.v;
         cur.expect_obs_scalar();
+        cur.skip_pows();
         assert!(matches!(cur.ops[cur.i], Op::SqueezeScalar), "L0 OOD beta");
         initial_ood.push(InitialOodRec {
             z_fin,
@@ -5166,6 +5167,7 @@ fn parse_open_levels(
                 let intro_v = cur.v;
                 cur.expect_obs_scalar(); // intro u_0
                 cur.expect_obs_scalar(); // intro u_2
+                cur.skip_pows();
                 assert!(matches!(cur.ops[cur.i], Op::SqueezeScalar), "OOD beta");
                 ood.push(OodRec {
                     z_fin,
@@ -5197,6 +5199,7 @@ fn parse_open_levels(
             ref o => panic!("op {}: expected queries squeeze, got {o:?}", cur.i),
         };
         cur.bump();
+        cur.skip_pows();
         let (a_fin, a_ch, a_count) = match cur.ops[cur.i] {
             Op::SqueezeSlice(n) => (cur.fin, cur.ch, n),
             ref o => panic!("op {}: expected alpha squeeze, got {o:?}", cur.i),
@@ -5207,6 +5210,7 @@ fn parse_open_levels(
             cur.expect_obs_scalar(); // intro u_0
             cur.expect_obs_scalar(); // intro u_2
         }
+        cur.skip_pows();
         assert!(matches!(cur.ops[cur.i], Op::SqueezeScalar), "beta");
         let (beta_fin, beta_ch) = (cur.fin, cur.ch);
         cur.bump();

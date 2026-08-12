@@ -17,11 +17,16 @@ eta = 0.02
 queries = 90
 grinding_bits = 16
 fold_grinding_bits = 20
+claim_batch_grinding_bits = 6
+consistency_batch_grinding_bits = 9
 ood_samples = 1
 target_security_bits = 100
 expected_eps_pg_bits = 80.8
 expected_eps_query_bits = 84.9
 expected_eps_ood_bits = 236.4
+expected_eps_claim_batch_bits = 122.4
+expected_eps_sumcheck_bits = 121.4
+expected_eps_consistency_batch_bits = 119.5
 
 [[levels]]
 log_inv_rate = 3
@@ -33,11 +38,16 @@ eta = 0.02
 queries = 60
 grinding_bits = 16
 fold_grinding_bits = 14
+claim_batch_grinding_bits = 7
+consistency_batch_grinding_bits = 9
 ood_samples = 2
 target_security_bits = 100
 expected_eps_pg_bits = 86.8
 expected_eps_query_bits = 85.2
 expected_eps_ood_bits = 236.2
+expected_eps_claim_batch_bits = 121.9
+expected_eps_sumcheck_bits = 120.9
+expected_eps_consistency_batch_bits = 119.3
 
 [[levels]]
 log_inv_rate = 4
@@ -49,11 +59,16 @@ eta = 0.02
 queries = 45
 grinding_bits = 16
 fold_grinding_bits = 11
+claim_batch_grinding_bits = 7
+consistency_batch_grinding_bits = 10
 ood_samples = 2
 target_security_bits = 100
 expected_eps_pg_bits = 89.1
 expected_eps_query_bits = 85.0
 expected_eps_ood_bits = 235.7
+expected_eps_claim_batch_bits = 121.4
+expected_eps_sumcheck_bits = 120.4
+expected_eps_consistency_batch_bits = 118.8
 
 [[levels]]
 log_inv_rate = 5
@@ -65,11 +80,16 @@ eta = 0.02
 queries = 36
 grinding_bits = 16
 fold_grinding_bits = 9
+claim_batch_grinding_bits = 8
+consistency_batch_grinding_bits = 10
 ood_samples = 2
 target_security_bits = 100
 expected_eps_pg_bits = 91.8
 expected_eps_query_bits = 84.4
 expected_eps_ood_bits = 235.3
+expected_eps_claim_batch_bits = 120.9
+expected_eps_sumcheck_bits = 119.9
+expected_eps_consistency_batch_bits = 118.3
 
 [[levels]]
 log_inv_rate = 6
@@ -80,12 +100,17 @@ regime = "johnson_ood"
 eta = 0.02
 queries = 31
 grinding_bits = 16
-fold_grinding_bits = 7
+fold_grinding_bits = 9
+claim_batch_grinding_bits = 8
+consistency_batch_grinding_bits = 10
 ood_samples = 2
 target_security_bits = 100
 expected_eps_pg_bits = 93.7
 expected_eps_query_bits = 86.4
 expected_eps_ood_bits = 235.1
+expected_eps_claim_batch_bits = 120.4
+expected_eps_sumcheck_bits = 119.4
+expected_eps_consistency_batch_bits = 118.0
 
 [[levels]]
 log_inv_rate = 7
@@ -96,12 +121,17 @@ regime = "johnson_ood"
 eta = 0.02
 queries = 27
 grinding_bits = 16
-fold_grinding_bits = 4
+fold_grinding_bits = 10
+claim_batch_grinding_bits = 9
+consistency_batch_grinding_bits = 11
 ood_samples = 2
 target_security_bits = 100
 expected_eps_pg_bits = 96.0
 expected_eps_query_bits = 86.6
 expected_eps_ood_bits = 235.1
+expected_eps_claim_batch_bits = 119.9
+expected_eps_sumcheck_bits = 118.9
+expected_eps_consistency_batch_bits = 117.5
 
 [final_block]
 yr_log_n = 4
