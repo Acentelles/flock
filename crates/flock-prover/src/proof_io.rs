@@ -10,7 +10,7 @@
 //! On-disk format:
 //! ```text
 //!   bytes 0..5    "FLOCK"                  (5-byte magic)
-//!   byte  5       VERSION                  (currently 17)
+//!   byte  5       VERSION                  (currently 18)
 //!   bytes 6..7    flavor: 2 = R1cs, 3 = Chain, 4 = Mixed
 //!                 (0/1 reserved: legacy BaseFold)
 //!   bytes 7..     bincode-serialized payload
@@ -44,6 +44,12 @@ use flock_core::pcs::Commitment;
 pub const MAGIC: [u8; 5] = *b"FLOCK";
 
 /// Format version. Bumped on incompatible serialization changes.
+/// v18 changes every Johnson/Ligerito query schedule to make the consistency
+/// term strictly 128-bit after optional query grinding. No struct changes,
+/// but v17 paths/caps and transcript shapes cannot replay under the larger
+/// public query counts.
+/// v17 adds the claim- and consistency-batching PoW nonce vectors from the
+/// Flock paper's Appendix C.3 to `LigeritoProof`.
 /// v16 changes the Johnson/Ligerito transcript: L0 batches one additional OOD
 /// evaluation before the initial sumcheck message, and every deeper level now
 /// carries two OOD evaluations. The proof structs are unchanged, but v15
@@ -90,9 +96,6 @@ pub const MAGIC: [u8; 5] = *b"FLOCK";
 /// the values' absorb + gamma squeeze and loses the per-statement assist
 /// rounds. Soundness: docs/multipoint-twisted-assist.tex.
 ///
-/// v17 adds the Appendix C.3 claim- and consistency-batching PoW nonce vectors
-/// to `LigeritoProof`.
-///
 /// v10: stratified queries (docs/stratified-queries.tex) — every level's
 /// query count decomposes into power-of-two summands, one query per
 /// depth-c subtree; the absorbed cap moves to the TOP SET BIT of the
@@ -117,7 +120,7 @@ pub const MAGIC: [u8; 5] = *b"FLOCK";
 /// v3 restructured `BaseFoldProof`: per-query Merkle paths were replaced by
 /// shared octopus multi-proofs (one per Merkle tree). v2 added `HashKind`
 /// to [`ChainProofBundle`].
-pub const VERSION: u8 = 17;
+pub const VERSION: u8 = 18;
 
 /// Which hash function a chain proof is over. Carried in
 /// [`ChainProofBundle`] so the verifier (e.g. the CLI) can pick the right

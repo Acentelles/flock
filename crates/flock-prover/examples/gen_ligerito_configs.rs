@@ -3,9 +3,9 @@
 //! For each `m` in 22..=35 it mechanically derives the security config of
 //! all three named profiles via `LigeritoSecurityConfig::derive_profile`:
 //!
-//! - `fast`:   JohnsonOod, rate 1/2, η = 0.02, 100-bit overall soundness.
+//! - `fast`:   JohnsonOod, rate 1/2, η = 0.02, 128-bit query component.
 //! - `slim`:   JohnsonOod, rate 1/4, η = 0.02, 16-bit query grinding,
-//!             100-bit overall.
+//!             128-bit combined query work factor.
 //! - `secure`: Udr, rate 1/2, ε* = 1e-3, 120-bit overall.
 //!
 //! Each derived config is validated against its per-component, round-by-round

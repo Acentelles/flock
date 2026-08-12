@@ -523,7 +523,7 @@ impl LincheckGrinding {
         }
     }
 
-    /// Per-challenge schedule for the roadmap's 128-bit grinding milestone.
+    /// Per-challenge schedule with strict 128-bit work-normalized bounds.
     pub const fn per_challenge_128() -> Self {
         Self {
             alpha_bits: Some(1),
