@@ -1581,10 +1581,13 @@ fn prove_padded_inner<Ch: Challenger>(
 
     // 1. Sample α (matches verifier's order). Used to batch the two scalar
     //    consistency checks v_a, v_b into a single sumcheck.
-    if let Some(bits) = grinding.alpha_bits() {
-        grinding_nonces.push(challenger.grind_pow(bits));
-    }
-    let alpha = challenger.sample_f128();
+    let alpha = if let Some(bits) = grinding.alpha_bits() {
+        let (nonce, alpha) = challenger.grind_pow_and_sample_f128(bits);
+        grinding_nonces.push(nonce);
+        alpha
+    } else {
+        challenger.sample_f128()
+    };
 
     // 2. Build the α-batched comb_vec via the circuit's per-block fold. For
     //    the sparse-matrix default this is the fused single-pass row-fold;
@@ -1623,10 +1626,13 @@ fn prove_padded_inner<Ch: Challenger>(
     //     entry update. β is sampled after α; the verifier mirrors both. See
     //     docs/const-wire-pin.md.
     if let Some(col) = circuit.const_pin_col() {
-        if let Some(bits) = grinding.beta_bits() {
-            grinding_nonces.push(challenger.grind_pow(bits));
-        }
-        let beta = challenger.sample_f128();
+        let beta = if let Some(bits) = grinding.beta_bits() {
+            let (nonce, beta) = challenger.grind_pow_and_sample_f128(bits);
+            grinding_nonces.push(nonce);
+            beta
+        } else {
+            challenger.sample_f128()
+        };
         comb_vec[col] += beta;
     }
 
@@ -1709,10 +1715,13 @@ fn column_sumcheck_prove<Ch: Challenger>(
         for t in 0..inner_rest_len {
             challenger.observe_f128(e1);
             challenger.observe_f128(einf);
-            if let Some(bits) = grinding.multilinear_round_bits() {
-                grinding_nonces.push(challenger.grind_pow(bits));
-            }
-            let r = challenger.sample_f128();
+            let r = if let Some(bits) = grinding.multilinear_round_bits() {
+                let (nonce, r) = challenger.grind_pow_and_sample_f128(bits);
+                grinding_nonces.push(nonce);
+                r
+            } else {
+                challenger.sample_f128()
+            };
             rounds.push((e1, einf));
             r_rounds.push(r);
             if t + 1 < inner_rest_len {
@@ -1741,10 +1750,13 @@ fn column_sumcheck_prove<Ch: Challenger>(
 
     // 7. Sample fresh z_skip AFTER observing z_partial — gives Schwartz-Zippel
     //    soundness on the φ8 (univariate-skip) dim.
-    if let Some(bits) = grinding.skip_bits(k_skip) {
-        grinding_nonces.push(challenger.grind_pow(bits));
-    }
-    let r_inner_skip = challenger.sample_f128();
+    let r_inner_skip = if let Some(bits) = grinding.skip_bits(k_skip) {
+        let (nonce, r) = challenger.grind_pow_and_sample_f128(bits);
+        grinding_nonces.push(nonce);
+        r
+    } else {
+        challenger.sample_f128()
+    };
 
     // 8. Output claim's value: φ8 Lagrange combination of z_partial at z_skip.
     //    Equals ẑ_φ8(z_skip, r_rest, x_outer) when z_partial is honest; the
@@ -1889,13 +1901,15 @@ pub fn verify_with_grinding<Ch: Challenger>(
     };
 
     // 1. Sample α (matches prover's order).
-    if let Some(bits) = grinding.alpha_bits() {
-        if !challenger.verify_pow(proof.grinding_nonces[nonce_idx], bits) {
-            return Err(VerifyError::InvalidGrindingNonce { which: "alpha" });
-        }
+    let alpha = if let Some(bits) = grinding.alpha_bits() {
+        let alpha = challenger
+            .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
+            .ok_or(VerifyError::InvalidGrindingNonce { which: "alpha" })?;
         nonce_idx += 1;
-    }
-    let alpha = challenger.sample_f128();
+        alpha
+    } else {
+        challenger.sample_f128()
+    };
 
     // 2. Build α-batched comb_vec via the circuit's per-block fold (same call
     //    the prover made — sparse default delegates to the fused row-fold;
@@ -1926,13 +1940,15 @@ pub fn verify_with_grinding<Ch: Challenger>(
     // all-ones constant column folds to 1. See docs/const-wire-pin.md.
     let mut target = alpha * v_a + v_b;
     if let Some(col) = circuit.const_pin_col() {
-        if let Some(bits) = grinding.beta_bits() {
-            if !challenger.verify_pow(proof.grinding_nonces[nonce_idx], bits) {
-                return Err(VerifyError::InvalidGrindingNonce { which: "beta" });
-            }
+        let beta = if let Some(bits) = grinding.beta_bits() {
+            let beta = challenger
+                .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
+                .ok_or(VerifyError::InvalidGrindingNonce { which: "beta" })?;
             nonce_idx += 1;
-        }
-        let beta = challenger.sample_f128();
+            beta
+        } else {
+            challenger.sample_f128()
+        };
         comb_vec[col] += beta;
         target += beta;
     }
@@ -1941,15 +1957,17 @@ pub fn verify_with_grinding<Ch: Challenger>(
     for &(e1, einf) in &proof.rounds {
         challenger.observe_f128(e1);
         challenger.observe_f128(einf);
-        if let Some(bits) = grinding.multilinear_round_bits() {
-            if !challenger.verify_pow(proof.grinding_nonces[nonce_idx], bits) {
-                return Err(VerifyError::InvalidGrindingNonce {
+        let r = if let Some(bits) = grinding.multilinear_round_bits() {
+            let r = challenger
+                .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
+                .ok_or(VerifyError::InvalidGrindingNonce {
                     which: "sumcheck-round",
-                });
-            }
+                })?;
             nonce_idx += 1;
-        }
-        let r = challenger.sample_f128();
+            r
+        } else {
+            challenger.sample_f128()
+        };
         // q(0) = claim + q(1) in char 2; q(X) = einf·X² + c1·X + e0.
         let e0 = running + e1;
         let c1 = e0 + e1 + einf;
@@ -1981,16 +1999,18 @@ pub fn verify_with_grinding<Ch: Challenger>(
     }
 
     // 6. Sample fresh z_skip AFTER z_partial — gives SZ on the φ8 dim.
-    if let Some(bits) = grinding.skip_bits(k_skip) {
-        if !challenger.verify_pow(proof.grinding_nonces[nonce_idx], bits) {
-            return Err(VerifyError::InvalidGrindingNonce {
+    let r_inner_skip = if let Some(bits) = grinding.skip_bits(k_skip) {
+        let r = challenger
+            .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
+            .ok_or(VerifyError::InvalidGrindingNonce {
                 which: "inner-skip",
-            });
-        }
+            })?;
         nonce_idx += 1;
-    }
+        r
+    } else {
+        challenger.sample_f128()
+    };
     debug_assert_eq!(nonce_idx, proof.grinding_nonces.len());
-    let r_inner_skip = challenger.sample_f128();
 
     // 7. Derive output claim value via φ8 Lagrange on z_partial at z_skip.
     //    Equals ẑ_φ8(z_skip, r_rest, x_outer) when z_partial is honest;

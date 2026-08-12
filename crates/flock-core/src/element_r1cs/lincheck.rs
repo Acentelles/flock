@@ -108,10 +108,13 @@ pub(crate) fn column_sumcheck_prove<C: Challenger>(
     for t in 0..rounds {
         ch.observe_f128(e1);
         ch.observe_f128(einf);
-        if let Some(bits) = grinding.round_bits() {
-            grinding_nonces.push(ch.grind_pow(bits));
-        }
-        let rho = ch.sample_f128();
+        let rho = if let Some(bits) = grinding.round_bits() {
+            let (nonce, rho) = ch.grind_pow_and_sample_f128(bits);
+            grinding_nonces.push(nonce);
+            rho
+        } else {
+            ch.sample_f128()
+        };
         msgs.push((e1, einf));
         challenges.push(rho);
         if t + 1 < rounds {
@@ -142,13 +145,15 @@ pub(crate) fn column_sumcheck_replay<C: Challenger>(
     for &(e1, einf) in rounds {
         ch.observe_f128(e1);
         ch.observe_f128(einf);
-        if let Some(bits) = grinding.round_bits() {
-            if !ch.verify_pow(grinding_nonces[*nonce_idx], bits) {
-                return Err(VerifyError::InvalidGrindingNonce { which: "round" });
-            }
+        let rho = if let Some(bits) = grinding.round_bits() {
+            let rho = ch
+                .verify_pow_and_sample_f128(grinding_nonces[*nonce_idx], bits)
+                .ok_or(VerifyError::InvalidGrindingNonce { which: "round" })?;
             *nonce_idx += 1;
-        }
-        let rho = ch.sample_f128();
+            rho
+        } else {
+            ch.sample_f128()
+        };
         let e0 = running + e1;
         let c1 = e0 + e1 + einf;
         running = einf * rho * rho + c1 * rho + e0;
@@ -239,10 +244,13 @@ pub fn prove_with_grinding<C: Challenger>(
 
     ch.observe_label(LABEL);
     let mut grinding_nonces = Vec::with_capacity(grinding.lincheck_nonce_count(kappa));
-    if let Some(bits) = grinding.alpha_bits() {
-        grinding_nonces.push(ch.grind_pow(bits));
-    }
-    let alpha = ch.sample_f128();
+    let alpha = if let Some(bits) = grinding.alpha_bits() {
+        let (nonce, alpha) = ch.grind_pow_and_sample_f128(bits);
+        grinding_nonces.push(nonce);
+        alpha
+    } else {
+        ch.sample_f128()
+    };
 
     // Rows live in the LOW coordinates of the point, columns in the high ones.
     let (r_row, r_con) = r.split_at(n_log);
@@ -326,13 +334,15 @@ pub fn verify_with_grinding<C: Challenger>(
 
     ch.observe_label(LABEL);
     let mut nonce_idx = 0;
-    if let Some(bits) = grinding.alpha_bits() {
-        if !ch.verify_pow(proof.grinding_nonces[nonce_idx], bits) {
-            return Err(VerifyError::InvalidGrindingNonce { which: "alpha" });
-        }
+    let alpha = if let Some(bits) = grinding.alpha_bits() {
+        let alpha = ch
+            .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
+            .ok_or(VerifyError::InvalidGrindingNonce { which: "alpha" })?;
         nonce_idx += 1;
-    }
-    let alpha = ch.sample_f128();
+        alpha
+    } else {
+        ch.sample_f128()
+    };
 
     // Replay the shared product sumcheck.
     let (running, r_rounds) = column_sumcheck_replay(

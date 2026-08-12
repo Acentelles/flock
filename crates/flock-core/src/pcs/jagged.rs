@@ -2012,10 +2012,13 @@ pub fn prove_frobenius_assist_with_grinding<C: Challenger>(
         }
         challenger.observe_f128(g_one);
         challenger.observe_f128(g_inf);
-        if round_grinding_bits != 0 {
-            grinding_nonces.push(challenger.grind_pow(round_grinding_bits));
-        }
-        let rc = challenger.sample_f128();
+        let rc = if round_grinding_bits != 0 {
+            let (nonce, rc) = challenger.grind_pow_and_sample_f128(round_grinding_bits);
+            grinding_nonces.push(nonce);
+            rc
+        } else {
+            challenger.sample_f128()
+        };
         rounds.push((g_one, g_inf));
 
         // d-round from the same buckets, folded at rc.
@@ -2034,10 +2037,13 @@ pub fn prove_frobenius_assist_with_grinding<C: Challenger>(
         }
         challenger.observe_f128(g_one);
         challenger.observe_f128(g_inf);
-        if round_grinding_bits != 0 {
-            grinding_nonces.push(challenger.grind_pow(round_grinding_bits));
-        }
-        let rd = challenger.sample_f128();
+        let rd = if round_grinding_bits != 0 {
+            let (nonce, rd) = challenger.grind_pow_and_sample_f128(round_grinding_bits);
+            grinding_nonces.push(nonce);
+            rd
+        } else {
+            challenger.sample_f128()
+        };
         rounds.push((g_one, g_inf));
 
         let rd1 = F128::ONE + rd;
@@ -2183,12 +2189,14 @@ fn verify_frobenius_assist_core<C: Challenger>(
     for (round, &(g_one, g_inf)) in proof.rounds.iter().enumerate() {
         challenger.observe_f128(g_one);
         challenger.observe_f128(g_inf);
-        if round_grinding_bits != 0
-            && !challenger.verify_pow(proof.grinding_nonces[round], round_grinding_bits)
-        {
-            return None;
-        }
-        let r = challenger.sample_f128();
+        let r = if round_grinding_bits != 0 {
+            challenger.verify_pow_and_sample_f128(
+                proof.grinding_nonces[round],
+                round_grinding_bits,
+            )?
+        } else {
+            challenger.sample_f128()
+        };
         claim = fold_round_claim(claim, g_one, g_inf, r);
         sigma.push(r);
     }
@@ -3004,10 +3012,11 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
         challenger.observe_f128(v);
     }
     let gamma_bits = grinding.gamma_bits_for(n_rs, n_g);
-    let gamma_grinding_nonce = (gamma_bits != 0)
-        .then(|| challenger.grind_pow(gamma_bits))
-        .unwrap_or(0);
-    let gamma = challenger.sample_f128();
+    let (gamma_grinding_nonce, gamma) = if gamma_bits != 0 {
+        challenger.grind_pow_and_sample_f128(gamma_bits)
+    } else {
+        (0, challenger.sample_f128())
+    };
     let mut gpow = Vec::with_capacity(128 * n_rs + n_g);
     let mut p = F128::ONE;
     for _ in 0..128 * n_rs + n_g {
@@ -3239,10 +3248,13 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
     for i in 0..m {
         challenger.observe_f128(g_one);
         challenger.observe_f128(g_inf);
-        if grinding.round_bits != 0 {
-            round_grinding_nonces.push(challenger.grind_pow(grinding.round_bits));
-        }
-        let r = challenger.sample_f128();
+        let r = if grinding.round_bits != 0 {
+            let (nonce, r) = challenger.grind_pow_and_sample_f128(grinding.round_bits);
+            round_grinding_nonces.push(nonce);
+            r
+        } else {
+            challenger.sample_f128()
+        };
         rounds.push((g_one, g_inf));
         point.push(r);
         if i + 1 == m {
@@ -4517,12 +4529,14 @@ fn verify_multipoint_twisted_core<C: Challenger>(
     // As with ring switching, this optional operation is absent from a
     // disabled transcript, so check canonical zero without absorbing it.
     let gamma_bits = grinding.gamma_bits_for(n_rs, n_g);
-    if (gamma_bits == 0 && proof.gamma_grinding_nonce != 0)
-        || (gamma_bits != 0 && !challenger.verify_pow(proof.gamma_grinding_nonce, gamma_bits))
-    {
-        return None;
-    }
-    let gamma = challenger.sample_f128();
+    let gamma = if gamma_bits != 0 {
+        challenger.verify_pow_and_sample_f128(proof.gamma_grinding_nonce, gamma_bits)?
+    } else {
+        if proof.gamma_grinding_nonce != 0 {
+            return None;
+        }
+        challenger.sample_f128()
+    };
     let mut gpow = Vec::with_capacity(128 * n_rs + n_g);
     let mut p = F128::ONE;
     for _ in 0..128 * n_rs + n_g {
@@ -4544,12 +4558,14 @@ fn verify_multipoint_twisted_core<C: Challenger>(
     for (round, &(g_one, g_inf)) in proof.rounds.iter().enumerate() {
         challenger.observe_f128(g_one);
         challenger.observe_f128(g_inf);
-        if grinding.round_bits != 0
-            && !challenger.verify_pow(proof.round_grinding_nonces[round], grinding.round_bits)
-        {
-            return None;
-        }
-        let r = challenger.sample_f128();
+        let r = if grinding.round_bits != 0 {
+            challenger.verify_pow_and_sample_f128(
+                proof.round_grinding_nonces[round],
+                grinding.round_bits,
+            )?
+        } else {
+            challenger.sample_f128()
+        };
         running = fold_round_claim(running, g_one, g_inf, r);
         point.push(r);
     }

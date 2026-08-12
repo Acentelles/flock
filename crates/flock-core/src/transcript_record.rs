@@ -80,9 +80,13 @@ pub enum TranscriptOp {
     Merge {
         fork: usize,
     },
-    /// `grind_pow` / `verify_pow` at `bits`. Both sides absorb the nonce as
-    /// `observe_bytes(8)` and take one state digest, so they share an op.
+    /// Fused PoW+squeeze marker at `bits`.  This op contributes the private
+    /// 16-byte nonce word; the immediately following `SqueezeScalar` or
+    /// `SqueezeSlice` performs the single domain-separated compression.
     Pow { bits: u32 },
+    /// Legacy standalone `grind_pow` / `verify_pow`.  Kept for callers that do
+    /// not use the fused APIs; active recursive protocol paths use `Pow`.
+    LegacyPow { bits: u32 },
 }
 
 impl TranscriptOp {
@@ -128,7 +132,7 @@ impl TranscriptOp {
             // A squeeze absorbs only its header — the output is not fed back.
             TranscriptOp::SqueezeScalar | TranscriptOp::SqueezeSlice(_) => 0,
             // The PoW nonce rides `observe_bytes(8)`.
-            TranscriptOp::Pow { .. } => 16,
+            TranscriptOp::Pow { .. } | TranscriptOp::LegacyPow { .. } => 16,
             TranscriptOp::Forked { .. } | TranscriptOp::Merge { .. } => unreachable!("early return"),
         }
     }
@@ -140,7 +144,8 @@ impl TranscriptOp {
         match self {
             TranscriptOp::SqueezeScalar => 16,
             TranscriptOp::SqueezeSlice(n) => 16 * n,
-            TranscriptOp::Pow { .. } => 32, // the state digest the PoW binds to
+            TranscriptOp::Pow { .. } => 0, // fused with the following squeeze
+            TranscriptOp::LegacyPow { .. } => 32,
             _ => 0,
         }
     }
@@ -151,7 +156,9 @@ impl TranscriptOp {
     pub fn finalizes(&self) -> bool {
         matches!(
             self,
-            TranscriptOp::SqueezeScalar | TranscriptOp::SqueezeSlice(_) | TranscriptOp::Pow { .. }
+            TranscriptOp::SqueezeScalar
+                | TranscriptOp::SqueezeSlice(_)
+                | TranscriptOp::LegacyPow { .. }
         )
     }
 }
@@ -265,6 +272,10 @@ impl TranscriptShape {
                     h.update([6u8]);
                     h.update(bits.to_le_bytes());
                 }
+                TranscriptOp::LegacyPow { bits } => {
+                    h.update([9u8]);
+                    h.update(bits.to_le_bytes());
+                }
                 // The child's shape is part of the parent's: a fork whose
                 // branch changed must move this digest.
                 TranscriptOp::Forked { label, ops } => {
@@ -362,7 +373,7 @@ impl TranscriptShape {
                     finalize_at(offset, op.squeezed_bytes(), &mut inv);
                     offset += op.absorbed_bytes() - 16;
                 }
-                TranscriptOp::Pow { .. } => {
+                TranscriptOp::Pow { .. } | TranscriptOp::LegacyPow { .. } => {
                     // `grind_pow` digests the state first, then absorbs the nonce.
                     finalize_at(offset, 32, &mut inv);
                     offset += op.absorbed_bytes();
@@ -584,7 +595,28 @@ impl TranscriptShape {
                     f.parent_digest_word = out.len() + 1;
                 }
                 TranscriptOp::Pow { .. } => {
-                    // `grind_pow` digests the state BEFORE absorbing the nonce.
+                    if duplex {
+                        // The fused nonce is one aligned private word
+                        // immediately before the following squeeze. Its high
+                        // half is zero padding constrained by recursion.
+                        out.push(StreamWord::Bytes {
+                            payload: *payloads,
+                            word: 0,
+                        });
+                        *payloads += 1;
+                    } else {
+                        // Non-duplex challengers use the trait's compatibility
+                        // implementation (legacy PoW, then an ordinary sample).
+                        finalize_after.push(out.len());
+                        out.push(header(OP_BYTES, KIND_NONE, 8));
+                        out.push(StreamWord::Bytes {
+                            payload: *payloads,
+                            word: 0,
+                        });
+                        *payloads += 1;
+                    }
+                }
+                TranscriptOp::LegacyPow { .. } => {
                     finalize_after.push(out.len());
                     out.push(header(OP_BYTES, KIND_NONE, 8));
                     out.push(StreamWord::Bytes {
@@ -729,6 +761,10 @@ impl<Ch: Challenger> RecordingChallenger<Ch> {
 }
 
 impl<Ch: Challenger> Challenger for RecordingChallenger<Ch> {
+    fn supports_fused_pow_squeeze(&self) -> bool {
+        self.inner.supports_fused_pow_squeeze()
+    }
+
     fn fork_from_seed(&self, _seed: [F128; 2], _label: &'static [u8]) -> Self {
         // `fork` (below) is the recorded entry: it samples the seed THROUGH
         // the recorder so the two seed squeezes land on the tape, then
@@ -839,16 +875,73 @@ impl<Ch: Challenger> Challenger for RecordingChallenger<Ch> {
     }
 
     fn grind_pow(&mut self, bits: u32) -> u64 {
-        self.ops.push(TranscriptOp::Pow { bits });
+        self.ops.push(TranscriptOp::LegacyPow { bits });
         let nonce = self.inner.grind_pow(bits);
         self.payloads.push(nonce.to_le_bytes().to_vec());
         nonce
     }
 
     fn verify_pow(&mut self, nonce: u64, bits: u32) -> bool {
-        self.ops.push(TranscriptOp::Pow { bits });
+        self.ops.push(TranscriptOp::LegacyPow { bits });
         self.payloads.push(nonce.to_le_bytes().to_vec());
         self.inner.verify_pow(nonce, bits)
+    }
+
+    fn grind_pow_and_sample_f128(&mut self, bits: u32) -> (u64, F128) {
+        self.ops.push(if self.inner.supports_fused_pow_squeeze() {
+            TranscriptOp::Pow { bits }
+        } else {
+            TranscriptOp::LegacyPow { bits }
+        });
+        self.ops.push(TranscriptOp::SqueezeScalar);
+        let (nonce, challenge) = self.inner.grind_pow_and_sample_f128(bits);
+        self.payloads.push(nonce.to_le_bytes().to_vec());
+        self.challenges.push(challenge);
+        (nonce, challenge)
+    }
+
+    fn verify_pow_and_sample_f128(&mut self, nonce: u64, bits: u32) -> Option<F128> {
+        self.ops.push(if self.inner.supports_fused_pow_squeeze() {
+            TranscriptOp::Pow { bits }
+        } else {
+            TranscriptOp::LegacyPow { bits }
+        });
+        self.ops.push(TranscriptOp::SqueezeScalar);
+        self.payloads.push(nonce.to_le_bytes().to_vec());
+        let challenge = self.inner.verify_pow_and_sample_f128(nonce, bits)?;
+        self.challenges.push(challenge);
+        Some(challenge)
+    }
+
+    fn grind_pow_and_sample_f128_vec(&mut self, bits: u32, n: usize) -> (u64, Vec<F128>) {
+        self.ops.push(if self.inner.supports_fused_pow_squeeze() {
+            TranscriptOp::Pow { bits }
+        } else {
+            TranscriptOp::LegacyPow { bits }
+        });
+        self.ops.push(TranscriptOp::SqueezeSlice(n));
+        let (nonce, challenges) = self.inner.grind_pow_and_sample_f128_vec(bits, n);
+        self.payloads.push(nonce.to_le_bytes().to_vec());
+        self.challenges.extend_from_slice(&challenges);
+        (nonce, challenges)
+    }
+
+    fn verify_pow_and_sample_f128_vec(
+        &mut self,
+        nonce: u64,
+        bits: u32,
+        n: usize,
+    ) -> Option<Vec<F128>> {
+        self.ops.push(if self.inner.supports_fused_pow_squeeze() {
+            TranscriptOp::Pow { bits }
+        } else {
+            TranscriptOp::LegacyPow { bits }
+        });
+        self.ops.push(TranscriptOp::SqueezeSlice(n));
+        self.payloads.push(nonce.to_le_bytes().to_vec());
+        let challenges = self.inner.verify_pow_and_sample_f128_vec(nonce, bits, n)?;
+        self.challenges.extend_from_slice(&challenges);
+        Some(challenges)
     }
 }
 
@@ -1016,8 +1109,8 @@ mod tests {
                 TranscriptOp::ObserveSlice(3),
                 TranscriptOp::SqueezeSlice(5),
                 TranscriptOp::ObserveBytes(37),
-                TranscriptOp::Pow { bits: 0 },
-                TranscriptOp::Pow { bits: 0 },
+                TranscriptOp::LegacyPow { bits: 0 },
+                TranscriptOp::LegacyPow { bits: 0 },
                 TranscriptOp::SqueezeScalar,
             ]
         );
@@ -1164,7 +1257,7 @@ mod tests {
         // Local duplex replay over the same primitive.
         let mut cv = crate::hash::BLAKE3_IV;
         let mut pend: Vec<u8> = Vec::new();
-        let mut drain = |cv: &mut [u32; 8], pend: &mut Vec<u8>| {
+        let drain = |cv: &mut [u32; 8], pend: &mut Vec<u8>| {
             while pend.len() >= 64 {
                 let mut m = [0u32; 16];
                 for (i, c) in pend[..64].chunks(4).enumerate() {

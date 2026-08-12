@@ -486,10 +486,13 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         challenger.observe_f128(pd.value);
     }
     let mut batching_nonces = Vec::with_capacity(usize::from(batch_bits != 0));
-    if batch_bits != 0 {
-        batching_nonces.push(challenger.grind_pow(batch_bits));
-    }
-    let gammas = challenger.sample_f128_vec(n_rs + n_pd);
+    let gammas = if batch_bits != 0 {
+        let (nonce, gammas) = challenger.grind_pow_and_sample_f128_vec(batch_bits, n_rs + n_pd);
+        batching_nonces.push(nonce);
+        gammas
+    } else {
+        challenger.sample_f128_vec(n_rs + n_pd)
+    };
     let (gammas_rs, gammas_pd) = gammas.split_at(n_rs);
     for ((_, output), &gamma) in rs_results.iter_mut().zip(gammas_rs) {
         output.rs_eq_ind.scale_in_place(gamma);
@@ -1043,14 +1046,15 @@ pub fn verify_opening_batch_ligerito_mixed_with_grinding<Ch: Challenger>(
         challenger.observe_label(b"flock-pcs-packed-direct-v0");
         challenger.observe_f128(pd.value);
     }
-    if batch_bits != 0
-        && !challenger.verify_pow(proof.batching_nonces[0], batch_bits)
-    {
-        return Err(VerifyError::RingSwitch(
-            ring_switch::VerifyError::InvalidGrinding,
-        ));
-    }
-    let gammas = challenger.sample_f128_vec(n_rs + n_pd);
+    let gammas = if batch_bits != 0 {
+        challenger
+            .verify_pow_and_sample_f128_vec(proof.batching_nonces[0], batch_bits, n_rs + n_pd)
+            .ok_or(VerifyError::RingSwitch(
+                ring_switch::VerifyError::InvalidGrinding,
+            ))?
+    } else {
+        challenger.sample_f128_vec(n_rs + n_pd)
+    };
     let (gammas_rs, gammas_pd) = gammas.split_at(n_rs);
 
     // 3. target_combined from succinct rs claims + PD values.
@@ -1353,10 +1357,14 @@ pub fn open_batch_merged<Ch: Challenger>(
         challenger.observe_f128(c.value);
     }
     let mut batching_nonces = Vec::with_capacity(usize::from(batch_bits != 0));
-    if batch_bits != 0 {
-        batching_nonces.push(challenger.grind_pow(batch_bits));
-    }
-    let gammas = challenger.sample_f128_vec(x_outers.len() + packed_direct.len());
+    let n_gammas = x_outers.len() + packed_direct.len();
+    let gammas = if batch_bits != 0 {
+        let (nonce, gammas) = challenger.grind_pow_and_sample_f128_vec(batch_bits, n_gammas);
+        batching_nonces.push(nonce);
+        gammas
+    } else {
+        challenger.sample_f128_vec(n_gammas)
+    };
     let (gammas_rs, gammas_pd) = gammas.split_at(x_outers.len());
     for ((_, output), &gamma) in rs_results.iter_mut().zip(gammas_rs) {
         output.rs_eq_ind.scale_in_place(gamma);
@@ -1461,10 +1469,13 @@ pub fn open_batch_merged<Ch: Challenger>(
         let half = cur / 2;
         challenger.observe_f128(g_one);
         challenger.observe_f128(g_inf);
-        if grinding.merged_round_bits != 0 {
-            merged_round_nonces.push(challenger.grind_pow(grinding.merged_round_bits));
-        }
-        let r = challenger.sample_f128();
+        let r = if grinding.merged_round_bits != 0 {
+            let (nonce, r) = challenger.grind_pow_and_sample_f128(grinding.merged_round_bits);
+            merged_round_nonces.push(nonce);
+            r
+        } else {
+            challenger.sample_f128()
+        };
         merged_rounds.push((g_one, g_inf));
         rho.push(r);
         let (a_src, b_src): (&[F128], &[F128]) = if round == 0 {
@@ -1937,10 +1948,13 @@ fn verify_batch_merged_core<Ch: Challenger>(
     for c in packed_direct {
         challenger.observe_f128(c.value);
     }
-    if batch_bits != 0 && !challenger.verify_pow(proof.batching_nonces[0], batch_bits) {
-        return Err(VerifyErrorOpen::Assist);
-    }
-    let gammas_all = challenger.sample_f128_vec(n_rs + n_pd);
+    let gammas_all = if batch_bits != 0 {
+        challenger
+            .verify_pow_and_sample_f128_vec(proof.batching_nonces[0], batch_bits, n_rs + n_pd)
+            .ok_or(VerifyErrorOpen::Assist)?
+    } else {
+        challenger.sample_f128_vec(n_rs + n_pd)
+    };
     let (gammas, gammas_pd) = gammas_all.split_at(n_rs);
     let mut target = F128::ZERO;
     for (out, g) in rs_outputs.iter().zip(gammas.iter()) {
@@ -1967,15 +1981,16 @@ fn verify_batch_merged_core<Ch: Challenger>(
     for (round, &(g_one, g_inf)) in proof.merged_rounds.iter().enumerate() {
         challenger.observe_f128(g_one);
         challenger.observe_f128(g_inf);
-        if grinding.merged_round_bits != 0
-            && !challenger.verify_pow(
-                proof.merged_round_nonces[round],
-                grinding.merged_round_bits,
-            )
-        {
-            return Err(VerifyErrorOpen::VirtualOpen);
-        }
-        let r = challenger.sample_f128();
+        let r = if grinding.merged_round_bits != 0 {
+            challenger
+                .verify_pow_and_sample_f128(
+                    proof.merged_round_nonces[round],
+                    grinding.merged_round_bits,
+                )
+                .ok_or(VerifyErrorOpen::VirtualOpen)?
+        } else {
+            challenger.sample_f128()
+        };
         running = jagged::fold_round_claim(running, g_one, g_inf, r);
         rho.push(r);
     }

@@ -291,13 +291,15 @@ fn replay_rounds<Ch: Challenger>(
     for &(q1, qinf) in rounds {
         ch.observe_f128(q1);
         ch.observe_f128(qinf);
-        if round_bits != 0 {
-            if !ch.verify_pow(proof_nonces[*nonce_idx], round_bits) {
-                return Err(FoldError::InvalidGrinding);
-            }
+        let r = if round_bits != 0 {
+            let r = ch
+                .verify_pow_and_sample_f128(proof_nonces[*nonce_idx], round_bits)
+                .ok_or(FoldError::InvalidGrinding)?;
             *nonce_idx += 1;
-        }
-        let r = ch.sample_f128();
+            r
+        } else {
+            ch.sample_f128()
+        };
         // char 2: q(0) = running + q(1); q(X) = qinf·X² + c1·X + q(0).
         let q0 = running + q1;
         let c1 = q0 + q1 + qinf;
@@ -308,26 +310,49 @@ fn replay_rounds<Ch: Challenger>(
 }
 
 #[inline]
-fn grind_if<Ch: Challenger>(ch: &mut Ch, nonces: &mut Vec<u64>, bits: u32) {
+fn grind_sample<Ch: Challenger>(ch: &mut Ch, nonces: &mut Vec<u64>, bits: u32) -> F128 {
     if bits != 0 {
-        nonces.push(ch.grind_pow(bits));
+        let (nonce, challenge) = ch.grind_pow_and_sample_f128(bits);
+        nonces.push(nonce);
+        challenge
+    } else {
+        ch.sample_f128()
     }
 }
 
 #[inline]
-fn verify_grind<Ch: Challenger>(
+fn grind_sample_vec<Ch: Challenger>(
+    ch: &mut Ch,
+    nonces: &mut Vec<u64>,
+    bits: u32,
+    n: usize,
+) -> Vec<F128> {
+    if bits != 0 {
+        let (nonce, challenge) = ch.grind_pow_and_sample_f128_vec(bits, n);
+        nonces.push(nonce);
+        challenge
+    } else {
+        ch.sample_f128_vec(n)
+    }
+}
+
+#[inline]
+fn verify_grind_sample_vec_n<Ch: Challenger>(
     ch: &mut Ch,
     nonces: &[u64],
     nonce_idx: &mut usize,
     bits: u32,
-) -> Result<(), FoldError> {
+    n: usize,
+) -> Result<Vec<F128>, FoldError> {
     if bits != 0 {
-        if !ch.verify_pow(nonces[*nonce_idx], bits) {
-            return Err(FoldError::InvalidGrinding);
-        }
+        let challenges = ch
+            .verify_pow_and_sample_f128_vec(nonces[*nonce_idx], bits, n)
+            .ok_or(FoldError::InvalidGrinding)?;
         *nonce_idx += 1;
+        Ok(challenges)
+    } else {
+        Ok(ch.sample_f128_vec(n))
     }
-    Ok(())
 }
 
 /// Bind the claims into the transcript — weights included, not just values.
@@ -377,8 +402,7 @@ pub fn prove_fold_with_grinding<Ch: Challenger>(
 
     let mut grinding_nonces = Vec::with_capacity(grinding.nonce_count(k_row, k_col));
     observe_claims(claims, ch);
-    grind_if(ch, &mut grinding_nonces, grinding.combination_bits);
-    let lambdas = ch.sample_f128_vec(claims.len());
+    let lambdas = grind_sample_vec(ch, &mut grinding_nonces, grinding.combination_bits, claims.len());
 
     // Column phase: Σ_c Σ_i λ_i·col_i(c)·comb_i(c). `combs` is the k·nnz
     // work, done by the caller with the type's tuned kernel.
@@ -398,8 +422,7 @@ pub fn prove_fold_with_grinding<Ch: Challenger>(
         let msg = round_message(&pairs, &lambdas);
         ch.observe_f128(msg.0);
         ch.observe_f128(msg.1);
-        grind_if(ch, &mut grinding_nonces, grinding.round_bits);
-        let r = ch.sample_f128();
+        let r = grind_sample(ch, &mut grinding_nonces, grinding.round_bits);
         col_rounds.push(msg);
         rho_col.push(r);
         for (a, b) in &mut pairs {
@@ -415,8 +438,7 @@ pub fn prove_fold_with_grinding<Ch: Challenger>(
     // Row phase. Every bridge value reads against the same h(r) = M̂(r, ρ_col),
     // so ONE marginal serves all k — the only pass this function makes over
     // the matrix itself.
-    grind_if(ch, &mut grinding_nonces, grinding.combination_bits);
-    let mus = ch.sample_f128_vec(claims.len());
+    let mus = grind_sample_vec(ch, &mut grinding_nonces, grinding.combination_bits, claims.len());
     let eq_col = Weight::eq(rho_col.clone()).materialize();
     let h = m.row_marginal(&eq_col, 1usize << k_row);
     let mut w_mu = vec![F128::ZERO; 1usize << k_row];
@@ -434,8 +456,7 @@ pub fn prove_fold_with_grinding<Ch: Challenger>(
         let msg = round_message(&row_pairs, &one);
         ch.observe_f128(msg.0);
         ch.observe_f128(msg.1);
-        grind_if(ch, &mut grinding_nonces, grinding.round_bits);
-        let r = ch.sample_f128();
+        let r = grind_sample(ch, &mut grinding_nonces, grinding.round_bits);
         row_rounds.push(msg);
         rho_row.push(r);
         for (a, b) in &mut row_pairs {
@@ -682,13 +703,13 @@ pub fn verify_fold_with_grinding<Ch: Challenger>(
     let mut nonce_idx = 0usize;
 
     observe_claims(claims, ch);
-    verify_grind(
+    let lambdas = verify_grind_sample_vec_n(
         ch,
         &proof.grinding_nonces,
         &mut nonce_idx,
         grinding.combination_bits,
+        claims.len(),
     )?;
-    let lambdas = ch.sample_f128_vec(claims.len());
 
     // Column sumcheck: target is the λ-combination of the claimed values.
     let target = claims
@@ -718,13 +739,13 @@ pub fn verify_fold_with_grinding<Ch: Challenger>(
     }
 
     // Row sumcheck: target is the μ-combination of the bridge values.
-    verify_grind(
+    let mus = verify_grind_sample_vec_n(
         ch,
         &proof.grinding_nonces,
         &mut nonce_idx,
         grinding.combination_bits,
+        claims.len(),
     )?;
-    let mus = ch.sample_f128_vec(claims.len());
     let target = proof
         .bridge
         .iter()
@@ -1103,8 +1124,7 @@ pub fn prove_fold_jagged_with_grinding<Ch: Challenger>(
 
     let mut grinding_nonces = Vec::with_capacity(grinding.nonce_count(t.k, n_col));
     observe_jagged_claims(t.k, claims, ch);
-    grind_if(ch, &mut grinding_nonces, grinding.combination_bits);
-    let lambdas = ch.sample_f128_vec(claims.len());
+    let lambdas = grind_sample_vec(ch, &mut grinding_nonces, grinding.combination_bits, claims.len());
 
     // Column phase, sparse: per claim, `comb_i` has one entry per run with a
     // nonzero row-weight mass. The claim's own eq tensor over the pair space
@@ -1165,8 +1185,7 @@ pub fn prove_fold_jagged_with_grinding<Ch: Challenger>(
         }
         ch.observe_f128(q1);
         ch.observe_f128(qinf);
-        grind_if(ch, &mut grinding_nonces, grinding.round_bits);
-        let r = ch.sample_f128();
+        let r = grind_sample(ch, &mut grinding_nonces, grinding.round_bits);
         col_rounds.push((q1, qinf));
         rho_col.push(r);
         for (st, c) in states.iter_mut().zip(claims) {
@@ -1191,8 +1210,7 @@ pub fn prove_fold_jagged_with_grinding<Ch: Challenger>(
 
     // Row phase — dense over the small `2^k` side, the machinery above
     // verbatim. `h(y) = Ĵ(y, ρ_col)` is one eq factor per run, broadcast.
-    grind_if(ch, &mut grinding_nonces, grinding.combination_bits);
-    let mus = ch.sample_f128_vec(claims.len());
+    let mus = grind_sample_vec(ch, &mut grinding_nonces, grinding.combination_bits, claims.len());
     let mut h = vec![F128::ZERO; 1usize << t.k];
     let mut y = 0usize;
     for &(t_c, t_next, run) in &t.bounds {
@@ -1215,8 +1233,7 @@ pub fn prove_fold_jagged_with_grinding<Ch: Challenger>(
         let msg = round_message(&row_pairs, &one);
         ch.observe_f128(msg.0);
         ch.observe_f128(msg.1);
-        grind_if(ch, &mut grinding_nonces, grinding.round_bits);
-        let r = ch.sample_f128();
+        let r = grind_sample(ch, &mut grinding_nonces, grinding.round_bits);
         row_rounds.push(msg);
         rho_row.push(r);
         for (a, b) in &mut row_pairs {
@@ -1282,13 +1299,13 @@ pub fn verify_fold_jagged_with_grinding<Ch: Challenger>(
     let mut nonce_idx = 0usize;
 
     observe_jagged_claims(k_row, claims, ch);
-    verify_grind(
+    let lambdas = verify_grind_sample_vec_n(
         ch,
         &proof.grinding_nonces,
         &mut nonce_idx,
         grinding.combination_bits,
+        claims.len(),
     )?;
-    let lambdas = ch.sample_f128_vec(claims.len());
 
     let target = claims
         .iter()
@@ -1323,13 +1340,13 @@ pub fn verify_fold_jagged_with_grinding<Ch: Challenger>(
         return Err(FoldError::ConsistencyFailed { which: "col" });
     }
 
-    verify_grind(
+    let mus = verify_grind_sample_vec_n(
         ch,
         &proof.grinding_nonces,
         &mut nonce_idx,
         grinding.combination_bits,
+        claims.len(),
     )?;
-    let mus = ch.sample_f128_vec(claims.len());
     let target = proof
         .bridge
         .iter()

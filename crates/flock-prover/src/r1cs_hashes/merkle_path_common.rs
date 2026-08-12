@@ -365,12 +365,11 @@ pub fn prove_merkle_paths_ligerito_generic<Ch: Challenger>(
     };
     let grinding = crate::merkle_path::MerklePathGrinding::for_profile(pcs_params.profile);
     let tau_pos_bits = grinding.packed_position_bits_for(layout.tau_pos_len());
-    let tau_pos_grinding_nonce = if tau_pos_bits == 0 {
-        0
+    let (tau_pos_grinding_nonce, tau_pos) = if tau_pos_bits == 0 {
+        (0, challenger.sample_f128_vec(layout.tau_pos_len()))
     } else {
-        challenger.grind_pow(tau_pos_bits)
+        challenger.grind_pow_and_sample_f128_vec(tau_pos_bits, layout.tau_pos_len())
     };
-    let tau_pos = challenger.sample_f128_vec(layout.tau_pos_len());
     let fold = MerklePathFold::new(layout, tau_pos);
     let slot_vals = fold_all_slots(layout, r1cs.layout, &core.z_packed, &fold);
     if let Some(t) = t {
@@ -505,15 +504,24 @@ pub fn verify_merkle_paths_ligerito_generic<Ch: Challenger>(
 
     let grinding = crate::merkle_path::MerklePathGrinding::for_profile(pcs_params.profile);
     let tau_pos_bits = grinding.packed_position_bits_for(layout.tau_pos_len());
-    if (tau_pos_bits == 0 && proof.tau_pos_grinding_nonce != 0)
-        || (tau_pos_bits != 0
-            && !challenger.verify_pow(proof.tau_pos_grinding_nonce, tau_pos_bits))
-    {
-        return Err(MerklePathVerifyError::Shift(
-            crate::merkle_path::MerklePathError::InvalidGrinding,
-        ));
-    }
-    let tau_pos = challenger.sample_f128_vec(layout.tau_pos_len());
+    let tau_pos = if tau_pos_bits != 0 {
+        challenger
+            .verify_pow_and_sample_f128_vec(
+                proof.tau_pos_grinding_nonce,
+                tau_pos_bits,
+                layout.tau_pos_len(),
+            )
+            .ok_or(MerklePathVerifyError::Shift(
+                crate::merkle_path::MerklePathError::InvalidGrinding,
+            ))?
+    } else {
+        if proof.tau_pos_grinding_nonce != 0 {
+            return Err(MerklePathVerifyError::Shift(
+                crate::merkle_path::MerklePathError::InvalidGrinding,
+            ));
+        }
+        challenger.sample_f128_vec(layout.tau_pos_len())
+    };
     let fold = MerklePathFold::new(layout, tau_pos);
 
     let leaf_evals: Vec<F128> = leaves_phys

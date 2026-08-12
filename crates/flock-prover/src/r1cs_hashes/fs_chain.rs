@@ -1,5 +1,4 @@
-//! The Fiat–Shamir chain: BLAKE3 over a transcript, with a finalize forked at
-//! every squeeze.
+//! The Fiat–Shamir chain: a sequential BLAKE3-compression duplex transcript.
 //!
 //! This is the witness generator for the FS chain's rows — the compression
 //! sequence a recursion circuit has to reproduce. Each row is one
@@ -7,26 +6,21 @@
 //! no table type; what it adds is *which* compressions, in what order, and how
 //! their chaining values connect ([`FsChainTrace::links`]).
 //!
-//! ## Why the finalizes dominate
-//!
-//! BLAKE3 is a tree, not a sequential duplex. Absorbing is cheap — 16 blocks
-//! chain into a 1 KiB chunk, chunk CVs merge pairwise — but a *squeeze* has to
-//! finalize the whole tree at that moment: compress the pending block, then
-//! collapse the current chunk stack with `PARENT` compressions, the last of
-//! them `ROOT`. That costs `popcount(complete chunks)` merges and grows as the
-//! transcript does, so late squeezes cost more than early ones. On the element
-//! transcript the finalize merges alone are 208 of 698 rows — a flat
-//! "one compression per squeeze" model undercounts by 42%
-//! (`TranscriptShape::blake3_inventory`).
+//! An ordinary squeeze consumes the pending partial block as its first output
+//! compression and advances the chaining value. A fused PoW+squeeze appends a
+//! 64-bit nonce word, reserves output word 1 for the leading-zero predicate,
+//! emits challenge words 0, 2 and 3, and continues from the output high half.
+//! Thus a scalar grind adds no standalone BLAKE3 row to recursion.
 //!
 //! ## Correctness
 //!
-//! Every finalize is checked against reference BLAKE3's XOF of the same prefix.
-//! Getting the chunk stack subtly wrong would still produce a self-consistent
-//! circuit — one proving a hash nobody computes — so this is differential
-//! rather than structural.
+//! Native, recorded-trace and recursive-row outputs are checked
+//! differentially. Getting output allocation or the high-half link wrong
+//! could otherwise produce a self-consistent circuit for a transcript nobody
+//! computes.
 
 use flock_core::field::F128;
+use flock_core::challenger::pow_squeeze_counter;
 use flock_core::transcript_record::{Stream, TranscriptOp};
 
 use super::blake3::{Compression, blake3_compress};
@@ -84,7 +78,19 @@ pub struct ForkedChains {
 pub fn trace_duplex(stream: &Stream, bytes: &[u8], ops: &[TranscriptOp]) -> FsChainTrace {
     let mut chain = FsChainSponge::new();
     let mut at = 0usize;
-    let fin_ops: Vec<&TranscriptOp> = ops.iter().filter(|o| o.finalizes()).collect();
+    let mut pending_pow = None;
+    let mut fin_ops = Vec::new();
+    for op in ops {
+        match op {
+            TranscriptOp::Pow { bits } => {
+                assert!(pending_pow.replace(*bits).is_none(), "nested fused PoW markers");
+            }
+            op if op.finalizes() => fin_ops.push((op, pending_pow.take())),
+            TranscriptOp::Forked { .. } => {}
+            _ => assert!(pending_pow.is_none(), "fused PoW must be followed by a squeeze"),
+        }
+    }
+    assert!(pending_pow.is_none(), "fused PoW marker without a squeeze");
     assert_eq!(
         stream.finalize_after.len(),
         fin_ops.len(),
@@ -93,9 +99,18 @@ pub fn trace_duplex(stream: &Stream, bytes: &[u8], ops: &[TranscriptOp]) -> FsCh
         fin_ops.len()
     );
     for (k, &upto) in stream.finalize_after.iter().enumerate() {
-        chain.absorb(&bytes[at * 16..upto * 16]);
+        let (_, pow_bits) = fin_ops[k];
+        if pow_bits.is_some() {
+            chain.absorb_hold_last_block(&bytes[at * 16..upto * 16]);
+        } else {
+            chain.absorb(&bytes[at * 16..upto * 16]);
+        }
         at = upto;
-        chain.finalize(fin_ops[k].squeezed_bytes());
+        if let Some(bits) = pow_bits {
+            chain.finalize_pow(fin_ops[k].0.squeezed_bytes(), bits);
+        } else {
+            chain.finalize(fin_ops[k].0.squeezed_bytes());
+        }
     }
     chain.absorb(&bytes[at * 16..]);
     chain.finish()
@@ -173,6 +188,8 @@ pub enum CvSource {
     Iv,
     /// `out_lo` of an earlier row (chunk chaining, or a parent's left input).
     Row(usize),
+    /// `out_hi` of a fused PoW+squeeze row.
+    RowHi(usize),
 }
 
 /// One row plus where its chaining input came from.
@@ -198,6 +215,10 @@ pub struct FsChainTrace {
     /// first is the `ROOT` compression; any others are counter-mode XOF blocks
     /// and are mutually independent.
     pub squeezes: Vec<Vec<usize>>,
+    /// Exact `(row, output-word)` source for every challenge word in a
+    /// squeeze. Ordinary squeezes enumerate all four row outputs; fused PoW
+    /// squeezes omit the word reserved for the zero-prefix predicate.
+    pub squeeze_words: Vec<Vec<(usize, usize)>>,
     /// For a row that compresses transcript bytes, the byte offset of its
     /// block; `None` for `PARENT` and XOF rows, whose message is chaining
     /// values rather than stream bytes.
@@ -208,6 +229,10 @@ pub struct FsChainTrace {
     /// circuit would assert the challenges rather than derive them, which is
     /// the entire content of Fiat–Shamir.
     pub block_offsets: Vec<Option<usize>>,
+    /// Number of real 16-byte stream words wired into each message block.
+    /// Usually derived from `block_len`; fused PoW rows deliberately use a
+    /// full-block length for SIMD while zero-padding after the nonce word.
+    pub block_word_counts: Vec<usize>,
 }
 
 /// Incremental BLAKE3 with forkable finalization.
@@ -215,6 +240,7 @@ pub struct FsChain {
     rows: Vec<Compression>,
     links: Vec<Link>,
     squeezes: Vec<Vec<usize>>,
+    squeeze_words: Vec<Vec<(usize, usize)>>,
     /// The current chunk's running chaining value, and the row that produced
     /// it (`None` at a chunk boundary, where it is the IV).
     chunk_cv: [u32; 8],
@@ -260,6 +286,7 @@ impl FsChain {
             rows: Vec::new(),
             links: Vec::new(),
             squeezes: Vec::new(),
+            squeeze_words: Vec::new(),
             chunk_cv: IV,
             chunk_cv_row: None,
             chunk_counter: 0,
@@ -436,16 +463,32 @@ impl FsChain {
             ctr += 1;
         }
         bytes.truncate(out_bytes);
+        self.squeeze_words.push(
+            ids.iter()
+                .flat_map(|&row| (0..4).map(move |word| (row, word)))
+                .take(out_bytes.div_ceil(16))
+                .collect(),
+        );
         self.squeezes.push(ids);
         bytes
     }
 
     pub fn finish(self) -> FsChainTrace {
+        let block_word_counts = self
+            .rows
+            .iter()
+            .zip(&self.block_offsets)
+            .map(|((_, _, _, blen, _), offset)| {
+                usize::from(offset.is_some()) * (*blen as usize).div_ceil(16)
+            })
+            .collect();
         FsChainTrace {
             rows: self.rows,
             links: self.links,
             squeezes: self.squeezes,
+            squeeze_words: self.squeeze_words,
             block_offsets: self.block_offsets,
+            block_word_counts,
         }
     }
 }
@@ -475,9 +518,11 @@ pub struct FsChainSponge {
     rows: Vec<Compression>,
     links: Vec<Link>,
     squeezes: Vec<Vec<usize>>,
+    squeeze_words: Vec<Vec<(usize, usize)>>,
     block_offsets: Vec<Option<usize>>,
+    block_word_counts: Vec<usize>,
     cv: [u32; 8],
-    cv_row: Option<usize>,
+    cv_source: CvSource,
     buf: Vec<u8>,
     buf_offset: usize,
     absorbed: usize,
@@ -495,25 +540,34 @@ impl FsChainSponge {
             rows: Vec::new(),
             links: Vec::new(),
             squeezes: Vec::new(),
+            squeeze_words: Vec::new(),
             block_offsets: Vec::new(),
+            block_word_counts: Vec::new(),
             cv: IV,
-            cv_row: None,
+            cv_source: CvSource::Iv,
             buf: Vec::with_capacity(BLOCK_BYTES),
             buf_offset: 0,
             absorbed: 0,
         }
     }
 
-    fn emit(&mut self, c: Compression, link: Link, offset: Option<usize>) -> usize {
+    fn emit(
+        &mut self,
+        c: Compression,
+        link: Link,
+        offset: Option<usize>,
+        word_count: usize,
+    ) -> usize {
         self.rows.push(c);
         self.links.push(link);
         self.block_offsets.push(offset);
+        self.block_word_counts.push(word_count);
         self.rows.len() - 1
     }
 
     fn cv_link(&self) -> Link {
         Link {
-            cv: self.cv_row.map_or(CvSource::Iv, CvSource::Row),
+            cv: self.cv_source,
             right: None,
             repeats: None,
         }
@@ -530,12 +584,40 @@ impl FsChainSponge {
                 (self.cv, m, 0, BLOCK_BYTES as u32, CHAIN_ABSORB),
                 link,
                 Some(self.buf_offset),
+                4,
             );
             self.cv = out[..8].try_into().expect("8 words");
-            self.cv_row = Some(row);
+            self.cv_source = CvSource::Row(row);
             self.buf.drain(..BLOCK_BYTES);
             self.buf_offset += BLOCK_BYTES;
         }
+    }
+
+    /// Absorb while retaining the final full block. A fused PoW row must
+    /// contain the nonce in the same compression that produces the challenge,
+    /// so an exactly-full pending block cannot become an ordinary absorb row.
+    pub fn absorb_hold_last_block(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+        self.absorbed += bytes.len();
+        while self.buf.len() > BLOCK_BYTES {
+            self.compress_absorb_block();
+        }
+    }
+
+    fn compress_absorb_block(&mut self) {
+        let m = words(&self.buf[..BLOCK_BYTES]);
+        let out = blake3_compress(&self.cv, &m, 0, BLOCK_BYTES as u32, CHAIN_ABSORB);
+        let link = self.cv_link();
+        let row = self.emit(
+            (self.cv, m, 0, BLOCK_BYTES as u32, CHAIN_ABSORB),
+            link,
+            Some(self.buf_offset),
+            4,
+        );
+        self.cv = out[..8].try_into().expect("8 words");
+        self.cv_source = CvSource::Row(row);
+        self.buf.drain(..BLOCK_BYTES);
+        self.buf_offset += BLOCK_BYTES;
     }
 
     /// Duplex squeeze (transcript-v3): the FIRST output row consumes the
@@ -562,9 +644,14 @@ impl FsChainSponge {
             };
             let o = blake3_compress(&self.cv, &m, 0, blen, CHAIN_SQUEEZE);
             let link = self.cv_link();
-            let row = self.emit((self.cv, m, 0, blen, CHAIN_SQUEEZE), link, offset);
+            let row = self.emit(
+                (self.cv, m, 0, blen, CHAIN_SQUEEZE),
+                link,
+                offset,
+                (blen as usize).div_ceil(16),
+            );
             self.cv = o[..8].try_into().expect("8 words");
-            self.cv_row = Some(row);
+            self.cv_source = CvSource::Row(row);
             ids.push(row);
             for w in o.iter() {
                 bytes.extend_from_slice(&w.to_le_bytes());
@@ -574,6 +661,81 @@ impl FsChainSponge {
         self.buf.clear();
         self.buf_offset = self.absorbed;
         bytes.truncate(out_bytes);
+        self.squeeze_words.push(
+            ids.iter()
+                .flat_map(|&row| (0..4).map(move |word| (row, word)))
+                .take(out_bytes.div_ceil(16))
+                .collect(),
+        );
+        self.squeezes.push(ids);
+        bytes
+    }
+
+    /// Fuse verification of the recorded PoW nonce with the first squeeze
+    /// compression. Output word 1 is reserved for the zero-prefix predicate;
+    /// challenge words are 0, 2, 3, followed by ordinary continuation rows.
+    pub fn finalize_pow(&mut self, out_bytes: usize, bits: u32) -> Vec<u8> {
+        assert!(bits <= 128, "fused PoW predicate occupies one F128 word");
+        assert!(!self.buf.is_empty() && self.buf.len() <= BLOCK_BYTES);
+        assert_eq!(self.buf.len() % 16, 0, "transcript words are 16-byte aligned");
+
+        let word_count = self.buf.len() / 16;
+        let m = words(&self.buf);
+        let counter = pow_squeeze_counter(bits, self.buf.len());
+        let out = blake3_compress(
+            &self.cv,
+            &m,
+            counter,
+            BLOCK_BYTES as u32,
+            CHAIN_SQUEEZE,
+        );
+        let link = self.cv_link();
+        let row = self.emit(
+            (self.cv, m, counter, BLOCK_BYTES as u32, CHAIN_SQUEEZE),
+            link,
+            Some(self.buf_offset),
+            word_count,
+        );
+        self.cv = out[8..16].try_into().expect("8 words");
+        self.cv_source = CvSource::RowHi(row);
+
+        let wanted_words = out_bytes.div_ceil(16);
+        let mut sources = Vec::with_capacity(wanted_words);
+        let mut bytes = Vec::with_capacity(wanted_words * 16);
+        for word in [0usize, 2, 3].into_iter().take(wanted_words) {
+            sources.push((row, word));
+            for limb in &out[word * 4..word * 4 + 4] {
+                bytes.extend_from_slice(&limb.to_le_bytes());
+            }
+        }
+        let mut ids = vec![row];
+        while sources.len() < wanted_words {
+            let zero = [0u32; 16];
+            let o = blake3_compress(&self.cv, &zero, 0, 0, CHAIN_SQUEEZE);
+            let link = self.cv_link();
+            let continuation = self.emit(
+                (self.cv, zero, 0, 0, CHAIN_SQUEEZE),
+                link,
+                None,
+                0,
+            );
+            self.cv = o[..8].try_into().expect("8 words");
+            self.cv_source = CvSource::Row(continuation);
+            ids.push(continuation);
+            for word in 0..4 {
+                if sources.len() == wanted_words {
+                    break;
+                }
+                sources.push((continuation, word));
+                for limb in &o[word * 4..word * 4 + 4] {
+                    bytes.extend_from_slice(&limb.to_le_bytes());
+                }
+            }
+        }
+        self.buf.clear();
+        self.buf_offset = self.absorbed;
+        bytes.truncate(out_bytes);
+        self.squeeze_words.push(sources);
         self.squeezes.push(ids);
         bytes
     }
@@ -583,7 +745,9 @@ impl FsChainSponge {
             rows: self.rows,
             links: self.links,
             squeezes: self.squeezes,
+            squeeze_words: self.squeeze_words,
             block_offsets: self.block_offsets,
+            block_word_counts: self.block_word_counts,
         }
     }
 }
@@ -603,7 +767,7 @@ mod tests {
         // Drive both through the SAME op schedule via the recording layer:
         // absorb framed values exactly as the challenger frames them.
         let mut ch = FsChallenger::with_chained_blake3(b"sponge-diff");
-        let mut rec_bytes: Vec<u8> = Vec::new();
+        let rec_bytes: Vec<u8> = Vec::new();
         // Reproduce the challenger's framing byte-for-byte using the
         // recording of a twin transcript.
         use flock_core::transcript_record::RecordingChallenger;
@@ -845,5 +1009,75 @@ mod tests {
             chal(&child.trace, child.digest_squeeze),
             "the parent's merge word is the child's closing-squeeze output"
         );
+    }
+
+    #[test]
+    fn fused_pow_squeeze_trace_matches_recorded_challenger() {
+        use flock_core::challenger::{Challenger, FsChallenger};
+        use flock_core::transcript_record::RecordingChallenger;
+
+        let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(b"pow-trace"));
+        rec.observe_f128_slice(&[
+            F128::new(1, 2),
+            F128::new(3, 4),
+            F128::new(5, 6),
+            F128::new(7, 8),
+            F128::new(9, 10),
+        ]);
+        let (nonce, protected) = rec.grind_pow_and_sample_f128_vec(5, 7);
+        rec.observe_f128(F128::new(11, 12));
+        let after = rec.sample_f128();
+
+        let shape = rec.shape();
+        let stream = shape.stream_words_duplex(b"pow-trace");
+        let bytes = stream.to_bytes(rec.values(), rec.payloads());
+        let trace = trace_duplex(&stream, &bytes, shape.ops());
+
+        assert_eq!(trace.squeezes.len(), 2);
+        assert_eq!(trace.squeeze_words[0].len(), 7);
+        assert_eq!(trace.squeeze_words[0][..3], [(trace.squeezes[0][0], 0), (trace.squeezes[0][0], 2), (trace.squeezes[0][0], 3)]);
+        assert!(matches!(trace.links[trace.squeezes[0][0] + 1].cv, CvSource::RowHi(r) if r == trace.squeezes[0][0]));
+
+        let read = |fin: usize, offset: usize| {
+            let (row, word) = trace.squeeze_words[fin][offset];
+            let (cv, m, counter, blen, flags) = trace.rows[row];
+            let out = blake3_compress(&cv, &m, counter, blen, flags);
+            let mut b = [0u8; 16];
+            for (i, limb) in out[word * 4..word * 4 + 4].iter().enumerate() {
+                b[4 * i..4 * i + 4].copy_from_slice(&limb.to_le_bytes());
+            }
+            F128::new(
+                u64::from_le_bytes(b[..8].try_into().unwrap()),
+                u64::from_le_bytes(b[8..].try_into().unwrap()),
+            )
+        };
+        assert_eq!((0..7).map(|i| read(0, i)).collect::<Vec<_>>(), protected);
+        assert_eq!(read(1, 0), after);
+
+        let pow_row = trace.squeezes[0][0];
+        let out = {
+            let (cv, m, counter, blen, flags) = trace.rows[pow_row];
+            blake3_compress(&cv, &m, counter, blen, flags)
+        };
+        let mut predicate = [0u8; 16];
+        for (i, limb) in out[4..8].iter().enumerate() {
+            predicate[4 * i..4 * i + 4].copy_from_slice(&limb.to_le_bytes());
+        }
+        assert_eq!(predicate[0] & 0b1111_1000, 0);
+        let nonce_word = F128::new(nonce, 0);
+        let nonce_at = stream
+            .words
+            .iter()
+            .position(|w| matches!(w, flock_core::transcript_record::StreamWord::Bytes { payload, .. } if rec.payloads()[*payload] == nonce.to_le_bytes()))
+            .expect("nonce word");
+        assert_eq!(
+            F128::new(
+                u64::from_le_bytes(bytes[16 * nonce_at..16 * nonce_at + 8].try_into().unwrap()),
+                u64::from_le_bytes(bytes[16 * nonce_at + 8..16 * nonce_at + 16].try_into().unwrap()),
+            ),
+            nonce_word,
+        );
+        assert_eq!(trace.rows[pow_row].3, 64);
+        assert!((1..=4).contains(&trace.block_word_counts[pow_row]));
     }
 }

@@ -2100,14 +2100,21 @@ fn mvp4_slice(depth: usize, n_queries: usize, nu: usize) {
             Some(right) => {
                 let l = match link.cv {
                     CvSource::Row(r) => r,
+                    CvSource::RowHi(r) => r,
                     CvSource::Iv => unreachable!(),
                 };
-                (iv, [outs[l][0], outs[l][1], outs[right][0], outs[right][1]])
+                let left = match link.cv {
+                    CvSource::Row(_) => [outs[l][0], outs[l][1]],
+                    CvSource::RowHi(_) => [outs[l][2], outs[l][3]],
+                    CvSource::Iv => unreachable!(),
+                };
+                (iv, [left[0], left[1], outs[right][0], outs[right][1]])
             }
             None => {
                 let cv_in = match link.cv {
                     CvSource::Iv => iv,
                     CvSource::Row(r) => [outs[r][0], outs[r][1]],
+                    CvSource::RowHi(r) => [outs[r][2], outs[r][3]],
                 };
                 let base = trace.block_offsets[i].expect("stream block") / 16;
                 let real = (blen as usize) / 16;
@@ -2150,8 +2157,9 @@ fn mvp4_slice(depth: usize, n_queries: usize, nu: usize) {
     // **The binding.** Challenge `k` is output `k % 4` of the squeeze's block
     // `k / 4` — so this is the wire, and there is no other route from the
     // transcript to a query.
-    let sq = &trace.squeezes[0];
-    let challenge_w: Vec<Wire> = (0..n_queries).map(|k| outs[sq[k / 4]][k % 4]).collect();
+    let challenge_w: Vec<Wire> = (0..n_queries)
+        .map(|k| squeeze_word_wire(&outs, &trace, 0, k))
+        .collect();
 
     // The openings, and the arithmetic on them.
     let v_w: Vec<Wire> = (0..LE_VARS).map(|_| sb.public_input()).collect();
@@ -2689,17 +2697,24 @@ fn mvp5_all_levels_query_phase() {
             Some(right) => {
                 let l = match link.cv {
                     CvSource::Row(r) => r,
+                    CvSource::RowHi(r) => r,
                     CvSource::Iv => unreachable!(),
                 };
-                (iv, [outs[l][0], outs[l][1], outs[right][0], outs[right][1]])
+                let left = match link.cv {
+                    CvSource::Row(_) => [outs[l][0], outs[l][1]],
+                    CvSource::RowHi(_) => [outs[l][2], outs[l][3]],
+                    CvSource::Iv => unreachable!(),
+                };
+                (iv, [left[0], left[1], outs[right][0], outs[right][1]])
             }
             None => {
                 let cv_in = match link.cv {
                     CvSource::Iv => iv,
                     CvSource::Row(r) => [outs[r][0], outs[r][1]],
+                    CvSource::RowHi(r) => [outs[r][2], outs[r][3]],
                 };
                 let base = trace.block_offsets[i].expect("stream block") / 16;
-                let real = (blen as usize) / 16;
+                let real = trace.block_word_counts[i];
                 let mut m = [iv[0]; 4];
                 for (j, slot) in m.iter_mut().enumerate() {
                     let wi = base + j;
@@ -2740,12 +2755,11 @@ fn mvp5_all_levels_query_phase() {
     let mut acc = sb.public_input();
     let mut all_roots: Vec<Vec<Vec<Wire>>> = Vec::new();
     for (li, l) in levels.iter().enumerate() {
-        let sq = &trace.squeezes[li];
         let vars = l.lanes.trailing_zeros() as usize;
         let vs: Vec<Wire> = (0..vars).map(|_| sb.public_input()).collect();
         let mut roots = Vec::with_capacity(l.queries);
         for k in 0..l.queries {
-            let cw = outs[sq[k / 4]][k % 4];
+            let cw = squeeze_word_wire(&outs, &trace, li, k);
             let leaf_w: Vec<Wire> = (0..l.lanes).map(|_| sb.input()).collect();
             let mut m_in = leaf_w.clone();
             m_in.push(cw);
@@ -3022,15 +3036,15 @@ fn cw(sb: &mut ShapeBuilder, vals: &mut Vec<F128>, consts: &mut Vec<(F128, Wire)
 /// Which byte payloads of a tape stay PUBLIC under the witness/public
 /// split: every `observe_bytes` payload — the STATEMENT surfaces (registry
 /// digest, counts, caps, a child's circuit digest + public words) and
-/// nothing else. PoW nonces share the payload counter but are witness (their
-/// wires publish separately where the grinding checker reads them).
+/// nothing else. PoW nonces share the payload counter but remain private
+/// witnesses constrained by the fused BLAKE3 and bit-spread rows.
 fn bytes_payload_mask(ops: &[flock_core::transcript_record::TranscriptOp]) -> Vec<bool> {
     use flock_core::transcript_record::TranscriptOp as Op;
     let mut v = Vec::new();
     for op in ops {
         match op {
             Op::ObserveBytes(_) => v.push(true),
-            Op::Pow { .. } => v.push(false),
+            Op::Pow { .. } | Op::LegacyPow { .. } => v.push(false),
             _ => {}
         }
     }
@@ -3092,9 +3106,15 @@ fn emit_fs_chain(
             Some(right) => {
                 let l = match link.cv {
                     CvSource::Row(r) => r,
+                    CvSource::RowHi(r) => r,
                     CvSource::Iv => unreachable!(),
                 };
-                (iv, [outs[l][0], outs[l][1], outs[right][0], outs[right][1]])
+                let left = match link.cv {
+                    CvSource::Row(_) => [outs[l][0], outs[l][1]],
+                    CvSource::RowHi(_) => [outs[l][2], outs[l][3]],
+                    CvSource::Iv => unreachable!(),
+                };
+                (iv, [left[0], left[1], outs[right][0], outs[right][1]])
             }
             None if trace.block_offsets[i].is_none() => {
                 // A sponge-chain SQUEEZE output row (transcript-v2): zero
@@ -3103,6 +3123,7 @@ fn emit_fs_chain(
                 let cv_in = match link.cv {
                     CvSource::Iv => iv,
                     CvSource::Row(r) => [outs[r][0], outs[r][1]],
+                    CvSource::RowHi(r) => [outs[r][2], outs[r][3]],
                 };
                 let z4 = cw(sb, vals, consts, F128::ZERO);
                 (cv_in, [z4, z4, z4, z4])
@@ -3111,9 +3132,10 @@ fn emit_fs_chain(
                 let cv_in = match link.cv {
                     CvSource::Iv => iv,
                     CvSource::Row(r) => [outs[r][0], outs[r][1]],
+                    CvSource::RowHi(r) => [outs[r][2], outs[r][3]],
                 };
                 let base = trace.block_offsets[i].expect("stream block") / 16;
-                let real = (blen as usize) / 16;
+                let real = trace.block_word_counts[i];
                 let mut m = [iv[0]; 4];
                 for (j, slot) in m.iter_mut().enumerate() {
                     let wi = base + j;
@@ -3225,8 +3247,6 @@ fn flatten_ops(
 /// inputs. Splicing at the fork point is what makes that possible — both
 /// sources are already emitted when their consumer's row comes up.
 struct MergedChain {
-    /// [`flatten_ops`] of the recorded ops — what every locator should walk.
-    ops: Vec<flock_core::transcript_record::TranscriptOp>,
     /// Parent words then child words, in the same order as `trace`'s rows.
     stream: flock_core::transcript_record::Stream,
     bytes: Vec<u8>,
@@ -3246,12 +3266,10 @@ fn merge_chain(
     use flock_core::transcript_record::StreamWord;
     use flock_prover::r1cs_hashes::fs_chain::{CvSource, Link, trace_duplex_forked};
     let chains = trace_duplex_forked(ops, stream, values, payloads);
-    let flat = flatten_ops(ops);
     let parent_bytes = stream.to_bytes(values, payloads);
     if chains.children.is_empty() {
         let cross = vec![None; stream.words.len()];
         return MergedChain {
-            ops: flat,
             stream: stream.clone(),
             bytes: parent_bytes,
             trace: chains.parent,
@@ -3296,6 +3314,7 @@ fn merge_chain(
         cv: match l.cv {
             CvSource::Iv => CvSource::Iv,
             CvSource::Row(r) => CvSource::Row(f(r)),
+            CvSource::RowHi(r) => CvSource::RowHi(f(r)),
         },
         right: l.right.map(&*f),
         repeats: l.repeats.map(&*f),
@@ -3313,6 +3332,7 @@ fn merge_chain(
     let mut rows = Vec::new();
     let mut links: Vec<Link> = Vec::new();
     let mut block_offsets = Vec::new();
+    let mut block_word_counts = Vec::new();
     let mut at = 0usize;
     for i in 0..n_ch {
         let c = &chains.children[i];
@@ -3320,6 +3340,7 @@ fn merge_chain(
         rows.extend_from_slice(&p.rows[at..splits[i]]);
         links.extend(p.links[at..splits[i]].iter().map(|l| remap(l, &pmap)));
         block_offsets.extend_from_slice(&p.block_offsets[at..splits[i]]);
+        block_word_counts.extend_from_slice(&p.block_word_counts[at..splits[i]]);
         rows.extend_from_slice(&c.trace.rows);
         links.extend(c.trace.links.iter().map(|l| remap(l, &cm)));
         block_offsets.extend(
@@ -3328,14 +3349,17 @@ fn merge_chain(
                 .iter()
                 .map(|o| o.map(|b| b + woffs[i] * 16)),
         );
+        block_word_counts.extend_from_slice(&c.trace.block_word_counts);
         at = splits[i];
     }
     rows.extend_from_slice(&p.rows[at..]);
     links.extend(p.links[at..].iter().map(|l| remap(l, &pmap)));
     block_offsets.extend_from_slice(&p.block_offsets[at..]);
+    block_word_counts.extend_from_slice(&p.block_word_counts[at..]);
 
     // The same splice on the squeeze list, the words and the finalize points.
     let mut squeezes: Vec<Vec<usize>> = Vec::new();
+    let mut squeeze_words: Vec<Vec<(usize, usize)>> = Vec::new();
     let mut words = stream.words.clone();
     let mut finalize_after: Vec<usize> = Vec::new();
     let mut bytes = parent_bytes;
@@ -3348,11 +3372,22 @@ fn merge_chain(
                 .iter()
                 .map(|s| s.iter().copied().map(pmap).collect::<Vec<_>>()),
         );
+        squeeze_words.extend(
+            p.squeeze_words[at..=last_seed[i]]
+                .iter()
+                .map(|s| s.iter().map(|&(r, w)| (pmap(r), w)).collect::<Vec<_>>()),
+        );
         squeezes.extend(
             c.trace
                 .squeezes
                 .iter()
                 .map(|s| s.iter().copied().map(&cm).collect::<Vec<_>>()),
+        );
+        squeeze_words.extend(
+            c.trace
+                .squeeze_words
+                .iter()
+                .map(|s| s.iter().map(|&(r, w)| (cm(r), w)).collect::<Vec<_>>()),
         );
         finalize_after.extend_from_slice(&stream.finalize_after[at..=last_seed[i]]);
         finalize_after.extend(cstreams[i].finalize_after.iter().map(|w| w + woffs[i]));
@@ -3364,6 +3399,11 @@ fn merge_chain(
         p.squeezes[at..]
             .iter()
             .map(|s| s.iter().copied().map(pmap).collect::<Vec<_>>()),
+    );
+    squeeze_words.extend(
+        p.squeeze_words[at..]
+            .iter()
+            .map(|s| s.iter().map(|&(r, w)| (pmap(r), w)).collect::<Vec<_>>()),
     );
     finalize_after.extend_from_slice(&stream.finalize_after[at..]);
 
@@ -3416,7 +3456,6 @@ fn merge_chain(
         "each fork contributes exactly four cross-link words"
     );
     MergedChain {
-        ops: flat,
         stream: flock_core::transcript_record::Stream {
             words,
             finalize_after,
@@ -3427,13 +3466,15 @@ fn merge_chain(
             rows,
             links,
             squeezes,
+            squeeze_words,
             block_offsets,
+            block_word_counts,
         },
         cross,
     }
 }
 
-/// THE SPLICE DIFFERENTIAL: every scalar challenge the recorder produced must
+/// THE SPLICE DIFFERENTIAL: every challenge the recorder produced must
 /// fall back out of the merged chain at its flattened finalize ordinal.
 ///
 /// This is what makes [`merge_chain`] trustworthy rather than merely
@@ -3449,13 +3490,19 @@ fn assert_chain_replays(
     use flock_core::transcript_record::TranscriptOp as Op;
     let (mut fin, mut ch, mut checked) = (0usize, 0usize, 0usize);
     for op in ops {
-        if matches!(op, Op::SqueezeScalar) {
-            let (cv, m, counter, blen, flags) = trace.rows[trace.squeezes[fin][0]];
+        let n = match op {
+            Op::SqueezeScalar => 1,
+            Op::SqueezeSlice(n) => *n,
+            _ => 0,
+        };
+        for j in 0..n {
+            let (row, word) = trace.squeeze_words[fin][j];
+            let (cv, m, counter, blen, flags) = trace.rows[row];
             let out = flock_prover::r1cs_hashes::blake3::blake3_compress(
                 &cv, &m, counter, blen, flags,
             );
             let mut b = [0u8; 16];
-            for (i, w) in out[..4].iter().enumerate() {
+            for (i, w) in out[word * 4..word * 4 + 4].iter().enumerate() {
                 b[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
             }
             assert_eq!(
@@ -3463,8 +3510,9 @@ fn assert_chain_replays(
                     u64::from_le_bytes(b[..8].try_into().unwrap()),
                     u64::from_le_bytes(b[8..].try_into().unwrap()),
                 ),
-                chals[ch],
-                "the merged chain diverges at finalize {fin} (challenge {ch})"
+                chals[ch + j],
+                "the merged chain diverges at finalize {fin}, word {j} (challenge {})",
+                ch + j,
             );
             checked += 1;
         }
@@ -3480,6 +3528,65 @@ fn assert_chain_replays(
     assert!(checked > 0, "no scalar squeezes to replay");
     assert_eq!(fin, trace.squeezes.len(), "finalize count vs squeeze rows");
     assert_eq!(ch, chals.len(), "challenge count vs the recorded list");
+}
+
+/// Independent row count for the duplex transcript, including every fork as
+/// its own IV-rooted chain.  It deliberately derives absorption from the
+/// serialized stream rather than from [`FsChainTrace`].
+fn duplex_row_count_model(
+    ops: &[flock_core::transcript_record::TranscriptOp],
+    stream: &flock_core::transcript_record::Stream,
+) -> usize {
+    use flock_core::transcript_record::TranscriptOp as Op;
+
+    let mut pending_pow = None;
+    let mut finals: Vec<(&Op, Option<u32>)> = Vec::new();
+    for op in ops {
+        match op {
+            Op::Pow { bits } => {
+                assert!(pending_pow.replace(*bits).is_none(), "nested fused PoW markers");
+            }
+            op if op.finalizes() => finals.push((op, pending_pow.take())),
+            Op::Forked { .. } => {}
+            _ => assert!(pending_pow.is_none(), "fused PoW must precede its squeeze"),
+        }
+    }
+    assert!(pending_pow.is_none(), "fused PoW marker without a squeeze");
+    assert_eq!(finals.len(), stream.finalize_after.len());
+
+    let (mut rows, mut at, mut pending) = (0usize, 0usize, 0usize);
+    for (k, &upto) in stream.finalize_after.iter().enumerate() {
+        pending += 16 * (upto - at);
+        at = upto;
+        let (op, pow_bits) = finals[k];
+        let words = op.squeezed_bytes() / 16;
+        if pow_bits.is_some() {
+            // Retain the final (possibly full) block for the fused row.
+            rows += pending.saturating_sub(1) / 64;
+            rows += 1 + words.saturating_sub(3).div_ceil(4);
+        } else {
+            // Ordinary absorb drains every full block before the squeeze.
+            rows += pending / 64;
+            rows += 1 + words.saturating_sub(4).div_ceil(4);
+        }
+        pending = 0;
+    }
+    pending += 16 * (stream.words.len() - at);
+    rows += pending / 64;
+
+    let children: Vec<_> = ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::Forked { label, ops } => Some((label, ops)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(children.len(), stream.forks.len());
+    for ((label, child_ops), child_stream) in children.into_iter().zip(&stream.forks) {
+        assert_eq!(label, &child_stream.label);
+        rows += duplex_row_count_model(child_ops, &child_stream.stream);
+    }
+    rows
 }
 
 /// The sumcheck-spine gate: one fold-and-eval step of the verifier's running
@@ -4585,12 +4692,12 @@ struct PdRec {
 #[inline]
 fn squeeze_word_wire(
     outs: &[Vec<Wire>],
-    squeezes: &[Vec<usize>],
+    trace: &flock_prover::r1cs_hashes::fs_chain::FsChainTrace,
     fin: usize,
     offset: usize,
 ) -> Wire {
-    let rows = &squeezes[fin];
-    outs[rows[offset / 4]][offset % 4]
+    let (row, word) = trace.squeeze_words[fin][offset];
+    outs[row][word]
 }
 
 /// One merged W-round: the (G(1), G(inf)) value index and the rho squeeze.
@@ -5314,9 +5421,9 @@ fn mvp7_real_query_phase() {
     }
 
     // ---- PoW grinding ops, located on the tape ----
-    // Each Pow op finalizes the chain (the state digest — output wires the
-    // replay already computes) and absorbs one aligned 8-byte nonce word
-    // (a Bytes payload). Record (finalize ordinal, payload ordinal, bits).
+    // Each fused Pow marker contributes one aligned 8-byte nonce word (a
+    // Bytes payload); the following squeeze exposes its predicate and
+    // challenges. Record (squeeze ordinal, payload ordinal, bits).
     struct PowRec {
         fin: usize,
         pay: usize,
@@ -5450,7 +5557,7 @@ fn mvp7_real_query_phase() {
         &levels,
         &geo,
         &lvl_src,
-        &trace.squeezes,
+        &trace,
         &outs,
         &chals,
         &cap_w,
@@ -5500,8 +5607,7 @@ fn mvp7_real_query_phase() {
     let mut zr = zw;
     let mut zc_deltas: Vec<Wire> = Vec::new();
     for (i, rr) in piop.zc_rounds.iter().enumerate() {
-        let sqt = &trace.squeezes[piop.tau_fin];
-        let t_w = outs[sqt[i / 4]][i % 4];
+        let t_w = squeeze_word_wire(&outs, &trace, piop.tau_fin, i);
         let rho_w = chw(&outs, &trace.squeezes, rr.fin);
         vals.push(zc_natives[i]);
         let g0w = sb.public_input();
@@ -5551,7 +5657,7 @@ fn mvp7_real_query_phase() {
     // Outer target: SpineGate tr-rows accumulate gamma_k * value_k.
     let mut mt = zw;
     for pd in &gammas {
-        let gw = squeeze_word_wire(&outs, &trace.squeezes, pd.fin, pd.squeeze_offset);
+        let gw = squeeze_word_wire(&outs, &trace, pd.fin, pd.squeeze_offset);
         let f = sb.gate(spine, &[zw, zw, zw, mt, zw, zw, wv(pd.val_v), gw, zw]);
         mt = f[3];
     }
@@ -5618,7 +5724,7 @@ fn mvp7_real_query_phase() {
         &w_rounds,
         inner_pd.fin,
         &yr_wires,
-        &trace.squeezes,
+        &trace,
         &outs,
         &chals,
         &mut vals,
@@ -5775,7 +5881,7 @@ fn mvp7_real_query_phase() {
         };
         for &i in members {
             let pd = &gammas[i];
-            let gpd_w = squeeze_word_wire(&outs, &trace.squeezes, pd.fin, pd.squeeze_offset);
+            let gpd_w = squeeze_word_wire(&outs, &trace, pd.fin, pd.squeeze_offset);
             let mut tail = ow;
             for r in 0..n_single {
                 let y = r as u64;
@@ -5822,12 +5928,10 @@ fn mvp7_real_query_phase() {
     let delta_anchor = sb.gate(macslot, &[acl, expect, ow])[0];
 
     // ---- the PoW bit predicate ----
-    // Per Pow op, retain (state-digest words, nonce word): the digest is the
-    // chain finalize's first two output words, the nonce its aligned stream
-    // word. `emit_pow_checks` below hashes and checks these wires INSIDE the
-    // relation.  They remain published only as a native differential oracle;
-    // recursive soundness no longer depends on that boundary check.
-    let pow_pub: Vec<[Wire; 3]> = pows
+    // Per fused Pow op, retain its predicate output and aligned nonce word.
+    // `emit_pow_checks` constrains both INSIDE the relation; proof-witness
+    // material is deliberately not re-published in the recursive statement.
+    let pow_wires: Vec<[Wire; 2]> = pows
         .iter()
         .map(|pr| {
             let sq = &trace.squeezes[pr.fin];
@@ -5837,10 +5941,10 @@ fn mvp7_real_query_phase() {
                 .position(|w| matches!(w, flock_core::transcript_record::StreamWord::Bytes { payload, .. } if *payload == pr.pay))
                 .expect("pow nonce stream word");
             let nw = word_wire[wi].expect("pow nonce wired");
-            [outs[sq[0]][0], outs[sq[0]][1], nw]
+            [outs[sq[0]][1], nw]
         })
         .collect();
-    let pow_checks: Vec<([Wire; 3], u32)> = pow_pub
+    let pow_checks: Vec<([Wire; 2], u32)> = pow_wires
         .iter()
         .zip(&pows)
         .map(|(&w, pr)| (w, pr.bits))
@@ -5896,11 +6000,6 @@ fn mvp7_real_query_phase() {
     sb.publish(delta_tm);
     sb.publish(delta_rq);
     sb.publish(delta_anchor);
-    for p in &pow_pub {
-        for w in p {
-            sb.publish(*w);
-        }
-    }
     for w in &assertion_pub {
         sb.publish(*w);
     }
@@ -5913,10 +6012,8 @@ fn mvp7_real_query_phase() {
 
     // ---- the boundary checks ----
     // The tail publics: three multipoint zero-deltas (T_m == anchor.v,
-    // running_W == q_eval·V, claim == expect), per-Pow (digest word0,
-    // digest word1, nonce word) triples the checker re-validates as a
-    // differential oracle (the relation already enforces them), then the
-    // emitted ElementAssertion fields.
+    // running_W == q_eval·V, claim == expect), then the emitted
+    // ElementAssertion fields. PoW witness material stays private.
     let n_assert = 1 + piop.zc_rounds.len() + piop.lc_rounds.len() + 3;
     let assert_base = built.public.len() - n_assert;
     {
@@ -5937,37 +6034,12 @@ fn mvp7_real_query_phase() {
         // absorbed c-claim value.
         assert_eq!(built.public[at + 2], vals_rec[gammas[0].val_v], "assertion z_eval");
     }
-    let pow_base = assert_base - 3 * pows.len();
     for (i, off) in [3, 2, 1].into_iter().enumerate() {
         assert_eq!(
-            built.public[pow_base - off],
+            built.public[assert_base - off],
             F128::ZERO,
             "multipoint zero-delta {i}"
         );
-    }
-    for (i, pr) in pows.iter().enumerate() {
-        let d0 = built.public[pow_base + 3 * i];
-        let d1 = built.public[pow_base + 3 * i + 1];
-        let nn = built.public[pow_base + 3 * i + 2];
-        let mut digest = [0u8; 32];
-        digest[..8].copy_from_slice(&d0.lo.to_le_bytes());
-        digest[8..16].copy_from_slice(&d0.hi.to_le_bytes());
-        digest[16..24].copy_from_slice(&d1.lo.to_le_bytes());
-        digest[24..].copy_from_slice(&d1.hi.to_le_bytes());
-        assert_eq!(nn.hi, 0, "pow {i}: nonce word is 8 bytes zero-padded");
-        if pr.bits == 0 {
-            assert_eq!(nn.lo, 0, "pow {i}: canonical zero nonce");
-        } else {
-            assert!(
-                flock_core::challenger::pow_has_leading_zero_bits(
-                    &digest,
-                    nn.lo,
-                    pr.bits,
-                    HashKind::Blake3,
-                ),
-                "pow {i}: grinding predicate on the published wires"
-            );
-        }
     }
     let yr_pub = levels.len() * yr_len
         + 1
@@ -5975,7 +6047,6 @@ fn mvp7_real_query_phase() {
         + piop.zc_rounds.len()
         + 3
         + 3
-        + 3 * pows.len()
         + n_assert;
     let total_pub: usize = 1 + yr_pub
         + levels.iter().map(|l| l.a_count).sum::<usize>();
@@ -6722,7 +6793,7 @@ fn emit_query_phase(
     levels: &[OpenLevel],
     geo: &[Lvl],
     lvl_src: &[(&[[u8; 32]], &Vec<Vec<F128>>, &Vec<[u8; 32]>)],
-    sq: &[Vec<usize>],
+    trace: &flock_prover::r1cs_hashes::fs_chain::FsChainTrace,
     outs: &[Vec<Wire>],
     chals: &[F128],
     cap_w: &[Vec<[Wire; 2]>],
@@ -6736,8 +6807,6 @@ fn emit_query_phase(
     for (li, lvl) in levels.iter().enumerate() {
         let g = &geo[li];
         let (_cap, rows, paths) = lvl_src[li];
-        let sqq = &sq[lvl.q_fin];
-        let sqa = &sq[lvl.a_fin];
         // Terminals: the upper layers from the cap wires to the shallowest
         // summand (2^c − 2^c_min PARENT rows, NO root) — each query's path
         // stops at its stratum depth and connects to its schedule-constant
@@ -6776,9 +6845,15 @@ fn emit_query_phase(
         // `cw` helper is shadowed by the challenge wire inside the loop).
         let parent_params = cw(sb, vals, consts, pack_params(0, 64, PARENT));
         // alpha words: chain outputs, PUBLISHED for the checker's expansion.
-        let a_wires: Vec<Wire> = (0..lvl.a_count).map(|j| outs[sqa[j / 4]][j % 4]).collect();
+        let a_wires: Vec<Wire> = (0..lvl.a_count)
+            .map(|j| squeeze_word_wire(outs, trace, lvl.a_fin, j))
+            .collect();
         // v: this level's fold challenges, chain outputs, wired straight in.
-        let v_wires: Vec<Wire> = lvl.fold_fins.iter().map(|&f| outs[sq[f][0]][0]).collect();
+        let v_wires: Vec<Wire> = lvl
+            .fold_fins
+            .iter()
+            .map(|&f| squeeze_word_wire(outs, trace, f, 0))
+            .collect();
         let alpha_vals: Vec<F128> = (0..lvl.a_count).map(|j| chals[lvl.a_ch + j]).collect();
         let aw = build_eq_table(&alpha_vals);
         // The hi-group weights of the leaf-eval split: eq over the native
@@ -6800,7 +6875,7 @@ fn emit_query_phase(
         for k in 0..g.q {
             vals.extend_from_slice(&rows[k]);
             let leaf_w: Vec<Wire> = (0..g.row_words).map(|_| sb.input()).collect();
-            let cw = outs[sqq[k / 4]][k % 4];
+            let cw = squeeze_word_wire(outs, trace, lvl.q_fin, k);
             let (ck, stratum) = g.q_stratum(k);
             let open_depth = g.depth - ck;
             let cv = emit_opening(
@@ -6909,7 +6984,7 @@ fn emit_residual_region(
     w_rounds: &[RoundRec],
     inner_pd_fin: usize,
     yr_wires: &[Wire],
-    sq: &[Vec<usize>],
+    trace: &flock_prover::r1cs_hashes::fs_chain::FsChainTrace,
     outs: &[Vec<Wire>],
     chals: &[F128],
     vals: &mut Vec<F128>,
@@ -6928,7 +7003,7 @@ fn emit_residual_region(
     let chunk = 1usize << chunk_log;
     let n_chunks = 1usize << (yr_log - chunk_log);
     let inv = |v: F128| if v == F128::ZERO { F128::ZERO } else { v.inv() };
-    let chw = |fin: usize| -> Wire { outs[sq[fin][0]][0] };
+    let chw = |fin: usize| -> Wire { squeeze_word_wire(outs, trace, fin, 0) };
     let mut resid_pub: Vec<Vec<Wire>> = Vec::new();
     for (li, lvl) in levels.iter().enumerate() {
         let pl: usize = levels[li + 1..].iter().map(|l| l.fold_fins.len()).sum();
@@ -7108,15 +7183,14 @@ fn emit_residual_region(
                 .flat_map(|l| l.fold_fins.iter().map(|&f| chw(f)))
                 .collect();
             assert_eq!(later.len(), folded, "OOD prefix = later folds");
-            let sqz = &sq[od.z_fin];
             let factors: Vec<(Wire, Wire)> = (0..folded)
-                .map(|j| (outs[sqz[j / 4]][j % 4], later[j]))
+                .map(|j| (squeeze_word_wire(outs, trace, od.z_fin, j), later[j]))
                 .collect();
             let pw = prefix_chain(sb, chw(od.beta_fin), &factors);
             let coords: Vec<Wire> = (0..yr_log)
                 .map(|j| {
                     let jj = folded + j;
-                    outs[sqz[jj / 4]][jj % 4]
+                    squeeze_word_wire(outs, trace, od.z_fin, jj)
                 })
                 .collect();
             apply_suffix(sb, &mut evb_accs, pw, &coords);
@@ -7250,51 +7324,44 @@ fn check_residual_publics(
 }
 
 /// BLAKE3 serializes its output words little-endian, while "leading bits"
-/// means most-significant-bit first within each serialized byte.  Return the
-/// two circuit-word masks whose set bits are exactly that prefix.
-fn pow_leading_zero_masks(bits: u32) -> [F128; 2] {
-    assert!(bits <= 256, "a BLAKE3 digest has only 256 bits");
-    let mut masks = [0u128; 2];
+/// means most-significant-bit first within each serialized byte. Return the
+/// circuit-word mask whose set bits are exactly that prefix.
+fn pow_leading_zero_mask(bits: u32) -> F128 {
+    assert!(bits <= 128, "the fused predicate is one F128 word");
+    let mut mask = 0u128;
     for k in 0..bits as usize {
         let serialized_bit = 8 * (k / 8) + (7 - k % 8);
-        masks[serialized_bit / 128] |= 1u128 << (serialized_bit % 128);
+        mask |= 1u128 << serialized_bit;
     }
-    masks.map(|m| F128::new(m as u64, (m >> 64) as u64))
+    F128::new(mask as u64, (mask >> 64) as u64)
 }
 
 /// Arithmetize every grinding operation in a recorded verifier transcript.
 ///
-/// For a nonzero target this emits the exact native predicate
+/// The fused BLAKE3 row has already bound the nonce to the transcript,
+/// advanced the state and produced the protected challenge. This helper adds
+/// only the selected-zero relations
 ///
 /// ```text
-/// h = BLAKE3(state_digest || nonce_le || 0^192)
-/// prefix_bits(h, lambda) = 0^lambda
+/// prefix_bits(predicate_word, lambda) = 0^lambda
 /// nonce[64..128] = 0.
 /// ```
 ///
-/// The one-block hash is a normal row of the shared BLAKE3 table.  The
-/// selected-zero equations are rows of the shared bit-spread table, whose
-/// mask input is a statement constant.  A zero-bit operation performs no
-/// hash (matching `verify_pow`) and instead enforces the canonical nonce 0.
+/// The selected-zero equations are rows of the shared bit-spread table, whose
+/// mask input is a statement constant. A zero-bit operation instead enforces
+/// the canonical nonce 0.
 fn emit_pow_checks(
     sb: &mut ShapeBuilder,
-    b3: flock_core::circuit::builder::SlotId,
+    _b3: flock_core::circuit::builder::SlotId,
     spread: flock_core::circuit::builder::SlotId,
-    iv: [Wire; 2],
-    pows: &[([Wire; 3], u32)],
+    _iv: [Wire; 2],
+    pows: &[([Wire; 2], u32)],
     vals: &mut Vec<F128>,
     consts: &mut Vec<(F128, Wire)>,
 ) {
-    let zero = cw(sb, vals, consts, F128::ZERO);
-    let params = cw(
-        sb,
-        vals,
-        consts,
-        pack_params(0, 64, CHUNK_START | CHUNK_END | ROOT),
-    );
     let nonce_hi_mask = F128::new(0, u64::MAX);
 
-    for &([d0, d1, nonce], bits) in pows {
+    for &([predicate, nonce], bits) in pows {
         // The transcript stream allocates a whole F128 word to the 8-byte
         // nonce.  This constraint is what makes the remaining eight bytes
         // padding rather than an extra grinding knob available to a
@@ -7311,26 +7378,14 @@ fn emit_pow_checks(
             continue;
         }
 
-        // `blake3_pow_preimage` is exactly four circuit words:
-        // digest[0..32], nonce[0..8] plus the now-constrained zero high
-        // half, and one final all-zero word.
-        let h = sb.gate(
-            b3,
-            &[iv[0], iv[1], d0, d1, nonce, zero, params],
-        );
-        let masks = pow_leading_zero_masks(bits);
-        for (digest_word, mask) in [h[0], h[1]].into_iter().zip(masks) {
-            if mask != F128::ZERO {
-                let mask_w = cw(sb, vals, consts, mask);
-                let _ = sb.gate(spread, &[digest_word, mask_w]);
-            }
-        }
+        let mask = pow_leading_zero_mask(bits);
+        let mask_w = cw(sb, vals, consts, mask);
+        let _ = sb.gate(spread, &[predicate, mask_w]);
     }
 }
 
-/// Locate the PoW state-digest finalization and nonce payloads on an
-/// arbitrary recorded tape, turn them into wires from its emitted FS chain,
-/// and constrain every native `verify_pow` call in-circuit.
+/// Locate fused PoW predicate and nonce wires on an arbitrary recorded tape
+/// and constrain every native fused verification call in-circuit.
 #[allow(clippy::too_many_arguments)]
 fn emit_recorded_pow_checks(
     sb: &mut ShapeBuilder,
@@ -7355,11 +7410,11 @@ fn emit_recorded_pow_checks(
         if op.finalizes() {
             fin += 1;
         }
-        if matches!(op, Op::ObserveBytes(_) | Op::Pow { .. }) {
+        if matches!(op, Op::ObserveBytes(_) | Op::Pow { .. } | Op::LegacyPow { .. }) {
             pay += 1;
         }
     }
-    let checks: Vec<([Wire; 3], u32)> = pows
+    let checks: Vec<([Wire; 2], u32)> = pows
         .into_iter()
         .map(|(fin, pay, bits)| {
             let sq = &trace.squeezes[fin];
@@ -7369,7 +7424,7 @@ fn emit_recorded_pow_checks(
                 .position(|w| matches!(w, flock_core::transcript_record::StreamWord::Bytes { payload, .. } if *payload == pay))
                 .expect("pow nonce stream word");
             (
-                [outs[sq[0]][0], outs[sq[0]][1], ww[wi].expect("pow nonce wired")],
+                [outs[sq[0]][1], ww[wi].expect("pow nonce wired")],
                 bits,
             )
         })
@@ -7378,57 +7433,42 @@ fn emit_recorded_pow_checks(
 }
 
 #[test]
-fn recursive_pow_hash_and_masks_match_native() {
-    let mut state_digest = [0u8; 32];
-    for (i, b) in state_digest.iter_mut().enumerate() {
-        *b = (17 * i + 9) as u8;
-    }
-
-    for nonce in 0..64u64 {
-        let mut preimage = [0u8; 64];
-        preimage[..32].copy_from_slice(&state_digest);
-        preimage[32..40].copy_from_slice(&nonce.to_le_bytes());
-        let native_hash = ::blake3::hash(&preimage);
-
-        // Pin the exact single-row BLAKE3 construction used by
-        // `emit_pow_checks`, including ROOT (without it this would only be a
-        // chaining value, not `blake3::hash`).
-        let message: [u32; 16] = std::array::from_fn(|i| {
-            u32::from_le_bytes(preimage[4 * i..4 * i + 4].try_into().unwrap())
-        });
-        let compressed = blake3::blake3_compress(
-            &IV,
-            &message,
-            0,
-            64,
-            CHUNK_START | CHUNK_END | ROOT,
-        );
-        let mut circuit_hash = [0u8; 32];
-        for (i, w) in compressed[..8].iter().enumerate() {
-            circuit_hash[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
-        }
-        assert_eq!(circuit_hash, *native_hash.as_bytes());
-
-        let digest_words = [
-            u128::from_le_bytes(circuit_hash[..16].try_into().unwrap()),
-            u128::from_le_bytes(circuit_hash[16..].try_into().unwrap()),
-        ];
-        for bits in [1u32, 2, 7, 8, 9, 13, 16, 17, 31, 64, 127, 128, 129, 255, 256] {
-            let masks = pow_leading_zero_masks(bits).map(|m| {
-                (m.lo as u128) | ((m.hi as u128) << 64)
-            });
-            let circuit_accepts = (digest_words[0] & masks[0]) == 0
-                && (digest_words[1] & masks[1]) == 0;
-            assert_eq!(
-                circuit_accepts,
-                flock_core::challenger::pow_has_leading_zero_bits(
-                    &state_digest,
-                    nonce,
-                    bits,
-                    HashKind::Blake3,
-                ),
-                "nonce {nonce}, lambda {bits}"
-            );
+fn fused_pow_masks_match_raw_compression() {
+    let cv: [u32; 8] = std::array::from_fn(|i| 0x1020_3040u32.wrapping_mul(i as u32 + 1));
+    for pending_words in 0..4 {
+        let pending_len = 16 * pending_words;
+        for nonce in 0..64u64 {
+            for bits in [1u32, 2, 7, 8, 9, 13, 16, 17, 31, 64, 127, 128] {
+                let mut block = [0u8; 64];
+                for (i, b) in block[..pending_len].iter_mut().enumerate() {
+                    *b = (17 * i + 9) as u8;
+                }
+                block[pending_len..pending_len + 8].copy_from_slice(&nonce.to_le_bytes());
+                let message: [u32; 16] = std::array::from_fn(|i| {
+                    u32::from_le_bytes(block[4 * i..4 * i + 4].try_into().unwrap())
+                });
+                let out = blake3::blake3_compress(
+                    &cv,
+                    &message,
+                    flock_core::challenger::pow_squeeze_counter(bits, pending_len + 16),
+                    64,
+                    flock_prover::r1cs_hashes::fs_chain::CHAIN_SQUEEZE,
+                );
+                let mut predicate = [0u8; 16];
+                for (i, word) in out[4..8].iter().enumerate() {
+                    predicate[4 * i..4 * i + 4].copy_from_slice(&word.to_le_bytes());
+                }
+                let predicate_word = u128::from_le_bytes(predicate);
+                let mask = pow_leading_zero_mask(bits);
+                let mask = (mask.lo as u128) | ((mask.hi as u128) << 64);
+                let circuit_accepts = predicate_word & mask == 0;
+                let native_accepts = (0..bits as usize)
+                    .all(|k| predicate[k / 8] & (1 << (7 - k % 8)) == 0);
+                assert_eq!(
+                    circuit_accepts, native_accepts,
+                    "pending words {pending_words}, nonce {nonce}, lambda {bits}"
+                );
+            }
         }
     }
 
@@ -7453,25 +7493,36 @@ fn recursive_pow_relation_accepts_valid_and_rejects_invalid_nonce() {
     for (i, b) in state_digest.iter_mut().enumerate() {
         *b = (29 * i + 3) as u8;
     }
+    let cv: [u32; 8] = std::array::from_fn(|i| {
+        u32::from_le_bytes(state_digest[4 * i..4 * i + 4].try_into().unwrap())
+    });
+    let fused = |nonce: u64| {
+        let mut block = [0u8; 64];
+        block[..8].copy_from_slice(&nonce.to_le_bytes());
+        let message: [u32; 16] = std::array::from_fn(|i| {
+            u32::from_le_bytes(block[4 * i..4 * i + 4].try_into().unwrap())
+        });
+        blake3::blake3_compress(
+            &cv,
+            &message,
+            flock_core::challenger::pow_squeeze_counter(bits, 16),
+            64,
+            flock_prover::r1cs_hashes::fs_chain::CHAIN_SQUEEZE,
+        )
+    };
+    let accepts = |nonce: u64| {
+        let out = fused(nonce);
+        let mut predicate = [0u8; 16];
+        for (i, word) in out[4..8].iter().enumerate() {
+            predicate[4 * i..4 * i + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        predicate[0] & 0b1111_1100 == 0
+    };
     let good = (0..u64::MAX)
-        .find(|&n| {
-            flock_core::challenger::pow_has_leading_zero_bits(
-                &state_digest,
-                n,
-                bits,
-                HashKind::Blake3,
-            )
-        })
+        .find(|&n| accepts(n))
         .expect("a six-bit nonce exists");
     let bad = (good + 1..u64::MAX)
-        .find(|&n| {
-            !flock_core::challenger::pow_has_leading_zero_bits(
-                &state_digest,
-                n,
-                bits,
-                HashKind::Blake3,
-            )
-        })
+        .find(|&n| !accepts(n))
         .expect("a neighboring invalid nonce exists");
 
     let build = |nonce: u64| {
@@ -7485,9 +7536,6 @@ fn recursive_pow_relation_accepts_valid_and_rejects_invalid_nonce() {
             nu,
         });
         let mut vals = Vec::new();
-        let iv_v = pack8(&IV);
-        vals.extend_from_slice(&iv_v);
-        let iv = [sb.public_input(), sb.public_input()];
         let digest_v = [
             F128::new(
                 u64::from_le_bytes(state_digest[..8].try_into().unwrap()),
@@ -7502,12 +7550,27 @@ fn recursive_pow_relation_accepts_valid_and_rejects_invalid_nonce() {
         let digest_w = [sb.input(), sb.input()];
         let nonce_w = sb.input();
         let mut consts = Vec::new();
+        let zero = cw(&mut sb, &mut vals, &mut consts, F128::ZERO);
+        let params = cw(
+            &mut sb,
+            &mut vals,
+            &mut consts,
+            pack_params(
+                flock_core::challenger::pow_squeeze_counter(bits, 16),
+                64,
+                flock_prover::r1cs_hashes::fs_chain::CHAIN_SQUEEZE,
+            ),
+        );
+        let h = sb.gate(
+            b3,
+            &[digest_w[0], digest_w[1], nonce_w, zero, zero, zero, params],
+        );
         emit_pow_checks(
             &mut sb,
             b3,
             spread,
-            iv,
-            &[([digest_w[0], digest_w[1], nonce_w], bits)],
+            digest_w,
+            &[([h[1], nonce_w], bits)],
             &mut vals,
             &mut consts,
         );
@@ -8006,17 +8069,24 @@ fn mvp6_all_levels_collapsed() {
             Some(right) => {
                 let l = match link.cv {
                     CvSource::Row(r) => r,
+                    CvSource::RowHi(r) => r,
                     CvSource::Iv => unreachable!(),
                 };
-                (iv, [outs[l][0], outs[l][1], outs[right][0], outs[right][1]])
+                let left = match link.cv {
+                    CvSource::Row(_) => [outs[l][0], outs[l][1]],
+                    CvSource::RowHi(_) => [outs[l][2], outs[l][3]],
+                    CvSource::Iv => unreachable!(),
+                };
+                (iv, [left[0], left[1], outs[right][0], outs[right][1]])
             }
             None => {
                 let cv_in = match link.cv {
                     CvSource::Iv => iv,
                     CvSource::Row(r) => [outs[r][0], outs[r][1]],
+                    CvSource::RowHi(r) => [outs[r][2], outs[r][3]],
                 };
                 let base = trace.block_offsets[i].expect("stream block") / 16;
-                let real = (blen as usize) / 16;
+                let real = trace.block_word_counts[i];
                 let mut m = [iv[0]; 4];
                 for (j, slot) in m.iter_mut().enumerate() {
                     let wi = base + j;
@@ -8075,7 +8145,6 @@ fn mvp6_all_levels_collapsed() {
     let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
     let mut all_opens: Vec<Vec<(Wire, [Wire; 2])>> = Vec::new();
     for (li, l) in levels.iter().enumerate() {
-        let sq = &trace.squeezes[li];
         let c = cap_depths[li];
         let vars = l.lanes.trailing_zeros() as usize;
         vals.extend_from_slice(&vees[li]);
@@ -8089,7 +8158,7 @@ fn mvp6_all_levels_collapsed() {
             let leaf_w: Vec<Wire> = (0..4 * blocks).map(|_| sb.input()).collect();
 
             // The challenge word IS the index word — no masking gadget.
-            let cw = outs[sq[k / 4]][k % 4];
+            let cw = squeeze_word_wire(&outs, &trace, li, k);
             let cv = emit_opening(&mut sb, slots, iv, &leaf_w, cw, l.depth, c, None, &mut vals);
             opens.push((cw, cv));
             hints.extend(trees[li].siblings(pos).into_iter().take(l.depth - c));
@@ -8819,7 +8888,6 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
     {
         use flock_core::lincheck::build_eq_table;
         use flock_prover::prover::UnionElementSlotInput;
-        use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
         let lig = &proof.pcs_open.inner.ligerito;
         assert_eq!(commitment.cap, lig.initial_cap, "commitment IS the L0 cap");
@@ -8850,12 +8918,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             rec.payloads(),
         );
         assert_chain_replays(&ops, &trace, &chals);
-        let pow_hash_rows = ops
-            .iter()
-            .filter(|op| matches!(op, Op::Pow { bits } if *bits != 0))
-            .count();
         let b3_rows: usize = trace.rows.len()
-            + pow_hash_rows
             + geo
                 .iter()
                 .map(|g| (g.lanes / 4 + g.depth) * g.q + (1usize << g.c) - 1)
@@ -8960,7 +9023,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             out
         };
         assert!(!pows.is_empty(), "the Fast profile grinds");
-        let pow_pub: Vec<[Wire; 3]> = pows
+        let pow_wires: Vec<[Wire; 2]> = pows
             .iter()
             .map(|pr| {
                 let sq = &trace.squeezes[pr.fin];
@@ -8970,10 +9033,10 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
                     .position(|w| matches!(w, flock_core::transcript_record::StreamWord::Bytes { payload, .. } if *payload == pr.pay))
                     .expect("pow nonce stream word");
                 let nw = ww[wi].expect("pow nonce wired");
-                [outs[sq[0]][0], outs[sq[0]][1], nw]
+                [outs[sq[0]][1], nw]
             })
             .collect();
-        let pow_checks: Vec<([Wire; 3], u32)> = pow_pub
+        let pow_checks: Vec<([Wire; 2], u32)> = pow_wires
             .iter()
             .zip(&pows)
             .map(|(&w, pr)| (w, pr.bits))
@@ -8998,7 +9061,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             &levels,
             &geo,
             &lvl_src,
-            &trace.squeezes,
+            &trace,
             &outs,
             &chals,
             &cap_w,
@@ -9323,8 +9386,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
                 cw(&mut sb, &mut vals, &mut consts, t_vals[k2])
             } else {
                 let j = k2 - 7;
-                let sq = &trace.squeezes[outer_fin];
-                outs[sq[j / 4]][j % 4]
+                squeeze_word_wire(&outs, &trace, outer_fin, j)
             };
             zc_t_w.push(t_w);
             let rho_w = outs[trace.squeezes[fin][0]][0];
@@ -9384,7 +9446,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             &w_rounds,
             inner_pd2.fin,
             &yr_wires,
-            &trace.squeezes,
+            &trace,
             &outs,
             &chals,
             &mut vals,
@@ -9812,11 +9874,6 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         for w in &level_accs {
             sb.publish(*w);
         }
-        for pp in &pow_pub {
-            for w in pp {
-                sb.publish(*w);
-            }
-        }
         for accs in &resid_pub {
             for w in accs {
                 sb.publish(*w);
@@ -9892,7 +9949,6 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             + 3
             + 5
             + n_assert_pub
-            + 3 * pows.len()
             + levels.iter().map(|l| l.a_count).sum::<usize>();
         let mut at2 = plen - total_pub;
         // The openings bind to the absorbed caps by COPY CONSTRAINT (the
@@ -9912,7 +9968,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         }
         // The residual region against the shared native replica (sks via
         // sk_at_vks — the mvp7 discipline).
-        let resid_base = at2 + native_sums.len() + 3 * pows.len();
+        let resid_base = at2 + native_sums.len();
         {
             let inner_n = check_residual_publics(
                 &built.public,
@@ -9932,31 +9988,6 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
                 inner_n,
                 "inner == t_r: the leaf statement closes"
             );
-        }
-        let pow_base = at2 + native_sums.len();
-        for (k, pr) in pows.iter().enumerate() {
-            let d0 = built.public[pow_base + 3 * k];
-            let d1 = built.public[pow_base + 3 * k + 1];
-            let nn = built.public[pow_base + 3 * k + 2];
-            let mut digest = [0u8; 32];
-            digest[..8].copy_from_slice(&d0.lo.to_le_bytes());
-            digest[8..16].copy_from_slice(&d0.hi.to_le_bytes());
-            digest[16..24].copy_from_slice(&d1.lo.to_le_bytes());
-            digest[24..].copy_from_slice(&d1.hi.to_le_bytes());
-            assert_eq!(nn.hi, 0, "pow {k}: nonce word zero-padded");
-            if pr.bits == 0 {
-                assert_eq!(nn.lo, 0, "pow {k}: canonical zero nonce");
-            } else {
-                assert!(
-                    flock_core::challenger::pow_has_leading_zero_bits(
-                        &digest,
-                        nn.lo,
-                        pr.bits,
-                        HashKind::Blake3,
-                    ),
-                    "pow {k}: grinding predicate on the published wires"
-                );
-            }
         }
         // Tail order: [.., zc_end, lc_end, mp_delta, anc, assertion fields].
         {
@@ -10335,7 +10366,6 @@ struct RealTape<'p> {
 impl<'p> RealTape<'p> {
     fn new(lo: &'p LeafOuter, domain: &'static [u8]) -> Self {
         use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
-        use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
         let union_i = outer_union(&lo.shape.registry, lo.shape.counts.clone());
         let mut lcs_ord: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
@@ -10652,12 +10682,7 @@ impl<'p> RealTape<'p> {
             rec.payloads(),
         );
         assert_chain_replays(&ops, &trace, &chals);
-        let b3_rows = trace.rows.len()
-            + ops
-                .iter()
-                .filter(|op| matches!(op, Op::Pow { bits } if *bits != 0))
-                .count()
-            + h_rows
+        let b3_rows = trace.rows.len() + h_rows
             + geo
                 .iter()
                 .map(|g| (g.row_words.div_ceil(4) + g.depth) * g.q + (1usize << g.c) - 1)
@@ -10705,59 +10730,44 @@ impl<'p> RealTape<'p> {
             {
                 let pad16 = |n: usize| n.div_ceil(16) * 16;
                 let (mut hdr_w, mut pay_w, mut n_obs, mut n_sq) = (0usize, 0usize, 0usize, 0usize);
-                // The domain header + padded domain are absorbed at
-                // construction, ahead of the recorded ops.
-                let (mut v3_rows, mut pend) = (0usize, 16 + pad16(domain.len()));
                 for op in ops.iter() {
                     match op {
                         Op::Label(l) => {
                             hdr_w += 1;
                             pay_w += pad16(l.len()) / 16;
                             n_obs += 1;
-                            pend += 16 + pad16(l.len());
                         }
                         Op::ObserveScalar => {
                             hdr_w += 1;
                             pay_w += 1;
                             n_obs += 1;
-                            pend += 32;
                         }
                         Op::ObserveSlice(n) => {
                             hdr_w += 1;
                             pay_w += n;
                             n_obs += 1;
-                            pend += 16 + 16 * n;
                         }
                         Op::ObserveBytes(len) => {
                             hdr_w += 1;
                             pay_w += pad16(*len) / 16;
                             n_obs += 1;
-                            pend += 16 + pad16(*len);
                         }
-                        // Fork bookkeeping contributes nothing to THIS
-                        // chain: the child is an independent chain and its
-                        // rows are counted from its own stream.
                         Op::Forked { .. } | Op::Merge { .. } => {}
-                        Op::SqueezeScalar | Op::SqueezeSlice(_) | Op::Pow { .. } => {
+                        Op::Pow { .. } => {
+                            pay_w += 1;
+                        }
+                        Op::LegacyPow { .. } => {
                             n_sq += 1;
-                            // v3: the squeeze row eats the pending partial
-                            // block and emits output block 0; extra output
-                            // blocks follow.
-                            v3_rows += pend / 64;
-                            v3_rows += 1 + (op.squeezed_bytes().div_ceil(64) - 1);
-                            pend = 0;
-                            if let Op::Pow { .. } = op {
-                                // the nonce rides observe_bytes(8): header + word
-                                pend += 32;
-                            }
+                        }
+                        Op::SqueezeScalar | Op::SqueezeSlice(_) => {
+                            n_sq += 1;
                         }
                     }
-                    v3_rows += pend / 64;
-                    pend %= 64;
                 }
-                if pend > 0 {
-                    v3_rows += 1;
-                }
+                let v3_rows = duplex_row_count_model(
+                    t_shape.ops(),
+                    &t_shape.stream_words_duplex(domain),
+                );
                 eprintln!(
                     "  [chain census] ops {} (obs {} / sq {}) | header words {} ({} B) | payload words {} | duplex rows {}",
                     ops.len(),
@@ -11746,7 +11756,7 @@ fn emit_real_child_region(
         );
     }
     // The PoW grinding wires: (digest word0, word1, nonce word) per op.
-    let pow_pub: Vec<[Wire; 3]> = rt
+    let pow_wires: Vec<[Wire; 2]> = rt
         .pows
         .iter()
         .map(|&(fin, pay, _)| {
@@ -11757,10 +11767,10 @@ fn emit_real_child_region(
                 .position(|w| matches!(w, flock_core::transcript_record::StreamWord::Bytes { payload, .. } if *payload == pay))
                 .expect("pow nonce stream word");
             let nw = ww[wi].expect("pow nonce wired");
-            [outs[sq[0]][0], outs[sq[0]][1], nw]
+            [outs[sq[0]][1], nw]
         })
         .collect();
-    let pow_checks: Vec<([Wire; 3], u32)> = pow_pub
+    let pow_checks: Vec<([Wire; 2], u32)> = pow_wires
         .iter()
         .zip(&rt.pows)
         .map(|(&w, &(_, _, bits))| (w, bits))
@@ -11807,7 +11817,7 @@ fn emit_real_child_region(
         levels,
         geo,
         &rt.lvl_src,
-        &trace.squeezes,
+        &trace,
         &outs,
         chals,
         &cap_w,
@@ -11849,7 +11859,7 @@ fn emit_real_child_region(
     // stays advice, production-checked over the RE-EXPOSED words below.
     let mut pdh_w = zw;
     for pd in gammas_i {
-        let gw = squeeze_word_wire(&outs, &trace.squeezes, pd.fin, pd.squeeze_offset);
+        let gw = squeeze_word_wire(&outs, &trace, pd.fin, pd.squeeze_offset);
         pdh_w = sb.gate(cs.macs, &[pdh_w, gw, wv(pd.val_v)])[0];
     }
     vals.push(rt.native_rs_half);
@@ -11949,7 +11959,7 @@ fn emit_real_child_region(
         &rt.w_resid,
         inner_pd_i.fin,
         &yr_wires,
-        &trace.squeezes,
+        &trace,
         &outs,
         chals,
         vals,
@@ -12046,9 +12056,8 @@ fn emit_real_child_region(
     cen.push(("GKR advice (g0s, mask)", sb.public_len(), sb.rows_in_slot(cs.macs)));
     // ---- the MULTI-SLOT element PIOP (general strip) ----
     let mut el_zr = zw;
-    let sqt = &trace.squeezes[piop_i.tau_fin];
     for (k, rr) in piop_i.zc_rounds.iter().enumerate() {
-        let t_w = outs[sqt[k / 4]][k % 4];
+        let t_w = squeeze_word_wire(&outs, &trace, piop_i.tau_fin, k);
         let rho_w = outs[trace.squeezes[rr.fin][0]][0];
         vals.push(rt.el_g0[k]);
         let g0w = sb.input();
@@ -12279,7 +12288,7 @@ fn emit_real_child_region(
                     .filter(|&(_, &h)| h)
                     .map(|(&i2, _)| {
                         let pd = &gammas_i[i2];
-                        squeeze_word_wire(&outs, &trace.squeezes, pd.fin, pd.squeeze_offset)
+                        squeeze_word_wire(&outs, &trace, pd.fin, pd.squeeze_offset)
                     })
                     .collect();
                 if let flock_core::matrix_fold::JaggedRowWeight::Combo(t) = &c.row {
@@ -12298,7 +12307,7 @@ fn emit_real_child_region(
             }
             let (_, c) = d_it.next().expect("a dense entry per non-hot member");
             let pd = &gammas_i[i2];
-            let gpd_w = squeeze_word_wire(&outs, &trace.squeezes, pd.fin, pd.squeeze_offset);
+            let gpd_w = squeeze_word_wire(&outs, &trace, pd.fin, pd.squeeze_offset);
             vals.push(c.value);
             let d_w = sb.input();
             jag_w.push(d_w);
@@ -12440,11 +12449,6 @@ fn emit_real_child_region(
     for w in &level_accs {
         sb.publish(*w);
     }
-    for p in &pow_pub {
-        for w in p {
-            sb.publish(*w);
-        }
-    }
     cen.push(("TAIL: query alphas + native accs", sb.public_len(), sb.rows_in_slot(cs.macs)));
     sb.publish(t_final);
     sb.publish(tgt_w);
@@ -12483,15 +12487,14 @@ fn emit_real_child_region(
         for i in 0..128 {
             sb.publish(wv(sv + i));
         }
-        let sq = &trace.squeezes[rfin];
         for j in 0..7 {
-            sb.publish(outs[sq[j / 4]][j % 4]);
+            sb.publish(squeeze_word_wire(&outs, &trace, rfin, j));
         }
         n_fam_pub += 135;
     }
     for k in 0..2 {
         let (fin, offset) = rt.rs_gam_fins[k];
-        sb.publish(squeeze_word_wire(&outs, &trace.squeezes, fin, offset));
+        sb.publish(squeeze_word_wire(&outs, &trace, fin, offset));
         n_fam_pub += 1;
     }
     for &vi in &mp_i.val_vs {
@@ -12514,7 +12517,6 @@ fn emit_real_child_region(
 
     let n_query_pub: usize = levels.iter().map(|l| l.a_count).sum();
     let n_tail = levels.len()
-        + 3 * rt.pows.len()
         + 3
         + levels.len() * rt.yr_len
         + 1
@@ -12586,34 +12588,7 @@ fn check_real_child_region(public: &[F128], rt: &RealTape<'_>, r: &RealRegion) -
             "L{li} enforced sum matches the native replica"
         );
     }
-    let pow_base = at2 + rt.native_sums.len();
-    // Differential oracle only: `emit_pow_checks` already constrains these
-    // same wires inside this child region.
-    for (k, &(_, _, bits)) in rt.pows.iter().enumerate() {
-        let d0 = public[pow_base + 3 * k];
-        let d1 = public[pow_base + 3 * k + 1];
-        let nn = public[pow_base + 3 * k + 2];
-        let mut digest = [0u8; 32];
-        digest[..8].copy_from_slice(&d0.lo.to_le_bytes());
-        digest[8..16].copy_from_slice(&d0.hi.to_le_bytes());
-        digest[16..24].copy_from_slice(&d1.lo.to_le_bytes());
-        digest[24..].copy_from_slice(&d1.hi.to_le_bytes());
-        assert_eq!(nn.hi, 0, "pow {k}: nonce word zero-padded");
-        if bits == 0 {
-            assert_eq!(nn.lo, 0, "pow {k}: canonical zero nonce");
-        } else {
-            assert!(
-                flock_core::challenger::pow_has_leading_zero_bits(
-                    &digest,
-                    nn.lo,
-                    bits,
-                    HashKind::Blake3,
-                ),
-                "pow {k}: grinding predicate on the published wires"
-            );
-        }
-    }
-    let sp_base = pow_base + 3 * rt.pows.len();
+    let sp_base = at2 + rt.native_sums.len();
     assert_eq!(
         public[sp_base],
         rt.t_final_n,
@@ -14051,7 +14026,6 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
     // ---- the outer: k chain-tape regions + the fold region + adjacency ----
     {
         use flock_prover::prover::UnionElementSlotInput;
-        use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
         // The transcript is FORKED (the wiring runs on its own chain);
         // `merge_chain` splices the child's rows in at the fork point and
@@ -14070,12 +14044,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
         );
         assert_chain_replays(&ops, &trace, &chals);
 
-        let b3_rows = tapes.iter().map(|t| t.b3_rows).sum::<usize>()
-            + trace.rows.len()
-            + ops
-                .iter()
-                .filter(|op| matches!(op, Op::Pow { bits } if *bits != 0))
-                .count();
+        let b3_rows = tapes.iter().map(|t| t.b3_rows).sum::<usize>() + trace.rows.len();
         let nu2_content = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7);
         // THE ENVELOPE (task 7b): a first-level node is an internal node's
         // CHILD, so its proof must carry the same geometry every other
@@ -14190,7 +14159,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
             pf_w,
             leslot,
             &locs,
-            &trace.squeezes,
+            &trace,
             &challenge_word_locs(t_shape.ops()),
             &chain_outs,
             &ww,
@@ -14209,7 +14178,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
             pfslot,
             pf_w,
             &jlocs,
-            &trace.squeezes,
+            &trace,
             &challenge_word_locs(t_shape.ops()),
             &chain_outs,
             &ww,
@@ -15499,7 +15468,6 @@ struct ChildTape<'p> {
 impl<'p> ChildTape<'p> {
     fn new(inner: &'p MixedInner, domain: &'static [u8]) -> Self {
         use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
-        use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
         let built = &inner.built;
         let proof = &inner.proof;
@@ -16087,59 +16055,44 @@ impl<'p> ChildTape<'p> {
             {
                 let pad16 = |n: usize| n.div_ceil(16) * 16;
                 let (mut hdr_w, mut pay_w, mut n_obs, mut n_sq) = (0usize, 0usize, 0usize, 0usize);
-                // The domain header + padded domain are absorbed at
-                // construction, ahead of the recorded ops.
-                let (mut v3_rows, mut pend) = (0usize, 16 + pad16(domain.len()));
                 for op in ops.iter() {
                     match op {
                         Op::Label(l) => {
                             hdr_w += 1;
                             pay_w += pad16(l.len()) / 16;
                             n_obs += 1;
-                            pend += 16 + pad16(l.len());
                         }
                         Op::ObserveScalar => {
                             hdr_w += 1;
                             pay_w += 1;
                             n_obs += 1;
-                            pend += 32;
                         }
                         Op::ObserveSlice(n) => {
                             hdr_w += 1;
                             pay_w += n;
                             n_obs += 1;
-                            pend += 16 + 16 * n;
                         }
                         Op::ObserveBytes(len) => {
                             hdr_w += 1;
                             pay_w += pad16(*len) / 16;
                             n_obs += 1;
-                            pend += 16 + pad16(*len);
                         }
-                        // Fork bookkeeping contributes nothing to THIS
-                        // chain: the child is an independent chain and its
-                        // rows are counted from its own stream.
                         Op::Forked { .. } | Op::Merge { .. } => {}
-                        Op::SqueezeScalar | Op::SqueezeSlice(_) | Op::Pow { .. } => {
+                        Op::Pow { .. } => {
+                            pay_w += 1;
+                        }
+                        Op::LegacyPow { .. } => {
                             n_sq += 1;
-                            // v3: the squeeze row eats the pending partial
-                            // block and emits output block 0; extra output
-                            // blocks follow.
-                            v3_rows += pend / 64;
-                            v3_rows += 1 + (op.squeezed_bytes().div_ceil(64) - 1);
-                            pend = 0;
-                            if let Op::Pow { .. } = op {
-                                // the nonce rides observe_bytes(8): header + word
-                                pend += 32;
-                            }
+                        }
+                        Op::SqueezeScalar | Op::SqueezeSlice(_) => {
+                            n_sq += 1;
                         }
                     }
-                    v3_rows += pend / 64;
-                    pend %= 64;
                 }
-                if pend > 0 {
-                    v3_rows += 1;
-                }
+                let v3_rows = duplex_row_count_model(
+                    t_shape.ops(),
+                    &t_shape.stream_words_duplex(domain),
+                );
                 eprintln!(
                     "  [chain census] ops {} (obs {} / sq {}) | header words {} ({} B) | payload words {} | duplex rows {}",
                     ops.len(),
@@ -17073,7 +17026,7 @@ fn emit_child_region(
         levels,
         geo,
         &ct.lvl_src,
-        &trace.squeezes,
+        &trace,
         &outs,
         chals,
         &cap_w,
@@ -17323,7 +17276,7 @@ fn emit_child_region(
         &ct.w_resid,
         inner_pd2.fin,
         &yr_wires,
-        &trace.squeezes,
+        &trace,
         &outs,
         chals,
         vals,
@@ -17343,8 +17296,7 @@ fn emit_child_region(
     let el_pub = el_rec.map(|el_rec| {
         let mut el_zr = zw;
         for (k, &(gv, rfin, _)) in el_rec.zc_rounds.iter().enumerate() {
-            let sqt = &trace.squeezes[el_rec.tau_fin];
-            let t_w = outs[sqt[k / 4]][k % 4];
+            let t_w = squeeze_word_wire(&outs, &trace, el_rec.tau_fin, k);
             let rho_w = outs[trace.squeezes[rfin][0]][0];
             vals.push(ct.el_g0[k]);
             let g0w = sb.input();
@@ -17560,7 +17512,7 @@ fn emit_child_region(
                     .filter(|&(_, &h)| h)
                     .map(|(&i2, _)| {
                         let pd = &ct.gammas_o[i2];
-                        squeeze_word_wire(&outs, &trace.squeezes, pd.fin, pd.squeeze_offset)
+                        squeeze_word_wire(&outs, &trace, pd.fin, pd.squeeze_offset)
                     })
                     .collect();
                 if let flock_core::matrix_fold::JaggedRowWeight::Combo(t) = &c.row {
@@ -17578,7 +17530,7 @@ fn emit_child_region(
             }
             let (_, c) = d_it.next().expect("a dense entry per non-hot member");
             let pd = &ct.gammas_o[i2];
-            let gpd_w = squeeze_word_wire(&outs, &trace.squeezes, pd.fin, pd.squeeze_offset);
+            let gpd_w = squeeze_word_wire(&outs, &trace, pd.fin, pd.squeeze_offset);
             vals.push(c.value);
             let d_w = sb.input();
             jag_w.push(d_w);
@@ -18358,7 +18310,6 @@ fn mvp11_sigma_fold_tape() {
     // rebuilt from the public segment alone and discharged at the root.
     let outer_stats = {
         use flock_prover::prover::UnionElementSlotInput;
-        use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
         // The transcript is FORKED (the wiring runs on its own chain);
         // `merge_chain` splices the child's rows in at the fork point and
@@ -18420,7 +18371,7 @@ fn mvp11_sigma_fold_tape() {
         let challenge_locs = challenge_word_locs(&ops);
         let chw = |ch: usize| -> Wire {
             let (fin, offset) = challenge_locs[ch];
-            squeeze_word_wire(&outs, &trace.squeezes, fin, offset)
+            squeeze_word_wire(&outs, &trace, fin, offset)
         };
         vals.push(F128::ZERO);
         let zw = sb.public_input();
@@ -18925,7 +18876,6 @@ fn mvp11_jagged_fold_tape() {
     // ---- the in-circuit replay ----
     let outer_stats = {
         use flock_prover::prover::UnionElementSlotInput;
-        use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
         // The transcript is FORKED (the wiring runs on its own chain);
         // `merge_chain` splices the child's rows in at the fork point and
@@ -18984,7 +18934,7 @@ fn mvp11_jagged_fold_tape() {
         let challenge_locs = challenge_word_locs(&ops);
         let chw = |ch: usize| -> Wire {
             let (fin, offset) = challenge_locs[ch];
-            squeeze_word_wire(&outs, &trace.squeezes, fin, offset)
+            squeeze_word_wire(&outs, &trace, fin, offset)
         };
         vals.push(F128::ZERO);
         let zw = sb.public_input();
@@ -19549,7 +19499,7 @@ fn emit_fold_region(
     pf_w: usize,
     leslot: flock_core::circuit::builder::SlotId,
     locs: &[FoldLoc],
-    sq: &[Vec<usize>],
+    trace: &flock_prover::r1cs_hashes::fs_chain::FsChainTrace,
     challenge_locs: &[(usize, usize)],
     outs: &[Vec<Wire>],
     ww: &[Option<Wire>],
@@ -19564,7 +19514,7 @@ fn emit_fold_region(
     let wv = |vi: usize| -> Wire { ww[vmap[vi].expect("stream word")].expect("wired") };
     let chw = |ch: usize| -> Wire {
         let (fin, offset) = challenge_locs[ch];
-        squeeze_word_wire(outs, sq, fin, offset)
+        squeeze_word_wire(outs, trace, fin, offset)
     };
     // seed · Π (1 + a_j + b_j) through the prefix slot, padded (zw, zw).
     let prefix = |sb: &mut ShapeBuilder, seed: Wire, fs: &[(Wire, Wire)]| -> Wire {
@@ -20212,7 +20162,7 @@ fn emit_jagged_fold_region(
     pfslot: flock_core::circuit::builder::SlotId,
     pf_w: usize,
     locs: &[JaggedFoldLoc],
-    sq: &[Vec<usize>],
+    trace: &flock_prover::r1cs_hashes::fs_chain::FsChainTrace,
     challenge_locs: &[(usize, usize)],
     outs: &[Vec<Wire>],
     ww: &[Option<Wire>],
@@ -20225,7 +20175,7 @@ fn emit_jagged_fold_region(
     let wv = |vi: usize| -> Wire { ww[vmap[vi].expect("stream word")].expect("wired") };
     let chw = |ch: usize| -> Wire {
         let (fin, offset) = challenge_locs[ch];
-        squeeze_word_wire(outs, sq, fin, offset)
+        squeeze_word_wire(outs, trace, fin, offset)
     };
     let prefix = |sb: &mut ShapeBuilder, seed: Wire, fs: &[(Wire, Wire)]| -> Wire {
         let mut s = seed;
@@ -20682,7 +20632,6 @@ fn mvp11_merge_fold_region() {
     // statement — rebuilt from the public segment alone and discharged.
     let outer_stats = {
         use flock_prover::prover::UnionElementSlotInput;
-        use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
         // The transcript is FORKED (the wiring runs on its own chain);
         // `merge_chain` splices the child's rows in at the fork point and
@@ -20705,11 +20654,7 @@ fn mvp11_merge_fold_region() {
         // the children's query-phase openings — size the row capacity once.
         let b3_rows = t0.b3_rows
             + t1.b3_rows
-            + trace.rows.len()
-            + ops
-                .iter()
-                .filter(|op| matches!(op, Op::Pow { bits } if *bits != 0))
-                .count();
+            + trace.rows.len();
         let nu2 = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7);
         let mut sb = ShapeBuilder::new(nu2);
         let mut cs = ChildSlots::new(&mut sb, nu2, t0.spread_w.max(t1.spread_w));
@@ -20784,7 +20729,7 @@ fn mvp11_merge_fold_region() {
             pf_w,
             leslot,
             &locs,
-            &trace.squeezes,
+            &trace,
             &challenge_word_locs(t_shape.ops()),
             &chain_outs,
             &ww,
@@ -21491,7 +21436,6 @@ fn mvp11_swap_children_fold_scale() {
     // ---- the in-circuit replay: the whole ~35-fold region ----
     let outer_stats = {
         use flock_prover::prover::UnionElementSlotInput;
-        use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
         // The transcript is FORKED (the wiring runs on its own chain);
         // `merge_chain` splices the child's rows in at the fork point and
@@ -21510,11 +21454,7 @@ fn mvp11_swap_children_fold_scale() {
         );
         assert_chain_replays(&ops, &trace, &chals);
 
-        let b3_rows = trace.rows.len()
-            + ops
-                .iter()
-                .filter(|op| matches!(op, Op::Pow { bits } if *bits != 0))
-                .count();
+        let b3_rows = trace.rows.len();
         let nu2 = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7);
         let mut sb = ShapeBuilder::new(nu2);
         let b3s = sb.slot(Blake3Gate { nu: nu2 });
@@ -21581,7 +21521,7 @@ fn mvp11_swap_children_fold_scale() {
             pf_w,
             leslot,
             &locs,
-            &trace.squeezes,
+            &trace,
             &challenge_word_locs(t_shape.ops()),
             &chain_outs,
             &ww,
@@ -22502,25 +22442,16 @@ fn build_node_outer_app(
         );
         assert_chain_replays(&ops, &trace, &chals);
 
-        let b3_rows = rts.iter().map(|rt| rt.b3_rows).sum::<usize>()
-            + trace.rows.len()
-            + ops
-                .iter()
-                .filter(|op| matches!(op, Op::Pow { bits } if *bits != 0))
-                .count();
+        let b3_rows = rts.iter().map(|rt| rt.b3_rows).sum::<usize>() + trace.rows.len();
         if std::env::var("B3_CENSUS").is_ok() {
             let fold_pows = ops
                 .iter()
                 .filter(|op| matches!(op, Op::Pow { bits } if *bits != 0))
                 .count();
             eprintln!(
-                "  [node pow census] child checks {:?} | fold checks {} | standalone BLAKE rows {}",
+                "  [node pow census] child checks {:?} | fold checks {} | standalone BLAKE rows 0",
                 rts.iter().map(|rt| rt.pows.len()).collect::<Vec<_>>(),
                 fold_pows,
-                rts.iter()
-                    .map(|rt| rt.pows.iter().filter(|(_, _, bits)| *bits != 0).count())
-                    .sum::<usize>()
-                    + fold_pows,
             );
         }
         // MEASURED AND REJECTED (2026-08-05): over-provisioning nu by one
@@ -22653,7 +22584,7 @@ fn build_node_outer_app(
             pf_w,
             leslot,
             &locs,
-            &trace.squeezes,
+            &trace,
             &challenge_word_locs(t_shape.ops()),
             &chain_outs,
             &ww,
@@ -22672,7 +22603,7 @@ fn build_node_outer_app(
             pfslot,
             pf_w,
             &jlocs,
-            &trace.squeezes,
+            &trace,
             &challenge_word_locs(t_shape.ops()),
             &chain_outs,
             &ww,
@@ -23381,7 +23312,7 @@ fn build_node_outer_app(
                 pf_w,
                 leslot,
                 llocs,
-                &ltrace.squeezes,
+                &ltrace,
                 &challenge_word_locs(lops),
                 &lchain_outs,
                 &lww,
@@ -23400,7 +23331,7 @@ fn build_node_outer_app(
                 pfslot,
                 pf_w,
                 ljlocs,
-                &ltrace.squeezes,
+                &ltrace,
                 &challenge_word_locs(lops),
                 &lchain_outs,
                 &lww,

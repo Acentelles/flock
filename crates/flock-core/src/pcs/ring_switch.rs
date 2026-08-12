@@ -2432,10 +2432,11 @@ pub fn prove_with_grinding<Ch: Challenger>(
 
     // The s_hat_v message is fixed. Bind a PoW witness before sampling the
     // seven-coordinate row-batching point r''.
-    let grinding_nonce = (grinding_bits != 0)
-        .then(|| challenger.grind_pow(grinding_bits))
-        .unwrap_or(0);
-    let r_dprime = challenger.sample_f128_vec(LOG_PACKING);
+    let (grinding_nonce, r_dprime) = if grinding_bits != 0 {
+        challenger.grind_pow_and_sample_f128_vec(grinding_bits, LOG_PACKING)
+    } else {
+        (0, challenger.sample_f128_vec(LOG_PACKING))
+    };
     let eq_r_dprime = build_eq(&r_dprime);
 
     // Compute BaseFold target: T = ⟨transpose(s_hat_v), eq(r'')⟩.
@@ -2798,10 +2799,11 @@ fn prove_batched_padded_with_precomputed_and_grinding_impl<Ch: Challenger>(
             Kind::Sparse(s) => sparse_s_hat_v[s].clone(),
         };
         challenger.observe_f128_slice(&s_hat_v);
-        let grinding_nonce = (ring_switch_bits != 0)
-            .then(|| challenger.grind_pow(ring_switch_bits))
-            .unwrap_or(0);
-        let r_dprime = challenger.sample_f128_vec(LOG_PACKING);
+        let (grinding_nonce, r_dprime) = if ring_switch_bits != 0 {
+            challenger.grind_pow_and_sample_f128_vec(ring_switch_bits, LOG_PACKING)
+        } else {
+            (0, challenger.sample_f128_vec(LOG_PACKING))
+        };
         let eq_r_dprime = build_eq(&r_dprime);
 
         let s_hat_u = tensor_algebra_transpose(&s_hat_v);
@@ -2823,9 +2825,10 @@ fn prove_batched_padded_with_precomputed_and_grinding_impl<Ch: Challenger>(
     let gammas_rs: Vec<F128> = (0..n)
         .map(|_| {
             if batch_bits != 0 {
-                gamma_nonces.push(challenger.grind_pow(batch_bits));
-            }
-            if claim_batch_bits.is_some() {
+                let (nonce, gamma) = challenger.grind_pow_and_sample_f128(batch_bits);
+                gamma_nonces.push(nonce);
+                gamma
+            } else if claim_batch_bits.is_some() {
                 challenger.sample_f128()
             } else {
                 F128::ONE
@@ -2962,12 +2965,16 @@ pub fn verify_with_grinding<Ch: Challenger>(
     // zero-bit `Pow` operation elsewhere in the transcript.  Keep its carried
     // field canonical without calling `verify_pow` (which would absorb a
     // nonce and incorrectly change the legacy transcript).
-    if (grinding_bits == 0 && proof.grinding_nonce != 0)
-        || (grinding_bits != 0 && !challenger.verify_pow(proof.grinding_nonce, grinding_bits))
-    {
-        return Err(VerifyError::InvalidGrinding);
-    }
-    let r_dprime = challenger.sample_f128_vec(LOG_PACKING);
+    let r_dprime = if grinding_bits != 0 {
+        challenger
+            .verify_pow_and_sample_f128_vec(proof.grinding_nonce, grinding_bits, LOG_PACKING)
+            .ok_or(VerifyError::InvalidGrinding)?
+    } else {
+        if proof.grinding_nonce != 0 {
+            return Err(VerifyError::InvalidGrinding);
+        }
+        challenger.sample_f128_vec(LOG_PACKING)
+    };
     let eq_r_dprime = build_eq(&r_dprime);
 
     // Compute BaseFold target.
@@ -3035,12 +3042,16 @@ pub fn verify_succinct_with_grinding<Ch: Challenger>(
         return Err(VerifyError::ClaimMismatch);
     }
 
-    if (grinding_bits == 0 && proof.grinding_nonce != 0)
-        || (grinding_bits != 0 && !challenger.verify_pow(proof.grinding_nonce, grinding_bits))
-    {
-        return Err(VerifyError::InvalidGrinding);
-    }
-    let r_dprime = challenger.sample_f128_vec(LOG_PACKING);
+    let r_dprime = if grinding_bits != 0 {
+        challenger
+            .verify_pow_and_sample_f128_vec(proof.grinding_nonce, grinding_bits, LOG_PACKING)
+            .ok_or(VerifyError::InvalidGrinding)?
+    } else {
+        if proof.grinding_nonce != 0 {
+            return Err(VerifyError::InvalidGrinding);
+        }
+        challenger.sample_f128_vec(LOG_PACKING)
+    };
     let eq_r_dprime = build_eq(&r_dprime);
 
     let s_hat_u = tensor_algebra_transpose(&proof.s_hat_v);

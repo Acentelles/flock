@@ -55,6 +55,13 @@ pub const fn grinding_bits_for_degree(degree: usize) -> u32 {
 // it threads through must be able to cross into that pool. Both concrete
 // challengers (`RandomChallenger`, `FsChallenger`) are trivially `Send`.
 pub trait Challenger: Send {
+    /// Whether the explicit PoW+sample methods use the chained-BLAKE3 fused
+    /// transition rather than their legacy default composition. Recording
+    /// wrappers use this only to choose the matching transcript opcode.
+    fn supports_fused_pow_squeeze(&self) -> bool {
+        false
+    }
+
     /// Absorb a domain-separation label (e.g. `b"flock-zerocheck-v0"`). Each
     /// protocol entry should call this once on entry so a transcript from
     /// one protocol cannot be replayed as another.
@@ -108,6 +115,42 @@ pub trait Challenger: Send {
     /// proof if this returns `false`.
     fn verify_pow(&mut self, _nonce: u64, _bits: u32) -> bool {
         true
+    }
+
+    /// Prover-side fused PoW + scalar squeeze.  The default preserves the
+    /// legacy two-operation transcript; the chained-BLAKE3 challenger
+    /// overrides this with one compression that emits a disjoint PoW word and
+    /// challenge word.
+    fn grind_pow_and_sample_f128(&mut self, bits: u32) -> (u64, F128) {
+        let nonce = self.grind_pow(bits);
+        (nonce, self.sample_f128())
+    }
+
+    /// Verifier mirror of [`Self::grind_pow_and_sample_f128`].
+    fn verify_pow_and_sample_f128(&mut self, nonce: u64, bits: u32) -> Option<F128> {
+        if !self.verify_pow(nonce, bits) {
+            return None;
+        }
+        Some(self.sample_f128())
+    }
+
+    /// Prover-side fused PoW + vector squeeze.
+    fn grind_pow_and_sample_f128_vec(&mut self, bits: u32, n: usize) -> (u64, Vec<F128>) {
+        let nonce = self.grind_pow(bits);
+        (nonce, self.sample_f128_vec(n))
+    }
+
+    /// Verifier mirror of [`Self::grind_pow_and_sample_f128_vec`].
+    fn verify_pow_and_sample_f128_vec(
+        &mut self,
+        nonce: u64,
+        bits: u32,
+        n: usize,
+    ) -> Option<Vec<F128>> {
+        if !self.verify_pow(nonce, bits) {
+            return None;
+        }
+        Some(self.sample_f128_vec(n))
     }
 
     /// Construct the DOMAIN-SEPARATED child transcript from an
@@ -303,10 +346,10 @@ enum FsState {
 
 /// Chained-MD state over [`crate::hash::blake3_compress`]: `cv` is the
 /// running 256-bit chaining value, `buf` the pending partial block
-/// (invariant: `< 64` bytes after any absorb). Absorb compressions run at
-/// counter 0 — block order is bound by the cv chain itself, so a position
-/// counter would be BLAKE3-tree residue (and every distinct counter value
-/// costs a public in the recursion circuit).
+/// (invariant: `< 64` bytes after any absorb). Ordinary absorb compressions
+/// run at counter 0 — block order is bound by the cv chain itself, so a
+/// position counter would be BLAKE3-tree residue (and every distinct counter
+/// value costs a public in the recursion circuit).
 ///
 /// **Squeezes are DUPLEX (transcript-v3)**: a squeeze's first output row is
 /// `compress(cv, m = pending partial block zero-padded, 0, buf.len(),
@@ -317,9 +360,11 @@ enum FsState {
 /// the state: no separate flush compression, no `OP_SQUEEZE` header absorb,
 /// no per-finalize block fragmentation — under transcript-v2's discipline
 /// those three were ~30% of every recursion child's chain rows. Counter
-/// stays 0 everywhere (sequential cv chaining binds order; no two rows
-/// share a cv, so the old output index `j` is dead too). Consecutive
-/// squeezes separate because each advances `cv`.
+/// stays 0 for ordinary rows (sequential cv chaining binds order; no two rows
+/// share a cv, so the old output index `j` is dead too). The fused PoW+squeeze
+/// transition uses [`pow_squeeze_counter`] to bind its domain, difficulty and
+/// real message length. Consecutive squeezes separate because each advances
+/// `cv`.
 #[derive(Clone)]
 struct B3Chain {
     cv: [u32; 8],
@@ -331,6 +376,16 @@ struct B3Chain {
 const CHAIN_ABSORB: u32 = 1 << 6;
 /// Domain flag for squeeze/output compressions.
 const CHAIN_SQUEEZE: u32 = 1 << 7;
+
+/// Domain-separating counter prefix for a fused PoW+squeeze row.  Ordinary
+/// absorb and squeeze rows use counter zero.  The low word binds the requested
+/// difficulty and the number of real bytes in the zero-padded message block.
+pub const POW_SQUEEZE_COUNTER_TAG: u64 = 0xF10C_5000_0000_0000;
+
+#[inline]
+pub const fn pow_squeeze_counter(bits: u32, message_len: usize) -> u64 {
+    POW_SQUEEZE_COUNTER_TAG | ((message_len as u64) << 32) | bits as u64
+}
 
 impl B3Chain {
     fn new() -> Self {
@@ -388,6 +443,134 @@ impl B3Chain {
             first = false;
         }
         self.buf.clear();
+    }
+
+    fn pow_block(&self, nonce: u64) -> [u8; 64] {
+        assert!(
+            self.buf.len() + 16 <= 64,
+            "the aligned chained transcript must leave one word for a PoW nonce"
+        );
+        let mut block = [0u8; 64];
+        block[..self.buf.len()].copy_from_slice(&self.buf);
+        block[self.buf.len()..self.buf.len() + 8].copy_from_slice(&nonce.to_le_bytes());
+        // The next eight bytes are deliberately zero.  The recursive circuit
+        // constrains them, so the nonce has exactly 64 grinding bits.
+        block
+    }
+
+    fn pow_candidate_output(&self, nonce: u64, bits: u32) -> [u32; 16] {
+        let block = self.pow_block(nonce);
+        let m = Self::block_words(&block);
+        crate::hash::blake3_compress(
+            &self.cv,
+            &m,
+            pow_squeeze_counter(bits, self.buf.len() + 16),
+            64,
+            CHAIN_SQUEEZE,
+        )
+    }
+
+    /// Apply the fused transition after the nonce is known.  Output word 1 is
+    /// reserved for the PoW predicate; challenge bytes are words 0, 2 and 3,
+    /// followed by ordinary zero-message continuation rows.  The first row's
+    /// high half becomes the next chaining value, keeping a scalar challenge,
+    /// the PoW predicate and the continuing state pairwise disjoint.
+    fn apply_pow_squeeze(&mut self, nonce: u64, bits: u32, out: &mut [u8]) -> bool {
+        assert!(!out.is_empty(), "a PoW must protect at least one challenge word");
+        assert!(bits <= 128, "the fused PoW predicate occupies one F128 word");
+        let ob = self.pow_candidate_output(nonce, bits);
+        let mut first = [0u8; 64];
+        for (i, w) in ob.iter().enumerate() {
+            first[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        let ok = if bits == 0 {
+            nonce == 0
+        } else {
+            has_leading_zero_bits(&first[16..32], bits)
+        };
+
+        // out_hi is disjoint from both the predicate (out_lo word 1) and the
+        // scalar challenge (out_lo word 0).
+        self.cv = ob[8..16].try_into().expect("8 words");
+        self.buf.clear();
+
+        let mut off = 0usize;
+        for src in [&first[..16], &first[32..64]] {
+            let take = (out.len() - off).min(src.len());
+            out[off..off + take].copy_from_slice(&src[..take]);
+            off += take;
+            if off == out.len() {
+                return ok;
+            }
+        }
+        while off < out.len() {
+            let ob = crate::hash::blake3_compress(
+                &self.cv,
+                &[0u32; 16],
+                0,
+                0,
+                CHAIN_SQUEEZE,
+            );
+            self.cv = ob[..8].try_into().expect("8 words");
+            let mut bytes = [0u8; 64];
+            for (i, w) in ob.iter().enumerate() {
+                bytes[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+            }
+            let take = (out.len() - off).min(64);
+            out[off..off + take].copy_from_slice(&bytes[..take]);
+            off += take;
+        }
+        ok
+    }
+
+    fn grind_pow_squeeze_into(&mut self, bits: u32, out: &mut [u8]) -> u64 {
+        assert!(bits <= 128, "the fused PoW predicate occupies one F128 word");
+        const PARALLEL_GRIND_MIN_HASHES: u64 = 1 << 13;
+        const GRIND_CHUNK: u64 = 1 << 10;
+        let nonce = if bits == 0 {
+            0
+        } else if (1u64 << bits.min(63)) < PARALLEL_GRIND_MIN_HASHES {
+            let mut start = 0u64;
+            loop {
+                if let Some(n) = blake3_chain_pow_scan(
+                    &self.cv,
+                    &self.buf,
+                    start,
+                    GRIND_CHUNK,
+                    bits,
+                ) {
+                    break n;
+                }
+                start = start.saturating_add(GRIND_CHUNK);
+            }
+        } else {
+            use rayon::prelude::*;
+            let block = 1u64 << (bits.min(24) + 1);
+            let n_chunks = block.div_ceil(GRIND_CHUNK);
+            let mut start = 0u64;
+            loop {
+                let found = (0..n_chunks)
+                    .into_par_iter()
+                    .map(|chunk| {
+                        blake3_chain_pow_scan(
+                            &self.cv,
+                            &self.buf,
+                            start.saturating_add(chunk * GRIND_CHUNK),
+                            GRIND_CHUNK,
+                            bits,
+                        )
+                    })
+                    .find_first(|r| r.is_some())
+                    .flatten();
+                if let Some(n) = found {
+                    break n;
+                }
+                start = start.saturating_add(block);
+            }
+        };
+        let ok = self.apply_pow_squeeze(nonce, bits, out);
+        debug_assert!(ok, "the nonce search returned an invalid fused PoW");
+        nonce
     }
 }
 
@@ -581,6 +764,10 @@ impl FsChallenger {
 }
 
 impl Challenger for FsChallenger {
+    fn supports_fused_pow_squeeze(&self) -> bool {
+        matches!(&self.state, FsState::Blake3Chain(_))
+    }
+
     fn observe_label(&mut self, label: &[u8]) {
         self.absorb_header(OP_LABEL, 0, label.len() as u64);
         self.absorb_padded(label);
@@ -757,6 +944,79 @@ impl Challenger for FsChallenger {
         self.observe_bytes(&nonce.to_le_bytes());
         ok
     }
+
+    fn grind_pow_and_sample_f128(&mut self, bits: u32) -> (u64, F128) {
+        if let FsState::Blake3Chain(c) = &mut self.state {
+            let mut bytes = [0u8; 16];
+            let nonce = c.grind_pow_squeeze_into(bits, &mut bytes);
+            let value = F128 {
+                lo: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                hi: u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+            };
+            return (nonce, value);
+        }
+        let nonce = self.grind_pow(bits);
+        (nonce, self.sample_f128())
+    }
+
+    fn verify_pow_and_sample_f128(&mut self, nonce: u64, bits: u32) -> Option<F128> {
+        if let FsState::Blake3Chain(c) = &mut self.state {
+            let mut bytes = [0u8; 16];
+            if !c.apply_pow_squeeze(nonce, bits, &mut bytes) {
+                return None;
+            }
+            return Some(F128 {
+                lo: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                hi: u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+            });
+        }
+        if !self.verify_pow(nonce, bits) {
+            return None;
+        }
+        Some(self.sample_f128())
+    }
+
+    fn grind_pow_and_sample_f128_vec(&mut self, bits: u32, n: usize) -> (u64, Vec<F128>) {
+        if let FsState::Blake3Chain(c) = &mut self.state {
+            assert!(n != 0, "a fused PoW vector squeeze must be nonempty");
+            let mut bytes = vec![0u8; 16 * n];
+            let nonce = c.grind_pow_squeeze_into(bits, &mut bytes);
+            return (nonce, f128s_from_le_bytes(&bytes));
+        }
+        let nonce = self.grind_pow(bits);
+        (nonce, self.sample_f128_vec(n))
+    }
+
+    fn verify_pow_and_sample_f128_vec(
+        &mut self,
+        nonce: u64,
+        bits: u32,
+        n: usize,
+    ) -> Option<Vec<F128>> {
+        if let FsState::Blake3Chain(c) = &mut self.state {
+            assert!(n != 0, "a fused PoW vector squeeze must be nonempty");
+            let mut bytes = vec![0u8; 16 * n];
+            if !c.apply_pow_squeeze(nonce, bits, &mut bytes) {
+                return None;
+            }
+            return Some(f128s_from_le_bytes(&bytes));
+        }
+        if !self.verify_pow(nonce, bits) {
+            return None;
+        }
+        Some(self.sample_f128_vec(n))
+    }
+}
+
+fn f128s_from_le_bytes(bytes: &[u8]) -> Vec<F128> {
+    debug_assert_eq!(bytes.len() % 16, 0);
+    bytes
+        .chunks_exact(16)
+        .map(|c| F128 {
+            lo: u64::from_le_bytes(c[..8].try_into().unwrap()),
+            hi: u64::from_le_bytes(c[8..].try_into().unwrap()),
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -898,6 +1158,57 @@ fn blake3_pow_scan(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> 
         );
         for i in 0..n {
             if has_leading_zero_bits(&out[i * 32..(i + 1) * 32], bits) {
+                return Some(base + i as u64);
+            }
+        }
+        base += n as u64;
+    }
+    None
+}
+
+/// Batched nonce search for the chained transcript's fused PoW+squeeze row.
+/// `hash_many` returns the compression's first 32 bytes; word 1 (bytes
+/// 16..32) is the PoW predicate, while word 0 remains an unbiased challenge.
+fn blake3_chain_pow_scan(
+    cv: &[u32; 8],
+    pending: &[u8],
+    start: u64,
+    len: u64,
+    bits: u32,
+) -> Option<u64> {
+    use blake3::platform::Platform;
+    assert!(pending.len() + 16 <= 64, "one aligned nonce word must fit");
+    let counter = pow_squeeze_counter(bits, pending.len() + 16);
+    let nonce_at = pending.len();
+    let plat = Platform::detect();
+    let mut pre = [[0u8; 64]; BLAKE3_POW_BATCH];
+    for p in &mut pre {
+        p[..pending.len()].copy_from_slice(pending);
+    }
+    let mut compressed_lo = [0u8; BLAKE3_POW_BATCH * 32];
+    let mut base = start;
+    let end = start.saturating_add(len);
+    while base < end {
+        let n = BLAKE3_POW_BATCH.min((end - base) as usize);
+        for (i, p) in pre[..n].iter_mut().enumerate() {
+            p[nonce_at..nonce_at + 8].copy_from_slice(&(base + i as u64).to_le_bytes());
+        }
+        #[cfg(feature = "hash-count")]
+        fs_count::POW_SHA256.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        let inputs: [&[u8; 64]; BLAKE3_POW_BATCH] = std::array::from_fn(|i| &pre[i]);
+        plat.hash_many(
+            &inputs[..n],
+            cv,
+            counter,
+            blake3::IncrementCounter::No,
+            CHAIN_SQUEEZE as u8,
+            0,
+            0,
+            &mut compressed_lo[..n * 32],
+        );
+        for i in 0..n {
+            let lo = &compressed_lo[i * 32..(i + 1) * 32];
+            if has_leading_zero_bits(&lo[16..32], bits) {
                 return Some(base + i as u64);
             }
         }
@@ -1326,5 +1637,36 @@ mod b3_chain_tests {
         // one ONLY through subsequent output count — both advanced.
         let (dn, an) = (d.sample_f128(), a.sample_f128());
         assert_ne!(dn, an, "post-squeeze states advanced independently");
+    }
+
+    #[test]
+    fn fused_pow_squeeze_prover_and_verifier_stay_in_lockstep() {
+        let mut prover = FsChallenger::with_chained_blake3(b"fused-pow-test");
+        let mut verifier = FsChallenger::with_chained_blake3(b"fused-pow-test");
+        let observed = [F128::new(1, 2), F128::new(3, 4), F128::new(5, 6)];
+        prover.observe_f128_slice(&observed);
+        verifier.observe_f128_slice(&observed);
+
+        let (nonce, challenges) = prover.grind_pow_and_sample_f128_vec(6, 9);
+        let replay = verifier
+            .verify_pow_and_sample_f128_vec(nonce, 6, 9)
+            .expect("honest fused nonce verifies");
+        assert_eq!(replay, challenges);
+        assert_eq!(prover.sample_f128(), verifier.sample_f128());
+
+        let mut bad = FsChallenger::with_chained_blake3(b"fused-pow-test");
+        bad.observe_f128_slice(&observed);
+        let bad_nonce = (0..u64::MAX)
+            .find(|&n| n != nonce && {
+                let mut probe = bad.clone();
+                probe.verify_pow_and_sample_f128_vec(n, 6, 9).is_none()
+            })
+            .expect("an invalid six-bit nonce exists");
+        assert!(bad.verify_pow_and_sample_f128_vec(bad_nonce, 6, 9).is_none());
+
+        let mut zero = FsChallenger::with_chained_blake3(b"fused-pow-zero");
+        assert!(zero.verify_pow_and_sample_f128(1, 0).is_none());
+        let mut zero = FsChallenger::with_chained_blake3(b"fused-pow-zero");
+        assert!(zero.verify_pow_and_sample_f128(0, 0).is_some());
     }
 }

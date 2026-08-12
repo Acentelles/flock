@@ -1471,9 +1471,13 @@ impl BatchedGrinding {
 }
 
 #[inline]
-fn grind_if<C: Challenger>(ch: &mut C, nonces: &mut Vec<u64>, bits: u32) {
+fn grind_sample<C: Challenger>(ch: &mut C, nonces: &mut Vec<u64>, bits: u32) -> F128 {
     if bits != 0 {
-        nonces.push(ch.grind_pow(bits));
+        let (nonce, challenge) = ch.grind_pow_and_sample_f128(bits);
+        nonces.push(nonce);
+        challenge
+    } else {
+        ch.sample_f128()
     }
 }
 
@@ -1711,8 +1715,7 @@ fn prove_batched_grouped<C: Challenger>(
     );
     let t_sc_total = std::time::Instant::now();
     for k in 0..mu {
-        grind_if(ch, grinding_nonces, grinding.lambda_bits);
-        let lambda = ch.sample_f128();
+        let lambda = grind_sample(ch, grinding_nonces, grinding.lambda_bits);
         let mut rounds = Vec::with_capacity(k);
         let mut r_prime = Vec::with_capacity(k + 1);
         let (l0v, l1v) = l_layers[mu - (k + 1)].split();
@@ -1753,8 +1756,7 @@ fn prove_batched_grouped<C: Challenger>(
             };
             ch.observe_f128(msg.0);
             ch.observe_f128(msg.1);
-            grind_if(ch, grinding_nonces, grinding.round_bits);
-            let rho = ch.sample_f128();
+            let rho = grind_sample(ch, grinding_nonces, grinding.round_bits);
             rounds.push(msg);
             r_prime.push(rho);
             let cur_rows = match &cur {
@@ -1811,8 +1813,7 @@ fn prove_batched_grouped<C: Challenger>(
             vr0,
             vr1,
         });
-        grind_if(ch, grinding_nonces, grinding.close_bits);
-        let c_k = ch.sample_f128();
+        let c_k = grind_sample(ch, grinding_nonces, grinding.close_bits);
         let one_plus_c = F128::ONE + c_k;
         claim_l = one_plus_c * vl0 + c_k * vl1;
         claim_r = one_plus_c * vr0 + c_k * vr1;
@@ -1891,12 +1892,11 @@ fn prove_batched_impl<C: Challenger>(
     ch.observe_label(DOMAIN_BATCHED);
     let live_entries = live.map_or(n, |m| m.counts.iter().sum());
     let mut grinding_nonces = Vec::with_capacity(grinding.nonce_count(mu, live_entries));
-    grind_if(
+    let alpha = grind_sample(
         ch,
         &mut grinding_nonces,
         grinding.fingerprint_bits_for(live_entries),
     );
-    let alpha = ch.sample_f128();
     let beta = ch.sample_f128();
 
     if !force_dense {
@@ -1995,8 +1995,7 @@ fn prove_batched_impl<C: Challenger>(
     let mut cur: [Vec<F128>; 4] = std::array::from_fn(|_| crate::scratch::take_f128(cap));
     let mut nxt: [Vec<F128>; 4] = std::array::from_fn(|_| crate::scratch::take_f128(cap));
     for k in 0..mu {
-        grind_if(ch, &mut grinding_nonces, grinding.lambda_bits);
-        let lambda = ch.sample_f128();
+        let lambda = grind_sample(ch, &mut grinding_nonces, grinding.lambda_bits);
         let h = 1usize << k;
         // Live prefix length of each `cur` buffer; set at round 0, halved after.
         let mut len = 0usize;
@@ -2023,8 +2022,7 @@ fn prove_batched_impl<C: Challenger>(
             let (g1, g_inf) = pending.expect("round i's message was produced already");
             ch.observe_f128(g1);
             ch.observe_f128(g_inf);
-            grind_if(ch, &mut grinding_nonces, grinding.round_bits);
-            let rho = ch.sample_f128();
+            let rho = grind_sample(ch, &mut grinding_nonces, grinding.round_bits);
             rounds.push((g1, g_inf));
             r_prime.push(rho);
 
@@ -2091,8 +2089,7 @@ fn prove_batched_impl<C: Challenger>(
             vr0,
             vr1,
         });
-        grind_if(ch, &mut grinding_nonces, grinding.close_bits);
-        let c_k = ch.sample_f128();
+        let c_k = grind_sample(ch, &mut grinding_nonces, grinding.close_bits);
         let one_plus_c = F128::ONE + c_k;
         claim_l = one_plus_c * vl0 + c_k * vl1;
         claim_r = one_plus_c * vr0 + c_k * vr1;
@@ -2256,20 +2253,19 @@ fn verify_batched_core<C: Challenger>(
         return Err(VerifyError::InvalidGrinding);
     }
     let mut nonce_idx = 0usize;
-    let mut verify_grind = |ch: &mut C, bits: u32| -> Result<(), VerifyError> {
+    let mut verify_grind_sample = |ch: &mut C, bits: u32| -> Result<F128, VerifyError> {
         if bits != 0 {
             let nonce = proof.grinding_nonces[nonce_idx];
             nonce_idx += 1;
-            if !ch.verify_pow(nonce, bits) {
-                return Err(VerifyError::InvalidGrinding);
-            }
+            ch.verify_pow_and_sample_f128(nonce, bits)
+                .ok_or(VerifyError::InvalidGrinding)
+        } else {
+            Ok(ch.sample_f128())
         }
-        Ok(())
     };
 
     ch.observe_label(DOMAIN_BATCHED);
-    verify_grind(ch, grinding.fingerprint_bits_for(live_entries))?;
-    let alpha = ch.sample_f128();
+    let alpha = verify_grind_sample(ch, grinding.fingerprint_bits_for(live_entries))?;
     let beta = ch.sample_f128();
 
     ch.observe_f128(proof.top_lhs);
@@ -2285,8 +2281,7 @@ fn verify_batched_core<C: Challenger>(
         if layer.rounds.len() != k {
             return Err(VerifyError::MalformedProof);
         }
-        verify_grind(ch, grinding.lambda_bits)?;
-        let lambda = ch.sample_f128();
+        let lambda = verify_grind_sample(ch, grinding.lambda_bits)?;
         let mut c_run = claim_l + lambda * claim_r;
         let mut r_prime = Vec::with_capacity(k + 1);
         for i in 0..k {
@@ -2296,8 +2291,7 @@ fn verify_batched_core<C: Challenger>(
             let g0 = (c_run + r_eq * g1) * one_plus_r_eq.inv();
             ch.observe_f128(g1);
             ch.observe_f128(g_inf);
-            verify_grind(ch, grinding.round_bits)?;
-            let rho = ch.sample_f128();
+            let rho = verify_grind_sample(ch, grinding.round_bits)?;
             r_prime.push(rho);
             let one_plus_rho = F128::ONE + rho;
             c_run = g0 * one_plus_rho + g1 * rho + g_inf * rho * one_plus_rho;
@@ -2310,8 +2304,7 @@ fn verify_batched_core<C: Challenger>(
         if c_run != gate {
             return Err(VerifyError::LayerCheckFailed);
         }
-        verify_grind(ch, grinding.close_bits)?;
-        let c_k = ch.sample_f128();
+        let c_k = verify_grind_sample(ch, grinding.close_bits)?;
         let one_plus_c = F128::ONE + c_k;
         claim_l = one_plus_c * vl0 + c_k * vl1;
         claim_r = one_plus_c * vr0 + c_k * vr1;

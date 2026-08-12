@@ -254,10 +254,13 @@ pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
     //    B-claims for every slot (doc §"The B-claim, and batching the two
     //    sumchecks"); the cross-slot weights w_t(r) are fixed scalars, not
     //    randomness.
-    if let Some(bits) = grinding.alpha_bits() {
-        grinding_nonces.push(challenger.grind_pow(bits));
-    }
-    let alpha = challenger.sample_f128();
+    let alpha = if let Some(bits) = grinding.alpha_bits() {
+        let (nonce, alpha) = challenger.grind_pow_and_sample_f128(bits);
+        grinding_nonces.push(nonce);
+        alpha
+    } else {
+        challenger.sample_f128()
+    };
 
     // 2. Per-type α-batched combs via each type's quirky table — the slot's
     //    column coordinates of r are z_skip, dim6, and the LOW `κ_t − 7`
@@ -315,10 +318,13 @@ pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
     //     `verify_union` and the module docs.
     for (slot, slot_in) in registry.slots().iter().zip(slots) {
         if let Some(col) = slot_in.circuit.const_pin_col() {
-            if let Some(bits) = grinding.beta_bits() {
-                grinding_nonces.push(challenger.grind_pow(bits));
-            }
-            let beta = challenger.sample_f128();
+            let beta = if let Some(bits) = grinding.beta_bits() {
+                let (nonce, beta) = challenger.grind_pow_and_sample_f128(bits);
+                grinding_nonces.push(nonce);
+                beta
+            } else {
+                challenger.sample_f128()
+            };
             let off = slot.prefix << (slot.m_slot - nu);
             comb_vec[off + col] += beta;
         }
@@ -773,13 +779,15 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
     let mut nonce_idx = 0;
 
     // 1. Sample α (matches prover's order).
-    if let Some(bits) = grinding.alpha_bits() {
-        if !challenger.verify_pow(proof.grinding_nonces[nonce_idx], bits) {
-            return Err(VerifyError::InvalidGrindingNonce { which: "alpha" });
-        }
+    let alpha = if let Some(bits) = grinding.alpha_bits() {
+        let alpha = challenger
+            .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
+            .ok_or(VerifyError::InvalidGrindingNonce { which: "alpha" })?;
         nonce_idx += 1;
-    }
-    let alpha = challenger.sample_f128();
+        alpha
+    } else {
+        challenger.sample_f128()
+    };
 
     // 2. The per-type α-batched combs are NOT built here — they are the
     //    only `O(nnz)` step, and they are needed nowhere before the final
@@ -805,13 +813,15 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
     let mut betas: Vec<Option<F128>> = Vec::with_capacity(circuits.len());
     for (circuit, &n_t) in circuits.iter().zip(union.counts()) {
         if circuit.const_pin_col().is_some() {
-            if let Some(bits) = grinding.beta_bits() {
-                if !challenger.verify_pow(proof.grinding_nonces[nonce_idx], bits) {
-                    return Err(VerifyError::InvalidGrindingNonce { which: "beta" });
-                }
+            let beta = if let Some(bits) = grinding.beta_bits() {
+                let beta = challenger
+                    .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
+                    .ok_or(VerifyError::InvalidGrindingNonce { which: "beta" })?;
                 nonce_idx += 1;
-            }
-            let beta = challenger.sample_f128();
+                beta
+            } else {
+                challenger.sample_f128()
+            };
             betas.push(Some(beta));
             target += beta * eq_prefix_sum(&x_ab.x_outer, n_t);
         } else {
@@ -827,15 +837,17 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
     for &(e1, einf) in &proof.rounds {
         challenger.observe_f128(e1);
         challenger.observe_f128(einf);
-        if let Some(bits) = grinding.multilinear_round_bits() {
-            if !challenger.verify_pow(proof.grinding_nonces[nonce_idx], bits) {
-                return Err(VerifyError::InvalidGrindingNonce {
+        let r = if let Some(bits) = grinding.multilinear_round_bits() {
+            let r = challenger
+                .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
+                .ok_or(VerifyError::InvalidGrindingNonce {
                     which: "sumcheck-round",
-                });
-            }
+                })?;
             nonce_idx += 1;
-        }
-        let r = challenger.sample_f128();
+            r
+        } else {
+            challenger.sample_f128()
+        };
         // q(0) = claim + q(1) in char 2; q(X) = einf·X² + c1·X + e0.
         let e0 = running + e1;
         let c1 = e0 + e1 + einf;
@@ -865,16 +877,18 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
 
     // 6.–7. Fresh skip challenge after z_partial; claim value via φ8
     //       Lagrange (identical to the single-table verifier).
-    if let Some(bits) = grinding.skip_bits(k_skip) {
-        if !challenger.verify_pow(proof.grinding_nonces[nonce_idx], bits) {
-            return Err(VerifyError::InvalidGrindingNonce {
+    let r_inner_skip = if let Some(bits) = grinding.skip_bits(k_skip) {
+        let r = challenger
+            .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
+            .ok_or(VerifyError::InvalidGrindingNonce {
                 which: "inner-skip",
-            });
-        }
+            })?;
         nonce_idx += 1;
-    }
+        r
+    } else {
+        challenger.sample_f128()
+    };
     debug_assert_eq!(nonce_idx, proof.grinding_nonces.len());
-    let r_inner_skip = challenger.sample_f128();
     let lambda = lagrange_weights_naive(k_skip, r_inner_skip);
     let w = inner_product(&lambda, &proof.z_partial);
 
