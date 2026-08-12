@@ -3675,6 +3675,22 @@ struct SparseSeg {
     y: Vec<F128>,
 }
 
+/// One segment's message contribution — the dense pair convention over
+/// the segment's `(2t, 2t+1)` pairs (segments keep even start and even
+/// length, so pairs never straddle). The message is LINEAR in `x` and
+/// overlap `y` values agree, so per-segment sums computed BEFORE the
+/// boundary merge XOR to exactly the merged state's message.
+#[inline]
+fn seg_msg(x: &[F128], y: &[F128]) -> (F128, F128) {
+    let mut p1 = F128::ZERO;
+    let mut pi = F128::ZERO;
+    for (xp, yp) in x.chunks_exact(2).zip(y.chunks_exact(2)) {
+        p1 += xp[1] * yp[1];
+        pi += (xp[0] + xp[1]) * (yp[0] + yp[1]);
+    }
+    (p1, pi)
+}
+
 /// Segment-sparse fold state for the group product of the two-product
 /// sumcheck. The gather-shaped groups are supported on a few columns'
 /// live ranges (~9% of the dense area for the wired hash tables), yet the
@@ -3765,7 +3781,7 @@ impl SparseGroupPair {
                 cuts
             })
             .collect();
-        let segs: Vec<SparseSeg> = ranges
+        let segs = ranges
             .par_iter()
             .map(|&(s, e)| {
                 let mut x = vec![F128::ZERO; e - s];
@@ -3791,8 +3807,20 @@ impl SparseGroupPair {
                         d = stop;
                     }
                 }
-                let y = (s..e).map(|d| eq0.at(d)).collect();
-                SparseSeg { start: s, x, y }
+                let y: Vec<F128> = (s..e).map(|d| eq0.at(d)).collect();
+                // Round-0 message, fused per segment: segments are
+                // disjoint and the message is linear in `x`, so the
+                // per-segment sums XOR to the whole — one pass, not two.
+                let (p1, pi) = seg_msg(&x, &y);
+                (SparseSeg { start: s, x, y }, p1, pi)
+            })
+            .collect::<Vec<_>>();
+        let mut msg = (F128::ZERO, F128::ZERO);
+        let segs = segs
+            .into_iter()
+            .map(|(seg, p1, pi)| {
+                msg = (msg.0 + p1, msg.1 + pi);
+                seg
             })
             .collect();
         let pair = Self {
@@ -3801,7 +3829,6 @@ impl SparseGroupPair {
             c: F128::ONE,
             round: 0,
         };
-        let msg = pair.message();
         (pair, msg)
     }
 
@@ -3820,26 +3847,17 @@ impl SparseGroupPair {
         v
     }
 
-    /// The current message — same pair convention as the dense path:
-    /// `g(1) = Σ_t x[2t+1]·y[2t+1]`, `g(∞) = Σ_t (x[2t]+x[2t+1])·(y[2t]+y[2t+1])`.
-    /// Off-support pairs have `x = 0` on both legs and contribute nothing.
-    fn message(&self) -> (F128, F128) {
-        use rayon::prelude::*;
-        self.segs
-            .par_iter()
-            .map(|seg| {
-                let mut p1 = F128::ZERO;
-                let mut pi = F128::ZERO;
-                for (xp, yp) in seg.x.chunks_exact(2).zip(seg.y.chunks_exact(2)) {
-                    p1 += xp[1] * yp[1];
-                    pi += (xp[0] + xp[1]) * (yp[0] + yp[1]);
-                }
-                (p1, pi)
-            })
-            .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1))
-    }
-
     /// Fold every segment at `r` and return the next round's message.
+    ///
+    /// The message rides the fold pass — computed per segment on the
+    /// freshly folded values BEFORE the boundary merge ([`seg_msg`]'s
+    /// linearity argument makes that exact) — so a round is ONE pass over
+    /// the support, not two. And once the stored support is small the
+    /// whole round runs on the calling thread: the tail rounds' work
+    /// shrinks toward nothing while a rayon dispatch does not, and those
+    /// dispatches (two per round, ~20 rounds, interleaved with the RS
+    /// pair's own parallelism) were the group line's cost AND its
+    /// run-to-run variance.
     fn fold_round(&mut self, cur: usize, r: F128) -> (F128, F128) {
         debug_assert_eq!(cur, 1usize << (self.rho.len() - self.round));
         debug_assert!(cur >= 4);
@@ -3847,39 +3865,42 @@ impl SparseGroupPair {
         self.c *= F128::ONE + self.rho[self.round] + r;
         self.round += 1;
         let this = &*self;
-        let folded: Vec<SparseSeg> = {
+        let fold_one = |seg: &SparseSeg| -> (SparseSeg, F128, F128) {
+            let half = seg.x.len() / 2;
+            let mut s = seg.start / 2;
+            let mut x = Vec::with_capacity(half + 2);
+            let mut y = Vec::with_capacity(half + 2);
+            if s & 1 == 1 {
+                s -= 1;
+                x.push(F128::ZERO);
+                y.push(this.e_at(s));
+            }
+            for q in 0..half {
+                x.push(seg.x[2 * q] + r * (seg.x[2 * q] + seg.x[2 * q + 1]));
+                y.push(seg.y[2 * q] + r * (seg.y[2 * q] + seg.y[2 * q + 1]));
+            }
+            if (s + x.len()) & 1 == 1 {
+                let d = s + x.len();
+                x.push(F128::ZERO);
+                y.push(this.e_at(d));
+            }
+            let (p1, pi) = seg_msg(&x, &y);
+            (SparseSeg { start: s, x, y }, p1, pi)
+        };
+        let folded: Vec<(SparseSeg, F128, F128)> = if this.stored() < SPARSE_SERIAL_WORDS {
+            this.segs.iter().map(fold_one).collect()
+        } else {
             use rayon::prelude::*;
-            this.segs
-                .par_iter()
-                .map(|seg| {
-                    let half = seg.x.len() / 2;
-                    let mut s = seg.start / 2;
-                    let mut x = Vec::with_capacity(half + 2);
-                    let mut y = Vec::with_capacity(half + 2);
-                    if s & 1 == 1 {
-                        s -= 1;
-                        x.push(F128::ZERO);
-                        y.push(this.e_at(s));
-                    }
-                    for q in 0..half {
-                        x.push(seg.x[2 * q] + r * (seg.x[2 * q] + seg.x[2 * q + 1]));
-                        y.push(seg.y[2 * q] + r * (seg.y[2 * q] + seg.y[2 * q + 1]));
-                    }
-                    if (s + x.len()) & 1 == 1 {
-                        let d = s + x.len();
-                        x.push(F128::ZERO);
-                        y.push(this.e_at(d));
-                    }
-                    SparseSeg { start: s, x, y }
-                })
-                .collect()
+            this.segs.par_iter().map(fold_one).collect()
         };
         // Boundary padding can make neighbors overlap by up to two entries:
         // merge them. x adds (the true weights are disjointly supported and
         // padding is zero — folding is linear in x); y values agree (every
         // stored e entry is the true folded tensor value).
+        let mut msg = (F128::ZERO, F128::ZERO);
         let mut segs: Vec<SparseSeg> = Vec::with_capacity(folded.len());
-        for seg in folded {
+        for (seg, p1, pi) in folded {
+            msg = (msg.0 + p1, msg.1 + pi);
             match segs.last_mut() {
                 Some(prev) if seg.start < prev.start + prev.x.len() => {
                     let off = seg.start - prev.start;
@@ -3897,7 +3918,7 @@ impl SparseGroupPair {
             }
         }
         self.segs = segs;
-        self.message()
+        msg
     }
 
     /// Materialize the dense [`ProductPair`] for the tail rounds: scatter
@@ -3927,6 +3948,12 @@ impl SparseGroupPair {
 
 /// Densify once the stored support stops paying against the live length.
 const SPARSE_DENSIFY_FACTOR: usize = 4;
+
+/// Below this stored-support size a sparse fold round runs on the calling
+/// thread: the round's whole work is a few thousand multiplies —
+/// dispatch-sized — and the tail rounds' dispatches were the group line's
+/// variance under contention with the RS pair's parallelism.
+const SPARSE_SERIAL_WORDS: usize = 1 << 12;
 
 /// A product of the two-product sumcheck: a materialized weight with a
 /// virtual partner, the group product's segment-sparse state, or the RS
@@ -5128,9 +5155,17 @@ mod tests {
         let c1 = sample_vec(&mut ch, 128);
         let c2 = sample_vec(&mut ch, 128);
         let g1r = sample_vec(&mut ch, 15);
-        let g1cols = sample_vec(&mut ch, 1 << 11);
+        let mut g1cols = sample_vec(&mut ch, 1 << 11);
         let g2r = sample_vec(&mut ch, 15);
-        let g2cols = sample_vec(&mut ch, 1 << 11);
+        let mut g2cols = sample_vec(&mut ch, 1 << 11);
+        // Gather-shaped groups, like the real node's: zero the weights on
+        // 84 of the 93 tall columns so the union support is ~745k words —
+        // the spine arm reads "group sparse, support 752464". Fully dense
+        // cols would trip the densify gate and skip the sparse pair.
+        for y in 0..84 {
+            g1cols[y] = F128::ZERO;
+            g2cols[y] = F128::ZERO;
+        }
         let rho = sample_vec(&mut ch, 22);
         let claims = [
             FrobeniusClaim { z_row: &z1r, z_col: &z1c, coeffs: &c1 },
