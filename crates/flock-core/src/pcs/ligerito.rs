@@ -53,10 +53,13 @@ use serde::{Deserialize, Serialize};
 /// config" from the raw code rate: `Fast` and `Secure` share rate 1/2 but
 /// differ in regime/target, so the rate alone cannot key the config lookup.
 ///
-/// - `Fast`:   rate 1/2, Johnson list-decoding regime with OOD binding,
-///             100-bit overall soundness. Default.
-/// - `Slim`:   rate 1/4, Johnson + OOD + 16-bit query grinding, 100-bit
-///             overall. Roughly half the proof, ~2x the L0 encoding work.
+/// - `Fast`:   rate 1/2, Johnson list-decoding regime with OOD binding. Its
+///             query component is 128-bit; MCA remains at the 100-bit profile
+///             target until it is evaluated over the intended F256 field.
+///             Default.
+/// - `Slim`:   rate 1/4, Johnson + OOD + 16-bit query grinding. Its combined
+///             query work factor is 128-bit; MCA remains at the 100-bit
+///             profile target. Roughly half the proof, ~2x L0 encoding work.
 /// - `Secure`: rate 1/2, unique-decoding regime (list size 1, no OOD),
 ///             120-bit overall soundness. Largest proof, most conservative
 ///             analysis.
@@ -126,6 +129,13 @@ pub struct ProverConfig {
     /// proximity-gap term, which lives on the fold challenges. Length =
     /// recursive_steps + 1.
     pub fold_grinding_bits: Vec<usize>,
+    /// Per-level PoW bits for scalar challenges that batch evaluation claims
+    /// (OOD claims and the recursive consistency claim). Length =
+    /// recursive_steps + 1.
+    pub claim_batch_grinding_bits: Vec<usize>,
+    /// Per-level PoW bits for the vector challenge that batches the queried
+    /// consistency equations. Length = recursive_steps + 1.
+    pub consistency_batch_grinding_bits: Vec<usize>,
     /// Per-commit-level out-of-domain samples (L0, ..., L_r), taken right
     /// after the level's Merkle root enters the transcript. `[0]` must be 0:
     /// L0 is bound by the opening's own (post-commit, random-point)
@@ -197,6 +207,10 @@ pub struct VerifierConfig {
     /// Per-level fold-challenge PoW grinding bits (one grind per fold
     /// challenge of the level). Length = recursive_steps + 1.
     pub fold_grinding_bits: Vec<usize>,
+    /// Per-level evaluation-claim batching PoW bits. Length = recursive_steps + 1.
+    pub claim_batch_grinding_bits: Vec<usize>,
+    /// Per-level queried-consistency batching PoW bits. Length = recursive_steps + 1.
+    pub consistency_batch_grinding_bits: Vec<usize>,
     /// Per-commit-level OOD samples. Length = recursive_steps + 1.
     pub ood_samples: Vec<usize>,
     /// Hash the prover's Merkle commitments were built under. Must match the
@@ -360,6 +374,8 @@ pub fn default_config(
         queries,
         grinding_bits,
         fold_grinding_bits: vec![0usize; n_levels],
+        claim_batch_grinding_bits: vec![0usize; n_levels],
+        consistency_batch_grinding_bits: vec![0usize; n_levels],
         ood_samples: vec![0usize; n_levels],
         merkle_hash: HashKind::default(),
         stratified: vec![],
@@ -572,6 +588,8 @@ pub fn default_verifier_config(
         queries: p.queries,
         grinding_bits: p.grinding_bits,
         fold_grinding_bits: p.fold_grinding_bits,
+        claim_batch_grinding_bits: p.claim_batch_grinding_bits,
+        consistency_batch_grinding_bits: p.consistency_batch_grinding_bits,
         ood_samples: p.ood_samples,
         merkle_hash: p.merkle_hash,
         stratified: vec![],
@@ -607,9 +625,9 @@ pub enum SoundnessRegime {
     /// proximity-gap exceptional set `a = O_ρ(n / η^5)`; the level's
     /// `fold_grinding_bits` should be ≥ (target_bits − log₂(q/a)).
     /// Binding to a single codeword of the (Johnson-bounded) interleaved list
-    /// is via `ood_samples` explicit multilinear OOD evaluations — except at
-    /// L0, where the opening's own post-commit random evaluation claim plays
-    /// the OOD role (union over the list, `L·μ/q`), so `ood_samples = 0`.
+    /// uses two independent post-commit multilinear evaluations. At L0 the
+    /// opening's ordinary evaluation supplies the first and `ood_samples = 1`
+    /// supplies the second; deeper levels use `ood_samples = 2`.
     ///
     /// Note there is deliberately no plain `Johnson` variant: without OOD
     /// binding the query phase pays a union bound over the interleaved list
@@ -672,11 +690,20 @@ pub struct LigeritoLevelConfig {
     /// `eps_pg + fold_grinding_bits ≥ target`.
     #[serde(default)]
     pub fold_grinding_bits: usize,
-    /// Out-of-domain samples taken right after this level's commit enters
-    /// the transcript (`JohnsonOod` only). Each binds the prover to a single
-    /// codeword of the interleaved list via a multilinear evaluation claim.
-    /// Must be 0 at L0 (bound by the opening's own post-commit evaluation
-    /// claim) and ≥ 1 at deeper `JohnsonOod` levels.
+    /// PoW bits on every scalar coefficient that batches evaluation claims at
+    /// this level. The Flock paper's Appendix C.3 bounds the bad event by
+    /// `L_max / |F|`.
+    #[serde(default)]
+    pub claim_batch_grinding_bits: usize,
+    /// PoW bits on the multilinear challenge used to batch this level's
+    /// queried consistency equations. Its Schwartz--Zippel numerator is
+    /// `L_max * ceil(log2(queries))`.
+    #[serde(default)]
+    pub consistency_batch_grinding_bits: usize,
+    /// Additional out-of-domain samples taken right after this level's commit
+    /// enters the transcript (`JohnsonOod` only). Two total binding points are
+    /// required: exactly 1 explicit sample at L0 (whose opening claim is the
+    /// other point), and exactly 2 at every deeper level.
     #[serde(default)]
     pub ood_samples: usize,
     /// Security target this level guarantees, post-grinding.
@@ -687,12 +714,24 @@ pub struct LigeritoLevelConfig {
     /// Diagnostic — `Q · log₂(1/(1−γ))`. Should be ≥
     /// `target_security_bits − grinding_bits`.
     pub expected_eps_query_bits: f64,
-    /// Diagnostic — OOD binding bits (`JohnsonOod` only):
-    /// `s·(128 − log₂μ) − (2·log₂L − 1)` for explicit samples, or
-    /// `128 − log₂L − log₂μ` for the implicit L0 binding, where `L` is the
-    /// Johnson interleaved list size and `μ` the level's variable count.
+    /// Diagnostic — OOD collision-binding bits (`JohnsonOod` only):
+    /// `s·(128 − log₂μ) − (2·log₂L − 1)`, where `s = 2` counts
+    /// total independent points (including L0's ordinary opening point), `L`
+    /// is the Johnson interleaved list size, and `μ` the variable count.
     #[serde(default)]
     pub expected_eps_ood_bits: Option<f64>,
+    /// Diagnostic -- unground claim-batching bits
+    /// `128 - log2(L_max)` from the Flock paper's Appendix C.3.
+    #[serde(default)]
+    pub expected_eps_claim_batch_bits: f64,
+    /// Diagnostic -- unground per-round sumcheck bits
+    /// `128 - log2(2 * L_max)` from the Flock paper's Appendix C.3.
+    #[serde(default)]
+    pub expected_eps_sumcheck_bits: f64,
+    /// Diagnostic -- unground queried-consistency batching bits
+    /// `128 - log2(L_max * ceil(log2(queries)))`.
+    #[serde(default)]
+    pub expected_eps_consistency_batch_bits: f64,
 }
 
 /// Descriptor for the final-residual block (`yr`) sent in the clear at the
@@ -763,11 +802,87 @@ pub struct LigeritoSecurityConfig {
 
 /// Default field size used for soundness analysis: `q = 2^128` (our F128).
 const ANALYSIS_LOG_Q: f64 = 128.0;
+/// OOD list binding is a 128-bit component even while the Fast/Slim MCA
+/// profiles still carry their original 100-bit target.
+const OOD_BINDING_TARGET_BITS: f64 = 128.0;
+/// Algebraic error terms in Appendix C.3 of "Flock: Fast Proving for Batch
+/// Boolean Computations" are required to be strictly below 2^-128,
+/// independently of the legacy MCA target.
+const ALGEBRAIC_TARGET_BITS: f64 = 128.0;
+/// Every Johnson consistency-query component, including optional query-phase
+/// grinding, must have a work-normalized error below 2^-128.
+const LIST_DECODING_QUERY_TARGET_BITS: f64 = 128.0;
 
 /// Round a float to one decimal place. Used to round paper-predicted
 /// soundness diagnostics so the generated TOMLs stay readable.
 fn round1(x: f64) -> f64 {
     (x * 10.0).round() / 10.0
+}
+
+/// Smallest integer lambda >= 0 for which `2^(log2_numerator-lambda) < 1`.
+/// The strict inequality matters when the numerator is an exact power of two.
+fn strict_grinding_bits(log2_numerator: f64) -> usize {
+    if log2_numerator < 0.0 {
+        0
+    } else {
+        log2_numerator.floor() as usize + 1
+    }
+}
+
+/// Smallest positive Q such that
+/// `Q * per_query_bits + grinding_bits > target_bits`.
+///
+/// The floor-plus-one form deliberately implements a strict inequality, even
+/// when the quotient lands exactly on an integer boundary.
+fn strict_query_count(target_bits: f64, grinding_bits: usize, per_query_bits: f64) -> usize {
+    debug_assert!(per_query_bits > 0.0);
+    let remaining = (target_bits - grinding_bits as f64).max(0.0);
+    (remaining / per_query_bits).floor() as usize + 1
+}
+
+/// Effective PoW bits for fold round `j`. The MCA term tapers by one bit per
+/// round, whereas the independent sumcheck term `2*L_max/|F|` does not.
+/// `claim_batch_bits + 1` is exactly the strict requirement for `2*L_max`
+/// whenever the Flock paper's Appendix C.3 algebraic schedule is enabled.
+fn fold_round_grinding_bits(fold_bits: u32, claim_batch_bits: u32, j: usize) -> u32 {
+    let sumcheck_floor = if claim_batch_bits == 0 {
+        0
+    } else {
+        claim_batch_bits.saturating_add(1)
+    };
+    fold_bits
+        .saturating_sub(j as u32)
+        .max(sumcheck_floor)
+}
+
+/// Return `(claim_bits, sumcheck_bits, consistency_bits, raw diagnostics)` for
+/// the Flock paper's Appendix C.3 algebraic terms. `eta = None` denotes the
+/// UDR list `L=1`.
+fn algebraic_grinding_schedule(
+    log_inv_rate: usize,
+    eta: Option<f64>,
+    queries: usize,
+) -> (usize, usize, usize, f64, f64, f64) {
+    let log2_l = eta
+        .map(|eta| johnson_interleaved_list_log2(log_inv_rate, eta))
+        .unwrap_or(0.0);
+    let consistency_degree = ceil_log2(queries);
+    let log2_consistency_degree = if consistency_degree <= 1 {
+        0.0
+    } else {
+        (consistency_degree as f64).log2()
+    };
+    let claim_log_num = log2_l;
+    let sumcheck_log_num = 1.0 + log2_l;
+    let consistency_log_num = log2_l + log2_consistency_degree;
+    (
+        strict_grinding_bits(claim_log_num),
+        strict_grinding_bits(sumcheck_log_num),
+        strict_grinding_bits(consistency_log_num),
+        ANALYSIS_LOG_Q - claim_log_num,
+        ANALYSIS_LOG_Q - sumcheck_log_num,
+        ANALYSIS_LOG_Q - consistency_log_num,
+    )
 }
 
 /// Bit-level tolerance when comparing declared diagnostics
@@ -930,28 +1045,52 @@ fn johnson_interleaved_list_log2(log_inv_rate: usize, eta: f64) -> f64 {
     l_base.log2()
 }
 
-/// OOD binding bits for a `JohnsonOod` level. `mu_vars` is the level's
-/// multilinear variable count (`log_msg_cols + log_num_interleaved`).
+/// OOD collision-binding bits for a `JohnsonOod` level with
+/// `total_samples` independently sampled post-commit evaluation points.
+/// `mu_vars` is the level's multilinear variable count
+/// (`log_msg_cols + log_num_interleaved`).
 ///
-/// - `ood_samples ≥ 1` (explicit samples): the bad event is two distinct
-///   list elements agreeing on all `s` random points of `F^μ`
-///   (Schwartz–Zippel, total degree ≤ μ), union over pairs:
-///       bits = s·(128 − log₂ μ) − (2·log₂ L_int − 1).
-/// - `ood_samples = 0` (L0's implicit binding): the opening's own evaluation
-///   claim at a post-commit random point pins the prover to one claimed
-///   value, so the union is over the list (not pairs):
-///       bits = 128 − log₂ L_int − log₂ μ.
-fn paper_ood_bits(log_inv_rate: usize, eta: f64, mu_vars: usize, ood_samples: usize) -> f64 {
+/// For two distinct list elements, their difference has total degree at most
+/// `μ`, hence Schwartz–Zippel gives agreement probability at most
+/// `(μ/2^128)^s` at `s` independent points. Union bounding over unordered
+/// pairs in the Johnson list gives
+///
+///   bits = s·(128 − log₂ μ) − (2·log₂ L_int − 1).
+///
+/// L0 already has one post-commit point: the opening claim's evaluation
+/// point. Its configured `ood_samples` are therefore *additional* points;
+/// callers pass `1 + ood_samples` for L0 and `ood_samples` elsewhere.
+fn paper_ood_bits(log_inv_rate: usize, eta: f64, mu_vars: usize, total_samples: usize) -> f64 {
+    debug_assert!(total_samples >= 1);
     let log2_l = johnson_interleaved_list_log2(log_inv_rate, eta);
     let log2_mu = (mu_vars as f64).log2();
-    if ood_samples == 0 {
-        ANALYSIS_LOG_Q - log2_l - log2_mu
-    } else {
-        ood_samples as f64 * (ANALYSIS_LOG_Q - log2_mu) - (2.0 * log2_l - 1.0)
-    }
+    total_samples as f64 * (ANALYSIS_LOG_Q - log2_mu) - (2.0 * log2_l - 1.0)
 }
 
 impl LigeritoLevelConfig {
+    /// Algebraic terms from the Flock paper's Appendix C.3, before grinding:
+    /// `(claim batching, one sumcheck round, queried-consistency batching)`.
+    fn paper_predicted_algebraic_bits(&self) -> (f64, f64, f64) {
+        let log2_l = match self.regime {
+            SoundnessRegime::JohnsonOod => johnson_interleaved_list_log2(
+                self.log_inv_rate,
+                self.eta.expect("JohnsonOod must have eta"),
+            ),
+            SoundnessRegime::Udr => 0.0,
+        };
+        let consistency_degree = ceil_log2(self.queries);
+        let log2_consistency_degree = if consistency_degree <= 1 {
+            0.0
+        } else {
+            (consistency_degree as f64).log2()
+        };
+        (
+            ANALYSIS_LOG_Q - log2_l,
+            ANALYSIS_LOG_Q - (1.0 + log2_l),
+            ANALYSIS_LOG_Q - (log2_l + log2_consistency_degree),
+        )
+    }
+
     /// Compute the proximity-gap and per-query soundness bits this level is
     /// expected to deliver under its declared regime. Returns
     /// `(eps_pg_bits, eps_query_bits)` where:
@@ -1007,12 +1146,17 @@ impl LigeritoLevelConfig {
     /// OOD binding bits this level is expected to deliver (`JohnsonOod`
     /// only; `None` for `Udr`, where the unique-decoding list has size 1 and
     /// no binding step exists). See [`paper_ood_bits`].
-    pub fn paper_predicted_ood_bits(&self) -> Option<f64> {
+    pub fn paper_predicted_ood_bits(&self, implicit_samples: usize) -> Option<f64> {
         match self.regime {
             SoundnessRegime::JohnsonOod => {
                 let eta = self.eta.expect("JohnsonOod must have eta");
                 let mu = self.log_msg_cols + self.log_num_interleaved;
-                Some(paper_ood_bits(self.log_inv_rate, eta, mu, self.ood_samples))
+                Some(paper_ood_bits(
+                    self.log_inv_rate,
+                    eta,
+                    mu,
+                    implicit_samples + self.ood_samples,
+                ))
             }
             SoundnessRegime::Udr => None,
         }
@@ -1102,9 +1246,11 @@ impl LigeritoSecurityConfig {
                 _ => {}
             }
 
-            // OOD samples match regime: UDR has no list, so no OOD; under
-            // JohnsonOod every level past L0 needs explicit samples, while
-            // L0 is bound by the opening's own post-commit evaluation claim.
+            // OOD samples match regime: UDR has no list, so no OOD. In the
+            // Johnson regime every commitment is bound at two independent
+            // post-commit points. L0's opening evaluation is the first, so it
+            // carries one additional explicit OOD sample; later levels carry
+            // two explicit samples.
             match lv.regime {
                 SoundnessRegime::Udr if lv.ood_samples != 0 => {
                     return Err(format!(
@@ -1113,18 +1259,18 @@ impl LigeritoSecurityConfig {
                         lv.ood_samples
                     ));
                 }
-                SoundnessRegime::JohnsonOod if i == 0 && lv.ood_samples != 0 => {
+                SoundnessRegime::JohnsonOod if i == 0 && lv.ood_samples != 1 => {
                     return Err(format!(
-                        "L0: ood_samples={} but L0 is bound by the opening's \
-                         own evaluation claim (must be 0)",
+                        "L0: ood_samples={} but two-point binding requires one \
+                         explicit sample in addition to the opening claim",
                         lv.ood_samples
                     ));
                 }
-                SoundnessRegime::JohnsonOod if i > 0 && lv.ood_samples == 0 => {
+                SoundnessRegime::JohnsonOod if i > 0 && lv.ood_samples != 2 => {
                     return Err(format!(
-                        "L{i}: regime=johnson_ood requires ood_samples ≥ 1 \
-                         past L0 (the query counts assume single-codeword \
-                         binding)"
+                        "L{i}: two-point Johnson binding requires exactly two \
+                         explicit OOD samples, got {}",
+                        lv.ood_samples
                     ));
                 }
                 _ => {}
@@ -1142,7 +1288,7 @@ impl LigeritoSecurityConfig {
                 }
                 (SoundnessRegime::JohnsonOod, Some(declared)) => {
                     let pred = lv
-                        .paper_predicted_ood_bits()
+                        .paper_predicted_ood_bits(usize::from(i == 0))
                         .expect("JohnsonOod has an OOD prediction");
                     if (declared - pred).abs() > PAPER_COMPAT_TOL_BITS {
                         return Err(format!(
@@ -1183,6 +1329,65 @@ impl LigeritoSecurityConfig {
                 ));
             }
 
+            let (claim_pred, sumcheck_pred, consistency_pred) =
+                lv.paper_predicted_algebraic_bits();
+            for (name, declared, predicted) in [
+                (
+                    "expected_eps_claim_batch_bits",
+                    lv.expected_eps_claim_batch_bits,
+                    claim_pred,
+                ),
+                (
+                    "expected_eps_sumcheck_bits",
+                    lv.expected_eps_sumcheck_bits,
+                    sumcheck_pred,
+                ),
+                (
+                    "expected_eps_consistency_batch_bits",
+                    lv.expected_eps_consistency_batch_bits,
+                    consistency_pred,
+                ),
+            ] {
+                if (declared - predicted).abs() > PAPER_COMPAT_TOL_BITS {
+                    return Err(format!(
+                        "L{i}: {name} ({declared:.2}) doesn't match Appendix C.3 \
+                         prediction ({predicted:.2}); tolerance +/-{:.2} bits",
+                        PAPER_COMPAT_TOL_BITS
+                    ));
+                }
+            }
+
+            // The list-unioned algebraic terms from the Flock paper's
+            // Appendix C.3 must be STRICTLY below 2^-128. Check the exact
+            // (unrounded) numerators so a power-of-two boundary cannot pass by
+            // rounding.
+            let claim_log_numerator = ALGEBRAIC_TARGET_BITS - claim_pred;
+            let sumcheck_log_numerator = ALGEBRAIC_TARGET_BITS - sumcheck_pred;
+            let consistency_log_numerator = ALGEBRAIC_TARGET_BITS - consistency_pred;
+            let required_claim = strict_grinding_bits(claim_log_numerator);
+            let required_sumcheck = strict_grinding_bits(sumcheck_log_numerator);
+            let required_consistency = strict_grinding_bits(consistency_log_numerator);
+            if lv.claim_batch_grinding_bits < required_claim {
+                return Err(format!(
+                    "L{i}: claim_batch_grinding_bits ({}) < required ({required_claim})",
+                    lv.claim_batch_grinding_bits
+                ));
+            }
+            if lv.fold_grinding_bits < required_sumcheck {
+                return Err(format!(
+                    "L{i}: fold_grinding_bits ({}) < Appendix C.3 sumcheck \
+                     requirement ({required_sumcheck})",
+                    lv.fold_grinding_bits
+                ));
+            }
+            if lv.consistency_batch_grinding_bits < required_consistency {
+                return Err(format!(
+                    "L{i}: consistency_batch_grinding_bits ({}) < required \
+                     ({required_consistency})",
+                    lv.consistency_batch_grinding_bits
+                ));
+            }
+
             // Security: queries cover the gap left by grinding.
             if lv.target_security_bits > lv.grinding_bits
                 && lv.expected_eps_query_bits + 1e-3
@@ -1195,6 +1400,23 @@ impl LigeritoSecurityConfig {
                     lv.grinding_bits,
                     lv.target_security_bits - lv.grinding_bits
                 ));
+            }
+
+            // Johnson/list-decoding consistency queries are an independently
+            // 128-bit component. Use the exact prediction, not the one-decimal
+            // TOML diagnostic, and require a strict bound:
+            //   (1-gamma)^Q * 2^-lambda_query < 2^-128
+            // iff Q*log2(1/(1-gamma)) + lambda_query > 128.
+            if lv.regime == SoundnessRegime::JohnsonOod {
+                let delivered = q_pred + lv.grinding_bits as f64;
+                if delivered <= LIST_DECODING_QUERY_TARGET_BITS {
+                    return Err(format!(
+                        "L{i}: query soundness ({q_pred:.6} + {} grinding = \
+                         {delivered:.6} bits) must be strictly above the \
+                         {LIST_DECODING_QUERY_TARGET_BITS}-bit list-decoding target",
+                        lv.grinding_bits
+                    ));
+                }
             }
 
             // Per-application proximity gap + fold-challenge grinding must
@@ -1210,15 +1432,14 @@ impl LigeritoSecurityConfig {
                 ));
             }
 
-            // OOD binding must reach target on its own (no grind covers it;
-            // escalate ood_samples instead).
+            // OOD binding is independently a 128-bit component even though
+            // the Johnson MCA/proximity profile still targets 100 bits.
             if let Some(ood) = lv.expected_eps_ood_bits
-                && ood + 1e-3 < lv.target_security_bits as f64
+                && ood + 1e-3 < OOD_BINDING_TARGET_BITS
             {
                 return Err(format!(
-                    "L{i}: expected_eps_ood_bits ({ood:.2}) < target ({}); \
-                         increase ood_samples",
-                    lv.target_security_bits
+                    "L{i}: expected_eps_ood_bits ({ood:.2}) < OOD target \
+                     ({OOD_BINDING_TARGET_BITS}); increase ood_samples"
                 ));
             }
 
@@ -1304,9 +1525,18 @@ impl LigeritoSecurityConfig {
             let eps_pg = ANALYSIS_LOG_Q - log_a;
             // Any pg shortfall is ground on the fold challenges (where the
             // pg bad event lives); 0 at the 100-bit target.
-            let fold_grinding_bits =
+            let proximity_fold_grinding_bits =
                 ((target_security_bits as f64) - eps_pg).ceil().max(0.0) as usize;
             let eps_query = queries as f64 * per_q;
+            let (
+                claim_batch_grinding_bits,
+                sumcheck_grinding_bits,
+                consistency_batch_grinding_bits,
+                eps_claim_batch,
+                eps_sumcheck,
+                eps_consistency_batch,
+            ) = algebraic_grinding_schedule(rate, None, queries);
+            let fold_grinding_bits = proximity_fold_grinding_bits.max(sumcheck_grinding_bits);
             levels.push(LigeritoLevelConfig {
                 log_inv_rate: rate,
                 log_msg_cols: log_msg_cols_per_level[i],
@@ -1318,11 +1548,16 @@ impl LigeritoSecurityConfig {
                 queries,
                 grinding_bits: 0,
                 fold_grinding_bits,
+                claim_batch_grinding_bits,
+                consistency_batch_grinding_bits,
                 ood_samples: 0,
                 target_security_bits,
                 expected_eps_pg_bits: round1(eps_pg),
                 expected_eps_query_bits: round1(eps_query),
                 expected_eps_ood_bits: None,
+                expected_eps_claim_batch_bits: round1(eps_claim_batch),
+                expected_eps_sumcheck_bits: round1(eps_sumcheck),
+                expected_eps_consistency_batch_bits: round1(eps_consistency_batch),
             });
         }
         // Final residual: yr_log_n = log_n − initial_k − Σ k_recursive
@@ -1352,9 +1587,11 @@ impl LigeritoSecurityConfig {
     /// Fiat-Shamir security (cf. Ethereum's `soundcalc`), not a whole-protocol
     /// union bound over terms. The three shipped profiles:
     ///
-    /// - `Fast`:   JohnsonOod, rate 1/2, η = 0.02, 100 bits per round.
+    /// - `Fast`:   JohnsonOod, rate 1/2, η = 0.02, 128-bit query component;
+    ///             the deferred MCA component retains its 100-bit target.
     /// - `Slim`:   JohnsonOod, rate 1/4, η = 0.02, 16-bit query grinding at
-    ///             every level, 100 bits per round.
+    ///             every level, 128-bit combined query work factor; the
+    ///             deferred MCA component retains its 100-bit target.
     /// - `Secure`: Udr, rate 1/2, ε* = 1e-3, 120 bits per round.
     pub fn derive_profile(m: usize, profile: LigeritoProfile) -> Result<Self, String> {
         /// Johnson slack below the Johnson radius, flat across levels.
@@ -1364,6 +1601,10 @@ impl LigeritoSecurityConfig {
         let query_grind: usize = match profile {
             LigeritoProfile::Slim => 16,
             LigeritoProfile::Fast | LigeritoProfile::Secure => 0,
+        };
+        let query_target_bits = match profile {
+            LigeritoProfile::Fast | LigeritoProfile::Slim => LIST_DECODING_QUERY_TARGET_BITS,
+            LigeritoProfile::Secure => target_bits as f64,
         };
         let log_n = m
             .checked_sub(crate::pcs::LOG_PACKING)
@@ -1379,8 +1620,8 @@ impl LigeritoSecurityConfig {
         // (rows ≈ 28-31 words). Soundness derives identically: Johnson
         // per-query bits depend on rate/η only, so per-level query counts
         // are unchanged; the Fast ladder re-derives as cols 17/14/11/8
-        // (yr 5, Σq 491) and the Slim ladder as cols 17/14/11/8/5
-        // (yr 5, Σq 262). Secure keeps 6 (unused by the recursion track).
+        // (yr 5, Σq 629) and the Slim ladder as cols 17/14/11/8/5
+        // (yr 5, Σq 347). Secure keeps 6 (unused by the recursion track).
         // m28 joined 2026-08-05 when the transcript-v3 duplex pushed the
         // slim L1 recursion node under 2^21 words: initial_k = 4 keeps the
         // same 2^17 columns (cols = log_n − initial_k = 21 − 4).
@@ -1405,11 +1646,11 @@ impl LigeritoSecurityConfig {
 
         // Shape derivation needs per-level query counts for block-length
         // feasibility before the level count (and hence the exact per-term
-        // target) is known. Use a conservative target of target_bits + 5
+        // target) is known. Use a conservative target of query_target_bits + 5
         // (≥ log₂(3 terms · 10 levels)); the final counts are ≤ this.
-        let t_feas = target_bits as f64 + 5.0;
+        let t_feas = query_target_bits + 5.0;
         let queries_feas = |rate: usize| -> usize {
-            ((t_feas - query_grind as f64).max(1.0) / per_query_bits_feas(rate)).ceil() as usize
+            strict_query_count(t_feas, query_grind, per_query_bits_feas(rate))
         };
         let shape = derive_ladder_shape(log_n, initial_k, log_inv_rate, &queries_feas)?;
         let n_levels = shape.log_inv_rates.len();
@@ -1439,7 +1680,7 @@ impl LigeritoSecurityConfig {
                     paper_per_query_bits(rate, JOHNSON_ETA)
                 }
             };
-            let queries = ((t - query_grind as f64).max(1.0) / per_q).ceil() as usize;
+            let queries = strict_query_count(query_target_bits, query_grind, per_q);
             if queries > (1usize << (cols + rate)) {
                 return Err(format!(
                     "L{i}: {queries} queries exceed block length 2^{}",
@@ -1467,16 +1708,13 @@ impl LigeritoSecurityConfig {
                 LigeritoProfile::Fast | LigeritoProfile::Slim => {
                     let eps_pg = ANALYSIS_LOG_Q - paper_johnson_log_a(rate, JOHNSON_ETA, cols, ilv);
                     let mu = cols + ilv;
-                    let ood_samples = if i == 0 {
-                        0 // bound by the opening's own evaluation claim
-                    } else {
-                        (1..=8usize)
-                            .find(|&s| paper_ood_bits(rate, JOHNSON_ETA, mu, s) >= t)
-                            .ok_or_else(|| {
-                                format!("L{i}: no OOD sample count reaches {t:.1} bits")
-                            })?
-                    };
-                    let eps_ood = paper_ood_bits(rate, JOHNSON_ETA, mu, ood_samples);
+                    // Two independent binding points at every commitment.
+                    // L0's ordinary opening point is already post-commit and
+                    // supplies the first; all later points are explicit.
+                    let implicit_samples = usize::from(i == 0);
+                    let total_samples = 2usize;
+                    let ood_samples = total_samples - implicit_samples;
+                    let eps_ood = paper_ood_bits(rate, JOHNSON_ETA, mu, total_samples);
                     (
                         SoundnessRegime::JohnsonOod,
                         Some(JOHNSON_ETA),
@@ -1487,7 +1725,21 @@ impl LigeritoSecurityConfig {
                     )
                 }
             };
-            let fold_grinding_bits = (t - eps_pg).ceil().max(0.0) as usize;
+            let proximity_fold_grinding_bits = (t - eps_pg).ceil().max(0.0) as usize;
+            let (
+                claim_batch_grinding_bits,
+                sumcheck_grinding_bits,
+                consistency_batch_grinding_bits,
+                eps_claim_batch,
+                eps_sumcheck,
+                eps_consistency_batch,
+            ) = algebraic_grinding_schedule(rate, eta, queries);
+            // One fold challenge carries both bad events from the Flock
+            // paper's Appendix C.3. A single PoW therefore protects both, at
+            // the larger requirement.
+            // The MCA target remains profile-local here; its stronger
+            // configuration uses arithmetic over the intended F256 field.
+            let fold_grinding_bits = proximity_fold_grinding_bits.max(sumcheck_grinding_bits);
 
             levels.push(LigeritoLevelConfig {
                 log_inv_rate: rate,
@@ -1500,18 +1752,23 @@ impl LigeritoSecurityConfig {
                 queries,
                 grinding_bits: query_grind,
                 fold_grinding_bits,
+                claim_batch_grinding_bits,
+                consistency_batch_grinding_bits,
                 ood_samples,
                 target_security_bits: target_bits,
                 expected_eps_pg_bits: round1(eps_pg),
                 expected_eps_query_bits: round1(eps_query),
                 expected_eps_ood_bits: eps_ood,
+                expected_eps_claim_batch_bits: round1(eps_claim_batch),
+                expected_eps_sumcheck_bits: round1(eps_sumcheck),
+                expected_eps_consistency_batch_bits: round1(eps_consistency_batch),
             });
         }
 
         let analysis_version = match profile {
             LigeritoProfile::Secure => "no_row_union_over_ben_sasson_2025_cor_1_4",
             LigeritoProfile::Fast | LigeritoProfile::Slim => {
-                "johnson_ood_row_union_over_bchks25_thm_4_6"
+                "johnson_two_point_ood_query128_c3_algebraic_row_union_over_bchks25_thm_4_6"
             }
         };
         let cfg = Self {
@@ -1572,6 +1829,16 @@ impl LigeritoSecurityConfig {
         let grinding_bits: Vec<usize> = self.levels.iter().map(|lv| lv.grinding_bits).collect();
         let fold_grinding_bits: Vec<usize> =
             self.levels.iter().map(|lv| lv.fold_grinding_bits).collect();
+        let claim_batch_grinding_bits: Vec<usize> = self
+            .levels
+            .iter()
+            .map(|lv| lv.claim_batch_grinding_bits)
+            .collect();
+        let consistency_batch_grinding_bits: Vec<usize> = self
+            .levels
+            .iter()
+            .map(|lv| lv.consistency_batch_grinding_bits)
+            .collect();
         let ood_samples: Vec<usize> = self.levels.iter().map(|lv| lv.ood_samples).collect();
         let prover = ProverConfig {
             log_inv_rates: log_inv_rates.clone(),
@@ -1584,6 +1851,8 @@ impl LigeritoSecurityConfig {
             queries: queries.clone(),
             grinding_bits: grinding_bits.clone(),
             fold_grinding_bits: fold_grinding_bits.clone(),
+            claim_batch_grinding_bits: claim_batch_grinding_bits.clone(),
+            consistency_batch_grinding_bits: consistency_batch_grinding_bits.clone(),
             ood_samples: ood_samples.clone(),
             merkle_hash,
             stratified: vec![],
@@ -1600,6 +1869,8 @@ impl LigeritoSecurityConfig {
             queries,
             grinding_bits,
             fold_grinding_bits,
+            claim_batch_grinding_bits,
+            consistency_batch_grinding_bits,
             ood_samples,
             merkle_hash,
             stratified: vec![],
@@ -1664,8 +1935,8 @@ pub struct LigeritoProof {
     #[serde(default)]
     pub grinding_nonces: Vec<u64>,
     /// Claimed multilinear OOD evaluations, flattened in transcript order
-    /// (level 1's `ood_samples[1]` values, then level 2's, ...). Empty when
-    /// the config takes no OOD samples (UDR profiles, legacy paths).
+    /// (L0's additional `ood_samples[0]` values, then level 1's, ...). Empty
+    /// when the config takes no OOD samples (UDR profiles, legacy paths).
     #[serde(default)]
     pub ood_values: Vec<F128>,
     /// Fold-challenge PoW nonces, flattened in transcript order — one per
@@ -1673,6 +1944,15 @@ pub struct LigeritoProof {
     /// when no level fold-grinds.
     #[serde(default)]
     pub fold_grinding_nonces: Vec<u64>,
+    /// Scalar claim-batching PoW nonces, flattened in transcript order: OOD
+    /// batching coefficients and one recursive-consistency glue coefficient
+    /// per level.
+    #[serde(default)]
+    pub claim_batch_grinding_nonces: Vec<u64>,
+    /// One PoW nonce per level for the multilinear challenge that batches the
+    /// queried consistency equations.
+    #[serde(default)]
+    pub consistency_batch_grinding_nonces: Vec<u64>,
 }
 
 impl LigeritoProof {
@@ -1697,7 +1977,11 @@ impl LigeritoProof {
             + self.final_proof.merkle_proof.len() * 32;
         total += self.sumcheck_transcript.len() * 2 * ELEM;
         total += self.ood_values.len() * ELEM;
-        total += (self.grinding_nonces.len() + self.fold_grinding_nonces.len()) * 8;
+        total += (self.grinding_nonces.len()
+            + self.fold_grinding_nonces.len()
+            + self.claim_batch_grinding_nonces.len()
+            + self.consistency_batch_grinding_nonces.len())
+            * 8;
         total
     }
 
@@ -2707,6 +2991,40 @@ fn round_msg_and_eval_lsb(f: &[F128], b: &[F128]) -> (SumcheckMessage, F128) {
     (SumcheckMessage { u_0, u_2 }, y)
 }
 
+/// Block-pairing counterpart of [`round_msg_and_eval_lsb`]. `d = 1` is the
+/// ordinary LSB order; `d > 1` pairs corresponding entries in adjacent
+/// `d`-word blocks, as required by a lane-major L0 fold.
+fn round_msg_and_eval_blocked(f: &[F128], b: &[F128], d: usize) -> (SumcheckMessage, F128) {
+    use rayon::prelude::*;
+    debug_assert!(d.is_power_of_two());
+    debug_assert_eq!(f.len(), b.len());
+    debug_assert!(f.len().is_multiple_of(2 * d));
+    if d == 1 {
+        return round_msg_and_eval_lsb(f, b);
+    }
+    let (u_0, u_2, y) = (0..f.len() / (2 * d))
+        .into_par_iter()
+        .map(|j| {
+            let (mut u0, mut u2, mut eval) = (F128::ZERO, F128::ZERO, F128::ZERO);
+            let b0 = 2 * j * d;
+            let b1 = b0 + d;
+            for k in 0..d {
+                let (f0, f1) = (f[b0 + k], f[b1 + k]);
+                let (e0, e1) = (b[b0 + k], b[b1 + k]);
+                let f0e0 = f0 * e0;
+                u0 += f0e0;
+                u2 += (f0 + f1) * (e0 + e1);
+                eval += f0e0 + f1 * e1;
+            }
+            (u0, u2, eval)
+        })
+        .reduce(
+            || (F128::ZERO, F128::ZERO, F128::ZERO),
+            |(a0, a2, ae), (b0, b2, be)| (a0 + b0, a2 + b2, ae + be),
+        );
+    (SumcheckMessage { u_0, u_2 }, y)
+}
+
 /// Partially evaluate `evals` at LSB variable = `r`, in place. Halves length.
 /// Parallel for large arrays. Test oracle for the fused fold below; the
 /// production path uses `fold_and_msg_lsb` instead.
@@ -3146,7 +3464,7 @@ fn fold_and_msg_blocked_jit(
 /// The basis is materialized exactly once, at the LAST L0 round (where
 /// `blocks_out == 1` and the next round pairs elements anyway), at the
 /// handoff size `2^(log_n − initial_k)` the recursion needs.
-pub(crate) struct VirtualEqBasis {
+struct VirtualEqTerm {
     /// Surviving point coordinates; coordinate `j` ↔ index bit `j` (the
     /// [`build_eq_table`] convention the caller's tensor was built under).
     coords: Vec<F128>,
@@ -3157,17 +3475,17 @@ pub(crate) struct VirtualEqBasis {
     n_lo: usize,
 }
 
-impl VirtualEqBasis {
-    pub(crate) fn new(point: Vec<F128>, gamma: F128) -> Self {
-        let mut vb = Self {
+impl VirtualEqTerm {
+    fn new(point: Vec<F128>, gamma: F128) -> Self {
+        let mut term = Self {
             coords: point,
             scale: gamma,
             lo: Vec::new(),
             hi: Vec::new(),
             n_lo: 0,
         };
-        vb.rebuild();
-        vb
+        term.rebuild();
+        term
     }
 
     fn rebuild(&mut self) {
@@ -3192,6 +3510,12 @@ impl VirtualEqBasis {
         1usize << self.coords.len()
     }
 
+    #[inline]
+    fn value_at(&self, u: usize) -> F128 {
+        let mask = (1usize << self.n_lo) - 1;
+        self.lo[u & mask] * self.hi[u >> self.n_lo]
+    }
+
     /// `out = b[g0 .. g0 + out.len()]`. Walked in runs where the `hi` factor
     /// is constant, so the inner loop is one multiply per word.
     fn fill(&self, out: &mut [F128], g0: usize) {
@@ -3210,6 +3534,65 @@ impl VirtualEqBasis {
         }
     }
 
+    fn add_to(&self, out: &mut [F128], g0: usize) {
+        let span = 1usize << self.n_lo;
+        let mask = span - 1;
+        let mut i = 0;
+        while i < out.len() {
+            let u = g0 + i;
+            let e_hi = self.hi[u >> self.n_lo];
+            let off = u & mask;
+            let n = (out.len() - i).min(span - off);
+            for (k, s) in out[i..i + n].iter_mut().enumerate() {
+                *s += self.lo[off + k] * e_hi;
+            }
+            i += n;
+        }
+    }
+}
+
+/// A factored sum of scaled equality tensors. It starts with the opening's
+/// basis and can absorb L0's additional OOD term without materializing a
+/// `2^log_n` vector.
+pub(crate) struct VirtualEqBasis {
+    terms: Vec<VirtualEqTerm>,
+}
+
+impl VirtualEqBasis {
+    pub(crate) fn new(point: Vec<F128>, gamma: F128) -> Self {
+        Self {
+            terms: vec![VirtualEqTerm::new(point, gamma)],
+        }
+    }
+
+    fn add_term(&mut self, point: Vec<F128>, scale: F128) {
+        assert_eq!(point.len(), self.terms[0].coords.len());
+        self.terms.push(VirtualEqTerm::new(point, scale));
+    }
+
+    fn fold_coord(&mut self, p: usize, r: F128) {
+        for term in &mut self.terms {
+            term.fold_coord(p, r);
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.terms[0].len()
+    }
+
+    fn fill(&self, out: &mut [F128], g0: usize) {
+        self.terms[0].fill(out, g0);
+        for term in &self.terms[1..] {
+            term.add_to(out, g0);
+        }
+    }
+
+    fn add_to(&self, out: &mut [F128], g0: usize) {
+        for term in &self.terms {
+            term.add_to(out, g0);
+        }
+    }
+
     /// The full basis, for the handoff into the recursive levels.
     fn materialize(&self) -> Vec<F128> {
         use rayon::prelude::*;
@@ -3221,6 +3604,40 @@ impl VirtualEqBasis {
             .for_each(|(ci, c)| self.fill(c, ci * CH));
         out
     }
+}
+
+/// Round-0 message and MLE evaluation for an unscaled equality tensor,
+/// retaining its square-root factorization throughout the pass.
+fn round_msg_and_eval_eq_point_blocked(
+    f: &[F128],
+    point: &[F128],
+    d: usize,
+) -> (SumcheckMessage, F128) {
+    use rayon::prelude::*;
+    debug_assert_eq!(f.len(), 1usize << point.len());
+    debug_assert!(f.len().is_multiple_of(2 * d));
+    let eq = VirtualEqTerm::new(point.to_vec(), F128::ONE);
+    let (u_0, u_2, y) = (0..f.len() / (2 * d))
+        .into_par_iter()
+        .map(|j| {
+            let (mut u0, mut u2, mut eval) = (F128::ZERO, F128::ZERO, F128::ZERO);
+            let i0 = 2 * j * d;
+            let i1 = i0 + d;
+            for k in 0..d {
+                let (f0, f1) = (f[i0 + k], f[i1 + k]);
+                let (e0, e1) = (eq.value_at(i0 + k), eq.value_at(i1 + k));
+                let f0e0 = f0 * e0;
+                u0 += f0e0;
+                u2 += (f0 + f1) * (e0 + e1);
+                eval += f0e0 + f1 * e1;
+            }
+            (u0, u2, eval)
+        })
+        .reduce(
+            || (F128::ZERO, F128::ZERO, F128::ZERO),
+            |(a0, a2, ae), (b0, b2, be)| (a0 + b0, a2 + b2, ae + be),
+        );
+    (SumcheckMessage { u_0, u_2 }, y)
 }
 
 /// Fold `f` only, at block granularity `d` (the [`fold_and_msg_blocked`]
@@ -3950,8 +4367,8 @@ pub(crate) fn recursive_prover_with_basis_precomputed_round0_lanes<Ch: Challenge
 fn recursive_prover_with_basis_impl<Ch: Challenger>(
     config: &ProverConfig,
     packed_witness: Vec<F128>,
-    b_initial: Vec<F128>,
-    target: F128,
+    mut b_initial: Vec<F128>,
+    mut target: F128,
     l0_codeword: &[F128],
     l0_tree: &[Hash],
     l0_num_lanes: usize,
@@ -3959,7 +4376,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     l0_live_blocks_in: usize,
     l0_jit_basis: Option<BasisWindowFn<'_>>,
     l0_virtual_basis: Option<VirtualEqBasis>,
-    first_msg: Option<SumcheckMessage>,
+    mut first_msg: Option<SumcheckMessage>,
     challenger: &mut Ch,
 ) -> (LigeritoProof, Vec<F128>) {
     let log_n = packed_witness.len().trailing_zeros() as usize;
@@ -3973,6 +4390,12 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     assert!(b_initial.len() == 1usize << log_n || (factored_basis && b_initial.is_empty()));
     assert_eq!(config.recursive_ks.len(), r);
     assert_eq!(config.log_inv_rates.len(), r + 1);
+    assert_eq!(config.queries.len(), r + 1);
+    assert_eq!(config.grinding_bits.len(), r + 1);
+    assert_eq!(config.fold_grinding_bits.len(), r + 1);
+    assert_eq!(config.claim_batch_grinding_bits.len(), r + 1);
+    assert_eq!(config.consistency_batch_grinding_bits.len(), r + 1);
+    assert_eq!(config.ood_samples.len(), r + 1);
     assert!(r >= 1);
 
     let log_inv_rate_0 = config.log_inv_rates[0];
@@ -4036,20 +4459,78 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     };
     challenger.observe_bytes(initial_cap.as_flattened());
 
-    // L0 takes no explicit OOD samples: it is bound by the opening's own
-    // evaluation claim (`target` at the post-commit random point behind
-    // `b_initial`), which plays the OOD role with a union over the list
-    // instead of over pairs. See `paper_ood_bits`.
-    assert_eq!(
-        config.ood_samples.first().copied().unwrap_or(0),
-        0,
-        "L0 must not take explicit OOD samples"
-    );
     let mut ood_values: Vec<F128> = Vec::new();
     let mut fold_grinding_nonces: Vec<u64> = Vec::new();
+    let mut claim_batch_grinding_nonces: Vec<u64> = Vec::new();
+    let mut consistency_batch_grinding_nonces: Vec<u64> = Vec::new();
     let fold_bits =
         |lvl: usize| -> u32 { config.fold_grinding_bits.get(lvl).copied().unwrap_or(0) as u32 };
+    let claim_batch_bits = |lvl: usize| -> u32 {
+        config
+            .claim_batch_grinding_bits
+            .get(lvl)
+            .copied()
+            .unwrap_or(0) as u32
+    };
+    let consistency_batch_bits = |lvl: usize| -> u32 {
+        config
+            .consistency_batch_grinding_bits
+            .get(lvl)
+            .copied()
+            .unwrap_or(0) as u32
+    };
     let ood_count = |lvl: usize| -> usize { config.ood_samples.get(lvl).copied().unwrap_or(0) };
+
+    // L0's ordinary opening evaluation is the first post-commit binding
+    // point. Batch each configured additional OOD claim into the INITIAL
+    // sumcheck before its first message. For the production factored-eq path,
+    // retain the new equality tensor in factored form as well: the second
+    // point must not regress the inner open to a 2^log_n basis allocation.
+    let mut vbasis = l0_virtual_basis;
+    let mut jit_ood_basis: Option<VirtualEqBasis> = None;
+    {
+        use rayon::prelude::*;
+        let _t = std::time::Instant::now();
+        for _ in 0..ood_count(0) {
+            let z = challenger.sample_f128_vec(log_n);
+            let (ood_msg, y, eq_z) = if factored_basis {
+                let (msg, y) =
+                    round_msg_and_eval_eq_point_blocked(&packed_witness, &z, l0_fold_block);
+                (msg, y, None)
+            } else {
+                let eq = build_eq_table(&z);
+                let (msg, y) = round_msg_and_eval_blocked(&packed_witness, &eq, l0_fold_block);
+                (msg, y, Some(eq))
+            };
+            challenger.observe_f128(y);
+            ood_values.push(y);
+            let (nonce, beta) = challenger.grind_pow_and_sample_f128(claim_batch_bits(0));
+            claim_batch_grinding_nonces.push(nonce);
+            target += beta * y;
+            if let Some(msg) = first_msg.as_mut() {
+                msg.u_0 += beta * ood_msg.u_0;
+                msg.u_2 += beta * ood_msg.u_2;
+            }
+            if factored_basis {
+                if let Some(vb) = vbasis.as_mut() {
+                    vb.add_term(z, beta);
+                } else if let Some(vb) = jit_ood_basis.as_mut() {
+                    vb.add_term(z, beta);
+                } else {
+                    jit_ood_basis = Some(VirtualEqBasis::new(z, beta));
+                }
+            } else {
+                let eq = eq_z.expect("materialized L0 basis has materialized OOD eq");
+                b_initial
+                    .par_iter_mut()
+                    .zip(eq.par_iter())
+                    .for_each(|(b, &e)| *b += beta * e);
+            }
+        }
+        if trace {
+            t_ood += _t.elapsed();
+        }
+    }
 
     let _t = std::time::Instant::now();
     let (mut sc_prover, start_msg) = match first_msg {
@@ -4063,11 +4544,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         None => SumcheckProver::new(packed_witness, b_initial, target),
     };
     let mut jit = l0_jit_basis;
-    let mut vbasis = l0_virtual_basis;
-    debug_assert!(
-        vbasis.is_none() || l0_fold_block > 1,
-        "the virtual basis rides the BLOCKED fold (the lane-major L0)"
-    );
     challenger.observe_f128(start_msg.u_0);
     challenger.observe_f128(start_msg.u_2);
 
@@ -4079,10 +4555,10 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         // varying the preceding sumcheck message; the grind prices every
         // such attempt). Tapered per round: round j folds a 2^{ℓ-j}-row word
         // whose MCA error carries the factor 2^{ℓ-1-j} (App. C.3 Lemma
-        // `mca-commutes`), so it needs (fold_bits − j) bits — one fewer per
-        // round than the worst (j=0) round `fold_grinding_bits` is sized for.
-        // Derived from fold_grinding_bits + round index; not stored.
-        let bits = fold_bits(0).saturating_sub(j as u32);
+        // `mca-commutes`), so that component needs (fold_bits − j) bits. The
+        // independent `2 L_max / |F|` sumcheck term does not taper, hence the
+        // constant `claim_batch_bits + 1` floor in the helper below.
+        let bits = fold_round_grinding_bits(fold_bits(0), claim_batch_bits(0), j);
         let r = if bits > 0 {
             let (nonce, r) = challenger.grind_pow_and_sample_f128(bits);
             fold_grinding_nonces.push(nonce);
@@ -4104,7 +4580,23 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 }
             }
             None => match jit.take() {
-                Some(fill) => sc_prover.fold_blocked_jit(r, l0_fold_block, l0_live_blocks, fill),
+                Some(fill) => match jit_ood_basis.as_ref() {
+                    Some(ood) => {
+                        let combined_fill = |out: &mut [F128], g0: usize| {
+                            fill(out, g0);
+                            ood.add_to(out, g0);
+                        };
+                        sc_prover.fold_blocked_jit(
+                            r,
+                            l0_fold_block,
+                            l0_live_blocks,
+                            &combined_fill,
+                        )
+                    }
+                    None => {
+                        sc_prover.fold_blocked_jit(r, l0_fold_block, l0_live_blocks, fill)
+                    }
+                },
                 None => sc_prover.fold_blocked(r, l0_fold_block, l0_live_blocks),
             },
         };
@@ -4161,7 +4653,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             ood_values.push(y);
             challenger.observe_f128(intro.u_0);
             challenger.observe_f128(intro.u_2);
-            let beta = challenger.sample_f128();
+            let (nonce, beta) = challenger.grind_pow_and_sample_f128(claim_batch_bits(1));
+            claim_batch_grinding_nonces.push(nonce);
             sc_prover.glue(beta);
         }
         if trace {
@@ -4184,7 +4677,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         strat(0),
     );
     let mut grinding_nonces: Vec<u64> = vec![pow_nonce_0];
-    let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
+    let (nonce, alpha_0) = challenger.grind_pow_and_sample_f128_vec(
+        consistency_batch_bits(0),
+        ceil_log2(num_queries_0),
+    );
+    consistency_batch_grinding_nonces.push(nonce);
     let _t = std::time::Instant::now();
     let opened_rows_0: Vec<Vec<F128>> = queries_0.iter().map(|&q| l0_row(q).to_vec()).collect();
     let merkle_proof_0 = merkle_paths_for(l0_tree, l0_block_len, &queries_0, strat(0));
@@ -4219,7 +4716,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let intro_msg_0 = sc_prover.introduce_new(basis_0_induced, enforced_sum_0);
     challenger.observe_f128(intro_msg_0.u_0);
     challenger.observe_f128(intro_msg_0.u_2);
-    let beta_0 = challenger.sample_f128();
+    let (nonce, beta_0) = challenger.grind_pow_and_sample_f128(claim_batch_bits(0));
+    claim_batch_grinding_nonces.push(nonce);
     sc_prover.glue(beta_0);
     if trace {
         t_intro_glue += _t.elapsed();
@@ -4239,9 +4737,14 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let _t = std::time::Instant::now();
         for j in 0..k_i {
             // These folds fold level i+1's commitment — fold-challenge
-            // grinding guards its proximity-gap term. Tapered per round:
-            // round j needs (fold_bits − j) bits (see L0 loop).
-            let bits = fold_bits(i + 1).saturating_sub(j as u32);
+            // grinding guards both its tapered proximity-gap term and its
+            // untapered sumcheck term from the Flock paper's Appendix C.3
+            // (see the L0 loop).
+            let bits = fold_round_grinding_bits(
+                fold_bits(i + 1),
+                claim_batch_bits(i + 1),
+                j,
+            );
             let ri = if bits > 0 {
                 let (nonce, ri) = challenger.grind_pow_and_sample_f128(bits);
                 fold_grinding_nonces.push(nonce);
@@ -4274,6 +4777,18 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 strat(i + 1),
             );
             grinding_nonces.push(nonce_last);
+            let (nonce, alpha_last) = challenger.grind_pow_and_sample_f128_vec(
+                consistency_batch_bits(i + 1),
+                ceil_log2(num_queries_last),
+            );
+            consistency_batch_grinding_nonces.push(nonce);
+            let (nonce, _beta_last) =
+                challenger.grind_pow_and_sample_f128(claim_batch_bits(i + 1));
+            claim_batch_grinding_nonces.push(nonce);
+            // The final challenges are verifier-only arithmetic, but the
+            // prover must execute their PoW steps so their nonces are carried
+            // in the proof and can be checked natively and recursively.
+            let _ = alpha_last;
             let _t = std::time::Instant::now();
             let opened_rows_last: Vec<Vec<F128>> = queries_last
                 .iter()
@@ -4338,6 +4853,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     grinding_nonces,
                     ood_values,
                     fold_grinding_nonces,
+                    claim_batch_grinding_nonces,
+                    consistency_batch_grinding_nonces,
                 },
                 ris_all,
             );
@@ -4379,7 +4896,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 ood_values.push(y);
                 challenger.observe_f128(intro.u_0);
                 challenger.observe_f128(intro.u_2);
-                let beta = challenger.sample_f128();
+                let (nonce, beta) =
+                    challenger.grind_pow_and_sample_f128(claim_batch_bits(i + 2));
+                claim_batch_grinding_nonces.push(nonce);
                 sc_prover.glue(beta);
             }
             if trace {
@@ -4397,7 +4916,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             strat(i + 1),
         );
         grinding_nonces.push(nonce_i);
-        let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
+        let (nonce, alpha_i) = challenger.grind_pow_and_sample_f128_vec(
+            consistency_batch_bits(i + 1),
+            ceil_log2(num_queries_i),
+        );
+        consistency_batch_grinding_nonces.push(nonce);
         let _t = std::time::Instant::now();
         let opened_rows_i: Vec<Vec<F128>> = queries_i
             .iter()
@@ -4435,7 +4958,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let intro_msg_i = sc_prover.introduce_new(basis_i_induced, enforced_sum_i);
         challenger.observe_f128(intro_msg_i.u_0);
         challenger.observe_f128(intro_msg_i.u_2);
-        let beta_i = challenger.sample_f128();
+        let (nonce, beta_i) = challenger.grind_pow_and_sample_f128(claim_batch_bits(i + 1));
+        claim_batch_grinding_nonces.push(nonce);
         sc_prover.glue(beta_i);
         if trace {
             t_intro_glue += _t.elapsed();
@@ -4485,7 +5009,16 @@ where
 
     let initial_k = config.initial_k;
     let r = config.recursive_steps;
-    if r < 1 || config.recursive_ks.len() != r || config.log_inv_rates.len() != r + 1 {
+    if r < 1
+        || config.recursive_ks.len() != r
+        || config.log_inv_rates.len() != r + 1
+        || config.queries.len() != r + 1
+        || config.grinding_bits.len() != r + 1
+        || config.fold_grinding_bits.len() != r + 1
+        || config.claim_batch_grinding_bits.len() != r + 1
+        || config.consistency_batch_grinding_bits.len() != r + 1
+        || config.ood_samples.len() != r + 1
+    {
         return false;
     }
     if proof.initial_cap.as_slice() != expected_initial_cap {
@@ -4509,24 +5042,26 @@ where
         return false;
     }
 
-    let mut t_r = target;
-    let mut tx_idx = 0usize;
-    if tx_idx >= proof.sumcheck_transcript.len() {
-        return false;
-    }
-    let start_msg = proof.sumcheck_transcript[tx_idx];
-    tx_idx += 1;
-    challenger.observe_f128(start_msg.u_0);
-    challenger.observe_f128(start_msg.u_2);
-    let mut running_quad = RoundQuad::from_msg(start_msg, t_r);
-
     let fold_bits =
         |lvl: usize| -> u32 { config.fold_grinding_bits.get(lvl).copied().unwrap_or(0) as u32 };
+    let claim_batch_bits = |lvl: usize| -> u32 {
+        config
+            .claim_batch_grinding_bits
+            .get(lvl)
+            .copied()
+            .unwrap_or(0) as u32
+    };
+    let consistency_batch_bits = |lvl: usize| -> u32 {
+        config
+            .consistency_batch_grinding_bits
+            .get(lvl)
+            .copied()
+            .unwrap_or(0) as u32
+    };
     let ood_count = |lvl: usize| -> usize { config.ood_samples.get(lvl).copied().unwrap_or(0) };
-    if config.ood_samples.first().copied().unwrap_or(0) != 0 {
-        return false; // L0 must be bound by the opening's own eval claim
-    }
     let mut fold_nonce_idx = 0usize;
+    let mut claim_batch_nonce_idx = 0usize;
+    let mut consistency_batch_nonce_idx = 0usize;
     let mut ood_idx = 0usize;
     // OOD claims glued into the running sumcheck: each contributes
     // `beta · Π_b eq(z_b, r_b) · eq(z_tail, ·)` at the residual.
@@ -4537,11 +5072,55 @@ where
     }
     let mut ood_ctxs: Vec<OodCtx> = Vec::new();
 
+    let mut t_r = target;
+    // L0's extra binding point is batched before the initial sumcheck
+    // message. The ordinary opening evaluation is its first point.
+    for _ in 0..ood_count(0) {
+        let mut z = challenger.sample_f128_vec(log_n);
+        if ood_idx >= proof.ood_values.len() {
+            return false;
+        }
+        let y = proof.ood_values[ood_idx];
+        ood_idx += 1;
+        challenger.observe_f128(y);
+        if claim_batch_nonce_idx >= proof.claim_batch_grinding_nonces.len() {
+            return false;
+        }
+        let Some(beta) = challenger.verify_pow_and_sample_f128(
+            proof.claim_batch_grinding_nonces[claim_batch_nonce_idx],
+            claim_batch_bits(0),
+        ) else {
+            return false;
+        };
+        claim_batch_nonce_idx += 1;
+        t_r += beta * y;
+        // A partial lane grid folds the HIGH lane coordinates first. Store
+        // the point in actual sumcheck-fold order so the generic residual
+        // prefix formula pairs every challenge with the coordinate it bound.
+        if l0_num_lanes < 1usize << initial_k {
+            z.rotate_left(log_msg_cols_0);
+        }
+        ood_ctxs.push(OodCtx {
+            z,
+            ris_start: 0,
+            beta,
+        });
+    }
+    let mut tx_idx = 0usize;
+    if tx_idx >= proof.sumcheck_transcript.len() {
+        return false;
+    }
+    let start_msg = proof.sumcheck_transcript[tx_idx];
+    tx_idx += 1;
+    challenger.observe_f128(start_msg.u_0);
+    challenger.observe_f128(start_msg.u_2);
+    let mut running_quad = RoundQuad::from_msg(start_msg, t_r);
+
     let mut r_lane_fold = Vec::with_capacity(initial_k);
     for j in 0..initial_k {
-        // Fold-challenge PoW mirror (L0's lane folds), tapered per round to
-        // (fold_bits − j) — see the prover's L0 loop.
-        let bits = fold_bits(0).saturating_sub(j as u32);
+        // Fold-challenge PoW mirror; see the prover's L0 loop for the
+        // tapered MCA / untapered sumcheck maximum.
+        let bits = fold_round_grinding_bits(fold_bits(0), claim_batch_bits(0), j);
         let ri = if bits > 0 {
             if fold_nonce_idx >= proof.fold_grinding_nonces.len() {
                 return false;
@@ -4593,7 +5172,16 @@ where
         challenger.observe_f128(intro_msg.u_0);
         challenger.observe_f128(intro_msg.u_2);
         let intro_quad = RoundQuad::from_msg(intro_msg, y);
-        let beta = challenger.sample_f128();
+        if claim_batch_nonce_idx >= proof.claim_batch_grinding_nonces.len() {
+            return false;
+        }
+        let Some(beta) = challenger.verify_pow_and_sample_f128(
+            proof.claim_batch_grinding_nonces[claim_batch_nonce_idx],
+            claim_batch_bits(1),
+        ) else {
+            return false;
+        };
+        claim_batch_nonce_idx += 1;
         running_quad = RoundQuad::fold(&running_quad, &intro_quad, beta);
         t_r += beta * y;
         ood_ctxs.push(OodCtx {
@@ -4627,7 +5215,17 @@ where
     if trace {
         t_sample_q += _t.elapsed();
     }
-    let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
+    if consistency_batch_nonce_idx >= proof.consistency_batch_grinding_nonces.len() {
+        return false;
+    }
+    let Some(alpha_0) = challenger.verify_pow_and_sample_f128_vec(
+        proof.consistency_batch_grinding_nonces[consistency_batch_nonce_idx],
+        consistency_batch_bits(0),
+        ceil_log2(num_queries_0),
+    ) else {
+        return false;
+    };
+    consistency_batch_nonce_idx += 1;
     let _t = std::time::Instant::now();
     if !verify_level_opens(
         &proof.initial_cap,
@@ -4668,7 +5266,16 @@ where
     challenger.observe_f128(intro_msg_0.u_0);
     challenger.observe_f128(intro_msg_0.u_2);
     let intro_quad_0 = RoundQuad::from_msg(intro_msg_0, enforced_sum_0);
-    let beta_0 = challenger.sample_f128();
+    if claim_batch_nonce_idx >= proof.claim_batch_grinding_nonces.len() {
+        return false;
+    }
+    let Some(beta_0) = challenger.verify_pow_and_sample_f128(
+        proof.claim_batch_grinding_nonces[claim_batch_nonce_idx],
+        claim_batch_bits(0),
+    ) else {
+        return false;
+    };
+    claim_batch_nonce_idx += 1;
     running_quad = RoundQuad::fold(&running_quad, &intro_quad_0, beta_0);
     t_r += beta_0 * enforced_sum_0;
 
@@ -4704,9 +5311,13 @@ where
         }
         let mut level_rs = Vec::with_capacity(k_i);
         for j in 0..k_i {
-            // Fold-challenge PoW mirror (level i+1's folds), tapered per round
-            // to (fold_bits − j) — see the prover's L0 loop.
-            let bits = fold_bits(i + 1).saturating_sub(j as u32);
+            // Fold-challenge PoW mirror; see the prover's L0 loop for the
+            // tapered MCA / untapered sumcheck maximum.
+            let bits = fold_round_grinding_bits(
+                fold_bits(i + 1),
+                claim_batch_bits(i + 1),
+                j,
+            );
             let ri = if bits > 0 {
                 if fold_nonce_idx >= proof.fold_grinding_nonces.len() {
                     return false;
@@ -4774,7 +5385,17 @@ where
             // after `yr` was observed (top of this branch) and the queries are
             // fixed — so a forged `yr` cannot be adapted to it. Mirrors `alpha_i`
             // at every non-final level (see ~line 3377).
-            let alpha_last = challenger.sample_f128_vec(ceil_log2(num_queries_last));
+            if consistency_batch_nonce_idx >= proof.consistency_batch_grinding_nonces.len() {
+                return false;
+            }
+            let Some(alpha_last) = challenger.verify_pow_and_sample_f128_vec(
+                proof.consistency_batch_grinding_nonces[consistency_batch_nonce_idx],
+                consistency_batch_bits(i + 1),
+                ceil_log2(num_queries_last),
+            ) else {
+                return false;
+            };
+            consistency_batch_nonce_idx += 1;
             if trace {
                 t_sample_q += _t.elapsed();
             }
@@ -4814,7 +5435,16 @@ where
                 &queries_last,
                 &alpha_last,
             );
-            let beta_last = challenger.sample_f128();
+            if claim_batch_nonce_idx >= proof.claim_batch_grinding_nonces.len() {
+                return false;
+            }
+            let Some(beta_last) = challenger.verify_pow_and_sample_f128(
+                proof.claim_batch_grinding_nonces[claim_batch_nonce_idx],
+                claim_batch_bits(i + 1),
+            ) else {
+                return false;
+            };
+            claim_batch_nonce_idx += 1;
             t_r += beta_last * enforced_sum_last;
             level_ctxs.push(LevelCtx {
                 log_msg_cols: n_current,
@@ -4925,6 +5555,15 @@ where
                     t_evalb.as_secs_f64() * 1e3
                 );
             }
+            if trace && inner != t_r {
+                eprintln!("  residual mismatch: inner={inner:?}, t_r={t_r:?}");
+            }
+            if claim_batch_nonce_idx != proof.claim_batch_grinding_nonces.len()
+                || consistency_batch_nonce_idx
+                    != proof.consistency_batch_grinding_nonces.len()
+            {
+                return false;
+            }
             return inner == t_r;
         }
 
@@ -4952,7 +5591,16 @@ where
             challenger.observe_f128(intro_msg.u_0);
             challenger.observe_f128(intro_msg.u_2);
             let intro_quad = RoundQuad::from_msg(intro_msg, y);
-            let beta = challenger.sample_f128();
+            if claim_batch_nonce_idx >= proof.claim_batch_grinding_nonces.len() {
+                return false;
+            }
+            let Some(beta) = challenger.verify_pow_and_sample_f128(
+                proof.claim_batch_grinding_nonces[claim_batch_nonce_idx],
+                claim_batch_bits(i + 2),
+            ) else {
+                return false;
+            };
+            claim_batch_nonce_idx += 1;
             running_quad = RoundQuad::fold(&running_quad, &intro_quad, beta);
             t_r += beta * y;
             ood_ctxs.push(OodCtx {
@@ -4984,7 +5632,17 @@ where
         if trace {
             t_sample_q += _t.elapsed();
         }
-        let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
+        if consistency_batch_nonce_idx >= proof.consistency_batch_grinding_nonces.len() {
+            return false;
+        }
+        let Some(alpha_i) = challenger.verify_pow_and_sample_f128_vec(
+            proof.consistency_batch_grinding_nonces[consistency_batch_nonce_idx],
+            consistency_batch_bits(i + 1),
+            ceil_log2(num_queries_i),
+        ) else {
+            return false;
+        };
+        consistency_batch_nonce_idx += 1;
         if recursive_proof_idx >= proof.recursive_proofs.len() {
             return false;
         }
@@ -5022,7 +5680,16 @@ where
         challenger.observe_f128(intro_msg_i.u_0);
         challenger.observe_f128(intro_msg_i.u_2);
         let intro_quad_i = RoundQuad::from_msg(intro_msg_i, enforced_sum_i);
-        let beta_i = challenger.sample_f128();
+        if claim_batch_nonce_idx >= proof.claim_batch_grinding_nonces.len() {
+            return false;
+        }
+        let Some(beta_i) = challenger.verify_pow_and_sample_f128(
+            proof.claim_batch_grinding_nonces[claim_batch_nonce_idx],
+            claim_batch_bits(i + 1),
+        ) else {
+            return false;
+        };
+        claim_batch_nonce_idx += 1;
         running_quad = RoundQuad::fold(&running_quad, &intro_quad_i, beta_i);
         t_r += beta_i * enforced_sum_i;
         level_ctxs.push(LevelCtx {
@@ -5062,7 +5729,16 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
     let initial_k = config.initial_k;
     let r = config.recursive_steps;
 
-    if r < 1 || config.recursive_ks.len() != r || config.log_inv_rates.len() != r + 1 {
+    if r < 1
+        || config.recursive_ks.len() != r
+        || config.log_inv_rates.len() != r + 1
+        || config.queries.len() != r + 1
+        || config.grinding_bits.len() != r + 1
+        || config.fold_grinding_bits.len() != r + 1
+        || config.claim_batch_grinding_bits.len() != r + 1
+        || config.consistency_batch_grinding_bits.len() != r + 1
+        || config.ood_samples.len() != r + 1
+    {
         return false;
     }
     if b_initial.len() != 1usize << log_n {
@@ -5081,8 +5757,55 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
     let block_len_0 = 1usize << (log_msg_cols_0 + log_inv_rate_0);
     let num_interleaved_0 = 1usize << initial_k;
 
-    // Replay sumcheck: start msg → initial_k folds.
+    let fold_bits =
+        |lvl: usize| -> u32 { config.fold_grinding_bits.get(lvl).copied().unwrap_or(0) as u32 };
+    let claim_batch_bits = |lvl: usize| -> u32 {
+        config
+            .claim_batch_grinding_bits
+            .get(lvl)
+            .copied()
+            .unwrap_or(0) as u32
+    };
+    let consistency_batch_bits = |lvl: usize| -> u32 {
+        config
+            .consistency_batch_grinding_bits
+            .get(lvl)
+            .copied()
+            .unwrap_or(0) as u32
+    };
+    let ood_count = |lvl: usize| -> usize { config.ood_samples.get(lvl).copied().unwrap_or(0) };
+    let mut fold_nonce_idx = 0usize;
+    let mut claim_batch_nonce_idx = 0usize;
+    let mut consistency_batch_nonce_idx = 0usize;
+    let mut ood_idx = 0usize;
+    // OOD eq bases glued into the running sumcheck, accumulated as
+    // (dense eq table, ris_start, beta) and added at the residual check.
+    let mut ood_bases: Vec<(Vec<F128>, usize, F128)> = Vec::new();
+
+    // Replay sumcheck: L0's extra binding claim is batched into the initial
+    // target/basis, then start msg → initial_k folds.
     let mut t_r = target;
+    for _ in 0..ood_count(0) {
+        let z = challenger.sample_f128_vec(log_n);
+        if ood_idx >= proof.ood_values.len() {
+            return false;
+        }
+        let y = proof.ood_values[ood_idx];
+        ood_idx += 1;
+        challenger.observe_f128(y);
+        if claim_batch_nonce_idx >= proof.claim_batch_grinding_nonces.len() {
+            return false;
+        }
+        let Some(beta) = challenger.verify_pow_and_sample_f128(
+            proof.claim_batch_grinding_nonces[claim_batch_nonce_idx],
+            claim_batch_bits(0),
+        ) else {
+            return false;
+        };
+        claim_batch_nonce_idx += 1;
+        t_r += beta * y;
+        ood_bases.push((build_eq_table(&z), 0, beta));
+    }
     let mut tx_idx = 0usize;
     if tx_idx >= proof.sumcheck_transcript.len() {
         return false;
@@ -5093,23 +5816,11 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
     challenger.observe_f128(start_msg.u_2);
     let mut running_quad = RoundQuad::from_msg(start_msg, t_r);
 
-    let fold_bits =
-        |lvl: usize| -> u32 { config.fold_grinding_bits.get(lvl).copied().unwrap_or(0) as u32 };
-    let ood_count = |lvl: usize| -> usize { config.ood_samples.get(lvl).copied().unwrap_or(0) };
-    if config.ood_samples.first().copied().unwrap_or(0) != 0 {
-        return false; // L0 must be bound by the opening's own eval claim
-    }
-    let mut fold_nonce_idx = 0usize;
-    let mut ood_idx = 0usize;
-    // OOD eq bases glued into the running sumcheck, accumulated as
-    // (dense eq table, ris_start, beta) and added at the residual check.
-    let mut ood_bases: Vec<(Vec<F128>, usize, F128)> = Vec::new();
-
     let mut r_lane_fold = Vec::with_capacity(initial_k);
     for j in 0..initial_k {
-        // Fold-challenge PoW mirror (L0's lane folds), tapered per round to
-        // (fold_bits − j) — see the prover's L0 loop.
-        let bits = fold_bits(0).saturating_sub(j as u32);
+        // Fold-challenge PoW mirror; see the prover's L0 loop for the
+        // tapered MCA / untapered sumcheck maximum.
+        let bits = fold_round_grinding_bits(fold_bits(0), claim_batch_bits(0), j);
         let ri = if bits > 0 {
             if fold_nonce_idx >= proof.fold_grinding_nonces.len() {
                 return false;
@@ -5160,7 +5871,16 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
         challenger.observe_f128(intro_msg.u_0);
         challenger.observe_f128(intro_msg.u_2);
         let intro_quad = RoundQuad::from_msg(intro_msg, y);
-        let beta = challenger.sample_f128();
+        if claim_batch_nonce_idx >= proof.claim_batch_grinding_nonces.len() {
+            return false;
+        }
+        let Some(beta) = challenger.verify_pow_and_sample_f128(
+            proof.claim_batch_grinding_nonces[claim_batch_nonce_idx],
+            claim_batch_bits(1),
+        ) else {
+            return false;
+        };
+        claim_batch_nonce_idx += 1;
         running_quad = RoundQuad::fold(&running_quad, &intro_quad, beta);
         t_r += beta * y;
         ood_bases.push((build_eq_table(&z), initial_k, beta));
@@ -5185,7 +5905,17 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
         return false;
     };
     nonce_idx += 1;
-    let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
+    if consistency_batch_nonce_idx >= proof.consistency_batch_grinding_nonces.len() {
+        return false;
+    }
+    let Some(alpha_0) = challenger.verify_pow_and_sample_f128_vec(
+        proof.consistency_batch_grinding_nonces[consistency_batch_nonce_idx],
+        consistency_batch_bits(0),
+        ceil_log2(num_queries_0),
+    ) else {
+        return false;
+    };
+    consistency_batch_nonce_idx += 1;
     if !verify_level_opens(
         &proof.initial_cap,
         block_len_0,
@@ -5220,7 +5950,16 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
     challenger.observe_f128(intro_msg_0.u_0);
     challenger.observe_f128(intro_msg_0.u_2);
     let intro_quad_0 = RoundQuad::from_msg(intro_msg_0, enforced_sum_0);
-    let beta_0 = challenger.sample_f128();
+    if claim_batch_nonce_idx >= proof.claim_batch_grinding_nonces.len() {
+        return false;
+    }
+    let Some(beta_0) = challenger.verify_pow_and_sample_f128(
+        proof.claim_batch_grinding_nonces[claim_batch_nonce_idx],
+        claim_batch_bits(0),
+    ) else {
+        return false;
+    };
+    claim_batch_nonce_idx += 1;
     running_quad = RoundQuad::fold(&running_quad, &intro_quad_0, beta_0);
     t_r += beta_0 * enforced_sum_0;
 
@@ -5247,9 +5986,13 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
         }
         let mut level_rs = Vec::with_capacity(k_i);
         for j in 0..k_i {
-            // Fold-challenge PoW mirror (level i+1's folds), tapered per round
-            // to (fold_bits − j) — see the prover's L0 loop.
-            let bits = fold_bits(i + 1).saturating_sub(j as u32);
+            // Fold-challenge PoW mirror; see the prover's L0 loop for the
+            // tapered MCA / untapered sumcheck maximum.
+            let bits = fold_round_grinding_bits(
+                fold_bits(i + 1),
+                claim_batch_bits(i + 1),
+                j,
+            );
             let ri = if bits > 0 {
                 if fold_nonce_idx >= proof.fold_grinding_nonces.len() {
                     return false;
@@ -5316,7 +6059,17 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
             // queries are fixed. Same position as the succinct verifier
             // (recursive_verifier_with_basis_succinct), which verifies the same
             // proof, so both stay in lockstep.
-            let alpha_last = challenger.sample_f128_vec(ceil_log2(num_queries_last));
+            if consistency_batch_nonce_idx >= proof.consistency_batch_grinding_nonces.len() {
+                return false;
+            }
+            let Some(alpha_last) = challenger.verify_pow_and_sample_f128_vec(
+                proof.consistency_batch_grinding_nonces[consistency_batch_nonce_idx],
+                consistency_batch_bits(i + 1),
+                ceil_log2(num_queries_last),
+            ) else {
+                return false;
+            };
+            consistency_batch_nonce_idx += 1;
             if !verify_level_opens(
                 prev_cap,
                 prev_block_len,
@@ -5344,7 +6097,16 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
                 &queries_last,
                 &alpha_last,
             );
-            let beta_last = challenger.sample_f128();
+            if claim_batch_nonce_idx >= proof.claim_batch_grinding_nonces.len() {
+                return false;
+            }
+            let Some(beta_last) = challenger.verify_pow_and_sample_f128(
+                proof.claim_batch_grinding_nonces[claim_batch_nonce_idx],
+                claim_batch_bits(i + 1),
+            ) else {
+                return false;
+            };
+            claim_batch_nonce_idx += 1;
             t_r += beta_last * enforced_sum_last;
             basis_polys.push(basis_last_induced);
             basis_ris_starts.push(ris.len());
@@ -5383,6 +6145,12 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
                 .zip(combined.iter())
                 .map(|(&y, &c)| y * c)
                 .fold(F128::ZERO, |a, v| a + v);
+            if claim_batch_nonce_idx != proof.claim_batch_grinding_nonces.len()
+                || consistency_batch_nonce_idx
+                    != proof.consistency_batch_grinding_nonces.len()
+            {
+                return false;
+            }
             return inner == t_r;
         }
 
@@ -5410,7 +6178,16 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
             challenger.observe_f128(intro_msg.u_0);
             challenger.observe_f128(intro_msg.u_2);
             let intro_quad = RoundQuad::from_msg(intro_msg, y);
-            let beta = challenger.sample_f128();
+            if claim_batch_nonce_idx >= proof.claim_batch_grinding_nonces.len() {
+                return false;
+            }
+            let Some(beta) = challenger.verify_pow_and_sample_f128(
+                proof.claim_batch_grinding_nonces[claim_batch_nonce_idx],
+                claim_batch_bits(i + 2),
+            ) else {
+                return false;
+            };
+            claim_batch_nonce_idx += 1;
             running_quad = RoundQuad::fold(&running_quad, &intro_quad, beta);
             t_r += beta * y;
             ood_bases.push((build_eq_table(&z), ris.len(), beta));
@@ -5434,7 +6211,17 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
             return false;
         };
         nonce_idx += 1;
-        let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
+        if consistency_batch_nonce_idx >= proof.consistency_batch_grinding_nonces.len() {
+            return false;
+        }
+        let Some(alpha_i) = challenger.verify_pow_and_sample_f128_vec(
+            proof.consistency_batch_grinding_nonces[consistency_batch_nonce_idx],
+            consistency_batch_bits(i + 1),
+            ceil_log2(num_queries_i),
+        ) else {
+            return false;
+        };
+        consistency_batch_nonce_idx += 1;
         if recursive_proof_idx >= proof.recursive_proofs.len() {
             return false;
         }
@@ -5471,7 +6258,16 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
         challenger.observe_f128(intro_msg_i.u_0);
         challenger.observe_f128(intro_msg_i.u_2);
         let intro_quad_i = RoundQuad::from_msg(intro_msg_i, enforced_sum_i);
-        let beta_i = challenger.sample_f128();
+        if claim_batch_nonce_idx >= proof.claim_batch_grinding_nonces.len() {
+            return false;
+        }
+        let Some(beta_i) = challenger.verify_pow_and_sample_f128(
+            proof.claim_batch_grinding_nonces[claim_batch_nonce_idx],
+            claim_batch_bits(i + 1),
+        ) else {
+            return false;
+        };
+        claim_batch_nonce_idx += 1;
         running_quad = RoundQuad::fold(&running_quad, &intro_quad_i, beta_i);
         t_r += beta_i * enforced_sum_i;
         basis_polys.push(basis_i_induced);
@@ -5511,12 +6307,17 @@ fn recursive_prover_inner<Ch: Challenger>(
     macro_rules! tlog {
         ($($arg:tt)*) => { if trace { eprintln!($($arg)*); } }
     }
-    // The legacy (non-basis) path predates OOD binding and fold grinding;
+    // The legacy (non-basis) path predates OOD binding and all round grinding;
     // configs that use them must go through `recursive_prover_with_basis`.
     assert!(
         config.ood_samples.iter().all(|&s| s == 0)
-            && config.fold_grinding_bits.iter().all(|&b| b == 0),
-        "OOD samples / fold grinding require the with_basis prover path"
+            && config.fold_grinding_bits.iter().all(|&b| b == 0)
+            && config.claim_batch_grinding_bits.iter().all(|&b| b == 0)
+            && config
+                .consistency_batch_grinding_bits
+                .iter()
+                .all(|&b| b == 0),
+        "OOD samples / round grinding require the with_basis prover path"
     );
     let log_n = poly.len().trailing_zeros() as usize;
     let r = config.recursive_steps;
@@ -5672,6 +6473,8 @@ fn recursive_prover_inner<Ch: Challenger>(
                 grinding_nonces: Vec::new(), // legacy recursive_prover_inner: no grinding plumbed
                 ood_values: Vec::new(),
                 fold_grinding_nonces: Vec::new(),
+                claim_batch_grinding_nonces: Vec::new(),
+                consistency_batch_grinding_nonces: Vec::new(),
             };
         }
 
@@ -5840,9 +6643,14 @@ pub fn recursive_verifier<Ch: Challenger>(
     if r < 1 || config.recursive_ks.len() != r || config.log_inv_rates.len() != r + 1 {
         return false;
     }
-    // The legacy (non-basis) path predates OOD binding and fold grinding.
+    // The legacy (non-basis) path predates OOD binding and round grinding.
     if config.ood_samples.iter().any(|&s| s != 0)
         || config.fold_grinding_bits.iter().any(|&b| b != 0)
+        || config.claim_batch_grinding_bits.iter().any(|&b| b != 0)
+        || config
+            .consistency_batch_grinding_bits
+            .iter()
+            .any(|&b| b != 0)
     {
         return false;
     }
@@ -6148,6 +6956,26 @@ mod tests {
         }
     }
 
+    /// L0 OOD batching computes its first message directly from a factored
+    /// equality tensor. Pin both natural and lane-major block pairings against
+    /// the materialized equality-table oracle, including the claimed MLE.
+    #[test]
+    fn factored_ood_round_message_matches_materialized() {
+        use crate::challenger::Challenger;
+
+        let log_n = 10usize;
+        let n = 1usize << log_n;
+        let mut rng = crate::challenger::RandomChallenger::new(0x00D0_0D00);
+        let f: Vec<F128> = (0..n).map(|_| rng.sample_f128()).collect();
+        let z: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
+        let eq = build_eq_table(&z);
+        for d in [1usize, 1 << 6] {
+            let factored = round_msg_and_eval_eq_point_blocked(&f, &z, d);
+            let dense = round_msg_and_eval_blocked(&f, &eq, d);
+            assert_eq!(factored, dense, "round-0 OOD batch at block size {d}");
+        }
+    }
+
     /// Worked example: `LigeritoSecurityConfig` for BLAKE3 m=29 at rate 1/2.
     /// Paper-compatible m=29 fast example, mechanically derived in the
     /// unique-decoding regime (Theorem 1.4, ε* = 10⁻³) targeting 100-bit
@@ -6171,20 +6999,21 @@ mod tests {
         assert_eq!(cfg.initial_k, 5);
         assert_eq!(cfg.hash, "sha256");
         assert_eq!(cfg.levels.len(), 5);
-        // Fast = JohnsonOod profile: 218 L0 queries per-round at 100 bits (no
-        // list union bound — single-codeword binding via the opening claim /
-        // OOD samples), proximity-gap shortfall covered by fold-challenge grinding.
+        // Fast = JohnsonOod profile: 279 L0 queries put the query term
+        // strictly below 2^-128 (no list union bound — single-codeword
+        // binding via the opening claim / OOD samples). The MCA/proximity
+        // shortfall remains covered separately by fold-challenge grinding.
         assert_eq!(cfg.levels[0].regime, SoundnessRegime::JohnsonOod);
-        assert_eq!(cfg.levels[0].queries, 218);
+        assert_eq!(cfg.levels[0].queries, 279);
         assert_eq!(cfg.levels[0].grinding_bits, 0);
         assert!(cfg.levels[0].fold_grinding_bits > 0);
-        assert_eq!(cfg.levels[0].ood_samples, 0); // L0: bound by eval claim
-        assert!(cfg.levels[1].ood_samples >= 1);
+        assert_eq!(cfg.levels[0].ood_samples, 1); // plus L0's opening point
+        assert!(cfg.levels.iter().skip(1).all(|lv| lv.ood_samples == 2));
         let (pv, _vc) = cfg.to_prover_verifier_configs().unwrap();
         let default = default_config(22, 5, 1).unwrap();
         assert_eq!(pv.log_inv_rates, default.log_inv_rates);
         assert_eq!(pv.recursive_ks, default.recursive_ks);
-        assert_eq!(pv.queries[0], 218);
+        assert_eq!(pv.queries[0], 279);
 
         // Slim mode: rates start at 1/4.
         let toml_str = include_str!("../../configs/ligerito/m29_slim.toml");
@@ -6192,7 +7021,7 @@ mod tests {
             .expect("m29_slim.toml must parse and validate");
         assert_eq!(cfg_slim.levels[0].log_inv_rate, 2);
         // Slim = JohnsonOod at rate 1/4 with 16-bit query grinding.
-        assert_eq!(cfg_slim.levels[0].queries, 90);
+        assert_eq!(cfg_slim.levels[0].queries, 119);
         assert_eq!(cfg_slim.levels[0].grinding_bits, 16);
         // m29 Slim is initial_k 5 like Fast (the recursion-node choice).
         assert_eq!(cfg_slim.initial_k, 5);
@@ -6255,8 +7084,8 @@ mod tests {
         );
     }
 
-    /// All 6 embedded configs validate strictly (i.e. each is paper-compat
-    /// AND satisfies the security target).
+    /// Every embedded config validates strictly (i.e. each is paper-compatible
+    /// and satisfies its declared component targets).
     #[test]
     fn ligerito_all_embedded_configs_validate() {
         for &(key, toml) in EMBEDDED_CONFIGS {
@@ -6267,6 +7096,26 @@ mod tests {
                     key.1.as_str()
                 )
             });
+        }
+    }
+
+    /// Checked-in TOMLs are exactly the canonical output of the profile
+    /// derivation. Validation alone would allow a hand-edited but internally
+    /// consistent file to drift away from the generator.
+    #[test]
+    fn ligerito_all_embedded_configs_match_derivation() {
+        for &((m, profile), toml) in EMBEDDED_CONFIGS {
+            let derived = LigeritoSecurityConfig::derive_profile(m, profile)
+                .unwrap_or_else(|e| panic!("derive m={m} profile={}: {e}", profile.as_str()));
+            let canonical = derived
+                .to_toml_string()
+                .unwrap_or_else(|e| panic!("serialize m={m} profile={}: {e}", profile.as_str()));
+            assert_eq!(
+                toml,
+                canonical,
+                "embedded m={m} profile={} differs from generator output",
+                profile.as_str()
+            );
         }
     }
 
@@ -6305,7 +7154,7 @@ mod tests {
         // recursion-node row-width choice); a stale batch-6 request is a
         // hard error, never a silent fallback.
         let pv = prover_config_for(22, 5, LigeritoProfile::Fast).expect("m29 fast must load");
-        assert_eq!(pv.queries[0], 218);
+        assert_eq!(pv.queries[0], 279);
         assert_eq!(pv.fold_grinding_bits[0], 16);
         assert_eq!(embedded_initial_k(29, LigeritoProfile::Fast), Some(5));
         let err = prover_config_for(22, 6, LigeritoProfile::Fast).unwrap_err();
@@ -6313,7 +7162,7 @@ mod tests {
 
         // m=29 slim: known → loads from TOML (initial_k 5, like Fast).
         let pv = prover_config_for(22, 5, LigeritoProfile::Slim).expect("m29 slim must load");
-        assert_eq!(pv.queries[0], 90);
+        assert_eq!(pv.queries[0], 119);
         assert_eq!(pv.grinding_bits[0], 16);
 
         // m=29 secure: known → loads from TOML (UDR, 120-bit).
@@ -6409,6 +7258,97 @@ mod tests {
         assert!(err.contains("expected_eps_query_bits"), "err = {err}");
     }
 
+    /// Generated Johnson schedules are minimal: the configured query count
+    /// plus optional query grinding is strictly above 128 bits, while removing
+    /// one query is at or below 128 bits.
+    #[test]
+    fn ligerito_list_decoding_queries_strictly_clear_128_bits() {
+        for m in 22..=35 {
+            for profile in [LigeritoProfile::Fast, LigeritoProfile::Slim] {
+                let cfg = LigeritoSecurityConfig::derive_profile(m, profile)
+                    .unwrap_or_else(|e| panic!("derive m{m} {profile:?}: {e}"));
+                for (i, lv) in cfg.levels.iter().enumerate() {
+                    let per_q = paper_per_query_bits(
+                        lv.log_inv_rate,
+                        lv.eta.expect("Johnson profile has eta"),
+                    );
+                    let delivered = lv.queries as f64 * per_q + lv.grinding_bits as f64;
+                    let one_fewer = (lv.queries - 1) as f64 * per_q + lv.grinding_bits as f64;
+                    assert!(
+                        delivered > LIST_DECODING_QUERY_TARGET_BITS,
+                        "m{m} {profile:?} L{i}: delivered {delivered}"
+                    );
+                    assert!(
+                        one_fewer <= LIST_DECODING_QUERY_TARGET_BITS,
+                        "m{m} {profile:?} L{i}: non-minimal ({one_fewer})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Validation uses the exact query formula rather than trusting the
+    /// rounded diagnostic in the TOML.
+    #[test]
+    fn ligerito_security_config_rejects_sub_128_list_query_schedule() {
+        let mut cfg = LigeritoSecurityConfig::derive_profile(29, LigeritoProfile::Fast)
+            .expect("derive m29 Fast");
+        let lv = &mut cfg.levels[0];
+        lv.queries -= 1;
+        let per_q = paper_per_query_bits(lv.log_inv_rate, lv.eta.expect("Johnson eta"));
+        lv.expected_eps_query_bits = round1(lv.queries as f64 * per_q);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("list-decoding target"), "err = {err}");
+    }
+
+    /// The Flock paper's Appendix C.3 algebraic schedule is enforced
+    /// independently of the profile-local query/MCA target. Lowering any one
+    /// of its three active PoW families must make an otherwise canonical
+    /// config invalid.
+    #[test]
+    fn ligerito_security_config_rejects_insufficient_algebraic_grinding() {
+        let baseline = LigeritoSecurityConfig::derive_profile(29, LigeritoProfile::Fast)
+            .expect("derive m29 Fast");
+
+        let mut cfg = baseline.clone();
+        cfg.levels[0].claim_batch_grinding_bits = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("claim_batch_grinding_bits"), "err = {err}");
+
+        let mut cfg = baseline.clone();
+        cfg.levels[0].fold_grinding_bits = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.contains("Appendix C.3 sumcheck requirement"),
+            "err = {err}"
+        );
+
+        let mut cfg = baseline;
+        cfg.levels[0].consistency_batch_grinding_bits = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.contains("consistency_batch_grinding_bits"),
+            "err = {err}"
+        );
+    }
+
+    /// The old one-point Johnson schedule must not remain loadable after the
+    /// collision analysis moved to two independent points.
+    #[test]
+    fn ligerito_security_config_rejects_one_point_ood() {
+        let mut cfg = LigeritoSecurityConfig::derive_profile(29, LigeritoProfile::Fast)
+            .expect("derive m29 Fast");
+        cfg.levels[0].ood_samples = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("two-point"), "err = {err}");
+
+        let mut cfg = LigeritoSecurityConfig::derive_profile(29, LigeritoProfile::Fast)
+            .expect("derive m29 Fast");
+        cfg.levels[1].ood_samples = 1;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("two-point"), "err = {err}");
+    }
+
     /// UDR regime must not carry an `eta` value.
     #[test]
     fn ligerito_security_config_rejects_udr_with_eta() {
@@ -6470,9 +7410,17 @@ mod tests {
         cfg.levels[0].proximity_loss = Some(eps_star);
         cfg.levels[0].queries = queries;
         cfg.levels[0].grinding_bits = 0;
-        cfg.levels[0].fold_grinding_bits = (100.0 - eps_pg).ceil().max(0.0) as usize;
+        let (claim_bits, sumcheck_bits, consistency_bits, e_claim, e_sumcheck, e_consistency) =
+            algebraic_grinding_schedule(cfg.levels[0].log_inv_rate, None, queries);
+        cfg.levels[0].fold_grinding_bits = ((100.0 - eps_pg).ceil().max(0.0) as usize)
+            .max(sumcheck_bits);
+        cfg.levels[0].claim_batch_grinding_bits = claim_bits;
+        cfg.levels[0].consistency_batch_grinding_bits = consistency_bits;
         cfg.levels[0].expected_eps_pg_bits = (eps_pg * 10.0).round() / 10.0;
         cfg.levels[0].expected_eps_query_bits = ((queries as f64 * per_q) * 10.0).round() / 10.0;
+        cfg.levels[0].expected_eps_claim_batch_bits = round1(e_claim);
+        cfg.levels[0].expected_eps_sumcheck_bits = round1(e_sumcheck);
+        cfg.levels[0].expected_eps_consistency_batch_bits = round1(e_consistency);
         cfg.validate()
             .unwrap_or_else(|e| panic!("UDR config failed to validate: {e}"));
     }
@@ -6531,6 +7479,8 @@ mod tests {
             queries: queries.clone(),
             grinding_bits: grinding_bits.clone(),
             fold_grinding_bits: vec![0; 2],
+            claim_batch_grinding_bits: vec![0; 2],
+            consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
             stratified: vec![],
@@ -6576,6 +7526,8 @@ mod tests {
             queries,
             grinding_bits,
             fold_grinding_bits: vec![0; 2],
+            claim_batch_grinding_bits: vec![0; 2],
+            consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
             stratified: vec![],
@@ -6649,6 +7601,8 @@ mod tests {
                 queries: queries.clone(),
                 grinding_bits: vec![0; 2],
                 fold_grinding_bits: vec![0; 2],
+                claim_batch_grinding_bits: vec![0; 2],
+                consistency_batch_grinding_bits: vec![0; 2],
                 ood_samples: vec![0; 2],
                 merkle_hash: Default::default(),
                 stratified: vec![],
@@ -6665,6 +7619,8 @@ mod tests {
                 queries,
                 grinding_bits: vec![0; 2],
                 fold_grinding_bits: vec![0; 2],
+                claim_batch_grinding_bits: vec![0; 2],
+                consistency_batch_grinding_bits: vec![0; 2],
                 ood_samples: vec![0; 2],
                 merkle_hash: Default::default(),
                 stratified: vec![],
@@ -7242,6 +8198,8 @@ mod tests {
             queries: queries.clone(),
             grinding_bits: grinding_bits.clone(),
             fold_grinding_bits: vec![0; 2],
+            claim_batch_grinding_bits: vec![0; 2],
+            consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
             stratified: vec![],
@@ -7258,6 +8216,8 @@ mod tests {
             queries,
             grinding_bits,
             fold_grinding_bits: vec![0; 2],
+            claim_batch_grinding_bits: vec![0; 2],
+            consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
             stratified: vec![],
@@ -7327,6 +8287,8 @@ mod tests {
             queries: queries_per_level.clone(),
             grinding_bits: grinding_bits.clone(),
             fold_grinding_bits: vec![0; r + 1],
+            claim_batch_grinding_bits: vec![0; r + 1],
+            consistency_batch_grinding_bits: vec![0; r + 1],
             ood_samples: vec![0; r + 1],
             merkle_hash: Default::default(),
             stratified: vec![],
@@ -7343,6 +8305,8 @@ mod tests {
             queries: queries_per_level,
             grinding_bits,
             fold_grinding_bits: vec![0; r + 1],
+            claim_batch_grinding_bits: vec![0; r + 1],
+            consistency_batch_grinding_bits: vec![0; r + 1],
             ood_samples: vec![0; r + 1],
             merkle_hash: Default::default(),
             stratified: vec![],
@@ -7669,6 +8633,8 @@ mod tests {
             queries: log_inv_rates.iter().map(|&r| udr_queries(r)).collect(),
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 3],
+            claim_batch_grinding_bits: vec![0; 3],
+            consistency_batch_grinding_bits: vec![0; 3],
             ood_samples: vec![0; 3],
             merkle_hash: Default::default(),
             stratified: vec![],
@@ -7685,6 +8651,8 @@ mod tests {
             queries: log_inv_rates.iter().map(|&r| udr_queries(r)).collect(),
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 3],
+            claim_batch_grinding_bits: vec![0; 3],
+            consistency_batch_grinding_bits: vec![0; 3],
             ood_samples: vec![0; 3],
             merkle_hash: Default::default(),
             stratified: vec![],
@@ -7731,6 +8699,8 @@ mod tests {
             queries: log_inv_rates.iter().map(|&r| udr_queries(r)).collect(),
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
+            claim_batch_grinding_bits: vec![0; 2],
+            consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
             stratified: vec![],
@@ -7779,6 +8749,8 @@ mod tests {
             queries: log_inv_rates.iter().map(|&r| udr_queries(r)).collect(),
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
+            claim_batch_grinding_bits: vec![0; 2],
+            consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
             stratified: vec![],
@@ -7823,6 +8795,8 @@ mod tests {
             queries: log_inv_rates.iter().map(|&r| udr_queries(r)).collect(),
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
+            claim_batch_grinding_bits: vec![0; 2],
+            consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
             stratified: vec![],
@@ -8220,6 +9194,8 @@ mod tests {
             queries: log_inv_rates.iter().map(|&r| udr_queries(r)).collect(),
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
+            claim_batch_grinding_bits: vec![0; 2],
+            consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
             stratified: vec![],
@@ -8264,6 +9240,8 @@ mod tests {
             queries: log_inv_rates.iter().map(|&r| udr_queries(r)).collect(),
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
+            claim_batch_grinding_bits: vec![0; 2],
+            consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
             stratified: vec![],
@@ -8340,6 +9318,8 @@ mod tests {
             queries: queries.clone(),
             grinding_bits: grinding_bits.clone(),
             fold_grinding_bits: fold_grinding_bits.clone(),
+            claim_batch_grinding_bits: vec![3; r + 1],
+            consistency_batch_grinding_bits: vec![4; r + 1],
             ood_samples: ood_samples.clone(),
             merkle_hash: Default::default(),
             stratified: vec![],
@@ -8356,6 +9336,8 @@ mod tests {
             queries,
             grinding_bits,
             fold_grinding_bits,
+            claim_batch_grinding_bits: vec![3; r + 1],
+            consistency_batch_grinding_bits: vec![4; r + 1],
             ood_samples,
             merkle_hash: Default::default(),
             stratified: vec![],
@@ -8365,8 +9347,8 @@ mod tests {
     }
 
     /// End-to-end OOD binding + fold-challenge grinding: a JohnsonOod-shaped
-    /// config (explicit OOD samples at L1/L2, a few fold-grind bits at every
-    /// level) round-trips through BOTH the dense and succinct verifiers, and
+    /// config (one extra OOD at L0 and two at L1/L2, a few fold-grind bits at
+    /// every level) round-trips through BOTH the dense and succinct verifiers, and
     /// tampering with either an OOD value or a fold-grinding nonce makes both
     /// reject. Exercises every new prover/verifier code path.
     #[test]
@@ -8375,8 +9357,8 @@ mod tests {
         let log_n = 12;
         let initial_k = 2;
         let ks = [2usize, 2];
-        // OOD at L1 and L2 (L0 must be 0); 3 fold-grind bits at each level.
-        let (p_cfg, v_cfg) = ood_test_configs(log_n, initial_k, &ks, vec![0, 2, 2], vec![3, 3, 3]);
+        // L0 opening point + one extra, and two explicit points at L1/L2.
+        let (p_cfg, v_cfg) = ood_test_configs(log_n, initial_k, &ks, vec![1, 2, 2], vec![3, 3, 3]);
 
         let mut rng = crate::challenger::RandomChallenger::new(0x00D_7E57);
         let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
@@ -8416,9 +9398,11 @@ mod tests {
         );
 
         // Sanity: the new proof fields are populated.
-        assert_eq!(proof.ood_values.len(), 4, "2 OOD samples each at L1 and L2");
+        assert_eq!(proof.ood_values.len(), 5, "1 + 2 + 2 explicit OOD samples");
         // 2 lane folds (L0) + 2 + 2 recursive folds, each with 3 grind bits.
         assert_eq!(proof.fold_grinding_nonces.len(), initial_k + ks[0] + ks[1]);
+        assert_eq!(proof.claim_batch_grinding_nonces.len(), 5 + 3);
+        assert_eq!(proof.consistency_batch_grinding_nonces.len(), 3);
 
         let dense = |proof: &LigeritoProof| {
             let mut ch = crate::challenger::FsChallenger::new(b"ood-test");
@@ -8461,13 +9445,36 @@ mod tests {
         assert!(dense(&proof), "dense verifier must accept OOD proof");
         assert!(succinct(&proof), "succinct verifier must accept OOD proof");
 
-        // Tamper an OOD value → both verifiers reject.
-        let mut bad_ood = proof.clone();
-        bad_ood.ood_values[0] += F128::ONE;
-        assert!(!dense(&bad_ood), "dense must reject tampered OOD value");
+        // Tamper every OOD value in turn → both verifiers reject. Iterating
+        // all five positions certifies L0 and both explicit points at L1/L2,
+        // rather than only the first flattened proof entry.
+        for idx in 0..proof.ood_values.len() {
+            let mut bad_ood = proof.clone();
+            bad_ood.ood_values[idx] += F128::ONE;
+            assert!(
+                !dense(&bad_ood),
+                "dense must reject tampered OOD value {idx}"
+            );
+            assert!(
+                !succinct(&bad_ood),
+                "succinct must reject tampered OOD value {idx}"
+            );
+        }
+
+        let mut missing_ood = proof.clone();
+        missing_ood.ood_values.pop();
+        assert!(!dense(&missing_ood), "dense must reject a missing OOD value");
         assert!(
-            !succinct(&bad_ood),
-            "succinct must reject tampered OOD value"
+            !succinct(&missing_ood),
+            "succinct must reject a missing OOD value"
+        );
+
+        let mut extra_ood = proof.clone();
+        extra_ood.ood_values.push(F128::ZERO);
+        assert!(!dense(&extra_ood), "dense must reject an extra OOD value");
+        assert!(
+            !succinct(&extra_ood),
+            "succinct must reject an extra OOD value"
         );
 
         // Tamper a fold-grinding nonce → both verifiers reject (PoW fails or
@@ -8479,6 +9486,60 @@ mod tests {
             !succinct(&bad_nonce),
             "succinct must reject tampered fold nonce"
         );
+
+        for (name, mutate) in [
+            (
+                "claim batching",
+                |p: &mut LigeritoProof| p.claim_batch_grinding_nonces[0] ^= 0xDEAD_BEEF,
+            ),
+            (
+                "consistency batching",
+                |p: &mut LigeritoProof| {
+                    p.consistency_batch_grinding_nonces[0] ^= 0xDEAD_BEEF
+                },
+            ),
+        ] as [(&str, fn(&mut LigeritoProof)); 2]
+        {
+            let mut bad = proof.clone();
+            mutate(&mut bad);
+            assert!(!dense(&bad), "dense must reject tampered {name} nonce");
+            assert!(
+                !succinct(&bad),
+                "succinct must reject tampered {name} nonce"
+            );
+        }
+
+        for (name, mutate) in [
+            (
+                "missing claim-batching",
+                |p: &mut LigeritoProof| {
+                    p.claim_batch_grinding_nonces.pop();
+                },
+            ),
+            (
+                "extra claim-batching",
+                |p: &mut LigeritoProof| p.claim_batch_grinding_nonces.push(0),
+            ),
+            (
+                "missing consistency-batching",
+                |p: &mut LigeritoProof| {
+                    p.consistency_batch_grinding_nonces.pop();
+                },
+            ),
+            (
+                "extra consistency-batching",
+                |p: &mut LigeritoProof| p.consistency_batch_grinding_nonces.push(0),
+            ),
+        ] as [(&str, fn(&mut LigeritoProof)); 4]
+        {
+            let mut bad = proof.clone();
+            mutate(&mut bad);
+            assert!(!dense(&bad), "dense must reject {name} nonce vector");
+            assert!(
+                !succinct(&bad),
+                "succinct must reject {name} nonce vector"
+            );
+        }
     }
 
     /// A real embedded profile config (m=22 fast = JohnsonOod) drives a full
@@ -8757,6 +9818,8 @@ mod tests {
             queries: log_inv_rates.iter().map(|&r| udr_queries(r)).collect(),
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
+            claim_batch_grinding_bits: vec![0; 2],
+            consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
             stratified: vec![],
@@ -8801,6 +9864,8 @@ mod tests {
             queries: log_inv_rates.iter().map(|&r| udr_queries(r)).collect(),
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
+            claim_batch_grinding_bits: vec![0; 2],
+            consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
             stratified: vec![],
@@ -8845,6 +9910,8 @@ mod tests {
             queries: log_inv_rates.iter().map(|&r| udr_queries(r)).collect(),
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
+            claim_batch_grinding_bits: vec![0; 2],
+            consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
             stratified: vec![],
@@ -8905,6 +9972,8 @@ mod tests {
             queries: log_inv_rates.iter().map(|&r| udr_queries(r)).collect(),
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
+            claim_batch_grinding_bits: vec![0; 2],
+            consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
             stratified: vec![],
@@ -8947,6 +10016,8 @@ mod tests {
             queries: log_inv_rates.iter().map(|&r| udr_queries(r)).collect(),
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
+            claim_batch_grinding_bits: vec![0; 2],
+            consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
             stratified: vec![],
@@ -8963,6 +10034,8 @@ mod tests {
             queries: log_inv_rates.iter().map(|&r| udr_queries(r)).collect(),
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
+            claim_batch_grinding_bits: vec![0; 2],
+            consistency_batch_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
             stratified: vec![],

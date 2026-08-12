@@ -115,7 +115,7 @@ fn r1cs_prove_verify_roundtrip_ligerito() {
     }
 }
 
-/// End-to-end pilot for the roadmap's Boolean zerocheck and lincheck
+/// End-to-end check for Secure-profile Boolean zerocheck and lincheck
 /// grinding. The `Secure` PCS profile selects both per-challenge schedules;
 /// this test deliberately remains ignored because its Ligerito opening is the
 /// same heavyweight m22 workload as the ordinary end-to-end roundtrip above.

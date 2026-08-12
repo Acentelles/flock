@@ -67,11 +67,11 @@ pub struct PcsParams {
 impl PcsParams {
     /// Grinding policy for the Boolean zerocheck PIOP.
     ///
-    /// `Secure` is the opt-in profile for the roadmap's first 128-bit
-    /// grinding milestone.  The Boolean, element, and pre-Ligerito PCS
-    /// transport policies are selected independently because they protect
-    /// different Fiat--Shamir challenges.  Ligerito's list-decoding / OOD /
-    /// query-soundness work remains a later roadmap milestone.
+    /// `Secure` enables strict 128-bit work-normalized grinding for this
+    /// challenge family. Boolean, element, and PCS-transport policies are
+    /// selected independently because they protect Fiat--Shamir challenges
+    /// with different degree bounds. Ligerito derives its own schedule from
+    /// the selected profile.
     pub fn zerocheck_grinding(&self) -> crate::zerocheck::ZerocheckGrinding {
         match self.profile {
             crate::pcs::ligerito::LigeritoProfile::Secure => {

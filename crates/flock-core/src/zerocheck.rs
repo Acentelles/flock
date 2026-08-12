@@ -56,9 +56,9 @@ pub const K_SKIP: usize = 6;
 /// `degree = 2` needs two bits, not one: `2 / 2 = 1` would only meet the
 /// bound, not beat it.
 ///
-/// The policy is intentionally local to zerocheck.  The other sumcheck
-/// families have different degrees and proof formats and will receive their
-/// own schedules as the 128-bit roadmap is implemented.
+/// The policy is intentionally local to zerocheck. Other sumcheck families
+/// have different degrees and proof formats, so they define separate
+/// schedules.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ZerocheckGrinding {
     enabled: bool,
