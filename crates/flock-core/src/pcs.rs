@@ -1382,16 +1382,54 @@ pub fn open_batch_merged<Ch: Challenger>(
         );
     }
     let t_assist = std::time::Instant::now();
+    // ---- eq-basis Ligerito opening of q̂(ρ): one packed-direct claim on
+    // the existing mixed path (whose verifier evaluates eq residuals in
+    // closed form — no b_tilde machinery).
+    let pd = PackedDirectClaim {
+        point: rho.clone(),
+        value: q_eval,
+        eq_ind: DirectEqInd::EqPoint(rho.clone()),
+    };
+    // FORK/JOIN: the assist and the inner open are SIBLINGS, not a chain.
+    // Both consume only `rho` and `q_eval` from the merged sumcheck above,
+    // and neither reads the other's output — the assist's `V` is checked
+    // against the sumcheck's folded claim, not against the opening. So they
+    // run CONCURRENTLY on domain-separated chains: the assist takes a child
+    // seeded from the parent, the inner open continues on the parent, and
+    // the child's closing digest merges after. Sound for the same reason
+    // the wiring fork is: both branches bind only the prefix through ρ,
+    // which the fork point already covers.
+    //
+    // The merge is what binds the child's chain into the parent even though
+    // nothing samples after it here — keep it, so composing this open into
+    // a longer transcript stays sound without revisiting the fork.
+    let mut ch_a = challenger.fork(b"flock-par-assist-v1");
     // The two-product multipoint replacement
     // (docs/multipoint-twisted-assist.tex): 128R + P claimed dual values +
     // one two-product sumcheck + ONE untwisted anchor, instead of a
     // per-statement assist — family K collapses, and every verifier piece
     // is a shape the recursion circuit already has.
-    let frobenius =
-        jagged::prove_multipoint_twisted(&params, &fclaims, &gclaims, &rho, challenger);
+    let (frobenius, inner) = rayon::join(
+        || jagged::prove_multipoint_twisted(&params, &fclaims, &gclaims, &rho, &mut ch_a),
+        || {
+            open_batch_mixed_ligerito_with_precomputed_s_hat_v(
+                q,
+                prover_data,
+                commitment,
+                &[],
+                &[],
+                &[pd],
+                &PaddingSpec::dense(commitment.params.m),
+                lig_config,
+                challenger,
+            )
+        },
+    );
+    challenger.merge_child(ch_a);
     if trace {
         eprintln!(
-            "  [open_merged] coeffs + multipoint assist: {:6.2} ms (assist alone {:6.2} ms)",
+            "  [open_merged] coeffs + (multipoint assist ∥ inner open): {:6.2} ms \
+             (join wall {:6.2} ms = max of the two branches)",
             t.elapsed().as_secs_f64() * 1e3,
             t_assist.elapsed().as_secs_f64() * 1e3
         );
@@ -1415,32 +1453,7 @@ pub fn open_batch_merged<Ch: Challenger>(
     }
     let _ = w_eval;
 
-    // ---- eq-basis Ligerito opening of q̂(ρ): one packed-direct claim on
-    // the existing mixed path (whose verifier evaluates eq residuals in
-    // closed form — no b_tilde machinery).
-    let pd = PackedDirectClaim {
-        point: rho.clone(),
-        value: q_eval,
-        eq_ind: DirectEqInd::EqPoint(rho.clone()),
-    };
-    let t = std::time::Instant::now();
-    let inner = open_batch_mixed_ligerito_with_precomputed_s_hat_v(
-        q,
-        prover_data,
-        commitment,
-        &[],
-        &[],
-        &[pd],
-        &PaddingSpec::dense(commitment.params.m),
-        lig_config,
-        challenger,
-    );
-
     if trace {
-        eprintln!(
-            "  [open_merged] inner eq-basis open: {:6.2} ms",
-            t.elapsed().as_secs_f64() * 1e3
-        );
         eprintln!(
             "  [open_merged] TOTAL: {:6.2} ms",
             t_total.elapsed().as_secs_f64() * 1e3
@@ -1820,6 +1833,12 @@ fn verify_batch_merged_core<Ch: Challenger>(
     let t = std::time::Instant::now();
     #[cfg(feature = "mul-count")]
     let assist_start = crate::field::gf2_128::op_count::snapshot();
+    // Mirror the prover's FORK/JOIN (see the prover-side note): the assist
+    // replays on a domain-separated child seeded here, the inner opening on
+    // the parent, and the child merges after. The verifier stays sequential
+    // — only the transcript forks — so the assist runs first and its `v` is
+    // held for the `running` check below, which moved past the merge.
+    let mut ch_a = challenger.fork(b"flock-par-assist-v1");
     let mut mp_defer = None;
     let v = if defer.is_some() {
         let (v, mp) = jagged::verify_multipoint_twisted_deferred(
@@ -1828,7 +1847,7 @@ fn verify_batch_merged_core<Ch: Challenger>(
             &gclaims,
             &rho,
             &proof.frobenius,
-            challenger,
+            &mut ch_a,
         )
         .ok_or(VerifyErrorOpen::Assist)?;
         mp_defer = Some(mp);
@@ -1840,7 +1859,7 @@ fn verify_batch_merged_core<Ch: Challenger>(
             &gclaims,
             &rho,
             &proof.frobenius,
-            challenger,
+            &mut ch_a,
         )
         .ok_or(VerifyErrorOpen::Assist)?
     };
@@ -1873,10 +1892,6 @@ fn verify_batch_merged_core<Ch: Challenger>(
             tfmt(t.elapsed().as_secs_f64())
         );
     }
-    if running != proof.q_eval * v {
-        return Err(VerifyErrorOpen::VirtualOpen);
-    }
-
     let t = std::time::Instant::now();
     let pd = PackedDirectClaimRef {
         point: &rho,
@@ -1893,6 +1908,13 @@ fn verify_batch_merged_core<Ch: Challenger>(
         challenger,
     )
     .map_err(|_| VerifyErrorOpen::Ligerito)?;
+    challenger.merge_child(ch_a);
+    // The assist's claim against the merged sumcheck's folded target. A pure
+    // arithmetic check — it consumes no challenges, so the fork moved it here
+    // without touching the transcript.
+    if running != proof.q_eval * v {
+        return Err(VerifyErrorOpen::VirtualOpen);
+    }
     if trace {
         eprintln!(
             "        [vbm] verify_opening_batch_ligerito_mixed: {}",

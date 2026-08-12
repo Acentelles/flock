@@ -3245,23 +3245,40 @@ fn merge_chain(
             cross,
         };
     }
-    assert_eq!(
-        chains.children.len(),
-        1,
-        "the one-sided fork has exactly one child"
-    );
-    let c = &chains.children[0];
     let p = &chains.parent;
-    let cstream = &stream.forks[0].stream;
-    let cbytes = cstream.to_bytes(values, payloads);
-
-    // The splice point: after BOTH seed squeezes (`seed_squeeze` names the
-    // first of the pair), which is where the flattened ops put the child.
-    let last_seed = c.seed_squeeze + 1;
-    let p_split = p.squeezes[last_seed].iter().copied().max().unwrap() + 1;
-    let nc = c.trace.rows.len();
-    let pmap = |r: usize| if r < p_split { r } else { r + nc };
-    let cmap = |r: usize| p_split + r;
+    let n_ch = chains.children.len();
+    // Every fork's splice point, in parent-row order. The forks a proof takes
+    // are SEQUENTIAL (the wiring's opens and closes before the opening phase
+    // starts its own), so the splits are strictly increasing and each child
+    // occupies one contiguous run of merged rows. `last_seed` is the second
+    // of the pair — `seed_squeeze` names the first — which is exactly where
+    // the flattened ops put the child.
+    let last_seed: Vec<usize> = chains.children.iter().map(|c| c.seed_squeeze + 1).collect();
+    let splits: Vec<usize> = last_seed
+        .iter()
+        .map(|&k| p.squeezes[k].iter().copied().max().unwrap() + 1)
+        .collect();
+    assert!(
+        splits.windows(2).all(|w| w[0] <= w[1]) && last_seed.windows(2).all(|w| w[0] < w[1]),
+        "forks must be sequential — nested or interleaved forks are not supported"
+    );
+    let ncs: Vec<usize> = chains
+        .children
+        .iter()
+        .map(|c| c.trace.rows.len())
+        .collect();
+    // A parent row shifts by every child spliced at or before it; child `i`
+    // starts after its split plus every earlier child's rows.
+    let pmap = |r: usize| {
+        r + (0..n_ch).filter(|&j| splits[j] <= r).map(|j| ncs[j]).sum::<usize>()
+    };
+    let child_base: Vec<usize> = (0..n_ch)
+        .map(|i| splits[i] + ncs[..i].iter().sum::<usize>())
+        .collect();
+    let cmap = |i: usize| {
+        let base = child_base[i];
+        move |r: usize| base + r
+    };
     let remap = |l: &Link, f: &dyn Fn(usize) -> usize| Link {
         cv: match l.cv {
             CvSource::Iv => CvSource::Iv,
@@ -3271,42 +3288,71 @@ fn merge_chain(
         repeats: l.repeats.map(&*f),
     };
 
-    let woff = stream.words.len();
-    let boff = parent_bytes.len();
-    debug_assert_eq!(boff, woff * 16, "words are 16 bytes");
-
-    let mut rows = p.rows[..p_split].to_vec();
-    rows.extend_from_slice(&c.trace.rows);
-    rows.extend_from_slice(&p.rows[p_split..]);
-    let mut links: Vec<Link> = p.links[..p_split].iter().map(|l| remap(l, &pmap)).collect();
-    links.extend(c.trace.links.iter().map(|l| remap(l, &cmap)));
-    links.extend(p.links[p_split..].iter().map(|l| remap(l, &pmap)));
-    let mut block_offsets = p.block_offsets[..p_split].to_vec();
-    block_offsets.extend(c.trace.block_offsets.iter().map(|o| o.map(|b| b + boff)));
-    block_offsets.extend_from_slice(&p.block_offsets[p_split..]);
-    let mut squeezes: Vec<Vec<usize>> = p.squeezes[..=last_seed]
-        .iter()
-        .map(|s| s.iter().copied().map(pmap).collect())
+    // Child streams and their word/byte offsets in the merged view.
+    let cstreams: Vec<&flock_core::transcript_record::Stream> =
+        stream.forks.iter().map(|f| &f.stream).collect();
+    let woffs: Vec<usize> = (0..n_ch)
+        .map(|i| stream.words.len() + cstreams[..i].iter().map(|s| s.words.len()).sum::<usize>())
         .collect();
+    debug_assert_eq!(parent_bytes.len(), stream.words.len() * 16, "words are 16 bytes");
+
+    // Splice: parent up to split 0, child 0, parent to split 1, child 1, ...
+    let mut rows = Vec::new();
+    let mut links: Vec<Link> = Vec::new();
+    let mut block_offsets = Vec::new();
+    let mut at = 0usize;
+    for i in 0..n_ch {
+        let c = &chains.children[i];
+        let cm = cmap(i);
+        rows.extend_from_slice(&p.rows[at..splits[i]]);
+        links.extend(p.links[at..splits[i]].iter().map(|l| remap(l, &pmap)));
+        block_offsets.extend_from_slice(&p.block_offsets[at..splits[i]]);
+        rows.extend_from_slice(&c.trace.rows);
+        links.extend(c.trace.links.iter().map(|l| remap(l, &cm)));
+        block_offsets.extend(
+            c.trace
+                .block_offsets
+                .iter()
+                .map(|o| o.map(|b| b + woffs[i] * 16)),
+        );
+        at = splits[i];
+    }
+    rows.extend_from_slice(&p.rows[at..]);
+    links.extend(p.links[at..].iter().map(|l| remap(l, &pmap)));
+    block_offsets.extend_from_slice(&p.block_offsets[at..]);
+
+    // The same splice on the squeeze list, the words and the finalize points.
+    let mut squeezes: Vec<Vec<usize>> = Vec::new();
+    let mut words = stream.words.clone();
+    let mut finalize_after: Vec<usize> = Vec::new();
+    let mut bytes = parent_bytes;
+    let mut at = 0usize;
+    for i in 0..n_ch {
+        let c = &chains.children[i];
+        let cm = cmap(i);
+        squeezes.extend(
+            p.squeezes[at..=last_seed[i]]
+                .iter()
+                .map(|s| s.iter().copied().map(pmap).collect::<Vec<_>>()),
+        );
+        squeezes.extend(
+            c.trace
+                .squeezes
+                .iter()
+                .map(|s| s.iter().copied().map(&cm).collect::<Vec<_>>()),
+        );
+        finalize_after.extend_from_slice(&stream.finalize_after[at..=last_seed[i]]);
+        finalize_after.extend(cstreams[i].finalize_after.iter().map(|w| w + woffs[i]));
+        words.extend(cstreams[i].words.iter().cloned());
+        bytes.extend_from_slice(&cstreams[i].to_bytes(values, payloads));
+        at = last_seed[i] + 1;
+    }
     squeezes.extend(
-        c.trace
-            .squeezes
-            .iter()
-            .map(|s| s.iter().copied().map(cmap).collect::<Vec<_>>()),
-    );
-    squeezes.extend(
-        p.squeezes[last_seed + 1..]
+        p.squeezes[at..]
             .iter()
             .map(|s| s.iter().copied().map(pmap).collect::<Vec<_>>()),
     );
-
-    let mut words = stream.words.clone();
-    words.extend(cstream.words.iter().cloned());
-    let mut finalize_after: Vec<usize> = stream.finalize_after[..=last_seed].to_vec();
-    finalize_after.extend(cstream.finalize_after.iter().map(|w| w + woff));
-    finalize_after.extend_from_slice(&stream.finalize_after[last_seed + 1..]);
-    let mut bytes = parent_bytes;
-    bytes.extend_from_slice(&cbytes);
+    finalize_after.extend_from_slice(&stream.finalize_after[at..]);
 
     // The four cross-links. Each side's pair is two CONSECUTIVE
     // `ObserveScalar`s, and the walk emits [header, value] per observe — so
@@ -3340,20 +3386,21 @@ fn merge_chain(
         );
         cross[wi] = Some((row, 0));
     };
-    for (k, half) in [(c.seed_squeeze, 0usize), (c.seed_squeeze + 1, 1)] {
-        link_word(woff + c.child_seed_word + 2 * half, pmap(p.squeezes[k][0]));
-    }
-    for (k, half) in [(c.digest_squeeze, 0usize), (c.digest_squeeze + 1, 1)] {
-        link_word(
-            c.parent_digest_word + 2 * half,
-            cmap(c.trace.squeezes[k][0]),
-        );
+    for i in 0..n_ch {
+        let c = &chains.children[i];
+        let cm = cmap(i);
+        for (k, half) in [(c.seed_squeeze, 0usize), (c.seed_squeeze + 1, 1)] {
+            link_word(woffs[i] + c.child_seed_word + 2 * half, pmap(p.squeezes[k][0]));
+        }
+        for (k, half) in [(c.digest_squeeze, 0usize), (c.digest_squeeze + 1, 1)] {
+            link_word(c.parent_digest_word + 2 * half, cm(c.trace.squeezes[k][0]));
+        }
     }
 
     assert_eq!(
         cross.iter().filter(|c| c.is_some()).count(),
-        4,
-        "a fork contributes exactly four cross-link words"
+        4 * n_ch,
+        "each fork contributes exactly four cross-link words"
     );
     MergedChain {
         ops: flat,
