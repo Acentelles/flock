@@ -33,6 +33,12 @@
 //! Re-pinned 2026-08-05: stratified queries (all TOMLs stratified = true):
 //! caps at the top set bit of each level's query count, per-summand path
 //! lengths (docs/stratified-queries.tex).
+//! Re-pinned 2026-08-12, two 2026-08-11 protocol changes at once: path
+//! truncation (`ec51b71` — per-query paths stop at the cap depth, the
+//! census's redundant siblings leave the wire) and the assist transcript
+//! fork (`4787509` — merged opens prove the assist beside the inner open
+//! on a forked chain, unconditional). Roundtrip suites green; digests
+//! stable across two print runs.
 
 use ::sha2 as sha2_hash;
 use flock_core::proof::{R1csClaim, R1csProofMergedLigerito};
@@ -144,22 +150,22 @@ fn m6_merged_union_proof_bytes_pinned() {
         (
             "merged-nu10-1024-1024",
             [1024, 1024],
-            "ba33b12e1d71d8203dfcc7a7a948f253a2c7cb6c51a9803ba6fb63350355146a",
+            "6535f217824d1537a86550e60439a149381fa323ad75d5f117ed8e20525939ab",
         ),
         (
             "merged-nu10-50-37",
             [50, 37],
-            "fe072f62e739f01617d763d6bd270907dedd0db6544fd6245a9c33068dd69172",
+            "a95f9bad8b9456349dc7ff02e16596b71ce991d1c2d1198670f7a4f88b781e15",
         ),
         (
             "merged-nu10-8-8",
             [8, 8],
-            "3eb932f8d95df7e2b879d0a650e14fdeb66d19a91e261dc4b08696b99a86ebb2",
+            "4e74778b8b56e49845bd621ff926fe4bc25062d3e8eb4fc53d4565e816c68c24",
         ),
         (
             "merged-nu10-0-64",
             [0, 64],
-            "f1a8a90e18e0ea05eba85b8edff584e4c35f78a4a6d23c44c133813f2271d5bf",
+            "8b80f3440f4f79cbf1b63df782af9fda6c15fa158e672948e65081592ca65457",
         ),
     ];
 
@@ -235,7 +241,7 @@ fn m6_merged_union_proof_bytes_pinned() {
 fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
     // BLAKE3, 256 blocks (m = 22).
     {
-        const EXPECTED: &str = "3056b59a29610076d5ef5d68d87a119600d89aabe60dd4f75b96f26a5ac168d8";
+        const EXPECTED: &str = "32558fdfe5ee33d63cf46cf1fe78ddf2d2c06b2e28803d727d66eee2f4532ef9";
         let n_blocks = 256usize;
         let setup = blake3::Blake3Setup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_B3B3);
@@ -267,7 +273,7 @@ fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
 
     // SHA-256, 128 blocks (m = 22).
     {
-        const EXPECTED: &str = "13a3734569c1e4edeb4af2e36782bd22dc21d89b8f8b4f71e6aa191a425db995";
+        const EXPECTED: &str = "e60258ad10de2d3103fc59d82a9db23aa36b760a0ce57549d39b9a56f402113b";
         let n_blocks = 128usize;
         let setup = sha2::Sha256HybridSetup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_5252);
