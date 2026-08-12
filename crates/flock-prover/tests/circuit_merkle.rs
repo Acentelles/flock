@@ -76,9 +76,11 @@ fn tower_profile() -> LigeritoProfile {
     match std::env::var("TOWER_PROFILE").as_deref() {
         Ok("slim") => LigeritoProfile::Slim,
         Ok("secure") => LigeritoProfile::Secure,
-        // The 100-bit recursion variant: Fast's Johnson analysis and
-        // transcript shape at the pre-list-decoding query schedule.
+        // The 100-bit recursion variants: Fast/Slim analysis and transcript
+        // shape at the pre-list-decoding query schedules. slim100 is the
+        // chain track's envelope profile at the old fixed point.
         Ok("fast100") => LigeritoProfile::Fast100,
+        Ok("slim100") => LigeritoProfile::Slim100,
         _ => LigeritoProfile::Fast,
     }
 }
@@ -88,7 +90,10 @@ fn tower_fold_grinding() -> flock_core::matrix_fold::FoldGrinding {
         LigeritoProfile::Secure => {
             flock_core::matrix_fold::FoldGrinding::per_challenge_128()
         }
-        LigeritoProfile::Fast | LigeritoProfile::Fast100 | LigeritoProfile::Slim => {
+        LigeritoProfile::Fast
+        | LigeritoProfile::Fast100
+        | LigeritoProfile::Slim
+        | LigeritoProfile::Slim100 => {
             flock_core::matrix_fold::FoldGrinding::disabled()
         }
     }
@@ -115,7 +120,7 @@ fn envelope_floor_m() -> Option<usize> {
     // ~2x slack; every slim level commits m29), re-target the tight 28
     // later via the mac shave + publics diet — one deliberate re-pin.
     match tower_profile() {
-        LigeritoProfile::Slim => Some(29),
+        LigeritoProfile::Slim | LigeritoProfile::Slim100 => Some(29),
         _ => None,
     }
 }
@@ -5113,7 +5118,12 @@ fn parse_open_levels(
         let y_v = cur.v;
         cur.expect_obs_scalar();
         cur.skip_pows();
-        assert!(matches!(cur.ops[cur.i], Op::SqueezeScalar), "L0 OOD beta");
+        assert!(
+            matches!(cur.ops[cur.i], Op::SqueezeScalar),
+            "L0 OOD beta at op {}: context {:?}",
+            cur.i,
+            &cur.ops[cur.i.saturating_sub(4)..(cur.i + 4).min(cur.ops.len())]
+        );
         initial_ood.push(InitialOodRec {
             z_fin,
             z_ch,
