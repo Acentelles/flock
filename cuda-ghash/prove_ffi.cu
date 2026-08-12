@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <vector>
 #include "ntt_f128.cuh"
@@ -58,6 +59,66 @@ cudaError_t configure_memory_pool() {
     if (err != cudaSuccess) return err;
     uint64_t keep = UINT64_MAX;
     return cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &keep);
+}
+
+struct CachedTwiddles {
+    TwiddleTable host;
+    F128* device;
+};
+
+cudaError_t get_cached_twiddles(int k_code, const TwiddleTable*& host, F128*& device) {
+    static std::map<int, CachedTwiddles> cache;
+    auto found = cache.find(k_code);
+    if (found == cache.end()) {
+        CachedTwiddles value{build_twiddle_table(k_code), nullptr};
+        cudaError_t err = cudaMalloc(&value.device, value.host.data.size() * sizeof(F128));
+        if (err != cudaSuccess) return err;
+        err = cudaMemcpy(value.device, value.host.data.data(),
+                         value.host.data.size() * sizeof(F128), cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            cudaFree(value.device);
+            return err;
+        }
+        found = cache.emplace(k_code, std::move(value)).first;
+    }
+    host = &found->second.host;
+    device = found->second.device;
+    return cudaSuccess;
+}
+
+struct InduceScratch {
+    F128* alpha = nullptr;
+    F128* basis = nullptr;
+    unsigned long long* queries = nullptr;
+    long long alpha_capacity = 0;
+    long long basis_capacity = 0;
+    size_t query_capacity = 0;
+};
+
+cudaError_t grow_buffer(F128*& buffer, long long& capacity, long long required) {
+    if (required <= capacity) return cudaSuccess;
+    if (buffer) {
+        cudaError_t err = cudaFree(buffer);
+        if (err != cudaSuccess) return err;
+        buffer = nullptr;
+        capacity = 0;
+    }
+    cudaError_t err = cudaMalloc(&buffer, required * sizeof(F128));
+    if (err == cudaSuccess) capacity = required;
+    return err;
+}
+
+cudaError_t grow_query_buffer(InduceScratch& scratch, size_t required) {
+    if (required <= scratch.query_capacity) return cudaSuccess;
+    if (scratch.queries) {
+        cudaError_t err = cudaFree(scratch.queries);
+        if (err != cudaSuccess) return err;
+        scratch.queries = nullptr;
+        scratch.query_capacity = 0;
+    }
+    cudaError_t err = cudaMalloc(&scratch.queries, required * sizeof(unsigned long long));
+    if (err == cudaSuccess) scratch.query_capacity = required;
+    return err;
 }
 
 F128 ADD(F128 a, F128 b) { return f128_add_hd(a, b); }
@@ -371,14 +432,13 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
         int num_ntts = 1 << P->initial_k;
         l0_bl = 1LL << k_code; l0_ni = num_ntts;
         long long cw_len = l0_bl * num_ntts;
-        TwiddleTable tt = build_twiddle_table(k_code);
+        const TwiddleTable* tt;
         F128* d_tw;
+        CK(get_cached_twiddles(k_code, tt, d_tw));
         CK(ffi_malloc(&d_cw0, cw_len * sizeof(F128)));
-        CK(ffi_malloc(&d_tw, tt.data.size() * sizeof(F128)));
-        CK(cudaMemcpy(d_tw, tt.data.data(), tt.data.size() * sizeof(F128), cudaMemcpyHostToDevice));
         CK(ffi_malloc(&d_tree0, (size_t)(2 * l0_bl - 1) * 32));
         if (ntt_can_fuse_src(k_code - P->log_inv_rates[0])) {
-            launch_ntt(d_cw0, d_tw, tt, P->log_inv_rates[0], k_code, num_ntts, 256, false, df, len - 1);
+            launch_ntt(d_cw0, d_tw, *tt, P->log_inv_rates[0], k_code, num_ntts, 256, false, df, len - 1);
         } else {
             printf("FFI: unfused L0 rate-extend not wired\n"); return 102;
         }
@@ -386,7 +446,6 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
         launch_merkle((const uint8_t*)d_cw0, d_tree0, l0_bl, num_ntts * 16);
         CK(cudaDeviceSynchronize());
         CK(cudaMemcpy(l0root, d_tree0 + (size_t)(2 * l0_bl - 2) * 32, 32, cudaMemcpyDeviceToHost));
-        ffi_free(d_tw);
     }
 
     // ================= challenger + statement binding =======================
@@ -777,15 +836,16 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
     CK(ffi_free(d_suffix_ab)); CK(ffi_free(d_suffix_c));
     CK(ffi_free(d_weights_ab)); CK(ffi_free(d_weights_c));
 
-    F128 *p0, *p2, *du0, *du2;
+    F128 *p0, *p2, *du0, *du2, *d_sc_part, *d_sc_out;
     CK(ffi_malloc(&p0, SMC_MAX_BLOCKS * sizeof(F128)));
     CK(ffi_malloc(&p2, SMC_MAX_BLOCKS * sizeof(F128)));
     CK(ffi_malloc(&du0, sizeof(F128))); CK(ffi_malloc(&du2, sizeof(F128)));
-    launch_sumcheck_msg(df, dcb, len / 2, p0, p2, du0, du2);
+    CK(ffi_malloc(&d_sc_part, 8 * SMC_MAX_BLOCKS * sizeof(F128)));
+    CK(ffi_malloc(&d_sc_out, 8 * sizeof(F128)));
+    int initial_message_blocks = sumcheck_blocks(len / 4);
+    sumcheck_msg2_partial<<<initial_message_blocks, SMC_TPB>>>(df, dcb, len / 4, d_sc_part);
+    sumcheck_msg2_combine<<<8, SMC_TPB>>>(d_sc_part, initial_message_blocks, d_sc_out);
     CK(cudaGetLastError());
-    F128 r0u0, r0u2;
-    CK(cudaMemcpy(&r0u0, du0, sizeof(F128), cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(&r0u2, du2, sizeof(F128), cudaMemcpyDeviceToHost));
     // ring-switch proof section
     W.f128s(shat_ab); W.f128s(shat_c);
 
@@ -802,8 +862,6 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
         ch.observe_label((const uint8_t*)"flock-ligerito-basis-v0", 23);
         ch.observe_f128(toch(target));
         ch.observe_bytes(l0root, 32);
-        ch.observe_f128(toch(r0u0)); ch.observe_f128(toch(r0u2));
-        sc_transcript.push_back(r0u0); sc_transcript.push_back(r0u2);
 
         // resident sumcheck state (f, b)
         F128 *dfp, *df2, *dcb2;
@@ -814,25 +872,65 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
         long long slen = len;
         F128 u0, u2;
 
-        vector<F128> r_lane;
-        for (int j = 0; j < P->initial_k; j++) {
-            int bits = P->fold_grinding_bits[0] - j; if (bits < 0) bits = 0;
+        vector<F128> initial_challenges;
+        auto observe_initial_message = [&](int message, F128 message_u0,
+                                           F128 message_u2) -> cudaError_t {
+            ch.observe_f128(toch(message_u0)); ch.observe_f128(toch(message_u2));
+            sc_transcript.push_back(message_u0); sc_transcript.push_back(message_u2);
+            if (message == P->initial_k) return cudaSuccess;
+            int bits = P->fold_grinding_bits[0] - message;
+            if (bits < 0) bits = 0;
             if (bits > 0) {
                 uint64_t nonce;
-                CK(grind_pow_device(ch, (uint32_t)bits, nonce));
+                cudaError_t err = grind_pow_device(ch, (uint32_t)bits, nonce);
+                if (err != cudaSuccess) return err;
                 fold_grind_nonces.push_back(nonce);
             }
-            F128 r = frch(ch.sample_f128());
+            initial_challenges.push_back(frch(ch.sample_f128()));
+            return cudaSuccess;
+        };
+
+        F128 initial_messages[8];
+        CK(cudaMemcpy(initial_messages, d_sc_out, sizeof(initial_messages), cudaMemcpyDeviceToHost));
+        CK(observe_initial_message(0, initial_messages[0], initial_messages[1]));
+        if (P->initial_k > 0) {
+            CK(observe_initial_message(
+                1,
+                interp3(initial_messages[2], initial_messages[3], initial_messages[4],
+                        initial_challenges[0]),
+                interp3(initial_messages[5], initial_messages[6], initial_messages[7],
+                        initial_challenges[0])));
+        }
+
+        int folds = 0;
+        int next_message = 2;
+        while (folds + 2 <= P->initial_k) {
+            launch_sumcheck_fold2_msg2(cf, ccb, nf, ncb, slen / 16,
+                                       initial_challenges[folds], initial_challenges[folds + 1],
+                                       d_sc_part, d_sc_out);
+            CK(cudaGetLastError());
+            { F128* t; t = cf; cf = nf; nf = t; t = ccb; ccb = ncb; ncb = t; }
+            slen /= 4;
+            folds += 2;
+            CK(cudaMemcpy(initial_messages, d_sc_out, sizeof(initial_messages), cudaMemcpyDeviceToHost));
+            CK(observe_initial_message(next_message, initial_messages[0], initial_messages[1]));
+            next_message++;
+            if (next_message <= P->initial_k) {
+                F128 challenge = initial_challenges.back();
+                CK(observe_initial_message(
+                    next_message,
+                    interp3(initial_messages[2], initial_messages[3], initial_messages[4], challenge),
+                    interp3(initial_messages[5], initial_messages[6], initial_messages[7], challenge)));
+                next_message++;
+            }
+        }
+        while (folds < P->initial_k) {
             long long half = slen / 2;
-            launch_sumcheck_fold_msg(cf, ccb, nf, ncb, half, r, p0, p2, du0, du2);
+            launch_sumcheck_fold(cf, ccb, nf, ncb, half, initial_challenges[folds]);
             CK(cudaGetLastError());
             { F128* t; t = cf; cf = nf; nf = t; t = ccb; ccb = ncb; ncb = t; }
             slen = half;
-            CK(cudaMemcpy(&u0, du0, sizeof(F128), cudaMemcpyDeviceToHost));
-            CK(cudaMemcpy(&u2, du2, sizeof(F128), cudaMemcpyDeviceToHost));
-            ch.observe_f128(toch(u0)); ch.observe_f128(toch(u2));
-            sc_transcript.push_back(u0); sc_transcript.push_back(u2);
-            r_lane.push_back(r);
+            folds++;
         }
 
         // scratch for OOD / intro
@@ -853,7 +951,6 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
         for (int lvl = 0; ; lvl++) {
             if (lvl > 0) {
                 int k_rec = P->recursive_ks[lvl - 1];
-                vector<F128> level_rs;
                 for (int j = 0; j < k_rec; j++) {
                     int bits = P->fold_grinding_bits[lvl] - j; if (bits < 0) bits = 0;
                     if (bits > 0) {
@@ -871,9 +968,7 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
                     CK(cudaMemcpy(&u2, du2, sizeof(F128), cudaMemcpyDeviceToHost));
                     ch.observe_f128(toch(u0)); ch.observe_f128(toch(u2));
                     sc_transcript.push_back(u0); sc_transcript.push_back(u2);
-                    level_rs.push_back(r);
                 }
-                r_lane = std::move(level_rs);
             }
 
             if (lvl == r_steps) {
@@ -903,11 +998,10 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
                 int num_ntts = 1 << k_comm;
                 bln = 1LL << k_code; lanesn = num_ntts;
                 long long cw_len = bln * num_ntts;
-                TwiddleTable tt = build_twiddle_table(k_code);
+                const TwiddleTable* tt;
                 F128* d_tw;
+                CK(get_cached_twiddles(k_code, tt, d_tw));
                 CK(ffi_malloc(&d_cwn, cw_len * sizeof(F128)));
-                CK(ffi_malloc(&d_tw, tt.data.size() * sizeof(F128)));
-                CK(cudaMemcpy(d_tw, tt.data.data(), tt.data.size() * sizeof(F128), cudaMemcpyHostToDevice));
                 CK(ffi_malloc(&d_treen, (size_t)(2 * bln - 1) * 32));
                 // Always the replicate path here: the recursive codewords are
                 // tiny, and the fused src read diverges from the Rust commit at
@@ -916,13 +1010,12 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
                 {
                     int tpb = 256;
                     replicate_fill_ffi<<<(unsigned)((cw_len + tpb - 1) / tpb), tpb>>>(cf, d_cwn, cw_len, nn_len);
-                    launch_ntt(d_cwn, d_tw, tt, rate_next, k_code, num_ntts);
+                    launch_ntt(d_cwn, d_tw, *tt, rate_next, k_code, num_ntts);
                 }
                 CK(cudaGetLastError());
                 launch_merkle((const uint8_t*)d_cwn, d_treen, bln, num_ntts * 16);
                 CK(cudaDeviceSynchronize());
                 CK(cudaMemcpy(rn, d_treen + (size_t)(2 * bln - 2) * 32, 32, cudaMemcpyDeviceToHost));
-                ffi_free(d_tw);
             }
             ch.observe_bytes(rn, 32);
             { MHash h; memcpy(h.b, rn, 32); rec_roots.push_back(h); }
@@ -963,13 +1056,28 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
 
             std::vector<unsigned long long> qull(q.size());
             for (size_t i = 0; i < q.size(); i++) qull[i] = q[i];
-            vector<F128> sks = eval_sk_at_vks_hd(n_next);
-            InduceSetupDev S = induce_setup_device(n_next, sks, r_lane, alpha_f, qull, lo.rows_flat, prev_ni);
             level_opens.push_back(std::move(lo));
-            F128* d_basis;
-            CK(ffi_malloc(&d_basis, (size_t)nn_len * sizeof(F128)));
-            launch_induce_accumulate(S.d_sh, S.d_low, S.n_queries, S.low_n, S.high_n, d_basis, nn_len);
+            static InduceScratch induce_scratch;
+            long long alpha_len = 1LL << al;
+            CK(grow_buffer(induce_scratch.alpha, induce_scratch.alpha_capacity, alpha_len));
+            CK(grow_buffer(induce_scratch.basis, induce_scratch.basis_capacity, prev_bl));
+            CK(grow_query_buffer(induce_scratch, qull.size()));
+            build_eq_device(induce_scratch.alpha, alpha_f.data(), al);
+            CK(cudaGetLastError());
+            CK(cudaMemcpy(induce_scratch.queries, qull.data(),
+                          qull.size() * sizeof(unsigned long long), cudaMemcpyHostToDevice));
+            const TwiddleTable* induce_tt;
+            F128* induce_twiddles;
+            int log_block = 0;
+            for (long long block = prev_bl; block > 1; block >>= 1) log_block++;
+            CK(get_cached_twiddles(log_block, induce_tt, induce_twiddles));
+            zero_f128<<<(unsigned)((prev_bl + 255) / 256), 256>>>(induce_scratch.basis, prev_bl);
+            scatter_weights<<<(unsigned)((qull.size() + 255) / 256), 256>>>(
+                induce_scratch.basis, induce_scratch.queries, induce_scratch.alpha,
+                (int)qull.size());
+            launch_transpose_ntt(induce_scratch.basis, induce_twiddles, *induce_tt, log_block);
             CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+            F128* d_basis = induce_scratch.basis;
 
             // introduce + glue
             { long long quads = nn_len / 2;
@@ -984,8 +1092,6 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
             ChF128 bi = ch.sample_f128();
             launch_glue(ccb, d_basis, frch(bi), nn_len);
             CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
-            ffi_free(S.d_low); ffi_free(S.d_sh); ffi_free(d_basis);
-
             ffi_free(d_prev_cw); ffi_free(d_prev_tree);
             d_prev_cw = d_cwn; d_prev_tree = d_treen;
             prev_bl = bln; prev_ni = lanesn;
@@ -995,6 +1101,7 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
 
         ffi_free(dfp); ffi_free(dcb); ffi_free(df2); ffi_free(dcb2);
         ffi_free(p0); ffi_free(p2); ffi_free(du0); ffi_free(du2);
+        ffi_free(d_sc_part); ffi_free(d_sc_out);
         ffi_free(d_bnew); ffi_free(ep0); ffi_free(ep2); ffi_free(epodd);
         ffi_free(eu0); ffi_free(eu2); ffi_free(ehnew);
     }
