@@ -1123,7 +1123,10 @@ fn scalar_claim_groups<'a>(
 #[allow(clippy::too_many_arguments)]
 pub fn open_batch_merged<Ch: Challenger>(
     q: Vec<F128>,
-    padded_witness: &[F128],
+    // The M-variable padded buffer the ring switch reads. `None` means it IS
+    // `q` — identity compaction, where the caller moved one buffer in rather
+    // than cloning it to satisfy the by-value/by-ref split.
+    padded_witness: Option<&[F128]>,
     prover_data: &ProverData,
     commitment: &Commitment,
     x_outers: &[&[F128]],
@@ -1161,6 +1164,7 @@ pub fn open_batch_merged<Ch: Challenger>(
     // entirely (the callee asserts a non-empty batch). This branch DEFINES the
     // element-only merged transcript: nothing is absorbed for the empty batch,
     // exactly as in the mixed open's `n_rs > 0` guard.
+    let padded_witness = padded_witness.unwrap_or(&q);
     let (rs_results, gammas_rs) = if !x_outers.is_empty() {
         ring_switch::prove_batched_padded_with_precomputed(
             padded_witness,

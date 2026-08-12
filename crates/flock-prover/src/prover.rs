@@ -728,17 +728,34 @@ fn prove_union_with_binding<Ch: Challenger>(
     // and never read — so the compaction skips the honest-zeros
     // debug_assert.
     let t = std::time::Instant::now();
-    let q: Vec<F128> = if union.compaction_is_identity() {
-        z_packed.clone()
+    // IDENTITY COMPACTION COPIES NOTHING. There is no compaction to do — the
+    // dense stack IS the padded buffer, byte for byte — and `open_batch_merged`
+    // wants both `q` (by value) and the padded witness (by reference), which
+    // under identity are the same 512 MB at m32. Cloning to satisfy that was a
+    // pure memcpy: 43 ms and a doubled residency, and single-threaded, so it
+    // read 1.0x on the scaling table while everything around it read 6-7x.
+    //
+    // Instead the buffer is MOVED into the open (see `open_witness` below) and
+    // the open aliases the padded witness to it. Pool-neutral: the Ligerito
+    // sumcheck's Drop hands `f` back to `scratch`, which is exactly where this
+    // caller's own give-back sends it — so only the FreshZeroed mode, whose
+    // buffer belongs to the union's own pool instead, keeps the copy.
+    let alias_q = union.compaction_is_identity() && give_back;
+    let q_owned: Option<Vec<F128>> = if alias_q {
+        None
+    } else if union.compaction_is_identity() {
+        Some(z_packed.clone())
     } else if buf_mode == flock_core::union::WitnessBufMode::PooledDirty {
-        union.compact_witness_unchecked(&z_packed)
+        Some(union.compact_witness_unchecked(&z_packed))
     } else {
-        union.compact_witness(&z_packed)
+        Some(union.compact_witness(&z_packed))
     };
+    let q: &[F128] = q_owned.as_deref().unwrap_or(&z_packed);
     if trace {
         eprintln!(
-            "  [prove_union] compact q (2^{} dense): {:7.2} ms",
+            "  [prove_union] compact q (2^{} dense{}): {:7.2} ms",
             union.dense_m() - 7,
+            if alias_q { ", ALIASED — no copy" } else { "" },
             t.elapsed().as_secs_f64() * 1e3
         );
     }
@@ -752,9 +769,9 @@ fn prove_union_with_binding<Ch: Challenger>(
     // `num_lanes` alone.
     let t = std::time::Instant::now();
     let (commitment, prover_data) = if pcs_params.num_lanes.is_some() {
-        pcs::commit_lane_major(&q, pcs_params)
+        pcs::commit_lane_major(q, pcs_params)
     } else {
-        pcs::commit(&q, pcs_params)
+        pcs::commit(q, pcs_params)
     };
     if trace {
         eprintln!(
@@ -1168,9 +1185,17 @@ fn prove_union_with_binding<Ch: Challenger>(
         .map(|cl| quirky_x_outer_full(&cl.point))
         .collect();
     let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
+    // Under the alias, `z_packed` IS `q`: hand it over and let the open serve
+    // the padded witness from it. Otherwise the two are distinct buffers and
+    // the padded one stays borrowed.
+    let gb_words = z_packed.len();
+    let (open_witness, padded_owner) = match q_owned {
+        Some(v) => (v, Some(z_packed)),
+        None => (z_packed, None),
+    };
     let pcs_open = pcs::open_batch_merged(
-        q,
-        &z_packed,
+        open_witness,
+        padded_owner.as_deref(),
         &prover_data,
         &commitment,
         &x_refs,
@@ -1183,11 +1208,15 @@ fn prove_union_with_binding<Ch: Challenger>(
         challenger,
     );
     let t_gb = std::time::Instant::now();
-    let gb_words = z_packed.len();
-    if give_back {
-        flock_core::scratch::give_f128(z_packed);
-    } else {
-        union.give_back_witness_buffer(z_packed);
+    // Under the alias there is nothing left to hand back: the open consumed
+    // the one buffer and the Ligerito sumcheck's Drop already returned it to
+    // `scratch`, which is where this arm would have sent it anyway.
+    if let Some(zp) = padded_owner {
+        if give_back {
+            flock_core::scratch::give_f128(zp);
+        } else {
+            union.give_back_witness_buffer(zp);
+        }
     }
     if trace {
         eprintln!(
