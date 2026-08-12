@@ -175,7 +175,7 @@ struct EnvShape {
     /// deliberate. Boolean trio first (b3, swap, spread — NOTE: swap
     /// before spread here, matching the builders' declaration fields, NOT
     /// the registry print order), then the element types by cache key.
-    counts_bool: [usize; 3],
+    counts_bool: [usize; 4],
     counts_el: [(usize, usize); 15],
     /// publics* — the ONE public-segment length every envelope outer pads
     /// to (published zeros appended after all real publics). The child's
@@ -351,7 +351,11 @@ fn envelope_shape() -> Option<EnvShape> {
         // census, elementwise max of leaf/node usage). Only b3, le8, pf8
         // and mac are content-geometry-sensitive; everything else hits its
         // cap exactly (registry-shaped) and skn/skc are the leaf's.
-        counts_bool: [26200, 12250, 1060],
+        // The 4th entry is the depth-0 PoW-mask slot (one row per masked
+        // word: 2 per nonzero grind, 1 per zero-bit site). NOT yet iterated
+        // at the padded envelope — an estimate above current usage; the pad
+        // assert fails loudly if outgrown and the re-pin is deliberate.
+        counts_bool: [26200, 12250, 1060, 4096],
         counts_el: [
             (600, 49000), // mac — the nu* driver; watch the 2^15 ceiling
             (500, 1000),  // zcr
@@ -449,6 +453,7 @@ fn declare_envelope_slots(
             ty: BitSpreadTable::new(env.spread_w),
             nu,
         }),
+        pow: sb.slot(PowMaskGate { nu }),
     };
     slot_cached(sb, cache, 600, MacGate::new);
     slot_cached(sb, cache, 500, ZcRoundGate::new);
@@ -534,9 +539,11 @@ fn pad_envelope_counts(
     let t_b3 = if no_pad { floor1(sb, q.b3) } else { env.counts_bool[0] };
     let t_swap = if no_pad { floor1(sb, q.swap) } else { env.counts_bool[1] };
     let t_spread = if no_pad { floor1(sb, q.spread) } else { env.counts_bool[2] };
+    let t_pow = if no_pad { floor1(sb, q.pow) } else { env.counts_bool[3] };
     pad(sb, hints, &mut over, "b3", q.b3, t_b3, false);
     pad(sb, hints, &mut over, "swap", q.swap, t_swap, true);
     pad(sb, hints, &mut over, "spread", q.spread, t_spread, false);
+    pad(sb, hints, &mut over, "pow", q.pow, t_pow, false);
     for &(key, count) in &env.counts_el {
         let &(_, s) = cache
             .iter()
@@ -5479,6 +5486,7 @@ fn mvp7_real_query_phase() {
             ty: BitSpreadTable::new(spread_w),
             nu,
         }),
+        pow: sb.slot(PowMaskGate { nu }),
     };
     let mut leaf_slot: Vec<(usize, flock_core::circuit::builder::SlotId)> = Vec::new();
     // ONE 8-lane leaf-eval type serves every level: a 64-lane leaf is 8
@@ -5952,7 +5960,7 @@ fn mvp7_real_query_phase() {
     emit_pow_checks(
         &mut sb,
         slots.b3,
-        slots.spread,
+        slots.pow,
         iv,
         &pow_checks,
         &mut vals,
@@ -6192,6 +6200,9 @@ fn mvp7_real_query_phase() {
     let spread_ty = BitSpreadTable::new(spread_w);
     let spread_r1cs = spread_ty.build_block_r1cs(nu);
     let spread_lc = spread_r1cs.csc_lincheck_circuit();
+    let pow_ty = PowMaskTable;
+    let pow_r1cs = pow_ty.build_block_r1cs(nu);
+    let pow_lc = pow_r1cs.csc_lincheck_circuit();
 
     for (i, row) in built.rows::<BitSpreadGate>(slots.spread).iter().enumerate() {
         assert_eq!(
@@ -6207,6 +6218,8 @@ fn mvp7_real_query_phase() {
     let swap_wit = SwapTable::generate_witness_batch_major(built.rows::<SwapGate>(slots.swap), nu);
     let spread_wit =
         spread_ty.generate_witness_batch_major(built.rows::<BitSpreadGate>(slots.spread), nu);
+    let pow_wit =
+        pow_ty.generate_witness_batch_major(built.rows::<PowMaskGate>(slots.pow), nu);
     let els: Vec<Vec<F128>> = leaf_slot
         .iter()
         .map(|(_, s)| match &built.witnesses[shape.registry_slot(*s)] {
@@ -6219,6 +6232,7 @@ fn mvp7_real_query_phase() {
         (shape.registry_slot(slots.b3), b3_lc),
         (shape.registry_slot(slots.swap), swap_lc),
         (shape.registry_slot(slots.spread), spread_lc),
+        (shape.registry_slot(slots.pow), pow_lc),
     ];
     lcs_ord.sort_by_key(|(i, _)| *i);
     let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
@@ -6237,6 +6251,10 @@ fn mvp7_real_query_phase() {
             (
                 shape.registry_slot(slots.spread),
                 UnionSlotProverInput::new(spread_wit.clone(), spread_lc),
+            ),
+            (
+                shape.registry_slot(slots.pow),
+                UnionSlotProverInput::new(pow_wit.clone(), pow_lc),
             ),
         ];
         bool_slots.sort_by_key(|(i, _)| *i);
@@ -6304,7 +6322,7 @@ fn mvp7_real_query_phase() {
 // ---------------------------------------------------------------------------
 
 use flock_prover::r1cs_hashes::merkle_glue::{
-    BitSpreadInput, BitSpreadTable, SwapInput, SwapTable,
+    BitSpreadInput, BitSpreadTable, PowMaskInput, PowMaskTable, SwapInput, SwapTable,
 };
 
 /// One Merkle level's conditional swap. The sibling is a [`GateType::Hint`] —
@@ -6370,12 +6388,46 @@ impl GateType for BitSpreadGate {
     }
 }
 
-/// The three slots a collapsed opening writes into.
+/// The fused PoW mask row: predicate prefix + nonce width in ONE 4-word
+/// row — see [`PowMaskTable`] for the layout and the repurposed-high-half
+/// trick that makes it fit 512 bits.
+struct PowMaskGate {
+    nu: usize,
+}
+
+impl GateType for PowMaskGate {
+    type Row = PowMaskInput;
+    type Hint = ();
+
+    fn table(&self) -> TableType {
+        TableType::from_block_r1cs(&PowMaskTable.build_block_r1cs(self.nu))
+            .with_io_schema(PowMaskTable.io_schema())
+    }
+
+    fn eval(&self, inputs: &[F128], _hint: &(), _outputs: &mut Vec<F128>) -> PowMaskInput {
+        let w = |i: usize| (inputs[i].lo as u128) | ((inputs[i].hi as u128) << 64);
+        PowMaskInput {
+            pred: w(0),
+            nonce: w(1),
+            mask: w(2),
+        }
+    }
+
+    fn witness(&self, _rows: &[Self::Row], _nu: usize) -> SlotWitness {
+        SlotWitness::DeferredToRows
+    }
+}
+
+/// The three slots a collapsed opening writes into, plus the fused PoW mask
+/// slot the grinding checks ride: one 4-word [`PowMaskTable`] row carries a
+/// whole check (prefix mask AND nonce width) — on the deep Merkle-index
+/// slot the same check paid two 16-word rows and two bit relocations.
 #[derive(Clone, Copy)]
 struct CollapsedSlots {
     b3: flock_core::circuit::builder::SlotId,
     swap: flock_core::circuit::builder::SlotId,
     spread: flock_core::circuit::builder::SlotId,
+    pow: flock_core::circuit::builder::SlotId,
 }
 
 /// One opened Ligerito level's geometry. Legacy levels report it from the
@@ -7353,34 +7405,31 @@ fn pow_leading_zero_mask(bits: u32) -> F128 {
 fn emit_pow_checks(
     sb: &mut ShapeBuilder,
     _b3: flock_core::circuit::builder::SlotId,
-    spread: flock_core::circuit::builder::SlotId,
+    pow: flock_core::circuit::builder::SlotId,
     _iv: [Wire; 2],
     pows: &[([Wire; 2], u32)],
     vals: &mut Vec<F128>,
     consts: &mut Vec<(F128, Wire)>,
 ) {
-    let nonce_hi_mask = F128::new(0, u64::MAX);
-
     for &([predicate, nonce], bits) in pows {
-        // The transcript stream allocates a whole F128 word to the 8-byte
-        // nonce.  This constraint is what makes the remaining eight bytes
-        // padding rather than an extra grinding knob available to a
+        // One fused PowMask row per check: the prefix cells mask the
+        // predicate and the mask word's wire-bound high half pins the
+        // nonce to 64 bits — the transcript stream allocates a whole F128
+        // word to the 8-byte nonce, and this is what keeps the remaining
+        // eight bytes padding rather than an extra grinding knob for a
         // malicious recursive prover.
-        let nonce_mask = if bits == 0 {
-            F128::new(u64::MAX, u64::MAX)
-        } else {
-            nonce_hi_mask
-        };
-        let nonce_mask_w = cw(sb, vals, consts, nonce_mask);
-        let _ = sb.gate(spread, &[nonce, nonce_mask_w]);
-
+        assert!(bits <= 64, "the PowMask row's prefix cells cover the low mask half");
         if bits == 0 {
-            continue;
+            // Canonical zero nonce: the nonce rides BOTH input words — the
+            // prefix cells pin its low half under the all-ones low mask,
+            // the structural high-half cells pin the rest.  All 128 bits,
+            // so a disabled site cannot become a grinding knob either.
+            let ones = cw(sb, vals, consts, F128::new(u64::MAX, 0));
+            let _ = sb.gate(pow, &[nonce, nonce, ones]);
+        } else {
+            let mask_w = cw(sb, vals, consts, pow_leading_zero_mask(bits));
+            let _ = sb.gate(pow, &[predicate, nonce, mask_w]);
         }
-
-        let mask = pow_leading_zero_mask(bits);
-        let mask_w = cw(sb, vals, consts, mask);
-        let _ = sb.gate(spread, &[predicate, mask_w]);
     }
 }
 
@@ -7472,18 +7521,28 @@ fn fused_pow_masks_match_raw_compression() {
         }
     }
 
-    // Pin the other half of the gadget: nonzero-bit PoW permits only a
-    // 64-bit nonce, and a zero-bit site permits only canonical nonce zero.
-    let ty = BitSpreadTable::new(1);
+    // Pin the other half of the gadget on the fused PowMask row: a
+    // nonzero-bit PoW permits only a 64-bit nonce, and a zero-bit site
+    // permits only the canonical nonce zero.  The prefix checks live in the
+    // R1CS; the nonce-width check is the mask input word's WIRE BINDING
+    // (the word must equal the statement's mask constant, whose high half
+    // is zero), so the pin models both.
+    let ty = PowMaskTable;
     let r1cs = ty.build_block_r1cs(0);
-    let satisfies = |word: u128, zero_mask: u128| {
-        let [z, _, _] = ty.build_masked_witness(BitSpreadInput { word, zero_mask });
-        r1cs.satisfies(&z)
+    let accepted = |pred: u128, nonce: u128, mask: u128| {
+        let [z, _, _] = ty.build_witness(PowMaskInput { pred, nonce, mask });
+        let word2 = (256..384).fold(0u128, |acc, i| acc | ((z[i] as u128) << (i - 256)));
+        r1cs.satisfies(&z) && word2 == mask
     };
-    assert!(satisfies(42, (u128::MAX) << 64));
-    assert!(!satisfies((1u128 << 100) | 42, (u128::MAX) << 64));
-    assert!(satisfies(0, u128::MAX));
-    assert!(!satisfies(1, u128::MAX));
+    // The nonce width, under a clearing predicate.
+    assert!(accepted(0, 42, 0b11));
+    assert!(!accepted(0, (1u128 << 100) | 42, 0b11));
+    // The prefix itself.
+    assert!(!accepted(0b10, 42, 0b11));
+    // The canonical zero-bit shape: the nonce as both words, all-ones low mask.
+    assert!(accepted(0, 0, u64::MAX as u128));
+    assert!(!accepted(1, 1, u64::MAX as u128));
+    assert!(!accepted(1u128 << 100, 1u128 << 100, u64::MAX as u128));
 }
 
 #[test]
@@ -7531,10 +7590,7 @@ fn recursive_pow_relation_accepts_valid_and_rejects_invalid_nonce() {
         let nu = 7usize;
         let mut sb = ShapeBuilder::new(nu);
         let b3 = sb.slot(Blake3Gate { nu });
-        let spread = sb.slot(BitSpreadGate {
-            ty: BitSpreadTable::new(1),
-            nu,
-        });
+        let spread = sb.slot(PowMaskGate { nu });
         let mut vals = Vec::new();
         let digest_v = [
             F128::new(
@@ -7584,16 +7640,16 @@ fn recursive_pow_relation_accepts_valid_and_rejects_invalid_nonce() {
     assert_eq!(good_shape.circuit.digest(), bad_shape.circuit.digest());
     assert!(
         good_built
-            .rows::<BitSpreadGate>(good_spread)
+            .rows::<PowMaskGate>(good_spread)
             .iter()
-            .all(|r| r.word & r.zero_mask == 0),
-        "the valid witness satisfies every selected-zero row"
+            .all(|r| r.pred & r.mask == 0 && r.nonce >> 64 == 0),
+        "the valid witness satisfies every fused PoW row"
     );
     assert!(
         bad_built
-            .rows::<BitSpreadGate>(bad_spread)
+            .rows::<PowMaskGate>(bad_spread)
             .iter()
-            .any(|r| r.word & r.zero_mask != 0),
+            .any(|r| r.pred & r.mask != 0 || r.nonce >> 64 != 0),
         "the invalid nonce reaches a failing in-circuit prefix row"
     );
 
@@ -7613,7 +7669,7 @@ fn recursive_pow_relation_accepts_valid_and_rejects_invalid_nonce() {
         };
         let b3_r1cs = blake3::build_block_r1cs(nu);
         let b3_lc = b3_r1cs.csc_lincheck_circuit();
-        let spread_ty = BitSpreadTable::new(1);
+        let spread_ty = PowMaskTable;
         let spread_r1cs = spread_ty.build_block_r1cs(nu);
         let spread_lc = spread_r1cs.csc_lincheck_circuit();
         let mut slots = vec![
@@ -7631,7 +7687,7 @@ fn recursive_pow_relation_accepts_valid_and_rejects_invalid_nonce() {
                 shape.registry_slot(spread_slot),
                 UnionSlotProverInput::new(
                     spread_ty.generate_witness_batch_major(
-                        built.rows::<BitSpreadGate>(spread_slot),
+                        built.rows::<PowMaskGate>(spread_slot),
                         nu,
                     ),
                     spread_lc,
@@ -7813,6 +7869,7 @@ fn collapsed_opening_matches_the_composite() {
                 ty: BitSpreadTable::new(depth),
                 nu,
             }),
+            pow: sb.slot(PowMaskGate { nu }),
         };
 
         let mut pubs: Vec<F128> = Vec::new();
@@ -8025,6 +8082,7 @@ fn mvp6_all_levels_collapsed() {
             ty: BitSpreadTable::new(max_depth),
             nu,
         }),
+        pow: sb.slot(PowMaskGate { nu }),
     };
     let mut leaf_slot: Vec<(usize, flock_core::circuit::builder::SlotId)> = Vec::new();
     let leafeval: Vec<_> = levels
@@ -8245,6 +8303,9 @@ fn mvp6_all_levels_collapsed() {
     let spread_ty = BitSpreadTable::new(max_depth);
     let spread_r1cs = spread_ty.build_block_r1cs(nu);
     let spread_lc = spread_r1cs.csc_lincheck_circuit();
+    let pow_ty = PowMaskTable;
+    let pow_r1cs = pow_ty.build_block_r1cs(nu);
+    let pow_lc = pow_r1cs.csc_lincheck_circuit();
 
     // Witnesses once; each prove rep rebuilds its inputs from CLONES outside
     // the timer (`UnionSlotProverInput::new` consumes them).
@@ -8254,6 +8315,8 @@ fn mvp6_all_levels_collapsed() {
     let swap_wit = SwapTable::generate_witness_batch_major(built.rows::<SwapGate>(slots.swap), nu);
     let spread_wit =
         spread_ty.generate_witness_batch_major(built.rows::<BitSpreadGate>(slots.spread), nu);
+    let pow_wit =
+        pow_ty.generate_witness_batch_major(built.rows::<PowMaskGate>(slots.pow), nu);
     let els: Vec<Vec<F128>> = leaf_slot
         .iter()
         .map(|(_, s)| match &built.witnesses[shape.registry_slot(*s)] {
@@ -8266,6 +8329,7 @@ fn mvp6_all_levels_collapsed() {
         (shape.registry_slot(slots.b3), b3_lc),
         (shape.registry_slot(slots.swap), swap_lc),
         (shape.registry_slot(slots.spread), spread_lc),
+        (shape.registry_slot(slots.pow), pow_lc),
     ];
     lcs_ord.sort_by_key(|(i, _)| *i);
     let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
@@ -8284,6 +8348,10 @@ fn mvp6_all_levels_collapsed() {
             (
                 shape.registry_slot(slots.spread),
                 UnionSlotProverInput::new(spread_wit.clone(), spread_lc),
+            ),
+            (
+                shape.registry_slot(slots.pow),
+                UnionSlotProverInput::new(pow_wit.clone(), pow_lc),
             ),
         ];
         bool_slots.sort_by_key(|(i, _)| *i);
@@ -8406,9 +8474,11 @@ struct LeafOuter {
     b3_r1cs: flock_core::r1cs::BlockR1cs,
     swap_r1cs: flock_core::r1cs::BlockR1cs,
     spread_r1cs: flock_core::r1cs::BlockR1cs,
+    pow_r1cs: flock_core::r1cs::BlockR1cs,
     b3_slot: usize,
     swap_slot: usize,
     spread_slot: usize,
+    pow_slot: usize,
 }
 
 /// mvp9's WHOLE construction as the shared builder the swap consumes: the
@@ -8959,6 +9029,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
                     ty: BitSpreadTable::new(spread_w),
                     nu,
                 }),
+                pow: sb.slot(PowMaskGate { nu }),
             },
         };
         let leafeval: Vec<_> = geo
@@ -9044,7 +9115,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         emit_pow_checks(
             &mut sb,
             slots.b3,
-            slots.spread,
+            slots.pow,
             iv,
             &pow_checks,
             &mut vals,
@@ -10096,9 +10167,12 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         let spread_ty = BitSpreadTable::new(spread_w);
         let spread_r1cs = spread_ty.build_block_r1cs(nu);
         let spread_lc = spread_r1cs.csc_lincheck_circuit();
+        let pow_r1cs = PowMaskTable.build_block_r1cs(nu);
+        let pow_lc = pow_r1cs.csc_lincheck_circuit();
         let b3_rows_l = built.rows::<Blake3Gate>(slots.b3).to_vec();
         let swap_rows_l = built.rows::<SwapGate>(slots.swap).to_vec();
         let spread_rows_l = built.rows::<BitSpreadGate>(slots.spread).to_vec();
+        let pow_rows_l = built.rows::<PowMaskGate>(slots.pow).to_vec();
         let els: Vec<Vec<F128>> = leaf_slot
             .iter()
             .map(|(_, sl)| match &built.witnesses[shape.registry_slot(*sl)] {
@@ -10127,6 +10201,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             (shape.registry_slot(slots.b3), b3_lc),
             (shape.registry_slot(slots.swap), swap_lc),
             (shape.registry_slot(slots.spread), spread_lc),
+            (shape.registry_slot(slots.pow), pow_lc),
         ];
         lcs_ord.sort_by_key(|(i, _)| *i);
         let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
@@ -10164,6 +10239,16 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
                             move |dst| ty.generate_witness_batch_major_into(&r, dst)
                         },
                         spread_lc,
+                    ),
+                ),
+                (
+                    shape.registry_slot(slots.pow),
+                    UnionSlotProverInput::in_place(
+                        {
+                            let r = pow_rows_l.clone();
+                            move |dst| PowMaskTable.generate_witness_batch_major_into(&r, dst)
+                        },
+                        pow_lc,
                     ),
                 ),
             ];
@@ -10217,10 +10302,11 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             bincode::serialize(&oproof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
             threads,
         );
-        let (b3_slot, swap_slot, spread_slot) = (
+        let (b3_slot, swap_slot, spread_slot, pow_slot) = (
             shape.registry_slot(slots.b3),
             shape.registry_slot(slots.swap),
             shape.registry_slot(slots.spread),
+            shape.registry_slot(slots.pow),
         );
         LeafOuter {
             public: built.public.clone(),
@@ -10231,9 +10317,11 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             b3_r1cs,
             swap_r1cs,
             spread_r1cs,
+            pow_r1cs,
             b3_slot,
             swap_slot,
             spread_slot,
+            pow_slot,
         }
     }
 }
@@ -10372,6 +10460,7 @@ impl<'p> RealTape<'p> {
             (lo.b3_slot, lo.b3_r1cs.csc_lincheck_circuit()),
             (lo.swap_slot, lo.swap_r1cs.csc_lincheck_circuit()),
             (lo.spread_slot, lo.spread_r1cs.csc_lincheck_circuit()),
+            (lo.pow_slot, lo.pow_r1cs.csc_lincheck_circuit()),
         ];
         lcs_ord.sort_by_key(|(i, _)| *i);
         let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
@@ -11778,7 +11867,7 @@ fn emit_real_child_region(
     emit_pow_checks(
         sb,
         cs.q.b3,
-        cs.q.spread,
+        cs.q.pow,
         iv2,
         &pow_checks,
         vals,
@@ -12876,6 +12965,9 @@ fn mvp10_leaf_outer_inner_tape() {
     let spread_ty2 = BitSpreadTable::new(rt.spread_w);
     let spread_r1cs2 = spread_ty2.build_block_r1cs(nu2);
     let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
+    let pow_ty2 = PowMaskTable;
+    let pow_r1cs2 = pow_ty2.build_block_r1cs(nu2);
+    let pow_lc2 = pow_r1cs2.csc_lincheck_circuit();
     let mut bslots: Vec<(usize, UnionSlotProverInput)> = vec![
         (
             shape2.registry_slot(cs.q.b3),
@@ -12904,6 +12996,16 @@ fn mvp10_leaf_outer_inner_tape() {
                 spread_lc2,
             ),
         ),
+        (
+            shape2.registry_slot(cs.q.pow),
+            UnionSlotProverInput::new(
+                pow_ty2.generate_witness_batch_major(
+                    built2.rows::<PowMaskGate>(cs.q.pow),
+                    nu2,
+                ),
+                pow_lc2,
+            ),
+        ),
     ];
     bslots.sort_by_key(|(i, _)| *i);
     let mut el_ord: Vec<(usize, Vec<F128>)> = cs
@@ -12929,6 +13031,7 @@ fn mvp10_leaf_outer_inner_tape() {
         (shape2.registry_slot(cs.q.b3), b3_lc2),
         (shape2.registry_slot(cs.q.swap), swap_lc2),
         (shape2.registry_slot(cs.q.spread), spread_lc2),
+        (shape2.registry_slot(cs.q.pow), pow_lc2),
     ];
     lco.sort_by_key(|(i, _)| *i);
     let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
@@ -14126,7 +14229,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
         emit_recorded_pow_checks(
             &mut sb,
             b3s,
-            cs.q.spread,
+            cs.q.pow,
             iv2,
             &ops,
             &trace,
@@ -14488,6 +14591,11 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
                 fill.rows::<BitSpreadGate>(cs.q.spread),
                 "fill plan: spread rows"
             );
+            assert_eq!(
+                walk.rows::<PowMaskGate>(cs.q.pow),
+                fill.rows::<PowMaskGate>(cs.q.pow),
+                "fill plan: pow rows"
+            );
         }
         let build_ms = t_build.elapsed().as_secs_f64() * 1e3;
         // Per-SHAPE prover materials, hoisted above the online loop — BLAKE3
@@ -14509,6 +14617,8 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
         let swap_lc2 = swap_r1cs2.csc_lincheck_circuit();
         let spread_r1cs2 = BitSpreadTable::new(spread_w2).build_block_r1cs(nu2);
         let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
+        let pow_r1cs2 = PowMaskTable.build_block_r1cs(nu2);
+        let pow_lc2 = pow_r1cs2.csc_lincheck_circuit();
         // ONLINE, `1 + steady_reps()` iterations over the ONE shape: tapes
         // (the recording verifies, re-run with results discarded — identical
         // by determinism), the walk (fill plan), witness assembly, prove,
@@ -14607,6 +14717,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
         // shape build or the prove.
         // Recreated per online iteration — the spread closure consumes it.
         let spread_ty2 = BitSpreadTable::new(spread_w2);
+        let pow_ty2 = PowMaskTable;
         let t_asm = std::time::Instant::now();
         // THE COPY-FREE ASSEMBLY, the node's path: the boolean drivers pack
         // straight into the union's slot blocks inside the prove (live rows
@@ -14616,6 +14727,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
         let b3_rows2 = built2.rows::<Blake3Gate>(cs.q.b3).to_vec();
         let swap_rows2 = built2.rows::<SwapGate>(cs.q.swap).to_vec();
         let spread_rows2 = built2.rows::<BitSpreadGate>(cs.q.spread).to_vec();
+        let pow_rows2 = built2.rows::<PowMaskGate>(cs.q.pow).to_vec();
         let mut bslots: Vec<(usize, UnionSlotProverInput)> = vec![
             (
                 shape2.registry_slot(cs.q.b3),
@@ -14638,6 +14750,13 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
                 UnionSlotProverInput::in_place(
                     move |dst| spread_ty2.generate_witness_batch_major_into(&spread_rows2, dst),
                     spread_lc2,
+                ),
+            ),
+            (
+                shape2.registry_slot(cs.q.pow),
+                UnionSlotProverInput::in_place(
+                    move |dst| pow_ty2.generate_witness_batch_major_into(&pow_rows2, dst),
+                    pow_lc2,
                 ),
             ),
         ];
@@ -14664,6 +14783,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
             (shape2.registry_slot(cs.q.b3), b3_lc2),
             (shape2.registry_slot(cs.q.swap), swap_lc2),
             (shape2.registry_slot(cs.q.spread), spread_lc2),
+            (shape2.registry_slot(cs.q.pow), pow_lc2),
         ];
         lco.sort_by_key(|(i, _)| *i);
         let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
@@ -14707,10 +14827,11 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
         fin = Some((built2, oproof, ocommit, acc_pub));
         }
         let (built2, oproof, ocommit, acc_pub) = fin.expect("one online iteration");
-        let (b3_ri, swap_ri, spread_ri) = (
+        let (b3_ri, swap_ri, spread_ri, pow_ri) = (
             shape2.registry_slot(cs.q.b3),
             shape2.registry_slot(cs.q.swap),
             shape2.registry_slot(cs.q.spread),
+            shape2.registry_slot(cs.q.pow),
         );
         FlNode {
             lo: LeafOuter {
@@ -14722,9 +14843,11 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
                 b3_r1cs: b3_r1cs2,
                 swap_r1cs: swap_r1cs2,
                 spread_r1cs: spread_r1cs2,
+                pow_r1cs: pow_r1cs2,
                 b3_slot: b3_ri,
                 swap_slot: swap_ri,
                 spread_slot: spread_ri,
+                pow_slot: pow_ri,
             },
             acc: acc_pub,
             stmt_base,
@@ -16809,6 +16932,7 @@ impl ChildSlots {
                     ty: BitSpreadTable::new(spread_w),
                     nu: nu2,
                 }),
+                pow: sb.slot(PowMaskGate { nu: nu2 }),
             },
             macs,
             zcr: sb.slot(ZcRoundGate::new()),
@@ -17903,6 +18027,9 @@ fn mvp10_circuit_inner_tape() {
     let swap_r1cs2 = SwapTable::build_block_r1cs(nu2);
     let swap_lc2 = swap_r1cs2.csc_lincheck_circuit();
     let spread_ty2 = BitSpreadTable::new(ct.spread_w);
+    let pow_ty2 = PowMaskTable;
+    let pow_r1cs2 = pow_ty2.build_block_r1cs(nu2);
+    let pow_lc2 = pow_r1cs2.csc_lincheck_circuit();
     let spread_r1cs2 = spread_ty2.build_block_r1cs(nu2);
     let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
     let mut el_ord: Vec<(usize, Vec<F128>)> = cs
@@ -17952,12 +18079,23 @@ fn mvp10_circuit_inner_tape() {
                 spread_lc2,
             ),
         ),
+        (
+            shape2.registry_slot(cs.q.pow),
+            UnionSlotProverInput::new(
+                pow_ty2.generate_witness_batch_major(
+                    built2.rows::<PowMaskGate>(cs.q.pow),
+                    nu2,
+                ),
+                pow_lc2,
+            ),
+        ),
     ];
     bslots.sort_by_key(|(i, _)| *i);
     let mut lco: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
         (shape2.registry_slot(cs.q.b3), b3_lc2),
         (shape2.registry_slot(cs.q.swap), swap_lc2),
         (shape2.registry_slot(cs.q.spread), spread_lc2),
+        (shape2.registry_slot(cs.q.pow), pow_lc2),
     ];
     lco.sort_by_key(|(i, _)| *i);
     let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
@@ -18047,6 +18185,7 @@ fn partial_block_leaves_hash_correctly() {
                 ty: BitSpreadTable::new(depth),
                 nu,
             }),
+            pow: sb.slot(PowMaskGate { nu }),
         };
         let mut vals: Vec<F128> = Vec::new();
         let iv_w = pack8(&IV);
@@ -20696,7 +20835,7 @@ fn mvp11_merge_fold_region() {
         emit_recorded_pow_checks(
             &mut sb,
             b3s,
-            cs.q.spread,
+            cs.q.pow,
             iv2,
             &ops,
             &trace,
@@ -21103,6 +21242,9 @@ fn mvp11_merge_fold_region() {
         let spread_ty2 = BitSpreadTable::new(t0.spread_w.max(t1.spread_w));
         let spread_r1cs2 = spread_ty2.build_block_r1cs(nu2);
         let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
+        let pow_ty2 = PowMaskTable;
+        let pow_r1cs2 = pow_ty2.build_block_r1cs(nu2);
+        let pow_lc2 = pow_r1cs2.csc_lincheck_circuit();
         let mut el_ord: Vec<(usize, Vec<F128>)> = cs
             .element_slot_ids()
             .into_iter()
@@ -21153,6 +21295,16 @@ fn mvp11_merge_fold_region() {
                     spread_lc2,
                 ),
             ),
+            (
+                shape2.registry_slot(cs.q.pow),
+                UnionSlotProverInput::new(
+                    pow_ty2.generate_witness_batch_major(
+                        built2.rows::<PowMaskGate>(cs.q.pow),
+                        nu2,
+                    ),
+                    pow_lc2,
+                ),
+            ),
         ];
         bslots.sort_by_key(|(i, _)| *i);
         let mut ch2 = FsChallenger::new(DOMAIN);
@@ -21169,6 +21321,7 @@ fn mvp11_merge_fold_region() {
             (shape2.registry_slot(cs.q.b3), b3_lc2),
             (shape2.registry_slot(cs.q.swap), swap_lc2),
             (shape2.registry_slot(cs.q.spread), spread_lc2),
+            (shape2.registry_slot(cs.q.pow), pow_lc2),
         ];
         lco.sort_by_key(|(i, _)| *i);
         let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
@@ -21266,6 +21419,7 @@ fn mvp11_swap_children_fold_scale() {
         (lo.b3_slot, lo.b3_r1cs.csc_lincheck_circuit()),
         (lo.swap_slot, lo.swap_r1cs.csc_lincheck_circuit()),
         (lo.spread_slot, lo.spread_r1cs.csc_lincheck_circuit()),
+        (lo.pow_slot, lo.pow_r1cs.csc_lincheck_circuit()),
     ];
     lcs_ord.sort_by_key(|(i, _)| *i);
     let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
@@ -21304,6 +21458,7 @@ fn mvp11_swap_children_fold_scale() {
         (lo.b3_slot, (&lo.b3_r1cs.a_0, &lo.b3_r1cs.b_0)),
         (lo.swap_slot, (&lo.swap_r1cs.a_0, &lo.swap_r1cs.b_0)),
         (lo.spread_slot, (&lo.spread_r1cs.a_0, &lo.spread_r1cs.b_0)),
+        (lo.pow_slot, (&lo.pow_r1cs.a_0, &lo.pow_r1cs.b_0)),
     ];
     mats_ord.sort_by_key(|&(i, _)| i);
     let mats: Vec<_> = mats_ord.iter().map(|&(_, m)| m).collect();
@@ -21315,7 +21470,7 @@ fn mvp11_swap_children_fold_scale() {
     let el_mats: Vec<_> = el_types.iter().map(|t| (t.a_0(), t.b_0())).collect();
     let n_bool = registry.num_boolean();
     let n_el = el_mats.len();
-    assert_eq!(n_bool, 3, "the real node's boolean census: b3, swap, spread");
+    assert_eq!(n_bool, 4, "the real node's boolean census: b3, swap, spread, pow");
     assert!(n_el > 5, "the real node carries the element gate census");
 
     // The native fold: prove + record-verify + discharge all three groups.
@@ -21461,11 +21616,9 @@ fn mvp11_swap_children_fold_scale() {
         let macs = sb.slot(MacGate::new());
         let mrs = sb.slot(MergedRoundGate::new());
         let pf_w = 8usize;
-        let spread_w = tower_fold_grinding().round_bits.max(1) as usize;
-        let spreads = sb.slot(BitSpreadGate {
-            ty: BitSpreadTable::new(spread_w),
-            nu: nu2,
-        });
+        // This outer's spread slot serves ONLY the fold tape's PoW mask
+        // checks — the fused one-row-per-check PowMask variant.
+        let spreads = sb.slot(PowMaskGate { nu: nu2 });
         let pfslot = sb.slot(PrefixGate::new(pf_w));
         let leslot = sb.slot(LeafEvalGate::new(8));
 
@@ -21595,7 +21748,7 @@ fn mvp11_swap_children_fold_scale() {
         };
         let b3_r1cs2 = blake3::build_block_r1cs(nu2);
         let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
-        let spread_ty2 = BitSpreadTable::new(spread_w);
+        let spread_ty2 = PowMaskTable;
         let spread_r1cs2 = spread_ty2.build_block_r1cs(nu2);
         let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
         let mut el_ord: Vec<(usize, Vec<F128>)> = [macs, mrs, pfslot, leslot]
@@ -21631,7 +21784,7 @@ fn mvp11_swap_children_fold_scale() {
                 shape2.registry_slot(spreads),
                 UnionSlotProverInput::new(
                     spread_ty2.generate_witness_batch_major(
-                        built2.rows::<BitSpreadGate>(spreads),
+                        built2.rows::<PowMaskGate>(spreads),
                         nu2,
                     ),
                     spread_lc2,
@@ -21748,6 +21901,7 @@ fn record_child_verify(lo: &LeafOuter, domain: &'static [u8]) {
         (lo.b3_slot, lo.b3_r1cs.csc_lincheck_circuit()),
         (lo.swap_slot, lo.swap_r1cs.csc_lincheck_circuit()),
         (lo.spread_slot, lo.spread_r1cs.csc_lincheck_circuit()),
+        (lo.pow_slot, lo.pow_r1cs.csc_lincheck_circuit()),
     ];
     lcs_ord.sort_by_key(|(i, _)| *i);
     let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
@@ -21962,6 +22116,7 @@ fn build_node_outer_app(
         (lo0.b3_slot, lo0.b3_r1cs.csc_lincheck_circuit()),
         (lo0.swap_slot, lo0.swap_r1cs.csc_lincheck_circuit()),
         (lo0.spread_slot, lo0.spread_r1cs.csc_lincheck_circuit()),
+        (lo0.pow_slot, lo0.pow_r1cs.csc_lincheck_circuit()),
     ];
     lcs_ord.sort_by_key(|(i, _)| *i);
     let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
@@ -21970,6 +22125,7 @@ fn build_node_outer_app(
         (lo0.b3_slot, (&lo0.b3_r1cs.a_0, &lo0.b3_r1cs.b_0)),
         (lo0.swap_slot, (&lo0.swap_r1cs.a_0, &lo0.swap_r1cs.b_0)),
         (lo0.spread_slot, (&lo0.spread_r1cs.a_0, &lo0.spread_r1cs.b_0)),
+        (lo0.pow_slot, (&lo0.pow_r1cs.a_0, &lo0.pow_r1cs.b_0)),
     ];
     mats_ord.sort_by_key(|&(i, _)| i);
     let mats: Vec<_> = mats_ord.iter().map(|&(_, m)| m).collect();
@@ -22552,7 +22708,7 @@ fn build_node_outer_app(
         emit_recorded_pow_checks(
             &mut sb,
             cs.q.b3,
-            cs.q.spread,
+            cs.q.pow,
             iv2,
             &ops,
             &trace,
@@ -23283,7 +23439,7 @@ fn build_node_outer_app(
             emit_recorded_pow_checks(
                 &mut sb,
                 cs.q.b3,
-                cs.q.spread,
+                cs.q.pow,
                 iv2,
                 lops,
                 &ltrace,
@@ -23614,6 +23770,11 @@ fn build_node_outer_app(
                 fill.rows::<BitSpreadGate>(cs.q.spread),
                 "fill plan: spread rows"
             );
+            assert_eq!(
+                walk.rows::<PowMaskGate>(cs.q.pow),
+                fill.rows::<PowMaskGate>(cs.q.pow),
+                "fill plan: pow rows"
+            );
         }
         // The node proves and verifies over the circuit path. Union, PCS
         // params and the R1CS tables are per-SHAPE — offline, ahead of the
@@ -23639,6 +23800,8 @@ fn build_node_outer_app(
         let swap_lc2 = swap_r1cs2.csc_lincheck_circuit();
         let spread_r1cs2 = BitSpreadTable::new(spread_w2).build_block_r1cs(nu2);
         let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
+        let pow_r1cs2 = PowMaskTable.build_block_r1cs(nu2);
+        let pow_lc2 = pow_r1cs2.csc_lincheck_circuit();
         let build_ms = build_ms + t_r1cs.elapsed().as_secs_f64() * 1e3;
         // TOWER_STEADY=N (or the bench's STEADY_OVERRIDE) re-runs the ONLINE
         // phases (tapes + trace + asm + prove + verify) N extra times over
@@ -23922,6 +24085,7 @@ fn build_node_outer_app(
         let t_asm = std::time::Instant::now();
         // Recreated per online iteration — the spread closure consumes it.
         let spread_ty2 = BitSpreadTable::new(spread_w2);
+        let pow_ty2 = PowMaskTable;
         // The copy-free assembly path: the boolean drivers pack straight
         // into the union slot blocks inside the prove (live rows only under
         // elide) — no intermediate capacity-sized buffers, no memcpy. The
@@ -23930,6 +24094,7 @@ fn build_node_outer_app(
         let b3_rows2 = built2.rows::<Blake3Gate>(cs.q.b3).to_vec();
         let swap_rows2 = built2.rows::<SwapGate>(cs.q.swap).to_vec();
         let spread_rows2 = built2.rows::<BitSpreadGate>(cs.q.spread).to_vec();
+        let pow_rows2 = built2.rows::<PowMaskGate>(cs.q.pow).to_vec();
         let mut bslots: Vec<(usize, UnionSlotProverInput)> = vec![
             (
                 shape2.registry_slot(cs.q.b3),
@@ -23952,6 +24117,13 @@ fn build_node_outer_app(
                 UnionSlotProverInput::in_place(
                     move |dst| spread_ty2.generate_witness_batch_major_into(&spread_rows2, dst),
                     spread_lc2,
+                ),
+            ),
+            (
+                shape2.registry_slot(cs.q.pow),
+                UnionSlotProverInput::in_place(
+                    move |dst| pow_ty2.generate_witness_batch_major_into(&pow_rows2, dst),
+                    pow_lc2,
                 ),
             ),
         ];
@@ -24021,6 +24193,7 @@ fn build_node_outer_app(
             (shape2.registry_slot(cs.q.b3), b3_lc2),
             (shape2.registry_slot(cs.q.swap), swap_lc2),
             (shape2.registry_slot(cs.q.spread), spread_lc2),
+            (shape2.registry_slot(cs.q.pow), pow_lc2),
         ];
         lco.sort_by_key(|(i, _)| *i);
         let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
@@ -24136,10 +24309,11 @@ fn build_node_outer_app(
             verify_ms,
         );
         };
-        let (b3_slot2, swap_slot2, spread_slot2) = (
+        let (b3_slot2, swap_slot2, spread_slot2, pow_slot2) = (
             shape2.registry_slot(cs.q.b3),
             shape2.registry_slot(cs.q.swap),
             shape2.registry_slot(cs.q.spread),
+            shape2.registry_slot(cs.q.pow),
         );
         NodeOut {
             lo: LeafOuter {
@@ -24151,9 +24325,11 @@ fn build_node_outer_app(
                 b3_r1cs: b3_r1cs2,
                 swap_r1cs: swap_r1cs2,
                 spread_r1cs: spread_r1cs2,
+                pow_r1cs: pow_r1cs2,
                 b3_slot: b3_slot2,
                 swap_slot: swap_slot2,
                 spread_slot: spread_slot2,
+                pow_slot: pow_slot2,
             },
             acc: acc_v,
             online: Online {
@@ -24295,6 +24471,7 @@ fn child_tape_ops(lo: &LeafOuter) -> Vec<flock_core::transcript_record::Transcri
         (lo.b3_slot, lo.b3_r1cs.csc_lincheck_circuit()),
         (lo.swap_slot, lo.swap_r1cs.csc_lincheck_circuit()),
         (lo.spread_slot, lo.spread_r1cs.csc_lincheck_circuit()),
+        (lo.pow_slot, lo.pow_r1cs.csc_lincheck_circuit()),
     ];
     lcs_ord.sort_by_key(|(i, _)| *i);
     let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
@@ -24538,6 +24715,7 @@ fn internal_node_three_ary() {
         (ch.b3_slot, (&ch.b3_r1cs.a_0, &ch.b3_r1cs.b_0)),
         (ch.swap_slot, (&ch.swap_r1cs.a_0, &ch.swap_r1cs.b_0)),
         (ch.spread_slot, (&ch.spread_r1cs.a_0, &ch.spread_r1cs.b_0)),
+        (ch.pow_slot, (&ch.pow_r1cs.a_0, &ch.pow_r1cs.b_0)),
     ];
     mats_ord.sort_by_key(|&(i, _)| i);
     let mats: Vec<_> = mats_ord.iter().map(|&(_, m)| m).collect();
@@ -25173,6 +25351,7 @@ fn chain_spine_converges() {
             (lo.b3_slot, lo.b3_r1cs.csc_lincheck_circuit()),
             (lo.swap_slot, lo.swap_r1cs.csc_lincheck_circuit()),
             (lo.spread_slot, lo.spread_r1cs.csc_lincheck_circuit()),
+            (lo.pow_slot, lo.pow_r1cs.csc_lincheck_circuit()),
         ];
         lcs_ord.sort_by_key(|(i, _)| *i);
         let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
@@ -25356,6 +25535,10 @@ fn chain_tower_e2e_with_lane() {
             fl0.lo.spread_slot,
             (&fl0.lo.spread_r1cs.a_0, &fl0.lo.spread_r1cs.b_0),
         ),
+        (
+            fl0.lo.pow_slot,
+            (&fl0.lo.pow_r1cs.a_0, &fl0.lo.pow_r1cs.b_0),
+        ),
     ];
     mats_ord.sort_by_key(|&(i, _)| i);
     let fl_mats: Vec<_> = mats_ord.iter().map(|&(_, m)| m).collect();
@@ -25389,6 +25572,7 @@ fn chain_tower_e2e_with_lane() {
             (fl0.lo.b3_slot, fl0.lo.b3_r1cs.csc_lincheck_circuit()),
             (fl0.lo.swap_slot, fl0.lo.swap_r1cs.csc_lincheck_circuit()),
             (fl0.lo.spread_slot, fl0.lo.spread_r1cs.csc_lincheck_circuit()),
+            (fl0.lo.pow_slot, fl0.lo.pow_r1cs.csc_lincheck_circuit()),
         ];
         lcs_ord.sort_by_key(|(i, _)| *i);
         let lcs_f: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
@@ -25463,6 +25647,7 @@ fn chain_tower_e2e_with_lane() {
             (node.b3_slot, node.b3_r1cs.csc_lincheck_circuit()),
             (node.swap_slot, node.swap_r1cs.csc_lincheck_circuit()),
             (node.spread_slot, node.spread_r1cs.csc_lincheck_circuit()),
+            (node.pow_slot, node.pow_r1cs.csc_lincheck_circuit()),
         ];
         lcs_ord.sort_by_key(|(i, _)| *i);
         let lcs_n: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
@@ -25699,6 +25884,10 @@ fn chain_tower_m32_headline() {
         (
             fl0.lo.spread_slot,
             (&fl0.lo.spread_r1cs.a_0, &fl0.lo.spread_r1cs.b_0),
+        ),
+        (
+            fl0.lo.pow_slot,
+            (&fl0.lo.pow_r1cs.a_0, &fl0.lo.pow_r1cs.b_0),
         ),
     ];
     mats_ord.sort_by_key(|&(i, _)| i);
@@ -25988,6 +26177,7 @@ fn recording_overhead_probe() {
         (n0.b3_slot, n0.b3_r1cs.csc_lincheck_circuit()),
         (n0.swap_slot, n0.swap_r1cs.csc_lincheck_circuit()),
         (n0.spread_slot, n0.spread_r1cs.csc_lincheck_circuit()),
+        (n0.pow_slot, n0.pow_r1cs.csc_lincheck_circuit()),
     ];
     lcs_ord.sort_by_key(|(i, _)| *i);
     let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
@@ -26167,6 +26357,7 @@ fn mvp12_recursion_tower() {
             (l0.b3_slot, (&l0.b3_r1cs.a_0, &l0.b3_r1cs.b_0)),
             (l0.swap_slot, (&l0.swap_r1cs.a_0, &l0.swap_r1cs.b_0)),
             (l0.spread_slot, (&l0.spread_r1cs.a_0, &l0.spread_r1cs.b_0)),
+            (l0.pow_slot, (&l0.pow_r1cs.a_0, &l0.pow_r1cs.b_0)),
         ];
         v.sort_by_key(|&(i, _)| i);
         v.into_iter().map(|(_, m)| m).collect::<Vec<_>>()
@@ -26197,6 +26388,7 @@ fn mvp12_recursion_tower() {
             (n0.b3_slot, (&n0.b3_r1cs.a_0, &n0.b3_r1cs.b_0)),
             (n0.swap_slot, (&n0.swap_r1cs.a_0, &n0.swap_r1cs.b_0)),
             (n0.spread_slot, (&n0.spread_r1cs.a_0, &n0.spread_r1cs.b_0)),
+            (n0.pow_slot, (&n0.pow_r1cs.a_0, &n0.pow_r1cs.b_0)),
         ];
         v.sort_by_key(|&(i, _)| i);
         v.into_iter().map(|(_, m)| m).collect::<Vec<_>>()
@@ -26337,6 +26529,7 @@ fn envelope_registry_diff() {
             (lo.b3_slot, (&lo.b3_r1cs.a_0, &lo.b3_r1cs.b_0)),
             (lo.swap_slot, (&lo.swap_r1cs.a_0, &lo.swap_r1cs.b_0)),
             (lo.spread_slot, (&lo.spread_r1cs.a_0, &lo.spread_r1cs.b_0)),
+            (lo.pow_slot, (&lo.pow_r1cs.a_0, &lo.pow_r1cs.b_0)),
         ];
         mats_ord.sort_by_key(|&(i, _)| i);
         let mats: Vec<_> = mats_ord.iter().map(|&(_, m)| m).collect();
@@ -26344,6 +26537,7 @@ fn envelope_registry_diff() {
             (lo.b3_slot, lo.b3_r1cs.csc_lincheck_circuit()),
             (lo.swap_slot, lo.swap_r1cs.csc_lincheck_circuit()),
             (lo.spread_slot, lo.spread_r1cs.csc_lincheck_circuit()),
+            (lo.pow_slot, lo.pow_r1cs.csc_lincheck_circuit()),
         ];
         lcs_ord.sort_by_key(|(i, _)| *i);
         let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
