@@ -184,9 +184,13 @@ fn main() {
             n_runs,
             "none",
             mk_ch,
-            |ch| product_gkr::prove_batched(black_box(&f), black_box(&g), black_box(&sigma), ch).0,
+            |ch| {
+                // Dense circuit, no padding: the live mask is `None`.
+                product_gkr::prove_batched(black_box(&f), black_box(&g), black_box(&sigma), None, ch)
+                    .0
+            },
             |p, ch| {
-                product_gkr::verify_batched(mu, p, ch).expect("prod-GKR-batched verify");
+                product_gkr::verify_batched(mu, p, None, ch).expect("prod-GKR-batched verify");
             },
             |p| bincode::serialize(p).expect("serialize").len(),
         );
