@@ -76,6 +76,9 @@ fn tower_profile() -> LigeritoProfile {
     match std::env::var("TOWER_PROFILE").as_deref() {
         Ok("slim") => LigeritoProfile::Slim,
         Ok("secure") => LigeritoProfile::Secure,
+        // The 100-bit recursion variant: Fast's Johnson analysis and
+        // transcript shape at the pre-list-decoding query schedule.
+        Ok("fast100") => LigeritoProfile::Fast100,
         _ => LigeritoProfile::Fast,
     }
 }
@@ -85,7 +88,7 @@ fn tower_fold_grinding() -> flock_core::matrix_fold::FoldGrinding {
         LigeritoProfile::Secure => {
             flock_core::matrix_fold::FoldGrinding::per_challenge_128()
         }
-        LigeritoProfile::Fast | LigeritoProfile::Slim => {
+        LigeritoProfile::Fast | LigeritoProfile::Fast100 | LigeritoProfile::Slim => {
             flock_core::matrix_fold::FoldGrinding::disabled()
         }
     }
