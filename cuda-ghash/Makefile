@@ -329,7 +329,8 @@ TEST_BINS = test_f128 test_commit_ntt test_sumcheck_ab test_lincheck \
 prove_ffi.o: prove_ffi.cu ntt_f128.cuh merkle.cuh merkle_open.hpp induce_sumcheck.cuh \
              ntt_transpose.cuh introduce_glue.cuh sumcheck_ab.cuh lincheck.cuh \
              blake3_witness.cuh zerocheck_round1.cuh zerocheck_round1_cpustyle.cuh \
-             zerocheck_round2.cuh zerocheck_tail.cuh phi8_table.cuh challenger.hpp f128.cuh
+             zerocheck_round2.cuh zerocheck_tail.cuh phi8_table.cuh challenger.hpp \
+             pow_grind.cuh f128.cuh
 	$(NVCC) $(NVCCFLAGS) -Xcompiler -fPIC -c prove_ffi.cu -o $@
 
 .PHONY: build-tests run-tests

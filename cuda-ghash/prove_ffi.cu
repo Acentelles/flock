@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <vector>
 #include "ntt_f128.cuh"
 #include "merkle.cuh"
@@ -34,6 +35,7 @@
 #include "phi8_table.cuh"
 #include "challenger.hpp"
 #include "zc_challenger_device.cuh"
+#include "pow_grind.cuh"
 
 #define CK(x) do { cudaError_t e=(x); if(e){ \
     printf("FFI CUDA error %s at %s:%d\n", cudaGetErrorString(e), __FILE__, __LINE__); \
@@ -174,29 +176,61 @@ __global__ void gather_codeword_rows(const F128* __restrict__ codeword,
     rows[i] = codeword[positions[row] * row_len + col];
 }
 
-__global__ void ring_switch_fold_rows(const F128* __restrict__ witness,
-                                      const F128* __restrict__ suffix, long long len,
-                                      F128* __restrict__ shat) {
-    int bit = blockIdx.x;
-    F128 acc{0, 0};
-    for (long long i = threadIdx.x; i < len; i += blockDim.x) {
-        u64 word = bit < 64 ? witness[i].lo : witness[i].hi;
-        if ((word >> (bit & 63)) & 1) {
-            acc.lo ^= suffix[i].lo;
-            acc.hi ^= suffix[i].hi;
+__global__ void ring_switch_fold_rows_grouped(const F128* __restrict__ witness,
+                                              const F128* __restrict__ suffix, long long len,
+                                              int chunks, F128* __restrict__ partials) {
+    int bit_base = blockIdx.y * 8;
+    F128 acc[8]{};
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         i < len; i += (long long)chunks * blockDim.x) {
+        F128 row = witness[i];
+        u64 word = bit_base < 64 ? row.lo : row.hi;
+        word >>= bit_base & 63;
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            if ((word >> j) & 1) {
+                acc[j].lo ^= suffix[i].lo;
+                acc[j].hi ^= suffix[i].hi;
+            }
         }
     }
     __shared__ F128 partial[256];
-    partial[threadIdx.x] = acc;
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        partial[threadIdx.x] = acc[j];
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                partial[threadIdx.x].lo ^= partial[threadIdx.x + stride].lo;
+                partial[threadIdx.x].hi ^= partial[threadIdx.x + stride].hi;
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0)
+            partials[((long long)(bit_base + j) * chunks) + blockIdx.x] = partial[0];
+        __syncthreads();
+    }
+}
+
+__global__ void ring_switch_fold_rows_reduce(const F128* __restrict__ partials,
+                                             int chunks, F128* __restrict__ shat) {
+    int bit = blockIdx.x;
+    F128 acc{0, 0};
+    for (int i = threadIdx.x; i < chunks; i += blockDim.x) {
+        acc.lo ^= partials[(long long)bit * chunks + i].lo;
+        acc.hi ^= partials[(long long)bit * chunks + i].hi;
+    }
+    __shared__ F128 shared[256];
+    shared[threadIdx.x] = acc;
     __syncthreads();
     for (int stride = blockDim.x / 2; stride; stride >>= 1) {
         if (threadIdx.x < stride) {
-            partial[threadIdx.x].lo ^= partial[threadIdx.x + stride].lo;
-            partial[threadIdx.x].hi ^= partial[threadIdx.x + stride].hi;
+            shared[threadIdx.x].lo ^= shared[threadIdx.x + stride].lo;
+            shared[threadIdx.x].hi ^= shared[threadIdx.x + stride].hi;
         }
         __syncthreads();
     }
-    if (threadIdx.x == 0) shat[bit] = partial[0];
+    if (threadIdx.x == 0) shat[bit] = shared[0];
 }
 
 __global__ void ring_switch_combine_basis(const F128* __restrict__ suffix_ab,
@@ -292,6 +326,8 @@ void flock_cuda_free(uint8_t* p) { free(p); }
 
 // Returns 0 on success; out/out_len receive a malloc'd flat proof stream.
 int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t* out_len) {
+    static std::mutex prover_mutex;
+    std::lock_guard<std::mutex> prover_lock(prover_mutex);
     const int m = P->m, k_log = P->k_log, k_skip = 6;
     const int log_n = m - 7;                    // packed-witness log length
     const long long len = 1LL << log_n;         // packed F128 elements
@@ -300,7 +336,6 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
     const int n_blocks = (int)n_total;
     if (n_blocks_log < 3) { printf("FFI: m too small\n"); return 101; }
     CK(configure_memory_pool());
-
     // ================= witness (real BLAKE3 compressions, deterministic) ====
     F128 *df, *d_a, *d_b; uint8_t* d_zlin;
     CK(ffi_malloc(&df, len * sizeof(F128)));
@@ -369,7 +404,20 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
     vector<F128> zc_r(m), mlv_rhos;
     {
         const long long n_out = 1LL << (m - 6);
-        zc_round1_upload_tables(P->zc_mcol, P->zc_f8mul, PHI_8_TABLE);
+        static std::once_flag zerocheck_setup_once;
+        static cudaError_t zerocheck_setup_error = cudaSuccess;
+        static vector<uint8_t> setup_zc_mcol, setup_zc_f8mul;
+        std::call_once(zerocheck_setup_once, [&] {
+            setup_zc_mcol.assign(P->zc_mcol, P->zc_mcol + 64 * 64);
+            setup_zc_f8mul.assign(P->zc_f8mul, P->zc_f8mul + 256 * 256);
+            zerocheck_setup_error = zc_round1_upload_tables(P->zc_mcol, P->zc_f8mul, PHI_8_TABLE);
+        });
+        CK(zerocheck_setup_error);
+        if (memcmp(P->zc_mcol, setup_zc_mcol.data(), setup_zc_mcol.size()) != 0 ||
+            memcmp(P->zc_f8mul, setup_zc_f8mul.data(), setup_zc_f8mul.size()) != 0) {
+            printf("FFI: zerocheck tables changed after setup\n");
+            return 105;
+        }
         F128 *d_eq, *d_r1ab, *d_r1c, *d_ft, *d_am, *d_bm, *d_amn, *d_bmn, *d_p1, *d_pinf, *d_m1d, *d_mid;
         CK(ffi_malloc(&d_eq, (1LL << (m - 13)) * sizeof(F128)));
         CK(ffi_malloc(&d_r1ab, 64 * sizeof(F128))); CK(ffi_malloc(&d_r1c, 64 * sizeof(F128)));
@@ -557,25 +605,58 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
         F128 beta{0, 0}; bool has_pin = P->const_pin_col >= 0;
         if (has_pin) beta = frch(ch.sample_f128());
 
+        static std::once_flag matrix_setup_once;
+        static cudaError_t matrix_setup_error = cudaSuccess;
+        static uint32_t *d_acp = nullptr, *d_ar = nullptr, *d_bcp = nullptr, *d_br = nullptr;
+        static uint32_t setup_a_nnz = 0, setup_b_nnz = 0;
+        static int setup_k_log = 0, setup_useful_bits = 0, setup_const_pin = -1;
+        static vector<uint32_t> setup_a_col_ptr, setup_a_rows, setup_b_col_ptr, setup_b_rows;
+        std::call_once(matrix_setup_once, [&] {
+            setup_a_nnz = P->a_nnz; setup_b_nnz = P->b_nnz;
+            setup_k_log = P->k_log; setup_useful_bits = P->useful_bits;
+            setup_const_pin = P->const_pin_col;
+            setup_a_col_ptr.assign(P->a_col_ptr, P->a_col_ptr + K + 1);
+            if (P->a_nnz) setup_a_rows.assign(P->a_rows, P->a_rows + P->a_nnz);
+            setup_b_col_ptr.assign(P->b_col_ptr, P->b_col_ptr + K + 1);
+            if (P->b_nnz) setup_b_rows.assign(P->b_rows, P->b_rows + P->b_nnz);
+            matrix_setup_error = cudaMalloc(&d_acp, (K + 1) * sizeof(uint32_t));
+            if (matrix_setup_error == cudaSuccess)
+                matrix_setup_error = cudaMalloc(&d_ar, (P->a_nnz ? P->a_nnz : 1) * sizeof(uint32_t));
+            if (matrix_setup_error == cudaSuccess)
+                matrix_setup_error = cudaMalloc(&d_bcp, (K + 1) * sizeof(uint32_t));
+            if (matrix_setup_error == cudaSuccess)
+                matrix_setup_error = cudaMalloc(&d_br, (P->b_nnz ? P->b_nnz : 1) * sizeof(uint32_t));
+            if (matrix_setup_error == cudaSuccess)
+                matrix_setup_error = cudaMemcpy(d_acp, P->a_col_ptr, (K + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice);
+            if (matrix_setup_error == cudaSuccess && P->a_nnz)
+                matrix_setup_error = cudaMemcpy(d_ar, P->a_rows, P->a_nnz * sizeof(uint32_t), cudaMemcpyHostToDevice);
+            if (matrix_setup_error == cudaSuccess)
+                matrix_setup_error = cudaMemcpy(d_bcp, P->b_col_ptr, (K + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice);
+            if (matrix_setup_error == cudaSuccess && P->b_nnz)
+                matrix_setup_error = cudaMemcpy(d_br, P->b_rows, P->b_nnz * sizeof(uint32_t), cudaMemcpyHostToDevice);
+        });
+        CK(matrix_setup_error);
+        if (P->a_nnz != setup_a_nnz || P->b_nnz != setup_b_nnz ||
+            P->k_log != setup_k_log || P->useful_bits != setup_useful_bits ||
+            P->const_pin_col != setup_const_pin ||
+            memcmp(P->a_col_ptr, setup_a_col_ptr.data(), (K + 1) * sizeof(uint32_t)) != 0 ||
+            (P->a_nnz && memcmp(P->a_rows, setup_a_rows.data(), P->a_nnz * sizeof(uint32_t)) != 0) ||
+            memcmp(P->b_col_ptr, setup_b_col_ptr.data(), (K + 1) * sizeof(uint32_t)) != 0 ||
+            (P->b_nnz && memcmp(P->b_rows, setup_b_rows.data(), P->b_nnz * sizeof(uint32_t)) != 0)) {
+            printf("FFI: BLAKE3 lincheck matrix changed after setup\n");
+            return 104;
+        }
+
         F128 *d_eq_inner, *d_comb, *d_zvec, *d_eq_outer, *d_nC, *d_nZ, *d_p1, *d_pinf, *d_e1, *d_einf;
-        uint32_t *d_acp, *d_ar, *d_bcp, *d_br;
         CK(ffi_malloc(&d_eq_inner, K * sizeof(F128))); CK(ffi_malloc(&d_comb, K * sizeof(F128)));
         CK(ffi_malloc(&d_zvec, K * sizeof(F128))); CK(ffi_malloc(&d_nC, K * sizeof(F128)));
         CK(ffi_malloc(&d_nZ, K * sizeof(F128)));
         CK(ffi_malloc(&d_eq_outer, n_outer * sizeof(F128)));
-        CK(ffi_malloc(&d_acp, (K + 1) * sizeof(uint32_t)));
-        CK(ffi_malloc(&d_ar, (P->a_nnz ? P->a_nnz : 1) * sizeof(uint32_t)));
-        CK(ffi_malloc(&d_bcp, (K + 1) * sizeof(uint32_t)));
-        CK(ffi_malloc(&d_br, (P->b_nnz ? P->b_nnz : 1) * sizeof(uint32_t)));
         CK(ffi_malloc(&d_p1, LC_MAX_BLOCKS * sizeof(F128))); CK(ffi_malloc(&d_pinf, LC_MAX_BLOCKS * sizeof(F128)));
         CK(ffi_malloc(&d_e1, sizeof(F128))); CK(ffi_malloc(&d_einf, sizeof(F128)));
 
-        vector<F128> eq_inner = build_quirky_eq_table_host(zc_z, xab_inner, k_skip);
-        CK(cudaMemcpy(d_eq_inner, eq_inner.data(), K * sizeof(F128), cudaMemcpyHostToDevice));
-        CK(cudaMemcpy(d_acp, P->a_col_ptr, (K + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice));
-        if (P->a_nnz) CK(cudaMemcpy(d_ar, P->a_rows, P->a_nnz * sizeof(uint32_t), cudaMemcpyHostToDevice));
-        CK(cudaMemcpy(d_bcp, P->b_col_ptr, (K + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice));
-        if (P->b_nnz) CK(cudaMemcpy(d_br, P->b_rows, P->b_nnz * sizeof(uint32_t), cudaMemcpyHostToDevice));
+        build_quirky_eq_device(d_eq_inner, zc_z, xab_inner, k_skip);
+        CK(cudaGetLastError());
         launch_lincheck_csc_fold(d_eq_inner, d_acp, d_ar, d_bcp, d_br, alpha, K, d_comb);
         CK(cudaGetLastError());
         if (has_pin) {   // comb_vec[pin] += beta
@@ -584,8 +665,8 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
             CK(cudaMemcpy(d_comb + P->const_pin_col, &v, sizeof(F128), cudaMemcpyHostToDevice));
         }
 
-        { vector<F128> eq_outer = build_eq_host(xab_outer.data(), n_log);
-          CK(cudaMemcpy(d_eq_outer, eq_outer.data(), n_outer * sizeof(F128), cudaMemcpyHostToDevice)); }
+        build_eq_device(d_eq_outer, xab_outer.data(), n_log);
+        CK(cudaGetLastError());
         launch_lincheck_partial_fold(d_zlin, d_eq_outer, n_stripes, K, P->useful_bits, d_zvec);
         CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
         CK(cudaMemcpy(z_vec.data(), d_zvec, K * sizeof(F128), cudaMemcpyDeviceToHost));
@@ -616,7 +697,7 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
           for (int i = 0; i < 64; i++) lc_w = ADD(lc_w, MUL(lam[i], lc_zpart[i])); }
 
         ffi_free(d_eq_inner); ffi_free(d_comb); ffi_free(d_zvec); ffi_free(d_nC); ffi_free(d_nZ);
-        ffi_free(d_eq_outer); ffi_free(d_acp); ffi_free(d_ar); ffi_free(d_bcp); ffi_free(d_br);
+        ffi_free(d_eq_outer);
         ffi_free(d_p1); ffi_free(d_pinf); ffi_free(d_e1); ffi_free(d_einf);
     }
     ffi_free(d_zlin);
@@ -641,17 +722,22 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
       for (size_t k = 0; k < eq_tail.size(); k++)
           for (int b = 0; b < 128; b++)
               shat_ab[b] = ADD(shat_ab[b], MUL(eq_tail[k], z_vec[k * 128 + b])); }
-    F128 *d_suffix_ab, *d_suffix_c, *d_shat_c;
+    F128 *d_suffix_ab, *d_suffix_c, *d_shat_c, *d_shat_partials;
+    const int ring_switch_chunks = 64;
     CK(ffi_malloc(&d_suffix_ab, len * sizeof(F128)));
     CK(ffi_malloc(&d_suffix_c, len * sizeof(F128)));
     CK(ffi_malloc(&d_shat_c, 128 * sizeof(F128)));
+    CK(ffi_malloc(&d_shat_partials, 128 * ring_switch_chunks * sizeof(F128)));
     build_eq_device(d_suffix_ab, xfull_ab.data() + 1, (int)xfull_ab.size() - 1);
     build_eq_device(d_suffix_c, xfull_c.data() + 1, (int)xfull_c.size() - 1);
-    ring_switch_fold_rows<<<128, 256>>>(df, d_suffix_c, len, d_shat_c);
+    ring_switch_fold_rows_grouped<<<dim3(ring_switch_chunks, 16), 256>>>(
+        df, d_suffix_c, len, ring_switch_chunks, d_shat_partials);
+    ring_switch_fold_rows_reduce<<<128, 256>>>(d_shat_partials, ring_switch_chunks, d_shat_c);
     CK(cudaGetLastError());
     vector<F128> shat_c(128);
     CK(cudaMemcpy(shat_c.data(), d_shat_c, 128 * sizeof(F128), cudaMemcpyDeviceToHost));
     CK(ffi_free(d_shat_c));
+    CK(ffi_free(d_shat_partials));
 
     ch.observe_label((const uint8_t*)"flock-pcs-open-batch-v0", 23);
     struct RsWork { vector<F128> shat, eq_rd; F128 claim; };
@@ -731,7 +817,11 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
         vector<F128> r_lane;
         for (int j = 0; j < P->initial_k; j++) {
             int bits = P->fold_grinding_bits[0] - j; if (bits < 0) bits = 0;
-            if (bits > 0) fold_grind_nonces.push_back(ch.grind_pow((uint32_t)bits));
+            if (bits > 0) {
+                uint64_t nonce;
+                CK(grind_pow_device(ch, (uint32_t)bits, nonce));
+                fold_grind_nonces.push_back(nonce);
+            }
             F128 r = frch(ch.sample_f128());
             long long half = slen / 2;
             launch_sumcheck_fold_msg(cf, ccb, nf, ncb, half, r, p0, p2, du0, du2);
@@ -766,7 +856,11 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
                 vector<F128> level_rs;
                 for (int j = 0; j < k_rec; j++) {
                     int bits = P->fold_grinding_bits[lvl] - j; if (bits < 0) bits = 0;
-                    if (bits > 0) fold_grind_nonces.push_back(ch.grind_pow((uint32_t)bits));
+                    if (bits > 0) {
+                        uint64_t nonce;
+                        CK(grind_pow_device(ch, (uint32_t)bits, nonce));
+                        fold_grind_nonces.push_back(nonce);
+                    }
                     F128 r = frch(ch.sample_f128());
                     long long half = slen / 2;
                     launch_sumcheck_fold_msg(cf, ccb, nf, ncb, half, r, p0, p2, du0, du2);
@@ -787,7 +881,9 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
                 yr_out.resize(slen);
                 CK(cudaMemcpy(yr_out.data(), cf, (size_t)slen * sizeof(F128), cudaMemcpyDeviceToHost));
                 for (long long i = 0; i < slen; i++) ch.observe_f128(toch(yr_out[i]));
-                grind_nonces.push_back(ch.grind_pow((uint32_t)P->grinding_bits[lvl]));
+                uint64_t nonce;
+                CK(grind_pow_device(ch, (uint32_t)P->grinding_bits[lvl], nonce));
+                grind_nonces.push_back(nonce);
                 std::vector<size_t> q = ch.sample_distinct_queries((size_t)prev_bl, P->queries[lvl]);
                 LevelOpen lo; lo.n_rows = q.size(); lo.row_len = prev_ni;
                 if (copy_codeword_rows(d_prev_cw, q, prev_ni, lo.rows_flat) != 0) return 100;
@@ -851,7 +947,9 @@ int flock_cuda_prove_blake3(const FlockCudaProveParams* P, uint8_t** out, size_t
                 CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
             }
 
-            grind_nonces.push_back(ch.grind_pow((uint32_t)P->grinding_bits[lvl]));
+            uint64_t nonce;
+            CK(grind_pow_device(ch, (uint32_t)P->grinding_bits[lvl], nonce));
+            grind_nonces.push_back(nonce);
             std::vector<size_t> q = ch.sample_distinct_queries((size_t)prev_bl, P->queries[lvl]);
             int al = 0; { int mq = P->queries[lvl] - 1; while (mq) { al++; mq >>= 1; } }
             if (P->queries[lvl] <= 1) al = 0;

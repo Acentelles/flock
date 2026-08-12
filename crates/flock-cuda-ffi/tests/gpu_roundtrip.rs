@@ -23,6 +23,7 @@ use flock_prover::verifier;
 use flock_prover::zerocheck::{K_SKIP, ZerocheckProof};
 
 const DOMAIN: &[u8] = b"flock-lig-r1cs-v0";
+static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[repr(C)]
 struct ProveParams {
@@ -334,6 +335,8 @@ fn gpu_prove(n_blocks_log: usize, dump_z: Option<&str>) -> GpuArtifacts {
 /// Full roundtrip: GPU prove, Rust verify; with `tamper`, also check that two
 /// corrupted variants are rejected.
 fn roundtrip(n_blocks_log: usize, tamper: bool) {
+    let _test_guard = GPU_TEST_LOCK.lock().expect("GPU test lock poisoned");
+    let warmup_secs = gpu_prove(n_blocks_log, None).prove_secs;
     let GpuArtifacts {
         r1cs,
         pcs_params,
@@ -356,7 +359,8 @@ fn roundtrip(n_blocks_log: usize, tamper: bool) {
     )
     .unwrap_or_else(|e| panic!("Rust verifier rejected the GPU proof at m={m}: {e:?}"));
     println!(
-        "GPU proof verified: m={m}, prove(+glue) {:.2}s, verify {:.2}s, ab claim {:016x}:{:016x}",
+        "GPU proof verified: m={m}, warmup {:.2}s, steady prove(+glue) {:.2}s, verify {:.2}s, ab claim {:016x}:{:016x}",
+        warmup_secs,
         prove_secs,
         t1.elapsed().as_secs_f64(),
         claim.ab.value.hi,

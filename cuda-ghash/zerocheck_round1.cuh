@@ -51,8 +51,8 @@ static F128* g_zc_phi = nullptr;       // φ8: F8->F128, 256 entries (4 KB)
 static u64* g_zc_t0 = nullptr;         // unified byte LUT (Cauchy collapse), 256*8 u64 (16 KB)
 static int g_zc_t0_ok = 0;             // 1 iff M has the Cauchy structure (single-table valid)
 
-inline void zc_round1_upload_tables(const uint8_t* mcol, const uint8_t* f8mul,
-                                    const F128* phi8_256) {
+inline cudaError_t zc_round1_upload_tables(const uint8_t* mcol, const uint8_t* f8mul,
+                                           const F128* phi8_256) {
     u64 mpacked[64 * 8];
     uint8_t mt[64 * 64];
     for (int s = 0; s < 64; s++)
@@ -64,14 +64,24 @@ inline void zc_round1_upload_tables(const uint8_t* mcol, const uint8_t* f8mul,
     for (int s = 0; s < 64; s++)
         for (int i = 0; i < 64; i++)
             mt[s * 64 + i] = (uint8_t)(mpacked[s * 8 + (i >> 3)] >> (8 * (i & 7)));
-    cudaMemcpyToSymbol(ZC_M, mpacked, sizeof(mpacked));
+    cudaError_t err = cudaMemcpyToSymbol(ZC_M, mpacked, sizeof(mpacked));
+    if (err != cudaSuccess) return err;
     F128 basis[8];
     for (int k = 0; k < 8; k++) basis[k] = phi8_256[1 << k];
-    cudaMemcpyToSymbol(ZC_BASIS, basis, sizeof(basis));
-    if (!g_zc_f8mul) cudaMalloc(&g_zc_f8mul, (size_t)256 * 256);
-    cudaMemcpy(g_zc_f8mul, f8mul, (size_t)256 * 256, cudaMemcpyHostToDevice);
-    if (!g_zc_mt) cudaMalloc(&g_zc_mt, sizeof(mt));
-    cudaMemcpy(g_zc_mt, mt, sizeof(mt), cudaMemcpyHostToDevice);
+    err = cudaMemcpyToSymbol(ZC_BASIS, basis, sizeof(basis));
+    if (err != cudaSuccess) return err;
+    if (!g_zc_f8mul) {
+        err = cudaMalloc(&g_zc_f8mul, (size_t)256 * 256);
+        if (err != cudaSuccess) return err;
+    }
+    err = cudaMemcpy(g_zc_f8mul, f8mul, (size_t)256 * 256, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return err;
+    if (!g_zc_mt) {
+        err = cudaMalloc(&g_zc_mt, sizeof(mt));
+        if (err != cudaSuccess) return err;
+    }
+    err = cudaMemcpy(g_zc_mt, mt, sizeof(mt), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return err;
     // Nibble (4-Russians) table: NIB[np][v][w] = XOR of M columns (4*np .. 4*np+3)
     // selected by nibble bits v, word w. extend word w = XOR_np NIB[np][nibble_np][w].
     u64 nib[16 * 16 * 8];
@@ -83,10 +93,18 @@ inline void zc_round1_upload_tables(const uint8_t* mcol, const uint8_t* f8mul,
                     if ((v >> bit) & 1) acc ^= mpacked[(np * 4 + bit) * 8 + w];
                 nib[(np * 16 + v) * 8 + w] = acc;
             }
-    if (!g_zc_nib) cudaMalloc(&g_zc_nib, sizeof(nib));
-    cudaMemcpy(g_zc_nib, nib, sizeof(nib), cudaMemcpyHostToDevice);
-    if (!g_zc_phi) cudaMalloc(&g_zc_phi, 256 * sizeof(F128));
-    cudaMemcpy(g_zc_phi, phi8_256, 256 * sizeof(F128), cudaMemcpyHostToDevice);
+    if (!g_zc_nib) {
+        err = cudaMalloc(&g_zc_nib, sizeof(nib));
+        if (err != cudaSuccess) return err;
+    }
+    err = cudaMemcpy(g_zc_nib, nib, sizeof(nib), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return err;
+    if (!g_zc_phi) {
+        err = cudaMalloc(&g_zc_phi, 256 * sizeof(F128));
+        if (err != cudaSuccess) return err;
+    }
+    err = cudaMemcpy(g_zc_phi, phi8_256, 256 * sizeof(F128), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return err;
 
     // Unified single-table collapse (Cauchy structure, docs/urm_optimizations.tex
     // §Single-table collapse): the additive-NTT M satisfies M[i', 8b+t] = M[i'^8b, t],
@@ -109,8 +127,11 @@ inline void zc_round1_upload_tables(const uint8_t* mcol, const uint8_t* f8mul,
                 if ((v >> t) & 1) acc ^= mpacked[t * 8 + w];
             t0[v * 8 + w] = acc;
         }
-    if (!g_zc_t0) cudaMalloc(&g_zc_t0, sizeof(t0));
-    cudaMemcpy(g_zc_t0, t0, sizeof(t0), cudaMemcpyHostToDevice);
+    if (!g_zc_t0) {
+        err = cudaMalloc(&g_zc_t0, sizeof(t0));
+        if (err != cudaSuccess) return err;
+    }
+    return cudaMemcpy(g_zc_t0, t0, sizeof(t0), cudaMemcpyHostToDevice);
 }
 
 __device__ __forceinline__ void zc_extend(const uint8_t* row8, u64 out[8]) {
