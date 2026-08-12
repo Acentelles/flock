@@ -638,3 +638,192 @@ pub struct BitSpreadInput {
     pub word: u128,
     pub zero_mask: u128,
 }
+
+// ---------------------------------------------------------------------------
+// The fused PoW mask row
+// ---------------------------------------------------------------------------
+
+/// One 512-bit row carrying BOTH selected-zero relations of a fused grinding
+/// check: the predicate word's leading-`lambda` prefix and the nonce word's
+/// high 64 bits.  This is the whole recursive cost of one PoW site beyond
+/// the challenge squeeze it already shares.
+///
+/// ```text
+///   0   .. 128    predicate word            (wired input 0)
+///   128 .. 256    nonce word                (wired input 1)
+///   256 .. 320    mask, low 64 bits         (wired input 2, low half)
+///   320 .. 384    nonce bits 64..128        (input 2's HIGH half, repurposed)
+///   384 .. 511    check_j = pred_j · mask_j (pinned zero)
+///   511           the constant-one column
+/// ```
+///
+/// The trick that makes it fit one 512-bit row: a prefix mask for
+/// `lambda <= 64` lives entirely in the low half (serialized "leading bits"
+/// are the FIRST bytes), so the mask constant's high half is zero BY
+/// CONSTRUCTION — and the relation writes the nonce's high bits into exactly
+/// those cells (`z[320+t] = nonce[64+t]`).  The input word's wire binding
+/// then forces them to equal the statement constant's zero high half: the
+/// nonce-width check costs no cells of its own.  A zero-bit site passes the
+/// nonce as BOTH input words with the all-ones low mask, pinning the whole
+/// canonical-zero nonce (low half through the prefix cells, high half
+/// through the repurposed cells) — no extra grinding knob.
+///
+/// `lambda <= 64` is asserted at emission; the current schedule's maximum is
+/// 18 (the Product-GKR fingerprint).
+pub struct PowMaskTable;
+
+/// One row of [`PowMaskTable`].  `mask` is statement data confined to the
+/// low 64 bits; every set bit requires that bit of `pred` to be zero, and
+/// the relation itself requires `nonce`'s high 64 bits to be zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PowMaskInput {
+    pub pred: u128,
+    pub nonce: u128,
+    pub mask: u128,
+}
+
+impl PowMaskTable {
+    pub fn k_log(&self) -> usize {
+        9
+    }
+
+    pub fn k(&self) -> usize {
+        512
+    }
+
+    pub fn const_pos(&self) -> usize {
+        511
+    }
+
+    pub fn useful_bits(&self) -> usize {
+        512
+    }
+
+    /// Inputs: predicate, nonce, mask.  No outputs — the row is pure checks.
+    pub fn io_schema(&self) -> Vec<IoWord> {
+        vec![IoWord::input(0), IoWord::input(1), IoWord::input(2)]
+    }
+
+    pub fn build_matrices(&self) -> (SparseBinaryMatrix, SparseBinaryMatrix) {
+        let k = self.k();
+        let gc = self.const_pos();
+        let mut a: Vec<Vec<usize>> = vec![Vec::new(); k];
+        let mut b: Vec<Vec<usize>> = vec![Vec::new(); k];
+
+        // Free assignment for the two full input words and the mask's low
+        // half: bit_j * 1 = bit_j.
+        for j in 0..128 {
+            a[j] = vec![j];
+            b[j] = vec![gc];
+            a[128 + j] = vec![128 + j];
+            b[128 + j] = vec![gc];
+        }
+        for j in 0..64 {
+            a[256 + j] = vec![256 + j];
+            b[256 + j] = vec![gc];
+            // Input 2's high half IS the nonce-width check: the cell must
+            // equal nonce bit 64+j, and the wire binding pins the word to
+            // the statement's mask constant, whose high half is zero.
+            a[320 + j] = vec![192 + j];
+            b[320 + j] = vec![gc];
+        }
+        // The prefix checks: check_j = pred_j * mask_j, pinned zero.  For
+        // j >= 64 the "mask" reference lands on the repurposed nonce cells
+        // (honest zero), so those checks are vacuous — masks are low-half
+        // by the lambda <= 64 contract.
+        for j in 0..127 {
+            a[384 + j] = vec![j];
+            b[384 + j] = vec![256 + j];
+        }
+        a[gc] = vec![gc];
+        b[gc] = vec![gc];
+
+        let m = |rows: Vec<Vec<usize>>| SparseBinaryMatrix {
+            num_rows: k,
+            num_cols: k,
+            rows,
+        };
+        (m(a), m(b))
+    }
+
+    pub fn build_block_r1cs(&self, n_log: usize) -> BlockR1cs {
+        let (a_0, b_0) = self.build_matrices();
+        BlockR1cs {
+            m: n_log + self.k_log(),
+            k_log: self.k_log(),
+            k_skip: flock_core::zerocheck::K_SKIP,
+            useful_bits: self.useful_bits(),
+            a_0,
+            b_0,
+            c_0: identity(self.k()),
+            layout: WitnessLayout::BatchMajor,
+            const_pin: Some(self.const_pos()),
+            digest_cache: std::sync::OnceLock::new(),
+            csc_cache: std::sync::OnceLock::new(),
+        }
+    }
+
+    pub fn build_witness(&self, input: PowMaskInput) -> [Vec<bool>; 3] {
+        let k = self.k();
+        let (mut z, mut a, mut b) = (vec![false; k], vec![false; k], vec![false; k]);
+        for j in 0..128 {
+            let p = (input.pred >> j) & 1 == 1;
+            z[j] = p;
+            a[j] = p;
+            b[j] = true;
+            let n = (input.nonce >> j) & 1 == 1;
+            z[128 + j] = n;
+            a[128 + j] = n;
+            b[128 + j] = true;
+        }
+        for j in 0..64 {
+            let m = (input.mask >> j) & 1 == 1;
+            z[256 + j] = m;
+            a[256 + j] = m;
+            b[256 + j] = true;
+            let nh = (input.nonce >> (64 + j)) & 1 == 1;
+            z[320 + j] = nh;
+            a[320 + j] = nh;
+            b[320 + j] = true;
+        }
+        for j in 0..127 {
+            // z/check stays zero.  A/B carry the product inputs so an
+            // overlapping bit makes A*B != z exactly where zerocheck reads.
+            a[384 + j] = (input.pred >> j) & 1 == 1;
+            b[384 + j] = z[256 + j];
+        }
+        let gc = self.const_pos();
+        z[gc] = true;
+        a[gc] = true;
+        b[gc] = true;
+        [z, a, b]
+    }
+
+    pub fn generate_witness_batch_major(
+        &self,
+        rows: &[PowMaskInput],
+        nu: usize,
+    ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
+        use rayon::prelude::*;
+        let per: Vec<[Vec<bool>; 3]> = rows
+            .par_iter()
+            .map(|&i| self.build_witness(i))
+            .collect();
+        scatter_zab(&per, self.k(), self.useful_bits(), nu)
+    }
+
+    /// [`Self::generate_witness_batch_major`] writing into a union slot's
+    /// destination block — the copy-free union assembly path.
+    pub fn generate_witness_batch_major_into(
+        &self,
+        rows: &[PowMaskInput],
+        dst: flock_core::union::SlotWitnessDest<'_>,
+    ) -> Vec<u8> {
+        use rayon::prelude::*;
+        let per: Vec<[Vec<bool>; 3]> = rows
+            .par_iter()
+            .map(|&i| self.build_witness(i))
+            .collect();
+        scatter_zab_into(&per, self.k(), self.useful_bits(), dst)
+    }
+}
