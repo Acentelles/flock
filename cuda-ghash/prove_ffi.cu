@@ -48,6 +48,20 @@ using std::vector;
 
 template <class T>
 cudaError_t ffi_malloc(T** ptr, size_t bytes) {
+    cudaError_t err = cudaMallocAsync((void**)ptr, bytes, 0);
+    if (err == cudaSuccess) return cudaSuccess;
+
+    // The pool retains idle blocks for later proofs. Distinct large sizes can
+    // consume VRAM even after their buffers are freed. Release idle blocks and
+    // retry once. Live allocations remain in place.
+    cudaGetLastError();
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) return err;
+    cudaMemPool_t pool;
+    err = cudaDeviceGetDefaultMemPool(&pool, 0);
+    if (err != cudaSuccess) return err;
+    err = cudaMemPoolTrimTo(pool, 0);
+    if (err != cudaSuccess) return err;
     return cudaMallocAsync((void**)ptr, bytes, 0);
 }
 
