@@ -24852,7 +24852,7 @@ fn tower_online_bench() {
     // apart instead of the old minutes-apart interleave; box drift over
     // seconds is far below what the interleave guarded against.
     use std::sync::atomic::Ordering;
-    STEADY_OVERRIDE.store(runs - 1, Ordering::Relaxed);
+    STEADY_OVERRIDE.store(runs, Ordering::Relaxed); // +1: iteration 0 is the shape warmup (setup tier)
 
     // ---- LEAF: nothing else is alive; the measured proof BECOMES cp0 ----
     let cp0 = build_chain_proof(h0, n_blocks);
@@ -24863,7 +24863,7 @@ fn tower_online_bench() {
     // ---- FL: two chain children and nothing more. The measured FL is the
     // spine's FRESH child — the EARLIEST segments, since a spine PREPENDS —
     // so the measured leaf and FL become the tower's own materials. ----
-    STEADY_OVERRIDE.store(runs - 1, Ordering::Relaxed);
+    STEADY_OVERRIDE.store(runs, Ordering::Relaxed); // +1: iteration 0 is the shape warmup (setup tier)
     let fresh = build_fl_node(&cp0, &cp1);
     let fl = fresh.onlines.clone();
     STEADY_OVERRIDE.store(0, Ordering::Relaxed);
@@ -24894,7 +24894,7 @@ fn tower_online_bench() {
     // Both arms' online iterations run back to back inside their builder
     // call (seconds apart, not the old minutes-apart interleave), from
     // materials that are ALL resident before either starts.
-    STEADY_OVERRIDE.store(runs - 1, Ordering::Relaxed);
+    STEADY_OVERRIDE.store(runs, Ordering::Relaxed); // +1: iteration 0 is the shape warmup (setup tier)
     let base = build_node_outer_app(
         &[&fl0.lo, &fl1.lo],
         Some(fresh.stmt_base),
@@ -24939,6 +24939,29 @@ fn tower_online_bench() {
     };
     STEADY_OVERRIDE.store(usize::MAX, Ordering::Relaxed);
 
+    // SHAPE WARMUP IS SETUP, NOT MARGINAL COST. A stage's first online
+    // iteration primes the zero/scratch pools and faults in the allocator
+    // arena for its buffer size classes — one-time per-shape state that a
+    // production prover reaches once and keeps. Left inside the samples it
+    // skews whichever arm runs FIRST (both node arms share size classes,
+    // so the later arm inherits the earlier one's warmth: the internal-vs-
+    // spine delta once read −7% from ordering alone). So iteration 0 is
+    // reported on the setup tier and every per-proof number below is a
+    // median over the STEADY iterations only.
+    let steady = |runs: &[Online]| -> Vec<Online> {
+        if runs.len() > 1 { runs[1..].to_vec() } else { runs.to_vec() }
+    };
+    let warmup = |runs: &[Online]| -> Option<f64> {
+        (runs.len() > 1).then(|| runs[0].total())
+    };
+    let warms = [
+        ("leaf", warmup(&leaf)),
+        ("FL", warmup(&fl)),
+        ("internal", warmup(&internal)),
+        ("spine", warmup(&spine)),
+    ];
+    let (leaf, fl, internal, spine) =
+        (steady(&leaf), steady(&fl), steady(&internal), steady(&spine));
     let (leaf_on, fl_on, int_on) = (
         median_total(&leaf),
         median_total(&fl),
@@ -24960,6 +24983,11 @@ fn tower_online_bench() {
          per-proof ONLINE (setup is per-SHAPE, shown for reference only):",
         tower_profile(),
     );
+    for (name, w) in warms {
+        if let Some(ms) = w {
+            println!("    {name:9} shape warmup (setup tier, dropped from medians): {ms:.1} ms");
+        }
+    }
     report_stage("leaf", &leaf);
     report_stage("FL", &fl);
     report_stage("internal", &internal);
