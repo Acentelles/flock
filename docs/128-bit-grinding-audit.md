@@ -1,18 +1,21 @@
 # 128-bit grinding audit
 
 Status: implementation audit and independent re-review of the current
-`min/recursion-128bit` working tree on 2026-08-11.
+`min/recursion-128bit` working tree. The non-Ligerito audit was completed on
+2026-08-11; Ligerito two-point OOD binding and Appendix C.3 algebraic
+grinding were reviewed on 2026-08-12.
 
 This is the authoritative reviewer-facing summary of the grinding milestone.
 It records what was implemented, why each bit count is sufficient, how the
 prover/native verifier/recursive R1CS agree, and how to reproduce the test
-evidence. Detailed implementation history lives in
-[`128-bit-implementation-notes.md`](128-bit-implementation-notes.md); the
-next-stage roadmap lives in [`road-to-128-bit.md`](road-to-128-bit.md).
+evidence. It is intentionally self-contained so a reviewer does not need
+branch-local planning or implementation-history documents.
 
 The review target is **per-part 128-bit computational security** for the
-algebraic challenge sites outside Ligerito/list decoding. As requested, the
-following are not review blockers and are not used to qualify the conclusion:
+algebraic challenge sites, including the completed Ligerito list-decoding
+Parts 1 and 2. The Ligerito query term and mutually correlated agreement
+(MCA) term remain explicit later milestones. As requested, the following are
+not review blockers and are not used to qualify the conclusion:
 
 - an eventual global soundness ledger or union bound;
 - inactive legacy APIs; and
@@ -20,9 +23,12 @@ following are not review blockers and are not used to qualify the conclusion:
 
 ## Executive conclusion
 
-**Go/no-go result: go.** No missing or under-grinded algebraic challenge was
-found in the active non-Ligerito production or recursion paths. The current
-code is ready for the Ligerito/list-decoding stage.
+**Go/no-go result: go for Ligerito Part 3.** No missing or under-grinded
+algebraic challenge was found in the active production or recursion paths,
+including Appendix C.3's claim batching, quadratic fold/sumcheck, and queried
+consistency batching. Two-point OOD binding is also complete. This is not a
+claim that Ligerito as a whole is already a 128-bit component: its query and
+MCA terms remain.
 
 All active non-Ligerito algebraic challenge families found in the current
 production prover/verifier paths have Secure-profile grinding:
@@ -171,6 +177,9 @@ All bit counts below are sufficient for the strict local rule.
 | Merkle packed-position vector, dimension `d` | at most `d` | `bits_for_degree(d)` |
 | Merkle initial `(tau,alpha)` | at most `max(n,path_log+1)` | corresponding rule |
 | Merkle shift round | effective verifier degree 3 | 2 |
+| Ligerito scalar claim batching | list union `L_max` | `floor(log2 L_max)+1` |
+| Ligerito quadratic fold/sumcheck round | list union `2 L_max` | `floor(log2(2 L_max))+1` |
+| Ligerito queried-consistency batching | `L_max ceil(log2 Q)` | `floor(log2(L_max ceil(log2 Q)))+1` |
 
 For Product-GKR the fingerprint degree is `L-1`, not `L`: the top homogeneous
 term cancels because the live identity tags are permuted. For the Merkle shift,
@@ -313,6 +322,7 @@ retain their old transcript shape.
 | Multipoint / anchor | `MultipointGrinding`; gamma, round and anchor nonces | active twisted multipoint functions in `pcs/jagged.rs` | generic child-tape `Pow` checks plus multipoint/anchor arithmetic |
 | Dense, element and sigma folds | `FoldGrinding`; `FoldProof.grinding_nonces` | `matrix_fold.rs`, `aggregate.rs` | generic fold-tape `Pow` checks plus fold arithmetic |
 | Jagged folds | same `FoldGrinding` and proof type | jagged fold entry points in `matrix_fold.rs`, `aggregate.rs` | same generic fold-tape handling |
+| Ligerito Appendix C.3 | per-level claim/fold/consistency schedules; three nonce vectors | `pcs/ligerito.rs`, dense and succinct verifiers | generic child-tape `Pow` checks plus Ligerito arithmetic |
 
 Key reviewer entry points:
 
@@ -353,8 +363,9 @@ challenge reused by a later check.
 
 Raw samples used only to create transcript fork seeds or bind transcript state
 do not independently test a polynomial identity; the algebraic challenges
-inside the resulting child transcript remain individually protected. Ligerito
-query/OOD/proximity randomness is deliberately left for the next audit.
+inside the resulting child transcript remain individually protected.
+Ligerito OOD and Appendix C.3 algebraic randomness have since been audited.
+Only the query and MCA/proximity terms remain for the next stages.
 
 ## Transcript and proof-shape improvements
 
@@ -384,10 +395,12 @@ it no longer assumes one challenge per finalization.
 
 ### Proof format
 
-The incompatible additions and transcript changes bump the aggregate proof
-format to v15. Product-GKR, matrix fold, chain and Merkle shift proofs carry
+The incompatible additions and transcript changes now place the aggregate
+proof format at v17. Product-GKR, matrix fold, chain and Merkle shift proofs carry
 transcript-ordered nonce vectors; chain/Merkle wrappers carry their
 packed-position nonce; opening batching has one nonce and one vector squeeze.
+Version 16 added two-point Ligerito OOD data; version 17 adds the Appendix C.3
+claim- and consistency-batching nonce vectors.
 
 ## Prover / verifier / recursive-circuit agreement
 
@@ -418,6 +431,7 @@ The family-specific nonce orders are:
 | Product-GKR | fingerprint; for each layer: `lambda`, its rounds, close |
 | Outer PCS transport | each ring switch; shared opening coefficient vector; merged rounds; multipoint gamma; multipoint rounds; anchor rounds |
 | Matrix fold | column coefficient vector; column rounds; row coefficient vector; row rounds |
+| Ligerito | each OOD `beta`; every fold challenge; per-level consistency `alpha`; per-level glue `beta` |
 
 Proofs with vector nonce fields are checked for their **exact** expected
 length before replay. Optional scalar nonce fields use a canonical zero when
@@ -531,7 +545,8 @@ Results:
 - `flock-prover`: 74 active library tests and every active integration suite
   passed; no failures.
 - Secure Boolean and Secure element/mixed production roundtrips passed.
-- All three v15 proof-bundle serialization/verification roundtrips passed.
+- All three current v17 proof-bundle serialization/verification roundtrips
+  passed (the earlier non-Ligerito checkpoint used v15).
 - Secure `mvp11_two_to_one_recursion_node` passed with 41,215 BLAKE rows and a
   589.2 KiB outer proof in the post-rebase recorded run.
 - Secure `mvp12_recursion_tower` passed, including a recursive proof consumed
@@ -546,16 +561,35 @@ Focused evidence in the full suites additionally covers:
   squeezing; and
 - native/circuit PoW agreement plus valid/invalid recursive nonce behavior.
 
+The 2026-08-12 Ligerito Part 2 review additionally ran:
+
+```sh
+cargo test -p flock-core --lib
+cargo test -p flock-prover
+cargo test -p flock-prover proof_io::tests -- --ignored --nocapture
+cargo test -p flock-prover --test circuit_merkle \
+  mvp10_circuit_inner_tape -- --ignored --exact --nocapture
+cargo test --release -p flock-prover --test circuit_merkle \
+  mvp10_leaf_outer_inner_tape -- --ignored --exact --nocapture
+```
+
+All passed. The core run had 483 active tests and 22 ignored. The focused
+Ligerito mutation test checks both dense and succinct verifiers, invalid
+claim/consistency nonces, and missing/extra nonce vectors. The config suite
+rejects each under-sized Appendix C.3 schedule and checks all 42 embedded
+TOMLs against canonical generator output. The recursive tests prove that the
+new `Pow` operations and protected arithmetic are replayed inside R1CS.
+
 ## Handoff to the next milestone
 
 There is no remaining in-scope algebraic grinding implementation blocker.
-The next security work is the Ligerito/list-decoding family:
+Ligerito now runs in the Johnson list-decoding regime with two-point OOD
+binding, and its Appendix C.3 algebraic terms are individually below
+`2^-128` after grinding. The next security work is:
 
-- list-decoding rather than the temporary unique-decoding accounting;
-- the proximity gap and correlated-agreement term;
-- OOD samples that pin the relevant codeword/list member;
-- any grinding required by those reductions; and
-- the resulting query schedule.
+- raise the list-decoding query term `(1-gamma)^Q` to the 128-bit target; and
+- move the MCA/correlated-agreement arithmetic to the planned 256-bit
+  quadratic-extension field after checking its bound and recursive cost.
 
 The global ledger, inactive legacy APIs, and recursive chain/Merkle wrapper
 verification remain deliberate exclusions of this review, not defects that
@@ -568,8 +602,9 @@ Ligerito geometry fixed, the 2-to-1 recursion node changed from 24,637 to
 three-run median of 232 to 257 ms online proving (+10.8%). The corresponding
 level-2 tower changes were 27,600 to 32,400 rows (+17.4%) and 299.0 to 316.2
 KiB (+5.8%). Both isolated recursive tests passed. The temporary config
-substitution was removed after measurement; see the implementation notes for
-the component census and comparison with the current Secure/UDR profile.
+substitution was removed after measurement. The component census and
+Secure/UDR comparison are recorded in the historical-performance section
+above.
 
 The grinding verifier was subsequently fused with its protected
 Fiat--Shamir squeeze. Repeating the same isolated experiment reduced the
@@ -622,4 +657,5 @@ following the code map and tests:
 - Are vector-squeeze word offsets derived rather than assumed?
 - Do the Secure production node and tower tests pass?
 
-The 2026-08-11 re-review answered yes to each item.
+The 2026-08-11 non-Ligerito re-review and 2026-08-12 Ligerito Part 2 re-review
+answered yes to each applicable item.

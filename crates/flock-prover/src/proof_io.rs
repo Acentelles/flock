@@ -10,7 +10,7 @@
 //! On-disk format:
 //! ```text
 //!   bytes 0..5    "FLOCK"                  (5-byte magic)
-//!   byte  5       VERSION                  (currently 16)
+//!   byte  5       VERSION                  (currently 17)
 //!   bytes 6..7    flavor: 2 = R1cs, 3 = Chain, 4 = Mixed
 //!                 (0/1 reserved: legacy BaseFold)
 //!   bytes 7..     bincode-serialized payload
@@ -90,6 +90,9 @@ pub const MAGIC: [u8; 5] = *b"FLOCK";
 /// the values' absorb + gamma squeeze and loses the per-statement assist
 /// rounds. Soundness: docs/multipoint-twisted-assist.tex.
 ///
+/// v17 adds the Appendix C.3 claim- and consistency-batching PoW nonce vectors
+/// to `LigeritoProof`.
+///
 /// v10: stratified queries (docs/stratified-queries.tex) — every level's
 /// query count decomposes into power-of-two summands, one query per
 /// depth-c subtree; the absorbed cap moves to the TOP SET BIT of the
@@ -114,7 +117,7 @@ pub const MAGIC: [u8; 5] = *b"FLOCK";
 /// v3 restructured `BaseFoldProof`: per-query Merkle paths were replaced by
 /// shared octopus multi-proofs (one per Merkle tree). v2 added `HashKind`
 /// to [`ChainProofBundle`].
-pub const VERSION: u8 = 16;
+pub const VERSION: u8 = 17;
 
 /// Which hash function a chain proof is over. Carried in
 /// [`ChainProofBundle`] so the verifier (e.g. the CLI) can pick the right
