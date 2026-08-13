@@ -87,6 +87,15 @@ pub enum LigeritoProfile {
     /// profile's own 100 bits (m29 ladder total 262, the schedule the
     /// envelope's fixed point was iterated against).
     Slim100,
+    /// `Slim` with an aggressive recursion ladder: the rate climbs +2 per
+    /// level (vs `Slim`'s +1), so the same folds reach higher rates sooner
+    /// and each tail level needs fewer consistency queries. Same 128-bit
+    /// Johnson accounting, rate 1/4 L0, two-point OOD and 16-bit query PoW as
+    /// `Slim` — only the per-level rate schedule changes. Nets ~10% smaller
+    /// proofs at equal security (the codewords still shrink per level because
+    /// `rate_gain` stays below the fold count). See
+    /// [`Self::derive_profile_ladder`].
+    Slim128,
     Secure,
 }
 
@@ -95,7 +104,7 @@ impl LigeritoProfile {
     pub fn log_inv_rate(self) -> usize {
         match self {
             Self::Fast | Self::Fast100 | Self::Secure => 1,
-            Self::Slim | Self::Slim100 => 2,
+            Self::Slim | Self::Slim100 | Self::Slim128 => 2,
         }
     }
     /// Historical profile-local target. Strict Fast/Slim configs retain the
@@ -105,7 +114,7 @@ impl LigeritoProfile {
     /// query floor.
     pub fn security_bits(self) -> usize {
         match self {
-            Self::Fast | Self::Fast100 | Self::Slim | Self::Slim100 => 100,
+            Self::Fast | Self::Fast100 | Self::Slim | Self::Slim100 | Self::Slim128 => 100,
             Self::Secure => 120,
         }
     }
@@ -115,6 +124,7 @@ impl LigeritoProfile {
             Self::Fast100 => "fast100",
             Self::Slim => "slim",
             Self::Slim100 => "slim100",
+            Self::Slim128 => "slim128",
             Self::Secure => "secure",
         }
     }
@@ -124,6 +134,7 @@ impl LigeritoProfile {
             "fast100" => Some(Self::Fast100),
             "slim" => Some(Self::Slim),
             "slim100" => Some(Self::Slim100),
+            "slim128" => Some(Self::Slim128),
             "secure" => Some(Self::Secure),
             _ => None,
         }
@@ -439,6 +450,30 @@ fn derive_ladder_shape(
     log_inv_rate: usize,
     queries_at_rate: &dyn Fn(usize) -> usize,
 ) -> Result<LadderShape, String> {
+    // Default ladder: 3 original folds per level, +1 rate step per level.
+    derive_ladder_shape_tuned(log_n, initial_k, log_inv_rate, 3, 1, queries_at_rate)
+}
+
+/// Ladder-shape generator with tunable recursion aggressiveness.
+///
+/// `folds_per_level` original variables are folded at each recursive level
+/// (the interleave is `folds_per_level + 1`, one extra for the F256→F128
+/// code-switch coordinate), and the rate climbs by `rate_gain` per level
+/// (bumped further only if a level's block length would fall below its query
+/// count). The default `(3, 1)` reproduces the shipped ladder; larger values
+/// approach WHIR's shape (fold more, gain rate faster → fewer, higher-rate
+/// tail levels). NB in F128 (16 B/element) a large `folds_per_level` widens
+/// the opened row to `2^(folds+1)` elements, which can cost more than the
+/// query reduction saves — the reason to measure, not assume.
+fn derive_ladder_shape_tuned(
+    log_n: usize,
+    initial_k: usize,
+    log_inv_rate: usize,
+    folds_per_level: usize,
+    rate_gain: usize,
+    queries_at_rate: &dyn Fn(usize) -> usize,
+) -> Result<LadderShape, String> {
+    assert!(folds_per_level >= 1 && rate_gain >= 1, "ladder tuning must be >= 1");
     if log_n <= initial_k {
         return Err("log_n must be > initial_k".into());
     }
@@ -455,10 +490,10 @@ fn derive_ladder_shape(
         return Err("L0 block_len < queries — log_n too small for chosen rate".into());
     }
     while n_running > 5 {
-        let original_folds = 3.min(n_running);
+        let original_folds = folds_per_level.min(n_running);
         let k = original_folds + 1;
         let log_msg_cols_next = n_running - original_folds;
-        let mut next_rate = rate_running + 1;
+        let mut next_rate = rate_running + rate_gain;
         loop {
             if (1usize << (log_msg_cols_next + next_rate)) >= queries_at_rate(next_rate) {
                 break;
@@ -498,6 +533,8 @@ macro_rules! profile_configs {
                  include_str!(concat!("../../configs/ligerito/m", $m, "_slim.toml"))),
                 (($m, LigeritoProfile::Slim100),
                  include_str!(concat!("../../configs/ligerito/m", $m, "_slim100.toml"))),
+                (($m, LigeritoProfile::Slim128),
+                 include_str!(concat!("../../configs/ligerito/m", $m, "_slim128.toml"))),
                 (($m, LigeritoProfile::Secure),
                  include_str!(concat!("../../configs/ligerito/m", $m, "_secure.toml"))),
             )+
@@ -541,6 +578,21 @@ pub fn embedded_initial_k_or_default(m: usize, profile: LigeritoProfile) -> usiz
     embedded_initial_k(m, profile).unwrap_or(6)
 }
 
+/// The security config for `(m, profile)` from the embedded TOML — the single
+/// lookup both [`prover_config_for`] and [`verifier_config_for`] share.
+fn security_config_for(
+    m: usize,
+    profile: LigeritoProfile,
+) -> Result<LigeritoSecurityConfig, String> {
+    let toml = embedded_security_config(m, profile).ok_or_else(|| {
+        format!(
+            "no security config registered for (m={m}, profile={})",
+            profile.as_str()
+        )
+    })?;
+    LigeritoSecurityConfig::from_toml_str(toml)
+}
+
 /// Build a `ProverConfig` for `(log_n, log_batch_size, log_inv_rate)` from
 /// the embedded security TOML. **Strict**: returns `Err` if no security
 /// config has been derived for `(m, log_inv_rate)`. Use this as the
@@ -557,16 +609,7 @@ pub fn prover_config_for(
     profile: LigeritoProfile,
 ) -> Result<ProverConfig, String> {
     let m = log_n + crate::pcs::LOG_PACKING;
-    let toml = embedded_security_config(m, profile).ok_or_else(|| {
-        format!(
-            "no security config registered for (m={m}, profile={}). \
-             Add a TOML at configs/ligerito/m{m}_{}.toml and register it in \
-             EMBEDDED_CONFIGS, or call default_config explicitly for ad-hoc shapes.",
-            profile.as_str(),
-            profile.as_str(),
-        )
-    })?;
-    let sec = LigeritoSecurityConfig::from_toml_str(toml)?;
+    let sec = security_config_for(m, profile)?;
     if sec.initial_k != log_batch_size {
         return Err(format!(
             "embedded config for (m={m}, profile={}) has \
@@ -586,13 +629,7 @@ pub fn verifier_config_for(
     profile: LigeritoProfile,
 ) -> Result<VerifierConfig, String> {
     let m = log_n + crate::pcs::LOG_PACKING;
-    let toml = embedded_security_config(m, profile).ok_or_else(|| {
-        format!(
-            "no security config registered for (m={m}, profile={})",
-            profile.as_str()
-        )
-    })?;
-    let sec = LigeritoSecurityConfig::from_toml_str(toml)?;
+    let sec = security_config_for(m, profile)?;
     if sec.initial_k != log_batch_size {
         return Err(format!(
             "embedded config for (m={m}, profile={}) has \
@@ -1692,16 +1729,37 @@ impl LigeritoSecurityConfig {
     ///             MCA arithmetic.
     /// - `Secure`: Udr, rate 1/2, ε* = 1e-3, 120 bits per round.
     pub fn derive_profile(m: usize, profile: LigeritoProfile) -> Result<Self, String> {
+        // Shipped ladder: 3 folds/level, +1 rate/level — except Slim128, whose
+        // whole point is the +2/level aggressive ladder (still < 3 folds, so
+        // codewords keep shrinking).
+        let rate_gain = if profile == LigeritoProfile::Slim128 { 2 } else { 1 };
+        Self::derive_profile_ladder(m, profile, 3, rate_gain)
+    }
+
+    /// [`Self::derive_profile`] with a tunable recursion ladder — fold
+    /// `folds_per_level` original variables per recursive level and climb the
+    /// rate by `rate_gain` per level (see [`derive_ladder_shape_tuned`]).
+    /// `(3, 1)` is the shipped shape; larger values collapse the tail into
+    /// fewer, higher-rate levels (WHIR-like). Experimental: used to measure
+    /// whether an aggressive ladder shrinks the proof in F128.
+    pub fn derive_profile_ladder(
+        m: usize,
+        profile: LigeritoProfile,
+        folds_per_level: usize,
+        rate_gain: usize,
+    ) -> Result<Self, String> {
         /// Johnson slack below the Johnson radius, flat across levels.
         const JOHNSON_ETA: f64 = 0.02;
         let target_bits = profile.security_bits();
         let log_inv_rate = profile.log_inv_rate();
         let query_grind: usize = match profile {
-            LigeritoProfile::Slim | LigeritoProfile::Slim100 => 16,
+            LigeritoProfile::Slim | LigeritoProfile::Slim100 | LigeritoProfile::Slim128 => 16,
             LigeritoProfile::Fast | LigeritoProfile::Fast100 | LigeritoProfile::Secure => 0,
         };
         let query_target_bits = match profile {
-            LigeritoProfile::Fast | LigeritoProfile::Slim => LIST_DECODING_QUERY_TARGET_BITS,
+            LigeritoProfile::Fast | LigeritoProfile::Slim | LigeritoProfile::Slim128 => {
+                LIST_DECODING_QUERY_TARGET_BITS
+            }
             // Fast100 IS Fast at the pre-list-decoding cost point: the
             // query term targets the profile's own 100 bits, reproducing
             // the schedule shipped before the strict-128 milestone.
@@ -1734,7 +1792,8 @@ impl LigeritoSecurityConfig {
                 LigeritoProfile::Fast
                 | LigeritoProfile::Fast100
                 | LigeritoProfile::Slim
-                | LigeritoProfile::Slim100,
+                | LigeritoProfile::Slim100
+                | LigeritoProfile::Slim128,
             ) => {
                 5usize
             }
@@ -1743,7 +1802,8 @@ impl LigeritoSecurityConfig {
                 LigeritoProfile::Fast
                 | LigeritoProfile::Fast100
                 | LigeritoProfile::Slim
-                | LigeritoProfile::Slim100,
+                | LigeritoProfile::Slim100
+                | LigeritoProfile::Slim128,
             ) => {
                 4usize
             }
@@ -1760,7 +1820,8 @@ impl LigeritoSecurityConfig {
                 LigeritoProfile::Fast
                 | LigeritoProfile::Fast100
                 | LigeritoProfile::Slim
-                | LigeritoProfile::Slim100 => {
+                | LigeritoProfile::Slim100
+                | LigeritoProfile::Slim128 => {
                     paper_per_query_bits(rate, JOHNSON_ETA)
                 }
             }
@@ -1774,7 +1835,14 @@ impl LigeritoSecurityConfig {
         let queries_feas = |rate: usize| -> usize {
             strict_query_count(t_feas, query_grind, per_query_bits_feas(rate))
         };
-        let shape = derive_ladder_shape(log_n, initial_k, log_inv_rate, &queries_feas)?;
+        let shape = derive_ladder_shape_tuned(
+            log_n,
+            initial_k,
+            log_inv_rate,
+            folds_per_level,
+            rate_gain,
+            &queries_feas,
+        )?;
         let n_levels = shape.log_inv_rates.len();
 
         // Round-by-round target: every error term (pg, query, ood) at every
@@ -1801,7 +1869,8 @@ impl LigeritoSecurityConfig {
                 LigeritoProfile::Fast
                 | LigeritoProfile::Fast100
                 | LigeritoProfile::Slim
-                | LigeritoProfile::Slim100 => {
+                | LigeritoProfile::Slim100
+                | LigeritoProfile::Slim128 => {
                     paper_per_query_bits(rate, JOHNSON_ETA)
                 }
             };
@@ -1833,7 +1902,8 @@ impl LigeritoSecurityConfig {
                 LigeritoProfile::Fast
                 | LigeritoProfile::Fast100
                 | LigeritoProfile::Slim
-                | LigeritoProfile::Slim100 => {
+                | LigeritoProfile::Slim100
+                | LigeritoProfile::Slim128 => {
                     let eps_pg =
                         FOLD_FIELD_LOG_Q - paper_johnson_log_a(rate, JOHNSON_ETA, cols, ilv);
                     let mu = cols + ilv;
@@ -1903,7 +1973,7 @@ impl LigeritoSecurityConfig {
             LigeritoProfile::Secure => {
                 "f256_split_no_row_union_over_ben_sasson_2025_cor_1_4"
             }
-            LigeritoProfile::Fast | LigeritoProfile::Slim => {
+            LigeritoProfile::Fast | LigeritoProfile::Slim | LigeritoProfile::Slim128 => {
                 "f256_split_johnson_two_point_ood_query128_c3_algebraic_row_union_over_bchks25_thm_4_6"
             }
             // Same analysis as Fast; only the query term's target differs
@@ -8691,6 +8761,177 @@ mod tests {
     #[ignore]
     fn ligerito_size_breakdown_m23() {
         size_breakdown_at(23, 4, vec![4, 4, 3, 3], vec![1, 2, 3, 4, 5]);
+    }
+
+    /// Experiment: does a WHIR-like aggressive recursion ladder shrink the
+    /// Slim PCS proof in F128? Compares the shipped ladder (fold 3, rate +1)
+    /// against tunings that fold more and/or climb the rate faster. The proof
+    /// size is estimated from each config's actual per-level (queries,
+    /// interleave, block length) via the stratified closed form — the
+    /// dominant terms (opened rows + capped Merkle paths + caps + residual).
+    /// Every variant is `validate()`d, so a printed size is a SOUND config.
+    #[test]
+    #[ignore]
+    fn slim_aggressive_ladder_size_experiment() {
+        const ELEM: usize = core::mem::size_of::<F128>();
+        let kib = |b: usize| format!("{:.1}", b as f64 / 1024.0);
+        let m = 29usize;
+        let variants: &[(&str, usize, usize)] = &[
+            ("baseline   fold3 rate+1", 3, 1),
+            ("hi-rate    fold3 rate+2", 3, 2),
+            ("hi-rate    fold3 rate+3", 3, 3),
+            ("whir-like  fold6 rate+2", 6, 2),
+            ("whir-like  fold7 rate+2", 7, 2),
+        ];
+        eprintln!("\nSLIM AGGRESSIVE-LADDER EXPERIMENT (m={m}, F128, PCS proof estimate)\n");
+        for &(label, folds, gain) in variants {
+            let cfg = match LigeritoSecurityConfig::derive_profile_ladder(
+                m,
+                LigeritoProfile::Slim,
+                folds,
+                gain,
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{label}: INFEASIBLE — {e}\n");
+                    continue;
+                }
+            };
+            let valid = cfg.validate();
+            let (mut opened, mut merkle, mut caps, mut total_q) = (0usize, 0usize, 0usize, 0usize);
+            let mut tail_opened = 0usize;
+            let mut tail_merkle = 0usize;
+            for (i, lv) in cfg.levels.iter().enumerate() {
+                let bl = lv.log_msg_cols + lv.log_inv_rate;
+                let q = lv.queries;
+                total_q += q;
+                let sched = stratified::LevelSchedule::decompose(q, bl);
+                let o = q * (1usize << lv.log_num_interleaved) * ELEM;
+                let mk = sched.total_path_siblings() * 32;
+                opened += o;
+                merkle += mk;
+                caps += (1usize << sched.cap_depth()) * 32;
+                if i > 0 {
+                    tail_opened += o;
+                    tail_merkle += mk;
+                }
+            }
+            let yr = (1usize << cfg.final_block.yr_log_n) * ELEM;
+            let total = opened + merkle + caps + yr;
+            let tail = tail_opened + tail_merkle;
+            eprintln!(
+                "{label}: {} levels  Σq={total_q}  validate={}",
+                cfg.levels.len(),
+                match &valid {
+                    Ok(()) => "OK".to_string(),
+                    Err(e) => format!("FAIL[{e}]"),
+                },
+            );
+            eprintln!(
+                "    rates(1/2^r)={:?}  q={:?}  interleave(2^k)={:?}",
+                cfg.levels.iter().map(|l| l.log_inv_rate).collect::<Vec<_>>(),
+                cfg.levels.iter().map(|l| l.queries).collect::<Vec<_>>(),
+                cfg.levels.iter().map(|l| l.log_num_interleaved).collect::<Vec<_>>(),
+            );
+            eprintln!(
+                "    opened={} KiB  merkle={} KiB  caps={} KiB  yr={} KiB  | TAIL(L1+)={} KiB | TOTAL={} KiB\n",
+                kib(opened),
+                kib(merkle),
+                kib(caps),
+                kib(yr),
+                kib(tail),
+                kib(total),
+            );
+        }
+    }
+
+    /// Real prove+verify cost of the aggressive ladder vs the shipped one.
+    /// Materializes the m29 polynomial and runs the F256 recursive prover, so
+    /// it measures actual prove time AND serialized proof bytes (not the
+    /// estimate) — the size win from `slim_aggressive_ladder_size_experiment`
+    /// has a prover cost (higher rate ⇒ longer codewords ⇒ more encoding);
+    /// this is where that shows up. Each proof is verified.
+    #[test]
+    #[ignore]
+    fn slim_aggressive_ladder_prove_cost() {
+        use crate::challenger::{Challenger, FsChallenger, RandomChallenger};
+        use std::time::Instant;
+        let m = 29usize;
+        let reps = 3usize;
+        let variants: &[(&str, usize, usize)] = &[
+            ("baseline fold3 rate+1", 3, 1),
+            ("hi-rate  fold3 rate+2", 3, 2),
+            ("hi-rate  fold3 rate+3", 3, 3),
+        ];
+        eprintln!("\nSLIM LADDER PROVE-COST (m={m}, F256, real prove+verify, medians of {reps})\n");
+        for &(label, folds, gain) in variants {
+            let cfg =
+                LigeritoSecurityConfig::derive_profile_ladder(m, LigeritoProfile::Slim, folds, gain)
+                    .expect("config derives");
+            let (pv, vc) = cfg.to_prover_verifier_configs().expect("pv/vc configs");
+            let log_n = cfg.log_n;
+            let initial_k = pv.initial_k;
+            let rate0 = pv.log_inv_rates[0];
+            let cols0 = pv.initial_log_msg_cols;
+            let hash = cfg.merkle_hash().expect("hash");
+
+            let mut rng = RandomChallenger::new(0xA11CE_5EED);
+            let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
+            let z: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
+            let b = build_eq_table(&z);
+            let target: F128 = poly
+                .iter()
+                .zip(b.iter())
+                .map(|(&a, &c)| a * c)
+                .fold(F128::ZERO, |a, x| a + x);
+            let ntt0 = AdditiveNttF128::standard(cols0 + rate0);
+            let wtns0 = ligero_commit(&poly, cols0, initial_k, rate0, &ntt0, hash);
+            let cap = wtns0
+                .cap(vc.l0_cap_depth(wtns0.block_len.trailing_zeros() as usize))
+                .to_vec();
+
+            let mut times = Vec::new();
+            let mut proof_bytes = 0usize;
+            let mut verified = false;
+            for _ in 0..reps {
+                let mut ch = FsChallenger::new(b"ladder-cost");
+                let t = Instant::now();
+                let proof = recursive_prover_with_basis(
+                    &pv,
+                    poly.clone(),
+                    b.clone(),
+                    target,
+                    &wtns0.mat,
+                    &wtns0.tree,
+                    &mut ch,
+                );
+                times.push(t.elapsed().as_secs_f64() * 1e3);
+                proof_bytes = bincode::serialize(&proof).map(|v| v.len()).unwrap_or(0);
+                let mut v_ch = FsChallenger::new(b"ladder-cost");
+                verified = extension::recursive_verifier_with_basis_succinct(
+                    &vc,
+                    &proof,
+                    log_n,
+                    target,
+                    &cap,
+                    1usize << initial_k,
+                    |ris, residual_log| extension::evaluate_dense_at_residual(&b, ris, residual_log),
+                    &mut v_ch,
+                );
+            }
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            eprintln!(
+                "{label}: {} levels Σq={}  rates={:?}\n    prove {:.0} ms [{:.0}-{:.0}]  proof {:.1} KiB  verify={}\n",
+                cfg.levels.len(),
+                cfg.levels.iter().map(|l| l.queries).sum::<usize>(),
+                cfg.levels.iter().map(|l| l.log_inv_rate).collect::<Vec<_>>(),
+                times[times.len() / 2],
+                times[0],
+                times[times.len() - 1],
+                proof_bytes as f64 / 1024.0,
+                if verified { "OK" } else { "FAIL" },
+            );
+        }
     }
 
     /// Analytical size estimator — runs **only** the challenger-driven query
