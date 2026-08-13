@@ -96,6 +96,13 @@ pub enum LigeritoProfile {
     /// `rate_gain` stays below the fold count). See
     /// [`Self::derive_profile_ladder`].
     Slim128,
+    /// `Fast` with the aggressive recursion ladder (rate +2/level), the
+    /// rate-1/2 twin of [`Self::Slim128`]. Same 128-bit Johnson accounting,
+    /// rate 1/2 L0 and no query PoW as `Fast` — only the per-level rate
+    /// schedule changes. Nets ~11% smaller proofs at equal 128-bit security,
+    /// near-free on prove (codewords keep shrinking since `rate_gain` < the
+    /// fold count). See [`Self::derive_profile_ladder`].
+    Fast128,
     Secure,
 }
 
@@ -103,7 +110,7 @@ impl LigeritoProfile {
     /// L0 code rate index for this profile (`rho_0 = 2^-log_inv_rate`).
     pub fn log_inv_rate(self) -> usize {
         match self {
-            Self::Fast | Self::Fast100 | Self::Secure => 1,
+            Self::Fast | Self::Fast100 | Self::Fast128 | Self::Secure => 1,
             Self::Slim | Self::Slim100 | Self::Slim128 => 2,
         }
     }
@@ -114,7 +121,12 @@ impl LigeritoProfile {
     /// query floor.
     pub fn security_bits(self) -> usize {
         match self {
-            Self::Fast | Self::Fast100 | Self::Slim | Self::Slim100 | Self::Slim128 => 100,
+            Self::Fast
+            | Self::Fast100
+            | Self::Fast128
+            | Self::Slim
+            | Self::Slim100
+            | Self::Slim128 => 100,
             Self::Secure => 120,
         }
     }
@@ -122,6 +134,7 @@ impl LigeritoProfile {
         match self {
             Self::Fast => "fast",
             Self::Fast100 => "fast100",
+            Self::Fast128 => "fast128",
             Self::Slim => "slim",
             Self::Slim100 => "slim100",
             Self::Slim128 => "slim128",
@@ -132,6 +145,7 @@ impl LigeritoProfile {
         match s.to_ascii_lowercase().as_str() {
             "fast" => Some(Self::Fast),
             "fast100" => Some(Self::Fast100),
+            "fast128" => Some(Self::Fast128),
             "slim" => Some(Self::Slim),
             "slim100" => Some(Self::Slim100),
             "slim128" => Some(Self::Slim128),
@@ -529,6 +543,8 @@ macro_rules! profile_configs {
                  include_str!(concat!("../../configs/ligerito/m", $m, "_fast.toml"))),
                 (($m, LigeritoProfile::Fast100),
                  include_str!(concat!("../../configs/ligerito/m", $m, "_fast100.toml"))),
+                (($m, LigeritoProfile::Fast128),
+                 include_str!(concat!("../../configs/ligerito/m", $m, "_fast128.toml"))),
                 (($m, LigeritoProfile::Slim),
                  include_str!(concat!("../../configs/ligerito/m", $m, "_slim.toml"))),
                 (($m, LigeritoProfile::Slim100),
@@ -1267,7 +1283,10 @@ impl LigeritoSecurityConfig {
     fn validate_profile(&self, profile: LigeritoProfile) -> Result<(), String> {
         let expected = match profile {
             LigeritoProfile::Secure => "f256_split_no_row_union_over_ben_sasson_2025_cor_1_4",
-            LigeritoProfile::Fast | LigeritoProfile::Slim | LigeritoProfile::Slim128 => {
+            LigeritoProfile::Fast
+            | LigeritoProfile::Fast128
+            | LigeritoProfile::Slim
+            | LigeritoProfile::Slim128 => {
                 "f256_split_johnson_two_point_ood_query128_c3_algebraic_row_union_over_bchks25_thm_4_6"
             }
             LigeritoProfile::Fast100 | LigeritoProfile::Slim100 => {
@@ -1775,10 +1794,13 @@ impl LigeritoSecurityConfig {
     ///             MCA arithmetic.
     /// - `Secure`: Udr, rate 1/2, ε* = 1e-3, 120 bits per round.
     pub fn derive_profile(m: usize, profile: LigeritoProfile) -> Result<Self, String> {
-        // Shipped ladder: 3 folds/level, +1 rate/level — except Slim128, whose
-        // whole point is the +2/level aggressive ladder (still < 3 folds, so
-        // codewords keep shrinking).
-        let rate_gain = if profile == LigeritoProfile::Slim128 { 2 } else { 1 };
+        // Shipped ladder: 3 folds/level, +1 rate/level — except the *128
+        // profiles, whose whole point is the +2/level aggressive ladder (still
+        // < 3 folds, so codewords keep shrinking).
+        let rate_gain = match profile {
+            LigeritoProfile::Slim128 | LigeritoProfile::Fast128 => 2,
+            _ => 1,
+        };
         Self::derive_profile_ladder(m, profile, 3, rate_gain)
     }
 
@@ -1800,12 +1822,16 @@ impl LigeritoSecurityConfig {
         let log_inv_rate = profile.log_inv_rate();
         let query_grind: usize = match profile {
             LigeritoProfile::Slim | LigeritoProfile::Slim100 | LigeritoProfile::Slim128 => 16,
-            LigeritoProfile::Fast | LigeritoProfile::Fast100 | LigeritoProfile::Secure => 0,
+            LigeritoProfile::Fast
+            | LigeritoProfile::Fast100
+            | LigeritoProfile::Fast128
+            | LigeritoProfile::Secure => 0,
         };
         let query_target_bits = match profile {
-            LigeritoProfile::Fast | LigeritoProfile::Slim | LigeritoProfile::Slim128 => {
-                LIST_DECODING_QUERY_TARGET_BITS
-            }
+            LigeritoProfile::Fast
+            | LigeritoProfile::Fast128
+            | LigeritoProfile::Slim
+            | LigeritoProfile::Slim128 => LIST_DECODING_QUERY_TARGET_BITS,
             // Fast100 IS Fast at the pre-list-decoding cost point: the
             // query term targets the profile's own 100 bits, reproducing
             // the schedule shipped before the strict-128 milestone.
@@ -1837,6 +1863,7 @@ impl LigeritoSecurityConfig {
                 29,
                 LigeritoProfile::Fast
                 | LigeritoProfile::Fast100
+                | LigeritoProfile::Fast128
                 | LigeritoProfile::Slim
                 | LigeritoProfile::Slim100
                 | LigeritoProfile::Slim128,
@@ -1845,6 +1872,7 @@ impl LigeritoSecurityConfig {
                 28,
                 LigeritoProfile::Fast
                 | LigeritoProfile::Fast100
+                | LigeritoProfile::Fast128
                 | LigeritoProfile::Slim
                 | LigeritoProfile::Slim100
                 | LigeritoProfile::Slim128,
@@ -1861,6 +1889,7 @@ impl LigeritoSecurityConfig {
                 LigeritoProfile::Secure => udr_per_query_bits_asymptotic(rate),
                 LigeritoProfile::Fast
                 | LigeritoProfile::Fast100
+                | LigeritoProfile::Fast128
                 | LigeritoProfile::Slim
                 | LigeritoProfile::Slim100
                 | LigeritoProfile::Slim128 => paper_per_query_bits(rate, JOHNSON_ETA),
@@ -1908,6 +1937,7 @@ impl LigeritoSecurityConfig {
                 LigeritoProfile::Secure => udr_per_query_bits(rate, cols, UDR_PROXIMITY_LOSS),
                 LigeritoProfile::Fast
                 | LigeritoProfile::Fast100
+                | LigeritoProfile::Fast128
                 | LigeritoProfile::Slim
                 | LigeritoProfile::Slim100
                 | LigeritoProfile::Slim128 => paper_per_query_bits(rate, JOHNSON_ETA),
@@ -1939,6 +1969,7 @@ impl LigeritoSecurityConfig {
                 }
                 LigeritoProfile::Fast
                 | LigeritoProfile::Fast100
+                | LigeritoProfile::Fast128
                 | LigeritoProfile::Slim
                 | LigeritoProfile::Slim100
                 | LigeritoProfile::Slim128 => {
@@ -2011,7 +2042,10 @@ impl LigeritoSecurityConfig {
             LigeritoProfile::Secure => {
                 "f256_split_no_row_union_over_ben_sasson_2025_cor_1_4"
             }
-            LigeritoProfile::Fast | LigeritoProfile::Slim | LigeritoProfile::Slim128 => {
+            LigeritoProfile::Fast
+            | LigeritoProfile::Fast128
+            | LigeritoProfile::Slim
+            | LigeritoProfile::Slim128 => {
                 "f256_split_johnson_two_point_ood_query128_c3_algebraic_row_union_over_bchks25_thm_4_6"
             }
             // Same analysis as Fast; only the query term's target differs
