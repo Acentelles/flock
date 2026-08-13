@@ -3165,6 +3165,7 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
         );
     }
     let mut sparse_support: Option<u64> = None;
+    let mut dense_group_support: Option<u64> = None;
     if n_g > 0
         && closed_rs_on()
         && let Some(used) = aligned.as_ref()
@@ -3222,6 +3223,7 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
             let (bv, msg) = build_combined_weight_and_msg(params, &sides, &partner, &eq0);
             msg0 = (msg0.0 + msg.0, msg0.1 + msg.1);
             pairs.push(Pair::Virtual(VirtualPair::new(bv, partner, rho, 0, area)));
+            dense_group_support = Some(support);
         }
     }
     if trace {
@@ -3229,9 +3231,10 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
             "    [multipoint] weight passes (2^{m}, {} products{}, round-0 fused): {:6.2} ms  \
              (rs {:.2} | group {:.2})",
             pairs.len(),
-            match sparse_support {
-                Some(s) => format!(" — group sparse, support {s} words"),
-                None => String::new(),
+            match (sparse_support, dense_group_support) {
+                (Some(s), _) => format!(" — group sparse, support {s} words"),
+                (None, Some(s)) => format!(" — group DENSE, support {s} words"),
+                (None, None) => String::new(),
             },
             t.elapsed().as_secs_f64() * 1e3,
             t_rs_weight.as_secs_f64() * 1e3,
@@ -4135,7 +4138,22 @@ impl SparseGroupPair {
 }
 
 /// Densify once the stored support stops paying against the live length.
-const SPARSE_DENSIFY_FACTOR: usize = 4;
+/// Sparse-vs-dense gate for the GROUP pair, used BOTH at entry (build
+/// segment-sparse when `support * this <= 2^m`) and by the mid-sumcheck
+/// self-densify (`stored * this > cur`). The two sites must share one
+/// factor: `stored` and `cur` both roughly halve per fold round, so the
+/// ratio is round-invariant — a pair admitted under a looser entry gate
+/// than the densify gate would densify at its FIRST fold, paying the
+/// materialize for nothing (measured: the fold line spiked to 11.8 ms
+/// when the gates briefly disagreed).
+///
+/// Was 4; relaxed to 3 (2026-08-14): the F256 registry's extra element
+/// columns pushed the envelope INTERNAL's support to 1,062,614 = 25.3% of
+/// 2^22 — 1.3% over the old gate — flipping it to the dense path at ~+4 ms
+/// of group weight per open (dense 6.4 ms over 2^22 vs sparse ~3.3 at this
+/// support; the measured per-word weight crossover is near 2^m/1.5, so 3
+/// keeps real margin). The FL at 793k = 18.9% was and stays sparse.
+const SPARSE_DENSIFY_FACTOR: usize = 3;
 
 /// Below this stored-support size a sparse fold round runs on the calling
 /// thread: the round's whole work is a few thousand multiplies —
