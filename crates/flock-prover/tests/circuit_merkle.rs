@@ -85,6 +85,23 @@ fn tower_profile() -> LigeritoProfile {
     }
 }
 
+/// Security level for the chain leaf's WORKLOAD inner proof.
+///
+/// Historically hardcoded to `Fast`, which on this branch is the 128-bit
+/// strict-list-decoding schedule (574 queries) — so a `slim100` recursion was
+/// silently carrying a 128-bit leaf, and the extra query openings ballooned
+/// the FL's replayed transcript (18.1k rows/leaf) past the arity-2 envelope.
+/// A 100-bit recursion should carry a 100-bit leaf. We use `Fast100` (not
+/// `Slim100`) so the leaf stays rate-1/2 with the SAME tape structure as
+/// `Fast` — only the query count drops (574 -> 448) — which keeps the FL/node
+/// tape walkers unchanged. A 128-bit recursion keeps the 128-bit `Fast` leaf.
+fn chain_leaf_profile() -> LigeritoProfile {
+    match tower_profile() {
+        LigeritoProfile::Fast100 | LigeritoProfile::Slim100 => LigeritoProfile::Fast100,
+        _ => LigeritoProfile::Fast,
+    }
+}
+
 fn tower_fold_grinding() -> flock_core::matrix_fold::FoldGrinding {
     let profile = tower_profile();
     PcsParams {
@@ -14777,8 +14794,11 @@ fn build_chain_proof(h_start: [u32; 16], n_blocks: usize) -> ChainProof {
         let pcs_params = PcsParams {
             m: union.dense_m(),
             log_inv_rate: 1,
+            // The chain leaf's WORKLOAD inner: honor the tower profile's
+            // security level instead of always paying 128-bit Fast. A 100-bit
+            // recursion (slim100/fast100) should not carry a 128-bit leaf.
+            profile: chain_leaf_profile(),
             log_batch_size: pcs_batch(&union),
-            profile: LigeritoProfile::Fast,
             num_lanes: union.commit_lanes(pcs_batch(&union)),
             merkle_hash: HashKind::Blake3,
         };
