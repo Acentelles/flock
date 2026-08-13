@@ -1023,7 +1023,10 @@ mod tests {
         let mu = 7;
         let (f, g, sigma) = honest_instance(mu, 0x2468);
         let (mut proof, _) = run_prove(&f, &g, &sigma);
-        proof.v_open.ligerito.sumcheck_transcript[0].u_0.lo ^= 1;
+        proof.v_open.ligerito.sumcheck_transcript_f256[0]
+            .u_0
+            .c0
+            .lo ^= 1;
         let res = run_verify(mu, &f, &g, &sigma, &proof);
         assert!(matches!(res, Err(VerifyError::PcsOpen(_))), "got {res:?}");
     }

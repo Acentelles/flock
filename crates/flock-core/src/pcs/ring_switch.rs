@@ -3191,6 +3191,44 @@ pub fn eval_rs_eq_finish_from_prefix_binary_q(
     eval.fold_vertical(eq_r_dprime)
 }
 
+/// Extension-field prefix evaluation for an F128 statement point evaluated at
+/// F256 Ligerito fold challenges.
+pub fn eval_rs_eq_prefix_f256(
+    z_vals: &[F128],
+    query_prefix: &[crate::field::F256],
+) -> crate::pcs::tensor_algebra::TensorAlgebra256 {
+    use crate::pcs::tensor_algebra::TensorAlgebra256;
+    assert!(query_prefix.len() <= z_vals.len());
+    let mut eval = TensorAlgebra256::one();
+    for (&z, &q) in z_vals.iter().zip(query_prefix) {
+        let z_scaled = eval.clone().scale_vertical_base(z);
+        let q_scaled = eval.clone().scale_horizontal_extension(q);
+        eval += &z_scaled;
+        eval += &q_scaled;
+    }
+    eval
+}
+
+/// Finish an extension-field ring-switch basis evaluation at a binary
+/// residual suffix.
+pub fn eval_rs_eq_finish_from_prefix_binary_q_f256(
+    prefix: &crate::pcs::tensor_algebra::TensorAlgebra256,
+    z_vals_suffix: &[F128],
+    y_bits: u32,
+    eq_r_dprime: &[F128],
+) -> crate::field::F256 {
+    let mut eval = prefix.clone();
+    for (j, &z) in z_vals_suffix.iter().enumerate() {
+        let scalar = if (y_bits >> j) & 1 == 1 {
+            z
+        } else {
+            F128::ONE + z
+        };
+        eval = eval.scale_vertical_base(scalar);
+    }
+    eval.fold(eq_r_dprime)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3234,6 +3272,40 @@ mod tests {
                 &eq_r_dprime,
             );
             assert_eq!(general, binary, "y={y} mismatch");
+        }
+    }
+
+    /// The extension-valued tensor recurrence must agree with directly
+    /// evaluating the materialized ring-switch equality polynomial.  Testing
+    /// only subfield query points would not exercise the quadratic-extension
+    /// cross terms.
+    #[test]
+    fn eval_rs_eq_f256_matches_dense_at_extension_points() {
+        use crate::challenger::{Challenger, RandomChallenger};
+        use crate::field::F256;
+
+        let mut rng = RandomChallenger::new(0xF256_D315);
+        for log_n in 1..8 {
+            let z: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
+            let q: Vec<F256> = (0..log_n)
+                .map(|_| F256::new(rng.sample_f128(), rng.sample_f128()))
+                .collect();
+            let coeffs: Vec<F128> = (0..(1 << LOG_PACKING))
+                .map(|_| rng.sample_f128())
+                .collect();
+
+            let dense = fold_b128_elems(&build_eq(&z), &coeffs);
+            let mut folded: Vec<F256> = dense.into_iter().map(F256::from).collect();
+            for &r in &q {
+                folded = folded
+                    .chunks_exact(2)
+                    .map(|pair| pair[0] + r * (pair[0] + pair[1]))
+                    .collect();
+            }
+            assert_eq!(folded.len(), 1);
+
+            let prefix = eval_rs_eq_prefix_f256(&z, &q);
+            assert_eq!(prefix.fold(&coeffs), folded[0], "log_n={log_n}");
         }
     }
 

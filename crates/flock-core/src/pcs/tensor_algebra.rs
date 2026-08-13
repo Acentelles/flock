@@ -16,7 +16,7 @@
 //!
 //! Used by the verifier's polylog `eval_rs_eq` (DP24 §1.3, Figure 3).
 
-use crate::field::F128;
+use crate::field::{F128, F256};
 use core::ops::{Add, AddAssign};
 
 /// The degree of `F_{2^128}` over `F_2`.
@@ -108,6 +108,62 @@ impl AddAssign<&TensorAlgebra> for TensorAlgebra {
         for (a, b) in self.elems.iter_mut().zip(rhs.elems.iter()) {
             *a = *a + *b;
         }
+    }
+}
+
+/// An element of `F128 tensor F256`, represented as two ordinary tensor
+/// values in the canonical quadratic-extension basis.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TensorAlgebra256 {
+    pub c0: TensorAlgebra,
+    pub c1: TensorAlgebra,
+}
+
+impl TensorAlgebra256 {
+    pub fn one() -> Self {
+        Self {
+            c0: TensorAlgebra::one(),
+            c1: TensorAlgebra::zero(),
+        }
+    }
+
+    pub fn scale_vertical_base(mut self, scalar: F128) -> Self {
+        for value in &mut self.c0.elems {
+            *value *= scalar;
+        }
+        for value in &mut self.c1.elems {
+            *value *= scalar;
+        }
+        self
+    }
+
+    pub fn scale_horizontal_extension(self, scalar: F256) -> Self {
+        let mut sum = self.c0.clone();
+        sum += &self.c1;
+        let p0 = self.c0.scale_horizontal(scalar.c0);
+        let p1 = self.c1.scale_horizontal(scalar.c1);
+        let p2 = sum.scale_horizontal(scalar.c0 + scalar.c1);
+        let mut c0 = p0.clone();
+        c0 += &p1
+            .clone()
+            .scale_horizontal(crate::field::QUADRATIC_NONRESIDUE);
+        let mut c1 = p2;
+        c1 += &p0;
+        Self { c0, c1 }
+    }
+
+    pub fn fold(self, coeffs: &[F128]) -> F256 {
+        F256::new(
+            self.c0.fold_vertical(coeffs),
+            self.c1.fold_vertical(coeffs),
+        )
+    }
+}
+
+impl AddAssign<&TensorAlgebra256> for TensorAlgebra256 {
+    fn add_assign(&mut self, rhs: &TensorAlgebra256) {
+        self.c0 += &rhs.c0;
+        self.c1 += &rhs.c1;
     }
 }
 

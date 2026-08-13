@@ -7,10 +7,11 @@
 
 //! Ligerito: recursive multilinear PCS.
 //!
-//! Ported from bolt-rs (`ligerito_recursive.rs`) onto Flock primitives:
-//! `F128` (GHASH irreducible), [`AdditiveNttF128`] (LCH novel basis,
-//! byte-identical to bolt-rs's FFT), SHA-256 merkle from [`crate::merkle`],
-//! and the [`Challenger`] trait for Fiat-Shamir.
+//! Ported from bolt-rs (`ligerito_recursive.rs`) onto Flock primitives. The
+//! committed Reed--Solomon words remain in `F128` (GHASH irreducible) and use
+//! [`AdditiveNttF128`], while fold challenges and running sumcheck claims use
+//! the quadratic extension `F256`. Merkle commitments come from
+//! [`crate::merkle`] and Fiat--Shamir from [`Challenger`].
 //!
 //! Soundness regimes (our paper App. C.3): unique decoding (Thm `ca-udr`,
 //! BCHKS25 Cor. 1.4, `Secure` profile) and Johnson list decoding with
@@ -30,12 +31,14 @@
 //!    c. Else: commit f^{i+2}, open f^{i+1}, induce next basis, glue.
 
 use crate::challenger::Challenger;
-use crate::field::{F128, F256Unreduced};
+use crate::field::{F128, F256, F256Unreduced};
 use crate::lincheck::build_eq_table;
 use crate::merkle::{self, Hash, HashKind};
 use crate::ntt::additive_ntt_f128::AdditiveNttF128;
 use crate::pcs::stratified;
 use serde::{Deserialize, Serialize};
+
+pub(crate) mod extension;
 
 // ===================================================================
 // Config
@@ -53,13 +56,12 @@ use serde::{Deserialize, Serialize};
 /// config" from the raw code rate: `Fast` and `Secure` share rate 1/2 but
 /// differ in regime/target, so the rate alone cannot key the config lookup.
 ///
-/// - `Fast`:   rate 1/2, Johnson list-decoding regime with OOD binding. Its
-///             query component is 128-bit; MCA remains at the 100-bit profile
-///             target until it is evaluated over the intended F256 field.
-///             Default.
+/// - `Fast`:   rate 1/2, Johnson list-decoding regime with two-point OOD
+///             binding. Its query component is 128-bit and its MCA/fold
+///             arithmetic is over F256. Default.
 /// - `Slim`:   rate 1/4, Johnson + OOD + 16-bit query grinding. Its combined
-///             query work factor is 128-bit; MCA remains at the 100-bit
-///             profile target. Roughly half the proof, ~2x L0 encoding work.
+///             query work factor is 128-bit and its MCA/fold arithmetic is
+///             over F256. Roughly half the proof, ~2x L0 encoding work.
 /// - `Secure`: rate 1/2, unique-decoding regime (list size 1, no OOD),
 ///             120-bit overall soundness. Largest proof, most conservative
 ///             analysis.
@@ -95,9 +97,11 @@ impl LigeritoProfile {
             Self::Slim | Self::Slim100 => 2,
         }
     }
-    /// Round-by-round soundness target (bits) the profile's configs are derived
-    /// for: every round must individually clear this level (total security =
-    /// min over rounds, per the Fiat-Shamir / `soundcalc` convention).
+    /// Historical profile-local target. Strict Fast/Slim configs retain the
+    /// value 100 for compatibility but independently override every Johnson
+    /// component to the 128-bit floors enforced by `validate()`; Fast100 and
+    /// Slim100 keep the 100-bit query floor, and Secure keeps its 120-bit UDR
+    /// query floor.
     pub fn security_bits(self) -> usize {
         match self {
             Self::Fast | Self::Fast100 | Self::Slim | Self::Slim100 => 100,
@@ -279,8 +283,9 @@ impl VerifierConfig {
 /// unique-decoding radius `γ = δ/2` with no backoff. Per our paper's Appendix
 /// C.3 (Theorem `ca-udr`, BCHKS25 Cor. 1.4) the proximity-gap exceptional set
 /// is then `a = γ·n + 1` — length-dependent (see [`paper_thm_1_4_log_a`]), so
-/// `eps_pg = 128 − log₂ a` shrinks ~1 bit per witness doubling and is
-/// recovered by `fold_grinding_bits`.
+/// `eps_pg = 256 − log₂ a` shrinks ~1 bit per witness doubling. The quadratic
+/// extension leaves ample margin for the shipped shapes, so their
+/// `fold_grinding_bits` are zero.
 pub const UDR_PROXIMITY_LOSS: f64 = 0.0;
 
 /// Soundness (in bits) the query phase must close on its own at every level
@@ -319,7 +324,9 @@ pub fn udr_queries(log_inv_rate: usize) -> usize {
 /// and `log_inv_rate` come from `PcsParams` (Ligerito's `initial_k` matches
 /// `log_batch_size` for L0 reuse; the first rate matches `log_inv_rate`).
 ///
-/// Strategy: 3-bit recursive folds (`k_i = 3`) with **decreasing rate**
+/// Strategy: three original-variable folds per recursive level plus the
+/// coordinate bit introduced by the F256-to-F128 code switch (`k_i = 4`),
+/// with **decreasing rate**
 /// (one rate step per recursive level) until the residual is small (`≤ 5` bits).
 /// Asserts that the chosen rate keeps `block_len ≥ udr_queries(rate)` at
 /// every level; if not, bumps the rate further.
@@ -352,8 +359,9 @@ pub fn default_config(
     }
 
     while n_running > 5 {
-        let k = 3.min(n_running);
-        let log_msg_cols_next = n_running - k;
+        let original_folds = 3.min(n_running);
+        let k = original_folds + 1;
+        let log_msg_cols_next = n_running - original_folds;
         // Pick the smallest rate ≥ rate_running+1 such that block_len ≥ queries.
         let mut next_rate = rate_running + 1;
         loop {
@@ -370,7 +378,7 @@ pub fn default_config(
         recursive_log_msg_cols.push(log_msg_cols_next);
         recursive_ks.push(k);
         log_inv_rates.push(next_rate);
-        n_running -= k;
+        n_running -= original_folds;
         rate_running = next_rate;
     }
 
@@ -412,9 +420,11 @@ struct LadderShape {
 }
 
 /// Shared shape derivation behind [`default_config`] and
-/// [`LigeritoSecurityConfig::derive_profile`]: 3-bit recursive folds with the
-/// rate index increasing by ≥ 1 per level, bumped further whenever the block
-/// length is narrower than `queries_at_rate(rate)`.
+/// [`LigeritoSecurityConfig::derive_profile`]: each recursive commitment adds
+/// one base-coordinate bit, so a four-round level removes three variables
+/// from the extension table. The rate index increases by ≥ 1 per level,
+/// bumped further whenever the block length is narrower than
+/// `queries_at_rate(rate)`.
 ///
 /// That width rule is a **proof-size convention, not a soundness bound**:
 /// [`sample_queries`] draws with replacement and stays sound for any width
@@ -444,8 +454,9 @@ fn derive_ladder_shape(
         return Err("L0 block_len < queries — log_n too small for chosen rate".into());
     }
     while n_running > 5 {
-        let k = 3.min(n_running);
-        let log_msg_cols_next = n_running - k;
+        let original_folds = 3.min(n_running);
+        let k = original_folds + 1;
+        let log_msg_cols_next = n_running - original_folds;
         let mut next_rate = rate_running + 1;
         loop {
             if (1usize << (log_msg_cols_next + next_rate)) >= queries_at_rate(next_rate) {
@@ -460,7 +471,7 @@ fn derive_ladder_shape(
         shape.log_msg_cols.push(log_msg_cols_next);
         shape.log_num_interleaved.push(k);
         shape.k_recursive.push(k);
-        n_running -= k;
+        n_running -= original_folds;
         rate_running = next_rate;
     }
     if shape.k_recursive.len() < 2 {
@@ -640,13 +651,14 @@ pub enum SoundnessRegime {
     /// Appendix C.3 (adapted from Ben-Sasson–Carmon–Haböck–Kopparty–Saraf
     /// "On Proximity Gaps for Reed–Solomon Codes", 2025, Corollary 1.4): the
     /// exceptional set is `a = γ·n + 1`, growing with the codeword length `n`,
-    /// so the proximity-gap term is recovered per level by `fold_grinding_bits`
-    /// rather than coming out 0. `eta` is `None` for this regime.
+    /// so the proximity-gap term is length-dependent. Fold/MCA arithmetic is
+    /// over F256; `eta` is `None` for this regime.
     Udr,
     /// Johnson radius with explicit slack `η` (γ = (1 − √ρ) − η) **with
     /// out-of-domain binding**. Theorem 1.5 of the same paper gives the
     /// proximity-gap exceptional set `a = O_ρ(n / η^5)`; the level's
-    /// `fold_grinding_bits` should be ≥ (target_bits − log₂(q/a)).
+    /// `fold_grinding_bits` should be ≥ (target_bits − log₂(q²/a)) when the
+    /// fold challenge is sampled in F256.
     /// Binding to a single codeword of the (Johnson-bounded) interleaved list
     /// uses two independent post-commit multilinear evaluations. At L0 the
     /// opening's ordinary evaluation supplies the first and `ood_samples = 1`
@@ -748,7 +760,8 @@ pub struct LigeritoLevelConfig {
     #[serde(default)]
     pub expected_eps_claim_batch_bits: f64,
     /// Diagnostic -- unground per-round sumcheck bits
-    /// `128 - log2(2 * L_max)` from the Flock paper's Appendix C.3.
+    /// `256 - log2(2 * L_max)` from the Flock paper's Appendix C.3, because
+    /// the sumcheck challenge and running claim are in F256.
     #[serde(default)]
     pub expected_eps_sumcheck_bits: f64,
     /// Diagnostic -- unground queried-consistency batching bits
@@ -762,8 +775,8 @@ pub struct LigeritoLevelConfig {
 /// only meaningful parameter is its dimension.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FinalBlockConfig {
-    /// `log_2(|yr|)` — number of F128 values sent in the clear. The last
-    /// recursive level's sumcheck stops at this dim instead of folding to 1.
+    /// Dimension of the final extension table. The clear residual contains
+    /// `2^(yr_log_n + 1)` F128 words after its final coordinate split.
     pub yr_log_n: usize,
 }
 
@@ -771,7 +784,8 @@ pub struct FinalBlockConfig {
 /// `(hash, m)` pair. Designed to round-trip cleanly via serde (TOML/JSON).
 ///
 /// **Validation invariants** (checked by [`Self::validate`]):
-/// 1. `initial_k + Σ levels[1..].k_recursive + final_block.yr_log_n == log_n`.
+/// 1. `initial_k + Σ levels[1..](k_recursive - 1) +
+///    final_block.yr_log_n == log_n`.
 /// 2. Each level's `expected_eps_pg_bits` is consistent with the declared
 ///    regime and `eta` (within tolerance).
 /// 3. Each level's `expected_eps_query_bits ≥ target_security_bits −
@@ -799,7 +813,8 @@ pub struct LigeritoSecurityConfig {
     /// theorem the per-level parameters were derived from. Example:
     /// `"ben_sasson_2025_thm_4_6"`.
     pub analysis_version: String,
-    /// Field of the protocol. Example: `"f128"`.
+    /// Field used by the fold/MCA arithmetic. Commitments remain over F128.
+    /// The implemented secure value is `"f256"`.
     pub field: String,
     /// Hash function used by the Merkle commitments: `"sha256"` or
     /// `"blake3"`. Read via [`LigeritoSecurityConfig::merkle_hash`] and
@@ -823,11 +838,18 @@ pub struct LigeritoSecurityConfig {
     pub final_block: FinalBlockConfig,
 }
 
-/// Default field size used for soundness analysis: `q = 2^128` (our F128).
-const ANALYSIS_LOG_Q: f64 = 128.0;
-/// OOD list binding is a 128-bit component even while the Fast/Slim MCA
-/// profiles still carry their original 100-bit target.
+/// Base field used by commitments, OOD points and answers, and the batching
+/// challenges that retain their existing grinding schedules.
+const BASE_FIELD_LOG_Q: f64 = 128.0;
+/// Quadratic extension used by every recursive fold challenge and running
+/// sumcheck claim.
+const FOLD_FIELD_LOG_Q: f64 = 256.0;
+/// OOD list binding is a 128-bit base-field component.
 const OOD_BINDING_TARGET_BITS: f64 = 128.0;
+/// The correlated-agreement/proximity term is evaluated over F256 and must
+/// independently be strictly below 2^-128 in every shipped profile. The
+/// legacy profile target still controls its query schedule, not this floor.
+const MCA_TARGET_BITS: f64 = 128.0;
 /// Algebraic error terms in Appendix C.3 of "Flock: Fast Proving for Batch
 /// Boolean Computations" are required to be strictly below 2^-128,
 /// independently of the legacy MCA target.
@@ -898,13 +920,14 @@ fn algebraic_grinding_schedule(
     let claim_log_num = log2_l;
     let sumcheck_log_num = 1.0 + log2_l;
     let consistency_log_num = log2_l + log2_consistency_degree;
+    let sumcheck_bits = FOLD_FIELD_LOG_Q - sumcheck_log_num;
     (
         strict_grinding_bits(claim_log_num),
-        strict_grinding_bits(sumcheck_log_num),
+        strict_grinding_bits(ALGEBRAIC_TARGET_BITS - sumcheck_bits),
         strict_grinding_bits(consistency_log_num),
-        ANALYSIS_LOG_Q - claim_log_num,
-        ANALYSIS_LOG_Q - sumcheck_log_num,
-        ANALYSIS_LOG_Q - consistency_log_num,
+        BASE_FIELD_LOG_Q - claim_log_num,
+        sumcheck_bits,
+        BASE_FIELD_LOG_Q - consistency_log_num,
     )
 }
 
@@ -1025,8 +1048,8 @@ fn udr_per_query_bits_asymptotic(log_inv_rate: usize) -> f64 {
 ///
 /// where `n = 2^(log_msg_cols + log_inv_rate)` is the codeword length at this
 /// level. The `log₂ a ≈ log₂(γ·n)` term therefore **grows with the codeword
-/// length**, so larger witnesses give a smaller `eps_pg = 128 − log₂ a` and
-/// need proportionally more `fold_grinding_bits` to hold a fixed target.
+/// length**, so larger witnesses give a smaller `eps_pg = 256 − log₂ a`.
+/// The shipped F256 shapes still remain well above the component target.
 /// Callers add **no** row-union penalty in this regime: the unique-decoding
 /// list has size 1, so (per Diamond and Gruen) MCA-commutes holds with error
 /// ε directly, unlike the Johnson regime's `2^{ℓ-1}` factor. This replaced an
@@ -1087,7 +1110,7 @@ fn paper_ood_bits(log_inv_rate: usize, eta: f64, mu_vars: usize, total_samples: 
     debug_assert!(total_samples >= 1);
     let log2_l = johnson_interleaved_list_log2(log_inv_rate, eta);
     let log2_mu = (mu_vars as f64).log2();
-    total_samples as f64 * (ANALYSIS_LOG_Q - log2_mu) - (2.0 * log2_l - 1.0)
+    total_samples as f64 * (BASE_FIELD_LOG_Q - log2_mu) - (2.0 * log2_l - 1.0)
 }
 
 impl LigeritoLevelConfig {
@@ -1108,9 +1131,9 @@ impl LigeritoLevelConfig {
             (consistency_degree as f64).log2()
         };
         (
-            ANALYSIS_LOG_Q - log2_l,
-            ANALYSIS_LOG_Q - (1.0 + log2_l),
-            ANALYSIS_LOG_Q - (log2_l + log2_consistency_degree),
+            BASE_FIELD_LOG_Q - log2_l,
+            FOLD_FIELD_LOG_Q - (1.0 + log2_l),
+            BASE_FIELD_LOG_Q - (log2_l + log2_consistency_degree),
         )
     }
 
@@ -1137,7 +1160,7 @@ impl LigeritoLevelConfig {
                     self.log_msg_cols,
                     self.log_num_interleaved,
                 );
-                let eps_pg = ANALYSIS_LOG_Q - log_a;
+                let eps_pg = FOLD_FIELD_LOG_Q - log_a;
                 // Per-query soundness WITHOUT a list union bound — the OOD
                 // binding (see `paper_ood_bits`) pins the prover to a single
                 // codeword of the interleaved list before queries are drawn.
@@ -1154,10 +1177,10 @@ impl LigeritoLevelConfig {
                 // No row-union penalty in the unique-decoding regime: the list
                 // has size 1, so (per Diamond and Gruen) the MCA-commutes step
                 // holds with error ε directly — the Johnson regime's 2^{ℓ-1}
-                // row union is unnecessary. So eps_pg = 128 − log₂ a.
+                // row union is unnecessary. So eps_pg = 256 − log₂ a.
                 let log_a =
                     paper_thm_1_4_log_a(self.log_inv_rate, self.log_msg_cols, proximity_loss);
-                let eps_pg = ANALYSIS_LOG_Q - log_a;
+                let eps_pg = FOLD_FIELD_LOG_Q - log_a;
                 let per_q =
                     udr_per_query_bits(self.log_inv_rate, self.log_msg_cols, proximity_loss);
                 let eps_query = self.queries as f64 * per_q;
@@ -1196,17 +1219,28 @@ impl LigeritoSecurityConfig {
                 self.log_n, self.m
             ));
         }
+        if self.field != "f256" {
+            return Err(format!(
+                "security config `field` must be f256 for correlated-agreement folds, got {:?}",
+                self.field
+            ));
+        }
 
         // Reject a `hash` we do not implement here, so a bad spelling is caught
         // at config-load time rather than silently committing under SHA-256.
         self.merkle_hash()?;
 
-        // Recursion shape: initial_k + Σ k_recursive (L1+) + yr_log_n = log_n.
-        let levels_recursive_sum: usize = self.levels.iter().skip(1).map(|lv| lv.k_recursive).sum();
+        // Each recursive level spends one fold on its coordinate bit.
+        let levels_recursive_sum: usize = self
+            .levels
+            .iter()
+            .skip(1)
+            .map(|lv| lv.k_recursive.saturating_sub(1))
+            .sum();
         let yr_log_n = self.final_block.yr_log_n;
         if self.initial_k + levels_recursive_sum + yr_log_n != self.log_n {
             return Err(format!(
-                "shape mismatch: initial_k ({}) + Σ k_recursive ({}) + yr_log_n ({}) = {} ≠ log_n ({})",
+                "shape mismatch: initial_k ({}) + Σ(k_recursive - 1) ({}) + yr_log_n ({}) = {} ≠ log_n ({})",
                 self.initial_k,
                 levels_recursive_sum,
                 yr_log_n,
@@ -1236,6 +1270,9 @@ impl LigeritoSecurityConfig {
         // Per-level checks.
         let mut dim_in = self.log_n;
         for (i, lv) in self.levels.iter().enumerate() {
+            if i != 0 {
+                dim_in += 1;
+            }
             // Shape: log_msg_cols + log_num_interleaved = dim_in.
             if lv.log_msg_cols + lv.log_num_interleaved != dim_in {
                 return Err(format!(
@@ -1452,10 +1489,24 @@ impl LigeritoSecurityConfig {
                 }
             }
 
+            // The F256 proximity/MCA component is independently required to
+            // be strictly below 2^-128. Use the exact prediction rather than
+            // the rounded TOML diagnostic. The profile-local check below is
+            // retained for compatibility profiles with a separate query
+            // target.
+            let delivered_pg = pg_pred + lv.fold_grinding_bits as f64;
+            if delivered_pg <= MCA_TARGET_BITS {
+                return Err(format!(
+                    "L{i}: F256 MCA soundness ({pg_pred:.6} + {} grinding = \
+                     {delivered_pg:.6} bits) must be strictly above \
+                     {MCA_TARGET_BITS} bits",
+                    lv.fold_grinding_bits
+                ));
+            }
+
             // Per-application proximity gap + fold-challenge grinding must
-            // reach target. (The pg bad event lives on the fold challenges,
-            // so only the fold grind — done before each fold challenge —
-            // boosts it; the query-phase grind does not.)
+            // also reach the profile-local target. The pg bad event lives on
+            // the fold challenges, so query-phase grinding does not apply.
             if lv.expected_eps_pg_bits + lv.fold_grinding_bits as f64 + 1e-3
                 < lv.target_security_bits as f64
             {
@@ -1465,25 +1516,26 @@ impl LigeritoSecurityConfig {
                 ));
             }
 
-            // OOD binding is independently a 128-bit component even though
-            // the Johnson MCA/proximity profile still targets 100 bits.
-            if let Some(ood) = lv.expected_eps_ood_bits
-                && ood + 1e-3 < OOD_BINDING_TARGET_BITS
+            // OOD binding is independently and strictly a 128-bit component.
+            // Again use the exact formula, not its one-decimal diagnostic.
+            if let Some(ood) = lv.paper_predicted_ood_bits(usize::from(i == 0))
+                && ood <= OOD_BINDING_TARGET_BITS
             {
                 return Err(format!(
-                    "L{i}: expected_eps_ood_bits ({ood:.2}) < OOD target \
-                     ({OOD_BINDING_TARGET_BITS}); increase ood_samples"
+                    "L{i}: OOD soundness ({ood:.6} bits) must be strictly \
+                     above {OOD_BINDING_TARGET_BITS}; increase ood_samples"
                 ));
             }
 
             if lv.target_security_bits < self.target_security_bits {
                 return Err(format!(
-                    "L{i}: target_security_bits ({}) < global target ({})",
+                    "L{i}: target_security_bits ({}) < config target ({})",
                     lv.target_security_bits, self.target_security_bits
                 ));
             }
 
-            // Advance dim_in for next level: subtract k_recursive (the folds at this level).
+            // Recursive inputs include one coordinate bit added at their code
+            // switch; subtracting all k rounds leaves the extension dimension.
             dim_in -= lv.k_recursive;
         }
 
@@ -1511,9 +1563,9 @@ impl LigeritoSecurityConfig {
     ///     close the target; per the "100 bits from queries always" policy).
     ///   * `expected_eps_pg_bits + fold_grinding_bits ≥ target_security_bits`.
     ///     Under Thm `ca-udr` the exceptional set is `a = γ·n + 1`
-    ///     (length-dependent), so `eps_pg = 128 − log₂(γ·n+1) − log₂(log L)`
-    ///     decreases with witness size; any shortfall below target is made up
-    ///     by `fold_grinding_bits` (query-phase `grinding_bits` stays 0).
+    ///     (length-dependent), so `eps_pg = 256 − log₂(γ·n+1)` decreases with
+    ///     witness size; any shortfall below target is made up by
+    ///     `fold_grinding_bits` (query-phase `grinding_bits` stays 0).
     ///
     /// All diagnostic fields are populated from the paper formulas so the
     /// resulting config validates strictly against [`Self::validate`].
@@ -1555,7 +1607,7 @@ impl LigeritoSecurityConfig {
             // per Diamond and Gruen, MCA-commutes holds with error ε directly,
             // unlike the Johnson regime's 2^{ℓ-1} row union.
             let log_a = paper_thm_1_4_log_a(rate, log_msg_cols_per_level[i], proximity_loss);
-            let eps_pg = ANALYSIS_LOG_Q - log_a;
+            let eps_pg = FOLD_FIELD_LOG_Q - log_a;
             // Any pg shortfall is ground on the fold challenges (where the
             // pg bad event lives); 0 at the 100-bit target.
             let proximity_fold_grinding_bits =
@@ -1593,16 +1645,16 @@ impl LigeritoSecurityConfig {
                 expected_eps_consistency_batch_bits: round1(eps_consistency_batch),
             });
         }
-        // Final residual: yr_log_n = log_n − initial_k − Σ k_recursive
-        let total_recursive: usize = prover.recursive_ks.iter().sum();
+        // One recursive fold per level consumes its coordinate bit.
+        let total_recursive: usize = prover.recursive_ks.iter().map(|&k| k - 1).sum();
         let yr_log_n = log_n - initial_k - total_recursive;
         let cfg = Self {
             m,
             log_n,
             initial_k,
             target_security_bits,
-            analysis_version: "no_row_union_over_ben_sasson_2025_cor_1_4".into(),
-            field: "f128".into(),
+            analysis_version: "f256_split_no_row_union_over_ben_sasson_2025_cor_1_4".into(),
+            field: "f256".into(),
             hash: "sha256".into(),
             grinding_step: GrindingStep::PostCommitPreQueries,
             levels,
@@ -1620,11 +1672,11 @@ impl LigeritoSecurityConfig {
     /// Fiat-Shamir security (cf. Ethereum's `soundcalc`), not a whole-protocol
     /// union bound over terms. The three shipped profiles:
     ///
-    /// - `Fast`:   JohnsonOod, rate 1/2, η = 0.02, 128-bit query component;
-    ///             the deferred MCA component retains its 100-bit target.
+    /// - `Fast`:   JohnsonOod, rate 1/2, η = 0.02, 128-bit query component
+    ///             and F256 MCA arithmetic.
     /// - `Slim`:   JohnsonOod, rate 1/4, η = 0.02, 16-bit query grinding at
-    ///             every level, 128-bit combined query work factor; the
-    ///             deferred MCA component retains its 100-bit target.
+    ///             every level, 128-bit combined query work factor, and F256
+    ///             MCA arithmetic.
     /// - `Secure`: Udr, rate 1/2, ε* = 1e-3, 120 bits per round.
     pub fn derive_profile(m: usize, profile: LigeritoProfile) -> Result<Self, String> {
         /// Johnson slack below the Johnson radius, flat across levels.
@@ -1754,8 +1806,8 @@ impl LigeritoSecurityConfig {
                     // No row-union penalty in the unique-decoding regime (list
                     // size 1): per Diamond and Gruen, MCA-commutes holds with
                     // error ε directly (vs the Johnson regime's 2^{ℓ-1} factor).
-                    let eps_pg =
-                        ANALYSIS_LOG_Q - paper_thm_1_4_log_a(rate, cols, UDR_PROXIMITY_LOSS);
+                    let eps_pg = FOLD_FIELD_LOG_Q
+                        - paper_thm_1_4_log_a(rate, cols, UDR_PROXIMITY_LOSS);
                     (
                         SoundnessRegime::Udr,
                         None,
@@ -1769,7 +1821,8 @@ impl LigeritoSecurityConfig {
                 | LigeritoProfile::Fast100
                 | LigeritoProfile::Slim
                 | LigeritoProfile::Slim100 => {
-                    let eps_pg = ANALYSIS_LOG_Q - paper_johnson_log_a(rate, JOHNSON_ETA, cols, ilv);
+                    let eps_pg =
+                        FOLD_FIELD_LOG_Q - paper_johnson_log_a(rate, JOHNSON_ETA, cols, ilv);
                     let mu = cols + ilv;
                     // Two independent binding points at every commitment.
                     // L0's ordinary opening point is already post-commit and
@@ -1800,8 +1853,8 @@ impl LigeritoSecurityConfig {
             // One fold challenge carries both bad events from the Flock
             // paper's Appendix C.3. A single PoW therefore protects both, at
             // the larger requirement.
-            // The MCA target remains profile-local here; its stronger
-            // configuration uses arithmetic over the intended F256 field.
+            // F256 makes this zero for the shipped shapes; validation still
+            // enforces the independent strict 128-bit MCA floor.
             let fold_grinding_bits = proximity_fold_grinding_bits.max(sumcheck_grinding_bits);
 
             levels.push(LigeritoLevelConfig {
@@ -1829,14 +1882,16 @@ impl LigeritoSecurityConfig {
         }
 
         let analysis_version = match profile {
-            LigeritoProfile::Secure => "no_row_union_over_ben_sasson_2025_cor_1_4",
+            LigeritoProfile::Secure => {
+                "f256_split_no_row_union_over_ben_sasson_2025_cor_1_4"
+            }
             LigeritoProfile::Fast | LigeritoProfile::Slim => {
-                "johnson_two_point_ood_query128_c3_algebraic_row_union_over_bchks25_thm_4_6"
+                "f256_split_johnson_two_point_ood_query128_c3_algebraic_row_union_over_bchks25_thm_4_6"
             }
             // Same analysis as Fast; only the query term's target differs
             // (the profile's own 100 bits, the pre-list-decoding schedule).
             LigeritoProfile::Fast100 | LigeritoProfile::Slim100 => {
-                "johnson_two_point_ood_query100_c3_algebraic_row_union_over_bchks25_thm_4_6"
+                "f256_split_johnson_two_point_ood_query100_c3_algebraic_row_union_over_bchks25_thm_4_6"
             }
         };
         let cfg = Self {
@@ -1845,7 +1900,7 @@ impl LigeritoSecurityConfig {
             initial_k,
             target_security_bits: target_bits,
             analysis_version: analysis_version.into(),
-            field: "f128".into(),
+            field: "f256".into(),
             hash: "sha256".into(),
             grinding_step: GrindingStep::PostCommitPreQueries,
             levels,
@@ -1996,6 +2051,10 @@ pub struct LigeritoProof {
     pub recursive_proofs: Vec<RecursiveProof>,
     pub final_proof: FinalProof,
     pub sumcheck_transcript: Vec<SumcheckMessage>,
+    /// Sumcheck messages whose running claim and fold challenges are in the
+    /// quadratic extension. Empty for legacy base-field proofs.
+    #[serde(default)]
+    pub sumcheck_transcript_f256: Vec<SumcheckMessage256>,
     /// Per-level PoW nonces (one entry per query phase). When all
     /// `grinding_bits` are 0 (the default config), each entry is just 0
     /// and the verifier's PoW check is a no-op. `#[serde(default)]` keeps
@@ -2044,6 +2103,7 @@ impl LigeritoProof {
                 .sum::<usize>()
             + self.final_proof.merkle_proof.len() * 32;
         total += self.sumcheck_transcript.len() * 2 * ELEM;
+        total += self.sumcheck_transcript_f256.len() * 4 * ELEM;
         total += self.ood_values.len() * ELEM;
         total += (self.grinding_nonces.len()
             + self.fold_grinding_nonces.len()
@@ -2126,15 +2186,20 @@ impl LigeritoProof {
         );
         total_opened += final_opened;
         total_merkle += final_merkle;
-        let tx_b = self.sumcheck_transcript.len() * 2 * ELEM;
+        let tx_base_b = self.sumcheck_transcript.len() * 2 * ELEM;
+        let tx_f256_b = self.sumcheck_transcript_f256.len() * 4 * ELEM;
+        let tx_b = tx_base_b + tx_f256_b;
         eprintln!(
-            "  TOTALS: roots={}  opened={}  merkle={}  yr={}  transcript={} ({}×2×{}B)  GRAND={}",
+            "  TOTALS: roots={}  opened={}  merkle={}  yr={}  transcript={} \
+             (base {}×2×{}B + F256 {}×4×{}B)  GRAND={}",
             kb(roots_b),
             kb(total_opened),
             kb(total_merkle),
             kb(yr_b),
             kb(tx_b),
             self.sumcheck_transcript.len(),
+            ELEM,
+            self.sumcheck_transcript_f256.len(),
             ELEM,
             kb(self.size_bytes()),
         );
@@ -2931,6 +2996,14 @@ pub(crate) fn ligero_commit(
 pub struct SumcheckMessage {
     pub u_0: F128,
     pub u_2: F128,
+}
+
+/// `(u_0, u_2)` for a sumcheck whose challenges and running claim live in the
+/// quadratic extension field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SumcheckMessage256 {
+    pub u_0: F256,
+    pub u_2: F256,
 }
 
 /// Round-quadratic in coefficient form `c + b·X + a·X²`. Used by the verifier
@@ -4326,7 +4399,7 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
     l0_tree: &[Hash],
     challenger: &mut Ch,
 ) -> LigeritoProof {
-    recursive_prover_with_basis_impl(
+    extension::recursive_prover_with_basis_impl(
         config,
         packed_witness,
         b_initial,
@@ -4335,13 +4408,11 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
         l0_tree,
         1usize << config.initial_k,
         false,
-        usize::MAX,
         None,
         None,
         None,
         challenger,
     )
-    .0
 }
 
 /// Variant of [`recursive_prover_with_basis`] that accepts the round-0 sumcheck
@@ -4360,7 +4431,7 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
     round0_uv: (F128, F128),
     challenger: &mut Ch,
 ) -> LigeritoProof {
-    recursive_prover_with_basis_impl(
+    extension::recursive_prover_with_basis_impl(
         config,
         packed_witness,
         b_initial,
@@ -4369,7 +4440,6 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
         l0_tree,
         1usize << config.initial_k,
         false,
-        usize::MAX,
         None,
         None,
         Some(SumcheckMessage {
@@ -4378,7 +4448,6 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
         }),
         challenger,
     )
-    .0
 }
 
 /// Lane-aware variant of [`recursive_prover_with_basis_precomputed_round0`]
@@ -4406,7 +4475,7 @@ pub(crate) fn recursive_prover_with_basis_precomputed_round0_lanes<Ch: Challenge
     l0_virtual_basis: Option<VirtualEqBasis>,
     challenger: &mut Ch,
 ) -> LigeritoProof {
-    recursive_prover_with_basis_impl(
+    extension::recursive_prover_with_basis_impl(
         config,
         packed_witness,
         b_initial,
@@ -4415,7 +4484,6 @@ pub(crate) fn recursive_prover_with_basis_precomputed_round0_lanes<Ch: Challenge
         l0_tree,
         l0_num_lanes,
         l0_lane_major,
-        usize::MAX,
         l0_jit_basis,
         l0_virtual_basis,
         Some(SumcheckMessage {
@@ -4424,7 +4492,6 @@ pub(crate) fn recursive_prover_with_basis_precomputed_round0_lanes<Ch: Challenge
         }),
         challenger,
     )
-    .0
 }
 
 /// Shared body of the `recursive_prover_with_basis*` entries. Returns the
@@ -4918,6 +4985,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                         merkle_proof: merkle_proof_last,
                     },
                     sumcheck_transcript: sc_prover.transcript().to_vec(),
+                    sumcheck_transcript_f256: Vec::new(),
                     grinding_nonces,
                     ood_values,
                     fold_grinding_nonces,
@@ -6540,6 +6608,7 @@ fn recursive_prover_inner<Ch: Challenger>(
                     merkle_proof: merkle_proof_last,
                 },
                 sumcheck_transcript: sc_prover.transcript().to_vec(),
+                sumcheck_transcript_f256: Vec::new(),
                 grinding_nonces: Vec::new(), // legacy recursive_prover_inner: no grinding plumbed
                 ood_values: Vec::new(),
                 fold_grinding_nonces: Vec::new(),
@@ -7072,11 +7141,12 @@ mod tests {
         // Fast = JohnsonOod profile: 279 L0 queries put the query term
         // strictly below 2^-128 (no list union bound — single-codeword
         // binding via the opening claim / OOD samples). The MCA/proximity
-        // shortfall remains covered separately by fold-challenge grinding.
+        // algebraic terms are evaluated over F256.
         assert_eq!(cfg.levels[0].regime, SoundnessRegime::JohnsonOod);
         assert_eq!(cfg.levels[0].queries, 279);
         assert_eq!(cfg.levels[0].grinding_bits, 0);
-        assert!(cfg.levels[0].fold_grinding_bits > 0);
+        assert!(cfg.levels.iter().all(|lv| lv.fold_grinding_bits == 0));
+        assert_eq!(cfg.field, "f256");
         assert_eq!(cfg.levels[0].ood_samples, 1); // plus L0's opening point
         assert!(cfg.levels.iter().skip(1).all(|lv| lv.ood_samples == 2));
         let (pv, _vc) = cfg.to_prover_verifier_configs().unwrap();
@@ -7225,7 +7295,7 @@ mod tests {
         // hard error, never a silent fallback.
         let pv = prover_config_for(22, 5, LigeritoProfile::Fast).expect("m29 fast must load");
         assert_eq!(pv.queries[0], 279);
-        assert_eq!(pv.fold_grinding_bits[0], 16);
+        assert!(pv.fold_grinding_bits.iter().all(|&bits| bits == 0));
         assert_eq!(embedded_initial_k(29, LigeritoProfile::Fast), Some(5));
         let err = prover_config_for(22, 6, LigeritoProfile::Fast).unwrap_err();
         assert!(err.contains("initial_k=5"), "unexpected error: {err}");
@@ -7397,10 +7467,10 @@ mod tests {
         );
     }
 
-    /// The Flock paper's Appendix C.3 algebraic schedule is enforced
-    /// independently of the profile-local query/MCA target. Lowering any one
-    /// of its three active PoW families must make an otherwise canonical
-    /// config invalid.
+    /// The algebraic schedule from Appendix C.3 of the Flock paper is
+    /// enforced independently of the profile-local query/MCA target. The
+    /// F128 batching challenges still require grinding, while F256 makes the
+    /// sumcheck challenges independently 128-bit secure without fold PoW.
     #[test]
     fn ligerito_security_config_rejects_insufficient_algebraic_grinding() {
         let baseline = LigeritoSecurityConfig::derive_profile(29, LigeritoProfile::Fast)
@@ -7411,12 +7481,12 @@ mod tests {
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("claim_batch_grinding_bits"), "err = {err}");
 
-        let mut cfg = baseline.clone();
-        cfg.levels[0].fold_grinding_bits = 0;
-        let err = cfg.validate().unwrap_err();
         assert!(
-            err.contains("Appendix C.3 sumcheck requirement"),
-            "err = {err}"
+            baseline
+                .levels
+                .iter()
+                .all(|level| level.fold_grinding_bits == 0),
+            "F256 sumcheck challenges need no fold grinding"
         );
 
         let mut cfg = baseline;
@@ -7496,11 +7566,11 @@ mod tests {
         let gamma = delta / 2.0 - 3.0 / (delta * n) - eps_star;
         let per_q = (1.0 / (1.0 - gamma)).log2();
         let queries = (100.0 / per_q).ceil() as usize;
-        // a = γ·n + 1; ε_pg = 128 − log₂ a with NO row-union penalty in the
+        // a = γ·n + 1; ε_pg = 256 − log₂ a with NO row-union penalty in the
         // unique-decoding regime (list size 1; Diamond and Gruen). Any
         // shortfall below the 100-bit target is covered by fold-grinding.
         let log_a_base = (gamma * n + 1.0).log2();
-        let eps_pg = 128.0 - log_a_base;
+        let eps_pg = FOLD_FIELD_LOG_Q - log_a_base;
         cfg.levels[0].regime = SoundnessRegime::Udr;
         cfg.levels[0].eta = None;
         cfg.levels[0].proximity_loss = Some(eps_star);
@@ -7508,8 +7578,7 @@ mod tests {
         cfg.levels[0].grinding_bits = 0;
         let (claim_bits, sumcheck_bits, consistency_bits, e_claim, e_sumcheck, e_consistency) =
             algebraic_grinding_schedule(cfg.levels[0].log_inv_rate, None, queries);
-        cfg.levels[0].fold_grinding_bits = ((100.0 - eps_pg).ceil().max(0.0) as usize)
-            .max(sumcheck_bits);
+        cfg.levels[0].fold_grinding_bits = sumcheck_bits;
         cfg.levels[0].claim_batch_grinding_bits = claim_bits;
         cfg.levels[0].consistency_batch_grinding_bits = consistency_bits;
         cfg.levels[0].expected_eps_pg_bits = (eps_pg * 10.0).round() / 10.0;
@@ -7570,7 +7639,7 @@ mod tests {
             initial_log_msg_cols: log_n - initial_k,
             initial_log_num_interleaved: initial_k,
             initial_k,
-            recursive_log_msg_cols: vec![log_n - initial_k - k_0],
+            recursive_log_msg_cols: vec![log_n - initial_k - (k_0 - 1)],
             recursive_ks: vec![k_0],
             queries: queries.clone(),
             grinding_bits: grinding_bits.clone(),
@@ -7617,7 +7686,7 @@ mod tests {
             initial_log_msg_cols: log_n - initial_k,
             initial_log_num_interleaved: initial_k,
             initial_k,
-            recursive_log_msg_cols: vec![log_n - initial_k - k_0],
+            recursive_log_msg_cols: vec![log_n - initial_k - (k_0 - 1)],
             recursive_ks: vec![k_0],
             queries,
             grinding_bits,
@@ -7630,8 +7699,16 @@ mod tests {
         }
         .with_default_stratified();
         let mut v_ch = crate::challenger::FsChallenger::new(b"pow-test");
-        let ok =
-            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_cap(&v_cfg), &mut v_ch);
+        let ok = extension::recursive_verifier_with_basis_succinct(
+            &v_cfg,
+            &proof,
+            log_n,
+            target,
+            &initial_cap(&v_cfg),
+            1usize << initial_k,
+            |ris, residual_log| extension::evaluate_dense_at_residual(&b, ris, residual_log),
+            &mut v_ch,
+        );
         assert!(
             ok,
             "verifier should accept proof with valid grinding nonces"
@@ -7641,8 +7718,16 @@ mod tests {
         let mut bad_proof = proof.clone();
         bad_proof.grinding_nonces[0] = bad_proof.grinding_nonces[0].wrapping_add(1);
         let mut v_ch = crate::challenger::FsChallenger::new(b"pow-test");
-        let ok =
-            recursive_verifier_with_basis(&v_cfg, &bad_proof, &b, target, &initial_cap(&v_cfg), &mut v_ch);
+        let ok = extension::recursive_verifier_with_basis_succinct(
+            &v_cfg,
+            &bad_proof,
+            log_n,
+            target,
+            &initial_cap(&v_cfg),
+            1usize << initial_k,
+            |ris, residual_log| extension::evaluate_dense_at_residual(&b, ris, residual_log),
+            &mut v_ch,
+        );
         assert!(
             !ok,
             "verifier must reject proof with tampered grinding nonce"
@@ -7692,7 +7777,7 @@ mod tests {
                 initial_log_msg_cols: log_n - initial_k,
                 initial_log_num_interleaved: initial_k,
                 initial_k,
-                recursive_log_msg_cols: vec![log_n - initial_k - k_0],
+                recursive_log_msg_cols: vec![log_n - initial_k - (k_0 - 1)],
                 recursive_ks: vec![k_0],
                 queries: queries.clone(),
                 grinding_bits: vec![0; 2],
@@ -7710,7 +7795,7 @@ mod tests {
                 initial_log_msg_cols: log_n - initial_k,
                 initial_log_num_interleaved: initial_k,
                 initial_k,
-                recursive_log_msg_cols: vec![log_n - initial_k - k_0],
+                recursive_log_msg_cols: vec![log_n - initial_k - (k_0 - 1)],
                 recursive_ks: vec![k_0],
                 queries,
                 grinding_bits: vec![0; 2],
@@ -7760,7 +7845,18 @@ mod tests {
 
             let mut v_ch = crate::challenger::FsChallenger::new(b"strat-sweep");
             assert!(
-                recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &cap0, &mut v_ch),
+                extension::recursive_verifier_with_basis_succinct(
+                    &v_cfg,
+                    &proof,
+                    log_n,
+                    target,
+                    &cap0,
+                    1usize << initial_k,
+                    |ris, residual_log| {
+                        extension::evaluate_dense_at_residual(&b, ris, residual_log)
+                    },
+                    &mut v_ch,
+                ),
                 "honest stratified proof rejected (q0={q0}, q1={q1})"
             );
 
@@ -7770,7 +7866,18 @@ mod tests {
             bad.initial_proof.opened_rows[0][0] += F128::ONE;
             let mut v_ch = crate::challenger::FsChallenger::new(b"strat-sweep");
             assert!(
-                !recursive_verifier_with_basis(&v_cfg, &bad, &b, target, &cap0, &mut v_ch),
+                !extension::recursive_verifier_with_basis_succinct(
+                    &v_cfg,
+                    &bad,
+                    log_n,
+                    target,
+                    &cap0,
+                    1usize << initial_k,
+                    |ris, residual_log| {
+                        extension::evaluate_dense_at_residual(&b, ris, residual_log)
+                    },
+                    &mut v_ch,
+                ),
                 "tampered row accepted (q0={q0})"
             );
 
@@ -7779,7 +7886,18 @@ mod tests {
             bad.initial_proof.merkle_proof[0][0] ^= 1;
             let mut v_ch = crate::challenger::FsChallenger::new(b"strat-sweep");
             assert!(
-                !recursive_verifier_with_basis(&v_cfg, &bad, &b, target, &cap0, &mut v_ch),
+                !extension::recursive_verifier_with_basis_succinct(
+                    &v_cfg,
+                    &bad,
+                    log_n,
+                    target,
+                    &cap0,
+                    1usize << initial_k,
+                    |ris, residual_log| {
+                        extension::evaluate_dense_at_residual(&b, ris, residual_log)
+                    },
+                    &mut v_ch,
+                ),
                 "tampered sibling accepted (q0={q0})"
             );
 
@@ -7788,7 +7906,18 @@ mod tests {
             bad.initial_proof.merkle_proof.pop();
             let mut v_ch = crate::challenger::FsChallenger::new(b"strat-sweep");
             assert!(
-                !recursive_verifier_with_basis(&v_cfg, &bad, &b, target, &cap0, &mut v_ch),
+                !extension::recursive_verifier_with_basis_succinct(
+                    &v_cfg,
+                    &bad,
+                    log_n,
+                    target,
+                    &cap0,
+                    1usize << initial_k,
+                    |ris, residual_log| {
+                        extension::evaluate_dense_at_residual(&b, ris, residual_log)
+                    },
+                    &mut v_ch,
+                ),
                 "truncated paths accepted (q0={q0})"
             );
 
@@ -7800,7 +7929,18 @@ mod tests {
             bad.initial_proof.merkle_proof.push(extra);
             let mut v_ch = crate::challenger::FsChallenger::new(b"strat-sweep");
             assert!(
-                !recursive_verifier_with_basis(&v_cfg, &bad, &b, target, &cap0, &mut v_ch),
+                !extension::recursive_verifier_with_basis_succinct(
+                    &v_cfg,
+                    &bad,
+                    log_n,
+                    target,
+                    &cap0,
+                    1usize << initial_k,
+                    |ris, residual_log| {
+                        extension::evaluate_dense_at_residual(&b, ris, residual_log)
+                    },
+                    &mut v_ch,
+                ),
                 "padded paths accepted (q0={q0})"
             );
         }
@@ -8840,7 +8980,7 @@ mod tests {
             initial_log_msg_cols: log_n - initial_k,
             initial_log_num_interleaved: initial_k,
             initial_k,
-            recursive_log_msg_cols: vec![log_n - initial_k - k_0],
+            recursive_log_msg_cols: vec![log_n - initial_k - (k_0 - 1)],
             recursive_ks: vec![k_0],
             queries: log_inv_rates.iter().map(|&r| udr_queries(r)).collect(),
             grinding_bits: vec![0; log_inv_rates.len()],
@@ -8886,7 +9026,7 @@ mod tests {
             initial_log_msg_cols: log_n - initial_k,
             initial_log_num_interleaved: initial_k,
             initial_k,
-            recursive_log_msg_cols: vec![log_n - initial_k - k_0],
+            recursive_log_msg_cols: vec![log_n - initial_k - (k_0 - 1)],
             recursive_ks: vec![k_0],
             queries: log_inv_rates.iter().map(|&r| udr_queries(r)).collect(),
             grinding_bits: vec![0; log_inv_rates.len()],
@@ -8899,8 +9039,16 @@ mod tests {
         }
         .with_default_stratified();
         let mut v_ch = crate::challenger::FsChallenger::new(b"basis-test");
-        let ok =
-            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_cap(&v_cfg), &mut v_ch);
+        let ok = extension::recursive_verifier_with_basis_succinct(
+            &v_cfg,
+            &proof,
+            log_n,
+            target,
+            &initial_cap(&v_cfg),
+            1usize << initial_k,
+            |ris, residual_log| extension::evaluate_dense_at_residual(&b, ris, residual_log),
+            &mut v_ch,
+        );
         assert!(ok, "basis-based verifier rejected valid proof");
     }
 
@@ -9257,11 +9405,10 @@ mod tests {
         );
     }
 
-    /// Succinct verifier accepts the same proof as the dense verifier when
-    /// given an `eval_b` closure that returns the same values as the dense
-    /// `b_initial[idx]` at multilinear `point = bit-decomp(idx)`.
+    /// The F256 succinct verifier accepts a proof when its residual-basis
+    /// callback evaluates the same materialized basis used by the prover.
     #[test]
-    fn recursive_verifier_with_basis_succinct_matches_dense() {
+    fn recursive_verifier_with_basis_succinct_accepts_dense_basis() {
         use crate::challenger::Challenger;
         let log_n = 14;
         let initial_k = 3;
@@ -9285,7 +9432,7 @@ mod tests {
             initial_log_msg_cols: log_n - initial_k,
             initial_log_num_interleaved: initial_k,
             initial_k,
-            recursive_log_msg_cols: vec![log_n - initial_k - k_0],
+            recursive_log_msg_cols: vec![log_n - initial_k - (k_0 - 1)],
             recursive_ks: vec![k_0],
             queries: log_inv_rates.iter().map(|&r| udr_queries(r)).collect(),
             grinding_bits: vec![0; log_inv_rates.len()],
@@ -9331,7 +9478,7 @@ mod tests {
             initial_log_msg_cols: log_n - initial_k,
             initial_log_num_interleaved: initial_k,
             initial_k,
-            recursive_log_msg_cols: vec![log_n - initial_k - k_0],
+            recursive_log_msg_cols: vec![log_n - initial_k - (k_0 - 1)],
             recursive_ks: vec![k_0],
             queries: log_inv_rates.iter().map(|&r| udr_queries(r)).collect(),
             grinding_bits: vec![0; log_inv_rates.len()],
@@ -9344,46 +9491,24 @@ mod tests {
         }
         .with_default_stratified();
 
-        // Dense verifier
         let mut v_ch = crate::challenger::FsChallenger::new(b"succ-cmp");
-        let dense_ok =
-            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_cap(&v_cfg), &mut v_ch);
-        assert!(dense_ok, "dense verifier must accept");
-
-        // Succinct verifier — batch eval_b is just eq(z, ris ++ y_bits) by construction
-        let mut v_ch2 = crate::challenger::FsChallenger::new(b"succ-cmp");
-        let eval_b_residual = |ris: &[F128], yr_log_n: usize| -> Vec<F128> {
-            let yr_len = 1usize << yr_log_n;
-            let mut point = ris.to_vec();
-            point.resize(ris.len() + yr_log_n, F128::ZERO);
-            (0..yr_len)
-                .map(|y| {
-                    for j in 0..yr_log_n {
-                        point[ris.len() + j] = if (y >> j) & 1 == 1 {
-                            F128::ONE
-                        } else {
-                            F128::ZERO
-                        };
-                    }
-                    crate::zerocheck::multilinear::eq_eval(&z, &point)
-                })
-                .collect()
-        };
-        let succ_ok = recursive_verifier_with_basis_succinct(
+        let ok = extension::recursive_verifier_with_basis_succinct(
             &v_cfg,
             &proof,
             log_n,
             target,
             &initial_cap(&v_cfg),
             1usize << v_cfg.initial_k,
-            eval_b_residual,
-            &mut v_ch2,
+            |ris, residual_log| {
+                extension::evaluate_dense_at_residual(&b, ris, residual_log)
+            },
+            &mut v_ch,
         );
-        assert!(succ_ok, "succinct verifier must accept");
+        assert!(ok, "F256 succinct verifier must accept");
     }
 
     /// Build a matching (ProverConfig, VerifierConfig) pair with explicit
-    /// OOD samples and fold-challenge grinding, for the OOD-path tests below.
+    /// OOD samples for the OOD-path tests below.
     /// Shape: L0 (initial_k) → r recursive levels of `k`; small query counts
     /// and grind bits keep the test fast while still exercising every path.
     fn ood_test_configs(
@@ -9396,10 +9521,10 @@ mod tests {
         let r = ks.len();
         let log_inv_rates: Vec<usize> = (0..=r).map(|i| 1 + i).collect();
         let mut recursive_log_msg_cols = Vec::new();
-        let mut dim = log_n - initial_k;
+        let mut dim = log_n - initial_k + 1;
         for &k in ks {
             recursive_log_msg_cols.push(dim - k);
-            dim -= k;
+            dim = dim - k + 1;
         }
         let queries = vec![20usize; r + 1];
         let grinding_bits = vec![0usize; r + 1];
@@ -9442,19 +9567,25 @@ mod tests {
         (p, v)
     }
 
-    /// End-to-end OOD binding + fold-challenge grinding: a JohnsonOod-shaped
-    /// config (one extra OOD at L0 and two at L1/L2, a few fold-grind bits at
-    /// every level) round-trips through BOTH the dense and succinct verifiers, and
-    /// tampering with either an OOD value or a fold-grinding nonce makes both
-    /// reject. Exercises every new prover/verifier code path.
+    /// End-to-end OOD binding under F256: a JohnsonOod-shaped config (one
+    /// extra OOD at L0 and two at L1/L2) round-trips through the production
+    /// succinct verifier. Tampering with OOD values or either F128 batching
+    /// nonce family rejects.
     #[test]
     fn ligerito_ood_and_fold_grinding_roundtrip_and_tamper() {
         use crate::challenger::Challenger;
-        let log_n = 12;
+        let log_n = 14;
         let initial_k = 2;
-        let ks = [2usize, 2];
-        // L0 opening point + one extra, and two explicit points at L1/L2.
-        let (p_cfg, v_cfg) = ood_test_configs(log_n, initial_k, &ks, vec![1, 2, 2], vec![3, 3, 3]);
+        let ks = [2usize, 2, 2, 2];
+        // Exercise enough code switches to match the production recursion
+        // depth: one point at L0 and two at every split commitment.
+        let (p_cfg, v_cfg) = ood_test_configs(
+            log_n,
+            initial_k,
+            &ks,
+            vec![1, 2, 2, 2, 2],
+            vec![0, 0, 0, 0, 0],
+        );
 
         let mut rng = crate::challenger::RandomChallenger::new(0x00D_7E57);
         let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
@@ -9494,115 +9625,58 @@ mod tests {
         );
 
         // Sanity: the new proof fields are populated.
-        assert_eq!(proof.ood_values.len(), 5, "1 + 2 + 2 explicit OOD samples");
-        // 2 lane folds (L0) + 2 + 2 recursive folds, each with 3 grind bits.
-        assert_eq!(proof.fold_grinding_nonces.len(), initial_k + ks[0] + ks[1]);
-        assert_eq!(proof.claim_batch_grinding_nonces.len(), 5 + 3);
-        assert_eq!(proof.consistency_batch_grinding_nonces.len(), 3);
+        assert_eq!(proof.ood_values.len(), 9, "1 + 4·2 explicit OOD samples");
+        assert!(proof.fold_grinding_nonces.is_empty());
+        assert_eq!(proof.claim_batch_grinding_nonces.len(), 9 + 5);
+        assert_eq!(proof.consistency_batch_grinding_nonces.len(), 5);
 
-        let dense = |proof: &LigeritoProof| {
+        let verify = |proof: &LigeritoProof| {
             let mut ch = crate::challenger::FsChallenger::new(b"ood-test");
-            recursive_verifier_with_basis(&v_cfg, proof, &b, target, &initial_cap(&v_cfg), &mut ch)
-        };
-        let eval_b_residual = {
-            let z = z.clone();
-            move |ris: &[F128], yr_log_n: usize| -> Vec<F128> {
-                let yr_len = 1usize << yr_log_n;
-                let mut point = ris.to_vec();
-                point.resize(ris.len() + yr_log_n, F128::ZERO);
-                (0..yr_len)
-                    .map(|y| {
-                        for j in 0..yr_log_n {
-                            point[ris.len() + j] = if (y >> j) & 1 == 1 {
-                                F128::ONE
-                            } else {
-                                F128::ZERO
-                            };
-                        }
-                        crate::zerocheck::multilinear::eq_eval(&z, &point)
-                    })
-                    .collect()
-            }
-        };
-        let succinct = |proof: &LigeritoProof| {
-            let mut ch = crate::challenger::FsChallenger::new(b"ood-test");
-            recursive_verifier_with_basis_succinct(
+            extension::recursive_verifier_with_basis_succinct(
                 &v_cfg,
                 proof,
                 log_n,
                 target,
                 &initial_cap(&v_cfg),
                 1usize << v_cfg.initial_k,
-                &eval_b_residual,
+                |ris, residual_log| {
+                    extension::evaluate_dense_at_residual(&b, ris, residual_log)
+                },
                 &mut ch,
             )
         };
 
-        assert!(dense(&proof), "dense verifier must accept OOD proof");
-        assert!(succinct(&proof), "succinct verifier must accept OOD proof");
+        assert!(verify(&proof), "F256 verifier must accept OOD proof");
 
         // Tamper every OOD value in turn → both verifiers reject. Iterating
-        // all five positions certifies L0 and both explicit points at L1/L2,
+        // all positions certifies L0 and every explicit recursive point,
         // rather than only the first flattened proof entry.
         for idx in 0..proof.ood_values.len() {
             let mut bad_ood = proof.clone();
             bad_ood.ood_values[idx] += F128::ONE;
-            assert!(
-                !dense(&bad_ood),
-                "dense must reject tampered OOD value {idx}"
-            );
-            assert!(
-                !succinct(&bad_ood),
-                "succinct must reject tampered OOD value {idx}"
-            );
+            assert!(!verify(&bad_ood), "must reject tampered OOD value {idx}");
         }
 
         let mut missing_ood = proof.clone();
         missing_ood.ood_values.pop();
-        assert!(!dense(&missing_ood), "dense must reject a missing OOD value");
-        assert!(
-            !succinct(&missing_ood),
-            "succinct must reject a missing OOD value"
-        );
+        assert!(!verify(&missing_ood), "must reject a missing OOD value");
 
         let mut extra_ood = proof.clone();
         extra_ood.ood_values.push(F128::ZERO);
-        assert!(!dense(&extra_ood), "dense must reject an extra OOD value");
-        assert!(
-            !succinct(&extra_ood),
-            "succinct must reject an extra OOD value"
-        );
+        assert!(!verify(&extra_ood), "must reject an extra OOD value");
 
         let mut missing_query_nonce = proof.clone();
         missing_query_nonce.grinding_nonces.pop();
         assert!(
-            !dense(&missing_query_nonce),
-            "dense must reject a missing query nonce"
-        );
-        assert!(
-            !succinct(&missing_query_nonce),
-            "succinct must reject a missing query nonce"
+            !verify(&missing_query_nonce),
+            "must reject a missing query nonce"
         );
 
         let mut extra_query_nonce = proof.clone();
         extra_query_nonce.grinding_nonces.push(0);
         assert!(
-            !dense(&extra_query_nonce),
-            "dense must reject a trailing query nonce"
-        );
-        assert!(
-            !succinct(&extra_query_nonce),
-            "succinct must reject a trailing query nonce"
-        );
-
-        // Tamper a fold-grinding nonce → both verifiers reject (PoW fails or
-        // the FS state diverges).
-        let mut bad_nonce = proof.clone();
-        bad_nonce.fold_grinding_nonces[0] ^= 0xDEAD_BEEF;
-        assert!(!dense(&bad_nonce), "dense must reject tampered fold nonce");
-        assert!(
-            !succinct(&bad_nonce),
-            "succinct must reject tampered fold nonce"
+            !verify(&extra_query_nonce),
+            "must reject a trailing query nonce"
         );
 
         for (name, mutate) in [
@@ -9620,11 +9694,7 @@ mod tests {
         {
             let mut bad = proof.clone();
             mutate(&mut bad);
-            assert!(!dense(&bad), "dense must reject tampered {name} nonce");
-            assert!(
-                !succinct(&bad),
-                "succinct must reject tampered {name} nonce"
-            );
+            assert!(!verify(&bad), "must reject tampered {name} nonce");
         }
 
         for (name, mutate) in [
@@ -9652,17 +9722,13 @@ mod tests {
         {
             let mut bad = proof.clone();
             mutate(&mut bad);
-            assert!(!dense(&bad), "dense must reject {name} nonce vector");
-            assert!(
-                !succinct(&bad),
-                "succinct must reject {name} nonce vector"
-            );
+            assert!(!verify(&bad), "must reject {name} nonce vector");
         }
     }
 
     /// A real embedded profile config (m=22 fast = JohnsonOod) drives a full
     /// prover→verifier round-trip through the basis opening path. This is the
-    /// production shape: OOD samples and fold grinding come straight from the
+    /// production shape: OOD samples and the F256 split ladder come straight from the
     /// derived TOML, not a hand-built config.
     #[test]
     fn ligerito_fast_profile_m22_roundtrip() {
@@ -9676,7 +9742,8 @@ mod tests {
             .expect("m22 fast verifier config");
         // The fast profile must actually use the new features.
         assert!(p_cfg.ood_samples.iter().skip(1).any(|&s| s > 0));
-        assert!(p_cfg.fold_grinding_bits.iter().any(|&g| g > 0));
+        assert!(p_cfg.fold_grinding_bits.iter().all(|&g| g == 0));
+        assert!(p_cfg.recursive_ks.iter().all(|&k| k == 4));
 
         let mut rng = crate::challenger::RandomChallenger::new(0xFA57_0022);
         let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
@@ -9715,11 +9782,42 @@ mod tests {
             &mut p_ch,
         );
 
-        let mut v_ch = crate::challenger::FsChallenger::new(b"m22-fast");
-        assert!(
-            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_cap(&v_cfg), &mut v_ch),
-            "m22 fast profile proof must verify"
-        );
+        let verify = |candidate: &LigeritoProof| {
+            let mut v_ch = crate::challenger::FsChallenger::new(b"m22-fast");
+            extension::recursive_verifier_with_basis_succinct(
+                &v_cfg,
+                candidate,
+                log_n,
+                target,
+                &initial_cap(&v_cfg),
+                1usize << initial_k,
+                |ris, residual_log| {
+                    extension::evaluate_dense_at_residual(&b, ris, residual_log)
+                },
+                &mut v_ch,
+            )
+        };
+        assert!(verify(&proof), "m22 fast profile proof must verify");
+
+        let mut bad = proof.clone();
+        bad.sumcheck_transcript_f256[0].u_0.c0.lo ^= 1;
+        assert!(!verify(&bad), "mutated F256 transcript limb must reject");
+
+        let mut bad = proof.clone();
+        bad.sumcheck_transcript_f256[0].u_0.c1.lo ^= 1;
+        assert!(!verify(&bad), "mutated extension coefficient must reject");
+
+        let mut bad = proof.clone();
+        bad.ood_values[0].lo ^= 1;
+        assert!(!verify(&bad), "mutated base-field OOD answer must reject");
+
+        let mut bad = proof.clone();
+        bad.final_proof.yr[0].lo ^= 1;
+        assert!(!verify(&bad), "mutated split residual word must reject");
+
+        let mut bad = proof.clone();
+        bad.final_proof.opened_rows[0][0].lo ^= 1;
+        assert!(!verify(&bad), "mutated coordinate row opening must reject");
     }
 
     /// End-to-end under BLAKE3: the same recursion, every Merkle commitment
@@ -9781,7 +9879,18 @@ mod tests {
 
         let mut v_ch = crate::challenger::FsChallenger::new(b"m22-blake3");
         assert!(
-            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_cap(&v_cfg), &mut v_ch),
+            extension::recursive_verifier_with_basis_succinct(
+                &v_cfg,
+                &proof,
+                log_n,
+                target,
+                &initial_cap(&v_cfg),
+                1usize << initial_k,
+                |ris, residual_log| {
+                    extension::evaluate_dense_at_residual(&b, ris, residual_log)
+                },
+                &mut v_ch,
+            ),
             "blake3 Merkle proof must verify"
         );
 
@@ -9791,12 +9900,16 @@ mod tests {
         wrong_cfg.merkle_hash = HashKind::Sha256;
         let mut w_ch = crate::challenger::FsChallenger::new(b"m22-blake3");
         assert!(
-            !recursive_verifier_with_basis(
+            !extension::recursive_verifier_with_basis_succinct(
                 &wrong_cfg,
                 &proof,
-                &b,
+                log_n,
                 target,
                 &initial_cap(&v_cfg),
+                1usize << initial_k,
+                |ris, residual_log| {
+                    extension::evaluate_dense_at_residual(&b, ris, residual_log)
+                },
                 &mut w_ch
             ),
             "a sha256-configured verifier must reject a blake3 proof"
@@ -9855,12 +9968,16 @@ mod tests {
 
                 let mut v_ch = crate::challenger::FsChallenger::with_hash(b"m22-matrix", fs_hash);
                 assert!(
-                    recursive_verifier_with_basis(
+                    extension::recursive_verifier_with_basis_succinct(
                         &v_cfg,
                         &proof,
-                        &b,
+                        log_n,
                         target,
                         &initial_cap(&v_cfg),
+                        1usize << initial_k,
+                        |ris, residual_log| {
+                            extension::evaluate_dense_at_residual(&b, ris, residual_log)
+                        },
                         &mut v_ch
                     ),
                     "merkle={merkle_hash} fs={fs_hash} must verify"
@@ -9874,12 +9991,16 @@ mod tests {
                 };
                 let mut w_ch = crate::challenger::FsChallenger::with_hash(b"m22-matrix", other_fs);
                 assert!(
-                    !recursive_verifier_with_basis(
+                    !extension::recursive_verifier_with_basis_succinct(
                         &v_cfg,
                         &proof,
-                        &b,
+                        log_n,
                         target,
                         &initial_cap(&v_cfg),
+                        1usize << initial_k,
+                        |ris, residual_log| {
+                            extension::evaluate_dense_at_residual(&b, ris, residual_log)
+                        },
                         &mut w_ch
                     ),
                     "merkle={merkle_hash}: an {other_fs} transcript must reject an {fs_hash} proof"
@@ -9931,7 +10052,7 @@ mod tests {
             initial_log_msg_cols: log_n - initial_k,
             initial_log_num_interleaved: initial_k,
             initial_k,
-            recursive_log_msg_cols: vec![log_n - initial_k - k_0],
+            recursive_log_msg_cols: vec![log_n - initial_k - (k_0 - 1)],
             recursive_ks: vec![k_0],
             queries: log_inv_rates.iter().map(|&r| udr_queries(r)).collect(),
             grinding_bits: vec![0; log_inv_rates.len()],
@@ -9977,7 +10098,7 @@ mod tests {
             initial_log_msg_cols: log_n - initial_k,
             initial_log_num_interleaved: initial_k,
             initial_k,
-            recursive_log_msg_cols: vec![log_n - initial_k - k_0],
+            recursive_log_msg_cols: vec![log_n - initial_k - (k_0 - 1)],
             recursive_ks: vec![k_0],
             queries: log_inv_rates.iter().map(|&r| udr_queries(r)).collect(),
             grinding_bits: vec![0; log_inv_rates.len()],
@@ -9990,8 +10111,16 @@ mod tests {
         }
         .with_default_stratified();
         let mut v_ch = crate::challenger::FsChallenger::new(b"batched");
-        let ok =
-            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_cap(&v_cfg), &mut v_ch);
+        let ok = extension::recursive_verifier_with_basis_succinct(
+            &v_cfg,
+            &proof,
+            log_n,
+            target,
+            &initial_cap(&v_cfg),
+            1usize << initial_k,
+            |ris, residual_log| extension::evaluate_dense_at_residual(&b, ris, residual_log),
+            &mut v_ch,
+        );
         assert!(ok, "batched-basis verifier rejected valid proof");
     }
 

@@ -1,4 +1,4 @@
-//! Byte-identity anchors for the MERGED transport — currently proof-IO v18.
+//! Byte-identity anchors for the MERGED transport — currently proof-IO v19.
 //! An optimization must produce byte-identical proofs; only a
 //! deliberate protocol change may move these digests, and it must re-pin
 //! them with a history entry below.
@@ -40,9 +40,13 @@
 //! on a forked chain, unconditional). Roundtrip suites green; digests
 //! stable across two print runs.
 //! Re-pinned 2026-08-13 for the deliberate v18 Ligerito protocol changes:
-//! two-point OOD binding, Appendix C.3 algebraic grinding, fused PoW/squeeze,
+//! two-point OOD binding, the Flock paper's Appendix C.3 algebraic grinding,
 //! and strict-128 Johnson query schedules. All six fixtures moved; roundtrip
 //! suites are green and the digests were identical across two print runs.
+//! Re-pinned 2026-08-13 for the deliberate v19 Ligerito protocol change:
+//! F256 mutual correlated agreement and the base-field split handoff. All six
+//! fixtures moved; roundtrip suites are green and the digests were stable
+//! across repeated deterministic generation.
 
 use ::sha2 as sha2_hash;
 use flock_core::proof::{R1csClaim, R1csProofMergedLigerito};
@@ -145,7 +149,7 @@ fn merged_bundle_digest(
 /// registry id, counts vector, commitment, and the merged proof — plus the
 /// claim values. The registry here (BLAKE3+SHA-256 at ν = 10) IS the
 /// `Blake3Sha2Nu10` tier, so this pins exactly what `proof_io` puts on disk
-/// for the current v18 mixed proof. It retains the removed jagged fixture's
+/// for the current v19 mixed proof. It retains the removed jagged fixture's
 /// statements and witness streams; the Ligerito query ladder intentionally
 /// changed with v18.
 #[test]
@@ -155,22 +159,22 @@ fn m6_merged_union_proof_bytes_pinned() {
         (
             "merged-nu10-1024-1024",
             [1024, 1024],
-            "6c08f76e7885d1d360f16d86de60657323eeefb0246d9db7f38ae4f29f31bdf1",
+            "c804ee2e56928e69e9e2e2e46226aa67360733a46e1756280c7839892b689323",
         ),
         (
             "merged-nu10-50-37",
             [50, 37],
-            "dc4a61b272ac9ea33c5ea2be2e0c18882554d4d0988331783e2b8ac7e72f0c6b",
+            "b92f9b5681c6bc0de1615bd88addf7022fe5422ea908d93c65f92b56a4b20f54",
         ),
         (
             "merged-nu10-8-8",
             [8, 8],
-            "039039e8c83ee73009dd677318b9910bd440fb7308dd244fcc57fc295f98d3fc",
+            "9f2f37e77b110d026790d977d81794973ebdcc418a6aa2d5707a63a2a80ce590",
         ),
         (
             "merged-nu10-0-64",
             [0, 64],
-            "acc484c2e835447e3a55579aadae1e13a6849644b5804741272c2876234b1ca5",
+            "0b071484c15a2768a5d8b7a8148a0d5825630bf7171e15f884790426b33c6fcb",
         ),
     ];
 
@@ -246,7 +250,7 @@ fn m6_merged_union_proof_bytes_pinned() {
 fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
     // BLAKE3, 256 blocks (m = 22).
     {
-        const EXPECTED: &str = "de5f937d3fcdafe2d3c5bd1044cb7365958dd0a764339dbe9f180be98aba2939";
+        const EXPECTED: &str = "07f6bed1093304028dccdde8521db0e8ed8fda137b1c43df01081bc204b6c6b5";
         let n_blocks = 256usize;
         let setup = blake3::Blake3Setup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_B3B3);
@@ -278,7 +282,7 @@ fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
 
     // SHA-256, 128 blocks (m = 22).
     {
-        const EXPECTED: &str = "0fb9ea20ba9cd1e6f9d6cf7cd1f5647033d7033f0d24704b38494a6f7cd96720";
+        const EXPECTED: &str = "ee293df2c7967425c84b7bf905d809132c7b72378c673e07c558660870d0f616";
         let n_blocks = 128usize;
         let setup = sha2::Sha256HybridSetup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_5252);

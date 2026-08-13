@@ -17,27 +17,27 @@ against your unmodified tip, none introduced by our commits.
 
 | | 100-bit | 128-bit |
 | --- | --- | --- |
-| leaf/node track (mvp) | `TOWER_PROFILE=fast100` | `TOWER_PROFILE=secure` |
-| chain track / spine | `TOWER_PROFILE=slim100` (envelope on, m29) | `TOWER_PROFILE=slim` (envelope on, m29); Secure chain tower also validated |
-| in code | `PcsParams.profile = Fast100 / Slim100` | `= Secure` |
+| leaf/node track (mvp) | `TOWER_PROFILE=fast100` | default `TOWER_PROFILE=fast` |
+| chain track / spine | `TOWER_PROFILE=slim100` (envelope on, m29) | `TOWER_PROFILE=slim` (envelope on, m29) |
+| in code | `PcsParams.profile = Fast100 / Slim100` | `= Fast / Slim` |
 
-The right-hand column is the recursion configuration used to validate the
-128-bit roadmap work; it is not yet an overall 128-bit Ligerito claim.
-Strict-Slim's Johnson consistency-query component clears 128 bits, while the
-F128 MCA term is the next milestone. `Secure` remains the separate historical
-120-bit unique-decoding profile used to exercise every algebraic-grinding
-family through recursion.
+The right-hand column is the strict component-security configuration. Its
+Johnson query, two-point OOD, Flock-paper Appendix C.3 batching, and F256 MCA
+terms each clear 128 bits. `Secure` remains the separate historical 120-bit
+unique-decoding profile used as an additional regression target for every
+algebraic-grinding family; its name does not make it the 128-bit profile.
 
 `Fast100` and `Slim100` are new `LigeritoProfile` variants that are `Fast`
 and `Slim` in every respect — the same Johnson accounting, two-point OOD,
-Appendix C.3 grinding schedule, transcript shape, and the m28/m29
+Flock-paper Appendix C.3 grinding schedule, transcript shape, and the m28/m29
 `initial_k` exceptions — except the consistency-query term targets the
 profile's own `security_bits()` (100) instead of
 `LIST_DECODING_QUERY_TARGET_BITS`. The Johnson query floor in
 `LigeritoSecurityConfig::validate` is keyed off `analysis_version`
 (`query128` vs `query100`), so each config family validates against its own
 target; a boundary test pins the `Fast100` floor and the schedule equality.
-No proof-format change: both variants live in one binary at v18.
+Both variants live in one binary and use the same split-F256 transcript shape
+at proof-format v19; their public query schedules remain different.
 
 **They reproduce the pre-branch schedules exactly.** The canonical generator
 at target 100 re-derives, byte-for-byte, the counts your Part 3 replaced:
@@ -62,16 +62,19 @@ at `f8093ec`, plus the soundness repair described in
 - `flock-core --lib` (incl. the config suite over all 70 embedded TOMLs) and
   the full `flock-prover` suite: green.
 - 100-bit leaf/node: mvp11 node + mvp12 tower green under `fast100`.
-- 128-bit leaf/node: mvp11 node + mvp12 tower green under `secure`.
+- 128-bit leaf/node: mvp11 node + mvp12 tower green under strict `fast`.
 - 100-bit chain track: `first_level_node_two_chains_fold_and_adjacency`,
   `chain_tower_e2e_with_lane`, and — notably — **`chain_spine_converges`
   green under `slim100` + the m29 envelope**. The envelope's fixed point
   held with zero re-pins, since it was iterated against exactly these
   schedules. This is the first spine run since your Ligerito parts landed.
-- 128-bit chain track: strict-Slim m29 spine and Secure chain tower now green;
+- 128-bit chain track: strict-Slim m29 spine and chain tower are green. The
+  historical Secure chain tower is also green as a compatibility regression;
   see the 2026-08-13 resolution below.
 
-Same-run mvp11 node comparison (medians of 10 online reps, M4 Max):
+Historical same-run mvp11 comparison from Ron's review (medians of 10 online
+reps, M4 Max; `secure` is the 120-bit compatibility profile, not the strict
+128-bit column above):
 
 | | 100-bit (`fast100`) | 128-bit (`secure`) |
 | --- | ---: | ---: |
@@ -136,12 +139,13 @@ tests.
    `counts_bool`/`counts_el` values remain only the retired padding oracle and
    slot-declaration key list.
 
-The 2026-08-13 validation matrix also passed Fast100 and Secure `mvp11` and
-`mvp12`, Slim100 first-level node / chain tower / converged spine, `mvp7`, the
-full active `flock-core` suite (486 passed, 22 ignored), and the full active
-`flock-prover` suite and integrations with no failures. Ron's three ignored
-proof-byte pin tests were also run explicitly. The branch's deliberate v18
-Ligerito protocol changes moved all thirteen fixture digests; the new values
+The 2026-08-13 validation matrix also passed strict Fast `mvp11`/`mvp12`,
+Fast100 and Secure `mvp11`/`mvp12`, strict Slim and Slim100 chain towers,
+Slim100's converged spine, `mvp7`, the full active `flock-core` suite (498
+passed, 22 ignored), and the full active `flock-prover` suite and integrations
+with no failures. Ron's three ignored
+proof-byte pin tests were also run explicitly. The branch's deliberate v19
+Ligerito protocol changes moved the fixture digests; the new values
 were identical across two print runs, were documented at the fixtures, and
 the pin tests now pass normally.
 

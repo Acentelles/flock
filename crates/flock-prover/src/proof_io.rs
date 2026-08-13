@@ -10,7 +10,7 @@
 //! On-disk format:
 //! ```text
 //!   bytes 0..5    "FLOCK"                  (5-byte magic)
-//!   byte  5       VERSION                  (currently 18)
+//!   byte  5       VERSION                  (currently 19)
 //!   bytes 6..7    flavor: 2 = R1cs, 3 = Chain, 4 = Mixed
 //!                 (0/1 reserved: legacy BaseFold)
 //!   bytes 7..     bincode-serialized payload
@@ -44,6 +44,10 @@ use flock_core::pcs::Commitment;
 pub const MAGIC: [u8; 5] = *b"FLOCK";
 
 /// Format version. Bumped on incompatible serialization changes.
+/// v19 moves Ligerito sumcheck claims and challenges to F256. Recursive
+/// commitments remain over F128 by splitting each extension word into a
+/// coordinate bit, so the transcript, recursive dimensions, final `yr`, and
+/// sumcheck-message payload are all incompatible with v18.
 /// v18 changes every Johnson/Ligerito query schedule to make the consistency
 /// term strictly 128-bit after optional query grinding. No struct changes,
 /// but v17 paths/caps and transcript shapes cannot replay under the larger
@@ -120,7 +124,7 @@ pub const MAGIC: [u8; 5] = *b"FLOCK";
 /// v3 restructured `BaseFoldProof`: per-query Merkle paths were replaced by
 /// shared octopus multi-proofs (one per Merkle tree). v2 added `HashKind`
 /// to [`ChainProofBundle`].
-pub const VERSION: u8 = 18;
+pub const VERSION: u8 = 19;
 
 /// Which hash function a chain proof is over. Carried in
 /// [`ChainProofBundle`] so the verifier (e.g. the CLI) can pick the right

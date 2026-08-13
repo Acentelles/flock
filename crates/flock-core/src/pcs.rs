@@ -35,7 +35,7 @@ pub use pack::{LOG_PACKING, pack_witness, unpack_witness};
 pub use ring_switch::{RingSwitchProof, SparseEqTensor};
 
 use crate::challenger::Challenger;
-use crate::field::F128;
+use crate::field::{F128, F256};
 use crate::zerocheck::PaddingSpec;
 use serde::{Deserialize, Serialize};
 
@@ -1072,18 +1072,17 @@ pub fn verify_opening_batch_ligerito_mixed_with_grinding<Ch: Challenger>(
     //    For PD claims, precompute eq prefix factors over ris and finish per y.
     //    For BLAKE3 m=30: ris is 19 dims, yr is 4 dims → 19× prefix reuse.
     let log_n = commitment.params.m - LOG_PACKING;
-    let eval_b_residual = |ris: &[F128], yr_log_n: usize| -> Vec<F128> {
-        use crate::zerocheck::multilinear::eq_eval;
+    let eval_b_residual = |ris: &[F256], yr_log_n: usize| -> Vec<F256> {
         let yr_len = 1usize << yr_log_n;
         let prefix_len = ris.len();
 
         // ---- RS claim prefixes ----
-        let rs_prefixes: Vec<crate::pcs::tensor_algebra::TensorAlgebra> = rs_outputs
+        let rs_prefixes: Vec<crate::pcs::tensor_algebra::TensorAlgebra256> = rs_outputs
             .iter()
             .zip(x_outers.iter())
             .map(|(_out, x_outer)| {
                 // x_outer[1..] has length log_n; we feed only the ris prefix.
-                ring_switch::eval_rs_eq_prefix(&x_outer[1..1 + prefix_len], ris)
+                ring_switch::eval_rs_eq_prefix_f256(&x_outer[1..1 + prefix_len], ris)
             })
             .collect();
 
@@ -1102,9 +1101,16 @@ pub fn verify_opening_batch_ligerito_mixed_with_grinding<Ch: Challenger>(
                 }
             })
             .collect();
-        let pd_prefix_scalars: Vec<F128> = pd_points_rot
+        let pd_prefix_scalars: Vec<F256> = pd_points_rot
             .iter()
-            .map(|pt| eq_eval(&pt[..prefix_len], ris))
+            .map(|pt| {
+                pt[..prefix_len]
+                    .iter()
+                    .zip(ris)
+                    .fold(F256::ONE, |acc, (&p, &r)| {
+                        acc * (F256::ONE + F256::from(p) + r)
+                    })
+            })
             .collect();
 
         // ---- Per-y assembly (parallel over yr positions; each y is independent).
@@ -1117,7 +1123,7 @@ pub fn verify_opening_batch_ligerito_mixed_with_grinding<Ch: Challenger>(
             .into_par_iter()
             .map(|y| {
                 let y_bits = y as u32;
-                let mut sum = F128::ZERO;
+                let mut sum = F256::ZERO;
                 for (((out, g), x_outer), prefix) in rs_outputs
                     .iter()
                     .zip(gammas_rs.iter())
@@ -1125,7 +1131,7 @@ pub fn verify_opening_batch_ligerito_mixed_with_grinding<Ch: Challenger>(
                     .zip(rs_prefixes.iter())
                 {
                     sum += *g
-                        * ring_switch::eval_rs_eq_finish_from_prefix_binary_q(
+                        * ring_switch::eval_rs_eq_finish_from_prefix_binary_q_f256(
                             prefix,
                             &x_outer[1 + prefix_len..],
                             y_bits,
@@ -1137,12 +1143,17 @@ pub fn verify_opening_batch_ligerito_mixed_with_grinding<Ch: Challenger>(
                     .zip(gammas_pd.iter())
                     .zip(pd_prefix_scalars.iter())
                 {
-                    sum += *g
-                        * *prefix_scalar
-                        * crate::zerocheck::multilinear::eq_eval_binary_x(
-                            &pt[prefix_len..],
-                            y_bits,
-                        );
+                    let suffix = pt[prefix_len..]
+                        .iter()
+                        .enumerate()
+                        .fold(F128::ONE, |acc, (j, &p)| {
+                            acc * if (y_bits >> j) & 1 == 1 {
+                                p
+                            } else {
+                                F128::ONE + p
+                            }
+                        });
+                    sum += *prefix_scalar * (*g * suffix);
                 }
                 sum
             })
@@ -1151,7 +1162,7 @@ pub fn verify_opening_batch_ligerito_mixed_with_grinding<Ch: Challenger>(
 
     // 5. Drive ligerito SUCCINCT verifier — eval_b_residual is called ONCE
     //    at the residual check (returns all yr_len values in one batch).
-    let ok = ligerito::recursive_verifier_with_basis_succinct(
+    let ok = ligerito::extension::recursive_verifier_with_basis_succinct(
         lig_config,
         &proof.ligerito,
         log_n,
@@ -2225,50 +2236,19 @@ mod tests {
         let z_packed = pack_witness(&z, m);
         let (commitment, prover_data) = commit(&z_packed, &params);
 
-        let recursive_ks = vec![3usize, 3, 3];
-        let log_inv_rates = vec![1usize, 3, 4, 6];
-        let queries: Vec<usize> = log_inv_rates
-            .iter()
-            .map(|&r| crate::pcs::ligerito::udr_queries(r))
-            .collect();
-        let grinding_bits = vec![0usize; log_inv_rates.len()];
-        let n_levels = log_inv_rates.len();
-        let lig_p_cfg = crate::pcs::ligerito::ProverConfig {
-            log_inv_rates: log_inv_rates.clone(),
-            recursive_steps: recursive_ks.len(),
-            initial_log_msg_cols: (m - LOG_PACKING) - initial_k,
-            initial_log_num_interleaved: initial_k,
+        let log_n = m - LOG_PACKING;
+        let lig_p_cfg = crate::pcs::ligerito::prover_config_for(
+            log_n,
             initial_k,
-            recursive_log_msg_cols: vec![6, 3, 0],
-            recursive_ks: recursive_ks.clone(),
-            queries: queries.clone(),
-            grinding_bits: grinding_bits.clone(),
-            fold_grinding_bits: vec![0; n_levels],
-            claim_batch_grinding_bits: vec![0; n_levels],
-            consistency_batch_grinding_bits: vec![0; n_levels],
-            ood_samples: vec![0; n_levels],
-            merkle_hash: Default::default(),
-            stratified: vec![],
-        }
-        .with_default_stratified();
-        let lig_v_cfg = crate::pcs::ligerito::VerifierConfig {
-            log_inv_rates,
-            recursive_steps: recursive_ks.len(),
-            initial_log_msg_cols: (m - LOG_PACKING) - initial_k,
-            initial_log_num_interleaved: initial_k,
+            crate::pcs::ligerito::LigeritoProfile::Fast,
+        )
+        .expect("m22 Fast prover config");
+        let lig_v_cfg = crate::pcs::ligerito::verifier_config_for(
+            log_n,
             initial_k,
-            recursive_log_msg_cols: vec![6, 3, 0],
-            recursive_ks,
-            queries,
-            grinding_bits,
-            fold_grinding_bits: vec![0; n_levels],
-            claim_batch_grinding_bits: vec![0; n_levels],
-            consistency_batch_grinding_bits: vec![0; n_levels],
-            ood_samples: vec![0; n_levels],
-            merkle_hash: Default::default(),
-            stratified: vec![],
-        }
-        .with_default_stratified();
+            crate::pcs::ligerito::LigeritoProfile::Fast,
+        )
+        .expect("m22 Fast verifier config");
 
         let mut ch_p = FsChallenger::new(b"flock-test-lig-v0");
         let proof = open_batch_mixed_ligerito_with_precomputed_s_hat_v(

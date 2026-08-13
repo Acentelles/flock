@@ -36,7 +36,7 @@
 //! real one (218 openings, depth 13, 1 KiB leaves).
 
 use flock_core::circuit::builder::{CircuitBuilder, GateType, ShapeBuilder, SlotWitness, Wire};
-use flock_core::field::F128;
+use flock_core::field::{F128, F256};
 use flock_core::matrix_fold::{MatrixClaim, Weight};
 use flock_core::merkle::{self as core_merkle, HashKind};
 use flock_core::pcs::PcsParams;
@@ -66,7 +66,7 @@ fn pcs_batch(union: &UnionInstance) -> usize {
 
 /// `TOWER_PROFILE=slim` flips the RECURSION-PATH commits (the leaf's
 /// workload inner, the leaf outer, the node outer) to Slim — rate 1/4,
-/// roughly HALF the queries (m29: Σq 262 vs Fast's 491), so the
+/// roughly half the strict-profile queries (m29: Σq 347 vs Fast's 629), so the
 /// openings-dominated b3 trace shrinks with q while the doubled codeword
 /// lands on the native NTT+Merkle side. `TOWER_PROFILE=secure` selects the
 /// Secure PCS schedules and every Secure algebraic-grinding policy exercised
@@ -178,7 +178,7 @@ struct EnvShape {
     /// comparison. Boolean slots come first (b3, swap, spread, pow), then
     /// element types by cache key.
     counts_bool: [usize; 4],
-    counts_el: [(usize, usize); 15],
+    counts_el: [(usize, usize); 25],
     /// publics* — the ONE public-segment length every envelope outer pads
     /// to (published zeros appended after all real publics). The child's
     /// publics count is what a PARENT's walk consumes — H(publics) chain
@@ -239,12 +239,10 @@ fn steady_reps() -> usize {
 /// shorter shape — a dev-size chain, a fold with fewer groups — rides the
 /// same layout and a reader simply stops at its own group widths.
 const ENV_ACC_CHAIN_WORDS: usize = 160;
-// 768, was 640 (was 600): the wall-3 live word grew every entry by one,
-// and the SPINE layout adds, to the keyed groups, a published KEY (two
-// words per entry) and a second SLOT — the node-child slot, dead in a
-// fresh-only node, which is what lets a base node and a steady node be
-// read at the same offsets.
-const ENV_ACC_MAIN_WORDS: usize = 768;
+// F256 verification adds extension-field table claims to the shared
+// registry. A live node uses 1,028 words; keep a fixed-shape margin so the
+// same block carries the accumulator at every recursive level.
+const ENV_ACC_MAIN_WORDS: usize = 1152;
 
 /// THE PASSENGER (wall 3): one sigma-shaped and one jagged-shaped entry,
 /// same layout as the ACC_MAIN keyed slots. A spine node's node-slot
@@ -365,10 +363,13 @@ fn envelope_shape() -> Option<EnvShape> {
             // extra keyed slot's rounds (measured 949 live).
             (400, 1000),
             (0, 9000),    // spine
+            (700, 9000),  // extension-field Ligerito spine
+            (701, 15000), // extension-field multiply-accumulate
             (601, 300),   // assist
             (510, 64),    // skip-node (leaf-only usage)
             (511, 1),     // skip-close (leaf-only usage)
             (8, 4200),    // leaf-eval 8-lane
+            (808, 4200),  // extension-field leaf evaluation
             (115, 900),   // resid pl 15 (the m32 chain ladder's level 0)
             (112, 1100),  // resid pl 12
             (109, 740),   // resid pl 9
@@ -376,14 +377,23 @@ fn envelope_shape() -> Option<EnvShape> {
             (103, 450),   // resid pl 3
             (100, 400),   // resid pl 0
             (318, 15000), // prefix w 8
+            (915, 900),   // extension residual pl 15
+            (912, 1100),  // extension residual pl 12
+            (909, 740),   // extension residual pl 9
+            (906, 560),   // extension residual pl 6
+            (903, 450),   // extension residual pl 3
+            (900, 400),   // extension residual pl 0
+            (1008, 15000), // extension prefix w 8
         ],
-        publics: 5300,
+        // Preserve the existing public body while enlarging ACC_MAIN.
+        publics: 5684,
         // The committed lane count — the ONE piece of a child's layout that
         // stays circuit structure (the parent hashes `num_lanes`-word
         // leaves), so it is pinned while everything count-shaped rides the
         // jagged claims. 24 covers every envelope member's content-derived
-        // count at min-one-row (FL 12 at dev / 23 at m32, internal 18) and
-        // stays below `2^initial_k = 32`, so children remain lane-major.
+        // count at min-one-row. F256 raises the largest live content to 25
+        // lanes; 31 stays below `2^initial_k = 32`, so children remain
+        // lane-major.
         // `ENV_LANES=n` re-pins it for EXPERIMENTS (the FL-arity pricing
         // runs: a wider FL's content overflows 24) — a mixed-pin tower dies
         // on the digest asserts, so misuse is loud, never silent. The
@@ -398,7 +408,7 @@ fn envelope_shape() -> Option<EnvShape> {
                 std::env::var("ENV_LANES")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(24)
+                    .unwrap_or(31)
             }
         },
     })
@@ -461,17 +471,24 @@ fn declare_envelope_slots(
     slot_cached(sb, cache, 500, ZcRoundGate::new);
     slot_cached(sb, cache, 400, MergedRoundGate::new);
     slot_cached(sb, cache, 0, SpineGate::new);
+    slot_cached(sb, cache, 700, SpineGate256::new);
+    slot_cached(sb, cache, 701, MacGate256::new);
     slot_cached(sb, cache, 601, AssistLayerGate::new);
     slot_cached(sb, cache, 510, SkipNodeGate::new);
     slot_cached(sb, cache, 511, SkipCloseGate::new);
     slot_cached(sb, cache, 8, || LeafEvalGate::new(8));
+    slot_cached(sb, cache, 808, || LeafEvalGate256::new(8));
     for &pl in &env.resid_pls {
         let lmc = pl + 3; // chunk_log 3 — both ladders' yr_log >= 3
         slot_cached(sb, cache, 100 + pl, || {
             ResidualGate::new(lmc, pl, 3, &sk_at_vks(lmc))
         });
+        slot_cached(sb, cache, 900 + pl, || {
+            ResidualGate256::new(lmc, pl, 3, &sk_at_vks(lmc))
+        });
     }
     slot_cached(sb, cache, 310 + env.pf_w, || PrefixGate::new(env.pf_w));
+    slot_cached(sb, cache, 1000 + env.pf_w, || PrefixGate256::new(env.pf_w));
     q
 }
 
@@ -1740,6 +1757,230 @@ impl GateType for LeafEvalGate {
         z[lay.t] = z[lay.alpha] * z[lay.y()];
         z[lay.acc] = z[lay.prev] + z[lay.t];
         outputs.extend_from_slice(&[z[lay.acc]]);
+        z
+    }
+
+    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
+        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
+        for (j, row) in rows.iter().enumerate() {
+            for (c, &v) in row.iter().enumerate() {
+                z[(c << nu) + j] = v;
+            }
+        }
+        SlotWitness::Element(z)
+    }
+}
+
+/// Extension-field version of the opened-row evaluation. Each extension
+/// value is represented by its `(c0, c1)` base-field wires. A product
+///
+/// ```text
+/// (a0 + a1 u)(b0 + b1 u),  u^2 = u + x^-1,
+/// ```
+///
+/// is constrained with the three Karatsuba products `a0 b0`, `a1 b1`, and
+/// `(a0+a1)(b0+b1)`; the two output limbs are linear combinations of those
+/// products. L0 words enter as `(word, 0)`, while recursive commitment rows
+/// already contain adjacent `(c0, c1)` words.
+struct LeafEvalGate256 {
+    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+    lay: LeafLayout256,
+}
+
+#[derive(Clone, Copy)]
+struct LeafLayout256 {
+    lanes: usize,
+    vars: usize,
+    v: usize,
+    alpha: usize,
+    prev: usize,
+    fold: usize,
+    n_in: usize,
+    t: usize,
+    acc: usize,
+    k: usize,
+    kappa: usize,
+}
+
+impl LeafLayout256 {
+    fn new(lanes: usize) -> Self {
+        assert!(lanes.is_power_of_two() && lanes >= 2);
+        let vars = lanes.trailing_zeros() as usize;
+        let v = 2 * lanes;
+        let alpha = v + 2 * vars;
+        let prev = alpha + 2;
+        let fold = prev + 2;
+        let t = fold + 5 * (lanes - 1);
+        let acc = t + 3;
+        let k = t + 5;
+        Self {
+            lanes,
+            vars,
+            v,
+            alpha,
+            prev,
+            fold,
+            n_in: fold,
+            t,
+            acc,
+            k,
+            kappa: k.next_power_of_two().trailing_zeros().max(2) as usize,
+        }
+    }
+
+    fn base(&self, l: usize) -> usize {
+        (1..l).fold(self.fold, |acc, k| acc + 5 * (self.lanes >> k))
+    }
+
+    fn prev_pair(&self, l: usize, j: usize) -> [usize; 2] {
+        if l == 1 {
+            [2 * j, 2 * j + 1]
+        } else {
+            let base = self.base(l - 1) + 5 * j;
+            [base + 3, base + 4]
+        }
+    }
+
+    fn y(&self) -> [usize; 2] {
+        let base = self.base(self.vars);
+        [base + 3, base + 4]
+    }
+}
+
+/// Emit `out = add + a*b` over F256, returning the next unused column.
+/// The five emitted columns are the three Karatsuba products and two limbs.
+fn build_mac256(
+    b: &mut flock_core::element_r1cs::ElementTableBuilder,
+    at: usize,
+    add: Option<[usize; 2]>,
+    a: [usize; 2],
+    rhs: [usize; 2],
+) -> usize {
+    let one = F128::ONE;
+    let nr = flock_core::field::gf2_256::QUADRATIC_NONRESIDUE;
+    b.mult(at, a[0], rhs[0]);
+    b.mult(at + 1, a[1], rhs[1]);
+    b.mult_lin(
+        at + 2,
+        &[(a[0], one), (a[1], one)],
+        &[(rhs[0], one), (rhs[1], one)],
+    );
+    let mut c0 = vec![(at, one), (at + 1, nr)];
+    let mut c1 = vec![(at + 2, one), (at, one)];
+    if let Some(add) = add {
+        c0.push((add[0], one));
+        c1.push((add[1], one));
+    }
+    b.linear(at + 3, &c0);
+    b.linear(at + 4, &c1);
+    at + 5
+}
+
+fn eval_mac256(add: F256, a: F256, b: F256) -> F256 {
+    add + a * b
+}
+
+impl LeafEvalGate256 {
+    fn new(lanes: usize) -> Self {
+        use flock_core::element_r1cs::ElementTableBuilder;
+        let one = F128::ONE;
+        let lay = LeafLayout256::new(lanes);
+        let mut b = ElementTableBuilder::new(lay.kappa);
+        for c in 0..lay.n_in {
+            b.free_wire(c);
+        }
+        for l in 1..=lay.vars {
+            for i in 0..(lay.lanes >> l) {
+                let left = lay.prev_pair(l, 2 * i);
+                let right = lay.prev_pair(l, 2 * i + 1);
+                let challenge = [lay.v + 2 * (l - 1), lay.v + 2 * (l - 1) + 1];
+                let at = lay.base(l) + 5 * i;
+                let nr = flock_core::field::gf2_256::QUADRATIC_NONRESIDUE;
+                b.mult_lin(at, &[(left[0], one), (right[0], one)], &[(challenge[0], one)]);
+                b.mult_lin(at + 1, &[(left[1], one), (right[1], one)], &[(challenge[1], one)]);
+                b.mult_lin(
+                    at + 2,
+                    &[
+                        (left[0], one),
+                        (right[0], one),
+                        (left[1], one),
+                        (right[1], one),
+                    ],
+                    &[(challenge[0], one), (challenge[1], one)],
+                );
+                b.linear(
+                    at + 3,
+                    &[(left[0], one), (at, one), (at + 1, nr)],
+                );
+                b.linear(
+                    at + 4,
+                    &[(left[1], one), (at + 2, one), (at, one)],
+                );
+            }
+        }
+        build_mac256(
+            &mut b,
+            lay.t,
+            Some([lay.prev, lay.prev + 1]),
+            [lay.alpha, lay.alpha + 1],
+            lay.y(),
+        );
+        Self {
+            ty: std::sync::Arc::new(b.build().expect("extension leaf-eval block is valid")),
+            lay,
+        }
+    }
+}
+
+impl GateType for LeafEvalGate256 {
+    type Row = Vec<F128>;
+    type Hint = ();
+
+    fn table(&self) -> TableType {
+        use flock_core::schedule::IoWord;
+        let mut schema: Vec<IoWord> = (0..self.lay.n_in).map(IoWord::input).collect();
+        schema.push(IoWord::output(self.lay.acc));
+        schema.push(IoWord::output(self.lay.acc + 1));
+        TableType::element(self.ty.clone()).with_io_schema(schema)
+    }
+
+    fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> Self::Row {
+        let lay = self.lay;
+        let mut z = vec![F128::ZERO; lay.k];
+        z[..lay.n_in].copy_from_slice(&inputs[..lay.n_in]);
+        for l in 1..=lay.vars {
+            for i in 0..(lay.lanes >> l) {
+                let lp = lay.prev_pair(l, 2 * i);
+                let rp = lay.prev_pair(l, 2 * i + 1);
+                let left = F256::new(z[lp[0]], z[lp[1]]);
+                let right = F256::new(z[rp[0]], z[rp[1]]);
+                let r = F256::new(z[lay.v + 2 * (l - 1)], z[lay.v + 2 * (l - 1) + 1]);
+                let out = eval_mac256(left, left + right, r);
+                let at = lay.base(l) + 5 * i;
+                let p0 = (left.c0 + right.c0) * r.c0;
+                let p1 = (left.c1 + right.c1) * r.c1;
+                let p2 = (left.c0 + right.c0 + left.c1 + right.c1) * (r.c0 + r.c1);
+                z[at] = p0;
+                z[at + 1] = p1;
+                z[at + 2] = p2;
+                z[at + 3] = out.c0;
+                z[at + 4] = out.c1;
+            }
+        }
+        let y = lay.y();
+        let alpha = F256::new(z[lay.alpha], z[lay.alpha + 1]);
+        let yv = F256::new(z[y[0]], z[y[1]]);
+        let prev = F256::new(z[lay.prev], z[lay.prev + 1]);
+        let p0 = alpha.c0 * yv.c0;
+        let p1 = alpha.c1 * yv.c1;
+        let p2 = (alpha.c0 + alpha.c1) * (yv.c0 + yv.c1);
+        z[lay.t] = p0;
+        z[lay.t + 1] = p1;
+        z[lay.t + 2] = p2;
+        let acc = prev + alpha * yv;
+        z[lay.acc] = acc.c0;
+        z[lay.acc + 1] = acc.c1;
+        outputs.extend_from_slice(&z[lay.acc..lay.acc + 2]);
         z
     }
 
@@ -3715,6 +3956,153 @@ impl GateType for SpineGate {
     }
 }
 
+/// The Ligerito sumcheck spine over F256. The batching coefficient `beta`
+/// remains a base-field scalar, while the quadratic, messages, fold
+/// challenge, running target, and outputs are pairs of base-field wires.
+struct SpineGate256 {
+    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+}
+
+const SP256_IN: usize = 17;
+const SP256_K: usize = 50;
+
+impl SpineGate256 {
+    fn new() -> Self {
+        use flock_core::element_r1cs::ElementTableBuilder;
+        let one = F128::ONE;
+        let pair = |at| [at, at + 1];
+        let (c, qb, qa, tr, u0, u2, y, beta, r) =
+            (pair(0), pair(2), pair(4), pair(6), pair(8), pair(10), pair(12), 14, pair(15));
+        let (pc, pb, pa, pt) = (pair(17), pair(19), pair(21), pair(23));
+        let (co, bo, ao, tro) = (pair(25), pair(27), pair(29), pair(31));
+        let mut b = ElementTableBuilder::new(6);
+        for w in 0..SP256_IN {
+            b.free_wire(w);
+        }
+        b.mult(pc[0], beta, u0[0]);
+        b.mult(pc[1], beta, u0[1]);
+        b.mult_lin(pb[0], &[(y[0], one), (u2[0], one)], &[(beta, one)]);
+        b.mult_lin(pb[1], &[(y[1], one), (u2[1], one)], &[(beta, one)]);
+        b.mult(pa[0], beta, u2[0]);
+        b.mult(pa[1], beta, u2[1]);
+        b.mult(pt[0], beta, y[0]);
+        b.mult(pt[1], beta, y[1]);
+        for (out, lhs, rhs) in [(co, c, pc), (bo, qb, pb), (ao, qa, pa), (tro, tr, pt)] {
+            b.linear(out[0], &[(lhs[0], one), (rhs[0], one)]);
+            b.linear(out[1], &[(lhs[1], one), (rhs[1], one)]);
+        }
+        let r2_at = 33;
+        build_mac256(&mut b, r2_at, None, r, r);
+        let r2 = pair(r2_at + 3);
+        let rb_at = 38;
+        build_mac256(&mut b, rb_at, None, r, bo);
+        let rb = pair(rb_at + 3);
+        let ra_at = 43;
+        build_mac256(&mut b, ra_at, None, r2, ao);
+        let ra = pair(ra_at + 3);
+        b.linear(48, &[(co[0], one), (rb[0], one), (ra[0], one)]);
+        b.linear(49, &[(co[1], one), (rb[1], one), (ra[1], one)]);
+        Self {
+            ty: std::sync::Arc::new(b.build().expect("extension spine gate is valid")),
+        }
+    }
+}
+
+impl GateType for SpineGate256 {
+    type Row = Vec<F128>;
+    type Hint = ();
+
+    fn table(&self) -> TableType {
+        use flock_core::schedule::IoWord;
+        let mut schema: Vec<IoWord> = (0..SP256_IN).map(IoWord::input).collect();
+        for o in [25, 26, 27, 28, 29, 30, 31, 32, 48, 49] {
+            schema.push(IoWord::output(o));
+        }
+        TableType::element(self.ty.clone()).with_io_schema(schema)
+    }
+
+    fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> Self::Row {
+        let get = |z: &[F128], at| F256::new(z[at], z[at + 1]);
+        let put = |z: &mut [F128], at, v: F256| {
+            z[at] = v.c0;
+            z[at + 1] = v.c1;
+        };
+        let mut z = vec![F128::ZERO; SP256_K];
+        z[..SP256_IN].copy_from_slice(&inputs[..SP256_IN]);
+        let (c, b, a, tr, u0, u2, y, beta, r) = (
+            get(&z, 0), get(&z, 2), get(&z, 4), get(&z, 6), get(&z, 8),
+            get(&z, 10), get(&z, 12), z[14], get(&z, 15),
+        );
+        let (pc, pb, pa, pt) = (u0 * beta, (y + u2) * beta, u2 * beta, y * beta);
+        put(&mut z, 17, pc);
+        put(&mut z, 19, pb);
+        put(&mut z, 21, pa);
+        put(&mut z, 23, pt);
+        let (co, bo, ao, tro) = (c + pc, b + pb, a + pa, tr + pt);
+        put(&mut z, 25, co);
+        put(&mut z, 27, bo);
+        put(&mut z, 29, ao);
+        put(&mut z, 31, tro);
+        let r2 = r * r;
+        let rb = r * bo;
+        let ra = r2 * ao;
+        for (at, x, lhs, rhs) in [(33, r2, r, r), (38, rb, r, bo), (43, ra, r2, ao)] {
+            let p0 = lhs.c0 * rhs.c0;
+            let p1 = lhs.c1 * rhs.c1;
+            let p2 = (lhs.c0 + lhs.c1) * (rhs.c0 + rhs.c1);
+            z[at] = p0;
+            z[at + 1] = p1;
+            z[at + 2] = p2;
+            put(&mut z, at + 3, x);
+        }
+        let to = co + rb + ra;
+        put(&mut z, 48, to);
+        outputs.extend_from_slice(&[
+            co.c0, co.c1, bo.c0, bo.c1, ao.c0, ao.c1, tro.c0, tro.c1, to.c0, to.c1,
+        ]);
+        z
+    }
+
+    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
+        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
+        for (j, row) in rows.iter().enumerate() {
+            for (col, &v) in row.iter().enumerate() {
+                z[(col << nu) + j] = v;
+            }
+        }
+        SlotWitness::Element(z)
+    }
+}
+
+fn emit_spine256(
+    sb: &mut ShapeBuilder,
+    slot: flock_core::circuit::builder::SlotId,
+    c: [Wire; 2],
+    b: [Wire; 2],
+    a: [Wire; 2],
+    tr: [Wire; 2],
+    u0: [Wire; 2],
+    u2: [Wire; 2],
+    y: [Wire; 2],
+    beta: Wire,
+    r: [Wire; 2],
+) -> [[Wire; 2]; 5] {
+    let inputs: Vec<Wire> = [c, b, a, tr, u0, u2, y]
+        .into_iter()
+        .flatten()
+        .chain([beta])
+        .chain(r)
+        .collect();
+    let out = sb.gate(slot, &inputs);
+    [
+        [out[0], out[1]],
+        [out[2], out[3]],
+        [out[4], out[5]],
+        [out[6], out[7]],
+        [out[8], out[9]],
+    ]
+}
+
 /// The residual-basis gate (step 2b): one query's contribution to a level's
 /// `induce_sumcheck_evaluate_at_residual`, at every residual position `y`.
 ///
@@ -3966,6 +4354,252 @@ impl GateType for ResidualGate {
     }
 }
 
+/// Residual-basis accumulation for extension-valued fold challenges. The
+/// novel-basis chain and query weights are base-field values; only the
+/// products involving later fold challenges and the running accumulators
+/// need two limbs.
+struct ResidualGate256 {
+    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+    sks_vks: Vec<F128>,
+    inv_sks: Vec<F128>,
+    acc_out: Vec<[usize; 2]>,
+    lmc: usize,
+    pl: usize,
+    yr: usize,
+    n_in: usize,
+    k: usize,
+}
+
+impl ResidualGate256 {
+    fn new(log_msg_cols: usize, prefix_len: usize, yr_log_n: usize, sks_vks: &[F128]) -> Self {
+        use flock_core::element_r1cs::ElementTableBuilder;
+        let one_w = F128::ONE;
+        let nr = flock_core::field::QUADRATIC_NONRESIDUE;
+        let (lmc, pl, yl) = (log_msg_cols, prefix_len, yr_log_n);
+        assert_eq!(pl + yl, lmc);
+        let yr = 1usize << yl;
+        let inv = |v: F128| if v == F128::ZERO { F128::ZERO } else { v.inv() };
+        // q | ris pairs | aw | one | zero | accumulator pairs
+        let aw = 1 + 2 * pl;
+        let one = aw + 1;
+        let zero = one + 1;
+        let acc0 = zero + 1;
+        let n_in = acc0 + 2 * yr;
+        let c_need = n_in
+            + lmc.saturating_sub(1)
+            + 7 * pl
+            + (yr - 1 - yl)
+            + 2 * usize::from(pl > 0)
+            + 2 * (yr - 1)
+            + 2 * yr;
+        let kappa = gate_kappa(c_need);
+        let mut b = ElementTableBuilder::new(kappa);
+        for col in 0..n_in {
+            b.free_wire(col);
+        }
+        let mut c = n_in;
+        let mut s_col = vec![0usize];
+        for k in 1..lmc {
+            b.mult_lin(
+                c,
+                &[(s_col[k - 1], one_w)],
+                &[(s_col[k - 1], one_w), (one, sks_vks[k - 1])],
+            );
+            s_col.push(c);
+            c += 1;
+        }
+        let mut pr = [one, zero];
+        for k in 0..pl {
+            let ivk = inv(sks_vks[k]);
+            let rk = [1 + 2 * k, 1 + 2 * k + 1];
+            // pk = ris_k * (1 + W_k), where W_k is base-field valued.
+            b.mult_lin(c, &[(rk[0], one_w)], &[(one, one_w), (s_col[k], ivk)]);
+            b.mult_lin(c + 1, &[(rk[1], one_w)], &[(one, one_w), (s_col[k], ivk)]);
+            let pk = [c, c + 1];
+            c += 2;
+            // pr *= 1 + pk, using Karatsuba with a linear-form rhs.
+            b.mult_lin(c, &[(pr[0], one_w)], &[(one, one_w), (pk[0], one_w)]);
+            b.mult(c + 1, pr[1], pk[1]);
+            b.mult_lin(
+                c + 2,
+                &[(pr[0], one_w), (pr[1], one_w)],
+                &[(one, one_w), (pk[0], one_w), (pk[1], one_w)],
+            );
+            b.linear(c + 3, &[(c, one_w), (c + 1, nr)]);
+            b.linear(c + 4, &[(c + 2, one_w), (c, one_w)]);
+            pr = [c + 3, c + 4];
+            c += 5;
+        }
+        let wf = |j: usize| (s_col[pl + j], inv(sks_vks[pl + j]));
+        let mut sp: Vec<Option<usize>> = vec![None; yr];
+        for y in 1..yr {
+            if !y.is_power_of_two() {
+                let low = y & y.wrapping_neg();
+                let jl = low.trailing_zeros() as usize;
+                let rest = y ^ low;
+                if rest.is_power_of_two() {
+                    b.mult_lin(c, &[wf(rest.trailing_zeros() as usize)], &[wf(jl)]);
+                } else {
+                    b.mult_lin(c, &[(sp[rest].unwrap(), one_w)], &[wf(jl)]);
+                }
+                sp[y] = Some(c);
+                c += 1;
+            }
+        }
+        let t = if pl > 0 {
+            b.mult(c, aw, pr[0]);
+            b.mult(c + 1, aw, pr[1]);
+            c += 2;
+            [c - 2, c - 1]
+        } else {
+            [aw, zero]
+        };
+        let mut acc_out = Vec::with_capacity(yr);
+        for y in 0..yr {
+            let cy = if y == 0 {
+                t
+            } else {
+                let factor = if y.is_power_of_two() {
+                    wf(y.trailing_zeros() as usize)
+                } else {
+                    (sp[y].unwrap(), one_w)
+                };
+                b.mult_lin(c, &[(t[0], one_w)], &[factor]);
+                b.mult_lin(c + 1, &[(t[1], one_w)], &[factor]);
+                c += 2;
+                [c - 2, c - 1]
+            };
+            b.linear(c, &[(acc0 + 2 * y, one_w), (cy[0], one_w)]);
+            b.linear(c + 1, &[(acc0 + 2 * y + 1, one_w), (cy[1], one_w)]);
+            acc_out.push([c, c + 1]);
+            c += 2;
+        }
+        assert_eq!(c, c_need, "the extension residual column count is exact");
+        Self {
+            ty: std::sync::Arc::new(b.build().expect("extension residual gate is valid")),
+            sks_vks: sks_vks.to_vec(),
+            inv_sks: sks_vks.iter().map(|&v| inv(v)).collect(),
+            acc_out,
+            lmc,
+            pl,
+            yr,
+            n_in,
+            k: c,
+        }
+    }
+}
+
+impl GateType for ResidualGate256 {
+    type Row = Vec<F128>;
+    type Hint = ();
+
+    fn table(&self) -> TableType {
+        use flock_core::schedule::IoWord;
+        let mut schema: Vec<IoWord> = (0..self.n_in).map(IoWord::input).collect();
+        for &p in &self.acc_out {
+            schema.push(IoWord::output(p[0]));
+            schema.push(IoWord::output(p[1]));
+        }
+        TableType::element(self.ty.clone()).with_io_schema(schema)
+    }
+
+    fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> Self::Row {
+        let (lmc, pl) = (self.lmc, self.pl);
+        let yl = lmc - pl;
+        let aw_col = 1 + 2 * pl;
+        let one_col = aw_col + 1;
+        let zero_col = one_col + 1;
+        let acc0 = zero_col + 1;
+        let mut z = vec![F128::ZERO; self.k];
+        z[..self.n_in].copy_from_slice(&inputs[..self.n_in]);
+        let mut c = self.n_in;
+        let mut s_col = vec![0usize];
+        for k in 1..lmc {
+            z[c] = z[s_col[k - 1]] * (z[s_col[k - 1]] + self.sks_vks[k - 1]);
+            s_col.push(c);
+            c += 1;
+        }
+        let mut pr = F256::new(z[one_col], z[zero_col]);
+        for k in 0..pl {
+            let ris = F256::new(z[1 + 2 * k], z[1 + 2 * k + 1]);
+            let w = z[s_col[k]] * self.inv_sks[k];
+            let pk = ris * (z[one_col] + w);
+            z[c] = pk.c0;
+            z[c + 1] = pk.c1;
+            c += 2;
+            let factor = F256::new(z[one_col] + pk.c0, pk.c1);
+            let lhs = pr;
+            let product = lhs * factor;
+            z[c] = lhs.c0 * factor.c0;
+            z[c + 1] = lhs.c1 * factor.c1;
+            z[c + 2] = (lhs.c0 + lhs.c1) * (factor.c0 + factor.c1);
+            z[c + 3] = product.c0;
+            z[c + 4] = product.c1;
+            pr = product;
+            c += 5;
+        }
+        let w: Vec<F128> = (0..yl)
+            .map(|j| z[s_col[pl + j]] * self.inv_sks[pl + j])
+            .collect();
+        let mut sp: Vec<Option<usize>> = vec![None; self.yr];
+        for y in 1..self.yr {
+            if !y.is_power_of_two() {
+                let low = y & y.wrapping_neg();
+                let jl = low.trailing_zeros() as usize;
+                let rest = y ^ low;
+                z[c] = if rest.is_power_of_two() {
+                    w[rest.trailing_zeros() as usize] * w[jl]
+                } else {
+                    z[sp[rest].unwrap()] * w[jl]
+                };
+                sp[y] = Some(c);
+                c += 1;
+            }
+        }
+        let t = if pl > 0 {
+            z[c] = z[aw_col] * pr.c0;
+            z[c + 1] = z[aw_col] * pr.c1;
+            c += 2;
+            F256::new(z[c - 2], z[c - 1])
+        } else {
+            F256::new(z[aw_col], z[zero_col])
+        };
+        let mut out = Vec::with_capacity(2 * self.yr);
+        for y in 0..self.yr {
+            let cy = if y == 0 {
+                t
+            } else {
+                let f = if y.is_power_of_two() {
+                    w[y.trailing_zeros() as usize]
+                } else {
+                    z[sp[y].unwrap()]
+                };
+                z[c] = t.c0 * f;
+                z[c + 1] = t.c1 * f;
+                c += 2;
+                F256::new(z[c - 2], z[c - 1])
+            };
+            z[c] = z[acc0 + 2 * y] + cy.c0;
+            z[c + 1] = z[acc0 + 2 * y + 1] + cy.c1;
+            out.push(z[c]);
+            out.push(z[c + 1]);
+            c += 2;
+        }
+        outputs.extend_from_slice(&out);
+        z
+    }
+
+    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
+        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
+        for (j, row) in rows.iter().enumerate() {
+            for (col, &v) in row.iter().enumerate() {
+                z[(col << nu) + j] = v;
+            }
+        }
+        SlotWitness::Element(z)
+    }
+}
+
 /// An element slot input that writes only the LIVE row prefix of each
 /// column. The destination block arrives freshly zeroed (element unions
 /// never pool dirty buffers) and the source's dead words are zero by the
@@ -4119,6 +4753,113 @@ impl GateType for PrefixGate {
     }
 }
 
+/// Extension-field prefix product `seed * product_j (1 + a_j + b_j)`.
+/// Every value occupies two base-field wires; `one` and `zero` inputs make
+/// the constant extension element `(1, 0)` explicit and preserve the
+/// all-zero padding-row convention.
+struct PrefixGate256 {
+    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+    pl: usize,
+    n_in: usize,
+    out: [usize; 2],
+    k: usize,
+}
+
+impl PrefixGate256 {
+    fn new(pl: usize) -> Self {
+        use flock_core::element_r1cs::ElementTableBuilder;
+        let o = F128::ONE;
+        let n_in = 4 + 4 * pl; // seed pair, a pairs, b pairs, one, zero
+        let one = n_in - 2;
+        let zero = n_in - 1;
+        let mut b = ElementTableBuilder::new(gate_kappa(n_in + 5 * pl));
+        for w in 0..n_in {
+            b.free_wire(w);
+        }
+        let mut c = n_in;
+        let mut pr = [0, 1];
+        for j in 0..pl {
+            let a = [2 + 2 * j, 2 + 2 * j + 1];
+            let bs = 2 + 2 * pl + 2 * j;
+            let factor0 = vec![(one, o), (a[0], o), (bs, o)];
+            let factor1 = vec![(zero, o), (a[1], o), (bs + 1, o)];
+            let nr = flock_core::field::QUADRATIC_NONRESIDUE;
+            b.mult_lin(c, &[(pr[0], o)], &factor0);
+            b.mult_lin(c + 1, &[(pr[1], o)], &factor1);
+            b.mult_lin(
+                c + 2,
+                &[(pr[0], o), (pr[1], o)],
+                &[
+                    (one, o),
+                    (zero, o),
+                    (a[0], o),
+                    (a[1], o),
+                    (bs, o),
+                    (bs + 1, o),
+                ],
+            );
+            b.linear(c + 3, &[(c, o), (c + 1, nr)]);
+            b.linear(c + 4, &[(c + 2, o), (c, o)]);
+            pr = [c + 3, c + 4];
+            c += 5;
+        }
+        Self {
+            ty: std::sync::Arc::new(b.build().expect("extension prefix gate")),
+            pl,
+            n_in,
+            out: pr,
+            k: c,
+        }
+    }
+}
+
+impl GateType for PrefixGate256 {
+    type Row = Vec<F128>;
+    type Hint = ();
+
+    fn table(&self) -> TableType {
+        use flock_core::schedule::IoWord;
+        let mut schema: Vec<IoWord> = (0..self.n_in).map(IoWord::input).collect();
+        schema.push(IoWord::output(self.out[0]));
+        schema.push(IoWord::output(self.out[1]));
+        TableType::element(self.ty.clone()).with_io_schema(schema)
+    }
+
+    fn eval(&self, inputs: &[F128], _h: &(), outputs: &mut Vec<F128>) -> Self::Row {
+        let mut z = vec![F128::ZERO; self.k];
+        z[..self.n_in].copy_from_slice(&inputs[..self.n_in]);
+        let one = self.n_in - 2;
+        let zero = self.n_in - 1;
+        let mut c = self.n_in;
+        let mut pr = F256::new(z[0], z[1]);
+        for j in 0..self.pl {
+            let a = F256::new(z[2 + 2 * j], z[2 + 2 * j + 1]);
+            let bs = 2 + 2 * self.pl + 2 * j;
+            let factor = F256::new(z[one], z[zero]) + a + F256::new(z[bs], z[bs + 1]);
+            let product = pr * factor;
+            z[c] = pr.c0 * factor.c0;
+            z[c + 1] = pr.c1 * factor.c1;
+            z[c + 2] = (pr.c0 + pr.c1) * (factor.c0 + factor.c1);
+            z[c + 3] = product.c0;
+            z[c + 4] = product.c1;
+            pr = product;
+            c += 5;
+        }
+        outputs.extend_from_slice(&[pr.c0, pr.c1]);
+        z
+    }
+
+    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
+        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
+        for (j, row) in rows.iter().enumerate() {
+            for (col, &v) in row.iter().enumerate() {
+                z[(col << nu) + j] = v;
+            }
+        }
+        SlotWitness::Element(z)
+    }
+}
+
 /// One merged W-round of the verifier (`jagged::fold_round_claim`):
 /// `t' = (t + g1) + (t + gi) r + gi r^2` — messages `(G(1), G(inf))` wire
 /// from the absorbed stream, `r` from the chain squeeze; the chain of these
@@ -4228,6 +4969,76 @@ impl GateType for MacGate {
         }
         SlotWitness::Element(z)
     }
+}
+
+/// Extension-field multiply-accumulate `out = acc + x*y`.
+struct MacGate256 {
+    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
+}
+
+impl MacGate256 {
+    fn new() -> Self {
+        use flock_core::element_r1cs::ElementTableBuilder;
+        let mut b = ElementTableBuilder::new(4);
+        for w in 0..6 {
+            b.free_wire(w);
+        }
+        build_mac256(&mut b, 6, Some([0, 1]), [2, 3], [4, 5]);
+        Self {
+            ty: std::sync::Arc::new(b.build().expect("extension mac gate")),
+        }
+    }
+}
+
+impl GateType for MacGate256 {
+    type Row = Vec<F128>;
+    type Hint = ();
+
+    fn table(&self) -> TableType {
+        use flock_core::schedule::IoWord;
+        let mut schema: Vec<IoWord> = (0..6).map(IoWord::input).collect();
+        schema.push(IoWord::output(9));
+        schema.push(IoWord::output(10));
+        TableType::element(self.ty.clone()).with_io_schema(schema)
+    }
+
+    fn eval(&self, inputs: &[F128], _h: &(), outputs: &mut Vec<F128>) -> Self::Row {
+        let acc = F256::new(inputs[0], inputs[1]);
+        let x = F256::new(inputs[2], inputs[3]);
+        let y = F256::new(inputs[4], inputs[5]);
+        let product = x * y;
+        let out = acc + product;
+        let mut z = vec![F128::ZERO; 11];
+        z[..6].copy_from_slice(&inputs[..6]);
+        z[6] = x.c0 * y.c0;
+        z[7] = x.c1 * y.c1;
+        z[8] = (x.c0 + x.c1) * (y.c0 + y.c1);
+        z[9] = out.c0;
+        z[10] = out.c1;
+        outputs.extend_from_slice(&[out.c0, out.c1]);
+        z
+    }
+
+    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
+        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
+        for (j, row) in rows.iter().enumerate() {
+            for (col, &v) in row.iter().enumerate() {
+                z[(col << nu) + j] = v;
+            }
+        }
+        SlotWitness::Element(z)
+    }
+}
+
+fn emit_mac256(
+    sb: &mut ShapeBuilder,
+    slot: flock_core::circuit::builder::SlotId,
+    acc: [Wire; 2],
+    x: [Wire; 2],
+    y: [Wire; 2],
+) -> [Wire; 2] {
+    let out = sb.gate(slot, &[acc[0], acc[1], x[0], x[1], y[0], y[1]]);
+    [out[0], out[1]]
 }
 
 /// One layer of the multipoint anchor's 4-state boundary DP (MVP-8 step 3;
@@ -4882,6 +5693,16 @@ fn parse_open_levels(
             self.bump();
         }
 
+        fn expect_obs_f256(&mut self) {
+            assert!(
+                matches!(self.ops[self.i], Op::ObserveSlice(2)),
+                "op {}: expected ObserveSlice(2), got {:?}",
+                self.i,
+                self.ops[self.i]
+            );
+            self.bump();
+        }
+
         /// PoW finalizes the transcript and absorbs a nonce but creates no
         /// field challenge or scalar message.  PIOP locators call this before
         /// every protected squeeze; the generic circuit relation constrains
@@ -4899,7 +5720,9 @@ fn parse_open_levels(
     // enter the tape at the wrong level.
     let label = ops
         .iter()
-        .position(|o| matches!(o, Op::Label(l) if l.as_slice() == b"flock-ligerito-basis-v0"))
+        .position(|o| {
+            matches!(o, Op::Label(l) if l.as_slice() == b"flock-ligerito-basis-f256-split-v0")
+        })
         .expect("Ligerito opening label");
     assert!(matches!(ops.get(label + 1), Some(Op::ObserveScalar)), "opening target");
     let start = label + 2;
@@ -5153,32 +5976,31 @@ fn parse_open_levels(
         cur.bump();
     }
     let start_v = cur.v;
-    cur.expect_obs_scalar(); // sumcheck start msg u_0
-    cur.expect_obs_scalar(); // ... u_2
+    cur.expect_obs_f256(); // sumcheck start msg u_0
+    cur.expect_obs_f256(); // ... u_2
 
     let mut levels = Vec::new();
     let mut yr_v = 0usize;
     for li in 0..=r {
-        // Fold batch: [Pow?] SqueezeScalar + ObserveScalar x2 per round. Only
-        // consume a Pow that fronts a fold — the query-grinding Pow follows
-        // this loop and must survive it.
+        // Fold batch: one double-width squeeze and two F256 message absorbs
+        // per round. Fold grinding is zero in the F256 protocol.
         let mut fold_fins = Vec::new();
         let mut fold_chs = Vec::new();
         let mut fold_msg_vs = Vec::new();
         loop {
             match cur.ops[cur.i] {
                 Op::Pow { .. }
-                    if matches!(cur.ops.get(cur.i + 1), Some(Op::SqueezeScalar)) =>
+                    if matches!(cur.ops.get(cur.i + 1), Some(Op::SqueezeSlice(2))) =>
                 {
                     cur.bump()
                 }
-                Op::SqueezeScalar => {
+                Op::SqueezeSlice(2) => {
                     fold_fins.push(cur.fin);
                     fold_chs.push(cur.ch);
                     cur.bump();
                     fold_msg_vs.push(cur.v);
-                    cur.expect_obs_scalar();
-                    cur.expect_obs_scalar();
+                    cur.expect_obs_f256();
+                    cur.expect_obs_f256();
                 }
                 _ => break,
             }
@@ -5201,10 +6023,10 @@ fn parse_open_levels(
                 let (z_fin, z_ch) = (cur.fin, cur.ch);
                 cur.bump();
                 let y_v = cur.v;
-                cur.expect_obs_scalar(); // y
+                cur.expect_obs_scalar(); // base-field y
                 let intro_v = cur.v;
-                cur.expect_obs_scalar(); // intro u_0
-                cur.expect_obs_scalar(); // intro u_2
+                cur.expect_obs_f256(); // intro u_0
+                cur.expect_obs_f256(); // intro u_2
                 cur.skip_pows();
                 assert!(matches!(cur.ops[cur.i], Op::SqueezeScalar), "OOD beta");
                 ood.push(OodRec {
@@ -5222,7 +6044,7 @@ fn parse_open_levels(
             // Final level: the yr observes.
             yr_v = cur.v;
             while matches!(cur.ops[cur.i], Op::ObserveScalar) {
-                cur.bump();
+                cur.expect_obs_scalar();
             }
         }
         assert!(
@@ -5245,8 +6067,8 @@ fn parse_open_levels(
         cur.bump();
         let intro_v = cur.v;
         if li < r {
-            cur.expect_obs_scalar(); // intro u_0
-            cur.expect_obs_scalar(); // intro u_2
+            cur.expect_obs_f256(); // intro u_0
+            cur.expect_obs_f256(); // intro u_2
         }
         cur.skip_pows();
         assert!(matches!(cur.ops[cur.i], Op::SqueezeScalar), "beta");
@@ -5578,11 +6400,11 @@ fn mvp7_real_query_phase() {
         .iter()
         .map(|g| {
             let lanes = g.lanes.min(8);
-            match leaf_slot.iter().find(|(n, _)| *n == lanes) {
+            match leaf_slot.iter().find(|(n, _)| *n == 800 + lanes) {
                 Some((_, s)) => *s,
                 None => {
-                    let s = sb.slot(LeafEvalGate::new(lanes));
-                    leaf_slot.push((lanes, s));
+                    let s = sb.slot(LeafEvalGate256::new(lanes));
+                    leaf_slot.push((800 + lanes, s));
                     s
                 }
             }
@@ -5781,12 +6603,22 @@ fn mvp7_real_query_phase() {
             let bw = chw(&outs, &trace.squeezes, lvl.beta_fin);
             let f = sb.gate(
                 spine,
-                &[qc, qb, qa, tw, wv(lvl.intro_v), wv(lvl.intro_v + 1), level_accs[li], bw, zw],
+                &[
+                    qc,
+                    qb,
+                    qa,
+                    tw,
+                    wv(lvl.intro_v),
+                    wv(lvl.intro_v + 1),
+                    level_accs[li][0],
+                    bw,
+                    zw,
+                ],
             );
             (qc, qb, qa, tw) = (f[0], f[1], f[2], f[3]);
         } else {
             let bw = chw(&outs, &trace.squeezes, lvl.beta_fin);
-            let f = sb.gate(spine, &[zw, zw, zw, tw, zw, zw, level_accs[li], bw, zw]);
+            let f = sb.gate(spine, &[zw, zw, zw, tw, zw, zw, level_accs[li][0], bw, zw]);
             tw = f[3];
         }
     }
@@ -5802,8 +6634,10 @@ fn mvp7_real_query_phase() {
     // merged-open v1: the points left the stream — pd_pts (the verifier's
     // own claim points) are the native reference; coordinates wire from the
     // element PIOP's round squeezes below.
-    let yr_len = proof.pcs_open.inner.ligerito.final_proof.yr.len();
-    let yr_wires: Vec<Wire> = (0..yr_len).map(|y| wv(yr_v + y)).collect();
+    let yr_len = proof.pcs_open.inner.ligerito.final_proof.yr.len() / 2;
+    let yr_wires: Vec<[Wire; 2]> = (0..yr_len)
+        .map(|y| [wv(yr_v + 2 * y), wv(yr_v + 2 * y + 1)])
+        .collect();
     let (resid_pub, inner_w, (pfslot, pf_w)) = emit_residual_region(
         &mut sb,
         &mut leaf_slot,
@@ -6081,10 +6915,12 @@ fn mvp7_real_query_phase() {
     sb.publish(lc_target);
     for accs in &resid_pub {
         for w in accs {
-            sb.publish(*w);
+            sb.publish(w[0]);
+            sb.publish(w[1]);
         }
     }
-    sb.publish(inner_w);
+    sb.publish(inner_w[0]);
+    sb.publish(inner_w[1]);
     sb.publish(delta_tm);
     sb.publish(delta_rq);
     sb.publish(delta_anchor);
@@ -6129,8 +6965,8 @@ fn mvp7_real_query_phase() {
             "multipoint zero-delta {i}"
         );
     }
-    let yr_pub = levels.len() * yr_len
-        + 1
+    let yr_pub = 2 * levels.len() * yr_len
+        + 2
         + 1
         + piop.zc_rounds.len()
         + 3
@@ -6151,36 +6987,16 @@ fn mvp7_real_query_phase() {
     // math, same start target, native enforced sums. Equality transitively
     // validates every eval/build/fold gate AND the LeafEval accumulators.
     let vals_rec = rec.values();
-    let quad = |u0: F128, u2: F128, t: F128| (u0, t + u2, u2);
-    let evalq = |q: (F128, F128, F128), x: F128| q.0 + x * q.1 + x * x * q.2;
-    // The bound start target: gamma' * q_eval.
-    let mut nt = chals[inner_pd.ch] * vals_rec[inner_pd.q_v];
-    for od in &levels[0].initial_ood {
-        nt += chals[od.beta_ch] * vals_rec[od.y_v];
-    }
-    let mut nq = quad(vals_rec[start_v], vals_rec[start_v + 1], nt);
-    for (li, lvl) in levels.iter().enumerate() {
-        for (j, &mv) in lvl.fold_msg_vs.iter().enumerate() {
-            nt = evalq(nq, chals[lvl.fold_chs[j]]);
-            nq = quad(vals_rec[mv], vals_rec[mv + 1], nt);
-        }
-        if li < levels.len() - 1 {
-            for od in &lvl.ood {
-                let b = chals[od.beta_ch];
-                let iq = quad(vals_rec[od.intro_v], vals_rec[od.intro_v + 1], vals_rec[od.y_v]);
-                nq = (nq.0 + b * iq.0, nq.1 + b * iq.1, nq.2 + b * iq.2);
-                nt += b * vals_rec[od.y_v];
-            }
-            let b = chals[lvl.beta_ch];
-            let iq = quad(vals_rec[lvl.intro_v], vals_rec[lvl.intro_v + 1], native_sums[li]);
-            nq = (nq.0 + b * iq.0, nq.1 + b * iq.1, nq.2 + b * iq.2);
-            nt += b * native_sums[li];
-        } else {
-            nt += chals[lvl.beta_ch] * native_sums[li];
-        }
-    }
-    assert_eq!(built.public[at], nt, "the spine's final t_r");
-    at += 1;
+    let nt = replay_ligerito_spine256(
+        &levels,
+        vals_rec,
+        &chals,
+        start_v,
+        chals[inner_pd.ch] * vals_rec[inner_pd.q_v],
+        &native_sums,
+    );
+    assert_eq!(F256::new(built.public[at], built.public[at + 1]), nt, "the spine's final t_r");
+    at += 2;
     // The merged rounds, natively: outer gamma-combination through
     // fold_round_claim. The native verify already enforced
     // `running == q_eval * v` (the assist stays native), so the published
@@ -6258,7 +7074,7 @@ fn mvp7_real_query_phase() {
         &geo,
         &w_rounds,
         inner_pd.ch,
-        &rec.values()[yr_v..yr_v + yr_len],
+        &observed_f256(rec.values(), yr_v, yr_len),
         &chals,
     );
     // THE CLOSURE: with the start target bound, the spine's t_r and the
@@ -6530,6 +7346,9 @@ struct Lvl {
     /// definitionally zero and never encoded). Equal to `lanes` whenever
     /// the lane count happens to be a power of two.
     row_words: usize,
+    /// Number of committed F128 words. Recursive codewords are also base
+    /// field rows; their extra coordinate bit is included in `folds`.
+    raw_row_words: usize,
     /// The stratified schedule this level's config mandates. Every
     /// consumer (emit, residual, checker) maps query → (stratum depth,
     /// stratum, path slice) through this.
@@ -6690,11 +7509,11 @@ fn level_geometry(
     chals: &[F128],
     hash: HashKind,
     scheds: &[flock_core::pcs::stratified::LevelSchedule],
-) -> (Vec<Lvl>, Vec<F128>) {
+) -> (Vec<Lvl>, Vec<F256>) {
     use flock_core::lincheck::build_eq_table;
     assert_eq!(scheds.len(), levels.len(), "one schedule per open level");
     let mut geo: Vec<Lvl> = Vec::new();
-    let mut native_sums: Vec<F128> = Vec::new();
+    let mut native_sums: Vec<F256> = Vec::new();
     for (li, lvl) in levels.iter().enumerate() {
         let (cap, rows, paths) = lvl_src[li];
         let q = lvl.q_count;
@@ -6715,14 +7534,28 @@ fn level_geometry(
         // NARROWER (its top lanes are definitionally zero), and the dot below
         // zips — which IS the zero-fill, exactly as the native verifier does.
         let lanes = 1usize << lvl.fold_fins.len();
-        let row_words = rows[0].len();
+        let raw_row_words = rows[0].len();
+        let row_words = raw_row_words;
         assert!(
             row_words >= 1 && row_words <= lanes,
             "L{li}: opened width {row_words} must fit the fold width {lanes}"
         );
-        let fold_vals: Vec<F128> = lvl.fold_chs.iter().map(|&i| chals[i]).collect();
+        let fold_vals: Vec<F256> = lvl
+            .fold_chs
+            .iter()
+            .map(|&i| F256::new(chals[i], chals[i + 1]))
+            .collect();
         let alpha_vals: Vec<F128> = (0..lvl.a_count).map(|j| chals[lvl.a_ch + j]).collect();
-        let eqv = build_eq_table(&fold_vals);
+        let mut eqv = vec![F256::ONE];
+        for &v in &fold_vals {
+            let old = eqv.len();
+            eqv.resize(2 * old, F256::ZERO);
+            for i in 0..old {
+                let x = eqv[i];
+                eqv[i + old] = x * v;
+                eqv[i] = x * (F256::ONE + v);
+            }
+        }
         let aw = build_eq_table(&alpha_vals);
         let c_min = sched.summand_depths.last().copied().unwrap_or(c);
         let lv = Lvl {
@@ -6731,6 +7564,7 @@ fn level_geometry(
             depth,
             lanes,
             row_words,
+            raw_row_words,
             sched: sched.clone(),
             cap_layers: native_cap_layers(cap, c - c_min, hash),
         };
@@ -6738,7 +7572,7 @@ fn level_geometry(
         // against the absorbed layer — no terminal-layer rebuild; the
         // stratum needs no enforcement because `q_pos` derives the index
         // itself with the stratum in the top bits.
-        let mut sum = F128::ZERO;
+        let mut sum = F256::ZERO;
         for (k, row) in rows.iter().enumerate() {
             let pos = lv.q_pos(k, chals[lvl.q_ch + k].lo);
             let mut leaf_bytes = Vec::with_capacity(16 * lanes);
@@ -6761,14 +7595,74 @@ fn level_geometry(
             let dot = row
                 .iter()
                 .zip(eqv.iter())
-                .map(|(&x, &e)| x * e)
-                .fold(F128::ZERO, |a, v| a + v);
+                .map(|(&x, &e)| F256::from(x) * e)
+                .fold(F256::ZERO, |a, v| a + v);
             sum += aw[k] * dot;
         }
         native_sums.push(sum);
         geo.push(lv);
     }
     (geo, native_sums)
+}
+
+fn replay_ligerito_spine256(
+    levels: &[OpenLevel],
+    values: &[F128],
+    challenges: &[F128],
+    start_v: usize,
+    initial_target: F128,
+    enforced_sums: &[F256],
+) -> F256 {
+    let msg = |at: usize| {
+        (
+            F256::new(values[at], values[at + 1]),
+            F256::new(values[at + 2], values[at + 3]),
+        )
+    };
+    let quad = |at: usize, target: F256| {
+        let (u0, u2) = msg(at);
+        (u0, target + u2, u2)
+    };
+    let eval = |q: (F256, F256, F256), r: F256| q.0 + r * q.1 + r * r * q.2;
+
+    let mut target = F256::from(initial_target);
+    for od in &levels[0].initial_ood {
+        target += F256::from(challenges[od.beta_ch] * values[od.y_v]);
+    }
+    let mut q = quad(start_v, target);
+    for (li, level) in levels.iter().enumerate() {
+        for (j, &mv) in level.fold_msg_vs.iter().enumerate() {
+            let ch = level.fold_chs[j];
+            target = eval(q, F256::new(challenges[ch], challenges[ch + 1]));
+            q = quad(mv, target);
+        }
+        if li + 1 < levels.len() {
+            for od in &level.ood {
+                let y = F256::from(values[od.y_v]);
+                let iq = quad(od.intro_v, y);
+                let beta = challenges[od.beta_ch];
+                q.0 += iq.0 * beta;
+                q.1 += iq.1 * beta;
+                q.2 += iq.2 * beta;
+                target += y * beta;
+            }
+            let iq = quad(level.intro_v, enforced_sums[li]);
+            let beta = challenges[level.beta_ch];
+            q.0 += iq.0 * beta;
+            q.1 += iq.1 * beta;
+            q.2 += iq.2 * beta;
+            target += enforced_sums[li] * beta;
+        } else {
+            target += enforced_sums[li] * challenges[level.beta_ch];
+        }
+    }
+    target
+}
+
+fn observed_f256(values: &[F128], start: usize, len: usize) -> Vec<F256> {
+    (0..len)
+        .map(|i| F256::new(values[start + 2 * i], values[start + 2 * i + 1]))
+        .collect()
 }
 
 /// Stream-word indices per `observe_bytes` payload, in payload-word order.
@@ -6958,10 +7852,10 @@ fn emit_query_phase(
     vals: &mut Vec<F128>,
     consts: &mut Vec<(F128, Wire)>,
     hints: &mut Vec<[u32; SLOT_WORDS]>,
-) -> (Vec<Vec<Wire>>, Vec<Wire>) {
+) -> (Vec<Vec<Wire>>, Vec<[Wire; 2]>) {
     use flock_core::lincheck::build_eq_table;
     let mut to_publish: Vec<Vec<Wire>> = Vec::new();
-    let mut level_accs: Vec<Wire> = Vec::new();
+    let mut level_accs: Vec<[Wire; 2]> = Vec::new();
     for (li, lvl) in levels.iter().enumerate() {
         let g = &geo[li];
         let (_cap, rows, paths) = lvl_src[li];
@@ -7007,10 +7901,15 @@ fn emit_query_phase(
             .map(|j| squeeze_word_wire(outs, trace, lvl.a_fin, j))
             .collect();
         // v: this level's fold challenges, chain outputs, wired straight in.
-        let v_wires: Vec<Wire> = lvl
+        let v_wires: Vec<[Wire; 2]> = lvl
             .fold_fins
             .iter()
-            .map(|&f| squeeze_word_wire(outs, trace, f, 0))
+            .map(|&f| {
+                [
+                    squeeze_word_wire(outs, trace, f, 0),
+                    squeeze_word_wire(outs, trace, f, 1),
+                ]
+            })
             .collect();
         let alpha_vals: Vec<F128> = (0..lvl.a_count).map(|j| chals[lvl.a_ch + j]).collect();
         let aw = build_eq_table(&alpha_vals);
@@ -7019,20 +7918,34 @@ fn emit_query_phase(
         let le_vars = g.lanes.min(8).trailing_zeros() as usize;
         let le_groups = g.lanes >> le_vars;
         let hw = {
-            let v_hi: Vec<F128> = lvl.fold_chs[le_vars..].iter().map(|&i| chals[i]).collect();
-            build_eq_table(&v_hi)
+            let v_hi: Vec<F256> = lvl.fold_chs[le_vars..]
+                .iter()
+                .map(|&i| F256::new(chals[i], chals[i + 1]))
+                .collect();
+            let mut table = vec![F256::ONE];
+            for r in v_hi {
+                let old = table.len();
+                table.resize(2 * old, F256::ZERO);
+                for i in 0..old {
+                    let x = table[i];
+                    table[i + old] = x * r;
+                    table[i] = x * (F256::ONE + r);
+                }
+            }
+            table
         };
-        let mut acc = cw(sb, vals, consts, F128::ZERO);
+        let zero = cw(sb, vals, consts, F128::ZERO);
+        let mut acc = [zero, zero];
         // Zero wire for the fold's known-zero top lanes (only declared when
         // the committed row is narrower than the fold).
         let pad_w = if g.row_words < g.lanes {
-            Some(cw(sb, vals, consts, F128::ZERO))
+            Some([zero, zero])
         } else {
             None
         };
         for k in 0..g.q {
             vals.extend_from_slice(&rows[k]);
-            let leaf_w: Vec<Wire> = (0..g.row_words).map(|_| sb.input()).collect();
+            let leaf_w: Vec<Wire> = (0..g.raw_row_words).map(|_| sb.input()).collect();
             let cw = squeeze_word_wire(outs, trace, lvl.q_fin, k);
             let (ck, stratum) = g.q_stratum(k);
             let open_depth = g.depth - ck;
@@ -7079,16 +7992,24 @@ fn emit_query_phase(
             sb.connect(bind[1], term[1]);
             // The fold reads the full `2^folds` domain: the committed words
             // then the definitionally-zero top lanes.
-            let mut fold_w = leaf_w.clone();
-            fold_w.resize(g.lanes, pad_w.unwrap_or(leaf_w[0]));
+            let mut fold_w: Vec<[Wire; 2]> =
+                leaf_w.iter().map(|&w| [w, zero]).collect();
+            fold_w.resize(g.lanes, pad_w.unwrap_or(fold_w[0]));
             let lanes = g.lanes.min(8);
             for h in 0..le_groups {
-                let mut a_in: Vec<Wire> = fold_w[lanes * h..lanes * (h + 1)].to_vec();
-                a_in.extend_from_slice(&v_wires[..le_vars]);
-                vals.push(aw[k] * hw[h]);
+                let mut a_in: Vec<Wire> = fold_w[lanes * h..lanes * (h + 1)]
+                    .iter()
+                    .flat_map(|p| *p)
+                    .collect();
+                a_in.extend(v_wires[..le_vars].iter().flat_map(|p| *p));
+                let weight = hw[h] * aw[k];
+                vals.push(weight.c0);
+                vals.push(weight.c1);
                 a_in.push(sb.input());
-                a_in.push(acc);
-                acc = sb.gate(leafeval[li], &a_in)[0];
+                a_in.push(sb.input());
+                a_in.extend_from_slice(&acc);
+                let out = sb.gate(leafeval[li], &a_in);
+                acc = [out[0], out[1]];
             }
         }
         to_publish.push(a_wires);
@@ -7141,7 +8062,7 @@ fn emit_residual_region(
     geo: &[Lvl],
     w_rounds: &[RoundRec],
     inner_pd_fin: usize,
-    yr_wires: &[Wire],
+    yr_wires: &[[Wire; 2]],
     trace: &flock_prover::r1cs_hashes::fs_chain::FsChainTrace,
     outs: &[Vec<Wire>],
     chals: &[F128],
@@ -7149,8 +8070,8 @@ fn emit_residual_region(
     zw: Wire,
     ow: Wire,
 ) -> (
-    Vec<Vec<Wire>>,
-    Wire,
+    Vec<Vec<[Wire; 2]>>,
+    [Wire; 2],
     (flock_core::circuit::builder::SlotId, usize),
 ) {
     use flock_core::lincheck::build_eq_table;
@@ -7161,10 +8082,19 @@ fn emit_residual_region(
     let chunk = 1usize << chunk_log;
     let n_chunks = 1usize << (yr_log - chunk_log);
     let inv = |v: F128| if v == F128::ZERO { F128::ZERO } else { v.inv() };
-    let chw = |fin: usize| -> Wire { squeeze_word_wire(outs, trace, fin, 0) };
-    let mut resid_pub: Vec<Vec<Wire>> = Vec::new();
+    let chw = |fin: usize| -> [Wire; 2] {
+        [
+            squeeze_word_wire(outs, trace, fin, 0),
+            squeeze_word_wire(outs, trace, fin, 1),
+        ]
+    };
+    let base_chw = |fin: usize| -> Wire { squeeze_word_wire(outs, trace, fin, 0) };
+    let mut resid_pub: Vec<Vec<[Wire; 2]>> = Vec::new();
     for (li, lvl) in levels.iter().enumerate() {
-        let pl: usize = levels[li + 1..].iter().map(|l| l.fold_fins.len()).sum();
+        let pl: usize = levels[li + 1..]
+            .iter()
+            .map(|l| l.fold_fins.len() - 1)
+            .sum();
         let lmc_full = pl + yr_log;
         let sks_full = sk_at_vks(lmc_full);
         let lmc = pl + chunk_log;
@@ -7180,21 +8110,21 @@ fn emit_residual_region(
         // cross-side pre-seeding needs. Distinct per level within a ladder
         // (pl strictly decreases), so off-envelope this keys identically to
         // the old per-level scheme.
-        let rslot = match leaf_slot.iter().find(|&&(k, _)| k == 100 + pl) {
+        let rslot = match leaf_slot.iter().find(|&&(k, _)| k == 900 + pl) {
             Some(&(_, s)) => s,
             None => {
-                let s = sb.slot(ResidualGate::new(lmc, pl, chunk_log, &sks));
-                leaf_slot.push((100 + pl, s));
+                let s = sb.slot(ResidualGate256::new(lmc, pl, chunk_log, &sks));
+                leaf_slot.push((900 + pl, s));
                 s
             }
         };
-        let ris_w: Vec<Wire> = levels[li + 1..]
+        let ris_w: Vec<[Wire; 2]> = levels[li + 1..]
             .iter()
-            .flat_map(|l| l.fold_fins.iter().map(|&f| chw(f)))
+            .flat_map(|l| l.fold_fins.iter().skip(1).map(|&f| chw(f)))
             .collect();
         let alpha_vals: Vec<F128> = (0..lvl.a_count).map(|j| chals[lvl.a_ch + j]).collect();
         let aw = build_eq_table(&alpha_vals);
-        let mut accs: Vec<Wire> = (0..yr_len).map(|_| zw).collect();
+        let mut accs: Vec<[Wire; 2]> = (0..yr_len).map(|_| [zw, zw]).collect();
         for k in 0..geo[li].q {
             let pos = geo[li].q_pos(k, chals[lvl.q_ch + k].lo);
             // The high subset factors sp_hi(h), natively from the full
@@ -7231,12 +8161,18 @@ fn emit_residual_region(
                 vals.push(aw[k] * sph);
                 let awp = sb.input();
                 let mut g_in = vec![qf];
-                g_in.extend_from_slice(&ris_w);
+                g_in.extend(ris_w.iter().flat_map(|p| *p));
                 g_in.push(awp);
                 g_in.push(ow);
-                g_in.extend_from_slice(&accs[h * chunk..(h + 1) * chunk]);
+                g_in.push(zw);
+                g_in.extend(accs[h * chunk..(h + 1) * chunk].iter().flat_map(|p| *p));
                 let out = sb.gate(rslot, &g_in);
-                accs[h * chunk..(h + 1) * chunk].copy_from_slice(&out);
+                for (dst, src) in accs[h * chunk..(h + 1) * chunk]
+                    .iter_mut()
+                    .zip(out.chunks_exact(2))
+                {
+                    *dst = [src[0], src[1]];
+                }
             }
         }
         resid_pub.push(accs);
@@ -7245,10 +8181,21 @@ fn emit_residual_region(
     // (rho, q_eval) with gamma'; rho's coords are the W-round squeezes —
     // chain wires. The OOD claims are the same shape, seed = beta, point =
     // the squeezed z.
-    let pl_full: usize = levels.iter().map(|l| l.fold_fins.len()).sum();
-    let ris_full: Vec<Wire> = levels
+    let total_fold_count: usize = levels.iter().map(|l| l.fold_fins.len()).sum();
+    let pl_full = levels[0].fold_fins.len()
+        + levels[1..]
+            .iter()
+            .map(|l| l.fold_fins.len() - 1)
+            .sum::<usize>();
+    let ris_full: Vec<[Wire; 2]> = levels[0]
+        .fold_fins
         .iter()
-        .flat_map(|l| l.fold_fins.iter().map(|&f| chw(f)))
+        .map(|&f| chw(f))
+        .chain(
+            levels[1..]
+                .iter()
+                .flat_map(|l| l.fold_fins.iter().skip(1).map(|&f| chw(f))),
+        )
         .collect();
     // ROUND 3: the close-out's suffix/combine/dot arithmetic rides the
     // shared 4-word MacGate (cache key 600, the mvp8 convention) plus the
@@ -7256,16 +8203,26 @@ fn emit_residual_region(
     // are DISSOLVED: 51 schema words (each a cell slot AND a gather claim)
     // bought ~30 rows of work; as mac/prefix rows the same work is ~250
     // live-prefix-cheap rows and zero types.
-    let macs = match leaf_slot.iter().find(|&&(k, _)| k == 600) {
+    let macs = match leaf_slot.iter().find(|&&(k, _)| k == 701) {
         Some(&(_, s)) => s,
         None => {
-            let s = sb.slot(MacGate::new());
-            leaf_slot.push((600, s));
+            let s = sb.slot(MacGate256::new());
+            leaf_slot.push((701, s));
             s
         }
     };
-    let pf_w = pl_full.min(8);
-    let pfslot = match leaf_slot.iter().find(|&&(k, _)| k == 310 + pf_w) {
+    let pf_w = total_fold_count.min(8);
+    let pfslot = match leaf_slot.iter().find(|&&(k, _)| k == 1000 + pf_w) {
+        Some(&(_, s)) => s,
+        None => {
+            let s = sb.slot(PrefixGate256::new(pf_w));
+            leaf_slot.push((1000 + pf_w, s));
+            s
+        }
+    };
+    // Other deferred-verifier arithmetic is base-field valued and reuses
+    // the original prefix type. Return that slot to the caller.
+    let base_pfslot = match leaf_slot.iter().find(|&&(k, _)| k == 310 + pf_w) {
         Some(&(_, s)) => s,
         None => {
             let s = sb.slot(PrefixGate::new(pf_w));
@@ -7274,63 +8231,91 @@ fn emit_residual_region(
         }
     };
     // Seed-chained prefix product: any factor list, `pf_w` per row.
-    let prefix_chain = |sb: &mut ShapeBuilder, seed: Wire, factors: &[(Wire, Wire)]| -> Wire {
+    let prefix_chain =
+        |sb: &mut ShapeBuilder, seed: [Wire; 2], factors: &[([Wire; 2], [Wire; 2])]| -> [Wire; 2] {
         let mut s = seed;
         for chunk_f in factors.chunks(pf_w) {
-            let mut g_in = vec![s];
+            let mut g_in = vec![s[0], s[1]];
             for (a, _) in chunk_f {
-                g_in.push(*a);
+                g_in.extend_from_slice(a);
             }
-            g_in.extend(std::iter::repeat_n(zw, pf_w - chunk_f.len()));
+            g_in.extend(std::iter::repeat_n(zw, 2 * (pf_w - chunk_f.len())));
             for (_, b) in chunk_f {
-                g_in.push(*b);
+                g_in.extend_from_slice(b);
             }
-            g_in.extend(std::iter::repeat_n(zw, pf_w - chunk_f.len()));
+            g_in.extend(std::iter::repeat_n(zw, 2 * (pf_w - chunk_f.len())));
             g_in.push(ow);
-            s = sb.gate(pfslot, &g_in)[0];
+            g_in.push(zw);
+            let out = sb.gate(pfslot, &g_in);
+            s = [out[0], out[1]];
         }
         s
     };
-    let mut evb_accs: Vec<Wire> = (0..yr_len).map(|_| zw).collect();
+    // A split commitment adds one coordinate variable per recursive level.
+    // Folding that bit at r contributes phi(r) = 1 + r(1 + u). Express it
+    // as the prefix factor 1 + r + r*u so the same F256 product gate binds
+    // the coordinate transport used by the native verifier.
+    let coordinate_factors = |sb: &mut ShapeBuilder, start_level: usize| {
+        levels[start_level.max(1)..]
+            .iter()
+            .map(|level| {
+                let r = chw(level.fold_fins[0]);
+                let ru = emit_mac256(sb, macs, [zw, zw], r, [zw, ow]);
+                (r, ru)
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut evb_accs: Vec<[Wire; 2]> = (0..yr_len).map(|_| [zw, zw]).collect();
     // Fold one claim (prefix product p at full-yl coord wires) into the
     // accumulators: per position, ONE prefix row computes p·eq(coords, y)
     // (high bits chunk-shared, low bits per position; eq factor =
     // 1 + coord + [bit] in char 2) and ONE MacGate row accumulates it.
     let apply_suffix =
-        |sb: &mut ShapeBuilder, evb_accs: &mut [Wire], p: Wire, coords: &[Wire]| {
+        |sb: &mut ShapeBuilder,
+         evb_accs: &mut [[Wire; 2]],
+         p: [Wire; 2],
+         coords: &[[Wire; 2]]| {
             assert_eq!(coords.len(), yr_log, "the claim tail spans yr");
             for h in 0..n_chunks {
                 let ph = if n_chunks == 1 {
                     p
                 } else {
-                    let factors: Vec<(Wire, Wire)> = coords[chunk_log..]
+                    let factors: Vec<([Wire; 2], [Wire; 2])> = coords[chunk_log..]
                         .iter()
                         .enumerate()
-                        .map(|(j, &cw2)| (cw2, if (h >> j) & 1 == 1 { ow } else { zw }))
+                        .map(|(j, &cw2)| {
+                            (cw2, [if (h >> j) & 1 == 1 { ow } else { zw }, zw])
+                        })
                         .collect();
                     prefix_chain(sb, p, &factors)
                 };
                 for y in 0..chunk {
-                    let factors: Vec<(Wire, Wire)> = coords[..chunk_log]
+                    let factors: Vec<([Wire; 2], [Wire; 2])> = coords[..chunk_log]
                         .iter()
                         .enumerate()
-                        .map(|(j, &cw2)| (cw2, if (y >> j) & 1 == 1 { ow } else { zw }))
+                        .map(|(j, &cw2)| {
+                            (cw2, [if (y >> j) & 1 == 1 { ow } else { zw }, zw])
+                        })
                         .collect();
                     let py = prefix_chain(sb, ph, &factors);
                     let at2 = h * chunk + y;
-                    evb_accs[at2] = sb.gate(macs, &[evb_accs[at2], py, ow])[0];
+                    evb_accs[at2] = emit_mac256(sb, macs, evb_accs[at2], py, [ow, zw]);
                 }
             }
         };
     {
         assert_eq!(w_rounds.len(), pl_full + yr_log, "rho spans the dense domain");
-        let factors: Vec<(Wire, Wire)> = w_rounds[..pl_full]
+        let mut factors: Vec<([Wire; 2], [Wire; 2])> = w_rounds[..pl_full]
             .iter()
-            .map(|rr| chw(rr.fin))
+            .map(|rr| [base_chw(rr.fin), zw])
             .zip(ris_full.iter().copied())
             .collect();
-        let pw = prefix_chain(sb, chw(inner_pd_fin), &factors);
-        let coords: Vec<Wire> = w_rounds[pl_full..].iter().map(|rr| chw(rr.fin)).collect();
+        factors.extend(coordinate_factors(sb, 0));
+        let pw = prefix_chain(sb, [base_chw(inner_pd_fin), zw], &factors);
+        let coords: Vec<[Wire; 2]> = w_rounds[pl_full..]
+            .iter()
+            .map(|rr| [base_chw(rr.fin), zw])
+            .collect();
         apply_suffix(sb, &mut evb_accs, pw, &coords);
     }
     for od in &levels[0].initial_ood {
@@ -7338,36 +8323,44 @@ fn emit_residual_region(
         assert_eq!(folded, ris_full.len(), "L0 OOD spans every fold");
         let initial_k = levels[0].fold_fins.len();
         let z_index = |j| l0_ood_z_index(od.z_len, initial_k, geo[0].row_words, j);
-        let factors: Vec<(Wire, Wire)> = (0..folded)
+        let mut factors: Vec<([Wire; 2], [Wire; 2])> = (0..folded)
             .map(|j| {
                 (
-                    squeeze_word_wire(outs, trace, od.z_fin, z_index(j)),
+                    [squeeze_word_wire(outs, trace, od.z_fin, z_index(j)), zw],
                     ris_full[j],
                 )
             })
             .collect();
-        let pw = prefix_chain(sb, chw(od.beta_fin), &factors);
-        let coords: Vec<Wire> = (0..yr_log)
-            .map(|j| squeeze_word_wire(outs, trace, od.z_fin, z_index(folded + j)))
+        factors.extend(coordinate_factors(sb, 0));
+        let pw = prefix_chain(sb, [base_chw(od.beta_fin), zw], &factors);
+        let coords: Vec<[Wire; 2]> = (0..yr_log)
+            .map(|j| [squeeze_word_wire(outs, trace, od.z_fin, z_index(folded + j)), zw])
             .collect();
         apply_suffix(sb, &mut evb_accs, pw, &coords);
     }
     for (li, lvl) in levels.iter().enumerate() {
         for od in &lvl.ood {
             let folded = od.z_len - yr_log;
-            let later: Vec<Wire> = levels[li + 1..]
+            let later: Vec<[Wire; 2]> = levels[li + 1]
+                .fold_fins
                 .iter()
-                .flat_map(|l| l.fold_fins.iter().map(|&f| chw(f)))
+                .map(|&f| chw(f))
+                .chain(
+                    levels[li + 2..]
+                        .iter()
+                        .flat_map(|l| l.fold_fins.iter().skip(1).map(|&f| chw(f))),
+                )
                 .collect();
             assert_eq!(later.len(), folded, "OOD prefix = later folds");
-            let factors: Vec<(Wire, Wire)> = (0..folded)
-                .map(|j| (squeeze_word_wire(outs, trace, od.z_fin, j), later[j]))
+            let mut factors: Vec<([Wire; 2], [Wire; 2])> = (0..folded)
+                .map(|j| ([squeeze_word_wire(outs, trace, od.z_fin, j), zw], later[j]))
                 .collect();
-            let pw = prefix_chain(sb, chw(od.beta_fin), &factors);
-            let coords: Vec<Wire> = (0..yr_log)
+            factors.extend(coordinate_factors(sb, li + 2));
+            let pw = prefix_chain(sb, [base_chw(od.beta_fin), zw], &factors);
+            let coords: Vec<[Wire; 2]> = (0..yr_log)
                 .map(|j| {
                     let jj = folded + j;
-                    squeeze_word_wire(outs, trace, od.z_fin, jj)
+                    [squeeze_word_wire(outs, trace, od.z_fin, jj), zw]
                 })
                 .collect();
             apply_suffix(sb, &mut evb_accs, pw, &coords);
@@ -7377,16 +8370,21 @@ fn emit_residual_region(
     // one MacGate row each), then the yr dot as one MAC chain.
     let mut comb = evb_accs;
     for (li, lvl) in levels.iter().enumerate() {
-        let beta_w = chw(lvl.beta_fin);
+        let coordinate = coordinate_factors(sb, li + 1);
+        let beta_w = prefix_chain(
+            sb,
+            [base_chw(lvl.beta_fin), zw],
+            &coordinate,
+        );
         for y in 0..yr_len {
-            comb[y] = sb.gate(macs, &[comb[y], beta_w, resid_pub[li][y]])[0];
+            comb[y] = emit_mac256(sb, macs, comb[y], beta_w, resid_pub[li][y]);
         }
     }
-    let mut inner_w = zw;
+    let mut inner_w = [zw, zw];
     for (yw, cb) in yr_wires.iter().zip(&comb) {
-        inner_w = sb.gate(macs, &[inner_w, *yw, *cb])[0];
+        inner_w = emit_mac256(sb, macs, inner_w, *yw, *cb);
     }
-    (resid_pub, inner_w, (pfslot, pf_w))
+    (resid_pub, inner_w, (base_pfslot, pf_w))
 }
 
 /// Check the residual region's published wires against a NATIVE replica:
@@ -7404,28 +8402,36 @@ fn check_residual_publics(
     geo: &[Lvl],
     w_rounds: &[RoundRec],
     inner_pd_ch: usize,
-    yr_vals: &[F128],
+    yr_vals: &[F256],
     chals: &[F128],
-) -> F128 {
+) -> F256 {
     use flock_core::lincheck::build_eq_table;
     let yr_len = yr_vals.len();
     assert!(yr_len.is_power_of_two());
     let yr_log = yr_len.trailing_zeros() as usize;
     let mut at = at;
-    let mut resid_native: Vec<Vec<F128>> = vec![vec![F128::ZERO; yr_len]; levels.len()];
+    let mut resid_native: Vec<Vec<F256>> = vec![vec![F256::ZERO; yr_len]; levels.len()];
     for (li, lvl) in levels.iter().enumerate() {
-        let pl: usize = levels[li + 1..].iter().map(|l| l.fold_fins.len()).sum();
+        let pl: usize = levels[li + 1..]
+            .iter()
+            .map(|l| l.fold_fins.len() - 1)
+            .sum();
         let lmc = pl + yr_log;
         let sks = sk_at_vks(lmc);
         let inv = |v: F128| if v == F128::ZERO { F128::ZERO } else { v.inv() };
-        let ris: Vec<F128> = levels[li + 1..]
+        let ris: Vec<F256> = levels[li + 1..]
             .iter()
-            .flat_map(|l| l.fold_chs.iter().map(|&i| chals[i]))
+            .flat_map(|l| {
+                l.fold_chs
+                    .iter()
+                    .skip(1)
+                    .map(|&i| F256::new(chals[i], chals[i + 1]))
+            })
             .collect();
         let alpha_vals: Vec<F128> = (0..lvl.a_count).map(|j| chals[lvl.a_ch + j]).collect();
         let aw = build_eq_table(&alpha_vals);
         for y in 0..yr_len {
-            let mut sum = F128::ZERO;
+            let mut sum = F256::ZERO;
             for k in 0..geo[li].q {
                 let pos = geo[li].q_pos(k, chals[lvl.q_ch + k].lo);
                 let mut sk = Vec::with_capacity(lmc);
@@ -7435,9 +8441,9 @@ fn check_residual_publics(
                         sk.push(sk[j - 1] * sk[j - 1] + sks[j - 1] * sk[j - 1]);
                     }
                 }
-                let mut prod = F128::ONE;
+                let mut prod = F256::ONE;
                 for j in 0..pl {
-                    prod *= F128::ONE + ris[j] * (F128::ONE + sk[j] * inv(sks[j]));
+                    prod *= F256::ONE + ris[j] * (F128::ONE + sk[j] * inv(sks[j]));
                 }
                 for j in 0..yr_log {
                     if (y >> j) & 1 == 1 {
@@ -7446,75 +8452,101 @@ fn check_residual_publics(
                 }
                 sum += aw[k] * prod;
             }
-            assert_eq!(public[at], sum, "L{li} residual y={y}");
+            assert_eq!(F256::new(public[at], public[at + 1]), sum, "L{li} residual y={y}");
             resid_native[li][y] = sum;
-            at += 1;
+            at += 2;
         }
     }
     // evb + combine, natively: gamma-weighted char-2 eq products, then the
     // yr dot.
-    let ris_v: Vec<F128> = levels
+    let ris_v: Vec<F256> = levels[0]
+        .fold_chs
         .iter()
-        .flat_map(|l| l.fold_chs.iter().map(|&i| chals[i]))
+        .map(|&i| F256::new(chals[i], chals[i + 1]))
+        .chain(levels[1..].iter().flat_map(|l| {
+            l.fold_chs
+                .iter()
+                .skip(1)
+                .map(|&i| F256::new(chals[i], chals[i + 1]))
+        }))
         .collect();
     let pl_full = ris_v.len();
-    let mut inner_n = F128::ZERO;
+    let coordinate_scale = |start_level: usize| {
+        levels[start_level.max(1)..]
+            .iter()
+            .fold(F256::ONE, |acc, level| {
+                let at = level.fold_chs[0];
+                let r = F256::new(chals[at], chals[at + 1]);
+                acc * (F256::ONE + r * F256::new(F128::ONE, F128::ONE))
+            })
+    };
+    let mut inner_n = F256::ZERO;
     for y in 0..yr_len {
-        let mut evb = chals[inner_pd_ch];
+        let mut evb = F256::from(chals[inner_pd_ch]);
         for j in 0..pl_full {
-            evb *= F128::ONE + chals[w_rounds[j].ch] + ris_v[j];
+            evb *= F256::ONE + F256::from(chals[w_rounds[j].ch]) + ris_v[j];
         }
         for j in 0..yr_log {
             evb *= if (y >> j) & 1 == 1 {
-                chals[w_rounds[pl_full + j].ch]
+                F256::from(chals[w_rounds[pl_full + j].ch])
             } else {
-                F128::ONE + chals[w_rounds[pl_full + j].ch]
+                F256::from(F128::ONE + chals[w_rounds[pl_full + j].ch])
             };
         }
+        evb *= coordinate_scale(0);
         let mut comb = evb;
         for od in &levels[0].initial_ood {
             let folded = od.z_len - yr_log;
             assert_eq!(folded, pl_full, "L0 OOD spans every fold");
             let initial_k = levels[0].fold_chs.len();
             let z_index = |j| l0_ood_z_index(od.z_len, initial_k, geo[0].row_words, j);
-            let mut t = chals[od.beta_ch];
+            let mut t = F256::from(chals[od.beta_ch]);
             for j in 0..folded {
-                t *= F128::ONE + chals[od.z_ch + z_index(j)] + ris_v[j];
+                t *= F256::ONE + F256::from(chals[od.z_ch + z_index(j)]) + ris_v[j];
             }
             for j in 0..yr_log {
                 t *= if (y >> j) & 1 == 1 {
-                    chals[od.z_ch + z_index(folded + j)]
+                    F256::from(chals[od.z_ch + z_index(folded + j)])
                 } else {
-                    F128::ONE + chals[od.z_ch + z_index(folded + j)]
+                    F256::from(F128::ONE + chals[od.z_ch + z_index(folded + j)])
                 };
             }
+            t *= coordinate_scale(0);
             comb += t;
         }
         for (li, lvl) in levels.iter().enumerate() {
-            comb += chals[lvl.beta_ch] * resid_native[li][y];
+            comb += resid_native[li][y] * chals[lvl.beta_ch] * coordinate_scale(li + 1);
             for od in &lvl.ood {
                 let folded = od.z_len - yr_log;
-                let later: Vec<F128> = levels[li + 1..]
+                let later: Vec<F256> = levels[li + 1]
+                    .fold_chs
                     .iter()
-                    .flat_map(|l| l.fold_chs.iter().map(|&i| chals[i]))
+                    .map(|&i| F256::new(chals[i], chals[i + 1]))
+                    .chain(levels[li + 2..].iter().flat_map(|l| {
+                        l.fold_chs
+                            .iter()
+                            .skip(1)
+                            .map(|&i| F256::new(chals[i], chals[i + 1]))
+                    }))
                     .collect();
-                let mut t = chals[od.beta_ch];
+                let mut t = F256::from(chals[od.beta_ch]);
                 for j in 0..folded {
-                    t *= F128::ONE + chals[od.z_ch + j] + later[j];
+                    t *= F256::ONE + F256::from(chals[od.z_ch + j]) + later[j];
                 }
                 for j in 0..yr_log {
                     t *= if (y >> j) & 1 == 1 {
-                        chals[od.z_ch + folded + j]
+                        F256::from(chals[od.z_ch + folded + j])
                     } else {
-                        F128::ONE + chals[od.z_ch + folded + j]
+                        F256::from(F128::ONE + chals[od.z_ch + folded + j])
                     };
                 }
+                t *= coordinate_scale(li + 2);
                 comb += t;
             }
         }
         inner_n += yr_vals[y] * comb;
     }
-    assert_eq!(public[at], inner_n, "the close-out inner");
+    assert_eq!(F256::new(public[at], public[at + 1]), inner_n, "the close-out inner");
     inner_n
 }
 
@@ -9187,11 +10219,11 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             .iter()
             .map(|g| {
                 let lanes = g.lanes.min(8);
-                match leaf_slot.iter().find(|(n, _)| *n == lanes) {
+                match leaf_slot.iter().find(|(n, _)| *n == 800 + lanes) {
                     Some((_, sl)) => *sl,
                     None => {
-                        let sl = sb.slot(LeafEvalGate::new(lanes));
-                        leaf_slot.push((lanes, sl));
+                        let sl = sb.slot(LeafEvalGate256::new(lanes));
+                        leaf_slot.push((800 + lanes, sl));
                         sl
                     }
                 }
@@ -9332,67 +10364,116 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         vals.push(F128::ZERO);
         let zassert = sb.public_input();
         let spine = slot_cached(&mut sb, &mut leaf_slot, 0, SpineGate::new);
+        let spine256 = slot_cached(&mut sb, &mut leaf_slot, 700, SpineGate256::new);
+        let z2 = [zw, zw];
         let gpw = outs[trace.squeezes[inner_pd2.fin][0]][0];
-        let tw0 = sb.gate(spine, &[zw, zw, zw, zw, zw, zw, wv(inner_pd2.q_v), gpw, zw]);
+        let tw0 = emit_spine256(
+            &mut sb,
+            spine256,
+            z2,
+            z2,
+            z2,
+            z2,
+            z2,
+            z2,
+            [wv(inner_pd2.q_v), zw],
+            gpw,
+            z2,
+        );
         let mut tsp = tw0[3];
         for od in &levels[0].initial_ood {
             let bw = outs[trace.squeezes[od.beta_fin][0]][0];
-            tsp = sb.gate(spine, &[zw, zw, zw, tsp, zw, zw, wv(od.y_v), bw, zw])[3];
+            tsp = emit_spine256(
+                &mut sb,
+                spine256,
+                z2,
+                z2,
+                z2,
+                tsp,
+                z2,
+                z2,
+                [wv(od.y_v), zw],
+                bw,
+                z2,
+            )[3];
         }
-        let st = sb.gate(
-            spine,
-            &[zw, zw, zw, zw, wv(start_v), wv(start_v + 1), tsp, ow, zw],
+        let st = emit_spine256(
+            &mut sb,
+            spine256,
+            z2,
+            z2,
+            z2,
+            z2,
+            [wv(start_v), wv(start_v + 1)],
+            [wv(start_v + 2), wv(start_v + 3)],
+            tsp,
+            ow,
+            z2,
         );
         let (mut qc, mut qb, mut qa) = (st[0], st[1], st[2]);
         for (li, lvl) in levels.iter().enumerate() {
             for (j, &mv) in lvl.fold_msg_vs.iter().enumerate() {
-                let rw = outs[trace.squeezes[lvl.fold_fins[j]][0]][0];
-                let ev = sb.gate(spine, &[qc, qb, qa, zw, zw, zw, zw, zw, rw]);
+                let rw = [
+                    squeeze_word_wire(&outs, &trace, lvl.fold_fins[j], 0),
+                    squeeze_word_wire(&outs, &trace, lvl.fold_fins[j], 1),
+                ];
+                let ev = emit_spine256(
+                    &mut sb, spine256, qc, qb, qa, z2, z2, z2, z2, zw, rw,
+                );
                 tsp = ev[4];
-                let bld = sb.gate(
-                    spine,
-                    &[zw, zw, zw, zw, wv(mv), wv(mv + 1), tsp, ow, zw],
+                let bld = emit_spine256(
+                    &mut sb,
+                    spine256,
+                    z2,
+                    z2,
+                    z2,
+                    z2,
+                    [wv(mv), wv(mv + 1)],
+                    [wv(mv + 2), wv(mv + 3)],
+                    tsp,
+                    ow,
+                    z2,
                 );
                 (qc, qb, qa) = (bld[0], bld[1], bld[2]);
             }
             if li < r {
                 for od in &lvl.ood {
                     let bw = outs[trace.squeezes[od.beta_fin][0]][0];
-                    let f = sb.gate(
-                        spine,
-                        &[
-                            qc,
-                            qb,
-                            qa,
-                            tsp,
-                            wv(od.intro_v),
-                            wv(od.intro_v + 1),
-                            wv(od.y_v),
-                            bw,
-                            zw,
-                        ],
-                    );
-                    (qc, qb, qa, tsp) = (f[0], f[1], f[2], f[3]);
-                }
-                let bw = outs[trace.squeezes[lvl.beta_fin][0]][0];
-                let f = sb.gate(
-                    spine,
-                    &[
+                    let f = emit_spine256(
+                        &mut sb,
+                        spine256,
                         qc,
                         qb,
                         qa,
                         tsp,
-                        wv(lvl.intro_v),
-                        wv(lvl.intro_v + 1),
-                        level_accs[li],
+                        [wv(od.intro_v), wv(od.intro_v + 1)],
+                        [wv(od.intro_v + 2), wv(od.intro_v + 3)],
+                        [wv(od.y_v), zw],
                         bw,
-                        zw,
-                    ],
+                        z2,
+                    );
+                    (qc, qb, qa, tsp) = (f[0], f[1], f[2], f[3]);
+                }
+                let bw = outs[trace.squeezes[lvl.beta_fin][0]][0];
+                let f = emit_spine256(
+                    &mut sb,
+                    spine256,
+                    qc,
+                    qb,
+                    qa,
+                    tsp,
+                    [wv(lvl.intro_v), wv(lvl.intro_v + 1)],
+                    [wv(lvl.intro_v + 2), wv(lvl.intro_v + 3)],
+                    level_accs[li],
+                    bw,
+                    z2,
                 );
                 (qc, qb, qa, tsp) = (f[0], f[1], f[2], f[3]);
             } else {
                 let bw = outs[trace.squeezes[lvl.beta_fin][0]][0];
-                let f = sb.gate(spine, &[zw, zw, zw, tsp, zw, zw, level_accs[li], bw, zw]);
+                let f = emit_spine256(
+                    &mut sb, spine256, z2, z2, z2, tsp, z2, z2, level_accs[li], bw, z2,
+                );
                 tsp = f[3];
             }
         }
@@ -9662,8 +10743,10 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         // (prefix/suffix/partial-combine/final-dot) assembles eval_b and
         // dots the absorbed yr words — `inner == t_r` then closes between
         // circuit outputs, exactly as on mvp7.
-        let yr_len = proof.pcs_open.inner.ligerito.final_proof.yr.len();
-        let yr_wires: Vec<Wire> = (0..yr_len).map(|y| wv(yr_v2 + y)).collect();
+        let yr_len = proof.pcs_open.inner.ligerito.final_proof.yr.len() / 2;
+        let yr_wires: Vec<[Wire; 2]> = (0..yr_len)
+            .map(|y| [wv(yr_v2 + 2 * y), wv(yr_v2 + 2 * y + 1)])
+            .collect();
         let (resid_pub, inner_w, (pfslot2, pf_w)) = emit_residual_region(
             &mut sb,
             &mut leaf_slot,
@@ -9680,7 +10763,8 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             ow,
         );
         // THE CLOSURE, in-circuit: inner == t_r as a copy constraint.
-        sb.connect(inner_w, t_final);
+        sb.connect(inner_w[0], t_final[0]);
+        sb.connect(inner_w[1], t_final[1]);
 
         // ---- the R = 2 multipoint chains ----
         // T0 = Σ gamma^{128i+j}·A_ij over the 256 absorbed dual values
@@ -10098,17 +11182,21 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             }
         }
         for w in &level_accs {
-            sb.publish(*w);
+            sb.publish(w[0]);
+            sb.publish(w[1]);
         }
         for accs in &resid_pub {
             for w in accs {
-                sb.publish(*w);
+                sb.publish(w[0]);
+                sb.publish(w[1]);
             }
         }
-        sb.publish(inner_w);
+        sb.publish(inner_w[0]);
+        sb.publish(inner_w[1]);
         sb.publish(tw);
         sb.publish(runw);
-        sb.publish(t_final);
+        sb.publish(t_final[0]);
+        sb.publish(t_final[1]);
         sb.publish(rc_w);
         sb.publish(seed_w);
         sb.publish(zrw);
@@ -10170,10 +11258,11 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         }
         let plen = prepad_publics - n_jag_pub;
         let n_assert_pub = 1 + lc_rounds2.len() + 2 * proof.lincheck.matrix_evals.len();
-        let total_pub: usize = levels.len()
-            + levels.len() * yr_len
-            + 1
-            + 3
+        let total_pub: usize = 2 * levels.len()
+            + 2 * levels.len() * yr_len
+            + 2
+            + 2
+            + 2
             + 5
             + n_assert_pub
             + levels.iter().map(|l| l.a_count).sum::<usize>();
@@ -10188,14 +11277,14 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         }
         for (li, want) in native_sums.iter().enumerate() {
             assert_eq!(
-                built.public[at2 + li],
+                F256::new(built.public[at2 + 2 * li], built.public[at2 + 2 * li + 1]),
                 *want,
                 "L{li} enforced sum matches the native replica"
             );
         }
         // The residual region against the shared native replica (sks via
         // sk_at_vks — the mvp7 discipline).
-        let resid_base = at2 + native_sums.len();
+        let resid_base = at2 + 2 * native_sums.len();
         {
             let inner_n = check_residual_publics(
                 &built.public,
@@ -10204,14 +11293,17 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
                 &geo,
                 &w_rounds,
                 inner_pd2.ch,
-                &vals_rec[yr_v2..yr_v2 + yr_len],
+                &observed_f256(&vals_rec, yr_v2, yr_len),
                 &chals,
             );
             // THE CLOSURE, between circuit outputs: the residual side's
             // inner and the spine's t_r are the same statement scalar.
             let zc_tail2 = n_assert_pub + 5;
             assert_eq!(
-                built.public[plen - zc_tail2 - 1],
+                F256::new(
+                    built.public[plen - zc_tail2 - 2],
+                    built.public[plen - zc_tail2 - 1]
+                ),
                 inner_n,
                 "inner == t_r: the leaf statement closes"
             );
@@ -10259,48 +11351,30 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         // The intake boundary: the advice target and the in-circuit
         // running, both checker-validated against the native replay.
         assert_eq!(
-            built.public[plen - zc_tail - 3],
+            built.public[plen - zc_tail - 4],
             native_target,
             "the RS target advice is the native gamma-combination"
         );
         assert_eq!(
-            built.public[plen - zc_tail - 2],
+            built.public[plen - zc_tail - 3],
             native_running,
             "the W-rounds fold the target to the native running claim"
         );
         // The spine's t_r, against the native quad replay.
         {
-            let quad = |u0: F128, u2: F128, t: F128| (u0, t + u2, u2);
-            let evalq = |q: (F128, F128, F128), x: F128| q.0 + x * q.1 + x * x * q.2;
-            let mut nt = chals[inner_pd2.ch] * vals_rec[inner_pd2.q_v];
-            for od in &levels[0].initial_ood {
-                nt += chals[od.beta_ch] * vals_rec[od.y_v];
-            }
-            let mut nq = quad(vals_rec[start_v], vals_rec[start_v + 1], nt);
-            for (li, lvl) in levels.iter().enumerate() {
-                for (j, &mv) in lvl.fold_msg_vs.iter().enumerate() {
-                    nt = evalq(nq, chals[lvl.fold_chs[j]]);
-                    nq = quad(vals_rec[mv], vals_rec[mv + 1], nt);
-                }
-                if li < levels.len() - 1 {
-                    for od in &lvl.ood {
-                        let b = chals[od.beta_ch];
-                        let iq =
-                            quad(vals_rec[od.intro_v], vals_rec[od.intro_v + 1], vals_rec[od.y_v]);
-                        nq = (nq.0 + b * iq.0, nq.1 + b * iq.1, nq.2 + b * iq.2);
-                        nt += b * vals_rec[od.y_v];
-                    }
-                    let b = chals[lvl.beta_ch];
-                    let iq =
-                        quad(vals_rec[lvl.intro_v], vals_rec[lvl.intro_v + 1], native_sums[li]);
-                    nq = (nq.0 + b * iq.0, nq.1 + b * iq.1, nq.2 + b * iq.2);
-                    nt += b * native_sums[li];
-                } else {
-                    nt += chals[lvl.beta_ch] * native_sums[li];
-                }
-            }
+            let nt = replay_ligerito_spine256(
+                &levels,
+                &vals_rec,
+                &chals,
+                start_v,
+                chals[inner_pd2.ch] * vals_rec[inner_pd2.q_v],
+                &native_sums,
+            );
             assert_eq!(
-                built.public[plen - zc_tail - 1],
+                F256::new(
+                    built.public[plen - zc_tail - 2],
+                    built.public[plen - zc_tail - 1]
+                ),
                 nt,
                 "the spine's final t_r matches the native replay"
             );
@@ -10540,7 +11614,7 @@ struct RealTape<'p> {
     levels: Vec<OpenLevel>,
     lvl_src: Vec<(&'p [[u8; 32]], &'p Vec<Vec<F128>>, &'p Vec<[u8; 32]>)>,
     geo: Vec<Lvl>,
-    native_sums: Vec<F128>,
+    native_sums: Vec<F256>,
     /// The grinding ops: (fin ordinal, payload ordinal, bits).
     pows: Vec<(usize, usize, u32)>,
     n_p: usize,
@@ -10586,7 +11660,7 @@ struct RealTape<'p> {
     native_vrs: F128,
     native_target: F128,
     native_running: F128,
-    t_final_n: F128,
+    t_final_n: F256,
     anc_end_n: F128,
     mid_n: F128,
     live_n: F128,
@@ -11165,51 +12239,21 @@ impl<'p> RealTape<'p> {
         };
 
         // ---- the spine's native quad replay ----
-        let t_final_n = {
-            let quad = |u0: F128, u2: F128, t: F128| (u0, t + u2, u2);
-            let evalq = |q: (F128, F128, F128), x: F128| q.0 + x * q.1 + x * x * q.2;
-            let mut nt = chals[inner_pd_i.ch] * vals_rec[inner_pd_i.q_v];
-            for od in &levels[0].initial_ood {
-                nt += chals[od.beta_ch] * vals_rec[od.y_v];
-            }
-            let mut nq = quad(vals_rec[start_v_i], vals_rec[start_v_i + 1], nt);
-            for (li, lvl) in levels.iter().enumerate() {
-                for (j, &mv) in lvl.fold_msg_vs.iter().enumerate() {
-                    nt = evalq(nq, chals[lvl.fold_chs[j]]);
-                    nq = quad(vals_rec[mv], vals_rec[mv + 1], nt);
-                }
-                if li < r {
-                    for od in &lvl.ood {
-                        let b = chals[od.beta_ch];
-                        let iq = quad(
-                            vals_rec[od.intro_v],
-                            vals_rec[od.intro_v + 1],
-                            vals_rec[od.y_v],
-                        );
-                        nq = (nq.0 + b * iq.0, nq.1 + b * iq.1, nq.2 + b * iq.2);
-                        nt += b * vals_rec[od.y_v];
-                    }
-                    let b = chals[lvl.beta_ch];
-                    let iq = quad(
-                        vals_rec[lvl.intro_v],
-                        vals_rec[lvl.intro_v + 1],
-                        native_sums[li],
-                    );
-                    nq = (nq.0 + b * iq.0, nq.1 + b * iq.1, nq.2 + b * iq.2);
-                    nt += b * native_sums[li];
-                } else {
-                    nt += chals[lvl.beta_ch] * native_sums[li];
-                }
-            }
-            nt
-        };
+        let t_final_n = replay_ligerito_spine256(
+            &levels,
+            &vals_rec,
+            &chals,
+            start_v_i,
+            chals[inner_pd_i.ch] * vals_rec[inner_pd_i.q_v],
+            &native_sums,
+        );
 
         // ---- the residual pairing's rotation (lane-major inners) ----
         // A pow2-lane inner (row_words == lanes — e.g. the m28-k4 slim node
         // whose 16-of-16 lanes make the commit exactly full) takes the
         // IDENTITY pairing, same as the native side's rotate gate and
         // ChildTape's conditional.
-        let yr_len = lo.proof.pcs_open.inner.ligerito.final_proof.yr.len();
+        let yr_len = lo.proof.pcs_open.inner.ligerito.final_proof.yr.len() / 2;
         let lane_major = geo[0].row_words < geo[0].lanes;
         let w_resid: Vec<RoundRec> = if lane_major {
             let k_rot = w_rounds.len() - levels[0].fold_fins.len();
@@ -11960,11 +13004,11 @@ fn emit_real_child_region(
         .iter()
         .map(|g| {
             let lanes = g.lanes.min(8);
-            match cs.le.iter().find(|(n, _)| *n == lanes) {
+            match cs.le.iter().find(|(n, _)| *n == 800 + lanes) {
                 Some((_, sl)) => *sl,
                 None => {
-                    let sl = sb.slot(LeafEvalGate::new(lanes));
-                    cs.le.push((lanes, sl));
+                    let sl = sb.slot(LeafEvalGate256::new(lanes));
+                    cs.le.push((800 + lanes, sl));
                     sl
                 }
             }
@@ -12095,6 +13139,7 @@ fn emit_real_child_region(
     let ow = sb.public_input();
     let mrslot = cs.mrs;
     let spine = cs.spine;
+    let spine256 = cs.spine256;
     // The assert-zero anchor: a dedicated zero public NO gate consumes,
     // so the zero-delta outputs connected into its class add no
     // dataflow edges (connecting them to the ubiquitous `zw` creates
@@ -12139,73 +13184,99 @@ fn emit_real_child_region(
     // The ligerito SPINE: start gamma'·q_eval, eval/build per fold,
     // intro-folds consuming the query phase's accumulator wires.
     let gpw = outs[trace.squeezes[inner_pd_i.fin][0]][0];
-    let tw0 = sb.gate(
-        spine,
-        &[zw, zw, zw, zw, zw, zw, wv(inner_pd_i.q_v), gpw, zw],
+    let z2 = [zw, zw];
+    let tw0 = emit_spine256(
+        sb, spine256, z2, z2, z2, z2, z2, z2, [wv(inner_pd_i.q_v), zw], gpw, z2,
     );
     let mut tsp = tw0[3];
     for od in &levels[0].initial_ood {
         let bw = outs[trace.squeezes[od.beta_fin][0]][0];
-        tsp = sb.gate(spine, &[zw, zw, zw, tsp, zw, zw, wv(od.y_v), bw, zw])[3];
+        tsp = emit_spine256(sb, spine256, z2, z2, z2, tsp, z2, z2, [wv(od.y_v), zw], bw, z2)[3];
     }
-    let st = sb.gate(
-        spine,
-        &[zw, zw, zw, zw, wv(rt.start_v_i), wv(rt.start_v_i + 1), tsp, ow, zw],
+    let st = emit_spine256(
+        sb,
+        spine256,
+        z2,
+        z2,
+        z2,
+        z2,
+        [wv(rt.start_v_i), wv(rt.start_v_i + 1)],
+        [wv(rt.start_v_i + 2), wv(rt.start_v_i + 3)],
+        tsp,
+        ow,
+        z2,
     );
     let (mut qc, mut qb, mut qa) = (st[0], st[1], st[2]);
     for (li, lvl) in levels.iter().enumerate() {
         for (j, &mv) in lvl.fold_msg_vs.iter().enumerate() {
-            let rw = outs[trace.squeezes[lvl.fold_fins[j]][0]][0];
-            let ev = sb.gate(spine, &[qc, qb, qa, zw, zw, zw, zw, zw, rw]);
+            let rw = [
+                squeeze_word_wire(&outs, &trace, lvl.fold_fins[j], 0),
+                squeeze_word_wire(&outs, &trace, lvl.fold_fins[j], 1),
+            ];
+            let ev = emit_spine256(sb, spine256, qc, qb, qa, z2, z2, z2, z2, zw, rw);
             tsp = ev[4];
-            let bld = sb.gate(spine, &[zw, zw, zw, zw, wv(mv), wv(mv + 1), tsp, ow, zw]);
+            let bld = emit_spine256(
+                sb,
+                spine256,
+                z2,
+                z2,
+                z2,
+                z2,
+                [wv(mv), wv(mv + 1)],
+                [wv(mv + 2), wv(mv + 3)],
+                tsp,
+                ow,
+                z2,
+            );
             (qc, qb, qa) = (bld[0], bld[1], bld[2]);
         }
         if li < r {
             for od in &lvl.ood {
                 let bw = outs[trace.squeezes[od.beta_fin][0]][0];
-                let f = sb.gate(
-                    spine,
-                    &[
-                        qc,
-                        qb,
-                        qa,
-                        tsp,
-                        wv(od.intro_v),
-                        wv(od.intro_v + 1),
-                        wv(od.y_v),
-                        bw,
-                        zw,
-                    ],
-                );
-                (qc, qb, qa, tsp) = (f[0], f[1], f[2], f[3]);
-            }
-            let bw = outs[trace.squeezes[lvl.beta_fin][0]][0];
-            let f = sb.gate(
-                spine,
-                &[
+                let f = emit_spine256(
+                    sb,
+                    spine256,
                     qc,
                     qb,
                     qa,
                     tsp,
-                    wv(lvl.intro_v),
-                    wv(lvl.intro_v + 1),
-                    level_accs[li],
+                    [wv(od.intro_v), wv(od.intro_v + 1)],
+                    [wv(od.intro_v + 2), wv(od.intro_v + 3)],
+                    [wv(od.y_v), zw],
                     bw,
-                    zw,
-                ],
+                    z2,
+                );
+                (qc, qb, qa, tsp) = (f[0], f[1], f[2], f[3]);
+            }
+            let bw = outs[trace.squeezes[lvl.beta_fin][0]][0];
+            let f = emit_spine256(
+                sb,
+                spine256,
+                qc,
+                qb,
+                qa,
+                tsp,
+                [wv(lvl.intro_v), wv(lvl.intro_v + 1)],
+                [wv(lvl.intro_v + 2), wv(lvl.intro_v + 3)],
+                level_accs[li],
+                bw,
+                z2,
             );
             (qc, qb, qa, tsp) = (f[0], f[1], f[2], f[3]);
         } else {
             let bw = outs[trace.squeezes[lvl.beta_fin][0]][0];
-            let f = sb.gate(spine, &[zw, zw, zw, tsp, zw, zw, level_accs[li], bw, zw]);
+            let f = emit_spine256(
+                sb, spine256, z2, z2, z2, tsp, z2, z2, level_accs[li], bw, z2,
+            );
             tsp = f[3];
         }
     }
     let t_final = tsp;
 
     // The RESIDUAL region via the shared emitter (lane-major rotation).
-    let yr_wires: Vec<Wire> = (0..rt.yr_len).map(|y| wv(rt.yr_v_i + y)).collect();
+    let yr_wires: Vec<[Wire; 2]> = (0..rt.yr_len)
+        .map(|y| [wv(rt.yr_v_i + 2 * y), wv(rt.yr_v_i + 2 * y + 1)])
+        .collect();
     let (resid_pub, inner_w, (pfslot, pf_w)) = emit_residual_region(
         sb,
         &mut cs.resid,
@@ -12222,7 +13293,8 @@ fn emit_real_child_region(
         ow,
     );
     // THE CLOSURE, in-circuit: inner == t_r as a copy constraint.
-    sb.connect(inner_w, t_final);
+    sb.connect(inner_w[0], t_final[0]);
+    sb.connect(inner_w[1], t_final[1]);
 
     cen.push(("spine + residual advice", sb.public_len(), sb.rows_in_slot(cs.macs)));
     // ---- the WIRING GKR in-circuit + the sigma emission ----
@@ -12702,19 +13774,23 @@ fn emit_real_child_region(
         }
     }
     for w in &level_accs {
-        sb.publish(*w);
+        sb.publish(w[0]);
+        sb.publish(w[1]);
     }
     cen.push(("TAIL: query alphas + native accs", sb.public_len(), sb.rows_in_slot(cs.macs)));
-    sb.publish(t_final);
+    sb.publish(t_final[0]);
+    sb.publish(t_final[1]);
     sb.publish(tgt_w);
     sb.publish(runw);
     for accs in &resid_pub {
         for w in accs {
-            sb.publish(*w);
+            sb.publish(w[0]);
+            sb.publish(w[1]);
         }
     }
     cen.push(("TAIL: chain ends + residual accs", sb.public_len(), sb.rows_in_slot(cs.macs)));
-    sb.publish(inner_w);
+    sb.publish(inner_w[0]);
+    sb.publish(inner_w[1]);
     sb.publish(sig_w);
     for w in &pt_w {
         sb.publish(*w);
@@ -12770,11 +13846,11 @@ fn emit_real_child_region(
     }
     cen.push(("TAIL: jagged claim values", sb.public_len(), sb.rows_in_slot(cs.macs)));
 
-    let n_query_pub: usize = levels.iter().map(|l| l.a_count).sum();
-    let n_tail = levels.len()
-        + 3
-        + levels.len() * rt.yr_len
-        + 1
+    let n_query_pub: usize =
+        2 * levels.len() + levels.iter().map(|l| l.a_count).sum::<usize>();
+    let n_tail = 4
+        + 2 * levels.len() * rt.yr_len
+        + 2
         + 1
         + rt.mu_i
         + 2
@@ -12838,35 +13914,35 @@ fn check_real_child_region(public: &[F128], rt: &RealTape<'_>, r: &RealRegion) -
     }
     for (li, want) in rt.native_sums.iter().enumerate() {
         assert_eq!(
-            public[at2 + li],
+            F256::new(public[at2 + 2 * li], public[at2 + 2 * li + 1]),
             *want,
             "L{li} enforced sum matches the native replica"
         );
     }
-    let sp_base = at2 + rt.native_sums.len();
+    let sp_base = at2 + 2 * rt.native_sums.len();
     assert_eq!(
-        public[sp_base],
+        F256::new(public[sp_base], public[sp_base + 1]),
         rt.t_final_n,
         "the spine's t_r matches the native replay"
     );
     assert_eq!(
-        public[sp_base + 1],
+        public[sp_base + 2],
         rt.native_target,
         "the target advice is the native two-halves combination"
     );
     assert_eq!(
-        public[sp_base + 2],
+        public[sp_base + 3],
         rt.native_running,
         "the W-rounds fold the target to the native running claim"
     );
     let inner_n = check_residual_publics(
         public,
-        sp_base + 3,
+        sp_base + 4,
         &rt.levels,
         &rt.geo,
         &rt.w_resid,
         rt.inner_pd_i.ch,
-        &rt.vals_rec[rt.yr_v_i..rt.yr_v_i + rt.yr_len],
+        &observed_f256(&rt.vals_rec, rt.yr_v_i, rt.yr_len),
         chals,
     );
     assert_eq!(
@@ -12875,7 +13951,7 @@ fn check_real_child_region(public: &[F128], rt: &RealTape<'_>, r: &RealRegion) -
     );
     // The GKR/element/multipoint/anchor identities are COPY CONSTRAINTS —
     // no publics, no checker items; the proof itself carries them.
-    let sig_base = sp_base + 3 + rt.levels.len() * rt.yr_len + 1;
+    let sig_base = sp_base + 4 + 2 * rt.levels.len() * rt.yr_len + 2;
     assert_eq!(
         public[sig_base],
         rt.lo.proof.wiring.gkr.s_sigma_eval,
@@ -15699,7 +16775,7 @@ struct ChildTape<'p> {
     levels: Vec<OpenLevel>,
     lvl_src: Vec<(&'p [[u8; 32]], &'p Vec<Vec<F128>>, &'p Vec<[u8; 32]>)>,
     geo: Vec<Lvl>,
-    native_sums: Vec<F128>,
+    native_sums: Vec<F256>,
     n_pd: usize,
     /// The child cell space's public-slot count — the recombination's tail.
     n_pub_slots_c: usize,
@@ -15729,7 +16805,7 @@ struct ChildTape<'p> {
     b_sum_n: F128,
     native_target: F128,
     native_running: F128,
-    t_final_n: F128,
+    t_final_n: F256,
     anc_end_n: F128,
     mid_n: F128,
     live_n: F128,
@@ -16465,44 +17541,14 @@ impl<'p> ChildTape<'p> {
         };
 
         // ---- the spine's native quad replay ----
-        let t_final_n = {
-            let quad = |u0: F128, u2: F128, t: F128| (u0, t + u2, u2);
-            let evalq = |q: (F128, F128, F128), x: F128| q.0 + x * q.1 + x * x * q.2;
-            let mut nt = chals[inner_pd2.ch] * vals_rec[inner_pd2.q_v];
-            for od in &levels[0].initial_ood {
-                nt += chals[od.beta_ch] * vals_rec[od.y_v];
-            }
-            let mut nq = quad(vals_rec[start_v], vals_rec[start_v + 1], nt);
-            for (li, lvl) in levels.iter().enumerate() {
-                for (j, &mv) in lvl.fold_msg_vs.iter().enumerate() {
-                    nt = evalq(nq, chals[lvl.fold_chs[j]]);
-                    nq = quad(vals_rec[mv], vals_rec[mv + 1], nt);
-                }
-                if li < r_lvl {
-                    for od in &lvl.ood {
-                        let b = chals[od.beta_ch];
-                        let iq = quad(
-                            vals_rec[od.intro_v],
-                            vals_rec[od.intro_v + 1],
-                            vals_rec[od.y_v],
-                        );
-                        nq = (nq.0 + b * iq.0, nq.1 + b * iq.1, nq.2 + b * iq.2);
-                        nt += b * vals_rec[od.y_v];
-                    }
-                    let b = chals[lvl.beta_ch];
-                    let iq = quad(
-                        vals_rec[lvl.intro_v],
-                        vals_rec[lvl.intro_v + 1],
-                        native_sums[li],
-                    );
-                    nq = (nq.0 + b * iq.0, nq.1 + b * iq.1, nq.2 + b * iq.2);
-                    nt += b * native_sums[li];
-                } else {
-                    nt += chals[lvl.beta_ch] * native_sums[li];
-                }
-            }
-            nt
-        };
+        let t_final_n = replay_ligerito_spine256(
+            &levels,
+            &vals_rec,
+            &chals,
+            start_v,
+            chals[inner_pd2.ch] * vals_rec[inner_pd2.q_v],
+            &native_sums,
+        );
 
         // ---- the anchor's native endpoint ----
         let anc_end_n = {
@@ -16982,7 +18028,7 @@ impl<'p> ChildTape<'p> {
         }
 
         // ---- the residual pairing's rotation (lane-major inners) ----
-        let yr_len = proof.pcs_open.inner.ligerito.final_proof.yr.len();
+        let yr_len = proof.pcs_open.inner.ligerito.final_proof.yr.len() / 2;
         let lane_major = geo[0].row_words < geo[0].lanes;
         let w_resid: Vec<RoundRec> = if lane_major {
             let k_rot = w_rounds.len() - levels[0].fold_fins.len();
@@ -17074,6 +18120,7 @@ struct ChildSlots {
     zcr: flock_core::circuit::builder::SlotId,
     mrs: flock_core::circuit::builder::SlotId,
     spine: flock_core::circuit::builder::SlotId,
+    spine256: flock_core::circuit::builder::SlotId,
     alslot: flock_core::circuit::builder::SlotId,
     le: Vec<(usize, flock_core::circuit::builder::SlotId)>,
     /// The residual region's keyed slot cache (`emit_residual_region`'s
@@ -17094,6 +18141,7 @@ struct ChildSlots {
 impl ChildSlots {
     fn new(sb: &mut ShapeBuilder, nu2: usize, spread_w: usize) -> Self {
         let macs = sb.slot(MacGate::new());
+        let mac256 = sb.slot(MacGate256::new());
         ChildSlots {
             q: CollapsedSlots {
                 b3: sb.slot(Blake3Gate { nu: nu2 }),
@@ -17108,12 +18156,13 @@ impl ChildSlots {
             zcr: sb.slot(ZcRoundGate::new()),
             mrs: sb.slot(MergedRoundGate::new()),
             spine: sb.slot(SpineGate::new()),
+            spine256: sb.slot(SpineGate256::new()),
             alslot: sb.slot(AssistLayerGate::new()),
             le: Vec::new(),
             // Key 600 pre-seeds the SHARED MacGate into the residual cache:
             // emit_residual_region's close-out rows land on the same slot
             // instead of registering a duplicate type.
-            resid: vec![(600, macs)],
+            resid: vec![(600, macs), (701, mac256)],
             skips: Vec::new(),
         }
     }
@@ -17141,14 +18190,21 @@ impl ChildSlots {
             zcr: take(500),
             mrs: take(400),
             spine: take(0),
+            spine256: take(700),
             alslot: take(601),
-            le: vec![(8, take(8))],
+            le: vec![(8, take(8)), (808, take(808))],
             // The residual-region cache inherits every entry in its key
             // namespaces: the shared mac (600), the five resid variants
             // (100 + pl) and the prefix slot (310 + w).
             resid: cache
                 .iter()
-                .filter(|&&(k, _)| k == 600 || (100..200).contains(&k) || (310..400).contains(&k))
+                .filter(|&&(k, _)| {
+                    matches!(k, 600 | 701)
+                        || (100..200).contains(&k)
+                        || (310..400).contains(&k)
+                        || (900..1000).contains(&k)
+                        || (1000..1100).contains(&k)
+                })
                 .cloned()
                 .collect(),
             skips: vec![take(510), take(511)],
@@ -17163,6 +18219,7 @@ impl ChildSlots {
             (500, self.zcr),
             (400, self.mrs),
             (0, self.spine),
+            (700, self.spine256),
             (601, self.alslot),
             (510, self.skips[0]),
             (511, self.skips[1]),
@@ -17174,7 +18231,14 @@ impl ChildSlots {
 
     /// Every element-class slot, for the outer prover's slot inputs.
     fn element_slot_ids(&self) -> Vec<flock_core::circuit::builder::SlotId> {
-        let mut v = vec![self.macs, self.zcr, self.mrs, self.spine, self.alslot];
+        let mut v = vec![
+            self.macs,
+            self.zcr,
+            self.mrs,
+            self.spine,
+            self.spine256,
+            self.alslot,
+        ];
         v.extend(self.le.iter().map(|&(_, s)| s));
         // Key 600 is the SHARED MacGate seed (already listed as `macs`).
         v.extend(self.resid.iter().filter(|&&(k, _)| k != 600).map(|&(_, s)| s));
@@ -17266,11 +18330,11 @@ fn emit_child_region(
         .iter()
         .map(|g| {
             let lanes = g.lanes.min(8);
-            match cs.le.iter().find(|(n, _)| *n == lanes) {
+            match cs.le.iter().find(|(n, _)| *n == 800 + lanes) {
                 Some((_, sl)) => *sl,
                 None => {
-                    let sl = sb.slot(LeafEvalGate::new(lanes));
-                    cs.le.push((lanes, sl));
+                    let sl = sb.slot(LeafEvalGate256::new(lanes));
+                    cs.le.push((800 + lanes, sl));
                     sl
                 }
             }
@@ -17498,74 +18562,101 @@ fn emit_child_region(
 
     // ---- the LIGERITO SPINE ----
     let spine = cs.spine;
+    let spine256 = cs.spine256;
     let gpw = outs[trace.squeezes[inner_pd2.fin][0]][0];
-    let tw0 = sb.gate(
-        spine,
-        &[zw, zw, zw, zw, zw, zw, wv(inner_pd2.q_v), gpw, zw],
+    let z2 = [zw, zw];
+    let tw0 = emit_spine256(
+        sb, spine256, z2, z2, z2, z2, z2, z2, [wv(inner_pd2.q_v), zw], gpw, z2,
     );
     let mut tsp = tw0[3];
     for od in &levels[0].initial_ood {
         let bw = outs[trace.squeezes[od.beta_fin][0]][0];
-        tsp = sb.gate(spine, &[zw, zw, zw, tsp, zw, zw, wv(od.y_v), bw, zw])[3];
+        tsp = emit_spine256(sb, spine256, z2, z2, z2, tsp, z2, z2, [wv(od.y_v), zw], bw, z2)[3];
     }
-    let st = sb.gate(
-        spine,
-        &[zw, zw, zw, zw, wv(ct.start_v), wv(ct.start_v + 1), tsp, ow, zw],
+    let st = emit_spine256(
+        sb,
+        spine256,
+        z2,
+        z2,
+        z2,
+        z2,
+        [wv(ct.start_v), wv(ct.start_v + 1)],
+        [wv(ct.start_v + 2), wv(ct.start_v + 3)],
+        tsp,
+        ow,
+        z2,
     );
     let (mut qc, mut qb, mut qa) = (st[0], st[1], st[2]);
     for (li, lvl) in levels.iter().enumerate() {
         for (j, &mv) in lvl.fold_msg_vs.iter().enumerate() {
-            let rw = outs[trace.squeezes[lvl.fold_fins[j]][0]][0];
-            let ev = sb.gate(spine, &[qc, qb, qa, zw, zw, zw, zw, zw, rw]);
+            let rw = [
+                squeeze_word_wire(&outs, &trace, lvl.fold_fins[j], 0),
+                squeeze_word_wire(&outs, &trace, lvl.fold_fins[j], 1),
+            ];
+            let ev = emit_spine256(sb, spine256, qc, qb, qa, z2, z2, z2, z2, zw, rw);
             tsp = ev[4];
-            let bld = sb.gate(spine, &[zw, zw, zw, zw, wv(mv), wv(mv + 1), tsp, ow, zw]);
+            let bld = emit_spine256(
+                sb,
+                spine256,
+                z2,
+                z2,
+                z2,
+                z2,
+                [wv(mv), wv(mv + 1)],
+                [wv(mv + 2), wv(mv + 3)],
+                tsp,
+                ow,
+                z2,
+            );
             (qc, qb, qa) = (bld[0], bld[1], bld[2]);
         }
         if li < r_lvl {
             for od in &lvl.ood {
                 let bw = outs[trace.squeezes[od.beta_fin][0]][0];
-                let f = sb.gate(
-                    spine,
-                    &[
-                        qc,
-                        qb,
-                        qa,
-                        tsp,
-                        wv(od.intro_v),
-                        wv(od.intro_v + 1),
-                        wv(od.y_v),
-                        bw,
-                        zw,
-                    ],
-                );
-                (qc, qb, qa, tsp) = (f[0], f[1], f[2], f[3]);
-            }
-            let bw = outs[trace.squeezes[lvl.beta_fin][0]][0];
-            let f = sb.gate(
-                spine,
-                &[
+                let f = emit_spine256(
+                    sb,
+                    spine256,
                     qc,
                     qb,
                     qa,
                     tsp,
-                    wv(lvl.intro_v),
-                    wv(lvl.intro_v + 1),
-                    level_accs[li],
+                    [wv(od.intro_v), wv(od.intro_v + 1)],
+                    [wv(od.intro_v + 2), wv(od.intro_v + 3)],
+                    [wv(od.y_v), zw],
                     bw,
-                    zw,
-                ],
+                    z2,
+                );
+                (qc, qb, qa, tsp) = (f[0], f[1], f[2], f[3]);
+            }
+            let bw = outs[trace.squeezes[lvl.beta_fin][0]][0];
+            let f = emit_spine256(
+                sb,
+                spine256,
+                qc,
+                qb,
+                qa,
+                tsp,
+                [wv(lvl.intro_v), wv(lvl.intro_v + 1)],
+                [wv(lvl.intro_v + 2), wv(lvl.intro_v + 3)],
+                level_accs[li],
+                bw,
+                z2,
             );
             (qc, qb, qa, tsp) = (f[0], f[1], f[2], f[3]);
         } else {
             let bw = outs[trace.squeezes[lvl.beta_fin][0]][0];
-            let f = sb.gate(spine, &[zw, zw, zw, tsp, zw, zw, level_accs[li], bw, zw]);
+            let f = emit_spine256(
+                sb, spine256, z2, z2, z2, tsp, z2, z2, level_accs[li], bw, z2,
+            );
             tsp = f[3];
         }
     }
     let t_final = tsp;
 
     // ---- the RESIDUAL region (shared emitter) ----
-    let yr_wires: Vec<Wire> = (0..ct.yr_len).map(|y| wv(ct.yr_v2 + y)).collect();
+    let yr_wires: Vec<[Wire; 2]> = (0..ct.yr_len)
+        .map(|y| [wv(ct.yr_v2 + 2 * y), wv(ct.yr_v2 + 2 * y + 1)])
+        .collect();
     let (resid_pub, inner_w, (pfslot, pf_w)) = emit_residual_region(
         sb,
         &mut cs.resid,
@@ -17584,7 +18675,8 @@ fn emit_child_region(
     // THE CLOSURE, in-circuit: the residual side's inner and the spine's
     // t_r are the same statement scalar — a copy constraint, not a
     // checker item (both stay published as test cross-checks).
-    sb.connect(inner_w, t_final);
+    sb.connect(inner_w[0], t_final[0]);
+    sb.connect(inner_w[1], t_final[1]);
 
     // ---- the ELEMENT PIOP rounds in-circuit (mixed children only) ----
     // Zerocheck rounds are ZcRoundGate rows (tau slice wires as eq weights,
@@ -17896,7 +18988,8 @@ fn emit_child_region(
         }
     }
     for w in &level_accs {
-        sb.publish(*w);
+        sb.publish(w[0]);
+        sb.publish(w[1]);
     }
     sb.publish(ga_w);
     sb.publish(mg_w);
@@ -17905,15 +18998,18 @@ fn emit_child_region(
         sb.publish(el_lcw);
     }
     sb.publish(anc_w);
-    sb.publish(t_final);
+    sb.publish(t_final[0]);
+    sb.publish(t_final[1]);
     sb.publish(tgt_w);
     sb.publish(runw);
     for accs in &resid_pub {
         for w in accs {
-            sb.publish(*w);
+            sb.publish(w[0]);
+            sb.publish(w[1]);
         }
     }
-    sb.publish(inner_w);
+    sb.publish(inner_w[0]);
+    sb.publish(inner_w[1]);
     // ---- the SIGMA ASSERTION emission (route B, in-circuit) ----
     // The claim exits as bound publics: the value is the deferred s_sigma
     // stream word — the SAME wire the rhs input check just consumed — and
@@ -17929,9 +19025,9 @@ fn emit_child_region(
         sb.publish(*w);
     }
     let n_tail =
-        2 + n_el_pd + 4 + levels.len() * ct.yr_len + 1 + 1 + ct.mu_i + jag_w.len();
+        2 + n_el_pd + 5 + 2 * levels.len() * ct.yr_len + 2 + 1 + ct.mu_i + jag_w.len();
     let n_query_pub: usize =
-        levels.len() + levels.iter().map(|l| l.a_count).sum::<usize>();
+        2 * levels.len() + levels.iter().map(|l| l.a_count).sum::<usize>();
     ChildRegion {
         pub_base,
         n_query_pub,
@@ -17992,13 +19088,13 @@ fn check_child_region(public: &[F128], ct: &ChildTape<'_>, r: &ChildRegion) -> u
         }
         for (li, want) in ct.native_sums.iter().enumerate() {
             assert_eq!(
-                public[at + li],
+                F256::new(public[at + 2 * li], public[at + 2 * li + 1]),
                 *want,
                 "L{li} enforced sum matches the native replica"
             );
         }
         assert_eq!(
-            at + ct.native_sums.len(),
+            at + 2 * ct.native_sums.len(),
             r.pub_base + r.n_query_pub,
             "the query publics walk consumed its whole block"
         );
@@ -18042,18 +19138,18 @@ fn check_child_region(public: &[F128], ct: &ChildTape<'_>, r: &ChildRegion) -> u
     );
     // THE LIGERITO CLOSE: the in-circuit spine reaches the native t_r.
     assert_eq!(
-        public[mp_base + 1],
+        F256::new(public[mp_base + 1], public[mp_base + 2]),
         ct.t_final_n,
         "the spine's final t_r matches the native replay"
     );
     // The merged intake: the advice target and the in-circuit running.
     assert_eq!(
-        public[mp_base + 2],
+        public[mp_base + 3],
         ct.native_target,
         "the RS target advice is the native gamma-combination"
     );
     assert_eq!(
-        public[mp_base + 3],
+        public[mp_base + 4],
         ct.native_running,
         "the W-rounds fold the target to the native running claim"
     );
@@ -18062,18 +19158,18 @@ fn check_child_region(public: &[F128], ct: &ChildTape<'_>, r: &ChildRegion) -> u
     // statement scalar, both held against published circuit outputs.
     let inner_n = check_residual_publics(
         public,
-        mp_base + 4,
+        mp_base + 5,
         &ct.levels,
         &ct.geo,
         &ct.w_resid,
         ct.inner_pd2.ch,
-        &ct.vals_rec[ct.yr_v2..ct.yr_v2 + ct.yr_len],
+        &observed_f256(&ct.vals_rec, ct.yr_v2, ct.yr_len),
         chals,
     );
     assert_eq!(inner_n, ct.t_final_n, "inner == t_r: the mixed statement closes");
     // The sigma assertion, as the accumulator would read it: the value and
     // the mu point coordinates, matched against the native claim.
-    let sig_base = mp_base + 4 + ct.levels.len() * ct.yr_len + 1;
+    let sig_base = mp_base + 5 + 2 * ct.levels.len() * ct.yr_len + 2;
     assert_eq!(
         public[sig_base],
         ct.inner.proof.wiring.gkr.s_sigma_eval,
@@ -23843,9 +24939,12 @@ fn build_node_outer_app(
             None => app_inline,
         };
         let shape2 = sb.finish().expect("the 2->1 node circuit builds");
+        // The two-limb Ligerito verifier adds extension-specific element
+        // tables to the fixed envelope. Keep the resulting mu=25 boundary
+        // explicit: crossing 1,024 slots would cost another full cell bit.
         assert!(
-            shape2.circuit.cells().slots().len() <= 512,
-            "the node's cell-slot budget regressed ({} slots)",
+            shape2.circuit.cells().slots().len() <= 1024,
+            "the F256 node's cell-slot budget regressed ({} slots)",
             shape2.circuit.cells().slots().len()
         );
         // ROUND-3 DATA (NODE_CENSUS=1): per-type schema words — each one a

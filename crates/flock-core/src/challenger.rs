@@ -30,7 +30,7 @@
 //!   ([`crate::pcs::commit::PcsParams::merkle_hash`]) — set both to the same
 //!   value if you want the whole system resting on a single primitive.
 
-use crate::field::F128;
+use crate::field::{F128, F256};
 use crate::hash::HashKind;
 use sha2::{Digest, Sha256};
 
@@ -79,6 +79,12 @@ pub trait Challenger: Send {
         }
     }
 
+    /// Absorb one quadratic-extension message as its two canonical F128
+    /// coordinates in `(c0, c1)` order.
+    fn observe_f256(&mut self, value: F256) {
+        self.observe_f128_slice(&value.coordinates());
+    }
+
     /// Absorb arbitrary bytes (e.g. a Merkle root or a statement digest).
     fn observe_bytes(&mut self, _bytes: &[u8]) {
         // default no-op — RandomChallenger inherits this.
@@ -90,6 +96,13 @@ pub trait Challenger: Send {
     /// Produce `n` F128 challenges, in order.
     fn sample_f128_vec(&mut self, n: usize) -> Vec<F128> {
         (0..n).map(|_| self.sample_f128()).collect()
+    }
+
+    /// Produce one uniform quadratic-extension challenge from one two-word
+    /// transcript squeeze.
+    fn sample_f256(&mut self) -> F256 {
+        let words = self.sample_f128_vec(2);
+        F256::new(words[0], words[1])
     }
 
     /// Prover-side PoW grinding: snapshot the current transcript state,
@@ -1494,6 +1507,29 @@ mod tests {
         let batch = c1.sample_f128_vec(5);
         let individual: Vec<F128> = (0..5).map(|_| c2.sample_f128()).collect();
         assert_eq!(batch, individual);
+    }
+
+    #[test]
+    fn sample_f256_is_one_double_width_squeeze() {
+        for kind in KINDS {
+            let mut extension = FsChallenger::with_hash(b"f256-squeeze", kind);
+            let mut words = FsChallenger::with_hash(b"f256-squeeze", kind);
+            let sampled = extension.sample_f256();
+            let expected = words.sample_f128_vec(2);
+            assert_eq!(sampled, F256::new(expected[0], expected[1]), "{kind}");
+        }
+    }
+
+    #[test]
+    fn observe_f256_is_canonical_coordinate_absorption() {
+        for kind in KINDS {
+            let value = F256::new(F128::new(1, 2), F128::new(3, 4));
+            let mut extension = FsChallenger::with_hash(b"f256-observe", kind);
+            let mut words = FsChallenger::with_hash(b"f256-observe", kind);
+            extension.observe_f256(value);
+            words.observe_f128_slice(&value.coordinates());
+            assert_eq!(extension.sample_f128_vec(4), words.sample_f128_vec(4), "{kind}");
+        }
     }
 
     // ---- FsChallenger ------------------------------------------------------
