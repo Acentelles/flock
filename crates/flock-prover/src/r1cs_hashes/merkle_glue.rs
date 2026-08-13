@@ -433,7 +433,7 @@ pub struct SwapInput {
 ///   0                  .. 128            the input word
 ///   128 + 128·l        .. +128           output l  (bit 0 = index bit l, rest 0)
 ///   128·(depth+1)       .. +128           zero mask
-///   128·(depth+2)       .. +128           check word (pinned zero)
+///   128·(depth+2)       .. +128           check word (wired input, zero)
 ///   128·(depth+3)                         the constant-one column
 /// ```
 ///
@@ -490,10 +490,17 @@ impl BitSpreadTable {
         self.const_pos() + 1
     }
 
-    /// Inputs: the word and its zero mask. Outputs: one single-bit word per
-    /// level.
+    /// Inputs: the word, its zero mask, and a zero check word. Outputs: one
+    /// single-bit word per level. Wiring the check word as an input is
+    /// essential: under the circuit's `C = I` convention the R1CS equations
+    /// define it as `word & mask`; the surrounding circuit supplies zero,
+    /// turning that definition into a selected-zero assertion.
     pub fn io_schema(&self) -> Vec<IoWord> {
-        let mut s = vec![IoWord::input(0), IoWord::input(self.mask_pos() / 128)];
+        let mut s = vec![
+            IoWord::input(0),
+            IoWord::input(self.mask_pos() / 128),
+            IoWord::input(self.check_pos() / 128),
+        ];
         s.extend((0..self.depth).map(|l| IoWord::output(self.out(l) / 128)));
         s
     }
@@ -513,9 +520,11 @@ impl BitSpreadTable {
             a[self.mask_pos() + j] = vec![self.mask_pos() + j];
             b[self.mask_pos() + j] = vec![gc];
 
-            // The optimized boolean prover uses the C=I convention.  Put
-            // the selected-zero predicate in a dedicated auxiliary bit that
-            // the witness pins to zero: input_j * mask_j = check_j = 0.
+            // The optimized boolean prover uses the C=I convention. Put the
+            // selected-zero predicate in a dedicated input word:
+            // input_j * mask_j = check_j. The circuit wires that whole word
+            // to zero, so a malicious witness cannot set check_j to the
+            // product and satisfy the relation.
             a[self.check_pos() + j] = vec![j];
             b[self.check_pos() + j] = vec![self.mask_pos() + j];
         }
@@ -653,7 +662,7 @@ pub struct BitSpreadInput {
 ///   128 .. 256    nonce word                (wired input 1)
 ///   256 .. 320    mask, low 64 bits         (wired input 2, low half)
 ///   320 .. 384    nonce bits 64..128        (input 2's HIGH half, repurposed)
-///   384 .. 511    check_j = pred_j · mask_j (pinned zero)
+///   384 .. 511    check_j = pred_j · mask_j (wired input, zero)
 ///   511           the constant-one column
 /// ```
 ///
@@ -668,8 +677,9 @@ pub struct BitSpreadInput {
 /// canonical-zero nonce (low half through the prefix cells, high half
 /// through the repurposed cells) — no extra grinding knob.
 ///
-/// `lambda <= 64` is asserted at emission; the current schedule's maximum is
-/// 18 (the Product-GKR fingerprint).
+/// `lambda <= 64` is asserted at emission; the embedded Ligerito profiles
+/// currently reach 23 bits, while the non-Ligerito circuit policies remain
+/// below that bound.
 pub struct PowMaskTable;
 
 /// One row of [`PowMaskTable`].  `mask` is statement data confined to the
@@ -699,9 +709,17 @@ impl PowMaskTable {
         512
     }
 
-    /// Inputs: predicate, nonce, mask.  No outputs — the row is pure checks.
+    /// Inputs: predicate, nonce, mask, and the final check word. The caller
+    /// wires that word to the constant whose low 127 bits are zero and whose
+    /// last bit is the table's constant-one column. Under `C = I`, binding
+    /// this input is what forces every prefix product to zero.
     pub fn io_schema(&self) -> Vec<IoWord> {
-        vec![IoWord::input(0), IoWord::input(1), IoWord::input(2)]
+        vec![
+            IoWord::input(0),
+            IoWord::input(1),
+            IoWord::input(2),
+            IoWord::input(3),
+        ]
     }
 
     pub fn build_matrices(&self) -> (SparseBinaryMatrix, SparseBinaryMatrix) {
@@ -727,10 +745,11 @@ impl PowMaskTable {
             a[320 + j] = vec![192 + j];
             b[320 + j] = vec![gc];
         }
-        // The prefix checks: check_j = pred_j * mask_j, pinned zero.  For
-        // j >= 64 the "mask" reference lands on the repurposed nonce cells
-        // (honest zero), so those checks are vacuous — masks are low-half
-        // by the lambda <= 64 contract.
+        // The prefix checks: check_j = pred_j * mask_j. The whole check word
+        // is a circuit input wired to 0..0,1, which forces these products to
+        // zero. For j >= 64 the "mask" reference lands on the repurposed
+        // nonce cells (honest zero), so those checks are vacuous — masks are
+        // low-half by the lambda <= 64 contract.
         for j in 0..127 {
             a[384 + j] = vec![j];
             b[384 + j] = vec![256 + j];

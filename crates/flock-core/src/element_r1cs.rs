@@ -656,12 +656,16 @@ const PCS_LOG_BATCH_SIZE: usize = 1;
 /// packed-direct opening points have length `m_words`. Deterministic in
 /// `m_words`, so the verifier rebuilds these from the statement and the proof
 /// carries only the root.
-fn pcs_params(m_words: usize) -> PcsParams {
+fn pcs_params(m_words: usize, grinding: Grinding) -> PcsParams {
     PcsParams {
         m: m_words + LOG_PACKING,
         log_inv_rate: PCS_LOG_INV_RATE,
         log_batch_size: PCS_LOG_BATCH_SIZE,
-        profile: Default::default(),
+        profile: if grinding.enabled {
+            pcs::ligerito::LigeritoProfile::Secure
+        } else {
+            Default::default()
+        },
         num_lanes: None,
         merkle_hash: Default::default(),
     }
@@ -795,7 +799,8 @@ pub fn prove<C: Challenger>(
 }
 
 /// [`prove`] with an explicit Fiat--Shamir grinding policy for both element
-/// PIOP phases.  The normal mixed-table prover selects this from
+/// PIOP phases and the packed-direct opening transport. The normal
+/// mixed-table prover selects this from
 /// [`PcsParams::element_grinding`]; this entry point gives standalone users
 /// the same protection without changing the legacy transcript by default.
 pub fn prove_with_grinding<C: Challenger>(
@@ -813,7 +818,7 @@ pub fn prove_with_grinding<C: Challenger>(
     assert_eq!(z.len(), stmt.n_words(), "witness length");
 
     // ---- 1. Commit the witness words, then bind the whole statement. ----
-    let params = pcs_params(m_words);
+    let params = pcs_params(m_words, grinding);
     let (commitment, pdata) = commit(z, &params);
     stmt.bind(&commitment.cap, ch);
 
@@ -848,7 +853,7 @@ pub fn prove_with_grinding<C: Challenger>(
 
     // ---- 4. Open both witness claims, packed-direct, no ring-switch. ----
     let claims = packed_direct_claims(&zc_claim.r, zc_claim.ec, &lc_claim.r_prime, lc_claim.z_eval);
-    let open = pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
+    let open = pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding(
         z.to_vec(),
         &pdata,
         &commitment,
@@ -857,6 +862,7 @@ pub fn prove_with_grinding<C: Challenger>(
         &claims,
         &PaddingSpec::dense(params.m),
         &ligerito_prover_config(m_words),
+        params.opening_grinding(),
         ch,
     );
 
@@ -911,7 +917,7 @@ pub fn verify_with_grinding<C: Challenger>(
     // and bind at the prover's transcript position.
     let commitment = Commitment {
         cap: proof.cap.clone(),
-        params: pcs_params(m_words),
+        params: pcs_params(m_words, grinding),
     };
     stmt.bind(&commitment.cap, ch);
 
@@ -937,7 +943,7 @@ pub fn verify_with_grinding<C: Challenger>(
         .zip(values)
         .map(|(point, value)| PackedDirectClaimRef { point, value })
         .collect();
-    pcs::verify_opening_batch_ligerito_mixed(
+    pcs::verify_opening_batch_ligerito_mixed_with_grinding(
         &commitment,
         &[],
         &[],
@@ -945,6 +951,7 @@ pub fn verify_with_grinding<C: Challenger>(
         &refs,
         &proof.open,
         &ligerito_verifier_config(m_words),
+        commitment.params.opening_grinding(),
         ch,
     )
     .map_err(VerifyError::Open)?;
@@ -1370,6 +1377,11 @@ mod e2e_tests {
             proof.lincheck.grinding_nonces.len(),
             grinding.lincheck_nonce_count(ty.kappa())
         );
+        assert_eq!(
+            proof.open.batching_nonces.len(),
+            1,
+            "the two packed-direct opening claims require one batching PoW"
+        );
 
         let mut ch_v = FsChallenger::new(TRANSCRIPT);
         assert_eq!(
@@ -1385,6 +1397,14 @@ mod e2e_tests {
             Err(VerifyError::Zerocheck(
                 zerocheck::VerifyError::BadGrindingNonceCount { .. }
             ))
+        ));
+
+        let mut missing_open = proof.clone();
+        missing_open.open.batching_nonces.pop();
+        let mut ch_v = FsChallenger::new(TRANSCRIPT);
+        assert!(matches!(
+            verify_with_grinding(&stmt, &missing_open, grinding, &mut ch_v),
+            Err(VerifyError::Open(_))
         ));
 
         // Pick a different nonce that fails the *initial* PoW predicate.

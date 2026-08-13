@@ -1,5 +1,5 @@
-//! Byte-identity anchors for the MERGED transport — the shipped wire-v6
-//! protocol. An optimization must produce byte-identical proofs; only a
+//! Byte-identity anchors for the MERGED transport — currently proof-IO v18.
+//! An optimization must produce byte-identical proofs; only a
 //! deliberate protocol change may move these digests, and it must re-pin
 //! them with a history entry below.
 //!
@@ -39,6 +39,10 @@
 //! fork (`4787509` — merged opens prove the assist beside the inner open
 //! on a forked chain, unconditional). Roundtrip suites green; digests
 //! stable across two print runs.
+//! Re-pinned 2026-08-13 for the deliberate v18 Ligerito protocol changes:
+//! two-point OOD binding, Appendix C.3 algebraic grinding, fused PoW/squeeze,
+//! and strict-128 Johnson query schedules. All six fixtures moved; roundtrip
+//! suites are green and the digests were identical across two print runs.
 
 use ::sha2 as sha2_hash;
 use flock_core::proof::{R1csClaim, R1csProofMergedLigerito};
@@ -114,7 +118,7 @@ fn check(label: &str, expected: &str, got: String) {
     assert_eq!(
         got, expected,
         "M6 byte-identity broken for fixture `{label}`: the prover's output \
-         bytes diverged from the pre-M6 base commit"
+         bytes diverged from the pinned proof-IO protocol"
     );
 }
 
@@ -141,8 +145,9 @@ fn merged_bundle_digest(
 /// registry id, counts vector, commitment, and the merged proof — plus the
 /// claim values. The registry here (BLAKE3+SHA-256 at ν = 10) IS the
 /// `Blake3Sha2Nu10` tier, so this pins exactly what `proof_io` puts on disk
-/// for a v6 mixed proof. Same count ladder and witness streams as the
-/// removed jagged fixture, whose digests pinned the same statements.
+/// for the current v18 mixed proof. It retains the removed jagged fixture's
+/// statements and witness streams; the Ligerito query ladder intentionally
+/// changed with v18.
 #[test]
 #[ignore] // Heavier — run with `cargo test --release ... -- --ignored`.
 fn m6_merged_union_proof_bytes_pinned() {
@@ -150,22 +155,22 @@ fn m6_merged_union_proof_bytes_pinned() {
         (
             "merged-nu10-1024-1024",
             [1024, 1024],
-            "6535f217824d1537a86550e60439a149381fa323ad75d5f117ed8e20525939ab",
+            "6c08f76e7885d1d360f16d86de60657323eeefb0246d9db7f38ae4f29f31bdf1",
         ),
         (
             "merged-nu10-50-37",
             [50, 37],
-            "a95f9bad8b9456349dc7ff02e16596b71ce991d1c2d1198670f7a4f88b781e15",
+            "dc4a61b272ac9ea33c5ea2be2e0c18882554d4d0988331783e2b8ac7e72f0c6b",
         ),
         (
             "merged-nu10-8-8",
             [8, 8],
-            "4e74778b8b56e49845bd621ff926fe4bc25062d3e8eb4fc53d4565e816c68c24",
+            "039039e8c83ee73009dd677318b9910bd440fb7308dd244fcc57fc295f98d3fc",
         ),
         (
             "merged-nu10-0-64",
             [0, 64],
-            "8b80f3440f4f79cbf1b63df782af9fda6c15fa158e672948e65081592ca65457",
+            "acc484c2e835447e3a55579aadae1e13a6849644b5804741272c2876234b1ca5",
         ),
     ];
 
@@ -241,7 +246,7 @@ fn m6_merged_union_proof_bytes_pinned() {
 fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
     // BLAKE3, 256 blocks (m = 22).
     {
-        const EXPECTED: &str = "32558fdfe5ee33d63cf46cf1fe78ddf2d2c06b2e28803d727d66eee2f4532ef9";
+        const EXPECTED: &str = "de5f937d3fcdafe2d3c5bd1044cb7365958dd0a764339dbe9f180be98aba2939";
         let n_blocks = 256usize;
         let setup = blake3::Blake3Setup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_B3B3);
@@ -273,7 +278,7 @@ fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
 
     // SHA-256, 128 blocks (m = 22).
     {
-        const EXPECTED: &str = "e60258ad10de2d3103fc59d82a9db23aa36b760a0ce57549d39b9a56f402113b";
+        const EXPECTED: &str = "0fb9ea20ba9cd1e6f9d6cf7cd1f5647033d7033f0d24704b38494a6f7cd96720";
         let n_blocks = 128usize;
         let setup = sha2::Sha256HybridSetup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_5252);

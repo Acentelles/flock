@@ -1,7 +1,9 @@
 # Two recursion variants: 100-bit and 128-bit
 
-To: Min (rkm0959). From: Ron's session, 2026-08-12, branch `pow-mask-slot`
-(sits on your `min/recursion-128bit` @ `4603c0f`, zero-conflict merge).
+Original review context: Ron's 2026-08-12 `pow-mask-slot` session, based on
+`min/recursion-128bit` at `4603c0f`. The resolution annotations and validation
+status below describe the rebased `min/recursion-128bit` working tree as of
+2026-08-13.
 
 Ron wants both security levels runnable side by side while the 128-bit work
 matures: **the 100-bit variant is the configuration shipped before your
@@ -16,8 +18,15 @@ against your unmodified tip, none introduced by our commits.
 | | 100-bit | 128-bit |
 | --- | --- | --- |
 | leaf/node track (mvp) | `TOWER_PROFILE=fast100` | `TOWER_PROFILE=secure` |
-| chain track / spine | `TOWER_PROFILE=slim100` (envelope on, m29) | blocked — see issues 2 and 3 |
+| chain track / spine | `TOWER_PROFILE=slim100` (envelope on, m29) | `TOWER_PROFILE=slim` (envelope on, m29); Secure chain tower also validated |
 | in code | `PcsParams.profile = Fast100 / Slim100` | `= Secure` |
+
+The right-hand column is the recursion configuration used to validate the
+128-bit roadmap work; it is not yet an overall 128-bit Ligerito claim.
+Strict-Slim's Johnson consistency-query component clears 128 bits, while the
+F128 MCA term is the next milestone. `Secure` remains the separate historical
+120-bit unique-decoding profile used to exercise every algebraic-grinding
+family through recursion.
 
 `Fast100` and `Slim100` are new `LigeritoProfile` variants that are `Fast`
 and `Slim` in every respect — the same Johnson accounting, two-point OOD,
@@ -45,8 +54,10 @@ algebraic grinding (a handful of extra rows, strictly more soundness).
 
 ## Validation status
 
-Everything below on `pow-mask-slot` (which also carries the fused PoW mask
-row — one 4-word row per grinding check; see commit `41a3a17`):
+The original measurements were made on `pow-mask-slot`. The rebased branch
+carries the same fused PoW-mask design (one four-word row per grinding check)
+at `f8093ec`, plus the soundness repair described in
+`128-bit-grinding-audit.md`.
 
 - `flock-core --lib` (incl. the config suite over all 70 embedded TOMLs) and
   the full `flock-prover` suite: green.
@@ -57,7 +68,8 @@ row — one 4-word row per grinding check; see commit `41a3a17`):
   green under `slim100` + the m29 envelope**. The envelope's fixed point
   held with zero re-pins, since it was iterated against exactly these
   schedules. This is the first spine run since your Ligerito parts landed.
-- 128-bit chain track: blocked by issues 2 and 3 below.
+- 128-bit chain track: strict-Slim m29 spine and Secure chain tower now green;
+  see the 2026-08-13 resolution below.
 
 Same-run mvp11 node comparison (medians of 10 online reps, M4 Max):
 
@@ -67,16 +79,19 @@ Same-run mvp11 node comparison (medians of 10 online reps, M4 Max):
 | outer proof | 292.0 KiB | 566.7 KiB (+94%) |
 | BLAKE rows / capacity | 24,827 at nu 15 / mu 23 | 38,489 at nu 16 / mu 24 |
 
-## Issues found (all pre-existing on `4603c0f`)
+## Issues found on `4603c0f` and current resolution
 
-**1. mvp7 fails to parse its own tape (`LegacyPow`).**
+**1. MVP-7 failed to parse its own tape (`LegacyPow`).**
 `mvp7_real_query_phase` dies at "op 272: expected the next cap absorb, got
 `LegacyPow { bits: 9 }`" — its inner still records legacy PoW ops the
 post-fusion parser never learned. Looks like mvp7 was not converted with
 the rest of the mvp ladder. Repro:
 `cargo test --release -p flock-prover --test circuit_merkle mvp7_real_query_phase -- --ignored --exact`.
 
-**2. The `initial_ood` walk breaks on the NEW slim schedule ("L0 OOD beta").**
+Resolved upstream by converting MVP-7 to the fused transcript path. The exact
+reproduction command is green after the rebase.
+
+**2. The `initial_ood` walk broke on the new Slim schedule ("L0 OOD beta").**
 `parse_open_levels`'s L0 OOD loop panics at the `SqueezeScalar` expectation
 when walking a strict-128 slim tape — which blocks **every** envelope run
 (`TOWER_PROFILE=slim` + `TOWER_ENV_M=29`), and with it the whole spine, at
@@ -84,11 +99,17 @@ the 128-bit schedule. Diagnostic that should localize it quickly: the SAME
 parser walks old-schedule slim tapes fine (`slim100` spine passes end to
 end), and fast/fast100 tapes fine — so it is something the new slim counts
 change about the L0 region's op order, not slim's query-phase PoW or rate
-per se. The assert now dumps its surrounding op context (we instrumented
-it). Repro:
+per se. The diagnostic at that point dumped its surrounding op context.
+Repro:
 `TOWER_ENV_M=29 TOWER_PROFILE=slim cargo test --release -p flock-prover --test circuit_merkle chain_spine_converges -- --ignored --exact`.
 
-**3. The Secure chain tower dies in witgen (first-ever run).**
+Resolved by anchoring `parse_open_levels` at the
+`flock-ligerito-basis-v0` protocol label, then checking the target and L0 cap
+that follow it. The former "last cap with this byte length" heuristic could
+select a later equal-sized recursive cap. The exact strict-Slim reproduction
+now passes through the converged spine.
+
+**3. The Secure chain tower failed in witness generation.**
 `chain_tower_e2e_with_lane` under `TOWER_PROFILE=secure` panics with "a
 connected wire disagrees with the gate output that produces it (slot 0
 [= b3], class root …)" in `builder.rs`. This is your audit's "recursive
@@ -98,24 +119,47 @@ grinding transcripts, and somewhere the FL/node emitters wire a chain row
 under a pre-grinding shape assumption. Repro:
 `TOWER_PROFILE=secure cargo test --release -p flock-prover --test circuit_merkle chain_tower_e2e_with_lane -- --ignored --exact`.
 
-## What chain-128 needs
+Resolved by replacing the chain lane's manual ordinary-finalize replay with
+the canonical PoW-aware `fs_chain::trace_duplex`. Under Secure, the manual
+loop ignored the fused PoW compression counter and therefore supplied the
+recursive fold endpoint with a different challenge from the native verifier.
+The exact reproduction now passes, including both lane discharges and tamper
+tests.
 
-1. Issue 2 fixed — unblocks the envelope at the new slim schedule.
-2. Issue 3 fixed — unblocks Secure (and presumably strict-128-slim) chain
-   recursion.
-3. An envelope re-iteration: Part 3 changed slim's counts, so the m29
-   envelope's `counts_bool`/`counts_el`/`publics` fixed point moves. Our
-   fused-PoW slot added a fourth boolean count (`counts_bool[3]`, currently
-   an estimated 4096 cap) that should be pinned in the same pass.
+## Chain-128 closure
 
-## Branch map
+1. The strict-Slim parser is fixed and its converged m29 spine passes.
+2. The Secure chain lane uses the PoW-aware trace and passes end to end.
+3. No count-cap re-iteration is required in the shipped design: free counts
+   are unconditional. The strict-Slim spine validates the live PoW count,
+   pinned lane count, fixed public layout, and steady circuit digest. The old
+   `counts_bool`/`counts_el` values remain only the retired padding oracle and
+   slot-declaration key list.
 
-- `41a3a17` — the fused PoW mask row (one 4-word row per grinding check;
+The 2026-08-13 validation matrix also passed Fast100 and Secure `mvp11` and
+`mvp12`, Slim100 first-level node / chain tower / converged spine, `mvp7`, the
+full active `flock-core` suite (486 passed, 22 ignored), and the full active
+`flock-prover` suite and integrations with no failures. Ron's three ignored
+proof-byte pin tests were also run explicitly. The branch's deliberate v18
+Ligerito protocol changes moved all thirteen fixture digests; the new values
+were identical across two print runs, were documented at the fixtures, and
+the pin tests now pass normally.
+
+## Rebased branch map
+
+- `f8093ec` — the fused PoW mask row (one four-word row per grinding check;
   isolated grinding overhead 11 → 6 ms, +4 → +2 BLAKE rows). One subtlety
   relevant to your recursive PoW relation: the nonce-width rejection lives
   in the mask word's WIRE BINDING (word 2 must equal the statement's mask
   constant, whose high half is zero), not in the R1CS alone.
-- `e9769ab` — merge of your Ligerito parts 1–3 (clean; the new Ligerito
-  `Pow` sites ride the fused row automatically via the generic tape walk).
-- `fc694b3` — `Fast100`.
-- HEAD — `Slim100` + the spine validation + the instrumented parser assert.
+- `2959d88` — merge of the Ligerito parts 1–3; the new Ligerito
+  `Pow` sites ride the fused row automatically via the generic tape walk.
+- `3f943eb` — `Fast100`.
+- `cfcfe16` — `Slim100`, spine validation, and the parser diagnostic that
+  exposed issue 2.
+- `be75c25` — Ron's original review report. The current working-tree fixes are
+  recorded above and in `128-bit-grinding-audit.md`.
+
+---
+
+Also, see https://claude.ai/code/artifact/70a216b1-ecd9-4839-b1ce-cbbca24a3618 for an audit of our branch in Fable 5.

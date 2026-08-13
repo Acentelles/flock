@@ -86,17 +86,16 @@ fn tower_profile() -> LigeritoProfile {
 }
 
 fn tower_fold_grinding() -> flock_core::matrix_fold::FoldGrinding {
-    match tower_profile() {
-        LigeritoProfile::Secure => {
-            flock_core::matrix_fold::FoldGrinding::per_challenge_128()
-        }
-        LigeritoProfile::Fast
-        | LigeritoProfile::Fast100
-        | LigeritoProfile::Slim
-        | LigeritoProfile::Slim100 => {
-            flock_core::matrix_fold::FoldGrinding::disabled()
-        }
+    let profile = tower_profile();
+    PcsParams {
+        m: 22,
+        log_inv_rate: profile.log_inv_rate(),
+        log_batch_size: 5,
+        profile,
+        num_lanes: None,
+        merkle_hash: HashKind::Blake3,
     }
+    .matrix_fold_grinding()
 }
 
 /// The ENVELOPE dense floor `m*` (wall 2): every recursion-path OUTER —
@@ -172,18 +171,12 @@ struct EnvShape {
     spread_w: usize,
     resid_pls: [usize; 6],
     pf_w: usize,
-    /// counts* — the ONE declared-count vector every envelope outer pads
-    /// to (`ShapeBuilder::pad_slot_rows` before finish, so `shape.counts`
-    /// and every union built from it carry counts* automatically). This is
-    /// what makes the child's content — and hence num_lanes, the ladder,
-    /// and the whole tape geometry a parent walks — LEVEL-INDEPENDENT.
-    /// EXACT fixed-point values (Ron's framework: determinism over
-    /// margin): elementwise max of the leaf/L1/L2 usage measured AT the
-    /// padded envelope, iterated to closure. A usage that outgrows its cap
-    /// fails the pad assert or the digest pin — loud, and the re-pin is
-    /// deliberate. Boolean trio first (b3, swap, spread — NOTE: swap
-    /// before spread here, matching the builders' declaration fields, NOT
-    /// the registry print order), then the element types by cache key.
+    /// Historical counts* oracle values. Shipped envelope proofs use
+    /// unconditional free counts, so these values no longer pad rows or
+    /// determine the circuit digest; `counts_el` remains the canonical
+    /// element-slot key list and both arrays retain the old cap census for
+    /// comparison. Boolean slots come first (b3, swap, spread, pow), then
+    /// element types by cache key.
     counts_bool: [usize; 4],
     counts_el: [(usize, usize); 15],
     /// publics* — the ONE public-segment length every envelope outer pads
@@ -360,10 +353,10 @@ fn envelope_shape() -> Option<EnvShape> {
         // census, elementwise max of leaf/node usage). Only b3, le8, pf8
         // and mac are content-geometry-sensitive; everything else hits its
         // cap exactly (registry-shaped) and skn/skc are the leaf's.
-        // The 4th entry is the depth-0 PoW-mask slot (one row per masked
-        // word: 2 per nonzero grind, 1 per zero-bit site). NOT yet iterated
-        // at the padded envelope — an estimate above current usage; the pad
-        // assert fails loudly if outgrown and the re-pin is deliberate.
+        // The 4th entry is the fused PoW-mask slot (one row per grinding
+        // site). It is a historical oracle cap only: free counts are
+        // unconditional, and the strict-Slim m29 spine exercises the live
+        // count and fixed envelope layout end to end.
         counts_bool: [26200, 12250, 1060, 4096],
         counts_el: [
             (600, 49000), // mac — the nu* driver; watch the 2^15 ceiling
@@ -502,6 +495,7 @@ fn pad_envelope_counts(
     zw: Wire,
     hints: &mut Vec<[u32; SLOT_WORDS]>,
     vals: &mut Vec<F128>,
+    consts: &mut Vec<(F128, Wire)>,
     tail: &EnvTail,
 ) {
     // FREE COUNTS ARE THE DEFAULT (the count win): the ROW padding is
@@ -519,14 +513,18 @@ fn pad_envelope_counts(
                    name: &str,
                    s: flock_core::circuit::builder::SlotId,
                    target: usize,
-                   hinted: bool| {
+                   hinted: bool,
+                   fixed_inputs: Option<&[Wire]>| {
         let live = sb.rows_in_slot(s);
         report.push(format!("{name} {live}/{target}"));
         if live > target {
             over.push(format!("{name} {live} > {target}"));
             return;
         }
-        let ins = vec![zw; sb.slot_inputs(s)];
+        let ins = fixed_inputs
+            .map(<[Wire]>::to_vec)
+            .unwrap_or_else(|| vec![zw; sb.slot_inputs(s)]);
+        assert_eq!(ins.len(), sb.slot_inputs(s), "padding input arity for {name}");
         for _ in live..target {
             if hinted {
                 hints.push([0u32; SLOT_WORDS]);
@@ -549,17 +547,37 @@ fn pad_envelope_counts(
     let t_swap = if no_pad { floor1(sb, q.swap) } else { env.counts_bool[1] };
     let t_spread = if no_pad { floor1(sb, q.spread) } else { env.counts_bool[2] };
     let t_pow = if no_pad { floor1(sb, q.pow) } else { env.counts_bool[3] };
-    pad(sb, hints, &mut over, "b3", q.b3, t_b3, false);
-    pad(sb, hints, &mut over, "swap", q.swap, t_swap, true);
-    pad(sb, hints, &mut over, "spread", q.spread, t_spread, false);
-    pad(sb, hints, &mut over, "pow", q.pow, t_pow, false);
+    pad(sb, hints, &mut over, "b3", q.b3, t_b3, false, None);
+    pad(sb, hints, &mut over, "swap", q.swap, t_swap, true, None);
+    pad(sb, hints, &mut over, "spread", q.spread, t_spread, false, None);
+    let pow_check = cw(sb, vals, consts, F128::new(0, 1u64 << 63));
+    let pow_inputs = [zw, zw, zw, pow_check];
+    pad(
+        sb,
+        hints,
+        &mut over,
+        "pow",
+        q.pow,
+        t_pow,
+        false,
+        Some(&pow_inputs),
+    );
     for &(key, count) in &env.counts_el {
         let &(_, s) = cache
             .iter()
             .find(|&&(k, _)| k == key)
             .unwrap_or_else(|| panic!("envelope slot key {key} missing from the cache"));
         let target = if no_pad { floor1(sb, s) } else { count };
-        pad(sb, hints, &mut over, &format!("el{key}"), s, target, false);
+        pad(
+            sb,
+            hints,
+            &mut over,
+            &format!("el{key}"),
+            s,
+            target,
+            false,
+            None,
+        );
     }
     // A slot the emission demanded but the envelope never declared: the
     // keyed cache created it on the fly, so this builder's registry carries
@@ -621,13 +639,12 @@ fn pad_envelope_counts(
             }
         }
     }
-    // The live/cap census — the fixed-point iteration's data. One line per
-    // build, so the tower prints leaf and node usage side by side.
-    println!("  [counts* live/cap] {}", report.join(" | "));
-    // An overshoot must be LOUD: a silent no-op would leave this outer's
-    // counts above counts* and quietly break the level independence the
-    // pin exists for. Growing usage re-pins counts* deliberately — the
-    // full census above is the data for that re-pin.
+    // The live/target census. Under shipped free counts, target is the live
+    // count (or one schema-preserving dummy row); the retired oracle branch
+    // instead reports the historical caps.
+    println!("  [envelope rows live/target] {}", report.join(" | "));
+    // This can fire only when exercising the historical cap branch. Free
+    // counts have no cap to outgrow.
     assert!(over.is_empty(), "counts* overshoot: {}", over.join(", "));
 }
 
@@ -4876,16 +4893,17 @@ fn parse_open_levels(
         }
     }
 
-    // Open start: the LAST ObserveBytes of the L0 cap's size —
-    // `bind_statement` absorbs the same cap once, earlier.
-    let starts: Vec<usize> = ops
+    // The opening protocol begins at its domain label. Cap byte lengths are
+    // not structural delimiters: under strict profiles a later recursive cap
+    // can have the same length as L0, so a last-matching-length heuristic can
+    // enter the tape at the wrong level.
+    let label = ops
         .iter()
-        .enumerate()
-        .filter(|(_, o)| matches!(o, Op::ObserveBytes(n) if *n == cap0_bytes))
-        .map(|(i, _)| i)
-        .collect();
-    assert!(starts.len() >= 2, "expected bind + open cap absorbs");
-    let start = *starts.last().unwrap();
+        .position(|o| matches!(o, Op::Label(l) if l.as_slice() == b"flock-ligerito-basis-v0"))
+        .expect("Ligerito opening label");
+    assert!(matches!(ops.get(label + 1), Some(Op::ObserveScalar)), "opening target");
+    let start = label + 2;
+    assert!(matches!(ops.get(start), Some(Op::ObserveBytes(n)) if *n == cap0_bytes), "L0 cap");
     // The merged intake runs every ring switch, absorbs every packed-direct
     // value, then protects and samples ONE coefficient vector in claim order
     // (RS first, PD second).  Consequently every PD coefficient below names
@@ -6444,6 +6462,7 @@ impl GateType for BitSpreadGate {
     fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> BitSpreadInput {
         let word = (inputs[0].lo as u128) | ((inputs[0].hi as u128) << 64);
         let zero_mask = (inputs[1].lo as u128) | ((inputs[1].hi as u128) << 64);
+        debug_assert_eq!(inputs[2], F128::ZERO);
         outputs.extend((0..self.ty.depth).map(|l| F128::new(((word >> l) & 1) as u64, 0)));
         BitSpreadInput { word, zero_mask }
     }
@@ -6471,6 +6490,7 @@ impl GateType for PowMaskGate {
 
     fn eval(&self, inputs: &[F128], _hint: &(), _outputs: &mut Vec<F128>) -> PowMaskInput {
         let w = |i: usize| (inputs[i].lo as u128) | ((inputs[i].hi as u128) << 64);
+        debug_assert_eq!(inputs[3], F128::new(0, 1u64 << 63));
         PowMaskInput {
             pred: w(0),
             nonce: w(1),
@@ -7522,9 +7542,9 @@ fn pow_leading_zero_mask(bits: u32) -> F128 {
 /// nonce[64..128] = 0.
 /// ```
 ///
-/// The selected-zero equations are rows of the shared bit-spread table, whose
-/// mask input is a statement constant. A zero-bit operation instead enforces
-/// the canonical nonce 0.
+/// The selected-zero equations are rows of the shared PoW-mask table, whose
+/// mask and check inputs are statement constants. A zero-bit operation instead
+/// enforces the canonical nonce 0.
 fn emit_pow_checks(
     sb: &mut ShapeBuilder,
     _b3: flock_core::circuit::builder::SlotId,
@@ -7534,6 +7554,8 @@ fn emit_pow_checks(
     vals: &mut Vec<F128>,
     consts: &mut Vec<(F128, Wire)>,
 ) {
+    let check_word = (!pows.is_empty())
+        .then(|| cw(sb, vals, consts, F128::new(0, 1u64 << 63)));
     for &([predicate, nonce], bits) in pows {
         // One fused PowMask row per check: the prefix cells mask the
         // predicate and the mask word's wire-bound high half pins the
@@ -7548,10 +7570,16 @@ fn emit_pow_checks(
             // the structural high-half cells pin the rest.  All 128 bits,
             // so a disabled site cannot become a grinding knob either.
             let ones = cw(sb, vals, consts, F128::new(u64::MAX, 0));
-            let _ = sb.gate(pow, &[nonce, nonce, ones]);
+            let _ = sb.gate(
+                pow,
+                &[nonce, nonce, ones, check_word.expect("nonempty PoW list")],
+            );
         } else {
             let mask_w = cw(sb, vals, consts, pow_leading_zero_mask(bits));
-            let _ = sb.gate(pow, &[predicate, nonce, mask_w]);
+            let _ = sb.gate(
+                pow,
+                &[predicate, nonce, mask_w, check_word.expect("nonempty PoW list")],
+            );
         }
     }
 }
@@ -7919,7 +7947,7 @@ fn emit_opening(
     // The index word's bits, one per level.
     // Its zero mask is empty: this row only relocates bits.  Grinding rows
     // below reuse the same table with nonzero masks to enforce predicates.
-    let bits = sb.gate(s.spread, &[index_w, zero_w]);
+    let bits = sb.gate(s.spread, &[index_w, zero_w, zero_w]);
 
     // Chunk chain: the leaf hashed as a BLAKE3 chunk.
     let mut cv = iv;
@@ -10113,6 +10141,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
                 zw,
                 &mut hints,
                 &mut vals,
+                &mut consts,
                 &EnvTail::default(),
             );
         }
@@ -14683,6 +14712,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
                     zw,
                     &mut hints,
                     &mut vals,
+                    &mut consts,
                     &EnvTail {
                         acc_chain: &acc_chain_w,
                         app: &app_w,
@@ -22723,7 +22753,6 @@ fn build_node_outer_app(
     // ---- ONE outer: two REAL child regions + the fold region ----
     let outer_stats = {
         use flock_prover::prover::UnionElementSlotInput;
-        use flock_prover::r1cs_hashes::fs_chain::FsChainSponge;
 
         // The transcript is FORKED (the wiring runs on its own chain);
         // `merge_chain` splices the child's rows in at the fork point and
@@ -23556,17 +23585,15 @@ fn build_node_outer_app(
         let lane_pub = lane_native.as_ref().map(|ln2| {
             let (_, llocs, ljlocs, lstream, lbytes, lops, lchals, lvals) = ln2;
             let lane_ref = lane.as_ref().expect("lane native implies lane");
-            let mut lchain = FsChainSponge::new();
-            let mut at = 0usize;
-            let lfin: Vec<_> = lops.iter().filter(|o| o.finalizes()).collect();
-            assert_eq!(lstream.finalize_after.len(), lfin.len(), "lane finalize alignment");
-            for (k, &upto) in lstream.finalize_after.iter().enumerate() {
-                lchain.absorb(&lbytes[at * 16..upto * 16]);
-                at = upto;
-                lchain.finalize(lfin[k].squeezed_bytes());
-            }
-            lchain.absorb(&lbytes[at * 16..]);
-            let ltrace = lchain.finish();
+            // Use the protocol tracer rather than a manual finalize loop:
+            // Secure fold tapes contain fused `Pow`+squeeze operations whose
+            // compression counter differs from an ordinary squeeze.
+            let ltrace = flock_prover::r1cs_hashes::fs_chain::trace_duplex(
+                lstream,
+                lbytes,
+                lops,
+            );
+            assert_chain_replays(lops, &ltrace, lchals);
             let lpub_payloads = bytes_payload_mask(&lops);
             let (lchain_outs, lww) = emit_fs_chain(
                 &mut sb,
@@ -23803,6 +23830,7 @@ fn build_node_outer_app(
                     zw,
                     &mut hints,
                     &mut vals,
+                    &mut consts,
                     &EnvTail {
                         acc_main: &acc_main_w,
                         acc_chain: lane_pub.as_ref().map(|(_, _, _, w, _)| w).unwrap_or(&empty),

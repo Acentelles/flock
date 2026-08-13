@@ -1285,19 +1285,23 @@ fn bundle_digest_merged(
 // beside the inner open on a forked chain, unconditional). All seven
 // fixtures moved; roundtrip suites green, digests stable across two
 // print runs.
+// Re-pinned 2026-08-13 for the deliberate proof-IO v18 Ligerito changes:
+// two-point OOD binding, Appendix C.3 algebraic grinding, fused PoW/squeeze,
+// and strict-128 Johnson query schedules. All seven fixtures moved;
+// roundtrip suites are green and digests were stable across two print runs.
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn mixed_class_merged_proof_bytes_pinned() {
     const ELEMENT_ONLY: [(&str, usize, &str); 3] = [
-        ("elem-merged-nu12-full", 1 << 12, "50f22119e500530eb088d2830b289a903006f705dec21453605b3a5ce4a117d2"),
-        ("elem-merged-nu12-2731", 2731, "cff3de5f57ab397d9267c5b5ae40ceacc5dbecb8ac3662ac67e478776b3b17a0"),
-        ("elem-merged-nu12-0", 0, "b52a5f8860d847023f1237c2319a0510ec433bb0e2ce0b9c1f61cf8fb06d5e11"),
+        ("elem-merged-nu12-full", 1 << 12, "50e68a0ca735d78351a88159e08af9eae33deec499e58f02b873f4c87eb7740a"),
+        ("elem-merged-nu12-2731", 2731, "b8d0030ba995076c7b8e078d4f50b362876ff63452cc9be191e14e1182a6161b"),
+        ("elem-merged-nu12-0", 0, "4f83379983a44a5eeb3f16eda075cda08ec30f6533636e26fe2f00be6185df06"),
     ];
     const MIXED: [(&str, [usize; 2], &str); 4] = [
-        ("mix-merged-nu7-128-128", [128, 128], "083141aafc3bcc8e751ea2d221e48335f5189698ba1a40273a02d91b641e8669"),
-        ("mix-merged-nu7-100-90", [100, 90], "4a0ae67dc9c7cd3778dbfb0aa336150ba21dd38e9cca826bc782656ffbdd8ad5"),
-        ("mix-merged-nu7-0-90", [0, 90], "f418f2edac79d13d844fb22077ec1f943bcfa6111fd59eb7dc96dbca02736107"),
-        ("mix-merged-nu7-100-0", [100, 0], "f2556cf6191bd936027e73a49a49343e1b8543d215985296e995d310ad886f8c"),
+        ("mix-merged-nu7-128-128", [128, 128], "f96274cd4ca29e26de53502daa00fb8816b528a2e4adfb9cc949845a0df094b3"),
+        ("mix-merged-nu7-100-90", [100, 90], "20b9bbc6a1588ea9c2d187c8888f04a2e05810cc3393451f95fabe8445ca1aca"),
+        ("mix-merged-nu7-0-90", [0, 90], "6b3484c1fb9fbf79a2361cb6c5b8764407d9f772cb52537674010d0754db53c9"),
+        ("mix-merged-nu7-100-0", [100, 0], "52777d7b24e1c0ae14a51934ae708eb1e66dc0ce90488f1e7f8f4d1edeb872e8"),
     ];
 
     let (w0, w1) = (F128::new(0x51F0, 0), F128::new(0, 0x2C7E));

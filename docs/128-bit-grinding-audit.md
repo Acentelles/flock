@@ -3,7 +3,9 @@
 Status: implementation audit and independent re-review of the current
 `min/recursion-128bit` working tree. The non-Ligerito audit was completed on
 2026-08-11; Ligerito two-point OOD binding, Appendix C.3 algebraic grinding,
-and the 128-bit list-decoding query schedule were reviewed on 2026-08-12.
+and the 128-bit list-decoding query schedule were reviewed on 2026-08-12. The
+Fable 5 external audit findings and Ron's 100/128 recursion-variant report
+were resolved and revalidated on 2026-08-13.
 
 This is the authoritative reviewer-facing summary of the grinding milestone.
 It records what was implemented, why each bit count is sufficient, how the
@@ -19,7 +21,7 @@ review blockers and are not used to qualify the conclusion:
 
 - an eventual global soundness ledger or union bound;
 - inactive legacy APIs; and
-- recursive verification of the public chain/Merkle wrapper proofs.
+- the MCA/F256 milestone, which remains separate work.
 
 ## Executive conclusion
 
@@ -43,7 +45,8 @@ The prover and native verifier use identical schedules, reject malformed nonce
 shapes before challenge replay, and bind each nonce immediately before the
 protected randomness. The active recursive Flock-proof circuit checks every
 recorded child-proof and accumulator-fold `Pow` with native BLAKE3 arithmetic,
-64-bit nonce constraints, and the requested leading-zero predicate.
+64-bit nonce constraints, and the requested leading-zero predicate. The check
+word is circuit IO bound to its fixed value; it is not a private witness cell.
 
 The current permutation/copy-constraint argument is the active batched
 Product-GKR path. It is included in this conclusion. The older standalone
@@ -60,9 +63,34 @@ A reviewer can follow the work in this order:
 5. Inspect the recursive relation and generic tape walker.
 6. Run the commands in "Test evidence."
 
-No trust in the prover's claimed nonce validity or in a native pre-check is
-part of the recursive soundness argument: the R1CS relation itself recomputes
-and constrains every recorded nonzero PoW.
+No trust in the prover's claimed nonce validity or in an honest witness
+generator is part of the recursive soundness argument: the R1CS relation and
+its circuit wiring recompute and constrain every recorded nonzero PoW.
+
+## External-audit resolution
+
+The Fable 5 audit found one high-severity recursive soundness gap and three
+secondary API/shape issues. All are resolved:
+
+- `PowMaskTable` previously used `C = I` to define a private check cell as
+  `pred_j * mask_j`. A malicious witness could write the product there. The
+  whole check word is now an input in the table's IO schema, and every circuit
+  invocation wires it to `0^127 || 1`; the last bit is the table's pinned-one
+  column. Thus the first 127 equations are
+  `pred_j * mask_j = 0`, including every supported `lambda <= 64` prefix bit.
+- The same latent issue in `BitSpreadTable::zero_mask` is fixed by making its
+  check word a zero-wired circuit input.
+- Dense and succinct Ligerito verification now require exact query-grinding
+  nonce-vector length, so a trailing unused nonce is rejected.
+- Standalone `element_r1cs::{prove,verify}_with_grinding` now applies Secure
+  PCS-opening grinding as well as PIOP grinding.
+- Recursion's matrix-fold policy now comes from
+  `PcsParams::matrix_fold_grinding()`, removing the duplicated policy switch.
+
+The regression tests deliberately construct the former `C = I` repair and
+show that it satisfies the raw table R1CS, then check that the repaired word
+differs from the circuit input required by production wiring. A focused real
+recursive proof accepts a valid nonce and rejects an invalid one.
 
 ## Soundness rule
 
@@ -135,9 +163,9 @@ are inputs to the same operation.
 The recursive relation in `circuit_merkle.rs` wires this compression as the
 ordinary challenge-squeeze row, constrains the nonce to 64 bits, and
 constrains the selected predicate bits to zero. A scalar `Pow` therefore adds
-no BLAKE row beyond the squeeze already needed for its challenge. It adds:
-
-- bit-spread rows for nonce width and leading-zero constraints.
+no BLAKE row beyond the squeeze already needed for its challenge. It adds one
+four-word `PowMaskTable` row. The row's check word is fixed by circuit wiring,
+which is load-bearing under the Boolean circuit convention `C = I`.
 
 Native and recursive implementations agree on byte order: `w` is
 little-endian, BLAKE3 output bytes use their native serialization, and
@@ -509,7 +537,9 @@ The recursive circuit uses the generic PoW relation for all child-tape sites,
 including Product-GKR and PCS transport. Accumulator fold tapes are also
 replayed in-circuit, including both coefficient-vector PoWs and every round
 PoW. Hand parsers now tolerate PoW payload insertion and vector squeezes by
-deriving payload/challenge locations from the op tape.
+deriving payload/challenge locations from the op tape. The Ligerito opening
+parser anchors at the protocol domain label rather than guessing from cap byte
+lengths.
 
 The Secure tower test consumes a recursive node proof as a child, so this is
 not only a one-level parse check.
@@ -519,7 +549,9 @@ The recursive PoW implementation has two independent tests:
 - a native/circuit differential test checks the exact BLAKE3 block,
   serialization, and prefix masks; and
 - a focused R1CS proof accepts a valid nonce and rejects a neighboring invalid
-  nonce.
+  nonce; and
+- adversarial table tests exhibit the formerly possible private-cell repair
+  and pin the load-bearing check words as circuit inputs.
 
 The Secure node then exercises the generic relation at real Boolean, element,
 Product-GKR, PCS-transport and fold sites. The Secure tower additionally
@@ -606,10 +638,10 @@ TOWER_PROFILE=secure cargo test --release -p flock-prover \
 
 Results:
 
-- `flock-core`: 476 unit tests passed, followed by all 11 active integration
-  tests; no failures.
-- `flock-prover`: 74 active library tests and every active integration suite
-  passed; no failures.
+- `flock-core --lib`: 486 tests passed and 22 were ignored; every active
+  integration suite also passed.
+- `flock-prover`: 76 active library tests passed and 23 were ignored; every
+  active integration suite also passed.
 - Secure Boolean and Secure element/mixed production roundtrips passed.
 - All three current v18 proof-bundle serialization/verification roundtrips
   passed (the earlier non-Ligerito checkpoint used v15).
@@ -617,6 +649,12 @@ Results:
   589.2 KiB outer proof in the post-rebase recorded run.
 - Secure `mvp12_recursion_tower` passed, including a recursive proof consumed
   by another recursive verifier.
+- Fast100 `mvp11`/`mvp12`, Slim100 first-level/chain-tower/spine, strict-Slim
+  `m=29` spine, and the Secure chain tower all passed on 2026-08-13.
+- Ron's three ignored merged-transport byte-pin tests were run explicitly.
+  The intentional v18 Ligerito changes moved all thirteen fixture digests;
+  the replacements were identical across two print runs and all three tests
+  pass with normal pin checking.
 
 Focused evidence in the full suites additionally covers:
 
@@ -733,11 +771,12 @@ transition and its security argument are documented in
 
 Good foundations now include a central degree-to-bits helper, exact nonce
 shape checks, canonical disabled fields, vectorized linear batching, one
-generic recursive PoW relation, and native/circuit differential tests. The
-largest maintenance risk remains the hand-written transcript parser in
-`circuit_merkle.rs`; deriving challenge and payload maps from the op tape has
-removed two classes of fixed-offset bugs, but a generated verifier transcript
-IR would be safer long term.
+generic recursive PoW relation, load-bearing IO-schema tests, and
+native/circuit differential tests. The largest maintenance risk remains the
+hand-written transcript parser in `circuit_merkle.rs`; deriving challenge and
+payload maps from the op tape and anchoring at protocol labels have removed
+several fixed-offset bugs, but a generated verifier transcript IR would be
+safer long term.
 
 Two small documentation-only inaccuracies were found during the final review:
 
@@ -747,10 +786,9 @@ Two small documentation-only inaccuracies were found during the final review:
 - the `tower_profile` comment in `circuit_merkle.rs` still says Secure selects
   only Boolean-zerocheck grinding, while it now selects all policies above.
 
-There is also one policy-plumbing cleanup opportunity: the recursion test's
-`tower_fold_grinding()` duplicates the same Secure/Fast/Slim choice exposed as
-`PcsParams::matrix_fold_grinding()`. They currently agree, but using one source
-would make future policy changes harder to drift.
+The recursion test's `tower_fold_grinding()` now delegates to
+`PcsParams::matrix_fold_grinding()`, so the production policy and recursive
+fold-tape policy have one source of truth.
 
 ## Reviewer checklist
 

@@ -7,9 +7,10 @@
 //! measuring the wrong thing.
 
 use flock_core::r1cs::BlockR1cs;
+use flock_core::schedule::{IoDirection, IoWord};
 use flock_prover::r1cs_hashes::blake3;
 use flock_prover::r1cs_hashes::merkle_glue::{
-    BitSpreadInput, BitSpreadTable, SwapInput, SwapTable,
+    BitSpreadInput, BitSpreadTable, PowMaskInput, PowMaskTable, SwapInput, SwapTable,
 };
 use flock_prover::r1cs_hashes::merkle_r1cs::{
     BLAKE3_FLAG_CHUNK_END, BLAKE3_FLAG_CHUNK_START, BLAKE3_FLAG_PARENT, ChunkPathInput,
@@ -234,6 +235,55 @@ fn bit_spread_zero_mask_is_enforced() {
     assert!(!r1cs.satisfies(&z), "a masked one bit must be rejected");
     assert_eq!(a, r1cs.apply_a(&z));
     assert_eq!(b, r1cs.apply_b(&z));
+
+    // Under C=I an attacker can otherwise repair the failing row by writing
+    // the product into its private check cell. The check word must therefore
+    // be a circuit input, which production wiring binds to zero.
+    let mut repaired = z.clone();
+    repaired[ty.check_pos() + forbidden_bit.trailing_zeros() as usize] = true;
+    assert!(
+        r1cs.satisfies(&repaired),
+        "the regression probe must model the C=I repair attack"
+    );
+    assert!(
+        ty.io_schema()
+            .contains(&IoWord::input(ty.check_pos() / 128)),
+        "the load-bearing check word must be a circuit input"
+    );
+}
+
+/// The fused PoW row has the same C=I shape as the optional BitSpread mask:
+/// its prefix products are sound only when word 3 is an input wired to
+/// the fixed 0..0,1 word by the recursive verifier circuit.
+#[test]
+fn pow_mask_inputs_the_load_bearing_check_word() {
+    let ty = PowMaskTable;
+    let r1cs = ty.build_block_r1cs(0);
+    let input = PowMaskInput {
+        pred: 1,
+        nonce: 0,
+        mask: 1,
+    };
+    let [z, ..] = ty.build_witness(input);
+    assert!(!r1cs.satisfies(&z), "an honest bad-prefix witness is rejected");
+
+    let mut repaired = z;
+    repaired[384] = true;
+    assert!(
+        r1cs.satisfies(&repaired),
+        "the regression probe must model the formerly accepted repair attack"
+    );
+    assert_eq!(ty.io_schema().last().map(|io| io.word_col), Some(3));
+    assert_eq!(ty.io_schema().last().map(|io| io.dir), Some(IoDirection::In));
+
+    let check_word = (384..512).fold(0u128, |acc, i| {
+        acc | ((repaired[i] as u128) << (i - 384))
+    });
+    assert_ne!(
+        check_word,
+        1u128 << 127,
+        "the malicious repair differs from the constant word production wiring requires"
+    );
 }
 
 /// The reason the glue exists: both tables are negligible against the BLAKE3

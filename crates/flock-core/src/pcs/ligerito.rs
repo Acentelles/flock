@@ -5448,7 +5448,7 @@ where
             ) else {
                 return false;
             };
-            // Last nonce: nonce_idx is intentionally not advanced past it.
+            nonce_idx += 1;
             // Basis-induction challenge for the LAST commitment. Sampled here —
             // after `yr` was observed (top of this branch) and the queries are
             // fixed — so a forged `yr` cannot be adapted to it. Mirrors `alpha_i`
@@ -5626,7 +5626,8 @@ where
             if trace && inner != t_r {
                 eprintln!("  residual mismatch: inner={inner:?}, t_r={t_r:?}");
             }
-            if claim_batch_nonce_idx != proof.claim_batch_grinding_nonces.len()
+            if nonce_idx != proof.grinding_nonces.len()
+                || claim_batch_nonce_idx != proof.claim_batch_grinding_nonces.len()
                 || consistency_batch_nonce_idx
                     != proof.consistency_batch_grinding_nonces.len()
             {
@@ -6122,7 +6123,7 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
             ) else {
                 return false;
             };
-            // Last nonce: nonce_idx is intentionally not advanced past it.
+            nonce_idx += 1;
             // Final-level basis-induction challenge — sampled after `yr` and the
             // queries are fixed. Same position as the succinct verifier
             // (recursive_verifier_with_basis_succinct), which verifies the same
@@ -6213,7 +6214,8 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
                 .zip(combined.iter())
                 .map(|(&y, &c)| y * c)
                 .fold(F128::ZERO, |a, v| a + v);
-            if claim_batch_nonce_idx != proof.claim_batch_grinding_nonces.len()
+            if nonce_idx != proof.grinding_nonces.len()
+                || claim_batch_nonce_idx != proof.claim_batch_grinding_nonces.len()
                 || consistency_batch_nonce_idx
                     != proof.consistency_batch_grinding_nonces.len()
             {
@@ -9569,6 +9571,28 @@ mod tests {
         assert!(
             !succinct(&extra_ood),
             "succinct must reject an extra OOD value"
+        );
+
+        let mut missing_query_nonce = proof.clone();
+        missing_query_nonce.grinding_nonces.pop();
+        assert!(
+            !dense(&missing_query_nonce),
+            "dense must reject a missing query nonce"
+        );
+        assert!(
+            !succinct(&missing_query_nonce),
+            "succinct must reject a missing query nonce"
+        );
+
+        let mut extra_query_nonce = proof.clone();
+        extra_query_nonce.grinding_nonces.push(0);
+        assert!(
+            !dense(&extra_query_nonce),
+            "dense must reject a trailing query nonce"
+        );
+        assert!(
+            !succinct(&extra_query_nonce),
+            "succinct must reject a trailing query nonce"
         );
 
         // Tamper a fold-grinding nonce → both verifiers reject (PoW fails or
