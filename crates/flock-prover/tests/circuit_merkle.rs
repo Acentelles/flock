@@ -75,6 +75,7 @@ fn pcs_batch(union: &UnionInstance) -> usize {
 fn tower_profile() -> LigeritoProfile {
     match std::env::var("TOWER_PROFILE").as_deref() {
         Ok("slim") => LigeritoProfile::Slim,
+        Ok("slim128") => LigeritoProfile::Slim128,
         Ok("secure") => LigeritoProfile::Secure,
         // The 100-bit recursion variants: Fast/Slim analysis and transcript
         // shape at the pre-list-decoding query schedules. slim100 is the
@@ -136,7 +137,7 @@ fn envelope_floor_m() -> Option<usize> {
     // ~2x slack; every slim level commits m29), re-target the tight 28
     // later via the mac shave + publics diet — one deliberate re-pin.
     match tower_profile() {
-        LigeritoProfile::Slim | LigeritoProfile::Slim100 => Some(29),
+        LigeritoProfile::Slim | LigeritoProfile::Slim100 | LigeritoProfile::Slim128 => Some(29),
         _ => None,
     }
 }
