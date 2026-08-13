@@ -149,6 +149,7 @@ impl ChainGrinding {
     pub fn for_profile(profile: flock_core::pcs::ligerito::LigeritoProfile) -> Self {
         match profile {
             flock_core::pcs::ligerito::LigeritoProfile::Fast
+            | flock_core::pcs::ligerito::LigeritoProfile::Fast128
             | flock_core::pcs::ligerito::LigeritoProfile::Slim
             | flock_core::pcs::ligerito::LigeritoProfile::Slim128
             | flock_core::pcs::ligerito::LigeritoProfile::Secure => Self::per_challenge_128(),

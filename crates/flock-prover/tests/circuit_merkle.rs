@@ -81,6 +81,7 @@ fn tower_profile() -> LigeritoProfile {
         // shape at the pre-list-decoding query schedules. slim100 is the
         // chain track's envelope profile at the old fixed point.
         Ok("fast100") => LigeritoProfile::Fast100,
+        Ok("fast128") => LigeritoProfile::Fast128,
         Ok("slim100") => LigeritoProfile::Slim100,
         _ => LigeritoProfile::Fast,
     }
@@ -15592,14 +15593,21 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
 
         let env = envelope_shape();
         let split_b3 = tapes.len() == 2
-            && (env.is_some() || tower_profile() == LigeritoProfile::Fast);
+            && (env.is_some()
+                || matches!(
+                    tower_profile(),
+                    LigeritoProfile::Fast | LigeritoProfile::Fast128
+                ));
         let (fold_b3_primary_rows, b3_rows) = if split_b3 {
             let a = tapes[0].b3_rows;
             let b = tapes[1].b3_rows;
             let unsplit = (a + trace.rows.len()).max(b);
             let (on_a, balanced) = balance_extra_rows(a, b, trace.rows.len());
             if env.is_none()
-                && tower_profile() == LigeritoProfile::Fast
+                && matches!(
+                    tower_profile(),
+                    LigeritoProfile::Fast | LigeritoProfile::Fast128
+                )
                 && balanced.next_power_of_two() < unsplit.next_power_of_two()
             {
                 (Some(on_a), balanced)
@@ -24124,14 +24132,21 @@ fn build_node_outer_app(
 
         let env = envelope_shape();
         let split_b3 = n_kids == 2
-            && (env.is_some() || tower_profile() == LigeritoProfile::Fast);
+            && (env.is_some()
+                || matches!(
+                    tower_profile(),
+                    LigeritoProfile::Fast | LigeritoProfile::Fast128
+                ));
         let (fold_b3_primary_rows, b3_rows) = if split_b3 {
             let a = rts[0].b3_rows;
             let b = rts[1].b3_rows;
             let unsplit = (a + trace.rows.len()).max(b);
             let (on_a, balanced) = balance_extra_rows(a, b, trace.rows.len());
             if env.is_none()
-                && tower_profile() == LigeritoProfile::Fast
+                && matches!(
+                    tower_profile(),
+                    LigeritoProfile::Fast | LigeritoProfile::Fast128
+                )
                 && balanced.next_power_of_two() < unsplit.next_power_of_two()
             {
                 (Some(on_a), balanced)

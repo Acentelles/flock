@@ -23,6 +23,7 @@ fn main() {
     let profiles = [
         LigeritoProfile::Fast,
         LigeritoProfile::Fast100,
+        LigeritoProfile::Fast128,
         LigeritoProfile::Slim,
         LigeritoProfile::Slim100,
         LigeritoProfile::Slim128,
