@@ -130,7 +130,7 @@ int main(int argc, char** argv) {
     if (a_nnz) CK(cudaMemcpy(d_ar, a_rows.data(), a_nnz * sizeof(uint32_t), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(d_bcp, b_col_ptr.data(), (k + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice));
     if (b_nnz) CK(cudaMemcpy(d_br, b_rows.data(), b_nnz * sizeof(uint32_t), cudaMemcpyHostToDevice));
-    launch_lincheck_csc_fold(d_eq_inner, d_acp, d_ar, d_bcp, d_br, alpha, k, d_comb);
+    launch_linear_check_compressed_column_fold(d_eq_inner, d_acp, d_ar, d_bcp, d_br, alpha, k, d_comb);
     CK(cudaGetLastError());
     std::vector<F128> comb(k);
     CK(cudaMemcpy(comb.data(), d_comb, k * sizeof(F128), cudaMemcpyDeviceToHost));
@@ -141,7 +141,7 @@ int main(int argc, char** argv) {
     std::vector<F128> eq_outer = build_eq_table_host(x_outer);
     CK(cudaMemcpy(d_eq_outer, eq_outer.data(), n_outer * sizeof(F128), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(d_zp, z_packed.data(), z_bytes, cudaMemcpyHostToDevice));
-    launch_lincheck_partial_fold(d_zp, d_eq_outer, n_stripes, k, useful_bits, d_zvec);
+    launch_linear_check_partial_fold(d_zp, d_eq_outer, n_stripes, k, useful_bits, d_zvec);
     CK(cudaGetLastError());
     std::vector<F128> zvec(k);
     CK(cudaMemcpy(zvec.data(), d_zvec, k * sizeof(F128), cudaMemcpyDeviceToHost));
@@ -153,7 +153,7 @@ int main(int argc, char** argv) {
     long long len = k;
     for (int rnd = 0; rnd < inner_rest_len; rnd++) {
         long long half = len / 2;
-        launch_lincheck_msg(cC, cZ, half, d_p1, d_pinf, d_e1, d_einf);
+        launch_linear_check_message(cC, cZ, half, d_p1, d_pinf, d_e1, d_einf);
         CK(cudaGetLastError());
         F128 e1, einf;
         CK(cudaMemcpy(&e1, d_e1, sizeof(F128), cudaMemcpyDeviceToHost));
@@ -164,7 +164,7 @@ int main(int argc, char** argv) {
         ch.observe_f128(to_ch(einf));
         F128 r = from_ch(ch.sample_f128());
         if (!eq(r, g_r[rnd])) fail("CHAL r", rnd, r, g_r[rnd]);
-        launch_lincheck_fold2(cC, cZ, nC, nZ, half, r);
+        launch_linear_check_fold_pair(cC, cZ, nC, nZ, half, r);
         CK(cudaGetLastError());
         CK(cudaDeviceSynchronize());
         F128* t;

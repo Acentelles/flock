@@ -104,17 +104,17 @@ static void run_one(int m, int k_log, int k_skip, int iters) {
     float t_csc = 0, t_pf = 0, t_sc = 0;
     for (int it = 0; it < iters; it++) {
         cudaEventRecord(e0);
-        launch_lincheck_csc_fold(d_eq_inner, d_acp, d_ar, d_bcp, d_br, alpha, k, d_comb);
+        launch_linear_check_compressed_column_fold(d_eq_inner, d_acp, d_ar, d_bcp, d_br, alpha, k, d_comb);
         cudaEventRecord(e1ev);
-        launch_lincheck_partial_fold(d_zp, d_eq_outer, n_stripes, k, k, d_zvec);
+        launch_linear_check_partial_fold(d_zp, d_eq_outer, n_stripes, k, k, d_zvec);
         cudaEventRecord(e2ev);
         // sumcheck cascade over fresh copies of comb/zvec each iter.
         F128 *cC = d_comb, *cZ = d_zvec, *nC = d_nC, *nZ = d_nZ;
         long long len = k;
         for (int r = 0; r < inner_rest_len; r++) {
             long long half = len / 2;
-            launch_lincheck_msg(cC, cZ, half, d_p1, d_pinf, d_e1, d_einf);
-            launch_lincheck_fold2(cC, cZ, nC, nZ, half, chal[r]);
+            launch_linear_check_message(cC, cZ, half, d_p1, d_pinf, d_e1, d_einf);
+            launch_linear_check_fold_pair(cC, cZ, nC, nZ, half, chal[r]);
             F128* t; t = cC; cC = nC; nC = t; t = cZ; cZ = nZ; nZ = t;
             len = half;
         }

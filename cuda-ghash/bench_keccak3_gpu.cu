@@ -29,51 +29,25 @@
 #include "blake3_witness.cuh"
 #include "keccak3_witness.cuh"
 #include "zerocheck_round1.cuh"
-#include "zerocheck_round1_cpustyle.cuh"   // fast cpustyle3 round-1 (launch_zc_round1_fast)
+#include "zerocheck_round1_cpustyle.cuh"
 #include "zerocheck_round2.cuh"
 #include "zerocheck_tail.cuh"
 #include "phi8_table.cuh"
 #include "challenger.hpp"
 #include "zc_challenger_device.cuh"   // resident on-device challenger for the tail
-static ZcSha zc_pack(const Sha256& s){ ZcSha z; for(int i=0;i<8;i++)z.h[i]=s.h[i]; z.total_len=s.total_len;
-    for(int i=0;i<64;i++)z.buf[i]=s.buf[i]; z.buf_len=(unsigned)s.buf_len; return z; }
-static void zc_unpack(Sha256& s, const ZcSha& z){ for(int i=0;i<8;i++)s.h[i]=z.h[i]; s.total_len=z.total_len;
-    for(int i=0;i<64;i++)s.buf[i]=z.buf[i]; s.buf_len=z.buf_len; }
-
 #define CK(x) do { cudaError_t e=(x); if(e){ printf("CUDA err %s @%d\n", cudaGetErrorString(e), __LINE__); exit(1);} } while(0)
 static const uint8_t PROVER_LABEL[] = "flock-ligerito-basis-v0";
 using Clock = std::chrono::steady_clock;
 static double ms_since(Clock::time_point t) { CK(cudaDeviceSynchronize());
     return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
-__global__ void fill2(F128* A, F128* B, long long n) {
+__global__ void fill_benchmark_polynomials(F128* A, F128* B, long long n) {
     long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (i >= n) return;
     u64 x = (u64)i * 0x9E3779B97F4A7C15ull + 1; A[i] = F128{x, x*0xBF58476D1CE4E5B9ull};
     B[i] = F128{x ^ 0x55, x*0x2545F4914F6CDD1Dull};
 }
 __global__ void replicate_fill(const F128* __restrict__ m, F128* __restrict__ cw, long long cw_len, long long ml) {
     long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (i >= cw_len) return; cw[i] = m[i % ml];
-}
-// Gather the `nq` queried rows (ni F128 each) from the device codeword.
-__global__ void gather_rows_k(const F128* __restrict__ cw, const unsigned long long* __restrict__ q,
-                              int nq, int ni, F128* __restrict__ out) {
-    long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
-    if (idx >= (long long)nq * ni) return;
-    int i = (int)(idx / ni), l = (int)(idx % ni);
-    out[idx] = cw[q[i] * ni + l];
-}
-// Gather rows from a device codeword into a host vector (small D2H).
-static std::vector<F128> gather_host(const F128* d_cw, const std::vector<size_t>& q, int ni) {
-    int nq = (int)q.size();
-    std::vector<unsigned long long> qh(nq); for (int i = 0; i < nq; i++) qh[i] = q[i];
-    unsigned long long* d_q; CK(cudaMalloc(&d_q, nq*sizeof(unsigned long long)));
-    CK(cudaMemcpy(d_q, qh.data(), nq*sizeof(unsigned long long), cudaMemcpyHostToDevice));
-    F128* d_rows; CK(cudaMalloc(&d_rows, (size_t)nq*ni*sizeof(F128)));
-    int tpb=256; gather_rows_k<<<(unsigned)(((long long)nq*ni+tpb-1)/tpb),tpb>>>(d_cw, d_q, nq, ni, d_rows);
-    std::vector<F128> out((size_t)nq*ni);
-    CK(cudaMemcpy(out.data(), d_rows, out.size()*sizeof(F128), cudaMemcpyDeviceToHost));
-    cudaFree(d_q); cudaFree(d_rows);
-    return out;
 }
 static ChF128 to_ch(F128 x){ return ChF128{x.lo,x.hi}; }
 
@@ -108,7 +82,7 @@ static void commit_dev(const F128* d_src, int msg_log, int log_msg_cols, int log
     CK(cudaMemcpy(root, d_tree+(size_t)(2*block_len-2)*32, 32, cudaMemcpyDeviceToHost));
 }
 static void msg(const F128*A,const F128*B,long long len,F128*p0,F128*p2,F128*du0,F128*du2,F128&u0,F128&u2){
-    launch_sumcheck_msg(A,B,len/2,p0,p2,du0,du2);
+    launch_sumcheck_message(A,B,len/2,p0,p2,du0,du2);
     CK(cudaMemcpy(&u0,du0,sizeof(F128),cudaMemcpyDeviceToHost)); CK(cudaMemcpy(&u2,du2,sizeof(F128),cudaMemcpyDeviceToHost));
 }
 
@@ -131,7 +105,7 @@ static void zerocheck_phase(F128* da, F128* db, F128* dc, int m, FsChallenger& c
         std::vector<uint8_t> mcol(64 * 64), f8mul((size_t)256 * 256);
         for (size_t i = 0; i < mcol.size(); i++) mcol[i] = (uint8_t)(i * 7 + 1);
         for (size_t i = 0; i < f8mul.size(); i++) f8mul[i] = (uint8_t)(i ^ (i >> 8));
-        zc_round1_upload_tables(mcol.data(), f8mul.data(), PHI_8_TABLE);
+        upload_zerocheck_first_round_tables(mcol.data(), f8mul.data(), PHI_8_TABLE);
         tables_done = true;
     }
 
@@ -164,8 +138,8 @@ static void zerocheck_phase(F128* da, F128* db, F128* dc, int m, FsChallenger& c
     // round-1 URM: build only eq_out=eq(r[13..m]) (stride-128 subsample, 128x less) + scale.
     { std::vector<F128> ro13(r.begin() + 13, r.end()); build_eq_device(d_eq, ro13.data(), m - 13); }
     F128 r1scale = ONE; for (int i = 6; i < 13; i++) r1scale = f128_mul_hd(r1scale, f128_add_hd(ONE, r[i]));
-    launch_zc_round1_cpustyle3((const uint8_t*)da, (const uint8_t*)db, (const uint8_t*)dc,
-                               d_eq, 1LL << (m - 13), nullptr, r1scale, d_r1ab, d_r1c);  // cpustyle3 direct
+    launch_zerocheck_first_round_cpu_structured((const uint8_t*)da, (const uint8_t*)db, (const uint8_t*)dc,
+                               d_eq, 1LL << (m - 13), r1scale, d_r1ab, d_r1c);
     std::vector<F128> r1ab(64), r1c(64);
     CK(cudaMemcpy(r1ab.data(), d_r1ab, 64 * sizeof(F128), cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(r1c.data(), d_r1c, 64 * sizeof(F128), cudaMemcpyDeviceToHost));
@@ -180,7 +154,7 @@ static void zerocheck_phase(F128* da, F128* db, F128* dc, int m, FsChallenger& c
     for (int j = 0; j < 8; j++) for (int v = 0; v < 256; v++) { F128 acc{0, 0};
         for (int bb = 0; bb < 8; bb++) if ((v >> bb) & 1) acc = f128_add_hd(acc, ws[8 * j + bb]); ft[j * 256 + v] = acc; }
     CK(cudaMemcpy(d_ft, ft.data(), 8 * 256 * sizeof(F128), cudaMemcpyHostToDevice));
-    launch_zc_round2_fold((const uint8_t*)da, (const uint8_t*)db, d_ft, rows, d_am, d_bm);
+    launch_zerocheck_second_round_fold((const uint8_t*)da, (const uint8_t*)db, d_ft, rows, d_am, d_bm);
 
     F128 *cA = d_am, *cB = d_bm, *nA = d_amn, *nB = d_bmn;
     long long len = rows;
@@ -190,7 +164,7 @@ static void zerocheck_phase(F128* da, F128* db, F128* dc, int m, FsChallenger& c
         long long half = len / 2;
         std::vector<F128> rs(r.begin() + r_from, r.end());   // eq on device (m-r_from vars)
         build_eq_device(d_eq, rs.data(), m - r_from);
-        launch_zt_msg(cA, cB, d_eq, half, d_p1, d_pinf, d_m1, d_minf);
+        launch_zerocheck_tail_message(cA, cB, d_eq, half, d_p1, d_pinf, d_m1, d_minf);
         F128 m1, mi; CK(cudaMemcpy(&m1, d_m1, sizeof(F128), cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(&mi, d_minf, sizeof(F128), cudaMemcpyDeviceToHost));
         ch.observe_f128(ChF128{m1.lo, m1.hi}); ch.observe_f128(ChF128{mi.lo, mi.hi});
@@ -202,7 +176,7 @@ static void zerocheck_phase(F128* da, F128* db, F128* dc, int m, FsChallenger& c
     // (A fully-resident on-device-challenger variant was tried — byte-exact but ~0.1 ms slower:
     // single-thread GPU SHA > CPU SHA; the tail was never round-trip-bound. See zc_challenger_device.cuh.)
     auto do_fused_eq = [&](const F128* d_eqbuf, long long op, F128 rho) -> ChF128 {
-        launch_zt_fold_msg(cA, cB, nA, nB, d_eqbuf, op, rho, d_p1, d_pinf, d_m1, d_minf);
+        launch_zerocheck_tail_fold_and_message(cA, cB, nA, nB, d_eqbuf, op, rho, d_p1, d_pinf, d_m1, d_minf);
         { F128* t2; t2 = cA; cA = nA; nA = t2; t2 = cB; cB = nB; nB = t2; } len = len / 2;
         F128 m1, mi; CK(cudaMemcpy(&m1, d_m1, sizeof(F128), cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(&mi, d_minf, sizeof(F128), cudaMemcpyDeviceToHost));
@@ -221,7 +195,7 @@ static void zerocheck_phase(F128* da, F128* db, F128* dc, int m, FsChallenger& c
     { long long L = len;
       for (int i = 0; i < n_tail; i++) {
           long long op = L / 4;
-          launch_eq_halve_scale(eprev, escr, op, sc[i]);                 // eq(r[8+i..m]) from eq(r[7+i..m])
+          launch_halve_and_scale_equality_values(eprev, escr, op, sc[i]);                 // eq(r[8+i..m]) from eq(r[7+i..m])
           ChF128 rr = do_fused_eq(escr, op, mlv_rhos.back());
           mlv_rhos.push_back(F128{rr.lo, rr.hi});
           { F128* t = eprev; eprev = escr; escr = t; } L /= 2; } }
@@ -323,13 +297,13 @@ static void lincheck_phase(const uint8_t* d_zlin, int m, int k_log, int k_skip,
     for (int r = 0; r < inner_rest_len; r++) chal[r] = F128{(u64)(r*2654435761ull+1), (u64)(r*40503+7)};
 
     auto t = Clock::now();
-    launch_lincheck_csc_fold(d_eq_inner, d_acp, d_ar, d_bcp, d_br, alpha, k, d_comb);
-    launch_lincheck_partial_fold(d_zlin, d_eq_outer, n_stripes, k, k, d_zvec);
+    launch_linear_check_compressed_column_fold(d_eq_inner, d_acp, d_ar, d_bcp, d_br, alpha, k, d_comb);
+    launch_linear_check_partial_fold(d_zlin, d_eq_outer, n_stripes, k, k, d_zvec);
     F128 *cC=d_comb,*cZ=d_zvec,*nC=d_nC,*nZ=d_nZ; long long len=k;
     for (int r = 0; r < inner_rest_len; r++) {
         long long half = len/2;
-        launch_lincheck_msg(cC, cZ, half, d_p1, d_pinf, d_e1, d_einf);
-        launch_lincheck_fold2(cC, cZ, nC, nZ, half, chal[r]);
+        launch_linear_check_message(cC, cZ, half, d_p1, d_pinf, d_e1, d_einf);
+        launch_linear_check_fold_pair(cC, cZ, nC, nZ, half, chal[r]);
         F128* z; z=cC;cC=nC;nC=z; z=cZ;cZ=nZ;nZ=z; len=half;
     }
     ph.lincheck += ms_since(t);
@@ -350,7 +324,7 @@ static double prove(int log_n,int initial_k,int log_inv_rate_0,int num_queries_0
     F128 *df,*dcb,*df2,*dcb2,*du0,*du2,*p0,*p2;
     CK(cudaMalloc(&df,len*sizeof(F128)));CK(cudaMalloc(&dcb,len*sizeof(F128)));CK(cudaMalloc(&df2,len*sizeof(F128)));CK(cudaMalloc(&dcb2,len*sizeof(F128)));
     CK(cudaMalloc(&p0,SMC_MAX_BLOCKS*sizeof(F128)));CK(cudaMalloc(&p2,SMC_MAX_BLOCKS*sizeof(F128)));CK(cudaMalloc(&du0,sizeof(F128)));CK(cudaMalloc(&du2,sizeof(F128)));
-    { int tpb=256; fill2<<<(unsigned)((len+tpb-1)/tpb),tpb>>>(df,dcb,len); CK(cudaDeviceSynchronize()); }
+    { int tpb=256; fill_benchmark_polynomials<<<(unsigned)((len+tpb-1)/tpb),tpb>>>(df,dcb,len); CK(cudaDeviceSynchronize()); }
 
     // ---- GPU witness generation (S4): produce the REAL witness z into `df`
     // (overwriting the random fill — `dcb` keeps its random basis), plus a/b and
@@ -399,7 +373,7 @@ static double prove(int log_n,int initial_k,int log_inv_rate_0,int num_queries_0
     auto t=Clock::now(); msg(cf,ccb,slen,p0,p2,du0,du2,u0,u2); ch.observe_f128(to_ch(u0));ch.observe_f128(to_ch(u2));
     std::vector<F128> r_lane;
     for(int k=0;k<initial_k;k++){ ChF128 rc=ch.sample_f128(); F128 rr{rc.lo,rc.hi};
-        long long half=slen/2; launch_sumcheck_fold_msg(cf,ccb,nf,ncb,half,rr,p0,p2,du0,du2); // fused fold + next msg (1 pass)
+        long long half=slen/2; launch_sumcheck_fold_and_message(cf,ccb,nf,ncb,half,rr,p0,p2,du0,du2); // fused fold + next msg (1 pass)
         {F128*z;z=cf;cf=nf;nf=z;z=ccb;ccb=ncb;ncb=z;} slen=half;
         CK(cudaMemcpy(&u0,du0,sizeof(F128),cudaMemcpyDeviceToHost));CK(cudaMemcpy(&u2,du2,sizeof(F128),cudaMemcpyDeviceToHost));
         ch.observe_f128(to_ch(u0));ch.observe_f128(to_ch(u2)); r_lane.push_back(rr); }
@@ -420,7 +394,7 @@ static double prove(int log_n,int initial_k,int log_inv_rate_0,int num_queries_0
         std::vector<ChF128> z(nn); ch.sample_f128_vec(z.data(),nn); std::vector<F128> zf(nn);
         for(int j=0;j<nn;j++) zf[j]=F128{z[j].lo,z[j].hi};
         build_eq_device(d_bnew, zf.data(), nn);   // device eq table (hardware clmad)
-        launch_msg_eval(cf,d_bnew,nl/2,ep0,ep2,epodd,eu0,eu2,ehnew);
+        launch_basis_message_evaluation(cf,d_bnew,nl/2,ep0,ep2,epodd,eu0,eu2,ehnew);
         F128 y,iu0,iu2; CK(cudaMemcpy(&iu0,eu0,sizeof(F128),cudaMemcpyDeviceToHost));CK(cudaMemcpy(&iu2,eu2,sizeof(F128),cudaMemcpyDeviceToHost));CK(cudaMemcpy(&y,ehnew,sizeof(F128),cudaMemcpyDeviceToHost));
         ch.observe_f128(to_ch(y));ch.observe_f128(to_ch(iu0));ch.observe_f128(to_ch(iu2));
         ChF128 bc=ch.sample_f128(); launch_glue(ccb,d_bnew,F128{bc.lo,bc.hi},nl); } };
@@ -454,8 +428,8 @@ static double prove(int log_n,int initial_k,int log_inv_rate_0,int num_queries_0
         CK(cudaMemcpy(d_q,qh.data(),nq*sizeof(unsigned long long),cudaMemcpyHostToDevice));
         F128* d_tw; const TwiddleTable& tt=cached_tt(log_block,d_tw);
         int tpb2=256;
-        zero_f128<<<(unsigned)((pbl+tpb2-1)/tpb2),tpb2>>>(d_c,pbl);
-        scatter_weights<<<(unsigned)((nq+tpb2-1)/tpb2),tpb2>>>(d_c,d_q,d_ap,nq);
+        clear_field_elements<<<(unsigned)((pbl+tpb2-1)/tpb2),tpb2>>>(d_c,pbl);
+        scatter_query_weights<<<(unsigned)((nq+tpb2-1)/tpb2),tpb2>>>(d_c,d_q,d_ap,nq);
         launch_transpose_ntt(d_c,d_tw,tt,log_block);
         F128* dbasis=d_c;   // first nl elements are the truncated basis
         ph.induce += ms_since(ti);
@@ -478,7 +452,7 @@ static double prove(int log_n,int initial_k,int log_inv_rate_0,int num_queries_0
         std::vector<F128> lvl_rs;
         t=Clock::now();
         for(int k=0;k<k_rec;k++){ ChF128 rc=ch.sample_f128(); F128 rr{rc.lo,rc.hi};
-            long long half=slen/2; launch_sumcheck_fold_msg(cf,ccb,nf,ncb,half,rr,p0,p2,du0,du2); // fused fold + next msg (1 pass)
+            long long half=slen/2; launch_sumcheck_fold_and_message(cf,ccb,nf,ncb,half,rr,p0,p2,du0,du2); // fused fold + next msg (1 pass)
             {F128*z;z=cf;cf=nf;nf=z;z=ccb;ccb=ncb;ncb=z;} slen=half;
             CK(cudaMemcpy(&u0,du0,sizeof(F128),cudaMemcpyDeviceToHost));CK(cudaMemcpy(&u2,du2,sizeof(F128),cudaMemcpyDeviceToHost));
             ch.observe_f128(to_ch(u0));ch.observe_f128(to_ch(u2)); lvl_rs.push_back(rr);}

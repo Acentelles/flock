@@ -49,30 +49,3 @@ inline std::vector<MHash> merkle_multi_proof_device(const uint8_t* d_tree, size_
     memcpy(out.data(), h_out, (size_t)n * 32);
     return out;
 }
-
-// Async variant — the multi-proof is NOT consumed downstream (it's proof output,
-// serialized only at the very end), so the gather is off the critical path.
-// Issue it on a side stream; it overlaps with the following induce/intro kernels
-// on the default stream. Gathers serialize on `stream` (shared pool, no race);
-// the host only does the cheap index walk. Caller syncs `stream` before reading.
-inline void merkle_multi_proof_device_async(const uint8_t* d_tree, size_t num_leaves,
-                                            const std::vector<size_t>& positions,
-                                            cudaStream_t stream, uint8_t* h_proof_out) {
-    std::vector<size_t> idxs = merkle_multi_proof_indices(num_leaves, positions);
-    int n = (int)idxs.size();
-    if (n == 0) return;
-    static unsigned long long* d_idx = nullptr; static uint8_t* d_out = nullptr;
-    static unsigned long long* h_idx = nullptr; static int cap = 0;
-    if (n > cap) {
-        if (d_idx) { cudaFree(d_idx); cudaFree(d_out); cudaFreeHost(h_idx); }
-        cap = n + (n >> 1);
-        (void)cudaMalloc(&d_idx, (size_t)cap * sizeof(unsigned long long));
-        (void)cudaMalloc(&d_out, (size_t)cap * 32);
-        (void)cudaHostAlloc(&h_idx, (size_t)cap * sizeof(unsigned long long), cudaHostAllocDefault);
-    }
-    for (int i = 0; i < n; i++) h_idx[i] = (unsigned long long)idxs[i];
-    (void)cudaMemcpyAsync(d_idx, h_idx, (size_t)n * sizeof(unsigned long long), cudaMemcpyHostToDevice, stream);
-    int tpb = 128;
-    gather_tree_nodes<<<(n + tpb - 1) / tpb, tpb, 0, stream>>>(d_tree, d_idx, n, d_out);
-    if (h_proof_out) (void)cudaMemcpyAsync(h_proof_out, d_out, (size_t)n * 32, cudaMemcpyDeviceToHost, stream);
-}

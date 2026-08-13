@@ -3,7 +3,7 @@
 //! so the CUDA port (`cuda-ghash/test_sumcheck_ab.cu`) can be checked
 //! bit-for-bit against it.
 //!
-//! Step 3 of the GPU `pcs::open` (Ligerito) port (`cuda-ghash/GPU_OPEN_PLAN.md`):
+//! GPU `pcs::open` (Ligerito) sumcheck vectors:
 //! the degree-2 sumcheck of `S = Σ_x a(x)·b(x)` the Ligerito prover runs (the
 //! `fold_and_msg_lsb` message/fold convention in `src/pcs/ligerito.rs`). Each
 //! round, over the CURRENT a,b (adjacent pairing `(a[2j],a[2j+1])`, matching

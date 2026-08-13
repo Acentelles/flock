@@ -85,15 +85,15 @@ int main() {
         std::vector<F128> refr; F128 reffinal;
         {
             F128 *cA = am, *cB = bm, *nA = amn, *nB = bmn;
-            launch_zc_round2_fold(da, db, dft, rows, cA, cB);
-            launch_zt_msg_split(cA, cB, eqlo, eqhi, 0, lobits, rows / 2, ONE, p1, pinf, m1d, minfd);
+            launch_zerocheck_second_round_fold(da, db, dft, rows, cA, cB);
+            launch_zerocheck_tail_message(cA, cB, eqlo, eqhi, 0, lobits, rows / 2, ONE, p1, pinf, m1d, minfd);
             CK(cudaDeviceSynchronize());
             F128 a, b; CK(cudaMemcpy(&a, m1d, sizeof(F128), cudaMemcpyDeviceToHost));
             CK(cudaMemcpy(&b, minfd, sizeof(F128), cudaMemcpyDeviceToHost));
             refr.push_back(mix(a, b));
             long long L = rows;
             for (int i = 0; i < n_tail; i++) {
-                launch_zt_fold_msg_split(cA, cB, nA, nB, eqlo, eqhi, i + 1, lobits, L / 4,
+                launch_zerocheck_tail_fold_and_message(cA, cB, nA, nB, eqlo, eqhi, i + 1, lobits, L / 4,
                                          refr.back(), sc[i], p1, pinf, m1d, minfd);
                 { F128* t = cA; cA = nA; nA = t; t = cB; cB = nB; nB = t; }
                 L /= 2;
@@ -113,7 +113,7 @@ int main() {
             F128 *cA = am, *cB = bm, *nA = amn, *nB = bmn;
             F128 h[8];
             if (LOOK) {
-                launch_zc_round2_fold_msg2(da, db, dft, eqlo, eqhi, lobits, rows, cA, cB,
+                launch_zerocheck_second_round_fold_with_lookahead(da, db, dft, eqlo, eqhi, lobits, rows, cA, cB,
                                            sc[0], part8, out8);
                 CK(cudaDeviceSynchronize());
                 CK(cudaMemcpy(h, out8, 8 * sizeof(F128), cudaMemcpyDeviceToHost));
@@ -126,7 +126,7 @@ int main() {
             while (k + 1 <= n_tail) {
                 long long out_quads = L / 16;
                 if (out_quads <= FIN) break;
-                launch_zt_fold_msg2(cA, cB, nA, nB, eqlo, eqhi, k, lobits, out_quads,
+                launch_zerocheck_tail_lookahead(cA, cB, nA, nB, eqlo, eqhi, k, lobits, out_quads,
                                     gotr[gotr.size() - 2], gotr.back(),
                                     sc[k - 1], sc[k], part8, out8);
                 { F128* t = cA; cA = nA; nA = t; t = cB; cB = nB; nB = t; }
@@ -144,7 +144,7 @@ int main() {
                 L /= 2; i = k - 1;
             }
             for (; i < n_tail; i++) {
-                launch_zt_fold_msg_split(cA, cB, nA, nB, eqlo, eqhi, i + 1, lobits, L / 4,
+                launch_zerocheck_tail_fold_and_message(cA, cB, nA, nB, eqlo, eqhi, i + 1, lobits, L / 4,
                                          gotr.back(), sc[i], p1, pinf, m1d, minfd);
                 { F128* t = cA; cA = nA; nA = t; t = cB; cB = nB; nB = t; }
                 L /= 2;

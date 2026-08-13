@@ -5,7 +5,7 @@
 //! `SumcheckProver::fold` → `fold_and_msg_lsb`).
 //!
 //! This is the step-3 re-validation for the Ligerito re-aim
-//! (`cuda-ghash/GPU_OPEN_PLAN.md`): Ligerito's per-round sumcheck folds
+//! Ligerito's per-round sumcheck folds
 //! `(f, combined_basis)` with `nf[j] = f[2j]·(1+r) + f[2j+1]·r` (≡ the CUDA
 //! kernel's `f[2j] + r·(f[2j]+f[2j+1])`) and sends `{u_0, u_2}` — the same math
 //! `dump_sumcheck_vectors` hand-replicates, but this oracle comes from the

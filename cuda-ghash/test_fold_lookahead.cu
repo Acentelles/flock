@@ -61,14 +61,14 @@ int main() {
             CK(cudaMemcpy(cf,a0,len*sizeof(F128),cudaMemcpyDeviceToDevice));
             CK(cudaMemcpy(ccb,b0,len*sizeof(F128),cudaMemcpyDeviceToDevice));
             F128 u0,u2;
-            launch_sumcheck_msg(cf,ccb,slen/2,p0,p2,du0,du0+1);
+            launch_sumcheck_message(cf,ccb,slen/2,p0,p2,du0,du0+1);
             CK(cudaDeviceSynchronize());
             { F128 u[2]; CK(cudaMemcpy(u,du0,2*sizeof(F128),cudaMemcpyDeviceToHost)); u0=u[0]; u2=u[1]; }
             F128 last = mix(u0,u2);
             for (int k=0;k<initial_k;k++) {
                 refr.push_back(last);
                 long long half=slen/2;
-                launch_sumcheck_fold_msg(cf,ccb,nf,ncb,half,refr.back(),p0,p2,du0,du0+1);
+                launch_sumcheck_fold_and_message(cf,ccb,nf,ncb,half,refr.back(),p0,p2,du0,du0+1);
                 {F128*z;z=cf;cf=nf;nf=z;z=ccb;ccb=ncb;ncb=z;} slen=half;
                 CK(cudaDeviceSynchronize());
                 { F128 u[2]; CK(cudaMemcpy(u,du0,2*sizeof(F128),cudaMemcpyDeviceToHost)); u0=u[0]; u2=u[1]; }
@@ -86,8 +86,8 @@ int main() {
             CK(cudaMemcpy(cf,a0,len*sizeof(F128),cudaMemcpyDeviceToDevice));
             CK(cudaMemcpy(ccb,b0,len*sizeof(F128),cudaMemcpyDeviceToDevice));
             int blocks = sumcheck_blocks(slen/4);
-            sumcheck_msg2_partial<<<blocks,SMC_TPB>>>(cf,ccb,slen/4,part);
-            sumcheck_msg2_combine<<<8,SMC_TPB>>>(part,blocks,out8);
+            sumcheck_lookahead_message_partial<<<blocks,SMC_TPB>>>(cf,ccb,slen/4,part);
+            combine_sumcheck_lookahead_message<<<8,SMC_TPB>>>(part,blocks,out8);
             CK(cudaDeviceSynchronize());
             int j = 0;
             auto obs = [&](F128 a, F128 b) {
@@ -100,7 +100,7 @@ int main() {
                 obs(interp3(h[2],h[3],h[4],rr), interp3(h[5],h[6],h[7],rr)); }
             int folds = 0;
             while (folds + 2 <= initial_k) {
-                launch_sumcheck_fold2_msg2(cf,ccb,nf,ncb,slen/16,gotr[folds],gotr[folds+1],part,out8);
+                launch_sumcheck_lookahead(cf,ccb,nf,ncb,slen/16,gotr[folds],gotr[folds+1],part,out8);
                 {F128*z;z=cf;cf=nf;nf=z;z=ccb;ccb=ncb;ncb=z;} slen/=4; folds+=2;
                 CK(cudaDeviceSynchronize());
                 CK(cudaMemcpy(h,out8,8*sizeof(F128),cudaMemcpyDeviceToHost));

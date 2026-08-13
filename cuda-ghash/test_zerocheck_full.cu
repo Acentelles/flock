@@ -9,9 +9,10 @@
 #include <cstdlib>
 #include <vector>
 #include "zerocheck_round1.cuh"
-#include "zerocheck_round1_cpustyle.cuh"   // fast cpustyle3 round-1 (launch_zc_round1_fast)
+#include "zerocheck_round1_cpustyle.cuh"
+#include "ntt_host.hpp"
 #include "zerocheck_round2.cuh"
-#include "zerocheck_tail.cuh"      // launch_zt_msg + sumcheck_ab fold
+#include "zerocheck_tail.cuh"      // launch_zerocheck_tail_message + sumcheck_ab fold
 #include "phi8_table.cuh"
 #include "challenger.hpp"
 #include "zc_challenger_device.cuh"   // resident on-device challenger for the tail
@@ -73,12 +74,12 @@ int main(int argc, char** argv){
     printf("ZCFV: m=%d n_mlv=%d\n", m, n_mlv);
 
     long long n_out = 1LL<<(m-6);      // a_mlv length after round-2
-    zc_round1_upload_tables(mcol.data(), f8mul.data(), PHI_8_TABLE);
+    upload_zerocheck_first_round_tables(mcol.data(), f8mul.data(), PHI_8_TABLE);
 
     // device buffers
     uint8_t *d_a,*d_b,*d_c; F128 *d_eq,*d_r1ab,*d_r1c,*d_ft,*d_am,*d_bm,*d_amn,*d_bmn,*d_p1,*d_pinf,*d_m1d,*d_mid;
     CK(cudaMalloc(&d_a,pb)); CK(cudaMalloc(&d_b,pb)); CK(cudaMalloc(&d_c,pb));
-    CK(cudaMalloc(&d_eq,n_out*sizeof(F128)));
+    CK(cudaMalloc(&d_eq,(1LL<<(m-13))*sizeof(F128)));
     CK(cudaMalloc(&d_r1ab,64*sizeof(F128))); CK(cudaMalloc(&d_r1c,64*sizeof(F128)));
     CK(cudaMalloc(&d_ft,8*256*sizeof(F128)));
     CK(cudaMalloc(&d_am,n_out*sizeof(F128))); CK(cudaMalloc(&d_bm,n_out*sizeof(F128)));
@@ -113,10 +114,12 @@ int main(int argc, char** argv){
     for(int i=0;i<m-13;i++) r[13+i]=frch(ro[i]);
 
     // ---- 2. round-1 URM ----
-    std::vector<F128> r6(r.begin()+6, r.end());
-    std::vector<F128> eqf6=build_eq(r6);
-    CK(cudaMemcpy(d_eq, eqf6.data(), n_out*sizeof(F128), cudaMemcpyHostToDevice));
-    launch_zc_round1_fast(d_a,d_b,d_c,d_eq,n_out,d_r1ab,d_r1c);   // cpustyle3 (was launch_zc_round1)
+    std::vector<F128> r_outer(r.begin()+13, r.end());
+    std::vector<F128> eq_outer=build_eq(r_outer);
+    CK(cudaMemcpy(d_eq,eq_outer.data(),eq_outer.size()*sizeof(F128),cudaMemcpyHostToDevice));
+    F128 round1_scale=ONE;
+    for(int i=6;i<13;i++) round1_scale=MUL(round1_scale,ADD(ONE,r[i]));
+    launch_zerocheck_first_round_cpu_structured(d_a,d_b,d_c,d_eq,eq_outer.size(),round1_scale,d_r1ab,d_r1c);
     CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
     std::vector<F128> r1ab(64), r1c(64);
     CK(cudaMemcpy(r1ab.data(),d_r1ab,64*sizeof(F128),cudaMemcpyDeviceToHost));
@@ -139,7 +142,7 @@ int main(int argc, char** argv){
     for(int j=0;j<8;j++){ for(int v=0;v<256;v++){ F128 acc{0,0};
         for(int bb=0;bb<8;bb++) if((v>>bb)&1) acc=ADD(acc, ws[8*j+bb]); ft[j*256+v]=acc; } }
     CK(cudaMemcpy(d_ft, ft.data(), 8*256*sizeof(F128), cudaMemcpyHostToDevice));
-    launch_zc_round2_fold(d_a,d_b,d_ft,n_out,d_am,d_bm);
+    launch_zerocheck_second_round_fold(d_a,d_b,d_ft,n_out,d_am,d_bm);
     CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
 
     F128 *cA=d_am,*cB=d_bm,*nA=d_amn,*nB=d_bmn;
@@ -153,7 +156,7 @@ int main(int argc, char** argv){
     // round-2 message: shift 0, scale ONE (eq = eq(r[7..m]) exactly).
     F128 m1,mi;
     { long long half=len/2;
-      launch_zt_msg_split(cA,cB,d_eqlo,d_eqhi,0,zt_lobits,half,ONE,d_p1,d_pinf,d_m1d,d_mid);
+      launch_zerocheck_tail_message(cA,cB,d_eqlo,d_eqhi,0,zt_lobits,half,ONE,d_p1,d_pinf,d_m1d,d_mid);
       CK(cudaMemcpy(&m1,d_m1d,sizeof(F128),cudaMemcpyDeviceToHost));
       CK(cudaMemcpy(&mi,d_mid,sizeof(F128),cudaMemcpyDeviceToHost)); }
     if(!eqf(m1,g_m1[0])||!eqf(mi,g_mi[0])) return fail("round2 msg");
@@ -171,18 +174,18 @@ int main(int argc, char** argv){
     { ZcSha zs=zc_pack(ch.hasher); CK(cudaMemcpy(d_state,&zs,sizeof(ZcSha),cudaMemcpyHostToDevice)); }
     CK(cudaMemcpy(d_rho,&rho,sizeof(F128),cudaMemcpyHostToDevice));
     // HYBRID tail: per-round fused fold+msg while op > ZT_FINISH_OP, then ONE
-    // zt_tail_finisher launch runs all remaining small rounds internally.
+    // finish_zerocheck_tail launch runs all remaining small rounds internally.
     F128* d_S; CK(cudaMalloc(&d_S, n_tail*sizeof(F128)));
     CK(cudaMemcpy(d_S, S.data(), n_tail*sizeof(F128), cudaMemcpyHostToDevice));
     { long long L=len; int i=0;
       for(; i<n_tail && L/4 > ZT_FINISH_OP; i++){ long long op=L/4;
-        launch_zt_fold_msg_split_dev(cA,cB,nA,nB,d_eqlo,d_eqhi,i+1,zt_lobits,op,d_rho,S[i],d_p1,d_pinf,d_m1d,d_mid);
-        zt_chal_round<<<1,1>>>(d_state,d_m1d,d_mid,d_rho,d_rhos+i,d_m1log+i,d_milog+i);
+        launch_zerocheck_tail_fold_and_message_device_challenge(cA,cB,nA,nB,d_eqlo,d_eqhi,i+1,zt_lobits,op,d_rho,S[i],d_p1,d_pinf,d_m1d,d_mid);
+        advance_zerocheck_tail_challenger<<<1,1>>>(d_state,d_m1d,d_mid,d_rho,d_rhos+i,d_m1log+i,d_milog+i);
         { F128* t; t=cA;cA=nA;nA=t; t=cB;cB=nB;nB=t; } L/=2; }
       if (i < n_tail) {
         F128 rho_h; CK(cudaMemcpy(&rho_h, d_rho, sizeof(F128), cudaMemcpyDeviceToHost));
         int rem = n_tail - i;
-        zt_tail_finisher<<<1, ZT_FIN_TPB>>>(cA,cB,nA,nB,d_eqlo,d_eqhi,zt_lobits,i+1,d_S+i,
+        finish_zerocheck_tail<<<1, ZT_FIN_TPB>>>(cA,cB,nA,nB,d_eqlo,d_eqhi,zt_lobits,i+1,d_S+i,
                                             rho_h, rem, L, d_state, d_rhos+i, d_m1log+i, d_milog+i);
         if (rem & 1) { F128* t; t=cA;cA=nA;nA=t; t=cB;cB=nB;nB=t; }
         L >>= rem;

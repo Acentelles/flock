@@ -1,5 +1,5 @@
 // Bit-for-bit validation of the CUDA induce_sumcheck_poly (step 4 of the GPU
-// pcs::open / Ligerito port, GPU_OPEN_PLAN.md) against the flock CPU oracle
+// pcs::open / Ligerito port against the flock CPU oracle
 // dumped by `src/bin/dump_induce_vectors.rs` (INDC format) — sourced from the
 // real `ligerito::induce_sumcheck_poly`.
 //

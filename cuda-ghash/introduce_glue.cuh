@@ -1,5 +1,5 @@
 // introduce_new + glue — step 5 of the GPU pcs::open (Ligerito) port
-// (GPU_OPEN_PLAN.md). Ports the α-batched basis introduction the recursive
+// for the GPU Ligerito open. Ports the α-batched basis introduction the recursive
 // prover runs when a level's induced basis (step 4) enters the sumcheck
 // (src/pcs/ligerito.rs SumcheckProver::introduce_new_with_eval + glue):
 //
@@ -22,7 +22,7 @@
 
 // Block-partial reduction → three F128 sums: a0=Σ f0·b0, a2=Σ (f0+f1)(b0+b1),
 // aodd=Σ f1·b1. (h_new = a0 ^ aodd; u_0 = a0; u_2 = a2.)
-__global__ void msg_eval_partial(const F128* __restrict__ F, const F128* __restrict__ B,
+__global__ void basis_message_evaluation_partial(const F128* __restrict__ F, const F128* __restrict__ B,
                                  long long half, F128* p0, F128* p2, F128* podd) {
     // Reduce-per-term (F128) rather than deferred (F256) — see sumcheck_ab.cuh.
     __shared__ F128 s0[IGL_TPB], s2[IGL_TPB], sodd[IGL_TPB];
@@ -47,7 +47,7 @@ __global__ void msg_eval_partial(const F128* __restrict__ F, const F128* __restr
 }
 
 // One 256-thread block (was a single-thread loop, ~200 us at 2048 blocks; bit-identical).
-__global__ void msg_eval_combine(const F128* p0, const F128* p2, const F128* podd, int blocks,
+__global__ void combine_basis_message_evaluation(const F128* p0, const F128* p2, const F128* podd, int blocks,
                                  F128* u0, F128* u2, F128* h_new) {
     __shared__ F128 s0[IGL_TPB], s2[IGL_TPB], sodd[IGL_TPB];
     F128 a0{0, 0}, a2{0, 0}, aodd{0, 0};
@@ -66,7 +66,7 @@ __global__ void msg_eval_combine(const F128* p0, const F128* p2, const F128* pod
 }
 
 // glue: combined_basis[j] ^= β · b_new[j]  (in place).
-__global__ void glue_axpy(F128* __restrict__ cb, const F128* __restrict__ b_new,
+__global__ void combine_basis_polynomials(F128* __restrict__ cb, const F128* __restrict__ b_new,
                           F128 beta, long long n) {
     long long j = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
@@ -80,15 +80,15 @@ inline int igl_blocks(long long half) {
     return (int)b;
 }
 
-inline void launch_msg_eval(const F128* dF, const F128* dB, long long half,
+inline void launch_basis_message_evaluation(const F128* dF, const F128* dB, long long half,
                             F128* d_p0, F128* d_p2, F128* d_podd,
                             F128* d_u0, F128* d_u2, F128* d_hnew) {
     int blocks = igl_blocks(half);
-    msg_eval_partial<<<blocks, IGL_TPB>>>(dF, dB, half, d_p0, d_p2, d_podd);
-    msg_eval_combine<<<1, IGL_TPB>>>(d_p0, d_p2, d_podd, blocks, d_u0, d_u2, d_hnew);
+    basis_message_evaluation_partial<<<blocks, IGL_TPB>>>(dF, dB, half, d_p0, d_p2, d_podd);
+    combine_basis_message_evaluation<<<1, IGL_TPB>>>(d_p0, d_p2, d_podd, blocks, d_u0, d_u2, d_hnew);
 }
 
 inline void launch_glue(F128* d_cb, const F128* d_bnew, F128 beta, long long n, int tpb = IGL_TPB) {
     long long blocks = (n + tpb - 1) / tpb;
-    glue_axpy<<<(unsigned)blocks, tpb>>>(d_cb, d_bnew, beta, n);
+    combine_basis_polynomials<<<(unsigned)blocks, tpb>>>(d_cb, d_bnew, beta, n);
 }

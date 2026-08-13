@@ -1,5 +1,5 @@
 // Bit-for-bit validation of the CUDA a·b multilinear sumcheck (step 3 of the
-// GPU pcs::open / Ligerito port, GPU_OPEN_PLAN.md) against the flock CPU oracle
+// GPU pcs::open / Ligerito port against the flock CPU oracle
 // dumped by `src/bin/dump_sumcheck_vectors.rs` (SMC1 format).
 //
 // Pipeline (mirrors the CPU a·b sumcheck — `ligerito.rs`'s `fold_and_msg_lsb`
@@ -74,7 +74,7 @@ int main(int argc, char** argv) {
     for (int k = 0; k < log_len; k++) {
         long long half = len / 2;
         // --- message
-        launch_sumcheck_msg(cA, cB, half, d_p0, d_p2, d_u0, d_u2);
+        launch_sumcheck_message(cA, cB, half, d_p0, d_p2, d_u0, d_u2);
         CK(cudaGetLastError());
         F128 u0, u2;
         CK(cudaMemcpy(&u0, d_u0, sizeof(F128), cudaMemcpyDeviceToHost));

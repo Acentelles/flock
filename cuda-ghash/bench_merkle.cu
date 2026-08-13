@@ -13,7 +13,7 @@
     printf("CUDA error %s at %s:%d\n", cudaGetErrorString(e), __FILE__, __LINE__); \
     exit(1);} } while(0)
 
-__global__ void fill_kernel(uint8_t* d, long long n) {
+__global__ void fill_benchmark_input(uint8_t* d, long long n) {
     long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
     if (i >= n) return;
     d[i] = (uint8_t)(i * 1315423911ull >> 13);
@@ -34,7 +34,7 @@ static void run_one(int m, int log_inv_rate, int log_batch_size, int iters, int 
     CK(cudaMalloc(&d_data, data_bytes));
     CK(cudaMalloc(&d_tree, total_nodes * 32));
     long long fb = (data_bytes + 255) / 256;
-    fill_kernel<<<(unsigned)fb, 256>>>(d_data, data_bytes);
+    fill_benchmark_input<<<(unsigned)fb, 256>>>(d_data, data_bytes);
     CK(cudaGetLastError());
 
     launch_merkle(d_data, d_tree, n_leaves, leaf_size, 256, kway);      // warm-up

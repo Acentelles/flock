@@ -1,5 +1,5 @@
 // Throughput baseline for the a·b multilinear sumcheck (GPU pcs::open /
-// Ligerito, step 3; GPU_OPEN_PLAN.md). No oracle — correctness is validated by
+// Ligerito. No oracle. Correctness is validated by
 // test_sumcheck_ab; here we only time. a,b are generated on-device.
 //
 // What's timed: the full L-round sumcheck cascade the CPU prover runs over the
@@ -25,7 +25,7 @@
     printf("CUDA error %s at %s:%d\n", cudaGetErrorString(e), __FILE__, __LINE__); \
     exit(1);} } while(0)
 
-__global__ void fill_ab(F128* A, F128* B, long long n) {
+__global__ void fill_sumcheck_inputs(F128* A, F128* B, long long n) {
     long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
     if (i >= n) return;
     u64 x = (u64)i * 0x9E3779B97F4A7C15ull + 1;
@@ -65,7 +65,7 @@ static void run_one(int m, int iters) {
 
     int tpb = 256;
     long long fb = (init_len + tpb - 1) / tpb;
-    fill_ab<<<(unsigned)fb, tpb>>>(dA, dB, init_len);
+    fill_sumcheck_inputs<<<(unsigned)fb, tpb>>>(dA, dB, init_len);
     CK(cudaGetLastError());
 
     auto run_cascade = [&]() {
@@ -73,7 +73,7 @@ static void run_one(int m, int iters) {
         long long len = init_len;
         for (int k = 0; k < L; k++) {
             long long half = len / 2;
-            launch_sumcheck_msg(cA, cB, half, d_p0, d_p2, d_u0, d_u2);
+            launch_sumcheck_message(cA, cB, half, d_p0, d_p2, d_u0, d_u2);
             launch_sumcheck_fold(cA, cB, nA, nB, half, chal[k]);
             F128* t;
             t = cA; cA = nA; nA = t;

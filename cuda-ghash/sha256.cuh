@@ -1,4 +1,4 @@
-// Device SHA-256 for the PCS-commit Merkle tree (P3 of GPU_COMMIT_PLAN).
+// Device SHA-256 for the PCS-commit Merkle tree.
 //
 // Standard FIPS-180-4 SHA-256, big-endian, byte-identical to the `sha2` crate
 // used by src/merkle.rs (no domain separation: a leaf is SHA256 of its raw

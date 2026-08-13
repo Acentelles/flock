@@ -1,14 +1,11 @@
 // Byte-exact validation of the CPU-structured GPU round-1 kernel against the ZCR1
-// golden. Build: make test_zc_cpustyle_gpu ; run on a zcr1 vector file.
+// golden. Build: make test_zc_CPU-structured_gpu ; run on a zcr1 vector file.
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <vector>
 #include "zerocheck_round1_cpustyle.cuh"
 #include "phi8_table.cuh"
-#ifndef ZC_CS_LAUNCH
-#define ZC_CS_LAUNCH launch_zc_round1_cpustyle3
-#endif
 #include "ntt_host.hpp"
 
 #define CK(x) do { cudaError_t e=(x); if(e){ printf("CUDA err %s @%d\n", cudaGetErrorString(e), __LINE__); exit(1);} } while(0)
@@ -21,7 +18,6 @@ static std::vector<F128> build_eq(const std::vector<F128>& r){
         for(size_t x=0;x<len;x++){ F128 v=t[x]; t[x+len]=f128_mul_hd(v,rj); t[x]=f128_mul_hd(v,omr);} }
     return t;
 }
-static F128 mul_by_x_h(F128 z){ u64 c=z.hi>>63, m=(u64)0-c; return F128{(z.lo<<1)^(0x87&m),(z.hi<<1)|(z.lo>>63)}; }
 
 int main(int argc, char** argv){
     const char* path = argc>1?argv[1]:"zcr1_m16.bin";
@@ -44,22 +40,17 @@ int main(int argc, char** argv){
     std::vector<F128> eq_small=build_eq(r_small), eq_med=build_eq(r_med), eq_out=build_eq(r_out);
     long long n_out=(long long)eq_out.size();
     F128 scale=f128_mul_hd(eq_small[0], eq_med[0]);
-    std::vector<F128> convert((size_t)16*256); F128 gp{1,0};
-    for(int j=0;j<16;j++){ for(int v=0;v<256;v++) convert[(size_t)j*256+v]=f128_mul_hd(gp,PHI_8_TABLE[v]); gp=mul_by_x_h(gp); }
+    upload_zerocheck_first_round_tables(mcol.data(), f8mul.data(), PHI_8_TABLE);   // uploads g_zc_t0, g_zc_f8mul
 
-    zc_round1_upload_tables(mcol.data(), f8mul.data(), PHI_8_TABLE);   // uploads g_zc_t0, g_zc_f8mul
-
-    uint8_t *d_a,*d_b,*d_c; F128 *d_eq,*d_conv,*d_ab,*d_c_out;
+    uint8_t *d_a,*d_b,*d_c; F128 *d_eq,*d_ab,*d_c_out;
     CK(cudaMalloc(&d_a,pb)); CK(cudaMalloc(&d_b,pb)); CK(cudaMalloc(&d_c,pb));
-    CK(cudaMalloc(&d_eq,n_out*sizeof(F128))); CK(cudaMalloc(&d_conv,convert.size()*sizeof(F128)));
+    CK(cudaMalloc(&d_eq,n_out*sizeof(F128)));
     CK(cudaMalloc(&d_ab,64*sizeof(F128))); CK(cudaMalloc(&d_c_out,64*sizeof(F128)));
     CK(cudaMemcpy(d_a,A.data(),pb,cudaMemcpyHostToDevice));
     CK(cudaMemcpy(d_b,B.data(),pb,cudaMemcpyHostToDevice));
     CK(cudaMemcpy(d_c,C.data(),pb,cudaMemcpyHostToDevice));
     CK(cudaMemcpy(d_eq,eq_out.data(),n_out*sizeof(F128),cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_conv,convert.data(),convert.size()*sizeof(F128),cudaMemcpyHostToDevice));
-
-    ZC_CS_LAUNCH(d_a,d_b,d_c,d_eq,n_out,d_conv,scale,d_ab,d_c_out);
+    launch_zerocheck_first_round_cpu_structured(d_a,d_b,d_c,d_eq,n_out,scale,d_ab,d_c_out);
     CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
 
     std::vector<F128> ab(64),cc(64);

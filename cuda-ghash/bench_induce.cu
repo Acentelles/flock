@@ -1,5 +1,5 @@
 // Throughput baseline for the induce_sumcheck_poly accumulation kernel (GPU
-// pcs::open / Ligerito, step 4; GPU_OPEN_PLAN.md). No oracle — correctness is
+// pcs::open / Ligerito. No oracle. Correctness is
 // validated by test_induce; here we only time the dominant device kernel:
 //   basis_poly[h·low_n + l] = Σ_i scaled_high[i][h] · low_i[l]     (deferred reduce)
 // over n = 2^log_n outputs, n_queries terms each (O(n·n_queries) muls). Inputs

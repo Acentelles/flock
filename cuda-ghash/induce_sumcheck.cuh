@@ -1,5 +1,5 @@
 // induce_sumcheck_poly — step 4 of the GPU pcs::open (Ligerito) port
-// (GPU_OPEN_PLAN.md). Port of src/pcs/ligerito.rs::induce_sumcheck_poly: build
+// for the GPU Ligerito open. Port of src/pcs/ligerito.rs::induce_sumcheck_poly: build
 // the induced basis poly (length n = 2^log_msg_cols) from the opened query rows.
 //
 // Split (correctness-first):
@@ -66,7 +66,7 @@ inline std::vector<F128> build_eq_table_hd(const std::vector<F128>& point) {
 
 // ---- device eq-table builder (hardware clmad, replaces host build_eq_table_hd
 // for the big OOD eq) ----
-__global__ void eq_double_kernel(F128* out, F128 r, F128 opr, long long len) {
+__global__ void double_equality_table(F128* out, F128 r, F128 opr, long long len) {
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= len) return;
     F128 v = out[i];
@@ -78,7 +78,7 @@ __global__ void eq_double_kernel(F128* out, F128 r, F128 opr, long long len) {
 // dominated the zerocheck tail (23 rounds × up-to-22 launches each). Challenges in
 // __constant__ (per-step broadcast). Bit-identical to the doubling.
 __constant__ F128 g_eq_chal[64];
-__global__ void eq_build_direct_k(int d, long long n, F128* __restrict__ out) {
+__global__ void build_equality_table_directly(int d, long long n, F128* __restrict__ out) {
     long long x = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (x >= n) return;
     F128 acc{1ull, 0ull};
@@ -99,7 +99,7 @@ inline void build_eq_device(F128* d_out, const F128* challenges, int d, int tpb 
     if (d <= 12) {
         cudaMemcpyToSymbol(g_eq_chal, challenges, (size_t)d * sizeof(F128));
         long long n = 1LL << d;
-        eq_build_direct_k<<<(unsigned)((n + tpb - 1) / tpb), tpb>>>(d, n, d_out);
+        build_equality_table_directly<<<(unsigned)((n + tpb - 1) / tpb), tpb>>>(d, n, d_out);
         return;
     }
     F128 one{1ull, 0ull};
@@ -108,7 +108,7 @@ inline void build_eq_device(F128* d_out, const F128* challenges, int d, int tpb 
         F128 r = challenges[j];
         F128 opr{r.lo ^ 1ull, r.hi};
         long long len = 1LL << j;
-        eq_double_kernel<<<(unsigned)((len + tpb - 1) / tpb), tpb>>>(d_out, r, opr, len);
+        double_equality_table<<<(unsigned)((len + tpb - 1) / tpb), tpb>>>(d_out, r, opr, len);
     }
 }
 
@@ -195,7 +195,7 @@ inline InduceSetup induce_setup(int log_n,
 // ---- device per-query w-chain (replaces the host software-mul s_k chain) ---
 // One thread per query: w[i][k] = s_k(query_i)·inv_sks[k], s_0=query, s_k via
 // next_s (s² + sks_vks[k-1]·s). Hardware clmad.
-__global__ void compute_w_kernel(const unsigned long long* __restrict__ queries,
+__global__ void compute_query_weights(const unsigned long long* __restrict__ queries,
                                  const F128* __restrict__ sks_vks, const F128* __restrict__ inv_sks,
                                  int n_total, int n_queries, F128* __restrict__ w_out) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -213,7 +213,7 @@ __global__ void compute_w_kernel(const unsigned long long* __restrict__ queries,
 // ---- device qtensor build (replaces the host software-mul doubling) -------
 // One block per query: build low[low_n] + high[high_n] in shared memory via the
 // novel-basis doubling, then write low and scaled_high = alpha_pows[i]·high.
-__global__ void build_qtensors_kernel(const F128* __restrict__ w, const F128* __restrict__ alpha_pows,
+__global__ void build_query_tensors(const F128* __restrict__ w, const F128* __restrict__ alpha_pows,
                                       int n_total, int low_bits, int high_bits,
                                       F128* __restrict__ d_low, F128* __restrict__ d_sh) {
     extern __shared__ F128 sh[];
@@ -288,9 +288,9 @@ inline InduceSetupDev induce_setup_device(int log_n, const std::vector<F128>& sk
     (void)cudaMemcpy(d_sks, sks_vks.data(), log_n*sizeof(F128), cudaMemcpyHostToDevice);
     (void)cudaMemcpy(d_inv, inv_sks.data(), log_n*sizeof(F128), cudaMemcpyHostToDevice);
     (void)cudaMemcpy(d_q, queries.data(), S.n_queries*sizeof(unsigned long long), cudaMemcpyHostToDevice);
-    compute_w_kernel<<<(S.n_queries+255)/256, 256>>>(d_q, d_sks, d_inv, log_n, S.n_queries, d_w);
+    compute_query_weights<<<(S.n_queries+255)/256, 256>>>(d_q, d_sks, d_inv, log_n, S.n_queries, d_w);
     size_t shmem = (size_t)(S.low_n + S.high_n) * sizeof(F128);
-    build_qtensors_kernel<<<S.n_queries, 256, shmem>>>(d_w, d_ap, log_n, low_bits, high_bits, S.d_low, S.d_sh);
+    build_query_tensors<<<S.n_queries, 256, shmem>>>(d_w, d_ap, log_n, low_bits, high_bits, S.d_low, S.d_sh);
     cudaFree(d_w); cudaFree(d_ap); cudaFree(d_sks); cudaFree(d_inv); cudaFree(d_q);
     return S;
 }

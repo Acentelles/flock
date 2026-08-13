@@ -1,4 +1,4 @@
-// GPU Merkle tree (SHA-256) for the PCS commit — P3 of GPU_COMMIT_PLAN.
+// GPU Merkle tree (SHA-256) for the PCS commit.
 //
 // Mirrors src/merkle.rs::merkle_tree exactly:
 //   * flat layout: tree[0..n] = leaf hashes, then each level above, root last;
@@ -18,7 +18,7 @@
 typedef uint8_t Hash[32];
 
 // One thread per leaf: hash leaf_size contiguous bytes into tree[leaf].
-__global__ void merkle_leaf_kernel(const uint8_t* data, uint8_t* tree,
+__global__ void hash_merkle_leaves(const uint8_t* data, uint8_t* tree,
                                    long long num_leaves, int leaf_size) {
     long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
     if (i >= num_leaves) return;
@@ -27,7 +27,7 @@ __global__ void merkle_leaf_kernel(const uint8_t* data, uint8_t* tree,
 
 // K leaves per thread, interleaved (ILP-hidden SHA dependency chain).
 template <int K>
-__global__ void merkle_leaf_kernel_kway(const uint8_t* data, uint8_t* tree,
+__global__ void hash_merkle_leaves_in_parallel(const uint8_t* data, uint8_t* tree,
                                         long long num_leaves, int leaf_size) {
     long long grp = blockIdx.x * (long long)blockDim.x + threadIdx.x;
     long long first = grp * K;
@@ -54,7 +54,7 @@ __global__ void merkle_leaf_kernel_kway(const uint8_t* data, uint8_t* tree,
 //            straight from shared (BE byte-swap on the register read).
 // The trailing padding block (0x80 ... bitlen) is a constant — computed in
 // registers, no staging. Digest layout matches sha256() bit-for-bit.
-__global__ void merkle_leaf_kernel_staged(const uint8_t* __restrict__ data, uint8_t* tree,
+__global__ void hash_staged_merkle_leaves(const uint8_t* __restrict__ data, uint8_t* tree,
                                           long long num_leaves, int leaf_size) {
     extern __shared__ uint32_t sw[];                  // 32*33 words per warp
     int wid = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -110,7 +110,7 @@ __global__ void merkle_leaf_kernel_staged(const uint8_t* __restrict__ data, uint
 
 // One thread per parent: hash the 64-byte child pair into the parent node.
 // read_start/write_start are node indices into the flat tree.
-__global__ void merkle_level_kernel(uint8_t* tree, long long read_start,
+__global__ void hash_merkle_level(uint8_t* tree, long long read_start,
                                     long long write_start, long long num_parents) {
     long long j = blockIdx.x * (long long)blockDim.x + threadIdx.x;
     if (j >= num_parents) return;
@@ -130,18 +130,18 @@ inline void launch_merkle(const uint8_t* d_data, uint8_t* d_tree,
         long long warps  = (num_leaves + 31) / 32;
         long long blocks = (warps + wpb - 1) / wpb;
         size_t smem = (size_t)wpb * 32 * 33 * sizeof(uint32_t);
-        merkle_leaf_kernel_staged<<<(unsigned)blocks, tpb, smem>>>(d_data, d_tree, num_leaves, leaf_size);
+        hash_staged_merkle_leaves<<<(unsigned)blocks, tpb, smem>>>(d_data, d_tree, num_leaves, leaf_size);
     } else if (kway == 2) {
         long long groups = (num_leaves + 1) / 2;
         long long b = (groups + tpb - 1) / tpb;
-        merkle_leaf_kernel_kway<2><<<(unsigned)b, tpb>>>(d_data, d_tree, num_leaves, leaf_size);
+        hash_merkle_leaves_in_parallel<2><<<(unsigned)b, tpb>>>(d_data, d_tree, num_leaves, leaf_size);
     } else if (kway == 4) {
         long long groups = (num_leaves + 3) / 4;
         long long b = (groups + tpb - 1) / tpb;
-        merkle_leaf_kernel_kway<4><<<(unsigned)b, tpb>>>(d_data, d_tree, num_leaves, leaf_size);
+        hash_merkle_leaves_in_parallel<4><<<(unsigned)b, tpb>>>(d_data, d_tree, num_leaves, leaf_size);
     } else {
         long long blocks = (num_leaves + tpb - 1) / tpb;
-        merkle_leaf_kernel<<<(unsigned)blocks, tpb>>>(d_data, d_tree, num_leaves, leaf_size);
+        hash_merkle_leaves<<<(unsigned)blocks, tpb>>>(d_data, d_tree, num_leaves, leaf_size);
     }
 
     long long read_start = 0, read_len = num_leaves;
@@ -149,7 +149,7 @@ inline void launch_merkle(const uint8_t* d_data, uint8_t* d_tree,
         long long next = read_len >> 1;
         long long write_start = read_start + read_len;
         long long b = (next + tpb - 1) / tpb;
-        merkle_level_kernel<<<(unsigned)b, tpb>>>(d_tree, read_start, write_start, next);
+        hash_merkle_level<<<(unsigned)b, tpb>>>(d_tree, read_start, write_start, next);
         read_start += read_len;
         read_len = next;
     }

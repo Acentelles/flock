@@ -5,7 +5,7 @@
 //          x = o*128 + j*8 + k: small k in bits[0,3), medium j in [3,7), outer o in [7,)).
 //   Ref B: the actual optimization — level-1 F8 shift-then-reduce over the 8 small
 //          dims, level-2 F128 convert-table over the 16 medium dims, one outer ghash.
-// No GPU. Build: make test_zc_round1_cpustyle ; run on zerocheck_round1_vectors.bin.
+// No GPU. Build: make test_zc_round1_CPU-structured ; run on zerocheck_round1_vectors.bin.
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>

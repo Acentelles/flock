@@ -1,5 +1,5 @@
 // Full Ligerito L0-phase orchestrator — step 6 (final assembly) of the GPU
-// pcs::open / Ligerito port (GPU_OPEN_PLAN.md). Reproduces an entire L0 phase of
+// pcs::open / Ligerito port. Reproduces an entire L0 phase of
 // recursive_prover_with_basis_impl on device + host challenger, validated
 // byte-for-byte against the real prover (dump_ligerito_l0_vectors.rs):
 //   L0 commit → observe → initial_k folds → commit f¹ → OOD intro/glue →
@@ -42,8 +42,6 @@ static uint64_t rd_u64(FILE* f) { uint64_t v; if (fread(&v, 8, 1, f) != 1) { pri
 static F128 rd_f128(FILE* f) { u64 v[2]; if (fread(v, 8, 2, f) != 2) { printf("short f128\n"); exit(1); } return F128{v[0], v[1]}; }
 static bool eqf(F128 a, F128 b) { return a.lo == b.lo && a.hi == b.hi; }
 static ChF128 to_ch(F128 x) { return ChF128{x.lo, x.hi}; }
-static int ceil_log2_i(int n) { if (n <= 1) return 0; int b = 0, m = n - 1; while (m) { b++; m >>= 1; } return b; }
-
 // Build a ligero_commit on device: replicate-fill `src` (len 2^msg_log) → NTT →
 // Merkle. Returns root (host) and leaves the codeword in d_cw, tree in d_tree.
 static void ligero_commit_dev(const F128* d_src, int msg_log, int log_msg_cols, int log_ni,
@@ -60,10 +58,10 @@ static void ligero_commit_dev(const F128* d_src, int msg_log, int log_msg_cols, 
     CK(cudaMalloc(&d_tw, tt.data.size() * sizeof(F128)));
     CK(cudaMemcpy(d_tw, tt.data.data(), tt.data.size() * sizeof(F128), cudaMemcpyHostToDevice));
     CK(cudaMalloc(&d_tree, (size_t)(2 * block_len - 1) * 32));
-    // Rate-extend fusion (same as bench_ligerito::commit_dev): first topK pass
+    // Rate-extend fusion (same as bench_ligerito::commit_dev): first shared-memory pass
     // reads the message directly instead of a replicate_fill'd codeword.
-    if (ntt_can_fuse_src(k_code - log_inv_rate)) {
-        launch_ntt(d_cw, d_tw, tt, log_inv_rate, k_code, num_ntts, 256, false, d_src, msg_len - 1);
+    if (ntt_can_fuse_source(k_code - log_inv_rate)) {
+        launch_ntt(d_cw, d_tw, tt, log_inv_rate, k_code, num_ntts, 256, d_src, msg_len - 1);
     } else {
         int tpb = 256;
         replicate_fill<<<(unsigned)((cw_len + tpb - 1) / tpb), tpb>>>(d_src, d_cw, cw_len, msg_len);
@@ -78,7 +76,7 @@ static void ligero_commit_dev(const F128* d_src, int msg_log, int log_msg_cols, 
 
 static void dev_msg(const F128* A, const F128* B, long long len, F128* p0, F128* p2,
                     F128* du0, F128* du2, F128& u0, F128& u2) {
-    launch_sumcheck_msg(A, B, len / 2, p0, p2, du0, du2);
+    launch_sumcheck_message(A, B, len / 2, p0, p2, du0, du2);
     CK(cudaGetLastError());
     CK(cudaMemcpy(&u0, du0, sizeof(F128), cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(&u2, du2, sizeof(F128), cudaMemcpyDeviceToHost));
@@ -163,7 +161,7 @@ int main(int argc, char** argv) {
         F128 gr = rd_f128(fp), gu0 = rd_f128(fp), gu2 = rd_f128(fp);
         if (!eqf(r, gr)) { printf("FOLD CHAL %d FAIL\n", k); return 1; }
         long long half = slen / 2;
-        launch_sumcheck_fold_msg(cf, ccb, nf, ncb, half, r, p0, p2, du0, du2); CK(cudaGetLastError());  // fused fold + next msg
+        launch_sumcheck_fold_and_message(cf, ccb, nf, ncb, half, r, p0, p2, du0, du2); CK(cudaGetLastError());  // fused fold + next msg
         { F128* t; t = cf; cf = nf; nf = t; t = ccb; ccb = ncb; ncb = t; }
         slen = half;
         CK(cudaMemcpy(&u0,du0,sizeof(F128),cudaMemcpyDeviceToHost));CK(cudaMemcpy(&u2,du2,sizeof(F128),cudaMemcpyDeviceToHost));
@@ -200,7 +198,7 @@ int main(int argc, char** argv) {
         std::vector<F128> zf(n1);
         for (int i = 0; i < n1; i++) { F128 gz = rd_f128(fp); if (!eqf(F128{z[i].lo,z[i].hi}, gz)) { printf("OOD z FAIL\n"); return 1; } zf[i] = F128{z[i].lo, z[i].hi}; }
         build_eq_device(d_bnew, zf.data(), n1);   // device eq (perf path)
-        launch_msg_eval(cf, d_bnew, n1_len / 2, ep0, ep2, epodd, eu0, eu2, ehnew); CK(cudaGetLastError());
+        launch_basis_message_evaluation(cf, d_bnew, n1_len / 2, ep0, ep2, epodd, eu0, eu2, ehnew); CK(cudaGetLastError());
         F128 iu0, iu2, y;
         CK(cudaMemcpy(&iu0, eu0, sizeof(F128), cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(&iu2, eu2, sizeof(F128), cudaMemcpyDeviceToHost));
@@ -282,7 +280,7 @@ int main(int argc, char** argv) {
             F128 gr = rd_f128(fp), gu0 = rd_f128(fp), gu2 = rd_f128(fp);
             if (!eqf(rr, gr)) { printf("REC L%d FOLD CHAL %d FAIL\n", lvl, k); return 1; }
             long long half = slen / 2;
-            launch_sumcheck_fold_msg(cf, ccb, nf, ncb, half, rr, p0, p2, du0, du2); CK(cudaGetLastError());  // fused fold + next msg
+            launch_sumcheck_fold_and_message(cf, ccb, nf, ncb, half, rr, p0, p2, du0, du2); CK(cudaGetLastError());  // fused fold + next msg
             { F128* t; t = cf; cf = nf; nf = t; t = ccb; ccb = ncb; ncb = t; }
             slen = half;
             CK(cudaMemcpy(&u0,du0,sizeof(F128),cudaMemcpyDeviceToHost));CK(cudaMemcpy(&u2,du2,sizeof(F128),cudaMemcpyDeviceToHost));
@@ -328,7 +326,7 @@ int main(int argc, char** argv) {
                 std::vector<F128> zf(n_next);
                 for (int j = 0; j < n_next; j++) { F128 gz = rd_f128(fp); if (!eqf(F128{z[j].lo,z[j].hi}, gz)) { printf("REC L%d OOD z FAIL\n", lvl); return 1; } zf[j] = F128{z[j].lo, z[j].hi}; }
                 build_eq_device(d_bnew, zf.data(), n_next);   // device eq (perf path)
-                launch_msg_eval(cf, d_bnew, nn_len / 2, ep0, ep2, epodd, eu0, eu2, ehnew); CK(cudaGetLastError());
+                launch_basis_message_evaluation(cf, d_bnew, nn_len / 2, ep0, ep2, epodd, eu0, eu2, ehnew); CK(cudaGetLastError());
                 F128 iu0, iu2, y;
                 CK(cudaMemcpy(&iu0, eu0, sizeof(F128), cudaMemcpyDeviceToHost));
                 CK(cudaMemcpy(&iu2, eu2, sizeof(F128), cudaMemcpyDeviceToHost));

@@ -1,5 +1,5 @@
 // Composed device-resident SumcheckProver — step 6 milestone of the GPU
-// pcs::open (Ligerito) port (GPU_OPEN_PLAN.md). Validates the full Ligerito
+// pcs::open (Ligerito) port. Validates the full Ligerito
 // sumcheck state machine (src/pcs/ligerito.rs::SumcheckProver) run entirely on
 // device — (f, combined_basis) stay in VRAM across the whole run; only the small
 // {u_0,u_2} messages cross to host. Drives a scripted op sequence (fold |
@@ -7,7 +7,7 @@
 // message transcript + final f match bit-for-bit.
 //
 // Composes the validated kernels: sumcheck_msg + sumcheck_fold (step 3) and
-// glue_axpy (step 5). The introduce message is round_msg_lsb(f, b_new) — the
+// combine_basis_polynomials (step 5). The introduce message is round_msg_lsb(f, b_new) — the
 // same {u_0,u_2} the sumcheck_msg kernel computes.
 //
 // Build:  make test_sumcheck_prover
@@ -39,7 +39,7 @@ static bool eq(F128 a, F128 b) { return a.lo == b.lo && a.hi == b.hi; }
 // Run the message kernel over (A,B) of length `len` and return (u_0,u_2).
 static void dev_msg(const F128* A, const F128* B, long long len,
                     F128* p0, F128* p2, F128* du0, F128* du2, F128& u0, F128& u2) {
-    launch_sumcheck_msg(A, B, len / 2, p0, p2, du0, du2);
+    launch_sumcheck_message(A, B, len / 2, p0, p2, du0, du2);
     CK(cudaGetLastError());
     CK(cudaMemcpy(&u0, du0, sizeof(F128), cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(&u2, du2, sizeof(F128), cudaMemcpyDeviceToHost));

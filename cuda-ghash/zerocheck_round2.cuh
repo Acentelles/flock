@@ -4,17 +4,17 @@
 // into a_mlv/b_mlv (F128, length 2^(m-6)):
 //   a_mlv[row] = Σ_{j=0..8} foldtable[j*256 + a_packed[row*8 + j]]   (UniSkipFoldTable)
 // The first multilinear message is then the eq-weighted deg-2 message over
-// (a_mlv, b_mlv) — reuse zerocheck_tail.cuh::launch_zt_msg.
+// (a_mlv, b_mlv) — reuse zerocheck_tail.cuh::launch_zerocheck_tail_message.
 #pragma once
 #include "f128.cuh"
-#include "zerocheck_tail.cuh"   // zt_split_eq / zt_msg_combine (fused fold+message)
+#include "zerocheck_tail.cuh"   // evaluate_zerocheck_split_equality / combine_zerocheck_tail_message (fused fold+message)
 
 #ifndef ZR2_TPB
 #define ZR2_TPB 256
 #endif
 
 // One thread per output row: 8 byte-lookups into the 8×256 F128 fold table.
-__global__ void zc_round2_fold(const uint8_t* __restrict__ a_packed,
+__global__ void zerocheck_second_round_fold(const uint8_t* __restrict__ a_packed,
                                const uint8_t* __restrict__ b_packed,
                                const F128* __restrict__ foldtable, long long n_out,
                                F128* __restrict__ a_mlv, F128* __restrict__ b_mlv) {
@@ -32,10 +32,10 @@ __global__ void zc_round2_fold(const uint8_t* __restrict__ a_packed,
     b_mlv[row] = bv;
 }
 
-inline void launch_zc_round2_fold(const uint8_t* d_a, const uint8_t* d_b, const F128* d_foldtable,
+inline void launch_zerocheck_second_round_fold(const uint8_t* d_a, const uint8_t* d_b, const F128* d_foldtable,
                                   long long n_out, F128* d_a_mlv, F128* d_b_mlv) {
     long long blocks = (n_out + ZR2_TPB - 1) / ZR2_TPB;
-    zc_round2_fold<<<(unsigned)blocks, ZR2_TPB>>>(d_a, d_b, d_foldtable, n_out, d_a_mlv, d_b_mlv);
+    zerocheck_second_round_fold<<<(unsigned)blocks, ZR2_TPB>>>(d_a, d_b, d_foldtable, n_out, d_a_mlv, d_b_mlv);
 }
 
 // FUSED fold-at-z + the first TWO multilinear messages, in one pass over the
@@ -51,7 +51,7 @@ inline void launch_zc_round2_fold(const uint8_t* d_a, const uint8_t* d_b, const 
 // Message #0 has eq shift 0 and scale ONE, so pairs 2z and 2z+1 index the
 // split-eq table directly; message #1 has shift 1 and scale S_1, and its pair z
 // lands on the same entry as pair 2z. eqlo/eqhi must be built before this launch.
-__global__ void zc_round2_fold_msg2(const uint8_t* __restrict__ a_packed,
+__global__ void zerocheck_second_round_fold_with_lookahead(const uint8_t* __restrict__ a_packed,
                                     const uint8_t* __restrict__ b_packed,
                                     const F128* __restrict__ foldtable,
                                     const F128* __restrict__ eqlo, const F128* __restrict__ eqhi,
@@ -82,8 +82,8 @@ __global__ void zc_round2_fold_msg2(const uint8_t* __restrict__ a_packed,
             a_mlv[o + t4] = av; b_mlv[o + t4] = bv;
         }
         zt_accum_quad(acc, w, x,
-                      zt_split_eq(eqlo, eqhi, z << 1, lobits),
-                      zt_split_eq(eqlo, eqhi, (z << 1) + 1, lobits));
+                      evaluate_zerocheck_split_equality(eqlo, eqhi, z << 1, lobits),
+                      evaluate_zerocheck_split_equality(eqlo, eqhi, (z << 1) + 1, lobits));
     }
     zt_reduce8(acc, sh, part, F128{1, 0});
 }
@@ -97,9 +97,9 @@ __global__ void zc_round2_fold_msg2(const uint8_t* __restrict__ a_packed,
 //
 // Blocks own contiguous chunks here rather than grid-striding, which is what
 // makes the single-eqhi property hold. Quad z reads eq indices 2z and 2z+1, so
-// the block spans 2*chunk eq indices — that is zt_hib_plan with shift 1. (2z is
+// the block spans 2*chunk eq indices — that is plan_zerocheck_high_bits with shift 1. (2z is
 // even and a segment boundary is odd, so 2z and 2z+1 never straddle one.)
-__global__ void zc_round2_fold_msg2_hib(const uint8_t* __restrict__ a_packed,
+__global__ void zerocheck_second_round_fold_with_lookahead_high_bits(const uint8_t* __restrict__ a_packed,
                                         const uint8_t* __restrict__ b_packed,
                                         const F128* __restrict__ foldtable,
                                         const F128* __restrict__ eqlo, const F128* __restrict__ eqhi,
@@ -141,18 +141,18 @@ __global__ void zc_round2_fold_msg2_hib(const uint8_t* __restrict__ a_packed,
 
 // n_out = number of a_mlv/b_mlv rows produced (2^(m-6), a multiple of 4).
 // d_out receives the 8 lookahead slots; d_part needs 8 * ZT_MAX_BLOCKS entries.
-inline void launch_zc_round2_fold_msg2(const uint8_t* d_a, const uint8_t* d_b, const F128* d_foldtable,
+inline void launch_zerocheck_second_round_fold_with_lookahead(const uint8_t* d_a, const uint8_t* d_b, const F128* d_foldtable,
                                        const F128* d_eqlo, const F128* d_eqhi, int lobits,
                                        long long n_out, F128* d_a_mlv, F128* d_b_mlv,
                                        F128 scale_1, F128* d_part, F128* d_out) {
     long long out_quads = n_out / 4;
     int blocks = zt_blocks(out_quads);
     long long chunk;
-    if (zt_hib_plan(out_quads, 1, lobits, blocks, chunk))
-        zc_round2_fold_msg2_hib<<<blocks, ZT_TPB>>>(d_a, d_b, d_foldtable, d_eqlo, d_eqhi, lobits,
+    if (plan_zerocheck_high_bits(out_quads, 1, lobits, blocks, chunk))
+        zerocheck_second_round_fold_with_lookahead_high_bits<<<blocks, ZT_TPB>>>(d_a, d_b, d_foldtable, d_eqlo, d_eqhi, lobits,
                                                     out_quads, chunk, d_a_mlv, d_b_mlv, d_part);
     else
-        zc_round2_fold_msg2<<<blocks, ZT_TPB>>>(d_a, d_b, d_foldtable, d_eqlo, d_eqhi, lobits,
+        zerocheck_second_round_fold_with_lookahead<<<blocks, ZT_TPB>>>(d_a, d_b, d_foldtable, d_eqlo, d_eqhi, lobits,
                                                 out_quads, d_a_mlv, d_b_mlv, d_part);
-    zt_msg2_combine<<<8, ZT_TPB>>>(d_part, blocks, F128{1, 0}, scale_1, d_out);
+    combine_zerocheck_tail_lookahead_message<<<8, ZT_TPB>>>(d_part, blocks, F128{1, 0}, scale_1, d_out);
 }

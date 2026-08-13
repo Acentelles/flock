@@ -3,7 +3,7 @@
 //! (`cuda-ghash/test_induce.cu`) is validated bit-for-bit against the code the
 //! recursive prover runs.
 //!
-//! Step 4 of the Ligerito re-aim (`cuda-ghash/GPU_OPEN_PLAN.md`): the induced
+//! The induced
 //! basis builder. Given the opened query rows, it produces a length-`2^log_n`
 //! basis poly (novel-basis tensor per query, α-weighted and summed) plus the
 //! `enforced_sum` scalar. We feed it real `sks_vks = eval_sk_at_vks(log_n)` and

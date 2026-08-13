@@ -3,7 +3,7 @@
 //! (`cuda-ghash/test_introduce_glue.cu`) is validated against the code the
 //! recursive prover runs.
 //!
-//! Step 5 of the Ligerito re-aim (`cuda-ghash/GPU_OPEN_PLAN.md`): when a level's
+//! During a Ligerito open, when a level's
 //! induced basis (step 4) enters the running sumcheck, the prover calls
 //!   introduce_new_with_eval(b_new) -> (msg{u_0,u_2}, h_new = Σ_x f·b_new)
 //! (via `round_msg_and_eval_lsb`), then `glue(β)`:

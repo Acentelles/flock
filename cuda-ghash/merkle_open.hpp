@@ -1,6 +1,6 @@
 // Host-side Merkle query opening — port of src/merkle.rs::merkle_multi_proof
 // (+ the opened-rows gather), step 6 of the GPU pcs::open / Ligerito port
-// (GPU_OPEN_PLAN.md). This is host proof-assembly, NOT a GPU compute kernel: it
+// for the GPU Ligerito open. This is host proof assembly. It
 // reads sibling hashes from the resident Merkle tree (built by the commit-port
 // kernel) for the challenger-sampled query positions.
 //
@@ -54,12 +54,4 @@ inline std::vector<MHash> merkle_multi_proof_host(const MHash* tree, size_t num_
     std::vector<MHash> proof(idxs.size());
     for (size_t i = 0; i < idxs.size(); i++) proof[i] = tree[idxs[i]];
     return proof;
-}
-
-// Sorted-unique positions (the opened_rows / multi-proof alignment).
-inline std::vector<size_t> sorted_unique(const std::vector<size_t>& positions) {
-    std::vector<size_t> v(positions.begin(), positions.end());
-    std::sort(v.begin(), v.end());
-    v.erase(std::unique(v.begin(), v.end()), v.end());
-    return v;
 }

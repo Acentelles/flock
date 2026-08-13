@@ -3,7 +3,7 @@
 //! (`cuda-ghash/challenger.hpp` / `test_challenger.cpp`) is validated
 //! byte-for-byte against the code the prover's transcript uses.
 //!
-//! Step 6 of the Ligerito re-aim (`cuda-ghash/GPU_OPEN_PLAN.md`): the host-side
+//! The host-side Ligerito challenger uses the generated vectors to check
 //! challenger is what derives every challenge/β/query/grinding nonce in the
 //! recursive ladder. We run a representative op sequence (observe / sample /
 //! slice / vec / grind / label) on the real challenger and dump the ops + the

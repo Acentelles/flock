@@ -7,7 +7,7 @@
 #include <cstdlib>
 #include <vector>
 #include "zerocheck_round2.cuh"
-#include "zerocheck_tail.cuh"   // launch_zt_msg (eq-weighted message)
+#include "zerocheck_tail.cuh"   // launch_zerocheck_tail_message (eq-weighted message)
 #include "ntt_host.hpp"
 
 #define CK(x) do { cudaError_t e=(x); if(e){ printf("CUDA error %s @%d\n", cudaGetErrorString(e), __LINE__); exit(1);} } while(0)
@@ -59,7 +59,7 @@ int main(int argc, char** argv){
     CK(cudaMemcpy(d_ft,foldtable.data(),foldtable.size()*sizeof(F128),cudaMemcpyHostToDevice));
 
     // ---- fold-at-z ----
-    launch_zc_round2_fold(d_a, d_b, d_ft, n_out, d_am, d_bm);
+    launch_zerocheck_second_round_fold(d_a, d_b, d_ft, n_out, d_am, d_bm);
     CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
     std::vector<F128> amlv(n_out), bmlv(n_out);
     CK(cudaMemcpy(amlv.data(),d_am,n_out*sizeof(F128),cudaMemcpyDeviceToHost));
@@ -76,7 +76,7 @@ int main(int argc, char** argv){
     long long half = n_out/2;
     if((long long)eq.size()!=half){ printf("eq size %zu != %lld\n", eq.size(), half); return 1; }
     CK(cudaMemcpy(d_eq,eq.data(),half*sizeof(F128),cudaMemcpyHostToDevice));
-    launch_zt_msg(d_am, d_bm, d_eq, half, d_p1, d_pinf, d_m1, d_minf);
+    launch_zerocheck_tail_message(d_am, d_bm, d_eq, half, d_p1, d_pinf, d_m1, d_minf);
     CK(cudaGetLastError());
     F128 m1, minf; CK(cudaMemcpy(&m1,d_m1,sizeof(F128),cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(&minf,d_minf,sizeof(F128),cudaMemcpyDeviceToHost));

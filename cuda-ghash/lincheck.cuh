@@ -123,7 +123,7 @@ inline std::vector<F128> build_quirky_eq_table_host(F128 z_skip,
 // 256 entries and they need a field inversion.
 __constant__ F128 g_qeq_lambda[256];
 __constant__ F128 g_qeq_chal[64];
-__global__ void quirky_eq_build_k(int k_skip, int d_rest, long long n, F128* __restrict__ out) {
+__global__ void build_quirky_equality_table(int k_skip, int d_rest, long long n, F128* __restrict__ out) {
     long long x = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (x >= n) return;
     long long i_rest = x >> k_skip;
@@ -142,7 +142,7 @@ inline void build_quirky_eq_device(F128* d_out, F128 z_skip,
     if (!x_inner_rest.empty())
         cudaMemcpyToSymbol(g_qeq_chal, x_inner_rest.data(), x_inner_rest.size() * sizeof(F128));
     long long n = (long long)lambda.size() << x_inner_rest.size();
-    quirky_eq_build_k<<<(unsigned)((n + tpb - 1) / tpb), tpb>>>(k_skip, (int)x_inner_rest.size(), n, d_out);
+    build_quirky_equality_table<<<(unsigned)((n + tpb - 1) / tpb), tpb>>>(k_skip, (int)x_inner_rest.size(), n, d_out);
 }
 
 // inner_product over equal-length F128 slices (for the final w on the host).
@@ -166,7 +166,7 @@ inline F128 inner_product_host(const std::vector<F128>& a, const std::vector<F12
 // Striding the lanes across ONE column's nonzeros fixes all three: reads
 // coalesce, every lane in a warp does equal work, and the grid becomes 2048
 // blocks. XOR-sum is order-independent, so the shuffle reduction is bit-identical.
-__global__ void lincheck_csc_fold(const F128* __restrict__ eq_inner,
+__global__ void linear_check_compressed_column_fold(const F128* __restrict__ eq_inner,
                                   const uint32_t* __restrict__ a_col_ptr,
                                   const uint32_t* __restrict__ a_rows,
                                   const uint32_t* __restrict__ b_col_ptr,
@@ -191,13 +191,13 @@ __global__ void lincheck_csc_fold(const F128* __restrict__ eq_inner,
     if (lane == 0) comb[c] = f128_add(ghash_mul_karatsuba(alpha, sa), sb);
 }
 
-inline void launch_lincheck_csc_fold(const F128* d_eq_inner,
+inline void launch_linear_check_compressed_column_fold(const F128* d_eq_inner,
                                      const uint32_t* d_a_col_ptr, const uint32_t* d_a_rows,
                                      const uint32_t* d_b_col_ptr, const uint32_t* d_b_rows,
                                      F128 alpha, int n_cols, F128* d_comb) {
     long long threads = (long long)n_cols * 32;            // one warp per column
     int blocks = (int)((threads + LC_TPB - 1) / LC_TPB);
-    lincheck_csc_fold<<<blocks, LC_TPB>>>(d_eq_inner, d_a_col_ptr, d_a_rows,
+    linear_check_compressed_column_fold<<<blocks, LC_TPB>>>(d_eq_inner, d_a_col_ptr, d_a_rows,
                                           d_b_col_ptr, d_b_rows, alpha, n_cols, d_comb);
 }
 
@@ -232,7 +232,7 @@ inline void launch_lincheck_csc_fold(const F128* d_eq_inner,
 #define LC_PF_BK (LC_PF_THREADS * LC_PF_ACC)   // i_inner per block = 2048
 
 __global__ void __launch_bounds__(LC_PF_THREADS)
-lincheck_partial_fold_shared(const uint8_t* __restrict__ z_packed,
+linear_check_partial_fold_shared(const uint8_t* __restrict__ z_packed,
                              const F128* __restrict__ eq_outer,
                              long long n_stripes, int k, int useful_bits,
                              F128* __restrict__ z_vec) {
@@ -289,7 +289,7 @@ lincheck_partial_fold_shared(const uint8_t* __restrict__ z_packed,
 
 // d_eq_outer holds 2^n_log = 8*n_stripes. z_vec is the accumulator, so it is
 // zeroed first — which also supplies the zeros for i_inner in [useful_bits, k).
-inline void launch_lincheck_partial_fold(const uint8_t* d_z_packed, const F128* d_eq_outer,
+inline void launch_linear_check_partial_fold(const uint8_t* d_z_packed, const F128* d_eq_outer,
                                          long long n_stripes, int k, int useful_bits,
                                          F128* d_z_vec) {
     int x_tiles = (k + LC_PF_BK - 1) / LC_PF_BK;     // i_inner tiles per stripe-group
@@ -307,7 +307,7 @@ inline void launch_lincheck_partial_fold(const uint8_t* d_z_packed, const F128* 
 
     CK_LC(cudaMemsetAsync(d_z_vec, 0, (size_t)k * sizeof(F128)));
     dim3 grid((unsigned)x_tiles, (unsigned)G);
-    lincheck_partial_fold_shared<<<grid, LC_PF_THREADS>>>(d_z_packed, d_eq_outer, n_stripes,
+    linear_check_partial_fold_shared<<<grid, LC_PF_THREADS>>>(d_z_packed, d_eq_outer, n_stripes,
                                                           k, useful_bits, d_z_vec);
 }
 
@@ -317,7 +317,7 @@ inline void launch_lincheck_partial_fold(const uint8_t* d_z_packed, const F128* 
 //            einf = Σ_{i<half} (C[i+half]+C[i])·(Z[i+half]+Z[i])  (= q(∞))
 //   fold:    V'[i] = V[i] + r·(V[i+half]+V[i])     (applied to both C and Z)
 // ---------------------------------------------------------------------------
-__global__ void lincheck_msg_partial(const F128* __restrict__ C, const F128* __restrict__ Z,
+__global__ void linear_check_message_partial(const F128* __restrict__ C, const F128* __restrict__ Z,
                                      long long half, F128* p1, F128* pinf) {
     __shared__ F128 s1[LC_TPB];
     __shared__ F128 sinf[LC_TPB];
@@ -341,7 +341,7 @@ __global__ void lincheck_msg_partial(const F128* __restrict__ C, const F128* __r
 }
 
 // One 256-thread block (was a single-thread loop, ~200 us at 2048 blocks; bit-identical).
-__global__ void lincheck_msg_combine(const F128* p1, const F128* pinf, int blocks,
+__global__ void combine_linear_check_message(const F128* p1, const F128* pinf, int blocks,
                                      F128* e1_out, F128* einf_out) {
     __shared__ F128 s1[LC_TPB];
     __shared__ F128 sinf[LC_TPB];
@@ -358,7 +358,7 @@ __global__ void lincheck_msg_combine(const F128* p1, const F128* pinf, int block
 }
 
 // Fold one table at r over the top-bit split: Vo[i] = V[i] + r·(V[i+half]+V[i]).
-__global__ void lincheck_fold_top(const F128* __restrict__ V, F128* __restrict__ Vo,
+__global__ void linear_check_fold(const F128* __restrict__ V, F128* __restrict__ Vo,
                                   long long half, F128 r) {
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= half) return;
@@ -368,7 +368,7 @@ __global__ void lincheck_fold_top(const F128* __restrict__ V, F128* __restrict__
 
 // Fold BOTH tables (comb_vec, z_vec) at r in one launch — they fold in lockstep
 // at the same r, so a single kernel halves the per-round fold launch overhead.
-__global__ void lincheck_fold_top2(const F128* __restrict__ C, const F128* __restrict__ Z,
+__global__ void linear_check_fold_pair(const F128* __restrict__ C, const F128* __restrict__ Z,
                                    F128* __restrict__ Co, F128* __restrict__ Zo,
                                    long long half, F128 r) {
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -388,21 +388,21 @@ inline int lincheck_blocks(long long half) {
 
 // One round's message over (dC, dZ): leaves (e1, einf) on device. d_p1/d_pinf
 // are scratch of length >= LC_MAX_BLOCKS.
-inline void launch_lincheck_msg(const F128* dC, const F128* dZ, long long half,
+inline void launch_linear_check_message(const F128* dC, const F128* dZ, long long half,
                                 F128* d_p1, F128* d_pinf, F128* d_e1, F128* d_einf) {
     int blocks = lincheck_blocks(half);
-    lincheck_msg_partial<<<blocks, LC_TPB>>>(dC, dZ, half, d_p1, d_pinf);
-    lincheck_msg_combine<<<1, LC_TPB>>>(d_p1, d_pinf, blocks, d_e1, d_einf);
+    linear_check_message_partial<<<blocks, LC_TPB>>>(dC, dZ, half, d_p1, d_pinf);
+    combine_linear_check_message<<<1, LC_TPB>>>(d_p1, d_pinf, blocks, d_e1, d_einf);
 }
 
-inline void launch_lincheck_fold(const F128* dV, F128* dVo, long long half, F128 r) {
+inline void launch_linear_check_fold(const F128* dV, F128* dVo, long long half, F128 r) {
     long long blocks = (half + LC_TPB - 1) / LC_TPB; if (blocks < 1) blocks = 1;
-    lincheck_fold_top<<<(unsigned)blocks, LC_TPB>>>(dV, dVo, half, r);
+    linear_check_fold<<<(unsigned)blocks, LC_TPB>>>(dV, dVo, half, r);
 }
 
 // Fold comb_vec and z_vec together at r (one launch).
-inline void launch_lincheck_fold2(const F128* dC, const F128* dZ, F128* dCo, F128* dZo,
+inline void launch_linear_check_fold_pair(const F128* dC, const F128* dZ, F128* dCo, F128* dZo,
                                   long long half, F128 r) {
     long long blocks = (half + LC_TPB - 1) / LC_TPB; if (blocks < 1) blocks = 1;
-    lincheck_fold_top2<<<(unsigned)blocks, LC_TPB>>>(dC, dZ, dCo, dZo, half, r);
+    linear_check_fold_pair<<<(unsigned)blocks, LC_TPB>>>(dC, dZ, dCo, dZo, half, r);
 }

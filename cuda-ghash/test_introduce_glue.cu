@@ -1,5 +1,5 @@
 // Bit-for-bit validation of the CUDA introduce_new + glue (step 5 of the GPU
-// pcs::open / Ligerito port, GPU_OPEN_PLAN.md) against the flock CPU oracle
+// pcs::open / Ligerito port against the flock CPU oracle
 // dumped by `src/bin/dump_introduce_glue_vectors.rs` (INGL format) — message +
 // h_new sourced from the real `SumcheckProver::introduce_new_with_eval`.
 //
@@ -72,7 +72,7 @@ int main(int argc, char** argv) {
     CK(cudaMemcpy(dCB, b1.data(), (size_t)len * sizeof(F128), cudaMemcpyHostToDevice)); // cb starts as b1
 
     // --- introduce: message + h_new over (f, b_new)
-    launch_msg_eval(dF, dB, (long long)len / 2, d_p0, d_p2, d_podd, d_u0, d_u2, d_hnew);
+    launch_basis_message_evaluation(dF, dB, (long long)len / 2, d_p0, d_p2, d_podd, d_u0, d_u2, d_hnew);
     CK(cudaGetLastError());
     F128 u0, u2, hnew;
     CK(cudaMemcpy(&u0, d_u0, sizeof(F128), cudaMemcpyDeviceToHost));

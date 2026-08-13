@@ -4,9 +4,8 @@
 //! The CUDA prover (cuda-ghash/prove_ffi.cu) returns a flat little-endian
 //! stream; `parse_and_verify` mirrors its FfiWriter layout exactly, rebuilds
 //! the typed `R1csProofLigerito`, and runs the ordinary Rust verifier.
-//! One roundtrip per proof size: m = 14 + n_blocks_log, gated on a ligerito
-//! config existing for that m. `FLOCK_GPU_M=<m> cargo test ... gpu_roundtrip_env`
-//! proves any other size.
+//! One roundtrip per proof size: m = 14 + n_blocks_log, gated on a Ligerito
+//! config existing for that m.
 #![cfg(feature = "gpu")]
 
 use flock_prover::challenger::FsChallenger;
@@ -350,16 +349,16 @@ fn gpu_prove(n_blocks_log: usize, dump_z: Option<&str>) -> GpuArtifacts {
 
 /// Full roundtrip: GPU prove, Rust verify; with `tamper`, also check that two
 /// corrupted variants are rejected.
-fn roundtrip(n_blocks_log: usize, tamper: bool) {
+fn roundtrip<const N_BLOCKS_LOG: usize, const TAMPER: bool>() {
     let _test_guard = GPU_TEST_LOCK.lock().expect("GPU test lock poisoned");
-    let warmup_secs = gpu_prove(n_blocks_log, None).prove_secs;
+    let warmup_secs = gpu_prove(N_BLOCKS_LOG, None).prove_secs;
     let GpuArtifacts {
         r1cs,
         pcs_params,
         proof,
         commitment,
         prove_secs,
-    } = gpu_prove(n_blocks_log, None);
+    } = gpu_prove(N_BLOCKS_LOG, None);
     let m = r1cs.m;
     let lc_circuit =
         lincheck::SparseMatrixCircuit::new(&r1cs.a_0, &r1cs.b_0).with_const_pin(r1cs.const_pin);
@@ -383,7 +382,7 @@ fn roundtrip(n_blocks_log: usize, tamper: bool) {
         claim.ab.value.lo
     );
 
-    if tamper {
+    if TAMPER {
         // Flip one bit of the final-level clear polynomial -> reject.
         let mut bad = proof.clone();
         bad.pcs_open.ligerito.final_proof.yr[0].lo ^= 1;
@@ -422,44 +421,48 @@ fn roundtrip(n_blocks_log: usize, tamper: bool) {
 #[test]
 #[ignore] // needs an sm_120 GPU; run explicitly with --ignored
 fn gpu_roundtrip_m22() {
-    roundtrip(8, true);
+    roundtrip::<8, true>();
 }
 
 #[test]
 #[ignore] // needs an sm_120 GPU; run explicitly with --ignored
 fn gpu_roundtrip_m32() {
-    roundtrip(18, false);
+    roundtrip::<18, false>();
 }
 
 #[test]
 #[ignore] // needs an sm_120 GPU; run explicitly with --ignored
 fn gpu_roundtrip_m33() {
-    roundtrip(19, false);
+    roundtrip::<19, false>();
 }
 
-/// Arbitrary size: `FLOCK_GPU_M=30 cargo test -p flock-cuda-ffi --release \
-///   --features gpu -- --ignored gpu_roundtrip_env --nocapture`
 #[test]
 #[ignore] // needs an sm_120 GPU; run explicitly with --ignored
-fn gpu_roundtrip_env() {
-    let Ok(mv) = std::env::var("FLOCK_GPU_M") else {
-        println!("FLOCK_GPU_M not set; skipping");
-        return;
-    };
-    let m: usize = mv.parse().expect("FLOCK_GPU_M must be an integer m");
-    assert!(m >= 17, "need m >= 17 (n_blocks_log >= 3)");
-    roundtrip(m - 14, true);
+fn gpu_roundtrip_m34() {
+    roundtrip::<20, false>();
+
+    for _ in 0..5 {
+        roundtrip::<20, false>();
+    }
 }
 
 /// Debug harness: prove the SAME witness on the GPU and in Rust, then report
-/// the first divergent proof field. Size from `FLOCK_GPU_M` (default 33).
+/// the first divergent proof field.
 #[test]
 #[ignore] // needs an sm_120 GPU; run explicitly with --ignored
-fn gpu_debug_diff() {
-    let m: usize = std::env::var("FLOCK_GPU_M")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(33);
+fn gpu_debug_diff_m33() {
+    gpu_debug_diff::<33>();
+}
+
+#[test]
+#[ignore] // needs an sm_120 GPU; run explicitly with --ignored
+fn gpu_debug_diff_m34() {
+    gpu_debug_diff::<34>();
+}
+
+fn gpu_debug_diff<const M: usize>() {
+    const { assert!(M >= 17, "need m >= 17 (n_blocks_log >= 3)") };
+    let m = M;
     let zpath = format!("/tmp/ffi_z_m{m}.bin");
     let art = gpu_prove(m - 14, Some(&zpath));
     let zb = std::fs::read(&zpath).expect("witness dump missing");

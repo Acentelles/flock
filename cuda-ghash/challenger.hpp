@@ -1,5 +1,5 @@
 // Host-side Fiat-Shamir challenger — CUDA port of src/challenger.rs::FsChallenger
-// (step 6 of the GPU pcs::open / Ligerito port, GPU_OPEN_PLAN.md). Pure host C++
+// for the GPU pcs::open / Ligerito port. Pure host C++
 // (no CUDA), since the transcript is inherently sequential; the GPU drives heavy
 // compute between the host-derived challenges.
 //

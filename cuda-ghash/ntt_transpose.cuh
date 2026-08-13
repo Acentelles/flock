@@ -14,7 +14,7 @@
 #include "ntt_host.hpp"
 
 // One transposed-NTT layer. One thread per butterfly (2^(log_d-1) total).
-__global__ void transpose_ntt_layer(F128* __restrict__ data, const F128* __restrict__ tw_basis,
+__global__ void transposed_ntt_layer(F128* __restrict__ data, const F128* __restrict__ tw_basis,
                                     int layer, int log_d) {
     long long bsh = 1LL << (log_d - layer - 1);
     long long half_total = 1LL << (log_d - 1);
@@ -37,18 +37,18 @@ inline void launch_transpose_ntt(F128* d_data, const F128* d_tw, const TwiddleTa
     long long half = 1LL << (log_d - 1);
     long long blocks = (half + tpb - 1) / tpb;
     for (int layer = log_d - 1; layer >= 0; layer--)
-        transpose_ntt_layer<<<(unsigned)blocks, tpb>>>(d_data, d_tw + tt.off[layer], layer, log_d);
+        transposed_ntt_layer<<<(unsigned)blocks, tpb>>>(d_data, d_tw + tt.off[layer], layer, log_d);
 }
 
 // Scatter sparse weights into a zeroed domain: data[queries[i]] = w[i].
 // queries are distinct (sample_distinct_queries), so no collisions.
-__global__ void scatter_weights(F128* __restrict__ data, const unsigned long long* __restrict__ queries,
+__global__ void scatter_query_weights(F128* __restrict__ data, const unsigned long long* __restrict__ queries,
                                 const F128* __restrict__ w, int n_queries) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_queries) return;
     data[queries[i]] = w[i];
 }
-__global__ void zero_f128(F128* d, long long n) {
+__global__ void clear_field_elements(F128* d, long long n) {
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) d[i] = F128{0ull, 0ull};
 }

@@ -3,20 +3,8 @@ ARCH      ?= sm_120
 NVCCFLAGS  = -O3 -gencode arch=compute_120,code=$(ARCH) -lineinfo -std=c++17
 VECTORS    = vectors.bin
 
-.PHONY: all test bench bench_ext4 sass vectors clean
-all: test_f128 bench_f128 bench_ext4
-
-# KoalaBear/BabyBear degree-4 extension (SP1 bb31 port) for comparison.
-bench_ext4: bench_ext4.cu monty31.cuh
-	$(NVCC) $(NVCCFLAGS) bench_ext4.cu -o $@
-
-# SP1's actual current KoalaBear kb31 extension (vendored under sp1/, needs c++20).
-bench_kb31: bench_kb31.cu sp1/fields/kb31_extension_t.cuh
-	$(NVCC) -O3 -gencode arch=compute_120,code=sm_120 -std=c++20 -Isp1 bench_kb31.cu -o $@
-
-# Real-world sumcheck inner product: GHASH vs KoalaBear, compute-only vs memory-fed.
-bench_sumcheck: bench_sumcheck.cu f128.cuh sp1/fields/kb31_extension_t.cuh
-	$(NVCC) -O3 -gencode arch=compute_120,code=sm_120 -std=c++20 -Isp1 bench_sumcheck.cu -o $@
+.PHONY: all test bench sass vectors clean
+all: test_f128 bench_f128
 
 test_f128: test_f128.cu f128.cuh
 	$(NVCC) $(NVCCFLAGS) test_f128.cu -o $@
@@ -72,15 +60,6 @@ test_blake3_witness: test_blake3_witness.cu blake3_witness.cuh
 bench_blake3_witness: bench_blake3_witness.cu blake3_witness.cuh
 	$(NVCC) $(NVCCFLAGS) bench_blake3_witness.cu -o $@
 
-# Zerocheck round-1 (univariate-skip URM message) — round1_ab/round1_c
-# bit-for-bit vs the real optimized prove_packed round-1.
-test_zerocheck_round1: test_zerocheck_round1.cu zerocheck_round1.cuh phi8_table.cuh ntt_host.hpp f128.cuh
-	$(NVCC) $(NVCCFLAGS) test_zerocheck_round1.cu -o $@
-
-# Throughput for the zerocheck round-1 kernel (random inputs, no oracle).
-bench_zerocheck_round1: bench_zerocheck_round1.cu zerocheck_round1.cuh phi8_table.cuh f128.cuh
-	$(NVCC) $(NVCCFLAGS) bench_zerocheck_round1.cu -o $@
-
 # CPU-structured round-1 (shift-reduce + convert-table). Host ref + GPU oracle + bench.
 test_zc_round1_cpustyle: test_zc_round1_cpustyle.cu phi8_table.cuh ntt_host.hpp f128.cuh
 	$(NVCC) $(NVCCFLAGS) test_zc_round1_cpustyle.cu -o $@
@@ -88,6 +67,11 @@ test_zc_challenger: test_zc_challenger.cu zc_challenger_device.cuh challenger.hp
 	$(NVCC) $(NVCCFLAGS) test_zc_challenger.cu -o $@
 test_zc_cpustyle_gpu: test_zc_cpustyle_gpu.cu zerocheck_round1_cpustyle.cuh zerocheck_round1.cuh phi8_table.cuh ntt_host.hpp f128.cuh
 	$(NVCC) $(NVCCFLAGS) test_zc_cpustyle_gpu.cu -o $@
+ZC_CPUSTYLE_ARGS ?= 15
+zc_cpustyle_vectors:
+	cd .. && cargo run --release --quiet --bin dump_zerocheck_round1_vectors -- cuda-ghash/zc_cpustyle_vectors.bin $(ZC_CPUSTYLE_ARGS)
+zc_cpustyle: test_zc_cpustyle_gpu zc_cpustyle_vectors
+	./test_zc_cpustyle_gpu zc_cpustyle_vectors.bin
 bench_zc_cpustyle: bench_zc_cpustyle.cu zerocheck_round1_cpustyle.cuh zerocheck_round1.cuh phi8_table.cuh f128.cuh
 	$(NVCC) $(NVCCFLAGS) bench_zc_cpustyle.cu -o $@
 
@@ -175,16 +159,6 @@ blake3_witness: test_blake3_witness blake3_witness_vectors
 blake3_lincheck_matrices:
 	cd .. && cargo run --release --quiet --bin dump_blake3_lincheck_matrices -- cuda-ghash/blake3_lincheck_matrices.bin
 
-# Regenerate the zerocheck round-1 oracle (ZCR1): a/b/c + r + M + golden round1.
-# Override:  make zerocheck_round1_vectors ZC_ARGS="20 14 8000"  (m k_log useful_bits)
-ZC_ARGS ?= 15
-zerocheck_round1_vectors:
-	cd .. && cargo run --release --quiet --bin dump_zerocheck_round1_vectors -- cuda-ghash/zerocheck_round1_vectors.bin $(ZC_ARGS)
-
-# Build + run the zerocheck round-1 oracle check end-to-end.
-zerocheck_round1: test_zerocheck_round1 zerocheck_round1_vectors
-	./test_zerocheck_round1 zerocheck_round1_vectors.bin
-
 # Regenerate the zerocheck sumcheck-tail oracle (ZTAL). Override:  make ztail_vectors ZTAIL_ARGS="20"
 ZTAIL_ARGS ?= 16
 ztail_vectors:
@@ -252,10 +226,6 @@ sass: bench_f128.cu f128.cuh
 clean:
 	rm -f test_f128 bench_f128 *.cubin $(VECTORS)
 
-# Full multilinear sumcheck (round poly + fold, log N rounds) GHASH vs KoalaBear.
-bench_full_sumcheck: bench_full_sumcheck.cu f128.cuh sp1/fields/kb31_extension_t.cuh
-	$(NVCC) -O3 -gencode arch=compute_120,code=sm_120 -std=c++20 -Isp1 bench_full_sumcheck.cu -o $@
-
 # Composed device-resident SumcheckProver (PCS open / Ligerito, step 6) —
 # full transcript + final f bit-for-bit vs the real SumcheckProver.
 test_sumcheck_prover: test_sumcheck_prover.cu sumcheck_ab.cuh introduce_glue.cuh f128.cuh
@@ -316,7 +286,7 @@ test_transpose_induce: test_transpose_induce.cu ntt_transpose.cuh induce_sumchec
 # Every test binary with a build rule. Compiling needs nvcc but no GPU, so the
 # hosted CI leg uses this to catch header/API bit-rot cheaply. Parallel-safe.
 TEST_BINS = test_f128 test_commit_ntt test_sumcheck_ab test_lincheck \
-            test_blake3_witness test_zerocheck_round1 test_zc_round1_cpustyle \
+            test_blake3_witness test_zc_round1_cpustyle \
             test_zc_challenger test_zc_cpustyle_gpu test_zerocheck_tail \
             test_zerocheck_round2 test_zerocheck_full test_induce \
             test_introduce_glue test_commit_merkle test_sumcheck_prover \
@@ -340,8 +310,8 @@ build-tests: $(TEST_BINS) prove_ffi.o
 # dump_* bin, then replay it on device. Needs a Blackwell GPU (clmad) plus
 # stable Rust. Run serially — sumcheck_ab and sumcheck_ab_ligerito share
 # sumcheck_vectors.bin, so this target must not be invoked with -j.
-run-tests: test commit_ntt sumcheck_ab sumcheck_ab_ligerito lincheck \
-           blake3_witness zerocheck_round1 zerocheck_tail zerocheck_round2 \
+run-tests: test commit_ntt sumcheck_ab sumcheck_ab_ligerito lincheck zc_cpustyle \
+           blake3_witness zerocheck_tail zerocheck_round2 \
            zerocheck_full induce introduce_glue sumcheck_prover challenger \
            merkle_open ligerito_l0 eq_builders zerocheck_lookahead fold_lookahead
 

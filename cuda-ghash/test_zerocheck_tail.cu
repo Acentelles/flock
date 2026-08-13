@@ -60,7 +60,7 @@ int main(int argc, char** argv){
         if((long long)eq.size()!=half){ printf("eq size %zu != %lld\n", eq.size(), half); return 1; }
         CK(cudaMemcpy(dEq, eq.data(), half*sizeof(F128), cudaMemcpyHostToDevice));
 
-        launch_zt_msg(cA, cB, dEq, half, d_p1, d_pinf, d_m1, d_minf);
+        launch_zerocheck_tail_message(cA, cB, dEq, half, d_p1, d_pinf, d_m1, d_minf);
         CK(cudaGetLastError());
         F128 m1, minf; CK(cudaMemcpy(&m1,d_m1,sizeof(F128),cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(&minf,d_minf,sizeof(F128),cudaMemcpyDeviceToHost));

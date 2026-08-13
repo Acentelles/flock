@@ -33,7 +33,7 @@ int main() {
         // device round
         CK(cudaMemcpy(d_m1,&m1,16,cudaMemcpyHostToDevice));
         CK(cudaMemcpy(d_mi,&mi,16,cudaMemcpyHostToDevice));
-        zt_chal_round<<<1,1>>>(d_st,d_m1,d_mi,d_rho,d_rstore,nullptr,nullptr);
+        advance_zerocheck_tail_challenger<<<1,1>>>(d_st,d_m1,d_mi,d_rho,d_rstore,nullptr,nullptr);
         F128 rho_dev; CK(cudaMemcpy(&rho_dev,d_rho,16,cudaMemcpyDeviceToHost));
         // host round
         ch.observe_f128(ChF128{m1.lo,m1.hi}); ch.observe_f128(ChF128{mi.lo,mi.hi});

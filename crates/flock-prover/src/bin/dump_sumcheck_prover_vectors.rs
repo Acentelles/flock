@@ -3,7 +3,7 @@
 //! (`cuda-ghash/test_sumcheck_prover.cu`) is validated end-to-end on one
 //! resident sumcheck: `new` → (`fold` | `introduce_new`+`glue`)* → final.
 //!
-//! Step 6 milestone of the Ligerito re-aim (`cuda-ghash/GPU_OPEN_PLAN.md`): this
+//! This
 //! composes the step-3 (fold+message) and step-5 (glue) kernels into the real
 //! state machine, driven by a scripted op sequence that exercises folds and
 //! α-batched basis introductions at multiple dims (mirroring the recursive

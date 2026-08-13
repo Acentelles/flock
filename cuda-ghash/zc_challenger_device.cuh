@@ -68,7 +68,7 @@ __device__ __forceinline__ F128 zc_sample_f128(ZcSha& s) {
 
 // One tail round on device: observe (m1, mi), sample rho. Updates the persistent state
 // in *st, writes rho to *rho_out (read by the next fold) and *rho_store (kept for host).
-__global__ void zt_chal_round(ZcSha* st, const F128* m1, const F128* mi,
+__global__ void advance_zerocheck_tail_challenger(ZcSha* st, const F128* m1, const F128* mi,
                               F128* rho_out, F128* rho_store, F128* m1log, F128* milog) {
     if (threadIdx.x || blockIdx.x) return;
     ZcSha s = *st;
@@ -86,7 +86,7 @@ __global__ void zt_chal_round(ZcSha* st, const F128* m1, const F128* mi,
 // message + on-device challenger) with __syncthreads() between rounds. The
 // small rounds are pure overhead when host-driven: each pays ~27 us of kernel
 // launches + two 16-byte D2H copies + host SHA for near-zero GPU work. The
-// fully-resident per-round kernel sequence (zt_chal_round above) was ~0.1 ms
+// fully-resident per-round kernel sequence (advance_zerocheck_tail_challenger above) was ~0.1 ms
 // slower than the host loop because single-thread GPU SHA also taxes the BIG
 // rounds; the finisher is the hybrid — host challenger while rounds are
 // bandwidth-bound, one fused kernel once op <= ZT_FINISH_OP.
@@ -96,7 +96,7 @@ __global__ void zt_chal_round(ZcSha* st, const F128* m1, const F128* mi,
 //   eq = scales[i] * eqlo[(x<<(shift0+i)) & lomask] * eqhi[..>>lobits],
 //   thread 0 observes (m1,minf) and samples the next rho (bit-identical
 //   challenger). Logs m1/minf/rho per round; state written back at the end.
-#include "zerocheck_tail.cuh"   // zt_split_eq (split-eq lookup)
+#include "zerocheck_tail.cuh"   // evaluate_zerocheck_split_equality (split-eq lookup)
 
 #ifndef ZT_FINISH_OP
 #define ZT_FINISH_OP (1LL << 10)   // hand off to the finisher once op <= this (swept: 2^9-2^10 optimal, TPB immaterial)
@@ -105,7 +105,7 @@ __global__ void zt_chal_round(ZcSha* st, const F128* m1, const F128* mi,
 #define ZT_FIN_TPB 256
 #endif
 
-__global__ void __launch_bounds__(ZT_FIN_TPB) zt_tail_finisher(F128* A, F128* B, F128* An, F128* Bn,
+__global__ void __launch_bounds__(ZT_FIN_TPB) finish_zerocheck_tail(F128* A, F128* B, F128* An, F128* Bn,
                                  const F128* __restrict__ eqlo, const F128* __restrict__ eqhi,
                                  int lobits, int shift0, const F128* __restrict__ scales,
                                  F128 rho0, int rounds, long long len0,
@@ -133,7 +133,7 @@ __global__ void __launch_bounds__(ZT_FIN_TPB) zt_tail_finisher(F128* A, F128* B,
             F128 bf0 = f128_add(b0, ghash_mul_karatsuba(rho, f128_add(b0, b1)));
             F128 bf1 = f128_add(b2, ghash_mul_karatsuba(rho, f128_add(b2, b3)));
             nA[2 * x] = af0; nA[2 * x + 1] = af1; nB[2 * x] = bf0; nB[2 * x + 1] = bf1;
-            F128 e = zt_split_eq(eqlo, eqhi, x << shift, lobits);
+            F128 e = evaluate_zerocheck_split_equality(eqlo, eqhi, x << shift, lobits);
             f256_xor(g1a, mul_unreduced_karatsuba(e, ghash_mul_karatsuba(af1, bf1)));
             f256_xor(gia, mul_unreduced_karatsuba(e, ghash_mul_karatsuba(
                               f128_add(af0, af1), f128_add(bf0, bf1))));

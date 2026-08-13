@@ -25,7 +25,7 @@
     exit(1);} } while(0)
 
 // Deterministic on-device fill (any bit pattern is a valid F128).
-__global__ void fill_kernel(F128* d, long long n) {
+__global__ void fill_benchmark_input(F128* d, long long n) {
     long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
     if (i >= n) return;
     u64 x = (u64)i * 0x9E3779B97F4A7C15ull + 1;
@@ -49,10 +49,9 @@ static void run_one(int m, int log_inv_rate, int log_batch_size, int iters) {
     CK(cudaMalloc(&d_tw, tt.data.size() * sizeof(F128)));
     CK(cudaMemcpy(d_tw, tt.data.data(), tt.data.size() * sizeof(F128), cudaMemcpyHostToDevice));
 
-    int tpb = 256;
-    if (const char* e = getenv("NTT_TPB")) tpb = atoi(e);
+    constexpr int tpb = 256;
     long long fill_blocks = (codeword_len + tpb - 1) / tpb;
-    fill_kernel<<<(unsigned)fill_blocks, tpb>>>(d_data, codeword_len);
+    fill_benchmark_input<<<(unsigned)fill_blocks, tpb>>>(d_data, codeword_len);
     CK(cudaGetLastError());
 
     auto run_transform = [&]() {

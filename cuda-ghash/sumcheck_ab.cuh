@@ -1,10 +1,10 @@
 // a·b multilinear sumcheck kernels — step 3 of the GPU pcs::open (Ligerito)
-// port (GPU_OPEN_PLAN.md). The degree-2 sumcheck of S = Σ_x a(x)·b(x) that
+// port. The degree-2 sumcheck of S = Σ_x a(x)·b(x) that
 // the Ligerito prover runs over `(f, combined_basis)`
 // (`src/pcs/ligerito.rs`'s `SumcheckProver` / `fold_and_msg_lsb`).
 //
 // Per round, over the CURRENT a,b with ADJACENT pairing (a[2j], a[2j+1]) —
-// matching the CPU prover (NOT the strided (i, i+half) layout in bench_full_sumcheck):
+// matching the CPU prover instead of a strided (i, i+half) layout:
 //   message:  u_0 = Σ_j a[2j]·b[2j]                     (= u(0))
 //             u_2 = Σ_j (a[2j]+a[2j+1])·(b[2j]+b[2j+1]) (= u(∞), leading coeff)
 //   fold:     a'[j] = a[2j] + r·(a[2j]+a[2j+1])  (and b)
@@ -25,7 +25,7 @@
 
 // Block-partial message reduction (adjacent pairing). Grid-stride so the
 // launched block count can be capped; each block writes one (p0, p2) F128.
-__global__ void sumcheck_msg_partial(const F128* __restrict__ A,
+__global__ void sumcheck_message_partial(const F128* __restrict__ A,
                                      const F128* __restrict__ B,
                                      long long half, F128* p0, F128* p2) {
     // Reduce-per-term (F128) rather than deferred (F256): halves shared memory
@@ -55,7 +55,7 @@ __global__ void sumcheck_msg_partial(const F128* __restrict__ A,
 // Combine block partials → u_0, u_2. One 256-thread block: the single-thread
 // loop this replaces cost ~200 us at 2048 blocks — same order as the partial
 // kernel itself. XOR order is irrelevant → bit-identical.
-__global__ void sumcheck_msg_combine(const F128* p0, const F128* p2, int blocks,
+__global__ void combine_sumcheck_message(const F128* p0, const F128* p2, int blocks,
                                      F128* u0, F128* u2) {
     __shared__ F128 s0[SMC_TPB];
     __shared__ F128 s2[SMC_TPB];
@@ -89,7 +89,7 @@ __global__ void sumcheck_fold(const F128* __restrict__ A, const F128* __restrict
 // twice (separate message pass eliminated). Each thread handles one output PAIR
 // (Ao[2j],Ao[2j+1]) from inputs A[4j..4j+4]; out_pairs = half/2 (half=folded len).
 // Requires half>=2 (even); the lone half==1 tail uses sumcheck_fold + zero msg.
-__global__ void sumcheck_fold_msg_partial(const F128* __restrict__ A, const F128* __restrict__ B,
+__global__ void sumcheck_fold_and_message_partial(const F128* __restrict__ A, const F128* __restrict__ B,
                                           F128* __restrict__ Ao, F128* __restrict__ Bo,
                                           long long out_pairs, F128 r, F128* p0, F128* p2) {
     __shared__ F128 s0[SMC_TPB];
@@ -173,7 +173,7 @@ static __device__ __forceinline__ void sc_reduce8(F128* acc, F128* sh, F128* __r
 // bootstrap — it runs on the side stream under the l0 commit, where the first
 // message was already being precomputed, so the extra slots ride along for free
 // and the first real pass can then fold TWICE.
-__global__ void sumcheck_msg2_partial(const F128* __restrict__ A, const F128* __restrict__ B,
+__global__ void sumcheck_lookahead_message_partial(const F128* __restrict__ A, const F128* __restrict__ B,
                                       long long quads, F128* __restrict__ part) {
     __shared__ F128 sh[SMC_TPB];
     F128 acc[8];
@@ -192,7 +192,7 @@ __global__ void sumcheck_msg2_partial(const F128* __restrict__ A, const F128* __
 
 // Fold twice by (r1, r2) and accumulate both rounds' data over the result.
 // out_quads = (folded length) / 4; each thread owns 16 input elements per array.
-__global__ void sumcheck_fold2_msg2_partial(const F128* __restrict__ A, const F128* __restrict__ B,
+__global__ void sumcheck_lookahead_fold_and_message_partial(const F128* __restrict__ A, const F128* __restrict__ B,
                                             F128* __restrict__ Ao, F128* __restrict__ Bo,
                                             long long out_quads, F128 r1, F128 r2,
                                             F128* __restrict__ part) {
@@ -222,7 +222,7 @@ __global__ void sumcheck_fold2_msg2_partial(const F128* __restrict__ A, const F1
 }
 
 // Reduce the eight partial rows into d_out[8]; block j owns slot j.
-__global__ void sumcheck_msg2_combine(const F128* __restrict__ part, int blocks,
+__global__ void combine_sumcheck_lookahead_message(const F128* __restrict__ part, int blocks,
                                       F128* __restrict__ out) {
     __shared__ F128 sh[SMC_TPB];
     int j = blockIdx.x;
@@ -250,11 +250,11 @@ inline int sumcheck_blocks(long long half) {
     return (int)b;
 }
 
-inline void launch_sumcheck_msg(const F128* dA, const F128* dB, long long half,
+inline void launch_sumcheck_message(const F128* dA, const F128* dB, long long half,
                                 F128* d_p0, F128* d_p2, F128* d_u0, F128* d_u2) {
     int blocks = sumcheck_blocks(half);
-    sumcheck_msg_partial<<<blocks, SMC_TPB>>>(dA, dB, half, d_p0, d_p2);
-    sumcheck_msg_combine<<<1, SMC_TPB>>>(d_p0, d_p2, blocks, d_u0, d_u2);
+    sumcheck_message_partial<<<blocks, SMC_TPB>>>(dA, dB, half, d_p0, d_p2);
+    combine_sumcheck_message<<<1, SMC_TPB>>>(d_p0, d_p2, blocks, d_u0, d_u2);
 }
 
 inline void launch_sumcheck_fold(const F128* dA, const F128* dB, F128* dAo, F128* dBo,
@@ -265,7 +265,7 @@ inline void launch_sumcheck_fold(const F128* dA, const F128* dB, F128* dAo, F128
 
 // Fused fold-by-r + next-round message in one pass. Folds (dA,dB)→(dAo,dBo) of
 // length `half`, and leaves the FOLDED arrays' message in (d_u0,d_u2). half>=2.
-inline void launch_sumcheck_fold_msg(const F128* dA, const F128* dB, F128* dAo, F128* dBo,
+inline void launch_sumcheck_fold_and_message(const F128* dA, const F128* dB, F128* dAo, F128* dBo,
                                      long long half, F128 r,
                                      F128* d_p0, F128* d_p2, F128* d_u0, F128* d_u2) {
     if (half < 2) {  // folded length <2 → message is empty (0,0); just fold the tail.
@@ -276,15 +276,15 @@ inline void launch_sumcheck_fold_msg(const F128* dA, const F128* dB, F128* dAo, 
     }
     long long out_pairs = half >> 1;
     int blocks = sumcheck_blocks(out_pairs);
-    sumcheck_fold_msg_partial<<<blocks, SMC_TPB>>>(dA, dB, dAo, dBo, out_pairs, r, d_p0, d_p2);
-    sumcheck_msg_combine<<<1, SMC_TPB>>>(d_p0, d_p2, blocks, d_u0, d_u2);
+    sumcheck_fold_and_message_partial<<<blocks, SMC_TPB>>>(dA, dB, dAo, dBo, out_pairs, r, d_p0, d_p2);
+    combine_sumcheck_message<<<1, SMC_TPB>>>(d_p0, d_p2, blocks, d_u0, d_u2);
 }
 
 // d_part needs 8 * SMC_MAX_BLOCKS entries; d_out receives the 8 slots.
-inline void launch_sumcheck_fold2_msg2(const F128* dA, const F128* dB, F128* dAo, F128* dBo,
+inline void launch_sumcheck_lookahead(const F128* dA, const F128* dB, F128* dAo, F128* dBo,
                                        long long out_quads, F128 r1, F128 r2,
                                        F128* d_part, F128* d_out) {
     int blocks = sumcheck_blocks(out_quads);
-    sumcheck_fold2_msg2_partial<<<blocks, SMC_TPB>>>(dA, dB, dAo, dBo, out_quads, r1, r2, d_part);
-    sumcheck_msg2_combine<<<8, SMC_TPB>>>(d_part, blocks, d_out);
+    sumcheck_lookahead_fold_and_message_partial<<<blocks, SMC_TPB>>>(dA, dB, dAo, dBo, out_quads, r1, r2, d_part);
+    combine_sumcheck_lookahead_message<<<8, SMC_TPB>>>(d_part, blocks, d_out);
 }

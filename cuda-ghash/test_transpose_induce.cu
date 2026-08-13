@@ -50,8 +50,8 @@ int main(int argc, char** argv){
     CK(cudaMalloc(&d_q, n_queries*sizeof(unsigned long long)));
     CK(cudaMemcpy(d_q, queries.data(), n_queries*sizeof(unsigned long long), cudaMemcpyHostToDevice));
     int tpb=256;
-    zero_f128<<<(unsigned)((block_len+tpb-1)/tpb),tpb>>>(d_c, block_len);
-    scatter_weights<<<(unsigned)((n_queries+tpb-1)/tpb),tpb>>>(d_c, d_q, d_ap, n_queries);
+    clear_field_elements<<<(unsigned)((block_len+tpb-1)/tpb),tpb>>>(d_c, block_len);
+    scatter_query_weights<<<(unsigned)((n_queries+tpb-1)/tpb),tpb>>>(d_c, d_q, d_ap, n_queries);
     CK(cudaGetLastError());
 
     F128* d_tw; TwiddleTable tt = build_twiddle_table(log_block);
@@ -75,11 +75,11 @@ int main(int argc, char** argv){
     // timing: scatter + transpose-NTT (the induce hot path)
     cudaEvent_t ea, eb; CK(cudaEventCreate(&ea)); CK(cudaEventCreate(&eb));
     int iters = 50;
-    zero_f128<<<(unsigned)((block_len+tpb-1)/tpb),tpb>>>(d_c, block_len); CK(cudaDeviceSynchronize());
+    clear_field_elements<<<(unsigned)((block_len+tpb-1)/tpb),tpb>>>(d_c, block_len); CK(cudaDeviceSynchronize());
     CK(cudaEventRecord(ea));
     for (int it=0; it<iters; it++) {
-        zero_f128<<<(unsigned)((block_len+tpb-1)/tpb),tpb>>>(d_c, block_len);
-        scatter_weights<<<(unsigned)((n_queries+tpb-1)/tpb),tpb>>>(d_c, d_q, d_ap, n_queries);
+        clear_field_elements<<<(unsigned)((block_len+tpb-1)/tpb),tpb>>>(d_c, block_len);
+        scatter_query_weights<<<(unsigned)((n_queries+tpb-1)/tpb),tpb>>>(d_c, d_q, d_ap, n_queries);
         launch_transpose_ntt(d_c, d_tw, tt, log_block);
     }
     CK(cudaEventRecord(eb)); CK(cudaEventSynchronize(eb));

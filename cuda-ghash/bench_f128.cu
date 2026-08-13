@@ -26,9 +26,9 @@ static const u64 GOLD = 0x9E3779B97F4A7C15ull;
 static const char* vname[4] = {"software shift-XOR", "schoolbook + clmad", "binius + clmad", "karatsuba + clmad"};
 
 // K independent accumulators per thread (ILP) x full grid (TLP). K is a
-// template param so we can sweep ILP=4/8/16 like bench_kb31's k_tp.
+// Template parameter for the ILP=4/8/16 sweep.
 template<int V, int K>
-__global__ void k_throughput(int iters, F128* out) {
+__global__ void measure_multiplication_throughput(int iters, F128* out) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     F128 a[K];
     #pragma unroll
@@ -48,7 +48,7 @@ __global__ void k_throughput(int iters, F128* out) {
 }
 
 template<int V>
-__global__ void k_latency(F128 a0, F128 b0, int iters, F128* out) {
+__global__ void measure_multiplication_latency(F128 a0, F128 b0, int iters, F128* out) {
     F128 a = a0, b = b0;
     for (int i = 0; i < iters; i++) { a = mulv<V>(a, b); b.lo += GOLD; }
     out[0] = a;
@@ -57,7 +57,7 @@ __global__ void k_latency(F128 a0, F128 b0, int iters, F128* out) {
 // Realistic GCM: each thread authenticates an independent message of
 // `nblocks` 16-byte blocks via Horner:  acc = (acc ^ block) * H.
 template<int V>
-__global__ void k_ghash(F128 H, int nblocks, F128* out) {
+__global__ void measure_ghash_throughput(F128 H, int nblocks, F128* out) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     F128 acc = {0, 0};
     F128 m = {0x100000001b3ull * (u64)(tid + 1), GOLD * (u64)(tid + 1)};
@@ -101,7 +101,7 @@ int main() {
 
     F128 *out; CK(cudaMalloc(&out, threads * sizeof(F128)));
 
-    // ---- Throughput: device-aggregate GMul/s, ILP sweep (matches bench_kb31) ----
+    // ---- Throughput: device-aggregate GMul/s, ILP sweep ----
     printf("== Throughput (ILP sweep x %ld threads, device-aggregate GMul/s) ==\n", threads);
     {
         auto run = [&](auto V_ic, auto K_ic){
@@ -110,7 +110,7 @@ int main() {
             int iters = (int)(target / (threads * K));
             if (iters < 1) iters = 1;
             double ops = (double)threads * iters * K;
-            float ms = best_ms([&]{ k_throughput<V,K><<<blocks,tpb>>>(iters,out); });
+            float ms = best_ms([&]{ measure_multiplication_throughput<V,K><<<blocks,tpb>>>(iters,out); });
             printf("  %-20s ILP=%-2d %8.2f GMul/s   %7.3f ns/op(aggregate)\n",
                    vname[V], K, ops/(ms*1e6), ms*1e6/ops);
         };
@@ -132,10 +132,10 @@ int main() {
         F128 a0 = {0xDEADBEEFCAFEBABEull, 0x0123456789ABCDEFull};
         F128 b0 = {0xFEDCBA9876543210ull, 0xA5A5A5A5A5A5A5A5ull};
         auto run = [&](int V){
-            float ms = (V==0)? best_ms([&]{ k_latency<0><<<1,1>>>(a0,b0,iters,out); })
-                     : (V==1)? best_ms([&]{ k_latency<1><<<1,1>>>(a0,b0,iters,out); })
-                     : (V==2)? best_ms([&]{ k_latency<2><<<1,1>>>(a0,b0,iters,out); })
-                     :         best_ms([&]{ k_latency<3><<<1,1>>>(a0,b0,iters,out); });
+            float ms = (V==0)? best_ms([&]{ measure_multiplication_latency<0><<<1,1>>>(a0,b0,iters,out); })
+                     : (V==1)? best_ms([&]{ measure_multiplication_latency<1><<<1,1>>>(a0,b0,iters,out); })
+                     : (V==2)? best_ms([&]{ measure_multiplication_latency<2><<<1,1>>>(a0,b0,iters,out); })
+                     :         best_ms([&]{ measure_multiplication_latency<3><<<1,1>>>(a0,b0,iters,out); });
             printf("  %-20s %8.2f ns/op   [%d iters in %.1f ms]\n",
                    vname[V], ms*1e6/iters, iters, ms);
         };
@@ -149,7 +149,7 @@ int main() {
         double ops   = (double)threads * nblocks;       // muls
         double bytes = ops * 16.0;                       // 16 B per GHASH block
         F128 H = {0x0388dace60b6a392ull, 0x66e94bd4ef8a2c3bull};  // arbitrary hash key
-        float ms = best_ms([&]{ k_ghash<2><<<blocks,tpb>>>(H, nblocks, out); });
+        float ms = best_ms([&]{ measure_ghash_throughput<2><<<blocks,tpb>>>(H, nblocks, out); });
         printf("  %ld chains x %d blocks: %8.2f GMul/s   %7.1f GB/s   [%.1f ms]\n",
                threads, nblocks, ops/(ms*1e6), bytes/(ms*1e6), ms);
     }

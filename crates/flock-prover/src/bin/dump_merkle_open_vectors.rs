@@ -3,7 +3,7 @@
 //! (`cuda-ghash/merkle_open.hpp` / `test_merkle_open.cpp`) is validated
 //! byte-for-byte against the query-opening logic the recursive prover uses.
 //!
-//! Step 6 of the Ligerito re-aim (`cuda-ghash/GPU_OPEN_PLAN.md`): per level the
+//! At each Ligerito level, the
 //! prover opens the challenger-sampled query rows of the committed codeword and
 //! emits a deduplicated Merkle multi-proof. This dumps a real tree + query
 //! positions + the resulting multi-proof; the C++ replays the sibling-collecting

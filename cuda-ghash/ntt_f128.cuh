@@ -1,4 +1,4 @@
-// Interleaved additive (LCH) NTT over GF(2^128) on CUDA — P2 of GPU_COMMIT_PLAN.
+// Interleaved additive (LCH) NTT over GF(2^128) on CUDA.
 //
 // Direct port of the scalar reference in
 //   src/ntt/additive_ntt_f128.rs
@@ -35,7 +35,7 @@
 //   off_bot = off_top + half*num_ntts
 //   new_u = top + v*tw;  bot = v + new_u
 // ---------------------------------------------------------------------------
-__global__ void ntt_layer_kernel(F128* data, const F128* tw_basis,
+__global__ void additive_ntt_layer(F128* data, const F128* tw_basis,
                                  int layer, int log_d, int num_ntts) {
     long long half    = 1LL << (log_d - layer - 1);
     long long pairs   = half * (long long)num_ntts;      // butterfly lanes per block
@@ -76,7 +76,7 @@ __global__ void ntt_layer_kernel(F128* data, const F128* tw_basis,
 // ---------------------------------------------------------------------------
 
 // twiddle(layer, block) on device: XOR of layer's span basis at set bits of block.
-__device__ __forceinline__ F128 dev_twiddle(const F128* basis, int layer, long long block) {
+__device__ __forceinline__ F128 evaluate_ntt_twiddle(const F128* basis, int layer, long long block) {
     F128 tw{0ull, 0ull};
     for (int j = 0; j < layer; j++)
         if ((block >> j) & 1ull) tw = f128_add(tw, basis[j]);
@@ -84,7 +84,7 @@ __device__ __forceinline__ F128 dev_twiddle(const F128* basis, int layer, long l
 }
 
 // One forward butterfly in a register array: nu = x[u] + x[v]*tw; x[v] += nu; x[u] = nu.
-__device__ __forceinline__ void bf(F128* x, int u, int v, F128 tw) {
+__device__ __forceinline__ void apply_ntt_butterfly(F128* x, int u, int v, F128 tw) {
     F128 nu = f128_add(x[u], ghash_mul_karatsuba(x[v], tw));
     x[v] = f128_add(x[v], nu);
     x[u] = nu;
@@ -92,7 +92,7 @@ __device__ __forceinline__ void bf(F128* x, int u, int v, F128 tw) {
 
 // Fuse 2 layers (L, L+1). One thread per (block, r, lane); 4 elements held in
 // registers. Needs block_size = 2^(log_d-L) >= 4. Matches butterfly_fused_2layer.
-__global__ void ntt_fused2_kernel(F128* data, const F128* bL, const F128* bL1,
+__global__ void additive_ntt_two_layer_tile(F128* data, const F128* bL, const F128* bL1,
                                   int L, int log_d, int num_ntts) {
     long long quarter    = 1LL << (log_d - L - 2);
     long long block_size = 1LL << (log_d - L);
@@ -112,11 +112,11 @@ __global__ void ntt_fused2_kernel(F128* data, const F128* bL, const F128* bL1,
 #pragma unroll
     for (int i = 0; i < 4; i++) x[i] = data[base + (long long)i * stride];
 
-    F128 t0  = dev_twiddle(bL,  L,     block);
-    F128 ta  = dev_twiddle(bL1, L + 1, 2 * block);
-    F128 tb  = dev_twiddle(bL1, L + 1, 2 * block + 1);
-    bf(x, 0, 2, t0); bf(x, 1, 3, t0);     // layer L:   (a,c) (b,d)
-    bf(x, 0, 1, ta); bf(x, 2, 3, tb);     // layer L+1: (a,b) (c,d)
+    F128 t0  = evaluate_ntt_twiddle(bL,  L,     block);
+    F128 ta  = evaluate_ntt_twiddle(bL1, L + 1, 2 * block);
+    F128 tb  = evaluate_ntt_twiddle(bL1, L + 1, 2 * block + 1);
+    apply_ntt_butterfly(x, 0, 2, t0); apply_ntt_butterfly(x, 1, 3, t0);     // layer L:   (a,c) (b,d)
+    apply_ntt_butterfly(x, 0, 1, ta); apply_ntt_butterfly(x, 2, 3, tb);     // layer L+1: (a,b) (c,d)
 
 #pragma unroll
     for (int i = 0; i < 4; i++) data[base + (long long)i * stride] = x[i];
@@ -124,7 +124,7 @@ __global__ void ntt_fused2_kernel(F128* data, const F128* bL, const F128* bL1,
 
 // Fuse 4 layers (L..L+3). One thread per (block, r, lane); 16 elements in
 // registers. Needs block_size >= 16. Matches fused4_butterfly_scalar.
-__global__ void ntt_fused4_kernel(F128* data, const F128* bL, const F128* bL1,
+__global__ void additive_ntt_four_layer_tile(F128* data, const F128* bL, const F128* bL1,
                                   const F128* bL2, const F128* bL3,
                                   int L, int log_d, int num_ntts) {
     long long sixteenth  = 1LL << (log_d - L - 4);
@@ -145,76 +145,31 @@ __global__ void ntt_fused4_kernel(F128* data, const F128* bL, const F128* bL1,
 #pragma unroll
     for (int i = 0; i < 16; i++) x[i] = data[base + (long long)i * stride];
 
-    F128 t0 = dev_twiddle(bL, L, block);
+    F128 t0 = evaluate_ntt_twiddle(bL, L, block);
 #pragma unroll
-    for (int i = 0; i < 8; i++) bf(x, i, i + 8, t0);                          // L  stride 8
+    for (int i = 0; i < 8; i++) apply_ntt_butterfly(x, i, i + 8, t0);                          // L  stride 8
 #pragma unroll
     for (int s = 0; s < 2; s++) {
-        F128 t = dev_twiddle(bL1, L + 1, 2 * block + s);
-        for (int i = 0; i < 4; i++) bf(x, 8 * s + i, 8 * s + i + 4, t);       // L+1 stride 4
+        F128 t = evaluate_ntt_twiddle(bL1, L + 1, 2 * block + s);
+        for (int i = 0; i < 4; i++) apply_ntt_butterfly(x, 8 * s + i, 8 * s + i + 4, t);       // L+1 stride 4
     }
 #pragma unroll
     for (int s = 0; s < 4; s++) {
-        F128 t = dev_twiddle(bL2, L + 2, 4 * block + s);
-        for (int i = 0; i < 2; i++) bf(x, 4 * s + i, 4 * s + i + 2, t);       // L+2 stride 2
+        F128 t = evaluate_ntt_twiddle(bL2, L + 2, 4 * block + s);
+        for (int i = 0; i < 2; i++) apply_ntt_butterfly(x, 4 * s + i, 4 * s + i + 2, t);       // L+2 stride 2
     }
 #pragma unroll
     for (int s = 0; s < 8; s++) {
-        F128 t = dev_twiddle(bL3, L + 3, 8 * block + s);
-        bf(x, 2 * s, 2 * s + 1, t);                                          // L+3 stride 1
+        F128 t = evaluate_ntt_twiddle(bL3, L + 3, 8 * block + s);
+        apply_ntt_butterfly(x, 2 * s, 2 * s + 1, t);                                          // L+3 stride 1
     }
 
 #pragma unroll
     for (int i = 0; i < 16; i++) data[base + (long long)i * stride] = x[i];
 }
 
-// span basis pointer for layer l from the flattened table base: off[l] =
-// l*(l-1)/2 (cumulative sum of 0..l-1), so no offset array is needed on device.
-__device__ __forceinline__ const F128* tw_basis_for(const F128* d_tw, int l) {
-    return d_tw + ((long long)l * (l - 1)) / 2;
-}
-
-// Deep-layer shared-memory tile. One threadblock owns one contiguous tile of
-// `T = 2^dt` positions (× num_ntts lanes); after the top `top_layers` are done
-// every remaining layer [top_layers, log_d) lives inside such a tile. Load the
-// tile to shared mem once, run all `dt` layers on-chip with a barrier between
-// them, write once — collapsing dt full-buffer passes into one. Mirrors the
-// Rust cache-blocked Stage-2 (forward_transform_batched deep stage).
-__global__ void ntt_deep_smem_kernel(F128* data, const F128* d_tw,
-                                     int top_layers, int log_d, int num_ntts, int dt) {
-    extern __shared__ F128 sm[];
-    long long T      = 1LL << dt;
-    long long tcount = T * num_ntts;                 // elements in this tile
-    long long g      = blockIdx.x;                   // which tile
-    long long base   = g * tcount;
-
-    for (long long i = threadIdx.x; i < tcount; i += blockDim.x) sm[i] = data[base + i];
-    __syncthreads();
-
-    long long nbf = (T >> 1) * num_ntts;             // butterflies per layer in this tile
-    for (int l = top_layers; l < log_d; l++) {
-        int rel              = l - top_layers;        // 0..dt-1
-        long long half       = 1LL << (dt - rel - 1); // sub-block half-size (positions)
-        long long num_sub    = 1LL << rel;            // sub-blocks in this tile
-        const F128* basis    = tw_basis_for(d_tw, l);
-        for (long long t = threadIdx.x; t < nbf; t += blockDim.x) {
-            long long lane = t % num_ntts;
-            long long tmp  = t / num_ntts;            // 0..T/2-1
-            long long sub  = tmp / half;
-            long long row  = tmp % half;
-            F128 tw = dev_twiddle(basis, l, g * num_sub + sub);
-            long long sb_start = sub * (half << 1) * num_ntts;
-            long long off_top  = sb_start + row * num_ntts + lane;
-            long long off_bot  = off_top + half * num_ntts;
-            F128 v = sm[off_bot];
-            F128 u = f128_add(sm[off_top], ghash_mul_karatsuba(v, tw));
-            sm[off_top] = u;
-            sm[off_bot] = f128_add(v, u);
-        }
-        __syncthreads();
-    }
-
-    for (long long i = threadIdx.x; i < tcount; i += blockDim.x) data[base + i] = sm[i];
+__device__ __forceinline__ const F128* ntt_basis_for_layer(const F128* d_tw, int layer) {
+    return d_tw + ((long long)layer * (layer - 1)) / 2;
 }
 
 // Top-stage shared-memory fusion. Unlike the register-resident fusedK kernels
@@ -226,7 +181,7 @@ __global__ void ntt_deep_smem_kernel(F128* data, const F128* d_tw,
 // all K layers on-chip with a barrier between them, collapsing K full-buffer
 // passes into one. smem index = pos*num_ntts + lane. Mirrors the fusedK butterfly
 // schedule: layer L+j has within-tile stride 2^(K-1-j) and 2^j sub-blocks, each
-// carrying twiddle dev_twiddle(basis_{L+j}, L+j, (block<<j)+sub).
+// carrying twiddle evaluate_ntt_twiddle(basis_{L+j}, L+j, (block<<j)+sub).
 // `lb` = lanes handled per block (a tile of the num_ntts batch dimension). At
 // large num_ntts the full-lane tile (lb = num_ntts) blows the shared-mem budget
 // and halves occupancy (e.g. 2^6·64·16 = 64 KB/block → ~3 blocks/SM on a 5090);
@@ -240,7 +195,7 @@ __global__ void ntt_deep_smem_kernel(F128* data, const F128* d_tw,
 // which runs on the (1/64-rate) FP64 pipe and was the measured top bottleneck
 // (70% FP64-pipe SOL). log_lb replaces them with shifts/masks.
 template <int K>
-__global__ void ntt_smem_topK_kernel(F128* data, const F128* d_tw,
+__global__ void additive_ntt_shared_memory_tile(F128* data, const F128* d_tw,
                                      int L, int log_d, int num_ntts, int log_lb,
                                      const F128* src, long long smask) {
     extern __shared__ F128 sm[];
@@ -273,15 +228,15 @@ __global__ void ntt_smem_topK_kernel(F128* data, const F128* d_tw,
         long long i = e >> log_lb, lin = e & lbm;
         sm[e] = src[(gbase + i * stride + lin) & smask];
     }
-    // Precompute the NTW distinct twiddles ONCE (was: dev_twiddle re-expanded per
+    // Precompute the NTW distinct twiddles ONCE (was: evaluate_ntt_twiddle re-expanded per
     // butterfly — an O(layer) XOR loop recomputed across all strj*lb butterflies
     // that share a sub, up to ~1000x). Twiddle t encodes (j, sub) with
     // 2^j-1 <= t < 2^(j+1)-1 and sub = (t+1) - 2^j; value matches the per-layer
-    // dev_twiddle(basis_{L+j}, L+j, (block<<j)+sub) bit-for-bit.
+    // evaluate_ntt_twiddle(basis_{L+j}, L+j, (block<<j)+sub) bit-for-bit.
     for (int t = threadIdx.x; t < NTW; t += blockDim.x) {
         int j   = 31 - __clz(t + 1);          // floor(log2(t+1))
         int sub = (t + 1) - (1 << j);
-        twid[t] = dev_twiddle(tw_basis_for(d_tw, L + j), L + j, (block << j) + sub);
+        twid[t] = evaluate_ntt_twiddle(ntt_basis_for_layer(d_tw, L + j), L + j, (block << j) + sub);
     }
     __syncthreads();
 
@@ -317,23 +272,20 @@ __global__ void ntt_smem_topK_kernel(F128* data, const F128* d_tw,
 // ≈ TOPK_SMEM_CAP regardless of num_ntts (keeps occupancy high; lb=num_ntts when
 // it fits). Valid whenever layer+K <= log_d (always true for chunks of a balanced
 // split of [from,to) with to <= log_d).
-template <int K>
-inline void launch_topK_chunk(F128* d_data, const F128* d_tw, int layer, int log_d,
+template <int K, size_t SharedMemoryBytes = 32 * 1024>
+inline void launch_ntt_shared_memory_chunk(F128* d_data, const F128* d_tw, int layer, int log_d,
                               int num_ntts, int tpb,
                               const F128* src = nullptr, long long smask = -1) {
-    static size_t TOPK_SMEM_CAP = [] {
-        const char* e = getenv("NTT_SMEM_KB"); return (size_t)(e ? atoi(e) : 32) * 1024;
-    }();
     int lb = num_ntts, log_lb = 0;
     while ((1 << log_lb) < num_ntts) log_lb++;
-    while ((size_t)(1LL << K) * (size_t)lb * sizeof(F128) > TOPK_SMEM_CAP && lb > 1) {
+    while ((size_t)(1LL << K) * (size_t)lb * sizeof(F128) > SharedMemoryBytes && lb > 1) {
         lb >>= 1; log_lb--;
     }
     size_t smem = ((size_t)(1LL << K) * (size_t)lb + ((1u << K) - 1)) * sizeof(F128);
-    cudaFuncSetAttribute(ntt_smem_topK_kernel<K>,
+    cudaFuncSetAttribute(additive_ntt_shared_memory_tile<K>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
     long long tiles = (1LL << (log_d - K)) * (long long)(num_ntts / lb);
-    ntt_smem_topK_kernel<K><<<(unsigned)tiles, tpb, smem>>>(d_data, d_tw, layer, log_d, num_ntts, log_lb,
+    additive_ntt_shared_memory_tile<K><<<(unsigned)tiles, tpb, smem>>>(d_data, d_tw, layer, log_d, num_ntts, log_lb,
                                                             src ? src : d_data, smask);
 }
 
@@ -343,47 +295,45 @@ inline void launch_topK_chunk(F128* d_data, const F128* d_tw, int layer, int log
 // lb=16). Balanced (not greedy) avoids a trailing lone layer: 19 layers go
 // 7+6+6 (3 passes) instead of 6+6+6+1 (4 passes). Chunks of 4/2/1 fall back to
 // the register-fused / single-layer kernels (cheaper than a smem tile at small K).
-inline void launch_top_fused(F128* d_data, const F128* d_tw, const TwiddleTable& tt,
+template <int MaxFusedLayers = 7, size_t SharedMemoryBytes = 32 * 1024>
+inline void launch_ntt_fused_layers(F128* d_data, const F128* d_tw, const TwiddleTable& tt,
                              int from, int to, int log_d, int num_ntts, int tpb,
                              const F128* src0 = nullptr, long long smask0 = -1) {
     int total = to - from;
     if (total <= 0) return;
-    static int KMAX = [] { const char* e = getenv("NTT_KMAX"); return e ? atoi(e) : 7; }();
-    int npass = (total + KMAX - 1) / KMAX;
+    static_assert(MaxFusedLayers >= 1 && MaxFusedLayers <= 7);
+    int npass = (total + MaxFusedLayers - 1) / MaxFusedLayers;
     int base = total / npass, extra = total % npass;
     int layer = from;
     for (int p = 0; p < npass; p++) {
         int c = base + (p < extra ? 1 : 0);     // this chunk's layer count
         // Rate-extend fusion: pass 0 may read from src0 (the pre-replication
-        // message) via smask0 — topK chunks only (see ntt_can_fuse_src).
+        // message) via smask0 — shared-memory chunks only (see ntt_can_fuse_source).
         const F128* src = (p == 0) ? src0 : nullptr;
         long long smask = (p == 0) ? smask0 : -1;
         long long total_bf, blocks;
         switch (c) {
-            case 10: launch_topK_chunk<10>(d_data, d_tw, layer, log_d, num_ntts, tpb, src, smask); break;
-            case 9: launch_topK_chunk<9>(d_data, d_tw, layer, log_d, num_ntts, tpb, src, smask); break;
-            case 8: launch_topK_chunk<8>(d_data, d_tw, layer, log_d, num_ntts, tpb, src, smask); break;
-            case 7: launch_topK_chunk<7>(d_data, d_tw, layer, log_d, num_ntts, tpb, src, smask); break;
-            case 6: launch_topK_chunk<6>(d_data, d_tw, layer, log_d, num_ntts, tpb, src, smask); break;
-            case 5: launch_topK_chunk<5>(d_data, d_tw, layer, log_d, num_ntts, tpb, src, smask); break;
-            case 3: launch_topK_chunk<3>(d_data, d_tw, layer, log_d, num_ntts, tpb, src, smask); break;
+            case 7: launch_ntt_shared_memory_chunk<7, SharedMemoryBytes>(d_data, d_tw, layer, log_d, num_ntts, tpb, src, smask); break;
+            case 6: launch_ntt_shared_memory_chunk<6, SharedMemoryBytes>(d_data, d_tw, layer, log_d, num_ntts, tpb, src, smask); break;
+            case 5: launch_ntt_shared_memory_chunk<5, SharedMemoryBytes>(d_data, d_tw, layer, log_d, num_ntts, tpb, src, smask); break;
+            case 3: launch_ntt_shared_memory_chunk<3, SharedMemoryBytes>(d_data, d_tw, layer, log_d, num_ntts, tpb, src, smask); break;
             case 4:
                 total_bf = (1LL << layer) * (1LL << (log_d - layer - 4)) * (long long)num_ntts;
                 blocks = (total_bf + tpb - 1) / tpb;
-                ntt_fused4_kernel<<<(unsigned)blocks, tpb>>>(
+                additive_ntt_four_layer_tile<<<(unsigned)blocks, tpb>>>(
                     d_data, d_tw + tt.off[layer], d_tw + tt.off[layer + 1],
                     d_tw + tt.off[layer + 2], d_tw + tt.off[layer + 3], layer, log_d, num_ntts);
                 break;
             case 2:
                 total_bf = (1LL << layer) * (1LL << (log_d - layer - 2)) * (long long)num_ntts;
                 blocks = (total_bf + tpb - 1) / tpb;
-                ntt_fused2_kernel<<<(unsigned)blocks, tpb>>>(
+                additive_ntt_two_layer_tile<<<(unsigned)blocks, tpb>>>(
                     d_data, d_tw + tt.off[layer], d_tw + tt.off[layer + 1], layer, log_d, num_ntts);
                 break;
             default:  // c == 1
                 total_bf = (1LL << (log_d - 1)) * (long long)num_ntts;
                 blocks = (total_bf + tpb - 1) / tpb;
-                ntt_layer_kernel<<<(unsigned)blocks, tpb>>>(
+                additive_ntt_layer<<<(unsigned)blocks, tpb>>>(
                     d_data, d_tw + tt.off[layer], layer, log_d, num_ntts);
                 break;
         }
@@ -392,50 +342,24 @@ inline void launch_top_fused(F128* d_data, const F128* d_tw, const TwiddleTable&
 }
 
 // Host launcher: forward interleaved NTT, layers [log_inv_rate, k_code).
-// Pure fused 4/2/1 is the DEFAULT and the fastest path. `deep_smem=true` adds a
-// shared-memory deep stage (top fused stage + one on-chip pass for the deepest
-// `dt` layers) — it is a MEASURED REGRESSION (~25% slower at m=29) and kept only
-// for reference: the deep layers have small strides and are already L2-resident
-// under pure fusion, so explicit tiling just costs occupancy + barriers. Caller
-// syncs. `d_tw`/`tt` come from build_twiddle_table (uploaded to device).
-// True when the first fused pass is a smem-topK chunk (layer counts 3,5,6,7 of
+// Uses balanced shared-memory chunks, then register kernels for chunks of 4/2/1.
+// Caller syncs. `d_tw`/`tt` come from build_twiddle_table (uploaded to device).
+// True when the first fused pass is a smem-shared-memory chunk (layer counts 3,5,6,7 of
 // a balanced split — everything except totals 1/2/4, which use the register
 // kernels without the src/smask load hook). Callers that want the rate-extend
 // fusion (skip replicate_fill, first pass reads the message) must check this
 // and fall back to replicate_fill + plain launch_ntt when false.
-inline bool ntt_can_fuse_src(int total_layers) {
+inline bool ntt_can_fuse_source(int total_layers) {
     return total_layers > 0 && total_layers != 1 && total_layers != 2 && total_layers != 4;
 }
 
 inline void launch_ntt(F128* d_data, const F128* d_tw, const TwiddleTable& tt,
                        int log_inv_rate, int k_code, int num_ntts,
-                       int tpb = 256, bool deep_smem = false,
+                       int tpb = 256,
                        const F128* src0 = nullptr, long long smask0 = -1) {
     int log_d = k_code;
     int total_layers = k_code - log_inv_rate;
     if (total_layers <= 0) return;
 
-    // Pick the deepest tile that fits the shared-mem budget (~100 KB), capped so
-    // the top fused stage still has something to do and dt stays sane.
-    const long long SMEM_BUDGET = 100 * 1024;
-    int dt = 0;
-    if (deep_smem) {
-        while (dt + 1 <= total_layers && dt + 1 <= 12 &&
-               ((1LL << (dt + 1)) * num_ntts * (long long)sizeof(F128)) <= SMEM_BUDGET) {
-            dt++;
-        }
-    }
-    if (dt < 1) {  // no useful tile — pure fused path
-        launch_top_fused(d_data, d_tw, tt, log_inv_rate, k_code, log_d, num_ntts, tpb, src0, smask0);
-        return;
-    }
-
-    int top_layers = k_code - dt;                       // deep stage = [top_layers, k_code)
-    launch_top_fused(d_data, d_tw, tt, log_inv_rate, top_layers, log_d, num_ntts, tpb, src0, smask0);
-
-    size_t smem = (size_t)(1LL << dt) * num_ntts * sizeof(F128);
-    cudaFuncSetAttribute(ntt_deep_smem_kernel,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-    long long tiles = 1LL << (log_d - dt);
-    ntt_deep_smem_kernel<<<(unsigned)tiles, tpb, smem>>>(d_data, d_tw, top_layers, log_d, num_ntts, dt);
+    launch_ntt_fused_layers(d_data, d_tw, tt, log_inv_rate, k_code, log_d, num_ntts, tpb, src0, smask0);
 }
