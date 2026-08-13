@@ -59,13 +59,13 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use super::ElementTableType;
+use super::Grinding;
 use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::lincheck::{
     sumcheck_bind_both_and_eval_next, sumcheck_bind_top_in_place_par, sumcheck_round_eval_par,
 };
 use crate::zerocheck::univariate_skip::build_eq;
-use super::Grinding;
 
 /// Domain label of the standalone single-table lincheck. The union's
 /// element-region lincheck runs the same sumcheck core under its own label
@@ -199,11 +199,22 @@ pub struct Claim {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VerifyError {
     /// Wrong number of round messages (expected `kappa`).
-    BadRoundCount { expected: usize, got: usize },
+    BadRoundCount {
+        expected: usize,
+        got: usize,
+    },
     /// `r` (the zerocheck point) has the wrong length for this statement.
-    BadPointLength { expected: usize, got: usize },
-    BadGrindingNonceCount { expected: usize, got: usize },
-    InvalidGrindingNonce { which: &'static str },
+    BadPointLength {
+        expected: usize,
+        got: usize,
+    },
+    BadGrindingNonceCount {
+        expected: usize,
+        got: usize,
+    },
+    InvalidGrindingNonce {
+        which: &'static str,
+    },
     /// The final consistency check
     /// `running == (Â_0 + α·B̂_0)(r_con, r'_col) · z_eval` failed.
     SumcheckFinalFailed,

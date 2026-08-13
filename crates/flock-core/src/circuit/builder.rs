@@ -390,6 +390,7 @@ pub struct ShapeBuilder {
     /// equivalence classes that were created independently.
     parent: Vec<usize>,
     public: Vec<Wire>,
+    fixed_public: Vec<Option<F128>>,
     inputs: Vec<Wire>,
     steps: Vec<Step>,
     rows_per_slot: Vec<usize>,
@@ -410,6 +411,7 @@ impl ShapeBuilder {
             wires: Vec::new(),
             parent: Vec::new(),
             public: Vec::new(),
+            fixed_public: Vec::new(),
             inputs: Vec::new(),
             steps: Vec::new(),
             rows_per_slot: Vec::new(),
@@ -494,6 +496,16 @@ impl ShapeBuilder {
         w
     }
 
+    /// A public input whose value is part of the circuit definition. The
+    /// value is committed by [`Circuit::digest`](super::Circuit::digest) and
+    /// checked at the prove/verify boundary.
+    pub fn fixed_public_input(&mut self, value: F128) -> Wire {
+        let w = self.input();
+        self.public.push(w);
+        self.fixed_public.push(Some(value));
+        w
+    }
+
     /// Instantiate a gate: allocate a row, bind `inputs` to its input cells,
     /// and return wires for its outputs. For a gate type whose
     /// [`Hint`](GateType::Hint) is `()`; use [`gate_hinted`] otherwise.
@@ -550,6 +562,7 @@ impl ShapeBuilder {
     /// Publish a wire: it joins the public segment, in call order.
     pub fn publish(&mut self, w: Wire) {
         self.public.push(w);
+        self.fixed_public.push(None);
     }
 
     /// How many public entries exist so far — the index the NEXT
@@ -714,7 +727,9 @@ impl ShapeBuilder {
         // by BLAKE3's ~21M nonzeros — the single largest item in setup. It is
         // a pure function of the table types, and `TableType` caches it, so a
         // caller that reuses one `TableType` across circuits pays it once.
-        let circuit = Circuit::new(&registry, counts.clone(), pubs.len(), wires)?;
+        debug_assert_eq!(self.fixed_public.len(), pubs.len());
+        let circuit =
+            Circuit::new_with_fixed_public(&registry, counts.clone(), self.fixed_public, wires)?;
         Ok(CircuitShape {
             registry,
             circuit,
@@ -1031,7 +1046,10 @@ impl CircuitShape {
             }
         }
         for &r in &self.publics {
-            assert!(def_at[r] != UNDEF, "a published wire was never given a value");
+            assert!(
+                def_at[r] != UNDEF,
+                "a published wire was never given a value"
+            );
         }
 
         // Compile each island onto its own compact tape: intern every root
@@ -1052,26 +1070,25 @@ impl CircuitShape {
                 let mut gather: Vec<(u32, u32)> = Vec::new();
                 let mut scatter: Vec<(u32, u32)> = Vec::new();
                 let mut tape_len = 0u32;
-                let intern_read =
-                    |r: usize,
-                     local_of: &mut Vec<u32>,
-                     touched: &mut Vec<usize>,
-                     gather: &mut Vec<(u32, u32)>,
-                     tape_len: &mut u32| {
-                        if local_of[r] != UNDEF {
-                            return local_of[r];
-                        }
-                        assert!(
-                            def_at[r] == DEF_INPUT || (def_at[r] as usize) < first_start,
-                            "an island reads a wire another island writes"
-                        );
-                        let l = *tape_len;
-                        *tape_len += 1;
-                        local_of[r] = l;
-                        touched.push(r);
-                        gather.push((l, r as u32));
-                        l
-                    };
+                let intern_read = |r: usize,
+                                   local_of: &mut Vec<u32>,
+                                   touched: &mut Vec<usize>,
+                                   gather: &mut Vec<(u32, u32)>,
+                                   tape_len: &mut u32| {
+                    if local_of[r] != UNDEF {
+                        return local_of[r];
+                    }
+                    assert!(
+                        def_at[r] == DEF_INPUT || (def_at[r] as usize) < first_start,
+                        "an island reads a wire another island writes"
+                    );
+                    let l = *tape_len;
+                    *tape_len += 1;
+                    local_of[r] = l;
+                    touched.push(r);
+                    gather.push((l, r as u32));
+                    l
+                };
                 for bi in ba..bb {
                     let bt = &batches[bi];
                     let slot = bt.slot as usize;
@@ -1259,7 +1276,12 @@ impl CircuitShape {
                         for bi in isl.batches.0 as usize..isl.batches.1 as usize {
                             let t = std::time::Instant::now();
                             self.exec_batches(
-                                plan, bi..bi + 1, &mut local, &mut irows, hints, &mut si,
+                                plan,
+                                bi..bi + 1,
+                                &mut local,
+                                &mut irows,
+                                hints,
+                                &mut si,
                                 &mut so,
                             );
                             let b = &plan.batches[bi];
@@ -1273,7 +1295,9 @@ impl CircuitShape {
                             .collect();
                         v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
                         for (s, ms, n) in v.iter().take(12) {
-                            eprintln!("    [census] declared slot {s:3}: {ms:7.2} ms over {n:6} rows");
+                            eprintln!(
+                                "    [census] declared slot {s:3}: {ms:7.2} ms over {n:6} rows"
+                            );
                         }
                     } else {
                         self.exec_batches(
@@ -1545,7 +1569,12 @@ impl CircuitBuilder {
 
     /// Instantiate a gate, supplying this instance's nondeterministic advice.
     /// See [`GateType::Hint`]; `hint` must be that exact type.
-    pub fn gate_with_hint<H: Any + Sync>(&mut self, slot: SlotId, inputs: &[Wire], hint: H) -> Vec<Wire> {
+    pub fn gate_with_hint<H: Any + Sync>(
+        &mut self,
+        slot: SlotId,
+        inputs: &[Wire],
+        hint: H,
+    ) -> Vec<Wire> {
         self.hints.push(Box::new(hint));
         self.shape.gate_hinted(slot, inputs)
     }
@@ -1607,6 +1636,30 @@ mod tests {
     use crate::element_r1cs::{ElementTableBuilder, ElementTableType};
     use crate::schedule::IoWord;
     use std::sync::Arc;
+
+    #[test]
+    fn fixed_public_values_are_digest_bound_and_checked() {
+        let build = |constant: F128| {
+            let mut b = ShapeBuilder::new(3);
+            let mult = b.slot(MultGate::new(3));
+            let c = b.fixed_public_input(constant);
+            let x = b.input();
+            let y = b.gate(mult, &[c, x])[0];
+            b.publish(y);
+            b.finish().expect("fixed-public circuit builds")
+        };
+
+        let seven = F128::new(7, 0);
+        let shape = build(seven);
+        let witness = shape.run(&[seven, F128::new(9, 0)], &[]);
+        assert!(shape.circuit.check_public(&witness.public));
+        let mut changed = witness.public.clone();
+        changed[0] = F128::new(6, 0);
+        assert!(!shape.circuit.check_public(&changed));
+
+        let other = build(F128::new(8, 0));
+        assert_ne!(shape.circuit.digest(), other.circuit.digest());
+    }
 
     /// The element `mult` gate from `circuit_wiring.rs`: columns 0,1 free
     /// wires in, column 2 = z0·z1 out.

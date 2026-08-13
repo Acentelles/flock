@@ -295,7 +295,7 @@ pub fn verify_ligerito_union_circuit<Ch: Challenger>(
     pcs_params: &crate::pcs::PcsParams,
     challenger: &mut Ch,
 ) -> Result<crate::proof::UnionClassClaims, VerifyError> {
-    if !circuit.check_instance(union) || public.len() != circuit.num_public() {
+    if !circuit.check_instance(union) || !circuit.check_public(public) {
         return Err(VerifyError::CircuitMismatch);
     }
     if proof.boolean.is_some() != (union.num_boolean() > 0)
@@ -371,7 +371,7 @@ pub fn verify_ligerito_union_circuit_deferred<Ch: Challenger>(
     ),
     VerifyError,
 > {
-    if !circuit.check_instance(union) || public.len() != circuit.num_public() {
+    if !circuit.check_instance(union) || !circuit.check_public(public) {
         return Err(VerifyError::CircuitMismatch);
     }
     if proof.boolean.is_some() != (union.num_boolean() > 0)
@@ -705,9 +705,7 @@ fn verify_union_piops<Ch: Challenger>(
     // (`UnionInstance::commit_lanes`, like `dense_m`), so require the
     // commitment to carry exactly it; a mismatch is a rejection, not a panic.
     if !commitment_params_match_expected(commitment, pcs_params) {
-        return Err(VerifyError::PcsOpen(
-            crate::pcs::VerifyErrorOpen::Ligerito,
-        ));
+        return Err(VerifyError::PcsOpen(crate::pcs::VerifyErrorOpen::Ligerito));
     }
     // Verification is single-threaded; run the PIOP replay on the dedicated
     // 1-thread pool (verify_claims_jagged_ligerito installs it itself).
@@ -894,6 +892,25 @@ fn verify_union_piops<Ch: Challenger>(
             packed_direct.extend(gather);
         }
 
+        // The circuit-structure accumulator also binds the succinct
+        // verifier's remaining static helper evaluations. These values enter
+        // Product-GKR/lincheck arithmetic above, but their truth depends only
+        // on the digest-bound child circuit and are therefore folded under
+        // the same key as sigma.
+        if let Some(sig) = sigma.as_mut() {
+            if let Some(a) = matrix.as_ref() {
+                sig.boolean_pins = a
+                    .pin_evals
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(t, value)| value.map(|v| (t, a.pin_point.clone(), v)))
+                    .collect();
+            }
+            if let Some(a) = el_matrix.as_ref() {
+                sig.element_constants = Some((a.r_con.clone(), a.a_const_eval, a.b_const_eval));
+            }
+        }
+
         Ok((
             crate::proof::UnionClassClaims {
                 boolean: bool_claim,
@@ -1073,13 +1090,9 @@ fn verify_core_inner<Ch: Challenger>(
 
     // ---- Zerocheck.
     let t = std::time::Instant::now();
-    let zc_claim = zerocheck::verify_with_grinding(
-        r1cs.m,
-        zerocheck_proof,
-        zerocheck_grinding,
-        challenger,
-    )
-    .map_err(VerifyError::Zerocheck)?;
+    let zc_claim =
+        zerocheck::verify_with_grinding(r1cs.m, zerocheck_proof, zerocheck_grinding, challenger)
+            .map_err(VerifyError::Zerocheck)?;
     if trace {
         eprintln!(
             "      [vco] zerocheck::verify: {}",

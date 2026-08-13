@@ -33,9 +33,9 @@ use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::lincheck::QuirkyPoint;
 use crate::pcs::Commitment;
-use crate::schedule::{Instance, Registry, TableType};
 #[cfg(test)]
 use crate::schedule::TableClass;
+use crate::schedule::{Instance, Registry, TableType};
 use crate::zerocheck::{K_SKIP, PaddingSpec};
 
 /// Floor of the committed dense-stack size, as a bit-variable count: the
@@ -85,7 +85,10 @@ impl<'r> UnionInstance<'r> {
     /// virtual domain (the committed domain may never outgrow the address
     /// space) — raise `nu` first.
     pub fn set_dense_floor(&mut self, m: usize) {
-        assert!(m >= MIN_DENSE_M, "the config floor already commits 2^{MIN_DENSE_M}");
+        assert!(
+            m >= MIN_DENSE_M,
+            "the config floor already commits 2^{MIN_DENSE_M}"
+        );
         assert!(
             1usize << (m - 7) <= self.packed_len(),
             "dense floor m={m} exceeds the padded virtual domain (m_total {}); \
@@ -1098,8 +1101,8 @@ pub struct SlotWitnessDest<'d> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::r1cs::{BlockR1cs, WitnessLayout};
     use crate::r1cs::SparseBinaryMatrix;
+    use crate::r1cs::{BlockR1cs, WitnessLayout};
 
     /// Empty matrix stub — nothing here applies the matrices (same practice
     /// as the schedule.rs layout tests).

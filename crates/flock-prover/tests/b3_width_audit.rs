@@ -15,7 +15,7 @@
 //! Run: `cargo test --release --test b3_width_audit -- --ignored --nocapture`
 
 use flock_prover::r1cs_hashes::blake3::{
-    build_matrices, CARRY_BITS_PER_ADD, GS_BASE, G_STRIDE, N_G, USEFUL_BITS,
+    CARRY_BITS_PER_ADD, G_STRIDE, GS_BASE, N_G, USEFUL_BITS, build_matrices,
 };
 
 const ADDS_PER_G: usize = 6;
@@ -119,9 +119,7 @@ fn b3_csc_fold_cost() {
 // ---------------------------------------------------------------------------
 
 mod sim {
-    use flock_prover::r1cs_hashes::blake3::{
-        BLAKE3_IV, G_LANES, G_MSG_IDX, MSG_PERMUTATION,
-    };
+    use flock_prover::r1cs_hashes::blake3::{BLAKE3_IV, G_LANES, G_MSG_IDX, MSG_PERMUTATION};
 
     const WB: usize = 32;
     const CARRY: usize = 31;

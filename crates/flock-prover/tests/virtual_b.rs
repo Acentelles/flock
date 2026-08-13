@@ -50,9 +50,16 @@ fn virtual_b_microbench() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(7);
     let env = |k: &str, d: usize| -> usize {
-        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
     };
-    let (m, k, lanes) = (env("MICRO_M", 32), env("MICRO_K", 6), env("MICRO_LANES", 56));
+    let (m, k, lanes) = (
+        env("MICRO_M", 32),
+        env("MICRO_K", 6),
+        env("MICRO_LANES", 56),
+    );
     let params = PcsParams {
         m,
         log_inv_rate: 2,

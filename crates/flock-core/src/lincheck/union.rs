@@ -68,7 +68,7 @@ use crate::zerocheck::K_SKIP;
 use crate::zerocheck::multilinear::lagrange_weights_naive;
 
 use super::{
-    LincheckCircuit, LincheckClaim, LincheckProof, LincheckGrinding, QuirkyPoint, VerifyError,
+    LincheckCircuit, LincheckClaim, LincheckGrinding, LincheckProof, QuirkyPoint, VerifyError,
     build_eq_table, build_quirky_eq_table, column_sumcheck_prove, inner_product,
     partial_fold_packed_z_rows_best,
 };
@@ -241,14 +241,16 @@ pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
 
     challenger.observe_label(b"flock-lincheck-v0");
     let trace = std::env::var("LINCHECK_TRACE").is_ok();
-    let mut grinding_nonces = Vec::with_capacity(grinding.nonce_count(
-        inner_rest_len,
-        slots
-            .iter()
-            .filter(|slot| slot.circuit.const_pin_col().is_some())
-            .count(),
-        k_skip,
-    ));
+    let mut grinding_nonces = Vec::with_capacity(
+        grinding.nonce_count(
+            inner_rest_len,
+            slots
+                .iter()
+                .filter(|slot| slot.circuit.const_pin_col().is_some())
+                .count(),
+            k_skip,
+        ),
+    );
 
     // 1. Sample α (matches verifier's order). ONE α batches the A- and
     //    B-claims for every slot (doc §"The B-claim, and batching the two
@@ -473,6 +475,11 @@ pub struct MatrixAssertion {
     /// column; the target-side half of the pin is already folded into
     /// [`Self::target`].
     pub betas: Vec<Option<F128>>,
+    /// Outer-row point and the count-prefix evaluation used by each const
+    /// pin. Recursive verification carries these as claims on the static
+    /// circuit-structure table instead of accepting prefix sums as advice.
+    pub pin_point: Vec<F128>,
+    pub pin_evals: Vec<Option<F128>>,
     /// What the weighted bilinear sum must equal.
     pub target: F128,
     /// The prover's per-type `(⟨W_t, A_0⟩, ⟨W_t, B_0⟩)`, in slot order —
@@ -811,6 +818,7 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
     //     carried in the assertion.
     let mut target = alpha * v_a + v_b;
     let mut betas: Vec<Option<F128>> = Vec::with_capacity(circuits.len());
+    let mut pin_evals: Vec<Option<F128>> = Vec::with_capacity(circuits.len());
     for (circuit, &n_t) in circuits.iter().zip(union.counts()) {
         if circuit.const_pin_col().is_some() {
             let beta = if let Some(bits) = grinding.beta_bits() {
@@ -823,9 +831,12 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
                 challenger.sample_f128()
             };
             betas.push(Some(beta));
-            target += beta * eq_prefix_sum(&x_ab.x_outer, n_t);
+            let eps = eq_prefix_sum(&x_ab.x_outer, n_t);
+            pin_evals.push(Some(eps));
+            target += beta * eps;
         } else {
             betas.push(None);
+            pin_evals.push(None);
         }
     }
 
@@ -871,6 +882,8 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
         rr: rr.clone(),
         z_partial: proof.z_partial.clone(),
         betas,
+        pin_point: x_ab.x_outer.clone(),
+        pin_evals,
         target: running,
         evals: proof.matrix_evals.clone(),
     };

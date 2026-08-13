@@ -2709,17 +2709,19 @@ mod tests {
         let mut missing = proof;
         missing.shift.grinding_nonces.pop();
         let mut chv = FsChallenger::new(b"sha2-merkle-secure-grinding");
-        assert!(setup
-            .verify_merkle_paths_ligerito(
-                path_log,
-                &commitment,
-                &missing,
-                &leaves,
-                &root,
-                &b,
-                &mut chv,
-            )
-            .is_err());
+        assert!(
+            setup
+                .verify_merkle_paths_ligerito(
+                    path_log,
+                    &commitment,
+                    &missing,
+                    &leaves,
+                    &root,
+                    &b,
+                    &mut chv,
+                )
+                .is_err()
+        );
     }
 
     #[test]

@@ -179,16 +179,13 @@ impl Accumulator {
     /// never skips. `true` when nothing sigma was accumulated.
     pub fn discharge_sigma(&self, circuits: &[&crate::circuit::Circuit]) -> bool {
         self.sigma.iter().all(|(d, claim)| {
-            circuits
-                .iter()
-                .find(|c| c.digest() == *d)
-                .is_some_and(|c| {
-                    crate::matrix_fold::bilinear(
-                        &claim.row,
-                        &claim.col,
-                        &crate::circuit::SigmaAssertion::matrix(c),
-                    ) == claim.value
-                })
+            circuits.iter().find(|c| c.digest() == *d).is_some_and(|c| {
+                crate::matrix_fold::bilinear(
+                    &claim.row,
+                    &claim.col,
+                    &crate::circuit::SigmaAssertion::matrix(c),
+                ) == claim.value
+            })
         })
     }
 }
@@ -290,7 +287,16 @@ pub fn prove_aggregate<Ch: Challenger>(
     ch: &mut Ch,
 ) -> Result<(AggregateProof, Accumulator), AggregateError> {
     prove_aggregate_classes(
-        registry, mats, circuits, assertions, &[], &[], &[], &[], priors, ch,
+        registry,
+        mats,
+        circuits,
+        assertions,
+        &[],
+        &[],
+        &[],
+        &[],
+        priors,
+        ch,
     )
 }
 
@@ -378,10 +384,8 @@ pub fn prove_aggregate_classes_with_grinding<Ch: Challenger>(
             combs_a.push(xa);
             combs_b.push(xb);
         }
-        let (pa, out_a) =
-            matrix_fold::prove_fold_with_grinding(*ma, &combs_a, &ca, grinding, ch);
-        let (pb, out_b) =
-            matrix_fold::prove_fold_with_grinding(*mb, &combs_b, &cb, grinding, ch);
+        let (pa, out_a) = matrix_fold::prove_fold_with_grinding(*ma, &combs_a, &ca, grinding, ch);
+        let (pb, out_b) = matrix_fold::prove_fold_with_grinding(*mb, &combs_b, &cb, grinding, ch);
         folds.push((pa, pb));
         per_type.push((out_a, out_b));
     }
@@ -402,10 +406,8 @@ pub fn prove_aggregate_classes_with_grinding<Ch: Challenger>(
             .iter()
             .map(|q| matrix_fold::FoldMatrix::col_marginal(*mb, &q.row.materialize(), n_cols))
             .collect();
-        let (pa, out_a) =
-            matrix_fold::prove_fold_with_grinding(*ma, &combs_a, &ca, grinding, ch);
-        let (pb, out_b) =
-            matrix_fold::prove_fold_with_grinding(*mb, &combs_b, &cb, grinding, ch);
+        let (pa, out_a) = matrix_fold::prove_fold_with_grinding(*ma, &combs_a, &ca, grinding, ch);
+        let (pb, out_b) = matrix_fold::prove_fold_with_grinding(*mb, &combs_b, &cb, grinding, ch);
         el_folds.push((pa, pb));
         per_element.push((out_a, out_b));
     }
@@ -451,8 +453,9 @@ pub type SigmaKey<'a> = (
 const DOMAIN_SIGMA_GROUP: &[u8] = b"flock-aggregate-sigma-v1";
 
 /// The claims of one sigma key, in the fixed order every group uses: the
-/// priors' entries with this digest first (in prior order), then one claim
-/// per assertion (shape-checked against the circuit).
+/// priors' entries with this digest first (in prior order), then every
+/// canonical circuit-structure claim per assertion (shape-checked against
+/// the circuit).
 fn gather_sigma(
     circuit: &crate::circuit::Circuit,
     asserts: &[&crate::circuit::SigmaAssertion],
@@ -468,10 +471,15 @@ fn gather_sigma(
         }
     }
     for a in asserts {
-        if a.nu != circuit.cells().nu() || a.rho.len() != circuit.cells().mu() {
+        let matrix = crate::circuit::SigmaAssertion::matrix(circuit);
+        let base_bits = (matrix_fold::FoldMatrix::n_cols(&matrix) / 8).trailing_zeros() as usize;
+        if a.nu != circuit.cells().nu()
+            || a.rho.len() != circuit.cells().mu()
+            || a.base_bits != base_bits
+        {
             return Err(AggregateError::Malformed);
         }
-        claims.push(a.claim());
+        claims.extend(a.claims());
     }
     if claims.is_empty() {
         return Err(AggregateError::Malformed);
@@ -510,12 +518,21 @@ fn fold_sigma_prove<Ch: Challenger>(
         ch.observe_bytes(&digest);
         let m = crate::circuit::SigmaAssertion::matrix(circuit);
         let n_cols = matrix_fold::FoldMatrix::n_cols(&m);
-        let combs: Vec<Vec<F128>> = claims
-            .iter()
-            .map(|q| matrix_fold::FoldMatrix::col_marginal(&m, &q.row.materialize(), n_cols))
-            .collect();
-        let (pf, folded) =
-            matrix_fold::prove_fold_with_grinding(&m, &combs, &claims, grinding, ch);
+        // Several circuit-structure claims share row points. Reuse each
+        // expensive marginal instead of streaming the child table again.
+        let mut combs: Vec<Vec<F128>> = Vec::with_capacity(claims.len());
+        for (i, q) in claims.iter().enumerate() {
+            if let Some(j) = claims[..i].iter().position(|p| p.row == q.row) {
+                combs.push(combs[j].clone());
+            } else {
+                combs.push(matrix_fold::FoldMatrix::col_marginal(
+                    &m,
+                    &q.row.materialize(),
+                    n_cols,
+                ));
+            }
+        }
+        let (pf, folded) = matrix_fold::prove_fold_with_grinding(&m, &combs, &claims, grinding, ch);
         folds.push(pf);
         out.push((digest, folded));
     }
@@ -619,8 +636,9 @@ fn gather_jagged(
     for p in priors {
         for (d, c) in &p.jagged {
             if d == digest {
-                claims
-                    .push(matrix_fold::JaggedClaim::from_folded(c).ok_or(AggregateError::Malformed)?);
+                claims.push(
+                    matrix_fold::JaggedClaim::from_folded(c).ok_or(AggregateError::Malformed)?,
+                );
             }
         }
     }

@@ -5,8 +5,8 @@
 //! `flock_core::verifier`'s in-crate test module when the crates were split.
 
 use flock_prover::challenger::FsChallenger;
-use flock_prover::pcs::{self, PcsParams};
 use flock_prover::pcs::ligerito::LigeritoProfile;
+use flock_prover::pcs::{self, PcsParams};
 use flock_prover::prover::prove_ligerito;
 use flock_prover::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
 use flock_prover::verifier::{self, VerifyError};
@@ -137,12 +137,8 @@ fn strict_fast_profile_grinds_boolean_piops() {
     };
 
     let mut ch_p = FsChallenger::new(b"flock-strict-zc-grinding-v0");
-    let (proof, commitment, claim_p) = prove_ligerito(
-        &r1cs,
-        pcs::pack_witness(&z, r1cs.m),
-        &pcs_params,
-        &mut ch_p,
-    );
+    let (proof, commitment, claim_p) =
+        prove_ligerito(&r1cs, pcs::pack_witness(&z, r1cs.m), &pcs_params, &mut ch_p);
     assert_eq!(
         proof.zerocheck.grinding_nonces.len(),
         2 + m - flock_prover::zerocheck::K_SKIP,

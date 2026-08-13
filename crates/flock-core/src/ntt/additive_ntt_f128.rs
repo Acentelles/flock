@@ -540,7 +540,13 @@ impl AdditiveNttF128 {
                         let twiddle = self.twiddle(layer, global_block);
                         let block_start = block_in_sub * block_bytes;
                         let block = &mut sub_data[block_start..block_start + block_bytes];
-                        butterfly_interleaved_block(block, twiddle, block_size_half, num_ntts, live);
+                        butterfly_interleaved_block(
+                            block,
+                            twiddle,
+                            block_size_half,
+                            num_ntts,
+                            live,
+                        );
                     }
                 }
             });
@@ -991,7 +997,12 @@ fn butterfly_interleaved_fused_2layer_par_rows(
             let (q2r, _) = q2[off..].split_at_mut(num_ntts);
             let (q3r, _) = q3[off..].split_at_mut(num_ntts);
             let (q4r, _) = q4[off..].split_at_mut(num_ntts);
-            do_one(&mut q1r[..live], &mut q2r[..live], &mut q3r[..live], &mut q4r[..live]);
+            do_one(
+                &mut q1r[..live],
+                &mut q2r[..live],
+                &mut q3r[..live],
+                &mut q4r[..live],
+            );
         }
     } else {
         q1.par_chunks_mut(num_ntts)

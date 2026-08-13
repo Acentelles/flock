@@ -317,9 +317,20 @@ pub enum CircuitError {
 #[derive(Clone, Debug)]
 pub struct Circuit {
     cells: CellSpace,
+    /// Immutable gate/type schedule used to construct this circuit. The
+    /// digest already binds it; retaining it lets root discharges evaluate
+    /// auxiliary circuit-static tables without a separate trusted argument.
+    registry: Registry,
     registry_digest: [u8; 32],
     counts: Vec<usize>,
     num_public: usize,
+    /// Public words whose values are part of the circuit definition rather
+    /// than supplied by the application statement. `None` denotes an ordinary
+    /// public input; `Some(v)` requires that public entry to equal `v`.
+    ///
+    /// Fixed publics are digest-bound. This lets circuits use shared constant
+    /// wires without trusting the proof producer to choose their values.
+    fixed_public: Vec<Option<F128>>,
     wires: Vec<Vec<usize>>,
     sigma: Vec<usize>,
     digest_cache: OnceLock<[u8; 32]>,
@@ -336,6 +347,19 @@ impl Circuit {
         num_public: usize,
         wires: Vec<Vec<Cell>>,
     ) -> Result<Self, CircuitError> {
+        Self::new_with_fixed_public(registry, counts, vec![None; num_public], wires)
+    }
+
+    /// Build a circuit with an optional fixed value for each public word.
+    /// Fixed values are included in the circuit digest and checked by both the
+    /// circuit prover and verifier entry points.
+    pub fn new_with_fixed_public(
+        registry: &Registry,
+        counts: Vec<usize>,
+        fixed_public: Vec<Option<F128>>,
+        wires: Vec<Vec<Cell>>,
+    ) -> Result<Self, CircuitError> {
+        let num_public = fixed_public.len();
         if counts.len() != registry.num_types() {
             return Err(CircuitError::Counts {
                 got: counts.len(),
@@ -475,9 +499,11 @@ impl Circuit {
 
         let c = Self {
             cells,
+            registry: registry.clone(),
             registry_digest: registry.digest(),
             counts,
             num_public,
+            fixed_public,
             wires: classes,
             sigma,
             digest_cache: OnceLock::new(),
@@ -514,6 +540,24 @@ impl Circuit {
     pub fn num_public(&self) -> usize {
         self.num_public
     }
+    /// The digest-bound gate/type schedule.
+    pub fn registry(&self) -> &Registry {
+        &self.registry
+    }
+    /// Fixed-value policy in public-segment order.
+    pub fn fixed_public(&self) -> &[Option<F128>] {
+        &self.fixed_public
+    }
+
+    /// Check the public segment's shape and every digest-bound constant.
+    pub fn check_public(&self, public: &[F128]) -> bool {
+        public.len() == self.num_public
+            && self
+                .fixed_public
+                .iter()
+                .zip(public)
+                .all(|(fixed, value)| fixed.is_none_or(|want| want == *value))
+    }
     /// The wire classes, canonical: cell indices ascending within a class,
     /// classes ordered by their least cell.
     pub fn wires(&self) -> &[Vec<usize>] {
@@ -527,7 +571,8 @@ impl Circuit {
 
     /// The circuit digest — the statement's circuit half.
     ///
-    /// Absorption order (format version 1): the domain label
+    /// Absorption order (format version 1 for circuits without fixed publics,
+    /// format version 2 otherwise): the domain label
     /// [`CIRCUIT_LABEL`], a version byte, the REGISTRY digest, `ν` and `c`,
     /// the schema-derived cell-slot enumeration (gate-slot count, then each
     /// gate slot's registry type, word-column and direction; then the public
@@ -545,11 +590,15 @@ impl Circuit {
             // cache is now warmed by `Circuit::new`). Byte-identical to the
             // per-field updates it replaces.
             let n_cells: usize = self.wires.iter().map(|c| c.len()).sum();
-            let mut buf: Vec<u8> =
-                Vec::with_capacity(256 + 9 * self.cells.num_gate_slots() + 12 * self.counts.len()
-                    + 4 * self.wires.len() + 8 * n_cells);
+            let mut buf: Vec<u8> = Vec::with_capacity(
+                256 + 9 * self.cells.num_gate_slots()
+                    + 12 * self.counts.len()
+                    + 4 * self.wires.len()
+                    + 8 * n_cells,
+            );
             buf.extend_from_slice(CIRCUIT_LABEL);
-            buf.push(1u8);
+            let has_fixed_public = self.fixed_public.iter().any(Option::is_some);
+            buf.push(if has_fixed_public { 2u8 } else { 1u8 });
             buf.extend_from_slice(&self.registry_digest);
             buf.extend_from_slice(&(self.cells.nu() as u32).to_le_bytes());
             buf.extend_from_slice(&(self.cells.c_bits() as u32).to_le_bytes());
@@ -568,6 +617,18 @@ impl Circuit {
                 buf.extend_from_slice(&(n as u64).to_le_bytes());
             }
             buf.extend_from_slice(&(self.num_public as u64).to_le_bytes());
+            if has_fixed_public {
+                for fixed in &self.fixed_public {
+                    match fixed {
+                        None => buf.push(0),
+                        Some(value) => {
+                            buf.push(1);
+                            buf.extend_from_slice(&value.lo.to_le_bytes());
+                            buf.extend_from_slice(&value.hi.to_le_bytes());
+                        }
+                    }
+                }
+            }
             buf.extend_from_slice(&(self.wires.len() as u32).to_le_bytes());
             for class in &self.wires {
                 buf.extend_from_slice(&(class.len() as u32).to_le_bytes());
@@ -689,22 +750,20 @@ pub fn prove_wiring_with_grinding<C: Challenger>(
     // makes the w materialization live-proportional.
     let mask = circuit.live_mask();
     let mut w = crate::scratch::take_f128(1usize << mu);
-    w.par_chunks_mut(rows)
-        .enumerate()
-        .for_each(|(iota, dst)| {
-            let live = mask.counts[iota];
-            match cells.slots()[iota] {
-                CellSlot::Gate { .. } => {
-                    let base = cells.gate_word_addr(iota, 0);
-                    dst[..live].copy_from_slice(&packed[base..base + live]);
-                }
-                CellSlot::Public { s } => {
-                    let base = s << nu;
-                    dst[..live].copy_from_slice(&public[base..base + live]);
-                }
-                CellSlot::Pad => {}
+    w.par_chunks_mut(rows).enumerate().for_each(|(iota, dst)| {
+        let live = mask.counts[iota];
+        match cells.slots()[iota] {
+            CellSlot::Gate { .. } => {
+                let base = cells.gate_word_addr(iota, 0);
+                dst[..live].copy_from_slice(&packed[base..base + live]);
             }
-        });
+            CellSlot::Public { s } => {
+                let base = s << nu;
+                dst[..live].copy_from_slice(&public[base..base + live]);
+            }
+            CellSlot::Pad => {}
+        }
+    });
 
     if trace {
         eprintln!(
@@ -794,45 +853,248 @@ pub fn prove_wiring_with_grinding<C: Challenger>(
 pub struct SigmaAssertion {
     pub rho: Vec<F128>,
     pub nu: usize,
+    /// Log2 of the shared circuit-structure table's base column domain.
+    pub base_bits: usize,
+    /// `MLE(live * s_id)(rho)`, used by the left Product-GKR input check.
+    pub masked_id_value: F128,
+    /// `MLE(live)(rho)`, used by both Product-GKR input checks.
+    pub live_value: F128,
+    /// `MLE(live * s_sigma)(rho)`, used by the right input check.
     pub value: F128,
+    /// Boolean const-pin prefix evaluations. Each entry selects the Boolean
+    /// registry slot at `type_index` and evaluates its live-row indicator at
+    /// `point` (the zerocheck outer row point).
+    pub boolean_pins: Vec<(usize, Vec<F128>, F128)>,
+    /// Element affine-constant evaluations at the element constraint point:
+    /// `(point, a_const_eval, b_const_eval)`.
+    pub element_constants: Option<(Vec<F128>, F128, F128)>,
 }
 
 impl SigmaAssertion {
-    /// The accumulator's form: a `MatrixClaim` on the sigma table reshaped
-    /// `2^nu × 2^c` (`M[r, c] = s_sig[(c << nu) + r]` — the cell space's
-    /// `(col << nu) | row` convention, so the point splits row-low).
-    pub fn claim(&self) -> crate::matrix_fold::MatrixClaim {
+    const MASKED_ID_PLANE: usize = 0;
+    const LIVE_PLANE: usize = 1;
+    const SIGMA_PLANE: usize = 2;
+    const ELEMENT_A_PLANE: usize = 3;
+    const ELEMENT_B_PLANE: usize = 4;
+    const BOOLEAN_PIN_PLANE: usize = 5;
+
+    fn plane_claim(&self, plane: usize, value: F128) -> crate::matrix_fold::MatrixClaim {
+        let selector = [
+            F128::new((plane & 1) as u64, 0),
+            F128::new(((plane >> 1) & 1) as u64, 0),
+            F128::new(((plane >> 2) & 1) as u64, 0),
+        ];
+        let mut col_point = self.rho[self.nu..].to_vec();
+        col_point.resize(self.base_bits, F128::ZERO);
+        col_point.extend_from_slice(&selector);
         crate::matrix_fold::MatrixClaim {
             row: crate::matrix_fold::Weight::eq(self.rho[..self.nu].to_vec()),
-            col: crate::matrix_fold::Weight::eq(self.rho[self.nu..].to_vec()),
-            value: self.value,
+            col: crate::matrix_fold::Weight::eq(col_point),
+            value,
         }
     }
 
-    /// The sigma table in the accumulator's matrix shape, from the SAME
-    /// encoding the verifier evaluates ([`product_gkr::build_s_sigma_vec`])
-    /// — MASKED to the live cells, matching the deferred claim's table
-    /// `live ⊙ s_σ` under the live-identity padding.
-    pub fn matrix(circuit: &Circuit) -> crate::matrix_fold::DenseMatrix {
-        let cells = circuit.cells();
-        let mask = circuit.live_mask();
-        let mut vals = product_gkr::build_s_sigma_vec(cells.mu(), circuit.sigma());
-        for (x, v) in vals.iter_mut().enumerate() {
-            if !mask.is_live(x) {
-                *v = F128::ZERO;
+    /// The historical sigma claim, now selecting plane 2 of the circuit-
+    /// structure table. Kept as a convenience for callers that need only the
+    /// sigma member; aggregation must use [`Self::claims`] so the Product-GKR
+    /// helper evaluations are bound as well.
+    pub fn claim(&self) -> crate::matrix_fold::MatrixClaim {
+        self.plane_claim(Self::SIGMA_PLANE, self.value)
+    }
+
+    /// All digest-keyed circuit-structure evaluations, in canonical order:
+    /// Product-GKR's `(live*s_id, live, live*s_sigma)`, then Boolean
+    /// constant-pin prefixes, then the element affine `A`/`B` constants.
+    pub fn claims(&self) -> Vec<crate::matrix_fold::MatrixClaim> {
+        let mut claims = vec![
+            self.plane_claim(Self::MASKED_ID_PLANE, self.masked_id_value),
+            self.plane_claim(Self::LIVE_PLANE, self.live_value),
+            self.claim(),
+        ];
+        for (type_index, point, value) in &self.boolean_pins {
+            let base_bits = self.matrix_base_bits();
+            let mut col = (0..base_bits)
+                .map(|j| F128::new(((type_index >> j) & 1) as u64, 0))
+                .collect::<Vec<_>>();
+            col.extend_from_slice(&[F128::ONE, F128::ZERO, F128::ONE]); // plane 5
+            claims.push(crate::matrix_fold::MatrixClaim {
+                row: crate::matrix_fold::Weight::eq(point.clone()),
+                col: crate::matrix_fold::Weight::eq(col),
+                value: *value,
+            });
+        }
+        if let Some((point, a, b)) = &self.element_constants {
+            let base_bits = self.matrix_base_bits();
+            let mut base = point.clone();
+            base.resize(base_bits, F128::ZERO);
+            for (plane, value) in [(Self::ELEMENT_A_PLANE, *a), (Self::ELEMENT_B_PLANE, *b)] {
+                let mut col = base.clone();
+                col.extend((0..3).map(|j| F128::new(((plane >> j) & 1) as u64, 0)));
+                claims.push(crate::matrix_fold::MatrixClaim {
+                    // The affine vectors are row-independent, so a fixed
+                    // zero row point gives a canonical claim identity.
+                    row: crate::matrix_fold::Weight::eq(vec![F128::ZERO; self.nu]),
+                    col: crate::matrix_fold::Weight::eq(col),
+                    value,
+                });
             }
         }
-        crate::matrix_fold::DenseMatrix {
-            vals,
-            n_rows_log: cells.nu(),
-        }
+        claims
+    }
+
+    fn matrix_base_bits(&self) -> usize {
+        // Filled/shape-checked against the circuit in aggregation. The base
+        // cell-space width is always at least the active auxiliary domains.
+        self.base_bits
+    }
+
+    /// The digest-keyed static table used by the accumulator. Its selected
+    /// planes contain `live*s_id`, `live`, `live*s_sigma`, the element affine
+    /// constants, and Boolean constant-pin prefixes; the remaining planes are
+    /// zero. One table therefore binds every circuit-static verifier value
+    /// without putting child-specific data into the recursive gate registry.
+    pub fn matrix(circuit: &Circuit) -> CircuitStructureMatrix<'_> {
+        CircuitStructureMatrix::new(circuit)
     }
 
     /// The root discharge: the claimed evaluation against the real table —
     /// `O(2^mu)`, paid once at the root, never per node.
     pub fn check(&self, circuit: &Circuit) -> bool {
-        let c = self.claim();
-        crate::matrix_fold::bilinear(&c.row, &c.col, &Self::matrix(circuit)) == self.value
+        let m = Self::matrix(circuit);
+        self.claims()
+            .iter()
+            .all(|c| crate::matrix_fold::bilinear(&c.row, &c.col, &m) == c.value)
+    }
+}
+
+/// A lazy eight-plane table of circuit-static verifier data.
+///
+/// Columns are `(cell_slot, plane)` and rows are the cell-space row. The
+/// table deliberately implements only matrix marginals: materializing every
+/// plane would multiply the already-large sigma root table's memory, while a
+/// fold/root discharge needs just these two streaming passes.
+pub struct CircuitStructureMatrix<'a> {
+    circuit: &'a Circuit,
+    mask: product_gkr::LiveMask,
+    base_cols: usize,
+}
+
+impl<'a> CircuitStructureMatrix<'a> {
+    fn new(circuit: &'a Circuit) -> Self {
+        let cell_cols = 1usize << (circuit.cells().mu() - circuit.cells().nu());
+        let element_cols = if circuit.registry().num_element() == 0 {
+            1
+        } else {
+            1usize << (circuit.registry().m_elem() - circuit.registry().nu() - 7)
+        };
+        let base_cols = cell_cols
+            .max(element_cols)
+            .max(circuit.registry().num_boolean().next_power_of_two());
+        Self {
+            circuit,
+            mask: circuit.live_mask(),
+            base_cols,
+        }
+    }
+
+    #[inline]
+    fn base_cols(&self) -> usize {
+        self.base_cols
+    }
+
+    #[inline]
+    fn entry(&self, row: usize, col: usize) -> F128 {
+        let base_cols = self.base_cols();
+        let plane = col / base_cols;
+        let slot = col % base_cols;
+        match plane {
+            SigmaAssertion::MASKED_ID_PLANE
+            | SigmaAssertion::LIVE_PLANE
+            | SigmaAssertion::SIGMA_PLANE => {
+                let cell_cols = 1usize << (self.circuit.cells().mu() - self.circuit.cells().nu());
+                if slot >= cell_cols {
+                    return F128::ZERO;
+                }
+                let x = (slot << self.circuit.cells().nu()) | row;
+                if !self.mask.is_live(x) {
+                    return F128::ZERO;
+                }
+                match plane {
+                    SigmaAssertion::MASKED_ID_PLANE => F128::new(x as u64, 0),
+                    SigmaAssertion::LIVE_PLANE => F128::ONE,
+                    _ => F128::new(self.circuit.sigma()[x] as u64, 0),
+                }
+            }
+            SigmaAssertion::ELEMENT_A_PLANE | SigmaAssertion::ELEMENT_B_PLANE => {
+                let registry = self.circuit.registry();
+                let nb = registry.num_boolean();
+                let base_word = registry.element_base() >> 7;
+                for (ty, layout) in registry.types()[nb..].iter().zip(&registry.slots()[nb..]) {
+                    let et = ty.element_type().expect("element registry suffix");
+                    let kappa = ty.k_log - 7;
+                    let offset = ((layout.offset >> 7) - base_word) >> registry.nu();
+                    if (offset..offset + (1usize << kappa)).contains(&slot) {
+                        let y = slot - offset;
+                        return if plane == SigmaAssertion::ELEMENT_A_PLANE {
+                            et.a_const()[y]
+                        } else {
+                            et.b_const()[y]
+                        };
+                    }
+                }
+                F128::ZERO
+            }
+            SigmaAssertion::BOOLEAN_PIN_PLANE => {
+                let registry = self.circuit.registry();
+                if slot >= registry.num_boolean() {
+                    return F128::ZERO;
+                }
+                let ty = &registry.boolean_types()[slot];
+                if ty.const_pin.is_some() && row < self.circuit.counts()[slot] {
+                    F128::ONE
+                } else {
+                    F128::ZERO
+                }
+            }
+            _ => F128::ZERO,
+        }
+    }
+}
+
+impl crate::matrix_fold::FoldMatrix for CircuitStructureMatrix<'_> {
+    fn row_marginal(&self, w: &[F128], n_rows: usize) -> Vec<F128> {
+        assert_eq!(n_rows, self.n_rows());
+        assert_eq!(w.len(), self.n_cols());
+        let mut out = vec![F128::ZERO; n_rows];
+        for (c, &wc) in w.iter().enumerate() {
+            if wc.is_zero() {
+                continue;
+            }
+            for (r, dst) in out.iter_mut().enumerate() {
+                *dst += wc * self.entry(r, c);
+            }
+        }
+        out
+    }
+
+    fn col_marginal(&self, w: &[F128], n_cols: usize) -> Vec<F128> {
+        assert_eq!(w.len(), self.n_rows());
+        assert_eq!(n_cols, self.n_cols());
+        (0..n_cols)
+            .map(|c| {
+                w.iter()
+                    .enumerate()
+                    .fold(F128::ZERO, |acc, (r, &wr)| acc + wr * self.entry(r, c))
+            })
+            .collect()
+    }
+
+    fn n_rows(&self) -> usize {
+        1usize << self.circuit.cells().nu()
+    }
+
+    fn n_cols(&self) -> usize {
+        8 * self.base_cols()
     }
 }
 
@@ -954,7 +1216,14 @@ fn verify_wiring_core<C: Challenger>(
     let assertion = SigmaAssertion {
         rho: claim.rho.clone(),
         nu,
+        base_bits: CircuitStructureMatrix::new(circuit)
+            .base_cols()
+            .trailing_zeros() as usize,
+        masked_id_value: mask.masked_id_eval(&product_gkr::s_id_basis(mu), &claim.rho),
+        live_value: mask.live_eval(&claim.rho),
         value: claim.s_sigma_eval,
+        boolean_pins: Vec::new(),
+        element_constants: None,
     };
     Ok((
         (0..cells.num_gate_slots())
@@ -1509,7 +1778,10 @@ mod tests {
 
         let mut bad = assertion.clone();
         bad.value += F128::ONE;
-        assert!(!bad.check(&circuit), "a tampered assertion fails the discharge");
+        assert!(
+            !bad.check(&circuit),
+            "a tampered assertion fails the discharge"
+        );
 
         let mut bad_proof = proof.clone();
         bad_proof.gkr.s_sigma_eval += F128::ONE;

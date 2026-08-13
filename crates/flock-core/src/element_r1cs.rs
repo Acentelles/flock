@@ -733,8 +733,7 @@ impl Grinding {
     }
 
     pub fn lincheck_nonce_count(self, rounds: usize) -> usize {
-        usize::from(self.alpha_bits().is_some())
-            + usize::from(self.round_bits().is_some()) * rounds
+        usize::from(self.alpha_bits().is_some()) + usize::from(self.round_bits().is_some()) * rounds
     }
 }
 
@@ -829,9 +828,7 @@ pub fn prove_with_grinding<C: Challenger>(
     let (mut pa, mut pb) = stmt.ty.apply(z, stmt.n_log);
     broadcast_add(&mut pa, stmt.ty.a_const(), stmt.n_log);
     broadcast_add(&mut pb, stmt.ty.b_const(), stmt.n_log);
-    let (zc_proof, zc_claim) = zerocheck::prove_with_grinding(
-        pa, pb, z, m_words, grinding, ch,
-    );
+    let (zc_proof, zc_claim) = zerocheck::prove_with_grinding(pa, pb, z, m_words, grinding, ch);
 
     // ---- 3. Phase 2: batched lincheck. ----
     //
@@ -840,16 +837,8 @@ pub fn prove_with_grinding<C: Challenger>(
     // no row dependence, so subtracting them (char 2: adding) leaves the pure
     // `Âz(r)` / `B̂z(r)` claims the lincheck reduces.
     let (va, vb) = strip_constants(stmt.ty, &zc_claim);
-    let (lc_proof, lc_claim) = lincheck::prove_with_grinding(
-        stmt.ty,
-        z,
-        stmt.n_log,
-        &zc_claim.r,
-        va,
-        vb,
-        grinding,
-        ch,
-    );
+    let (lc_proof, lc_claim) =
+        lincheck::prove_with_grinding(stmt.ty, z, stmt.n_log, &zc_claim.r, va, vb, grinding, ch);
 
     // ---- 4. Open both witness claims, packed-direct, no ring-switch. ----
     let claims = packed_direct_claims(&zc_claim.r, zc_claim.ec, &lc_claim.r_prime, lc_claim.z_eval);
@@ -1425,7 +1414,10 @@ mod e2e_tests {
                 break;
             }
         }
-        assert!(rejected_bad_nonce, "a changed initial PoW nonce must reject");
+        assert!(
+            rejected_bad_nonce,
+            "a changed initial PoW nonce must reject"
+        );
 
         let mut missing_lc = proof;
         missing_lc.lincheck.grinding_nonces.pop();

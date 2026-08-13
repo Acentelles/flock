@@ -476,17 +476,9 @@ pub fn prove_packed_padded_with_grinding<C: Challenger>(
     grinding: ZerocheckGrinding,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim) {
-    let (proof, claim, _) =
-        prove_packed_padded_inner(
-            a_packed,
-            b_packed,
-            c_packed,
-            m,
-            padding,
-            grinding,
-            false,
-            challenger,
-        );
+    let (proof, claim, _) = prove_packed_padded_inner(
+        a_packed, b_packed, c_packed, m, padding, grinding, false, challenger,
+    );
     (proof, claim)
 }
 
@@ -528,17 +520,9 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_grinding<C: Challenger>(
     grinding: ZerocheckGrinding,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
-    let (proof, claim, captured) =
-        prove_packed_padded_inner(
-            a_packed,
-            b_packed,
-            c_packed,
-            m,
-            padding,
-            grinding,
-            true,
-            challenger,
-        );
+    let (proof, claim, captured) = prove_packed_padded_inner(
+        a_packed, b_packed, c_packed, m, padding, grinding, true, challenger,
+    );
     (
         proof,
         claim,
@@ -955,12 +939,7 @@ pub fn verify<C: Challenger>(
     proof: &ZerocheckProof,
     challenger: &mut C,
 ) -> Result<ZerocheckClaim, VerifyError> {
-    verify_with_grinding(
-        log_n,
-        proof,
-        ZerocheckGrinding::disabled(),
-        challenger,
-    )
+    verify_with_grinding(log_n, proof, ZerocheckGrinding::disabled(), challenger)
 }
 
 /// [`verify`] with an explicit Fiat--Shamir grinding policy.  The policy is
@@ -1288,7 +1267,10 @@ mod tests {
             .collect();
         let mut expected = vec![4, 7];
         expected.extend(std::iter::repeat_n(2, m - K_SKIP));
-        assert_eq!(pow_bits, expected, "one PoW immediately precedes each protected challenge");
+        assert_eq!(
+            pow_bits, expected,
+            "one PoW immediately precedes each protected challenge"
+        );
 
         let mut missing = proof.clone();
         missing.grinding_nonces.pop();

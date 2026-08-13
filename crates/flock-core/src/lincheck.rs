@@ -548,11 +548,18 @@ impl LincheckGrinding {
     /// The φ8 skip polynomial has degree `2^k_skip - 1`; zero variables
     /// means it is constant and needs no grinding.
     pub fn skip_bits(self, k_skip: usize) -> Option<u32> {
-        self.skip_bits.then_some(k_skip as u32).filter(|&bits| bits != 0)
+        self.skip_bits
+            .then_some(k_skip as u32)
+            .filter(|&bits| bits != 0)
     }
 
     /// Number of nonces the proof must carry for this concrete lincheck.
-    pub fn nonce_count(self, inner_rest_len: usize, pinned_circuits: usize, k_skip: usize) -> usize {
+    pub fn nonce_count(
+        self,
+        inner_rest_len: usize,
+        pinned_circuits: usize,
+        k_skip: usize,
+    ) -> usize {
         usize::from(self.alpha_bits.is_some())
             + usize::from(self.beta_bits.is_some()) * pinned_circuits
             + usize::from(self.multilinear_round_bits.is_some()) * inner_rest_len
@@ -2616,14 +2623,7 @@ mod tests {
 
         let mut ch_p = FsChallenger::new(b"flock-lc-grinding-v0");
         let (proof, claim_p) = prove_with_grinding(
-            &z_packed,
-            m,
-            k_log,
-            k_skip,
-            &circuit,
-            &x_ab,
-            grinding,
-            &mut ch_p,
+            &z_packed, m, k_log, k_skip, &circuit, &x_ab, grinding, &mut ch_p,
         );
         assert_eq!(
             proof.grinding_nonces.len(),
@@ -2632,16 +2632,7 @@ mod tests {
 
         let mut ch_v = FsChallenger::new(b"flock-lc-grinding-v0");
         let claim_v = verify_with_grinding(
-            m,
-            k_log,
-            k_skip,
-            &circuit,
-            &x_ab,
-            v_a,
-            v_b,
-            &proof,
-            grinding,
-            &mut ch_v,
+            m, k_log, k_skip, &circuit, &x_ab, v_a, v_b, &proof, grinding, &mut ch_v,
         )
         .expect("valid grinding witnesses must verify");
         assert_eq!(claim_p, claim_v);

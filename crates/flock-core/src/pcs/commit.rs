@@ -620,8 +620,7 @@ fn finalize_commit(
     // row-batch lanes (num_ntts F_{2^128} values = 2^log_batch_size). This is
     // Ligerito's L0 commitment.
     let merkle_tree = merkle::merkle_tree(codeword_bytes, params.n_leaves(), params.merkle_hash);
-    let cap =
-        merkle::cap_layer(&merkle_tree, params.n_leaves(), params.l0_cap_depth()).to_vec();
+    let cap = merkle::cap_layer(&merkle_tree, params.n_leaves(), params.l0_cap_depth()).to_vec();
     if timing {
         eprintln!(
             "[commit-timing] merkle: {:.2} ms",
@@ -882,11 +881,8 @@ mod tests {
             };
             let oracle_tree =
                 crate::merkle::merkle_tree(oracle_bytes, params.n_leaves(), params.merkle_hash);
-            let oracle_cap = crate::merkle::cap_layer(
-                &oracle_tree,
-                params.n_leaves(),
-                params.l0_cap_depth(),
-            );
+            let oracle_cap =
+                crate::merkle::cap_layer(&oracle_tree, params.n_leaves(), params.l0_cap_depth());
             assert_eq!(
                 commitment.cap, oracle_cap,
                 "cap mismatch at m={m} r={log_inv_rate}"
@@ -966,7 +962,10 @@ mod tests {
                 replicate_lane_major_fill(&mut codeword, &q, t, d);
                 let (c_ref, pd_ref) = finalize_commit(codeword, t, &params);
                 assert_eq!(c_skip.cap, c_ref.cap, "cap (m={m}, t={t}, c={c})");
-                assert_eq!(pd_skip.codeword, pd_ref.codeword, "codeword (m={m}, t={t}, c={c})");
+                assert_eq!(
+                    pd_skip.codeword, pd_ref.codeword,
+                    "codeword (m={m}, t={t}, c={c})"
+                );
                 assert_eq!(
                     pd_skip.merkle_tree, pd_ref.merkle_tree,
                     "tree (m={m}, t={t}, c={c})"
@@ -1048,11 +1047,8 @@ mod tests {
                 };
                 let tree =
                     crate::merkle::merkle_tree(bytes, t_params.n_leaves(), t_params.merkle_hash);
-                let cap = crate::merkle::cap_layer(
-                    &tree,
-                    t_params.n_leaves(),
-                    t_params.l0_cap_depth(),
-                );
+                let cap =
+                    crate::merkle::cap_layer(&tree, t_params.n_leaves(), t_params.l0_cap_depth());
                 assert_eq!(cap, _c_t.cap, "cap must be over t-wide leaves");
             }
         }

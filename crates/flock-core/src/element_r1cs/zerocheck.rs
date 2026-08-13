@@ -32,10 +32,10 @@
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use super::Grinding;
 use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::zerocheck::univariate_skip::SplitEqGhash;
-use super::Grinding;
 
 /// Domain label of the standalone single-table zerocheck. The union's
 /// element-region zerocheck runs the same protocol under its own label — see
@@ -72,9 +72,17 @@ pub struct Claim {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VerifyError {
     /// Wrong number of round messages.
-    BadRoundCount { expected: usize, got: usize },
-    BadGrindingNonceCount { expected: usize, got: usize },
-    InvalidGrindingNonce { which: &'static str },
+    BadRoundCount {
+        expected: usize,
+        got: usize,
+    },
+    BadGrindingNonceCount {
+        expected: usize,
+        got: usize,
+    },
+    InvalidGrindingNonce {
+        which: &'static str,
+    },
     /// The final consistency check `running == ea·eb + ec` failed. Any
     /// inconsistency in a round message or in the three final evaluations
     /// propagates here.
@@ -214,9 +222,7 @@ pub fn prove_with_label_and_grinding<C: Challenger>(
     grinding: Grinding,
     ch: &mut C,
 ) -> (Proof, Claim) {
-    let out = prove_with_support_with_grinding(
-        label, &pa, &pb, z, m_words, 0, None, grinding, ch,
-    );
+    let out = prove_with_support_with_grinding(label, &pa, &pb, z, m_words, 0, None, grinding, ch);
     // The borrowed originals were never written; recycle them here, as the
     // pre-borrow fold used to when it swapped them out at round 1.
     crate::scratch::give_f128(pa);

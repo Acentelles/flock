@@ -90,7 +90,10 @@ fn kappa7_wide_gate_union() {
                 z[at(c, j)] = prev;
             }
         }
-        assert!(ty.satisfies(&z, nu, n), "wide witness must satisfy (used={used})");
+        assert!(
+            ty.satisfies(&z, nu, n),
+            "wide witness must satisfy (used={used})"
+        );
 
         let union = UnionInstance::new(&registry, vec![n]);
         let pcs_params = PcsParams {

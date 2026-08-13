@@ -117,6 +117,9 @@ fn random_sha2_inputs(rng: &mut Rng, n: usize) -> Vec<sha2::Compression> {
 // packed-direct claims collapse into merged-column scalar groups (one
 // dual value each); the multipoint label bumped to v1, so even the
 // boolean-only fixtures here (no packed-direct claims) move.
+// Re-pinned 2026-08-13 after circuit digests began binding fixed-public
+// declarations and the retained registry. The statement transcript changes
+// by design; two deterministic print runs agreed for all six fixtures.
 fn check(label: &str, expected: &str, got: String) {
     if std::env::var_os("M6_FIXTURES_PRINT").is_some() {
         println!("(\"{label}\", \"{got}\"),");
@@ -162,22 +165,22 @@ fn m6_merged_union_proof_bytes_pinned() {
         (
             "merged-nu10-1024-1024",
             [1024, 1024],
-            "75fa201136b2a7ec39a8ffcb80dd50de5293b5c1fada285a0ebb3322c3982b2c",
+            "86905eb1f362323013b0b10d52ec4cc9759ed437683ec4bb4a21cc1727ab01bd",
         ),
         (
             "merged-nu10-50-37",
             [50, 37],
-            "09854073d0c4d6805f81782ccebc64d95a6f10db4ef5fab9c580a84d16e1f2ee",
+            "f63f7a1f09c7ad07996dcf8abb3a5cdfccd2a86959ca1e4fa5ec4c8683bb40f9",
         ),
         (
             "merged-nu10-8-8",
             [8, 8],
-            "0fc6dfb671d97a3efbcc5e1dead8709def136d24f171968906933298869c055a",
+            "1763a59de978d72cf58d23de7d221e207ae9f15ec0ddb2d52f57d9ed59fd9850",
         ),
         (
             "merged-nu10-0-64",
             [0, 64],
-            "a1272527b4a56ca9f32cf2fee0003d9fc6ddf44e558959b38535ab7d15eb3734",
+            "a560716ba14b08e19b8d8c0b29d57a563d78d7c1ba9da77b6e1dd46c2d8bacf0",
         ),
     ];
 
@@ -253,7 +256,7 @@ fn m6_merged_union_proof_bytes_pinned() {
 fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
     // BLAKE3, 256 blocks (m = 22).
     {
-        const EXPECTED: &str = "a2f511c2557c34fc243fe5179e5467a223b16908037e9000e00471a860fd5c96";
+        const EXPECTED: &str = "727b5c0ebd7f7289763ae770c3d519347c6c805cfa9abc1fdd4d784400659176";
         let n_blocks = 256usize;
         let setup = blake3::Blake3Setup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_B3B3);
@@ -270,12 +273,8 @@ fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
             circuit,
         );
         let mut ch = FsChallenger::new(DOMAIN);
-        let (proof, commitment, claim) = prover::prove_fast_ligerito_union(
-            &union,
-            &setup.pcs_params,
-            vec![slot],
-            &mut ch,
-        );
+        let (proof, commitment, claim) =
+            prover::prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
         check(
             "merged-anchor-blake3-m22",
             EXPECTED,
@@ -285,7 +284,7 @@ fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
 
     // SHA-256, 128 blocks (m = 22).
     {
-        const EXPECTED: &str = "7b858050b891ffc5a3b846d0029be61032bef0ff4e699405dbdb09e010dcfc32";
+        const EXPECTED: &str = "f595c6c0605f2d2cd78033b63e913f58802cfbde68d2802f698001faa92de50a";
         let n_blocks = 128usize;
         let setup = sha2::Sha256HybridSetup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_5252);
@@ -302,12 +301,8 @@ fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
             circuit,
         );
         let mut ch = FsChallenger::new(DOMAIN);
-        let (proof, commitment, claim) = prover::prove_fast_ligerito_union(
-            &union,
-            &setup.pcs_params,
-            vec![slot],
-            &mut ch,
-        );
+        let (proof, commitment, claim) =
+            prover::prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
         check(
             "merged-anchor-sha2-m22",
             EXPECTED,

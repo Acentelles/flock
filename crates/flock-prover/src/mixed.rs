@@ -224,10 +224,7 @@ impl MixedSetup {
     /// `PcsParams.m` cannot redirect verification.
     pub fn pcs_params(&self, counts: MixedCounts, profile: LigeritoProfile) -> PcsParams {
         let union = self.union(counts);
-        let lb = flock_core::pcs::ligerito::embedded_initial_k_or_default(
-            union.dense_m(),
-            profile,
-        );
+        let lb = flock_core::pcs::ligerito::embedded_initial_k_or_default(union.dense_m(), profile);
         PcsParams {
             m: union.dense_m(),
             log_inv_rate: profile.log_inv_rate(),
@@ -385,10 +382,7 @@ impl MerkleMixedSetup {
     /// on both sides exactly as [`MixedSetup::pcs_params`].
     pub fn pcs_params(&self, counts: MerkleMixedCounts, profile: LigeritoProfile) -> PcsParams {
         let union = self.union(counts);
-        let lb = flock_core::pcs::ligerito::embedded_initial_k_or_default(
-            union.dense_m(),
-            profile,
-        );
+        let lb = flock_core::pcs::ligerito::embedded_initial_k_or_default(union.dense_m(), profile);
         PcsParams {
             m: union.dense_m(),
             log_inv_rate: profile.log_inv_rate(),

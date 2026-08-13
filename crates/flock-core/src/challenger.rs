@@ -489,8 +489,14 @@ impl B3Chain {
     /// high half becomes the next chaining value, keeping a scalar challenge,
     /// the PoW predicate and the continuing state pairwise disjoint.
     fn apply_pow_squeeze(&mut self, nonce: u64, bits: u32, out: &mut [u8]) -> bool {
-        assert!(!out.is_empty(), "a PoW must protect at least one challenge word");
-        assert!(bits <= 128, "the fused PoW predicate occupies one F128 word");
+        assert!(
+            !out.is_empty(),
+            "a PoW must protect at least one challenge word"
+        );
+        assert!(
+            bits <= 128,
+            "the fused PoW predicate occupies one F128 word"
+        );
         let ob = self.pow_candidate_output(nonce, bits);
         let mut first = [0u8; 64];
         for (i, w) in ob.iter().enumerate() {
@@ -517,13 +523,7 @@ impl B3Chain {
             }
         }
         while off < out.len() {
-            let ob = crate::hash::blake3_compress(
-                &self.cv,
-                &[0u32; 16],
-                0,
-                0,
-                CHAIN_SQUEEZE,
-            );
+            let ob = crate::hash::blake3_compress(&self.cv, &[0u32; 16], 0, 0, CHAIN_SQUEEZE);
             self.cv = ob[..8].try_into().expect("8 words");
             let mut bytes = [0u8; 64];
             for (i, w) in ob.iter().enumerate() {
@@ -537,7 +537,10 @@ impl B3Chain {
     }
 
     fn grind_pow_squeeze_into(&mut self, bits: u32, out: &mut [u8]) -> u64 {
-        assert!(bits <= 128, "the fused PoW predicate occupies one F128 word");
+        assert!(
+            bits <= 128,
+            "the fused PoW predicate occupies one F128 word"
+        );
         const PARALLEL_GRIND_MIN_HASHES: u64 = 1 << 13;
         const GRIND_CHUNK: u64 = 1 << 10;
         let nonce = if bits == 0 {
@@ -545,13 +548,9 @@ impl B3Chain {
         } else if (1u64 << bits.min(63)) < PARALLEL_GRIND_MIN_HASHES {
             let mut start = 0u64;
             loop {
-                if let Some(n) = blake3_chain_pow_scan(
-                    &self.cv,
-                    &self.buf,
-                    start,
-                    GRIND_CHUNK,
-                    bits,
-                ) {
+                if let Some(n) =
+                    blake3_chain_pow_scan(&self.cv, &self.buf, start, GRIND_CHUNK, bits)
+                {
                     break n;
                 }
                 start = start.saturating_add(GRIND_CHUNK);
@@ -1528,7 +1527,11 @@ mod tests {
             let mut words = FsChallenger::with_hash(b"f256-observe", kind);
             extension.observe_f256(value);
             words.observe_f128_slice(&value.coordinates());
-            assert_eq!(extension.sample_f128_vec(4), words.sample_f128_vec(4), "{kind}");
+            assert_eq!(
+                extension.sample_f128_vec(4),
+                words.sample_f128_vec(4),
+                "{kind}"
+            );
         }
     }
 
@@ -1693,12 +1696,17 @@ mod b3_chain_tests {
         let mut bad = FsChallenger::with_chained_blake3(b"fused-pow-test");
         bad.observe_f128_slice(&observed);
         let bad_nonce = (0..u64::MAX)
-            .find(|&n| n != nonce && {
-                let mut probe = bad.clone();
-                probe.verify_pow_and_sample_f128_vec(n, 6, 9).is_none()
+            .find(|&n| {
+                n != nonce && {
+                    let mut probe = bad.clone();
+                    probe.verify_pow_and_sample_f128_vec(n, 6, 9).is_none()
+                }
             })
             .expect("an invalid six-bit nonce exists");
-        assert!(bad.verify_pow_and_sample_f128_vec(bad_nonce, 6, 9).is_none());
+        assert!(
+            bad.verify_pow_and_sample_f128_vec(bad_nonce, 6, 9)
+                .is_none()
+        );
 
         let mut zero = FsChallenger::with_chained_blake3(b"fused-pow-zero");
         assert!(zero.verify_pow_and_sample_f128(1, 0).is_none());

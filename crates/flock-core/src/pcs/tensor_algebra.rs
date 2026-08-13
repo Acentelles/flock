@@ -153,10 +153,7 @@ impl TensorAlgebra256 {
     }
 
     pub fn fold(self, coeffs: &[F128]) -> F256 {
-        F256::new(
-            self.c0.fold_vertical(coeffs),
-            self.c1.fold_vertical(coeffs),
-        )
+        F256::new(self.c0.fold_vertical(coeffs), self.c1.fold_vertical(coeffs))
     }
 }
 

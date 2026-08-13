@@ -332,11 +332,7 @@ pub(super) struct SumcheckProver256 {
 }
 
 impl SumcheckProver256 {
-    pub(super) fn new(
-        f: Vec<F128>,
-        b: Option<Vec<F128>>,
-        first: SumcheckMessage,
-    ) -> Self {
+    pub(super) fn new(f: Vec<F128>, b: Option<Vec<F128>>, first: SumcheckMessage) -> Self {
         Self {
             initial_f: Some(f),
             initial_b: b,
@@ -593,8 +589,7 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
     for _ in 0..ood_count(0) {
         let z = challenger.sample_f128_vec(log_n);
         let (ood_msg, y, eq_z) = if factored {
-            let (msg, y) =
-                round_msg_and_eval_eq_point_blocked(&packed_witness, &z, fold_block);
+            let (msg, y) = round_msg_and_eval_eq_point_blocked(&packed_witness, &z, fold_block);
             (msg, y, None)
         } else {
             let eq_z = build_eq_table(&z);
@@ -722,10 +717,8 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
         strat(0),
     );
     grinding_nonces.push(nonce);
-    let (nonce, alpha_0) = challenger.grind_pow_and_sample_f128_vec(
-        consistency_bits(0),
-        ceil_log2(config.queries[0]),
-    );
+    let (nonce, alpha_0) =
+        challenger.grind_pow_and_sample_f128_vec(consistency_bits(1), ceil_log2(config.queries[0]));
     consistency_batch_grinding_nonces.push(nonce);
     let opened_rows_0: Vec<Vec<F128>> = queries_0.iter().map(|&q| l0_row(q).to_vec()).collect();
     let initial_proof = RecursiveProof {
@@ -736,7 +729,7 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let enforced_0 = induce_enforced_sum(&opened_rows_0, &lane_challenges, &alpha_0);
     let msg = sumcheck.introduce_presplit_basis(basis_0, enforced_0);
     observe_message(challenger, msg);
-    let (nonce, beta) = challenger.grind_pow_and_sample_f128(claim_bits(0));
+    let (nonce, beta) = challenger.grind_pow_and_sample_f128(claim_bits(1));
     claim_batch_grinding_nonces.push(nonce);
     sumcheck.glue(beta);
 
@@ -777,8 +770,7 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 ceil_log2(config.queries[level]),
             );
             consistency_batch_grinding_nonces.push(nonce);
-            let (nonce, _) =
-                challenger.grind_pow_and_sample_f128(claim_bits(level));
+            let (nonce, _) = challenger.grind_pow_and_sample_f128(claim_bits(level));
             claim_batch_grinding_nonces.push(nonce);
             let opened_rows = queries.iter().map(|&q| previous.row(q).to_vec()).collect();
             return LigeritoProof {
@@ -833,7 +825,7 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
         );
         grinding_nonces.push(nonce);
         let (nonce, alpha) = challenger.grind_pow_and_sample_f128_vec(
-            consistency_bits(level),
+            consistency_bits(next_level),
             ceil_log2(config.queries[level]),
         );
         consistency_batch_grinding_nonces.push(nonce);
@@ -852,7 +844,7 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let enforced = induce_enforced_sum(&opened_rows, &level_challenges, &alpha);
         let msg = sumcheck.introduce_presplit_basis(basis, enforced);
         observe_message(challenger, msg);
-        let (nonce, beta) = challenger.grind_pow_and_sample_f128(claim_bits(level));
+        let (nonce, beta) = challenger.grind_pow_and_sample_f128(claim_bits(next_level));
         claim_batch_grinding_nonces.push(nonce);
         sumcheck.glue(beta);
         previous = next;
@@ -900,16 +892,13 @@ fn induced_basis_at_residual(
             per_query
                 .iter()
                 .map(|&(weight, prefix, ref suffix)| {
-                    let tail = suffix
-                        .iter()
-                        .enumerate()
-                        .fold(F256::ONE, |acc, (j, &wk)| {
-                            if (y >> j) & 1 == 0 {
-                                acc
-                            } else {
-                                acc * F256::from(wk)
-                            }
-                        });
+                    let tail = suffix.iter().enumerate().fold(F256::ONE, |acc, (j, &wk)| {
+                        if (y >> j) & 1 == 0 {
+                            acc
+                        } else {
+                            acc * F256::from(wk)
+                        }
+                    });
                     prefix * tail * weight
                 })
                 .fold(F256::ZERO, |a, b| a + b)
@@ -957,19 +946,12 @@ fn residual_original_challenges(
 }
 
 fn coordinate_factor_product(levels: &[Vec<F256>], start_level: usize) -> F256 {
-    levels[start_level..]
-        .iter()
-        .fold(F256::ONE, |acc, level| {
-            acc * coordinate_fold_factor(level[0])
-        })
+    levels[start_level..].iter().fold(F256::ONE, |acc, level| {
+        acc * coordinate_fold_factor(level[0])
+    })
 }
 
-fn eq_residual(
-    point: &[F128],
-    fixed: &[F256],
-    residual_log: usize,
-    scale: F256,
-) -> Vec<F256> {
+fn eq_residual(point: &[F128], fixed: &[F256], residual_log: usize, scale: F256) -> Vec<F256> {
     assert_eq!(fixed.len() + residual_log, point.len());
     let prefix = point[..fixed.len()]
         .iter()
@@ -981,11 +963,7 @@ fn eq_residual(
                 .iter()
                 .enumerate()
                 .fold(prefix, |acc, (j, &z)| {
-                    acc * if (y >> j) & 1 == 1 {
-                        z
-                    } else {
-                        F128::ONE + z
-                    }
+                    acc * if (y >> j) & 1 == 1 { z } else { F128::ONE + z }
                 })
         })
         .collect()
@@ -1142,7 +1120,7 @@ where
     };
     let Some(alpha_0) = challenger.verify_pow_and_sample_f128_vec(
         nonce,
-        consistency_bits(0),
+        consistency_bits(1),
         ceil_log2(config.queries[0]),
     ) else {
         return false;
@@ -1174,7 +1152,7 @@ where
     let Some(&nonce) = proof.claim_batch_grinding_nonces.get(claim_nonce) else {
         return false;
     };
-    let Some(beta_0) = challenger.verify_pow_and_sample_f128(nonce, claim_bits(0)) else {
+    let Some(beta_0) = challenger.verify_pow_and_sample_f128(nonce, claim_bits(1)) else {
         return false;
     };
     claim_nonce += 1;
@@ -1270,11 +1248,8 @@ where
             ) {
                 return false;
             }
-            let enforced = induce_enforced_sum(
-                &proof.final_proof.opened_rows,
-                &level_challenges[i],
-                &alpha,
-            );
+            let enforced =
+                induce_enforced_sum(&proof.final_proof.opened_rows, &level_challenges[i], &alpha);
             let Some(&nonce) = proof.claim_batch_grinding_nonces.get(claim_nonce) else {
                 return false;
             };
@@ -1335,17 +1310,9 @@ where
 
             for context in &consistency_contexts {
                 let fixed = if context.start_level == 0 {
-                    residual_original_challenges(
-                        &[],
-                        &level_challenges,
-                        context.start_level,
-                    )
+                    residual_original_challenges(&[], &level_challenges, context.start_level)
                 } else {
-                    residual_original_challenges(
-                        &[],
-                        &level_challenges,
-                        context.start_level,
-                    )
+                    residual_original_challenges(&[], &level_challenges, context.start_level)
                 };
                 let values = induced_basis_at_residual(
                     context.log_cols,
@@ -1354,8 +1321,8 @@ where
                     &fixed,
                     extension_dim,
                 );
-                let scale =
-                    coordinate_factor_product(&level_challenges, context.start_level) * context.beta;
+                let scale = coordinate_factor_product(&level_challenges, context.start_level)
+                    * context.beta;
                 for (dst, value) in residual.iter_mut().zip(values) {
                     *dst += value * scale;
                 }
@@ -1431,7 +1398,7 @@ where
         };
         let Some(alpha) = challenger.verify_pow_and_sample_f128_vec(
             nonce,
-            consistency_bits(level),
+            consistency_bits(level + 1),
             ceil_log2(config.queries[level]),
         ) else {
             return false;
@@ -1453,11 +1420,7 @@ where
         ) {
             return false;
         }
-        let enforced = induce_enforced_sum(
-            &opening.opened_rows,
-            &level_challenges[i],
-            &alpha,
-        );
+        let enforced = induce_enforced_sum(&opening.opened_rows, &level_challenges[i], &alpha);
         let Some(&msg) = proof.sumcheck_transcript_f256.get(tx) else {
             return false;
         };
@@ -1467,7 +1430,7 @@ where
         let Some(&nonce) = proof.claim_batch_grinding_nonces.get(claim_nonce) else {
             return false;
         };
-        let Some(beta) = challenger.verify_pow_and_sample_f128(nonce, claim_bits(level)) else {
+        let Some(beta) = challenger.verify_pow_and_sample_f128(nonce, claim_bits(level + 1)) else {
             return false;
         };
         claim_nonce += 1;
@@ -1604,19 +1567,17 @@ mod tests {
             .collect();
         let lane_weights = build_eq_table256(&lane_point);
         let row_weights = build_eq_table(&alpha);
-        let expected = rows.iter().zip(row_weights).fold(
-            F256::ZERO,
-            |outer, (row, row_weight)| {
+        let expected = rows
+            .iter()
+            .zip(row_weights)
+            .fold(F256::ZERO, |outer, (row, row_weight)| {
                 outer
                     + row
                         .iter()
                         .zip(&lane_weights)
-                        .fold(F256::ZERO, |inner, (&word, &weight)| {
-                            inner + weight * word
-                        })
+                        .fold(F256::ZERO, |inner, (&word, &weight)| inner + weight * word)
                         * row_weight
-            },
-        );
+            });
         assert_eq!(induce_enforced_sum(&rows, &lane_point, &alpha), expected);
     }
 

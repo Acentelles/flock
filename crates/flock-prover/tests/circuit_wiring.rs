@@ -86,12 +86,10 @@ fn union_pcs_params(union: &UnionInstance<'_>) -> PcsParams {
             LigeritoProfile::Fast,
         ),
         profile: LigeritoProfile::Fast,
-        num_lanes: union.commit_lanes(
-            flock_core::pcs::ligerito::embedded_initial_k_or_default(
-                union.dense_m(),
-                LigeritoProfile::Fast,
-            ),
-        ),
+        num_lanes: union.commit_lanes(flock_core::pcs::ligerito::embedded_initial_k_or_default(
+            union.dense_m(),
+            LigeritoProfile::Fast,
+        )),
         merkle_hash: Default::default(),
     }
 }
@@ -1504,13 +1502,9 @@ fn a_merge_node_folds_two_circuit_proofs() {
     let circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![circuit_lc];
     let circuit0 = &proofs[0].3;
     let digest = circuit0.digest();
-    let jagged_p: Vec<aggregate::JaggedKeyProve<'_>> = vec![(
-        digest,
-        &jagged_params,
-        jaggeds.iter().collect(),
-    )];
-    let jagged_v: Vec<aggregate::JaggedKeyVerify<'_>> =
-        vec![(digest, jaggeds.iter().collect())];
+    let jagged_p: Vec<aggregate::JaggedKeyProve<'_>> =
+        vec![(digest, &jagged_params, jaggeds.iter().collect())];
+    let jagged_v: Vec<aggregate::JaggedKeyVerify<'_>> = vec![(digest, jaggeds.iter().collect())];
     let mut chp = FsChallenger::new(b"merge");
     let (agg, acc) = aggregate::prove_aggregate_classes(
         &registry,
@@ -1671,8 +1665,14 @@ fn a_merge_node_folds_two_circuit_proofs() {
         &mut chv,
     )
     .expect("the two-prior merge verifies");
-    assert_eq!(acc2_p, acc2_v, "prover and verifier accumulators must agree");
-    assert!(acc2_v.discharge(&mats), "the inherited-only merge discharges");
+    assert_eq!(
+        acc2_p, acc2_v,
+        "prover and verifier accumulators must agree"
+    );
+    assert!(
+        acc2_v.discharge(&mats),
+        "the inherited-only merge discharges"
+    );
     assert!(
         acc2_v.discharge_sigma(&[circuit0]),
         "both children's sigma claims fold through the merge to one root discharge"

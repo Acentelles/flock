@@ -186,8 +186,14 @@ fn main() {
             mk_ch,
             |ch| {
                 // Dense circuit, no padding: the live mask is `None`.
-                product_gkr::prove_batched(black_box(&f), black_box(&g), black_box(&sigma), None, ch)
-                    .0
+                product_gkr::prove_batched(
+                    black_box(&f),
+                    black_box(&g),
+                    black_box(&sigma),
+                    None,
+                    ch,
+                )
+                .0
             },
             |p, ch| {
                 product_gkr::verify_batched(mu, p, None, ch).expect("prod-GKR-batched verify");

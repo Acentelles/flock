@@ -303,13 +303,7 @@ fn merkle_blake3_mixed_wrong_counts_rejected() {
         let mut ch_v = FsChallenger::new(DOMAIN);
         assert!(
             setup
-                .verify(
-                    bad,
-                    LigeritoProfile::Fast,
-                    &commitment,
-                    &proof,
-                    &mut ch_v,
-                )
+                .verify(bad, LigeritoProfile::Fast, &commitment, &proof, &mut ch_v,)
                 .is_err(),
             "a (5, 6) proof verified as {bad:?}"
         );

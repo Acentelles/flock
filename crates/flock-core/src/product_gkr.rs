@@ -912,24 +912,13 @@ fn gv_fold(v: &GView<'_>, rho: F128) -> GVec {
                 lens.push(1);
             }
         }
-        GVec {
-            buf,
-            lens,
-            rows: 1,
-        }
+        GVec { buf, lens, rows: 1 }
     }
 }
 
 /// `Σ_{x ∈ [a, b)} lo[x mod B]·hi[x div B]` in O(1) from prefix-sum arrays
 /// (`plo[i] = Σ_{j<i} lo[j]`, likewise `phi`; char 2: suffix = total + prefix).
-fn range_eq_sum(
-    lo: &[F128],
-    hi: &[F128],
-    plo: &[F128],
-    phi: &[F128],
-    a: usize,
-    b: usize,
-) -> F128 {
+fn range_eq_sum(lo: &[F128], hi: &[F128], plo: &[F128], phi: &[F128], a: usize, b: usize) -> F128 {
     if a >= b {
         return F128::ZERO;
     }
@@ -970,11 +959,7 @@ fn gv_message(
         let (bmask, bshift) = (bsz - 1, bsz.trailing_zeros() as usize);
         #[inline]
         fn rd(s: &[F128], r: usize) -> F128 {
-            if r < s.len() {
-                s[r]
-            } else {
-                F128::ONE
-            }
+            if r < s.len() { s[r] } else { F128::ONE }
         }
         let body = |g: usize| -> (F128, F128) {
             let lmax = vs.iter().map(|v| v.lens[g]).max().unwrap();
@@ -1455,9 +1440,10 @@ impl BatchedGrinding {
         if self.fingerprint_bits == 0 {
             0
         } else {
-            self.fingerprint_bits.max(crate::challenger::grinding_bits_for_degree(
-                live_entries.saturating_sub(1),
-            ))
+            self.fingerprint_bits
+                .max(crate::challenger::grinding_bits_for_degree(
+                    live_entries.saturating_sub(1),
+                ))
         }
     }
 
@@ -1580,15 +1566,7 @@ pub(crate) fn prove_batched_dense_masked_for_tests<C: Challenger>(
     live: Option<&LiveMask>,
     ch: &mut C,
 ) -> (ProductGkrBatchedProof, ProductGkrBatchedClaim) {
-    prove_batched_impl(
-        f,
-        g,
-        sigma,
-        live,
-        true,
-        BatchedGrinding::disabled(),
-        ch,
-    )
+    prove_batched_impl(f, g, sigma, live, true, BatchedGrinding::disabled(), ch)
 }
 
 /// The sparse masked σ evaluation: `Σ_live eq_lo(row)·eq_hi(slot)·tag(σ(x))`
@@ -2213,14 +2191,7 @@ pub fn verify_batched_with_sigma<C: Challenger>(
     ch: &mut C,
 ) -> Result<ProductGkrBatchedClaim, VerifyError> {
     assert_eq!(sigma.len(), 1usize << mu, "σ length must be 2^mu");
-    verify_batched_with_sigma_and_grinding(
-        mu,
-        proof,
-        sigma,
-        live,
-        BatchedGrinding::disabled(),
-        ch,
-    )
+    verify_batched_with_sigma_and_grinding(mu, proof, sigma, live, BatchedGrinding::disabled(), ch)
 }
 
 /// [`verify_batched_with_sigma`] with an explicit grinding policy.
@@ -2387,7 +2358,11 @@ mod tests {
         let mut rng = Rng::new(0x6B0B_2026);
         for (nu, c, seed_counts) in [
             (4usize, 3usize, [5usize, 16, 0, 9, 1, 13, 7, 3].as_slice()),
-            (3, 4, [8, 0, 3, 1, 7, 2, 5, 4, 0, 8, 6, 1, 2, 3, 0, 5].as_slice()),
+            (
+                3,
+                4,
+                [8, 0, 3, 1, 7, 2, 5, 4, 0, 8, 6, 1, 2, 3, 0, 5].as_slice(),
+            ),
             (5, 2, [31, 0, 17, 32].as_slice()),
         ] {
             let mu = nu + c;
@@ -2804,8 +2779,7 @@ mod tests {
         let policy = BatchedGrinding::per_challenge_128();
         let mut chp = FsChallenger::new(b"prod-gkr-batched-grinding-test");
         bind(&mut chp, &f, &g, &sigma);
-        let (proof, claim_p) =
-            prove_batched_with_grinding(&f, &g, &sigma, None, policy, &mut chp);
+        let (proof, claim_p) = prove_batched_with_grinding(&f, &g, &sigma, None, policy, &mut chp);
         assert_eq!(proof.grinding_nonces.len(), policy.nonce_count(mu, 1 << mu));
 
         let mut chv = FsChallenger::new(b"prod-gkr-batched-grinding-test");
@@ -3039,7 +3013,8 @@ mod tests {
         // ...and still accepts the honest proof.
         let mut chv = FsChallenger::new(DOMAIN_TEST);
         bind(&mut chv, &f, &g, &sigma);
-        verify_batched_with_sigma(mu, &proof, &sigma, None, &mut chv).expect("honest proof verifies");
+        verify_batched_with_sigma(mu, &proof, &sigma, None, &mut chv)
+            .expect("honest proof verifies");
     }
 
     /// The F128 additive-NTT PREFIX-EXTENSION property that a GKR univariate

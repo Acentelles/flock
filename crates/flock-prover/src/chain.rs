@@ -169,13 +169,13 @@ impl ChainGrinding {
         if self.initial_bits == 0 {
             0
         } else {
-            self.initial_bits.max(flock_core::challenger::grinding_bits_for_degree(n.max(1)))
+            self.initial_bits
+                .max(flock_core::challenger::grinding_bits_for_degree(n.max(1)))
         }
     }
 
     fn nonce_count(self, n: usize) -> usize {
-        usize::from(self.initial_bits_for(n) != 0)
-            + (n + 1) * usize::from(self.round_bits != 0)
+        usize::from(self.initial_bits_for(n) != 0) + (n + 1) * usize::from(self.round_bits != 0)
     }
 }
 
@@ -226,12 +226,7 @@ pub fn prove_chain_shift<Ch: Challenger>(
     out_vals: &[F128],
     challenger: &mut Ch,
 ) -> (ChainShiftProof, ChainClaims) {
-    prove_chain_shift_with_grinding(
-        in_vals,
-        out_vals,
-        ChainGrinding::disabled(),
-        challenger,
-    )
+    prove_chain_shift_with_grinding(in_vals, out_vals, ChainGrinding::disabled(), challenger)
 }
 
 /// [`prove_chain_shift`] with explicit Fiat--Shamir grinding.
@@ -808,18 +803,11 @@ mod tests {
         let out_vals = &chain[1..];
         let policy = ChainGrinding::per_challenge_128();
         let mut chp = FsChallenger::new(b"chain-shift-grinding-test");
-        let (proof, claim_p) =
-            prove_chain_shift_with_grinding(in_vals, out_vals, policy, &mut chp);
+        let (proof, claim_p) = prove_chain_shift_with_grinding(in_vals, out_vals, policy, &mut chp);
         let mut chv = FsChallenger::new(b"chain-shift-grinding-test");
-        let claim_v = verify_chain_shift_with_grinding(
-            &proof,
-            chain[0],
-            chain[n_total],
-            n,
-            policy,
-            &mut chv,
-        )
-        .expect("grinded chain shift verifies");
+        let claim_v =
+            verify_chain_shift_with_grinding(&proof, chain[0], chain[n_total], n, policy, &mut chv)
+                .expect("grinded chain shift verifies");
         assert_eq!(claim_p, claim_v);
 
         let mut missing = proof;

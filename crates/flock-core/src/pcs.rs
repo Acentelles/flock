@@ -137,8 +137,7 @@ pub struct PackedDirectClaim {
 /// path (round-0-only JIT fill). A few-ms effect only resolves under an
 /// ALTERNATING in-process instrument over identical inputs — process-level
 /// arms on this box carry ±4-8 ms of interference per sample.
-pub static VIRTUAL_B_OVERRIDE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(0);
+pub static VIRTUAL_B_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Fiat--Shamir grinding policy for the PCS transport that sits before the
 /// Ligerito opening.  Each nonzero field is applied immediately after its
@@ -179,8 +178,11 @@ impl OpeningGrinding {
         Self {
             // 7 / 2^128, then a 2^-3 PoW filter.
             ring_switch_bits: 3,
-            // 1 / 2^128, then a 2^-1 PoW filter.
-            claim_batch_bits: 1,
+            // The transport coefficient is sampled before Ligerito's OOD
+            // points bind one candidate from the Johnson list. Its bad event
+            // therefore unions over L0's list (log2 L < 6 in every embedded
+            // strict profile); six PoW bits make L/2^(128+6) < 2^-128.
+            claim_batch_bits: 6,
             // Quadratic sumcheck rounds: 2 / 2^128, then 2^-2.
             merged_round_bits: 2,
             multipoint: jagged::MultipointGrinding::per_challenge_128(),
@@ -189,7 +191,9 @@ impl OpeningGrinding {
 
     #[inline]
     fn claim_batch_bits_for(self, claim_count: usize) -> u32 {
-        (claim_count > 1).then_some(self.claim_batch_bits).unwrap_or(0)
+        (claim_count > 1)
+            .then_some(self.claim_batch_bits)
+            .unwrap_or(0)
     }
 }
 
@@ -1013,7 +1017,9 @@ pub fn verify_opening_batch_ligerito_mixed_with_grinding<Ch: Challenger>(
     let batch_bits = grinding.claim_batch_bits_for(n_rs + n_pd);
     let expected_batch_nonces = usize::from(batch_bits != 0);
     if proof.batching_nonces.len() != expected_batch_nonces {
-        return Err(VerifyError::RingSwitch(ring_switch::VerifyError::InvalidGrinding));
+        return Err(VerifyError::RingSwitch(
+            ring_switch::VerifyError::InvalidGrinding,
+        ));
     }
     // Lane-major (integer-lane) commitments: supported only for the merged
     // inner-open configuration (packed-direct claims only). The RS claims'
@@ -1147,16 +1153,17 @@ pub fn verify_opening_batch_ligerito_mixed_with_grinding<Ch: Challenger>(
                     .zip(gammas_pd.iter())
                     .zip(pd_prefix_scalars.iter())
                 {
-                    let suffix = pt[prefix_len..]
-                        .iter()
-                        .enumerate()
-                        .fold(F128::ONE, |acc, (j, &p)| {
-                            acc * if (y_bits >> j) & 1 == 1 {
-                                p
-                            } else {
-                                F128::ONE + p
-                            }
-                        });
+                    let suffix =
+                        pt[prefix_len..]
+                            .iter()
+                            .enumerate()
+                            .fold(F128::ONE, |acc, (j, &p)| {
+                                acc * if (y_bits >> j) & 1 == 1 {
+                                    p
+                                } else {
+                                    F128::ONE + p
+                                }
+                            });
                     sum += *prefix_scalar * (*g * suffix);
                 }
                 sum
@@ -2300,4 +2307,10 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn strict_transport_grinds_over_the_johnson_l0_list() {
+        let policy = OpeningGrinding::per_challenge_128();
+        assert_eq!(policy.claim_batch_bits_for(1), 0);
+        assert_eq!(policy.claim_batch_bits_for(2), 6);
+    }
 }

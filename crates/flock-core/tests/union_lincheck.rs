@@ -557,18 +557,14 @@ fn two_type_union_lincheck_matches_brute_force() {
     let mut ch_p_secure = FsChallenger::new(b"flock-union-lincheck-secure-v0");
     let (zc_proof_secure, zc_claim_secure) =
         zerocheck::prove_packed_padded(&a_p, &b_p, &c_p, m, &padding, &mut ch_p_secure);
-    let x_ab_secure = union.x_ab_from_mlv(
-        zc_claim_secure.z,
-        &zc_claim_secure.mlv_challenges,
+    let x_ab_secure = union.x_ab_from_mlv(zc_claim_secure.z, &zc_claim_secure.mlv_challenges);
+    let (lc_proof_secure, lc_claim_secure, _) = lincheck::prove_union_capture_z_vec_with_grinding(
+        &union,
+        &lc_slots,
+        &x_ab_secure,
+        grinding,
+        &mut ch_p_secure,
     );
-    let (lc_proof_secure, lc_claim_secure, _) =
-        lincheck::prove_union_capture_z_vec_with_grinding(
-            &union,
-            &lc_slots,
-            &x_ab_secure,
-            grinding,
-            &mut ch_p_secure,
-        );
     assert_eq!(
         lc_proof_secure.grinding_nonces.len(),
         grinding.nonce_count(registry.m_bool() - nu - K_SKIP, 1, K_SKIP),
@@ -577,10 +573,7 @@ fn two_type_union_lincheck_matches_brute_force() {
     let mut ch_v_secure = FsChallenger::new(b"flock-union-lincheck-secure-v0");
     let zc_claim_secure_v = zerocheck::verify(m, &zc_proof_secure, &mut ch_v_secure)
         .expect("ungrinded zerocheck side must verify");
-    let x_ab_secure_v = union.x_ab_from_mlv(
-        zc_claim_secure_v.z,
-        &zc_claim_secure_v.mlv_challenges,
-    );
+    let x_ab_secure_v = union.x_ab_from_mlv(zc_claim_secure_v.z, &zc_claim_secure_v.mlv_challenges);
     let lc_claim_secure_v = lincheck::verify_union_with_grinding(
         &union,
         &circuits,
@@ -1203,13 +1196,19 @@ fn aggregating_real_proofs_defers_all_matrix_work_to_one_discharge() {
     // its own accumulator — plus fresh assertions, folding 4 → 1 per
     // matrix (two inherited, two fresh).
     let leaf = |i: usize, j: usize| {
-        run(&[assert_of(&slots[i], false), assert_of(&slots[j], false)], &[])
-            .expect("leaf aggregation verifies")
+        run(
+            &[assert_of(&slots[i], false), assert_of(&slots[j], false)],
+            &[],
+        )
+        .expect("leaf aggregation verifies")
     };
     let (acc_l, acc_r) = (leaf(0, 1), leaf(2, 3));
     let fresh = [assert_of(&slots[1], false), assert_of(&slots[2], false)];
     let acc_m = run(&fresh, &[&acc_l, &acc_r]).expect("two-prior merge verifies");
-    assert!(acc_m.discharge(&mats), "the 4->1 accumulator must discharge");
+    assert!(
+        acc_m.discharge(&mats),
+        "the 4->1 accumulator must discharge"
+    );
 
     // A tampered INHERITED claim must poison the merge: the fold verifier
     // targets the claimed values, so the replay diverges from the honest
