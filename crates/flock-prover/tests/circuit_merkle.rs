@@ -3372,12 +3372,47 @@ fn emit_fs_chain(
     pub_payloads: &[bool],
     cross: &[Option<(usize, usize)>],
 ) -> (Vec<Vec<Wire>>, Vec<Option<Wire>>) {
+    emit_fs_chain_partitioned(
+        sb,
+        b3,
+        None,
+        iv,
+        trace,
+        stream,
+        bytes,
+        vals,
+        consts,
+        pub_payloads,
+        cross,
+    )
+}
+
+/// As [`emit_fs_chain`], with rows at and after `primary_rows` emitted into
+/// a second slot carrying the same BLAKE3 relation. Wires may cross the slot
+/// boundary normally; the circuit's copy constraints preserve the chain.
+fn emit_fs_chain_partitioned(
+    sb: &mut ShapeBuilder,
+    b3: flock_core::circuit::builder::SlotId,
+    alternate: Option<(flock_core::circuit::builder::SlotId, usize)>,
+    iv: [Wire; 2],
+    trace: &flock_prover::r1cs_hashes::fs_chain::FsChainTrace,
+    stream: &flock_core::transcript_record::Stream,
+    bytes: &[u8],
+    vals: &mut Vec<F128>,
+    consts: &mut Vec<(F128, Wire)>,
+    pub_payloads: &[bool],
+    cross: &[Option<(usize, usize)>],
+) -> (Vec<Vec<Wire>>, Vec<Option<Wire>>) {
     use flock_core::transcript_record::StreamWord;
     use flock_prover::r1cs_hashes::fs_chain::CvSource;
     let mut word_wire: Vec<Option<Wire>> = vec![None; stream.words.len()];
     let mut outs: Vec<Vec<Wire>> = Vec::with_capacity(trace.rows.len());
     let mut gate_in: Vec<[Wire; 7]> = Vec::with_capacity(trace.rows.len());
     for (i, row) in trace.rows.iter().enumerate() {
+        let b3_row = match alternate {
+            Some((slot, primary_rows)) if i >= primary_rows => slot,
+            _ => b3,
+        };
         let (_, _, counter, blen, flags) = *row;
         let link = trace.links[i];
         let params = cw(sb, vals, consts, pack_params(counter, blen, flags));
@@ -3385,7 +3420,7 @@ fn emit_fs_chain(
             let s = gate_in[root];
             let g_in = [s[0], s[1], s[2], s[3], s[4], s[5], params];
             gate_in.push(g_in);
-            outs.push(sb.gate(b3, &g_in));
+            outs.push(sb.gate(b3_row, &g_in));
             continue;
         }
         let (cv_in, m_in) = match link.right {
@@ -3485,7 +3520,7 @@ fn emit_fs_chain(
             cv_in[0], cv_in[1], m_in[0], m_in[1], m_in[2], m_in[3], params,
         ];
         gate_in.push(g_in);
-        outs.push(sb.gate(b3, &g_in));
+        outs.push(sb.gate(b3_row, &g_in));
     }
     (outs, word_wire)
 }
@@ -7385,10 +7420,10 @@ impl GateType for PowMaskGate {
 #[derive(Clone, Copy)]
 struct CollapsedSlots {
     b3: flock_core::circuit::builder::SlotId,
-    /// A second identical compression table under the Slim recursion
-    /// envelope. The two child-verifier regions use distinct slots so the
-    /// uniform row exponent can stay at 14; off-envelope circuits need only
-    /// the primary slot.
+    /// A second identical compression table for recursion shapes whose two
+    /// independent child-verifier workloads each fit a smaller row domain.
+    /// The Slim envelope and strict Fast nodes use distinct slots; smaller
+    /// standalone and compatibility-profile circuits retain one slot.
     b3_alt: Option<flock_core::circuit::builder::SlotId>,
     swap: flock_core::circuit::builder::SlotId,
     spread: flock_core::circuit::builder::SlotId,
@@ -7491,6 +7526,42 @@ impl Lvl {
         let lo_bits = self.depth - c;
         (stratum << lo_bits) | ((lo as usize) & ((1usize << lo_bits) - 1))
     }
+}
+
+/// Exact BLAKE compression rows emitted by [`emit_query_phase`]. Each level
+/// materializes only the cap layers down to its shallowest configured
+/// stratum. A query hashes its committed row, climbs to that stratum, and
+/// top-stratum queries take one additional edge so the opening binds to a
+/// derived cap-layer node without creating a transcript cycle.
+fn level_query_phase_b3_rows(g: &Lvl) -> (usize, usize, usize) {
+    let c_min = g.sched.summand_depths.last().copied().unwrap_or(g.c);
+    let n_layers = (g.c - c_min).max(1);
+    let cap_rows = (1..=n_layers).map(|j| 1usize << (g.c - j)).sum();
+    let leaf_rows = g.raw_row_words.div_ceil(4) * g.q;
+    let path_rows = (0..g.q)
+        .map(|k| {
+            let (ck, _) = g.q_stratum(k);
+            (g.depth - ck) + usize::from(ck == g.c)
+        })
+        .sum();
+    (leaf_rows, path_rows, cap_rows)
+}
+
+fn query_phase_b3_rows(geo: &[Lvl]) -> usize {
+    geo.iter()
+        .map(|g| {
+            let (leaf, path, cap) = level_query_phase_b3_rows(g);
+            leaf + path + cap
+        })
+        .sum()
+}
+
+/// Place `extra` identical-relation rows on two existing slots as evenly as
+/// their current loads permit. Returns `(extra_on_a, resulting_max_load)`.
+fn balance_extra_rows(a: usize, b: usize, extra: usize) -> (usize, usize) {
+    let target = (a + b + extra).div_ceil(2).max(a).max(b);
+    let on_a = target.saturating_sub(a).min(extra);
+    (on_a, (a + on_a).max(b + extra - on_a))
 }
 
 /// The tree's layers from the cap upward, natively: entry `i` is the
@@ -12116,11 +12187,7 @@ impl<'p> RealTape<'p> {
             rec.payloads(),
         );
         assert_chain_replays(&ops, &trace, &chals);
-        let b3_rows = trace.rows.len() + h_rows
-            + geo
-                .iter()
-                .map(|g| (g.row_words.div_ceil(4) + g.depth) * g.q + (1usize << g.c) - 1)
-                .sum::<usize>();
+        let b3_rows = trace.rows.len() + h_rows + query_phase_b3_rows(&geo);
         if std::env::var("B3_CENSUS").is_ok() {
             let parents = trace.block_offsets.iter().filter(|o| o.is_none()).count();
             let blocks = trace.rows.len() - parents;
@@ -12147,14 +12214,15 @@ impl<'p> RealTape<'p> {
                 pow_by_bits
             );
             for g in geo.iter() {
+                let (leaf, path, cap) = level_query_phase_b3_rows(g);
                 eprintln!(
                     "    level: q {} depth {} row_words {} -> leaf {} + path {} + cap {}",
                     g.q,
                     g.depth,
-                    g.row_words,
-                    g.row_words.div_ceil(4) * g.q,
-                    g.depth * g.q,
-                    (1usize << g.c) - 1
+                    g.raw_row_words,
+                    leaf,
+                    path,
+                    cap,
                 );
             }
             // CHAIN DECOMPOSITION + an independent row-count model of the
@@ -15521,15 +15589,27 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
         );
         assert_chain_replays(&ops, &trace, &chals);
 
-        let b3_rows = if envelope_shape().is_some() {
-            tapes
-                .iter()
-                .enumerate()
-                .map(|(i, t)| t.b3_rows + usize::from(i == 0) * trace.rows.len())
-                .max()
-                .unwrap_or(trace.rows.len())
+        let env = envelope_shape();
+        let split_b3 = tapes.len() == 2
+            && (env.is_some() || tower_profile() == LigeritoProfile::Fast);
+        let (fold_b3_primary_rows, b3_rows) = if split_b3 {
+            let a = tapes[0].b3_rows;
+            let b = tapes[1].b3_rows;
+            let unsplit = (a + trace.rows.len()).max(b);
+            let (on_a, balanced) = balance_extra_rows(a, b, trace.rows.len());
+            if env.is_none()
+                && tower_profile() == LigeritoProfile::Fast
+                && balanced.next_power_of_two() < unsplit.next_power_of_two()
+            {
+                (Some(on_a), balanced)
+            } else {
+                (None, unsplit)
+            }
         } else {
-            tapes.iter().map(|t| t.b3_rows).sum::<usize>() + trace.rows.len()
+            (
+                None,
+                tapes.iter().map(|t| t.b3_rows).sum::<usize>() + trace.rows.len(),
+            )
         };
         let nu2_content = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7);
         // THE ENVELOPE (task 7b): a first-level node is an internal node's
@@ -15538,7 +15618,6 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
         // padded public segment and the m* dense floor. Then a parent's walk
         // over an FL child is row-identical to its walk over an internal
         // child, which is what makes ONE internal circuit serve every level.
-        let env = envelope_shape();
         let nu2 = match &env {
             Some(e) => {
                 assert!(
@@ -15562,7 +15641,10 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
                 );
                 (e.spread_w, ChildSlots::new_env(&mut sb, nu2, e))
             }
-            None => (spread_own2, ChildSlots::new(&mut sb, nu2, spread_own2)),
+            None => (
+                spread_own2,
+                ChildSlots::new_with_b3_split(&mut sb, nu2, spread_own2, split_b3),
+            ),
         };
         let mut vals: Vec<F128> = Vec::new();
         let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
@@ -15581,7 +15663,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
                     (0, _) => cs.q.b3,
                     (1, Some(slot)) => slot,
                     (_, None) => cs.q.b3,
-                    _ => panic!("the recursion envelope supports exactly two children"),
+                    _ => panic!("split-BLAKE recursion supports exactly two children"),
                 };
                 let r = emit_child_region(
                     &mut sb, &mut cs, b3_slot, t, &mut vals, &mut hints, &mut consts,
@@ -15606,9 +15688,16 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
         let iv2 = [sb.public_input(), sb.public_input()];
         let mut consts: Vec<(F128, Wire)> = Vec::new();
         let pub_payloads = bytes_payload_mask(&ops);
-        let (chain_outs, ww) = emit_fs_chain(
+        let (chain_outs, ww) = emit_fs_chain_partitioned(
             &mut sb,
             b3s,
+            fold_b3_primary_rows.map(|n| {
+                (
+                    cs.q.b3_alt
+                        .expect("a balanced fold chain needs the second BLAKE slot"),
+                    n,
+                )
+            }),
             iv2,
             &trace,
             &stream,
@@ -17559,12 +17648,7 @@ impl<'p> ChildTape<'p> {
             HashKind::Blake3,
             &strat_scheds(&inner.pcs),
         );
-        let b3_rows = trace.rows.len()
-            + h_rows
-            + geo
-                .iter()
-                .map(|g| (g.row_words.div_ceil(4) + g.depth) * g.q + (1usize << g.c) - 1)
-                .sum::<usize>();
+        let b3_rows = trace.rows.len() + h_rows + query_phase_b3_rows(&geo);
         if std::env::var("B3_CENSUS").is_ok() {
             let parents = trace.block_offsets.iter().filter(|o| o.is_none()).count();
             let blocks = trace.rows.len() - parents;
@@ -17580,14 +17664,15 @@ impl<'p> ChildTape<'p> {
                 b3_rows
             );
             for g in geo.iter() {
+                let (leaf, path, cap) = level_query_phase_b3_rows(g);
                 eprintln!(
                     "    level: q {} depth {} row_words {} -> leaf {} + path {} + cap {}",
                     g.q,
                     g.depth,
-                    g.row_words,
-                    g.row_words.div_ceil(4) * g.q,
-                    g.depth * g.q,
-                    (1usize << g.c) - 1
+                    g.raw_row_words,
+                    leaf,
+                    path,
+                    cap,
                 );
             }
             // CHAIN DECOMPOSITION + an independent row-count model of the
@@ -18286,9 +18371,9 @@ impl<'p> ChildTape<'p> {
 /// The gate slots a child-tape region emits into. Created ONCE by the outer
 /// test and shared by every region in the builder — the mvp11 merge outer
 /// instantiates two child regions (and the fold region) over shared slots.
-/// Under the recursion envelope only, the two independent child BLAKE
-/// workloads use two identical slots; the other families still add rows,
-/// not columns. The `le`/`resid` caches fill on demand during emission;
+/// The recursion envelope and strict Fast nodes place the two independent
+/// child BLAKE workloads in identical slots; the other families still add
+/// rows, not columns. The `le`/`resid` caches fill on demand during emission;
 /// cache hits require same-shape children (the keyed constructor parameters
 /// must match, which the merge test asserts by requiring one shared circuit).
 struct ChildSlots {
@@ -18317,12 +18402,23 @@ struct ChildSlots {
 
 impl ChildSlots {
     fn new(sb: &mut ShapeBuilder, nu2: usize, spread_w: usize) -> Self {
+        Self::new_with_b3_split(sb, nu2, spread_w, false)
+    }
+
+    fn new_with_b3_split(
+        sb: &mut ShapeBuilder,
+        nu2: usize,
+        spread_w: usize,
+        split_b3: bool,
+    ) -> Self {
         let macs = sb.slot(MacGate::new());
         let mac256 = sb.slot(MacGate256::new());
+        let b3 = sb.slot(Blake3Gate { nu: nu2 });
+        let b3_alt = split_b3.then(|| sb.slot(Blake3Gate { nu: nu2 }));
         ChildSlots {
             q: CollapsedSlots {
-                b3: sb.slot(Blake3Gate { nu: nu2 }),
-                b3_alt: None,
+                b3,
+                b3_alt,
                 swap: sb.slot(SwapGate { nu: nu2 }),
                 spread: sb.slot(BitSpreadGate {
                     ty: BitSpreadTable::new(spread_w),
@@ -24025,14 +24121,27 @@ fn build_node_outer_app(
         );
         assert_chain_replays(&ops, &trace, &chals);
 
-        let b3_rows = if envelope_shape().is_some() {
-            rts.iter()
-                .enumerate()
-                .map(|(i, rt)| rt.b3_rows + usize::from(i == 0) * trace.rows.len())
-                .max()
-                .unwrap_or(trace.rows.len())
+        let env = envelope_shape();
+        let split_b3 = n_kids == 2
+            && (env.is_some() || tower_profile() == LigeritoProfile::Fast);
+        let (fold_b3_primary_rows, b3_rows) = if split_b3 {
+            let a = rts[0].b3_rows;
+            let b = rts[1].b3_rows;
+            let unsplit = (a + trace.rows.len()).max(b);
+            let (on_a, balanced) = balance_extra_rows(a, b, trace.rows.len());
+            if env.is_none()
+                && tower_profile() == LigeritoProfile::Fast
+                && balanced.next_power_of_two() < unsplit.next_power_of_two()
+            {
+                (Some(on_a), balanced)
+            } else {
+                (None, unsplit)
+            }
         } else {
-            rts.iter().map(|rt| rt.b3_rows).sum::<usize>() + trace.rows.len()
+            (
+                None,
+                rts.iter().map(|rt| rt.b3_rows).sum::<usize>() + trace.rows.len(),
+            )
         };
         if std::env::var("B3_CENSUS").is_ok() {
             let fold_pows = ops
@@ -24064,7 +24173,6 @@ fn build_node_outer_app(
         // Under the envelope the node pins nu* and the canonical type set
         // (wall 2); the TOWER_NU_BUMP capacity probe is an off-envelope
         // knob — the pin wins.
-        let env = envelope_shape();
         let nu2 = match &env {
             Some(e) => {
                 assert!(
@@ -24092,7 +24200,10 @@ fn build_node_outer_app(
                 );
                 (e.spread_w, ChildSlots::new_env(&mut sb, nu2, e))
             }
-            None => (spread_own2, ChildSlots::new(&mut sb, nu2, spread_own2)),
+            None => (
+                spread_own2,
+                ChildSlots::new_with_b3_split(&mut sb, nu2, spread_own2, split_b3),
+            ),
         };
         let mut vals: Vec<F128> = Vec::new();
         let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
@@ -24112,7 +24223,7 @@ fn build_node_outer_app(
                     (0, _) => cs.q.b3,
                     (1, Some(slot)) => slot,
                     (_, None) => cs.q.b3,
-                    _ => panic!("the recursion envelope supports exactly two children"),
+                    _ => panic!("split-BLAKE recursion supports exactly two children"),
                 };
                 let r = emit_real_child_region(
                     &mut sb,
@@ -24142,9 +24253,16 @@ fn build_node_outer_app(
         let iv2 = [sb.public_input(), sb.public_input()];
         let mut consts: Vec<(F128, Wire)> = Vec::new();
         let pub_payloads = bytes_payload_mask(&flatten_ops(t_shape.ops()));
-        let (chain_outs, ww) = emit_fs_chain(
+        let (chain_outs, ww) = emit_fs_chain_partitioned(
             &mut sb,
             cs.q.b3,
+            fold_b3_primary_rows.map(|n| {
+                (
+                    cs.q.b3_alt
+                        .expect("a balanced fold chain needs the second BLAKE slot"),
+                    n,
+                )
+            }),
             iv2,
             &trace,
             &stream,
