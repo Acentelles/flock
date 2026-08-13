@@ -24,6 +24,14 @@ use flock_prover::zerocheck::{K_SKIP, ZerocheckProof};
 
 const DOMAIN: &[u8] = b"flock-lig-r1cs-v0";
 static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static BLAKE3_CSC_MATRICES: std::sync::OnceLock<CscMatrices> = std::sync::OnceLock::new();
+
+struct CscMatrices {
+    a_col_ptr: Vec<u32>,
+    a_rows: Vec<u32>,
+    b_col_ptr: Vec<u32>,
+    b_rows: Vec<u32>,
+}
 
 #[repr(C)]
 struct ProveParams {
@@ -177,8 +185,16 @@ fn gpu_prove(n_blocks_log: usize, dump_z: Option<&str>) -> GpuArtifacts {
         .unwrap_or_else(|_| panic!("no fast ligerito config for m={m}"));
 
     let digest = r1cs.statement_digest();
-    let (a_cp, a_rw) = csc_from_rows(&r1cs.a_0);
-    let (b_cp, b_rw) = csc_from_rows(&r1cs.b_0);
+    let matrices = BLAKE3_CSC_MATRICES.get_or_init(|| {
+        let (a_col_ptr, a_rows) = csc_from_rows(&r1cs.a_0);
+        let (b_col_ptr, b_rows) = csc_from_rows(&r1cs.b_0);
+        CscMatrices {
+            a_col_ptr,
+            a_rows,
+            b_col_ptr,
+            b_rows,
+        }
+    });
     let (mcol, f8mul) = zc_tables();
 
     let to_i32 = |v: &[usize]| -> Vec<i32> { v.iter().map(|&x| x as i32).collect() };
@@ -196,12 +212,12 @@ fn gpu_prove(n_blocks_log: usize, dump_z: Option<&str>) -> GpuArtifacts {
         statement_digest: digest.as_ptr(),
         domain: DOMAIN.as_ptr(),
         domain_len: DOMAIN.len() as u32,
-        a_col_ptr: a_cp.as_ptr(),
-        a_rows: a_rw.as_ptr(),
-        a_nnz: a_rw.len() as u32,
-        b_col_ptr: b_cp.as_ptr(),
-        b_rows: b_rw.as_ptr(),
-        b_nnz: b_rw.len() as u32,
+        a_col_ptr: matrices.a_col_ptr.as_ptr(),
+        a_rows: matrices.a_rows.as_ptr(),
+        a_nnz: matrices.a_rows.len() as u32,
+        b_col_ptr: matrices.b_col_ptr.as_ptr(),
+        b_rows: matrices.b_rows.as_ptr(),
+        b_nnz: matrices.b_rows.len() as u32,
         const_pin_col: r1cs.const_pin.map_or(-1, |c| c as i32),
         useful_bits: r1cs.useful_bits as i32,
         k_log: r1cs.k_log as i32,
