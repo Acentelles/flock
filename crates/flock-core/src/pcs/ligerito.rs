@@ -1820,12 +1820,19 @@ impl LigeritoSecurityConfig {
         const JOHNSON_ETA: f64 = 0.02;
         let target_bits = profile.security_bits();
         let log_inv_rate = profile.log_inv_rate();
+        // 16-bit query PoW: each level's grinding substitutes for 16 bits of
+        // query soundness (strict_query_count subtracts it from the target),
+        // cutting Σq ~12% at the fast128 m32 leaf for ~2^16 hash trials per
+        // level natively. Slim has shipped this since its first schedule;
+        // Fast128 joined 2026-08-14 (Ron's call, the leanVM comparison — its
+        // Johnson configs grind 16 bits at every round). Plain Fast/Fast100
+        // stay grind-free: they are the fixed historical cost points.
         let query_grind: usize = match profile {
-            LigeritoProfile::Slim | LigeritoProfile::Slim100 | LigeritoProfile::Slim128 => 16,
-            LigeritoProfile::Fast
-            | LigeritoProfile::Fast100
-            | LigeritoProfile::Fast128
-            | LigeritoProfile::Secure => 0,
+            LigeritoProfile::Slim
+            | LigeritoProfile::Slim100
+            | LigeritoProfile::Slim128
+            | LigeritoProfile::Fast128 => 16,
+            LigeritoProfile::Fast | LigeritoProfile::Fast100 | LigeritoProfile::Secure => 0,
         };
         let query_target_bits = match profile {
             LigeritoProfile::Fast
@@ -8816,6 +8823,13 @@ mod tests {
             ("baseline   fold3 rate+1", 3, 1),
             ("hi-rate    fold3 rate+2", 3, 2),
             ("hi-rate    fold3 rate+3", 3, 3),
+            // The gap in the original sweep: fold 5 allows rate_gain up to 4
+            // under the rate_gain < folds rule — leanVM's Johnson schedules
+            // climb ~4 bits/round at 512 B opened rows, which is exactly
+            // 2^5 F128 elements; fold 6/7 (2^6-2^7 rows) was the measured
+            // F128 wall, but fold 5 was never priced.
+            ("leanvm-ish fold5 rate+3", 5, 3),
+            ("leanvm-ish fold5 rate+4", 5, 4),
             ("whir-like  fold6 rate+2", 6, 2),
             ("whir-like  fold7 rate+2", 7, 2),
         ];
@@ -8898,6 +8912,8 @@ mod tests {
             ("baseline fold3 rate+1", 3, 1),
             ("hi-rate  fold3 rate+2", 3, 2),
             ("hi-rate  fold3 rate+3", 3, 3),
+            ("leanvm-ish fold5 rate+3", 5, 3),
+            ("leanvm-ish fold5 rate+4", 5, 4),
         ];
         eprintln!("\nSLIM LADDER PROVE-COST (m={m}, F256, real prove+verify, medians of {reps})\n");
         for &(label, folds, gain) in variants {
