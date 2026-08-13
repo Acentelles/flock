@@ -374,7 +374,7 @@ fn roundtrip<const N_BLOCKS_LOG: usize, const TAMPER: bool>() {
     )
     .unwrap_or_else(|e| panic!("Rust verifier rejected the GPU proof at m={m}: {e:?}"));
     println!(
-        "GPU proof verified: m={m}, warmup {:.2}s, steady prove(+glue) {:.2}s, verify {:.2}s, ab claim {:016x}:{:016x}",
+        "GPU proof verified: m={m}, warmup {:.4}s, steady prove(+glue) {:.4}s, verify {:.4}s, ab claim {:016x}:{:016x}",
         warmup_secs,
         prove_secs,
         t1.elapsed().as_secs_f64(),
