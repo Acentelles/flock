@@ -100,6 +100,11 @@ fn tower_profile() -> LigeritoProfile {
 fn chain_leaf_profile() -> LigeritoProfile {
     match tower_profile() {
         LigeritoProfile::Fast100 | LigeritoProfile::Slim100 => LigeritoProfile::Fast100,
+        // The aggressive 128-bit recursion carries the aggressive leaf:
+        // rate-1/2 like Fast (same tape structure, the walkers are
+        // unchanged), but on the rate+2 ladder — m32: Σq 675 → 527, which
+        // is what shrinks the FL's replayed b3 trace under the envelope.
+        LigeritoProfile::Fast128 | LigeritoProfile::Slim128 => LigeritoProfile::Fast128,
         _ => LigeritoProfile::Fast,
     }
 }
@@ -4474,7 +4479,12 @@ struct ResidualWeightsGate256 {
 }
 
 impl ResidualWeightsGate256 {
-    const N_WEIGHTS: usize = 18;
+    /// Sized to the deepest walked ladder, like `spread_w`/`resid_pls`: the
+    /// m32 FAST chain leaf's L0 needs `pl 15 + yr_log 4 = 19` (the residual
+    /// domain is 16 entries = two 8-chunks; the chunk-high extension reads
+    /// `weights[pl + yr_log - 1]`). The m29 outer ladders stay below this;
+    /// anything deeper fails the `lmc` assert loudly at build.
+    const N_WEIGHTS: usize = 19;
 
     fn new() -> Self {
         use flock_core::element_r1cs::ElementTableBuilder;
@@ -8414,7 +8424,11 @@ fn emit_residual_region(
     assert_eq!(query_positions.len(), levels.len());
     for (li, lvl) in levels.iter().enumerate() {
         let pl: usize = levels[li + 1..].iter().map(|l| l.fold_fins.len() - 1).sum();
-        let lmc = pl + chunk_log;
+        // The deepest weight this level touches is `weights[pl + yr_log - 1]`
+        // (the chunk-high extension below), not `pl + chunk_log`: the old
+        // bound under-checked whenever the residual domain has more than one
+        // 8-chunk, so the m32 walk overran the gate instead of failing here.
+        let lmc = pl + yr_log;
         assert!(
             lmc <= ResidualWeightsGate256::N_WEIGHTS,
             "the residual ladder needs {lmc} normalized weights"
