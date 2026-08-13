@@ -10,7 +10,7 @@
 //!                                                        default: hash's IV / all-zero state)
 //!                       --out FILE
 //!   flock_chain prove   --mix blake3=N,sha2=M [--seed HEX] --out FILE
-//!   flock_chain verify  --in FILE
+//!   flock_chain verify  --in FILE [--mode <fast|fast100|slim|slim100|secure>]
 //!   flock_chain help
 //! ```
 //!
@@ -45,10 +45,9 @@ use flock_prover::r1cs_hashes::sha2::{
 // Argument parsing (tiny, no clap dep)
 // ---------------------------------------------------------------------------
 
-/// Prover profile — selects the Ligerito security config. `Fast` = rate 1/2,
-/// Johnson+OOD, 100-bit (default). `Slim` = rate 1/4, Johnson+OOD + query
-/// grinding, 100-bit (smaller proof, slower prover). `Secure` = rate 1/2,
-/// unique-decoding regime, 120-bit (largest proof, most conservative).
+/// Proof profile. `Fast` and `Slim` are the strict component-wise 128-bit
+/// profiles; `Fast100` and `Slim100` preserve the historical query cost point;
+/// `Secure` is the historical 120-bit unique-decoding profile.
 type Mode = flock_prover::pcs::ligerito::LigeritoProfile;
 
 #[derive(Default)]
@@ -140,7 +139,10 @@ fn parse_args(it: impl Iterator<Item = String>) -> Result<Args, String> {
             "--mode" => {
                 let v: String = val!();
                 args.mode = Some(Mode::parse(&v).ok_or_else(|| {
-                    format!("--mode: unknown profile '{v}' (expected fast|slim|secure)")
+                    format!(
+                        "--mode: unknown profile '{v}' \
+                         (expected fast|fast100|slim|slim100|secure)"
+                    )
                 })?);
             }
             "--help" | "-h" => return Err(USAGE.to_string()),
@@ -155,10 +157,10 @@ flock_chain — prove/verify hash-chain proofs and mixed multi-table proofs
 
 Usage:
   flock_chain prove  --hash <blake3|sha2|keccak> [--steps N] [--seed HEX]
-                     [--initial-cv HEX] [--mode <fast|slim|secure>] --out FILE
+                     [--initial-cv HEX] [--mode <fast|fast100|slim|slim100|secure>] --out FILE
   flock_chain prove  --mix blake3=N,sha2=M [--seed HEX]
-                     [--mode <fast|slim|secure>] --out FILE
-  flock_chain verify --in FILE
+                     [--mode <fast|fast100|slim|slim100|secure>] --out FILE
+  flock_chain verify --in FILE [--mode <fast|fast100|slim|slim100|secure>]
   flock_chain help
 
 Notes:
@@ -176,7 +178,9 @@ Notes:
               blake3, sha2: 64 hex chars = 8 × 32-bit words, big-endian per word
               keccak:       400 hex chars = 1600 bits, LSB-first per byte
               Defaults: BLAKE3_IV, SHA256_IV, or all-zero state for keccak.
-  --mode <fast|slim|secure>: prover profile. Default fast.
+  --mode <fast|fast100|slim|slim100|secure>: expected proof profile (and prover profile for
+              `prove`). Default fast. Compatibility modes `fast100` and
+              `slim100` must be requested explicitly.
               fast = rate 1/2 (smaller log_inv_rate, faster prover, larger proof).
               slim = rate 1/4 (larger log_inv_rate, smaller proof, slower prover).
   --out FILE: write proof bundle here.
@@ -510,13 +514,14 @@ fn prove_keccak(
 // ---------------------------------------------------------------------------
 
 fn cmd_verify(args: Args) -> Result<(), String> {
+    let expected_profile = args.mode.unwrap_or_default();
     let input = args.input.ok_or("verify: --in is required")?;
 
     // Flavor auto-detect: chain and mixed bundles share the header.
     let bytes = read_bytes_from_file(&input).map_err(|e| format!("read {input}: {e}"))?;
     match peek_flavor(&bytes).map_err(|e| format!("deserialize {input}: {e}"))? {
         BundleFlavor::Chain => {}
-        BundleFlavor::Mixed => return cmd_verify_mix(&input, &bytes),
+        BundleFlavor::Mixed => return cmd_verify_mix(&input, &bytes, expected_profile),
         BundleFlavor::R1cs => {
             return Err(format!(
                 "{input}: bare R1cs bundles carry no statement for this CLI \
@@ -527,6 +532,14 @@ fn cmd_verify(args: Args) -> Result<(), String> {
 
     let bundle = ChainProofBundleLigerito::from_bytes(&bytes)
         .map_err(|e| format!("deserialize {input}: {e}"))?;
+
+    if bundle.commitment.params.profile != expected_profile {
+        return Err(format!(
+            "profile mismatch: verifier requires {}, proof carries {}",
+            expected_profile.as_str(),
+            bundle.commitment.params.profile.as_str()
+        ));
+    }
 
     let m = bundle.commitment.params.m;
     let hash = bundle.hash_kind;
@@ -544,13 +557,11 @@ fn cmd_verify(args: Args) -> Result<(), String> {
 
     let mut ch = FsChallenger::new(b"flock_chain-cli");
     let t = Instant::now();
-    // The profile is recovered from the committed PcsParams in the proof
-    // bundle, not assumed — so `verify` works regardless of which `--mode`
-    // produced the proof. Reconstruct the setup with that profile so its
-    // r1cs/pcs_params match the prover's.
+    // Reconstruct the setup from the verifier-selected profile. The explicit
+    // equality check above prevents the bundle from selecting a weaker mode.
     let result = match hash {
         HashKind::Blake3 => {
-            let setup = Blake3Setup::with_profile(steps, bundle.commitment.params.profile);
+            let setup = Blake3Setup::with_profile(steps, expected_profile);
             verify_ligerito_with_layout(
                 &setup.r1cs,
                 &blake3_chain::CHAIN_LAYOUT,
@@ -562,7 +573,7 @@ fn cmd_verify(args: Args) -> Result<(), String> {
             )
         }
         HashKind::Sha2 => {
-            let setup = Sha256HybridSetup::with_profile(steps, bundle.commitment.params.profile);
+            let setup = Sha256HybridSetup::with_profile(steps, expected_profile);
             verify_ligerito_with_layout(
                 &setup.r1cs,
                 &sha2_chain::CHAIN_LAYOUT,
@@ -574,7 +585,7 @@ fn cmd_verify(args: Args) -> Result<(), String> {
             )
         }
         HashKind::Keccak => {
-            let setup = KeccakSetup::with_profile(steps, bundle.commitment.params.profile);
+            let setup = KeccakSetup::with_profile(steps, expected_profile);
             verify_ligerito_with_layout(
                 &setup.r1cs,
                 &keccak_chain::CHAIN_LAYOUT,
@@ -603,7 +614,7 @@ fn cmd_verify(args: Args) -> Result<(), String> {
 /// Verify a mixed bundle: rebuild the registry from the bundle's id (which
 /// pins the full registry, capacity included), take the counts from the
 /// bundle, and run the union verifier under the `flock-mixed-v1` binding.
-fn cmd_verify_mix(input: &str, bytes: &[u8]) -> Result<(), String> {
+fn cmd_verify_mix(input: &str, bytes: &[u8], expected_profile: Mode) -> Result<(), String> {
     let bundle = MixedProofBundleLigerito::from_bytes(bytes)
         .map_err(|e| format!("deserialize {input}: {e}"))?;
     let id = bundle.registry_id;
@@ -640,7 +651,13 @@ fn cmd_verify_mix(input: &str, bytes: &[u8]) -> Result<(), String> {
     eprintln!("  registry setup: {:.2}s", t.elapsed().as_secs_f64());
     let mut ch = FsChallenger::new(b"flock_chain-cli-mixed");
     let t = Instant::now();
-    let result = setup.verify(counts, &bundle.commitment, &bundle.proof, &mut ch);
+    let result = setup.verify(
+        counts,
+        expected_profile,
+        &bundle.commitment,
+        &bundle.proof,
+        &mut ch,
+    );
     eprintln!("  verify_mixed: {:.2}s", t.elapsed().as_secs_f64());
 
     match result {

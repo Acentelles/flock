@@ -16948,6 +16948,9 @@ impl<'p> ChildTape<'p> {
         );
         {
             let mut i = zc_l[0] + 1;
+            while matches!(ops[i], Op::Pow { .. }) {
+                i += 1;
+            }
             assert!(matches!(ops[i], Op::SqueezeSlice(_)), "zc tau lo");
             i += 1;
             assert!(matches!(ops[i], Op::SqueezeSlice(_)), "zc tau hi");

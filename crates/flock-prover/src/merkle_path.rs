@@ -125,10 +125,10 @@ impl MerklePathGrinding {
 
     pub fn for_profile(profile: flock_core::pcs::ligerito::LigeritoProfile) -> Self {
         match profile {
-            flock_core::pcs::ligerito::LigeritoProfile::Secure => Self::per_challenge_128(),
             flock_core::pcs::ligerito::LigeritoProfile::Fast
-            | flock_core::pcs::ligerito::LigeritoProfile::Fast100
             | flock_core::pcs::ligerito::LigeritoProfile::Slim
+            | flock_core::pcs::ligerito::LigeritoProfile::Secure => Self::per_challenge_128(),
+            flock_core::pcs::ligerito::LigeritoProfile::Fast100
             | flock_core::pcs::ligerito::LigeritoProfile::Slim100 => Self::disabled(),
         }
     }
@@ -755,6 +755,28 @@ pub fn verify_merkle_path_shift_with_grinding<Ch: Challenger>(
 mod tests {
     use super::*;
     use flock_core::challenger::FsChallenger;
+
+    #[test]
+    fn fast_slim_and_secure_enable_merkle_path_grinding() {
+        use flock_core::pcs::ligerito::LigeritoProfile;
+
+        for profile in [
+            LigeritoProfile::Fast,
+            LigeritoProfile::Slim,
+            LigeritoProfile::Secure,
+        ] {
+            assert_eq!(
+                MerklePathGrinding::for_profile(profile),
+                MerklePathGrinding::per_challenge_128()
+            );
+        }
+        for profile in [LigeritoProfile::Fast100, LigeritoProfile::Slim100] {
+            assert_eq!(
+                MerklePathGrinding::for_profile(profile),
+                MerklePathGrinding::disabled()
+            );
+        }
+    }
 
     struct Rng(u64);
     impl Rng {

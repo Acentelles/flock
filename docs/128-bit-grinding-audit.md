@@ -8,7 +8,10 @@ and the 128-bit list-decoding query schedule were reviewed on 2026-08-12. The
 Fable 5 external audit findings and Ron's 100/128 recursion-variant report
 were resolved and revalidated on 2026-08-13. Ron's split-commitment F256 MCA
 design and the full component-security pass were implemented and reviewed on
-2026-08-13.
+2026-08-13. A final independent pass that day found and fixed strict-profile
+composition, verifier-policy binding, proof-decoder robustness, one malformed
+ring-switch panic, and conservative L0 OOD degree accounting; the complete
+native and recursive test matrix was rerun afterward.
 
 This is the authoritative reviewer-facing summary of the 128-bit milestone.
 It records what was implemented, why each bit count is sufficient, how the
@@ -28,20 +31,24 @@ following are not review blockers and are not used to qualify the conclusion:
 ## Executive conclusion
 
 **Go/no-go result: the strict Fast/Slim component-security pass is complete.**
-No missing or under-protected component was found in the active production or
-recursion paths. The Flock paper's Appendix C.3 claim batching and queried
-consistency retain their strict base-field grinding; quadratic fold/sumcheck and MCA arithmetic
-now run over F256; two-point OOD binding and the Johnson query term also clear
-128 bits independently.
+The final pass found that Fast/Slim selected strict Ligerito parameters but
+still disabled the non-Ligerito grinding families; this profile-composition
+bug is fixed. No missing or under-protected component remains in the active
+production or recursion paths. The Flock paper's Appendix C.3 claim batching
+and queried consistency retain their strict base-field grinding; quadratic
+fold/sumcheck and MCA arithmetic now run over F256; two-point OOD binding and
+the Johnson query term also clear 128 bits independently.
 
 This conclusion is profile-specific. `Fast` and `Slim` are the strict
 128-bit Johnson profiles. `Fast100` and `Slim100` intentionally preserve the
-old 100-bit query cost point, while `Secure` remains the historical 120-bit
-unique-decoding profile. Those compatibility profiles are useful regression
-targets but must not be advertised as 128-bit configurations.
+old 100-bit query cost point and disable non-Ligerito algebraic grinding,
+while `Secure` enables those grinding families but remains the historical
+120-bit unique-decoding profile. Those compatibility profiles are useful
+regression targets but must not be advertised as 128-bit configurations.
 
 All active non-Ligerito algebraic challenge families found in the current
-production prover/verifier paths have Secure-profile grinding:
+production prover/verifier paths have grinding under strict `Fast`/`Slim`
+(and historical `Secure`):
 
 - Boolean and element zerocheck/lincheck;
 - ring switching, opening batching, merged sumcheck, multipoint and anchor;
@@ -99,6 +106,22 @@ The regression tests deliberately construct the former `C = I` repair and
 show that it satisfies the raw table R1CS, then check that the repaired word
 differs from the circuit input required by production wiring. A focused real
 recursive proof accepts a valid nonce and rejects an invalid one.
+
+The final independent pass resolved five additional robustness findings:
+
+- strict `Fast` and `Slim` now enable every non-Ligerito grinding policy,
+  including the public chain and Merkle-path wrappers; `Fast100` and
+  `Slim100` retain the compatibility transcript without those nonces;
+- mixed/union verification re-derives commitment parameters from the
+  caller-selected profile and compares every security-relevant field, so a
+  proof cannot select a weaker profile or Merkle hash through its commitment;
+- all proof readers use a 64 MiB size ceiling, bounded bincode decoding, and
+  trailing-byte rejection;
+- a malformed ring-switch vector now returns a typed verification error
+  instead of panicking; and
+- L0's implicit OOD opening is conservatively charged degree `m = mu + 7`,
+  rather than degree `mu`. Canonically regenerated diagnostics changed by
+  less than one bit and the weakest OOD component remains 233.7 bits.
 
 ## Soundness rule
 
@@ -186,7 +209,7 @@ transition and code map.
 
 All bit counts below are sufficient for the strict local rule.
 
-| Family / challenge | degree bound | Secure bits |
+| Family / challenge | degree bound | strict-profile bits |
 | --- | ---: | ---: |
 | Boolean zerocheck initial equality point | `m` | `bits_for_degree(m)` |
 | Boolean zerocheck skip point | `2^(K_SKIP+1)-1` | `K_SKIP+1` |
@@ -358,6 +381,21 @@ validator independently enforces a strict 128-bit floor for the F256 MCA,
 OOD, Appendix C.3 batching, and strict Johnson query components rather than
 trusting the profile's rounded diagnostic fields.
 
+For deeper Johnson levels, the two explicit OOD points each evaluate a
+degree-`mu` packed polynomial. At L0, one point is explicit degree `mu` and
+the ordinary ring-switched opening supplies the other point with degree at
+most `m = mu + 7`. Therefore the pair-collision factors used by validation
+are respectively
+
+```text
+(mu / 2^128)^2                    (deeper levels)
+(mu / 2^128) * (m / 2^128)       (L0).
+```
+
+Both are then union-bounded over unordered pairs in the Johnson list. This is
+the conservative accounting implemented by `paper_ood_bits`; all 56 Johnson
+configs (`Fast`, `Fast100`, `Slim`, and `Slim100`) validate against it.
+
 Implementation map:
 
 - `field/gf2_256.rs`: field representation, nonresidue and Karatsuba;
@@ -497,9 +535,10 @@ work-normalized term.
 ## Production coverage matrix
 
 This table maps each implemented family to its policy, active native entry
-points, proof witness, and recursive handling. `Secure` selects the PIOP,
-Product-GKR and PCS policies through `PcsParams`; the recursion tower selects
-the matching fold policy through `tower_fold_grinding()`.
+points, proof witness, and recursive handling. Strict `Fast`/`Slim` and
+historical `Secure` select the PIOP, Product-GKR and PCS policies through
+`PcsParams`; the recursion tower selects the matching fold policy through
+`tower_fold_grinding()`.
 
 | Family | Policy / proof data | Active prover and verifier | Recursive R1CS |
 | --- | --- | --- | --- |
@@ -590,7 +629,7 @@ it no longer assumes one challenge per finalization.
 ### Proof format
 
 The incompatible additions and transcript changes now place the aggregate
-proof format at v19. Product-GKR, matrix fold, chain and Merkle shift proofs carry
+proof format at v20. Product-GKR, matrix fold, chain and Merkle shift proofs carry
 transcript-ordered nonce vectors; chain/Merkle wrappers carry their
 packed-position nonce; opening batching has one nonce and one vector squeeze.
 Version 16 added two-point Ligerito OOD data; version 17 adds the Flock
@@ -601,16 +640,29 @@ but v17 caps, authentication paths, and transcript challenges cannot be
 replayed under the new public schedule. Version 19 moves Ligerito fold
 challenges, sumcheck messages, and running claims to F256 and changes every
 recursive code switch to the split-coordinate representation.
+Version 20 enables all non-Ligerito grinding families for strict Fast/Slim,
+changing their transcript nonce shape without adding proof-structure fields.
+Deterministic proof-byte fixtures were re-pinned only after two identical
+generation runs.
 
 ## Prover / verifier / recursive-circuit agreement
 
 For each enabled family the native verifier:
 
-1. derives the public policy from the PCS profile;
+1. derives the public policy and commitment parameters from the
+   caller-selected PCS profile;
 2. checks the exact expected nonce count (or canonical optional scalar);
 3. observes the same proof messages as the prover;
 4. verifies the nonce before sampling protected randomness; and
 5. replays the same arithmetic relation.
+
+The proof-carried commitment profile is data, not verifier policy. Mixed and
+union verification compare the commitment against the complete expected
+parameter tuple (`m`, rate, batch size, profile, lane shape, and Merkle hash)
+before accepting it. The CLI likewise requires or defaults an expected
+profile and rejects disagreement. The recursive relation is constructed for
+that fixed expected transcript/parameter shape; native recording rejects a
+profile mismatch before circuit construction.
 
 The load-bearing transcript order is always
 
@@ -650,7 +702,7 @@ an F256 challenge as one `SqueezeSlice(2)`; both limbs feed constrained
 Karatsuba arithmetic. The residual inner product is copy-constrained to both
 limbs of the sumcheck's final running claim.
 
-The Secure tower test consumes a recursive node proof as a child, so this is
+The strict Fast tower test consumes a recursive node proof as a child, so this is
 not only a one-level parse check.
 
 The recursive PoW implementation has three complementary tests:
@@ -663,7 +715,7 @@ The recursive PoW implementation has three complementary tests:
   and pin the load-bearing check words as circuit inputs.
 
 The profile-matrix node tests exercise the generic relation at real Boolean, element,
-Product-GKR, PCS-transport and fold sites. The Secure tower additionally
+Product-GKR, PCS-transport and fold sites. The strict Fast tower additionally
 proves composability by consuming a recursive node proof as a child.
 
 ## Historical pre-fusion BLAKE and performance census
@@ -727,32 +779,43 @@ work for this measured child.
 The final review reran the following commands from the repository root:
 
 ```sh
-cargo test -p flock-core
-cargo test -p flock-prover
+cargo test --locked --workspace --release
 
-cargo test -p flock-prover --test verifier_roundtrip \
-  secure_profile_grinds_boolean_piops -- --ignored --nocapture
-cargo test -p flock-prover --test union_element \
-  secure_profile_grinds_element_piops -- --ignored --nocapture
+cargo test --locked --release -p flock-prover --test verifier_roundtrip \
+  strict_fast_profile_grinds_boolean_piops -- --ignored --nocapture
+cargo test --locked --release -p flock-prover --test union_element \
+  strict_fast_profile_grinds_element_piops -- --ignored --nocapture
 
-cargo test -p flock-prover proof_io::tests -- --ignored
+cargo test --locked --release -p flock-prover \
+  proof_io::tests -- --ignored --nocapture
+cargo test --locked --release -p flock-prover \
+  proof_bytes_pinned -- --ignored --nocapture
 
-TOWER_PROFILE=secure cargo test --release -p flock-prover \
+TOWER_PROFILE=fast cargo test --locked --release -p flock-prover \
   --test circuit_merkle mvp11_two_to_one_recursion_node \
-  -- --ignored --nocapture
-TOWER_PROFILE=secure cargo test --release -p flock-prover \
+  -- --ignored --exact --nocapture
+TOWER_PROFILE=fast cargo test --locked --release -p flock-prover \
   --test circuit_merkle mvp12_recursion_tower \
-  -- --ignored --nocapture
+  -- --ignored --exact --nocapture
+TOWER_PROFILE=slim cargo test --locked --release -p flock-prover \
+  --test circuit_merkle envelope_registry_diff \
+  -- --ignored --exact --nocapture
+TOWER_PROFILE=slim cargo test --locked --release -p flock-prover \
+  --test circuit_merkle chain_tower_e2e_with_lane \
+  -- --ignored --exact --nocapture
+TOWER_ENV_M=29 TOWER_PROFILE=slim cargo test --locked --release \
+  -p flock-prover --test circuit_merkle chain_spine_converges \
+  -- --ignored --exact --nocapture
 ```
 
 Results:
 
-- `flock-core --lib`: 498 tests passed and 22 were ignored; every active
+- `flock-core --lib`: 501 tests passed and 22 were ignored; every active
   integration suite also passed.
-- `flock-prover`: 76 active library tests passed and 23 were ignored; every
+- `flock-prover`: 81 active library tests passed and 23 were ignored; every
   active integration suite also passed.
-- Secure Boolean and Secure element/mixed production roundtrips passed.
-- All three current v19 proof-bundle serialization/verification roundtrips
+- Strict Fast Boolean and element/mixed production roundtrips passed.
+- All three current v20 proof-bundle serialization/verification roundtrips
   passed (the earlier non-Ligerito checkpoint used v15).
 - The production PCS roundtrip uses the embedded `m22_fast` F256 config and
   passes through `open_batch_mixed_ligerito` and the active mixed verifier.
@@ -760,13 +823,13 @@ Results:
   tower consumes two first-level recursive proofs, proves the internal node,
   verifies it, and rejects its statement/tape tampering cases.
 - Fast100 and Secure `mvp11`/`mvp12`, plus Slim100 and Secure chain towers,
-  pass under the same v19 F256 transcript shape.
+  pass under their corresponding F256 transcript shapes.
 - Fast100 `mvp11`/`mvp12`, Slim100 first-level/chain-tower/spine, strict-Slim
   `m=29` spine, and the Secure chain tower all passed on 2026-08-13.
 - Ron's three ignored merged-transport byte-pin tests were run explicitly.
-  The intentional v19 F256/split-commit protocol change moved all thirteen
-  fixture digests; the replacements were stable under repeated deterministic
-  generation and all three tests pass with normal pin checking.
+  The intentional v20 strict-profile transcript change moved all thirteen
+  fixture digests; the replacements were identical across two deterministic
+  generation runs and all three tests pass with normal pin checking.
 
 Focused evidence in the full suites additionally covers:
 
@@ -851,7 +914,7 @@ There is no remaining in-scope 128-bit component blocker in the active
 two-point OOD binding, strict Johnson query schedules, strict base-field
 grinding for its Appendix C.3 batching challenges, and F256
 MCA/quadratic-sumcheck arithmetic. The prover, active native verifier, and
-recursive R1CS consume the same v19 transcript and reject malformed proof
+recursive R1CS consume the same v20 transcript and reject malformed proof
 shapes and the tested mutations.
 
 This is deliberately not a claim about a global union-bound ledger, inactive
@@ -884,18 +947,28 @@ arithmetic: every general F256 multiplication becomes three constrained F128
 products, the gate registry grows from 19 to 29 types, and the circuit cell
 capacity moves from `mu=24` to `mu=25`.
 
-Native serialized proofs grow less: the v19 R1CS bundle is 389.4 KiB versus
-363.2 KiB (+7.2%), and the mixed bundle is 356.5 KiB versus 330.2 KiB (+8.0%).
+Native serialized proofs grow less: the v20 R1CS bundle is 389.7 KiB versus
+363.2 KiB (+7.3%), and the mixed bundle is 357.2 KiB versus 330.2 KiB (+8.2%).
 Timings are host-local and the leaf samples are visibly noisy; sizes and row
 counts are deterministic.
 
-A fresh strict-Fast v19 smoke benchmark on the same 32-thread host gives
-11,076 BLAKE rows and a 353.5 KiB proof per leaf. The two-to-one node has
-33,283 BLAKE rows, a 448.9 KiB proof, 14 ms native verification, and observed
-online times of 548--642 ms. The level-2 tower node has 39,589 BLAKE rows, a
-470.9 KiB proof, 14 ms native verification, and a 741 ms observed online
-time. These are end-to-end confirmation numbers, not an isolated A/B; the
-pre-F256 comparison above is the overhead measurement.
+A fresh strict-Fast v20 smoke benchmark on the same 32-thread host gives
+11,076 BLAKE rows and a 357.1 KiB proof per leaf. The two-to-one node has
+33,295 BLAKE rows, a 453.0 KiB proof, 14 ms native verification, and a 621 ms
+observed online time. The level-2 tower node has 39,605 BLAKE rows, a 475.0
+KiB proof, and a 744 ms observed online time. Relative to the immediately
+preceding v19 strict-Fast run, enabling the omitted non-Ligerito grinding adds
+12 BLAKE rows at level 1 and 16 at level 2, while adding about 4.1 KiB to each
+outer proof. Timings remain within the earlier run-to-run range.
+
+Strict Slim v20 gives 5,755 leaf BLAKE rows, 27,651 node BLAKE rows, and a
+285.8 KiB outer proof. Those BLAKE row totals are unchanged from v19 because
+the fused PoW/squeeze relation reuses transcript finalizations; the recursive
+PoW census nevertheless rises from 14/48 to 109/2,074 at the representative
+leaf/node, demonstrating that the new checks are present. The observed node
+online time was 573 ms versus 554 ms before, which is not a stable regression
+outside the noise of these host-local samples. The strict Slim chain tower
+and the `m=29` converging spine both passed with the full PoW census.
 
 The exact benchmark commands are:
 
@@ -939,6 +1012,9 @@ generic recursive PoW relation, load-bearing IO-schema tests, and
 native/circuit differential tests. The F256 implementation is isolated in a
 small field module and a split-Ligerito module, with algebraic equivalence
 tests for coordinate splitting, residual bases, and ring-switch tensors.
+Verifier-facing proof IO is fail-closed: exact wire version and flavor,
+bounded input and allocation size, no trailing bytes, complete expected PCS
+parameter matching, and typed errors for malformed opening vectors.
 
 The largest maintenance risk remains the hand-written transcript parser in
 `circuit_merkle.rs`; deriving challenge and payload maps from the op tape and

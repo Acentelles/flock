@@ -248,7 +248,13 @@ fn merkle_blake3_mixed_roundtrip() {
         let t = std::time::Instant::now();
         let mut ch_v = FsChallenger::new(DOMAIN);
         let claim_v = setup
-            .verify(counts, &commitment, &proof, &mut ch_v)
+            .verify(
+                counts,
+                LigeritoProfile::Fast,
+                &commitment,
+                &proof,
+                &mut ch_v,
+            )
             .unwrap_or_else(|e| {
                 panic!("mixed proof ({n_merkle} merkle, {n_blake3} blake3) rejected: {e:?}")
             });
@@ -296,7 +302,15 @@ fn merkle_blake3_mixed_wrong_counts_rejected() {
     ] {
         let mut ch_v = FsChallenger::new(DOMAIN);
         assert!(
-            setup.verify(bad, &commitment, &proof, &mut ch_v).is_err(),
+            setup
+                .verify(
+                    bad,
+                    LigeritoProfile::Fast,
+                    &commitment,
+                    &proof,
+                    &mut ch_v,
+                )
+                .is_err(),
             "a (5, 6) proof verified as {bad:?}"
         );
     }

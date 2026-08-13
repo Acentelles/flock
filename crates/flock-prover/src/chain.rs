@@ -148,10 +148,10 @@ impl ChainGrinding {
 
     pub fn for_profile(profile: flock_core::pcs::ligerito::LigeritoProfile) -> Self {
         match profile {
-            flock_core::pcs::ligerito::LigeritoProfile::Secure => Self::per_challenge_128(),
             flock_core::pcs::ligerito::LigeritoProfile::Fast
-            | flock_core::pcs::ligerito::LigeritoProfile::Fast100
             | flock_core::pcs::ligerito::LigeritoProfile::Slim
+            | flock_core::pcs::ligerito::LigeritoProfile::Secure => Self::per_challenge_128(),
+            flock_core::pcs::ligerito::LigeritoProfile::Fast100
             | flock_core::pcs::ligerito::LigeritoProfile::Slim100 => Self::disabled(),
         }
     }
@@ -582,6 +582,28 @@ pub fn fold_contiguous_regions(
 mod tests {
     use super::*;
     use flock_core::challenger::{FsChallenger, RandomChallenger};
+
+    #[test]
+    fn fast_slim_and_secure_enable_chain_grinding() {
+        use flock_core::pcs::ligerito::LigeritoProfile;
+
+        for profile in [
+            LigeritoProfile::Fast,
+            LigeritoProfile::Slim,
+            LigeritoProfile::Secure,
+        ] {
+            assert_eq!(
+                ChainGrinding::for_profile(profile),
+                ChainGrinding::per_challenge_128()
+            );
+        }
+        for profile in [LigeritoProfile::Fast100, LigeritoProfile::Slim100] {
+            assert_eq!(
+                ChainGrinding::for_profile(profile),
+                ChainGrinding::disabled()
+            );
+        }
+    }
 
     /// SplitMix64-ish RNG for test data.
     struct Rng(u64);

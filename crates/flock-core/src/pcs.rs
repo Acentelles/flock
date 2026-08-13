@@ -1004,7 +1004,11 @@ pub fn verify_opening_batch_ligerito_mixed_with_grinding<Ch: Challenger>(
     let n_pd = packed_direct.len();
     assert_eq!(z_skips.len(), n_rs);
     assert_eq!(x_outers.len(), n_rs);
-    assert_eq!(proof.ring_switches.len(), n_rs);
+    if proof.ring_switches.len() != n_rs {
+        return Err(VerifyError::RingSwitch(
+            ring_switch::VerifyError::MalformedProof,
+        ));
+    }
     assert!(n_rs + n_pd > 0);
     let batch_bits = grinding.claim_batch_bits_for(n_rs + n_pd);
     let expected_batch_nonces = usize::from(batch_bits != 0);
@@ -2275,6 +2279,25 @@ mod tests {
             &mut ch_v,
         )
         .unwrap_or_else(|e| panic!("ligerito verify rejected honest proof: {e:?}"));
+
+        let mut malformed = proof.clone();
+        malformed.ring_switches.clear();
+        let mut ch_v = FsChallenger::new(b"flock-test-lig-v0");
+        assert!(matches!(
+            verify_opening_batch_ligerito_mixed(
+                &commitment,
+                &[rs_claim],
+                &[z_skip],
+                &[x_outer.as_slice()],
+                &[],
+                &malformed,
+                &lig_v_cfg,
+                &mut ch_v,
+            ),
+            Err(VerifyError::RingSwitch(
+                ring_switch::VerifyError::MalformedProof
+            ))
+        ));
     }
 
 }

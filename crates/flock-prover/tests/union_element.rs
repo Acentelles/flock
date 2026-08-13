@@ -261,19 +261,19 @@ fn element_only_union_roundtrip() {
     }
 }
 
-/// The production element path under `Secure`: native proving, native
+/// The production element path under strict `Fast`: native proving, native
 /// verification, and the merged opening all see the element PIOP's PoW
 /// witnesses.  The recursive-node test separately consumes this same proof
 /// shape inside its Boolean R1CS verifier.
 #[test]
-#[ignore] // Run with `cargo test --release -p flock-prover --test union_element secure_profile_grinds_element_piops -- --ignored`.
-fn secure_profile_grinds_element_piops() {
+#[ignore] // Run with `cargo test --release -p flock-prover --test union_element strict_fast_profile_grinds_element_piops -- --ignored`.
+fn strict_fast_profile_grinds_element_piops() {
     let (nu, kappa, n) = (12usize, 3usize, 2731usize);
     let (w0, w1) = (F128::new(0x128, 0), F128::new(0, 0xE1E));
     let ty = gate_block(kappa, w0, w1);
     let registry = Registry::new(vec![TableType::element(ty.clone())], nu);
     let union = UnionInstance::new(&registry, vec![n]);
-    let pcs_params = union_pcs_params_with_profile(&union, LigeritoProfile::Secure);
+    let pcs_params = union_pcs_params_with_profile(&union, LigeritoProfile::Fast);
     let mut rng = Rng::new(0x128_E1E_0002);
     let z = gate_witness(&ty, nu, n, w0, w1, &mut rng);
 
@@ -303,7 +303,7 @@ fn secure_profile_grinds_element_piops() {
     // claim-batching coefficients in this element-only proof, followed by one
     // dense sumcheck witness per round and the multipoint
     // batching/round/anchor witnesses.  This keeps the test from only
-    // exercising the element PIOP half of Secure.
+    // exercising only the element PIOP half of the strict profile.
     let open = &proof.pcs_open;
     let opening_grinding = pcs_params.opening_grinding();
     assert!(open.ring_switches.is_empty(), "element-only has no RS claims");
@@ -1293,19 +1293,22 @@ fn bundle_digest_merged(
 // F256 mutual correlated agreement and the base-field split handoff. All
 // seven fixtures moved; roundtrip suites are green and deterministic
 // generation produced stable digests.
+// Re-pinned 2026-08-13 for proof-IO v20. Strict Fast and Slim proofs now
+// include every non-Ligerito grinding nonce, changing the transcript and
+// serialized proof bytes. Two deterministic print runs agreed.
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn mixed_class_merged_proof_bytes_pinned() {
     const ELEMENT_ONLY: [(&str, usize, &str); 3] = [
-        ("elem-merged-nu12-full", 1 << 12, "28ebe4cc5bfbd9de8f96b368909b27bb7c17a78c02eddb6022063828f4a0fbf7"),
-        ("elem-merged-nu12-2731", 2731, "52b05bd4cccf8fe6ac71a34edc2ca7dc04d707c0239e2006494ecff7a543314e"),
-        ("elem-merged-nu12-0", 0, "030d954d8c536879e9cc0a87ae7f6c2e156d8f4dbab3c8113545538473a30ca0"),
+        ("elem-merged-nu12-full", 1 << 12, "1cc52df9df98114baf9379d983c2c77dfce5732ca7ffa415e7530c6affbbc84f"),
+        ("elem-merged-nu12-2731", 2731, "4d882eebb04ee0f0205af940eade97a6fd5dce241ea60f9d3f2e5e38133728d8"),
+        ("elem-merged-nu12-0", 0, "20c14b536abf68fde61f1e22cef4707ede0f1ea144e363ba26a7af916cb53b69"),
     ];
     const MIXED: [(&str, [usize; 2], &str); 4] = [
-        ("mix-merged-nu7-128-128", [128, 128], "0c9903fa62ac2becdcd7c0c658130bcf13803b9b6fce063c3e5c0086df82cad6"),
-        ("mix-merged-nu7-100-90", [100, 90], "dcd36b6807be47ff417ad54ba14b637ff2188d2238ab53dc5d9f94286a1b1707"),
-        ("mix-merged-nu7-0-90", [0, 90], "21fecd8bc794da6e3981d63327c7752ca6c3f1267528f6a120fbc59c4105b69b"),
-        ("mix-merged-nu7-100-0", [100, 0], "a5b348ebadfd2b967df01fd257819e65809303825f715624c1204b1ff62dbba2"),
+        ("mix-merged-nu7-128-128", [128, 128], "3bc773cd102a1d3477522a3c6aa19a312776bb8e1f580e887f8d3094e55e37bb"),
+        ("mix-merged-nu7-100-90", [100, 90], "3dcb47ac53cbebc6f40be37f419547cf9172c0be4dbcdb1139165f9a2cb9eb64"),
+        ("mix-merged-nu7-0-90", [0, 90], "e4a09e8f68681f2fe450c00a741fe9b7e2625284e6b04f0e813d3b5c4a323894"),
+        ("mix-merged-nu7-100-0", [100, 0], "5652d47c03ba259465db30a62283ba752dab99ed5d97c58ce70f8295b7987803"),
     ];
 
     let (w0, w1) = (F128::new(0x51F0, 0), F128::new(0, 0x2C7E));

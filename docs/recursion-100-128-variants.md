@@ -27,17 +27,19 @@ terms each clear 128 bits. `Secure` remains the separate historical 120-bit
 unique-decoding profile used as an additional regression target for every
 algebraic-grinding family; its name does not make it the 128-bit profile.
 
-`Fast100` and `Slim100` are new `LigeritoProfile` variants that are `Fast`
-and `Slim` in every respect — the same Johnson accounting, two-point OOD,
-Flock-paper Appendix C.3 grinding schedule, transcript shape, and the m28/m29
-`initial_k` exceptions — except the consistency-query term targets the
-profile's own `security_bits()` (100) instead of
-`LIST_DECODING_QUERY_TARGET_BITS`. The Johnson query floor in
+Within Ligerito, `Fast100` and `Slim100` use the same Johnson accounting,
+two-point OOD, Flock-paper Appendix C.3 grinding schedule, F256 transcript
+shape, and m28/m29 `initial_k` exceptions as `Fast` and `Slim`, except that
+the consistency-query term targets the profile's own `security_bits()` (100)
+instead of `LIST_DECODING_QUERY_TARGET_BITS`. The Johnson query floor in
 `LigeritoSecurityConfig::validate` is keyed off `analysis_version`
 (`query128` vs `query100`), so each config family validates against its own
 target; a boundary test pins the `Fast100` floor and the schedule equality.
-Both variants live in one binary and use the same split-F256 transcript shape
-at proof-format v19; their public query schedules remain different.
+Both variants live in one binary. Proof format v20 additionally makes the
+non-Ligerito policy distinction explicit: strict `Fast`/`Slim` enable all
+algebraic grinding families, whereas `Fast100`/`Slim100` intentionally keep
+those families disabled. Their public Ligerito query schedules also remain
+different.
 
 **They reproduce the pre-branch schedules exactly.** The canonical generator
 at target 100 re-derives, byte-for-byte, the counts your Part 3 replaced:
@@ -49,8 +51,9 @@ at target 100 re-derives, byte-for-byte, the counts your Part 3 replaced:
 
 This doubles as a proof that the old Fast/Slim were 100-bit query targets.
 Note the 100-bit variants are *slightly stronger* than the literal
-pre-branch state: they inherit the two-point OOD binding and the C.3
-algebraic grinding (a handful of extra rows, strictly more soundness).
+pre-branch state inside Ligerito: they inherit two-point OOD binding, C.3
+algebraic grinding, and F256 MCA. They do not claim 128-bit security and do
+not enable the non-Ligerito grinding families.
 
 ## Validation status
 
@@ -141,11 +144,11 @@ tests.
 
 The 2026-08-13 validation matrix also passed strict Fast `mvp11`/`mvp12`,
 Fast100 and Secure `mvp11`/`mvp12`, strict Slim and Slim100 chain towers,
-Slim100's converged spine, `mvp7`, the full active `flock-core` suite (498
+Slim100's converged spine, `mvp7`, the full active `flock-core` suite (501
 passed, 22 ignored), and the full active `flock-prover` suite and integrations
 with no failures. Ron's three ignored
-proof-byte pin tests were also run explicitly. The branch's deliberate v19
-Ligerito protocol changes moved the fixture digests; the new values
+proof-byte pin tests were also run explicitly. The branch's deliberate v20
+strict-profile transcript change moved the fixture digests; the new values
 were identical across two print runs, were documented at the fixtures, and
 the pin tests now pass normally.
 

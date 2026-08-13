@@ -2364,6 +2364,7 @@ impl RsEqInd {
 pub enum VerifyError {
     ClaimMismatch,
     InvalidGrinding,
+    MalformedProof,
 }
 
 /// Prover side of the ring-switching reduction.

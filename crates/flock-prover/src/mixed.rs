@@ -277,20 +277,20 @@ impl MixedSetup {
         prover::prove_fast_ligerito_union(&union, &pcs_params, slots, challenger)
     }
 
-    /// Verify a mixed proof against the declared counts. The Ligerito
-    /// profile is recovered from the commitment's `PcsParams` (as the
-    /// single-type CLI does); the remaining params are re-derived from the
-    /// tier and the declared counts, so a tampered `PcsParams.m`/rate/batch
-    /// in the bundle cannot redirect verification.
+    /// Verify a mixed proof against the declared counts and the caller's
+    /// expected Ligerito profile. All PCS params are re-derived from that
+    /// public policy, the tier, and the counts; a proof-carried profile cannot
+    /// downgrade verification.
     pub fn verify<Ch: Challenger>(
         &self,
         counts: MixedCounts,
+        expected_profile: LigeritoProfile,
         commitment: &Commitment,
         proof: &R1csProofMergedLigerito,
         challenger: &mut Ch,
     ) -> Result<R1csClaim, VerifyError> {
         let union = self.union(counts);
-        let pcs_params = self.pcs_params(counts, commitment.params.profile);
+        let pcs_params = self.pcs_params(counts, expected_profile);
         let circuits: [&dyn LincheckCircuit; 2] = [
             self.sha2_r1cs.csc_lincheck_circuit(),
             self.blake3_r1cs.csc_lincheck_circuit(),
@@ -435,18 +435,19 @@ impl MerkleMixedSetup {
         prover::prove_fast_ligerito_union(&union, &pcs_params, slots, challenger)
     }
 
-    /// Verify against the declared counts. Params are re-derived from the
-    /// tier and the counts, so a tampered bundle `PcsParams` cannot redirect
-    /// verification.
+    /// Verify against the declared counts and caller-selected profile. Params
+    /// are re-derived from that public policy, the tier, and the counts, so a
+    /// tampered bundle `PcsParams` cannot redirect or downgrade verification.
     pub fn verify<Ch: Challenger>(
         &self,
         counts: MerkleMixedCounts,
+        expected_profile: LigeritoProfile,
         commitment: &Commitment,
         proof: &R1csProofMergedLigerito,
         challenger: &mut Ch,
     ) -> Result<R1csClaim, VerifyError> {
         let union = self.union(counts);
-        let pcs_params = self.pcs_params(counts, commitment.params.profile);
+        let pcs_params = self.pcs_params(counts, expected_profile);
         verifier::verify_ligerito_union(
             &union,
             &self.circuits(),

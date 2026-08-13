@@ -115,13 +115,13 @@ fn r1cs_prove_verify_roundtrip_ligerito() {
     }
 }
 
-/// End-to-end check for Secure-profile Boolean zerocheck and lincheck
-/// grinding. The `Secure` PCS profile selects both per-challenge schedules;
+/// End-to-end check for strict Fast-profile Boolean zerocheck and lincheck
+/// grinding. The default strict PCS profile selects both schedules;
 /// this test deliberately remains ignored because its Ligerito opening is the
 /// same heavyweight m22 workload as the ordinary end-to-end roundtrip above.
 #[test]
-#[ignore] // Run with `cargo test -p flock-prover --test verifier_roundtrip secure_profile_grinds_boolean_piops -- --ignored`.
-fn secure_profile_grinds_boolean_piops() {
+#[ignore] // Run with `cargo test -p flock-prover --test verifier_roundtrip strict_fast_profile_grinds_boolean_piops -- --ignored`.
+fn strict_fast_profile_grinds_boolean_piops() {
     let m = 22;
     let r1cs = identity_r1cs(m, 6, 6, 1 << 6);
     let mut rng = Rng::new(0x1280_0001);
@@ -131,12 +131,12 @@ fn secure_profile_grinds_boolean_piops() {
         m,
         log_inv_rate: 1,
         log_batch_size: 6,
-        profile: LigeritoProfile::Secure,
+        profile: LigeritoProfile::Fast,
         num_lanes: None,
         merkle_hash: Default::default(),
     };
 
-    let mut ch_p = FsChallenger::new(b"flock-secure-zc-grinding-v0");
+    let mut ch_p = FsChallenger::new(b"flock-strict-zc-grinding-v0");
     let (proof, commitment, claim_p) = prove_ligerito(
         &r1cs,
         pcs::pack_witness(&z, r1cs.m),
@@ -155,7 +155,7 @@ fn secure_profile_grinds_boolean_piops() {
     );
 
     let lc_circuit = r1cs.sparse_lincheck_circuit();
-    let mut ch_v = FsChallenger::new(b"flock-secure-zc-grinding-v0");
+    let mut ch_v = FsChallenger::new(b"flock-strict-zc-grinding-v0");
     let claim_v = verifier::verify_ligerito(
         &r1cs,
         &commitment,
@@ -169,7 +169,7 @@ fn secure_profile_grinds_boolean_piops() {
 
     let mut missing_nonce = proof.clone();
     missing_nonce.zerocheck.grinding_nonces.pop();
-    let mut ch_bad = FsChallenger::new(b"flock-secure-zc-grinding-v0");
+    let mut ch_bad = FsChallenger::new(b"flock-strict-zc-grinding-v0");
     assert!(matches!(
         verifier::verify_ligerito(
             &r1cs,
@@ -186,7 +186,7 @@ fn secure_profile_grinds_boolean_piops() {
 
     let mut missing_lincheck_nonce = proof.clone();
     missing_lincheck_nonce.lincheck.grinding_nonces.pop();
-    let mut ch_bad = FsChallenger::new(b"flock-secure-zc-grinding-v0");
+    let mut ch_bad = FsChallenger::new(b"flock-strict-zc-grinding-v0");
     assert!(matches!(
         verifier::verify_ligerito(
             &r1cs,

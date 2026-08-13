@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 /// (`2^log_batch_size · 16` bytes per leaf). This trades leaf-call SHA-256
 /// overhead (was 16 B leaves, now 512 B leaves at default `log_batch_size=5`)
 /// for much fewer Merkle nodes and better scaling to large `m`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PcsParams {
     pub m: usize,
     pub log_inv_rate: usize,
@@ -67,19 +67,20 @@ pub struct PcsParams {
 impl PcsParams {
     /// Grinding policy for the Boolean zerocheck PIOP.
     ///
-    /// `Secure` enables strict 128-bit work-normalized grinding for this
-    /// challenge family. Boolean, element, and PCS-transport policies are
-    /// selected independently because they protect Fiat--Shamir challenges
-    /// with different degree bounds. Ligerito derives its own schedule from
-    /// the selected profile.
+    /// `Fast`, `Slim`, and `Secure` enable strict 128-bit work-normalized
+    /// grinding for this challenge family. The `*100`
+    /// compatibility profiles retain the historical transcript shape.
+    /// Boolean, element, and PCS-transport policies are selected independently
+    /// because they protect Fiat--Shamir challenges with different degree
+    /// bounds. Ligerito derives its own schedule from the selected profile.
     pub fn zerocheck_grinding(&self) -> crate::zerocheck::ZerocheckGrinding {
         match self.profile {
-            crate::pcs::ligerito::LigeritoProfile::Secure => {
+            crate::pcs::ligerito::LigeritoProfile::Fast
+            | crate::pcs::ligerito::LigeritoProfile::Slim
+            | crate::pcs::ligerito::LigeritoProfile::Secure => {
                 crate::zerocheck::ZerocheckGrinding::per_challenge_128()
             }
-            crate::pcs::ligerito::LigeritoProfile::Fast
-            | crate::pcs::ligerito::LigeritoProfile::Fast100
-            | crate::pcs::ligerito::LigeritoProfile::Slim
+            crate::pcs::ligerito::LigeritoProfile::Fast100
             | crate::pcs::ligerito::LigeritoProfile::Slim100 => {
                 crate::zerocheck::ZerocheckGrinding::disabled()
             }
@@ -90,16 +91,16 @@ impl PcsParams {
     ///
     /// Kept separate from [`Self::zerocheck_grinding`] because the two
     /// protocols have different challenge degrees and therefore different
-    /// schedules. Secure enables both; Fast and Slim retain their legacy
-    /// transcript shape.
+    /// schedules. `Fast`, `Slim`, and `Secure` enable both; the `*100`
+    /// profiles retain their legacy transcript shape.
     pub fn lincheck_grinding(&self) -> crate::lincheck::LincheckGrinding {
         match self.profile {
-            crate::pcs::ligerito::LigeritoProfile::Secure => {
+            crate::pcs::ligerito::LigeritoProfile::Fast
+            | crate::pcs::ligerito::LigeritoProfile::Slim
+            | crate::pcs::ligerito::LigeritoProfile::Secure => {
                 crate::lincheck::LincheckGrinding::per_challenge_128()
             }
-            crate::pcs::ligerito::LigeritoProfile::Fast
-            | crate::pcs::ligerito::LigeritoProfile::Fast100
-            | crate::pcs::ligerito::LigeritoProfile::Slim
+            crate::pcs::ligerito::LigeritoProfile::Fast100
             | crate::pcs::ligerito::LigeritoProfile::Slim100 => {
                 crate::lincheck::LincheckGrinding::disabled()
             }
@@ -109,12 +110,12 @@ impl PcsParams {
     /// Grinding policy for the large-field element/dense PIOP.
     pub fn element_grinding(&self) -> crate::element_r1cs::Grinding {
         match self.profile {
-            crate::pcs::ligerito::LigeritoProfile::Secure => {
+            crate::pcs::ligerito::LigeritoProfile::Fast
+            | crate::pcs::ligerito::LigeritoProfile::Slim
+            | crate::pcs::ligerito::LigeritoProfile::Secure => {
                 crate::element_r1cs::Grinding::per_challenge_128()
             }
-            crate::pcs::ligerito::LigeritoProfile::Fast
-            | crate::pcs::ligerito::LigeritoProfile::Fast100
-            | crate::pcs::ligerito::LigeritoProfile::Slim
+            crate::pcs::ligerito::LigeritoProfile::Fast100
             | crate::pcs::ligerito::LigeritoProfile::Slim100 => {
                 crate::element_r1cs::Grinding::disabled()
             }
@@ -129,12 +130,12 @@ impl PcsParams {
     /// jagged reductions rather than the proximity protocol.
     pub fn opening_grinding(&self) -> crate::pcs::OpeningGrinding {
         match self.profile {
-            crate::pcs::ligerito::LigeritoProfile::Secure => {
+            crate::pcs::ligerito::LigeritoProfile::Fast
+            | crate::pcs::ligerito::LigeritoProfile::Slim
+            | crate::pcs::ligerito::LigeritoProfile::Secure => {
                 crate::pcs::OpeningGrinding::per_challenge_128()
             }
-            crate::pcs::ligerito::LigeritoProfile::Fast
-            | crate::pcs::ligerito::LigeritoProfile::Fast100
-            | crate::pcs::ligerito::LigeritoProfile::Slim
+            crate::pcs::ligerito::LigeritoProfile::Fast100
             | crate::pcs::ligerito::LigeritoProfile::Slim100 => {
                 crate::pcs::OpeningGrinding::disabled()
             }
@@ -144,12 +145,12 @@ impl PcsParams {
     /// Grinding policy for the circuit-wiring Product-GKR permutation check.
     pub fn product_gkr_grinding(&self) -> crate::product_gkr::BatchedGrinding {
         match self.profile {
-            crate::pcs::ligerito::LigeritoProfile::Secure => {
+            crate::pcs::ligerito::LigeritoProfile::Fast
+            | crate::pcs::ligerito::LigeritoProfile::Slim
+            | crate::pcs::ligerito::LigeritoProfile::Secure => {
                 crate::product_gkr::BatchedGrinding::per_challenge_128()
             }
-            crate::pcs::ligerito::LigeritoProfile::Fast
-            | crate::pcs::ligerito::LigeritoProfile::Fast100
-            | crate::pcs::ligerito::LigeritoProfile::Slim
+            crate::pcs::ligerito::LigeritoProfile::Fast100
             | crate::pcs::ligerito::LigeritoProfile::Slim100 => {
                 crate::product_gkr::BatchedGrinding::disabled()
             }
@@ -159,12 +160,12 @@ impl PcsParams {
     /// Grinding policy for recursive dense/sigma/jagged accumulation folds.
     pub fn matrix_fold_grinding(&self) -> crate::matrix_fold::FoldGrinding {
         match self.profile {
-            crate::pcs::ligerito::LigeritoProfile::Secure => {
+            crate::pcs::ligerito::LigeritoProfile::Fast
+            | crate::pcs::ligerito::LigeritoProfile::Slim
+            | crate::pcs::ligerito::LigeritoProfile::Secure => {
                 crate::matrix_fold::FoldGrinding::per_challenge_128()
             }
-            crate::pcs::ligerito::LigeritoProfile::Fast
-            | crate::pcs::ligerito::LigeritoProfile::Fast100
-            | crate::pcs::ligerito::LigeritoProfile::Slim
+            crate::pcs::ligerito::LigeritoProfile::Fast100
             | crate::pcs::ligerito::LigeritoProfile::Slim100 => {
                 crate::matrix_fold::FoldGrinding::disabled()
             }
@@ -769,6 +770,78 @@ mod tests {
             profile: Default::default(),
             num_lanes: None,
             merkle_hash: Default::default(),
+        }
+    }
+
+    #[test]
+    fn fast_slim_and_secure_enable_every_non_ligerito_grinding_family() {
+        use crate::pcs::ligerito::LigeritoProfile;
+
+        for profile in [
+            LigeritoProfile::Fast,
+            LigeritoProfile::Slim,
+            LigeritoProfile::Secure,
+        ] {
+            let mut params = default_params(22);
+            params.profile = profile;
+            assert_eq!(
+                params.zerocheck_grinding(),
+                crate::zerocheck::ZerocheckGrinding::per_challenge_128()
+            );
+            assert_eq!(
+                params.lincheck_grinding(),
+                crate::lincheck::LincheckGrinding::per_challenge_128()
+            );
+            assert_eq!(
+                params.element_grinding(),
+                crate::element_r1cs::Grinding::per_challenge_128()
+            );
+            assert_eq!(
+                params.opening_grinding(),
+                crate::pcs::OpeningGrinding::per_challenge_128()
+            );
+            assert_eq!(
+                params.product_gkr_grinding(),
+                crate::product_gkr::BatchedGrinding::per_challenge_128()
+            );
+            assert_eq!(
+                params.matrix_fold_grinding(),
+                crate::matrix_fold::FoldGrinding::per_challenge_128()
+            );
+        }
+    }
+
+    #[test]
+    fn hundred_bit_profiles_keep_non_ligerito_grinding_disabled() {
+        use crate::pcs::ligerito::LigeritoProfile;
+
+        for profile in [LigeritoProfile::Fast100, LigeritoProfile::Slim100] {
+            let mut params = default_params(22);
+            params.profile = profile;
+            assert_eq!(
+                params.zerocheck_grinding(),
+                crate::zerocheck::ZerocheckGrinding::disabled()
+            );
+            assert_eq!(
+                params.lincheck_grinding(),
+                crate::lincheck::LincheckGrinding::disabled()
+            );
+            assert_eq!(
+                params.element_grinding(),
+                crate::element_r1cs::Grinding::disabled()
+            );
+            assert_eq!(
+                params.opening_grinding(),
+                crate::pcs::OpeningGrinding::disabled()
+            );
+            assert_eq!(
+                params.product_gkr_grinding(),
+                crate::product_gkr::BatchedGrinding::disabled()
+            );
+            assert_eq!(
+                params.matrix_fold_grinding(),
+                crate::matrix_fold::FoldGrinding::disabled()
+            );
         }
     }
 

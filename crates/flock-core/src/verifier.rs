@@ -100,6 +100,17 @@ fn verifier_pool() -> &'static rayon::ThreadPool {
     })
 }
 
+/// The verifier's PCS parameters are public policy, not proof-selected
+/// inputs. Compare every serialized parameter before accepting an opening so
+/// a commitment cannot downgrade the requested profile or redirect Merkle
+/// verification.
+fn commitment_params_match_expected(
+    commitment: &Commitment,
+    expected: &crate::pcs::PcsParams,
+) -> bool {
+    &commitment.params == expected
+}
+
 /// Verify an R1CS proof: replay zerocheck + lincheck → the two base z-claims,
 /// then verify the batched Ligerito PCS opening covering both.
 pub fn verify_ligerito<Ch: Challenger>(
@@ -693,11 +704,7 @@ fn verify_union_piops<Ch: Challenger>(
     // ATTACKER-CONTROLLED. The honest lane count is count-derived
     // (`UnionInstance::commit_lanes`, like `dense_m`), so require the
     // commitment to carry exactly it; a mismatch is a rejection, not a panic.
-    if commitment.params.m != pcs_params.m
-        || commitment.params.log_batch_size != pcs_params.log_batch_size
-        || commitment.params.log_inv_rate != pcs_params.log_inv_rate
-        || commitment.params.num_ntts() != pcs_params.num_ntts()
-    {
+    if !commitment_params_match_expected(commitment, pcs_params) {
         return Err(VerifyError::PcsOpen(
             crate::pcs::VerifyErrorOpen::Ligerito,
         ));
@@ -949,6 +956,9 @@ fn verify_claims_ligerito_inner<Ch: Challenger>(
     pcs_params: &crate::pcs::PcsParams,
     challenger: &mut Ch,
 ) -> Result<(), pcs::VerifyError> {
+    if !commitment_params_match_expected(commitment, pcs_params) {
+        return Err(pcs::VerifyError::Ligerito);
+    }
     let z_skips: Vec<F128> = claims.iter().map(|c| c.point.z_skip).collect();
     let values: Vec<F128> = claims.iter().map(|c| c.value).collect();
     let x_fulls: Vec<Vec<F128>> = claims
@@ -1120,6 +1130,10 @@ fn verify_core_inner<Ch: Challenger>(
 
 #[cfg(test)]
 mod tests {
+    use crate::merkle::HashKind;
+    use crate::pcs::ligerito::LigeritoProfile;
+    use crate::pcs::{Commitment, PcsParams};
+
     /// The verifier is intentionally single-threaded: every `par_*` reached
     /// from a verify core must collapse onto the one-thread `verifier_pool`.
     /// Guard the invariant so a future `ThreadPoolBuilder` tweak can't silently
@@ -1132,5 +1146,37 @@ mod tests {
     fn verifier_pool_is_single_threaded() {
         let n = super::verifier_pool().install(rayon::current_num_threads);
         assert_eq!(n, 1, "verifier_pool must have exactly one worker thread");
+    }
+
+    #[test]
+    fn commitment_params_cannot_select_profile_or_merkle_hash() {
+        let expected = PcsParams {
+            m: 22,
+            log_inv_rate: 1,
+            log_batch_size: 6,
+            profile: LigeritoProfile::Fast,
+            num_lanes: None,
+            merkle_hash: HashKind::Sha256,
+        };
+        let mut commitment = Commitment {
+            cap: Vec::new(),
+            params: expected.clone(),
+        };
+        assert!(super::commitment_params_match_expected(
+            &commitment,
+            &expected
+        ));
+
+        commitment.params.profile = LigeritoProfile::Fast100;
+        assert!(!super::commitment_params_match_expected(
+            &commitment,
+            &expected
+        ));
+        commitment.params.profile = expected.profile;
+        commitment.params.merkle_hash = HashKind::Blake3;
+        assert!(!super::commitment_params_match_expected(
+            &commitment,
+            &expected
+        ));
     }
 }

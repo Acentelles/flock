@@ -36,6 +36,7 @@ use crate::lincheck::build_eq_table;
 use crate::merkle::{self, Hash, HashKind};
 use crate::ntt::additive_ntt_f128::AdditiveNttF128;
 use crate::pcs::stratified;
+use crate::pcs::LOG_PACKING;
 use serde::{Deserialize, Serialize};
 
 pub(crate) mod extension;
@@ -660,9 +661,11 @@ pub enum SoundnessRegime {
     /// `fold_grinding_bits` should be ≥ (target_bits − log₂(q²/a)) when the
     /// fold challenge is sampled in F256.
     /// Binding to a single codeword of the (Johnson-bounded) interleaved list
-    /// uses two independent post-commit multilinear evaluations. At L0 the
-    /// opening's ordinary evaluation supplies the first and `ood_samples = 1`
-    /// supplies the second; deeper levels use `ood_samples = 2`.
+    /// uses two independent post-commit evaluations. At L0 the ordinary
+    /// ring-switched opening supplies the first, conservatively accounted at
+    /// degree `m = μ + 7`, and `ood_samples = 1` supplies a packed-polynomial
+    /// evaluation of degree `μ`. Deeper levels use two explicit degree-`μ`
+    /// samples.
     ///
     /// Note there is deliberately no plain `Johnson` variant: without OOD
     /// binding the query phase pays a union bound over the interleaved list
@@ -749,10 +752,11 @@ pub struct LigeritoLevelConfig {
     /// Diagnostic — `Q · log₂(1/(1−γ))`. Should be ≥
     /// `target_security_bits − grinding_bits`.
     pub expected_eps_query_bits: f64,
-    /// Diagnostic — OOD collision-binding bits (`JohnsonOod` only):
-    /// `s·(128 − log₂μ) − (2·log₂L − 1)`, where `s = 2` counts
-    /// total independent points (including L0's ordinary opening point), `L`
-    /// is the Johnson interleaved list size, and `μ` the variable count.
+    /// Diagnostic — OOD collision-binding bits (`JohnsonOod` only). Deeper
+    /// levels use `2·(128 − log₂μ) − (2·log₂L − 1)`. At L0 the ordinary
+    /// ring-switched opening has degree at most `m = μ + LOG_PACKING`, so the
+    /// conservative bound is `(128 − log₂m) + (128 − log₂μ)
+    /// − (2·log₂L − 1)`. Here `L` is the Johnson interleaved-list bound.
     #[serde(default)]
     pub expected_eps_ood_bits: Option<f64>,
     /// Diagnostic -- unground claim-batching bits
@@ -1091,26 +1095,34 @@ fn johnson_interleaved_list_log2(log_inv_rate: usize, eta: f64) -> f64 {
     l_base.log2()
 }
 
-/// OOD collision-binding bits for a `JohnsonOod` level with
-/// `total_samples` independently sampled post-commit evaluation points.
-/// `mu_vars` is the level's multilinear variable count
-/// (`log_msg_cols + log_num_interleaved`).
+/// OOD collision-binding bits for a `JohnsonOod` level. Explicit OOD samples
+/// evaluate the packed polynomial, whose total degree is at most
+/// `explicit_degree`. L0 additionally uses its ordinary ring-switched opening
+/// as an implicit sample; that check may have the separate
+/// `implicit_degree = explicit_degree + LOG_PACKING` because its basis also
+/// depends on the seven-coordinate ring-switch point.
 ///
-/// For two distinct list elements, their difference has total degree at most
-/// `μ`, hence Schwartz–Zippel gives agreement probability at most
-/// `(μ/2^128)^s` at `s` independent points. Union bounding over unordered
-/// pairs in the Johnson list gives
+/// Schwartz--Zippel bounds each agreement by `degree / 2^128`. Independence
+/// of the post-commit samples lets those factors multiply. Union bounding over
+/// unordered pairs in the Johnson list gives
 ///
-///   bits = s·(128 − log₂ μ) − (2·log₂ L_int − 1).
-///
-/// L0 already has one post-commit point: the opening claim's evaluation
-/// point. Its configured `ood_samples` are therefore *additional* points;
-/// callers pass `1 + ood_samples` for L0 and `ood_samples` elsewhere.
-fn paper_ood_bits(log_inv_rate: usize, eta: f64, mu_vars: usize, total_samples: usize) -> f64 {
-    debug_assert!(total_samples >= 1);
+///   bits = sum_j (128 - log2 degree_j) - (2 log2 L_int - 1).
+fn paper_ood_bits(
+    log_inv_rate: usize,
+    eta: f64,
+    explicit_degree: usize,
+    explicit_samples: usize,
+    implicit_degree: Option<usize>,
+) -> f64 {
+    debug_assert!(explicit_samples + usize::from(implicit_degree.is_some()) >= 1);
+    debug_assert!(explicit_degree >= 1);
     let log2_l = johnson_interleaved_list_log2(log_inv_rate, eta);
-    let log2_mu = (mu_vars as f64).log2();
-    total_samples as f64 * (BASE_FIELD_LOG_Q - log2_mu) - (2.0 * log2_l - 1.0)
+    let explicit_bits =
+        explicit_samples as f64 * (BASE_FIELD_LOG_Q - (explicit_degree as f64).log2());
+    let implicit_bits = implicit_degree
+        .map(|degree| BASE_FIELD_LOG_Q - (degree as f64).log2())
+        .unwrap_or(0.0);
+    explicit_bits + implicit_bits - (2.0 * log2_l - 1.0)
 }
 
 impl LigeritoLevelConfig {
@@ -1192,7 +1204,7 @@ impl LigeritoLevelConfig {
     /// OOD binding bits this level is expected to deliver (`JohnsonOod`
     /// only; `None` for `Udr`, where the unique-decoding list has size 1 and
     /// no binding step exists). See [`paper_ood_bits`].
-    pub fn paper_predicted_ood_bits(&self, implicit_samples: usize) -> Option<f64> {
+    pub fn paper_predicted_ood_bits(&self, is_l0: bool) -> Option<f64> {
         match self.regime {
             SoundnessRegime::JohnsonOod => {
                 let eta = self.eta.expect("JohnsonOod must have eta");
@@ -1201,7 +1213,8 @@ impl LigeritoLevelConfig {
                     self.log_inv_rate,
                     eta,
                     mu,
-                    implicit_samples + self.ood_samples,
+                    self.ood_samples,
+                    is_l0.then_some(mu + LOG_PACKING),
                 ))
             }
             SoundnessRegime::Udr => None,
@@ -1348,7 +1361,7 @@ impl LigeritoSecurityConfig {
                 }
                 (SoundnessRegime::JohnsonOod, Some(declared)) => {
                     let pred = lv
-                        .paper_predicted_ood_bits(usize::from(i == 0))
+                        .paper_predicted_ood_bits(i == 0)
                         .expect("JohnsonOod has an OOD prediction");
                     if (declared - pred).abs() > PAPER_COMPAT_TOL_BITS {
                         return Err(format!(
@@ -1518,7 +1531,7 @@ impl LigeritoSecurityConfig {
 
             // OOD binding is independently and strictly a 128-bit component.
             // Again use the exact formula, not its one-decimal diagnostic.
-            if let Some(ood) = lv.paper_predicted_ood_bits(usize::from(i == 0))
+            if let Some(ood) = lv.paper_predicted_ood_bits(i == 0)
                 && ood <= OOD_BINDING_TARGET_BITS
             {
                 return Err(format!(
@@ -1827,10 +1840,15 @@ impl LigeritoSecurityConfig {
                     // Two independent binding points at every commitment.
                     // L0's ordinary opening point is already post-commit and
                     // supplies the first; all later points are explicit.
-                    let implicit_samples = usize::from(i == 0);
-                    let total_samples = 2usize;
-                    let ood_samples = total_samples - implicit_samples;
-                    let eps_ood = paper_ood_bits(rate, JOHNSON_ETA, mu, total_samples);
+                    let is_l0 = i == 0;
+                    let ood_samples = if is_l0 { 1 } else { 2 };
+                    let eps_ood = paper_ood_bits(
+                        rate,
+                        JOHNSON_ETA,
+                        mu,
+                        ood_samples,
+                        is_l0.then_some(mu + LOG_PACKING),
+                    );
                     (
                         SoundnessRegime::JohnsonOod,
                         Some(JOHNSON_ETA),
@@ -7113,6 +7131,47 @@ mod tests {
             let dense = round_msg_and_eval_blocked(&f, &eq, d);
             assert_eq!(factored, dense, "round-0 OOD batch at block size {d}");
         }
+    }
+
+    #[test]
+    fn l0_ood_accounting_includes_the_ring_switch_degree() {
+        let cfg = LigeritoSecurityConfig::from_toml_str(include_str!(
+            "../../configs/ligerito/m22_fast.toml"
+        ))
+        .expect("m22 Fast config validates");
+        let l0 = &cfg.levels[0];
+        let eta = l0.eta.expect("Fast uses Johnson OOD");
+        let mu = l0.log_msg_cols + l0.log_num_interleaved;
+
+        let conservative = l0
+            .paper_predicted_ood_bits(true)
+            .expect("Johnson OOD has a prediction");
+        let treating_both_points_as_degree_mu = paper_ood_bits(
+            l0.log_inv_rate,
+            eta,
+            mu,
+            l0.ood_samples + 1,
+            None,
+        );
+        let expected_loss = ((mu + LOG_PACKING) as f64 / mu as f64).log2();
+        assert!(conservative < treating_both_points_as_degree_mu);
+        assert!(
+            ((treating_both_points_as_degree_mu - conservative) - expected_loss).abs()
+                < 1e-10
+        );
+
+        let l1 = &cfg.levels[1];
+        let mu1 = l1.log_msg_cols + l1.log_num_interleaved;
+        assert_eq!(
+            l1.paper_predicted_ood_bits(false),
+            Some(paper_ood_bits(
+                l1.log_inv_rate,
+                l1.eta.expect("Fast uses Johnson OOD"),
+                mu1,
+                l1.ood_samples,
+                None,
+            ))
+        );
     }
 
     /// Worked example: `LigeritoSecurityConfig` for BLAKE3 m=29 at rate 1/2.

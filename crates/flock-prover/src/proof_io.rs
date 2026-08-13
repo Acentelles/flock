@@ -10,7 +10,7 @@
 //! On-disk format:
 //! ```text
 //!   bytes 0..5    "FLOCK"                  (5-byte magic)
-//!   byte  5       VERSION                  (currently 19)
+//!   byte  5       VERSION                  (currently 20)
 //!   bytes 6..7    flavor: 2 = R1cs, 3 = Chain, 4 = Mixed
 //!                 (0/1 reserved: legacy BaseFold)
 //!   bytes 7..     bincode-serialized payload
@@ -32,9 +32,10 @@
 //! // Then call e.g. `setup.verify(&bundle.commitment, &bundle.proof, ...)`.
 //! ```
 
-use std::io;
+use std::io::{self, Read};
 use std::path::Path;
 
+use bincode::Options;
 use serde::{Deserialize, Serialize};
 
 use flock_core::pcs::Commitment;
@@ -43,7 +44,17 @@ use flock_core::pcs::Commitment;
 /// random binary data early.
 pub const MAGIC: [u8; 5] = *b"FLOCK";
 
+/// Maximum accepted proof-bundle size, including the seven-byte header.
+/// Current bundles are well below this ceiling; bounding both file reads and
+/// bincode prevents malformed length prefixes or oversized files from turning
+/// verification into an unbounded allocation.
+pub const MAX_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Format version. Bumped on incompatible serialization changes.
+/// v20 enables the existing non-Ligerito algebraic grinding schedules for
+/// the strict Fast and Slim profiles. No payload fields changed, but their
+/// nonce vectors and Fiat--Shamir transcript shapes are incompatible with
+/// v19 proofs made under those profiles.
 /// v19 moves Ligerito sumcheck claims and challenges to F256. Recursive
 /// commitments remain over F128 by splitting each extension word into a
 /// coordinate bit, so the transcript, recursive dimensions, final `yr`, and
@@ -124,7 +135,7 @@ pub const MAGIC: [u8; 5] = *b"FLOCK";
 /// v3 restructured `BaseFoldProof`: per-query Merkle paths were replaced by
 /// shared octopus multi-proofs (one per Merkle tree). v2 added `HashKind`
 /// to [`ChainProofBundle`].
-pub const VERSION: u8 = 19;
+pub const VERSION: u8 = 20;
 
 /// Which hash function a chain proof is over. Carried in
 /// [`ChainProofBundle`] so the verifier (e.g. the CLI) can pick the right
@@ -177,6 +188,7 @@ pub enum BundleFlavor {
 /// Validate the header (magic + version) and return the bundle flavor,
 /// without touching the payload.
 pub fn peek_flavor(bytes: &[u8]) -> Result<BundleFlavor, DeserializeError> {
+    check_bundle_size(bytes.len())?;
     if bytes.len() < HEADER_LEN {
         return Err(DeserializeError::Truncated);
     }
@@ -210,6 +222,8 @@ pub enum DeserializeError {
     UnknownFlavor(u8),
     /// `from_bytes` was called with a slice shorter than `HEADER_LEN`.
     Truncated,
+    /// The encoded bundle exceeds [`MAX_BUNDLE_BYTES`].
+    TooLarge { len: usize, max: usize },
     /// The expected flavor and the file's flavor disagree (e.g. trying to
     /// load a `ChainProofBundle` from an R1CS bundle file).
     FlavorMismatch { expected: u8, found: u8 },
@@ -226,6 +240,9 @@ impl std::fmt::Display for DeserializeError {
             }
             Self::UnknownFlavor(v) => write!(f, "unknown flavor byte: {v}"),
             Self::Truncated => write!(f, "input shorter than header ({HEADER_LEN} bytes)"),
+            Self::TooLarge { len, max } => {
+                write!(f, "proof bundle is {len} bytes; maximum is {max}")
+            }
             Self::FlavorMismatch { expected, found } => {
                 write!(f, "flavor mismatch: expected {expected}, found {found}")
             }
@@ -275,7 +292,7 @@ impl R1csProofBundleLigerito {
     }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DeserializeError> {
         let payload = parse_header(bytes, FLAVOR_R1CS_LIGERITO)?;
-        Ok(bincode::deserialize(payload)?)
+        deserialize_payload(payload)
     }
 }
 
@@ -289,7 +306,7 @@ impl ChainProofBundleLigerito {
     }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DeserializeError> {
         let payload = parse_header(bytes, FLAVOR_CHAIN_LIGERITO)?;
-        Ok(bincode::deserialize(payload)?)
+        deserialize_payload(payload)
     }
 }
 
@@ -323,7 +340,7 @@ impl MixedProofBundleLigerito {
     }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DeserializeError> {
         let payload = parse_header(bytes, FLAVOR_MIXED_LIGERITO)?;
-        Ok(bincode::deserialize(payload)?)
+        deserialize_payload(payload)
     }
 }
 
@@ -354,6 +371,7 @@ fn write_header(out: &mut Vec<u8>, flavor: u8) {
 }
 
 fn parse_header(bytes: &[u8], expected_flavor: u8) -> Result<&[u8], DeserializeError> {
+    check_bundle_size(bytes.len())?;
     if bytes.len() < HEADER_LEN {
         return Err(DeserializeError::Truncated);
     }
@@ -380,6 +398,28 @@ fn parse_header(bytes: &[u8], expected_flavor: u8) -> Result<&[u8], DeserializeE
     Ok(&bytes[HEADER_LEN..])
 }
 
+fn check_bundle_size(len: usize) -> Result<(), DeserializeError> {
+    if len > MAX_BUNDLE_BYTES {
+        Err(DeserializeError::TooLarge {
+            len,
+            max: MAX_BUNDLE_BYTES,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn deserialize_payload<T: serde::de::DeserializeOwned>(
+    payload: &[u8],
+) -> Result<T, DeserializeError> {
+    Ok(bincode::DefaultOptions::new()
+        // Preserve the wire encoding used by bincode's top-level helpers.
+        .with_fixint_encoding()
+        .with_limit((MAX_BUNDLE_BYTES - HEADER_LEN) as u64)
+        .reject_trailing_bytes()
+        .deserialize(payload)?)
+}
+
 // ---------------------------------------------------------------------------
 // File-IO conveniences
 // ---------------------------------------------------------------------------
@@ -401,9 +441,33 @@ pub fn write_bytes_to_file<P: AsRef<Path>>(path: P, bytes: &[u8]) -> io::Result<
     std::fs::rename(&tmp, path)
 }
 
-/// Read raw bytes from a file. Thin wrapper over `std::fs::read`.
+/// Read proof bytes from a file without ever buffering more than
+/// [`MAX_BUNDLE_BYTES`]. The `take` guard also handles a file growing between
+/// its metadata check and the read.
 pub fn read_bytes_from_file<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
-    std::fs::read(path)
+    let mut file = std::fs::File::open(path)?;
+    let declared_len = file.metadata()?.len();
+    if declared_len > MAX_BUNDLE_BYTES as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "proof bundle is {declared_len} bytes; maximum is {MAX_BUNDLE_BYTES}"
+            ),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(declared_len as usize);
+    file.by_ref()
+        .take(MAX_BUNDLE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_BUNDLE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "proof bundle exceeded the {MAX_BUNDLE_BYTES}-byte maximum while reading"
+            ),
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Write a Ligerito chain bundle to `path`.
@@ -580,8 +644,8 @@ mod tests {
             .expect("verify round-tripped chain proof");
     }
 
-    /// Mixed bundle (wire v6, merged transport) end-to-end: prove a small
-    /// partial-count mixed
+    /// Mixed bundle (current wire version, merged transport) end-to-end:
+    /// prove a small partial-count mixed
     /// instance on the nu7 tier, serialize, roundtrip, verify from the
     /// deserialized bundle (registry rebuilt from the id, counts from the
     /// bundle), and reject count tampering.
@@ -617,6 +681,13 @@ mod tests {
         assert_eq!(bundle2.counts, bundle.counts);
         assert_eq!(bundle2.commitment.cap, bundle.commitment.cap);
 
+        let mut bytes_with_suffix = bytes.clone();
+        bytes_with_suffix.push(0);
+        assert!(
+            MixedProofBundleLigerito::from_bytes(&bytes_with_suffix).is_err(),
+            "a valid bundle with trailing bytes must be rejected"
+        );
+
         // Verify from the deserialized bundle alone (+ the rebuilt tier).
         let setup2 = MixedSetup::new(bundle2.registry_id);
         let counts = MixedCounts {
@@ -625,8 +696,30 @@ mod tests {
         };
         let mut chv = FsChallenger::new(b"flock-proofio-mixed");
         setup2
-            .verify(counts, &bundle2.commitment, &bundle2.proof, &mut chv)
+            .verify(
+                counts,
+                bundle2.commitment.params.profile,
+                &bundle2.commitment,
+                &bundle2.proof,
+                &mut chv,
+            )
             .expect("verify round-tripped mixed proof");
+
+        // Verification policy is caller-selected. A valid Fast proof must
+        // not be accepted when the caller requests a compatibility profile.
+        let mut chv = FsChallenger::new(b"flock-proofio-mixed");
+        assert!(
+            setup2
+                .verify(
+                    counts,
+                    flock_core::pcs::ligerito::LigeritoProfile::Fast100,
+                    &bundle2.commitment,
+                    &bundle2.proof,
+                    &mut chv,
+                )
+                .is_err(),
+            "proof-carried profile must not override verifier policy"
+        );
 
         // Tampered counts must reject (they bind before any challenge).
         let mut chv = FsChallenger::new(b"flock-proofio-mixed");
@@ -637,6 +730,7 @@ mod tests {
                         sha2: 101,
                         blake3: 37
                     },
+                    bundle2.commitment.params.profile,
                     &bundle2.commitment,
                     &bundle2.proof,
                     &mut chv,
@@ -787,5 +881,32 @@ mod tests {
     fn rejects_truncated() {
         let res = R1csProofBundleLigerito::from_bytes(&[0u8; 3]);
         assert!(matches!(res, Err(DeserializeError::Truncated)));
+    }
+
+    #[test]
+    fn bounded_decoder_rejects_trailing_bytes() {
+        let mut payload = bincode::serialize(&0x1280_u64).expect("serialize test value");
+        payload.push(0);
+        assert!(deserialize_payload::<u64>(&payload).is_err());
+    }
+
+    #[test]
+    fn bounded_decoder_rejects_impossible_vector_length() {
+        // Fixed-width bincode represents a Vec length as a little-endian u64.
+        // The byte limit rejects this before attempting the requested
+        // allocation.
+        let payload = u64::MAX.to_le_bytes();
+        assert!(deserialize_payload::<Vec<u8>>(&payload).is_err());
+    }
+
+    #[test]
+    fn rejects_bundle_above_size_ceiling() {
+        assert!(matches!(
+            check_bundle_size(MAX_BUNDLE_BYTES + 1),
+            Err(DeserializeError::TooLarge {
+                len,
+                max: MAX_BUNDLE_BYTES
+            }) if len == MAX_BUNDLE_BYTES + 1
+        ));
     }
 }
