@@ -50,6 +50,12 @@
 //! Re-pinned 2026-08-13 for proof-IO v20. Strict Fast and Slim proofs now
 //! include every non-Ligerito grinding nonce. All six deterministic digests
 //! were stable across two print runs.
+//! Re-pinned 2026-08-14: BLAKE3 R1CS "Option F" — the zk.golf record's
+//! fused 3-operand adders (61 rows vs 62) and round-1 constant-c adders
+//! (30/29 rows) shrink the table 10,416 → 10,298 AND rows, USEFUL_BITS
+//! 11,825 → 11,707 (93 → 92 chunk-columns), so every blake3-committed
+//! fixture's bytes move. The pure SHA-256 anchor is untouched — the change
+//! is blake3-local. Digests stable across two print runs.
 
 use ::sha2 as sha2_hash;
 use flock_core::proof::{R1csClaim, R1csProofMergedLigerito};
@@ -165,22 +171,22 @@ fn m6_merged_union_proof_bytes_pinned() {
         (
             "merged-nu10-1024-1024",
             [1024, 1024],
-            "86905eb1f362323013b0b10d52ec4cc9759ed437683ec4bb4a21cc1727ab01bd",
+            "4e9ee1c855d8cf4873cea7dccb389fc184ed01f7580279acd58575546a856dea",
         ),
         (
             "merged-nu10-50-37",
             [50, 37],
-            "f63f7a1f09c7ad07996dcf8abb3a5cdfccd2a86959ca1e4fa5ec4c8683bb40f9",
+            "68730de8448ce3403709b29457f542270e86a2fd9a42bb241da0a1b34aa2194d",
         ),
         (
             "merged-nu10-8-8",
             [8, 8],
-            "1763a59de978d72cf58d23de7d221e207ae9f15ec0ddb2d52f57d9ed59fd9850",
+            "a1c022c9ef8e8cf3730c4770baadb512a36cf6191b883edb925dd922fe0838e6",
         ),
         (
             "merged-nu10-0-64",
             [0, 64],
-            "a560716ba14b08e19b8d8c0b29d57a563d78d7c1ba9da77b6e1dd46c2d8bacf0",
+            "9c1abee932fd641d0c32664ce03374ee5cce9710dd759e35de94d22797801d68",
         ),
     ];
 
@@ -256,7 +262,7 @@ fn m6_merged_union_proof_bytes_pinned() {
 fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
     // BLAKE3, 256 blocks (m = 22).
     {
-        const EXPECTED: &str = "727b5c0ebd7f7289763ae770c3d519347c6c805cfa9abc1fdd4d784400659176";
+        const EXPECTED: &str = "874fcef97c0f7460fe0d8a98a7de21c567ea8856452cda973a4594119d8edb4f";
         let n_blocks = 256usize;
         let setup = blake3::Blake3Setup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_B3B3);

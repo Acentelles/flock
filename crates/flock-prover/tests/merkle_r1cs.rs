@@ -42,7 +42,7 @@ fn path(rng: &mut Rng, depth: usize, index: u64) -> PathInput {
 #[test]
 fn layout_geometry() {
     let spec = blake3_spec();
-    const U: usize = 11_825; // blake3 useful bits
+    const U: usize = flock_prover::r1cs_hashes::blake3::USEFUL_BITS; // 11,707
     const STRIDE: usize = 1 << 14;
     for (depth, want_k_log) in [(1usize, 14usize), (2, 15), (3, 16), (26, 19)] {
         let layout = MerkleTreeLayout::new(depth, spec.clone());
@@ -65,14 +65,16 @@ fn layout_geometry() {
         }
     }
 
-    // The depth-26 experiment target. Padding each level to 2^14 costs 31%
-    // more columns than the tightly-packed layout (321,045 → 421,937 — the
-    // fraction grew when the lin-id drop narrowed the base block) and buys
-    // the walker's 26× eq factorization; k_log is unchanged at 19.
+    // The depth-26 experiment target. Padding each level to 2^14 costs ~31%
+    // more columns than the tightly-packed layout (the fraction grew when
+    // the lin-id drop narrowed the base block: 421,937 at Option E, 421,819
+    // at Option F's fused/const adders) and buys the walker's 26× eq
+    // factorization; k_log is unchanged at 19.
     let l26 = MerkleTreeLayout::new(26, spec);
-    assert_eq!(l26.useful_bits, 421_937);
+    assert_eq!(l26.useful_bits, 25 * STRIDE + U + 512);
+    assert_eq!(l26.useful_bits, 421_819);
     assert_eq!(l26.k_log, 19);
-    assert_eq!(l26.useful_bits.div_ceil(128), 3_297);
+    assert_eq!(l26.useful_bits.div_ceil(128), 3_296);
 }
 
 /// The composite R1CS accepts an honest path, at every index pattern that
@@ -634,7 +636,7 @@ fn hash_to_digest(h: &[u8; 32]) -> [u32; SLOT_WORDS] {
 #[test]
 fn chunk_layout_geometry() {
     let spec = blake3_spec();
-    const U: usize = 11_825;
+    const U: usize = flock_prover::r1cs_hashes::blake3::USEFUL_BITS; // 11,707
     const STRIDE: usize = 1 << 14;
     for (depth, leaf_bytes, want_k_log) in
         [(1usize, 64usize, 15usize), (2, 128, 16), (13, 1024, 19)]

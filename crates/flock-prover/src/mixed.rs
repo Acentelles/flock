@@ -496,8 +496,8 @@ mod tests {
 
     /// The tier registry reproduces the geometry the M3/M4/M5 mixed tests
     /// pin: slot order SHA-256 then BLAKE3, M = nu + 16, and the
-    /// height-`n_t` dense-stack sizes — count-proportional (339 used
-    /// chunk-columns: 246 SHA-256 + 93 BLAKE3), floored at the m22
+    /// height-`n_t` dense-stack sizes — count-proportional (338 used
+    /// chunk-columns: 246 SHA-256 + 92 BLAKE3), floored at the m22
     /// Ligerito config, reaching M4's capacity-height size only at full
     /// utilization.
     #[test]
@@ -505,14 +505,14 @@ mod tests {
         let setup = MixedSetup::new(MixedRegistryId::Blake3Sha2Nu7);
         assert_eq!(setup.registry.m_total(), 23);
         // The CLI's flagship mix: counts (100, 37) — dense
-        // 100·246 + 37·93 = 28 041 words → committed 2^15 (m = 22), HALF
+        // 100·246 + 37·92 = 28,004 words → committed 2^15 (m = 22), HALF
         // of M4's capacity-height 2^16 (m = 23).
         let counts = MixedCounts {
             sha2: 100,
             blake3: 37,
         };
         let union = setup.union(counts);
-        assert_eq!(union.dense_words(), 100 * 246 + 37 * 93);
+        assert_eq!(union.dense_words(), 100 * 246 + 37 * 92);
         assert_eq!(union.dense_m(), 22);
         assert!(!union.compaction_is_identity());
         assert_eq!(
@@ -525,7 +525,7 @@ mod tests {
             sha2: 128,
             blake3: 128,
         };
-        assert_eq!(setup.union(full).dense_words(), (246 + 93) << 7);
+        assert_eq!(setup.union(full).dense_words(), (246 + 92) << 7);
         assert_eq!(setup.union(full).dense_m(), 23);
         assert_eq!(setup.pcs_params(full, LigeritoProfile::Fast).m, 23);
     }
@@ -574,21 +574,23 @@ mod tests {
         assert_eq!(setup.registry.m_total(), 3 + 20);
         assert_eq!(setup.merkle_layout.depth, MERKLE_DEPTH);
 
-        // Merkle contributes 3,297 chunk-columns per path, BLAKE3 93.
+        // Merkle contributes 3,296 chunk-columns per path, BLAKE3 92.
         // (The composite's embedded blocks sit at aligned 2^k_log strides,
-        // so the lin-id drop trims only its TAIL block: 3,325 → 3,297.)
+        // so useful-bit trims land only in its TAIL block: 3,325 → 3,297
+        // at the Option-E lin-id drop, → 3,296 at Option F's fused/const
+        // adders.)
         let counts = MerkleMixedCounts {
             merkle: 8,
             blake3: 8,
         };
         let union = setup.union(counts);
-        assert_eq!(union.dense_words(), 8 * 3_297 + 8 * 93);
+        assert_eq!(union.dense_words(), 8 * 3_296 + 8 * 92);
         assert_eq!(union.dense_m(), 22);
         // A Merkle-only instance still works (count 0 for the other slot).
         let merkle_only = MerkleMixedCounts {
             merkle: 8,
             blake3: 0,
         };
-        assert_eq!(setup.union(merkle_only).dense_words(), 8 * 3_297);
+        assert_eq!(setup.union(merkle_only).dense_words(), 8 * 3_296);
     }
 }

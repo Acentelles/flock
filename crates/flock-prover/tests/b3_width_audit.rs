@@ -14,11 +14,7 @@
 //!
 //! Run: `cargo test --release --test b3_width_audit -- --ignored --nocapture`
 
-use flock_prover::r1cs_hashes::blake3::{
-    CARRY_BITS_PER_ADD, G_STRIDE, GS_BASE, N_G, USEFUL_BITS, build_matrices,
-};
-
-const ADDS_PER_G: usize = 6;
+use flock_prover::r1cs_hashes::blake3::{G_BASE, USEFUL_BITS, build_matrices, g_block_bits};
 
 #[test]
 #[ignore]
@@ -35,31 +31,25 @@ fn b3_density_profile() {
         (na + nb) as f64 / USEFUL_BITS as f64
     );
 
-    // Per-round carry-row density: for each G, sum A+B nnz over its 6 ADDs'
-    // carry rows, and separately the lin-id rows. The carry prefix alone
-    // contributes 2*(0+1+..+30) = 930 per ADD; anything above that is
-    // inlined lane material (the cascade).
-    let carry_prefix_floor = 2 * (CARRY_BITS_PER_ADD * (CARRY_BITS_PER_ADD - 1) / 2);
-    eprintln!("carry-prefix floor per ADD (A+B): {carry_prefix_floor}");
-    // Option E: the G block is carry rows only (G_STRIDE = 186).
+    // Per-round aux-row density: for each G, sum A+B nnz over its ADD
+    // product rows (Option F: two fused adds + two 2-op adds; round 1's
+    // column G's have narrower constant-c ADD_C1 groups).
     for r in 0..7 {
-        let mut carry = 0usize;
+        let mut aux = 0usize;
+        let mut n_rows = 0usize;
         let mut max_row = 0usize;
         for gi in 0..8 {
             let g = r * 8 + gi;
-            let base = GS_BASE + G_STRIDE * g;
-            for add in 0..ADDS_PER_G {
-                for i in 0..CARRY_BITS_PER_ADD {
-                    let s = base + add * CARRY_BITS_PER_ADD + i;
-                    let w = a.rows[s].len() + b.rows[s].len();
-                    carry += w;
-                    max_row = max_row.max(w);
-                }
+            for s in G_BASE[g]..G_BASE[g] + g_block_bits(g) {
+                let w = a.rows[s].len() + b.rows[s].len();
+                aux += w;
+                n_rows += 1;
+                max_row = max_row.max(w);
             }
         }
         eprintln!(
-            "round {r}: carry nnz {carry} (avg {:.1}/row, max {max_row})",
-            carry as f64 / (8.0 * 6.0 * 31.0),
+            "round {r}: aux nnz {aux} (avg {:.1}/row over {n_rows} rows, max {max_row})",
+            aux as f64 / n_rows as f64,
         );
     }
 

@@ -6,7 +6,7 @@
 //!   cargo bench --bench urm_probe --no-run
 //!   RAYON_NUM_THREADS=1 samply record -- ./target/release/deps/urm_probe-<hash> [n_runs] [m] [padding]
 //!
-//! `padding` = `dense` (default) or `blake3` (k_log=14, useful=11825 — the
+//! `padding` = `dense` (default) or `blake3` (k_log=14, useful=blake3::USEFUL_BITS — the
 //! real blake3 prove_fast call shape).
 //!
 //! Prints an FNV checksum of all three outputs: inputs are seeded, so the
@@ -89,8 +89,12 @@ fn main() {
         .unwrap_or_else(|| "dense".to_string());
     let padding = match padding_mode.as_str() {
         "dense" => PaddingSpec::dense(m),
-        // BLAKE3 prove_fast shape: K_LOG=14, USEFUL_BITS=11,825 (Option E).
-        "blake3" => PaddingSpec::uniform(14, 11_825, 1usize << (m - 14)),
+        // BLAKE3 prove_fast shape: K_LOG=14, USEFUL_BITS (Option F: 11,707).
+        "blake3" => PaddingSpec::uniform(
+            14,
+            flock_prover::r1cs_hashes::blake3::USEFUL_BITS,
+            1usize << (m - 14),
+        ),
         other => panic!("padding arg must be 'dense' or 'blake3', got '{other}'"),
     };
 

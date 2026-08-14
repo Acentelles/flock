@@ -59,6 +59,20 @@ impl<const NW: usize> BitRecord<NW> {
         }
     }
 
+    /// OR a (pre-masked) value into record bits `[pos, pos + width)` at a
+    /// runtime position — for the few record shapes whose field offsets vary
+    /// per instance (BLAKE3's first-round column G's).
+    #[inline(always)]
+    pub(crate) fn push_at(&mut self, pos: usize, val: u32) {
+        let v = val as u64;
+        let idx = pos >> 6;
+        let s = pos & 63;
+        self.w[idx] |= v << s;
+        if s > 32 {
+            self.w[idx + 1] |= v >> (64 - s);
+        }
+    }
+
     /// OR the record into `buf` starting at bit `base_bit`.
     #[inline(always)]
     pub(crate) fn flush(&self, buf: &mut [u64], base_bit: usize) {
@@ -86,6 +100,45 @@ pub(crate) fn add_carry_parts(x: u32, y: u32) -> (u32, u32, u32, u32) {
     let right = (y ^ cin) & MASK_LO31;
     let carry_aux = left & right;
     (sum, left, right, carry_aux)
+}
+
+/// One fused 3-operand ADD's witness parts (`x + y + m` mod 2³², carry-save,
+/// 61 product rows — one fewer than two chained 2-operand ADDs; the zk.golf
+/// BLAKE3 record's `Add3Canon` construction).
+///
+/// * Layer 1, bits 0..30: majority products `w_i = (x_i⊕m_i)(y_i⊕m_i)`; the
+///   true majority is `w_i ⊕ m_i` (affine in char 2), and `maj_31` carries
+///   weight 2³² so it is dropped.
+/// * Layer 2, bits 1..30: ripple products `v_j = (p_j⊕g_j)(bw_j⊕g_j)` of the
+///   partial sum `p = x⊕y⊕m` against the shifted majority word
+///   `bw = (w⊕m) << 1`, with carries `g_{j+1} = v_j ⊕ g_j`. `bw_0 = 0` makes
+///   bit 0's product structurally zero — no row.
+///
+/// Returns `(sum, [maj_left, maj_right, maj_prod], [rip_left, rip_right,
+/// rip_prod])`: the majority triple masked to the low 31 bits, the ripple
+/// triple holding row bits 1..30 shifted down to the low 30 bits.
+#[inline(always)]
+pub(crate) fn fused_add3_parts(x: u32, y: u32, m: u32) -> (u32, [u32; 3], [u32; 3]) {
+    const MASK_LO31: u32 = 0x7FFF_FFFF;
+    const MASK_LO30: u32 = 0x3FFF_FFFF;
+    let xm = x ^ m;
+    let ym = y ^ m;
+    let w = xm & ym;
+    let p = x ^ y ^ m;
+    let bw = (w ^ m) << 1;
+    let sum = p.wrapping_add(bw);
+    let cin = sum ^ p ^ bw;
+    let rip_left = p ^ cin;
+    let rip_right = bw ^ cin;
+    (
+        sum,
+        [xm & MASK_LO31, ym & MASK_LO31, w & MASK_LO31],
+        [
+            (rip_left >> 1) & MASK_LO30,
+            (rip_right >> 1) & MASK_LO30,
+            ((rip_left & rip_right) >> 1) & MASK_LO30,
+        ],
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -499,6 +552,29 @@ pub(crate) fn add_carry_parts_v(
         carry[j] = l & r;
     }
     (sum, left, right, carry)
+}
+
+/// V-wide [`fused_add3_parts`]: `(sum, [maj_left, maj_right, maj_prod],
+/// [rip_left, rip_right, rip_prod])` lanes.
+#[inline(always)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn fused_add3_parts_v(
+    x: &[u32; BM_V],
+    y: &[u32; BM_V],
+    m: &[u32; BM_V],
+) -> ([u32; BM_V], [[u32; BM_V]; 3], [[u32; BM_V]; 3]) {
+    let mut sum = [0u32; BM_V];
+    let mut maj = [[0u32; BM_V]; 3];
+    let mut rip = [[0u32; BM_V]; 3];
+    for j in 0..BM_V {
+        let (s, mj, rp) = fused_add3_parts(x[j], y[j], m[j]);
+        sum[j] = s;
+        for t in 0..3 {
+            maj[t][j] = mj[t];
+            rip[t][j] = rp[t];
+        }
+    }
+    (sum, maj, rip)
 }
 
 /// Shared driver for the interleaved-row batch-major producers (sha2,
