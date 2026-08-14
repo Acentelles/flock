@@ -1,20 +1,25 @@
 //! **The recursion tower**: chain leaves folded 2->1 up to a converging
 //! spine — the production chain100/chain128 pipeline.
 //!
-//! Extracted verbatim from `tests/circuit_merkle.rs` (stage 1 of the tower
-//! productionization). The pipeline is three builders:
+//! [`TowerConfig`] names the two production configurations: the LEAF (the
+//! application's BLAKE3 hash-chain segment) proves under the rate-1/2 Fast
+//! twin of the tower's security level, and every OUTER (FL / internal /
+//! spine) proves under the Slim twin at the m* = 29 / nu* = 14 envelope,
+//! always on. The pipeline is three builders:
 //!
-//! - [`build_chain_proof`] — the LEAF: a Fast-profile Ligerito proof of a
-//!   BLAKE3 hash-chain segment (the application workload).
-//! - [`build_fl_node_k`] — the FIRST-LEVEL node: k adjacent chain leaves
-//!   verified in-circuit (tape replay), their claims folded, proven under
-//!   the Slim outer profile at the m*=29/nu*=14 envelope.
+//! - [`build_chain_proof`] — the LEAF: a Ligerito proof of one chain
+//!   segment (the workload).
+//! - [`build_fl_node_k`] — the FIRST-LEVEL node: adjacent chain leaves
+//!   verified in-circuit (tape replay), their claims folded and proven as
+//!   one envelope outer.
 //! - [`build_node_outer_app`] — INTERNAL and SPINE nodes: 2->1 recursion
-//!   over envelope outers, with the chain-lane accumulator riding along.
+//!   over envelope outers, with the chain-lane accumulator riding along
+//!   and the spine inheriting its base's accumulator toward the converged
+//!   fixed point (`chain_spine_converges` gates the ONE-digest property).
 //!
-//! The `#[test]` functions ride along under the lib test harness
-//! (`cargo test -p flock-prover --lib tower::`); the mvp-history tests and
-//! env-var profile plumbing are scheduled for removal in stages 2-4.
+//! Bench knobs (`CHAIN_BLOCKS`, `BENCH_RUNS`, `TOWER_STEADY`, and the
+//! test-only `TOWER_CONFIG=chain100`) live in the `#[test]` harness; the
+//! production geometry is typed, never env-var-driven.
 
 use crate::challenger::FsChallenger;
 use crate::prover::{self, UnionSlotProverInput};
@@ -5915,7 +5920,7 @@ fn emit_opening(
 /// shape.counts.clone())` reconstructs the instance), the public segment,
 /// the BLAKE3/BLAKE3 circuit proof, and the boolean tables whose lincheck
 /// circuits a verifier needs (in registry order via the `*_slot` indices).
-struct LeafOuter {
+pub struct LeafOuter {
     shape: flock_core::circuit::builder::CircuitShape,
     public: Vec<F128>,
     proof: flock_core::proof::R1csProofCircuitMerged,
@@ -9209,7 +9214,7 @@ fn build_chain_circuit(
 /// discharged, and h_end cross-checked against the native chain. The
 /// [`MixedInner`] embedding is deliberate: a chain proof is a circuit
 /// proof, so [`ChildTape`] consumes it directly (element side `None`).
-struct ChainProof {
+pub struct ChainProof {
     inner: MixedInner,
     h_start: [u32; 16],
     h_end: [u32; 16],
@@ -9223,7 +9228,7 @@ struct ChainProof {
 /// A chain leaf. The SHAPE build is per-shape setup (statement-independent
 /// — the digest pin), the WALK is per-statement and is the chain compute
 /// itself, so it is reported apart from the proving phases.
-fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) -> ChainProof {
+pub fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) -> ChainProof {
     let t_shape = std::time::Instant::now();
     let cs: ChainShape = chain_shape_cached(n_blocks).as_ref().clone();
     let shape_ms = t_shape.elapsed().as_secs_f64() * 1e3;
@@ -9580,7 +9585,7 @@ fn chain_child_region_emits_alone() {
 /// [`build_node_outer`]) consumes it exactly like a leaf outer; `acc` is
 /// the folded chain accumulator the node carries up; `stmt_base` locates
 /// the 8-word application-statement block (h_start, h_end) in `lo.public`.
-struct FlNode {
+pub struct FlNode {
     lo: LeafOuter,
     acc: flock_core::aggregate::Accumulator,
     stmt_base: usize,
@@ -9671,7 +9676,7 @@ fn record_chain_child_verify(
     .expect("the chain child verifies (recorded)");
 }
 
-fn build_fl_node(cfg: TowerConfig, cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
+pub fn build_fl_node(cfg: TowerConfig, cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
     build_fl_node_k(cfg, &[cp0, cp1])
 }
 
@@ -9680,7 +9685,7 @@ fn build_fl_node(cfg: TowerConfig, cp0: &ChainProof, cp1: &ChainProof) -> FlNode
 /// group, adjacency as k−1 four-word seams, the app statement the combined
 /// span. `k = 2` emits in exactly the historical two-child order — every
 /// existing gate rides the wrapper above unchanged.
-fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
+pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
     use flock_core::aggregate;
     use flock_core::matrix_fold::{FoldProof, MatrixClaim};
     use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
@@ -15421,7 +15426,7 @@ fn record_child_verify(lo: &LeafOuter, domain: &'static [u8]) {
 /// node and a steady node publish the same layout, so ONE parent circuit
 /// reads either.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct MainBlock {
+pub struct MainBlock {
     per_type: Vec<(MatrixClaim, MatrixClaim)>,
     per_element: Vec<(MatrixClaim, MatrixClaim)>,
     /// Slot order: 0 is the FL-child slot, 1 the NODE-child slot.
@@ -15471,7 +15476,7 @@ fn entry_live(c: &MatrixClaim) -> bool {
 /// THE SPINE (wall 3): the node child's published block riding in as this
 /// node's MAIN-fold prior. `node_child` is that child's index in `los`
 /// (the steady shape: 1 — child 0 is the fresh FL).
-struct SpineIn<'a> {
+pub struct SpineIn<'a> {
     node_child: usize,
     prior: &'a MainBlock,
     /// THE ADVERSARIAL LEG: re-witness the match-gate's mac rows as a
@@ -15483,7 +15488,7 @@ struct SpineIn<'a> {
 }
 
 /// Everything [`build_node_outer_app`] hands back.
-struct NodeOut {
+pub struct NodeOut {
     lo: LeafOuter,
     /// The MAIN fold's accumulator — LIVE entries only, the thing a root
     /// discharges.
@@ -15507,7 +15512,7 @@ struct NodeOut {
 /// priors-only aggregate, whose prior surfaces connect WIRE-TO-WIRE to
 /// the children's published accumulator claims (`claims_base` locates
 /// them; a prior's surface IS what the child published).
-struct ChainLane<'a> {
+pub struct ChainLane<'a> {
     registry: &'a crate::schedule::Registry,
     mats: &'a [flock_core::aggregate::TypeMatrices<'a>],
     circs: &'a [&'a dyn flock_core::lincheck::LincheckCircuit],
@@ -15528,7 +15533,7 @@ struct ChainLane<'a> {
 /// connects left.h_end == right.h_start wire-to-wire and publishes the
 /// combined span as its OWN app block, returning that block's offset — so
 /// the output feeds the next level with the same plumbing.
-fn build_node_outer_app(
+pub fn build_node_outer_app(
     cfg: TowerConfig,
     los: &[&LeafOuter],
     app_stmt: Option<usize>,
