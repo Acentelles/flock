@@ -163,6 +163,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "flock-cuda-ffi"
+version = "0.1.0"
+dependencies = [
+ "flock-core",
+ "flock-prover",
+]
+
+[[package]]
 name = "flock-prover"
 version = "0.1.0"
 dependencies = [
