@@ -174,13 +174,23 @@ pub const SC_MAJ1: usize = 0;
 pub const SC_MAJ2: usize = CARRIES_PER_ADD; // 31
 pub const SC_RIP: usize = 2 * CARRIES_PER_ADD; // 62
 
-pub const W_BASE: usize = ROUND_BASE[N_ROUNDS]; // 18,757
-pub const SCHED_CARRY_BASE: usize = W_BASE + N_SCHED * WORD_BITS; // 20,293
-pub const E_NEW_BASE: usize = SCHED_CARRY_BASE + N_SCHED * SCHED_ADD_BITS; // 24,709
-pub const A_NEW_BASE: usize = E_NEW_BASE + N_ROUNDS * WORD_BITS; // 26,757
-pub const OUT_CARRY_BASE: usize = A_NEW_BASE + N_ROUNDS * WORD_BITS; // 28,805
-pub const Z_CONST_POS: usize = OUT_CARRY_BASE + N_OUT_WORDS * CARRIES_PER_ADD; // 29,053
-pub const USEFUL_BITS: usize = Z_CONST_POS + 1; // 29,054
+// Lin-id discipline (measured 2026-08-14, `sha2_linid_drop_sim`): W is
+// never materialized (the schedule cascade stays shallow — 19.7M nnz),
+// and E_NEW/A_NEW materialize only every OTHER round (`EA_PERIOD` = 2):
+// an inlined round's state expressions are cut one round later, bounding
+// the σ/Σ fan-out at 47.4M template nnz / max row ~8.9k — the same
+// density envelope blake3's Option-E full cascade already lives in. The
+// zk.golf record's FULL inlining measures 184M nnz here and does not
+// price in against the CSC fold + cached-template costs.
+pub const EA_PERIOD: usize = 2;
+/// Rounds whose E_NEW/A_NEW are materialized (r % EA_PERIOD == 1).
+pub const N_EA_SLOTS: usize = N_ROUNDS / EA_PERIOD; // 32
+pub const SCHED_CARRY_BASE: usize = ROUND_BASE[N_ROUNDS]; // 18,757
+pub const E_NEW_BASE: usize = SCHED_CARRY_BASE + N_SCHED * SCHED_ADD_BITS; // 23,173
+pub const A_NEW_BASE: usize = E_NEW_BASE + N_EA_SLOTS * WORD_BITS; // 24,197
+pub const OUT_CARRY_BASE: usize = A_NEW_BASE + N_EA_SLOTS * WORD_BITS; // 25,221
+pub const Z_CONST_POS: usize = OUT_CARRY_BASE + N_OUT_WORDS * CARRIES_PER_ADD; // 25,469
+pub const USEFUL_BITS: usize = Z_CONST_POS + 1; // 25,470
 
 // Slot accessors.
 #[inline]
@@ -205,26 +215,19 @@ pub fn round_bit(r: usize, off: usize) -> usize {
     ROUND_BASE[r] + off
 }
 #[inline]
-pub fn w_bit(t: usize, b: usize) -> usize {
-    debug_assert!(t < N_SCHED + 16);
-    if t < 16 {
-        m_bit(t, b)
-    } else {
-        W_BASE + (t - 16) * WORD_BITS + b
-    }
-}
-#[inline]
 pub fn sched_bit(t: usize, off: usize) -> usize {
     debug_assert!((16..16 + N_SCHED).contains(&t) && off < SCHED_ADD_BITS);
     SCHED_CARRY_BASE + (t - 16) * SCHED_ADD_BITS + off
 }
 #[inline]
 pub fn e_new_bit(r: usize, b: usize) -> usize {
-    E_NEW_BASE + WORD_BITS * r + b
+    debug_assert!(r % EA_PERIOD == EA_PERIOD - 1);
+    E_NEW_BASE + WORD_BITS * (r / EA_PERIOD) + b
 }
 #[inline]
 pub fn a_new_bit(r: usize, b: usize) -> usize {
-    A_NEW_BASE + WORD_BITS * r + b
+    debug_assert!(r % EA_PERIOD == EA_PERIOD - 1);
+    A_NEW_BASE + WORD_BITS * (r / EA_PERIOD) + b
 }
 #[inline]
 pub fn out_carry_bit(w: usize, b: usize) -> usize {
@@ -527,7 +530,21 @@ fn add32_alloc<S: RowSink, F1: Fn(usize) -> usize, F2: Fn(usize) -> usize>(
 
 /// The complete symbolic walk: every row of one compression, emitted into
 /// `sink`. Serves the matrix builder and the lincheck scatterer alike.
+/// Whether the walk materializes the periodic E_NEW/A_NEW cascade
+/// breakers (production: yes, at [`EA_PERIOD`]). The density probe's
+/// full-inlining variant sets `ea: false` — measured 184M template nnz,
+/// which is why the zk.golf record's shape is NOT the production one.
+#[derive(Copy, Clone)]
+struct MatCfg {
+    ea: bool,
+}
+const MAT_PROD: MatCfg = MatCfg { ea: true };
+
 fn walk_rows<S: RowSink>(sink: &mut S) {
+    walk_rows_cfg(sink, MAT_PROD)
+}
+
+fn walk_rows_cfg<S: RowSink>(sink: &mut S, mat: MatCfg) {
     // Z_CONST tautology: z[ZC]·z[ZC] = z[ZC] (boolean-pin).
     sink.row(Z_CONST_POS, &vec![Z_CONST_POS], &vec![Z_CONST_POS]);
 
@@ -567,8 +584,7 @@ fn walk_rows<S: RowSink>(sink: &mut S) {
             sched_bit(t, SC_RIP),
             sink,
         );
-        let w_t = materialize(&raw, |b| w_bit(t, b), sink);
-        w_arr.push(w_t);
+        w_arr.push(raw);
     }
 
     // Working state (a, b, c, d, e, f, g, h).
@@ -635,10 +651,19 @@ fn walk_rows<S: RowSink>(sink: &mut S) {
             round_bit(r, RC_ARIP),
             sink,
         );
-        let a_new = materialize(&a_raw, |b| a_new_bit(r, b), sink);
+        let mat_this_round = mat.ea && r % EA_PERIOD == EA_PERIOD - 1;
+        let a_new = if mat_this_round {
+            materialize(&a_raw, |b| a_new_bit(r, b), sink)
+        } else {
+            a_raw
+        };
         // e_new = d + T1.
         let e_raw = add32_inline(&d, &t1, |i| round_bit(r, RC_ENEW + i), sink);
-        let e_new = materialize(&e_raw, |b| e_new_bit(r, b), sink);
+        let e_new = if mat_this_round {
+            materialize(&e_raw, |b| e_new_bit(r, b), sink)
+        } else {
+            e_raw
+        };
 
         // Register shift: (a', b', c', d', e', f', g', h') = (A_NEW, a, b, c, E_NEW, e, f, g)
         state = [a_new, a, bb, c, e_new, e, f, g];
@@ -728,7 +753,6 @@ pub fn build_block_witness(h_in: &[u32; 8], m: &[u32; 16]) -> Vec<bool> {
         write_bits(&mut z, sched_bit(t, SC_MAJ1), m1[2], CARRIES_PER_ADD);
         write_bits(&mut z, sched_bit(t, SC_MAJ2), m2[2], CARRIES_PER_ADD);
         write_bits(&mut z, sched_bit(t, SC_RIP), rp[2], RIPPLE_BITS);
-        write_word(&mut z, w_bit(t, 0), w_t);
         w_arr[t] = w_t;
     }
 
@@ -759,9 +783,11 @@ pub fn build_block_witness(h_in: &[u32; 8], m: &[u32; 16]) -> Vec<bool> {
         let (a_new, am, ar) = fused_add3_parts(t1, s0a, maj_out);
         write_bits(&mut z, round_bit(r, RC_AMAJ), am[2], CARRIES_PER_ADD);
         write_bits(&mut z, round_bit(r, RC_ARIP), ar[2], RIPPLE_BITS);
-        write_word(&mut z, a_new_bit(r, 0), a_new);
         let e_new = add32_w(d, t1, round_bit(r, RC_ENEW), &mut z);
-        write_word(&mut z, e_new_bit(r, 0), e_new);
+        if r % EA_PERIOD == EA_PERIOD - 1 {
+            write_word(&mut z, a_new_bit(r, 0), a_new);
+            write_word(&mut z, e_new_bit(r, 0), e_new);
+        }
 
         state = [a_new, a, b, c, e_new, e, f, g];
     }
@@ -976,12 +1002,6 @@ fn build_block_ab_packed_into(
         ra.flush(a, sched_base);
         rb.flush(b, sched_base);
 
-        // W[t] sum row: (z, a, b) = (w_t, w_t, 1).
-        let off = w_bit(t, 0);
-        or_u32_at_bit(z, off, w_t);
-        or_u32_at_bit(a, off, w_t);
-        or_u32_at_bit(b, off, 0xFFFF_FFFF);
-
         w_sched[t] = w_t;
     }
 
@@ -1048,20 +1068,21 @@ fn build_block_ab_packed_into(
         let (a_new, am, ar2) = fused_add3_parts(t1, big_sigma0(aa), maj_out);
         push3!(RC_AMAJ, am);
         push3!(RC_ARIP, ar2);
-        let off = a_new_bit(r, 0);
-        or_u32_at_bit(z, off, a_new);
-        or_u32_at_bit(a, off, a_new);
-        or_u32_at_bit(b, off, 0xFFFF_FFFF);
-
-        // e_new = d + T1, materialized.
         let (e_new, el, er, ep) = add_carry_parts(dd, t1);
         rz.push::<{ RC_ENEW }>(ep);
         ra.push::<{ RC_ENEW }>(el);
         rb.push::<{ RC_ENEW }>(er);
-        let off = e_new_bit(r, 0);
-        or_u32_at_bit(z, off, e_new);
-        or_u32_at_bit(a, off, e_new);
-        or_u32_at_bit(b, off, 0xFFFF_FFFF);
+        // E_NEW/A_NEW materialize only on the periodic cascade-breaker rounds.
+        if r % EA_PERIOD == EA_PERIOD - 1 {
+            let off = a_new_bit(r, 0);
+            or_u32_at_bit(z, off, a_new);
+            or_u32_at_bit(a, off, a_new);
+            or_u32_at_bit(b, off, 0xFFFF_FFFF);
+            let off = e_new_bit(r, 0);
+            or_u32_at_bit(z, off, e_new);
+            or_u32_at_bit(a, off, e_new);
+            or_u32_at_bit(b, off, 0xFFFF_FFFF);
+        }
 
         let round_base = round_bit(r, 0);
         rz.flush(z, round_base);
@@ -1930,7 +1951,6 @@ fn build_group_batch_major(
             sched_bit(t, SC_MAJ2),
             sched_bit(t, SC_RIP),
         );
-        bm_write_lin(&mut rows, w_bit(t, 0), &w_t);
         w_sched.push(w_t);
     }
 
@@ -1978,9 +1998,11 @@ fn build_group_batch_major(
             round_bit(r, RC_AMAJ),
             round_bit(r, RC_ARIP),
         );
-        bm_write_lin(&mut rows, a_new_bit(r, 0), &a_new);
         let e_new = bm_add_inline(&mut rows, &dd, &t1, round_bit(r, RC_ENEW));
-        bm_write_lin(&mut rows, e_new_bit(r, 0), &e_new);
+        if r % EA_PERIOD == EA_PERIOD - 1 {
+            bm_write_lin(&mut rows, a_new_bit(r, 0), &a_new);
+            bm_write_lin(&mut rows, e_new_bit(r, 0), &e_new);
+        }
 
         hh = gg;
         gg = ff;
@@ -2260,14 +2282,54 @@ mod tests {
             ROUND_BASE[N_ROUNDS] - ROUND_CARRY_BASE,
             (0..N_ROUNDS).map(round_add_bits).sum::<usize>()
         );
-        assert_eq!(W_BASE, 18_757);
-        assert_eq!(SCHED_CARRY_BASE, 20_293);
-        assert_eq!(E_NEW_BASE, 24_709);
-        assert_eq!(A_NEW_BASE, 26_757);
-        assert_eq!(OUT_CARRY_BASE, 28_805);
-        assert_eq!(Z_CONST_POS, 29_053);
-        assert_eq!(USEFUL_BITS, 29_054);
+        // W is never materialized; E_NEW/A_NEW only every EA_PERIOD-th
+        // round (32 slots each).
+        assert_eq!(SCHED_CARRY_BASE, 18_757);
+        assert_eq!(E_NEW_BASE, 23_173);
+        assert_eq!(A_NEW_BASE, 24_197);
+        assert_eq!(OUT_CARRY_BASE, 25_221);
+        assert_eq!(Z_CONST_POS, 25_469);
+        assert_eq!(USEFUL_BITS, 25_470);
         assert!(USEFUL_BITS <= K);
+    }
+
+    /// Variant simulator: nnz + max-row of the production lin-id set vs
+    /// the zk.golf record's full inlining. Production (W inlined, E/A at
+    /// `EA_PERIOD` = 2) measured 47.4M nnz / max row ~8.9k — the accepted
+    /// blake3-Option-E density envelope; full inlining measured 184M and
+    /// is rejected. Run with `-- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn sha2_linid_drop_sim() {
+        let report = |name: &str, mat: MatCfg, useful: usize| {
+            let t = std::time::Instant::now();
+            let mut a_rows: Vec<Sup> = vec![Sup::new(); K];
+            let mut b_rows: Vec<Sup> = vec![Sup::new(); K];
+            walk_rows_cfg(
+                &mut MatSink {
+                    a_rows: &mut a_rows,
+                    b_rows: &mut b_rows,
+                },
+                mat,
+            );
+            let nnz: usize = a_rows.iter().chain(b_rows.iter()).map(|r| r.len()).sum();
+            let max_row = (0..K)
+                .map(|s| a_rows[s].len() + b_rows[s].len())
+                .max()
+                .unwrap();
+            eprintln!(
+                "{name}: useful {useful} ({} cols), nnz {:.2}M, max A+B row {max_row}, sim {:?}",
+                useful.div_ceil(128),
+                nnz as f64 / 1e6,
+                t.elapsed()
+            );
+        };
+        report("production (E/A period 2)", MAT_PROD, USEFUL_BITS);
+        report(
+            "full inlining (zk.golf shape)",
+            MatCfg { ea: false },
+            USEFUL_BITS - 2 * N_EA_SLOTS * WORD_BITS,
+        );
     }
 
     /// Density audit: template nnz + max row width of the REAL matrices —

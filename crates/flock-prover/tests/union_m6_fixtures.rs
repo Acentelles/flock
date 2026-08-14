@@ -50,6 +50,12 @@
 //! Re-pinned 2026-08-13 for proof-IO v20. Strict Fast and Slim proofs now
 //! include every non-Ligerito grinding nonce. All six deterministic digests
 //! were stable across two print runs.
+//! Re-pinned 2026-08-14 (third): SHA-256 lin-id drops, measured — W never
+//! materialized, E_NEW/A_NEW only every other round (EA_PERIOD 2):
+//! USEFUL_BITS 29,054 -> 25,470 (227 -> 199 chunk-columns) at 47.4M
+//! template nnz (the accepted blake3-envelope density; full zk.golf-style
+//! inlining measured 184M and was rejected). sha2-touching fixtures move;
+//! the BLAKE3 anchor is byte-identical. Stable across two print runs.
 //! Re-pinned 2026-08-14 (second): SHA-256 R1CS "Option F" — the zk.golf
 //! sha256 record's systematic techniques (K folded as constant adds, fused
 //! 4-op T1 tree and 3-op a_new tree, T1 slots dissolved, schedule steps
@@ -178,22 +184,22 @@ fn m6_merged_union_proof_bytes_pinned() {
         (
             "merged-nu10-1024-1024",
             [1024, 1024],
-            "66f54ae526f34c3eb31690305d55b2859113346eeaa6b002296da9e22149aeed",
+            "f882d115f84a05df612cee7e18f15c23c138aeeadd561345b5fc2e9d81cc8eb8",
         ),
         (
             "merged-nu10-50-37",
             [50, 37],
-            "04943a863e55475a2feae6cdb75f6fa9a67bd1eda9d1ca4cf0925e2e94246b6e",
+            "3f11f215ce1a2e83254f04453283b771cb100674090038b8c2a3617a75d99b38",
         ),
         (
             "merged-nu10-8-8",
             [8, 8],
-            "ababa93a1a1ae4e4e335e65790c1aa090e609e6fff6423396ba6ac5f9d8127eb",
+            "ad2119fde710734277113155aef65380619f644bf968577185b164ca7bea0fbf",
         ),
         (
             "merged-nu10-0-64",
             [0, 64],
-            "c75ece1c6614ac3511fb93c837ef3d5805086e709fe923b8ec559f07f92e4e32",
+            "fb9e99cacd560278d2b6c5e873d1908e0b79ea4d6e7515b4cae6f09f7cf067c9",
         ),
     ];
 
@@ -297,7 +303,7 @@ fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
 
     // SHA-256, 128 blocks (m = 22).
     {
-        const EXPECTED: &str = "3019761fe82c9b99ee607f6efbffb6146a82db47f3249788681d669b6809e712";
+        const EXPECTED: &str = "c14911f638759daa9f079ab7315e5c33f3d18bb08aa24dc8e827ab06882ddaa9";
         let n_blocks = 128usize;
         let setup = sha2::Sha256HybridSetup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_5252);
