@@ -2544,7 +2544,11 @@ pub fn prove_batched_padded_with_precomputed_and_grinding<Ch: Challenger>(
     ring_switch_bits: u32,
     claim_batch_bits: u32,
     challenger: &mut Ch,
-) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>, Vec<u64>) {
+) -> (
+    Vec<(RingSwitchProof, RingSwitchBatchOutput)>,
+    Vec<F128>,
+    Vec<u64>,
+) {
     prove_batched_padded_with_precomputed_and_grinding_impl(
         packed_witness,
         x_outers,
@@ -2588,7 +2592,11 @@ fn prove_batched_padded_with_precomputed_and_grinding_impl<Ch: Challenger>(
     ring_switch_bits: u32,
     claim_batch_bits: Option<u32>,
     challenger: &mut Ch,
-) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>, Vec<u64>) {
+) -> (
+    Vec<(RingSwitchProof, RingSwitchBatchOutput)>,
+    Vec<F128>,
+    Vec<u64>,
+) {
     assert!(!x_outers.is_empty());
     let trace = std::env::var("PCS_TRACE").is_ok();
     let n = x_outers.len();
@@ -2865,7 +2873,11 @@ fn prove_batched_padded_with_precomputed_and_grinding_impl<Ch: Challenger>(
                         // Gate-rich circuit unions hit this. Byte-identical
                         // to the Dense fold on every consumer.
                         let sfx = &dense_suffixes[d];
-                        let n_lo = if sfx.len() >= 4 { split_n_lo(sfx.len()) } else { sfx.len() };
+                        let n_lo = if sfx.len() >= 4 {
+                            split_n_lo(sfx.len())
+                        } else {
+                            sfx.len()
+                        };
                         let (eq_lo, eq_hi) = build_eq_split(sfx, n_lo);
                         RsEqInd::DeferredDense {
                             eq_lo,
@@ -2884,7 +2896,11 @@ fn prove_batched_padded_with_precomputed_and_grinding_impl<Ch: Challenger>(
                 // element region grows.
                 Kind::Sparse(sp) => {
                     let sfx = sparse_suffixes[sp];
-                    let n_lo = if sfx.len() >= 4 { split_n_lo(sfx.len()) } else { sfx.len() };
+                    let n_lo = if sfx.len() >= 4 {
+                        split_n_lo(sfx.len())
+                    } else {
+                        sfx.len()
+                    };
                     let (eq_lo, eq_hi) = build_eq_split(sfx, n_lo);
                     RsEqInd::DeferredDense {
                         eq_lo,
@@ -3291,9 +3307,7 @@ mod tests {
             let q: Vec<F256> = (0..log_n)
                 .map(|_| F256::new(rng.sample_f128(), rng.sample_f128()))
                 .collect();
-            let coeffs: Vec<F128> = (0..(1 << LOG_PACKING))
-                .map(|_| rng.sample_f128())
-                .collect();
+            let coeffs: Vec<F128> = (0..(1 << LOG_PACKING)).map(|_| rng.sample_f128()).collect();
 
             let dense = fold_b128_elems(&build_eq(&z), &coeffs);
             let mut folded: Vec<F256> = dense.into_iter().map(F256::from).collect();

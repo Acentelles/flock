@@ -275,8 +275,6 @@ fn out_hi_bit(w: usize, b: usize) -> usize {
 
 #[inline]
 
-
-
 /// BLAKE3 compression function. Returns the full 16-word output state
 /// (post-finalization XOR). For chaining, the new CV is `out[0..8]`.
 pub fn blake3_compress(
@@ -2467,9 +2465,11 @@ mod chain_e2e_tests {
         let mut missing = proof;
         missing.shift.grinding_nonces.pop();
         let mut chv = FsChallenger::new(b"b3-chain-secure-grinding");
-        assert!(setup
-            .verify_chain(&comm, &missing, &cv0, &cv_last, &mut chv)
-            .is_err());
+        assert!(
+            setup
+                .verify_chain(&comm, &missing, &cv0, &cv_last, &mut chv)
+                .is_err()
+        );
     }
 
     #[test]

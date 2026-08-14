@@ -97,12 +97,10 @@ fn union_pcs_params(union: &UnionInstance<'_>) -> PcsParams {
             LigeritoProfile::Fast,
         ),
         profile: LigeritoProfile::Fast,
-        num_lanes: union.commit_lanes(
-            flock_core::pcs::ligerito::embedded_initial_k_or_default(
-                union.dense_m(),
-                LigeritoProfile::Fast,
-            ),
-        ),
+        num_lanes: union.commit_lanes(flock_core::pcs::ligerito::embedded_initial_k_or_default(
+            union.dense_m(),
+            LigeritoProfile::Fast,
+        )),
         merkle_hash: Default::default(),
     }
 }
@@ -266,13 +264,13 @@ fn element_only_transcript_shape_is_data_independent() {
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn element_only_transcript_shape_is_pinned() {
-// Re-pinned 2026-08-02: multipoint-twisted assist (proof_io v8) — the
-// per-statement assist became 128K dual values + one product sumcheck +
-// one untwisted anchor; transcript + wire moved by design.
-// Re-pinned 2026-08-02: two-product multipoint grouping (proof_io v9) —
-// element-only claims are all packed-direct, so the values absorb shrinks
-// from 128·K to ONE word per merged-row group and the sumcheck is the
-// single untwisted product; multipoint label v1.
+    // Re-pinned 2026-08-02: multipoint-twisted assist (proof_io v8) — the
+    // per-statement assist became 128K dual values + one product sumcheck +
+    // one untwisted anchor; transcript + wire moved by design.
+    // Re-pinned 2026-08-02: two-product multipoint grouping (proof_io v9) —
+    // element-only claims are all packed-direct, so the values absorb shrinks
+    // from 128·K to ONE word per merged-row group and the sumcheck is the
+    // single untwisted product; multipoint label v1.
     // Re-pinned 2026-08-04: merged-open v1 — value-only packed-direct
     // intake (points are transcript-derived; label v0 -> v1).
     // Re-pinned 2026-08-05: stratified queries (all TOMLs stratified = true)

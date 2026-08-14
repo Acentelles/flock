@@ -450,9 +450,7 @@ pub fn read_bytes_from_file<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
     if declared_len > MAX_BUNDLE_BYTES as u64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "proof bundle is {declared_len} bytes; maximum is {MAX_BUNDLE_BYTES}"
-            ),
+            format!("proof bundle is {declared_len} bytes; maximum is {MAX_BUNDLE_BYTES}"),
         ));
     }
     let mut bytes = Vec::with_capacity(declared_len as usize);
@@ -462,9 +460,7 @@ pub fn read_bytes_from_file<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
     if bytes.len() > MAX_BUNDLE_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "proof bundle exceeded the {MAX_BUNDLE_BYTES}-byte maximum while reading"
-            ),
+            format!("proof bundle exceeded the {MAX_BUNDLE_BYTES}-byte maximum while reading"),
         ));
     }
     Ok(bytes)

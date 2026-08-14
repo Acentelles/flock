@@ -106,24 +106,24 @@ impl GateType for Blake3Gate {
 
     fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> Self::Row {
         let (o, row) = {
-        // Schema In-order: cv0, cv1, m0..m3, params.
-        let cv = unpack8(inputs[0], inputs[1]);
-        let mut m = [0u32; 16];
-        for i in 0..4 {
-            m[4 * i..4 * i + 4].copy_from_slice(&unpack4(inputs[2 + i]));
-        }
-        let (counter, block_len, flags) = unpack_params(inputs[6]);
+            // Schema In-order: cv0, cv1, m0..m3, params.
+            let cv = unpack8(inputs[0], inputs[1]);
+            let mut m = [0u32; 16];
+            for i in 0..4 {
+                m[4 * i..4 * i + 4].copy_from_slice(&unpack4(inputs[2 + i]));
+            }
+            let (counter, block_len, flags) = unpack_params(inputs[6]);
 
-        let out = blake3::blake3_compress(&cv, &m, counter, block_len, flags);
-        let out_lo: [u32; 8] = out[0..8].try_into().unwrap();
-        let out_hi: [u32; 8] = out[8..16].try_into().unwrap();
-        let (lo, hi) = (pack8(&out_lo), pack8(&out_hi));
+            let out = blake3::blake3_compress(&cv, &m, counter, block_len, flags);
+            let out_lo: [u32; 8] = out[0..8].try_into().unwrap();
+            let out_hi: [u32; 8] = out[8..16].try_into().unwrap();
+            let (lo, hi) = (pack8(&out_lo), pack8(&out_hi));
 
-        (
-            vec![lo[0], lo[1], hi[0], hi[1]],
-            (cv, m, counter, block_len, flags),
-        )
-    };
+            (
+                vec![lo[0], lo[1], hi[0], hi[1]],
+                (cv, m, counter, block_len, flags),
+            )
+        };
         outputs.extend_from_slice(&o);
         row
     }
@@ -834,11 +834,11 @@ impl GateType for ArithGate {
 
     fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> Self::Row {
         let (o, row) = {
-        let r: [F128; 4] = [inputs[0], inputs[1], inputs[2], inputs[3]];
-        let prod = (r[0] + r[1]) * (r[2] + r[3]);
-        let sum = r[0] + r[1] + r[2] + r[3];
-        (vec![prod, sum], r)
-    };
+            let r: [F128; 4] = [inputs[0], inputs[1], inputs[2], inputs[3]];
+            let prod = (r[0] + r[1]) * (r[2] + r[3]);
+            let sum = r[0] + r[1] + r[2] + r[3];
+            (vec![prod, sum], r)
+        };
         outputs.extend_from_slice(&o);
         row
     }

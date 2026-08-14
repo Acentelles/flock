@@ -19,8 +19,8 @@
 //! could otherwise produce a self-consistent circuit for a transcript nobody
 //! computes.
 
-use flock_core::field::F128;
 use flock_core::challenger::pow_squeeze_counter;
+use flock_core::field::F128;
 use flock_core::transcript_record::{Stream, TranscriptOp};
 
 use super::blake3::{Compression, blake3_compress};
@@ -83,11 +83,17 @@ pub fn trace_duplex(stream: &Stream, bytes: &[u8], ops: &[TranscriptOp]) -> FsCh
     for op in ops {
         match op {
             TranscriptOp::Pow { bits } => {
-                assert!(pending_pow.replace(*bits).is_none(), "nested fused PoW markers");
+                assert!(
+                    pending_pow.replace(*bits).is_none(),
+                    "nested fused PoW markers"
+                );
             }
             op if op.finalizes() => fin_ops.push((op, pending_pow.take())),
             TranscriptOp::Forked { .. } => {}
-            _ => assert!(pending_pow.is_none(), "fused PoW must be followed by a squeeze"),
+            _ => assert!(
+                pending_pow.is_none(),
+                "fused PoW must be followed by a squeeze"
+            ),
         }
     }
     assert!(pending_pow.is_none(), "fused PoW marker without a squeeze");
@@ -161,7 +167,6 @@ pub fn trace_duplex_forked(
         .collect();
     ForkedChains { parent, children }
 }
-
 
 const CHUNK_START: u32 = 1 << 0;
 const CHUNK_END: u32 = 1 << 1;
@@ -677,18 +682,16 @@ impl FsChainSponge {
     pub fn finalize_pow(&mut self, out_bytes: usize, bits: u32) -> Vec<u8> {
         assert!(bits <= 128, "fused PoW predicate occupies one F128 word");
         assert!(!self.buf.is_empty() && self.buf.len() <= BLOCK_BYTES);
-        assert_eq!(self.buf.len() % 16, 0, "transcript words are 16-byte aligned");
+        assert_eq!(
+            self.buf.len() % 16,
+            0,
+            "transcript words are 16-byte aligned"
+        );
 
         let word_count = self.buf.len() / 16;
         let m = words(&self.buf);
         let counter = pow_squeeze_counter(bits, self.buf.len());
-        let out = blake3_compress(
-            &self.cv,
-            &m,
-            counter,
-            BLOCK_BYTES as u32,
-            CHAIN_SQUEEZE,
-        );
+        let out = blake3_compress(&self.cv, &m, counter, BLOCK_BYTES as u32, CHAIN_SQUEEZE);
         let link = self.cv_link();
         let row = self.emit(
             (self.cv, m, counter, BLOCK_BYTES as u32, CHAIN_SQUEEZE),
@@ -713,12 +716,7 @@ impl FsChainSponge {
             let zero = [0u32; 16];
             let o = blake3_compress(&self.cv, &zero, 0, 0, CHAIN_SQUEEZE);
             let link = self.cv_link();
-            let continuation = self.emit(
-                (self.cv, zero, 0, 0, CHAIN_SQUEEZE),
-                link,
-                None,
-                0,
-            );
+            let continuation = self.emit((self.cv, zero, 0, 0, CHAIN_SQUEEZE), link, None, 0);
             self.cv = o[..8].try_into().expect("8 words");
             self.cv_source = CvSource::Row(continuation);
             ids.push(continuation);
@@ -774,7 +772,10 @@ mod tests {
         let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(b"sponge-diff"));
         let mut squeezed_ch: Vec<Vec<u8>> = Vec::new();
         for i in 0..40u64 {
-            let v = F128 { lo: i, hi: i.wrapping_mul(77) };
+            let v = F128 {
+                lo: i,
+                hi: i.wrapping_mul(77),
+            };
             ch.observe_f128(v);
             rec.observe_f128(v);
             if i % 3 == 0 {
@@ -1035,8 +1036,17 @@ mod tests {
 
         assert_eq!(trace.squeezes.len(), 2);
         assert_eq!(trace.squeeze_words[0].len(), 7);
-        assert_eq!(trace.squeeze_words[0][..3], [(trace.squeezes[0][0], 0), (trace.squeezes[0][0], 2), (trace.squeezes[0][0], 3)]);
-        assert!(matches!(trace.links[trace.squeezes[0][0] + 1].cv, CvSource::RowHi(r) if r == trace.squeezes[0][0]));
+        assert_eq!(
+            trace.squeeze_words[0][..3],
+            [
+                (trace.squeezes[0][0], 0),
+                (trace.squeezes[0][0], 2),
+                (trace.squeezes[0][0], 3)
+            ]
+        );
+        assert!(
+            matches!(trace.links[trace.squeezes[0][0] + 1].cv, CvSource::RowHi(r) if r == trace.squeezes[0][0])
+        );
 
         let read = |fin: usize, offset: usize| {
             let (row, word) = trace.squeeze_words[fin][offset];
@@ -1073,7 +1083,11 @@ mod tests {
         assert_eq!(
             F128::new(
                 u64::from_le_bytes(bytes[16 * nonce_at..16 * nonce_at + 8].try_into().unwrap()),
-                u64::from_le_bytes(bytes[16 * nonce_at + 8..16 * nonce_at + 16].try_into().unwrap()),
+                u64::from_le_bytes(
+                    bytes[16 * nonce_at + 8..16 * nonce_at + 16]
+                        .try_into()
+                        .unwrap()
+                ),
             ),
             nonce_word,
         );

@@ -220,6 +220,8 @@ fn bit_spread_zero_mask_is_enforced() {
     let allowed = BitSpreadInput {
         word,
         zero_mask: !word,
+        position_mask: 0,
+        position_prefix: 0,
     };
     let [z, a, b] = ty.build_masked_witness(allowed);
     assert!(r1cs.satisfies(&z), "a disjoint zero mask must pass");
@@ -230,6 +232,8 @@ fn bit_spread_zero_mask_is_enforced() {
     let rejected = BitSpreadInput {
         word,
         zero_mask: forbidden_bit,
+        position_mask: 0,
+        position_prefix: 0,
     };
     let [z, a, b] = ty.build_masked_witness(rejected);
     assert!(!r1cs.satisfies(&z), "a masked one bit must be rejected");
@@ -252,6 +256,33 @@ fn bit_spread_zero_mask_is_enforced() {
     );
 }
 
+#[test]
+fn bit_spread_derives_stratified_position() {
+    let ty = BitSpreadTable::new(14);
+    let word = 0xDEAD_BEEF_1234_5678u128;
+    let position_mask = (1u128 << 9) - 1;
+    let position_prefix = 5u128 << 9;
+    let input = BitSpreadInput {
+        word,
+        zero_mask: 0,
+        position_mask,
+        position_prefix,
+    };
+    let [z, a, b] = ty.build_masked_witness(input);
+    let r1cs = ty.build_block_r1cs(0);
+    assert!(r1cs.satisfies(&z));
+    assert_eq!(a, r1cs.apply_a(&z));
+    assert_eq!(b, r1cs.apply_b(&z));
+    let got = (0..128).fold(0u128, |acc, j| {
+        acc | ((z[ty.position_pos() + j] as u128) << j)
+    });
+    assert_eq!(got, (word & position_mask) ^ position_prefix);
+
+    let mut bad = z;
+    bad[ty.position_pos()] ^= true;
+    assert!(!r1cs.satisfies(&bad));
+}
+
 /// The fused PoW row has the same C=I shape as the optional BitSpread mask:
 /// its prefix products are sound only when word 3 is an input wired to
 /// the fixed 0..0,1 word by the recursive verifier circuit.
@@ -265,7 +296,10 @@ fn pow_mask_inputs_the_load_bearing_check_word() {
         mask: 1,
     };
     let [z, ..] = ty.build_witness(input);
-    assert!(!r1cs.satisfies(&z), "an honest bad-prefix witness is rejected");
+    assert!(
+        !r1cs.satisfies(&z),
+        "an honest bad-prefix witness is rejected"
+    );
 
     let mut repaired = z;
     repaired[384] = true;
@@ -274,11 +308,12 @@ fn pow_mask_inputs_the_load_bearing_check_word() {
         "the regression probe must model the formerly accepted repair attack"
     );
     assert_eq!(ty.io_schema().last().map(|io| io.word_col), Some(3));
-    assert_eq!(ty.io_schema().last().map(|io| io.dir), Some(IoDirection::In));
+    assert_eq!(
+        ty.io_schema().last().map(|io| io.dir),
+        Some(IoDirection::In)
+    );
 
-    let check_word = (384..512).fold(0u128, |acc, i| {
-        acc | ((repaired[i] as u128) << (i - 384))
-    });
+    let check_word = (384..512).fold(0u128, |acc, i| acc | ((repaired[i] as u128) << (i - 384)));
     assert_ne!(
         check_word,
         1u128 << 127,

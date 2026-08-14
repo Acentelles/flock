@@ -148,6 +148,46 @@ pub fn give_f128(v: Vec<F128>) {
     }
 }
 
+/// [`take_f128`] for `F256` buffers, SHARING the F128 pool: an F256 array is
+/// layout-identical to twice-as-many F128s (`repr(C)`, two `F128` fields,
+/// align 16 — `Layout::array::<F256>(n) == Layout::array::<F128>(2n)`), so
+/// the F256 fold chain recycles the same physical buffers the F128 phases
+/// cycle (witness, codeword, ping-pong) instead of faulting fresh pages
+/// every prove. A split pool was the shape of the measured "+24% open_batch"
+/// trap in [`give_f128`]'s doc — do not separate them.
+///
+/// Same write-before-read contract as [`take_f128`].
+pub fn take_f256(n: usize) -> Vec<crate::field::F256> {
+    use crate::field::F256;
+    if let Some(v) = try_take_f128(2 * n) {
+        // Reinterpreting requires an even F128 capacity so the F256 vec's
+        // drop layout (`Layout::array::<F256>(cap/2)`) matches the
+        // allocation. Practically every pooled buffer is a power-of-two
+        // size; an odd-capacity stray just goes back untouched.
+        if v.capacity().is_multiple_of(2) {
+            let mut v = std::mem::ManuallyDrop::new(v);
+            let (ptr, cap) = (v.as_mut_ptr(), v.capacity());
+            // SAFETY: identical allocation layout (asserted even capacity);
+            // both types are Copy PODs valid for every bit pattern; len n
+            // ≤ cap/2 holds because take gave len 2n ≤ cap. Contents stay
+            // uninitialized per the take contract.
+            return unsafe { Vec::from_raw_parts(ptr as *mut F256, n, cap / 2) };
+        }
+        give_f128(v);
+    }
+    crate::alloc_uninit_vec(n)
+}
+
+/// Return an `F256` buffer to the shared pool (see [`take_f256`]).
+pub fn give_f256(v: Vec<crate::field::F256>) {
+    let mut v = std::mem::ManuallyDrop::new(v);
+    let (ptr, len, cap) = (v.as_mut_ptr(), v.len(), v.capacity());
+    // SAFETY: exact inverse of the reinterpretation in [`take_f256`] —
+    // identical allocation layout, POD contents, doubled len/cap in F128
+    // units.
+    give_f128(unsafe { Vec::from_raw_parts(ptr as *mut F128, 2 * len, 2 * cap) });
+}
+
 // ---------------------------------------------------------------------------
 // Zero pool: buffers KNOWN to be all-zero, for the padding-dominant witness
 // shapes (every node-shaped circuit prove).

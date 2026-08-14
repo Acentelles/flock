@@ -1597,9 +1597,14 @@ pub(crate) fn build_merged_weight_and_prime(
     let tabs: Vec<(Vec<F128>, ColSide<'_>)> = claims
         .iter()
         .map(|c| match c {
-            MergedWeightClaim::Folded { z_row, z_col, table } => {
-                (build_eq_table(z_row), ColSide::Fold(build_eq_table(z_col), *table))
-            }
+            MergedWeightClaim::Folded {
+                z_row,
+                z_col,
+                table,
+            } => (
+                build_eq_table(z_row),
+                ColSide::Fold(build_eq_table(z_col), *table),
+            ),
             MergedWeightClaim::Scalar { z_row, cols } => {
                 (build_eq_table(z_row), ColSide::Combined(cols))
             }
@@ -1938,7 +1943,14 @@ pub fn prove_frobenius_assist_with_grinding<C: Challenger>(
     let lo = params.n.clamp(1, m + 1);
     let tail = assist_shared_tail_blocked(&blocks, rho, &sparse, m, lo);
     let lo_off = blocks.off[lo];
-    let mut sts = frobenius_statements(params, claims, groups, rho, &bounds, Some((&blocks, &tail, lo)));
+    let mut sts = frobenius_statements(
+        params,
+        claims,
+        groups,
+        rho,
+        &bounds,
+        Some((&blocks, &tail, lo)),
+    );
     if trace {
         eprintln!(
             "    [frobenius] statements + suffix rows (x{}, {} low + {} shared blocks vs {} dense): {:6.2} ms",
@@ -1966,9 +1978,7 @@ pub fn prove_frobenius_assist_with_grinding<C: Challenger>(
 
     let mut ch4: Option<[F128; 4]> = None;
     let mut rounds = Vec::with_capacity(2 * (m + 1));
-    let mut grinding_nonces = Vec::with_capacity(
-        (round_grinding_bits != 0) as usize * 2 * (m + 1),
-    );
+    let mut grinding_nonces = Vec::with_capacity((round_grinding_bits != 0) as usize * 2 * (m + 1));
     for layer in 0..=m {
         // Per-statement block pass: ascend one layer with the previous layer's
         // challenges, bucket the weight partials against their parents' suffix
@@ -2190,10 +2200,8 @@ fn verify_frobenius_assist_core<C: Challenger>(
         challenger.observe_f128(g_one);
         challenger.observe_f128(g_inf);
         let r = if round_grinding_bits != 0 {
-            challenger.verify_pow_and_sample_f128(
-                proof.grinding_nonces[round],
-                round_grinding_bits,
-            )?
+            challenger
+                .verify_pow_and_sample_f128(proof.grinding_nonces[round], round_grinding_bits)?
         } else {
             challenger.sample_f128()
         };
@@ -2412,11 +2420,9 @@ fn twisted_eq_at(gpow: &[F128], rho_pows: &[Vec<F128>], x: &[F128]) -> F128 {
 /// endpoint factor.
 fn eq_at(a: &[F128], b: &[F128]) -> F128 {
     debug_assert_eq!(a.len(), b.len());
-    a.iter()
-        .zip(b)
-        .fold(F128::ONE, |acc, (&x, &y)| {
-            acc * (x * y + (F128::ONE + x) * (F128::ONE + y))
-        })
+    a.iter().zip(b).fold(F128::ONE, |acc, (&x, &y)| {
+        acc * (x * y + (F128::ONE + x) * (F128::ONE + y))
+    })
 }
 
 /// Basis images of `x ↦ x^{2^{-j}}` for every `j` (level 0 = identity).
@@ -2978,7 +2984,11 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
         assert_eq!(claim.coeffs.len(), 128);
     }
     for g in groups {
-        assert_eq!(g.cols.len(), 1usize << params.k, "group cols must be dense over 2^k columns");
+        assert_eq!(
+            g.cols.len(),
+            1usize << params.k,
+            "group cols must be dense over 2^k columns"
+        );
     }
     let n_rs = claims.len();
     let n_g = groups.len();
@@ -3155,7 +3165,11 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
         );
     }
     let mut sparse_support: Option<u64> = None;
-    if n_g > 0 && closed_rs_on() && let Some(used) = aligned.as_ref() {
+    let mut dense_group_support: Option<u64> = None;
+    if n_g > 0
+        && closed_rs_on()
+        && let Some(used) = aligned.as_ref()
+    {
         // THE SAME CLOSED FORM, one conjugate. A group's weight is
         // `scale·cols[y]·eq(z_row, row)` — the RS side's shape exactly — and
         // its partner is a SINGLE scaled `eq(ρ,·)` rather than 128 twisted
@@ -3209,6 +3223,7 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
             let (bv, msg) = build_combined_weight_and_msg(params, &sides, &partner, &eq0);
             msg0 = (msg0.0 + msg.0, msg0.1 + msg.1);
             pairs.push(Pair::Virtual(VirtualPair::new(bv, partner, rho, 0, area)));
+            dense_group_support = Some(support);
         }
     }
     if trace {
@@ -3216,9 +3231,10 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
             "    [multipoint] weight passes (2^{m}, {} products{}, round-0 fused): {:6.2} ms  \
              (rs {:.2} | group {:.2})",
             pairs.len(),
-            match sparse_support {
-                Some(s) => format!(" — group sparse, support {s} words"),
-                None => String::new(),
+            match (sparse_support, dense_group_support) {
+                (Some(s), _) => format!(" — group sparse, support {s} words"),
+                (None, Some(s)) => format!(" — group DENSE, support {s} words"),
+                (None, None) => String::new(),
             },
             t.elapsed().as_secs_f64() * 1e3,
             t_rs_weight.as_secs_f64() * 1e3,
@@ -3234,8 +3250,7 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
     // endpoint.
     let t = std::time::Instant::now();
     let mut rounds = Vec::with_capacity(m);
-    let mut round_grinding_nonces =
-        Vec::with_capacity((grinding.round_bits != 0) as usize * m);
+    let mut round_grinding_nonces = Vec::with_capacity((grinding.round_bits != 0) as usize * m);
     let mut point = Vec::with_capacity(m);
     // Per-PAIR fold attribution: which product's rounds cost what. The two
     // products are not comparable — the RS side folds the whole area against
@@ -3311,7 +3326,11 @@ pub fn prove_multipoint_twisted_with_grinding<C: Challenger>(
         Some(rp) => twisted_eq_at(&gpow, rp, &point),
         None => F128::ZERO,
     };
-    let e_at = if n_g > 0 { eq_at(rho, &point) } else { F128::ZERO };
+    let e_at = if n_g > 0 {
+        eq_at(rho, &point)
+    } else {
+        F128::ZERO
+    };
     let anchor_coeffs: Vec<Vec<F128>> = (0..n_rs)
         .map(|i| {
             let mut c = vec![F128::ZERO; 128];
@@ -4119,7 +4138,22 @@ impl SparseGroupPair {
 }
 
 /// Densify once the stored support stops paying against the live length.
-const SPARSE_DENSIFY_FACTOR: usize = 4;
+/// Sparse-vs-dense gate for the GROUP pair, used BOTH at entry (build
+/// segment-sparse when `support * this <= 2^m`) and by the mid-sumcheck
+/// self-densify (`stored * this > cur`). The two sites must share one
+/// factor: `stored` and `cur` both roughly halve per fold round, so the
+/// ratio is round-invariant — a pair admitted under a looser entry gate
+/// than the densify gate would densify at its FIRST fold, paying the
+/// materialize for nothing (measured: the fold line spiked to 11.8 ms
+/// when the gates briefly disagreed).
+///
+/// Was 4; relaxed to 3 (2026-08-14): the F256 registry's extra element
+/// columns pushed the envelope INTERNAL's support to 1,062,614 = 25.3% of
+/// 2^22 — 1.3% over the old gate — flipping it to the dense path at ~+4 ms
+/// of group weight per open (dense 6.4 ms over 2^22 vs sparse ~3.3 at this
+/// support; the measured per-word weight crossover is near 2^m/1.5, so 3
+/// keeps real margin). The FL at 793k = 18.9% was and stays sparse.
+const SPARSE_DENSIFY_FACTOR: usize = 3;
 
 /// Below this stored-support size a sparse fold round runs on the calling
 /// thread: the round's whole work is a few thousand multiplies —
@@ -4139,8 +4173,7 @@ const LAZY_RS_MAX_SIDES: usize = 8;
 /// In-process override for the lazy (virtual-ā) dense RS pair: 0 = env
 /// (`FLOCK_NO_VIRTUAL_A` disables), 1 = force on, 2 = force off — the
 /// alternating-arm contract of [`crate::pcs::VIRTUAL_B_OVERRIDE`].
-pub static VIRTUAL_A_OVERRIDE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(0);
+pub static VIRTUAL_A_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 fn virtual_a_on() -> bool {
     match VIRTUAL_A_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -4417,7 +4450,9 @@ pub fn verify_multipoint_twisted_with_grinding<C: Challenger>(
     grinding: MultipointGrinding,
     challenger: &mut C,
 ) -> Option<F128> {
-    verify_multipoint_twisted_core(params, claims, groups, rho, proof, grinding, challenger, None)
+    verify_multipoint_twisted_core(
+        params, claims, groups, rho, proof, grinding, challenger, None,
+    )
 }
 
 /// The deferred export of the whole multipoint anchor: the assist's final
@@ -4513,7 +4548,11 @@ fn verify_multipoint_twisted_core<C: Challenger>(
         return None;
     }
     for g in groups {
-        assert_eq!(g.cols.len(), 1usize << params.k, "group cols must be dense over 2^k columns");
+        assert_eq!(
+            g.cols.len(),
+            1usize << params.k,
+            "group cols must be dense over 2^k columns"
+        );
     }
     let n_rs = claims.len();
     let n_g = groups.len();
@@ -4580,7 +4619,11 @@ fn verify_multipoint_twisted_core<C: Challenger>(
     } else {
         F128::ZERO
     };
-    let e_at = if n_g > 0 { eq_at(rho, &point) } else { F128::ZERO };
+    let e_at = if n_g > 0 {
+        eq_at(rho, &point)
+    } else {
+        F128::ZERO
+    };
     let anchor_coeffs: Vec<Vec<F128>> = (0..n_rs)
         .map(|i| {
             let mut c = vec![F128::ZERO; 128];
@@ -5459,10 +5502,21 @@ mod tests {
                 let g1cols = sample_vec(&mut ch, 1 << k);
                 let rho = sample_vec(&mut ch, m);
                 let claims_all = [
-                    FrobeniusClaim { z_row: &z1r, z_col: &z1c, coeffs: &c1 },
-                    FrobeniusClaim { z_row: &z2r, z_col: &z2c, coeffs: &c2 },
+                    FrobeniusClaim {
+                        z_row: &z1r,
+                        z_col: &z1c,
+                        coeffs: &c1,
+                    },
+                    FrobeniusClaim {
+                        z_row: &z2r,
+                        z_col: &z2c,
+                        coeffs: &c2,
+                    },
                 ];
-                let groups_all = [ScalarGroupClaim { z_row: &g1r, cols: &g1cols }];
+                let groups_all = [ScalarGroupClaim {
+                    z_row: &g1r,
+                    cols: &g1cols,
+                }];
                 for (n_claims, n_groups) in [(2usize, 1usize), (1, 1), (2, 0)] {
                     let claims = &claims_all[..n_claims];
                     let groups = &groups_all[..n_groups];
@@ -5475,7 +5529,8 @@ mod tests {
                     let dense = arm(2);
                     VIRTUAL_A_OVERRIDE.store(0, Ordering::Relaxed);
                     assert_eq!(
-                        lazy, dense,
+                        lazy,
+                        dense,
                         "n={n} k={k} m={m} rep={rep} R={n_claims} G={n_groups} area={}",
                         params.area()
                     );
@@ -5540,12 +5595,26 @@ mod tests {
         }
         let rho = sample_vec(&mut ch, 22);
         let claims = [
-            FrobeniusClaim { z_row: &z1r, z_col: &z1c, coeffs: &c1 },
-            FrobeniusClaim { z_row: &z2r, z_col: &z2c, coeffs: &c2 },
+            FrobeniusClaim {
+                z_row: &z1r,
+                z_col: &z1c,
+                coeffs: &c1,
+            },
+            FrobeniusClaim {
+                z_row: &z2r,
+                z_col: &z2c,
+                coeffs: &c2,
+            },
         ];
         let groups = [
-            ScalarGroupClaim { z_row: &g1r, cols: &g1cols },
-            ScalarGroupClaim { z_row: &g2r, cols: &g2cols },
+            ScalarGroupClaim {
+                z_row: &g1r,
+                cols: &g1cols,
+            },
+            ScalarGroupClaim {
+                z_row: &g2r,
+                cols: &g2cols,
+            },
         ];
         let mut times: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
         let mut reference: Option<MultipointTwistedProof> = None;
@@ -5568,7 +5637,9 @@ mod tests {
             let med = ts[ts.len() / 2];
             println!(
                 "virtual_a node-shape {name}: median {med:6.2} ms  (runs {:?})",
-                ts.iter().map(|t| (t * 100.0).round() / 100.0).collect::<Vec<_>>()
+                ts.iter()
+                    .map(|t| (t * 100.0).round() / 100.0)
+                    .collect::<Vec<_>>()
             );
         }
     }

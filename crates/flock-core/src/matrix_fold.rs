@@ -402,7 +402,12 @@ pub fn prove_fold_with_grinding<Ch: Challenger>(
 
     let mut grinding_nonces = Vec::with_capacity(grinding.nonce_count(k_row, k_col));
     observe_claims(claims, ch);
-    let lambdas = grind_sample_vec(ch, &mut grinding_nonces, grinding.combination_bits, claims.len());
+    let lambdas = grind_sample_vec(
+        ch,
+        &mut grinding_nonces,
+        grinding.combination_bits,
+        claims.len(),
+    );
 
     // Column phase: Σ_c Σ_i λ_i·col_i(c)·comb_i(c). `combs` is the k·nnz
     // work, done by the caller with the type's tuned kernel.
@@ -438,7 +443,12 @@ pub fn prove_fold_with_grinding<Ch: Challenger>(
     // Row phase. Every bridge value reads against the same h(r) = M̂(r, ρ_col),
     // so ONE marginal serves all k — the only pass this function makes over
     // the matrix itself.
-    let mus = grind_sample_vec(ch, &mut grinding_nonces, grinding.combination_bits, claims.len());
+    let mus = grind_sample_vec(
+        ch,
+        &mut grinding_nonces,
+        grinding.combination_bits,
+        claims.len(),
+    );
     let eq_col = Weight::eq(rho_col.clone()).materialize();
     let h = m.row_marginal(&eq_col, 1usize << k_row);
     let mut w_mu = vec![F128::ZERO; 1usize << k_row];
@@ -857,7 +867,11 @@ impl JaggedTable {
         let mut acc = F128::ONE;
         for l in 0..=self.m {
             let (rc, rd) = (rho[2 * l], rho[2 * l + 1]);
-            acc *= if (t_c >> l) & 1 == 1 { rc } else { F128::ONE + rc };
+            acc *= if (t_c >> l) & 1 == 1 {
+                rc
+            } else {
+                F128::ONE + rc
+            };
             acc *= if (t_next >> l) & 1 == 1 {
                 rd
             } else {
@@ -906,16 +920,17 @@ impl JaggedRowWeight {
         match self {
             Self::Eq(scale, point) => {
                 assert_eq!(point.len(), rho.len(), "point/arity mismatch");
-                point
-                    .iter()
-                    .zip(rho)
-                    .fold(*scale, |acc, (&p, &r)| {
-                        acc * (p * r + (F128::ONE + p) * (F128::ONE + r))
-                    })
+                point.iter().zip(rho).fold(*scale, |acc, (&p, &r)| {
+                    acc * (p * r + (F128::ONE + p) * (F128::ONE + r))
+                })
             }
             Self::Combo(terms) => terms.iter().fold(F128::ZERO, |acc, &(c, addr)| {
                 let e = rho.iter().enumerate().fold(F128::ONE, |e, (l, &r)| {
-                    e * if (addr >> l) & 1 == 1 { r } else { F128::ONE + r }
+                    e * if (addr >> l) & 1 == 1 {
+                        r
+                    } else {
+                        F128::ONE + r
+                    }
                 });
                 acc + c * e
             }),
@@ -1124,7 +1139,12 @@ pub fn prove_fold_jagged_with_grinding<Ch: Challenger>(
 
     let mut grinding_nonces = Vec::with_capacity(grinding.nonce_count(t.k, n_col));
     observe_jagged_claims(t.k, claims, ch);
-    let lambdas = grind_sample_vec(ch, &mut grinding_nonces, grinding.combination_bits, claims.len());
+    let lambdas = grind_sample_vec(
+        ch,
+        &mut grinding_nonces,
+        grinding.combination_bits,
+        claims.len(),
+    );
 
     // Column phase, sparse: per claim, `comb_i` has one entry per run with a
     // nonzero row-weight mass. The claim's own eq tensor over the pair space
@@ -1210,7 +1230,12 @@ pub fn prove_fold_jagged_with_grinding<Ch: Challenger>(
 
     // Row phase — dense over the small `2^k` side, the machinery above
     // verbatim. `h(y) = Ĵ(y, ρ_col)` is one eq factor per run, broadcast.
-    let mus = grind_sample_vec(ch, &mut grinding_nonces, grinding.combination_bits, claims.len());
+    let mus = grind_sample_vec(
+        ch,
+        &mut grinding_nonces,
+        grinding.combination_bits,
+        claims.len(),
+    );
     let mut h = vec![F128::ZERO; 1usize << t.k];
     let mut y = 0usize;
     for &(t_c, t_next, run) in &t.bounds {
@@ -1322,20 +1347,17 @@ pub fn verify_fold_jagged_with_grinding<Ch: Challenger>(
     for &v in &proof.bridge {
         ch.observe_f128(v);
     }
-    let expect = claims
-        .iter()
-        .zip(&lambdas)
-        .zip(&proof.bridge)
-        .fold(F128::ZERO, |acc, ((c, &l), &g)| {
-            let col_eval = c
-                .col
-                .iter()
-                .zip(&rho_col)
-                .fold(F128::ONE, |e, (&p, &r)| {
+    let expect =
+        claims
+            .iter()
+            .zip(&lambdas)
+            .zip(&proof.bridge)
+            .fold(F128::ZERO, |acc, ((c, &l), &g)| {
+                let col_eval = c.col.iter().zip(&rho_col).fold(F128::ONE, |e, (&p, &r)| {
                     e * (p * r + (F128::ONE + p) * (F128::ONE + r))
                 });
-            acc + l * col_eval * g
-        });
+                acc + l * col_eval * g
+            });
     if running != expect {
         return Err(FoldError::ConsistencyFailed { which: "col" });
     }
@@ -1544,8 +1566,7 @@ mod tests {
         let k = 5;
         let m = matrix(k, 4, 0x1280_D35E);
         let mut rng = Rng(0x1280_F01D);
-        let claims: Vec<MatrixClaim> =
-            (0..3).map(|_| honest_claim(&m, k, 3, &mut rng)).collect();
+        let claims: Vec<MatrixClaim> = (0..3).map(|_| honest_claim(&m, k, 3, &mut rng)).collect();
         let combs = gen_combs(&m, &claims);
         let policy = FoldGrinding::per_challenge_128();
         let mut chp = FsChallenger::new(b"matrix-fold-grinding-test");
@@ -1586,8 +1607,7 @@ mod tests {
         ];
         let policy = FoldGrinding::per_challenge_128();
         let mut chp = FsChallenger::new(b"jagged-fold-grinding-test");
-        let (proof, out_p) =
-            prove_fold_jagged_with_grinding(&table, &claims, policy, &mut chp);
+        let (proof, out_p) = prove_fold_jagged_with_grinding(&table, &claims, policy, &mut chp);
         let mut chv = FsChallenger::new(b"jagged-fold-grinding-test");
         let out_v = verify_fold_jagged_with_grinding(table.k, &claims, &proof, policy, &mut chv)
             .expect("grinded jagged fold verifies");

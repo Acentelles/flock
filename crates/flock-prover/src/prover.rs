@@ -523,6 +523,10 @@ pub fn prove_fast_ligerito_union_circuit<Ch: Challenger>(
         "the circuit and the union instance must be the same statement \
          (same registry, and the circuit's gate counts ARE the union's counts)"
     );
+    assert!(
+        circuit.check_public(public),
+        "the public segment must have the circuit's declared length and fixed constants"
+    );
     let (out, commitment) = prove_union_with_binding(
         union,
         UnionProveBinding::Circuit(CircuitProverInput { circuit, public }),
@@ -1057,15 +1061,16 @@ fn prove_union_with_binding<Ch: Challenger>(
                         )
                     }
                 };
-                let (zc_proof, zc_claim, _shv) = zerocheck::prove_packed_padded_capture_s_hat_v_c_with_grinding(
-                    view(&a_packed_f128),
-                    view(&b_packed_f128),
-                    view(&z_packed),
-                    m_bool,
-                    &bool_padding,
-                    pcs_params.zerocheck_grinding(),
-                    &mut ch,
-                );
+                let (zc_proof, zc_claim, _shv) =
+                    zerocheck::prove_packed_padded_capture_s_hat_v_c_with_grinding(
+                        view(&a_packed_f128),
+                        view(&b_packed_f128),
+                        view(&z_packed),
+                        m_bool,
+                        &bool_padding,
+                        pcs_params.zerocheck_grinding(),
+                        &mut ch,
+                    );
                 let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
                 let lc_slots: Vec<lincheck::UnionLincheckSlot<'_>> = linchecks
                     .iter()

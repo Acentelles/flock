@@ -77,9 +77,7 @@ pub enum TranscriptOp {
     /// Marks the merge of fork number `fork` (index among `Forked` ops, in
     /// order): the two parent `ObserveScalar`s that follow absorb that
     /// child's closing digest. Contributes no words itself.
-    Merge {
-        fork: usize,
-    },
+    Merge { fork: usize },
     /// Fused PoW+squeeze marker at `bits`.  This op contributes the private
     /// 16-byte nonce word; the immediately following `SqueezeScalar` or
     /// `SqueezeSlice` performs the single domain-separated compression.
@@ -133,7 +131,9 @@ impl TranscriptOp {
             TranscriptOp::SqueezeScalar | TranscriptOp::SqueezeSlice(_) => 0,
             // The PoW nonce rides `observe_bytes(8)`.
             TranscriptOp::Pow { .. } | TranscriptOp::LegacyPow { .. } => 16,
-            TranscriptOp::Forked { .. } | TranscriptOp::Merge { .. } => unreachable!("early return"),
+            TranscriptOp::Forked { .. } | TranscriptOp::Merge { .. } => {
+                unreachable!("early return")
+            }
         }
     }
 
@@ -282,12 +282,7 @@ impl TranscriptShape {
                     h.update([7u8]);
                     h.update((label.len() as u64).to_le_bytes());
                     h.update(label);
-                    h.update(
-                        TranscriptShape {
-                            ops: ops.clone(),
-                        }
-                        .digest(),
-                    );
+                    h.update(TranscriptShape { ops: ops.clone() }.digest());
                 }
                 TranscriptOp::Merge { fork } => {
                     h.update([8u8]);
@@ -566,7 +561,10 @@ impl TranscriptShape {
                     // domain header + padded label, plus the observe header.
                     let child_seed_word = 1 + label.len().div_ceil(16) + 1;
                     assert!(
-                        matches!(stream.words.get(child_seed_word), Some(StreamWord::Value(_))),
+                        matches!(
+                            stream.words.get(child_seed_word),
+                            Some(StreamWord::Value(_))
+                        ),
                         "child chain must open by absorbing its seed"
                     );
                     assert!(
@@ -787,10 +785,7 @@ impl<Ch: Challenger> Challenger for RecordingChallenger<Ch> {
         });
         RecordingChallenger {
             inner: self.inner.fork_from_seed(seed, label),
-            ops: vec![
-                TranscriptOp::ObserveScalar,
-                TranscriptOp::ObserveScalar,
-            ],
+            ops: vec![TranscriptOp::ObserveScalar, TranscriptOp::ObserveScalar],
             values: vec![seed[0], seed[1]],
             payloads: Vec::new(),
             challenges: Vec::new(),

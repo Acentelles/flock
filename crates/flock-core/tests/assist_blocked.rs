@@ -158,7 +158,12 @@ fn assist_shapes_probe() {
         let fverify = min_ms(iters, || {
             let mut ch = FsChallenger::new(b"assist-blocked-probe");
             std::hint::black_box(verify_frobenius_assist(
-                &params, &claims, &[], &rho, &fproof, &mut ch,
+                &params,
+                &claims,
+                &[],
+                &rho,
+                &fproof,
+                &mut ch,
             ));
         });
         let mut vch = FsChallenger::new(b"assist-blocked-probe");

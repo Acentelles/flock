@@ -117,12 +117,7 @@ impl AssistLayerGate {
         for s in 0..4 {
             b.linear(
                 AL_OUT0 + s,
-                &[
-                    (33 + s, one),
-                    (37 + s, one),
-                    (41 + s, one),
-                    (45 + s, one),
-                ],
+                &[(33 + s, one), (37 + s, one), (41 + s, one), (45 + s, one)],
             );
         }
         Self {
@@ -145,37 +140,37 @@ impl GateType for AssistLayerGate {
 
     fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> Self::Row {
         let (o, row) = {
-        let sparse = assist_sparse_transitions();
-        let mut z = vec![F128::ZERO; AL_K];
-        z[..AL_IN].copy_from_slice(&inputs[..AL_IN]);
-        let one = F128::ONE;
-        z[9] = z[4] * z[5];
-        z[10] = one + z[4] + z[5] + z[9];
-        z[11] = z[4] + z[9];
-        z[12] = z[5] + z[9];
-        let eq4 = [10usize, 11, 12, 9];
-        z[13] = z[6] * z[7];
-        z[14] = one + z[6] + z[7] + z[13];
-        z[15] = z[6] + z[13];
-        z[16] = z[7] + z[13];
-        let e = [14usize, 15, 16, 13];
-        let p = |i: usize, o: usize| 17 + 4 * i + o;
-        for i in 0..4 {
-            for o in 0..4 {
-                z[p(i, o)] = z[eq4[i]] * z[o];
+            let sparse = assist_sparse_transitions();
+            let mut z = vec![F128::ZERO; AL_K];
+            z[..AL_IN].copy_from_slice(&inputs[..AL_IN]);
+            let one = F128::ONE;
+            z[9] = z[4] * z[5];
+            z[10] = one + z[4] + z[5] + z[9];
+            z[11] = z[4] + z[9];
+            z[12] = z[5] + z[9];
+            let eq4 = [10usize, 11, 12, 9];
+            z[13] = z[6] * z[7];
+            z[14] = one + z[6] + z[7] + z[13];
+            z[15] = z[6] + z[13];
+            z[16] = z[7] + z[13];
+            let e = [14usize, 15, 16, 13];
+            let p = |i: usize, o: usize| 17 + 4 * i + o;
+            for i in 0..4 {
+                for o in 0..4 {
+                    z[p(i, o)] = z[eq4[i]] * z[o];
+                }
             }
-        }
-        for (cd, rows) in sparse.iter().enumerate() {
-            for (s, row) in rows.iter().enumerate() {
-                let [(i0, o0), (i1, o1)] = *row;
-                z[33 + 4 * cd + s] = z[e[cd]] * (z[p(i0, o0)] + z[p(i1, o1)]);
+            for (cd, rows) in sparse.iter().enumerate() {
+                for (s, row) in rows.iter().enumerate() {
+                    let [(i0, o0), (i1, o1)] = *row;
+                    z[33 + 4 * cd + s] = z[e[cd]] * (z[p(i0, o0)] + z[p(i1, o1)]);
+                }
             }
-        }
-        for s in 0..4 {
-            z[AL_OUT0 + s] = z[33 + s] + z[37 + s] + z[41 + s] + z[45 + s];
-        }
-        (z[AL_OUT0..AL_OUT0 + 4].to_vec(), z)
-    };
+            for s in 0..4 {
+                z[AL_OUT0 + s] = z[33 + s] + z[37 + s] + z[41 + s] + z[45 + s];
+            }
+            (z[AL_OUT0..AL_OUT0 + 4].to_vec(), z)
+        };
         outputs.extend_from_slice(&o);
         row
     }
@@ -246,7 +241,12 @@ fn assist_layer_gate_chains_match_the_native_dp() {
         g[STATE_SUCCESS] = ow;
         for layer in (0..=m).rev() {
             let mut a_in = g.to_vec();
-            for v in [pb(zr, layer), pb(rho, layer), sigma[2 * layer], sigma[2 * layer + 1]] {
+            for v in [
+                pb(zr, layer),
+                pb(rho, layer),
+                sigma[2 * layer],
+                sigma[2 * layer + 1],
+            ] {
                 vals.push(v);
                 a_in.push(sb.public_input());
             }

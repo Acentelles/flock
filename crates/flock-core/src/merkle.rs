@@ -633,12 +633,7 @@ pub fn cap_layer(tree: &[Hash], num_leaves: usize, c: usize) -> &[Hash] {
 /// `log2(num_leaves) − c` hashes. `c = 0` is the classic root-anchored path.
 ///
 /// Verify with [`verify_merkle_proof_capped`].
-pub fn merkle_proof_capped(
-    tree: &[Hash],
-    num_leaves: usize,
-    index: usize,
-    c: usize,
-) -> Vec<Hash> {
+pub fn merkle_proof_capped(tree: &[Hash], num_leaves: usize, index: usize, c: usize) -> Vec<Hash> {
     assert!(num_leaves.is_power_of_two() && num_leaves > 0);
     assert!(index < num_leaves);
     assert_eq!(tree.len(), 2 * num_leaves - 1);
@@ -1144,10 +1139,14 @@ mod tests {
                 let leaf_hash = hash_leaf(&data[i * leaf_size..(i + 1) * leaf_size], kind);
                 let path = merkle_proof_capped(&tree, n_leaves, i, d);
                 assert!(path.is_empty());
-                assert!(verify_merkle_proof_capped(cap, n_leaves, &leaf_hash, i, &path, kind));
+                assert!(verify_merkle_proof_capped(
+                    cap, n_leaves, &leaf_hash, i, &path, kind
+                ));
                 let mut wrong = leaf_hash;
                 wrong[0] ^= 1;
-                assert!(!verify_merkle_proof_capped(cap, n_leaves, &wrong, i, &path, kind));
+                assert!(!verify_merkle_proof_capped(
+                    cap, n_leaves, &wrong, i, &path, kind
+                ));
             }
         }
     }
@@ -1187,13 +1186,24 @@ mod tests {
             let i = 5usize;
             let leaf_hash = hash_leaf(&data[i * leaf_size..(i + 1) * leaf_size], kind);
             let path = merkle_proof_capped(&tree, n_leaves, i, c);
-            assert!(verify_merkle_proof_capped(cap, n_leaves, &leaf_hash, i, &path, kind));
+            assert!(verify_merkle_proof_capped(
+                cap, n_leaves, &leaf_hash, i, &path, kind
+            ));
             // Wrong index (same cap node, sibling half).
-            assert!(!verify_merkle_proof_capped(cap, n_leaves, &leaf_hash, i ^ 1, &path, kind));
+            assert!(!verify_merkle_proof_capped(
+                cap,
+                n_leaves,
+                &leaf_hash,
+                i ^ 1,
+                &path,
+                kind
+            ));
             // Tampered sibling.
             let mut bad = path.clone();
             bad[0][0] ^= 1;
-            assert!(!verify_merkle_proof_capped(cap, n_leaves, &leaf_hash, i, &bad, kind));
+            assert!(!verify_merkle_proof_capped(
+                cap, n_leaves, &leaf_hash, i, &bad, kind
+            ));
             // The other hash kind.
             let other = match kind {
                 HashKind::Sha256 => HashKind::Blake3,
@@ -1201,7 +1211,9 @@ mod tests {
                 #[allow(unreachable_patterns)]
                 _ => continue,
             };
-            assert!(!verify_merkle_proof_capped(cap, n_leaves, &leaf_hash, i, &path, other));
+            assert!(!verify_merkle_proof_capped(
+                cap, n_leaves, &leaf_hash, i, &path, other
+            ));
         }
     }
 
@@ -1221,10 +1233,14 @@ mod tests {
             let path = merkle_proof_capped(&tree, n_leaves, i, c);
             let mut short = path.clone();
             short.pop();
-            assert!(!verify_merkle_proof_capped(cap, n_leaves, &leaf_hash, i, &short, kind));
+            assert!(!verify_merkle_proof_capped(
+                cap, n_leaves, &leaf_hash, i, &short, kind
+            ));
             let mut long = path.clone();
             long.push([0u8; 32]);
-            assert!(!verify_merkle_proof_capped(cap, n_leaves, &leaf_hash, i, &long, kind));
+            assert!(!verify_merkle_proof_capped(
+                cap, n_leaves, &leaf_hash, i, &long, kind
+            ));
         }
     }
 
@@ -1245,5 +1261,4 @@ mod tests {
         assert_eq!(cap_depth(218, 4), 4);
         assert_eq!(cap_depth(131, 8), 8);
     }
-
 }

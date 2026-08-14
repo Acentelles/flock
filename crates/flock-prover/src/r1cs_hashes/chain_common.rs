@@ -307,12 +307,8 @@ pub fn prove_chain_ligerito_generic<Ch: Challenger>(
     let fold = ChainFold::new(layout, tau_pos);
     let (in_vals, out_vals) = fold_in_out(layout, r1cs.layout, &core.z_packed, &fold);
 
-    let (shift, claims) = crate::chain::prove_chain_shift_with_grinding(
-        &in_vals,
-        &out_vals,
-        grinding,
-        challenger,
-    );
+    let (shift, claims) =
+        crate::chain::prove_chain_shift_with_grinding(&in_vals, &out_vals, grinding, challenger);
     let chain_claim = assemble_chain_claim(layout, r1cs.layout, &fold, &claims);
 
     let padding = r1cs.padding_spec();
@@ -394,10 +390,14 @@ pub fn verify_chain_ligerito_generic<Ch: Challenger>(
                 tau_pos_bits,
                 layout.tau_pos_len(),
             )
-            .ok_or(ChainVerifyError::Shift(crate::chain::ChainError::InvalidGrinding))?
+            .ok_or(ChainVerifyError::Shift(
+                crate::chain::ChainError::InvalidGrinding,
+            ))?
     } else {
         if proof.tau_pos_grinding_nonce != 0 {
-            return Err(ChainVerifyError::Shift(crate::chain::ChainError::InvalidGrinding));
+            return Err(ChainVerifyError::Shift(
+                crate::chain::ChainError::InvalidGrinding,
+            ));
         }
         challenger.sample_f128_vec(layout.tau_pos_len())
     };

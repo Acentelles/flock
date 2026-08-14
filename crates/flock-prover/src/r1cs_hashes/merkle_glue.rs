@@ -147,7 +147,10 @@ pub(crate) fn scatter_zab_into(
     assert_eq!(z.len() % words_per_block, 0, "aligned slot block");
     let n_total = z.len() / words_per_block;
     assert!(per_row.len() <= n_total, "live rows fit the capacity");
-    assert!(n_total.is_multiple_of(8), "the lincheck stripe needs nu >= 3");
+    assert!(
+        n_total.is_multiple_of(8),
+        "the lincheck stripe needs nu >= 3"
+    );
     let nu = n_total.trailing_zeros() as usize;
     if !elide_padding_writes {
         for buf in [&mut *z, &mut *a, &mut *b] {
@@ -460,7 +463,7 @@ impl BitSpreadTable {
     }
 
     pub fn k_log(&self) -> usize {
-        (128 * (self.depth + 3) + 1)
+        (128 * (self.depth + 7) + 1)
             .next_power_of_two()
             .trailing_zeros() as usize
     }
@@ -475,7 +478,7 @@ impl BitSpreadTable {
     }
 
     pub fn const_pos(&self) -> usize {
-        self.check_pos() + 128
+        self.position_pos() + 128
     }
 
     pub fn mask_pos(&self) -> usize {
@@ -486,12 +489,30 @@ impl BitSpreadTable {
         self.mask_pos() + 128
     }
 
+    pub fn position_mask_pos(&self) -> usize {
+        self.check_pos() + 128
+    }
+
+    pub fn position_prefix_pos(&self) -> usize {
+        self.position_mask_pos() + 128
+    }
+
+    pub fn masked_position_pos(&self) -> usize {
+        self.position_prefix_pos() + 128
+    }
+
+    pub fn position_pos(&self) -> usize {
+        self.masked_position_pos() + 128
+    }
+
     pub fn useful_bits(&self) -> usize {
         self.const_pos() + 1
     }
 
-    /// Inputs: the word, its zero mask, and a zero check word. Outputs: one
-    /// single-bit word per level. Wiring the check word as an input is
+    /// Inputs: the word, its zero mask, a zero check word, and the mask/prefix
+    /// defining `position = (word & position_mask) XOR position_prefix`.
+    /// Outputs: one single-bit word per level and the derived position word.
+    /// Wiring the check word as an input is
     /// essential: under the circuit's `C = I` convention the R1CS equations
     /// define it as `word & mask`; the surrounding circuit supplies zero,
     /// turning that definition into a selected-zero assertion.
@@ -500,8 +521,11 @@ impl BitSpreadTable {
             IoWord::input(0),
             IoWord::input(self.mask_pos() / 128),
             IoWord::input(self.check_pos() / 128),
+            IoWord::input(self.position_mask_pos() / 128),
+            IoWord::input(self.position_prefix_pos() / 128),
         ];
         s.extend((0..self.depth).map(|l| IoWord::output(self.out(l) / 128)));
+        s.push(IoWord::output(self.position_pos() / 128));
         s
     }
 
@@ -527,6 +551,21 @@ impl BitSpreadTable {
             // product and satisfy the relation.
             a[self.check_pos() + j] = vec![j];
             b[self.check_pos() + j] = vec![self.mask_pos() + j];
+
+            // The position mask and prefix are ordinary wired inputs.
+            for p in [self.position_mask_pos() + j, self.position_prefix_pos() + j] {
+                a[p] = vec![p];
+                b[p] = vec![gc];
+            }
+            // masked_j = word_j * position_mask_j.
+            a[self.masked_position_pos() + j] = vec![j];
+            b[self.masked_position_pos() + j] = vec![self.position_mask_pos() + j];
+            // position_j = masked_j + prefix_j.
+            a[self.position_pos() + j] = vec![
+                self.masked_position_pos() + j,
+                self.position_prefix_pos() + j,
+            ];
+            b[self.position_pos() + j] = vec![gc];
         }
         for l in 0..self.depth {
             // Bit 0 of output `l` IS index bit `l`.
@@ -572,6 +611,8 @@ impl BitSpreadTable {
         self.build_masked_witness(BitSpreadInput {
             word: input_word,
             zero_mask: 0,
+            position_mask: 0,
+            position_prefix: 0,
         })
     }
 
@@ -594,6 +635,26 @@ impl BitSpreadTable {
             // overlapping bit makes A*B != z exactly where zerocheck reads.
             a[self.check_pos() + j] = v;
             b[self.check_pos() + j] = mask;
+
+            let position_mask = (input.position_mask >> j) & 1 == 1;
+            z[self.position_mask_pos() + j] = position_mask;
+            a[self.position_mask_pos() + j] = position_mask;
+            b[self.position_mask_pos() + j] = true;
+
+            let prefix = (input.position_prefix >> j) & 1 == 1;
+            z[self.position_prefix_pos() + j] = prefix;
+            a[self.position_prefix_pos() + j] = prefix;
+            b[self.position_prefix_pos() + j] = true;
+
+            let masked = v && position_mask;
+            z[self.masked_position_pos() + j] = masked;
+            a[self.masked_position_pos() + j] = v;
+            b[self.masked_position_pos() + j] = position_mask;
+
+            let position = masked ^ prefix;
+            z[self.position_pos() + j] = position;
+            a[self.position_pos() + j] = position;
+            b[self.position_pos() + j] = true;
         }
         for l in 0..self.depth {
             let v = (input.word >> l) & 1 == 1;
@@ -646,6 +707,10 @@ impl BitSpreadTable {
 pub struct BitSpreadInput {
     pub word: u128,
     pub zero_mask: u128,
+    /// Bits retained from `word` in the derived position output.
+    pub position_mask: u128,
+    /// Fixed high-bit stratum inserted into the derived position output.
+    pub position_prefix: u128,
 }
 
 // ---------------------------------------------------------------------------
@@ -824,10 +889,7 @@ impl PowMaskTable {
         nu: usize,
     ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
         use rayon::prelude::*;
-        let per: Vec<[Vec<bool>; 3]> = rows
-            .par_iter()
-            .map(|&i| self.build_witness(i))
-            .collect();
+        let per: Vec<[Vec<bool>; 3]> = rows.par_iter().map(|&i| self.build_witness(i)).collect();
         scatter_zab(&per, self.k(), self.useful_bits(), nu)
     }
 
@@ -839,10 +901,7 @@ impl PowMaskTable {
         dst: flock_core::union::SlotWitnessDest<'_>,
     ) -> Vec<u8> {
         use rayon::prelude::*;
-        let per: Vec<[Vec<bool>; 3]> = rows
-            .par_iter()
-            .map(|&i| self.build_witness(i))
-            .collect();
+        let per: Vec<[Vec<bool>; 3]> = rows.par_iter().map(|&i| self.build_witness(i)).collect();
         scatter_zab_into(&per, self.k(), self.useful_bits(), dst)
     }
 }

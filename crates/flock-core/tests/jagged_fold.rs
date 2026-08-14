@@ -10,9 +10,7 @@
 
 use flock_core::challenger::FsChallenger;
 use flock_core::field::F128;
-use flock_core::matrix_fold::{
-    self, JaggedClaim, JaggedRowWeight, JaggedTable, MatrixClaim,
-};
+use flock_core::matrix_fold::{self, JaggedClaim, JaggedRowWeight, JaggedTable, MatrixClaim};
 use flock_core::pcs::jagged::JaggedParams;
 
 struct Rng(u64);
@@ -65,7 +63,11 @@ fn w_reference(weights: &[F128], prefix: &[u64], m: usize, rho: &[F128]) -> F128
         let mut term = w;
         for l in 0..=m {
             let (rc, rd) = (rho[2 * l], rho[2 * l + 1]);
-            term *= if (t_c >> l) & 1 == 1 { rc } else { F128::ONE + rc };
+            term *= if (t_c >> l) & 1 == 1 {
+                rc
+            } else {
+                F128::ONE + rc
+            };
             term *= if (t_next >> l) & 1 == 1 {
                 rd
             } else {
@@ -94,8 +96,7 @@ fn dense_eq(point: &[F128]) -> Vec<F128> {
 /// The realistic mixed shape: live runs, interior zero-height columns, a
 /// zero tail. Area 45 in a 2^6 dense bound; 32 layout columns.
 const HEIGHTS: [u64; 32] = [
-    3, 7, 0, 5, 1, 0, 0, 9, 4, 0, 2, 6, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0,
+    3, 7, 0, 5, 1, 0, 0, 9, 4, 0, 2, 6, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 const N: usize = 4;
 const M: usize = 6;

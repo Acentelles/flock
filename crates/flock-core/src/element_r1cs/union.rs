@@ -189,7 +189,9 @@ pub enum VerifyError {
     },
     /// A lincheck PoW witness did not satisfy the difficulty that protects
     /// its following Fiat--Shamir challenge.
-    LincheckGrindingInvalid { which: &'static str },
+    LincheckGrindingInvalid {
+        which: &'static str,
+    },
     /// The lincheck's final consistency check `running == Ĉomb(r'_col)·z_eval`
     /// failed.
     LincheckFinalFailed,
@@ -235,9 +237,17 @@ pub fn prove_with_grinding<C: Challenger>(
     // `O(2^E)`. Bit-identical to the dense path — see `zerocheck::RowSupport`.
     let support = row_support(&slots, nu, e_vars);
     let (zc_proof, zc) = zerocheck::prove_with_support_with_grinding(
-        ZC_LABEL, pa, pb, z, e_vars, nu, Some(&support), grinding, ch,
+        ZC_LABEL,
+        pa,
+        pb,
+        z,
+        e_vars,
+        nu,
+        Some(&support),
+        grinding,
+        ch,
     );
-    let (va, vb) = strip_constants(&slots, nu, &zc);
+    let (va, vb, _, _) = strip_constants(&slots, nu, &zc);
 
     // ---- Phase 2: the column-domain lincheck with the per-slot collapse.
     ch.observe_label(LC_LABEL);
@@ -335,15 +345,10 @@ pub fn verify_deferred_with_grinding<C: Challenger>(
         });
     }
 
-    let zc = zerocheck::verify_with_label_and_grinding(
-        ZC_LABEL,
-        e_vars,
-        &proof.zerocheck,
-        grinding,
-        ch,
-    )
-        .map_err(VerifyError::Zerocheck)?;
-    let (va, vb) = strip_constants(&slots, nu, &zc);
+    let zc =
+        zerocheck::verify_with_label_and_grinding(ZC_LABEL, e_vars, &proof.zerocheck, grinding, ch)
+            .map_err(VerifyError::Zerocheck)?;
+    let (va, vb, a_const_eval, b_const_eval) = strip_constants(&slots, nu, &zc);
 
     ch.observe_label(LC_LABEL);
     let expected_nonces = grinding.lincheck_nonce_count(lc_rounds);
@@ -396,6 +401,8 @@ pub fn verify_deferred_with_grinding<C: Challenger>(
         evals: proof.lincheck.matrix_evals.clone(),
         z_eval: proof.lincheck.z_eval,
         target: running,
+        a_const_eval,
+        b_const_eval,
     };
 
     Ok((
@@ -443,7 +450,11 @@ fn assemble_claims(
 /// sum away by partition of unity and the slot contributes
 /// `eq(r[ν+κ_t..], q_t) · Σ_c eq(r[ν..ν+κ_t], c)·a_const_t[c]`. Gaps
 /// contribute nothing (no slot owns them). `O(Σ_t 2^{κ_t})`.
-fn strip_constants(slots: &[RegionSlot<'_>], nu: usize, zc: &zerocheck::Claim) -> (F128, F128) {
+fn strip_constants(
+    slots: &[RegionSlot<'_>],
+    nu: usize,
+    zc: &zerocheck::Claim,
+) -> (F128, F128, F128, F128) {
     let mut a_sum = F128::ZERO;
     let mut b_sum = F128::ZERO;
     for s in slots {
@@ -459,7 +470,7 @@ fn strip_constants(slots: &[RegionSlot<'_>], nu: usize, zc: &zerocheck::Claim) -
         a_sum += w * dot(s.ty.a_const());
         b_sum += w * dot(s.ty.b_const());
     }
-    (zc.ea + a_sum, zc.eb + b_sum)
+    (zc.ea + a_sum, zc.eb + b_sum, a_sum, b_sum)
 }
 
 /// `Π_j eq(coords[j], bit_j(bits))` — the eq factor freezing `coords` to the
@@ -560,6 +571,11 @@ pub struct ElementAssertion {
     pub z_eval: F128,
     /// What `Ĉomb·z_eval` must equal — the sumcheck's running claim.
     pub target: F128,
+    /// Evaluations of the registry-static affine constant vectors at
+    /// `r_con`. They are folded into the circuit-structure accumulator on
+    /// recursive paths, binding the zerocheck-to-lincheck strip.
+    pub a_const_eval: F128,
+    pub b_const_eval: F128,
 }
 
 impl ElementAssertion {
@@ -1267,9 +1283,7 @@ mod tests {
         let lc_rounds = e_vars - nu;
 
         let mut ch_p = FsChallenger::new(b"element-region-grinding");
-        let (proof, claims_p) = prove_with_grinding(
-            &union, &z, &pa, &pb, grinding, &mut ch_p,
-        );
+        let (proof, claims_p) = prove_with_grinding(&union, &z, &pa, &pb, grinding, &mut ch_p);
         assert_eq!(
             proof.zerocheck.grinding_nonces.len(),
             grinding.zerocheck_nonce_count(e_vars)

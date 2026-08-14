@@ -148,9 +148,10 @@ impl MerklePathGrinding {
         if self.initial_bits == 0 {
             0
         } else {
-            self.initial_bits.max(flock_core::challenger::grinding_bits_for_degree(
-                n.max(path_log + 1),
-            ))
+            self.initial_bits
+                .max(flock_core::challenger::grinding_bits_for_degree(
+                    n.max(path_log + 1),
+                ))
         }
     }
 
@@ -887,28 +888,12 @@ mod tests {
         let policy = MerklePathGrinding::per_challenge_128();
         let mut chp = FsChallenger::new(b"merkle-path-grinding-test");
         let (proof, claims_p) = prove_merkle_path_shift_with_grinding(
-            path_log,
-            &x_l,
-            &x_r,
-            &z,
-            &iv,
-            &b,
-            layout,
-            policy,
-            &mut chp,
+            path_log, &x_l, &x_r, &z, &iv, &b, layout, policy, &mut chp,
         );
         let leaves = vec![leaf; 1 << path_log];
         let mut chv = FsChallenger::new(b"merkle-path-grinding-test");
         let claims_v = verify_merkle_path_shift_with_grinding(
-            path_log,
-            &proof,
-            &leaves,
-            root,
-            &b,
-            n,
-            layout,
-            policy,
-            &mut chv,
+            path_log, &proof, &leaves, root, &b, n, layout, policy, &mut chv,
         )
         .expect("grinded Merkle-path shift verifies");
         assert_eq!(claims_p, claims_v);
@@ -918,15 +903,7 @@ mod tests {
         let mut chv = FsChallenger::new(b"merkle-path-grinding-test");
         assert_eq!(
             verify_merkle_path_shift_with_grinding(
-                path_log,
-                &missing,
-                &leaves,
-                root,
-                &b,
-                n,
-                layout,
-                policy,
-                &mut chv,
+                path_log, &missing, &leaves, root, &b, n, layout, policy, &mut chv,
             ),
             Err(MerklePathError::InvalidGrinding)
         );
