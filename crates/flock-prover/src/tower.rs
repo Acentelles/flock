@@ -16,6 +16,12 @@
 //! (`cargo test -p flock-prover --lib tower::`); the mvp-history tests and
 //! env-var profile plumbing are scheduled for removal in stages 2-4.
 
+use crate::challenger::FsChallenger;
+use crate::prover::{self, UnionSlotProverInput};
+use crate::r1cs_hashes::blake3;
+use crate::r1cs_hashes::merkle_r1cs::{ChunkPathInput, MerkleTreeLayout, SLOT_WORDS, blake3_spec};
+use crate::schedule::TableType;
+use crate::union::UnionInstance;
 use flock_core::circuit::builder::{CircuitBuilder, GateType, ShapeBuilder, SlotWitness, Wire};
 use flock_core::field::{F128, F256};
 use flock_core::matrix_fold::{MatrixClaim, Weight};
@@ -23,14 +29,6 @@ use flock_core::merkle::{self as core_merkle, HashKind};
 use flock_core::pcs::PcsParams;
 use flock_core::pcs::ligerito::LigeritoProfile;
 use flock_core::verifier;
-use crate::challenger::FsChallenger;
-use crate::prover::{self, UnionSlotProverInput};
-use crate::r1cs_hashes::blake3;
-use crate::r1cs_hashes::merkle_r1cs::{
-    ChunkPathInput, MerkleTreeLayout, SLOT_WORDS, blake3_spec,
-};
-use crate::schedule::TableType;
-use crate::union::UnionInstance;
 
 /// The L0 interleave for a content-sized commit: the embedded config's
 /// own `initial_k` (6 everywhere except m29 Fast/Slim = 5 — the
@@ -41,57 +39,57 @@ fn pcs_batch_for(union: &UnionInstance, profile: LigeritoProfile) -> usize {
     flock_core::pcs::ligerito::embedded_initial_k_or_default(union.dense_m(), profile)
 }
 
-fn pcs_batch(union: &UnionInstance) -> usize {
-    pcs_batch_for(union, LigeritoProfile::Fast)
-}
-
-/// `TOWER_PROFILE=slim` flips the RECURSION-PATH commits (the leaf's
-/// workload inner, the leaf outer, the node outer) to Slim — rate 1/4,
-/// roughly half the strict-profile queries (m29: Σq 347 vs Fast's 629), so the
-/// openings-dominated b3 trace shrinks with q while the doubled codeword
-/// lands on the native NTT+Merkle side. `TOWER_PROFILE=secure` selects the
-/// Secure PCS schedules and every Secure algebraic-grinding policy exercised
-/// by the recursive path (Boolean, element, opening, and fold families).
-/// Default Fast; the legacy mvp tests stay Fast unconditionally.
-fn tower_profile() -> LigeritoProfile {
-    match std::env::var("TOWER_PROFILE").as_deref() {
-        Ok("slim") => LigeritoProfile::Slim,
-        Ok("slim128") => LigeritoProfile::Slim128,
-        Ok("secure") => LigeritoProfile::Secure,
-        // The 100-bit recursion variants: Fast/Slim analysis and transcript
-        // shape at the pre-list-decoding query schedules. slim100 is the
-        // chain track's envelope profile at the old fixed point.
-        Ok("fast100") => LigeritoProfile::Fast100,
-        Ok("fast128") => LigeritoProfile::Fast128,
-        Ok("slim100") => LigeritoProfile::Slim100,
-        _ => LigeritoProfile::Fast,
-    }
-}
-
-/// Security level for the chain leaf's WORKLOAD inner proof.
+/// The two production recursion towers. The LEAF (the application's chain
+/// segment — the workload inner proof) proves under the rate-1/2 Fast twin
+/// of the tower's security level; the OUTERS (FL / internal / spine) prove
+/// under the Slim twin at the m* = 29 / nu* = 14 envelope, always ON.
 ///
-/// Historically hardcoded to `Fast`, which on this branch is the 128-bit
-/// strict-list-decoding schedule (574 queries) — so a `slim100` recursion was
-/// silently carrying a 128-bit leaf, and the extra query openings ballooned
-/// the FL's replayed transcript (18.1k rows/leaf) past the arity-2 envelope.
-/// A 100-bit recursion should carry a 100-bit leaf. We use `Fast100` (not
-/// `Slim100`) so the leaf stays rate-1/2 with the SAME tape structure as
-/// `Fast` — only the query count drops (574 -> 448) — which keeps the FL/node
-/// tape walkers unchanged. A 128-bit recursion keeps the 128-bit `Fast` leaf.
-fn chain_leaf_profile() -> LigeritoProfile {
-    match tower_profile() {
-        LigeritoProfile::Fast100 | LigeritoProfile::Slim100 => LigeritoProfile::Fast100,
-        // The aggressive 128-bit recursion carries the aggressive leaf:
-        // rate-1/2 like Fast (same tape structure, the walkers are
-        // unchanged), but on the rate+2 ladder — m32: Σq 675 → 527, which
-        // is what shrinks the FL's replayed b3 trace under the envelope.
-        LigeritoProfile::Fast128 | LigeritoProfile::Slim128 => LigeritoProfile::Fast128,
-        _ => LigeritoProfile::Fast,
+/// Fast leaf + Slim outers is deliberate. The leaf keeps the SAME tape
+/// structure as Fast (the FL/node tape walkers are level-blind), while its
+/// query count follows the tower's security level: a 100-bit recursion
+/// carries a 100-bit leaf (Fast100, 448q — a 128-bit leaf under a 100-bit
+/// recursion balloons the FL's replayed transcript past the arity-2
+/// envelope), and the 128-bit aggressive recursion carries the aggressive
+/// Fast128 leaf (rate-1/2 on the rate+2 ladder; m32: Σq 675 → 527).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TowerConfig {
+    /// The 100-bit tower: Fast100 leaf, Slim100 outers.
+    Chain100,
+    /// The 128-bit tower on the aggressive rate ladder: Fast128 leaf,
+    /// Slim128 outers.
+    Chain128,
+}
+
+impl TowerConfig {
+    /// The chain leaf's WORKLOAD inner-proof profile (rate 1/2).
+    pub fn leaf_profile(self) -> LigeritoProfile {
+        match self {
+            TowerConfig::Chain100 => LigeritoProfile::Fast100,
+            TowerConfig::Chain128 => LigeritoProfile::Fast128,
+        }
+    }
+    /// The recursion-path OUTER profile (rate 1/4, envelope-ON).
+    pub fn outer_profile(self) -> LigeritoProfile {
+        match self {
+            TowerConfig::Chain100 => LigeritoProfile::Slim100,
+            TowerConfig::Chain128 => LigeritoProfile::Slim128,
+        }
     }
 }
 
-fn tower_fold_grinding() -> flock_core::matrix_fold::FoldGrinding {
-    let profile = tower_profile();
+/// Bench/test knob: which production tower the ignored tower tests and
+/// benches exercise. `TOWER_CONFIG=chain100` selects [`TowerConfig::Chain100`];
+/// the default is the 128-bit production tower.
+#[cfg(test)]
+fn test_config() -> TowerConfig {
+    match std::env::var("TOWER_CONFIG").as_deref() {
+        Ok("chain100") => TowerConfig::Chain100,
+        _ => TowerConfig::Chain128,
+    }
+}
+
+fn tower_fold_grinding(cfg: TowerConfig) -> flock_core::matrix_fold::FoldGrinding {
+    let profile = cfg.outer_profile();
     PcsParams {
         m: 22,
         log_inv_rate: profile.log_inv_rate(),
@@ -108,26 +106,12 @@ fn tower_fold_grinding() -> flock_core::matrix_fold::FoldGrinding {
 /// ONE shape regardless of level (an L1 node's leaf children carry the
 /// same query geometry as an L2 node's node children).
 ///
-/// OPT-IN via `TOWER_ENV_M` while the m* fork is open (measured
-/// 2026-08-06 at slim): `TOWER_ENV_M=28` converges leaf+L1 geometry
-/// (leaf prove 50→58, L1 = m28/nu 14/174.2 KiB, all green) but the
-/// grown child proofs push L2's content over its 98%-full 2^21 boundary
-/// → L2 dense_m 29, prove ~123→~157. The fork: m* = 29 (simple, slack,
-/// ~+30 ms/node) vs m* = 28 (tight; needs the mac shave −8k words +
-/// publics arithmetization −40k+ at the fixed point). No default until
-/// the call is made.
-fn envelope_floor_m() -> Option<usize> {
-    if let Ok(v) = std::env::var("TOWER_ENV_M") {
-        return v.parse().ok();
-    }
-    // Ron's call 2026-08-06: m* = 29 FIRST (the fixed point closes with
-    // ~2x slack; every slim level commits m29), re-target the tight 28
-    // later via the mac shave + publics diet — one deliberate re-pin.
-    match tower_profile() {
-        LigeritoProfile::Slim | LigeritoProfile::Slim100 | LigeritoProfile::Slim128 => Some(29),
-        _ => None,
-    }
-}
+/// Ron's call 2026-08-06: m* = 29 (the fixed point closes with ~2x slack;
+/// every Slim level commits m29). Re-targeting the tight m* = 28 (needs
+/// the mac shave −8k words + publics arithmetization −40k+ at the fixed
+/// point) is a deliberate future re-pin; `envelope_content_probe` is the
+/// instrument that sizes it.
+const ENVELOPE_FLOOR_M: usize = 29;
 
 /// A recursion-path OUTER's union instance, with the envelope floor
 /// applied. Every instance over a leaf/node OUTER shape must come from
@@ -138,9 +122,7 @@ fn outer_union<'r>(
     counts: Vec<usize>,
 ) -> UnionInstance<'r> {
     let mut u = UnionInstance::new(registry, counts);
-    if let Some(m) = envelope_floor_m() {
-        u.set_dense_floor(m);
-    }
+    u.set_dense_floor(ENVELOPE_FLOOR_M);
     u
 }
 
@@ -194,11 +176,6 @@ struct EnvShape {
 /// The APPLICATION STATEMENT's width in the envelope's public segment: the
 /// hash-chain PoC's span `(h_start, h_end)`, eight 128-bit words.
 const ENV_APP_WORDS: usize = 8;
-
-/// Per-arm lane-pin override for experiments that need TWO pins in one
-/// process (the FL-arity A/B: the 2-ary arm at the shipped 24, the wide
-/// arm at its own content). 0 = unset — `ENV_LANES` / the default apply.
-static ENV_LANES_OVERRIDE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Steady-repetition override: how many EXTRA times a builder re-runs its
 /// ONLINE phases (tapes + walk + witgen + prove + verify) over the
@@ -270,12 +247,7 @@ fn env_free_counts() -> bool {
 
 fn outer_lanes(union: &UnionInstance, log_batch_size: usize) -> Option<usize> {
     let content = union.commit_lanes(log_batch_size);
-    let Some(env) = envelope_shape() else {
-        return content;
-    };
-    if !env_free_counts() {
-        return content;
-    }
+    let env = envelope_shape();
     let c = content.unwrap_or(1usize << log_batch_size);
     assert!(
         c <= env.lanes,
@@ -321,8 +293,8 @@ struct EnvTail<'w> {
 /// convergence below is pinned to m* = 29's measured geometry, so a
 /// `TOWER_ENV_M` override other than 29 gets the dense floor only (an
 /// experiment, not the envelope).
-fn envelope_shape() -> Option<EnvShape> {
-    (envelope_floor_m() == Some(29)).then(|| EnvShape {
+fn envelope_shape() -> EnvShape {
+    EnvShape {
         // The two-child envelope fits at 14 after consolidating the F256
         // residual tables and assigning each independent child verifier to
         // its own identical BLAKE slot. Every physical slot remains below
@@ -392,24 +364,8 @@ fn envelope_shape() -> Option<EnvShape> {
         // count at min-one-row. F256 raises the largest live content to 25
         // lanes; 31 stays below `2^initial_k = 32`, so children remain
         // lane-major.
-        // `ENV_LANES=n` re-pins it for EXPERIMENTS (the FL-arity pricing
-        // runs: a wider FL's content overflows 24) — a mixed-pin tower dies
-        // on the digest asserts, so misuse is loud, never silent. The
-        // atomic override serves the SAME experiments when two pins must
-        // coexist in one process (per-arm in the arity A/B; `set_var` is
-        // unsafe in edition 2024).
-        lanes: {
-            let ov = ENV_LANES_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
-            if ov != 0 {
-                ov
-            } else {
-                std::env::var("ENV_LANES")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(31)
-            }
-        },
-    })
+        lanes: 31,
+    }
 }
 
 /// Find-or-create a slot under this file's keyed-cache scheme (lanes /
@@ -1642,7 +1598,6 @@ impl GateType for LeafEvalGate256 {
 // MVP-5: every level's query phase
 // ---------------------------------------------------------------------------
 
-
 // ---------------------------------------------------------------------------
 // The collapsed opening: wiring over ONE BLAKE3 table
 // ---------------------------------------------------------------------------
@@ -1755,8 +1710,8 @@ fn emit_fs_chain_partitioned(
     pub_payloads: &[bool],
     cross: &[Option<(usize, usize)>],
 ) -> (Vec<Vec<Wire>>, Vec<Option<Wire>>) {
-    use flock_core::transcript_record::StreamWord;
     use crate::r1cs_hashes::fs_chain::CvSource;
+    use flock_core::transcript_record::StreamWord;
     let mut word_wire: Vec<Option<Wire>> = vec![None; stream.words.len()];
     let mut outs: Vec<Vec<Wire>> = Vec::with_capacity(trace.rows.len());
     let mut gate_in: Vec<[Wire; 7]> = Vec::with_capacity(trace.rows.len());
@@ -1936,8 +1891,8 @@ fn merge_chain(
     values: &[F128],
     payloads: &[Vec<u8>],
 ) -> MergedChain {
-    use flock_core::transcript_record::StreamWord;
     use crate::r1cs_hashes::fs_chain::{CvSource, Link, trace_duplex_forked};
+    use flock_core::transcript_record::StreamWord;
     let chains = trace_duplex_forked(ops, stream, values, payloads);
     let parent_bytes = stream.to_bytes(values, payloads);
     if chains.children.is_empty() {
@@ -2176,8 +2131,7 @@ fn assert_chain_replays(
         for j in 0..n {
             let (row, word) = trace.squeeze_words[fin][j];
             let (cv, m, counter, blen, flags) = trace.rows[row];
-            let out =
-                crate::r1cs_hashes::blake3::blake3_compress(&cv, &m, counter, blen, flags);
+            let out = crate::r1cs_hashes::blake3::blake3_compress(&cv, &m, counter, blen, flags);
             let mut b = [0u8; 16];
             for (i, w) in out[word * 4..word * 4 + 4].iter().enumerate() {
                 b[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
@@ -6205,9 +6159,9 @@ fn recursive_pow_relation_accepts_valid_and_rejects_invalid_nonce() {
         let pcs = PcsParams {
             m: union.dense_m(),
             log_inv_rate: 1,
-            log_batch_size: pcs_batch(&union),
+            log_batch_size: pcs_batch_for(&union, LigeritoProfile::Fast),
             profile: LigeritoProfile::Fast,
-            num_lanes: union.commit_lanes(pcs_batch(&union)),
+            num_lanes: union.commit_lanes(pcs_batch_for(&union, LigeritoProfile::Fast)),
             merkle_hash: HashKind::Blake3,
         };
         let b3_r1cs = blake3::build_block_r1cs(nu);
@@ -9499,9 +9453,9 @@ fn chain_probe_boolean_only_wired_union() {
     let pcs_params = PcsParams {
         m: union.dense_m(),
         log_inv_rate: 1,
-        log_batch_size: pcs_batch(&union),
+        log_batch_size: pcs_batch_for(&union, LigeritoProfile::Fast),
         profile: LigeritoProfile::Fast,
-        num_lanes: union.commit_lanes(pcs_batch(&union)),
+        num_lanes: union.commit_lanes(pcs_batch_for(&union, LigeritoProfile::Fast)),
         merkle_hash: HashKind::Blake3,
     };
     let blake_r1cs = blake3::build_block_r1cs(nu);
@@ -9713,7 +9667,7 @@ struct ChainProof {
 /// A chain leaf. The SHAPE build is per-shape setup (statement-independent
 /// — the digest pin), the WALK is per-statement and is the chain compute
 /// itself, so it is reported apart from the proving phases.
-fn build_chain_proof(h_start: [u32; 16], n_blocks: usize) -> ChainProof {
+fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) -> ChainProof {
     let t_shape = std::time::Instant::now();
     let cs: ChainShape = chain_shape_cached(n_blocks).as_ref().clone();
     let shape_ms = t_shape.elapsed().as_secs_f64() * 1e3;
@@ -9738,12 +9692,14 @@ fn build_chain_proof(h_start: [u32; 16], n_blocks: usize) -> ChainProof {
         let pcs_params = PcsParams {
             m: union.dense_m(),
             log_inv_rate: 1,
-            // The chain leaf's WORKLOAD inner: honor the tower profile's
-            // security level instead of always paying 128-bit Fast. A 100-bit
-            // recursion (slim100/fast100) should not carry a 128-bit leaf.
-            profile: chain_leaf_profile(),
-            log_batch_size: pcs_batch(&union),
-            num_lanes: union.commit_lanes(pcs_batch(&union)),
+            // The chain leaf's WORKLOAD inner: the tower's security level,
+            // rate 1/2 (a 100-bit recursion carries a 100-bit leaf). The
+            // batch is keyed by the SAME profile as the params — the old
+            // Fast-keyed batch only worked because the Fast twins share
+            // initial_k at these m's.
+            profile: cfg.leaf_profile(),
+            log_batch_size: pcs_batch_for(&union, cfg.leaf_profile()),
+            num_lanes: union.commit_lanes(pcs_batch_for(&union, cfg.leaf_profile())),
             merkle_hash: HashKind::Blake3,
         };
         let t1 = std::time::Instant::now();
@@ -9844,6 +9800,7 @@ fn build_chain_proof(h_start: [u32; 16], n_blocks: usize) -> ChainProof {
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn chain_proof_message_chain_roundtrip_and_tampers() {
+    let cfg = test_config();
     let n_blocks = 256usize;
     let mut rng = Rng(0xC4A1_0002);
     let h_start: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
@@ -9852,7 +9809,7 @@ fn chain_proof_message_chain_roundtrip_and_tampers() {
     // both assertion families and cross-checks h_end against the native
     // chain. Determinism of the statement: a second build from the same
     // h_start yields the same h_end.
-    let cp = build_chain_proof(h_start, n_blocks);
+    let cp = build_chain_proof(cfg, h_start, n_blocks);
     assert_eq!(cp.h_end, native_chain(&h_start, n_blocks));
     assert_eq!(cp.inner.nu, 8);
 
@@ -9976,10 +9933,11 @@ fn chain_proof_message_chain_roundtrip_and_tampers() {
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn chain_tape_regions_pinned() {
+    let cfg = test_config();
     let mut rng = Rng(0xC4A1_0003);
     let h_start: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
     let n_blocks = 256usize;
-    let cp = build_chain_proof(h_start, n_blocks);
+    let cp = build_chain_proof(cfg, h_start, n_blocks);
     let ct = ChildTape::new(&cp.inner, DOMAIN);
 
     // The boolean-only shape facts.
@@ -10025,9 +9983,10 @@ fn chain_tape_regions_pinned() {
 #[test]
 #[ignore]
 fn chain_child_region_emits_alone() {
+    let cfg = test_config();
     let mut rng = Rng(0xC4A1_0005);
     let h_start: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
-    let cp = build_chain_proof(h_start, 256);
+    let cp = build_chain_proof(cfg, h_start, 256);
     let ct = ChildTape::new(&cp.inner, DOMAIN);
     let nu2 = (ct.b3_rows.next_power_of_two().trailing_zeros() as usize).max(3);
     let mut sb = ShapeBuilder::new(nu2);
@@ -10156,8 +10115,8 @@ fn record_chain_child_verify(
     .expect("the chain child verifies (recorded)");
 }
 
-fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
-    build_fl_node_k(&[cp0, cp1])
+fn build_fl_node(cfg: TowerConfig, cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
+    build_fl_node_k(cfg, &[cp0, cp1])
 }
 
 /// The k-ARY first-level node (the FL-arity lever): `k` adjacent chain
@@ -10165,7 +10124,7 @@ fn build_fl_node(cp0: &ChainProof, cp1: &ChainProof) -> FlNode {
 /// group, adjacency as k−1 four-word seams, the app statement the combined
 /// span. `k = 2` emits in exactly the historical two-child order — every
 /// existing gate rides the wrapper above unchanged.
-fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
+fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
     use flock_core::aggregate;
     use flock_core::matrix_fold::{FoldProof, MatrixClaim};
     use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
@@ -10235,7 +10194,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
         &[(&cp0.inner.built.shape.circuit, sigmas.iter().collect())],
         &jagged_p,
         &[],
-        tower_fold_grinding(),
+        tower_fold_grinding(cfg),
         &mut chp,
     )
     .expect("the first-level fold proves");
@@ -10248,7 +10207,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
         &jagged_v,
         &[],
         &agg,
-        tower_fold_grinding(),
+        tower_fold_grinding(cfg),
         &mut rec,
     )
     .expect("the first-level fold verifies");
@@ -10289,12 +10248,12 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
         Op::ObserveBytes(1),
     ];
     let n_uni = fold_claims.len() - 1;
-    want.extend(fold_region_ops(&fold_claims[..n_uni]));
+    want.extend(fold_region_ops(cfg, &fold_claims[..n_uni]));
     // The sigma group binds per key now (wall 3): its label + digest
     // precede the fold, exactly as the jagged groups bind.
     want.push(Op::Label(b"flock-aggregate-sigma-v1".to_vec()));
     want.push(Op::ObserveBytes(32));
-    want.extend(fold_region_ops(&fold_claims[n_uni..]));
+    want.extend(fold_region_ops(cfg, &fold_claims[n_uni..]));
     // The jagged group rides the SAME tape after the uniform folds.
     let jagged_keys: Vec<([u8; 32], Vec<flock_core::matrix_fold::JaggedClaim>)> = vec![(
         chain_digest,
@@ -10302,7 +10261,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
             .flat_map(|a| a.claims().into_iter().cloned())
             .collect(),
     )];
-    want.extend(jagged_fold_region_ops(&jagged_keys));
+    want.extend(jagged_fold_region_ops(cfg, &jagged_keys));
     assert_eq!(ops, want.as_slice(), "the first-level fold tape shape");
     assert_eq!(
         rec.payloads()[0],
@@ -10367,26 +10326,13 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
         assert_chain_replays(&ops, &trace, &chals);
 
         let env = envelope_shape();
-        let split_b3 = tapes.len() == 2
-            && (env.is_some()
-                || matches!(
-                    tower_profile(),
-                    LigeritoProfile::Fast | LigeritoProfile::Fast128
-                ));
+        let split_b3 = tapes.len() == 2;
         let (fold_b3_primary_rows, b3_rows) = if split_b3 {
             let a = tapes[0].b3_rows;
             let b = tapes[1].b3_rows;
             let unsplit = (a + trace.rows.len()).max(b);
             let (on_a, balanced) = balance_extra_rows(a, b, trace.rows.len());
-            let envelope_needs_balance = env.as_ref().is_some_and(|e| unsplit > (1usize << e.nu));
-            if envelope_needs_balance
-                || (env.is_none()
-                    && matches!(
-                        tower_profile(),
-                        LigeritoProfile::Fast | LigeritoProfile::Fast128
-                    )
-                    && balanced.next_power_of_two() < unsplit.next_power_of_two())
-            {
+            if unsplit > (1usize << env.nu) {
                 (Some(on_a), balanced)
             } else {
                 (None, unsplit)
@@ -10404,34 +10350,22 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
         // padded public segment and the m* dense floor. Then a parent's walk
         // over an FL child is row-identical to its walk over an internal
         // child, which is what makes ONE internal circuit serve every level.
-        let nu2 = match &env {
-            Some(e) => {
-                assert!(
-                    nu2_content <= e.nu,
-                    "FL content nu {nu2_content} exceeds the envelope nu* {}",
-                    e.nu
-                );
-                e.nu
-            }
-            None => nu2_content,
-        };
+        assert!(
+            nu2_content <= env.nu,
+            "FL content nu {nu2_content} exceeds the envelope nu* {}",
+            env.nu
+        );
+        let nu2 = env.nu;
         let t_build = std::time::Instant::now();
         let mut sb = ShapeBuilder::new(nu2);
         let spread_own2 = tapes.iter().map(|t| t.spread_w).max().expect("children");
-        let (spread_w2, mut cs) = match &env {
-            Some(e) => {
-                assert!(
-                    spread_own2 <= e.spread_w,
-                    "chain-child ladder depth {spread_own2} exceeds the envelope spread width {}",
-                    e.spread_w
-                );
-                (e.spread_w, ChildSlots::new_env(&mut sb, nu2, e))
-            }
-            None => (
-                spread_own2,
-                ChildSlots::new_with_b3_split(&mut sb, nu2, spread_own2, split_b3),
-            ),
-        };
+        assert!(
+            spread_own2 <= env.spread_w,
+            "chain-child ladder depth {spread_own2} exceeds the envelope spread width {}",
+            env.spread_w
+        );
+        let spread_w2 = env.spread_w;
+        let mut cs = ChildSlots::new_env(&mut sb, nu2, &env);
         let mut vals: Vec<F128> = Vec::new();
         let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
         let mut consts: Vec<(F128, Wire)> = Vec::new();
@@ -10797,16 +10731,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
             acc_chain_w.extend_from_slice(&fp.rho_row);
             acc_chain_w.push(fp.value);
         }
-        let fold_pub_base = match &env {
-            Some(e) => env_acc_chain_base(e),
-            None => {
-                let b = sb.public_len();
-                for &w in &acc_chain_w {
-                    sb.publish(w);
-                }
-                b
-            }
-        };
+        let fold_pub_base = env_acc_chain_base(&env);
         // The value-binding publics stay in the BODY: nothing above reads
         // them, they only bind the claim values this outer folded.
         for k in 0..k_ary {
@@ -10822,32 +10747,23 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
             .map(|j| regions[0].child_pub_w[3 + j])
             .chain((0..4).map(|j| regions[k_ary - 1].child_pub_w[11 - 4 + j]))
             .collect();
-        let stmt_base = match &env {
-            Some(e) => {
-                pad_envelope_counts(
-                    &mut sb,
-                    &cs.q,
-                    &cs.env_cache(),
-                    e,
-                    zw,
-                    &mut hints,
-                    &mut vals,
-                    &mut consts,
-                    &EnvTail {
-                        acc_chain: &acc_chain_w,
-                        app: &app_w,
-                        ..EnvTail::default()
-                    },
-                );
-                env_app_base(e)
-            }
-            None => {
-                let b = sb.public_len();
-                for &w in &app_w {
-                    sb.publish(w);
-                }
-                b
-            }
+        let stmt_base = {
+            pad_envelope_counts(
+                &mut sb,
+                &cs.q,
+                &cs.env_cache(),
+                &env,
+                zw,
+                &mut hints,
+                &mut vals,
+                &mut consts,
+                &EnvTail {
+                    acc_chain: &acc_chain_w,
+                    app: &app_w,
+                    ..EnvTail::default()
+                },
+            );
+            env_app_base(&env)
         };
         let shape2 = sb.finish().expect("the first-level node circuit builds");
         let hint_refs: Vec<&(dyn std::any::Any + Sync)> = hints
@@ -10904,7 +10820,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
         // for BOTH the Merkle trees and the FS chain, so the node is
         // RECURSABLE (both recorded gotchas).
         let union2 = outer_union(&shape2.registry, shape2.counts.clone());
-        let pf = tower_profile();
+        let pf = cfg.outer_profile();
         let pcs2 = PcsParams {
             m: union2.dense_m(),
             log_inv_rate: pf.log_inv_rate(),
@@ -11207,12 +11123,13 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn first_level_node_two_chains_fold_and_adjacency() {
+    let cfg = test_config();
     let n_blocks = 256usize;
     let mut rng = Rng(0xC4A1_0004);
     let h0: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
-    let cp0 = build_chain_proof(h0, n_blocks);
-    let cp1 = build_chain_proof(cp0.h_end, n_blocks);
-    let fl = build_fl_node(&cp0, &cp1);
+    let cp0 = build_chain_proof(cfg, h0, n_blocks);
+    let cp1 = build_chain_proof(cfg, cp0.h_end, n_blocks);
+    let fl = build_fl_node(cfg, &cp0, &cp1);
     assert_eq!(fl.h_start, cp0.h_start);
     assert_eq!(fl.h_end, cp1.h_end);
     for j in 0..4 {
@@ -11244,74 +11161,6 @@ fn first_level_node_two_chains_fold_and_adjacency() {
     );
 }
 
-/// **The k-ARY FL, dev-size gate** (the FL-arity lever's correctness leg):
-/// three adjacent chain segments verified deferred in ONE first-level node —
-/// every discharge/adjacency/statement assert lives inside
-/// [`build_fl_node_k`]; this wrapper re-checks the surface and prints the
-/// arity ledger (publics vs the envelope body, content lanes vs lanes*,
-/// dense_m vs the m* floor — the three budgets arity spends).
-#[test]
-#[ignore] // Heavy — three chain proofs + one outer.
-fn fl_node_three_ary() {
-    let n_blocks: usize = std::env::var("CHAIN_BLOCKS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(256);
-    let mut rng = Rng(0xC4A1_00F3);
-    let h0: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
-    let mut cps_own = Vec::new();
-    let mut h = h0;
-    for _ in 0..3 {
-        let cp = build_chain_proof(h, n_blocks);
-        h = cp.h_end;
-        cps_own.push(cp);
-    }
-    let cps: Vec<&ChainProof> = cps_own.iter().collect();
-    let fl = build_fl_node_k(&cps);
-    assert_eq!(fl.h_start, h0);
-    assert_eq!(fl.h_end, native_chain(&h0, 3 * n_blocks), "span H^(3N)");
-    for j in 0..4 {
-        assert_eq!(
-            fl.lo.public[fl.stmt_base + j],
-            pack4(fl.h_start[4 * j..4 * j + 4].try_into().unwrap()),
-            "statement h_start"
-        );
-        assert_eq!(
-            fl.lo.public[fl.stmt_base + 4 + j],
-            pack4(fl.h_end[4 * j..4 * j + 4].try_into().unwrap()),
-            "statement h_end"
-        );
-    }
-    // The arity ledger: what a third child spends of each pinned budget.
-    let u = outer_union(&fl.lo.shape.registry, fl.lo.shape.counts.clone());
-    let content_u = UnionInstance::new(&fl.lo.shape.registry, fl.lo.shape.counts.clone());
-    let batch = pcs_batch_for(&u, tower_profile());
-    println!(
-        "\n3-ARY FIRST-LEVEL NODE (three adjacent chain proofs in ONE fold)\n  \
-         span H^{}(h_start) | nu {} | mu {} | proof {:.1} KiB\n  \
-         publics {} | dense_m {} (content {}) | lanes content {:?} vs pin {:?}\n  \
-         ONLINE: walk {:.1} + tapes {:.1} + witgen {:.1} + prove {:.1} = {:.1} ms | verify {:.1}\n",
-        3 * n_blocks,
-        fl.lo.shape.circuit.cells().nu(),
-        fl.lo.shape.circuit.cells().mu(),
-        bincode::serialize(&fl.lo.proof)
-            .map(|b| b.len())
-            .unwrap_or(0) as f64
-            / 1024.0,
-        fl.lo.public.len(),
-        u.dense_m(),
-        content_u.dense_m(),
-        content_u.commit_lanes(batch),
-        fl.lo.pcs.num_lanes,
-        fl.t.walk_ms,
-        fl.t.tapes_ms,
-        fl.t.witgen_ms,
-        fl.t.prove_ms,
-        fl.t.total(),
-        fl.t.verify_ms,
-    );
-}
-
 /// **THE ENVELOPE CONTENT PROBE** — the m\* headroom question: the FL's and
 /// the internal node's UNFLOORED content (dense_words / content dense_m)
 /// under free counts, against the m\*28 cap (2^21 packed words). The
@@ -11321,6 +11170,7 @@ fn fl_node_three_ary() {
 #[test]
 #[ignore] // Heavy at m32 — four chain proofs, two FLs, one node.
 fn envelope_content_probe() {
+    let cfg = test_config();
     let n_blocks: usize = std::env::var("CHAIN_BLOCKS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -11330,12 +11180,12 @@ fn envelope_content_probe() {
     let mut cps = Vec::new();
     let mut h = h0;
     for _ in 0..4 {
-        let cp = build_chain_proof(h, n_blocks);
+        let cp = build_chain_proof(cfg, h, n_blocks);
         h = cp.h_end;
         cps.push(cp);
     }
-    let fl0 = build_fl_node(&cps[0], &cps[1]);
-    let fl1 = build_fl_node(&cps[2], &cps[3]);
+    let fl0 = build_fl_node(cfg, &cps[0], &cps[1]);
+    let fl1 = build_fl_node(cfg, &cps[2], &cps[3]);
     let chain_registry = &cps[0].inner.built.shape.registry;
     let blake_r1cs = blake3::build_block_r1cs(cps[0].inner.nu);
     let blake_lc = blake_r1cs.csc_lincheck_circuit();
@@ -11343,6 +11193,7 @@ fn envelope_content_probe() {
     let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
     let chain_jp = chain_jagged_params(&cps[0]);
     let node = build_node_outer_app(
+        cfg,
         &[&fl0.lo, &fl1.lo],
         Some(fl0.stmt_base),
         Some(ChainLane {
@@ -11359,7 +11210,7 @@ fn envelope_content_probe() {
     println!(
         "\nENVELOPE CONTENT PROBE — {n_blocks} compressions/leaf, profile {:?}\n  \
          m28 cap = {} words | m29 cap = {} words",
-        tower_profile(),
+        cfg.outer_profile(),
         1usize << (28 - 7),
         1usize << (29 - 7),
     );
@@ -14850,11 +14701,12 @@ struct FoldPub {
 /// lambdas, col rounds, bridge, mus, row rounds, and the output value.
 /// Width-driven, so mixed low widths and any claim count pin themselves.
 fn fold_region_ops(
+    cfg: TowerConfig,
     fold_claims: &[Vec<flock_core::matrix_fold::MatrixClaim>],
 ) -> Vec<flock_core::transcript_record::TranscriptOp> {
     use flock_core::transcript_record::TranscriptOp as Op;
     let mut want: Vec<Op> = Vec::new();
-    let grinding = tower_fold_grinding();
+    let grinding = tower_fold_grinding(cfg);
     for cs in fold_claims {
         want.push(Op::Label(b"flock-matrix-fold-v0".to_vec()));
         for c in cs {
@@ -15453,12 +15305,13 @@ struct JaggedFoldLoc {
 /// then the jagged fold's ops — the label, the shape header, the tagged
 /// variable-width claim blocks, and the two sumchecks. Width-driven.
 fn jagged_fold_region_ops(
+    cfg: TowerConfig,
     keys: &[([u8; 32], Vec<flock_core::matrix_fold::JaggedClaim>)],
 ) -> Vec<flock_core::transcript_record::TranscriptOp> {
     use flock_core::matrix_fold::JaggedRowWeight;
     use flock_core::transcript_record::TranscriptOp as Op;
     let mut want: Vec<Op> = Vec::new();
-    let grinding = tower_fold_grinding();
+    let grinding = tower_fold_grinding(cfg);
     for (_, cs) in keys {
         let n_col = cs[0].col.len();
         let k_row = cs
@@ -16132,6 +15985,7 @@ struct ChainLane<'a> {
 /// combined span as its OWN app block, returning that block's offset — so
 /// the output feeds the next level with the same plumbing.
 fn build_node_outer_app(
+    cfg: TowerConfig,
     los: &[&LeafOuter],
     app_stmt: Option<usize>,
     lane: Option<ChainLane<'_>>,
@@ -16317,7 +16171,7 @@ fn build_node_outer_app(
         &sigma_keys,
         &jagged_p,
         &priors,
-        tower_fold_grinding(),
+        tower_fold_grinding(cfg),
         &mut chp,
     )
     .expect("the node fold proves");
@@ -16330,7 +16184,7 @@ fn build_node_outer_app(
         &jagged_v,
         &priors,
         &agg,
-        tower_fold_grinding(),
+        tower_fold_grinding(cfg),
         &mut rec,
     )
     .expect("the node fold verifies");
@@ -16443,13 +16297,13 @@ fn build_node_outer_app(
         Op::ObserveBytes(32),
         Op::ObserveBytes(1),
     ];
-    want.extend(fold_region_ops(&fold_claims[..n_uni]));
+    want.extend(fold_region_ops(cfg, &fold_claims[..n_uni]));
     // The sigma group binds per key (wall 3): its label + digest precede
     // each key's fold, exactly as the jagged groups bind.
     for j in 0..n_keys {
         want.push(Op::Label(b"flock-aggregate-sigma-v1".to_vec()));
         want.push(Op::ObserveBytes(32));
-        want.extend(fold_region_ops(&fold_claims[n_uni + j..n_uni + j + 1]));
+        want.extend(fold_region_ops(cfg, &fold_claims[n_uni + j..n_uni + j + 1]));
     }
     // The jagged groups ride the SAME tape after the uniform folds — the
     // prior's (gated) entry first, then that key's children's claims.
@@ -16470,7 +16324,7 @@ fn build_node_outer_app(
             (key_digests[j], cs)
         })
         .collect();
-    want.extend(jagged_fold_region_ops(&jagged_keys));
+    want.extend(jagged_fold_region_ops(cfg, &jagged_keys));
     assert_eq!(ops, want.as_slice(), "the node tape is the expected shape");
     assert_eq!(
         rec.payloads()[0],
@@ -16570,7 +16424,7 @@ fn build_node_outer_app(
             &[(ln.circuit, Vec::new())],
             &ljagged_p,
             ln.priors,
-            tower_fold_grinding(),
+            tower_fold_grinding(cfg),
             &mut chp,
         )
         .expect("the lane fold proves");
@@ -16583,7 +16437,7 @@ fn build_node_outer_app(
             &ljagged_v,
             ln.priors,
             &lagg,
-            tower_fold_grinding(),
+            tower_fold_grinding(cfg),
             &mut lrec,
         )
         .expect("the lane fold verifies");
@@ -16616,10 +16470,10 @@ fn build_node_outer_app(
             Op::ObserveBytes(1),
         ];
         let n_uni_l = lclaims.len() - 1;
-        want.extend(fold_region_ops(&lclaims[..n_uni_l]));
+        want.extend(fold_region_ops(cfg, &lclaims[..n_uni_l]));
         want.push(Op::Label(b"flock-aggregate-sigma-v1".to_vec()));
         want.push(Op::ObserveBytes(32));
-        want.extend(fold_region_ops(&lclaims[n_uni_l..]));
+        want.extend(fold_region_ops(cfg, &lclaims[n_uni_l..]));
         // The inherited jagged claims (the priors' chain-keyed entries,
         // plain eq by construction) ride the same tape after.
         let ljagged_keys: Vec<([u8; 32], Vec<flock_core::matrix_fold::JaggedClaim>)> = vec![(
@@ -16634,7 +16488,7 @@ fn build_node_outer_app(
                 })
                 .collect(),
         )];
-        want.extend(jagged_fold_region_ops(&ljagged_keys));
+        want.extend(jagged_fold_region_ops(cfg, &ljagged_keys));
         assert_eq!(lops, want, "the lane tape shape");
         assert_eq!(
             lrec.payloads()[0],
@@ -16700,26 +16554,13 @@ fn build_node_outer_app(
         assert_chain_replays(&ops, &trace, &chals);
 
         let env = envelope_shape();
-        let split_b3 = n_kids == 2
-            && (env.is_some()
-                || matches!(
-                    tower_profile(),
-                    LigeritoProfile::Fast | LigeritoProfile::Fast128
-                ));
+        let split_b3 = n_kids == 2;
         let (fold_b3_primary_rows, b3_rows) = if split_b3 {
             let a = rts[0].b3_rows;
             let b = rts[1].b3_rows;
             let unsplit = (a + trace.rows.len()).max(b);
             let (on_a, balanced) = balance_extra_rows(a, b, trace.rows.len());
-            let envelope_needs_balance = env.as_ref().is_some_and(|e| unsplit > (1usize << e.nu));
-            if envelope_needs_balance
-                || (env.is_none()
-                    && matches!(
-                        tower_profile(),
-                        LigeritoProfile::Fast | LigeritoProfile::Fast128
-                    )
-                    && balanced.next_power_of_two() < unsplit.next_power_of_two())
-            {
+            if unsplit > (1usize << env.nu) {
                 (Some(on_a), balanced)
             } else {
                 (None, unsplit)
@@ -16741,57 +16582,28 @@ fn build_node_outer_app(
                 fold_pows,
             );
         }
-        // MEASURED AND REJECTED (2026-08-05): over-provisioning nu by one
-        // bit to re-engage the pay-per-live arms. Boolean committed area was
-        // then CAPACITY-shaped (M_bool 31→32 doubled the boolean stack; the
-        // open went 84→190 ms and level-1 prove 260→390). RE-MEASURED
-        // 2026-08-05 post-stratified/slim/live via TOWER_NU_BUMP=1 (slim L2,
-        // steady): +1 nu costs only +7.3 ms prove (wiring +2.0 at μ+1, open
-        // +2.4, element PIOP +0.7, witgen +0.4; commit and boolean zc+lc
-        // FLAT, dense_m HELD at 28 — the committed stack is content-derived)
-        // — the old doubling no longer reproduces, so a nu-14 squeeze buys
-        // only ~5-7 ms and no proof bytes. The knob stays as the capacity-
-        // sensitivity probe.
-        let nu2_content = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7)
-            + std::env::var("TOWER_NU_BUMP")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(0);
-        // Under the envelope the node pins nu* and the canonical type set
-        // (wall 2); the TOWER_NU_BUMP capacity probe is an off-envelope
-        // knob — the pin wins.
-        let nu2 = match &env {
-            Some(e) => {
-                assert!(
-                    nu2_content <= e.nu,
-                    "node content nu {nu2_content} exceeds the envelope nu* {}",
-                    e.nu
-                );
-                e.nu
-            }
-            None => nu2_content,
-        };
+        let nu2_content = (b3_rows.next_power_of_two().trailing_zeros() as usize).max(7);
+        // The node pins the envelope's nu* and canonical type set (wall 2).
+        assert!(
+            nu2_content <= env.nu,
+            "node content nu {nu2_content} exceeds the envelope nu* {}",
+            env.nu
+        );
+        let nu2 = env.nu;
         let mut sb = ShapeBuilder::new(nu2);
-        // Under the envelope the DECLARED width is the envelope's (the max
-        // over child kinds at the fixed point); a shallower child ladder
-        // rides the wide slot with its high outputs unread, and one that
-        // exceeds it fails here. The witness tables below build at
-        // `spread_w2`, so it must be the DECLARED width.
+        // The DECLARED width is the envelope's (the max over child kinds at
+        // the fixed point); a shallower child ladder rides the wide slot
+        // with its high outputs unread, and one that exceeds it fails here.
+        // The witness tables below build at `spread_w2`, so it must be the
+        // DECLARED width.
         let spread_own2 = rts.iter().map(|rt| rt.spread_w).max().expect("a child");
-        let (spread_w2, mut cs) = match &env {
-            Some(e) => {
-                assert!(
-                    spread_own2 <= e.spread_w,
-                    "child ladder depth {spread_own2} exceeds the envelope spread width {}",
-                    e.spread_w
-                );
-                (e.spread_w, ChildSlots::new_env(&mut sb, nu2, e))
-            }
-            None => (
-                spread_own2,
-                ChildSlots::new_with_b3_split(&mut sb, nu2, spread_own2, split_b3),
-            ),
-        };
+        assert!(
+            spread_own2 <= env.spread_w,
+            "child ladder depth {spread_own2} exceeds the envelope spread width {}",
+            env.spread_w
+        );
+        let spread_w2 = env.spread_w;
+        let mut cs = ChildSlots::new_env(&mut sb, nu2, &env);
         let mut vals: Vec<F128> = Vec::new();
         let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
         // The two child regions are independent gate subgraphs (each reads
@@ -16956,9 +16768,7 @@ fn build_node_outer_app(
         // a hard connect).
         let mac_spine0 = sb.rows_in_slot(cs.macs);
         let spine_w = spine.as_ref().map(|sp| {
-            let e = env
-                .as_ref()
-                .expect("the spine needs the envelope's offsets");
+            let e = &env;
             let rk = &regions[sp.node_child];
             let cp = |i: usize| rk.child_pub_w[i];
             // The assert-zero anchor for the gadget below: producers only,
@@ -17507,8 +17317,9 @@ fn build_node_outer_app(
         // own passenger is empty — so the sum is a SELECT that can never
         // silently drop a live claim: two live terms garble each other and
         // the root's discharge rejects, which is the safe direction.
-        let pass_w: Vec<Wire> = match (&spine_w, &env) {
-            (Some((_, sig_off, jag_off, sig, jag)), Some(e)) => {
+        let pass_w: Vec<Wire> = match &spine_w {
+            Some((_, sig_off, jag_off, sig, jag)) => {
+                let e = &env;
                 let rk = &regions[spine.as_ref().unwrap().node_child];
                 let pb = env_pass_base(e);
                 let mut out = Vec::with_capacity(sig_ent + jag_ent);
@@ -17529,16 +17340,7 @@ fn build_node_outer_app(
             }
             _ => Vec::new(),
         };
-        let fold_pub_base = match &env {
-            Some(e) => env_acc_main_base(e),
-            None => {
-                let b = sb.public_len();
-                for &w in &acc_main_w {
-                    sb.publish(w);
-                }
-                b
-            }
-        };
+        let fold_pub_base = env_acc_main_base(&env);
         // ---- the APPLICATION STATEMENT (hash-chain adjacency) ----
         // When the children carry an app block: left.h_end == right.h_start
         // as four copy constraints (both children's publics are witness
@@ -17563,16 +17365,9 @@ fn build_node_outer_app(
                 .chain((0..4).map(|j| last.child_pub_w[off + 4 + j]))
                 .collect()
         });
-        let app_inline = match &env {
-            Some(_) => None,
-            None => app_w.as_ref().map(|v| {
-                let base = sb.public_len();
-                for &w in v {
-                    sb.publish(w);
-                }
-                base
-            }),
-        };
+        // The publish of the combined span rides the envelope's fixed tail
+        // block (below, with the padding), never inline.
+        let app_inline: Option<usize> = None;
         // ---- the LANE fold region, in-circuit: priors-only, every prior
         // surface WIRED to the child's published accumulator claim (a
         // prior's surface IS what the child published — the child_pub_w
@@ -17764,16 +17559,7 @@ fn build_node_outer_app(
                 lane_w.push(fp.value);
             }
             let lane_words = lane_w.len();
-            let lane_pub_base = match &env {
-                Some(e) => env_acc_chain_base(e),
-                None => {
-                    let b = sb.public_len();
-                    for &w in &lane_w {
-                        sb.publish(w);
-                    }
-                    b
-                }
-            };
+            let lane_pub_base = env_acc_chain_base(&env);
             (
                 lane_pub_base,
                 lane_words,
@@ -17834,28 +17620,26 @@ fn build_node_outer_app(
         // segment length the leaf does. The tail-anchor assert below walks
         // the REAL segment end, recorded pre-pad.
         let prepad_publics2 = sb.public_len();
-        let app_base = match &env {
-            Some(e) => {
-                let empty: Vec<Wire> = Vec::new();
-                pad_envelope_counts(
-                    &mut sb,
-                    &cs.q,
-                    &cs.env_cache(),
-                    e,
-                    zw,
-                    &mut hints,
-                    &mut vals,
-                    &mut consts,
-                    &EnvTail {
-                        acc_main: &acc_main_w,
-                        acc_chain: lane_pub.as_ref().map(|(_, _, _, w, _)| w).unwrap_or(&empty),
-                        pass: &pass_w,
-                        app: app_w.as_deref().unwrap_or(&empty),
-                    },
-                );
-                app_w.as_ref().map(|_| env_app_base(e))
-            }
-            None => app_inline,
+        let app_base = {
+            let _ = app_inline;
+            let empty: Vec<Wire> = Vec::new();
+            pad_envelope_counts(
+                &mut sb,
+                &cs.q,
+                &cs.env_cache(),
+                &env,
+                zw,
+                &mut hints,
+                &mut vals,
+                &mut consts,
+                &EnvTail {
+                    acc_main: &acc_main_w,
+                    acc_chain: lane_pub.as_ref().map(|(_, _, _, w, _)| w).unwrap_or(&empty),
+                    pass: &pass_w,
+                    app: app_w.as_deref().unwrap_or(&empty),
+                },
+            );
+            app_w.as_ref().map(|_| env_app_base(&env))
         };
         let shape2 = sb.finish().expect("the 2->1 node circuit builds");
         // The two-limb Ligerito verifier plus the split BLAKE table stays
@@ -17993,7 +17777,7 @@ fn build_node_outer_app(
         // params and the R1CS tables are per-SHAPE — offline, ahead of the
         // online loop.
         let union2 = outer_union(&shape2.registry, shape2.counts.clone());
-        let pf = tower_profile();
+        let pf = cfg.outer_profile();
         let pcs2 = PcsParams {
             m: union2.dense_m(),
             log_inv_rate: pf.log_inv_rate(),
@@ -18120,27 +17904,18 @@ fn build_node_outer_app(
                 );
             }
             let tail_len = p_at - fold_pub_base;
-            let passenger: Vec<([F128; 2], MatrixClaim)> = match &env {
-                Some(e) => {
-                    let mut q = env_pass_base(e);
-                    vec![
-                        read_acc_entry(
-                            &built2.public,
-                            &mut q,
-                            true,
-                            locs[n_uni].k_col,
-                            locs[n_uni].k_row,
-                        ),
-                        read_acc_entry(
-                            &built2.public,
-                            &mut q,
-                            true,
-                            jlocs[0].n_col,
-                            jlocs[0].k_row,
-                        ),
-                    ]
-                }
-                None => Vec::new(),
+            let passenger: Vec<([F128; 2], MatrixClaim)> = {
+                let mut q = env_pass_base(&env);
+                vec![
+                    read_acc_entry(
+                        &built2.public,
+                        &mut q,
+                        true,
+                        locs[n_uni].k_col,
+                        locs[n_uni].k_row,
+                    ),
+                    read_acc_entry(&built2.public, &mut q, true, jlocs[0].n_col, jlocs[0].k_row),
+                ]
             };
             let acc_pub = aggregate::Accumulator {
                 registry_digest: registry.digest(),
@@ -18244,29 +18019,12 @@ fn build_node_outer_app(
                     F128::ZERO,
                     "the lows' assert-zero anchor"
                 );
-                // OFF-ENVELOPE the REAL segment ends at the last publish block:
-                // the lane's fold blocks when a lane rides (its emitter also
-                // declares its own boundary publics before them), else the
-                // node's fold blocks + the app block. UNDER the envelope those
-                // blocks moved to the reserved tail, so the body simply has to
-                // fit — which `pad_envelope_counts` asserts — and the tail
-                // layout is checked where it matters, by rebuilding both
-                // accumulators at their CONSTANT bases below.
-                if env.is_none() {
-                    let seg_end = lane_pub.as_ref().map(|&(b, w, _, _, _)| b + w).unwrap_or(
-                        fold_pub_base
-                            + tail_len
-                            + if app_inline.is_some() {
-                                ENV_APP_WORDS
-                            } else {
-                                0
-                            },
-                    );
-                    assert_eq!(
-                        seg_end, prepad_publics2,
-                        "the last publish block ends the REAL segment"
-                    );
-                }
+                // UNDER the envelope the publish blocks live on the reserved
+                // tail, so the body simply has to fit — which
+                // `pad_envelope_counts` asserts — and the tail layout is
+                // checked where it matters, by rebuilding both accumulators
+                // at their CONSTANT bases below.
+                let _ = (tail_len, prepad_publics2);
                 // The LANE accumulator, reassembled from the public segment
                 // alone — the parent-facing statement of the lower registry.
                 if let (Some((lpb, _, lar, _, lrec)), Some((lacc_n, llocs, ljlocs, ..))) =
@@ -18612,15 +18370,16 @@ fn build_node_outer_app(
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn internal_node_over_two_fl_nodes() {
+    let cfg = test_config();
     let n_blocks = 256usize;
     let mut rng = Rng(0xC4A1_0006);
     let h0: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
-    let cp0 = build_chain_proof(h0, n_blocks);
-    let cp1 = build_chain_proof(cp0.h_end, n_blocks);
-    let cp2 = build_chain_proof(cp1.h_end, n_blocks);
-    let cp3 = build_chain_proof(cp2.h_end, n_blocks);
-    let fl0 = build_fl_node(&cp0, &cp1);
-    let fl1 = build_fl_node(&cp2, &cp3);
+    let cp0 = build_chain_proof(cfg, h0, n_blocks);
+    let cp1 = build_chain_proof(cfg, cp0.h_end, n_blocks);
+    let cp2 = build_chain_proof(cfg, cp1.h_end, n_blocks);
+    let cp3 = build_chain_proof(cfg, cp2.h_end, n_blocks);
+    let fl0 = build_fl_node(cfg, &cp0, &cp1);
+    let fl1 = build_fl_node(cfg, &cp2, &cp3);
     assert_eq!(
         fl0.lo.shape.circuit.digest(),
         fl1.lo.shape.circuit.digest(),
@@ -18629,7 +18388,7 @@ fn internal_node_over_two_fl_nodes() {
     assert_eq!(fl0.stmt_base, fl1.stmt_base, "one statement offset");
     assert_eq!(fl1.h_start, fl0.h_end, "the FL spans are adjacent");
 
-    let out = build_node_outer_app(&[&fl0.lo, &fl1.lo], Some(fl0.stmt_base), None, None);
+    let out = build_node_outer_app(cfg, &[&fl0.lo, &fl1.lo], Some(fl0.stmt_base), None, None);
     let (node, acc, app) = (out.lo, out.acc, out.app_base);
     let app = app.expect("the internal node carries the app block");
     for j in 0..4 {
@@ -18667,7 +18426,7 @@ fn internal_node_over_two_fl_nodes() {
     // DIFFER: the heights are data now, reaching a parent only as jagged
     // claims, and the parent's circuit never reads them. Under the
     // `ENV_PAD=1` oracle the old counts* equality still holds.
-    if envelope_shape().is_some() {
+    {
         assert_eq!(
             fl0.lo.shape.registry.digest(),
             node.shape.registry.digest(),
@@ -18710,459 +18469,6 @@ fn internal_node_over_two_fl_nodes() {
             .map(|b| b.len())
             .unwrap_or(0) as f64
             / 1024.0,
-    );
-}
-
-/// **THE 3-ARY INTERNAL NODE.** Commit and open are FLOOR-bound — they
-/// cost the same whatever the arity, as long as content stays under
-/// `2^(m*-7)` — so they are a per-node toll that every child past the first
-/// rides for free, and a k-ary layer needs `1/(k-1)` as many nodes. Six
-/// chain segments → three first-level nodes → ONE internal node folding all
-/// three, lane included (three priors, not two).
-///
-/// The prerequisite is `nu* = 16`: mac is ~97% per-child work (14,411 rows
-/// per child against 921 shared), so three children need ~44k rows against
-/// 2^15's 32,768.
-#[test]
-#[ignore] // Heavy — six chain proofs, three FLs, one 3-ary node.
-fn internal_node_three_ary() {
-    let n_blocks = 256usize;
-    let mut rng = Rng(0xC4A1_000C);
-    let h0: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
-    let mut cps = Vec::new();
-    let mut h = h0;
-    for _ in 0..6 {
-        let cp = build_chain_proof(h, n_blocks);
-        h = cp.h_end;
-        cps.push(cp);
-    }
-    let fls: Vec<FlNode> = (0..3)
-        .map(|i| build_fl_node(&cps[2 * i], &cps[2 * i + 1]))
-        .collect();
-    let chain_registry = &cps[0].inner.built.shape.registry;
-    let blake_r1cs = blake3::build_block_r1cs(cps[0].inner.nu);
-    let blake_lc = blake_r1cs.csc_lincheck_circuit();
-    let chain_mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
-    let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
-    let priors: Vec<&flock_core::aggregate::Accumulator> = fls.iter().map(|f| &f.acc).collect();
-    let kids: Vec<&LeafOuter> = fls.iter().map(|f| &f.lo).collect();
-    let chain_jp = chain_jagged_params(&cps[0]);
-
-    let out = build_node_outer_app(
-        &kids,
-        Some(fls[0].stmt_base),
-        Some(ChainLane {
-            registry: chain_registry,
-            mats: &chain_mats,
-            circs: &chain_circs,
-            circuit: &cps[0].inner.built.shape.circuit,
-            params: &chain_jp,
-            priors: &priors,
-            claims_base: fls[0].fold_pub_base,
-        }),
-        None,
-    );
-    let (node, acc, t) = (out.lo, out.acc, out.online);
-    let app = out.app_base.expect("the app block rode");
-    let lane_acc = out.lane_acc.expect("the lane rode");
-
-    // The statement spans all six segments, and both accumulators discharge.
-    let h_end = native_chain(&h0, 6 * n_blocks);
-    for j in 0..4 {
-        assert_eq!(
-            node.public[app + j],
-            pack4(h0[4 * j..4 * j + 4].try_into().unwrap()),
-            "3-ary node h_start"
-        );
-        assert_eq!(
-            node.public[app + 4 + j],
-            pack4(h_end[4 * j..4 * j + 4].try_into().unwrap()),
-            "3-ary node h_end == H^N(h_start)"
-        );
-    }
-    assert!(
-        lane_acc.discharge(&chain_mats)
-            && lane_acc.discharge_sigma(&[&cps[0].inner.built.shape.circuit]),
-        "the 3-prior chain lane discharges"
-    );
-    // The accumulator holds claims about the CHILDREN's tables, so it
-    // discharges against THEIR matrices — which are the node's own only
-    // because the envelope pins one nu and one registry.
-    let ch = &fls[0].lo;
-    let el_types: Vec<_> = ch
-        .shape
-        .registry
-        .element_types()
-        .iter()
-        .map(|s| s.element_type().expect("an element slot's table"))
-        .collect();
-    let el_mats: Vec<_> = el_types.iter().map(|ty| (ty.a_0(), ty.b_0())).collect();
-    let mats = leaf_boolean_mats(ch);
-    assert!(
-        acc.discharge(&mats)
-            && acc.discharge_element(&el_mats)
-            && acc.discharge_sigma(&[&fls[0].lo.shape.circuit]),
-        "the 3-ary node's own accumulator discharges all three groups"
-    );
-    println!(
-        "\n3-ARY INTERNAL NODE (three FL children in ONE proof)\n  \
-         span H^{}(h_start) | nu {} | mu {} | publics {} | proof {:.1} KiB\n  \
-         ONLINE: walk {:.1} + tapes {:.1} + witgen {:.1} + prove {:.1} = {:.1} ms | verify {:.1}\n  \
-         per-leaf internal share (k=3): {:.1} ms vs 2-ary's C/2\n",
-        6 * n_blocks,
-        node.shape.circuit.cells().nu(),
-        node.shape.circuit.cells().mu(),
-        node.public.len(),
-        bincode::serialize(&node.proof)
-            .map(|b| b.len())
-            .unwrap_or(0) as f64
-            / 1024.0,
-        t.walk_ms,
-        t.tapes_ms,
-        t.witgen_ms,
-        t.prove_ms,
-        t.total(),
-        t.verify_ms,
-        t.total() / 4.0,
-    );
-}
-
-/// **TASK 7b's HEADLINE: ONE INTERNAL CIRCUIT, EVERY LEVEL.** Eight chain
-/// segments → four first-level nodes → two internal nodes → one THIRD-level
-/// node, and the level-3 circuit digest EQUALS the level-2 one: once the FL
-/// node is envelope-shaped (nu*, counts*, publics*, m*, the app block at
-/// `env_app_base`), a parent's walk cannot tell an FL child from an internal
-/// child, so the same circuit serves both — the tower is depth-unbounded in
-/// SHAPE.
-///
-/// **The chain LANE is threaded across BOTH levels here**, which is the
-/// point of the reserved `ACC_CHAIN` block: a first-level child publishes
-/// its own chain fold there and an internal child publishes its LANE's fold
-/// there, at the SAME constant index — so the level-3 lane connects to its
-/// internal children exactly as the level-2 lane connects to its FL
-/// children, and the two circuits stay identical.
-///
-/// STILL OPEN (the fork in the handoff): each internal node's MAIN
-/// (envelope-registry) accumulator is not yet inherited by its parent, so a
-/// tower deeper than two levels is not yet sound end to end — the level-2
-/// main accumulators would have to be folded as priors of the level-3 main
-/// fold, which needs the FL-vs-internal sigma key pair. Their claims now
-/// have a fixed home (`ACC_MAIN`) waiting for it. This test pins the SHAPE
-/// and the lane mechanism.
-#[test]
-#[ignore] // Heavy — eight chain proofs and seven outers.
-fn chain_tower_three_levels_one_internal_digest() {
-    // The cross-level connects read the children's claims and statement at
-    // CONSTANT indices, and those constants exist only under the envelope —
-    // off-envelope every builder publishes inline, where the offsets depend
-    // on live usage and an FL child and an internal child genuinely differ.
-    let Some(env) = envelope_shape() else {
-        println!(
-            "\nTHREE-LEVEL CHAIN TOWER: skipped — the fixed-offset tail blocks the \
-             cross-level\n  connects need exist only under the envelope \
-             (TOWER_PROFILE=slim)\n"
-        );
-        return;
-    };
-    // 256: the registered Ligerito configs floor at m22, and a 128-block
-    // chain commits at m21.
-    let n_blocks = 256usize;
-    let mut rng = Rng(0xC4A1_000B);
-    let h0: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
-    let mut cps = Vec::new();
-    let mut h = h0;
-    for _ in 0..8 {
-        let cp = build_chain_proof(h, n_blocks);
-        h = cp.h_end;
-        cps.push(cp);
-    }
-    let fls: Vec<FlNode> = (0..4)
-        .map(|i| build_fl_node(&cps[2 * i], &cps[2 * i + 1]))
-        .collect();
-    let app_fl = fls[0].stmt_base;
-    for f in &fls {
-        assert_eq!(f.stmt_base, app_fl, "one FL app offset");
-        assert_eq!(
-            f.lo.shape.circuit.digest(),
-            fls[0].lo.shape.circuit.digest(),
-            "one FL circuit digest"
-        );
-    }
-    // The lane's registry materials — the CHAIN side, shared by every level.
-    let chain_registry = &cps[0].inner.built.shape.registry;
-    let blake_r1cs = blake3::build_block_r1cs(cps[0].inner.nu);
-    let blake_lc = blake_r1cs.csc_lincheck_circuit();
-    let chain_mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
-    let chain_circs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
-    let chain_circuit = &cps[0].inner.built.shape.circuit;
-    let chain_jp = chain_jagged_params(&cps[0]);
-    let acc_base = fls[0].fold_pub_base;
-    assert_eq!(
-        acc_base,
-        env_acc_chain_base(&env),
-        "an FL publishes its chain claims in the reserved ACC_CHAIN block"
-    );
-
-    // Level 2: the chain lane's priors are the FL children's chain
-    // accumulators, read at the FL's ACC_CHAIN block.
-    let o0 = build_node_outer_app(
-        &[&fls[0].lo, &fls[1].lo],
-        Some(app_fl),
-        Some(ChainLane {
-            registry: chain_registry,
-            mats: &chain_mats,
-            circs: &chain_circs,
-            circuit: chain_circuit,
-            params: &chain_jp,
-            priors: &[&fls[0].acc, &fls[1].acc],
-            claims_base: acc_base,
-        }),
-        None,
-    );
-    let o1 = build_node_outer_app(
-        &[&fls[2].lo, &fls[3].lo],
-        Some(app_fl),
-        Some(ChainLane {
-            registry: chain_registry,
-            mats: &chain_mats,
-            circs: &chain_circs,
-            circuit: chain_circuit,
-            params: &chain_jp,
-            priors: &[&fls[2].acc, &fls[3].acc],
-            claims_base: acc_base,
-        }),
-        None,
-    );
-    let (n0, n1) = (&o0.lo, &o1.lo);
-    let app0 = o0.app_base.expect("level-2 app block");
-    assert_eq!(
-        app0,
-        o1.app_base.expect("level-2 app block"),
-        "one L2 app offset"
-    );
-    assert_eq!(
-        n0.shape.circuit.digest(),
-        n1.shape.circuit.digest(),
-        "one level-2 circuit digest"
-    );
-    let (lane0, lane1) = (
-        o0.lane_acc.clone().expect("L2 lane"),
-        o1.lane_acc.clone().expect("L2 lane"),
-    );
-
-    // THE STEP THAT MATTERS: an internal node over two INTERNAL children,
-    // its lane inheriting THEIR lane accumulators — published at the same
-    // ACC_CHAIN index the FL children used, which is why one circuit reads
-    // both kinds.
-    let o2 = build_node_outer_app(
-        &[&n0, &n1],
-        Some(app0),
-        Some(ChainLane {
-            registry: chain_registry,
-            mats: &chain_mats,
-            circs: &chain_circs,
-            circuit: chain_circuit,
-            params: &chain_jp,
-            priors: &[&lane0, &lane1],
-            claims_base: acc_base,
-        }),
-        None,
-    );
-    let n2 = &o2.lo;
-    let app2 = o2.app_base.expect("level-3 app block");
-    let lane2 = o2.lane_acc.clone().expect("L3 lane");
-    assert!(
-        lane2.discharge(&chain_mats) && lane2.discharge_sigma(&[chain_circuit]),
-        "the level-3 chain lane discharges against the chain tables — \
-         eight leaves' claims in one accumulator"
-    );
-    if n2.shape.circuit.digest() != n0.shape.circuit.digest() {
-        println!("  DIGEST MISMATCH — per-slot rows (L2 over FLs vs L3 over nodes):");
-        for (t, (a, b)) in n0.shape.counts.iter().zip(&n2.shape.counts).enumerate() {
-            if a != b {
-                println!("    type {t}: L2 {a} vs L3 {b}");
-            }
-        }
-        println!(
-            "    publics {} vs {} | lanes {:?} vs {:?}",
-            n0.public.len(),
-            n2.public.len(),
-            n0.pcs.num_lanes,
-            n2.pcs.num_lanes,
-        );
-        // Rows and publics equal but digests differ ⇒ the WIRING differs.
-        // wires() is the class list (each a set of cell indices), so the
-        // first differing class names the emission site.
-        let (w0, w2) = (n0.shape.circuit.wires(), n2.shape.circuit.wires());
-        println!("    wire classes: {} vs {}", w0.len(), w2.len());
-        let mut shown = 0;
-        for (i, (a, b)) in w0.iter().zip(w2).enumerate() {
-            if a != b {
-                println!(
-                    "    class {i}: len {} vs {}\n      L2 {:?}\n      L3 {:?}",
-                    a.len(),
-                    b.len(),
-                    &a[..a.len().min(6)],
-                    &b[..b.len().min(6)],
-                );
-                shown += 1;
-                if shown >= 3 {
-                    break;
-                }
-            }
-        }
-        let n_diff = w0.iter().zip(w2).filter(|(a, b)| a != b).count();
-        println!("    {n_diff} of {} classes differ", w0.len().min(w2.len()));
-        // Decode the differing cells: cell_index = (cell_slot << nu) | row.
-        let cs = n0.shape.circuit.cells();
-        let nu = cs.nu();
-        let mut seen: Vec<usize> = Vec::new();
-        for (a, b) in w0.iter().zip(w2) {
-            if a != b {
-                for &c in a.iter().take(4) {
-                    let sl = c >> nu;
-                    if !seen.contains(&sl) {
-                        seen.push(sl);
-                    }
-                }
-            }
-        }
-        // WHERE the differing cells actually are: classes span many slots,
-        // so diff the CONTENTS and histogram the symmetric difference by
-        // cell-slot. The first members of a class only say where it starts.
-        {
-            use std::collections::{HashMap, HashSet};
-            let mut hist: HashMap<usize, (usize, usize)> = HashMap::new();
-            for (a, b) in w0.iter().zip(w2) {
-                if a == b {
-                    continue;
-                }
-                let (sa, sb2): (HashSet<usize>, HashSet<usize>) =
-                    (a.iter().copied().collect(), b.iter().copied().collect());
-                for &c in sa.difference(&sb2) {
-                    hist.entry(c >> nu).or_default().0 += 1;
-                }
-                for &c in sb2.difference(&sa) {
-                    hist.entry(c >> nu).or_default().1 += 1;
-                }
-            }
-            // Row ranges of the differing cells: the emit site's fingerprint.
-            {
-                let mut rmin = usize::MAX;
-                let mut rmax = 0usize;
-                let mut n = 0usize;
-                let mask = (1usize << nu) - 1;
-                for (a, b) in w0.iter().zip(w2) {
-                    if a == b {
-                        continue;
-                    }
-                    let (sa, sb2): (HashSet<usize>, HashSet<usize>) =
-                        (a.iter().copied().collect(), b.iter().copied().collect());
-                    for &c in sa.symmetric_difference(&sb2) {
-                        let r = c & mask;
-                        rmin = rmin.min(r);
-                        rmax = rmax.max(r);
-                        n += 1;
-                    }
-                }
-                println!("    differing cells span pf8 rows [{rmin}, {rmax}] ({n} cells)");
-            }
-            let mut rows: Vec<_> = hist.into_iter().collect();
-            rows.sort_by_key(|&(sl, _)| sl);
-            println!("    symmetric difference by cell-slot (L2-only, L3-only):");
-            for (sl, (x, y)) in rows {
-                let d = cs.slots()[sl];
-                let name = match d {
-                    flock_core::circuit::CellSlot::Gate { ty, word } => format!(
-                        "ty {ty} ({} bits) word {:?}",
-                        n0.shape.registry.types()[ty].useful_bits,
-                        word
-                    ),
-                    other => format!("{other:?}"),
-                };
-                println!("      slot {sl:4}: L2-only {x:5} L3-only {y:5}  {name}");
-            }
-        }
-        // How many of pf8's b-side cells are CONSTANTS at all (in the
-        // classes the diff implicates, i.e. zw/ow), versus wires? That is
-        // the population a bit-supply table would have to feed.
-        {
-            use std::collections::HashSet;
-            let diff_idx: HashSet<usize> = (0..w0.len()).filter(|&i| w0[i] != w2[i]).collect();
-            let mut b_cells = 0usize;
-            let mut b_const = 0usize;
-            for (ci, cls) in w0.iter().enumerate() {
-                for &c in cls {
-                    let sl = c >> nu;
-                    if let flock_core::circuit::CellSlot::Gate { ty, word } = cs.slots()[sl] {
-                        // pf8 = the type carrying the differing words; b side
-                        // is the upper half of the 2+2pl input block.
-                        if ty == 12 && word.dir == flock_core::schedule::IoDirection::In {
-                            b_cells += 1;
-                            if diff_idx.contains(&ci) {
-                                b_const += 1;
-                            }
-                        }
-                    }
-                }
-            }
-            println!(
-                "    pf8 input cells in wire classes: {b_cells} total, {b_const} in the \n      \
-                 implicated (constant) classes = {:.0}%",
-                100.0 * b_const as f64 / b_cells.max(1) as f64
-            );
-        }
-        for sl in seen {
-            let d = cs.slots()[sl];
-            let extra = match d {
-                flock_core::circuit::CellSlot::Gate { ty, .. } => {
-                    let t = &n0.shape.registry.types()[ty];
-                    format!(
-                        " -> registry type {ty}: {} useful_bits, k_log {}",
-                        t.useful_bits, t.k_log
-                    )
-                }
-                _ => String::new(),
-            };
-            println!("    cell-slot {sl}: {d:?}{extra}");
-        }
-    }
-    assert_eq!(
-        n2.shape.circuit.digest(),
-        n0.shape.circuit.digest(),
-        "ONE internal circuit digest at level 3 as at level 2 — depth-unbounded shape"
-    );
-    assert_eq!(app2, app0, "the app block never moves");
-    assert_eq!(
-        app2,
-        env_app_base(&env),
-        "and it is the envelope's own tail"
-    );
-
-    // The statement rode all three levels: the root span is the whole chain.
-    let h_end = native_chain(&h0, 8 * n_blocks);
-    for j in 0..4 {
-        assert_eq!(
-            n2.public[app2 + j],
-            pack4(h0[4 * j..4 * j + 4].try_into().unwrap()),
-            "root h_start"
-        );
-        assert_eq!(
-            n2.public[app2 + 4 + j],
-            pack4(h_end[4 * j..4 * j + 4].try_into().unwrap()),
-            "root h_end == H^N(h_start)"
-        );
-    }
-    println!(
-        "\nTHREE-LEVEL CHAIN TOWER (8 chains -> 4 FL -> 2 internal -> 1)\n  \
-         span H^{}(h_start) | L2 digest == L3 digest | app at fixed offset {}\n  \
-         internal outer: nu {} | mu {} | publics {} | proof {:.1} KiB\n",
-        8 * n_blocks,
-        app2,
-        n2.shape.circuit.cells().nu(),
-        n2.shape.circuit.cells().mu(),
-        n2.public.len(),
-        bincode::serialize(&n2.proof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
     );
 }
 
@@ -19209,28 +18515,22 @@ fn node_jagged_params(lo: &LeafOuter) -> flock_core::pcs::jagged::JaggedParams {
 #[test]
 #[ignore] // Heavy — eight chain proofs and eight outers.
 fn chain_spine_converges() {
+    let cfg = test_config();
     use flock_core::aggregate;
 
-    let Some(env) = envelope_shape() else {
-        println!(
-            "\nSPINE CONVERGENCE: skipped — the fixed-offset tail blocks the \
-             inheritance reads need\n  exist only under the envelope \
-             (TOWER_PROFILE=slim)\n"
-        );
-        return;
-    };
+    let env = envelope_shape();
     let n_blocks = 256usize;
     let mut rng = Rng(0xC4A1_5B1E);
     let h0: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
     let mut cps = Vec::new();
     let mut h = h0;
     for _ in 0..8 {
-        let cp = build_chain_proof(h, n_blocks);
+        let cp = build_chain_proof(cfg, h, n_blocks);
         h = cp.h_end;
         cps.push(cp);
     }
     let fls: Vec<FlNode> = (0..4)
-        .map(|i| build_fl_node(&cps[2 * i], &cps[2 * i + 1]))
+        .map(|i| build_fl_node(cfg, &cps[2 * i], &cps[2 * i + 1]))
         .collect();
     let app_fl = fls[0].stmt_base;
     assert_eq!(
@@ -19264,6 +18564,7 @@ fn chain_spine_converges() {
     // THE BASE: fresh-only over the LAST two FLs. The spine grows by
     // prepending, so the base covers the tail of the chain.
     let base = build_node_outer_app(
+        cfg,
         &[&fls[2].lo, &fls[3].lo],
         Some(app_fl),
         Some(ChainLane {
@@ -19298,6 +18599,7 @@ fn chain_spine_converges() {
     // the base's DEAD one, and its own node-slot output is keyed by the
     // BASE circuit — the entry that will orphan one level up.
     let n2 = build_node_outer_app(
+        cfg,
         &[&fls[1].lo, &base.lo],
         Some(app_fl),
         Some(ChainLane {
@@ -19337,6 +18639,7 @@ fn chain_spine_converges() {
     // orphans. Its node slot names node_2's circuit, so the entry it
     // inherits (keyed by the base's) cannot fold and rides the passenger.
     let n3 = build_node_outer_app(
+        cfg,
         &[&fls[0].lo, &n2.lo],
         Some(app_fl),
         Some(ChainLane {
@@ -19486,6 +18789,7 @@ fn chain_spine_converges() {
     // builder asserts the proof dies on exactly Wiring/Gkr/ProductMismatch
     // (the assert lives inside build_node_outer_app, forge: true).
     build_node_outer_app(
+        cfg,
         &[&fls[0].lo, &n2.lo],
         Some(app_fl),
         Some(ChainLane {
@@ -19579,17 +18883,18 @@ fn chain_spine_converges() {
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn chain_tower_e2e_with_lane() {
+    let cfg = test_config();
     use flock_core::aggregate;
 
     let n_blocks = 256usize;
     let mut rng = Rng(0xC4A1_0007);
     let h0: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
-    let cp0 = build_chain_proof(h0, n_blocks);
-    let cp1 = build_chain_proof(cp0.h_end, n_blocks);
-    let cp2 = build_chain_proof(cp1.h_end, n_blocks);
-    let cp3 = build_chain_proof(cp2.h_end, n_blocks);
-    let fl0 = build_fl_node(&cp0, &cp1);
-    let fl1 = build_fl_node(&cp2, &cp3);
+    let cp0 = build_chain_proof(cfg, h0, n_blocks);
+    let cp1 = build_chain_proof(cfg, cp0.h_end, n_blocks);
+    let cp2 = build_chain_proof(cfg, cp1.h_end, n_blocks);
+    let cp3 = build_chain_proof(cfg, cp2.h_end, n_blocks);
+    let fl0 = build_fl_node(cfg, &cp0, &cp1);
+    let fl1 = build_fl_node(cfg, &cp2, &cp3);
     assert_eq!(
         fl0.fold_pub_base, fl1.fold_pub_base,
         "one fold-block layout"
@@ -19611,7 +18916,13 @@ fn chain_tower_e2e_with_lane() {
         priors: &[&fl0.acc, &fl1.acc],
         claims_base: fl0.fold_pub_base,
     };
-    let out = build_node_outer_app(&[&fl0.lo, &fl1.lo], Some(fl0.stmt_base), Some(lane), None);
+    let out = build_node_outer_app(
+        cfg,
+        &[&fl0.lo, &fl1.lo],
+        Some(fl0.stmt_base),
+        Some(lane),
+        None,
+    );
     let (node, acc) = (out.lo, out.acc);
     let app = out.app_base.expect("the app block rode");
     let lane_acc = out.lane_acc.expect("the lane rode");
@@ -19718,7 +19029,7 @@ fn chain_tower_e2e_with_lane() {
             &[(&cp0.inner.built.shape.circuit, Vec::new())],
             &jagged_pt,
             &[&fl0.acc, &fl1.acc],
-            tower_fold_grinding(),
+            tower_fold_grinding(cfg),
             &mut chp,
         )
         .expect("honest lane fold proves");
@@ -19732,7 +19043,7 @@ fn chain_tower_e2e_with_lane() {
                 &jagged_vt,
                 &[&bad_acc, &fl1.acc],
                 &lagg,
-                tower_fold_grinding(),
+                tower_fold_grinding(cfg),
                 &mut ch,
             )
             .is_err(),
@@ -19789,6 +19100,7 @@ fn chain_tower_e2e_with_lane() {
 #[test]
 #[ignore] // The headline measurement — run explicitly with --nocapture.
 fn chain_tower_m32_headline() {
+    let cfg = test_config();
     let n_blocks: usize = std::env::var("CHAIN_BLOCKS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -19805,7 +19117,7 @@ fn chain_tower_m32_headline() {
     let mut _leaf_ms: Vec<f64> = Vec::new();
     let mut mk = |start: [u32; 16]| -> ChainProof {
         let t = std::time::Instant::now();
-        let cp = build_chain_proof(start, n_blocks);
+        let cp = build_chain_proof(cfg, start, n_blocks);
         _leaf_ms.push(t.elapsed().as_secs_f64() * 1e3);
         cp
     };
@@ -19816,8 +19128,8 @@ fn chain_tower_m32_headline() {
     assert_eq!(cp3.h_end, h_all, "the four segments ARE the chain");
 
     let t_fl = std::time::Instant::now();
-    let fl0 = build_fl_node(&cp0, &cp1);
-    let fl1 = build_fl_node(&cp2, &cp3);
+    let fl0 = build_fl_node(cfg, &cp0, &cp1);
+    let fl1 = build_fl_node(cfg, &cp2, &cp3);
     let _fl_ms = t_fl.elapsed().as_secs_f64() * 1e3 / 2.0;
 
     let chain_registry = &cp0.inner.built.shape.registry;
@@ -19836,7 +19148,13 @@ fn chain_tower_m32_headline() {
         claims_base: fl0.fold_pub_base,
     };
     let t_in = std::time::Instant::now();
-    let out = build_node_outer_app(&[&fl0.lo, &fl1.lo], Some(fl0.stmt_base), Some(lane), None);
+    let out = build_node_outer_app(
+        cfg,
+        &[&fl0.lo, &fl1.lo],
+        Some(fl0.stmt_base),
+        Some(lane),
+        None,
+    );
     let (node, acc, nt) = (out.lo, out.acc, out.online);
     let _internal_ms = t_in.elapsed().as_secs_f64() * 1e3;
     let app = out.app_base.expect("app block");
@@ -19938,6 +19256,7 @@ fn chain_tower_m32_headline() {
 #[test]
 #[ignore] // Benchmark — run explicitly with --nocapture.
 fn tower_online_bench() {
+    let cfg = test_config();
     let runs: usize = std::env::var("BENCH_RUNS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -19968,16 +19287,16 @@ fn tower_online_bench() {
     STEADY_OVERRIDE.store(runs, Ordering::Relaxed); // +1: iteration 0 is the shape warmup (setup tier)
 
     // ---- LEAF: nothing else is alive; the measured proof BECOMES cp0 ----
-    let cp0 = build_chain_proof(h0, n_blocks);
+    let cp0 = build_chain_proof(cfg, h0, n_blocks);
     let leaf = cp0.onlines.clone();
     STEADY_OVERRIDE.store(0, Ordering::Relaxed);
-    let cp1 = build_chain_proof(cp0.h_end, n_blocks);
+    let cp1 = build_chain_proof(cfg, cp0.h_end, n_blocks);
 
     // ---- FL: two chain children and nothing more. The measured FL is the
     // spine's FRESH child — the EARLIEST segments, since a spine PREPENDS —
     // so the measured leaf and FL become the tower's own materials. ----
     STEADY_OVERRIDE.store(runs, Ordering::Relaxed); // +1: iteration 0 is the shape warmup (setup tier)
-    let fresh = build_fl_node(&cp0, &cp1);
+    let fresh = build_fl_node(cfg, &cp0, &cp1);
     let fl = fresh.onlines.clone();
     STEADY_OVERRIDE.store(0, Ordering::Relaxed);
 
@@ -19988,11 +19307,14 @@ fn tower_online_bench() {
     // 10, 5 and 3. The segment pairs are scoped so they drop once folded —
     // what production carries.
     let (fl0, fl1) = {
-        let cp2 = build_chain_proof(cp1.h_end, n_blocks);
-        let cp3 = build_chain_proof(cp2.h_end, n_blocks);
-        let cp4 = build_chain_proof(cp3.h_end, n_blocks);
-        let cp5 = build_chain_proof(cp4.h_end, n_blocks);
-        (build_fl_node(&cp2, &cp3), build_fl_node(&cp4, &cp5))
+        let cp2 = build_chain_proof(cfg, cp1.h_end, n_blocks);
+        let cp3 = build_chain_proof(cfg, cp2.h_end, n_blocks);
+        let cp4 = build_chain_proof(cfg, cp3.h_end, n_blocks);
+        let cp5 = build_chain_proof(cfg, cp4.h_end, n_blocks);
+        (
+            build_fl_node(cfg, &cp2, &cp3),
+            build_fl_node(cfg, &cp4, &cp5),
+        )
     };
     drop(cp1);
     // The lane is what production carries: the children's chain
@@ -20009,6 +19331,7 @@ fn tower_online_bench() {
     // materials that are ALL resident before either starts.
     STEADY_OVERRIDE.store(runs, Ordering::Relaxed); // +1: iteration 0 is the shape warmup (setup tier)
     let base = build_node_outer_app(
+        cfg,
         &[&fl0.lo, &fl1.lo],
         Some(fresh.stmt_base),
         Some(ChainLane {
@@ -20026,9 +19349,10 @@ fn tower_online_bench() {
     // The steady spine node: the fresh FL (the segments BEFORE the base's)
     // plus the base as the node child whose accumulator it inherits —
     // built exactly as the convergence test builds node_2.
-    let spine: Vec<Online> = if envelope_shape().is_some() {
+    let spine: Vec<Online> = {
         let lane = base.lane_acc.clone().expect("the base's lane");
         build_node_outer_app(
+            cfg,
             &[&fresh.lo, &base.lo],
             Some(fresh.stmt_base),
             Some(ChainLane {
@@ -20047,8 +19371,6 @@ fn tower_online_bench() {
             }),
         )
         .onlines
-    } else {
-        Vec::new()
     };
     STEADY_OVERRIDE.store(usize::MAX, Ordering::Relaxed);
 
@@ -20100,7 +19422,7 @@ fn tower_online_bench() {
     println!(
         "\nONLINE BENCH — {n_blocks} compressions/leaf, {runs} runs/stage, profile {:?}\n  \
          per-proof ONLINE (setup is per-SHAPE, shown for reference only):",
-        tower_profile(),
+        cfg,
     );
     for (name, w) in warms {
         if let Some(ms) = w {
