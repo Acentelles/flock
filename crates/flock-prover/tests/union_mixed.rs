@@ -153,12 +153,12 @@ fn mixed_blake3_sha256_roundtrip_and_tamper() {
     let pcs_params = union_pcs_params(&union);
     // The dense-stack shape on this registry at FULL utilization (heights =
     // capacity, M4's grid exactly): 339 of 512 chunk-columns used (SHA-256
-    // 246/256, BLAKE3 92/128; the top gap grew with the lin-id drop and the
-    // Option-F fused/const adders), a genuinely non-identity compaction
-    // (BLAKE3's columns stack at 246, not 256), rounding back to the padded
-    // word count at this ratio.
+    // 227/256, BLAKE3 92/128; the top gap grew with the lin-id drops and the
+    // Option-F fused/const adders on both tables), a genuinely non-identity
+    // compaction (BLAKE3's columns stack at 227, not 256), rounding back to
+    // the padded word count at this ratio.
     assert!(!union.compaction_is_identity());
-    assert_eq!(union.dense_words(), (246 + 92) << nu);
+    assert_eq!(union.dense_words(), (227 + 92) << nu);
     assert_eq!(union.committed_words(), 1 << (union.m_total() - 7));
 
     let mut rng = Rng::new(0x03_31_2B_B3);
@@ -548,7 +548,7 @@ fn dense_floor_roundtrip_and_statement_binding() {
 
 /// M5 — THE area gate, end to end: at ν = 7 (M = 23, padded 2^16 words) a
 /// partial-utilization mix at counts (32, 32) commits the height-`n_t`
-/// dense stack of 32·(246 + 92) = 10 816 words → 2^15 committed words
+/// dense stack of 32·(227 + 92) = 10 208 words → 2^15 committed words
 /// (the m22 config floor) — HALF of M4's capacity-height 2^16 — and the
 /// proof roundtrips through the smaller commitment. Wrong-count tampering
 /// still rejects (transcript binding first; the count-derived
@@ -563,9 +563,9 @@ fn mixed_area_saving_roundtrip() {
     let (registry, sha2_r1cs, blake3_r1cs) = mixed_registry(nu);
     assert_eq!(registry.m_total(), 23);
     let union = UnionInstance::new(&registry, counts.to_vec());
-    // The halving: dense 10 816 words → committed 2^15 (config floor;
+    // The halving: dense 10 208 words → committed 2^15 (config floor;
     // next_pow2 alone would give 2^14) vs M4's capacity-height 2^16.
-    assert_eq!(union.dense_words(), 10_816);
+    assert_eq!(union.dense_words(), 10_208);
     assert_eq!(union.committed_words(), 1 << 15);
     assert_eq!(union.dense_m(), 22);
     assert_eq!(
@@ -1681,7 +1681,7 @@ fn in_place_generation_matches_prebuilt_byte_identical() {
 /// production scale, the mixed-union analogue of `jagged_throughput`'s
 /// BLAKE3 m = 30 sweep). ν = 14 puts the union at M = 30; at FULL
 /// utilization (16384, 16384) the count-proportional dense stack —
-/// (246 + 92)·2^14 = 5 537 792 words — rounds back up to the full 2^23-word
+/// (227 + 92)·2^14 = 5 226 496 words — rounds back up to the full 2^23-word
 /// padded commit, i.e. `dense_m = 30` (the embedded m30 Ligerito config; the
 /// count-proportional shrink only bites below full utilization). The two
 /// single-type baselines run BLAKE3 (16384 blocks, m = 28) and SHA-256
@@ -1782,7 +1782,7 @@ fn mixed_m30_throughput() {
     let pcs_params = union_pcs_params(&union);
     // Full utilization: the dense stack rounds back to the padded commit, so
     // dense_m lands on the embedded m30 Ligerito config.
-    assert_eq!(union.dense_words(), (246 + 92) << nu);
+    assert_eq!(union.dense_words(), (227 + 92) << nu);
     assert_eq!(union.dense_m(), 30);
     assert_eq!(union.committed_words(), union.packed_len());
     assert_eq!(pcs_params.m, 30);

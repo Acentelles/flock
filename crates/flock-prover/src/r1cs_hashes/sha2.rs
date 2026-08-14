@@ -45,7 +45,10 @@
 //!   each Ch / Maj AND row would blow up to thousands of terms.
 //! - `H_out[w]` — the public output of the compression.
 
-use super::common::{BitRecord, add_carry_parts, or_bit_at, or_u32_at_bit};
+use super::common::{
+    BitRecord, add_carry_parts, const_add_parts, fused_add3_parts, fused_add4_parts, or_bit_at,
+    or_u32_at_bit,
+};
 use flock_core::field::F128;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
 
@@ -65,9 +68,10 @@ pub const WORD_BITS: usize = 32;
 pub const H_WORDS: usize = 8;
 pub const M_WORDS: usize = 16;
 pub const N_OUT_WORDS: usize = 8;
-pub const ADDS_PER_ROUND: usize = 7;
-pub const ADDS_PER_SCHED: usize = 3;
 pub const CARRIES_PER_ADD: usize = WORD_BITS - 1; // 31
+/// Ripple products of a fused carry-save adder (bit 0's product row
+/// vanishes against the shifted majority word's zero low bit).
+pub const RIPPLE_BITS: usize = WORD_BITS - 2; // 30
 
 /// SHA-256 IV (FIPS 180-4 §5.3.3).
 pub const SHA256_IV: [u32; 8] = [
@@ -108,14 +112,75 @@ pub const M_BASE: usize = 2 * SLOT_BITS; // 512
 pub const CH_AND_BASE: usize = M_BASE + M_WORDS * WORD_BITS; // 1,024
 pub const MAJ_AND_BASE: usize = CH_AND_BASE + N_ROUNDS * WORD_BITS; // 3,072
 pub const ROUND_CARRY_BASE: usize = MAJ_AND_BASE + N_ROUNDS * WORD_BITS; // 5,120
-pub const W_BASE: usize = ROUND_CARRY_BASE + N_ROUNDS * ADDS_PER_ROUND * CARRIES_PER_ADD; // 19,008
-pub const SCHED_CARRY_BASE: usize = W_BASE + N_SCHED * WORD_BITS; // 20,544
-pub const T1_BASE: usize = SCHED_CARRY_BASE + N_SCHED * ADDS_PER_SCHED * CARRIES_PER_ADD; // 25,008
-pub const E_NEW_BASE: usize = T1_BASE + N_ROUNDS * WORD_BITS; // 27,056
-pub const A_NEW_BASE: usize = E_NEW_BASE + N_ROUNDS * WORD_BITS; // 29,104
-pub const OUT_CARRY_BASE: usize = A_NEW_BASE + N_ROUNDS * WORD_BITS; // 31,152
-pub const Z_CONST_POS: usize = OUT_CARRY_BASE + N_OUT_WORDS * CARRIES_PER_ADD; // 31,400
-pub const USEFUL_BITS: usize = Z_CONST_POS + 1; // 31,401
+
+// **"Option F for SHA-256"** (the zk.golf `gf2-sha256-compress-canonical`
+// record's systematic techniques, ported 2026-08-14): the round's five
+// T1-chain additions become one constant add plus one fused 4-operand
+// carry-save tree, `a_new` fuses `T2` into a 3-operand tree, `T1` is never
+// materialized (its two consumers inline it), and each schedule step is a
+// fused 4-operand tree. Per round:
+//
+//   hk    = h + K[r]            constant add — `31 − t` aux products, where
+//                               `t = trailing_zeros(K) + 1` (the carry into
+//                               bit t is the affine seed)
+//   T1    = hk + Σ1(e) + Ch + W[r]   fused 4-op: 31 + 31 + 30 = 92 products
+//   a_new = T1 + Σ0(a) + Maj        fused 3-op: 31 + 30 = 61 products
+//   e_new = d + T1                  ripple add: 31 products
+//
+// Round r's aux block (variable stride, `184 + (31 − t_r)` bits):
+//   [0..31)   maj1 (hk, Σ1 | shared Ch)     [92..123)  a_new maj (T1, Σ0 | Maj)
+//   [31..62)  maj2 (p1, b1 | shared W)      [123..153) a_new ripple
+//   [62..92)  T1 ripple                     [153..184) e_new carries
+//                                           [184..184+31−t) hk = h + K aux
+/// `t` of round r's constant add: `trailing_zeros(K[r]) + 1`.
+pub const fn k_seed_t(r: usize) -> usize {
+    SHA256_K[r].trailing_zeros() as usize + 1
+}
+/// Aux products of round r's `h + K[r]` constant add.
+pub const fn k_add_rows(r: usize) -> usize {
+    CARRIES_PER_ADD - k_seed_t(r)
+}
+/// Bits of round r's aux block.
+pub const fn round_add_bits(r: usize) -> usize {
+    RC_ADDK + k_add_rows(r)
+}
+// Within-round aux offsets (relative to `ROUND_BASE[r]`).
+pub const RC_MAJ1: usize = 0;
+pub const RC_MAJ2: usize = CARRIES_PER_ADD; // 31
+pub const RC_RIP: usize = 2 * CARRIES_PER_ADD; // 62
+pub const RC_AMAJ: usize = RC_RIP + RIPPLE_BITS; // 92
+pub const RC_ARIP: usize = RC_AMAJ + CARRIES_PER_ADD; // 123
+pub const RC_ENEW: usize = RC_ARIP + RIPPLE_BITS; // 153
+pub const RC_ADDK: usize = RC_ENEW + CARRIES_PER_ADD; // 184
+/// `ROUND_BASE[r]` = first bit of round r's aux block; `ROUND_BASE[64]` ends
+/// the region.
+pub const ROUND_BASE: [usize; N_ROUNDS + 1] = {
+    let mut t = [0usize; N_ROUNDS + 1];
+    let mut acc = ROUND_CARRY_BASE;
+    let mut r = 0;
+    while r < N_ROUNDS {
+        t[r] = acc;
+        acc += round_add_bits(r);
+        r += 1;
+    }
+    t[N_ROUNDS] = acc;
+    t
+};
+
+// Schedule step: W[t] = σ1(W[t-2]) + W[t-7] + σ0(W[t-15]) + W[t-16] as one
+// fused 4-op tree — 92 aux bits per step.
+pub const SCHED_ADD_BITS: usize = 2 * CARRIES_PER_ADD + RIPPLE_BITS; // 92
+pub const SC_MAJ1: usize = 0;
+pub const SC_MAJ2: usize = CARRIES_PER_ADD; // 31
+pub const SC_RIP: usize = 2 * CARRIES_PER_ADD; // 62
+
+pub const W_BASE: usize = ROUND_BASE[N_ROUNDS]; // 18,757
+pub const SCHED_CARRY_BASE: usize = W_BASE + N_SCHED * WORD_BITS; // 20,293
+pub const E_NEW_BASE: usize = SCHED_CARRY_BASE + N_SCHED * SCHED_ADD_BITS; // 24,709
+pub const A_NEW_BASE: usize = E_NEW_BASE + N_ROUNDS * WORD_BITS; // 26,757
+pub const OUT_CARRY_BASE: usize = A_NEW_BASE + N_ROUNDS * WORD_BITS; // 28,805
+pub const Z_CONST_POS: usize = OUT_CARRY_BASE + N_OUT_WORDS * CARRIES_PER_ADD; // 29,053
+pub const USEFUL_BITS: usize = Z_CONST_POS + 1; // 29,054
 
 // Slot accessors.
 #[inline]
@@ -135,8 +200,9 @@ pub fn maj_and_bit(r: usize, b: usize) -> usize {
     MAJ_AND_BASE + WORD_BITS * r + b
 }
 #[inline]
-pub fn round_carry_bit(r: usize, add: usize, b: usize) -> usize {
-    ROUND_CARRY_BASE + r * ADDS_PER_ROUND * CARRIES_PER_ADD + add * CARRIES_PER_ADD + b
+pub fn round_bit(r: usize, off: usize) -> usize {
+    debug_assert!(r < N_ROUNDS && off < round_add_bits(r));
+    ROUND_BASE[r] + off
 }
 #[inline]
 pub fn w_bit(t: usize, b: usize) -> usize {
@@ -148,13 +214,9 @@ pub fn w_bit(t: usize, b: usize) -> usize {
     }
 }
 #[inline]
-pub fn sched_carry_bit(t: usize, add: usize, b: usize) -> usize {
-    debug_assert!((16..16 + N_SCHED).contains(&t));
-    SCHED_CARRY_BASE + (t - 16) * ADDS_PER_SCHED * CARRIES_PER_ADD + add * CARRIES_PER_ADD + b
-}
-#[inline]
-pub fn t1_bit(r: usize, b: usize) -> usize {
-    T1_BASE + WORD_BITS * r + b
+pub fn sched_bit(t: usize, off: usize) -> usize {
+    debug_assert!((16..16 + N_SCHED).contains(&t) && off < SCHED_ADD_BITS);
+    SCHED_CARRY_BASE + (t - 16) * SCHED_ADD_BITS + off
 }
 #[inline]
 pub fn e_new_bit(r: usize, b: usize) -> usize {
@@ -268,15 +330,57 @@ fn big_sigma_1(w: &Word) -> Word {
     rot_xor3(w, 6, 11, 25)
 }
 
-/// 32-bit modular add `x + y`. Allocates 31 carry-aux AND rows via
-/// `carry_slot(i)`; the carry chain is `cin[i+1] = cin[i] ⊕ carry_aux[i]`.
+// ───────────────────────────────────────────────────────────────────────────
+// Row sink — ONE symbolic walk serves both the matrix builder and the
+// lincheck scatter walker, so the two can never drift apart.
+// ───────────────────────────────────────────────────────────────────────────
+
+trait RowSink {
+    /// Emit row `slot` with `A = a`, `B = b` (products and copy rows alike).
+    fn row(&mut self, slot: usize, a: &Sup, b: &Sup);
+}
+
+/// Writes the sparse `(A_0, B_0)` rows.
+struct MatSink<'m> {
+    a_rows: &'m mut [Sup],
+    b_rows: &'m mut [Sup],
+}
+impl RowSink for MatSink<'_> {
+    fn row(&mut self, slot: usize, a: &Sup, b: &Sup) {
+        self.a_rows[slot] = a.clone();
+        self.b_rows[slot] = b.clone();
+    }
+}
+
+/// Scatters `alpha·eq[row]` (A side) and `eq[row]` (B side) into the
+/// lincheck combination — duplicate slot adds cancel in char 2, matching
+/// the matrix side's XOR support.
+struct FoldSink<'m> {
+    comb: &'m mut [F128],
+    alpha: F128,
+    eq_inner: &'m [F128],
+}
+impl RowSink for FoldSink<'_> {
+    fn row(&mut self, slot: usize, a: &Sup, b: &Sup) {
+        let e = self.eq_inner[slot];
+        let ea = self.alpha * e;
+        for &c in a {
+            self.comb[c] += ea;
+        }
+        for &c in b {
+            self.comb[c] += e;
+        }
+    }
+}
+
+/// 32-bit modular add `x + y`. Allocates 31 aux AND rows via
+/// `carry_slot(i)`; the carry chain is `cin[i+1] = cin[i] ⊕ aux[i]`.
 /// Returns the symbolic 32-bit sum (per-bit XOR support).
-fn add32_inline<F: Fn(usize) -> usize>(
+fn add32_inline<S: RowSink, F: Fn(usize) -> usize>(
     x: &Word,
     y: &Word,
     carry_slot: F,
-    a_rows: &mut [Sup],
-    b_rows: &mut [Sup],
+    sink: &mut S,
 ) -> Word {
     let mut sum = zero_word();
     let mut cin: Sup = Sup::new();
@@ -284,106 +388,186 @@ fn add32_inline<F: Fn(usize) -> usize>(
         sum[i] = xor3(&x[i], &y[i], &cin);
         if i < CARRIES_PER_ADD {
             let slot = carry_slot(i);
-            a_rows[slot] = xor_sup(&x[i], &cin);
-            b_rows[slot] = xor_sup(&y[i], &cin);
+            sink.row(slot, &xor_sup(&x[i], &cin), &xor_sup(&y[i], &cin));
             cin = xor_sup(&cin, &vec![slot]);
         }
     }
     sum
 }
 
+/// Constant-operand add `k + y` (`k` a compile-time constant, here a round
+/// constant): aux products only for bits `t..30` at `base..`, where
+/// `t = trailing_zeros(k) + 1` — the carries below `k`'s lowest set bit are
+/// zero and the carry into bit `t` is the affine seed `y_{t-1}`.
+fn add_const_inline<S: RowSink>(k: u32, y: &Word, base: usize, sink: &mut S) -> Word {
+    let t = k.trailing_zeros() as usize + 1;
+    let k_sup = |i: usize| -> Sup {
+        if (k >> i) & 1 == 1 {
+            vec![Z_CONST_POS]
+        } else {
+            Sup::new()
+        }
+    };
+    // carry(i) for i >= t: the seed y_{t-1} plus the materialized prefix.
+    let mut sum = zero_word();
+    let mut carry: Sup = Sup::new();
+    for i in 0..WORD_BITS {
+        if i == t {
+            carry = y[t - 1].clone();
+        }
+        sum[i] = xor3(&k_sup(i), &y[i], &carry);
+        if (t..CARRIES_PER_ADD).contains(&i) {
+            let slot = base + (i - t);
+            sink.row(slot, &xor_sup(&k_sup(i), &carry), &xor_sup(&y[i], &carry));
+            carry = xor_sup(&carry, &vec![slot]);
+        }
+    }
+    sum
+}
+
+/// One carry-save layer over `(x, y | shared z)`: 31 majority-product rows
+/// at `maj_base..`. Returns the partial sum `p = x⊕y⊕z` and the shifted
+/// majority word `b` (`b_0 = 0`, `b_{i+1} = slot_i ⊕ z_i`).
+fn csa_layer<S: RowSink>(
+    x: &Word,
+    y: &Word,
+    z: &Word,
+    maj_base: usize,
+    sink: &mut S,
+) -> (Word, Word) {
+    let mut p = zero_word();
+    let mut bw = zero_word();
+    for i in 0..WORD_BITS {
+        p[i] = xor3(&x[i], &y[i], &z[i]);
+        if i < CARRIES_PER_ADD {
+            let slot = maj_base + i;
+            sink.row(slot, &xor_sup(&x[i], &z[i]), &xor_sup(&y[i], &z[i]));
+            if i + 1 < WORD_BITS {
+                bw[i + 1] = xor_sup(&vec![slot], &z[i]);
+            }
+        }
+    }
+    (p, bw)
+}
+
+/// The fused ripple of a carry-save pair `(p, b)` with `b_0 = 0`: 30
+/// product rows at `rip_base..` (bit 0's product vanishes), sum inlined.
+fn csa_ripple<S: RowSink>(p: &Word, bw: &Word, rip_base: usize, sink: &mut S) -> Word {
+    let mut sum = zero_word();
+    let mut g: Sup = Sup::new();
+    for i in 0..WORD_BITS {
+        sum[i] = xor3(&p[i], &bw[i], &g);
+        if (1..=RIPPLE_BITS).contains(&i) {
+            let slot = rip_base + (i - 1);
+            sink.row(slot, &xor_sup(&p[i], &g), &xor_sup(&bw[i], &g));
+            g = xor_sup(&g, &vec![slot]);
+        }
+    }
+    sum
+}
+
+/// Fused 3-operand add `x + y + z` (z the shared/compact operand):
+/// 31 + 30 = 61 rows.
+fn fused_add3_inline<S: RowSink>(
+    x: &Word,
+    y: &Word,
+    z: &Word,
+    maj_base: usize,
+    rip_base: usize,
+    sink: &mut S,
+) -> Word {
+    let (p, bw) = csa_layer(x, y, z, maj_base, sink);
+    csa_ripple(&p, &bw, rip_base, sink)
+}
+
+/// Fused 4-operand add `x + y + z + w` (z shared in layer 1, w in layer 2):
+/// 31 + 31 + 30 = 92 rows.
+#[allow(clippy::too_many_arguments)]
+fn fused_add4_inline<S: RowSink>(
+    x: &Word,
+    y: &Word,
+    z: &Word,
+    w: &Word,
+    maj1_base: usize,
+    maj2_base: usize,
+    rip_base: usize,
+    sink: &mut S,
+) -> Word {
+    let (p1, b1) = csa_layer(x, y, z, maj1_base, sink);
+    let (p2, b2) = csa_layer(&p1, &b1, w, maj2_base, sink);
+    csa_ripple(&p2, &b2, rip_base, sink)
+}
+
 /// Materialize a symbolic word at fresh slots: emit 32 rows
 /// `(linear support) · z[Z_CONST] = z[slot]`, return a slot-word.
-fn materialize<F: Fn(usize) -> usize>(
-    raw: &Word,
-    slot_fn: F,
-    a_rows: &mut [Sup],
-    b_rows: &mut [Sup],
-) -> Word {
+fn materialize<S: RowSink, F: Fn(usize) -> usize>(raw: &Word, slot_fn: F, sink: &mut S) -> Word {
     let mut out = zero_word();
     for b in 0..WORD_BITS {
         let s = slot_fn(b);
-        a_rows[s] = raw[b].clone();
-        b_rows[s] = vec![Z_CONST_POS];
+        sink.row(s, &raw[b], &vec![Z_CONST_POS]);
         out[b] = vec![s];
     }
     out
 }
 
-fn add32_alloc<F1: Fn(usize) -> usize, F2: Fn(usize) -> usize>(
+fn add32_alloc<S: RowSink, F1: Fn(usize) -> usize, F2: Fn(usize) -> usize>(
     x: &Word,
     y: &Word,
     carry_slot: F1,
     sum_slot: F2,
-    a_rows: &mut [Sup],
-    b_rows: &mut [Sup],
+    sink: &mut S,
 ) -> Word {
-    let raw = add32_inline(x, y, carry_slot, a_rows, b_rows);
-    materialize(&raw, sum_slot, a_rows, b_rows)
+    let raw = add32_inline(x, y, carry_slot, sink);
+    materialize(&raw, sum_slot, sink)
 }
 
 // ───────────────────────────────────────────────────────────────────────────
 // Public matrix builder
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Build `(A_0, B_0)` for one block of the hybrid SHA-256 R1CS. `C_0 = I`
-/// (circuit shape); use [`build_block_r1cs`] to wrap these into a
-/// [`BlockR1cs`].
-pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
-    let mut a_rows: Vec<Sup> = vec![Sup::new(); K];
-    let mut b_rows: Vec<Sup> = vec![Sup::new(); K];
-
-    // Z_CONST tautology: z[0]·z[0] = z[0] (boolean-pin).
-    a_rows[Z_CONST_POS] = vec![Z_CONST_POS];
-    b_rows[Z_CONST_POS] = vec![Z_CONST_POS];
+/// The complete symbolic walk: every row of one compression, emitted into
+/// `sink`. Serves the matrix builder and the lincheck scatterer alike.
+fn walk_rows<S: RowSink>(sink: &mut S) {
+    // Z_CONST tautology: z[ZC]·z[ZC] = z[ZC] (boolean-pin).
+    sink.row(Z_CONST_POS, &vec![Z_CONST_POS], &vec![Z_CONST_POS]);
 
     // H_in, M_in: free-witness rows.
     for w in 0..H_WORDS {
         for b in 0..WORD_BITS {
             let s = h_bit(w, b);
-            a_rows[s] = vec![s];
-            b_rows[s] = vec![Z_CONST_POS];
+            sink.row(s, &vec![s], &vec![Z_CONST_POS]);
         }
     }
     for i in 0..M_WORDS {
         for b in 0..WORD_BITS {
             let s = m_bit(i, b);
-            a_rows[s] = vec![s];
-            b_rows[s] = vec![Z_CONST_POS];
+            sink.row(s, &vec![s], &vec![Z_CONST_POS]);
         }
     }
 
     let h_in: Vec<Word> = (0..H_WORDS).map(|w| wire_word(|b| h_bit(w, b))).collect();
     let mut w_arr: Vec<Word> = (0..M_WORDS).map(|i| wire_word(|b| m_bit(i, b))).collect();
 
-    // Message schedule (W[16..64]). Inline sched_0, sched_1; allocate W[t] = sched_2.
+    // Message schedule (W[16..64]): one fused 4-operand tree per step
+    // (σ1(W[t-2]) + σ0(W[t-15]) + W[t-7] + W[t-16], the plain-slot words
+    // riding the shared sides); W[t] materialized (the schedule cascades
+    // for t ≥ 32 without it).
     for t in 16..(16 + N_SCHED) {
         let s1 = sigma_1(&w_arr[t - 2]);
         let s0 = sigma_0(&w_arr[t - 15]);
         let w_m7 = w_arr[t - 7].clone();
         let w_m16 = w_arr[t - 16].clone();
-        let sched_0 = add32_inline(
+        let raw = fused_add4_inline(
             &s1,
-            &w_m7,
-            |i| sched_carry_bit(t, 0, i),
-            &mut a_rows,
-            &mut b_rows,
-        );
-        let sched_1 = add32_inline(
-            &sched_0,
             &s0,
-            |i| sched_carry_bit(t, 1, i),
-            &mut a_rows,
-            &mut b_rows,
-        );
-        let w_t = add32_alloc(
-            &sched_1,
+            &w_m7,
             &w_m16,
-            |i| sched_carry_bit(t, 2, i),
-            |b| w_bit(t, b),
-            &mut a_rows,
-            &mut b_rows,
+            sched_bit(t, SC_MAJ1),
+            sched_bit(t, SC_MAJ2),
+            sched_bit(t, SC_RIP),
+            sink,
         );
+        let w_t = materialize(&raw, |b| w_bit(t, b), sink);
         w_arr.push(w_t);
     }
 
@@ -413,84 +597,48 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
         let mut ch_and = zero_word();
         for bit in 0..WORD_BITS {
             let s = ch_and_bit(r, bit);
-            a_rows[s] = e[bit].clone();
-            b_rows[s] = xor_sup(&f[bit], &g[bit]);
+            sink.row(s, &e[bit], &xor_sup(&f[bit], &g[bit]));
             ch_and[bit] = vec![s];
         }
         // maj_and[r][bit] = (a[bit] ⊕ b[bit]) · (a[bit] ⊕ c[bit])
         let mut maj_and = zero_word();
         for bit in 0..WORD_BITS {
             let s = maj_and_bit(r, bit);
-            a_rows[s] = xor_sup(&a[bit], &bb[bit]);
-            b_rows[s] = xor_sup(&a[bit], &c[bit]);
+            sink.row(s, &xor_sup(&a[bit], &bb[bit]), &xor_sup(&a[bit], &c[bit]));
             maj_and[bit] = vec![s];
         }
         let ch_out = xor_words(&ch_and, &g); // Ch = e·(f⊕g) ⊕ g
         let maj_out = xor_words(&maj_and, &a); // Maj = (a⊕b)·(a⊕c) ⊕ a
 
-        // T1 chain: inline T1_0..T1_2, allocate T1.
-        let t1_0 = add32_inline(
-            &h_var,
+        // hk = h + K[r]: the round constant folded in as a constant add.
+        let hk = add_const_inline(SHA256_K[r], &h_var, round_bit(r, RC_ADDK), sink);
+        // T1 = hk + Σ1(e) + Ch + W[r]: one fused 4-operand tree. T1 is NOT
+        // materialized — its two consumers inline it (both feed rows whose
+        // other operands are materialized state, so the expansion is
+        // bounded; no cross-round cascade).
+        let t1 = fused_add4_inline(
+            &hk,
             &big_sigma_1(&e),
-            |i| round_carry_bit(r, 0, i),
-            &mut a_rows,
-            &mut b_rows,
-        );
-        let t1_1 = add32_inline(
-            &t1_0,
             &ch_out,
-            |i| round_carry_bit(r, 1, i),
-            &mut a_rows,
-            &mut b_rows,
-        );
-        let k_word: Word = (0..WORD_BITS)
-            .map(|i| {
-                if (SHA256_K[r] >> i) & 1 == 1 {
-                    vec![Z_CONST_POS]
-                } else {
-                    Sup::new()
-                }
-            })
-            .collect();
-        let t1_2 = add32_inline(
-            &t1_1,
-            &k_word,
-            |i| round_carry_bit(r, 2, i),
-            &mut a_rows,
-            &mut b_rows,
-        );
-        let t1 = add32_alloc(
-            &t1_2,
             &w_arr[r],
-            |i| round_carry_bit(r, 3, i),
-            |b| t1_bit(r, b),
-            &mut a_rows,
-            &mut b_rows,
+            round_bit(r, RC_MAJ1),
+            round_bit(r, RC_MAJ2),
+            round_bit(r, RC_RIP),
+            sink,
         );
-        // T2 inlined; E_NEW, A_NEW allocated.
-        let t2 = add32_inline(
+        // a_new = T1 + Σ0(a) + Maj: T2 dissolves into a fused 3-op tree.
+        let a_raw = fused_add3_inline(
+            &t1,
             &big_sigma_0(&a),
             &maj_out,
-            |i| round_carry_bit(r, 4, i),
-            &mut a_rows,
-            &mut b_rows,
+            round_bit(r, RC_AMAJ),
+            round_bit(r, RC_ARIP),
+            sink,
         );
-        let e_new = add32_alloc(
-            &d,
-            &t1,
-            |i| round_carry_bit(r, 5, i),
-            |b| e_new_bit(r, b),
-            &mut a_rows,
-            &mut b_rows,
-        );
-        let a_new = add32_alloc(
-            &t1,
-            &t2,
-            |i| round_carry_bit(r, 6, i),
-            |b| a_new_bit(r, b),
-            &mut a_rows,
-            &mut b_rows,
-        );
+        let a_new = materialize(&a_raw, |b| a_new_bit(r, b), sink);
+        // e_new = d + T1.
+        let e_raw = add32_inline(&d, &t1, |i| round_bit(r, RC_ENEW + i), sink);
+        let e_new = materialize(&e_raw, |b| e_new_bit(r, b), sink);
 
         // Register shift: (a', b', c', d', e', f', g', h') = (A_NEW, a, b, c, E_NEW, e, f, g)
         state = [a_new, a, bb, c, e_new, e, f, g];
@@ -503,11 +651,21 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
             &h_in[w],
             |i| out_carry_bit(w, i),
             |b| h_out_bit(w, b),
-            &mut a_rows,
-            &mut b_rows,
+            sink,
         );
     }
+}
 
+/// Build `(A_0, B_0)` for one block of the hybrid SHA-256 R1CS. `C_0 = I`
+/// (circuit shape); use [`build_block_r1cs`] to wrap these into a
+/// [`BlockR1cs`].
+pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
+    let mut a_rows: Vec<Sup> = vec![Sup::new(); K];
+    let mut b_rows: Vec<Sup> = vec![Sup::new(); K];
+    walk_rows(&mut MatSink {
+        a_rows: &mut a_rows,
+        b_rows: &mut b_rows,
+    });
     let to_mat = |rows| SparseBinaryMatrix {
         num_rows: K,
         num_cols: K,
@@ -553,17 +711,23 @@ pub fn build_block_witness(h_in: &[u32; 8], m: &[u32; 16]) -> Vec<bool> {
         write_word(&mut z, m_bit(i, 0), m[i]);
     }
 
-    // Schedule W[16..64].
+    // Bit-writer for a parts value whose row block starts at `base`.
+    fn write_bits(z: &mut [bool], base: usize, v: u32, n: usize) {
+        for i in 0..n {
+            z[base + i] = (v >> i) & 1 == 1;
+        }
+    }
+
+    // Schedule W[16..64]: fused 4-op trees.
     let mut w_arr = [0u32; 64];
     w_arr[..16].copy_from_slice(m);
     for t in 16..64 {
-        let s0 =
-            w_arr[t - 15].rotate_right(7) ^ w_arr[t - 15].rotate_right(18) ^ (w_arr[t - 15] >> 3);
-        let s1 =
-            w_arr[t - 2].rotate_right(17) ^ w_arr[t - 2].rotate_right(19) ^ (w_arr[t - 2] >> 10);
-        let sched_0 = add32_w(s1, w_arr[t - 7], sched_carry_bit(t, 0, 0), &mut z);
-        let sched_1 = add32_w(sched_0, s0, sched_carry_bit(t, 1, 0), &mut z);
-        let w_t = add32_w(sched_1, w_arr[t - 16], sched_carry_bit(t, 2, 0), &mut z);
+        let s0 = small_sigma0(w_arr[t - 15]);
+        let s1 = small_sigma1(w_arr[t - 2]);
+        let (w_t, m1, m2, rp) = fused_add4_parts(s1, s0, w_arr[t - 7], w_arr[t - 16]);
+        write_bits(&mut z, sched_bit(t, SC_MAJ1), m1[2], CARRIES_PER_ADD);
+        write_bits(&mut z, sched_bit(t, SC_MAJ2), m2[2], CARRIES_PER_ADD);
+        write_bits(&mut z, sched_bit(t, SC_RIP), rp[2], RIPPLE_BITS);
         write_word(&mut z, w_bit(t, 0), w_t);
         w_arr[t] = w_t;
     }
@@ -581,20 +745,23 @@ pub fn build_block_witness(h_in: &[u32; 8], m: &[u32; 16]) -> Vec<bool> {
 
         let ch_out = ch_and ^ g;
         let maj_out = maj_and ^ a;
-        let s1e = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-        let s0a = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let s1e = big_sigma1(e);
+        let s0a = big_sigma0(a);
 
-        let t1_0 = add32_w(h_var, s1e, round_carry_bit(r, 0, 0), &mut z);
-        let t1_1 = add32_w(t1_0, ch_out, round_carry_bit(r, 1, 0), &mut z);
-        let t1_2 = add32_w(t1_1, SHA256_K[r], round_carry_bit(r, 2, 0), &mut z);
-        let t1 = add32_w(t1_2, w_arr[r], round_carry_bit(r, 3, 0), &mut z);
-        write_word(&mut z, t1_bit(r, 0), t1);
-
-        let t2 = add32_w(s0a, maj_out, round_carry_bit(r, 4, 0), &mut z);
-        let e_new = add32_w(d, t1, round_carry_bit(r, 5, 0), &mut z);
-        write_word(&mut z, e_new_bit(r, 0), e_new);
-        let a_new = add32_w(t1, t2, round_carry_bit(r, 6, 0), &mut z);
+        // hk = h + K[r] (constant add), then T1 as one fused 4-op tree.
+        let (hk, _kl, _kr, kp) = const_add_parts(SHA256_K[r], h_var);
+        write_bits(&mut z, round_bit(r, RC_ADDK), kp, k_add_rows(r));
+        let (t1, m1, m2, rp) = fused_add4_parts(hk, s1e, ch_out, w_arr[r]);
+        write_bits(&mut z, round_bit(r, RC_MAJ1), m1[2], CARRIES_PER_ADD);
+        write_bits(&mut z, round_bit(r, RC_MAJ2), m2[2], CARRIES_PER_ADD);
+        write_bits(&mut z, round_bit(r, RC_RIP), rp[2], RIPPLE_BITS);
+        // a_new = T1 + Σ0(a) + Maj (fused 3-op); e_new = d + T1.
+        let (a_new, am, ar) = fused_add3_parts(t1, s0a, maj_out);
+        write_bits(&mut z, round_bit(r, RC_AMAJ), am[2], CARRIES_PER_ADD);
+        write_bits(&mut z, round_bit(r, RC_ARIP), ar[2], RIPPLE_BITS);
         write_word(&mut z, a_new_bit(r, 0), a_new);
+        let e_new = add32_w(d, t1, round_bit(r, RC_ENEW), &mut z);
+        write_word(&mut z, e_new_bit(r, 0), e_new);
 
         state = [a_new, a, b, c, e_new, e, f, g];
     }
@@ -635,75 +802,10 @@ pub fn build_block_r1cs(n_blocks_log: usize) -> BlockR1cs {
         Some(Z_CONST_POS),
     )
 }
-
 // ───────────────────────────────────────────────────────────────────────────
-// Lincheck circuit walker — mirrors `build_matrices`. Same structure as
-// `sha2::Sha2LincheckCircuit` but uses this module's I/O-aligned slot
-// positions.
+// Lincheck circuit walker — the SAME `walk_rows` the matrix builder runs,
+// scattered into the combination via `FoldSink`.
 // ───────────────────────────────────────────────────────────────────────────
-
-fn scatter_add32_inline<F: Fn(usize) -> usize>(
-    x: &Word,
-    y: &Word,
-    carry_slot: F,
-    comb: &mut [F128],
-    alpha: F128,
-    eq_inner: &[F128],
-) -> Word {
-    let mut sum = zero_word();
-    let mut cin: Sup = Sup::new();
-    for i in 0..WORD_BITS {
-        sum[i] = xor3(&x[i], &y[i], &cin);
-        if i < CARRIES_PER_ADD {
-            let slot = carry_slot(i);
-            let row = slot;
-            let e = eq_inner[row];
-            let ea = alpha * e;
-            for &c in xor_sup(&x[i], &cin).iter() {
-                comb[c] += ea;
-            }
-            for &c in xor_sup(&y[i], &cin).iter() {
-                comb[c] += e;
-            }
-            cin = xor_sup(&cin, &vec![slot]);
-        }
-    }
-    sum
-}
-
-fn scatter_materialize<F: Fn(usize) -> usize>(
-    raw: &Word,
-    slot_fn: F,
-    comb: &mut [F128],
-    alpha: F128,
-    eq_inner: &[F128],
-) -> Word {
-    let mut out = zero_word();
-    for b in 0..WORD_BITS {
-        let s = slot_fn(b);
-        let e = eq_inner[s];
-        let ea = alpha * e;
-        for &c in raw[b].iter() {
-            comb[c] += ea;
-        }
-        comb[Z_CONST_POS] += e;
-        out[b] = vec![s];
-    }
-    out
-}
-
-fn scatter_add32_alloc<F1: Fn(usize) -> usize, F2: Fn(usize) -> usize>(
-    x: &Word,
-    y: &Word,
-    carry_slot: F1,
-    sum_slot: F2,
-    comb: &mut [F128],
-    alpha: F128,
-    eq_inner: &[F128],
-) -> Word {
-    let raw = scatter_add32_inline(x, y, carry_slot, comb, alpha, eq_inner);
-    scatter_materialize(&raw, sum_slot, comb, alpha, eq_inner)
-}
 
 pub struct Sha2LincheckCircuit;
 
@@ -715,198 +817,11 @@ impl flock_core::lincheck::LincheckCircuit for Sha2LincheckCircuit {
     fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
         assert_eq!(eq_inner.len(), K, "eq_inner length must equal n_cols = K");
         let mut comb = vec![F128::ZERO; K];
-
-        let e0 = eq_inner[Z_CONST_POS];
-        comb[Z_CONST_POS] += alpha * e0;
-        comb[Z_CONST_POS] += e0;
-
-        for w in 0..H_WORDS {
-            for b in 0..WORD_BITS {
-                let s = h_bit(w, b);
-                let e = eq_inner[s];
-                comb[s] += alpha * e;
-                comb[Z_CONST_POS] += e;
-            }
-        }
-        for i in 0..M_WORDS {
-            for b in 0..WORD_BITS {
-                let s = m_bit(i, b);
-                let e = eq_inner[s];
-                comb[s] += alpha * e;
-                comb[Z_CONST_POS] += e;
-            }
-        }
-
-        let h_in: Vec<Word> = (0..H_WORDS).map(|w| wire_word(|b| h_bit(w, b))).collect();
-        let mut w_arr: Vec<Word> = (0..M_WORDS).map(|i| wire_word(|b| m_bit(i, b))).collect();
-
-        for t in 16..(16 + N_SCHED) {
-            let s1 = sigma_1(&w_arr[t - 2]);
-            let s0 = sigma_0(&w_arr[t - 15]);
-            let w_m7 = w_arr[t - 7].clone();
-            let w_m16 = w_arr[t - 16].clone();
-            let sched_0 = scatter_add32_inline(
-                &s1,
-                &w_m7,
-                |i| sched_carry_bit(t, 0, i),
-                &mut comb,
-                alpha,
-                eq_inner,
-            );
-            let sched_1 = scatter_add32_inline(
-                &sched_0,
-                &s0,
-                |i| sched_carry_bit(t, 1, i),
-                &mut comb,
-                alpha,
-                eq_inner,
-            );
-            let w_t = scatter_add32_alloc(
-                &sched_1,
-                &w_m16,
-                |i| sched_carry_bit(t, 2, i),
-                |b| w_bit(t, b),
-                &mut comb,
-                alpha,
-                eq_inner,
-            );
-            w_arr.push(w_t);
-        }
-
-        let mut state: [Word; 8] = [
-            h_in[0].clone(),
-            h_in[1].clone(),
-            h_in[2].clone(),
-            h_in[3].clone(),
-            h_in[4].clone(),
-            h_in[5].clone(),
-            h_in[6].clone(),
-            h_in[7].clone(),
-        ];
-
-        for r in 0..N_ROUNDS {
-            let a = state[0].clone();
-            let bb = state[1].clone();
-            let c = state[2].clone();
-            let d = state[3].clone();
-            let e = state[4].clone();
-            let f = state[5].clone();
-            let g = state[6].clone();
-            let h_var = state[7].clone();
-
-            let mut ch_and = zero_word();
-            for bit in 0..WORD_BITS {
-                let s = ch_and_bit(r, bit);
-                let eq = eq_inner[s];
-                let ea = alpha * eq;
-                for &c2 in e[bit].iter() {
-                    comb[c2] += ea;
-                }
-                for &c2 in xor_sup(&f[bit], &g[bit]).iter() {
-                    comb[c2] += eq;
-                }
-                ch_and[bit] = vec![s];
-            }
-            let mut maj_and = zero_word();
-            for bit in 0..WORD_BITS {
-                let s = maj_and_bit(r, bit);
-                let eq = eq_inner[s];
-                let ea = alpha * eq;
-                for &c2 in xor_sup(&a[bit], &bb[bit]).iter() {
-                    comb[c2] += ea;
-                }
-                for &c2 in xor_sup(&a[bit], &c[bit]).iter() {
-                    comb[c2] += eq;
-                }
-                maj_and[bit] = vec![s];
-            }
-            let ch_out = xor_words(&ch_and, &g);
-            let maj_out = xor_words(&maj_and, &a);
-
-            let t1_0 = scatter_add32_inline(
-                &h_var,
-                &big_sigma_1(&e),
-                |i| round_carry_bit(r, 0, i),
-                &mut comb,
-                alpha,
-                eq_inner,
-            );
-            let t1_1 = scatter_add32_inline(
-                &t1_0,
-                &ch_out,
-                |i| round_carry_bit(r, 1, i),
-                &mut comb,
-                alpha,
-                eq_inner,
-            );
-            let k_word: Word = (0..WORD_BITS)
-                .map(|i| {
-                    if (SHA256_K[r] >> i) & 1 == 1 {
-                        vec![Z_CONST_POS]
-                    } else {
-                        Sup::new()
-                    }
-                })
-                .collect();
-            let t1_2 = scatter_add32_inline(
-                &t1_1,
-                &k_word,
-                |i| round_carry_bit(r, 2, i),
-                &mut comb,
-                alpha,
-                eq_inner,
-            );
-            let t1 = scatter_add32_alloc(
-                &t1_2,
-                &w_arr[r],
-                |i| round_carry_bit(r, 3, i),
-                |b| t1_bit(r, b),
-                &mut comb,
-                alpha,
-                eq_inner,
-            );
-            let t2 = scatter_add32_inline(
-                &big_sigma_0(&a),
-                &maj_out,
-                |i| round_carry_bit(r, 4, i),
-                &mut comb,
-                alpha,
-                eq_inner,
-            );
-            let e_new = scatter_add32_alloc(
-                &d,
-                &t1,
-                |i| round_carry_bit(r, 5, i),
-                |b| e_new_bit(r, b),
-                &mut comb,
-                alpha,
-                eq_inner,
-            );
-            let a_new = scatter_add32_alloc(
-                &t1,
-                &t2,
-                |i| round_carry_bit(r, 6, i),
-                |b| a_new_bit(r, b),
-                &mut comb,
-                alpha,
-                eq_inner,
-            );
-
-            state = [a_new, a, bb, c, e_new, e, f, g];
-        }
-
-        for w in 0..N_OUT_WORDS {
-            let _ = scatter_add32_alloc(
-                &state[w],
-                &h_in[w],
-                |i| out_carry_bit(w, i),
-                |b| h_out_bit(w, b),
-                &mut comb,
-                alpha,
-                eq_inner,
-            );
-        }
-
+        walk_rows(&mut FoldSink {
+            comb: &mut comb,
+            alpha,
+            eq_inner,
+        });
         comb
     }
 }
@@ -1032,29 +947,31 @@ fn build_block_ab_packed_into(
     // [`BitRecord`]).
     let mut w_sched = [0u32; 64];
     w_sched[..16].copy_from_slice(m);
-    const SC0: usize = 0;
-    const SC1: usize = CARRIES_PER_ADD;
-    const SC2: usize = 2 * CARRIES_PER_ADD;
     for t in 16..64 {
         let mut rz = BitRecord::<2>::new();
         let mut ra = BitRecord::<2>::new();
         let mut rb = BitRecord::<2>::new();
 
-        macro_rules! add_into {
-            ($pos:ident, $x:expr, $y:expr) => {{
-                let (sum, left, right, carry) = add_carry_parts($x, $y);
-                rz.push::<$pos>(carry);
-                ra.push::<$pos>(left);
-                rb.push::<$pos>(right);
-                sum
+        macro_rules! push3 {
+            ($pos:expr, $tr:expr) => {{
+                let tr = $tr;
+                rz.push::<{ $pos }>(tr[2]);
+                ra.push::<{ $pos }>(tr[0]);
+                rb.push::<{ $pos }>(tr[1]);
             }};
         }
 
-        let s_0 = add_into!(SC0, small_sigma1(w_sched[t - 2]), w_sched[t - 7]);
-        let s_1 = add_into!(SC1, s_0, small_sigma0(w_sched[t - 15]));
-        let w_t = add_into!(SC2, s_1, w_sched[t - 16]);
+        let (w_t, m1, m2, rp) = fused_add4_parts(
+            small_sigma1(w_sched[t - 2]),
+            small_sigma0(w_sched[t - 15]),
+            w_sched[t - 7],
+            w_sched[t - 16],
+        );
+        push3!(SC_MAJ1, m1);
+        push3!(SC_MAJ2, m2);
+        push3!(SC_RIP, rp);
 
-        let sched_base = sched_carry_bit(t, 0, 0);
+        let sched_base = sched_bit(t, 0);
         rz.flush(z, sched_base);
         ra.flush(a, sched_base);
         rb.flush(b, sched_base);
@@ -1099,54 +1016,54 @@ fn build_block_ab_packed_into(
         or_u32_at_bit(b, off, c_xor_a);
         let maj_out = maj_and_v ^ aa;
 
-        // The 7 × 31-bit round carries are contiguous (217 bits at stride
-        // 217) — composed in a register record and flushed once per buffer.
-        const RC0: usize = 0;
-        const RC1: usize = CARRIES_PER_ADD;
-        const RC2: usize = 2 * CARRIES_PER_ADD;
-        const RC3: usize = 3 * CARRIES_PER_ADD;
-        const RC4: usize = 4 * CARRIES_PER_ADD;
-        const RC5: usize = 5 * CARRIES_PER_ADD;
-        const RC6: usize = 6 * CARRIES_PER_ADD;
+        // The round's aux block (≤ 215 bits at a variable stride) is
+        // composed in a register record and flushed once per buffer. The
+        // fixed-offset prefix takes const-position pushes; the trailing
+        // variable-width `h + K` aux takes a runtime push.
         let mut rz = BitRecord::<4>::new();
         let mut ra = BitRecord::<4>::new();
         let mut rb = BitRecord::<4>::new();
 
-        macro_rules! add_into {
-            ($pos:ident, $x:expr, $y:expr) => {{
-                let (sum, left, right, carry) = add_carry_parts($x, $y);
-                rz.push::<$pos>(carry);
-                ra.push::<$pos>(left);
-                rb.push::<$pos>(right);
-                sum
+        macro_rules! push3 {
+            ($pos:expr, $tr:expr) => {{
+                let tr = $tr;
+                rz.push::<{ $pos }>(tr[2]);
+                ra.push::<{ $pos }>(tr[0]);
+                rb.push::<{ $pos }>(tr[1]);
             }};
         }
 
-        // T1 chain: T1_0..T1_2 inlined, T1 (= T1_3) allocated.
-        let t1_0 = add_into!(RC0, hh, big_sigma1(ee));
-        let t1_1 = add_into!(RC1, t1_0, ch_out);
-        let t1_2 = add_into!(RC2, t1_1, SHA256_K[r]);
-        let t1 = add_into!(RC3, t1_2, w_sched[r]);
-        let off = t1_bit(r, 0);
-        or_u32_at_bit(z, off, t1);
-        or_u32_at_bit(a, off, t1);
-        or_u32_at_bit(b, off, 0xFFFF_FFFF);
+        // hk = h + K[r] (constant add), then T1 as one fused 4-op tree —
+        // T1 is NOT materialized.
+        let (hk, kl, kr, kp) = const_add_parts(SHA256_K[r], hh);
+        rz.push_at(RC_ADDK, kp);
+        ra.push_at(RC_ADDK, kl);
+        rb.push_at(RC_ADDK, kr);
+        let (t1, m1, m2, rp) = fused_add4_parts(hk, big_sigma1(ee), ch_out, w_sched[r]);
+        push3!(RC_MAJ1, m1);
+        push3!(RC_MAJ2, m2);
+        push3!(RC_RIP, rp);
 
-        // T2 inlined.
-        let t2 = add_into!(RC4, big_sigma0(aa), maj_out);
-        // E_NEW, A_NEW allocated.
-        let e_new = add_into!(RC5, dd, t1);
-        let off = e_new_bit(r, 0);
-        or_u32_at_bit(z, off, e_new);
-        or_u32_at_bit(a, off, e_new);
-        or_u32_at_bit(b, off, 0xFFFF_FFFF);
-        let a_new = add_into!(RC6, t1, t2);
+        // a_new = T1 + Σ0(a) + Maj (fused 3-op), materialized.
+        let (a_new, am, ar2) = fused_add3_parts(t1, big_sigma0(aa), maj_out);
+        push3!(RC_AMAJ, am);
+        push3!(RC_ARIP, ar2);
         let off = a_new_bit(r, 0);
         or_u32_at_bit(z, off, a_new);
         or_u32_at_bit(a, off, a_new);
         or_u32_at_bit(b, off, 0xFFFF_FFFF);
 
-        let round_base = round_carry_bit(r, 0, 0);
+        // e_new = d + T1, materialized.
+        let (e_new, el, er, ep) = add_carry_parts(dd, t1);
+        rz.push::<{ RC_ENEW }>(ep);
+        ra.push::<{ RC_ENEW }>(el);
+        rb.push::<{ RC_ENEW }>(er);
+        let off = e_new_bit(r, 0);
+        or_u32_at_bit(z, off, e_new);
+        or_u32_at_bit(a, off, e_new);
+        or_u32_at_bit(b, off, 0xFFFF_FFFF);
+
+        let round_base = round_bit(r, 0);
         rz.flush(z, round_base);
         ra.flush(a, round_base);
         rb.flush(b, round_base);
@@ -1893,6 +1810,87 @@ fn bm_add_inline(
 /// Build one V = 8 group of compressions into interleaved rows. Mirrors
 /// [`build_block_ab_packed_into`] field-for-field (the lockstep test below
 /// pins byte-equality against the row-major driver).
+#[inline(always)]
+fn bm_triple(rows: &mut BmRows<'_>, bit: usize, l: &[u32; BM_V], r: &[u32; BM_V], p: &[u32; BM_V]) {
+    or_u32_row(rows.z, bit, p);
+    or_u32_row(rows.a, bit, l);
+    or_u32_row(rows.b, bit, r);
+}
+
+/// V-wide fused 4-operand add: maj1/maj2/ripple triples at the given bits.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn bm_fused_add4(
+    rows: &mut BmRows<'_>,
+    x: &[u32; BM_V],
+    y: &[u32; BM_V],
+    z: &[u32; BM_V],
+    w: &[u32; BM_V],
+    maj1_bit: usize,
+    maj2_bit: usize,
+    rip_bit: usize,
+) -> [u32; BM_V] {
+    let mut sum = [0u32; BM_V];
+    let mut m1 = [[0u32; BM_V]; 3];
+    let mut m2 = [[0u32; BM_V]; 3];
+    let mut rp = [[0u32; BM_V]; 3];
+    for j in 0..BM_V {
+        let (s, a1, a2, a3) = fused_add4_parts(x[j], y[j], z[j], w[j]);
+        sum[j] = s;
+        for t in 0..3 {
+            m1[t][j] = a1[t];
+            m2[t][j] = a2[t];
+            rp[t][j] = a3[t];
+        }
+    }
+    bm_triple(rows, maj1_bit, &m1[0], &m1[1], &m1[2]);
+    bm_triple(rows, maj2_bit, &m2[0], &m2[1], &m2[2]);
+    bm_triple(rows, rip_bit, &rp[0], &rp[1], &rp[2]);
+    sum
+}
+
+/// V-wide fused 3-operand add.
+#[inline(always)]
+fn bm_fused_add3(
+    rows: &mut BmRows<'_>,
+    x: &[u32; BM_V],
+    y: &[u32; BM_V],
+    z: &[u32; BM_V],
+    maj_bit: usize,
+    rip_bit: usize,
+) -> [u32; BM_V] {
+    let mut sum = [0u32; BM_V];
+    let mut mj = [[0u32; BM_V]; 3];
+    let mut rp = [[0u32; BM_V]; 3];
+    for j in 0..BM_V {
+        let (s, a1, a2) = fused_add3_parts(x[j], y[j], z[j]);
+        sum[j] = s;
+        for t in 0..3 {
+            mj[t][j] = a1[t];
+            rp[t][j] = a2[t];
+        }
+    }
+    bm_triple(rows, maj_bit, &mj[0], &mj[1], &mj[2]);
+    bm_triple(rows, rip_bit, &rp[0], &rp[1], &rp[2]);
+    sum
+}
+
+/// V-wide constant add `k + y`.
+#[inline(always)]
+fn bm_const_add(rows: &mut BmRows<'_>, k: u32, y: &[u32; BM_V], bit: usize) -> [u32; BM_V] {
+    let mut sum = [0u32; BM_V];
+    let mut tr = [[0u32; BM_V]; 3];
+    for j in 0..BM_V {
+        let (s, l, r, p) = const_add_parts(k, y[j]);
+        sum[j] = s;
+        tr[0][j] = l;
+        tr[1][j] = r;
+        tr[2][j] = p;
+    }
+    bm_triple(rows, bit, &tr[0], &tr[1], &tr[2]);
+    sum
+}
+
 fn build_group_batch_major(
     inputs: [&([u32; 8], [u32; 16]); BM_V],
     rz: &mut [BmRow],
@@ -1922,19 +1920,16 @@ fn build_group_batch_major(
     let mut w_sched: Vec<[u32; BM_V]> = Vec::with_capacity(64);
     w_sched.extend_from_slice(&m);
     for t in 16..64 {
-        let s_0 = bm_add_inline(
+        let w_t = bm_fused_add4(
             &mut rows,
             &map_v(&w_sched[t - 2], small_sigma1),
-            &w_sched[t - 7],
-            sched_carry_bit(t, 0, 0),
-        );
-        let s_1 = bm_add_inline(
-            &mut rows,
-            &s_0,
             &map_v(&w_sched[t - 15], small_sigma0),
-            sched_carry_bit(t, 1, 0),
+            &w_sched[t - 7],
+            &w_sched[t - 16],
+            sched_bit(t, SC_MAJ1),
+            sched_bit(t, SC_MAJ2),
+            sched_bit(t, SC_RIP),
         );
-        let w_t = bm_add_inline(&mut rows, &s_1, &w_sched[t - 16], sched_carry_bit(t, 2, 0));
         bm_write_lin(&mut rows, w_bit(t, 0), &w_t);
         w_sched.push(w_t);
     }
@@ -1964,28 +1959,28 @@ fn build_group_batch_major(
         or_u32_row(rows.b, maj_and_bit(r, 0), &c_xor_a);
         let maj_out = xor_v(&maj_and_v, &aa);
 
-        let k_r = [SHA256_K[r]; BM_V];
-        let t1_0 = bm_add_inline(
+        let hk = bm_const_add(&mut rows, SHA256_K[r], &hh, round_bit(r, RC_ADDK));
+        let t1 = bm_fused_add4(
             &mut rows,
-            &hh,
+            &hk,
             &map_v(&ee, big_sigma1),
-            round_carry_bit(r, 0, 0),
+            &ch_out,
+            &w_sched[r],
+            round_bit(r, RC_MAJ1),
+            round_bit(r, RC_MAJ2),
+            round_bit(r, RC_RIP),
         );
-        let t1_1 = bm_add_inline(&mut rows, &t1_0, &ch_out, round_carry_bit(r, 1, 0));
-        let t1_2 = bm_add_inline(&mut rows, &t1_1, &k_r, round_carry_bit(r, 2, 0));
-        let t1 = bm_add_inline(&mut rows, &t1_2, &w_sched[r], round_carry_bit(r, 3, 0));
-        bm_write_lin(&mut rows, t1_bit(r, 0), &t1);
-
-        let t2 = bm_add_inline(
+        let a_new = bm_fused_add3(
             &mut rows,
+            &t1,
             &map_v(&aa, big_sigma0),
             &maj_out,
-            round_carry_bit(r, 4, 0),
+            round_bit(r, RC_AMAJ),
+            round_bit(r, RC_ARIP),
         );
-        let e_new = bm_add_inline(&mut rows, &dd, &t1, round_carry_bit(r, 5, 0));
-        bm_write_lin(&mut rows, e_new_bit(r, 0), &e_new);
-        let a_new = bm_add_inline(&mut rows, &t1, &t2, round_carry_bit(r, 6, 0));
         bm_write_lin(&mut rows, a_new_bit(r, 0), &a_new);
+        let e_new = bm_add_inline(&mut rows, &dd, &t1, round_bit(r, RC_ENEW));
+        bm_write_lin(&mut rows, e_new_bit(r, 0), &e_new);
 
         hh = gg;
         gg = ff;
@@ -2258,15 +2253,43 @@ mod tests {
         assert_eq!(CH_AND_BASE, 1024);
         assert_eq!(MAJ_AND_BASE, 3072);
         assert_eq!(ROUND_CARRY_BASE, 5120);
-        assert_eq!(W_BASE, 19008);
-        assert_eq!(SCHED_CARRY_BASE, 20544);
-        assert_eq!(T1_BASE, 25008);
-        assert_eq!(E_NEW_BASE, 27056);
-        assert_eq!(A_NEW_BASE, 29104);
-        assert_eq!(OUT_CARRY_BASE, 31152);
-        assert_eq!(Z_CONST_POS, 31400);
-        assert_eq!(USEFUL_BITS, 31401);
+        // Option F rounds: 184 + (31 − t_r) aux bits each, Σ t_r = 123 over
+        // the 64 round constants → 13,637 round-aux bits (was 7 × 31 × 64 =
+        // 13,888), T1 no longer materialized, schedule steps at 92 (was 93).
+        assert_eq!(
+            ROUND_BASE[N_ROUNDS] - ROUND_CARRY_BASE,
+            (0..N_ROUNDS).map(round_add_bits).sum::<usize>()
+        );
+        assert_eq!(W_BASE, 18_757);
+        assert_eq!(SCHED_CARRY_BASE, 20_293);
+        assert_eq!(E_NEW_BASE, 24_709);
+        assert_eq!(A_NEW_BASE, 26_757);
+        assert_eq!(OUT_CARRY_BASE, 28_805);
+        assert_eq!(Z_CONST_POS, 29_053);
+        assert_eq!(USEFUL_BITS, 29_054);
         assert!(USEFUL_BITS <= K);
+    }
+
+    /// Density audit: template nnz + max row width of the REAL matrices —
+    /// the price of Option F's T1 inlining is bounded row growth in T1's
+    /// two consumers (run with `-- --ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn sha2_density_profile() {
+        let (a, b) = build_matrices();
+        let nnz = |m: &SparseBinaryMatrix| -> usize { m.rows.iter().map(|r| r.len()).sum() };
+        let (na, nb) = (nnz(&a), nnz(&b));
+        let max_row = (0..K)
+            .map(|s| a.rows[s].len() + b.rows[s].len())
+            .max()
+            .unwrap();
+        eprintln!(
+            "sha2 template: A {na} + B {nb} = {} nnz over {USEFUL_BITS} useful rows \
+             (avg {:.1}/row, max A+B row {max_row})",
+            na + nb,
+            (na + nb) as f64 / USEFUL_BITS as f64,
+        );
+        assert!(na + nb > 0);
     }
 
     #[test]

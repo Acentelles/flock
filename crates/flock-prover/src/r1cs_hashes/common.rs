@@ -141,6 +141,74 @@ pub(crate) fn fused_add3_parts(x: u32, y: u32, m: u32) -> (u32, [u32; 3], [u32; 
     )
 }
 
+/// One fused 4-operand ADD's witness parts (`x + y + z + w` mod 2³²,
+/// two carry-save layers + ripple, 92 product rows — one fewer than three
+/// chained 2-operand ADDs; the zk.golf SHA-256 record's tree shape).
+///
+/// * Layer 1, bits 0..30: `w1_i = (x_i⊕z_i)(y_i⊕z_i)`, majority `w1 ⊕ z`.
+/// * Layer 2, bits 0..30: the partial sum `p1 = x⊕y⊕z` and shifted majority
+///   `b1 = (w1⊕z) << 1` reduce against `w`: `w2_i = (p1_i⊕w_i)(b1_i⊕w_i)`,
+///   majority `w2 ⊕ w`.
+/// * Ripple, bits 1..30: `p2 = p1⊕b1⊕w` against `b2 = (w2⊕w) << 1` (zero
+///   low bit — bit 0's product row vanishes).
+///
+/// Returns `(sum, maj1, maj2, rip)` triples as `[left, right, prod]`,
+/// majorities masked to the low 31 bits, ripple shifted to the low 30.
+#[inline(always)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn fused_add4_parts(
+    x: u32,
+    y: u32,
+    z: u32,
+    w: u32,
+) -> (u32, [u32; 3], [u32; 3], [u32; 3]) {
+    const MASK_LO31: u32 = 0x7FFF_FFFF;
+    const MASK_LO30: u32 = 0x3FFF_FFFF;
+    let xz = x ^ z;
+    let yz = y ^ z;
+    let w1 = xz & yz;
+    let p1 = x ^ y ^ z;
+    let b1 = (w1 ^ z) << 1;
+    let pw = p1 ^ w;
+    let bw = b1 ^ w;
+    let w2 = pw & bw;
+    let p2 = p1 ^ b1 ^ w;
+    let b2 = (w2 ^ w) << 1;
+    let sum = p2.wrapping_add(b2);
+    let cin = sum ^ p2 ^ b2;
+    let rip_left = p2 ^ cin;
+    let rip_right = b2 ^ cin;
+    (
+        sum,
+        [xz & MASK_LO31, yz & MASK_LO31, w1 & MASK_LO31],
+        [pw & MASK_LO31, bw & MASK_LO31, w2 & MASK_LO31],
+        [
+            (rip_left >> 1) & MASK_LO30,
+            (rip_right >> 1) & MASK_LO30,
+            ((rip_left & rip_right) >> 1) & MASK_LO30,
+        ],
+    )
+}
+
+/// Constant-operand ADD parts for `k + y`: the aux products for bits
+/// `t..30` only (t = trailing_zeros(k) + 1 — the carries below the
+/// constant's lowest set bit are zero, and the carry into bit `t` is the
+/// affine seed `y_{t-1}`), shifted down to the low `31 − t` bits.
+/// Returns `(sum, left, right, prod)`.
+#[inline(always)]
+pub(crate) fn const_add_parts(k: u32, y: u32) -> (u32, u32, u32, u32) {
+    debug_assert!(k != 0);
+    let t = k.trailing_zeros() + 1;
+    let (sum, left, right, carry) = add_carry_parts(k, y);
+    let mask = (1u32 << (31 - t)) - 1;
+    (
+        sum,
+        (left >> t) & mask,
+        (right >> t) & mask,
+        (carry >> t) & mask,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Shared R1CS helpers: empty matrix, identity, BlockR1cs stub builder.
 //

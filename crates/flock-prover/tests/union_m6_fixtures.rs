@@ -50,6 +50,13 @@
 //! Re-pinned 2026-08-13 for proof-IO v20. Strict Fast and Slim proofs now
 //! include every non-Ligerito grinding nonce. All six deterministic digests
 //! were stable across two print runs.
+//! Re-pinned 2026-08-14 (second): SHA-256 R1CS "Option F" — the zk.golf
+//! sha256 record's systematic techniques (K folded as constant adds, fused
+//! 4-op T1 tree and 3-op a_new tree, T1 slots dissolved, schedule steps
+//! 93 -> 92): USEFUL_BITS 31,401 -> 29,054 (246 -> 227 chunk-columns).
+//! Every sha2-touching fixture moves, incl. the sha2 anchor; the BLAKE3
+//! anchor is byte-identical — the change is sha2-local. Digests stable
+//! across two print runs.
 //! Re-pinned 2026-08-14: BLAKE3 R1CS "Option F" — the zk.golf record's
 //! fused 3-operand adders (61 rows vs 62) and round-1 constant-c adders
 //! (30/29 rows) shrink the table 10,416 → 10,298 AND rows, USEFUL_BITS
@@ -171,22 +178,22 @@ fn m6_merged_union_proof_bytes_pinned() {
         (
             "merged-nu10-1024-1024",
             [1024, 1024],
-            "4e9ee1c855d8cf4873cea7dccb389fc184ed01f7580279acd58575546a856dea",
+            "66f54ae526f34c3eb31690305d55b2859113346eeaa6b002296da9e22149aeed",
         ),
         (
             "merged-nu10-50-37",
             [50, 37],
-            "68730de8448ce3403709b29457f542270e86a2fd9a42bb241da0a1b34aa2194d",
+            "04943a863e55475a2feae6cdb75f6fa9a67bd1eda9d1ca4cf0925e2e94246b6e",
         ),
         (
             "merged-nu10-8-8",
             [8, 8],
-            "a1c022c9ef8e8cf3730c4770baadb512a36cf6191b883edb925dd922fe0838e6",
+            "ababa93a1a1ae4e4e335e65790c1aa090e609e6fff6423396ba6ac5f9d8127eb",
         ),
         (
             "merged-nu10-0-64",
             [0, 64],
-            "9c1abee932fd641d0c32664ce03374ee5cce9710dd759e35de94d22797801d68",
+            "c75ece1c6614ac3511fb93c837ef3d5805086e709fe923b8ec559f07f92e4e32",
         ),
     ];
 
@@ -290,7 +297,7 @@ fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
 
     // SHA-256, 128 blocks (m = 22).
     {
-        const EXPECTED: &str = "f595c6c0605f2d2cd78033b63e913f58802cfbde68d2802f698001faa92de50a";
+        const EXPECTED: &str = "3019761fe82c9b99ee607f6efbffb6146a82db47f3249788681d669b6809e712";
         let n_blocks = 128usize;
         let setup = sha2::Sha256HybridSetup::new_batch_major(n_blocks);
         let mut rng = Rng::new(0x4D36_5252);
