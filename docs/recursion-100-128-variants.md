@@ -42,7 +42,8 @@ those families disabled. Their public Ligerito query schedules also remain
 different.
 
 **They reproduce the pre-branch schedules exactly.** The canonical generator
-at target 100 re-derives, byte-for-byte, the counts your Part 3 replaced:
+at target 100 re-derives, byte-for-byte, the counts replaced by the strict
+128-bit schedules:
 
 - `m27_fast100`: per-level `[218, 106, 71, 53]`, Σq 448 (your audit's own
   "before" example);
@@ -151,6 +152,53 @@ proof-byte pin tests were also run explicitly. The branch's deliberate v20
 strict-profile transcript change moved the fixture digests; the new values
 were identical across two print runs, were documented at the fixtures, and
 the pin tests now pass normally.
+
+## Family-H recursive closure (2026-08-14)
+
+The ring-switch verifier's family-H arithmetic is now inside every recursive
+R1CS verifier path: the direct boolean leaf, the first-level `ChildRegion`,
+and the steady `RealRegion`. The circuit computes the two
+transpose/equality-weight dots, derives the inverse-Moore coefficients,
+replays all Frobenius powers in the $V$ recombination, adds the
+packed-direct/group terms, and copy-constrains the terminal relation
+`running = q_eval * V`. The native target/running replays remain test oracles
+only; they are no longer the soundness mechanism.
+
+The transpose uses a 17-IO-word boolean table over dynamic $8\times8$ tiles.
+The inverse-Moore rows use the GHASH trace-dual basis's geometric tail and
+seven exceptional entries. The two RS Frobenius ladders are paired in F256;
+their 8,128 squarings per child fill the existing narrow F256 MAC slot and
+spill into the existing F256 spine at the physical row limit. No new element
+type was added. At m32 the envelope remains `nu=14`, `mu=23`, 511 gate cell
+slots plus one public slot, with a 256.0 KiB recursive proof.
+
+Same-host, same-command steady comparison against `9b94943` (x86 host,
+64 logical CPUs, three runs per stage, `TOWER_PROFILE=slim128`,
+`CHAIN_BLOCKS=262144`):
+
+| online stage | before family H | after family H | delta |
+| --- | ---: | ---: | ---: |
+| base chain leaf | 1313.3 ms | 1282.8 ms | -2.3% (noise; path unchanged) |
+| first-level wrapper | 403.9 ms | 441.0 ms | +9.2% |
+| fresh internal node | 375.9 ms | 424.9 ms | +13.0% |
+| steady spine node | 382.1 ms | 430.1 ms | +12.6% |
+| amortized per leaf | 1706 ms | 1718 ms | +0.7% raw |
+| throughput | 154k comp/s | 153k comp/s | about -0.7% raw |
+| recursive proof | 255.7 KiB | 256.0 KiB | +0.1% |
+
+Because the unchanged base-leaf measurement happened to improve by about
+30 ms, the raw amortized delta understates the added verifier work. Holding
+that stage at its baseline gives about 1749 ms/leaf, or a more conservative
+**+2.5% amortized family-H overhead**. The internal-node BLAKE census moves
+22,804 to 23,133 rows (+1.4%); family H itself is algebraic, while the BLAKE
+increase comes from the enlarged recursive statement/claim surfaces. Dense
+area moves 2,977,357 to 3,466,436 words (+16.4%) but remains at `dense_m=29`.
+
+Validation includes the tile relation's honest/transcript assembly plus
+mutated-output and mutated-selector rejection, the direct-leaf and standalone
+mixed-child recursive proofs, the m32 headline tower, the converged
+`chain_spine_converges` run, all active `flock-core` library tests (506 passed,
+25 ignored), and the complete active `flock-prover` test suite.
 
 ## Rebased branch map
 

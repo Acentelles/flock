@@ -176,7 +176,7 @@ fn outer_union<'r>(
 /// - `nu` 14: each of the two independent child verifiers has its own
 ///   identical BLAKE slot, and the consolidated extension-field residual
 ///   gates keep every physical slot below 2^14 rows.
-/// - 28 table types occupy 490 gate slots; with one public slot, the cell
+/// - 29 table types occupy 511 gate slots; with one public slot, the cell
 ///   address needs 9 bits and `mu = nu + 9 = 23` tower-wide.
 ///
 /// A ladder that drifts off these constants surfaces as a NEW slot at
@@ -191,8 +191,9 @@ struct EnvShape {
     /// unconditional free counts, so these values no longer pad rows or
     /// determine the circuit digest; `counts_el` remains the canonical
     /// element-slot key list and both arrays retain the old cap census for
-    /// comparison. Boolean slots come first (b3, b3-alt, swap, spread,
-    /// pow), then element types by cache key.
+    /// comparison. The historical boolean caps cover b3, b3-alt, swap,
+    /// spread, and pow; the live family-H tile type follows them, then the
+    /// element types are keyed by `counts_el`.
     counts_bool: [usize; 5],
     counts_el: [(usize, usize); 23],
     /// publics* — the ONE public-segment length every envelope outer pads
@@ -344,7 +345,7 @@ fn envelope_shape() -> Option<EnvShape> {
         // The two-child envelope fits at 14 after consolidating the F256
         // residual tables and assigning each independent child verifier to
         // its own identical BLAKE slot. Every physical slot remains below
-        // 2^14 rows, while 491 cell slots give mu = 14 + 9 = 23.
+        // 2^14 rows, while 512 cell slots give mu = 14 + 9 = 23.
         nu: 14,
         // 20 = the m32 FAST chain leaf's L0 depth (log_msg_cols 19 +
         // log_inv_rate 1), which the B-fast PoC's first-level node walks;
@@ -459,12 +460,12 @@ where
     }
 }
 
-/// Declare the envelope's 28 table types in one canonical order.
+/// Declare the envelope's 29 table types in one canonical order.
 /// `Registry::new` sorts class-major then k_log-descending with a
 /// STABLE sort, so the declaration order here fixes every same-k_log
 /// tie-break — the leaf-outer and node registries become the same sorted
 /// type list, which together with nu* is registry-digest equality. Returns
-/// the five boolean slots; every element type pre-seeds `cache` under the keyed
+/// the six boolean slots; every element type pre-seeds `cache` under the keyed
 /// scheme so both builders' demand sites hit the cache instead of
 /// declaring. The order is the node's historical one with the leaf-only
 /// types (SkipNode/SkipClose) appended inside their k_log group.
@@ -484,6 +485,7 @@ fn declare_envelope_slots(
             nu,
         }),
         pow: sb.slot(PowMaskGate { nu }),
+        family: Some(sb.slot(FamilyTransposeTileGate { nu })),
     };
     slot_cached(sb, cache, 600, MacGate::new);
     slot_cached(sb, cache, 602, MacGate::new);
@@ -625,6 +627,11 @@ fn pad_envelope_counts(
         t_pow,
         false,
         Some(&pow_inputs),
+    );
+    let family = q.family.expect("the envelope declares family H");
+    let t_family = if no_pad { floor1(sb, family) } else { 1 };
+    pad(
+        sb, hints, &mut over, "family", family, t_family, false, None,
     );
     for &(key, count) in &env.counts_el {
         let &(_, s) = cache
@@ -5387,8 +5394,8 @@ impl GateType for ZcRoundGate {
     }
 }
 
-/// One Λ-node of the univariate skip's interpolation (the family-H pass,
-/// first item): the barycentric NUMERATOR recurrence
+/// One Λ-node of the univariate skip's interpolation: the barycentric
+/// NUMERATOR recurrence
 ///
 ///   A' = A·(z+λ),   B' = B·(z+λ) + v·A
 ///
@@ -6563,6 +6570,7 @@ fn mvp7_real_query_phase() {
             nu,
         }),
         pow: sb.slot(PowMaskGate { nu }),
+        family: None,
     };
     let mut leaf_slot: Vec<(usize, flock_core::circuit::builder::SlotId)> = Vec::new();
     // ONE 8-lane leaf-eval type serves every level: a 64-lane leaf is 8
@@ -7490,7 +7498,8 @@ fn mvp7_real_query_phase() {
 // ---------------------------------------------------------------------------
 
 use flock_prover::r1cs_hashes::merkle_glue::{
-    BitSpreadInput, BitSpreadTable, PowMaskInput, PowMaskTable, SwapInput, SwapTable,
+    BitSpreadInput, BitSpreadTable, FamilyTransposeTileInput, FamilyTransposeTileTable,
+    PowMaskInput, PowMaskTable, SwapInput, SwapTable,
 };
 
 /// One Merkle level's conditional swap. The sibling is a [`GateType::Hint`] —
@@ -7575,6 +7584,40 @@ struct PowMaskGate {
     nu: usize,
 }
 
+/// One wired 8x8 tile of the family-H tensor-algebra transpose.  The boolean
+/// relation binds the tile selector as well as all eight source and output
+/// words; the element layer only has to accumulate the resulting partial dot
+/// products.
+struct FamilyTransposeTileGate {
+    nu: usize,
+}
+
+impl GateType for FamilyTransposeTileGate {
+    type Row = FamilyTransposeTileInput;
+    type Hint = ();
+
+    fn table(&self) -> TableType {
+        TableType::from_block_r1cs(&FamilyTransposeTileTable::build_block_r1cs(self.nu))
+            .with_io_schema(FamilyTransposeTileTable::io_schema())
+    }
+
+    fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> Self::Row {
+        let rows: [F128; 8] = inputs[..8].try_into().expect("eight transpose rows");
+        debug_assert_eq!(inputs[8].hi, 0, "the tile selector fits one byte");
+        debug_assert_eq!(inputs[8].lo >> 8, 0, "the tile selector fits one byte");
+        let row = FamilyTransposeTileInput {
+            rows,
+            selector: inputs[8].lo as u8,
+        };
+        outputs.extend_from_slice(&FamilyTransposeTileTable::outputs(&row));
+        row
+    }
+
+    fn witness(&self, _rows: &[Self::Row], _nu: usize) -> SlotWitness {
+        SlotWitness::DeferredToRows
+    }
+}
+
 impl GateType for PowMaskGate {
     type Row = PowMaskInput;
     type Hint = ();
@@ -7614,6 +7657,9 @@ struct CollapsedSlots {
     swap: flock_core::circuit::builder::SlotId,
     spread: flock_core::circuit::builder::SlotId,
     pow: flock_core::circuit::builder::SlotId,
+    /// Present on recursive verifier circuits.  Smaller query-only fixtures
+    /// do not declare the family-H transpose relation.
+    family: Option<flock_core::circuit::builder::SlotId>,
 }
 
 /// One opened Ligerito level's geometry. Legacy levels report it from the
@@ -9411,6 +9457,7 @@ fn collapsed_opening_matches_the_composite() {
                 nu,
             }),
             pow: sb.slot(PowMaskGate { nu }),
+            family: None,
         };
 
         let mut pubs: Vec<F128> = Vec::new();
@@ -9633,6 +9680,7 @@ fn mvp6_all_levels_collapsed() {
             nu,
         }),
         pow: sb.slot(PowMaskGate { nu }),
+        family: None,
     };
     let mut leaf_slot: Vec<(usize, flock_core::circuit::builder::SlotId)> = Vec::new();
     let leafeval: Vec<_> = levels
@@ -9997,19 +10045,12 @@ fn mvp6_all_levels_collapsed() {
 ///   regions (s_hat_v slices, r_dprime/gamma ordinals) with the whole
 ///   R = 2 merged boundary replayed: succinct outputs, W-fold,
 ///   linearized coefficients, running == q_eval·V.
-/// - IN-CIRCUIT: the full FS chain; the full query phase (collapsed
-///   openings against the absorbed caps, FS-derived v, boundary-
-///   expanded alpha, per-level enforced sums == native replicas); the
-///   PoW bit predicate (BLAKE3 + selected-zero constraints in-circuit;
-///   published digest/nonce wires retained as a differential oracle);
-///   and the intake W-rounds (target as checker-validated advice — the
-///   sc dots are family-H, the bit-matrix transpose — with rho BOUND
-///   in-circuit and running published). The outer proves and verifies
-///   over the circuit path.
-///
-/// Remaining for the leaf node: the ligerito spine, the boolean PIOP
-/// gates (skip round checker-native first), the R = 2 T0/anchor deltas,
-/// MatrixAssertion emission, then the family-H upgrade batch.
+/// - IN-CIRCUIT: the FS chain and PoW predicate; the complete query phase;
+///   the Ligerito spine and residual closure; the boolean PIOP; the R=2
+///   multipoint intake and anchor; and family H itself (tiled transpose,
+///   inverse-Moore coefficients, Frobenius recombination, and
+///   `running == q_eval * V`). Published native replicas remain differential
+///   test oracles only. The outer proves and verifies over the circuit path.
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn mvp9_boolean_leaf_tape() {
@@ -10032,10 +10073,12 @@ struct LeafOuter {
     swap_r1cs: flock_core::r1cs::BlockR1cs,
     spread_r1cs: flock_core::r1cs::BlockR1cs,
     pow_r1cs: flock_core::r1cs::BlockR1cs,
+    family_r1cs: flock_core::r1cs::BlockR1cs,
     b3_slots: Vec<usize>,
     swap_slot: usize,
     spread_slot: usize,
     pow_slot: usize,
+    family_slot: usize,
 }
 
 fn leaf_boolean_lcs(lo: &LeafOuter) -> Vec<&dyn flock_core::lincheck::LincheckCircuit> {
@@ -10043,6 +10086,7 @@ fn leaf_boolean_lcs(lo: &LeafOuter) -> Vec<&dyn flock_core::lincheck::LincheckCi
         (lo.swap_slot, lo.swap_r1cs.csc_lincheck_circuit()),
         (lo.spread_slot, lo.spread_r1cs.csc_lincheck_circuit()),
         (lo.pow_slot, lo.pow_r1cs.csc_lincheck_circuit()),
+        (lo.family_slot, lo.family_r1cs.csc_lincheck_circuit()),
     ];
     ordered.extend(lo.b3_slots.iter().map(|&slot| {
         (
@@ -10064,6 +10108,7 @@ fn leaf_boolean_mats(
         (lo.swap_slot, (&lo.swap_r1cs.a_0, &lo.swap_r1cs.b_0)),
         (lo.spread_slot, (&lo.spread_r1cs.a_0, &lo.spread_r1cs.b_0)),
         (lo.pow_slot, (&lo.pow_r1cs.a_0, &lo.pow_r1cs.b_0)),
+        (lo.family_slot, (&lo.family_r1cs.a_0, &lo.family_r1cs.b_0)),
     ];
     ordered.extend(
         lo.b3_slots
@@ -10465,7 +10510,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
     // linearized coefficients derived from the SAME pub helpers, and
     // running == q_eval·V closed with the R = 2 recombination. This is the
     // exact relation chain the leaf circuit will publish as zero-deltas.
-    let (native_target, native_running) = {
+    let (native_target, native_running, direct_rs_recs, direct_gamma_fin) = {
         use flock_core::pcs::ring_switch as rs;
         use flock_core::zerocheck::univariate_skip::build_eq;
         let (mut v, mut c, mut i) = (0usize, 0usize, 0usize);
@@ -10481,7 +10526,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             i += 1;
         }
         i += 1;
-        let mut rs_recs: Vec<(usize, usize)> = Vec::new();
+        let mut rs_recs: Vec<(usize, usize, usize)> = Vec::new();
         while matches!(&ops[i], Op::Label(l) if l.as_slice() == b"flock-ring-switch-v0") {
             i += 1;
             assert!(matches!(ops[i], Op::ObserveSlice(128)), "s_hat_v slice");
@@ -10494,9 +10539,10 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             }
             assert!(matches!(ops[i], Op::SqueezeSlice(7)), "r_dprime");
             let rc = c;
+            let rfin = ops[..i].iter().filter(|op| op.finalizes()).count();
             bump(&ops[i], &mut v, &mut c);
             i += 1;
-            rs_recs.push((sv, rc));
+            rs_recs.push((sv, rc, rfin));
         }
         assert_eq!(rs_recs.len(), 2, "rs×2 at the leaf");
         while matches!(ops[i], Op::Pow { .. }) {
@@ -10507,12 +10553,13 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             matches!(ops[i], Op::SqueezeSlice(2)),
             "rs coefficient vector"
         );
+        let gamma_fin = ops[..i].iter().filter(|op| op.finalizes()).count();
         let gs = vec![chals[c], chals[c + 1]];
         bump(&ops[i], &mut v, &mut c);
         i += 1;
         let mut target = F128::ZERO;
         let mut coeffs: Vec<Vec<F128>> = Vec::new();
-        for (k, &(sv, rc)) in rs_recs.iter().enumerate() {
+        for (k, &(sv, rc, _)) in rs_recs.iter().enumerate() {
             let shv = &vals_rec[sv..sv + 128];
             assert_eq!(
                 shv,
@@ -10570,7 +10617,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             }
         }
         assert_eq!(running, q_eval * big_v, "the R = 2 merged boundary replays");
-        (target, running)
+        (target, running, rs_recs, gamma_fin)
     };
 
     // ---- phase 2a step 2 + the query-phase port: the leaf's chain AND
@@ -10659,6 +10706,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
                     nu,
                 }),
                 pow: sb.slot(PowMaskGate { nu }),
+                family: Some(sb.slot(FamilyTransposeTileGate { nu })),
             },
         };
         let leafeval: Vec<_> = geo
@@ -10772,12 +10820,11 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             &mut consts,
             &mut hints,
         );
-        // ---- the intake W-rounds in-circuit: the RS target enters as
-        // CHECKER-VALIDATED advice (its sc dots are family-H — the bit
-        // transpose — deferred to the boundary batch), the W-rounds fold
-        // it through mrslot binding rho, and `running` publishes; the
-        // checker closes target == Σ γ·sc and running == q_eval·V
-        // natively (the 2b replay above is the reference).
+        // ---- the intake W-rounds in-circuit. `tw` retains the historical
+        // public layout, but the family-H region below copy-constrains it to
+        // the computed transpose target and closes `running = q_eval * V`.
+        // The native value supplied here is only the honest witness and test
+        // oracle, not the soundness mechanism.
         let mut vmap: Vec<Option<usize>> = Vec::new();
         for (wi, w) in stream.words.iter().enumerate() {
             if let flock_core::transcript_record::StreamWord::Value(vi) = *w {
@@ -10937,7 +10984,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         let t_final = tsp;
 
         // ---- the boolean zerocheck in-circuit ----
-        // The SKIP ROUND is fully bound (the family-H pass, item 1): the
+        // The SKIP ROUND is fully bound: the
         // barycentric numerator recurrence over the Λ nodes (SkipNodeGate,
         // 64 rows — no inversions, no advice), z^(2^j) via spine tr-rows,
         // and the close gate baking the linearized Z_S coefficients and
@@ -11228,13 +11275,67 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         sb.connect(inner_w[0], t_final[0]);
         sb.connect(inner_w[1], t_final[1]);
 
+        // Close the two family-H scalars inside the leaf circuit.  `tw` is
+        // retained as the historical public layout cell, but it is now copy-
+        // constrained to the computed transpose target; `runw = q_eval*V_rs`
+        // is likewise a circuit equality rather than a checker assertion.
+        let macs = slot_cached(&mut sb, &mut leaf_slot, 600, MacGate::new);
+        let fold_macs = slot_cached(&mut sb, &mut leaf_slot, 602, MacGate::new);
+        let family_mac256 = leaf_slot
+            .iter()
+            .find(|&&(key, _)| key == 701)
+            .expect("the residual region declares its F256 MAC slot")
+            .1;
+        let shv_w: [Vec<Wire>; 2] = std::array::from_fn(|k| {
+            let sv = direct_rs_recs[k].0;
+            (0..128).map(|i| wv(sv + i)).collect()
+        });
+        let value_w: [Vec<Wire>; 2] = std::array::from_fn(|k| {
+            val_vs[128 * k..128 * (k + 1)]
+                .iter()
+                .map(|&vi| wv(vi))
+                .collect()
+        });
+        let rdp_w: [Vec<Wire>; 2] = std::array::from_fn(|k| {
+            (0..7)
+                .map(|j| squeeze_word_wire(&outs, &trace, direct_rs_recs[k].2, j))
+                .collect()
+        });
+        let gamma_w = [
+            squeeze_word_wire(&outs, &trace, direct_gamma_fin, 0),
+            squeeze_word_wire(&outs, &trace, direct_gamma_fin, 1),
+        ];
+        let (rsh_w, vrs_w) = emit_family_h(
+            &mut sb,
+            slots.family.expect("family-H slot"),
+            macs,
+            fold_macs,
+            spine,
+            spine256,
+            family_mac256,
+            1usize << nu,
+            &shv_w,
+            &value_w,
+            &rdp_w,
+            gamma_w,
+            pfslot2,
+            pf_w,
+            zw,
+            ow,
+            &mut vals,
+            &mut consts,
+        );
+        sb.connect(rsh_w, tw);
+        let family_rhs = sb.gate(macs, &[zw, wv(inner_pd2.q_v), vrs_w])[0];
+        sb.connect(runw, family_rhs);
+
         // ---- the R = 2 multipoint chains ----
         // T0 = Σ gamma^{128i+j}·A_ij over the 256 absorbed dual values
         // (gamma-power chain + tr-row MACs), the rounds via mrslot,
         // T_m + anchor.v published as a zero-delta, and the anchor's own
         // rounds folded to an endpoint checked against the native replay.
-        // The anchor EXPECT (RS statements, ĝ closed form) stays
-        // checker-native with the family-H batch.
+        // The anchor EXPECT (RS statements, ĝ closed form) is emitted
+        // below after the multipoint chain is located.
         let (mp_gamma_ch, mp_gamma_fin, mp_rounds3, mp_anchor_v, mp_anchor_rounds3) = {
             use flock_core::transcript_record::TranscriptOp as Op5;
             let ops3 = flatten_ops(t_shape.ops());
@@ -11353,7 +11454,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             t
         };
 
-        // ---- the R=2 anchor EXPECT in-circuit (family-H pass, item 2) ----
+        // ---- the R=2 anchor EXPECT in-circuit ----
         // The anchor's accept `claim == expect` becomes a published
         // zero-delta: expect = Σ_i γ^{128·i}·ĝ(ρ″)·(w_i·DP_i) over the two
         // RS statements (P = 0 at the leaf; each RS anchor claim has only
@@ -11832,12 +11933,12 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             zc_end_native,
             "the zc chain ends at the native running claim"
         );
-        // The intake boundary: the advice target and the in-circuit
-        // running, both checker-validated against the native replay.
+        // The intake boundary is computed in-circuit; these publications
+        // retain an independent native replay as a test oracle.
         assert_eq!(
             built.public[plen - zc_tail - 4],
             native_target,
-            "the RS target advice is the native gamma-combination"
+            "the computed RS target matches the native gamma-combination"
         );
         assert_eq!(
             built.public[plen - zc_tail - 3],
@@ -11886,6 +11987,9 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         let spread_lc = spread_r1cs.csc_lincheck_circuit();
         let pow_r1cs = PowMaskTable.build_block_r1cs(nu);
         let pow_lc = pow_r1cs.csc_lincheck_circuit();
+        let family_slot = slots.family.expect("family-H slot");
+        let family_r1cs = FamilyTransposeTileTable::build_block_r1cs(nu);
+        let family_lc = family_r1cs.csc_lincheck_circuit();
         let b3_declared: Vec<_> = std::iter::once(slots.b3).chain(slots.b3_alt).collect();
         let b3_rows_l: Vec<_> = b3_declared
             .iter()
@@ -11894,6 +11998,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         let swap_rows_l = built.rows::<SwapGate>(slots.swap).to_vec();
         let spread_rows_l = built.rows::<BitSpreadGate>(slots.spread).to_vec();
         let pow_rows_l = built.rows::<PowMaskGate>(slots.pow).to_vec();
+        let family_rows_l = built.rows::<FamilyTransposeTileGate>(family_slot).to_vec();
         let els: Vec<Vec<F128>> = leaf_slot
             .iter()
             .map(|(_, sl)| match &built.witnesses[shape.registry_slot(*sl)] {
@@ -11926,6 +12031,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             (shape.registry_slot(slots.swap), swap_lc),
             (shape.registry_slot(slots.spread), spread_lc),
             (shape.registry_slot(slots.pow), pow_lc),
+            (shape.registry_slot(family_slot), family_lc),
         ];
         lcs_ord.extend(b3_declared.iter().map(|&s| {
             (
@@ -11967,6 +12073,18 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
                             move |dst| PowMaskTable.generate_witness_batch_major_into(&r, dst)
                         },
                         pow_lc,
+                    ),
+                ),
+                (
+                    shape.registry_slot(family_slot),
+                    UnionSlotProverInput::in_place(
+                        {
+                            let r = family_rows_l.clone();
+                            move |dst| {
+                                FamilyTransposeTileTable::generate_witness_batch_major_into(&r, dst)
+                            }
+                        },
+                        family_lc,
                     ),
                 ),
             ];
@@ -12029,10 +12147,11 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             bincode::serialize(&oproof).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0,
             threads,
         );
-        let (swap_slot, spread_slot, pow_slot) = (
+        let (swap_slot, spread_slot, pow_slot, family_slot_ri) = (
             shape.registry_slot(slots.swap),
             shape.registry_slot(slots.spread),
             shape.registry_slot(slots.pow),
+            shape.registry_slot(family_slot),
         );
         let b3_slots = b3_declared
             .iter()
@@ -12048,10 +12167,12 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             swap_r1cs,
             spread_r1cs,
             pow_r1cs,
+            family_r1cs,
             b3_slots,
             swap_slot,
             spread_slot,
             pow_slot,
+            family_slot: family_slot_ri,
         }
     }
 }
@@ -12139,10 +12260,9 @@ struct RealTape<'p> {
     zp_v: usize,
     /// The rs regions: (s_hat_v ordinal, r_dprime fin, r_dprime ch), plus
     /// the two rs gammas' `(fin, word offset)` and challenge ordinals — the
-    /// family-H re-exposure set.  Both coefficients share one vector squeeze.
+    /// family-H circuit. Both coefficients share one vector squeeze.
     rs_recs: Vec<(usize, usize, usize)>,
     rs_gam_fins: Vec<(usize, usize)>,
-    rs_gam_chs: Vec<usize>,
     // native references + replicas
     mat_assert: flock_core::lincheck::MatrixAssertion,
     el_assert: flock_core::element_r1cs::union::ElementAssertion,
@@ -12153,8 +12273,6 @@ struct RealTape<'p> {
     el_run_n: F128,
     a_sum_n: F128,
     b_sum_n: F128,
-    native_rs_half: F128,
-    native_vrs: F128,
     native_target: F128,
     native_running: F128,
     t_final_n: F256,
@@ -12682,11 +12800,10 @@ impl<'p> RealTape<'p> {
             let gfins = vec![(fin, 0), (fin, 1)];
             (recs, gchs, gfins)
         };
-        // The two-halves target and V, split into their family-H (RS) and
-        // in-circuit-computable (packed-direct / group) parts — the round-0
-        // production posture: the pd/group halves become MAC chains in the
-        // circuit, the RS halves stay advice checked over RE-EXPOSED words.
-        let (native_rs_half, native_target, native_vrs, native_running) = {
+        // Native differential replay of the two-halves target and V. The
+        // recursive circuit independently computes the RS, packed-direct,
+        // and group parts below; these values no longer discharge soundness.
+        let (native_target, native_running) = {
             use flock_core::pcs::ring_switch as rsw;
             use flock_core::zerocheck::univariate_skip::build_eq;
             let gs: Vec<F128> = rs_gam_ch2.iter().map(|&ch| chals[ch]).collect();
@@ -12736,7 +12853,7 @@ impl<'p> RealTape<'p> {
                 vals_rec[inner_pd_i.q_v] * big_v,
                 "the R=2 + P merged boundary replays at real-inner scale"
             );
-            (rs_half, target, vrs, running)
+            (target, running)
         };
 
         // ---- the spine's native quad replay ----
@@ -13385,7 +13502,6 @@ impl<'p> RealTape<'p> {
             zp_v,
             rs_recs: rs_recs2,
             rs_gam_fins: rs_gam_fin2,
-            rs_gam_chs: rs_gam_ch2,
             mat_assert,
             el_assert,
             sigma_native,
@@ -13394,8 +13510,6 @@ impl<'p> RealTape<'p> {
             el_run_n,
             a_sum_n,
             b_sum_n,
-            native_rs_half,
-            native_vrs,
             native_target,
             native_running,
             t_final_n,
@@ -13425,9 +13539,6 @@ struct RealRegion {
     n_query_pub: usize,
     n_tail: usize,
     n_mat_pub: usize,
-    /// The family-H re-exposure block length (the tail past z_skip).
-    #[allow(dead_code)]
-    n_fam_pub: usize,
     n_ela_pub: usize,
     /// Labeled `public_len` checkpoints through the emission — the publics
     /// census (`PUB_CENSUS=1` on the node test prints the block sizes).
@@ -13480,6 +13591,222 @@ struct RealRegion {
     /// against the key an inherited entry was published with.
     #[allow(dead_code)]
     cd_w: [Wire; 2],
+}
+
+/// Decompose the polynomial-basis trace-dual table into one geometric row and
+/// seven exceptional entries.  If `d_t = moore_inverse()[t]`, then
+/// `d_t = g0 * ratio^t` for every `t >= 7`; the low seven corrections are the
+/// only effect of the low terms in GHASH's defining polynomial.  Frobenius
+/// powers preserve this form, which lets the circuit evaluate every inverse-
+/// Moore row with one prefix product and seven MACs instead of wiring a
+/// 128-word constant row.
+fn family_h_dual_decomposition() -> (F128, F128, [F128; 7]) {
+    use std::sync::OnceLock;
+    static DECOMP: OnceLock<(F128, F128, [F128; 7])> = OnceLock::new();
+    *DECOMP.get_or_init(|| {
+        let minv = flock_core::pcs::ring_switch::moore_inverse();
+        let d = &minv[..128];
+        let ratio = d[8] * d[7].inv();
+        let ratio_inv = ratio.inv();
+        let mut g0 = d[7];
+        for _ in 0..7 {
+            g0 *= ratio_inv;
+        }
+        let mut corrections = [F128::ZERO; 7];
+        let mut g = g0;
+        for t in 0..128 {
+            if t < 7 {
+                corrections[t] = d[t] + g;
+            } else {
+                assert_eq!(d[t], g, "the GHASH dual basis is geometric above t=6");
+            }
+            g *= ratio;
+        }
+        (g0, ratio, corrections)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_family_h(
+    sb: &mut ShapeBuilder,
+    tile: flock_core::circuit::builder::SlotId,
+    macs: flock_core::circuit::builder::SlotId,
+    fold_macs: flock_core::circuit::builder::SlotId,
+    spine: flock_core::circuit::builder::SlotId,
+    spine256: flock_core::circuit::builder::SlotId,
+    mac256: flock_core::circuit::builder::SlotId,
+    row_capacity: usize,
+    shv: &[Vec<Wire>; 2],
+    values: &[Vec<Wire>; 2],
+    r_dprime: &[Vec<Wire>; 2],
+    gamma: [Wire; 2],
+    pfslot: flock_core::circuit::builder::SlotId,
+    pf_w: usize,
+    zw: Wire,
+    ow: Wire,
+    vals: &mut Vec<F128>,
+    consts: &mut Vec<(F128, Wire)>,
+) -> (Wire, Wire) {
+    assert_eq!(pf_w, 8, "the envelope family-H prefix width is eight");
+    for k in 0..2 {
+        assert_eq!(shv[k].len(), 128, "one full tensor-algebra row table");
+        assert_eq!(values[k].len(), 128, "one Frobenius value per Moore row");
+        assert_eq!(
+            r_dprime[k].len(),
+            7,
+            "the ring-switch suffix has seven bits"
+        );
+    }
+    let prefix = |sb: &mut ShapeBuilder, seed: Wire, a: &[Wire], b: &[Wire]| {
+        assert!(a.len() <= pf_w && b.len() <= pf_w);
+        let mut input = Vec::with_capacity(2 + 2 * pf_w);
+        input.push(seed);
+        input.extend_from_slice(a);
+        input.extend(std::iter::repeat_n(zw, pf_w - a.len()));
+        input.extend_from_slice(b);
+        input.extend(std::iter::repeat_n(zw, pf_w - b.len()));
+        input.push(ow);
+        sb.gate(pfslot, &input)[0]
+    };
+    let spine_mac = |sb: &mut ShapeBuilder, acc: Wire, x: Wire, y: Wire| {
+        sb.gate(spine, &[zw, zw, zw, acc, zw, zw, x, y, zw])[3]
+    };
+    let spine_square =
+        |sb: &mut ShapeBuilder, x: Wire| sb.gate(spine, &[zw, zw, ow, zw, zw, zw, zw, zw, x])[4];
+
+    // Equality weights are shared by the transpose dot and the seven sparse
+    // corrections in every inverse-Moore coefficient.
+    let mut eq_w: [Vec<Wire>; 2] = std::array::from_fn(|_| Vec::with_capacity(128));
+    for k in 0..2 {
+        for t in 0..128 {
+            let bits: Vec<Wire> = (0..7)
+                .map(|j| if (t >> j) & 1 == 1 { ow } else { zw })
+                .collect();
+            eq_w[k].push(prefix(sb, ow, &r_dprime[k], &bits));
+        }
+    }
+
+    // The transpose is tiled so the boolean relation needs only 17 wired
+    // words.  Dot-product linearity lets us accumulate each partial output
+    // directly, without materializing the 128 transposed words in the element
+    // layer.  Claim 0 uses the main MAC slot and claim 1 the fold MAC slot;
+    // this split keeps both below 2^14 rows at the two-child fixed point.
+    let mut rs_half = zw;
+    for k in 0..2 {
+        let dot_slot = if k == 0 { macs } else { fold_macs };
+        let mut dot = zw;
+        for destination_byte in 0..16 {
+            let rows = &shv[k][8 * destination_byte..8 * destination_byte + 8];
+            for source_byte in 0..16 {
+                let selector = cw(
+                    sb,
+                    vals,
+                    consts,
+                    F128::new((source_byte | (destination_byte << 4)) as u64, 0),
+                );
+                let mut input = rows.to_vec();
+                input.push(selector);
+                let partial = sb.gate(tile, &input);
+                for c in 0..8 {
+                    dot = sb.gate(dot_slot, &[dot, partial[c], eq_w[k][8 * source_byte + c]])[0];
+                }
+            }
+        }
+        rs_half = sb.gate(macs, &[rs_half, gamma[k], dot])[0];
+    }
+
+    // c_j/gamma is the MLE of inverse-Moore row j at r_dprime.  The trace-
+    // dual table is geometric except at indices 0..6, so one prefix product
+    // plus seven correction MACs computes it.  Constants are fixed publics:
+    // changing any of them changes the circuit digest.
+    let (mut g0_j, mut ratio_j, mut corrections_j) = family_h_dual_decomposition();
+    let minv = flock_core::pcs::ring_switch::moore_inverse();
+    // Only the eight orbit seeds are fixed publics.  Successive Frobenius
+    // powers are derived by the existing spine's squaring cell, saving more
+    // than one thousand public constants at a two-child node.
+    let mut g0_j_w = cw(sb, vals, consts, g0_j);
+    let mut corrections_j_w: [Wire; 7] =
+        std::array::from_fn(|t| cw(sb, vals, consts, corrections_j[t]));
+    let mut coeff_w: [Vec<Wire>; 2] = std::array::from_fn(|_| Vec::with_capacity(128));
+    for j in 0..128 {
+        let mut ratio_pows = [F128::ZERO; 7];
+        ratio_pows[0] = ratio_j;
+        for q in 1..7 {
+            ratio_pows[q] = ratio_pows[q - 1] * ratio_pows[q - 1];
+        }
+        for k in 0..2 {
+            let scaled_r: Vec<Wire> = (0..7)
+                .map(|q| {
+                    let factor = cw(sb, vals, consts, ratio_pows[q]);
+                    spine_mac(sb, zw, r_dprime[k][q], factor)
+                })
+                .collect();
+            let mut mle = prefix(sb, g0_j_w, &r_dprime[k], &scaled_r);
+            for t in 0..7 {
+                mle = sb.gate(macs, &[mle, corrections_j_w[t], eq_w[k][t]])[0];
+            }
+            coeff_w[k].push(sb.gate(macs, &[zw, gamma[k], mle])[0]);
+        }
+
+        // Pin the closed form to the native matrix on every row.  This is a
+        // shape-time assertion, not witness checking, and catches a basis or
+        // field-polynomial change before it can silently alter family H.
+        let mut gp = g0_j;
+        for t in 0..128 {
+            let got = gp + if t < 7 { corrections_j[t] } else { F128::ZERO };
+            assert_eq!(got, minv[j * 128 + t], "inverse-Moore row {j}, entry {t}");
+            gp *= ratio_j;
+        }
+        g0_j *= g0_j;
+        ratio_j *= ratio_j;
+        for d in &mut corrections_j {
+            *d *= *d;
+        }
+        if j + 1 < 128 {
+            g0_j_w = spine_square(sb, g0_j_w);
+            for d in &mut corrections_j_w {
+                *d = spine_square(sb, *d);
+            }
+        }
+    }
+
+    // Pair the two RS claims in one F256 squaring chain.  After j extension-
+    // field squarings of a+b*u, the second component is b^(2^j) and the first
+    // is a^(2^j)+K_j*b^(2^j), with K_{j+1}=K_j^2+NR.  One base-field MAC
+    // recovers a^(2^j). The squarings fill the residual region's narrower
+    // F256 MAC relation first, then spill into the equivalent Ligerito-spine
+    // multiplication only at that slot's physical row limit. This keeps both
+    // existing slots in bounds without adding a table type.
+    let mut vrs = zw;
+    let mut k_j = F128::ZERO;
+    for j in 0..128 {
+        let mut pair = [values[0][j], values[1][j]];
+        for _ in 0..j {
+            pair = if sb.rows_in_slot(mac256) < row_capacity {
+                emit_mac256(sb, mac256, [zw, zw], pair, pair)
+            } else {
+                emit_spine256(
+                    sb,
+                    spine256,
+                    [zw, zw],
+                    [zw, zw],
+                    [ow, zw],
+                    [zw, zw],
+                    [zw, zw],
+                    [zw, zw],
+                    [zw, zw],
+                    zw,
+                    pair,
+                )[4]
+            };
+        }
+        let kw = cw(sb, vals, consts, k_j);
+        let p0 = sb.gate(macs, &[pair[0], kw, pair[1]])[0];
+        vrs = sb.gate(macs, &[vrs, coeff_w[0][j], p0])[0];
+        vrs = sb.gate(macs, &[vrs, coeff_w[1][j], pair[1]])[0];
+        k_j = k_j * k_j + flock_core::field::QUADRATIC_NONRESIDUE;
+    }
+    (rs_half, vrs)
 }
 
 /// Emit ONE real child's complete deferred-verifier region — the swap
@@ -13676,42 +14003,6 @@ fn emit_real_child_region(
         sb.public_len(),
         sb.rows_in_slot(cs.macs),
     ));
-    // The merged target's TWO HALVES, round-0 posture: the packed-direct
-    // half is a MAC chain over absorbed value words × gamma squeeze wires
-    // (fully in-circuit); only the RS half — the family-H transpose dots —
-    // stays advice, production-checked over the RE-EXPOSED words below.
-    let mut pdh_w = zw;
-    for pd in gammas_i {
-        let gw = squeeze_word_wire(&outs, &trace, pd.fin, pd.squeeze_offset);
-        pdh_w = sb.gate(cs.macs, &[pdh_w, gw, wv(pd.val_v)])[0];
-    }
-    vals.push(rt.native_rs_half);
-    let rsh_w = sb.public_input();
-    let tgt_w = sb.gate(cs.macs, &[rsh_w, ow, pdh_w])[0];
-    let mut runw = tgt_w;
-    for rr in w_rounds {
-        let r_w = outs[trace.squeezes[rr.fin][0]][0];
-        runw = sb.gate(mrslot, &[runw, wv(rr.g_v), wv(rr.g_v + 1), r_w])[0];
-    }
-    // V, the other family-H item, same split: the group-value sum is a MAC
-    // chain over absorbed words; V_rs stays advice; and the boundary
-    // `running == q_eval·V` CLOSES IN-CIRCUIT as a copy constraint —
-    // q_eval needs no exposure at all.
-    let mut vgrp_w = zw;
-    for &vi in &mp_i.val_vs[256..] {
-        vgrp_w = sb.gate(cs.macs, &[vgrp_w, ow, wv(vi)])[0];
-    }
-    vals.push(rt.native_vrs);
-    let vrs_w = sb.public_input();
-    let v_w = sb.gate(cs.macs, &[vrs_w, ow, vgrp_w])[0];
-    let rhs_v_w = sb.gate(cs.macs, &[zw, wv(inner_pd_i.q_v), v_w])[0];
-    sb.connect(runw, rhs_v_w);
-
-    cen.push((
-        "merged target + family-H advice",
-        sb.public_len(),
-        sb.rows_in_slot(cs.macs),
-    ));
     // The ligerito SPINE: start gamma'·q_eval, eval/build per fold,
     // intro-folds consuming the query phase's accumulator wires.
     let gpw = outs[trace.squeezes[inner_pd_i.fin][0]][0];
@@ -13858,6 +14149,79 @@ fn emit_real_child_region(
     // THE CLOSURE, in-circuit: inner == t_r as a copy constraint.
     sb.connect(inner_w[0], t_final[0]);
     sb.connect(inner_w[1], t_final[1]);
+
+    // The complete family-H relation.  All inputs below are already bound
+    // transcript or proof wires; no target/V advice and no native checker are
+    // part of the recursive statement anymore.
+    let shv_w: [Vec<Wire>; 2] = std::array::from_fn(|k| {
+        let sv = rt.rs_recs[k].0;
+        (0..128).map(|i| wv(sv + i)).collect()
+    });
+    let value_w: [Vec<Wire>; 2] = std::array::from_fn(|k| {
+        mp_i.val_vs[128 * k..128 * (k + 1)]
+            .iter()
+            .map(|&vi| wv(vi))
+            .collect()
+    });
+    let rdp_w: [Vec<Wire>; 2] = std::array::from_fn(|k| {
+        let fin = rt.rs_recs[k].1;
+        (0..7)
+            .map(|j| squeeze_word_wire(&outs, &trace, fin, j))
+            .collect()
+    });
+    let gamma_w: [Wire; 2] = std::array::from_fn(|k| {
+        let (fin, offset) = rt.rs_gam_fins[k];
+        squeeze_word_wire(&outs, &trace, fin, offset)
+    });
+    let (rsh_w, vrs_w) = emit_family_h(
+        sb,
+        cs.q.family.expect("family-H slot"),
+        cs.macs,
+        cs.fold_macs,
+        cs.spine,
+        cs.spine256,
+        cs.resid
+            .iter()
+            .find(|&&(key, _)| key == 701)
+            .expect("the child slots declare an F256 MAC slot")
+            .1,
+        1usize << cs.nu,
+        &shv_w,
+        &value_w,
+        &rdp_w,
+        gamma_w,
+        pfslot,
+        pf_w,
+        zw,
+        ow,
+        vals,
+        consts,
+    );
+
+    let mut pdh_w = zw;
+    for pd in gammas_i {
+        let gw = squeeze_word_wire(&outs, &trace, pd.fin, pd.squeeze_offset);
+        pdh_w = sb.gate(cs.macs, &[pdh_w, gw, wv(pd.val_v)])[0];
+    }
+    let tgt_w = sb.gate(cs.macs, &[rsh_w, ow, pdh_w])[0];
+    let mut runw = tgt_w;
+    for rr in w_rounds {
+        let r_w = outs[trace.squeezes[rr.fin][0]][0];
+        runw = sb.gate(mrslot, &[runw, wv(rr.g_v), wv(rr.g_v + 1), r_w])[0];
+    }
+    let mut vgrp_w = zw;
+    for &vi in &mp_i.val_vs[256..] {
+        vgrp_w = sb.gate(cs.macs, &[vgrp_w, ow, wv(vi)])[0];
+    }
+    let v_w = sb.gate(cs.macs, &[vrs_w, ow, vgrp_w])[0];
+    let rhs_v_w = sb.gate(cs.macs, &[zw, wv(inner_pd_i.q_v), v_w])[0];
+    sb.connect(runw, rhs_v_w);
+
+    cen.push((
+        "family-H + merged boundary",
+        sb.public_len(),
+        sb.rows_in_slot(cs.macs),
+    ));
 
     cen.push((
         "spine + residual advice",
@@ -14469,41 +14833,9 @@ fn emit_real_child_region(
         sb.public_len(),
         sb.rows_in_slot(cs.macs),
     ));
-    // ROUND 0's family-H RE-EXPOSURE: the words the rs_half / V_rs advice
-    // checks reference — s_hat_v (2×128), the r_dprime squeeze wires
-    // (2×7), the two rs gammas, and the 256+P multipoint value words. All
-    // wires that already exist; published so the production checker can
-    // recompute the transpose dots and the linearized-coefficient
-    // combination from PUBLIC data alone. Removed again when the
-    // family-H arithmetization lands.
-    let mut n_fam_pub = 0usize;
-    for &(sv, rfin, _) in &rt.rs_recs {
-        for i in 0..128 {
-            sb.publish(wv(sv + i));
-        }
-        for j in 0..7 {
-            sb.publish(squeeze_word_wire(&outs, &trace, rfin, j));
-        }
-        n_fam_pub += 135;
-    }
-    for k in 0..2 {
-        let (fin, offset) = rt.rs_gam_fins[k];
-        sb.publish(squeeze_word_wire(&outs, &trace, fin, offset));
-        n_fam_pub += 1;
-    }
-    for &vi in &mp_i.val_vs {
-        sb.publish(wv(vi));
-        n_fam_pub += 1;
-    }
-    // The two family-H advice values themselves, at known tail positions.
-    sb.publish(rsh_w);
-    sb.publish(vrs_w);
-    n_fam_pub += 2;
-    cen.push((
-        "TAIL: family-H re-exposure",
-        sb.public_len(),
-        sb.rows_in_slot(cs.macs),
-    ));
+    // Family H is now internal arithmetic.  Its source words are already
+    // bound where they enter the transcript/proof stream, so no duplicate
+    // public re-exposure or checker-only advice remains.
     // ---- the JAGGED ASSERTION emission (the count win) ----
     // Raw W claim values in emission order (rs, then per group combo +
     // dense members), checker-held against the deferred export — the
@@ -14527,7 +14859,6 @@ fn emit_real_child_region(
         + 1
         + mat_pub.len()
         + ela_pub.len()
-        + n_fam_pub
         + jag_w.len();
     let el_zc_rho_w: Vec<Wire> = piop_i
         .zc_rounds
@@ -14562,7 +14893,6 @@ fn emit_real_child_region(
         n_query_pub,
         n_tail,
         n_mat_pub: mat_pub.len(),
-        n_fam_pub,
         census: cen,
         jag_w,
         jag_sig_w: mp_sig_w.clone(),
@@ -14622,7 +14952,7 @@ fn check_real_child_region(public: &[F128], rt: &RealTape<'_>, r: &RealRegion) -
     assert_eq!(
         public[sp_base + 2],
         rt.native_target,
-        "the target advice is the native two-halves combination"
+        "the computed target is the native two-halves combination"
     );
     assert_eq!(
         public[sp_base + 3],
@@ -14784,50 +15114,7 @@ fn check_real_child_region(public: &[F128], rt: &RealTape<'_>, r: &RealRegion) -
             "per-slot eval pair {j} rides as bound advice"
         );
     }
-    // The family-H re-exposure block: the words the rs_half / V_rs advice
-    // reference, all published — validated here against the proof's own
-    // fields and the located challenges.
     let mut fq = ela_base + r.n_ela_pub;
-    for (k, &(_, _, rc)) in rt.rs_recs.iter().enumerate() {
-        for (i, &w) in rt.lo.proof.pcs_open.ring_switches[k]
-            .s_hat_v
-            .iter()
-            .enumerate()
-        {
-            assert_eq!(public[fq + i], w, "s_hat_v[{k}][{i}] re-exposed");
-        }
-        fq += 128;
-        for j in 0..7 {
-            assert_eq!(
-                public[fq + j],
-                chals[rc + j],
-                "r_dprime[{k}][{j}] re-exposed"
-            );
-        }
-        fq += 7;
-    }
-    for k in 0..2 {
-        assert_eq!(
-            public[fq + k],
-            chals[rt.rs_gam_chs[k]],
-            "rs gamma {k} re-exposed"
-        );
-    }
-    fq += 2;
-    let fro = &rt.lo.proof.pcs_open.frobenius;
-    for (k, &vi) in rt.mp_i.val_vs.iter().enumerate() {
-        let want = if k < 256 {
-            fro.values[k / 128][k % 128]
-        } else {
-            fro.group_values[k - 256]
-        };
-        assert_eq!(public[fq + k], want, "mp value {k} re-exposed");
-        let _ = vi;
-    }
-    fq += rt.mp_i.val_vs.len();
-    assert_eq!(public[fq], rt.native_rs_half, "the rs_half advice");
-    assert_eq!(public[fq + 1], rt.native_vrs, "the V_rs advice");
-    fq += 2;
     // The jagged assertion's value surfaces (the count win), in emission
     // order — each the deferred export's own raw claim value; the full
     // claims discharge against the child's layout at the root.
@@ -14931,6 +15218,9 @@ fn mvp10_leaf_outer_inner_tape() {
     let pow_ty2 = PowMaskTable;
     let pow_r1cs2 = pow_ty2.build_block_r1cs(nu2);
     let pow_lc2 = pow_r1cs2.csc_lincheck_circuit();
+    let family_slot = cs.q.family.expect("family-H slot");
+    let family_r1cs2 = FamilyTransposeTileTable::build_block_r1cs(nu2);
+    let family_lc2 = family_r1cs2.csc_lincheck_circuit();
     let mut bslots: Vec<(usize, UnionSlotProverInput)> = vec![
         (
             shape2.registry_slot(cs.q.b3),
@@ -14964,6 +15254,16 @@ fn mvp10_leaf_outer_inner_tape() {
                 pow_lc2,
             ),
         ),
+        (
+            shape2.registry_slot(family_slot),
+            UnionSlotProverInput::new(
+                FamilyTransposeTileTable::generate_witness_batch_major(
+                    built2.rows::<FamilyTransposeTileGate>(family_slot),
+                    nu2,
+                ),
+                family_lc2,
+            ),
+        ),
     ];
     bslots.sort_by_key(|(i, _)| *i);
     let mut el_ord: Vec<(usize, Vec<F128>)> = cs
@@ -14990,6 +15290,7 @@ fn mvp10_leaf_outer_inner_tape() {
         (shape2.registry_slot(cs.q.swap), swap_lc2),
         (shape2.registry_slot(cs.q.spread), spread_lc2),
         (shape2.registry_slot(cs.q.pow), pow_lc2),
+        (shape2.registry_slot(family_slot), family_lc2),
     ];
     lco.sort_by_key(|(i, _)| *i);
     let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
@@ -16647,6 +16948,12 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
                 fill.rows::<PowMaskGate>(cs.q.pow),
                 "fill plan: pow rows"
             );
+            let family_slot = cs.q.family.expect("family-H slot");
+            assert_eq!(
+                walk.rows::<FamilyTransposeTileGate>(family_slot),
+                fill.rows::<FamilyTransposeTileGate>(family_slot),
+                "fill plan: family-H rows"
+            );
         }
         let build_ms = t_build.elapsed().as_secs_f64() * 1e3;
         // Per-SHAPE prover materials, hoisted above the online loop — BLAKE3
@@ -16670,6 +16977,9 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
         let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
         let pow_r1cs2 = PowMaskTable.build_block_r1cs(nu2);
         let pow_lc2 = pow_r1cs2.csc_lincheck_circuit();
+        let family_slot = cs.q.family.expect("family-H slot");
+        let family_r1cs2 = FamilyTransposeTileTable::build_block_r1cs(nu2);
+        let family_lc2 = family_r1cs2.csc_lincheck_circuit();
         // ONLINE, `1 + steady_reps()` iterations over the ONE shape: tapes
         // (the recording verifies, re-run with results discarded — identical
         // by determinism), the walk (fill plan), witness assembly, prove,
@@ -16788,6 +17098,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
             let swap_rows2 = built2.rows::<SwapGate>(cs.q.swap).to_vec();
             let spread_rows2 = built2.rows::<BitSpreadGate>(cs.q.spread).to_vec();
             let pow_rows2 = built2.rows::<PowMaskGate>(cs.q.pow).to_vec();
+            let family_rows2 = built2.rows::<FamilyTransposeTileGate>(family_slot).to_vec();
             let mut bslots: Vec<(usize, UnionSlotProverInput)> = vec![
                 (
                     shape2.registry_slot(cs.q.swap),
@@ -16808,6 +17119,18 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
                     UnionSlotProverInput::in_place(
                         move |dst| pow_ty2.generate_witness_batch_major_into(&pow_rows2, dst),
                         pow_lc2,
+                    ),
+                ),
+                (
+                    shape2.registry_slot(family_slot),
+                    UnionSlotProverInput::in_place(
+                        move |dst| {
+                            FamilyTransposeTileTable::generate_witness_batch_major_into(
+                                &family_rows2,
+                                dst,
+                            )
+                        },
+                        family_lc2,
                     ),
                 ),
             ];
@@ -16845,6 +17168,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
                 (shape2.registry_slot(cs.q.swap), swap_lc2),
                 (shape2.registry_slot(cs.q.spread), spread_lc2),
                 (shape2.registry_slot(cs.q.pow), pow_lc2),
+                (shape2.registry_slot(family_slot), family_lc2),
             ];
             lco.extend(b3_declared.iter().map(|&s| {
                 (
@@ -16894,10 +17218,11 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
             fin = Some((built2, oproof, ocommit, acc_pub));
         }
         let (built2, oproof, ocommit, acc_pub) = fin.expect("one online iteration");
-        let (swap_ri, spread_ri, pow_ri) = (
+        let (swap_ri, spread_ri, pow_ri, family_ri) = (
             shape2.registry_slot(cs.q.swap),
             shape2.registry_slot(cs.q.spread),
             shape2.registry_slot(cs.q.pow),
+            shape2.registry_slot(family_slot),
         );
         let b3_ris = std::iter::once(cs.q.b3)
             .chain(cs.q.b3_alt)
@@ -16914,10 +17239,12 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
                 swap_r1cs: swap_r1cs2,
                 spread_r1cs: spread_r1cs2,
                 pow_r1cs: pow_r1cs2,
+                family_r1cs: family_r1cs2,
                 b3_slots: b3_ris,
                 swap_slot: swap_ri,
                 spread_slot: spread_ri,
                 pow_slot: pow_ri,
+                family_slot: family_ri,
             },
             acc: acc_pub,
             stmt_base,
@@ -17887,6 +18214,11 @@ struct ChildTape<'p> {
     ga_fin: usize,
     mg_c: usize,
     mg_fin: usize,
+    /// The two ring-switch regions: `(s_hat_v, r_dprime finalization,
+    /// r_dprime challenge)`, plus each batching coefficient's location in
+    /// their shared vector squeeze. These are the family-H source wires.
+    rs_recs: Vec<(usize, usize, usize)>,
+    rs_gam_fins: Vec<(usize, usize)>,
     // native references + replicas
     bool_assert: flock_core::lincheck::MatrixAssertion,
     el_assert: Option<flock_core::element_r1cs::union::ElementAssertion>,
@@ -18267,9 +18599,9 @@ impl<'p> ChildTape<'p> {
         });
 
         // ---- the merged open: rs x 2, then PD values, then one coefficient vector ----
-        let (pd_recs, mp_val_v, rs_recs, rs_gam_ch) = {
+        let (pd_recs, mp_val_v, rs_recs, rs_gam_ch, rs_gam_fins) = {
             let mut i = mo_l[0] + 1;
-            let mut rs_recs: Vec<(usize, usize)> = Vec::new(); // (s_hat_v index, r_dprime ch)
+            let mut rs_recs: Vec<(usize, usize, usize)> = Vec::new();
             for k in 0..2 {
                 assert!(
                     matches!(&ops[i], Op::Label(l) if l.as_slice() == b"flock-ring-switch-v0"),
@@ -18288,7 +18620,7 @@ impl<'p> ChildTape<'p> {
                     i += 1;
                 }
                 assert!(matches!(ops[i], Op::SqueezeSlice(7)), "r_dprime");
-                rs_recs.push((sv, vc_at(i).1));
+                rs_recs.push((sv, fin_at(i), vc_at(i).1));
                 i += 1;
             }
             // Packed-direct claims contribute just their values.  Their
@@ -18307,6 +18639,7 @@ impl<'p> ChildTape<'p> {
                 "mixed coefficient vector"
             );
             let rs_gam_ch = vc_at(i).1;
+            let rs_gam_fin = fin_at(i);
             i += 1;
             // W rounds until the multipoint label.
             let mut w_rounds = 0usize;
@@ -18331,7 +18664,13 @@ impl<'p> ChildTape<'p> {
             }
             i += 1;
             let (mv, _) = vc_at(i);
-            (pd_recs, mv, rs_recs, rs_gam_ch)
+            (
+                pd_recs,
+                mv,
+                rs_recs,
+                rs_gam_ch,
+                vec![(rs_gam_fin, 0), (rs_gam_fin, 1)],
+            )
         };
         // The pd claims are the element class's two (c, lc) — when the
         // class exists — plus one per wiring GATHER; every gather value is
@@ -18578,7 +18917,7 @@ impl<'p> ChildTape<'p> {
             let gs: Vec<F128> = (0..2).map(|k| chals[rs_gam_ch + k]).collect();
             let mut target = F128::ZERO;
             let mut coeffs: Vec<Vec<F128>> = Vec::new();
-            for (k, &(sv, rc)) in rs_recs.iter().enumerate() {
+            for (k, &(sv, _, rc)) in rs_recs.iter().enumerate() {
                 let shv = &vals_rec[sv..sv + 128];
                 let rdp: Vec<F128> = (0..7).map(|j| chals[rc + j]).collect();
                 let eq = build_eq(&rdp);
@@ -19225,6 +19564,8 @@ impl<'p> ChildTape<'p> {
             ga_fin,
             mg_c,
             mg_fin,
+            rs_recs,
+            rs_gam_fins,
             bool_assert,
             el_assert,
             sigma_native,
@@ -19263,6 +19604,7 @@ impl<'p> ChildTape<'p> {
 /// cache hits require same-shape children (the keyed constructor parameters
 /// must match, which the merge test asserts by requiring one shared circuit).
 struct ChildSlots {
+    nu: usize,
     q: CollapsedSlots,
     macs: flock_core::circuit::builder::SlotId,
     fold_macs: flock_core::circuit::builder::SlotId,
@@ -19304,6 +19646,7 @@ impl ChildSlots {
         let b3 = sb.slot(Blake3Gate { nu: nu2 });
         let b3_alt = split_b3.then(|| sb.slot(Blake3Gate { nu: nu2 }));
         ChildSlots {
+            nu: nu2,
             q: CollapsedSlots {
                 b3,
                 b3_alt,
@@ -19313,6 +19656,7 @@ impl ChildSlots {
                     nu: nu2,
                 }),
                 pow: sb.slot(PowMaskGate { nu: nu2 }),
+                family: Some(sb.slot(FamilyTransposeTileGate { nu: nu2 })),
             },
             macs,
             fold_macs,
@@ -19348,6 +19692,7 @@ impl ChildSlots {
                 .1
         };
         ChildSlots {
+            nu: nu2,
             q,
             macs: take(600),
             fold_macs: take(602),
@@ -19734,17 +20079,6 @@ fn emit_child_region(
         "sigma spans the anchor layers"
     );
 
-    // ---- the merged intake's W-ROUNDS ----
-    // The RS target is FAMILY H — checker-validated advice; the W-rounds
-    // fold it through the shared round gate, binding rho in-circuit.
-    vals.push(ct.native_target);
-    let tgt_w = sb.public_input();
-    let mut runw = tgt_w;
-    for rr in w_rounds {
-        let rho_w = outs[trace.squeezes[rr.fin][0]][0];
-        runw = sb.gate(mrs, &[runw, wv(rr.g_v), wv(rr.g_v + 1), rho_w])[0];
-    }
-
     // ---- the LIGERITO SPINE ----
     let spine = cs.spine;
     let spine256 = cs.spine256;
@@ -19894,6 +20228,74 @@ fn emit_child_region(
     // checker item (both stay published as test cross-checks).
     sb.connect(inner_w[0], t_final[0]);
     sb.connect(inner_w[1], t_final[1]);
+
+    // ---- FAMILY H + the merged intake boundary ----
+    // The transpose/equality dot products and inverse-Moore/Frobenius
+    // recombination are all recursive-circuit arithmetic. Every source is
+    // an existing transcript/proof wire; the native target is retained only
+    // as a published test oracle below.
+    let shv_w: [Vec<Wire>; 2] = std::array::from_fn(|k| {
+        let sv = ct.rs_recs[k].0;
+        (0..128).map(|i| wv(sv + i)).collect()
+    });
+    let value_w: [Vec<Wire>; 2] = std::array::from_fn(|k| {
+        mp_o.val_vs[128 * k..128 * (k + 1)]
+            .iter()
+            .map(|&vi| wv(vi))
+            .collect()
+    });
+    let rdp_w: [Vec<Wire>; 2] = std::array::from_fn(|k| {
+        let fin = ct.rs_recs[k].1;
+        (0..7)
+            .map(|j| squeeze_word_wire(&outs, &trace, fin, j))
+            .collect()
+    });
+    let gamma_w: [Wire; 2] = std::array::from_fn(|k| {
+        let (fin, offset) = ct.rs_gam_fins[k];
+        squeeze_word_wire(&outs, &trace, fin, offset)
+    });
+    let (rsh_w, vrs_w) = emit_family_h(
+        sb,
+        cs.q.family.expect("family-H slot"),
+        cs.macs,
+        cs.fold_macs,
+        cs.spine,
+        cs.spine256,
+        cs.resid
+            .iter()
+            .find(|&&(key, _)| key == 701)
+            .expect("the child slots declare an F256 MAC slot")
+            .1,
+        1usize << cs.nu,
+        &shv_w,
+        &value_w,
+        &rdp_w,
+        gamma_w,
+        pfslot,
+        pf_w,
+        zw,
+        ow,
+        vals,
+        consts,
+    );
+    let mut pdh_w = zw;
+    for pd in &ct.gammas_o {
+        let gw = squeeze_word_wire(&outs, &trace, pd.fin, pd.squeeze_offset);
+        pdh_w = sb.gate(macs, &[pdh_w, gw, wv(pd.val_v)])[0];
+    }
+    let tgt_w = sb.gate(macs, &[rsh_w, ow, pdh_w])[0];
+    let mut runw = tgt_w;
+    for rr in w_rounds {
+        let rho_w = outs[trace.squeezes[rr.fin][0]][0];
+        runw = sb.gate(mrs, &[runw, wv(rr.g_v), wv(rr.g_v + 1), rho_w])[0];
+    }
+    let mut vgrp_w = zw;
+    for &vi in &mp_o.val_vs[256..] {
+        vgrp_w = sb.gate(macs, &[vgrp_w, ow, wv(vi)])[0];
+    }
+    let v_w = sb.gate(macs, &[vrs_w, ow, vgrp_w])[0];
+    let rhs_v_w = sb.gate(macs, &[zw, wv(inner_pd2.q_v), v_w])[0];
+    sb.connect(runw, rhs_v_w);
 
     // ---- the ELEMENT PIOP rounds in-circuit (mixed children only) ----
     // Zerocheck rounds are ZcRoundGate rows (tau slice wires as eq weights,
@@ -20481,11 +20883,12 @@ fn check_child_region(public: &[F128], ct: &ChildTape<'_>, r: &ChildRegion) -> u
         ct.t_final_n,
         "the spine's final t_r matches the native replay"
     );
-    // The merged intake: the advice target and the in-circuit running.
+    // The merged intake is fully constrained; its publications retain the
+    // native replay as a test oracle.
     assert_eq!(
         public[mp_base + 3],
         ct.native_target,
-        "the RS target advice is the native gamma-combination"
+        "the computed RS target matches the native gamma-combination"
     );
     assert_eq!(
         public[mp_base + 4],
@@ -20660,6 +21063,9 @@ fn mvp10_circuit_inner_tape() {
     let pow_ty2 = PowMaskTable;
     let pow_r1cs2 = pow_ty2.build_block_r1cs(nu2);
     let pow_lc2 = pow_r1cs2.csc_lincheck_circuit();
+    let family_slot2 = cs.q.family.expect("family-H slot");
+    let family_r1cs2 = FamilyTransposeTileTable::build_block_r1cs(nu2);
+    let family_lc2 = family_r1cs2.csc_lincheck_circuit();
     let spread_r1cs2 = spread_ty2.build_block_r1cs(nu2);
     let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
     let mut el_ord: Vec<(usize, Vec<F128>)> = cs
@@ -20714,6 +21120,16 @@ fn mvp10_circuit_inner_tape() {
                 pow_lc2,
             ),
         ),
+        (
+            shape2.registry_slot(family_slot2),
+            UnionSlotProverInput::new(
+                FamilyTransposeTileTable::generate_witness_batch_major(
+                    built2.rows::<FamilyTransposeTileGate>(family_slot2),
+                    nu2,
+                ),
+                family_lc2,
+            ),
+        ),
     ];
     bslots.sort_by_key(|(i, _)| *i);
     let mut lco: Vec<(usize, &dyn flock_core::lincheck::LincheckCircuit)> = vec![
@@ -20721,6 +21137,7 @@ fn mvp10_circuit_inner_tape() {
         (shape2.registry_slot(cs.q.swap), swap_lc2),
         (shape2.registry_slot(cs.q.spread), spread_lc2),
         (shape2.registry_slot(cs.q.pow), pow_lc2),
+        (shape2.registry_slot(family_slot2), family_lc2),
     ];
     lco.sort_by_key(|(i, _)| *i);
     let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
@@ -20815,6 +21232,7 @@ fn partial_block_leaves_hash_correctly() {
                 nu,
             }),
             pow: sb.slot(PowMaskGate { nu }),
+            family: None,
         };
         let mut vals: Vec<F128> = Vec::new();
         let iv_w = pack8(&IV);
@@ -23980,6 +24398,9 @@ fn mvp11_merge_fold_region() {
         let pow_ty2 = PowMaskTable;
         let pow_r1cs2 = pow_ty2.build_block_r1cs(nu2);
         let pow_lc2 = pow_r1cs2.csc_lincheck_circuit();
+        let family_slot2 = cs.q.family.expect("family-H slot");
+        let family_r1cs2 = FamilyTransposeTileTable::build_block_r1cs(nu2);
+        let family_lc2 = family_r1cs2.csc_lincheck_circuit();
         let mut el_ord: Vec<(usize, Vec<F128>)> = cs
             .element_slot_ids()
             .into_iter()
@@ -24037,6 +24458,16 @@ fn mvp11_merge_fold_region() {
                     pow_lc2,
                 ),
             ),
+            (
+                shape2.registry_slot(family_slot2),
+                UnionSlotProverInput::new(
+                    FamilyTransposeTileTable::generate_witness_batch_major(
+                        built2.rows::<FamilyTransposeTileGate>(family_slot2),
+                        nu2,
+                    ),
+                    family_lc2,
+                ),
+            ),
         ];
         bslots.sort_by_key(|(i, _)| *i);
         let mut ch2 = FsChallenger::new(DOMAIN);
@@ -24054,6 +24485,7 @@ fn mvp11_merge_fold_region() {
             (shape2.registry_slot(cs.q.swap), swap_lc2),
             (shape2.registry_slot(cs.q.spread), spread_lc2),
             (shape2.registry_slot(cs.q.pow), pow_lc2),
+            (shape2.registry_slot(family_slot2), family_lc2),
         ];
         lco.sort_by_key(|(i, _)| *i);
         let lcs2: Vec<&dyn flock_core::lincheck::LincheckCircuit> =
@@ -26507,10 +26939,16 @@ fn build_node_outer_app(
                 (shape2.registry_slot(cs.q.b3), "b3".to_string()),
                 (shape2.registry_slot(cs.q.swap), "swap".to_string()),
                 (shape2.registry_slot(cs.q.spread), "spread".to_string()),
+                (
+                    shape2.registry_slot(cs.q.family.expect("family-H slot")),
+                    "family-h".to_string(),
+                ),
                 (shape2.registry_slot(cs.macs), "mac".to_string()),
+                (shape2.registry_slot(cs.fold_macs), "fold-mac".to_string()),
                 (shape2.registry_slot(cs.zcr), "zcr".to_string()),
                 (shape2.registry_slot(cs.mrs), "mrs".to_string()),
                 (shape2.registry_slot(cs.spine), "spine".to_string()),
+                (shape2.registry_slot(cs.spine256), "spine256".to_string()),
                 (shape2.registry_slot(cs.alslot), "assist".to_string()),
             ];
             if let Some(slot) = cs.q.b3_alt {
@@ -26610,6 +27048,12 @@ fn build_node_outer_app(
                 fill.rows::<PowMaskGate>(cs.q.pow),
                 "fill plan: pow rows"
             );
+            let family_slot = cs.q.family.expect("family-H slot");
+            assert_eq!(
+                walk.rows::<FamilyTransposeTileGate>(family_slot),
+                fill.rows::<FamilyTransposeTileGate>(family_slot),
+                "fill plan: family-H rows"
+            );
         }
         // The node proves and verifies over the circuit path. Union, PCS
         // params and the R1CS tables are per-SHAPE — offline, ahead of the
@@ -26637,6 +27081,9 @@ fn build_node_outer_app(
         let spread_lc2 = spread_r1cs2.csc_lincheck_circuit();
         let pow_r1cs2 = PowMaskTable.build_block_r1cs(nu2);
         let pow_lc2 = pow_r1cs2.csc_lincheck_circuit();
+        let family_slot = cs.q.family.expect("family-H slot");
+        let family_r1cs2 = FamilyTransposeTileTable::build_block_r1cs(nu2);
+        let family_lc2 = family_r1cs2.csc_lincheck_circuit();
         let build_ms = build_ms + t_r1cs.elapsed().as_secs_f64() * 1e3;
         // TOWER_STEADY=N (or the bench's STEADY_OVERRIDE) re-runs the ONLINE
         // phases (tapes + trace + asm + prove + verify) N extra times over
@@ -26931,6 +27378,7 @@ fn build_node_outer_app(
             let swap_rows2 = built2.rows::<SwapGate>(cs.q.swap).to_vec();
             let spread_rows2 = built2.rows::<BitSpreadGate>(cs.q.spread).to_vec();
             let pow_rows2 = built2.rows::<PowMaskGate>(cs.q.pow).to_vec();
+            let family_rows2 = built2.rows::<FamilyTransposeTileGate>(family_slot).to_vec();
             let mut bslots: Vec<(usize, UnionSlotProverInput)> = vec![
                 (
                     shape2.registry_slot(cs.q.swap),
@@ -26951,6 +27399,18 @@ fn build_node_outer_app(
                     UnionSlotProverInput::in_place(
                         move |dst| pow_ty2.generate_witness_batch_major_into(&pow_rows2, dst),
                         pow_lc2,
+                    ),
+                ),
+                (
+                    shape2.registry_slot(family_slot),
+                    UnionSlotProverInput::in_place(
+                        move |dst| {
+                            FamilyTransposeTileTable::generate_witness_batch_major_into(
+                                &family_rows2,
+                                dst,
+                            )
+                        },
+                        family_lc2,
                     ),
                 ),
             ];
@@ -27031,6 +27491,7 @@ fn build_node_outer_app(
                 (shape2.registry_slot(cs.q.swap), swap_lc2),
                 (shape2.registry_slot(cs.q.spread), spread_lc2),
                 (shape2.registry_slot(cs.q.pow), pow_lc2),
+                (shape2.registry_slot(family_slot), family_lc2),
             ];
             lco.extend(b3_declared.iter().map(|&slot| {
                 (
@@ -27157,10 +27618,11 @@ fn build_node_outer_app(
                 built2, oproof, ocommit, block_pub, tapes_ms, trace_ms, asm_ms, prove_ms, verify_ms,
             );
         };
-        let (swap_slot2, spread_slot2, pow_slot2) = (
+        let (swap_slot2, spread_slot2, pow_slot2, family_slot2) = (
             shape2.registry_slot(cs.q.swap),
             shape2.registry_slot(cs.q.spread),
             shape2.registry_slot(cs.q.pow),
+            shape2.registry_slot(family_slot),
         );
         let b3_slots2 = std::iter::once(cs.q.b3)
             .chain(cs.q.b3_alt)
@@ -27177,10 +27639,12 @@ fn build_node_outer_app(
                 swap_r1cs: swap_r1cs2,
                 spread_r1cs: spread_r1cs2,
                 pow_r1cs: pow_r1cs2,
+                family_r1cs: family_r1cs2,
                 b3_slots: b3_slots2,
                 swap_slot: swap_slot2,
                 spread_slot: spread_slot2,
                 pow_slot: pow_slot2,
+                family_slot: family_slot2,
             },
             acc: acc_v,
             online: Online {

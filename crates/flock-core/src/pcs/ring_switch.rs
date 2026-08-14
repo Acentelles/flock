@@ -1691,12 +1691,12 @@ fn bit_basis(t: usize) -> F128 {
 /// universal (proof- and registry-independent), computed once per process by
 /// Gauss–Jordan over `F` (~2·128³ multiplies). Row-major, `inv[j·128 + t]`.
 ///
-/// `pub`: the recursion circuit's family-H arithmetization bakes row `j` as
-/// the constant lane table of its MooreFold gates — the linearized
-/// coefficient is `c_j = γ·Σ_t inv[j·128+t]·eq(r″, t)`, i.e. the MLE of row
-/// `j` at the fold challenge point (see
-/// [`linearized_coefficients_are_moore_row_mles`]) — so both sides must name
-/// the SAME matrix.
+/// The recursion circuit's family-H arithmetization evaluates row `j` via
+/// the trace-dual basis's geometric tail plus its seven low-index
+/// corrections. The linearized coefficient is
+/// `c_j = γ·Σ_t inv[j·128+t]·eq(r″, t)`, i.e. the MLE of row `j` at the fold
+/// challenge point (see [`linearized_coefficients_are_moore_row_mles`]); a
+/// shape-time assertion pins the closed form to this same matrix.
 pub fn moore_inverse() -> &'static [F128] {
     use std::sync::OnceLock;
     static MINV: OnceLock<Vec<F128>> = OnceLock::new();
@@ -3324,15 +3324,15 @@ mod tests {
         }
     }
 
-    /// **The family-H closed form the recursion circuit builds on** (route A,
-    /// 2026-08-04): the linearized fold coefficients are MLEs of the constant
+    /// **The family-H closed form the recursion circuit builds on.** The
+    /// linearized fold coefficients are MLEs of the constant
     /// inverse-Moore rows at the fold challenge point,
     /// `c_j = γ·Σ_t minv[j][t]·eq(r″, t) = γ·M̂inv_j(r″)`, because
     /// `Φ(bit_basis(t)) = scaled_eq[t]` (a basis vector's fold picks exactly
-    /// one table entry). The circuit's MooreFold gates bake row `j` as
-    /// constant lanes and fold them at the wired `r″` — this test is the pin
-    /// that the native `linearized_coefficients` and that gate compute the
-    /// same values, and that the linearization identity
+    /// one table entry). The circuit evaluates each row from the
+    /// trace-dual basis's geometric tail and seven exceptional entries at
+    /// the wired `r″`. This test pins the native coefficients to that same
+    /// inverse-Moore row MLE and checks that the linearization identity
     /// `fold_one_slot(x) = Σ_j c_j·x^{2^j}` holds (what V_rs's squaring
     /// chains replay).
     #[test]

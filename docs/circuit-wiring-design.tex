@@ -975,11 +975,29 @@ pure-element inner is the subset without the RS items):
         its \code{rc} output additionally \emph{binds}
         \code{final\_c\_eval}, which the transcript never absorbs; the
         checker holds the published wire against the proof field.)
-  \item \emph{The family-H batch} (boundary-first; the standing upgrade
-        target): the RS transpose dots (a bit-matrix transpose), the
-        linearized fold coefficients, and the $V$ recombination's
-        Frobenius squarings — $\F_2$-linear maps of bound words,
-        recomputed natively. Two items have LEFT the batch, in-circuit:
+  \item \emph{The family-H batch}: no native-checker obligation remains.
+        For RS claim $k$, the circuit computes
+        \[
+          h_k=\left\langle
+             \operatorname{transpose}(\hat s_{v,k}),
+             \operatorname{eq}(r'_k)
+          \right\rangle,
+          \qquad H_{\rm RS}=\sum_{k=0}^{1}\gamma_k h_k,
+        \]
+        then derives every inverse-Moore coefficient $c_{k,j}$ from the
+        same $r'_k,\gamma_k$ wires and checks
+        \[
+          V_{\rm RS}=\sum_{k=0}^{1}\sum_{j=0}^{127}
+             c_{k,j} A_{k,j}^{2^j}.
+        \]
+        The packed-direct target terms and scalar-group values are added by
+        ordinary MAC chains, the recorded $W$ rounds start from the computed
+        target, and the terminal relation is a copy constraint
+        $W_{\rm final}=q_{\rm eval}(V_{\rm RS}+V_{\rm groups})$.
+        Every operand is an already-bound transcript or proof wire. The
+        published target and running value remain only as independent native
+        test oracles, not as soundness checks. Two adjacent deferred-algebra
+        upgrades are likewise in-circuit:
         \begin{itemize}[nosep]
           \item The \emph{skip-round interpolation}: the barycentric
                 \emph{numerator} recurrence $A' = A(z{+}\lambda)$,
@@ -1040,37 +1058,33 @@ contract shrinks monotonically as items move in-circuit, and it is
 part of the statement: a checker that skips an item verifies a weaker
 claim.
 
-\paragraph{The family-H batch is not one pass — it splits by cell-slot
-cost.} The cell space's $c$ bits count \emph{IO words} (one cell-slot
-per schema word of each gate type, plus one per $2^\nu$ block of
-publics), so a boolean bit-gadget table is charged by its wired words,
-not its live rows. That splits the batch:
+\paragraph{How family H fits the fixed envelope.}
+A monolithic transpose table would indeed spend hundreds of IO words. The
+implemented relation instead transposes one $8\times8$ bit tile per row. Its
+schema is eight bound input words, one fixed selector word, and eight partial
+output words (17 IO words total). There are $2\cdot16\cdot16=512$ live tile
+rows per verified child. Linearity lets each partial output enter its
+equality-weighted dot product immediately, so the circuit never materializes
+the full 128-word transpose as element wires.
 
-\begin{itemize}[nosep]
-  \item \emph{Element-tractable — both landed}: the skip interpolation
-        and the R=2 anchor expect including $\hat g(\rho'')$ (see the
-        family-H bullet above). The enabling facts: in characteristic 2
-        the eq factor is \emph{affine} ($1+a+b$), so the existing
-        \code{PrefixGate} slot evaluates every $\mathrm{eq}(\rho^{2^{-j}},
-        \rho'')$ with zero-padding (padding pairs contribute 1); the
-        inverse-Frobenius points ride as advice verified by
-        \emph{forward} squaring deltas on the existing spine slot;
-        $\gamma$-powers are spine MACs. One new cell-slot group
-        (\code{AssistLayerGate}, 13 IO words) — $\mu$ held at 21; cost is
-        rows ($\approx 128$ prefix chains $+\ 127m$ advice checks) and
-        $\approx 2 \cdot 127m$ publics ($\approx$ 20 KiB of proof).
-  \item \emph{Cell-slot-expensive}: the RS transpose dots and the $V$
-        recombination's Frobenius twists. A faithful transpose table
-        needs its 128 input words \emph{wired} (free-witness inputs are
-        unsound here — binding the inputs to the stream is the content)
-        plus outputs: $\geq 256$ new cell-slots, i.e.\ $c{+}1$ and a
-        verifier-cost step, or tiling into $32{\times}32$ blocks
-        (64 words) against whatever slot headroom remains. The clean fix
-        is per-slot row capacity (the ``jagged remainder''): a
-        transpose table with 2 live rows wants $\nu_{\mathrm{slot}} = 1$,
-        at which point its index space is trivial. Until that exists,
-        these two items \emph{stay boundary} deliberately.
-\end{itemize}
+The inverse-Moore work uses a GHASH-basis identity checked against the native
+matrix at shape construction: if $d_t$ is the trace-dual row, then
+$d_t=g_0\eta^t$ for $t\geq7$, with only seven low-index corrections. Every
+Frobenius row has the same form after squaring $g_0,\eta$, and the seven
+corrections. Thus one prefix product and seven MACs compute each coefficient;
+only the eight orbit seeds are fixed publics, while later orbit members are
+derived by constrained squaring.
+
+For the $V$ recombination, the two RS values for row $j$ are packed into one
+quadratic-extension element and squared $j$ times. The second limb is the
+second base-field Frobenius power; the first is the first power plus a known
+multiple of the second, removed by one MAC. This costs
+$\sum_{j=0}^{127}j=8128$ extension multiplications per child. They first use
+the existing narrow extension-MAC slot and spill into the existing Ligerito
+spine relation only at the former's physical row limit. No extra element type
+is introduced. At the m32 two-child fixed point every slot remains within
+$2^{14}$ rows, the cell layout remains 511 gate slots plus one public slot
+($\mu=23$), and the recursive proof remains approximately 256 KiB.
 
 % ===========================================================================
 \section{Cost accounting}\label{sec:costs}

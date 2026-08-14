@@ -757,6 +757,282 @@ pub struct PowMaskInput {
     pub mask: u128,
 }
 
+// ---------------------------------------------------------------------------
+// Family-H 8x8 transpose tiles
+// ---------------------------------------------------------------------------
+
+/// One dynamically placed 8x8 tile of the 128x128 bit-matrix transpose used
+/// by the ring-switch verifier.  The selector's low nibble chooses one input
+/// byte and its high nibble chooses the destination byte.  Eight input rows
+/// become eight output columns; every output word is zero outside the selected
+/// destination byte.
+///
+/// Keeping the selector wired is essential: without it a witness could choose
+/// which tile it exposes.  The 8 inputs + selector + 8 outputs make exactly 17
+/// IO words, the remaining cell-slot headroom of the m32 recursion envelope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FamilyTransposeTileInput {
+    pub rows: [F128; 8],
+    pub selector: u8,
+}
+
+pub struct FamilyTransposeTileTable;
+
+impl FamilyTransposeTileTable {
+    pub const K_LOG: usize = 12;
+    const INPUT: usize = 0;
+    const SELECTOR: usize = 8 * 128;
+    const NOT_SELECTOR: usize = Self::SELECTOR + 128;
+    const SRC_ONE_HOT: usize = Self::NOT_SELECTOR + 8;
+    const DST_ONE_HOT: usize = Self::SRC_ONE_HOT + 16 * 3;
+    const SELECTED_PRODUCTS: usize = Self::DST_ONE_HOT + 16 * 3;
+    const CONST: usize = Self::SELECTED_PRODUCTS + 8 * 8 * 16;
+    const OUTPUT: usize = 18 * 128;
+    const USEFUL_BITS: usize = Self::OUTPUT + 8 * 128;
+
+    fn k() -> usize {
+        1usize << Self::K_LOG
+    }
+
+    fn bit(x: F128, j: usize) -> bool {
+        if j < 64 {
+            (x.lo >> j) & 1 == 1
+        } else {
+            (x.hi >> (j - 64)) & 1 == 1
+        }
+    }
+
+    fn selector_literal(bit: usize, value: bool) -> usize {
+        if value {
+            Self::SELECTOR + bit
+        } else {
+            Self::NOT_SELECTOR + bit
+        }
+    }
+
+    fn hot_base(source: bool, value: usize) -> usize {
+        let base = if source {
+            Self::SRC_ONE_HOT
+        } else {
+            Self::DST_ONE_HOT
+        };
+        base + 3 * value
+    }
+
+    fn product(r: usize, c: usize, source_byte: usize) -> usize {
+        Self::SELECTED_PRODUCTS + ((r * 8 + c) * 16 + source_byte)
+    }
+
+    pub fn io_schema() -> Vec<IoWord> {
+        let mut schema: Vec<IoWord> = (0..8).map(IoWord::input).collect();
+        schema.push(IoWord::input(Self::SELECTOR / 128));
+        schema.extend((0..8).map(|w| IoWord::output(Self::OUTPUT / 128 + w)));
+        schema
+    }
+
+    pub fn outputs(input: &FamilyTransposeTileInput) -> [F128; 8] {
+        let source_byte = (input.selector & 0x0f) as usize;
+        let destination_byte = (input.selector >> 4) as usize;
+        let mut out = [F128::ZERO; 8];
+        for c in 0..8 {
+            for r in 0..8 {
+                if Self::bit(input.rows[r], 8 * source_byte + c) {
+                    let at = 8 * destination_byte + r;
+                    if at < 64 {
+                        out[c].lo |= 1u64 << at;
+                    } else {
+                        out[c].hi |= 1u64 << (at - 64);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
+        let k = Self::k();
+        let gc = Self::CONST;
+        let mut a = vec![Vec::new(); k];
+        let mut b = vec![Vec::new(); k];
+        let free = |a: &mut Vec<Vec<usize>>, b: &mut Vec<Vec<usize>>, at: usize| {
+            a[at] = vec![at];
+            b[at] = vec![gc];
+        };
+
+        for at in Self::INPUT..Self::SELECTOR + 128 {
+            free(&mut a, &mut b, at);
+        }
+        for q in 0..8 {
+            let at = Self::NOT_SELECTOR + q;
+            a[at] = vec![gc, Self::SELECTOR + q];
+            b[at] = vec![gc];
+        }
+
+        for source in [true, false] {
+            let selector_base = if source { 0 } else { 4 };
+            for value in 0..16 {
+                let base = Self::hot_base(source, value);
+                let lit =
+                    |q: usize| Self::selector_literal(selector_base + q, ((value >> q) & 1) == 1);
+                a[base] = vec![lit(0)];
+                b[base] = vec![lit(1)];
+                a[base + 1] = vec![lit(2)];
+                b[base + 1] = vec![lit(3)];
+                a[base + 2] = vec![base];
+                b[base + 2] = vec![base + 1];
+            }
+        }
+
+        for r in 0..8 {
+            for c in 0..8 {
+                for source_byte in 0..16 {
+                    let at = Self::product(r, c, source_byte);
+                    a[at] = vec![Self::INPUT + 128 * r + 8 * source_byte + c];
+                    b[at] = vec![Self::hot_base(true, source_byte) + 2];
+                }
+            }
+        }
+
+        for c in 0..8 {
+            for destination_byte in 0..16 {
+                for r in 0..8 {
+                    let at = Self::OUTPUT + 128 * c + 8 * destination_byte + r;
+                    a[at] = (0..16).map(|s| Self::product(r, c, s)).collect();
+                    b[at] = vec![Self::hot_base(false, destination_byte) + 2];
+                }
+            }
+        }
+        a[gc] = vec![gc];
+        b[gc] = vec![gc];
+
+        let m = |rows: Vec<Vec<usize>>| SparseBinaryMatrix {
+            num_rows: k,
+            num_cols: k,
+            rows,
+        };
+        (m(a), m(b))
+    }
+
+    pub fn build_block_r1cs(n_log: usize) -> BlockR1cs {
+        let (a_0, b_0) = Self::build_matrices();
+        BlockR1cs {
+            m: n_log + Self::K_LOG,
+            k_log: Self::K_LOG,
+            k_skip: flock_core::zerocheck::K_SKIP,
+            useful_bits: Self::USEFUL_BITS,
+            a_0,
+            b_0,
+            c_0: identity(Self::k()),
+            layout: WitnessLayout::BatchMajor,
+            const_pin: Some(Self::CONST),
+            digest_cache: std::sync::OnceLock::new(),
+            csc_cache: std::sync::OnceLock::new(),
+        }
+    }
+
+    pub fn build_witness(input: &FamilyTransposeTileInput) -> [Vec<bool>; 3] {
+        let k = Self::k();
+        let (mut z, mut a, mut b) = (vec![false; k], vec![false; k], vec![false; k]);
+        let free = |z: &mut [bool], a: &mut [bool], b: &mut [bool], at: usize, v: bool| {
+            z[at] = v;
+            a[at] = v;
+            b[at] = true;
+        };
+
+        for r in 0..8 {
+            for j in 0..128 {
+                free(
+                    &mut z,
+                    &mut a,
+                    &mut b,
+                    Self::INPUT + 128 * r + j,
+                    Self::bit(input.rows[r], j),
+                );
+            }
+        }
+        for j in 0..128 {
+            free(
+                &mut z,
+                &mut a,
+                &mut b,
+                Self::SELECTOR + j,
+                j < 8 && ((input.selector >> j) & 1) == 1,
+            );
+        }
+        for q in 0..8 {
+            let s = ((input.selector >> q) & 1) == 1;
+            let at = Self::NOT_SELECTOR + q;
+            z[at] = !s;
+            a[at] = !s;
+            b[at] = true;
+        }
+
+        for source in [true, false] {
+            let selector_base = if source { 0 } else { 4 };
+            for value in 0..16 {
+                let base = Self::hot_base(source, value);
+                let lit = |q: usize| {
+                    ((input.selector >> (selector_base + q)) & 1) as usize == ((value >> q) & 1)
+                };
+                z[base] = lit(0) && lit(1);
+                a[base] = lit(0);
+                b[base] = lit(1);
+                z[base + 1] = lit(2) && lit(3);
+                a[base + 1] = lit(2);
+                b[base + 1] = lit(3);
+                z[base + 2] = z[base] && z[base + 1];
+                a[base + 2] = z[base];
+                b[base + 2] = z[base + 1];
+            }
+        }
+
+        let source_byte = (input.selector & 0x0f) as usize;
+        let destination_byte = (input.selector >> 4) as usize;
+        for r in 0..8 {
+            for c in 0..8 {
+                let mut selected = false;
+                for s in 0..16 {
+                    let at = Self::product(r, c, s);
+                    let x = Self::bit(input.rows[r], 8 * s + c);
+                    let hot = s == source_byte;
+                    z[at] = x && hot;
+                    a[at] = x;
+                    b[at] = hot;
+                    selected ^= z[at];
+                }
+                for d in 0..16 {
+                    let at = Self::OUTPUT + 128 * c + 8 * d + r;
+                    z[at] = selected && d == destination_byte;
+                    a[at] = selected;
+                    b[at] = d == destination_byte;
+                }
+            }
+        }
+        z[Self::CONST] = true;
+        a[Self::CONST] = true;
+        b[Self::CONST] = true;
+        [z, a, b]
+    }
+
+    pub fn generate_witness_batch_major(
+        rows: &[FamilyTransposeTileInput],
+        nu: usize,
+    ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
+        use rayon::prelude::*;
+        let per: Vec<[Vec<bool>; 3]> = rows.par_iter().map(Self::build_witness).collect();
+        scatter_zab(&per, Self::k(), Self::USEFUL_BITS, nu)
+    }
+
+    pub fn generate_witness_batch_major_into(
+        rows: &[FamilyTransposeTileInput],
+        dst: flock_core::union::SlotWitnessDest<'_>,
+    ) -> Vec<u8> {
+        use rayon::prelude::*;
+        let per: Vec<[Vec<bool>; 3]> = rows.par_iter().map(Self::build_witness).collect();
+        scatter_zab_into(&per, Self::k(), Self::USEFUL_BITS, dst)
+    }
+}
+
 impl PowMaskTable {
     pub fn k_log(&self) -> usize {
         9
@@ -903,5 +1179,52 @@ impl PowMaskTable {
         use rayon::prelude::*;
         let per: Vec<[Vec<bool>; 3]> = rows.par_iter().map(|&i| self.build_witness(i)).collect();
         scatter_zab_into(&per, self.k(), self.useful_bits(), dst)
+    }
+}
+
+#[cfg(test)]
+mod family_h_tests {
+    use super::*;
+
+    #[test]
+    fn transpose_tiles_assemble_exactly_and_are_constrained() {
+        let rows: [F128; 128] = std::array::from_fn(|i| {
+            F128::new(
+                (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                (!(i as u64)).rotate_left((i % 64) as u32),
+            )
+        });
+        let mut assembled = [F128::ZERO; 128];
+        let r1cs = FamilyTransposeTileTable::build_block_r1cs(0);
+        for destination_byte in 0..16 {
+            let tile_rows: [F128; 8] = rows[8 * destination_byte..8 * destination_byte + 8]
+                .try_into()
+                .unwrap();
+            for source_byte in 0..16 {
+                let input = FamilyTransposeTileInput {
+                    rows: tile_rows,
+                    selector: (source_byte | (destination_byte << 4)) as u8,
+                };
+                let out = FamilyTransposeTileTable::outputs(&input);
+                for c in 0..8 {
+                    assembled[8 * source_byte + c] += out[c];
+                }
+                let witness = FamilyTransposeTileTable::build_witness(&input);
+                assert!(r1cs.satisfies(&witness[0]), "honest tile must satisfy");
+                let mut bad = witness[0].clone();
+                bad[FamilyTransposeTileTable::OUTPUT] ^= true;
+                assert!(!r1cs.satisfies(&bad), "a changed output bit must fail");
+                let mut bad_selector = witness[0].clone();
+                bad_selector[FamilyTransposeTileTable::SELECTOR] ^= true;
+                assert!(
+                    !r1cs.satisfies(&bad_selector),
+                    "the tile selector is part of the constrained input"
+                );
+            }
+        }
+        assert_eq!(
+            assembled.to_vec(),
+            flock_core::pcs::ring_switch::tensor_algebra_transpose(&rows),
+        );
     }
 }
