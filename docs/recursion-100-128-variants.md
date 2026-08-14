@@ -215,6 +215,63 @@ mixed-child recursive proofs, the m32 headline tower, the converged
 - `be75c25` — Ron's original review report. The current working-tree fixes are
   recorded above and in `128-bit-grinding-audit.md`.
 
+## Parked option: chain100 on the F128-only ladder (~140 ms nodes)
+
+*Recorded 2026-08-14. Status: PARKED — a real project, not a config flip.
+Revisit if Chain100 becomes a product tier where +20% throughput matters.*
+
+Before the F256 rewrite, the 100-bit chain tower ran on an F128-only
+Ligerito ladder and its nodes cost ~140 ms — vs ~199 ms today. That world
+is fully recoverable from git, and it is sound for 100 bits: F256 exists
+only to close the proximity-gap/MCA term that the 128-bit target needs.
+
+**The pointers:**
+
+- `be75c25` — the last F128 world. `configs/ligerito/m29_slim100.toml`
+  there says `field = "f128"` with the certified 100-bit analysis
+  (`analysis_version = "johnson_two_point_ood_query100_c3_algebraic_…"`,
+  v18-era: two-point OOD + Appendix C.3 grinding). Measured on Ron's
+  M4 Max at m32: leaf 423.9 | FL 194.5 | internal 142.7 ms, amortised
+  593 ms/leaf -> 442k compressions/sec.
+- `97cc1d2` ("feat: 256-bit field ligerito") — the in-place rewrite that
+  removed it: ~687 churned lines in the `pcs/ligerito.rs` ladder core plus
+  the new F256 modules (`ligerito/extension.rs`, `field/gf2_256.rs`,
+  ring-switch/tensor changes), and 2,041 lines of in-circuit-verifier
+  changes (then `tests/circuit_merkle.rs`, since productionized as
+  `src/tower.rs` behind `TowerConfig::{Chain100, Chain128}`). The config
+  loader now REJECTS `field != "f256"`
+  (`LigeritoSecurityConfig::validate`), so the knob survives but the path
+  behind it does not.
+- Attribution of the +60 ms/node: the chain-m32 paired-trace session
+  (2026-08-14) — ~+25 ms soundness-priced protocol (coordinate-split F256
+  commits, two-limb folds, 128-bit PoW), ~+13 ms honest content growth
+  (+12% replayed b3 rows), +4 ms was a real bug fixed as `9878c4c`; the
+  serial-fill bug was fixed as `cf05a2a`. The remaining ladder is at its
+  measured floor (~2x the F128 baseline in every phase = the honest F256
+  cost).
+
+**What restoring it takes** (sized from the rewrite itself):
+
+1. *flock-core, first*: make the ladder core field-generic again (or keep
+   two variants of the commit/fold/OOD/handoff phases) and un-reject
+   `field = "f128"`. This is rkm0959's rewrite; a supported restore in
+   core is far cheaper than forking around it downstream.
+2. *The tower*: dual transcript-shape support keyed by `TowerConfig` —
+   the pre-F256 parse/emit paths back alongside the F256 ones, including
+   the per-prefix base-field `ResidualGate` family deleted in the stage-3
+   registry diet (`babcb52`), plus a SECOND envelope registry with its own
+   measured counts*/publics*/lanes* census. Est. 1.5–2.5k lines of
+   circuit code.
+3. Two tower-proof wire formats, and a re-certification pass that the
+   resurrected 100-bit grinding budgets (`fold_grinding_bits` 17 vs 0,
+   etc.) still compose with the post-v18/v20 protocol.
+
+The permanent cost is the fork itself: every future ladder/protocol change
+(the m*=28 envelope re-target, new grinding families) lands and audits
+twice. The cheaper lever that helps BOTH configs is the m*=28 re-pin
+(`envelope_content_probe` is its sizing instrument) — it will not reach
+140 ms, but it is one protocol, one audit.
+
 ---
 
 Also, see https://claude.ai/code/artifact/70a216b1-ecd9-4839-b1ce-cbbca24a3618 for an audit of our branch in Fable 5.
