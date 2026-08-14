@@ -1701,7 +1701,12 @@ fn mixed_m30_throughput() {
     use std::time::Instant;
 
     const ITERS: usize = 2; // timed runs after one warm-up; best reported
-    let nu = 14usize; // M = 30; full utilization = 16384 invocations per type
+    // M = nu + 16; full utilization = 2^nu invocations per type. Default
+    // nu 14 (M = 30); `MIXED_NU=16` benches the M = 32 point.
+    let nu: usize = std::env::var("MIXED_NU")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(14);
     let n_per_type = 1usize << nu;
     let mut rng = Rng::new(0x30_31_2B_B3);
     let blake3_inputs = random_blake3_inputs(&mut rng, n_per_type);
@@ -1777,15 +1782,15 @@ fn mixed_m30_throughput() {
     // verification and size reporting; the witness buffers are consumed each
     // iteration and drop inside prove.
     let (registry, sha2_r1cs, blake3_r1cs) = mixed_registry(nu);
-    assert_eq!(registry.m_total(), 30);
+    assert_eq!(registry.m_total(), nu + 16);
     let union = UnionInstance::new(&registry, vec![n_per_type, n_per_type]);
     let pcs_params = union_pcs_params(&union);
     // Full utilization: the dense stack rounds back to the padded commit, so
     // dense_m lands on the embedded m30 Ligerito config.
     assert_eq!(union.dense_words(), (227 + 92) << nu);
-    assert_eq!(union.dense_m(), 30);
+    assert_eq!(union.dense_m(), nu + 16);
     assert_eq!(union.committed_words(), union.packed_len());
-    assert_eq!(pcs_params.m, 30);
+    assert_eq!(pcs_params.m, nu + 16);
     flock_core::scratch::prewarm_prover(registry.m_total());
     let s2_mix_circuit = sha2_r1cs.csc_lincheck_circuit();
     let b3_mix_circuit = blake3_r1cs.csc_lincheck_circuit();
