@@ -133,9 +133,9 @@ fn outer_union<'r>(
 ///
 /// - `spread_w` 20 covers the m32 FAST chain leaf's L0 depth; the m29 Slim
 ///   outer ladder needs 19 and leaves the high output unread.
-/// - `resid_pls` {15, 12, 9, 6, 3, 0} covers the base-field residual gates
-///   of both ladders. Extension-field residual work uses three reusable
-///   gates, independent of prefix length.
+/// - Extension-field residual work uses three reusable gates, independent
+///   of prefix length (the base-field per-prefix `ResidualGate` family died
+///   in the stage-3 registry diet).
 /// - `nu` 14: each of the two independent child verifiers has its own
 ///   identical BLAKE slot, and the consolidated extension-field residual
 ///   gates keep every physical slot below 2^14 rows.
@@ -148,7 +148,6 @@ fn outer_union<'r>(
 struct EnvShape {
     nu: usize,
     spread_w: usize,
-    resid_pls: [usize; 6],
     pf_w: usize,
     /// Historical counts* oracle values. Shipped envelope proofs use
     /// unconditional free counts, so these values no longer pad rows or
@@ -158,7 +157,7 @@ struct EnvShape {
     /// spread, and pow; the live family-H tile type follows them, then the
     /// element types are keyed by `counts_el`.
     counts_bool: [usize; 5],
-    counts_el: [(usize, usize); 23],
+    counts_el: [(usize, usize); 15],
     /// publics* — the ONE public-segment length every envelope outer pads
     /// to (published zeros appended after all real publics). The child's
     /// publics count is what a PARENT's walk consumes — H(publics) chain
@@ -309,7 +308,6 @@ fn envelope_shape() -> EnvShape {
         // the m32 FAST chain ladder's level-0 (six levels, 5×3 folds above
         // it) — the m29 slim outer ladder's five stop at 12 and ride the
         // rest at count 0.
-        resid_pls: [15, 12, 9, 6, 3, 0],
         pf_w: 8,
         // Iterated at the padded envelope 2026-08-06 (probe + tower
         // census, elementwise max of leaf/node usage). Only b3, le8, pf8
@@ -334,16 +332,8 @@ fn envelope_shape() -> EnvShape {
             (700, 9000),  // extension-field Ligerito spine
             (701, 15000), // extension-field multiply-accumulate
             (601, 300),   // assist
-            (510, 64),    // skip-node (leaf-only usage)
-            (511, 1),     // skip-close (leaf-only usage)
             (8, 4200),    // leaf-eval 8-lane
             (808, 4200),  // extension-field leaf evaluation
-            (115, 900),   // resid pl 15 (the m32 chain ladder's level 0)
-            (112, 1100),  // resid pl 12
-            (109, 740),   // resid pl 9
-            (106, 560),   // resid pl 6
-            (103, 450),   // resid pl 3
-            (100, 400),   // resid pl 0
             (318, 15000), // prefix w 8
             // The extension residual relation is decomposed into three
             // shared tables: one normalized-weight row and one accumulator
@@ -432,16 +422,8 @@ fn declare_envelope_slots(
     slot_cached(sb, cache, 700, SpineGate256::new);
     slot_cached(sb, cache, 701, MacGate256::new);
     slot_cached(sb, cache, 601, AssistLayerGate::new);
-    slot_cached(sb, cache, 510, SkipNodeGate::new);
-    slot_cached(sb, cache, 511, SkipCloseGate::new);
     slot_cached(sb, cache, 8, || LeafEvalGate::new(8));
     slot_cached(sb, cache, 808, || LeafEvalGate256::new(8));
-    for &pl in &env.resid_pls {
-        let lmc = pl + 3; // chunk_log 3 — both ladders' yr_log >= 3
-        slot_cached(sb, cache, 100 + pl, || {
-            ResidualGate::new(lmc, pl, 3, &sk_at_vks(lmc))
-        });
-    }
     slot_cached(sb, cache, 880, ResidualWeightsGate256::new);
     slot_cached(sb, cache, 881, ResidualPrefix3Gate256::new);
     slot_cached(sb, cache, 882, ResidualAccGate256::new);
@@ -2502,233 +2484,6 @@ fn gate_kappa(c_need: usize) -> usize {
     (c_need.next_power_of_two().trailing_zeros() as usize).max(3)
 }
 
-struct ResidualGate {
-    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
-    sks_vks: Vec<F128>,
-    /// `1/sks_vks[k]` (0 for 0), once per SLOT: `eval` used to invert these
-    /// per ROW, and ~10 GF(2^128) inversions/row was ~85% of the whole
-    /// online fill (measured 12 µs/row; the five residual slots were 9.2 of
-    /// a child region's 10.8 ms).
-    inv_sks: Vec<F128>,
-    acc_out: Vec<usize>,
-    lmc: usize,
-    pl: usize,
-    yr: usize,
-    n_in: usize,
-    k: usize,
-}
-
-impl ResidualGate {
-    /// Column layout, in declaration order:
-    ///   q(0), ris(1..=pl), aw, one, acc_in[yr]          — inputs (n_in)
-    ///   s_1..s_{lmc-1}                                   — the chain
-    ///   pk_0..pk_{pl-1}, pr_1..pr_{pl-1}                 — prefix terms/products
-    ///   sp for each y with >=2 bits                      — subset products
-    ///   t = aw*prefix (pl>0 only), c_y (y>0), acc_out[yr] — the contributions
-    ///
-    /// The normalized suffix factors W_j = s_{pl+j}(q)/s_{pl+j}(v) have no
-    /// cells of their own: each use is fused into a product as a mult_lin
-    /// side `(s_col, inv)` — the envelope program.
-    fn new(log_msg_cols: usize, prefix_len: usize, yr_log_n: usize, sks_vks: &[F128]) -> Self {
-        use flock_core::element_r1cs::ElementTableBuilder;
-        let one_w = F128::ONE;
-        let (lmc, pl, yl) = (log_msg_cols, prefix_len, yr_log_n);
-        assert_eq!(pl + yl, lmc);
-        let yr = 1usize << yl;
-        let inv = |v: F128| if v == F128::ZERO { F128::ZERO } else { v.inv() };
-        let n_in = 1 + pl + 1 + 1 + yr;
-        let (q, aw, one, acc0) = (0usize, 1 + pl, 2 + pl, 3 + pl);
-        // Total columns, counted up front so kappa ADAPTS: inputs, the
-        // chain (lmc−1), prefix (2·pl), multi-bit subset products
-        // (yr−1−yl), t only when pl>0, contributions (yr−1) and
-        // accumulators (yr). Sums to 4·pl + 4·yr + [pl>0].
-        let c_need = 4 * pl + 4 * yr + usize::from(pl > 0);
-        let kappa = gate_kappa(c_need);
-        let mut c = n_in; // next free column
-        let mut b = ElementTableBuilder::new(kappa);
-        for wcol in 0..n_in {
-            b.free_wire(wcol);
-        }
-        // s columns: s_col[k] holds s_k(q); s_0 IS the q input column.
-        let mut s_col = vec![q];
-        for k in 1..lmc {
-            b.mult_lin(
-                c,
-                &[(s_col[k - 1], one_w)],
-                &[(s_col[k - 1], one_w), (one, sks_vks[k - 1])],
-            );
-            s_col.push(c);
-            c += 1;
-        }
-        // prefix: pk = ris_k * (1 + W_k), pr = running product of (1 + pk).
-        let mut pr = one; // empty product
-        for k in 0..pl {
-            let ivk = inv(sks_vks[k]);
-            b.mult_lin(c, &[(1 + k, one_w)], &[(one, one_w), (s_col[k], ivk)]);
-            let pk = c;
-            c += 1;
-            b.mult_lin(c, &[(pr, one_w)], &[(one, one_w), (pk, one_w)]);
-            pr = c;
-            c += 1;
-        }
-        // Suffix factor for bit j, as a fused mult_lin side (no cell).
-        let wf = |j: usize| (s_col[pl + j], inv(sks_vks[pl + j]));
-        // Subset products, multi-bit y only; y=0 is the empty product and
-        // single-bit y is a fused factor at the point of use.
-        let mut sp: Vec<Option<usize>> = vec![None; yr];
-        for y in 1..yr {
-            if !y.is_power_of_two() {
-                let low = y & y.wrapping_neg();
-                let jl = low.trailing_zeros() as usize;
-                let rest = y ^ low;
-                if rest.is_power_of_two() {
-                    b.mult_lin(c, &[wf(rest.trailing_zeros() as usize)], &[wf(jl)]);
-                } else {
-                    b.mult_lin(c, &[(sp[rest].unwrap(), one_w)], &[wf(jl)]);
-                }
-                sp[y] = Some(c);
-                c += 1;
-            }
-        }
-        // t = aw * prefix (aw itself when the prefix is empty);
-        // contributions and accumulators.
-        let t = if pl > 0 {
-            b.mult(c, aw, pr);
-            c += 1;
-            c - 1
-        } else {
-            aw
-        };
-        let mut acc_out = Vec::with_capacity(yr);
-        for y in 0..yr {
-            let cy = if y == 0 {
-                t
-            } else if y.is_power_of_two() {
-                b.mult_lin(c, &[(t, one_w)], &[wf(y.trailing_zeros() as usize)]);
-                c += 1;
-                c - 1
-            } else {
-                b.mult(c, t, sp[y].unwrap());
-                c += 1;
-                c - 1
-            };
-            b.linear(c, &[(acc0 + y, one_w), (cy, one_w)]);
-            acc_out.push(c);
-            c += 1;
-        }
-        assert_eq!(c, c_need, "the residual column count is the counted one");
-        Self {
-            ty: std::sync::Arc::new(b.build().expect("residual gate is valid")),
-            inv_sks: sks_vks.iter().map(|&v| inv(v)).collect(),
-            sks_vks: sks_vks.to_vec(),
-            acc_out,
-            lmc,
-            pl,
-            yr,
-            n_in,
-            k: c,
-        }
-    }
-}
-
-impl GateType for ResidualGate {
-    type Row = Vec<F128>;
-    type Hint = ();
-
-    fn table(&self) -> TableType {
-        use flock_core::schedule::IoWord;
-        let mut schema: Vec<IoWord> = (0..self.n_in).map(IoWord::input).collect();
-        for &o in &self.acc_out {
-            schema.push(IoWord::output(o));
-        }
-        TableType::element(self.ty.clone()).with_io_schema(schema)
-    }
-
-    fn eval(&self, inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> Self::Row {
-        // A structural mirror of `new()`: same column cursor, same order.
-        let (lmc, pl) = (self.lmc, self.pl);
-        let yl = lmc - pl;
-        let acc0 = 3 + pl;
-        let mut z = vec![F128::ZERO; self.k];
-        z[..self.n_in].copy_from_slice(&inputs[..self.n_in]);
-        let mut c = self.n_in;
-        let mut s_col = vec![0usize];
-        for k in 1..lmc {
-            z[c] = z[s_col[k - 1]] * (z[s_col[k - 1]] + self.sks_vks[k - 1]);
-            s_col.push(c);
-            c += 1;
-        }
-        // The table's prefix rows read the ONE input wire (column 2 + pl,
-        // which is also the empty-product seed) — eval mirrors the
-        // constraint rather than shortcutting with literal ones, so the
-        // counts* padding's all-zero inputs yield all-zero satisfying rows.
-        let one_col = 2 + pl;
-        let mut pr_v = z[one_col];
-        for k in 0..pl {
-            z[c] = z[1 + k] * (z[one_col] + z[s_col[k]] * self.inv_sks[k]);
-            let pk = z[c];
-            c += 1;
-            z[c] = pr_v * (z[one_col] + pk);
-            pr_v = z[c];
-            c += 1;
-        }
-        let w_v: Vec<F128> = (0..yl)
-            .map(|j| z[s_col[pl + j]] * self.inv_sks[pl + j])
-            .collect();
-        let mut sp: Vec<Option<usize>> = vec![None; self.yr];
-        for y in 1..self.yr {
-            if !y.is_power_of_two() {
-                let low = y & y.wrapping_neg();
-                let jl = low.trailing_zeros() as usize;
-                let rest = y ^ low;
-                z[c] = if rest.is_power_of_two() {
-                    w_v[rest.trailing_zeros() as usize] * w_v[jl]
-                } else {
-                    z[sp[rest].unwrap()] * w_v[jl]
-                };
-                sp[y] = Some(c);
-                c += 1;
-            }
-        }
-        let t_v = if pl > 0 {
-            z[c] = z[1 + pl] * pr_v;
-            c += 1;
-            z[c - 1]
-        } else {
-            z[1 + pl]
-        };
-        let mut outs = Vec::with_capacity(self.yr);
-        for y in 0..self.yr {
-            let cy = if y == 0 {
-                t_v
-            } else {
-                z[c] = if y.is_power_of_two() {
-                    t_v * w_v[y.trailing_zeros() as usize]
-                } else {
-                    t_v * z[sp[y].unwrap()]
-                };
-                c += 1;
-                z[c - 1]
-            };
-            z[c] = z[acc0 + y] + cy;
-            outs.push(z[c]);
-            c += 1;
-        }
-        outputs.extend_from_slice(&outs);
-        z
-    }
-
-    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
-        for (j, row) in rows.iter().enumerate() {
-            for (col, &v) in row.iter().enumerate() {
-                z[(col << nu) + j] = v;
-            }
-        }
-        SlotWitness::Element(z)
-    }
-}
-
 /// Residual-basis accumulation for extension-valued fold challenges. The
 /// novel-basis chain and query weights are base-field values; only the
 /// products involving later fold challenges and the running accumulators
@@ -2739,7 +2494,7 @@ struct ResidualWeightsGate256 {
 }
 
 impl ResidualWeightsGate256 {
-    /// Sized to the deepest walked ladder, like `spread_w`/`resid_pls`: the
+    /// Sized to the deepest walked ladder, like `spread_w`: the
     /// m32 FAST chain leaf's L0 needs `pl 15 + yr_log 4 = 19` (the residual
     /// domain is 16 entries = two 8-chunks; the chunk-high extension reads
     /// `weights[pl + yr_log - 1]`). The m29 outer ladders stay below this;
@@ -3608,205 +3363,6 @@ impl GateType for ZcRoundGate {
         z[13] = z[2] * z[12];
         z[14] = z[10] + z[11] + z[13];
         outputs.extend_from_slice(&[z[9], z[14]]);
-        z
-    }
-    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
-        for (j, row) in rows.iter().enumerate() {
-            for (col, &v) in row.iter().enumerate() {
-                z[(col << nu) + j] = v;
-            }
-        }
-        SlotWitness::Element(z)
-    }
-}
-
-/// One Λ-node of the univariate skip's interpolation: the barycentric
-/// NUMERATOR recurrence
-///
-///   A' = A·(z+λ),   B' = B·(z+λ) + v·A
-///
-/// accumulates `B_final = Σ_i v_i · Π_{j≠i}(z+λ_j)` in one forward pass —
-/// no inversions, no advice, and (unlike the native closed form's
-/// `Z(z)/(z+λ_i)` branch) EXACT even when z lands on a node. Both
-/// interpolations (`round1_c` alone and the combined `ab+c`) share the
-/// node products, so one row carries both accumulators.
-struct SkipNodeGate {
-    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
-}
-
-impl SkipNodeGate {
-    fn new() -> Self {
-        use flock_core::element_r1cs::ElementTableBuilder;
-        let o = F128::ONE;
-        // in: A(0) bc(1) bab(2) z(3) lam(4) vc(5) vab(6)
-        let mut b = ElementTableBuilder::new(4);
-        for w in 0..7 {
-            b.free_wire(w);
-        }
-        b.mult_lin(7, &[(0, o)], &[(3, o), (4, o)]); // A' = A (z+lam)
-        b.mult_lin(8, &[(1, o)], &[(3, o), (4, o)]); // bc (z+lam)
-        b.mult(9, 5, 0); // vc A
-        b.linear(10, &[(8, o), (9, o)]); // bc'
-        b.mult_lin(11, &[(2, o)], &[(3, o), (4, o)]); // bab (z+lam)
-        b.mult_lin(12, &[(6, o), (5, o)], &[(0, o)]); // (vab+vc) A
-        b.linear(13, &[(11, o), (12, o)]); // bab'
-        Self {
-            ty: std::sync::Arc::new(b.build().expect("skip node gate")),
-        }
-    }
-}
-
-impl GateType for SkipNodeGate {
-    type Row = Vec<F128>;
-    type Hint = ();
-    fn table(&self) -> TableType {
-        use flock_core::schedule::IoWord;
-        let mut schema: Vec<IoWord> = (0..7).map(IoWord::input).collect();
-        schema.push(IoWord::output(7));
-        schema.push(IoWord::output(10));
-        schema.push(IoWord::output(13));
-        TableType::element(self.ty.clone()).with_io_schema(schema)
-    }
-    fn eval(&self, inputs: &[F128], _h: &(), outputs: &mut Vec<F128>) -> Self::Row {
-        let mut z = vec![F128::ZERO; 14];
-        z[..7].copy_from_slice(&inputs[..7]);
-        let zl = z[3] + z[4];
-        z[7] = z[0] * zl;
-        z[8] = z[1] * zl;
-        z[9] = z[5] * z[0];
-        z[10] = z[8] + z[9];
-        z[11] = z[2] * zl;
-        z[12] = (z[6] + z[5]) * z[0];
-        z[13] = z[11] + z[12];
-        outputs.extend_from_slice(&[z[7], z[10], z[13]]);
-        z
-    }
-    fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
-        let mut z = flock_core::alloc_zeroed_vec::<F128>(self.ty.width() << nu);
-        for (j, row) in rows.iter().enumerate() {
-            for (col, &v) in row.iter().enumerate() {
-                z[(col << nu) + j] = v;
-            }
-        }
-        SlotWitness::Element(z)
-    }
-}
-
-/// The skip round's close-out (one row): scales the two numerator sums by
-/// the subspace-denominator inverses and the linearized `Z_S(z)`.
-///
-/// The φ8 node sets are F₂-subspaces, so `Z_S(X) = Σ_j c_j·X^(2^j)` is
-/// LINEARIZED — its evaluation is a constant-coefficient combination of the
-/// squaring-chain wires `z^(2^j)`, free inside the row — and the Lagrange
-/// denominator is the same constant for every node (it is `Z'_S = c_0`, the
-/// formal derivative). Outputs: `rc = interpolate_on_lambda(round1_c)(z)` —
-/// which BINDS `final_c_eval` (never absorbed; the native verifier
-/// recomputes-and-compares, so the published wire is its binding) — and
-/// `seed = combined_at_z + rc`, the multilinear chain's entry, replacing
-/// the zc-seed advice.
-struct SkipCloseGate {
-    ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
-}
-
-impl SkipCloseGate {
-    /// Linearized coefficients of `Z_{V_m}` over `V_m = φ_8({0..2^m−1})` via
-    /// the subspace-polynomial recursion `Z_{k+1} = Z_k² + Z_k(φ(2^k))·Z_k`
-    /// (squaring shifts the coefficient basis: `(Σ c_j X^(2^j))² =
-    /// Σ c_j²·X^(2^(j+1))`).
-    fn linearized_coeffs(dim: usize) -> Vec<F128> {
-        use flock_core::field::PHI_8_TABLE;
-        let mut c = vec![F128::ONE];
-        for k in 0..dim {
-            let bk = PHI_8_TABLE[1 << k];
-            let mut t = F128::ZERO;
-            let mut p = bk;
-            for &cj in &c {
-                t += cj * p;
-                p = p * p;
-            }
-            let mut nc = vec![F128::ZERO; c.len() + 1];
-            for (j, &cj) in c.iter().enumerate() {
-                nc[j + 1] += cj * cj;
-                nc[j] += t * cj;
-            }
-            c = nc;
-        }
-        c
-    }
-
-    fn new() -> Self {
-        use flock_core::element_r1cs::ElementTableBuilder;
-        use flock_core::field::PHI_8_TABLE;
-        let o = F128::ONE;
-        let c = Self::linearized_coeffs(6);
-        // Z_{V6} vanishes on V6 and matches the product form off it; the
-        // denominator is its formal derivative c_0. One-time construction
-        // checks — the constants below are load-bearing for soundness.
-        let zv6 = |x: F128| {
-            let mut acc = F128::ZERO;
-            let mut p = x;
-            for &cj in &c {
-                acc += cj * p;
-                p = p * p;
-            }
-            acc
-        };
-        assert_eq!(zv6(PHI_8_TABLE[1]), F128::ZERO, "Z_V6 vanishes on V6");
-        assert_eq!(zv6(PHI_8_TABLE[63]), F128::ZERO, "Z_V6 vanishes on V6");
-        let den6 = (1..64).fold(F128::ONE, |acc, i| acc * PHI_8_TABLE[i]);
-        assert_eq!(c[0], den6, "den6 is Z_V6's formal derivative");
-        let den7 = zv6(PHI_8_TABLE[64]) * den6;
-        // in: bc(0) bab(1) zp_j = z^(2^j) at (2+j) for j in 0..7
-        let mut b = ElementTableBuilder::new(4);
-        for w in 0..9 {
-            b.free_wire(w);
-        }
-        let zs: Vec<(usize, F128)> = c
-            .iter()
-            .enumerate()
-            .filter(|&(_, &cj)| cj != F128::ZERO)
-            .map(|(j, &cj)| (2 + j, cj))
-            .collect();
-        b.mult_lin(9, &[(1, den7.inv())], &zs); // combined_at_z
-        b.linear(10, &[(0, den6.inv())]); // rc
-        b.linear(11, &[(9, o), (10, o)]); // seed
-        Self {
-            ty: std::sync::Arc::new(b.build().expect("skip close gate")),
-        }
-    }
-}
-
-impl GateType for SkipCloseGate {
-    type Row = Vec<F128>;
-    type Hint = ();
-    fn table(&self) -> TableType {
-        use flock_core::schedule::IoWord;
-        let mut schema: Vec<IoWord> = (0..9).map(IoWord::input).collect();
-        schema.push(IoWord::output(10));
-        schema.push(IoWord::output(11));
-        TableType::element(self.ty.clone()).with_io_schema(schema)
-    }
-    fn eval(&self, inputs: &[F128], _h: &(), outputs: &mut Vec<F128>) -> Self::Row {
-        use flock_core::field::PHI_8_TABLE;
-        let c = Self::linearized_coeffs(6);
-        let den6 = c[0];
-        let mut t6 = F128::ZERO;
-        let mut p = PHI_8_TABLE[64];
-        for &cj in &c {
-            t6 += cj * p;
-            p = p * p;
-        }
-        let mut z = vec![F128::ZERO; 12];
-        z[..9].copy_from_slice(&inputs[..9]);
-        let zs = c
-            .iter()
-            .enumerate()
-            .fold(F128::ZERO, |acc, (j, &cj)| acc + cj * z[2 + j]);
-        z[9] = (t6 * den6).inv() * z[1] * zs;
-        z[10] = den6.inv() * z[0];
-        z[11] = z[9] + z[10];
-        outputs.extend_from_slice(&[z[10], z[11]]);
         z
     }
     fn witness(&self, rows: &[Self::Row], nu: usize) -> SlotWitness {
@@ -13215,11 +12771,6 @@ struct ChildSlots {
     /// `1000 + width` = base/extension prefix gates; and `880..=882` = the
     /// three shared extension-field residual relations.
     resid: Vec<(usize, flock_core::circuit::builder::SlotId)>,
-    /// The leaf-only skip types the ENVELOPE cross-declares at count 0
-    /// (wall 2) — no node emission touches them, but the element prover
-    /// input assembly must still cover their registry slots. Empty
-    /// off-envelope.
-    skips: Vec<flock_core::circuit::builder::SlotId>,
 }
 
 impl ChildSlots {
@@ -13263,17 +12814,14 @@ impl ChildSlots {
             // emit_residual_region's close-out rows land on the same slot
             // instead of registering a duplicate type.
             resid: vec![(600, macs), (701, mac256)],
-            skips: Vec::new(),
         }
     }
 
     /// The ENVELOPE constructor (wall 2): the same canonical declaration
-    /// order [`declare_envelope_slots`] gives the leaf builder — including
-    /// the leaf-only SkipNode/SkipClose types this node never rows (count
-    /// 0) — so the node's registry digest-equals the leaf's. Every keyed
-    /// entry pre-seeds the demand caches; emission that would need a slot
-    /// OUTSIDE the envelope set creates a new type and fails the digest
-    /// pin loudly.
+    /// order [`declare_envelope_slots`] gives every envelope outer, so all
+    /// their registry digests agree. Every keyed entry pre-seeds the
+    /// demand caches; emission that would need a slot OUTSIDE the envelope
+    /// set creates a new type and fails the digest pin loudly.
     fn new_env(sb: &mut ShapeBuilder, nu2: usize, env: &EnvShape) -> Self {
         let mut cache: Vec<(usize, flock_core::circuit::builder::SlotId)> = Vec::new();
         let q = declare_envelope_slots(sb, nu2, &mut cache, env);
@@ -13309,12 +12857,11 @@ impl ChildSlots {
                 })
                 .cloned()
                 .collect(),
-            skips: vec![take(510), take(511)],
         }
     }
 
     /// The keyed cache view `pad_envelope_counts` consumes — envelope path
-    /// only (`new_env`; the skips are positional [skn, skc]).
+    /// only (`new_env`).
     fn env_cache(&self) -> Vec<(usize, flock_core::circuit::builder::SlotId)> {
         let mut v = vec![
             (600, self.macs),
@@ -13324,8 +12871,6 @@ impl ChildSlots {
             (0, self.spine),
             (700, self.spine256),
             (601, self.alslot),
-            (510, self.skips[0]),
-            (511, self.skips[1]),
         ];
         v.extend(self.le.iter().map(|&(n, s)| (n, s)));
         v.extend(self.resid.iter().filter(|&&(k, _)| k != 600).cloned());
@@ -13351,7 +12896,6 @@ impl ChildSlots {
                 .filter(|&&(k, _)| k != 600)
                 .map(|&(_, s)| s),
         );
-        v.extend(self.skips.iter().copied());
         v
     }
 }
