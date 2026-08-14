@@ -102,6 +102,28 @@ pub(super) fn observe_message<Ch: Challenger>(challenger: &mut Ch, msg: Sumcheck
     challenger.observe_f256(msg.u_2);
 }
 
+/// [`round_msg`] with a base-VALUED f-side (the just-split table at a code
+/// switch): each product is F256×F128 = 2 muls instead of 3, value-identical
+/// because the f words' second limbs are zero.
+fn round_msg_fbase(f: &[F256], b: &[F256]) -> SumcheckMessage256 {
+    debug_assert_eq!(f.len(), b.len());
+    debug_assert!(f.len().is_power_of_two() && f.len() >= 2);
+    let half = f.len() / 2;
+    let (u_0, u_2) = (0..half)
+        .into_par_iter()
+        .map(|j| {
+            let (f0, f1) = (f[2 * j], f[2 * j + 1]);
+            debug_assert!(f0.c1.is_zero() && f1.c1.is_zero(), "f must be base-valued");
+            let (b0, b1) = (b[2 * j], b[2 * j + 1]);
+            (b0 * f0.c0, (b0 + b1) * (f0.c0 + f1.c0))
+        })
+        .reduce(
+            || (F256::ZERO, F256::ZERO),
+            |(a0, a2), (b0, b2)| (a0 + b0, a2 + b2),
+        );
+    SumcheckMessage256 { u_0, u_2 }
+}
+
 fn round_msg(f: &[F256], b: &[F256]) -> SumcheckMessage256 {
     debug_assert_eq!(f.len(), b.len());
     debug_assert!(f.len().is_power_of_two() && f.len() >= 2);
@@ -272,10 +294,10 @@ fn fold_base_fill(
 /// the folded length keeps the blocked layout (`d == 1 && half >= 2`, or
 /// `d > 1 && half >= 2d`) and fall back to the unfused pair otherwise.
 macro_rules! fused_fold_msg {
-    ($name:ident, $elem:ty, $lift:expr) => {
+    ($name:ident, $fel:ty, $bel:ty, $ffold:path, $bfold:path) => {
         fn $name(
-            f: &[$elem],
-            b: &[$elem],
+            f: &[$fel],
+            b: &[$bel],
             r: F256,
             d: usize,
         ) -> (Vec<F256>, Vec<F256>, SumcheckMessage256) {
@@ -283,7 +305,6 @@ macro_rules! fused_fold_msg {
             let half = f.len() / 2;
             debug_assert!(d.is_power_of_two() && half.is_power_of_two());
             debug_assert!(if d == 1 { half >= 2 } else { half >= 2 * d });
-            let lift = $lift;
             let block = 2 * d;
             let zero2 = || (F256::ZERO, F256::ZERO);
             let sum2 = |(a0, a2): (F256, F256), (b0, b2): (F256, F256)| (a0 + b0, a2 + b2);
@@ -317,10 +338,10 @@ macro_rules! fused_fold_msg {
                                 let mut u2 = F256::ZERO;
                                 for k in 0..flc.len() {
                                     let i = in0 + k0 + k;
-                                    let flo = lift(f[i]) + r * (f[i + d] + f[i]);
-                                    let fhi = lift(f[i + 2 * d]) + r * (f[i + 3 * d] + f[i + 2 * d]);
-                                    let blo = lift(b[i]) + r * (b[i + d] + b[i]);
-                                    let bhi = lift(b[i + 2 * d]) + r * (b[i + 3 * d] + b[i + 2 * d]);
+                                    let flo = $ffold(f, i, i + d, r);
+                                    let fhi = $ffold(f, i + 2 * d, i + 3 * d, r);
+                                    let blo = $bfold(b, i, i + d, r);
+                                    let bhi = $bfold(b, i + 2 * d, i + 3 * d, r);
                                     flc[k] = flo;
                                     fhc[k] = fhi;
                                     blc[k] = blo;
@@ -348,12 +369,10 @@ macro_rules! fused_fold_msg {
                         {
                             let in0 = 2 * (out0 + jo * block);
                             for k in 0..d {
-                                let flo = lift(f[in0 + k]) + r * (f[in0 + d + k] + f[in0 + k]);
-                                let fhi =
-                                    lift(f[in0 + 2 * d + k]) + r * (f[in0 + 3 * d + k] + f[in0 + 2 * d + k]);
-                                let blo = lift(b[in0 + k]) + r * (b[in0 + d + k] + b[in0 + k]);
-                                let bhi =
-                                    lift(b[in0 + 2 * d + k]) + r * (b[in0 + 3 * d + k] + b[in0 + 2 * d + k]);
+                                let flo = $ffold(f, in0 + k, in0 + d + k, r);
+                                let fhi = $ffold(f, in0 + 2 * d + k, in0 + 3 * d + k, r);
+                                let blo = $bfold(b, in0 + k, in0 + d + k, r);
+                                let bhi = $bfold(b, in0 + 2 * d + k, in0 + 3 * d + k, r);
                                 fblk[k] = flo;
                                 fblk[d + k] = fhi;
                                 bblk[k] = blo;
@@ -371,8 +390,31 @@ macro_rules! fused_fold_msg {
     };
 }
 
-fused_fold_msg!(fused_fold_msg_base, F128, F256::from);
-fused_fold_msg!(fused_fold_msg_ext, F256, |x: F256| x);
+/// One fold step `a[lo] + r*(a[hi] + a[lo])` per operand class. The split
+/// step exploits base-VALUED (post-code-switch) F256 words: `r * x` for
+/// base `x` is two F128 products — the third Karatsuba product is
+/// identically zero (`p1 = r1*0`), so skipping it is value-identical.
+#[inline]
+fn fold_step_base(a: &[F128], lo: usize, hi: usize, r: F256) -> F256 {
+    F256::from(a[lo]) + r * (a[hi] + a[lo])
+}
+#[inline]
+fn fold_step_ext(a: &[F256], lo: usize, hi: usize, r: F256) -> F256 {
+    a[lo] + r * (a[hi] + a[lo])
+}
+#[inline]
+fn fold_step_split_base(a: &[F256], lo: usize, hi: usize, r: F256) -> F256 {
+    debug_assert!(
+        a[lo].c1.is_zero() && a[hi].c1.is_zero(),
+        "split-base fold step requires base-valued words"
+    );
+    let x = a[hi].c0 + a[lo].c0;
+    F256::new(a[lo].c0 + r.c0 * x, r.c1 * x)
+}
+
+fused_fold_msg!(fused_fold_msg_base, F128, F128, fold_step_base, fold_step_base);
+fused_fold_msg!(fused_fold_msg_ext, F256, F256, fold_step_ext, fold_step_ext);
+fused_fold_msg!(fused_fold_msg_fbase, F256, F256, fold_step_split_base, fold_step_ext);
 
 /// The fused kernel applies exactly when `next_round_msg(folded, d)` keeps
 /// the blocked pairing the sweep produces.
@@ -689,6 +731,22 @@ impl SumcheckProver256 {
         self.fold_materialized(r, 1)
     }
 
+    /// The FIRST fold of a recursive level: the f-side is base-valued (the
+    /// code switch just split it — `introduce_ood_with_eval` asserts the
+    /// same invariant), so its products are F256×F128 = 2 muls instead of
+    /// the generic 3. The b-side has been through `split_basis` and glue
+    /// and stays generic. Value-identical to [`Self::fold`].
+    pub(super) fn fold_after_switch(&mut self, r: F256) -> SumcheckMessage256 {
+        if !fused_fold_applies(self.f.len(), 1) {
+            return self.fold_materialized(r, 1);
+        }
+        let (nf, nb, msg) = fused_fold_msg_fbase(&self.f, &self.combined_basis, r, 1);
+        crate::scratch::give_f256(std::mem::replace(&mut self.f, nf));
+        crate::scratch::give_f256(std::mem::replace(&mut self.combined_basis, nb));
+        self.transcript.push(msg);
+        msg
+    }
+
     /// Replace the just-produced next-round message with the message for the
     /// coordinate-split table. No transcript item is added: the code switch is
     /// a representation change at the same sumcheck boundary.
@@ -699,7 +757,7 @@ impl SumcheckProver256 {
         crate::scratch::give_f256(std::mem::replace(&mut self.f, split_f));
         let split_b = split_basis(&self.combined_basis);
         crate::scratch::give_f256(std::mem::replace(&mut self.combined_basis, split_b));
-        let msg = round_msg(&self.f, &self.combined_basis);
+        let msg = round_msg_fbase(&self.f, &self.combined_basis);
         *self
             .transcript
             .last_mut()
@@ -1080,7 +1138,13 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let _t = std::time::Instant::now();
         for j in 0..k {
             let challenge = challenger.sample_f256();
-            let pre_switch = sumcheck.fold(challenge);
+            // j == 0 folds the just-switched (base-valued) table — the
+            // f-side products are 2 muls there, not 3.
+            let pre_switch = if j == 0 {
+                sumcheck.fold_after_switch(challenge)
+            } else {
+                sumcheck.fold(challenge)
+            };
             let msg = if j + 1 == k && i + 1 != r {
                 sumcheck.code_switch_and_replace_message()
             } else {
@@ -2049,6 +2113,34 @@ mod tests {
         assert!(!fused_fold_applies(2, 2));
         assert!(!fused_fold_applies(1 << 10, 512));
         assert!(!fused_fold_applies(1 << 10, 1024));
+    }
+
+    /// The base-valued-f variants (the post-code-switch fold and round
+    /// message) match their generic counterparts on split tables.
+    #[test]
+    fn split_base_variants_match_generic() {
+        let mut rng = RandomChallenger::new(0x5B_BA5E_F01D);
+        for &(log_n, d) in &[(2usize, 1usize), (12, 1), (13, 16)] {
+            let n = 1usize << log_n;
+            let r = random_f256(&mut rng);
+            let fb: Vec<F256> = (0..n).map(|_| F256::from(rng.sample_f128())).collect();
+            let bx: Vec<F256> = (0..n).map(|_| random_f256(&mut rng)).collect();
+            let (nf, nb, msg) = fused_fold_msg_fbase(&fb, &bx, r, d);
+            let ef = fold_extension(&fb, r, d);
+            let eb = fold_extension(&bx, r, d);
+            assert_eq!(nf, ef, "fbase fold f (log_n {log_n}, d {d})");
+            assert_eq!(nb, eb, "fbase fold b (log_n {log_n}, d {d})");
+            assert_eq!(
+                msg,
+                next_round_msg(&ef, &eb, d),
+                "fbase msg (log_n {log_n}, d {d})"
+            );
+            assert_eq!(
+                round_msg_fbase(&fb, &bx),
+                round_msg(&fb, &bx),
+                "fbase round msg (log_n {log_n})"
+            );
+        }
     }
 
     /// The fused first virtual fold matches (fold_base, materialize,
