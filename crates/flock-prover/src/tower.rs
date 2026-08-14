@@ -1,39 +1,20 @@
-//! **MVP-3: PCS query openings as circuit gates, and the arithmetic on them.**
+//! **The recursion tower**: chain leaves folded 2->1 up to a converging
+//! spine — the production chain100/chain128 pipeline.
 //!
-//! A recursive verifier's dominant cost is checking PCS query openings — 218
-//! depth-13 Merkle paths over 1 KiB leaves, per the L0 measurement. This file
-//! makes one such opening a [`GateType`], so a circuit can instantiate as many
-//! as it needs and the builder produces the wiring and the witness together.
+//! Extracted verbatim from `tests/circuit_merkle.rs` (stage 1 of the tower
+//! productionization). The pipeline is three builders:
 //!
-//! Three things are being validated, and they are the three that were open:
+//! - [`build_chain_proof`] — the LEAF: a Fast-profile Ligerito proof of a
+//!   BLAKE3 hash-chain segment (the application workload).
+//! - [`build_fl_node_k`] — the FIRST-LEVEL node: k adjacent chain leaves
+//!   verified in-circuit (tape replay), their claims folded, proven under
+//!   the Slim outer profile at the m*=29/nu*=14 envelope.
+//! - [`build_node_outer_app`] — INTERNAL and SPINE nodes: 2->1 recursion
+//!   over envelope outers, with the chain-lane accumulator riding along.
 //!
-//! - **The sibling path travels as a [`GateType::Hint`].** It is not a schema
-//!   word and never can be: a sibling sits at
-//!   [`sibling_bit`](MerkleTreeLayout::sibling_bit), inside its level's
-//!   base-block padding at an unaligned offset, and a wire carries a whole
-//!   128-bit word. It needs no wire — no other gate reads it, and the relation
-//!   binds it through the root the schema does export.
-//!
-//! - **The index word is wireable, and is wired to a hash output.** This is
-//!   the Fiat–Shamir query binding in miniature: a BLAKE3 gate produces a
-//!   challenge word, that word is connected to the opening's index, and the
-//!   masking `sample_queries` does natively (`& (block_len − 1)`) costs no
-//!   gadget at all — it is which columns the Merkle relation reads. The word
-//!   alignment this needs is why the index moved.
-//!
-//! - **A boolean slot with a hint proves and verifies** against the real
-//!   union prover, over the walker lincheck circuit rather than materialized
-//!   matrices.
-//!
-//! MVP-3b adds the other half — `LeafEvalGate`, an ELEMENT gate consuming the
-//! same leaf words to compute `Σ_i α_i · ⟨row_i, eq(v, ·)⟩`, the `enforced_sum`
-//! the Ligerito verifier checks. The 64 leaf words are one wire class each with
-//! cells in both slots, so the copy constraint is what makes "the leaf that is
-//! in the tree" and "the leaf the arithmetic ran on" the same leaf — across the
-//! boolean/element class boundary.
-//!
-//! Small shapes where the geometry allows; `l0_shape_circuit_cost` runs the
-//! real one (218 openings, depth 13, 1 KiB leaves).
+//! The `#[test]` functions ride along under the lib test harness
+//! (`cargo test -p flock-prover --lib tower::`); the mvp-history tests and
+//! env-var profile plumbing are scheduled for removal in stages 2-4.
 
 use flock_core::circuit::builder::{CircuitBuilder, GateType, ShapeBuilder, SlotWitness, Wire};
 use flock_core::field::{F128, F256};
@@ -42,14 +23,14 @@ use flock_core::merkle::{self as core_merkle, HashKind};
 use flock_core::pcs::PcsParams;
 use flock_core::pcs::ligerito::LigeritoProfile;
 use flock_core::verifier;
-use flock_prover::challenger::FsChallenger;
-use flock_prover::prover::{self, UnionSlotProverInput};
-use flock_prover::r1cs_hashes::blake3;
-use flock_prover::r1cs_hashes::merkle_r1cs::{
+use crate::challenger::FsChallenger;
+use crate::prover::{self, UnionSlotProverInput};
+use crate::r1cs_hashes::blake3;
+use crate::r1cs_hashes::merkle_r1cs::{
     ChunkPathInput, MerkleTreeLayout, SLOT_WORDS, blake3_spec,
 };
-use flock_prover::schedule::TableType;
-use flock_prover::union::UnionInstance;
+use crate::schedule::TableType;
+use crate::union::UnionInstance;
 
 /// The L0 interleave for a content-sized commit: the embedded config's
 /// own `initial_k` (6 everywhere except m29 Fast/Slim = 5 — the
@@ -153,7 +134,7 @@ fn envelope_floor_m() -> Option<usize> {
 /// here — prover, verifier and tape recorder alike: the floor is
 /// STATEMENT data, like the counts.
 fn outer_union<'r>(
-    registry: &'r flock_prover::schedule::Registry,
+    registry: &'r crate::schedule::Registry,
     counts: Vec<usize>,
 ) -> UnionInstance<'r> {
     let mut u = UnionInstance::new(registry, counts);
@@ -2068,7 +2049,7 @@ impl GateType for LeafEvalGate256 {
 #[ignore] // Heavier — run with `-- --ignored`.
 fn leaf_arithmetic_joins_the_merkle_openings() {
     use flock_core::lincheck::build_eq_table;
-    use flock_prover::prover::UnionElementSlotInput;
+    use crate::prover::UnionElementSlotInput;
 
     // 1 KiB leaves: the L0 shape, and what makes a leaf exactly LE_LANES words.
     let (depth, leaf_bytes, n_open) = (2usize, 1024usize, 4usize);
@@ -2329,8 +2310,8 @@ fn mvp4_slice(depth: usize, n_queries: usize, nu: usize) {
     use flock_core::challenger::Challenger as _;
     use flock_core::lincheck::build_eq_table;
     use flock_core::transcript_record::{RecordingChallenger, TranscriptOp};
-    use flock_prover::prover::UnionElementSlotInput;
-    use flock_prover::r1cs_hashes::fs_chain::{CvSource, FsChain};
+    use crate::prover::UnionElementSlotInput;
+    use crate::r1cs_hashes::fs_chain::{CvSource, FsChain};
 
     use std::time::Instant;
 
@@ -2410,7 +2391,7 @@ fn mvp4_slice(depth: usize, n_queries: usize, nu: usize) {
     // index in the public segment — which the tamper check below relies on.
     let mut fs_values: Vec<F128> = Vec::new();
     let mut first_msg_pub: Option<usize> = None;
-    let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+    let iv_w = pack8(&crate::r1cs_hashes::fs_chain::IV);
     fs_values.extend_from_slice(&iv_w);
 
     for (i, row) in trace.rows.iter().enumerate() {
@@ -2912,8 +2893,8 @@ fn mvp5_all_levels_query_phase() {
     use flock_core::challenger::Challenger as _;
     use flock_core::lincheck::build_eq_table;
     use flock_core::transcript_record::{RecordingChallenger, TranscriptOp};
-    use flock_prover::prover::UnionElementSlotInput;
-    use flock_prover::r1cs_hashes::fs_chain::{CvSource, FsChain};
+    use crate::prover::UnionElementSlotInput;
+    use crate::r1cs_hashes::fs_chain::{CvSource, FsChain};
     use std::time::Instant;
 
     const SLICE: &[u8] = b"flock-mvp5-all-levels-v0";
@@ -3009,7 +2990,7 @@ fn mvp5_all_levels_query_phase() {
     let mut outs: Vec<Vec<Wire>> = Vec::with_capacity(trace.rows.len());
     let mut gate_in: Vec<[Wire; 7]> = Vec::with_capacity(trace.rows.len());
     let mut fs_values: Vec<F128> = Vec::new();
-    let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+    let iv_w = pack8(&crate::r1cs_hashes::fs_chain::IV);
     fs_values.extend_from_slice(&iv_w);
 
     for (i, row) in trace.rows.iter().enumerate() {
@@ -3417,7 +3398,7 @@ fn emit_fs_chain(
     sb: &mut ShapeBuilder,
     b3: flock_core::circuit::builder::SlotId,
     iv: [Wire; 2],
-    trace: &flock_prover::r1cs_hashes::fs_chain::FsChainTrace,
+    trace: &crate::r1cs_hashes::fs_chain::FsChainTrace,
     stream: &flock_core::transcript_record::Stream,
     bytes: &[u8],
     vals: &mut Vec<F128>,
@@ -3448,7 +3429,7 @@ fn emit_fs_chain_partitioned(
     b3: flock_core::circuit::builder::SlotId,
     alternate: Option<(flock_core::circuit::builder::SlotId, usize)>,
     iv: [Wire; 2],
-    trace: &flock_prover::r1cs_hashes::fs_chain::FsChainTrace,
+    trace: &crate::r1cs_hashes::fs_chain::FsChainTrace,
     stream: &flock_core::transcript_record::Stream,
     bytes: &[u8],
     vals: &mut Vec<F128>,
@@ -3457,7 +3438,7 @@ fn emit_fs_chain_partitioned(
     cross: &[Option<(usize, usize)>],
 ) -> (Vec<Vec<Wire>>, Vec<Option<Wire>>) {
     use flock_core::transcript_record::StreamWord;
-    use flock_prover::r1cs_hashes::fs_chain::CvSource;
+    use crate::r1cs_hashes::fs_chain::CvSource;
     let mut word_wire: Vec<Option<Wire>> = vec![None; stream.words.len()];
     let mut outs: Vec<Vec<Wire>> = Vec::with_capacity(trace.rows.len());
     let mut gate_in: Vec<[Wire; 7]> = Vec::with_capacity(trace.rows.len());
@@ -3624,7 +3605,7 @@ struct MergedChain {
     /// Parent words then child words, in the same order as `trace`'s rows.
     stream: flock_core::transcript_record::Stream,
     bytes: Vec<u8>,
-    trace: flock_prover::r1cs_hashes::fs_chain::FsChainTrace,
+    trace: crate::r1cs_hashes::fs_chain::FsChainTrace,
     /// Per merged word: `Some((row, half))` iff the word is a cross-link.
     cross: Vec<Option<(usize, usize)>>,
 }
@@ -3638,7 +3619,7 @@ fn merge_chain(
     payloads: &[Vec<u8>],
 ) -> MergedChain {
     use flock_core::transcript_record::StreamWord;
-    use flock_prover::r1cs_hashes::fs_chain::{CvSource, Link, trace_duplex_forked};
+    use crate::r1cs_hashes::fs_chain::{CvSource, Link, trace_duplex_forked};
     let chains = trace_duplex_forked(ops, stream, values, payloads);
     let parent_bytes = stream.to_bytes(values, payloads);
     if chains.children.is_empty() {
@@ -3800,7 +3781,7 @@ fn merge_chain(
             panic!("cross-link word {wi} is not an observed value");
         };
         let (cv, m, counter, blen, flags) = rows[row];
-        let out = flock_prover::r1cs_hashes::blake3::blake3_compress(&cv, &m, counter, blen, flags);
+        let out = crate::r1cs_hashes::blake3::blake3_compress(&cv, &m, counter, blen, flags);
         let mut b = [0u8; 16];
         for (i, w) in out[..4].iter().enumerate() {
             b[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
@@ -3841,7 +3822,7 @@ fn merge_chain(
             forks: Vec::new(),
         },
         bytes,
-        trace: flock_prover::r1cs_hashes::fs_chain::FsChainTrace {
+        trace: crate::r1cs_hashes::fs_chain::FsChainTrace {
             rows,
             links,
             squeezes,
@@ -3863,7 +3844,7 @@ fn merge_chain(
 /// straight through the fork. Cheap enough to leave on at every real shape.
 fn assert_chain_replays(
     ops: &[flock_core::transcript_record::TranscriptOp],
-    trace: &flock_prover::r1cs_hashes::fs_chain::FsChainTrace,
+    trace: &crate::r1cs_hashes::fs_chain::FsChainTrace,
     chals: &[F128],
 ) {
     use flock_core::transcript_record::TranscriptOp as Op;
@@ -3878,7 +3859,7 @@ fn assert_chain_replays(
             let (row, word) = trace.squeeze_words[fin][j];
             let (cv, m, counter, blen, flags) = trace.rows[row];
             let out =
-                flock_prover::r1cs_hashes::blake3::blake3_compress(&cv, &m, counter, blen, flags);
+                crate::r1cs_hashes::blake3::blake3_compress(&cv, &m, counter, blen, flags);
             let mut b = [0u8; 16];
             for (i, w) in out[word * 4..word * 4 + 4].iter().enumerate() {
                 b[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
@@ -4783,8 +4764,8 @@ fn live_element_input(
     z: Vec<F128>,
     count: usize,
     nu: usize,
-) -> flock_prover::prover::UnionElementSlotInput<'static> {
-    flock_prover::prover::UnionElementSlotInput::new(move |dst: &mut [F128]| {
+) -> crate::prover::UnionElementSlotInput<'static> {
+    crate::prover::UnionElementSlotInput::new(move |dst: &mut [F128]| {
         debug_assert_eq!(dst.len(), z.len());
         let rows = 1usize << nu;
         if count >= rows {
@@ -4808,8 +4789,8 @@ fn live_element_input(
 fn live_element_input_from_rows(
     rows: Vec<Vec<F128>>,
     nu: usize,
-) -> flock_prover::prover::UnionElementSlotInput<'static> {
-    flock_prover::prover::UnionElementSlotInput::new(move |dst: &mut [F128]| {
+) -> crate::prover::UnionElementSlotInput<'static> {
+    crate::prover::UnionElementSlotInput::new(move |dst: &mut [F128]| {
         debug_assert!(rows.len() <= 1usize << nu);
         for (j, row) in rows.iter().enumerate() {
             for (col, &v) in row.iter().enumerate() {
@@ -5696,7 +5677,7 @@ struct PdRec {
 #[inline]
 fn squeeze_word_wire(
     outs: &[Vec<Wire>],
-    trace: &flock_prover::r1cs_hashes::fs_chain::FsChainTrace,
+    trace: &crate::r1cs_hashes::fs_chain::FsChainTrace,
     fin: usize,
     offset: usize,
 ) -> Wire {
@@ -6337,8 +6318,8 @@ fn parse_open_levels(
 fn mvp7_real_query_phase() {
     use flock_core::element_r1cs::ElementTableBuilder;
     use flock_core::transcript_record::RecordingChallenger;
-    use flock_prover::prover::UnionElementSlotInput;
-    use flock_prover::schedule::Registry;
+    use crate::prover::UnionElementSlotInput;
+    use crate::schedule::Registry;
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -6603,7 +6584,7 @@ fn mvp7_real_query_phase() {
     leaf_slot.push((700, spine256));
 
     let mut vals: Vec<F128> = Vec::new();
-    let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+    let iv_w = pack8(&crate::r1cs_hashes::fs_chain::IV);
     vals.extend_from_slice(&iv_w);
     let iv = [
         sb.fixed_public_input(iv_w[0]),
@@ -7497,7 +7478,7 @@ fn mvp7_real_query_phase() {
 
 // ---------------------------------------------------------------------------
 
-use flock_prover::r1cs_hashes::merkle_glue::{
+use crate::r1cs_hashes::merkle_glue::{
     BitSpreadInput, BitSpreadTable, FamilyTransposeTileInput, FamilyTransposeTileTable,
     PowMaskInput, PowMaskTable, SwapInput, SwapTable,
 };
@@ -8208,7 +8189,7 @@ fn emit_query_phase(
     levels: &[OpenLevel],
     geo: &[Lvl],
     lvl_src: &[(&[[u8; 32]], &Vec<Vec<F128>>, &Vec<[u8; 32]>)],
-    trace: &flock_prover::r1cs_hashes::fs_chain::FsChainTrace,
+    trace: &crate::r1cs_hashes::fs_chain::FsChainTrace,
     outs: &[Vec<Wire>],
     chals: &[F128],
     cap_w: &[Vec<[Wire; 2]>],
@@ -8435,7 +8416,7 @@ fn emit_residual_region(
     w_rounds: &[RoundRec],
     inner_pd_fin: usize,
     yr_wires: &[[Wire; 2]],
-    trace: &flock_prover::r1cs_hashes::fs_chain::FsChainTrace,
+    trace: &crate::r1cs_hashes::fs_chain::FsChainTrace,
     outs: &[Vec<Wire>],
     zw: Wire,
     ow: Wire,
@@ -9003,7 +8984,7 @@ fn emit_recorded_pow_checks(
     spread: flock_core::circuit::builder::SlotId,
     iv: [Wire; 2],
     ops: &[flock_core::transcript_record::TranscriptOp],
-    trace: &flock_prover::r1cs_hashes::fs_chain::FsChainTrace,
+    trace: &crate::r1cs_hashes::fs_chain::FsChainTrace,
     stream: &flock_core::transcript_record::Stream,
     outs: &[Vec<Wire>],
     ww: &[Option<Wire>],
@@ -9065,7 +9046,7 @@ fn fused_pow_masks_match_raw_compression() {
                     &message,
                     flock_core::challenger::pow_squeeze_counter(bits, pending_len + 16),
                     64,
-                    flock_prover::r1cs_hashes::fs_chain::CHAIN_SQUEEZE,
+                    crate::r1cs_hashes::fs_chain::CHAIN_SQUEEZE,
                 );
                 let mut predicate = [0u8; 16];
                 for (i, word) in out[4..8].iter().enumerate() {
@@ -9130,7 +9111,7 @@ fn recursive_pow_relation_accepts_valid_and_rejects_invalid_nonce() {
             &message,
             flock_core::challenger::pow_squeeze_counter(bits, 16),
             64,
-            flock_prover::r1cs_hashes::fs_chain::CHAIN_SQUEEZE,
+            crate::r1cs_hashes::fs_chain::CHAIN_SQUEEZE,
         )
     };
     let accepts = |nonce: u64| {
@@ -9178,7 +9159,7 @@ fn recursive_pow_relation_accepts_valid_and_rejects_invalid_nonce() {
             pack_params(
                 flock_core::challenger::pow_squeeze_counter(circuit_bits, 16),
                 64,
-                flock_prover::r1cs_hashes::fs_chain::CHAIN_SQUEEZE,
+                crate::r1cs_hashes::fs_chain::CHAIN_SQUEEZE,
             ),
         );
         let h = sb.gate(
@@ -9585,8 +9566,8 @@ fn mvp6_all_levels_collapsed() {
     use flock_core::challenger::Challenger as _;
     use flock_core::lincheck::build_eq_table;
     use flock_core::transcript_record::{RecordingChallenger, TranscriptOp};
-    use flock_prover::prover::UnionElementSlotInput;
-    use flock_prover::r1cs_hashes::fs_chain::{CvSource, FsChain};
+    use crate::prover::UnionElementSlotInput;
+    use crate::r1cs_hashes::fs_chain::{CvSource, FsChain};
     use std::time::Instant;
 
     const SLICE: &[u8] = b"flock-mvp6-collapsed-v0";
@@ -9701,7 +9682,7 @@ fn mvp6_all_levels_collapsed() {
     leaf_slot.push((0, spine));
 
     let mut vals: Vec<F128> = Vec::new();
-    let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+    let iv_w = pack8(&crate::r1cs_hashes::fs_chain::IV);
     vals.extend_from_slice(&iv_w);
     let iv = [
         sb.fixed_public_input(iv_w[0]),
@@ -10152,7 +10133,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
         })
         .collect();
     let circuit = setup.r1cs.csc_lincheck_circuit();
-    let registry = flock_prover::schedule::Registry::new(
+    let registry = crate::schedule::Registry::new(
         vec![TableType::from_block_r1cs(&setup.r1cs)],
         setup.r1cs.n_log(),
     );
@@ -10627,7 +10608,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
     // instantiated on the boolean leaf tape.
     {
         use flock_core::lincheck::build_eq_table;
-        use flock_prover::prover::UnionElementSlotInput;
+        use crate::prover::UnionElementSlotInput;
 
         let lig = &proof.pcs_open.inner.ligerito;
         assert_eq!(commitment.cap, lig.initial_cap, "commitment IS the L0 cap");
@@ -10724,7 +10705,7 @@ fn build_leaf_outer_seeded(seed: u64) -> LeafOuter {
             })
             .collect();
         let mut vals: Vec<F128> = Vec::new();
-        let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+        let iv_w = pack8(&crate::r1cs_hashes::fs_chain::IV);
         vals.extend_from_slice(&iv_w);
         let iv = [
             sb.fixed_public_input(iv_w[0]),
@@ -12211,7 +12192,7 @@ struct RealTape<'p> {
     /// Per level, the absorbed cap's payload index ([`cap_payloads`]).
     cap_pays: Vec<usize>,
     // chain materials
-    trace: flock_prover::r1cs_hashes::fs_chain::FsChainTrace,
+    trace: crate::r1cs_hashes::fs_chain::FsChainTrace,
     stream: flock_core::transcript_record::Stream,
     bytes: Vec<u8>,
     /// The fork's four cross-link wires ([`MergedChain::cross`]).
@@ -13860,7 +13841,7 @@ fn emit_real_child_region(
         .collect();
     let mut cen: Vec<(&'static str, usize, usize)> =
         vec![("start", sb.public_len(), sb.rows_in_slot(cs.macs))];
-    let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+    let iv_w = pack8(&crate::r1cs_hashes::fs_chain::IV);
     vals.extend_from_slice(&iv_w);
     let iv2 = [
         sb.fixed_public_input(iv_w[0]),
@@ -15148,7 +15129,7 @@ fn check_real_child_region(public: &[F128], rt: &RealTape<'_>, r: &RealRegion) -
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn mvp10_leaf_outer_inner_tape() {
-    use flock_prover::prover::UnionElementSlotInput;
+    use crate::prover::UnionElementSlotInput;
 
     let lo = build_leaf_outer();
     let rt = RealTape::new(&lo, DOMAIN);
@@ -15398,7 +15379,7 @@ struct MixedInner {
 }
 
 fn build_mixed_inner(n_blocks: usize, mac_take: usize, seed: u64) -> MixedInner {
-    use flock_prover::prover::UnionElementSlotInput;
+    use crate::prover::UnionElementSlotInput;
 
     let nu = n_blocks.trailing_zeros() as usize;
     assert_eq!(1usize << nu, n_blocks, "block count is a power of two");
@@ -16403,7 +16384,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
 
     // ---- the outer: k chain-tape regions + the fold region + adjacency ----
     {
-        use flock_prover::prover::UnionElementSlotInput;
+        use crate::prover::UnionElementSlotInput;
 
         // The transcript is FORKED (the wiring runs on its own chain);
         // `merge_chain` splices the child's rows in at the fork point and
@@ -16531,7 +16512,7 @@ fn build_fl_node_k(cps: &[&ChainProof]) -> FlNode {
             .map(|&(_, s)| s)
             .expect("the child regions created the 8-lane leaf-eval slot");
 
-        let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+        let iv_w = pack8(&crate::r1cs_hashes::fs_chain::IV);
         vals.extend_from_slice(&iv_w);
         let iv2 = [
             sb.fixed_public_input(iv_w[0]),
@@ -17905,7 +17886,7 @@ fn emit_boolean_reported_check(
     spine: flock_core::circuit::builder::SlotId,
     pfslot: flock_core::circuit::builder::SlotId,
     pf_w: usize,
-    registry: &flock_prover::schedule::Registry,
+    registry: &crate::schedule::Registry,
     alpha_w: Wire,
     x_inner_w: &[Wire],
     rr_w: &[Wire],
@@ -18163,7 +18144,7 @@ struct ChildTape<'p> {
     /// Per level, the absorbed cap's payload index ([`cap_payloads`]).
     cap_pays: Vec<usize>,
     // chain materials
-    trace: flock_prover::r1cs_hashes::fs_chain::FsChainTrace,
+    trace: crate::r1cs_hashes::fs_chain::FsChainTrace,
     stream: flock_core::transcript_record::Stream,
     bytes: Vec<u8>,
     /// The fork's four cross-link wires ([`MergedChain::cross`]).
@@ -19862,7 +19843,7 @@ fn emit_child_region(
             }
         })
         .collect();
-    let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+    let iv_w = pack8(&crate::r1cs_hashes::fs_chain::IV);
     vals.extend_from_slice(&iv_w);
     let iv2 = [
         sb.fixed_public_input(iv_w[0]),
@@ -20995,7 +20976,7 @@ fn check_child_region(public: &[F128], ct: &ChildTape<'_>, r: &ChildRegion) -> u
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn mvp10_circuit_inner_tape() {
-    use flock_prover::prover::UnionElementSlotInput;
+    use crate::prover::UnionElementSlotInput;
 
     let inner = build_mixed_inner(256, 32, 0x4D51_0001);
     let ct = ChildTape::new(&inner, DOMAIN);
@@ -21512,7 +21493,7 @@ fn mvp11_sigma_fold_tape() {
     // (ρ_col, ρ_row, value) publishes as the merge node's statement —
     // rebuilt from the public segment alone and discharged at the root.
     let outer_stats = {
-        use flock_prover::prover::UnionElementSlotInput;
+        use crate::prover::UnionElementSlotInput;
 
         // The transcript is FORKED (the wiring runs on its own chain);
         // `merge_chain` splices the child's rows in at the fork point and
@@ -21544,7 +21525,7 @@ fn mvp11_sigma_fold_tape() {
         let pfslot = sb.slot(PrefixGate::new(pf_w));
 
         let mut vals: Vec<F128> = Vec::new();
-        let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+        let iv_w = pack8(&crate::r1cs_hashes::fs_chain::IV);
         vals.extend_from_slice(&iv_w);
         let iv2 = [
             sb.fixed_public_input(iv_w[0]),
@@ -22092,7 +22073,7 @@ fn mvp11_jagged_fold_tape() {
 
     // ---- the in-circuit replay ----
     let outer_stats = {
-        use flock_prover::prover::UnionElementSlotInput;
+        use crate::prover::UnionElementSlotInput;
 
         // The transcript is FORKED (the wiring runs on its own chain);
         // `merge_chain` splices the child's rows in at the fork point and
@@ -22121,7 +22102,7 @@ fn mvp11_jagged_fold_tape() {
         let pfslot = sb.slot(PrefixGate::new(pf_w));
 
         let mut vals: Vec<F128> = Vec::new();
-        let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+        let iv_w = pack8(&crate::r1cs_hashes::fs_chain::IV);
         vals.extend_from_slice(&iv_w);
         let iv2 = [
             sb.fixed_public_input(iv_w[0]),
@@ -22719,7 +22700,7 @@ fn emit_fold_region(
     pf_w: usize,
     leslot: flock_core::circuit::builder::SlotId,
     locs: &[FoldLoc],
-    trace: &flock_prover::r1cs_hashes::fs_chain::FsChainTrace,
+    trace: &crate::r1cs_hashes::fs_chain::FsChainTrace,
     challenge_locs: &[(usize, usize)],
     outs: &[Vec<Wire>],
     ww: &[Option<Wire>],
@@ -23398,7 +23379,7 @@ fn emit_jagged_fold_region(
     pfslot: flock_core::circuit::builder::SlotId,
     pf_w: usize,
     locs: &[JaggedFoldLoc],
-    trace: &flock_prover::r1cs_hashes::fs_chain::FsChainTrace,
+    trace: &crate::r1cs_hashes::fs_chain::FsChainTrace,
     challenge_locs: &[(usize, usize)],
     outs: &[Vec<Wire>],
     ww: &[Option<Wire>],
@@ -23892,7 +23873,7 @@ fn mvp11_merge_fold_region() {
     // publish, and the five accumulator claims publish as the merge node's
     // statement — rebuilt from the public segment alone and discharged.
     let outer_stats = {
-        use flock_prover::prover::UnionElementSlotInput;
+        use crate::prover::UnionElementSlotInput;
 
         // The transcript is FORKED (the wiring runs on its own chain);
         // `merge_chain` splices the child's rows in at the fork point and
@@ -23952,7 +23933,7 @@ fn mvp11_merge_fold_region() {
             .map(|&(_, s)| s)
             .expect("the child regions created the 8-lane leaf-eval slot");
 
-        let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+        let iv_w = pack8(&crate::r1cs_hashes::fs_chain::IV);
         vals.extend_from_slice(&iv_w);
         let iv2 = [
             sb.fixed_public_input(iv_w[0]),
@@ -24746,7 +24727,7 @@ fn mvp11_swap_children_fold_scale() {
 
     // ---- the in-circuit replay: the whole ~35-fold region ----
     let outer_stats = {
-        use flock_prover::prover::UnionElementSlotInput;
+        use crate::prover::UnionElementSlotInput;
 
         // The transcript is FORKED (the wiring runs on its own chain);
         // `merge_chain` splices the child's rows in at the fork point and
@@ -24779,7 +24760,7 @@ fn mvp11_swap_children_fold_scale() {
         let leslot = sb.slot(LeafEvalGate::new(8));
 
         let mut vals: Vec<F128> = Vec::new();
-        let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+        let iv_w = pack8(&crate::r1cs_hashes::fs_chain::IV);
         vals.extend_from_slice(&iv_w);
         let iv2 = [
             sb.fixed_public_input(iv_w[0]),
@@ -25177,7 +25158,7 @@ struct NodeOut {
 /// the children's published accumulator claims (`claims_base` locates
 /// them; a prior's surface IS what the child published).
 struct ChainLane<'a> {
-    registry: &'a flock_prover::schedule::Registry,
+    registry: &'a crate::schedule::Registry,
     mats: &'a [flock_core::aggregate::TypeMatrices<'a>],
     circs: &'a [&'a dyn flock_core::lincheck::LincheckCircuit],
     /// The lane's sigma table owner (the chain circuit).
@@ -25746,7 +25727,7 @@ fn build_node_outer_app(
 
     // ---- ONE outer: two REAL child regions + the fold region ----
     let outer_stats = {
-        use flock_prover::prover::UnionElementSlotInput;
+        use crate::prover::UnionElementSlotInput;
 
         // The transcript is FORKED (the wiring runs on its own chain);
         // `merge_chain` splices the child's rows in at the fork point and
@@ -25901,7 +25882,7 @@ fn build_node_outer_app(
             .find(|&&(n, _)| n == 8)
             .map(|&(_, s)| s)
             .expect("the child regions created the 8-lane leaf-eval slot");
-        let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
+        let iv_w = pack8(&crate::r1cs_hashes::fs_chain::IV);
         vals.extend_from_slice(&iv_w);
         let iv2 = [
             sb.fixed_public_input(iv_w[0]),
@@ -26651,7 +26632,7 @@ fn build_node_outer_app(
             // Use the protocol tracer rather than a manual finalize loop:
             // Secure fold tapes contain fused `Pow`+squeeze operations whose
             // compression counter differs from an ordinary squeeze.
-            let ltrace = flock_prover::r1cs_hashes::fs_chain::trace_duplex(lstream, lbytes, lops);
+            let ltrace = crate::r1cs_hashes::fs_chain::trace_duplex(lstream, lbytes, lops);
             assert_chain_replays(lops, &ltrace, lchals);
             let lpub_payloads = bytes_payload_mask(&lops);
             let (lchain_outs, lww) = emit_fs_chain(
@@ -29084,7 +29065,7 @@ fn chain_leaf_prove_probe() {
     let nu = n_blocks.trailing_zeros() as usize;
     let blake_r1cs = blake3::build_block_r1cs(nu);
     let blake_lc = blake_r1cs.csc_lincheck_circuit();
-    let registry = flock_prover::schedule::Registry::new(
+    let registry = crate::schedule::Registry::new(
         vec![TableType::from_block_r1cs(&blake_r1cs).with_io_schema(blake3::io_schema())],
         nu,
     );
