@@ -28625,11 +28625,14 @@ fn chain_leaf_prove_probe() {
         nu,
     );
     let union = UnionInstance::new(&registry, vec![n_blocks]);
+    // The control follows the chain leaf's profile (TOWER_PROFILE-driven),
+    // so the pure-single-table floor is measurable per security point.
+    let control_profile = chain_leaf_profile();
     let pcs = PcsParams {
         m: union.dense_m(),
         log_inv_rate: 1,
         log_batch_size: pcs_batch(&union),
-        profile: LigeritoProfile::Fast,
+        profile: control_profile,
         num_lanes: union.commit_lanes(pcs_batch(&union)),
         merkle_hash: HashKind::Blake3,
     };
@@ -28651,7 +28654,8 @@ fn chain_leaf_prove_probe() {
             &mut ch,
         );
         println!(
-            "CONTROL {r} (union batch, no wiring): prove {:.0} ms",
+            "CONTROL {r} (union batch, no wiring, {:?}): prove {:.0} ms",
+            control_profile,
             t.elapsed().as_secs_f64() * 1e3
         );
         std::hint::black_box(&p);
