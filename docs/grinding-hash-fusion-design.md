@@ -1,6 +1,8 @@
 # Fused grinding and Fiat--Shamir squeeze
 
-Status: implemented and exercised end to end on 2026-08-12.
+Status: implemented and exercised end to end on 2026-08-12. (References to
+`tests/circuit_merkle.rs` below are historical — that file has since been
+productionized into `src/tower.rs`.)
 
 This note specifies the optimized grinding transcript, explains the security
 argument it relies on, maps the construction to code, and records the isolated

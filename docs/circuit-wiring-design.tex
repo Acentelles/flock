@@ -705,8 +705,9 @@ Recursion \emph{requires} the v2 form (an $O(2^\mu)$ in-circuit evaluation
 is unaffordable --- measured at 4.2M constraints / 210 inversions on the
 leaf outer); v1 is for native verification. Structured wirings
 (chains, complete trees) evaluate in $O(\mu)$ --- the existing
-\code{chain.rs}/\code{merkle\_path.rs} glue is the degenerate case of this
-layer and stays.
+\code{merkle\_path.rs} glue is the degenerate case of this
+layer and stays (\code{chain.rs} was retired with the chain product,
+2026-08-14).
 
 \paragraph{v2 design sketch (2026-08-03).} The observation that makes v2
 cheap: with the merged transport, a preprocessed commitment's opening is

@@ -8,10 +8,8 @@
 //! [`common`].
 
 pub mod blake3;
-/// Generic hash-chain glue ([`ChainLayout`]-parameterized prove/verify) shared
-/// by the per-hash `*_chain` modules.
-///
-/// [`ChainLayout`]: chain_common::ChainLayout
+/// Shared low-level bit-packing / R1CS-row utilities (carry-save adders,
+/// fused adders, lin-id slot helpers) used by the per-hash encoders.
 pub mod common;
 /// The Fiat–Shamir chain: BLAKE3 over a transcript with a finalize forked at
 /// every squeeze — the FS chain's witness generator, over [`blake3`]'s rows.
@@ -21,7 +19,7 @@ pub mod keccak;
 /// for tighter PCS utilization (~97% vs the single encoder's ~65%).
 pub mod keccak3;
 /// Generic Merkle-path glue ([`MerkleLayout`]-parameterized prove/verify),
-/// analogous to [`chain_common`] but with a per-row bit selector.
+/// with a per-row bit selector.
 ///
 /// [`MerkleLayout`]: merkle_path_common::MerkleLayout
 pub mod merkle_glue;

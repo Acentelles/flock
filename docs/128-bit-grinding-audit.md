@@ -1,5 +1,11 @@
 # 128-bit component-security audit
 
+> **Historical-command note (2026-08-15):** `--test circuit_merkle`
+> invocations below predate the tower's productionization —
+> `tests/circuit_merkle.rs` now lives in `src/tower.rs` and its tests run as
+> `cargo test --release -p flock-prover --lib tower::<name> -- --ignored
+> --exact`. Commands are kept verbatim as an audit record.
+
 Status: implementation audit and independent re-review of the current
 `min/recursion-128bit` working tree. The non-Ligerito audit was completed on
 2026-08-11; Ligerito two-point OOD binding, the Flock paper's Appendix C.3

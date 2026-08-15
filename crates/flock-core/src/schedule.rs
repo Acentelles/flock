@@ -1,4 +1,4 @@
-//! Multi-table registry and slot schedule — Phase 0 scaffolding.
+//! Multi-table registry and slot schedule.
 //!
 //! Pure data types for the multi-table design (`docs/multi-table-design.tex`):
 //! a [`Registry`] fixes, once, an ordered list of [`TableType`]s (one per hash

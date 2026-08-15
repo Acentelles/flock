@@ -1,6 +1,6 @@
 //! Bit-packing and R1CS-row helpers shared by the monolithic hash R1CS
 //! modules (`sha2`, `blake3`, `keccak`). The shared `prove_fast`
-//! orchestration lives in [`crate::prover::prove_fast_from_witness`].
+//! orchestration lives in [`crate::prover::prove_fast_ligerito_union`].
 
 use std::sync::OnceLock;
 

@@ -17,7 +17,8 @@
 # - spartan2:  microsoft/Spartan2's sha256_spartan criterion bench (T256Hyrax-
 #              Engine: 256-bit curve field, Hyrax PCS). Proves ONE monolithic
 #              SHA-256 R1CS over a small preimage = a chain of sequentially-
-#              dependent compressions (cf. Flock sha2_chain_proof), not N
+#              dependent compressions (a shape Flock's retired chain bench
+#              used to cover), not N
 #              independent ones. Being monolithic (no folding) its throughput is
 #              flat then DECLINES with size, so we sweep small preimages
 #              (SPARTAN_SIZES) and report the peak. See run_spartan2.
@@ -530,7 +531,7 @@ fi
 echo
 echo "  notes: flock/binius64 prove N INDEPENDENT SHA-256 compressions (compress(IV, m_i));"
 echo "         spartan2 (Hyrax) proves ONE monolithic SHA-256 R1CS over a small (swept) preimage ="
-echo "         a chain of sequentially-dependent compressions (cf. Flock sha2_chain_proof) — flat then"
+echo "         a chain of sequentially-dependent compressions — flat then"
 echo "         declining throughput, so the peak is reported; neutronnova FOLDS N single-block"
 echo "         compressions (swept), scaling with the batch. Neither is directly comparable to the"
 echo "         independent-compression rows."

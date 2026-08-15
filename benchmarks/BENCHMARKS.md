@@ -52,7 +52,7 @@ cross-prover comparison tables.
 ## README hash throughput matrix
 
 Regenerate the README table across SHA-256, BLAKE3, and Keccak-f[1600], at
-multiple batch sizes, with row-major and batch-major witnesses, using one
+multiple batch sizes, using one
 thread and the machine's physical-core count:
 
 ```bash

@@ -1,5 +1,14 @@
 # Two recursion variants: 100-bit and 128-bit
 
+> **Historical-command note (2026-08-15):** the `--test circuit_merkle`
+> invocations and `TOWER_PROFILE`/`TOWER_ENV_M` env vars quoted in the
+> resolved-incident records below describe the pre-productionization harness.
+> `tests/circuit_merkle.rs` has since moved into `src/tower.rs` — the tests
+> run as `cargo test --release -p flock-prover --lib tower::<name> --
+> --ignored --exact`, and the profile/geometry env vars were replaced by the
+> typed `TowerConfig::{Chain100, Chain128}` (`TOWER_CONFIG=chain100` for
+> the 100-bit tower). The records are kept verbatim as history.
+
 Original review context: Ron's 2026-08-12 `pow-mask-slot` session, based on
 `min/recursion-128bit` at `4603c0f`. The resolution annotations and validation
 status below describe the rebased `min/recursion-128bit` working tree as of

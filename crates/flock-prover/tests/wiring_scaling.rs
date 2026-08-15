@@ -2,8 +2,8 @@
 //!
 //! The question decides whether collapsing the Merkle composites into one
 //! plain BLAKE3 table is worth doing. That change would cut the lincheck's
-//! swept nonzeros ~5x (105.1M → 21.0M, measured in
-//! `circuit_merkle::mvp5_all_levels_query_phase`) by removing four table
+//! swept nonzeros ~5x (105.1M → 21.0M, measured 2026-08 in the since-retired
+//! `circuit_merkle::mvp5_all_levels_query_phase` scaffolding) by removing four table
 //! types — but it pays for it in `nu`: the composite packs 30 compressions
 //! into ONE row, so splitting them out takes `nu` from 8 to 14 and `mu` from
 //! 16 to 21.
