@@ -1935,42 +1935,17 @@ fn two_blake3_tables_vs_direct() {
     let (direct_ms, direct_bytes, direct_verify_ms, direct_committed) = {
         let setup = blake3::Blake3Setup::new_batch_major(n_total);
         assert_eq!(setup.m(), 30, "2N = 65536 blocks must land on m = 30");
-        let circuit = setup.r1cs.csc_lincheck_circuit();
         // Untimed warm-up (hot scratch pool).
         {
-            let (z, a, b, stripe) =
-                blake3::generate_witness_batch_major(&blake3_inputs, setup.n_blocks_log());
             let mut ch = FsChallenger::new(DOMAIN);
-            let _ = prover::prove_fast_ligerito_from_witness(
-                &setup.r1cs,
-                &setup.pcs_params,
-                z,
-                a,
-                b,
-                stripe,
-                circuit,
-                None,
-                &mut ch,
-            );
+            let _ = setup.prove_fast(&blake3_inputs, &mut ch);
         }
         let mut best = f64::INFINITY;
         let mut out = None;
         for _ in 0..iters {
             let mut ch = FsChallenger::new(DOMAIN);
             let t = Instant::now();
-            let (z, a, b, stripe) =
-                blake3::generate_witness_batch_major(&blake3_inputs, setup.n_blocks_log());
-            let o = prover::prove_fast_ligerito_from_witness(
-                &setup.r1cs,
-                &setup.pcs_params,
-                z,
-                a,
-                b,
-                stripe,
-                circuit,
-                None,
-                &mut ch,
-            );
+            let o = setup.prove_fast(&blake3_inputs, &mut ch);
             best = best.min(t.elapsed().as_secs_f64() * 1e3);
             out = Some(o);
         }
@@ -1978,17 +1953,21 @@ fn two_blake3_tables_vs_direct() {
         let bytes = bincode::serialize(&proof).unwrap().len();
         let t = Instant::now();
         let mut ch = FsChallenger::new(DOMAIN);
-        verifier::verify_ligerito(
-            &setup.r1cs,
-            &comm,
-            &proof,
-            circuit,
-            &setup.pcs_params,
-            &mut ch,
-        )
-        .expect("direct verify rejected honest proof");
+        setup
+            .verify(&comm, &proof, &mut ch)
+            .expect("direct verify rejected honest proof");
         let v_ms = t.elapsed().as_secs_f64() * 1e3;
-        (best, bytes, v_ms, 1usize << (setup.m() - 7))
+        (
+            best,
+            bytes,
+            v_ms,
+            setup
+                .pcs_params
+                .num_lanes
+                .map_or(1usize << (setup.pcs_params.m - 7), |t_lanes| {
+                    t_lanes << (setup.pcs_params.m - 7 - setup.pcs_params.log_batch_size)
+                }),
+        )
     };
 
     // ---- (2) UNION, two BLAKE3 tables, N = 32768 each (nu = 15, M = 30).

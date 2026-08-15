@@ -1179,11 +1179,20 @@ pub fn generate_witness(compressions: &[([u32; 8], [u32; 16])], n_blocks_log: us
     z
 }
 
-#[derive(Clone, Debug)]
+/// The monolithic SHA-256 R1CS + its single-slot union registry. Batch
+/// proving ([`Self::prove_fast`]) goes through the UNION commit (dense
+/// stack + integer lanes; `pcs_params` are the union params); the
+/// Merkle-path methods still run the padded commit
+/// ([`Self::padded_pcs_params`]) — the last padded-commit product.
+#[derive(Debug)]
 pub struct Sha256HybridSetup {
     pub n_compressions: usize,
     pub r1cs: BlockR1cs,
+    pub registry: crate::schedule::Registry,
     pub pcs_params: flock_core::pcs::PcsParams,
+    /// Padded-commit params for the Merkle-path protocol (region openings
+    /// assume the padded block-major layout).
+    padded_pcs_params: flock_core::pcs::PcsParams,
 }
 
 impl Sha256HybridSetup {
@@ -1191,16 +1200,14 @@ impl Sha256HybridSetup {
         Self::with_log_inv_rate(n_compressions, 1)
     }
 
-    /// [`Self::new`] with the **batch-major** witness layout (see
-    /// [`flock_core::r1cs::WitnessLayout`]). The generic matrix provers and
-    /// chain/Merkle wrappers still require row-major.
+    /// Alias of [`Self::new`] — the union path is batch-major by
+    /// construction.
     pub fn new_batch_major(n_compressions: usize) -> Self {
-        let mut s = Self::new(n_compressions);
-        s.r1cs.layout = flock_core::r1cs::WitnessLayout::BatchMajor;
-        s
+        Self::new(n_compressions)
     }
 
-    /// Fast-path witness generation dispatched on the r1cs's witness layout.
+    /// Row-major witness for the Merkle-path protocol (its region openings
+    /// assume the padded block-major layout).
     fn generate_witness_ab(
         &self,
         compressions: &[([u32; 8], [u32; 16])],
@@ -1210,14 +1217,7 @@ impl Sha256HybridSetup {
         Vec<flock_core::field::F128>,
         Vec<u8>,
     ) {
-        match self.r1cs.layout {
-            flock_core::r1cs::WitnessLayout::RowMajor => {
-                generate_witness_with_ab_packed_and_lincheck(compressions, self.n_blocks_log())
-            }
-            flock_core::r1cs::WitnessLayout::BatchMajor => {
-                generate_witness_batch_major(compressions, self.n_blocks_log())
-            }
-        }
+        generate_witness_with_ab_packed_and_lincheck(compressions, self.n_blocks_log())
     }
 
     pub fn with_log_inv_rate(n_compressions: usize, log_inv_rate: usize) -> Self {
@@ -1252,12 +1252,9 @@ impl Sha256HybridSetup {
         // so even the first prove performs no page faults.
         r1cs.csc_lincheck_circuit();
         flock_core::scratch::prewarm_prover(r1cs.m);
-        let pcs_params = flock_core::pcs::PcsParams {
+        let padded_pcs_params = flock_core::pcs::PcsParams {
             m: r1cs.m,
             log_inv_rate,
-            // The embedded config's initial_k is the source of truth for the
-            // L0 interleave (6 everywhere except m29 Fast = 5 — the
-            // recursion-node row-width choice).
             log_batch_size: flock_core::pcs::ligerito::embedded_initial_k_or_default(
                 r1cs.m, profile,
             ),
@@ -1265,11 +1262,35 @@ impl Sha256HybridSetup {
             num_lanes: None,
             merkle_hash: Default::default(),
         };
+        let registry = crate::schedule::Registry::new(
+            vec![crate::schedule::TableType::from_block_r1cs(&r1cs)],
+            n_log,
+        );
+        let pcs_params = {
+            let union = flock_core::union::UnionInstance::new(&registry, vec![n_compressions]);
+            let m = union.dense_m();
+            let batch = flock_core::pcs::ligerito::embedded_initial_k_or_default(m, profile);
+            flock_core::pcs::PcsParams {
+                m,
+                log_inv_rate,
+                log_batch_size: batch,
+                profile,
+                num_lanes: union.commit_lanes(batch),
+                merkle_hash: Default::default(),
+            }
+        };
         Self {
             n_compressions,
             r1cs,
+            registry,
             pcs_params,
+            padded_pcs_params,
         }
+    }
+
+    /// The padded-commit params the Merkle-path protocol still runs on.
+    pub fn padded_pcs_params(&self) -> &flock_core::pcs::PcsParams {
+        &self.padded_pcs_params
     }
 
     pub fn m(&self) -> usize {
@@ -1299,100 +1320,43 @@ impl Sha256HybridSetup {
         z_packed
     }
 
-    /// Generic (matrix-driven) prover. Same witness path (bool trace →
-    /// pack) as the fused [`Self::prove_fast`]; produces a byte-identical
-    /// proof, verifiable with [`Self::verify`].
-    pub fn prove_ligerito<Ch: flock_core::challenger::Challenger>(
-        &self,
-        compressions: &[([u32; 8], [u32; 16])],
-        challenger: &mut Ch,
-    ) -> (
-        flock_core::proof::R1csProofLigerito,
-        flock_core::pcs::Commitment,
-        flock_core::proof::R1csClaim,
-    ) {
-        let z_packed = self.generate_witness_packed(compressions);
-        crate::prover::prove_ligerito(&self.r1cs, z_packed, &self.pcs_params, challenger)
-    }
-
-    /// Fast prover: skips `pack_witness`, `apply_{a,b,c}_packed`, and
-    /// `pack_z_lincheck_from_packed` by emitting `(z, a, b, c, z_lincheck)`
-    /// directly via the fused witness builder. Requires m ≥ ~21 (Ligerito).
+    /// Prove `n_compressions` over the single-slot UNION commit (dense
+    /// stack + integer lanes; `PCS_TRACE=1` prints the per-phase
+    /// breakdown). Counts below capacity leave zero dummy rows.
     pub fn prove_fast<Ch: flock_core::challenger::Challenger>(
         &self,
         compressions: &[([u32; 8], [u32; 16])],
         challenger: &mut Ch,
     ) -> (
-        flock_core::proof::R1csProofLigerito,
+        flock_core::proof::R1csProofMergedLigerito,
         flock_core::pcs::Commitment,
         flock_core::proof::R1csClaim,
     ) {
         assert_eq!(compressions.len(), self.n_compressions);
-        // Pre-fault the commit codeword buffer on a background (E-core) thread
-        // while witness generation runs on the perf cores; gated so
-        // RAYON_NUM_THREADS=1 stays truly serial (no extra thread).
-        let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
-            flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
-                self.generate_witness_ab(compressions)
-            });
-        crate::prover::prove_fast_ligerito_from_witness(
-            &self.r1cs,
-            &self.pcs_params,
-            z_packed,
-            a_packed_f128,
-            b_packed_f128,
-            z_packed_lincheck,
+        let union =
+            flock_core::union::UnionInstance::new(&self.registry, vec![self.n_compressions]);
+        let slot = crate::prover::UnionSlotProverInput::new(
+            generate_witness_batch_major_partial(compressions, self.n_blocks_log()),
             self.r1cs.csc_lincheck_circuit(),
-            codeword,
-            challenger,
-        )
-    }
-
-    /// [`Self::prove_fast`] with a per-phase timing breakdown of the real
-    /// Ligerito prover (witness gen + commit + zerocheck + lincheck + recursive
-    /// open). Benchmark-only.
-    pub fn prove_fast_timed<Ch: flock_core::challenger::Challenger>(
-        &self,
-        compressions: &[([u32; 8], [u32; 16])],
-        challenger: &mut Ch,
-    ) -> (
-        flock_core::proof::R1csProofLigerito,
-        flock_core::pcs::Commitment,
-        flock_core::proof::R1csClaim,
-        crate::prover::ProvePhaseTimings,
-    ) {
-        assert_eq!(compressions.len(), self.n_compressions);
-        let t0 = std::time::Instant::now();
-        let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
-            self.generate_witness_ab(compressions);
-        let witness_s = t0.elapsed().as_secs_f64();
-        let lc_circuit = self.r1cs.csc_lincheck_circuit();
-        let (proof, commitment, claim, mut timings) = crate::prover::prove_fast_ligerito_timed(
-            &self.r1cs,
-            &self.pcs_params,
-            z_packed,
-            a_packed_f128,
-            b_packed_f128,
-            z_packed_lincheck,
-            lc_circuit,
-            None,
-            challenger,
         );
-        timings.witness_s = witness_s;
-        (proof, commitment, claim, timings)
+        crate::prover::prove_fast_ligerito_union(&union, &self.pcs_params, vec![slot], challenger)
     }
 
     pub fn verify<Ch: flock_core::challenger::Challenger>(
         &self,
         commitment: &flock_core::pcs::Commitment,
-        proof: &flock_core::proof::R1csProofLigerito,
+        proof: &flock_core::proof::R1csProofMergedLigerito,
         challenger: &mut Ch,
     ) -> Result<flock_core::proof::R1csClaim, flock_core::verifier::VerifyError> {
-        flock_core::verifier::verify_ligerito(
-            &self.r1cs,
+        let union =
+            flock_core::union::UnionInstance::new(&self.registry, vec![self.n_compressions]);
+        let circuit = self.r1cs.csc_lincheck_circuit();
+        let circs: [&dyn flock_core::lincheck::LincheckCircuit; 1] = [circuit];
+        flock_core::verifier::verify_ligerito_union(
+            &union,
+            &circs,
             commitment,
             proof,
-            self.r1cs.csc_lincheck_circuit(),
             &self.pcs_params,
             challenger,
         )
@@ -1435,12 +1399,7 @@ pub const MERKLE_LAYOUT: super::merkle_path_common::MerkleLayout =
 
 /// Reference SHA-256 compression. Returns the 8-word output chaining value
 /// `H_out = H_in + state` where `state = compress256(M)` is the post-rounds
-/// register state. Public so the chain caller can build honest chains via
-/// `blocks[i+1].0 = sha256_compress(blocks[i])`.
-/// Reference SHA-256 compression. Returns the 8-word output chaining value
-/// `H_out = H_in + state` where `state = compress256(M)` is the post-rounds
-/// register state. Public so the chain caller can build honest chains via
-/// `blocks[i+1].0 = sha256_compress(blocks[i])`.
+/// register state.
 pub fn sha256_compress(h_in: &[u32; 8], m: &[u32; 16]) -> [u32; 8] {
     let mut w = [0u32; 64];
     w[..16].copy_from_slice(m);
@@ -1533,7 +1492,7 @@ impl Sha256HybridSetup {
         let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness_ab(compressions);
         super::merkle_path_common::prove_merkle_paths_ligerito_generic(
             &self.r1cs,
-            &self.pcs_params,
+            &self.padded_pcs_params,
             &MERKLE_LAYOUT,
             0, // path_log: single-path
             z_packed,
@@ -1581,7 +1540,7 @@ impl Sha256HybridSetup {
             &root_phys,
             b_bits,
             self.r1cs.csc_lincheck_circuit(),
-            &self.pcs_params,
+            &self.padded_pcs_params,
             challenger,
         )
     }
@@ -1618,7 +1577,7 @@ impl Sha256HybridSetup {
         let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness_ab(compressions);
         super::merkle_path_common::prove_merkle_paths_ligerito_generic(
             &self.r1cs,
-            &self.pcs_params,
+            &self.padded_pcs_params,
             &MERKLE_LAYOUT,
             path_log,
             z_packed,
@@ -1670,7 +1629,7 @@ impl Sha256HybridSetup {
             &root_phys,
             b_bits,
             self.r1cs.csc_lincheck_circuit(),
-            &self.pcs_params,
+            &self.padded_pcs_params,
             challenger,
         )
     }
@@ -2362,43 +2321,6 @@ mod tests {
         assert_eq!(claim_p, claim_v);
     }
 
-    /// Generic (matrix-driven) Ligerito prove produces a byte-identical
-    /// proof to the specialized `prove_fast` — pins that the generic path
-    /// (bool trace → pack → apply → prove) and the fused path agree.
-    /// 128 compressions = m = 22, the smallest default-Ligerito-legal size.
-    #[test]
-    fn prove_ligerito_generic_matches_prove_fast() {
-        use flock_core::challenger::FsChallenger;
-        let n = 128;
-        let setup = Sha256HybridSetup::new(n);
-        let mut rng = Rng::new(0x5A2_63112);
-        let comps: Vec<Compression> = (0..n)
-            .map(|_| {
-                (
-                    std::array::from_fn(|_| rng.next_u32()),
-                    std::array::from_fn(|_| rng.next_u32()),
-                )
-            })
-            .collect();
-        let mut ch_f = FsChallenger::new(b"flock-sha2-gvf");
-        let (proof_f, commit_f, claim_f) = setup.prove_fast(&comps, &mut ch_f);
-        let mut ch_g = FsChallenger::new(b"flock-sha2-gvf");
-        let (proof_g, commit_g, claim_g) = setup.prove_ligerito(&comps, &mut ch_g);
-        assert_eq!(commit_f.cap, commit_g.cap);
-        assert_eq!(claim_f, claim_g);
-        assert_eq!(
-            bincode::serialize(&proof_f).unwrap(),
-            bincode::serialize(&proof_g).unwrap(),
-            "generic and fused Ligerito proofs must be byte-identical"
-        );
-        // And it verifies through the standard (Ligerito) verifier.
-        let mut ch_v = FsChallenger::new(b"flock-sha2-gvf");
-        let claim_v = setup
-            .verify(&commit_g, &proof_g, &mut ch_v)
-            .expect("verify ok");
-        assert_eq!(claim_v, claim_g);
-    }
-
     /// Constant-wire pin (docs/const-wire-pin.md). `new(120)` has padding
     /// blocks (filled with a valid all-zero-input compression, constant = 1)
     /// so the honest proof verifies; the all-zero witness must be rejected by
@@ -2423,10 +2345,11 @@ mod tests {
             .unwrap_or_else(|e| panic!("honest padded proof rejected: {e:?}"));
         assert_eq!(claim_p, claim_v);
 
-        // (2) All-zero witness must be rejected by the pin.
+        // (2) All-zero witness must be rejected by the pin (union path:
+        // the count-derived const-pin target).
         let zeros: Vec<([u32; 8], [u32; 16])> = vec![([0u32; 8], [0u32; 16]); n];
         let (mut z, mut a, mut b, mut zlc) =
-            generate_witness_with_ab_packed_and_lincheck(&zeros, setup.n_blocks_log());
+            generate_witness_batch_major_partial(&zeros, setup.n_blocks_log());
         z.iter_mut()
             .for_each(|v| *v = flock_core::field::F128::ZERO);
         a.iter_mut()
@@ -2434,17 +2357,16 @@ mod tests {
         b.iter_mut()
             .for_each(|v| *v = flock_core::field::F128::ZERO);
         zlc.iter_mut().for_each(|v| *v = 0);
-        let circuit = setup.r1cs.csc_lincheck_circuit();
+        let union = flock_core::union::UnionInstance::new(&setup.registry, vec![n]);
+        let slot = crate::prover::UnionSlotProverInput::new(
+            (z, a, b, zlc),
+            setup.r1cs.csc_lincheck_circuit(),
+        );
         let mut ch_p = FsChallenger::new(b"poc");
-        let (proof, commit, _) = crate::prover::prove_fast_ligerito_from_witness(
-            &setup.r1cs,
+        let (proof, commit, _) = crate::prover::prove_fast_ligerito_union(
+            &union,
             &setup.pcs_params,
-            z,
-            a,
-            b,
-            zlc,
-            circuit,
-            None,
+            vec![slot],
             &mut ch_p,
         );
         let mut ch_v = FsChallenger::new(b"poc");

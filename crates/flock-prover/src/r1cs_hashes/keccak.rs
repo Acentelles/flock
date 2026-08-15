@@ -832,10 +832,16 @@ impl LincheckCircuit for KeccakLincheckCircuit {
 // Setup
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
+/// The Keccak-f[1600] R1CS + its single-slot union registry. Proving goes
+/// through the UNION commit (dense stack + integer lanes); the constraint
+/// definition stays on the walker lincheck circuit. Counts are always the
+/// full capacity — padding slots run `keccak_f(0)` (the walker's constant
+/// pin needs them).
+#[derive(Debug)]
 pub struct KeccakSetup {
     pub n_keccaks: usize,
     pub r1cs: BlockR1cs,
+    pub registry: crate::schedule::Registry,
     pub pcs_params: PcsParams,
 }
 
@@ -870,54 +876,44 @@ impl KeccakSetup {
     ) -> Self {
         assert!(n_keccaks >= 1);
         let n_log = min_n_keccaks_log(n_keccaks);
-        let r1cs = build_block_r1cs(n_log);
+        let mut r1cs = build_block_r1cs(n_log);
+        r1cs.layout = flock_core::r1cs::WitnessLayout::BatchMajor;
         // Pre-fault the prove-cycle scratch buffers — see scratch::prewarm_prover.
         flock_core::scratch::prewarm_prover(r1cs.m);
-        let pcs_params = PcsParams {
-            m: r1cs.m,
-            log_inv_rate,
-            // The embedded config's initial_k is the source of truth for the
-            // L0 interleave (6 everywhere except m29 Fast = 5 — the
-            // recursion-node row-width choice).
-            log_batch_size: flock_core::pcs::ligerito::embedded_initial_k_or_default(
-                r1cs.m, profile,
-            ),
-            profile,
-            num_lanes: None,
-            merkle_hash: Default::default(),
+        let registry = {
+            // The empty-stub r1cs carries no const_pin (the walker owns it);
+            // the union lincheck asserts the registry type agrees with the
+            // slot circuit, so copy the walker's pin onto the type.
+            let mut ty = crate::schedule::TableType::from_block_r1cs(&r1cs);
+            ty.const_pin = Some(Z_CONST);
+            crate::schedule::Registry::new(vec![ty], n_log)
+        };
+        let n_slots = 1usize << n_log;
+        let pcs_params = {
+            let union = flock_core::union::UnionInstance::new(&registry, vec![n_slots]);
+            let m = union.dense_m();
+            let batch = flock_core::pcs::ligerito::embedded_initial_k_or_default(m, profile);
+            PcsParams {
+                m,
+                log_inv_rate,
+                log_batch_size: batch,
+                profile,
+                num_lanes: union.commit_lanes(batch),
+                merkle_hash: Default::default(),
+            }
         };
         Self {
             n_keccaks,
             r1cs,
+            registry,
             pcs_params,
         }
     }
 
-    /// [`Self::new`] with the **batch-major** witness layout (see
-    /// [`flock_core::r1cs::WitnessLayout`]): fold-log_n-first variable
-    /// order, contiguous padding suffix, direct-write witness producer.
-    /// Chain wrappers preserve the selected witness layout.
+    /// Alias of [`Self::new`] — the union path is batch-major by
+    /// construction.
     pub fn new_batch_major(n_keccaks: usize) -> Self {
-        let mut s = Self::new(n_keccaks);
-        // Safe to set post-construction: the digest/csc caches are lazy and
-        // untouched by `new`.
-        s.r1cs.layout = flock_core::r1cs::WitnessLayout::BatchMajor;
-        s
-    }
-
-    /// Witness generation dispatched on the r1cs's witness layout.
-    fn generate_witness(
-        &self,
-        initial_states: &[State],
-    ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
-        match self.r1cs.layout {
-            flock_core::r1cs::WitnessLayout::RowMajor => {
-                generate_witness_with_ab_packed_and_lincheck(initial_states, self.n_keccaks_log())
-            }
-            flock_core::r1cs::WitnessLayout::BatchMajor => {
-                generate_witness_batch_major(initial_states, self.n_keccaks_log())
-            }
-        }
+        Self::new(n_keccaks)
     }
 
     pub fn m(&self) -> usize {
@@ -930,43 +926,41 @@ impl KeccakSetup {
         1usize << self.n_keccaks_log()
     }
 
-    /// Build a base R1CS proof (without the chain shift sumcheck).
-    /// Requires `m ≥ ~21` (Ligerito recursion floor).
+    /// Prove over the single-slot UNION commit. Requires `m ≥ ~21`.
     pub fn prove_fast<Ch: Challenger>(
         &self,
         initial_states: &[State],
         challenger: &mut Ch,
-    ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
+    ) -> (
+        flock_core::proof::R1csProofMergedLigerito,
+        Commitment,
+        R1csClaim,
+    ) {
         assert_eq!(initial_states.len(), self.n_keccaks);
-        let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
-            flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
-                self.generate_witness(initial_states)
-            });
-        crate::prover::prove_fast_ligerito_from_witness(
-            &self.r1cs,
-            &self.pcs_params,
-            z_packed,
-            a_packed_f128,
-            b_packed_f128,
-            z_packed_lincheck,
+        let n_slots = self.n_keccak_slots();
+        let union = flock_core::union::UnionInstance::new(&self.registry, vec![n_slots]);
+        let slot = crate::prover::UnionSlotProverInput::new(
+            generate_witness_batch_major(initial_states, self.n_keccaks_log()),
             &KeccakLincheckCircuit,
-            codeword,
-            challenger,
-        )
+        );
+        crate::prover::prove_fast_ligerito_union(&union, &self.pcs_params, vec![slot], challenger)
     }
 
-    /// Verify a [`Self::prove_fast`] (Ligerito) proof.
+    /// Verify a [`Self::prove_fast`] proof.
     pub fn verify<Ch: Challenger>(
         &self,
         commitment: &Commitment,
-        proof: &flock_core::proof::R1csProofLigerito,
+        proof: &flock_core::proof::R1csProofMergedLigerito,
         challenger: &mut Ch,
     ) -> Result<R1csClaim, verifier::VerifyError> {
-        verifier::verify_ligerito(
-            &self.r1cs,
+        let n_slots = self.n_keccak_slots();
+        let union = flock_core::union::UnionInstance::new(&self.registry, vec![n_slots]);
+        let circs: [&dyn flock_core::lincheck::LincheckCircuit; 1] = [&KeccakLincheckCircuit];
+        verifier::verify_ligerito_union(
+            &union,
+            &circs,
             commitment,
             proof,
-            &KeccakLincheckCircuit,
             &self.pcs_params,
             challenger,
         )
@@ -1679,24 +1673,22 @@ mod tests {
             .unwrap_or_else(|e| panic!("honest padded proof rejected: {e:?}"));
         assert_eq!(claim_p, claim_v);
 
-        // (2) All-zero witness must be rejected by the pin.
+        // (2) All-zero witness must be rejected by the pin (union path).
         let zeros: Vec<State> = vec![[false; STATE_BITS]; n];
         let (mut z, mut a, mut b, mut zlc) =
-            generate_witness_with_ab_packed_and_lincheck(&zeros, setup.n_keccaks_log());
+            generate_witness_batch_major(&zeros, setup.n_keccaks_log());
         z.iter_mut().for_each(|v| *v = F128::ZERO);
         a.iter_mut().for_each(|v| *v = F128::ZERO);
         b.iter_mut().for_each(|v| *v = F128::ZERO);
         zlc.iter_mut().for_each(|v| *v = 0);
+        let n_slots = setup.n_keccak_slots();
+        let union = flock_core::union::UnionInstance::new(&setup.registry, vec![n_slots]);
+        let slot = crate::prover::UnionSlotProverInput::new((z, a, b, zlc), &KeccakLincheckCircuit);
         let mut ch_p = FsChallenger::new(b"poc");
-        let (proof, commitment, _) = crate::prover::prove_fast_ligerito_from_witness(
-            &setup.r1cs,
+        let (proof, commitment, _) = crate::prover::prove_fast_ligerito_union(
+            &union,
             &setup.pcs_params,
-            z,
-            a,
-            b,
-            zlc,
-            &KeccakLincheckCircuit,
-            None,
+            vec![slot],
             &mut ch_p,
         );
         let mut ch_v = FsChallenger::new(b"poc");

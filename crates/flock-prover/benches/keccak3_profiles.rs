@@ -81,9 +81,12 @@ fn bench_profile(n_keccaks: usize, profile: LigeritoProfile, n_runs: usize, labe
         verify_t = verify_t.min(t0.elapsed().as_secs_f64());
     }
 
-    let bundle = flock_prover::proof_io::R1csProofBundleLigerito { commitment, proof };
-    let size = bundle.to_bytes().len();
-    black_box(&bundle);
+    // keccak3 still emits the padded-commit proof type; size it directly.
+    let size = bincode::serialize(&proof).map(|b| b.len()).unwrap_or(0)
+        + bincode::serialize(&commitment)
+            .map(|b| b.len())
+            .unwrap_or(0);
+    black_box(&proof);
 
     let kps = n_keccaks as f64 / prove_t / 1000.0;
     println!(

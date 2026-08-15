@@ -187,10 +187,6 @@ name = "stability_probe"
 harness = false
 
 [[bench]]
-name = "generic_vs_fast_proof"
-harness = false
-
-[[bench]]
 name = "verifier_hash_count"
 harness = false
 required-features = ["hash-count"]

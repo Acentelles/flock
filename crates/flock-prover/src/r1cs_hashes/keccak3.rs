@@ -487,6 +487,9 @@ impl LincheckCircuit for KeccakLincheckCircuit {
 // Setup
 // ---------------------------------------------------------------------------
 
+// NOTE (2026-08-14): still on the padded commit — keccak3 has no
+// batch-major witness producer yet, so it cannot ride the union path the
+// other hash setups moved to. Next candidate for consolidation-or-retire.
 #[derive(Clone, Debug)]
 pub struct KeccakSetup {
     pub n_keccaks: usize,

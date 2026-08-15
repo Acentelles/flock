@@ -170,26 +170,9 @@ fn bench_one(n_compressions: usize, n_runs: usize) {
         black_box(&bundle);
     }
 
-    // Per-phase breakdown of the *real* Ligerito prover (witness gen + commit +
-    // zerocheck + lincheck + recursive PCS open) via prove_fast_timed, so the
-    // phases decompose exactly the prover the headline number runs.
-    println!("  [prove_fast breakdown]");
-    let mut ch = FsChallenger::new(b"flock-bench-v0");
-    let (proof, _commitment, _claim, tm) = setup.prove_fast_timed(&input_sets[0], &mut ch);
-    println!(
-        "    {:32} {}",
-        "gen_witness_ab + lincheck",
-        fmt_ms(tm.witness_s)
-    );
-    println!("    {:32} {}", "pcs::commit", fmt_ms(tm.commit_s));
-    println!(
-        "    {:32} {}",
-        "zerocheck::prove_packed",
-        fmt_ms(tm.zerocheck_s)
-    );
-    println!("    {:32} {}", "lincheck::prove", fmt_ms(tm.lincheck_s));
-    println!("    {:32} {}", "pcs::open (ligerito)", fmt_ms(tm.open_s));
-    black_box(&proof);
+    // Per-phase breakdown: the union prover prints one under `PCS_TRACE=1`
+    // (witgen / compact / commit / zerocheck+lincheck / open).
+    println!("  (per-phase breakdown: rerun with PCS_TRACE=1)");
 }
 
 fn main() {

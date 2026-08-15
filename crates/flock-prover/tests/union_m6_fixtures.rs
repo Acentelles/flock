@@ -50,6 +50,12 @@
 //! Re-pinned 2026-08-13 for proof-IO v20. Strict Fast and Slim proofs now
 //! include every non-Ligerito grinding nonce. All six deterministic digests
 //! were stable across two print runs.
+//! Re-pinned 2026-08-14 (fourth): the legacy cleanup — proof-IO v21 (the
+//! R1cs flavor's payload became the merged union proof) moves every
+//! wire-digested fixture, and the standalone setups now prove over the
+//! single-slot union commit with INTEGER LANES (dense stack), so both
+//! anchors move too; the anchor tests now pin `setup.prove_fast` itself.
+//! Stable across two print runs.
 //! Re-pinned 2026-08-14 (third): SHA-256 lin-id drops, measured — W never
 //! materialized, E_NEW/A_NEW only every other round (EA_PERIOD 2):
 //! USEFUL_BITS 29,054 -> 25,470 (227 -> 199 chunk-columns) at 47.4M
@@ -184,22 +190,22 @@ fn m6_merged_union_proof_bytes_pinned() {
         (
             "merged-nu10-1024-1024",
             [1024, 1024],
-            "f882d115f84a05df612cee7e18f15c23c138aeeadd561345b5fc2e9d81cc8eb8",
+            "a11b54c2aee00161ea65c165ebd6eaf11a66c497bcb9b8fece920a37addce4a6",
         ),
         (
             "merged-nu10-50-37",
             [50, 37],
-            "3f11f215ce1a2e83254f04453283b771cb100674090038b8c2a3617a75d99b38",
+            "ed988c189e253a03568b69a208d0527034a75754fa6fbed87b8c17b05483391f",
         ),
         (
             "merged-nu10-8-8",
             [8, 8],
-            "ad2119fde710734277113155aef65380619f644bf968577185b164ca7bea0fbf",
+            "a5a4c478c8e33fc05ceef8be011075f6618f73cc1e02cedeb18cc938b19acff8",
         ),
         (
             "merged-nu10-0-64",
             [0, 64],
-            "fb9e99cacd560278d2b6c5e873d1908e0b79ea4d6e7515b4cae6f09f7cf067c9",
+            "b34ac2ba4425e805cdc248c17a11ff7437d338493ad4b709933e84c55bcbc04b",
         ),
     ];
 
@@ -275,25 +281,15 @@ fn m6_merged_union_proof_bytes_pinned() {
 fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
     // BLAKE3, 256 blocks (m = 22).
     {
-        const EXPECTED: &str = "874fcef97c0f7460fe0d8a98a7de21c567ea8856452cda973a4594119d8edb4f";
+        const EXPECTED: &str = "6e366f2ac2a68b97c90b5269bc4ee2b31d00d0b18bf6f67fcc51ae845740d675";
         let n_blocks = 256usize;
-        let setup = blake3::Blake3Setup::new_batch_major(n_blocks);
+        // The setup API IS the shipped single-slot union path since the
+        // 2026-08-14 consolidation — the anchor pins it directly.
+        let setup = blake3::Blake3Setup::new(n_blocks);
         let mut rng = Rng::new(0x4D36_B3B3);
         let inputs = random_blake3_inputs(&mut rng, n_blocks);
-        let circuit = setup.r1cs.csc_lincheck_circuit();
-        let registry = Registry::new(
-            vec![TableType::from_block_r1cs(&setup.r1cs)],
-            setup.r1cs.n_log(),
-        );
-        let union = UnionInstance::new(&registry, vec![n_blocks]);
-        assert!(union.compaction_is_identity());
-        let slot = UnionSlotProverInput::new(
-            blake3::generate_witness_batch_major(&inputs, setup.n_blocks_log()),
-            circuit,
-        );
         let mut ch = FsChallenger::new(DOMAIN);
-        let (proof, commitment, claim) =
-            prover::prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
+        let (proof, commitment, claim) = setup.prove_fast(&inputs, &mut ch);
         check(
             "merged-anchor-blake3-m22",
             EXPECTED,
@@ -303,25 +299,13 @@ fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
 
     // SHA-256, 128 blocks (m = 22).
     {
-        const EXPECTED: &str = "c14911f638759daa9f079ab7315e5c33f3d18bb08aa24dc8e827ab06882ddaa9";
+        const EXPECTED: &str = "818334e28817c5b7702f8ab64f302967681a9cd9a60e8f12128e1ce19f2c9c20";
         let n_blocks = 128usize;
-        let setup = sha2::Sha256HybridSetup::new_batch_major(n_blocks);
+        let setup = sha2::Sha256HybridSetup::new(n_blocks);
         let mut rng = Rng::new(0x4D36_5252);
         let inputs = random_sha2_inputs(&mut rng, n_blocks);
-        let circuit = setup.r1cs.csc_lincheck_circuit();
-        let registry = Registry::new(
-            vec![TableType::from_block_r1cs(&setup.r1cs)],
-            setup.r1cs.n_log(),
-        );
-        let union = UnionInstance::new(&registry, vec![n_blocks]);
-        assert!(union.compaction_is_identity());
-        let slot = UnionSlotProverInput::new(
-            sha2::generate_witness_batch_major(&inputs, setup.n_blocks_log()),
-            circuit,
-        );
         let mut ch = FsChallenger::new(DOMAIN);
-        let (proof, commitment, claim) =
-            prover::prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
+        let (proof, commitment, claim) = setup.prove_fast(&inputs, &mut ch);
         check(
             "merged-anchor-sha2-m22",
             EXPECTED,

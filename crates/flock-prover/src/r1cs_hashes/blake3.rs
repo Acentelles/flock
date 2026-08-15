@@ -1544,56 +1544,33 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
 // Convenience API: Blake3Setup
 // ---------------------------------------------------------------------------
 
-/// Bundles the monolithic BLAKE3 compression R1CS + PCS params sized for
-/// `n_blocks` compressions. Mirrors [`super::sha2::Sha256Setup`].
-#[derive(Clone, Debug)]
+/// Bundles the monolithic BLAKE3 compression R1CS, its single-slot union
+/// registry, and dense/integer-lane PCS params for `n_blocks` compressions.
+/// Proving goes through the UNION commit — dense stack + integer lanes;
+/// the padded-commit prove path was retired 2026-08-14 with the rest of
+/// the legacy standalone machinery.
+#[derive(Debug)]
 pub struct Blake3Setup {
     pub n_blocks: usize,
     pub r1cs: BlockR1cs,
+    pub registry: crate::schedule::Registry,
     pub pcs_params: PcsParams,
 }
 
 impl Blake3Setup {
-    /// Build a setup for `n_blocks` BLAKE3 compressions with PCS
-    /// `log_inv_rate = 1`.
-    /// [`Self::new`] with the **batch-major** witness layout (see
-    /// [`flock_core::r1cs::WitnessLayout`]). The generic matrix provers and
-    /// chain/Merkle wrappers still require row-major.
+    /// Alias of [`Self::new`] — the union path is batch-major by
+    /// construction; the row-major/batch-major split died with the padded
+    /// commit.
     pub fn new_batch_major(n_blocks: usize) -> Self {
-        let mut s = Self::new(n_blocks);
-        s.r1cs.layout = flock_core::r1cs::WitnessLayout::BatchMajor;
-        s
+        Self::new(n_blocks)
     }
 
-    /// [`Self::with_profile`] with the batch-major witness layout — the
-    /// profile-selectable twin of [`Self::new_batch_major`].
+    /// Alias of [`Self::with_profile`].
     pub fn batch_major_with_profile(
         n_blocks: usize,
         profile: flock_core::pcs::ligerito::LigeritoProfile,
     ) -> Self {
-        let mut s = Self::with_profile(n_blocks, profile);
-        s.r1cs.layout = flock_core::r1cs::WitnessLayout::BatchMajor;
-        s
-    }
-
-    /// Fast-path witness generation dispatched on the r1cs's witness layout.
-    fn generate_witness_ab(
-        &self,
-        blocks: &[Compression],
-    ) -> (
-        Vec<flock_core::field::F128>,
-        Vec<flock_core::field::F128>,
-        Vec<flock_core::field::F128>,
-        Vec<u8>,
-    ) {
-        match self.r1cs.layout {
-            flock_core::r1cs::WitnessLayout::RowMajor => {
-                generate_witness_with_ab_packed_and_lincheck(blocks, self.n_blocks_log())
-            }
-            flock_core::r1cs::WitnessLayout::BatchMajor => {
-                generate_witness_batch_major(blocks, self.n_blocks_log())
-            }
-        }
+        Self::with_profile(n_blocks, profile)
     }
 
     pub fn new(n_blocks: usize) -> Self {
@@ -1627,28 +1604,37 @@ impl Blake3Setup {
     ) -> Self {
         assert!(n_blocks >= 1, "n_blocks must be ≥ 1");
         let n_log = min_n_blocks_log(n_blocks);
-        let r1cs = build_block_r1cs(n_log);
-        // Warm the CSC fold circuit here so its one-time build (a pass over
-        // ~21M nonzeros) stays out of the first prove/verify, and pre-fault
-        // the prove-cycle scratch buffers (see scratch::prewarm_prover).
+        let mut r1cs = build_block_r1cs(n_log);
+        r1cs.layout = flock_core::r1cs::WitnessLayout::BatchMajor;
+        // Warm the CSC fold circuit here so its one-time build stays out of
+        // the first prove/verify, and pre-fault the prove-cycle scratch
+        // buffers (see scratch::prewarm_prover).
         r1cs.csc_lincheck_circuit();
         flock_core::scratch::prewarm_prover(r1cs.m);
-        let pcs_params = PcsParams {
-            m: r1cs.m,
-            log_inv_rate,
-            // The embedded config's initial_k is the source of truth for the
-            // L0 interleave (6 everywhere except m29 Fast = 5 — the
-            // recursion-node row-width choice).
-            log_batch_size: flock_core::pcs::ligerito::embedded_initial_k_or_default(
-                r1cs.m, profile,
-            ),
-            profile,
-            num_lanes: None,
-            merkle_hash: Default::default(),
+        let registry = crate::schedule::Registry::new(
+            vec![crate::schedule::TableType::from_block_r1cs(&r1cs)],
+            n_log,
+        );
+        // Dense/integer-lane commit params: the union commits the compacted
+        // stack (used chunk-columns × declared count) at its dense_m, with
+        // only the active lanes encoded and hashed.
+        let pcs_params = {
+            let union = flock_core::union::UnionInstance::new(&registry, vec![n_blocks]);
+            let m = union.dense_m();
+            let batch = flock_core::pcs::ligerito::embedded_initial_k_or_default(m, profile);
+            PcsParams {
+                m,
+                log_inv_rate,
+                log_batch_size: batch,
+                profile,
+                num_lanes: union.commit_lanes(batch),
+                merkle_hash: Default::default(),
+            }
         };
         Self {
             n_blocks,
             r1cs,
+            registry,
             pcs_params,
         }
     }
@@ -1674,96 +1660,42 @@ impl Blake3Setup {
         generate_witness(blocks, self.n_blocks_log())
     }
 
-    /// Packed witness trace for the generic (matrix-driven) provers — see
-    /// `Sha256HybridSetup::generate_witness_packed`.
-    pub fn generate_witness_packed(&self, blocks: &[Compression]) -> Vec<F128> {
-        let (z_packed, _a, _b, _stripe) = self.generate_witness_ab(blocks);
-        z_packed
-    }
-
-    /// Generic (matrix-driven) prover. Same witness path as the fused
-    /// [`Self::prove_fast`]; produces a byte-identical proof, verifiable
-    /// with [`Self::verify`].
-    pub fn prove_ligerito<Ch: Challenger>(
-        &self,
-        blocks: &[Compression],
-        challenger: &mut Ch,
-    ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
-        let z_packed = self.generate_witness_packed(blocks);
-        crate::prover::prove_ligerito(&self.r1cs, z_packed, &self.pcs_params, challenger)
-    }
-
-    /// Ligerito-backend prove. Requires m ≥ ~21.
+    /// Prove `n_blocks` compressions over the single-slot UNION commit
+    /// (dense stack + integer lanes; `PCS_TRACE=1` prints the per-phase
+    /// breakdown). Counts below capacity leave zero dummy rows — no
+    /// padding compressions needed.
     pub fn prove_fast<Ch: Challenger>(
         &self,
         blocks: &[Compression],
         challenger: &mut Ch,
-    ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
-        assert_eq!(blocks.len(), self.n_blocks);
-        let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
-            flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
-                self.generate_witness_ab(blocks)
-            });
-        let lc_circuit = self.r1cs.csc_lincheck_circuit();
-        crate::prover::prove_fast_ligerito_from_witness(
-            &self.r1cs,
-            &self.pcs_params,
-            z_packed,
-            a_packed_f128,
-            b_packed_f128,
-            z_packed_lincheck,
-            lc_circuit,
-            codeword,
-            challenger,
-        )
-    }
-
-    /// [`Self::prove_fast`] with a per-phase timing breakdown of the real
-    /// Ligerito prover (witness gen + commit + zerocheck + lincheck + recursive
-    /// open). Benchmark-only.
-    pub fn prove_fast_timed<Ch: Challenger>(
-        &self,
-        blocks: &[Compression],
-        challenger: &mut Ch,
     ) -> (
-        flock_core::proof::R1csProofLigerito,
+        flock_core::proof::R1csProofMergedLigerito,
         Commitment,
         R1csClaim,
-        crate::prover::ProvePhaseTimings,
     ) {
         assert_eq!(blocks.len(), self.n_blocks);
-        let t0 = std::time::Instant::now();
-        let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
-            self.generate_witness_ab(blocks);
-        let witness_s = t0.elapsed().as_secs_f64();
-        let lc_circuit = self.r1cs.csc_lincheck_circuit();
-        let (proof, commitment, claim, mut timings) = crate::prover::prove_fast_ligerito_timed(
-            &self.r1cs,
-            &self.pcs_params,
-            z_packed,
-            a_packed_f128,
-            b_packed_f128,
-            z_packed_lincheck,
-            lc_circuit,
-            None,
-            challenger,
+        let union = flock_core::union::UnionInstance::new(&self.registry, vec![self.n_blocks]);
+        let slot = crate::prover::UnionSlotProverInput::new(
+            generate_witness_batch_major_partial(blocks, self.n_blocks_log()),
+            self.r1cs.csc_lincheck_circuit(),
         );
-        timings.witness_s = witness_s;
-        (proof, commitment, claim, timings)
+        crate::prover::prove_fast_ligerito_union(&union, &self.pcs_params, vec![slot], challenger)
     }
 
     pub fn verify<Ch: Challenger>(
         &self,
         commitment: &Commitment,
-        proof: &flock_core::proof::R1csProofLigerito,
+        proof: &flock_core::proof::R1csProofMergedLigerito,
         challenger: &mut Ch,
     ) -> Result<R1csClaim, verifier::VerifyError> {
-        let lc_circuit = self.r1cs.csc_lincheck_circuit();
-        verifier::verify_ligerito(
-            &self.r1cs,
+        let union = flock_core::union::UnionInstance::new(&self.registry, vec![self.n_blocks]);
+        let circuit = self.r1cs.csc_lincheck_circuit();
+        let circs: [&dyn flock_core::lincheck::LincheckCircuit; 1] = [circuit];
+        verifier::verify_ligerito_union(
+            &union,
+            &circs,
             commitment,
             proof,
-            lc_circuit,
             &self.pcs_params,
             challenger,
         )
@@ -2543,7 +2475,7 @@ mod tests {
         ] {
             let setup = Blake3Setup::with_profile(256, profile);
             let mut ch_p = FsChallenger::new(b"flock-blake3-prof");
-            let (proof, commitment, claim_p) = setup.prove_ligerito(&blocks, &mut ch_p);
+            let (proof, commitment, claim_p) = setup.prove_fast(&blocks, &mut ch_p);
             let mut ch_v = FsChallenger::new(b"flock-blake3-prof");
             let claim_v = setup
                 .verify(&commitment, &proof, &mut ch_v)
@@ -2586,34 +2518,6 @@ mod tests {
         assert_eq!(claim_p, claim_v);
     }
 
-    /// Generic (matrix-driven) Ligerito prove produces a byte-identical
-    /// proof to the specialized `prove_fast` — pins that the generic path
-    /// (bool trace → pack → apply → prove) and the fused path agree.
-    #[test]
-    fn prove_ligerito_generic_matches_prove_fast() {
-        use flock_core::challenger::FsChallenger;
-        let setup = Blake3Setup::new(256);
-        let mut rng = Rng::new(0xb1a_63112);
-        let blocks: Vec<Compression> = (0..256)
-            .map(|_| {
-                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
-                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
-                (cv, m, 0u64, 64u32, 11u32)
-            })
-            .collect();
-        let mut ch_f = FsChallenger::new(b"flock-blake3-gvf");
-        let (proof_f, commit_f, claim_f) = setup.prove_fast(&blocks, &mut ch_f);
-        let mut ch_g = FsChallenger::new(b"flock-blake3-gvf");
-        let (proof_g, commit_g, claim_g) = setup.prove_ligerito(&blocks, &mut ch_g);
-        assert_eq!(commit_f.cap, commit_g.cap);
-        assert_eq!(claim_f, claim_g);
-        assert_eq!(
-            bincode::serialize(&proof_f).unwrap(),
-            bincode::serialize(&proof_g).unwrap(),
-            "generic and fused Ligerito proofs must be byte-identical"
-        );
-    }
-
     /// Constant-wire pin (docs/const-wire-pin.md). `new(250)` has padding
     /// blocks (filled with a valid all-zero-input compression, constant = 1)
     /// so the honest proof verifies; the all-zero witness must be rejected by
@@ -2644,10 +2548,11 @@ mod tests {
             .unwrap_or_else(|e| panic!("honest padded proof rejected: {e:?}"));
         assert_eq!(claim_p, claim_v);
 
-        // (2) All-zero witness must be rejected by the pin.
+        // (2) All-zero witness must be rejected by the pin (union path:
+        // the count-derived const-pin target).
         let zeros: Vec<Compression> = vec![([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32); n];
         let (mut z, mut a, mut b, mut zlc) =
-            generate_witness_with_ab_packed_and_lincheck(&zeros, setup.n_blocks_log());
+            generate_witness_batch_major_partial(&zeros, setup.n_blocks_log());
         z.iter_mut()
             .for_each(|v| *v = flock_core::field::F128::ZERO);
         a.iter_mut()
@@ -2655,17 +2560,16 @@ mod tests {
         b.iter_mut()
             .for_each(|v| *v = flock_core::field::F128::ZERO);
         zlc.iter_mut().for_each(|v| *v = 0);
-        let circuit = setup.r1cs.csc_lincheck_circuit();
+        let union = flock_core::union::UnionInstance::new(&setup.registry, vec![n]);
+        let slot = crate::prover::UnionSlotProverInput::new(
+            (z, a, b, zlc),
+            setup.r1cs.csc_lincheck_circuit(),
+        );
         let mut ch_p = FsChallenger::new(b"poc");
-        let (proof, commitment, _) = crate::prover::prove_fast_ligerito_from_witness(
-            &setup.r1cs,
+        let (proof, commitment, _) = crate::prover::prove_fast_ligerito_union(
+            &union,
             &setup.pcs_params,
-            z,
-            a,
-            b,
-            zlc,
-            circuit,
-            None,
+            vec![slot],
             &mut ch_p,
         );
         let mut ch_v = FsChallenger::new(b"poc");

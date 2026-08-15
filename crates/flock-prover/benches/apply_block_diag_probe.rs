@@ -281,7 +281,13 @@ fn main() {
         for _ in 0..3 {
             let mut ch = FsChallenger::new(b"probe-e2e");
             let t = Instant::now();
-            let p = setup.prove_ligerito(&comps, &mut ch);
+            let z = setup.generate_witness_packed(&comps);
+            let p = flock_prover::prover::prove_ligerito(
+                &setup.r1cs,
+                z,
+                setup.padded_pcs_params(),
+                &mut ch,
+            );
             best = best.min(t.elapsed().as_secs_f64());
             black_box(&p);
         }

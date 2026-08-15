@@ -135,11 +135,14 @@ pub const MAX_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
 /// v3 restructured `BaseFoldProof`: per-query Merkle paths were replaced by
 /// shared octopus multi-proofs (one per Merkle tree). v2 added `HashKind`
 /// to [`ChainProofBundle`].
-pub const VERSION: u8 = 20;
+// v21 (2026-08-14): the R1cs flavor's payload became the MERGED union
+// proof — the standalone hash setups prove over the single-slot union
+// commit now (dense stack + integer lanes); the padded-commit
+// R1csProofLigerito payload is gone from this flavor.
+pub const VERSION: u8 = 21;
 
-/// Which hash function a chain proof is over. Carried in
-/// [`ChainProofBundle`] so the verifier (e.g. the CLI) can pick the right
-/// `*_chain` setup without out-of-band info.
+/// Which hash function a proof is over, so a verifier can pick the right
+/// setup without out-of-band info.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HashKind {
     Blake3,
@@ -267,7 +270,7 @@ impl From<bincode::Error> for DeserializeError {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct R1csProofBundleLigerito {
     pub commitment: Commitment,
-    pub proof: flock_core::proof::R1csProofLigerito,
+    pub proof: flock_core::proof::R1csProofMergedLigerito,
 }
 
 impl R1csProofBundleLigerito {
