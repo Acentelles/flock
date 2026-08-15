@@ -1,7 +1,7 @@
 //! Reproducible headline proving-throughput matrix for the README.
 //!
 //! Measures SHA-256 compressions, BLAKE3 compressions, and Keccak-f[1600]
-//! permutations with both witness layouts. Thread count is controlled through
+//! permutations. Thread count is controlled through
 //! `RAYON_NUM_THREADS`; `benchmarks/bench_hash_throughput.sh` runs the complete
 //! single- and multi-threaded matrix and renders it as Markdown.
 
@@ -12,23 +12,6 @@ use flock_prover::challenger::FsChallenger;
 use flock_prover::r1cs_hashes::blake3::{Blake3Setup, Compression};
 use flock_prover::r1cs_hashes::keccak::{KeccakSetup, STATE_BITS, State};
 use flock_prover::r1cs_hashes::sha2::Sha256HybridSetup;
-
-const LAYOUTS: [BenchLayout; 2] = [BenchLayout::RowMajor, BenchLayout::BatchMajor];
-
-#[derive(Clone, Copy)]
-enum BenchLayout {
-    RowMajor,
-    BatchMajor,
-}
-
-impl BenchLayout {
-    fn name(self) -> &'static str {
-        match self {
-            Self::RowMajor => "row-major",
-            Self::BatchMajor => "batch-major",
-        }
-    }
-}
 
 struct Rng(u64);
 
@@ -99,22 +82,18 @@ where
     best
 }
 
-fn report(hash: &str, layout: BenchLayout, batch: usize, best: Duration) {
+fn report(hash: &str, batch: usize, best: Duration) {
     let seconds = best.as_secs_f64();
     let throughput = batch as f64 / seconds;
     println!(
-        "RESULT\t{hash}\t{}\t{batch}\t{}\t{seconds:.6}\t{throughput:.2}",
-        layout.name(),
+        "RESULT\t{hash}\t{batch}\t{}\t{seconds:.6}\t{throughput:.2}",
         rayon::current_num_threads(),
     );
 }
 
-fn bench_sha2(batch: usize, layout: BenchLayout, runs: usize) {
-    eprintln!("  SHA-256, {}, batch {batch}", layout.name());
-    let setup = match layout {
-        BenchLayout::RowMajor => Sha256HybridSetup::new(batch),
-        BenchLayout::BatchMajor => Sha256HybridSetup::new_batch_major(batch),
-    };
+fn bench_sha2(batch: usize, runs: usize) {
+    eprintln!("  SHA-256, batch {batch}");
+    let setup = Sha256HybridSetup::new(batch);
     let input_sets: Vec<Vec<_>> = (0..=runs)
         .map(|run| {
             let mut rng = Rng::new(0x5A25_6000 ^ batch as u64 ^ run as u64);
@@ -134,15 +113,12 @@ fn bench_sha2(batch: usize, layout: BenchLayout, runs: usize) {
         let mut challenger = FsChallenger::new(b"flock-readme-bench-v0");
         setup.prove_fast(inputs, &mut challenger)
     });
-    report("sha2", layout, batch, best);
+    report("sha2", batch, best);
 }
 
-fn bench_blake3(batch: usize, layout: BenchLayout, runs: usize) {
-    eprintln!("  BLAKE3, {}, batch {batch}", layout.name());
-    let setup = match layout {
-        BenchLayout::RowMajor => Blake3Setup::new(batch),
-        BenchLayout::BatchMajor => Blake3Setup::new_batch_major(batch),
-    };
+fn bench_blake3(batch: usize, runs: usize) {
+    eprintln!("  BLAKE3, batch {batch}");
+    let setup = Blake3Setup::new(batch);
     let input_sets: Vec<Vec<_>> = (0..=runs)
         .map(|run| {
             let mut rng = Rng::new(0xB1A3_E000 ^ batch as u64 ^ run as u64);
@@ -162,15 +138,12 @@ fn bench_blake3(batch: usize, layout: BenchLayout, runs: usize) {
         let mut challenger = FsChallenger::new(b"flock-readme-bench-v0");
         setup.prove_fast(inputs, &mut challenger)
     });
-    report("blake3", layout, batch, best);
+    report("blake3", batch, best);
 }
 
-fn bench_keccak(batch: usize, layout: BenchLayout, runs: usize) {
-    eprintln!("  Keccak-f[1600], {}, batch {batch}", layout.name());
-    let setup = match layout {
-        BenchLayout::RowMajor => KeccakSetup::new(batch),
-        BenchLayout::BatchMajor => KeccakSetup::new_batch_major(batch),
-    };
+fn bench_keccak(batch: usize, runs: usize) {
+    eprintln!("  Keccak-f[1600], batch {batch}");
+    let setup = KeccakSetup::new(batch);
     let input_sets: Vec<Vec<_>> = (0..=runs)
         .map(|run| {
             let mut rng = Rng::new(0xAECC_A000 ^ batch as u64 ^ run as u64);
@@ -190,7 +163,7 @@ fn bench_keccak(batch: usize, layout: BenchLayout, runs: usize) {
         let mut challenger = FsChallenger::new(b"flock-readme-bench-v0");
         setup.prove_fast(inputs, &mut challenger)
     });
-    report("keccak", layout, batch, best);
+    report("keccak", batch, best);
 }
 
 fn parse_log2_batches() -> Vec<u32> {
@@ -252,19 +225,13 @@ fn main() {
         enabled_x86_features(),
     );
 
-    for layout in LAYOUTS {
-        for &log2 in &batches {
-            bench_sha2(1usize << log2, layout, runs);
-        }
+    for &log2 in &batches {
+        bench_sha2(1usize << log2, runs);
     }
-    for layout in LAYOUTS {
-        for &log2 in &batches {
-            bench_blake3(1usize << log2, layout, runs);
-        }
+    for &log2 in &batches {
+        bench_blake3(1usize << log2, runs);
     }
-    for layout in LAYOUTS {
-        for &log2 in &batches {
-            bench_keccak(1usize << log2, layout, runs);
-        }
+    for &log2 in &batches {
+        bench_keccak(1usize << log2, runs);
     }
 }

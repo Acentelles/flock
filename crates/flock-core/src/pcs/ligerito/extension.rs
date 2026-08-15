@@ -221,6 +221,8 @@ fn fold_extension(values: &[F256], r: F256, d: usize) -> Vec<F256> {
         .collect()
 }
 
+/// Test oracle: fold a dense basis at an extension-point prefix the slow way.
+#[cfg(test)]
 pub(super) fn evaluate_dense_at_residual(
     basis: &[F128],
     point_prefix: &[F256],

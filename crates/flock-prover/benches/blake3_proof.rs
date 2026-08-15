@@ -95,7 +95,6 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
         witness_bytes >> 20
     );
 
-    // BLAKE3_BATCH_MAJOR=1 switches the witness layout (WitnessLayout::BatchMajor).
     // BLAKE3_PROFILE=fast|slim|secure selects the Ligerito profile (default fast).
     let mut setup = match std::env::var("BLAKE3_PROFILE").as_deref() {
         Ok("slim") => Blake3Setup::with_profile(
@@ -167,8 +166,6 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
             fmt_ms(elapsed)
         );
     }
-    // The per-phase breakdown below uses the warm-up block set.
-    let blocks = &block_sets[0];
     println!(
         "  best prove_fast: {}  ({:.0} compressions/sec)",
         fmt_ms(best_fast),

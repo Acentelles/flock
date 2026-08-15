@@ -1200,11 +1200,6 @@ impl Sha256HybridSetup {
         Self::with_log_inv_rate(n_compressions, 1)
     }
 
-    /// Alias of [`Self::new`] — the union path is batch-major by
-    /// construction.
-    pub fn new_batch_major(n_compressions: usize) -> Self {
-        Self::new(n_compressions)
-    }
 
     /// Row-major witness for the Merkle-path protocol (its region openings
     /// assume the padded block-major layout).
@@ -2089,7 +2084,7 @@ mod tests {
     fn batch_major_prove_fast_roundtrip() {
         use flock_core::challenger::FsChallenger;
 
-        let setup = Sha256HybridSetup::new_batch_major(128);
+        let setup = Sha256HybridSetup::new(128);
         let mut rng = Rng::new(0xBA7C_F012);
         let inputs: Vec<([u32; 8], [u32; 16])> = (0..128)
             .map(|_| (std::array::from_fn(|_| rng.next_u32()), rng.next_block()))
@@ -2625,7 +2620,7 @@ mod tests {
     fn batch_major_prove_merkle_path_ligerito_roundtrip() {
         use flock_core::challenger::FsChallenger;
 
-        let setup = Sha256HybridSetup::new_batch_major(128);
+        let setup = Sha256HybridSetup::new(128);
         let (blocks, leaf, root, b) = honest_merkle_path(setup.n_compressions, 0xBA7C_BEEF);
         let mut ch = FsChallenger::new(b"sha2-merkle-batch-major");
         let (proof, commitment) = setup.prove_merkle_path_ligerito(&blocks, &b, &mut ch);

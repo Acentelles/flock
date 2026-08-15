@@ -910,11 +910,6 @@ impl KeccakSetup {
         }
     }
 
-    /// Alias of [`Self::new`] — the union path is batch-major by
-    /// construction.
-    pub fn new_batch_major(n_keccaks: usize) -> Self {
-        Self::new(n_keccaks)
-    }
 
     pub fn m(&self) -> usize {
         self.r1cs.m
@@ -1638,7 +1633,7 @@ mod tests {
     fn batch_major_prove_fast_roundtrip() {
         use flock_core::challenger::FsChallenger;
 
-        let setup = KeccakSetup::new_batch_major(64);
+        let setup = KeccakSetup::new(64);
         let mut rng = Rng::new(0xBA7C_2170);
         let inputs: Vec<State> = (0..64).map(|_| random_state(&mut rng)).collect();
         let mut ch_p = FsChallenger::new(b"flock-lig-keccak-v0");

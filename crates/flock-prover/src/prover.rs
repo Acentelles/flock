@@ -878,7 +878,7 @@ fn prove_union_with_binding<Ch: Challenger>(
     // the fork point already covers; lincheck-after-zerocheck and
     // gather-after-GKR are data orderings WITHIN their own forks. The
     // verifier forks identically, and the recursion circuit binds both chains
-    // (`merge_chain` in the circuit_merkle tape tests).
+    // (`merge_chain` in the tower's tape tests).
     let par_transcript =
         matches!(&binding, UnionProveBinding::Circuit(_)) && union.num_boolean() > 0;
     let t_bool = std::time::Instant::now();
@@ -1390,7 +1390,7 @@ pub fn prove_fast_core<Ch: Challenger>(
 /// overlapped with witness generation. When `None`, behaves exactly like
 /// [`prove_fast_core`] (commit allocates inline).
 #[allow(clippy::too_many_arguments)]
-pub fn prove_fast_core_with_codeword<Ch: Challenger>(
+fn prove_fast_core_with_codeword<Ch: Challenger>(
     r1cs: &BlockR1cs,
     pcs_params: &PcsParams,
     z_packed: Vec<F128>,

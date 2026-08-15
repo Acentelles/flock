@@ -24,8 +24,8 @@ use flock_core::field::F128;
 use flock_core::merkle::HashKind;
 use flock_core::pcs::ligerito::LigeritoProfile;
 use flock_core::pcs::{
-    DirectEqInd, PackedDirectClaim, PcsParams, VIRTUAL_B_OVERRIDE, commit_lane_major,
-    open_batch_mixed_ligerito_with_precomputed_s_hat_v,
+    DirectEqInd, OpeningGrinding, PackedDirectClaim, PcsParams, VIRTUAL_B_OVERRIDE,
+    commit_lane_major, open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding,
 };
 use flock_core::zerocheck::PaddingSpec;
 use std::sync::atomic::Ordering;
@@ -100,7 +100,7 @@ fn virtual_b_microbench() {
         let w = q.clone();
         let mut ch = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
         let t = std::time::Instant::now();
-        let proof = open_batch_mixed_ligerito_with_precomputed_s_hat_v(
+        let proof = open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding(
             w,
             &prover_data,
             &commitment,
@@ -109,6 +109,7 @@ fn virtual_b_microbench() {
             &[claim()],
             &padding,
             &cfg,
+            OpeningGrinding::disabled(),
             &mut ch,
         );
         let ms = t.elapsed().as_secs_f64() * 1e3;

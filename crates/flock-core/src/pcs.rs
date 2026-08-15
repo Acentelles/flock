@@ -202,38 +202,12 @@ impl OpeningGrinding {
 /// precomputed `s_hat_v`) and **packed-direct** claims (packed-MLE openings
 /// that skip ring-switch). Runs the ring_switch + b_combined computation, then
 /// routes to [`ligerito::recursive_prover_with_basis`] using the existing
-/// `prover_data`'s codeword + tree as Ligerito's L0 commit (no L0 re-commit).
+/// `prover_data`'s codeword + tree as Ligerito's L0 commit (no L0 re-commit),
+/// with PoW witnesses for ring switching and nontrivial claim batching
+/// (pass [`OpeningGrinding::disabled`] for a grind-free transcript).
 ///
 /// `lig_config.initial_k` must equal `commitment.params.log_batch_size` so that
 /// `prover_data`'s codeword/tree shape matches what Ligerito expects for L0.
-#[allow(clippy::too_many_arguments)]
-pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
-    packed_witness: Vec<F128>,
-    prover_data: &ProverData,
-    commitment: &Commitment,
-    x_outers: &[&[F128]],
-    precomputed_s_hat_v: &[Option<&[F128]>],
-    packed_direct: &[PackedDirectClaim],
-    padding: &PaddingSpec,
-    lig_config: &ligerito::ProverConfig,
-    challenger: &mut Ch,
-) -> BatchOpeningProofLigerito {
-    open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding(
-        packed_witness,
-        prover_data,
-        commitment,
-        x_outers,
-        precomputed_s_hat_v,
-        packed_direct,
-        padding,
-        lig_config,
-        OpeningGrinding::disabled(),
-        challenger,
-    )
-}
-
-/// [`open_batch_mixed_ligerito_with_precomputed_s_hat_v`] with PoW witnesses
-/// for ring switching and nontrivial claim batching.
 #[allow(clippy::too_many_arguments)]
 pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding<Ch: Challenger>(
     packed_witness: Vec<F128>,
@@ -962,36 +936,11 @@ pub struct PackedDirectClaimRef<'a> {
 }
 
 /// Verify a mixed-claim batched opening (mirror of
-/// [`open_batch_mixed_ligerito_with_precomputed_s_hat_v`]). Uses
+/// [`open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding`]). Uses
 /// `ring_switch::verify_succinct` per claim (no dense `rs_eq_ind`
 /// materialization), then drives the succinct recursive Ligerito verifier,
-/// evaluating the combined basis only at the residual point.
-#[allow(clippy::too_many_arguments)]
-pub fn verify_opening_batch_ligerito_mixed<Ch: Challenger>(
-    commitment: &Commitment,
-    claims: &[F128],
-    z_skips: &[F128],
-    x_outers: &[&[F128]],
-    packed_direct: &[PackedDirectClaimRef<'_>],
-    proof: &BatchOpeningProofLigerito,
-    lig_config: &ligerito::VerifierConfig,
-    challenger: &mut Ch,
-) -> Result<(), VerifyError> {
-    verify_opening_batch_ligerito_mixed_with_grinding(
-        commitment,
-        claims,
-        z_skips,
-        x_outers,
-        packed_direct,
-        proof,
-        lig_config,
-        OpeningGrinding::disabled(),
-        challenger,
-    )
-}
-
-/// [`verify_opening_batch_ligerito_mixed`] with the matching PCS-transport
-/// PoW checks.
+/// evaluating the combined basis only at the residual point, with the
+/// matching PCS-transport PoW checks.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_opening_batch_ligerito_mixed_with_grinding<Ch: Challenger>(
     commitment: &Commitment,
@@ -2262,7 +2211,7 @@ mod tests {
         .expect("m22 Fast verifier config");
 
         let mut ch_p = FsChallenger::new(b"flock-test-lig-v0");
-        let proof = open_batch_mixed_ligerito_with_precomputed_s_hat_v(
+        let proof = open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding(
             z_packed.clone(),
             &prover_data,
             &commitment,
@@ -2271,11 +2220,12 @@ mod tests {
             &[],
             &PaddingSpec::dense(m),
             &lig_p_cfg,
+            OpeningGrinding::disabled(),
             &mut ch_p,
         );
 
         let mut ch_v = FsChallenger::new(b"flock-test-lig-v0");
-        verify_opening_batch_ligerito_mixed(
+        verify_opening_batch_ligerito_mixed_with_grinding(
             &commitment,
             &[rs_claim],
             &[z_skip],
@@ -2283,6 +2233,7 @@ mod tests {
             &[],
             &proof,
             &lig_v_cfg,
+            OpeningGrinding::disabled(),
             &mut ch_v,
         )
         .unwrap_or_else(|e| panic!("ligerito verify rejected honest proof: {e:?}"));
@@ -2291,7 +2242,7 @@ mod tests {
         malformed.ring_switches.clear();
         let mut ch_v = FsChallenger::new(b"flock-test-lig-v0");
         assert!(matches!(
-            verify_opening_batch_ligerito_mixed(
+            verify_opening_batch_ligerito_mixed_with_grinding(
                 &commitment,
                 &[rs_claim],
                 &[z_skip],
@@ -2299,6 +2250,7 @@ mod tests {
                 &[],
                 &malformed,
                 &lig_v_cfg,
+                OpeningGrinding::disabled(),
                 &mut ch_v,
             ),
             Err(VerifyError::RingSwitch(

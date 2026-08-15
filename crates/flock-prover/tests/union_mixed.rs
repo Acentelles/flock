@@ -666,7 +666,7 @@ fn mixed_prove_rejects_swapped_slot_order() {
 #[ignore] // Heavier — run with `cargo test -p flock-prover --test union_mixed -- --ignored`
 fn blake3_single_type_roundtrip_under_mixed_binding() {
     let n_blocks = 256usize;
-    let setup = blake3::Blake3Setup::new_batch_major(n_blocks);
+    let setup = blake3::Blake3Setup::new(n_blocks);
     let mut rng = Rng::new(0x03_31_00_B3);
     let inputs = random_blake3_inputs(&mut rng, n_blocks);
     let lc_circuit = setup.r1cs.csc_lincheck_circuit();
@@ -707,7 +707,7 @@ fn blake3_single_type_roundtrip_under_mixed_binding() {
 #[ignore] // Heavier — run with `cargo test -p flock-prover --test union_mixed -- --ignored`
 fn identity_compaction_roundtrips_over_the_merged_transport() {
     let n_blocks = 256usize;
-    let setup = blake3::Blake3Setup::new_batch_major(n_blocks);
+    let setup = blake3::Blake3Setup::new(n_blocks);
     let mut rng = Rng::new(0x03_31_1D_B3);
     let inputs = random_blake3_inputs(&mut rng, n_blocks);
     let lc_circuit = setup.r1cs.csc_lincheck_circuit();
@@ -770,7 +770,7 @@ fn mixed_throughput_smoke() {
     // sizes (the single-table jagged path was removed with the jagged
     // transport; identity compaction keeps m the same). One untimed warm-up
     // prove per path (hot scratch pool), then one timed run.
-    let b3_setup = blake3::Blake3Setup::new_batch_major(n_per_type);
+    let b3_setup = blake3::Blake3Setup::new(n_per_type);
     assert_eq!(b3_setup.n_blocks_log(), nu);
     let b3_circuit = b3_setup.r1cs.csc_lincheck_circuit();
     let b3_registry = Registry::new(vec![TableType::from_block_r1cs(&b3_setup.r1cs)], nu);
@@ -790,7 +790,7 @@ fn mixed_throughput_smoke() {
         }
     }
 
-    let s2_setup = sha2::Sha256HybridSetup::new_batch_major(n_per_type);
+    let s2_setup = sha2::Sha256HybridSetup::new(n_per_type);
     assert_eq!(s2_setup.n_blocks_log(), nu);
     let s2_circuit = s2_setup.r1cs.csc_lincheck_circuit();
     let s2_registry = Registry::new(vec![TableType::from_block_r1cs(&s2_setup.r1cs)], nu);
@@ -1721,7 +1721,7 @@ fn mixed_m30_throughput() {
     // One untimed warm-up (hot scratch pool), then best-of-ITERS timed. The
     // setup and its buffers drop at the end of the block.
     let (b3_ms, b3_m) = {
-        let setup = blake3::Blake3Setup::new_batch_major(n_per_type);
+        let setup = blake3::Blake3Setup::new(n_per_type);
         assert_eq!(setup.n_blocks_log(), nu);
         let circuit = setup.r1cs.csc_lincheck_circuit();
         let registry = Registry::new(vec![TableType::from_block_r1cs(&setup.r1cs)], nu);
@@ -1753,7 +1753,7 @@ fn mixed_m30_throughput() {
     // ---- Single-type SHA-256 baseline as a single-slot merged union
     // (m = 29).
     let (s2_ms, s2_m) = {
-        let setup = sha2::Sha256HybridSetup::new_batch_major(n_per_type);
+        let setup = sha2::Sha256HybridSetup::new(n_per_type);
         assert_eq!(setup.n_blocks_log(), nu);
         let circuit = setup.r1cs.csc_lincheck_circuit();
         let registry = Registry::new(vec![TableType::from_block_r1cs(&setup.r1cs)], nu);
@@ -1933,7 +1933,7 @@ fn two_blake3_tables_vs_direct() {
 
     // ---- (1) DIRECT BLAKE3, 2N blocks (m = 30). The pre-multitable baseline.
     let (direct_ms, direct_bytes, direct_verify_ms, direct_committed) = {
-        let setup = blake3::Blake3Setup::new_batch_major(n_total);
+        let setup = blake3::Blake3Setup::new(n_total);
         assert_eq!(setup.m(), 30, "2N = 65536 blocks must land on m = 30");
         // Untimed warm-up (hot scratch pool).
         {

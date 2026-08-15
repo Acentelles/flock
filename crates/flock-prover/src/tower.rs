@@ -24,10 +24,14 @@
 use crate::challenger::FsChallenger;
 use crate::prover::{self, UnionSlotProverInput};
 use crate::r1cs_hashes::blake3;
-use crate::r1cs_hashes::merkle_r1cs::{ChunkPathInput, MerkleTreeLayout, SLOT_WORDS, blake3_spec};
+use crate::r1cs_hashes::merkle_r1cs::SLOT_WORDS;
+#[cfg(test)]
+use crate::r1cs_hashes::merkle_r1cs::{ChunkPathInput, MerkleTreeLayout, blake3_spec};
 use crate::schedule::TableType;
 use crate::union::UnionInstance;
-use flock_core::circuit::builder::{CircuitBuilder, GateType, ShapeBuilder, SlotWitness, Wire};
+#[cfg(test)]
+use flock_core::circuit::builder::CircuitBuilder;
+use flock_core::circuit::builder::{GateType, ShapeBuilder, SlotWitness, Wire};
 use flock_core::field::{F128, F256};
 use flock_core::matrix_fold::{MatrixClaim, Weight};
 use flock_core::merkle::{self as core_merkle, HashKind};
@@ -659,6 +663,9 @@ fn pad_envelope_counts(
 // the union and PCS params, the fill plan, the tape pins. A shape is
 // statement-independent (the digest pins say so), so a production prover
 // pays it once per level and then never again.
+// Populated by the pub builders; READ only by the in-file `#[test]` benches
+// (`tower_online_bench` and friends), so the lib unit sees the fields unread.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Default)]
 struct Online {
     setup_ms: f64,
@@ -674,6 +681,7 @@ struct Online {
     wall_ms: f64,
 }
 
+#[cfg(test)]
 impl Online {
     /// The per-proof online total. The MEASURED wall where a stage supplies
     /// it, the phase sum otherwise — a sum can only be a lower bound.
@@ -692,12 +700,14 @@ impl Online {
     }
 }
 
+#[cfg(test)]
 fn median_of(runs: &[Online], f: impl Fn(&Online) -> f64) -> f64 {
     let mut v: Vec<f64> = runs.iter().map(&f).collect();
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     v[v.len() / 2]
 }
 
+#[cfg(test)]
 fn median_total(runs: &[Online]) -> f64 {
     median_of(runs, |o| o.total())
 }
@@ -715,6 +725,7 @@ fn median_total(runs: &[Online]) -> f64 {
 /// parent replays the child's transcript through its b3 slot at one
 /// compression per 64 bytes, so at the measured ~6.1 µs per b3 row a KiB of
 /// child proof is ~0.1 ms of parent per child.
+#[cfg(test)]
 fn proof_census(label: &str, p: &flock_core::proof::R1csProofCircuitMerged, pcs: &PcsParams) {
     // Per-level stratified schedules, and the siblings a path emits ABOVE
     // the cap layer. The cap is the whole layer at the DEEPEST summand's
@@ -762,6 +773,7 @@ fn proof_census(label: &str, p: &flock_core::proof::R1csProofCircuitMerged, pcs:
     proof_census_inner(label, p)
 }
 
+#[cfg(test)]
 fn proof_census_inner(label: &str, p: &flock_core::proof::R1csProofCircuitMerged) {
     let sz = |b: Result<Vec<u8>, _>| b.map(|v| v.len()).unwrap_or(0) as f64 / 1024.0;
     let total = sz(bincode::serialize(p));
@@ -816,6 +828,7 @@ fn proof_census_inner(label: &str, p: &flock_core::proof::R1csProofCircuitMerged
     );
 }
 
+#[cfg(test)]
 fn report_stage(name: &str, runs: &[Online]) {
     let mut tot: Vec<f64> = runs.iter().map(|o| o.total()).collect();
     tot.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -902,6 +915,7 @@ fn unpack_params(v: F128) -> (u64, u32, u32) {
 /// A 128-bit word of leaf data: bytes `[o, o+16)` little-endian, which is
 /// exactly how the message region reads them (`leaf_msg_words` is LE `u32`s,
 /// and committed bit `t` of a word is bit `t` of `lo`).
+#[cfg(test)]
 fn leaf_word(data: &[u8], o: usize) -> F128 {
     F128::new(
         u64::from_le_bytes(data[o..o + 8].try_into().unwrap()),
@@ -925,7 +939,9 @@ fn hash_to_digest(h: &[u8; 32]) -> [u32; SLOT_WORDS] {
     std::array::from_fn(|w| u32::from_le_bytes(h[4 * w..4 * w + 4].try_into().unwrap()))
 }
 
+#[cfg(test)]
 struct Rng(u64);
+#[cfg(test)]
 impl Rng {
     fn next_u32(&mut self) -> u32 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -980,11 +996,13 @@ impl GateType for Blake3Gate {
 
 /// One chunk-leaf Merkle opening: leaf data and an index word in, the root
 /// out, the sibling path as a hint.
+#[cfg(test)]
 struct MerklePathGate {
     layout: MerkleTreeLayout,
     nu: usize,
 }
 
+#[cfg(test)]
 impl MerklePathGate {
     /// `block_len` is the PCS block length the opening's index will be
     /// sampled against — `sample_queries` masks a challenge with
@@ -1014,6 +1032,7 @@ impl MerklePathGate {
     }
 }
 
+#[cfg(test)]
 impl GateType for MerklePathGate {
     type Row = ChunkPathInput;
     /// The sibling path, level 0 closest to the leaf. Unwireable by
@@ -1062,6 +1081,7 @@ impl GateType for MerklePathGate {
 // ---------------------------------------------------------------------------
 
 /// A tree, and one opening's siblings out of it.
+#[cfg(test)]
 struct Tree {
     data: Vec<u8>,
     flat: Vec<[u8; 32]>,
@@ -1070,6 +1090,7 @@ struct Tree {
     leaf_bytes: usize,
 }
 
+#[cfg(test)]
 impl Tree {
     fn new(depth: usize, leaf_bytes: usize, rng: &mut Rng) -> Self {
         let n_leaves = 1usize << depth;
@@ -1110,6 +1131,7 @@ impl Tree {
 /// be wireable straight into the index: `sample_queries` masks the challenge
 /// to a position, so the circuit must open that position and not its
 /// complement.
+#[cfg(test)]
 fn table_index(pos: usize, _depth: usize) -> u128 {
     pos as u128
 }
@@ -6034,7 +6056,6 @@ struct RealTape<'p> {
     native_sums: Vec<F256>,
     /// The grinding ops: (fin ordinal, payload ordinal, bits).
     pows: Vec<(usize, usize, u32)>,
-    n_p: usize,
     n_gather: usize,
     /// The child cell space's public-slot count — the recombination's tail.
     n_pub_slots_c: usize,
@@ -7285,7 +7306,6 @@ impl<'p> RealTape<'p> {
             geo,
             native_sums,
             pows,
-            n_p,
             n_gather,
             n_pub_slots_c,
             zc_rounds_b,
@@ -9190,6 +9210,7 @@ fn chain_vals(h_start: &[u32; 16]) -> Vec<F128> {
     v
 }
 
+#[cfg(test)]
 fn build_chain_circuit(
     h_start: &[u32; 16],
     n_blocks: usize,
@@ -9219,9 +9240,12 @@ pub struct ChainProof {
     h_start: [u32; 16],
     h_end: [u32; 16],
     /// What the leaf cost, split SETUP vs ONLINE — see [`Online`]. The
-    /// LAST online iteration under steady repetition.
+    /// LAST online iteration under steady repetition. Read by the in-file
+    /// `#[test]` benches only.
+    #[cfg_attr(not(test), allow(dead_code))]
     t: Online,
     /// One record per online iteration (1 + steady_reps of them).
+    #[cfg_attr(not(test), allow(dead_code))]
     onlines: Vec<Online>,
 }
 
@@ -9585,6 +9609,9 @@ fn chain_child_region_emits_alone() {
 /// [`build_node_outer`]) consumes it exactly like a leaf outer; `acc` is
 /// the folded chain accumulator the node carries up; `stmt_base` locates
 /// the 8-word application-statement block (h_start, h_end) in `lo.public`.
+// Several fields are read only by the in-file `#[test]` benches; the lib
+// unit sees them write-only.
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct FlNode {
     lo: LeafOuter,
     acc: flock_core::aggregate::Accumulator,
@@ -9616,6 +9643,7 @@ pub struct FlNode {
 /// scale step's job — this is the m22 dev shape.
 /// The chain layout's jagged params — the count win's per-digest table
 /// owner for the lane, rebuilt exactly as the opening verifier reads it.
+#[cfg(test)]
 fn chain_jagged_params(cp: &ChainProof) -> flock_core::pcs::jagged::JaggedParams {
     let u = UnionInstance::new(
         &cp.inner.built.shape.registry,
@@ -12779,10 +12807,12 @@ struct ChildSlots {
 }
 
 impl ChildSlots {
+    #[cfg(test)]
     fn new(sb: &mut ShapeBuilder, nu2: usize, spread_w: usize) -> Self {
         Self::new_with_b3_split(sb, nu2, spread_w, false)
     }
 
+    #[cfg(test)]
     fn new_with_b3_split(
         sb: &mut ShapeBuilder,
         nu2: usize,
@@ -12925,11 +12955,6 @@ struct ChildRegion {
     /// bound by the fold side's shared constant publics).
     jag_sig_w: Vec<Wire>,
     jag_row_w: Vec<Vec<Wire>>,
-    /// The element assertion's point wires: every element zc round rho (in
-    /// round order — r_con = zc.r[ν..]) and every element lc round rho (in
-    /// round order — r_col is these reversed).
-    el_zc_rho_w: Vec<Wire>,
-    el_lc_rho_w: Vec<Wire>,
     /// The boolean MatrixAssertion's wires: the zc mlv round rhos (round
     /// order — [dim6 | x_outer | x_inner_rest]), the lc round rhos (round
     /// order — rr is these reversed), and the absorbed z_partial words.
@@ -12939,7 +12964,6 @@ struct ChildRegion {
     /// Reported matrix evaluations, constrained by the in-circuit scalar
     /// closure and connected to the aggregate fold's fresh claim values.
     mat_eval_w: Vec<(Wire, Wire)>,
-    el_eval_w: Vec<(Wire, Wire)>,
     /// The z_skip squeeze wire — the merge assemblies derive the lagrange
     /// row lows from it IN-CIRCUIT (no publish, no checker rebuild).
     zskip_w: Wire,
@@ -13813,9 +13837,8 @@ fn emit_child_region(
                 .collect()
         })
         .unwrap_or_default();
-    let mut el_eval_w = Vec::new();
     if let (Some(el_assert), Some((_, el_lcw, _, _, el_alpha_w))) = (&ct.el_assert, el_pub) {
-        el_eval_w = el_assert
+        let el_eval_w: Vec<(Wire, Wire)> = el_assert
             .evals
             .iter()
             .map(|&(a, b)| {
@@ -13929,16 +13952,6 @@ fn emit_child_region(
         jag_w,
         jag_sig_w: mp_sig_w.clone(),
         jag_row_w,
-        el_zc_rho_w,
-        el_lc_rho_w: el_rec
-            .map(|el_rec| {
-                el_rec
-                    .lc_rounds
-                    .iter()
-                    .map(|&(_, rfin, _)| outs[trace.squeezes[rfin][0]][0])
-                    .collect()
-            })
-            .unwrap_or_default(),
         b_mlv_w: mlv_pw.iter().map(|&(_, w)| w).collect(),
         b_lc_w: ct
             .lc_rounds_b
@@ -13947,7 +13960,6 @@ fn emit_child_region(
             .collect(),
         b_zpartial_w: (0..64).map(|i| wv(ct.zp_v + i)).collect(),
         mat_eval_w,
-        el_eval_w,
         zskip_w: outs[trace.squeezes[ct.zskip_fin][0]][0],
         pf: (pfslot, pf_w),
         child_pub_w: pub_w,
@@ -15488,6 +15500,9 @@ pub struct SpineIn<'a> {
 }
 
 /// Everything [`build_node_outer_app`] hands back.
+// Read only by the in-file `#[test]` benches; the lib unit sees the fields
+// write-only.
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct NodeOut {
     lo: LeafOuter,
     /// The MAIN fold's accumulator — LIVE entries only, the thing a root
@@ -18024,6 +18039,7 @@ fn internal_node_over_two_fl_nodes() {
 /// One node's own JAGGED LAYOUT — the table its published claims are
 /// about, keyed by its circuit digest. Heights are a shape constant of
 /// that circuit, which is why the key names the table.
+#[cfg(test)]
 fn node_jagged_params(lo: &LeafOuter) -> flock_core::pcs::jagged::JaggedParams {
     let u = outer_union(&lo.shape.registry, lo.shape.counts.clone());
     flock_core::pcs::jagged::JaggedParams::from_heights(

@@ -1558,21 +1558,6 @@ pub struct Blake3Setup {
 }
 
 impl Blake3Setup {
-    /// Alias of [`Self::new`] — the union path is batch-major by
-    /// construction; the row-major/batch-major split died with the padded
-    /// commit.
-    pub fn new_batch_major(n_blocks: usize) -> Self {
-        Self::new(n_blocks)
-    }
-
-    /// Alias of [`Self::with_profile`].
-    pub fn batch_major_with_profile(
-        n_blocks: usize,
-        profile: flock_core::pcs::ligerito::LigeritoProfile,
-    ) -> Self {
-        Self::with_profile(n_blocks, profile)
-    }
-
     pub fn new(n_blocks: usize) -> Self {
         Self::with_log_inv_rate(n_blocks, 1)
     }
@@ -2179,7 +2164,7 @@ mod tests {
     fn batch_major_prove_fast_roundtrip() {
         use flock_core::challenger::FsChallenger;
 
-        let setup = Blake3Setup::new_batch_major(256);
+        let setup = Blake3Setup::new(256);
         let mut rng = Rng::new(0xBA7C_F013);
         let inputs: Vec<Compression> = (0..256)
             .map(|_| {

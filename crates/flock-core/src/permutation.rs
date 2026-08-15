@@ -346,7 +346,7 @@ fn open_v<C: Challenger>(
     let num_vars = commitment.params.log_msg_len();
     let padding = PaddingSpec::dense(commitment.params.m);
     let cfg = ligerito_prover_config(num_vars);
-    pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
+    pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding(
         poly,
         prover_data,
         commitment,
@@ -355,6 +355,7 @@ fn open_v<C: Challenger>(
         claims,
         &padding,
         &cfg,
+        pcs::OpeningGrinding::disabled(),
         ch,
     )
 }
@@ -368,8 +369,18 @@ fn verify_v<C: Challenger>(
 ) -> Result<(), VerifyError> {
     let num_vars = commitment.params.log_msg_len();
     let cfg = ligerito_verifier_config(num_vars);
-    pcs::verify_opening_batch_ligerito_mixed(commitment, &[], &[], &[], claims, open, &cfg, ch)
-        .map_err(VerifyError::PcsOpen)
+    pcs::verify_opening_batch_ligerito_mixed_with_grinding(
+        commitment,
+        &[],
+        &[],
+        &[],
+        claims,
+        open,
+        &cfg,
+        pcs::OpeningGrinding::disabled(),
+        ch,
+    )
+    .map_err(VerifyError::PcsOpen)
 }
 
 /// The five evaluation points of `v` (each length `μ+1`) that the PCS opens, in
