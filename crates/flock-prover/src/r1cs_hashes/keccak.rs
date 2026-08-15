@@ -60,9 +60,8 @@
 //! [`KeccakLincheckCircuit`], and witness gen emits `a`, `b` values
 //! directly from the running keccak_f simulation. `r1cs.satisfies(z)` and
 //! the slow `prove` path will report "everything satisfied vacuously" for
-//! this encoding — only use `prove_fast`/`prove_chain`.
+//! this encoding — only use `prove_fast`.
 
-use crate::r1cs_hashes::chain_common::{ChainLayout, ChainVerifyError};
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 use flock_core::lincheck::LincheckCircuit;
@@ -649,7 +648,7 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
     // Constant-wire pin (docs/const-wire-pin.md): fill padding blocks with a
     // valid keccak_f(0) computation so the constant cell is 1 in every block.
-    // (The chain forbids padding — `prove_chain` asserts no padding — so this is
+    // (so this is
     // a no-op there and only affects the standalone batch setup.)
     let padding: State = [false; STATE_BITS];
     super::common::drive_witness_packed_and_lincheck(
@@ -830,32 +829,6 @@ impl LincheckCircuit for KeccakLincheckCircuit {
 }
 
 // ---------------------------------------------------------------------------
-// CHAIN_LAYOUT
-// ---------------------------------------------------------------------------
-
-/// I/O geometry for the generic chain core: `state_0` in aligned slot 0,
-/// `state_24` in slot 1, each in a 2048-bit (`region_log = 11`) window
-/// holding a 1600-bit Keccak state.
-pub const CHAIN_LAYOUT: ChainLayout = ChainLayout {
-    k_log: K_LOG,
-    k_skip: K_SKIP,
-    region_log: 11,
-    region_bits: STATE_BITS,
-    input_byte_off: STATE0_BIT_BASE / 8,   // 0
-    output_byte_off: STATE24_BIT_BASE / 8, // 256
-};
-
-/// Convert a public state (logical FIPS bit order) to the region's physical
-/// within-slot bit order. Used for the public-endpoint fold in verify_chain.
-pub fn state_to_phys_bits(x: &State) -> Vec<bool> {
-    let mut phys = vec![false; STATE_BITS];
-    for j in 0..STATE_BITS {
-        phys[within_lane_contiguous(j)] = x[j];
-    }
-    phys
-}
-
-// ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
 
@@ -993,61 +966,6 @@ impl KeccakSetup {
             &self.r1cs,
             commitment,
             proof,
-            &KeccakLincheckCircuit,
-            &self.pcs_params,
-            challenger,
-        )
-    }
-
-    /// Prove that `initial_states` form a sequential chain: for the committed
-    /// witness, `state_24` of instance `i` equals `state_0` of instance `i+1`,
-    /// with public endpoints `x_0 = state_0[0]` and `x_last = state_24[N-1]`.
-    /// **Ligerito backend.** Requires m ≥ ~21.
-    pub fn prove_chain<Ch: Challenger>(
-        &self,
-        initial_states: &[State],
-        challenger: &mut Ch,
-    ) -> (
-        crate::r1cs_hashes::chain_common::ChainProofLigerito,
-        Commitment,
-    ) {
-        assert_eq!(initial_states.len(), self.n_keccaks);
-        assert_eq!(self.n_keccaks, self.n_keccak_slots());
-        let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness(initial_states);
-        crate::r1cs_hashes::chain_common::prove_chain_ligerito_generic(
-            &self.r1cs,
-            &self.pcs_params,
-            &CHAIN_LAYOUT,
-            z_packed,
-            a_packed,
-            b_packed,
-            z_lincheck,
-            &KeccakLincheckCircuit,
-            challenger,
-        )
-    }
-
-    /// Verify a [`Self::prove_chain`] (Ligerito) proof.
-    pub fn verify_chain<Ch: Challenger>(
-        &self,
-        commitment: &Commitment,
-        proof: &crate::r1cs_hashes::chain_common::ChainProofLigerito,
-        x_0: &State,
-        x_last: &State,
-        challenger: &mut Ch,
-    ) -> Result<(), ChainVerifyError> {
-        assert_eq!(self.n_keccaks, self.n_keccak_slots());
-        let n_log = self.n_keccaks_log();
-        let x0_phys = state_to_phys_bits(x_0);
-        let xlast_phys = state_to_phys_bits(x_last);
-        crate::r1cs_hashes::chain_common::verify_chain_ligerito_generic(
-            &self.r1cs,
-            &CHAIN_LAYOUT,
-            commitment,
-            proof,
-            n_log,
-            &x0_phys,
-            &xlast_phys,
             &KeccakLincheckCircuit,
             &self.pcs_params,
             challenger,
@@ -1787,90 +1705,5 @@ mod tests {
             matches!(res, Err(flock_core::verifier::VerifyError::Lincheck(_))),
             "all-zero witness must be rejected by the constant-wire pin; got {res:?}"
         );
-    }
-
-    /// Batch-major chain: the packed-pos fold must produce IDENTICAL In/Out
-    /// vectors from the batch-major and row-major witnesses (same semantic
-    /// content, different addressing), pinning `fold_in_out`'s batch-major
-    /// word addressing.
-    #[test]
-    fn batch_major_chain_fold_matches_row_major() {
-        use crate::r1cs_hashes::chain_common::{ChainFold, fold_in_out};
-        let n_log = 3;
-        let mut rng = Rng::new(0xF01D_BA7C);
-        let inputs: Vec<State> = (0..8).map(|_| random_state(&mut rng)).collect();
-        let (z_r, _, _, _) = generate_witness_with_ab_packed_and_lincheck(&inputs, n_log);
-        let (z_b, _, _, _) = generate_witness_batch_major(&inputs, n_log);
-
-        let tau_pos: Vec<F128> = (0..CHAIN_LAYOUT.tau_pos_len())
-            .map(|i| F128 {
-                lo: rng.next_u64() ^ i as u64,
-                hi: rng.next_u64(),
-            })
-            .collect();
-        let fold = ChainFold::new(&CHAIN_LAYOUT, tau_pos);
-        let (in_r, out_r) = fold_in_out(
-            &CHAIN_LAYOUT,
-            flock_core::r1cs::WitnessLayout::RowMajor,
-            &z_r,
-            &fold,
-        );
-        let (in_b, out_b) = fold_in_out(
-            &CHAIN_LAYOUT,
-            flock_core::r1cs::WitnessLayout::BatchMajor,
-            &z_b,
-            &fold,
-        );
-        assert_eq!(in_b, in_r, "In fold diverged across layouts");
-        assert_eq!(out_b, out_r, "Out fold diverged across layouts");
-    }
-
-    /// Batch-major chain roundtrip on the Ligerito backend (K=64, m=22) —
-    /// covers the mixed open (2 ring-switched + 1 packed-direct claim) with
-    /// the batch-major point ordering. Ignored like the row-major variant.
-    #[test]
-    #[ignore]
-    fn batch_major_prove_chain_ligerito_roundtrip() {
-        use flock_core::challenger::RandomChallenger;
-        let setup = KeccakSetup::new_batch_major(64);
-        let mut rng = Rng::new(0xBA7C_11C7);
-        let x0 = random_state(&mut rng);
-        let mut inputs = Vec::with_capacity(64);
-        let mut cur = x0;
-        for _ in 0..64 {
-            inputs.push(cur);
-            keccak_f(&mut cur);
-        }
-        let x_last = cur;
-        let mut chp = RandomChallenger::new(0xCA2);
-        let (proof, comm) = setup.prove_chain(&inputs, &mut chp);
-        let mut chv = RandomChallenger::new(0xCA2);
-        setup
-            .verify_chain(&comm, &proof, &x0, &x_last, &mut chv)
-            .expect("batch-major ligerito chain must verify");
-    }
-
-    /// Chain prove → verify roundtrip (Ligerito default). K=64 → m=22.
-    #[test]
-    #[ignore]
-    fn prove_chain_roundtrip() {
-        use flock_core::challenger::RandomChallenger;
-        let setup = KeccakSetup::new(64);
-        let n_inst = setup.n_keccak_slots();
-        let mut rng = Rng::new(0xC0DE_5170);
-        let x0 = random_state(&mut rng);
-        let mut inputs = Vec::with_capacity(n_inst);
-        let mut cur = x0;
-        for _ in 0..n_inst {
-            inputs.push(cur);
-            keccak_f(&mut cur);
-        }
-        let x_last = cur;
-        let mut chp = RandomChallenger::new(0xCA1);
-        let (proof, comm) = setup.prove_chain(&inputs, &mut chp);
-        let mut chv = RandomChallenger::new(0xCA1);
-        setup
-            .verify_chain(&comm, &proof, &x0, &x_last, &mut chv)
-            .expect("chain must verify");
     }
 }

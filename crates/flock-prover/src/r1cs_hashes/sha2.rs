@@ -1399,46 +1399,44 @@ impl Sha256HybridSetup {
     }
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// Hash chain: SHA-256 geometry + thin wrappers over the generic chain core.
-// ───────────────────────────────────────────────────────────────────────────
-
-pub use super::chain_common::{ChainFold, ChainVerifyError};
-
 /// One SHA-256 compression input: `(H_in, M)` — the 8-word input chaining
 /// value plus the 16-word message block. Mirrors the [`Sha256HybridSetup`]
 /// witness-gen tuple type.
 pub type Compression = ([u32; 8], [u32; 16]);
 
-/// SHA-256's I/O-region geometry for the generic chain core. The input
-/// chaining value `H_in` sits in aligned slot 0 (byte 0), the output chaining
-/// value `H_out` in slot 1 (byte 32); each region is exactly 256 bits in a
-/// 256-bit (`region_log = 8`) slot — no interior padding. Within a slot the
-/// layout is word-contiguous (8 × 32-bit words), and since the low
-/// `K_SKIP = 6` physical bits are the φ8 z-skip block, the fold weight matches
-/// the generic `phys_weights[p] = λ[p & 63]·eq(r_rest, p >> 6)`.
-pub const CHAIN_LAYOUT: super::chain_common::ChainLayout = super::chain_common::ChainLayout {
-    k_log: K_LOG,
-    k_skip: K_SKIP,
-    region_log: 8,                   // SLOT_BITS = 2^8 = 256
-    region_bits: 256,                // 8 words × 32 bits, fills the slot exactly
-    input_byte_off: H_BASE / 8,      // 0
-    output_byte_off: H_OUT_BASE / 8, // 32
-};
+// ───────────────────────────────────────────────────────────────────────────
+// Merkle path: SHA-256 geometry + thin wrappers over the generic Merkle core.
+// ───────────────────────────────────────────────────────────────────────────
 
-/// Convert a public 256-bit chaining value (8 × u32 words, LE bit order within
-/// each word) to the region's **physical** within-slot bool layout. The region
-/// is word-contiguous: physical bit `32·w + b` holds bit `b` of word `w`.
-pub fn cv_to_phys_bits(cv: &[u32; 8]) -> Vec<bool> {
-    let mut phys = vec![false; 256];
-    for w in 0..8 {
-        for b in 0..WORD_BITS {
-            phys[WORD_BITS * w + b] = (cv[w] >> b) & 1 == 1;
-        }
-    }
-    phys
-}
+pub use super::merkle_path_common::{MerklePathProofLigerito, MerklePathVerifyError};
 
+/// SHA-256's 4-slot geometry for the Merkle-path protocol. The block starts
+/// with four 256-bit slots in order:
+/// - slot 0 (bytes 0..32)    = `H` (the IV — committed but unconstrained by
+///                              the Merkle protocol)
+/// - slot 1 (bytes 32..64)   = `H_out` (= z_i, the per-hash output) → `Z`
+/// - slot 2 (bytes 64..96)   = `M[0..8]` (left 8 words of the message) → `X_L`
+/// - slot 3 (bytes 96..128)  = `M[8..16]` (right 8 words of the message) → `X_R`
+///
+/// The slot offsets are byte-aligned (32 byte each) and contiguous because of
+/// the layout adjustment that moved `Z_CONST_POS` to the end of the witness.
+pub const MERKLE_LAYOUT: super::merkle_path_common::MerkleLayout =
+    super::merkle_path_common::MerkleLayout {
+        k_log: K_LOG,
+        k_skip: K_SKIP,
+        region_log: 8,         // 2^8 = 256-bit slots
+        region_bits: 256,      // each slot fully used (no padding within slot)
+        slot_base_byte_off: 0, // 4-slot region starts at byte 0
+        z_slot: 1,
+        x_l_slot: 2,
+        x_r_slot: 3,
+        // other_slot = 0 (the IV / H_in)
+    };
+
+/// Reference SHA-256 compression. Returns the 8-word output chaining value
+/// `H_out = H_in + state` where `state = compress256(M)` is the post-rounds
+/// register state. Public so the chain caller can build honest chains via
+/// `blocks[i+1].0 = sha256_compress(blocks[i])`.
 /// Reference SHA-256 compression. Returns the 8-word output chaining value
 /// `H_out = H_in + state` where `state = compress256(M)` is the post-rounds
 /// register state. Public so the chain caller can build honest chains via
@@ -1489,110 +1487,18 @@ pub fn sha256_compress(h_in: &[u32; 8], m: &[u32; 16]) -> [u32; 8] {
     ]
 }
 
-impl Sha256HybridSetup {
-    /// Prove that the committed compressions form a sequential chaining-value
-    /// chain: for each instance `i`, the output CV (`H_out`) equals the input
-    /// CV (`H_in`) of instance `i+1`, with public endpoints `cv_0` (first
-    /// input) and `cv_last` (last output).
-    ///
-    /// The prover is **given the full sequence** of `Compression`s (one per
-    /// instance) so trace-gen is parallel; for an honest chain the caller sets
-    /// `blocks[i+1].0 = sha256_compress(&blocks[i].0, &blocks[i].1)`.
-    pub fn prove_chain<Ch: flock_core::challenger::Challenger>(
-        &self,
-        compressions: &[Compression],
-        challenger: &mut Ch,
-    ) -> (
-        super::chain_common::ChainProofLigerito,
-        flock_core::pcs::Commitment,
-    ) {
-        assert_eq!(compressions.len(), self.n_compressions);
-        // The chain shift sumcheck enforces the relation across ALL witness
-        // slots, including padding — require an exact fit.
-        assert_eq!(
-            self.n_compressions,
-            self.n_block_slots(),
-            "prove_chain requires n_compressions to exactly fill n_block_slots \
-             (no padding); got n_compressions={}, n_block_slots={}. Use a \
-             power-of-2 ≥ 8.",
-            self.n_compressions,
-            self.n_block_slots(),
-        );
-        let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness_ab(compressions);
-        super::chain_common::prove_chain_ligerito_generic(
-            &self.r1cs,
-            &self.pcs_params,
-            &CHAIN_LAYOUT,
-            z_packed,
-            a_packed,
-            b_packed,
-            z_lincheck,
-            self.r1cs.csc_lincheck_circuit(),
-            challenger,
-        )
-    }
-
-    pub fn verify_chain<Ch: flock_core::challenger::Challenger>(
-        &self,
-        commitment: &flock_core::pcs::Commitment,
-        proof: &super::chain_common::ChainProofLigerito,
-        cv_0: &[u32; 8],
-        cv_last: &[u32; 8],
-        challenger: &mut Ch,
-    ) -> Result<(), ChainVerifyError> {
-        assert_eq!(self.n_compressions, self.n_block_slots());
-        let n_log = self.n_blocks_log();
-        let cv0_phys = cv_to_phys_bits(cv_0);
-        let cvlast_phys = cv_to_phys_bits(cv_last);
-        super::chain_common::verify_chain_ligerito_generic(
-            &self.r1cs,
-            &CHAIN_LAYOUT,
-            commitment,
-            proof,
-            n_log,
-            &cv0_phys,
-            &cvlast_phys,
-            self.r1cs.csc_lincheck_circuit(),
-            &self.pcs_params,
-            challenger,
-        )
-    }
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Merkle path: SHA-256 geometry + thin wrappers over the generic Merkle core.
-// ───────────────────────────────────────────────────────────────────────────
-
-pub use super::merkle_path_common::{MerklePathProofLigerito, MerklePathVerifyError};
-
-/// SHA-256's 4-slot geometry for the Merkle-path protocol. The block starts
-/// with four 256-bit slots in order:
-/// - slot 0 (bytes 0..32)    = `H` (the IV — committed but unconstrained by
-///                              the Merkle protocol)
-/// - slot 1 (bytes 32..64)   = `H_out` (= z_i, the per-hash output) → `Z`
-/// - slot 2 (bytes 64..96)   = `M[0..8]` (left 8 words of the message) → `X_L`
-/// - slot 3 (bytes 96..128)  = `M[8..16]` (right 8 words of the message) → `X_R`
-///
-/// The slot offsets are byte-aligned (32 byte each) and contiguous because of
-/// the layout adjustment that moved `Z_CONST_POS` to the end of the witness.
-pub const MERKLE_LAYOUT: super::merkle_path_common::MerkleLayout =
-    super::merkle_path_common::MerkleLayout {
-        k_log: K_LOG,
-        k_skip: K_SKIP,
-        region_log: 8,         // 2^8 = 256-bit slots
-        region_bits: 256,      // each slot fully used (no padding within slot)
-        slot_base_byte_off: 0, // 4-slot region starts at byte 0
-        z_slot: 1,
-        x_l_slot: 2,
-        x_r_slot: 3,
-        // other_slot = 0 (the IV / H_in)
-    };
-
 /// Convert a public 256-bit hash value (8 × u32 words, LE bit order within
-/// each word) to physical within-slot bool order. Same shape as
-/// `cv_to_phys_bits`; reused for the Merkle-path leaf and root.
+/// each word) to physical within-slot bool order — the region is
+/// word-contiguous, physical bit `32·w + b` holds bit `b` of word `w`.
+/// Used for the Merkle-path leaf and root.
 pub fn hash_to_phys_bits(h: &[u32; 8]) -> Vec<bool> {
-    cv_to_phys_bits(h)
+    let mut phys = vec![false; 256];
+    for w in 0..8 {
+        for b in 0..WORD_BITS {
+            phys[WORD_BITS * w + b] = (h[w] >> b) & 1 == 1;
+        }
+    }
+    phys
 }
 
 impl Sha256HybridSetup {
@@ -2575,64 +2481,6 @@ mod tests {
     // suite.
     // -----------------------------------------------------------------------
 
-    /// Build an honest SHA-256 chain of `n` compressions: each block's H_in
-    /// equals the previous block's H_out (= `sha256_compress` of the previous).
-    /// Returns `(blocks, cv_0, cv_last)`.
-    fn honest_chain(n: usize, seed: u64) -> (Vec<Compression>, [u32; 8], [u32; 8]) {
-        let mut rng = Rng::new(seed);
-        let mut cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
-        let cv0 = cv;
-        let mut blocks = Vec::with_capacity(n);
-        for _ in 0..n {
-            let m = rng.next_block();
-            blocks.push((cv, m));
-            cv = sha256_compress(&cv, &m);
-        }
-        (blocks, cv0, cv)
-    }
-
-    /// Ligerito-backend chain roundtrip.
-    #[test]
-    #[ignore]
-    fn prove_chain_ligerito_roundtrip() {
-        use flock_core::challenger::FsChallenger;
-        // n=128 → m=22 with K_LOG=15.
-        let setup = Sha256HybridSetup::new(128);
-        let (blocks, cv_0, cv_last) = honest_chain(setup.n_compressions, 0x511_3E_C0DE);
-        let mut ch = FsChallenger::new(b"sha2-chain-lig");
-        let (proof, commitment) = setup.prove_chain(&blocks, &mut ch);
-        let mut chv = FsChallenger::new(b"sha2-chain-lig");
-        setup
-            .verify_chain(&commitment, &proof, &cv_0, &cv_last, &mut chv)
-            .expect("ligerito chain must verify");
-
-        // Wrong public endpoints must be rejected.
-        let mut mutated_last = cv_last;
-        mutated_last[0] ^= 1;
-        let mut chv = FsChallenger::new(b"sha2-chain-lig");
-        let res = setup.verify_chain(&commitment, &proof, &cv_0, &mutated_last, &mut chv);
-        assert!(res.is_err(), "verifier must reject wrong cv_last");
-
-        let mut mutated_0 = cv_0;
-        mutated_0[7] ^= 1 << 31;
-        let mut chv = FsChallenger::new(b"sha2-chain-lig");
-        let res = setup.verify_chain(&commitment, &proof, &mutated_0, &cv_last, &mut chv);
-        assert!(res.is_err(), "verifier must reject wrong cv_0");
-    }
-
-    /// `prove_chain` must require `n_compressions == n_block_slots`.
-    #[test]
-    #[should_panic(expected = "prove_chain requires n_compressions to exactly fill n_block_slots")]
-    fn prove_chain_panics_on_padding() {
-        use flock_core::challenger::FsChallenger;
-        let setup = Sha256HybridSetup::new(5);
-        assert_eq!(setup.n_compressions, 5);
-        assert_eq!(setup.n_block_slots(), 8);
-        let (blocks, _, _) = honest_chain(setup.n_compressions, 0xDEADBEEF);
-        let mut ch = FsChallenger::new(b"sha2-chain-test");
-        let _ = setup.prove_chain(&blocks, &mut ch);
-    }
-
     // -----------------------------------------------------------------------
     // Merkle-path end-to-end tests.
     // -----------------------------------------------------------------------
@@ -2928,7 +2776,7 @@ mod tests {
             0x01234567, 0x89ABCDEF, 0xDEADBEEF, 0xFEEDC0DE, 0xCAFEBABE, 0x12345678, 0x9ABCDEF0,
             0x0F1E2D3C,
         ];
-        let phys = cv_to_phys_bits(&cv);
+        let phys = hash_to_phys_bits(&cv);
         assert_eq!(phys.len(), 256);
         for w in 0..8 {
             let mut recovered = 0u32;

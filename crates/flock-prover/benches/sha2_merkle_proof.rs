@@ -7,11 +7,9 @@
 //! Builds an honest length-K SHA-256 Merkle path (block i ≥ 1 hashes
 //! (z_{i-1}, sibling_i) or (sibling_i, z_{i-1}) under the public bit b_i),
 //! and times three paths back-to-back:
-//!   - prove_fast       : base (no chain, no Merkle column-lincheck)
-//!   - prove_chain      : straight-line chain (z_i = h(M_i) consistency)
+//!   - prove_fast       : base (no Merkle column-lincheck)
 //!   - prove_merkle_path: Merkle-path column-lincheck (per-row bit selector)
-//! Reports both the chain overhead and the Merkle overhead over `prove_fast`,
-//! and the Merkle-vs-chain delta. K_LOG=15 → m=29 at 16,384 blocks.
+//! Reports the Merkle overhead over `prove_fast`. K_LOG=15 → m=29 at 16,384 blocks.
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -93,10 +91,6 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
         let (p, _, _) = setup.prove_fast(&blocks, &mut ch);
         black_box(&p);
         let mut ch = FsChallenger::new(b"flock-merkle-bench-v0");
-        let (proof, comm) = setup.prove_chain(&blocks, &mut ch);
-        black_box(&proof);
-        black_box(&comm);
-        let mut ch = FsChallenger::new(b"flock-merkle-bench-v0");
         let (proof, comm) = setup.prove_merkle_path_ligerito(&blocks, &b, &mut ch);
         black_box(&proof);
         black_box(&comm);
@@ -110,17 +104,6 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
         let (p, _, _) = setup.prove_fast(&blocks, &mut ch);
         best_base = best_base.min(t.elapsed().as_secs_f64());
         black_box(&p);
-    }
-
-    // Best-of-n_runs prove_chain.
-    let mut best_chain = f64::INFINITY;
-    for _ in 0..n_runs {
-        let mut ch = FsChallenger::new(b"flock-merkle-bench-v0");
-        let t = Instant::now();
-        let (proof, comm) = setup.prove_chain(&blocks, &mut ch);
-        best_chain = best_chain.min(t.elapsed().as_secs_f64());
-        black_box(&proof);
-        black_box(&comm);
     }
 
     // Best-of-n_runs prove_merkle_path.
@@ -151,30 +134,17 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
     black_box(&single_proof);
     black_box(&single_comm);
 
-    let chain_over = best_chain - best_base;
     let merkle_over = best_merkle - best_base;
-    let mvc = best_merkle - best_chain;
     println!(
         "  prove_fast        :  {}  ({:.0} comp/sec)",
         fmt_ms(best_base),
         n_blocks as f64 / best_base
     );
     println!(
-        "  prove_chain       :  {}  ({:.0} comp/sec)  [+{:.1}% over base]",
-        fmt_ms(best_chain),
-        n_blocks as f64 / best_chain,
-        100.0 * chain_over / best_base
-    );
-    println!(
         "  prove_merkle_path :  {}  ({:.0} comp/sec)  [+{:.1}% over base]",
         fmt_ms(best_merkle),
         n_blocks as f64 / best_merkle,
         100.0 * merkle_over / best_base
-    );
-    println!(
-        "  Δ(merkle - chain) :  {}  ({:+.1}% of base)",
-        fmt_ms(mvc),
-        100.0 * mvc / best_base
     );
     println!("  verify_merkle_path:  {}", fmt_ms(best_verify_single));
 
@@ -257,12 +227,11 @@ fn main() {
     println!("(target: aarch64 + aes)");
     println!(
         "SHA-256 Merkle-path proof generation benchmark \
-         (prove_merkle_path vs prove_chain vs prove_fast)."
+         (prove_merkle_path vs prove_fast)."
     );
     println!("(honest path, warm-up + best-of-n_runs timing)");
 
-    // Same m grid as the chain bench. n_compressions must be a power of 2 ≥ 8
-    // (Merkle path uses the same no-padding constraint as the chain).
+    // n_compressions must be a power of 2 ≥ 8 (the Merkle path forbids padding).
     for &(n, n_runs) in &[(8usize, 3), (64, 2), (4096, 2), (16384, 2), (32768, 2)] {
         bench_one(n, n_runs);
     }

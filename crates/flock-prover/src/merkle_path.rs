@@ -248,12 +248,34 @@ fn slot_indicator(target_slot: u8, ss: F128, sd: F128) -> F128 {
 }
 
 // ---------------------------------------------------------------------------
-// Shift MLE (re-exported from chain)
+// Shift MLE — the successor-relation MLE `shift(a, b)`: for boolean `y`,
+// `shift(τ, y) = eq(τ, y − 1)`. Inlined from the retired hash-chain shift
+// argument (`chain.rs`, deleted 2026-08-14); the Merkle-path protocol is
+// its only remaining consumer.
 // ---------------------------------------------------------------------------
 
-#[inline]
 fn shift_mle(a: &[F128], b: &[F128]) -> F128 {
-    crate::chain::shift_mle(a, b)
+    let n = a.len();
+    assert_eq!(b.len(), n, "shift_mle: arity mismatch");
+
+    // pre[j] = Π_{l<j} a_l·(1 + b_l)
+    let mut pre = vec![F128::ONE; n + 1];
+    for j in 0..n {
+        pre[j + 1] = pre[j] * (a[j] * (F128::ONE + b[j]));
+    }
+    // eqsuf[j] = Π_{l=j}^{n-1} eq(a_l, b_l)
+    let mut eqsuf = vec![F128::ONE; n + 1];
+    for j in (0..n).rev() {
+        let eq_l = F128::ONE + a[j] + b[j];
+        eqsuf[j] = eqsuf[j + 1] * eq_l;
+    }
+
+    let mut acc = F128::ZERO;
+    for j in 0..n {
+        let mid = (F128::ONE + a[j]) * b[j]; // bit j flips 0 → 1
+        acc += pre[j] * mid * eqsuf[j + 1]; // eqsuf[j+1] = Π_{l>j} eq
+    }
+    acc
 }
 
 // ---------------------------------------------------------------------------

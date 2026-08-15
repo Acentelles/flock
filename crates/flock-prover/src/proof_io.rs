@@ -173,7 +173,9 @@ impl HashKind {
 /// [`peek_flavor`]). Values 0/1 are reserved: they were the legacy BaseFold
 /// R1cs/Chain flavors.
 const FLAVOR_R1CS_LIGERITO: u8 = 2;
-const FLAVOR_CHAIN_LIGERITO: u8 = 3;
+// Flavor byte 3 was the hash-chain (shift-argument) bundle — the product was
+// retired 2026-08-14 with `chain.rs`/`chain_common.rs`; the byte stays
+// reserved and now parses as UnknownFlavor.
 const FLAVOR_MIXED_LIGERITO: u8 = 4;
 
 /// What kind of bundle a byte buffer holds. Returned by [`peek_flavor`] so
@@ -200,7 +202,6 @@ pub fn peek_flavor(bytes: &[u8]) -> Result<BundleFlavor, DeserializeError> {
     }
     match bytes[6] {
         FLAVOR_R1CS_LIGERITO => Ok(BundleFlavor::R1cs),
-        FLAVOR_CHAIN_LIGERITO => Ok(BundleFlavor::Chain),
         FLAVOR_MIXED_LIGERITO => Ok(BundleFlavor::Mixed),
         other => Err(DeserializeError::UnknownFlavor(other)),
     }
@@ -269,20 +270,6 @@ pub struct R1csProofBundleLigerito {
     pub proof: flock_core::proof::R1csProofLigerito,
 }
 
-/// Bundles a hash-chain proof with its commitment + public endpoint bits
-/// (`cv_0_phys` and `cv_last_phys` are the physical within-slot bool layouts
-/// returned by per-hash `*_to_phys_bits` helpers — `region_bits` long each)
-/// plus the [`HashKind`] discriminator so a verifier can pick the right
-/// per-hash setup from the bundle alone.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ChainProofBundleLigerito {
-    pub hash_kind: HashKind,
-    pub commitment: Commitment,
-    pub proof: crate::r1cs_hashes::chain_common::ChainProofLigerito,
-    pub cv_0_phys: Vec<bool>,
-    pub cv_last_phys: Vec<bool>,
-}
-
 impl R1csProofBundleLigerito {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER_LEN + 1024);
@@ -292,20 +279,6 @@ impl R1csProofBundleLigerito {
     }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DeserializeError> {
         let payload = parse_header(bytes, FLAVOR_R1CS_LIGERITO)?;
-        deserialize_payload(payload)
-    }
-}
-
-impl ChainProofBundleLigerito {
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(HEADER_LEN + 1024);
-        write_header(&mut out, FLAVOR_CHAIN_LIGERITO);
-        bincode::serialize_into(&mut out, self)
-            .expect("bincode serialize ChainProofBundleLigerito");
-        out
-    }
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DeserializeError> {
-        let payload = parse_header(bytes, FLAVOR_CHAIN_LIGERITO)?;
         deserialize_payload(payload)
     }
 }
@@ -383,10 +356,7 @@ fn parse_header(bytes: &[u8], expected_flavor: u8) -> Result<&[u8], DeserializeE
         return Err(DeserializeError::UnsupportedVersion(v));
     }
     let flavor = bytes[6];
-    if flavor != FLAVOR_R1CS_LIGERITO
-        && flavor != FLAVOR_CHAIN_LIGERITO
-        && flavor != FLAVOR_MIXED_LIGERITO
-    {
+    if flavor != FLAVOR_R1CS_LIGERITO && flavor != FLAVOR_MIXED_LIGERITO {
         return Err(DeserializeError::UnknownFlavor(flavor));
     }
     if flavor != expected_flavor {
@@ -466,22 +436,6 @@ pub fn read_bytes_from_file<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Write a Ligerito chain bundle to `path`.
-pub fn write_chain_bundle_ligerito_to_file<P: AsRef<Path>>(
-    path: P,
-    bundle: &ChainProofBundleLigerito,
-) -> io::Result<()> {
-    write_bytes_to_file(path, &bundle.to_bytes())
-}
-
-/// Read a Ligerito chain bundle from `path`.
-pub fn read_chain_bundle_ligerito_from_file<P: AsRef<Path>>(
-    path: P,
-) -> Result<ChainProofBundleLigerito, BundleReadError> {
-    let bytes = read_bytes_from_file(path).map_err(BundleReadError::Io)?;
-    ChainProofBundleLigerito::from_bytes(&bytes).map_err(BundleReadError::Deserialize)
-}
-
 /// Combined error returned by file-read helpers: either IO failed or the
 /// bytes weren't a valid bundle.
 #[derive(Debug)]
@@ -508,7 +462,7 @@ impl std::error::Error for BundleReadError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::r1cs_hashes::blake3::{Blake3Setup, Compression, blake3_compress, cv_to_phys_bits};
+    use crate::r1cs_hashes::blake3::{Blake3Setup, Compression, blake3_compress};
     use flock_core::challenger::FsChallenger;
 
     /// SplitMix64.
@@ -603,41 +557,6 @@ mod tests {
             bytes.len(),
             bytes.len() as f64 / 1024.0
         );
-    }
-
-    /// Ligerito chain bundle roundtrip. Requires m ≥ 21 — n=256 blocks.
-    #[test]
-    #[ignore] // Heavier — run with `cargo test chain_bundle_roundtrip -- --ignored --nocapture`
-    fn chain_bundle_roundtrip_and_verify() {
-        let setup = Blake3Setup::new(256);
-        let (blocks, cv_0, cv_last) = honest_chain(256, 0xC0FFEE);
-        let mut ch = FsChallenger::new(b"flock-proofio-test");
-        let (proof, commitment) = setup.prove_chain(&blocks, &mut ch);
-
-        let bundle = ChainProofBundleLigerito {
-            hash_kind: HashKind::Blake3,
-            commitment: commitment.clone(),
-            proof: proof.clone(),
-            cv_0_phys: cv_to_phys_bits(&cv_0),
-            cv_last_phys: cv_to_phys_bits(&cv_last),
-        };
-        let bytes = bundle.to_bytes();
-        assert_eq!(bytes[6], FLAVOR_CHAIN_LIGERITO);
-
-        let bundle2 = ChainProofBundleLigerito::from_bytes(&bytes).expect("chain round-trip");
-        assert_eq!(bundle2.cv_0_phys, bundle.cv_0_phys);
-        assert_eq!(bundle2.cv_last_phys, bundle.cv_last_phys);
-
-        let mut chv = FsChallenger::new(b"flock-proofio-test");
-        setup
-            .verify_chain(
-                &bundle2.commitment,
-                &bundle2.proof,
-                &cv_0,
-                &cv_last,
-                &mut chv,
-            )
-            .expect("verify round-tripped chain proof");
     }
 
     /// Mixed bundle (current wire version, merged transport) end-to-end:
@@ -792,20 +711,19 @@ mod tests {
         bytes[5] = VERSION;
         for (flavor, expect) in [
             (FLAVOR_R1CS_LIGERITO, BundleFlavor::R1cs),
-            (FLAVOR_CHAIN_LIGERITO, BundleFlavor::Chain),
             (FLAVOR_MIXED_LIGERITO, BundleFlavor::Mixed),
         ] {
             bytes[6] = flavor;
             assert!(matches!(peek_flavor(&bytes), Ok(f) if f == expect));
         }
 
-        // Chain-flavored header read as Mixed: flavor mismatch.
-        bytes[6] = FLAVOR_CHAIN_LIGERITO;
+        // R1cs-flavored header read as Mixed: flavor mismatch.
+        bytes[6] = FLAVOR_R1CS_LIGERITO;
         assert!(matches!(
             MixedProofBundleLigerito::from_bytes(&bytes),
             Err(DeserializeError::FlavorMismatch {
                 expected: FLAVOR_MIXED_LIGERITO,
-                found: FLAVOR_CHAIN_LIGERITO
+                found: FLAVOR_R1CS_LIGERITO
             })
         ));
 
@@ -844,18 +762,18 @@ mod tests {
 
     #[test]
     fn rejects_flavor_mismatch() {
-        // R1CS-flavored header — try to read as Chain. Header validation
+        // Mixed-flavored header — try to read as R1cs. Header validation
         // fails before any payload deserialization, so zero payload is fine.
         let mut bytes = vec![0u8; HEADER_LEN + 10];
         bytes[0..5].copy_from_slice(&MAGIC);
         bytes[5] = VERSION;
-        bytes[6] = FLAVOR_R1CS_LIGERITO;
-        let res = ChainProofBundleLigerito::from_bytes(&bytes);
+        bytes[6] = FLAVOR_MIXED_LIGERITO;
+        let res = R1csProofBundleLigerito::from_bytes(&bytes);
         assert!(matches!(
             res,
             Err(DeserializeError::FlavorMismatch {
-                expected: FLAVOR_CHAIN_LIGERITO,
-                found: FLAVOR_R1CS_LIGERITO
+                expected: FLAVOR_R1CS_LIGERITO,
+                found: FLAVOR_MIXED_LIGERITO
             })
         ));
     }

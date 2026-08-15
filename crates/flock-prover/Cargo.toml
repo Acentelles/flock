@@ -208,10 +208,6 @@ harness = false
 name = "keccak3_witlc_probe"
 harness = false
 
-[[example]]
-name = "chain_bench"
-required-features = ["unsound-challenger"]
-
 [[bench]]
 name = "permutation"
 harness = false
