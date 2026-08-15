@@ -123,43 +123,11 @@ name = "blake3_native_chain"
 harness = false
 
 [[bench]]
-name = "padded_vs_dense"
-harness = false
-
-[[bench]]
 name = "genwitness_phase"
 harness = false
 
 [[bench]]
-name = "gamma_bake_probe"
-harness = false
-
-[[bench]]
-name = "streaming_fusion_probe"
-harness = false
-
-[[bench]]
 name = "profile_prover"
-harness = false
-
-[[bench]]
-name = "urm_probe"
-harness = false
-
-[[bench]]
-name = "ntt_butterfly_probe"
-harness = false
-
-[[bench]]
-name = "ntt_layout_probe"
-harness = false
-
-[[bench]]
-name = "merkle_probe"
-harness = false
-
-[[bench]]
-name = "eq_build_probe"
 harness = false
 
 [[bench]]
@@ -175,18 +143,6 @@ name = "hash_throughput"
 harness = false
 
 [[bench]]
-name = "ecore_offload_probe"
-harness = false
-
-[[bench]]
-name = "apply_block_diag_probe"
-harness = false
-
-[[bench]]
-name = "stability_probe"
-harness = false
-
-[[bench]]
 name = "verifier_hash_count"
 harness = false
 required-features = ["hash-count"]
@@ -195,14 +151,6 @@ required-features = ["hash-count"]
 name = "verifier_mul_count"
 harness = false
 required-features = ["mul-count"]
-
-[[bench]]
-name = "witness_lincheck_probe"
-harness = false
-
-[[bench]]
-name = "keccak3_witlc_probe"
-harness = false
 
 [[bench]]
 name = "permutation"
@@ -222,10 +170,6 @@ harness = false
 
 [lints]
 workspace = true
-
-[[bench]]
-name = "blake3_node_probe"
-harness = false
 
 [[bench]]
 name = "fs_challenger"
