@@ -1700,7 +1700,12 @@ fn mixed_m30_throughput() {
     let _quiet = timing_lock();
     use std::time::Instant;
 
-    const ITERS: usize = 2; // timed runs after one warm-up; best reported
+    // Timed runs after one warm-up; best reported. `MIXED_ITERS` overrides
+    // (phase-median A/Bs want 5+).
+    let iters: usize = std::env::var("MIXED_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
     // M = nu + 16; full utilization = 2^nu invocations per type. Default
     // nu 14 (M = 30); `MIXED_NU=16` benches the M = 32 point.
     let nu: usize = std::env::var("MIXED_NU")
@@ -1731,7 +1736,7 @@ fn mixed_m30_throughput() {
                 prover::prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
         }
         let mut best = f64::INFINITY;
-        for _ in 0..ITERS {
+        for _ in 0..iters {
             let mut ch = FsChallenger::new(DOMAIN);
             let t = Instant::now();
             let slot = UnionSlotProverInput::new(
@@ -1763,7 +1768,7 @@ fn mixed_m30_throughput() {
                 prover::prove_fast_ligerito_union(&union, &setup.pcs_params, vec![slot], &mut ch);
         }
         let mut best = f64::INFINITY;
-        for _ in 0..ITERS {
+        for _ in 0..iters {
             let mut ch = FsChallenger::new(DOMAIN);
             let t = Instant::now();
             let slot = UnionSlotProverInput::new(
@@ -1810,7 +1815,7 @@ fn mixed_m30_throughput() {
     }
     let mut mixed_ms = f64::INFINITY;
     let mut mixed_out = None;
-    for _ in 0..ITERS {
+    for _ in 0..iters {
         let slots = vec![
             UnionSlotProverInput::new(
                 sha2::generate_witness_batch_major(&sha2_inputs, nu),
@@ -1853,7 +1858,7 @@ fn mixed_m30_throughput() {
     let combined_hps = (2 * n_per_type) as f64 / mixed_s;
     println!(
         "mixed m=30 throughput, {n_per_type} invocations per type (full util), \
-         best-of-{ITERS} (prove incl. witgen):"
+         best-of-{iters} (prove incl. witgen):"
     );
     println!("  blake3-only jagged (m = {b3_m}): {b3_ms:.0} ms");
     println!("  sha2-only jagged   (m = {s2_m}): {s2_ms:.0} ms");
@@ -1912,7 +1917,12 @@ fn two_blake3_tables_vs_direct() {
     let _quiet = timing_lock();
     use std::time::Instant;
 
-    const ITERS: usize = 2; // timed runs after one warm-up; best reported
+    // Timed runs after one warm-up; best reported. `MIXED_ITERS` overrides
+    // (phase-median A/Bs want 5+).
+    let iters: usize = std::env::var("MIXED_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
     let n_total = 1usize << 16; // 2N = 65536 total BLAKE3 compressions
 
     // Shared inputs: 65536 BLAKE3 compressions. The two-table row proves the
@@ -1945,7 +1955,7 @@ fn two_blake3_tables_vs_direct() {
         }
         let mut best = f64::INFINITY;
         let mut out = None;
-        for _ in 0..ITERS {
+        for _ in 0..iters {
             let mut ch = FsChallenger::new(DOMAIN);
             let t = Instant::now();
             let (z, a, b, stripe) =
@@ -2023,7 +2033,7 @@ fn two_blake3_tables_vs_direct() {
         }
         let mut best = f64::INFINITY;
         let mut out = None;
-        for _ in 0..ITERS {
+        for _ in 0..iters {
             let slots = vec![
                 UnionSlotProverInput::new(blake3::generate_witness_batch_major(lo, nu), circuit),
                 UnionSlotProverInput::new(blake3::generate_witness_batch_major(hi, nu), circuit),
@@ -2070,7 +2080,7 @@ fn two_blake3_tables_vs_direct() {
         }
         let mut best = f64::INFINITY;
         let mut out = None;
-        for _ in 0..ITERS {
+        for _ in 0..iters {
             let slots = vec![UnionSlotProverInput::new(
                 blake3::generate_witness_batch_major(&blake3_inputs, nu),
                 circuit,
@@ -2096,7 +2106,7 @@ fn two_blake3_tables_vs_direct() {
     let committed_all_equal = direct_committed == u2_committed && u2_committed == u1_committed;
     println!(
         "\ntwo-blake3-table control: 2N = {n_total} total invocations, \
-         best-of-{ITERS} (prove incl. witgen)\n"
+         best-of-{iters} (prove incl. witgen)\n"
     );
     println!(
         "  {:<40} {:>10} {:>12} {:>11} {:>16}",
