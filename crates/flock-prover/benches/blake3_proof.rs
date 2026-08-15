@@ -96,10 +96,18 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
     );
 
     // BLAKE3_BATCH_MAJOR=1 switches the witness layout (WitnessLayout::BatchMajor).
-    let mut setup = if std::env::var_os("BLAKE3_BATCH_MAJOR").is_some() {
-        Blake3Setup::new_batch_major(n_blocks)
-    } else {
-        Blake3Setup::new(n_blocks)
+    // BLAKE3_PROFILE=fast|slim|secure selects the Ligerito profile (default fast).
+    let mut setup = match std::env::var("BLAKE3_PROFILE").as_deref() {
+        Ok("slim") => Blake3Setup::with_profile(
+            n_blocks,
+            flock_prover::pcs::ligerito::LigeritoProfile::Slim,
+        ),
+        Ok("secure") => Blake3Setup::with_profile(
+            n_blocks,
+            flock_prover::pcs::ligerito::LigeritoProfile::Secure,
+        ),
+        Ok("fast") | Err(_) => Blake3Setup::new(n_blocks),
+        Ok(p) => panic!("BLAKE3_PROFILE must be fast, slim, or secure (got {p})"),
     };
     // FLOCK_MERKLE_HASH=sha256|blake3 selects the PCS Merkle hash (default
     // sha256). Setting it on `pcs_params` is enough: the Ligerito prover and
