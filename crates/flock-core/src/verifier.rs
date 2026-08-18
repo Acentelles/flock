@@ -465,6 +465,121 @@ pub fn verify_ligerito_union_circuit_deferred<Ch: Challenger>(
     ))
 }
 
+/// [`verify_ligerito_union_circuit`] with the **AG-skip** boolean zerocheck —
+/// the mirror of `flock_prover::prover::prove_fast_ligerito_union_circuit_ag`.
+/// Same replay; only the boolean zerocheck's round 1 differs.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_ligerito_union_circuit_ag<Ch: Challenger>(
+    union: &crate::union::UnionInstance<'_>,
+    circuit: &crate::circuit::Circuit,
+    public: &[F128],
+    circuits: &[&dyn lincheck::LincheckCircuit],
+    commitment: &Commitment,
+    proof: &crate::proof::R1csProofCircuitMergedAg,
+    pcs_params: &crate::pcs::PcsParams,
+    challenger: &mut Ch,
+) -> Result<crate::proof::UnionClassClaims, VerifyError> {
+    if !circuit.check_instance(union) || !circuit.check_public(public) {
+        return Err(VerifyError::CircuitMismatch);
+    }
+    if proof.boolean.is_some() != (union.num_boolean() > 0)
+        || proof.element.is_some() != union.has_element()
+    {
+        return Err(VerifyError::ClassMismatch);
+    }
+    let (claims, packed_direct_points, matrix, el_matrix, _sigma) = verify_union_piops(
+        union,
+        UnionVerifyBinding::Circuit { circuit, public },
+        circuits,
+        commitment,
+        proof.boolean.as_ref().map(BooleanPiopRef::Ag),
+        proof.element.as_ref(),
+        Some(&proof.wiring),
+        false,
+        pcs_params,
+        challenger,
+    )?;
+    if let Some(a) = matrix {
+        a.check(union, circuits).map_err(VerifyError::Lincheck)?;
+    }
+    if let Some(a) = el_matrix {
+        a.check_reported(union).map_err(VerifyError::Element)?;
+    }
+    verify_merged_opening(
+        union,
+        commitment,
+        &claims,
+        &packed_direct_points,
+        &proof.pcs_open,
+        pcs_params,
+        challenger,
+        None,
+    )
+}
+
+/// [`verify_ligerito_union_circuit_deferred`] with the **AG-skip** boolean
+/// zerocheck — the succinct entry the recursion tower records and replays for
+/// AG-flavored children. Same conditional-claims contract as the RS twin.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_ligerito_union_circuit_ag_deferred<Ch: Challenger>(
+    union: &crate::union::UnionInstance<'_>,
+    circuit: &crate::circuit::Circuit,
+    public: &[F128],
+    circuits: &[&dyn lincheck::LincheckCircuit],
+    commitment: &Commitment,
+    proof: &crate::proof::R1csProofCircuitMergedAg,
+    pcs_params: &crate::pcs::PcsParams,
+    challenger: &mut Ch,
+) -> Result<
+    (
+        crate::proof::UnionClassClaims,
+        DeferredMatrixWork,
+        crate::circuit::SigmaAssertion,
+    ),
+    VerifyError,
+> {
+    if !circuit.check_instance(union) || !circuit.check_public(public) {
+        return Err(VerifyError::CircuitMismatch);
+    }
+    if proof.boolean.is_some() != (union.num_boolean() > 0)
+        || proof.element.is_some() != union.has_element()
+    {
+        return Err(VerifyError::ClassMismatch);
+    }
+    let (claims, packed_direct_points, matrix, el_matrix, sigma) = verify_union_piops(
+        union,
+        UnionVerifyBinding::Circuit { circuit, public },
+        circuits,
+        commitment,
+        proof.boolean.as_ref().map(BooleanPiopRef::Ag),
+        proof.element.as_ref(),
+        Some(&proof.wiring),
+        true,
+        pcs_params,
+        challenger,
+    )?;
+    let mut jagged = None;
+    let claims = verify_merged_opening(
+        union,
+        commitment,
+        &claims,
+        &packed_direct_points,
+        &proof.pcs_open,
+        pcs_params,
+        challenger,
+        Some(&mut jagged),
+    )?;
+    Ok((
+        claims,
+        DeferredMatrixWork {
+            boolean: matrix,
+            element: el_matrix,
+            jagged: jagged.expect("the deferred opening fills the export"),
+        },
+        sigma.expect("a circuit binding always verifies wiring"),
+    ))
+}
+
 /// The merged transport's verification, shared by the mixed-class and circuit
 /// entries: the boolean pair ring-switched, everything else packed-direct.
 fn verify_merged_opening<Ch: Challenger>(

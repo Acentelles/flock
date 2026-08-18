@@ -571,8 +571,12 @@ rejection sampling from a transcript seed, with a nonce in the proof
 strict schedule the nonce is FUSED: `H(seed || nonce)` must clear the
 explicit PoW target AND decode to a valid point — both criteria on the same
 hash, so every candidate an adversary evaluates re-enters the PoW and there
-is no free choice among valid nonces. The verifier is one attempt
-(constant-shape, no rejection replay).
+is no free choice among valid nonces. The PoW predicate is the transcript
+convention: leading zero bits, MSB-first within each serialized byte, of the
+hash's second 16-byte word — the same predicate word and bit order the
+recursion circuit's `PowMaskTable` checks, so the in-circuit form is a
+gadget reuse. The verifier is one attempt (constant-shape, no rejection
+replay).
 
 The rejection sampling itself contributes exactly `log2(32) = 5` bits, by
 two facts, neither empirical:

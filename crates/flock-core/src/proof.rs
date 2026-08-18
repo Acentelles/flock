@@ -112,6 +112,20 @@ pub struct R1csProofMergedLigeritoAg {
     pub pcs_open: pcs::MergedOpenProof,
 }
 
+/// [`R1csProofCircuitMerged`] with the **AG-skip** boolean zerocheck — the
+/// circuit proof, AG flavor. The element class and the wiring argument are
+/// flavor-independent; only the boolean zerocheck's round 1 differs (and the
+/// boolean claim points ride [`lincheck::SkipPoint::Ag`]). MIGRATION shape:
+/// when the RS skip is removed this struct is renamed to primary and
+/// [`R1csProofCircuitMerged`] is deleted (docs/ag-recursion-plan.md).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct R1csProofCircuitMergedAg {
+    pub boolean: Option<BooleanPiopProofAg>,
+    pub element: Option<crate::element_r1cs::union::Proof>,
+    pub wiring: crate::circuit::WiringProof,
+    pub pcs_open: pcs::MergedOpenProof,
+}
+
 /// The claims a verified mixed-class union proof leaves behind, per class.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnionClassClaims {

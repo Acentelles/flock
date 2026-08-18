@@ -636,6 +636,81 @@ enum BooleanZcKind {
     Ag,
 }
 
+/// [`prove_fast_ligerito_union_circuit`] with the **AG-skip** boolean
+/// zerocheck — verify with
+/// [`flock_core::verifier::verify_ligerito_union_circuit_ag`] (or the
+/// `_deferred` twin). Same class PIOP order, wiring argument, and merged
+/// opening; only the boolean zerocheck's round 1 differs. The element class
+/// may be present (its PIOP is flavor-independent); the AG flavor forces the
+/// honest-zero witness mode inside the shared body. aarch64-only (the AG
+/// round-1 kernel is NEON).
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+pub fn prove_fast_ligerito_union_circuit_ag<Ch: Challenger>(
+    union: &flock_core::union::UnionInstance<'_>,
+    circuit: &flock_core::circuit::Circuit,
+    public: &[F128],
+    pcs_params: &PcsParams,
+    slots: Vec<UnionSlotProverInput<'_>>,
+    element_slots: Vec<UnionElementSlotInput<'_>>,
+    challenger: &mut Ch,
+) -> (
+    flock_core::proof::R1csProofCircuitMergedAg,
+    Commitment,
+    flock_core::proof::UnionClassClaims,
+) {
+    assert!(
+        circuit.check_instance(union),
+        "the circuit and the union instance must be the same statement \
+         (same registry, and the circuit's gate counts ARE the union's counts)"
+    );
+    assert!(
+        circuit.check_public(public),
+        "the public segment must have the circuit's declared length and fixed constants"
+    );
+    let (out, commitment) = prove_union_with_binding_zc(
+        union,
+        UnionProveBinding::Circuit(CircuitProverInput { circuit, public }),
+        BooleanZcKind::Ag,
+        pcs_params,
+        slots,
+        element_slots,
+        challenger,
+    );
+    let UnionProveOutput {
+        boolean,
+        element,
+        wiring,
+        pcs_open,
+    } = out;
+    let (bool_proof, bool_claim) = match boolean {
+        Some((p, c)) => {
+            let UnionBooleanProof::Ag(p) = p else {
+                unreachable!("the Ag flavor produces an Ag boolean proof")
+            };
+            (Some(p), Some(c))
+        }
+        None => (None, None),
+    };
+    let (el_proof, el_claim) = match element {
+        Some((p, c)) => (Some(p), Some(c)),
+        None => (None, None),
+    };
+    (
+        flock_core::proof::R1csProofCircuitMergedAg {
+            boolean: bool_proof,
+            element: el_proof,
+            wiring: wiring.expect("the circuit binding runs the wiring argument"),
+            pcs_open,
+        },
+        commitment,
+        flock_core::proof::UnionClassClaims {
+            boolean: bool_claim,
+            element: el_claim,
+        },
+    )
+}
+
 /// The zerocheck transcript alone, before the lincheck joins it in the
 /// closure's assembly step.
 enum UnionZcProof {

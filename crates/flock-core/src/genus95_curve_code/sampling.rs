@@ -70,8 +70,11 @@ pub fn evaluation_point_from_nonce(
 
 /// [`evaluation_point_from_nonce`] with a FUSED proof-of-work criterion: the
 /// nonce is valid only when its DRBG seed `H(seed ‖ LE32(nonce))` ALSO clears
-/// the PoW target (low `pow_bits` bits of the seed's first 8 bytes, read LE,
-/// all zero) — both criteria on the same hash, so a prover iterating nonces
+/// the PoW target — at least `pow_bits` leading zero bits of the seed's
+/// SECOND 16-byte word (bytes 16..32, MSB-first within each byte: the same
+/// predicate word and bit convention as the transcript PoW and the recursion
+/// circuit's `PowMaskTable`, so the eventual in-circuit check is a gadget
+/// reuse) — both criteria on the same hash, so a prover iterating nonces
 /// pays the PoW lottery on every sampling attempt and vice versa.
 ///
 /// Success per nonce is exactly `p · 2^-pow_bits`, where `p` is the sampler's
@@ -92,10 +95,9 @@ pub fn evaluation_point_from_nonce_pow(
     kind: crate::hash::HashKind,
     pow_bits: u32,
 ) -> Option<EvaluationPoint> {
-    debug_assert!(pow_bits < 64);
+    debug_assert!(pow_bits <= 64);
     let ns = nonce_seed(seed, nonce, kind);
-    let word = u64::from_le_bytes(ns[0..8].try_into().expect("8 bytes"));
-    if word & ((1u64 << pow_bits) - 1) != 0 {
+    if !crate::challenger::has_leading_zero_bits(&ns[16..32], pow_bits) {
         return None;
     }
     try_evaluation_point(&mut super::rng::FsRng::new(kind, ns))
