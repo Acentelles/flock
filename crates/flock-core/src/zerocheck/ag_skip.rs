@@ -869,14 +869,24 @@ pub const R1_ZERO_BOUND: usize = 474;
 /// empirical acceptance estimate; guarded by `credit_constants_are_pinned`.
 pub const AG_SAMPLING_CREDIT_BITS: u32 = 5;
 
-/// Explicit PoW bits on the FUSED r₁ nonce under a strict grinding schedule:
-/// `bits_for(R1_ZERO_BOUND) − AG_SAMPLING_CREDIT_BITS = 9 − 5 = 4`.
-pub const R1_POW_BITS: u32 = 4;
+/// Explicit PoW bits on the FUSED r₁ nonce under a strict grinding
+/// schedule: ALL of `bits_for(R1_ZERO_BOUND) = 9` — the sampler's
+/// [`AG_SAMPLING_CREDIT_BITS`] = 5 no longer discount r₁'s explicit bits.
+/// WHY (phase D, docs/ag-recursion-plan.md): the recursion circuit binds
+/// the r₁ decode with RELAXED canonicity — it enforces `x` from the
+/// nonce-seed's XOF and fiber membership for `(y, z₁..z₃)`, but not WHICH
+/// fiber point (the ≤ 32-point fiber = exactly the sampler's 5 flattening
+/// bits). A circuit-side prover may therefore choose among the fiber
+/// points, so those 5 bits are repaid explicitly; the total stays
+/// `bits_for(474)`, the split moves. The sampler's credit still stands
+/// where the decode is canonical end-to-end (the lincheck fresh skip).
+pub const R1_POW_BITS: u32 = 9;
 
 /// Prover-side scan budget for the fused r₁ nonce: success per nonce is
-/// `2^-R1_POW_BITS / 32 = 2^-9`, so exhausting `2^20` nonces has probability
-/// `(1 − 2^-9)^(2^20) ≈ 2^-2954` — a completeness error we accept (panic).
-pub const R1_FUSED_ATTEMPT_BUDGET: u32 = 1 << 20;
+/// `2^-R1_POW_BITS / 32 = 2^-14`, so exhausting `2^24` nonces has
+/// probability `(1 − 2^-14)^(2^24) ≈ 2^-1477` — a completeness error we
+/// accept (panic). Fits the 4-byte nonce encoding with room.
+pub const R1_FUSED_ATTEMPT_BUDGET: u32 = 1 << 24;
 
 /// rejection sampling exhausts its attempt budget. Baked from one offline sample.
 ///
@@ -973,9 +983,12 @@ pub(super) fn sample_r1_prover<C: Challenger>(challenger: &mut C) -> (Evaluation
 /// (or an attacker) evaluates re-enters the PoW, so there is no free choice
 /// among valid nonces; with the sampler's provable
 /// [`AG_SAMPLING_CREDIT_BITS`] = 5 bits on top, `r₁` carries
-/// `pow_bits + 5` grinding bits total. Expected prover cost is
-/// `2^pow_bits · 32` hash calls plus `2^pow_bits` point attempts (~50 µs at
-/// the strict [`R1_POW_BITS`] = 4); the verifier stays ONE-SHOT.
+/// `pow_bits + 5` grinding bits total against a CANONICAL decode — the
+/// strict schedule sets `pow_bits =` [`R1_POW_BITS`] = 9 so the budget
+/// holds even against the recursion circuit's relaxed-canonicity decode,
+/// which returns the fiber's 5 bits to the prover. Expected prover cost is
+/// `2^pow_bits · 32` hash calls plus `2^pow_bits` point attempts (~1 ms at
+/// 9 bits); the verifier stays ONE-SHOT.
 pub(super) fn sample_r1_prover_pow<C: Challenger>(
     challenger: &mut C,
     pow_bits: u32,
@@ -1241,9 +1254,10 @@ pub fn prove_capture_s_hat_v_c<C: Challenger>(
 /// (`initial_bits(m)`) and every multilinear round
 /// (`multilinear_round_bits`), mirroring the RS zerocheck's schedule; `r₁`
 /// switches to the FUSED nonce ([`sample_r1_prover_pow`]):
-/// [`R1_POW_BITS`] = 4 explicit PoW bits + the sampler's
-/// [`AG_SAMPLING_CREDIT_BITS`] = 5 provable bits = `bits_for(474)` for the
-/// product+base code bad set ([`R1_ZERO_BOUND`]), with a ONE-SHOT verifier.
+/// [`R1_POW_BITS`] = 9 explicit PoW bits = `bits_for(474)` for the
+/// product+base code bad set ([`R1_ZERO_BOUND`]) — all explicit, so the
+/// budget survives the recursion circuit's relaxed-canonicity decode —
+/// with a ONE-SHOT verifier.
 ///
 /// PADDING CONTRACT: round 1 sums the FULL `2^m` region — every padding
 /// word of `a`/`b`/`c` must be an HONEST ZERO (the union's fresh-zeroed
@@ -2689,11 +2703,10 @@ mod tests {
         let sampler_denom = crate::genus95_curve_code::BASE_Y_DEGREE * 8;
         assert_eq!(sampler_denom, 32);
         assert_eq!(AG_SAMPLING_CREDIT_BITS, sampler_denom.trailing_zeros());
-        // Explicit + credit = the strict per-challenge requirement.
-        assert_eq!(
-            R1_POW_BITS + AG_SAMPLING_CREDIT_BITS,
-            bits_for(R1_ZERO_BOUND)
-        );
+        // r₁: ALL bits explicit — the recursion circuit's relaxed-canonicity
+        // decode (phase D) hands the fiber's 5 flattening bits back to the
+        // prover, so the sampler credit no longer discounts this site.
+        assert_eq!(R1_POW_BITS, bits_for(R1_ZERO_BOUND));
         assert_eq!(
             crate::lincheck::AG_LINCHECK_SKIP_POW_BITS + AG_SAMPLING_CREDIT_BITS,
             bits_for(base_deg)

@@ -121,11 +121,13 @@ impl ZerocheckGrinding {
     }
 
     /// Explicit PoW bits on the AG-skip zerocheck's FUSED `r₁` nonce
-    /// ([`ag_skip::sample_r1_prover_pow`]): `bits_for(474) = 9` total bits
-    /// required ([`ag_skip::R1_ZERO_BOUND`]), of which the rejection sampler
-    /// provably contributes [`ag_skip::AG_SAMPLING_CREDIT_BITS`] = 5, leaving
-    /// 4 explicit. `None` under a disabled schedule (the direct route's plain
-    /// single-attempt nonce, which makes no 128-bit claim).
+    /// ([`ag_skip::sample_r1_prover_pow`]): ALL `bits_for(474) = 9` bits
+    /// required ([`ag_skip::R1_ZERO_BOUND`]) are explicit — the recursion
+    /// circuit binds the decode with RELAXED canonicity (any fiber point
+    /// over the XOF-derived `x`), which returns the sampler's 5 flattening
+    /// bits to the prover, so they are repaid in the PoW target. `None`
+    /// under a disabled schedule (the direct route's plain single-attempt
+    /// nonce, which makes no 128-bit claim).
     pub const fn ag_r1_bits(self) -> Option<u32> {
         if self.enabled {
             Some(ag_skip::R1_POW_BITS)

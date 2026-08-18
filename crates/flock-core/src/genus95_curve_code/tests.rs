@@ -383,3 +383,60 @@ fn acceptance_rate_is_one_in_32() {
         "acceptance rate {p:.5} strayed from the pinned 1/32"
     );
 }
+
+/// Census of the BASE functional's in-circuit cost surfaces (phase D's
+/// `emit_ag_lows` sizing): the pushed-monomial count, the total XOR terms
+/// across the 64 coordinate masks, and the x-power ladder length.
+#[test]
+fn base_functional_circuit_census() {
+    use super::constants::{BASE_X_POWER_COUNT, FOUR_RUSSIANS_BLOCK_BITS};
+    use super::tables::TABLES;
+    let l = &TABLES.base_layout;
+    let mut xor_terms = 0usize;
+    for (blk, masks) in l.block_masks.iter().enumerate() {
+        let (s, e) = (
+            l.block_coordinate_offsets[blk],
+            l.block_coordinate_offsets[blk + 1],
+        );
+        for &coord in &l.block_coordinates[s..e] {
+            xor_terms += masks[coord as usize].count_ones() as usize;
+        }
+    }
+    println!(
+        "base layout: input_count {} | xor terms {} | x powers {} | blocks {} (block bits {})",
+        l.input_count,
+        xor_terms,
+        BASE_X_POWER_COUNT,
+        l.block_masks.len(),
+        FOUR_RUSSIANS_BLOCK_BITS,
+    );
+    // The in-circuit sharing estimate: per block, each DISTINCT nonzero
+    // sub-mask sum is built once (popcount-1 adds), then one add folds it
+    // into each affected coordinate.
+    let (mut pairs, mut distinct_builds, mut distinct_total) = (0usize, 0usize, 0usize);
+    for (blk, masks) in l.block_masks.iter().enumerate() {
+        let (s, e) = (
+            l.block_coordinate_offsets[blk],
+            l.block_coordinate_offsets[blk + 1],
+        );
+        let mut seen = std::collections::HashSet::new();
+        for &coord in &l.block_coordinates[s..e] {
+            let m = masks[coord as usize];
+            pairs += 1;
+            if seen.insert(m) {
+                distinct_total += 1;
+                distinct_builds += (m.count_ones() as usize).saturating_sub(1);
+            }
+        }
+    }
+    println!(
+        "sharing: (block,coord) pairs {} | distinct masks {} (build adds {}) | est rows = pushes {} + builds {} + pairs {} = {}",
+        pairs,
+        distinct_total,
+        distinct_builds,
+        l.input_count,
+        distinct_builds,
+        pairs,
+        l.input_count + distinct_builds + pairs,
+    );
+}
