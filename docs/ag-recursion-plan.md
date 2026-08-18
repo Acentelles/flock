@@ -4,6 +4,14 @@ Status: PLAN (2026-08-18, branch `ag-union`). Goal: the tower's provers run the
 AG-skip boolean zerocheck (union-AG measured −21% prove at m32) and the
 recursion circuit replays those proofs.
 
+ENDGAME (Ron, 2026-08-18): the RS/φ8 univariate skip will EVENTUALLY be
+deprecated and removed — AG becomes the only skip basis. Not immediate, but
+it re-weights this plan: AG-everywhere (Phase C) is the critical path rather
+than optional; the in-circuit AG lows (Phase D) are the *successor* of
+`emit_lagrange_lows`, not an optional upgrade; migration knobs should be
+flip-in-place + delete, not permanent parallel API; and Phase F lists the
+removal blockers (x86 + CUDA AG kernels chief among them).
+
 ## What the survey established (tower @ `ag-union` tip)
 
 1. **The boolean zerocheck's arithmetic is NOT wired in-circuit today.** The
@@ -99,20 +107,59 @@ Decode-canonicity (which AS root) either pinned via linear functionals
   internal/spine digest equality, `chain_spine_converges` re-run.
 - Expect node prove −10-15% (zerocheck share at m29).
 
-**Phase D — optional Tier-1 upgrade** (in-circuit lows + on-curve + hash
-binding), driven by the recursion exit contract, not performance.
+**Phase D — Tier-1 upgrade** (in-circuit lows + on-curve + hash binding).
+Under the deprecation endgame this is SCHEDULED, not optional: when RS is
+removed, `emit_lagrange_lows` dies and `emit_ag_lows` is its mainline
+replacement — going to Tier 0 permanently would be a posture REGRESSION
+(the in-circuit lows were the recorded upgrade over the checker boundary).
+Tier 0 remains the right FIRST landing; D closes the loop before removal.
 
 **Phase E — audit + docs.** Extend the audit's recursive-agreement section:
 AG rows are checker-tier obligations (like the fold publics), not PowMask
 rows; friendly constants ≠ 1 is free in-circuit (baked constants); update
 `docs/local/recursion-handoff.md` censuses and the memory track.
 
+**Phase F — RS deprecation prerequisites** (the removal blockers, so they
+can be scheduled early rather than discovered late):
+1. **x86 AG round-1 kernel.** The AG prover's round-1 is aarch64-NEON SLP
+   only; RS removal without an AVX-512 port kills x86 proving entirely
+   (x86 VERIFY already works — `verify_ag`/`verify_with_grinding` are
+   arch-independent).
+2. **CUDA AG round-1 kernel.** The GPU prover runs the full RS zerocheck
+   on-device (`cuda-ghash/zerocheck_round1/2/tail.cuh`, z_skip→lincheck
+   hand-off resident); RS removal needs the AG twin (the mlv tail carries
+   over — it is shape-identical — but round-1 over the genus-95 product
+   code is a new kernel + vectors).
+3. Recursion: delete the RS locator arms + `emit_lagrange_lows` + the φ8
+   fused Pow+squeeze sites (keep the AG arms structurally parallel from
+   Phase B so this is arm-deletion, not surgery).
+4. Profiles/grinding: the RS rows of the audit schedule retire;
+   `ZerocheckGrinding::skip_bits` / `LincheckGrinding::skip_bits` collapse
+   to the AG accounting; the ungrinded direct route decides whether it
+   gains the fused nonce or stays no-claim.
+5. Transcript/fixture retirement: every RS byte pin (m6 merged fixtures,
+   mixed-class pins, chain/Merkle/keccak3/sha2 relations — all currently
+   RS), proof-IO version bump, and the parallel `*Ag` structs/entries
+   renamed to primary as the RS structs are deleted.
+6. `SkipPoint::Phi8` and `phi8()` die; `SkipPoint` may collapse back to a
+   plain `EvaluationPoint` (claim types simplify).
+
 ## Open decisions (for Ron)
 
-1. Tier 0 vs Tier 1 to start — recommend Tier 0.
-2. TowerConfig shape for the flavor — variants vs field.
-3. Proof struct: separate `R1csProofCircuitMergedAg` (recommended — matches
-   the existing Ag pattern, keeps RS byte-compat) vs an enum field.
-4. Scope order leaf-first — recommend yes (Phase B is where the workload
-   payoff is; Phase C is optional-until-measured).
-5. PoW-convention alignment in Phase A — recommend yes.
+1. Tier 0 vs Tier 1 to start — recommend Tier 0 first, with Tier 1 (Phase D)
+   scheduled before RS removal (see endgame note).
+2. TowerConfig: under the endgame, do NOT grow the public config — keep
+   Chain100/Chain128 and flip the flavor in place per phase (a private
+   accessor / test-only knob during migration), so the eventual state has
+   no residual flavor API to delete.
+3. Proof struct: parallel `R1csProofCircuitMergedAg` during migration (no
+   RS wire churn now); renamed to primary when the RS structs are deleted
+   in Phase F. Structure all tower locator/region code as PARALLEL ARMS so
+   RS removal is arm-deletion.
+4. Scope order leaf-first — recommend yes; Phase C is on the deprecation
+   critical path (no longer optional-until-measured).
+5. PoW-convention alignment in Phase A — recommend yes (mandatory before
+   the AG transcript becomes the only one).
+6. Phase F sequencing: the x86 and CUDA AG round-1 kernels are the
+   long-lead items — start them as soon as AG-everywhere (Phase C) is
+   validated, independent of Phase D.
