@@ -17,8 +17,9 @@
 //!     cryptographic primitive enters the soundness argument.
 
 use super::multilinear::{
-    fold_and_compute_round_pair_into, fold_in_place_pair, fold1_lookahead_into,
-    fold2_lookahead_into, lookahead_msg_first, lookahead_msg_second, round_pair_naive,
+    LiveLayout, expand_to_dense, fold_and_compute_round_pair_into, fold_and_round_pair_sparse_into,
+    fold_in_place_pair, fold1_lookahead_into, fold2_lookahead_into, lookahead_msg_first,
+    lookahead_msg_second, round_pair_naive,
 };
 use crate::challenger::Challenger;
 use crate::field::{F128, F256Unreduced, mul_by_x};
@@ -429,6 +430,83 @@ pub fn fold_and_first_round_padded(
         })
         .reduce(|| (F128::ZERO, F128::ZERO), |(p, q), (r, s)| (p + r, q + s));
     (a_mlv, b_mlv, g1, g_inf)
+}
+
+/// [`fold_and_first_round_padded`] with LIVE-SPAN output — the AG analog of
+/// RS's `uni_skip_fold_and_round_pair_runs_sparse`: dead blocks get no
+/// storage at all, so the fold's cost AND footprint are count-derived. The
+/// returned [`LiveLayout`] maps the compacted buffers back to the padded
+/// `2^(m−6)` domain: the k-th live block's 128 slots sit at offset `128·k`.
+/// Intervals are 128-aligned by construction — pair-aligned for every tail
+/// round. Message and live values are byte-identical to the dense fold on
+/// an honestly zero-padded witness; a Partial block stores its full 128
+/// slots (the cleansed fold writes honest zeros past its ranges).
+pub fn fold_and_first_round_sparse(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    w: &[F128],
+    r_rest: &[F128],
+    coverage: &[super::BlockCoverage],
+) -> (Vec<F128>, Vec<F128>, F128, F128, LiveLayout) {
+    use rayon::prelude::*;
+    assert_eq!(a_packed.len(), b_packed.len());
+    debug_assert_eq!(
+        &r_rest[1..N_INNER],
+        &friendly_challenges()[1..N_INNER],
+        "fold_and_first_round assumes γ-geometric friendly dims"
+    );
+    let table = build_w_tables(w);
+    let eq_outer = super::univariate_skip::build_eq(&r_rest[N_INNER..]);
+    let n_outer = eq_outer.len();
+    assert_eq!(a_packed.len() / 8, n_outer * 128, "128 messages per block");
+    assert_eq!(coverage.len(), n_outer, "one coverage entry per outer block");
+    let mut d1 = F128::ONE;
+    for j in 1..N_INNER {
+        d1 *= F128::ONE + gamma_pow(1usize << j);
+    }
+    let d1_inv = d1.inv();
+
+    // The live block list + its 128-aligned mlv-slot intervals.
+    let live: Vec<usize> = (0..n_outer)
+        .filter(|&o| !matches!(coverage[o], super::BlockCoverage::Dead))
+        .collect();
+    debug_assert!(!live.is_empty(), "a witness with no live block");
+    let mut intervals: Vec<(usize, usize)> = Vec::new();
+    for &o in &live {
+        match intervals.last_mut() {
+            Some((_, e)) if *e == 128 * o => *e = 128 * (o + 1),
+            _ => intervals.push((128 * o, 128 * (o + 1))),
+        }
+    }
+    let store = LiveLayout::new(intervals);
+    let n_live = 128 * live.len();
+    let mut a_mlv = crate::scratch::take_f128(n_live);
+    let mut b_mlv = crate::scratch::take_f128(n_live);
+    let (g1, g_inf) = a_mlv
+        .par_chunks_mut(128)
+        .zip(b_mlv.par_chunks_mut(128))
+        .zip(live.par_iter())
+        .map(|((am, bm), &outer)| {
+            let (s1, s_inf) = match &coverage[outer] {
+                super::BlockCoverage::Dead => unreachable!("the live list has no dead entry"),
+                super::BlockCoverage::Full => {
+                    fold_block_at(a_packed, b_packed, outer * 128, &table, am, bm)
+                }
+                super::BlockCoverage::Partial(ranges) => {
+                    let mut a_buf = [0u8; 1024];
+                    let mut b_buf = [0u8; 1024];
+                    super::cleanse_block(a_packed, outer * 1024, ranges, &mut a_buf);
+                    super::cleanse_block(b_packed, outer * 1024, ranges, &mut b_buf);
+                    fold_block_at(&a_buf, &b_buf, 0, &table, am, bm)
+                }
+            };
+            let e = eq_outer[outer] * d1_inv;
+            (e * s1.reduce(), e * s_inf.reduce())
+        })
+        .reduce(|| (F128::ZERO, F128::ZERO), |(p, q), (r, s)| (p + r, q + s));
+    a_mlv.truncate(n_live);
+    b_mlv.truncate(n_live);
+    (a_mlv, b_mlv, g1, g_inf, store)
 }
 
 /// One wide-Horner step with a compile-time shift `S` (the friendly base
@@ -1360,11 +1438,32 @@ fn prove_from_round1<C: Challenger>(
     let mut r_rest = friendly_challenges().to_vec();
     r_rest.extend_from_slice(r_outer);
 
-    // Round 0: fused fold of a,b at r1 + the first (full-size) multilinear
-    // message — run-list-gated when the caller supplies a coverage map.
-    let (a_mlv, b_mlv, g1_0, ginf_0) = match coverage {
-        Some(cov) => fold_and_first_round_padded(a_packed, b_packed, &w, &r_rest, cov),
-        None => fold_and_first_round(a_packed, b_packed, &w, &r_rest),
+    // Round 0 + the tail. The sparse-support decision mirrors the RS
+    // zerocheck's `sparse_from_round2`: when the run-list has dead blocks
+    // and the live fraction clears the gate, the fold emits LIVE-SPAN
+    // buffers and the tail runs support-proportional rounds; otherwise the
+    // padded (or dense) fold feeds the lookahead tail. Byte-identical wire
+    // output on every path.
+    let sparse = coverage.is_some_and(|cov| {
+        let live_blocks = cov
+            .iter()
+            .filter(|c| !matches!(c, super::BlockCoverage::Dead))
+            .count();
+        let n_out = cov.len() * 128;
+        live_blocks < cov.len()
+            && n_out >= 8
+            && live_blocks * 128 * super::sparse_tail_gate() <= n_out
+    });
+    let (a_mlv, b_mlv, g1_0, ginf_0, store) = if sparse {
+        let cov = coverage.expect("sparse implies coverage");
+        let (a, b, g1, gi, st) = fold_and_first_round_sparse(a_packed, b_packed, &w, &r_rest, cov);
+        (a, b, g1, gi, Some(st))
+    } else {
+        let (a, b, g1, gi) = match coverage {
+            Some(cov) => fold_and_first_round_padded(a_packed, b_packed, &w, &r_rest, cov),
+            None => fold_and_first_round(a_packed, b_packed, &w, &r_rest),
+        };
+        (a, b, g1, gi, None)
     };
     let (rounds, rhos, a_eval, b_eval) = match grinding.multilinear_round_bits() {
         Some(bits) => {
@@ -1373,9 +1472,9 @@ fn prove_from_round1<C: Challenger>(
                 bits,
                 nonces: &mut grinding_nonces,
             };
-            mlv_tail_fs(a_mlv, b_mlv, g1_0, ginf_0, &r_rest, &mut gch)
+            mlv_tail_dispatch(a_mlv, b_mlv, g1_0, ginf_0, store, &r_rest, &mut gch)
         }
-        None => mlv_tail_fs(a_mlv, b_mlv, g1_0, ginf_0, &r_rest, challenger),
+        None => mlv_tail_dispatch(a_mlv, b_mlv, g1_0, ginf_0, store, &r_rest, challenger),
     };
 
     let proof = AgProof {
@@ -1421,6 +1520,109 @@ pub(super) fn mlv_tail_fs<C: Challenger>(
     rhos.push(rho0);
     let (tail_rounds, tail_rhos, a_eval, b_eval) =
         mlv_tail_fs_resume(a_mlv, b_mlv, 1, rho0, None, r_rest, challenger);
+    rounds.extend(tail_rounds);
+    rhos.extend(tail_rhos);
+    (rounds, rhos, a_eval, b_eval)
+}
+
+/// One tail, two storages: dispatch on whether the fold handed over
+/// live-span buffers (+ their [`LiveLayout`]) or a full dense pair.
+fn mlv_tail_dispatch<C: Challenger>(
+    a_mlv: Vec<F128>,
+    b_mlv: Vec<F128>,
+    g1_0: F128,
+    ginf_0: F128,
+    store: Option<LiveLayout>,
+    r_rest: &[F128],
+    challenger: &mut C,
+) -> (Vec<(F128, F128)>, Vec<F128>, F128, F128) {
+    match store {
+        Some(st) => mlv_tail_fs_sparse(a_mlv, b_mlv, g1_0, ginf_0, st, r_rest, challenger),
+        None => mlv_tail_fs(a_mlv, b_mlv, g1_0, ginf_0, r_rest, challenger),
+    }
+}
+
+/// [`mlv_tail_fs`] over LIVE-SPAN buffers (the sparse fold's output): the
+/// tail runs the support-proportional rounds — RS's
+/// [`fold_and_round_pair_sparse_into`], with the friendly constants riding
+/// as ordinary `r_next` weights — while the live set clears the gate and
+/// the domain keeps the fused threshold, then expands to dense ONCE and
+/// resumes the lookahead tail mid-stream. Wire output is bit-identical to
+/// the dense tail: every skipped term carries an `a·b` factor of zero.
+pub(super) fn mlv_tail_fs_sparse<C: Challenger>(
+    mut a_mlv: Vec<F128>,
+    mut b_mlv: Vec<F128>,
+    g1_0: F128,
+    ginf_0: F128,
+    mut store: LiveLayout,
+    r_rest: &[F128],
+    challenger: &mut C,
+) -> (Vec<(F128, F128)>, Vec<F128>, F128, F128) {
+    let n_mlv = r_rest.len();
+    let mut rounds = Vec::with_capacity(n_mlv);
+    let mut rhos = Vec::with_capacity(n_mlv);
+    rounds.push((g1_0, ginf_0));
+    challenger.observe_f128(g1_0);
+    challenger.observe_f128(ginf_0);
+    let mut rho_prev = challenger.sample_f128();
+    rhos.push(rho_prev);
+
+    // The sparse rounds — the RS tail's loop shape: the logical `domain`
+    // halves every round regardless of the compacted buffer length, and
+    // the gate re-checks per round (interval ends round outward, so the
+    // live fraction can cross it mid-tail).
+    let mut domain = 1usize << n_mlv;
+    let (mut a_nxt, mut b_nxt) = (Vec::new(), Vec::new());
+    let mut i = 1usize;
+    while i < n_mlv && domain >= 1024 && store.len() * super::sparse_tail_gate() <= domain {
+        let log_before = domain.trailing_zeros() as usize;
+        let mut r_next = vec![F128::ONE; log_before - 1];
+        r_next[1..].copy_from_slice(&r_rest[i + 1..]);
+        // Output storage is bounded by the input's: shrinking pairs can
+        // only round outward by one slot per interval end.
+        let cap = store.len() + 2 * store.intervals().len() + 2;
+        if a_nxt.len() < cap {
+            crate::scratch::give_f128(a_nxt);
+            crate::scratch::give_f128(b_nxt);
+            a_nxt = crate::scratch::take_f128(cap);
+            b_nxt = crate::scratch::take_f128(cap);
+        }
+        let (m1, mi, store_out) = fold_and_round_pair_sparse_into(
+            &a_mlv,
+            &b_mlv,
+            &mut a_nxt[..cap],
+            &mut b_nxt[..cap],
+            rho_prev,
+            &r_next,
+            &store,
+            domain,
+        );
+        std::mem::swap(&mut a_mlv, &mut a_nxt);
+        std::mem::swap(&mut b_mlv, &mut b_nxt);
+        a_mlv.truncate(store_out.len());
+        b_mlv.truncate(store_out.len());
+        store = store_out;
+        domain /= 2;
+        rounds.push((m1, mi));
+        challenger.observe_f128(m1);
+        challenger.observe_f128(mi);
+        rho_prev = challenger.sample_f128();
+        rhos.push(rho_prev);
+        i += 1;
+    }
+
+    // Back to global indexing: scatter the live span into a full padded
+    // buffer once and resume the lookahead tail mid-stream (the arrays are
+    // folded through every sampled challenge except `rho_prev` — resume's
+    // own invariant).
+    let a_full = expand_to_dense(&a_mlv, &store, domain);
+    let b_full = expand_to_dense(&b_mlv, &store, domain);
+    crate::scratch::give_f128(a_mlv);
+    crate::scratch::give_f128(b_mlv);
+    crate::scratch::give_f128(a_nxt);
+    crate::scratch::give_f128(b_nxt);
+    let (tail_rounds, tail_rhos, a_eval, b_eval) =
+        mlv_tail_fs_resume(a_full, b_full, i, rho_prev, None, r_rest, challenger);
     rounds.extend(tail_rounds);
     rhos.extend(tail_rhos);
     (rounds, rhos, a_eval, b_eval)
@@ -2623,6 +2825,73 @@ mod tests {
         assert_eq!(p0, p2, "padded-honest proof bytes");
         assert_eq!(sv0, sv2, "padded-honest s_hat_v_c");
         verify_with_grinding(m, &p1, g, &mut mk()).expect("the padded-dirty proof verifies");
+    }
+
+    /// The SPARSE tail at deep low utilization (3 of 64 code blocks live):
+    /// the live-span fold + four support-proportional rounds + the
+    /// expand-and-resume handoff produce a proof byte-identical to the
+    /// dense-honest one, under both grinding schedules, over a witness
+    /// whose dead regions hold garbage.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn sparse_tail_matches_dense_at_low_utilization() {
+        use crate::challenger::FsChallenger;
+        use crate::zerocheck::{PaddingRun, PaddingSpec};
+        let m = 19usize; // 64 blocks; n_mlv = 13, so the gate holds 4 rounds
+        let spec = PaddingSpec::from_runs(vec![
+            PaddingRun {
+                k_log: 13,
+                useful_bits_per_block: 1 << 13,
+                n_blocks: 2,
+            },
+            PaddingRun {
+                k_log: 13,
+                useful_bits_per_block: 0,
+                n_blocks: 30,
+            },
+            PaddingRun {
+                k_log: 13,
+                useful_bits_per_block: 5000,
+                n_blocks: 1,
+            },
+        ]); // + an implicit 31-block trailing gap
+        let mut mask = vec![0u8; (1usize << m) / 8];
+        for (s, e) in spec.useful_intervals() {
+            for i in s..e {
+                mask[i / 8] |= 1 << (i % 8);
+            }
+        }
+        let (a0, b0, c0) = random_witness(m, 55);
+        let honest = |v: &[u8]| -> Vec<u8> { v.iter().zip(&mask).map(|(x, k)| x & k).collect() };
+        let dirty = |v: &[u8], g: u8| -> Vec<u8> {
+            v.iter()
+                .zip(&mask)
+                .map(|(x, k)| (x & k) | (g & !k))
+                .collect()
+        };
+        let (ah, bh, ch) = (honest(&a0), honest(&b0), honest(&c0));
+        let (ad, bd, cd) = (dirty(&a0, 0xC3), dirty(&b0, 0x3C), dirty(&c0, 0xFF));
+        for g in [
+            crate::zerocheck::ZerocheckGrinding::disabled(),
+            crate::zerocheck::ZerocheckGrinding::per_challenge_128(),
+        ] {
+            let mk = || FsChallenger::new(b"flock-ag-sparse-test");
+            let (p0, cl0, sv0) = prove_capture_s_hat_v_c_with_grinding(
+                &ah,
+                &bh,
+                &ch,
+                m,
+                &PaddingSpec::dense(m),
+                g,
+                &mut mk(),
+            );
+            let (p1, cl1, sv1) =
+                prove_capture_s_hat_v_c_with_grinding(&ad, &bd, &cd, m, &spec, g, &mut mk());
+            assert_eq!(p0, p1, "proof bytes (grinding: {})", g.enabled);
+            assert_eq!(cl0, cl1, "claims");
+            assert_eq!(sv0, sv1, "s_hat_v_c");
+            verify_with_grinding(m, &p1, g, &mut mk()).expect("the sparse-path proof verifies");
+        }
     }
 
     /// Full grinding roundtrip on the fused transcript + fused-nonce tamper
