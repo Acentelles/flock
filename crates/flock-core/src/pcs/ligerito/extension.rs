@@ -461,59 +461,428 @@ fn lookahead_add_scaled(la: &mut FoldLookahead, ood: &FoldLookahead, beta: F128)
     }
 }
 
-/// FUSED double fold from the BASE arrays: fold by `r0` then `r1` (LSB
-/// pairing, `d = 1`) writing only the QUARTER-size outputs, and accumulate
-/// the next round's `(u_0, u_2)` — the deferred-fold half of the round-1
-/// lookahead skip. The half-size intermediate never exists.
-///
-/// VALUE-IDENTICAL to `fold_base(r0)` → `fold_extension(r1)` →
-/// `next_round_msg`: the per-element expression composes the two fold steps
-/// verbatim (`lo/hi = fold_step_base`, then `lo + r1·(hi + lo)`), and
-/// `u_0`/`u_2` are XOR-additive sums, so chunk order cannot change them.
+/// Mid-ladder alternation state: the NEXT round's message as a quadratic in
+/// its not-yet-sampled F256 fold challenge — the extension-coefficient
+/// counterpart of the combine pass's base-field [`FoldLookahead`]. Produced
+/// INSIDE fold passes (over the freshly folded outputs, +4 muls per output
+/// quad, four of the eight products shared with this round's message);
+/// consumed as an O(1) skip. Exact polynomial identity → transcripts are
+/// bit-identical to the fold-then-message path.
+/// Output-size cap for producing mid-chain coefficients: above it, the
+/// accumulation's extra products (and the wide accumulator's register
+/// pressure) measurably lose to the fold pass they would save (M4 Max,
+/// m32 lane-major: +10 ms at 2^23 outputs vs a ~7 ms fold); below it, the
+/// skip is a clean win by both traffic and product counts. The caller
+/// lookahead (free coefficients from the combine pass) is not capped.
+const LA_MAX_OUTPUTS: usize = 1 << 19;
+
+#[derive(Clone, Copy)]
+pub(super) struct La256 {
+    u0: [F256; 3],
+    u2: [F256; 3],
+}
+
+impl La256 {
+    #[inline]
+    fn eval(&self, r: F256) -> SumcheckMessage256 {
+        let r2 = r * r;
+        SumcheckMessage256 {
+            u_0: self.u0[0] + r * self.u0[1] + r2 * self.u0[2],
+            u_2: self.u2[0] + r * self.u2[1] + r2 * self.u2[2],
+        }
+    }
+}
+
+/// Per-quad accumulation over FOLDED outputs, under the pairing the NEXT
+/// fold uses: this round's message (pairs `(0,1)`, `(2,3)`) plus the next
+/// round's quadratic coefficients (next fold pairs `(0,1)`→slot 0,
+/// `(2,3)`→slot 1; next message pairs the slots). Char-2 collapses the
+/// Karatsuba middle factors: `A0+dA0 = af[1]`, `S+dS = af[1]+af[3]`.
+/// Accumulator layout: `[u0, u2, c0, c1, c2, d0, d1, d2]`.
+#[inline(always)]
+fn la_msg_quad(af: &[F256; 4], ab: &[F256; 4], acc: &mut [F256; 8]) {
+    let m1 = af[0] * ab[0];
+    let p1 = af[2] * ab[2];
+    let m2 = (af[0] + af[1]) * (ab[0] + ab[1]);
+    let p2 = (af[2] + af[3]) * (ab[2] + ab[3]);
+    let m3 = af[1] * ab[1];
+    let n1 = (af[0] + af[2]) * (ab[0] + ab[2]);
+    let n3 = (af[1] + af[3]) * (ab[1] + ab[3]);
+    let n2 = (af[0] + af[1] + af[2] + af[3]) * (ab[0] + ab[1] + ab[2] + ab[3]);
+    acc[0] += m1 + p1;
+    acc[1] += m2 + p2;
+    acc[2] += m1;
+    acc[3] += m1 + m2 + m3;
+    acc[4] += m2;
+    acc[5] += n1;
+    acc[6] += n1 + n2 + n3;
+    acc[7] += n2;
+}
+
+#[inline]
+fn acc8_add(mut a: [F256; 8], b: [F256; 8]) -> [F256; 8] {
+    for k in 0..8 {
+        a[k] += b[k];
+    }
+    a
+}
+
+#[inline]
+fn acc8_finish(acc: [F256; 8]) -> (SumcheckMessage256, La256) {
+    (
+        SumcheckMessage256 {
+            u_0: acc[0],
+            u_2: acc[1],
+        },
+        La256 {
+            u0: [acc[2], acc[3], acc[4]],
+            u2: [acc[5], acc[6], acc[7]],
+        },
+    )
+}
+
+#[inline]
+fn fold2_step_base(a: &[F128], i: usize, r0: F256, r1: F256) -> F256 {
+    let lo = F256::from(a[i]) + r0 * (a[i + 1] + a[i]);
+    let hi = F256::from(a[i + 2]) + r0 * (a[i + 3] + a[i + 2]);
+    lo + r1 * (hi + lo)
+}
+
+#[inline]
+fn fold2_step_ext_blocked(a: &[F256], i: usize, d: usize, r0: F256, r1: F256) -> F256 {
+    let lo = fold_step_ext(a, i, i + d, r0);
+    let hi = fold_step_ext(a, i + 2 * d, i + 3 * d, r0);
+    lo + r1 * (hi + lo)
+}
+
+/// FUSED double fold from the BASE arrays (LSB pairing): fold by `(r0, r1)`
+/// straight to the quarter-size state — the half-size intermediate never
+/// exists — and accumulate the next round's message plus, when `want_la`,
+/// the round after's coefficients ([`La256`]) over the same in-register
+/// outputs. VALUE-IDENTICAL to the unfused chain: the per-element
+/// expression composes the fold steps verbatim and all sums are
+/// XOR-additive.
 fn fused_fold2_msg_base(
     f: &[F128],
     b: &[F128],
     r0: F256,
     r1: F256,
-) -> (Vec<F256>, Vec<F256>, SumcheckMessage256) {
+    want_la: bool,
+) -> (Vec<F256>, Vec<F256>, SumcheckMessage256, Option<La256>) {
     debug_assert_eq!(f.len(), b.len());
     let quarter = f.len() / 4;
     debug_assert!(quarter >= 2 && quarter.is_power_of_two());
-    let zero2 = || (F256::ZERO, F256::ZERO);
-    let sum2 = |(a0, a2): (F256, F256), (b0, b2): (F256, F256)| (a0 + b0, a2 + b2);
+    let want_la = want_la && (4..=LA_MAX_OUTPUTS).contains(&quarter);
     let mut nf = crate::scratch::take_f256(quarter);
     let mut nb = crate::scratch::take_f256(quarter);
-    let fold2 = |a: &[F128], i: usize| -> F256 {
-        let lo = F256::from(a[i]) + r0 * (a[i + 1] + a[i]);
-        let hi = F256::from(a[i + 2]) + r0 * (a[i + 3] + a[i + 2]);
-        lo + r1 * (hi + lo)
-    };
-    // Chunk on message-block boundaries (2 outputs per block).
-    let chunk = (1usize << 12).clamp(2, quarter);
-    debug_assert!(chunk.is_multiple_of(2));
-    let (u_0, u_2) = nf
+    let gran = if want_la { 4 } else { 2 };
+    let chunk = (1usize << 12).clamp(gran, quarter);
+    debug_assert!(chunk.is_multiple_of(gran));
+    let acc = nf
         .par_chunks_mut(chunk)
         .zip(nb.par_chunks_mut(chunk))
         .enumerate()
         .map(|(ci, (fo, bo))| {
             let out0 = ci * chunk;
+            let mut acc = [F256::ZERO; 8];
             for (k, (fslot, bslot)) in fo.iter_mut().zip(bo.iter_mut()).enumerate() {
                 let i = 4 * (out0 + k);
-                *fslot = fold2(f, i);
-                *bslot = fold2(b, i);
+                *fslot = fold2_step_base(f, i, r0, r1);
+                *bslot = fold2_step_base(b, i, r0, r1);
             }
-            let mut u0 = F256::ZERO;
-            let mut u2 = F256::ZERO;
-            for j in 0..fo.len() / 2 {
-                let (f0, f1) = (fo[2 * j], fo[2 * j + 1]);
-                let (b0, b1) = (bo[2 * j], bo[2 * j + 1]);
-                u0 += f0 * b0;
-                u2 += (f0 + f1) * (b0 + b1);
+            if want_la {
+                for (fq, bq) in fo.as_chunks::<4>().0.iter().zip(bo.as_chunks::<4>().0) {
+                    la_msg_quad(fq, bq, &mut acc);
+                }
+            } else {
+                for j in 0..fo.len() / 2 {
+                    acc[0] += fo[2 * j] * bo[2 * j];
+                    acc[1] += (fo[2 * j] + fo[2 * j + 1]) * (bo[2 * j] + bo[2 * j + 1]);
+                }
             }
-            (u0, u2)
+            acc
         })
-        .reduce(zero2, sum2);
-    (nf, nb, SumcheckMessage256 { u_0, u_2 })
+        .reduce(|| [F256::ZERO; 8], acc8_add);
+    let (msg, la) = acc8_finish(acc);
+    (nf, nb, msg, want_la.then_some(la))
+}
+
+/// FUSED double fold of the EXTENSION state (block pairing `d`): the
+/// mid-chain pass of the alternating schedule — absorbs the deferred skip
+/// challenge `r0` and this round's `r1` in one sweep, quarter-size outputs,
+/// message + optional next-round coefficients. The lane-major geometry
+/// (few huge 4d-superblocks) splits the k dimension.
+fn fused_fold2_msg_ext(
+    f: &[F256],
+    b: &[F256],
+    r0: F256,
+    r1: F256,
+    d: usize,
+    want_la: bool,
+) -> (Vec<F256>, Vec<F256>, SumcheckMessage256, Option<La256>) {
+    debug_assert_eq!(f.len(), b.len());
+    let quarter = f.len() / 4;
+    // `quarter >= d` is the fold's own requirement; the MESSAGE additionally
+    // needs a blocked pair (`quarter >= 2d`) — drains (which discard it) are
+    // the only callers below that.
+    debug_assert!(d.is_power_of_two() && quarter.is_power_of_two() && quarter >= d);
+    let want_la = want_la && quarter >= 4 * d && quarter <= LA_MAX_OUTPUTS;
+    let sblock = if want_la { 4 * d } else { 2 * d };
+    let mut nf = crate::scratch::take_f256(quarter);
+    let mut nb = crate::scratch::take_f256(quarter);
+    // Output o = b·d + w composes inputs {4bd+w, +d, +2d, +3d}; a superblock
+    // of `sblock` outputs reads the 4·sblock inputs at 4·(superblock start).
+    // The split-based big-block branch requires FULL superblocks; smaller
+    // arrays (the big-d drain shapes) take the chunked branch, whose
+    // n_segs-aware loop writes every output.
+    if quarter == d {
+        // Degenerate (drain-only) shape: one block, no message pairs —
+        // parallelize the k dimension directly. The message/coefficients
+        // are meaningless here (callers discard them).
+        nf.par_chunks_mut(1 << 12)
+            .zip(nb.par_chunks_mut(1 << 12))
+            .enumerate()
+            .for_each(|(ci, (fo, bo))| {
+                let k0 = ci << 12;
+                for (k, (fs, bs)) in fo.iter_mut().zip(bo.iter_mut()).enumerate() {
+                    *fs = fold2_step_ext_blocked(f, k0 + k, d, r0, r1);
+                    *bs = fold2_step_ext_blocked(b, k0 + k, d, r0, r1);
+                }
+            });
+        return (
+            nf,
+            nb,
+            SumcheckMessage256 {
+                u_0: F256::ZERO,
+                u_2: F256::ZERO,
+            },
+            None,
+        );
+    }
+    let acc = if sblock >= (1 << 16) && quarter >= sblock {
+        // Few huge superblocks: split each segment's k dimension too.
+        const KC: usize = 1 << 13;
+        nf.par_chunks_mut(sblock)
+            .zip(nb.par_chunks_mut(sblock))
+            .enumerate()
+            .map(|(jb, (fblk, bblk))| {
+                let out0 = jb * sblock;
+                let in0 = 4 * out0;
+                if want_la {
+                    // 4 d-segments per superblock (the la quad).
+                    let (f0, fr) = fblk.split_at_mut(d);
+                    let (f1, fr2) = fr.split_at_mut(d);
+                    let (f2, f3) = fr2.split_at_mut(d);
+                    let (b0, br) = bblk.split_at_mut(d);
+                    let (b1, br2) = br.split_at_mut(d);
+                    let (b2, b3) = br2.split_at_mut(d);
+                    f0.par_chunks_mut(KC)
+                        .zip(f1.par_chunks_mut(KC))
+                        .zip(f2.par_chunks_mut(KC).zip(f3.par_chunks_mut(KC)))
+                        .zip(
+                            b0.par_chunks_mut(KC)
+                                .zip(b1.par_chunks_mut(KC))
+                                .zip(b2.par_chunks_mut(KC).zip(b3.par_chunks_mut(KC))),
+                        )
+                        .enumerate()
+                        .map(
+                            |(kc, (((fc0, fc1), (fc2, fc3)), ((bc0, bc1), (bc2, bc3))))| {
+                                let k0 = kc * KC;
+                                let mut acc = [F256::ZERO; 8];
+                                for k in 0..fc0.len() {
+                                    let i = in0 + k0 + k;
+                                    let af = [
+                                        fold2_step_ext_blocked(f, i, d, r0, r1),
+                                        fold2_step_ext_blocked(f, i + 4 * d, d, r0, r1),
+                                        fold2_step_ext_blocked(f, i + 8 * d, d, r0, r1),
+                                        fold2_step_ext_blocked(f, i + 12 * d, d, r0, r1),
+                                    ];
+                                    let ab = [
+                                        fold2_step_ext_blocked(b, i, d, r0, r1),
+                                        fold2_step_ext_blocked(b, i + 4 * d, d, r0, r1),
+                                        fold2_step_ext_blocked(b, i + 8 * d, d, r0, r1),
+                                        fold2_step_ext_blocked(b, i + 12 * d, d, r0, r1),
+                                    ];
+                                    fc0[k] = af[0];
+                                    fc1[k] = af[1];
+                                    fc2[k] = af[2];
+                                    fc3[k] = af[3];
+                                    bc0[k] = ab[0];
+                                    bc1[k] = ab[1];
+                                    bc2[k] = ab[2];
+                                    bc3[k] = ab[3];
+                                    la_msg_quad(&af, &ab, &mut acc);
+                                }
+                                acc
+                            },
+                        )
+                        .reduce(|| [F256::ZERO; 8], acc8_add)
+                } else {
+                    // 2 d-segments (message pairs only — the drain shape).
+                    let (f0, f1) = fblk.split_at_mut(d);
+                    let (b0, b1) = bblk.split_at_mut(d);
+                    f0.par_chunks_mut(KC)
+                        .zip(f1.par_chunks_mut(KC))
+                        .zip(b0.par_chunks_mut(KC).zip(b1.par_chunks_mut(KC)))
+                        .enumerate()
+                        .map(|(kc, ((fc0, fc1), (bc0, bc1)))| {
+                            let k0 = kc * KC;
+                            let mut acc = [F256::ZERO; 8];
+                            for k in 0..fc0.len() {
+                                let i = in0 + k0 + k;
+                                let flo = fold2_step_ext_blocked(f, i, d, r0, r1);
+                                let fhi = fold2_step_ext_blocked(f, i + 4 * d, d, r0, r1);
+                                let blo = fold2_step_ext_blocked(b, i, d, r0, r1);
+                                let bhi = fold2_step_ext_blocked(b, i + 4 * d, d, r0, r1);
+                                fc0[k] = flo;
+                                fc1[k] = fhi;
+                                bc0[k] = blo;
+                                bc1[k] = bhi;
+                                acc[0] += flo * blo;
+                                acc[1] += (flo + fhi) * (blo + bhi);
+                            }
+                            acc
+                        })
+                        .reduce(|| [F256::ZERO; 8], acc8_add)
+                }
+            })
+            .reduce(|| [F256::ZERO; 8], acc8_add)
+    } else {
+        let chunk = sblock.max(1 << 12).min(quarter);
+        debug_assert!(chunk.is_multiple_of(sblock) || chunk == quarter);
+        let dd = d.min(quarter);
+        nf.par_chunks_mut(chunk)
+            .zip(nb.par_chunks_mut(chunk))
+            .enumerate()
+            .map(|(ci, (fo, bo))| {
+                let out0 = ci * chunk;
+                let mut acc = [F256::ZERO; 8];
+                for (js, (fblk, bblk)) in
+                    fo.chunks_mut(sblock).zip(bo.chunks_mut(sblock)).enumerate()
+                {
+                    let ob = out0 + js * sblock;
+                    let in0 = 4 * ob;
+                    let n_segs = fblk.len() / dd;
+                    for k in 0..dd {
+                        let mut outs = [F256::ZERO; 4];
+                        let mut outsb = [F256::ZERO; 4];
+                        for s in 0..n_segs {
+                            outs[s] = fold2_step_ext_blocked(f, in0 + 4 * s * d + k, d, r0, r1);
+                            outsb[s] = fold2_step_ext_blocked(b, in0 + 4 * s * d + k, d, r0, r1);
+                            fblk[s * dd + k] = outs[s];
+                            bblk[s * dd + k] = outsb[s];
+                        }
+                        if n_segs == 4 {
+                            la_msg_quad(&outs, &outsb, &mut acc);
+                        } else if n_segs >= 2 {
+                            acc[0] += outs[0] * outsb[0];
+                            acc[1] += (outs[0] + outs[1]) * (outsb[0] + outsb[1]);
+                        }
+                    }
+                }
+                acc
+            })
+            .reduce(|| [F256::ZERO; 8], acc8_add)
+    };
+    let (msg, la) = acc8_finish(acc);
+    (nf, nb, msg, want_la.then_some(la))
+}
+
+/// FUSED single fold + message + next-round coefficients for a level's
+/// FIRST round (the just-split base-valued f-side, LSB pairing) — the
+/// alternation ENTRY of every recursive level: the pass that already runs
+/// also produces the coefficients that make the level's second round a
+/// skip.
+fn fused_fold_msg_la_fbase(
+    f: &[F256],
+    b: &[F256],
+    r: F256,
+) -> (Vec<F256>, Vec<F256>, SumcheckMessage256, Option<La256>) {
+    debug_assert_eq!(f.len(), b.len());
+    let half = f.len() / 2;
+    debug_assert!(half.is_power_of_two() && half >= 4);
+    debug_assert!(half <= LA_MAX_OUTPUTS, "caller gates by size");
+    let mut nf = crate::scratch::take_f256(half);
+    let mut nb = crate::scratch::take_f256(half);
+    let chunk = (1usize << 12).clamp(4, half);
+    debug_assert!(chunk.is_multiple_of(4));
+    let acc = nf
+        .par_chunks_mut(chunk)
+        .zip(nb.par_chunks_mut(chunk))
+        .enumerate()
+        .map(|(ci, (fo, bo))| {
+            let out0 = ci * chunk;
+            let mut acc = [F256::ZERO; 8];
+            for (q, (fq_o, bq_o)) in fo
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(bo.as_chunks_mut::<4>().0)
+                .enumerate()
+            {
+                let base = 2 * (out0 + 4 * q);
+                let mut af = [F256::ZERO; 4];
+                let mut ab = [F256::ZERO; 4];
+                for t in 0..4 {
+                    af[t] = fold_step_split_base(f, base + 2 * t, base + 2 * t + 1, r);
+                    ab[t] = fold_step_ext(b, base + 2 * t, base + 2 * t + 1, r);
+                }
+                *fq_o = af;
+                *bq_o = ab;
+                la_msg_quad(&af, &ab, &mut acc);
+            }
+            acc
+        })
+        .reduce(|| [F256::ZERO; 8], acc8_add);
+    let (msg, la) = acc8_finish(acc);
+    (nf, nb, msg, Some(la))
+}
+
+/// [`fused_fold_msg_la_fbase`] for the ladder-entry BASE arrays (both sides
+/// F128, LSB): the no-caller-lookahead fallback that still starts the
+/// alternating schedule at round 0.
+fn fused_fold_msg_la_base(
+    f: &[F128],
+    b: &[F128],
+    r: F256,
+) -> (Vec<F256>, Vec<F256>, SumcheckMessage256, Option<La256>) {
+    debug_assert_eq!(f.len(), b.len());
+    let half = f.len() / 2;
+    debug_assert!(half.is_power_of_two() && half >= 4);
+    let mut nf = crate::scratch::take_f256(half);
+    let mut nb = crate::scratch::take_f256(half);
+    let chunk = (1usize << 12).clamp(4, half);
+    debug_assert!(chunk.is_multiple_of(4));
+    let acc = nf
+        .par_chunks_mut(chunk)
+        .zip(nb.par_chunks_mut(chunk))
+        .enumerate()
+        .map(|(ci, (fo, bo))| {
+            let out0 = ci * chunk;
+            let mut acc = [F256::ZERO; 8];
+            for (q, (fq_o, bq_o)) in fo
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(bo.as_chunks_mut::<4>().0)
+                .enumerate()
+            {
+                let base = 2 * (out0 + 4 * q);
+                let mut af = [F256::ZERO; 4];
+                let mut ab = [F256::ZERO; 4];
+                for t in 0..4 {
+                    af[t] = fold_step_base(f, base + 2 * t, base + 2 * t + 1, r);
+                    ab[t] = fold_step_base(b, base + 2 * t, base + 2 * t + 1, r);
+                }
+                *fq_o = af;
+                *bq_o = ab;
+                la_msg_quad(&af, &ab, &mut acc);
+            }
+            acc
+        })
+        .reduce(|| [F256::ZERO; 8], acc8_add);
+    let (msg, la) = acc8_finish(acc);
+    (nf, nb, msg, Some(la))
 }
 
 /// FUSED first virtual fold: one sweep folds `f` by `r`, EVALUATES the
@@ -615,106 +984,159 @@ fn fused_first_fold_virtual(
 /// FUSED double fold with a VIRTUAL basis: fold `f` by `(r0, r1)` (block
 /// pairing `d`) straight to the quarter-size state, EVALUATE the
 /// twice-folded virtual basis directly into `nb`, and accumulate the next
-/// round's message — the factored-basis counterpart of
-/// [`fused_fold2_msg_base`], and the lane-major consumer of the seeded
-/// EqPoint combine's round-1 lookahead. `basis` must already be folded by
-/// BOTH challenges (two `fold_coord`s); its index space is exactly the
-/// output's. Value-identical to fold → materialize → fold → message: the
-/// fold expression composes the two steps verbatim, `nb[o]` is the same
-/// per-term XOR-sum `fill` writes, the message pairing matches
-/// `next_round_msg(nf, nb, d)`, and the sums are XOR-additive.
+/// round's message plus (when `want_la`) the round after's coefficients —
+/// the lane-major alternation entry. `basis` must already be folded by BOTH
+/// challenges; its index space is exactly the output's. Value-identical to
+/// fold → materialize → fold → message: the fold expression composes the two
+/// steps verbatim, `nb[o]` is the same per-term XOR-sum `fill` writes, the
+/// pairings match `next_round_msg(nf, nb, d)`, and all sums are
+/// XOR-additive.
 fn fused_first_fold2_virtual(
     f: &[F128],
     basis: &VirtualEqBasis256,
     r0: F256,
     r1: F256,
     d: usize,
-) -> (Vec<F256>, Vec<F256>, SumcheckMessage256) {
+    want_la: bool,
+) -> (Vec<F256>, Vec<F256>, SumcheckMessage256, Option<La256>) {
     let quarter = f.len() / 4;
     debug_assert_eq!(basis.len(), quarter);
     debug_assert!(d.is_power_of_two() && quarter.is_power_of_two() && quarter >= 2 * d);
-    let block = 2 * d;
-    let zero2 = || (F256::ZERO, F256::ZERO);
-    let sum2 = |(a0, a2): (F256, F256), (b0, b2): (F256, F256)| (a0 + b0, a2 + b2);
+    let want_la = want_la && quarter >= 4 * d && quarter <= LA_MAX_OUTPUTS;
+    let sblock = if want_la { 4 * d } else { 2 * d };
     let mut nf = crate::scratch::take_f256(quarter);
     let mut nb = crate::scratch::take_f256(quarter);
-    // Output o = b·d + w composes inputs {4bd+w, +d, +2d, +3d}; a message
-    // block of 2d outputs therefore reads the 8d inputs at 4·(block start).
+    // Output o = b·d + w composes f inputs {4bd+w, +d, +2d, +3d}.
     let fold2 = |i: usize| -> F256 {
         let lo = F256::from(f[i]) + r0 * (f[i + d] + f[i]);
         let hi = F256::from(f[i + 2 * d]) + r0 * (f[i + 3 * d] + f[i + 2 * d]);
         lo + r1 * (hi + lo)
     };
-    let (u_0, u_2) = if block >= (1 << 16) {
+    let acc = if sblock >= (1 << 16) && quarter >= sblock {
         const KC: usize = 1 << 13;
-        nf.par_chunks_mut(block)
-            .zip(nb.par_chunks_mut(block))
+        nf.par_chunks_mut(sblock)
+            .zip(nb.par_chunks_mut(sblock))
             .enumerate()
             .map(|(jb, (fblk, bblk))| {
-                let out0 = jb * block;
+                let out0 = jb * sblock;
                 let in0 = 4 * out0;
-                let (flo_h, fhi_h) = fblk.split_at_mut(d);
-                let (blo_h, bhi_h) = bblk.split_at_mut(d);
-                flo_h
-                    .par_chunks_mut(KC)
-                    .zip(fhi_h.par_chunks_mut(KC))
-                    .zip(blo_h.par_chunks_mut(KC).zip(bhi_h.par_chunks_mut(KC)))
-                    .enumerate()
-                    .map(|(kc, ((flc, fhc), (blc, bhc)))| {
-                        let k0 = kc * KC;
-                        let mut u0 = F256::ZERO;
-                        let mut u2 = F256::ZERO;
-                        for k in 0..flc.len() {
-                            let i = in0 + k0 + k;
-                            let o = out0 + k0 + k;
-                            let flo = fold2(i);
-                            let fhi = fold2(i + 4 * d);
-                            let blo = basis.value_sum_at(o);
-                            let bhi = basis.value_sum_at(o + d);
-                            flc[k] = flo;
-                            fhc[k] = fhi;
-                            blc[k] = blo;
-                            bhc[k] = bhi;
-                            u0 += flo * blo;
-                            u2 += (flo + fhi) * (blo + bhi);
-                        }
-                        (u0, u2)
-                    })
-                    .reduce(zero2, sum2)
+                if want_la {
+                    let (f0, fr) = fblk.split_at_mut(d);
+                    let (f1, fr2) = fr.split_at_mut(d);
+                    let (f2, f3) = fr2.split_at_mut(d);
+                    let (b0, br) = bblk.split_at_mut(d);
+                    let (b1, br2) = br.split_at_mut(d);
+                    let (b2, b3) = br2.split_at_mut(d);
+                    f0.par_chunks_mut(KC)
+                        .zip(f1.par_chunks_mut(KC))
+                        .zip(f2.par_chunks_mut(KC).zip(f3.par_chunks_mut(KC)))
+                        .zip(
+                            b0.par_chunks_mut(KC)
+                                .zip(b1.par_chunks_mut(KC))
+                                .zip(b2.par_chunks_mut(KC).zip(b3.par_chunks_mut(KC))),
+                        )
+                        .enumerate()
+                        .map(
+                            |(kc, (((fc0, fc1), (fc2, fc3)), ((bc0, bc1), (bc2, bc3))))| {
+                                let k0 = kc * KC;
+                                let mut acc = [F256::ZERO; 8];
+                                for k in 0..fc0.len() {
+                                    let i = in0 + k0 + k;
+                                    let o = out0 + k0 + k;
+                                    let af = [
+                                        fold2(i),
+                                        fold2(i + 4 * d),
+                                        fold2(i + 8 * d),
+                                        fold2(i + 12 * d),
+                                    ];
+                                    let ab = [
+                                        basis.value_sum_at(o),
+                                        basis.value_sum_at(o + d),
+                                        basis.value_sum_at(o + 2 * d),
+                                        basis.value_sum_at(o + 3 * d),
+                                    ];
+                                    fc0[k] = af[0];
+                                    fc1[k] = af[1];
+                                    fc2[k] = af[2];
+                                    fc3[k] = af[3];
+                                    bc0[k] = ab[0];
+                                    bc1[k] = ab[1];
+                                    bc2[k] = ab[2];
+                                    bc3[k] = ab[3];
+                                    la_msg_quad(&af, &ab, &mut acc);
+                                }
+                                acc
+                            },
+                        )
+                        .reduce(|| [F256::ZERO; 8], acc8_add)
+                } else {
+                    let (f0, f1) = fblk.split_at_mut(d);
+                    let (b0, b1) = bblk.split_at_mut(d);
+                    f0.par_chunks_mut(KC)
+                        .zip(f1.par_chunks_mut(KC))
+                        .zip(b0.par_chunks_mut(KC).zip(b1.par_chunks_mut(KC)))
+                        .enumerate()
+                        .map(|(kc, ((fc0, fc1), (bc0, bc1)))| {
+                            let k0 = kc * KC;
+                            let mut acc = [F256::ZERO; 8];
+                            for k in 0..fc0.len() {
+                                let i = in0 + k0 + k;
+                                let o = out0 + k0 + k;
+                                let flo = fold2(i);
+                                let fhi = fold2(i + 4 * d);
+                                let blo = basis.value_sum_at(o);
+                                let bhi = basis.value_sum_at(o + d);
+                                fc0[k] = flo;
+                                fc1[k] = fhi;
+                                bc0[k] = blo;
+                                bc1[k] = bhi;
+                                acc[0] += flo * blo;
+                                acc[1] += (flo + fhi) * (blo + bhi);
+                            }
+                            acc
+                        })
+                        .reduce(|| [F256::ZERO; 8], acc8_add)
+                }
             })
-            .reduce(zero2, sum2)
+            .reduce(|| [F256::ZERO; 8], acc8_add)
     } else {
-        let chunk = block.max(1 << 12).min(quarter);
-        debug_assert!(chunk.is_multiple_of(block) || chunk == quarter);
+        let chunk = sblock.max(1 << 12).min(quarter);
+        debug_assert!(chunk.is_multiple_of(sblock) || chunk == quarter);
         nf.par_chunks_mut(chunk)
             .zip(nb.par_chunks_mut(chunk))
             .enumerate()
             .map(|(ci, (fo, bo))| {
-                let mut u0 = F256::ZERO;
-                let mut u2 = F256::ZERO;
                 let out0 = ci * chunk;
-                for (jo, (fblk, bblk)) in fo.chunks_mut(block).zip(bo.chunks_mut(block)).enumerate()
+                let mut acc = [F256::ZERO; 8];
+                for (js, (fblk, bblk)) in
+                    fo.chunks_mut(sblock).zip(bo.chunks_mut(sblock)).enumerate()
                 {
-                    let ob = out0 + jo * block;
+                    let ob = out0 + js * sblock;
                     let in0 = 4 * ob;
+                    let n_segs = fblk.len() / d;
                     for k in 0..d {
-                        let flo = fold2(in0 + k);
-                        let fhi = fold2(in0 + 4 * d + k);
-                        let blo = basis.value_sum_at(ob + k);
-                        let bhi = basis.value_sum_at(ob + d + k);
-                        fblk[k] = flo;
-                        fblk[d + k] = fhi;
-                        bblk[k] = blo;
-                        bblk[d + k] = bhi;
-                        u0 += flo * blo;
-                        u2 += (flo + fhi) * (blo + bhi);
+                        let mut af = [F256::ZERO; 4];
+                        let mut ab = [F256::ZERO; 4];
+                        for s in 0..n_segs {
+                            af[s] = fold2(in0 + 4 * s * d + k);
+                            ab[s] = basis.value_sum_at(ob + s * d + k);
+                            fblk[s * d + k] = af[s];
+                            bblk[s * d + k] = ab[s];
+                        }
+                        if n_segs == 4 {
+                            la_msg_quad(&af, &ab, &mut acc);
+                        } else {
+                            acc[0] += af[0] * ab[0];
+                            acc[1] += (af[0] + af[1]) * (ab[0] + ab[1]);
+                        }
                     }
                 }
-                (u0, u2)
+                acc
             })
-            .reduce(zero2, sum2)
+            .reduce(|| [F256::ZERO; 8], acc8_add)
     };
-    (nf, nb, SumcheckMessage256 { u_0, u_2 })
+    let (msg, la) = acc8_finish(acc);
+    (nf, nb, msg, want_la.then_some(la))
 }
 
 struct VirtualEqTerm256 {
@@ -906,26 +1328,39 @@ impl SumcheckProver256 {
         msg
     }
 
-    /// Round-1 SKIP: the message came from the caller's lookahead evaluated
-    /// at the round-0 challenge ([`lookahead_eval256`]); record it — the
-    /// array fold is deferred into [`Self::first_fold2_materialized`].
-    pub(super) fn skip_first_fold(&mut self, msg: SumcheckMessage256) {
+    /// A SKIP round: the message came from a lookahead evaluation (the
+    /// caller's base-field coefficients at round 1, or a mid-ladder
+    /// [`La256`]); record it — the array fold is deferred into the next
+    /// fold2 pass (or a drain).
+    pub(super) fn push_skip_message(&mut self, msg: SumcheckMessage256) {
         self.transcript.push(msg);
     }
 
-    /// The deferred round-0 fold fused with round 1's: double-fold the base
+    /// Whether the ladder-entry base arrays are still unconsumed (the first
+    /// fold has not run) — decides which fold2 variant a deferred challenge
+    /// takes.
+    pub(super) fn initial_pending(&self) -> bool {
+        self.initial_f.is_some()
+    }
+
+    /// The deferred fold fused with this round's: double-fold the base
     /// arrays by `(r0, r1)` in ONE pass straight to the quarter-size F256
-    /// state ([`fused_fold2_msg_base`]) — the half-size intermediate is
-    /// never written. LSB pairing only (the lookahead never arrives on the
-    /// lane-major path).
-    pub(super) fn first_fold2_materialized(&mut self, r0: F256, r1: F256) -> SumcheckMessage256 {
+    /// state — the half-size intermediate is never written. LSB pairing
+    /// only (the caller lookahead never arrives on the lane-major
+    /// materialized path).
+    pub(super) fn first_fold2_materialized(
+        &mut self,
+        r0: F256,
+        r1: F256,
+        want_la: bool,
+    ) -> (SumcheckMessage256, Option<La256>) {
         let f = self.initial_f.take().expect("first fold already consumed");
         let b = self.initial_b.take().expect("materialized basis missing");
-        let (nf, nb, msg) = fused_fold2_msg_base(&f, &b, r0, r1);
+        let (nf, nb, msg, la) = fused_fold2_msg_base(&f, &b, r0, r1, want_la);
         self.f = nf;
         self.combined_basis = nb;
         self.transcript.push(msg);
-        msg
+        (msg, la)
     }
 
     /// [`Self::first_fold2_materialized`] for the VIRTUAL basis (the
@@ -936,13 +1371,90 @@ impl SumcheckProver256 {
         r1: F256,
         d: usize,
         basis: &VirtualEqBasis256,
-    ) -> SumcheckMessage256 {
+        want_la: bool,
+    ) -> (SumcheckMessage256, Option<La256>) {
         let f = self.initial_f.take().expect("first fold already consumed");
-        let (nf, nb, msg) = fused_first_fold2_virtual(&f, basis, r0, r1, d);
+        let (nf, nb, msg, la) = fused_first_fold2_virtual(&f, basis, r0, r1, d, want_la);
         self.f = nf;
         self.combined_basis = nb;
         self.transcript.push(msg);
-        msg
+        (msg, la)
+    }
+
+    /// Ladder-entry single fold + message + next-round coefficients (base
+    /// arrays, LSB): starts the alternating schedule when no caller
+    /// lookahead arrived. Falls back to the plain fused fold when the
+    /// arrays are too small for coefficient quads.
+    pub(super) fn first_fold_materialized_la(
+        &mut self,
+        r: F256,
+    ) -> (SumcheckMessage256, Option<La256>) {
+        if self
+            .initial_f
+            .as_ref()
+            .is_none_or(|f| f.len() < 8 || f.len() / 2 > LA_MAX_OUTPUTS)
+        {
+            return (self.first_fold_materialized(r, 1), None);
+        }
+        let f = self.initial_f.take().expect("first fold already consumed");
+        let b = self.initial_b.take().expect("materialized basis missing");
+        let (nf, nb, msg, la) = fused_fold_msg_la_base(&f, &b, r);
+        self.f = nf;
+        self.combined_basis = nb;
+        self.transcript.push(msg);
+        (msg, la)
+    }
+
+    /// A recursive level's FIRST fold + the level's alternation entry: the
+    /// fbase fold pass also emits the next round's coefficients. Runs AFTER
+    /// every glue, so the coefficients are always fresh — no corrections.
+    pub(super) fn fold_after_switch_la(&mut self, r: F256) -> (SumcheckMessage256, Option<La256>) {
+        if !fused_fold_applies(self.f.len(), 1)
+            || self.f.len() < 8
+            || self.f.len() / 2 > LA_MAX_OUTPUTS
+        {
+            return (self.fold_after_switch(r), None);
+        }
+        let (nf, nb, msg, la) = fused_fold_msg_la_fbase(&self.f, &self.combined_basis, r);
+        crate::scratch::give_f256(std::mem::replace(&mut self.f, nf));
+        crate::scratch::give_f256(std::mem::replace(&mut self.combined_basis, nb));
+        self.transcript.push(msg);
+        (msg, la)
+    }
+
+    /// Mid-chain double fold (extension state, block pairing `d`): absorbs
+    /// the deferred skip challenge and this round's in one pass.
+    pub(super) fn mid_fold2(
+        &mut self,
+        r0: F256,
+        r1: F256,
+        d: usize,
+        want_la: bool,
+    ) -> (SumcheckMessage256, Option<La256>) {
+        let (nf, nb, msg, la) =
+            fused_fold2_msg_ext(&self.f, &self.combined_basis, r0, r1, d, want_la);
+        crate::scratch::give_f256(std::mem::replace(&mut self.f, nf));
+        crate::scratch::give_f256(std::mem::replace(&mut self.combined_basis, nb));
+        self.transcript.push(msg);
+        (msg, la)
+    }
+
+    /// Message-free double fold — the pre-switch drain when the previous
+    /// round was a skip (the switch's own message replaces this round's).
+    pub(super) fn fold2_drain(&mut self, r0: F256, r1: F256, d: usize) {
+        let (nf, nb, _msg, _) =
+            fused_fold2_msg_ext(&self.f, &self.combined_basis, r0, r1, d, false);
+        crate::scratch::give_f256(std::mem::replace(&mut self.f, nf));
+        crate::scratch::give_f256(std::mem::replace(&mut self.combined_basis, nb));
+    }
+
+    /// Message-free single fold — the drain before a switch (or the final
+    /// residual) when this round's message came from a skip or is replaced.
+    pub(super) fn drain(&mut self, r: F256, d: usize) {
+        let nf = fold_extension(&self.f, r, d);
+        let nb = fold_extension(&self.combined_basis, r, d);
+        crate::scratch::give_f256(std::mem::replace(&mut self.f, nf));
+        crate::scratch::give_f256(std::mem::replace(&mut self.combined_basis, nb));
     }
 
     pub(super) fn fold_materialized(&mut self, r: F256, d: usize) -> SumcheckMessage256 {
@@ -988,17 +1500,32 @@ impl SumcheckProver256 {
     /// a representation change at the same sumcheck boundary.
     pub(super) fn code_switch_and_replace_message(&mut self) -> SumcheckMessage256 {
         assert!(self.pending.is_none());
-        let words = split_coordinates(&self.f);
-        let split_f = words.into_iter().map(F256::from).collect();
-        crate::scratch::give_f256(std::mem::replace(&mut self.f, split_f));
-        let split_b = split_basis(&self.combined_basis);
-        crate::scratch::give_f256(std::mem::replace(&mut self.combined_basis, split_b));
-        let msg = round_msg_fbase(&self.f, &self.combined_basis);
+        let msg = self.code_switch_message();
         *self
             .transcript
             .last_mut()
             .expect("a fold message must precede a code switch") = msg;
         msg
+    }
+
+    /// The code switch when the last fold round emitted NO message (it was
+    /// a skip or a drain under the alternating schedule): the switch's
+    /// message is PUSHED as that round's — same transcript contents as
+    /// fold-then-replace, one entry per round either way.
+    pub(super) fn code_switch_and_push_message(&mut self) -> SumcheckMessage256 {
+        assert!(self.pending.is_none());
+        let msg = self.code_switch_message();
+        self.transcript.push(msg);
+        msg
+    }
+
+    fn code_switch_message(&mut self) -> SumcheckMessage256 {
+        let words = split_coordinates(&self.f);
+        let split_f = words.into_iter().map(F256::from).collect();
+        crate::scratch::give_f256(std::mem::replace(&mut self.f, split_f));
+        let split_b = split_basis(&self.combined_basis);
+        crate::scratch::give_f256(std::mem::replace(&mut self.combined_basis, split_b));
+        round_msg_fbase(&self.f, &self.combined_basis)
     }
 
     fn introduce_extension(&mut self, basis: Vec<F256>, claim: F256) -> SumcheckMessage256 {
@@ -1187,14 +1714,14 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
     // (len ≥ 8·d). FLOCK_NO_FOLD_LOOKAHEAD=1 / FOLD_LOOKAHEAD_OVERRIDE is
     // the A/B knob — value-identical either way (exact polynomial
     // identity), so proofs are byte-equal.
+    let alternation = match FOLD_LOOKAHEAD_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => std::env::var_os("FLOCK_NO_FOLD_LOOKAHEAD").is_none(),
+    };
     let mut lookahead = round1_lookahead.filter(|_| {
-        let knob = match FOLD_LOOKAHEAD_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
-            1 => true,
-            2 => false,
-            _ => std::env::var_os("FLOCK_NO_FOLD_LOOKAHEAD").is_none(),
-        };
         let kind_ok = virtual_basis.is_some() || (l0_jit_basis.is_none() && fold_block == 1);
-        knob && kind_ok && initial_k >= 2 && packed_witness.len() >= 8 * fold_block
+        alternation && kind_ok && initial_k >= 2 && packed_witness.len() >= 8 * fold_block
     });
     let _t = std::time::Instant::now();
     for _ in 0..ood_count(0) {
@@ -1278,76 +1805,148 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let mut virtual_basis = virtual_basis.map(VirtualEqBasis256::from_base);
     let mut jit = l0_jit_basis;
     let mut lane_challenges = Vec::with_capacity(initial_k);
+    // The alternating schedule: a skip round evaluates a lookahead (the
+    // caller's base-field coefficients at round 0, [`La256`] mid-chain) and
+    // DEFERS its fold; the next fold pass absorbs both challenges and emits
+    // the following round's coefficients. The chain's last round never emits
+    // its own message (the code switch's replaces it), so a trailing
+    // deferred fold DRAINS message-free into the switch.
     let mut pending_r0: Option<F256> = None;
+    let mut la_mid: Option<La256> = None;
     let _t = std::time::Instant::now();
     let mut t_fold_j = std::time::Instant::now();
     for j in 0..initial_k {
         let challenge = challenger.sample_f256();
-        let path = if j == 0 && lookahead.is_some() {
-            "lookahead-skip"
-        } else if j == 1 && pending_r0.is_some() {
-            "fold2"
-        } else if j > 0 {
-            "materialized"
-        } else if virtual_basis.is_some() {
-            "virtual-once"
-        } else if jit.is_some() {
-            "jit"
+        lane_challenges.push(challenge);
+        let last = j + 1 == initial_k;
+        let path;
+        if last {
+            // Materialize through any deferred challenge, then switch; the
+            // switch's fbase message is this round's transcript entry.
+            match pending_r0.take() {
+                Some(r0) => {
+                    path = "drain2+switch";
+                    if let Some(mut vb) = virtual_basis.take() {
+                        let p = fold_block.trailing_zeros() as usize;
+                        vb.fold_coord(p, r0);
+                        vb.fold_coord(p, challenge);
+                        let _ = sumcheck.first_fold2_virtual(r0, challenge, fold_block, &vb, false);
+                        // first_fold2_virtual pushes its message; the switch
+                        // replaces it — same shape as the plain path.
+                        let msg = sumcheck.code_switch_and_replace_message();
+                        observe_message(challenger, msg);
+                    } else if sumcheck.initial_pending() {
+                        let _ = sumcheck.first_fold2_materialized(r0, challenge, false);
+                        let msg = sumcheck.code_switch_and_replace_message();
+                        observe_message(challenger, msg);
+                    } else {
+                        sumcheck.fold2_drain(r0, challenge, fold_block);
+                        let msg = sumcheck.code_switch_and_push_message();
+                        observe_message(challenger, msg);
+                    }
+                }
+                None => {
+                    path = "fold+switch";
+                    // Plain (non-alternating) tail: fold with a message the
+                    // switch replaces, exactly the historical shape.
+                    let _ = if j == 0 {
+                        if let Some(mut vb) = virtual_basis.take() {
+                            vb.fold_coord(fold_block.trailing_zeros() as usize, challenge);
+                            sumcheck.first_fold_virtual(challenge, fold_block, &vb)
+                        } else if let Some(fill) = jit.take() {
+                            match jit_ood_basis.as_ref() {
+                                Some(ood) => {
+                                    let combined = |out: &mut [F128], offset: usize| {
+                                        fill(out, offset);
+                                        ood.add_to(out, offset);
+                                    };
+                                    sumcheck.first_fold_jit(challenge, fold_block, &combined)
+                                }
+                                None => sumcheck.first_fold_jit(challenge, fold_block, fill),
+                            }
+                        } else {
+                            sumcheck.first_fold_materialized(challenge, fold_block)
+                        }
+                    } else {
+                        sumcheck.fold_materialized(challenge, fold_block)
+                    };
+                    let msg = sumcheck.code_switch_and_replace_message();
+                    observe_message(challenger, msg);
+                }
+            }
         } else {
-            "materialized"
-        };
-        // The virtual basis serves exactly ONE fill: fold its description by
-        // the first challenge, materialize the folded half, and from then on
-        // it is ordinary materialized state (the LazyRsPair design). Every
-        // later fold rides the fused materialized kernel.
-        let _pre_switch = if j == 0 {
-            if let Some(la) = lookahead.as_ref() {
+            let msg = if let (0, Some(la)) = (j, lookahead.as_ref()) {
+                path = "lookahead-skip";
                 // O(1) skip: round 1's message by polynomial identity; the
-                // array fold is deferred into the j = 1 double-fold pass.
+                // fold is deferred into the next double-fold pass.
                 let msg = lookahead_eval256(la, challenge);
-                sumcheck.skip_first_fold(msg);
+                sumcheck.push_skip_message(msg);
                 pending_r0 = Some(challenge);
                 msg
-            } else if let Some(mut vb) = virtual_basis.take() {
-                vb.fold_coord(fold_block.trailing_zeros() as usize, challenge);
-                sumcheck.first_fold_virtual(challenge, fold_block, &vb)
-            } else if let Some(fill) = jit.take() {
-                match jit_ood_basis.as_ref() {
-                    Some(ood) => {
-                        let combined = |out: &mut [F128], offset: usize| {
-                            fill(out, offset);
-                            ood.add_to(out, offset);
-                        };
-                        sumcheck.first_fold_jit(challenge, fold_block, &combined)
+            } else if let Some(la) = la_mid.take() {
+                path = "skip";
+                let msg = la.eval(challenge);
+                sumcheck.push_skip_message(msg);
+                pending_r0 = Some(challenge);
+                msg
+            } else if let Some(r0) = pending_r0.take() {
+                if let Some(mut vb) = virtual_basis.take() {
+                    path = "fold2-virtual";
+                    // The deferred fold and this one both bind the variable
+                    // at bit log2(d): fold_coord removes it, so the second
+                    // bind at the SAME position takes the next block
+                    // variable — the ladder's successive block-d folds.
+                    let p = fold_block.trailing_zeros() as usize;
+                    vb.fold_coord(p, r0);
+                    vb.fold_coord(p, challenge);
+                    let (msg, la) =
+                        sumcheck.first_fold2_virtual(r0, challenge, fold_block, &vb, alternation);
+                    la_mid = la;
+                    msg
+                } else {
+                    path = "fold2";
+                    let (msg, la) = if sumcheck.initial_pending() {
+                        sumcheck.first_fold2_materialized(r0, challenge, alternation)
+                    } else {
+                        sumcheck.mid_fold2(r0, challenge, fold_block, alternation)
+                    };
+                    la_mid = la;
+                    msg
+                }
+            } else if j == 0 {
+                // No caller lookahead: start the alternation at round 0 on
+                // the materialized path; virtual/jit first folds stay plain.
+                if let Some(mut vb) = virtual_basis.take() {
+                    path = "virtual-once";
+                    vb.fold_coord(fold_block.trailing_zeros() as usize, challenge);
+                    sumcheck.first_fold_virtual(challenge, fold_block, &vb)
+                } else if let Some(fill) = jit.take() {
+                    path = "jit";
+                    match jit_ood_basis.as_ref() {
+                        Some(ood) => {
+                            let combined = |out: &mut [F128], offset: usize| {
+                                fill(out, offset);
+                                ood.add_to(out, offset);
+                            };
+                            sumcheck.first_fold_jit(challenge, fold_block, &combined)
+                        }
+                        None => sumcheck.first_fold_jit(challenge, fold_block, fill),
                     }
-                    None => sumcheck.first_fold_jit(challenge, fold_block, fill),
+                } else if alternation && fold_block == 1 {
+                    path = "fold+la";
+                    let (msg, la) = sumcheck.first_fold_materialized_la(challenge);
+                    la_mid = la;
+                    msg
+                } else {
+                    path = "materialized";
+                    sumcheck.first_fold_materialized(challenge, fold_block)
                 }
             } else {
-                sumcheck.first_fold_materialized(challenge, fold_block)
-            }
-        } else if let Some(r0) = pending_r0.take() {
-            if let Some(mut vb) = virtual_basis.take() {
-                // The deferred fold-0 and fold-1 both bind the variable at
-                // bit log2(d): fold_coord removes it, so the second bind at
-                // the SAME position takes the next block variable — exactly
-                // the ladder's successive block-d folds.
-                let p = fold_block.trailing_zeros() as usize;
-                vb.fold_coord(p, r0);
-                vb.fold_coord(p, challenge);
-                sumcheck.first_fold2_virtual(r0, challenge, fold_block, &vb)
-            } else {
-                sumcheck.first_fold2_materialized(r0, challenge)
-            }
-        } else {
-            sumcheck.fold_materialized(challenge, fold_block)
-        };
-        let msg = if j + 1 == initial_k {
-            sumcheck.code_switch_and_replace_message()
-        } else {
-            _pre_switch
-        };
-        observe_message(challenger, msg);
-        lane_challenges.push(challenge);
+                path = "materialized";
+                sumcheck.fold_materialized(challenge, fold_block)
+            };
+            observe_message(challenger, msg);
+        }
         if trace {
             eprintln!(
                 "    init fold {j} ({path}, d {}): {:.2} ms",
@@ -1446,22 +2045,56 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
         assert!(current_split_dim >= k);
         let mut level_challenges = Vec::with_capacity(k);
         let _t = std::time::Instant::now();
+        // The level's alternating schedule. j = 0 is the entry: the fbase
+        // fold pass (which runs AFTER every glue, so its coefficients are
+        // always fresh) also emits the next round's La256 → j = 1 skips,
+        // j = 2 double-folds, … A pre-switch round emits no message of its
+        // own (the switch's replaces it), so a trailing deferred challenge
+        // drains message-free into the switch.
+        let mut level_pending: Option<F256> = None;
+        let mut level_la: Option<La256> = None;
         for j in 0..k {
             let challenge = challenger.sample_f256();
-            // j == 0 folds the just-switched (base-valued) table — the
-            // f-side products are 2 muls there, not 3.
-            let pre_switch = if j == 0 {
-                sumcheck.fold_after_switch(challenge)
-            } else {
-                sumcheck.fold(challenge)
-            };
-            let msg = if j + 1 == k && i + 1 != r {
-                sumcheck.code_switch_and_replace_message()
-            } else {
-                pre_switch
-            };
-            observe_message(challenger, msg);
             level_challenges.push(challenge);
+            let switching = j + 1 == k && i + 1 != r;
+            if switching {
+                // No message of this round's own survives (the switch's
+                // replaces it) — materialize through the deferred and
+                // current challenges message-free, then switch-push. The
+                // level state is always F256 here, so the generic extension
+                // fold covers the base-valued j = 0 edge too.
+                match level_pending.take() {
+                    Some(r0) => sumcheck.fold2_drain(r0, challenge, 1),
+                    None => sumcheck.drain(challenge, 1),
+                }
+                let msg = sumcheck.code_switch_and_push_message();
+                observe_message(challenger, msg);
+            } else {
+                let msg = if let Some(la) = level_la.take() {
+                    let msg = la.eval(challenge);
+                    sumcheck.push_skip_message(msg);
+                    level_pending = Some(challenge);
+                    msg
+                } else if let Some(r0) = level_pending.take() {
+                    let (msg, la) = sumcheck.mid_fold2(r0, challenge, 1, alternation);
+                    level_la = la;
+                    msg
+                } else if j == 0 && alternation {
+                    let (msg, la) = sumcheck.fold_after_switch_la(challenge);
+                    level_la = la;
+                    msg
+                } else if j == 0 {
+                    sumcheck.fold_after_switch(challenge)
+                } else {
+                    sumcheck.fold(challenge)
+                };
+                observe_message(challenger, msg);
+            }
+        }
+        // FINAL level only: a trailing skip leaves one deferred fold —
+        // materialize before the residual ships.
+        if let Some(r0) = level_pending.take() {
+            sumcheck.drain(r0, 1);
         }
         if trace {
             t_folds += _t.elapsed();

@@ -76,3 +76,11 @@ fn union_prove_fast_lookahead_is_byte_identical_m22() {
 fn union_prove_fast_lookahead_is_byte_identical_m23() {
     assert_byte_identical(512, 0xCD);
 }
+
+/// m27: the lane-major block hits the ≥2^16 superblock kernels (the KC-split
+/// branches) AND the degenerate pre-switch drain whose array is smaller than
+/// a superblock — the shape the small arms never reach.
+#[test]
+fn union_prove_fast_lookahead_is_byte_identical_m27() {
+    assert_byte_identical(8192, 0xEF);
+}
