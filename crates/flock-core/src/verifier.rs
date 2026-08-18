@@ -6,6 +6,7 @@
 use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::lincheck;
+use crate::lincheck::SkipPoint;
 use crate::pcs::{self, Commitment};
 use crate::proof::{R1csClaim, R1csProofLigerito, ZClaim};
 use crate::r1cs::BlockR1cs;
@@ -14,6 +15,8 @@ use crate::zerocheck;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VerifyError {
     Zerocheck(zerocheck::VerifyError),
+    /// AG-skip zerocheck round replay failed (`verify_core_ag`).
+    Ag(zerocheck::ag_skip::AgVerifyError),
     Lincheck(lincheck::VerifyError),
     PcsAb(pcs::VerifyError),
     PcsC(pcs::VerifyError),
@@ -170,7 +173,7 @@ pub fn verify_ligerito_timed<Ch: Challenger>(
             )
             .map_err(VerifyError::Zerocheck)?;
             let zerocheck_s = t0.elapsed().as_secs_f64();
-            let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
+            let x_ab = r1cs.x_ab_from_mlv(SkipPoint::Phi8(zc_claim.z), &zc_claim.mlv_challenges);
             let t0 = Instant::now();
             let lc_claim = lincheck::verify_with_grinding(
                 r1cs.m,
@@ -195,7 +198,7 @@ pub fn verify_ligerito_timed<Ch: Challenger>(
                 value: lc_claim.w,
             };
             let c = ZClaim {
-                point: r1cs.c_claim_point(zc_claim.z, &zc_claim.r_rest),
+                point: r1cs.c_claim_point(SkipPoint::Phi8(zc_claim.z), &zc_claim.r_rest),
                 value: zc_claim.c_eval,
             };
             Ok((ab, c, zerocheck_s, lincheck_s))
@@ -430,7 +433,7 @@ fn verify_merged_opening<Ch: Challenger>(
         None => Vec::new(),
     };
     let values: Vec<F128> = cl.iter().map(|z| z.value).collect();
-    let z_skips: Vec<F128> = cl.iter().map(|z| z.point.z_skip).collect();
+    let z_skips: Vec<F128> = cl.iter().map(|z| z.point.z_skip.phi8()).collect();
     let x_fulls: Vec<Vec<F128>> = cl
         .iter()
         .map(|z| {
@@ -536,7 +539,7 @@ pub fn verify_ligerito_union_mixed_class<Ch: Challenger>(
         None => Vec::new(),
     };
     let values: Vec<F128> = cl.iter().map(|z| z.value).collect();
-    let z_skips: Vec<F128> = cl.iter().map(|z| z.point.z_skip).collect();
+    let z_skips: Vec<F128> = cl.iter().map(|z| z.point.z_skip.phi8()).collect();
     let x_fulls: Vec<Vec<F128>> = cl
         .iter()
         .map(|z| {
@@ -619,7 +622,7 @@ pub fn verify_ligerito_union_mixed_class_deferred<Ch: Challenger>(
         None => Vec::new(),
     };
     let values: Vec<F128> = cl.iter().map(|z| z.value).collect();
-    let z_skips: Vec<F128> = cl.iter().map(|z| z.point.z_skip).collect();
+    let z_skips: Vec<F128> = cl.iter().map(|z| z.point.z_skip.phi8()).collect();
     let x_fulls: Vec<Vec<F128>> = cl
         .iter()
         .map(|z| {
@@ -742,7 +745,8 @@ fn verify_union_piops<Ch: Challenger>(
                     challenger,
                 )
                 .map_err(VerifyError::Zerocheck)?;
-                let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
+                let x_ab =
+                    union.x_ab_from_mlv(SkipPoint::Phi8(zc_claim.z), &zc_claim.mlv_challenges);
                 // The union-column lincheck (one circuit per BOOLEAN slot, in
                 // slot order); the declared counts additionally bind through
                 // the per-type const-pin target terms.
@@ -771,7 +775,7 @@ fn verify_union_piops<Ch: Challenger>(
                         value: lc_claim.w,
                     },
                     c: ZClaim {
-                        point: union.c_claim_point(zc_claim.z, &zc_claim.r_rest),
+                        point: union.c_claim_point(SkipPoint::Phi8(zc_claim.z), &zc_claim.r_rest),
                         value: zc_claim.c_eval,
                     },
                 })
@@ -949,6 +953,108 @@ pub struct DeferredMatrixWork {
     pub jagged: crate::matrix_fold::JaggedAssertion,
 }
 
+/// AG-skip mirror of [`verify_ligerito`]: replays the AG zerocheck
+/// ([`zerocheck::ag_skip::verify`], including the single-attempt r₁ nonce
+/// re-derivation) + lincheck → base claims, then the standard ring-switch
+/// Ligerito open with AG base-code skip weights. Counterpart of
+/// `flock_prover::prover::prove_fast_ligerito_ag_from_witness`.
+pub fn verify_ligerito_ag<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    commitment: &Commitment,
+    proof: &crate::proof::R1csProofLigeritoAg,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    pcs_params: &crate::pcs::PcsParams,
+    challenger: &mut Ch,
+) -> Result<R1csClaim, VerifyError> {
+    let (ab, c) = verify_core_ag(
+        r1cs,
+        &proof.ag,
+        &proof.lincheck,
+        commitment,
+        lincheck_circuit,
+        challenger,
+    )?;
+    verify_claims_ligerito(
+        commitment,
+        &[ab.clone(), c.clone()],
+        &proof.pcs_open,
+        pcs_params,
+        challenger,
+    )
+    .map_err(VerifyError::PcsAb)?;
+    Ok(R1csClaim { ab, c })
+}
+
+/// AG-skip mirror of [`verify_core`]: replay bind → AG zerocheck → lincheck
+/// and reconstruct the two base z-claims, stopping before the PCS open.
+pub fn verify_core_ag<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    ag_proof: &zerocheck::ag_skip::AgProof,
+    lincheck_proof: &lincheck::LincheckProof,
+    commitment: &Commitment,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    challenger: &mut Ch,
+) -> Result<(ZClaim, ZClaim), VerifyError> {
+    verifier_pool().install(move || {
+        verify_core_ag_inner(
+            r1cs,
+            ag_proof,
+            lincheck_proof,
+            commitment,
+            lincheck_circuit,
+            challenger,
+        )
+    })
+}
+
+fn verify_core_ag_inner<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    ag_proof: &zerocheck::ag_skip::AgProof,
+    lincheck_proof: &lincheck::LincheckProof,
+    commitment: &Commitment,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    challenger: &mut Ch,
+) -> Result<(ZClaim, ZClaim), VerifyError> {
+    assert_eq!(
+        r1cs.k_skip,
+        zerocheck::ag_skip::K_SKIP,
+        "AG skip is k_skip=6"
+    );
+
+    // ---- Bind FS transcript to the statement (mirrors the AG prover).
+    crate::proof::bind_statement(challenger, r1cs, commitment);
+
+    // ---- Replay the AG-skip zerocheck rounds.
+    let ag_claim =
+        zerocheck::ag_skip::verify(r1cs.m, ag_proof, challenger).map_err(VerifyError::Ag)?;
+
+    // ---- Lincheck on the AG quirky point (layout-aware constructors).
+    let x_ab = r1cs.x_ab_from_mlv(SkipPoint::Ag(ag_claim.r1), &ag_claim.mlv_challenges);
+    let lc_claim = lincheck::verify(
+        r1cs.m,
+        r1cs.k_log,
+        r1cs.k_skip,
+        lincheck_circuit,
+        &x_ab,
+        ag_claim.a_eval,
+        ag_claim.b_eval,
+        lincheck_proof,
+        challenger,
+    )
+    .map_err(VerifyError::Lincheck)?;
+
+    // ---- Build the two z-claims (must match what the AG prover returned).
+    let ab = ZClaim {
+        point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
+        value: lc_claim.w,
+    };
+    let c = ZClaim {
+        point: r1cs.c_claim_point(SkipPoint::Ag(ag_claim.r1), &ag_claim.r_rest),
+        value: ag_claim.c_eval,
+    };
+    Ok((ab, c))
+}
+
 /// Verify a batched PCS opening over an arbitrary list of `ẑ`-claims — the
 /// mirror of `flock_prover::prover::open_claims_with_precomputed_ligerito`.
 /// Relation wrappers (e.g. the hash chain) reuse this with their own appended
@@ -976,7 +1082,11 @@ fn verify_claims_ligerito_inner<Ch: Challenger>(
     if !commitment_params_match_expected(commitment, pcs_params) {
         return Err(pcs::VerifyError::Ligerito);
     }
-    let z_skips: Vec<F128> = claims.iter().map(|c| c.point.z_skip).collect();
+    let skip_weight_vecs: Vec<Vec<F128>> = claims
+        .iter()
+        .map(|c| c.point.z_skip.weights(pcs::LOG_PACKING - 1))
+        .collect();
+    let skip_weights: Vec<&[F128]> = skip_weight_vecs.iter().map(|v| v.as_slice()).collect();
     let values: Vec<F128> = claims.iter().map(|c| c.value).collect();
     let x_fulls: Vec<Vec<F128>> = claims
         .iter()
@@ -993,7 +1103,7 @@ fn verify_claims_ligerito_inner<Ch: Challenger>(
     pcs::verify_opening_batch_ligerito_mixed_with_grinding(
         commitment,
         &values,
-        &z_skips,
+        &skip_weights,
         &x_refs,
         &[],
         pcs_open,
@@ -1102,7 +1212,7 @@ fn verify_core_inner<Ch: Challenger>(
 
     // ---- Build lincheck's shared quirky point from the zerocheck output
     // (layout-aware: the mlv challenges are address-ordered).
-    let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
+    let x_ab = r1cs.x_ab_from_mlv(SkipPoint::Phi8(zc_claim.z), &zc_claim.mlv_challenges);
 
     // ---- Lincheck. v_a, v_b come from the zerocheck's final â, b̂ evals.
     let t = std::time::Instant::now();
@@ -1134,7 +1244,7 @@ fn verify_core_inner<Ch: Challenger>(
     };
     // c-claim is already a z-claim since `C = I` ⇒ ĉ = ẑ.
     let c = ZClaim {
-        point: r1cs.c_claim_point(zc_claim.z, &zc_claim.r_rest),
+        point: r1cs.c_claim_point(SkipPoint::Phi8(zc_claim.z), &zc_claim.r_rest),
         value: zc_claim.c_eval,
     };
 

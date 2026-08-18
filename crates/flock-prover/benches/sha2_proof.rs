@@ -99,12 +99,9 @@ fn bench_one(n_compressions: usize, n_runs: usize) {
         witness_bytes >> 20
     );
 
-    // SHA2_BATCH_MAJOR=1 switches the witness layout (WitnessLayout::BatchMajor).
-    let setup = if std::env::var_os("SHA2_BATCH_MAJOR").is_some() {
-        Sha256HybridSetup::new(n_compressions)
-    } else {
-        Sha256HybridSetup::new(n_compressions)
-    };
+    // The batch-major witness layout is the default (and only) setup path;
+    // the old SHA2_BATCH_MAJOR knob selected it before it became universal.
+    let setup = Sha256HybridSetup::new(n_compressions);
     let mk_inputs = |seed: u64| {
         let mut rng = Rng::new(seed);
         (0..n_compressions)

@@ -1877,20 +1877,18 @@ fn prove_batched_impl<C: Challenger>(
     );
     let beta = ch.sample_f128();
 
-    if !force_dense {
-        if let Some(m) = live {
-            return prove_batched_grouped(
-                f,
-                g,
-                sigma,
-                m,
-                alpha,
-                beta,
-                grinding,
-                &mut grinding_nonces,
-                ch,
-            );
-        }
+    if !force_dense && let Some(m) = live {
+        return prove_batched_grouped(
+            f,
+            g,
+            sigma,
+            m,
+            alpha,
+            beta,
+            grinding,
+            &mut grinding_nonces,
+            ch,
+        );
     }
 
     let basis = s_id_basis(mu);

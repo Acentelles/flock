@@ -716,7 +716,7 @@ impl Grinding {
     /// `m_words / (2^bits |F|) < 2^-128` for `m_words >= 1`.
     pub fn initial_bits(self, m_words: usize) -> Option<u32> {
         self.enabled
-            .then_some((usize::BITS - m_words.leading_zeros()) as u32)
+            .then_some(usize::BITS - m_words.leading_zeros())
     }
 
     pub fn round_bits(self) -> Option<u32> {

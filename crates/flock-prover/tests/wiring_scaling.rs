@@ -56,7 +56,7 @@ impl GateType for MultGate {
         ])
     }
 
-    fn eval(&self, _inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) -> () {
+    fn eval(&self, _inputs: &[F128], _hint: &(), outputs: &mut Vec<F128>) {
         let (o, row) = {
             // Values are irrelevant to the wiring cost — the grand product runs
             // over the cell space regardless of what the cells hold. All-zero is

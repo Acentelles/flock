@@ -31,7 +31,7 @@
 
 use crate::challenger::Challenger;
 use crate::field::F128;
-use crate::lincheck::QuirkyPoint;
+use crate::lincheck::{QuirkyPoint, SkipPoint};
 use crate::pcs::Commitment;
 #[cfg(test)]
 use crate::schedule::TableClass;
@@ -538,7 +538,7 @@ impl<'r> UnionInstance<'r> {
     /// `x_inner_rest = [dim6, chunk…]` and `x_outer = batch`. Union analog of
     /// [`BlockR1cs::x_ab_from_mlv`] (BatchMajor). Stays in BOOLEAN-REGION
     /// coordinates — the boolean lincheck's column domain is `M_bool − nu`.
-    pub fn x_ab_from_mlv(&self, z_skip: F128, mlv: &[F128]) -> QuirkyPoint {
+    pub fn x_ab_from_mlv(&self, z_skip: SkipPoint, mlv: &[F128]) -> QuirkyPoint {
         let nu = self.n_log();
         assert_eq!(mlv.len(), self.m_bool() - K_SKIP);
         let mut x_inner_rest = Vec::with_capacity(1 + self.boolean_col_log());
@@ -563,7 +563,7 @@ impl<'r> UnionInstance<'r> {
     /// address-ordered suffix is `[dim6 | batch | chunk | frozen zeros]`.
     pub fn ab_claim_point(
         &self,
-        r_inner_skip: F128,
+        r_inner_skip: SkipPoint,
         r_inner_rest: &[F128],
         x_outer: &[F128],
     ) -> QuirkyPoint {
@@ -585,7 +585,7 @@ impl<'r> UnionInstance<'r> {
     /// zerocheck's `r_rest` (already address-ordered, length `M_bool − 6`),
     /// lifted with the frozen-zero high coordinates. Union analog of
     /// [`BlockR1cs::c_claim_point`] (BatchMajor).
-    pub fn c_claim_point(&self, z_skip: F128, r_rest: &[F128]) -> QuirkyPoint {
+    pub fn c_claim_point(&self, z_skip: SkipPoint, r_rest: &[F128]) -> QuirkyPoint {
         assert_eq!(r_rest.len(), self.m_bool() - K_SKIP);
         let frozen = self.boolean_frozen_high();
         let mut x_outer = Vec::with_capacity(r_rest.len() - 1 + frozen);
@@ -1202,22 +1202,30 @@ mod tests {
         for _ in 0..16 {
             let z_skip = rng.next_f128();
             let mlv = rng.f128_vec(m - K_SKIP);
-            let x_ab_union = union.x_ab_from_mlv(z_skip, &mlv);
-            let x_ab_r1cs = r1cs.x_ab_from_mlv(z_skip, &mlv);
+            let x_ab_union = union.x_ab_from_mlv(SkipPoint::Phi8(z_skip), &mlv);
+            let x_ab_r1cs = r1cs.x_ab_from_mlv(SkipPoint::Phi8(z_skip), &mlv);
             assert_eq!(x_ab_union, x_ab_r1cs, "x_ab_from_mlv diverged");
 
             let r_inner_skip = rng.next_f128();
             let r_inner_rest = rng.f128_vec(k_log - K_SKIP);
             assert_eq!(
-                union.ab_claim_point(r_inner_skip, &r_inner_rest, &x_ab_union.x_outer),
-                r1cs.ab_claim_point(r_inner_skip, &r_inner_rest, &x_ab_r1cs.x_outer),
+                union.ab_claim_point(
+                    SkipPoint::Phi8(r_inner_skip),
+                    &r_inner_rest,
+                    &x_ab_union.x_outer
+                ),
+                r1cs.ab_claim_point(
+                    SkipPoint::Phi8(r_inner_skip),
+                    &r_inner_rest,
+                    &x_ab_r1cs.x_outer
+                ),
                 "ab_claim_point diverged"
             );
 
             let r_rest = rng.f128_vec(m - K_SKIP);
             assert_eq!(
-                union.c_claim_point(z_skip, &r_rest),
-                r1cs.c_claim_point(z_skip, &r_rest),
+                union.c_claim_point(SkipPoint::Phi8(z_skip), &r_rest),
+                r1cs.c_claim_point(SkipPoint::Phi8(z_skip), &r_rest),
                 "c_claim_point diverged"
             );
         }
@@ -2013,7 +2021,7 @@ mod tests {
         let mut rng = Rng::new(0xE1E_C7);
 
         let mlv = rng.f128_vec(m_bool - K_SKIP);
-        let x_ab = union.x_ab_from_mlv(rng.next_f128(), &mlv);
+        let x_ab = union.x_ab_from_mlv(SkipPoint::Phi8(rng.next_f128()), &mlv);
         assert_eq!(x_ab.x_outer.len(), union.n_log());
         assert_eq!(
             x_ab.x_inner_rest.len(),
@@ -2022,7 +2030,11 @@ mod tests {
         );
 
         let r_inner_rest = rng.f128_vec(1 + union.boolean_col_log());
-        let ab = union.ab_claim_point(rng.next_f128(), &r_inner_rest, &x_ab.x_outer);
+        let ab = union.ab_claim_point(
+            SkipPoint::Phi8(rng.next_f128()),
+            &r_inner_rest,
+            &x_ab.x_outer,
+        );
         let full = ab.x_inner_rest.len() + ab.x_outer.len();
         assert_eq!(full, m - K_SKIP, "the point must address the UNION space");
         assert!(
@@ -2038,7 +2050,7 @@ mod tests {
         );
 
         let r_rest = rng.f128_vec(m_bool - K_SKIP);
-        let c = union.c_claim_point(rng.next_f128(), &r_rest);
+        let c = union.c_claim_point(SkipPoint::Phi8(rng.next_f128()), &r_rest);
         assert_eq!(c.x_inner_rest.len() + c.x_outer.len(), m - K_SKIP);
         assert_eq!(&c.x_outer[..r_rest.len() - 1], &r_rest[1..]);
         assert!(

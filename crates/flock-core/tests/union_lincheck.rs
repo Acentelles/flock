@@ -16,8 +16,8 @@
 use flock_core::challenger::{Challenger, FsChallenger};
 use flock_core::field::F128;
 use flock_core::lincheck::{
-    self, LincheckCircuit, QuirkyPoint, SparseMatrixCircuit, UnionLincheckSlot, build_eq_table,
-    build_quirky_eq_table, pack_z_lincheck,
+    self, LincheckCircuit, QuirkyPoint, SkipPoint, SparseMatrixCircuit, UnionLincheckSlot,
+    build_eq_table, build_quirky_eq_table, pack_z_lincheck,
 };
 use flock_core::r1cs::SparseBinaryMatrix;
 use flock_core::schedule::{Registry, TableClass, TableType};
@@ -204,7 +204,7 @@ fn quirky_eval_addr(f: &[bool], z_skip: F128, rest: &[F128]) -> F128 {
 /// Brute-force quirky MLE of a semantic (column-inner, row-outer) Boolean
 /// vector at a semantic [`QuirkyPoint`].
 fn quirky_eval_sem(f: &[bool], k_log: usize, p: &QuirkyPoint) -> F128 {
-    let lambda = lagrange_weights_naive(K_SKIP, p.z_skip);
+    let lambda = lagrange_weights_naive(K_SKIP, p.z_skip.phi8());
     let eq_rest = build_eq_table(&p.x_inner_rest);
     let eq_outer = build_eq_table(&p.x_outer);
     let skip_mask = (1usize << K_SKIP) - 1;
@@ -234,7 +234,7 @@ fn single_type_union_lincheck_is_byte_identical() {
 
     let mut rng = Rng::new(0x0DD_0);
     let x_ab = QuirkyPoint {
-        z_skip: rng.f128(),
+        z_skip: SkipPoint::Phi8(rng.f128()),
         x_inner_rest: rng.f128_vec(k_log - K_SKIP),
         x_outer: rng.f128_vec(nu),
     };
@@ -341,7 +341,7 @@ fn two_type_union_lincheck_matches_brute_force() {
     let mut ch_p = FsChallenger::new(DOMAIN);
     let (zc_proof, zc_claim) =
         zerocheck::prove_packed_padded(&a_p, &b_p, &c_p, m, &padding, &mut ch_p);
-    let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
+    let x_ab = union.x_ab_from_mlv(SkipPoint::Phi8(zc_claim.z), &zc_claim.mlv_challenges);
     let lc_slots = [
         UnionLincheckSlot {
             z_lincheck: &stripe_a,
@@ -360,7 +360,7 @@ fn two_type_union_lincheck_matches_brute_force() {
     let mut ch_v = FsChallenger::new(DOMAIN);
     let zc_claim_v = zerocheck::verify(m, &zc_proof, &mut ch_v).expect("zerocheck must accept");
     assert_eq!(zc_claim_v, zc_claim);
-    let x_ab_v = union.x_ab_from_mlv(zc_claim_v.z, &zc_claim_v.mlv_challenges);
+    let x_ab_v = union.x_ab_from_mlv(SkipPoint::Phi8(zc_claim_v.z), &zc_claim_v.mlv_challenges);
     assert_eq!(x_ab_v, x_ab);
 
     let mut probe = ch_v.clone();
@@ -416,7 +416,7 @@ fn two_type_union_lincheck_matches_brute_force() {
         .collect();
     assert_eq!(
         lc_claim.w,
-        quirky_eval_addr(&z_addr, point.z_skip, &rest),
+        quirky_eval_addr(&z_addr, point.z_skip.phi8(), &rest),
         "final witness claim != brute-force union witness MLE"
     );
 
@@ -430,7 +430,8 @@ fn two_type_union_lincheck_matches_brute_force() {
         .zip(circuits)
         .map(|((ty, layout), circuit)| {
             let inner = ty.k_log - K_SKIP;
-            let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest[..inner], K_SKIP);
+            let eq_inner =
+                build_quirky_eq_table(x_ab.z_skip.phi8(), &x_ab.x_inner_rest[..inner], K_SKIP);
             let mut comb = circuit.fold_alpha_batched(alpha, &eq_inner);
             let w_t = lincheck::eq_prefix_weight(&x_ab.x_inner_rest[inner..], layout.prefix);
             for v in &mut comb {
@@ -447,7 +448,7 @@ fn two_type_union_lincheck_matches_brute_force() {
     // offsets (zero on gaps), pin added, then folded with the full eq tensor
     // over the bound challenges.
     let col_vars = m - nu;
-    let lambda = lagrange_weights_naive(K_SKIP, x_ab.z_skip);
+    let lambda = lagrange_weights_naive(K_SKIP, x_ab.z_skip.phi8());
     let mut dense = vec![F128::ZERO; 1 << col_vars];
     for (slot, layout) in [&slot_a, &slot_b].into_iter().zip(registry.slots()) {
         let inner = slot.k_log - K_SKIP;
@@ -512,7 +513,7 @@ fn two_type_union_lincheck_matches_brute_force() {
      -> Result<lincheck::LincheckClaim, lincheck::VerifyError> {
         let mut ch = FsChallenger::new(DOMAIN);
         let zc = zerocheck::verify(m, &zc_proof, &mut ch).expect("zerocheck side is untampered");
-        let x = union.x_ab_from_mlv(zc.z, &zc.mlv_challenges);
+        let x = union.x_ab_from_mlv(SkipPoint::Phi8(zc.z), &zc.mlv_challenges);
         lincheck::verify_union(union, &circuits, &x, zc.a_eval, zc.b_eval, proof, &mut ch)
     };
 
@@ -557,7 +558,10 @@ fn two_type_union_lincheck_matches_brute_force() {
     let mut ch_p_secure = FsChallenger::new(b"flock-union-lincheck-secure-v0");
     let (zc_proof_secure, zc_claim_secure) =
         zerocheck::prove_packed_padded(&a_p, &b_p, &c_p, m, &padding, &mut ch_p_secure);
-    let x_ab_secure = union.x_ab_from_mlv(zc_claim_secure.z, &zc_claim_secure.mlv_challenges);
+    let x_ab_secure = union.x_ab_from_mlv(
+        SkipPoint::Phi8(zc_claim_secure.z),
+        &zc_claim_secure.mlv_challenges,
+    );
     let (lc_proof_secure, lc_claim_secure, _) = lincheck::prove_union_capture_z_vec_with_grinding(
         &union,
         &lc_slots,
@@ -573,7 +577,10 @@ fn two_type_union_lincheck_matches_brute_force() {
     let mut ch_v_secure = FsChallenger::new(b"flock-union-lincheck-secure-v0");
     let zc_claim_secure_v = zerocheck::verify(m, &zc_proof_secure, &mut ch_v_secure)
         .expect("ungrinded zerocheck side must verify");
-    let x_ab_secure_v = union.x_ab_from_mlv(zc_claim_secure_v.z, &zc_claim_secure_v.mlv_challenges);
+    let x_ab_secure_v = union.x_ab_from_mlv(
+        SkipPoint::Phi8(zc_claim_secure_v.z),
+        &zc_claim_secure_v.mlv_challenges,
+    );
     let lc_claim_secure_v = lincheck::verify_union_with_grinding(
         &union,
         &circuits,
@@ -592,7 +599,7 @@ fn two_type_union_lincheck_matches_brute_force() {
     let mut ch_missing = FsChallenger::new(b"flock-union-lincheck-secure-v0");
     let zc_missing = zerocheck::verify(m, &zc_proof_secure, &mut ch_missing)
         .expect("ungrinded zerocheck side must verify");
-    let x_missing = union.x_ab_from_mlv(zc_missing.z, &zc_missing.mlv_challenges);
+    let x_missing = union.x_ab_from_mlv(SkipPoint::Phi8(zc_missing.z), &zc_missing.mlv_challenges);
     assert!(matches!(
         lincheck::verify_union_with_grinding(
             &union,
@@ -646,7 +653,7 @@ fn deferred_lincheck_matches_and_defers_the_matrix_work() {
     let mut ch_p = FsChallenger::new(DOMAIN);
     let (zc_proof, zc_claim) =
         zerocheck::prove_packed_padded(&a_p, &b_p, &c_p, m, &union.padding_spec(), &mut ch_p);
-    let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
+    let x_ab = union.x_ab_from_mlv(SkipPoint::Phi8(zc_claim.z), &zc_claim.mlv_challenges);
     let lc_slots = [
         UnionLincheckSlot {
             z_lincheck: &stripe_a,
@@ -665,7 +672,7 @@ fn deferred_lincheck_matches_and_defers_the_matrix_work() {
     let replay = || {
         let mut ch = FsChallenger::new(DOMAIN);
         let zc = zerocheck::verify(m, &zc_proof, &mut ch).expect("zerocheck untampered");
-        let x = union.x_ab_from_mlv(zc.z, &zc.mlv_challenges);
+        let x = union.x_ab_from_mlv(SkipPoint::Phi8(zc.z), &zc.mlv_challenges);
         (x, zc.a_eval, zc.b_eval, ch)
     };
 
@@ -772,7 +779,7 @@ fn matrix_assertion_decomposes_into_foldable_claims() {
     let mut ch_p = FsChallenger::new(DOMAIN);
     let (zc_proof, zc_claim) =
         zerocheck::prove_packed_padded(&a_p, &b_p, &c_p, m, &union.padding_spec(), &mut ch_p);
-    let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
+    let x_ab = union.x_ab_from_mlv(SkipPoint::Phi8(zc_claim.z), &zc_claim.mlv_challenges);
     let lc_slots = [UnionLincheckSlot {
         z_lincheck: &stripe,
         circuit: &circ,
@@ -783,7 +790,7 @@ fn matrix_assertion_decomposes_into_foldable_claims() {
     let circuits: Vec<&dyn LincheckCircuit> = vec![&circ];
     let mut ch_v = FsChallenger::new(DOMAIN);
     let zc = zerocheck::verify(m, &zc_proof, &mut ch_v).expect("zerocheck accepts");
-    let x = union.x_ab_from_mlv(zc.z, &zc.mlv_challenges);
+    let x = union.x_ab_from_mlv(SkipPoint::Phi8(zc.z), &zc.mlv_challenges);
     let (_, assertion) = lincheck::verify_union_deferred(
         &union, &circuits, &x, zc.a_eval, zc.b_eval, &lc_proof, &mut ch_v,
     )
@@ -884,7 +891,7 @@ fn reported_matrix_evals_agree_with_reading_the_matrices() {
     let mut ch_p = FsChallenger::new(DOMAIN);
     let (zc_proof, zc_claim) =
         zerocheck::prove_packed_padded(&a_p, &b_p, &c_p, m, &union.padding_spec(), &mut ch_p);
-    let x_ab = union.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
+    let x_ab = union.x_ab_from_mlv(SkipPoint::Phi8(zc_claim.z), &zc_claim.mlv_challenges);
     let lc_slots = [
         UnionLincheckSlot {
             z_lincheck: &stripe_a,
@@ -902,7 +909,7 @@ fn reported_matrix_evals_agree_with_reading_the_matrices() {
     let assertion_for = |proof: &lincheck::LincheckProof| {
         let mut ch = FsChallenger::new(DOMAIN);
         let zc = zerocheck::verify(m, &zc_proof, &mut ch).expect("zerocheck accepts");
-        let x = union.x_ab_from_mlv(zc.z, &zc.mlv_challenges);
+        let x = union.x_ab_from_mlv(SkipPoint::Phi8(zc.z), &zc.mlv_challenges);
         lincheck::verify_union_deferred(&union, &circuits, &x, zc.a_eval, zc.b_eval, proof, &mut ch)
             .map(|(_, a)| a)
     };
@@ -1026,7 +1033,7 @@ fn two_proofs_fold_two_to_one_per_matrix() {
         let mut ch = FsChallenger::new(DOMAIN);
         let (zc_proof, zc) =
             zerocheck::prove_packed_padded(&a_p, &b_p, &c_p, m, &union.padding_spec(), &mut ch);
-        let x_ab = union.x_ab_from_mlv(zc.z, &zc.mlv_challenges);
+        let x_ab = union.x_ab_from_mlv(SkipPoint::Phi8(zc.z), &zc.mlv_challenges);
         let (mut proof, _c, _g) = lincheck::prove_union_capture_z_vec(
             &union,
             &[UnionLincheckSlot {
@@ -1043,7 +1050,7 @@ fn two_proofs_fold_two_to_one_per_matrix() {
         let circuits: Vec<&dyn LincheckCircuit> = vec![&circ];
         let mut chv = FsChallenger::new(DOMAIN);
         let zcv = zerocheck::verify(m, &zc_proof, &mut chv).expect("zerocheck accepts");
-        let xv = union.x_ab_from_mlv(zcv.z, &zcv.mlv_challenges);
+        let xv = union.x_ab_from_mlv(SkipPoint::Phi8(zcv.z), &zcv.mlv_challenges);
         let (_, assertion) = lincheck::verify_union_deferred(
             &union, &circuits, &xv, zcv.a_eval, zcv.b_eval, &proof, &mut chv,
         )
@@ -1141,7 +1148,7 @@ fn aggregating_real_proofs_defers_all_matrix_work_to_one_discharge() {
         let mut ch = FsChallenger::new(DOMAIN);
         let (zc_proof, zc) =
             zerocheck::prove_packed_padded(&a_p, &b_p, &c_p, m, &union.padding_spec(), &mut ch);
-        let x_ab = union.x_ab_from_mlv(zc.z, &zc.mlv_challenges);
+        let x_ab = union.x_ab_from_mlv(SkipPoint::Phi8(zc.z), &zc.mlv_challenges);
         let (mut proof, _c, _g) = lincheck::prove_union_capture_z_vec(
             &union,
             &[UnionLincheckSlot {
@@ -1157,7 +1164,7 @@ fn aggregating_real_proofs_defers_all_matrix_work_to_one_discharge() {
         let circuits: Vec<&dyn LincheckCircuit> = vec![&circ];
         let mut chv = FsChallenger::new(DOMAIN);
         let zcv = zerocheck::verify(m, &zc_proof, &mut chv).expect("zerocheck accepts");
-        let xv = union.x_ab_from_mlv(zcv.z, &zcv.mlv_challenges);
+        let xv = union.x_ab_from_mlv(SkipPoint::Phi8(zcv.z), &zcv.mlv_challenges);
         lincheck::verify_union_deferred(
             &union, &circuits, &xv, zcv.a_eval, zcv.b_eval, &proof, &mut chv,
         )

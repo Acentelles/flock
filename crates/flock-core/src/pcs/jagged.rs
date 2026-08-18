@@ -1534,7 +1534,7 @@ pub(crate) fn build_merged_weight_and_prime(
                 table,
             } => (
                 build_eq_table(z_row),
-                ColSide::Fold(build_eq_table(z_col), *table),
+                ColSide::Fold(build_eq_table(z_col), table),
             ),
             MergedWeightClaim::Scalar { z_row, cols } => {
                 (build_eq_table(z_row), ColSide::Combined(cols))
@@ -5498,7 +5498,7 @@ mod tests {
             (2706, 26),
             (2582, 29),
         ] {
-            heights.extend(std::iter::repeat(h).take(c));
+            heights.extend(std::iter::repeat_n(h, c));
         }
         while heights.len() < 687 {
             heights.push(341);

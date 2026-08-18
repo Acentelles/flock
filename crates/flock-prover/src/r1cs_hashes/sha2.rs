@@ -1200,7 +1200,6 @@ impl Sha256HybridSetup {
         Self::with_log_inv_rate(n_compressions, 1)
     }
 
-
     /// Row-major witness for the Merkle-path protocol (its region openings
     /// assume the padded block-major layout).
     fn generate_witness_ab(

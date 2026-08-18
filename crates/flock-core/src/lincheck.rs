@@ -118,6 +118,7 @@
 
 use crate::challenger::Challenger;
 use crate::field::F128;
+use crate::genus95_curve_code::{EvaluationPoint, base_evaluation_functional};
 use crate::r1cs::SparseBinaryMatrix;
 use crate::zerocheck::multilinear::lagrange_weights_naive;
 use serde::{Deserialize, Serialize};
@@ -137,8 +138,9 @@ pub use union::{
 pub use kernels::partial_fold_packed_z_x86_tiled_padded;
 #[cfg(target_arch = "aarch64")]
 pub use kernels::{
-    partial_fold_packed_z_neon_iblock_padded, partial_fold_packed_z_neon_oblock_padded,
-    partial_fold_packed_z_neon_single, partial_fold_packed_z_neon_single_padded,
+    partial_fold_packed_z_neon_allcore_padded, partial_fold_packed_z_neon_iblock_padded,
+    partial_fold_packed_z_neon_oblock_padded, partial_fold_packed_z_neon_single,
+    partial_fold_packed_z_neon_single_padded,
 };
 
 /// Bench-only A/B toggle: when set, [`partial_fold_packed_z_best`] uses the legacy
@@ -149,6 +151,62 @@ pub use kernels::{
 /// builds each tile's sum-tables once instead of once per worker, scaling the fold
 /// ~8.5× vs iblock's ~6.5× on 10 P-cores at m=32. See `benches/lincheck.rs` (FOLD_AB=1).
 pub static FOLD_IBLOCK: AtomicBool = AtomicBool::new(false);
+
+/// A/B toggle: when set, lincheck's two heavy passes (the z partial fold and
+/// `fold_alpha_batched`) stay on the caller's (P-core) rayon pool instead of
+/// [`crate::all_core_pool`]. Both passes are flat parallel-fors with dynamic
+/// work assignment, so the work-stealing scheduler drains around the slower
+/// E-cores and the extra cores are a straight throughput win (same shape as
+/// the PCS combine's −29%). Thread count / pool choice cannot change output
+/// bits: the alpha fold writes every slot deterministically and the partial
+/// fold is an XOR reduction of per-worker partials. `LINCHECK_PCORES_ONLY=1`
+/// in the environment forces the same fallback (production kill-switch);
+/// the AtomicBool exists for paired within-process A/B (see
+/// `benches/lincheck.rs`, `ALLCORE_AB=1`).
+pub static LC_PCORES_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// True when lincheck's passes may hop to the all-core (P+E) pool at all:
+/// not disabled (atomic or env), and the all-core pool actually has more
+/// threads than the caller's pool (under `RAYON_NUM_THREADS=1` both are 1,
+/// so ST parity conventions hold automatically). The prover's partial fold
+/// additionally requires an E-rich topology (see [`lincheck_use_all_cores`]);
+/// the alpha fold does not — from the verify context the P-pool runs it at
+/// ~11 ms vs ~2.3 ms all-core on 4P+4E, and the same ~10.2 → ~2.9 ms verify
+/// win reproduces on 10P+4E, so the hop pays on every measured topology.
+fn lincheck_all_cores_enabled() -> bool {
+    !LC_PCORES_ONLY.load(std::sync::atomic::Ordering::Relaxed)
+        && std::env::var("LINCHECK_PCORES_ONLY").is_err()
+        && crate::all_core_pool().current_num_threads() > rayon::current_num_threads()
+}
+
+/// [`lincheck_all_cores_enabled`] plus the E-rich topology requirement — the
+/// gate for the prover's z partial fold, where the hop measures as a win only
+/// with a large-enough E-cluster (see [`crate::ecore_rich_topology`] — on
+/// 10P+4E it is a ~13% LOSS, `FLOCK_ALLCORE=1` overrides).
+// Only consulted by the aarch64 partial-fold dispatch; dead elsewhere.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn lincheck_use_all_cores() -> bool {
+    lincheck_all_cores_enabled() && crate::ecore_rich_topology()
+}
+
+/// `circuit.fold_alpha_batched` on the all-core pool when profitable. The
+/// alpha fold is a flat per-column gather (cost ∝ NNZ, e.g. ~21M for BLAKE3)
+/// — the same drain-friendly shape as the partial fold. Only worth the pool
+/// hop when the column loop parallelizes at all; identical output either way
+/// (every slot written deterministically). Shared by prover and verifier —
+/// and deliberately NOT topology-gated: the verify-context win is large on
+/// both measured topologies (see [`lincheck_all_cores_enabled`]).
+fn fold_alpha_batched_pooled(
+    circuit: &dyn LincheckCircuit,
+    alpha: F128,
+    eq_inner: &[F128],
+) -> Vec<F128> {
+    if circuit.n_cols() >= SUMCHECK_PAR_THRESHOLD && lincheck_all_cores_enabled() {
+        crate::all_core_pool().install(|| circuit.fold_alpha_batched(alpha, eq_inner))
+    } else {
+        circuit.fold_alpha_batched(alpha, eq_inner)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // LincheckCircuit: the per-block linear structure lincheck consumes
@@ -441,8 +499,10 @@ impl LincheckCircuit for CscCircuit {
 /// zerocheck's extract_c output uses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QuirkyPoint {
-    /// Univariate-skip challenge ∈ F₁₂₈. Binds all `k_skip` skip variables.
-    pub z_skip: F128,
+    /// Univariate-skip challenge. Binds all `k_skip` skip variables. φ₈ point
+    /// (`SkipPoint::Phi8`) for the RS path, AG `EvaluationPoint`
+    /// (`SkipPoint::Ag`) for the AG zerocheck's claims.
+    pub z_skip: SkipPoint,
     /// Multilinear coords for the inner dims *after* the skip block. Length
     /// `k_log − k_skip`.
     pub x_inner_rest: Vec<F128>,
@@ -572,8 +632,8 @@ impl LincheckGrinding {
 /// (publicly known to the caller).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LincheckClaim {
-    /// Univariate-skip post-vector random sample.
-    pub r_inner_skip: F128,
+    /// Univariate-skip post-vector random sample (same basis as the input skip).
+    pub r_inner_skip: SkipPoint,
     /// Multilinear post-vector random sample, length `k_log − k_skip`.
     pub r_inner_rest: Vec<F128>,
     /// `ẑ((r_inner_skip, r_inner_rest), x_ab.x_outer)` — the single
@@ -934,6 +994,17 @@ fn partial_fold_packed_z_best(
             let n_log = m - k_log;
             if n_log >= OBLOCK_MIN_N_LOG && !FOLD_IBLOCK.load(std::sync::atomic::Ordering::Relaxed)
             {
+                // Large folds additionally hop to the all-core (P+E) pool —
+                // dynamic tile assignment drains around the slower E-cores.
+                if lincheck_use_all_cores() {
+                    return partial_fold_packed_z_neon_allcore_padded(
+                        z_packed,
+                        m,
+                        k_log,
+                        useful_bits,
+                        eq_outer,
+                    );
+                }
                 return partial_fold_packed_z_neon_oblock_padded(
                     z_packed,
                     m,
@@ -1111,35 +1182,113 @@ pub fn pack_z_lincheck_from_packed(
     z_packed
 }
 
-/// Build the **quirky eq table** for a claim point on the inner half:
+/// A univariate-skip evaluation point in one of the two supported bases. Both
+/// yield the length-`2^k_skip` skip evaluation functional via
+/// [`SkipPoint::weights`], which feeds [`build_quirky_eq_table_from_weights`]
+/// (the AB claim's input skip) and the lincheck output z-claim value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkipPoint {
+    /// RS / φ₈ basis: a single field point; weights via `lagrange_weights_naive`.
+    Phi8(F128),
+    /// AG multiplication-code basis: a genus-95 curve point; weights via the
+    /// base-code evaluation functional. Always `k_skip = 6` (64 base coords).
+    Ag(EvaluationPoint),
+}
+
+impl SkipPoint {
+    /// The length-`2^k_skip` skip evaluation functional at this point.
+    pub fn weights(&self, k_skip: usize) -> Vec<F128> {
+        match self {
+            SkipPoint::Phi8(z) => lagrange_weights_naive(k_skip, *z),
+            SkipPoint::Ag(p) => {
+                debug_assert_eq!(
+                    k_skip,
+                    crate::zerocheck::ag_skip::K_SKIP,
+                    "AG base code is k_skip=6 only"
+                );
+                let bf = base_evaluation_functional(p)
+                    .expect("AG base evaluation functional: denominator nonzero at point");
+                (0..(1usize << k_skip)).map(|i| bf[i]).collect()
+            }
+        }
+    }
+
+    /// Sample a fresh skip point of the **same basis** as `self` from the
+    /// challenger. Call AFTER observing the preceding prover message (e.g.
+    /// `z_partial`) so the point is post-commitment for Schwartz-Zippel. The AG
+    /// arm seeds a hash-matched DRBG (`FsRng`, following the transcript hash)
+    /// from two F128 squeezes and replays the rejection sampler on both sides (unlike the zerocheck's `r₁`, which now uses the
+    /// prover-side nonce grind — see `ag_skip::sample_r1_prover`).
+    pub fn sample_fresh<Ch: crate::challenger::Challenger>(&self, ch: &mut Ch) -> SkipPoint {
+        match self {
+            SkipPoint::Phi8(_) => SkipPoint::Phi8(ch.sample_f128()),
+            SkipPoint::Ag(_) => {
+                ch.observe_label(b"flock-lincheck-ag-skip-point");
+                let s0 = ch.sample_f128();
+                let s1 = ch.sample_f128();
+                let mut seed = [0u8; 32];
+                seed[0..8].copy_from_slice(&s0.lo.to_le_bytes());
+                seed[8..16].copy_from_slice(&s0.hi.to_le_bytes());
+                seed[16..24].copy_from_slice(&s1.lo.to_le_bytes());
+                seed[24..32].copy_from_slice(&s1.hi.to_le_bytes());
+                let p = crate::genus95_curve_code::sample_random_evaluation_point(
+                    &mut crate::genus95_curve_code::FsRng::new(ch.hash_kind(), seed),
+                )
+                .unwrap_or_else(|_| crate::zerocheck::ag_skip::fallback_point());
+                SkipPoint::Ag(p)
+            }
+        }
+    }
+
+    /// Extract the φ₈ field point. Panics on an AG point — used at RS PCS-verify
+    /// boundaries that still operate on a single `F128 z_skip` and have not been
+    /// generalized to the AG clear-tail eval (#6). Keeps the RS path's `F128`
+    /// interface unchanged while the claim types carry `SkipPoint`.
+    pub fn phi8(&self) -> F128 {
+        match self {
+            SkipPoint::Phi8(z) => *z,
+            SkipPoint::Ag(_) => {
+                panic!(
+                    "SkipPoint::phi8 on an AG point — the AG PCS clear-tail path (#6) is not wired"
+                )
+            }
+        }
+    }
+}
+
+/// Build the **quirky eq table** from a precomputed skip-weight vector tensored
+/// with `eq(x_inner_rest)`:
 ///
 ///   `out[i_skip + i_inner_rest · 2^k_skip]
-///     = L_{i_skip}(z_skip)  ·  eq(x_inner_rest, i_inner_rest)`
+///     = skip_weights[i_skip] · eq(x_inner_rest, i_inner_rest)`
 ///
-/// where `L_{i_skip}` are Lagrange weights at `z_skip` for the φ_8 basis
-/// over `{0, …, 2^k_skip − 1}`. Length: `2^k_log`.
-///
-/// Encoding: the skip dim occupies the **low** `k_skip` bits of the table
-/// index (matches z_packed's stripe layout / zerocheck's LSB-first
-/// univariate-skip variable ordering). The `k_log − k_skip` multilinear
-/// inner-rest dims occupy the next bits.
-///
-/// Cost: 64 (Lagrange) + 32 (eq) + 2048 outer products ≈ tiny.
-pub fn build_quirky_eq_table(z_skip: F128, x_inner_rest: &[F128], k_skip: usize) -> Vec<F128> {
-    let ell_skip = 1usize << k_skip;
-    let ell_rest = 1usize << x_inner_rest.len();
-    let lambda_skip = lagrange_weights_naive(k_skip, z_skip);
+/// `skip_weights` (length `2^k_skip`) is the skip dimension's **evaluation
+/// functional** at its challenge: φ₈ Lagrange (`lagrange_weights_naive`, the RS
+/// path) or the AG base-code functional (`genus95_curve_code::
+/// base_evaluation_functional`, the native-`c` path). Encoding: the skip dim is
+/// the **low** `k_skip` table-index bits, the `inner_rest` dims the next bits.
+pub fn build_quirky_eq_table_from_weights(
+    skip_weights: &[F128],
+    x_inner_rest: &[F128],
+) -> Vec<F128> {
     let eq_rest = build_eq_table(x_inner_rest);
-    let total = ell_skip * ell_rest;
+    let total = skip_weights.len() * eq_rest.len();
     let mut out = Vec::with_capacity(total);
     // Layout: index = i_skip + i_inner_rest · 2^k_skip  ⇒  i_skip is low bits.
     for &er in &eq_rest {
-        for &ls in &lambda_skip {
+        for &ls in skip_weights {
             out.push(ls * er);
         }
     }
     debug_assert_eq!(out.len(), total);
     out
+}
+
+/// φ₈ (RS-path) quirky eq table: `skip_weights = L_{i_skip}(z_skip)` for the
+/// φ₈ basis over `{0,…,2^k_skip−1}`. Thin wrapper over
+/// [`build_quirky_eq_table_from_weights`]. Cost ≈ tiny.
+pub fn build_quirky_eq_table(z_skip: F128, x_inner_rest: &[F128], k_skip: usize) -> Vec<F128> {
+    build_quirky_eq_table_from_weights(&lagrange_weights_naive(k_skip, z_skip), x_inner_rest)
 }
 
 /// Dot product of two equal-length F128 slices.
@@ -1605,7 +1754,8 @@ fn prove_padded_inner<Ch: Challenger>(
     } else {
         None
     };
-    let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
+    let eq_inner =
+        build_quirky_eq_table_from_weights(&x_ab.z_skip.weights(k_skip), &x_ab.x_inner_rest);
     if let Some(t) = t {
         eprintln!(
             "[lc] {:<26} {:>7.2} ms",
@@ -1618,7 +1768,7 @@ fn prove_padded_inner<Ch: Challenger>(
     } else {
         None
     };
-    let mut comb_vec = circuit.fold_alpha_batched(alpha, &eq_inner);
+    let mut comb_vec = fold_alpha_batched_pooled(circuit, alpha, &eq_inner);
     if let Some(t) = t {
         eprintln!(
             "[lc] {:<26} {:>7.2} ms",
@@ -1673,6 +1823,7 @@ fn prove_padded_inner<Ch: Challenger>(
         comb_vec,
         z_vec,
         k_skip,
+        &x_ab.z_skip,
         trace,
         grinding,
         &mut grinding_nonces,
@@ -1693,6 +1844,7 @@ fn column_sumcheck_prove<Ch: Challenger>(
     mut comb_vec: Vec<F128>,
     mut z_vec: Vec<F128>,
     k_skip: usize,
+    z_skip: &SkipPoint,
     trace: bool,
     grinding: LincheckGrinding,
     grinding_nonces: &mut Vec<u64>,
@@ -1758,17 +1910,29 @@ fn column_sumcheck_prove<Ch: Challenger>(
     // 7. Sample fresh z_skip AFTER observing z_partial — gives Schwartz-Zippel
     //    soundness on the φ8 (univariate-skip) dim.
     let r_inner_skip = if let Some(bits) = grinding.skip_bits(k_skip) {
-        let (nonce, r) = challenger.grind_pow_and_sample_f128(bits);
-        grinding_nonces.push(nonce);
-        r
+        match z_skip {
+            // Grinding profiles run the φ₈ basis; keep the FUSED PoW+squeeze
+            // transcript (byte-pinned on the chained-BLAKE3 challenger).
+            SkipPoint::Phi8(_) => {
+                let (nonce, r) = challenger.grind_pow_and_sample_f128(bits);
+                grinding_nonces.push(nonce);
+                SkipPoint::Phi8(r)
+            }
+            // No grinding profile uses the AG basis today; compose the two
+            // operations sequentially if one ever does.
+            SkipPoint::Ag(_) => {
+                grinding_nonces.push(challenger.grind_pow(bits));
+                z_skip.sample_fresh(challenger)
+            }
+        }
     } else {
-        challenger.sample_f128()
+        z_skip.sample_fresh(challenger)
     };
 
     // 8. Output claim's value: φ8 Lagrange combination of z_partial at z_skip.
     //    Equals ẑ_φ8(z_skip, r_rest, x_outer) when z_partial is honest; the
     //    PCS catches mismatches downstream.
-    let lambda = lagrange_weights_naive(k_skip, r_inner_skip);
+    let lambda = r_inner_skip.weights(k_skip);
     let w = inner_product(&lambda, &z_partial);
 
     // 9. Convert sumcheck challenges to LSB-first `x_inner_rest` order. The
@@ -1922,7 +2086,8 @@ pub fn verify_with_grinding<Ch: Challenger>(
     //    the prover made — sparse default delegates to the fused row-fold;
     //    per-hash impls walk the constraint graph directly).
     let t = std::time::Instant::now();
-    let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
+    let eq_inner =
+        build_quirky_eq_table_from_weights(&x_ab.z_skip.weights(k_skip), &x_ab.x_inner_rest);
     if trace {
         eprintln!(
             "        [lcv] build_quirky_eq_table (2^{k_log}): {}",
@@ -1930,7 +2095,7 @@ pub fn verify_with_grinding<Ch: Challenger>(
         );
     }
     let t = std::time::Instant::now();
-    let mut comb_vec = circuit.fold_alpha_batched(alpha, &eq_inner);
+    let mut comb_vec = fold_alpha_batched_pooled(circuit, alpha, &eq_inner);
     if trace {
         eprintln!(
             "        [lcv] circuit.fold_alpha_batched: {}",
@@ -2007,15 +2172,28 @@ pub fn verify_with_grinding<Ch: Challenger>(
 
     // 6. Sample fresh z_skip AFTER z_partial — gives SZ on the φ8 dim.
     let r_inner_skip = if let Some(bits) = grinding.skip_bits(k_skip) {
-        let r = challenger
-            .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
-            .ok_or(VerifyError::InvalidGrindingNonce {
-                which: "inner-skip",
-            })?;
-        nonce_idx += 1;
-        r
+        match &x_ab.z_skip {
+            SkipPoint::Phi8(_) => {
+                let r = challenger
+                    .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
+                    .ok_or(VerifyError::InvalidGrindingNonce {
+                        which: "inner-skip",
+                    })?;
+                nonce_idx += 1;
+                SkipPoint::Phi8(r)
+            }
+            SkipPoint::Ag(_) => {
+                if !challenger.verify_pow(proof.grinding_nonces[nonce_idx], bits) {
+                    return Err(VerifyError::InvalidGrindingNonce {
+                        which: "inner-skip",
+                    });
+                }
+                nonce_idx += 1;
+                x_ab.z_skip.sample_fresh(challenger)
+            }
+        }
     } else {
-        challenger.sample_f128()
+        x_ab.z_skip.sample_fresh(challenger)
     };
     debug_assert_eq!(nonce_idx, proof.grinding_nonces.len());
 
@@ -2023,7 +2201,7 @@ pub fn verify_with_grinding<Ch: Challenger>(
     //    Equals ẑ_φ8(z_skip, r_rest, x_outer) when z_partial is honest;
     //    PCS catches mismatches downstream.
     let t = std::time::Instant::now();
-    let lambda = lagrange_weights_naive(k_skip, r_inner_skip);
+    let lambda = r_inner_skip.weights(k_skip);
     let w = inner_product(&lambda, &proof.z_partial);
     if trace {
         eprintln!(
@@ -2099,7 +2277,7 @@ mod tests {
     /// x_inner_rest of length `k_log − k_skip`, x_outer of length `n_log`.
     fn random_quirky_point(m: usize, k_log: usize, k_skip: usize, rng: &mut Rng) -> QuirkyPoint {
         QuirkyPoint {
-            z_skip: rng.f128(),
+            z_skip: SkipPoint::Phi8(rng.f128()),
             x_inner_rest: rng.f128_vec(k_log - k_skip),
             x_outer: rng.f128_vec(m - k_log),
         }
@@ -2127,7 +2305,7 @@ mod tests {
         let n_outer = 1usize << (m - k_log);
         assert_eq!(f.len(), 1 << m);
 
-        let lambda = crate::zerocheck::multilinear::lagrange_weights_naive(k_skip, point.z_skip);
+        let lambda = point.z_skip.weights(k_skip);
         let eq_rest = build_eq_table(&point.x_inner_rest);
         let eq_outer = build_eq_table(&point.x_outer);
         debug_assert_eq!(lambda.len(), k_skip_dim);
@@ -2720,7 +2898,8 @@ mod tests {
 
         // Pick a mutation position where BOTH row vectors are nonzero so the
         // mutation guarantees both checks would diverge.
-        let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
+        let eq_inner =
+            build_quirky_eq_table_from_weights(&x_ab.z_skip.weights(k_skip), &x_ab.x_inner_rest);
         let row_a = sparse_row_fold(&a_0, &eq_inner);
         let row_b = sparse_row_fold(&b_0, &eq_inner);
         let idx = (0..k)

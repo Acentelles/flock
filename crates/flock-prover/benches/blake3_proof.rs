@@ -97,10 +97,9 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
 
     // BLAKE3_PROFILE=fast|slim|secure selects the Ligerito profile (default fast).
     let mut setup = match std::env::var("BLAKE3_PROFILE").as_deref() {
-        Ok("slim") => Blake3Setup::with_profile(
-            n_blocks,
-            flock_prover::pcs::ligerito::LigeritoProfile::Slim,
-        ),
+        Ok("slim") => {
+            Blake3Setup::with_profile(n_blocks, flock_prover::pcs::ligerito::LigeritoProfile::Slim)
+        }
         Ok("secure") => Blake3Setup::with_profile(
             n_blocks,
             flock_prover::pcs::ligerito::LigeritoProfile::Secure,

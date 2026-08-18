@@ -414,9 +414,21 @@ fn fold_step_split_base(a: &[F256], lo: usize, hi: usize, r: F256) -> F256 {
     F256::new(a[lo].c0 + r.c0 * x, r.c1 * x)
 }
 
-fused_fold_msg!(fused_fold_msg_base, F128, F128, fold_step_base, fold_step_base);
+fused_fold_msg!(
+    fused_fold_msg_base,
+    F128,
+    F128,
+    fold_step_base,
+    fold_step_base
+);
 fused_fold_msg!(fused_fold_msg_ext, F256, F256, fold_step_ext, fold_step_ext);
-fused_fold_msg!(fused_fold_msg_fbase, F256, F256, fold_step_split_base, fold_step_ext);
+fused_fold_msg!(
+    fused_fold_msg_fbase,
+    F256,
+    F256,
+    fold_step_split_base,
+    fold_step_ext
+);
 
 /// The fused kernel applies exactly when `next_round_msg(folded, d)` keeps
 /// the blocked pairing the sweep produces.
@@ -878,6 +890,14 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
     l0_jit_basis: Option<BasisWindowFn<'_>>,
     l0_virtual_basis: Option<VirtualEqBasis>,
     mut first_msg: Option<SumcheckMessage>,
+    // Round-1 coefficients from the pcs combine's fused lookahead pass. The
+    // F128 driver consumed these via the fold_skip/fold2 state machine; this
+    // F256-ladder driver has no lookahead kernels yet, so they are accepted
+    // (the combine computes them either way) and unused — porting the
+    // two-rounds-per-pass schedule onto the ladder's fused folds is the
+    // recorded follow-up. Ignoring them cannot change the transcript: the
+    // lookahead is an exact polynomial identity over the same messages.
+    _round1_lookahead: Option<FoldLookahead>,
     challenger: &mut Ch,
 ) -> LigeritoProof {
     let log_n = packed_witness.len().trailing_zeros() as usize;
@@ -1270,8 +1290,8 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
         for _ in 0..ood_count(next_level) {
             let z = challenger.sample_f128_vec(current_split_dim);
             let (msg, y) = sumcheck.introduce_ood_with_eval(
-            crate::pcs::ring_switch::build_eq_scaled_parallel(&z, F128::ONE),
-        );
+                crate::pcs::ring_switch::build_eq_scaled_parallel(&z, F128::ONE),
+            );
             challenger.observe_f128(y);
             ood_values.push(y);
             observe_message(challenger, msg);
@@ -1788,11 +1808,8 @@ where
             }
 
             for context in &consistency_contexts {
-                let fixed = if context.start_level == 0 {
-                    residual_original_challenges(&[], &level_challenges, context.start_level)
-                } else {
-                    residual_original_challenges(&[], &level_challenges, context.start_level)
-                };
+                let fixed =
+                    residual_original_challenges(&[], &level_challenges, context.start_level);
                 let values = induced_basis_at_residual(
                     context.log_cols,
                     &context.queries,
@@ -2092,7 +2109,10 @@ mod tests {
             (19, 1 << 16),
         ] {
             let n = 1usize << log_n;
-            assert!(fused_fold_applies(n, d), "case must exercise the fused path");
+            assert!(
+                fused_fold_applies(n, d),
+                "case must exercise the fused path"
+            );
             let r = random_f256(&mut rng);
             let fb: Vec<F128> = (0..n).map(|_| rng.sample_f128()).collect();
             let bb: Vec<F128> = (0..n).map(|_| rng.sample_f128()).collect();
@@ -2101,7 +2121,11 @@ mod tests {
             let eb = fold_base(&bb, r, d);
             assert_eq!(nf, ef, "base fold f (log_n {log_n}, d {d})");
             assert_eq!(nb, eb, "base fold b (log_n {log_n}, d {d})");
-            assert_eq!(msg, next_round_msg(&ef, &eb, d), "base msg (log_n {log_n}, d {d})");
+            assert_eq!(
+                msg,
+                next_round_msg(&ef, &eb, d),
+                "base msg (log_n {log_n}, d {d})"
+            );
             let fx: Vec<F256> = (0..n).map(|_| random_f256(&mut rng)).collect();
             let bx: Vec<F256> = (0..n).map(|_| random_f256(&mut rng)).collect();
             let (nf, nb, msg) = fused_fold_msg_ext(&fx, &bx, r, d);
@@ -2109,7 +2133,11 @@ mod tests {
             let eb = fold_extension(&bx, r, d);
             assert_eq!(nf, ef, "ext fold f (log_n {log_n}, d {d})");
             assert_eq!(nb, eb, "ext fold b (log_n {log_n}, d {d})");
-            assert_eq!(msg, next_round_msg(&ef, &eb, d), "ext msg (log_n {log_n}, d {d})");
+            assert_eq!(
+                msg,
+                next_round_msg(&ef, &eb, d),
+                "ext msg (log_n {log_n}, d {d})"
+            );
         }
         // Boundary shapes take the fallback, not the fused sweep.
         assert!(!fused_fold_applies(2, 2));
@@ -2150,9 +2178,18 @@ mod tests {
     #[test]
     fn fused_first_fold_virtual_matches_unfused() {
         let mut rng = RandomChallenger::new(0xF1_057F_01D);
-        for &(log_n, d) in &[(6usize, 1usize), (12, 1), (13, 16), (18, 1 << 15), (19, 1 << 16)] {
+        for &(log_n, d) in &[
+            (6usize, 1usize),
+            (12, 1),
+            (13, 16),
+            (18, 1 << 15),
+            (19, 1 << 16),
+        ] {
             let n = 1usize << log_n;
-            assert!(fused_fold_applies(n, d), "case must exercise the fused path");
+            assert!(
+                fused_fold_applies(n, d),
+                "case must exercise the fused path"
+            );
             let f: Vec<F128> = (0..n).map(|_| rng.sample_f128()).collect();
             let z1: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
             let z2: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();

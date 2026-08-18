@@ -57,42 +57,6 @@ impl std::fmt::Display for HashKind {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Every variant, for tests that sweep both.
-    pub(crate) const ALL: [HashKind; 2] = [HashKind::Sha256, HashKind::Blake3];
-
-    #[test]
-    fn parses_and_round_trips() {
-        for kind in ALL {
-            assert_eq!(HashKind::parse(kind.as_str()).unwrap(), kind);
-            assert_eq!(kind.to_string(), kind.as_str());
-        }
-        assert_eq!(HashKind::parse("BLAKE3").unwrap(), HashKind::Blake3);
-        assert_eq!(HashKind::parse("sha-256").unwrap(), HashKind::Sha256);
-        assert_eq!(HashKind::parse("  blake3 ").unwrap(), HashKind::Blake3);
-        assert_eq!(HashKind::default(), HashKind::Sha256);
-        // An unrecognized hash must be an error, never a silent SHA-256.
-        assert!(HashKind::parse("keccak").is_err());
-        assert!(HashKind::parse("").is_err());
-    }
-
-    #[test]
-    fn serde_uses_config_spellings() {
-        for kind in ALL {
-            let json = serde_json::to_string(&kind).unwrap();
-            assert_eq!(json, format!("\"{}\"", kind.as_str()));
-            assert_eq!(
-                serde_json::from_str::<HashKind>(&json).unwrap(),
-                kind,
-                "{kind}"
-            );
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // The raw BLAKE3 compression function.
 //
@@ -175,4 +139,40 @@ pub fn blake3_compress(
         state[i + 8] ^= cv[i];
     }
     state
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every variant, for tests that sweep both.
+    pub(crate) const ALL: [HashKind; 2] = [HashKind::Sha256, HashKind::Blake3];
+
+    #[test]
+    fn parses_and_round_trips() {
+        for kind in ALL {
+            assert_eq!(HashKind::parse(kind.as_str()).unwrap(), kind);
+            assert_eq!(kind.to_string(), kind.as_str());
+        }
+        assert_eq!(HashKind::parse("BLAKE3").unwrap(), HashKind::Blake3);
+        assert_eq!(HashKind::parse("sha-256").unwrap(), HashKind::Sha256);
+        assert_eq!(HashKind::parse("  blake3 ").unwrap(), HashKind::Blake3);
+        assert_eq!(HashKind::default(), HashKind::Sha256);
+        // An unrecognized hash must be an error, never a silent SHA-256.
+        assert!(HashKind::parse("keccak").is_err());
+        assert!(HashKind::parse("").is_err());
+    }
+
+    #[test]
+    fn serde_uses_config_spellings() {
+        for kind in ALL {
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(json, format!("\"{}\"", kind.as_str()));
+            assert_eq!(
+                serde_json::from_str::<HashKind>(&json).unwrap(),
+                kind,
+                "{kind}"
+            );
+        }
+    }
 }

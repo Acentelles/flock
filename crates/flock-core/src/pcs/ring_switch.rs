@@ -131,21 +131,24 @@ impl ChunkPadding {
 }
 
 /// Build the 128-entry weights vector for the verifier's ring-switching claim
-/// check, given the zerocheck's `z_skip` (univariate-skip coord, absorbs 6
-/// boolean coords via the φ_8 basis) and `x_outer_0` (the 7th prefix bit, a
-/// fresh F_{2^128} multilinear coord).
+/// check from a precomputed 64-entry **skip evaluation functional** and
+/// `x_outer_0` (the 7th packing-prefix bit, a multilinear coord).
 ///
 /// ```text
-/// weights[i] = ν_φ8(i & 63)(z_skip) · eq(x_outer_0, (i >> 6) & 1)
+/// weights[i] = skip_weights[i & 63] · eq(x_outer_0, (i >> 6) & 1)
 ///            for i ∈ {0..128}
 /// ```
 ///
-/// `i & 63` selects the low 6 bits (LCH dimensions); `(i >> 6) & 1` is the 7th
-/// bit (a standard multilinear coord).
-pub fn build_claim_weights(z_skip: F128, x_outer_0: F128) -> Vec<F128> {
+/// `i & 63` selects the low 6 bits (the skip dimension); `(i >> 6) & 1` is the
+/// 7th packing bit. `skip_weights` is the skip dim's evaluation functional at
+/// its challenge in EITHER basis: φ₈ Lagrange (`lagrange_weights_naive`, the RS
+/// path — see [`build_claim_weights`]) or the AG base-code functional
+/// (`genus95_curve_code::base_evaluation_functional`, the AG-skip path). The
+/// skip stays inside the packing prefix in both bases; the ring-switch suffix
+/// machinery (`fold_b128` / `eval_rs_eq`) never sees it, so it is untouched.
+pub fn build_claim_weights_from_skip(skip_weights: &[F128], x_outer_0: F128) -> Vec<F128> {
     const K_SKIP: usize = 6;
-    let lambda = lagrange_weights_naive(K_SKIP, z_skip); // length 64
-    debug_assert_eq!(lambda.len(), 1 << K_SKIP);
+    debug_assert_eq!(skip_weights.len(), 1 << K_SKIP);
 
     let eq_lo = F128::ONE + x_outer_0; // eq(x_outer_0, 0)
     let eq_hi = x_outer_0; // eq(x_outer_0, 1)
@@ -157,9 +160,17 @@ pub fn build_claim_weights(z_skip: F128, x_outer_0: F128) -> Vec<F128> {
         let i_lo = i & 63;
         let bit_6 = (i >> 6) & 1;
         let eq_b6 = if bit_6 == 1 { eq_hi } else { eq_lo };
-        weights.push(lambda[i_lo] * eq_b6);
+        weights.push(skip_weights[i_lo] * eq_b6);
     }
     weights
+}
+
+/// φ₈ (RS-path) wrapper over [`build_claim_weights_from_skip`]: derives the
+/// length-64 skip functional from a single field point `z_skip` via the φ₈
+/// Lagrange basis over `{0,…,63}`.
+pub fn build_claim_weights(z_skip: F128, x_outer_0: F128) -> Vec<F128> {
+    const K_SKIP: usize = 6;
+    build_claim_weights_from_skip(&lagrange_weights_naive(K_SKIP, z_skip), x_outer_0)
 }
 
 /// Batched version of [`fold_1b_rows_naive`]: compute `s_hat_v_k` for each
@@ -2937,7 +2948,8 @@ fn prove_batched_padded_with_precomputed_and_grinding_impl<Ch: Challenger>(
 ///
 /// Inputs:
 /// - `claim`: the zerocheck's claim value `ẑ_skip(z_skip, x_outer)`.
-/// - `z_skip` ∈ F_{2^128}: the univariate-skip coord.
+/// - `skip_weights` (length 64): the skip dim's evaluation functional at its
+///   challenge — φ₈ Lagrange (RS) or AG base-code (`base_evaluation_functional`).
 /// - `x_outer` (length m − 6): the multilinear coords.
 /// - `proof`: the prover's `s_hat_v` message.
 /// - `challenger` for sampling `r''` in lockstep with the prover.
@@ -2946,18 +2958,18 @@ fn prove_batched_padded_with_precomputed_and_grinding_impl<Ch: Challenger>(
 /// `ClaimMismatch` error if `weights · s_hat_v ≠ claim`.
 pub fn verify<Ch: Challenger>(
     claim: F128,
-    z_skip: F128,
+    skip_weights: &[F128],
     x_outer: &[F128],
     proof: &RingSwitchProof,
     challenger: &mut Ch,
 ) -> Result<RingSwitchOutput, VerifyError> {
-    verify_with_grinding(claim, z_skip, x_outer, proof, 0, challenger)
+    verify_with_grinding(claim, skip_weights, x_outer, proof, 0, challenger)
 }
 
 /// [`verify`] with the matching PoW check before the ring-switch point.
 pub fn verify_with_grinding<Ch: Challenger>(
     claim: F128,
-    z_skip: F128,
+    skip_weights: &[F128],
     x_outer: &[F128],
     proof: &RingSwitchProof,
     grinding_bits: u32,
@@ -2972,8 +2984,8 @@ pub fn verify_with_grinding<Ch: Challenger>(
     // Verifier observes s_hat_v.
     challenger.observe_f128_slice(&proof.s_hat_v);
 
-    // Check the claim against ν_φ8 ⊗ eq weights.
-    let weights = build_claim_weights(z_skip, x_outer[0]);
+    // Check the claim against skip ⊗ eq weights.
+    let weights = build_claim_weights_from_skip(skip_weights, x_outer[0]);
     if claim_check(&weights, &proof.s_hat_v) != claim {
         return Err(VerifyError::ClaimMismatch);
     }
@@ -3030,19 +3042,19 @@ pub struct RingSwitchVerifierOutput {
 /// instead of `O(2^(m−7))`.
 pub fn verify_succinct<Ch: Challenger>(
     claim: F128,
-    z_skip: F128,
+    skip_weights: &[F128],
     x_outer: &[F128],
     proof: &RingSwitchProof,
     challenger: &mut Ch,
 ) -> Result<RingSwitchVerifierOutput, VerifyError> {
-    verify_succinct_with_grinding(claim, z_skip, x_outer, proof, 0, challenger)
+    verify_succinct_with_grinding(claim, skip_weights, x_outer, proof, 0, challenger)
 }
 
 /// [`verify_succinct`] with the matching PoW check before the ring-switch
 /// point `r''`.
 pub fn verify_succinct_with_grinding<Ch: Challenger>(
     claim: F128,
-    z_skip: F128,
+    skip_weights: &[F128],
     x_outer: &[F128],
     proof: &RingSwitchProof,
     grinding_bits: u32,
@@ -3054,7 +3066,7 @@ pub fn verify_succinct_with_grinding<Ch: Challenger>(
     challenger.observe_label(b"flock-ring-switch-v0");
     challenger.observe_f128_slice(&proof.s_hat_v);
 
-    let weights = build_claim_weights(z_skip, x_outer[0]);
+    let weights = build_claim_weights_from_skip(skip_weights, x_outer[0]);
     if claim_check(&weights, &proof.s_hat_v) != claim {
         return Err(VerifyError::ClaimMismatch);
     }
@@ -3483,8 +3495,14 @@ mod tests {
 
             // Verifier (matched challenger).
             let mut ch_v = FsChallenger::new(b"flock-test-v0");
-            let out_v = verify(claim, z_skip, &x_outer, &proof, &mut ch_v)
-                .unwrap_or_else(|e| panic!("verify rejected honest at m={m}: {e:?}"));
+            let out_v = verify(
+                claim,
+                &lagrange_weights_naive(6, z_skip),
+                &x_outer,
+                &proof,
+                &mut ch_v,
+            )
+            .unwrap_or_else(|e| panic!("verify rejected honest at m={m}: {e:?}"));
 
             assert_eq!(
                 out_p.sumcheck_claim, out_v.sumcheck_claim,
@@ -3517,7 +3535,8 @@ mod tests {
         let (proof, out_p) = prove_with_grinding(&packed, &x_outer, 3, &mut ch_p);
 
         let mut ch_v = FsChallenger::new(b"flock-ring-grinding-test");
-        let out_v = verify_with_grinding(claim, z_skip, &x_outer, &proof, 3, &mut ch_v)
+        let skip_w = crate::zerocheck::multilinear::lagrange_weights_naive(6, z_skip);
+        let out_v = verify_with_grinding(claim, &skip_w, &x_outer, &proof, 3, &mut ch_v)
             .expect("honest grinded ring-switch proof verifies");
         assert_eq!(out_p.sumcheck_claim, out_v.sumcheck_claim);
         assert_eq!(out_p.rs_eq_ind, out_v.rs_eq_ind);
@@ -3540,7 +3559,7 @@ mod tests {
         bad.grinding_nonce = bad_nonce;
         let mut ch_bad = FsChallenger::new(b"flock-ring-grinding-test");
         assert!(matches!(
-            verify_with_grinding(claim, z_skip, &x_outer, &bad, 3, &mut ch_bad),
+            verify_with_grinding(claim, &skip_w, &x_outer, &bad, 3, &mut ch_bad),
             Err(VerifyError::InvalidGrinding)
         ));
 
@@ -3551,7 +3570,7 @@ mod tests {
         legacy.grinding_nonce = 1;
         let mut ch_v = FsChallenger::new(b"flock-ring-no-grinding-test");
         assert!(matches!(
-            verify(claim, z_skip, &x_outer, &legacy, &mut ch_v),
+            verify(claim, &skip_w, &x_outer, &legacy, &mut ch_v),
             Err(VerifyError::InvalidGrinding)
         ));
     }
@@ -3594,7 +3613,13 @@ mod tests {
         proof.s_hat_v[0].lo ^= 1;
 
         let mut ch_v = FsChallenger::new(b"flock-test-v0");
-        let res = verify(claim, z_skip, &x_outer, &proof, &mut ch_v);
+        let res = verify(
+            claim,
+            &lagrange_weights_naive(6, z_skip),
+            &x_outer,
+            &proof,
+            &mut ch_v,
+        );
         assert!(matches!(res, Err(VerifyError::ClaimMismatch)));
     }
 

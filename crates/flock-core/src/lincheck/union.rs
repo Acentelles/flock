@@ -68,8 +68,8 @@ use crate::zerocheck::K_SKIP;
 use crate::zerocheck::multilinear::lagrange_weights_naive;
 
 use super::{
-    LincheckCircuit, LincheckClaim, LincheckGrinding, LincheckProof, QuirkyPoint, VerifyError,
-    build_eq_table, build_quirky_eq_table, column_sumcheck_prove, inner_product,
+    LincheckCircuit, LincheckClaim, LincheckGrinding, LincheckProof, QuirkyPoint, SkipPoint,
+    VerifyError, build_eq_table, build_quirky_eq_table, column_sumcheck_prove, inner_product,
     partial_fold_packed_z_rows_best,
 };
 
@@ -293,7 +293,8 @@ pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
         .zip(slots)
     {
         let inner = ty.k_log - k_skip;
-        let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest[..inner], k_skip);
+        let eq_inner =
+            build_quirky_eq_table(x_ab.z_skip.phi8(), &x_ab.x_inner_rest[..inner], k_skip);
         // Split, so the per-matrix bilinear values can be reported below.
         // Same nonzeros as the α-batched fold; only the accumulation differs.
         let (comb_a, comb_b) = slot_in.circuit.fold_split(&eq_inner);
@@ -397,6 +398,7 @@ pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
         comb_vec,
         z_vec,
         k_skip,
+        &x_ab.z_skip,
         trace,
         grinding,
         &mut grinding_nonces,
@@ -877,7 +879,7 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
     rr.reverse();
     let assertion = MatrixAssertion {
         alpha,
-        z_skip: x_ab.z_skip,
+        z_skip: x_ab.z_skip.phi8(),
         x_inner_rest: x_ab.x_inner_rest.clone(),
         rr: rr.clone(),
         z_partial: proof.z_partial.clone(),
@@ -907,7 +909,7 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
 
     Ok((
         LincheckClaim {
-            r_inner_skip,
+            r_inner_skip: SkipPoint::Phi8(r_inner_skip),
             r_inner_rest: rr,
             w,
         },

@@ -910,7 +910,6 @@ impl KeccakSetup {
         }
     }
 
-
     pub fn m(&self) -> usize {
         self.r1cs.m
     }

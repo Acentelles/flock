@@ -458,7 +458,7 @@ pub struct BitSpreadTable {
 
 impl BitSpreadTable {
     pub fn new(depth: usize) -> Self {
-        assert!(depth >= 1 && depth <= 127, "depth {depth} out of range");
+        assert!((1..=127).contains(&depth), "depth {depth} out of range");
         Self { depth }
     }
 

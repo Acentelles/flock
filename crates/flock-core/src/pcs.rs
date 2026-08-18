@@ -191,9 +191,11 @@ impl OpeningGrinding {
 
     #[inline]
     fn claim_batch_bits_for(self, claim_count: usize) -> u32 {
-        (claim_count > 1)
-            .then_some(self.claim_batch_bits)
-            .unwrap_or(0)
+        if claim_count > 1 {
+            self.claim_batch_bits
+        } else {
+            0
+        }
     }
 }
 
@@ -294,6 +296,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding<Ch: Chall
         eq_gamma,
         target_combined,
         round0_prime,
+        round1_lookahead,
     } = combined;
     // Factored EqPoint basis. DEFAULT (virtual): the basis stays factored
     // across EVERY L0 fold — an eq tensor folds to an eq tensor, so no round
@@ -351,6 +354,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding<Ch: Chall
         l0_num_lanes,
         lane_major,
         round0_prime,
+        round1_lookahead,
         jit,
         vbasis,
         challenger,
@@ -396,6 +400,11 @@ struct CombinedClaim {
     /// Round-0 sumcheck `(u_0, u_2)` prime over `packed_witness · b_combined`,
     /// consumed by `recursive_prover_with_basis_precomputed_round0`.
     round0_prime: (F128, F128),
+    /// Quadratic coefficients of Ligerito's ROUND-1 message in the round-0
+    /// fold challenge, accumulated in the same combine pass (fast path with
+    /// no packed-direct claims only). Lets the recursive prover's first lane
+    /// fold be an O(1) skip round — see [`ligerito::FoldLookahead`].
+    round1_lookahead: Option<ligerito::FoldLookahead>,
 }
 
 /// Runs ring_switch over RS claims, observes packed-direct claim values +
@@ -613,6 +622,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             eq_gamma: Some(gammas_pd[0]),
             target_combined,
             round0_prime: (round0_u0, round0_u2),
+            round1_lookahead: None,
         };
     }
 
@@ -645,14 +655,35 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     //      round-0 prime (u_0, u_2 over packed_witness · b_combined).
     let mut b_combined: Vec<F128> = crate::scratch::take_f128(l);
 
-    let (mut round0_u0, mut round0_u2) = if use_fast {
-        let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
-        debug_assert!(b >= 2 && b.is_multiple_of(2));
-        debug_assert!(rs_deferred.iter().all(|d| d.0.len() == b));
-        b_combined
-            .par_chunks_mut(b)
-            .enumerate()
-            .map(|(hi, out_block)| {
+    // The combine is compute-bound (open_combine_probe: ~4.3 ms traffic floor
+    // vs ~18 ms total at m=30 on 4 P-threads), and its flat block-parallel
+    // shape drains cleanly around slow cores — run it on the all-core (P+E)
+    // pool (−29% on the probe on 4P+4E; a wash-to-slight-loss on 10P+4E, so
+    // gated on [`crate::ecore_rich_topology`], `FLOCK_ALLCORE=1` overrides).
+    // PCS_COMBINE_PCORES_ONLY=1 keeps it on the caller's pool (A/B toggle).
+    // Thread count never changes the output bits: every slot is written
+    // deterministically and the prime is an XOR reduction (associative +
+    // commutative, exact).
+    let combine_all_cores =
+        std::env::var("PCS_COMBINE_PCORES_ONLY").is_err() && crate::ecore_rich_topology();
+    // With no packed-direct claims nothing is scatter-added after the fast
+    // path, so the block tail can also accumulate Ligerito's round-1 message
+    // coefficients (groups of 4; +1 unreduced mul per slot) — the round-0
+    // prime falls out of the same accumulators. See `CombinedClaim`.
+    let want_lookahead = use_fast && packed_direct.is_empty();
+    let mut round1_lookahead: Option<ligerito::FoldLookahead> = None;
+    let b_combined_ref = &mut b_combined;
+    let la_ref = &mut round1_lookahead;
+    let mut combine = || {
+        if use_fast {
+            use crate::field::F256Unreduced;
+            let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
+            debug_assert!(b >= 2 && b.is_multiple_of(2));
+            debug_assert!(rs_deferred.iter().all(|d| d.0.len() == b));
+            // Fold one block of every claim into `out_block`; returns true when
+            // the block is DEAD (stored as zeros — no prime or lookahead terms
+            // to accumulate).
+            let fold_block = |hi: usize, out_block: &mut [F128]| -> bool {
                 // DEAD-BLOCK SKIP. A claim's `e_hi = eq_hi[hi]` is exactly
                 // `F128::ZERO` on every block whose high address bits fall
                 // outside the claim's own support — which is what a claim point
@@ -679,8 +710,8 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                 // densely when the witness support is not sparse.
                 if rs_deferred.iter().all(|d| d.1[hi] == F128::ZERO) {
                     out_block.fill(F128::ZERO);
-                    // The prime's terms here are `a·0`, i.e. zero.
-                    return (F128::ZERO, F128::ZERO);
+                    // The prime's (and lookahead's) terms here are `a·0`.
+                    return true;
                 }
                 // Accumulate each claim's block: first claim writes, rest add.
                 // `e_hi` is read once per claim per block, then swept over eq_lo.
@@ -696,55 +727,102 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                         }
                     }
                 }
-                // Round-0 prime over this block's pairs (b is even, base is
-                // even).
-                let base = hi * b;
-                let mut u0 = F128::ZERO;
-                let mut u2 = F128::ZERO;
-                for t in 0..(b / 2) {
-                    let s0 = out_block[2 * t];
-                    let s1 = out_block[2 * t + 1];
-                    let a0 = packed_witness[base + 2 * t];
-                    let a1 = packed_witness[base + 2 * t + 1];
-                    u0 += a0 * s0;
-                    u2 += (a0 + a1) * (s0 + s1);
-                }
-                (u0, u2)
-            })
-            .reduce(
-                || (F128::ZERO, F128::ZERO),
-                |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
-            )
-    } else {
-        // General path (mixed / sparse / packed-direct): materialize any
-        // deferred-dense claims (parallel block fold), then the per-element
-        // combine over all dense buffers + packed-direct, matching the
-        // original behavior.
-        let materialized: Vec<Vec<F128>> = rs_results
-            .iter()
-            .filter_map(|(_, o)| match &o.rs_eq_ind {
-                ring_switch::RsEqInd::DeferredDense {
-                    eq_lo,
-                    eq_hi,
-                    table,
-                } => Some(ring_switch::fold_b128_from_table(eq_lo, eq_hi, table)),
-                _ => None,
-            })
-            .collect();
-        let mut rs_dense_all: Vec<&[F128]> = rs_baked.clone();
-        rs_dense_all.extend(materialized.iter().map(|v| v.as_slice()));
-        if rs_dense_all.is_empty() && pd_dense.is_empty() {
-            // All-sparse open (e.g. the permutation check's five pinned-coord
-            // claims): the per-element loop below would write zeros into every
-            // slot and accumulate `a·0` into the prime. Skip straight to the
-            // memset — the sparse scatter-adds that follow supply the whole of
-            // `b_combined`, and the prime they fold in is the whole prime.
-            b_combined.par_chunks_mut(1 << 13).for_each(|c| {
-                c.fill(F128::ZERO);
-            });
-            (F128::ZERO, F128::ZERO)
+                false
+            };
+            if want_lookahead && b.is_multiple_of(4) {
+                // Fused prime + round-1 lookahead tail (groups of 4).
+                let acc = b_combined_ref
+                    .par_chunks_mut(b)
+                    .enumerate()
+                    .map(|(hi, out_block)| {
+                        if fold_block(hi, out_block) {
+                            return [F256Unreduced::ZERO; 8];
+                        }
+                        let base = hi * b;
+                        let mut acc = [F256Unreduced::ZERO; 8];
+                        for g in 0..(b / 4) {
+                            let i = 4 * g;
+                            let fq = [
+                                packed_witness[base + i],
+                                packed_witness[base + i + 1],
+                                packed_witness[base + i + 2],
+                                packed_witness[base + i + 3],
+                            ];
+                            let bq = [
+                                out_block[i],
+                                out_block[i + 1],
+                                out_block[i + 2],
+                                out_block[i + 3],
+                            ];
+                            ligerito::lookahead_accum_group(&fq, &bq, &mut acc);
+                        }
+                        acc
+                    })
+                    .reduce(|| [F256Unreduced::ZERO; 8], ligerito::xor_acc8);
+                let (msg, la) = ligerito::lookahead_finish(acc);
+                *la_ref = Some(la);
+                (msg.u_0, msg.u_2)
+            } else {
+                let (u0, u2) = b_combined_ref
+                    .par_chunks_mut(b)
+                    .enumerate()
+                    .map(|(hi, out_block)| {
+                        if fold_block(hi, out_block) {
+                            return (F256Unreduced::ZERO, F256Unreduced::ZERO);
+                        }
+                        // Round-0 prime over this block's pairs (b is even, base is
+                        // even). Unreduced 256-bit accumulation, one reduction at
+                        // the very end (XOR-linear, bit-identical to reducing per
+                        // term).
+                        let base = hi * b;
+                        let mut u0 = F256Unreduced::ZERO;
+                        let mut u2 = F256Unreduced::ZERO;
+                        for t in 0..(b / 2) {
+                            let s0 = out_block[2 * t];
+                            let s1 = out_block[2 * t + 1];
+                            let a0 = packed_witness[base + 2 * t];
+                            let a1 = packed_witness[base + 2 * t + 1];
+                            u0 ^= a0.mul_unreduced(s0);
+                            u2 ^= (a0 + a1).mul_unreduced(s0 + s1);
+                        }
+                        (u0, u2)
+                    })
+                    .reduce(
+                        || (F256Unreduced::ZERO, F256Unreduced::ZERO),
+                        |(x0, x2), (y0, y2)| (x0 ^ y0, x2 ^ y2),
+                    );
+                (u0.reduce(), u2.reduce())
+            }
         } else {
-            let prime = b_combined
+            // General path (mixed / sparse / packed-direct): materialize any
+            // deferred-dense claims (parallel block fold), then the per-element
+            // combine over all dense buffers + packed-direct, matching the
+            // original behavior.
+            let materialized: Vec<Vec<F128>> = rs_results
+                .iter()
+                .filter_map(|(_, o)| match &o.rs_eq_ind {
+                    ring_switch::RsEqInd::DeferredDense {
+                        eq_lo,
+                        eq_hi,
+                        table,
+                    } => Some(ring_switch::fold_b128_from_table(eq_lo, eq_hi, table)),
+                    _ => None,
+                })
+                .collect();
+            let mut rs_dense_all: Vec<&[F128]> = rs_baked.clone();
+            rs_dense_all.extend(materialized.iter().map(|v| v.as_slice()));
+            if rs_dense_all.is_empty() && pd_dense.is_empty() {
+                // All-sparse open (e.g. the permutation check's five pinned-coord
+                // claims): the per-element loop below would write zeros into every
+                // slot and accumulate `a·0` into the prime. Skip straight to the
+                // memset — the sparse scatter-adds that follow supply the whole of
+                // `b_combined`, and the prime they fold in is the whole prime.
+                b_combined_ref.par_chunks_mut(1 << 13).for_each(|c| {
+                    c.fill(F128::ZERO);
+                });
+                return (F128::ZERO, F128::ZERO);
+            }
+            let prime = b_combined_ref
                 .par_chunks_mut(2)
                 .enumerate()
                 .map(|(i, chunk)| {
@@ -774,6 +852,11 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             prime
         }
     };
+    let (mut round0_u0, mut round0_u2) = if combine_all_cores {
+        crate::all_core_pool().install(combine)
+    } else {
+        combine()
+    };
     let mut adjust_prime_for_delta = |idx: usize, delta: F128| {
         let pair = idx / 2;
         let a0 = packed_witness[2 * pair];
@@ -785,6 +868,13 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     };
     for (_, output) in rs_results.iter() {
         if let ring_switch::RsEqInd::Sparse { entries, .. } = &output.rs_eq_ind {
+            // Post-combine mutation of b_combined: the round-1 lookahead
+            // coefficients (if any) are now stale. Unreachable when they are
+            // emitted (fast path = no sparse RS claims), but keep the
+            // invalidation in case the emission condition ever widens.
+            if !entries.is_empty() {
+                round1_lookahead = None;
+            }
             for &(idx, val) in entries {
                 b_combined[idx] += val;
                 adjust_prime_for_delta(idx, val);
@@ -793,6 +883,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     }
     for (pd, g) in packed_direct.iter().zip(gammas_pd.iter()) {
         if let DirectEqInd::Sparse(eq) = &pd.eq_ind {
+            round1_lookahead = None; // see above — pd claims never emit coeffs
             // Scatter-add the sparse claim and fold its round-0 prime
             // contribution in the SAME pass (O(live positions)), instead of a
             // full O(L) re-pass over b_combined. The prime is linear in
@@ -831,6 +922,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         eq_gamma: None,
         target_combined,
         round0_prime: (round0_u0, round0_u2),
+        round1_lookahead,
     }
 }
 
@@ -945,7 +1037,7 @@ pub struct PackedDirectClaimRef<'a> {
 pub fn verify_opening_batch_ligerito_mixed_with_grinding<Ch: Challenger>(
     commitment: &Commitment,
     claims: &[F128],
-    z_skips: &[F128],
+    skip_weights: &[&[F128]],
     x_outers: &[&[F128]],
     packed_direct: &[PackedDirectClaimRef<'_>],
     proof: &BatchOpeningProofLigerito,
@@ -955,7 +1047,7 @@ pub fn verify_opening_batch_ligerito_mixed_with_grinding<Ch: Challenger>(
 ) -> Result<(), VerifyError> {
     let n_rs = claims.len();
     let n_pd = packed_direct.len();
-    assert_eq!(z_skips.len(), n_rs);
+    assert_eq!(skip_weights.len(), n_rs);
     assert_eq!(x_outers.len(), n_rs);
     if proof.ring_switches.len() != n_rs {
         return Err(VerifyError::RingSwitch(
@@ -990,7 +1082,7 @@ pub fn verify_opening_batch_ligerito_mixed_with_grinding<Ch: Challenger>(
     for i in 0..n_rs {
         let out = ring_switch::verify_succinct_with_grinding(
             claims[i],
-            z_skips[i],
+            skip_weights[i],
             x_outers[i],
             &proof.ring_switches[i],
             grinding.ring_switch_bits,
@@ -1364,7 +1456,7 @@ pub fn open_batch_merged<Ch: Challenger>(
     // univariate-skip coordinate, which is the one place the splits differ.
     let pd_groups = scalar_claim_groups(
         packed_direct.iter().map(|c| c.point.as_slice()),
-        &gammas_pd,
+        gammas_pd,
         n_log,
         k_cols,
     );
@@ -1894,9 +1986,10 @@ fn verify_batch_merged_core<Ch: Challenger>(
     let t = std::time::Instant::now();
     let mut rs_outputs = Vec::with_capacity(n_rs);
     for i in 0..n_rs {
+        let skip_w = crate::lincheck::SkipPoint::Phi8(z_skips[i]).weights(LOG_PACKING - 1);
         let out = ring_switch::verify_succinct_with_grinding(
             claims[i],
-            z_skips[i],
+            &skip_w,
             x_outers[i],
             &proof.ring_switches[i],
             grinding.ring_switch_bits,
@@ -2009,7 +2102,7 @@ fn verify_batch_merged_core<Ch: Challenger>(
     }
     let pd_groups = scalar_claim_groups(
         packed_direct.iter().map(|c| c.point),
-        &gammas_pd,
+        gammas_pd,
         n_log,
         k_cols,
     );
@@ -2064,7 +2157,7 @@ fn verify_batch_merged_core<Ch: Challenger>(
             &params,
             x_outers,
             packed_direct,
-            &gammas_pd,
+            gammas_pd,
             &pd_groups,
             n_log,
             &mp,
@@ -2228,7 +2321,7 @@ mod tests {
         verify_opening_batch_ligerito_mixed_with_grinding(
             &commitment,
             &[rs_claim],
-            &[z_skip],
+            &[&lagrange_weights_naive(6, z_skip)],
             &[x_outer.as_slice()],
             &[],
             &proof,
@@ -2245,7 +2338,7 @@ mod tests {
             verify_opening_batch_ligerito_mixed_with_grinding(
                 &commitment,
                 &[rs_claim],
-                &[z_skip],
+                &[&lagrange_weights_naive(6, z_skip)],
                 &[x_outer.as_slice()],
                 &[],
                 &malformed,

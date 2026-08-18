@@ -1952,8 +1952,8 @@ fn merge_chain(
             CvSource::Row(r) => CvSource::Row(f(r)),
             CvSource::RowHi(r) => CvSource::RowHi(f(r)),
         },
-        right: l.right.map(&*f),
-        repeats: l.repeats.map(&*f),
+        right: l.right.map(f),
+        repeats: l.repeats.map(f),
     };
 
     // Child streams and their word/byte offsets in the merged view.
@@ -5866,7 +5866,7 @@ fn emit_opening(
         }
     };
     let zero_w = shared(sb, pubs, F128::ZERO);
-    let pad_w = if leaf_w.len() % 4 == 0 {
+    let pad_w = if leaf_w.len().is_multiple_of(4) {
         None
     } else {
         Some(zero_w)
@@ -5998,18 +5998,18 @@ fn leaf_boolean_mats(
     ordered.into_iter().map(|(_, matrices)| matrices).collect()
 }
 
-/// **THE SWAP, step 1 — mvp9's outer becomes the inner.** The leaf-outer
-/// circuit proof (the first real recursion node, BLAKE3/BLAKE3 from the
-/// shared builder) is natively verified under a RecordingChallenger and its
-/// tape walked by the SAME machinery mvp10's assembly consumes:
-/// parse_open_levels, the region label map, level_geometry (native capped
-/// paths + enforced-sum replicas per level), and the R=2 + P multipoint
-/// schedule replayed to the anchor's claimed v — pinned before any
-/// assembly, the step-1 pattern every phase ran. What it establishes about
-/// the REAL inner's shape: the element PIOP parses at multi-slot scale, the
-/// packed-direct claims are the element (c, lc) pair plus every wiring
-/// gather, the R=2 + P>0 schedule holds, and the committed lane count is
-/// once more an arbitrary integer.
+// **THE SWAP, step 1 — mvp9's outer becomes the inner.** The leaf-outer
+// circuit proof (the first real recursion node, BLAKE3/BLAKE3 from the
+// shared builder) is natively verified under a RecordingChallenger and its
+// tape walked by the SAME machinery mvp10's assembly consumes:
+// parse_open_levels, the region label map, level_geometry (native capped
+// paths + enforced-sum replicas per level), and the R=2 + P multipoint
+// schedule replayed to the anchor's claimed v — pinned before any
+// assembly, the step-1 pattern every phase ran. What it establishes about
+// the REAL inner's shape: the element PIOP parses at multi-slot scale, the
+// packed-direct claims are the element (c, lc) pair plus every wiring
+// gather, the R=2 + P>0 schedule holds, and the committed lane count is
+// once more an arbitrary integer.
 // ---------------------------------------------------------------------------
 // The REAL child: the leaf outer's deferred verifier as a reusable region
 // (the swap test's assembly, extracted so the 2→1 merge node can
@@ -7778,7 +7778,7 @@ fn emit_real_child_region(
         levels,
         geo,
         &rt.lvl_src,
-        &trace,
+        trace,
         &outs,
         chals,
         &cap_w,
@@ -7873,8 +7873,8 @@ fn emit_real_child_region(
     for (li, lvl) in levels.iter().enumerate() {
         for (j, &mv) in lvl.fold_msg_vs.iter().enumerate() {
             let rw = [
-                squeeze_word_wire(&outs, &trace, lvl.fold_fins[j], 0),
-                squeeze_word_wire(&outs, &trace, lvl.fold_fins[j], 1),
+                squeeze_word_wire(&outs, trace, lvl.fold_fins[j], 0),
+                squeeze_word_wire(&outs, trace, lvl.fold_fins[j], 1),
             ];
             let ev = emit_spine256(sb, spine256, qc, qb, qa, z2, z2, z2, z2, zw, rw);
             tsp = ev[4];
@@ -7960,7 +7960,7 @@ fn emit_real_child_region(
         &rt.w_resid,
         inner_pd_i.fin,
         &yr_wires,
-        &trace,
+        trace,
         &outs,
         zw,
         ow,
@@ -7985,12 +7985,12 @@ fn emit_real_child_region(
     let rdp_w: [Vec<Wire>; 2] = std::array::from_fn(|k| {
         let fin = rt.rs_recs[k].1;
         (0..7)
-            .map(|j| squeeze_word_wire(&outs, &trace, fin, j))
+            .map(|j| squeeze_word_wire(&outs, trace, fin, j))
             .collect()
     });
     let gamma_w: [Wire; 2] = std::array::from_fn(|k| {
         let (fin, offset) = rt.rs_gam_fins[k];
-        squeeze_word_wire(&outs, &trace, fin, offset)
+        squeeze_word_wire(&outs, trace, fin, offset)
     });
     let (rsh_w, vrs_w) = emit_family_h(
         sb,
@@ -8019,7 +8019,7 @@ fn emit_real_child_region(
 
     let mut pdh_w = zw;
     for pd in gammas_i {
-        let gw = squeeze_word_wire(&outs, &trace, pd.fin, pd.squeeze_offset);
+        let gw = squeeze_word_wire(&outs, trace, pd.fin, pd.squeeze_offset);
         pdh_w = sb.gate(cs.macs, &[pdh_w, gw, wv(pd.val_v)])[0];
     }
     let tgt_w = sb.gate(cs.macs, &[rsh_w, ow, pdh_w])[0];
@@ -8143,7 +8143,7 @@ fn emit_real_child_region(
     // ---- the MULTI-SLOT element PIOP (general strip) ----
     let mut el_zr = zw;
     for (k, rr) in piop_i.zc_rounds.iter().enumerate() {
-        let t_w = squeeze_word_wire(&outs, &trace, piop_i.tau_fin, k);
+        let t_w = squeeze_word_wire(&outs, trace, piop_i.tau_fin, k);
         let rho_w = outs[trace.squeezes[rr.fin][0]][0];
         vals.push(rt.el_g0[k]);
         let g0w = sb.input();
@@ -8385,7 +8385,7 @@ fn emit_real_child_region(
                     .filter(|&(_, &h)| h)
                     .map(|(&i2, _)| {
                         let pd = &gammas_i[i2];
-                        squeeze_word_wire(&outs, &trace, pd.fin, pd.squeeze_offset)
+                        squeeze_word_wire(&outs, trace, pd.fin, pd.squeeze_offset)
                     })
                     .collect();
                 if let flock_core::matrix_fold::JaggedRowWeight::Combo(t) = &c.row {
@@ -8404,7 +8404,7 @@ fn emit_real_child_region(
             }
             let (_, c) = d_it.next().expect("a dense entry per non-hot member");
             let pd = &gammas_i[i2];
-            let gpd_w = squeeze_word_wire(&outs, &trace, pd.fin, pd.squeeze_offset);
+            let gpd_w = squeeze_word_wire(&outs, trace, pd.fin, pd.squeeze_offset);
             vals.push(c.value);
             let d_w = sb.input();
             jag_w.push(d_w);
@@ -9912,7 +9912,7 @@ pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
             rec.values(),
             rec.payloads(),
         );
-        assert_chain_replays(&ops, &trace, &chals);
+        assert_chain_replays(&ops, &trace, chals);
 
         let env = envelope_shape();
         let split_b3 = tapes.len() == 2;
@@ -10825,7 +10825,7 @@ fn envelope_content_probe() {
                 (cols * n_t, i, cols, n_t)
             })
             .collect();
-        per.sort_by(|a, b| b.0.cmp(&a.0));
+        per.sort_by_key(|p| std::cmp::Reverse(p.0));
         for &(words, i, cols, rows) in per.iter().take(8) {
             println!(
                 "    type {i:2}: {words:>8} words ({cols:3} cols x {rows:6} rows) = {:.1}%",
@@ -13075,7 +13075,7 @@ fn emit_child_region(
         levels,
         geo,
         &ct.lvl_src,
-        &trace,
+        trace,
         &outs,
         chals,
         &cap_w,
@@ -13297,8 +13297,8 @@ fn emit_child_region(
     for (li, lvl) in levels.iter().enumerate() {
         for (j, &mv) in lvl.fold_msg_vs.iter().enumerate() {
             let rw = [
-                squeeze_word_wire(&outs, &trace, lvl.fold_fins[j], 0),
-                squeeze_word_wire(&outs, &trace, lvl.fold_fins[j], 1),
+                squeeze_word_wire(&outs, trace, lvl.fold_fins[j], 0),
+                squeeze_word_wire(&outs, trace, lvl.fold_fins[j], 1),
             ];
             let ev = emit_spine256(sb, spine256, qc, qb, qa, z2, z2, z2, z2, zw, rw);
             tsp = ev[4];
@@ -13384,7 +13384,7 @@ fn emit_child_region(
         &ct.w_resid,
         inner_pd2.fin,
         &yr_wires,
-        &trace,
+        trace,
         &outs,
         zw,
         ow,
@@ -13413,12 +13413,12 @@ fn emit_child_region(
     let rdp_w: [Vec<Wire>; 2] = std::array::from_fn(|k| {
         let fin = ct.rs_recs[k].1;
         (0..7)
-            .map(|j| squeeze_word_wire(&outs, &trace, fin, j))
+            .map(|j| squeeze_word_wire(&outs, trace, fin, j))
             .collect()
     });
     let gamma_w: [Wire; 2] = std::array::from_fn(|k| {
         let (fin, offset) = ct.rs_gam_fins[k];
-        squeeze_word_wire(&outs, &trace, fin, offset)
+        squeeze_word_wire(&outs, trace, fin, offset)
     });
     let (rsh_w, vrs_w) = emit_family_h(
         sb,
@@ -13446,7 +13446,7 @@ fn emit_child_region(
     );
     let mut pdh_w = zw;
     for pd in &ct.gammas_o {
-        let gw = squeeze_word_wire(&outs, &trace, pd.fin, pd.squeeze_offset);
+        let gw = squeeze_word_wire(&outs, trace, pd.fin, pd.squeeze_offset);
         pdh_w = sb.gate(macs, &[pdh_w, gw, wv(pd.val_v)])[0];
     }
     let tgt_w = sb.gate(macs, &[rsh_w, ow, pdh_w])[0];
@@ -13471,7 +13471,7 @@ fn emit_child_region(
     let el_pub = el_rec.map(|el_rec| {
         let mut el_zr = zw;
         for (k, &(gv, rfin, _)) in el_rec.zc_rounds.iter().enumerate() {
-            let t_w = squeeze_word_wire(&outs, &trace, el_rec.tau_fin, k);
+            let t_w = squeeze_word_wire(&outs, trace, el_rec.tau_fin, k);
             let rho_w = outs[trace.squeezes[rfin][0]][0];
             vals.push(ct.el_g0[k]);
             let g0w = sb.input();
@@ -13687,7 +13687,7 @@ fn emit_child_region(
                     .filter(|&(_, &h)| h)
                     .map(|(&i2, _)| {
                         let pd = &ct.gammas_o[i2];
-                        squeeze_word_wire(&outs, &trace, pd.fin, pd.squeeze_offset)
+                        squeeze_word_wire(&outs, trace, pd.fin, pd.squeeze_offset)
                     })
                     .collect();
                 if let flock_core::matrix_fold::JaggedRowWeight::Combo(t) = &c.row {
@@ -13705,7 +13705,7 @@ fn emit_child_region(
             }
             let (_, c) = d_it.next().expect("a dense entry per non-hot member");
             let pd = &ct.gammas_o[i2];
-            let gpd_w = squeeze_word_wire(&outs, &trace, pd.fin, pd.squeeze_offset);
+            let gpd_w = squeeze_word_wire(&outs, trace, pd.fin, pd.squeeze_offset);
             vals.push(c.value);
             let d_w = sb.input();
             jag_w.push(d_w);
@@ -16097,7 +16097,8 @@ pub fn build_node_outer_app(
     });
 
     // ---- ONE outer: two REAL child regions + the fold region ----
-    let outer_stats = {
+
+    {
         use crate::prover::UnionElementSlotInput;
 
         // The transcript is FORKED (the wiring runs on its own chain);
@@ -16115,7 +16116,7 @@ pub fn build_node_outer_app(
             rec.values(),
             rec.payloads(),
         );
-        assert_chain_replays(&ops, &trace, &chals);
+        assert_chain_replays(&ops, &trace, chals);
 
         let env = envelope_shape();
         let split_b3 = n_kids == 2;
@@ -16946,7 +16947,7 @@ pub fn build_node_outer_app(
             // compression counter differs from an ordinary squeeze.
             let ltrace = crate::r1cs_hashes::fs_chain::trace_duplex(lstream, lbytes, lops);
             assert_chain_replays(lops, &ltrace, lchals);
-            let lpub_payloads = bytes_payload_mask(&lops);
+            let lpub_payloads = bytes_payload_mask(lops);
             let (lchain_outs, lww) = emit_fs_chain(
                 &mut sb,
                 cs.q.b3,
@@ -17917,8 +17918,7 @@ pub fn build_node_outer_app(
             lane_acc: lane_native.map(|(a, ..)| a),
             block: block_pub,
         }
-    };
-    outer_stats
+    }
 }
 
 /// **Task 5: THE INTERNAL NODE carries the chain statement.** Four chain
