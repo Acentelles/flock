@@ -56,6 +56,12 @@ bench_lincheck: bench_lincheck.cu lincheck.cuh phi8_table.cuh ntt_host.hpp f128.
 test_blake3_witness: test_blake3_witness.cu blake3_witness.cuh
 	$(NVCC) $(NVCCFLAGS) test_blake3_witness.cu -o $@
 
+# Host-only witness-layout check (no GPU/nvcc): the serial builder + stripe
+# transpose vs the same B3WT oracle. Validate layout moves locally before
+# they cost a Blackwell CI run.
+test_blake3_witness_host: test_blake3_witness_host.cpp blake3_witness.cuh
+	$(CXX) -O2 -std=c++17 test_blake3_witness_host.cpp -o $@
+
 # Throughput for the BLAKE3 witness kernels (random inputs, no oracle).
 bench_blake3_witness: bench_blake3_witness.cu blake3_witness.cuh
 	$(NVCC) $(NVCCFLAGS) bench_blake3_witness.cu -o $@
@@ -154,6 +160,10 @@ blake3_witness_vectors:
 # Build + run the BLAKE3 witness oracle check end-to-end.
 blake3_witness: test_blake3_witness blake3_witness_vectors
 	./test_blake3_witness blake3_witness_vectors.bin
+
+# Host-only twin of the blake3_witness target (runs anywhere).
+blake3_witness_host: test_blake3_witness_host blake3_witness_vectors
+	./test_blake3_witness_host blake3_witness_vectors.bin
 
 # Dump the REAL BLAKE3 R1CS lincheck CSC matrices for bench_ligerito's lincheck phase.
 blake3_lincheck_matrices:
