@@ -119,16 +119,48 @@ This also pre-pays Phase C's cost profile: the envelope outers' dead
 boolean space (swap 12250/16384, spread 1060/16384, pow 4096/16384 at
 nu* = 14) is now skipped, not scanned, under AG.
 
-NEXT — **Phase C (outers-AG)**: the same five items on
-`RealTape`/`RealRegion` (`zc_l` find at 6222, round-1 pins ~6300s, walk
-~6848s, `zskip_ch/zskip_fin` fields at 7422/8764, `emit_lagrange_lows`
-call in `build_node_outer_app` at ~17000s, the ghash constants at 8273) +
-mixed-class-with-element AG entries. The envelope moves: re-check nu* ≤ 14
-per b3 slot, m* = 29 content, the publics cap (now shared with the FL's AG
-blocks), internal/spine digest equality, `chain_spine_converges`. Note the
-mixed outers carry an ELEMENT class — the AG flavor forces honest-zero
-witness mode (already enforced in the shared prove body). Then Phase F's
-long-lead kernels (x86 AVX-512 + CUDA round-1) can start.
+**Phase C COMPLETE (same day, evening 4)** — the envelope outers (FL /
+internal / spine) prove under AG behind the private `outer_zc_ag()`
+switch (`TOWER_OUTER_ZC=rs` A/B override). `LeafOuter.proof` is the
+shared `MixedProof` (with `boolean_lincheck()` +
+`verify_circuit{,_deferred}` dispatch methods); `RealTape`/`RealRegion`
+carry the ChildTape/ChildRegion AG arms verbatim (anchor, 158/64 pins,
+seed/nonce locator, point-pin decode, `ZskipWires`, friendly c-constants,
+the exact `squeeze_word_wire` map — the RealRegion emitter had the same
+naive-4-per-row bug the child emitter had); `build_node_outer_app` takes
+the Tier-0 publish + `check_ag_skip_publics` per AG child, with the RS
+λ machinery conditional. Pipeline green under AG-everywhere incl.
+`chain_spine_converges` (one-digest property holds), all four flavor-knob
+combos, Chain100+Chain128.
+
+PERF LESSON EARNED EN ROUTE: the parity slice's segment-call round-1
+driver COLLAPSED at the envelope — its per-column run structure is
+19,920 full / 228 partial / 110,924 dead blocks at m30 (~15% live,
+~450 segments), and per-segment rayon bridges made round 1 cost 28–43 ms
+(2–3× the FULL dense scan). Fixed by
+`round1_slp_packed_banks_fused_padded` — ONE parallel pass over the
+live-block list (Full pairs keep the 2src c-transpose, Partials cleanse
+inline; char-2 addition makes visit order irrelevant) — now 2.4–4.7 ms,
+count-proportional parity. The segment driver survives only as the
+bench-only unfused arm. `FLOCK_ZC_TIMING` now prints the AG phases.
+
+m32 A/B (tower_online_bench, warm medians, same box): all-RS 721 ms/leaf
+amortised (364k c/s) → all-AG **660 ms (397k c/s, +9.1%)**: leaf
+494.6→442.1, FL 224.1→222.1, internal 224.7→214.2, spine 228.0→213.7.
+The node wins are capped by the PIOP∥wiring join (the wiring GKR no
+longer hides fully under the faster AG PIOP); the leaf carries the bulk.
+Proof sizes: node 252.8→254.3 KiB (+1.5, the AG round-1 message).
+
+NEXT (order per the endgame):
+1. **Phase F long-lead kernels, start now**: the x86 AVX-512 AG round-1
+   (RS removal otherwise kills x86 proving) and the CUDA AG round-1
+   (GPU runs full RS zerocheck on-device; mlv tail carries over).
+2. **Phase D — Tier-1 in-circuit AG lows** (`emit_ag_lows` + on-curve +
+   standalone-hash binding), replacing the Tier-0 72-publics blocks at
+   BOTH consumers (FL over leaves, nodes over outers) — scheduled before
+   RS removal.
+3. Phase E audit/docs; then Phase F removal (locator arm deletion,
+   fixture/proof-IO retirement, SkipPoint collapse).
 
 Memory track: `recursion-track.md` (machine-local) mirrors this and adds
 session gotchas. The two survey reports' full maps are summarized in the
