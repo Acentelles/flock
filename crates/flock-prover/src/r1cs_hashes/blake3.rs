@@ -1711,7 +1711,6 @@ impl Blake3Setup {
     /// is shared. Witness generation dispatches on the r1cs's witness layout,
     /// so both row-major and batch-major setups work. aarch64-only (NEON
     /// round-1 kernel).
-    #[cfg(target_arch = "aarch64")]
     /// The AG-skip prover runs the DIRECT (dense pow2-lane) commit — the
     /// standard-pack shape its zerocheck and claims are wired for — while
     /// `prove_fast` moved to the single-slot UNION commit (dense stack +
@@ -1731,6 +1730,7 @@ impl Blake3Setup {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
     pub fn prove_fast_ag<Ch: Challenger>(
         &self,
         blocks: &[Compression],
