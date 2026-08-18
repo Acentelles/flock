@@ -2530,6 +2530,29 @@ mod tests {
                 "must reject a corrupted grinding nonce"
             );
         }
+
+        // The FUSED r1 nonce: any change must reject (bad PoW, bad point, or
+        // a diverged r1 failing the c-eval bind).
+        let mut bad = proof.clone();
+        bad.boolean.ag.r1_nonce = bad.boolean.ag.r1_nonce.wrapping_add(1);
+        let mut ch = FsChallenger::new(b"flock-union-ag-v0");
+        assert!(
+            setup.verify_union_ag(&commitment, &bad, &mut ch).is_err(),
+            "must reject a tampered fused r1 nonce"
+        );
+
+        // The lincheck's FUSED AG skip nonce (the last lincheck nonce).
+        let mut bad = proof.clone();
+        *bad.boolean
+            .lincheck
+            .grinding_nonces
+            .last_mut()
+            .expect("the AG arm carries a fused skip nonce") ^= 1;
+        let mut ch = FsChallenger::new(b"flock-union-ag-v0");
+        assert!(
+            setup.verify_union_ag(&commitment, &bad, &mut ch).is_err(),
+            "must reject a tampered fused lincheck skip nonce"
+        );
     }
 
     #[test]

@@ -692,6 +692,33 @@ pub fn verify_multilinear(
 // ---------------------------------------------------------------------------
 
 /// A fixed, valid point of `Y`, the fallback for the (≈`2^-289`) chance that
+/// Zero-count bound behind the r₁ grinding budget: a false round-1 message
+/// pair survives at r₁ only if a nonzero PRODUCT-code word (a function in
+/// `L(2D)`, at most `deg 2D = 316` zeros — the ab check) or a nonzero
+/// BASE-code word (`L(D)`, at most `deg D = 158` zeros — the c check)
+/// vanishes there. `316 + 158 = 474` bad points over the ~`2^128` valid
+/// cover points; `bits_for(474) = 9` total bits required.
+pub const R1_ZERO_BOUND: usize = 474;
+
+/// Provable grinding contribution of the rejection sampler itself:
+/// `log2(BASE_Y_DEGREE · 2^3) = log2(32) = 5` bits. The sampler weights
+/// every reachable cover point at exactly `1/(2^128 · 32)` (slot flattening
+/// over the degree-4 base fiber, three all-or-nothing Artin–Schreier levels
+/// with uniform choice bits), and Hasse–Weil pins the genus-95 cover's point
+/// count to `2^128 · (1 ± 2^-56)` — so each valid draw provably costs
+/// ≥ ~32 attempts. A protocol constant (the sampler's shape), NOT an
+/// empirical acceptance estimate; guarded by `credit_constants_are_pinned`.
+pub const AG_SAMPLING_CREDIT_BITS: u32 = 5;
+
+/// Explicit PoW bits on the FUSED r₁ nonce under a strict grinding schedule:
+/// `bits_for(R1_ZERO_BOUND) − AG_SAMPLING_CREDIT_BITS = 9 − 5 = 4`.
+pub const R1_POW_BITS: u32 = 4;
+
+/// Prover-side scan budget for the fused r₁ nonce: success per nonce is
+/// `2^-R1_POW_BITS / 32 = 2^-9`, so exhausting `2^20` nonces has probability
+/// `(1 − 2^-9)^(2^20) ≈ 2^-2954` — a completeness error we accept (panic).
+pub const R1_FUSED_ATTEMPT_BUDGET: u32 = 1 << 20;
+
 /// rejection sampling exhausts its attempt budget. Baked from one offline sample.
 ///
 /// No longer used by the AG-skip `r₁` derivation (the nonce-grind path panics
@@ -699,8 +726,9 @@ pub fn verify_multilinear(
 /// prover pin `r₁` to this public constant). Still backs
 /// [`crate::lincheck::SkipPoint::sample_fresh`], where BOTH sides replay the
 /// same deterministic loop, so a prover cannot claim failure unilaterally:
-/// forcing it costs `~1/P_fail ≈ 2^289`, far above the `2^128` target. (Keep
-/// linked to the sampler's attempt cap; lowering the cap raises `P_fail`.)
+/// forcing it costs `~1/P_fail ≈ 2^916` (acceptance is 1/32 per attempt, so
+/// `P_fail = (1 − 1/32)^20000`), far above the `2^128` target. (Keep linked
+/// to the sampler's attempt cap; lowering the cap raises `P_fail`.)
 pub(crate) fn fallback_point() -> EvaluationPoint {
     EvaluationPoint {
         x: F128 {
@@ -753,13 +781,19 @@ fn observe_r1_nonce<C: Challenger>(challenger: &mut C, nonce: u32) {
 /// ([`crate::genus95_curve_code::evaluation_point_from_nonce`]); the first
 /// nonce whose attempt lands a valid point is observed into the transcript and
 /// shipped in the proof, so the verifier re-derives `r₁` with a SINGLE attempt
-/// rather than the expected ~100 (worst-case 20 000) replayed ones.
+/// rather than the expected ~32 (worst-case 20 000) replayed ones.
 ///
-/// Per-attempt acceptance is ~1%, so exhausting all
+/// Per-attempt acceptance is 1/32 (measured 3.141% over 10⁶ attempts;
+/// structurally `1/(BASE_Y_DEGREE · 2^3)`), so exhausting all
 /// [`SAMPLE_ATTEMPT_BUDGET`](crate::genus95_curve_code::SAMPLE_ATTEMPT_BUDGET)
-/// nonces has probability ~2⁻²⁸⁹ — a completeness error we accept (panic)
+/// nonces has probability ~2⁻⁹²¹ — a completeness error we accept (panic)
 /// instead of a verifier-side fallback point: an unconditionally accepted
 /// fallback claim would let a cheating prover fix `r₁` to a public constant.
+///
+/// UNGRINDED path only (the direct route / disabled schedules, which make no
+/// 128-bit claim): the verifier's single attempt lets a cheating prover pick
+/// among the ~630 expected valid nonces in the budget — ≤ log₂(20 000) ≈ 14.3
+/// bits of freedom. Strict schedules use [`sample_r1_prover_pow`] instead.
 pub(super) fn sample_r1_prover<C: Challenger>(challenger: &mut C) -> (EvaluationPoint, u32) {
     let seed = r1_seed(challenger);
     let kind = challenger.hash_kind();
@@ -771,15 +805,42 @@ pub(super) fn sample_r1_prover<C: Challenger>(challenger: &mut C) -> (Evaluation
             return (point, nonce);
         }
     }
-    unreachable!("r1 nonce grind exhausted its budget (probability ~2^-289)")
+    unreachable!("r1 nonce grind exhausted its budget (probability ~2^-921)")
+}
+
+/// [`sample_r1_prover`] under a strict grinding schedule: the FUSED nonce —
+/// `H(seed ‖ nonce)` must clear `pow_bits` of PoW AND decode to a valid
+/// cover point, both criteria on the same hash. Every candidate the prover
+/// (or an attacker) evaluates re-enters the PoW, so there is no free choice
+/// among valid nonces; with the sampler's provable
+/// [`AG_SAMPLING_CREDIT_BITS`] = 5 bits on top, `r₁` carries
+/// `pow_bits + 5` grinding bits total. Expected prover cost is
+/// `2^pow_bits · 32` hash calls plus `2^pow_bits` point attempts (~50 µs at
+/// the strict [`R1_POW_BITS`] = 4); the verifier stays ONE-SHOT.
+pub(super) fn sample_r1_prover_pow<C: Challenger>(
+    challenger: &mut C,
+    pow_bits: u32,
+) -> (EvaluationPoint, u32) {
+    let seed = r1_seed(challenger);
+    let kind = challenger.hash_kind();
+    for nonce in 0..R1_FUSED_ATTEMPT_BUDGET {
+        if let Some(point) =
+            crate::genus95_curve_code::evaluation_point_from_nonce_pow(&seed, nonce, kind, pow_bits)
+        {
+            observe_r1_nonce(challenger, nonce);
+            return (point, nonce);
+        }
+    }
+    unreachable!("fused r1 nonce grind exhausted its budget (probability ~2^-2954)")
 }
 
 /// Verifier: re-derive `r₁` from the proof's nonce — range-check it, run the
 /// single attempt, and reject unless it lands a valid point. The verifier does
 /// NOT check the nonce is the prover's minimal one, so a cheating prover may
-/// pick any of the ~200 expected valid nonces in the budget: ≤ log₂(20 000) ≈
-/// 14.3 bits of grinding over `r₁`, charged to the soundness budget exactly
-/// like a PoW grind.
+/// pick any of the ~630 expected valid nonces in the budget: ≤ log₂(20 000) ≈
+/// 14.3 bits of freedom over `r₁`. UNGRINDED path only — strict schedules
+/// verify the fused nonce via [`replay_r1_verifier_pow`], which has no such
+/// freedom (every candidate carries its own PoW).
 pub(super) fn replay_r1_verifier<C: Challenger>(
     challenger: &mut C,
     nonce: u32,
@@ -791,6 +852,28 @@ pub(super) fn replay_r1_verifier<C: Challenger>(
     observe_r1_nonce(challenger, nonce);
     crate::genus95_curve_code::evaluation_point_from_nonce(&seed, nonce, challenger.hash_kind())
         .ok_or(AgVerifyError::BadR1Nonce { nonce })
+}
+
+/// Verifier mirror of [`sample_r1_prover_pow`]: ONE hash + ONE point attempt,
+/// rejecting unless the fused nonce clears the PoW target AND lands a valid
+/// point. Constant-shape — no rejection replay, no data-dependent loop.
+pub(super) fn replay_r1_verifier_pow<C: Challenger>(
+    challenger: &mut C,
+    nonce: u32,
+    pow_bits: u32,
+) -> Result<EvaluationPoint, AgVerifyError> {
+    let seed = r1_seed(challenger);
+    if nonce >= R1_FUSED_ATTEMPT_BUDGET {
+        return Err(AgVerifyError::BadR1Nonce { nonce });
+    }
+    observe_r1_nonce(challenger, nonce);
+    crate::genus95_curve_code::evaluation_point_from_nonce_pow(
+        &seed,
+        nonce,
+        challenger.hash_kind(),
+        pow_bits,
+    )
+    .ok_or(AgVerifyError::BadR1Nonce { nonce })
 }
 
 /// All round messages the AG-skip prover sends, in order.
@@ -910,7 +993,8 @@ impl<C: Challenger> Challenger for RoundGrindProver<'_, C> {
 
 /// Nonce count [`AgProof::grinding_nonces`] must carry for `m` under a
 /// schedule: the initial outer-eq point + one per multilinear round. (`r₁`'s
-/// rejection nonce is a separate proof field.)
+/// nonce — fused PoW+sampling under a strict schedule, plain sampling
+/// otherwise — is the separate [`AgProof::r1_nonce`] field.)
 pub fn grinding_nonce_count(grinding: super::ZerocheckGrinding, m: usize) -> usize {
     usize::from(grinding.initial_bits(m).is_some())
         + usize::from(grinding.multilinear_round_bits().is_some()) * (m - K_SKIP)
@@ -995,8 +1079,10 @@ pub fn prove_capture_s_hat_v_c<C: Challenger>(
 /// UNION route's strict-profile entry. Grinds the initial outer-eq point
 /// (`initial_bits(m)`) and every multilinear round
 /// (`multilinear_round_bits`), mirroring the RS zerocheck's schedule; `r₁`
-/// keeps its inherent rejection-sampling nonce (the AG challenge family's
-/// strict-bits accounting is an audit TODO — this variant is opt-in).
+/// switches to the FUSED nonce ([`sample_r1_prover_pow`]):
+/// [`R1_POW_BITS`] = 4 explicit PoW bits + the sampler's
+/// [`AG_SAMPLING_CREDIT_BITS`] = 5 provable bits = `bits_for(474)` for the
+/// product+base code bad set ([`R1_ZERO_BOUND`]), with a ONE-SHOT verifier.
 ///
 /// PADDING CONTRACT: round 1 sums the FULL `2^m` region — every padding
 /// word of `a`/`b`/`c` must be an HONEST ZERO (the union's fresh-zeroed
@@ -1094,7 +1180,10 @@ fn prove_from_round1<C: Challenger>(
     challenger.observe_f128_slice(&msg.ab_fresh);
     challenger.observe_f128_slice(&msg.c_msg);
 
-    let (r1, r1_nonce) = sample_r1_prover(challenger);
+    let (r1, r1_nonce) = match grinding.ag_r1_bits() {
+        Some(bits) => sample_r1_prover_pow(challenger, bits),
+        None => sample_r1_prover(challenger),
+    };
     let c_eval = eval_c_at(&msg, &r1);
 
     let bf = base_evaluation_functional(&r1).expect("denominator nonzero at r1");
@@ -1460,7 +1549,10 @@ pub fn verify_with_grinding<C: Challenger>(
     challenger.observe_f128_slice(&proof.round1_ab);
     challenger.observe_f128_slice(&proof.round1_c);
 
-    let r1 = replay_r1_verifier(challenger, proof.r1_nonce)?;
+    let r1 = match grinding.ag_r1_bits() {
+        Some(bits) => replay_r1_verifier_pow(challenger, proof.r1_nonce, bits)?,
+        None => replay_r1_verifier(challenger, proof.r1_nonce)?,
+    };
     let msg = Round1Message {
         ab_fresh: proof.round1_ab.clone(),
         c_msg: proof.round1_c.clone(),
@@ -2174,5 +2266,108 @@ mod tests {
             verify(m, &proof, &mut FsChallenger::new(b"flock-ag-skip-test")).is_err(),
             "must reject a witness violating a*b=c"
         );
+    }
+
+    /// The fused-nonce grinding credit rests on pinned protocol constants —
+    /// this test ties every number in the derivation together so a change to
+    /// the sampler's shape or the code parameters cannot silently invalidate
+    /// the 5-bit credit or the explicit-bit splits.
+    #[test]
+    fn credit_constants_are_pinned() {
+        const GENUS: usize = 95;
+        let bits_for = |n: usize| usize::BITS - n.leading_zeros();
+        // Code degrees from the Riemann–Roch dimensions: deg = dim + g − 1.
+        let base_deg = crate::genus95_curve_code::BASE_MESSAGE_BITS + GENUS - 1;
+        let product_deg = crate::genus95_curve_code::PRODUCT_MESSAGE_BITS + GENUS - 1;
+        assert_eq!(base_deg, 158);
+        assert_eq!(product_deg, 316);
+        assert_eq!(R1_ZERO_BOUND, product_deg + base_deg);
+        // The sampler's per-point weight is 1/(2^128 · BASE_Y_DEGREE · 2^3):
+        // the slot flattening over the base fiber and the three
+        // Artin–Schreier choice bits. log2 of that constant is the credit.
+        let sampler_denom = crate::genus95_curve_code::BASE_Y_DEGREE * 8;
+        assert_eq!(sampler_denom, 32);
+        assert_eq!(AG_SAMPLING_CREDIT_BITS, sampler_denom.trailing_zeros());
+        // Explicit + credit = the strict per-challenge requirement.
+        assert_eq!(
+            R1_POW_BITS + AG_SAMPLING_CREDIT_BITS,
+            bits_for(R1_ZERO_BOUND)
+        );
+        assert_eq!(
+            crate::lincheck::AG_LINCHECK_SKIP_POW_BITS + AG_SAMPLING_CREDIT_BITS,
+            bits_for(base_deg)
+        );
+        // The schedule methods expose exactly these constants.
+        let g = crate::zerocheck::ZerocheckGrinding::per_challenge_128();
+        assert_eq!(g.ag_r1_bits(), Some(R1_POW_BITS));
+        assert_eq!(
+            crate::zerocheck::ZerocheckGrinding::disabled().ag_r1_bits(),
+            None
+        );
+    }
+
+    /// The fused predicate really gates on BOTH criteria: a nonce whose
+    /// attempt lands a valid point still rejects under a PoW target its hash
+    /// does not clear, and pow_bits = 0 degenerates to the plain attempt.
+    #[test]
+    fn fused_nonce_gates_on_pow_and_point() {
+        use crate::genus95_curve_code::{
+            evaluation_point_from_nonce, evaluation_point_from_nonce_pow,
+        };
+        use crate::hash::HashKind;
+        let seed = [5u8; 32];
+        let n = (0..20_000u32)
+            .find(|&n| evaluation_point_from_nonce(&seed, n, HashKind::Sha256).is_some())
+            .expect("a valid nonce exists in the budget");
+        // pow_bits = 0: identical to the plain attempt.
+        assert_eq!(
+            evaluation_point_from_nonce_pow(&seed, n, HashKind::Sha256, 0),
+            evaluation_point_from_nonce(&seed, n, HashKind::Sha256)
+        );
+        // A 40-bit target rejects this specific point-valid nonce (its hash
+        // clears 40 zero bits with probability 2^-40 — deterministic here).
+        assert_eq!(
+            evaluation_point_from_nonce_pow(&seed, n, HashKind::Sha256, 40),
+            None,
+            "the PoW gate must reject a point-valid nonce whose hash misses the target"
+        );
+        // And a nonce found UNDER the 4-bit target also passes the plain attempt.
+        let n4 = (0..(1u32 << 20))
+            .find(|&n| evaluation_point_from_nonce_pow(&seed, n, HashKind::Sha256, 4).is_some())
+            .expect("a fused nonce exists in the budget");
+        assert!(evaluation_point_from_nonce(&seed, n4, HashKind::Sha256).is_some());
+    }
+
+    /// Full grinding roundtrip on the fused transcript + fused-nonce tamper
+    /// rejection: any change to `r1_nonce` must reject (bad PoW, bad point,
+    /// or — if both criteria fluke — a different r₁ failing the c-eval bind).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn grinding_roundtrip_rejects_fused_nonce_tampers() {
+        use crate::challenger::FsChallenger;
+        let m = 14usize;
+        let (a, b, c) = random_witness(m, 77);
+        let g = crate::zerocheck::ZerocheckGrinding::per_challenge_128();
+        let mk = || FsChallenger::new(b"flock-ag-grind-test");
+        let (proof, claim, _) = prove_capture_s_hat_v_c_with_grinding(&a, &b, &c, m, g, &mut mk());
+        let vclaim =
+            verify_with_grinding(m, &proof, g, &mut mk()).expect("honest fused proof verifies");
+        assert_eq!(vclaim, claim);
+
+        for delta in [1u32, 2, 3, 17] {
+            let mut bad = proof.clone();
+            bad.r1_nonce = proof.r1_nonce.wrapping_add(delta);
+            assert!(
+                verify_with_grinding(m, &bad, g, &mut mk()).is_err(),
+                "tampered fused r1 nonce (+{delta}) accepted"
+            );
+        }
+        // The grinding-nonce vector still binds: wrong count rejects.
+        let mut bad = proof.clone();
+        bad.grinding_nonces.push(0);
+        assert!(matches!(
+            verify_with_grinding(m, &bad, g, &mut mk()),
+            Err(AgVerifyError::BadGrindingNonceCount { .. })
+        ));
     }
 }

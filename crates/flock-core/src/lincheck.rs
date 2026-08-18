@@ -613,6 +613,18 @@ impl LincheckGrinding {
             .filter(|&bits| bits != 0)
     }
 
+    /// Explicit PoW bits for the AG-basis final skip point's FUSED nonce. The
+    /// bad set is a nonzero BASE-code word's zeros — at most `deg D = 158`
+    /// (the genus tax: `dim 64 + g 95 − 1`), against the φ₈ basis's `2^6 − 1
+    /// = 63` — so `bits_for(158) = 8` total bits, of which the rejection
+    /// sampler provably contributes
+    /// [`crate::zerocheck::ag_skip::AG_SAMPLING_CREDIT_BITS`] = 5, leaving 3
+    /// explicit. Gated on the same flag as [`Self::skip_bits`], so
+    /// [`Self::nonce_count`] holds for either basis (one skip nonce each).
+    pub fn ag_skip_bits(self, k_skip: usize) -> Option<u32> {
+        self.skip_bits(k_skip).map(|_| AG_LINCHECK_SKIP_POW_BITS)
+    }
+
     /// Number of nonces the proof must carry for this concrete lincheck.
     pub fn nonce_count(
         self,
@@ -626,6 +638,11 @@ impl LincheckGrinding {
             + usize::from(self.skip_bits(k_skip).is_some())
     }
 }
+
+/// Explicit PoW bits on the AG-basis final-skip fused nonce:
+/// `bits_for(158) − AG_SAMPLING_CREDIT_BITS = 8 − 5 = 3`. See
+/// [`LincheckGrinding::ag_skip_bits`]; guarded by the ag_skip constants test.
+pub const AG_LINCHECK_SKIP_POW_BITS: u32 = 3;
 
 /// Lincheck output: one MLE evaluation claim on `z`, at the quirky inner
 /// point `(r_inner_skip, r_inner_rest)` combined with `x_ab.x_outer`
@@ -1223,14 +1240,7 @@ impl SkipPoint {
         match self {
             SkipPoint::Phi8(_) => SkipPoint::Phi8(ch.sample_f128()),
             SkipPoint::Ag(_) => {
-                ch.observe_label(b"flock-lincheck-ag-skip-point");
-                let s0 = ch.sample_f128();
-                let s1 = ch.sample_f128();
-                let mut seed = [0u8; 32];
-                seed[0..8].copy_from_slice(&s0.lo.to_le_bytes());
-                seed[8..16].copy_from_slice(&s0.hi.to_le_bytes());
-                seed[16..24].copy_from_slice(&s1.lo.to_le_bytes());
-                seed[24..32].copy_from_slice(&s1.hi.to_le_bytes());
+                let seed = Self::ag_fresh_seed(ch);
                 let p = crate::genus95_curve_code::sample_random_evaluation_point(
                     &mut crate::genus95_curve_code::FsRng::new(ch.hash_kind(), seed),
                 )
@@ -1238,6 +1248,84 @@ impl SkipPoint {
                 SkipPoint::Ag(p)
             }
         }
+    }
+
+    /// The 32-byte transcript seed for a fresh AG skip point: label + two
+    /// squeezes. Shared by [`Self::sample_fresh`] (deterministic replay on
+    /// both sides) and the fused-nonce pair below.
+    fn ag_fresh_seed<Ch: crate::challenger::Challenger>(ch: &mut Ch) -> [u8; 32] {
+        ch.observe_label(b"flock-lincheck-ag-skip-point");
+        let s0 = ch.sample_f128();
+        let s1 = ch.sample_f128();
+        let mut seed = [0u8; 32];
+        seed[0..8].copy_from_slice(&s0.lo.to_le_bytes());
+        seed[8..16].copy_from_slice(&s0.hi.to_le_bytes());
+        seed[16..24].copy_from_slice(&s1.lo.to_le_bytes());
+        seed[24..32].copy_from_slice(&s1.hi.to_le_bytes());
+        seed
+    }
+
+    /// Bind the chosen fused nonce into the transcript — later challenges
+    /// (nothing today, but the claim value flows onward) depend on the point
+    /// through it. Mirrored exactly by the verifier.
+    fn observe_ag_fresh_nonce<Ch: crate::challenger::Challenger>(ch: &mut Ch, nonce: u32) {
+        ch.observe_label(b"flock-lincheck-ag-skip-nonce");
+        ch.observe_bytes(&nonce.to_le_bytes());
+    }
+
+    /// [`Self::sample_fresh`] under a strict grinding schedule, AG basis only
+    /// — the FUSED nonce: `H(seed ‖ nonce)` must clear `pow_bits` of PoW AND
+    /// decode to a valid cover point (both criteria on one hash, so no free
+    /// choice among valid nonces). With the sampler's provable
+    /// [`crate::zerocheck::ag_skip::AG_SAMPLING_CREDIT_BITS`] = 5 bits on
+    /// top, the point carries `pow_bits + 5` grinding bits total, and the
+    /// verifier mirror is ONE-SHOT (no rejection replay).
+    pub fn sample_fresh_pow_prover<Ch: crate::challenger::Challenger>(
+        &self,
+        ch: &mut Ch,
+        pow_bits: u32,
+    ) -> (SkipPoint, u64) {
+        let SkipPoint::Ag(_) = self else {
+            unreachable!("the fused fresh-point nonce is AG-basis only");
+        };
+        let seed = Self::ag_fresh_seed(ch);
+        let kind = ch.hash_kind();
+        for nonce in 0..crate::zerocheck::ag_skip::R1_FUSED_ATTEMPT_BUDGET {
+            if let Some(p) = crate::genus95_curve_code::evaluation_point_from_nonce_pow(
+                &seed, nonce, kind, pow_bits,
+            ) {
+                Self::observe_ag_fresh_nonce(ch, nonce);
+                return (SkipPoint::Ag(p), u64::from(nonce));
+            }
+        }
+        unreachable!("fused fresh-point grind exhausted its budget (probability ~2^-2954)")
+    }
+
+    /// Verifier mirror of [`Self::sample_fresh_pow_prover`]: one hash + one
+    /// point attempt; `None` rejects (bad PoW, bad point, or a nonce outside
+    /// the prover's scan budget).
+    pub fn sample_fresh_pow_verifier<Ch: crate::challenger::Challenger>(
+        &self,
+        ch: &mut Ch,
+        nonce: u64,
+        pow_bits: u32,
+    ) -> Option<SkipPoint> {
+        let SkipPoint::Ag(_) = self else {
+            unreachable!("the fused fresh-point nonce is AG-basis only");
+        };
+        let seed = Self::ag_fresh_seed(ch);
+        let nonce = u32::try_from(nonce).ok()?;
+        if nonce >= crate::zerocheck::ag_skip::R1_FUSED_ATTEMPT_BUDGET {
+            return None;
+        }
+        Self::observe_ag_fresh_nonce(ch, nonce);
+        crate::genus95_curve_code::evaluation_point_from_nonce_pow(
+            &seed,
+            nonce,
+            ch.hash_kind(),
+            pow_bits,
+        )
+        .map(SkipPoint::Ag)
     }
 
     /// Extract the φ₈ field point. Panics on an AG point — used at RS PCS-verify
@@ -1909,24 +1997,27 @@ fn column_sumcheck_prove<Ch: Challenger>(
 
     // 7. Sample fresh z_skip AFTER observing z_partial — gives Schwartz-Zippel
     //    soundness on the φ8 (univariate-skip) dim.
-    let r_inner_skip = if let Some(bits) = grinding.skip_bits(k_skip) {
-        match z_skip {
-            // Grinding profiles run the φ₈ basis; keep the FUSED PoW+squeeze
-            // transcript (byte-pinned on the chained-BLAKE3 challenger).
-            SkipPoint::Phi8(_) => {
+    let r_inner_skip = match z_skip {
+        // Grinding profiles on the φ₈ basis keep the FUSED PoW+squeeze
+        // transcript (byte-pinned on the chained-BLAKE3 challenger).
+        SkipPoint::Phi8(_) => match grinding.skip_bits(k_skip) {
+            Some(bits) => {
                 let (nonce, r) = challenger.grind_pow_and_sample_f128(bits);
                 grinding_nonces.push(nonce);
                 SkipPoint::Phi8(r)
             }
-            // No grinding profile uses the AG basis today; compose the two
-            // operations sequentially if one ever does.
-            SkipPoint::Ag(_) => {
-                grinding_nonces.push(challenger.grind_pow(bits));
-                z_skip.sample_fresh(challenger)
+            None => z_skip.sample_fresh(challenger),
+        },
+        // AG basis: the FUSED nonce (PoW + point validity on one hash) —
+        // 3 explicit bits + the sampler's 5 provable bits = bits_for(158).
+        SkipPoint::Ag(_) => match grinding.ag_skip_bits(k_skip) {
+            Some(bits) => {
+                let (p, nonce) = z_skip.sample_fresh_pow_prover(challenger, bits);
+                grinding_nonces.push(nonce);
+                p
             }
-        }
-    } else {
-        z_skip.sample_fresh(challenger)
+            None => z_skip.sample_fresh(challenger),
+        },
     };
 
     // 8. Output claim's value: φ8 Lagrange combination of z_partial at z_skip.
@@ -2171,9 +2262,9 @@ pub fn verify_with_grinding<Ch: Challenger>(
     }
 
     // 6. Sample fresh z_skip AFTER z_partial — gives SZ on the φ8 dim.
-    let r_inner_skip = if let Some(bits) = grinding.skip_bits(k_skip) {
-        match &x_ab.z_skip {
-            SkipPoint::Phi8(_) => {
+    let r_inner_skip = match &x_ab.z_skip {
+        SkipPoint::Phi8(_) => match grinding.skip_bits(k_skip) {
+            Some(bits) => {
                 let r = challenger
                     .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
                     .ok_or(VerifyError::InvalidGrindingNonce {
@@ -2182,18 +2273,20 @@ pub fn verify_with_grinding<Ch: Challenger>(
                 nonce_idx += 1;
                 SkipPoint::Phi8(r)
             }
-            SkipPoint::Ag(_) => {
-                if !challenger.verify_pow(proof.grinding_nonces[nonce_idx], bits) {
-                    return Err(VerifyError::InvalidGrindingNonce {
-                        which: "inner-skip",
-                    });
-                }
+            None => x_ab.z_skip.sample_fresh(challenger),
+        },
+        SkipPoint::Ag(_) => match grinding.ag_skip_bits(k_skip) {
+            Some(bits) => {
+                let nonce = proof.grinding_nonces[nonce_idx];
                 nonce_idx += 1;
-                x_ab.z_skip.sample_fresh(challenger)
+                x_ab.z_skip
+                    .sample_fresh_pow_verifier(challenger, nonce, bits)
+                    .ok_or(VerifyError::InvalidGrindingNonce {
+                        which: "inner-skip",
+                    })?
             }
-        }
-    } else {
-        x_ab.z_skip.sample_fresh(challenger)
+            None => x_ab.z_skip.sample_fresh(challenger),
+        },
     };
     debug_assert_eq!(nonce_idx, proof.grinding_nonces.len());
 

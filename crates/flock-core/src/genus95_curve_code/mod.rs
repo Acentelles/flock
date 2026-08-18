@@ -37,6 +37,8 @@ mod slp_derived;
 mod tables;
 
 pub use base_evaluator::{BaseFunctional, base_evaluation_functional, evaluate_base_functional};
+#[cfg(test)]
+pub(crate) use constants::BASE_Y_DEGREE;
 pub use constants::{BASE_MESSAGE_BITS, PRODUCT_MESSAGE_BITS};
 pub use evaluator::{
     EvaluationPoint, ProductFunctional, evaluate_product_functional, product_evaluation_functional,
@@ -48,7 +50,7 @@ pub use rand_core::RngCore;
 pub use rng::{Blake3Rng, FsRng, Sha256Rng};
 pub use sampling::{
     SAMPLE_ATTEMPT_BUDGET, SampleError, evaluation_point_from_nonce,
-    sample_random_evaluation_point, try_evaluation_point,
+    evaluation_point_from_nonce_pow, sample_random_evaluation_point, try_evaluation_point,
 };
 
 #[cfg(test)]

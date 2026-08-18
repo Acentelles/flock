@@ -361,3 +361,25 @@ fn gf128_row_rank(mut rows: Vec<[F128; PRODUCT_MESSAGE_BITS]>) -> usize {
     }
     rank
 }
+
+/// The rejection sampler's acceptance rate is the protocol constant
+/// 1/(BASE_Y_DEGREE · 2^3) = 1/32 (up to the ~2^-56 Hasse–Weil dust) — the
+/// number behind the fused-nonce grinding credit
+/// (`zerocheck::ag_skip::AG_SAMPLING_CREDIT_BITS`). 200k attempts give
+/// σ ≈ 4·10⁻⁴; the asserted window is ±8σ around 1/32.
+#[test]
+fn acceptance_rate_is_one_in_32() {
+    let mut rng = super::Sha256Rng::new([0xACu8; 32]);
+    let n: u32 = 200_000;
+    let mut ok: u32 = 0;
+    for _ in 0..n {
+        if super::try_evaluation_point(&mut rng).is_some() {
+            ok += 1;
+        }
+    }
+    let p = f64::from(ok) / f64::from(n);
+    assert!(
+        (p - 1.0 / 32.0).abs() < 0.0032,
+        "acceptance rate {p:.5} strayed from the pinned 1/32"
+    );
+}

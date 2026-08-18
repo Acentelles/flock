@@ -120,6 +120,20 @@ impl ZerocheckGrinding {
         }
     }
 
+    /// Explicit PoW bits on the AG-skip zerocheck's FUSED `r₁` nonce
+    /// ([`ag_skip::sample_r1_prover_pow`]): `bits_for(474) = 9` total bits
+    /// required ([`ag_skip::R1_ZERO_BOUND`]), of which the rejection sampler
+    /// provably contributes [`ag_skip::AG_SAMPLING_CREDIT_BITS`] = 5, leaving
+    /// 4 explicit. `None` under a disabled schedule (the direct route's plain
+    /// single-attempt nonce, which makes no 128-bit claim).
+    pub const fn ag_r1_bits(self) -> Option<u32> {
+        if self.enabled {
+            Some(ag_skip::R1_POW_BITS)
+        } else {
+            None
+        }
+    }
+
     /// PoW before a standard degree-two tail-round challenge.
     pub const fn multilinear_round_bits(self) -> Option<u32> {
         if self.enabled {

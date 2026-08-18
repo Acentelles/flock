@@ -901,11 +901,11 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
     //       `column_sumcheck_prove`'s grinding composition exactly: the φ₈
     //       basis keeps the FUSED PoW+squeeze (byte-pinned), the AG basis
     //       composes the standalone PoW with `sample_fresh`.
-    let r_inner_skip = if let Some(bits) = grinding.skip_bits(k_skip) {
-        let nonce = proof.grinding_nonces[nonce_idx];
-        nonce_idx += 1;
-        match x_ab.z_skip {
-            SkipPoint::Phi8(_) => {
+    let r_inner_skip = match x_ab.z_skip {
+        SkipPoint::Phi8(_) => match grinding.skip_bits(k_skip) {
+            Some(bits) => {
+                let nonce = proof.grinding_nonces[nonce_idx];
+                nonce_idx += 1;
                 let r = challenger.verify_pow_and_sample_f128(nonce, bits).ok_or(
                     VerifyError::InvalidGrindingNonce {
                         which: "inner-skip",
@@ -913,17 +913,22 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
                 )?;
                 SkipPoint::Phi8(r)
             }
-            SkipPoint::Ag(_) => {
-                if !challenger.verify_pow(nonce, bits) {
-                    return Err(VerifyError::InvalidGrindingNonce {
+            None => x_ab.z_skip.sample_fresh(challenger),
+        },
+        // AG basis: ONE-SHOT fused-nonce check — 3 explicit bits + the
+        // sampler's 5 provable bits = bits_for(158) for the base-code bad set.
+        SkipPoint::Ag(_) => match grinding.ag_skip_bits(k_skip) {
+            Some(bits) => {
+                let nonce = proof.grinding_nonces[nonce_idx];
+                nonce_idx += 1;
+                x_ab.z_skip
+                    .sample_fresh_pow_verifier(challenger, nonce, bits)
+                    .ok_or(VerifyError::InvalidGrindingNonce {
                         which: "inner-skip",
-                    });
-                }
-                x_ab.z_skip.sample_fresh(challenger)
+                    })?
             }
-        }
-    } else {
-        x_ab.z_skip.sample_fresh(challenger)
+            None => x_ab.z_skip.sample_fresh(challenger),
+        },
     };
     debug_assert_eq!(nonce_idx, proof.grinding_nonces.len());
     let lambda = r_inner_skip.weights(k_skip);
