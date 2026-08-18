@@ -81,6 +81,34 @@ RS run-list gating on this shape, or the recorded three-arm bench's arm not
 matching the leaf's exact profile/transport. Worth one attribution pass
 before Phase C multiplies it across the outers.
 
+**AG/RS OPTIMIZATION PARITY (Ron's call, same day): CLOSED** — the AG
+zerocheck now has every RS-branch optimization (commits on this branch):
+- Run-list round 1: `PaddingSpec::block_coverage` classifies the 8192-bit
+  code-block grid Dead/Full/Partial; the SLP kernels needed NO surgery —
+  they are position-independent additive sums, so full runs go in as
+  (slice, eq-subrange) segments and Partial blocks are cleansed
+  (`cleanse_block`, bit-masked edges) into zeroed scratch. No
+  declared-dead bit is ever read.
+- The fused fold is gated on the same map (`fold_and_first_round_padded`),
+  and below the utilization gate emits LIVE-SPAN buffers
+  (`fold_and_first_round_sparse` + 128-aligned `LiveLayout`) feeding RS's
+  own support-proportional rounds (`fold_and_round_pair_sparse_into` —
+  the friendly constants ride as ordinary r_next weights), with ONE
+  expand-to-dense on exit resuming the AG lookahead tail mid-stream.
+- Consequence: the `PooledDirty` witness election dropped its RS-only
+  condition — the AG honest-zero forcing is GONE (the padding contract is
+  now enforced by read-exactness, not by memset).
+- Differential coverage: byte-identical proofs between dense-honest,
+  padded-honest, and padded-DIRTY witnesses (deliberately inconsistent
+  garbage in dead regions), both grinding schedules, at 62%/8-block and
+  3-of-64-block utilization; plus a 200/256-row union roundtrip re-proving
+  over pooled-dirty buffers byte-identically.
+The direction of remaining asymmetry is now AG-ahead-of-RS (lookahead +
+friendly-Horner tail), which is fine — RS is the deprecation target.
+This also pre-pays Phase C's cost profile: the envelope outers' dead
+boolean space (swap 12250/16384, spread 1060/16384, pow 4096/16384 at
+nu* = 14) is now skipped, not scanned, under AG.
+
 NEXT — **Phase C (outers-AG)**: the same five items on
 `RealTape`/`RealRegion` (`zc_l` find at 6222, round-1 pins ~6300s, walk
 ~6848s, `zskip_ch/zskip_fin` fields at 7422/8764, `emit_lagrange_lows`
