@@ -12,6 +12,62 @@ than optional; the in-circuit AG lows (Phase D) are the *successor* of
 flip-in-place + delete, not permanent parallel API; and Phase F lists the
 removal blockers (x86 + CUDA AG kernels chief among them).
 
+## Status + next-session entry point (updated 2026-08-18)
+
+DONE: **Phase A complete** (commit d6a0eb1 — circuit-AG entries
+`R1csProofCircuitMergedAg` / `prove_fast_ligerito_union_circuit_ag` /
+`verify_ligerito_union_circuit_ag{,_deferred}`; fused PoW predicate aligned
+to the PowMask convention; `cross_class_circuit_ag_roundtrip` green).
+**Phase B slice 1 done** (5a35c4e — `chain_leaf_ag_roundtrip`: the real
+chain shape proves under AG, RS 17.6 vs AG 12.3 ms at m22 dev size).
+
+NEXT — **Phase B remainder**, all in `crates/flock-prover/src/tower.rs`
+(line refs at 5a35c4e):
+
+1. `MixedInner.proof` becomes a flavor enum (`Rs(R1csProofCircuitMerged) |
+   Ag(R1csProofCircuitMergedAg)`), with accessors for the shared fields
+   (lincheck / wiring / pcs_open) so the non-zerocheck pins stay one code
+   path. `build_chain_proof` proves AG behind a private flavor switch
+   (flip-in-place — no public TowerConfig change).
+2. `ChildTape::new` AG arm:
+   - native verify under the recorder → `verify_ligerito_union_circuit_ag`
+     (11451); assertions still from `inner.work`.
+   - region anchor `find(b"flock-ag-skip-v1")` instead of
+     `flock-zerocheck-v0` (11494).
+   - round-1 pins: `ObserveSlice(158)`/`(64)` against `bp.ag.round1_ab/_c`
+     (11553-11583).
+   - the locator walk (12284-12354): ONE `SqueezeSlice` (r_outer — RS has
+     two: r_skip + r_outer); then in place of `[Pow] + SqueezeScalar`
+     z_skip: `Label("flock-ag-skip-r1-point") + SqueezeScalar ×2 +
+     Label("flock-ag-skip-r1-nonce") + ObserveBytes(4)`. The mlv loop code
+     is unchanged. After `z_partial`, the lincheck fresh-skip is the same
+     5-op AG shape (label + 2 squeezes + label + ObserveBytes(4)).
+   - the `.phi8()` pin (12392) → native point pin: rebuild the 32-byte seed
+     from the two located seed chals (`ag_skip::r1_seed` layout: s0.lo,
+     s0.hi, s1.lo, s1.hi LE), run `evaluation_point_from_nonce_pow(seed,
+     proof.r1_nonce, kind, R1_POW_BITS)`, compare to
+     `bool_assert.z_skip` (`SkipPoint::Ag`).
+   - GOTCHA: the nonce payload rides the STREAM WORDS (`ww`), not
+     `vals_rec` (ObserveBytes contributes no vals entries);
+     `bytes_payload_mask` marks it public by default — desired here.
+3. `ChildRegion`: for AG children skip `emit_lagrange_lows` (FL connects at
+   10201-10215) and instead publish (seed₂, nonce, point₅) via the
+   `FoldPub`/`AlphaRec` publics pattern (14558/14244); extend the FL
+   checker (sibling of `check_fold_publics`, 14770) to recompute the point
+   from (seed, nonce) and `base_evaluation_functional(point)` against the
+   fold row-lows. The fold tape itself is unchanged (64-wide lows both
+   bases). Publics count (5684 at tower.rs:362) moves — it is shape, not a
+   pinned digest.
+4. c-point baked constants: the 7 ghash inner constants →
+   `ag_skip::friendly_challenges()` (13504-13511) for AG children.
+5. Tests: FL node over AG leaves (twin of the existing FL roundtrip),
+   shape-diff, capacity asserts, then `tower_online_bench` with the AG
+   leaf (`CHAIN_BLOCKS=262144`; expect ~−100 ms/leaf at m32).
+
+Memory track: `recursion-track.md` (machine-local) mirrors this and adds
+session gotchas. The two survey reports' full maps are summarized in the
+section below; anything deeper re-derives quickly from the line refs.
+
 ## What the survey established (tower @ `ag-union` tip)
 
 1. **The boolean zerocheck's arithmetic is NOT wired in-circuit today.** The
