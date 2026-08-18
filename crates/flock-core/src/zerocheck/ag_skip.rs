@@ -808,6 +808,12 @@ pub struct AgProof {
     pub final_a_eval: F128,
     pub final_b_eval: F128,
     pub final_c_eval: F128,
+    /// PoW nonces in transcript order: the initial outer-eq point, then one
+    /// per multilinear round. Empty under [`ZerocheckGrinding::disabled`]
+    /// (the direct-route entries and every pre-grinding proof). `r₁` keeps
+    /// its own rejection-sampling nonce (`r1_nonce`) regardless.
+    #[serde(default)]
+    pub grinding_nonces: Vec<u64>,
 }
 
 /// Evaluation claims the AG-skip zerocheck reduces to (no PCS). `a_eval`, `b_eval`
@@ -844,6 +850,67 @@ pub enum AgVerifyError {
     },
     CEvalMismatch,
     SumcheckFinalFailed,
+    /// The nonce vector does not match the configured grinding schedule.
+    BadGrindingNonceCount { expected: usize, got: usize },
+    /// A nonce fails the PoW at the FS position sampling its challenge.
+    InvalidGrindingNonce,
+}
+
+/// Challenger adapter for the multilinear tail under per-round grinding:
+/// every `sample_f128` in the tail IS a round challenge, so the adapter
+/// grinds `bits` before each and records the nonce — the tail's kernels stay
+/// untouched. Framing-sensitive ops delegate verbatim.
+struct RoundGrindProver<'a, C: Challenger> {
+    inner: &'a mut C,
+    bits: u32,
+    nonces: &'a mut Vec<u64>,
+}
+
+impl<C: Challenger> Challenger for RoundGrindProver<'_, C> {
+    fn supports_fused_pow_squeeze(&self) -> bool {
+        self.inner.supports_fused_pow_squeeze()
+    }
+    fn hash_kind(&self) -> crate::merkle::HashKind {
+        self.inner.hash_kind()
+    }
+    fn observe_label(&mut self, label: &[u8]) {
+        self.inner.observe_label(label)
+    }
+    fn observe_f128(&mut self, value: F128) {
+        self.inner.observe_f128(value)
+    }
+    fn observe_f128_slice(&mut self, values: &[F128]) {
+        self.inner.observe_f128_slice(values)
+    }
+    fn observe_bytes(&mut self, bytes: &[u8]) {
+        self.inner.observe_bytes(bytes)
+    }
+    fn sample_f128(&mut self) -> F128 {
+        let (nonce, r) = self.inner.grind_pow_and_sample_f128(self.bits);
+        self.nonces.push(nonce);
+        r
+    }
+    fn sample_f128_vec(&mut self, n: usize) -> Vec<F128> {
+        // The tail never vector-squeezes; keep the inner framing if it ever does.
+        self.inner.sample_f128_vec(n)
+    }
+    fn grind_pow(&mut self, bits: u32) -> u64 {
+        self.inner.grind_pow(bits)
+    }
+    fn verify_pow(&mut self, nonce: u64, bits: u32) -> bool {
+        self.inner.verify_pow(nonce, bits)
+    }
+    fn fork_from_seed(&self, _seed: [F128; 2], _label: &'static [u8]) -> Self {
+        unreachable!("the grinding tail adapter is never forked")
+    }
+}
+
+/// Nonce count [`AgProof::grinding_nonces`] must carry for `m` under a
+/// schedule: the initial outer-eq point + one per multilinear round. (`r₁`'s
+/// rejection nonce is a separate proof field.)
+pub fn grinding_nonce_count(grinding: super::ZerocheckGrinding, m: usize) -> usize {
+    usize::from(grinding.initial_bits(m).is_some())
+        + usize::from(grinding.multilinear_round_bits().is_some()) * (m - K_SKIP)
 }
 
 /// Prove `a(y)·b(y) = c(y)` for all `y ∈ {0,1}^m` via the AG-skip zerocheck.
@@ -867,7 +934,15 @@ pub fn prove<C: Challenger>(
     let eq = crate::zerocheck::univariate_skip::build_eq(&r_outer);
 
     let msg = prove_round1(a_packed, b_packed, c_packed, &eq);
-    prove_from_round1(a_packed, b_packed, msg, &r_outer, challenger)
+    prove_from_round1(
+        a_packed,
+        b_packed,
+        msg,
+        &r_outer,
+        super::ZerocheckGrinding::disabled(),
+        Vec::new(),
+        challenger,
+    )
 }
 
 /// [`prove`] that ALSO returns the c-claim's `s_hat_v_c` — the length-128
@@ -901,7 +976,67 @@ pub fn prove_capture_s_hat_v_c<C: Challenger>(
     let eq = crate::zerocheck::univariate_skip::build_eq(&r_outer);
 
     let (msg, s_hat_v_c) = prove_round1_banks(a_packed, b_packed, c_packed, &eq);
-    let (proof, claim) = prove_from_round1(a_packed, b_packed, msg, &r_outer, challenger);
+    let (proof, claim) = prove_from_round1(
+        a_packed,
+        b_packed,
+        msg,
+        &r_outer,
+        super::ZerocheckGrinding::disabled(),
+        Vec::new(),
+        challenger,
+    );
+    (proof, claim, s_hat_v_c)
+}
+
+/// [`prove_capture_s_hat_v_c`] under a Fiat--Shamir grinding schedule — the
+/// UNION route's strict-profile entry. Grinds the initial outer-eq point
+/// (`initial_bits(m)`) and every multilinear round
+/// (`multilinear_round_bits`), mirroring the RS zerocheck's schedule; `r₁`
+/// keeps its inherent rejection-sampling nonce (the AG challenge family's
+/// strict-bits accounting is an audit TODO — this variant is opt-in).
+///
+/// PADDING CONTRACT: round 1 sums the FULL `2^m` region — every padding
+/// word of `a`/`b`/`c` must be an HONEST ZERO (the union's fresh-zeroed
+/// witness mode), unlike the run-list-gated RS kernels which never read
+/// them.
+#[cfg(target_arch = "aarch64")]
+pub fn prove_capture_s_hat_v_c_with_grinding<C: Challenger>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    grinding: super::ZerocheckGrinding,
+    challenger: &mut C,
+) -> (AgProof, AgClaim, Vec<F128>) {
+    assert!(m >= K_SKIP + N_INNER, "m >= 13 required");
+    let expected = (1usize << m) / 8;
+    assert_eq!(a_packed.len(), expected);
+    assert_eq!(b_packed.len(), expected);
+    assert_eq!(c_packed.len(), expected);
+
+    challenger.observe_label(b"flock-ag-skip-v1");
+    let mut grinding_nonces = Vec::with_capacity(grinding_nonce_count(grinding, m));
+    let r_outer = match grinding.initial_bits(m) {
+        Some(bits) => {
+            let (nonce, v) =
+                challenger.grind_pow_and_sample_f128_vec(bits, m - K_SKIP - N_INNER);
+            grinding_nonces.push(nonce);
+            v
+        }
+        None => challenger.sample_f128_vec(m - K_SKIP - N_INNER),
+    };
+    let eq = crate::zerocheck::univariate_skip::build_eq(&r_outer);
+
+    let (msg, s_hat_v_c) = prove_round1_banks(a_packed, b_packed, c_packed, &eq);
+    let (proof, claim) = prove_from_round1(
+        a_packed,
+        b_packed,
+        msg,
+        &r_outer,
+        grinding,
+        grinding_nonces,
+        challenger,
+    );
     (proof, claim, s_hat_v_c)
 }
 
@@ -950,6 +1085,8 @@ fn prove_from_round1<C: Challenger>(
     b_packed: &[u8],
     msg: Round1Message,
     r_outer: &[F128],
+    grinding: super::ZerocheckGrinding,
+    mut grinding_nonces: Vec<u64>,
     challenger: &mut C,
 ) -> (AgProof, AgClaim) {
     challenger.observe_f128_slice(&msg.ab_fresh);
@@ -965,8 +1102,17 @@ fn prove_from_round1<C: Challenger>(
 
     // Round 0: fused fold of a,b at r1 + the first (full-size) multilinear message.
     let (a_mlv, b_mlv, g1_0, ginf_0) = fold_and_first_round(a_packed, b_packed, &w, &r_rest);
-    let (rounds, rhos, a_eval, b_eval) =
-        mlv_tail_fs(a_mlv, b_mlv, g1_0, ginf_0, &r_rest, challenger);
+    let (rounds, rhos, a_eval, b_eval) = match grinding.multilinear_round_bits() {
+        Some(bits) => {
+            let mut gch = RoundGrindProver {
+                inner: challenger,
+                bits,
+                nonces: &mut grinding_nonces,
+            };
+            mlv_tail_fs(a_mlv, b_mlv, g1_0, ginf_0, &r_rest, &mut gch)
+        }
+        None => mlv_tail_fs(a_mlv, b_mlv, g1_0, ginf_0, &r_rest, challenger),
+    };
 
     let proof = AgProof {
         round1_ab: msg.ab_fresh,
@@ -976,6 +1122,7 @@ fn prove_from_round1<C: Challenger>(
         final_a_eval: a_eval,
         final_b_eval: b_eval,
         final_c_eval: c_eval,
+        grinding_nonces,
     };
     let claim = AgClaim {
         r1,
@@ -1253,6 +1400,18 @@ pub fn verify<C: Challenger>(
     proof: &AgProof,
     challenger: &mut C,
 ) -> Result<AgClaim, AgVerifyError> {
+    verify_with_grinding(m, proof, super::ZerocheckGrinding::disabled(), challenger)
+}
+
+/// [`verify`] under a grinding schedule — the mirror of
+/// [`prove_capture_s_hat_v_c_with_grinding`]. With a disabled schedule this
+/// accepts exactly the old proofs (an empty nonce vector is required).
+pub fn verify_with_grinding<C: Challenger>(
+    m: usize,
+    proof: &AgProof,
+    grinding: super::ZerocheckGrinding,
+    challenger: &mut C,
+) -> Result<AgClaim, AgVerifyError> {
     if m < K_SKIP + N_INNER {
         return Err(AgVerifyError::LogNTooSmall { log_n: m });
     }
@@ -1277,9 +1436,25 @@ pub fn verify<C: Challenger>(
             got: proof.multilinear_rounds.len(),
         });
     }
+    let expected_nonces = grinding_nonce_count(grinding, m);
+    if proof.grinding_nonces.len() != expected_nonces {
+        return Err(AgVerifyError::BadGrindingNonceCount {
+            expected: expected_nonces,
+            got: proof.grinding_nonces.len(),
+        });
+    }
+    let mut nonces = proof.grinding_nonces.iter().copied();
 
     challenger.observe_label(b"flock-ag-skip-v1");
-    let r_outer = challenger.sample_f128_vec(m - K_SKIP - N_INNER);
+    let r_outer = match grinding.initial_bits(m) {
+        Some(bits) => {
+            let nonce = nonces.next().ok_or(AgVerifyError::InvalidGrindingNonce)?;
+            challenger
+                .verify_pow_and_sample_f128_vec(nonce, bits, m - K_SKIP - N_INNER)
+                .ok_or(AgVerifyError::InvalidGrindingNonce)?
+        }
+        None => challenger.sample_f128_vec(m - K_SKIP - N_INNER),
+    };
     challenger.observe_f128_slice(&proof.round1_ab);
     challenger.observe_f128_slice(&proof.round1_c);
 
@@ -1296,6 +1471,7 @@ pub fn verify<C: Challenger>(
     let mut r_rest = friendly_challenges().to_vec();
     r_rest.extend_from_slice(&r_outer);
 
+    let mlv_bits = grinding.multilinear_round_bits();
     let mut rhos = Vec::with_capacity(n_mlv);
     for i in 0..n_mlv {
         let (g1, g_inf) = proof.multilinear_rounds[i];
@@ -1303,7 +1479,15 @@ pub fn verify<C: Challenger>(
         let g0 = (c_running + r_eq * g1) * (F128::ONE + r_eq).inv();
         challenger.observe_f128(g1);
         challenger.observe_f128(g_inf);
-        let rho = challenger.sample_f128();
+        let rho = match mlv_bits {
+            Some(bits) => {
+                let nonce = nonces.next().ok_or(AgVerifyError::InvalidGrindingNonce)?;
+                challenger
+                    .verify_pow_and_sample_f128(nonce, bits)
+                    .ok_or(AgVerifyError::InvalidGrindingNonce)?
+            }
+            None => challenger.sample_f128(),
+        };
         rhos.push(rho);
         c_running = g0 * (F128::ONE + rho) + g1 * rho + g_inf * rho * (rho + F128::ONE);
     }

@@ -89,6 +89,29 @@ pub struct BooleanPiopProof {
     pub lincheck: lincheck::LincheckProof,
 }
 
+/// [`BooleanPiopProof`] with the **AG-skip** zerocheck: the genus-95 AG
+/// multiplication code replaces the RS additive-NTT round 1; the lincheck and
+/// every claim downstream are unchanged (the skip point rides as
+/// [`lincheck::SkipPoint::Ag`]). PADDING CONTRACT: the AG round-1 sum reads
+/// the full `2^m_bool` boolean region, so the witness must be built in
+/// honest-zero padding mode — the run-list-gated dirty-padding mode the RS
+/// kernels tolerate is UNSOUND here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BooleanPiopProofAg {
+    pub ag: zerocheck::ag_skip::AgProof,
+    pub lincheck: lincheck::LincheckProof,
+}
+
+/// [`R1csProofMergedLigerito`] with the **AG-skip** boolean zerocheck — the
+/// boolean-only union proof over the MERGED transport, AG flavor. Same
+/// transport, same lincheck, same merged opening; only the zerocheck's round
+/// 1 differs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct R1csProofMergedLigeritoAg {
+    pub boolean: BooleanPiopProofAg,
+    pub pcs_open: pcs::MergedOpenProof,
+}
+
 /// The claims a verified mixed-class union proof leaves behind, per class.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnionClassClaims {

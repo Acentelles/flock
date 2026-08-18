@@ -65,11 +65,11 @@ use crate::matrix_fold::{MatrixClaim, Weight};
 use crate::schedule::Registry;
 use crate::union::UnionInstance;
 use crate::zerocheck::K_SKIP;
-use crate::zerocheck::multilinear::lagrange_weights_naive;
 
 use super::{
     LincheckCircuit, LincheckClaim, LincheckGrinding, LincheckProof, QuirkyPoint, SkipPoint,
-    VerifyError, build_eq_table, build_quirky_eq_table, column_sumcheck_prove, inner_product,
+    VerifyError, build_eq_table, build_quirky_eq_table_from_weights,
+    column_sumcheck_prove, inner_product,
     partial_fold_packed_z_rows_best,
 };
 
@@ -293,8 +293,10 @@ pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
         .zip(slots)
     {
         let inner = ty.k_log - k_skip;
-        let eq_inner =
-            build_quirky_eq_table(x_ab.z_skip.phi8(), &x_ab.x_inner_rest[..inner], k_skip);
+        let eq_inner = build_quirky_eq_table_from_weights(
+            &x_ab.z_skip.weights(k_skip),
+            &x_ab.x_inner_rest[..inner],
+        );
         // Split, so the per-matrix bilinear values can be reported below.
         // Same nonzeros as the α-batched fold; only the accumulation differs.
         let (comb_a, comb_b) = slot_in.circuit.fold_split(&eq_inner);
@@ -466,8 +468,10 @@ fn col_weight(z_partial: &[F128], rr: &[F128], k_skip: usize) -> Vec<F128> {
 pub struct MatrixAssertion {
     /// The challenge batching the A- and B-matrices.
     pub alpha: F128,
-    /// Row-side weight: `λ(z_skip) ⊗ eq(x_inner_rest)`.
-    pub z_skip: F128,
+    /// Row-side weight: `λ(z_skip) ⊗ eq(x_inner_rest)` — `λ` is the skip
+    /// basis's evaluation functional ([`SkipPoint::weights`]), φ₈ Lagrange
+    /// on the RS route, the AG base-code functional on the AG route.
+    pub z_skip: SkipPoint,
     pub x_inner_rest: Vec<F128>,
     /// Column-side weight: `z_partial ⊗ eq(rr)`.
     pub rr: Vec<F128>,
@@ -509,7 +513,7 @@ impl MatrixAssertion {
             .map(|(ty, &(v_a, v_b))| {
                 let inner = ty.k_log - k_skip;
                 let row = Weight::low_eq(
-                    lagrange_weights_naive(k_skip, self.z_skip),
+                    self.z_skip.weights(k_skip),
                     self.x_inner_rest[..inner].to_vec(),
                 );
                 let col = Weight::low_eq(self.z_partial.clone(), self.rr[..inner].to_vec());
@@ -593,7 +597,10 @@ impl MatrixAssertion {
             .map(|((ty, slot), circuit)| {
                 let inner = ty.k_log - k_skip;
                 let eq_inner =
-                    build_quirky_eq_table(self.z_skip, &self.x_inner_rest[..inner], k_skip);
+                    build_quirky_eq_table_from_weights(
+                        &self.z_skip.weights(k_skip),
+                        &self.x_inner_rest[..inner],
+                    );
                 let mut comb = circuit.fold_alpha_batched(self.alpha, &eq_inner);
                 if slot.prefix_bits > 0 {
                     let w_t = eq_prefix_weight(&self.x_inner_rest[inner..], slot.prefix);
@@ -879,7 +886,7 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
     rr.reverse();
     let assertion = MatrixAssertion {
         alpha,
-        z_skip: x_ab.z_skip.phi8(),
+        z_skip: x_ab.z_skip,
         x_inner_rest: x_ab.x_inner_rest.clone(),
         rr: rr.clone(),
         z_partial: proof.z_partial.clone(),
@@ -890,26 +897,43 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
         evals: proof.matrix_evals.clone(),
     };
 
-    // 6.–7. Fresh skip challenge after z_partial; claim value via φ8
-    //       Lagrange (identical to the single-table verifier).
+    // 6.–7. Fresh skip challenge after z_partial, in the SAME basis as the
+    //       input point (identical to the single-table verifier); claim
+    //       value via the basis's evaluation functional. Mirrors
+    //       `column_sumcheck_prove`'s grinding composition exactly: the φ₈
+    //       basis keeps the FUSED PoW+squeeze (byte-pinned), the AG basis
+    //       composes the standalone PoW with `sample_fresh`.
     let r_inner_skip = if let Some(bits) = grinding.skip_bits(k_skip) {
-        let r = challenger
-            .verify_pow_and_sample_f128(proof.grinding_nonces[nonce_idx], bits)
-            .ok_or(VerifyError::InvalidGrindingNonce {
-                which: "inner-skip",
-            })?;
+        let nonce = proof.grinding_nonces[nonce_idx];
         nonce_idx += 1;
-        r
+        match x_ab.z_skip {
+            SkipPoint::Phi8(_) => {
+                let r = challenger.verify_pow_and_sample_f128(nonce, bits).ok_or(
+                    VerifyError::InvalidGrindingNonce {
+                        which: "inner-skip",
+                    },
+                )?;
+                SkipPoint::Phi8(r)
+            }
+            SkipPoint::Ag(_) => {
+                if !challenger.verify_pow(nonce, bits) {
+                    return Err(VerifyError::InvalidGrindingNonce {
+                        which: "inner-skip",
+                    });
+                }
+                x_ab.z_skip.sample_fresh(challenger)
+            }
+        }
     } else {
-        challenger.sample_f128()
+        x_ab.z_skip.sample_fresh(challenger)
     };
     debug_assert_eq!(nonce_idx, proof.grinding_nonces.len());
-    let lambda = lagrange_weights_naive(k_skip, r_inner_skip);
+    let lambda = r_inner_skip.weights(k_skip);
     let w = inner_product(&lambda, &proof.z_partial);
 
     Ok((
         LincheckClaim {
-            r_inner_skip: SkipPoint::Phi8(r_inner_skip),
+            r_inner_skip,
             r_inner_rest: rr,
             w,
         },

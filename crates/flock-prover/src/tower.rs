@@ -6956,7 +6956,7 @@ impl<'p> RealTape<'p> {
                     "rr {j} is the located lc round, reversed"
                 );
             }
-            assert_eq!(chals[zskip_ch], mat_assert.z_skip, "z_skip located");
+            assert_eq!(chals[zskip_ch], mat_assert.z_skip.phi8(), "z_skip located");
             assert_eq!(
                 &vals_rec[zp_v..zp_v + 64],
                 &mat_assert.z_partial[..],
@@ -12389,7 +12389,7 @@ impl<'p> ChildTape<'p> {
                     "rr {j} is the located lc round, reversed"
                 );
             }
-            assert_eq!(chals[zskip_ch], bool_assert.z_skip, "z_skip located");
+            assert_eq!(chals[zskip_ch], bool_assert.z_skip.phi8(), "z_skip located");
             assert_eq!(
                 &vals_rec[zp_v..zp_v + 64],
                 &bool_assert.z_partial[..],
