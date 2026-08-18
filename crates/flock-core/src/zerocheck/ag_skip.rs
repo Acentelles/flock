@@ -1268,6 +1268,8 @@ pub fn prove_capture_s_hat_v_c_with_grinding<C: Challenger>(
     // the fold share it. Read-exact (Dead skipped, Partial cleansed), so
     // the honest-zero witness-mode forcing this entry used to need is gone:
     // declared-dead bits are never read, whatever they hold.
+    let zc_timing = std::env::var_os("FLOCK_ZC_TIMING").is_some();
+    let t0 = std::time::Instant::now();
     let coverage = padding.block_coverage(K_SKIP + N_INNER, 1usize << (m - K_SKIP - N_INNER));
 
     challenger.observe_label(b"flock-ag-skip-v1");
@@ -1281,8 +1283,24 @@ pub fn prove_capture_s_hat_v_c_with_grinding<C: Challenger>(
         None => challenger.sample_f128_vec(m - K_SKIP - N_INNER),
     };
     let eq = crate::zerocheck::univariate_skip::build_eq(&r_outer);
-
+    let t_r1 = std::time::Instant::now();
     let (msg, s_hat_v_c) = prove_round1_banks_padded(a_packed, b_packed, c_packed, &eq, &coverage);
+    if zc_timing {
+        let (mut full, mut part, mut dead) = (0usize, 0usize, 0usize);
+        for c in &coverage {
+            match c {
+                super::BlockCoverage::Full => full += 1,
+                super::BlockCoverage::Partial(_) => part += 1,
+                super::BlockCoverage::Dead => dead += 1,
+            }
+        }
+        eprintln!(
+            "[ag-zc-timing] m={m} setup+eq {:.2} ms | round1 {:.2} ms (blocks: {full} full / {part} partial / {dead} dead)",
+            (t_r1 - t0).as_secs_f64() * 1e3,
+            t_r1.elapsed().as_secs_f64() * 1e3,
+        );
+    }
+    let t_tail = std::time::Instant::now();
     let (proof, claim) = prove_from_round1(
         a_packed,
         b_packed,
@@ -1293,6 +1311,12 @@ pub fn prove_capture_s_hat_v_c_with_grinding<C: Challenger>(
         Some(&coverage),
         challenger,
     );
+    if zc_timing {
+        eprintln!(
+            "[ag-zc-timing] m={m} fold+tail {:.2} ms",
+            t_tail.elapsed().as_secs_f64() * 1e3
+        );
+    }
     (proof, claim, s_hat_v_c)
 }
 
@@ -1316,14 +1340,13 @@ fn prove_round1_banks(
     banks_to_message(raw)
 }
 
-/// [`prove_round1_banks`] under a witness run-list. The round-1 kernels are
-/// position-independent additive sums over 8192-bit blocks (one eq weight
-/// each), so the run-list needs NO kernel changes: maximal runs of FULL
-/// blocks go to the untouched kernel as (slice, eq-subrange) segments,
-/// PARTIAL blocks are cleansed into zeroed scratch and run as one-block
-/// segments, DEAD blocks are skipped, and the segment outputs sum. Reads no
-/// declared-dead bit (`PooledDirty`-legal); a fully-Full coverage is the
-/// one-segment identity call.
+/// [`prove_round1_banks`] under a witness run-list. The hot (fused) path
+/// is [`round1_slp_packed_banks_fused_padded`] — ONE parallel pass over
+/// the live-block list, Partial blocks cleansed inline, per-element parity
+/// with the dense kernel. The bench-only unfused arm keeps the
+/// segment-call driver below (correct, but it pays a rayon bridge per
+/// full-run segment — the envelope's per-column run structure has ~450 of
+/// them, which is exactly why the fused arm got its own kernel).
 #[cfg(target_arch = "aarch64")]
 fn prove_round1_banks_padded(
     a_packed: &[u8],
@@ -1333,11 +1356,14 @@ fn prove_round1_banks_padded(
     coverage: &[super::BlockCoverage],
 ) -> (Round1Message, Vec<F128>) {
     use super::BlockCoverage;
-    let kernel = if ROUND1_UNFUSED.load(Ordering::Relaxed) {
-        crate::genus95_curve_code::round1::round1_slp_packed_banks
-    } else {
-        crate::genus95_curve_code::round1::round1_slp_packed_banks_fused
-    };
+    if !ROUND1_UNFUSED.load(Ordering::Relaxed) {
+        return banks_to_message(
+            crate::genus95_curve_code::round1::round1_slp_packed_banks_fused_padded(
+                a_packed, b_packed, c_packed, eq, coverage,
+            ),
+        );
+    }
+    let kernel = crate::genus95_curve_code::round1::round1_slp_packed_banks;
     let n = a_packed.len() / 1024;
     assert_eq!(eq.len(), n, "one eq weight per block");
     assert_eq!(coverage.len(), n, "one coverage entry per block");
