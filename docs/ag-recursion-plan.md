@@ -147,8 +147,16 @@ bench-only unfused arm. `FLOCK_ZC_TIMING` now prints the AG phases.
 m32 A/B (tower_online_bench, warm medians, same box): all-RS 721 ms/leaf
 amortised (364k c/s) → all-AG **660 ms (397k c/s, +9.1%)**: leaf
 494.6→442.1, FL 224.1→222.1, internal 224.7→214.2, spine 228.0→213.7.
-The node wins are capped by the PIOP∥wiring join (the wiring GKR no
-longer hides fully under the faster AG PIOP); the leaf carries the bulk.
+NODE-DELTA CAVEAT (Ron's catch, corrected next day): nodes were ~200 ms
+under RS on a prior good-box day, so the cross-run node totals above are
+mostly BOX DRIFT — node cost is ~195–230 ms under BOTH flavors by box
+state. The within-run evidence (flavor-identical commit/open lining up
+across runs): the node's PIOP∥wiring joint reads 35–41 ms under AG vs
+45–85 under RS — a real but small ~10 ms flavor win, often swallowed by
+the wiring join and noise, exactly as the join-cap mechanism predicts.
+The LEAF win (~50–60 ms, three same-process probes) is the arc's real
+measured speed gain; phases C/D buy the nodes uniformity for RS removal
+and the soundness posture, not speed.
 Proof sizes: node 252.8→254.3 KiB (+1.5, the AG round-1 message).
 
 **Phase D COMPLETE (same day, evening 5) — with a redesign on measured
@@ -178,7 +186,8 @@ Whole pipeline green under everything (all knobs, Chain100+128), 687
 workspace tests, x86 clean. m32 bench with the binding in place:
 amortised 637 ms/leaf = 412k c/s (leaf 429.6, FL 209.2, internal 196.6,
 spine 205.0) — the ~110 rows/child and the 9-bit grind cost nothing
-measurable.
+measurable (the run's absolute node numbers reflect a friendly box; see
+the node-delta caveat above — cost-NEUTRALITY is the claim, not a win).
 
 NEXT (order per the endgame):
 1. **Phase F long-lead kernels, start now**: the x86 AVX-512 AG round-1
