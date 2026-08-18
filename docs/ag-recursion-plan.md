@@ -69,17 +69,27 @@ same session — `TOWER_LEAF_ZC=rs` vs default): leaf online 520.9 → 469.8 ms
 (prove 475.8 → 427.7, −10.1%); amortised 762 → 688 ms/leaf = 344k → 381k
 compressions/sec (+10.7%). The internal/spine arms flipped between the two
 runs (wide bands on one arm — box noise); the leaf bands are tight, so the
-leaf delta is the solid number. OPEN ATTRIBUTION: the recorded union-AG
-margin (466.0 → 367.3 at m32, −98.7 ms) predicted ~−100 ms; the leaf shows
-−48 on the prove. The RS arm matches its union twin (475.8 ≈ 466 + wiring),
-the AG arm runs ~50 ms above its (427.7 vs ~377). The honest-zero forcing
-is NOT the cause: the chain leaf is identity-compacted, so BOTH flavors run
-PooledZeroed (verified with PCS_TRACE — the RS arm's PooledDirty election
-requires !identity), and the padding cost is identical across arms. The gap
-is unattributed; candidates: the AG round-1's dense full-region scan vs the
-RS run-list gating on this shape, or the recorded three-arm bench's arm not
-matching the leaf's exact profile/transport. Worth one attribution pass
-before Phase C multiplies it across the outers.
+leaf delta is the solid number. ATTRIBUTION RESOLVED (same day, evening 3): **the ~50 ms "gap" was not a
+real AG cost — the reference was stale.** The recorded union numbers
+(466.0/367.3, margin 98.7) came from a pressured-box session; re-run fresh
+on a quiet box the same bench reads 375.3/319.1 (margin 56.2, 1.176×).
+Three independent same-session probes then agree at m32:
+- isolated zerocheck (ag_e2e_zerocheck): 161.7 → 101.4, margin 60.3
+  (round-1 URM 2.29×, fold 1.24×, mlv tail 1.00× — the win is ALL round 1);
+- union prove (blake3_rs_vs_ag): 375.3 → 319.1, margin 56.2;
+- leaf PIOP∥wiring phase (PCS_TRACE): 172.9 → 119.8, margin 53.1 —
+  commit and open are flavor-identical code and their apparent deltas
+  (±10) are the cross-run noise floor.
+So the flavor margin carries through the circuit path undiminished — the
+wiring (μ = 22, 11 claims) hides inside BOTH flavors' PIOP spans — and
+there is nothing leaf-specific to fix. WHY the stale margin was 99: the RS
+round-1 URM is memory-bandwidth-bound and inflates disproportionately
+under box pressure (466 → 375 = +24% vs AG's +15%) — the same mechanism as
+the recorded a503066 swapping-box incident. LESSON: flavor A/B RATIOS are
+box-state-dependent; trust same-process interleaved A/Bs (the three-arm
+bench's warm-up discipline), never cross-session number reuse. The honest
+quiet-box m32 zerocheck margin is ~53–60 ms ≈ 1.6× isolated, 1.18× on the
+union prove.
 
 **AG/RS OPTIMIZATION PARITY (Ron's call, same day): CLOSED** — the AG
 zerocheck now has every RS-branch optimization (commits on this branch):
