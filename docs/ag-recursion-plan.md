@@ -151,16 +151,46 @@ The node wins are capped by the PIOP∥wiring join (the wiring GKR no
 longer hides fully under the faster AG PIOP); the leaf carries the bulk.
 Proof sizes: node 252.8→254.3 KiB (+1.5, the AG round-1 message).
 
+**Phase D COMPLETE (same day, evening 5) — with a redesign on measured
+evidence.** The plan's (b) `emit_ag_lows` is MEASURED-REJECTED: the base
+functional's coordinate masks are ~48% dense (920 monomials, 28,464 XOR
+terms, ~24.5k MAC rows/child even with four-Russians sharing —
+`base_functional_circuit_census` in flock-core is the receipt), 20× the
+plan's estimate and past the mac slot's cap for two children. What
+landed instead ((a)+(c), Ron's call):
+- `emit_ag_point_binding` at BOTH consumers: two BLAKE3 rows recompute
+  `ns = H(seed‖nonce)` and its XOF block from the child's transcript
+  wires (x binds by wire connect); a PowMask row enforces the fused
+  target on `ns[16..32]`; and the point coordinates are constrained to a
+  fiber point over x — the factored base fiber with `s` eliminated
+  (`t²+t = x³+x`, `y²+uy = xut`, inverse-free) + the three
+  denominator-cleared AS levels (D₀/D₁ guarded by advice inverses).
+  ~110 mac rows + 2 b3 + 1 pow per AG child. (a) on-curve is subsumed —
+  the fiber constraints ARE curve membership.
+- CANONICITY RELAXED BY DESIGN: any of the ≤32 fiber points satisfies
+  the rows; the sampler's 5 flattening bits return to the prover and are
+  repaid by the all-explicit `R1_POW_BITS = 9` (was 4+5 credit; total
+  unchanged; scan budget 2^24; the lincheck site keeps 3+5 — its decode
+  stays canonical end-to-end).
+- `check_ag_skip_publics` slims to ONE item: `lows == bf(point)`. The
+  genus-95 sampler/DRBG/AS-solver leave the exit contract; `bf()` stays.
+Whole pipeline green under everything (all knobs, Chain100+128), 687
+workspace tests, x86 clean. m32 bench with the binding in place:
+amortised 637 ms/leaf = 412k c/s (leaf 429.6, FL 209.2, internal 196.6,
+spine 205.0) — the ~110 rows/child and the 9-bit grind cost nothing
+measurable.
+
 NEXT (order per the endgame):
 1. **Phase F long-lead kernels, start now**: the x86 AVX-512 AG round-1
    (RS removal otherwise kills x86 proving) and the CUDA AG round-1
    (GPU runs full RS zerocheck on-device; mlv tail carries over).
-2. **Phase D — Tier-1 in-circuit AG lows** (`emit_ag_lows` + on-curve +
-   standalone-hash binding), replacing the Tier-0 72-publics blocks at
-   BOTH consumers (FL over leaves, nodes over outers) — scheduled before
-   RS removal.
-3. Phase E audit/docs; then Phase F removal (locator arm deletion,
-   fixture/proof-IO retirement, SkipPoint collapse).
+2. Phase E audit/docs — the audit ledger's AG rows move with the 9-bit
+   split (guard tests already updated); the recursive-agreement section
+   records the in-circuit decode + the one remaining checker item.
+3. Phase F removal (locator arm deletion, fixture/proof-IO retirement,
+   SkipPoint collapse). If the lows publics ever need to go fully
+   in-circuit, the recorded path is a dedicated static-table route for
+   the dense mask map, not per-term MACs.
 
 Memory track: `recursion-track.md` (machine-local) mirrors this and adds
 session gotchas. The two survey reports' full maps are summarized in the
