@@ -22,6 +22,8 @@
 
 // Minimal F128 (host, no field math needed here).
 struct ChF128 { uint64_t lo, hi; };
+// Quadratic-extension element as its two canonical F128 coordinates.
+struct ChF256 { ChF128 c0, c1; };
 
 // ---- SHA-256 (FIPS 180-4), incremental + copyable state -------------------
 struct Sha256 {
@@ -162,9 +164,25 @@ struct FsChallenger {
 
     void sample_f128_vec(ChF128* out, size_t n) {
         absorb_header(OP_SQUEEZE, KIND_SLICE, n);
+        if (n == 0) return;   // header-only (matches Rust: empty vec squeeze)
         std::vector<uint8_t> buf(n * 16);
         squeeze_into(buf.data(), n * 16);
         for (size_t i = 0; i < n; i++) out[i] = ChF128{rd_le64(&buf[16*i]), rd_le64(&buf[16*i+8])};
+    }
+
+    // One uniform quadratic-extension challenge = one two-word vec squeeze
+    // (challenger.rs::sample_f256: sample_f128_vec(2) → F256::new(w0, w1)).
+    ChF256 sample_f256() {
+        ChF128 w[2];
+        sample_f128_vec(w, 2);
+        return ChF256{w[0], w[1]};
+    }
+
+    // Absorb an F256 as its two coordinates in (c0, c1) order — one length-2
+    // slice observe (challenger.rs::observe_f256 → observe_f128_slice).
+    void observe_f256(ChF256 v) {
+        ChF128 w[2] = {v.c0, v.c1};
+        observe_f128_slice(w, 2);
     }
 
     static bool has_leading_zero_bits(const uint8_t sd[32], uint64_t nonce, uint32_t bits) {
@@ -186,8 +204,23 @@ struct FsChallenger {
         return nonce;
     }
 
+    // Fused PoW + squeeze, SHA-256 discipline: the trait-default sequence
+    // grind_pow(bits) then sample (challenger.rs — the one-compression fusion
+    // is the chained-BLAKE3 challenger only, which this port does not carry).
+    uint64_t grind_pow_and_sample_f128(uint32_t bits, ChF128* out) {
+        uint64_t nonce = grind_pow(bits);
+        *out = sample_f128();
+        return nonce;
+    }
+    uint64_t grind_pow_and_sample_f128_vec(uint32_t bits, ChF128* out, size_t n) {
+        uint64_t nonce = grind_pow(bits);
+        sample_f128_vec(out, n);
+        return nonce;
+    }
+
     // Port of ligerito.rs::sample_distinct_queries: keep sampling f128 challenges,
     // map lo % block_len, dedup, until `count` distinct; return sorted ascending.
+    // LEGACY (pre-stratified protocol) — kept for the frozen dump-bin oracles.
     std::vector<size_t> sample_distinct_queries(size_t block_len, size_t count) {
         std::set<size_t> seen;
         std::vector<size_t> out;
@@ -201,3 +234,60 @@ struct FsChallenger {
         return out;
     }
 };
+
+// ---- Stratified query schedule (src/pcs/stratified.rs) ---------------------
+// A level's schedule is the binary decomposition of its query count into
+// power-of-two summands (depths descending, clamped at the leaf layer):
+// summand of depth c draws one query in each of the 2^c depth-c subtrees.
+// The cap depth (= the absorbed commitment layer, and where every opening
+// path truncates) is the top summand's depth.
+
+// LevelSchedule::decompose(queries, log_block_len).summand_depths.
+inline std::vector<uint32_t> stratified_depths(size_t queries, uint32_t log_block_len) {
+    std::vector<uint32_t> out;
+    size_t rem = queries;
+    while (rem > 0) {
+        uint32_t c = 63u - (uint32_t)__builtin_clzll((unsigned long long)rem);
+        if (c > log_block_len) c = log_block_len;
+        out.push_back(c);
+        rem -= (size_t)1 << c;
+    }
+    return out;
+}
+
+inline uint32_t stratified_cap_depth(const std::vector<uint32_t>& depths) {
+    return depths.empty() ? 0 : depths[0];
+}
+
+// ligerito.rs::queries_from_words — one squeezed word per query, in the
+// canonical sample order (summands in schedule order, strata 0..2^c within
+// each): index = (stratum << (d − c)) | (word.lo & ((1 << (d − c)) − 1)).
+inline std::vector<size_t> stratified_queries_from_words(uint32_t log_block_len,
+                                                         const std::vector<uint32_t>& depths,
+                                                         const ChF128* words, size_t n_words) {
+    std::vector<size_t> out;
+    out.reserve(n_words);
+    size_t w = 0;
+    for (uint32_t c : depths) {
+        uint32_t lo_bits = log_block_len - c;
+        size_t mask = (lo_bits >= 64) ? ~(size_t)0 : (((size_t)1 << lo_bits) - 1);
+        for (size_t s = 0; s < ((size_t)1 << c); s++) {
+            out.push_back((s << lo_bits) | ((size_t)words[w].lo & mask));
+            w++;
+        }
+    }
+    if (w != n_words) { out.clear(); }   // caller sized the squeeze wrong
+    return out;
+}
+
+// ligerito.rs::grind_and_sample_queries — fused query-phase PoW (nonce always
+// absorbed, 0-bit included) + ONE vector squeeze of `count` words + mapping.
+inline uint64_t grind_and_sample_stratified_queries(FsChallenger& ch, uint32_t bits,
+                                                    uint32_t log_block_len, size_t count,
+                                                    const std::vector<uint32_t>& depths,
+                                                    std::vector<size_t>& queries_out) {
+    std::vector<ChF128> words(count);
+    uint64_t nonce = ch.grind_pow_and_sample_f128_vec(bits, words.data(), count);
+    queries_out = stratified_queries_from_words(log_block_len, depths, words.data(), count);
+    return nonce;
+}

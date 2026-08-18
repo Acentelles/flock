@@ -18,6 +18,45 @@ __global__ void gather_tree_nodes(const uint8_t* __restrict__ tree,
     for (int j = 0; j < 32; j++) dst[j] = src[j];
 }
 
+// Gather an arbitrary host-computed node-index list from a device tree.
+inline std::vector<MHash> gather_tree_nodes_device(const uint8_t* d_tree,
+                                                   const std::vector<size_t>& idxs) {
+    int n = (int)idxs.size();
+    std::vector<MHash> out(n);
+    if (n == 0) return out;
+    unsigned long long* d_idx = nullptr;
+    uint8_t* d_out = nullptr;
+    std::vector<unsigned long long> h_idx(idxs.begin(), idxs.end());
+    (void)cudaMalloc(&d_idx, (size_t)n * sizeof(unsigned long long));
+    (void)cudaMalloc(&d_out, (size_t)n * 32);
+    (void)cudaMemcpy(d_idx, h_idx.data(), (size_t)n * sizeof(unsigned long long), cudaMemcpyHostToDevice);
+    int tpb = 128;
+    gather_tree_nodes<<<(n + tpb - 1) / tpb, tpb>>>(d_tree, d_idx, n, d_out);
+    (void)cudaMemcpy(out.data(), d_out, (size_t)n * 32, cudaMemcpyDeviceToHost);
+    cudaFree(d_idx);
+    cudaFree(d_out);
+    return out;
+}
+
+// Capped per-query paths against a device-resident tree (the live protocol).
+inline std::vector<MHash> merkle_capped_paths_device(const uint8_t* d_tree, size_t num_leaves,
+                                                     const std::vector<size_t>& queries,
+                                                     uint32_t cap_depth) {
+    return gather_tree_nodes_device(d_tree, merkle_capped_path_indices(num_leaves, queries, cap_depth));
+}
+
+// The absorbed commitment: the 2^c cap-layer nodes (contiguous slice of the
+// flat tree — src/merkle.rs::cap_layer: the level with L nodes starts at
+// 2N − 2L).
+inline std::vector<MHash> merkle_cap_layer_device(const uint8_t* d_tree, size_t num_leaves,
+                                                  uint32_t cap_depth) {
+    size_t l = (size_t)1 << cap_depth;
+    std::vector<MHash> cap(l);
+    (void)cudaMemcpy(cap.data(), d_tree + (2 * num_leaves - 2 * l) * 32, l * 32,
+                     cudaMemcpyDeviceToHost);
+    return cap;
+}
+
 // Multi-proof over a device-resident tree `d_tree`. No full-tree D2H.
 inline std::vector<MHash> merkle_multi_proof_device(const uint8_t* d_tree, size_t num_leaves,
                                                     const std::vector<size_t>& positions) {

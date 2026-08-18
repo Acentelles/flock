@@ -55,3 +55,27 @@ inline std::vector<MHash> merkle_multi_proof_host(const MHash* tree, size_t num_
     for (size_t i = 0; i < idxs.size(); i++) proof[i] = tree[idxs[i]];
     return proof;
 }
+
+// ---- Capped per-query paths (the LIVE protocol; the multi-proof above is the
+// frozen pre-cap oracle) — src/merkle.rs::merkle_proof_capped via
+// ligerito.rs::merkle_paths_for. Every query emits its own path of exactly
+// `depth − cap_depth` siblings, leaf level upward, in SAMPLE order; duplicates
+// repeat their path — no sorting, no dedup.
+inline std::vector<size_t> merkle_capped_path_indices(size_t num_leaves,
+                                                      const std::vector<size_t>& queries,
+                                                      uint32_t cap_depth) {
+    uint32_t d = 0;
+    while (((size_t)1 << d) < num_leaves) d++;
+    std::vector<size_t> idxs;
+    idxs.reserve(queries.size() * (d - cap_depth));
+    for (size_t q : queries) {
+        size_t level_start = 0, level_len = num_leaves, idx = q;
+        for (uint32_t l = 0; l < d - cap_depth; l++) {
+            idxs.push_back(level_start + (idx ^ 1));
+            idx >>= 1;
+            level_start += level_len;
+            level_len >>= 1;
+        }
+    }
+    return idxs;
+}
