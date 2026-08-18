@@ -281,6 +281,41 @@ ligerito_l0_vectors:
 ligerito_l0: test_ligerito_l0 ligerito_l0_vectors
 	./test_ligerito_l0 ligerito_l0_vectors.bin
 
+# GF(2^256) quadratic-extension field ops (the F256 fold ladder's field) —
+# bit-for-bit vs flock_core::field::F256. Pure host C++ (no CUDA); the device
+# multiplies share the same Karatsuba composition over the clmad F128 multiply.
+test_f256_host: test_f256_host.cpp f256.cuh ntt_host.hpp
+	$(CXX) -O2 -std=c++17 test_f256_host.cpp -o $@
+f256_vectors:
+	cd .. && cargo run --release --quiet --bin dump_f256_vectors -- cuda-ghash/f256_vectors.bin
+f256_host: test_f256_host f256_vectors
+	./test_f256_host f256_vectors.bin
+
+# The F256 fold ladder (transcript-v2 "flock-ligerito-basis-f256-split-v0"):
+# folds, code switches, recursive commits, capped Merkle, stratified queries,
+# claim/consistency PoW — every proof field bit-for-bit vs the real
+# extension.rs driver at a REGISTERED config (m22 fast by default).
+test_ligerito_f256: test_ligerito_f256.cu ligerito_f256.cuh f256.cuh challenger.hpp \
+                    sumcheck_ab.cuh introduce_glue.cuh induce_sumcheck.cuh \
+                    ntt_transpose.cuh merkle_open.hpp merkle_open_device.cuh \
+                    ntt_f128.cuh ntt_host.hpp merkle.cuh f128.cuh
+	$(NVCC) $(NVCCFLAGS) test_ligerito_f256.cu -o $@
+LF256_ARGS ?= 22
+ligerito_f256_vectors:
+	cd .. && cargo run --release --quiet --bin dump_ligerito_f256_vectors -- cuda-ghash/ligerito_f256_vectors.bin $(LF256_ARGS)
+ligerito_f256: test_ligerito_f256 ligerito_f256_vectors
+	./test_ligerito_f256 ligerito_f256_vectors.bin
+
+# Host-only replay of the same "LF25" oracle (no GPU/nvcc): validates the
+# whole ladder ORCHESTRATION — transcript order, code-switch algebra, caps,
+# stratified queries + capped paths, induce, PoW schedule — locally before a
+# Blackwell run; the CUDA twin above then pins the device kernels.
+test_ligerito_f256_host: test_ligerito_f256_host.cpp f256.cuh challenger.hpp \
+                         merkle_open.hpp ntt_host.hpp
+	$(CXX) -O2 -std=c++17 test_ligerito_f256_host.cpp -o $@
+ligerito_f256_host: test_ligerito_f256_host ligerito_f256_vectors
+	./test_ligerito_f256_host ligerito_f256_vectors.bin
+
 # Full Ligerito open prover benchmark (prove-only, no oracle).
 bench_keccak3_gpu: bench_keccak3_gpu.cu keccak3_witness.cuh zerocheck_round1_cpustyle.cuh zerocheck_round1.cuh ntt_f128.cuh merkle.cuh merkle_open.hpp induce_sumcheck.cuh introduce_glue.cuh sumcheck_ab.cuh challenger.hpp f128.cuh
 	$(NVCC) $(NVCCFLAGS) bench_keccak3_gpu.cu -o $@
@@ -302,7 +337,8 @@ TEST_BINS = test_f128 test_commit_ntt test_sumcheck_ab test_lincheck \
             test_introduce_glue test_commit_merkle test_sumcheck_prover \
             test_challenger test_merkle_open test_ligerito_l0 \
             test_transpose_induce test_eq_builders test_zerocheck_lookahead \
-            test_fold_lookahead
+            test_fold_lookahead test_f256_host test_ligerito_f256 \
+            test_ligerito_f256_host
 
 # FFI prover TU (linked into Rust by crates/flock-cuda-ffi's build.rs; the
 # object build here is the hosted compile leg's bit-rot check — no GPU needed).
@@ -310,7 +346,7 @@ prove_ffi.o: prove_ffi.cu ntt_f128.cuh merkle.cuh merkle_open.hpp induce_sumchec
              ntt_transpose.cuh introduce_glue.cuh sumcheck_ab.cuh lincheck.cuh \
              blake3_witness.cuh zerocheck_round1.cuh zerocheck_round1_cpustyle.cuh \
              zerocheck_round2.cuh zerocheck_tail.cuh phi8_table.cuh challenger.hpp \
-             pow_grind.cuh f128.cuh
+             pow_grind.cuh f128.cuh f256.cuh ligerito_f256.cuh merkle_open_device.cuh
 	$(NVCC) $(NVCCFLAGS) -Xcompiler -fPIC -c prove_ffi.cu -o $@
 
 .PHONY: build-tests run-tests
@@ -323,7 +359,8 @@ build-tests: $(TEST_BINS) prove_ffi.o
 run-tests: test commit_ntt sumcheck_ab sumcheck_ab_ligerito lincheck zc_cpustyle \
            blake3_witness zerocheck_tail zerocheck_round2 \
            zerocheck_full induce introduce_glue sumcheck_prover challenger \
-           merkle_open ligerito_l0 eq_builders zerocheck_lookahead fold_lookahead
+           merkle_open ligerito_l0 eq_builders zerocheck_lookahead fold_lookahead \
+           f256_host ligerito_f256_host ligerito_f256
 
 # Self-checking equivalence tests: no Rust oracle to dump, they pin a fast path
 # to the slower reference path that the vector tests above already validate.
