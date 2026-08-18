@@ -2555,6 +2555,43 @@ mod tests {
         );
     }
 
+    /// UNION-AG at PARTIAL UTILIZATION (200/256 declared rows): the
+    /// count-derived multi-run spec drives the AG run-list arms — round-1
+    /// full/partial/dead segments and the gated fold — through the real
+    /// transport, with the witness buffers eligible for the dirty pool
+    /// (the PooledDirty election no longer excludes the AG flavor). The
+    /// prove runs TWICE: the second draw takes the buffers the first
+    /// returned DIRTY, and byte-identical proofs pin the arms'
+    /// read-exactness in situ (the kernel-level legs live in
+    /// `ag_skip::padded_arms_match_dense_and_ignore_dirty_padding`).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore] // Heavy — run with `-- --ignored`.
+    fn prove_fast_union_ag_partial_utilization_roundtrip() {
+        use flock_core::challenger::FsChallenger;
+        let setup = Blake3Setup::new(200);
+        let mut rng = Rng::new(0xA9_0110_4A7);
+        let blocks: Vec<Compression> = (0..200)
+            .map(|_| {
+                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                let counter = ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64);
+                (cv, m, counter, 64u32, 11u32)
+            })
+            .collect();
+        let mut ch_p = FsChallenger::new(b"flock-union-ag-part");
+        let (proof, commitment, claim_p) = setup.prove_fast_union_ag(&blocks, &mut ch_p);
+        let mut ch_v = FsChallenger::new(b"flock-union-ag-part");
+        let claim_v = setup
+            .verify_union_ag(&commitment, &proof, &mut ch_v)
+            .unwrap_or_else(|e| panic!("partial-utilization union-AG rejected: {e:?}"));
+        assert_eq!(claim_p, claim_v, "verifier claim != prover claim");
+
+        let mut ch_p2 = FsChallenger::new(b"flock-union-ag-part");
+        let (proof2, _, _) = setup.prove_fast_union_ag(&blocks, &mut ch_p2);
+        assert_eq!(proof, proof2, "re-prove over pooled-dirty buffers");
+    }
+
     #[test]
     fn layout_constants() {
         // I/O-aligned layout: cv in slot 0, out_lo in slot 1 (both 256-bit),

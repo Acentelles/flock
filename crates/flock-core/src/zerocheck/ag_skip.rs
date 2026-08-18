@@ -113,6 +113,7 @@ pub fn d_inv() -> F128 {
 // ---------------------------------------------------------------------------
 
 /// The round-1 wire message in canonical (`D⁻¹`-scaled) form, evaluator basis.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Round1Message {
     /// `P^{ab}` fresh coords (158): kernel fresh slot `s` ↦ evaluator product
     /// coord `64 + s`. (Garbage kernel slots 158/159 dropped.)
@@ -320,31 +321,111 @@ pub fn fold_and_first_round(
         .zip(eq_outer.par_iter())
         .enumerate()
         .map(|(outer, ((am, bm), &eo))| {
-            // One fused pass over the 64 pairs (reverse, for the γ²-Horner): fold
-            // the four rows at r₁, write them to a_mlv/b_mlv, AND accumulate the
-            // first message from those just-folded values — no read-back of the
-            // folded array (the two-pass version re-read 2 KB/block). γ² = x², so
-            // each Σ weight is a pure 2-bit shift: a *wide* Horner on a 256-bit
-            // accumulator (no per-step reduction — max degree 2·63+127 = 253 <
-            // 256), reduced once per block.
-            let base = outer * 128;
-            let mut s1 = F256Unreduced::ZERO;
-            let mut s_inf = F256Unreduced::ZERO;
-            for inner in (0..64).rev() {
-                let (i0, i1) = (2 * inner, 2 * inner + 1);
-                let a0 = byte_dot(a_packed, base + i0, &table);
-                let a1 = byte_dot(a_packed, base + i1, &table);
-                let b0 = byte_dot(b_packed, base + i0, &table);
-                let b1 = byte_dot(b_packed, base + i1, &table);
-                am[i0] = a0;
-                am[i1] = a1;
-                bm[i0] = b0;
-                bm[i1] = b1;
-                s1 = shl2_xor(s1, a1 * b1);
-                s_inf = shl2_xor(s_inf, (a0 + a1) * (b0 + b1));
-            }
+            let (s1, s_inf) = fold_block_at(a_packed, b_packed, outer * 128, &table, am, bm);
             let e = eo * d1_inv;
             (e * s1.reduce(), e * s_inf.reduce())
+        })
+        .reduce(|| (F128::ZERO, F128::ZERO), |(p, q), (r, s)| (p + r, q + s));
+    (a_mlv, b_mlv, g1, g_inf)
+}
+
+/// One outer block of the fused fold + first-round accumulation — one fused
+/// pass over the 64 pairs (reverse, for the γ²-Horner): fold the four rows
+/// at `r₁` via the byte-dot `table`, write them to `am`/`bm`, AND
+/// accumulate the first message from those just-folded values — no
+/// read-back of the folded array (the two-pass version re-read 2 KB/block).
+/// γ² = x², so each Σ weight is a pure 2-bit shift: a *wide* Horner on a
+/// 256-bit accumulator (no per-step reduction — max degree 2·63+127 = 253 <
+/// 256), reduced once per block by the caller. `msg_base` is the block's
+/// first 64-bit-message index in `a_src`/`b_src` — a cleansed single-block
+/// scratch buffer passes 0.
+#[inline]
+fn fold_block_at(
+    a_src: &[u8],
+    b_src: &[u8],
+    msg_base: usize,
+    table: &[[F128; 256]],
+    am: &mut [F128],
+    bm: &mut [F128],
+) -> (F256Unreduced, F256Unreduced) {
+    let mut s1 = F256Unreduced::ZERO;
+    let mut s_inf = F256Unreduced::ZERO;
+    for inner in (0..64).rev() {
+        let (i0, i1) = (2 * inner, 2 * inner + 1);
+        let a0 = byte_dot(a_src, msg_base + i0, table);
+        let a1 = byte_dot(a_src, msg_base + i1, table);
+        let b0 = byte_dot(b_src, msg_base + i0, table);
+        let b1 = byte_dot(b_src, msg_base + i1, table);
+        am[i0] = a0;
+        am[i1] = a1;
+        bm[i0] = b0;
+        bm[i1] = b1;
+        s1 = shl2_xor(s1, a1 * b1);
+        s_inf = shl2_xor(s_inf, (a0 + a1) * (b0 + b1));
+    }
+    (s1, s_inf)
+}
+
+/// [`fold_and_first_round`] under a witness run-list ([`BlockCoverage`] at
+/// the 8192-bit code-block grid, one entry per outer block): DEAD blocks
+/// write zero folds and contribute nothing (their honest bits are all
+/// zero), FULL blocks run the in-place fused pass, and PARTIAL blocks are
+/// cleansed into zeroed scratch first — no declared-dead bit is ever read,
+/// so `PooledDirty` witnesses are legal. Value-identical to the dense fold
+/// on an honestly zero-padded witness.
+pub fn fold_and_first_round_padded(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    w: &[F128],
+    r_rest: &[F128],
+    coverage: &[super::BlockCoverage],
+) -> (Vec<F128>, Vec<F128>, F128, F128) {
+    use rayon::prelude::*;
+    assert_eq!(a_packed.len(), b_packed.len());
+    debug_assert_eq!(
+        &r_rest[1..N_INNER],
+        &friendly_challenges()[1..N_INNER],
+        "fold_and_first_round assumes γ-geometric friendly dims"
+    );
+    let n = a_packed.len() / 8;
+    let table = build_w_tables(w);
+    let eq_outer = super::univariate_skip::build_eq(&r_rest[N_INNER..]);
+    let n_outer = eq_outer.len();
+    assert_eq!(n, n_outer * 128, "each outer block is 128 (2^7) messages");
+    assert_eq!(coverage.len(), n_outer, "one coverage entry per outer block");
+    let mut d1 = F128::ONE;
+    for j in 1..N_INNER {
+        d1 *= F128::ONE + gamma_pow(1usize << j);
+    }
+    let d1_inv = d1.inv();
+
+    let mut a_mlv = crate::scratch::take_f128(n);
+    let mut b_mlv = crate::scratch::take_f128(n);
+    let (g1, g_inf) = a_mlv
+        .par_chunks_mut(128)
+        .zip(b_mlv.par_chunks_mut(128))
+        .zip(eq_outer.par_iter())
+        .enumerate()
+        .map(|(outer, ((am, bm), &eo))| match &coverage[outer] {
+            super::BlockCoverage::Dead => {
+                am.fill(F128::ZERO);
+                bm.fill(F128::ZERO);
+                (F128::ZERO, F128::ZERO)
+            }
+            super::BlockCoverage::Full => {
+                let (s1, s_inf) = fold_block_at(a_packed, b_packed, outer * 128, &table, am, bm);
+                let e = eo * d1_inv;
+                (e * s1.reduce(), e * s_inf.reduce())
+            }
+            super::BlockCoverage::Partial(ranges) => {
+                let mut a_buf = [0u8; 1024];
+                let mut b_buf = [0u8; 1024];
+                super::cleanse_block(a_packed, outer * 1024, ranges, &mut a_buf);
+                super::cleanse_block(b_packed, outer * 1024, ranges, &mut b_buf);
+                let (s1, s_inf) = fold_block_at(&a_buf, &b_buf, 0, &table, am, bm);
+                let e = eo * d1_inv;
+                (e * s1.reduce(), e * s_inf.reduce())
+            }
         })
         .reduce(|| (F128::ZERO, F128::ZERO), |(p, q), (r, s)| (p + r, q + s));
     (a_mlv, b_mlv, g1, g_inf)
@@ -1028,6 +1109,7 @@ pub fn prove<C: Challenger>(
         &r_outer,
         super::ZerocheckGrinding::disabled(),
         Vec::new(),
+        None,
         challenger,
     )
 }
@@ -1070,6 +1152,7 @@ pub fn prove_capture_s_hat_v_c<C: Challenger>(
         &r_outer,
         super::ZerocheckGrinding::disabled(),
         Vec::new(),
+        None,
         challenger,
     );
     (proof, claim, s_hat_v_c)
@@ -1094,6 +1177,7 @@ pub fn prove_capture_s_hat_v_c_with_grinding<C: Challenger>(
     b_packed: &[u8],
     c_packed: &[u8],
     m: usize,
+    padding: &super::PaddingSpec,
     grinding: super::ZerocheckGrinding,
     challenger: &mut C,
 ) -> (AgProof, AgClaim, Vec<F128>) {
@@ -1102,6 +1186,11 @@ pub fn prove_capture_s_hat_v_c_with_grinding<C: Challenger>(
     assert_eq!(a_packed.len(), expected);
     assert_eq!(b_packed.len(), expected);
     assert_eq!(c_packed.len(), expected);
+    // The run-list at the kernels' 8192-bit code-block grid — round 1 and
+    // the fold share it. Read-exact (Dead skipped, Partial cleansed), so
+    // the honest-zero witness-mode forcing this entry used to need is gone:
+    // declared-dead bits are never read, whatever they hold.
+    let coverage = padding.block_coverage(K_SKIP + N_INNER, 1usize << (m - K_SKIP - N_INNER));
 
     challenger.observe_label(b"flock-ag-skip-v1");
     let mut grinding_nonces = Vec::with_capacity(grinding_nonce_count(grinding, m));
@@ -1115,7 +1204,7 @@ pub fn prove_capture_s_hat_v_c_with_grinding<C: Challenger>(
     };
     let eq = crate::zerocheck::univariate_skip::build_eq(&r_outer);
 
-    let (msg, s_hat_v_c) = prove_round1_banks(a_packed, b_packed, c_packed, &eq);
+    let (msg, s_hat_v_c) = prove_round1_banks_padded(a_packed, b_packed, c_packed, &eq, &coverage);
     let (proof, claim) = prove_from_round1(
         a_packed,
         b_packed,
@@ -1123,6 +1212,7 @@ pub fn prove_capture_s_hat_v_c_with_grinding<C: Challenger>(
         &r_outer,
         grinding,
         grinding_nonces,
+        Some(&coverage),
         challenger,
     );
     (proof, claim, s_hat_v_c)
@@ -1138,21 +1228,99 @@ fn prove_round1_banks(
     c_packed: &[u8],
     eq: &[F128],
 ) -> (Round1Message, Vec<F128>) {
-    let (res_ab, bank0, bank1) = if ROUND1_UNFUSED.load(Ordering::Relaxed) {
+    let raw = if ROUND1_UNFUSED.load(Ordering::Relaxed) {
         crate::genus95_curve_code::round1::round1_slp_packed_banks(a_packed, b_packed, c_packed, eq)
     } else {
         crate::genus95_curve_code::round1::round1_slp_packed_banks_fused(
             a_packed, b_packed, c_packed, eq,
         )
     };
+    banks_to_message(raw)
+}
+
+/// [`prove_round1_banks`] under a witness run-list. The round-1 kernels are
+/// position-independent additive sums over 8192-bit blocks (one eq weight
+/// each), so the run-list needs NO kernel changes: maximal runs of FULL
+/// blocks go to the untouched kernel as (slice, eq-subrange) segments,
+/// PARTIAL blocks are cleansed into zeroed scratch and run as one-block
+/// segments, DEAD blocks are skipped, and the segment outputs sum. Reads no
+/// declared-dead bit (`PooledDirty`-legal); a fully-Full coverage is the
+/// one-segment identity call.
+#[cfg(target_arch = "aarch64")]
+fn prove_round1_banks_padded(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    eq: &[F128],
+    coverage: &[super::BlockCoverage],
+) -> (Round1Message, Vec<F128>) {
+    use super::BlockCoverage;
+    let kernel = if ROUND1_UNFUSED.load(Ordering::Relaxed) {
+        crate::genus95_curve_code::round1::round1_slp_packed_banks
+    } else {
+        crate::genus95_curve_code::round1::round1_slp_packed_banks_fused
+    };
+    let n = a_packed.len() / 1024;
+    assert_eq!(eq.len(), n, "one eq weight per block");
+    assert_eq!(coverage.len(), n, "one coverage entry per block");
+    let mut res_ab = [F128::ZERO; 160];
+    let mut bank0 = [F128::ZERO; 64];
+    let mut bank1 = [F128::ZERO; 64];
+    let mut acc = |seg: ([F128; 160], [F128; 64], [F128; 64])| {
+        for j in 0..160 {
+            res_ab[j] += seg.0[j];
+        }
+        for k in 0..64 {
+            bank0[k] += seg.1[k];
+            bank1[k] += seg.2[k];
+        }
+    };
+    let mut i = 0usize;
+    while i < n {
+        match &coverage[i] {
+            BlockCoverage::Dead => i += 1,
+            BlockCoverage::Full => {
+                let mut j = i + 1;
+                while j < n && coverage[j] == BlockCoverage::Full {
+                    j += 1;
+                }
+                acc(kernel(
+                    &a_packed[i * 1024..j * 1024],
+                    &b_packed[i * 1024..j * 1024],
+                    &c_packed[i * 1024..j * 1024],
+                    &eq[i..j],
+                ));
+                i = j;
+            }
+            BlockCoverage::Partial(ranges) => {
+                let mut a_buf = [0u8; 1024];
+                let mut b_buf = [0u8; 1024];
+                let mut c_buf = [0u8; 1024];
+                super::cleanse_block(a_packed, i * 1024, ranges, &mut a_buf);
+                super::cleanse_block(b_packed, i * 1024, ranges, &mut b_buf);
+                super::cleanse_block(c_packed, i * 1024, ranges, &mut c_buf);
+                acc(kernel(&a_buf, &b_buf, &c_buf, &eq[i..i + 1]));
+                i += 1;
+            }
+        }
+    }
+    banks_to_message((res_ab, bank0, bank1))
+}
+
+/// The shared banks → wire-message post-processing: `D⁻¹` scaling of the
+/// fresh coords and the recombined `w̄`, plus the canonical `s_hat_v_c`
+/// capture — `s_hat_v_c[skip + b·64] = bank_b[skip] / D₁`, with `γ⁻¹` for
+/// bank 1 (the kernel's odd-i bank carries an extra `γ` from friendly bit
+/// 0 = 1). `1/D₁ = (1+γ)·κ` since `D = (1+γ)·D₁` and `κ = D⁻¹ = d_inv()`.
+#[cfg(target_arch = "aarch64")]
+fn banks_to_message(
+    (res_ab, bank0, bank1): ([F128; 160], [F128; 64], [F128; 64]),
+) -> (Round1Message, Vec<F128>) {
     let di = d_inv();
     let msg = Round1Message {
         ab_fresh: (0..158).map(|s| di * res_ab[s]).collect(),
         c_msg: (0..64).map(|i| di * (bank0[i] + bank1[i])).collect(),
     };
-    // Canonical s_hat_v_c[skip + b·64] = bank_b[skip] / D₁, with γ⁻¹ for bank 1
-    // (the kernel's odd-i bank carries an extra γ from friendly bit 0 = 1).
-    // 1/D₁ = (1+γ)·κ since D = (1+γ)·D₁ and κ = D⁻¹ = d_inv().
     let inv_d1 = (F128::ONE + gamma_pow(1)) * di;
     let gamma_inv = gamma_pow(1).inv();
     let n_skip = 1usize << K_SKIP;
@@ -1175,6 +1343,7 @@ fn prove_from_round1<C: Challenger>(
     r_outer: &[F128],
     grinding: super::ZerocheckGrinding,
     mut grinding_nonces: Vec<u64>,
+    coverage: Option<&[super::BlockCoverage]>,
     challenger: &mut C,
 ) -> (AgProof, AgClaim) {
     challenger.observe_f128_slice(&msg.ab_fresh);
@@ -1191,8 +1360,12 @@ fn prove_from_round1<C: Challenger>(
     let mut r_rest = friendly_challenges().to_vec();
     r_rest.extend_from_slice(r_outer);
 
-    // Round 0: fused fold of a,b at r1 + the first (full-size) multilinear message.
-    let (a_mlv, b_mlv, g1_0, ginf_0) = fold_and_first_round(a_packed, b_packed, &w, &r_rest);
+    // Round 0: fused fold of a,b at r1 + the first (full-size) multilinear
+    // message — run-list-gated when the caller supplies a coverage map.
+    let (a_mlv, b_mlv, g1_0, ginf_0) = match coverage {
+        Some(cov) => fold_and_first_round_padded(a_packed, b_packed, &w, &r_rest, cov),
+        None => fold_and_first_round(a_packed, b_packed, &w, &r_rest),
+    };
     let (rounds, rhos, a_eval, b_eval) = match grinding.multilinear_round_bits() {
         Some(bits) => {
             let mut gch = RoundGrindProver {
@@ -2338,6 +2511,120 @@ mod tests {
         assert!(evaluation_point_from_nonce(&seed, n4, HashKind::Sha256).is_some());
     }
 
+    /// The run-list arms are value-identical to the dense kernels on an
+    /// honestly zero-padded witness AND read no declared-dead bit: proving
+    /// over a witness whose dead regions hold garbage (deliberately
+    /// inconsistent garbage — dead `c` bits set where `a·b` is zero) yields
+    /// byte-identical round-1 message, fold, `s_hat_v_c`, and full proof —
+    /// the exactness `PooledDirty` requires.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn padded_arms_match_dense_and_ignore_dirty_padding() {
+        use crate::challenger::FsChallenger;
+        use crate::zerocheck::{PaddingRun, PaddingSpec};
+        let m = 16usize;
+        let spec = PaddingSpec::from_runs(vec![
+            PaddingRun {
+                k_log: 13,
+                useful_bits_per_block: 1 << 13,
+                n_blocks: 2,
+            },
+            PaddingRun {
+                k_log: 13,
+                useful_bits_per_block: 3001,
+                n_blocks: 1,
+            },
+            PaddingRun {
+                k_log: 13,
+                useful_bits_per_block: 0,
+                n_blocks: 2,
+            },
+            PaddingRun {
+                k_log: 14,
+                useful_bits_per_block: 9000,
+                n_blocks: 1,
+            },
+        ]);
+        // LSB-first byte mask of the useful bits.
+        let mut mask = vec![0u8; (1usize << m) / 8];
+        for (s, e) in spec.useful_intervals() {
+            for i in s..e {
+                mask[i / 8] |= 1 << (i % 8);
+            }
+        }
+        let (a0, b0, c0) = random_witness(m, 91);
+        let honest = |v: &[u8]| -> Vec<u8> { v.iter().zip(&mask).map(|(x, k)| x & k).collect() };
+        let dirty = |v: &[u8], g: u8| -> Vec<u8> {
+            v.iter()
+                .zip(&mask)
+                .map(|(x, k)| (x & k) | (g & !k))
+                .collect()
+        };
+        let (ah, bh, ch) = (honest(&a0), honest(&b0), honest(&c0));
+        let (ad, bd, cd) = (dirty(&a0, 0xA5), dirty(&b0, 0x5A), dirty(&c0, 0xFF));
+
+        // Kernel level, round 1: dense-honest vs padded-dirty.
+        let cov = spec.block_coverage(K_SKIP + N_INNER, 1usize << (m - K_SKIP - N_INNER));
+        let mut rng = Sha256Rng::new([7u8; 32]);
+        let r_outer: Vec<F128> = (0..m - K_SKIP - N_INNER)
+            .map(|_| F128::new(rng.next_u64(), rng.next_u64()))
+            .collect();
+        let eq = crate::zerocheck::univariate_skip::build_eq(&r_outer);
+        let dense = prove_round1_banks(&ah, &bh, &ch, &eq);
+        let padded = prove_round1_banks_padded(&ad, &bd, &cd, &eq, &cov);
+        assert_eq!(dense.0, padded.0, "round-1 message");
+        assert_eq!(dense.1, padded.1, "s_hat_v_c capture");
+
+        // Kernel level, the fold + first message, at a decoded point.
+        let seed = [3u8; 32];
+        let pt = (0..u32::MAX)
+            .find_map(|n| {
+                crate::genus95_curve_code::evaluation_point_from_nonce(
+                    &seed,
+                    n,
+                    crate::hash::HashKind::Sha256,
+                )
+            })
+            .expect("a decodable nonce exists");
+        let w: Vec<F128> = base_evaluation_functional(&pt)
+            .expect("functional at a sampled point")
+            .iter()
+            .copied()
+            .collect();
+        let mut r_rest = friendly_challenges().to_vec();
+        r_rest.extend_from_slice(&r_outer);
+        let (af, bf, g1, gi) = fold_and_first_round(&ah, &bh, &w, &r_rest);
+        let (afp, bfp, g1p, gip) = fold_and_first_round_padded(&ad, &bd, &w, &r_rest, &cov);
+        assert_eq!((g1, gi), (g1p, gip), "first multilinear message");
+        assert_eq!(af, afp, "folded a");
+        assert_eq!(bf, bfp, "folded b");
+
+        // End to end under the strict schedule: the padded-dirty proof is
+        // byte-identical to the dense-honest one, and to the padded-honest
+        // one, and verifies.
+        let g = crate::zerocheck::ZerocheckGrinding::per_challenge_128();
+        let mk = || FsChallenger::new(b"flock-ag-padded-test");
+        let (p0, cl0, sv0) = prove_capture_s_hat_v_c_with_grinding(
+            &ah,
+            &bh,
+            &ch,
+            m,
+            &PaddingSpec::dense(m),
+            g,
+            &mut mk(),
+        );
+        let (p1, cl1, sv1) =
+            prove_capture_s_hat_v_c_with_grinding(&ad, &bd, &cd, m, &spec, g, &mut mk());
+        assert_eq!(p0, p1, "proof bytes");
+        assert_eq!(cl0, cl1, "claims");
+        assert_eq!(sv0, sv1, "s_hat_v_c");
+        let (p2, _, sv2) =
+            prove_capture_s_hat_v_c_with_grinding(&ah, &bh, &ch, m, &spec, g, &mut mk());
+        assert_eq!(p0, p2, "padded-honest proof bytes");
+        assert_eq!(sv0, sv2, "padded-honest s_hat_v_c");
+        verify_with_grinding(m, &p1, g, &mut mk()).expect("the padded-dirty proof verifies");
+    }
+
     /// Full grinding roundtrip on the fused transcript + fused-nonce tamper
     /// rejection: any change to `r1_nonce` must reject (bad PoW, bad point,
     /// or — if both criteria fluke — a different r₁ failing the c-eval bind).
@@ -2349,7 +2636,15 @@ mod tests {
         let (a, b, c) = random_witness(m, 77);
         let g = crate::zerocheck::ZerocheckGrinding::per_challenge_128();
         let mk = || FsChallenger::new(b"flock-ag-grind-test");
-        let (proof, claim, _) = prove_capture_s_hat_v_c_with_grinding(&a, &b, &c, m, g, &mut mk());
+        let (proof, claim, _) = prove_capture_s_hat_v_c_with_grinding(
+            &a,
+            &b,
+            &c,
+            m,
+            &crate::zerocheck::PaddingSpec::dense(m),
+            g,
+            &mut mk(),
+        );
         let vclaim =
             verify_with_grinding(m, &proof, g, &mut mk()).expect("honest fused proof verifies");
         assert_eq!(vclaim, claim);

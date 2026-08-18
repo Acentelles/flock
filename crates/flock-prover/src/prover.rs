@@ -900,11 +900,10 @@ fn prove_union_with_binding_zc<Ch: Challenger>(
     // its padding words are committed and must be honest zeros — dirty
     // pooling would put garbage into the committed stack (a latent hazard
     // of the pre-unification standalone body, never exercised there).
-    // The AG flavor's round 1 sums the FULL boolean region densely (no
-    // run-list gating), so it READS the padding words — dirty pooled padding
-    // is unsound under it. Force the honest-zero witness mode.
-    let padding_unread = bool_zc == BooleanZcKind::Rs
-        && !union.has_element()
+    // Flavor-independent since the AG round 1 + fold went run-list-gated
+    // (Dead blocks skipped, Partial blocks cleansed — no declared-dead bit
+    // is read on either flavor).
+    let padding_unread = !union.has_element()
         && !union.compaction_is_identity()
         && union.m_total() - union.n_log() >= pcs::LOG_PACKING;
     let (z_packed, a_packed_f128, b_packed_f128, stripes, buf_mode) =
@@ -1113,14 +1112,16 @@ fn prove_union_with_binding_zc<Ch: Challenger>(
                     }
                     #[cfg(target_arch = "aarch64")]
                     BooleanZcKind::Ag => {
-                        // Dense over the full boolean region — sound because
-                        // this flavor forced the honest-zero witness mode
-                        // above (padding rows contribute a·b − c = 0).
+                        // Run-list-gated like the RS twin: round 1 and the
+                        // fold skip Dead code blocks and cleanse Partial
+                        // ones, reading no declared-dead bit — PooledDirty
+                        // witnesses are legal here too.
                         let (p, cl, sv) = zerocheck::ag_skip::prove_capture_s_hat_v_c_with_grinding(
                             a_packed,
                             b_packed,
                             c_packed,
                             m_bool,
+                            &bool_padding,
                             pcs_params.zerocheck_grinding(),
                             challenger,
                         );
