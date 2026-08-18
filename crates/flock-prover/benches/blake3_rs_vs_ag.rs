@@ -244,7 +244,9 @@ fn bench_block(n_blocks: usize, n_runs: usize, threads_label: &str) {
             .verify_union_ag(&commitment, &proof, &mut ch_v)
             .expect("union-AG verify");
         let verify_t = t0.elapsed().as_secs_f64();
-        let size = bincode::serialize(&proof).expect("ser union-AG proof").len();
+        let size = bincode::serialize(&proof)
+            .expect("ser union-AG proof")
+            .len();
         black_box(&proof);
 
         println!(

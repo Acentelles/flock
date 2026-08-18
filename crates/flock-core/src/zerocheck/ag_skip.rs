@@ -851,7 +851,10 @@ pub enum AgVerifyError {
     CEvalMismatch,
     SumcheckFinalFailed,
     /// The nonce vector does not match the configured grinding schedule.
-    BadGrindingNonceCount { expected: usize, got: usize },
+    BadGrindingNonceCount {
+        expected: usize,
+        got: usize,
+    },
     /// A nonce fails the PoW at the FS position sampling its challenge.
     InvalidGrindingNonce,
 }
@@ -1018,8 +1021,7 @@ pub fn prove_capture_s_hat_v_c_with_grinding<C: Challenger>(
     let mut grinding_nonces = Vec::with_capacity(grinding_nonce_count(grinding, m));
     let r_outer = match grinding.initial_bits(m) {
         Some(bits) => {
-            let (nonce, v) =
-                challenger.grind_pow_and_sample_f128_vec(bits, m - K_SKIP - N_INNER);
+            let (nonce, v) = challenger.grind_pow_and_sample_f128_vec(bits, m - K_SKIP - N_INNER);
             grinding_nonces.push(nonce);
             v
         }

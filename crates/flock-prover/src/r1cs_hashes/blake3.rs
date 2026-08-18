@@ -1725,7 +1725,12 @@ impl Blake3Setup {
             generate_witness_batch_major_partial(blocks, self.n_blocks_log()),
             self.r1cs.csc_lincheck_circuit(),
         );
-        crate::prover::prove_fast_ligerito_union_ag(&union, &self.pcs_params, vec![slot], challenger)
+        crate::prover::prove_fast_ligerito_union_ag(
+            &union,
+            &self.pcs_params,
+            vec![slot],
+            challenger,
+        )
     }
 
     /// Verify a [`Self::prove_fast_union_ag`] proof. (Unlike the prove side,

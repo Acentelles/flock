@@ -68,9 +68,8 @@ use crate::zerocheck::K_SKIP;
 
 use super::{
     LincheckCircuit, LincheckClaim, LincheckGrinding, LincheckProof, QuirkyPoint, SkipPoint,
-    VerifyError, build_eq_table, build_quirky_eq_table_from_weights,
-    column_sumcheck_prove, inner_product,
-    partial_fold_packed_z_rows_best,
+    VerifyError, build_eq_table, build_quirky_eq_table_from_weights, column_sumcheck_prove,
+    inner_product, partial_fold_packed_z_rows_best,
 };
 
 /// One slot's lincheck inputs, in slot order — the union counterpart of the
@@ -596,11 +595,10 @@ impl MatrixAssertion {
             .zip(circuits)
             .map(|((ty, slot), circuit)| {
                 let inner = ty.k_log - k_skip;
-                let eq_inner =
-                    build_quirky_eq_table_from_weights(
-                        &self.z_skip.weights(k_skip),
-                        &self.x_inner_rest[..inner],
-                    );
+                let eq_inner = build_quirky_eq_table_from_weights(
+                    &self.z_skip.weights(k_skip),
+                    &self.x_inner_rest[..inner],
+                );
                 let mut comb = circuit.fold_alpha_batched(self.alpha, &eq_inner);
                 if slot.prefix_bits > 0 {
                     let w_t = eq_prefix_weight(&self.x_inner_rest[inner..], slot.prefix);

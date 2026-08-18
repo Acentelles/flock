@@ -1041,15 +1041,14 @@ fn prove_union_with_binding_zc<Ch: Challenger>(
                         // Dense over the full boolean region — sound because
                         // this flavor forced the honest-zero witness mode
                         // above (padding rows contribute a·b − c = 0).
-                        let (p, cl, sv) =
-                            zerocheck::ag_skip::prove_capture_s_hat_v_c_with_grinding(
-                                a_packed,
-                                b_packed,
-                                c_packed,
-                                m_bool,
-                                pcs_params.zerocheck_grinding(),
-                                challenger,
-                            );
+                        let (p, cl, sv) = zerocheck::ag_skip::prove_capture_s_hat_v_c_with_grinding(
+                            a_packed,
+                            b_packed,
+                            c_packed,
+                            m_bool,
+                            pcs_params.zerocheck_grinding(),
+                            challenger,
+                        );
                         (
                             UnionZcProof::Ag(p),
                             SkipPoint::Ag(cl.r1),
