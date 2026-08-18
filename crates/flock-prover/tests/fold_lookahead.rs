@@ -41,7 +41,7 @@ fn blocks(n: usize, seed: u64) -> Vec<Compression> {
 fn assert_byte_identical(n_blocks: usize, seed: u64) {
     let setup = Blake3Setup::new(n_blocks);
     let inputs = blocks(n_blocks, seed);
-    let mut prove = |force: u8| {
+    let prove = |force: u8| {
         FOLD_LOOKAHEAD_OVERRIDE.store(force, Ordering::Relaxed);
         let mut ch = FsChallenger::new(b"la-union-test");
         let out = setup.prove_fast(&inputs, &mut ch);
