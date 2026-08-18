@@ -45,24 +45,37 @@ __device__ __forceinline__ void zcsha_finalize(ZcSha& s, uint8_t out[32]) {
 #define ZC_OP_OBSERVE 0x03
 #define ZC_OP_SQUEEZE 0x04
 #define ZC_KIND_SCALAR 0x01
+// One op's 16-byte header [op][kind][0;6][len u64 LE] — transcript-v2's
+// word-aligned framing (mirrors challenger.hpp::absorb_header).
+__device__ __forceinline__ void zc_absorb_header(ZcSha& s, uint8_t op, uint8_t kind,
+                                                 unsigned long long len);
 __device__ __forceinline__ void zc_le64(uint8_t* b, unsigned long long v) {
     for (int i = 0; i < 8; i++) b[i] = (uint8_t)(v >> (8 * i));
 }
 __device__ __forceinline__ unsigned long long zc_rd_le64(const uint8_t* b) {
     unsigned long long v = 0; for (int i = 0; i < 8; i++) v |= (unsigned long long)b[i] << (8 * i); return v;
 }
+__device__ __forceinline__ void zc_absorb_header(ZcSha& s, uint8_t op, uint8_t kind,
+                                                 unsigned long long len) {
+    uint8_t h[16];
+    for (int i = 0; i < 16; i++) h[i] = 0;
+    h[0] = op; h[1] = kind;
+    zc_le64(h + 8, len);
+    zcsha_update(s, h, 16);
+}
 __device__ __forceinline__ void zc_observe_f128(ZcSha& s, F128 v) {
-    uint8_t op[2] = {ZC_OP_OBSERVE, ZC_KIND_SCALAR}; zcsha_update(s, op, 2);
+    zc_absorb_header(s, ZC_OP_OBSERVE, ZC_KIND_SCALAR, 1ull);
     uint8_t b[16]; zc_le64(b, v.lo); zc_le64(b + 8, v.hi); zcsha_update(s, b, 16);
 }
-// sample_f128: squeeze 16 bytes as SHA256(state || ctr=0) without mutating, then re-absorb.
+// sample_f128: absorb the OP_SQUEEZE header (which itself separates consecutive
+// samples), then squeeze 16 bytes as SHA256(state || ctr=0) without mutating.
+// The squeezed output is NOT re-absorbed (transcript-v2, matches the Rust).
 __device__ __forceinline__ F128 zc_sample_f128(ZcSha& s) {
-    uint8_t op[2] = {ZC_OP_SQUEEZE, ZC_KIND_SCALAR}; zcsha_update(s, op, 2);
+    zc_absorb_header(s, ZC_OP_SQUEEZE, ZC_KIND_SCALAR, 1ull);
     ZcSha h = s;                       // clone live state
     uint8_t cb[8]; zc_le64(cb, 0ull); zcsha_update(h, cb, 8);
     uint8_t block[32]; zcsha_finalize(h, block);
     uint8_t buf[16]; for (int i = 0; i < 16; i++) buf[i] = block[i];
-    zcsha_update(s, buf, 16);          // re-absorb
     return F128{zc_rd_le64(buf), zc_rd_le64(buf + 8)};
 }
 
