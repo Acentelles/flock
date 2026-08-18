@@ -612,6 +612,111 @@ fn fused_first_fold_virtual(
     (nf, nb, SumcheckMessage256 { u_0, u_2 })
 }
 
+/// FUSED double fold with a VIRTUAL basis: fold `f` by `(r0, r1)` (block
+/// pairing `d`) straight to the quarter-size state, EVALUATE the
+/// twice-folded virtual basis directly into `nb`, and accumulate the next
+/// round's message — the factored-basis counterpart of
+/// [`fused_fold2_msg_base`], and the lane-major consumer of the seeded
+/// EqPoint combine's round-1 lookahead. `basis` must already be folded by
+/// BOTH challenges (two `fold_coord`s); its index space is exactly the
+/// output's. Value-identical to fold → materialize → fold → message: the
+/// fold expression composes the two steps verbatim, `nb[o]` is the same
+/// per-term XOR-sum `fill` writes, the message pairing matches
+/// `next_round_msg(nf, nb, d)`, and the sums are XOR-additive.
+fn fused_first_fold2_virtual(
+    f: &[F128],
+    basis: &VirtualEqBasis256,
+    r0: F256,
+    r1: F256,
+    d: usize,
+) -> (Vec<F256>, Vec<F256>, SumcheckMessage256) {
+    let quarter = f.len() / 4;
+    debug_assert_eq!(basis.len(), quarter);
+    debug_assert!(d.is_power_of_two() && quarter.is_power_of_two() && quarter >= 2 * d);
+    let block = 2 * d;
+    let zero2 = || (F256::ZERO, F256::ZERO);
+    let sum2 = |(a0, a2): (F256, F256), (b0, b2): (F256, F256)| (a0 + b0, a2 + b2);
+    let mut nf = crate::scratch::take_f256(quarter);
+    let mut nb = crate::scratch::take_f256(quarter);
+    // Output o = b·d + w composes inputs {4bd+w, +d, +2d, +3d}; a message
+    // block of 2d outputs therefore reads the 8d inputs at 4·(block start).
+    let fold2 = |i: usize| -> F256 {
+        let lo = F256::from(f[i]) + r0 * (f[i + d] + f[i]);
+        let hi = F256::from(f[i + 2 * d]) + r0 * (f[i + 3 * d] + f[i + 2 * d]);
+        lo + r1 * (hi + lo)
+    };
+    let (u_0, u_2) = if block >= (1 << 16) {
+        const KC: usize = 1 << 13;
+        nf.par_chunks_mut(block)
+            .zip(nb.par_chunks_mut(block))
+            .enumerate()
+            .map(|(jb, (fblk, bblk))| {
+                let out0 = jb * block;
+                let in0 = 4 * out0;
+                let (flo_h, fhi_h) = fblk.split_at_mut(d);
+                let (blo_h, bhi_h) = bblk.split_at_mut(d);
+                flo_h
+                    .par_chunks_mut(KC)
+                    .zip(fhi_h.par_chunks_mut(KC))
+                    .zip(blo_h.par_chunks_mut(KC).zip(bhi_h.par_chunks_mut(KC)))
+                    .enumerate()
+                    .map(|(kc, ((flc, fhc), (blc, bhc)))| {
+                        let k0 = kc * KC;
+                        let mut u0 = F256::ZERO;
+                        let mut u2 = F256::ZERO;
+                        for k in 0..flc.len() {
+                            let i = in0 + k0 + k;
+                            let o = out0 + k0 + k;
+                            let flo = fold2(i);
+                            let fhi = fold2(i + 4 * d);
+                            let blo = basis.value_sum_at(o);
+                            let bhi = basis.value_sum_at(o + d);
+                            flc[k] = flo;
+                            fhc[k] = fhi;
+                            blc[k] = blo;
+                            bhc[k] = bhi;
+                            u0 += flo * blo;
+                            u2 += (flo + fhi) * (blo + bhi);
+                        }
+                        (u0, u2)
+                    })
+                    .reduce(zero2, sum2)
+            })
+            .reduce(zero2, sum2)
+    } else {
+        let chunk = block.max(1 << 12).min(quarter);
+        debug_assert!(chunk.is_multiple_of(block) || chunk == quarter);
+        nf.par_chunks_mut(chunk)
+            .zip(nb.par_chunks_mut(chunk))
+            .enumerate()
+            .map(|(ci, (fo, bo))| {
+                let mut u0 = F256::ZERO;
+                let mut u2 = F256::ZERO;
+                let out0 = ci * chunk;
+                for (jo, (fblk, bblk)) in fo.chunks_mut(block).zip(bo.chunks_mut(block)).enumerate()
+                {
+                    let ob = out0 + jo * block;
+                    let in0 = 4 * ob;
+                    for k in 0..d {
+                        let flo = fold2(in0 + k);
+                        let fhi = fold2(in0 + 4 * d + k);
+                        let blo = basis.value_sum_at(ob + k);
+                        let bhi = basis.value_sum_at(ob + d + k);
+                        fblk[k] = flo;
+                        fblk[d + k] = fhi;
+                        bblk[k] = blo;
+                        bblk[d + k] = bhi;
+                        u0 += flo * blo;
+                        u2 += (flo + fhi) * (blo + bhi);
+                    }
+                }
+                (u0, u2)
+            })
+            .reduce(zero2, sum2)
+    };
+    (nf, nb, SumcheckMessage256 { u_0, u_2 })
+}
+
 struct VirtualEqTerm256 {
     coords: Vec<F128>,
     scale: F256,
@@ -817,6 +922,23 @@ impl SumcheckProver256 {
         let f = self.initial_f.take().expect("first fold already consumed");
         let b = self.initial_b.take().expect("materialized basis missing");
         let (nf, nb, msg) = fused_fold2_msg_base(&f, &b, r0, r1);
+        self.f = nf;
+        self.combined_basis = nb;
+        self.transcript.push(msg);
+        msg
+    }
+
+    /// [`Self::first_fold2_materialized`] for the VIRTUAL basis (the
+    /// lane-major merged opens): `basis` must already carry both fold_coords.
+    pub(super) fn first_fold2_virtual(
+        &mut self,
+        r0: F256,
+        r1: F256,
+        d: usize,
+        basis: &VirtualEqBasis256,
+    ) -> SumcheckMessage256 {
+        let f = self.initial_f.take().expect("first fold already consumed");
+        let (nf, nb, msg) = fused_first_fold2_virtual(&f, basis, r0, r1, d);
         self.f = nf;
         self.combined_basis = nb;
         self.transcript.push(msg);
@@ -1056,24 +1178,39 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let mut jit_ood_basis: Option<VirtualEqBasis> = None;
     // The combine pass's round-1 lookahead (message coefficients in the
     // round-0 challenge) makes round 1 an O(1) skip and fuses the deferred
-    // fold-0 into fold 1's pass. It only ever arrives on the standard
-    // materialized path (pd claims and the lane-major inner open never emit
-    // coefficients); the double fold needs two initial rounds and ≥ 8 base
-    // words. FLOCK_NO_FOLD_LOOKAHEAD=1 is the A/B knob — value-identical
-    // either way (exact polynomial identity), so proofs are byte-equal.
+    // fold-0 into fold 1's pass. Consumed on the materialized (d = 1,
+    // compression-proof) path AND the virtual-basis lane-major path (the
+    // merged-transport inner opens — the seeded EqPoint combine emits
+    // blocked coefficients); the jit fallback (FLOCK_NO_VIRTUAL_B) keeps
+    // the plain first fold. The double fold needs two initial rounds and a
+    // quarter table that still supports the blocked message pairing
+    // (len ≥ 8·d). FLOCK_NO_FOLD_LOOKAHEAD=1 / FOLD_LOOKAHEAD_OVERRIDE is
+    // the A/B knob — value-identical either way (exact polynomial
+    // identity), so proofs are byte-equal.
     let mut lookahead = round1_lookahead.filter(|_| {
-        !factored
-            && fold_block == 1
-            && initial_k >= 2
-            && packed_witness.len() >= 8
-            && std::env::var_os("FLOCK_NO_FOLD_LOOKAHEAD").is_none()
+        let knob = match FOLD_LOOKAHEAD_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => std::env::var_os("FLOCK_NO_FOLD_LOOKAHEAD").is_none(),
+        };
+        let kind_ok = virtual_basis.is_some() || (l0_jit_basis.is_none() && fold_block == 1);
+        knob && kind_ok && initial_k >= 2 && packed_witness.len() >= 8 * fold_block
     });
     let _t = std::time::Instant::now();
     for _ in 0..ood_count(0) {
         let z = challenger.sample_f128_vec(log_n);
         let mut ood_la = None;
         let (ood_msg, y, eq_z) = if factored {
-            let (msg, y) = round_msg_and_eval_eq_point_blocked(&packed_witness, &z, fold_block);
+            let (msg, y) = if lookahead.is_some() {
+                // Same factored sweep, plus the (f, eq_z) pair's own BLOCKED
+                // round-1 coefficients so the lookahead survives the β-glue.
+                let (msg, y, la) =
+                    round_msg_eval_and_lookahead_eq_point_blocked(&packed_witness, &z, fold_block);
+                ood_la = Some(la);
+                (msg, y)
+            } else {
+                round_msg_and_eval_eq_point_blocked(&packed_witness, &z, fold_block)
+            };
             (msg, y, None)
         } else {
             // Same doubling recurrence as `build_eq_table`, parallel —
@@ -1189,7 +1326,18 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 sumcheck.first_fold_materialized(challenge, fold_block)
             }
         } else if let Some(r0) = pending_r0.take() {
-            sumcheck.first_fold2_materialized(r0, challenge)
+            if let Some(mut vb) = virtual_basis.take() {
+                // The deferred fold-0 and fold-1 both bind the variable at
+                // bit log2(d): fold_coord removes it, so the second bind at
+                // the SAME position takes the next block variable — exactly
+                // the ladder's successive block-d folds.
+                let p = fold_block.trailing_zeros() as usize;
+                vb.fold_coord(p, r0);
+                vb.fold_coord(p, challenge);
+                sumcheck.first_fold2_virtual(r0, challenge, fold_block, &vb)
+            } else {
+                sumcheck.first_fold2_materialized(r0, challenge)
+            }
         } else {
             sumcheck.fold_materialized(challenge, fold_block)
         };

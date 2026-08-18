@@ -3485,6 +3485,13 @@ pub struct FoldLookahead {
     u2: [F128; 3],
 }
 
+/// In-process A/B override for the F256 ladder's round-1 lookahead skip:
+/// `0` follows the `FLOCK_NO_FOLD_LOOKAHEAD` env knob, `1` forces it on,
+/// `2` forces the plain first-fold path. Byte-identical either way (exact
+/// polynomial identity) — the oracle tests alternate this to prove it.
+pub static FOLD_LOOKAHEAD_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
 impl FoldLookahead {
     #[inline]
     fn eval(&self, r: F128) -> SumcheckMessage {
@@ -3492,6 +3499,16 @@ impl FoldLookahead {
         SumcheckMessage {
             u_0: self.u0[0] + r * self.u0[1] + r2 * self.u0[2],
             u_2: self.u2[0] + r * self.u2[1] + r2 * self.u2[2],
+        }
+    }
+
+    /// Componentwise addition. The coefficients are LINEAR in the basis, so
+    /// a post-combine basis delta corrects a stored lookahead by adding the
+    /// delta's own coefficients.
+    pub(crate) fn add(&mut self, other: &FoldLookahead) {
+        for i in 0..3 {
+            self.u0[i] += other.u0[i];
+            self.u2[i] += other.u2[i];
         }
     }
 }
@@ -4185,6 +4202,57 @@ fn round_msg_and_eval_eq_point_blocked(
             |(a0, a2, ae), (b0, b2, be)| (a0 + b0, a2 + b2, ae + be),
         );
     (SumcheckMessage { u_0, u_2 }, y)
+}
+
+/// [`round_msg_and_eval_eq_point_blocked`] that ALSO accumulates the round-1
+/// message's quadratic coefficients in the round-0 fold challenge, under the
+/// same BLOCK pairing (`d = 1` is the LSB order). Quad `b` covers the four
+/// consecutive `d`-blocks `[4bd, 4bd+4d)`: fold 0 pairs blocks (0,1) and
+/// (2,3), fold 1 pairs the two results — exactly the fused fold kernels'
+/// geometry, so [`lookahead_accum_group`] applies verbatim with blocked
+/// gathering. Used by the F256 ladder's factored L0 OOD loop to keep a
+/// caller lookahead live across the β-glues.
+pub(crate) fn round_msg_eval_and_lookahead_eq_point_blocked(
+    f: &[F128],
+    point: &[F128],
+    d: usize,
+) -> (SumcheckMessage, F128, FoldLookahead) {
+    use rayon::prelude::*;
+    debug_assert_eq!(f.len(), 1usize << point.len());
+    debug_assert!(d.is_power_of_two() && f.len().is_multiple_of(4 * d));
+    let eq = VirtualEqTerm::new(point.to_vec(), F128::ONE);
+    let (acc, odd) = (0..f.len() / (4 * d))
+        .into_par_iter()
+        .map(|q| {
+            let mut acc = [F256Unreduced::ZERO; 8];
+            let mut odd = F256Unreduced::ZERO;
+            let i0 = 4 * q * d;
+            for k in 0..d {
+                let i = i0 + k;
+                let fq = [f[i], f[i + d], f[i + 2 * d], f[i + 3 * d]];
+                let bq = [
+                    eq.value_at(i),
+                    eq.value_at(i + d),
+                    eq.value_at(i + 2 * d),
+                    eq.value_at(i + 3 * d),
+                ];
+                lookahead_accum_group(&fq, &bq, &mut acc);
+                odd ^= fq[1].mul_unreduced(bq[1]) ^ fq[3].mul_unreduced(bq[3]);
+            }
+            (acc, odd)
+        })
+        .reduce(
+            || ([F256Unreduced::ZERO; 8], F256Unreduced::ZERO),
+            |(a, ao), (b, bo)| {
+                (xor_acc8(a, b), {
+                    let mut o = ao;
+                    o ^= bo;
+                    o
+                })
+            },
+        );
+    let (msg, la) = lookahead_finish(acc);
+    (msg, msg.u_0 + odd.reduce(), la)
 }
 
 pub struct SumcheckProver {
