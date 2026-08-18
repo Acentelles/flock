@@ -9381,6 +9381,129 @@ pub fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) 
     }
 }
 
+/// **Phase B slice 1 (docs/ag-recursion-plan.md): the REAL chain-leaf shape
+/// through the AG-skip circuit entries.** Same cached chain shape, same
+/// statement, same leaf profile — prove with
+/// `prove_fast_ligerito_union_circuit_ag`, deferred-verify with the AG twin,
+/// discharge both assertion families, pin h_end against the native chain,
+/// reject the fused-nonce tampers, and print the same-shape RS vs AG leaf
+/// prove times (the workload number the AG leaf exists for). No tower
+/// plumbing is touched yet — `MixedInner`/`ChildTape` stay RS until the FL
+/// walker grows its AG arm.
+#[cfg(target_arch = "aarch64")]
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+fn chain_leaf_ag_roundtrip() {
+    let cfg = test_config();
+    let n_blocks = 256usize;
+    let mut rng = Rng(0xC4A1_00A6);
+    let h_start: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+
+    let cs: ChainShape = chain_shape_cached(n_blocks).as_ref().clone();
+    let (nu, hash) = (cs.nu, cs.hash);
+    let blake_r1cs = chain_blake_r1cs(nu);
+    let blake_lc = blake_r1cs.csc_lincheck_circuit();
+
+    let witness = cs.shape.run(&chain_vals(&h_start), &[]);
+    let union = UnionInstance::new(&cs.shape.registry, cs.shape.counts.clone());
+    assert!(!union.has_element(), "a chain proof is boolean-only");
+    let pcs_params = PcsParams {
+        m: union.dense_m(),
+        log_inv_rate: 1,
+        profile: cfg.leaf_profile(),
+        log_batch_size: pcs_batch_for(&union, cfg.leaf_profile()),
+        num_lanes: union.commit_lanes(pcs_batch_for(&union, cfg.leaf_profile())),
+        merkle_hash: HashKind::Blake3,
+    };
+    let wit_rows = witness.rows::<Blake3Gate>(hash);
+
+    // Same-shape RS baseline (the flavor delta, not a cross-shape number).
+    let t0 = std::time::Instant::now();
+    let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
+    let (_rs_proof, _, _) = prover::prove_fast_ligerito_union_circuit(
+        &union,
+        &cs.shape.circuit,
+        &witness.public,
+        &pcs_params,
+        vec![UnionSlotProverInput::new(
+            blake3::generate_witness_batch_major_partial(wit_rows, nu),
+            blake_lc,
+        )],
+        Vec::new(),
+        &mut ch,
+    );
+    let rs_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+    let t0 = std::time::Instant::now();
+    let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
+    let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit_ag(
+        &union,
+        &cs.shape.circuit,
+        &witness.public,
+        &pcs_params,
+        vec![UnionSlotProverInput::new(
+            blake3::generate_witness_batch_major_partial(wit_rows, nu),
+            blake_lc,
+        )],
+        Vec::new(),
+        &mut ch,
+    );
+    let ag_ms = t0.elapsed().as_secs_f64() * 1e3;
+    eprintln!(
+        "[chain-leaf] prove RS {rs_ms:7.2} ms vs AG {ag_ms:7.2} ms (same shape, m = {})",
+        union.dense_m()
+    );
+
+    let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
+    let verify = |p: &flock_core::proof::R1csProofCircuitMergedAg| {
+        let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
+        verifier::verify_ligerito_union_circuit_ag_deferred(
+            &union,
+            &cs.shape.circuit,
+            &witness.public,
+            &lcs,
+            &commitment,
+            p,
+            &pcs_params,
+            &mut ch,
+        )
+    };
+    let (_claims, work, sigma) = verify(&proof).expect("deferred AG chain leaf verifies");
+    work.boolean
+        .as_ref()
+        .expect("boolean matrix work")
+        .check(&union, &lcs)
+        .expect("boolean matrix work discharges");
+    assert!(work.element.is_none(), "no element class, no element work");
+    assert!(sigma.check(&cs.shape.circuit), "sigma discharges");
+
+    // The statement is bound end to end: the published tail is h_end.
+    let h_end = native_chain(&h_start, n_blocks);
+    let public = &witness.public;
+    for j in 0..4 {
+        assert_eq!(
+            public[public.len() - 4 + j],
+            pack4(h_end[4 * j..4 * j + 4].try_into().unwrap()),
+            "the published tail is the native h_end"
+        );
+    }
+
+    // Fused-nonce tampers on the REAL chain shape.
+    let mut bad = proof.clone();
+    let n = &mut bad.boolean.as_mut().expect("boolean").ag.r1_nonce;
+    *n = n.wrapping_add(1);
+    assert!(verify(&bad).is_err(), "tampered fused r1 nonce accepted");
+    let mut bad = proof.clone();
+    *bad.boolean
+        .as_mut()
+        .expect("boolean")
+        .lincheck
+        .grinding_nonces
+        .last_mut()
+        .expect("fused skip nonce") ^= 1;
+    assert!(verify(&bad).is_err(), "tampered fused skip nonce accepted");
+}
+
 /// **Task 2's pin: the message-chain leaf, honest + the tamper matrix.**
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
