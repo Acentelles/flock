@@ -97,6 +97,17 @@ fn test_config() -> TowerConfig {
     }
 }
 
+/// Phase B flip-in-place (docs/ag-recursion-plan.md): the chain leaf proves
+/// under the AG-skip boolean zerocheck wherever the round-1 prover kernel
+/// exists (aarch64 NEON); elsewhere it stays RS until Phase F ports the
+/// kernel. Private on purpose — the endgame deletes the RS arm rather than
+/// growing `TowerConfig`. `TOWER_LEAF_ZC=rs` forces the RS leaf for A/B
+/// measurement on aarch64.
+fn leaf_zc_ag() -> bool {
+    cfg!(target_arch = "aarch64")
+        && !matches!(std::env::var("TOWER_LEAF_ZC").as_deref(), Ok("rs"))
+}
+
 fn tower_fold_grinding(cfg: TowerConfig) -> flock_core::matrix_fold::FoldGrinding {
     let profile = cfg.outer_profile();
     PcsParams {
@@ -726,7 +737,51 @@ fn median_total(runs: &[Online]) -> f64 {
 /// compression per 64 bytes, so at the measured ~6.1 µs per b3 row a KiB of
 /// child proof is ~0.1 ms of parent per child.
 #[cfg(test)]
+fn census_kib<T: serde::Serialize + ?Sized>(v: &T) -> f64 {
+    bincode::serialize(v).map(|b| b.len()).unwrap_or(0) as f64 / 1024.0
+}
+
+#[cfg(test)]
 fn proof_census(label: &str, p: &flock_core::proof::R1csProofCircuitMerged, pcs: &PcsParams) {
+    proof_census_parts(
+        label,
+        census_kib(p),
+        census_kib(&p.boolean),
+        census_kib(&p.element),
+        census_kib(&p.wiring),
+        &p.pcs_open,
+        pcs,
+    )
+}
+
+/// [`proof_census`] over the leaf's flavor enum — the AG flavor differs
+/// only in the boolean PIOP struct; every other section is shape-shared.
+#[cfg(test)]
+fn proof_census_mixed(label: &str, p: &MixedProof, pcs: &PcsParams) {
+    match p {
+        MixedProof::Rs(p) => proof_census(label, p, pcs),
+        MixedProof::Ag(p) => proof_census_parts(
+            label,
+            census_kib(p),
+            census_kib(&p.boolean),
+            census_kib(&p.element),
+            census_kib(&p.wiring),
+            &p.pcs_open,
+            pcs,
+        ),
+    }
+}
+
+#[cfg(test)]
+fn proof_census_parts(
+    label: &str,
+    total: f64,
+    boolean_kib: f64,
+    element_kib: f64,
+    wiring_kib: f64,
+    pcs_open: &flock_core::pcs::MergedOpenProof,
+    pcs: &PcsParams,
+) {
     // Per-level stratified schedules, and the siblings a path emits ABOVE
     // the cap layer. The cap is the whole layer at the DEEPEST summand's
     // depth c1, so every query can be checked with d - c1 siblings — since
@@ -734,7 +789,7 @@ fn proof_census(label: &str, p: &flock_core::proof::R1csProofCircuitMerged, pcs:
     // (not recomputed from the schedule), so `redundant` certifies the
     // truncation stays landed: anything past q·(d − c1) is waste.
     if let Ok(cfg) = pcs.ligerito_prover_config() {
-        let lig = &p.pcs_open.inner.ligerito;
+        let lig = &pcs_open.inner.ligerito;
         let r = lig.recursive_caps.len();
         assert_eq!(cfg.stratified.len(), r + 1, "one schedule per open level");
         let level_paths = |lvl: usize| -> usize {
@@ -770,14 +825,8 @@ fn proof_census(label: &str, p: &flock_core::proof::R1csProofCircuitMerged, pcs:
             100.0 * waste as f64 / emitted as f64,
         );
     }
-    proof_census_inner(label, p)
-}
-
-#[cfg(test)]
-fn proof_census_inner(label: &str, p: &flock_core::proof::R1csProofCircuitMerged) {
     let sz = |b: Result<Vec<u8>, _>| b.map(|v| v.len()).unwrap_or(0) as f64 / 1024.0;
-    let total = sz(bincode::serialize(p));
-    let lig = &p.pcs_open.inner.ligerito;
+    let lig = &pcs_open.inner.ligerito;
     let rows = |v: &Vec<flock_core::pcs::ligerito::RecursiveProof>| -> (f64, f64) {
         (
             v.iter()
@@ -808,14 +857,14 @@ fn proof_census_inner(label: &str, p: &flock_core::proof::R1csProofCircuitMerged
          \x20   inner: caps         {:6.1}   (L0 {:.1} + rec {:.1})\n\
          \x20   inner: final block  {:6.1}\n\
          \x20   inner: sumcheck     {:6.1}",
-        sz(bincode::serialize(&p.boolean)),
-        sz(bincode::serialize(&p.element)),
-        sz(bincode::serialize(&p.wiring)),
-        sz(bincode::serialize(&p.pcs_open.merged_rounds)),
-        sz(bincode::serialize(&p.pcs_open.ring_switches)),
-        sz(bincode::serialize(&p.pcs_open.frobenius.values)),
-        sz(bincode::serialize(&p.pcs_open.frobenius.rounds)),
-        sz(bincode::serialize(&p.pcs_open.frobenius.anchor)),
+        boolean_kib,
+        element_kib,
+        wiring_kib,
+        sz(bincode::serialize(&pcs_open.merged_rounds)),
+        sz(bincode::serialize(&pcs_open.ring_switches)),
+        sz(bincode::serialize(&pcs_open.frobenius.values)),
+        sz(bincode::serialize(&pcs_open.frobenius.rounds)),
+        sz(bincode::serialize(&pcs_open.frobenius.anchor)),
         l0_rows,
         l0_paths,
         rec_rows,
@@ -1651,6 +1700,40 @@ fn bytes_payload_mask(ops: &[flock_core::transcript_record::TranscriptOp]) -> Ve
         }
     }
     v
+}
+
+/// The 32-byte AG sampling seed from its two transcript squeezes — the
+/// exact layout `ag_skip::r1_seed` writes: s0.lo, s0.hi, s1.lo, s1.hi,
+/// each LE.
+fn ag_seed_bytes(s0: F128, s1: F128) -> [u8; 32] {
+    let mut seed = [0u8; 32];
+    seed[0..8].copy_from_slice(&s0.lo.to_le_bytes());
+    seed[8..16].copy_from_slice(&s0.hi.to_le_bytes());
+    seed[16..24].copy_from_slice(&s1.lo.to_le_bytes());
+    seed[24..32].copy_from_slice(&s1.hi.to_le_bytes());
+    seed
+}
+
+/// Re-derive an AG skip point from (seed, nonce) under the child's grinding
+/// schedule — ONE hash + one attempt, the verifier's own fused-nonce
+/// derivation (`H(seed ‖ nonce)` must clear the PoW target AND decode).
+fn decode_ag_point(
+    seed: &[u8; 32],
+    nonce: u32,
+    pow_bits: Option<u32>,
+) -> flock_core::genus95_curve_code::EvaluationPoint {
+    match pow_bits {
+        Some(bits) => flock_core::genus95_curve_code::evaluation_point_from_nonce_pow(
+            seed,
+            nonce,
+            HashKind::Blake3,
+            bits,
+        ),
+        None => {
+            flock_core::genus95_curve_code::evaluation_point_from_nonce(seed, nonce, HashKind::Blake3)
+        }
+    }
+    .expect("the AG nonce decodes to a valid cover point")
 }
 
 /// Replay a recorded transcript's FS chain into the blake3 slot; squeeze
@@ -8977,10 +9060,45 @@ fn check_real_child_region(public: &[F128], rt: &RealTape<'_>, r: &RealRegion) -
 /// (message words), so same-parameter instances share the CIRCUIT — and its
 /// digest, the key the accumulator folds sigma under — while their claims
 /// land at unrelated FS points, which is what a merge node actually sees.
+/// A chain leaf's proof by boolean-zerocheck FLAVOR — parallel arms so the
+/// RS deprecation endgame is arm-deletion, not surgery
+/// (docs/ag-recursion-plan.md). The element region, the wiring argument,
+/// and the merged open are shape-identical across flavors, so shared
+/// consumers read them through the accessors; only the zerocheck walk and
+/// its z_skip surface match on the arm.
+enum MixedProof {
+    Rs(flock_core::proof::R1csProofCircuitMerged),
+    /// Constructed only where the AG round-1 prover kernel exists
+    /// (aarch64); the consuming arms are arch-independent.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    Ag(flock_core::proof::R1csProofCircuitMergedAg),
+}
+
+impl MixedProof {
+    fn wiring(&self) -> &flock_core::circuit::WiringProof {
+        match self {
+            MixedProof::Rs(p) => &p.wiring,
+            MixedProof::Ag(p) => &p.wiring,
+        }
+    }
+    fn pcs_open(&self) -> &flock_core::pcs::MergedOpenProof {
+        match self {
+            MixedProof::Rs(p) => &p.pcs_open,
+            MixedProof::Ag(p) => &p.pcs_open,
+        }
+    }
+    fn element(&self) -> Option<&flock_core::element_r1cs::union::Proof> {
+        match self {
+            MixedProof::Rs(p) => p.element.as_ref(),
+            MixedProof::Ag(p) => p.element.as_ref(),
+        }
+    }
+}
+
 struct MixedInner {
     nu: usize,
     built: flock_core::circuit::builder::BuiltCircuit,
-    proof: flock_core::proof::R1csProofCircuitMerged,
+    proof: MixedProof,
     commitment: flock_core::pcs::commit::Commitment,
     pcs: PcsParams,
     work: flock_core::verifier::DeferredMatrixWork,
@@ -9293,15 +9411,34 @@ pub fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) 
         let witgen_ms = t1.elapsed().as_secs_f64() * 1e3;
         let t2 = std::time::Instant::now();
         let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
-        let (proof, commitment, _) = prover::prove_fast_ligerito_union_circuit(
-            &union,
-            &cs.shape.circuit,
-            &witness.public,
-            &pcs_params,
-            vec![UnionSlotProverInput::new(wit, blake_lc)],
-            Vec::new(),
-            &mut ch,
-        );
+        let (proof, commitment) = if leaf_zc_ag() {
+            #[cfg(target_arch = "aarch64")]
+            {
+                let (p, c, _) = prover::prove_fast_ligerito_union_circuit_ag(
+                    &union,
+                    &cs.shape.circuit,
+                    &witness.public,
+                    &pcs_params,
+                    vec![UnionSlotProverInput::new(wit, blake_lc)],
+                    Vec::new(),
+                    &mut ch,
+                );
+                (MixedProof::Ag(p), c)
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            unreachable!("leaf_zc_ag() is false off aarch64")
+        } else {
+            let (p, c, _) = prover::prove_fast_ligerito_union_circuit(
+                &union,
+                &cs.shape.circuit,
+                &witness.public,
+                &pcs_params,
+                vec![UnionSlotProverInput::new(wit, blake_lc)],
+                Vec::new(),
+                &mut ch,
+            );
+            (MixedProof::Rs(p), c)
+        };
         let prove_ms = t2.elapsed().as_secs_f64() * 1e3;
         // `t0` opened before the walk, so this is the whole online span in
         // ONE timer — the honest per-leaf number, against which the phase
@@ -9326,16 +9463,28 @@ pub fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) 
 
     let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
     let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
-    let (_claims, work, sigma) = verifier::verify_ligerito_union_circuit_deferred(
-        &union,
-        &built.shape.circuit,
-        &built.witness.public,
-        &lcs,
-        &commitment,
-        &proof,
-        &pcs_params,
-        &mut ch,
-    )
+    let (_claims, work, sigma) = match &proof {
+        MixedProof::Rs(p) => verifier::verify_ligerito_union_circuit_deferred(
+            &union,
+            &built.shape.circuit,
+            &built.witness.public,
+            &lcs,
+            &commitment,
+            p,
+            &pcs_params,
+            &mut ch,
+        ),
+        MixedProof::Ag(p) => verifier::verify_ligerito_union_circuit_ag_deferred(
+            &union,
+            &built.shape.circuit,
+            &built.witness.public,
+            &lcs,
+            &commitment,
+            p,
+            &pcs_params,
+            &mut ch,
+        ),
+    }
     .expect("the deferred verify accepts an honest chain proof");
     work.boolean
         .as_ref()
@@ -9543,20 +9692,30 @@ fn chain_proof_message_chain_roundtrip_and_tampers() {
             &mut ch,
         )
     };
-    let verify = |public: &[F128],
-                  cm: &flock_core::pcs::commit::Commitment,
-                  p: &flock_core::proof::R1csProofCircuitMerged| {
+    let verify = |public: &[F128], cm: &flock_core::pcs::commit::Commitment, p: &MixedProof| {
         let mut ch = FsChallenger::with_chained_blake3(DOMAIN);
-        verifier::verify_ligerito_union_circuit(
-            &union,
-            &built.shape.circuit,
-            public,
-            &lcs,
-            cm,
-            p,
-            &cp.inner.pcs,
-            &mut ch,
-        )
+        match p {
+            MixedProof::Rs(p) => verifier::verify_ligerito_union_circuit(
+                &union,
+                &built.shape.circuit,
+                public,
+                &lcs,
+                cm,
+                p,
+                &cp.inner.pcs,
+                &mut ch,
+            ),
+            MixedProof::Ag(p) => verifier::verify_ligerito_union_circuit_ag(
+                &union,
+                &built.shape.circuit,
+                public,
+                &lcs,
+                cm,
+                p,
+                &cp.inner.pcs,
+                &mut ch,
+            ),
+        }
     };
 
     // (a) A broken chain link: row 100 re-witnessed from a message one bit
@@ -9568,7 +9727,7 @@ fn chain_proof_message_chain_roundtrip_and_tampers() {
         let (p, cm, _) = prove(&bad, &built.witness.public);
         assert!(
             matches!(
-                verify(&built.witness.public, &cm, &p),
+                verify(&built.witness.public, &cm, &MixedProof::Rs(p)),
                 Err(flock_core::verifier::VerifyError::Wiring(
                     flock_core::circuit::WiringError::Gkr(
                         flock_core::product_gkr::VerifyError::ProductMismatch
@@ -9592,7 +9751,7 @@ fn chain_proof_message_chain_roundtrip_and_tampers() {
         );
         let (p, cm, _) = prove(built.rows::<Blake3Gate>(hash), &bad);
         assert!(
-            verify(&bad, &cm, &p).is_err(),
+            verify(&bad, &cm, &MixedProof::Rs(p)).is_err(),
             "statement word {i} must be enforced by the wiring"
         );
     }
@@ -9653,7 +9812,7 @@ fn chain_tape_regions_pinned() {
     assert!(ct.el_assert.is_none(), "no element assertion travels");
     assert_eq!(
         ct.n_pd,
-        cp.inner.proof.wiring.gather.len(),
+        cp.inner.proof.wiring().gather.len(),
         "the pd claims are the wiring gathers ONLY"
     );
     assert!(ct.n_p > 0, "the gathers form scalar groups");
@@ -9680,7 +9839,7 @@ fn chain_tape_regions_pinned() {
         ct.n_pd,
         ct.n_p,
         ct.mu_i,
-        cp.inner.proof.wiring.gkr.layers.len(),
+        cp.inner.proof.wiring().gkr.layers.len(),
         ct.b3_rows,
         ct.geo[0].lanes,
         ct.geo[0].row_words,
@@ -9814,16 +9973,28 @@ fn record_chain_child_verify(
     );
     let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
     let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(DOMAIN));
-    verifier::verify_ligerito_union_circuit_deferred(
-        &union,
-        &inner.built.shape.circuit,
-        &inner.built.witness.public,
-        &lcs,
-        &inner.commitment,
-        &inner.proof,
-        &inner.pcs,
-        &mut rec,
-    )
+    match &inner.proof {
+        MixedProof::Rs(p) => verifier::verify_ligerito_union_circuit_deferred(
+            &union,
+            &inner.built.shape.circuit,
+            &inner.built.witness.public,
+            &lcs,
+            &inner.commitment,
+            p,
+            &inner.pcs,
+            &mut rec,
+        ),
+        MixedProof::Ag(p) => verifier::verify_ligerito_union_circuit_ag_deferred(
+            &union,
+            &inner.built.shape.circuit,
+            &inner.built.witness.public,
+            &lcs,
+            &inner.commitment,
+            p,
+            &inner.pcs,
+            &mut rec,
+        ),
+    }
     .expect("the chain child verifies (recorded)");
 }
 
@@ -10300,41 +10471,101 @@ pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
         // ---- the connects: fold surfaces == child-region wires ----
         use flock_core::field::PHI_8_TABLE;
         use flock_core::zerocheck::K_SKIP;
-        use flock_core::zerocheck::multilinear::{
-            lagrange_weights_naive, subspace_denominator_pair,
-        };
-        let lam_base = sb.public_len();
-        let lam_w: Vec<Wire> = PHI_8_TABLE[..1 << K_SKIP]
+        use flock_core::zerocheck::multilinear::subspace_denominator_pair;
+        // The RS lows machinery (λ table + denominator + zero anchor) is
+        // emitted only when an RS child consumes it; AG children take the
+        // Tier-0 published surface instead (docs/ag-recursion-plan.md).
+        let any_rs = tapes
             .iter()
-            .map(|&v| {
-                vals.push(v);
-                sb.public_input()
-            })
-            .collect();
-        vals.push(subspace_denominator_pair(K_SKIP).1);
-        let deninv_w = sb.public_input();
-        vals.push(F128::ZERO);
-        let lag_zassert = sb.public_input();
+            .any(|tk| matches!(tk.zskip, ZskipTapeRec::Rs { .. }));
+        let rs_lam: Option<(usize, Vec<Wire>, Wire, Wire)> = any_rs.then(|| {
+            let lam_base = sb.public_len();
+            let lam_w: Vec<Wire> = PHI_8_TABLE[..1 << K_SKIP]
+                .iter()
+                .map(|&v| {
+                    vals.push(v);
+                    sb.public_input()
+                })
+                .collect();
+            vals.push(subspace_denominator_pair(K_SKIP).1);
+            let deninv_w = sb.public_input();
+            vals.push(F128::ZERO);
+            let lag_zassert = sb.public_input();
+            (lam_base, lam_w, deninv_w, lag_zassert)
+        });
+        // Per AG child, the Tier-0 public block's base — the layout
+        // [`check_ag_skip_publics`] walks.
+        let mut ag_pub_bases: Vec<Option<usize>> = Vec::new();
         for (k, (tk, rk)) in tapes.iter().zip(&regions).enumerate() {
+            // Basis-generic native pre-assert: the fold's absorbed lows
+            // ARE the skip functional at the child's own z_skip point.
             assert_eq!(
                 &fold_claims[0][n_priors + k].row.low[..],
-                &lagrange_weights_naive(K_SKIP, tk.chals[tk.zskip_ch])[..],
-                "child {k}: the fold's lagrange lows are the closed form"
+                &tk.bool_assert.z_skip.weights(K_SKIP)[..],
+                "child {k}: the fold's row lows are the skip functional"
             );
-            let lows = emit_lagrange_lows(
-                &mut sb,
-                cs.macs,
-                &lam_w,
-                deninv_w,
-                rk.zskip_w,
-                tk.chals[tk.zskip_ch],
-                &mut vals,
-                zw,
-                ow,
-                lag_zassert,
-            );
-            for (j, &lw2) in lows.iter().enumerate() {
-                sb.connect(lw2, wv(locs[0].claims[n_priors + k].row_low_v + j));
+            match (&tk.zskip, &rk.zskip) {
+                (ZskipTapeRec::Rs { ch, .. }, ZskipWires::Rs(zskip_w)) => {
+                    let (_, lam_w, deninv_w, lag_zassert) =
+                        rs_lam.as_ref().expect("the RS lows machinery is emitted");
+                    let lows = emit_lagrange_lows(
+                        &mut sb,
+                        cs.macs,
+                        lam_w,
+                        *deninv_w,
+                        *zskip_w,
+                        tk.chals[*ch],
+                        &mut vals,
+                        zw,
+                        ow,
+                        *lag_zassert,
+                    );
+                    for (j, &lw2) in lows.iter().enumerate() {
+                        sb.connect(lw2, wv(locs[0].claims[n_priors + k].row_low_v + j));
+                    }
+                    ag_pub_bases.push(None);
+                }
+                (ZskipTapeRec::Ag { seed_ch, .. }, ZskipWires::Ag { seed_w, nonce_w }) => {
+                    // Tier 0: the AG point has no transcript word and no
+                    // in-circuit derivation yet (Phase D's emit_ag_lows),
+                    // so publish the whole surface — seed and nonce
+                    // CONNECTED to the child's transcript wires, the point
+                    // as advice, and the fold's absorbed row lows
+                    // word-for-word — and let the native checker re-derive
+                    // the point and the lows.
+                    let base = sb.public_len();
+                    for (v, src) in [
+                        (tk.chals[*seed_ch], seed_w[0]),
+                        (tk.chals[*seed_ch + 1], seed_w[1]),
+                    ] {
+                        vals.push(v);
+                        let w = sb.public_input();
+                        sb.connect(w, src);
+                    }
+                    let nonce = match &tk.inner.proof {
+                        MixedProof::Ag(p) => {
+                            p.boolean.as_ref().expect("boolean side present").ag.r1_nonce
+                        }
+                        MixedProof::Rs(_) => unreachable!("an AG tape carries an AG proof"),
+                    };
+                    vals.push(F128::new(u64::from(nonce), 0));
+                    let w = sb.public_input();
+                    sb.connect(w, *nonce_w);
+                    let flock_core::lincheck::SkipPoint::Ag(pt) = tk.bool_assert.z_skip else {
+                        unreachable!("an AG tape carries an AG skip point")
+                    };
+                    for c in [pt.x, pt.y, pt.z1, pt.z2, pt.z3] {
+                        vals.push(c);
+                        sb.public_input();
+                    }
+                    for (j, &lv) in fold_claims[0][n_priors + k].row.low.iter().enumerate() {
+                        vals.push(lv);
+                        let lw2 = sb.public_input();
+                        sb.connect(lw2, wv(locs[0].claims[n_priors + k].row_low_v + j));
+                    }
+                    ag_pub_bases.push(Some(base));
+                }
+                _ => unreachable!("the region's zskip wires match the tape flavor"),
             }
             // Native pre-asserts, then the wire connects — all static
             // Product-GKR evaluations, boolean points + z_partial lows.
@@ -10620,8 +10851,22 @@ pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
                     && acc_pub.discharge_jagged(&[(chain_digest, &chain_params_j)]),
                 "the public-segment accumulator discharges all three groups"
             );
-            for (i, &v) in PHI_8_TABLE[..1 << K_SKIP].iter().enumerate() {
-                assert_eq!(built2.public[lam_base + i], v, "λ const {i}");
+            if let Some((lam_base, _, _, _)) = &rs_lam {
+                for (i, &v) in PHI_8_TABLE[..1 << K_SKIP].iter().enumerate() {
+                    assert_eq!(built2.public[*lam_base + i], v, "λ const {i}");
+                }
+            }
+            // The Tier-0 AG-skip blocks: point re-derived from the
+            // published (seed, nonce) under the child's grinding schedule,
+            // row lows re-derived from the point.
+            for (cp, base) in cps.iter().zip(&ag_pub_bases) {
+                if let Some(base) = base {
+                    check_ag_skip_publics(
+                        &built2.public,
+                        *base,
+                        cp.inner.pcs.zerocheck_grinding().ag_r1_bits(),
+                    );
+                }
             }
             for &(v, idx) in &jag_const_rec {
                 assert_eq!(built2.public[idx], v, "jagged shared constant public");
@@ -11508,11 +11753,10 @@ struct ChildTape<'p> {
     lc_msg_vs: Vec<usize>,
     lc_rounds_b: Vec<(usize, usize)>,
     eps_n: Vec<F128>,
-    // z_skip's ordinals (the boolean claims' lagrange row lows derive from
-    // it — published, checker-validated) and z_partial's value ordinal (the
-    // boolean claims' column lows — absorbed child words, connectable).
-    zskip_ch: usize,
-    zskip_fin: usize,
+    // The z_skip transcript surface, by flavor (the boolean claims' row
+    // lows derive from it), and z_partial's value ordinal (the boolean
+    // claims' column lows — absorbed child words, connectable).
+    zskip: ZskipTapeRec,
     zp_v: usize,
     // published chain ordinals
     ga_c: usize,
@@ -11560,6 +11804,30 @@ struct ChildTape<'p> {
     jag: flock_core::matrix_fold::JaggedAssertion,
 }
 
+/// The boolean z_skip's transcript surface, by flavor. RS: the one fused
+/// PoW+squeeze — the merge assembly derives the 64 Lagrange row lows from
+/// its wire in-circuit ([`emit_lagrange_lows`]). AG: the point has NO
+/// transcript word — it decodes from (seed = two squeezes, nonce = a
+/// 4-byte observe) through a STANDALONE hash, so the tape records the seed
+/// ordinals and the nonce's payload ordinal, and the consumer publishes
+/// (seed, nonce, point, row lows) for the Tier-0 native checker
+/// ([`check_ag_skip_publics`], docs/ag-recursion-plan.md).
+enum ZskipTapeRec {
+    Rs {
+        ch: usize,
+        fin: usize,
+    },
+    Ag {
+        /// chals ordinal of seed word s0 (s1 sits at `seed_ch + 1`).
+        seed_ch: usize,
+        /// The two seed squeezes' finalization ordinals.
+        seed_fins: [usize; 2],
+        /// The r₁ nonce's byte-payload ordinal (the ObserveBytes/Pow
+        /// counter — its stream word is public under `bytes_payload_mask`).
+        nonce_payload: usize,
+    },
+}
+
 impl<'p> ChildTape<'p> {
     fn new(inner: &'p MixedInner, domain: &'static [u8]) -> Self {
         use flock_core::transcript_record::{RecordingChallenger, TranscriptOp as Op};
@@ -11571,16 +11839,28 @@ impl<'p> ChildTape<'p> {
         let blake_lc = blake_r1cs.csc_lincheck_circuit();
         let lcs: Vec<&dyn flock_core::lincheck::LincheckCircuit> = vec![blake_lc];
         let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(domain));
-        let all_claims = verifier::verify_ligerito_union_circuit(
-            &union,
-            &built.shape.circuit,
-            &built.witness.public,
-            &lcs,
-            &inner.commitment,
-            proof,
-            &inner.pcs,
-            &mut rec,
-        )
+        let all_claims = match proof {
+            MixedProof::Rs(p) => verifier::verify_ligerito_union_circuit(
+                &union,
+                &built.shape.circuit,
+                &built.witness.public,
+                &lcs,
+                &inner.commitment,
+                p,
+                &inner.pcs,
+                &mut rec,
+            ),
+            MixedProof::Ag(p) => verifier::verify_ligerito_union_circuit_ag(
+                &union,
+                &built.shape.circuit,
+                &built.witness.public,
+                &lcs,
+                &inner.commitment,
+                p,
+                &inner.pcs,
+                &mut rec,
+            ),
+        }
         .expect("the mixed circuit inner verifies");
         let native_claims = all_claims
             .boolean
@@ -11614,7 +11894,24 @@ impl<'p> ChildTape<'p> {
                 })
                 .collect()
         };
-        let zc_l = find(b"flock-zerocheck-v0");
+        // The boolean zerocheck region's anchor is flavor-specific; the
+        // OTHER flavor's label must be absent (one boolean zerocheck).
+        let zc_l = match proof {
+            MixedProof::Rs(_) => {
+                assert!(
+                    find(b"flock-ag-skip-v1").is_empty(),
+                    "an RS tape carries no AG-skip region"
+                );
+                find(b"flock-zerocheck-v0")
+            }
+            MixedProof::Ag(_) => {
+                assert!(
+                    find(b"flock-zerocheck-v0").is_empty(),
+                    "an AG tape carries no RS zerocheck region"
+                );
+                find(b"flock-ag-skip-v1")
+            }
+        };
         let lc_l = find(b"flock-lincheck-v0");
         let elzc_l = find(b"flock-element-union-zc-v0");
         let el_l = find(b"flock-element-union-lc-v0");
@@ -11673,36 +11970,62 @@ impl<'p> ChildTape<'p> {
         let fin_at = |end: usize| ops[..end].iter().filter(|o| o.finalizes()).count();
 
         // ---- the boolean zerocheck slices, same shape as the leaf ----
-        let bp = proof.boolean.as_ref().expect("boolean side present");
         assert_eq!(
-            proof.element.is_some(),
+            proof.element().is_some(),
             has_el,
             "the element proof section mirrors the union's classes"
         );
-        {
-            let mut i = zc_l[0] + 1;
-            while matches!(ops[i], Op::Pow { .. }) {
+        match proof {
+            MixedProof::Rs(p) => {
+                let bp = p.boolean.as_ref().expect("boolean side present");
+                let mut i = zc_l[0] + 1;
+                while matches!(ops[i], Op::Pow { .. }) {
+                    i += 1;
+                }
+                assert!(matches!(ops[i], Op::SqueezeSlice(_)), "zc tau lo");
                 i += 1;
+                assert!(matches!(ops[i], Op::SqueezeSlice(_)), "zc tau hi");
+                i += 1;
+                assert!(matches!(ops[i], Op::ObserveSlice(64)), "round1_ab");
+                let (v0, _) = vc_at(i);
+                assert_eq!(
+                    &vals_rec[v0..v0 + 64],
+                    &bp.zerocheck.round1_ab[..],
+                    "round1_ab on the stream"
+                );
+                i += 1;
+                assert!(matches!(ops[i], Op::ObserveSlice(64)), "round1_c");
+                let (v1, _) = vc_at(i);
+                assert_eq!(
+                    &vals_rec[v1..v1 + 64],
+                    &bp.zerocheck.round1_c[..],
+                    "round1_c on the stream"
+                );
             }
-            assert!(matches!(ops[i], Op::SqueezeSlice(_)), "zc tau lo");
-            i += 1;
-            assert!(matches!(ops[i], Op::SqueezeSlice(_)), "zc tau hi");
-            i += 1;
-            assert!(matches!(ops[i], Op::ObserveSlice(64)), "round1_ab");
-            let (v0, _) = vc_at(i);
-            assert_eq!(
-                &vals_rec[v0..v0 + 64],
-                &bp.zerocheck.round1_ab[..],
-                "round1_ab on the stream"
-            );
-            i += 1;
-            assert!(matches!(ops[i], Op::ObserveSlice(64)), "round1_c");
-            let (v1, _) = vc_at(i);
-            assert_eq!(
-                &vals_rec[v1..v1 + 64],
-                &bp.zerocheck.round1_c[..],
-                "round1_c on the stream"
-            );
+            MixedProof::Ag(p) => {
+                let bp = p.boolean.as_ref().expect("boolean side present");
+                let mut i = zc_l[0] + 1;
+                while matches!(ops[i], Op::Pow { .. }) {
+                    i += 1;
+                }
+                assert!(matches!(ops[i], Op::SqueezeSlice(_)), "ag r_outer");
+                i += 1;
+                assert!(matches!(ops[i], Op::ObserveSlice(158)), "ag round1_ab");
+                let (v0, _) = vc_at(i);
+                assert_eq!(
+                    &vals_rec[v0..v0 + 158],
+                    &bp.ag.round1_ab[..],
+                    "ag round1_ab on the stream"
+                );
+                i += 1;
+                assert!(matches!(ops[i], Op::ObserveSlice(64)), "ag round1_c");
+                let (v1, _) = vc_at(i);
+                assert_eq!(
+                    &vals_rec[v1..v1 + 64],
+                    &bp.ag.round1_c[..],
+                    "ag round1_c on the stream"
+                );
+            }
         }
 
         // ---- the wiring GKR region, walked op by op ----
@@ -11713,7 +12036,7 @@ impl<'p> ChildTape<'p> {
         // (f, g, s_sigma) triple observed last]. The walk also RECORDS the
         // ordinals the assembly wires against, and the per-round `g0` advice.
         let gkr_rec = {
-            let gkr = &proof.wiring.gkr;
+            let gkr = &proof.wiring().gkr;
             let mut i = gkr_l[0] + 1;
             while matches!(ops[i], Op::Pow { .. }) {
                 i += 1;
@@ -11917,7 +12240,7 @@ impl<'p> ChildTape<'p> {
                 let (sv, _) = vc_at(i);
                 assert_eq!(
                     &vals_rec[sv..sv + 128],
-                    &proof.pcs_open.ring_switches[k].s_hat_v[..],
+                    &proof.pcs_open().ring_switches[k].s_hat_v[..],
                     "s_hat_v {k} on the stream"
                 );
                 i += 1;
@@ -11960,7 +12283,7 @@ impl<'p> ChildTape<'p> {
             }
             assert_eq!(
                 w_rounds,
-                proof.pcs_open.merged_rounds.len(),
+                proof.pcs_open().merged_rounds.len(),
                 "the W rounds fill the dense domain"
             );
             while !matches!(&ops[i], Op::Label(l) if l.as_slice() == b"flock-multipoint-twisted-v1")
@@ -11983,11 +12306,11 @@ impl<'p> ChildTape<'p> {
         let n_el_pd = if has_el { 2 } else { 0 };
         assert_eq!(
             pd_recs.len(),
-            n_el_pd + proof.wiring.gather.len(),
+            n_el_pd + proof.wiring().gather.len(),
             "pd claims = element (c, lc) + the wiring gathers"
         );
         let pd_vals: Vec<F128> = pd_recs.iter().map(|&pv| vals_rec[pv]).collect();
-        for (k, g) in proof.wiring.gather.iter().enumerate() {
+        for (k, g) in proof.wiring().gather.iter().enumerate() {
             assert!(
                 pd_vals.contains(g),
                 "gather value {k} rides a packed-direct claim"
@@ -11995,7 +12318,7 @@ impl<'p> ChildTape<'p> {
         }
 
         // ---- the multipoint: the R=2 + P>0 schedule, pinned ----
-        let fro = &proof.pcs_open.frobenius;
+        let fro = &proof.pcs_open().frobenius;
         let n_p = fro.group_values.len();
         assert!(n_p > 0, "a circuit inner carries scalar groups (P > 0)");
         {
@@ -12098,7 +12421,7 @@ impl<'p> ChildTape<'p> {
         assert_chain_replays(&ops, &trace, &chals);
 
         // ---- the open-phase walk + geometry ----
-        let lig = &proof.pcs_open.inner.ligerito;
+        let lig = &proof.pcs_open().inner.ligerito;
         assert_eq!(
             inner.commitment.cap, lig.initial_cap,
             "commitment IS the L0 cap"
@@ -12359,7 +12682,7 @@ impl<'p> ChildTape<'p> {
             inner.built.shape.circuit.cells(),
             n_log_i,
             &inner.built.witness.public,
-            &inner.proof.wiring.gather,
+            &inner.proof.wiring().gather,
             &gammas_o,
             n_el_pd,
             &vals_rec,
@@ -12393,9 +12716,22 @@ impl<'p> ChildTape<'p> {
         // statements sit at points made of its round challenges, and the
         // MatrixAssertion's surfaces (x_inner_rest, rr, z_skip, z_partial)
         // map onto the same walk — the merge node's connects consume them.
+        // Byte-payload ordinal of the op at `end` (ObserveBytes and Pow
+        // share the payload counter — see [`bytes_payload_mask`]).
+        let payload_at = |end: usize| -> usize {
+            ops[..end]
+                .iter()
+                .filter(|o| {
+                    matches!(
+                        o,
+                        Op::ObserveBytes(_) | Op::Pow { .. } | Op::LegacyPow { .. }
+                    )
+                })
+                .count()
+        };
         let (
             zc_rounds_b,
-            (zskip_ch, zskip_fin),
+            zskip,
             (outer_ch_b, outer_fin_b),
             bl_alpha,
             betas_b,
@@ -12408,21 +12744,70 @@ impl<'p> ChildTape<'p> {
             while matches!(ops[i2], Op::Pow { .. }) {
                 i2 += 1;
             }
-            assert!(matches!(ops[i2], Op::SqueezeSlice(_)), "r_skip slice");
-            i2 += 1;
-            assert!(matches!(ops[i2], Op::SqueezeSlice(_)), "r_outer slice");
-            let outer = (vc_at(i2).1, fin_at(i2));
-            i2 += 1;
-            assert!(matches!(ops[i2], Op::ObserveSlice(64)), "round1_ab");
-            i2 += 1;
-            assert!(matches!(ops[i2], Op::ObserveSlice(64)), "round1_c");
-            i2 += 1;
-            while matches!(ops[i2], Op::Pow { .. }) {
-                i2 += 1;
-            }
-            assert!(matches!(ops[i2], Op::SqueezeScalar), "z_skip");
-            let zskip = (vc_at(i2).1, fin_at(i2));
-            i2 += 1;
+            // The flavored region head. RS: two squeeze slices (r_skip +
+            // r_outer), the two 64-slices, then the fused z_skip squeeze.
+            // AG: ONE squeeze slice (r_outer), the 158+64 round-1 slices,
+            // then r₁'s 5-op surface — seed label, two seed squeezes,
+            // nonce label, the 4-byte nonce observe (the point itself has
+            // no transcript word; it decodes from seed ‖ nonce).
+            let (outer, zskip) = match proof {
+                MixedProof::Rs(_) => {
+                    assert!(matches!(ops[i2], Op::SqueezeSlice(_)), "r_skip slice");
+                    i2 += 1;
+                    assert!(matches!(ops[i2], Op::SqueezeSlice(_)), "r_outer slice");
+                    let outer = (vc_at(i2).1, fin_at(i2));
+                    i2 += 1;
+                    assert!(matches!(ops[i2], Op::ObserveSlice(64)), "round1_ab");
+                    i2 += 1;
+                    assert!(matches!(ops[i2], Op::ObserveSlice(64)), "round1_c");
+                    i2 += 1;
+                    while matches!(ops[i2], Op::Pow { .. }) {
+                        i2 += 1;
+                    }
+                    assert!(matches!(ops[i2], Op::SqueezeScalar), "z_skip");
+                    let zskip = ZskipTapeRec::Rs {
+                        ch: vc_at(i2).1,
+                        fin: fin_at(i2),
+                    };
+                    i2 += 1;
+                    (outer, zskip)
+                }
+                MixedProof::Ag(_) => {
+                    assert!(matches!(ops[i2], Op::SqueezeSlice(_)), "ag r_outer slice");
+                    let outer = (vc_at(i2).1, fin_at(i2));
+                    i2 += 1;
+                    assert!(matches!(ops[i2], Op::ObserveSlice(158)), "ag round1_ab");
+                    i2 += 1;
+                    assert!(matches!(ops[i2], Op::ObserveSlice(64)), "ag round1_c");
+                    i2 += 1;
+                    assert!(
+                        matches!(&ops[i2], Op::Label(l) if l.as_slice() == b"flock-ag-skip-r1-point"),
+                        "ag r1 seed label"
+                    );
+                    i2 += 1;
+                    assert!(matches!(ops[i2], Op::SqueezeScalar), "ag r1 seed s0");
+                    let seed_ch = vc_at(i2).1;
+                    let seed_fin0 = fin_at(i2);
+                    i2 += 1;
+                    assert!(matches!(ops[i2], Op::SqueezeScalar), "ag r1 seed s1");
+                    assert_eq!(vc_at(i2).1, seed_ch + 1, "seed words are adjacent");
+                    let seed_fin1 = fin_at(i2);
+                    i2 += 1;
+                    assert!(
+                        matches!(&ops[i2], Op::Label(l) if l.as_slice() == b"flock-ag-skip-r1-nonce"),
+                        "ag r1 nonce label"
+                    );
+                    i2 += 1;
+                    assert!(matches!(ops[i2], Op::ObserveBytes(4)), "ag r1 nonce bytes");
+                    let zskip = ZskipTapeRec::Ag {
+                        seed_ch,
+                        seed_fins: [seed_fin0, seed_fin1],
+                        nonce_payload: payload_at(i2),
+                    };
+                    i2 += 1;
+                    (outer, zskip)
+                }
+            };
             let mut zc_r: Vec<(usize, usize)> = Vec::new();
             while matches!(ops[i2], Op::ObserveScalar) && matches!(ops[i2 + 1], Op::ObserveScalar) {
                 let mut squeeze_i = i2 + 2;
@@ -12512,7 +12897,29 @@ impl<'p> ChildTape<'p> {
                     "rr {j} is the located lc round, reversed"
                 );
             }
-            assert_eq!(chals[zskip_ch], bool_assert.z_skip.phi8(), "z_skip located");
+            // The z_skip pin, by flavor: RS locates the fused squeeze; AG
+            // has no point word — rebuild the seed from the two located
+            // squeezes, decode H(seed ‖ nonce) under the child's grinding
+            // schedule, and pin the assertion's point to the decode.
+            match (proof, &zskip) {
+                (MixedProof::Rs(_), ZskipTapeRec::Rs { ch, .. }) => {
+                    assert_eq!(chals[*ch], bool_assert.z_skip.phi8(), "z_skip located");
+                }
+                (MixedProof::Ag(p), ZskipTapeRec::Ag { seed_ch, .. }) => {
+                    let nonce = p.boolean.as_ref().expect("boolean side present").ag.r1_nonce;
+                    let pt = decode_ag_point(
+                        &ag_seed_bytes(chals[*seed_ch], chals[*seed_ch + 1]),
+                        nonce,
+                        inner.pcs.zerocheck_grinding().ag_r1_bits(),
+                    );
+                    assert_eq!(
+                        bool_assert.z_skip,
+                        flock_core::lincheck::SkipPoint::Ag(pt),
+                        "z_skip is the r1 point decoded from the located seed + nonce"
+                    );
+                }
+                _ => unreachable!("the tape's zskip record matches the proof flavor"),
+            }
             assert_eq!(
                 &vals_rec[zp_v..zp_v + 64],
                 &bool_assert.z_partial[..],
@@ -12806,7 +13213,7 @@ impl<'p> ChildTape<'p> {
         }
 
         // ---- the residual pairing's rotation (lane-major inners) ----
-        let yr_len = proof.pcs_open.inner.ligerito.final_proof.yr.len() / 2;
+        let yr_len = proof.pcs_open().inner.ligerito.final_proof.yr.len() / 2;
         let lane_major = geo[0].row_words < geo[0].lanes;
         let w_resid: Vec<RoundRec> = if lane_major {
             let k_rot = w_rounds.len() - levels[0].fold_fins.len();
@@ -12862,8 +13269,7 @@ impl<'p> ChildTape<'p> {
             lc_msg_vs,
             lc_rounds_b,
             eps_n,
-            zskip_ch,
-            zskip_fin,
+            zskip,
             zp_v,
             ga_c,
             ga_fin,
@@ -13061,6 +13467,19 @@ impl ChildSlots {
 /// What one emitted child region hands back: where its public block starts,
 /// the walk counts the checker needs, and the assertion-emission wires the
 /// mvp11 merge node CONNECTS the fold region's claim words to.
+/// A child region's z_skip wires, by flavor. RS: the one fused-squeeze
+/// output — the merge assembly derives the 64 Lagrange row lows from it
+/// IN-CIRCUIT ([`emit_lagrange_lows`]; no publish, no checker rebuild).
+/// AG: the seed squeezes' outputs and the r₁ nonce's stream-word wire —
+/// the merge assembly publishes them beside the point and the row lows,
+/// and the Tier-0 checker ([`check_ag_skip_publics`]) re-derives the point
+/// and the lows natively (docs/ag-recursion-plan.md; the in-circuit
+/// derivation is Phase D's `emit_ag_lows`).
+enum ZskipWires {
+    Rs(Wire),
+    Ag { seed_w: [Wire; 2], nonce_w: Wire },
+}
+
 struct ChildRegion {
     pub_base: usize,
     n_query_pub: usize,
@@ -13087,9 +13506,8 @@ struct ChildRegion {
     /// Reported matrix evaluations, constrained by the in-circuit scalar
     /// closure and connected to the aggregate fold's fresh claim values.
     mat_eval_w: Vec<(Wire, Wire)>,
-    /// The z_skip squeeze wire — the merge assemblies derive the lagrange
-    /// row lows from it IN-CIRCUIT (no publish, no checker rebuild).
-    zskip_w: Wire,
+    /// The z_skip surface, by flavor — see [`ZskipWires`].
+    zskip: ZskipWires,
     /// The residual close-out's prefix slot (and width) — reusable by a
     /// caller emitting more prefix products into the same builder.
     pf: (flock_core::circuit::builder::SlotId, usize),
@@ -13624,13 +14042,22 @@ fn emit_child_region(
     // γ^{256+k}·eq(ρ,ρ″)·(w_k·DP_k) over the P groups; claim == expect
     // publishes as a zero-delta. ĝ's inverse-Frobenius points ride as advice
     // bound by forward squaring deltas.
-    use flock_core::zerocheck::univariate_skip_optimized::{
-        medium_challenges_ghash, small_challenges_ghash,
+    // The c-point's 7 baked inner constants are the zerocheck's friendly
+    // challenges — the RS ghash set or the AG set, by the tape's flavor
+    // (baked constants are free in-circuit either way).
+    let t_vals_b: Vec<F128> = match &ct.zskip {
+        ZskipTapeRec::Rs { .. } => {
+            use flock_core::zerocheck::univariate_skip_optimized::{
+                medium_challenges_ghash, small_challenges_ghash,
+            };
+            let mut v: Vec<F128> = Vec::new();
+            v.extend_from_slice(&small_challenges_ghash());
+            v.extend_from_slice(&medium_challenges_ghash());
+            v
+        }
+        ZskipTapeRec::Ag { .. } => flock_core::zerocheck::ag_skip::friendly_challenges().to_vec(),
     };
-    let mut t_vals_b: Vec<F128> = Vec::new();
-    t_vals_b.extend_from_slice(&small_challenges_ghash());
-    t_vals_b.extend_from_slice(&medium_challenges_ghash());
-    assert_eq!(t_vals_b.len(), 7, "the seven baked ghash weights");
+    assert_eq!(t_vals_b.len(), 7, "the seven baked inner constants");
 
     // The statements' points as (native value, wire) pairs, pinned against
     // the native claims: ab = [LAST lc round | zc mlv rounds 1..1+ν | lc
@@ -13667,9 +14094,14 @@ fn emit_child_region(
             if k2 < 7 {
                 (t_vals_b[k2], cw(sb, vals, consts, t_vals_b[k2]))
             } else {
+                // The exact (row, word) map — a FUSED slice squeeze (the
+                // AG r_outer grind) reserves one word per row for the PoW
+                // predicate, so the naive 4-per-row split misaddresses.
                 let j = k2 - 7;
-                let sq2 = &trace.squeezes[outer_fin_b];
-                (chals[outer_ch_b + j], outs[sq2[j / 4]][j % 4])
+                (
+                    chals[outer_ch_b + j],
+                    squeeze_word_wire(&outs, trace, outer_fin_b, j),
+                )
             }
         })
         .collect();
@@ -14083,7 +14515,33 @@ fn emit_child_region(
             .collect(),
         b_zpartial_w: (0..64).map(|i| wv(ct.zp_v + i)).collect(),
         mat_eval_w,
-        zskip_w: outs[trace.squeezes[ct.zskip_fin][0]][0],
+        zskip: match &ct.zskip {
+            ZskipTapeRec::Rs { fin, .. } => ZskipWires::Rs(outs[trace.squeezes[*fin][0]][0]),
+            ZskipTapeRec::Ag {
+                seed_fins,
+                nonce_payload,
+                ..
+            } => {
+                let nonce_wi = stream
+                    .words
+                    .iter()
+                    .position(|w| {
+                        matches!(
+                            w,
+                            flock_core::transcript_record::StreamWord::Bytes { payload, word: 0 }
+                                if *payload == *nonce_payload
+                        )
+                    })
+                    .expect("the r1 nonce rides one stream word");
+                ZskipWires::Ag {
+                    seed_w: [
+                        squeeze_word_wire(&outs, trace, seed_fins[0], 0),
+                        squeeze_word_wire(&outs, trace, seed_fins[1], 0),
+                    ],
+                    nonce_w: ww[nonce_wi].expect("the nonce payload word is wired"),
+                }
+            }
+        },
         pf: (pfslot, pf_w),
         child_pub_w: pub_w,
     }
@@ -14193,7 +14651,7 @@ fn check_child_region(public: &[F128], ct: &ChildTape<'_>, r: &ChildRegion) -> u
     // the mu point coordinates, matched against the native claim.
     let sig_base = mp_base + 5 + 2 * ct.levels.len() * ct.yr_len + 2;
     assert_eq!(
-        public[sig_base], ct.inner.proof.wiring.gkr.s_sigma_eval,
+        public[sig_base], ct.inner.proof.wiring().gkr.s_sigma_eval,
         "the emitted sigma value is the proof's deferred evaluation"
     );
     let sig_rho = &public[sig_base + 1..sig_base + 1 + ct.mu_i];
@@ -14888,6 +15346,87 @@ fn read_acc_entry(
             value,
         },
     )
+}
+
+/// The Tier-0 AG-skip checker (docs/ag-recursion-plan.md, Phase B): walk
+/// one AG child's published block `[seed0, seed1, nonce, point ×5,
+/// lows ×64]` — re-derive the point from `H(seed ‖ nonce)` under the
+/// child's grinding schedule (fused PoW + decode on ONE hash) and the row
+/// lows as the point's base evaluation functional. The seed and nonce
+/// publics are wire-connected to the child's transcript and the lows
+/// publics to the fold's absorbed row lows, so this closes the same
+/// binding [`emit_lagrange_lows`] gives an RS child in-circuit. Returns
+/// the number of public words consumed.
+fn check_ag_skip_publics(public: &[F128], base: usize, ag_r1_bits: Option<u32>) -> usize {
+    let seed = ag_seed_bytes(public[base], public[base + 1]);
+    let nonce_word = public[base + 2];
+    assert_eq!(nonce_word.hi, 0, "the nonce word's high half is zero");
+    let nonce = u32::try_from(nonce_word.lo).expect("the nonce fits 32 bits");
+    let budget = match ag_r1_bits {
+        Some(_) => flock_core::zerocheck::ag_skip::R1_FUSED_ATTEMPT_BUDGET,
+        None => flock_core::genus95_curve_code::SAMPLE_ATTEMPT_BUDGET,
+    };
+    assert!(nonce < budget, "the nonce is inside the prover's scan budget");
+    let pt = decode_ag_point(&seed, nonce, ag_r1_bits);
+    for (j, c) in [pt.x, pt.y, pt.z1, pt.z2, pt.z3].into_iter().enumerate() {
+        assert_eq!(public[base + 3 + j], c, "published AG point coord {j}");
+    }
+    let bf = flock_core::genus95_curve_code::base_evaluation_functional(&pt)
+        .expect("the base functional exists at a decoded point");
+    for j in 0..64 {
+        assert_eq!(public[base + 8 + j], bf[j], "published AG row low {j}");
+    }
+    72
+}
+
+/// The Tier-0 checker rejects every tampered surface of the published AG
+/// block: a shifted nonce (fails the fused PoW+decode — and if a shifted
+/// nonce happens to decode, its point differs and the coord pin catches
+/// it), a tampered point coordinate, a tampered row low, an out-of-budget
+/// nonce, and a tampered seed word. The honest block passes and consumes
+/// exactly 72 words.
+#[test]
+fn ag_skip_publics_checker_rejects_tampers() {
+    use flock_core::genus95_curve_code::{
+        base_evaluation_functional, evaluation_point_from_nonce_pow,
+    };
+    use flock_core::zerocheck::ag_skip::{R1_FUSED_ATTEMPT_BUDGET, R1_POW_BITS};
+    let (s0, s1) = (F128::new(0xA6, 0x51), F128::new(0x1F, 0xB3));
+    let seed = ag_seed_bytes(s0, s1);
+    let (nonce, pt) = (0..R1_FUSED_ATTEMPT_BUDGET)
+        .find_map(|n| {
+            evaluation_point_from_nonce_pow(&seed, n, HashKind::Blake3, R1_POW_BITS)
+                .map(|p| (n, p))
+        })
+        .expect("a valid fused nonce exists in the budget");
+    let bf = base_evaluation_functional(&pt).expect("the functional exists at a sampled point");
+    let base = 3usize; // the checker walks from an arbitrary base
+    let mut public = vec![F128::ZERO; base];
+    public.extend([s0, s1, F128::new(u64::from(nonce), 0)]);
+    public.extend([pt.x, pt.y, pt.z1, pt.z2, pt.z3]);
+    public.extend((0..64).map(|j| bf[j]));
+    assert_eq!(
+        check_ag_skip_publics(&public, base, Some(R1_POW_BITS)),
+        72,
+        "the honest block passes"
+    );
+
+    let rejects = |mutate: &dyn Fn(&mut [F128])| -> bool {
+        let mut bad = public.clone();
+        mutate(&mut bad);
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            check_ag_skip_publics(&bad, base, Some(R1_POW_BITS))
+        }))
+        .is_err()
+    };
+    assert!(rejects(&|p| p[base] += F128::ONE), "tampered seed word");
+    assert!(rejects(&|p| p[base + 2] += F128::ONE), "shifted nonce");
+    assert!(
+        rejects(&|p| p[base + 2] = F128::new(u64::from(R1_FUSED_ATTEMPT_BUDGET), 0)),
+        "out-of-budget nonce"
+    );
+    assert!(rejects(&|p| p[base + 4] += F128::ONE), "tampered point coord");
+    assert!(rejects(&|p| p[base + 8 + 17] += F128::ONE), "tampered row low");
 }
 
 /// Walk the published fold blocks from `tail0`: both endpoint deltas zero
@@ -18919,7 +19458,7 @@ fn chain_tower_m32_headline() {
             / 1024.0,
     );
     proof_census("internal node", &node.proof, &node.pcs);
-    proof_census("chain leaf (m32 Fast)", &cp0.inner.proof, &cp0.inner.pcs);
+    proof_census_mixed("chain leaf (m32 Fast)", &cp0.inner.proof, &cp0.inner.pcs);
     proof_census("FL node", &fl0.lo.proof, &fl0.lo.pcs);
 }
 

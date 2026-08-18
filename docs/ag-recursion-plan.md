@@ -12,7 +12,7 @@ than optional; the in-circuit AG lows (Phase D) are the *successor* of
 flip-in-place + delete, not permanent parallel API; and Phase F lists the
 removal blockers (x86 + CUDA AG kernels chief among them).
 
-## Status + next-session entry point (updated 2026-08-18)
+## Status + next-session entry point (updated 2026-08-18, evening 2)
 
 DONE: **Phase A complete** (commit d6a0eb1 — circuit-AG entries
 `R1csProofCircuitMergedAg` / `prove_fast_ligerito_union_circuit_ag` /
@@ -20,49 +20,73 @@ DONE: **Phase A complete** (commit d6a0eb1 — circuit-AG entries
 to the PowMask convention; `cross_class_circuit_ag_roundtrip` green).
 **Phase B slice 1 done** (5a35c4e — `chain_leaf_ag_roundtrip`: the real
 chain shape proves under AG, RS 17.6 vs AG 12.3 ms at m22 dev size).
+**Phase B COMPLETE** (this branch): the tower's chain leaf proves under AG
+on aarch64 and the whole pipeline replays it. What landed, all in
+`crates/flock-prover/src/tower.rs` unless noted:
 
-NEXT — **Phase B remainder**, all in `crates/flock-prover/src/tower.rs`
-(line refs at 5a35c4e):
+1. `MixedProof` flavor enum (`Rs | Ag`) with `wiring()/pcs_open()/element()`
+   accessors; `build_chain_proof` proves AG behind the private
+   `leaf_zc_ag()` switch — aarch64 only (the round-1 kernel), with
+   `TOWER_LEAF_ZC=rs` as the A/B override. No public TowerConfig change.
+2. `ChildTape::new` AG arm: flavored recording verify; anchor
+   `flock-ag-skip-v1` (and the OTHER flavor's label asserted absent);
+   round-1 pins ObserveSlice(158)/(64) vs `bp.ag.round1_ab/_c`; the
+   locator walk's flavored head (ONE r_outer slice; r₁'s 5-op surface:
+   point label + 2 seed squeezes + nonce label + ObserveBytes(4), recorded
+   as `ZskipTapeRec::Ag { seed_ch, seed_fins, nonce_payload }`); the
+   `.phi8()` pin replaced by the native point pin (seed rebuilt from the
+   located chals, `decode_ag_point` under
+   `pcs.zerocheck_grinding().ag_r1_bits()`, compared to
+   `bool_assert.z_skip`).
+3. Tier 0 landed as PUBLISH-THE-WHOLE-SURFACE: per AG child the FL
+   publishes `[seed₂ (wire-connected), nonce (wire-connected to the
+   ObserveBytes stream word), point₅ (advice), row-lows₆₄ (wire-connected
+   to the fold's absorbed lows)]` — 72 publics/child — and
+   `check_ag_skip_publics` re-derives point + lows natively (fused decode,
+   budget bound, functional). `emit_lagrange_lows` + the λ-table publics
+   are now emitted only for RS children. The envelope publics cap (5684)
+   absorbed the delta — no envelope change needed at k=2.
+4. c-point baked constants: flavored — `ag_skip::friendly_challenges()`
+   for AG children (same 7-slot shape as the ghash set).
+5. Tests: the WHOLE existing tower suite runs AG on aarch64 (leaf
+   roundtrip+tampers, tape pins, region-alone, FL, internal, spine
+   converges, e2e+lane) — the RS arm stays covered by the x86 CI arm and
+   the `TOWER_LEAF_ZC=rs` knob; new `ag_skip_publics_checker_rejects_tampers`
+   (seed/nonce/budget/point/low tampers all rejected).
 
-1. `MixedInner.proof` becomes a flavor enum (`Rs(R1csProofCircuitMerged) |
-   Ag(R1csProofCircuitMergedAg)`), with accessors for the shared fields
-   (lincheck / wiring / pcs_open) so the non-zerocheck pins stay one code
-   path. `build_chain_proof` proves AG behind a private flavor switch
-   (flip-in-place — no public TowerConfig change).
-2. `ChildTape::new` AG arm:
-   - native verify under the recorder → `verify_ligerito_union_circuit_ag`
-     (11451); assertions still from `inner.work`.
-   - region anchor `find(b"flock-ag-skip-v1")` instead of
-     `flock-zerocheck-v0` (11494).
-   - round-1 pins: `ObserveSlice(158)`/`(64)` against `bp.ag.round1_ab/_c`
-     (11553-11583).
-   - the locator walk (12284-12354): ONE `SqueezeSlice` (r_outer — RS has
-     two: r_skip + r_outer); then in place of `[Pow] + SqueezeScalar`
-     z_skip: `Label("flock-ag-skip-r1-point") + SqueezeScalar ×2 +
-     Label("flock-ag-skip-r1-nonce") + ObserveBytes(4)`. The mlv loop code
-     is unchanged. After `z_partial`, the lincheck fresh-skip is the same
-     5-op AG shape (label + 2 squeezes + label + ObserveBytes(4)).
-   - the `.phi8()` pin (12392) → native point pin: rebuild the 32-byte seed
-     from the two located seed chals (`ag_skip::r1_seed` layout: s0.lo,
-     s0.hi, s1.lo, s1.hi LE), run `evaluation_point_from_nonce_pow(seed,
-     proof.r1_nonce, kind, R1_POW_BITS)`, compare to
-     `bool_assert.z_skip` (`SkipPoint::Ag`).
-   - GOTCHA: the nonce payload rides the STREAM WORDS (`ww`), not
-     `vals_rec` (ObserveBytes contributes no vals entries);
-     `bytes_payload_mask` marks it public by default — desired here.
-3. `ChildRegion`: for AG children skip `emit_lagrange_lows` (FL connects at
-   10201-10215) and instead publish (seed₂, nonce, point₅) via the
-   `FoldPub`/`AlphaRec` publics pattern (14558/14244); extend the FL
-   checker (sibling of `check_fold_publics`, 14770) to recompute the point
-   from (seed, nonce) and `base_evaluation_functional(point)` against the
-   fold row-lows. The fold tape itself is unchanged (64-wide lows both
-   bases). Publics count (5684 at tower.rs:362) moves — it is shape, not a
-   pinned digest.
-4. c-point baked constants: the 7 ghash inner constants →
-   `ag_skip::friendly_challenges()` (13504-13511) for AG children.
-5. Tests: FL node over AG leaves (twin of the existing FL roundtrip),
-   shape-diff, capacity asserts, then `tower_online_bench` with the AG
-   leaf (`CHAIN_BLOCKS=262144`; expect ~−100 ms/leaf at m32).
+Two bugs flushed en route (both latent, both would bite anything AG):
+- `RecordingChallenger` did not forward `hash_kind()` — the trait default
+  (SHA-256) silently diverged the AG nonce decode from the BLAKE3
+  transcript during recording (flock-core/src/transcript_record.rs).
+  Nothing had ever recorded an AG proof.
+- The c-point r_outer wires used a naive 4-words-per-row squeeze map;
+  a FUSED slice squeeze (the AG initial grind) reserves one word per row
+  for the PoW predicate, so the map misaddressed. Now
+  `squeeze_word_wire` (the exact map) everywhere.
+
+m32 A/B (tower_online_bench, CHAIN_BLOCKS=262144, warm medians, same box
+same session — `TOWER_LEAF_ZC=rs` vs default): leaf online 520.9 → 469.8 ms
+(prove 475.8 → 427.7, −10.1%); amortised 762 → 688 ms/leaf = 344k → 381k
+compressions/sec (+10.7%). The internal/spine arms flipped between the two
+runs (wide bands on one arm — box noise); the leaf bands are tight, so the
+leaf delta is the solid number. OPEN ATTRIBUTION: the recorded union-AG
+margin (466.0 → 367.3 at m32, −98.7 ms) predicted ~−100 ms; the leaf shows
+−48 on the prove. The RS arm matches its union twin (475.8 ≈ 466 + wiring),
+the AG arm runs ~50 ms above its (427.7 vs ~377) — the forced honest-zero
+witness mode inside the circuit-AG prove path is the prime suspect
+(the RS arm keeps pooled-dirty pages). Worth one attribution pass before
+Phase C multiplies it across the outers.
+
+NEXT — **Phase C (outers-AG)**: the same five items on
+`RealTape`/`RealRegion` (`zc_l` find at 6222, round-1 pins ~6300s, walk
+~6848s, `zskip_ch/zskip_fin` fields at 7422/8764, `emit_lagrange_lows`
+call in `build_node_outer_app` at ~17000s, the ghash constants at 8273) +
+mixed-class-with-element AG entries. The envelope moves: re-check nu* ≤ 14
+per b3 slot, m* = 29 content, the publics cap (now shared with the FL's AG
+blocks), internal/spine digest equality, `chain_spine_converges`. Note the
+mixed outers carry an ELEMENT class — the AG flavor forces honest-zero
+witness mode (already enforced in the shared prove body). Then Phase F's
+long-lead kernels (x86 AVX-512 + CUDA round-1) can start.
 
 Memory track: `recursion-track.md` (machine-local) mirrors this and adds
 session gotchas. The two survey reports' full maps are summarized in the
