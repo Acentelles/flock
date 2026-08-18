@@ -72,7 +72,10 @@ jobs:
 
       - name: Run vector-validated CUDA tests
         # Serial on purpose — see the run-tests note in cuda-ghash/Makefile.
-        run: make -C cuda-ghash run-tests
+        # -k: keep going past a failing target so one run reports every
+        # failing test instead of only the first; the step still fails if
+        # any target failed.
+        run: make -C cuda-ghash -k run-tests
 
       - name: GPU prove -> Rust verify roundtrips (m=22/32/33)
         # The name filter selects exactly the fixed-size roundtrips; the
