@@ -10735,13 +10735,13 @@ pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
                     ag_pub_bases.push(None);
                 }
                 (ZskipTapeRec::Ag { seed_ch, .. }, ZskipWires::Ag { seed_w, nonce_w }) => {
-                    // Tier 0: the AG point has no transcript word and no
-                    // in-circuit derivation yet (Phase D's emit_ag_lows),
-                    // so publish the whole surface — seed and nonce
-                    // CONNECTED to the child's transcript wires, the point
-                    // as advice, and the fold's absorbed row lows
-                    // word-for-word — and let the native checker re-derive
-                    // the point and the lows.
+                    // TIER 1 (phase D): publish [seed₂, nonce, point₅,
+                    // lows₆₄] — seed/nonce/lows wire-connected as before —
+                    // and BIND the point in-circuit
+                    // ([`emit_ag_point_binding`]: the two BLAKE3 decode
+                    // rows, the fused-PoW row, the fiber algebra over the
+                    // published coordinate wires). The native checker keeps
+                    // only `lows == bf(point)`.
                     let base = sb.public_len();
                     for (v, src) in [
                         (tk.chals[*seed_ch], seed_w[0]),
@@ -10763,15 +10763,33 @@ pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
                     let flock_core::lincheck::SkipPoint::Ag(pt) = tk.bool_assert.z_skip else {
                         unreachable!("an AG tape carries an AG skip point")
                     };
-                    for c in [pt.x, pt.y, pt.z1, pt.z2, pt.z3] {
+                    let pt_w: [Wire; 5] = [pt.x, pt.y, pt.z1, pt.z2, pt.z3].map(|c| {
                         vals.push(c);
-                        sb.public_input();
-                    }
+                        sb.public_input()
+                    });
                     for (j, &lv) in fold_claims[0][n_priors + k].row.low.iter().enumerate() {
                         vals.push(lv);
                         let lw2 = sb.public_input();
                         sb.connect(lw2, wv(locs[0].claims[n_priors + k].row_low_v + j));
                     }
+                    emit_ag_point_binding(
+                        &mut sb,
+                        cs.q.b3,
+                        cs.q.pow,
+                        cs.macs,
+                        iv2,
+                        *seed_w,
+                        *nonce_w,
+                        &pt_w,
+                        [tk.chals[*seed_ch], tk.chals[*seed_ch + 1]],
+                        nonce,
+                        &pt,
+                        cps[k].inner.pcs.zerocheck_grinding().ag_r1_bits(),
+                        &mut vals,
+                        &mut consts,
+                        zw,
+                        ow,
+                    );
                     ag_pub_bases.push(Some(base));
                 }
                 _ => unreachable!("the region's zskip wires match the tape flavor"),
@@ -11065,17 +11083,10 @@ pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
                     assert_eq!(built2.public[*lam_base + i], v, "λ const {i}");
                 }
             }
-            // The Tier-0 AG-skip blocks: point re-derived from the
-            // published (seed, nonce) under the child's grinding schedule,
-            // row lows re-derived from the point.
-            for (cp, base) in cps.iter().zip(&ag_pub_bases) {
-                if let Some(base) = base {
-                    check_ag_skip_publics(
-                        &built2.public,
-                        *base,
-                        cp.inner.pcs.zerocheck_grinding().ag_r1_bits(),
-                    );
-                }
+            // The AG-skip blocks: the decode is in-circuit since phase D;
+            // the checker holds the row lows to the published point.
+            for base in ag_pub_bases.iter().flatten() {
+                check_ag_skip_publics(&built2.public, *base);
             }
             for &(v, idx) in &jag_const_rec {
                 assert_eq!(built2.public[idx], v, "jagged shared constant public");
@@ -11791,6 +11802,277 @@ fn emit_element_reported_check(
 }
 
 /// **THE LAGRANGE ROW LOWS in-circuit (round 4).** The 64 weights
+/// PHASE D (docs/ag-recursion-plan.md): the AG z_skip point's IN-CIRCUIT
+/// binding — the Tier-1 successor of the Tier-0 decode checker. From the
+/// child's transcript wires (the two seed squeezes and the absorbed 4-byte
+/// nonce), two BLAKE3 rows recompute the nonce-seed `ns = H(seed ‖ nonce)`
+/// and its first XOF block; a PowMask row enforces the fused grinding
+/// target on `ns[16..32]` (the Phase-A convention alignment cashing in);
+/// and the published point coordinates are constrained to a fiber point
+/// over the XOF-derived `x`:
+///
+///   x = XOF word 0                       (a wire connect)
+///   t² + t = x³ + x                      (advice t — the factored base
+///   y² + u·y = x·u·t,   u = x + 1        fiber with s eliminated: y = u·s
+///                                        turns both AS levels inverse-free)
+///   D₀·(z₁² + z₁) = Σⱼ P₀ⱼ(x)·yʲ         (denominators cleared; D₀, D₁
+///   D₀D₁·(z₂² + z₂) = D₁·Σⱼ<₃ P₁ⱼ·yʲ     guarded nonzero by advice
+///                       + D₀·P₁₃·y³       inverses against a fixed ONE)
+///   D₀·(z₃² + z₃) = Σⱼ P₂ⱼ(x)·yʲ
+///
+/// CANONICITY IS RELAXED BY DESIGN: any of the ≤ 32 fiber points over `x`
+/// satisfies these rows — the sampler's slot/choice bits are deliberately
+/// unbound, and the fiber's 5 bits of prover freedom are repaid by the
+/// all-explicit `R1_POW_BITS = 9` fused target (the schedule constant
+/// moved with this emitter; the total stays `bits_for(474)`). The one
+/// checker item left on this surface is `lows == bf(point)`
+/// ([`check_ag_skip_publics`]).
+#[allow(clippy::too_many_arguments)]
+fn emit_ag_point_binding(
+    sb: &mut ShapeBuilder,
+    b3: flock_core::circuit::builder::SlotId,
+    pow: flock_core::circuit::builder::SlotId,
+    macs: flock_core::circuit::builder::SlotId,
+    iv: [Wire; 2],
+    seed_w: [Wire; 2],
+    nonce_w: Wire,
+    pt_w: &[Wire; 5],
+    seed_n: [F128; 2],
+    nonce_n: u32,
+    pt_n: &flock_core::genus95_curve_code::EvaluationPoint,
+    ag_r1_bits: Option<u32>,
+    vals: &mut Vec<F128>,
+    consts: &mut Vec<(F128, Wire)>,
+    zw: Wire,
+    ow: Wire,
+) {
+    use crate::r1cs_hashes::blake3 as b3m;
+    let flags = CHUNK_START | CHUNK_END | ROOT;
+    // ---- native replicas of the decode chain the rows must reproduce ----
+    let seed_bytes = ag_seed_bytes(seed_n[0], seed_n[1]);
+    let mut block36 = [0u8; 64];
+    block36[..32].copy_from_slice(&seed_bytes);
+    block36[32..36].copy_from_slice(&nonce_n.to_le_bytes());
+    let words36: [u32; 16] =
+        std::array::from_fn(|i| u32::from_le_bytes(block36[4 * i..4 * i + 4].try_into().unwrap()));
+    let ns16 = b3m::blake3_compress(&IV, &words36, 0, 36, flags);
+    let ns_bytes: [u8; 32] = std::array::from_fn(|i| (ns16[i / 4] >> (8 * (i % 4))) as u8);
+    let mut block32 = [0u8; 64];
+    block32[..32].copy_from_slice(&ns_bytes);
+    let words32: [u32; 16] =
+        std::array::from_fn(|i| u32::from_le_bytes(block32[4 * i..4 * i + 4].try_into().unwrap()));
+    let xof16 = b3m::blake3_compress(&IV, &words32, 0, 32, flags);
+    let x_native = F128::new(
+        u64::from(xof16[0]) | (u64::from(xof16[1]) << 32),
+        u64::from(xof16[2]) | (u64::from(xof16[3]) << 32),
+    );
+    assert_eq!(x_native, pt_n.x, "the XOF x is the point's x");
+    if let Some(bits) = ag_r1_bits {
+        assert!(
+            flock_core::challenger::has_leading_zero_bits(&ns_bytes[16..32], bits),
+            "the honest nonce clears the fused target"
+        );
+    }
+    let (x, y) = (pt_n.x, pt_n.y);
+    let u_n = x + F128::ONE;
+    let t_n = if x == F128::ZERO || u_n == F128::ZERO {
+        F128::ZERO
+    } else {
+        let s = y * u_n.inv();
+        u_n * (s * s + s) * x.inv()
+    };
+    assert_eq!(t_n * t_n + t_n, x * x * x + x, "t solves the base AS level");
+    assert_eq!(y * y + u_n * y, x * u_n * t_n, "y sits on the fiber over x");
+    let mut xp = [F128::ONE; 12];
+    for d in 1..12 {
+        xp[d] = xp[d - 1] * x;
+    }
+    let d0_n = xp[10] + xp[4] + F128::ONE;
+    let d1_n = xp[11] + xp[10] + xp[5] + xp[4] + xp[1] + F128::ONE;
+    let (d0_inv_n, d1_inv_n) = (
+        d0_n.inv(), // the honest decode rejected D₀ = 0 nonces
+        d1_n.inv(),
+    );
+    // Native replicas of the cleared AS equations (mirroring the sampler's
+    // rhs masks) — the method-note discipline before the rows land.
+    let pv = |degs: &[usize], plus_one: bool| -> F128 {
+        degs.iter().fold(
+            if plus_one { F128::ONE } else { F128::ZERO },
+            |acc, &d| acc + xp[d],
+        )
+    };
+    let yp_n = [F128::ONE, y, y * y, y * y * y];
+    let z_n = [pt_n.z1, pt_n.z2, pt_n.z3];
+    for (i, (zi, p)) in [
+        (
+            z_n[0],
+            [
+                pv(&[9, 6, 5, 4, 3, 2], false),
+                pv(&[5, 4, 3, 2], true),
+                pv(&[4, 3, 2], false),
+                pv(&[3], true),
+            ],
+        ),
+        (
+            z_n[2],
+            [
+                pv(&[6, 4, 3, 2], false),
+                pv(&[5], true),
+                pv(&[3, 2, 1], true),
+                pv(&[3, 2], false),
+            ],
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let rhs: F128 = (0..4).fold(F128::ZERO, |acc, j| acc + p[j] * yp_n[j]);
+        assert_eq!(
+            d0_n * (zi * zi + zi),
+            rhs,
+            "cleared AS level {} closes at the honest point",
+            [1, 3][i]
+        );
+    }
+    {
+        let p1_n = [
+            pv(&[8, 5, 4, 3, 2, 1], false),
+            pv(&[6, 5, 2, 1], false),
+            pv(&[3, 1], false),
+            pv(&[4, 2, 1], false),
+        ];
+        let inner: F128 = (0..3).fold(F128::ZERO, |acc, j| acc + p1_n[j] * yp_n[j]);
+        assert_eq!(
+            d0_n * d1_n * (z_n[1] * z_n[1] + z_n[1]),
+            d1_n * inner + d0_n * p1_n[3] * yp_n[3],
+            "cleared AS level 2 closes at the honest point"
+        );
+    }
+
+    // ---- the two BLAKE3 rows + the fused-PoW row ----
+    let params36 = cw(sb, vals, consts, pack_params(0, 36, flags));
+    let ns_out = sb.gate(
+        b3,
+        &[iv[0], iv[1], seed_w[0], seed_w[1], nonce_w, zw, params36],
+    );
+    let params32 = cw(sb, vals, consts, pack_params(0, 32, flags));
+    let xof_out = sb.gate(
+        b3,
+        &[iv[0], iv[1], ns_out[0], ns_out[1], zw, zw, params32],
+    );
+    sb.connect(xof_out[0], pt_w[0]);
+    if let Some(bits) = ag_r1_bits {
+        emit_pow_checks(
+            sb,
+            b3,
+            pow,
+            iv,
+            &[([ns_out[1], nonce_w], bits)],
+            vals,
+            consts,
+        );
+    }
+
+    // ---- the fiber algebra over the published point wires ----
+    let zass = cw(sb, vals, consts, F128::ZERO);
+    let one_w = cw(sb, vals, consts, F128::ONE);
+    let (xw, yw) = (pt_w[0], pt_w[1]);
+    let zwires = [pt_w[2], pt_w[3], pt_w[4]];
+    // x-powers x²..x^11 (x⁰/x¹ are ow/xw).
+    let mut xpw = [ow; 12];
+    xpw[1] = xw;
+    for d in 2..12 {
+        xpw[d] = sb.gate(macs, &[zw, xpw[d - 1], xw])[0];
+    }
+    // y-powers y², y³.
+    let y2w = sb.gate(macs, &[zw, yw, yw])[0];
+    let y3w = sb.gate(macs, &[zw, y2w, yw])[0];
+    let ypw = [ow, yw, y2w, y3w];
+    // C1: t² + t + x³ + x == 0.
+    vals.push(t_n);
+    let tw = sb.input();
+    let t2w = sb.gate(macs, &[zw, tw, tw])[0];
+    let mut c1 = sb.gate(macs, &[t2w, tw, ow])[0];
+    c1 = sb.gate(macs, &[c1, xpw[3], ow])[0];
+    c1 = sb.gate(macs, &[c1, xw, ow])[0];
+    sb.connect(c1, zass);
+    // C2: y² + u·y + x·u·t == 0 with u = x + 1.
+    let uw = sb.gate(macs, &[ow, xw, ow])[0];
+    let xuw = sb.gate(macs, &[zw, xw, uw])[0];
+    let xutw = sb.gate(macs, &[zw, xuw, tw])[0];
+    let mut c2 = sb.gate(macs, &[y2w, uw, yw])[0];
+    c2 = sb.gate(macs, &[c2, xutw, ow])[0];
+    sb.connect(c2, zass);
+    // D₀, D₁ + their nonzero guards (advice inverses against the fixed ONE).
+    let mut d0w = sb.gate(macs, &[ow, xpw[4], ow])[0];
+    d0w = sb.gate(macs, &[d0w, xpw[10], ow])[0];
+    let mut d1w = sb.gate(macs, &[ow, xw, ow])[0];
+    for d in [4, 5, 10, 11] {
+        d1w = sb.gate(macs, &[d1w, xpw[d], ow])[0];
+    }
+    vals.push(d0_inv_n);
+    let d0iw = sb.input();
+    let g0 = sb.gate(macs, &[zw, d0w, d0iw])[0];
+    sb.connect(g0, one_w);
+    vals.push(d1_inv_n);
+    let d1iw = sb.input();
+    let g1 = sb.gate(macs, &[zw, d1w, d1iw])[0];
+    sb.connect(g1, one_w);
+    // The three Artin–Schreier levels, denominators cleared. The Pᵢⱼ masks
+    // mirror `sampling::sample_artin_schreier_rhs_coeffs_cached` exactly
+    // (there `d0`/`d1` NAME the inverses; clearing multiplies them away).
+    let poly = |sb: &mut ShapeBuilder, degs: &[usize], plus_one: bool| -> Wire {
+        let mut acc = if plus_one { ow } else { zw };
+        for &d in degs {
+            acc = sb.gate(macs, &[acc, xpw[d], ow])[0];
+        }
+        acc
+    };
+    let p0: [Wire; 4] = [
+        poly(sb, &[9, 6, 5, 4, 3, 2], false),
+        poly(sb, &[5, 4, 3, 2], true),
+        poly(sb, &[4, 3, 2], false),
+        poly(sb, &[3], true),
+    ];
+    let p1: [Wire; 4] = [
+        poly(sb, &[8, 5, 4, 3, 2, 1], false),
+        poly(sb, &[6, 5, 2, 1], false),
+        poly(sb, &[3, 1], false),
+        poly(sb, &[4, 2, 1], false),
+    ];
+    let p2: [Wire; 4] = [
+        poly(sb, &[6, 4, 3, 2], false),
+        poly(sb, &[5], true),
+        poly(sb, &[3, 2, 1], true),
+        poly(sb, &[3, 2], false),
+    ];
+    // i = 0, 2 (all over D₀): D₀·(z² + z) + Σⱼ Pⱼ·yʲ == 0.
+    for (zi, p) in [(zwires[0], &p0), (zwires[2], &p2)] {
+        let z2 = sb.gate(macs, &[zw, zi, zi])[0];
+        let z2z = sb.gate(macs, &[z2, zi, ow])[0];
+        let mut acc = sb.gate(macs, &[zw, d0w, z2z])[0];
+        for j in 0..4 {
+            acc = sb.gate(macs, &[acc, p[j], ypw[j]])[0];
+        }
+        sb.connect(acc, zass);
+    }
+    // i = 1 (mixed D₀/D₁): D₀D₁·(z²+z) + D₁·Σⱼ<₃ Pⱼ·yʲ + D₀·P₃·y³ == 0.
+    {
+        let zi = zwires[1];
+        let z2 = sb.gate(macs, &[zw, zi, zi])[0];
+        let z2z = sb.gate(macs, &[z2, zi, ow])[0];
+        let d0d1 = sb.gate(macs, &[zw, d0w, d1w])[0];
+        let mut inner = sb.gate(macs, &[zw, p1[0], ow])[0];
+        inner = sb.gate(macs, &[inner, p1[1], yw])[0];
+        inner = sb.gate(macs, &[inner, p1[2], y2w])[0];
+        let p3y3 = sb.gate(macs, &[zw, p1[3], y3w])[0];
+        let mut acc = sb.gate(macs, &[zw, d0d1, z2z])[0];
+        acc = sb.gate(macs, &[acc, d1w, inner])[0];
+        acc = sb.gate(macs, &[acc, d0w, p3y3])[0];
+        sb.connect(acc, zass);
+    }
+}
+
 /// `L_i(z_skip) = Z_N(z)·(z + λ_i)^{-1}·den^{-1}` a merge fold's boolean
 /// claims carry, derived from the child's z_skip WIRE instead of published
 /// and checker-rebuilt: `t_i = z + λ_i` against the shared λ const wires,
@@ -15576,29 +15858,22 @@ fn read_acc_entry(
     )
 }
 
-/// The Tier-0 AG-skip checker (docs/ag-recursion-plan.md, Phase B): walk
-/// one AG child's published block `[seed0, seed1, nonce, point ×5,
-/// lows ×64]` — re-derive the point from `H(seed ‖ nonce)` under the
-/// child's grinding schedule (fused PoW + decode on ONE hash) and the row
-/// lows as the point's base evaluation functional. The seed and nonce
-/// publics are wire-connected to the child's transcript and the lows
-/// publics to the fold's absorbed row lows, so this closes the same
-/// binding [`emit_lagrange_lows`] gives an RS child in-circuit. Returns
-/// the number of public words consumed.
-fn check_ag_skip_publics(public: &[F128], base: usize, ag_r1_bits: Option<u32>) -> usize {
-    let seed = ag_seed_bytes(public[base], public[base + 1]);
-    let nonce_word = public[base + 2];
-    assert_eq!(nonce_word.hi, 0, "the nonce word's high half is zero");
-    let nonce = u32::try_from(nonce_word.lo).expect("the nonce fits 32 bits");
-    let budget = match ag_r1_bits {
-        Some(_) => flock_core::zerocheck::ag_skip::R1_FUSED_ATTEMPT_BUDGET,
-        None => flock_core::genus95_curve_code::SAMPLE_ATTEMPT_BUDGET,
+/// The AG-skip surface checker: walk one AG child's published block
+/// `[seed₂, nonce, point ×5, lows ×64]` and hold the row lows to the
+/// published point's base evaluation functional. Since phase D the decode
+/// itself (seed/nonce → point, fused PoW included) is IN-CIRCUIT
+/// ([`emit_ag_point_binding`]), so `lows == bf(point)` is the ONE item
+/// this surface leaves at the checker tier — the same class as the leaf's
+/// skip-interpolation items, with the genus-95 sampler gone from the exit
+/// contract. Returns the number of public words consumed.
+fn check_ag_skip_publics(public: &[F128], base: usize) -> usize {
+    let pt = flock_core::genus95_curve_code::EvaluationPoint {
+        x: public[base + 3],
+        y: public[base + 4],
+        z1: public[base + 5],
+        z2: public[base + 6],
+        z3: public[base + 7],
     };
-    assert!(nonce < budget, "the nonce is inside the prover's scan budget");
-    let pt = decode_ag_point(&seed, nonce, ag_r1_bits);
-    for (j, c) in [pt.x, pt.y, pt.z1, pt.z2, pt.z3].into_iter().enumerate() {
-        assert_eq!(public[base + 3 + j], c, "published AG point coord {j}");
-    }
     let bf = flock_core::genus95_curve_code::base_evaluation_functional(&pt)
         .expect("the base functional exists at a decoded point");
     for j in 0..64 {
@@ -15634,25 +15909,22 @@ fn ag_skip_publics_checker_rejects_tampers() {
     public.extend([pt.x, pt.y, pt.z1, pt.z2, pt.z3]);
     public.extend((0..64).map(|j| bf[j]));
     assert_eq!(
-        check_ag_skip_publics(&public, base, Some(R1_POW_BITS)),
+        check_ag_skip_publics(&public, base),
         72,
         "the honest block passes"
     );
 
+    // Since phase D the seed/nonce/decode bindings are IN-CIRCUIT
+    // (emit_ag_point_binding); the checker's remaining item is the
+    // lows-to-point functional, so its tamper matrix is point + lows.
     let rejects = |mutate: &dyn Fn(&mut [F128])| -> bool {
         let mut bad = public.clone();
         mutate(&mut bad);
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            check_ag_skip_publics(&bad, base, Some(R1_POW_BITS))
+            check_ag_skip_publics(&bad, base)
         }))
         .is_err()
     };
-    assert!(rejects(&|p| p[base] += F128::ONE), "tampered seed word");
-    assert!(rejects(&|p| p[base + 2] += F128::ONE), "shifted nonce");
-    assert!(
-        rejects(&|p| p[base + 2] = F128::new(u64::from(R1_FUSED_ATTEMPT_BUDGET), 0)),
-        "out-of-budget nonce"
-    );
     assert!(rejects(&|p| p[base + 4] += F128::ONE), "tampered point coord");
     assert!(rejects(&|p| p[base + 8 + 17] += F128::ONE), "tampered row low");
 }
@@ -17572,11 +17844,11 @@ pub fn build_node_outer_app(
                     ag_pub_bases.push(None);
                 }
                 (ZskipTapeRec::Ag { seed_ch, .. }, ZskipWires::Ag { seed_w, nonce_w }) => {
-                    // Tier 0 (docs/ag-recursion-plan.md): publish the whole
-                    // surface — seed and nonce CONNECTED to the child's
-                    // transcript wires, the point as advice, and the fold's
-                    // absorbed row lows word-for-word — and let the native
-                    // checker re-derive the point and the lows.
+                    // TIER 1 (phase D): publish [seed₂, nonce, point₅,
+                    // lows₆₄] — seed/nonce/lows wire-connected as before —
+                    // and BIND the point in-circuit
+                    // ([`emit_ag_point_binding`]). The native checker keeps
+                    // only `lows == bf(point)`.
                     let base = sb.public_len();
                     for (v, src) in [
                         (tk.chals[*seed_ch], seed_w[0]),
@@ -17598,15 +17870,33 @@ pub fn build_node_outer_app(
                     let flock_core::lincheck::SkipPoint::Ag(pt) = tk.mat_assert.z_skip else {
                         unreachable!("an AG tape carries an AG skip point")
                     };
-                    for c in [pt.x, pt.y, pt.z1, pt.z2, pt.z3] {
+                    let pt_w: [Wire; 5] = [pt.x, pt.y, pt.z1, pt.z2, pt.z3].map(|c| {
                         vals.push(c);
-                        sb.public_input();
-                    }
+                        sb.public_input()
+                    });
                     for (j, &lv) in fold_claims[0][cj + k].row.low.iter().enumerate() {
                         vals.push(lv);
                         let lw2 = sb.public_input();
                         sb.connect(lw2, wv(locs[0].claims[cj + k].row_low_v + j));
                     }
+                    emit_ag_point_binding(
+                        &mut sb,
+                        cs.q.b3,
+                        cs.q.pow,
+                        cs.macs,
+                        iv2,
+                        *seed_w,
+                        *nonce_w,
+                        &pt_w,
+                        [tk.chals[*seed_ch], tk.chals[*seed_ch + 1]],
+                        nonce,
+                        &pt,
+                        los[k].pcs.zerocheck_grinding().ag_r1_bits(),
+                        &mut vals,
+                        &mut consts,
+                        zw,
+                        ow,
+                    );
                     ag_pub_bases.push(Some(base));
                 }
                 _ => unreachable!("the region's zskip wires match the tape flavor"),
@@ -18527,17 +18817,10 @@ pub fn build_node_outer_app(
                         "the lows' assert-zero anchor"
                     );
                 }
-                // The Tier-0 AG-skip blocks: point re-derived from the
-                // published (seed, nonce) under the child's grinding
-                // schedule, row lows re-derived from the point.
-                for (lo_c, base) in los.iter().zip(&ag_pub_bases) {
-                    if let Some(base) = base {
-                        check_ag_skip_publics(
-                            &built2.public,
-                            *base,
-                            lo_c.pcs.zerocheck_grinding().ag_r1_bits(),
-                        );
-                    }
+                // The AG-skip blocks: the decode is in-circuit since
+                // phase D; the checker holds the lows to the point.
+                for base in ag_pub_bases.iter().flatten() {
+                    check_ag_skip_publics(&built2.public, *base);
                 }
                 for &(v, idx) in &jag_const_rec {
                     assert_eq!(built2.public[idx], v, "jagged shared constant public");
