@@ -1712,6 +1712,25 @@ impl Blake3Setup {
     /// so both row-major and batch-major setups work. aarch64-only (NEON
     /// round-1 kernel).
     #[cfg(target_arch = "aarch64")]
+    /// The AG-skip prover runs the DIRECT (dense pow2-lane) commit — the
+    /// standard-pack shape its zerocheck and claims are wired for — while
+    /// `prove_fast` moved to the single-slot UNION commit (dense stack +
+    /// integer lanes). These params are the direct shape at the r1cs's own
+    /// `m`; the commitment carries them, so [`Self::verify_ag`] follows.
+    fn direct_pcs_params(&self) -> PcsParams {
+        PcsParams {
+            m: self.r1cs.m,
+            log_inv_rate: self.pcs_params.log_inv_rate,
+            log_batch_size: flock_core::pcs::ligerito::embedded_initial_k_or_default(
+                self.r1cs.m,
+                self.pcs_params.profile,
+            ),
+            profile: self.pcs_params.profile,
+            num_lanes: None,
+            merkle_hash: self.pcs_params.merkle_hash,
+        }
+    }
+
     pub fn prove_fast_ag<Ch: Challenger>(
         &self,
         blocks: &[Compression],
@@ -1722,14 +1741,15 @@ impl Blake3Setup {
         R1csClaim,
     ) {
         assert_eq!(blocks.len(), self.n_blocks);
+        let pcs_params = self.direct_pcs_params();
         let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
-            flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
+            flock_core::pcs::prefault_codeword_during(&pcs_params, || {
                 self.generate_witness_ab(blocks)
             });
         let lc_circuit = self.r1cs.csc_lincheck_circuit();
         crate::prover::prove_fast_ligerito_ag_from_witness(
             &self.r1cs,
-            &self.pcs_params,
+            &pcs_params,
             z_packed,
             a_packed_f128,
             b_packed_f128,
@@ -1822,7 +1842,7 @@ impl Blake3Setup {
             commitment,
             proof,
             lc_circuit,
-            &self.pcs_params,
+            &self.direct_pcs_params(),
             challenger,
         )
     }
