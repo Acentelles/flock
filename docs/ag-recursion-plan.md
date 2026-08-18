@@ -72,10 +72,14 @@ runs (wide bands on one arm — box noise); the leaf bands are tight, so the
 leaf delta is the solid number. OPEN ATTRIBUTION: the recorded union-AG
 margin (466.0 → 367.3 at m32, −98.7 ms) predicted ~−100 ms; the leaf shows
 −48 on the prove. The RS arm matches its union twin (475.8 ≈ 466 + wiring),
-the AG arm runs ~50 ms above its (427.7 vs ~377) — the forced honest-zero
-witness mode inside the circuit-AG prove path is the prime suspect
-(the RS arm keeps pooled-dirty pages). Worth one attribution pass before
-Phase C multiplies it across the outers.
+the AG arm runs ~50 ms above its (427.7 vs ~377). The honest-zero forcing
+is NOT the cause: the chain leaf is identity-compacted, so BOTH flavors run
+PooledZeroed (verified with PCS_TRACE — the RS arm's PooledDirty election
+requires !identity), and the padding cost is identical across arms. The gap
+is unattributed; candidates: the AG round-1's dense full-region scan vs the
+RS run-list gating on this shape, or the recorded three-arm bench's arm not
+matching the leaf's exact profile/transport. Worth one attribution pass
+before Phase C multiplies it across the outers.
 
 NEXT — **Phase C (outers-AG)**: the same five items on
 `RealTape`/`RealRegion` (`zc_l` find at 6222, round-1 pins ~6300s, walk
