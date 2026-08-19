@@ -1566,10 +1566,14 @@ pub fn shrink_intervals(live: &[(usize, usize)]) -> Vec<(usize, usize)> {
 ///   makes the output byte-identical to the dense fold.
 /// - Only the pair-cover of the folded live set is written; everything else
 ///   in `a_out`/`b_out` is left untouched. Callers switching back to a dense
-///   kernel must zero the dead regions first (`zero_dead_regions`).
+///   kernel bridge through [`expand_to_dense`], which scatters only the live
+///   span into a fresh zeroed buffer.
 ///
 /// Returns `(r_next[0] · G(1), G(∞), live_out)` where `live_out` is the
-/// folded domain's live list — exactly [`shrink_intervals`] of `live_in`.
+/// folded domain's live list — the PAIR-ALIGNED COVER of
+/// [`shrink_intervals`] of `live_in` (a superset when a live interval's
+/// image ends on an odd position; the extra covered slots are zero on an
+/// honest witness).
 /// The message equals the dense kernel's value exactly: the skipped terms
 /// each carry an `a·b` factor of zero, and field ops are exact, so dropping
 /// them cannot change the sum.
@@ -1764,19 +1768,6 @@ pub fn expand_to_dense(compact: &[F128], store: &LiveLayout, domain: usize) -> V
         out[s..e].copy_from_slice(&compact[off..off + (e - s)]);
     }
     out
-}
-
-/// Zero every position of `v[..len]` outside the canonical live interval
-/// list — restores the dense kernels' "dead positions are zero" invariant
-/// after a sequence of sparse-support folds (which leave dead scratch
-/// untouched).
-pub fn zero_dead_regions(v: &mut [F128], len: usize, live: &[(usize, usize)]) {
-    let mut pos = 0usize;
-    for &(s, e) in live {
-        v[pos..s.min(len)].fill(F128::ZERO);
-        pos = e.min(len);
-    }
-    v[pos..len].fill(F128::ZERO);
 }
 
 /// Serial reference — identical I/O contract to

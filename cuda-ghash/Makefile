@@ -331,7 +331,7 @@ test_transpose_induce: test_transpose_induce.cu ntt_transpose.cuh induce_sumchec
 # Every test binary with a build rule. Compiling needs nvcc but no GPU, so the
 # hosted CI leg uses this to catch header/API bit-rot cheaply. Parallel-safe.
 TEST_BINS = test_f128 test_commit_ntt test_sumcheck_ab test_lincheck \
-            test_blake3_witness test_zc_round1_cpustyle \
+            test_blake3_witness test_blake3_witness_host test_zc_round1_cpustyle \
             test_zc_challenger test_zc_cpustyle_gpu test_zerocheck_tail \
             test_zerocheck_round2 test_zerocheck_full test_induce \
             test_introduce_glue test_commit_merkle test_sumcheck_prover \
@@ -357,7 +357,7 @@ build-tests: $(TEST_BINS) prove_ffi.o
 # stable Rust. Run serially — sumcheck_ab and sumcheck_ab_ligerito share
 # sumcheck_vectors.bin, so this target must not be invoked with -j.
 run-tests: test commit_ntt sumcheck_ab sumcheck_ab_ligerito lincheck zc_cpustyle \
-           blake3_witness zerocheck_tail zerocheck_round2 \
+           blake3_witness blake3_witness_host zerocheck_tail zerocheck_round2 \
            zerocheck_full induce introduce_glue sumcheck_prover challenger \
            merkle_open ligerito_l0 eq_builders zerocheck_lookahead fold_lookahead \
            f256_host ligerito_f256_host ligerito_f256

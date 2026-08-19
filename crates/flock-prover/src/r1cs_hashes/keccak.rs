@@ -648,8 +648,6 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
     // Constant-wire pin (docs/const-wire-pin.md): fill padding blocks with a
     // valid keccak_f(0) computation so the constant cell is 1 in every block.
-    // (so this is
-    // a no-op there and only affects the standalone batch setup.)
     let padding: State = [false; STATE_BITS];
     super::common::drive_witness_packed_and_lincheck(
         initial_states,

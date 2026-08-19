@@ -161,11 +161,8 @@ struct EnvShape {
     /// Historical counts* oracle values. Shipped envelope proofs use
     /// unconditional free counts, so these values no longer pad rows or
     /// determine the circuit digest; `counts_el` remains the canonical
-    /// element-slot key list and both arrays retain the old cap census for
-    /// comparison. The historical boolean caps cover b3, b3-alt, swap,
-    /// spread, and pow; the live family-H tile type follows them, then the
-    /// element types are keyed by `counts_el`.
-    counts_bool: [usize; 5],
+    /// element-slot key list and retains the old cap census for
+    /// comparison.
     counts_el: [(usize, usize); 15],
     /// publics* — the ONE public-segment length every envelope outer pads
     /// to (published zeros appended after all real publics). The child's
@@ -242,17 +239,7 @@ const ENV_PASS_WORDS: usize = 96;
 /// heights reach a parent only as folded claims on the jagged layout,
 /// discharged at the root — and only the LANE COUNT stays pinned
 /// (`EnvShape::lanes`). The former count-padding switches are retired;
-/// `counts_bool` and `counts_el` remain only as a historical census.
-fn env_free_counts() -> bool {
-    // THE ORACLE IS RETIRED (2026-08-10): its charter was "until the
-    // measurement pass concludes", the pass concluded 2026-08-09, and
-    // the reduced two-child envelope is incompatible with the counts*
-    // caps (mac 49,000 > 2^14). Free counts are unconditional;
-    // the counts_el vector remains as the slot-declaration KEY LIST and
-    // the historical cap record. ENV_PAD/ENV_NO_PAD no longer read.
-    true
-}
-
+/// `counts_el` remains only as the key list + historical census.
 fn outer_lanes(union: &UnionInstance, log_batch_size: usize) -> Option<usize> {
     let content = union.commit_lanes(log_batch_size);
     let env = envelope_shape();
@@ -297,10 +284,8 @@ struct EnvTail<'w> {
     app: &'w [Wire],
 }
 
-/// `Some` exactly when the DEFAULT envelope is active: the registry
-/// convergence below is pinned to m* = 29's measured geometry, so a
-/// `TOWER_ENV_M` override other than 29 gets the dense floor only (an
-/// experiment, not the envelope).
+/// The fixed envelope shape — always on, no override: the registry
+/// convergence below is pinned to m* = 29's measured geometry.
 fn envelope_shape() -> EnvShape {
     EnvShape {
         // The two-child envelope fits at 14 after consolidating the F256
@@ -321,7 +306,7 @@ fn envelope_shape() -> EnvShape {
         // Iterated at the padded envelope 2026-08-06 (probe + tower
         // census, elementwise max of leaf/node usage). Only b3, le8, pf8
         // and mac are content-geometry-sensitive; everything else hits its
-        // cap exactly (registry-shaped) and skn/skc are the leaf's.
+        // cap exactly (registry-shaped).
         // The 4th entry is the fused PoW-mask slot (one row per grinding
         // site). It is a historical oracle cap only: free counts are
         // unconditional, and the strict-Slim m29 spine exercises the live
@@ -329,7 +314,6 @@ fn envelope_shape() -> EnvShape {
         // BLAKE is the only boolean family whose live count exceeds 2^14.
         // The two independent child regions use identical slots while the
         // shipped free-count path records each actual prefix.
-        counts_bool: [16384, 16384, 12250, 1060, 4096],
         counts_el: [
             (600, 49000), // mac — the nu* driver; watch the 2^15 ceiling
             (602, 8000),  // fold/recombination MACs, split from verifier arithmetic
@@ -349,7 +333,7 @@ fn envelope_shape() -> EnvShape {
             // row per query, plus one three-factor prefix row per later
             // Ligerito level. These caps are the sums of the former six
             // per-prefix variants at the envelope maxima above.
-            (880, 4150),   // normalized W_0..W_17 chain
+            (880, 4150),   // normalized W_0..W_18 chain
             (881, 12690),  // three-factor extension prefix
             (882, 4150),   // eight-way residual accumulation
             (1008, 15000), // extension prefix w 8
@@ -367,10 +351,11 @@ fn envelope_shape() -> EnvShape {
     }
 }
 
-/// Find-or-create a slot under this file's keyed-cache scheme (lanes /
-/// 0 spine / 400 mrs / 500 zcr / 510 skn / 511 skc / 600 mac /
-/// 601 assist / 602 fold-mac /
-/// 100+pl resid / 310+w prefix). Every element-slot declaration on the
+/// Find-or-create a slot under this file's keyed-cache scheme
+/// (0 spine / 8 leaf-eval / 400 mrs / 500 zcr / 600 mac / 601 assist /
+/// 602 fold-mac / 700 spine256 / 701 mac256 / 808 leaf-eval256 /
+/// 880 resid-weights / 881 resid-prefix3 / 882 resid-acc /
+/// 310+w prefix / 1000+w prefix256). Every element-slot declaration on the
 /// recursion path routes through this, so the envelope can pre-seed the
 /// cache (fixing the declaration order registry-wide) while the
 /// off-envelope path creates on first use, in the historical order,
@@ -403,8 +388,7 @@ where
 /// type list, which together with nu* is registry-digest equality. Returns
 /// the six boolean slots; every element type pre-seeds `cache` under the keyed
 /// scheme so both builders' demand sites hit the cache instead of
-/// declaring. The order is the node's historical one with the leaf-only
-/// types (SkipNode/SkipClose) appended inside their k_log group.
+/// declaring. The order is the node's historical one.
 fn declare_envelope_slots(
     sb: &mut ShapeBuilder,
     nu: usize,
@@ -468,9 +452,8 @@ fn pad_envelope_counts(
     // skipped — children declare their own counts, min-one-row keeps every
     // type live, and the heights reach a parent only as jagged claims.
     // The tail blocks and the public segment still pad, so the layout a
-    // parent reads is unchanged. The historical caps remain below as a
-    // census oracle, but row-count padding is retired.
-    let no_pad = env_free_counts();
+    // parent reads is unchanged. The historical caps remain in `counts_el`
+    // as the slot-declaration key list, but row-count padding is retired.
     let mut report: Vec<String> = Vec::new();
     let mut over: Vec<String> = Vec::new();
     let mut pad = |sb: &mut ShapeBuilder,
@@ -512,32 +495,12 @@ fn pad_envelope_counts(
     // the predicate `n_t > 0`. Keep every type non-empty and the counts
     // become pure values.
     let floor1 = |sb: &ShapeBuilder, s| sb.rows_in_slot(s).max(1);
-    let t_b3 = if no_pad {
-        floor1(sb, q.b3)
-    } else {
-        env.counts_bool[0]
-    };
+    let t_b3 = floor1(sb, q.b3);
     let b3_alt = q.b3_alt.expect("the envelope declares two BLAKE slots");
-    let t_b3_alt = if no_pad {
-        floor1(sb, b3_alt)
-    } else {
-        env.counts_bool[1]
-    };
-    let t_swap = if no_pad {
-        floor1(sb, q.swap)
-    } else {
-        env.counts_bool[2]
-    };
-    let t_spread = if no_pad {
-        floor1(sb, q.spread)
-    } else {
-        env.counts_bool[3]
-    };
-    let t_pow = if no_pad {
-        floor1(sb, q.pow)
-    } else {
-        env.counts_bool[4]
-    };
+    let t_b3_alt = floor1(sb, b3_alt);
+    let t_swap = floor1(sb, q.swap);
+    let t_spread = floor1(sb, q.spread);
+    let t_pow = floor1(sb, q.pow);
     pad(sb, hints, &mut over, "b3", q.b3, t_b3, false, None);
     pad(sb, hints, &mut over, "b3b", b3_alt, t_b3_alt, false, None);
     pad(sb, hints, &mut over, "swap", q.swap, t_swap, true, None);
@@ -557,7 +520,7 @@ fn pad_envelope_counts(
         Some(&pow_inputs),
     );
     let family = q.family.expect("the envelope declares family H");
-    let t_family = if no_pad { floor1(sb, family) } else { 1 };
+    let t_family = floor1(sb, family);
     pad(
         sb, hints, &mut over, "family", family, t_family, false, None,
     );
@@ -566,7 +529,8 @@ fn pad_envelope_counts(
             .iter()
             .find(|&&(k, _)| k == key)
             .unwrap_or_else(|| panic!("envelope slot key {key} missing from the cache"));
-        let target = if no_pad { floor1(sb, s) } else { count };
+        let _ = count;
+        let target = floor1(sb, s);
         pad(
             sb,
             hints,
@@ -635,12 +599,11 @@ fn pad_envelope_counts(
             }
         }
     }
-    // The live/target census. Under shipped free counts, target is the live
-    // count (or one schema-preserving dummy row); the retired oracle branch
-    // instead reports the historical caps.
+    // The live/target census: target is the live count (or one
+    // schema-preserving dummy row).
     println!("  [envelope rows live/target] {}", report.join(" | "));
-    // This can fire only when exercising the historical cap branch. Free
-    // counts have no cap to outgrow.
+    // Overshoot is a real failure: the public segment or a tail block
+    // outgrew the envelope's fixed layout.
     assert!(over.is_empty(), "counts* overshoot: {}", over.join(", "));
 }
 
@@ -957,8 +920,8 @@ impl Rng {
 // ---------------------------------------------------------------------------
 
 /// One BLAKE3 compression, the challenge source. (Same gate as
-/// `circuit_builder.rs`; duplicated rather than shared because these are
-/// separate test binaries.)
+/// `tests/circuit_builder.rs`; duplicated rather than shared because a lib
+/// module cannot import from the crate's `tests/` binaries.)
 struct Blake3Gate {
     nu: usize,
 }
@@ -2538,7 +2501,7 @@ impl ResidualWeightsGate256 {
                 sks[k] * sks[k] * sks[k + 1].inv()
             })
             .collect();
-        // in: W_0=q, one. out: W_1..W_17.
+        // in: W_0=q, one. out: W_1..W_18.
         let mut b = ElementTableBuilder::new(5);
         b.free_wire(0).free_wire(1);
         let mut prev = 0;
@@ -6563,7 +6526,7 @@ impl<'p> RealTape<'p> {
                     fin += 1;
                 }
                 match op {
-                    Op::ObserveBytes(_) | Op::Pow { .. } => pay += 1,
+                    Op::ObserveBytes(_) | Op::Pow { .. } | Op::LegacyPow { .. } => pay += 1,
                     _ => {}
                 }
             }
@@ -7720,7 +7683,7 @@ fn emit_real_child_region(
             consts.len()
         );
     }
-    // The PoW grinding wires: (digest word0, word1, nonce word) per op.
+    // The PoW grinding wires: [predicate word, nonce word] per op.
     let pow_wires: Vec<[Wire; 2]> = rt
         .pows
         .iter()
@@ -9606,7 +9569,7 @@ fn chain_child_region_emits_alone() {
 /// The first-level node as a BUILDER: [`build_fl_node`]'s output. `lo` is
 /// a real, RECURSABLE [`LeafOuter`] (BLAKE3 for both the FS chain and the
 /// Merkle trees), so the internal-node machinery ([`RealTape`],
-/// [`build_node_outer`]) consumes it exactly like a leaf outer; `acc` is
+/// [`build_node_outer_app`]) consumes it exactly like a leaf outer; `acc` is
 /// the folded chain accumulator the node carries up; `stmt_base` locates
 /// the 8-word application-statement block (h_start, h_end) in `lo.public`.
 // Several fields are read only by the in-file `#[test]` benches; the lib
@@ -9708,11 +9671,12 @@ pub fn build_fl_node(cfg: TowerConfig, cp0: &ChainProof, cp1: &ChainProof) -> Fl
     build_fl_node_k(cfg, &[cp0, cp1])
 }
 
-/// The k-ARY first-level node (the FL-arity lever): `k` adjacent chain
-/// proofs verified deferred in ONE outer, their assertions folded k→1 per
-/// group, adjacency as k−1 four-word seams, the app statement the combined
-/// span. `k = 2` emits in exactly the historical two-child order — every
-/// existing gate rides the wrapper above unchanged.
+/// The 2-ary first-level node: two adjacent chain proofs verified deferred
+/// in ONE outer, their assertions folded 2→1 per group, adjacency as one
+/// four-word seam, the app statement the combined span. The `cps` slice is
+/// the arity LEVER, but today it is pinned to exactly two children — the
+/// split-BLAKE slot assignment (`ChildSlots::new_env` sets `b3_alt` for
+/// child 1 only) has no slots for a third child.
 pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
     use flock_core::aggregate;
     use flock_core::matrix_fold::{FoldProof, MatrixClaim};
@@ -9721,7 +9685,10 @@ pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
     const FL_DOMAIN: &[u8] = b"flock-chain-fl-node-v0";
 
     let k_ary = cps.len();
-    assert!(k_ary >= 2, "an FL folds at least two chain segments");
+    assert_eq!(
+        k_ary, 2,
+        "split-BLAKE recursion supports exactly two children"
+    );
     let cp0 = cps[0];
     let cp_last = cps[k_ary - 1];
     // Each child CONTINUES the chain: its h_start IS the previous h_end.
@@ -14957,7 +14924,7 @@ fn labeled_bytes_payloads(
         {
             out.push(payload);
         }
-        if matches!(op, Op::ObserveBytes(_) | Op::Pow { .. }) {
+        if matches!(op, Op::ObserveBytes(_) | Op::Pow { .. } | Op::LegacyPow { .. }) {
             payload += 1;
         }
     }
@@ -15375,36 +15342,6 @@ fn check_jagged_fold_publics(
     (out, keys, p)
 }
 
-/// **THE 2→1 RECURSION NODE.** Two DISTINCT real recursion nodes (seeded
-/// leaf outers — one circuit, unrelated FS points) go in; ONE proof comes
-/// out, carrying everything a parent needs:
-///
-/// - TWO REAL CHILD-TAPE REGIONS — each child's complete deferred verifier
-///   (the swap assembly via [`emit_real_child_region`]) over SHARED slots,
-/// - the FOLD REGION at the real registry (~35 folds via the width-driven
-///   helpers), and
-/// - THE CONNECTS: every fold claim's surfaces are copy-constrained to the
-///   child regions' own assertion-emission wires — points to chain
-///   squeezes, z_partial lows word-for-word, and (richer than the minimal
-///   children) the matrix/element EVAL VALUES to the children's bound
-///   advice publics. The lagrange row lows stay the boundary pattern:
-///   published once per child, rebuilt by the checker from that child's
-///   PUBLISHED z_skip.
-///
-/// The accumulator reassembles from the public segment alone, equals the
-/// native verifier's, and discharges all three groups against the node
-/// circuit's own matrices and sigma table. This outer IS the merge node:
-/// its proof attests both children's verification AND the fold that
-/// combined their claims. (It is not yet SELF-similar — normalization is
-/// deliberately out of scope.)
-/// Build a 2→1 RECURSION NODE over two children and return its artifacts
-/// AS A [`LeafOuter`] (plus its output accumulator): the node's proof is
-/// BLAKE3/BLAKE3-recursable and shaped exactly like a child input, so the
-/// builder composes with ITSELF — `build_node_outer(&n0, &n1)` is the
-/// level-2 node consuming its own outputs. The children must share one
-/// circuit digest (the foldability key); their claims land at unrelated FS
-/// points. Every tape pin, connect, and checker walk of the 2→1 milestone
-/// lives inside — the builder IS the test.
 /// The PRODUCTION per-proof tape cost of one child: the recorded deferred
 /// verify alone — the tape (op sequence + values + challenges) and the
 /// assertion references in one pass. Everything else `RealTape::new` does
@@ -15542,12 +15479,43 @@ pub struct ChainLane<'a> {
     claims_base: usize,
 }
 
-/// [`build_node_outer`] with the APPLICATION-STATEMENT plumbing: when the
-/// children carry an app block (`app_stmt` = its offset in their public
-/// segments — the hash-chain span (h_start, h_end), 8 words), the node
-/// connects left.h_end == right.h_start wire-to-wire and publishes the
-/// combined span as its OWN app block, returning that block's offset — so
-/// the output feeds the next level with the same plumbing.
+/// **THE 2→1 RECURSION NODE.** Two DISTINCT real recursion nodes (seeded
+/// leaf outers — one circuit, unrelated FS points) go in; ONE proof comes
+/// out, carrying everything a parent needs:
+///
+/// - TWO REAL CHILD-TAPE REGIONS — each child's complete deferred verifier
+///   (the swap assembly via [`emit_real_child_region`]) over SHARED slots,
+/// - the FOLD REGION at the real registry (~35 folds via the width-driven
+///   helpers), and
+/// - THE CONNECTS: every fold claim's surfaces are copy-constrained to the
+///   child regions' own assertion-emission wires — points to chain
+///   squeezes, z_partial lows word-for-word, and (richer than the minimal
+///   children) the matrix/element EVAL VALUES to the children's bound
+///   advice publics. The lagrange row lows stay the boundary pattern:
+///   published once per child, rebuilt by the checker from that child's
+///   PUBLISHED z_skip.
+///
+/// The accumulator reassembles from the public segment alone, equals the
+/// native verifier's, and discharges all three groups against the node
+/// circuit's own matrices and sigma table. This outer IS the merge node:
+/// its proof attests both children's verification AND the fold that
+/// combined their claims. (It is not yet SELF-similar — normalization is
+/// deliberately out of scope.)
+/// Build a 2→1 RECURSION NODE over two children and return its artifacts
+/// AS A [`LeafOuter`] (plus its output accumulator): the node's proof is
+/// BLAKE3/BLAKE3-recursable and shaped exactly like a child input, so the
+/// builder composes with ITSELF — `build_node_outer_app(&[&n0, &n1], ..)` is the
+/// level-2 node consuming its own outputs. The children must share one
+/// circuit digest (the foldability key); their claims land at unrelated FS
+/// points. Every tape pin, connect, and checker walk of the 2→1 milestone
+/// lives inside — the builder IS the test.
+///
+/// APPLICATION-STATEMENT plumbing: when the children carry an app block
+/// (`app_stmt` = its offset in their public segments — the hash-chain span
+/// (h_start, h_end), 8 words), the node connects left.h_end ==
+/// right.h_start wire-to-wire and publishes the combined span as its OWN
+/// app block, returning that block's offset — so the output feeds the next
+/// level with the same plumbing.
 pub fn build_node_outer_app(
     cfg: TowerConfig,
     los: &[&LeafOuter],
@@ -16816,7 +16784,9 @@ pub fn build_node_outer_app(
             }
         }
 
-        // Publishes: per fold, deltas + accumulator claim. This is the
+        // Publishes: per fold, the accumulator claim [live | rho_col |
+        // rho_row | value] (endpoint identities are copy constraints,
+        // nothing published). This is the
         // ENVELOPE-registry surface a parent inherits, so under the
         // envelope it rides the reserved ACC_MAIN block at a constant
         // index; off-envelope it publishes inline, as before.
@@ -17181,9 +17151,9 @@ pub fn build_node_outer_app(
         }
         let build_ms = t_tapes.elapsed().as_secs_f64() * 1e3 - tape_setup_ms;
         let t_build2 = std::time::Instant::now();
-        // counts* + publics*: the node declares the same count vector and
-        // segment length the leaf does. The tail-anchor assert below walks
-        // the REAL segment end, recorded pre-pad.
+        // publics*: the node pads to the same public-segment length the
+        // leaf does (free counts: the count VECTORS deliberately differ —
+        // see the assert_ne below the builders).
         let prepad_publics2 = sb.public_len();
         let app_base = {
             let _ = app_inline;
@@ -17986,27 +17956,19 @@ fn internal_node_over_two_fl_nodes() {
     // same public-segment length with the app block at the same fixed
     // offset (publics*), same PINNED lane count (lanes*) — so a parent's
     // walk cannot tell an FL child from an internal child. Under FREE
-    // COUNTS (the default) the declared count vectors deliberately
-    // DIFFER: the heights are data now, reaching a parent only as jagged
-    // claims, and the parent's circuit never reads them. Under the
-    // `ENV_PAD=1` oracle the old counts* equality still holds.
+    // COUNTS the declared count vectors deliberately DIFFER: the heights
+    // are data now, reaching a parent only as jagged claims, and the
+    // parent's circuit never reads them.
     {
         assert_eq!(
             fl0.lo.shape.registry.digest(),
             node.shape.registry.digest(),
             "FL and internal share ONE envelope registry"
         );
-        if env_free_counts() {
-            assert_ne!(
-                fl0.lo.shape.counts, node.shape.counts,
-                "free counts: the FL and internal declare their OWN counts"
-            );
-        } else {
-            assert_eq!(
-                fl0.lo.shape.counts, node.shape.counts,
-                "counts* oracle: FL and internal declare ONE count vector"
-            );
-        }
+        assert_ne!(
+            fl0.lo.shape.counts, node.shape.counts,
+            "free counts: the FL and internal declare their OWN counts"
+        );
         assert_eq!(
             fl0.lo.pcs.num_lanes, node.pcs.num_lanes,
             "ONE lane count (lanes* — pinned, the layout's structural residue)"

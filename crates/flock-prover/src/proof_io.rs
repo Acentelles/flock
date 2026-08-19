@@ -1,18 +1,16 @@
 //! Serialize / deserialize proofs to bytes (and files).
 //!
-//! Three bundle types: [`R1csProofBundleLigerito`] for the base R1CS proof,
-//! [`ChainProofBundleLigerito`] for the hash-chain proof, and
-//! [`MixedProofBundleLigerito`] for the multi-table mixed proof. All pair a
-//! proof with its commitment (which the verifier needs); the chain bundle
-//! additionally carries the public endpoint bits, the mixed bundle its
-//! registry id + counts vector.
+//! Two bundle types: [`R1csProofBundleLigerito`] for the base R1CS proof and
+//! [`MixedProofBundleLigerito`] for the multi-table mixed proof. Both pair a
+//! proof with its commitment (which the verifier needs); the mixed bundle
+//! additionally carries its registry id + counts vector.
 //!
 //! On-disk format:
 //! ```text
 //!   bytes 0..5    "FLOCK"                  (5-byte magic)
-//!   byte  5       VERSION                  (currently 20)
-//!   bytes 6..7    flavor: 2 = R1cs, 3 = Chain, 4 = Mixed
-//!                 (0/1 reserved: legacy BaseFold)
+//!   byte  5       VERSION                  (currently 21)
+//!   bytes 6..7    flavor: 2 = R1cs, 4 = Mixed
+//!                 (0/1 reserved: legacy BaseFold; 3 was the retired chain)
 //!   bytes 7..     bincode-serialized payload
 //! ```
 //!
@@ -141,36 +139,6 @@ pub const MAX_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
 // R1csProofLigerito payload is gone from this flavor.
 pub const VERSION: u8 = 21;
 
-/// Which hash function a proof is over, so a verifier can pick the right
-/// setup without out-of-band info.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum HashKind {
-    Blake3,
-    Sha2,
-    Keccak,
-}
-
-impl HashKind {
-    /// Parse a CLI-style name; case-insensitive. Accepts `blake3`, `sha2` /
-    /// `sha256`, `keccak` / `keccak_f`.
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "blake3" => Some(Self::Blake3),
-            "sha2" | "sha256" | "sha-2" | "sha-256" => Some(Self::Sha2),
-            "keccak" | "keccak_f" | "keccak-f" => Some(Self::Keccak),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Blake3 => "blake3",
-            Self::Sha2 => "sha2",
-            Self::Keccak => "keccak",
-        }
-    }
-}
-
 /// Flavor discriminator (1 byte). Lets a generic reader peek what kind of
 /// bundle a file holds without parsing the payload first (see
 /// [`peek_flavor`]). Values 0/1 are reserved: they were the legacy BaseFold
@@ -186,7 +154,6 @@ const FLAVOR_MIXED_LIGERITO: u8 = 4;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BundleFlavor {
     R1cs,
-    Chain,
     Mixed,
 }
 
@@ -221,15 +188,15 @@ pub enum DeserializeError {
     /// The version byte didn't match this build's `VERSION`. The number is
     /// the version found in the file.
     UnsupportedVersion(u8),
-    /// The flavor byte was none of `2` (R1cs Ligerito), `3` (Chain
-    /// Ligerito), `4` (Mixed Ligerito).
+    /// The flavor byte was neither `2` (R1cs Ligerito) nor `4` (Mixed
+    /// Ligerito).
     UnknownFlavor(u8),
     /// `from_bytes` was called with a slice shorter than `HEADER_LEN`.
     Truncated,
     /// The encoded bundle exceeds [`MAX_BUNDLE_BYTES`].
     TooLarge { len: usize, max: usize },
     /// The expected flavor and the file's flavor disagree (e.g. trying to
-    /// load a `ChainProofBundle` from an R1CS bundle file).
+    /// load a `MixedProofBundleLigerito` from an R1CS bundle file).
     FlavorMismatch { expected: u8, found: u8 },
     /// The bincode-deserialization step failed (corrupted payload, etc.).
     Bincode(bincode::Error),
@@ -299,8 +266,7 @@ impl R1csProofBundleLigerito {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MixedProofBundleLigerito {
     pub registry_id: crate::mixed::MixedRegistryId,
-    /// Declared invocation counts, in slot order (for the current tiers:
-    /// SHA-256, then BLAKE3).
+    /// Declared invocation counts, in the registry's slot order.
     pub counts: Vec<u64>,
     pub commitment: Commitment,
     pub proof: flock_core::proof::R1csProofMergedLigerito,
@@ -704,9 +670,9 @@ mod tests {
         }
     }
 
-    /// Mixed flavor header mechanics (cheap): peek_flavor on all three
-    /// flavors, mixed-vs-chain flavor mismatch, and version strictness for
-    /// the mixed reader.
+    /// Mixed flavor header mechanics (cheap): peek_flavor on both flavors,
+    /// mixed-vs-R1cs flavor mismatch, and version strictness for the mixed
+    /// reader.
     #[test]
     fn mixed_flavor_header_checks() {
         let mut bytes = vec![0u8; HEADER_LEN + 10];
@@ -730,7 +696,7 @@ mod tests {
             })
         ));
 
-        // Old version (v4) rejected — strict versioning.
+        // Old version (v20) rejected — strict versioning.
         bytes[5] = VERSION - 1;
         bytes[6] = FLAVOR_MIXED_LIGERITO;
         assert!(matches!(

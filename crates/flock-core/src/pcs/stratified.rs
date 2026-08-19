@@ -50,10 +50,10 @@ pub struct Summand {
 /// depths are non-increasing, strictly decreasing below `log_block_len`,
 /// and repeats are allowed only *at* `log_block_len` (a full deterministic
 /// sweep of the leaf layer; only reachable when `q > block_len`, which no
-/// shipped ladder produces — [`derive_ladder_shape`] keeps `block_len ≥ q`
+/// shipped ladder produces — [`derive_ladder_shape_tuned`] keeps `block_len ≥ q`
 /// as a proof-size convention).
 ///
-/// [`derive_ladder_shape`]: super::ligerito
+/// [`derive_ladder_shape_tuned`]: super::ligerito
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LevelSchedule {
     /// `d`: log₂ of the level's committed block length (codeword positions).

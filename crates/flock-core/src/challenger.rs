@@ -506,6 +506,16 @@ impl B3Chain {
             bits <= 128,
             "the fused PoW predicate occupies one F128 word"
         );
+        // One PoW evaluation + one squeeze of `out.len()` bytes: the fused
+        // transition is both at once, so both ledgers get their entry (the
+        // grind side's failed attempts are counted inside the scan itself).
+        #[cfg(feature = "hash-count")]
+        {
+            fs_count::POW_SHA256.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            fs_count::SQUEEZED_BYTES
+                .fetch_add(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         let ob = self.pow_candidate_output(nonce, bits);
         let mut first = [0u8; 64];
         for (i, w) in ob.iter().enumerate() {

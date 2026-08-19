@@ -1818,6 +1818,7 @@ impl Blake3Setup {
             self.generate_witness_ab(blocks);
         let witness_s = t0.elapsed().as_secs_f64();
         let lc_circuit = self.r1cs.csc_lincheck_circuit();
+        let pcs_params = self.direct_pcs_params();
         let (proof, commitment, claim, mut timings) = crate::prover::prove_fast_ligerito_ag_timed(
             &self.r1cs,
             &pcs_params,
@@ -2361,9 +2362,10 @@ mod tests {
     /// through the full commit → AG zerocheck → lincheck → ring-switch
     /// Ligerito open pipeline.
     #[cfg(target_arch = "aarch64")]
-    #[test] // Default-run: this is the guard for the direct-shape params
-    // class of stranding (the union migration broke prove_fast_ag and the
-    // ignore gate hid it; the timed twin then broke the same way).
+    #[test]
+    // Default-run: this is the guard for the direct-shape params class of
+    // stranding (the AG/timed entry points commit the standard-pack witness,
+    // so a union-shaped `pcs_params` panics them all).
     fn prove_fast_ligerito_ag_roundtrip() {
         use flock_core::challenger::FsChallenger;
         let setup = Blake3Setup::new(256);
@@ -2741,10 +2743,10 @@ mod tests {
         assert_eq!(claim_p, claim_v);
     }
 
-    /// Constant-wire pin (docs/const-wire-pin.md). `new(250)` has padding
-    /// blocks (filled with a valid all-zero-input compression, constant = 1)
-    /// so the honest proof verifies; the all-zero witness must be rejected by
-    /// the pin. (For BLAKE3 the pin lives on the R1CS-built CSC circuit, not
+    /// Constant-wire pin (docs/const-wire-pin.md). `new(250)` is a partial
+    /// count: `prove_fast`'s batch-major partial witness leaves the dummy
+    /// rows identically zero (no padding compressions) and the honest proof
+    /// verifies; the all-zero witness must be rejected by the pin. (For BLAKE3 the pin lives on the R1CS-built CSC circuit, not
     /// the walker.)
     #[test]
     #[ignore] // Heavier — Ligerito needs m=22; run with `cargo test const_pin_all_zero_rejected -- --ignored`

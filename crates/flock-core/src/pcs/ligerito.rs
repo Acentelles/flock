@@ -230,12 +230,11 @@ impl ProverConfig {
         stratified::validate_schedules(&self.stratified, &self.queries, &self.level_block_logs())
     }
 
-    /// The L0 cap depth this config implies for a depth-`d` L0 tree — the
-    /// ONE rule commit-time sizing (`PcsParams::l0_cap_depth`), the open
-    /// entries' belt-and-braces asserts, and the prover's own absorb must
-    /// share: the schedule's cap (top set bit) when stratified, else the
-    /// legacy `min(⌈log2 q₀⌉, d)`.
-    pub fn l0_cap_depth(&self, _d: usize) -> usize {
+    /// The L0 cap depth this config implies — the ONE rule commit-time
+    /// sizing (`PcsParams::l0_cap_depth`), the open entries'
+    /// belt-and-braces asserts, and the prover's own absorb must share:
+    /// the L0 schedule's cap (top set bit).
+    pub fn l0_cap_depth(&self) -> usize {
         self.stratified[0].cap_depth()
     }
 }
@@ -298,7 +297,7 @@ impl VerifierConfig {
 
     /// The L0 cap depth this config implies; see
     /// [`ProverConfig::l0_cap_depth`].
-    pub fn l0_cap_depth(&self, _d: usize) -> usize {
+    pub fn l0_cap_depth(&self) -> usize {
         self.stratified[0].cap_depth()
     }
 }
@@ -567,8 +566,9 @@ pub fn embedded_security_config(m: usize, profile: LigeritoProfile) -> Option<&'
 /// for `(m, profile)` was derived with. **The TOML is the source of truth**:
 /// callers building `PcsParams` at a content-derived `m` must use this as
 /// `log_batch_size` — `prover_config_for` rejects a mismatch. 6 everywhere
-/// except m29 Fast (5 — the recursion-node row-width choice; see
-/// `derive_profile`). Returns `None` when no config is registered.
+/// except the m28 fast/slim families (4) and the m29 fast/slim families
+/// (5 — the recursion-node row-width choices; see `derive_profile`).
+/// Returns `None` when no config is registered.
 pub fn embedded_initial_k(m: usize, profile: LigeritoProfile) -> Option<usize> {
     let toml = embedded_security_config(m, profile)?;
     // Cheap scan — the TOML serializer always writes `initial_k = <n>` as
@@ -933,19 +933,6 @@ fn strict_query_count(target_bits: f64, grinding_bits: usize, per_query_bits: f6
     debug_assert!(per_query_bits > 0.0);
     let remaining = (target_bits - grinding_bits as f64).max(0.0);
     (remaining / per_query_bits).floor() as usize + 1
-}
-
-/// Effective PoW bits for fold round `j`. The MCA term tapers by one bit per
-/// round, whereas the independent sumcheck term `2*L_max/|F|` does not.
-/// `claim_batch_bits + 1` is exactly the strict requirement for `2*L_max`
-/// whenever the Flock paper's Appendix C.3 algebraic schedule is enabled.
-fn fold_round_grinding_bits(fold_bits: u32, claim_batch_bits: u32, j: usize) -> u32 {
-    let sumcheck_floor = if claim_batch_bits == 0 {
-        0
-    } else {
-        claim_batch_bits.saturating_add(1)
-    };
-    fold_bits.saturating_sub(j as u32).max(sumcheck_floor)
 }
 
 /// Return `(claim_bits, sumcheck_bits, consistency_bits, raw diagnostics)` for
@@ -2495,10 +2482,29 @@ fn evaluate_scaled_basis_inplace(
 // The verifier reconstructs both independently from public inputs and checks
 // the sumcheck claim Σ_j f(j) · basis_poly[j] = enforced_sum at the residual.
 
+/// **Succinct** evaluator for the induced basis poly's MLE at residual points.
+/// Replaces `induce_sumcheck_poly` + `partial_eval_lsb` in the verifier:
+/// instead of materializing the dense `2^log_msg_cols` basis_poly, evaluates
+/// its MLE directly using the closed-form identity:
+///   `MLE(basis_poly)(p) = Σ_i α^i · Π_k (1 + p[k] · (1 + Ŵ_k(q_i)))`
+/// where each `q_i` is the field embedding of `queries[i]`.
+///
+/// `ris_for_basis` is the fixed prefix of the residual point (the ris range
+/// that would have been passed to `partial_eval_lsb(basis_poly, ris_for_basis)`).
+/// Length must be `log_msg_cols - yr_log_n`. The function returns evaluations
+/// at `2^yr_log_n` points: `ris_for_basis ++ y_bits` for `y ∈ [0, 2^yr_log_n)`.
+///
+/// Cost: O(num_queries × yr_log_n × 2^yr_log_n + num_queries × log_msg_cols),
+/// vs the dense path's O(num_queries × log_msg_cols × 2^log_msg_cols). At m=30
+/// L0 with 221 queries, log_msg_cols=17, yr_log_n=4: ~18k ops vs ~500M ops.
+/// `⌈log₂ n⌉`. Number of bits needed to index `n` items. Used to size the
+/// per-level `alpha` slice for the eq-tensor basis-induction combination.
+#[inline]
 /// Compute just the `enforced_sum` half of [`induce_sumcheck_poly`]:
 ///   `enforced_sum = Σ_i eq(α, i_bin) · ⟨opened_rows[i], eq(v_challenges, ·)⟩`
 /// Cheap: O(num_queries × num_interleaved). Verifier needs this at level
 /// intro time (before residual challenges are known).
+#[cfg(test)]
 pub(crate) fn induce_sumcheck_enforced_sum(
     opened_rows: &[Vec<F128>],
     v_challenges: &[F128],
@@ -2555,6 +2561,7 @@ pub(crate) fn ceil_log2(n: usize) -> usize {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn induce_sumcheck_evaluate_at_residual(
     log_msg_cols: usize,
     sks_vks: &[F128],
@@ -3945,7 +3952,7 @@ fn fold_and_msg_blocked(
 
 /// Fills a window of the basis: `out = b[g0 .. g0 + out.len()]`. Lets L0
 /// source its basis from a compact factored form
-/// (`jagged::JaggedWeight`) instead of a materialized `2^m` array.
+/// (`jagged::fill_weight_range`) instead of a materialized `2^m` array.
 pub type BasisWindowFn<'a> = &'a (dyn Fn(&mut [F128], usize) + Sync);
 
 /// [`fold_and_msg_blocked`] with the basis supplied JUST-IN-TIME. Identical
@@ -4538,7 +4545,7 @@ impl SumcheckProver {
 /// `count` may exceed `block_len` without harm; the soundness bound
 /// (see [`udr_queries`]) is the independent-sample one and never depended on
 /// distinctness. Ladder shapes still keep `block_len >= count` — see
-/// [`derive_ladder_shape`] — but that is now a proof-size convention rather
+/// [`derive_ladder_shape_tuned`] — but that is now a proof-size convention rather
 /// than a correctness requirement.
 fn sample_queries<Ch: Challenger>(
     challenger: &mut Ch,
@@ -4921,1314 +4928,6 @@ pub(crate) fn recursive_prover_with_basis_precomputed_round0_lanes<Ch: Challenge
         round1_lookahead,
         challenger,
     )
-}
-
-/// Succinct verifier for [`recursive_prover_with_basis`]: instead of accepting
-/// a dense `b_initial: &[F128]` (which would be ~16 MB at m=29), accepts a
-/// **closure** `eval_b` that evaluates `b_initial(point)` at any multilinear
-/// point. The verifier calls `eval_b` only `yr.len()` times (at the residual)
-/// — typically a few dozen times, not 2^L. Use this from
-/// `pcs::verify_opening_batch_ligerito_mixed` where the closure is built from
-/// `ring_switch::verify_succinct` outputs + PD claim points.
-///
-/// `log_n` is the original packed-witness log size (= b_initial's logical dim).
-#[allow(clippy::too_many_arguments)]
-pub fn recursive_verifier_with_basis_succinct<Ch, F>(
-    config: &VerifierConfig,
-    proof: &LigeritoProof,
-    log_n: usize,
-    target: F128,
-    expected_initial_cap: &[Hash],
-    l0_num_lanes: usize,
-    eval_b_residual: F,
-    challenger: &mut Ch,
-) -> bool
-where
-    Ch: Challenger,
-    // Called ONCE at the residual check with the full ris and yr_log_n.
-    // Returns 2^yr_log_n values: eval_b(ris ++ y_bits) for y ∈ [0, 2^yr_log_n).
-    // This API allows callers to amortize prefix work across yr positions
-    // (e.g. ring_switch::eval_rs_eq_prefix + finish_from_prefix).
-    F: Fn(&[F128], usize) -> Vec<F128>,
-{
-    let trace = std::env::var("LIG_VERIFY_TRACE").is_ok();
-    let mut t_merkle = std::time::Duration::ZERO;
-    let mut t_sample_q = std::time::Duration::ZERO;
-    let mut t_enforced = std::time::Duration::ZERO;
-    let mut t_residual = std::time::Duration::ZERO;
-    let mut t_evalb = std::time::Duration::ZERO;
-    let t_start = std::time::Instant::now();
-
-    let initial_k = config.initial_k;
-    let r = config.recursive_steps;
-    if r < 1
-        || config.recursive_ks.len() != r
-        || config.log_inv_rates.len() != r + 1
-        || config.queries.len() != r + 1
-        || config.grinding_bits.len() != r + 1
-        || config.fold_grinding_bits.len() != r + 1
-        || config.claim_batch_grinding_bits.len() != r + 1
-        || config.consistency_batch_grinding_bits.len() != r + 1
-        || config.ood_samples.len() != r + 1
-    {
-        return false;
-    }
-    if proof.initial_cap.as_slice() != expected_initial_cap {
-        return false;
-    }
-
-    challenger.observe_label(b"flock-ligerito-basis-v0");
-    challenger.observe_f128(target);
-    challenger.observe_bytes(proof.initial_cap.as_flattened());
-
-    let log_inv_rate_0 = config.log_inv_rates[0];
-    let log_msg_cols_0 = log_n - initial_k;
-    let block_len_0 = 1usize << (log_msg_cols_0 + log_inv_rate_0);
-    // Opened L0 rows are `l0_num_lanes` wide — `2^initial_k` on the
-    // power-of-two path, the integer `t` under a high-bit-lane commit whose
-    // top lanes are definitionally zero. The lane-fold weights stay
-    // `2^initial_k`-wide; the shorter rows zero-pad against them (the dot
-    // products below zip, which IS the zero-fill).
-    let num_interleaved_0 = l0_num_lanes;
-    if num_interleaved_0 == 0 || num_interleaved_0 > 1usize << initial_k {
-        return false;
-    }
-
-    let fold_bits =
-        |lvl: usize| -> u32 { config.fold_grinding_bits.get(lvl).copied().unwrap_or(0) as u32 };
-    let claim_batch_bits = |lvl: usize| -> u32 {
-        config
-            .claim_batch_grinding_bits
-            .get(lvl)
-            .copied()
-            .unwrap_or(0) as u32
-    };
-    let consistency_batch_bits = |lvl: usize| -> u32 {
-        config
-            .consistency_batch_grinding_bits
-            .get(lvl)
-            .copied()
-            .unwrap_or(0) as u32
-    };
-    let ood_count = |lvl: usize| -> usize { config.ood_samples.get(lvl).copied().unwrap_or(0) };
-    let mut fold_nonce_idx = 0usize;
-    let mut claim_batch_nonce_idx = 0usize;
-    let mut consistency_batch_nonce_idx = 0usize;
-    let mut ood_idx = 0usize;
-    // OOD claims glued into the running sumcheck: each contributes
-    // `beta · Π_b eq(z_b, r_b) · eq(z_tail, ·)` at the residual.
-    struct OodCtx {
-        z: Vec<F128>,
-        ris_start: usize,
-        beta: F128,
-    }
-    let mut ood_ctxs: Vec<OodCtx> = Vec::new();
-
-    let mut t_r = target;
-    // L0's extra binding point is batched before the initial sumcheck
-    // message. The ordinary opening evaluation is its first point.
-    for _ in 0..ood_count(0) {
-        let mut z = challenger.sample_f128_vec(log_n);
-        if ood_idx >= proof.ood_values.len() {
-            return false;
-        }
-        let y = proof.ood_values[ood_idx];
-        ood_idx += 1;
-        challenger.observe_f128(y);
-        if claim_batch_nonce_idx >= proof.claim_batch_grinding_nonces.len() {
-            return false;
-        }
-        let Some(beta) = challenger.verify_pow_and_sample_f128(
-            proof.claim_batch_grinding_nonces[claim_batch_nonce_idx],
-            claim_batch_bits(0),
-        ) else {
-            return false;
-        };
-        claim_batch_nonce_idx += 1;
-        t_r += beta * y;
-        // A partial lane grid folds the HIGH lane coordinates first. Store
-        // the point in actual sumcheck-fold order so the generic residual
-        // prefix formula pairs every challenge with the coordinate it bound.
-        if l0_num_lanes < 1usize << initial_k {
-            z.rotate_left(log_msg_cols_0);
-        }
-        ood_ctxs.push(OodCtx {
-            z,
-            ris_start: 0,
-            beta,
-        });
-    }
-    let mut tx_idx = 0usize;
-    if tx_idx >= proof.sumcheck_transcript.len() {
-        return false;
-    }
-    let start_msg = proof.sumcheck_transcript[tx_idx];
-    tx_idx += 1;
-    challenger.observe_f128(start_msg.u_0);
-    challenger.observe_f128(start_msg.u_2);
-    let mut running_quad = RoundQuad::from_msg(start_msg, t_r);
-
-    let mut r_lane_fold = Vec::with_capacity(initial_k);
-    for j in 0..initial_k {
-        // Fold-challenge PoW mirror; see the prover's L0 loop for the
-        // tapered MCA / untapered sumcheck maximum.
-        let bits = fold_round_grinding_bits(fold_bits(0), claim_batch_bits(0), j);
-        let ri = if bits > 0 {
-            if fold_nonce_idx >= proof.fold_grinding_nonces.len() {
-                return false;
-            }
-            let Some(ri) = challenger
-                .verify_pow_and_sample_f128(proof.fold_grinding_nonces[fold_nonce_idx], bits)
-            else {
-                return false;
-            };
-            fold_nonce_idx += 1;
-            ri
-        } else {
-            challenger.sample_f128()
-        };
-        r_lane_fold.push(ri);
-        t_r = running_quad.eval(ri);
-        if tx_idx >= proof.sumcheck_transcript.len() {
-            return false;
-        }
-        let msg = proof.sumcheck_transcript[tx_idx];
-        tx_idx += 1;
-        challenger.observe_f128(msg.u_0);
-        challenger.observe_f128(msg.u_2);
-        running_quad = RoundQuad::from_msg(msg, t_r);
-    }
-
-    if proof.recursive_caps.is_empty() {
-        return false;
-    }
-    let cap_1: &[Hash] = &proof.recursive_caps[0];
-    challenger.observe_bytes(cap_1.as_flattened());
-
-    // OOD binding mirror for the L1 commit: sample z, read the claimed
-    // evaluation from the proof, and glue the claim into the running
-    // sumcheck exactly like the prover.
-    for _ in 0..ood_count(1) {
-        let z = challenger.sample_f128_vec(log_n - initial_k);
-        if ood_idx >= proof.ood_values.len() {
-            return false;
-        }
-        let y = proof.ood_values[ood_idx];
-        ood_idx += 1;
-        challenger.observe_f128(y);
-        if tx_idx >= proof.sumcheck_transcript.len() {
-            return false;
-        }
-        let intro_msg = proof.sumcheck_transcript[tx_idx];
-        tx_idx += 1;
-        challenger.observe_f128(intro_msg.u_0);
-        challenger.observe_f128(intro_msg.u_2);
-        let intro_quad = RoundQuad::from_msg(intro_msg, y);
-        if claim_batch_nonce_idx >= proof.claim_batch_grinding_nonces.len() {
-            return false;
-        }
-        let Some(beta) = challenger.verify_pow_and_sample_f128(
-            proof.claim_batch_grinding_nonces[claim_batch_nonce_idx],
-            claim_batch_bits(1),
-        ) else {
-            return false;
-        };
-        claim_batch_nonce_idx += 1;
-        running_quad = RoundQuad::fold(&running_quad, &intro_quad, beta);
-        t_r += beta * y;
-        ood_ctxs.push(OodCtx {
-            z,
-            ris_start: initial_k,
-            beta,
-        });
-    }
-
-    // PoW grinding check for L0's query phase. With grinding_bits[0]=0 this
-    // is a no-op (still absorbs the 0 nonce so the FS state matches the
-    // prover side).
-    let mut nonce_idx = 0usize;
-    if nonce_idx >= proof.grinding_nonces.len() {
-        return false;
-    }
-    let strat = |l: usize| &config.stratified[l];
-    let num_queries_0 = config.queries[0];
-    let _t = std::time::Instant::now();
-    let Some(queries_0) = verify_and_sample_queries(
-        challenger,
-        proof.grinding_nonces[nonce_idx],
-        config.grinding_bits[0] as u32,
-        block_len_0,
-        num_queries_0,
-        strat(0),
-    ) else {
-        return false;
-    };
-    nonce_idx += 1;
-    if trace {
-        t_sample_q += _t.elapsed();
-    }
-    if consistency_batch_nonce_idx >= proof.consistency_batch_grinding_nonces.len() {
-        return false;
-    }
-    let Some(alpha_0) = challenger.verify_pow_and_sample_f128_vec(
-        proof.consistency_batch_grinding_nonces[consistency_batch_nonce_idx],
-        consistency_batch_bits(0),
-        ceil_log2(num_queries_0),
-    ) else {
-        return false;
-    };
-    consistency_batch_nonce_idx += 1;
-    let _t = std::time::Instant::now();
-    if !verify_level_opens(
-        &proof.initial_cap,
-        block_len_0,
-        &queries_0,
-        &proof.initial_proof.opened_rows,
-        num_interleaved_0,
-        &proof.initial_proof.merkle_proof,
-        config.merkle_hash,
-        strat(0),
-    ) {
-        return false;
-    }
-    if trace {
-        t_merkle += _t.elapsed();
-    }
-
-    // Compute enforced_sum cheaply at intro time. The induced basis poly's
-    // residual evaluations are deferred to the final check (succinct path —
-    // see `induce_sumcheck_evaluate_at_residual`).
-    let n1 = log_n - initial_k;
-    let _t = std::time::Instant::now();
-    let enforced_sum_0 = induce_sumcheck_enforced_sum(
-        &proof.initial_proof.opened_rows,
-        &r_lane_fold,
-        &queries_0,
-        &alpha_0,
-    );
-    if trace {
-        t_enforced += _t.elapsed();
-    }
-
-    if tx_idx >= proof.sumcheck_transcript.len() {
-        return false;
-    }
-    let intro_msg_0 = proof.sumcheck_transcript[tx_idx];
-    tx_idx += 1;
-    challenger.observe_f128(intro_msg_0.u_0);
-    challenger.observe_f128(intro_msg_0.u_2);
-    let intro_quad_0 = RoundQuad::from_msg(intro_msg_0, enforced_sum_0);
-    if claim_batch_nonce_idx >= proof.claim_batch_grinding_nonces.len() {
-        return false;
-    }
-    let Some(beta_0) = challenger.verify_pow_and_sample_f128(
-        proof.claim_batch_grinding_nonces[claim_batch_nonce_idx],
-        claim_batch_bits(0),
-    ) else {
-        return false;
-    };
-    claim_batch_nonce_idx += 1;
-    running_quad = RoundQuad::fold(&running_quad, &intro_quad_0, beta_0);
-    t_r += beta_0 * enforced_sum_0;
-
-    // Per-level induced-basis evaluation context — small (no dense vec).
-    struct LevelCtx {
-        log_msg_cols: usize,
-        queries: Vec<usize>,
-        alpha: Vec<F128>, // ⌈log₂ Q⌉ field elements (eq-tensor combination)
-        ris_start: usize,
-        beta: F128,
-    }
-    let mut level_ctxs: Vec<LevelCtx> = vec![LevelCtx {
-        log_msg_cols: n1,
-        queries: queries_0.clone(),
-        alpha: alpha_0,
-        ris_start: initial_k,
-        beta: beta_0,
-    }];
-    let mut ris: Vec<F128> = r_lane_fold.clone();
-
-    let mut prev_cap: &[Hash] = cap_1;
-    let mut prev_log_num_interleaved = config.recursive_ks[0];
-    let mut prev_log_msg_cols = n1 - prev_log_num_interleaved;
-    let mut prev_log_inv_rate = config.log_inv_rates[1];
-    let mut next_root_idx = 1usize;
-    let mut recursive_proof_idx = 0usize;
-    let mut n_current = n1;
-
-    for i in 0..r {
-        let k_i = config.recursive_ks[i];
-        if n_current < k_i {
-            return false;
-        }
-        let mut level_rs = Vec::with_capacity(k_i);
-        for j in 0..k_i {
-            // Fold-challenge PoW mirror; see the prover's L0 loop for the
-            // tapered MCA / untapered sumcheck maximum.
-            let bits = fold_round_grinding_bits(fold_bits(i + 1), claim_batch_bits(i + 1), j);
-            let ri = if bits > 0 {
-                if fold_nonce_idx >= proof.fold_grinding_nonces.len() {
-                    return false;
-                }
-                let Some(ri) = challenger
-                    .verify_pow_and_sample_f128(proof.fold_grinding_nonces[fold_nonce_idx], bits)
-                else {
-                    return false;
-                };
-                fold_nonce_idx += 1;
-                ri
-            } else {
-                challenger.sample_f128()
-            };
-            ris.push(ri);
-            level_rs.push(ri);
-            t_r = running_quad.eval(ri);
-            if tx_idx >= proof.sumcheck_transcript.len() {
-                return false;
-            }
-            let msg = proof.sumcheck_transcript[tx_idx];
-            tx_idx += 1;
-            challenger.observe_f128(msg.u_0);
-            challenger.observe_f128(msg.u_2);
-            running_quad = RoundQuad::from_msg(msg, t_r);
-        }
-        n_current -= k_i;
-
-        if i == r - 1 {
-            if tx_idx != proof.sumcheck_transcript.len() {
-                return false;
-            }
-            if ood_idx != proof.ood_values.len()
-                || fold_nonce_idx != proof.fold_grinding_nonces.len()
-            {
-                return false;
-            }
-            let yr = &proof.final_proof.yr;
-            if yr.len() != 1 << n_current {
-                return false;
-            }
-            for v in yr {
-                challenger.observe_f128(*v);
-            }
-            // PoW grinding check for last level's query phase.
-            if nonce_idx >= proof.grinding_nonces.len() {
-                return false;
-            }
-            let prev_block_len = 1usize << (prev_log_msg_cols + prev_log_inv_rate);
-            let prev_num_interleaved = 1usize << prev_log_num_interleaved;
-            let num_queries_last = config.queries[i + 1];
-            let _t = std::time::Instant::now();
-            let Some(queries_last) = verify_and_sample_queries(
-                challenger,
-                proof.grinding_nonces[nonce_idx],
-                config.grinding_bits[i + 1] as u32,
-                prev_block_len,
-                num_queries_last,
-                strat(i + 1),
-            ) else {
-                return false;
-            };
-            nonce_idx += 1;
-            // Basis-induction challenge for the LAST commitment. Sampled here —
-            // after `yr` was observed (top of this branch) and the queries are
-            // fixed — so a forged `yr` cannot be adapted to it. Mirrors `alpha_i`
-            // at every non-final level (see ~line 3377).
-            if consistency_batch_nonce_idx >= proof.consistency_batch_grinding_nonces.len() {
-                return false;
-            }
-            let Some(alpha_last) = challenger.verify_pow_and_sample_f128_vec(
-                proof.consistency_batch_grinding_nonces[consistency_batch_nonce_idx],
-                consistency_batch_bits(i + 1),
-                ceil_log2(num_queries_last),
-            ) else {
-                return false;
-            };
-            consistency_batch_nonce_idx += 1;
-            if trace {
-                t_sample_q += _t.elapsed();
-            }
-            let _t = std::time::Instant::now();
-            if !verify_level_opens(
-                prev_cap,
-                prev_block_len,
-                &queries_last,
-                &proof.final_proof.opened_rows,
-                prev_num_interleaved,
-                &proof.final_proof.merkle_proof,
-                config.merkle_hash,
-                strat(i + 1),
-            ) {
-                return false;
-            }
-            if trace {
-                t_merkle += _t.elapsed();
-            }
-
-            // Bind the LAST commitment to `yr`. Every non-final level folds its
-            // opened rows into the running sumcheck via induce_sumcheck; the
-            // final level used to only Merkle-check its opened rows, leaving `yr`
-            // (the claimed final message) constrained by a single scalar equation
-            // — so a malicious prover could solve for a `yr` that opens the
-            // commitment to an arbitrary value. We add the same proximity tie as
-            // the other levels: `enforced_sum_last` is the α-weighted lane-fold
-            // of the (Merkle-bound) opened rows, batched into `t_r` with a fresh
-            // `beta_last`; its induced basis is already at the residual dimension
-            // (zero further folds), so it joins `combined` below via this
-            // LevelCtx. With `alpha_last` drawn after `yr`, the batched check now
-            // forces `yr` to agree with the committed codeword at every queried
-            // column (multilinear Schwartz–Zippel), restoring binding.
-            let enforced_sum_last = induce_sumcheck_enforced_sum(
-                &proof.final_proof.opened_rows,
-                &level_rs,
-                &queries_last,
-                &alpha_last,
-            );
-            if claim_batch_nonce_idx >= proof.claim_batch_grinding_nonces.len() {
-                return false;
-            }
-            let Some(beta_last) = challenger.verify_pow_and_sample_f128(
-                proof.claim_batch_grinding_nonces[claim_batch_nonce_idx],
-                claim_batch_bits(i + 1),
-            ) else {
-                return false;
-            };
-            claim_batch_nonce_idx += 1;
-            t_r += beta_last * enforced_sum_last;
-            level_ctxs.push(LevelCtx {
-                log_msg_cols: n_current,
-                queries: queries_last.clone(),
-                alpha: alpha_last,
-                ris_start: ris.len(),
-                beta: beta_last,
-            });
-
-            // Succinct residual check: per-level induced basis evaluations
-            // via closed-form (no dense materialization).
-            let yr_len = yr.len();
-            let yr_log_n = n_current;
-
-            let _t = std::time::Instant::now();
-            let induced_residuals: Vec<Vec<F128>> = level_ctxs
-                .iter()
-                .map(|ctx| {
-                    let sks_vks = eval_sk_at_vks(ctx.log_msg_cols);
-                    let ris_for_basis =
-                        &ris[ctx.ris_start..ctx.ris_start + ctx.log_msg_cols - yr_log_n];
-                    induce_sumcheck_evaluate_at_residual(
-                        ctx.log_msg_cols,
-                        &sks_vks,
-                        &ctx.queries,
-                        &ctx.alpha,
-                        ris_for_basis,
-                        yr_log_n,
-                    )
-                })
-                .collect();
-            if trace {
-                t_residual += _t.elapsed();
-            }
-            for resid in &induced_residuals {
-                if resid.len() != yr_len {
-                    return false;
-                }
-            }
-
-            // OOD bases: closed-form residual. An eq(z, ·) basis introduced
-            // at dim |z| and folded by the subsequent challenges contributes
-            // `beta · Π_b eq(z_b, r_b)` times the eq table on z's unfolded
-            // tail (char-2 eq factor: 1 + a + b).
-            let mut ood_residuals: Vec<Vec<F128>> = Vec::with_capacity(ood_ctxs.len());
-            for ctx in &ood_ctxs {
-                if ctx.z.len() < yr_log_n || ctx.ris_start + (ctx.z.len() - yr_log_n) > ris.len() {
-                    return false;
-                }
-                let folded = ctx.z.len() - yr_log_n;
-                let mut scalar = ctx.beta;
-                for b in 0..folded {
-                    scalar *= F128::ONE + ctx.z[b] + ris[ctx.ris_start + b];
-                }
-                let mut tail = build_eq_table(&ctx.z[folded..]);
-                for v in tail.iter_mut() {
-                    *v *= scalar;
-                }
-                ood_residuals.push(tail);
-            }
-
-            // Batch-evaluate b at all yr positions in one call so the
-            // caller can amortize prefix work (e.g. ring_switch tensor prefix).
-            let _te = std::time::Instant::now();
-            let evb_vec = eval_b_residual(&ris, yr_log_n);
-            if trace {
-                t_evalb += _te.elapsed();
-            }
-            if evb_vec.len() != yr_len {
-                return false;
-            }
-            let mut inner = F128::ZERO;
-            let _t = std::time::Instant::now();
-            for y in 0..yr_len {
-                let mut combined_y = evb_vec[y];
-                for (k, residual) in induced_residuals.iter().enumerate() {
-                    combined_y += level_ctxs[k].beta * residual[y];
-                }
-                for resid in &ood_residuals {
-                    combined_y += resid[y];
-                }
-                inner += yr[y] * combined_y;
-            }
-            if trace {
-                t_residual += _t.elapsed();
-            }
-            if trace {
-                let total = t_start.elapsed();
-                eprintln!("[lig-verify] total = {:.2} ms", total.as_secs_f64() * 1e3);
-                eprintln!(
-                    "  merkle multi-proofs:       {:.2} ms",
-                    t_merkle.as_secs_f64() * 1e3
-                );
-                eprintln!(
-                    "  sample_queries:            {:.2} ms",
-                    t_sample_q.as_secs_f64() * 1e3
-                );
-                eprintln!(
-                    "  enforced_sum (eq+dot):     {:.2} ms",
-                    t_enforced.as_secs_f64() * 1e3
-                );
-                eprintln!(
-                    "  residual basis eval:       {:.2} ms",
-                    t_residual.as_secs_f64() * 1e3
-                );
-                eprintln!(
-                    "  eval_b (yr_len positions): {:.2} ms",
-                    t_evalb.as_secs_f64() * 1e3
-                );
-            }
-            if trace && inner != t_r {
-                eprintln!("  residual mismatch: inner={inner:?}, t_r={t_r:?}");
-            }
-            if nonce_idx != proof.grinding_nonces.len()
-                || claim_batch_nonce_idx != proof.claim_batch_grinding_nonces.len()
-                || consistency_batch_nonce_idx != proof.consistency_batch_grinding_nonces.len()
-            {
-                return false;
-            }
-            return inner == t_r;
-        }
-
-        if next_root_idx >= proof.recursive_caps.len() {
-            return false;
-        }
-        let cap_next: &[Hash] = &proof.recursive_caps[next_root_idx];
-        next_root_idx += 1;
-        challenger.observe_bytes(cap_next.as_flattened());
-
-        // OOD binding mirror for the L_{i+2} commit.
-        for _ in 0..ood_count(i + 2) {
-            let z = challenger.sample_f128_vec(n_current);
-            if ood_idx >= proof.ood_values.len() {
-                return false;
-            }
-            let y = proof.ood_values[ood_idx];
-            ood_idx += 1;
-            challenger.observe_f128(y);
-            if tx_idx >= proof.sumcheck_transcript.len() {
-                return false;
-            }
-            let intro_msg = proof.sumcheck_transcript[tx_idx];
-            tx_idx += 1;
-            challenger.observe_f128(intro_msg.u_0);
-            challenger.observe_f128(intro_msg.u_2);
-            let intro_quad = RoundQuad::from_msg(intro_msg, y);
-            if claim_batch_nonce_idx >= proof.claim_batch_grinding_nonces.len() {
-                return false;
-            }
-            let Some(beta) = challenger.verify_pow_and_sample_f128(
-                proof.claim_batch_grinding_nonces[claim_batch_nonce_idx],
-                claim_batch_bits(i + 2),
-            ) else {
-                return false;
-            };
-            claim_batch_nonce_idx += 1;
-            running_quad = RoundQuad::fold(&running_quad, &intro_quad, beta);
-            t_r += beta * y;
-            ood_ctxs.push(OodCtx {
-                z,
-                ris_start: ris.len(),
-                beta,
-            });
-        }
-
-        // PoW grinding check for this iteration's query phase.
-        if nonce_idx >= proof.grinding_nonces.len() {
-            return false;
-        }
-        let prev_block_len = 1usize << (prev_log_msg_cols + prev_log_inv_rate);
-        let prev_num_interleaved = 1usize << prev_log_num_interleaved;
-        let num_queries_i = config.queries[i + 1];
-        let _t = std::time::Instant::now();
-        let Some(queries_i) = verify_and_sample_queries(
-            challenger,
-            proof.grinding_nonces[nonce_idx],
-            config.grinding_bits[i + 1] as u32,
-            prev_block_len,
-            num_queries_i,
-            strat(i + 1),
-        ) else {
-            return false;
-        };
-        nonce_idx += 1;
-        if trace {
-            t_sample_q += _t.elapsed();
-        }
-        if consistency_batch_nonce_idx >= proof.consistency_batch_grinding_nonces.len() {
-            return false;
-        }
-        let Some(alpha_i) = challenger.verify_pow_and_sample_f128_vec(
-            proof.consistency_batch_grinding_nonces[consistency_batch_nonce_idx],
-            consistency_batch_bits(i + 1),
-            ceil_log2(num_queries_i),
-        ) else {
-            return false;
-        };
-        consistency_batch_nonce_idx += 1;
-        if recursive_proof_idx >= proof.recursive_proofs.len() {
-            return false;
-        }
-        let rp = &proof.recursive_proofs[recursive_proof_idx];
-        recursive_proof_idx += 1;
-        let _t = std::time::Instant::now();
-        if !verify_level_opens(
-            prev_cap,
-            prev_block_len,
-            &queries_i,
-            &rp.opened_rows,
-            prev_num_interleaved,
-            &rp.merkle_proof,
-            config.merkle_hash,
-            strat(i + 1),
-        ) {
-            return false;
-        }
-        if trace {
-            t_merkle += _t.elapsed();
-        }
-
-        let _t = std::time::Instant::now();
-        let enforced_sum_i =
-            induce_sumcheck_enforced_sum(&rp.opened_rows, &level_rs, &queries_i, &alpha_i);
-        if trace {
-            t_enforced += _t.elapsed();
-        }
-
-        if tx_idx >= proof.sumcheck_transcript.len() {
-            return false;
-        }
-        let intro_msg_i = proof.sumcheck_transcript[tx_idx];
-        tx_idx += 1;
-        challenger.observe_f128(intro_msg_i.u_0);
-        challenger.observe_f128(intro_msg_i.u_2);
-        let intro_quad_i = RoundQuad::from_msg(intro_msg_i, enforced_sum_i);
-        if claim_batch_nonce_idx >= proof.claim_batch_grinding_nonces.len() {
-            return false;
-        }
-        let Some(beta_i) = challenger.verify_pow_and_sample_f128(
-            proof.claim_batch_grinding_nonces[claim_batch_nonce_idx],
-            claim_batch_bits(i + 1),
-        ) else {
-            return false;
-        };
-        claim_batch_nonce_idx += 1;
-        running_quad = RoundQuad::fold(&running_quad, &intro_quad_i, beta_i);
-        t_r += beta_i * enforced_sum_i;
-        level_ctxs.push(LevelCtx {
-            log_msg_cols: n_current,
-            queries: queries_i.clone(),
-            alpha: alpha_i,
-            ris_start: ris.len(),
-            beta: beta_i,
-        });
-
-        prev_cap = cap_next;
-        let k_next = config.recursive_ks[i + 1];
-        if n_current < k_next {
-            return false;
-        }
-        prev_log_num_interleaved = k_next;
-        prev_log_msg_cols = n_current - k_next;
-        prev_log_inv_rate = config.log_inv_rates[i + 2];
-    }
-
-    unreachable!()
-}
-
-/// Verifier for [`recursive_prover_with_basis`]. Caller supplies the basis
-/// `b_initial` recomputed locally (typically from the combined claims) and
-/// `target`. Also supplies the L0 root (from the upstream `Commitment`).
-#[allow(clippy::too_many_arguments)]
-pub fn recursive_verifier_with_basis<Ch: Challenger>(
-    config: &VerifierConfig,
-    proof: &LigeritoProof,
-    b_initial: &[F128],
-    target: F128,
-    expected_initial_cap: &[Hash],
-    challenger: &mut Ch,
-) -> bool {
-    let log_n = b_initial.len().trailing_zeros() as usize;
-    let initial_k = config.initial_k;
-    let r = config.recursive_steps;
-
-    if r < 1
-        || config.recursive_ks.len() != r
-        || config.log_inv_rates.len() != r + 1
-        || config.queries.len() != r + 1
-        || config.grinding_bits.len() != r + 1
-        || config.fold_grinding_bits.len() != r + 1
-        || config.claim_batch_grinding_bits.len() != r + 1
-        || config.consistency_batch_grinding_bits.len() != r + 1
-        || config.ood_samples.len() != r + 1
-    {
-        return false;
-    }
-    if b_initial.len() != 1usize << log_n {
-        return false;
-    }
-    if proof.initial_cap.as_slice() != expected_initial_cap {
-        return false;
-    }
-
-    challenger.observe_label(b"flock-ligerito-basis-v0");
-    challenger.observe_f128(target);
-    challenger.observe_bytes(proof.initial_cap.as_flattened());
-
-    let log_inv_rate_0 = config.log_inv_rates[0];
-    let log_msg_cols_0 = log_n - initial_k;
-    let block_len_0 = 1usize << (log_msg_cols_0 + log_inv_rate_0);
-    let num_interleaved_0 = 1usize << initial_k;
-
-    let fold_bits =
-        |lvl: usize| -> u32 { config.fold_grinding_bits.get(lvl).copied().unwrap_or(0) as u32 };
-    let claim_batch_bits = |lvl: usize| -> u32 {
-        config
-            .claim_batch_grinding_bits
-            .get(lvl)
-            .copied()
-            .unwrap_or(0) as u32
-    };
-    let consistency_batch_bits = |lvl: usize| -> u32 {
-        config
-            .consistency_batch_grinding_bits
-            .get(lvl)
-            .copied()
-            .unwrap_or(0) as u32
-    };
-    let ood_count = |lvl: usize| -> usize { config.ood_samples.get(lvl).copied().unwrap_or(0) };
-    let mut fold_nonce_idx = 0usize;
-    let mut claim_batch_nonce_idx = 0usize;
-    let mut consistency_batch_nonce_idx = 0usize;
-    let mut ood_idx = 0usize;
-    // OOD eq bases glued into the running sumcheck, accumulated as
-    // (dense eq table, ris_start, beta) and added at the residual check.
-    let mut ood_bases: Vec<(Vec<F128>, usize, F128)> = Vec::new();
-
-    // Replay sumcheck: L0's extra binding claim is batched into the initial
-    // target/basis, then start msg → initial_k folds.
-    let mut t_r = target;
-    for _ in 0..ood_count(0) {
-        let z = challenger.sample_f128_vec(log_n);
-        if ood_idx >= proof.ood_values.len() {
-            return false;
-        }
-        let y = proof.ood_values[ood_idx];
-        ood_idx += 1;
-        challenger.observe_f128(y);
-        if claim_batch_nonce_idx >= proof.claim_batch_grinding_nonces.len() {
-            return false;
-        }
-        let Some(beta) = challenger.verify_pow_and_sample_f128(
-            proof.claim_batch_grinding_nonces[claim_batch_nonce_idx],
-            claim_batch_bits(0),
-        ) else {
-            return false;
-        };
-        claim_batch_nonce_idx += 1;
-        t_r += beta * y;
-        ood_bases.push((build_eq_table(&z), 0, beta));
-    }
-    let mut tx_idx = 0usize;
-    if tx_idx >= proof.sumcheck_transcript.len() {
-        return false;
-    }
-    let start_msg = proof.sumcheck_transcript[tx_idx];
-    tx_idx += 1;
-    challenger.observe_f128(start_msg.u_0);
-    challenger.observe_f128(start_msg.u_2);
-    let mut running_quad = RoundQuad::from_msg(start_msg, t_r);
-
-    let mut r_lane_fold = Vec::with_capacity(initial_k);
-    for j in 0..initial_k {
-        // Fold-challenge PoW mirror; see the prover's L0 loop for the
-        // tapered MCA / untapered sumcheck maximum.
-        let bits = fold_round_grinding_bits(fold_bits(0), claim_batch_bits(0), j);
-        let ri = if bits > 0 {
-            if fold_nonce_idx >= proof.fold_grinding_nonces.len() {
-                return false;
-            }
-            let Some(ri) = challenger
-                .verify_pow_and_sample_f128(proof.fold_grinding_nonces[fold_nonce_idx], bits)
-            else {
-                return false;
-            };
-            fold_nonce_idx += 1;
-            ri
-        } else {
-            challenger.sample_f128()
-        };
-        r_lane_fold.push(ri);
-        t_r = running_quad.eval(ri);
-        if tx_idx >= proof.sumcheck_transcript.len() {
-            return false;
-        }
-        let msg = proof.sumcheck_transcript[tx_idx];
-        tx_idx += 1;
-        challenger.observe_f128(msg.u_0);
-        challenger.observe_f128(msg.u_2);
-        running_quad = RoundQuad::from_msg(msg, t_r);
-    }
-
-    // Observe wtns_1 root + open wtns_0.
-    if proof.recursive_caps.is_empty() {
-        return false;
-    }
-    let cap_1: &[Hash] = &proof.recursive_caps[0];
-    challenger.observe_bytes(cap_1.as_flattened());
-
-    // OOD binding mirror for the L1 commit.
-    for _ in 0..ood_count(1) {
-        let z = challenger.sample_f128_vec(log_n - initial_k);
-        if ood_idx >= proof.ood_values.len() {
-            return false;
-        }
-        let y = proof.ood_values[ood_idx];
-        ood_idx += 1;
-        challenger.observe_f128(y);
-        if tx_idx >= proof.sumcheck_transcript.len() {
-            return false;
-        }
-        let intro_msg = proof.sumcheck_transcript[tx_idx];
-        tx_idx += 1;
-        challenger.observe_f128(intro_msg.u_0);
-        challenger.observe_f128(intro_msg.u_2);
-        let intro_quad = RoundQuad::from_msg(intro_msg, y);
-        if claim_batch_nonce_idx >= proof.claim_batch_grinding_nonces.len() {
-            return false;
-        }
-        let Some(beta) = challenger.verify_pow_and_sample_f128(
-            proof.claim_batch_grinding_nonces[claim_batch_nonce_idx],
-            claim_batch_bits(1),
-        ) else {
-            return false;
-        };
-        claim_batch_nonce_idx += 1;
-        running_quad = RoundQuad::fold(&running_quad, &intro_quad, beta);
-        t_r += beta * y;
-        ood_bases.push((build_eq_table(&z), initial_k, beta));
-    }
-
-    // PoW grinding check (dense verifier mirror) — keeps the FS state in
-    // lockstep with the prover even at grinding_bits = 0.
-    let mut nonce_idx = 0usize;
-    if nonce_idx >= proof.grinding_nonces.len() {
-        return false;
-    }
-    let strat = |l: usize| &config.stratified[l];
-    let num_queries_0 = config.queries[0];
-    let Some(queries_0) = verify_and_sample_queries(
-        challenger,
-        proof.grinding_nonces[nonce_idx],
-        config.grinding_bits[0] as u32,
-        block_len_0,
-        num_queries_0,
-        strat(0),
-    ) else {
-        return false;
-    };
-    nonce_idx += 1;
-    if consistency_batch_nonce_idx >= proof.consistency_batch_grinding_nonces.len() {
-        return false;
-    }
-    let Some(alpha_0) = challenger.verify_pow_and_sample_f128_vec(
-        proof.consistency_batch_grinding_nonces[consistency_batch_nonce_idx],
-        consistency_batch_bits(0),
-        ceil_log2(num_queries_0),
-    ) else {
-        return false;
-    };
-    consistency_batch_nonce_idx += 1;
-    if !verify_level_opens(
-        &proof.initial_cap,
-        block_len_0,
-        &queries_0,
-        &proof.initial_proof.opened_rows,
-        num_interleaved_0,
-        &proof.initial_proof.merkle_proof,
-        config.merkle_hash,
-        strat(0),
-    ) {
-        return false;
-    }
-
-    let n1 = log_n - initial_k;
-    let sks_vks_n1 = eval_sk_at_vks(n1);
-    let (basis_0_induced, enforced_sum_0) = induce_sumcheck_poly_auto(
-        n1,
-        log_inv_rate_0,
-        &sks_vks_n1,
-        &proof.initial_proof.opened_rows,
-        &r_lane_fold,
-        &queries_0,
-        &alpha_0,
-    );
-
-    // Intro + glue.
-    if tx_idx >= proof.sumcheck_transcript.len() {
-        return false;
-    }
-    let intro_msg_0 = proof.sumcheck_transcript[tx_idx];
-    tx_idx += 1;
-    challenger.observe_f128(intro_msg_0.u_0);
-    challenger.observe_f128(intro_msg_0.u_2);
-    let intro_quad_0 = RoundQuad::from_msg(intro_msg_0, enforced_sum_0);
-    if claim_batch_nonce_idx >= proof.claim_batch_grinding_nonces.len() {
-        return false;
-    }
-    let Some(beta_0) = challenger.verify_pow_and_sample_f128(
-        proof.claim_batch_grinding_nonces[claim_batch_nonce_idx],
-        claim_batch_bits(0),
-    ) else {
-        return false;
-    };
-    claim_batch_nonce_idx += 1;
-    running_quad = RoundQuad::fold(&running_quad, &intro_quad_0, beta_0);
-    t_r += beta_0 * enforced_sum_0;
-
-    // Basis poly tracking for residual check.
-    // b_initial is the "level-0 basis" — it gets partial-eval'd at all ris.
-    // basis_0_induced is introduced at start (before any ris from level 0+) — partial-eval at the level-0+ ris.
-    let mut basis_polys: Vec<Vec<F128>> = vec![b_initial.to_vec(), basis_0_induced];
-    let mut basis_ris_starts: Vec<usize> = vec![0, initial_k];
-    let mut basis_separations: Vec<F128> = vec![beta_0];
-    let mut ris: Vec<F128> = r_lane_fold.clone();
-
-    let mut prev_cap: &[Hash] = cap_1;
-    let mut prev_log_num_interleaved = config.recursive_ks[0];
-    let mut prev_log_msg_cols = n1 - prev_log_num_interleaved;
-    let mut prev_log_inv_rate = config.log_inv_rates[1];
-    let mut next_root_idx = 1usize;
-    let mut recursive_proof_idx = 0usize;
-    let mut n_current = n1;
-
-    for i in 0..r {
-        let k_i = config.recursive_ks[i];
-        if n_current < k_i {
-            return false;
-        }
-        let mut level_rs = Vec::with_capacity(k_i);
-        for j in 0..k_i {
-            // Fold-challenge PoW mirror; see the prover's L0 loop for the
-            // tapered MCA / untapered sumcheck maximum.
-            let bits = fold_round_grinding_bits(fold_bits(i + 1), claim_batch_bits(i + 1), j);
-            let ri = if bits > 0 {
-                if fold_nonce_idx >= proof.fold_grinding_nonces.len() {
-                    return false;
-                }
-                let Some(ri) = challenger
-                    .verify_pow_and_sample_f128(proof.fold_grinding_nonces[fold_nonce_idx], bits)
-                else {
-                    return false;
-                };
-                fold_nonce_idx += 1;
-                ri
-            } else {
-                challenger.sample_f128()
-            };
-            ris.push(ri);
-            level_rs.push(ri);
-            t_r = running_quad.eval(ri);
-            if tx_idx >= proof.sumcheck_transcript.len() {
-                return false;
-            }
-            let msg = proof.sumcheck_transcript[tx_idx];
-            tx_idx += 1;
-            challenger.observe_f128(msg.u_0);
-            challenger.observe_f128(msg.u_2);
-            running_quad = RoundQuad::from_msg(msg, t_r);
-        }
-        n_current -= k_i;
-
-        if i == r - 1 {
-            if tx_idx != proof.sumcheck_transcript.len() {
-                return false;
-            }
-            if ood_idx != proof.ood_values.len()
-                || fold_nonce_idx != proof.fold_grinding_nonces.len()
-            {
-                return false;
-            }
-            let yr = &proof.final_proof.yr;
-            if yr.len() != 1 << n_current {
-                return false;
-            }
-            for v in yr {
-                challenger.observe_f128(*v);
-            }
-            // PoW grinding check for last level (dense verifier).
-            if nonce_idx >= proof.grinding_nonces.len() {
-                return false;
-            }
-            let prev_block_len = 1usize << (prev_log_msg_cols + prev_log_inv_rate);
-            let prev_num_interleaved = 1usize << prev_log_num_interleaved;
-            let num_queries_last = config.queries[i + 1];
-            let Some(queries_last) = verify_and_sample_queries(
-                challenger,
-                proof.grinding_nonces[nonce_idx],
-                config.grinding_bits[i + 1] as u32,
-                prev_block_len,
-                num_queries_last,
-                strat(i + 1),
-            ) else {
-                return false;
-            };
-            nonce_idx += 1;
-            // Final-level basis-induction challenge — sampled after `yr` and the
-            // queries are fixed. Same position as the succinct verifier
-            // (recursive_verifier_with_basis_succinct), which verifies the same
-            // proof, so both stay in lockstep.
-            if consistency_batch_nonce_idx >= proof.consistency_batch_grinding_nonces.len() {
-                return false;
-            }
-            let Some(alpha_last) = challenger.verify_pow_and_sample_f128_vec(
-                proof.consistency_batch_grinding_nonces[consistency_batch_nonce_idx],
-                consistency_batch_bits(i + 1),
-                ceil_log2(num_queries_last),
-            ) else {
-                return false;
-            };
-            consistency_batch_nonce_idx += 1;
-            if !verify_level_opens(
-                prev_cap,
-                prev_block_len,
-                &queries_last,
-                &proof.final_proof.opened_rows,
-                prev_num_interleaved,
-                &proof.final_proof.merkle_proof,
-                config.merkle_hash,
-                strat(i + 1),
-            ) {
-                return false;
-            }
-
-            // Bind the LAST commitment to `yr`: induce its opened rows into the
-            // sumcheck exactly like every non-final level, batched with a fresh
-            // `beta_last`. Without this the last commitment is only Merkle-checked
-            // and `yr` is left unconstrained — a forged `yr` could open to any
-            // value. (Dense mirror of the succinct verifier fix.)
-            let sks_vks_last = eval_sk_at_vks(n_current);
-            let (basis_last_induced, enforced_sum_last) = induce_sumcheck_poly(
-                n_current,
-                &sks_vks_last,
-                &proof.final_proof.opened_rows,
-                &level_rs,
-                &queries_last,
-                &alpha_last,
-            );
-            if claim_batch_nonce_idx >= proof.claim_batch_grinding_nonces.len() {
-                return false;
-            }
-            let Some(beta_last) = challenger.verify_pow_and_sample_f128(
-                proof.claim_batch_grinding_nonces[claim_batch_nonce_idx],
-                claim_batch_bits(i + 1),
-            ) else {
-                return false;
-            };
-            claim_batch_nonce_idx += 1;
-            t_r += beta_last * enforced_sum_last;
-            basis_polys.push(basis_last_induced);
-            basis_ris_starts.push(ris.len());
-            basis_separations.push(beta_last);
-
-            // Residual check.
-            let yr_len = yr.len();
-            let mut combined = vec![F128::ZERO; yr_len];
-            for (k, basis) in basis_polys.iter().enumerate() {
-                let start = basis_ris_starts[k];
-                let residual = partial_eval_lsb(basis, &ris[start..]);
-                if residual.len() != yr_len {
-                    return false;
-                }
-                let sep = if k == 0 {
-                    F128::ONE
-                } else {
-                    basis_separations[k - 1]
-                };
-                for (c, &rr) in combined.iter_mut().zip(residual.iter()) {
-                    *c += sep * rr;
-                }
-            }
-            // OOD eq bases contribute the same way (dense tables).
-            for (basis, start, beta) in &ood_bases {
-                let residual = partial_eval_lsb(basis, &ris[*start..]);
-                if residual.len() != yr_len {
-                    return false;
-                }
-                for (c, &rr) in combined.iter_mut().zip(residual.iter()) {
-                    *c += *beta * rr;
-                }
-            }
-            let inner: F128 = yr
-                .iter()
-                .zip(combined.iter())
-                .map(|(&y, &c)| y * c)
-                .fold(F128::ZERO, |a, v| a + v);
-            if nonce_idx != proof.grinding_nonces.len()
-                || claim_batch_nonce_idx != proof.claim_batch_grinding_nonces.len()
-                || consistency_batch_nonce_idx != proof.consistency_batch_grinding_nonces.len()
-            {
-                return false;
-            }
-            return inner == t_r;
-        }
-
-        if next_root_idx >= proof.recursive_caps.len() {
-            return false;
-        }
-        let cap_next: &[Hash] = &proof.recursive_caps[next_root_idx];
-        next_root_idx += 1;
-        challenger.observe_bytes(cap_next.as_flattened());
-
-        // OOD binding mirror for the L_{i+2} commit.
-        for _ in 0..ood_count(i + 2) {
-            let z = challenger.sample_f128_vec(n_current);
-            if ood_idx >= proof.ood_values.len() {
-                return false;
-            }
-            let y = proof.ood_values[ood_idx];
-            ood_idx += 1;
-            challenger.observe_f128(y);
-            if tx_idx >= proof.sumcheck_transcript.len() {
-                return false;
-            }
-            let intro_msg = proof.sumcheck_transcript[tx_idx];
-            tx_idx += 1;
-            challenger.observe_f128(intro_msg.u_0);
-            challenger.observe_f128(intro_msg.u_2);
-            let intro_quad = RoundQuad::from_msg(intro_msg, y);
-            if claim_batch_nonce_idx >= proof.claim_batch_grinding_nonces.len() {
-                return false;
-            }
-            let Some(beta) = challenger.verify_pow_and_sample_f128(
-                proof.claim_batch_grinding_nonces[claim_batch_nonce_idx],
-                claim_batch_bits(i + 2),
-            ) else {
-                return false;
-            };
-            claim_batch_nonce_idx += 1;
-            running_quad = RoundQuad::fold(&running_quad, &intro_quad, beta);
-            t_r += beta * y;
-            ood_bases.push((build_eq_table(&z), ris.len(), beta));
-        }
-
-        // PoW grinding check for this iteration (dense verifier mirror).
-        if nonce_idx >= proof.grinding_nonces.len() {
-            return false;
-        }
-        let prev_block_len = 1usize << (prev_log_msg_cols + prev_log_inv_rate);
-        let prev_num_interleaved = 1usize << prev_log_num_interleaved;
-        let num_queries_i = config.queries[i + 1];
-        let Some(queries_i) = verify_and_sample_queries(
-            challenger,
-            proof.grinding_nonces[nonce_idx],
-            config.grinding_bits[i + 1] as u32,
-            prev_block_len,
-            num_queries_i,
-            strat(i + 1),
-        ) else {
-            return false;
-        };
-        nonce_idx += 1;
-        if consistency_batch_nonce_idx >= proof.consistency_batch_grinding_nonces.len() {
-            return false;
-        }
-        let Some(alpha_i) = challenger.verify_pow_and_sample_f128_vec(
-            proof.consistency_batch_grinding_nonces[consistency_batch_nonce_idx],
-            consistency_batch_bits(i + 1),
-            ceil_log2(num_queries_i),
-        ) else {
-            return false;
-        };
-        consistency_batch_nonce_idx += 1;
-        if recursive_proof_idx >= proof.recursive_proofs.len() {
-            return false;
-        }
-        let rp = &proof.recursive_proofs[recursive_proof_idx];
-        recursive_proof_idx += 1;
-        if !verify_level_opens(
-            prev_cap,
-            prev_block_len,
-            &queries_i,
-            &rp.opened_rows,
-            prev_num_interleaved,
-            &rp.merkle_proof,
-            config.merkle_hash,
-            strat(i + 1),
-        ) {
-            return false;
-        }
-
-        let sks_vks_i = eval_sk_at_vks(n_current);
-        let (basis_i_induced, enforced_sum_i) = induce_sumcheck_poly(
-            n_current,
-            &sks_vks_i,
-            &rp.opened_rows,
-            &level_rs,
-            &queries_i,
-            &alpha_i,
-        );
-
-        if tx_idx >= proof.sumcheck_transcript.len() {
-            return false;
-        }
-        let intro_msg_i = proof.sumcheck_transcript[tx_idx];
-        tx_idx += 1;
-        challenger.observe_f128(intro_msg_i.u_0);
-        challenger.observe_f128(intro_msg_i.u_2);
-        let intro_quad_i = RoundQuad::from_msg(intro_msg_i, enforced_sum_i);
-        if claim_batch_nonce_idx >= proof.claim_batch_grinding_nonces.len() {
-            return false;
-        }
-        let Some(beta_i) = challenger.verify_pow_and_sample_f128(
-            proof.claim_batch_grinding_nonces[claim_batch_nonce_idx],
-            claim_batch_bits(i + 1),
-        ) else {
-            return false;
-        };
-        claim_batch_nonce_idx += 1;
-        running_quad = RoundQuad::fold(&running_quad, &intro_quad_i, beta_i);
-        t_r += beta_i * enforced_sum_i;
-        basis_polys.push(basis_i_induced);
-        basis_ris_starts.push(ris.len());
-        basis_separations.push(beta_i);
-
-        prev_cap = cap_next;
-        let k_next = config.recursive_ks[i + 1];
-        if n_current < k_next {
-            return false;
-        }
-        prev_log_num_interleaved = k_next;
-        prev_log_msg_cols = n_current - k_next;
-        prev_log_inv_rate = config.log_inv_rates[i + 2];
-    }
-
-    unreachable!()
 }
 
 /// Shared body — runs after wtns_0 is in hand (whether freshly built or
@@ -7740,7 +6439,7 @@ mod tests {
         );
         let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
             wtns_0
-                .cap(cfg.l0_cap_depth(wtns_0.block_len.trailing_zeros() as usize))
+                .cap(cfg.l0_cap_depth())
                 .to_vec()
         };
 
@@ -8851,7 +7550,7 @@ mod tests {
             let ntt0 = AdditiveNttF128::standard(cols0 + rate0);
             let wtns0 = ligero_commit(&poly, cols0, initial_k, rate0, &ntt0, hash);
             let cap = wtns0
-                .cap(vc.l0_cap_depth(wtns0.block_len.trailing_zeros() as usize))
+                .cap(vc.l0_cap_depth())
                 .to_vec();
 
             let mut times = Vec::new();
@@ -9356,7 +8055,7 @@ mod tests {
         );
         let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
             wtns_0
-                .cap(cfg.l0_cap_depth(wtns_0.block_len.trailing_zeros() as usize))
+                .cap(cfg.l0_cap_depth())
                 .to_vec()
         };
 
@@ -9810,7 +8509,7 @@ mod tests {
         );
         let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
             wtns_0
-                .cap(cfg.l0_cap_depth(wtns_0.block_len.trailing_zeros() as usize))
+                .cap(cfg.l0_cap_depth())
                 .to_vec()
         };
 
@@ -9960,7 +8659,7 @@ mod tests {
         );
         let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
             wtns_0
-                .cap(cfg.l0_cap_depth(wtns_0.block_len.trailing_zeros() as usize))
+                .cap(cfg.l0_cap_depth())
                 .to_vec()
         };
 
@@ -10104,7 +8803,7 @@ mod tests {
         );
         let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
             wtns_0
-                .cap(cfg.l0_cap_depth(wtns_0.block_len.trailing_zeros() as usize))
+                .cap(cfg.l0_cap_depth())
                 .to_vec()
         };
 
@@ -10197,7 +8896,7 @@ mod tests {
         );
         let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
             wtns_0
-                .cap(cfg.l0_cap_depth(wtns_0.block_len.trailing_zeros() as usize))
+                .cap(cfg.l0_cap_depth())
                 .to_vec()
         };
 
@@ -10286,7 +8985,7 @@ mod tests {
                     ligero_commit(&poly, log_msg_cols_0, initial_k, 1, &ntt_0, merkle_hash);
                 let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
                     wtns_0
-                        .cap(cfg.l0_cap_depth(wtns_0.block_len.trailing_zeros() as usize))
+                        .cap(cfg.l0_cap_depth())
                         .to_vec()
                 };
 
@@ -10412,7 +9111,7 @@ mod tests {
         );
         let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
             wtns_0
-                .cap(cfg.l0_cap_depth(wtns_0.block_len.trailing_zeros() as usize))
+                .cap(cfg.l0_cap_depth())
                 .to_vec()
         };
 

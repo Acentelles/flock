@@ -238,13 +238,33 @@ pub(crate) fn fold_sqrt_rule() -> bool {
     *RULE.get_or_init(|| std::env::var("FLOCK_FOLD_RULE").is_ok_and(|v| v == "sqrt"))
 }
 
+/// Types whose all-zero bit pattern is a valid, initialized value.
+///
+/// # Safety
+///
+/// Implement only for plain-old-data types with no invalid bit patterns and
+/// no padding-sensitive invariants: no references, no `NonZero`, no enums
+/// whose discriminant 0 is unassigned. [`alloc_zeroed_vec`] hands out
+/// OS-zeroed memory as `Vec<T>` on the strength of this marker.
+pub unsafe trait Zeroable: Copy {}
+// SAFETY: primitive integers and F128 (a transparent pair of u64 limbs; zero
+// is the field's additive identity) are all-zero-valid, and an array of
+// all-zero-valid values is all-zero-valid.
+unsafe impl Zeroable for u8 {}
+unsafe impl Zeroable for u16 {}
+unsafe impl Zeroable for u32 {}
+unsafe impl Zeroable for u64 {}
+unsafe impl Zeroable for usize {}
+unsafe impl Zeroable for field::F128 {}
+unsafe impl<T: Zeroable, const N: usize> Zeroable for [T; N] {}
+
 /// A length-`n` all-zero vector from `alloc_zeroed` — LAZY zero pages from
 /// the OS for large allocations, so untouched regions cost nothing.
 /// (`vec![T::ZERO; n]` does NOT get this for custom structs: the zero-value
 /// specialization only fires for built-in types, so it eagerly memsets.)
 /// `pub`: capacity-sized, mostly-dead buffers (a circuit's element slot
 /// witnesses at 2^nu rows for a few hundred live) want the lazy pages too.
-pub fn alloc_zeroed_vec<T: Copy>(n: usize) -> Vec<T> {
+pub fn alloc_zeroed_vec<T: Zeroable>(n: usize) -> Vec<T> {
     if n == 0 {
         return Vec::new();
     }
@@ -252,8 +272,8 @@ pub fn alloc_zeroed_vec<T: Copy>(n: usize) -> Vec<T> {
     // SAFETY:
     // - `alloc_zeroed` returns `n * size_of::<T>()` zeroed bytes with the
     //   layout's alignment (or null, handled below).
-    // - T: Copy (no Drop) and the all-zero bit pattern must be a valid T —
-    //   true for the plain-old-data field/word types this crate uses it for.
+    // - T: Copy (no Drop), and `T: Zeroable` certifies the all-zero bit
+    //   pattern is a valid T.
     unsafe {
         let ptr = std::alloc::alloc_zeroed(layout) as *mut T;
         if ptr.is_null() {

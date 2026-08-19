@@ -90,7 +90,8 @@ pub enum TranscriptOp {
 impl TranscriptOp {
     /// Bytes this op absorbs: a fixed 16-byte header
     /// `[op][kind][0;6][len u64]`, then the payload zero-padded to a multiple
-    /// of 16. Squeezed output is re-absorbed, so squeeze ops absorb too.
+    /// of 16. Squeeze ops absorb too — their 16-byte header (the squeezed
+    /// output itself is never fed back into the transcript).
     ///
     /// **Why everything is 16-aligned.** Every observed value is an `F128` —
     /// 16 bytes, and exactly one 128-bit committed word. A recursion circuit
@@ -109,7 +110,8 @@ impl TranscriptOp {
     /// **v2 accounting.** The DUPLEX chain discipline (transcript-v3,
     /// `with_chained_blake3`) absorbs no squeeze headers, so its per-op
     /// byte count differs: squeezes absorb 0 there and a `Pow` absorbs only
-    /// its nonce 32. Chain consumers derive the layout from
+    /// its nonce word (16 bytes: the 8-byte LE nonce plus the zero-constrained
+    /// pad). Chain consumers derive the layout from
     /// [`TranscriptShape::stream_words_duplex`], never from this.
     pub fn absorbed_bytes(&self) -> usize {
         let pad16 = |n: usize| n.div_ceil(16) * 16;
@@ -151,8 +153,9 @@ impl TranscriptOp {
     }
 
     /// Whether this op finalizes the pending state. Finalizations are the
-    /// transcript's serial depth: each squeeze's output is re-absorbed, so
-    /// nothing after one can be computed before it.
+    /// transcript's serial depth: a squeeze finalizes the running state, and
+    /// everything after it depends on that state, so nothing downstream can
+    /// be computed before it.
     pub fn finalizes(&self) -> bool {
         matches!(
             self,
@@ -362,8 +365,8 @@ impl TranscriptShape {
         for op in &self.ops {
             match op {
                 TranscriptOp::SqueezeScalar | TranscriptOp::SqueezeSlice(_) => {
-                    // The header is absorbed, THEN the state is finalized, then
-                    // the squeezed output is re-absorbed.
+                    // The header is absorbed, THEN the state is finalized;
+                    // the squeezed output is emitted, never re-absorbed.
                     offset += 16;
                     finalize_at(offset, op.squeezed_bytes(), &mut inv);
                     offset += op.absorbed_bytes() - 16;
@@ -763,6 +766,13 @@ impl<Ch: Challenger> Challenger for RecordingChallenger<Ch> {
         self.inner.supports_fused_pow_squeeze()
     }
 
+    fn hash_kind(&self) -> crate::hash::HashKind {
+        // Forward — the trait default (SHA-256) would silently diverge any
+        // out-of-sponge derivation (the AG-skip nonce decode) from the
+        // inner transcript's hash during recording.
+        self.inner.hash_kind()
+    }
+
     fn fork_from_seed(&self, _seed: [F128; 2], _label: &'static [u8]) -> Self {
         // `fork` (below) is the recorded entry: it samples the seed THROUGH
         // the recorder so the two seed squeezes land on the tape, then
@@ -1109,7 +1119,7 @@ mod tests {
                 TranscriptOp::SqueezeScalar,
             ]
         );
-        // Four finalizing ops: two squeezes plus the two PoW state digests.
+        // Five finalizing ops: three squeezes plus the two PoW state digests.
         assert_eq!(shape.finalizations(), 5);
         // Squeezes address by phase, not absolute index.
         assert_eq!(

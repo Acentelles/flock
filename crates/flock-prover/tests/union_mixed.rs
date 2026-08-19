@@ -1,7 +1,7 @@
 //! M3: the first end-to-end MIXED proofs — BLAKE3 and SHA-256 in one
 //! statement, proved through the union entries under the real multi-table
 //! binding (`flock-mixed-v1`: registry digest + counts vector + commitment
-//! root, design doc §"Statement, transcript, wire format").
+//! cap, design doc §"Statement, transcript, wire format").
 //!
 //! Registry shape: the real SHA-256 (κ = 15) and BLAKE3 (κ = 14) base
 //! blocks at uniform capacity 2^ν. Slot order is the registry order —

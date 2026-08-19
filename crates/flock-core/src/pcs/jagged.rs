@@ -370,9 +370,9 @@ fn fill_weight_range(
     // and the row index runs contiguously, so a segment is a run of `eq_row`
     // scaled by one hoisted constant — the `i >= area` test and the column
     // cursor leave the inner loop entirely. This is what makes the
-    // just-in-time basis ([`JaggedWeight`]) competitive: it is called twice per
-    // element position across the round-0 message and fold, so per-element
-    // branching there costs double.
+    // just-in-time basis window fill ([`fill_weight_range`]) competitive:
+    // it runs once per element position in the round-0 message, so
+    // per-element branching there is the hot path.
     let mut col = prefix
         .partition_point(|&t| t <= g0 as u64)
         .saturating_sub(1);
@@ -415,9 +415,9 @@ pub fn prove<C: Challenger>(
 /// [`prove`], additionally returning the bound point `i*` (the per-round
 /// challenges, low bit first) — needed to continue the transcript into the
 /// assist sub-protocol ([`prove_with_assist`] pairs the two). Not on the
-/// fused opening path (`the removed jagged open` discharges the
-/// weight-table inner product directly in Ligerito, with no jagged main
-/// sumcheck).
+/// fused opening path (the merged opening — `pcs::open_batch_merged` —
+/// discharges the weight-table inner product directly in Ligerito, with no
+/// jagged main sumcheck).
 pub(crate) fn prove_main<C: Challenger>(
     params: &JaggedParams,
     q: &[F128],
@@ -3816,7 +3816,7 @@ fn seg_msg(x: &[F128], y: &[F128]) -> (F128, F128) {
 /// Segment-sparse fold state for the group product of the two-product
 /// sumcheck. The gather-shaped groups are supported on a few columns'
 /// live ranges (~9% of the dense area for the wired hash tables), yet the
-/// dense [`ProductPair`] materializes and folds `b̄` and a copy of `e`
+/// dense [`VirtualPair`] materializes and folds `b̄` and a copy of `e`
 /// over the full `2^m`: this state stores only the support runs and folds
 /// them locally, so the group product costs O(support) per round instead
 /// of O(2^m). Exactness: every message equals the dense path's — `b̄` is
@@ -3825,7 +3825,7 @@ fn seg_msg(x: &[F128], y: &[F128]) -> (F128, F128) {
 /// (`e⁽ⁱ⁾ = Πⱼ eq(ρⱼ, rⱼ) · eq(ρ[i..], ·)`, exact in F128), so boundary
 /// padding entries are recomputable pointwise at any round. Once the
 /// support stops paying (`4·stored > cur`, reached in the tail rounds)
-/// the state densifies into a [`ProductPair`] and proceeds as before.
+/// the state densifies into a [`VirtualPair`] and proceeds as before.
 struct SparseGroupPair {
     /// Sorted by `start`; disjoint (overlaps from boundary padding are
     /// merged after each fold — `x` adds, `y` values agree).
@@ -4043,7 +4043,7 @@ impl SparseGroupPair {
         msg
     }
 
-    /// Materialize the dense [`ProductPair`] for the tail rounds: scatter
+    /// Materialize the dense [`VirtualPair`] for the tail rounds: scatter
     /// the stored weights, rebuild the partner as the scaled eq tensor —
     /// both exactly equal to what the dense path would hold at this round.
     fn densify(&self, cur: usize) -> VirtualPair {
@@ -4092,10 +4092,6 @@ const SPARSE_DENSIFY_FACTOR: usize = 3;
 /// variance under contention with the RS pair's parallelism.
 const SPARSE_SERIAL_WORDS: usize = 1 << 12;
 
-/// A product of the two-product sumcheck: a materialized weight with a
-/// virtual partner, the group product's segment-sparse state, or the RS
-/// product's aligned closed form — the latter two densify themselves into
-/// the first for the tail rounds.
 /// Cap on the RS claim count the lazy pair's per-position side loop hoists
 /// for (a fixed-width array). Real proofs carry R = 2; anything wider falls
 /// back to the materialized path.
@@ -4310,6 +4306,11 @@ impl LazyRsPair {
     }
 }
 
+/// A product of the two-product sumcheck: a materialized weight with a
+/// virtual partner ([`VirtualPair`]), the group product's segment-sparse
+/// state ([`SparseGroupPair`]), or the RS product's aligned closed form —
+/// eager ([`AlignedRsPair`]) or lazy ([`LazyRsPair`]); each non-virtual
+/// variant densifies itself into the first for the tail rounds.
 enum Pair {
     Virtual(VirtualPair),
     Sparse(SparseGroupPair),
@@ -4743,7 +4744,7 @@ pub(crate) fn fold_oop_par(a: &[F128], b: &[F128], r: F128, ao: &mut [F128], bo:
 /// in one pass. Requires `a.len() >= 4`. This is the production kernel — in the
 /// bandwidth-bound parallel regime the halved pass count is a ~1.4× win (the
 /// serial penalty from the fold→message dependency is hidden across cores).
-/// Shared with the virtual-opening sumcheck (`the removed jagged open`),
+/// Shared with the merged-open sumcheck (`pcs::open_batch_merged`),
 /// which runs the same product-sumcheck round structure.
 pub(crate) fn fold_and_round_oop_par(
     a: &[F128],
