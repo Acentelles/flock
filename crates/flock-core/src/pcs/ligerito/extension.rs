@@ -1431,6 +1431,12 @@ impl SumcheckProver256 {
         d: usize,
         want_la: bool,
     ) -> (SumcheckMessage256, Option<La256>) {
+        // The message needs a blocked pair; the degenerate shape below
+        // fabricates a zero message and belongs to the drains only.
+        debug_assert!(
+            self.f.len() >= 8 * d,
+            "mid_fold2 needs a blocked message pair; drains own the degenerate shape"
+        );
         let (nf, nb, msg, la) =
             fused_fold2_msg_ext(&self.f, &self.combined_basis, r0, r1, d, want_la);
         crate::scratch::give_f256(std::mem::replace(&mut self.f, nf));
@@ -1639,13 +1645,15 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
     l0_jit_basis: Option<BasisWindowFn<'_>>,
     l0_virtual_basis: Option<VirtualEqBasis>,
     mut first_msg: Option<SumcheckMessage>,
-    // Round-1 coefficients from the pcs combine's fused lookahead pass. The
-    // F128 driver consumed these via the fold_skip/fold2 state machine; this
-    // F256-ladder driver has no lookahead kernels yet, so they are accepted
-    // (the combine computes them either way) and unused — porting the
-    // two-rounds-per-pass schedule onto the ladder's fused folds is the
-    // recorded follow-up. Ignoring them cannot change the transcript: the
-    // lookahead is an exact polynomial identity over the same messages.
+    // Round-1 coefficients from the pcs combine's fused lookahead pass —
+    // the entry of the ladder's ALTERNATING SCHEDULE: round 1 becomes an
+    // O(1) skip (the coefficients evaluated at the F256 challenge, exact
+    // over the extension), the deferred fold fuses into the next pass, and
+    // every subsequent fold pass can emit the next round's La256 (the
+    // `alternation`/shape gates at the consumption site below decide).
+    // Byte-identical either way: the skip is an exact polynomial identity
+    // over the same messages, so `None` (or the A/B override) just takes
+    // the plain fold path.
     round1_lookahead: Option<FoldLookahead>,
     challenger: &mut Ch,
 ) -> LigeritoProof {
@@ -1819,6 +1827,10 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let challenge = challenger.sample_f256();
         lane_challenges.push(challenge);
         let last = j + 1 == initial_k;
+        // La production pays only when the NEXT round exists to consume it
+        // as a skip — the last round drains into the switch, so producing
+        // there is pure waste (+4 F256 muls per output quad).
+        let want_la = alternation && j + 2 < initial_k;
         let path;
         if last {
             // Materialize through any deferred challenge, then switch; the
@@ -1900,15 +1912,15 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     vb.fold_coord(p, r0);
                     vb.fold_coord(p, challenge);
                     let (msg, la) =
-                        sumcheck.first_fold2_virtual(r0, challenge, fold_block, &vb, alternation);
+                        sumcheck.first_fold2_virtual(r0, challenge, fold_block, &vb, want_la);
                     la_mid = la;
                     msg
                 } else {
                     path = "fold2";
                     let (msg, la) = if sumcheck.initial_pending() {
-                        sumcheck.first_fold2_materialized(r0, challenge, alternation)
+                        sumcheck.first_fold2_materialized(r0, challenge, want_la)
                     } else {
-                        sumcheck.mid_fold2(r0, challenge, fold_block, alternation)
+                        sumcheck.mid_fold2(r0, challenge, fold_block, want_la)
                     };
                     la_mid = la;
                     msg
@@ -1932,7 +1944,7 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
                         }
                         None => sumcheck.first_fold_jit(challenge, fold_block, fill),
                     }
-                } else if alternation && fold_block == 1 {
+                } else if want_la && fold_block == 1 {
                     path = "fold+la";
                     let (msg, la) = sumcheck.first_fold_materialized_la(challenge);
                     la_mid = la;
@@ -2057,6 +2069,10 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let challenge = challenger.sample_f256();
             level_challenges.push(challenge);
             let switching = j + 1 == k && i + 1 != r;
+            // As in the init loop: produce La only when the NEXT round
+            // consumes it — the pre-switch round of a non-final level
+            // drains, so its predecessor's La would be dead weight.
+            let want_la = alternation && (j + 2 < k || i + 1 == r);
             if switching {
                 // No message of this round's own survives (the switch's
                 // replaces it) — materialize through the deferred and
@@ -2076,10 +2092,10 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     level_pending = Some(challenge);
                     msg
                 } else if let Some(r0) = level_pending.take() {
-                    let (msg, la) = sumcheck.mid_fold2(r0, challenge, 1, alternation);
+                    let (msg, la) = sumcheck.mid_fold2(r0, challenge, 1, want_la);
                     level_la = la;
                     msg
-                } else if j == 0 && alternation {
+                } else if j == 0 && want_la {
                     let (msg, la) = sumcheck.fold_after_switch_la(challenge);
                     level_la = la;
                     msg

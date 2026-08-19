@@ -1754,12 +1754,6 @@ impl Blake3Setup {
         )
     }
 
-    /// AG-skip mirror of [`Self::prove_fast`]: round 1 of the zerocheck runs
-    /// on the genus-95 AG multiplication code instead of the RS additive-NTT
-    /// skip; everything else (witness gen, commit, lincheck, ring-switch open)
-    /// is shared. Witness generation dispatches on the r1cs's witness layout,
-    /// so both row-major and batch-major setups work. aarch64-only (NEON
-    /// round-1 kernel).
     /// The AG-skip prover runs the DIRECT (dense pow2-lane) commit — the
     /// standard-pack shape its zerocheck and claims are wired for — while
     /// `prove_fast` moved to the single-slot UNION commit (dense stack +
@@ -1779,6 +1773,12 @@ impl Blake3Setup {
         }
     }
 
+    /// AG-skip mirror of [`Self::prove_fast`]: round 1 of the zerocheck runs
+    /// on the genus-95 AG multiplication code instead of the RS additive-NTT
+    /// skip; everything else (witness gen, commit, lincheck, ring-switch open)
+    /// is shared. Witness generation dispatches on the r1cs's witness layout,
+    /// so both row-major and batch-major setups work. aarch64-only (NEON
+    /// round-1 kernel).
     #[cfg(target_arch = "aarch64")]
     pub fn prove_fast_ag<Ch: Challenger>(
         &self,
@@ -1828,9 +1828,10 @@ impl Blake3Setup {
             self.generate_witness_ab(blocks);
         let witness_s = t0.elapsed().as_secs_f64();
         let lc_circuit = self.r1cs.csc_lincheck_circuit();
+        let pcs_params = self.direct_pcs_params();
         let (proof, commitment, claim, mut timings) = crate::prover::prove_fast_ligerito_timed(
             &self.r1cs,
-            &self.pcs_params,
+            &pcs_params,
             z_packed,
             a_packed_f128,
             b_packed_f128,
@@ -1858,6 +1859,9 @@ impl Blake3Setup {
         crate::prover::ProvePhaseTimings,
     ) {
         assert_eq!(blocks.len(), self.n_blocks);
+        // The DIRECT commit shape, like `prove_fast_ag`/`verify_ag` — the
+        // union-shaped `self.pcs_params` fails the commit length assert.
+        let pcs_params = self.direct_pcs_params();
         let t0 = std::time::Instant::now();
         let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
             self.generate_witness_ab(blocks);
@@ -1865,7 +1869,7 @@ impl Blake3Setup {
         let lc_circuit = self.r1cs.csc_lincheck_circuit();
         let (proof, commitment, claim, mut timings) = crate::prover::prove_fast_ligerito_ag_timed(
             &self.r1cs,
-            &self.pcs_params,
+            &pcs_params,
             z_packed,
             a_packed_f128,
             b_packed_f128,
@@ -2406,8 +2410,9 @@ mod tests {
     /// through the full commit → AG zerocheck → lincheck → ring-switch
     /// Ligerito open pipeline.
     #[cfg(target_arch = "aarch64")]
-    #[test]
-    #[ignore] // Heavy — run with `cargo test prove_fast_ligerito_ag_roundtrip -- --ignored`
+    #[test] // Default-run: this is the guard for the direct-shape params
+    // class of stranding (the union migration broke prove_fast_ag and the
+    // ignore gate hid it; the timed twin then broke the same way).
     fn prove_fast_ligerito_ag_roundtrip() {
         use flock_core::challenger::FsChallenger;
         let setup = Blake3Setup::new(256);

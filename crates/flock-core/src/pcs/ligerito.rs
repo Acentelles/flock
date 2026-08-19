@@ -3485,10 +3485,13 @@ pub struct FoldLookahead {
     u2: [F128; 3],
 }
 
-/// In-process A/B override for the F256 ladder's round-1 lookahead skip:
-/// `0` follows the `FLOCK_NO_FOLD_LOOKAHEAD` env knob, `1` forces it on,
-/// `2` forces the plain first-fold path. Byte-identical either way (exact
-/// polynomial identity) — the oracle tests alternate this to prove it.
+/// In-process A/B override for the F256 ladder's WHOLE alternating fold
+/// schedule — the round-1 lookahead skip AND every mid-ladder `La256`
+/// production + skip round it seeds, through the initial folds and all
+/// recursive levels: `0` follows the `FLOCK_NO_FOLD_LOOKAHEAD` env knob,
+/// `1` forces the schedule on, `2` forces the plain per-round folds.
+/// Byte-identical either way (exact polynomial identity) — the oracle
+/// tests alternate this to prove it.
 pub static FOLD_LOOKAHEAD_OVERRIDE: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
 

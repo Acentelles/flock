@@ -39,6 +39,13 @@ fn blocks(n: usize, seed: u64) -> Vec<Compression> {
 }
 
 fn assert_byte_identical(n_blocks: usize, seed: u64) {
+    // The override is PROCESS-GLOBAL and the harness runs tests on parallel
+    // threads: without serialization, a concurrent store can land between
+    // this store and the prover's read, both proves take the same arm, and
+    // the byte-equality assert passes vacuously (an A/A). One lock per
+    // A/B, released only after the override is reset.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let setup = Blake3Setup::new(n_blocks);
     let inputs = blocks(n_blocks, seed);
     let prove = |force: u8| {
