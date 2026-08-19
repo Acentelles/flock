@@ -285,7 +285,7 @@ impl PcsParams {
     /// k_code)`. The `udr_queries` fallback mirrors [`Self::l0_queries`].
     pub fn l0_cap_depth(&self) -> usize {
         match self.ligerito_prover_config() {
-            Ok(cfg) => cfg.l0_cap_depth(self.k_code()),
+            Ok(cfg) => cfg.l0_cap_depth(),
             // The fallback mirrors `default_config`, which is stratified
             // since the flip: the schedule of the udr count.
             Err(_) => crate::pcs::stratified::LevelSchedule::decompose(
@@ -436,7 +436,7 @@ pub fn commit_into(
 // `e = t·p + l` is not multilinear in the index bits at all.
 //
 // [`lane_grid_from_lane_major`] converts the lane-major dense stack into the
-// LSB-lane "grid" array Ligerito folds; [`commit_lane_grid`] encodes it while
+// LSB-lane "grid" array Ligerito folds; [`commit_lane_major`] encodes it while
 // dropping the zero lanes. See `pcs::open_batch_merged`.
 // ---------------------------------------------------------------------------
 
@@ -1069,7 +1069,7 @@ mod tests {
     /// High-bit lanes (Oracle 3): the lane-grid commit of a lane-major dense
     /// stack `q` — whose real data is the contiguous prefix `q[..dense]`, so
     /// lanes `≥ t` are wholly zero — is byte-identical to the plain `t`-lane
-    /// commit of the compacted message. I.e. `commit_lane_grid` really is
+    /// commit of the compacted message. I.e. `commit_lane_major` really is
     /// "encode the `t` real lanes and nothing else", and the transpose
     /// `lane_grid_from_lane_major` is its inverse-consistent partner.
     ///

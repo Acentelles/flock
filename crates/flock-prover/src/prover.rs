@@ -1273,70 +1273,6 @@ fn prove_union_with_binding_zc<Ch: Challenger>(
             t_bool.elapsed().as_secs_f64() * 1e3
         );
     }
-    // DIAGNOSTIC (GKR_PAR_DIAG=1): price the fork/join transcript variant —
-    // the boolean PIOP and the wiring argument run CONCURRENTLY on throwaway
-    // domain-separated challengers and the combined wall prints; the honest
-    // sequential transcript below then produces the real proof, unaffected.
-    // A fork/join protocol would be sound (α/β and the zerocheck's r each
-    // bind only the commitment+statement prefix; lincheck-after-zerocheck
-    // and gather-after-GKR are the only data orderings) — this measures
-    // what it would buy before anyone pays the transcript change.
-    if std::env::var("GKR_PAR_DIAG").is_ok()
-        && let UnionProveBinding::Circuit(ci) = &binding
-        && union.num_boolean() > 0
-    {
-        let t_diag = std::time::Instant::now();
-        rayon::join(
-            || {
-                let mut ch = flock_core::challenger::FsChallenger::new(b"gkr-par-diag-zc");
-                let view = |v: &[F128]| -> &[u8] {
-                    unsafe {
-                        std::slice::from_raw_parts(
-                            v.as_ptr() as *const u8,
-                            bool_words * core::mem::size_of::<F128>(),
-                        )
-                    }
-                };
-                let (zc_proof, zc_claim, _shv) =
-                    zerocheck::prove_packed_padded_capture_s_hat_v_c_with_grinding(
-                        view(&a_packed_f128),
-                        view(&b_packed_f128),
-                        view(&z_packed),
-                        m_bool,
-                        &bool_padding,
-                        pcs_params.zerocheck_grinding(),
-                        &mut ch,
-                    );
-                let x_ab =
-                    union.x_ab_from_mlv(SkipPoint::Phi8(zc_claim.z), &zc_claim.mlv_challenges);
-                let lc_slots: Vec<lincheck::UnionLincheckSlot<'_>> = linchecks
-                    .iter()
-                    .map(|(stripe, circuit)| lincheck::UnionLincheckSlot {
-                        z_lincheck: stripe,
-                        circuit: *circuit,
-                    })
-                    .collect();
-                std::hint::black_box(lincheck::prove_union_capture_z_vec(
-                    union, &lc_slots, &x_ab, &mut ch,
-                ));
-                std::hint::black_box(zc_proof);
-            },
-            || {
-                if std::env::var("GKR_PAR_DIAG").as_deref() == Ok("zc-only") {
-                    return;
-                }
-                let mut ch = flock_core::challenger::FsChallenger::new(b"gkr-par-diag-w");
-                std::hint::black_box(flock_core::circuit::prove_wiring(
-                    ci.circuit, &z_packed, ci.public, &mut ch,
-                ));
-            },
-        );
-        eprintln!(
-            "  [prove_union] DIAG fork/join (boolean PIOP ∥ wiring): {:7.2} ms",
-            t_diag.elapsed().as_secs_f64() * 1e3
-        );
-    }
-
     // a/b are consumed; recycle the buffers as in `prove_fast_core`. The
     // FreshZeroed (all-zero) ones return to the ZERO pool with their slot
     // areas re-zeroed rather than being dropped — unmapping multi-GiB per
@@ -2044,15 +1980,6 @@ pub struct ProvePhaseTimings {
     pub lincheck_s: f64,
     /// The real Ligerito recursive PCS open (`open_claims_…_ligerito`).
     pub open_s: f64,
-    /// SUB-phase of `witness_s` (union paths only): building the padded
-    /// union buffers — the scatter (`UnionInstance::assemble_witness`) for
-    /// prebuilt slots, or the drivers' in-place generation for
-    /// [`UnionSlotProverInput::in_place`] ones (where it therefore ALSO
-    /// covers witness generation). Do not add to the total.
-    pub witness_place_s: f64,
-    /// SUB-phase of `witness_s` (union paths only): the dense-stack gather
-    /// (`UnionInstance::compact_witness`). Do not add to the total.
-    pub witness_compact_s: f64,
 }
 
 /// [`prove_fast_ligerito_from_witness`] with per-phase timers. Inlines the same

@@ -39,8 +39,9 @@ SHA-256 backend **counterproductive** (κ = 15 ⇒ composite `k_log` 20 ⇒ more
 columns), reversing what the open items below say. The bigger prover lever is the
 **multipoint-twisted prototype** already in `pcs/jagged.rs`: it deletes the
 128·K-statement structure rather than sharing within it (so it subsumes both
-optimizations above), is tested against brute force, and is *not* wired into
-`verify_batch_merged` — integration is the unfinished part.
+optimizations above), is tested against brute force. (Update 2026-08-19: the integration has
+since shipped — the twisted assist is the production merged path inside
+`verify_batch_merged`; see `crates/flock-core/src/pcs.rs`.)
 
 Three claims in earlier revisions of this file were measured to be wrong and are
 corrected in place: the verifier is not dominated by `fold_alpha_batched`; the

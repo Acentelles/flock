@@ -48,8 +48,9 @@ use super::{Cell, Circuit, CircuitError};
 ///
 /// Wires are usable before their producer is emitted — a value can be consumed
 /// by a gate declared earlier in the program than the one that defines it,
-/// because a class is just a set. The Fiat–Shamir chain needs this: a squeezed
-/// challenge is re-absorbed into the transcript that produced it. In the online
+/// because a class is just a set. The Fiat–Shamir chain needs this: a value a
+/// hash row derives is consumed by gates emitted earlier in the program than
+/// that row. In the online
 /// phase such a wire takes its value from the input that supplies it, and the
 /// producing gate's output is then *checked* against it rather than overwriting
 /// it — see [`CircuitShape::run`].

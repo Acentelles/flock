@@ -2,9 +2,11 @@
 
 > **Historical-command note (2026-08-15):** `--test circuit_merkle`
 > invocations below predate the tower's productionization —
-> `tests/circuit_merkle.rs` now lives in `src/tower.rs` and its tests run as
-> `cargo test --release -p flock-prover --lib tower::<name> -- --ignored
-> --exact`. Commands are kept verbatim as an audit record.
+> `tests/circuit_merkle.rs` now lives in `src/tower.rs`. The mvp*/envelope
+> test names quoted below were retired with the productionization — the
+> surviving end-to-end tower tests are `chain_spine_converges` and
+> `chain_tower_e2e_with_lane` (`cargo test --release -p flock-prover --lib
+> tower:: -- --ignored`). Commands are kept verbatim as an audit record.
 
 Status: implementation audit and independent re-review of the current
 `min/recursion-128bit` working tree. The non-Ligerito audit was completed on
@@ -664,7 +666,7 @@ Key reviewer entry points:
   and [`verifier.rs`](../crates/flock-core/src/verifier.rs); and
 - recursive recording and R1CS replay:
   [`transcript_record.rs`](../crates/flock-core/src/transcript_record.rs) and
-  [`circuit_merkle.rs`](../crates/flock-prover/tests/circuit_merkle.rs).
+  [`tower.rs`](../crates/flock-prover/src/tower.rs).
 
 The native chain and Merkle-path wrappers also carry grinding for their own
 packed-position and shift arguments. Their native implementations are recorded
@@ -713,8 +715,9 @@ it no longer assumes one challenge per finalization.
 
 ### Proof format
 
-The incompatible additions and transcript changes now place the aggregate
-proof format at v20. Product-GKR, matrix fold, chain and Merkle shift proofs carry
+The incompatible additions and transcript changes placed the aggregate
+proof format at v20 as of this audit (head is at v21 — 2026-08-14, the
+merged-union R1cs payload). Product-GKR, matrix fold, chain and Merkle shift proofs carry
 transcript-ordered nonce vectors; chain/Merkle wrappers carry their
 packed-position nonce; opening batching has one nonce and one vector squeeze.
 Version 16 added two-point Ligerito OOD data; version 17 adds the Flock

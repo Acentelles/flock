@@ -435,9 +435,13 @@ pub struct SwapInput {
 /// ```text
 ///   0                  .. 128            the input word
 ///   128 + 128·l        .. +128           output l  (bit 0 = index bit l, rest 0)
-///   128·(depth+1)       .. +128           zero mask
-///   128·(depth+2)       .. +128           check word (wired input, zero)
-///   128·(depth+3)                         the constant-one column
+///   128·(depth+1)      .. +128           zero mask
+///   128·(depth+2)      .. +128           check word (wired input, zero)
+///   128·(depth+3)      .. +128           position mask
+///   128·(depth+4)      .. +128           position prefix
+///   128·(depth+5)      .. +128           masked position
+///   128·(depth+6)      .. +128           position
+///   128·(depth+7)                        the constant-one column
 /// ```
 ///
 /// In addition to the relocation constraints, every input bit satisfies

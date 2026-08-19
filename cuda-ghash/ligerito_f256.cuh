@@ -607,11 +607,12 @@ inline int run_ligerito_f256(const LigF256Config& C, FsChallenger& ch, F128 targ
         return 0;
     };
 
-    // Query phase against the previous tree (`open_level` indexes queries/
-    // grinding; the α consistency batch is ground at `next_level`'s bits).
-    // Gathers rows + capped paths into `open`; returns α (empty at the final
-    // level, where the squeeze happens but the α is unused).
-    auto query_phase = [&](int open_level, int next_level, LigLevelOpen& open,
+    // Query phase against the previous tree (`open_level` indexes queries,
+    // grinding, and the α consistency batch — each level grinds its OWN
+    // consistency bits). Gathers rows + capped paths into `open`; returns α
+    // (empty at the final level, where the squeeze happens but the α is
+    // unused).
+    auto query_phase = [&](int open_level, LigLevelOpen& open,
                            std::vector<F128>& alpha_out, std::vector<size_t>& q_out) -> int {
         q_out.clear();
         out.grinding_nonces.push_back(grind_and_sample_stratified_queries(
@@ -620,7 +621,7 @@ inline int run_ligerito_f256(const LigF256Config& C, FsChallenger& ch, F128 targ
         int al = lf_ceil_log2((size_t)C.queries[open_level]);
         std::vector<ChF128> alpha_c(al);
         out.consistency_batch_nonces.push_back(ch.grind_pow_and_sample_f128_vec(
-            (uint32_t)C.consistency_batch_grinding_bits[next_level], alpha_c.data(), al));
+            (uint32_t)C.consistency_batch_grinding_bits[open_level], alpha_c.data(), al));
         alpha_out.resize(al);
         for (int i = 0; i < al; i++) alpha_out[i] = lf_frch(alpha_c[i]);
 
@@ -724,7 +725,7 @@ inline int run_ligerito_f256(const LigF256Config& C, FsChallenger& ch, F128 targ
         if (rc) return rc;
         std::vector<F128> alpha;
         std::vector<size_t> queries;
-        rc = query_phase(0, 1, out.initial_open, alpha, queries);
+        rc = query_phase(0, out.initial_open, alpha, queries);
         if (rc) return rc;
         rc = induce_introduce_glue(n1, 1, queries, alpha);
         if (rc) return rc;
@@ -787,7 +788,7 @@ inline int run_ligerito_f256(const LigF256Config& C, FsChallenger& ch, F128 targ
             for (const F128& v : out.yr) ch.observe_f128(lf_toch(v));
             std::vector<F128> alpha;
             std::vector<size_t> queries;
-            int rc = query_phase(level, level, out.final_open, alpha, queries);
+            int rc = query_phase(level, out.final_open, alpha, queries);
             if (rc) return rc;
             // The trailing claim-batch grind (its β is unused — Rust discards it).
             ChF128 beta_c;
@@ -810,7 +811,7 @@ inline int run_ligerito_f256(const LigF256Config& C, FsChallenger& ch, F128 targ
         std::vector<F128> alpha;
         std::vector<size_t> queries;
         out.recursive_opens.emplace_back();
-        rc = query_phase(level, next_level, out.recursive_opens.back(), alpha, queries);
+        rc = query_phase(level, out.recursive_opens.back(), alpha, queries);
         if (rc) return rc;
         rc = induce_introduce_glue(extension_dim, next_level, queries, alpha);
         if (rc) return rc;
