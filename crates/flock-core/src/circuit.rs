@@ -293,7 +293,7 @@ pub enum CircuitError {
     /// A cell appears in two classes, or twice in one.
     RepeatedCell(Cell),
     EmptyClass,
-    /// Two `out`-direction cells in one wire class — the single-producer ru    /// The gate dataflow (producer → consumer) has a cycle.
+    /// The gate dataflow (producer → consumer) has a cycle.
     Cyclic,
     /// σ is not a permutation. Unreachable given disjointness; checked anyway,
     /// because completeness (and the verifier's `s_σ`) rests on it.
@@ -304,10 +304,13 @@ pub enum CircuitError {
 /// wiring.
 ///
 /// Validated at construction (see [`CircuitError`]): every wired cell exists
-/// and is live, classes are disjoint, at most one producer per class, the
-/// dataflow is acyclic, and σ is a permutation. Semantics are satisfiability —
-/// that a satisfying assignment computes "the" output is a property of the
-/// circuit (single producer + acyclicity), checked by whoever endorses the
+/// and is live, classes are disjoint, the dataflow is acyclic, and σ is a
+/// permutation. Multiple producers per class are allowed — the permutation
+/// forces every cell of a class equal, so a multi-producer class IS the
+/// circuit's assert_eq between computed values, and witness generation
+/// asserts the producers agree. Semantics are satisfiability — that a
+/// satisfying assignment computes "the" output is a property of the circuit
+/// (acyclicity + producer agreement), checked by whoever endorses the
 /// digest, exactly as in Plonk.
 ///
 /// The wiring is stored CANONICALLY (cells ascending within a class, classes by

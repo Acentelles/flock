@@ -287,12 +287,13 @@ fn blake3_chunk_chain_through_the_builder() {
 /// were free witness a prover would choose challenges that make a false inner
 /// proof pass, and every other constraint would still be satisfied.
 ///
-/// The load-bearing wiring is the **re-absorbed challenge**. A squeeze's output
-/// goes straight back into the transcript, so the `m` word holding challenge
-/// `k` is wired from the `out_lo` of the ROOT row that produced it — a pure
-/// copy, which is what the 16-byte-aligned framing bought. Take that word as a
-/// public constant instead and the circuit asserts the challenges rather than
-/// deriving them, which is the entire content of Fiat–Shamir.
+/// The load-bearing wiring is the **derived challenge**. Squeezed output is
+/// never re-absorbed into the transcript; challenge `k` IS the `out_lo` of
+/// the ROOT row that finalizes it, and downstream consumers take that output
+/// wire directly — a pure copy, which is what the 16-byte-aligned framing
+/// bought. Take the challenge as a public constant instead and the circuit
+/// asserts the challenges rather than deriving them, which is the entire
+/// content of Fiat–Shamir.
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn fs_chain_circuit_derives_the_challenges() {
@@ -374,8 +375,10 @@ fn fs_chain_circuit_derives_the_challenges() {
     let iv_w = pack8(&flock_prover::r1cs_hashes::fs_chain::IV);
     let iv = [b.public_value(iv_w[0]), b.public_value(iv_w[1])];
 
-    // Stream words become public cells, EXCEPT squeezed ones, which are wired
-    // from the row that produced them.
+    // Stream words become public cells, memoized in `word_wire` so every
+    // consumer of a stream word shares one wire. (Squeezed output never
+    // appears in the stream; challenges are read off the producing rows'
+    // output wires instead — see `rho_w` below.)
     let mut word_wire: Vec<Option<[Wire; 1]>> = vec![None; words.len()];
     let mut outs: Vec<Vec<Wire>> = Vec::with_capacity(trace.rows.len());
 

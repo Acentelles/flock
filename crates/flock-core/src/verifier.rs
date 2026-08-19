@@ -229,7 +229,7 @@ pub fn verify_ligerito_timed<Ch: Challenger>(
 /// `flock_prover::prover`).
 enum UnionVerifyBinding<'a> {
     /// The protocol binding: `flock-mixed-v1` over the registry digest, the
-    /// counts vector, and the commitment root
+    /// counts vector, and the commitment cap layer
     /// ([`crate::union::UnionInstance::bind_statement`]).
     Mixed,
     /// The circuit binding: [`UnionVerifyBinding::Mixed`] plus the circuit

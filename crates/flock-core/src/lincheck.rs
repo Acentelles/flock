@@ -1860,8 +1860,8 @@ fn column_sumcheck_prove<Ch: Challenger>(
     };
 
     // 5. Standard multilinear product-sumcheck over the high `inner_rest_len`
-    //    bits of `i`. Each round binds the TOP remaining bit (mirrors
-    //    chain::prove_chain_shift). After `inner_rest_len` rounds, both
+    //    bits of `i`. Each round binds the TOP remaining bit. After
+    //    `inner_rest_len` rounds, both
     //    tables collapse to length `2^k_skip`. Per-round work is parallel via
     //    rayon when the residual table is large enough.
     let mut rounds = Vec::with_capacity(inner_rest_len);

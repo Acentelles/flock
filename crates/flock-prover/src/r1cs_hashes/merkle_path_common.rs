@@ -1,4 +1,5 @@
-//! Generic Merkle-path glue, analogous to [`super::chain_common`].
+//! Generic Merkle-path glue — the hash-agnostic statement layer for the
+//! Merkle-path protocol.
 //!
 //! The Merkle-path protocol (packed-pos fold → shift-with-bit-selector sumcheck
 //! → batched PCS open over `[ab, c] ring-switched + [merkle] packed-direct`)
@@ -184,8 +185,7 @@ pub fn fold_all_slots(
 
     let eq_tau = build_eq_table(&fold.tau_pos);
 
-    // Word address of within-block word `w` of instance `i` (see
-    // `chain_common::fold_in_out`).
+    // Word address of within-block word `w` of instance `i`.
     let word_addr = move |i: usize, w: usize| -> usize {
         match wl {
             flock_core::r1cs::WitnessLayout::RowMajor => i * block_packed + w,
@@ -246,7 +246,7 @@ pub fn assemble_merkle_path_claim(
 /// Verifier-side helper: build the claim point identically to
 /// [`assemble_merkle_path_claim`] without constructing the sparse eq tensor.
 /// Word-index claim point ordered by the witness layout's address
-/// decomposition (see `chain_common::build_chain_claim_point`):
+/// decomposition:
 /// RowMajor `[τ_pos…, sel_slot, side, 0^high, instance…]`;
 /// BatchMajor `[instance…, τ_pos…, sel_slot, side, 0^high]`.
 fn build_merkle_claim_point(

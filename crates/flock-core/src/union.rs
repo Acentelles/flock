@@ -1642,7 +1642,7 @@ mod tests {
 
     /// The `flock-mixed-v1` binding is deterministic and sensitive to every
     /// bound component — registry digest, counts (value AND slot order), and
-    /// commitment root: divergence anywhere yields a different first
+    /// commitment cap: divergence anywhere yields a different first
     /// challenge, which is what makes the statement non-substitutable.
     #[test]
     fn bind_statement_sensitivity() {

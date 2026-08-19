@@ -2740,10 +2740,10 @@ mod tests {
         assert_eq!(claim_p, claim_v);
     }
 
-    /// Constant-wire pin (docs/const-wire-pin.md). `new(250)` has padding
-    /// blocks (filled with a valid all-zero-input compression, constant = 1)
-    /// so the honest proof verifies; the all-zero witness must be rejected by
-    /// the pin. (For BLAKE3 the pin lives on the R1CS-built CSC circuit, not
+    /// Constant-wire pin (docs/const-wire-pin.md). `new(250)` is a partial
+    /// count: `prove_fast`'s batch-major partial witness leaves the dummy
+    /// rows identically zero (no padding compressions) and the honest proof
+    /// verifies; the all-zero witness must be rejected by the pin. (For BLAKE3 the pin lives on the R1CS-built CSC circuit, not
     /// the walker.)
     #[test]
     #[ignore] // Heavier — Ligerito needs m=22; run with `cargo test const_pin_all_zero_rejected -- --ignored`

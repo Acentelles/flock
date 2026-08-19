@@ -50,9 +50,9 @@ const IO_SCHEMA_LABEL: &[u8] = b"flock-io-schema-v0";
 /// Which side of a gate an [`IoWord`] is. **Metadata for circuit validation
 /// only** — the wiring argument is direction-blind (a permutation neither
 /// knows nor cares which cell of a wire class is the producer); the circuit
-/// layer uses it for the single-producer rule
-/// (`crate::circuit::CircuitError::MultipleProducers`) and the dataflow
-/// order that acyclicity is checked against.
+/// layer uses it for the dataflow order that acyclicity is checked against,
+/// and witness generation uses it to assert that a class's several producers
+/// agree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IoDirection {
     In,
@@ -73,7 +73,7 @@ impl IoDirection {
 /// type's row that circuits may wire, plus its direction.
 ///
 /// The unit is a committed WORD, not a bit — the aligned IO regions
-/// (`chain_common::ChainLayout`'s `region_log = 8` slots for SHA-256/BLAKE3,
+/// (`region_log = 8` slots for SHA-256/BLAKE3,
 /// one element column for a large-field type) make a wire value exactly one
 /// committed word, which is what collapses the gather to a packed-direct
 /// claim (design doc §"The wiring argument", Remark "Where each convention is

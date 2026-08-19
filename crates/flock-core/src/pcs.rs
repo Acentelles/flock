@@ -229,7 +229,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding<Ch: Chall
     // prove time instead of as a verifier reject.
     assert_eq!(
         commitment.cap.len(),
-        1usize << lig_config.l0_cap_depth(commitment.params.k_code()),
+        1usize << lig_config.l0_cap_depth(),
         "commitment cap size disagrees with the opener config's L0 query count"
     );
     debug_assert_eq!(
@@ -237,7 +237,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_grinding<Ch: Chall
         crate::merkle::cap_layer(
             &prover_data.merkle_tree,
             commitment.params.n_leaves(),
-            lig_config.l0_cap_depth(commitment.params.k_code()),
+            lig_config.l0_cap_depth(),
         ),
         "commitment cap is not the prover tree's cap layer"
     );
@@ -1364,7 +1364,7 @@ pub fn open_batch_merged<Ch: Challenger>(
     // prove time instead of as a verifier reject.
     assert_eq!(
         commitment.cap.len(),
-        1usize << lig_config.l0_cap_depth(commitment.params.k_code()),
+        1usize << lig_config.l0_cap_depth(),
         "commitment cap size disagrees with the opener config's L0 query count"
     );
     debug_assert_eq!(
@@ -1372,7 +1372,7 @@ pub fn open_batch_merged<Ch: Challenger>(
         crate::merkle::cap_layer(
             &prover_data.merkle_tree,
             commitment.params.n_leaves(),
-            lig_config.l0_cap_depth(commitment.params.k_code()),
+            lig_config.l0_cap_depth(),
         ),
         "commitment cap is not the prover tree's cap layer"
     );

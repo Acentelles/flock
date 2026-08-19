@@ -230,12 +230,11 @@ impl ProverConfig {
         stratified::validate_schedules(&self.stratified, &self.queries, &self.level_block_logs())
     }
 
-    /// The L0 cap depth this config implies for a depth-`d` L0 tree — the
-    /// ONE rule commit-time sizing (`PcsParams::l0_cap_depth`), the open
-    /// entries' belt-and-braces asserts, and the prover's own absorb must
-    /// share: the schedule's cap (top set bit) when stratified, else the
-    /// legacy `min(⌈log2 q₀⌉, d)`.
-    pub fn l0_cap_depth(&self, _d: usize) -> usize {
+    /// The L0 cap depth this config implies — the ONE rule commit-time
+    /// sizing (`PcsParams::l0_cap_depth`), the open entries'
+    /// belt-and-braces asserts, and the prover's own absorb must share:
+    /// the L0 schedule's cap (top set bit).
+    pub fn l0_cap_depth(&self) -> usize {
         self.stratified[0].cap_depth()
     }
 }
@@ -298,7 +297,7 @@ impl VerifierConfig {
 
     /// The L0 cap depth this config implies; see
     /// [`ProverConfig::l0_cap_depth`].
-    pub fn l0_cap_depth(&self, _d: usize) -> usize {
+    pub fn l0_cap_depth(&self) -> usize {
         self.stratified[0].cap_depth()
     }
 }
@@ -567,8 +566,9 @@ pub fn embedded_security_config(m: usize, profile: LigeritoProfile) -> Option<&'
 /// for `(m, profile)` was derived with. **The TOML is the source of truth**:
 /// callers building `PcsParams` at a content-derived `m` must use this as
 /// `log_batch_size` — `prover_config_for` rejects a mismatch. 6 everywhere
-/// except m29 Fast (5 — the recursion-node row-width choice; see
-/// `derive_profile`). Returns `None` when no config is registered.
+/// except the m28 fast/slim families (4) and the m29 fast/slim families
+/// (5 — the recursion-node row-width choices; see `derive_profile`).
+/// Returns `None` when no config is registered.
 pub fn embedded_initial_k(m: usize, profile: LigeritoProfile) -> Option<usize> {
     let toml = embedded_security_config(m, profile)?;
     // Cheap scan — the TOML serializer always writes `initial_k = <n>` as
@@ -3884,7 +3884,7 @@ fn fold_and_msg_blocked(
 
 /// Fills a window of the basis: `out = b[g0 .. g0 + out.len()]`. Lets L0
 /// source its basis from a compact factored form
-/// (`jagged::JaggedWeight`) instead of a materialized `2^m` array.
+/// (`jagged::fill_weight_range`) instead of a materialized `2^m` array.
 pub type BasisWindowFn<'a> = &'a (dyn Fn(&mut [F128], usize) + Sync);
 
 /// [`fold_and_msg_blocked`] with the basis supplied JUST-IN-TIME. Identical
@@ -4426,7 +4426,7 @@ impl SumcheckProver {
 /// `count` may exceed `block_len` without harm; the soundness bound
 /// (see [`udr_queries`]) is the independent-sample one and never depended on
 /// distinctness. Ladder shapes still keep `block_len >= count` — see
-/// [`derive_ladder_shape`] — but that is now a proof-size convention rather
+/// [`derive_ladder_shape_tuned`] — but that is now a proof-size convention rather
 /// than a correctness requirement.
 fn sample_queries<Ch: Challenger>(
     challenger: &mut Ch,
@@ -6320,7 +6320,7 @@ mod tests {
         );
         let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
             wtns_0
-                .cap(cfg.l0_cap_depth(wtns_0.block_len.trailing_zeros() as usize))
+                .cap(cfg.l0_cap_depth())
                 .to_vec()
         };
 
@@ -7431,7 +7431,7 @@ mod tests {
             let ntt0 = AdditiveNttF128::standard(cols0 + rate0);
             let wtns0 = ligero_commit(&poly, cols0, initial_k, rate0, &ntt0, hash);
             let cap = wtns0
-                .cap(vc.l0_cap_depth(wtns0.block_len.trailing_zeros() as usize))
+                .cap(vc.l0_cap_depth())
                 .to_vec();
 
             let mut times = Vec::new();
@@ -7854,7 +7854,7 @@ mod tests {
         );
         let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
             wtns_0
-                .cap(cfg.l0_cap_depth(wtns_0.block_len.trailing_zeros() as usize))
+                .cap(cfg.l0_cap_depth())
                 .to_vec()
         };
 
@@ -8308,7 +8308,7 @@ mod tests {
         );
         let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
             wtns_0
-                .cap(cfg.l0_cap_depth(wtns_0.block_len.trailing_zeros() as usize))
+                .cap(cfg.l0_cap_depth())
                 .to_vec()
         };
 
@@ -8458,7 +8458,7 @@ mod tests {
         );
         let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
             wtns_0
-                .cap(cfg.l0_cap_depth(wtns_0.block_len.trailing_zeros() as usize))
+                .cap(cfg.l0_cap_depth())
                 .to_vec()
         };
 
@@ -8602,7 +8602,7 @@ mod tests {
         );
         let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
             wtns_0
-                .cap(cfg.l0_cap_depth(wtns_0.block_len.trailing_zeros() as usize))
+                .cap(cfg.l0_cap_depth())
                 .to_vec()
         };
 
@@ -8695,7 +8695,7 @@ mod tests {
         );
         let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
             wtns_0
-                .cap(cfg.l0_cap_depth(wtns_0.block_len.trailing_zeros() as usize))
+                .cap(cfg.l0_cap_depth())
                 .to_vec()
         };
 
@@ -8784,7 +8784,7 @@ mod tests {
                     ligero_commit(&poly, log_msg_cols_0, initial_k, 1, &ntt_0, merkle_hash);
                 let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
                     wtns_0
-                        .cap(cfg.l0_cap_depth(wtns_0.block_len.trailing_zeros() as usize))
+                        .cap(cfg.l0_cap_depth())
                         .to_vec()
                 };
 
@@ -8910,7 +8910,7 @@ mod tests {
         );
         let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
             wtns_0
-                .cap(cfg.l0_cap_depth(wtns_0.block_len.trailing_zeros() as usize))
+                .cap(cfg.l0_cap_depth())
                 .to_vec()
         };
 

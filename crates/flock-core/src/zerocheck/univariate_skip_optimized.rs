@@ -646,8 +646,8 @@ fn build_b_med_counts(padding: &PaddingSpec, m: usize) -> (usize, Vec<u8>) {
         return (within_outer_mask, counts);
     }
 
-    // General run-list path (no production callers yet — the multi-table
-    // slot schedule): one count per window over the whole domain, computed
+    // General run-list path (the multi-table slot schedule — the union
+    // prove path reaches it): one count per window over the whole domain, computed
     // from the useful intervals; the mask covers all outer bits. A window's
     // count reaches up to its highest useful bit — all-padding sub-windows
     // below that are processed anyway (contributing zero), which keeps the
