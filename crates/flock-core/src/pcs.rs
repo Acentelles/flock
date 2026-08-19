@@ -401,8 +401,11 @@ struct CombinedClaim {
     /// consumed by `recursive_prover_with_basis_precomputed_round0`.
     round0_prime: (F128, F128),
     /// Quadratic coefficients of Ligerito's ROUND-1 message in the round-0
-    /// fold challenge, accumulated in the same combine pass (fast path with
-    /// no packed-direct claims only). Lets the recursive prover's first lane
+    /// fold challenge, accumulated in the same combine pass. Three paths
+    /// emit them: the plain fast path (LSB-pair coefficients), the fast
+    /// path WITH sparse packed-direct claims (scatter deltas corrected by
+    /// linearity), and the seeded EqPoint path (BLOCKED coefficients, the
+    /// fold's own block pairing). Lets the recursive prover's first lane
     /// fold be an O(1) skip round — see [`ligerito::FoldLookahead`].
     round1_lookahead: Option<ligerito::FoldLookahead>,
 }
