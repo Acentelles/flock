@@ -1,4 +1,4 @@
-//! Byte-identity anchors for the MERGED transport — currently proof-IO v20.
+//! Byte-identity anchors for the MERGED transport — currently proof-IO v21.
 //! An optimization must produce byte-identical proofs; only a
 //! deliberate protocol change may move these digests, and it must re-pin
 //! them with a history entry below.
@@ -75,6 +75,13 @@
 //! 11,825 → 11,707 (93 → 92 chunk-columns), so every blake3-committed
 //! fixture's bytes move. The pure SHA-256 anchor is untouched — the change
 //! is blake3-local. Digests stable across two print runs.
+//! Re-pinned 2026-08-19: the consistency-batch grinding off-by-one fix —
+//! each ladder level now grinds its OWN `consistency_batch_grinding_bits`
+//! entry (level ℓ was ground under bits[ℓ+1]; bits[0] was never applied),
+//! restoring the exact schedule `validate()` certifies. Both m22 anchors
+//! and the nu10 full-utilization fixture move (their levels' bits differ);
+//! the three small nu10 shapes hold (adjacent bits equal). Roundtrip
+//! suites green; digests stable across two print runs.
 
 use ::sha2 as sha2_hash;
 use flock_core::proof::{R1csClaim, R1csProofMergedLigerito};
@@ -180,7 +187,7 @@ fn merged_bundle_digest(
 /// registry id, counts vector, commitment, and the merged proof — plus the
 /// claim values. The registry here (BLAKE3+SHA-256 at ν = 10) IS the
 /// `Blake3Sha2Nu10` tier, so this pins exactly what `proof_io` puts on disk
-/// for the current v20 mixed proof. It retains the removed jagged fixture's
+/// for the current v21 mixed proof. It retains the removed jagged fixture's
 /// statements and witness streams; the Ligerito query ladder intentionally
 /// changed with v18.
 #[test]
@@ -191,7 +198,7 @@ fn m6_merged_union_proof_bytes_pinned() {
         (
             "merged-nu10-1024-1024",
             [1024, 1024],
-            "a11b54c2aee00161ea65c165ebd6eaf11a66c497bcb9b8fece920a37addce4a6",
+            "44e50df0ac2f4282e8a94e9ce1eb4ef094fda6d7556795c9ba174514b113d3cb",
         ),
         (
             "merged-nu10-50-37",
@@ -282,7 +289,7 @@ fn m6_merged_union_proof_bytes_pinned() {
 fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
     // BLAKE3, 256 blocks (m = 22).
     {
-        const EXPECTED: &str = "6e366f2ac2a68b97c90b5269bc4ee2b31d00d0b18bf6f67fcc51ae845740d675";
+        const EXPECTED: &str = "8bd3451eaf94fb8ad433c094bb4a1375f856565546b26fdf303d4a0b48a8325c";
         let n_blocks = 256usize;
         // The setup API IS the shipped single-slot union path since the
         // 2026-08-14 consolidation — the anchor pins it directly.
@@ -300,7 +307,7 @@ fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
 
     // SHA-256, 128 blocks (m = 22).
     {
-        const EXPECTED: &str = "818334e28817c5b7702f8ab64f302967681a9cd9a60e8f12128e1ce19f2c9c20";
+        const EXPECTED: &str = "d4686311e9887d778c00b7e1b93ddddabb3bf10db74ca9bfdac75f8db55e0b80";
         let n_blocks = 128usize;
         let setup = sha2::Sha256HybridSetup::new(n_blocks);
         let mut rng = Rng::new(0x4D36_5252);

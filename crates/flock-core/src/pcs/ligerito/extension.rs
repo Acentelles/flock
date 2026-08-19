@@ -1126,7 +1126,7 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
     );
     grinding_nonces.push(nonce);
     let (nonce, alpha_0) =
-        challenger.grind_pow_and_sample_f128_vec(consistency_bits(1), ceil_log2(config.queries[0]));
+        challenger.grind_pow_and_sample_f128_vec(consistency_bits(0), ceil_log2(config.queries[0]));
     consistency_batch_grinding_nonces.push(nonce);
     if trace {
         t_grind += _t.elapsed();
@@ -1313,7 +1313,7 @@ pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
         );
         grinding_nonces.push(nonce);
         let (nonce, alpha) = challenger.grind_pow_and_sample_f128_vec(
-            consistency_bits(next_level),
+            consistency_bits(level),
             ceil_log2(config.queries[level]),
         );
         consistency_batch_grinding_nonces.push(nonce);
@@ -1619,7 +1619,7 @@ where
     };
     let Some(alpha_0) = challenger.verify_pow_and_sample_f128_vec(
         nonce,
-        consistency_bits(1),
+        consistency_bits(0),
         ceil_log2(config.queries[0]),
     ) else {
         return false;
@@ -1894,7 +1894,7 @@ where
         };
         let Some(alpha) = challenger.verify_pow_and_sample_f128_vec(
             nonce,
-            consistency_bits(level + 1),
+            consistency_bits(level),
             ceil_log2(config.queries[level]),
         ) else {
             return false;
