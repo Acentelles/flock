@@ -1810,14 +1810,13 @@ impl Blake3Setup {
         crate::prover::ProvePhaseTimings,
     ) {
         assert_eq!(blocks.len(), self.n_blocks);
-        // The DIRECT commit shape, like `prove_fast_ag`/`verify_ag` — the
-        // union-shaped `self.pcs_params` fails the commit length assert.
-        let pcs_params = self.direct_pcs_params();
         let t0 = std::time::Instant::now();
         let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
             self.generate_witness_ab(blocks);
         let witness_s = t0.elapsed().as_secs_f64();
         let lc_circuit = self.r1cs.csc_lincheck_circuit();
+        // The DIRECT commit shape, like `prove_fast_ag`/`verify_ag` — the
+        // union-shaped `self.pcs_params` fails the commit length assert.
         let pcs_params = self.direct_pcs_params();
         let (proof, commitment, claim, mut timings) = crate::prover::prove_fast_ligerito_ag_timed(
             &self.r1cs,
