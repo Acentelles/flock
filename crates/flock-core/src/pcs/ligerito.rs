@@ -6318,11 +6318,8 @@ mod tests {
             &ntt_0,
             HashKind::Sha256,
         );
-        let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
-            wtns_0
-                .cap(cfg.l0_cap_depth())
-                .to_vec()
-        };
+        let initial_cap =
+            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
 
         let mut p_ch = crate::challenger::FsChallenger::new(b"pow-test");
         let proof = recursive_prover_with_basis(
@@ -7430,9 +7427,7 @@ mod tests {
                 .fold(F128::ZERO, |a, x| a + x);
             let ntt0 = AdditiveNttF128::standard(cols0 + rate0);
             let wtns0 = ligero_commit(&poly, cols0, initial_k, rate0, &ntt0, hash);
-            let cap = wtns0
-                .cap(vc.l0_cap_depth())
-                .to_vec();
+            let cap = wtns0.cap(vc.l0_cap_depth()).to_vec();
 
             let mut times = Vec::new();
             let mut proof_bytes = 0usize;
@@ -7852,11 +7847,8 @@ mod tests {
             &ntt_0,
             HashKind::Sha256,
         );
-        let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
-            wtns_0
-                .cap(cfg.l0_cap_depth())
-                .to_vec()
-        };
+        let initial_cap =
+            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
 
         let mut p_ch = crate::challenger::FsChallenger::new(b"basis-test");
         let proof = recursive_prover_with_basis(
@@ -8306,11 +8298,8 @@ mod tests {
             &ntt_0,
             HashKind::Sha256,
         );
-        let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
-            wtns_0
-                .cap(cfg.l0_cap_depth())
-                .to_vec()
-        };
+        let initial_cap =
+            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
 
         let mut p_ch = crate::challenger::FsChallenger::new(b"succ-cmp");
         let proof = recursive_prover_with_basis(
@@ -8456,11 +8445,8 @@ mod tests {
             &ntt_0,
             HashKind::Sha256,
         );
-        let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
-            wtns_0
-                .cap(cfg.l0_cap_depth())
-                .to_vec()
-        };
+        let initial_cap =
+            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
 
         let mut p_ch = crate::challenger::FsChallenger::new(b"ood-test");
         let proof = recursive_prover_with_basis(
@@ -8600,11 +8586,8 @@ mod tests {
             &ntt_0,
             HashKind::Sha256,
         );
-        let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
-            wtns_0
-                .cap(cfg.l0_cap_depth())
-                .to_vec()
-        };
+        let initial_cap =
+            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
 
         let mut p_ch = crate::challenger::FsChallenger::new(b"m22-fast");
         let proof = recursive_prover_with_basis(
@@ -8693,11 +8676,8 @@ mod tests {
             &ntt_0,
             HashKind::Blake3,
         );
-        let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
-            wtns_0
-                .cap(cfg.l0_cap_depth())
-                .to_vec()
-        };
+        let initial_cap =
+            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
 
         let mut p_ch = crate::challenger::FsChallenger::new(b"m22-blake3");
         let proof = recursive_prover_with_basis(
@@ -8782,11 +8762,8 @@ mod tests {
                 let ntt_0 = AdditiveNttF128::standard(log_msg_cols_0 + 1);
                 let wtns_0 =
                     ligero_commit(&poly, log_msg_cols_0, initial_k, 1, &ntt_0, merkle_hash);
-                let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
-                    wtns_0
-                        .cap(cfg.l0_cap_depth())
-                        .to_vec()
-                };
+                let initial_cap =
+                    |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
 
                 let mut p_ch = crate::challenger::FsChallenger::with_hash(b"m22-matrix", fs_hash);
                 let proof = recursive_prover_with_basis(
@@ -8908,11 +8885,8 @@ mod tests {
             &ntt_0,
             HashKind::Sha256,
         );
-        let initial_cap = |cfg: &VerifierConfig| -> Vec<Hash> {
-            wtns_0
-                .cap(cfg.l0_cap_depth())
-                .to_vec()
-        };
+        let initial_cap =
+            |cfg: &VerifierConfig| -> Vec<Hash> { wtns_0.cap(cfg.l0_cap_depth()).to_vec() };
 
         let mut p_ch = crate::challenger::FsChallenger::new(b"batched");
         let proof = recursive_prover_with_basis(
