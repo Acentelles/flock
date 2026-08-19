@@ -3716,16 +3716,16 @@ pub fn round1_slp_packed_banks_fused_padded(
             // the dense kernel's tail branch, source-parameterized so a
             // 1024-byte scratch block passes with base 0.
             let single = |a_src: &[u8],
-                              b_src: &[u8],
-                              c_src: &[u8],
-                              base: usize,
-                              eq_o: F128,
-                              af: &mut [uint8x16_t; 160],
-                              bf: &mut [uint8x16_t; 160],
-                              pab: &mut [uint8x16_t; 128],
-                              res: &mut [UnredAcc; 160],
-                              bank0: &mut [UnredAcc; 64],
-                              bank1: &mut [UnredAcc; 64]| {
+                          b_src: &[u8],
+                          c_src: &[u8],
+                          base: usize,
+                          eq_o: F128,
+                          af: &mut [uint8x16_t; 160],
+                          bf: &mut [uint8x16_t; 160],
+                          pab: &mut [uint8x16_t; 128],
+                          res: &mut [UnredAcc; 160],
+                          bank0: &mut [UnredAcc; 64],
+                          bank1: &mut [UnredAcc; 64]| {
                 let mut pc = [z; 128];
                 let mut buf = [0u8; 128 * 16];
                 bitslice_block_into(c_src, base, &mut buf, &mut pc);
@@ -3760,8 +3760,14 @@ pub fn round1_slp_packed_banks_fused_padded(
                             );
                             unsafe {
                                 process_block_fused(
-                                    a_packed, b_packed, o * 1024, eq[o], &mut pab, &mut af,
-                                    &mut bf, &mut res,
+                                    a_packed,
+                                    b_packed,
+                                    o * 1024,
+                                    eq[o],
+                                    &mut pab,
+                                    &mut af,
+                                    &mut bf,
+                                    &mut res,
                                 );
                                 process_block_fused(
                                     a_packed,
@@ -3778,8 +3784,17 @@ pub fn round1_slp_packed_banks_fused_padded(
                             continue;
                         }
                         single(
-                            a_packed, b_packed, c_packed, o * 1024, eq[o], &mut af, &mut bf,
-                            &mut pab, &mut res, &mut bank0, &mut bank1,
+                            a_packed,
+                            b_packed,
+                            c_packed,
+                            o * 1024,
+                            eq[o],
+                            &mut af,
+                            &mut bf,
+                            &mut pab,
+                            &mut res,
+                            &mut bank0,
+                            &mut bank1,
                         );
                         i += 1;
                     }
@@ -3791,8 +3806,8 @@ pub fn round1_slp_packed_banks_fused_padded(
                         crate::zerocheck::cleanse_block(b_packed, o * 1024, ranges, &mut b_buf);
                         crate::zerocheck::cleanse_block(c_packed, o * 1024, ranges, &mut c_buf);
                         single(
-                            &a_buf, &b_buf, &c_buf, 0, eq[o], &mut af, &mut bf, &mut pab,
-                            &mut res, &mut bank0, &mut bank1,
+                            &a_buf, &b_buf, &c_buf, 0, eq[o], &mut af, &mut bf, &mut pab, &mut res,
+                            &mut bank0, &mut bank1,
                         );
                         i += 1;
                     }

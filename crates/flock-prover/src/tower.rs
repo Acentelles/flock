@@ -104,16 +104,14 @@ fn test_config() -> TowerConfig {
 /// growing `TowerConfig`. `TOWER_LEAF_ZC=rs` forces the RS leaf for A/B
 /// measurement on aarch64.
 fn leaf_zc_ag() -> bool {
-    cfg!(target_arch = "aarch64")
-        && !matches!(std::env::var("TOWER_LEAF_ZC").as_deref(), Ok("rs"))
+    cfg!(target_arch = "aarch64") && !matches!(std::env::var("TOWER_LEAF_ZC").as_deref(), Ok("rs"))
 }
 
 /// Phase C flip-in-place: the envelope OUTERS (FL / internal / spine)
 /// prove under the AG skip on the same terms as the leaf.
 /// `TOWER_OUTER_ZC=rs` forces the RS outers for A/B measurement.
 fn outer_zc_ag() -> bool {
-    cfg!(target_arch = "aarch64")
-        && !matches!(std::env::var("TOWER_OUTER_ZC").as_deref(), Ok("rs"))
+    cfg!(target_arch = "aarch64") && !matches!(std::env::var("TOWER_OUTER_ZC").as_deref(), Ok("rs"))
 }
 
 fn tower_fold_grinding(cfg: TowerConfig) -> flock_core::matrix_fold::FoldGrinding {
@@ -1700,9 +1698,11 @@ fn decode_ag_point(
             HashKind::Blake3,
             bits,
         ),
-        None => {
-            flock_core::genus95_curve_code::evaluation_point_from_nonce(seed, nonce, HashKind::Blake3)
-        }
+        None => flock_core::genus95_curve_code::evaluation_point_from_nonce(
+            seed,
+            nonce,
+            HashKind::Blake3,
+        ),
     }
     .expect("the AG nonce decodes to a valid cover point")
 }
@@ -7099,7 +7099,12 @@ impl<'p> RealTape<'p> {
                     assert_eq!(chals[*ch], mat_assert.z_skip.phi8(), "z_skip located");
                 }
                 (MixedProof::Ag(p), ZskipTapeRec::Ag { seed_ch, .. }) => {
-                    let nonce = p.boolean.as_ref().expect("boolean side present").ag.r1_nonce;
+                    let nonce = p
+                        .boolean
+                        .as_ref()
+                        .expect("boolean side present")
+                        .ag
+                        .r1_nonce;
                     let pt = decode_ag_point(
                         &ag_seed_bytes(chals[*seed_ch], chals[*seed_ch + 1]),
                         nonce,
@@ -8991,7 +8996,8 @@ fn check_real_child_region(public: &[F128], rt: &RealTape<'_>, r: &RealRegion) -
     // no publics, no checker items; the proof itself carries them.
     let sig_base = sp_base + 4 + 2 * rt.levels.len() * rt.yr_len + 2;
     assert_eq!(
-        public[sig_base], rt.lo.proof.wiring().gkr.s_sigma_eval,
+        public[sig_base],
+        rt.lo.proof.wiring().gkr.s_sigma_eval,
         "the emitted sigma value is the proof's deferred evaluation"
     );
     let sa = flock_core::circuit::SigmaAssertion {
@@ -10720,7 +10726,11 @@ pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
                     }
                     let nonce = match &tk.inner.proof {
                         MixedProof::Ag(p) => {
-                            p.boolean.as_ref().expect("boolean side present").ag.r1_nonce
+                            p.boolean
+                                .as_ref()
+                                .expect("boolean side present")
+                                .ag
+                                .r1_nonce
                         }
                         MixedProof::Rs(_) => unreachable!("an AG tape carries an AG proof"),
                     };
@@ -11869,10 +11879,10 @@ fn emit_ag_point_binding(
     // Native replicas of the cleared AS equations (mirroring the sampler's
     // rhs masks) — the method-note discipline before the rows land.
     let pv = |degs: &[usize], plus_one: bool| -> F128 {
-        degs.iter().fold(
-            if plus_one { F128::ONE } else { F128::ZERO },
-            |acc, &d| acc + xp[d],
-        )
+        degs.iter()
+            .fold(if plus_one { F128::ONE } else { F128::ZERO }, |acc, &d| {
+                acc + xp[d]
+            })
     };
     let yp_n = [F128::ONE, y, y * y, y * y * y];
     let z_n = [pt_n.z1, pt_n.z2, pt_n.z3];
@@ -11929,10 +11939,7 @@ fn emit_ag_point_binding(
         &[iv[0], iv[1], seed_w[0], seed_w[1], nonce_w, zw, params36],
     );
     let params32 = cw(sb, vals, consts, pack_params(0, 32, flags));
-    let xof_out = sb.gate(
-        b3,
-        &[iv[0], iv[1], ns_out[0], ns_out[1], zw, zw, params32],
-    );
+    let xof_out = sb.gate(b3, &[iv[0], iv[1], ns_out[0], ns_out[1], zw, zw, params32]);
     sb.connect(xof_out[0], pt_w[0]);
     if let Some(bits) = ag_r1_bits {
         emit_pow_checks(
@@ -13392,7 +13399,12 @@ impl<'p> ChildTape<'p> {
                     assert_eq!(chals[*ch], bool_assert.z_skip.phi8(), "z_skip located");
                 }
                 (MixedProof::Ag(p), ZskipTapeRec::Ag { seed_ch, .. }) => {
-                    let nonce = p.boolean.as_ref().expect("boolean side present").ag.r1_nonce;
+                    let nonce = p
+                        .boolean
+                        .as_ref()
+                        .expect("boolean side present")
+                        .ag
+                        .r1_nonce;
                     let pt = decode_ag_point(
                         &ag_seed_bytes(chals[*seed_ch], chals[*seed_ch + 1]),
                         nonce,
@@ -15139,7 +15151,8 @@ fn check_child_region(public: &[F128], ct: &ChildTape<'_>, r: &ChildRegion) -> u
     // the mu point coordinates, matched against the native claim.
     let sig_base = mp_base + 5 + 2 * ct.levels.len() * ct.yr_len + 2;
     assert_eq!(
-        public[sig_base], ct.inner.proof.wiring().gkr.s_sigma_eval,
+        public[sig_base],
+        ct.inner.proof.wiring().gkr.s_sigma_eval,
         "the emitted sigma value is the proof's deferred evaluation"
     );
     let sig_rho = &public[sig_base + 1..sig_base + 1 + ct.mu_i];
@@ -15892,8 +15905,7 @@ fn ag_skip_publics_checker_rejects_tampers() {
     let seed = ag_seed_bytes(s0, s1);
     let (nonce, pt) = (0..R1_FUSED_ATTEMPT_BUDGET)
         .find_map(|n| {
-            evaluation_point_from_nonce_pow(&seed, n, HashKind::Blake3, R1_POW_BITS)
-                .map(|p| (n, p))
+            evaluation_point_from_nonce_pow(&seed, n, HashKind::Blake3, R1_POW_BITS).map(|p| (n, p))
         })
         .expect("a valid fused nonce exists in the budget");
     let bf = base_evaluation_functional(&pt).expect("the functional exists at a sampled point");
@@ -15924,8 +15936,14 @@ fn ag_skip_publics_checker_rejects_tampers() {
         rejects(&|p| p[base + 2] = F128::new(u64::from(R1_FUSED_ATTEMPT_BUDGET), 0)),
         "an out-of-budget nonce is rejected"
     );
-    assert!(rejects(&|p| p[base + 4] += F128::ONE), "tampered point coord");
-    assert!(rejects(&|p| p[base + 8 + 17] += F128::ONE), "tampered row low");
+    assert!(
+        rejects(&|p| p[base + 4] += F128::ONE),
+        "tampered point coord"
+    );
+    assert!(
+        rejects(&|p| p[base + 8 + 17] += F128::ONE),
+        "tampered row low"
+    );
 }
 
 /// Walk the published fold blocks from `tail0`: both endpoint deltas zero
@@ -17863,7 +17881,11 @@ pub fn build_node_outer_app(
                     }
                     let nonce = match &tk.lo.proof {
                         MixedProof::Ag(p) => {
-                            p.boolean.as_ref().expect("boolean side present").ag.r1_nonce
+                            p.boolean
+                                .as_ref()
+                                .expect("boolean side present")
+                                .ag
+                                .r1_nonce
                         }
                         MixedProof::Rs(_) => unreachable!("an AG tape carries an AG proof"),
                     };

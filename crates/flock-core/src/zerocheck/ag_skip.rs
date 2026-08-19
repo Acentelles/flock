@@ -393,7 +393,11 @@ pub fn fold_and_first_round_padded(
     let eq_outer = super::univariate_skip::build_eq(&r_rest[N_INNER..]);
     let n_outer = eq_outer.len();
     assert_eq!(n, n_outer * 128, "each outer block is 128 (2^7) messages");
-    assert_eq!(coverage.len(), n_outer, "one coverage entry per outer block");
+    assert_eq!(
+        coverage.len(),
+        n_outer,
+        "one coverage entry per outer block"
+    );
     let mut d1 = F128::ONE;
     for j in 1..N_INNER {
         d1 *= F128::ONE + gamma_pow(1usize << j);
@@ -459,7 +463,11 @@ pub fn fold_and_first_round_sparse(
     let eq_outer = super::univariate_skip::build_eq(&r_rest[N_INNER..]);
     let n_outer = eq_outer.len();
     assert_eq!(a_packed.len() / 8, n_outer * 128, "128 messages per block");
-    assert_eq!(coverage.len(), n_outer, "one coverage entry per outer block");
+    assert_eq!(
+        coverage.len(),
+        n_outer,
+        "one coverage entry per outer block"
+    );
     let mut d1 = F128::ONE;
     for j in 1..N_INNER {
         d1 *= F128::ONE + gamma_pow(1usize << j);
