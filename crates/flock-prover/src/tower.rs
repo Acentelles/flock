@@ -16118,7 +16118,10 @@ fn labeled_bytes_payloads(
         {
             out.push(payload);
         }
-        if matches!(op, Op::ObserveBytes(_) | Op::Pow { .. } | Op::LegacyPow { .. }) {
+        if matches!(
+            op,
+            Op::ObserveBytes(_) | Op::Pow { .. } | Op::LegacyPow { .. }
+        ) {
             payload += 1;
         }
     }
