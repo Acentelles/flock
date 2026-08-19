@@ -7975,9 +7975,7 @@ mod tests {
 
         // And the proof is a real one.
         let v_cfg = verifier_config_for(log_n, 6, LigeritoProfile::Fast).unwrap();
-        let cap = wtns
-            .cap(v_cfg.l0_cap_depth())
-            .to_vec();
+        let cap = wtns.cap(v_cfg.l0_cap_depth()).to_vec();
         let mut v_ch = crate::challenger::FsChallenger::new(b"la-test");
         assert!(extension::recursive_verifier_with_basis_succinct(
             &v_cfg,
