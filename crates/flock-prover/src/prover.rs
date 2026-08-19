@@ -630,8 +630,9 @@ pub fn prove_fast_ligerito_union<Ch: Challenger>(
 enum BooleanZcKind {
     /// RS additive-NTT univariate skip (the default).
     Rs,
-    /// Genus-95 AG multiplication-code skip. aarch64-only (NEON SLP kernel);
-    /// forces the honest-zero witness mode — see the padding note in the body.
+    /// Genus-95 AG multiplication-code skip. aarch64-only (NEON SLP
+    /// kernel); run-list read-exact like the RS flavor — see the padding
+    /// contract on `flock_core::proof::BooleanPiopProofAg`.
     #[cfg(target_arch = "aarch64")]
     Ag,
 }
@@ -641,9 +642,9 @@ enum BooleanZcKind {
 /// [`flock_core::verifier::verify_ligerito_union_circuit_ag`] (or the
 /// `_deferred` twin). Same class PIOP order, wiring argument, and merged
 /// opening; only the boolean zerocheck's round 1 differs. The element class
-/// may be present (its PIOP is flavor-independent); the AG flavor forces the
-/// honest-zero witness mode inside the shared body. aarch64-only (the AG
-/// round-1 kernel is NEON).
+/// may be present (its PIOP is flavor-independent). Run-list read-exact —
+/// the padding contract on [`flock_core::proof::BooleanPiopProofAg`] is
+/// the owning statement. aarch64-only (the AG round-1 kernel is NEON).
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_arguments)]
 pub fn prove_fast_ligerito_union_circuit_ag<Ch: Challenger>(
@@ -745,10 +746,9 @@ impl UnionBooleanProof {
 /// differs (the genus-95 AG multiplication code replaces the RS
 /// additive-NTT skip, and the claim points ride [`SkipPoint::Ag`]).
 ///
-/// aarch64-only (the AG round-1 kernel is NEON SLP). Forces the honest-zero
-/// witness mode: the AG round-1 sum reads the FULL boolean region, so the
-/// dirty pooled padding the run-list-gated RS kernels tolerate is unsound
-/// here (the flavor gate inside the shared body enforces this).
+/// aarch64-only (the AG round-1 kernel is NEON SLP). Run-list read-exact —
+/// the padding contract on [`flock_core::proof::BooleanPiopProofAg`] is
+/// the owning statement; dirty pooled padding is legal for both flavors.
 #[cfg(target_arch = "aarch64")]
 pub fn prove_fast_ligerito_union_ag<Ch: Challenger>(
     union: &flock_core::union::UnionInstance<'_>,

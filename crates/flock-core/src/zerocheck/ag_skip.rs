@@ -1003,7 +1003,7 @@ pub(super) fn sample_r1_prover_pow<C: Challenger>(
             return (point, nonce);
         }
     }
-    unreachable!("fused r1 nonce grind exhausted its budget (probability ~2^-2954)")
+    unreachable!("fused r1 nonce grind exhausted its budget (see R1_FUSED_ATTEMPT_BUDGET)")
 }
 
 /// Verifier: re-derive `r₁` from the proof's nonce — range-check it, run the
@@ -1148,9 +1148,10 @@ impl<C: Challenger> Challenger for RoundGrindProver<'_, C> {
         self.nonces.push(nonce);
         r
     }
-    fn sample_f128_vec(&mut self, n: usize) -> Vec<F128> {
-        // The tail never vector-squeezes; keep the inner framing if it ever does.
-        self.inner.sample_f128_vec(n)
+    fn sample_f128_vec(&mut self, _n: usize) -> Vec<F128> {
+        // Fail loudly rather than silently skip the per-round grind: a tail
+        // change that vector-squeezes must extend the adapter first.
+        unreachable!("the grinding tail adapter never vector-squeezes")
     }
     fn grind_pow(&mut self, bits: u32) -> u64 {
         self.inner.grind_pow(bits)
@@ -1259,10 +1260,10 @@ pub fn prove_capture_s_hat_v_c<C: Challenger>(
 /// budget survives the recursion circuit's relaxed-canonicity decode —
 /// with a ONE-SHOT verifier.
 ///
-/// PADDING CONTRACT: round 1 sums the FULL `2^m` region — every padding
-/// word of `a`/`b`/`c` must be an HONEST ZERO (the union's fresh-zeroed
-/// witness mode), unlike the run-list-gated RS kernels which never read
-/// them.
+/// PADDING CONTRACT: this entry is run-list READ-EXACT — see the owning
+/// statement on [`crate::proof::BooleanPiopProofAg`]. Round 1 and the fold
+/// consult the `padding` spec's block coverage; declared-dead bits are
+/// never read, whatever the pooled buffers hold.
 #[cfg(target_arch = "aarch64")]
 pub fn prove_capture_s_hat_v_c_with_grinding<C: Challenger>(
     a_packed: &[u8],

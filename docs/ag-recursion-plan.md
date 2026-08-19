@@ -180,8 +180,11 @@ landed instead ((a)+(c), Ron's call):
   repaid by the all-explicit `R1_POW_BITS = 9` (was 4+5 credit; total
   unchanged; scan budget 2^24; the lincheck site keeps 3+5 — its decode
   stays canonical end-to-end).
-- `check_ag_skip_publics` slims to ONE item: `lows == bf(point)`. The
-  genus-95 sampler/DRBG/AS-solver leave the exit contract; `bf()` stays.
+- `check_ag_skip_publics` slims to TWO items: the NONCE RANGE (the
+  PowMask row pins only the nonce word's high half, and Chain100 emits no
+  row, so the range check stays native — the PR review caught its brief
+  removal) and `lows == bf(point)`. The genus-95 sampler/DRBG/AS-solver
+  leave the exit contract; `bf()` and the range check stay.
 Whole pipeline green under everything (all knobs, Chain100+128), 687
 workspace tests, x86 clean. m32 bench with the binding in place:
 amortised 637 ms/leaf = 412k c/s (leaf 429.6, FL 209.2, internal 196.6,

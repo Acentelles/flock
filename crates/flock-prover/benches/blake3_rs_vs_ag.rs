@@ -6,8 +6,7 @@
 //!               comparison mixes commit shape with zerocheck flavor.
 //!   AG-union  — `prove_fast_union_ag`: the SAME union transport as RS with
 //!               the AG zerocheck — the apples-to-apples pair. The only
-//!               difference vs RS is round 1 of the zerocheck (plus the
-//!               honest-zero witness mode AG requires).
+//!               difference vs RS is round 1 of the zerocheck.
 //!
 //! Run twice for ST and MT:
 //!   cargo bench --bench blake3_rs_vs_ag                       # MT (default)

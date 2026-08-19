@@ -92,10 +92,14 @@ pub struct BooleanPiopProof {
 /// [`BooleanPiopProof`] with the **AG-skip** zerocheck: the genus-95 AG
 /// multiplication code replaces the RS additive-NTT round 1; the lincheck and
 /// every claim downstream are unchanged (the skip point rides as
-/// [`lincheck::SkipPoint::Ag`]). PADDING CONTRACT: the AG round-1 sum reads
-/// the full `2^m_bool` boolean region, so the witness must be built in
-/// honest-zero padding mode — the run-list-gated dirty-padding mode the RS
-/// kernels tolerate is UNSOUND here.
+/// [`lincheck::SkipPoint::Ag`]). PADDING CONTRACT (the owning statement —
+/// other sites point here): the AG union entries are run-list READ-EXACT,
+/// exactly like the RS kernels — Dead code blocks are skipped, Partial
+/// blocks are cleansed into zeroed scratch (`zerocheck::cleanse_block`),
+/// and no declared-dead bit is ever read — so dirty pooled padding
+/// (`PooledDirty`) is legal for both flavors. Only the DENSE direct-route
+/// entries (`ag_skip::prove`, `prove_capture_s_hat_v_c`) still sum the
+/// full region and need honestly zero padding.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BooleanPiopProofAg {
     pub ag: zerocheck::ag_skip::AgProof,

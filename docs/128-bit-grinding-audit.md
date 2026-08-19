@@ -223,7 +223,7 @@ All bit counts below are sufficient for the strict local rule.
 | Boolean lincheck batching/pins | 1 | 1 |
 | Boolean lincheck ordinary round | 2 | 2 |
 | Boolean lincheck final skip | `2^k-1` | `k` |
-| AG-skip zerocheck `r_1` (fused nonce) | 474 | 4 explicit + 5 sampling credit |
+| AG-skip zerocheck `r_1` (fused nonce) | 474 | 9 explicit (no sampling credit at `r_1`) |
 | AG-basis lincheck final skip (fused nonce) | 158 | 3 explicit + 5 sampling credit |
 | Element zerocheck initial equality point | `m_words` | `bits_for_degree(m_words)` |
 | Element zerocheck/lincheck ordinary round | 2 | 2 |
@@ -590,8 +590,14 @@ two facts, neither empirical:
 
 Work-normalized, a candidate costs at least one hash and succeeds with
 probability `p * 2^-b * numerator / N <= 2^-(b+5) * numerator / 2^128 * (1 + 2^-55)`,
-so `b_explicit = bits_for_degree(numerator) - 5`: **4 bits at `r_1`, 3 at
-the lincheck skip**. The constants are tied together by
+so `b_explicit = bits_for_degree(numerator) - 5` where the sampling credit
+applies. The credit applies at the LINCHECK skip only (**3 explicit
+bits**): its decode stays canonical end-to-end. At `r_1` the recursion
+circuit binds the decode with RELAXED canonicity (`emit_ag_point_binding`
+accepts any of the <= 32 fiber points over the XOF-derived `x`), which
+returns the sampler's 5 flattening bits to a circuit-side prover — so
+`r_1` carries **all `bits_for_degree(474) = 9` bits explicitly** and the
+total budget is unchanged. The constants are tied together by
 `ag_skip::credit_constants_are_pinned` (code degrees, the `4 * 8 = 32`
 sampler shape, and both explicit-bit splits) and the statistical pin
 `genus95_curve_code::tests::acceptance_rate_is_one_in_32`; a sampler

@@ -9202,13 +9202,6 @@ fn check_real_child_region(public: &[F128], rt: &RealTape<'_>, r: &RealRegion) -
 // child-tape region per child — the build_leaf_outer precedent)
 // ---------------------------------------------------------------------------
 
-/// A minimal MIXED circuit inner — a blake3 chain feeding MacGate rows across
-/// the class boundary, ends published — proven over the circuit path and
-/// verified DEFERRED. The shape mvp10 pins at `(256, 32)` and the mvp11 merge
-/// children instantiate at `(128, 16)`. The seed varies only the witness
-/// (message words), so same-parameter instances share the CIRCUIT — and its
-/// digest, the key the accumulator folds sigma under — while their claims
-/// land at unrelated FS points, which is what a merge node actually sees.
 /// A circuit-union proof by boolean-zerocheck FLAVOR — parallel arms so
 /// the RS deprecation endgame is arm-deletion, not surgery
 /// (docs/ag-recursion-plan.md). Carried by the chain leaf ([`MixedInner`])
@@ -9304,6 +9297,13 @@ impl MixedProof {
     }
 }
 
+/// A minimal MIXED circuit inner — a blake3 chain feeding MacGate rows across
+/// the class boundary, ends published — proven over the circuit path and
+/// verified DEFERRED. The shape mvp10 pins at `(256, 32)` and the mvp11 merge
+/// children instantiate at `(128, 16)`. The seed varies only the witness
+/// (message words), so same-parameter instances share the CIRCUIT — and its
+/// digest, the key the accumulator folds sigma under — while their claims
+/// land at unrelated FS points, which is what a merge node actually sees.
 struct MixedInner {
     nu: usize,
     built: flock_core::circuit::builder::BuiltCircuit,
@@ -10741,7 +10741,7 @@ pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
                     // ([`emit_ag_point_binding`]: the two BLAKE3 decode
                     // rows, the fused-PoW row, the fiber algebra over the
                     // published coordinate wires). The native checker keeps
-                    // only `lows == bf(point)`.
+                    // the nonce range and `lows == bf(point)`.
                     let base = sb.public_len();
                     for (v, src) in [
                         (tk.chals[*seed_ch], seed_w[0]),
@@ -11084,9 +11084,15 @@ pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
                 }
             }
             // The AG-skip blocks: the decode is in-circuit since phase D;
-            // the checker holds the row lows to the published point.
-            for base in ag_pub_bases.iter().flatten() {
-                check_ag_skip_publics(&built2.public, *base);
+            // the checker holds the nonce range and the row lows.
+            for (cp, base) in cps.iter().zip(&ag_pub_bases) {
+                if let Some(base) = base {
+                    check_ag_skip_publics(
+                        &built2.public,
+                        *base,
+                        cp.inner.pcs.zerocheck_grinding().ag_r1_bits(),
+                    );
+                }
             }
             for &(v, idx) in &jag_const_rec {
                 assert_eq!(built2.public[idx], v, "jagged shared constant public");
@@ -11801,7 +11807,6 @@ fn emit_element_reported_check(
     sb.connect(rhs, target_w);
 }
 
-/// **THE LAGRANGE ROW LOWS in-circuit (round 4).** The 64 weights
 /// PHASE D (docs/ag-recursion-plan.md): the AG z_skip point's IN-CIRCUIT
 /// binding — the Tier-1 successor of the Tier-0 decode checker. From the
 /// child's transcript wires (the two seed squeezes and the absorbed 4-byte
@@ -11824,9 +11829,10 @@ fn emit_element_reported_check(
 /// satisfies these rows — the sampler's slot/choice bits are deliberately
 /// unbound, and the fiber's 5 bits of prover freedom are repaid by the
 /// all-explicit `R1_POW_BITS = 9` fused target (the schedule constant
-/// moved with this emitter; the total stays `bits_for(474)`). The one
-/// checker item left on this surface is `lows == bf(point)`
-/// ([`check_ag_skip_publics`]).
+/// moved with this emitter; the total stays `bits_for(474)`). The checker
+/// items left on this surface are the nonce range and `lows == bf(point)`
+/// ([`check_ag_skip_publics`] — the PowMask row pins only the nonce
+/// word's high half, and Chain100 emits no row).
 #[allow(clippy::too_many_arguments)]
 fn emit_ag_point_binding(
     sb: &mut ShapeBuilder,
@@ -12073,6 +12079,7 @@ fn emit_ag_point_binding(
     }
 }
 
+/// **THE LAGRANGE ROW LOWS in-circuit (round 4).** The 64 weights
 /// `L_i(z_skip) = Z_N(z)·(z + λ_i)^{-1}·den^{-1}` a merge fold's boolean
 /// claims carry, derived from the child's z_skip WIRE instead of published
 /// and checker-rebuilt: `t_i = z + λ_i` against the shared λ const wires,
@@ -12319,8 +12326,10 @@ struct ChildTape<'p> {
 /// its wire in-circuit ([`emit_lagrange_lows`]). AG: the point has NO
 /// transcript word — it decodes from (seed = two squeezes, nonce = a
 /// 4-byte observe) through a STANDALONE hash, so the tape records the seed
-/// ordinals and the nonce's payload ordinal, and the consumer publishes
-/// (seed, nonce, point, row lows) for the Tier-0 native checker
+/// ordinals and the nonce's payload ordinal; the consumer publishes
+/// (seed, nonce, point, row lows), binds the decode IN-CIRCUIT
+/// ([`emit_ag_point_binding`]), and leaves the nonce range + the
+/// lows-to-functional items to the native checker
 /// ([`check_ag_skip_publics`], docs/ag-recursion-plan.md).
 enum ZskipTapeRec {
     Rs {
@@ -13974,22 +13983,24 @@ impl ChildSlots {
     }
 }
 
-/// What one emitted child region hands back: where its public block starts,
-/// the walk counts the checker needs, and the assertion-emission wires the
-/// mvp11 merge node CONNECTS the fold region's claim words to.
 /// A child region's z_skip wires, by flavor. RS: the one fused-squeeze
 /// output — the merge assembly derives the 64 Lagrange row lows from it
 /// IN-CIRCUIT ([`emit_lagrange_lows`]; no publish, no checker rebuild).
 /// AG: the seed squeezes' outputs and the r₁ nonce's stream-word wire —
 /// the merge assembly publishes them beside the point and the row lows,
-/// and the Tier-0 checker ([`check_ag_skip_publics`]) re-derives the point
-/// and the lows natively (docs/ag-recursion-plan.md; the in-circuit
-/// derivation is Phase D's `emit_ag_lows`).
+/// binds the decode IN-CIRCUIT from these wires
+/// ([`emit_ag_point_binding`]: hash, PoW, fiber membership), and leaves
+/// the nonce range + the lows-to-functional items to the native checker
+/// ([`check_ag_skip_publics`]); the in-circuit lows derivation
+/// (`emit_ag_lows`) is measured-rejected — see docs/ag-recursion-plan.md.
 enum ZskipWires {
     Rs(Wire),
     Ag { seed_w: [Wire; 2], nonce_w: Wire },
 }
 
+/// What one emitted child region hands back: where its public block starts,
+/// the walk counts the checker needs, and the assertion-emission wires the
+/// mvp11 merge node CONNECTS the fold region's claim words to.
 struct ChildRegion {
     pub_base: usize,
     n_query_pub: usize,
@@ -15859,14 +15870,30 @@ fn read_acc_entry(
 }
 
 /// The AG-skip surface checker: walk one AG child's published block
-/// `[seed₂, nonce, point ×5, lows ×64]` and hold the row lows to the
-/// published point's base evaluation functional. Since phase D the decode
-/// itself (seed/nonce → point, fused PoW included) is IN-CIRCUIT
-/// ([`emit_ag_point_binding`]), so `lows == bf(point)` is the ONE item
-/// this surface leaves at the checker tier — the same class as the leaf's
-/// skip-interpolation items, with the genus-95 sampler gone from the exit
-/// contract. Returns the number of public words consumed.
-fn check_ag_skip_publics(public: &[F128], base: usize) -> usize {
+/// `[seed₂, nonce, point ×5, lows ×64]`. Two items stay at the checker
+/// tier since phase D moved the decode in-circuit
+/// ([`emit_ag_point_binding`]):
+/// - the NONCE RANGE — the published nonce word (wire-connected to the
+///   absorbed stream word) must be a native nonce: high half zero, low
+///   half inside the schedule's scan budget. The in-circuit PowMask row
+///   pins only the word's high 64 bits (and Chain100 emits no row), so
+///   without this item the circuit would accept nonce words no native
+///   verifier accepts;
+/// - `lows == bf(point)` — the base functional at the published point.
+/// Both are the leaf skip-interpolation class of obligation; the
+/// genus-95 sampler itself stays out of the exit checker set. Returns
+/// the number of public words consumed.
+fn check_ag_skip_publics(public: &[F128], base: usize, ag_r1_bits: Option<u32>) -> usize {
+    let nonce_word = public[base + 2];
+    assert_eq!(nonce_word.hi, 0, "the nonce word's high half is zero");
+    let budget = match ag_r1_bits {
+        Some(_) => flock_core::zerocheck::ag_skip::R1_FUSED_ATTEMPT_BUDGET,
+        None => flock_core::genus95_curve_code::SAMPLE_ATTEMPT_BUDGET,
+    };
+    assert!(
+        nonce_word.lo < u64::from(budget),
+        "the nonce is inside the schedule's scan budget"
+    );
     let pt = flock_core::genus95_curve_code::EvaluationPoint {
         x: public[base + 3],
         y: public[base + 4],
@@ -15882,12 +15909,12 @@ fn check_ag_skip_publics(public: &[F128], base: usize) -> usize {
     72
 }
 
-/// The Tier-0 checker rejects every tampered surface of the published AG
-/// block: a shifted nonce (fails the fused PoW+decode — and if a shifted
-/// nonce happens to decode, its point differs and the coord pin catches
-/// it), a tampered point coordinate, a tampered row low, an out-of-budget
-/// nonce, and a tampered seed word. The honest block passes and consumes
-/// exactly 72 words.
+/// The checker rejects every surface its two items cover: a non-native
+/// nonce word (high half set, or low half past the scan budget), a
+/// tampered point coordinate, and a tampered row low. The honest block
+/// passes and consumes exactly 72 words. (Seed and decode tampers are
+/// IN-CIRCUIT since phase D — `emit_ag_point_binding` — and are outside
+/// this checker's coverage by design.)
 #[test]
 fn ag_skip_publics_checker_rejects_tampers() {
     use flock_core::genus95_curve_code::{
@@ -15909,22 +15936,27 @@ fn ag_skip_publics_checker_rejects_tampers() {
     public.extend([pt.x, pt.y, pt.z1, pt.z2, pt.z3]);
     public.extend((0..64).map(|j| bf[j]));
     assert_eq!(
-        check_ag_skip_publics(&public, base),
+        check_ag_skip_publics(&public, base, Some(R1_POW_BITS)),
         72,
         "the honest block passes"
     );
 
-    // Since phase D the seed/nonce/decode bindings are IN-CIRCUIT
-    // (emit_ag_point_binding); the checker's remaining item is the
-    // lows-to-point functional, so its tamper matrix is point + lows.
     let rejects = |mutate: &dyn Fn(&mut [F128])| -> bool {
         let mut bad = public.clone();
         mutate(&mut bad);
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            check_ag_skip_publics(&bad, base)
+            check_ag_skip_publics(&bad, base, Some(R1_POW_BITS))
         }))
         .is_err()
     };
+    assert!(
+        rejects(&|p| p[base + 2] = F128::new(u64::from(nonce), 1)),
+        "a set nonce high half is rejected"
+    );
+    assert!(
+        rejects(&|p| p[base + 2] = F128::new(u64::from(R1_FUSED_ATTEMPT_BUDGET), 0)),
+        "an out-of-budget nonce is rejected"
+    );
     assert!(rejects(&|p| p[base + 4] += F128::ONE), "tampered point coord");
     assert!(rejects(&|p| p[base + 8 + 17] += F128::ONE), "tampered row low");
 }
@@ -17848,7 +17880,7 @@ pub fn build_node_outer_app(
                     // lows₆₄] — seed/nonce/lows wire-connected as before —
                     // and BIND the point in-circuit
                     // ([`emit_ag_point_binding`]). The native checker keeps
-                    // only `lows == bf(point)`.
+                    // the nonce range and `lows == bf(point)`.
                     let base = sb.public_len();
                     for (v, src) in [
                         (tk.chals[*seed_ch], seed_w[0]),
@@ -18818,9 +18850,15 @@ pub fn build_node_outer_app(
                     );
                 }
                 // The AG-skip blocks: the decode is in-circuit since
-                // phase D; the checker holds the lows to the point.
-                for base in ag_pub_bases.iter().flatten() {
-                    check_ag_skip_publics(&built2.public, *base);
+                // phase D; the checker holds the nonce range and the lows.
+                for (lo_c, base) in los.iter().zip(&ag_pub_bases) {
+                    if let Some(base) = base {
+                        check_ag_skip_publics(
+                            &built2.public,
+                            *base,
+                            lo_c.pcs.zerocheck_grinding().ag_r1_bits(),
+                        );
+                    }
                 }
                 for &(v, idx) in &jag_const_rec {
                     assert_eq!(built2.public[idx], v, "jagged shared constant public");

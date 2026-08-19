@@ -900,7 +900,7 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
     //       value via the basis's evaluation functional. Mirrors
     //       `column_sumcheck_prove`'s grinding composition exactly: the φ₈
     //       basis keeps the FUSED PoW+squeeze (byte-pinned), the AG basis
-    //       composes the standalone PoW with `sample_fresh`.
+    //       verifies the fused nonce one-shot (`sample_fresh_pow_verifier`).
     let r_inner_skip = match x_ab.z_skip {
         SkipPoint::Phi8(_) => match grinding.skip_bits(k_skip) {
             Some(bits) => {

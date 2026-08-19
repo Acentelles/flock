@@ -1298,7 +1298,9 @@ impl SkipPoint {
                 return (SkipPoint::Ag(p), u64::from(nonce));
             }
         }
-        unreachable!("fused fresh-point grind exhausted its budget (probability ~2^-2954)")
+        unreachable!(
+            "fused fresh-point grind exhausted its budget (see R1_FUSED_ATTEMPT_BUDGET)"
+        )
     }
 
     /// Verifier mirror of [`Self::sample_fresh_pow_prover`]: one hash + one
