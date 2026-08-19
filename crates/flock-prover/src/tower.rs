@@ -6563,7 +6563,7 @@ impl<'p> RealTape<'p> {
                     fin += 1;
                 }
                 match op {
-                    Op::ObserveBytes(_) | Op::Pow { .. } => pay += 1,
+                    Op::ObserveBytes(_) | Op::Pow { .. } | Op::LegacyPow { .. } => pay += 1,
                     _ => {}
                 }
             }
@@ -9708,11 +9708,12 @@ pub fn build_fl_node(cfg: TowerConfig, cp0: &ChainProof, cp1: &ChainProof) -> Fl
     build_fl_node_k(cfg, &[cp0, cp1])
 }
 
-/// The k-ARY first-level node (the FL-arity lever): `k` adjacent chain
-/// proofs verified deferred in ONE outer, their assertions folded k→1 per
-/// group, adjacency as k−1 four-word seams, the app statement the combined
-/// span. `k = 2` emits in exactly the historical two-child order — every
-/// existing gate rides the wrapper above unchanged.
+/// The 2-ary first-level node: two adjacent chain proofs verified deferred
+/// in ONE outer, their assertions folded 2→1 per group, adjacency as one
+/// four-word seam, the app statement the combined span. The `cps` slice is
+/// the arity LEVER, but today it is pinned to exactly two children — the
+/// split-BLAKE slot assignment (`ChildSlots::new_env` sets `b3_alt` for
+/// child 1 only) has no slots for a third child.
 pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
     use flock_core::aggregate;
     use flock_core::matrix_fold::{FoldProof, MatrixClaim};
@@ -9721,7 +9722,10 @@ pub fn build_fl_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
     const FL_DOMAIN: &[u8] = b"flock-chain-fl-node-v0";
 
     let k_ary = cps.len();
-    assert!(k_ary >= 2, "an FL folds at least two chain segments");
+    assert_eq!(
+        k_ary, 2,
+        "split-BLAKE recursion supports exactly two children"
+    );
     let cp0 = cps[0];
     let cp_last = cps[k_ary - 1];
     // Each child CONTINUES the chain: its h_start IS the previous h_end.
@@ -14957,7 +14961,7 @@ fn labeled_bytes_payloads(
         {
             out.push(payload);
         }
-        if matches!(op, Op::ObserveBytes(_) | Op::Pow { .. }) {
+        if matches!(op, Op::ObserveBytes(_) | Op::Pow { .. } | Op::LegacyPow { .. }) {
             payload += 1;
         }
     }

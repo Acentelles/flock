@@ -4,8 +4,23 @@
 // ~q·d sibling hashes from the device tree (~tens of KB). Byte-identical to
 // merkle_multi_proof_host.
 #pragma once
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 #include "merkle_open.hpp"   // MHash, merkle_multi_proof_indices
+
+// Fail fast on any CUDA error, like the .cu translation units' CK macros.
+// A swallowed error here would return success with a zeroed opening path —
+// the prover must die loudly instead.
+#define MOD_CK(x)                                                              \
+    do {                                                                       \
+        cudaError_t mod_e_ = (x);                                              \
+        if (mod_e_) {                                                          \
+            fprintf(stderr, "CUDA err %s @%s:%d\n",                           \
+                    cudaGetErrorString(mod_e_), __FILE__, __LINE__);           \
+            exit(1);                                                           \
+        }                                                                      \
+    } while (0)
 
 __global__ void gather_tree_nodes(const uint8_t* __restrict__ tree,
                                   const unsigned long long* __restrict__ idxs,
@@ -27,14 +42,15 @@ inline std::vector<MHash> gather_tree_nodes_device(const uint8_t* d_tree,
     unsigned long long* d_idx = nullptr;
     uint8_t* d_out = nullptr;
     std::vector<unsigned long long> h_idx(idxs.begin(), idxs.end());
-    (void)cudaMalloc(&d_idx, (size_t)n * sizeof(unsigned long long));
-    (void)cudaMalloc(&d_out, (size_t)n * 32);
-    (void)cudaMemcpy(d_idx, h_idx.data(), (size_t)n * sizeof(unsigned long long), cudaMemcpyHostToDevice);
+    MOD_CK(cudaMalloc(&d_idx, (size_t)n * sizeof(unsigned long long)));
+    MOD_CK(cudaMalloc(&d_out, (size_t)n * 32));
+    MOD_CK(cudaMemcpy(d_idx, h_idx.data(), (size_t)n * sizeof(unsigned long long), cudaMemcpyHostToDevice));
     int tpb = 128;
     gather_tree_nodes<<<(n + tpb - 1) / tpb, tpb>>>(d_tree, d_idx, n, d_out);
-    (void)cudaMemcpy(out.data(), d_out, (size_t)n * 32, cudaMemcpyDeviceToHost);
-    cudaFree(d_idx);
-    cudaFree(d_out);
+    MOD_CK(cudaGetLastError());
+    MOD_CK(cudaMemcpy(out.data(), d_out, (size_t)n * 32, cudaMemcpyDeviceToHost));
+    MOD_CK(cudaFree(d_idx));
+    MOD_CK(cudaFree(d_out));
     return out;
 }
 
@@ -52,8 +68,8 @@ inline std::vector<MHash> merkle_cap_layer_device(const uint8_t* d_tree, size_t 
                                                   uint32_t cap_depth) {
     size_t l = (size_t)1 << cap_depth;
     std::vector<MHash> cap(l);
-    (void)cudaMemcpy(cap.data(), d_tree + (2 * num_leaves - 2 * l) * 32, l * 32,
-                     cudaMemcpyDeviceToHost);
+    MOD_CK(cudaMemcpy(cap.data(), d_tree + (2 * num_leaves - 2 * l) * 32, l * 32,
+                     cudaMemcpyDeviceToHost));
     return cap;
 }
 
@@ -75,16 +91,17 @@ inline std::vector<MHash> merkle_multi_proof_device(const uint8_t* d_tree, size_
     if (n > cap) {
         if (d_idx) { cudaFree(d_idx); cudaFree(d_out); cudaFreeHost(h_idx); cudaFreeHost(h_out); }
         cap = n + (n >> 1);  // headroom to avoid frequent regrow
-        (void)cudaMalloc(&d_idx, (size_t)cap * sizeof(unsigned long long));
-        (void)cudaMalloc(&d_out, (size_t)cap * 32);
-        (void)cudaHostAlloc(&h_idx, (size_t)cap * sizeof(unsigned long long), cudaHostAllocDefault);
-        (void)cudaHostAlloc(&h_out, (size_t)cap * 32, cudaHostAllocDefault);
+        MOD_CK(cudaMalloc(&d_idx, (size_t)cap * sizeof(unsigned long long)));
+        MOD_CK(cudaMalloc(&d_out, (size_t)cap * 32));
+        MOD_CK(cudaHostAlloc(&h_idx, (size_t)cap * sizeof(unsigned long long), cudaHostAllocDefault));
+        MOD_CK(cudaHostAlloc(&h_out, (size_t)cap * 32, cudaHostAllocDefault));
     }
     for (int i = 0; i < n; i++) h_idx[i] = (unsigned long long)idxs[i];
-    (void)cudaMemcpy(d_idx, h_idx, (size_t)n * sizeof(unsigned long long), cudaMemcpyHostToDevice);
+    MOD_CK(cudaMemcpy(d_idx, h_idx, (size_t)n * sizeof(unsigned long long), cudaMemcpyHostToDevice));
     int tpb = 128;
     gather_tree_nodes<<<(n + tpb - 1) / tpb, tpb>>>(d_tree, d_idx, n, d_out);
-    (void)cudaMemcpy(h_out, d_out, (size_t)n * 32, cudaMemcpyDeviceToHost);
+    MOD_CK(cudaGetLastError());
+    MOD_CK(cudaMemcpy(h_out, d_out, (size_t)n * 32, cudaMemcpyDeviceToHost));
     memcpy(out.data(), h_out, (size_t)n * 32);
     return out;
 }

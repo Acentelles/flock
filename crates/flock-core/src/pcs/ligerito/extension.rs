@@ -2300,15 +2300,4 @@ mod tests {
             });
         assert_eq!(induce_enforced_sum(&rows, &lane_point, &alpha), expected);
     }
-
-    #[test]
-    fn each_split_level_removes_k_minus_one_original_variables() {
-        for dimension in 4..20 {
-            for k in 2..=dimension {
-                let committed_dimension = dimension + 1;
-                let after_folds = committed_dimension - k;
-                assert_eq!(after_folds, dimension - (k - 1));
-            }
-        }
-    }
 }

@@ -1705,6 +1705,25 @@ impl Blake3Setup {
         )
     }
 
+    /// The AG-skip prover runs the DIRECT (dense pow2-lane) commit — the
+    /// standard-pack shape its zerocheck and claims are wired for — while
+    /// `prove_fast` moved to the single-slot UNION commit (dense stack +
+    /// integer lanes). These params are the direct shape at the r1cs's own
+    /// `m`; the commitment carries them, so [`Self::verify_ag`] follows.
+    fn direct_pcs_params(&self) -> PcsParams {
+        PcsParams {
+            m: self.r1cs.m,
+            log_inv_rate: self.pcs_params.log_inv_rate,
+            log_batch_size: flock_core::pcs::ligerito::embedded_initial_k_or_default(
+                self.r1cs.m,
+                self.pcs_params.profile,
+            ),
+            profile: self.pcs_params.profile,
+            num_lanes: None,
+            merkle_hash: self.pcs_params.merkle_hash,
+        }
+    }
+
     /// AG-skip mirror of [`Self::prove_fast`]: round 1 of the zerocheck runs
     /// on the genus-95 AG multiplication code instead of the RS additive-NTT
     /// skip; everything else (witness gen, commit, lincheck, ring-switch open)
@@ -1722,14 +1741,15 @@ impl Blake3Setup {
         R1csClaim,
     ) {
         assert_eq!(blocks.len(), self.n_blocks);
+        let pcs_params = self.direct_pcs_params();
         let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
-            flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
+            flock_core::pcs::prefault_codeword_during(&pcs_params, || {
                 self.generate_witness_ab(blocks)
             });
         let lc_circuit = self.r1cs.csc_lincheck_circuit();
         crate::prover::prove_fast_ligerito_ag_from_witness(
             &self.r1cs,
-            &self.pcs_params,
+            &pcs_params,
             z_packed,
             a_packed_f128,
             b_packed_f128,
@@ -1759,9 +1779,10 @@ impl Blake3Setup {
             self.generate_witness_ab(blocks);
         let witness_s = t0.elapsed().as_secs_f64();
         let lc_circuit = self.r1cs.csc_lincheck_circuit();
+        let pcs_params = self.direct_pcs_params();
         let (proof, commitment, claim, mut timings) = crate::prover::prove_fast_ligerito_timed(
             &self.r1cs,
-            &self.pcs_params,
+            &pcs_params,
             z_packed,
             a_packed_f128,
             b_packed_f128,
@@ -1794,9 +1815,10 @@ impl Blake3Setup {
             self.generate_witness_ab(blocks);
         let witness_s = t0.elapsed().as_secs_f64();
         let lc_circuit = self.r1cs.csc_lincheck_circuit();
+        let pcs_params = self.direct_pcs_params();
         let (proof, commitment, claim, mut timings) = crate::prover::prove_fast_ligerito_ag_timed(
             &self.r1cs,
-            &self.pcs_params,
+            &pcs_params,
             z_packed,
             a_packed_f128,
             b_packed_f128,
@@ -1822,7 +1844,7 @@ impl Blake3Setup {
             commitment,
             proof,
             lc_circuit,
-            &self.pcs_params,
+            &self.direct_pcs_params(),
             challenger,
         )
     }
@@ -2338,7 +2360,9 @@ mod tests {
     /// Ligerito open pipeline.
     #[cfg(target_arch = "aarch64")]
     #[test]
-    #[ignore] // Heavy — run with `cargo test prove_fast_ligerito_ag_roundtrip -- --ignored`
+    // Default-run: this is the guard for the direct-shape params class of
+    // stranding (the AG/timed entry points commit the standard-pack witness,
+    // so a union-shaped `pcs_params` panics them all).
     fn prove_fast_ligerito_ag_roundtrip() {
         use flock_core::challenger::FsChallenger;
         let setup = Blake3Setup::new(256);

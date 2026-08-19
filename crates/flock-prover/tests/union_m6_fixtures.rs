@@ -184,7 +184,8 @@ fn merged_bundle_digest(
 /// statements and witness streams; the Ligerito query ladder intentionally
 /// changed with v18.
 #[test]
-#[ignore] // Heavier — run with `cargo test --release ... -- --ignored`.
+// Default-run (~2 s for both anchors): these pins are what makes the
+// "fixture anchors byte-stable" claim enforceable in CI.
 fn m6_merged_union_proof_bytes_pinned() {
     const FIXTURES: [(&str, [usize; 2], &str); 4] = [
         (
@@ -277,7 +278,7 @@ fn m6_merged_union_proof_bytes_pinned() {
 /// drivers. These replace the single-table direct-jagged anchors when that
 /// path is removed.
 #[test]
-#[ignore] // Heavier — run with `cargo test --release ... -- --ignored`.
+// Default-run (~2 s for both anchors): see m6_merged_union_proof_bytes_pinned.
 fn m6_single_slot_merged_anchor_proof_bytes_pinned() {
     // BLAKE3, 256 blocks (m = 22).
     {

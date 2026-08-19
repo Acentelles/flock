@@ -763,6 +763,13 @@ impl<Ch: Challenger> Challenger for RecordingChallenger<Ch> {
         self.inner.supports_fused_pow_squeeze()
     }
 
+    fn hash_kind(&self) -> crate::hash::HashKind {
+        // Forward — the trait default (SHA-256) would silently diverge any
+        // out-of-sponge derivation (the AG-skip nonce decode) from the
+        // inner transcript's hash during recording.
+        self.inner.hash_kind()
+    }
+
     fn fork_from_seed(&self, _seed: [F128; 2], _label: &'static [u8]) -> Self {
         // `fork` (below) is the recorded entry: it samples the seed THROUGH
         // the recorder so the two seed squeezes land on the tape, then

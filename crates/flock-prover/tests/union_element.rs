@@ -144,7 +144,8 @@ fn random_blake3_inputs(rng: &mut Rng, n: usize) -> Vec<blake3::Compression> {
 /// exactly `Σ_t n_t · used_cols_t` (before the power-of-two rounding and the
 /// config floor).
 #[test]
-#[ignore] // Heavier — run with `-- --ignored`.
+// Default-run (0.03 s): the only CI coverage of the element-in-union
+// end-to-end path — the heavier shapes below stay `-- --ignored`.
 fn element_only_union_roundtrip() {
     let mut rng = Rng::new(0x0E1E_0001);
     let (w0, w1) = (F128::new(7, 0), F128::new(0, 3));
