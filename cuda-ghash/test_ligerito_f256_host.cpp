@@ -377,7 +377,9 @@ int main(int argc, char** argv) {
     };
 
     // Query phase against prev; fills opens[slot] and returns (queries, alpha).
-    auto query_phase = [&](int open_level, int next_level, ExpOpen& open,
+    // Each level grinds its OWN consistency bits (matches ligerito_f256.cuh
+    // and the Rust driver).
+    auto query_phase = [&](int open_level, ExpOpen& open,
                            std::vector<size_t>& q_out, std::vector<F128>& alpha_out) {
         q_out.clear();
         g_nonces.push_back(grind_and_sample_stratified_queries(
@@ -386,7 +388,7 @@ int main(int argc, char** argv) {
         int al = ceil_log2_host((size_t)queries[open_level]);
         std::vector<ChF128> ac(al);
         x_nonces.push_back(
-            ch.grind_pow_and_sample_f128_vec((uint32_t)xbits[next_level], ac.data(), al));
+            ch.grind_pow_and_sample_f128_vec((uint32_t)xbits[open_level], ac.data(), al));
         alpha_out.resize(al);
         for (int i = 0; i < al; i++) alpha_out[i] = frch(ac[i]);
         open.n_rows = (uint32_t)q_out.size();
@@ -435,7 +437,7 @@ int main(int argc, char** argv) {
         level_oods(1);
         std::vector<size_t> qs;
         std::vector<F128> alpha;
-        query_phase(0, 1, opens[0], qs, alpha);
+        query_phase(0, opens[0], qs, alpha);
         induce_introduce_glue(n1, 1, qs, alpha);
         prev_cw = std::move(next.cw);
         prev_tree = std::move(next.tree);
@@ -478,7 +480,7 @@ int main(int argc, char** argv) {
             for (const F128& v : yr) ch.observe_f128(toch(v));
             std::vector<size_t> qs;
             std::vector<F128> alpha;
-            query_phase(level, level, opens[n_opens - 1], qs, alpha);
+            query_phase(level, opens[n_opens - 1], qs, alpha);
             ChF128 bc;
             c_nonces.push_back(ch.grind_pow_and_sample_f128((uint32_t)cbits[level], &bc));
             break;
@@ -488,7 +490,7 @@ int main(int argc, char** argv) {
         level_oods(i + 2);
         std::vector<size_t> qs;
         std::vector<F128> alpha;
-        query_phase(level, i + 2, opens[level], qs, alpha);
+        query_phase(level, opens[level], qs, alpha);
         induce_introduce_glue(ext_dim, i + 2, qs, alpha);
         prev_cw = std::move(next.cw);
         prev_tree = std::move(next.tree);
