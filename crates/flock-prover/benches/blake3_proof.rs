@@ -211,6 +211,20 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
     );
     println!("    {:32} {}", "lincheck::prove", fmt_ms(tm.lincheck_s));
     println!("    {:32} {}", "pcs::open (ligerito)", fmt_ms(tm.open_s));
+    // Full-precision machine-readable mirror of the rows above, for
+    // benchmarks/breakdown_phases.sh: `fmt_ms` rounds seconds to 2 decimals,
+    // which is +/-5 ms on a ~1 s phase and too coarse to attribute small wins.
+    if std::env::var_os("FLOCK_PHASE_TSV").is_some() {
+        for (name, secs) in [
+            ("witness", tm.witness_s),
+            ("commit", tm.commit_s),
+            ("zerocheck", tm.zerocheck_s),
+            ("lincheck", tm.lincheck_s),
+            ("open", tm.open_s),
+        ] {
+            println!("PHASE\t{n_blocks}\t{name}\t{secs:.9}");
+        }
+    }
     black_box(&proof);
 }
 
