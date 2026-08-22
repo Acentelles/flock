@@ -2,7 +2,7 @@
 # breakdown_phases.sh — per-phase prover breakdown at a fixed BLAKE3 batch,
 # split the way the RS-path porting work needs it:
 #
-#   witness | commit | zerocheck round 1 | zerocheck rounds 2+ | lincheck | open
+#   witness | commit | zc round 1 | zc round 2 | zc rounds 3+ | lincheck | open
 #
 # breakdown.sh reports five coarse phases across three hashes at 2^14; this
 # script instead pins one hash (BLAKE3) at one size (default 2^18, the ranked
@@ -75,7 +75,7 @@ comp_s() { sed -E -n 's/.*\(([0-9]+) compressions\/sec\).*/\1/p' "$1" | tail -1;
 
 emit() {
 	local f_out="$1" f_err="$2" threads="$3"
-	local witness commit zc lincheck open r1 r2 tl rest total head_cps
+	local witness commit zc lincheck open r1 r2 tl total head_cps
 	# `|| true` so a parse miss reports below instead of tripping set -e silently.
 	witness=$(phase_s "$f_out" witness || true); commit=$(phase_s "$f_out" commit || true)
 	zc=$(phase_s "$f_out" zerocheck || true);    lincheck=$(phase_s "$f_out" lincheck || true)
@@ -94,18 +94,17 @@ emit() {
 	    -v N="$N" -v cps="$head_cps" -v out="$OUT" '
 	BEGIN {
 		w*=1000; c*=1000; zc*=1000; lc*=1000; op*=1000
-		rest = r2 + tl                      # rounds 2+
-		total = w + c + r1 + rest + lc + op
+		total = w + c + r1 + r2 + tl + lc + op
 		printf "  %-26s %10s %8s\n", "phase (" T "T)", "ms", "%"
 		printf "  %-26s %10s %8s\n", "--------------------------", "----------", "-------"
-		split("witness:" w " commit:" c " zc_round1:" r1 " zc_rounds2plus:" rest " lincheck:" lc " open:" op, rows, " ")
-		for (i = 1; i <= 6; i++) {
+		split("witness:" w " commit:" c " zc_round1:" r1 " zc_round2:" r2 " zc_rounds3plus:" tl " lincheck:" lc " open:" op, rows, " ")
+		for (i = 1; i <= 7; i++) {
 			split(rows[i], kv, ":")
 			printf "  %-26s %10.2f %7.1f%%\n", kv[1], kv[2], 100 * kv[2] / total
 			if (out != "") printf "%s\t%s\t%s\t%s\t%.4f\n", L, N, T, kv[1], kv[2] >> out
 		}
 		printf "  %-26s %10.2f %7.1f%%\n", "TOTAL", total, 100
-		printf "\n  reconcile: zc round1+rounds2+ = %.2f ms vs coarse zerocheck %.2f ms (delta %.2f)\n", r1 + rest, zc, r1 + rest - zc
+		printf "\n  reconcile: zc round1+2+3plus = %.2f ms vs coarse zerocheck %.2f ms (delta %.2f)\n", r1 + r2 + tl, zc, r1 + r2 + tl - zc
 		if (cps != "") printf "  headline: %s compressions/sec\n", cps
 		if (out != "") printf "%s\t%s\t%s\t%s\t%.4f\n", L, N, T, "TOTAL", total >> out
 	}'
