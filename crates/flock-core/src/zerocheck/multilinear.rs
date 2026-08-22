@@ -889,14 +889,46 @@ pub fn fold_and_compute_round_pair_into(
                         let b1_d = b_out[o + 7];
 
                         // 8 reduced msg muls (g1 = a1·b1, g_inf = (a0+a1)(b0+b1)).
-                        let g1_a = a1_a * b1_a;
-                        let g1_b = a1_b * b1_b;
-                        let g1_c = a1_c * b1_c;
-                        let g1_d = a1_d * b1_d;
-                        let g_inf_a = (a0_a + a1_a) * (b0_a + b1_a);
-                        let g_inf_b = (a0_b + a1_b) * (b0_b + b1_b);
-                        let g_inf_c = (a0_c + a1_c) * (b0_c + b1_c);
-                        let g_inf_d = (a0_d + a1_d) * (b0_d + b1_d);
+                        //
+                        // aarch64 batches them two at a time through
+                        // `ghash_mul_vec2_neon`, which replaces each mul's two
+                        // reduction PMULLs with one XOR-based reduction shared
+                        // across both lanes. PMULL is the scarce resource on
+                        // M-class cores (2 units, 1/cycle), so the 8 muls drop
+                        // from 48 to 32 PMULLs. Same values either way: the pair
+                        // kernel is cross-checked against the scalar mul by
+                        // `gf2_128::tests::neon_mul_vec2_matches_scalar`.
+                        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+                        let (g1_a, g1_b, g1_c, g1_d, g_inf_a, g_inf_b, g_inf_c, g_inf_d) = {
+                            use crate::field::gf2_128::aarch64::ghash_mul_vec2_neon;
+                            // SAFETY: `aes` is statically enabled by this cfg.
+                            unsafe {
+                                let [g1_a, g1_b] =
+                                    ghash_mul_vec2_neon([a1_a, a1_b], [b1_a, b1_b]);
+                                let [g1_c, g1_d] =
+                                    ghash_mul_vec2_neon([a1_c, a1_d], [b1_c, b1_d]);
+                                let [gi_a, gi_b] = ghash_mul_vec2_neon(
+                                    [a0_a + a1_a, a0_b + a1_b],
+                                    [b0_a + b1_a, b0_b + b1_b],
+                                );
+                                let [gi_c, gi_d] = ghash_mul_vec2_neon(
+                                    [a0_c + a1_c, a0_d + a1_d],
+                                    [b0_c + b1_c, b0_d + b1_d],
+                                );
+                                (g1_a, g1_b, g1_c, g1_d, gi_a, gi_b, gi_c, gi_d)
+                            }
+                        };
+                        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+                        let (g1_a, g1_b, g1_c, g1_d, g_inf_a, g_inf_b, g_inf_c, g_inf_d) = (
+                            a1_a * b1_a,
+                            a1_b * b1_b,
+                            a1_c * b1_c,
+                            a1_d * b1_d,
+                            (a0_a + a1_a) * (b0_a + b1_a),
+                            (a0_b + a1_b) * (b0_b + b1_b),
+                            (a0_c + a1_c) * (b0_c + b1_c),
+                            (a0_d + a1_d) * (b0_d + b1_d),
+                        );
                         // Deferred-reduction accumulate: on x86 widen all 8 products
                         // 4 lanes at a time (eq_lo[x_lo_a..x_lo_a+4] is contiguous),
                         // reduced once after the loop; else scalar mul_unreduced.
@@ -953,10 +985,27 @@ pub fn fold_and_compute_round_pair_into(
 
                     let eq_l_a = eq_lo[x_lo_a];
                     let eq_l_b = eq_lo[x_lo_b];
-                    let g1_a = a1_a * b1_a;
-                    let g1_b = a1_b * b1_b;
-                    let g_inf_a = (a0_a + a1_a) * (b0_a + b1_a);
-                    let g_inf_b = (a0_b + a1_b) * (b0_b + b1_b);
+                    // Same pair-batching as the 4-wide loop above.
+                    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+                    let (g1_a, g1_b, g_inf_a, g_inf_b) = {
+                        use crate::field::gf2_128::aarch64::ghash_mul_vec2_neon;
+                        // SAFETY: `aes` is statically enabled by this cfg.
+                        unsafe {
+                            let [g1_a, g1_b] = ghash_mul_vec2_neon([a1_a, a1_b], [b1_a, b1_b]);
+                            let [gi_a, gi_b] = ghash_mul_vec2_neon(
+                                [a0_a + a1_a, a0_b + a1_b],
+                                [b0_a + b1_a, b0_b + b1_b],
+                            );
+                            (g1_a, g1_b, gi_a, gi_b)
+                        }
+                    };
+                    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+                    let (g1_a, g1_b, g_inf_a, g_inf_b) = (
+                        a1_a * b1_a,
+                        a1_b * b1_b,
+                        (a0_a + a1_a) * (b0_a + b1_a),
+                        (a0_b + a1_b) * (b0_b + b1_b),
+                    );
                     p1_acc ^= eq_l_a.mul_unreduced(g1_a);
                     p1_acc ^= eq_l_b.mul_unreduced(g1_b);
                     pinf_acc ^= eq_l_a.mul_unreduced(g_inf_a);
