@@ -474,6 +474,41 @@ mod tests {
         }
     }
 
+    /// The register-resident wide accumulator must agree with the
+    /// F256Unreduced path product-for-product AND after accumulation, since
+    /// the hot loops sum many products before a single reduce.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn neon_wide_accumulator_matches_f256unreduced() {
+        let mut rng = Rng::new(4242);
+        // Single products.
+        for _ in 0..256 {
+            let a = rng.next_f128();
+            let b = rng.next_f128();
+            let wide = unsafe { aarch64::wide_mul_unreduced_neon(a, b).reduce() };
+            let scalar = unsafe { aarch64::ghash_mul_unreduced_neon(a, b) }.reduce();
+            assert_eq!(wide, scalar, "single product");
+            assert_eq!(wide, a * b, "vs reduced mul");
+        }
+        // Accumulated sums: reduction is F2-linear, so sum-then-reduce must
+        // match reduce-then-sum.
+        for len in [1usize, 2, 3, 8, 17] {
+            let mut acc_wide = unsafe { aarch64::WideNeon::zero() };
+            let mut acc_scalar = F256Unreduced::ZERO;
+            let mut acc_direct = F128::ZERO;
+            for _ in 0..len {
+                let a = rng.next_f128();
+                let b = rng.next_f128();
+                unsafe { acc_wide.xor_assign(aarch64::wide_mul_unreduced_neon(a, b)) };
+                acc_scalar ^= unsafe { aarch64::ghash_mul_unreduced_neon(a, b) };
+                acc_direct += a * b;
+            }
+            let got = unsafe { acc_wide.reduce() };
+            assert_eq!(got, acc_scalar.reduce(), "accumulated len={len}");
+            assert_eq!(got, acc_direct, "accumulated vs direct len={len}");
+        }
+    }
+
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     #[test]
     fn all_neon_variants_agree() {

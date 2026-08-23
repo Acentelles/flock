@@ -502,6 +502,14 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
                 let b_pkt_ptr = b_packed.as_ptr();
                 let base = x_hi * chunk_size;
 
+                // Deferred-reduction accumulators held in q registers; same
+                // treatment as `fold_and_compute_round_pair_into`.
+                #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+                let (mut p1_nacc, mut pinf_nacc) = (
+                    crate::field::gf2_128::aarch64::WideNeon::zero(),
+                    crate::field::gf2_128::aarch64::WideNeon::zero(),
+                );
+
                 for x_lo in 0..lo_size {
                     let x0l = 2 * x_lo;
                     let x1l = x0l + 1;
@@ -529,9 +537,23 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
 
                     let eq_l = eq_lo[x_lo];
                     let g1 = a1 * b1;
-                    p1_acc ^= eq_l.mul_unreduced(g1);
                     let g_inf = (a0 + a1) * (b0 + b1);
-                    pinf_acc ^= eq_l.mul_unreduced(g_inf);
+                    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+                    {
+                        use crate::field::gf2_128::aarch64::wide_mul_unreduced_neon as wmul;
+                        p1_nacc.xor_assign(wmul(eq_l, g1));
+                        pinf_nacc.xor_assign(wmul(eq_l, g_inf));
+                    }
+                    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+                    {
+                        p1_acc ^= eq_l.mul_unreduced(g1);
+                        pinf_acc ^= eq_l.mul_unreduced(g_inf);
+                    }
+                }
+                #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+                {
+                    p1_acc ^= p1_nacc.to_unreduced();
+                    pinf_acc ^= pinf_nacc.to_unreduced();
                 }
             }
             #[cfg(all(

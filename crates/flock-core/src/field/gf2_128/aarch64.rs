@@ -279,6 +279,126 @@ pub unsafe fn ghash_mul_unreduced_neon(a: F128, b: F128) -> F256Unreduced {
     }
 }
 
+/// A 256-bit carry-less product kept in NEON registers.
+///
+/// Layout matches [`F256Unreduced`]: `lo = (r0, r1)`, `hi = (r2, r3)`, with the
+/// middle-cross fold already applied. The point is to never leave the vector
+/// register file: [`ghash_mul_unreduced_neon`] returns the same value as a
+/// `{r0,r1,r2,r3}` struct, which costs 6 `vgetq_lane_u64` extracts per product
+/// and turns each accumulate into 4 GPR XORs. Accumulating in this form is 2
+/// NEON XORs and no extracts, paying the 4 extracts once at [`Self::reduce`].
+#[derive(Clone, Copy)]
+pub struct WideNeon {
+    pub lo: uint64x2_t,
+    pub hi: uint64x2_t,
+}
+
+impl WideNeon {
+    /// Additive identity.
+    ///
+    /// # Safety
+    /// aarch64 statically guarantees NEON.
+    #[inline(always)]
+    pub unsafe fn zero() -> Self {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe {
+            let z = vdupq_n_u64(0);
+            Self { lo: z, hi: z }
+        }
+    }
+
+    /// `self ^= rhs` — 2 NEON XORs, no register-file round trip.
+    ///
+    /// # Safety
+    /// aarch64 statically guarantees NEON.
+    #[inline(always)]
+    pub unsafe fn xor_assign(&mut self, rhs: Self) {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe {
+            self.lo = veorq_u64(self.lo, rhs.lo);
+            self.hi = veorq_u64(self.hi, rhs.hi);
+        }
+    }
+
+    /// Move to the GPR-resident form, paying the 4 lane extracts once. Lets a
+    /// caller keep a NEON accumulator inside a hot loop and fold it into an
+    /// existing [`F256Unreduced`] total on the way out.
+    ///
+    /// # Safety
+    /// aarch64 statically guarantees NEON.
+    #[inline]
+    pub unsafe fn to_unreduced(self) -> F256Unreduced {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe {
+            F256Unreduced {
+                r0: vgetq_lane_u64::<0>(self.lo),
+                r1: vgetq_lane_u64::<1>(self.lo),
+                r2: vgetq_lane_u64::<0>(self.hi),
+                r3: vgetq_lane_u64::<1>(self.hi),
+            }
+        }
+    }
+
+    /// Reduce mod p. Reuses the shared scalar [`ghash_reduce`]; the 4 lane
+    /// extracts are paid once per accumulator, not once per product.
+    ///
+    /// # Safety
+    /// aarch64 statically guarantees NEON.
+    #[inline]
+    pub unsafe fn reduce(self) -> F128 {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe {
+            ghash_reduce(
+                vgetq_lane_u64::<0>(self.lo),
+                vgetq_lane_u64::<1>(self.lo),
+                vgetq_lane_u64::<0>(self.hi),
+                vgetq_lane_u64::<1>(self.hi),
+            )
+        }
+    }
+}
+
+/// Karatsuba split of `a · b`: returns `(ll, cross, hh)` where
+/// `cross = a.lo·b.hi + a.hi·b.lo` is recovered from a single extra PMULL via
+/// `(a.lo+a.hi)(b.lo+b.hi) + ll + hh`. 3 PMULLs instead of the schoolbook 4;
+/// the XORs of the operand halves are free (they are already in GPRs).
+///
+/// # Safety
+/// Requires the `aes` target feature (compiles to PMULL).
+#[target_feature(enable = "aes")]
+#[inline]
+unsafe fn karatsuba_products_neon(a: F128, b: F128) -> (uint64x2_t, uint64x2_t, uint64x2_t) {
+    // SAFETY: function carries the aes target feature.
+    unsafe {
+        let ll = pmull(a.lo, b.lo);
+        let hh = pmull(a.hi, b.hi);
+        let mid = pmull(a.lo ^ a.hi, b.lo ^ b.hi);
+        let cross = veorq_u64(veorq_u64(mid, ll), hh);
+        (ll, cross, hh)
+    }
+}
+
+/// Register-resident twin of [`ghash_mul_unreduced_neon`]: full 256-bit
+/// carry-less product with the middle-cross fold applied, left in q registers.
+///
+/// # Safety
+/// Requires the `aes` target feature (compiles to PMULL); only call where
+/// `aes` is statically enabled or has been runtime-detected.
+#[target_feature(enable = "aes")]
+#[inline]
+pub unsafe fn wide_mul_unreduced_neon(a: F128, b: F128) -> WideNeon {
+    // SAFETY: function carries the aes target feature.
+    unsafe {
+        let (ll, cross, hh) = karatsuba_products_neon(a, b);
+        let zero = vdupq_n_u64(0);
+        WideNeon {
+            // lo = (ll_lo, ll_hi ^ cross_lo); hi = (hh_lo ^ cross_hi, hh_hi).
+            lo: veorq_u64(ll, vextq_u64::<1>(zero, cross)),
+            hi: veorq_u64(hh, vextq_u64::<1>(cross, zero)),
+        }
+    }
+}
+
 /// Dedicated square: carry-less squaring has no cross term (`(a+b)^2 = a^2 + b^2`
 /// over GF(2)), so squaring drops the cross PMULLs — half the PMULL of a
 /// general multiply.
