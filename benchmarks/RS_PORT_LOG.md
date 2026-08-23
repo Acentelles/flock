@@ -52,21 +52,41 @@ Treat the column as directional, not as a scoreboard.
 | 3 | same, rounds 3+ | rounds 3+ | 452.5 → 455.7 (+0.7%) | 68.6 → 69.2 (+0.9%) | dropped |
 | 4 | defer round-1 partial-sum reduction to once per x_hi | round 1 | 1441.4 → 1447.1 (+0.4%) | 196.7 → 203.2 (+3.3%) | **reverted** |
 | 5 | port the multilinear lookahead to the RS tail | rounds 3+ | −7.5% *(pre-measured)* | — | not attempted |
+| 6 | fetch inv-NTT rows with one `LD1 x4` | round 1 | 1455.8 → 1634.6 (**+12.3%**) | 192.1 → 218.4 (+13.7%) | **reverted** |
+| 7 | fold XOR accumulation into `EOR3` pairs | round 1 | 1444.3 → 1469.9 (+1.8%) | *(8T arm discarded, drift)* | **reverted** |
 
 Net kept: **round 2 −13.4% ST**, total 4781.0 → 4716.2 ST (−1.4%), for 179
 added lines.
 
 ## What the negative results tell us
 
-- **Round 1 is gather-bound, not PMULL-bound.** Attempt 4 did exactly what it
-  claimed — reductions cut by a factor of `big_lo_size`, products from 6 PMULLs
-  to 3 — and round 1 did not move. `accumulate_convert_with_s_hat_v` issues 3
-  gathers per lane per b_med into the 64 KB convert table, up to 3072 loads per
-  chunk, and that traffic hides the arithmetic completely. **Round 1's
-  remaining ~1130 ms is not reachable by cheaper arithmetic.** Whoever picks
-  this up should attack the gather pattern; that is what the challenge repo's
-  AB-precompute-with-NT-stores and `c_fold4` mask tables do, and it is the
-  bloat-heavy part.
+- **Round 1 is not multiply-bound** (attempt 4: reductions cut by a factor of
+  `big_lo_size`, products from 6 PMULLs to 3, no movement). An earlier version
+  of this log inferred from that "round 1 is gather-bound on the convert
+  table". **That inference was wrong.** Measuring the split directly
+  (temporary `FLOCK_R1_SPLIT` scaffold, since removed) gives, at 2^18 ST:
+
+  | round-1 component | ST ms | of round 1 | of whole prove |
+  |---|---:|---:|---:|
+  | `shift_reduce_inner_ab` | ~810 | 56% | 17% |
+  | `bit_transpose_64bytes` | ~136 | 9% | 3% |
+  | `accumulate_convert` | ~521 | 36% | 11% |
+
+  So the convert-table accumulate is only a third of round 1; the prep pass
+  dominates. Reproduce by re-adding two `Instant` counters around the b_med
+  prep loop and the `accumulate_convert_with_s_hat_v` call in
+  `process_one_x_hi_with_s_hat_v` (per-x_outer_lo granularity; per-b_med timers
+  add ~470 ms of their own overhead and only the ratio survives).
+- **`shift_reduce_inner_ab` is limited by neither load-issue nor XOR-issue
+  count.** Attempts 6 and 7 cut load instructions 4x (8 per byte-pair to 2) and
+  XOR ops ~1.75x (56 to 32) respectively; the first cost 12.3% and the second
+  1.8%. On Apple cores the four-register structured `LD1` is microcoded and
+  loses to four independent 128-bit loads, and `EOR3` bought nothing. What is
+  left as the plausible limiter is load *latency* / L1 port pressure against
+  the 16 KB inv-NTT table — whose gathers are data-dependent and cannot be
+  batched — plus the `gf8_mul_vec16` work. Neither yields to a local rewrite,
+  which is consistent with the challenge repo needing specialized and generated
+  kernels here rather than a tidier loop.
 - **Interface shape can outweigh instruction counts.** Attempt 1 reduced PMULLs
   (4/mul vs binius's 6) and still lost 10%, because `ghash_mul_vec2_neon` takes
   and returns `[F128; 2]` and forces operands through memory. It earns its
@@ -93,6 +113,35 @@ added lines.
   prototyped in `benches/eq_build_probe.rs` but never landed; lincheck is only
   3.9% of ST here and its cross-repo gap is partly re-attribution (see above),
   so it was not the best next move.
+
+## The idea behind their `accumulate_convert` win
+
+Worth recording even though it did not transplant, because the algebra is the
+interesting part. Their C-side drain does **no table gathers at all**.
+
+`convert[b][v] = γ^b · φ_8(v)`, and **γ = X** — the comments confirm it, the
+rows are built by `mul_by_x` doubling. So `Σ_b γ^b · (bit_b)` is *literally* a
+16-bit mask in the field's coefficient representation: `F128 { lo: mask }`.
+Since `φ_8` is F2-linear, the per-lane C contribution decomposes over the 8 bit
+positions of the byte into 8 such masks — the "eight-bank C drain" — each
+accumulated with pure bit operations. The only field work left is one multiply
+by `eq`, and `F128 { lo: m } * eq` is itself F2-linear in the mask's 16 bits,
+so even that becomes `T_lo[m & 0xff] + T_hi[m >> 8]` from tables built **once
+per prove** and shared read-only (8 MiB at their shape; building per call would
+cost ~4 GiB of L1 stores).
+
+Why it does not transplant on its own: profitability depends on data layout,
+not just the algebra. Building the masks needs one lane's bytes gathered
+*across* `b_med`, but `chunk_c_bytes` is `[b_med][lane]`, so extracting them
+costs exactly the 16 strided loads the trick was meant to remove. Their
+pipeline gets the transposed layout for free from the `Round1AbInner`
+precompute pass. The AB side is handled separately by the tensor split
+`eq.lo[(w << s) | u] · D^-1 == eq_top_scaled[w] · eq_bot[u]`, pre-scaling the
+convert tables by `eq_top` so the inner loop is pure XOR with no per-lane
+multiply, keeping `2^s` bank accumulators and applying `eq_bot` once at the
+end.
+
+Any future round-1 attempt should start from the layout, not the algebra.
 
 ## Note on the geometric trick
 
