@@ -143,6 +143,42 @@ structural explanations we can test account for it. That points at
 generated `aarch64_bstatic_gen.rs` -- i.e. the specialized-and-generated
 kernel zoo, which is exactly the bloat this effort set out to avoid.
 
+## The lincheck-stripe dedup does not exist (checked, closed)
+
+The most promising remaining idea was that `z` gets transposed twice -- once
+into the lincheck stripe, once again by round 1's `bit_transpose_64bytes` --
+and that round 1 could read its C input out of the stripe instead, deleting
+~136 ms of transpose plus the ~113 ms of C gathers it feeds. The challenge
+repo's active path is even named `round1_c_fold8_from_lincheck_stripe`.
+
+It does not work: the two byte-groupings run along different axes. Traced by
+setting one logical witness bit at a time (m=18, k_log=14):
+
+| byte | logical bits feeding it | stride |
+|---|---|---:|
+| round-1 C `[b_med=0][lane=0]` | 0, 64, 128, ..., 448 | 64 |
+| stripe `[byte_idx=0][i_inner=0]` | 0, 16384, ..., 114688 | 16384 |
+
+With `logical = i_inner + i_outer·K` and `K = 2^14`, round 1's byte runs along
+logical bits 6-8 (three of the within-block inner dims) while the stripe's runs
+along `i_outer`'s low three bits, logical bits 14-16. Disjoint. Converting one
+grouping into the other is precisely the transpose we wanted to skip.
+
+Two corollaries:
+
+- The challenge repo does not avoid this transpose either. Its C drain still
+  calls `bit_transpose_64bytes` into a local scratch (confirmed by the session
+  that has that checkout), so `..._from_lincheck_stripe` names the buffer it
+  reads, not an avoided pass.
+- The z transpose is already better handled here than "in parallel" would be:
+  `generate_witness_with_ab_packed_and_lincheck` fuses it into witness
+  generation, bit-transposing z u64s into the stripe while they are still hot
+  in L1, and replaces the standalone `pack_z_lincheck_from_packed` on the fast
+  path. Splitting it out to overlap it would add a 512 MiB DRAM round trip to
+  buy concurrency on an already-saturated pool -- the same trap as the AB
+  hoist. The remaining `pack_z_lincheck_from_packed` call sites are the generic
+  `prove_ligerito` path only.
+
 ## Not attempted, and why
 
 - Anything GPU-gated (`partial_fold_packed_z_best_gpu_split`,
