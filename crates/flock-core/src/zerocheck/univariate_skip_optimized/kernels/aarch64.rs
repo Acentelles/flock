@@ -269,6 +269,27 @@ pub(crate) fn shift_reduce_inner_ab_neon(
 // into the per-(K, lane) 16-bit accumulators.
 // ---------------------------------------------------------------------------
 
+/// Bind the four 16-byte chunks of a loaded table row in `j ^ BH` order.
+/// `BH` is a const generic so this compiles to register naming, not code.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn permute4<const BH: usize>(
+    t: core::arch::aarch64::uint8x16x4_t,
+) -> (
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+) {
+    match BH {
+        0 => (t.0, t.1, t.2, t.3),
+        1 => (t.1, t.0, t.3, t.2),
+        2 => (t.2, t.3, t.0, t.1),
+        3 => (t.3, t.2, t.1, t.0),
+        _ => panic!("BH must be 0..4"),
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
@@ -288,14 +309,14 @@ unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
     unsafe {
         let ra = table_base.add(a_byte as usize * 64);
         let rb = table_base.add(b_byte as usize * 64);
-        let va0 = vld1q_u8(ra.add((0 ^ BH) * 16));
-        let va1 = vld1q_u8(ra.add((1 ^ BH) * 16));
-        let va2 = vld1q_u8(ra.add((2 ^ BH) * 16));
-        let va3 = vld1q_u8(ra.add((3 ^ BH) * 16));
-        let vb0 = vld1q_u8(rb.add((0 ^ BH) * 16));
-        let vb1 = vld1q_u8(rb.add((1 ^ BH) * 16));
-        let vb2 = vld1q_u8(rb.add((2 ^ BH) * 16));
-        let vb3 = vld1q_u8(rb.add((3 ^ BH) * 16));
+        // The four 16-byte chunks are contiguous, so one LD1 {v-v3} fetches the
+        // whole 64-byte row instead of four separate loads. `BH` is a const
+        // generic, so the `j ^ BH` permutation is just which register feeds
+        // which accumulator -- resolved at compile time, no instruction.
+        let ta = vld1q_u8_x4(ra);
+        let tb = vld1q_u8_x4(rb);
+        let (va0, va1, va2, va3) = permute4::<BH>(ta);
+        let (vb0, vb1, vb2, vb3) = permute4::<BH>(tb);
         let (va0, va1, va2, va3, vb0, vb1, vb2, vb3) = if ODD {
             (
                 vextq_u8::<8>(va0, va0),
@@ -344,14 +365,10 @@ unsafe fn fused_apply_one_k<const K: i32>(
         // b = 0: identity permutation — plain load of the 4 chunks.
         let ra0 = table_base.add(*a_row as usize * 64);
         let rb0 = table_base.add(*b_row as usize * 64);
-        let mut da0 = vld1q_u8(ra0);
-        let mut da1 = vld1q_u8(ra0.add(16));
-        let mut da2 = vld1q_u8(ra0.add(32));
-        let mut da3 = vld1q_u8(ra0.add(48));
-        let mut db0 = vld1q_u8(rb0);
-        let mut db1 = vld1q_u8(rb0.add(16));
-        let mut db2 = vld1q_u8(rb0.add(32));
-        let mut db3 = vld1q_u8(rb0.add(48));
+        let ta0 = vld1q_u8_x4(ra0);
+        let tb0 = vld1q_u8_x4(rb0);
+        let (mut da0, mut da1, mut da2, mut da3) = (ta0.0, ta0.1, ta0.2, ta0.3);
+        let (mut db0, mut db1, mut db2, mut db3) = (tb0.0, tb0.1, tb0.2, tb0.3);
 
         // b = 1..7: XOR with table row[bytes[b]], permuted per (BH, ODD).
         xor_apply_byte_into_8_regs::<0, true>(
