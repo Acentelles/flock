@@ -217,6 +217,41 @@ fn build_convert_table() -> Vec<F128> {
     table
 }
 
+/// Nibble-split form of [`build_convert_table`].
+///
+/// `φ_8` is F_2-linear, so `X^b · φ_8(v) = X^b·φ_8(v & 0xf) + X^b·φ_8(v & 0xf0)`
+/// and one 256-row lookup becomes two 16-row lookups. That trades 48 gathers
+/// per lane for 96, but shrinks the drain's hot table from 64 KiB to 8 KiB --
+/// it has to share L1 with the 16 KiB inv-NTT table and two streaming witness
+/// buffers. Whether that trade pays is a question about this core's cache
+/// behaviour, not about instruction counts.
+///
+/// Layout: `[0..256]` is `CL[b*16 + n] = X^b·φ_8(n)`, `[256..512]` is
+/// `CH[b*16 + n] = X^b·φ_8(n << 4)`.
+const CONVERT_NIB_HALF: usize = 16 * 16;
+
+fn build_convert_nibble_table() -> Vec<F128> {
+    let mut gamma_pow = [F128::ZERO; 16];
+    gamma_pow[0] = F128::ONE;
+    for b in 1..16 {
+        gamma_pow[b] = mul_by_x(gamma_pow[b - 1]);
+    }
+    let mut t = vec![F128::ZERO; 2 * CONVERT_NIB_HALF];
+    for b in 0..16 {
+        let g_b = gamma_pow[b];
+        for n in 0..16 {
+            t[b * 16 + n] = g_b * PHI_8_TABLE[n];
+            t[CONVERT_NIB_HALF + b * 16 + n] = g_b * PHI_8_TABLE[n << 4];
+        }
+    }
+    t
+}
+
+fn convert_nibble_table() -> &'static [F128] {
+    static C: std::sync::OnceLock<Vec<F128>> = std::sync::OnceLock::new();
+    C.get_or_init(build_convert_nibble_table)
+}
+
 fn convert_table() -> &'static [F128] {
     CONVERT_TABLE_CACHE.get_or_init(build_convert_table)
 }
@@ -1463,6 +1498,19 @@ mod tests {
                 out_scalar, out_neon,
                 "scalar/neon inner disagree at (base={chunk_byte_base}, b_med={b_med})"
             );
+        }
+    }
+
+    /// The nibble split must reproduce the 256-row table exactly.
+    #[test]
+    fn nibble_convert_matches_full_table() {
+        let full = convert_table();
+        let nib = convert_nibble_table();
+        for b in 0..16 {
+            for v in 0..256usize {
+                let got = nib[b * 16 + (v & 0xf)] + nib[CONVERT_NIB_HALF + b * 16 + (v >> 4)];
+                assert_eq!(got, full[b * 256 + v], "b={b} v={v}");
+            }
         }
     }
 
