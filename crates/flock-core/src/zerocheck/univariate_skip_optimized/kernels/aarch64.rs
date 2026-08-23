@@ -1,26 +1,5 @@
 use super::super::{F8, F128, InvNttTableByteSingleGf8, N_CHUNKS};
 
-/// Three-input XOR (EOR3 where the SHA3 extension is present).
-#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-#[inline(always)]
-unsafe fn xor3_u8(
-    a: core::arch::aarch64::uint8x16_t,
-    b: core::arch::aarch64::uint8x16_t,
-    c: core::arch::aarch64::uint8x16_t,
-) -> core::arch::aarch64::uint8x16_t {
-    unsafe { core::arch::aarch64::veor3q_u8(a, b, c) }
-}
-#[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
-#[inline(always)]
-unsafe fn xor3_u8(
-    a: core::arch::aarch64::uint8x16_t,
-    b: core::arch::aarch64::uint8x16_t,
-    c: core::arch::aarch64::uint8x16_t,
-) -> core::arch::aarch64::uint8x16_t {
-    use core::arch::aarch64::*;
-    unsafe { veorq_u8(a, veorq_u8(b, c)) }
-}
-
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 pub(crate) unsafe fn accumulate_convert(
@@ -82,14 +61,7 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
 
     // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
     unsafe {
-        // Nibble-split convert tables: 8 KiB total instead of the 64 KiB
-        // 256-row table, at two gathers per term instead of one. EOR3 folds
-        // each pair into the accumulator in a single op, so the XOR count is
-        // unchanged -- only the gather count and the hot footprint move.
-        let _ = convert;
-        let nib = super::super::convert_nibble_table();
-        let cl = nib.as_ptr() as *const u8;
-        let ch = cl.add(super::super::CONVERT_NIB_HALF * 16);
+        let convert_ptr = convert.as_ptr() as *const u8;
         for lane in 0..64 {
             let mut converted_ab = vdupq_n_u8(0);
             let mut converted_c_0 = vdupq_n_u8(0);
@@ -97,23 +69,17 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
             for b_med in 0..n_b_med {
                 let ab = chunk_ab_bytes[b_med][lane] as usize;
                 let c = chunk_c_bytes[b_med][lane] as usize;
-                let c0 = c & 0x55;
-                let c1 = c & 0xaa;
-                let row = b_med * 16;
-                converted_ab = xor3_u8(
+                converted_ab = veorq_u8(
                     converted_ab,
-                    vld1q_u8(cl.add((row + (ab & 0xf)) * 16)),
-                    vld1q_u8(ch.add((row + (ab >> 4)) * 16)),
+                    vld1q_u8(convert_ptr.add((b_med * 256 + ab) * 16)),
                 );
-                converted_c_0 = xor3_u8(
+                converted_c_0 = veorq_u8(
                     converted_c_0,
-                    vld1q_u8(cl.add((row + (c0 & 0xf)) * 16)),
-                    vld1q_u8(ch.add((row + (c0 >> 4)) * 16)),
+                    vld1q_u8(convert_ptr.add((b_med * 256 + (c & 0x55)) * 16)),
                 );
-                converted_c_1 = xor3_u8(
+                converted_c_1 = veorq_u8(
                     converted_c_1,
-                    vld1q_u8(cl.add((row + (c1 & 0xf)) * 16)),
-                    vld1q_u8(ch.add((row + (c1 >> 4)) * 16)),
+                    vld1q_u8(convert_ptr.add((b_med * 256 + (c & 0xaa)) * 16)),
                 );
             }
             let ab = vreinterpretq_u64_u8(converted_ab);
