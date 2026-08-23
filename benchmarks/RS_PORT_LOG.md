@@ -55,6 +55,7 @@ Treat the column as directional, not as a scoreboard.
 | 6 | fetch inv-NTT rows with one `LD1 x4` | round 1 | 1455.8 → 1634.6 (**+12.3%**) | 192.1 → 218.4 (+13.7%) | **reverted** |
 | 7 | fold XOR accumulation into `EOR3` pairs | round 1 | 1444.3 → 1469.9 (+1.8%) | *(8T arm discarded, drift)* | **reverted** |
 | 8 | hoist the challenge-independent AB transform out of the zerocheck, `rayon::join`ed with the commit (+ `stnp` non-temporal stores) | round 1 | 1474.6 → 601.1 (**−59%**) but **total unchanged** | 219.8 → 81.4 (−63%), total unchanged | **reverted** |
+| 9 | nibble-split convert tables (64 KiB → 8 KiB hot table, gathers 48 → 96/lane) | round-1 drain | headline 53508 → 51582 comp/s (**−3.6%**, base 8/8) | — | **reverted** |
 
 Net kept: **round 2 −13.4% ST**, total 4781.0 → 4716.2 ST (−1.4%), for 179
 added lines.
@@ -101,6 +102,46 @@ added lines.
 - **Our `commit` is already ~1.4x faster than theirs** (1277 vs 1797 ms ST),
   plausibly from #29/#30 which `c576e68` predates. Cross-pollination runs both
   ways; commit is not a target for us.
+
+## What bounds each round-1 kernel (measured, not inferred)
+
+Five local rewrites of round 1 have now failed. Taken together they say
+something fairly precise about the two kernels, which is more useful than any
+of the individual results:
+
+- **The drain is bound by gather COUNT.** Doubling gathers (48 → 96 per lane)
+  while shrinking the hot table 8x (64 KiB → 8 KiB) cost 3.6%. M1 has 128 KiB
+  of L1D per performance core, so the 256-row convert table already fit and
+  there was no footprint problem to fix. Calibrating from that regression, the
+  drain's 48 gathers/lane are worth roughly 170 ms of its ~521 ms.
+- **The prep kernel is bound by neither load-issue nor XOR-issue count.**
+  Cutting load instructions 4x (LD1 x4) cost 12.3%; cutting XOR ops 1.75x
+  (EOR3 pairing) gave +1.8%. Deferring its reduction entirely moved nothing.
+- **And it is not bound by anything the witness's structure could unlock.**
+  Byte statistics of the packed BLAKE3 witness at 2^12 blocks:
+
+  | buffer | zeros | dominant byte | all-0xff rows | uniform 8-byte rows |
+  |---|---:|---|---:|---:|
+  | a | 6.6% | — | 0.0% | 5.9% |
+  | b | 6.1% | **0xff at 28.9%** | 9.4% | 15.3% |
+  | z | 12.6% | — | 0.0% | 5.9% |
+
+  `b` is strikingly non-random, which is presumably why the challenge repo has
+  a `static_b` / `mixed_const_b` / `single_k0_static_b` kernel family. But the
+  0xff bytes are scattered inside mixed rows rather than clustered: only 9.4%
+  of b's aligned 8-byte rows are uniformly 0xff, and the 5.9% all-zero rows
+  (identical in all three buffers) are padding that `b_med_counts` already
+  skips. Row-level constant specialization is therefore worth ~4% of prep
+  loads here -- order 10 ms -- not the 262 ms of the AB-prep gap.
+
+The uncomfortable implication: their AB prep is 548 ms against our ~810 ms
+while doing strictly MORE memory work (it streams 512 MiB out through
+non-temporal stores; ours writes a 1 KiB L1 scratch). So their kernel is
+genuinely ~1.5x better code at the same computation, and none of the
+structural explanations we can test account for it. That points at
+`fused_apply_one_k_fast` / `fast_shift_reduce_with_policy` / the 839-line
+generated `aarch64_bstatic_gen.rs` -- i.e. the specialized-and-generated
+kernel zoo, which is exactly the bloat this effort set out to avoid.
 
 ## Not attempted, and why
 
