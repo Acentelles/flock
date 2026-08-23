@@ -269,6 +269,102 @@ pub(crate) fn shift_reduce_inner_ab_neon(
 // into the per-(K, lane) 16-bit accumulators.
 // ---------------------------------------------------------------------------
 
+/// One byte's 4 table chunks in `j ^ BH` order with the `ODD` half-swap.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn row4<const BH: usize, const ODD: bool>(
+    table_base: *const u8,
+    byte: u8,
+) -> [core::arch::aarch64::uint8x16_t; 4] {
+    use core::arch::aarch64::*;
+    unsafe {
+        let r = table_base.add(byte as usize * 64);
+        let v = [
+            vld1q_u8(r.add((0 ^ BH) * 16)),
+            vld1q_u8(r.add((1 ^ BH) * 16)),
+            vld1q_u8(r.add((2 ^ BH) * 16)),
+            vld1q_u8(r.add((3 ^ BH) * 16)),
+        ];
+        if ODD {
+            [
+                vextq_u8::<8>(v[0], v[0]),
+                vextq_u8::<8>(v[1], v[1]),
+                vextq_u8::<8>(v[2], v[2]),
+                vextq_u8::<8>(v[3], v[3]),
+            ]
+        } else {
+            v
+        }
+    }
+}
+
+/// A-side only: the all-ones-b fast path needs the A accumulation but takes
+/// the B accumulators from a constant.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn xor_apply_byte_a_only<const BH: usize, const ODD: bool>(
+    table_base: *const u8,
+    a_byte: u8,
+    da0: &mut core::arch::aarch64::uint8x16_t,
+    da1: &mut core::arch::aarch64::uint8x16_t,
+    da2: &mut core::arch::aarch64::uint8x16_t,
+    da3: &mut core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let v = row4::<BH, ODD>(table_base, a_byte);
+        *da0 = veorq_u8(*da0, v[0]);
+        *da1 = veorq_u8(*da1, v[1]);
+        *da2 = veorq_u8(*da2, v[2]);
+        *da3 = veorq_u8(*da3, v[3]);
+    }
+}
+
+/// The B accumulators for an all-0xff K-row, which the BLAKE3 circuit pins at
+/// ~8.6% of word positions (const-one wires). Every position reads the same
+/// table row, so the result is a constant: 32 loads and 32 XORs collapse to
+/// four register loads. Built once; the table is the canonical k_skip = 6
+/// inverse-NTT table at every call site.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn bstatic_ones_partial(table_base: *const u8) -> &'static [u8; 64] {
+    static P: std::sync::OnceLock<[u8; 64]> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        use core::arch::aarch64::*;
+        // SAFETY: replicates the generic path's B accumulation for byte 0xff,
+        // in the same (BH, ODD) order as `fused_apply_one_k`.
+        unsafe {
+            let r0 = table_base.add(0xff * 64);
+            let mut d = [
+                vld1q_u8(r0),
+                vld1q_u8(r0.add(16)),
+                vld1q_u8(r0.add(32)),
+                vld1q_u8(r0.add(48)),
+            ];
+            macro_rules! acc {
+                ($bh:literal, $odd:literal) => {{
+                    let v = row4::<$bh, $odd>(table_base, 0xff);
+                    for i in 0..4 {
+                        d[i] = veorq_u8(d[i], v[i]);
+                    }
+                }};
+            }
+            acc!(0, true);
+            acc!(1, false);
+            acc!(1, true);
+            acc!(2, false);
+            acc!(2, true);
+            acc!(3, false);
+            acc!(3, true);
+            let mut out = [0u8; 64];
+            for i in 0..4 {
+                vst1q_u8(out.as_mut_ptr().add(i * 16), d[i]);
+            }
+            out
+        }
+    })
+}
+
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
@@ -349,7 +445,57 @@ unsafe fn fused_apply_one_k<const K: i32>(
         // y_* = gf8_mul(da_*, 0) = 0 and this K-row contributes nothing to any
         // accumulator. Skipping it is exact, and the guard is a compare -- the
         // kernel stays correct for any witness that disagrees.
-        if (b_row as *const u64).read_unaligned() == 0 {
+        let bw = (b_row as *const u64).read_unaligned();
+        if bw == 0 {
+            return;
+        }
+        // All-ones b row: the circuit pins ~8.6% of word positions to
+        // 0xffffffffffffffff (const-one wires). Every byte position then reads
+        // the same table row, so the B accumulators are a constant -- 32 loads
+        // and 32 XORs collapse to four register loads. A still accumulates
+        // normally. Guarded, so a disagreeing witness takes the generic path.
+        if bw == u64::MAX {
+            let p = bstatic_ones_partial(table_base).as_ptr();
+            let db0 = vld1q_u8(p);
+            let db1 = vld1q_u8(p.add(16));
+            let db2 = vld1q_u8(p.add(32));
+            let db3 = vld1q_u8(p.add(48));
+            let ra = table_base.add(*a_row as usize * 64);
+            let mut da0 = vld1q_u8(ra);
+            let mut da1 = vld1q_u8(ra.add(16));
+            let mut da2 = vld1q_u8(ra.add(32));
+            let mut da3 = vld1q_u8(ra.add(48));
+            macro_rules! a_only {
+                ($bh:literal, $odd:literal, $n:literal) => {
+                    xor_apply_byte_a_only::<$bh, $odd>(
+                        table_base,
+                        *a_row.add($n),
+                        &mut da0,
+                        &mut da1,
+                        &mut da2,
+                        &mut da3,
+                    )
+                };
+            }
+            a_only!(0, true, 1);
+            a_only!(1, false, 2);
+            a_only!(1, true, 3);
+            a_only!(2, false, 4);
+            a_only!(2, true, 5);
+            a_only!(3, false, 6);
+            a_only!(3, true, 7);
+            let y0 = gf8_mul_vec16(da0, db0);
+            let y1 = gf8_mul_vec16(da1, db1);
+            let y2 = gf8_mul_vec16(da2, db2);
+            let y3 = gf8_mul_vec16(da3, db3);
+            *acc0_lo = veorq_u16(*acc0_lo, vshll_n_u8::<K>(vget_low_u8(y0)));
+            *acc0_hi = veorq_u16(*acc0_hi, vshll_n_u8::<K>(vget_high_u8(y0)));
+            *acc1_lo = veorq_u16(*acc1_lo, vshll_n_u8::<K>(vget_low_u8(y1)));
+            *acc1_hi = veorq_u16(*acc1_hi, vshll_n_u8::<K>(vget_high_u8(y1)));
+            *acc2_lo = veorq_u16(*acc2_lo, vshll_n_u8::<K>(vget_low_u8(y2)));
+            *acc2_hi = veorq_u16(*acc2_hi, vshll_n_u8::<K>(vget_high_u8(y2)));
+            *acc3_lo = veorq_u16(*acc3_lo, vshll_n_u8::<K>(vget_low_u8(y3)));
+            *acc3_hi = veorq_u16(*acc3_hi, vshll_n_u8::<K>(vget_high_u8(y3)));
             return;
         }
         // b = 0: identity permutation — plain load of the 4 chunks.
