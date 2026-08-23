@@ -179,6 +179,48 @@ Two corollaries:
   hoist. The remaining `pack_z_lincheck_from_packed` call sites are the generic
   `prove_ligerito` path only.
 
+## The lincheck gap is re-attribution, and its fold has no reachable headroom
+
+Their lincheck is 32 ms against our 183 ms -- the largest ratio in the table
+(5.7x) and the row we explored last. It is not a real gap.
+
+**Physics.** `partial_fold_packed_z_neon_*` is byte-table driven: per input byte
+it loads the byte, loads a 16-byte `build_sum_table` entry, and XORs into an
+accumulator pinned in a Q register. At the 2^18 BLAKE3 shape z_packed is 512
+MiB, so 2^30 loads. M1 sustains ~3 loads/cycle, giving a floor of ~112 ms
+(~84 ms allowing for the `useful_bits` padding skip). Their 32 ms works out to
+**0.19 cycles per input byte**, roughly 3.5x below that floor, and even a
+16-bit-table variant (two bytes per lookup) only floors at ~0.34. So their
+lincheck cannot be performing this fold -- the C-side fold is presumably
+computed in round 1 from the stripe and reused, consistent with the active path
+being named `round1_c_fold8_from_lincheck_stripe`.
+
+Correcting for this, the real comparable gap is ~970 ms, not ~1120 ms.
+
+**And the genuine headroom is not reachable.** Our fold does sit 1.6-2.2x above
+its own floor, but:
+
+- It is insensitive to blocking. `FOLD_AB=1` A/Bs the size-aware dispatch
+  against forced `iblock` interleaved per m: 0.988x at m=26, 0.972x at m=28,
+  0.994x at m=29. Both strategies land within 3%.
+- The only load-reducing transform is arithmetically dominated. `build_sum_table`
+  builds 256 entries with 255 XORs by doubling; a 16-bit table needs 65535 XORs
+  to enable only `k = 2^14 = 16384` lookups per stripe, so the build costs 4x
+  more than it saves. (And the two stripe bytes for one `i_inner` are `k` bytes
+  apart, so forming a u16 index needs two loads regardless -- loads would go
+  4 -> 3, not 4 -> 2.) It could only pay at much larger `k_log`.
+
+**Stale comment worth fixing.** `benches/lincheck.rs` documents oblock beating
+iblock by "≈1.4-1.7x by m=28-29 at this k_log". That does not reproduce here --
+see the ratios above. Whoever tuned `OBLOCK_MIN_N_LOG = 16` did it on different
+hardware or the win has since regressed; do not trust that comment on M1.
+
+**Also closed for free:** the geometric eq-build (`build_eq_table_optimized` in
+their tree, prototyped here in `benches/eq_build_probe.rs`). Running that probe
+shows the entire `SplitEqGhash::new` at the round-2 shape costs 0.13 ms, and the
+geometric variant is *slower* than the standard build at 5 of 6 sizes. Worth
+approximately zero.
+
 ## Not attempted, and why
 
 - Anything GPU-gated (`partial_fold_packed_z_best_gpu_split`,
