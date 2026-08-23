@@ -269,106 +269,6 @@ pub(crate) fn shift_reduce_inner_ab_neon(
 // into the per-(K, lane) 16-bit accumulators.
 // ---------------------------------------------------------------------------
 
-/// Three-input XOR. The SHA3 extension's EOR3 does it in one full-throughput
-/// vector op; without it, two EORs.
-#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-#[inline(always)]
-unsafe fn xor3_u8(
-    a: core::arch::aarch64::uint8x16_t,
-    b: core::arch::aarch64::uint8x16_t,
-    c: core::arch::aarch64::uint8x16_t,
-) -> core::arch::aarch64::uint8x16_t {
-    // SAFETY: sha3 is statically enabled by this cfg.
-    unsafe { core::arch::aarch64::veor3q_u8(a, b, c) }
-}
-#[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
-#[inline(always)]
-unsafe fn xor3_u8(
-    a: core::arch::aarch64::uint8x16_t,
-    b: core::arch::aarch64::uint8x16_t,
-    c: core::arch::aarch64::uint8x16_t,
-) -> core::arch::aarch64::uint8x16_t {
-    use core::arch::aarch64::*;
-    // SAFETY: NEON is baseline on aarch64.
-    unsafe { veorq_u8(a, veorq_u8(b, c)) }
-}
-
-/// Two byte positions at once: same loads as two `xor_apply_byte_into_8_regs`
-/// calls, but each accumulator is updated with one EOR3 instead of two EORs --
-/// 8 XOR ops per byte-pair-of-positions instead of 16.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-unsafe fn xor_apply_byte_pair_into_8_regs<
-    const BH1: usize,
-    const ODD1: bool,
-    const BH2: usize,
-    const ODD2: bool,
->(
-    table_base: *const u8,
-    a1: u8,
-    b1: u8,
-    a2: u8,
-    b2: u8,
-    da0: &mut core::arch::aarch64::uint8x16_t,
-    da1: &mut core::arch::aarch64::uint8x16_t,
-    da2: &mut core::arch::aarch64::uint8x16_t,
-    da3: &mut core::arch::aarch64::uint8x16_t,
-    db0: &mut core::arch::aarch64::uint8x16_t,
-    db1: &mut core::arch::aarch64::uint8x16_t,
-    db2: &mut core::arch::aarch64::uint8x16_t,
-    db3: &mut core::arch::aarch64::uint8x16_t,
-) {
-    // SAFETY: caller guarantees the table rows are in bounds.
-    unsafe {
-        let (pa0, pa1, pa2, pa3) = row4::<BH1, ODD1>(table_base, a1);
-        let (pb0, pb1, pb2, pb3) = row4::<BH1, ODD1>(table_base, b1);
-        let (qa0, qa1, qa2, qa3) = row4::<BH2, ODD2>(table_base, a2);
-        let (qb0, qb1, qb2, qb3) = row4::<BH2, ODD2>(table_base, b2);
-        *da0 = xor3_u8(*da0, pa0, qa0);
-        *da1 = xor3_u8(*da1, pa1, qa1);
-        *da2 = xor3_u8(*da2, pa2, qa2);
-        *da3 = xor3_u8(*da3, pa3, qa3);
-        *db0 = xor3_u8(*db0, pb0, qb0);
-        *db1 = xor3_u8(*db1, pb1, qb1);
-        *db2 = xor3_u8(*db2, pb2, qb2);
-        *db3 = xor3_u8(*db3, pb3, qb3);
-    }
-}
-
-/// One byte's 4 table chunks, in `j ^ BH` order with the `ODD` half-swap.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn row4<const BH: usize, const ODD: bool>(
-    table_base: *const u8,
-    byte: u8,
-) -> (
-    core::arch::aarch64::uint8x16_t,
-    core::arch::aarch64::uint8x16_t,
-    core::arch::aarch64::uint8x16_t,
-    core::arch::aarch64::uint8x16_t,
-) {
-    use core::arch::aarch64::*;
-    // SAFETY: caller guarantees the row is in bounds.
-    unsafe {
-        let r = table_base.add(byte as usize * 64);
-        let v0 = vld1q_u8(r.add((0 ^ BH) * 16));
-        let v1 = vld1q_u8(r.add((1 ^ BH) * 16));
-        let v2 = vld1q_u8(r.add((2 ^ BH) * 16));
-        let v3 = vld1q_u8(r.add((3 ^ BH) * 16));
-        if ODD {
-            (
-                vextq_u8::<8>(v0, v0),
-                vextq_u8::<8>(v1, v1),
-                vextq_u8::<8>(v2, v2),
-                vextq_u8::<8>(v3, v3),
-            )
-        } else {
-            (v0, v1, v2, v3)
-        }
-    }
-}
-
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
@@ -454,10 +354,21 @@ unsafe fn fused_apply_one_k<const K: i32>(
         let mut db3 = vld1q_u8(rb0.add(48));
 
         // b = 1..7: XOR with table row[bytes[b]], permuted per (BH, ODD).
-        xor_apply_byte_pair_into_8_regs::<0, true, 1, false>(
+        xor_apply_byte_into_8_regs::<0, true>(
             table_base,
             *a_row.add(1),
             *b_row.add(1),
+            &mut da0,
+            &mut da1,
+            &mut da2,
+            &mut da3,
+            &mut db0,
+            &mut db1,
+            &mut db2,
+            &mut db3,
+        );
+        xor_apply_byte_into_8_regs::<1, false>(
+            table_base,
             *a_row.add(2),
             *b_row.add(2),
             &mut da0,
@@ -469,10 +380,21 @@ unsafe fn fused_apply_one_k<const K: i32>(
             &mut db2,
             &mut db3,
         );
-        xor_apply_byte_pair_into_8_regs::<1, true, 2, false>(
+        xor_apply_byte_into_8_regs::<1, true>(
             table_base,
             *a_row.add(3),
             *b_row.add(3),
+            &mut da0,
+            &mut da1,
+            &mut da2,
+            &mut da3,
+            &mut db0,
+            &mut db1,
+            &mut db2,
+            &mut db3,
+        );
+        xor_apply_byte_into_8_regs::<2, false>(
+            table_base,
             *a_row.add(4),
             *b_row.add(4),
             &mut da0,
@@ -484,10 +406,21 @@ unsafe fn fused_apply_one_k<const K: i32>(
             &mut db2,
             &mut db3,
         );
-        xor_apply_byte_pair_into_8_regs::<2, true, 3, false>(
+        xor_apply_byte_into_8_regs::<2, true>(
             table_base,
             *a_row.add(5),
             *b_row.add(5),
+            &mut da0,
+            &mut da1,
+            &mut da2,
+            &mut da3,
+            &mut db0,
+            &mut db1,
+            &mut db2,
+            &mut db3,
+        );
+        xor_apply_byte_into_8_regs::<3, false>(
+            table_base,
             *a_row.add(6),
             *b_row.add(6),
             &mut da0,
