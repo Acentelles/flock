@@ -1,5 +1,4 @@
-use super::super::{F8, F128, InvNttTableByteSingleGf8, N_CHUNKS, PartialAcc};
-use crate::field::gf2_128::aarch64::wide_mul_unreduced_neon;
+use super::super::{F8, F128, InvNttTableByteSingleGf8, N_CHUNKS};
 
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
@@ -9,8 +8,8 @@ pub(crate) unsafe fn accumulate_convert(
     n_b_med: usize,
     convert: &[F128],
     eq_lo_val: F128,
-    partial_ab: &mut [PartialAcc; 64],
-    partial_c: &mut [PartialAcc; 64],
+    partial_ab: &mut [F128; 64],
+    partial_c: &mut [F128; 64],
 ) {
     use core::arch::aarch64::*;
 
@@ -34,23 +33,14 @@ pub(crate) unsafe fn accumulate_convert(
             }
             let ab = vreinterpretq_u64_u8(converted_ab);
             let c = vreinterpretq_u64_u8(converted_c);
-            // Accumulate unreduced; the caller reduces once per lane per
-            // x_hi. Saves a full mod-p reduction per lane per chunk and uses
-            // Karatsuba's 3 PMULLs in place of binius's 6.
-            partial_ab[lane].xor_assign(wide_mul_unreduced_neon(
-                F128 {
-                    lo: vgetq_lane_u64::<0>(ab),
-                    hi: vgetq_lane_u64::<1>(ab),
-                },
-                eq_lo_val,
-            ));
-            partial_c[lane].xor_assign(wide_mul_unreduced_neon(
-                F128 {
-                    lo: vgetq_lane_u64::<0>(c),
-                    hi: vgetq_lane_u64::<1>(c),
-                },
-                eq_lo_val,
-            ));
+            partial_ab[lane] += F128 {
+                lo: vgetq_lane_u64::<0>(ab),
+                hi: vgetq_lane_u64::<1>(ab),
+            } * eq_lo_val;
+            partial_c[lane] += F128 {
+                lo: vgetq_lane_u64::<0>(c),
+                hi: vgetq_lane_u64::<1>(c),
+            } * eq_lo_val;
         }
     }
 }
@@ -63,9 +53,9 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
     n_b_med: usize,
     convert: &[F128],
     eq_lo_val: F128,
-    partial_ab: &mut [PartialAcc; 64],
-    partial_c_0: &mut [PartialAcc; 64],
-    partial_c_1: &mut [PartialAcc; 64],
+    partial_ab: &mut [F128; 64],
+    partial_c_0: &mut [F128; 64],
+    partial_c_1: &mut [F128; 64],
 ) {
     use core::arch::aarch64::*;
 
@@ -95,30 +85,18 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
             let ab = vreinterpretq_u64_u8(converted_ab);
             let c_0 = vreinterpretq_u64_u8(converted_c_0);
             let c_1 = vreinterpretq_u64_u8(converted_c_1);
-            // Accumulate unreduced; the caller reduces once per lane per
-            // x_hi. Saves a full mod-p reduction per lane per chunk and uses
-            // Karatsuba's 3 PMULLs in place of binius's 6.
-            partial_ab[lane].xor_assign(wide_mul_unreduced_neon(
-                F128 {
-                    lo: vgetq_lane_u64::<0>(ab),
-                    hi: vgetq_lane_u64::<1>(ab),
-                },
-                eq_lo_val,
-            ));
-            partial_c_0[lane].xor_assign(wide_mul_unreduced_neon(
-                F128 {
-                    lo: vgetq_lane_u64::<0>(c_0),
-                    hi: vgetq_lane_u64::<1>(c_0),
-                },
-                eq_lo_val,
-            ));
-            partial_c_1[lane].xor_assign(wide_mul_unreduced_neon(
-                F128 {
-                    lo: vgetq_lane_u64::<0>(c_1),
-                    hi: vgetq_lane_u64::<1>(c_1),
-                },
-                eq_lo_val,
-            ));
+            partial_ab[lane] += F128 {
+                lo: vgetq_lane_u64::<0>(ab),
+                hi: vgetq_lane_u64::<1>(ab),
+            } * eq_lo_val;
+            partial_c_0[lane] += F128 {
+                lo: vgetq_lane_u64::<0>(c_0),
+                hi: vgetq_lane_u64::<1>(c_0),
+            } * eq_lo_val;
+            partial_c_1[lane] += F128 {
+                lo: vgetq_lane_u64::<0>(c_1),
+                hi: vgetq_lane_u64::<1>(c_1),
+            } * eq_lo_val;
         }
     }
 }
