@@ -1,4 +1,4 @@
-use super::{F8, InvNttTableByteSingleGf8};
+use super::{F8, InvNttTableByteSingleGf8, PartialAcc};
 
 mod portable;
 
@@ -138,8 +138,8 @@ pub(super) fn accumulate_convert(
     n_b_med: usize,
     convert: &[super::F128],
     eq_lo_val: super::F128,
-    partial_ab: &mut [super::F128; 64],
-    partial_c: &mut [super::F128; 64],
+    partial_ab: &mut [PartialAcc; 64],
+    partial_c: &mut [PartialAcc; 64],
 ) {
     #[cfg(target_arch = "aarch64")]
     // SAFETY: aarch64 statically guarantees NEON and the fixed arrays cover
@@ -176,9 +176,9 @@ pub(super) fn accumulate_convert_with_s_hat_v(
     n_b_med: usize,
     convert: &[super::F128],
     eq_lo_val: super::F128,
-    partial_ab: &mut [super::F128; 64],
-    partial_c_0: &mut [super::F128; 64],
-    partial_c_1: &mut [super::F128; 64],
+    partial_ab: &mut [PartialAcc; 64],
+    partial_c_0: &mut [PartialAcc; 64],
+    partial_c_1: &mut [PartialAcc; 64],
 ) {
     #[cfg(target_arch = "aarch64")]
     // SAFETY: aarch64 statically guarantees NEON and the fixed arrays cover

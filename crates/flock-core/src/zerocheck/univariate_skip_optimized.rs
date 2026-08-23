@@ -297,9 +297,45 @@ pub fn round1_shift_reduce_extract_c(
 }
 
 // Per-worker scratch + local accumulator. ~6 KB total, stack-allocated.
+/// Accumulator for the per-lane `Σ_{x_lo} converted · eq_lo` partial sums.
+///
+/// The sum runs over one x_hi's entire x_lo loop, so the mod-p reduction can be
+/// deferred to one reduce per lane per x_hi rather than one per lane per chunk
+/// -- `big_lo_size` times fewer. On aarch64 the accumulator is also kept in q
+/// registers; elsewhere it stays the reduced F128 so the portable and x86
+/// kernels are untouched.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+type PartialAcc = crate::field::gf2_128::aarch64::WideNeon;
+#[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+type PartialAcc = F128;
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(always)]
+fn partial_zero() -> PartialAcc {
+    // SAFETY: NEON is baseline on aarch64.
+    unsafe { crate::field::gf2_128::aarch64::WideNeon::zero() }
+}
+#[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+#[inline(always)]
+fn partial_zero() -> PartialAcc {
+    F128::ZERO
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(always)]
+fn partial_reduce(acc: PartialAcc) -> F128 {
+    // SAFETY: NEON is baseline on aarch64.
+    unsafe { acc.reduce() }
+}
+#[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+#[inline(always)]
+fn partial_reduce(acc: PartialAcc) -> F128 {
+    acc
+}
+
 struct WorkerState {
-    partial_ab: [F128; ELL],
-    partial_c: [F128; ELL],
+    partial_ab: [PartialAcc; ELL],
+    partial_c: [PartialAcc; ELL],
     chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
     chunk_c_bytes: [[u8; 64]; 1 << N_MEDIUM],
     a_col: [F8; ELL],
@@ -311,8 +347,8 @@ struct WorkerState {
 impl WorkerState {
     fn new() -> Self {
         Self {
-            partial_ab: [F128::ZERO; ELL],
-            partial_c: [F128::ZERO; ELL],
+            partial_ab: [partial_zero(); ELL],
+            partial_c: [partial_zero(); ELL],
             chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             chunk_c_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             a_col: [F8::ZERO; ELL],
@@ -353,8 +389,8 @@ fn process_one_x_hi(
     convert: &[F128],
     state: &mut WorkerState,
 ) {
-    state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
-    state.partial_c.iter_mut().for_each(|p| *p = F128::ZERO);
+    state.partial_ab.iter_mut().for_each(|p| *p = partial_zero());
+    state.partial_c.iter_mut().for_each(|p| *p = partial_zero());
 
     let n_lo = n_lo_and_inner - N_INNER;
 
@@ -440,8 +476,8 @@ fn process_one_x_hi(
 
     // Outer fold by eq_hi.
     for lane in 0..ELL {
-        state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
-        state.local_res_c_s[lane] += eq_hi_val * state.partial_c[lane];
+        state.local_res_ab[lane] += eq_hi_val * partial_reduce(state.partial_ab[lane]);
+        state.local_res_c_s[lane] += eq_hi_val * partial_reduce(state.partial_c[lane]);
     }
 }
 
@@ -465,9 +501,9 @@ fn process_one_x_hi(
 /// Identical to [`WorkerState`] except `partial_c` and `local_res_c_s` are
 /// split into bank 0 / bank 1.
 struct WorkerStateWithSHatV {
-    partial_ab: [F128; ELL],
-    partial_c_0: [F128; ELL],
-    partial_c_1: [F128; ELL],
+    partial_ab: [PartialAcc; ELL],
+    partial_c_0: [PartialAcc; ELL],
+    partial_c_1: [PartialAcc; ELL],
     chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
     chunk_c_bytes: [[u8; 64]; 1 << N_MEDIUM],
     a_col: [F8; ELL],
@@ -480,9 +516,9 @@ struct WorkerStateWithSHatV {
 impl WorkerStateWithSHatV {
     fn new() -> Self {
         Self {
-            partial_ab: [F128::ZERO; ELL],
-            partial_c_0: [F128::ZERO; ELL],
-            partial_c_1: [F128::ZERO; ELL],
+            partial_ab: [partial_zero(); ELL],
+            partial_c_0: [partial_zero(); ELL],
+            partial_c_1: [partial_zero(); ELL],
             chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             chunk_c_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             a_col: [F8::ZERO; ELL],
@@ -514,9 +550,9 @@ fn process_one_x_hi_with_s_hat_v(
     convert: &[F128],
     state: &mut WorkerStateWithSHatV,
 ) {
-    state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
-    state.partial_c_0.iter_mut().for_each(|p| *p = F128::ZERO);
-    state.partial_c_1.iter_mut().for_each(|p| *p = F128::ZERO);
+    state.partial_ab.iter_mut().for_each(|p| *p = partial_zero());
+    state.partial_c_0.iter_mut().for_each(|p| *p = partial_zero());
+    state.partial_c_1.iter_mut().for_each(|p| *p = partial_zero());
 
     let n_lo = n_lo_and_inner - N_INNER;
 
@@ -594,9 +630,9 @@ fn process_one_x_hi_with_s_hat_v(
 
     // Outer fold by eq_hi (per bank).
     for lane in 0..ELL {
-        state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
-        state.local_res_c_s_0[lane] += eq_hi_val * state.partial_c_0[lane];
-        state.local_res_c_s_1[lane] += eq_hi_val * state.partial_c_1[lane];
+        state.local_res_ab[lane] += eq_hi_val * partial_reduce(state.partial_ab[lane]);
+        state.local_res_c_s_0[lane] += eq_hi_val * partial_reduce(state.partial_c_0[lane]);
+        state.local_res_c_s_1[lane] += eq_hi_val * partial_reduce(state.partial_c_1[lane]);
     }
 }
 
