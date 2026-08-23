@@ -194,7 +194,7 @@ pub fn prove_packed_padded<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim) {
     let (proof, claim, _) =
-        prove_packed_padded_inner(a_packed, b_packed, c_packed, m, padding, false, challenger, None);
+        prove_packed_padded_inner(a_packed, b_packed, c_packed, m, padding, false, challenger);
     (proof, claim)
 }
 
@@ -214,33 +214,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
     let (proof, claim, captured) =
-        prove_packed_padded_inner(a_packed, b_packed, c_packed, m, padding, true, challenger, None);
-    (
-        proof,
-        claim,
-        captured.expect("capture=true must produce s_hat_v_c"),
-    )
-}
-
-/// [`prove_packed_padded_capture_s_hat_v_c`] consuming a challenge-independent
-/// AB transform built earlier (see
-/// [`univariate_skip_optimized::precompute_round1_ab`]). Output is identical;
-/// only the placement of the AB work differs.
-#[allow(clippy::too_many_arguments)]
-pub fn prove_packed_padded_capture_s_hat_v_c_with_ab_pre<C: Challenger>(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    c_packed: &[u8],
-    m: usize,
-    padding: &PaddingSpec,
-    challenger: &mut C,
-    ab_pre: &univariate_skip_optimized::Round1AbPre,
-) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
-    // a/b are still needed: only round 1's AB transform is precomputed; the
-    // round-2 fused fold reads the packed witness directly.
-    let (proof, claim, captured) = prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, true, challenger, Some(ab_pre),
-    );
+        prove_packed_padded_inner(a_packed, b_packed, c_packed, m, padding, true, challenger);
     (
         proof,
         claim,
@@ -257,7 +231,6 @@ fn prove_packed_padded_inner<C: Challenger>(
     padding: &PaddingSpec,
     capture_s_hat_v_c: bool,
     challenger: &mut C,
-    ab_pre: Option<&univariate_skip_optimized::Round1AbPre>,
 ) -> (ZerocheckProof, ZerocheckClaim, Option<Vec<F128>>) {
     let k_skip = K_SKIP;
     const N_INNER: usize = 7; // 3 small + 4 medium fixed-constant eq dims
@@ -304,23 +277,21 @@ fn prove_packed_padded_inner<C: Challenger>(
     // about this internal optimization; we restore the C_s factor here.
     let zc_timing = std::env::var_os("FLOCK_ZC_TIMING").is_some();
     let t_round1 = std::time::Instant::now();
-    let inv_table = univariate_skip_optimized::cached_inv_table_k6();
+    let ntt_s = AdditiveNttGf8::new(k_skip, F8::ZERO);
+    let ntt_l = AdditiveNttGf8::new(k_skip, F8(1u8 << k_skip));
+    let inv_table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
     let (round1_ab_opt, round1_c_opt, s_hat_v_c) = if capture_s_hat_v_c {
-        let (ab, c, s) = match ab_pre {
-            Some(pre) => crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_precomputed(
-                c_packed, m, k_skip, &r, inv_table, padding, pre,
-            ),
-            None => crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
+        let (ab, c, s) =
+            crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
                 a_packed,
                 b_packed,
                 c_packed,
                 m,
                 k_skip,
                 &r,
-                inv_table,
+                &inv_table,
                 padding,
-            ),
-        };
+            );
         (ab, c, Some(s))
     } else {
         let (ab, c) = round1_shift_reduce_extract_c_packed_padded(
