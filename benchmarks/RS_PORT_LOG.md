@@ -54,6 +54,7 @@ Treat the column as directional, not as a scoreboard.
 | 5 | port the multilinear lookahead to the RS tail | rounds 3+ | −7.5% *(pre-measured)* | — | not attempted |
 | 6 | fetch inv-NTT rows with one `LD1 x4` | round 1 | 1455.8 → 1634.6 (**+12.3%**) | 192.1 → 218.4 (+13.7%) | **reverted** |
 | 7 | fold XOR accumulation into `EOR3` pairs | round 1 | 1444.3 → 1469.9 (+1.8%) | *(8T arm discarded, drift)* | **reverted** |
+| 8 | hoist the challenge-independent AB transform out of the zerocheck, `rayon::join`ed with the commit (+ `stnp` non-temporal stores) | round 1 | 1474.6 → 601.1 (**−59%**) but **total unchanged** | 219.8 → 81.4 (−63%), total unchanged | **reverted** |
 
 Net kept: **round 2 −13.4% ST**, total 4781.0 → 4716.2 ST (−1.4%), for 179
 added lines.
@@ -113,6 +114,56 @@ added lines.
   prototyped in `benches/eq_build_probe.rs` but never landed; lincheck is only
   3.9% of ST here and its cross-repo gap is partly re-attribution (see above),
   so it was not the best next move.
+
+## The cross-repo round-1 comparison was never like-for-like
+
+This is the most important correction in this log. The challenge repo's
+round-1 figure **excludes its AB precompute**. `commit_with_round1_ab_precompute`
+in its `prover.rs` runs
+
+    rayon::join(commit_arm, precompute_ab_arm)
+
+so `precompute_round1_ab_inner_packed_padded` — the same
+`shift_reduce_inner_ab` work that is 56% of our round 1 — lands in its *commit*
+bucket, and its `t.commit_s` wraps the whole join. Comparing their 314 ms
+round 1 against our 1444 ms was comparing a drain against a prep-plus-drain.
+Combined:
+
+| phase | ours ST | theirs ST |
+|---|---:|---:|
+| commit | 1277.4 | 1796.7 |
+| zc round 1 | 1444.3 | 314.1 |
+| **commit + round 1** | **2721.7** | **2110.7** |
+
+The honest gap is ~611 ms, not ~1130 ms. An earlier claim in this log that
+"our commit is already ~1.4x faster than theirs" was wrong for the same
+reason — they do strictly more work in that phase.
+
+We implemented the same architecture to check whether it is a speedup or an
+accounting choice, and it is the latter. The transform really is
+challenge-independent (the challenge reaches round 1 only via `eq_lo_scaled`
+and the convert table, both owned by the drain), a
+`[x_outer][b_med][64]` buffer lets the drain consume it by borrowing with no
+copy, and the result is bit-identical. But:
+
+- **ST is a wash.** `rayon::join` is sequential on one thread, so the locality
+  won by no longer interleaving AB with the C transpose and the 64 KB
+  convert-table drain is spent again on a 512 MiB write plus 512 MiB read the
+  interleaved version never did. Non-temporal `stnp` stores, which skip the
+  read-for-ownership on that write-once surface, did not change it.
+- **8T is a wash.** Both join arms compete for the same saturated pool, so
+  there is no idle capacity for the overlap to fill.
+
+Measured three ways (ST paired n=8 order-alternating with NT stores: base
+53288 vs 53037, base 5/8; 8T paired n=6: 325007 vs 320655, base 4/6; ST
+paired n=10 without NT stores: indistinguishable once warm). Reverted.
+
+**Methodology note worth keeping.** An earlier version of the paired script
+always ran the base arm first. Throughput declines monotonically across a run
+as the machine heats (342707 → 315100 over six 8T pairs), so a fixed order
+biases the comparison by roughly the size of the effect being measured. Always
+alternate which arm runs first, and discard a warm-up of each arm — an
+apparent +3.3% win for the hoist evaporated once both were done.
 
 ## The idea behind their `accumulate_convert` win
 
