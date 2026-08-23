@@ -513,6 +513,7 @@ fn process_one_x_hi_with_s_hat_v(
     eq_hi_val: F128,
     convert: &[F128],
     state: &mut WorkerStateWithSHatV,
+    ab_pre: Option<&Round1AbPre>,
 ) {
     state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
     state.partial_c_0.iter_mut().for_each(|p| *p = F128::ZERO);
@@ -533,16 +534,18 @@ fn process_one_x_hi_with_s_hat_v(
 
         if n_b_med == (1 << N_MEDIUM) {
             for b_med in 0..(1 << N_MEDIUM) {
-                shift_reduce_inner_ab(
-                    a_packed,
-                    b_packed,
-                    inv_table,
-                    chunk_byte_base,
-                    b_med,
-                    &mut state.chunk_ab_bytes[b_med],
-                    &mut state.a_col,
-                    &mut state.b_col,
-                );
+                if ab_pre.is_none() {
+                    shift_reduce_inner_ab(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        chunk_byte_base,
+                        b_med,
+                        &mut state.chunk_ab_bytes[b_med],
+                        &mut state.a_col,
+                        &mut state.b_col,
+                    );
+                }
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
                     .try_into()
@@ -550,8 +553,12 @@ fn process_one_x_hi_with_s_hat_v(
                 bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
             }
 
+            let ab_src = match ab_pre {
+                Some(pre) => pre.outer(x_outer),
+                None => &state.chunk_ab_bytes,
+            };
             kernels::accumulate_convert_with_s_hat_v(
-                &state.chunk_ab_bytes,
+                ab_src,
                 &state.chunk_c_bytes,
                 1 << N_MEDIUM,
                 convert,
@@ -562,16 +569,18 @@ fn process_one_x_hi_with_s_hat_v(
             );
         } else {
             for b_med in 0..n_b_med {
-                shift_reduce_inner_ab(
-                    a_packed,
-                    b_packed,
-                    inv_table,
-                    chunk_byte_base,
-                    b_med,
-                    &mut state.chunk_ab_bytes[b_med],
-                    &mut state.a_col,
-                    &mut state.b_col,
-                );
+                if ab_pre.is_none() {
+                    shift_reduce_inner_ab(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        chunk_byte_base,
+                        b_med,
+                        &mut state.chunk_ab_bytes[b_med],
+                        &mut state.a_col,
+                        &mut state.b_col,
+                    );
+                }
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
                     .try_into()
@@ -579,8 +588,12 @@ fn process_one_x_hi_with_s_hat_v(
                 bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
             }
 
+            let ab_src = match ab_pre {
+                Some(pre) => pre.outer(x_outer),
+                None => &state.chunk_ab_bytes,
+            };
             kernels::accumulate_convert_with_s_hat_v(
-                &state.chunk_ab_bytes,
+                ab_src,
                 &state.chunk_c_bytes,
                 n_b_med,
                 convert,
@@ -609,6 +622,125 @@ fn process_one_x_hi_with_s_hat_v(
 ///   - `b_med_counts[w]` is how many of the 16 b_med 512-bit sub-windows of
 ///     window `w` we should process. Entries past the useful prefix are 0
 ///     (full skip) — kernels just `continue` past those x_outer_lo iterations.
+/// The standard k_skip=6 inverse-NTT table, built once.
+///
+/// The precompute and the drain must use the same table; caching also avoids
+/// rebuilding it on every prove.
+pub fn cached_inv_table_k6() -> &'static InvNttTableByteSingleGf8 {
+    static T: std::sync::OnceLock<InvNttTableByteSingleGf8> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let ntt_s = crate::ntt::AdditiveNttGf8::new(K_SKIP, F8::ZERO);
+        let ntt_l = crate::ntt::AdditiveNttGf8::new(K_SKIP, F8(1u8 << K_SKIP));
+        InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l)
+    })
+}
+
+/// One `shift_reduce_inner_ab` output block.
+const AB_PRE_CHUNK: usize = 64;
+/// All `b_med` blocks for one `x_outer`.
+const AB_PRE_PER_OUTER: usize = (1 << N_MEDIUM) * AB_PRE_CHUNK;
+
+/// The challenge-independent half of round 1, materialized.
+///
+/// `shift_reduce_inner_ab` reads only the witness and the inverse-NTT table --
+/// the verifier's challenge enters round 1 solely through `eq_lo_scaled` and
+/// the convert table, both of which are used by the drain. So the AB transform
+/// can be computed before the commitment root exists.
+///
+/// Hoisting it buys two things. It becomes one streaming pass instead of being
+/// interleaved with the C-side bit-transpose and the 64 KB convert-table drain,
+/// which cuts the concurrent working set of both. And it lets the caller
+/// overlap it with the commit.
+///
+/// Layout is `[x_outer][b_med][64]`, matching what the drain wants to read.
+/// Size is `2^(m-13) * 1024` bytes -- 512 MiB at m = 32.
+pub struct Round1AbPre {
+    bytes: Vec<u8>,
+    n_outer: usize,
+}
+
+impl Round1AbPre {
+    #[inline]
+    fn chunk(&self, x_outer: usize, b_med: usize) -> &[u8; AB_PRE_CHUNK] {
+        let off = (x_outer * (1 << N_MEDIUM) + b_med) * AB_PRE_CHUNK;
+        (&self.bytes[off..off + AB_PRE_CHUNK])
+            .try_into()
+            .expect("AB_PRE_CHUNK bytes")
+    }
+
+    /// All `b_med` blocks for one `x_outer`, in exactly the shape the drain
+    /// wants -- consuming the precompute costs a borrow, not a copy.
+    #[inline]
+    fn outer(&self, x_outer: usize) -> &[[u8; AB_PRE_CHUNK]; 1 << N_MEDIUM] {
+        debug_assert!(x_outer < self.n_outer);
+        let off = x_outer * AB_PRE_PER_OUTER;
+        // SAFETY: `bytes` is n_outer * AB_PRE_PER_OUTER long and u8 has no
+        // alignment requirement, so this window is in bounds and well-aligned.
+        unsafe { &*(self.bytes.as_ptr().add(off) as *const [[u8; AB_PRE_CHUNK]; 1 << N_MEDIUM]) }
+    }
+
+    pub fn len_bytes(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+/// Run the challenge-independent AB transform over the whole witness.
+///
+/// Mirrors the prep half of [`process_one_x_hi_with_s_hat_v`] exactly,
+/// including the `b_med` padding skip, so the drain sees identical bytes.
+pub fn precompute_round1_ab(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+) -> Round1AbPre {
+    use rayon::prelude::*;
+
+    assert_eq!(k_skip, K_SKIP, "precompute is k_skip=6 only");
+    assert!(m >= k_skip + N_INNER);
+    let n_outer = 1usize << (m - k_skip - N_INNER);
+    let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+
+    // Slots for skipped b_med are never written and never read (the drain
+    // bounds its own loop by n_b_med), but zeroing keeps the buffer ordinary
+    // initialized memory rather than requiring MaybeUninit discipline.
+    let mut bytes = vec![0u8; n_outer * AB_PRE_PER_OUTER];
+
+    bytes
+        .par_chunks_mut(AB_PRE_PER_OUTER)
+        .enumerate()
+        .for_each(|(x_outer, out)| {
+            let within_hash_outer = x_outer & within_outer_mask;
+            let n_b_med = b_med_counts[within_hash_outer] as usize;
+            if n_b_med == 0 {
+                return;
+            }
+            let chunk_byte_base = (x_outer << N_INNER) * N_CHUNKS;
+            let mut a_col = [F8::ZERO; ELL];
+            let mut b_col = [F8::ZERO; ELL];
+            for b_med in 0..n_b_med {
+                let dst: &mut [u8; AB_PRE_CHUNK] = (&mut out
+                    [b_med * AB_PRE_CHUNK..(b_med + 1) * AB_PRE_CHUNK])
+                    .try_into()
+                    .expect("AB_PRE_CHUNK bytes");
+                kernels::shift_reduce_inner_ab(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    chunk_byte_base,
+                    b_med,
+                    dst,
+                    &mut a_col,
+                    &mut b_col,
+                );
+            }
+        });
+
+    Round1AbPre { bytes, n_outer }
+}
+
 fn build_b_med_counts(padding: &PaddingSpec) -> (usize, Vec<u8>) {
     const STRIDE: usize = 1 << (K_SKIP + N_INNER); // 8192 bits per within-window
     const B_MED_WINDOW: usize = 1 << (K_SKIP + 3); // 512 bits per b_med
@@ -763,6 +895,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded(
 /// (the bank-split convert lookup). bit_transpose, shift_reduce, eq folds
 /// are unchanged. See module-level docs for the F_2-linearity argument that
 /// makes `s_hat_v_c[(λ, 0)] + s_hat_v_c[(λ, 1)] · α == res_c_s_opt[λ]`.
+/// Round 1, computing the AB transform inline.
 pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -773,6 +906,40 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+    round1_with_s_hat_v_inner(
+        a_packed, b_packed, c_packed, m, k_skip, r, inv_table, padding, None,
+    )
+}
+
+/// Round 1, consuming an AB transform produced earlier by
+/// [`precompute_round1_ab`] -- typically alongside the commit, since that half
+/// does not depend on the challenge.
+pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_precomputed(
+    c_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    ab_pre: &Round1AbPre,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+    round1_with_s_hat_v_inner(
+        &[], &[], c_packed, m, k_skip, r, inv_table, padding, Some(ab_pre),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn round1_with_s_hat_v_inner(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    ab_pre: Option<&Round1AbPre>,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
     use rayon::prelude::*;
 
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
@@ -782,8 +949,10 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
         k_skip + N_INNER
     );
     let total_bytes = (1usize << m) / 8;
-    assert_eq!(a_packed.len(), total_bytes);
-    assert_eq!(b_packed.len(), total_bytes);
+    if ab_pre.is_none() {
+        assert_eq!(a_packed.len(), total_bytes);
+        assert_eq!(b_packed.len(), total_bytes);
+    }
     assert_eq!(c_packed.len(), total_bytes);
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
@@ -818,6 +987,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
                 eq_hi_val,
                 convert,
                 &mut state,
+                ab_pre,
             );
             state
         })
@@ -1132,6 +1302,36 @@ mod tests {
         };
         let d = (F128::ONE + g1) * (F128::ONE + g2) * (F128::ONE + g4) * (F128::ONE + g8);
         assert_eq!(d * d_inv_val, F128::ONE);
+    }
+
+    /// The precomputed-AB entry must be bit-identical to computing AB inline:
+    /// the transform is challenge-independent, so hoisting it changes when the
+    /// work happens, never what it produces.
+    #[test]
+    fn precomputed_ab_matches_inline() {
+        use crate::zerocheck::univariate_skip::pack_bits;
+
+        for &m in &[14usize, 15, 16] {
+            let mut rng = Rng::new(0xAB_9E_51 + m as u64);
+            let a_p = pack_bits(&rng.bits(1 << m));
+            let b_p = pack_bits(&rng.bits(1 << m));
+            let c_p = pack_bits(&rng.bits(1 << m));
+            let outer = rng.f128_vec(m - K_SKIP - N_INNER);
+            let r = build_protocol_r(m, &outer);
+            let table = make_inv_table();
+            let padding = PaddingSpec::dense(m);
+
+            let inline = round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
+                &a_p, &b_p, &c_p, m, K_SKIP, &r, &table, &padding,
+            );
+            let pre = precompute_round1_ab(&a_p, &b_p, m, K_SKIP, &table, &padding);
+            let hoisted = round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_precomputed(
+                &c_p, m, K_SKIP, &r, &table, &padding, &pre,
+            );
+            assert_eq!(inline.0, hoisted.0, "res_ab at m={m}");
+            assert_eq!(inline.1, hoisted.1, "res_c_lifted at m={m}");
+            assert_eq!(inline.2, hoisted.2, "s_hat_v_c at m={m}");
+        }
     }
 
     #[test]
