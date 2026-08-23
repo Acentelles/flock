@@ -1261,6 +1261,66 @@ mod tests {
     }
 
     #[cfg(target_arch = "aarch64")]
+    /// The structurally-zero-b fast path in `fused_apply_one_k` must be exact.
+    /// Random witnesses essentially never contain an all-zero 8-byte b K-row,
+    /// so the general oracle above does not reach it; craft the cases directly.
+    /// Also covers all-ones and mixed rows so the guard cannot pass wrongly.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_fused_inner_matches_scalar_on_pinned_b_rows() {
+        let mut rng = Rng::new(0x5EED_0B);
+        let m = 14;
+        let table = make_inv_table();
+        let a_packed = super::super::univariate_skip::pack_bits(&rng.bits(1 << m));
+
+        // Patterns applied to every 8-byte K-row of the b window under test.
+        let patterns: [(&str, fn(usize) -> u8); 4] = [
+            ("all-zero", |_| 0x00),
+            ("all-ones", |_| 0xff),
+            ("zero-then-ones", |i| if i < 32 { 0x00 } else { 0xff }),
+            ("one-nonzero-byte", |i| if i == 3 { 0x01 } else { 0x00 }),
+        ];
+
+        let mut a_col = vec![F8::ZERO; ELL];
+        let mut b_col = vec![F8::ZERO; ELL];
+        for (name, f) in patterns {
+            let mut b_packed = vec![0u8; a_packed.len()];
+            for (i, byte) in b_packed.iter_mut().enumerate() {
+                *byte = f(i % 64);
+            }
+            for &(chunk_byte_base, b_med) in &[(0usize, 0usize), (64, 5), (1024, 7)] {
+                let needed = chunk_byte_base + b_med * N_CHUNKS * 8 + 8 * N_CHUNKS;
+                if needed > a_packed.len() {
+                    continue;
+                }
+                let mut out_scalar = [0u8; 64];
+                let mut out_fused = [0u8; 64];
+                shift_reduce_inner_ab_scalar(
+                    &a_packed,
+                    &b_packed,
+                    &table,
+                    chunk_byte_base,
+                    b_med,
+                    &mut out_scalar,
+                    &mut a_col,
+                    &mut b_col,
+                );
+                shift_reduce_inner_ab_fused_neon(
+                    &a_packed,
+                    &b_packed,
+                    &table,
+                    chunk_byte_base,
+                    b_med,
+                    &mut out_fused,
+                );
+                assert_eq!(
+                    out_fused, out_scalar,
+                    "pattern={name} base={chunk_byte_base} b_med={b_med}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn neon_fused_inner_matches_scalar_inner() {
         // The new register-fused NEON kernel — verify against the same scalar

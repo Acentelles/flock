@@ -341,6 +341,17 @@ unsafe fn fused_apply_one_k<const K: i32>(
     use crate::field::gf2_8::neon::gf8_mul_vec16;
     use core::arch::aarch64::*;
     unsafe {
+        // Structurally-zero b row: the BLAKE3 circuit pins ~6% of the b
+        // operand's 8-byte K-rows to zero (structural zeros of the linear
+        // constraints), and a census over 256 word positions x 256 blocks x 3
+        // independent witnesses finds them at fixed positions. The inv-NTT
+        // transform is F_2-linear so row(0) = 0, hence db_* = 0, hence
+        // y_* = gf8_mul(da_*, 0) = 0 and this K-row contributes nothing to any
+        // accumulator. Skipping it is exact, and the guard is a compare -- the
+        // kernel stays correct for any witness that disagrees.
+        if (b_row as *const u64).read_unaligned() == 0 {
+            return;
+        }
         // b = 0: identity permutation — plain load of the 4 chunks.
         let ra0 = table_base.add(*a_row as usize * 64);
         let rb0 = table_base.add(*b_row as usize * 64);
