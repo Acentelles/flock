@@ -62,7 +62,56 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
     // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
     unsafe {
         let convert_ptr = convert.as_ptr() as *const u8;
-        for lane in 0..64 {
+        // Two lanes per iteration. Each lane carries three XOR chains of depth
+        // n_b_med (16 at the ranked shape), and the chains are serial even
+        // though the gathers feeding them are independent -- so a single lane
+        // exposes only three chains to the out-of-order engine. Interleaving a
+        // second lane doubles that to six without changing the work. The
+        // all-ones experiment showed this kernel family is sensitive to how
+        // much independent work is in flight, and the drain is gather-bound,
+        // so both halves of the trade point the same way here.
+        let mut lane = 0usize;
+        while lane + 2 <= 64 {
+            let l0 = lane;
+            let l1 = lane + 1;
+            let mut ab_0 = vdupq_n_u8(0);
+            let mut c0_0 = vdupq_n_u8(0);
+            let mut c1_0 = vdupq_n_u8(0);
+            let mut ab_1 = vdupq_n_u8(0);
+            let mut c0_1 = vdupq_n_u8(0);
+            let mut c1_1 = vdupq_n_u8(0);
+            for b_med in 0..n_b_med {
+                let base = b_med * 256;
+                let a0 = chunk_ab_bytes[b_med][l0] as usize;
+                let x0 = chunk_c_bytes[b_med][l0] as usize;
+                let a1 = chunk_ab_bytes[b_med][l1] as usize;
+                let x1 = chunk_c_bytes[b_med][l1] as usize;
+                ab_0 = veorq_u8(ab_0, vld1q_u8(convert_ptr.add((base + a0) * 16)));
+                c0_0 = veorq_u8(c0_0, vld1q_u8(convert_ptr.add((base + (x0 & 0x55)) * 16)));
+                c1_0 = veorq_u8(c1_0, vld1q_u8(convert_ptr.add((base + (x0 & 0xaa)) * 16)));
+                ab_1 = veorq_u8(ab_1, vld1q_u8(convert_ptr.add((base + a1) * 16)));
+                c0_1 = veorq_u8(c0_1, vld1q_u8(convert_ptr.add((base + (x1 & 0x55)) * 16)));
+                c1_1 = veorq_u8(c1_1, vld1q_u8(convert_ptr.add((base + (x1 & 0xaa)) * 16)));
+            }
+            macro_rules! drain {
+                ($acc:expr, $dst:expr, $l:expr) => {{
+                    let v = vreinterpretq_u64_u8($acc);
+                    $dst[$l] += F128 {
+                        lo: vgetq_lane_u64::<0>(v),
+                        hi: vgetq_lane_u64::<1>(v),
+                    } * eq_lo_val;
+                }};
+            }
+            drain!(ab_0, partial_ab, l0);
+            drain!(c0_0, partial_c_0, l0);
+            drain!(c1_0, partial_c_1, l0);
+            drain!(ab_1, partial_ab, l1);
+            drain!(c0_1, partial_c_0, l1);
+            drain!(c1_1, partial_c_1, l1);
+            lane += 2;
+        }
+        #[allow(clippy::needless_range_loop)]
+        for lane in lane..64 {
             let mut converted_ab = vdupq_n_u8(0);
             let mut converted_c_0 = vdupq_n_u8(0);
             let mut converted_c_1 = vdupq_n_u8(0);
