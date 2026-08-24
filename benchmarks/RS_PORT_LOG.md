@@ -56,6 +56,11 @@ Treat the column as directional, not as a scoreboard.
 | 7 | fold XOR accumulation into `EOR3` pairs | round 1 | 1444.3 → 1469.9 (+1.8%) | *(8T arm discarded, drift)* | **reverted** |
 | 8 | hoist the challenge-independent AB transform out of the zerocheck, `rayon::join`ed with the commit (+ `stnp` non-temporal stores) | round 1 | 1474.6 → 601.1 (**−59%**) but **total unchanged** | 219.8 → 81.4 (−63%), total unchanged | **reverted** |
 | 9 | nibble-split convert tables (64 KiB → 8 KiB hot table, gathers 48 → 96/lane) | round-1 drain | headline 53508 → 51582 comp/s (**−3.6%**, base 8/8) | — | **reverted** |
+| 10 | lincheck-stripe dedup for round 1's C input | round-1 drain | *impossible* — byte groupings run on disjoint axes (stride 64 vs 2^14) | — | **closed on algebra** |
+| 11 | geometric eq-build in lincheck | lincheck | whole eq build is 0.13 ms; geometric variant *slower* at 5/6 sizes | — | **closed for free** |
+| 12 | **skip structurally-zero b K-rows** | round 1 | **1475.4 → 1433.0 ms (−42.4, −2.9%), head 8/8** | — | **KEPT** |
+| 13 | constant-fold all-ones b K-rows | round 1 | 1420.0 → 1413.9 (−6.1, −0.43%), 7/8 | — | reverted (~90 lines for 6 ms) |
+| 14 | **two lanes per iteration in the drain** | round-1 drain | **1483.1 → 1420.0 ms (−63.1, −4.3%), head 8/8** | — | **KEPT** |
 
 Net kept: **round 2 −13.4% ST**, total 4781.0 → 4716.2 ST (−1.4%), for 179
 added lines.
@@ -220,6 +225,77 @@ their tree, prototyped here in `benches/eq_build_probe.rs`). Running that probe
 shows the entire `SplitEqGhash::new` at the round-2 shape costs 0.13 ms, and the
 geometric variant is *slower* than the standard build at 5 of 6 sizes. Worth
 approximately zero.
+
+## What finally worked, and why
+
+Two round-1 wins landed after eleven failures, and they share a property none
+of the failures had: they change **how much work exists** or **how much of it
+can be in flight**, rather than how the same work is encoded.
+
+**1. Skip structurally-zero b K-rows (−42.4 ms, 8/8).** A census of the packed
+BLAKE3 witness -- 256 word positions per block, 256 blocks, 3 independent
+witnesses -- found the circuit pins 38 of 256 8-byte b K-rows regardless of the
+inputs, taking only three distinct values:
+
+| value | positions | |
+|---|---:|---|
+| `0xffffffffffffffff` | 22 (8.6%) | const-one wires |
+| `0x0000000000000000` | 15 (5.9%) | structural zeros |
+| `0x0001ffffffffffff` | 1 | |
+
+33.7% of all b bytes are fixed, cross-checking the byte histogram (28.9% 0xff,
+6.1% zero) from the other direction. The zero case is the strongest: the
+inv-NTT transform is F_2-linear, so row(0) = 0, so db = 0, so
+y = gf8_mul(da, 0) = 0 and the K-row contributes nothing at all --
+`fused_apply_one_k` returns immediately, skipping all 64 table loads and the
+four F_8 multiplies. One u64 compare, no census data shipped, no position
+tracking, and a disagreeing witness falls through to the generic path.
+
+This is strictly better than the challenge repo's `static_b` fast path, which
+still loads a precomputed partial for these rows.
+
+**2. Two lanes per drain iteration (−63.1 ms, 8/8).** The drain carries three
+XOR chains per lane, each of depth `n_b_med` = 16. The gathers feeding them are
+independent but the accumulations are serial, so one lane exposes only three
+chains. Interleaving a second doubles that to six with no change in work.
+
+**The all-ones case is the instructive failure.** Predicted ~27 ms from the
+zero case's calibration; delivered 6.1. Halving a row's loads halves its
+memory-level parallelism at the same time, and the remaining dependency chain
+goes latency-bound -- the same mechanism that sank the LD1 x4 attempt. Whole-row
+elimination avoids it because no chain survives. That result is what motivated
+the lane unroll, which then outperformed the win that inspired it.
+
+**Two censuses that closed leads without any code:**
+
+- `a`-side pinned zeros are *exactly* the same 15 positions as `b`'s (union 15,
+  a-only 0) -- the padding rows where both operands vanish. An a-side check
+  would add nothing.
+- The zero words cluster into the block tail (parity 1, b_med 14-15), giving
+  only one fully-zero `(parity, b_med)` group of 32, worth ~1% of drain
+  gathers. Whole-`b_med` elimination is not there.
+
+**Combined effect, measured directly.** The two wins together, against the
+pre-zero-skip commit in a single session, paired n=8 with alternating arm
+order:
+
+  round1 URM  base median 1477.30 ms -> head median 1403.07 ms
+              -74.2 ms (-5.0%), head 8/8, ranges disjoint
+              (base min 1469.55 > head max 1433.81)
+
+That is less than the 42.4 + 63.1 = 105 ms the individual measurements suggest,
+and the combined figure is the one to trust: it is the only one where both arms
+ran under the same conditions. The individual runs were taken in different
+sessions, and cross-run drift on this machine is large enough to swamp the
+difference -- identical code measured 1420 ms in one run and 1483 ms in another.
+
+**Methodology that made these findable.** Earlier attempts were measured on the
+end-to-end headline, where a 40 ms effect is ~1% and sits under the noise. These
+were measured on `round1 URM` directly via `FLOCK_ZC_TIMING`, taking the min
+across the ~5 zerocheck calls in a run, 8 alternating-order pairs per verdict --
+about 3x faster per sample and aimed at the phase actually being changed. Note
+cross-run drift remains large: the same code measured 1420 ms in one run and
+1483 ms in another, so only within-run paired deltas are trustworthy.
 
 ## Not attempted, and why
 
