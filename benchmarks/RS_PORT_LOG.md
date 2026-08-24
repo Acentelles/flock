@@ -108,6 +108,32 @@ added lines.
   plausibly from #29/#30 which `c576e68` predates. Cross-pollination runs both
   ways; commit is not a target for us.
 
+## Where the branch ended up
+
+Three changes kept, everything else reverted with its measurement in the commit
+message. Against `9793190` (the harness-only commit, before any optimization),
+2^18 BLAKE3 ST, paired n=8 with alternating arm order:
+
+| level | base | head | delta |
+|---|---:|---:|---|
+| round 1 (`round1 URM`) | 1477.30 ms | 1403.07 ms | **-5.0%**, 8/8, disjoint ranges |
+| end-to-end headline | 50143 comp/s | 52566 comp/s | **+4.8%**, 8/8 |
+
+Caveat on the end-to-end figure: the base arm spread that run was wide
+(46894-51655, ~10%) while head was tight (51231-53209), so the point estimate is
+soft even though the sign test is not. The round-1 number is the better
+measured of the two.
+
+The three kept changes:
+
+1. **Round-2 NEON register accumulator** (~179 lines) -- `WideNeon`, a 256-bit
+   product held as two uint64x2_t instead of the GPR-resident F256Unreduced.
+   -13% on `zc_round2`.
+2. **Structurally-zero b K-row skip** (~10 lines) -- see above. Part of the
+   -5.0%.
+3. **Two lanes per drain iteration** (~50 lines) -- see above. Part of the
+   -5.0%.
+
 ## What bounds each round-1 kernel (measured, not inferred)
 
 Five local rewrites of round 1 have now failed. Taken together they say
