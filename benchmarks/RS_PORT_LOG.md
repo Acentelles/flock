@@ -721,3 +721,63 @@ call (a real >15% gap could not hide in data this tight, but treat the
 third decimal as weather); and their tree has a Metal `gpu_commit.rs` path
 we did not exercise — CPU-vs-CPU is parity, GPU-on is untested and out of
 scope for this campaign.
+
+## Open campaign, ST (2026-08-25): the combine port, and a full two-tree reconciliation
+
+Protocol parity first: both trees produce byte-identical proofs at n=65536
+BLAKE3 (395,919 bytes) with identical verify times, so open comparisons are
+clean. ST decomposition (PCS_TRACE + LIG_PROVE_TRACE / their
+FLOCK_OPEN_TIMING, same day, same machine):
+
+| sub-phase | ours (pre) | theirs | ours (post-port) |
+|---|---:|---:|---:|
+| combine (b_combined fold+prime) | 94.4 | 64.4 | **78.5–79.4** |
+| initial sumcheck | ~36 | 44.6 | ~36 |
+| recursive commits (NTT+merkle) | 19.0 | 14.9 | 19.0 |
+| induce_sumcheck_poly | 7.5 | 5.6 | 7.5 |
+| ring_switch / folds / glue / OOD | ~3.7 | ~3.7 | ~3.7 |
+| **open TOTAL** | **~160** | **132.7** | **~145** |
+
+**The port (commit 6baccea): composed-table fold.** `fold_one_slot(·, T)` is
+F₂-linear, so `lo ↦ fold_one_slot(lo·e_hi, T)` collapses into one composed
+byte table per claim per block (x-ladder monomial walk + subset-sum
+doubling), deleting the per-slot field multiply — 2·L muls — from the sweep.
+Needs the coarse deferred split (eq_lo 2^15, not the balanced 2^11) so the
+~4.3k-op build amortizes. Bit-identical (equivalence test + verify). Their
+tree had both pieces; they never A/B'd it as a unit — it predates their
+session. Prediction was −30 ms; measured −15 ms, and the sub-timer probe
+explains the rest (below). MT: combine 10.9 ms at 8T (near-linear transfer).
+
+**Corrected accounting (in-fold sub-timers + open_combine_probe micro).**
+Sweeps alone: ours compose 1.2 + sweep0 22.7 + sweep1 24.5 = 48.4 ms —
+EXACTLY their sweep cost (64.4 bucket − ~16 prime). The remaining bucket
+difference is the tail pass: our fused prime+round-1-lookahead costs 24.5 ms
+vs their plain prime ~16 ms, and the lookahead buys ~12 ms back in initial
+sumcheck (36 vs 44.6). Tail+initial: ours 60.5, theirs 60.6 — **the
+lookahead placement is a wash**, another instance of "moving fixed work
+between buckets is not a speedup." It stays only because it is inherited
+code (zero new lines to keep). Earlier probes that "showed lookahead free"
+were wrong: LIG_LOOKAHEAD_DISABLE only gates the ligerito consumer, never
+the combine's producer pass.
+
+**Nulls, measured.** (1) EOR3 depth-3 fold tree: flat (79.5 vs 79.1) — LLVM
+already fuses XOR pairs into EOR3 under target-cpu=native, and the sweep is
+load-port bound (32 loads/slot). Not kept. (2) Fusing both claims into one
+sweep (two live 64 KiB composed tables, single store, no RMW read-back):
+55.6 vs 48.4 ms in the micro — the doubled gather footprint thrashes L1.
+Validates the claim-sequential design note in the challenge tree.
+
+**Residual vs theirs, and why it is closed for now**: ~6 ms structural
+(recursive commits 19 vs 15, induce 7.5 vs 5.6) comes from their
+sparse/windowed transpose-NTT + truncated-final-NTT machinery — thousands
+of lines whose four kill-switches all measured null at this shape in their
+own tree (peer-session test; several gate on their ranked 2^18 shape and
+cannot fire here). Fails the bloat bar decisively at ~6 ms. The remaining
+~7 ms is unattributed noise; Fiat-Shamir grinding lives inside "initial
+sumcheck" and swings 1.8–8.4 ms per sample (their measurement, same bucket
+convention in both trees).
+
+Instrumentation kept (strip at campaign close): `open_combine_probe` bench +
+`pcs::combine_probe` module, and the `b=` field in the combine trace line.
+Conditions caveat: battery power + active Zoom all afternoon; every kept
+number is an internal same-run comparison or reproduced across ≥3 samples.

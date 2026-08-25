@@ -26,6 +26,137 @@ pub mod pack;
 pub mod ring_switch;
 pub mod tensor_algebra;
 
+/// TEMP probe (open campaign): isolated variants of the combine sweep for
+/// `benches/open_combine_probe.rs`. Strip when the open campaign closes.
+#[doc(hidden)]
+pub mod combine_probe {
+    use super::ring_switch;
+    use crate::field::F128;
+    use rayon::prelude::*;
+
+    pub const FOLD_TABLE_LEN: usize = ring_switch::FOLD_TABLE_LEN;
+    type Claims = [(Vec<F128>, Vec<F128>, Vec<F128>)];
+
+    /// Production shape: per block, compose each claim's table then sweep.
+    fn composed(claims: &Claims, out: &mut [F128]) -> F128 {
+        let b = claims[0].0.len();
+        out.par_chunks_mut(b)
+            .enumerate()
+            .map_init(
+                || vec![F128::ZERO; FOLD_TABLE_LEN],
+                |ctable, (hi, out_block)| {
+                    for (ci, (eq_lo, eq_hi, table)) in claims.iter().enumerate() {
+                        ring_switch::compose_fold_byte_table_into(eq_hi[hi], table, ctable);
+                        if ci == 0 {
+                            for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                                *slot = ring_switch::fold_one_slot(lo, ctable);
+                            }
+                        } else {
+                            for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                                *slot += ring_switch::fold_one_slot(lo, ctable);
+                            }
+                        }
+                    }
+                    out_block[0]
+                },
+            )
+            .reduce(|| F128::ZERO, |a, x| a + x)
+    }
+
+    /// Compose hoisted out (stale table — wrong values, isolates build cost).
+    fn composed_no_build(claims: &Claims, out: &mut [F128]) -> F128 {
+        let b = claims[0].0.len();
+        out.par_chunks_mut(b)
+            .enumerate()
+            .map_init(
+                || {
+                    let mut ct = vec![F128::ZERO; FOLD_TABLE_LEN];
+                    ring_switch::compose_fold_byte_table_into(
+                        claims[0].1[0],
+                        &claims[0].2,
+                        &mut ct,
+                    );
+                    ct
+                },
+                |ctable, (_hi, out_block)| {
+                    for (ci, (eq_lo, _, _)) in claims.iter().enumerate() {
+                        if ci == 0 {
+                            for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                                *slot = ring_switch::fold_one_slot(lo, ctable);
+                            }
+                        } else {
+                            for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                                *slot += ring_switch::fold_one_slot(lo, ctable);
+                            }
+                        }
+                    }
+                    out_block[0]
+                },
+            )
+            .reduce(|| F128::ZERO, |a, x| a + x)
+    }
+
+    /// Pre-composed-port baseline: per-slot multiply into the base table.
+    fn slot_mul(claims: &Claims, out: &mut [F128]) -> F128 {
+        let b = claims[0].0.len();
+        out.par_chunks_mut(b)
+            .enumerate()
+            .map(|(hi, out_block)| {
+                for (ci, (eq_lo, eq_hi, table)) in claims.iter().enumerate() {
+                    let e_hi = eq_hi[hi];
+                    if ci == 0 {
+                        for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                            *slot = ring_switch::fold_one_slot(lo * e_hi, table);
+                        }
+                    } else {
+                        for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                            *slot += ring_switch::fold_one_slot(lo * e_hi, table);
+                        }
+                    }
+                }
+                out_block[0]
+            })
+            .reduce(|| F128::ZERO, |a, x| a + x)
+    }
+
+    /// Both claims fused into one sweep: two composed tables live (128 KiB),
+    /// one store per slot, no intermediate read-back.
+    fn fused_claims(claims: &Claims, out: &mut [F128]) -> F128 {
+        let b = claims[0].0.len();
+        out.par_chunks_mut(b)
+            .enumerate()
+            .map_init(
+                || {
+                    (
+                        vec![F128::ZERO; FOLD_TABLE_LEN],
+                        vec![F128::ZERO; FOLD_TABLE_LEN],
+                    )
+                },
+                |(ct0, ct1), (hi, out_block)| {
+                    ring_switch::compose_fold_byte_table_into(claims[0].1[hi], &claims[0].2, ct0);
+                    ring_switch::compose_fold_byte_table_into(claims[1].1[hi], &claims[1].2, ct1);
+                    for ((slot, &lo0), &lo1) in out_block
+                        .iter_mut()
+                        .zip(claims[0].0.iter())
+                        .zip(claims[1].0.iter())
+                    {
+                        *slot = ring_switch::fold_one_slot(lo0, ct0)
+                            + ring_switch::fold_one_slot(lo1, ct1);
+                    }
+                    out_block[0]
+                },
+            )
+            .reduce(|| F128::ZERO, |a, x| a + x)
+    }
+
+    pub const VARIANTS: &[(&str, fn(&Claims, &mut [F128]) -> F128)] = &[
+        ("composed (production)", composed),
+        ("composed, build hoisted (timing only)", composed_no_build),
+        ("slot-multiply (old baseline)", slot_mul),
+        ("fused claims, one pass", fused_claims),
+    ];
+}
+
 pub use commit::{
     Commitment, PcsParams, ProverData, commit, commit_into, prefault_codeword_during,
 };
@@ -537,10 +668,11 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     }
     if trace {
         eprintln!(
-            "  [open_batch] combine rs_eq_ind (L={}, rs×{}, pd×{}): {:6.2} ms",
+            "  [open_batch] combine rs_eq_ind (L={}, rs×{}, pd×{}, b={}): {:6.2} ms",
             l,
             n_rs,
             n_pd,
+            rs_deferred.first().map_or(0, |d| d.0.len()),
             t.elapsed().as_secs_f64() * 1e3
         );
     }
