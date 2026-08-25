@@ -781,3 +781,15 @@ Instrumentation kept (strip at campaign close): `open_combine_probe` bench +
 `pcs::combine_probe` module, and the `b=` field in the combine trace line.
 Conditions caveat: battery power + active Zoom all afternoon; every kept
 number is an internal same-run comparison or reproduced across ≥3 samples.
+
+**Addendum (peer measurement, same day): their truncated-final-NTT is a real
+null even at its designed shape.** At the ranked 2^18 config (the exact shape
+`is_ranked_induce_truncated_final_ntt_shape` pins: log_msg_cols=19,
+n_queries=218), 7 paired ST samples with the production switch
+`FLOCK_NO_LIG_INDUCE_TRUNCATED_NTT`: lig-prove 132.39 ms ON vs 132.79 OFF,
+induce 12.23 vs 11.80 — flat. So the truncation contributes nothing anywhere;
+whatever induce/commit edge their tree holds (~6 ms at our shape) rides on
+the always-on sparse transpose-NTT, not this. The not-ported decision stands
+with their own numbers behind it. Their run also showed the familiar
+environmental spike (two trailing samples at ~2× on BOTH arms identically) —
+same all-week pattern, comparison-safe, logged for the record.
