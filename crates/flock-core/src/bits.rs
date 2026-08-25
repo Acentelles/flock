@@ -11,7 +11,7 @@
 /// "simplify" this back.
 #[inline(always)]
 pub fn lowest_one(x: usize) -> usize {
-    x & x.wrapping_neg()
+    x.isolate_lowest_one()
 }
 
 /// Hacker's Delight (Sec. 7-3) 8×8 bit-matrix transpose stored in a `u64`.

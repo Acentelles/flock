@@ -228,7 +228,7 @@ fn bit_spread_zero_mask_is_enforced() {
     assert_eq!(a, r1cs.apply_a(&z));
     assert_eq!(b, r1cs.apply_b(&z));
 
-    let forbidden_bit = word & word.wrapping_neg();
+    let forbidden_bit = word.isolate_lowest_one();
     let rejected = BitSpreadInput {
         word,
         zero_mask: forbidden_bit,

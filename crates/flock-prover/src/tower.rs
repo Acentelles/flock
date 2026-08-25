@@ -4279,7 +4279,9 @@ fn native_cap_layers(cap: &[[u8; 32]], n_layers: usize, hash: HashKind) -> Vec<V
         let next: Vec<[u8; 32]> = layers
             .last()
             .unwrap()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|p| core_merkle::hash_pair(&p[0], &p[1], hash))
             .collect();
         layers.push(next);
@@ -5009,7 +5011,7 @@ fn emit_residual_region(
                 let out = sb.gate(acc_slot, &g_in);
                 for (dst, src) in accs[h * chunk..(h + 1) * chunk]
                     .iter_mut()
-                    .zip(out.chunks_exact(2))
+                    .zip(out.as_chunks::<2>().0.iter())
                 {
                     *dst = [src[0], src[1]];
                 }
