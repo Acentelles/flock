@@ -9,6 +9,87 @@ use crate::field::F128;
 /// # Safety
 /// Caller must guarantee `table_data` points to ≥ 8 × 256 × 16 valid bytes
 /// (an `n_chunks ≥ 8` table) and `bytes_ptr` to ≥ 8 valid bytes.
+/// Fused fold-and-message pass for the rounds-3+ tail, entirely in q
+/// registers. The incumbent shape made two passes per worker chunk -- fold
+/// `a_in`/`b_in` into `a_out`/`b_out`, then RE-READ the multi-megabyte output
+/// chunk to build the message, shuttling every value through F128 structs in
+/// general registers on the way. Here each output pair is folded, stored once
+/// (the required write), and consumed for the message while still in vector
+/// registers: same PMULL count, one memory pass instead of two, no
+/// register-file boundary crossings.
+///
+/// Contract matches the generic branch of `fold_and_compute_round_pair_into`:
+/// `a_in.len() == 4 * eq_lo.len()`, `a_out.len() == 2 * eq_lo.len()`, fold at
+/// `r_fold` (out = even + r * (even + odd)), returns the REDUCED
+/// `(sum eq*g1, sum eq*g_inf)` for the caller's `eq_hi` fold.
+///
+/// # Safety
+/// Requires the `aes` target feature (PMULL); slices per the contract above.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[target_feature(enable = "aes")]
+pub(crate) unsafe fn fold_and_message_neon(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    eq_lo: &[F128],
+) -> (F128, F128) {
+    use crate::field::gf2_128::aarch64::{WideNeon, mul_q, wide_mul_unreduced_q};
+    use core::arch::aarch64::*;
+
+    let lo_size = eq_lo.len();
+    debug_assert_eq!(a_in.len(), 4 * lo_size);
+    debug_assert_eq!(a_out.len(), 2 * lo_size);
+
+    // SAFETY: F128 is repr(C, align(16)); all offsets below stay within the
+    // slice lengths asserted above.
+    unsafe {
+        let r_arr = [r_fold.lo, r_fold.hi];
+        let r_q = vld1q_u64(r_arr.as_ptr());
+        let ap = a_in.as_ptr() as *const u64;
+        let bp = b_in.as_ptr() as *const u64;
+        let aop = a_out.as_mut_ptr() as *mut u64;
+        let bop = b_out.as_mut_ptr() as *mut u64;
+        let eqp = eq_lo.as_ptr() as *const u64;
+
+        let mut p1_nacc = WideNeon::zero();
+        let mut pinf_nacc = WideNeon::zero();
+
+        // fold: even + r * (even ^ odd), all operands resident in q registers.
+        #[inline(always)]
+        unsafe fn fold_pair_q(
+            e: core::arch::aarch64::uint64x2_t,
+            o: core::arch::aarch64::uint64x2_t,
+            r: core::arch::aarch64::uint64x2_t,
+        ) -> core::arch::aarch64::uint64x2_t {
+            use core::arch::aarch64::*;
+            unsafe { veorq_u64(e, mul_q(r, veorq_u64(e, o))) }
+        }
+
+        for x in 0..lo_size {
+            let i = 4 * x;
+            let a0 = fold_pair_q(vld1q_u64(ap.add(2 * i)), vld1q_u64(ap.add(2 * i + 2)), r_q);
+            let a1 = fold_pair_q(vld1q_u64(ap.add(2 * i + 4)), vld1q_u64(ap.add(2 * i + 6)), r_q);
+            let b0 = fold_pair_q(vld1q_u64(bp.add(2 * i)), vld1q_u64(bp.add(2 * i + 2)), r_q);
+            let b1 = fold_pair_q(vld1q_u64(bp.add(2 * i + 4)), vld1q_u64(bp.add(2 * i + 6)), r_q);
+
+            let o = 2 * x;
+            vst1q_u64(aop.add(2 * o), a0);
+            vst1q_u64(aop.add(2 * o + 2), a1);
+            vst1q_u64(bop.add(2 * o), b0);
+            vst1q_u64(bop.add(2 * o + 2), b1);
+
+            let g1 = mul_q(a1, b1);
+            let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
+            let eq_q = vld1q_u64(eqp.add(2 * x));
+            p1_nacc.xor_assign(wide_mul_unreduced_q(eq_q, g1));
+            pinf_nacc.xor_assign(wide_mul_unreduced_q(eq_q, g_inf));
+        }
+        (p1_nacc.reduce(), pinf_nacc.reduce())
+    }
+}
+
 /// [`fold_one_row_neon_unchecked_8`] without the final lane extraction: the
 /// XOR-accumulated row stays in a q register for callers that keep computing
 /// on it (the round-2 message chain). Same safety contract.

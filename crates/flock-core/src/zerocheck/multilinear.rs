@@ -854,10 +854,20 @@ pub fn fold_and_compute_round_pair_into(
             let (p1, pinf) =
                 unsafe { fold_and_message_x86_avx512(a_in, b_in, a_out, b_out, r_fold, eq_lo) };
 
-            #[cfg(not(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+            // SAFETY: aes by the cfg; chunk geometry supplies 4 inputs per
+            // eq_lo value and 2 outputs, as the kernel's contract requires.
+            let (p1, pinf) = unsafe {
+                kernels::aarch64::fold_and_message_neon(a_in, b_in, a_out, b_out, r_fold, eq_lo)
+            };
+
+            #[cfg(not(any(
+                all(target_arch = "aarch64", target_feature = "aes"),
+                all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "vpclmulqdq"
+                )
             )))]
             let (p1, pinf) = {
                 // Fold a_in→a_out and b_in→b_out at r_fold. The field layer
