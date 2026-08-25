@@ -66,6 +66,7 @@ Treat the column as directional, not as a scoreboard.
 | 17 | **q-resident round 2: fold outputs stay in q registers, in-register karatsuba `mul_q` (5 PMULLs), `WideNeon` fed directly** | round 2 | **358.1 → 311.6 ms (−13.0%), 8/8, every pair −12.6..−13.3%** | — | **KEPT** |
 | 18 | **fused q-resident rounds-3+ tail: fold+message in one pass, second read pass over multi-MB chunks deleted** | rounds 3+ | **449.5 → 306.6 ms (−31.8%), 8/8, every pair −31.1..−32.6% — largest single win of the effort** | — | **KEPT** |
 | 19 | **stripe fold through lincheck's tiled dispatcher** (was calling the portable fallback; its 256 KiB accumulator thrashes L2 at k_log=14) | round-1 C fold | **1191.0 → 1023.7 ms (−167.3, −14.0%), 8/8, every pair −13.6..−14.4%** | — | **KEPT** |
+| 21 | b === all-ones round-2 pair degeneration | round 2 | 312.0 → 312.4 ms, sign 4-4 — **null** (third partial-skip-vs-ILP confirmation) | — | reverted |
 | 20 | **word-extract addressing in the prep** (16 byte-loads per K-row → 2 word loads + shifts) | round-1 prep | **1027.6 → 974.8 ms (−52.7, −5.1%), 6/6** | — | **KEPT** |
 
 Net kept: **round 2 −13.4% ST**, total 4781.0 → 4716.2 ST (−1.4%), for 179
@@ -362,6 +363,33 @@ Zerocheck like-for-like standing: ~1643 vs ~1376 = **1.19x** (was 1.74x
 fairly accounted, "2.7x" as first misread). Rounds 3+ (1.03x) and drain+fold
 (1.06x) are closed; round 2 (1.45x, ~97 ms, their compact-fold mechanism) is
 the largest remaining relative gap.
+
+## The SHA-256 cross-circuit control
+
+Question: is the challenge repo's remaining advantage BLAKE3 specialization
+(its static-b census, degen flags) or generic kernel quality? Control: SHA-256
+at 2^16 (m=31), ST, identical command on both trees, where neither side's
+structure guards fire at their tuned density.
+
+| tree | best prove_fast | throughput |
+|---|---:|---:|
+| this branch | 2.05 s | 32,027 h/s |
+| challenge (c576e68 frontier) | 1.72 s | 38,170 h/s |
+
+Their advantage on SHA-256: **1.19x** -- statistically the same as the ~1.16x
+comparable whole-proof gap on BLAKE3. Conclusion: their edge is uniform,
+circuit-agnostic kernel quality (commit path, round-2 compact/NT stores, prep
+tail, allocator recycling), and the BLAKE3-specific structure machinery is
+performance noise at end-to-end scale on both sides -- consistent with their
+own per-switch ablations (1-3% each) and with our ports of that family
+(zero-skip -42 ms; b===1 degen null).
+
+Also measured by the control: this branch's campaign improved SHA-256 by
+**+18% for free** (27.1k -> 32.0k h/s vs the session-baseline matrix) --
+no SHA-specific work was ever done, confirming the kept wins are
+circuit-agnostic. The b===1 degeneration port (row 21, reverted) was the
+last BLAKE3-structural candidate; with this control there is no reason to
+pursue that family further.
 
 ## What finally worked, and why
 
