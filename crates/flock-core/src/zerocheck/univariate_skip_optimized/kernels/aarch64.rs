@@ -472,12 +472,18 @@ unsafe fn fused_apply_one_k<const K: i32>(
         // y_* = gf8_mul(da_*, 0) = 0 and this K-row contributes nothing to any
         // accumulator. Skipping it is exact, and the guard is a compare -- the
         // kernel stays correct for any witness that disagrees.
-        if (b_row as *const u64).read_unaligned() == 0 {
+        let bw = u64::from_le((b_row as *const u64).read_unaligned());
+        if bw == 0 {
             return;
         }
+        // Read each operand row as ONE word and extract bytes in-register:
+        // the byte values only feed table-address arithmetic, so this trades
+        // 16 L1 byte-loads per K-row for 2 word loads plus shifts on the
+        // 6-wide integer side, freeing load-issue slots for the row gathers.
+        let aw = u64::from_le((a_row as *const u64).read_unaligned());
         // b = 0: identity permutation — plain load of the 4 chunks.
-        let ra0 = a_table.add(*a_row as usize * 64);
-        let rb0 = table_base.add(*b_row as usize * 64);
+        let ra0 = a_table.add((aw & 0xff) as usize * 64);
+        let rb0 = table_base.add((bw & 0xff) as usize * 64);
         let mut da0 = vld1q_u8(ra0);
         let mut da1 = vld1q_u8(ra0.add(16));
         let mut da2 = vld1q_u8(ra0.add(32));
@@ -491,8 +497,8 @@ unsafe fn fused_apply_one_k<const K: i32>(
         xor_apply_byte_into_8_regs::<0, true>(
             a_table,
             table_base,
-            *a_row.add(1),
-            *b_row.add(1),
+            (aw >> 8) as u8,
+            (bw >> 8) as u8,
             &mut da0,
             &mut da1,
             &mut da2,
@@ -505,8 +511,8 @@ unsafe fn fused_apply_one_k<const K: i32>(
         xor_apply_byte_into_8_regs::<1, false>(
             a_table,
             table_base,
-            *a_row.add(2),
-            *b_row.add(2),
+            (aw >> 16) as u8,
+            (bw >> 16) as u8,
             &mut da0,
             &mut da1,
             &mut da2,
@@ -519,8 +525,8 @@ unsafe fn fused_apply_one_k<const K: i32>(
         xor_apply_byte_into_8_regs::<1, true>(
             a_table,
             table_base,
-            *a_row.add(3),
-            *b_row.add(3),
+            (aw >> 24) as u8,
+            (bw >> 24) as u8,
             &mut da0,
             &mut da1,
             &mut da2,
@@ -533,8 +539,8 @@ unsafe fn fused_apply_one_k<const K: i32>(
         xor_apply_byte_into_8_regs::<2, false>(
             a_table,
             table_base,
-            *a_row.add(4),
-            *b_row.add(4),
+            (aw >> 32) as u8,
+            (bw >> 32) as u8,
             &mut da0,
             &mut da1,
             &mut da2,
@@ -547,8 +553,8 @@ unsafe fn fused_apply_one_k<const K: i32>(
         xor_apply_byte_into_8_regs::<2, true>(
             a_table,
             table_base,
-            *a_row.add(5),
-            *b_row.add(5),
+            (aw >> 40) as u8,
+            (bw >> 40) as u8,
             &mut da0,
             &mut da1,
             &mut da2,
@@ -561,8 +567,8 @@ unsafe fn fused_apply_one_k<const K: i32>(
         xor_apply_byte_into_8_regs::<3, false>(
             a_table,
             table_base,
-            *a_row.add(6),
-            *b_row.add(6),
+            (aw >> 48) as u8,
+            (bw >> 48) as u8,
             &mut da0,
             &mut da1,
             &mut da2,
@@ -575,8 +581,8 @@ unsafe fn fused_apply_one_k<const K: i32>(
         xor_apply_byte_into_8_regs::<3, true>(
             a_table,
             table_base,
-            *a_row.add(7),
-            *b_row.add(7),
+            (aw >> 56) as u8,
+            (bw >> 56) as u8,
             &mut da0,
             &mut da1,
             &mut da2,
