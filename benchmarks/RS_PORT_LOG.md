@@ -464,6 +464,18 @@ Measured three ways (ST paired n=8 order-alternating with NT stores: base
 53288 vs 53037, base 5/8; 8T paired n=6: 325007 vs 320655, base 4/6; ST
 paired n=10 without NT stores: indistinguishable once warm). Reverted.
 
+**Methodology note worth keeping: check the power source before measuring.**
+Two grand-total runs were invalidated in one evening by power state. On low
+battery, macOS caps frequencies (one base arm carried a sample ~20% low); while
+fast-charging a nearly-empty battery, it is even worse -- the charger's power
+budget is shared with the SoC and a paired run swung -13% to +57% per pair
+with a 51% base-arm spread. Run `pmset -g batt` first: measure only on AC with
+the battery above ~60%, where the charge rate has tapered. The alternating
+paired design protects the sign test through slow drift (arms sit within ~80 s
+of each other), and min-of-5 within a run rejects transient dips -- which is
+how the round-1 results cross-validated and survived -- but end-to-end
+magnitudes from a throttled window are unusable.
+
 **Methodology note worth keeping.** An earlier version of the paired script
 always ran the base arm first. Throughput declines monotonically across a run
 as the machine heats (342707 → 315100 over six 8T pairs), so a fixed order
