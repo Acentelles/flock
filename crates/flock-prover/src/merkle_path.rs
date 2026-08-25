@@ -903,7 +903,10 @@ mod tests {
         let mut rng = Rng::new(0x1A65EED);
         for _ in 0..1000 {
             let (a, b, c, d, r) = (rng.f128(), rng.f128(), rng.f128(), rng.f128(), rng.f128());
-            assert_eq!(lagrange_eval_degree3(a, b, c, d, r), reference(a, b, c, d, r));
+            assert_eq!(
+                lagrange_eval_degree3(a, b, c, d, r),
+                reference(a, b, c, d, r)
+            );
         }
         // Boundary points: r ∈ {0, 1, ω, ω+1} must reproduce the four inputs.
         let (a, b, c, d) = (rng.f128(), rng.f128(), rng.f128(), rng.f128());
