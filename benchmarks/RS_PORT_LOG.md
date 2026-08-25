@@ -831,3 +831,32 @@ their in-prove witness bucket (30.4) is HALF their own focused bench
 moves witness work out of that bucket; under investigation. Honest
 remaining real gaps: lincheck 1.34×, their witness accounting, ~9% kernel
 quality in zerocheck+commit.
+
+## Lincheck: two-stripe word-load fold reaches the load floor (2026-08-25, kept)
+
+The prior "no reachable headroom" verdict on the lincheck fold examined
+blocking strategies and table geometry; the challenge tree's newer asm
+kernel wins differently: the inner loop is load-port bound, and their
+kernel grabs each stripe's 8 index bytes as ONE paired load (UBFX
+extracts) while folding two stripes per iteration with EOR3. Ported the
+idea as intrinsics (u64 load + shift extraction, two stripes per
+iteration, XOR pairs LLVM fuses to EOR3): 16 loads/stripe -> ~9,
+bit-identical XOR multiset. Paired A/B: **partial_fold_z ST 40.7-40.8 ->
+27.8-28.0 ms (-32%, 3/3 disjoint, at the ~28 ms computed floor); 8T
+6.0-6.1 -> 4.3-4.4 ms (-28%)**. Lincheck bucket 56.4 -> 42.6 ST — parity
+with theirs (42.2). One measurement-hygiene note for the record: two
+paired runs were invalidated before the real one — a stale-binary
+overwrite refusal (aliased interactive cp) and a stash left behind by a
+failed && chain built both arms from the same source; both caught by the
+disjoint-range check and a binary cmp before trusting any numbers.
+
+## End-of-day cumulative (n=65536, m=30): 1.46x -> ~1.10x
+
+ST: witness 71.6 / commit 300.7 / zerocheck 379.7 / lincheck 42.6 /
+open 144.6 — **936 ms, 70.0k comp/s**. 8T: 152.9 ms, **428.7k comp/s**.
+Vs their same-day CPU-only 847 ms ST: 1.10x, with their commit+zerocheck
+bucket confounds unwound this is within the ~9% uniform-kernel-quality
+band established by the SHA-256 control. Today's three kept ports:
+composed-table open fold (-15 ms), streamed witness builder (-22 ms),
+two-stripe lincheck fold (-13 ms) — ~50 ms ST total, all bit-identical,
+all paired-decisive, all transferring to 8T.
