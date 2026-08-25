@@ -20,11 +20,12 @@
 \maketitle
 
 \begin{abstract}
-Six changes to the RS (additive-NTT) zerocheck path, each kept only after a
+Seven changes to the RS (additive-NTT) zerocheck path, each kept only after a
 paired, order-alternating A/B measurement with a decisive sign test. Together
 they reduce zerocheck round~1 from $1477\,$ms to $1205\,$ms ($-18.4\%$),
-round~2 from $433$ to $312\,$ms ($-28\%$), and whole-proof time by
-$\approx9\%$ single-threaded. Three are ideas ported
+round~2 from $433$ to $312\,$ms ($-28\%$), the rounds-3+ tail from $455$ to
+$307\,$ms ($-33\%$), and whole-proof time by more than $10\%$
+single-threaded. Three are ideas ported
 from an independently optimized fork of this prover (the ``challenge'' tree),
 re-derived and re-implemented rather than copied; three originated here. The
 recurring themes: reductions in fields of characteristic two are
@@ -283,9 +284,43 @@ Section~\ref{sec:wideneon} accumulator directly. Per pair, the only remaining
 memory traffic is the four required stores of folded values and one eq load.
 
 \emph{Measured: round-2 phase $358.1\to311.6\,$ms ($-13.0\%$), $8/8$, every
-pair in $[-12.6\%,-13.3\%]$ --- the tightest distribution of the whole
-effort, taken on a machine with an active browser session (the min-of-5
-protocol absorbs interactive bursts).}
+pair in $[-12.6\%,-13.3\%]$, taken on a machine with an active browser
+session (the min-of-5 protocol absorbs interactive bursts).}
+
+\paragraph{The rounds-3+ tail: fusing away a memory pass.}
+The tail rounds (3 and beyond) apply the same treatment plus one thing round~2
+had no opportunity for. The incumbent made \emph{two} passes per worker chunk:
+fold $a_{\mathrm{in}},b_{\mathrm{in}}$ into $a_{\mathrm{out}},b_{\mathrm{out}}$,
+then re-read the just-written multi-megabyte chunk to build the message ---
+an L2/DRAM read of data that had been in vector registers moments earlier.
+The fused kernel folds each output pair in-register
+($e + r\,(e+o)$ via \code{mul\_q}), issues the one required store, and
+consumes the pair for the message while still in registers:
+
+\begin{algorithmic}[1]
+\For{$x = 0 \dots \mathit{lo}-1$}
+  \State $a_0,a_1,b_0,b_1 \gets$ fold four input pairs at $r$
+    \Comment{in q registers}
+  \State store $a_0,a_1,b_0,b_1$ \Comment{the required write, once}
+  \State $g_1 \gets a_1 b_1$;\quad
+         $g_\infty \gets (a_0{+}a_1)(b_0{+}b_1)$
+         \Comment{\code{mul\_q}, never leaving registers}
+  \State $\mathit{acc}_1 \mathrel{\oplus}= \eq_x \odot g_1$;\quad
+         $\mathit{acc}_\infty \mathrel{\oplus}= \eq_x \odot g_\infty$
+         \Comment{unreduced, \S\ref{sec:wideneon}}
+\EndFor
+\end{algorithmic}
+
+\noindent
+The \code{PMULL} count is identical to the two-pass form; the entire gain is
+one traversal instead of two plus the removed struct crossings. Notably, two
+earlier attempts on this exact loop had failed (a memory-interfaced pair-multiply
+kernel, $+10\%$; wide accumulators alone, $0\%$): they changed the arithmetic
+encoding and the accumulator while leaving the pass structure intact, which is
+where the cost actually lived.
+
+\emph{Measured: rounds-3+ phase $449.5\to306.6\,$ms ($-31.8\%$), $8/8$,
+every pair in $[-31.1\%,-32.6\%]$ --- the largest single win of the effort.}
 
 \section{Summary}
 
@@ -307,12 +342,16 @@ Optimization & Kind & Phase effect (ST) & Sign test\\
   round 1: $-5.7\%$ & $8/8$\\
 \S\ref{sec:qres}\ register-resident round 2 & representation &
   round 2: $-13.0\%$ & $8/8$\\
+\S\ref{sec:qres}\ fused rounds-3+ tail & representation + pass fusion &
+  rounds 3+: $-31.8\%$ & $8/8$\\
 \midrule
 \multicolumn{2}{@{}l}{round 1 cumulative} &
   \multicolumn{2}{r@{}}{$1477 \to 1205\,$ms\quad($-18.4\%$)}\\
 \multicolumn{2}{@{}l}{round 2 cumulative
   (\S\ref{sec:wideneon}+\S\ref{sec:qres})} &
   \multicolumn{2}{r@{}}{$433 \to 312\,$ms\quad($-28\%$)}\\
+\multicolumn{2}{@{}l}{rounds 3+ cumulative} &
+  \multicolumn{2}{r@{}}{$455 \to 307\,$ms\quad($-33\%$)}\\
 \multicolumn{2}{@{}l}{end-to-end, all six} &
   \multicolumn{2}{r@{}}{$52{,}110 \to 56{,}820$ comp/s\quad($\approx+9\%$)}\\
 \bottomrule
