@@ -107,16 +107,38 @@ pub(crate) unsafe fn fold_one_row_neon_q_unchecked_8(
         // integer side and the freed load slots go to the table gathers.
         // Same mechanism as the round-1 prep word-extract (-5.1% there).
         let w = u64::from_le((bytes_ptr as *const u64).read_unaligned());
-        let mut acc = vld1q_u8(table_data.add((w & 0xff) as usize * 16));
-        for j in 1..8usize {
-            acc = veorq_u8(
-                acc,
-                vld1q_u8(
-                    table_data.add(j * STRIDE + ((w >> (8 * j)) & 0xff) as usize * 16),
-                ),
-            );
+        macro_rules! row {
+            ($j:expr) => {
+                vld1q_u8(table_data.add($j * STRIDE + ((w >> (8 * $j)) & 0xff) as usize * 16))
+            };
         }
-        acc
+        let t0 = vld1q_u8(table_data.add((w & 0xff) as usize * 16));
+        let t1 = row!(1);
+        let t2 = row!(2);
+        let t3 = row!(3);
+        let t4 = row!(4);
+        let t5 = row!(5);
+        let t6 = row!(6);
+        let t7 = row!(7);
+        // Tree reduction instead of a serial 7-XOR chain: the round-2 loop is
+        // latency-bound (measured: manual unrolling regresses, address loads
+        // are latency-hidden), so the row's critical path is what matters.
+        // Depth drops from 7 XORs to 2 EOR3 levels at the same op count.
+        #[cfg(target_feature = "sha3")]
+        {
+            veor3q_u8(
+                veor3q_u8(t0, t1, t2),
+                veor3q_u8(t3, t4, t5),
+                veorq_u8(t6, t7),
+            )
+        }
+        #[cfg(not(target_feature = "sha3"))]
+        {
+            veorq_u8(
+                veorq_u8(veorq_u8(t0, t1), veorq_u8(t2, t3)),
+                veorq_u8(veorq_u8(t4, t5), veorq_u8(t6, t7)),
+            )
+        }
     }
 }
 
