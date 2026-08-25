@@ -696,3 +696,28 @@ top layers (`fused4_ok` is currently x86-only; top layers are full-buffer
 sweeps, so deeper fusion removes memory passes — the win category with the
 best track record), and nothing else obvious; cross-tree, our commit was
 already at parity or ahead.
+
+## Cross-tree commit is measured parity, not inferred (2026-08-25)
+
+The earlier claims ("our commit is 1.4x faster", later corrected, then
+"parity or ahead") all came from in-prover bucket timers, which are
+confounded: their `commit_s` wraps a `rayon::join` that includes their
+round-1 AB precompute. Today: direct primitive-level A/B, m=31 packed
+breakdown, ST, alternating arms, 3 pairs, same minute, both trees' own
+`pcs_commit` bench (byte-identical bench code; theirs got the same
+FLOCK_COMMIT_M knob temporarily and was restored after; both merkle
+defaults are SHA-256; FLOCK_NO_GPU_COMMIT=1 on their arm):
+
+| arm | NTT (3 runs) | merkle | total |
+|---|---|---|---|
+| ours | 418 / 421 / 419 ms | 212.8 / 212.6 / 212.4 | 692 / 692 / 690 |
+| theirs (c576e68) | 422 / 437 / 420 ms | 212.2 / 213.8 / 212.2 | 690 / 706 / 684 |
+
+Identical to within ~1% on every bucket. Their NTT source files DO differ
+from ours (5 files), so this is a measured null, not shared code: whatever
+they changed there is performance-neutral at this shape, and there is no
+commit-phase port pool. Caveats: run on battery power with an active Zoom
+call (a real >15% gap could not hide in data this tight, but treat the
+third decimal as weather); and their tree has a Metal `gpu_commit.rs` path
+we did not exercise — CPU-vs-CPU is parity, GPU-on is untested and out of
+scope for this campaign.
