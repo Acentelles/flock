@@ -399,6 +399,81 @@ pub unsafe fn wide_mul_unreduced_neon(a: F128, b: F128) -> WideNeon {
     }
 }
 
+/// Karatsuba split with both operands in q registers: `(ll, cross, hh)` with
+/// `cross` recovered from one extra PMULL. The `vgetq_lane_u64` feeds compile
+/// to NEON-resident PMULL operands, not general-register round trips.
+///
+/// # Safety
+/// Requires the `aes` target feature (compiles to PMULL).
+#[target_feature(enable = "aes")]
+#[inline]
+unsafe fn karatsuba_products_q(
+    a: uint64x2_t,
+    b: uint64x2_t,
+) -> (uint64x2_t, uint64x2_t, uint64x2_t) {
+    // SAFETY: function carries the aes target feature.
+    unsafe {
+        let ll = pmull(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b));
+        let hh = pmull(vgetq_lane_u64::<1>(a), vgetq_lane_u64::<1>(b));
+        let a_sum = veorq_u64(a, vextq_u64::<1>(a, a));
+        let b_sum = veorq_u64(b, vextq_u64::<1>(b, b));
+        let mid = pmull(vgetq_lane_u64::<0>(a_sum), vgetq_lane_u64::<0>(b_sum));
+        let cross = veorq_u64(veorq_u64(mid, ll), hh);
+        (ll, cross, hh)
+    }
+}
+
+/// Fully reduced GHASH multiply with operands and result kept in q registers.
+/// Karatsuba (3 PMULLs) plus the two-step fold through `x^128 ≡ x^7+x^2+x+1`
+/// (2 more): 5 PMULLs total against binius's 6, and -- the actual point -- no
+/// F128 struct crossing of the vector/general register-file boundary on
+/// either side.
+///
+/// # Safety
+/// Requires the `aes` target feature (compiles to PMULL).
+#[target_feature(enable = "aes")]
+#[inline]
+pub unsafe fn mul_q(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+    // SAFETY: function carries the aes target feature.
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let (t0, t1, t2) = karatsuba_products_q(a, b);
+        let t1 = veorq_u64(
+            t1,
+            veorq_u64(
+                vextq_u64::<1>(zero, t2),
+                pmull(vgetq_lane_u64::<1>(t2), 0x87),
+            ),
+        );
+        veorq_u64(
+            t0,
+            veorq_u64(
+                vextq_u64::<1>(zero, t1),
+                pmull(vgetq_lane_u64::<1>(t1), 0x87),
+            ),
+        )
+    }
+}
+
+/// [`wide_mul_unreduced_neon`] with q-register operands: the unreduced 256-bit
+/// product for a [`WideNeon`] accumulator, no register-file crossing.
+///
+/// # Safety
+/// Requires the `aes` target feature (compiles to PMULL).
+#[target_feature(enable = "aes")]
+#[inline]
+pub unsafe fn wide_mul_unreduced_q(a: uint64x2_t, b: uint64x2_t) -> WideNeon {
+    // SAFETY: function carries the aes target feature.
+    unsafe {
+        let (ll, cross, hh) = karatsuba_products_q(a, b);
+        let zero = vdupq_n_u64(0);
+        WideNeon {
+            lo: veorq_u64(ll, vextq_u64::<1>(zero, cross)),
+            hi: veorq_u64(hh, vextq_u64::<1>(cross, zero)),
+        }
+    }
+}
+
 /// Dedicated square: carry-less squaring has no cross term (`(a+b)^2 = a^2 + b^2`
 /// over GF(2)), so squaring drops the cross PMULLs — half the PMULL of a
 /// general multiply.

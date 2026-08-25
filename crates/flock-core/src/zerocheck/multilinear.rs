@@ -45,8 +45,8 @@ use crate::zerocheck::univariate_skip::{SplitEqGhash, build_eq, pack_bits};
 
 mod kernels;
 
-#[cfg(target_arch = "aarch64")]
-use kernels::aarch64::fold_one_row_neon_unchecked_8;
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+use kernels::aarch64::fold_one_row_neon_q_unchecked_8;
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -495,20 +495,24 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
             let mut pinf_acc = F256Unreduced::ZERO;
             let pair_idx_base = x_hi * lo_size;
 
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+            // The whole per-pair chain stays in q registers: the folded rows
+            // come back as uint8x16_t (no lane extraction), the message muls
+            // use the in-register karatsuba `mul_q` (5 PMULLs vs binius's 6,
+            // and no F128 struct crossing of the vector/general register-file
+            // boundary), and the eq·g products accumulate into WideNeon. The
+            // only per-pair trips through memory are the four required stores
+            // of the folded values and the one eq load.
             unsafe {
+                use crate::field::gf2_128::aarch64::{WideNeon, mul_q, wide_mul_unreduced_q};
+                use core::arch::aarch64::*;
+
                 let table_ptr = table.data.as_ptr() as *const u8;
                 let a_pkt_ptr = a_packed.as_ptr();
                 let b_pkt_ptr = b_packed.as_ptr();
                 let base = x_hi * chunk_size;
 
-                // Deferred-reduction accumulators held in q registers; same
-                // treatment as `fold_and_compute_round_pair_into`.
-                #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-                let (mut p1_nacc, mut pinf_nacc) = (
-                    crate::field::gf2_128::aarch64::WideNeon::zero(),
-                    crate::field::gf2_128::aarch64::WideNeon::zero(),
-                );
+                let (mut p1_nacc, mut pinf_nacc) = (WideNeon::zero(), WideNeon::zero());
 
                 for x_lo in 0..lo_size {
                     let x0l = 2 * x_lo;
@@ -525,36 +529,31 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
                     let x0g = base + 2 * x_lo;
                     let x1g = x0g + 1;
 
-                    let a0 = fold_one_row_neon_unchecked_8(table_ptr, a_pkt_ptr.add(x0g * 8));
-                    let b0 = fold_one_row_neon_unchecked_8(table_ptr, b_pkt_ptr.add(x0g * 8));
-                    let a1 = fold_one_row_neon_unchecked_8(table_ptr, a_pkt_ptr.add(x1g * 8));
-                    let b1 = fold_one_row_neon_unchecked_8(table_ptr, b_pkt_ptr.add(x1g * 8));
+                    let a0 = fold_one_row_neon_q_unchecked_8(table_ptr, a_pkt_ptr.add(x0g * 8));
+                    let b0 = fold_one_row_neon_q_unchecked_8(table_ptr, b_pkt_ptr.add(x0g * 8));
+                    let a1 = fold_one_row_neon_q_unchecked_8(table_ptr, a_pkt_ptr.add(x1g * 8));
+                    let b1 = fold_one_row_neon_q_unchecked_8(table_ptr, b_pkt_ptr.add(x1g * 8));
 
-                    a_chunk[x0l] = a0;
-                    a_chunk[x1l] = a1;
-                    b_chunk[x0l] = b0;
-                    b_chunk[x1l] = b1;
+                    // F128 is repr(C, align(16)), so these are single stores.
+                    vst1q_u8(a_chunk.as_mut_ptr().add(x0l) as *mut u8, a0);
+                    vst1q_u8(a_chunk.as_mut_ptr().add(x1l) as *mut u8, a1);
+                    vst1q_u8(b_chunk.as_mut_ptr().add(x0l) as *mut u8, b0);
+                    vst1q_u8(b_chunk.as_mut_ptr().add(x1l) as *mut u8, b1);
 
-                    let eq_l = eq_lo[x_lo];
-                    let g1 = a1 * b1;
-                    let g_inf = (a0 + a1) * (b0 + b1);
-                    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-                    {
-                        use crate::field::gf2_128::aarch64::wide_mul_unreduced_neon as wmul;
-                        p1_nacc.xor_assign(wmul(eq_l, g1));
-                        pinf_nacc.xor_assign(wmul(eq_l, g_inf));
-                    }
-                    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
-                    {
-                        p1_acc ^= eq_l.mul_unreduced(g1);
-                        pinf_acc ^= eq_l.mul_unreduced(g_inf);
-                    }
+                    let a0 = vreinterpretq_u64_u8(a0);
+                    let a1 = vreinterpretq_u64_u8(a1);
+                    let b0 = vreinterpretq_u64_u8(b0);
+                    let b1 = vreinterpretq_u64_u8(b1);
+                    let eq_q = vreinterpretq_u64_u8(vld1q_u8(
+                        eq_lo.as_ptr().add(x_lo) as *const u8
+                    ));
+                    let g1 = mul_q(a1, b1);
+                    let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
+                    p1_nacc.xor_assign(wide_mul_unreduced_q(eq_q, g1));
+                    pinf_nacc.xor_assign(wide_mul_unreduced_q(eq_q, g_inf));
                 }
-                #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-                {
-                    p1_acc ^= p1_nacc.to_unreduced();
-                    pinf_acc ^= pinf_nacc.to_unreduced();
-                }
+                p1_acc ^= p1_nacc.to_unreduced();
+                pinf_acc ^= pinf_nacc.to_unreduced();
             }
             #[cfg(all(
                 target_arch = "x86_64",
@@ -654,7 +653,7 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
                 pinf_acc ^= pinf_wide.fold();
             }
             #[cfg(not(any(
-                target_arch = "aarch64",
+                all(target_arch = "aarch64", target_feature = "aes"),
                 all(
                     target_arch = "x86_64",
                     target_feature = "avx512f",
@@ -1487,7 +1486,10 @@ mod tests {
             let scalar = table.fold_one_row(&bytes);
             // SAFETY: on aarch64; bytes has 8 entries; table has 8 chunks.
             let neon = unsafe {
-                fold_one_row_neon_unchecked_8(table.data.as_ptr() as *const u8, bytes.as_ptr())
+                kernels::aarch64::fold_one_row_neon_unchecked_8(
+                    table.data.as_ptr() as *const u8,
+                    bytes.as_ptr(),
+                )
             };
             assert_eq!(scalar, neon, "fold mismatch bytes={bytes:02x?}");
         }
