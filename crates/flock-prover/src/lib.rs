@@ -2,8 +2,8 @@
 //!
 //! Builds on [`flock_core`] (the protocol library + verifier) with the
 //! top-level prove orchestration ([`prover`]), the monolithic hash R1CS
-//! encoders ([`r1cs_hashes`]), and the hash-chain / Merkle-path statement
-//! builders ([`chain`], [`merkle_path`], [`proof_io`]).
+//! encoders ([`r1cs_hashes`]), and the Merkle-path statement builders
+//! ([`merkle_path`], [`proof_io`]).
 //!
 //! For convenience, the entire `flock_core` API is re-exported here, so code
 //! depending on `flock-prover` can reach `field`, `pcs`, `verifier`, etc.
@@ -14,8 +14,9 @@
 
 pub use flock_core::*;
 
-pub mod chain;
 pub mod merkle_path;
+pub mod mixed;
 pub mod proof_io;
 pub mod prover;
 pub mod r1cs_hashes;
+pub mod tower;

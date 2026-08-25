@@ -82,6 +82,9 @@ fn main() -> std::io::Result<()> {
         m,
         log_inv_rate,
         log_batch_size,
+        // Power-of-two commit: the CUDA kernels implement the classic dense
+        // path, not the integer-lane commit.
+        num_lanes: None,
         profile: Default::default(),
         // Pin SHA-256: the CUDA Merkle kernels (cuda-ghash/merkle.cuh) implement it.
         merkle_hash: HashKind::Sha256,
@@ -95,7 +98,12 @@ fn main() -> std::io::Result<()> {
 
     let (commitment, prover_data) = commit(&z_packed, &params);
     let codeword = &prover_data.codeword;
-    let root = commitment.root;
+    // The commitment now carries a CAP LAYER instead of a single root; the
+    // tree root is the depth-0 cap, which is what the CUDA Merkle kernel
+    // reproduces.
+    let root =
+        flock_prover::merkle::cap_layer(&prover_data.merkle_tree, commitment.params.n_leaves(), 0)
+            [0];
 
     let mut w = BufWriter::new(File::create(&path)?);
     let u32le = |w: &mut BufWriter<File>, v: usize| -> std::io::Result<()> {

@@ -3,7 +3,7 @@
 // Unlike the built-in `keccak` example (which proves a single Keccak-256 sponge
 // hash of a message — sequentially-dependent permutations), this proves N
 // INDEPENDENT keccak-f permutations in one circuit, with no sponge/XOR/padding.
-// Directly comparable to Flock's `cargo bench --bench keccak_proof` (K=4096) and
+// Directly comparable to Flock's `cargo bench --bench keccak3_proof` (3-wide) and
 // plonky3's `keccak-f-permutations` objective.
 //
 // Config via env vars:

@@ -487,6 +487,9 @@ impl LincheckCircuit for KeccakLincheckCircuit {
 // Setup
 // ---------------------------------------------------------------------------
 
+// NOTE (2026-08-14): still on the padded commit — keccak3 has no
+// batch-major witness producer yet, so it cannot ride the union path the
+// other hash setups moved to. Next candidate for consolidation-or-retire.
 #[derive(Clone, Debug)]
 pub struct KeccakSetup {
     pub n_keccaks: usize,
@@ -529,8 +532,14 @@ impl KeccakSetup {
         let pcs_params = PcsParams {
             m: r1cs.m,
             log_inv_rate,
-            log_batch_size: 6,
+            // The embedded config's initial_k is the source of truth for the
+            // L0 interleave (6 everywhere except m29 Fast = 5 — the
+            // recursion-node row-width choice).
+            log_batch_size: flock_core::pcs::ligerito::embedded_initial_k_or_default(
+                r1cs.m, profile,
+            ),
             profile,
+            num_lanes: None,
             merkle_hash: Default::default(),
         };
         Self {

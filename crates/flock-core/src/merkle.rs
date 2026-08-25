@@ -627,26 +627,58 @@ pub fn merkle_tree_sequential(data: &[u8], num_leaves: usize, kind: HashKind) ->
 // Merkle path opening and verification.
 // ---------------------------------------------------------------------------
 
-/// Build an opening proof for leaf `index`: the sibling hashes from the leaf
-/// level up to (but not including) the root.
+// ---------------------------------------------------------------------------
+// Merkle CAPPING: a tree's commitment is its cap — the 2^c nodes at depth c
+// below the root — and an opening authenticates leaf → cap node only
+// (d − c siblings). At c = ⌈log2 q⌉ the cap replaces exactly the region
+// where q query paths funnel and share, so capped independent paths cost
+// about what the shared multi-proof did, with NONE of its data-dependent
+// shape: no sorting, no dedup, a duplicate query is just a repeated path.
+// c = 0 degenerates to the classic single root; c = d to "the cap IS the
+// leaf-hash layer" (empty paths — real for the shallow trees of some
+// shipped configs).
+// ---------------------------------------------------------------------------
+
+/// Cap depth for `q` queries into a depth-`d` tree: `min(⌈log2 q⌉, d)`.
+/// Raising c by one saves `q` path siblings but doubles the cap, and at
+/// `c = log2 q` those exactly cancel — the sweet spot. `q ≤ 1` → 0.
+pub fn cap_depth(q: usize, d: usize) -> usize {
+    if q <= 1 {
+        return 0;
+    }
+    (usize::BITS as usize - (q - 1).leading_zeros() as usize).min(d)
+}
+
+/// The cap layer: the `2^c` nodes at depth `c` below the root, as a slice of
+/// the flat tree. The flat layout is levels concatenated bottom-up (leaves at
+/// `[0, N)`, then `N/2` parents, …), so the level with `L` nodes starts at
+/// `2N − 2L`. `c = 0` → `[root]`; `c = d` → the leaf-hash layer.
+pub fn cap_layer(tree: &[Hash], num_leaves: usize, c: usize) -> &[Hash] {
+    assert!(num_leaves.is_power_of_two() && num_leaves > 0);
+    assert_eq!(tree.len(), 2 * num_leaves - 1);
+    let d = num_leaves.trailing_zeros() as usize;
+    assert!(c <= d, "cap depth {c} exceeds tree depth {d}");
+    let l = 1usize << c;
+    &tree[2 * num_leaves - 2 * l..][..l]
+}
+
+/// Build a CAPPED opening proof for leaf `index`: the sibling hashes from the
+/// leaf level up to (but not including) the cap layer at depth `c` — exactly
+/// `log2(num_leaves) − c` hashes. `c = 0` is the classic root-anchored path.
 ///
-/// `tree` must be the flat tree produced by [`merkle_tree`] or
-/// [`merkle_tree_sequential`] for `num_leaves` leaves. The returned vector has
-/// length `log2(num_leaves)`.
-///
-/// Verify with [`verify_merkle_proof`].
-pub fn merkle_proof(tree: &[Hash], num_leaves: usize, index: usize) -> Vec<Hash> {
+/// Verify with [`verify_merkle_proof_capped`].
+pub fn merkle_proof_capped(tree: &[Hash], num_leaves: usize, index: usize, c: usize) -> Vec<Hash> {
     assert!(num_leaves.is_power_of_two() && num_leaves > 0);
     assert!(index < num_leaves);
     assert_eq!(tree.len(), 2 * num_leaves - 1);
+    let d = num_leaves.trailing_zeros() as usize;
+    assert!(c <= d, "cap depth {c} exceeds tree depth {d}");
 
-    let log_n = num_leaves.trailing_zeros() as usize;
-    let mut proof = Vec::with_capacity(log_n);
-
+    let mut proof = Vec::with_capacity(d - c);
     let mut level_start = 0usize;
     let mut level_len = num_leaves;
     let mut idx = index;
-    while level_len > 1 {
+    while level_len > (1 << c) {
         let sibling_idx = idx ^ 1;
         proof.push(tree[level_start + sibling_idx]);
         level_start += level_len;
@@ -656,18 +688,44 @@ pub fn merkle_proof(tree: &[Hash], num_leaves: usize, index: usize) -> Vec<Hash>
     proof
 }
 
-/// Verify a Merkle opening: recomputes the root from `leaf_hash`, the path,
-/// and the leaf index. Returns true iff the recomputed root matches `root`.
-pub fn verify_merkle_proof(
-    root: &Hash,
+/// Build an opening proof for leaf `index`: the sibling hashes from the leaf
+/// level up to (but not including) the root — [`merkle_proof_capped`] at
+/// `c = 0`. The returned vector has length `log2(num_leaves)`.
+///
+/// Verify with [`verify_merkle_proof`].
+pub fn merkle_proof(tree: &[Hash], num_leaves: usize, index: usize) -> Vec<Hash> {
+    merkle_proof_capped(tree, num_leaves, index, 0)
+}
+
+/// Verify a CAPPED Merkle opening: recompute leaf `index`'s cap node from
+/// `leaf_hash` and the path, and compare it to `cap[index >> path.len()]`.
+/// Self-checking on shape: `cap.len()` a power of two ≤ `num_leaves`, and
+/// `path.len()` exactly `log2(num_leaves) − log2(cap.len())` — a wrong-length
+/// path can never verify.
+pub fn verify_merkle_proof_capped(
+    cap: &[Hash],
+    num_leaves: usize,
     leaf_hash: &Hash,
     index: usize,
-    proof: &[Hash],
+    path: &[Hash],
     kind: HashKind,
 ) -> bool {
+    if !num_leaves.is_power_of_two()
+        || num_leaves == 0
+        || !cap.len().is_power_of_two()
+        || cap.len() > num_leaves
+        || index >= num_leaves
+    {
+        return false;
+    }
+    let d = num_leaves.trailing_zeros() as usize;
+    let c = cap.len().trailing_zeros() as usize;
+    if path.len() != d - c {
+        return false;
+    }
     let mut acc = *leaf_hash;
     let mut idx = index;
-    for sibling in proof {
+    for sibling in path {
         // If idx is even, our node is the LEFT child; sibling is on the RIGHT.
         let (left, right) = if idx & 1 == 0 {
             (acc, *sibling)
@@ -677,157 +735,36 @@ pub fn verify_merkle_proof(
         acc = hash_pair(&left, &right, kind);
         idx >>= 1;
     }
-    &acc == root
+    acc == cap[idx]
 }
 
-// ---------------------------------------------------------------------------
-// Multi-proof (Octopus / batched opening): one shared proof for multiple leaf
-// positions, deduplicating siblings that lie on multiple paths.
-// ---------------------------------------------------------------------------
-
-/// Build a Merkle multi-proof for `positions`. Returns the sibling hashes
-/// needed to verify ALL positions against the root, in the canonical
-/// bottom-up sorted-by-position traversal order.
-///
-/// `positions` need not be sorted or unique; the function sorts + dedupes
-/// internally. For `q` queries in a tree of depth `d`, the output is at
-/// most `q · d` hashes (matching `q` independent paths) and typically much
-/// smaller (siblings shared across multiple paths are emitted once).
-///
-/// Verify with [`verify_merkle_multi_proof`].
-pub fn merkle_multi_proof(tree: &[Hash], num_leaves: usize, positions: &[usize]) -> Vec<Hash> {
-    assert!(num_leaves.is_power_of_two() && num_leaves > 0);
-    assert_eq!(tree.len(), 2 * num_leaves - 1);
-
-    if positions.is_empty() || num_leaves == 1 {
-        return Vec::new();
-    }
-
-    let mut active: Vec<usize> = positions.to_vec();
-    active.sort_unstable();
-    active.dedup();
-    debug_assert!(active.iter().all(|&p| p < num_leaves));
-
-    let mut proof = Vec::new();
-    let mut level_start = 0usize;
-    let mut level_len = num_leaves;
-
-    while level_len > 1 {
-        let mut next = Vec::with_capacity(active.len());
-        let mut i = 0;
-        while i < active.len() {
-            let p = active[i];
-            let sib_active = i + 1 < active.len() && active[i + 1] == (p ^ 1);
-            if sib_active {
-                // Both children active — no sibling hash needed; both fold into
-                // the same parent.
-                i += 2;
-            } else {
-                // Sibling not in active set; emit it.
-                proof.push(tree[level_start + (p ^ 1)]);
-                i += 1;
-            }
-            next.push(p >> 1);
-        }
-        // `next` is sorted-unique by construction: the input was sorted-unique;
-        // consecutive sibling pairs (handled above) collapse to one; otherwise
-        // p >> 1 preserves strict ordering.
-        active = next;
-        level_start += level_len;
-        level_len >>= 1;
-    }
-
-    proof
-}
-
-/// Verify a Merkle multi-proof produced by [`merkle_multi_proof`].
-///
-/// `sorted_unique_positions` and `leaf_hashes` must be aligned and sorted:
-/// `leaf_hashes[i]` is the hash of the leaf at `sorted_unique_positions[i]`,
-/// and the position list is strictly ascending. Returns true iff the
-/// reconstructed root equals `root` and the proof is consumed exactly.
-pub fn verify_merkle_multi_proof(
+/// Verify a Merkle opening: recomputes the root from `leaf_hash`, the path,
+/// and the leaf index — [`verify_merkle_proof_capped`] against the one-node
+/// cap `[root]`. Returns true iff the recomputed root matches `root`.
+pub fn verify_merkle_proof(
     root: &Hash,
-    num_leaves: usize,
-    sorted_unique_positions: &[usize],
-    leaf_hashes: &[Hash],
+    leaf_hash: &Hash,
+    index: usize,
     proof: &[Hash],
     kind: HashKind,
 ) -> bool {
-    if !num_leaves.is_power_of_two() || num_leaves == 0 {
-        return false;
-    }
-    if sorted_unique_positions.len() != leaf_hashes.len() {
-        return false;
-    }
-    if sorted_unique_positions.is_empty() {
-        // Vacuous; nothing to verify. Treat as "ok" iff the proof is empty.
-        return proof.is_empty();
-    }
-    // Verify the position list is sorted strictly ascending + in range.
-    for (i, &p) in sorted_unique_positions.iter().enumerate() {
-        if p >= num_leaves {
-            return false;
-        }
-        if i > 0 && sorted_unique_positions[i - 1] >= p {
-            return false;
-        }
-    }
-    // Edge case: 1-leaf tree, no proof needed.
-    if num_leaves == 1 {
-        return proof.is_empty() && leaf_hashes[0] == *root;
-    }
-
-    let mut active: Vec<(usize, Hash)> = sorted_unique_positions
-        .iter()
-        .copied()
-        .zip(leaf_hashes.iter().copied())
-        .collect();
-    let mut proof_iter = proof.iter().copied();
-    let mut level_len = num_leaves;
-
-    while level_len > 1 {
-        let mut next = Vec::with_capacity(active.len());
-        let mut i = 0;
-        while i < active.len() {
-            let (p, h) = active[i];
-            let sib_active = i + 1 < active.len() && active[i + 1].0 == (p ^ 1);
-            let (left, right) = if sib_active {
-                let (_, h_sib) = active[i + 1];
-                // Sorted strictly ascending → active[i+1].0 = p + 1 (= p ^ 1
-                // since p is even when p ^ 1 = p + 1). So p is LEFT child.
-                debug_assert_eq!(p & 1, 0);
-                i += 2;
-                (h, h_sib)
-            } else {
-                let sib = match proof_iter.next() {
-                    Some(s) => s,
-                    None => return false,
-                };
-                i += 1;
-                if p & 1 == 0 { (h, sib) } else { (sib, h) }
-            };
-            next.push((p >> 1, hash_pair(&left, &right, kind)));
-        }
-        active = next;
-        level_len >>= 1;
-    }
-
-    // After the loop, `active` has exactly one element (the root). Reject
-    // any leftover proof bytes.
-    if proof_iter.next().is_some() {
-        return false;
-    }
-    active.len() == 1 && active[0].1 == *root
+    verify_merkle_proof_capped(
+        std::slice::from_ref(root),
+        1usize << proof.len(),
+        leaf_hash,
+        index,
+        proof,
+        kind,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Every structural test runs against both hashes: the tree, path and
-    /// multi-proof logic is hash-agnostic, so anything true of one must hold
-    /// for the other.
+    /// Every structural test runs against both hashes: the tree and path
+    /// logic is hash-agnostic, so anything true of one must hold for the
+    /// other.
     const KINDS: [HashKind; 2] = [HashKind::Sha256, HashKind::Blake3];
 
     #[test]
@@ -1176,284 +1113,186 @@ mod tests {
         data
     }
 
+    /// Capped roundtrip at every leaf, at EVERY cap depth 0..=d, both hashes:
+    /// path length is exactly d − c and each leaf verifies against its own
+    /// cap node.
     #[test]
-    fn multi_proof_single_position_matches_single_proof() {
-        let (n_leaves, leaf_size) = (16, 8);
-        let data = random_data(n_leaves, leaf_size, 42);
+    fn capped_proof_roundtrips_at_every_leaf_and_depth() {
+        let (n_leaves, leaf_size) = (16usize, 8usize);
+        let d = 4usize;
+        let data = random_data(n_leaves, leaf_size, 4242);
+        for kind in KINDS {
+            let tree = merkle_tree(&data, n_leaves, kind);
+            for c in 0..=d {
+                let cap = cap_layer(&tree, n_leaves, c);
+                assert_eq!(cap.len(), 1 << c);
+                for i in 0..n_leaves {
+                    let leaf_hash = hash_leaf(&data[i * leaf_size..(i + 1) * leaf_size], kind);
+                    let path = merkle_proof_capped(&tree, n_leaves, i, c);
+                    assert_eq!(path.len(), d - c, "{kind}: c={c}");
+                    assert!(
+                        verify_merkle_proof_capped(cap, n_leaves, &leaf_hash, i, &path, kind),
+                        "{kind}: verify failed at i={i}, c={c}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// c = 0 IS the classic single-root opening: same path bytes, and the
+    /// capped verifier against `[root]` agrees with `verify_merkle_proof`.
+    #[test]
+    fn cap_zero_is_the_classic_opening() {
+        let (n_leaves, leaf_size) = (16usize, 8usize);
+        let data = random_data(n_leaves, leaf_size, 99);
         for kind in KINDS {
             let tree = merkle_tree(&data, n_leaves, kind);
             let root = *tree.last().unwrap();
-
+            assert_eq!(cap_layer(&tree, n_leaves, 0), &[root]);
             for i in 0..n_leaves {
-                let multi = merkle_multi_proof(&tree, n_leaves, &[i]);
-                let single = merkle_proof(&tree, n_leaves, i);
-                assert_eq!(
-                    multi, single,
-                    "{kind}: multi-proof of [{i}] must equal single proof"
-                );
-
                 let leaf_hash = hash_leaf(&data[i * leaf_size..(i + 1) * leaf_size], kind);
-                assert!(verify_merkle_multi_proof(
-                    &root,
-                    n_leaves,
-                    &[i],
-                    &[leaf_hash],
-                    &multi,
-                    kind
+                let capped = merkle_proof_capped(&tree, n_leaves, i, 0);
+                assert_eq!(capped, merkle_proof(&tree, n_leaves, i));
+                assert!(verify_merkle_proof(&root, &leaf_hash, i, &capped, kind));
+            }
+        }
+    }
+
+    /// Degenerate c = d: the cap IS the leaf-hash layer, paths are empty, and
+    /// verification is a straight leaf-hash comparison. A wrong leaf rejects.
+    #[test]
+    fn cap_at_leaf_depth_is_the_leaf_layer() {
+        let (n_leaves, leaf_size) = (16usize, 8usize);
+        let d = 4usize;
+        let data = random_data(n_leaves, leaf_size, 7);
+        for kind in KINDS {
+            let tree = merkle_tree(&data, n_leaves, kind);
+            let cap = cap_layer(&tree, n_leaves, d);
+            assert_eq!(cap, &tree[..n_leaves]);
+            for i in 0..n_leaves {
+                let leaf_hash = hash_leaf(&data[i * leaf_size..(i + 1) * leaf_size], kind);
+                let path = merkle_proof_capped(&tree, n_leaves, i, d);
+                assert!(path.is_empty());
+                assert!(verify_merkle_proof_capped(
+                    cap, n_leaves, &leaf_hash, i, &path, kind
+                ));
+                let mut wrong = leaf_hash;
+                wrong[0] ^= 1;
+                assert!(!verify_merkle_proof_capped(
+                    cap, n_leaves, &wrong, i, &path, kind
                 ));
             }
         }
     }
 
+    /// Tampering ONE cap node breaks exactly the leaves under it and no
+    /// others — this pins the `index >> (d − c)` cap-node indexing.
     #[test]
-    fn multi_proof_sibling_pair_emits_no_hashes_at_leaf_level() {
-        // Sibling pair (0,1) at the leaf level shares its parent → no leaf-level
-        // sibling is needed; one sibling per remaining level.
-        let n_leaves = 8;
-        let leaf_size = 4;
-        let data = random_data(n_leaves, leaf_size, 7);
+    fn cap_node_tamper_is_local() {
+        let (n_leaves, leaf_size) = (16usize, 8usize);
+        let (d, c) = (4usize, 2usize);
+        let data = random_data(n_leaves, leaf_size, 1234);
         for kind in KINDS {
             let tree = merkle_tree(&data, n_leaves, kind);
-            let root = *tree.last().unwrap();
-
-            let multi = merkle_multi_proof(&tree, n_leaves, &[0, 1]);
-            assert_eq!(
-                multi.len(),
-                2,
-                "sibling pair at leaves saves the leaf-level hash"
-            );
-
-            let leaves: Vec<Hash> = [0usize, 1]
-                .iter()
-                .map(|&i| hash_leaf(&data[i * leaf_size..(i + 1) * leaf_size], kind))
-                .collect();
-            assert!(verify_merkle_multi_proof(
-                &root,
-                n_leaves,
-                &[0, 1],
-                &leaves,
-                &multi,
-                kind
-            ));
-        }
-    }
-
-    #[test]
-    fn multi_proof_full_query_set_is_root_only() {
-        // Every leaf queried → the verifier already knows everything, so the
-        // multi-proof should be empty.
-        let n_leaves = 16;
-        let leaf_size = 8;
-        let data = random_data(n_leaves, leaf_size, 99);
-        for kind in KINDS {
-            let tree = merkle_tree(&data, n_leaves, kind);
-            let root = *tree.last().unwrap();
-
-            let positions: Vec<usize> = (0..n_leaves).collect();
-            let multi = merkle_multi_proof(&tree, n_leaves, &positions);
-            assert!(
-                multi.is_empty(),
-                "full-set multi-proof should have zero hashes"
-            );
-
-            let leaves: Vec<Hash> = (0..n_leaves)
-                .map(|i| hash_leaf(&data[i * leaf_size..(i + 1) * leaf_size], kind))
-                .collect();
-            assert!(verify_merkle_multi_proof(
-                &root, n_leaves, &positions, &leaves, &multi, kind
-            ));
-        }
-    }
-
-    #[test]
-    fn multi_proof_random_subsets_roundtrip() {
-        let n_leaves = 64;
-        let leaf_size = 16;
-        let data = random_data(n_leaves, leaf_size, 2024);
-        for kind in KINDS {
-            let tree = merkle_tree(&data, n_leaves, kind);
-            let root = *tree.last().unwrap();
-
-            let all_leaves: Vec<Hash> = (0..n_leaves)
-                .map(|i| hash_leaf(&data[i * leaf_size..(i + 1) * leaf_size], kind))
-                .collect();
-
-            let subsets: &[&[usize]] = &[
-                &[0],
-                &[63],
-                &[0, 63],
-                &[3, 17, 41],
-                &[10, 11, 12, 13],
-                &[0, 1, 2, 3, 60, 61, 62, 63],
-                &[5, 5, 5, 17, 17],
-                &[0, 8, 16, 24, 32, 40, 48, 56],
-            ];
-            for positions in subsets {
-                let multi = merkle_multi_proof(&tree, n_leaves, positions);
-
-                let mut sorted: Vec<usize> = positions.to_vec();
-                sorted.sort_unstable();
-                sorted.dedup();
-                let leaves: Vec<Hash> = sorted.iter().map(|&p| all_leaves[p]).collect();
-
-                assert!(
-                    verify_merkle_multi_proof(&root, n_leaves, &sorted, &leaves, &multi, kind),
-                    "{kind}: roundtrip failed for positions={positions:?}"
-                );
-
-                let log_n = n_leaves.trailing_zeros() as usize;
-                assert!(
-                    multi.len() <= sorted.len() * log_n,
-                    "multi-proof can't exceed sum of independent paths"
-                );
+            let mut cap = cap_layer(&tree, n_leaves, c).to_vec();
+            let bad_node = 1usize; // covers leaves 4..8 at d − c = 2
+            cap[bad_node][0] ^= 1;
+            for i in 0..n_leaves {
+                let leaf_hash = hash_leaf(&data[i * leaf_size..(i + 1) * leaf_size], kind);
+                let path = merkle_proof_capped(&tree, n_leaves, i, c);
+                let ok = verify_merkle_proof_capped(&cap, n_leaves, &leaf_hash, i, &path, kind);
+                let under_bad = (i >> (d - c)) == bad_node;
+                assert_eq!(ok, !under_bad, "{kind}: i={i}");
             }
         }
     }
 
+    /// Wrong index, tampered sibling, and the wrong hash kind all reject on
+    /// the capped path — mirrors of the classic-opening tamper tests.
     #[test]
-    fn multi_proof_rejects_wrong_leaf() {
-        let (n_leaves, leaf_size) = (32, 8);
-        let data = random_data(n_leaves, leaf_size, 1);
+    fn capped_proof_rejects_tampering() {
+        let (n_leaves, leaf_size) = (16usize, 8usize);
+        let c = 2usize;
+        let data = random_data(n_leaves, leaf_size, 555);
         for kind in KINDS {
             let tree = merkle_tree(&data, n_leaves, kind);
-            let root = *tree.last().unwrap();
-
-            let positions = vec![3usize, 7, 19, 28];
-            let multi = merkle_multi_proof(&tree, n_leaves, &positions);
-            let mut leaves: Vec<Hash> = positions
-                .iter()
-                .map(|&p| hash_leaf(&data[p * leaf_size..(p + 1) * leaf_size], kind))
-                .collect();
-
-            assert!(verify_merkle_multi_proof(
-                &root, n_leaves, &positions, &leaves, &multi, kind
+            let cap = cap_layer(&tree, n_leaves, c);
+            let i = 5usize;
+            let leaf_hash = hash_leaf(&data[i * leaf_size..(i + 1) * leaf_size], kind);
+            let path = merkle_proof_capped(&tree, n_leaves, i, c);
+            assert!(verify_merkle_proof_capped(
+                cap, n_leaves, &leaf_hash, i, &path, kind
             ));
-            leaves[1][0] ^= 1;
-            assert!(!verify_merkle_multi_proof(
-                &root, n_leaves, &positions, &leaves, &multi, kind
-            ));
-        }
-    }
-
-    #[test]
-    fn multi_proof_rejects_tampered_proof_hash() {
-        let (n_leaves, leaf_size) = (32, 8);
-        let data = random_data(n_leaves, leaf_size, 2);
-        for kind in KINDS {
-            let tree = merkle_tree(&data, n_leaves, kind);
-            let root = *tree.last().unwrap();
-
-            let positions = vec![1usize, 14, 27];
-            let mut multi = merkle_multi_proof(&tree, n_leaves, &positions);
-            let leaves: Vec<Hash> = positions
-                .iter()
-                .map(|&p| hash_leaf(&data[p * leaf_size..(p + 1) * leaf_size], kind))
-                .collect();
-
-            assert!(verify_merkle_multi_proof(
-                &root, n_leaves, &positions, &leaves, &multi, kind
-            ));
-            multi[0][0] ^= 1;
-            assert!(!verify_merkle_multi_proof(
-                &root, n_leaves, &positions, &leaves, &multi, kind
-            ));
-        }
-    }
-
-    #[test]
-    fn multi_proof_rejects_extra_or_missing_hashes() {
-        let (n_leaves, leaf_size) = (16, 8);
-        let data = random_data(n_leaves, leaf_size, 3);
-        for kind in KINDS {
-            let tree = merkle_tree(&data, n_leaves, kind);
-            let root = *tree.last().unwrap();
-
-            let positions = vec![2usize, 11];
-            let multi = merkle_multi_proof(&tree, n_leaves, &positions);
-            let leaves: Vec<Hash> = positions
-                .iter()
-                .map(|&p| hash_leaf(&data[p * leaf_size..(p + 1) * leaf_size], kind))
-                .collect();
-
-            let mut extra = multi.clone();
-            extra.push([0xaa; 32]);
-            assert!(!verify_merkle_multi_proof(
-                &root, n_leaves, &positions, &leaves, &extra, kind
-            ));
-
-            let mut short = multi.clone();
-            short.pop();
-            assert!(!verify_merkle_multi_proof(
-                &root, n_leaves, &positions, &leaves, &short, kind
-            ));
-        }
-    }
-
-    #[test]
-    fn multi_proof_rejects_unsorted_positions() {
-        let (n_leaves, leaf_size) = (16, 8);
-        let data = random_data(n_leaves, leaf_size, 5);
-        for kind in KINDS {
-            let tree = merkle_tree(&data, n_leaves, kind);
-            let root = *tree.last().unwrap();
-
-            let positions = vec![2usize, 11];
-            let multi = merkle_multi_proof(&tree, n_leaves, &positions);
-            let leaves: Vec<Hash> = positions
-                .iter()
-                .map(|&p| hash_leaf(&data[p * leaf_size..(p + 1) * leaf_size], kind))
-                .collect();
-
-            let unsorted = vec![11usize, 2];
-            let unsorted_leaves = vec![leaves[1], leaves[0]];
-            assert!(!verify_merkle_multi_proof(
-                &root,
+            // Wrong index (same cap node, sibling half).
+            assert!(!verify_merkle_proof_capped(
+                cap,
                 n_leaves,
-                &unsorted,
-                &unsorted_leaves,
-                &multi,
+                &leaf_hash,
+                i ^ 1,
+                &path,
                 kind
             ));
+            // Tampered sibling.
+            let mut bad = path.clone();
+            bad[0][0] ^= 1;
+            assert!(!verify_merkle_proof_capped(
+                cap, n_leaves, &leaf_hash, i, &bad, kind
+            ));
+            // The other hash kind.
+            let other = match kind {
+                HashKind::Sha256 => HashKind::Blake3,
+                HashKind::Blake3 => HashKind::Sha256,
+                #[allow(unreachable_patterns)]
+                _ => continue,
+            };
+            assert!(!verify_merkle_proof_capped(
+                cap, n_leaves, &leaf_hash, i, &path, other
+            ));
         }
     }
 
+    /// A path of the wrong LENGTH (±1 sibling) can never verify: the capped
+    /// verifier's shape check ties `path.len()` to `log2(num_leaves) −
+    /// log2(cap.len())`.
     #[test]
-    fn multi_proof_beats_independent_paths_at_scale() {
-        let n_leaves = 1024;
-        let leaf_size = 8;
-        let data = random_data(n_leaves, leaf_size, 4096);
-        let log_n = n_leaves.trailing_zeros() as usize;
+    fn capped_proof_rejects_wrong_length() {
+        let (n_leaves, leaf_size) = (16usize, 8usize);
+        let c = 2usize;
+        let data = random_data(n_leaves, leaf_size, 808);
         for kind in KINDS {
             let tree = merkle_tree(&data, n_leaves, kind);
-            let root = *tree.last().unwrap();
-
-            let positions_raw: Vec<usize> = (0..100)
-                .map(|i| {
-                    let mut z = (i as u64).wrapping_mul(0xDEAD_BEEF_F0F0_F0F0);
-                    z ^= z >> 27;
-                    (z as usize) & (n_leaves - 1)
-                })
-                .collect();
-            let multi = merkle_multi_proof(&tree, n_leaves, &positions_raw);
-
-            let mut positions = positions_raw.clone();
-            positions.sort_unstable();
-            positions.dedup();
-            let leaves: Vec<Hash> = positions
-                .iter()
-                .map(|&p| hash_leaf(&data[p * leaf_size..(p + 1) * leaf_size], kind))
-                .collect();
-
-            assert!(verify_merkle_multi_proof(
-                &root, n_leaves, &positions, &leaves, &multi, kind
+            let cap = cap_layer(&tree, n_leaves, c);
+            let i = 3usize;
+            let leaf_hash = hash_leaf(&data[i * leaf_size..(i + 1) * leaf_size], kind);
+            let path = merkle_proof_capped(&tree, n_leaves, i, c);
+            let mut short = path.clone();
+            short.pop();
+            assert!(!verify_merkle_proof_capped(
+                cap, n_leaves, &leaf_hash, i, &short, kind
             ));
-            assert!(
-                multi.len() < positions.len() * log_n,
-                "multi-proof should beat independent paths: got {} vs {} × {}",
-                multi.len(),
-                positions.len(),
-                log_n
-            );
+            let mut long = path.clone();
+            long.push([0u8; 32]);
+            assert!(!verify_merkle_proof_capped(
+                cap, n_leaves, &leaf_hash, i, &long, kind
+            ));
         }
+    }
+
+    /// cap_depth: ⌈log2 q⌉ clamped to the tree depth; q ≤ 1 → 0.
+    #[test]
+    fn cap_depth_formula() {
+        assert_eq!(cap_depth(0, 10), 0);
+        assert_eq!(cap_depth(1, 10), 0);
+        assert_eq!(cap_depth(2, 10), 1);
+        assert_eq!(cap_depth(3, 10), 2);
+        assert_eq!(cap_depth(53, 10), 6);
+        assert_eq!(cap_depth(71, 10), 7);
+        assert_eq!(cap_depth(106, 10), 7);
+        assert_eq!(cap_depth(218, 10), 8);
+        assert_eq!(cap_depth(256, 10), 8);
+        assert_eq!(cap_depth(257, 10), 9);
+        // Clamped: shallow trees cap at the leaf layer.
+        assert_eq!(cap_depth(218, 4), 4);
+        assert_eq!(cap_depth(131, 8), 8);
     }
 }

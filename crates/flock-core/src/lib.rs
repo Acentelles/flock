@@ -17,20 +17,28 @@
 //! Workspace-wide Clippy `allow`s for the hand-tuned numeric kernels are
 //! declared in `[workspace.lints.clippy]` at the repo root.
 
+pub mod aggregate;
 pub mod bits;
 pub mod challenger;
+pub mod circuit;
+pub mod element_r1cs;
 pub mod field;
 pub mod genus95_curve_code;
 pub mod hash;
 pub mod lincheck;
+pub mod matrix_fold;
 pub mod merkle;
 pub mod ntt;
 pub mod pcs;
 pub mod permutation;
+pub mod product_gkr;
 pub mod proof;
 pub mod r1cs;
+pub mod schedule;
 pub mod scratch;
 pub mod suboptimal;
+pub mod transcript_record;
+pub mod union;
 pub mod verifier;
 pub mod zerocheck;
 
@@ -139,6 +147,140 @@ pub(crate) fn alloc_uninit_vec<T: Copy>(n: usize) -> Vec<T> {
 /// Compatibility shim — same as `alloc_uninit_vec::<F128>(n)`.
 pub(crate) fn alloc_uninit_f128_vec(n: usize) -> Vec<crate::field::F128> {
     alloc_uninit_vec::<crate::field::F128>(n)
+}
+
+/// At/above this round width (in summed elements) a sumcheck round uses the full
+/// thread pool; below it, [`sumcheck_round_min_len`] caps the fan-out.
+pub(crate) const SUMCHECK_PAR_THRESHOLD: usize = 1 << 12;
+
+/// Width-aware parallel fan-out for a sumcheck round: the number of rayon jobs
+/// (≈ engaged threads) worth using for a round of `pairs` elements. Per-job
+/// dispatch/join overhead is roughly constant (≈ one round's-worth of work, on
+/// the order of 128 elements) while useful work is linear in `pairs`, so the
+/// round time `pairs/T + c·T` is minimised at `T ≈ √(pairs/128)`. Clamped to the
+/// pool size; `1` means "not worth parallelising". Empirically tuned on an
+/// 8-P-core M-series; the √-shape is machine-independent, only the constant
+/// shifts, so it degrades gracefully.
+pub(crate) fn round_fanout(pairs: usize) -> usize {
+    (pairs / 128).isqrt().clamp(1, rayon::current_num_threads())
+}
+
+/// Rayon `with_min_len` value for parallelising a sumcheck round of `pairs`
+/// elements over `n_blocks` jobs, or `None` to run serial. Wide rounds keep the
+/// full split (`min_len = 1`, the biggest rounds where dispatch is negligible);
+/// mid rounds cap the job count to [`round_fanout`] so they don't pay full 8-way
+/// overhead on too little work; rounds the fan-out deems too small run serial.
+pub(crate) fn sumcheck_round_min_len(pairs: usize, n_blocks: usize) -> Option<usize> {
+    if pairs >= SUMCHECK_PAR_THRESHOLD {
+        Some(1)
+    } else {
+        match round_fanout(pairs) {
+            0 | 1 => None,
+            t => Some(n_blocks.div_ceil(t)),
+        }
+    }
+}
+
+/// At/above this fold width a fold uses the full thread pool; below it,
+/// [`fold_min_len`] caps the fan-out.
+///
+/// Overridable via `FLOCK_FOLD_GATE` for tuning. Measured on M4 Max (10 P-core
+/// pool) with `product_gkr::tests::fold_scaling_probe`: the full-split branch
+/// scales well (2^17 outputs run 3.2× faster than serial), but the capped
+/// fan-out branch below the gate *loses* to serial — 1.3× slower at 2^15
+/// outputs, 3× slower at 2^13. Lowering the gate hands those widths the
+/// full split instead of the cap.
+pub(crate) const FOLD_PAR_THRESHOLD_DEFAULT: usize = 1 << 16;
+
+pub(crate) fn fold_par_threshold() -> usize {
+    static GATE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("FLOCK_FOLD_GATE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(FOLD_PAR_THRESHOLD_DEFAULT)
+    })
+}
+
+/// Rayon `with_min_len` value for the fold/bind step over `half` outputs, or
+/// `None` to run serial. Folds at or above [`fold_par_threshold`] take the full
+/// split; narrower ones run serial by default, or cap the job count via the
+/// √-rule when [`fold_sqrt_rule`] is on. The fold is a lighter, more
+/// bandwidth-bound kernel than a round message (~2 muls + 1 write per output vs
+/// ~10 muls/pair), so for a given width it saturates at fewer threads — hence
+/// the √-rule constant of ~1024 (`T ≈ √(half/1024)`) against 128 for rounds.
+pub(crate) fn fold_min_len(half: usize) -> Option<usize> {
+    if half >= fold_par_threshold() {
+        Some(1)
+    } else if fold_sqrt_rule() {
+        match (half / 1024).isqrt().clamp(1, rayon::current_num_threads()) {
+            0 | 1 => None,
+            t => Some(half.div_ceil(t)),
+        }
+    } else {
+        None
+    }
+}
+
+/// Whether sub-gate folds use the capped √-rule fan-out (`FLOCK_FOLD_RULE=sqrt`)
+/// rather than running serial.
+///
+/// Serial is the default because the cap measured *worse than serial* on this
+/// crate's only `fold_min_len` consumer, `product_gkr`: per
+/// `fold_scaling_probe` on a 10-P-core M4 Max, the capped branch is 1.3× slower
+/// than serial at 2^15 outputs and 3× slower at 2^13, and switching those
+/// widths to serial cut the end-to-end fold phase from ~5.0 ms to ~4.6 ms at
+/// μ=20. The √-rule was originally tuned for `logup_gkr`'s fold on an 8-P-core
+/// part; that module is not in this tree, so the knob preserves it rather than
+/// deleting it.
+pub(crate) fn fold_sqrt_rule() -> bool {
+    static RULE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *RULE.get_or_init(|| std::env::var("FLOCK_FOLD_RULE").is_ok_and(|v| v == "sqrt"))
+}
+
+/// Types whose all-zero bit pattern is a valid, initialized value.
+///
+/// # Safety
+///
+/// Implement only for plain-old-data types with no invalid bit patterns and
+/// no padding-sensitive invariants: no references, no `NonZero`, no enums
+/// whose discriminant 0 is unassigned. [`alloc_zeroed_vec`] hands out
+/// OS-zeroed memory as `Vec<T>` on the strength of this marker.
+pub unsafe trait Zeroable: Copy {}
+// SAFETY: primitive integers and F128 (a transparent pair of u64 limbs; zero
+// is the field's additive identity) are all-zero-valid, and an array of
+// all-zero-valid values is all-zero-valid.
+unsafe impl Zeroable for u8 {}
+unsafe impl Zeroable for u16 {}
+unsafe impl Zeroable for u32 {}
+unsafe impl Zeroable for u64 {}
+unsafe impl Zeroable for usize {}
+unsafe impl Zeroable for field::F128 {}
+unsafe impl<T: Zeroable, const N: usize> Zeroable for [T; N] {}
+
+/// A length-`n` all-zero vector from `alloc_zeroed` — LAZY zero pages from
+/// the OS for large allocations, so untouched regions cost nothing.
+/// (`vec![T::ZERO; n]` does NOT get this for custom structs: the zero-value
+/// specialization only fires for built-in types, so it eagerly memsets.)
+/// `pub`: capacity-sized, mostly-dead buffers (a circuit's element slot
+/// witnesses at 2^nu rows for a few hundred live) want the lazy pages too.
+pub fn alloc_zeroed_vec<T: Zeroable>(n: usize) -> Vec<T> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let layout = std::alloc::Layout::array::<T>(n).expect("allocation size overflows");
+    // SAFETY:
+    // - `alloc_zeroed` returns `n * size_of::<T>()` zeroed bytes with the
+    //   layout's alignment (or null, handled below).
+    // - T: Copy (no Drop), and `T: Zeroable` certifies the all-zero bit
+    //   pattern is a valid T.
+    unsafe {
+        let ptr = std::alloc::alloc_zeroed(layout) as *mut T;
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        Vec::from_raw_parts(ptr, n, n)
+    }
 }
 
 /// Cached [`perf_core_count`]. The uncached version may spawn `sysctl`; this

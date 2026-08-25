@@ -97,10 +97,7 @@ fn main() -> std::io::Result<()> {
         *value = rng.f128();
     }
 
-    let padding = PaddingSpec {
-        k_log,
-        useful_bits_per_block: useful_bits,
-    };
+    let padding = PaddingSpec::uniform(k_log, useful_bits, 1usize << (m - k_log));
     let ntt_s = AdditiveNttGf8::new(K_SKIP, F8::ZERO);
     let ntt_l = AdditiveNttGf8::new(K_SKIP, F8(1u8 << K_SKIP));
     let inv_table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);

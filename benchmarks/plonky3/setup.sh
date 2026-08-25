@@ -14,8 +14,9 @@
 # 131072/24 = 5461 keccaks. Plonky3 requires power-of-2 trace heights, so 5461
 # is the nearest achievable count to Flock's K=4096 (1.33x more).
 #
-# Closest Flock comparison (independent permutations):
-#   cargo bench --bench keccak_proof   (K=4096)
+# Closest Flock comparison (independent permutations, 3-wide encoder):
+#   cargo bench --bench keccak3_proof
+# (the single-permutation keccak_proof bench was retired 2026-08-14)
 # See ../CLAUDE.md "plonky3/ (Plonky3)" for the full comparison.
 
 set -euo pipefail

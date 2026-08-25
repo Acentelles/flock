@@ -2,17 +2,18 @@
 //!   cargo test -p flock-cuda-ffi --release --features gpu -- --ignored --nocapture
 //!
 //! The CUDA prover (cuda-ghash/prove_ffi.cu) returns a flat little-endian
-//! stream; `parse_and_verify` mirrors its FfiWriter layout exactly, rebuilds
-//! the typed `R1csProofLigerito`, and runs the ordinary Rust verifier.
-//! One roundtrip per proof size: m = 14 + n_blocks_log, gated on a Ligerito
-//! config existing for that m.
+//! stream; `gpu_prove` mirrors its FfiWriter layout exactly, rebuilds the
+//! typed `R1csProofLigerito` (F256 ladder: capped Merkle commitments,
+//! stratified queries, the full 128-bit grinding schedule), and runs the
+//! ordinary Rust verifier. One roundtrip per proof size: m = 14 +
+//! n_blocks_log, gated on a Ligerito config existing for that m.
 #![cfg(feature = "gpu")]
 
 use flock_prover::challenger::FsChallenger;
-use flock_prover::field::{F8, F128};
+use flock_prover::field::{F8, F128, F256};
 use flock_prover::lincheck::{self, LincheckProof};
 use flock_prover::ntt::AdditiveNttGf8;
-use flock_prover::pcs::ligerito::{FinalProof, LigeritoProof, RecursiveProof, SumcheckMessage};
+use flock_prover::pcs::ligerito::{FinalProof, LigeritoProof, RecursiveProof, SumcheckMessage256};
 use flock_prover::pcs::ring_switch::RingSwitchProof;
 use flock_prover::pcs::{BatchOpeningProofLigerito, Commitment, PcsParams};
 use flock_prover::proof::R1csProofLigerito;
@@ -55,9 +56,19 @@ struct ProveParams {
     recursive_ks: *const i32,
     queries: *const i32,
     grinding_bits: *const i32,
-    fold_grinding_bits: *const i32,
+    claim_batch_grinding_bits: *const i32,
+    consistency_batch_grinding_bits: *const i32,
     ood_samples: *const i32,
     recursive_steps: i32,
+    zc_initial_bits: i32,
+    zc_skip_bits: i32,
+    zc_round_bits: i32,
+    lc_alpha_bits: i32,
+    lc_beta_bits: i32,
+    lc_round_bits: i32,
+    lc_skip_bits: i32,
+    rs_bits: i32,
+    gamma_bits: i32,
     dump_z_path: *const std::ffi::c_char,
 }
 
@@ -132,10 +143,19 @@ impl<'a> Reader<'a> {
         self.o += 8;
         v
     }
+    fn u64s(&mut self) -> Vec<u64> {
+        let n = self.u64() as usize;
+        (0..n).map(|_| self.u64()).collect()
+    }
     fn f128(&mut self) -> F128 {
         let lo = self.u64();
         let hi = self.u64();
         F128 { lo, hi }
+    }
+    fn f256(&mut self) -> F256 {
+        let c0 = self.f128();
+        let c1 = self.f128();
+        F256::new(c0, c1)
     }
     fn f128s(&mut self) -> Vec<F128> {
         let n = self.u64() as usize;
@@ -177,11 +197,16 @@ fn gpu_prove(n_blocks_log: usize, dump_z: Option<&str>) -> GpuArtifacts {
         log_inv_rate: 1,
         log_batch_size: 6,
         profile: Default::default(),
+        num_lanes: None,
         merkle_hash: Default::default(),
     };
     let cfg = pcs_params
         .ligerito_prover_config()
         .unwrap_or_else(|_| panic!("no fast ligerito config for m={m}"));
+    assert!(
+        cfg.fold_grinding_bits.iter().all(|&b| b == 0),
+        "the F256 ladder never fold-grinds"
+    );
 
     let digest = r1cs.statement_digest();
     let matrices = BLAKE3_CSC_MATRICES.get_or_init(|| {
@@ -201,9 +226,16 @@ fn gpu_prove(n_blocks_log: usize, dump_z: Option<&str>) -> GpuArtifacts {
     let recursive_ks = to_i32(&cfg.recursive_ks);
     let queries = to_i32(&cfg.queries);
     let grinding_bits = to_i32(&cfg.grinding_bits);
-    let fold_grinding_bits = to_i32(&cfg.fold_grinding_bits);
+    let claim_batch = to_i32(&cfg.claim_batch_grinding_bits);
+    let consistency_batch = to_i32(&cfg.consistency_batch_grinding_bits);
     let ood_samples = to_i32(&cfg.ood_samples);
     let r_steps = cfg.recursive_steps;
+
+    // The 128-bit FS grinding schedule the profile selects (0 = site absent).
+    let zc = pcs_params.zerocheck_grinding();
+    let lc = pcs_params.lincheck_grinding();
+    let og = pcs_params.opening_grinding();
+    let opt = |b: Option<u32>| b.map_or(0, |x| x as i32);
 
     let dump_c = dump_z.map(|p| std::ffi::CString::new(p).unwrap());
     let params = ProveParams {
@@ -228,9 +260,19 @@ fn gpu_prove(n_blocks_log: usize, dump_z: Option<&str>) -> GpuArtifacts {
         recursive_ks: recursive_ks.as_ptr(),
         queries: queries.as_ptr(),
         grinding_bits: grinding_bits.as_ptr(),
-        fold_grinding_bits: fold_grinding_bits.as_ptr(),
+        claim_batch_grinding_bits: claim_batch.as_ptr(),
+        consistency_batch_grinding_bits: consistency_batch.as_ptr(),
         ood_samples: ood_samples.as_ptr(),
         recursive_steps: r_steps as i32,
+        zc_initial_bits: opt(zc.initial_bits(m)),
+        zc_skip_bits: opt(zc.skip_bits()),
+        zc_round_bits: opt(zc.multilinear_round_bits()),
+        lc_alpha_bits: opt(lc.alpha_bits()),
+        lc_beta_bits: opt(lc.beta_bits()),
+        lc_round_bits: opt(lc.multilinear_round_bits()),
+        lc_skip_bits: opt(lc.skip_bits(K_SKIP)),
+        rs_bits: og.ring_switch_bits as i32,
+        gamma_bits: og.claim_batch_bits as i32, // 2 claims > 1 → the batch grinds
         dump_z_path: dump_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
     };
 
@@ -245,7 +287,7 @@ fn gpu_prove(n_blocks_log: usize, dump_z: Option<&str>) -> GpuArtifacts {
 
     // ---- parse the flat stream (must mirror prove_ffi.cu::FfiWriter) ----
     let mut r = Reader { b: &bytes, o: 0 };
-    let root = r.hash();
+    let cap = r.hashes();
     let round1_ab = r.f128s();
     let round1_c = r.f128s();
     let n_mlv = r.u64() as usize;
@@ -253,12 +295,18 @@ fn gpu_prove(n_blocks_log: usize, dump_z: Option<&str>) -> GpuArtifacts {
     let final_a_eval = r.f128();
     let final_b_eval = r.f128();
     let final_c_eval = r.f128();
+    let zc_nonces = r.u64s();
     let n_lc = r.u64() as usize;
     let lc_rounds: Vec<(F128, F128)> = (0..n_lc).map(|_| (r.f128(), r.f128())).collect();
     let z_partial = r.f128s();
+    let lc_nonces = r.u64s();
     let shat_ab = r.f128s();
+    let rs_nonce_ab = r.u64();
     let shat_c = r.f128s();
-    let recursive_roots = r.hashes();
+    let rs_nonce_c = r.u64();
+    let batching_nonces = r.u64s();
+    let n_rcaps = r.u64() as usize;
+    let recursive_caps: Vec<Vec<[u8; 32]>> = (0..n_rcaps).map(|_| r.hashes()).collect();
     let n_opens = r.u64() as usize;
     assert_eq!(n_opens, r_steps + 1, "level opens = r+1");
     let mut opens: Vec<(Vec<Vec<F128>>, Vec<[u8; 32]>)> = (0..n_opens)
@@ -270,21 +318,16 @@ fn gpu_prove(n_blocks_log: usize, dump_z: Option<&str>) -> GpuArtifacts {
         .collect();
     let yr = r.f128s();
     let n_sc = r.u64() as usize;
-    let sumcheck_transcript: Vec<SumcheckMessage> = (0..n_sc)
-        .map(|_| SumcheckMessage {
-            u_0: r.f128(),
-            u_2: r.f128(),
+    let sumcheck_transcript_f256: Vec<SumcheckMessage256> = (0..n_sc)
+        .map(|_| SumcheckMessage256 {
+            u_0: r.f256(),
+            u_2: r.f256(),
         })
         .collect();
     let ood_values = r.f128s();
-    let grinding_nonces: Vec<u64> = {
-        let n = r.u64() as usize;
-        (0..n).map(|_| r.u64()).collect()
-    };
-    let fold_grinding_nonces: Vec<u64> = {
-        let n = r.u64() as usize;
-        (0..n).map(|_| r.u64()).collect()
-    };
+    let grinding_nonces = r.u64s();
+    let claim_batch_grinding_nonces = r.u64s();
+    let consistency_batch_grinding_nonces = r.u64s();
     assert_eq!(r.o, bytes.len(), "trailing bytes in FFI stream");
 
     let (initial_rows, initial_mp) = opens.remove(0);
@@ -305,33 +348,46 @@ fn gpu_prove(n_blocks_log: usize, dump_z: Option<&str>) -> GpuArtifacts {
             final_a_eval,
             final_b_eval,
             final_c_eval,
+            grinding_nonces: zc_nonces,
         },
         lincheck: LincheckProof {
             rounds: lc_rounds,
             z_partial,
+            matrix_evals: Vec::new(),
+            grinding_nonces: lc_nonces,
         },
         pcs_open: BatchOpeningProofLigerito {
             ring_switches: vec![
-                RingSwitchProof { s_hat_v: shat_ab },
-                RingSwitchProof { s_hat_v: shat_c },
+                RingSwitchProof {
+                    s_hat_v: shat_ab,
+                    grinding_nonce: rs_nonce_ab,
+                },
+                RingSwitchProof {
+                    s_hat_v: shat_c,
+                    grinding_nonce: rs_nonce_c,
+                },
             ],
+            batching_nonces,
             ligerito: LigeritoProof {
-                initial_root: root,
+                initial_cap: cap.clone(),
                 initial_proof: RecursiveProof {
                     opened_rows: initial_rows,
                     merkle_proof: initial_mp,
                 },
-                recursive_roots,
+                recursive_caps,
                 recursive_proofs,
                 final_proof: FinalProof {
                     yr,
                     opened_rows: final_rows,
                     merkle_proof: final_mp,
                 },
-                sumcheck_transcript,
+                sumcheck_transcript: Vec::new(),
+                sumcheck_transcript_f256,
                 grinding_nonces,
                 ood_values,
-                fold_grinding_nonces,
+                fold_grinding_nonces: Vec::new(),
+                claim_batch_grinding_nonces,
+                consistency_batch_grinding_nonces,
             },
         },
     };
@@ -340,7 +396,7 @@ fn gpu_prove(n_blocks_log: usize, dump_z: Option<&str>) -> GpuArtifacts {
         pcs_params: pcs_params.clone(),
         proof,
         commitment: Commitment {
-            root,
+            cap,
             params: pcs_params,
         },
         prove_secs: t_prove.as_secs_f64(),
@@ -450,6 +506,12 @@ fn gpu_roundtrip_m34() {
 /// the first divergent proof field.
 #[test]
 #[ignore] // needs an sm_120 GPU; run explicitly with --ignored
+fn gpu_debug_diff_m22() {
+    gpu_debug_diff::<22>();
+}
+
+#[test]
+#[ignore] // needs an sm_120 GPU; run explicitly with --ignored
 fn gpu_debug_diff_m33() {
     gpu_debug_diff::<33>();
 }
@@ -492,7 +554,7 @@ fn gpu_debug_diff<const M: usize>() {
         println!("  {name}: OK ({} entries)", r.len());
     }
 
-    assert_eq!(rcomm.root, art.commitment.root, "commitment root");
+    first_diff("commitment.cap", &rcomm.cap, &art.commitment.cap);
     first_diff(
         "zc.round1_ab",
         &rp.zerocheck.round1_ab,
@@ -507,6 +569,11 @@ fn gpu_debug_diff<const M: usize>() {
         "zc.multilinear_rounds",
         &rp.zerocheck.multilinear_rounds,
         &gp.zerocheck.multilinear_rounds,
+    );
+    first_diff(
+        "zc.grinding_nonces",
+        &rp.zerocheck.grinding_nonces,
+        &gp.zerocheck.grinding_nonces,
     );
     assert_eq!(
         rp.zerocheck.final_a_eval, gp.zerocheck.final_a_eval,
@@ -526,6 +593,11 @@ fn gpu_debug_diff<const M: usize>() {
         &rp.lincheck.z_partial,
         &gp.lincheck.z_partial,
     );
+    first_diff(
+        "lc.grinding_nonces",
+        &rp.lincheck.grinding_nonces,
+        &gp.lincheck.grinding_nonces,
+    );
     for (i, (r, g)) in rp
         .pcs_open
         .ring_switches
@@ -534,30 +606,49 @@ fn gpu_debug_diff<const M: usize>() {
         .enumerate()
     {
         first_diff(&format!("rs[{i}].s_hat_v"), &r.s_hat_v, &g.s_hat_v);
+        assert_eq!(r.grinding_nonce, g.grinding_nonce, "rs[{i}].grinding_nonce");
     }
-    let (rl, gl) = (&rp.pcs_open.ligerito, &gp.pcs_open.ligerito);
-    assert_eq!(rl.initial_root, gl.initial_root, "lig.initial_root");
     first_diff(
-        "lig.sumcheck_transcript",
-        &rl.sumcheck_transcript,
-        &gl.sumcheck_transcript,
+        "batching_nonces",
+        &rp.pcs_open.batching_nonces,
+        &gp.pcs_open.batching_nonces,
+    );
+    let (rl, gl) = (&rp.pcs_open.ligerito, &gp.pcs_open.ligerito);
+    first_diff("lig.initial_cap", &rl.initial_cap, &gl.initial_cap);
+    first_diff(
+        "lig.sumcheck_transcript_f256",
+        &rl.sumcheck_transcript_f256,
+        &gl.sumcheck_transcript_f256,
     );
     first_diff("lig.ood_values", &rl.ood_values, &gl.ood_values);
-    first_diff(
-        "lig.fold_grinding_nonces",
-        &rl.fold_grinding_nonces,
-        &gl.fold_grinding_nonces,
-    );
     first_diff(
         "lig.grinding_nonces",
         &rl.grinding_nonces,
         &gl.grinding_nonces,
     );
     first_diff(
-        "lig.recursive_roots",
-        &rl.recursive_roots,
-        &gl.recursive_roots,
+        "lig.claim_batch_grinding_nonces",
+        &rl.claim_batch_grinding_nonces,
+        &gl.claim_batch_grinding_nonces,
     );
+    first_diff(
+        "lig.consistency_batch_grinding_nonces",
+        &rl.consistency_batch_grinding_nonces,
+        &gl.consistency_batch_grinding_nonces,
+    );
+    assert_eq!(
+        rl.recursive_caps.len(),
+        gl.recursive_caps.len(),
+        "recursive_caps count"
+    );
+    for (i, (r, g)) in rl
+        .recursive_caps
+        .iter()
+        .zip(gl.recursive_caps.iter())
+        .enumerate()
+    {
+        first_diff(&format!("lig.rcap[{i}]"), r, g);
+    }
     first_diff(
         "lig.initial.rows",
         &rl.initial_proof.opened_rows,

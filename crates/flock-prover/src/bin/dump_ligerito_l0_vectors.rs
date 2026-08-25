@@ -23,11 +23,22 @@ use flock_prover::challenger::{Challenger, FsChallenger};
 use flock_prover::field::F128;
 use flock_prover::hash::HashKind;
 use flock_prover::lincheck::build_eq_table;
-use flock_prover::merkle::merkle_multi_proof;
 use flock_prover::ntt::AdditiveNttF128;
 use flock_prover::pcs::ligerito::{
-    SumcheckProver, eval_sk_at_vks, induce_sumcheck_poly, ligero_commit,
+    LigeroWitness, SumcheckProver, eval_sk_at_vks, induce_sumcheck_poly, ligero_commit,
 };
+
+// The multi-proof left the live protocol (cap layers replaced it); the CUDA
+// oracle pair keeps a frozen copy. Same story for the single-root absorb:
+// `LigeroWitness::root()` was retired with the cap-layer switch, but this
+// replay pins the transcript shape the CUDA kernels implement.
+#[path = "dump_common/merkle_octopus.rs"]
+mod merkle_octopus;
+use merkle_octopus::merkle_multi_proof;
+
+fn wtns_root(w: &LigeroWitness) -> flock_prover::merkle::Hash {
+    w.tree[w.tree.len() - 1]
+}
 
 const PROVER_LABEL: &[u8] = b"flock-ligerito-basis-v0";
 
@@ -136,7 +147,7 @@ fn main() -> std::io::Result<()> {
     let mut ch = FsChallenger::new(domain);
     ch.observe_label(PROVER_LABEL);
     ch.observe_f128(target);
-    ch.observe_bytes(&wtns_0.root());
+    ch.observe_bytes(&wtns_root(&wtns_0));
 
     let (mut sc, start_msg) = SumcheckProver::new(f.clone(), b1.clone(), target);
     ch.observe_f128(start_msg.u_0);
@@ -156,7 +167,7 @@ fn main() -> std::io::Result<()> {
     }
     wf(&mut w, target)?;
     w.write_all(&(log_inv_rate_0 as u32).to_le_bytes())?;
-    w.write_all(&wtns_0.root())?;
+    w.write_all(&wtns_root(&wtns_0))?;
     w.write_all(&(initial_k as u32).to_le_bytes())?;
     w.write_all(&fold_bits.to_le_bytes())?;
     wf(&mut w, start_msg.u_0)?;
@@ -192,10 +203,10 @@ fn main() -> std::io::Result<()> {
         &ntt_1,
         HashKind::Sha256,
     );
-    ch.observe_bytes(&wtns_1.root());
+    ch.observe_bytes(&wtns_root(&wtns_1));
     w.write_all(&(log_ni1 as u32).to_le_bytes())?;
     w.write_all(&(log_inv_rate_1 as u32).to_le_bytes())?;
-    w.write_all(&wtns_1.root())?;
+    w.write_all(&wtns_root(&wtns_1))?;
 
     // ---- OOD intro/glue ----
     w.write_all(&(ood_count as u32).to_le_bytes())?;
@@ -332,8 +343,8 @@ fn main() -> std::io::Result<()> {
                 &ntt_next,
                 HashKind::Sha256,
             );
-            ch.observe_bytes(&wtns_next.root());
-            w.write_all(&wtns_next.root())?;
+            ch.observe_bytes(&wtns_root(&wtns_next));
+            w.write_all(&wtns_root(&wtns_next))?;
             for _ in 0..ood_rec {
                 let z = ch.sample_f128_vec(n_next);
                 let eq_z = build_eq_table(&z);

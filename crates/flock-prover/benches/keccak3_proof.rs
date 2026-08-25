@@ -236,14 +236,18 @@ fn bench_3wide_report(n_keccaks: usize, n_runs: usize) {
             .expect("verify failed");
         println!("  verify: {}", fmt_ms(t.elapsed().as_secs_f64()));
 
-        let bundle = flock_prover::proof_io::R1csProofBundleLigerito { commitment, proof };
-        let proof_size = bundle.to_bytes().len();
+        // keccak3 still emits the padded-commit proof type; size it directly
+        // (the R1cs bundle flavor carries merged union proofs since v21).
+        let proof_size = bincode::serialize(&proof).map(|b| b.len()).unwrap_or(0)
+            + bincode::serialize(&commitment)
+                .map(|b| b.len())
+                .unwrap_or(0);
         println!(
             "  proof size: {} bytes ({:.2} KiB)",
             proof_size,
             proof_size as f64 / 1024.0
         );
-        black_box(&bundle);
+        black_box(&proof);
     }
 
     // Inline per-phase breakdown of the *real* Ligerito prover (witness gen +

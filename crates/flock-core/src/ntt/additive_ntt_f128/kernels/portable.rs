@@ -45,6 +45,59 @@ pub(super) fn butterfly_fused_2layer(
     }
 }
 
+/// Fused THREE-layer butterfly over one 8-row group, all interleaved lanes.
+/// Row k of the group is `rows[k]`; layer L pairs (k, k+4) @ `t0`, layer L+1
+/// pairs (k, k+2) within each half @ `t1[half]`, layer L+2 pairs (k, k+1)
+/// within each quarter @ `t2[quarter]`. Scalar per lane ON PURPOSE — the
+/// field muls ILP through the compiler (the explicit-batching regression),
+/// and 8 values + 7 twiddles in flight stays far from the register pressure
+/// that sank the generic 16-point kernel on aarch64.
+#[inline]
+pub(super) fn butterfly_fused_3layer(
+    rows: [&mut [F128]; 8],
+    t0: F128,
+    t1: &[F128; 2],
+    t2: &[F128; 4],
+) {
+    #[inline(always)]
+    fn bf(v: &mut [F128; 8], u: usize, w: usize, t: F128) {
+        let nu = v[u] + v[w] * t;
+        v[w] += nu;
+        v[u] = nu;
+    }
+    let [r0, r1, r2, r3, r4, r5, r6, r7] = rows;
+    debug_assert!(
+        [&r1, &r2, &r3, &r4, &r5, &r6, &r7]
+            .iter()
+            .all(|r| r.len() == r0.len())
+    );
+    for lane in 0..r0.len() {
+        let mut v = [
+            r0[lane], r1[lane], r2[lane], r3[lane], r4[lane], r5[lane], r6[lane], r7[lane],
+        ];
+        bf(&mut v, 0, 4, t0);
+        bf(&mut v, 1, 5, t0);
+        bf(&mut v, 2, 6, t0);
+        bf(&mut v, 3, 7, t0);
+        bf(&mut v, 0, 2, t1[0]);
+        bf(&mut v, 1, 3, t1[0]);
+        bf(&mut v, 4, 6, t1[1]);
+        bf(&mut v, 5, 7, t1[1]);
+        bf(&mut v, 0, 1, t2[0]);
+        bf(&mut v, 2, 3, t2[1]);
+        bf(&mut v, 4, 5, t2[2]);
+        bf(&mut v, 6, 7, t2[3]);
+        r0[lane] = v[0];
+        r1[lane] = v[1];
+        r2[lane] = v[2];
+        r3[lane] = v[3];
+        r4[lane] = v[4];
+        r5[lane] = v[5];
+        r6[lane] = v[6];
+        r7[lane] = v[7];
+    }
+}
+
 #[inline]
 pub(super) fn butterfly_fused_4layer(values: &mut [F128; 16], twiddles: &[F128; 15]) {
     #[inline(always)]

@@ -178,8 +178,9 @@ impl AdditiveNttF128 {
     /// (same `self.twiddle(layer, block)` is applied to every lane at the
     /// corresponding butterfly).
     ///
-    /// `num_ntts` must be a positive power of 2. `data.len()` must equal
-    /// `(1 << log_d) * num_ntts` for some `log_d ≤ log_domain_size()`.
+    /// `num_ntts` must be a positive integer (need NOT be a power of two — the
+    /// integer-lane commit path passes an arbitrary `t`). `data.len()` must
+    /// equal `(1 << log_d) * num_ntts` for some `log_d ≤ log_domain_size()`.
     ///
     /// This produces the SAME RS code per lane as `forward_transform`, with
     /// FRI-compatible twiddles. The SoA layout is what makes each Merkle leaf
@@ -204,12 +205,47 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         start_layer: usize,
     ) {
-        assert!(num_ntts.is_power_of_two() && num_ntts > 0);
+        self.forward_transform_interleaved_live_from_layer(data, num_ntts, num_ntts, start_layer);
+    }
+
+    /// [`Self::forward_transform_interleaved_from_layer`] transforming only
+    /// the FIRST `live` lanes of every position; lanes `live..num_ntts` must
+    /// be IDENTICALLY ZERO on entry. Zero is a fixed point of the butterfly
+    /// (`u = 0, v = 0 → (0, 0)`), so the bounded transform leaves the buffer
+    /// byte-identical to what the full transform would produce — it skips
+    /// the arithmetic and memory traffic of lanes whose codeword is already
+    /// in place. This is the integer-lane commit's DEAD-LANE SKIP: a pinned
+    /// lane count above the content's (the envelope's `lanes*`) commits
+    /// trailing all-zero lanes, and their encode is free.
+    pub fn forward_transform_interleaved_live_from_layer(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        live: usize,
+        start_layer: usize,
+    ) {
+        // `num_ntts` may be any positive integer (integer-lane commit): the
+        // per-lane butterfly kernels iterate over the lane stride, and the
+        // SIMD kernels handle the `num_ntts % SIMD_WIDTH` tail lanes with the
+        // portable path. Only `n_total / num_ntts` (the per-lane length) must
+        // be a power of two.
+        assert!(num_ntts > 0);
+        assert!(live <= num_ntts, "live lanes are a prefix of the stride");
         let n_total = data.len();
         assert_eq!(n_total % num_ntts, 0);
         let log_d = log2_pow2(n_total / num_ntts);
         assert!(log_d <= self.log_domain_size());
         assert!(start_layer <= log_d);
+        debug_assert!(
+            live == num_ntts
+                || data
+                    .chunks_exact(num_ntts)
+                    .all(|row| row[live..].iter().all(|w| w.is_zero())),
+            "dead lanes must be identically zero"
+        );
+        if live == 0 {
+            return; // an all-zero message's codeword is already in place
+        }
 
         // Scalar; SIMD/parallel variants below dispatch from `forward_transform_interleaved`
         // on supported targets.
@@ -218,14 +254,14 @@ impl AdditiveNttF128 {
             all(target_arch = "x86_64", target_feature = "pclmulqdq"),
         ))]
         {
-            self.forward_transform_interleaved_parallel_from_layer(data, num_ntts, start_layer);
+            self.interleaved_parallel_live_from_layer(data, num_ntts, live, start_layer);
         }
         #[cfg(not(any(
             all(target_arch = "aarch64", target_feature = "aes"),
             all(target_arch = "x86_64", target_feature = "pclmulqdq"),
         )))]
         {
-            self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
+            self.interleaved_scalar_live_from_layer(data, num_ntts, live, start_layer);
         }
     }
 
@@ -240,6 +276,19 @@ impl AdditiveNttF128 {
         &self,
         data: &mut [F128],
         num_ntts: usize,
+        start_layer: usize,
+    ) {
+        self.interleaved_scalar_live_from_layer(data, num_ntts, num_ntts, start_layer);
+    }
+
+    /// Scalar interleaved forward NTT over the first `live` lanes of the
+    /// `num_ntts`-lane stride (dead lanes stay untouched — they must be zero,
+    /// see [`Self::forward_transform_interleaved_live_from_layer`]).
+    fn interleaved_scalar_live_from_layer(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        live: usize,
         start_layer: usize,
     ) {
         let n_total = data.len();
@@ -258,7 +307,7 @@ impl AdditiveNttF128 {
                 for row in 0..block_size_half {
                     let off_top = block_start + row * num_ntts;
                     let off_bot = off_top + block_size_half * num_ntts;
-                    for lane in 0..num_ntts {
+                    for lane in 0..live {
                         let v = data[off_bot + lane];
                         let new_u = data[off_top + lane] + v * twiddle;
                         data[off_top + lane] = new_u;
@@ -297,6 +346,23 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         start_layer: usize,
     ) {
+        self.interleaved_parallel_live_from_layer(data, num_ntts, num_ntts, start_layer);
+    }
+
+    /// Parallel interleaved forward NTT over the first `live` lanes (dead
+    /// lanes stay untouched — they must be zero, see
+    /// [`Self::forward_transform_interleaved_live_from_layer`]).
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    fn interleaved_parallel_live_from_layer(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        live: usize,
+        start_layer: usize,
+    ) {
         use rayon::prelude::*;
         let n_total = data.len();
         let log_d = log2_pow2(n_total / num_ntts);
@@ -307,7 +373,13 @@ impl AdditiveNttF128 {
         // num_ntts=32: 2^12 positions. (Without this scaling, sub-groups at
         // num_ntts=32 would be 64 MB and overflow L2 cache.)
         const TARGET_SUBGROUP_LOG_BYTES: usize = 21;
-        let log_bytes_per_position = 4 + log2_pow2(num_ntts);
+        // `num_ntts` need not be a power of two (integer-lane commit). Round the
+        // lane count UP to a power of two for the cache-blocking heuristic so an
+        // integer `t` blocks exactly like the padded `2^ceil(log2 t)` (measured:
+        // this recovers the full per-lane efficiency — a floor-log2 here left
+        // t=46 with oversized 3 MB sub-groups and ~15% slower than ideal). Only
+        // affects the sub-group SIZE (a tuning knob), never correctness.
+        let log_bytes_per_position = 4 + ceil_log2(num_ntts);
         let target_log_positions = TARGET_SUBGROUP_LOG_BYTES.saturating_sub(log_bytes_per_position);
         let cache_n_top = log_d.saturating_sub(target_log_positions);
 
@@ -335,7 +407,7 @@ impl AdditiveNttF128 {
             cache_n_top
         };
         if n_top == 0 || log_d < 8 {
-            self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
+            self.interleaved_scalar_live_from_layer(data, num_ntts, live, start_layer);
             return;
         }
 
@@ -354,11 +426,21 @@ impl AdditiveNttF128 {
         // (x86 AVX-512). On other targets the 16-point kernel falls back to
         // scalar, which is slower than the NEON fused-2 path — so keep fused-2
         // there. NEON fused-4 is a future addition.
-        let fused4_ok = cfg!(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq"
-        ));
+        // The fused-4 kernel walks rows through raw pointers with its own
+        // offset math; the dead-lane skip keeps to the slice-based kernels,
+        // so a bounded transform takes the fused-3/2/block route instead.
+        let fused4_ok = live == num_ntts
+            && cfg!(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ));
+        // Fused-3 (8-point): the aarch64 middle tier — a third fewer full-
+        // buffer passes than fused-2 on the layers it covers, with 8 values
+        // + 7 twiddles in flight (the 16-point kernel's register pressure is
+        // what lost on this target). `FLOCK_NTT_NO_FUSED3=1` disables — the
+        // A/B knob.
+        let fused3_ok = std::env::var_os("FLOCK_NTT_NO_FUSED3").is_none();
         let mut layer = start_layer.min(n_top);
         while layer < n_top {
             let num_blocks = 1usize << layer;
@@ -390,6 +472,34 @@ impl AdditiveNttF128 {
                     );
                 }
                 layer += 4;
+            } else if fused3_ok && layer + 2 < n_top && block_size >= 8 {
+                // Fuse three layers (layer..layer+3): 8-point butterflies,
+                // one read+write pass where fused-2 alternation needs 1.5.
+                let eighth = block_size >> 3;
+                for block in 0..num_blocks {
+                    let t0 = self.twiddle(layer, block);
+                    let t1 = [
+                        self.twiddle(layer + 1, 2 * block),
+                        self.twiddle(layer + 1, 2 * block + 1),
+                    ];
+                    let t2 = [
+                        self.twiddle(layer + 2, 4 * block),
+                        self.twiddle(layer + 2, 4 * block + 1),
+                        self.twiddle(layer + 2, 4 * block + 2),
+                        self.twiddle(layer + 2, 4 * block + 3),
+                    ];
+                    let start = block * block_bytes;
+                    butterfly_interleaved_fused_3layer_par_rows(
+                        &mut data[start..start + block_bytes],
+                        t0,
+                        t1,
+                        t2,
+                        eighth,
+                        num_ntts,
+                        live,
+                    );
+                }
+                layer += 3;
             } else if layer + 1 < n_top && block_size >= 4 {
                 // Fuse layers (layer, layer+1).
                 let quarter = block_size >> 2;
@@ -405,6 +515,7 @@ impl AdditiveNttF128 {
                         t_inner_b,
                         quarter,
                         num_ntts,
+                        live,
                     );
                 }
                 layer += 2;
@@ -418,6 +529,7 @@ impl AdditiveNttF128 {
                         t,
                         block_size_half,
                         num_ntts,
+                        live,
                     );
                 }
                 layer += 1;
@@ -460,7 +572,7 @@ impl AdditiveNttF128 {
                                 let block_start = block_in_sub * block_bytes;
                                 let block = &mut sub_data[block_start..block_start + block_bytes];
                                 butterfly_interleaved_fused_2layer_serial(
-                                    block, t_outer, t_inner_a, t_inner_b, quarter, num_ntts,
+                                    block, t_outer, t_inner_a, t_inner_b, quarter, num_ntts, live,
                                 );
                             }
                             layer += 2;
@@ -476,6 +588,7 @@ impl AdditiveNttF128 {
                                     twiddle,
                                     block_size_half,
                                     num_ntts,
+                                    live,
                                 );
                             }
                             layer += 1;
@@ -528,6 +641,32 @@ impl AdditiveNttF128 {
                     let new_u = data[idx0] + v * twiddle;
                     data[idx0] = new_u;
                     data[idx1] = v + new_u;
+                }
+            }
+        }
+    }
+
+    /// Inverse of [`Self::forward_transform_scalar`]: evaluations back to
+    /// LCH-basis coefficients. Layers run in reverse with the same twiddles;
+    /// each butterfly inverts as `v = v' + u'; u = u' + v·twiddle`. In char 2
+    /// the additive butterfly is involutive up to this reordering, so no
+    /// scaling pass is needed.
+    pub fn inverse_transform_scalar(&self, data: &mut [F128]) {
+        let log_d = log2_pow2(data.len());
+        assert!(log_d <= self.log_domain_size());
+
+        for layer in (0..log_d).rev() {
+            let num_blocks = 1usize << layer;
+            let block_size_half = 1usize << (log_d - layer - 1);
+            for block in 0..num_blocks {
+                let twiddle = self.twiddle(layer, block);
+                let block_start = block << (log_d - layer);
+                for idx0 in block_start..(block_start + block_size_half) {
+                    let idx1 = idx0 | block_size_half;
+                    let u = data[idx0];
+                    let v = data[idx1] + u;
+                    data[idx0] = u + v * twiddle;
+                    data[idx1] = v;
                 }
             }
         }
@@ -786,11 +925,12 @@ fn butterfly_interleaved_block_par_rows(
     twiddle: F128,
     block_size_half: usize,
     num_ntts: usize,
+    live: usize,
 ) {
     use rayon::prelude::*;
     const PARALLEL_ROW_THRESHOLD: usize = 512;
     if block_size_half < PARALLEL_ROW_THRESHOLD {
-        butterfly_interleaved_block(block, twiddle, block_size_half, num_ntts);
+        butterfly_interleaved_block(block, twiddle, block_size_half, num_ntts, live);
         return;
     }
     let half_offset = block_size_half * num_ntts;
@@ -809,8 +949,86 @@ fn butterfly_interleaved_block_par_rows(
     top.par_chunks_mut(num_ntts)
         .zip(bot.par_chunks_mut(num_ntts))
         .for_each(|(top_row, bot_row)| {
-            kernels::butterfly_row_pair(top_row, bot_row, twiddle);
+            kernels::butterfly_row_pair(&mut top_row[..live], &mut bot_row[..live], twiddle);
         });
+}
+
+/// Fused 3-layer butterfly over one layer-L block: 8-point sub-butterflies,
+/// rows `r + k·eighth` for `k ∈ 0..8` per group. Layer L pairs at distance
+/// `4·eighth` (@ `t0`), L+1 at `2·eighth` (@ `t1[half]`), L+2 at `eighth`
+/// (@ `t2[quarter]`). One read+write pass over the block for three layers.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn butterfly_interleaved_fused_3layer_par_rows(
+    block: &mut [F128],
+    t0: F128,
+    t1: [F128; 2],
+    t2: [F128; 4],
+    eighth: usize,
+    num_ntts: usize,
+    live: usize,
+) {
+    use rayon::prelude::*;
+    const PARALLEL_ROW_THRESHOLD: usize = 256;
+    let stride = eighth * num_ntts;
+    debug_assert_eq!(block.len(), 8 * stride);
+
+    // Split the block into eight eighths, then zip row-wise: each task is
+    // one row-group index = 8 logical rows of work.
+    let (q0, rest) = block.split_at_mut(stride);
+    let (q1, rest) = rest.split_at_mut(stride);
+    let (q2, rest) = rest.split_at_mut(stride);
+    let (q3, rest) = rest.split_at_mut(stride);
+    let (q4, rest) = rest.split_at_mut(stride);
+    let (q5, rest) = rest.split_at_mut(stride);
+    let (q6, q7) = rest.split_at_mut(stride);
+
+    if eighth < PARALLEL_ROW_THRESHOLD {
+        for r in 0..eighth {
+            let o = r * num_ntts;
+            kernels::butterfly_fused_3layer(
+                [
+                    &mut q0[o..o + live],
+                    &mut q1[o..o + live],
+                    &mut q2[o..o + live],
+                    &mut q3[o..o + live],
+                    &mut q4[o..o + live],
+                    &mut q5[o..o + live],
+                    &mut q6[o..o + live],
+                    &mut q7[o..o + live],
+                ],
+                t0,
+                &t1,
+                &t2,
+            );
+        }
+    } else {
+        q0.par_chunks_mut(num_ntts)
+            .zip(q1.par_chunks_mut(num_ntts))
+            .zip(q2.par_chunks_mut(num_ntts))
+            .zip(q3.par_chunks_mut(num_ntts))
+            .zip(q4.par_chunks_mut(num_ntts))
+            .zip(q5.par_chunks_mut(num_ntts))
+            .zip(q6.par_chunks_mut(num_ntts))
+            .zip(q7.par_chunks_mut(num_ntts))
+            .for_each(|(((((((r0, r1), r2), r3), r4), r5), r6), r7)| {
+                kernels::butterfly_fused_3layer(
+                    [
+                        &mut r0[..live],
+                        &mut r1[..live],
+                        &mut r2[..live],
+                        &mut r3[..live],
+                        &mut r4[..live],
+                        &mut r5[..live],
+                        &mut r6[..live],
+                        &mut r7[..live],
+                    ],
+                    t0,
+                    &t1,
+                    &t2,
+                );
+            });
+    }
 }
 
 /// One quarter-row of the fused 2-layer butterfly, with the zero-twiddle
@@ -828,10 +1046,9 @@ fn fused_2layer_row_op(
     t_inner_a: F128,
     t_inner_b: F128,
     zero_block: bool,
-    num_ntts: usize,
 ) {
     if zero_block {
-        for lane in 0..num_ntts {
+        for lane in 0..row_a.len() {
             let a = row_a[lane];
             let b = row_b[lane];
             // Layer L with t_outer=0: a,b unchanged; c += a; d += b.
@@ -860,6 +1077,7 @@ fn butterfly_interleaved_fused_2layer_serial(
     t_inner_b: F128,
     quarter: usize,
     num_ntts: usize,
+    live: usize,
 ) {
     let stride = quarter * num_ntts;
     debug_assert_eq!(block.len(), 4 * stride);
@@ -874,7 +1092,14 @@ fn butterfly_interleaved_fused_2layer_serial(
         let (q3r, _) = q3[off..].split_at_mut(num_ntts);
         let (q4r, _) = q4[off..].split_at_mut(num_ntts);
         fused_2layer_row_op(
-            q1r, q2r, q3r, q4r, t_outer, t_inner_a, t_inner_b, zero_block, num_ntts,
+            &mut q1r[..live],
+            &mut q2r[..live],
+            &mut q3r[..live],
+            &mut q4r[..live],
+            t_outer,
+            t_inner_a,
+            t_inner_b,
+            zero_block,
         );
     }
 }
@@ -898,6 +1123,7 @@ fn butterfly_interleaved_fused_2layer_par_rows(
     t_inner_b: F128,
     quarter: usize,
     num_ntts: usize,
+    live: usize,
 ) {
     use rayon::prelude::*;
     const PARALLEL_ROW_THRESHOLD: usize = 256;
@@ -911,7 +1137,7 @@ fn butterfly_interleaved_fused_2layer_par_rows(
     let do_one =
         |row_a: &mut [F128], row_b: &mut [F128], row_c: &mut [F128], row_d: &mut [F128]| {
             fused_2layer_row_op(
-                row_a, row_b, row_c, row_d, t_outer, t_inner_a, t_inner_b, zero_block, num_ntts,
+                row_a, row_b, row_c, row_d, t_outer, t_inner_a, t_inner_b, zero_block,
             );
         };
 
@@ -929,7 +1155,12 @@ fn butterfly_interleaved_fused_2layer_par_rows(
             let (q2r, _) = q2[off..].split_at_mut(num_ntts);
             let (q3r, _) = q3[off..].split_at_mut(num_ntts);
             let (q4r, _) = q4[off..].split_at_mut(num_ntts);
-            do_one(q1r, q2r, q3r, q4r);
+            do_one(
+                &mut q1r[..live],
+                &mut q2r[..live],
+                &mut q3r[..live],
+                &mut q4r[..live],
+            );
         }
     } else {
         q1.par_chunks_mut(num_ntts)
@@ -937,7 +1168,12 @@ fn butterfly_interleaved_fused_2layer_par_rows(
             .zip(q3.par_chunks_mut(num_ntts))
             .zip(q4.par_chunks_mut(num_ntts))
             .for_each(|(((row_a, row_b), row_c), row_d)| {
-                do_one(row_a, row_b, row_c, row_d);
+                do_one(
+                    &mut row_a[..live],
+                    &mut row_b[..live],
+                    &mut row_c[..live],
+                    &mut row_d[..live],
+                );
             });
     }
 }
@@ -983,6 +1219,7 @@ fn butterfly_interleaved_block(
     twiddle: F128,
     block_size_half: usize,
     num_ntts: usize,
+    live: usize,
 ) {
     let off_bot = block_size_half * num_ntts;
     // Zero-twiddle fast path: block 0 of EVERY layer has twiddle 0
@@ -1019,11 +1256,7 @@ fn butterfly_interleaved_block(
     let (top, bot) = block.split_at_mut(off_bot);
     for r in 0..block_size_half {
         let o = r * num_ntts;
-        kernels::butterfly_row_pair(
-            &mut top[o..o + num_ntts],
-            &mut bot[o..o + num_ntts],
-            twiddle,
-        );
+        kernels::butterfly_row_pair(&mut top[o..o + live], &mut bot[o..o + live], twiddle);
     }
 }
 
@@ -1068,6 +1301,16 @@ fn log2_pow2(n: usize) -> usize {
         "length must be a positive power of 2"
     );
     n.trailing_zeros() as usize
+}
+
+/// Ceil of `log2(n)` for any `n ≥ 1` (`ceil_log2(1) = 0`). Used only by the
+/// cache-blocking heuristic for the interleaved transform, where `num_ntts`
+/// may be a non-power-of-two integer lane count — rounding up makes an integer
+/// `t` block exactly like the padded `2^ceil(log2 t)` power-of-two width.
+#[inline]
+fn ceil_log2(n: usize) -> usize {
+    debug_assert!(n >= 1);
+    n.next_power_of_two().trailing_zeros() as usize
 }
 
 #[cfg(test)]
@@ -1249,6 +1492,97 @@ mod tests {
                 assert_eq!(
                     v_par, v_scalar,
                     "interleaved parallel mismatch at log_d={log_d}, num_ntts={num_ntts}"
+                );
+            }
+        }
+    }
+
+    /// Oracle 2 (integer-lane encode correctness): the `t`-lane interleaved
+    /// encode of a dense buffer `D` (SoA stride `t`) is byte-identical, per
+    /// real lane, to the `2^k`-lane encode of the SAME data zero-padded in the
+    /// lane dimension (SoA stride `2^k`, top lanes zero). Covers the scalar and
+    /// the parallel/SIMD paths, and several non-power-of-two `t`.
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq")
+    ))]
+    #[test]
+    fn interleaved_integer_lanes_match_padded() {
+        let mut rng = Rng::new(0x1A6E_2026);
+        for log_d in [4usize, 8, 12, 14] {
+            let positions = 1usize << log_d;
+            for &t in &[1usize, 3, 5, 7, 13, 46, 63] {
+                let padded_lanes = t.next_power_of_two();
+                let ntt = AdditiveNttF128::standard(log_d);
+
+                // Dense t-lane buffer D[pos*t + lane].
+                let dense = rand_vec(&mut rng, positions * t);
+                // Zero-pad the lane dimension to `padded_lanes`.
+                let mut padded = vec![F128::ZERO; positions * padded_lanes];
+                for pos in 0..positions {
+                    for lane in 0..t {
+                        padded[pos * padded_lanes + lane] = dense[pos * t + lane];
+                    }
+                }
+
+                // Encode both (parallel path — exercises the SIMD tail-lane
+                // handling for non-power-of-two t).
+                let mut enc_t = dense.clone();
+                ntt.forward_transform_interleaved_parallel(&mut enc_t, t);
+                let mut enc_padded = padded.clone();
+                ntt.forward_transform_interleaved_parallel(&mut enc_padded, padded_lanes);
+
+                for pos in 0..positions {
+                    for lane in 0..t {
+                        assert_eq!(
+                            enc_t[pos * t + lane],
+                            enc_padded[pos * padded_lanes + lane],
+                            "lane {lane} pos {pos} diverged (log_d={log_d}, t={t})"
+                        );
+                    }
+                }
+
+                // The scalar path must agree with the parallel one too.
+                let mut enc_t_scalar = dense.clone();
+                ntt.forward_transform_interleaved_scalar(&mut enc_t_scalar, t);
+                assert_eq!(enc_t_scalar, enc_t, "scalar vs parallel (t={t})");
+            }
+        }
+    }
+
+    /// The DEAD-LANE SKIP oracle: a buffer whose trailing lanes are zero,
+    /// transformed with `live` bounded, is byte-identical to the full
+    /// transform (zeros are butterfly fixed points). Sizes above and below
+    /// the parallel thresholds; (24, 18) is the envelope internal's shape;
+    /// live = 0 is the all-zero degenerate; a nonzero start layer is the
+    /// commit path's replicate-fill entry.
+    #[test]
+    fn interleaved_live_skip_byte_identical() {
+        let mut rng = Rng::new(0x11FE_5C1B);
+        for log_d in [4usize, 8, 12, 14] {
+            let positions = 1usize << log_d;
+            for &(t, live) in &[(7usize, 4usize), (24, 18), (24, 23), (5, 0), (13, 13)] {
+                let ntt = AdditiveNttF128::standard(log_d);
+                let mut data = vec![F128::ZERO; positions * t];
+                for pos in 0..positions {
+                    for lane in 0..live {
+                        data[pos * t + lane] = rng.f128();
+                    }
+                }
+                let mut full = data.clone();
+                ntt.forward_transform_interleaved(&mut full, t);
+                let mut skip = data.clone();
+                ntt.forward_transform_interleaved_live_from_layer(&mut skip, t, live, 0);
+                assert_eq!(skip, full, "live skip (log_d={log_d}, t={t}, live={live})");
+                // Both sides from the same nonzero start layer: the bounded
+                // and full transforms must stay in lockstep there too.
+                let mut full2 = data.clone();
+                ntt.forward_transform_interleaved_from_layer(&mut full2, t, 2);
+                let mut skip2 = data.clone();
+                ntt.forward_transform_interleaved_live_from_layer(&mut skip2, t, live, 2);
+                assert_eq!(
+                    skip2, full2,
+                    "live skip from layer 2 (log_d={log_d}, t={t}, live={live})"
                 );
             }
         }

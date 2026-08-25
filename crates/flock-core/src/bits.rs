@@ -1,5 +1,19 @@
 //! Small bit-manipulation primitives shared across modules.
 
+/// Lowest set bit of `x`, or 0 if `x == 0` — i.e. `usize::isolate_lowest_one`.
+///
+/// Written out rather than calling the standard-library method on purpose.
+/// `isolate_lowest_one` only stabilized in Rust **1.97.0**, and the crate's
+/// `edition = "2024"` otherwise builds on anything from 1.85, so using it would
+/// silently raise the minimum toolchain by twelve releases for a two-instruction
+/// idiom. (It previously sat behind `#![feature(...)]`, which made the tree
+/// nightly-only, then a hard error on stable once the feature landed.) Do not
+/// "simplify" this back.
+#[inline(always)]
+pub fn lowest_one(x: usize) -> usize {
+    x & x.wrapping_neg()
+}
+
 /// Hacker's Delight (Sec. 7-3) 8×8 bit-matrix transpose stored in a `u64`.
 ///
 /// The input holds 8 bytes representing 8 rows of 8 bits each; the output holds
@@ -41,6 +55,25 @@ pub fn transpose_8_u64s_to_64_bytes(lanes: &[u64; 8], out: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`lowest_one`] against an independent `trailing_zeros` reference. Not
+    /// against `usize::isolate_lowest_one`: the whole point of the helper is
+    /// that the tree must build without that method, tests included.
+    #[test]
+    fn lowest_one_matches_trailing_zeros() {
+        assert_eq!(lowest_one(0), 0, "no set bit to isolate");
+        // The four call sites all work over 1..256; check that exhaustively,
+        // then the bit-width edges.
+        for x in 1usize..1024 {
+            assert_eq!(lowest_one(x), 1usize << x.trailing_zeros(), "x={x}");
+        }
+        for b in 0..usize::BITS {
+            let bit = 1usize << b;
+            assert_eq!(lowest_one(bit), bit, "single bit {b}");
+            // Higher bits set alongside must not change the answer.
+            assert_eq!(lowest_one(usize::MAX << b), bit, "MAX<<{b}");
+        }
+    }
 
     /// Scalar reference for [`transpose_8_u64s_to_64_bytes`] — test oracle only.
     #[allow(clippy::erasing_op, clippy::identity_op)]

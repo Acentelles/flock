@@ -95,6 +95,48 @@ int main(int argc, char** argv) {
                 }
                 samples++; break;
             }
+            case 9: { // sample_f256 + expected (c0, c1)
+                ChF128 e0 = rd_f128(f), e1 = rd_f128(f);
+                ChF256 got = ch.sample_f256();
+                if (!eq(got.c0, e0) || !eq(got.c1, e1)) { printf("SAMPLE_F256 op %u FAIL\n", op); return 1; }
+                samples++; break;
+            }
+            case 10: { // observe_f256
+                ChF128 c0 = rd_f128(f), c1 = rd_f128(f);
+                ch.observe_f256(ChF256{c0, c1}); break;
+            }
+            case 11: { // fused grind + scalar squeeze
+                uint32_t bits = rd_u32(f); uint64_t en = rd_u64(f); ChF128 er = rd_f128(f);
+                ChF128 got; uint64_t gn = ch.grind_pow_and_sample_f128(bits, &got);
+                if (gn != en || !eq(got, er)) { printf("GRIND_SAMPLE op %u (bits=%u) FAIL\n", op, bits); return 1; }
+                samples++; grinds++; break;
+            }
+            case 12: { // fused grind + vector squeeze
+                uint32_t bits = rd_u32(f), n = rd_u32(f); uint64_t en = rd_u64(f);
+                std::vector<ChF128> exp(n);
+                for (uint32_t i = 0; i < n; i++) exp[i] = rd_f128(f);
+                std::vector<ChF128> got(n);
+                uint64_t gn = ch.grind_pow_and_sample_f128_vec(bits, got.data(), n);
+                if (gn != en) { printf("GRIND_SAMPLE_VEC op %u nonce FAIL\n", op); return 1; }
+                for (uint32_t i = 0; i < n; i++) if (!eq(got[i], exp[i])) {
+                    printf("GRIND_SAMPLE_VEC op %u idx %u FAIL\n", op, i); return 1;
+                }
+                samples++; grinds++; break;
+            }
+            case 13: { // stratified query phase: grind + one vec squeeze + mapping
+                uint32_t bits = rd_u32(f), lbl = rd_u32(f), count = rd_u32(f);
+                uint64_t en = rd_u64(f);
+                std::vector<size_t> exp(count);
+                for (uint32_t i = 0; i < count; i++) exp[i] = (size_t)rd_u64(f);
+                std::vector<uint32_t> depths = stratified_depths(count, lbl);
+                std::vector<size_t> got;
+                uint64_t gn = grind_and_sample_stratified_queries(ch, bits, lbl, count, depths, got);
+                if (gn != en || got.size() != count) { printf("STRAT_QUERIES op %u FAIL (nonce/size)\n", op); return 1; }
+                for (uint32_t i = 0; i < count; i++) if (got[i] != exp[i]) {
+                    printf("STRAT_QUERIES op %u idx %u FAIL: got %zu exp %zu\n", op, i, got[i], exp[i]); return 1;
+                }
+                samples++; grinds++; break;
+            }
             default: printf("bad op_type %u\n", t); return 1;
         }
     }

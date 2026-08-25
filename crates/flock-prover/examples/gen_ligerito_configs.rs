@@ -3,13 +3,13 @@
 //! For each `m` in 22..=35 it mechanically derives the security config of
 //! all three named profiles via `LigeritoSecurityConfig::derive_profile`:
 //!
-//! - `fast`:   JohnsonOod, rate 1/2, η = 0.02, 100-bit overall soundness.
+//! - `fast`:   JohnsonOod, rate 1/2, η = 0.02, 128-bit query component.
 //! - `slim`:   JohnsonOod, rate 1/4, η = 0.02, 16-bit query grinding,
-//!             100-bit overall.
+//!             128-bit combined query work factor.
 //! - `secure`: Udr, rate 1/2, ε* = 1e-3, 120-bit overall.
 //!
-//! Each derived config is validated (including the whole-protocol union
-//! bound), serialized, round-trip checked, and written to
+//! Each derived config is validated against its per-component, round-by-round
+//! targets, serialized, round-trip checked, and written to
 //! `crates/flock-core/configs/ligerito/m<m>_<profile>.toml` (these are the
 //! configs `flock-core` embeds via `include_str!`).
 //!
@@ -22,7 +22,11 @@ use flock_prover::pcs::ligerito::{LigeritoProfile, LigeritoSecurityConfig};
 fn main() {
     let profiles = [
         LigeritoProfile::Fast,
+        LigeritoProfile::Fast100,
+        LigeritoProfile::Fast128,
         LigeritoProfile::Slim,
+        LigeritoProfile::Slim100,
+        LigeritoProfile::Slim128,
         LigeritoProfile::Secure,
     ];
     // Configs live in the flock-core crate (which embeds them via include_str!).

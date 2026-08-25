@@ -19,8 +19,9 @@
 #   all          — both (default).
 #   none         — clone/build only, run nothing (CI / setup-only).
 #
-# Closest Flock comparison (sequentially-dependent SHA-256 compressions):
-#   cargo bench --bench sha2_chain_proof
+# Closest Flock comparison (independent SHA-256 compressions; the
+# sequential-chain bench was retired with the chain product, 2026-08-14):
+#   cargo bench --bench sha2_proof
 #
 # Thread count: BENCH_THREADS is a comma-separated sweep list consumed by
 # Spartan2's bench harness (e.g. "1,4"). Defaults to the performance-core
@@ -105,7 +106,7 @@ echo "=== BENCH_THREADS=$BENCH_THREADS ($THREADS_NOTE) ==="
 BENCH="${SPARTAN_BENCH:-all}"
 
 run_spartan() {
-	echo "=== sha256_spartan: SHA-256 of 1/2 KiB preimage, T256HyraxEngine (cf. Flock sha2_chain_proof) ==="
+	echo "=== sha256_spartan: SHA-256 of 1/2 KiB preimage, T256HyraxEngine (cf. Flock sha2_proof; the chain bench is retired) ==="
 	RUSTFLAGS="-C target-cpu=native" BENCH_THREADS="$BENCH_THREADS" \
 		cargo bench --manifest-path "$DIR/Cargo.toml" --bench sha256_spartan \
 		${SPARTAN_FILTER:+-- "$SPARTAN_FILTER"}

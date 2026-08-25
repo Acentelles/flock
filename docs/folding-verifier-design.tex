@@ -1,0 +1,449 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1.1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xspace}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+
+% ---------------------------------------------------------------------------
+% Macros (shared with multi-table-design.tex, circuit-wiring-design.tex)
+% ---------------------------------------------------------------------------
+\newcommand{\F}{\mathbb{F}}
+\newcommand{\Ftwo}{\F_2}
+\newcommand{\eq}{\mathsf{eq}}
+\newcommand{\nnz}{\mathsf{nnz}}
+\newcommand{\ip}[2]{\langle #1, #2 \rangle}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\settled}[1]{\medskip\noindent\textbf{SETTLED} (#1).\xspace}
+
+\newtheorem{lemma}{Lemma}
+\newtheorem{remark}{Remark}
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+
+\title{Folding the Verifier's Matrix Work:\\ Deferred Claims, Accumulation, and How Recursion Closes\\[0.6ex]
+\large Design document --- working draft v0.1}
+\author{Flock}
+\date{July 31, 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Flock's lincheck verifier spends most of its time on a single quantity: a
+bilinear form in the base matrices $\alpha \hat A_0 + \hat B_0$ at a rank-1
+tensor point. It is $O(\nnz)$ --- ${\sim}21$M nonzeros for BLAKE3 --- and
+${\sim}84\%$ of verify. This document designs its removal from the verifier:
+the verifier stops evaluating it and instead \emph{emits} it as a claim, and
+claims about the (registry-static) matrices are \textbf{folded} into a
+constant-size accumulator that somebody discharges once, at the end.
+Natively this is not a speedup and is not meant to be --- folding $k$ claims
+costs the same $k\cdot\nnz$ as checking them. What it buys is an
+\textbf{asymmetry}: the fold's prover pays $O(\nnz)$, its verifier pays
+$O(\kappa)$ and reads no matrix at all. That is worth nothing outside a
+circuit and everything inside one, because arithmetising the matrix work
+directly is \emph{$\nnz$-preserving} --- the gadget's matrix \emph{is} the
+matrix it evaluates --- so a recursion circuit that pays it inline can never
+verify a proof of itself. Deferral plus folding is what makes the fixed
+point close. Everything here is implemented on the \code{folding\_verifier}
+branch and composed with the circuit layer on \code{recursion\_circuit},
+where a native merge node verifies two circuit proofs with their matrix work
+deferred and folds both children into one accumulator.
+\end{abstract}
+
+\tableofcontents
+
+% ===========================================================================
+\section{The problem}\label{sec:problem}
+
+\subsection{What the verifier actually spends its time on}
+
+The union lincheck's final consistency check is, per boolean type $t$,
+\[
+  \text{target} \;=\; \sum_t P_t\,w_t\bigl(\alpha\ip{W_t}{A_0^{(t)}} +
+  \ip{W_t}{B_0^{(t)}}\bigr) \;+\; \sum_t P_t\,\beta_t\,W^{\text{col}}_t[\text{pin}],
+\]
+where the weight $W_t = W^{\text{row}}_t \otimes W^{\text{col}}_t$ with
+\[
+  W^{\text{row}}_t = \lambda(z_{\text{skip}}) \otimes \eq(x_{\text{inner\_rest}}),
+  \qquad
+  W^{\text{col}}_t = z_{\text{partial}} \otimes \eq(rr),
+\]
+and $w_t, P_t, \beta_t$ are verifier-computable scalars (the slot prefix
+weights from the row point and the bound column point, and the const-pin
+challenge). Everything the verifier does \emph{except} those bilinear forms
+is succinct.
+
+\settled{measured, M30} The split is stark. Of the lincheck verify, the
+matrix work is essentially all of it: union-single $9.28/9.36$\,ms,
+union-two $19.26/19.34$, mixed (SHA-256 + BLAKE3) $10.15/10.23$. What
+remains succinct across the whole proof is ${\sim}1.9$\,ms, and it is
+dominated by the \emph{opening}, not the lincheck, whose succinct part is
+$0.08$\,ms.
+
+\subsection{Why it cannot simply be arithmetised}\label{sec:nnzpreserving}
+
+The obvious move for recursion --- express the matrix evaluation as gates
+--- fails for a structural reason worth stating precisely, because it is the
+whole justification for everything that follows.
+
+The comb is a \emph{linear} map, $\text{comb}[c] = \sum_r
+\eq_{\text{inner}}[r]\cdot M[r,c]$. In the element ($\F$-native) R1CS a
+linear map costs almost no multiplications and almost no area: one
+constraint per output, with the coefficients living in the $A_0$ matrix. Its
+entire cost appears as \textbf{matrix nonzeros} --- and the gadget computing
+it has matrix $M^{\mathsf T}$, so
+\[
+  \nnz(\text{gadget}) \;=\; \nnz(M).
+\]
+Arithmetising is $\nnz$-\emph{preserving}. Now impose self-recursion: the
+circuit $R$ must evaluate the comb of every table in the proof it verifies,
+which is a proof of $R$, so
+\[
+  \nnz(\text{comb gadget}) \;=\;
+  \nnz(\text{Merkle}) + \nnz(\text{FS}) + \nnz(\text{comb gadget}) + \cdots,
+\]
+which has no solution. Each recursion level adds the \emph{other} tables'
+$\nnz$ rather than converging.
+
+\begin{remark}[Constant factors do not help]
+Structural factorisation --- exploiting that a composite table is $k$
+aligned repeats of a base block, so its comb costs the base block's $\nnz$
+rather than $k$ times it --- is a large and worthwhile win natively
+(measured $15.5\times$ on the Merkle composite's verify). It does not change
+the recurrence above: it shrinks the increment, never making it zero. The
+requirement is \emph{sublinearity} in $\nnz$, which only a different
+mechanism provides.
+\end{remark}
+
+% ===========================================================================
+\section{Deferral}\label{sec:defer}
+
+\settled{implemented} The verifier stops discharging the matrix work and
+returns it.
+
+\code{lincheck::MatrixAssertion} carries exactly the residue: $\alpha$, the
+row weight's $(z_{\text{skip}}, x_{\text{inner\_rest}})$, the column
+weight's $(z_{\text{partial}}, rr)$, the pin $\beta$'s, and the target the
+weighted bilinear sum must equal. \code{verify\_union\_deferred} returns it
+alongside the witness claim; \code{verify\_union} is that followed by
+\code{MatrixAssertion::check}, so every existing caller is unchanged and the
+byte-identity fixtures still pass.
+
+\paragraph{Why this is a refactor and not a protocol change.} The combs are
+needed nowhere before the final consistency check, and building them touches
+the challenger not at all. Lifting them out therefore leaves the transcript
+byte-identical --- which is what let the split land under the existing
+anchors.
+
+\paragraph{The reported evaluations.} The verifier's final check is one
+equation in $2T$ unknowns, so it cannot recover the individual bilinear
+forms. The prover reports them: \code{LincheckProof::matrix\_evals} carries,
+per boolean type, the \textbf{unscaled} pair
+$\bigl(\ip{W_t}{A_0}, \ip{W_t}{B_0}\bigr)$. The verifier checks they
+reproduce the target using only its own scalars, then hands them out as
+claims.
+
+\settled{A and B stay separate} Only their $\alpha$-combination appears in
+the target, and $\alpha$ is per-proof --- so a claim about
+$\alpha A_0 + B_0$ would name a \emph{different polynomial in every proof}
+and could never fold with its neighbours. Claims about $A_0$ and $B_0$
+individually name registry-static matrices and fold forever.
+
+\paragraph{Both classes.} The element class defers identically
+(\code{element\_r1cs::union::verify\_deferred} $\to$
+\code{ElementAssertion}). Element combs are small, which is beside the
+point: \S\ref{sec:nnzpreserving} does not care about size. Element weights
+are simpler --- plain $\eq \otimes \eq$, since the element PIOP has no
+univariate skip and hence no $\lambda$ factor.
+
+\begin{remark}[$z_{\text{eval}} = 0$]
+The element relation is $\text{running} = \widehat{\text{Comb}}(r_{\text{col}})
+\cdot z_{\text{eval}}$. Stating the assertion by dividing out
+$z_{\text{eval}}$ is wrong exactly when it is zero (an all-dummy instance),
+where the relation constrains the matrices not at all --- an honest empty
+proof gets rejected. The assertion therefore carries both sides and checks
+$\widehat{\text{Comb}} \cdot z_{\text{eval}} = \text{running}$: no special
+case, no inversion.
+\end{remark}
+
+% ===========================================================================
+\section{The fold}\label{sec:fold}
+
+A claim is $\sum_{r,c} \text{row}(r)\,\text{col}(c)\,M[r,c] = v$ for
+structured weights. \code{matrix\_fold::Weight} is one shape,
+$\text{low} \otimes \eq(\text{point})$, covering both what the lincheck
+produces ($\lambda \otimes \eq$, $z_{\text{partial}} \otimes \eq$) and what a
+folded claim carries (plain $\eq$) --- which is what lets a fold's output
+feed straight back in.
+
+\subsection{Two sumchecks, in this order}
+
+$k$ claims about one $M$ fold to one:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Column.} With $\text{comb}_i(c) = \sum_r
+        \text{row}_i(r) M[r,c]$, each claim reads
+        $\sum_c \text{col}_i(c)\,\text{comb}_i(c) = v_i$. A degree-2
+        sumcheck on the $\lambda$-combination binds every claim to one
+        shared $\rho_{\text{col}}$; the prover then sends the $k$ bridge
+        values $\text{comb}_i(\rho_{\text{col}})$.
+  \item \textbf{Row.} Because $\rho_{\text{col}}$ is now shared, every
+        bridge value reads against the \emph{same}
+        $h(r) = \hat M(r, \rho_{\text{col}})$ --- so the row side collapses
+        to a single $\mu$-combined sumcheck landing on
+        $\hat M(\rho_{\text{row}}, \rho_{\text{col}})$.
+\end{enumerate}
+
+The output is a plain evaluation claim, which folds again by the same
+machinery.
+
+\settled{the order is load-bearing} The $k$ per-claim marginals are the
+dominant $k\cdot\nnz$ cost, and \emph{which kind} they are is decided by
+which phase runs first. Column-first makes them \textbf{column} marginals,
+which is exactly what \code{LincheckCircuit::fold\_split} computes with each
+type's tuned walker/CSC kernel. Row-first would make them row marginals,
+which no tuned kernel provides. Only the single shared marginal of step 2
+touches the raw matrix.
+
+\begin{remark}[Why fresh $\mu$]
+The bridge values are prover-supplied. Reporting them
+$\lambda$-consistently but individually wrong shifts the column sumcheck's
+target, so the error lands in the output claim --- where the root discharge
+catches it. That is the accumulation property: \textbf{if any input claim is
+false, the output claim is false with overwhelming probability.}
+\end{remark}
+
+\subsection{Nothing is committed}
+
+The claims are about \emph{public, registry-static} polynomials, so the
+accumulated claim at the root is discharged by direct evaluation in the
+clear. No sparse-matrix commitment, no preprocessing, no verification key
+--- which is the SPARK-style delegation this design replaces.
+
+\subsection{Sumcheck prover cost}
+
+\settled{measured, BLAKE3 $k_{\log}=14$, 21M nonzeros, 14 threads} The fold
+$+$ discharge went $66.6 \to 10.8$\,ms across three changes, each with a
+distinct cause: interleaving the $k$ column weights so a nonzero costs one
+contiguous $k$-wide read instead of $k$ scattered ones, and parallelising
+both generic passes ($66.6 \to 25.1$); the phase order above, putting the
+$k\cdot\nnz$ work on the tuned kernels ($25.1 \to 15.9$); and a one-pass
+\code{fold\_split} ($15.9 \to 10.8$).
+
+That last one is worth recording: the default \code{fold\_split} walked the
+nonzeros \emph{twice} (\code{fold\_alpha\_batched} at $\alpha = 0$ and
+$\alpha = 1$) to separate the two marginals. Both real implementations
+already form them apart internally and only mix at the end, so keeping them
+apart is strictly \emph{less} work --- the same walk without the per-column
+multiply. Measured $2.258 \to 1.050$\,ms, faster than a single
+$\alpha$-batched fold.
+
+What remains is near the floor: $k\cdot\nnz$ for the per-claim marginals
+(${\sim}4.2$\,ms), one row marginal per fold (${\sim}2.6$\,ms, the direction
+no tuned kernel provides), and the discharge (${\sim}2.8$\,ms, which a merge
+node does not pay --- the root discharges once for the whole tree).
+
+% ===========================================================================
+\section{Accumulation}\label{sec:accum}
+
+\code{aggregate::Accumulator} holds one $(A_0, B_0)$ claim pair per type,
+in two groups --- boolean and element --- tied to a registry digest.
+
+\settled{the key is $(\text{registry}, \text{type}, \text{matrix})$} All
+three components separate claims that name different polynomials, and
+folding across any of them would be meaningless. The digest covers the
+first; the class split the second; $A$/$B$ the third. An accumulator from a
+different registry is rejected, not silently folded.
+
+\paragraph{How many claims per fold.} Within one accumulator:
+
+\begin{center}
+\begin{tabular}{lccl}
+\toprule
+node & inherited & fresh & fold \\
+\midrule
+leaf over two base proofs & 0 & 2 & $2\to1$ \\
+$2\to1$ merge of two recursive proofs & 2 & 2 & $4\to1$ \\
+$1\to1$ self-recursion & 1 & 1 & $2\to1$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\emph{Fresh} is what succinctly verifying a child emits; \emph{inherited} is
+the accumulator the child already carried, which the merge cannot discharge
+(that is the $O(\nnz)$ it is avoiding) and so carries forward.
+
+\paragraph{Constant size.} After a fold, a claim's weights are plain $\eq$,
+so it is $(\rho_{\text{row}}, \rho_{\text{col}}, v)$ --- $2\kappa+1$ field
+elements. The accumulator is independent of tree depth and of how many
+proofs have been folded in: depth 1 and depth 20 carry the same few
+kilobytes. That is what makes unbounded aggregation possible.
+
+\paragraph{An API that cannot be misused.} \code{verify\_aggregate} runs
+each assertion's \code{check\_reported} itself, so the step tying a proof's
+reported matrix work \emph{to that proof} cannot be forgotten by a caller.
+
+% ===========================================================================
+\section{Merge composition, and why recursion closes}\label{sec:merge}
+
+A recursive proof is $\pi = (p, \alpha)$: \emph{$p$ attests to the
+statement, assuming the accumulated claims $\alpha$ are true.}
+
+Merging $\pi_1, \pi_2$: the merge circuit succinctly verifies both children
+(emitting fresh claims $\beta^1, \beta^2$), folds
+$\{\alpha^1, \alpha^2, \beta^1, \beta^2\}$ per (type, matrix), and outputs
+the folded $\alpha$ as a public output.
+
+\begin{lemma}[The invariant]
+$\pi = (p, \alpha)$ is valid iff $p$ succinctly verifies and $\alpha$ is
+true; and the merge preserves it.
+\end{lemma}
+
+Verifying child $p_1$ leaves two debts --- the one it just created
+($\beta^1$, its own lincheck's matrix evaluation) and the one it arrived
+with ($\alpha^1$, everything beneath it). Folding all four covers the entire
+subtree. Neither can be dropped: discharging $\alpha$ costs the $O(\nnz)$
+the design exists to avoid, and ignoring $\beta$ lets the child's lincheck
+go unchecked. The debt telescopes, so whoever discharges the root's $\alpha$
+retroactively validates every lincheck in the tree.
+
+\paragraph{Where the fold transcript lives.} It is \textbf{witness} to the
+merge circuit. The fold's prover runs natively, before the circuit exists;
+its transcript enters as witness, is hashed by the circuit's own FS gadget
+to derive $\lambda, \mu, \rho$, and is \emph{consumed} there. It never
+appears in the output proof --- the verifier of $\pi$ checks $p$, which
+already attests the fold was replayed correctly. That is what preserves the
+shape: proof plus accumulator in, proof plus accumulator out.
+
+Folding \emph{outside} and appending the transcript does not close: the
+proof grows by a fold transcript per level, unless the next level's circuit
+consumes it --- which is this design again.
+
+\paragraph{Why $\alpha$ and $\beta$ fold together.} They are the same kind
+of object, differing in weight shape ($\beta$ is $\lambda \otimes \eq$
+fresh from a lincheck; $\alpha$ is plain $\eq \otimes \eq$ from a previous
+fold), in provenance ($\beta$ is derived now from the child's challenges,
+$\alpha$ arrives as public state), and in scope ($\beta$ is the child's own
+lincheck, $\alpha$ is everything beneath it). What they share is the matrix
+they name --- under self-recursion every proof is of the same circuit, hence
+the same registry.
+
+\begin{remark}[Two registries, not one]
+At level $\ge 2$ they may name \emph{different} registries: the merge
+circuit verifying two \emph{base} proofs emits $\beta$ about the application
+circuit's matrices, while at the next level $\beta$ is about the merge
+circuit's own and the inherited $\alpha$ is still about the application's.
+The groups fold independently and the slot set stabilises at two registries
+--- so the accumulator stays constant-size, roughly double a single
+registry's.
+\end{remark}
+
+\paragraph{Cost.} In-circuit, each fold verifier is $2\kappa$ sumcheck
+rounds ($\kappa$ row $+$ $\kappa$ column: the matrix is
+$2^\kappa \times 2^\kappa$, square because $C = I$), ${\approx}38$ for the
+Merkle composite, plus a few weight evaluations. Its transcript is $4\kappa$
+field elements (${\sim}1.2$\,KB), so absorbing it costs ${\sim}20$ BLAKE3
+compressions against a ${\sim}10$k budget. The recurrence's increment drops
+from ${\sim}42$M to a few hundred constraints, and converges.
+
+\begin{remark}[Two phases, not one sumcheck]
+The full matrix domain is $2^{2\kappa}$ --- $2^{38}$ for the Merkle
+composite --- and nothing can materialise it. Splitting into row and column
+phases means the prover only ever touches length-$2^\kappa$ vectors, so
+sparsity is exploited by the \emph{structure of the reduction} rather than
+by a sparse-polynomial commitment.
+\end{remark}
+
+% ===========================================================================
+\section{What this does \emph{not} buy}\label{sec:notbuy}
+
+\settled{measured, and it retracts an earlier claim} Native batch
+verification is \textbf{not} faster --- it is several times slower. At
+$N = 4$ BLAKE3 proofs: $9.4$\,ms of ordinary verifies against $71$\,ms of
+deferred-verify-plus-fold (later $23$\,ms after the fold optimisations, still
+slower).
+
+The reason is structural. Folding $k$ claims costs $k \cdot \nnz$, because
+the fold builds one marginal per claim --- exactly what checking those $k$
+claims directly costs --- with the discharge on top. No random-linear-
+combination avoids it: the combined weight is a sum of $k$ rank-1 terms, so
+every nonzero still needs $k$ multiplications. \emph{$k$ claims at $k$
+distinct points cost $k$ passes over the matrix, full stop.}
+
+What survives is the asymmetry, and it is worth only one thing: the fold's
+\textbf{prover} pays the $k\cdot\nnz$; its \textbf{verifier} pays
+$O(\kappa)$ and reads no matrix. That moves the matrix work from inside a
+circuit --- where it is $\nnz$-preserving and the fixed point cannot close
+--- to a native prover, where it is ordinary.
+
+% ===========================================================================
+\section{Implementation status}\label{sec:status}
+
+On \code{folding\_verifier} (downstream of \code{multitable}), composed with
+the circuit layer on \code{recursion\_circuit}:
+
+\begin{itemize}[nosep]
+  \item \code{lincheck::MatrixAssertion} $+$ \code{verify\_union\_deferred};
+        \code{verify\_union} is the composition. Byte fixtures re-pinned for
+        the \code{matrix\_evals} report.
+  \item \code{element\_r1cs::union::verify\_deferred} $+$
+        \code{ElementAssertion} --- both classes defer.
+  \item \code{matrix\_fold}: \code{Weight}, \code{MatrixClaim},
+        \code{FoldMatrix} (spanning $\Ftwo$ supports and $\F$-coefficient
+        matrices), \code{prove\_fold} / \code{verify\_fold},
+        \code{bilinear} / \code{check\_direct}.
+  \item \code{aggregate}: \code{Accumulator} (boolean $+$ element groups,
+        registry digest), \code{prove\_aggregate\_classes} /
+        \code{verify\_aggregate\_classes}, \code{discharge}.
+  \item Deferred verify entries at proof level, for the union and (merged
+        only) for circuits.
+  \item A native merge node: two circuit proofs verified deferred, both
+        children folded into one accumulator, discharged once
+        (\code{a\_merge\_node\_folds\_two\_circuit\_proofs}).
+\end{itemize}
+
+\paragraph{Tests worth knowing about.} The differential oracles are the
+load-bearing ones: an honest fold's \emph{output} is itself true
+(\code{check\_direct} against the real matrix), so an accumulator can be
+believed at the root; the reported evaluations recombine to the comb the
+verifier used to build itself, so deferring changed what is \emph{computed}
+and not what is \emph{checked}; and both transports carry the same claim set
+while their openings differ.
+
+\begin{remark}[A recurring test-writing mistake]
+Twice I asserted that a tampered input makes the \emph{prover's}
+accumulator false. It does not: \code{prove\_fold} computes its output from
+the real matrix, so the prover's claim is honest regardless of what the
+input claims said. It is the \emph{verifier's} accumulator that is
+conditional on them. Relatedly, a tampered fold may be caught by outright
+rejection \emph{or} by a false accumulator --- both sound, so an assertion
+must accept either, and the property is always about the verifier's side.
+\end{remark}
+
+% ===========================================================================
+\section{Open questions}\label{sec:open}
+
+\begin{enumerate}[nosep]
+  \item \textbf{Element-only proofs over the merged transport} ---
+        \code{prove\_batched\_padded\_with\_precomputed} asserts at least one
+        ring-switched claim, so a proof with no boolean class cannot use it.
+        Small and isolated.
+  \item \textbf{A row-marginal kernel per table type} would close the last
+        generic pass in the fold (${\sim}2.6$\,ms of ${\sim}10.8$). Worth it
+        only if merge-prover time becomes the constraint --- a merge also
+        generates a full proof, which will dwarf it.
+  \item \textbf{The jagged remainder} (see the circuit-wiring document): the
+        merged transport's verifier delegates its jagged-composed weight
+        evaluation via the Frobenius assist, which is column-linear. Now
+        that element and circuit proofs ride the merged path, it is no
+        longer avoidable by choosing a transport.
+  \item \textbf{Structural factorisation of the base blocks} --- a constant
+        factor, not a fix (\S\ref{sec:nnzpreserving}), but it cheapens the
+        fold's prover, which every merge node pays.
+\end{enumerate}
+
+\end{document}

@@ -72,6 +72,20 @@ pub(super) fn butterfly_fused_2layer(
     portable::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
 }
 
+/// Fused three-layer (8-point) butterfly over one row group. Portable on
+/// every target: the kernel is deliberately scalar-per-lane (compiler ILP —
+/// see the fused-2 lane-batching regression note) and the x86 AVX-512 path
+/// prefers fused-4, so this branch fires there only on remnant block sizes.
+#[inline]
+pub(super) fn butterfly_fused_3layer(
+    rows: [&mut [F128]; 8],
+    t0: F128,
+    t1: &[F128; 2],
+    t2: &[F128; 4],
+) {
+    portable::butterfly_fused_3layer(rows, t0, t1, t2);
+}
+
 /// Process one fused-four-layer row group across every interleaved NTT lane.
 ///
 /// # Safety

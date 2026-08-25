@@ -54,12 +54,12 @@ if [[ "$MT_THREADS" != "1" ]]; then
 fi
 
 lookup() {
-	local hash="$1" layout="$2" batch="$3" threads="$4"
+	local hash="$1" batch="$2" threads="$3"
 	awk -F '\t' \
-		-v hash="$hash" -v layout="$layout" -v batch="$batch" -v threads="$threads" \
-		'$1 == "RESULT" && $2 == hash && $3 == layout && $4 == batch && $5 == threads {
+		-v hash="$hash" -v batch="$batch" -v threads="$threads" \
+		'$1 == "RESULT" && $2 == hash && $3 == batch && $4 == threads {
 			found = 1
-			printf "%.1f", $7 / 1000
+			printf "%.1f", $6 / 1000
 			exit
 		}
 		END { if (!found) exit 1 }' "$results"
@@ -67,18 +67,16 @@ lookup() {
 
 echo
 echo "Throughput in thousands of hashes per second (k hashes/s; higher is better)."
-echo "| Hash | Batch | 1T row-major | 1T batch-major | ${MT_THREADS}T row-major | ${MT_THREADS}T batch-major |"
-echo "|---|---:|---:|---:|---:|---:|"
+echo "| Hash | Batch | 1T | ${MT_THREADS}T |"
+echo "|---|---:|---:|---:|"
 for hash_spec in "sha2:SHA-256" "blake3:BLAKE3" "keccak:Keccak-f[1600]"; do
 	hash="${hash_spec%%:*}"
 	label="${hash_spec#*:}"
 	for log2 in $LOG2S; do
 		batch="$((1 << log2))"
-		st_row="$(lookup "$hash" row-major "$batch" 1)"
-		st_batch="$(lookup "$hash" batch-major "$batch" 1)"
-		mt_row="$(lookup "$hash" row-major "$batch" "$MT_THREADS")"
-		mt_batch="$(lookup "$hash" batch-major "$batch" "$MT_THREADS")"
-		printf '| %s | %s | %s | %s | %s | %s |\n' \
-			"$label" "$batch" "$st_row" "$st_batch" "$mt_row" "$mt_batch"
+		st="$(lookup "$hash" "$batch" 1)"
+		mt="$(lookup "$hash" "$batch" "$MT_THREADS")"
+		printf '| %s | %s | %s | %s |\n' \
+			"$label" "$batch" "$st" "$mt"
 	done
 done

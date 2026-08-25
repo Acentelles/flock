@@ -221,20 +221,23 @@ impl BlockR1cs {
     // -----------------------------------------------------------------------
 
     /// Witness padding descriptor for URM / PCS work-skipping under this
-    /// layout. RowMajor: per-block useful prefix (padding interleaved at
-    /// each block's tail). BatchMajor: the padding chunk-columns coalesce
-    /// into ONE contiguous buffer suffix, expressed as a single giant block
-    /// (`k_log = m`) with a useful prefix.
+    /// layout. Both are single-run [`crate::zerocheck::PaddingSpec`]s tiling
+    /// the whole domain (the kernels' fast path). RowMajor: per-block useful
+    /// prefix (padding interleaved at each block's tail). BatchMajor: the
+    /// padding chunk-columns coalesce into ONE contiguous buffer suffix,
+    /// expressed as a single giant block (`k_log = m`) with a useful prefix.
     pub fn padding_spec(&self) -> crate::zerocheck::PaddingSpec {
         match self.layout {
-            WitnessLayout::RowMajor => crate::zerocheck::PaddingSpec {
-                k_log: self.k_log,
-                useful_bits_per_block: self.useful_bits,
-            },
-            WitnessLayout::BatchMajor => crate::zerocheck::PaddingSpec {
-                k_log: self.m,
-                useful_bits_per_block: self.useful_bits.div_ceil(128) << (7 + self.n_log()),
-            },
+            WitnessLayout::RowMajor => crate::zerocheck::PaddingSpec::uniform(
+                self.k_log,
+                self.useful_bits,
+                1usize << self.n_log(),
+            ),
+            WitnessLayout::BatchMajor => crate::zerocheck::PaddingSpec::uniform(
+                self.m,
+                self.useful_bits.div_ceil(128) << (7 + self.n_log()),
+                1,
+            ),
         }
     }
 
@@ -324,6 +327,33 @@ impl BlockR1cs {
         }
     }
 
+    /// Per-chunk-column heights (in packed words) of the committed witness's
+    /// jagged grid, for the jagged opening path
+    /// (`pcs::open_batch_merged`): `2^(k_log−7)` entries, the leading
+    /// `ceil(useful_bits/128)` equal to `2^n_log` (every declared row) and the
+    /// rest 0 (the padding chunk-columns, zero by the BatchMajor buffer
+    /// layout — see [`Self::padding_spec`]). Shared by the prover and verifier
+    /// wiring — any divergence is a transcript break, so both derive it here.
+    /// Requires the BatchMajor layout (`addr = [7 in-word | n_log batch |
+    /// k_log−7 chunk]`), whose packed-word suffix order `[batch | chunk]` is
+    /// what makes the chunk-columns the jagged grid's columns.
+    pub fn jagged_heights(&self) -> Vec<u64> {
+        assert_eq!(
+            self.layout,
+            WitnessLayout::BatchMajor,
+            "jagged_heights requires the BatchMajor witness layout"
+        );
+        assert!(self.k_log >= 7, "BatchMajor needs k_log >= 7");
+        let n_chunks = 1usize << (self.k_log - 7);
+        let useful_chunks = self.useful_bits.div_ceil(128);
+        debug_assert!(useful_chunks <= n_chunks);
+        let mut heights = vec![0u64; n_chunks];
+        for h in &mut heights[..useful_chunks] {
+            *h = 1u64 << self.n_log();
+        }
+        heights
+    }
+
     /// BLAKE3 hash of the R1CS instance (parameters + sparse matrices).
     /// Stable across runs; used to bind the Fiat-Shamir transcript to the
     /// statement being proved.
@@ -373,7 +403,10 @@ impl BlockR1cs {
 /// `(num_rows, num_cols, [(row_len, col_indices...) for each row])`, all
 /// little-endian u64, so two matrices with different shapes/contents always
 /// produce different states.
-fn absorb_matrix(h: &mut blake3::Hasher, m: &SparseBinaryMatrix) {
+///
+/// `pub(crate)` so [`crate::schedule::Registry::digest`] absorbs matrices
+/// with the exact same encoding rather than duplicating it.
+pub(crate) fn absorb_matrix(h: &mut blake3::Hasher, m: &SparseBinaryMatrix) {
     h.update(&(m.num_rows as u64).to_le_bytes());
     h.update(&(m.num_cols as u64).to_le_bytes());
     for row in &m.rows {
