@@ -65,6 +65,8 @@ Treat the column as directional, not as a scoreboard.
 | 16 | **stripe-fold C side: round-1 C banks from one multilinear fold of the lincheck stripe; drain runs AB-only, C transpose deleted** | round 1 | **1277.5 → 1204.7 ms (−72.7, −5.7%), head 8/8** | — | **KEPT** |
 | 17 | **q-resident round 2: fold outputs stay in q registers, in-register karatsuba `mul_q` (5 PMULLs), `WideNeon` fed directly** | round 2 | **358.1 → 311.6 ms (−13.0%), 8/8, every pair −12.6..−13.3%** | — | **KEPT** |
 | 18 | **fused q-resident rounds-3+ tail: fold+message in one pass, second read pass over multi-MB chunks deleted** | rounds 3+ | **449.5 → 306.6 ms (−31.8%), 8/8, every pair −31.1..−32.6% — largest single win of the effort** | — | **KEPT** |
+| 19 | **stripe fold through lincheck's tiled dispatcher** (was calling the portable fallback; its 256 KiB accumulator thrashes L2 at k_log=14) | round-1 C fold | **1191.0 → 1023.7 ms (−167.3, −14.0%), 8/8, every pair −13.6..−14.4%** | — | **KEPT** |
+| 20 | word-extract addressing in the prep (16 byte-loads per K-row → 2 word loads + shifts) | round-1 prep | *measurement in flight* | — | pending |
 
 Net kept: **round 2 −13.4% ST**, total 4781.0 → 4716.2 ST (−1.4%), for 179
 added lines.
@@ -120,7 +122,7 @@ message. Against `9793190` (the harness-only commit, before any optimization),
 
 | level | base | head | delta |
 |---|---:|---:|---|
-| round 1 (`round1 URM`) | 1477.30 ms | 1204.74 ms | **-18.4%**, each step 8/8 |
+| round 1 (`round1 URM`) | 1477.30 ms | 1023.72 ms | **-30.7%**, each step 8/8 |
 | round 2 (`round2 fused fold`) | ~433 ms | 311.56 ms | **-28%** (WideNeon + q-resident) |
 | rounds 3+ (`rounds 3+ tail`) | ~455 ms | 306.56 ms | **-33%** (fused one-pass q-resident) |
 | end-to-end headline | ~52,400 comp/s | ~58,100 comp/s | **~+11%**, 8/8 (clean-band read; per-pair delta stable +9.6..+12.4% even through throttled pairs) |
@@ -338,6 +340,28 @@ their tree, prototyped here in `benches/eq_build_probe.rs`). Running that probe
 shows the entire `SplitEqGhash::new` at the round-2 shape costs 0.13 ms, and the
 geometric variant is *slower* than the standard build at 5 of 6 sizes. Worth
 approximately zero.
+
+## The measured round-1 decomposition (post-stripe-C), and what it closed
+
+A second FLOCK_R1_SPLIT probe (since removed) replaced the estimated
+decomposition with a measured one and immediately found a defect:
+
+| component | estimated | measured | note |
+|---|---:|---:|---|
+| AB prep | ~640 | ~715 | 90% gathers: a gathers-only probe put the whole multiply tail at ~67 ms, killing the h4-Horner port idea (ceiling ~15 ms for ~100 lines) |
+| stripe fold | ~180 | **340 -> 166** | was calling the PORTABLE fold; `partial_fold_packed_z_best` (lincheck's tiled NEON dispatcher) halves it -- the portable kernel's length-k accumulator is 256 KiB at k_log=14, twice M1's L1D |
+| AB drain | ~340 | ~167 | near its gather floor all along; the estimate that made it look like a target was wrong |
+
+With the dispatcher fix, drain+fold is ~333 ms against their ~314 --
+effectively at parity (and theirs may include an unquantified Metal prefix).
+The entire remaining round-1 gap (~150 ms after word-extract, if it lands)
+is AB-prep gather machinery, where the remaining lever is the static-b
+partial-load import previously ruled out as bloat.
+
+Zerocheck like-for-like standing: ~1643 vs ~1376 = **1.19x** (was 1.74x
+fairly accounted, "2.7x" as first misread). Rounds 3+ (1.03x) and drain+fold
+(1.06x) are closed; round 2 (1.45x, ~97 ms, their compact-fold mechanism) is
+the largest remaining relative gap.
 
 ## What finally worked, and why
 
