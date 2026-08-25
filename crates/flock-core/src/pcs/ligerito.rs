@@ -7914,10 +7914,6 @@ mod tests {
         eprintln!("LigeritoProof bincode size: {} bytes", bytes.len());
     }
 
-    /// `recursive_prover_with_basis` + `recursive_verifier_with_basis`
-    /// roundtrip — this is the basefold-compatible signature that
-    /// `pcs::open_batch` will call. Single-claim case (`b = eq(z, ·)`,
-    /// `target = poly(z)`) — must round-trip cleanly.
     /// The round-1 lookahead skip is an exact polynomial identity, so the
     /// F256 ladder must emit BYTE-IDENTICAL proofs with and without it —
     /// including across the L0 OOD β-glues, which the lookahead survives via
@@ -7998,6 +7994,10 @@ mod tests {
         );
     }
 
+    /// `recursive_prover_with_basis` +
+    /// `extension::recursive_verifier_with_basis_succinct` roundtrip.
+    /// Single-claim case (`b = eq(z, ·)`, `target = poly(z)`) — must
+    /// round-trip cleanly.
     #[test]
     fn recursive_prover_with_basis_roundtrip_single_claim() {
         use crate::challenger::Challenger;
