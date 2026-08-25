@@ -534,18 +534,11 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
                     let a1 = fold_one_row_neon_q_unchecked_8(table_ptr, a_pkt_ptr.add(x1g * 8));
                     let b1 = fold_one_row_neon_q_unchecked_8(table_ptr, b_pkt_ptr.add(x1g * 8));
 
-                    // The pair slots are adjacent; one non-temporal STNP per
-                    // polynomial skips the RFO on this write-once surface.
-                    kernels::aarch64::store_pair_nt_pub(
-                        a_chunk.as_mut_ptr().add(x0l) as *mut u8,
-                        a0,
-                        a1,
-                    );
-                    kernels::aarch64::store_pair_nt_pub(
-                        b_chunk.as_mut_ptr().add(x0l) as *mut u8,
-                        b0,
-                        b1,
-                    );
+                    // F128 is repr(C, align(16)), so these are single stores.
+                    vst1q_u8(a_chunk.as_mut_ptr().add(x0l) as *mut u8, a0);
+                    vst1q_u8(a_chunk.as_mut_ptr().add(x1l) as *mut u8, a1);
+                    vst1q_u8(b_chunk.as_mut_ptr().add(x0l) as *mut u8, b0);
+                    vst1q_u8(b_chunk.as_mut_ptr().add(x1l) as *mut u8, b1);
 
                     let a0 = vreinterpretq_u64_u8(a0);
                     let a1 = vreinterpretq_u64_u8(a1);
