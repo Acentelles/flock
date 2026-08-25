@@ -34,6 +34,13 @@ pub enum VerifyError {
     /// different registry, or gate counts that are not the union's declared
     /// counts. A rejection, not a panic — both come from the caller.
     CircuitMismatch,
+    /// The single-table entries build the c-claim as a direct z-claim, which
+    /// is sound only for the circuit-R1CS shape `C = I` — an R1CS with any
+    /// other `c_0` must be rejected here, not silently misverified. (The
+    /// union path has no such check by design: registry table types carry
+    /// stub `c_0` matrices under the walker-encoder convention, and the
+    /// statement is bound through the registry digest instead.)
+    NonIdentityC,
 }
 
 /// Per-phase wall-clock timings (seconds) of a verify, for benchmark cost
@@ -1226,6 +1233,10 @@ fn verify_core_ag_inner<Ch: Challenger>(
         zerocheck::ag_skip::K_SKIP,
         "AG skip is k_skip=6"
     );
+    // The c-claim below is a direct z-claim (ĉ = ẑ) — sound only for C = I.
+    if !r1cs.c0_is_identity() {
+        return Err(VerifyError::NonIdentityC);
+    }
 
     // ---- Bind FS transcript to the statement (mirrors the AG prover).
     crate::proof::bind_statement(challenger, r1cs, commitment);
@@ -1384,6 +1395,10 @@ fn verify_core_inner<Ch: Challenger>(
     lincheck_grinding: lincheck::LincheckGrinding,
     challenger: &mut Ch,
 ) -> Result<(ZClaim, ZClaim), VerifyError> {
+    // The c-claim below is a direct z-claim (ĉ = ẑ) — sound only for C = I.
+    if !r1cs.c0_is_identity() {
+        return Err(VerifyError::NonIdentityC);
+    }
     let trace = std::env::var("VERIFY_TRACE").is_ok();
     let fmt = |s: f64| -> String {
         let ms = s * 1000.0;
@@ -1506,6 +1521,92 @@ mod tests {
         assert!(!super::commitment_params_match_expected(
             &commitment,
             &expected
+        ));
+    }
+
+    /// Both single-table entries build the c-claim as a direct z-claim, which
+    /// assumes `C = I`; an R1CS with any other `c_0` must be REJECTED (a
+    /// structured error), not silently misverified. The guard fires before
+    /// any proof inspection, so empty proofs suffice.
+    #[test]
+    fn non_identity_c_is_rejected_by_both_single_table_entries() {
+        use crate::challenger::FsChallenger;
+        use crate::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
+
+        let k_log = 6;
+        let k = 1usize << k_log;
+        let identity = SparseBinaryMatrix {
+            num_rows: k,
+            num_cols: k,
+            rows: (0..k).map(|i| vec![i]).collect(),
+        };
+        // c_0 = a shift-by-one permutation: a valid matrix, not the identity.
+        let shifted = SparseBinaryMatrix {
+            num_rows: k,
+            num_cols: k,
+            rows: (0..k).map(|i| vec![(i + 1) % k]).collect(),
+        };
+        let r1cs = BlockR1cs {
+            m: 12,
+            k_log,
+            k_skip: crate::zerocheck::ag_skip::K_SKIP,
+            useful_bits: k,
+            a_0: identity.clone(),
+            b_0: identity.clone(),
+            c_0: shifted,
+            layout: WitnessLayout::RowMajor,
+            const_pin: None,
+            digest_cache: std::sync::OnceLock::new(),
+            csc_cache: std::sync::OnceLock::new(),
+        };
+        let commitment = Commitment {
+            cap: Vec::new(),
+            params: PcsParams {
+                m: 12,
+                log_inv_rate: 1,
+                log_batch_size: 6,
+                profile: LigeritoProfile::Fast,
+                num_lanes: None,
+                merkle_hash: HashKind::Sha256,
+            },
+        };
+        let circuit = r1cs.csc_lincheck_circuit();
+
+        let zc = crate::zerocheck::ZerocheckProof {
+            round1_ab: Vec::new(),
+            round1_c: Vec::new(),
+            multilinear_rounds: Vec::new(),
+            final_a_eval: crate::field::F128::ZERO,
+            final_b_eval: crate::field::F128::ZERO,
+            final_c_eval: crate::field::F128::ZERO,
+            grinding_nonces: Vec::new(),
+        };
+        let lc = crate::lincheck::LincheckProof {
+            rounds: Vec::new(),
+            z_partial: Vec::new(),
+            matrix_evals: Vec::new(),
+            grinding_nonces: Vec::new(),
+        };
+        let mut ch = FsChallenger::new(b"non-identity-c-test");
+        assert!(matches!(
+            super::verify_core(&r1cs, &zc, &lc, &commitment, circuit, &mut ch),
+            Err(super::VerifyError::NonIdentityC)
+        ));
+
+        let ag = crate::zerocheck::ag_skip::AgProof {
+            round1_ab: Vec::new(),
+            round1_c: Vec::new(),
+            r1_nonce: 0,
+            multilinear_rounds: Vec::new(),
+            final_a_eval: crate::field::F128::ZERO,
+            final_b_eval: crate::field::F128::ZERO,
+            final_c_eval: crate::field::F128::ZERO,
+            grinding_nonces: Vec::new(),
+        };
+        let mut ch = FsChallenger::new(b"non-identity-c-test");
+        assert!(matches!(
+            super::verify_core_ag(&r1cs, &ag, &lc, &commitment, circuit, &mut ch),
+            Err(super::VerifyError::NonIdentityC)
         ));
     }
 }

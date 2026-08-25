@@ -364,10 +364,20 @@ impl BlockR1cs {
     pub fn statement_digest(&self) -> [u8; 32] {
         *self.digest_cache.get_or_init(|| {
             let mut h = blake3::Hasher::new();
-            h.update(b"flock-r1cs-stmt-v1");
+            h.update(b"flock-r1cs-stmt-v2");
             h.update(&(self.m as u64).to_le_bytes());
             h.update(&(self.k_log as u64).to_le_bytes());
             h.update(&(self.k_skip as u64).to_le_bytes());
+            // useful_bits (the padding boundary — which rows carry witness)
+            // and const_pin (the constant-wire pin) both change protocol
+            // semantics, so they are part of the statement. const_pin
+            // absorbs as (present, value) so Some(0) differs from None.
+            // (v2, 2026-08-25: v1 lacked both — the union path was already
+            // covered via the registry digest, this is the legacy
+            // single-table binding catching up.)
+            h.update(&(self.useful_bits as u64).to_le_bytes());
+            h.update(&[self.const_pin.is_some() as u8]);
+            h.update(&(self.const_pin.unwrap_or(0) as u64).to_le_bytes());
             // The layout determines which polynomial a given witness commits
             // to — it is part of the statement.
             h.update(&[match self.layout {
@@ -888,5 +898,44 @@ mod tests {
         let mut z_nonzero = vec![false; 1 << m];
         z_nonzero[5] = true;
         assert!(!r1cs.satisfies(&z_nonzero));
+    }
+
+    /// `useful_bits` and `const_pin` both change protocol semantics (the
+    /// padding boundary; the constant-wire pin), so the statement digest must
+    /// be sensitive to each — including `Some(0)` vs `None`. Mirrors the
+    /// registry-digest sensitivity tests that already cover the union path.
+    #[test]
+    fn statement_digest_binds_useful_bits_and_const_pin() {
+        let k_log = 3;
+        let base = BlockR1cs {
+            m: 6,
+            k_log,
+            k_skip: 2,
+            useful_bits: 1 << k_log,
+            a_0: identity(1 << k_log),
+            b_0: identity(1 << k_log),
+            c_0: identity(1 << k_log),
+            layout: WitnessLayout::RowMajor,
+            const_pin: None,
+            digest_cache: std::sync::OnceLock::new(),
+            csc_cache: std::sync::OnceLock::new(),
+        };
+        let d0 = base.statement_digest();
+
+        let mut smaller_useful = base.clone();
+        smaller_useful.useful_bits = (1 << k_log) - 1;
+        assert_ne!(d0, smaller_useful.statement_digest(), "useful_bits");
+
+        let mut pin_zero = base.clone();
+        pin_zero.const_pin = Some(0);
+        assert_ne!(d0, pin_zero.statement_digest(), "const_pin Some(0) vs None");
+
+        let mut pin_five = base.clone();
+        pin_five.const_pin = Some(5);
+        assert_ne!(
+            pin_zero.statement_digest(),
+            pin_five.statement_digest(),
+            "const_pin value"
+        );
     }
 }
