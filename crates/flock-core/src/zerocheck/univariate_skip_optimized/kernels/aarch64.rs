@@ -59,30 +59,28 @@ pub(crate) unsafe fn accumulate_convert_ab_only(
     // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
     unsafe {
         let convert_ptr = convert.as_ptr() as *const u8;
+        // Four lanes per iteration: with the C side gone each lane carries a
+        // single XOR chain of depth n_b_med, so two lanes expose only two
+        // chains -- four keeps enough independent gathers in flight to cover
+        // the L1 load latency (same mechanism as the earlier two-lane win).
         let mut lane = 0usize;
-        while lane + 2 <= 64 {
-            let l0 = lane;
-            let l1 = lane + 1;
-            let mut ab_0 = vdupq_n_u8(0);
-            let mut ab_1 = vdupq_n_u8(0);
+        while lane + 4 <= 64 {
+            let mut acc = [vdupq_n_u8(0); 4];
             for b_med in 0..n_b_med {
                 let base = b_med * 256;
-                let a0 = chunk_ab_bytes[b_med][l0] as usize;
-                let a1 = chunk_ab_bytes[b_med][l1] as usize;
-                ab_0 = veorq_u8(ab_0, vld1q_u8(convert_ptr.add((base + a0) * 16)));
-                ab_1 = veorq_u8(ab_1, vld1q_u8(convert_ptr.add((base + a1) * 16)));
+                for j in 0..4 {
+                    let byte = chunk_ab_bytes[b_med][lane + j] as usize;
+                    acc[j] = veorq_u8(acc[j], vld1q_u8(convert_ptr.add((base + byte) * 16)));
+                }
             }
-            let v0 = vreinterpretq_u64_u8(ab_0);
-            let v1 = vreinterpretq_u64_u8(ab_1);
-            partial_ab[l0] += F128 {
-                lo: vgetq_lane_u64::<0>(v0),
-                hi: vgetq_lane_u64::<1>(v0),
-            } * eq_lo_val;
-            partial_ab[l1] += F128 {
-                lo: vgetq_lane_u64::<0>(v1),
-                hi: vgetq_lane_u64::<1>(v1),
-            } * eq_lo_val;
-            lane += 2;
+            for j in 0..4 {
+                let v = vreinterpretq_u64_u8(acc[j]);
+                partial_ab[lane + j] += F128 {
+                    lo: vgetq_lane_u64::<0>(v),
+                    hi: vgetq_lane_u64::<1>(v),
+                } * eq_lo_val;
+            }
+            lane += 4;
         }
     }
 }
