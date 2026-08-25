@@ -1,0 +1,331 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1.1in]{geometry}
+\usepackage{amsmath,amssymb,booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage[hidelinks]{hyperref}
+
+\newcommand{\Ftwo}{\mathbb{F}_2}
+\newcommand{\Feight}{\mathbb{F}_{2^8}}
+\newcommand{\Fbig}{\mathbb{F}_{2^{128}}}
+\newcommand{\eq}{\mathrm{eq}}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{Verified Optimizations to Flock's RS Zerocheck Prover\\
+{\large measurements on Apple M1 Max, single-threaded, $2^{18}$ BLAKE3 compressions}}
+\author{branch \code{snark-fast-improvements}}
+\date{August 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Six changes to the RS (additive-NTT) zerocheck path, each kept only after a
+paired, order-alternating A/B measurement with a decisive sign test. Together
+they reduce zerocheck round~1 from $1477\,$ms to $1205\,$ms ($-18.4\%$) and
+whole-proof time by more than $5\%$ single-threaded. Three are ideas ported
+from an independently optimized fork of this prover (the ``challenge'' tree),
+re-derived and re-implemented rather than copied; three originated here. The
+recurring themes: reductions in fields of characteristic two are
+$\Ftwo$-linear and can be deferred almost arbitrarily; work that a circuit
+fixes structurally can be skipped with a one-word guard; and on Apple silicon
+the boundary between the vector and general register files costs more than
+most instruction counts.
+\end{abstract}
+
+\section{Setting and notation}
+
+Fields. $\Feight = \Ftwo[x]/(x^8+x^4+x^3+x+1)$ and the GHASH field
+$\Fbig = \Ftwo[X]/(X^{128}+X^7+X^2+X+1)$, with the ring embedding
+$\varphi:\Feight\hookrightarrow\Fbig$. Write $\alpha := \varphi(x)$ and
+$\gamma := X$.
+
+The witness is $z\in\Ftwo^{2^m}$; at the benchmark shape $m=32$
+($2^{18}$ BLAKE3 compressions, $k_{\log}=14$ bits per block). After the
+univariate skip, round~1 of the zerocheck views the $m$ index bits as
+\[
+[\;\underbrace{\lambda}_{6\ \text{(univariate)}}\;|\;
+ \underbrace{s}_{3\ \text{(small)}}\;|\;
+ \underbrace{b}_{4\ \text{(medium)}}\;|\;
+ \underbrace{t}_{m-13\ \text{(rest)}}\;],
+\]
+and must emit, for each of the $64$ points $\lambda$ of the skip domain, the
+quadratic message $P^{AB}(\lambda)$ and the linear message $P^{C}(\lambda)$,
+plus a pair of \emph{banks} (the ring-switch helper $\hat s_{v,C}$) that keep
+the small parity dimension unfolded.
+
+The protocol pins the small and medium challenges to \emph{friendly} values:
+$r_{6+i} = \varphi(v_i)$ with $v=(\mathtt{0xF7},\mathtt{0x53},\mathtt{0xB5})$,
+and $\beta_i = \gamma^{2^{i-1}}/(1+\gamma^{2^{i-1}})$. These make the eq
+weights geometric:
+\begin{equation}
+\prod_{i=0}^{2}\eq(r_{6+i},K_i) \;=\; C_s\,\alpha^{K},
+\qquad
+\prod_{i=1}^{4}\eq(\beta_i,b_i) \;=\; \gamma^{b}/D,
+\label{eq:friendly}
+\end{equation}
+with $K=\sum K_i 2^i$, $C_s=\prod_i(1+r_{6+i})=\varphi(\mathtt{0x1C})$, and
+$D=\prod_i(1+\gamma^{2^{i-1}})$. The baseline kernels exploit
+\eqref{eq:friendly} through lookup tables; several optimizations below exploit
+it in the opposite direction, replacing tables by folds at the actual
+challenge values.
+
+\paragraph{Measurement protocol.}
+All numbers are single-threaded at the shape above. Each verdict is a paired
+A/B: both arms built once, one discarded warm-up each, then eight pairs with
+the \emph{order alternating within each pair} (a fixed order is biased by
+thermal drift by roughly the size of the effects measured here). Phase times
+are the minimum over the $\sim$5 zerocheck invocations within one run. A
+change is kept only on a decisive sign test; two of the six wins were
+$8/8$ with disjoint ranges. Measure only on AC power with the battery above
+$\sim60\%$: low battery caps frequencies, and fast-charging a nearly empty
+battery is worse.
+
+\section{Deferred reduction in vector registers}\label{sec:wideneon}
+
+For $u\in\Ftwo^{256}$ (an unreduced carry-less product) let
+$R(u)\in\Fbig$ be reduction mod $X^{128}+X^7+X^2+X+1$. $R$ is
+$\Ftwo$-linear, so for any products $u_i = a_i \odot b_i$ (unreduced),
+\[
+\textstyle\sum_i R(u_i) \;=\; R\!\left(\sum_i u_i\right),
+\]
+and a sum of $n$ field products needs one reduction, not $n$. The baseline
+already used this identity, but held the $256$-bit accumulator as a four-word
+struct in \emph{general} registers: each product paid six lane extracts to
+leave the vector file, and each accumulate was four scalar XORs.
+
+The fix is representational, not algorithmic: keep the accumulator as two
+$128$-bit vector registers. The unreduced product uses Karatsuba,
+\[
+(a_l + a_h X^{64})(b_l + b_h X^{64}) : \quad
+\mathit{ll}=a_l b_l,\ \ \mathit{hh}=a_h b_h,\ \
+\mathit{cross}=(a_l{+}a_h)(b_l{+}b_h)+\mathit{ll}+\mathit{hh},
+\]
+three \code{PMULL}s instead of the schoolbook four; accumulation is two vector
+XORs; the four extracts are paid once per worker chunk on the way out, and the
+existing scalar reducer is reused unchanged.
+
+\emph{Measured: round-2 phase $433.1\to375.2\,$ms ($-13.4\%$).}
+
+\section{Structurally fixed rows of the $b$ operand}\label{sec:zeroskip}
+
+Round~1's dominant kernel transforms the operands $a,b$ through a table $T$
+implementing the inverse-NTT composition; $T$ is $\Ftwo$-linear, so
+$T(0)=0$. A census of the packed BLAKE3 witness (256 word positions per
+block $\times$ 256 blocks $\times$ 3 independent witnesses) shows the circuit
+pins $38$ of $256$ eight-byte $K$-rows of $b$ regardless of the inputs, taking
+only three values:
+\[
+\underbrace{\mathtt{0xff}^8}_{22\ \text{positions (const-one wires)}},\qquad
+\underbrace{0^8}_{15\ \text{positions (structural zeros)}},\qquad
+\text{one mixed word.}
+\]
+For a zero row the entire row's work vanishes: $db=T(0)=0$, hence
+$y = da \odot db = 0$ contributes nothing to any accumulator. The kernel
+gains a single guard:
+
+\begin{algorithmic}[1]
+\State \textbf{if} $\mathrm{load}_{64}(b\_\mathit{row}) = 0$ \textbf{then
+return} \Comment{skips all 64 table loads and 4 $\Feight$ multiplies}
+\end{algorithmic}
+
+\noindent
+No census data ships and no positions are tracked: the guard is exact for any
+witness, and a disagreeing witness falls through to the generic path.
+(The all-ones rows were also tried: constant-folding them saves only the $b$
+half of a row's work, and halving a row's loads halves its memory-level
+parallelism, returning $6\,$ms where $27$ were predicted. Reverted; whole-row
+elimination is what pays.)
+
+\emph{Measured: round~1 $-42.4\,$ms ($-2.9\%$), $8/8$.}
+
+\section{Instruction-level parallelism in the gather drain}\label{sec:twolane}
+
+The drain accumulates, per output lane, three XOR chains of depth
+$n_{\mathrm{med}}=16$ (one per bank), each link a table gather feeding an XOR.
+The gathers are independent but the chains are serial, so one lane exposes
+three dependency chains to the out-of-order engine. Processing two lanes per
+iteration doubles that to six with no change in total work:
+
+\begin{algorithmic}[1]
+\For{$\ell = 0,2,4,\dots,62$}
+  \State $u_0,u_1,u_2 \gets 0$;\quad $v_0,v_1,v_2 \gets 0$
+    \Comment{banks for lanes $\ell$ and $\ell{+}1$}
+  \For{$b = 0 \dots n_{\mathrm{med}}-1$}
+    \State $u_j \mathrel{\oplus}= \mathrm{convert}[b][\cdot]$;\quad
+           $v_j \mathrel{\oplus}= \mathrm{convert}[b][\cdot]$
+           \Comment{6 independent chains in flight}
+  \EndFor
+\EndFor
+\end{algorithmic}
+
+This targets latency, not throughput: an attempt to shrink the gather
+\emph{table} ($64\to8\,$KiB, doubling gather count) had cost $3.6\%$ --- the
+table already fit M1's $128\,$KiB L1D, establishing that the drain is bound by
+gather count and chain depth, not footprint.
+
+\emph{Measured: round~1 $-63.1\,$ms ($-4.3\%$), $8/8$. Combined with
+Section~\ref{sec:zeroskip}: $1477.3\to1403.1\,$ms ($-5.0\%$).}
+
+\section{Unreduced accumulation with multiplicative weight splitting}
+\label{sec:pmull}
+
+The prep kernel computes, per $K$-row ($K\in\{0,\dots,7\}$) and 16-lane block,
+$y_K = a_K \odot b_K \in \Feight$ and accumulates $\sum_K x^K y_K$ in 16-bit
+lanes, reducing once at the end. The baseline computed each $y_K$
+\emph{reduced}: two \code{PMULL}s for the raw product plus a reduction costing
+four more, then a widening shift by $K$ --- six \code{PMULL}s per row-block for
+a reduction that the final fold makes redundant.
+
+Let $u_K$ be the \emph{unreduced} 15-bit product. Then
+$\sum_K x^K u_K \equiv \sum_K x^K y_K \pmod{p_8}$, but $x^K u_K$ overflows 16
+bits for $K\ge2$. Split the weight so every factor lands where it is free:
+\[
+x^K \;=\;
+\underbrace{(x^4)^{[K\ge4]}}_{\text{choice of gather table}}\cdot
+\underbrace{(x^2)^{[\lfloor K/2\rfloor\ \mathrm{odd}]}}_{\text{byte-wise
+doubling of the reduced operand}}\cdot
+\underbrace{x^{K\bmod 2}}_{\text{in-lane shift}}.
+\]
+The $x^4$ factor costs nothing per element: a second table image with every
+byte pre-multiplied by $x^4$ scales each gathered XOR-sum by $x^4$, by
+linearity of $T$. The $x^2$ factor is a six-instruction shift-and-conditional-XOR
+on the already-reduced 8-bit operand ($\deg$ still $\le7$). The residual shift
+is one vector instruction and raises term degree to at most $15$.
+
+\begin{algorithm}[h]
+\caption{Row-block accumulate, before and after}
+\begin{algorithmic}[1]
+\State \textbf{before:}\ $\mathit{acc} \mathrel{\oplus}=
+  \mathrm{shift}_K\!\big(\mathrm{reduce}(\mathrm{pmull}(da, db))\big)$
+  \Comment{$6$ \code{PMULL}}
+\State \textbf{after:}\ \ $da \gets [K\ge4]\ ?\ \text{gathered from }x^4\text{
+  table} : da$;\quad $da \gets [(K/2)\bmod 2]\ ?\ x^2\!\cdot\!da : da$
+\State \phantom{\textbf{after:}}\ $\mathit{acc} \mathrel{\oplus}=
+  \mathrm{shift}_{K\bmod2}\!\big(\mathrm{pmull}(da, db)\big)$
+  \Comment{$2$ \code{PMULL}}
+\end{algorithmic}
+\end{algorithm}
+
+Correctness needs the final reducer to be exact to degree $15$, one beyond its
+documented ``$\le14$''; both the scalar and vector reducers were verified
+exhaustively over all $2^{16}$ inputs (tests now permanent). Gather traffic is
+unchanged apart from the second $16\,$KiB table image.
+
+\emph{Measured: round~1 $1401.4\to1273.4\,$ms ($-9.1\%$), $8/8$, every pair in
+$[-8.7\%,-10.1\%]$. The reference implementation's attribution predicted
+$100$--$140\,$ms; measured $128$.}
+
+\section{The C-side message as a fold of the lincheck stripe}
+\label{sec:stripe}
+
+In the fast hash setups $C=I$, so $\hat c = \hat z$ and everything round~1
+emits on the C side is \emph{linear} in the witness. Concretely the two banks
+are, for parity $p\in\{0,1\}$ and lane $\lambda$,
+\begin{equation}
+\mathrm{bank}_p[\lambda] \;=\;
+\sum_{K\equiv p\ (2)} \alpha^{K}
+\sum_{b} \frac{\gamma^{b}}{D}
+\sum_{t} \eq(r_{\ge13}, t)\; z[\lambda,K,b,t],
+\label{eq:banks}
+\end{equation}
+a multilinear evaluation --- which the baseline nevertheless computed with the
+quadratic side's machinery: a bit transpose of every $8192$-bit window plus
+$32$ of the drain's $48$ gathers per lane.
+
+By \eqref{eq:friendly}, a \emph{true} multilinear fold at the actual pinned
+challenges reproduces the weights in \eqref{eq:banks} exactly. The prover
+already materializes the \emph{lincheck stripe}, a repacking of $z$ indexed
+$[\,i_{\mathrm{inner}}\,|\,i_{\mathrm{outer}}\,]$, for the later lincheck
+phase. So:
+
+\begin{algorithmic}[1]
+\State $v \gets \mathrm{fold\_stripe\_outer}(z_{\mathrm{stripe}},\
+  \eq(r_{k_{\log}..m}))$
+  \Comment{the one $O(2^m)$ pass; same kernel lincheck uses}
+\For{$d = k_{\log}-1$ \textbf{downto} $7$}
+  \Comment{data halves each round: $2^{14}\to2^{7}$ elements}
+  \State $v[i] \gets v[i] + r_d\,(v[i]+v[i+2^{d}])$
+\EndFor
+\State $\mathrm{bank}_p[\lambda] \gets \dfrac{\eq(r_6,p)}{C_s}\;
+       v[\,p\cdot64+\lambda\,]$
+  \Comment{$C_s=(1{+}r_6)(1{+}r_7)(1{+}r_8)$, from $r$ itself}
+\end{algorithmic}
+
+\noindent
+Dimension 6 (the parity) and dimensions $0..5$ (the lanes) are kept unfolded;
+the constant in step~3 undoes the two eq factors the partial fold applied,
+derived from the identity $Y_p = (C_s/\eq(r_6,p))\,\mathrm{bank}_p$ obtained
+by factoring \eqref{eq:friendly} over the folded dimensions. With the banks
+gone from the drain, the workers run AB-only: the per-window bit transpose is
+deleted and the drain issues one gather per (lane, $b$) instead of three.
+Equivalence was proven at two levels before wiring: banks bit-identical to the
+drain's, and all three entry outputs identical, dense and padded.
+
+\emph{Measured: round~1 $1277.5\to1204.7\,$ms ($-5.7\%$), $8/8$. The cost of
+the added fold ($\approx180\,$ms) is included; the removals
+($\approx250\,$ms) net out.}
+
+\section{Register-resident round 2}\label{sec:qres}
+
+\emph{Implemented and correctness-verified; performance verification pending
+a clean measurement window.}
+
+Round~2's message loop crossed the vector/general register-file boundary three
+times per output pair: the table-driven fold extracted its vector accumulator
+into a two-word struct; the message products
+$g_1 = a_1 b_1$, $g_\infty = (a_0{+}a_1)(b_0{+}b_1)$ went through the scalar
+field multiply (struct in, struct out); and the accumulate of
+Section~\ref{sec:wideneon} re-entered the vector file. The rewrite keeps the
+whole chain in vector registers: the fold returns its register unextracted;
+the products use an in-register Karatsuba multiply (five \code{PMULL}s ---
+three for the product, two for the fold through $X^{128}\equiv X^7{+}X^2{+}X{+}1$
+--- against the baseline's six); the $\eq\cdot g$ products feed the
+Section~\ref{sec:wideneon} accumulator directly. Per pair, the only remaining
+memory traffic is the four required stores of folded values and one eq load.
+
+\section{Summary}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}llrr@{}}
+\toprule
+Optimization & Kind & Phase effect (ST) & Sign test\\
+\midrule
+\S\ref{sec:wideneon}\ deferred reduction in registers & representation &
+  round 2: $-13.4\%$ & decisive\\
+\S\ref{sec:zeroskip}\ structurally-zero $b$ rows & work removal &
+  round 1: $-2.9\%$ & $8/8$\\
+\S\ref{sec:twolane}\ two-lane drain & ILP &
+  round 1: $-4.3\%$ & $8/8$\\
+\S\ref{sec:pmull}\ unreduced accumulate, split weights & arithmetic &
+  round 1: $-9.1\%$ & $8/8$\\
+\S\ref{sec:stripe}\ C side as stripe fold & structural &
+  round 1: $-5.7\%$ & $8/8$\\
+\S\ref{sec:qres}\ register-resident round 2 & representation &
+  pending & ---\\
+\midrule
+\multicolumn{2}{@{}l}{round 1 cumulative} &
+  \multicolumn{2}{r@{}}{$1477 \to 1205\,$ms\quad($-18.4\%$)}\\
+\multicolumn{2}{@{}l}{end-to-end (through \S\ref{sec:pmull} state)} &
+  \multicolumn{2}{r@{}}{$52{,}364 \to 55{,}021$ comp/s\quad($+5.1\%$, $8/8$)}\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Negative space.}
+The kept changes are one side of a 17-experiment record; the failures shaped
+them. On this core, re-encoding fixed work never paid: pairing multiplies
+through a memory-interfaced kernel ($+10\%$), a four-register structured load
+($+12\%$, microcoded), three-way XOR fusion ($+1.8\%$), an $8\times$ smaller
+gather table ($-3.6\%$ regression), and deferring an already-cheap reduction
+($0\%$) all failed, while every win either removed work, added independent
+work in flight, or removed register-file boundary crossings. Two further
+structural transplants measured neutral end-to-end and were reverted despite
+making the zerocheck \emph{bucket} look better (hoisting the challenge-independent
+prep under the commit; the lookahead double-round, which loses $7$--$15\%$ in
+the zerocheck tail on both this machine and the reference tree's, while
+\emph{helping} the PCS open by $7\%$ --- the same technique, opposite signs,
+two call sites).
+
+\end{document}
