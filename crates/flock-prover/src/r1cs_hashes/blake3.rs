@@ -1146,6 +1146,304 @@ fn build_block_witness_ab_packed_into(
     }
 }
 
+/// Sequential full-word writer for one packed block. Unlike the OR-based
+/// helpers, this never reads the destination and initializes every word,
+/// letting the outer driver skip its group memset (and the read-modify-write
+/// the OR path forces on every store).
+struct PackedWordWriter {
+    out: *mut u64,
+    word: usize,
+    pending: u64,
+    used: usize,
+}
+
+impl PackedWordWriter {
+    #[inline(always)]
+    fn at(out: *mut u64, word: usize, pending: u64, used: usize) -> Self {
+        Self {
+            out,
+            word,
+            pending,
+            used,
+        }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, value: u64, width: usize) {
+        debug_assert!((1..=64).contains(&width));
+        let value = if width == 64 {
+            value
+        } else {
+            value & ((1u64 << width) - 1)
+        };
+        if self.used == 0 && width == 64 {
+            // SAFETY: the fixed BLAKE3 layout emits exactly `K / 64` words;
+            // the caller supplies a distinct block-sized destination.
+            unsafe {
+                self.out.add(self.word).write(value);
+            }
+            self.word += 1;
+            return;
+        }
+        let room = 64 - self.used;
+        if width < room {
+            self.pending |= value << self.used;
+            self.used += width;
+        } else {
+            // SAFETY: as above.
+            unsafe {
+                self.out
+                    .add(self.word)
+                    .write(self.pending | (value << self.used));
+            }
+            self.word += 1;
+            if width == room {
+                self.pending = 0;
+                self.used = 0;
+            } else {
+                self.pending = value >> room;
+                self.used = width - room;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn push_record<const N: usize>(&mut self, record: &BitRecord<N>, bits: usize) {
+        let mut left = bits;
+        for &value in record.words() {
+            if left == 0 {
+                break;
+            }
+            let width = left.min(64);
+            self.push(value, width);
+            left -= width;
+        }
+        debug_assert_eq!(left, 0);
+    }
+
+    #[inline(always)]
+    fn position(&self) -> usize {
+        self.word * 64 + self.used
+    }
+
+    #[inline]
+    fn finish(mut self, total_words: usize) {
+        if self.used != 0 {
+            // SAFETY: see `push`; a partial final word is still within the
+            // fixed-size block.
+            unsafe {
+                self.out.add(self.word).write(self.pending);
+            }
+            self.word += 1;
+        }
+        debug_assert!(self.word <= total_words);
+        // SAFETY: the unwritten suffix is within the same block-sized output.
+        unsafe {
+            std::ptr::write_bytes(self.out.add(self.word), 0, total_words - self.word);
+        }
+    }
+}
+
+#[inline(always)]
+fn stream_lin_word(
+    value: u32,
+    z: &mut PackedWordWriter,
+    a: &mut PackedWordWriter,
+    b: &mut PackedWordWriter,
+) {
+    z.push(value as u64, 32);
+    a.push(value as u64, 32);
+    b.push(u32::MAX as u64, 32);
+}
+
+/// Full-write counterpart of [`build_block_witness_ab_packed_into`]. The
+/// circuit rows are contiguous through `USEFUL_BITS`, so three streaming bit
+/// writers publish complete u64s without a destination read-modify-write, and
+/// the driver's per-group memset is unnecessary. The only out-of-order region
+/// is the 256-bit-aligned `out_lo` slot, reserved (zeroed) while the
+/// compression runs and overwritten once the final state is known.
+///
+/// Bit-identical to the OR-based builder on zeroed storage (see the
+/// `stream_builder_matches_or_builder` test); the fully unrolled G sequence
+/// additionally gives LLVM literal state/message indices.
+fn build_block_witness_ab_stream_into(
+    cv: &[u32; 8],
+    m: &[u32; 16],
+    counter: u64,
+    block_len: u32,
+    flags: u32,
+    z: &mut [u64],
+    a: &mut [u64],
+    b: &mut [u64],
+) {
+    const U64_PER_BLOCK: usize = K / 64;
+    debug_assert_eq!(z.len(), U64_PER_BLOCK);
+    debug_assert_eq!(a.len(), U64_PER_BLOCK);
+    debug_assert_eq!(b.len(), U64_PER_BLOCK);
+
+    let counter_lo = counter as u32;
+    let counter_hi = (counter >> 32) as u32;
+
+    // Initialize the fixed prefix [0, GS_BASE) directly: cv in words 0..4,
+    // the reserved out_lo region zeroed in words 4..8, then the constant bit
+    // plus the 20 input words (m, counter, block_len, flags) bit-shifted by
+    // one across words 8..18. This leaves each writer at word 18 with exactly
+    // one pending bit, so the generated G sequence starts from a
+    // compile-time-known packing phase.
+    let z_ptr = z.as_mut_ptr();
+    let a_ptr = a.as_mut_ptr();
+    let b_ptr = b.as_mut_ptr();
+    unsafe {
+        for i in 0..4 {
+            let value = (cv[2 * i] as u64) | ((cv[2 * i + 1] as u64) << 32);
+            z_ptr.add(i).write(value);
+            a_ptr.add(i).write(value);
+            b_ptr.add(i).write(u64::MAX);
+        }
+        std::ptr::write_bytes(z_ptr.add(4), 0, 4);
+        std::ptr::write_bytes(a_ptr.add(4), 0, 4);
+        std::ptr::write_bytes(b_ptr.add(4), 0, 4);
+
+        let values = [
+            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13],
+            m[14], m[15], counter_lo, counter_hi, block_len, flags,
+        ];
+        for i in 0..10 {
+            let low = if i == 0 {
+                1
+            } else {
+                (values[2 * i - 1] >> 31) as u64
+            };
+            let value = low | ((values[2 * i] as u64) << 1) | ((values[2 * i + 1] as u64) << 33);
+            z_ptr.add(8 + i).write(value);
+            a_ptr.add(8 + i).write(value);
+            b_ptr.add(8 + i).write(u64::MAX);
+        }
+    }
+    let pending = (flags >> 31) as u64;
+    let mut wz = PackedWordWriter::at(z_ptr, 18, pending, 1);
+    let mut wa = PackedWordWriter::at(a_ptr, 18, pending, 1);
+    let mut wb = PackedWordWriter::at(b_ptr, 18, 1, 1);
+    debug_assert_eq!(wz.position(), GS_BASE);
+
+    let mut state: [u32; 16] = [
+        cv[0],
+        cv[1],
+        cv[2],
+        cv[3],
+        cv[4],
+        cv[5],
+        cv[6],
+        cv[7],
+        BLAKE3_IV[0],
+        BLAKE3_IV[1],
+        BLAKE3_IV[2],
+        BLAKE3_IV[3],
+        counter_lo,
+        counter_hi,
+        block_len,
+        flags,
+    ];
+    // The circuit shape and message schedule are fixed. Expanding all 56 Gs
+    // gives LLVM literal state/message indices and exposes the complete
+    // dependency graph to register allocation.
+    macro_rules! g {
+        ($la:literal, $lb:literal, $lc:literal, $ld:literal, $mx:literal, $my:literal) => {{
+            let mx = m[$mx];
+            let my = m[$my];
+            let a_val = state[$la];
+            let b_val = state[$lb];
+            let c_val = state[$lc];
+            let d_val = state[$ld];
+
+            let mut rz = BitRecord::<4>::new();
+            let mut ra = BitRecord::<4>::new();
+            let mut rb = BitRecord::<4>::new();
+
+            macro_rules! add_into_stream {
+                ($pos:ident, $x:expr, $y:expr) => {{
+                    let (sum, left, right, carry) = add_carry_parts($x, $y);
+                    rz.push::<$pos>(carry);
+                    ra.push::<$pos>(left);
+                    rb.push::<$pos>(right);
+                    sum
+                }};
+            }
+
+            let tmp_0 = add_into_stream!(REC_C0, a_val, b_val);
+            let a_1 = add_into_stream!(REC_C1, tmp_0, mx);
+            let d_1 = (d_val ^ a_1).rotate_right(16);
+            let c_1 = add_into_stream!(REC_C2, c_val, d_1);
+            let b_1 = (b_val ^ c_1).rotate_right(12);
+            let tmp_1 = add_into_stream!(REC_C3, a_1, b_1);
+            let a_2 = add_into_stream!(REC_C4, tmp_1, my);
+            let d_2 = (d_1 ^ a_2).rotate_right(8);
+            let c_2 = add_into_stream!(REC_C5, c_1, d_2);
+            let b_new = (b_1 ^ c_2).rotate_right(7);
+            let d_new = d_2;
+            rz.push::<REC_LIN0>(b_new);
+            ra.push::<REC_LIN0>(b_new);
+            rb.push::<REC_LIN0>(u32::MAX);
+            rz.push::<REC_LIN1>(d_new);
+            ra.push::<REC_LIN1>(d_new);
+            rb.push::<REC_LIN1>(u32::MAX);
+
+            wz.push_record(&rz, G_STRIDE);
+            wa.push_record(&ra, G_STRIDE);
+            wb.push_record(&rb, G_STRIDE);
+
+            state[$la] = a_2;
+            state[$lb] = b_new;
+            state[$lc] = c_2;
+            state[$ld] = d_new;
+        }};
+    }
+    macro_rules! round {
+        ($m0:literal, $m1:literal, $m2:literal, $m3:literal,
+         $m4:literal, $m5:literal, $m6:literal, $m7:literal,
+         $m8:literal, $m9:literal, $m10:literal, $m11:literal,
+         $m12:literal, $m13:literal, $m14:literal, $m15:literal) => {{
+            g!(0, 4, 8, 12, $m0, $m1);
+            g!(1, 5, 9, 13, $m2, $m3);
+            g!(2, 6, 10, 14, $m4, $m5);
+            g!(3, 7, 11, 15, $m6, $m7);
+            g!(0, 5, 10, 15, $m8, $m9);
+            g!(1, 6, 11, 12, $m10, $m11);
+            g!(2, 7, 8, 13, $m12, $m13);
+            g!(3, 4, 9, 14, $m14, $m15);
+        }};
+    }
+    round!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    round!(2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8);
+    round!(3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1);
+    round!(10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6);
+    round!(12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4);
+    round!(9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7);
+    round!(11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13);
+    debug_assert_eq!(wz.position(), OUT_HI_BASE);
+
+    let out_lo: [u32; 8] = std::array::from_fn(|w| state[w] ^ state[w + 8]);
+    for w in 0..8 {
+        stream_lin_word(state[w + 8] ^ cv[w], &mut wz, &mut wa, &mut wb);
+    }
+    debug_assert_eq!(wz.position(), USEFUL_BITS);
+
+    wz.finish(U64_PER_BLOCK);
+    wa.finish(U64_PER_BLOCK);
+    wb.finish(U64_PER_BLOCK);
+
+    // OUT_LO_BASE is 256-bit aligned, so the four reserved words can be
+    // replaced without touching neighboring rows.
+    const OUT_LO_WORD: usize = OUT_LO_BASE / 64;
+    debug_assert_eq!(OUT_LO_BASE % 64, 0);
+    for i in 0..4 {
+        let value = (out_lo[2 * i] as u64) | ((out_lo[2 * i + 1] as u64) << 32);
+        z[OUT_LO_WORD + i] = value;
+        a[OUT_LO_WORD + i] = value;
+        b[OUT_LO_WORD + i] = u64::MAX;
+    }
+}
+
 /// **The fast path.** Produces `(z, a, b)` directly as F_{2^128}-packed
 /// vectors — no bool intermediates, no `pack_witness` step, no
 /// `apply_block_diag_packed`. Parallel across compression instances via rayon.
@@ -1234,14 +1532,14 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     // every block. (The chain forbids padding, so this only affects the
     // standalone batch setup.)
     let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
-    super::common::drive_witness_packed_and_lincheck(
+    super::common::drive_witness_packed_and_lincheck_full_write(
         blocks,
-        Some(&padding),
+        &padding,
         n_blocks_log,
         K_LOG,
         |block: &Compression, z_u64, a_u64, b_u64| {
             let (cv, m, t, bl, fl) = block;
-            build_block_witness_ab_packed_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
+            build_block_witness_ab_stream_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
         },
     )
 }
@@ -2270,6 +2568,42 @@ mod tests {
             .verify(&commitment, &proof, &mut ch_v)
             .unwrap_or_else(|e| panic!("ligerito verify rejected: {e:?}"));
         assert_eq!(claim_p, claim_v);
+    }
+
+    /// The streamed full-write builder (no memset, no OR read-modify-write,
+    /// unrolled G schedule) is bit-identical to the OR-based builder through
+    /// the whole driver: z/a/b and the lincheck stripe, real and padding
+    /// slots alike, with counters/flags exercising the prefix's carry bit.
+    #[test]
+    fn stream_builder_matches_or_builder() {
+        let mut rng = Rng::new(0x57e4_3a11);
+        let n_blocks_log = 5; // 32 slots, 21 real + 11 padding
+        let blocks: Vec<Compression> = (0..21)
+            .map(|i| {
+                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                // Odd blocks get all-ones flags so the prefix's pending bit
+                // (flags >> 31) takes both values.
+                let flags = if i % 2 == 0 { 11u32 } else { u32::MAX };
+                (cv, m, rng.next_u32() as u64, 64u32, flags)
+            })
+            .collect();
+        let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
+        let old = super::super::common::drive_witness_packed_and_lincheck(
+            &blocks,
+            Some(&padding),
+            n_blocks_log,
+            K_LOG,
+            |block: &Compression, z_u64, a_u64, b_u64| {
+                let (cv, m, t, bl, fl) = block;
+                build_block_witness_ab_packed_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
+            },
+        );
+        let new = generate_witness_with_ab_packed_and_lincheck(&blocks, n_blocks_log);
+        assert_eq!(old.0, new.0, "z differs");
+        assert_eq!(old.1, new.1, "a differs");
+        assert_eq!(old.2, new.2, "b differs");
+        assert_eq!(old.3, new.3, "z_lincheck differs");
     }
 
     /// Generic (matrix-driven) Ligerito prove produces a byte-identical

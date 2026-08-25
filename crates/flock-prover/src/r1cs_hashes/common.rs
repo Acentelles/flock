@@ -45,6 +45,13 @@ impl<const NW: usize> BitRecord<NW> {
         Self { w: [0u64; NW] }
     }
 
+    /// The record's raw words, for sequential full-word publication
+    /// (see `PackedWordWriter::push_record` in blake3.rs).
+    #[inline(always)]
+    pub(crate) fn words(&self) -> &[u64; NW] {
+        &self.w
+    }
+
     /// OR a (pre-masked) value into record bits `[POS, POS + width)`.
     /// `POS` is const so the straddle branch and shifts fold at compile time.
     #[inline(always)]
@@ -219,7 +226,54 @@ pub(crate) fn drive_witness_packed_and_lincheck<S: Sync, F>(
 where
     F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
 {
+    drive_witness_packed_and_lincheck_impl(
+        initial_states,
+        padding,
+        n_blocks_log,
+        k_log,
+        false,
+        per_block,
+    )
+}
+
+/// [`drive_witness_packed_and_lincheck`] for per-block builders that WRITE
+/// EVERY WORD of their (z, a, b) slices (no OR into pre-zeroed storage) —
+/// the group memset and its read-modify-write tax are skipped entirely.
+/// Requires `padding` so every slot is built; a `None` slot would be left
+/// uninitialized.
+pub(crate) fn drive_witness_packed_and_lincheck_full_write<S: Sync, F>(
+    initial_states: &[S],
+    padding: &S,
+    n_blocks_log: usize,
+    k_log: usize,
+    per_block: F,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
+where
+    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
+{
+    drive_witness_packed_and_lincheck_impl(
+        initial_states,
+        Some(padding),
+        n_blocks_log,
+        k_log,
+        true,
+        per_block,
+    )
+}
+
+fn drive_witness_packed_and_lincheck_impl<S: Sync, F>(
+    initial_states: &[S],
+    padding: Option<&S>,
+    n_blocks_log: usize,
+    k_log: usize,
+    full_write: bool,
+    per_block: F,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
+where
+    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
+{
     use rayon::prelude::*;
+    debug_assert!(!full_write || padding.is_some());
 
     let k = 1usize << k_log;
     let f128_per_block = k / 128;
@@ -257,12 +311,16 @@ where
             // were uninit-allocated). The per-block builder ORs 1-bits into
             // pre-zeroed words; any slot left unbuilt (no padding block) stays
             // zero, which the lincheck transpose below reads correctly.
+            // Full-write builders initialize every word themselves, so the
+            // memset (and the RMW it forces on every subsequent OR) is skipped.
             // SAFETY: F128 is `Copy` (no Drop) and the all-zero bit pattern is
             // the valid `F128::ZERO`, so a byte memset is a correct init.
-            unsafe {
-                std::ptr::write_bytes(z_grp.as_mut_ptr(), 0, z_grp.len());
-                std::ptr::write_bytes(a_grp.as_mut_ptr(), 0, a_grp.len());
-                std::ptr::write_bytes(b_grp.as_mut_ptr(), 0, b_grp.len());
+            if !full_write {
+                unsafe {
+                    std::ptr::write_bytes(z_grp.as_mut_ptr(), 0, z_grp.len());
+                    std::ptr::write_bytes(a_grp.as_mut_ptr(), 0, a_grp.len());
+                    std::ptr::write_bytes(b_grp.as_mut_ptr(), 0, b_grp.len());
+                }
             }
             for k_in in 0..8 {
                 let global_idx = 8 * g + k_in;
