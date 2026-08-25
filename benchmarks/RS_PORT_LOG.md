@@ -117,23 +117,29 @@ message. Against `9793190` (the harness-only commit, before any optimization),
 
 | level | base | head | delta |
 |---|---:|---:|---|
-| round 1 (`round1 URM`) | 1477.30 ms | 1403.07 ms | **-5.0%**, 8/8, disjoint ranges |
-| end-to-end headline | 50143 comp/s | 52566 comp/s | **+4.8%**, 8/8 |
+| round 1 (`round1 URM`) | 1477.30 ms | 1273.43 ms | **-13.8%**, each step 8/8 with disjoint ranges |
+| end-to-end headline | 52364 comp/s | 55021 comp/s | **+5.1%**, 8/8, base spread 1.7% |
+
+(The end-to-end row is the refreshed post-pmull measurement; an earlier interim
+figure of +4.8% at the three-win state had a noisy base arm and is superseded.)
 
 Caveat on the end-to-end figure: the base arm spread that run was wide
 (46894-51655, ~10%) while head was tight (51231-53209), so the point estimate is
 soft even though the sign test is not. The round-1 number is the better
 measured of the two.
 
-The three kept changes:
+The four kept changes:
 
 1. **Round-2 NEON register accumulator** (~179 lines) -- `WideNeon`, a 256-bit
    product held as two uint64x2_t instead of the GPR-resident F256Unreduced.
    -13% on `zc_round2`.
 2. **Structurally-zero b K-row skip** (~10 lines) -- see above. Part of the
    -5.0%.
-3. **Two lanes per drain iteration** (~50 lines) -- see above. Part of the
-   -5.0%.
+3. **Two lanes per drain iteration** (~50 lines) -- see above.
+4. **Unreduced pmull accumulate + x^K weight split** (~80 lines) -- the
+   challenge repo's top-attributed AB-prep mechanism, ported as an idea.
+   -128 ms on round 1 by itself (1401.4 -> 1273.4, 8/8, predicted 100-130 from
+   their attribution).
 
 ## What bounds each round-1 kernel (measured, not inferred)
 
