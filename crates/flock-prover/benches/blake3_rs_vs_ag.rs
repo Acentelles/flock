@@ -1,8 +1,12 @@
-//! BLAKE3 `prove_fast` (RS additive-NTT zerocheck) vs `prove_fast_ag` (genus-95
-//! AG-code zerocheck) head-to-head — both on the standard pack + Ligerito PCS.
-//! The ONLY difference is round 1 of the zerocheck; everything else (witness gen,
-//! commit, lincheck, ring-switch open) is shared, so this isolates the AG-skip
-//! zerocheck win at the full-proof level.
+//! BLAKE3 zerocheck-flavor head-to-head, three arms:
+//!   RS        — `prove_fast`: the UNION route (dense-stack commit, integer
+//!               lanes) with the RS additive-NTT zerocheck.
+//!   AG-direct — `prove_fast_ag`: the standard-pack (dense pow2-lane) commit
+//!               with the AG zerocheck. Different transport than RS, so the
+//!               comparison mixes commit shape with zerocheck flavor.
+//!   AG-union  — `prove_fast_union_ag`: the SAME union transport as RS with
+//!               the AG zerocheck — the apples-to-apples pair. The only
+//!               difference vs RS is round 1 of the zerocheck.
 //!
 //! Run twice for ST and MT:
 //!   cargo bench --bench blake3_rs_vs_ag                       # MT (default)
@@ -210,6 +214,51 @@ fn bench_block(n_blocks: usize, n_runs: usize, threads_label: &str) {
             "  ──> AG prove speedup vs RS: {:.3}×  ({:+.2} ms)",
             rs_prove / ag_prove,
             (rs_prove - ag_prove) * 1000.0,
+        );
+    }
+
+    // ============ AG on the UNION transport (same commit as RS) ============
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut ch_p = FsChallenger::new(b"flock-bench-v0");
+        let (p, _, _) = setup.prove_fast_union_ag(&block_sets[0], &mut ch_p);
+        black_box(&p);
+
+        let mut agu_prove = f64::INFINITY;
+        for run in 0..n_runs {
+            let mut ch_p = FsChallenger::new(b"flock-bench-v0");
+            let t0 = Instant::now();
+            let (p, _, _) = setup.prove_fast_union_ag(&block_sets[run + 1], &mut ch_p);
+            agu_prove = agu_prove.min(t0.elapsed().as_secs_f64());
+            black_box(&p);
+        }
+
+        reset_peak();
+        let mut ch_p = FsChallenger::new(b"flock-bench-v0");
+        let (proof, commitment, _) = setup.prove_fast_union_ag(&block_sets[0], &mut ch_p);
+        let peak = peak_mb();
+        let mut ch_v = FsChallenger::new(b"flock-bench-v0");
+        let t0 = Instant::now();
+        setup
+            .verify_union_ag(&commitment, &proof, &mut ch_v)
+            .expect("union-AG verify");
+        let verify_t = t0.elapsed().as_secs_f64();
+        let size = bincode::serialize(&proof)
+            .expect("ser union-AG proof")
+            .len();
+        black_box(&proof);
+
+        println!(
+            "  AGu zerocheck: prove = {}   verify = {}   proof = {}   peak = {:.1} MB",
+            fmt_ms(agu_prove),
+            fmt_ms(verify_t),
+            fmt_kb(size),
+            peak,
+        );
+        println!(
+            "  ──> union-AG prove speedup vs union-RS: {:.3}×  ({:+.2} ms)",
+            rs_prove / agu_prove,
+            (rs_prove - agu_prove) * 1000.0,
         );
     }
 

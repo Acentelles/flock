@@ -361,3 +361,82 @@ fn gf128_row_rank(mut rows: Vec<[F128; PRODUCT_MESSAGE_BITS]>) -> usize {
     }
     rank
 }
+
+/// The rejection sampler's acceptance rate is the protocol constant
+/// 1/(BASE_Y_DEGREE · 2^3) = 1/32 (up to the ~2^-56 Hasse–Weil dust) — the
+/// number behind the fused-nonce grinding credit
+/// (`zerocheck::ag_skip::AG_SAMPLING_CREDIT_BITS`). 200k attempts give
+/// σ ≈ 4·10⁻⁴; the asserted window is ±8σ around 1/32.
+#[test]
+fn acceptance_rate_is_one_in_32() {
+    let mut rng = super::Sha256Rng::new([0xACu8; 32]);
+    let n: u32 = 200_000;
+    let mut ok: u32 = 0;
+    for _ in 0..n {
+        if super::try_evaluation_point(&mut rng).is_some() {
+            ok += 1;
+        }
+    }
+    let p = f64::from(ok) / f64::from(n);
+    assert!(
+        (p - 1.0 / 32.0).abs() < 0.0032,
+        "acceptance rate {p:.5} strayed from the pinned 1/32"
+    );
+}
+
+/// Census of the BASE functional's in-circuit cost surfaces (phase D's
+/// `emit_ag_lows` sizing): the pushed-monomial count, the total XOR terms
+/// across the 64 coordinate masks, and the x-power ladder length.
+#[test]
+fn base_functional_circuit_census() {
+    use super::constants::{BASE_X_POWER_COUNT, FOUR_RUSSIANS_BLOCK_BITS};
+    use super::tables::TABLES;
+    let l = &TABLES.base_layout;
+    let mut xor_terms = 0usize;
+    for (blk, masks) in l.block_masks.iter().enumerate() {
+        let (s, e) = (
+            l.block_coordinate_offsets[blk],
+            l.block_coordinate_offsets[blk + 1],
+        );
+        for &coord in &l.block_coordinates[s..e] {
+            xor_terms += masks[coord as usize].count_ones() as usize;
+        }
+    }
+    println!(
+        "base layout: input_count {} | xor terms {} | x powers {} | blocks {} (block bits {})",
+        l.input_count,
+        xor_terms,
+        BASE_X_POWER_COUNT,
+        l.block_masks.len(),
+        FOUR_RUSSIANS_BLOCK_BITS,
+    );
+    // The in-circuit sharing estimate: per block, each DISTINCT nonzero
+    // sub-mask sum is built once (popcount-1 adds), then one add folds it
+    // into each affected coordinate.
+    let (mut pairs, mut distinct_builds, mut distinct_total) = (0usize, 0usize, 0usize);
+    for (blk, masks) in l.block_masks.iter().enumerate() {
+        let (s, e) = (
+            l.block_coordinate_offsets[blk],
+            l.block_coordinate_offsets[blk + 1],
+        );
+        let mut seen = std::collections::HashSet::new();
+        for &coord in &l.block_coordinates[s..e] {
+            let m = masks[coord as usize];
+            pairs += 1;
+            if seen.insert(m) {
+                distinct_total += 1;
+                distinct_builds += (m.count_ones() as usize).saturating_sub(1);
+            }
+        }
+    }
+    println!(
+        "sharing: (block,coord) pairs {} | distinct masks {} (build adds {}) | est rows = pushes {} + builds {} + pairs {} = {}",
+        pairs,
+        distinct_total,
+        distinct_builds,
+        l.input_count,
+        distinct_builds,
+        pairs,
+        l.input_count + distinct_builds + pairs,
+    );
+}

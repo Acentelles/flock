@@ -545,7 +545,7 @@ pub fn prove_fast_ligerito_union_circuit<Ch: Challenger>(
         pcs_open,
     } = out;
     let (bool_proof, bool_claim) = match boolean {
-        Some((p, c)) => (Some(p), Some(c)),
+        Some((p, c)) => (Some(p.expect_rs()), Some(c)),
         None => (None, None),
     };
     let (el_proof, el_claim) = match element {
@@ -611,6 +611,7 @@ pub fn prove_fast_ligerito_union<Ch: Challenger>(
         challenger,
     );
     let (piop, claim) = out.boolean.expect("asserted boolean-only above");
+    let piop = piop.expect_rs();
     (
         flock_core::proof::R1csProofMergedLigerito {
             zerocheck: piop.zerocheck,
@@ -622,11 +623,175 @@ pub fn prove_fast_ligerito_union<Ch: Challenger>(
     )
 }
 
+/// Which zerocheck the boolean class runs inside
+/// [`prove_union_with_binding_zc`]. The lincheck, claims, and opening are
+/// flavor-generic ([`SkipPoint`] carries the difference).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BooleanZcKind {
+    /// RS additive-NTT univariate skip (the default).
+    Rs,
+    /// Genus-95 AG multiplication-code skip. aarch64-only (NEON SLP
+    /// kernel); run-list read-exact like the RS flavor — see the padding
+    /// contract on `flock_core::proof::BooleanPiopProofAg`.
+    #[cfg(target_arch = "aarch64")]
+    Ag,
+}
+
+/// [`prove_fast_ligerito_union_circuit`] with the **AG-skip** boolean
+/// zerocheck — verify with
+/// [`flock_core::verifier::verify_ligerito_union_circuit_ag`] (or the
+/// `_deferred` twin). Same class PIOP order, wiring argument, and merged
+/// opening; only the boolean zerocheck's round 1 differs. The element class
+/// may be present (its PIOP is flavor-independent). Run-list read-exact —
+/// the padding contract on [`flock_core::proof::BooleanPiopProofAg`] is
+/// the owning statement. aarch64-only (the AG round-1 kernel is NEON).
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+pub fn prove_fast_ligerito_union_circuit_ag<Ch: Challenger>(
+    union: &flock_core::union::UnionInstance<'_>,
+    circuit: &flock_core::circuit::Circuit,
+    public: &[F128],
+    pcs_params: &PcsParams,
+    slots: Vec<UnionSlotProverInput<'_>>,
+    element_slots: Vec<UnionElementSlotInput<'_>>,
+    challenger: &mut Ch,
+) -> (
+    flock_core::proof::R1csProofCircuitMergedAg,
+    Commitment,
+    flock_core::proof::UnionClassClaims,
+) {
+    assert!(
+        circuit.check_instance(union),
+        "the circuit and the union instance must be the same statement \
+         (same registry, and the circuit's gate counts ARE the union's counts)"
+    );
+    assert!(
+        circuit.check_public(public),
+        "the public segment must have the circuit's declared length and fixed constants"
+    );
+    let (out, commitment) = prove_union_with_binding_zc(
+        union,
+        UnionProveBinding::Circuit(CircuitProverInput { circuit, public }),
+        BooleanZcKind::Ag,
+        pcs_params,
+        slots,
+        element_slots,
+        challenger,
+    );
+    let UnionProveOutput {
+        boolean,
+        element,
+        wiring,
+        pcs_open,
+    } = out;
+    let (bool_proof, bool_claim) = match boolean {
+        Some((p, c)) => {
+            let UnionBooleanProof::Ag(p) = p else {
+                unreachable!("the Ag flavor produces an Ag boolean proof")
+            };
+            (Some(p), Some(c))
+        }
+        None => (None, None),
+    };
+    let (el_proof, el_claim) = match element {
+        Some((p, c)) => (Some(p), Some(c)),
+        None => (None, None),
+    };
+    (
+        flock_core::proof::R1csProofCircuitMergedAg {
+            boolean: bool_proof,
+            element: el_proof,
+            wiring: wiring.expect("the circuit binding runs the wiring argument"),
+            pcs_open,
+        },
+        commitment,
+        flock_core::proof::UnionClassClaims {
+            boolean: bool_claim,
+            element: el_claim,
+        },
+    )
+}
+
+/// The zerocheck transcript alone, before the lincheck joins it in the
+/// closure's assembly step.
+enum UnionZcProof {
+    Rs(zerocheck::ZerocheckProof),
+    #[cfg(target_arch = "aarch64")]
+    Ag(flock_core::zerocheck::ag_skip::AgProof),
+}
+
+/// The boolean sub-proof [`prove_union_with_binding_zc`] hands back — the
+/// prove-side counterpart of the verifier's `BooleanPiopRef`.
+enum UnionBooleanProof {
+    Rs(flock_core::proof::BooleanPiopProof),
+    #[cfg(target_arch = "aarch64")]
+    Ag(flock_core::proof::BooleanPiopProofAg),
+}
+
+impl UnionBooleanProof {
+    fn expect_rs(self) -> flock_core::proof::BooleanPiopProof {
+        match self {
+            UnionBooleanProof::Rs(p) => p,
+            #[cfg(target_arch = "aarch64")]
+            UnionBooleanProof::Ag(_) => {
+                unreachable!("an RS-flavor entry received an AG boolean proof")
+            }
+        }
+    }
+}
+
+/// [`prove_fast_ligerito_union`] with the **AG-skip** boolean zerocheck —
+/// verify with [`flock_core::verifier::verify_ligerito_union_ag`]. Same
+/// transport, lincheck, and merged opening; only the zerocheck's round 1
+/// differs (the genus-95 AG multiplication code replaces the RS
+/// additive-NTT skip, and the claim points ride [`SkipPoint::Ag`]).
+///
+/// aarch64-only (the AG round-1 kernel is NEON SLP). Run-list read-exact —
+/// the padding contract on [`flock_core::proof::BooleanPiopProofAg`] is
+/// the owning statement; dirty pooled padding is legal for both flavors.
+#[cfg(target_arch = "aarch64")]
+pub fn prove_fast_ligerito_union_ag<Ch: Challenger>(
+    union: &flock_core::union::UnionInstance<'_>,
+    pcs_params: &PcsParams,
+    slots: Vec<UnionSlotProverInput<'_>>,
+    challenger: &mut Ch,
+) -> (
+    flock_core::proof::R1csProofMergedLigeritoAg,
+    Commitment,
+    R1csClaim,
+) {
+    assert!(
+        !union.has_element(),
+        "the AG union route is boolean-only; element registries go through          the RS mixed-class entry"
+    );
+    let (out, commitment) = prove_union_with_binding_zc(
+        union,
+        UnionProveBinding::Mixed,
+        BooleanZcKind::Ag,
+        pcs_params,
+        slots,
+        Vec::new(),
+        challenger,
+    );
+    let (piop, claim) = out.boolean.expect("asserted boolean-only above");
+    let UnionBooleanProof::Ag(boolean) = piop else {
+        unreachable!("the Ag flavor produces an Ag boolean proof")
+    };
+    (
+        flock_core::proof::R1csProofMergedLigeritoAg {
+            boolean,
+            pcs_open: out.pcs_open,
+        },
+        commitment,
+        claim,
+    )
+}
+
 /// What [`prove_union_with_binding`] produces: each class's PIOP sub-proof
 /// paired with its claims (`None` when the registry has no type of that class),
 /// plus the single opening covering all of them.
 struct UnionProveOutput {
-    boolean: Option<(flock_core::proof::BooleanPiopProof, R1csClaim)>,
+    boolean: Option<(UnionBooleanProof, R1csClaim)>,
     element: Option<(
         flock_core::element_r1cs::union::Proof,
         flock_core::element_r1cs::union::Claims,
@@ -646,6 +811,27 @@ struct UnionProveOutput {
 fn prove_union_with_binding<Ch: Challenger>(
     union: &flock_core::union::UnionInstance<'_>,
     binding: UnionProveBinding,
+    pcs_params: &PcsParams,
+    slots: Vec<UnionSlotProverInput<'_>>,
+    element_slots: Vec<UnionElementSlotInput<'_>>,
+    challenger: &mut Ch,
+) -> (UnionProveOutput, Commitment) {
+    prove_union_with_binding_zc(
+        union,
+        binding,
+        BooleanZcKind::Rs,
+        pcs_params,
+        slots,
+        element_slots,
+        challenger,
+    )
+}
+
+/// [`prove_union_with_binding`] with the boolean zerocheck flavor explicit.
+fn prove_union_with_binding_zc<Ch: Challenger>(
+    union: &flock_core::union::UnionInstance<'_>,
+    binding: UnionProveBinding,
+    bool_zc: BooleanZcKind,
     pcs_params: &PcsParams,
     slots: Vec<UnionSlotProverInput<'_>>,
     element_slots: Vec<UnionElementSlotInput<'_>>,
@@ -714,6 +900,9 @@ fn prove_union_with_binding<Ch: Challenger>(
     // its padding words are committed and must be honest zeros — dirty
     // pooling would put garbage into the committed stack (a latent hazard
     // of the pre-unification standalone body, never exercised there).
+    // Flavor-independent since the AG round 1 + fold went run-list-gated
+    // (Dead blocks skipped, Partial blocks cleansed — no declared-dead bit
+    // is read on either flavor).
     let padding_unread = !union.has_element()
         && !union.compaction_is_identity()
         && union.m_total() - union.n_log() >= pcs::LOG_PACKING;
@@ -887,7 +1076,7 @@ fn prove_union_with_binding<Ch: Challenger>(
     let t_bool = std::time::Instant::now();
     let run_boolean = |challenger: &mut Ch| {
         (union.num_boolean() > 0).then(|| {
-            let (zc_proof, zc_claim, s_hat_v_c) = {
+            let (zc_proof, z_skip, mlv_challenges, zc_r_rest, zc_c_eval, s_hat_v_c) = {
                 // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
                 let view = |v: &[F128]| -> &[u8] {
                     unsafe {
@@ -900,18 +1089,55 @@ fn prove_union_with_binding<Ch: Challenger>(
                 let a_packed = view(&a_packed_f128);
                 let b_packed = view(&b_packed_f128);
                 let c_packed = view(&z_packed);
-                zerocheck::prove_packed_padded_capture_s_hat_v_c_with_grinding(
-                    a_packed,
-                    b_packed,
-                    c_packed,
-                    m_bool,
-                    &bool_padding,
-                    pcs_params.zerocheck_grinding(),
-                    challenger,
-                )
+                match bool_zc {
+                    BooleanZcKind::Rs => {
+                        let (p, cl, sv) =
+                            zerocheck::prove_packed_padded_capture_s_hat_v_c_with_grinding(
+                                a_packed,
+                                b_packed,
+                                c_packed,
+                                m_bool,
+                                &bool_padding,
+                                pcs_params.zerocheck_grinding(),
+                                challenger,
+                            );
+                        (
+                            UnionZcProof::Rs(p),
+                            SkipPoint::Phi8(cl.z),
+                            cl.mlv_challenges,
+                            cl.r_rest,
+                            cl.c_eval,
+                            sv,
+                        )
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    BooleanZcKind::Ag => {
+                        // Run-list-gated like the RS twin: round 1 and the
+                        // fold skip Dead code blocks and cleanse Partial
+                        // ones, reading no declared-dead bit — PooledDirty
+                        // witnesses are legal here too.
+                        let (p, cl, sv) = zerocheck::ag_skip::prove_capture_s_hat_v_c_with_grinding(
+                            a_packed,
+                            b_packed,
+                            c_packed,
+                            m_bool,
+                            &bool_padding,
+                            pcs_params.zerocheck_grinding(),
+                            challenger,
+                        );
+                        (
+                            UnionZcProof::Ag(p),
+                            SkipPoint::Ag(cl.r1),
+                            cl.mlv_challenges,
+                            cl.r_rest,
+                            cl.c_eval,
+                            sv,
+                        )
+                    }
+                }
             };
 
-            let x_ab = union.x_ab_from_mlv(SkipPoint::Phi8(zc_claim.z), &zc_claim.mlv_challenges);
+            let x_ab = union.x_ab_from_mlv(z_skip, &mlv_challenges);
 
             // M2: the union-column lincheck — one sumcheck over the boolean
             // column domain against the per-slot stripes and circuits. On the M1
@@ -943,8 +1169,8 @@ fn prove_union_with_binding<Ch: Challenger>(
                 value: lc_claim.w,
             };
             let c = ZClaim {
-                point: union.c_claim_point(SkipPoint::Phi8(zc_claim.z), &zc_claim.r_rest),
-                value: zc_claim.c_eval,
+                point: union.c_claim_point(z_skip, &zc_r_rest),
+                value: zc_c_eval,
             };
 
             // `s_hat_v_from_z_vec` needs `z_vec.len() = 2^LOG_PACKING · 2^tail`;
@@ -976,15 +1202,22 @@ fn prove_union_with_binding<Ch: Challenger>(
             } else {
                 None
             };
-            (
-                flock_core::proof::BooleanPiopProof {
-                    zerocheck: zc_proof,
-                    lincheck: lc_proof,
-                },
-                R1csClaim { ab, c },
-                s_hat_v_ab,
-                s_hat_v_c,
-            )
+            let piop = match zc_proof {
+                UnionZcProof::Rs(zerocheck) => {
+                    UnionBooleanProof::Rs(flock_core::proof::BooleanPiopProof {
+                        zerocheck,
+                        lincheck: lc_proof,
+                    })
+                }
+                #[cfg(target_arch = "aarch64")]
+                UnionZcProof::Ag(ag) => {
+                    UnionBooleanProof::Ag(flock_core::proof::BooleanPiopProofAg {
+                        ag,
+                        lincheck: lc_proof,
+                    })
+                }
+            };
+            (piop, R1csClaim { ab, c }, s_hat_v_ab, s_hat_v_c)
         })
     };
     let (boolean, wiring_pre) = if par_transcript {
@@ -1920,7 +2153,7 @@ pub fn prove_fast_ligerito_union_mixed_class<Ch: Challenger>(
     } = out;
     debug_assert!(wiring.is_none(), "the Mixed binding runs no wiring");
     let (bool_proof, bool_claim) = match boolean {
-        Some((p, c)) => (Some(p), Some(c)),
+        Some((p, c)) => (Some(p.expect_rs()), Some(c)),
         None => (None, None),
     };
     let (el_proof, el_claim) = match element {

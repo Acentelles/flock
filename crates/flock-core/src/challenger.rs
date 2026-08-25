@@ -1086,9 +1086,14 @@ fn blake3_pow_preimage(state_digest: &[u8; 32], nonce: u64) -> [u8; 64] {
     pre
 }
 
-/// Whether `h` has at least `bits` leading zero bits.
+/// Whether `h` has at least `bits` leading zero bits — MSB-first within each
+/// serialized byte, the one PoW bit convention everywhere (the fused
+/// transcript PoW here, the recursion circuit's `PowMaskTable`, and the AG
+/// fused sampling nonce in `genus95_curve_code::evaluation_point_from_nonce_pow`).
+/// Public: the recursion tower's native replicas assert it beside the
+/// in-circuit PowMask rows.
 #[inline]
-fn has_leading_zero_bits(h: &[u8], bits: u32) -> bool {
+pub fn has_leading_zero_bits(h: &[u8], bits: u32) -> bool {
     let full_bytes = (bits / 8) as usize;
     let extra = bits % 8;
     for &b in h.iter().take(full_bytes) {

@@ -278,6 +278,55 @@ pub fn verify_ligerito_union<Ch: Challenger>(
     Ok(claims.boolean.expect("asserted boolean-only above"))
 }
 
+/// [`verify_ligerito_union`] with the **AG-skip** boolean zerocheck — the
+/// mirror of `flock_prover::prover::prove_fast_ligerito_union_ag`. Same
+/// statement binding, lincheck, and merged opening; only the zerocheck's
+/// round-1 replay differs (and the claim points ride [`SkipPoint::Ag`]).
+pub fn verify_ligerito_union_ag<Ch: Challenger>(
+    union: &crate::union::UnionInstance<'_>,
+    circuits: &[&dyn lincheck::LincheckCircuit],
+    commitment: &Commitment,
+    proof: &crate::proof::R1csProofMergedLigeritoAg,
+    pcs_params: &crate::pcs::PcsParams,
+    challenger: &mut Ch,
+) -> Result<R1csClaim, VerifyError> {
+    assert!(
+        !union.has_element(),
+        "the AG union route is boolean-only (the element region's PIOP is \
+         independent of the zerocheck flavor, but no mixed AG proof shape \
+         exists yet)"
+    );
+    if union.num_boolean() == 0 {
+        return Err(VerifyError::ClassMismatch);
+    }
+    let (claims, packed_direct_points, matrix, _el_matrix, _sigma) = verify_union_piops(
+        union,
+        UnionVerifyBinding::Mixed,
+        circuits,
+        commitment,
+        Some(BooleanPiopRef::Ag(&proof.boolean)),
+        None,
+        None,
+        false,
+        pcs_params,
+        challenger,
+    )?;
+    if let Some(a) = matrix {
+        a.check(union, circuits).map_err(VerifyError::Lincheck)?;
+    }
+    let claims = verify_merged_opening(
+        union,
+        commitment,
+        &claims,
+        &packed_direct_points,
+        &proof.pcs_open,
+        pcs_params,
+        challenger,
+        None,
+    )?;
+    Ok(claims.boolean.expect("boolean-only registry checked above"))
+}
+
 /// The **circuit** verify entry over the MERGED transport — the production
 /// shape, and the mirror of
 /// `flock_prover::prover::prove_fast_ligerito_union_circuit`.
@@ -311,7 +360,7 @@ pub fn verify_ligerito_union_circuit<Ch: Challenger>(
         UnionVerifyBinding::Circuit { circuit, public },
         circuits,
         commitment,
-        proof.boolean.as_ref(),
+        proof.boolean.as_ref().map(BooleanPiopRef::Rs),
         proof.element.as_ref(),
         Some(&proof.wiring),
         false,
@@ -387,7 +436,122 @@ pub fn verify_ligerito_union_circuit_deferred<Ch: Challenger>(
         UnionVerifyBinding::Circuit { circuit, public },
         circuits,
         commitment,
-        proof.boolean.as_ref(),
+        proof.boolean.as_ref().map(BooleanPiopRef::Rs),
+        proof.element.as_ref(),
+        Some(&proof.wiring),
+        true,
+        pcs_params,
+        challenger,
+    )?;
+    let mut jagged = None;
+    let claims = verify_merged_opening(
+        union,
+        commitment,
+        &claims,
+        &packed_direct_points,
+        &proof.pcs_open,
+        pcs_params,
+        challenger,
+        Some(&mut jagged),
+    )?;
+    Ok((
+        claims,
+        DeferredMatrixWork {
+            boolean: matrix,
+            element: el_matrix,
+            jagged: jagged.expect("the deferred opening fills the export"),
+        },
+        sigma.expect("a circuit binding always verifies wiring"),
+    ))
+}
+
+/// [`verify_ligerito_union_circuit`] with the **AG-skip** boolean zerocheck —
+/// the mirror of `flock_prover::prover::prove_fast_ligerito_union_circuit_ag`.
+/// Same replay; only the boolean zerocheck's round 1 differs.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_ligerito_union_circuit_ag<Ch: Challenger>(
+    union: &crate::union::UnionInstance<'_>,
+    circuit: &crate::circuit::Circuit,
+    public: &[F128],
+    circuits: &[&dyn lincheck::LincheckCircuit],
+    commitment: &Commitment,
+    proof: &crate::proof::R1csProofCircuitMergedAg,
+    pcs_params: &crate::pcs::PcsParams,
+    challenger: &mut Ch,
+) -> Result<crate::proof::UnionClassClaims, VerifyError> {
+    if !circuit.check_instance(union) || !circuit.check_public(public) {
+        return Err(VerifyError::CircuitMismatch);
+    }
+    if proof.boolean.is_some() != (union.num_boolean() > 0)
+        || proof.element.is_some() != union.has_element()
+    {
+        return Err(VerifyError::ClassMismatch);
+    }
+    let (claims, packed_direct_points, matrix, el_matrix, _sigma) = verify_union_piops(
+        union,
+        UnionVerifyBinding::Circuit { circuit, public },
+        circuits,
+        commitment,
+        proof.boolean.as_ref().map(BooleanPiopRef::Ag),
+        proof.element.as_ref(),
+        Some(&proof.wiring),
+        false,
+        pcs_params,
+        challenger,
+    )?;
+    if let Some(a) = matrix {
+        a.check(union, circuits).map_err(VerifyError::Lincheck)?;
+    }
+    if let Some(a) = el_matrix {
+        a.check_reported(union).map_err(VerifyError::Element)?;
+    }
+    verify_merged_opening(
+        union,
+        commitment,
+        &claims,
+        &packed_direct_points,
+        &proof.pcs_open,
+        pcs_params,
+        challenger,
+        None,
+    )
+}
+
+/// [`verify_ligerito_union_circuit_deferred`] with the **AG-skip** boolean
+/// zerocheck — the succinct entry the recursion tower records and replays for
+/// AG-flavored children. Same conditional-claims contract as the RS twin.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_ligerito_union_circuit_ag_deferred<Ch: Challenger>(
+    union: &crate::union::UnionInstance<'_>,
+    circuit: &crate::circuit::Circuit,
+    public: &[F128],
+    circuits: &[&dyn lincheck::LincheckCircuit],
+    commitment: &Commitment,
+    proof: &crate::proof::R1csProofCircuitMergedAg,
+    pcs_params: &crate::pcs::PcsParams,
+    challenger: &mut Ch,
+) -> Result<
+    (
+        crate::proof::UnionClassClaims,
+        DeferredMatrixWork,
+        crate::circuit::SigmaAssertion,
+    ),
+    VerifyError,
+> {
+    if !circuit.check_instance(union) || !circuit.check_public(public) {
+        return Err(VerifyError::CircuitMismatch);
+    }
+    if proof.boolean.is_some() != (union.num_boolean() > 0)
+        || proof.element.is_some() != union.has_element()
+    {
+        return Err(VerifyError::ClassMismatch);
+    }
+    let (claims, packed_direct_points, matrix, el_matrix, sigma) = verify_union_piops(
+        union,
+        UnionVerifyBinding::Circuit { circuit, public },
+        circuits,
+        commitment,
+        proof.boolean.as_ref().map(BooleanPiopRef::Ag),
         proof.element.as_ref(),
         Some(&proof.wiring),
         true,
@@ -433,7 +597,7 @@ fn verify_merged_opening<Ch: Challenger>(
         None => Vec::new(),
     };
     let values: Vec<F128> = cl.iter().map(|z| z.value).collect();
-    let z_skips: Vec<F128> = cl.iter().map(|z| z.point.z_skip.phi8()).collect();
+    let z_skips: Vec<SkipPoint> = cl.iter().map(|z| z.point.z_skip).collect();
     let x_fulls: Vec<Vec<F128>> = cl
         .iter()
         .map(|z| {
@@ -512,7 +676,7 @@ pub fn verify_ligerito_union_mixed_class<Ch: Challenger>(
         UnionVerifyBinding::Mixed,
         circuits,
         commitment,
-        proof.boolean.as_ref(),
+        proof.boolean.as_ref().map(BooleanPiopRef::Rs),
         proof.element.as_ref(),
         None,
         false,
@@ -539,7 +703,7 @@ pub fn verify_ligerito_union_mixed_class<Ch: Challenger>(
         None => Vec::new(),
     };
     let values: Vec<F128> = cl.iter().map(|z| z.value).collect();
-    let z_skips: Vec<F128> = cl.iter().map(|z| z.point.z_skip.phi8()).collect();
+    let z_skips: Vec<SkipPoint> = cl.iter().map(|z| z.point.z_skip).collect();
     let x_fulls: Vec<Vec<F128>> = cl
         .iter()
         .map(|z| {
@@ -607,7 +771,7 @@ pub fn verify_ligerito_union_mixed_class_deferred<Ch: Challenger>(
         UnionVerifyBinding::Mixed,
         circuits,
         commitment,
-        proof.boolean.as_ref(),
+        proof.boolean.as_ref().map(BooleanPiopRef::Rs),
         proof.element.as_ref(),
         None,
         false,
@@ -622,7 +786,7 @@ pub fn verify_ligerito_union_mixed_class_deferred<Ch: Challenger>(
         None => Vec::new(),
     };
     let values: Vec<F128> = cl.iter().map(|z| z.value).collect();
-    let z_skips: Vec<F128> = cl.iter().map(|z| z.point.z_skip.phi8()).collect();
+    let z_skips: Vec<SkipPoint> = cl.iter().map(|z| z.point.z_skip).collect();
     let x_fulls: Vec<Vec<F128>> = cl
         .iter()
         .map(|z| {
@@ -673,6 +837,15 @@ pub fn verify_ligerito_union_mixed_class_deferred<Ch: Challenger>(
     ))
 }
 
+/// The boolean sub-proof as [`verify_union_piops`] consumes it — either
+/// zerocheck flavor. Downstream of the zerocheck the two are identical (the
+/// lincheck and both claim points are generic over [`SkipPoint`]).
+#[derive(Clone, Copy)]
+enum BooleanPiopRef<'a> {
+    Rs(&'a crate::proof::BooleanPiopProof),
+    Ag(&'a crate::proof::BooleanPiopProofAg),
+}
+
 /// Shared PIOP replay for both union verify shapes: statement binding, the
 /// boolean class's zerocheck + lincheck over the `M_bool` prefix subcube, then
 /// the element region's PIOP. Returns the per-class claims and the element
@@ -685,7 +858,7 @@ fn verify_union_piops<Ch: Challenger>(
     binding: UnionVerifyBinding<'_>,
     circuits: &[&dyn lincheck::LincheckCircuit],
     commitment: &Commitment,
-    boolean: Option<&crate::proof::BooleanPiopProof>,
+    boolean: Option<BooleanPiopRef<'_>>,
     element: Option<&crate::element_r1cs::union::Proof>,
     wiring: Option<&crate::circuit::WiringProof>,
     defer_sigma: bool,
@@ -737,16 +910,49 @@ fn verify_union_piops<Ch: Challenger>(
                 // The boolean PIOP runs over the BOOLEAN REGION only — the
                 // prefix subcube `[0, 2^M_bool)`, `M_bool = M` for a
                 // boolean-only registry. (The element region cannot join this
-                // sum: `c = z` there.)
-                let zc_claim = zerocheck::verify_with_grinding(
-                    union.m_bool(),
-                    &piop.zerocheck,
-                    pcs_params.zerocheck_grinding(),
-                    challenger,
-                )
-                .map_err(VerifyError::Zerocheck)?;
-                let x_ab =
-                    union.x_ab_from_mlv(SkipPoint::Phi8(zc_claim.z), &zc_claim.mlv_challenges);
+                // sum: `c = z` there.) The zerocheck flavor dispatches here;
+                // everything downstream is shared, generic over the flavor's
+                // skip point.
+                let (z_skip, mlv_challenges, a_eval, b_eval, c_eval, r_rest, lincheck_proof) =
+                    match piop {
+                        BooleanPiopRef::Rs(p) => {
+                            let zc = zerocheck::verify_with_grinding(
+                                union.m_bool(),
+                                &p.zerocheck,
+                                pcs_params.zerocheck_grinding(),
+                                challenger,
+                            )
+                            .map_err(VerifyError::Zerocheck)?;
+                            (
+                                SkipPoint::Phi8(zc.z),
+                                zc.mlv_challenges,
+                                zc.a_eval,
+                                zc.b_eval,
+                                zc.c_eval,
+                                zc.r_rest,
+                                &p.lincheck,
+                            )
+                        }
+                        BooleanPiopRef::Ag(p) => {
+                            let ag = zerocheck::ag_skip::verify_with_grinding(
+                                union.m_bool(),
+                                &p.ag,
+                                pcs_params.zerocheck_grinding(),
+                                challenger,
+                            )
+                            .map_err(VerifyError::Ag)?;
+                            (
+                                SkipPoint::Ag(ag.r1),
+                                ag.mlv_challenges,
+                                ag.a_eval,
+                                ag.b_eval,
+                                ag.c_eval,
+                                ag.r_rest,
+                                &p.lincheck,
+                            )
+                        }
+                    };
+                let x_ab = union.x_ab_from_mlv(z_skip, &mlv_challenges);
                 // The union-column lincheck (one circuit per BOOLEAN slot, in
                 // slot order); the declared counts additionally bind through
                 // the per-type const-pin target terms.
@@ -757,9 +963,9 @@ fn verify_union_piops<Ch: Challenger>(
                     union,
                     circuits,
                     &x_ab,
-                    zc_claim.a_eval,
-                    zc_claim.b_eval,
-                    &piop.lincheck,
+                    a_eval,
+                    b_eval,
+                    lincheck_proof,
                     pcs_params.lincheck_grinding(),
                     challenger,
                 )
@@ -775,8 +981,8 @@ fn verify_union_piops<Ch: Challenger>(
                         value: lc_claim.w,
                     },
                     c: ZClaim {
-                        point: union.c_claim_point(SkipPoint::Phi8(zc_claim.z), &zc_claim.r_rest),
-                        value: zc_claim.c_eval,
+                        point: union.c_claim_point(z_skip, &r_rest),
+                        value: c_eval,
                     },
                 })
             }

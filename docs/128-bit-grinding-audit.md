@@ -225,6 +225,8 @@ All bit counts below are sufficient for the strict local rule.
 | Boolean lincheck batching/pins | 1 | 1 |
 | Boolean lincheck ordinary round | 2 | 2 |
 | Boolean lincheck final skip | `2^k-1` | `k` |
+| AG-skip zerocheck `r_1` (fused nonce) | 474 | 9 explicit (no sampling credit at `r_1`) |
+| AG-basis lincheck final skip (fused nonce) | 158 | 3 explicit + 5 sampling credit |
 | Element zerocheck initial equality point | `m_words` | `bits_for_degree(m_words)` |
 | Element zerocheck/lincheck ordinary round | 2 | 2 |
 | Element lincheck batching | 1 | 1 |
@@ -539,6 +541,83 @@ For each initial vector, the union of its sampled exceptional hyperplanes has
 degree at most the dimension used by `bits_for_degree`. Thus that exceptional
 family, treated as its own algebraic part, also has a strict sub-`2^-128`
 work-normalized term.
+
+### AG-skip challenge family (union-AG route)
+
+The AG-skip zerocheck (`zerocheck/ag_skip.rs`) and the AG-basis lincheck
+skip replace two φ₈-basis challenges with points on the genus-95 cover.
+Both are covered by the same strict local rule, with two AG-specific
+ingredients: code-degree numerators and a provable sampling credit.
+
+**Numerators.** Code dimensions fix the degrees through Riemann–Roch
+(`deg = dim + g - 1`, `g = 95`): the base code `L(D)` has `dim 64`, so
+`deg D = 158`; the product code `L(2D)` has `dim 222`, so `deg 2D = 316`.
+
+- `r_1` protects the round-1 message pair: a false message survives only if
+  a nonzero product-code word (at most 316 zeros — the ab check) or a
+  nonzero base-code word (at most 158 — the c check) vanishes at `r_1`:
+  numerator `474`, so `bits_for_degree(474) = 9`.
+- The lincheck's fresh AG skip point protects `z_partial` exactly as the φ₈
+  final skip does, but the interpolant is a base-code word: numerator `158`,
+  so `bits_for_degree(158) = 8` (the φ₈ basis's `2^6 - 1 = 63 -> 6` row).
+
+The challenge space is the set of valid cover points: Hasse–Weil bounds the
+genus-95 cover's count within `2 * 95 * 2^64` of `2^128`, and the sampler's
+exclusions (denominator poles — the x-degree-49 product denominator — and
+points at infinity) remove a few hundred more, so the denominator is
+`2^128 (1 - 2^-56)`; the slack is absorbed by the strict `+1` bit.
+
+**Fused nonce and the sampling credit.** Both sites derive their point by
+rejection sampling from a transcript seed, with a nonce in the proof
+(`AgProof::r1_nonce`; the lincheck's skip slot in its nonce vector). Under a
+strict schedule the nonce is FUSED: `H(seed || nonce)` must clear the
+explicit PoW target AND decode to a valid point — both criteria on the same
+hash, so every candidate an adversary evaluates re-enters the PoW and there
+is no free choice among valid nonces. The PoW predicate is the transcript
+convention: leading zero bits, MSB-first within each serialized byte, of the
+hash's second 16-byte word — the same predicate word and bit order the
+recursion circuit's `PowMaskTable` checks, so the in-circuit form is a
+gadget reuse. The verifier is one attempt (constant-shape, no rejection
+replay).
+
+The rejection sampling itself contributes exactly `log2(32) = 5` bits, by
+two facts, neither empirical:
+
+1. *Uniformity*: the sampler weights every reachable cover point at exactly
+   `1 / (2^128 * 4 * 8)` — slot flattening over the degree-4 base fiber,
+   and the z-fiber is all-or-nothing (three Artin–Schreier levels, eight
+   lifts selected by three uniform choice bits; any failure rejects the
+   whole x). So a valid draw costs at least `~32` attempts.
+2. *Hasse–Weil* pins the acceptance probability to `(1/32)(1 ± 2^-56)`.
+
+Work-normalized, a candidate costs at least one hash and succeeds with
+probability `p * 2^-b * numerator / N <= 2^-(b+5) * numerator / 2^128 * (1 + 2^-55)`,
+so `b_explicit = bits_for_degree(numerator) - 5` where the sampling credit
+applies. The credit applies at the LINCHECK skip only (**3 explicit
+bits**): its decode stays canonical end-to-end. At `r_1` the recursion
+circuit binds the decode with RELAXED canonicity (`emit_ag_point_binding`
+accepts any of the <= 32 fiber points over the XOF-derived `x`), which
+returns the sampler's 5 flattening bits to a circuit-side prover — so
+`r_1` carries **all `bits_for_degree(474) = 9` bits explicitly** and the
+total budget is unchanged. The constants are tied together by
+`ag_skip::credit_constants_are_pinned` (code degrees, the `4 * 8 = 32`
+sampler shape, and both explicit-bit splits) and the statistical pin
+`genus95_curve_code::tests::acceptance_rate_is_one_in_32`; a sampler
+reshape breaks the guard tests before it can silently void the credit.
+
+The AG protocol's seven friendly inner coordinates are protocol-fixed
+constants (the γ-geometric weights), not challenges — the same treatment as
+the boolean zerocheck's seven fixed inner coordinates in the
+challenge-dependent denominator audit above. The ungrinded direct route
+(`prove_fast_ag`) keeps the plain single-attempt nonce and makes no 128-bit
+claim (its nonce freedom is at most `log2(20000) = 14.3` bits).
+
+Remaining AG-specific obligations before a strict profile may select this
+family: an external check of the curve data underlying both uses of
+Hasse–Weil (genus, absolute irreducibility — the `AG_codes`
+`F2_human_audit/` artifacts, which the code-degree soundness already
+assumes), and the recursive-circuit treatment of the fused check (one hash
+plus one point evaluation; constant-shape by construction).
 
 ## Production coverage matrix
 
