@@ -386,21 +386,28 @@ config, same machine, days apart) and got **342 ms where it had reported
 shows round-1 samples of 92-95 ms jumping to 309 ms MID-RUN with no code
 change. 92 ms is implausibly fast for its CPU drain+fold; it is exactly what
 its Metal GPU round-1 prefix produces, and that prefix "fires if the shape
-matches and Metal's available" with no warmup latch. Working hypothesis
-(test pending on their side via FLOCK_NO_GPU_ZEROCHECK=1): their historical
-low buckets were INTERMITTENTLY GPU-ASSISTED, and their pure-CPU numbers are
-the high samples.
+matches and Metal's available" with no warmup latch. The Metal-assist hypothesis was TESTED AND REFUTED as a complete explanation:
+with both GPU arms force-disabled (FLOCK_NO_GPU_ZEROCHECK=1 and the separately
+gated FLOCK_NO_GPU_ZC_R2=1), their first samples remained chaotic (a 1182 ms
+round-2 with no GPU involved). The broader driver: this shared machine ran
+builds and benches from three concurrent Claude sessions that day, plus
+ambient load. Widen the caveat from GPU-status to: fine-grained (sub-100 ms)
+cross-tree bucket deltas from this date are unresolvable, period.
 
 Consequences for this log:
 - Every "theirs" column in the cross-tree tables is soft until their GPU
   test reports. Their bracket accounting itself was verified clean (buffer
   takes, tables, and padding all inside their round-2 timer; their tail
   honestly carries the compact-format reconstruction).
-- Against their pure-CPU-mode samples, the trees read: round 1 ~333 vs ~309,
-  round 2 ~305 vs **~342 (we are AHEAD)**, rounds 3+ ~307 vs ~319 --
-  **parity overall on equal no-GPU terms**. The 90 ms round-2 "gap" this
-  log's recent rows chased was plausibly a phantom of comparing our CPU
-  against their sometimes-GPU.
+- What the stable window of their full-GPU-off run DOES support (samples 3-7,
+  tight): their pure-CPU round 2 is 274-285 ms against our same-conditions
+  305, i.e. a residual of ~27 ms -- the size of their compact format's
+  modeled store saving (~25 ms), the one mechanism deliberately not ported.
+  The original "90 ms gap" therefore decomposes as ~25 ms format + ~65 ms
+  measurement conditions. Their tail (300-307) matches ours (307) exactly.
+  Coarse conclusion that survives all of this: the trees are within ~10% on
+  the zerocheck CPU-vs-CPU, and bucket deltas below ~50 ms cannot be
+  adjudicated on this machine this week.
 - Every KEPT win in this log is unaffected: all were internally paired A/B
   on this tree alone and never depended on their numbers.
 
