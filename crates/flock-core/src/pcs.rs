@@ -341,12 +341,40 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
             debug_assert!(b >= 2 && b.is_multiple_of(2));
             debug_assert!(rs_deferred.iter().all(|d| d.0.len() == b));
-            let fold_block = |hi: usize, out_block: &mut [F128]| {
+            // Composed-table sweep: `fold_one_slot(·, T)` is F₂-linear, so the
+            // per-slot map `lo ↦ fold_one_slot(lo·e_hi, T)` collapses into one
+            // composed byte table per claim per block (see
+            // `compose_fold_byte_table_into`) — deleting the per-slot field
+            // multiply from the L-sized sweep for a per-block table build
+            // amortized over `b` slots. Below ~2^12 slots the build doesn't
+            // amortize; tiny shapes keep the direct slot-multiply sweep.
+            const COMPOSE_MIN_BLOCK: usize = 1 << 12;
+            let composed = b >= COMPOSE_MIN_BLOCK;
+            let init_ctable = move || {
+                if composed {
+                    vec![F128::ZERO; ring_switch::FOLD_TABLE_LEN]
+                } else {
+                    Vec::new()
+                }
+            };
+            let fold_block = |ctable: &mut Vec<F128>, hi: usize, out_block: &mut [F128]| {
                 // Accumulate each claim's block: first claim writes, rest add.
-                // `e_hi` is read once per claim per block, then swept over eq_lo.
+                // `e_hi` is read once per claim per block (composed into the
+                // byte table, or multiplied per slot), then swept over eq_lo.
                 for (ci, (eq_lo, eq_hi, table, _)) in rs_deferred.iter().enumerate() {
                     let e_hi = eq_hi[hi];
-                    if ci == 0 {
+                    if composed {
+                        ring_switch::compose_fold_byte_table_into(e_hi, table, ctable);
+                        if ci == 0 {
+                            for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                                *slot = ring_switch::fold_one_slot(lo, ctable);
+                            }
+                        } else {
+                            for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                                *slot += ring_switch::fold_one_slot(lo, ctable);
+                            }
+                        }
+                    } else if ci == 0 {
                         for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
                             *slot = ring_switch::fold_one_slot(lo * e_hi, table);
                         }
@@ -362,8 +390,8 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                 let acc = b_combined_ref
                     .par_chunks_mut(b)
                     .enumerate()
-                    .map(|(hi, out_block)| {
-                        fold_block(hi, out_block);
+                    .map_init(init_ctable, |ctable, (hi, out_block)| {
+                        fold_block(ctable, hi, out_block);
                         let base = hi * b;
                         let mut acc = [F256Unreduced::ZERO; 8];
                         for g in 0..(b / 4) {
@@ -392,8 +420,8 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                 let (u0, u2) = b_combined_ref
                     .par_chunks_mut(b)
                     .enumerate()
-                    .map(|(hi, out_block)| {
-                        fold_block(hi, out_block);
+                    .map_init(init_ctable, |ctable, (hi, out_block)| {
+                        fold_block(ctable, hi, out_block);
                         // Round-0 prime over this block's pairs (b is even, base is
                         // even). Unreduced 256-bit accumulation, one reduction at
                         // the very end (XOR-linear, bit-identical to reducing per
