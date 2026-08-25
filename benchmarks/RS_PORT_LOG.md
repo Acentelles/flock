@@ -123,7 +123,7 @@ message. Against `9793190` (the harness-only commit, before any optimization),
 | round 1 (`round1 URM`) | 1477.30 ms | 1204.74 ms | **-18.4%**, each step 8/8 |
 | round 2 (`round2 fused fold`) | ~433 ms | 311.56 ms | **-28%** (WideNeon + q-resident) |
 | rounds 3+ (`rounds 3+ tail`) | ~455 ms | 306.56 ms | **-33%** (fused one-pass q-resident) |
-| end-to-end headline | 52110 comp/s | 56820 comp/s | **~+9%** (clean-band read +8.6%; first 3 pairs carried browser bursts) |
+| end-to-end headline | ~52,400 comp/s | ~58,100 comp/s | **~+11%**, 8/8 (clean-band read; per-pair delta stable +9.6..+12.4% even through throttled pairs) |
 
 (Supersedes the interim +5.1% figure from the four-win state. The final run was
 taken with an active browser session; pairs 4-8 form tight bands on both arms

@@ -24,7 +24,7 @@ Seven changes to the RS (additive-NTT) zerocheck path, each kept only after a
 paired, order-alternating A/B measurement with a decisive sign test. Together
 they reduce zerocheck round~1 from $1477\,$ms to $1205\,$ms ($-18.4\%$),
 round~2 from $433$ to $312\,$ms ($-28\%$), the rounds-3+ tail from $455$ to
-$307\,$ms ($-33\%$), and whole-proof time by more than $10\%$
+$307\,$ms ($-33\%$), and whole-proof time by $\approx11\%$
 single-threaded. Three are ideas ported
 from an independently optimized fork of this prover (the ``challenge'' tree),
 re-derived and re-implemented rather than copied; three originated here. The
@@ -352,8 +352,8 @@ Optimization & Kind & Phase effect (ST) & Sign test\\
   \multicolumn{2}{r@{}}{$433 \to 312\,$ms\quad($-28\%$)}\\
 \multicolumn{2}{@{}l}{rounds 3+ cumulative} &
   \multicolumn{2}{r@{}}{$455 \to 307\,$ms\quad($-33\%$)}\\
-\multicolumn{2}{@{}l}{end-to-end, all six} &
-  \multicolumn{2}{r@{}}{$52{,}110 \to 56{,}820$ comp/s\quad($\approx+9\%$)}\\
+\multicolumn{2}{@{}l}{end-to-end, all seven} &
+  \multicolumn{2}{r@{}}{$\approx52{,}400 \to \approx58{,}100$ comp/s\quad($\approx+11\%$, $8/8$)}\\
 \bottomrule
 \end{tabular}
 \end{table}
