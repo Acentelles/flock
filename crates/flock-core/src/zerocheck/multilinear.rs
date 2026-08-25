@@ -514,74 +514,43 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
 
                 let (mut p1_nacc, mut pinf_nacc) = (WideNeon::zero(), WideNeon::zero());
 
-                // Two x_lo per iteration: one pair's fold -> mul_q -> wide-mul
-                // chain is deep and serial, so a single pair in flight leaves
-                // the OoO engine starved (the word-extract change captured only
-                // ~8 of a predicted ~40 ms, marking this loop latency-bound).
-                // Padding holes fall back to per-pair handling; they are rare
-                // and clustered at block tails.
-                macro_rules! one_pair {
-                    ($x_lo:expr) => {{
-                        let x0l = 2 * $x_lo;
-                        let x1l = x0l + 1;
-                        if (($x_lo + pair_idx_base) & pair_in_block_mask) >= useful_pairs_inclusive
-                        {
-                            a_chunk[x0l] = F128::ZERO;
-                            a_chunk[x1l] = F128::ZERO;
-                            b_chunk[x0l] = F128::ZERO;
-                            b_chunk[x1l] = F128::ZERO;
-                            None
-                        } else {
-                            let x0g = base + 2 * $x_lo;
-                            let x1g = x0g + 1;
-                            let a0 =
-                                fold_one_row_neon_q_unchecked_8(table_ptr, a_pkt_ptr.add(x0g * 8));
-                            let b0 =
-                                fold_one_row_neon_q_unchecked_8(table_ptr, b_pkt_ptr.add(x0g * 8));
-                            let a1 =
-                                fold_one_row_neon_q_unchecked_8(table_ptr, a_pkt_ptr.add(x1g * 8));
-                            let b1 =
-                                fold_one_row_neon_q_unchecked_8(table_ptr, b_pkt_ptr.add(x1g * 8));
-                            vst1q_u8(a_chunk.as_mut_ptr().add(x0l) as *mut u8, a0);
-                            vst1q_u8(a_chunk.as_mut_ptr().add(x1l) as *mut u8, a1);
-                            vst1q_u8(b_chunk.as_mut_ptr().add(x0l) as *mut u8, b0);
-                            vst1q_u8(b_chunk.as_mut_ptr().add(x1l) as *mut u8, b1);
-                            Some((
-                                vreinterpretq_u64_u8(a0),
-                                vreinterpretq_u64_u8(a1),
-                                vreinterpretq_u64_u8(b0),
-                                vreinterpretq_u64_u8(b1),
-                            ))
-                        }
-                    }};
-                }
-                macro_rules! message {
-                    ($vals:expr, $x_lo:expr) => {{
-                        if let Some((a0, a1, b0, b1)) = $vals {
-                            let eq_q = vreinterpretq_u64_u8(vld1q_u8(
-                                eq_lo.as_ptr().add($x_lo) as *const u8,
-                            ));
-                            let g1 = mul_q(a1, b1);
-                            let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
-                            p1_nacc.xor_assign(wide_mul_unreduced_q(eq_q, g1));
-                            pinf_nacc.xor_assign(wide_mul_unreduced_q(eq_q, g_inf));
-                        }
-                    }};
-                }
-                let mut x_lo = 0usize;
-                while x_lo + 2 <= lo_size {
-                    // Interleave: both pairs' folds issue before either message
-                    // chain, doubling the independent work in flight.
-                    let v0 = one_pair!(x_lo);
-                    let v1 = one_pair!(x_lo + 1);
-                    message!(v0, x_lo);
-                    message!(v1, x_lo + 1);
-                    x_lo += 2;
-                }
-                while x_lo < lo_size {
-                    let v = one_pair!(x_lo);
-                    message!(v, x_lo);
-                    x_lo += 1;
+                for x_lo in 0..lo_size {
+                    let x0l = 2 * x_lo;
+                    let x1l = x0l + 1;
+                    if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
+                        // Padding hole: write zero (a_folded/b_folded were alloc'd
+                        // uninit, so we have to write every slot we don't fold into).
+                        a_chunk[x0l] = F128::ZERO;
+                        a_chunk[x1l] = F128::ZERO;
+                        b_chunk[x0l] = F128::ZERO;
+                        b_chunk[x1l] = F128::ZERO;
+                        continue;
+                    }
+                    let x0g = base + 2 * x_lo;
+                    let x1g = x0g + 1;
+
+                    let a0 = fold_one_row_neon_q_unchecked_8(table_ptr, a_pkt_ptr.add(x0g * 8));
+                    let b0 = fold_one_row_neon_q_unchecked_8(table_ptr, b_pkt_ptr.add(x0g * 8));
+                    let a1 = fold_one_row_neon_q_unchecked_8(table_ptr, a_pkt_ptr.add(x1g * 8));
+                    let b1 = fold_one_row_neon_q_unchecked_8(table_ptr, b_pkt_ptr.add(x1g * 8));
+
+                    // F128 is repr(C, align(16)), so these are single stores.
+                    vst1q_u8(a_chunk.as_mut_ptr().add(x0l) as *mut u8, a0);
+                    vst1q_u8(a_chunk.as_mut_ptr().add(x1l) as *mut u8, a1);
+                    vst1q_u8(b_chunk.as_mut_ptr().add(x0l) as *mut u8, b0);
+                    vst1q_u8(b_chunk.as_mut_ptr().add(x1l) as *mut u8, b1);
+
+                    let a0 = vreinterpretq_u64_u8(a0);
+                    let a1 = vreinterpretq_u64_u8(a1);
+                    let b0 = vreinterpretq_u64_u8(b0);
+                    let b1 = vreinterpretq_u64_u8(b1);
+                    let eq_q = vreinterpretq_u64_u8(vld1q_u8(
+                        eq_lo.as_ptr().add(x_lo) as *const u8
+                    ));
+                    let g1 = mul_q(a1, b1);
+                    let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
+                    p1_nacc.xor_assign(wide_mul_unreduced_q(eq_q, g1));
+                    pinf_nacc.xor_assign(wide_mul_unreduced_q(eq_q, g_inf));
                 }
                 p1_acc ^= p1_nacc.to_unreduced();
                 pinf_acc ^= pinf_nacc.to_unreduced();
