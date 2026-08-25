@@ -3325,7 +3325,9 @@ mod tests {
             let mut folded: Vec<F256> = dense.into_iter().map(F256::from).collect();
             for &r in &q {
                 folded = folded
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|pair| pair[0] + r * (pair[0] + pair[1]))
                     .collect();
             }
