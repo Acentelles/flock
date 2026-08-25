@@ -1673,6 +1673,52 @@ mod tests {
     /// byte-identical output to the serial version. F128 XOR + multiply sum
     /// is commutative + associative, so worker scheduling order doesn't
     /// affect the result.
+    /// The b === all-ones degeneration must be exact: it forces both b folds
+    /// to F128::ONE by partition of unity, which random witnesses never
+    /// exercise (an all-ones 64-bit row has probability 2^-64). Craft them.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn round2_all_ones_b_matches_serial() {
+        use crate::zerocheck::univariate_skip::pack_bits;
+        let k_skip = 6;
+        for &m in &[16usize, 17] {
+            let mut rng = Rng::new(0xB00E5 + m as u64);
+            let a = rng.bits(1 << m);
+            // b: all-ones everywhere (every pair degenerate), and a mixed
+            // variant with only the first half of rows all-ones.
+            for mode in 0..2 {
+                let b: Vec<bool> = (0..1usize << m)
+                    .map(|i| mode == 0 || i < (1 << (m - 1)) || rng.f128().lo & 1 == 1)
+                    .collect();
+                let a_packed = pack_bits(&a);
+                let b_packed = pack_bits(&b);
+                let z = rng.f128();
+                let mlv_challenges = rng.f128_vec(m - k_skip);
+                let table = UniSkipFoldTable::new(k_skip, z);
+                let par = uni_skip_fold_and_round_pair_optimized_packed(
+                    &a_packed,
+                    &b_packed,
+                    m,
+                    k_skip,
+                    &table,
+                    &mlv_challenges,
+                );
+                let ser = uni_skip_fold_and_round_pair_optimized_packed_serial(
+                    &a_packed,
+                    &b_packed,
+                    m,
+                    k_skip,
+                    &table,
+                    &mlv_challenges,
+                );
+                assert_eq!(par.0, ser.0, "a_mlv m={m} mode={mode}");
+                assert_eq!(par.1, ser.1, "b_mlv m={m} mode={mode}");
+                assert_eq!(par.2, ser.2, "msg1 m={m} mode={mode}");
+                assert_eq!(par.3, ser.3, "msg_inf m={m} mode={mode}");
+            }
+        }
+    }
+
     #[test]
     fn parallel_matches_serial() {
         for &m in &[7usize, 8, 9, 10] {
