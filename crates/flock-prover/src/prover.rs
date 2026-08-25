@@ -139,9 +139,29 @@ pub fn prove_ligerito<Ch: Challenger>(
     let z_packed_lincheck = pack_z_lincheck_from_packed(&z_packed, r1cs.m, r1cs.k_log);
 
     let padding = r1cs.padding_spec();
-    let (zc_proof, zc_claim, s_hat_v_c) = zerocheck::prove_packed_padded_capture_s_hat_v_c(
-        a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
-    );
+    let (zc_proof, zc_claim, s_hat_v_c) = if c_packed_f128.is_empty()
+        && r1cs.k_log >= 9
+        && r1cs.m - r1cs.k_log >= 3
+    {
+        // c aliases z (C = I): round 1's C side folds the lincheck stripe.
+        zerocheck::prove_packed_padded_capture_s_hat_v_c_with_stripe(
+            a_packed,
+            b_packed,
+            c_packed,
+            r1cs.m,
+            &padding,
+            challenger,
+            zerocheck::univariate_skip_optimized::StripeC {
+                stripe: &z_packed_lincheck,
+                k_log: r1cs.k_log,
+                useful_bits: r1cs.useful_bits,
+            },
+        )
+    } else {
+        zerocheck::prove_packed_padded_capture_s_hat_v_c(
+            a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
+        )
+    };
 
     let x_ab = r1cs.x_ab_from_mlv(SkipPoint::Phi8(zc_claim.z), &zc_claim.mlv_challenges);
 
@@ -656,9 +676,28 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
                 z_packed.len() * core::mem::size_of::<F128>(),
             )
         };
-        zerocheck::prove_packed_padded_capture_s_hat_v_c(
-            a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
-        )
+        // c aliases z here (C = I), so round 1's C side can be computed from
+        // the lincheck stripe -- built above, consumed by lincheck later --
+        // skipping the C transpose and the C convert-table gathers entirely.
+        if r1cs.k_log >= 9 && r1cs.m - r1cs.k_log >= 3 {
+            zerocheck::prove_packed_padded_capture_s_hat_v_c_with_stripe(
+                a_packed,
+                b_packed,
+                c_packed,
+                r1cs.m,
+                &padding,
+                challenger,
+                zerocheck::univariate_skip_optimized::StripeC {
+                    stripe: &z_packed_lincheck,
+                    k_log: r1cs.k_log,
+                    useful_bits: r1cs.useful_bits,
+                },
+            )
+        } else {
+            zerocheck::prove_packed_padded_capture_s_hat_v_c(
+                a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
+            )
+        }
     };
     // Nothing downstream reads a/b (zerocheck consumed them in rounds 1–2);
     // recycle the two buffers (2 × 2^(m-3) bytes — 128 MB at m = 29) instead
@@ -791,9 +830,28 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
                 z_packed.len() * core::mem::size_of::<F128>(),
             )
         };
-        zerocheck::prove_packed_padded_capture_s_hat_v_c(
-            a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
-        )
+        // c aliases z here (C = I), so round 1's C side can be computed from
+        // the lincheck stripe -- built above, consumed by lincheck later --
+        // skipping the C transpose and the C convert-table gathers entirely.
+        if r1cs.k_log >= 9 && r1cs.m - r1cs.k_log >= 3 {
+            zerocheck::prove_packed_padded_capture_s_hat_v_c_with_stripe(
+                a_packed,
+                b_packed,
+                c_packed,
+                r1cs.m,
+                &padding,
+                challenger,
+                zerocheck::univariate_skip_optimized::StripeC {
+                    stripe: &z_packed_lincheck,
+                    k_log: r1cs.k_log,
+                    useful_bits: r1cs.useful_bits,
+                },
+            )
+        } else {
+            zerocheck::prove_packed_padded_capture_s_hat_v_c(
+                a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
+            )
+        }
     };
     t.zerocheck_s = t0.elapsed().as_secs_f64();
     flock_core::scratch::give_f128(a_packed_f128);

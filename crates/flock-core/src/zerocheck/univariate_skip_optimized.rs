@@ -513,6 +513,7 @@ fn process_one_x_hi_with_s_hat_v(
     eq_hi_val: F128,
     convert: &[F128],
     state: &mut WorkerStateWithSHatV,
+    compute_c: bool,
 ) {
     state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
     state.partial_c_0.iter_mut().for_each(|p| *p = F128::ZERO);
@@ -543,23 +544,35 @@ fn process_one_x_hi_with_s_hat_v(
                     &mut state.a_col,
                     &mut state.b_col,
                 );
-                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-                let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
-                    .try_into()
-                    .expect("64 c-bytes per medium position");
-                bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
+                if compute_c {
+                    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+                    let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
+                        .try_into()
+                        .expect("64 c-bytes per medium position");
+                    bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
+                }
             }
 
-            kernels::accumulate_convert_with_s_hat_v(
-                &state.chunk_ab_bytes,
-                &state.chunk_c_bytes,
-                1 << N_MEDIUM,
-                convert,
-                eq_lo_val,
-                &mut state.partial_ab,
-                &mut state.partial_c_0,
-                &mut state.partial_c_1,
-            );
+            if compute_c {
+                kernels::accumulate_convert_with_s_hat_v(
+                    &state.chunk_ab_bytes,
+                    &state.chunk_c_bytes,
+                    1 << N_MEDIUM,
+                    convert,
+                    eq_lo_val,
+                    &mut state.partial_ab,
+                    &mut state.partial_c_0,
+                    &mut state.partial_c_1,
+                );
+            } else {
+                kernels::accumulate_convert_ab_only(
+                    &state.chunk_ab_bytes,
+                    1 << N_MEDIUM,
+                    convert,
+                    eq_lo_val,
+                    &mut state.partial_ab,
+                );
+            }
         } else {
             for b_med in 0..n_b_med {
                 shift_reduce_inner_ab(
@@ -572,23 +585,35 @@ fn process_one_x_hi_with_s_hat_v(
                     &mut state.a_col,
                     &mut state.b_col,
                 );
-                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-                let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
-                    .try_into()
-                    .expect("64 c-bytes per medium position");
-                bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
+                if compute_c {
+                    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+                    let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
+                        .try_into()
+                        .expect("64 c-bytes per medium position");
+                    bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
+                }
             }
 
-            kernels::accumulate_convert_with_s_hat_v(
-                &state.chunk_ab_bytes,
-                &state.chunk_c_bytes,
-                n_b_med,
-                convert,
-                eq_lo_val,
-                &mut state.partial_ab,
-                &mut state.partial_c_0,
-                &mut state.partial_c_1,
-            );
+            if compute_c {
+                kernels::accumulate_convert_with_s_hat_v(
+                    &state.chunk_ab_bytes,
+                    &state.chunk_c_bytes,
+                    n_b_med,
+                    convert,
+                    eq_lo_val,
+                    &mut state.partial_ab,
+                    &mut state.partial_c_0,
+                    &mut state.partial_c_1,
+                );
+            } else {
+                kernels::accumulate_convert_ab_only(
+                    &state.chunk_ab_bytes,
+                    n_b_med,
+                    convert,
+                    eq_lo_val,
+                    &mut state.partial_ab,
+                );
+            }
         }
     }
 
@@ -763,6 +788,86 @@ pub fn round1_shift_reduce_extract_c_packed_padded(
 /// (the bank-split convert lookup). bit_transpose, shift_reduce, eq folds
 /// are unchanged. See module-level docs for the F_2-linearity argument that
 /// makes `s_hat_v_c[(λ, 0)] + s_hat_v_c[(λ, 1)] · α == res_c_s_opt[λ]`.
+/// Round-1 C banks computed as a multilinear fold of the lincheck stripe.
+///
+/// The C side of round 1 is linear in the witness (C = I in the fast BLAKE3
+/// setup, so ĉ = ẑ), which means its two per-lane banks are multilinear
+/// evaluations and never needed the bit-transpose + convert-table machinery
+/// the quadratic AB side needs. Fold the lincheck stripe -- a buffer the
+/// prover already builds -- over the non-kept dims at the round-1 eq point:
+///
+///   - dims `k_log..m` (outer): [`crate::lincheck::partial_fold_packed_z_fast_padded`]
+///     with `eq_outer = build_eq(r[k_log..])`, the same O(witness) pass shape
+///     lincheck itself uses;
+///   - dims `7..k_log`: plain multilinear folds at `r[dim]` (this covers the
+///     top window bit(s), the four pinned medium dims -- whose true eq weights
+///     ARE `γ^b/D`, the identity the convert table hardcodes -- and small dims
+///     7..8);
+///   - dim 6 is kept: it is the bank parity;
+///   - dims 0..6 are kept: they are the ELL = 64 λ lanes.
+///
+/// Bank constants from the geometric small-eq identity `eq₃(K) = C_s·α^K`:
+/// folding dims 7..8 gives `Y_p = (C_s / eq(r₆, p)) · bank_p`, so
+/// `bank_p = eq(r₆, p) · C_s⁻¹ · Y_p` with `C_s = eq₃(0) = (1+r₆)(1+r₇)(1+r₈)`
+/// computed directly from `r` (no reliance on the pinned-value constants).
+///
+/// Returns `(bank0, bank1)` bit-identical to the drain's
+/// `(res_c_s_0, res_c_s_1)` -- asserted by
+/// `stripe_c_banks_match_drain_banks`.
+pub fn round1_c_banks_from_stripe(
+    z_stripe: &[u8],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    r: &[F128],
+) -> ([F128; ELL], [F128; ELL]) {
+    assert_eq!(r.len(), m);
+    assert!(k_log >= K_SKIP + 1 + 2, "need the parity dim + small dims in-block");
+    assert!(m - k_log >= 3, "stripe fold needs n_outer >= 8");
+
+    // 1. The one O(witness) pass: fold the outer dims.
+    let eq_outer = super::univariate_skip::build_eq(&r[k_log..]);
+    let mut v = crate::lincheck::partial_fold_packed_z_fast_padded(
+        z_stripe, m, k_log, useful_bits, &eq_outer,
+    );
+
+    // 2. Fold dims k_log-1 down to 7 at their r values. All remaining data is
+    //    tiny (<= 2^k_log F128s, halving each round).
+    let mut len = 1usize << k_log;
+    for dim in (7..k_log).rev() {
+        let rj = r[dim];
+        len >>= 1;
+        for i in 0..len {
+            let f0 = v[i];
+            let f1 = v[i + len];
+            v[i] = f0 + rj * (f0 + f1);
+        }
+    }
+    debug_assert_eq!(len, 2 * ELL);
+
+    // 3. Undo the fold's eq factors down to the drain's bank convention.
+    let r6 = r[K_SKIP];
+    let c_s = (F128::ONE + r6) * (F128::ONE + r[K_SKIP + 1]) * (F128::ONE + r[K_SKIP + 2]);
+    let c_s_inv = c_s.inv();
+    let k0 = (F128::ONE + r6) * c_s_inv;
+    let k1 = r6 * c_s_inv;
+    let mut bank0 = [F128::ZERO; ELL];
+    let mut bank1 = [F128::ZERO; ELL];
+    for lane in 0..ELL {
+        bank0[lane] = k0 * v[lane];
+        bank1[lane] = k1 * v[ELL + lane];
+    }
+    (bank0, bank1)
+}
+
+/// The lincheck stripe handed to the stripe-C round-1 entry.
+#[derive(Clone, Copy)]
+pub struct StripeC<'a> {
+    pub stripe: &'a [u8],
+    pub k_log: usize,
+    pub useful_bits: usize,
+}
+
 pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -772,6 +877,44 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
     r: &[F128],
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+    round1_with_s_hat_v_impl(
+        a_packed, b_packed, c_packed, m, k_skip, r, inv_table, padding, None,
+    )
+}
+
+/// Round 1 with the C side computed by [`round1_c_banks_from_stripe`] instead
+/// of the transpose + convert-table drain. Requires `c_packed` to be the
+/// witness itself (C = I), since the stripe is a repacking of z. The AB side
+/// is unchanged; the drain runs AB-only and the C transpose is skipped.
+#[allow(clippy::too_many_arguments)]
+pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_stripe_c(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    stripe_c: StripeC<'_>,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+    round1_with_s_hat_v_impl(
+        a_packed, b_packed, c_packed, m, k_skip, r, inv_table, padding, Some(stripe_c),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn round1_with_s_hat_v_impl(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    stripe_c: Option<StripeC<'_>>,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
     use rayon::prelude::*;
 
@@ -818,6 +961,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
                 eq_hi_val,
                 convert,
                 &mut state,
+                stripe_c.is_none(),
             );
             state
         })
@@ -833,6 +977,13 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
                 (ab1, c0_1, c1_1)
             },
         );
+
+    // With a stripe, the C banks come from the multilinear fold; the workers
+    // above ran AB-only and left their C accumulators zero.
+    let (res_c_s_0, res_c_s_1) = match stripe_c {
+        Some(sc) => round1_c_banks_from_stripe(sc.stripe, m, sc.k_log, sc.useful_bits, r),
+        None => (res_c_s_0, res_c_s_1),
+    };
 
     // Wire output: bank_0 + bank_1 reconstructs the original `res_c_s` (by
     // F_2-linearity of φ_8 over the masked-byte sum).
@@ -1132,6 +1283,111 @@ mod tests {
         };
         let d = (F128::ONE + g1) * (F128::ONE + g2) * (F128::ONE + g4) * (F128::ONE + g8);
         assert_eq!(d * d_inv_val, F128::ONE);
+    }
+
+    /// Full-entry equivalence: the stripe-C round 1 must match the classic
+    /// entry on all three outputs, dense and padded.
+    #[test]
+    fn stripe_c_entry_matches_classic() {
+        use crate::lincheck::pack_z_lincheck;
+        use crate::zerocheck::univariate_skip::pack_bits;
+
+        let k_log = 14usize;
+        for &(m, useful) in &[(17usize, 1usize << 14), (18, 1 << 14), (18, 3 << 12)] {
+            let mut rng = Rng::new(0x57217E5 + m as u64 + useful as u64);
+            let a_bits = rng.bits(1 << m);
+            let b_bits = rng.bits(1 << m);
+            let mut z_bits = rng.bits(1 << m);
+            // Honest padding: zero the rows >= useful in every block.
+            for (i, bit) in z_bits.iter_mut().enumerate() {
+                if (i & ((1 << k_log) - 1)) >= useful {
+                    *bit = false;
+                }
+            }
+            let a_p = pack_bits(&a_bits);
+            let b_p = pack_bits(&b_bits);
+            let c_p = pack_bits(&z_bits);
+            let stripe = pack_z_lincheck(&z_bits, m, k_log);
+            let outer = rng.f128_vec(m - K_SKIP - N_INNER);
+            let r = build_protocol_r(m, &outer);
+            let table = make_inv_table();
+            let padding = PaddingSpec::dense(m);
+
+            let classic = round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
+                &a_p, &b_p, &c_p, m, K_SKIP, &r, &table, &padding,
+            );
+            let striped = round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_stripe_c(
+                &a_p,
+                &b_p,
+                &c_p,
+                m,
+                K_SKIP,
+                &r,
+                &table,
+                &padding,
+                StripeC {
+                    stripe: &stripe,
+                    k_log,
+                    useful_bits: useful,
+                },
+            );
+            assert_eq!(classic.0, striped.0, "res_ab at m={m} useful={useful}");
+            assert_eq!(classic.1, striped.1, "res_c_lifted at m={m} useful={useful}");
+            assert_eq!(classic.2, striped.2, "s_hat_v_c at m={m} useful={useful}");
+        }
+    }
+
+    /// The stripe-fold C path must reproduce the drain's banks bit-for-bit.
+    /// Banks are recovered from the s_hat_v_c wire output via the module's
+    /// own constants, and the lifted C message is cross-checked too.
+    #[test]
+    fn stripe_c_banks_match_drain_banks() {
+        use crate::lincheck::pack_z_lincheck;
+        use crate::zerocheck::univariate_skip::pack_bits;
+
+        for &m in &[17usize, 18] {
+            let k_log = 14usize;
+            let mut rng = Rng::new(0x57217EC + m as u64);
+            let a_bits = rng.bits(1 << m);
+            let b_bits = rng.bits(1 << m);
+            let z_bits = rng.bits(1 << m);
+            let a_p = pack_bits(&a_bits);
+            let b_p = pack_bits(&b_bits);
+            let c_p = pack_bits(&z_bits);
+            let stripe = pack_z_lincheck(&z_bits, m, k_log);
+            let outer = rng.f128_vec(m - K_SKIP - N_INNER);
+            let r = build_protocol_r(m, &outer);
+            let table = make_inv_table();
+            let padding = PaddingSpec::dense(m);
+
+            let (_ab, c_lifted, s_hat_v_c) =
+                round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
+                    &a_p, &b_p, &c_p, m, K_SKIP, &r, &table, &padding,
+                );
+            let (bank0, bank1) =
+                round1_c_banks_from_stripe(&stripe, m, k_log, 1 << k_log, &r);
+
+            let c_2 = c_2_small_f128();
+            let alpha_inv = alpha_inv_f128();
+            for lane in 0..ELL {
+                assert_eq!(
+                    c_2 * bank0[lane],
+                    s_hat_v_c[lane],
+                    "bank0 lane {lane} at m={m}"
+                );
+                assert_eq!(
+                    c_2 * alpha_inv * bank1[lane],
+                    s_hat_v_c[ELL + lane],
+                    "bank1 lane {lane} at m={m}"
+                );
+            }
+            let mut comb = [F128::ZERO; ELL];
+            for lane in 0..ELL {
+                comb[lane] = bank0[lane] + bank1[lane];
+            }
+            let lifted = ntt_extend_f128_vec_ghash(&comb, &table);
+            assert_eq!(lifted, c_lifted, "lifted C message at m={m}");
+        }
     }
 
     #[test]
