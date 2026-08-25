@@ -8,10 +8,12 @@
 /// silently raise the minimum toolchain by twelve releases for a two-instruction
 /// idiom. (It previously sat behind `#![feature(...)]`, which made the tree
 /// nightly-only, then a hard error on stable once the feature landed.) Do not
-/// "simplify" this back.
+/// "simplify" this back — clippy 1.98's `manual_isolate_lowest_one` tries to,
+/// and the Blackwell CI runner's older toolchain cannot compile the result.
 #[inline(always)]
+#[allow(clippy::manual_isolate_lowest_one)]
 pub fn lowest_one(x: usize) -> usize {
-    x.isolate_lowest_one()
+    x & x.wrapping_neg()
 }
 
 /// Hacker's Delight (Sec. 7-3) 8×8 bit-matrix transpose stored in a `u64`.

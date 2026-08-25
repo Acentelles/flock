@@ -228,7 +228,10 @@ fn bit_spread_zero_mask_is_enforced() {
     assert_eq!(a, r1cs.apply_a(&z));
     assert_eq!(b, r1cs.apply_b(&z));
 
-    let forbidden_bit = word.isolate_lowest_one();
+    // Manual on purpose: the std method needs 1.97+, above the Blackwell
+    // CI runner's toolchain (see flock_core::bits::lowest_one).
+    #[allow(clippy::manual_isolate_lowest_one)]
+    let forbidden_bit = word & word.wrapping_neg();
     let rejected = BitSpreadInput {
         word,
         zero_mask: forbidden_bit,

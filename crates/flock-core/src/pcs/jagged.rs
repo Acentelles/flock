@@ -2392,7 +2392,7 @@ fn linear_byte_tables(images: &[F128; 128]) -> Vec<[F128; 256]> {
     let mut tables = vec![[F128::ZERO; 256]; 16];
     for (k, table) in tables.iter_mut().enumerate() {
         for v in 1usize..256 {
-            let low = v.isolate_lowest_one();
+            let low = crate::bits::lowest_one(v);
             table[v] = table[v ^ low] + images[8 * k + low.trailing_zeros() as usize];
         }
     }
