@@ -69,6 +69,8 @@ Treat the column as directional, not as a scoreboard.
 | 21 | b === all-ones round-2 pair degeneration | round 2 | 312.0 → 312.4 ms, sign 4-4 — **null** (third partial-skip-vs-ILP confirmation) | — | reverted |
 | 22 | non-temporal (STNP) round-2 output stores | round 2 | 313.1 → 350.3 ms (**+12%**), base 8/8 — STNP *inverts* on M1 (M4-specific idiom, their ablation +1.2%) | — | **reverted** |
 | 23 | **four lanes per iteration in the AB-only drain** | round-1 drain | 960.5 → 954.4 ms (−6.0, −0.6%), 7/8 | — | **KEPT** (10 lines) |
+| 25 | word-extract in the round-2 fold | round 2 | 313.1 → 305.3 ms (−7.9, −2.5%), 6/8 | — | **KEPT** |
+| 26 | two round-2 pairs per iteration | round 2 | 306.5 → 317.9 (+3.7%), base 8/8; **re-verified under challenge**: 307.1 vs 325.4, unroll worse 8/8 disjoint, regression larger under load (register spills amplify with memory contention) | — | reverted, double-sourced |
 | 24 | static-b partial loads — bounded by probe, not implemented | round-1 prep | deleting ALL b gathers: 954 → 750.6 ms, so ceiling = 33.7% × 204 ≈ **69 ms**; realistic ≈ 15–20 at measured partial-skip capture rates, vs 200–800 lines | — | **closed on the bound** |
 | 20 | **word-extract addressing in the prep** (16 byte-loads per K-row → 2 word loads + shifts) | round-1 prep | **1027.6 → 974.8 ms (−52.7, −5.1%), 6/6** | — | **KEPT** |
 
