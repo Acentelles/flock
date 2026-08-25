@@ -213,11 +213,17 @@ from ~1403 to ~1330 ms), ~380 ms gathers+XORs.
 At our request they kill-switched their sumcheck lookahead on their own machine:
 591 -> 514 ms with it OFF (13-15% loss when on, all 6 paired samples),
 matching this tree's M1 measurement (285.9 vs 307.2 in the AG tail). It is
-default-ON in their tree and loses on both chips. Their actual rounds-2+
-mechanism is cascade2/cascade3: composing rho into a 32 KiB byte table so round
-pairs (5+6, 7+8) collapse into one composed double-fold each, deleting a full
-DRAM pass and a Fiat-Shamir round boundary per fusion — exact reassociation,
-unmeasured individually.
+default-ON in their tree and loses on both chips. Cascade2/cascade3 (composed
+double-folds via a 32 KiB rho byte table) was the initial candidate for their
+remaining rounds-2+ edge, but a follow-up kill-switch run on their machine says
+otherwise: with cascade OFF and lookahead ON, rounds 2+ measured ~736 ms avg
+(noisy, 612-964, low confidence), while their fastest configuration remains
+lookahead fully OFF (~514 ms) -- where cascade structurally never fires, since
+it requires lookahead. So their rounds-2+ advantage over this tree's ~800 ms
+lives in the BASE per-round kernels: the register-resident wide-arithmetic
+family in their multilinear kernels (2779 lines against this tree's 56; the
+same family our round-2 WideNeon win was one piece of), not the fusion
+machinery. Cascade's own contribution could not be cleanly isolated.
 
 Direct consequence for THIS tree: the ligerito OPEN runs the same lookahead
 family by default (landed in #30, presumably tuned on the M4 Max reference
