@@ -174,6 +174,65 @@ structural explanations we can test account for it. That points at
 generated `aarch64_bstatic_gen.rs` -- i.e. the specialized-and-generated
 kernel zoo, which is exactly the bloat this effort set out to avoid.
 
+## Anatomy of the remaining zerocheck gap (from the challenge-repo session)
+
+The session holding the c576e68 checkout read its own kernels and explained the
+mechanisms behind each sub-phase advantage. Recorded here because the *shape*
+of each answer matters for what upstream should do next.
+
+**AB prep (548 vs ~770 ms): one real arithmetic-kernel win.** Their
+`fused_apply_one_k_fast` replaces the incumbent's per-lane REDUCED GF(2^8)
+multiply (`gf8_mul_vec16`) with an UNREDUCED carry-less multiply (raw
+PMULL/PMULL2) and defers all reduction into an incremental Horner fold
+(`acc = acc*x XOR lo XOR hi`, one fused BCAX per step, precomputed carry
+constant x^16 mod p = 0x5e). Same gathers, same passes; cheaper arithmetic.
+~50-60% of the prep gap, per their attribution. The rest is traffic: zero-copy
+views into the precompute buffer instead of a per-row scratch memcpy
+(DIRECT_AB_ROWS) and skipping the zero-fill of dead tail rows
+(AB_COMPACT_STORE). This is the one honest kernel-quality gap, and it is
+portable as a technique.
+
+**Round-1 drain (314 vs ~590 ms): structural — they do not run this
+computation.** Their active path never reads c_packed, never bit-transposes,
+never touches the convert table. Because C = I (C aliases z), the round-1
+C-claim derives from the LINCHECK STRIPE via an eq-fold
+(`partial_fold_packed_z_best`) plus ring-switch's own fold8
+(`s_hat_v_fold8_from_z_vec`), a small quad fold, and one collapse to the
+two-half s_hat_v_c layout. This refines the "stripe dedup does not exist"
+section below: the index algebra there is correct — the stripe cannot feed
+*this tree's drain shape* — but they compute the same OUTPUT by a different
+algorithm, so the dedup exists at the algorithm level, not the buffer level.
+Their per-lane gather cost model simply does not apply. (Unresolved caveat:
+part of their 314 ms may be a Metal GPU prefix they could not isolate.)
+
+Decomposition of OUR 590 ms drain, all measured: ~136 ms C bit-transpose,
+~75 ms per-lane eq multiplies (timing probe: removing the muls took round 1
+from ~1403 to ~1330 ms), ~380 ms gathers+XORs.
+
+**Rounds 2+ (538 vs ~800 ms): NOT lookahead — lookahead is a shared regression.**
+At our request they kill-switched their sumcheck lookahead on their own machine:
+591 -> 514 ms with it OFF (13-15% loss when on, all 6 paired samples),
+matching this tree's M1 measurement (285.9 vs 307.2 in the AG tail). It is
+default-ON in their tree and loses on both chips. Their actual rounds-2+
+mechanism is cascade2/cascade3: composing rho into a 32 KiB byte table so round
+pairs (5+6, 7+8) collapse into one composed double-fold each, deleting a full
+DRAM pass and a Fiat-Shamir round boundary per fusion — exact reassociation,
+unmeasured individually.
+
+Direct consequence for THIS tree: the ligerito OPEN runs the same lookahead
+family by default (landed in #30, presumably tuned on the M4 Max reference
+machine) with the kill-switch `LIG_LOOKAHEAD_DISABLE=1`. Measured separately —
+see below if a result was recorded.
+
+**Connective tissue:** a size-classed scratch allocator (take_f128/give_f128)
+recycling large buffers across prove calls; the same recycle-don't-allocate
+pattern as their largest historical non-GPU win.
+
+Net revision to the earlier "no big idea" conclusion: the gap is NOT dozens of
+micro-tunings. It is one structural algorithm change (drain), one arithmetic
+kernel (prep), one fusion family (rounds 2+), plus a shared lookahead
+regression that is an upstream opportunity rather than a deficit.
+
 ## The lincheck-stripe dedup does not exist (checked, closed)
 
 The most promising remaining idea was that `z` gets transposed twice -- once
