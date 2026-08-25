@@ -1,5 +1,7 @@
 use crate::field::F128;
 
+// Unused on targets with a dedicated kernel; kept as the reference/fallback.
+#[cfg_attr(any(target_arch = "aarch64", target_arch = "x86_64"), allow(dead_code))]
 #[inline]
 pub(super) fn butterfly_row_pair(top: &mut [F128], bot: &mut [F128], twiddle: F128) {
     for lane in 0..top.len() {
@@ -11,6 +13,8 @@ pub(super) fn butterfly_row_pair(top: &mut [F128], bot: &mut [F128], twiddle: F1
 }
 
 #[allow(clippy::too_many_arguments)]
+// Unused on targets with a dedicated kernel; kept as the reference/fallback.
+#[cfg_attr(any(target_arch = "aarch64", target_arch = "x86_64"), allow(dead_code))]
 #[inline]
 pub(super) fn butterfly_fused_2layer(
     a: &mut [F128],

@@ -359,6 +359,7 @@ impl AdditiveNttF128 {
             target_feature = "avx512f",
             target_feature = "vpclmulqdq"
         ));
+        let t_top = std::time::Instant::now(); // TEMP PROBE
         let mut layer = start_layer.min(n_top);
         while layer < n_top {
             let num_blocks = 1usize << layer;
@@ -423,6 +424,17 @@ impl AdditiveNttF128 {
                 layer += 1;
             }
         }
+
+        // TEMP PROBE
+        if std::env::var_os("FLOCK_NTT_SPLIT").is_some() {
+            eprintln!(
+                "[ntt-split] top layers ({} of {}): {:.2} ms",
+                n_top - start_layer.min(n_top),
+                log_d,
+                t_top.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        let t_deep = std::time::Instant::now(); // TEMP PROBE
 
         // Deep layers: process each sub-NTT-group cache-resident.
         let sub_size_positions = 1usize << (log_d - n_top);
@@ -506,6 +518,16 @@ impl AdditiveNttF128 {
             crate::all_core_pool().install(|| deep(data));
         } else {
             deep(data);
+        }
+        if std::env::var_os("FLOCK_NTT_SPLIT").is_some() {
+            eprintln!(
+                "[ntt-split] deep layers ({}): {:.2} ms",
+                log_d - n_top,
+                t_deep.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        #[allow(unreachable_code)]
+        {
         }
     }
 
