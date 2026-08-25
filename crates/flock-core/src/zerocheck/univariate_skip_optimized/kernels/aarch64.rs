@@ -318,10 +318,42 @@ pub(crate) fn shift_reduce_inner_ab_neon(
 // into the per-(K, lane) 16-bit accumulators.
 // ---------------------------------------------------------------------------
 
+/// Unreduced carry-less products of the 8 low / high lanes (raw PMULL).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn pmull_lo_u16(
+    a: core::arch::aarch64::uint8x16_t,
+    b: core::arch::aarch64::uint8x16_t,
+) -> core::arch::aarch64::uint16x8_t {
+    use core::arch::aarch64::*;
+    unsafe {
+        vreinterpretq_u16_p16(vmull_p8(
+            core::mem::transmute::<uint8x8_t, poly8x8_t>(vget_low_u8(a)),
+            core::mem::transmute::<uint8x8_t, poly8x8_t>(vget_low_u8(b)),
+        ))
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn pmull_hi_u16(
+    a: core::arch::aarch64::uint8x16_t,
+    b: core::arch::aarch64::uint8x16_t,
+) -> core::arch::aarch64::uint16x8_t {
+    use core::arch::aarch64::*;
+    unsafe {
+        vreinterpretq_u16_p16(vmull_p8(
+            core::mem::transmute::<uint8x8_t, poly8x8_t>(vget_high_u8(a)),
+            core::mem::transmute::<uint8x8_t, poly8x8_t>(vget_high_u8(b)),
+        ))
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
-    table_base: *const u8,
+    a_table: *const u8,
+    b_table: *const u8,
     a_byte: u8,
     b_byte: u8,
     da0: &mut core::arch::aarch64::uint8x16_t,
@@ -335,8 +367,8 @@ unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
 ) {
     use core::arch::aarch64::*;
     unsafe {
-        let ra = table_base.add(a_byte as usize * 64);
-        let rb = table_base.add(b_byte as usize * 64);
+        let ra = a_table.add(a_byte as usize * 64);
+        let rb = b_table.add(b_byte as usize * 64);
         let va0 = vld1q_u8(ra.add((0 ^ BH) * 16));
         let va1 = vld1q_u8(ra.add((1 ^ BH) * 16));
         let va2 = vld1q_u8(ra.add((2 ^ BH) * 16));
@@ -375,6 +407,7 @@ unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn fused_apply_one_k<const K: i32>(
+    a_table: *const u8,
     table_base: *const u8,
     a_row: *const u8,
     b_row: *const u8,
@@ -387,7 +420,6 @@ unsafe fn fused_apply_one_k<const K: i32>(
     acc3_lo: &mut core::arch::aarch64::uint16x8_t,
     acc3_hi: &mut core::arch::aarch64::uint16x8_t,
 ) {
-    use crate::field::gf2_8::neon::gf8_mul_vec16;
     use core::arch::aarch64::*;
     unsafe {
         // Structurally-zero b row: the BLAKE3 circuit pins ~6% of the b
@@ -402,7 +434,7 @@ unsafe fn fused_apply_one_k<const K: i32>(
             return;
         }
         // b = 0: identity permutation — plain load of the 4 chunks.
-        let ra0 = table_base.add(*a_row as usize * 64);
+        let ra0 = a_table.add(*a_row as usize * 64);
         let rb0 = table_base.add(*b_row as usize * 64);
         let mut da0 = vld1q_u8(ra0);
         let mut da1 = vld1q_u8(ra0.add(16));
@@ -415,6 +447,7 @@ unsafe fn fused_apply_one_k<const K: i32>(
 
         // b = 1..7: XOR with table row[bytes[b]], permuted per (BH, ODD).
         xor_apply_byte_into_8_regs::<0, true>(
+            a_table,
             table_base,
             *a_row.add(1),
             *b_row.add(1),
@@ -428,6 +461,7 @@ unsafe fn fused_apply_one_k<const K: i32>(
             &mut db3,
         );
         xor_apply_byte_into_8_regs::<1, false>(
+            a_table,
             table_base,
             *a_row.add(2),
             *b_row.add(2),
@@ -441,6 +475,7 @@ unsafe fn fused_apply_one_k<const K: i32>(
             &mut db3,
         );
         xor_apply_byte_into_8_regs::<1, true>(
+            a_table,
             table_base,
             *a_row.add(3),
             *b_row.add(3),
@@ -454,6 +489,7 @@ unsafe fn fused_apply_one_k<const K: i32>(
             &mut db3,
         );
         xor_apply_byte_into_8_regs::<2, false>(
+            a_table,
             table_base,
             *a_row.add(4),
             *b_row.add(4),
@@ -467,6 +503,7 @@ unsafe fn fused_apply_one_k<const K: i32>(
             &mut db3,
         );
         xor_apply_byte_into_8_regs::<2, true>(
+            a_table,
             table_base,
             *a_row.add(5),
             *b_row.add(5),
@@ -480,6 +517,7 @@ unsafe fn fused_apply_one_k<const K: i32>(
             &mut db3,
         );
         xor_apply_byte_into_8_regs::<3, false>(
+            a_table,
             table_base,
             *a_row.add(6),
             *b_row.add(6),
@@ -493,6 +531,7 @@ unsafe fn fused_apply_one_k<const K: i32>(
             &mut db3,
         );
         xor_apply_byte_into_8_regs::<3, true>(
+            a_table,
             table_base,
             *a_row.add(7),
             *b_row.add(7),
@@ -506,21 +545,43 @@ unsafe fn fused_apply_one_k<const K: i32>(
             &mut db3,
         );
 
-        // F_8 multiply lane-wise (4 × 16 lanes = 64 total).
-        let y0 = gf8_mul_vec16(da0, db0);
-        let y1 = gf8_mul_vec16(da1, db1);
-        let y2 = gf8_mul_vec16(da2, db2);
-        let y3 = gf8_mul_vec16(da3, db3);
-
-        // Widen-shift by K, XOR into the 16-bit accumulators.
-        *acc0_lo = veorq_u16(*acc0_lo, vshll_n_u8::<K>(vget_low_u8(y0)));
-        *acc0_hi = veorq_u16(*acc0_hi, vshll_n_u8::<K>(vget_high_u8(y0)));
-        *acc1_lo = veorq_u16(*acc1_lo, vshll_n_u8::<K>(vget_low_u8(y1)));
-        *acc1_hi = veorq_u16(*acc1_hi, vshll_n_u8::<K>(vget_high_u8(y1)));
-        *acc2_lo = veorq_u16(*acc2_lo, vshll_n_u8::<K>(vget_low_u8(y2)));
-        *acc2_hi = veorq_u16(*acc2_hi, vshll_n_u8::<K>(vget_high_u8(y2)));
-        *acc3_lo = veorq_u16(*acc3_lo, vshll_n_u8::<K>(vget_low_u8(y3)));
-        *acc3_hi = veorq_u16(*acc3_hi, vshll_n_u8::<K>(vget_high_u8(y3)));
+        // Accumulate the UNREDUCED products, decomposing the x^K row weight
+        // as x^4 (the caller passed the x^4-scaled gather table for K >= 4)
+        // * x^2 (cheap byte-wise multiply on the reduced a operand)
+        // * x^(K&1) (a u16 shift; both reducers are exact over the full
+        // 16-bit domain -- gf2_8::tests::*_reduce_full_u16_domain). This
+        // deletes the per-K gf8_mul_vec16 reduction (4 of its 6 PMULLs),
+        // keeping only the 2 raw product PMULLs; reduction happens once per
+        // block in gf8_reduce_vec16 at the end, unchanged.
+        let (da0, da1, da2, da3) = if (K >> 1) & 1 == 1 {
+            use crate::field::gf2_8::neon::gf8_mul_x2_vec16;
+            (
+                gf8_mul_x2_vec16(da0),
+                gf8_mul_x2_vec16(da1),
+                gf8_mul_x2_vec16(da2),
+                gf8_mul_x2_vec16(da3),
+            )
+        } else {
+            (da0, da1, da2, da3)
+        };
+        macro_rules! absorb {
+            ($acc:expr, $p:expr) => {{
+                let p = $p;
+                if K & 1 == 1 {
+                    *$acc = veorq_u16(*$acc, vshlq_n_u16::<1>(p));
+                } else {
+                    *$acc = veorq_u16(*$acc, p);
+                }
+            }};
+        }
+        absorb!(acc0_lo, pmull_lo_u16(da0, db0));
+        absorb!(acc0_hi, pmull_hi_u16(da0, db0));
+        absorb!(acc1_lo, pmull_lo_u16(da1, db1));
+        absorb!(acc1_hi, pmull_hi_u16(da1, db1));
+        absorb!(acc2_lo, pmull_lo_u16(da2, db2));
+        absorb!(acc2_hi, pmull_hi_u16(da2, db2));
+        absorb!(acc3_lo, pmull_lo_u16(da3, db3));
+        absorb!(acc3_hi, pmull_hi_u16(da3, db3));
     }
 }
 
@@ -539,6 +600,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon(
 
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
     let table_base = inv_table.data_ptr();
+    let table_x4 = inv_table.data_x4_ptr();
 
     unsafe {
         let mut acc0_lo = vdupq_n_u16(0);
@@ -556,6 +618,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon(
             ($k:literal) => {{
                 let off = byte_base_b + $k * N_CHUNKS;
                 fused_apply_one_k::<$k>(
+                    if $k >= 4 { table_x4 } else { table_base },
                     table_base,
                     a_packed.as_ptr().add(off),
                     b_packed.as_ptr().add(off),
