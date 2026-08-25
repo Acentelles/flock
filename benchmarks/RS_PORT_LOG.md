@@ -62,6 +62,7 @@ Treat the column as directional, not as a scoreboard.
 | 13 | constant-fold all-ones b K-rows | round 1 | 1420.0 → 1413.9 (−6.1, −0.43%), 7/8 | — | reverted (~90 lines for 6 ms) |
 | 14 | **two lanes per iteration in the drain** | round-1 drain | **1483.1 → 1420.0 ms (−63.1, −4.3%), head 8/8** | — | **KEPT** |
 | 15 | **unreduced pmull accumulate + x^K weight split (x⁴ table image · x² byte-mul · u16 shift)** | round-1 prep | **1401.4 → 1273.4 ms (−128.0, −9.1%), head 8/8, every pair −8.7..−10.1%** | — | **KEPT** |
+| 16 | **stripe-fold C side: round-1 C banks from one multilinear fold of the lincheck stripe; drain runs AB-only, C transpose deleted** | round 1 | **1277.5 → 1204.7 ms (−72.7, −5.7%), head 8/8** | — | **KEPT** |
 
 Net kept: **round 2 −13.4% ST**, total 4781.0 → 4716.2 ST (−1.4%), for 179
 added lines.
