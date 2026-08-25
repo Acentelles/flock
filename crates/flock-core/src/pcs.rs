@@ -565,6 +565,49 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         let mask = (1usize << n_lo) - 1;
         let bs = |u: usize| lo[u & mask] * hi[u >> n_lo];
         let blk = eqpoint_round0_block;
+        if blk == 1 {
+            // The ladder statically rejects a lookahead on this shape:
+            // `fold_block == 1` comes with the factored (JIT) basis, so
+            // `kind_ok` in extension.rs never consumes it. Run the lean
+            // prime-only pass (2 muls/pair) instead of paying the doubled
+            // lookahead accumulation for coefficients nothing reads.
+            const C: usize = 1 << 13;
+            let (round0_u0, round0_u2) = packed_witness
+                .par_chunks(C)
+                .enumerate()
+                .map(|(ci, qc)| {
+                    let base = ci * C;
+                    let mut a = F128::ZERO;
+                    let mut b = F128::ZERO;
+                    for (j, qp) in qc.as_chunks::<2>().0.iter().enumerate() {
+                        let u = base + 2 * j;
+                        let (w0, w1) = (bs(u), bs(u + 1));
+                        a += qp[0] * w0;
+                        b += (qp[0] + qp[1]) * (w0 + w1);
+                    }
+                    (a, b)
+                })
+                .reduce(
+                    || (F128::ZERO, F128::ZERO),
+                    |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+                );
+            if trace {
+                eprintln!(
+                    "  [open_batch] combine (seeded EqPoint, L={l}): {:6.2} ms",
+                    t.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            return CombinedClaim {
+                ring_switches: Vec::new(),
+                batching_nonces,
+                b_combined: Vec::new(),
+                eq_basis: Some((lo, hi, n_lo)),
+                eq_gamma: Some(gammas_pd[0]),
+                target_combined,
+                round0_prime: (round0_u0, round0_u2),
+                round1_lookahead: None,
+            };
+        }
         // The same seeded pass now also accumulates the ROUND-1 message's
         // quadratic coefficients in the round-0 fold challenge, under the
         // fold's own pairing: quad `q` covers the four consecutive
