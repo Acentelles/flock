@@ -102,11 +102,18 @@ pub(crate) unsafe fn fold_one_row_neon_q_unchecked_8(
     use core::arch::aarch64::*;
     unsafe {
         const STRIDE: usize = 256 * 16;
-        let mut acc = vld1q_u8(table_data.add((*bytes_ptr) as usize * 16));
+        // One u64 load + in-register extracts instead of eight byte loads:
+        // the bytes only feed gather addresses, so the extraction rides the
+        // integer side and the freed load slots go to the table gathers.
+        // Same mechanism as the round-1 prep word-extract (-5.1% there).
+        let w = u64::from_le((bytes_ptr as *const u64).read_unaligned());
+        let mut acc = vld1q_u8(table_data.add((w & 0xff) as usize * 16));
         for j in 1..8usize {
             acc = veorq_u8(
                 acc,
-                vld1q_u8(table_data.add(j * STRIDE + (*bytes_ptr.add(j)) as usize * 16)),
+                vld1q_u8(
+                    table_data.add(j * STRIDE + ((w >> (8 * j)) & 0xff) as usize * 16),
+                ),
             );
         }
         acc
