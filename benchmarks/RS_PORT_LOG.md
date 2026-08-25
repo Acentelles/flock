@@ -793,3 +793,41 @@ the always-on sparse transpose-NTT, not this. The not-ported decision stands
 with their own numbers behind it. Their run also showed the familiar
 environmental spike (two trailing samples at ~2× on BOTH arms identically) —
 same all-week pattern, comparison-safe, logged for the record.
+
+## Witness gen, ST: streamed full-write builder (2026-08-25, kept)
+
+Focused bench (`genwitness_phase`, n=65536, m=30): ours 95.9 ms best /
+123 avg; their default 61.4/62.4; their scalar path (FLOCK_NO_WITGEN_SIMD=1)
+73.8/76.1. So their edge decomposed as: streamed full-write + unrolled Gs
+(−22 ms) then SIMD quad lockstep (−12 ms more).
+
+Ported the first, natively: three `PackedWordWriter`s publish complete u64s
+sequentially (rows are contiguous through USEFUL_BITS), killing BOTH the
+driver's per-group memset and the OR path's read-modify-write on every
+store; the 56-G sequence unrolls with literal state/message indices. The
+one out-of-order region (out_lo, 256-bit aligned) is reserved and
+overwritten at the end. Bit-identical through the whole driver (new test:
+real + padding slots, both values of the prefix carry bit).
+
+Paired alternating A/B, best-of-12 per invocation: **ST 87.1–90.0 →
+64.8–68.9 ms (−24%, 3/3 disjoint ranges); 8T 18.0–18.3 → 14.4–15.8 ms
+(−20%, 2/2)**. Avg variance also fell (113 → 88 ms ST). In-prove witness
+bucket: 89.5 → 67.3 ms. Our streamed scalar now BEATS their scalar (73.8);
+their remaining SIMD-quad edge is ~3–7 ms ST for ~400+ lines of NEON
+lockstep + NT-drain + scratch-provenance machinery — fails the bloat bar.
+
+## Re-baseline: full ST cross-tree table after the open + witness ports
+
+Same day, same machine, GPU off on their arm (their Aug 22 binary),
+n=65536: ours witness 67.3 / commit 300.8 / zerocheck 396.9 / lincheck
+56.4 / open 146.7 / **total 967.4 ms (67.7k comp/s)**; theirs 30.4 /
+424.8 / 217.3 / 42.2 / 132.7 / **total 847.1 ms (77.4k comp/s)**. Headline
+gap **1.46× (start of day) → 1.14×**. Two buckets remain confounded, both
+in their favor's appearance only: their commit carries their round-1 AB
+prep (known since the zerocheck campaign) — commit+zerocheck combined is
+697.7 vs 642.1 (1.09×, matching the ~10% kernel-quality verdict) — and
+their in-prove witness bucket (30.4) is HALF their own focused bench
+(61.4), so something (seed-pipe speculation or the rate2-codeword fusion)
+moves witness work out of that bucket; under investigation. Honest
+remaining real gaps: lincheck 1.34×, their witness accounting, ~9% kernel
+quality in zerocheck+commit.
