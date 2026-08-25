@@ -382,6 +382,46 @@ coefficients accumulated in the combine's tail are an accounting wash, not a
 speedup: tail-plus-initial-sumcheck costs $60.5$ vs.\ $60.6\,$ms across the
 two trees' opposite placements of the same work.
 
+\section{Witness generation: streaming full-word publication}
+\label{sec:streamwit}
+
+The BLAKE3 witness builder fills three bit-packed buffers (z, a, b; one bit
+per R1CS wire) per compression block. The incumbent wrote them by OR-ing
+sub-word fields into pre-zeroed storage: a $\approx$130\,MB\,$\times$3 memset,
+then a read-modify-write on every store. But the circuit's rows are
+\emph{contiguous} through the block's useful bits, so a sequential writer
+that carries a partial word in a register can publish complete u64s in
+order and never read the destination --- the memset and the RMW tax both
+disappear. The one out-of-order region (the output chaining value, 256-bit
+aligned) is reserved and overwritten once the final state is known. The
+fixed 56-G compression schedule is also fully unrolled with literal
+state/message indices, exposing the whole dependency graph to register
+allocation. Bit-identical through the driver (tested against the OR
+builder on real and padding slots, both values of the prefix carry bit).
+Measured, paired: ST $87$--$90 \to 64.8$--$68.9\,$ms ($-24\%$, $3/3$
+disjoint); 8T $-20\%$. Idea from the challenge tree; their further
+$\approx$$3$--$7\,$ms SIMD-lockstep stage was priced against its
+$\approx$400 lines and not taken.
+
+\section{Lincheck fold: one word load per stripe, two stripes per pass}
+\label{sec:lcfold}
+
+The lincheck's dominant pass folds the 128\,MB packed witness through
+per-stripe 256-entry byte tables into eight Q-register accumulators. The
+loop is load-port bound (M1: 3 loads/cycle), and the incumbent spent 16
+loads per stripe step: 8 table entries \emph{plus 8 scalar byte loads} for
+the indices. The indices are 8 adjacent bytes --- one u64 load and GPR
+shift-extracts replace all eight --- and folding two stripes per iteration
+lets the two table entries enter the accumulator as an XOR pair, which LLVM
+fuses to a single \code{EOR3} under the SHA3 feature: $\approx$9 loads per
+stripe, same XOR multiset, bit-identical. Measured, paired:
+\code{partial\_fold\_z} ST $40.7$--$40.8 \to 27.8$--$28.0\,$ms ($-32\%$,
+$3/3$ disjoint) --- landing on the pass's computed $\approx$28\,ms load
+floor; 8T $-28\%$. This supersedes the earlier ``no reachable headroom''
+verdict, which had priced blocking and table-geometry changes but not the
+index-load restructure (idea from the challenge tree's asm kernel,
+re-expressed in intrinsics).
+
 \section{Summary}
 
 \begin{table}[h]
@@ -406,6 +446,10 @@ Optimization & Kind & Phase effect (ST) & Sign test\\
   rounds 3+: $-31.8\%$ & $8/8$\\
 \S\ref{sec:composedfold}\ composed fold table (PCS open) & work removal &
   open combine: $-17\%$ & decisive\\
+\S\ref{sec:streamwit}\ streamed witness builder & work removal &
+  witness gen: $-24\%$ & $3/3$\\
+\S\ref{sec:lcfold}\ two-stripe word-load fold & work removal &
+  lincheck fold: $-32\%$ & $3/3$\\
 \midrule
 \multicolumn{2}{@{}l}{round 1 cumulative} &
   \multicolumn{2}{r@{}}{$1477 \to 1205\,$ms\quad($-18.4\%$)}\\
