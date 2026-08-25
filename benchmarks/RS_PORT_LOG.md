@@ -67,6 +67,9 @@ Treat the column as directional, not as a scoreboard.
 | 18 | **fused q-resident rounds-3+ tail: fold+message in one pass, second read pass over multi-MB chunks deleted** | rounds 3+ | **449.5 → 306.6 ms (−31.8%), 8/8, every pair −31.1..−32.6% — largest single win of the effort** | — | **KEPT** |
 | 19 | **stripe fold through lincheck's tiled dispatcher** (was calling the portable fallback; its 256 KiB accumulator thrashes L2 at k_log=14) | round-1 C fold | **1191.0 → 1023.7 ms (−167.3, −14.0%), 8/8, every pair −13.6..−14.4%** | — | **KEPT** |
 | 21 | b === all-ones round-2 pair degeneration | round 2 | 312.0 → 312.4 ms, sign 4-4 — **null** (third partial-skip-vs-ILP confirmation) | — | reverted |
+| 22 | non-temporal (STNP) round-2 output stores | round 2 | 313.1 → 350.3 ms (**+12%**), base 8/8 — STNP *inverts* on M1 (M4-specific idiom, their ablation +1.2%) | — | **reverted** |
+| 23 | **four lanes per iteration in the AB-only drain** | round-1 drain | 960.5 → 954.4 ms (−6.0, −0.6%), 7/8 | — | **KEPT** (10 lines) |
+| 24 | static-b partial loads — bounded by probe, not implemented | round-1 prep | deleting ALL b gathers: 954 → 750.6 ms, so ceiling = 33.7% × 204 ≈ **69 ms**; realistic ≈ 15–20 at measured partial-skip capture rates, vs 200–800 lines | — | **closed on the bound** |
 | 20 | **word-extract addressing in the prep** (16 byte-loads per K-row → 2 word loads + shifts) | round-1 prep | **1027.6 → 974.8 ms (−52.7, −5.1%), 6/6** | — | **KEPT** |
 
 Net kept: **round 2 −13.4% ST**, total 4781.0 → 4716.2 ST (−1.4%), for 179
@@ -363,6 +366,15 @@ Zerocheck like-for-like standing: ~1643 vs ~1376 = **1.19x** (was 1.74x
 fairly accounted, "2.7x" as first misread). Rounds 3+ (1.03x) and drain+fold
 (1.06x) are closed; round 2 (1.45x, ~97 ms, their compact-fold mechanism) is
 the largest remaining relative gap.
+
+## Machine-specific tunings: three inversions/nulls on M1
+
+Mechanisms measured good on the challenge tree's M4 that fail on M1:
+oblock fold gating (comment claims 1.4-1.7x, measures 0.97-0.99x here),
+zerocheck-tail lookahead (default-ON there, loses 7-15% on BOTH machines),
+and STNP output stores (+1.2% there, **+12% regression** here -- the
+non-temporal hint costs store throughput on M1 instead of saving RFO
+traffic). Port memory-system hints only with a local paired measurement.
 
 ## The SHA-256 cross-circuit control
 
