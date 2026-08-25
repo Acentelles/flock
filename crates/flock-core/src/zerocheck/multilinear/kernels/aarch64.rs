@@ -9,6 +9,32 @@ use crate::field::F128;
 /// # Safety
 /// Caller must guarantee `table_data` points to ≥ 8 × 256 × 16 valid bytes
 /// (an `n_chunks ≥ 8` table) and `bytes_ptr` to ≥ 8 valid bytes.
+/// Non-temporal store of two adjacent 16-byte register values (STNP).
+///
+/// The round-2 output arrays are a write-once ~1 GiB surface consumed a full
+/// round later; plain stores read-for-ownership every line first. STNP skips
+/// the RFO and keeps the lines out of the caches the fold table needs.
+///
+/// # Safety
+/// `dst` must be valid for 32 bytes.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) unsafe fn store_pair_nt_pub(
+    dst: *mut u8,
+    v0: core::arch::aarch64::uint8x16_t,
+    v1: core::arch::aarch64::uint8x16_t,
+) {
+    unsafe {
+        core::arch::asm!(
+            "stnp {v0:q}, {v1:q}, [{dst}]",
+            v0 = in(vreg) v0,
+            v1 = in(vreg) v1,
+            dst = in(reg) dst,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
 /// Fused fold-and-message pass for the rounds-3+ tail, entirely in q
 /// registers. The incumbent shape made two passes per worker chunk -- fold
 /// `a_in`/`b_in` into `a_out`/`b_out`, then RE-READ the multi-megabyte output
