@@ -943,6 +943,14 @@ impl flock_core::lincheck::LincheckCircuit for Blake3LincheckCircuit {
         K
     }
 
+    // Without this override the trait default (`None`) silently drops the
+    // constant-wire pin the R1CS declares, reopening the all-zero-witness
+    // gap for any caller pairing this walker with a pinned setup — the
+    // keccak/merkle walkers all override; this one had inherited the default.
+    fn const_pin_col(&self) -> Option<usize> {
+        Some(Z_CONST_POS)
+    }
+
     fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
         assert_eq!(eq_inner.len(), K, "eq_inner length must equal n_cols = K");
         let mut comb = vec![F128::ZERO; K];
@@ -2202,6 +2210,17 @@ pub fn generate_witness_batch_major_partial_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The walker's constant-wire pin must equal the pin the R1CS itself
+    /// declares — a walker inheriting the trait's `None` default silently
+    /// drops the pin and reopens the all-zero-witness gap.
+    #[test]
+    fn walker_const_pin_matches_r1cs() {
+        use flock_core::lincheck::LincheckCircuit as _;
+        let r1cs = build_block_r1cs(3);
+        assert_eq!(Blake3LincheckCircuit.const_pin_col(), r1cs.const_pin);
+        assert_eq!(r1cs.const_pin, Some(Z_CONST_POS));
+    }
 
     /// The IO schema must cover **every free-witness input region**: a word
     /// the relation does not pin and the schema does not expose is a value the
