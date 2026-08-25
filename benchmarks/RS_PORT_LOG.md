@@ -655,3 +655,44 @@ small-eq + shift_reduce, geometric medium-eq + 64 KB convert-table lookups, and
 D^-1 absorbed into eq_lo — are **already in this tree**; the doc headers are
 byte-identical to the challenge repo's. They are inherited upstream code, not a
 Yukon addition, and nothing there needs porting.
+
+## Commit phase, ST: decomposition and the refuted butterfly rewrite (2026-08-25)
+
+Commit-phase breakdown at m=32, single-threaded (`FLOCK_COMMIT_M=32
+FLOCK_NTT_SPLIT=1 RAYON_NUM_THREADS=1`, bench `pcs_commit`):
+alloc/pad ~90 ms (prefault-hidden in the real prover), **NTT 858 ms** (top 9
+fused-2 layers 329 ms, deep 11 blocked layers 529 ms), **merkle 417 ms** —
+merkle is at the SHA-256 silicon floor (~2.6 GB/s) and closed.
+
+**Refuted experiment — "q-resident 3-PMULL karatsuba butterflies"** (reverted,
+this commit). The premise was a misdiagnosis: `butterfly_row_pair` /
+`butterfly_fused_2layer` have no aarch64 dispatch arm, so I read the portable
+fallback as "scalar, 6 PMULLs through the struct/GPR interface". Wrong — the
+portable butterfly is generic over `F128` ops, and `F128::mul` on aarch64
+inlines `ghash_mul_binius` (gf2_128.rs:104-115, where the comment records that
+M-series picked binius over karatsuba). The baseline was already running the
+M1-tuned mul, register-resident after inlining.
+
+Measured, same session, same machine state, m=32 ST:
+
+| arm | top 9 | deep 11 | NTT total |
+|---|---|---|---|
+| baseline (binius via generic path) | 328.6 ms | 529.5 ms | 858 ms |
+| karatsuba + q-resident kernels, GPR half-sums | 540 ms | 873 ms | 1410 ms |
+| same, half-sums moved to NEON (veor+vext) | 525 ms | 835 ms | 1360 ms |
+
++58% regression, reproduced across two runs pre-fix and confirmed post-fix;
+the GPR-vs-NEON sum was worth only ~4 points of the 58. Fewer PMULLs lost to
+binius's shape: karatsuba's mid-term chain plus a per-butterfly vzip/reduce/
+vunzip repack costs more than the three PMULLs it saves. This is the sixth
+confirmation that re-encoding fixed work never pays on this machine (0/6), and
+it extends the rule to PMULL count itself: **binius's 6-PMULL mul beats
+3-PMULL karatsuba in situ on M1, not just in the latency microbench**.
+
+Kept from the episode: the `FLOCK_COMMIT_M` bench knob and the temporary
+`FLOCK_NTT_SPLIT` probe (strip the probe when the commit campaign closes).
+Remaining commit-ST headroom candidates, unmeasured: aarch64 fused-4 for the
+top layers (`fused4_ok` is currently x86-only; top layers are full-buffer
+sweeps, so deeper fusion removes memory passes — the win category with the
+best track record), and nothing else obvious; cross-tree, our commit was
+already at parity or ahead.

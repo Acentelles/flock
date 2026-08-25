@@ -31,19 +31,10 @@ pub(super) fn butterfly_row_pair(top: &mut [F128], bot: &mut [F128], twiddle: F1
         x86_64::butterfly_row_pair(top, bot, twiddle);
     }
 
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    // SAFETY: the cfg gate guarantees the aes target feature.
-    unsafe {
-        aarch64::butterfly_row_pair_neon(top, bot, twiddle);
-    }
-
-    #[cfg(not(any(
-        all(target_arch = "aarch64", target_feature = "aes"),
-        all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq"
-        )
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
     )))]
     portable::butterfly_row_pair(top, bot, twiddle);
 }
@@ -73,19 +64,10 @@ pub(super) fn butterfly_fused_2layer(
         x86_64::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
     }
 
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    // SAFETY: the cfg gate guarantees the aes target feature.
-    unsafe {
-        aarch64::butterfly_fused_2layer_neon(a, b, c, d, t_outer, t_inner_a, t_inner_b);
-    }
-
-    #[cfg(not(any(
-        all(target_arch = "aarch64", target_feature = "aes"),
-        all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq"
-        )
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
     )))]
     portable::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
 }
