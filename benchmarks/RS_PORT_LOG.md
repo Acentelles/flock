@@ -61,6 +61,7 @@ Treat the column as directional, not as a scoreboard.
 | 12 | **skip structurally-zero b K-rows** | round 1 | **1475.4 → 1433.0 ms (−42.4, −2.9%), head 8/8** | — | **KEPT** |
 | 13 | constant-fold all-ones b K-rows | round 1 | 1420.0 → 1413.9 (−6.1, −0.43%), 7/8 | — | reverted (~90 lines for 6 ms) |
 | 14 | **two lanes per iteration in the drain** | round-1 drain | **1483.1 → 1420.0 ms (−63.1, −4.3%), head 8/8** | — | **KEPT** |
+| 15 | **unreduced pmull accumulate + x^K weight split (x⁴ table image · x² byte-mul · u16 shift)** | round-1 prep | **1401.4 → 1273.4 ms (−128.0, −9.1%), head 8/8, every pair −8.7..−10.1%** | — | **KEPT** |
 
 Net kept: **round 2 −13.4% ST**, total 4781.0 → 4716.2 ST (−1.4%), for 179
 added lines.
@@ -344,6 +345,18 @@ tracking, and a disagreeing witness falls through to the generic path.
 
 This is strictly better than the challenge repo's `static_b` fast path, which
 still loads a precomputed partial for these rows.
+
+**3. Unreduced pmull accumulate in the prep kernel (−128.0 ms, 8/8) — the
+largest single win of the effort, and the challenge repo's own top-attributed
+mechanism, ported as an idea (~80 lines).** `gf8_mul_vec16` spent 6 PMULLs per
+K-row per block — 2 for the raw product, 4 for a reduction that was redundant,
+since the accumulator gets one final reduce anyway. Now the raw product
+accumulates unreduced, with the x^K row weight decomposed as x^4 (a pre-scaled
+second table image to gather from — F_2-linearity makes scaled entries scale
+the XOR-sum) times x^2 (a 6-op byte-mul) times x^(K&1) (a u16 shift). Terms
+reach degree 15; both reducers were verified exact over the full 16-bit domain
+first (exhaustive tests now permanent in gf2_8). Predicted 100-130 ms from the
+challenge session's attribution; measured 128.
 
 **2. Two lanes per drain iteration (−63.1 ms, 8/8).** The drain carries three
 XOR chains per lane, each of depth `n_b_med` = 16. The gathers feeding them are
