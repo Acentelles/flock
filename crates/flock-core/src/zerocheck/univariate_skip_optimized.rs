@@ -827,7 +827,12 @@ pub fn round1_c_banks_from_stripe(
 
     // 1. The one O(witness) pass: fold the outer dims.
     let eq_outer = super::univariate_skip::build_eq(&r[k_log..]);
-    let mut v = crate::lincheck::partial_fold_packed_z_fast_padded(
+    // The tiled NEON dispatcher, not the portable fallback: at k_log = 14 the
+    // portable kernel's length-k accumulator is 256 KiB -- twice M1's L1D --
+    // so every accumulate becomes an L2 round trip. The tiled kernels keep
+    // BLOCK_K = 8 accumulators in registers across a stripe sweep, which is
+    // why lincheck's own fold runs this shape at roughly half the cost.
+    let mut v = crate::lincheck::partial_fold_packed_z_best(
         z_stripe, m, k_log, useful_bits, &eq_outer,
     );
 
