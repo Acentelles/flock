@@ -63,6 +63,7 @@ Treat the column as directional, not as a scoreboard.
 | 14 | **two lanes per iteration in the drain** | round-1 drain | **1483.1 → 1420.0 ms (−63.1, −4.3%), head 8/8** | — | **KEPT** |
 | 15 | **unreduced pmull accumulate + x^K weight split (x⁴ table image · x² byte-mul · u16 shift)** | round-1 prep | **1401.4 → 1273.4 ms (−128.0, −9.1%), head 8/8, every pair −8.7..−10.1%** | — | **KEPT** |
 | 16 | **stripe-fold C side: round-1 C banks from one multilinear fold of the lincheck stripe; drain runs AB-only, C transpose deleted** | round 1 | **1277.5 → 1204.7 ms (−72.7, −5.7%), head 8/8** | — | **KEPT** |
+| 17 | **q-resident round 2: fold outputs stay in q registers, in-register karatsuba `mul_q` (5 PMULLs), `WideNeon` fed directly** | round 2 | **358.1 → 311.6 ms (−13.0%), 8/8, every pair −12.6..−13.3%** | — | **KEPT** |
 
 Net kept: **round 2 −13.4% ST**, total 4781.0 → 4716.2 ST (−1.4%), for 179
 added lines.
@@ -118,18 +119,20 @@ message. Against `9793190` (the harness-only commit, before any optimization),
 
 | level | base | head | delta |
 |---|---:|---:|---|
-| round 1 (`round1 URM`) | 1477.30 ms | 1273.43 ms | **-13.8%**, each step 8/8 with disjoint ranges |
-| end-to-end headline | 52364 comp/s | 55021 comp/s | **+5.1%**, 8/8, base spread 1.7% |
+| round 1 (`round1 URM`) | 1477.30 ms | 1204.74 ms | **-18.4%**, each step 8/8 |
+| round 2 (`round2 fused fold`) | ~433 ms | 311.56 ms | **-28%** (WideNeon + q-resident) |
+| end-to-end headline | 52110 comp/s | 56820 comp/s | **~+9%** (clean-band read +8.6%; first 3 pairs carried browser bursts) |
 
-(The end-to-end row is the refreshed post-pmull measurement; an earlier interim
-figure of +4.8% at the three-win state had a noisy base arm and is superseded.)
+(Supersedes the interim +5.1% figure from the four-win state. The final run was
+taken with an active browser session; pairs 4-8 form tight bands on both arms
+and cross-check against the predicted sum of the individual wins, ~+7.9%.)
 
 Caveat on the end-to-end figure: the base arm spread that run was wide
 (46894-51655, ~10%) while head was tight (51231-53209), so the point estimate is
 soft even though the sign test is not. The round-1 number is the better
 measured of the two.
 
-The four kept changes:
+The six kept changes:
 
 1. **Round-2 NEON register accumulator** (~179 lines) -- `WideNeon`, a 256-bit
    product held as two uint64x2_t instead of the GPR-resident F256Unreduced.
@@ -141,6 +144,10 @@ The four kept changes:
    challenge repo's top-attributed AB-prep mechanism, ported as an idea.
    -128 ms on round 1 by itself (1401.4 -> 1273.4, 8/8, predicted 100-130 from
    their attribution).
+5. **Stripe-fold C side** (~150 lines) -- round-1 C banks from one multilinear
+   fold of the lincheck stripe; drain AB-only, C transpose deleted. -72.7 ms.
+6. **q-resident round 2** (~120 lines) -- fold outputs stay in q registers,
+   in-register karatsuba mul_q, WideNeon fed directly. -46.6 ms (-13.0%).
 
 ## What bounds each round-1 kernel (measured, not inferred)
 

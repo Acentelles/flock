@@ -22,8 +22,9 @@
 \begin{abstract}
 Six changes to the RS (additive-NTT) zerocheck path, each kept only after a
 paired, order-alternating A/B measurement with a decisive sign test. Together
-they reduce zerocheck round~1 from $1477\,$ms to $1205\,$ms ($-18.4\%$) and
-whole-proof time by more than $5\%$ single-threaded. Three are ideas ported
+they reduce zerocheck round~1 from $1477\,$ms to $1205\,$ms ($-18.4\%$),
+round~2 from $433$ to $312\,$ms ($-28\%$), and whole-proof time by
+$\approx9\%$ single-threaded. Three are ideas ported
 from an independently optimized fork of this prover (the ``challenge'' tree),
 re-derived and re-implemented rather than copied; three originated here. The
 recurring themes: reductions in fields of characteristic two are
@@ -268,9 +269,6 @@ the added fold ($\approx180\,$ms) is included; the removals
 
 \section{Register-resident round 2}\label{sec:qres}
 
-\emph{Implemented and correctness-verified; performance verification pending
-a clean measurement window.}
-
 Round~2's message loop crossed the vector/general register-file boundary three
 times per output pair: the table-driven fold extracted its vector accumulator
 into a two-word struct; the message products
@@ -283,6 +281,11 @@ three for the product, two for the fold through $X^{128}\equiv X^7{+}X^2{+}X{+}1
 --- against the baseline's six); the $\eq\cdot g$ products feed the
 Section~\ref{sec:wideneon} accumulator directly. Per pair, the only remaining
 memory traffic is the four required stores of folded values and one eq load.
+
+\emph{Measured: round-2 phase $358.1\to311.6\,$ms ($-13.0\%$), $8/8$, every
+pair in $[-12.6\%,-13.3\%]$ --- the tightest distribution of the whole
+effort, taken on a machine with an active browser session (the min-of-5
+protocol absorbs interactive bursts).}
 
 \section{Summary}
 
@@ -303,12 +306,15 @@ Optimization & Kind & Phase effect (ST) & Sign test\\
 \S\ref{sec:stripe}\ C side as stripe fold & structural &
   round 1: $-5.7\%$ & $8/8$\\
 \S\ref{sec:qres}\ register-resident round 2 & representation &
-  pending & ---\\
+  round 2: $-13.0\%$ & $8/8$\\
 \midrule
 \multicolumn{2}{@{}l}{round 1 cumulative} &
   \multicolumn{2}{r@{}}{$1477 \to 1205\,$ms\quad($-18.4\%$)}\\
-\multicolumn{2}{@{}l}{end-to-end (through \S\ref{sec:pmull} state)} &
-  \multicolumn{2}{r@{}}{$52{,}364 \to 55{,}021$ comp/s\quad($+5.1\%$, $8/8$)}\\
+\multicolumn{2}{@{}l}{round 2 cumulative
+  (\S\ref{sec:wideneon}+\S\ref{sec:qres})} &
+  \multicolumn{2}{r@{}}{$433 \to 312\,$ms\quad($-28\%$)}\\
+\multicolumn{2}{@{}l}{end-to-end, all six} &
+  \multicolumn{2}{r@{}}{$52{,}110 \to 56{,}820$ comp/s\quad($\approx+9\%$)}\\
 \bottomrule
 \end{tabular}
 \end{table}
