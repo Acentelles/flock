@@ -330,7 +330,12 @@ fn generate_f_and_claim(
             let mut acc = F128::ZERO;
             let mut m_one = F128::ZERO;
             let mut m_inf = F128::ZERO;
-            for (bp, qp) in b_chunk.chunks_exact(2).zip(q_chunk.chunks_exact(2)) {
+            for (bp, qp) in b_chunk
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .zip(q_chunk.as_chunks::<2>().0.iter())
+            {
                 let t = qp[1] * bp[1];
                 acc += qp[0] * bp[0] + t;
                 m_one += t;
@@ -2387,7 +2392,7 @@ fn linear_byte_tables(images: &[F128; 128]) -> Vec<[F128; 256]> {
     let mut tables = vec![[F128::ZERO; 256]; 16];
     for (k, table) in tables.iter_mut().enumerate() {
         for v in 1usize..256 {
-            let low = v & v.wrapping_neg();
+            let low = crate::bits::lowest_one(v);
             table[v] = table[v ^ low] + images[8 * k + low.trailing_zeros() as usize];
         }
     }
@@ -2790,7 +2795,7 @@ fn build_combined_weight_and_msg(
             }
             let mut p1 = F128::ZERO;
             let mut pi = F128::ZERO;
-            for (j, ap) in chunk.chunks_exact(2).enumerate() {
+            for (j, ap) in chunk.as_chunks::<2>().0.iter().enumerate() {
                 let u = start as usize + 2 * j;
                 let q0 = partner.at(eq, u);
                 let q1 = partner.at(eq, u + 1);
@@ -3806,7 +3811,7 @@ struct SparseSeg {
 fn seg_msg(x: &[F128], y: &[F128]) -> (F128, F128) {
     let mut p1 = F128::ZERO;
     let mut pi = F128::ZERO;
-    for (xp, yp) in x.chunks_exact(2).zip(y.chunks_exact(2)) {
+    for (xp, yp) in x.as_chunks::<2>().0.iter().zip(y.as_chunks::<2>().0.iter()) {
         p1 += xp[1] * yp[1];
         pi += (xp[0] + xp[1]) * (yp[0] + yp[1]);
     }

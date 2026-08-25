@@ -3492,6 +3492,16 @@ pub struct FoldLookahead {
     u2: [F128; 3],
 }
 
+/// In-process A/B override for the F256 ladder's WHOLE alternating fold
+/// schedule — the round-1 lookahead skip AND every mid-ladder `La256`
+/// production + skip round it seeds, through the initial folds and all
+/// recursive levels: `0` follows the `FLOCK_NO_FOLD_LOOKAHEAD` env knob,
+/// `1` forces the schedule on, `2` forces the plain per-round folds.
+/// Byte-identical either way (exact polynomial identity) — the oracle
+/// tests alternate this to prove it.
+pub static FOLD_LOOKAHEAD_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
 impl FoldLookahead {
     #[inline]
     fn eval(&self, r: F128) -> SumcheckMessage {
@@ -3499,6 +3509,16 @@ impl FoldLookahead {
         SumcheckMessage {
             u_0: self.u0[0] + r * self.u0[1] + r2 * self.u0[2],
             u_2: self.u2[0] + r * self.u2[1] + r2 * self.u2[2],
+        }
+    }
+
+    /// Componentwise addition. The coefficients are LINEAR in the basis, so
+    /// a post-combine basis delta corrects a stored lookahead by adding the
+    /// delta's own coefficients.
+    pub(crate) fn add(&mut self, other: &FoldLookahead) {
+        for i in 0..3 {
+            self.u0[i] += other.u0[i];
+            self.u2[i] += other.u2[i];
         }
     }
 }
@@ -3569,6 +3589,54 @@ pub(crate) fn xor_acc8(mut a: [F256Unreduced; 8], b: [F256Unreduced; 8]) -> [F25
         a[k] ^= b[k];
     }
     a
+}
+
+/// [`round_msg_and_eval_lsb`] that ALSO accumulates the round-1 message's
+/// quadratic coefficients in the round-0 fold challenge (the entry-pass use
+/// of [`lookahead_accum_group`], plus one odd-dot accumulator for the full
+/// evaluation `y = Σ f·b`). One sweep, LSB pairing (`d = 1`).
+///
+/// The F256 ladder's L0 OOD loop uses this to keep a caller-provided
+/// [`FoldLookahead`] LIVE across the OOD β-glues: the coefficients are
+/// linear in the basis, so `b += β·eq_z` corrects the lookahead by
+/// `β · (coefficients of (f, eq_z))` — which this returns.
+pub(crate) fn round_msg_eval_and_lookahead(
+    f: &[F128],
+    b: &[F128],
+) -> (SumcheckMessage, F128, FoldLookahead) {
+    use rayon::prelude::*;
+    debug_assert_eq!(f.len(), b.len());
+    debug_assert!(f.len() >= 4 && f.len().is_multiple_of(4));
+    // 9 accumulators: the 8 lookahead slots + the odd dot (y = u_0 + odd).
+    let group =
+        |fq: &[F128; 4], bq: &[F128; 4], acc: &mut [F256Unreduced; 8], odd: &mut F256Unreduced| {
+            lookahead_accum_group(fq, bq, acc);
+            *odd ^= fq[1].mul_unreduced(bq[1]) ^ fq[3].mul_unreduced(bq[3]);
+        };
+    const CHUNK: usize = 1 << 12;
+    let (acc, odd) = f
+        .par_chunks(CHUNK)
+        .zip(b.par_chunks(CHUNK))
+        .map(|(fc, bc)| {
+            let mut acc = [F256Unreduced::ZERO; 8];
+            let mut odd = F256Unreduced::ZERO;
+            for (fq, bq) in fc.as_chunks::<4>().0.iter().zip(bc.as_chunks::<4>().0) {
+                group(fq, bq, &mut acc, &mut odd);
+            }
+            (acc, odd)
+        })
+        .reduce(
+            || ([F256Unreduced::ZERO; 8], F256Unreduced::ZERO),
+            |(a, ao), (b, bo)| {
+                (xor_acc8(a, b), {
+                    let mut o = ao;
+                    o ^= bo;
+                    o
+                })
+            },
+        );
+    let (msg, la) = lookahead_finish(acc);
+    (msg, msg.u_0 + odd.reduce(), la)
 }
 
 /// Entry lookahead pass: fold ONE variable (`n → n/2`) and return this
@@ -4144,6 +4212,57 @@ fn round_msg_and_eval_eq_point_blocked(
             |(a0, a2, ae), (b0, b2, be)| (a0 + b0, a2 + b2, ae + be),
         );
     (SumcheckMessage { u_0, u_2 }, y)
+}
+
+/// [`round_msg_and_eval_eq_point_blocked`] that ALSO accumulates the round-1
+/// message's quadratic coefficients in the round-0 fold challenge, under the
+/// same BLOCK pairing (`d = 1` is the LSB order). Quad `b` covers the four
+/// consecutive `d`-blocks `[4bd, 4bd+4d)`: fold 0 pairs blocks (0,1) and
+/// (2,3), fold 1 pairs the two results — exactly the fused fold kernels'
+/// geometry, so [`lookahead_accum_group`] applies verbatim with blocked
+/// gathering. Used by the F256 ladder's factored L0 OOD loop to keep a
+/// caller lookahead live across the β-glues.
+pub(crate) fn round_msg_eval_and_lookahead_eq_point_blocked(
+    f: &[F128],
+    point: &[F128],
+    d: usize,
+) -> (SumcheckMessage, F128, FoldLookahead) {
+    use rayon::prelude::*;
+    debug_assert_eq!(f.len(), 1usize << point.len());
+    debug_assert!(d.is_power_of_two() && f.len().is_multiple_of(4 * d));
+    let eq = VirtualEqTerm::new(point.to_vec(), F128::ONE);
+    let (acc, odd) = (0..f.len() / (4 * d))
+        .into_par_iter()
+        .map(|q| {
+            let mut acc = [F256Unreduced::ZERO; 8];
+            let mut odd = F256Unreduced::ZERO;
+            let i0 = 4 * q * d;
+            for k in 0..d {
+                let i = i0 + k;
+                let fq = [f[i], f[i + d], f[i + 2 * d], f[i + 3 * d]];
+                let bq = [
+                    eq.value_at(i),
+                    eq.value_at(i + d),
+                    eq.value_at(i + 2 * d),
+                    eq.value_at(i + 3 * d),
+                ];
+                lookahead_accum_group(&fq, &bq, &mut acc);
+                odd ^= fq[1].mul_unreduced(bq[1]) ^ fq[3].mul_unreduced(bq[3]);
+            }
+            (acc, odd)
+        })
+        .reduce(
+            || ([F256Unreduced::ZERO; 8], F256Unreduced::ZERO),
+            |(a, ao), (b, bo)| {
+                (xor_acc8(a, b), {
+                    let mut o = ao;
+                    o ^= bo;
+                    o
+                })
+            },
+        );
+    let (msg, la) = lookahead_finish(acc);
+    (msg, msg.u_0 + odd.reduce(), la)
 }
 
 pub struct SumcheckProver {
@@ -7795,10 +7914,90 @@ mod tests {
         eprintln!("LigeritoProof bincode size: {} bytes", bytes.len());
     }
 
-    /// `recursive_prover_with_basis` + `recursive_verifier_with_basis`
-    /// roundtrip — this is the basefold-compatible signature that
-    /// `pcs::open_batch` will call. Single-claim case (`b = eq(z, ·)`,
-    /// `target = poly(z)`) — must round-trip cleanly.
+    /// The round-1 lookahead skip is an exact polynomial identity, so the
+    /// F256 ladder must emit BYTE-IDENTICAL proofs with and without it —
+    /// including across the L0 OOD β-glues, which the lookahead survives via
+    /// the per-OOD coefficient correction ([`round_msg_eval_and_lookahead`]).
+    /// Registered m22 fast config (ood_samples[0] = 1, real PoW schedule),
+    /// plus an ood_samples[0] = 2 variant to exercise repeated corrections;
+    /// the registered-config proof is also verified.
+    #[test]
+    fn f256_round1_lookahead_is_byte_identical() {
+        use crate::challenger::Challenger;
+        let log_n = 15;
+        let cfg = prover_config_for(log_n, 6, LigeritoProfile::Fast).unwrap();
+
+        let mut rng = crate::challenger::RandomChallenger::new(0x10_0CA_4EAD);
+        let f: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
+        let b: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
+
+        // The combine pass's entry accumulation: round-0 message + round-1
+        // coefficients in one sweep (also pins the fused y against the plain
+        // message pass). The true inner product is the sumcheck target.
+        let (first, y, la) = round_msg_eval_and_lookahead(&f, &b);
+        let (first_plain, y_plain) = round_msg_and_eval_blocked(&f, &b, 1);
+        assert_eq!(first, first_plain);
+        assert_eq!(y, y_plain);
+        let target = y;
+
+        let log_msg_cols_0 = log_n - cfg.initial_k;
+        let ntt = AdditiveNttF128::standard(log_msg_cols_0 + cfg.log_inv_rates[0]);
+        let wtns = ligero_commit(
+            &f,
+            log_msg_cols_0,
+            cfg.initial_k,
+            cfg.log_inv_rates[0],
+            &ntt,
+            cfg.merkle_hash,
+        );
+
+        let prove = |cfg: &ProverConfig, la: Option<FoldLookahead>| -> LigeritoProof {
+            let mut ch = crate::challenger::FsChallenger::new(b"la-test");
+            recursive_prover_with_basis_precomputed_round0(
+                cfg,
+                f.clone(),
+                b.clone(),
+                target,
+                &wtns.mat,
+                &wtns.tree,
+                (first.u_0, first.u_2),
+                la,
+                &mut ch,
+            )
+        };
+        let with_la = prove(&cfg, Some(la));
+        let without = prove(&cfg, None);
+        assert_eq!(with_la, without, "lookahead skip must not move a byte");
+
+        // And the proof is a real one.
+        let v_cfg = verifier_config_for(log_n, 6, LigeritoProfile::Fast).unwrap();
+        let cap = wtns.cap(v_cfg.l0_cap_depth()).to_vec();
+        let mut v_ch = crate::challenger::FsChallenger::new(b"la-test");
+        assert!(extension::recursive_verifier_with_basis_succinct(
+            &v_cfg,
+            &with_la,
+            log_n,
+            target,
+            &cap,
+            1 << cfg.initial_k,
+            |ris, residual_log| extension::evaluate_dense_at_residual(&b, ris, residual_log),
+            &mut v_ch,
+        ));
+
+        // Two L0 OODs → two lookahead corrections.
+        let mut cfg2 = cfg.clone();
+        cfg2.ood_samples[0] = 2;
+        assert_eq!(
+            prove(&cfg2, Some(la)),
+            prove(&cfg2, None),
+            "lookahead must survive repeated OOD β-glues"
+        );
+    }
+
+    /// `recursive_prover_with_basis` +
+    /// `extension::recursive_verifier_with_basis_succinct` roundtrip.
+    /// Single-claim case (`b = eq(z, ·)`, `target = poly(z)`) — must
+    /// round-trip cleanly.
     #[test]
     fn recursive_prover_with_basis_roundtrip_single_claim() {
         use crate::challenger::Challenger;
