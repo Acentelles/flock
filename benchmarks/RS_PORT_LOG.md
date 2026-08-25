@@ -378,6 +378,29 @@ and STNP output stores (+1.2% there, **+12% regression** here -- the
 non-temporal hint costs store throughput on M1 instead of saving RFO
 traffic). Port memory-system hints only with a local paired measurement.
 
+## Final ST+MT comparison vs the session baseline (lightweight, 2026-08-25)
+
+Single instrumented invocation per cell; untouched phases (witness, commit,
+lincheck, open) matched across arms to <1% at both thread counts, validating
+the run. All 13 kept optimizations, vs `9793190`:
+
+| phase | ST base | ST head | delta | 8T base | 8T head | delta |
+|---|---:|---:|---:|---:|---:|---:|
+| zerocheck | 2357 | 1638 | **-30.5%** | 322 | 221 | **-31.4%** |
+| -- round 1 | 1465 | 961 | -34% | 191 | 129 | -33% |
+| -- round 2 | 437 | 304 | -30% | 59 | 41 | -31% |
+| -- rounds 3+ | 454 | 310 | -32% | 65 | 48 | -26% |
+| **headline** | 52.5k | **62.5k c/s** | **+18.9%** | 349k | **406k c/s** | **+16.1%** |
+
+The MT columns are the first multithreaded measurement since any optimization
+landed: every win transferred to 8T at essentially its ST magnitude, and the
+end-to-end gain in the threaded (production/scored) configuration is +16%.
+
+Known anomaly, comparison-safe: the open phase measured ~850 ms ST on BOTH
+arms today vs ~636 in earlier sessions -- a day-scale bimodality also seen
+once before (the 857 ms lookahead-test reading). Same on both arms, so no
+delta is affected; flag for the commit/open campaign.
+
 ## Cross-tree comparisons: GPU-status-uncertain (major caveat, 2026-08-25)
 
 The challenge-tree session re-ran its own round-2 measurement (identical
