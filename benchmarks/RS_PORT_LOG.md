@@ -378,6 +378,32 @@ and STNP output stores (+1.2% there, **+12% regression** here -- the
 non-temporal hint costs store throughput on M1 instead of saving RFO
 traffic). Port memory-system hints only with a local paired measurement.
 
+## Cross-tree comparisons: GPU-status-uncertain (major caveat, 2026-08-25)
+
+The challenge-tree session re-ran its own round-2 measurement (identical
+config, same machine, days apart) and got **342 ms where it had reported
+215** -- a 127 ms swing it flagged rather than explained away. Its raw dump
+shows round-1 samples of 92-95 ms jumping to 309 ms MID-RUN with no code
+change. 92 ms is implausibly fast for its CPU drain+fold; it is exactly what
+its Metal GPU round-1 prefix produces, and that prefix "fires if the shape
+matches and Metal's available" with no warmup latch. Working hypothesis
+(test pending on their side via FLOCK_NO_GPU_ZEROCHECK=1): their historical
+low buckets were INTERMITTENTLY GPU-ASSISTED, and their pure-CPU numbers are
+the high samples.
+
+Consequences for this log:
+- Every "theirs" column in the cross-tree tables is soft until their GPU
+  test reports. Their bracket accounting itself was verified clean (buffer
+  takes, tables, and padding all inside their round-2 timer; their tail
+  honestly carries the compact-format reconstruction).
+- Against their pure-CPU-mode samples, the trees read: round 1 ~333 vs ~309,
+  round 2 ~305 vs **~342 (we are AHEAD)**, rounds 3+ ~307 vs ~319 --
+  **parity overall on equal no-GPU terms**. The 90 ms round-2 "gap" this
+  log's recent rows chased was plausibly a phantom of comparing our CPU
+  against their sometimes-GPU.
+- Every KEPT win in this log is unaffected: all were internally paired A/B
+  on this tree alone and never depended on their numbers.
+
 ## The SHA-256 cross-circuit control
 
 Question: is the challenge repo's remaining advantage BLAKE3 specialization
