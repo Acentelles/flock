@@ -11,8 +11,9 @@
 \newcommand{\eq}{\mathrm{eq}}
 \newcommand{\code}[1]{\texttt{#1}}
 
-\title{Verified Optimizations to Flock's RS Zerocheck Prover\\
-{\large measurements on Apple M1 Max, single-threaded, $2^{18}$ BLAKE3 compressions}}
+\title{Verified Optimizations to Flock's RS Prover\\
+{\large measurements on Apple M1 Max, single-threaded; zerocheck at $2^{18}$,
+PCS open at $2^{16}$ BLAKE3 compressions}}
 \author{branch \code{snark-fast-improvements}}
 \date{August 2026}
 
@@ -32,7 +33,9 @@ recurring themes: reductions in fields of characteristic two are
 $\Ftwo$-linear and can be deferred almost arbitrarily; work that a circuit
 fixes structurally can be skipped with a one-word guard; and on Apple silicon
 the boundary between the vector and general register files costs more than
-most instruction counts.
+most instruction counts. A later section extends the record to the PCS open,
+whose dominant pass loses its per-slot field multiply to the same
+$\Ftwo$-linearity argument (\S\ref{sec:composedfold}).
 \end{abstract}
 
 \section{Setting and notation}
@@ -322,6 +325,63 @@ where the cost actually lived.
 \emph{Measured: rounds-3+ phase $449.5\to306.6\,$ms ($-31.8\%$), $8/8$,
 every pair in $[-31.1\%,-32.6\%]$ --- the largest single win of the effort.}
 
+\section{PCS open: composing the block scalar into the fold table}
+\label{sec:composedfold}
+
+\emph{Shape for this section: the $2^{16}$-compression open ($m=30$,
+$L=2^{23}$ packed slots, two batched claims).} The ring-switch reduction
+leaves, for each claim $k$, an eq tensor in factored form
+$\eq = \mathrm{eq}_{\mathrm{lo}} \otimes \mathrm{eq}_{\mathrm{hi}}$
+(lengths $B$ and $L/B$) and an $\Ftwo$-linear map
+$L_k:\Fbig\to\Fbig$ (the $\gamma_k$-weighted byte-table fold). The
+\emph{combine} pass materializes the batched basis
+\[
+b[j] \;=\; \sum_k L_k\bigl(\mathrm{eq}_{\mathrm{lo}}[j \bmod B]\cdot
+                            \mathrm{eq}_{\mathrm{hi}}[\lfloor j/B\rfloor]\bigr),
+\qquad j < L,
+\]
+and was the largest bucket of the open: one field multiply plus one
+16-load table fold per slot per claim, $58\%$ of open time.
+
+The multiply is removable. Multiplication by the block constant
+$e=\mathrm{eq}_{\mathrm{hi}}[\lfloor j/B\rfloor]$ is itself $\Ftwo$-linear, so
+the per-slot map $G_{k,e}(w) = L_k(w\cdot e)$ is a composition of
+$\Ftwo$-linear maps and is fully determined by its $128$ monomial images
+$g_r = L_k(X^r e)$. Once per (claim, block), encode $G_{k,e}$ as a fresh
+$16\times256$ byte table: advance $X^r e$ by $127$ exact shift-and-fold
+doublings (multiplication by $X$ costs one shift and a conditional XOR of the
+reduction word), evaluate $L_k$ on each via the existing table, and expand
+every byte position from its $8$ generators by subset-sum doubling
+($16\cdot255$ additions). About $4.3$k word operations per block; the sweep
+then indexes only the composed table, and the per-slot multiply --- $2L
+\approx 16.8$M multiplies per open --- is gone.
+
+The catch is the block length. The balanced split used by the many-pass
+folds ($B = 2^{\lceil n/2\rceil} = 2^{11}$ here) is too fine for the build to
+amortize; the deferred claims carry their own coarse split
+$B = \min(2^{15},\,2^{\,n-8})$, making $\mathrm{eq}_{\mathrm{lo}}$ a single
+$512$\,KiB L2-resident stream shared by every block and the build
+$\approx0.4$ ops/slot. Correctness is exact, not approximate: every composed
+entry is an XOR combination of exact field products --- the same XOR multiset
+as the slot-multiply path --- so the transcript is bit-identical (unit
+equivalence test; verification of full proofs unchanged).
+
+Measured (ST, minimum over samples): combine $94.4\to78.5\,$ms, open total
+$\approx160\to\approx145\,$ms ($-9\%$); at $8$ threads the combine is
+$10.9\,$ms, a near-linear transfer. The idea was found dormant in the
+challenge tree (present, never isolated or measured there) and re-derived.
+
+\paragraph{Negative space for the open.}
+(i) Three-way XOR fusion (\code{EOR3}) in the fold's reduction tree is flat:
+LLVM already emits it under \code{target-cpu=native}, and the sweep is bound
+by its $32$ loads per slot, not its XOR count. (ii) Fusing both claims into
+one sweep --- two live composed tables, one store, no read-back of the
+intermediate --- \emph{regresses} $15\%$: $128$\,KiB of gather targets thrash
+L1, so the claim-sequential order stands. (iii) The round-1 lookahead
+coefficients accumulated in the combine's tail are an accounting wash, not a
+speedup: tail-plus-initial-sumcheck costs $60.5$ vs.\ $60.6\,$ms across the
+two trees' opposite placements of the same work.
+
 \section{Summary}
 
 \begin{table}[h]
@@ -344,6 +404,8 @@ Optimization & Kind & Phase effect (ST) & Sign test\\
   round 2: $-13.0\%$ & $8/8$\\
 \S\ref{sec:qres}\ fused rounds-3+ tail & representation + pass fusion &
   rounds 3+: $-31.8\%$ & $8/8$\\
+\S\ref{sec:composedfold}\ composed fold table (PCS open) & work removal &
+  open combine: $-17\%$ & decisive\\
 \midrule
 \multicolumn{2}{@{}l}{round 1 cumulative} &
   \multicolumn{2}{r@{}}{$1477 \to 1205\,$ms\quad($-18.4\%$)}\\
@@ -352,7 +414,9 @@ Optimization & Kind & Phase effect (ST) & Sign test\\
   \multicolumn{2}{r@{}}{$433 \to 312\,$ms\quad($-28\%$)}\\
 \multicolumn{2}{@{}l}{rounds 3+ cumulative} &
   \multicolumn{2}{r@{}}{$455 \to 307\,$ms\quad($-33\%$)}\\
-\multicolumn{2}{@{}l}{end-to-end, all seven} &
+\multicolumn{2}{@{}l}{PCS open cumulative (\S\ref{sec:composedfold})} &
+  \multicolumn{2}{r@{}}{$\approx160 \to \approx145\,$ms\quad($-9\%$)}\\
+\multicolumn{2}{@{}l}{end-to-end, all seven zerocheck changes} &
   \multicolumn{2}{r@{}}{$\approx52{,}400 \to \approx58{,}100$ comp/s\quad($\approx+11\%$, $8/8$)}\\
 \bottomrule
 \end{tabular}
@@ -365,7 +429,11 @@ through a memory-interfaced kernel ($+10\%$), a four-register structured load
 ($+12\%$, microcoded), three-way XOR fusion ($+1.8\%$), an $8\times$ smaller
 gather table ($-3.6\%$ regression), and deferring an already-cheap reduction
 ($0\%$) all failed, while every win either removed work, added independent
-work in flight, or removed register-file boundary crossings. Two further
+work in flight, or removed register-file boundary crossings. In the
+commit-phase NTT, rewriting the butterfly multiply as a $3$-PMULL Karatsuba
+with a q-resident interface regressed $58\%$: the generic butterfly already
+inlines the latency-optimal binius kernel, and six PMULLs with no repack beat
+three with one, in situ and not only in the microbenchmark. Two further
 structural transplants measured neutral end-to-end and were reverted despite
 making the zerocheck \emph{bucket} look better (hoisting the challenge-independent
 prep under the commit; the lookahead double-round, which loses $7$--$15\%$ in
