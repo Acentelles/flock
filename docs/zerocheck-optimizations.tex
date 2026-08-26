@@ -427,6 +427,30 @@ verdict, which had priced blocking and table-geometry changes but not the
 index-load restructure (idea from the challenge tree's asm kernel,
 re-expressed in intrinsics).
 
+\section{Merkle BLAKE3: two transposed four-wide states in flight}
+\label{sec:blake3neon}
+
+The PCS Merkle tree can hash with SHA-256 (hardware silicon, $\approx$2.5\,GB/s
+per core) or BLAKE3. The blake3 crate's NEON backend processes four messages
+in lockstep --- one \code{uint32x4} per state word --- but a single 4-wide
+state is \emph{latency}-bound: BLAKE3's G function is a serial
+add--xor--rotate chain, and Apple's four NEON pipes sit half idle waiting on
+it. Interleaving a \emph{second} independent transposed 4-wide state, G-for-G
+(eight messages in flight, the full 32-register NEON file), fills the pipes
+--- the same independent-chains pattern as \S\ref{sec:twolane}. Dispatch:
+groups of eight leaves or parent pairs take the new kernel; tails fall to the
+crate path; byte-identical by an equivalence test over all batched message
+sizes, counts, and flag combinations.
+
+Measured (ST tree build): $1.63 \to 2.30$\,GB/s at 512\,B leaves ($+41\%$,
+now $1.08\times$ \emph{faster} than SHA-256) and $1.71 \to 2.42$\,GB/s at the
+1\,KiB production-geometry leaves ($+42\%$, parity with the SHA silicon). The
+challenge tree reaches $\approx$2.58\,GB/s with a 2.6k-line generated
+assembly kernel; this is $\approx$290 lines of intrinsics within $6\%$ of it
+--- LLVM absorbed the full register pressure without measurable spill cost.
+End-to-end the change erases the $-5\%$ penalty BLAKE3-Merkle previously
+carried in this tree, making the Merkle hash choice free.
+
 \section*{Summary}
 
 \begin{table}[h]
@@ -446,6 +470,7 @@ Section & Kind & Phase effect (ST) & Sign test\\
 \S\ref{sec:composedfold} & work removal & open combine: $-17\%$ & decisive\\
 \S\ref{sec:streamwit} & work removal & witness gen: $-24\%$ & $3/3$\\
 \S\ref{sec:lcfold} & work removal & lincheck fold: $-32\%$ & $3/3$\\
+\S\ref{sec:blake3neon} & ILP & BLAKE3 merkle: $+41\%$ GB/s & decisive\\
 \midrule
 \multicolumn{2}{@{}l}{round 1 cumulative} &
   \multicolumn{2}{r@{}}{$1477 \to 1205\,$ms\quad($-18.4\%$)}\\
