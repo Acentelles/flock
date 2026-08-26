@@ -97,12 +97,26 @@ tables by folds at the actual challenge values: the C-side banks are
 recomputed as a true multilinear fold at the pinned challenges, with the
 over-folded eq factors undone by a closed-form constant that exists only
 because of \eqref{eq:friendly} (\S\ref{sec:stripe}); the prep kernel's
-weight $x^K$ is factored so one piece stays a table image while the $x^2$
+weight $x^K$ is factored so one piece stays table-driven while the $x^2$
 piece is applied as a shift-and-conditional-XOR directly on the operand
 (\S\ref{sec:pmull}); and the PCS open builds its composed fold table by
 walking the monomials $X^r e$ with 127 exact shift-and-folds instead of 128
 general multiplies (\S\ref{sec:composedfold} --- resting on $\gamma = X$
 being the generator rather than on \eqref{eq:friendly} itself).
+
+\paragraph{Notation.}
+A few recurring terms, used across multiple sections below:
+\begin{itemize}
+\setlength{\itemsep}{1pt}
+\item \textbf{witness builder} (``the builder''): the code that serializes
+  the R1CS witness into the packed bit-buffers $z$, $a$, $b$.
+\item \textbf{drain} (the gather drain): the loop that walks the per-row
+  lookup tables to accumulate round~1's output messages; detailed in
+  \S\ref{sec:twolane}.
+\item \textbf{lincheck stripe}: the repacking of the witness $z$, indexed
+  by inner/outer position, that the lincheck phase consumes; defined
+  fully in \S\ref{sec:stripe}.
+\end{itemize}
 
 The two directions, in math. Both evaluate contractions against the same
 geometric weight vector: with $w_K = C\,\alpha^K$ for $K < n$ and
@@ -134,20 +148,22 @@ freshly \emph{sampled} challenges (rounds two and onward) get no such
 shortcut --- there a fold is an ordinary multiply.
 
 \paragraph{Measurement protocol.}
-All numbers are single-threaded at the shape above. Each verdict is a paired
-A/B: both arms built once, one discarded warm-up each, then eight pairs with
-the \emph{order alternating within each pair} (a fixed order is biased by
-thermal drift by roughly the size of the effects measured here). Phase times
-are the minimum over the $\sim$5 zerocheck invocations within one run. A
-change is kept only on a decisive sign test; two of the six wins were
-$8/8$ with disjoint ranges. Measure only on AC power with the battery above
-$\sim60\%$: low battery caps frequencies, and fast-charging a nearly empty
-battery is worse.
+All numbers are single-threaded (ST) at the shape above unless marked 8T
+(eight threads). Each verdict is a paired A/B: both arms built once, one
+discarded warm-up each, then eight pairs with the \emph{order alternating
+within each pair} (a fixed order is biased by thermal drift by roughly the
+size of the effects measured here). Phase times are the minimum over the
+$\sim$5 zerocheck invocations within one run; we call each phase's measured
+time slice its \emph{bucket}. A change is kept only on a decisive sign test
+(a nonparametric test of whether the paired differences all share the same
+sign); two of the six wins were $8/8$ with disjoint ranges. Measure only on
+AC power with the battery above $\sim60\%$: low battery caps frequencies,
+and fast-charging a nearly empty battery is worse.
 
 \section{Witness generation}
 
-Everything downstream consumes the bit-packed witness; its builder is the
-first timed phase.
+Everything downstream consumes the bit-packed witness; its witness builder
+(defined in Preliminaries) is the first timed phase.
 
 \subsection{Streaming full-word publication}
 \label{sec:streamwit}
@@ -167,11 +183,14 @@ then a read-modify-write on every store. But the circuit's rows are
 that carries a partial word in a register can publish complete u64s in
 order and never read the destination --- the memset and the RMW tax both
 disappear. The one out-of-order region (the output chaining value, 256-bit
-aligned) is reserved and overwritten once the final state is known. The
-fixed 56-G compression schedule is also fully unrolled with literal
-state/message indices, exposing the whole dependency graph to register
-allocation. Bit-identical through the driver (tested against the OR
-builder on real and padding slots, both values of the prefix carry bit).
+aligned) is reserved and overwritten once the final state is known. BLAKE3
+compresses each block with 56 rounds of its inner G function (the
+add-rotate-xor mixing step); this fixed 56-G schedule is fully unrolled
+by hand, with each round's state/message array indices written as fixed
+literals rather than computed at runtime, so the register allocator sees
+every round's actual data dependencies directly. Verified bit-identical
+to the OR-based builder, on real and padding slots, for both values of
+the prefix carry bit.
 Measured, paired: ST $87$--$90 \to 64.8$--$68.9\,$ms ($-24\%$, $3/3$
 disjoint); 8T $-20\%$. Idea from the challenge tree; their further
 $\approx$$3$--$7\,$ms SIMD-lockstep stage was priced against its
@@ -197,10 +216,10 @@ lockstep, and finished words dump contiguously through a
 \code{vld4} de-interleave. We reproduced the full design with a
 \code{build.rs} generator ($\approx$200 committed lines emitting the
 unrolled kernel, rather than porting their $2.6$k generated lines). It
-was bit-identical on its first full test run --- and measured a
-\emph{null} in-prove at both shapes.
+matched the existing witness builder's output bit-for-bit on its first
+full test run --- and measured a \emph{null} in-prove at both shapes.
 
-The discrepancy exposed the real cost, which was never the builder: the
+The discrepancy exposed the real cost, which was never the witness builder: the
 lincheck stripe buffer --- a repacking of $z$ consumed by the lincheck
 --- was a fresh \emph{zeroed} $128$--$512$\,MB allocation on every
 prove, and its first-touch page faults dominated the bucket. Pooling
@@ -232,7 +251,8 @@ from $1477$ to $1205$\,ms ($-18.4\%$) at the benchmark shape.
 \item[Result:] Round~1 $1401.4\to1273.4\,$ms ($-9.1\%$), $8/8$, every pair in $[-8.7\%,-10.1\%]$.
 \end{optsummary}
 
-The prep kernel computes, per $K$-row ($K\in\{0,\dots,7\}$) and 16-lane block,
+The prep kernel --- round~1's per-row operand-weighting stage --- computes,
+per $K$-row ($K\in\{0,\dots,7\}$) and 16-lane block,
 $y_K = a_K \odot b_K \in \Feight$ and accumulates $\sum_K x^K y_K$ in 16-bit
 lanes, reducing once at the end. The baseline computed each $y_K$
 \emph{reduced}: two \code{PMULL}s for the raw product plus a reduction costing
@@ -249,8 +269,8 @@ x^K \;=\;
 doubling of the reduced operand}}\cdot
 \underbrace{x^{K\bmod 2}}_{\text{in-lane shift}}.
 \]
-The $x^4$ factor costs nothing per element: a second table image with every
-byte pre-multiplied by $x^4$ scales each gathered XOR-sum by $x^4$, by
+The $x^4$ factor costs nothing per element: a second copy of the table with
+every byte pre-multiplied by $x^4$ scales each gathered XOR-sum by $x^4$, by
 linearity of $T$. The $x^2$ factor is a six-instruction shift-and-conditional-XOR
 on the already-reduced 8-bit operand ($\deg$ still $\le7$). The residual shift
 is one vector instruction and raises term degree to at most $15$.
@@ -272,10 +292,10 @@ is one vector instruction and raises term degree to at most $15$.
 Correctness needs the final reducer to be exact to degree $15$, one beyond its
 documented ``$\le14$''; both the scalar and vector reducers were verified
 exhaustively over all $2^{16}$ inputs (tests now permanent). Gather traffic is
-unchanged apart from the second $16\,$KiB table image.
+unchanged apart from the second $16\,$KiB copy of the table.
 
 \emph{Measured: round~1 $1401.4\to1273.4\,$ms ($-9.1\%$), $8/8$, every pair in
-$[-8.7\%,-10.1\%]$. The reference implementation's attribution predicted
+$[-8.7\%,-10.1\%]$. The challenge tree's attribution predicted
 $100$--$140\,$ms; measured $128$.}
 
 \subsection{The C-side message as a fold of the lincheck stripe}
@@ -328,8 +348,9 @@ derived from the identity $Y_p = (C_s/\eq(r_6,p))\,\mathrm{bank}_p$ obtained
 by factoring \eqref{eq:friendly} over the folded dimensions. With the banks
 gone from the drain, the workers run AB-only: the per-window bit transpose is
 deleted and the drain issues one gather per (lane, $b$) instead of three.
-Equivalence was proven at two levels before wiring: banks bit-identical to the
-drain's, and all three entry outputs identical, dense and padded.
+Equivalence was proven at two levels before wiring: the new banks
+bit-identical to the drain's old output, and all three entry outputs
+(dense and padded) identical between the two implementations.
 
 \emph{Measured: round~1 $1277.5\to1204.7\,$ms ($-5.7\%$), $8/8$. The cost of
 the added fold ($\approx180\,$ms) is included; the removals
@@ -381,8 +402,8 @@ Section~\ref{sec:zeroskip}: $1477.3\to1403.1\,$ms ($-5.0\%$).}
 
 Round~1's dominant kernel transforms the operands $a,b$ through a table $T$
 implementing the inverse-NTT composition; $T$ is $\Ftwo$-linear, so
-$T(0)=0$. A census of the packed BLAKE3 witness (256 word positions per
-block $\times$ 256 blocks $\times$ 3 independent witnesses) shows the circuit
+$T(0)=0$. An exhaustive tally of the packed BLAKE3 witness (256 word positions
+per block $\times$ 256 blocks $\times$ 3 independent witnesses) shows the circuit
 pins $38$ of $256$ eight-byte $K$-rows of $b$ regardless of the inputs, taking
 only three values:
 \[
@@ -400,7 +421,7 @@ return} \Comment{skips all 64 table loads and 4 $\Feight$ multiplies}
 \end{algorithmic}
 
 \noindent
-No census data ships and no positions are tracked: the guard is exact for any
+No tally data ships and no positions are tracked: the guard is exact for any
 witness, and a disagreeing witness falls through to the generic path.
 (The all-ones rows were also tried: constant-folding them saves only the $b$
 half of a row's work, and halving a row's loads halves its memory-level
@@ -498,7 +519,7 @@ consumes the pair for the message while still in registers:
 \begin{algorithmic}[1]
 \For{$x = 0 \dots \mathit{lo}-1$}
   \State $a_0,a_1,b_0,b_1 \gets$ fold four input pairs at $r$
-    \Comment{in q registers}
+    \Comment{in 128-bit NEON Q-registers}
   \State store $a_0,a_1,b_0,b_1$ \Comment{the required write, once}
   \State $g_1 \gets a_1 b_1$;\quad
          $g_\infty \gets (a_0{+}a_1)(b_0{+}b_1)$
@@ -539,8 +560,9 @@ loads per stripe step: 8 table entries \emph{plus 8 scalar byte loads} for
 the indices. The indices are 8 adjacent bytes --- one u64 load and GPR
 shift-extracts replace all eight --- and folding two stripes per iteration
 lets the two table entries enter the accumulator as an XOR pair, which LLVM
-fuses to a single \code{EOR3} under the SHA3 feature: $\approx$9 loads per
-stripe, same XOR multiset, bit-identical. Measured, paired:
+fuses to a single three-input XOR instruction, \code{EOR3}, available under
+ARM's SHA3 feature: $\approx$9 loads per stripe, same XOR multiset, output
+bit-identical to the baseline. Measured, paired:
 \code{partial\_fold\_z} ST $40.7$--$40.8 \to 27.8$--$28.0\,$ms ($-32\%$,
 $3/3$ disjoint) --- landing on the pass's computed $\approx$28\,ms load
 floor; 8T $-28\%$. This supersedes the earlier ``no reachable headroom''
@@ -595,15 +617,16 @@ $B = \min(2^{15},\,2^{\,n-8})$, making $\mathrm{eq}_{\mathrm{lo}}$ a single
 $512$\,KiB L2-resident stream shared by every block and the build
 $\approx0.4$ ops/slot. Correctness is exact, not approximate: every composed
 entry is an XOR combination of exact field products --- the same XOR multiset
-as the slot-multiply path --- so the transcript is bit-identical (unit
-equivalence test; verification of full proofs unchanged).
+as the slot-multiply path --- so the transcript is bit-identical to the
+slot-multiply path's (unit equivalence test; verification of full proofs
+unchanged).
 
 Measured (ST, minimum over samples): combine $94.4\to78.5\,$ms, open total
 $\approx160\to\approx145\,$ms ($-9\%$); at $8$ threads the combine is
 $10.9\,$ms, a near-linear transfer. The idea was found dormant in the
 challenge tree (present, never isolated or measured there) and re-derived.
 
-\paragraph{Negative space for the open.}
+\paragraph{Rejected alternatives for the open.}
 (i) Three-way XOR fusion (\code{EOR3}) in the fold's reduction tree is flat:
 LLVM already emits it under \code{target-cpu=native}, and the sweep is bound
 by its $32$ loads per slot, not its XOR count. (ii) Fusing both claims into
@@ -635,8 +658,8 @@ it. Interleaving a \emph{second} independent transposed 4-wide state, G-for-G
 (eight messages in flight, the full 32-register NEON file), fills the pipes
 --- the same independent-chains pattern as \S\ref{sec:twolane}. Dispatch:
 groups of eight leaves or parent pairs take the new kernel; tails fall to the
-crate path; byte-identical by an equivalence test over all batched message
-sizes, counts, and flag combinations.
+crate path; byte-identical to the crate's original kernel by an equivalence
+test over all batched message sizes, counts, and flag combinations.
 
 Measured (ST tree build): $1.63 \to 2.30$\,GB/s at 512\,B leaves ($+41\%$,
 now $1.08\times$ \emph{faster} than SHA-256) and $1.71 \to 2.42$\,GB/s at the
@@ -655,7 +678,11 @@ multithreaded throughput within $10\%$ of the challenge tree. Start:
 $1.19\times$ apart at the $2^{16}$ shape. Standing after the two
 subsections below: $1.146\times$ (149.3 vs 130.2\,ms, paired same-minute,
 production configuration). All numbers here are 8-thread-class production
-runs at $2^{16}$ compressions.
+runs at $2^{16}$ compressions, on Apple silicon's split between
+performance cores (P-cores) and efficiency cores (E-cores). Several
+results below are a paired \emph{kill-switch A/B}: the optimization is
+gated behind a runtime toggle, so disabling it reproduces the pre-change
+baseline in the same binary.
 
 \subsection{Round-1 AB prep under the commit, on all cores}
 \label{sec:abhoist}
@@ -691,7 +718,7 @@ transforms are equality-tested on all outputs.
 
 \begin{optsummary}
 \item[Baseline:] The full-write witness builder rewrites every byte of z/a/b each prove, including regions --- $b$'s all-ones prefix, reserved-slot words, all three streams' zero tails --- identical across every prove of a layout.
-\item[Improvement:] Tag a pooled buffer with its provenance (derived independently at give and take sites) and, on a tagged hit, skip the constant-region writes.
+\item[Improvement:] Tag a pooled buffer with its provenance --- which layout's output it currently holds, derived independently at give and take sites --- and, on a tagged hit, skip the constant-region writes.
 \item[Mechanism:] No explicit byte or operation count is given in this section; this is a work-removal via provenance tracking, not a stated op-count reduction.
 \item[Result:] Paired kill-switch A/B: $4/5$ ($147.0$--$149.0$ vs $148.3$--$152.7\,$ms).
 \end{optsummary}
@@ -699,16 +726,19 @@ transforms are equality-tested on all outputs.
 The full-write witness builder rewrites every byte of z/a/b each prove ---
 including $b$'s all-ones prefix and reserved-slot words and all three
 streams' zero tails, which are identical for every prove of a layout. A
-provenance tag (derived independently at the buffer's give site from the
-R1CS constants and at its take site from the encoder's own constants ---
-no plumbing carries it) marks a pooled buffer as holding exactly a previous
-prove's output of this layout; any other pool custody clears the tag. On a
-tagged hit the builder skips the constant-region writes. Idea from the
-challenge tree's scratch tokens, re-derived; paired kill-switch A/B: $4/5$
-($147.0$--$149.0$ vs $148.3$--$152.7$\,ms). Byte-identity is enforced by a
-test that drives a tagged give/take cycle against a fresh generation.
+provenance tag records which prove-layout's output a pooled buffer
+currently holds. It is derived independently at the buffer's give site
+(from the R1CS constants) and at its take site (from the encoder's own
+constants) --- no plumbing carries it --- so a match marks the buffer as
+holding exactly a previous prove's output of this layout; any other pool
+custody clears the tag. On a tagged hit the builder skips the
+constant-region writes. Idea from the challenge tree's scratch tokens,
+re-derived; paired kill-switch A/B: $4/5$ ($147.0$--$149.0$ vs
+$148.3$--$152.7$\,ms). Byte-identity is enforced by a test that compares
+a tagged give/take cycle's output against a fresh, non-skipped
+generation.
 
-\paragraph{Negative space for multithreading.}
+\paragraph{Rejected alternatives for multithreading.}
 Seven mechanisms measured null or inverted on this machine, all paired:
 the P-pool-only join (twice); non-temporal stores in the witness writers
 (M1 ignores the hint --- third confirmation); the stripe transpose on
@@ -722,7 +752,8 @@ stripe-buffer allocation was fixed). What separates the remaining few
 percent at the production shape: the challenge tree's compact round-2
 anchor+delta format with symbolic round-collapsing lookaheads --- a
 thousand-line-class port, priced and declined at the current bloat bar
-pending an explicit call.
+(the campaign's implicit line-count-vs-payoff threshold) pending an
+explicit call.
 
 \section*{Summary}
 
@@ -760,7 +791,7 @@ Section & Kind & Phase effect (ST) & Sign test\\
 \end{tabular}
 \end{table}
 
-\paragraph{Negative space.}
+\paragraph{Rejected alternatives.}
 The kept changes are one side of a 17-experiment record; the failures shaped
 them. On this core, re-encoding fixed work never paid: pairing multiplies
 through a memory-interfaced kernel ($+10\%$), a four-register structured load
@@ -775,7 +806,7 @@ three with one, in situ and not only in the microbenchmark. Two further
 structural transplants measured neutral end-to-end and were reverted despite
 making the zerocheck \emph{bucket} look better (hoisting the challenge-independent
 prep under the commit; the lookahead double-round, which loses $7$--$15\%$ in
-the zerocheck tail on both this machine and the reference tree's, while
+the zerocheck tail on both this machine and the challenge tree's, while
 \emph{helping} the PCS open by $7\%$ --- the same technique, opposite signs,
 two call sites).
 
