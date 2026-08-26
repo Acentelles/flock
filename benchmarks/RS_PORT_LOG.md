@@ -1384,3 +1384,22 @@ parked (zc-only variant listed on the menu at −6..7). The "uniform
 kernel-quality band" is NOT hidden E-core scheduling; the m=32 menu
 stands: r2 complex (−15..30, ~800 lines), open ranked (−10..20),
 lincheck stripe-reuse (−5), epool-zc (−6..7, ~200 lines).
+
+### epool: NULL-TO-NEGATIVE on our kernels, reverted (2026-08-26)
+
+Paired kill-switch A/B, 3 pairs m=32: tail 3/3 WORSE with helpers
+(49.7-51.4 off vs 53.6-56.2 on), zc bucket 3/3 worse (131-149 off vs
+142-171 on), r2 2/3 worse (42.2-47.4 off vs 45.3-46.7 on). Reverted (the
+implementation survives in history, commit "zerocheck: bounded-tail
+E-core chunk queue"). Mechanism: our r2/tail are bandwidth-heavy
+streaming passes; background-QoS E-cores add DRAM pressure the P-cores
+need — 4th confirmation of the bandwidth-on-bandwidth rule. Their epool
+pays on THEIR kernels plausibly because anchor+delta/compact formats
+made those passes compute-relative. RETEST epool after the anchor+delta
+port lands.
+
+Also learned from the off arm: our incumbent r2 is 42-47ms at m=32 —
+already FASTER than their timed 49.4 (≈ parity with their scored ~43).
+The r2-side of the anchor+delta port is ≈0; the port's value is
+concentrated in the TAIL (ours ~50 vs their timed 29.7): the r3
+table-combine, lookahead, and cascades. Task #3 rescoped accordingly.
