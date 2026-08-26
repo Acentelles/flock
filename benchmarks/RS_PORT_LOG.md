@@ -1427,3 +1427,25 @@ Staged opt-in (FLOCK_ZC_LOOKAHEAD=1, transcript byte-identical by test);
 anchor+delta port is the remaining piece, anatomy question out to the
 peer: where do the odd folded values for THEIR Q products come from —
 paid delta-gathers in r2, or a product formulation in anchor/delta space?
+
+## Cascade CERTIFIED default-on via one-weight-per-group products (2026-08-26)
+
+The peer read their actual r2 kernel and surfaced the missing formulation:
+all eight lookahead products share the group's eq weight → pre-scale the
+four a-rows once, every product becomes a single unreduced multiply
+(52 vs 72 PMULL/group). Also confirmed from their kernel: anchor+delta is
+a STORE-side cut only (their r2 pays the same gathers) — decoupled from
+the cascade after all, re-priced as a separate −5..8 item (compact stores
++ r3 byte-table combine).
+
+With w-scaling in both kernels: m=32 tail 33-37 vs classic 53-66 (4/4
+disjoint; better than their timed 29.7 after wrapper deflation), r2
+surcharge +12 (= its PMULL floor), zc net −8..13 (sign 3/4; −7.7 on the
+clean pair). m=30: net −1.0, 2/2, best-of-run sample was a cascade arm
+(142.5) — no regression at the certified shape. DEFAULT ON,
+FLOCK_NO_ZC_LOOKAHEAD=1 kill switch, transcript byte-identical by test.
+
+Projected m=32 standing: zc 134 → ~121-126 vs their timed 120 — the
+zerocheck kernel gap is essentially closed. Remaining m=32 items:
+anchor+delta compact stores (−5..8), open ranked (−10..20, parked for
+M3/M4 per Benedikt), commit absorption economics (−40, structural).
