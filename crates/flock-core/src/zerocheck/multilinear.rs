@@ -836,28 +836,39 @@ pub fn uni_skip_fold_and_round_pair_lookahead_packed_padded(
                 let gb1 = vld1q_u64(bcp.add(2 * o + 2));
                 let gb2 = vld1q_u64(bcp.add(2 * o + 4));
                 let gb3 = vld1q_u64(bcp.add(2 * o + 6));
-                // Product indices match `lookahead_products`.
-                let sxa0 = veorq_u64(ga0, ga1);
-                let sxb0 = veorq_u64(gb0, gb1);
-                let sxa1 = veorq_u64(ga2, ga3);
-                let sxb1 = veorq_u64(gb2, gb3);
-                let dca = veorq_u64(ga0, ga2);
-                let dcb = veorq_u64(gb0, gb2);
-                let dsa = veorq_u64(sxa0, sxa1);
-                let dsb = veorq_u64(sxb0, sxb1);
+                // One weight per group (idea from the challenge tree's
+                // compact-r2 kernel): all eight products share this group's
+                // weight, so pre-scale the four a-rows once (4 reduced muls)
+                // and every product becomes a SINGLE unreduced multiply —
+                // 52 PMULL/group vs 72 for weight-per-product. Exact: each
+                // accumulated term reduces to the same field value
+                // (w·(x·y) = (w·x)·y), pinned by the transcript-identity
+                // test. Product indices match `lookahead_products`.
                 let eq_arr = [eq_la_lo[g].lo, eq_la_lo[g].hi];
-                let eq_q = vld1q_u64(eq_arr.as_ptr());
-                acc[0].xor_assign(wide_mul_unreduced_q(eq_q, mul_q(ga1, gb1)));
-                acc[1].xor_assign(wide_mul_unreduced_q(eq_q, mul_q(sxa0, sxb0)));
-                acc[2].xor_assign(wide_mul_unreduced_q(eq_q, mul_q(ga2, gb2)));
-                acc[3].xor_assign(wide_mul_unreduced_q(eq_q, mul_q(ga3, gb3)));
-                acc[4].xor_assign(wide_mul_unreduced_q(eq_q, mul_q(sxa1, sxb1)));
-                acc[5].xor_assign(wide_mul_unreduced_q(eq_q, mul_q(dca, dcb)));
+                let w = vld1q_u64(eq_arr.as_ptr());
+                let wa0 = mul_q(w, ga0);
+                let wa1 = mul_q(w, ga1);
+                let wa2 = mul_q(w, ga2);
+                let wa3 = mul_q(w, ga3);
+                let wsxa0 = veorq_u64(wa0, wa1);
+                let wsxa1 = veorq_u64(wa2, wa3);
+                let wdca = veorq_u64(wa0, wa2);
+                let wdsa = veorq_u64(wsxa0, wsxa1);
+                let sxb0 = veorq_u64(gb0, gb1);
+                let sxb1 = veorq_u64(gb2, gb3);
+                let dcb = veorq_u64(gb0, gb2);
+                let dsb = veorq_u64(sxb0, sxb1);
+                acc[0].xor_assign(wide_mul_unreduced_q(wa1, gb1));
+                acc[1].xor_assign(wide_mul_unreduced_q(wsxa0, sxb0));
+                acc[2].xor_assign(wide_mul_unreduced_q(wa2, gb2));
+                acc[3].xor_assign(wide_mul_unreduced_q(wa3, gb3));
+                acc[4].xor_assign(wide_mul_unreduced_q(wsxa1, sxb1));
+                acc[5].xor_assign(wide_mul_unreduced_q(wdca, dcb));
                 acc[6].xor_assign(wide_mul_unreduced_q(
-                    eq_q,
-                    mul_q(veorq_u64(dca, dsa), veorq_u64(dcb, dsb)),
+                    veorq_u64(wdca, wdsa),
+                    veorq_u64(dcb, dsb),
                 ));
-                acc[7].xor_assign(wide_mul_unreduced_q(eq_q, mul_q(dsa, dsb)));
+                acc[7].xor_assign(wide_mul_unreduced_q(wdsa, dsb));
             }
             [
                 acc[0].reduce(),

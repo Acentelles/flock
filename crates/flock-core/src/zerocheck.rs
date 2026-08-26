@@ -39,17 +39,16 @@ use multilinear::{
     uni_skip_fold_and_round_pair_optimized_packed_padded,
 };
 
-/// Opt-in toggle for the RS cascade tail (integrated round-2 lookahead +
-/// 4→1 tail passes; see [`prove_packed_padded_inner`]). DEFAULT OFF: the
-/// cascade's tail win (−15 ms at m=32, 3/3 disjoint) is currently outweighed
-/// by round 2's lookahead-product surcharge (+24 ms — the mul-count floor of
-/// the general-eq formulation). It nets positive only together with the
-/// anchor+delta compact round-2 format (the challenge tree couples them);
-/// staged here behind `FLOCK_ZC_LOOKAHEAD=1` / this AtomicBool until that
-/// lands. The transcript is identical either way — the lookahead messages
-/// are the same polynomial values, derived without the intermediate data
-/// pass (pinned by `lookahead_tail_transcript_identical_to_classic`).
-pub static RS_TAIL_LOOKAHEAD_FORCE: std::sync::atomic::AtomicBool =
+/// A/B kill switch for the RS cascade tail (integrated round-2 lookahead +
+/// 4→1 tail passes; see [`prove_packed_padded_inner`]), DEFAULT ON. With
+/// the one-weight-per-group product form the cascade certifies at both
+/// shapes (m=32: tail −20 with r2 +12, zc net −8..13, sign 3/4; m=30: net
+/// −1.0, 2/2). `FLOCK_NO_ZC_LOOKAHEAD=1` is the production kill switch;
+/// the AtomicBool exists for paired within-process A/B. The transcript is
+/// identical either way — the lookahead messages are the same polynomial
+/// values, derived without the intermediate data pass (pinned by
+/// `lookahead_tail_transcript_identical_to_classic`).
+pub static RS_TAIL_LOOKAHEAD_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 use univariate_skip_optimized::{
     c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
@@ -399,8 +398,8 @@ fn prove_packed_padded_inner<C: Challenger>(
     let mut mlv_arg = vec![F128::ONE; n_mlv];
     mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
 
-    let lookahead_on = RS_TAIL_LOOKAHEAD_FORCE.load(std::sync::atomic::Ordering::Relaxed)
-        || std::env::var_os("FLOCK_ZC_LOOKAHEAD").is_some();
+    let lookahead_on = !(RS_TAIL_LOOKAHEAD_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var_os("FLOCK_NO_ZC_LOOKAHEAD").is_some());
     // Integrated round-2 lookahead: round 2 emits the eight lookahead sums
     // alongside its fold, from which BOTH round 2's and round 3's messages
     // derive with zero further data passes — so the tail below starts
@@ -914,10 +913,10 @@ mod tests {
             let mut ch1 = FsChallenger::new(b"flock-test-v0");
             let (proof_la, claim_la) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch1);
 
-            RS_TAIL_LOOKAHEAD_FORCE.store(true, Ordering::Relaxed);
+            RS_TAIL_LOOKAHEAD_DISABLE.store(true, Ordering::Relaxed);
             let mut ch2 = FsChallenger::new(b"flock-test-v0");
             let (proof_cl, claim_cl) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch2);
-            RS_TAIL_LOOKAHEAD_FORCE.store(false, Ordering::Relaxed);
+            RS_TAIL_LOOKAHEAD_DISABLE.store(false, Ordering::Relaxed);
 
             assert_eq!(
                 proof_la.multilinear_rounds, proof_cl.multilinear_rounds,
