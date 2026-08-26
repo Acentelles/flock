@@ -1200,3 +1200,24 @@ class), r2 complex (−18, ~800 lines), lincheck stripe-reuse (−12,
 unscoped), open ranked pieces (−14, partially GPU-adjacent), commit misc
 (−29, undecomposed). Ceiling if all land: ~600 → ~490 vs their ~400
 untimed — the last ~90 is their untimed-path leanness itself.
+
+## The SIMD packing port that became an allocation fix (2026-08-26)
+
+The witgen SIMD packing network — the full lane-wise design: u32-granular
+writers whose pending word lives in a vector register, every push one
+vsli with compile-time constants, an L1 stage per stream, vld4-deinterleave
+contiguous dump — was implemented via a build.rs generator (committed
+artifact = the ~200-line generator, not the 2.6k-line unrolled output) and
+was bit-identical on the first full test run. It then measured a NULL
+in-prove at both shapes, because the real in-prove witness cost was never
+the builder: **the lincheck stripe buffer was a fresh zeroed 128–512 MB
+allocation every prove**, faulted during the transpose. Pooling that one
+buffer (c8d36b6): witness m=30 18.5→8.0 ms, m=32 74→33 ms, both 2/2
+decisive — more than the SIMD port's entire predicted value. The quad
+kernel was reverted unmerged per the bloat rule; its full design and the
+generator live in the commit history via c8d36b6's message.
+
+Their in-prove witness advantage is now INVERTED at m=30 (ours 7.9 vs
+their 12.1) and mostly closed at m=32 (ours ~33 vs their timed 29.5).
+Third lesson of this genre in the campaign: measure the allocation story
+before porting a kernel (elision, ab_pre pooling, and now this).
