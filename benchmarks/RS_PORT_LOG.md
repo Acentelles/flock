@@ -915,3 +915,25 @@ anomaly was ambient load, not code; (3) their GPU is worth nothing at 8T
 (4) the MT gap is 1.19x under clean conditions (1.23x on battery), and it
 is scheduling (helper threads / epool P+E / allocator recycling), not
 kernels — ST stands at 1.10x with every bucket at parity or priced.
+
+## Their GPU, resolved: an ST-only, ranked-shape-only effect (2026-08-25 night)
+
+The clean grid showed GPU-on worth ~nothing at n=65536, contradicting the
+campaign-era "+10.7% ST" table. Both were right — different cells. Full
+GPU value map (their Aug 22 binary, clean machine, AC, paired same-minute):
+
+| shape / threads | GPU-on | GPU-off | GPU worth |
+|---|---:|---:|---:|
+| m=30 ST | 832 ms | 847 ms | +1.7% |
+| m=30 8T | 131.0 ms | 131.3 ms | 0 |
+| m=32 ST | 2.63 s | 2.87 s | **+9.2%** |
+| m=32 8T | 413.5 ms | 406.1 ms | −1.8% |
+
+Mechanism: their heavy offloads are shape-pinned to the ranked m=32
+geometry (dormant at m=30 — Metal initializes but the cpu= telemetry shows
+all threads busy doing the work), and the GPU only adds value when the CPU
+is starved (ST). At 8T the CPU saturates the same memory system, the GPU
+graph "finishes with 0.00 ms host wait" (their comment), and sync overhead
+turns it slightly negative. In the threaded production configuration the
+GPU is worth nothing on either shape; the +10.7% campaign figure was the
+m=32 ST cell (reproduced tonight at +9.2%), not a general advantage.
