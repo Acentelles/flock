@@ -1137,3 +1137,31 @@ non-default arm. Same-binary A/B: blake-vs-sha −1% at m=30, +2.3% at m=32
 — neutral-to-positive thanks to the neon8 merkle kernel. All future
 default-config numbers are now at the scored hash point; historical log
 entries above used SHA defaults unless marked otherwise.
+
+## m=32 blake, CPU-vs-CPU, finally clean (2026-08-26) — and the real root cause
+
+**The contamination mechanism was a shell bug, not a switch-coverage hole:**
+`GPUOFF="A=1 B=1 ..."` as a STRING does not word-split in zsh, so
+`env $GPUOFF cmd` set one garbage variable and none of the kill switches —
+verified by a 1 s GPU trace showing 94–98% utilization through an "all-off"
+run. The array form (used by the original official grid) and inline env
+lists were always valid; every blake "GPU-off" cell used the string form.
+The earlier "blake-gated GPU-merkle paths escaped the kill list" hypothesis
+is withdrawn — the switches were simply never delivered. (Same zsh footgun
+as the `for arm in $order` loop earlier in this campaign; now twice bitten.)
+
+**Clean paired comparison, m=32, Blake3 merkle+FS (the ranked hash point),
+CPU-only both arms, inline envs:**
+
+| pair | ours (default config, prod) | theirs (8T, all kills) | ratio |
+|---|---:|---:|---:|
+| 1 | 592.3 ms / 442.6k c/s | 392.1 ms / 668.6k c/s | 1.51× |
+| 2 | 629.0 ms / 416.8k c/s | 413.4 ms / 634.1k c/s | 1.52× |
+
+Their arm agrees with the owner's airtight fresh-build (638.9k) and their
+worker-scored GPU-off (630.8k) — three independent methodologies within
+5%. **Verified standing at the ranked shape and hash: 1.51× CPU-only.**
+(Slightly above the SHA-arms 1.40–1.45× because the blake hash point
+benefits their tree ~4% and ours ~2%.) The composition of that gap is the
+previously-logged one: their m=32-gated pipeline (phase overlap, deferred
+stripe, round-collapsing r2 complex) plus their blake-tuned kernels.
