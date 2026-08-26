@@ -2,46 +2,48 @@
 \providecommand\hyper@newdestlabel[2]{}
 \providecommand\HyField@AuxAddToFields[1]{}
 \providecommand\HyField@AuxAddToCoFields[2]{}
-\newlabel{eq:friendly}{{1}{1}{Setting and notation}{equation.1}{}}
+\newlabel{eq:friendly}{{1}{2}{Preliminaries}{equation.1}{}}
 \@writefile{toc}{\contentsline {paragraph}{Measurement protocol.}{2}{section*.2}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {1}Witness generation}{2}{section.1}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {1.1}Streaming full-word publication}{2}{subsection.1.1}\protected@file@percent }
-\newlabel{sec:streamwit}{{1.1}{2}{Streaming full-word publication}{subsection.1.1}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {2}Zerocheck round 1}{2}{section.2}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {2.1}Unreduced accumulation with multiplicative weight splitting}{2}{subsection.2.1}\protected@file@percent }
-\newlabel{sec:pmull}{{2.1}{2}{Unreduced accumulation with multiplicative weight splitting}{subsection.2.1}{}}
-\@writefile{loa}{\contentsline {algorithm}{\numberline {1}{\ignorespaces Row-block accumulate, before and after}}{3}{algorithm.1}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {2.2}The C-side message as a fold of the lincheck stripe}{3}{subsection.2.2}\protected@file@percent }
-\newlabel{sec:stripe}{{2.2}{3}{The C-side message as a fold of the lincheck stripe}{subsection.2.2}{}}
-\newlabel{eq:banks}{{2}{3}{The C-side message as a fold of the lincheck stripe}{equation.2}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {2.3}Instruction-level parallelism in the gather drain}{4}{subsection.2.3}\protected@file@percent }
-\newlabel{sec:twolane}{{2.3}{4}{Instruction-level parallelism in the gather drain}{subsection.2.3}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {2.4}Structurally fixed rows of the $b$ operand}{4}{subsection.2.4}\protected@file@percent }
-\newlabel{sec:zeroskip}{{2.4}{4}{Structurally fixed rows of the $b$ operand}{subsection.2.4}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {3}Zerocheck round 2}{4}{section.3}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Deferred reduction in vector registers}{5}{subsection.3.1}\protected@file@percent }
-\newlabel{sec:wideneon}{{3.1}{5}{Deferred reduction in vector registers}{subsection.3.1}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}The register-resident message loop}{5}{subsection.3.2}\protected@file@percent }
-\newlabel{sec:qres}{{3.2}{5}{The register-resident message loop}{subsection.3.2}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {4}Zerocheck rounds 3+}{5}{section.4}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Fusing away a memory pass}{5}{subsection.4.1}\protected@file@percent }
-\newlabel{sec:tailfuse}{{4.1}{5}{Fusing away a memory pass}{subsection.4.1}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {5}Lincheck}{6}{section.5}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}One word load per stripe, two stripes per pass}{6}{subsection.5.1}\protected@file@percent }
-\newlabel{sec:lcfold}{{5.1}{6}{One word load per stripe, two stripes per pass}{subsection.5.1}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {6}PCS open}{6}{section.6}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Composing the block scalar into the fold table}{6}{subsection.6.1}\protected@file@percent }
-\newlabel{sec:composedfold}{{6.1}{6}{Composing the block scalar into the fold table}{subsection.6.1}{}}
-\@writefile{toc}{\contentsline {paragraph}{Negative space for the open.}{7}{section*.3}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {7}Merkle hashing: BLAKE3}{7}{section.7}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.1}Two transposed four-wide states in flight}{7}{subsection.7.1}\protected@file@percent }
-\newlabel{sec:blake3neon}{{7.1}{7}{Two transposed four-wide states in flight}{subsection.7.1}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {8}Multithreading}{7}{section.8}\protected@file@percent }
-\newlabel{sec:mt}{{8}{7}{Multithreading}{section.8}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {8.1}Round-1 AB prep under the commit, on all cores}{8}{subsection.8.1}\protected@file@percent }
-\newlabel{sec:abhoist}{{8.1}{8}{Round-1 AB prep under the commit, on all cores}{subsection.8.1}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {8.2}Witness constant-region elision via scratch provenance}{8}{subsection.8.2}\protected@file@percent }
-\newlabel{sec:elision}{{8.2}{8}{Witness constant-region elision via scratch provenance}{subsection.8.2}{}}
-\@writefile{toc}{\contentsline {paragraph}{Negative space for multithreading.}{8}{section*.4}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Negative space.}{8}{section*.6}\protected@file@percent }
-\gdef \@abspage@last{9}
+\@writefile{toc}{\contentsline {subsection}{\numberline {1.1}Streaming full-word publication}{3}{subsection.1.1}\protected@file@percent }
+\newlabel{sec:streamwit}{{1.1}{3}{Streaming full-word publication}{subsection.1.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {1.2}The vectorized-packing port that became an allocation fix}{3}{subsection.1.2}\protected@file@percent }
+\newlabel{sec:zpool}{{1.2}{3}{The vectorized-packing port that became an allocation fix}{subsection.1.2}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {2}Zerocheck round 1}{3}{section.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.1}Unreduced accumulation with multiplicative weight splitting}{3}{subsection.2.1}\protected@file@percent }
+\newlabel{sec:pmull}{{2.1}{3}{Unreduced accumulation with multiplicative weight splitting}{subsection.2.1}{}}
+\@writefile{loa}{\contentsline {algorithm}{\numberline {1}{\ignorespaces Row-block accumulate, before and after}}{4}{algorithm.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.2}The C-side message as a fold of the lincheck stripe}{4}{subsection.2.2}\protected@file@percent }
+\newlabel{sec:stripe}{{2.2}{4}{The C-side message as a fold of the lincheck stripe}{subsection.2.2}{}}
+\newlabel{eq:banks}{{2}{4}{The C-side message as a fold of the lincheck stripe}{equation.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.3}Instruction-level parallelism in the gather drain}{5}{subsection.2.3}\protected@file@percent }
+\newlabel{sec:twolane}{{2.3}{5}{Instruction-level parallelism in the gather drain}{subsection.2.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.4}Structurally fixed rows of the $b$ operand}{5}{subsection.2.4}\protected@file@percent }
+\newlabel{sec:zeroskip}{{2.4}{5}{Structurally fixed rows of the $b$ operand}{subsection.2.4}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {3}Zerocheck round 2}{5}{section.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Deferred reduction in vector registers}{6}{subsection.3.1}\protected@file@percent }
+\newlabel{sec:wideneon}{{3.1}{6}{Deferred reduction in vector registers}{subsection.3.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}The register-resident message loop}{6}{subsection.3.2}\protected@file@percent }
+\newlabel{sec:qres}{{3.2}{6}{The register-resident message loop}{subsection.3.2}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {4}Zerocheck rounds 3+}{6}{section.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Fusing away a memory pass}{6}{subsection.4.1}\protected@file@percent }
+\newlabel{sec:tailfuse}{{4.1}{6}{Fusing away a memory pass}{subsection.4.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {5}Lincheck}{7}{section.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}One word load per stripe, two stripes per pass}{7}{subsection.5.1}\protected@file@percent }
+\newlabel{sec:lcfold}{{5.1}{7}{One word load per stripe, two stripes per pass}{subsection.5.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {6}PCS open}{7}{section.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Composing the block scalar into the fold table}{7}{subsection.6.1}\protected@file@percent }
+\newlabel{sec:composedfold}{{6.1}{7}{Composing the block scalar into the fold table}{subsection.6.1}{}}
+\@writefile{toc}{\contentsline {paragraph}{Negative space for the open.}{8}{section*.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7}Merkle hashing: BLAKE3}{8}{section.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.1}Two transposed four-wide states in flight}{8}{subsection.7.1}\protected@file@percent }
+\newlabel{sec:blake3neon}{{7.1}{8}{Two transposed four-wide states in flight}{subsection.7.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {8}Multithreading}{8}{section.8}\protected@file@percent }
+\newlabel{sec:mt}{{8}{8}{Multithreading}{section.8}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.1}Round-1 AB prep under the commit, on all cores}{9}{subsection.8.1}\protected@file@percent }
+\newlabel{sec:abhoist}{{8.1}{9}{Round-1 AB prep under the commit, on all cores}{subsection.8.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.2}Witness constant-region elision via scratch provenance}{9}{subsection.8.2}\protected@file@percent }
+\newlabel{sec:elision}{{8.2}{9}{Witness constant-region elision via scratch provenance}{subsection.8.2}{}}
+\@writefile{toc}{\contentsline {paragraph}{Negative space for multithreading.}{9}{section*.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Negative space.}{10}{section*.6}\protected@file@percent }
+\gdef \@abspage@last{10}

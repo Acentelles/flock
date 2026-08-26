@@ -1289,3 +1289,31 @@ Our zc r1/r2/r3+ split at m=32: attempted, contaminated (user interactive
 on the machine; mins r1 38.7 / r2 70.1 / r3+ 64.7 exceed the known-clean
 134ms zc total — upper bounds only). Redo in a quiet window; their
 r2 49.4 vs our clean r2 (TBD) prices the r2-complex port properly.
+
+## Fill→NTT fusion: NULL, reverted (2026-08-26)
+
+Implemented `forward_transform_interleaved_from_message`: the first fused-2
+top pass copies its four input rows straight from z into the codeword rows
+and butterflies them in place L1-hot, deleting the standalone 2GB
+replicate pass (bit-identical: garbage-start equivalence test over 5
+shapes, NTT oracle, prove/verify roundtrips ×3 circuits; kill switch
+FLOCK_NO_FILL_FUSE=1). Paired same-binary A/B, 8 pairs at m=32 (ambient
+noisy, user interactive): commit-bucket sign test 6-2 AGAINST fusion,
+totals 4-4, min-vs-min commit 308.3 fuse vs 297.9 nofuse. Reverted;
+diff preserved at scratchpad/fillfuse.patch (566 lines) and in this entry.
+
+MODEL REFINEMENT (the valuable part): the fill's 90ms under the join was
+QUEUEING, not work — a memcpy pass contributes few thread-ms, so deleting
+its DRAM traffic doesn't shorten a thread-bound critical path, and the
+per-row copies added overhead inside the butterfly tasks. The commit
+bucket is compute-limited: NTT ~124 + merkle ~54 + prep ~85 ≈ 263 of
+thread-work ≈ the measured 270-278 wall. Corollary: the planned
+NTT→merkle-leaf fusion retry is ALSO downgraded — it deletes a 2GB READ
+(bandwidth, not thread-work) and keeps all the hashing compute; the
+earlier solo null likely stands under the join too.
+
+Surviving m=32 commit levers, by the compute model: make PREP cheaper
+(unreduced-PMULL Horner arithmetic, priced ~100 lines at m=30 and
+declined at ~8-15ms; prep is 85ms at m=32 so the same idea re-prices to
+an est. −20-30 bucket) — everything else in the window is already at its
+measured floor (fused-4 top NEON: tried, register spill, +19-26%).
