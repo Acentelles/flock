@@ -1066,3 +1066,27 @@ lane-wise vectorized packing network (−2–3 ms; our quad-lite probe
 confirmed the packing, not the hash math, is the cost — vectorizing it is
 their 2.6k-line codegen). Both exceed the standing bloat bar; parked for
 an explicit call rather than taken unilaterally.
+
+## The m=32 shape, decomposed and probed (2026-08-26)
+
+First m=32 bucket decomposition, both trees (8T-class, same minute):
+ours witness 71.2 / commit 260.3 / zc 131.2 / lincheck 27.9 / open 93.6
+(sum 584, best total 572.6); theirs 19.2 / 271.6 / 142.4 / 15.9 / 84.9
+(sum 534, best total **394.9** — 139 ms of phase OVERLAP that exists only
+at m=32, where their ranked stack's gates open). Notably our commit AND
+zerocheck buckets are BETTER than theirs at m=32 — the kernel campaign
+transferred; the 1.45× lives in witness (−52: their m==32-gated deferred
+stripe + witgen hetero drains), lincheck (−12: their round-1 stripe-fold
+reuse), open (−9), and the wholesale pipeline overlap.
+
+**Probed and rejected:** deferring our lincheck stripe into the commit's
+all-core join window as a third arm, gated to n_blocks_log ≥ 17 —
+NEGATIVE 3/3 at m=32 (628.9–641.6 on vs 616.4–633.8 off). Their own
+m==32 gate on the same idea works only inside their epool/GPU-window
+architecture; re-streaming 512 MB from DRAM into our already-saturated
+join window loses to the L1-fused eager transpose both at m=30 (measured
+earlier) and m=32. Reverted.
+
+m=32 conclusion: closing it means porting the pipeline architecture
+(phase-overlap scheduling), not any single mechanism — same class of
+decision as the r2 complex and the packing network. Parked with the rest.
