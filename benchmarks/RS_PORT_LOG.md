@@ -1505,3 +1505,30 @@ single sample vs scored best-of-3 with warm pools — if the timed inner
 fn defeats warm-path buffer reuse, the 18% is allocation economics
 (the genre of our two biggest wins). Same 3-untimed+1-timed harness
 shape here shows only ~2% skew, so the asymmetry is in their prover fns.
+
+### The 470ms resolved: their instrumentation artifact, nothing to port (2026-08-26, close)
+
+Peer located both mechanisms in their timed path, with line numbers.
+(1) A commit-tail-fill hook: their scored path stages round-1's C-fold
+prefix in the commit join's idle tail (their commit arm finishes first —
+their from-message commit shortened it; the hook fills the window while
+their prep arm runs). Their timed core hardcodes the hook to None.
+DOESN'T MAP HERE: our join has no idle window — our commit arm is the
+long pole and rayon keeps every thread busy (the same thread-bound
+economics as the absorption story); at ST it's work-reordering, not
+work-deletion. (2) Their scored path's ranked_lincheck_c_reuse (stripe-
+based C-derivation, gated to EXACTLY the ranked blake3 shape) — which
+our tree runs in ALL paths already (StripeC). Bottom line, their words:
+"not something you'd port — it only affects the fairness of MY
+diagnostic function against MY real path."
+
+FINAL m=32 ST accounting: the 870ms gap = ~400ms of modest per-phase
+deltas (witness +22..53, ntt+merkle +100..160 vs old parity — worth one
+re-check, open +66..146, tail OURS ahead) + ~470ms that was their
+timed-path artifact inflating every per-phase comparison we made against
+their instrumented numbers, of which the real scored-path content is
+C-reuse (we have it) and the tail-fill staging (doesn't map). The
+cross-tree kernel gap at m=32 is materially smaller than today's bucket
+tables suggested; the honest scored-vs-scored per-phase decomposition
+would require them instrumenting their scored path, which they may do
+for their own tooling honesty.
