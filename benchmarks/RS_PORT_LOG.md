@@ -1470,3 +1470,20 @@ whose value concentrates at m=32; our ST witness bucket is 227ms with
 no pool overlap to hide the scalar builder). Our ST buckets (cascade
 on): witness 227 / commit 1277 / zc 1559 (pre-cascade ~1820) /
 lincheck 126 / open 600.
+
+### m=32 ST attribution completed — half the gap is their scored-only path (2026-08-26)
+
+Peer's ST breakdown + our sub-phase split, prep-aligned (their AB prep
+sits in their commit at ST — sequential join, a straight +551 tax; ours
+sits inline in our zc/r1, ~620): like-instrumented per-phase gaps are
+MODEST — witness +22, ntt+merkle +159, r1-sans-prep parity (270 vs ~260,
+theirs on their slow r1 path), r2 404 vs ~350, tail 226 vs ~250 (OURS
+AHEAD — the cascade), lincheck parity, open +66; our commit-with-prep is
+AHEAD of theirs at ST. Sum ≈ +400 of the measured 870ms ST gap. The
+other ~470ms: their own bucket sum (3.39s) vs their scored run (2.88s) —
+their scored prove_fast is ~18% leaner than their instrumented
+prove_fast_timed ("bypasses several ranked-specific warm-path
+optimizations", r1 stripe path confirmed as one instance). Ours: ~2%.
+THE BIGGEST m=32 ITEM IS NOW ENUMERABLE BY CODE-READ: the diff list
+between their prove_fast and prove_fast_timed paths — requested from the
+peer. Everything else we have compared is within ~15% per phase.
