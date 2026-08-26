@@ -17,7 +17,7 @@
 
 use core::arch::aarch64::*;
 
-use super::{BLAKE3_IV, Hash};
+use super::BLAKE3_IV;
 
 /// Per-round message-word schedule, fixed by the BLAKE3 spec.
 const MSG_SCHEDULE: [[usize; 16]; 7] = [

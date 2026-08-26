@@ -156,6 +156,7 @@ pub fn prove_ligerito<Ch: Challenger>(
                 k_log: r1cs.k_log,
                 useful_bits: r1cs.useful_bits,
             },
+            None,
         )
     } else {
         zerocheck::prove_packed_padded_capture_s_hat_v_c(
@@ -637,6 +638,70 @@ pub fn prove_fast_core<Ch: Challenger>(
 /// [`pcs::commit_into`] instead of allocating — the alloc was already done,
 /// overlapped with witness generation. When `None`, behaves exactly like
 /// [`prove_fast_core`] (commit allocates inline).
+
+/// Whether the round-1 AB hoist applies: the stripe-C zerocheck entry must be
+/// the one taken (it is the only consumer of the precompute), and
+/// `FLOCK_NO_AB_HOIST=1` is the same-binary kill switch for paired A/B runs.
+fn ab_hoist_enabled(r1cs: &BlockR1cs) -> bool {
+    r1cs.m >= 13
+        && r1cs.k_log >= 9
+        && r1cs.m - r1cs.k_log >= 3
+        // Sequential (1-thread) pools gain nothing from the overlap and pay
+        // a small re-attribution overhead — keep single-threaded runs exact.
+        && rayon::current_num_threads() > 1
+        && std::env::var_os("FLOCK_NO_AB_HOIST").is_none()
+}
+
+/// Run the commit closure and, when the hoist applies, round 1's
+/// challenge-independent AB transform beside it under `rayon::join`. The
+/// transform reads only the witness views and the cached inverse-NTT table,
+/// so transcript order is unaffected; the zerocheck's round 1 later consumes
+/// the buffer by borrowing (see `Round1AbPre`).
+fn commit_with_ab_hoist<T>(
+    commit: impl FnOnce() -> T + Send,
+    a_packed_f128: &[F128],
+    b_packed_f128: &[F128],
+    r1cs: &BlockR1cs,
+    padding: &zerocheck::PaddingSpec,
+) -> (T, Option<zerocheck::univariate_skip_optimized::Round1AbPre>)
+where
+    T: Send,
+{
+    use zerocheck::univariate_skip_optimized as usko;
+    if !ab_hoist_enabled(r1cs) {
+        return (commit(), None);
+    }
+    let a_packed: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            a_packed_f128.as_ptr() as *const u8,
+            std::mem::size_of_val(a_packed_f128),
+        )
+    };
+    let b_packed: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            b_packed_f128.as_ptr() as *const u8,
+            std::mem::size_of_val(b_packed_f128),
+        )
+    };
+    // Run the join window on the all-core (P+E) pool: the commit's NTT is
+    // bandwidth-bound and leaves issue slots; the prep is gather/PMULL
+    // compute the efficiency cores can contribute to without stealing DRAM
+    // bandwidth. Measured: the same join on the 8 P-core pool is a wash,
+    // with the E-cores it wins (paired, see commit message). The rest of the
+    // prove stays on the perf-core pool.
+    let (commit_out, ab_pre) = flock_core::all_core_pool().install(|| rayon::join(commit, || {
+        usko::precompute_round1_ab(
+            a_packed,
+            b_packed,
+            r1cs.m,
+            usko::K_SKIP,
+            usko::cached_inv_table_k6(),
+            padding,
+        )
+    }));
+    (commit_out, Some(ab_pre))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     r1cs: &BlockR1cs,
@@ -649,13 +714,19 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     prefaulted_codeword: Option<Vec<F128>>,
     challenger: &mut Ch,
 ) -> ProveCore {
-    let (commitment, prover_data) = match prefaulted_codeword {
-        Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
-        None => pcs::commit(&z_packed, pcs_params),
-    };
+    let padding = r1cs.padding_spec();
+    let ((commitment, prover_data), ab_pre) = commit_with_ab_hoist(
+        || match prefaulted_codeword {
+            Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
+            None => pcs::commit(&z_packed, pcs_params),
+        },
+        &a_packed_f128,
+        &b_packed_f128,
+        r1cs,
+        &padding,
+    );
     bind_statement(challenger, r1cs, &commitment);
 
-    let padding = r1cs.padding_spec();
     let (zc_proof, zc_claim, s_hat_v_c) = {
         // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
         let a_packed: &[u8] = unsafe {
@@ -692,6 +763,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
                     k_log: r1cs.k_log,
                     useful_bits: r1cs.useful_bits,
                 },
+                ab_pre.as_ref(),
             )
         } else {
             zerocheck::prove_packed_padded_capture_s_hat_v_c(
@@ -702,6 +774,9 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     // Nothing downstream reads a/b (zerocheck consumed them in rounds 1–2);
     // recycle the two buffers (2 × 2^(m-3) bytes — 128 MB at m = 29) instead
     // of carrying them through lincheck and the PCS open.
+    if let Some(pre) = ab_pre {
+        pre.recycle();
+    }
     flock_core::scratch::give_f128(a_packed_f128);
     flock_core::scratch::give_f128(b_packed_f128);
 
@@ -798,16 +873,21 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
         .ligerito_prover_config()
         .expect("Ligerito default config; bump m for tiny instances");
 
-    // --- PCS commit ---
+    // --- PCS commit (+ hoisted challenge-independent AB transform) ---
+    let padding = r1cs.padding_spec();
     let t0 = Instant::now();
-    let (commitment, prover_data) = match prefaulted_codeword {
-        Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
-        None => pcs::commit(&z_packed, pcs_params),
-    };
+    let ((commitment, prover_data), ab_pre) = commit_with_ab_hoist(
+        || match prefaulted_codeword {
+            Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
+            None => pcs::commit(&z_packed, pcs_params),
+        },
+        &a_packed_f128,
+        &b_packed_f128,
+        r1cs,
+        &padding,
+    );
     t.commit_s = t0.elapsed().as_secs_f64();
     bind_statement(challenger, r1cs, &commitment);
-
-    let padding = r1cs.padding_spec();
 
     // --- zerocheck ---
     let t0 = Instant::now();
@@ -846,6 +926,7 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
                     k_log: r1cs.k_log,
                     useful_bits: r1cs.useful_bits,
                 },
+                ab_pre.as_ref(),
             )
         } else {
             zerocheck::prove_packed_padded_capture_s_hat_v_c(
@@ -854,6 +935,9 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
         }
     };
     t.zerocheck_s = t0.elapsed().as_secs_f64();
+    if let Some(pre) = ab_pre {
+        pre.recycle();
+    }
     flock_core::scratch::give_f128(a_packed_f128);
     flock_core::scratch::give_f128(b_packed_f128);
 

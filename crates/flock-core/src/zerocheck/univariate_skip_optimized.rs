@@ -514,6 +514,7 @@ fn process_one_x_hi_with_s_hat_v(
     convert: &[F128],
     state: &mut WorkerStateWithSHatV,
     compute_c: bool,
+    ab_pre: Option<&Round1AbPre>,
 ) {
     state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
     state.partial_c_0.iter_mut().for_each(|p| *p = F128::ZERO);
@@ -534,16 +535,18 @@ fn process_one_x_hi_with_s_hat_v(
 
         if n_b_med == (1 << N_MEDIUM) {
             for b_med in 0..(1 << N_MEDIUM) {
-                shift_reduce_inner_ab(
-                    a_packed,
-                    b_packed,
-                    inv_table,
-                    chunk_byte_base,
-                    b_med,
-                    &mut state.chunk_ab_bytes[b_med],
-                    &mut state.a_col,
-                    &mut state.b_col,
-                );
+                if ab_pre.is_none() {
+                    shift_reduce_inner_ab(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        chunk_byte_base,
+                        b_med,
+                        &mut state.chunk_ab_bytes[b_med],
+                        &mut state.a_col,
+                        &mut state.b_col,
+                    );
+                }
                 if compute_c {
                     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                     let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -553,9 +556,13 @@ fn process_one_x_hi_with_s_hat_v(
                 }
             }
 
+            let ab_src = match ab_pre {
+                Some(pre) => pre.outer(x_outer),
+                None => &state.chunk_ab_bytes,
+            };
             if compute_c {
                 kernels::accumulate_convert_with_s_hat_v(
-                    &state.chunk_ab_bytes,
+                    ab_src,
                     &state.chunk_c_bytes,
                     1 << N_MEDIUM,
                     convert,
@@ -566,7 +573,7 @@ fn process_one_x_hi_with_s_hat_v(
                 );
             } else {
                 kernels::accumulate_convert_ab_only(
-                    &state.chunk_ab_bytes,
+                    ab_src,
                     1 << N_MEDIUM,
                     convert,
                     eq_lo_val,
@@ -575,16 +582,18 @@ fn process_one_x_hi_with_s_hat_v(
             }
         } else {
             for b_med in 0..n_b_med {
-                shift_reduce_inner_ab(
-                    a_packed,
-                    b_packed,
-                    inv_table,
-                    chunk_byte_base,
-                    b_med,
-                    &mut state.chunk_ab_bytes[b_med],
-                    &mut state.a_col,
-                    &mut state.b_col,
-                );
+                if ab_pre.is_none() {
+                    shift_reduce_inner_ab(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        chunk_byte_base,
+                        b_med,
+                        &mut state.chunk_ab_bytes[b_med],
+                        &mut state.a_col,
+                        &mut state.b_col,
+                    );
+                }
                 if compute_c {
                     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                     let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -594,9 +603,13 @@ fn process_one_x_hi_with_s_hat_v(
                 }
             }
 
+            let ab_src = match ab_pre {
+                Some(pre) => pre.outer(x_outer),
+                None => &state.chunk_ab_bytes,
+            };
             if compute_c {
                 kernels::accumulate_convert_with_s_hat_v(
-                    &state.chunk_ab_bytes,
+                    ab_src,
                     &state.chunk_c_bytes,
                     n_b_med,
                     convert,
@@ -607,7 +620,7 @@ fn process_one_x_hi_with_s_hat_v(
                 );
             } else {
                 kernels::accumulate_convert_ab_only(
-                    &state.chunk_ab_bytes,
+                    ab_src,
                     n_b_med,
                     convert,
                     eq_lo_val,
@@ -623,6 +636,127 @@ fn process_one_x_hi_with_s_hat_v(
         state.local_res_c_s_0[lane] += eq_hi_val * state.partial_c_0[lane];
         state.local_res_c_s_1[lane] += eq_hi_val * state.partial_c_1[lane];
     }
+}
+
+/// The standard k_skip=6 inverse-NTT table, built once per process.
+///
+/// The AB precompute and the round-1 drain must read the same table; caching
+/// also avoids rebuilding it on every prove.
+pub fn cached_inv_table_k6() -> &'static InvNttTableByteSingleGf8 {
+    static T: OnceLock<InvNttTableByteSingleGf8> = OnceLock::new();
+    T.get_or_init(|| {
+        let ntt_s = crate::ntt::AdditiveNttGf8::new(K_SKIP, F8::ZERO);
+        let ntt_l = crate::ntt::AdditiveNttGf8::new(K_SKIP, F8(1u8 << K_SKIP));
+        InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l)
+    })
+}
+
+/// One `shift_reduce_inner_ab` output block.
+const AB_PRE_CHUNK: usize = 64;
+/// All `b_med` blocks for one `x_outer`.
+const AB_PRE_PER_OUTER: usize = (1 << N_MEDIUM) * AB_PRE_CHUNK;
+
+/// The challenge-independent half of round 1, materialized.
+///
+/// `shift_reduce_inner_ab` reads only the witness and the inverse-NTT table —
+/// the verifier's challenge enters round 1 solely through `eq_lo_scaled` and
+/// the convert table, both owned by the drain. So the AB transform can be
+/// computed before the commitment root exists, and the caller can overlap it
+/// with the commit (`rayon::join` in the prover's fast paths).
+///
+/// Layout is `[x_outer][b_med][64]`, exactly the shape the drain reads —
+/// consuming it costs a borrow, not a copy. Size is `2^(m-13)` KiB
+/// (512 MiB at m = 32).
+pub struct Round1AbPre {
+    /// Pool-recycled backing storage, viewed as bytes. Slots for skipped
+    /// `b_med` rows are UNINITIALIZED/stale: every consumer bounds its reads
+    /// by the same `n_b_med` (derived from the same `PaddingSpec`), so they
+    /// are never read — zero-filling 2^(m-13) KiB per prove costs more than
+    /// the whole overlap saves.
+    storage: Vec<F128>,
+    n_outer: usize,
+}
+
+impl Round1AbPre {
+    /// All `b_med` blocks for one `x_outer`.
+    #[inline]
+    fn outer(&self, x_outer: usize) -> &[[u8; AB_PRE_CHUNK]; 1 << N_MEDIUM] {
+        debug_assert!(x_outer < self.n_outer);
+        let off = x_outer * AB_PRE_PER_OUTER;
+        // SAFETY: the storage holds `n_outer * AB_PRE_PER_OUTER` bytes and u8
+        // has no alignment requirement; in-bounds by the debug_assert.
+        unsafe { &*((self.storage.as_ptr() as *const u8).add(off) as *const [[u8; AB_PRE_CHUNK]; 1 << N_MEDIUM]) }
+    }
+
+    pub fn len_bytes(&self) -> usize {
+        self.storage.len() * core::mem::size_of::<F128>()
+    }
+
+    /// Recycle the backing storage (call after round 1 consumed the buffer).
+    pub fn recycle(self) {
+        crate::scratch::give_f128(self.storage);
+    }
+}
+
+/// Run the challenge-independent AB transform over the whole witness.
+///
+/// Mirrors the prep half of [`process_one_x_hi_with_s_hat_v`] exactly,
+/// including the `b_med` padding skip, so the drain sees identical bytes.
+pub fn precompute_round1_ab(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+) -> Round1AbPre {
+    use rayon::prelude::*;
+
+    assert_eq!(k_skip, K_SKIP, "precompute is k_skip=6 only");
+    assert!(m >= k_skip + N_INNER);
+    let n_outer = 1usize << (m - k_skip - N_INNER);
+    let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+
+    let total = n_outer * AB_PRE_PER_OUTER;
+    debug_assert_eq!(total % core::mem::size_of::<F128>(), 0);
+    let mut storage = crate::scratch::take_f128(total / core::mem::size_of::<F128>());
+    // SAFETY: F128 is plain bytes; the byte view covers exactly the buffer.
+    // Contents start uninitialized/stale — see the field docs for why the
+    // skipped-b_med holes are sound.
+    let bytes: &mut [u8] =
+        unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total) };
+
+    bytes
+        .par_chunks_mut(AB_PRE_PER_OUTER)
+        .enumerate()
+        .for_each(|(x_outer, out)| {
+            let within_hash_outer = x_outer & within_outer_mask;
+            let n_b_med = b_med_counts[within_hash_outer] as usize;
+            if n_b_med == 0 {
+                return;
+            }
+            let chunk_byte_base = (x_outer << N_INNER) * N_CHUNKS;
+            let mut a_col = [F8::ZERO; ELL];
+            let mut b_col = [F8::ZERO; ELL];
+            for b_med in 0..n_b_med {
+                let dst: &mut [u8; AB_PRE_CHUNK] = (&mut out
+                    [b_med * AB_PRE_CHUNK..(b_med + 1) * AB_PRE_CHUNK])
+                    .try_into()
+                    .expect("AB_PRE_CHUNK bytes");
+                kernels::shift_reduce_inner_ab(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    chunk_byte_base,
+                    b_med,
+                    dst,
+                    &mut a_col,
+                    &mut b_col,
+                );
+            }
+        });
+
+    Round1AbPre { storage, n_outer }
 }
 
 /// Build the `b_med_counts` table from a [`PaddingSpec`] for use by
@@ -884,7 +1018,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
     padding: &PaddingSpec,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
     round1_with_s_hat_v_impl(
-        a_packed, b_packed, c_packed, m, k_skip, r, inv_table, padding, None,
+        a_packed, b_packed, c_packed, m, k_skip, r, inv_table, padding, None, None,
     )
 }
 
@@ -903,9 +1037,10 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_stripe_c(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
     stripe_c: StripeC<'_>,
+    ab_pre: Option<&Round1AbPre>,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
     round1_with_s_hat_v_impl(
-        a_packed, b_packed, c_packed, m, k_skip, r, inv_table, padding, Some(stripe_c),
+        a_packed, b_packed, c_packed, m, k_skip, r, inv_table, padding, Some(stripe_c), ab_pre,
     )
 }
 
@@ -920,6 +1055,7 @@ fn round1_with_s_hat_v_impl(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
     stripe_c: Option<StripeC<'_>>,
+    ab_pre: Option<&Round1AbPre>,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
     use rayon::prelude::*;
 
@@ -969,6 +1105,7 @@ fn round1_with_s_hat_v_impl(
                 convert,
                 &mut state,
                 stripe_c.is_none(),
+                ab_pre,
             );
             state
         })
@@ -1347,10 +1484,33 @@ mod tests {
                     k_log,
                     useful_bits: useful,
                 },
+                None,
             );
             assert_eq!(classic.0, striped.0, "res_ab at m={m} useful={useful}");
             assert_eq!(classic.1, striped.1, "res_c_lifted at m={m} useful={useful}");
             assert_eq!(classic.2, striped.2, "s_hat_v_c at m={m} useful={useful}");
+
+            // The hoisted AB precompute must be bit-identical to inline prep.
+            let ab_pre = precompute_round1_ab(&a_p, &b_p, m, K_SKIP, &table, &padding);
+            let pre = round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_stripe_c(
+                &a_p,
+                &b_p,
+                &c_p,
+                m,
+                K_SKIP,
+                &r,
+                &table,
+                &padding,
+                StripeC {
+                    stripe: &stripe,
+                    k_log,
+                    useful_bits: useful,
+                },
+                Some(&ab_pre),
+            );
+            assert_eq!(classic.0, pre.0, "ab_pre res_ab at m={m} useful={useful}");
+            assert_eq!(classic.1, pre.1, "ab_pre res_c at m={m} useful={useful}");
+            assert_eq!(classic.2, pre.2, "ab_pre s_hat_v at m={m} useful={useful}");
         }
     }
 
