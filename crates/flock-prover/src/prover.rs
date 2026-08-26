@@ -777,8 +777,28 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     if let Some(pre) = ab_pre {
         pre.recycle();
     }
-    flock_core::scratch::give_f128(a_packed_f128);
-    flock_core::scratch::give_f128(b_packed_f128);
+    // Provenance-tagged give: a/b still hold exactly the witness encoder's
+    // output for this layout (the zerocheck only reads them), so the next
+    // prove's generator may skip rewriting the layout's constant regions.
+    // The tag is derived from the same values the take side uses.
+    flock_core::scratch::give_f128_tagged(
+        a_packed_f128,
+        crate::r1cs_hashes::common::witness_scratch_tag(
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.useful_bits,
+            crate::r1cs_hashes::common::WITNESS_ROLE_A,
+        ),
+    );
+    flock_core::scratch::give_f128_tagged(
+        b_packed_f128,
+        crate::r1cs_hashes::common::witness_scratch_tag(
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.useful_bits,
+            crate::r1cs_hashes::common::WITNESS_ROLE_B,
+        ),
+    );
 
     let x_ab = r1cs.x_ab_from_mlv(SkipPoint::Phi8(zc_claim.z), &zc_claim.mlv_challenges);
 
@@ -938,8 +958,28 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
     if let Some(pre) = ab_pre {
         pre.recycle();
     }
-    flock_core::scratch::give_f128(a_packed_f128);
-    flock_core::scratch::give_f128(b_packed_f128);
+    // Provenance-tagged give: a/b still hold exactly the witness encoder's
+    // output for this layout (the zerocheck only reads them), so the next
+    // prove's generator may skip rewriting the layout's constant regions.
+    // The tag is derived from the same values the take side uses.
+    flock_core::scratch::give_f128_tagged(
+        a_packed_f128,
+        crate::r1cs_hashes::common::witness_scratch_tag(
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.useful_bits,
+            crate::r1cs_hashes::common::WITNESS_ROLE_A,
+        ),
+    );
+    flock_core::scratch::give_f128_tagged(
+        b_packed_f128,
+        crate::r1cs_hashes::common::witness_scratch_tag(
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.useful_bits,
+            crate::r1cs_hashes::common::WITNESS_ROLE_B,
+        ),
+    );
 
     let x_ab = r1cs.x_ab_from_mlv(SkipPoint::Phi8(zc_claim.z), &zc_claim.mlv_challenges);
 

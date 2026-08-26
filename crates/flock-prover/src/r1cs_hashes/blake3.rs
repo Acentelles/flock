@@ -1226,6 +1226,20 @@ impl PackedWordWriter {
         self.word * 64 + self.used
     }
 
+    /// Publish the pending partial word WITHOUT zero-filling the tail —
+    /// for buffers whose tail provably already holds the layout's zeros
+    /// (scratch-pool provenance hit; see `witness_scratch_tag`).
+    #[inline]
+    fn finish_data_only(mut self) {
+        if self.used != 0 {
+            // SAFETY: see `push`; the partial word is within the block.
+            unsafe {
+                self.out.add(self.word).write(self.pending);
+            }
+            self.word += 1;
+        }
+    }
+
     #[inline]
     fn finish(mut self, total_words: usize) {
         if self.used != 0 {
@@ -1275,11 +1289,18 @@ fn build_block_witness_ab_stream_into(
     z: &mut [u64],
     a: &mut [u64],
     b: &mut [u64],
+    hits: [bool; 3],
 ) {
     const U64_PER_BLOCK: usize = K / 64;
     debug_assert_eq!(z.len(), U64_PER_BLOCK);
     debug_assert_eq!(a.len(), U64_PER_BLOCK);
     debug_assert_eq!(b.len(), U64_PER_BLOCK);
+    // Constant-region elision: on a provenance hit the buffer already holds
+    // this layout's constant bytes — b's MAX prefix and reserved-slot MAXes,
+    // and every stream's zero tail — so those writes are skipped. Data
+    // regions are always written. Bit-identical either way (test:
+    // `witness_elision_matches_fresh`).
+    let [z_hit, a_hit, b_hit] = hits;
 
     let counter_lo = counter as u32;
     let counter_hi = (counter >> 32) as u32;
@@ -1298,11 +1319,15 @@ fn build_block_witness_ab_stream_into(
             let value = (cv[2 * i] as u64) | ((cv[2 * i + 1] as u64) << 32);
             z_ptr.add(i).write(value);
             a_ptr.add(i).write(value);
-            b_ptr.add(i).write(u64::MAX);
+            if !b_hit {
+                b_ptr.add(i).write(u64::MAX);
+            }
         }
         std::ptr::write_bytes(z_ptr.add(4), 0, 4);
         std::ptr::write_bytes(a_ptr.add(4), 0, 4);
-        std::ptr::write_bytes(b_ptr.add(4), 0, 4);
+        if !b_hit {
+            std::ptr::write_bytes(b_ptr.add(4), 0, 4);
+        }
 
         let values = [
             m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13],
@@ -1317,7 +1342,9 @@ fn build_block_witness_ab_stream_into(
             let value = low | ((values[2 * i] as u64) << 1) | ((values[2 * i + 1] as u64) << 33);
             z_ptr.add(8 + i).write(value);
             a_ptr.add(8 + i).write(value);
-            b_ptr.add(8 + i).write(u64::MAX);
+            if !b_hit {
+                b_ptr.add(8 + i).write(u64::MAX);
+            }
         }
     }
     let pending = (flags >> 31) as u64;
@@ -1428,9 +1455,21 @@ fn build_block_witness_ab_stream_into(
     }
     debug_assert_eq!(wz.position(), USEFUL_BITS);
 
-    wz.finish(U64_PER_BLOCK);
-    wa.finish(U64_PER_BLOCK);
-    wb.finish(U64_PER_BLOCK);
+    if z_hit {
+        wz.finish_data_only();
+    } else {
+        wz.finish(U64_PER_BLOCK);
+    }
+    if a_hit {
+        wa.finish_data_only();
+    } else {
+        wa.finish(U64_PER_BLOCK);
+    }
+    if b_hit {
+        wb.finish_data_only();
+    } else {
+        wb.finish(U64_PER_BLOCK);
+    }
 
     // OUT_LO_BASE is 256-bit aligned, so the four reserved words can be
     // replaced without touching neighboring rows.
@@ -1440,7 +1479,9 @@ fn build_block_witness_ab_stream_into(
         let value = (out_lo[2 * i] as u64) | ((out_lo[2 * i + 1] as u64) << 32);
         z[OUT_LO_WORD + i] = value;
         a[OUT_LO_WORD + i] = value;
-        b[OUT_LO_WORD + i] = u64::MAX;
+        if !b_hit {
+            b[OUT_LO_WORD + i] = u64::MAX;
+        }
     }
 }
 
@@ -1532,14 +1573,21 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     // every block. (The chain forbids padding, so this only affects the
     // standalone batch setup.)
     let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
+    let m_log = K_LOG + n_blocks_log;
+    let tags = [
+        super::common::witness_scratch_tag(m_log, K_LOG, USEFUL_BITS, super::common::WITNESS_ROLE_Z),
+        super::common::witness_scratch_tag(m_log, K_LOG, USEFUL_BITS, super::common::WITNESS_ROLE_A),
+        super::common::witness_scratch_tag(m_log, K_LOG, USEFUL_BITS, super::common::WITNESS_ROLE_B),
+    ];
     super::common::drive_witness_packed_and_lincheck_full_write(
         blocks,
         &padding,
         n_blocks_log,
         K_LOG,
-        |block: &Compression, z_u64, a_u64, b_u64| {
+        tags,
+        |block: &Compression, z_u64, a_u64, b_u64, hits| {
             let (cv, m, t, bl, fl) = block;
-            build_block_witness_ab_stream_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
+            build_block_witness_ab_stream_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64, hits);
         },
     )
 }
@@ -2604,6 +2652,56 @@ mod tests {
         assert_eq!(old.1, new.1, "a differs");
         assert_eq!(old.2, new.2, "b differs");
         assert_eq!(old.3, new.3, "z_lincheck differs");
+    }
+
+    /// A provenance-hit regeneration (buffers given back tagged, taken
+    /// again with the same tags, constant regions elided) must be
+    /// byte-identical to a fresh miss-path generation.
+    #[test]
+    fn witness_elision_matches_fresh() {
+        use super::super::common::{
+            WITNESS_ROLE_A, WITNESS_ROLE_B, WITNESS_ROLE_Z, witness_scratch_tag,
+        };
+        let n_blocks_log = 5;
+        let m_log = K_LOG + n_blocks_log;
+        let mut rng = Rng::new(0xe11d_0001);
+        let mk = |rng: &mut Rng| -> Vec<Compression> {
+            (0..21)
+                .map(|i| {
+                    let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                    let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                    let flags = if i % 2 == 0 { 11u32 } else { u32::MAX };
+                    (cv, m, rng.next_u32() as u64, 64u32, flags)
+                })
+                .collect()
+        };
+        let blocks1 = mk(&mut rng);
+        let blocks2 = mk(&mut rng);
+
+        // Fresh run of blocks2 (reference, no hits possible for its buffers).
+        let reference = generate_witness_with_ab_packed_and_lincheck(&blocks2, n_blocks_log);
+
+        // Prove-cycle simulation: generate blocks1, give all three buffers
+        // back TAGGED (as the prover does for a/b — z tagged here too to
+        // exercise the z tail path), regenerate blocks2 — hits fire.
+        let (z, a, b, _s) = generate_witness_with_ab_packed_and_lincheck(&blocks1, n_blocks_log);
+        flock_core::scratch::give_f128_tagged(
+            z,
+            witness_scratch_tag(m_log, K_LOG, USEFUL_BITS, WITNESS_ROLE_Z),
+        );
+        flock_core::scratch::give_f128_tagged(
+            a,
+            witness_scratch_tag(m_log, K_LOG, USEFUL_BITS, WITNESS_ROLE_A),
+        );
+        flock_core::scratch::give_f128_tagged(
+            b,
+            witness_scratch_tag(m_log, K_LOG, USEFUL_BITS, WITNESS_ROLE_B),
+        );
+        let hit_run = generate_witness_with_ab_packed_and_lincheck(&blocks2, n_blocks_log);
+        assert_eq!(reference.0, hit_run.0, "z differs on provenance hit");
+        assert_eq!(reference.1, hit_run.1, "a differs on provenance hit");
+        assert_eq!(reference.2, hit_run.2, "b differs on provenance hit");
+        assert_eq!(reference.3, hit_run.3, "stripe differs on provenance hit");
     }
 
     /// Generic (matrix-driven) Ligerito prove produces a byte-identical

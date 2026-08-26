@@ -20,7 +20,14 @@
 use crate::field::F128;
 use std::sync::Mutex;
 
-static POOL: Mutex<Vec<Vec<F128>>> = Mutex::new(Vec::new());
+/// Pool entries carry a provenance tag (0 = none): a producer that returns a
+/// buffer whose byte contents it can vouch for attaches a layout-specific
+/// tag; a later taker asking for the SAME tag and exact length receives the
+/// buffer with contents intact (a "hit") and may skip rewriting the layout's
+/// constant regions. Any other custody event — an untagged take, a
+/// different-tag take — clears the tag, so a hit can only ever alias bytes
+/// with a buffer that genuinely holds a previous run of the same layout.
+static POOL: Mutex<Vec<(Vec<F128>, u64)>> = Mutex::new(Vec::new());
 
 /// Max buffers retained. The m=29 prove cycle gives ~18 distinct buffers:
 /// witness z/a/b, the L0 codeword, zerocheck's 2 fold outputs + 2 ping-pong
@@ -53,13 +60,14 @@ pub fn take_f128(n: usize) -> Vec<F128> {
 pub(crate) fn try_take_f128(n: usize) -> Option<Vec<F128>> {
     let mut pool = POOL.lock().unwrap();
     let mut best: Option<usize> = None;
-    for (i, v) in pool.iter().enumerate() {
-        if v.capacity() >= n && best.is_none_or(|b| v.capacity() < pool[b].capacity()) {
+    for (i, (v, _)) in pool.iter().enumerate() {
+        if v.capacity() >= n && best.is_none_or(|b: usize| v.capacity() < pool[b].0.capacity()) {
             best = Some(i);
         }
     }
     if let Some(i) = best {
-        let mut v = pool.swap_remove(i);
+        // Untagged custody: the tag (if any) dies here.
+        let (mut v, _) = pool.swap_remove(i);
         drop(pool);
         v.clear();
         // SAFETY: capacity ≥ n was checked above; F128: Copy (no Drop), so
@@ -71,25 +79,50 @@ pub(crate) fn try_take_f128(n: usize) -> Option<Vec<F128>> {
     None
 }
 
+/// [`take_f128`] with provenance: returns `(buffer, hit)`. `hit` is true only
+/// when the pool held a buffer given back via [`give_f128_tagged`] with this
+/// exact `tag` and length `n` — its contents are then EXACTLY the previous
+/// producer's output, so layout-constant regions need not be rewritten.
+/// On a miss the buffer is ordinary uninitialized scratch. `tag` 0 never hits.
+pub fn take_f128_tagged(n: usize, tag: u64) -> (Vec<F128>, bool) {
+    if tag != 0 {
+        let mut pool = POOL.lock().unwrap();
+        if let Some(i) = pool
+            .iter()
+            .position(|(v, t)| *t == tag && v.len() == n)
+        {
+            let (v, _) = pool.swap_remove(i);
+            return (v, true);
+        }
+    }
+    (take_f128(n), false)
+}
+
+/// [`give_f128`]-with-provenance: the caller vouches that `v`'s bytes are a
+/// complete output of the layout named by `tag` (see [`take_f128_tagged`]).
+pub fn give_f128_tagged(v: Vec<F128>, tag: u64) {
+    if v.capacity() == 0 {
+        return;
+    }
+    let mut pool = POOL.lock().unwrap();
+    pool.push((v, tag));
+    if pool.len() > MAX_POOLED {
+        let smallest = pool
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (v, _))| v.capacity())
+            .map(|(i, _)| i)
+            .expect("pool non-empty");
+        pool.swap_remove(smallest);
+    }
+}
+
 /// Return a buffer to the pool for reuse. When the pool is full, the
 /// smallest-capacity buffer is evicted (large buffers are the expensive ones
 /// to re-fault; a run that ramps problem sizes upward must not get its big
 /// buffers crowded out by stale small ones).
 pub fn give_f128(v: Vec<F128>) {
-    if v.capacity() == 0 {
-        return;
-    }
-    let mut pool = POOL.lock().unwrap();
-    pool.push(v);
-    if pool.len() > MAX_POOLED {
-        let smallest = pool
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, v)| v.capacity())
-            .map(|(i, _)| i)
-            .expect("pool non-empty");
-        pool.swap_remove(smallest);
-    }
+    give_f128_tagged(v, 0)
 }
 
 /// Pre-warm the pool for proves at witness size `2^m`: allocate and
