@@ -194,9 +194,7 @@ pub fn prove_packed_padded<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim) {
     let (proof, claim, _) =
-        prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, false, challenger, None, None,
-    );
+        prove_packed_padded_inner(a_packed, b_packed, c_packed, m, padding, false, challenger, None);
     (proof, claim)
 }
 
@@ -216,9 +214,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
     let (proof, claim, captured) =
-        prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, true, challenger, None, None,
-    );
+        prove_packed_padded_inner(a_packed, b_packed, c_packed, m, padding, true, challenger, None);
     (
         proof,
         claim,
@@ -239,7 +235,6 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_stripe<C: Challenger>(
     padding: &PaddingSpec,
     challenger: &mut C,
     stripe_c: univariate_skip_optimized::StripeC<'_>,
-    ab_pre: Option<&univariate_skip_optimized::Round1AbPre>,
 ) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
     let (proof, claim, captured) = prove_packed_padded_inner(
         a_packed,
@@ -250,7 +245,6 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_stripe<C: Challenger>(
         true,
         challenger,
         Some(stripe_c),
-        ab_pre,
     );
     (
         proof,
@@ -269,7 +263,6 @@ fn prove_packed_padded_inner<C: Challenger>(
     capture_s_hat_v_c: bool,
     challenger: &mut C,
     stripe_c: Option<univariate_skip_optimized::StripeC<'_>>,
-    ab_pre: Option<&univariate_skip_optimized::Round1AbPre>,
 ) -> (ZerocheckProof, ZerocheckClaim, Option<Vec<F128>>) {
     let k_skip = K_SKIP;
     const N_INNER: usize = 7; // 3 small + 4 medium fixed-constant eq dims
@@ -331,7 +324,6 @@ fn prove_packed_padded_inner<C: Challenger>(
                 &inv_table,
                 padding,
                 sc,
-                ab_pre,
             ),
             None => crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
                 a_packed,
