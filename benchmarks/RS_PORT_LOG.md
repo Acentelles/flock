@@ -1449,3 +1449,24 @@ Projected m=32 standing: zc 134 → ~121-126 vs their timed 120 — the
 zerocheck kernel gap is essentially closed. Remaining m=32 items:
 anchor+delta compact stores (−5..8), open ranked (−10..20, parked for
 M3/M4 per Benedikt), commit absorption economics (−40, structural).
+
+## m=32 ST gap measured: 1.30x — the MT hypothesis refuted (2026-08-26)
+
+Benedikt asked whether the m=32 gap is multithreading. Both trees ST
+(RAYON_NUM_THREADS=1, blake3, CPU-only, same-minute): ours 3.76s vs
+theirs 2.89s = 1.30x, vs 1.36x MT (ours 542.1 / theirs 398.3 same
+evening, cascade engaged — after fixing ANOTHER stale-bench-binary
+incident: the default-on flip was committed without rebuilding the
+bench, so the first "quick pull" measured the old default; hazard rule
+extended: rebuild the BENCH after every lib change, verify engagement
+by a phase signature before comparing). Parallel scaling ours 6.9x vs
+theirs 7.3x — MT contributes only ~0.05x. The m=32 deficit is
+kernel/path-level, present on one core.
+
+Why m=32 ST is 1.30x when m=30 ST closed at ~1.10-1.15x: their m==32
+allowlist — machinery that fires only at this shape (deeper
+cascade+anchor+delta forms, ranked-open pieces, SIMD witness packing
+whose value concentrates at m=32; our ST witness bucket is 227ms with
+no pool overlap to hide the scalar builder). Our ST buckets (cascade
+on): witness 227 / commit 1277 / zc 1559 (pre-cascade ~1820) /
+lincheck 126 / open 600.
