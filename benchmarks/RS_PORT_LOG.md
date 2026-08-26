@@ -860,3 +860,36 @@ band established by the SHA-256 control. Today's three kept ports:
 composed-table open fold (-15 ms), streamed witness builder (-22 ms),
 two-stripe lincheck fold (-13 ms) — ~50 ms ST total, all bit-identical,
 all paired-decisive, all transferring to 8T.
+
+## Round 1, final pass: the "bigish gap" was mostly an estimation error (2026-08-25)
+
+Skip-arm probes (FLOCK_R1_SKIP_PREP / _DRAIN, since stripped; the stripe-fold
+timer under FLOCK_ZC_TIMING was kept) split our round 1 at m=30 ST:
+**AB prep 160 + AB drain 39 + stripe fold 28 ≈ 230 ms** — the stripe fold
+already carries today's two-stripe lincheck kernel (was ~41).
+
+The peer session then measured their prep arm directly (their
+FLOCK_PHASE_TIMING probe inside the commit rayon::join, 7 ST samples,
+GPU off): **~140 ms**, not the ~105–125 my commit-bucket subtraction
+estimated. Corrected comparison:
+
+| piece | ours | theirs |
+|---|---:|---:|
+| AB prep | 160 | ~140 (measured) |
+| drain + fold | 67 | 72.5 |
+| **round 1 total** | **~230** | **~213** |
+
+So round 1 is ~7% apart, we are AHEAD on drain+fold, and the prep delta is
+12.5%, not 40%. Their prep mechanism (their read): `fused_apply_one_k_fast`
+— identical gather structure, but unreduced PMULL/Horner accumulation with
+one fused BCAX reduction per step instead of a full reduced GF(2^8)
+multiply per K-row. Arithmetic-only; our multiply tail is ~17 ms of the
+160 (gathers ~90%), so the port ceiling is ~8–15 ms for ~100 lines of
+kernel restructure — below the bloat bar. Their other two prep levers
+(DIRECT_AB_ROWS zero-copy views, AB_COMPACT_STORE) address the
+materialize-then-read-back architecture ours doesn't have: our prep is
+fused into the drain and never writes the 128 MB buffer at all.
+
+**Round-1 verdict, this time with both sides measured: closed.** The
+remaining zerocheck delta decomposes as r1 arithmetic ~8–15 (priced, not
+taken), r2 compact format ~7–10 (priced, not taken), tail parity.

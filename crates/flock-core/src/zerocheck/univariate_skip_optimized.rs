@@ -948,6 +948,8 @@ fn round1_with_s_hat_v_impl(
 
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
 
+    let r1_trace = std::env::var("FLOCK_ZC_TIMING").is_ok();
+
     let (res_ab, res_c_s_0, res_c_s_1) = (0..hi_size)
         .into_par_iter()
         .fold(WorkerStateWithSHatV::new, |mut state, x_hi| {
@@ -986,7 +988,17 @@ fn round1_with_s_hat_v_impl(
     // With a stripe, the C banks come from the multilinear fold; the workers
     // above ran AB-only and left their C accumulators zero.
     let (res_c_s_0, res_c_s_1) = match stripe_c {
-        Some(sc) => round1_c_banks_from_stripe(sc.stripe, m, sc.k_log, sc.useful_bits, r),
+        Some(sc) => {
+            let t_fold = std::time::Instant::now();
+            let banks = round1_c_banks_from_stripe(sc.stripe, m, sc.k_log, sc.useful_bits, r);
+            if r1_trace {
+                eprintln!(
+                    "[zc-r1] stripe fold: {:.2} ms",
+                    t_fold.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            banks
+        }
         None => (res_c_s_0, res_c_s_1),
     };
 
