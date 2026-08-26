@@ -4,7 +4,8 @@
 \usepackage{algorithm}
 \usepackage{algpseudocode}
 \usepackage[hidelinks]{hyperref}
-
+\usepackage{color}
+\newcommand{\benedikt}[1]{{\color{red} Benedikt: #1 }}
 \newcommand{\Ftwo}{\mathbb{F}_2}
 \newcommand{\Feight}{\mathbb{F}_{2^8}}
 \newcommand{\Fbig}{\mathbb{F}_{2^{128}}}
@@ -38,13 +39,12 @@ whose dominant pass loses its per-slot field multiply to the same
 $\Ftwo$-linearity argument (\S\ref{sec:composedfold}).
 \end{abstract}
 
-\section*{Setting and notation}
+\section*{Preliminaries}
 
-\emph{This section is front matter: shared definitions and the benchmark
-shape. The numbered sections group the work by prover phase, in pipeline
-order; each \emph{subsection} is one verified optimization, presented with
-its mechanism and its paired measurement.}
-
+\emph{Shared definitions and the benchmark shape. The numbered sections
+group the work by prover phase, in pipeline order; each \emph{subsection}
+is one verified optimization, presented with its mechanism and its paired
+measurement.}
 
 Fields. $\Feight = \Ftwo[x]/(x^8+x^4+x^3+x+1)$ and the GHASH field
 $\Fbig = \Ftwo[X]/(X^{128}+X^7+X^2+X+1)$, with the ring embedding
@@ -65,6 +65,10 @@ quadratic message $P^{AB}(\lambda)$ and the linear message $P^{C}(\lambda)$,
 plus a pair of \emph{banks} (the ring-switch helper $\hat s_{v,C}$) that keep
 the small parity dimension unfolded.
 
+The pinned values below are protocol design, common to both trees --- not
+one of this document's optimizations. The optimization content is
+\emph{which direction} a kernel exploits them; the two directions are
+stated in math at the end of this section.
 The protocol pins the small and medium challenges to \emph{friendly} values:
 $r_{6+i} = \varphi(v_i)$ with $v=(\mathtt{0xF7},\mathtt{0x53},\mathtt{0xB5})$,
 and $\beta_i = \gamma^{2^{i-1}}/(1+\gamma^{2^{i-1}})$. These make the eq
@@ -89,12 +93,36 @@ piece is applied as a shift-and-conditional-XOR directly on the operand
 (\S\ref{sec:pmull}); and the PCS open builds its composed fold table by
 walking the monomials $X^r e$ with 127 exact shift-and-folds instead of 128
 general multiplies (\S\ref{sec:composedfold} --- resting on $\gamma = X$
-being the generator rather than on \eqref{eq:friendly} itself). The rule
-separating the directions: a table wins when one fixed map is applied to a
-stream of arbitrary inputs (the load-port-bound drains); a fold at the value
-wins when the input is a single accumulator or the map itself is being
-constructed. Folds at freshly \emph{sampled} challenges (rounds two and
-onward) get no such shortcut --- there a fold is an ordinary multiply.
+being the generator rather than on \eqref{eq:friendly} itself).
+
+The two directions, in math. Both evaluate contractions against the same
+geometric weight vector: with $w_K = C\,\alpha^K$ for $K < n$ and
+bit-inputs $u \in \Ftwo^n$, the quantity is
+$\langle w, u\rangle = \sum_{K<n} u_K\, w_K$. The \emph{table} direction
+precomputes the entire linear map once,
+\[
+T[u] \;=\; \sum_{K<n} u_K\, w_K
+\quad\text{for all } u\in\Ftwo^{n}
+\qquad(2^{n}\ \text{entries, built by subset-sum doubling}),
+\]
+after which each of $N$ streamed inputs costs a single gather,
+$\langle w, u^{(j)}\rangle = T[u^{(j)}]$: setup $O(2^{n})$, then per-input
+cost independent of $n$ and no multiplies at all. The \emph{fold}
+direction never materializes $T$; it applies the weights level by level
+to the resident data itself,
+\[
+u \;\leftarrow\; u_{\mathrm{even}} \;+\; \alpha^{2^{i}}\, u_{\mathrm{odd}},
+\qquad i = 0,\dots,\log_2 n - 1,
+\]
+costing $n-1$ multiplies per resident vector and touching no table
+memory. Hence the rule separating them: the table amortizes when one
+fixed map meets a stream of many inputs ($N \gg 2^{n}/n$, the
+load-port-bound drains); the fold wins when there is essentially one
+resident object --- an accumulator, a bank, or the table $T$ itself while
+it is being constructed (subset-sum doubling \emph{is} a fold;
+\S\ref{sec:composedfold} is that observation at $n=128$). Folds at
+freshly \emph{sampled} challenges (rounds two and onward) get no such
+shortcut --- there a fold is an ordinary multiply.
 
 \paragraph{Measurement protocol.}
 All numbers are single-threaded at the shape above. Each verdict is a paired
