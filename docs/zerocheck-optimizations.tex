@@ -41,8 +41,9 @@ $\Ftwo$-linearity argument (\S\ref{sec:composedfold}).
 \section*{Setting and notation}
 
 \emph{This section is front matter: shared definitions and the benchmark
-shape. Every \emph{numbered} section that follows is one verified
-optimization, presented with its mechanism and its paired measurement.}
+shape. The numbered sections group the work by prover phase, in pipeline
+order; each \emph{subsection} is one verified optimization, presented with
+its mechanism and its paired measurement.}
 
 
 Fields. $\Feight = \Ftwo[x]/(x^8+x^4+x^3+x+1)$ and the GHASH field
@@ -91,93 +92,38 @@ $8/8$ with disjoint ranges. Measure only on AC power with the battery above
 $\sim60\%$: low battery caps frequencies, and fast-charging a nearly empty
 battery is worse.
 
-\section{Deferred reduction in vector registers}\label{sec:wideneon}
+\section{Witness generation}
 
-For $u\in\Ftwo^{256}$ (an unreduced carry-less product) let
-$R(u)\in\Fbig$ be reduction mod $X^{128}+X^7+X^2+X+1$. $R$ is
-$\Ftwo$-linear, so for any products $u_i = a_i \odot b_i$ (unreduced),
-\[
-\textstyle\sum_i R(u_i) \;=\; R\!\left(\sum_i u_i\right),
-\]
-and a sum of $n$ field products needs one reduction, not $n$. The baseline
-already used this identity, but held the $256$-bit accumulator as a four-word
-struct in \emph{general} registers: each product paid six lane extracts to
-leave the vector file, and each accumulate was four scalar XORs.
+Everything downstream consumes the bit-packed witness; its builder is the
+first timed phase.
 
-The fix is representational, not algorithmic: keep the accumulator as two
-$128$-bit vector registers. The unreduced product uses Karatsuba,
-\[
-(a_l + a_h X^{64})(b_l + b_h X^{64}) : \quad
-\mathit{ll}=a_l b_l,\ \ \mathit{hh}=a_h b_h,\ \
-\mathit{cross}=(a_l{+}a_h)(b_l{+}b_h)+\mathit{ll}+\mathit{hh},
-\]
-three \code{PMULL}s instead of the schoolbook four; accumulation is two vector
-XORs; the four extracts are paid once per worker chunk on the way out, and the
-existing scalar reducer is reused unchanged.
+\subsection{Streaming full-word publication}
+\label{sec:streamwit}
 
-\emph{Measured: round-2 phase $433.1\to375.2\,$ms ($-13.4\%$).}
+The BLAKE3 witness builder fills three bit-packed buffers (z, a, b; one bit
+per R1CS wire) per compression block. The incumbent wrote them by OR-ing
+sub-word fields into pre-zeroed storage: a $\approx$130\,MB\,$\times$3 memset,
+then a read-modify-write on every store. But the circuit's rows are
+\emph{contiguous} through the block's useful bits, so a sequential writer
+that carries a partial word in a register can publish complete u64s in
+order and never read the destination --- the memset and the RMW tax both
+disappear. The one out-of-order region (the output chaining value, 256-bit
+aligned) is reserved and overwritten once the final state is known. The
+fixed 56-G compression schedule is also fully unrolled with literal
+state/message indices, exposing the whole dependency graph to register
+allocation. Bit-identical through the driver (tested against the OR
+builder on real and padding slots, both values of the prefix carry bit).
+Measured, paired: ST $87$--$90 \to 64.8$--$68.9\,$ms ($-24\%$, $3/3$
+disjoint); 8T $-20\%$. Idea from the challenge tree; their further
+$\approx$$3$--$7\,$ms SIMD-lockstep stage was priced against its
+$\approx$400 lines and not taken.
 
-\section{Structurally fixed rows of the $b$ operand}\label{sec:zeroskip}
+\section{Zerocheck round 1}
 
-Round~1's dominant kernel transforms the operands $a,b$ through a table $T$
-implementing the inverse-NTT composition; $T$ is $\Ftwo$-linear, so
-$T(0)=0$. A census of the packed BLAKE3 witness (256 word positions per
-block $\times$ 256 blocks $\times$ 3 independent witnesses) shows the circuit
-pins $38$ of $256$ eight-byte $K$-rows of $b$ regardless of the inputs, taking
-only three values:
-\[
-\underbrace{\mathtt{0xff}^8}_{22\ \text{positions (const-one wires)}},\qquad
-\underbrace{0^8}_{15\ \text{positions (structural zeros)}},\qquad
-\text{one mixed word.}
-\]
-For a zero row the entire row's work vanishes: $db=T(0)=0$, hence
-$y = da \odot db = 0$ contributes nothing to any accumulator. The kernel
-gains a single guard:
+Round~1 is the zerocheck's largest phase; the four kept changes below took it
+from $1477$ to $1205$\,ms ($-18.4\%$) at the benchmark shape.
 
-\begin{algorithmic}[1]
-\State \textbf{if} $\mathrm{load}_{64}(b\_\mathit{row}) = 0$ \textbf{then
-return} \Comment{skips all 64 table loads and 4 $\Feight$ multiplies}
-\end{algorithmic}
-
-\noindent
-No census data ships and no positions are tracked: the guard is exact for any
-witness, and a disagreeing witness falls through to the generic path.
-(The all-ones rows were also tried: constant-folding them saves only the $b$
-half of a row's work, and halving a row's loads halves its memory-level
-parallelism, returning $6\,$ms where $27$ were predicted. Reverted; whole-row
-elimination is what pays.)
-
-\emph{Measured: round~1 $-42.4\,$ms ($-2.9\%$), $8/8$.}
-
-\section{Instruction-level parallelism in the gather drain}\label{sec:twolane}
-
-The drain accumulates, per output lane, three XOR chains of depth
-$n_{\mathrm{med}}=16$ (one per bank), each link a table gather feeding an XOR.
-The gathers are independent but the chains are serial, so one lane exposes
-three dependency chains to the out-of-order engine. Processing two lanes per
-iteration doubles that to six with no change in total work:
-
-\begin{algorithmic}[1]
-\For{$\ell = 0,2,4,\dots,62$}
-  \State $u_0,u_1,u_2 \gets 0$;\quad $v_0,v_1,v_2 \gets 0$
-    \Comment{banks for lanes $\ell$ and $\ell{+}1$}
-  \For{$b = 0 \dots n_{\mathrm{med}}-1$}
-    \State $u_j \mathrel{\oplus}= \mathrm{convert}[b][\cdot]$;\quad
-           $v_j \mathrel{\oplus}= \mathrm{convert}[b][\cdot]$
-           \Comment{6 independent chains in flight}
-  \EndFor
-\EndFor
-\end{algorithmic}
-
-This targets latency, not throughput: an attempt to shrink the gather
-\emph{table} ($64\to8\,$KiB, doubling gather count) had cost $3.6\%$ --- the
-table already fit M1's $128\,$KiB L1D, establishing that the drain is bound by
-gather count and chain depth, not footprint.
-
-\emph{Measured: round~1 $-63.1\,$ms ($-4.3\%$), $8/8$. Combined with
-Section~\ref{sec:zeroskip}: $1477.3\to1403.1\,$ms ($-5.0\%$).}
-
-\section{Unreduced accumulation with multiplicative weight splitting}
+\subsection{Unreduced accumulation with multiplicative weight splitting}
 \label{sec:pmull}
 
 The prep kernel computes, per $K$-row ($K\in\{0,\dots,7\}$) and 16-lane block,
@@ -226,7 +172,7 @@ unchanged apart from the second $16\,$KiB table image.
 $[-8.7\%,-10.1\%]$. The reference implementation's attribution predicted
 $100$--$140\,$ms; measured $128$.}
 
-\section{The C-side message as a fold of the lincheck stripe}
+\subsection{The C-side message as a fold of the lincheck stripe}
 \label{sec:stripe}
 
 In the fast hash setups $C=I$, so $\hat c = \hat z$ and everything round~1
@@ -276,7 +222,98 @@ drain's, and all three entry outputs identical, dense and padded.
 the added fold ($\approx180\,$ms) is included; the removals
 ($\approx250\,$ms) net out.}
 
-\section{Register-resident round 2}\label{sec:qres}
+\subsection{Instruction-level parallelism in the gather drain}\label{sec:twolane}
+
+The drain accumulates, per output lane, three XOR chains of depth
+$n_{\mathrm{med}}=16$ (one per bank), each link a table gather feeding an XOR.
+The gathers are independent but the chains are serial, so one lane exposes
+three dependency chains to the out-of-order engine. Processing two lanes per
+iteration doubles that to six with no change in total work:
+
+\begin{algorithmic}[1]
+\For{$\ell = 0,2,4,\dots,62$}
+  \State $u_0,u_1,u_2 \gets 0$;\quad $v_0,v_1,v_2 \gets 0$
+    \Comment{banks for lanes $\ell$ and $\ell{+}1$}
+  \For{$b = 0 \dots n_{\mathrm{med}}-1$}
+    \State $u_j \mathrel{\oplus}= \mathrm{convert}[b][\cdot]$;\quad
+           $v_j \mathrel{\oplus}= \mathrm{convert}[b][\cdot]$
+           \Comment{6 independent chains in flight}
+  \EndFor
+\EndFor
+\end{algorithmic}
+
+This targets latency, not throughput: an attempt to shrink the gather
+\emph{table} ($64\to8\,$KiB, doubling gather count) had cost $3.6\%$ --- the
+table already fit M1's $128\,$KiB L1D, establishing that the drain is bound by
+gather count and chain depth, not footprint.
+
+\emph{Measured: round~1 $-63.1\,$ms ($-4.3\%$), $8/8$. Combined with
+Section~\ref{sec:zeroskip}: $1477.3\to1403.1\,$ms ($-5.0\%$).}
+
+\subsection{Structurally fixed rows of the $b$ operand}\label{sec:zeroskip}
+
+Round~1's dominant kernel transforms the operands $a,b$ through a table $T$
+implementing the inverse-NTT composition; $T$ is $\Ftwo$-linear, so
+$T(0)=0$. A census of the packed BLAKE3 witness (256 word positions per
+block $\times$ 256 blocks $\times$ 3 independent witnesses) shows the circuit
+pins $38$ of $256$ eight-byte $K$-rows of $b$ regardless of the inputs, taking
+only three values:
+\[
+\underbrace{\mathtt{0xff}^8}_{22\ \text{positions (const-one wires)}},\qquad
+\underbrace{0^8}_{15\ \text{positions (structural zeros)}},\qquad
+\text{one mixed word.}
+\]
+For a zero row the entire row's work vanishes: $db=T(0)=0$, hence
+$y = da \odot db = 0$ contributes nothing to any accumulator. The kernel
+gains a single guard:
+
+\begin{algorithmic}[1]
+\State \textbf{if} $\mathrm{load}_{64}(b\_\mathit{row}) = 0$ \textbf{then
+return} \Comment{skips all 64 table loads and 4 $\Feight$ multiplies}
+\end{algorithmic}
+
+\noindent
+No census data ships and no positions are tracked: the guard is exact for any
+witness, and a disagreeing witness falls through to the generic path.
+(The all-ones rows were also tried: constant-folding them saves only the $b$
+half of a row's work, and halving a row's loads halves its memory-level
+parallelism, returning $6\,$ms where $27$ were predicted. Reverted; whole-row
+elimination is what pays.)
+
+\emph{Measured: round~1 $-42.4\,$ms ($-2.9\%$), $8/8$.}
+
+\section{Zerocheck round 2}
+
+Two kept changes, sharing the deferred-reduction machinery, took round~2 from
+$433$ to $312$\,ms ($-28\%$).
+
+\subsection{Deferred reduction in vector registers}\label{sec:wideneon}
+
+For $u\in\Ftwo^{256}$ (an unreduced carry-less product) let
+$R(u)\in\Fbig$ be reduction mod $X^{128}+X^7+X^2+X+1$. $R$ is
+$\Ftwo$-linear, so for any products $u_i = a_i \odot b_i$ (unreduced),
+\[
+\textstyle\sum_i R(u_i) \;=\; R\!\left(\sum_i u_i\right),
+\]
+and a sum of $n$ field products needs one reduction, not $n$. The baseline
+already used this identity, but held the $256$-bit accumulator as a four-word
+struct in \emph{general} registers: each product paid six lane extracts to
+leave the vector file, and each accumulate was four scalar XORs.
+
+The fix is representational, not algorithmic: keep the accumulator as two
+$128$-bit vector registers. The unreduced product uses Karatsuba,
+\[
+(a_l + a_h X^{64})(b_l + b_h X^{64}) : \quad
+\mathit{ll}=a_l b_l,\ \ \mathit{hh}=a_h b_h,\ \
+\mathit{cross}=(a_l{+}a_h)(b_l{+}b_h)+\mathit{ll}+\mathit{hh},
+\]
+three \code{PMULL}s instead of the schoolbook four; accumulation is two vector
+XORs; the four extracts are paid once per worker chunk on the way out, and the
+existing scalar reducer is reused unchanged.
+
+\emph{Measured: round-2 phase $433.1\to375.2\,$ms ($-13.4\%$).}
+
+\subsection{The register-resident message loop}\label{sec:qres}
 
 Round~2's message loop crossed the vector/general register-file boundary three
 times per output pair: the table-driven fold extracted its vector accumulator
@@ -295,9 +332,14 @@ memory traffic is the four required stores of folded values and one eq load.
 pair in $[-12.6\%,-13.3\%]$, taken on a machine with an active browser
 session (the min-of-5 protocol absorbs interactive bursts).}
 
-\paragraph{The rounds-3+ tail: fusing away a memory pass.}
-The tail rounds (3 and beyond) apply the same treatment plus one thing round~2
-had no opportunity for. The incumbent made \emph{two} passes per worker chunk:
+\section{Zerocheck rounds 3+}
+
+One structural change took the tail from $455$ to $307$\,ms ($-33\%$).
+
+\subsection{Fusing away a memory pass}\label{sec:tailfuse}
+
+The tail rounds apply the register-resident treatment of \S\ref{sec:qres}
+plus one thing round~2 had no opportunity for. The incumbent made \emph{two} passes per worker chunk:
 fold $a_{\mathrm{in}},b_{\mathrm{in}}$ into $a_{\mathrm{out}},b_{\mathrm{out}}$,
 then re-read the just-written multi-megabyte chunk to build the message ---
 an L2/DRAM read of data that had been in vector registers moments earlier.
@@ -330,7 +372,30 @@ where the cost actually lived.
 \emph{Measured: rounds-3+ phase $449.5\to306.6\,$ms ($-31.8\%$), $8/8$,
 every pair in $[-31.1\%,-32.6\%]$ --- the largest single win of the effort.}
 
-\section{PCS open: composing the block scalar into the fold table}
+\section{Lincheck}
+
+\subsection{One word load per stripe, two stripes per pass}
+\label{sec:lcfold}
+
+The lincheck's dominant pass folds the 128\,MB packed witness through
+per-stripe 256-entry byte tables into eight Q-register accumulators. The
+loop is load-port bound (M1: 3 loads/cycle), and the incumbent spent 16
+loads per stripe step: 8 table entries \emph{plus 8 scalar byte loads} for
+the indices. The indices are 8 adjacent bytes --- one u64 load and GPR
+shift-extracts replace all eight --- and folding two stripes per iteration
+lets the two table entries enter the accumulator as an XOR pair, which LLVM
+fuses to a single \code{EOR3} under the SHA3 feature: $\approx$9 loads per
+stripe, same XOR multiset, bit-identical. Measured, paired:
+\code{partial\_fold\_z} ST $40.7$--$40.8 \to 27.8$--$28.0\,$ms ($-32\%$,
+$3/3$ disjoint) --- landing on the pass's computed $\approx$28\,ms load
+floor; 8T $-28\%$. This supersedes the earlier ``no reachable headroom''
+verdict, which had priced blocking and table-geometry changes but not the
+index-load restructure (idea from the challenge tree's asm kernel,
+re-expressed in intrinsics).
+
+\section{PCS open}
+
+\subsection{Composing the block scalar into the fold table}
 \label{sec:composedfold}
 
 \emph{Shape for this section: the $2^{16}$-compression open ($m=30$,
@@ -387,47 +452,9 @@ coefficients accumulated in the combine's tail are an accounting wash, not a
 speedup: tail-plus-initial-sumcheck costs $60.5$ vs.\ $60.6\,$ms across the
 two trees' opposite placements of the same work.
 
-\section{Witness generation: streaming full-word publication}
-\label{sec:streamwit}
+\section{Merkle hashing: BLAKE3}
 
-The BLAKE3 witness builder fills three bit-packed buffers (z, a, b; one bit
-per R1CS wire) per compression block. The incumbent wrote them by OR-ing
-sub-word fields into pre-zeroed storage: a $\approx$130\,MB\,$\times$3 memset,
-then a read-modify-write on every store. But the circuit's rows are
-\emph{contiguous} through the block's useful bits, so a sequential writer
-that carries a partial word in a register can publish complete u64s in
-order and never read the destination --- the memset and the RMW tax both
-disappear. The one out-of-order region (the output chaining value, 256-bit
-aligned) is reserved and overwritten once the final state is known. The
-fixed 56-G compression schedule is also fully unrolled with literal
-state/message indices, exposing the whole dependency graph to register
-allocation. Bit-identical through the driver (tested against the OR
-builder on real and padding slots, both values of the prefix carry bit).
-Measured, paired: ST $87$--$90 \to 64.8$--$68.9\,$ms ($-24\%$, $3/3$
-disjoint); 8T $-20\%$. Idea from the challenge tree; their further
-$\approx$$3$--$7\,$ms SIMD-lockstep stage was priced against its
-$\approx$400 lines and not taken.
-
-\section{Lincheck fold: one word load per stripe, two stripes per pass}
-\label{sec:lcfold}
-
-The lincheck's dominant pass folds the 128\,MB packed witness through
-per-stripe 256-entry byte tables into eight Q-register accumulators. The
-loop is load-port bound (M1: 3 loads/cycle), and the incumbent spent 16
-loads per stripe step: 8 table entries \emph{plus 8 scalar byte loads} for
-the indices. The indices are 8 adjacent bytes --- one u64 load and GPR
-shift-extracts replace all eight --- and folding two stripes per iteration
-lets the two table entries enter the accumulator as an XOR pair, which LLVM
-fuses to a single \code{EOR3} under the SHA3 feature: $\approx$9 loads per
-stripe, same XOR multiset, bit-identical. Measured, paired:
-\code{partial\_fold\_z} ST $40.7$--$40.8 \to 27.8$--$28.0\,$ms ($-32\%$,
-$3/3$ disjoint) --- landing on the pass's computed $\approx$28\,ms load
-floor; 8T $-28\%$. This supersedes the earlier ``no reachable headroom''
-verdict, which had priced blocking and table-geometry changes but not the
-index-load restructure (idea from the challenge tree's asm kernel,
-re-expressed in intrinsics).
-
-\section{Merkle BLAKE3: two transposed four-wide states in flight}
+\subsection{Two transposed four-wide states in flight}
 \label{sec:blake3neon}
 
 The PCS Merkle tree can hash with SHA-256 (hardware silicon, $\approx$2.5\,GB/s
@@ -451,6 +478,18 @@ assembly kernel; this is $\approx$290 lines of intrinsics within $6\%$ of it
 End-to-end the change erases the $-5\%$ penalty BLAKE3-Merkle previously
 carried in this tree, making the Merkle hash choice free.
 
+\section{Multithreading}
+\label{sec:mt}
+
+In progress. The campaign target mirrors the single-threaded closure above:
+CPU-only multithreaded throughput within $10\%$ of the challenge tree
+(currently $1.19\times$ apart at the $2^{16}$ shape and $1.49\times$ at the
+ranked $2^{18}$ shape, where the challenge tree's shape-gated scheduling
+stack engages). The first candidate --- round~1's challenge-independent AB
+transform overlapped with the commit under \code{rayon::join} --- is
+implemented and under measurement as of this revision; subsections will be
+added as mechanisms pass their paired tests.
+
 \section*{Summary}
 
 \begin{table}[h]
@@ -465,8 +504,8 @@ Section & Kind & Phase effect (ST) & Sign test\\
 \S\ref{sec:twolane} & ILP & round 1: $-4.3\%$ & $8/8$\\
 \S\ref{sec:pmull} & arithmetic & round 1: $-9.1\%$ & $8/8$\\
 \S\ref{sec:stripe} & structural & round 1: $-5.7\%$ & $8/8$\\
-\S\ref{sec:qres} (round 2) & representation & round 2: $-13.0\%$ & $8/8$\\
-\S\ref{sec:qres} (rounds 3+) & pass fusion & rounds 3+: $-31.8\%$ & $8/8$\\
+\S\ref{sec:qres} & representation & round 2: $-13.0\%$ & $8/8$\\
+\S\ref{sec:tailfuse} & pass fusion & rounds 3+: $-31.8\%$ & $8/8$\\
 \S\ref{sec:composedfold} & work removal & open combine: $-17\%$ & decisive\\
 \S\ref{sec:streamwit} & work removal & witness gen: $-24\%$ & $3/3$\\
 \S\ref{sec:lcfold} & work removal & lincheck fold: $-32\%$ & $3/3$\\
