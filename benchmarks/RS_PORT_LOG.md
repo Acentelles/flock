@@ -1317,3 +1317,27 @@ Surviving m=32 commit levers, by the compute model: make PREP cheaper
 declined at ~8-15ms; prep is 85ms at m=32 so the same idea re-prices to
 an est. −20-30 bucket) — everything else in the window is already at its
 measured floor (fused-4 top NEON: tried, register spill, +19-26%).
+
+## RETRACTION: the "prep Horner" menu item was already banked (2026-08-26)
+
+Before implementing the recommended unreduced-PMULL Horner port, archaeology
+killed it: the headline win behind that name is ALREADY MERGED as e1398be
+(Aug 24, "accumulate round-1 prep products unreduced (pmull + weight
+split)") — the −128 ms / 8-of-8 ST result, §pmull of the writeup, one of
+the seven kept changes. What the menu item actually referred to was the
+RESIDUAL after that merge, priced at round-1 closure (74802fc): ~8-15 ms
+ceiling at m=30 ST for ~100 lines through the hottest kernel — declined
+then, and the decline stands.
+
+Decisive at today's target shape: at m=32 8T under the join, OUR prep arm
+measures 85-101 ms vs THEIR prep arm's 116.9 (their own clean sample).
+Our prep is already faster than theirs in the current architecture; there
+is nothing left in their tree's prep worth porting. My "−20-30 ms"
+estimate from earlier today was an error — I re-priced the menu label
+without checking that the mechanism behind it was already in.
+
+Corrected m=32 menu (nothing cheap left in commit): zc r2 anchor+delta
+complex (−15..30, ~800 lines), open ranked pieces (−10..20), lincheck
+stripe-fold reuse (−5, unscoped). The commit bucket's remaining −40 vs
+theirs is absorption economics (their bandwidth-bound fused pass hides
+prep free); by the compute-limited model it has no sub-800-line lever.
