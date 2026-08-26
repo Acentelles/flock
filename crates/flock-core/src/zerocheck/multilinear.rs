@@ -704,6 +704,244 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
     (a_folded, b_folded, mlv_challenges[0] * sum1, sum_inf)
 }
 
+/// Round-2 fused fold with integrated LOOKAHEAD: like
+/// [`uni_skip_fold_and_round_pair_optimized_packed_padded`], but instead of
+/// the round-2 message pair it returns the eight lookahead sums over the two
+/// upcoming variables. The caller derives BOTH round 2's message
+/// (`lookahead_msg_first(q, mlv_challenges[1])` — algebraically identical to
+/// the classic return) and round 3's (`lookahead_msg_second(q, ρ₁)`) with
+/// zero further data passes, so every tail pass can fold TWO variables
+/// (4→1, [`fold2_lookahead_into`]) and no intermediate tail state ever
+/// touches DRAM. The transcript is unchanged.
+///
+/// Costs the extra lookahead products here (8 per four outputs, replacing
+/// the classic message's 4) to delete the tail's `fold1` entry pass — the
+/// largest tail pass, which saves no traffic and pays the same product bill.
+///
+/// aarch64-NEON + scalar arms only (no AVX-512 arm) — gate callers on
+/// aarch64, where the classic kernel's shape is matched. Requires
+/// `lo_size ≥ 2` even (caller gates on instance size).
+pub fn uni_skip_fold_and_round_pair_lookahead_packed_padded(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+) -> (Vec<F128>, Vec<F128>, LookaheadSums) {
+    use rayon::prelude::*;
+
+    assert_eq!(k_skip, 6, "lookahead round-2 variant is k_skip=6 only");
+    assert_eq!(table.n_chunks, 8);
+    let n_chunks = table.n_chunks;
+    let n_out = 1usize << (m - k_skip);
+    assert_eq!(a_packed.len(), n_out * n_chunks);
+    assert_eq!(b_packed.len(), n_out * n_chunks);
+    assert_eq!(mlv_challenges.len(), m - k_skip);
+
+    let mut a_folded: Vec<F128> = crate::scratch::take_f128(n_out);
+    let mut b_folded: Vec<F128> = crate::scratch::take_f128(n_out);
+
+    let eq = SplitEqGhash::new(&mlv_challenges[1..]);
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert_eq!(lo_size * hi_size * 2, n_out);
+    assert!(
+        eq.n_lo >= 1 && lo_size >= 2,
+        "lookahead round-2 needs an even pair count per chunk"
+    );
+
+    // Lookahead group = two consecutive pairs (four outputs). Group index =
+    // pair index >> 1, so the group-lo coords drop the lowest pair coord
+    // (`mlv_challenges[1]`, which becomes the Y column weight applied by
+    // `lookahead_msg_first`) and the group-hi coords are exactly `eq.hi`.
+    let eq_la_lo = crate::zerocheck::univariate_skip::build_eq(&mlv_challenges[2..1 + eq.n_lo]);
+    debug_assert_eq!(eq_la_lo.len(), lo_size / 2);
+
+    let chunk_size = 2 * lo_size;
+    let eq_hi = &eq.hi;
+    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
+
+    // Per-x_hi body: fold one chunk (writing every slot) and return this
+    // chunk's eight raw lookahead sums, eq_hi-weighted. Exact XOR merge.
+    let chunk_body = |x_hi: usize, a_chunk: &mut [F128], b_chunk: &mut [F128]| -> [F128; 8] {
+        let pair_idx_base = x_hi * lo_size;
+
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        // SAFETY: `aes` by the cfg; row offsets bounded by the length asserts
+        // above (same access pattern as the classic kernel).
+        let sums8 = unsafe {
+            use crate::field::gf2_128::aarch64::{WideNeon, mul_q, wide_mul_unreduced_q};
+            use core::arch::aarch64::*;
+
+            let table_ptr = table.data.as_ptr() as *const u8;
+            let a_pkt_ptr = a_packed.as_ptr();
+            let b_pkt_ptr = b_packed.as_ptr();
+            let base = x_hi * chunk_size;
+            let zero_q = vdupq_n_u64(0);
+
+            let mut acc = [
+                WideNeon::zero(),
+                WideNeon::zero(),
+                WideNeon::zero(),
+                WideNeon::zero(),
+                WideNeon::zero(),
+                WideNeon::zero(),
+                WideNeon::zero(),
+                WideNeon::zero(),
+            ];
+
+            // SWEEP 1 — fold + store only, the classic kernel's register
+            // budget (gather state, no live accumulators). Padded pairs
+            // write zeros, so sweep 2 can run unconditionally (0·x = 0
+            // keeps every sum exact).
+            let _ = zero_q;
+            for x_lo in 0..lo_size {
+                let x0l = 2 * x_lo;
+                let x1l = x0l + 1;
+                if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
+                    a_chunk[x0l] = F128::ZERO;
+                    a_chunk[x1l] = F128::ZERO;
+                    b_chunk[x0l] = F128::ZERO;
+                    b_chunk[x1l] = F128::ZERO;
+                    continue;
+                }
+                let x0g = base + x0l;
+                let x1g = x0g + 1;
+                let a0 = fold_one_row_neon_q_unchecked_8(table_ptr, a_pkt_ptr.add(x0g * 8));
+                let b0 = fold_one_row_neon_q_unchecked_8(table_ptr, b_pkt_ptr.add(x0g * 8));
+                let a1 = fold_one_row_neon_q_unchecked_8(table_ptr, a_pkt_ptr.add(x1g * 8));
+                let b1 = fold_one_row_neon_q_unchecked_8(table_ptr, b_pkt_ptr.add(x1g * 8));
+                vst1q_u8(a_chunk.as_mut_ptr().add(x0l) as *mut u8, a0);
+                vst1q_u8(a_chunk.as_mut_ptr().add(x1l) as *mut u8, a1);
+                vst1q_u8(b_chunk.as_mut_ptr().add(x0l) as *mut u8, b0);
+                vst1q_u8(b_chunk.as_mut_ptr().add(x1l) as *mut u8, b1);
+            }
+
+            // SWEEP 2 — the eight lookahead products over the just-written
+            // chunk (L2-resident: ~256 KB per worker), with the full vector
+            // register file available. Fusing this into sweep 1 was measured
+            // +16 ms at m=32: 8 wide accumulators + 8 group values + the
+            // gather state spill hard.
+            let acp = a_chunk.as_ptr() as *const u64;
+            let bcp = b_chunk.as_ptr() as *const u64;
+            for g in 0..lo_size / 2 {
+                let o = 4 * g;
+                let ga0 = vld1q_u64(acp.add(2 * o));
+                let ga1 = vld1q_u64(acp.add(2 * o + 2));
+                let ga2 = vld1q_u64(acp.add(2 * o + 4));
+                let ga3 = vld1q_u64(acp.add(2 * o + 6));
+                let gb0 = vld1q_u64(bcp.add(2 * o));
+                let gb1 = vld1q_u64(bcp.add(2 * o + 2));
+                let gb2 = vld1q_u64(bcp.add(2 * o + 4));
+                let gb3 = vld1q_u64(bcp.add(2 * o + 6));
+                // Product indices match `lookahead_products`.
+                let sxa0 = veorq_u64(ga0, ga1);
+                let sxb0 = veorq_u64(gb0, gb1);
+                let sxa1 = veorq_u64(ga2, ga3);
+                let sxb1 = veorq_u64(gb2, gb3);
+                let dca = veorq_u64(ga0, ga2);
+                let dcb = veorq_u64(gb0, gb2);
+                let dsa = veorq_u64(sxa0, sxa1);
+                let dsb = veorq_u64(sxb0, sxb1);
+                let eq_arr = [eq_la_lo[g].lo, eq_la_lo[g].hi];
+                let eq_q = vld1q_u64(eq_arr.as_ptr());
+                acc[0].xor_assign(wide_mul_unreduced_q(eq_q, mul_q(ga1, gb1)));
+                acc[1].xor_assign(wide_mul_unreduced_q(eq_q, mul_q(sxa0, sxb0)));
+                acc[2].xor_assign(wide_mul_unreduced_q(eq_q, mul_q(ga2, gb2)));
+                acc[3].xor_assign(wide_mul_unreduced_q(eq_q, mul_q(ga3, gb3)));
+                acc[4].xor_assign(wide_mul_unreduced_q(eq_q, mul_q(sxa1, sxb1)));
+                acc[5].xor_assign(wide_mul_unreduced_q(eq_q, mul_q(dca, dcb)));
+                acc[6].xor_assign(wide_mul_unreduced_q(
+                    eq_q,
+                    mul_q(veorq_u64(dca, dsa), veorq_u64(dcb, dsb)),
+                ));
+                acc[7].xor_assign(wide_mul_unreduced_q(eq_q, mul_q(dsa, dsb)));
+            }
+            [
+                acc[0].reduce(),
+                acc[1].reduce(),
+                acc[2].reduce(),
+                acc[3].reduce(),
+                acc[4].reduce(),
+                acc[5].reduce(),
+                acc[6].reduce(),
+                acc[7].reduce(),
+            ]
+        };
+
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+        let sums8 = {
+            let base = x_hi * chunk_size;
+            let mut acc = [F256Unreduced::ZERO; 8];
+            for g in 0..lo_size / 2 {
+                let mut ga = [F128::ZERO; 4];
+                let mut gb = [F128::ZERO; 4];
+                let mut any = false;
+                for p in 0..2usize {
+                    let x_lo = 2 * g + p;
+                    let x0l = 2 * x_lo;
+                    let x1l = x0l + 1;
+                    if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
+                        a_chunk[x0l] = F128::ZERO;
+                        a_chunk[x1l] = F128::ZERO;
+                        b_chunk[x0l] = F128::ZERO;
+                        b_chunk[x1l] = F128::ZERO;
+                        continue;
+                    }
+                    any = true;
+                    let x0g = base + x0l;
+                    let x1g = x0g + 1;
+                    ga[2 * p] = table.fold_one_row(&a_packed[x0g * n_chunks..(x0g + 1) * n_chunks]);
+                    ga[2 * p + 1] =
+                        table.fold_one_row(&a_packed[x1g * n_chunks..(x1g + 1) * n_chunks]);
+                    gb[2 * p] = table.fold_one_row(&b_packed[x0g * n_chunks..(x0g + 1) * n_chunks]);
+                    gb[2 * p + 1] =
+                        table.fold_one_row(&b_packed[x1g * n_chunks..(x1g + 1) * n_chunks]);
+                    a_chunk[x0l] = ga[2 * p];
+                    a_chunk[x1l] = ga[2 * p + 1];
+                    b_chunk[x0l] = gb[2 * p];
+                    b_chunk[x1l] = gb[2 * p + 1];
+                }
+                if !any {
+                    continue;
+                }
+                lookahead_accum(&ga, &gb, eq_la_lo[g], &mut acc);
+            }
+            let mut out = [F128::ZERO; 8];
+            for k in 0..8 {
+                out[k] = acc[k].reduce();
+            }
+            out
+        };
+
+        let eh = eq_hi[x_hi];
+        let mut out = [F128::ZERO; 8];
+        for k in 0..8 {
+            out[k] = eh * sums8[k];
+        }
+        out
+    };
+
+    let sums = a_folded
+        .par_chunks_mut(chunk_size)
+        .zip(b_folded.par_chunks_mut(chunk_size))
+        .enumerate()
+        .map(|(x_hi, (a_chunk, b_chunk))| chunk_body(x_hi, a_chunk, b_chunk))
+        .reduce(
+            || [F128::ZERO; 8],
+            |mut p, q| {
+                for k in 0..8 {
+                    p[k] += q[k];
+                }
+                p
+            },
+        );
+
+    (a_folded, b_folded, lookahead_finish(sums))
+}
+
 // ---------------------------------------------------------------------------
 // Subsequent multilinear rounds (3..(m−k_skip+1)): fold + next message.
 // ---------------------------------------------------------------------------
@@ -1210,30 +1448,51 @@ macro_rules! lookahead_pass {
             let eq_hi = build_eq(&rest[n_lo..]);
             let lo_size = eq_lo.len();
             let fold = $fold;
+            // The scalar per-unit closure is only compiled in on targets
+            // without the NEON chunk kernel.
+            let _ = &fold;
             let sums = a_out
                 .par_chunks_mut(4 * lo_size)
                 .zip(b_out.par_chunks_mut(4 * lo_size))
                 .enumerate()
                 .map(|(u_hi, (ao, bo))| {
-                    let mut acc = [F256Unreduced::ZERO; 8];
                     let base_u = u_hi * lo_size;
-                    for u_lo in 0..lo_size {
-                        let u = base_u + u_lo;
-                        let mut ga = [F128::ZERO; 4];
-                        let mut gb = [F128::ZERO; 4];
-                        for v in 0..4usize {
-                            let base = u * PER_U + v * (PER_U / 4);
-                            ga[v] = fold(&a[base..], rhos);
-                            gb[v] = fold(&b[base..], rhos);
-                            ao[4 * u_lo + v] = ga[v];
-                            bo[4 * u_lo + v] = gb[v];
+                    // Fold + lookahead products in q registers, one memory
+                    // pass (see the kernel's doc); scalar fallback elsewhere.
+                    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+                    // SAFETY: aes by the cfg; slice bounds per the asserts
+                    // above (a.len() = PER_U · n_u, chunks are lo_size units).
+                    let sums8 = unsafe {
+                        kernels::aarch64::lookahead_chunk_neon::<PER_U>(
+                            a, b, ao, bo, base_u, lo_size, rhos, &eq_lo,
+                        )
+                    };
+                    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+                    let sums8 = {
+                        let mut acc = [F256Unreduced::ZERO; 8];
+                        for u_lo in 0..lo_size {
+                            let u = base_u + u_lo;
+                            let mut ga = [F128::ZERO; 4];
+                            let mut gb = [F128::ZERO; 4];
+                            for v in 0..4usize {
+                                let base = u * PER_U + v * (PER_U / 4);
+                                ga[v] = fold(&a[base..], rhos);
+                                gb[v] = fold(&b[base..], rhos);
+                                ao[4 * u_lo + v] = ga[v];
+                                bo[4 * u_lo + v] = gb[v];
+                            }
+                            lookahead_accum(&ga, &gb, eq_lo[u_lo], &mut acc);
                         }
-                        lookahead_accum(&ga, &gb, eq_lo[u_lo], &mut acc);
-                    }
+                        let mut out = [F128::ZERO; 8];
+                        for k in 0..8 {
+                            out[k] = acc[k].reduce();
+                        }
+                        out
+                    };
                     let eh = eq_hi[u_hi];
                     let mut out = [F128::ZERO; 8];
                     for k in 0..8 {
-                        out[k] = eh * acc[k].reduce();
+                        out[k] = eh * sums8[k];
                     }
                     out
                 })

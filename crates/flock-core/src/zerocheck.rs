@@ -34,9 +34,23 @@ pub mod univariate_skip_optimized;
 
 use multilinear::{
     UniSkipFoldTable, fold_and_compute_round_pair_into, fold_in_place_pair,
-    interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
+    fold1_lookahead_into, fold2_lookahead_into, interpolate_at_z_combined,
+    interpolate_at_z_on_lambda, lookahead_msg_first, lookahead_msg_second, round_pair_naive,
     uni_skip_fold_and_round_pair_optimized_packed_padded,
 };
+
+/// Opt-in toggle for the RS cascade tail (integrated round-2 lookahead +
+/// 4→1 tail passes; see [`prove_packed_padded_inner`]). DEFAULT OFF: the
+/// cascade's tail win (−15 ms at m=32, 3/3 disjoint) is currently outweighed
+/// by round 2's lookahead-product surcharge (+24 ms — the mul-count floor of
+/// the general-eq formulation). It nets positive only together with the
+/// anchor+delta compact round-2 format (the challenge tree couples them);
+/// staged here behind `FLOCK_ZC_LOOKAHEAD=1` / this AtomicBool until that
+/// lands. The transcript is identical either way — the lookahead messages
+/// are the same polynomial values, derived without the intermediate data
+/// pass (pinned by `lookahead_tail_transcript_identical_to_classic`).
+pub static RS_TAIL_LOOKAHEAD_FORCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 use univariate_skip_optimized::{
     c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
     small_challenges_ghash,
@@ -384,17 +398,63 @@ fn prove_packed_padded_inner<C: Challenger>(
     let fold_table = UniSkipFoldTable::new(k_skip, z);
     let mut mlv_arg = vec![F128::ONE; n_mlv];
     mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
-    let (mut a_mlv, mut b_mlv, msg_1, msg_inf) =
-        uni_skip_fold_and_round_pair_optimized_packed_padded(
-            a_packed,
-            b_packed,
-            m,
-            k_skip,
-            &fold_table,
-            &mlv_arg,
-            padding,
-        );
 
+    let lookahead_on = RS_TAIL_LOOKAHEAD_FORCE.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var_os("FLOCK_ZC_LOOKAHEAD").is_some();
+    // Integrated round-2 lookahead: round 2 emits the eight lookahead sums
+    // alongside its fold, from which BOTH round 2's and round 3's messages
+    // derive with zero further data passes — so the tail below starts
+    // directly with 4→1 passes and its `fold1` entry (a full-size pass that
+    // saves no traffic and pays the same product bill) disappears. aarch64
+    // only (the lookahead round-2 kernel has no AVX-512 arm); opt-in — see
+    // [`RS_TAIL_LOOKAHEAD_FORCE`] for why it is not yet the default.
+    let use_r2_lookahead = lookahead_on
+        && cfg!(all(target_arch = "aarch64", target_feature = "aes"))
+        && n_mlv >= 4
+        && (1usize << (m - k_skip)) >= 1024;
+
+    let mut multilinear_msgs = Vec::with_capacity(n_mlv);
+    let mut mlv_rhos: Vec<F128> = Vec::with_capacity(n_mlv);
+    let (mut a_mlv, mut b_mlv, mut rho_prev, mut pending2, mut i);
+    if use_r2_lookahead {
+        let (a, b, q) = multilinear::uni_skip_fold_and_round_pair_lookahead_packed_padded(
+            a_packed, b_packed, m, k_skip, &fold_table, &mlv_arg, padding,
+        );
+        a_mlv = a;
+        b_mlv = b;
+        // Round 2's message from the Y∈{0,1} columns — identical to the
+        // classic kernel's return (mlv_arg[0] = ONE Convention A).
+        let (m1a, mia) = lookahead_msg_first(&q, mlv_arg[1]);
+        multilinear_msgs.push((m1a, mia));
+        challenger.observe_f128(m1a);
+        challenger.observe_f128(mia);
+        let rho_a = challenger.sample_f128();
+        mlv_rhos.push(rho_a);
+        // Round 3's message: the column polynomials evaluated at ρ₁.
+        let (m1b, mib) = lookahead_msg_second(&q, rho_a);
+        multilinear_msgs.push((m1b, mib));
+        challenger.observe_f128(m1b);
+        challenger.observe_f128(mib);
+        let rho_b = challenger.sample_f128();
+        mlv_rhos.push(rho_b);
+        rho_prev = rho_a;
+        pending2 = Some(rho_b);
+        i = 1;
+    } else {
+        let (a, b, msg_1, msg_inf) = uni_skip_fold_and_round_pair_optimized_packed_padded(
+            a_packed, b_packed, m, k_skip, &fold_table, &mlv_arg, padding,
+        );
+        a_mlv = a;
+        b_mlv = b;
+        multilinear_msgs.push((msg_1, msg_inf));
+        challenger.observe_f128(msg_1);
+        challenger.observe_f128(msg_inf);
+        let rho = challenger.sample_f128();
+        mlv_rhos.push(rho);
+        rho_prev = rho;
+        pending2 = None;
+        i = 0;
+    }
     if zc_timing {
         eprintln!(
             "[zc-timing] round2 fused fold: {:.2} ms",
@@ -402,12 +462,6 @@ fn prove_packed_padded_inner<C: Challenger>(
         );
     }
     let t_tail = std::time::Instant::now();
-    let mut multilinear_msgs = Vec::with_capacity(n_mlv);
-    multilinear_msgs.push((msg_1, msg_inf));
-    challenger.observe_f128(msg_1);
-    challenger.observe_f128(msg_inf);
-    let mut mlv_rhos: Vec<F128> = Vec::with_capacity(n_mlv);
-    mlv_rhos.push(challenger.sample_f128());
 
     // ---- 7. Rounds 3..(n_mlv + 1) — AB only (c is done) ----
     //
@@ -432,8 +486,65 @@ fn prove_packed_padded_inner<C: Challenger>(
         (Vec::new(), Vec::new())
     };
 
-    for i in 0..(n_mlv - 1) {
-        let rho_prev = mlv_rhos[i];
+    // LOOKAHEAD/cascade tail (idea from the challenge tree, machinery shared
+    // with the AG-skip tail): one 4→1 pass serves TWO rounds. The pass folds
+    // the deferred challenges and, from the four folded values held per
+    // output position, accumulates the sums that determine the next two
+    // messages as polynomials — the first evaluated directly, the second a
+    // quadratic in the next challenge, evaluated after sampling with zero
+    // data passes. Deletes the intermediate state's DRAM round trip per round
+    // pair; the emitted messages (and hence the transcript) are identical.
+    //
+    // Invariant: `a_mlv`/`b_mlv` are folded through every sampled challenge
+    // EXCEPT `rho_prev` (and `pending2`, if set). Entry state comes from the
+    // round-2 branch above (integrated lookahead: two challenges deferred,
+    // one tail message already emitted; classic: one deferred, none).
+    while i < n_mlv - 1 {
+        let len = a_mlv.len();
+        // Lookahead needs TWO more message rounds and the fused-size floor.
+        if use_r2_lookahead && i + 2 <= n_mlv - 1 && len >= 1024 {
+            let out_len = if pending2.is_some() { len / 4 } else { len / 2 };
+            let (ao, bo) = (&mut a_nxt[..out_len], &mut b_nxt[..out_len]);
+            let q = if let Some(r2) = pending2 {
+                fold2_lookahead_into(&a_mlv, &b_mlv, ao, bo, (rho_prev, r2), &r[k_skip + i + 3..])
+            } else {
+                fold1_lookahead_into(
+                    &a_mlv,
+                    &b_mlv,
+                    ao,
+                    bo,
+                    (rho_prev, F128::ZERO),
+                    &r[k_skip + i + 3..],
+                )
+            };
+            std::mem::swap(&mut a_mlv, &mut a_nxt);
+            std::mem::swap(&mut b_mlv, &mut b_nxt);
+            a_mlv.truncate(out_len);
+            b_mlv.truncate(out_len);
+            let (m1a, mia) = lookahead_msg_first(&q, r[k_skip + i + 2]);
+            multilinear_msgs.push((m1a, mia));
+            challenger.observe_f128(m1a);
+            challenger.observe_f128(mia);
+            let rho_a = challenger.sample_f128();
+            mlv_rhos.push(rho_a);
+            let (m1b, mib) = lookahead_msg_second(&q, rho_a);
+            multilinear_msgs.push((m1b, mib));
+            challenger.observe_f128(m1b);
+            challenger.observe_f128(mib);
+            let rho_b = challenger.sample_f128();
+            mlv_rhos.push(rho_b);
+            rho_prev = rho_a;
+            pending2 = Some(rho_b);
+            i += 2;
+            continue;
+        }
+        // Leaving lookahead mode: resolve the deferred fold before classic
+        // processing (arrays here are small — the serial fold is free).
+        if let Some(r2) = pending2.take() {
+            fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
+            rho_prev = r2;
+            continue;
+        }
         let log_n_before = a_mlv.len().trailing_zeros() as usize;
 
         // r_next for the next round's message: length log_n_before - 1.
@@ -469,12 +580,17 @@ fn prove_packed_padded_inner<C: Challenger>(
         multilinear_msgs.push((m1, mi));
         challenger.observe_f128(m1);
         challenger.observe_f128(mi);
-        mlv_rhos.push(challenger.sample_f128());
+        rho_prev = challenger.sample_f128();
+        mlv_rhos.push(rho_prev);
+        i += 1;
     }
 
-    // ---- 8. Final binding at ρ_{n_mlv} (the last challenge) ----
-    let rho_last = *mlv_rhos.last().expect("at least one ρ sampled");
-    fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_last);
+    // ---- 8. Final binding: one or (after a trailing lookahead pass) two
+    // deferred challenges remain unfolded ----
+    fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
+    if let Some(r2) = pending2 {
+        fold_in_place_pair(&mut a_mlv, &mut b_mlv, r2);
+    }
     debug_assert_eq!(a_mlv.len(), 1);
     debug_assert_eq!(b_mlv.len(), 1);
 
@@ -778,6 +894,37 @@ mod tests {
             let claim_v = result.unwrap_or_else(|e| panic!("verify rejected at m={m}: {e:?}"));
 
             assert_eq!(claim_p, claim_v, "claim mismatch at m={m}");
+        }
+    }
+
+    /// The lookahead/cascade tail emits a byte-identical transcript to the
+    /// classic per-round tail: same messages, same challenges, same claim.
+    /// (The lookahead messages are the same polynomial values, derived
+    /// without the intermediate data pass — this pins that algebra.)
+    #[test]
+    fn lookahead_tail_transcript_identical_to_classic() {
+        use std::sync::atomic::Ordering;
+        for &m in &[16usize, 18] {
+            let mut rng = Rng::new(7700 + m as u64);
+            let a = rng.bits(1 << m);
+            let b = rng.bits(1 << m);
+            let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
+            let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+
+            let mut ch1 = FsChallenger::new(b"flock-test-v0");
+            let (proof_la, claim_la) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch1);
+
+            RS_TAIL_LOOKAHEAD_FORCE.store(true, Ordering::Relaxed);
+            let mut ch2 = FsChallenger::new(b"flock-test-v0");
+            let (proof_cl, claim_cl) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch2);
+            RS_TAIL_LOOKAHEAD_FORCE.store(false, Ordering::Relaxed);
+
+            assert_eq!(
+                proof_la.multilinear_rounds, proof_cl.multilinear_rounds,
+                "tail messages diverge at m={m}"
+            );
+            assert_eq!(proof_la.round1_ab, proof_cl.round1_ab, "m={m}");
+            assert_eq!(claim_la, claim_cl, "claim diverges at m={m}");
         }
     }
 
