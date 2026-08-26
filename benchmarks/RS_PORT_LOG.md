@@ -1487,3 +1487,21 @@ optimizations", r1 stripe path confirmed as one instance). Ours: ~2%.
 THE BIGGEST m=32 ITEM IS NOW ENUMERABLE BY CODE-READ: the diff list
 between their prove_fast and prove_fast_timed paths — requested from the
 peer. Everything else we have compared is within ~15% per phase.
+
+### Their scored-path enumeration: one real mechanism (= our adjudicated
+### fill-fusion), 470ms still unattributed (2026-08-26, late)
+
+Peer's wrapper-diff enumeration: the one substantial scored-only
+mechanism is their "from-message commit" (synthesize both codeword
+replicas from z during the NTT first layer, deleting a ~1GiB replica
+store) — MT-gated (threads>1), and ARCHITECTURALLY IDENTICAL to our
+fill-fusion (fillfuse.patch), which measured null-to-negative here:
+it pays on their bandwidth-bound commit window, not on our
+compute-saturated one. Items 2-6 minor/inapplicable. Their honest
+bottom line: the wrapper list does NOT account for the ~470ms
+scored-vs-instrumented delta; they are now diffing the timed-vs-untimed
+INNER prover fns. Our hypothesis handed over: their timed figure is a
+single sample vs scored best-of-3 with warm pools — if the timed inner
+fn defeats warm-path buffer reuse, the 18% is allocation economics
+(the genre of our two biggest wins). Same 3-untimed+1-timed harness
+shape here shows only ~2% skew, so the asymmetry is in their prover fns.
