@@ -5624,7 +5624,7 @@ mod tests {
         assert_eq!(cfg.m, 29);
         assert_eq!(cfg.log_n, 22);
         assert_eq!(cfg.initial_k, 6);
-        assert_eq!(cfg.hash, "sha256");
+        assert_eq!(cfg.hash, "blake3");
         assert_eq!(cfg.levels.len(), 5);
         // Fast = JohnsonOod profile: 218 L0 queries per-round at 100 bits (no
         // list union bound — single-codeword binding via the opening claim /
@@ -5991,7 +5991,7 @@ mod tests {
             initial_k,
             log_inv_rate,
             &ntt_0,
-            HashKind::Sha256,
+            HashKind::default(),
         );
         let initial_root = wtns_0.root();
 
@@ -6453,7 +6453,7 @@ mod tests {
             log_interleaved,
             log_inv_rate,
             &ntt,
-            HashKind::Sha256,
+            HashKind::default(),
         );
         assert_eq!(w.block_len, block_len);
 
@@ -7091,7 +7091,7 @@ mod tests {
             initial_k,
             log_inv_rate,
             &ntt_0,
-            HashKind::Sha256,
+            HashKind::default(),
         );
         let initial_root = wtns_0.root();
 
@@ -7323,7 +7323,7 @@ mod tests {
             initial_k,
             log_inv_rate,
             &ntt_0,
-            HashKind::Sha256,
+            HashKind::default(),
         );
         let initial_root = wtns_0.root();
 
@@ -7474,7 +7474,7 @@ mod tests {
             initial_k,
             1,
             &ntt_0,
-            HashKind::Sha256,
+            HashKind::default(),
         );
         let initial_root = wtns_0.root();
 
@@ -7590,7 +7590,7 @@ mod tests {
             initial_k,
             1,
             &ntt_0,
-            HashKind::Sha256,
+            HashKind::default(),
         );
         let initial_root = wtns_0.root();
 
@@ -7617,7 +7617,7 @@ mod tests {
     /// Also pins the failure mode of a hash mismatch — a verifier configured
     /// for the wrong hash must reject, since the roots commit to the hash.
     #[test]
-    fn ligerito_m22_roundtrip_under_blake3() {
+    fn ligerito_m22_roundtrip_under_sha256() {
         use crate::challenger::Challenger;
         let m = 22usize;
         let log_n = m - crate::pcs::LOG_PACKING;
@@ -7626,11 +7626,11 @@ mod tests {
             .expect("m22 fast prover config");
         let mut v_cfg = verifier_config_for(log_n, initial_k, LigeritoProfile::Fast)
             .expect("m22 fast verifier config");
-        // The embedded configs all declare sha256; override to exercise the
+        // The embedded configs all declare blake3; override to exercise the
         // other arm of the option end to end.
-        assert_eq!(p_cfg.merkle_hash, HashKind::Sha256);
-        p_cfg.merkle_hash = HashKind::Blake3;
-        v_cfg.merkle_hash = HashKind::Blake3;
+        assert_eq!(p_cfg.merkle_hash, HashKind::Blake3);
+        p_cfg.merkle_hash = HashKind::Sha256;
+        v_cfg.merkle_hash = HashKind::Sha256;
 
         let mut rng = crate::challenger::RandomChallenger::new(0xB1A5_E300);
         let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
@@ -7650,7 +7650,7 @@ mod tests {
             initial_k,
             1,
             &ntt_0,
-            HashKind::Blake3,
+            HashKind::Sha256,
         );
         let initial_root = wtns_0.root();
 
@@ -7668,13 +7668,13 @@ mod tests {
         let mut v_ch = crate::challenger::FsChallenger::new(b"m22-blake3");
         assert!(
             recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_root, &mut v_ch),
-            "blake3 Merkle proof must verify"
+            "sha256 Merkle proof must verify"
         );
 
         // Same proof, verifier configured for SHA-256 → every opening's
         // recomputed root disagrees, so it must reject.
         let mut wrong_cfg = v_cfg.clone();
-        wrong_cfg.merkle_hash = HashKind::Sha256;
+        wrong_cfg.merkle_hash = HashKind::Blake3;
         let mut w_ch = crate::challenger::FsChallenger::new(b"m22-blake3");
         assert!(
             !recursive_verifier_with_basis(
@@ -7830,7 +7830,7 @@ mod tests {
             initial_k,
             log_inv_rate,
             &ntt_0,
-            HashKind::Sha256,
+            HashKind::default(),
         );
         let initial_root = wtns_0.root();
 
@@ -7915,7 +7915,7 @@ mod tests {
             initial_k,
             log_inv_rate,
             &ntt_0,
-            HashKind::Sha256,
+            HashKind::default(),
         );
         let mut p_ch_b = crate::challenger::FsChallenger::new(b"l0-test");
         let proof_b = recursive_prover_with_l0(
@@ -8051,7 +8051,7 @@ mod tests {
             log_interleaved,
             log_inv_rate,
             &ntt,
-            HashKind::Sha256,
+            HashKind::default(),
         );
         assert_eq!(w.block_len, block_len);
         assert_eq!(w.num_interleaved, num_interleaved);
@@ -8088,7 +8088,7 @@ mod tests {
             log_interleaved,
             log_inv_rate,
             &ntt,
-            HashKind::Sha256,
+            HashKind::default(),
         );
         assert_eq!(w.root(), w2.root());
     }

@@ -90,10 +90,11 @@ pub trait Challenger: Send {
     /// The hash backing this transcript, for protocol components that derive
     /// auxiliary randomness outside the challenger itself (e.g. the AG-skip
     /// `r₁` nonce-grind DRBG) and must follow the transcript's hash choice so
-    /// no second primitive enters the soundness argument. Default SHA-256
-    /// (`RandomChallenger` and legacy implementations inherit it).
+    /// no second primitive enters the soundness argument. Defaults to the
+    /// crate default (`RandomChallenger` and legacy implementations inherit
+    /// it).
     fn hash_kind(&self) -> HashKind {
-        HashKind::Sha256
+        HashKind::default()
     }
 }
 
@@ -224,13 +225,14 @@ pub struct FsChallenger {
 
 impl FsChallenger {
     /// New challenger seeded with a domain-separation tag (e.g.
-    /// `b"flock-r1cs-v0"`), using SHA-256.
+    /// `b"flock-r1cs-v0"`), using the default hash ([`HashKind::default`],
+    /// BLAKE3 — the ranked worker's configuration).
     ///
     /// The domain is length-prefixed before being absorbed so two domains
     /// where one is a prefix of the other cannot produce the same initial
-    /// state. For the BLAKE3 transcript, see [`Self::with_hash`].
+    /// state. For an explicit choice, see [`Self::with_hash`].
     pub fn new(domain: &[u8]) -> Self {
-        Self::with_hash(domain, HashKind::Sha256)
+        Self::with_hash(domain, HashKind::default())
     }
 
     /// New challenger over an explicit hash.
@@ -734,15 +736,15 @@ mod tests {
     /// way, and silently moving them to another hash would invalidate every
     /// proof they produce.
     #[test]
-    fn fs_challenger_new_defaults_to_sha256() {
-        assert_eq!(FsChallenger::new(b"d").hash_kind(), HashKind::Sha256);
+    fn fs_challenger_new_defaults_to_blake3() {
+        assert_eq!(FsChallenger::new(b"d").hash_kind(), HashKind::Blake3);
         for kind in KINDS {
             assert_eq!(FsChallenger::with_hash(b"d", kind).hash_kind(), kind);
         }
-        // The default constructor must be exactly the SHA-256 one, transcript
+        // The default constructor must be exactly the BLAKE3 one, transcript
         // and all — not merely tagged the same.
         let mut a = FsChallenger::new(b"d");
-        let mut b = FsChallenger::with_hash(b"d", HashKind::Sha256);
+        let mut b = FsChallenger::with_hash(b"d", HashKind::Blake3);
         assert_eq!(a.sample_f128_vec(4), b.sample_f128_vec(4));
     }
 

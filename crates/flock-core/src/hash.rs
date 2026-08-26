@@ -9,20 +9,22 @@
 //! - the Fiat-Shamir transcript and its proof-of-work grinding, via
 //!   [`crate::challenger::FsChallenger::with_hash`].
 //!
-//! Both default to SHA-256, so configs and call sites that predate the options
-//! keep their behaviour.
+//! Both default to BLAKE3, matching the ranked benchmark worker's hardcoded
+//! configuration; SHA-256 remains selectable per component.
 
 use serde::{Deserialize, Serialize};
 
 /// Which hash function backs a component.
 ///
-/// `Sha256` is the default, so existing serialized params and configs that
-/// predate these options deserialize unchanged.
+/// `Blake3` is the default, matching the ranked benchmark worker's hardcoded
+/// configuration (Blake3 for both the Merkle tree and the Fiat–Shamir
+/// transcript). Serialized params/configs that spell out a hash are
+/// unaffected; ones that omit it now mean Blake3.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HashKind {
-    #[default]
     Sha256,
+    #[default]
     Blake3,
 }
 
@@ -73,7 +75,7 @@ mod tests {
         assert_eq!(HashKind::parse("BLAKE3").unwrap(), HashKind::Blake3);
         assert_eq!(HashKind::parse("sha-256").unwrap(), HashKind::Sha256);
         assert_eq!(HashKind::parse("  blake3 ").unwrap(), HashKind::Blake3);
-        assert_eq!(HashKind::default(), HashKind::Sha256);
+        assert_eq!(HashKind::default(), HashKind::Blake3);
         // An unrecognized hash must be an error, never a silent SHA-256.
         assert!(HashKind::parse("keccak").is_err());
         assert!(HashKind::parse("").is_err());
