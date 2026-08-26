@@ -1357,3 +1357,16 @@ no named mechanism left (unreduced accumulation, zero-copy rows, and
 dead-row-fill skip are all banked here; their BCAX fold vs our
 shift+x2-byte absorb is a few vector ops in a gather-dominated kernel) —
 it's the campaign's unattributed uniform-kernel-quality band.
+
+## 8-P-core pool pinning retested at m=32: still correct (2026-08-26)
+
+Benedikt asked whether the deliberate 8-thread (P-core) global pool is now
+a slowdown at the ranked shape. Paired A/B, default-8 vs
+RAYON_NUM_THREADS=10, 3 pairs m=32 (noisy window): sign 2-1 for t8,
+cleanest pair dead even (574.2 vs 576.1). Per-phase on the clean samples:
+zc +14 ms and lincheck +6 ms on 10T (E-core stragglers at barriers),
+witness/open unchanged. The early-campaign "8 beats 10 on NTT-shaped
+phases" verdict holds with today's kernels. E-cores remain harvested
+selectively (join window, NTT deep pass, open combine — the phases where
+they add compute to bandwidth-bound windows) and nowhere else. Pool
+pinning is NOT part of the m=32 residual.
