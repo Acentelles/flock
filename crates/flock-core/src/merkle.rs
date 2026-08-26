@@ -99,6 +99,13 @@ mod sha256x4;
 #[path = "merkle/x86_64.rs"]
 mod sha256x4;
 
+/// Eight-message interleaved NEON BLAKE3 compression (two transposed 4-wide
+/// states in flight) — fills the pipes the crate's latency-bound 4-wide
+/// backend leaves idle. See the module docs for the derivation.
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[path = "merkle/blake3_neon.rs"]
+mod blake3_neon;
+
 /// Global Merkle hash call/compression counters, enabled with
 /// `--features hash-count` (e.g. by `benches/verifier_hash_count.rs`).
 /// Relaxed atomics — exact totals, no ordering guarantees across threads.
@@ -315,6 +322,30 @@ fn blake3_hash_many<const N: usize>(
     flags_end: u8,
 ) {
     debug_assert_eq!(data.len(), out.len() * N);
+    // Full groups of eight go through the interleaved two×4-wide NEON kernel;
+    // the tail (< 8 messages) falls through to the crate's `hash_many`.
+    // Byte-identical either way (`blake3_neon8_matches_crate`).
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    let (data, out) = {
+        let full = (out.len() / 8) * 8;
+        for i in (0..full).step_by(8) {
+            // SAFETY: messages i..i+8 are in-bounds `N`-byte rows of `data`
+            // (asserted above); `out[i..i+8]` is 256 writable bytes; `Hash`
+            // is `[u8; 32]` with no padding.
+            unsafe {
+                blake3_neon::hash8(
+                    data.as_ptr().add(i * N),
+                    N,
+                    N / 64,
+                    flags,
+                    flags_start,
+                    flags_end,
+                    out.as_mut_ptr().add(i) as *mut u8,
+                );
+            }
+        }
+        (&data[full * N..], &mut out[full..])
+    };
     let plat = blake3_platform();
     for (outs, msgs) in out
         .chunks_mut(BLAKE3_BATCH)
@@ -829,6 +860,71 @@ mod tests {
     /// multi-proof logic is hash-agnostic, so anything true of one must hold
     /// for the other.
     const KINDS: [HashKind; 2] = [HashKind::Sha256, HashKind::Blake3];
+
+    /// The 8-wide NEON kernel (and its crate-path tail) must be
+    /// byte-identical to the blake3 crate's `hash_many` for every message
+    /// size the batched paths dispatch on, at counts covering full groups,
+    /// tails, and both at once — for leaves, parents, and flag combinations.
+    #[test]
+    fn blake3_neon8_matches_crate() {
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 32) as u8
+        };
+        fn run<const N: usize>(data: &[u8], count: usize, f: u8, fs: u8, fe: u8) -> Vec<Hash> {
+            let mut out = vec![[0u8; 32]; count];
+            blake3_hash_many::<N>(&data[..count * N], &mut out, f, fs, fe);
+            out
+        }
+        fn reference<const N: usize>(data: &[u8], count: usize, f: u8, fs: u8, fe: u8) -> Vec<Hash> {
+            let mut out = vec![[0u8; 32]; count];
+            for (o, msg) in out.iter_mut().zip(data.chunks(N)) {
+                let input: &[u8; N] = msg.try_into().unwrap();
+                let mut bytes = [0u8; 32];
+                blake3_platform().hash_many(
+                    &[input],
+                    &BLAKE3_IV,
+                    0,
+                    blake3::IncrementCounter::No,
+                    f,
+                    fs,
+                    fe,
+                    &mut bytes,
+                );
+                *o = bytes;
+            }
+            out
+        }
+        macro_rules! check {
+            ($n:literal, $data:expr, $count:expr) => {
+                for (f, fs, fe) in [
+                    (0, BLAKE3_CHUNK_START, BLAKE3_CHUNK_END), // leaves
+                    (BLAKE3_PARENT, 0, 0),                     // parents
+                ] {
+                    assert_eq!(
+                        run::<$n>($data, $count, f, fs, fe),
+                        reference::<$n>($data, $count, f, fs, fe),
+                        "N={} count={} flags=({},{},{})",
+                        $n,
+                        $count,
+                        f,
+                        fs,
+                        fe,
+                    );
+                }
+            };
+        }
+        let data: Vec<u8> = (0..24 * 1024).map(|_| next()).collect();
+        for count in [1usize, 3, 7, 8, 9, 15, 16, 17, 24] {
+            check!(64, &data, count);
+            check!(128, &data, count);
+            check!(512, &data, count);
+        }
+        for count in [1usize, 7, 8, 9, 16] {
+            check!(1024, &data, count);
+        }
+    }
 
     #[test]
     fn two_leaves_matches_hand_computation() {
