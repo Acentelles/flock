@@ -226,7 +226,14 @@ pub fn commit_into(
     // directly (replicating z costs the same writes as the zero-fill it
     // replaces) and start the NTT at layer `log_inv_rate`, skipping those
     // layers' full-buffer reads and multiplies.
+    let t_fill = std::time::Instant::now();
     replicate_message_fill(&mut codeword, z_packed);
+    if std::env::var_os("FLOCK_COMMIT_TIMING").is_some() {
+        eprintln!(
+            "[commit-timing] replicate-fill: {:.2} ms",
+            t_fill.elapsed().as_secs_f64() * 1e3
+        );
+    }
 
     finalize_commit(codeword, params)
 }

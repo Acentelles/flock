@@ -689,16 +689,47 @@ where
     // bandwidth. Measured: the same join on the 8 P-core pool is a wash,
     // with the E-cores it wins (paired, see commit message). The rest of the
     // prove stays on the perf-core pool.
-    let (commit_out, ab_pre) = flock_core::all_core_pool().install(|| rayon::join(commit, || {
-        usko::precompute_round1_ab(
-            a_packed,
-            b_packed,
-            r1cs.m,
-            usko::K_SKIP,
-            usko::cached_inv_table_k6(),
-            padding,
+    let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+    let t_wall = std::time::Instant::now();
+    let (commit_out, ab_pre) = flock_core::all_core_pool().install(|| {
+        rayon::join(
+            || {
+                let t = std::time::Instant::now();
+                let out = commit();
+                if timing {
+                    eprintln!(
+                        "[commit-timing] join commit arm: {:.2} ms",
+                        t.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+                out
+            },
+            || {
+                let t = std::time::Instant::now();
+                let pre = usko::precompute_round1_ab(
+                    a_packed,
+                    b_packed,
+                    r1cs.m,
+                    usko::K_SKIP,
+                    usko::cached_inv_table_k6(),
+                    padding,
+                );
+                if timing {
+                    eprintln!(
+                        "[commit-timing] join ab_prep arm: {:.2} ms",
+                        t.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+                pre
+            },
         )
-    }));
+    });
+    if timing {
+        eprintln!(
+            "[commit-timing] join wall: {:.2} ms",
+            t_wall.elapsed().as_secs_f64() * 1e3
+        );
+    }
     (commit_out, Some(ab_pre))
 }
 
