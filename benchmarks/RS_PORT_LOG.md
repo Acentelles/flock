@@ -1090,3 +1090,17 @@ earlier) and m=32. Reverted.
 m=32 conclusion: closing it means porting the pipeline architecture
 (phase-overlap scheduling), not any single mechanism — same class of
 decision as the r2 complex and the packing network. Parked with the rest.
+
+**Correction to the m=32 entry above (blake arms).** The 1.45× figure
+compared SHA-merkle arms — which silently disables the blake-gated half of
+their ranked stack (the deferred stripe requires HashKind::Blake3, and the
+witness attribution above is accordingly wrong: that gate was closed in the
+SHA runs). With blake arms (their true ranked config, CPU verified via
+util telemetry): theirs 920–950k c/s vs our best (SHA) 457.8k —
+**~2.1× at the ranked shape**. What the blake gates open, bucket-level:
+their lincheck 15.9→7.6 ms, open 84.9→21.9 ms, plus the deferred-stripe
+witness path. Their dev-bench blake-CPU (950k) also exceeds their
+worker-scored GPU-off number (630.8k), so ranked scoring overhead is
+large; cross-methodology caution applies. Conclusion unchanged in kind
+but bigger in degree: the m=32 gap is the integrated blake+m32-gated
+pipeline architecture, a deliberate port-project, not a mechanism list.
