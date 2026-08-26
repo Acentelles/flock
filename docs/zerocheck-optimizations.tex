@@ -38,7 +38,12 @@ whose dominant pass loses its per-slot field multiply to the same
 $\Ftwo$-linearity argument (\S\ref{sec:composedfold}).
 \end{abstract}
 
-\section{Setting and notation}
+\section*{Setting and notation}
+
+\emph{This section is front matter: shared definitions and the benchmark
+shape. Every \emph{numbered} section that follows is one verified
+optimization, presented with its mechanism and its paired measurement.}
+
 
 Fields. $\Feight = \Ftwo[x]/(x^8+x^4+x^3+x+1)$ and the GHASH field
 $\Fbig = \Ftwo[X]/(X^{128}+X^7+X^2+X+1)$, with the ring embedding
@@ -422,34 +427,25 @@ verdict, which had priced blocking and table-geometry changes but not the
 index-load restructure (idea from the challenge tree's asm kernel,
 re-expressed in intrinsics).
 
-\section{Summary}
+\section*{Summary}
 
 \begin{table}[h]
 \centering
+\small
 \begin{tabular}{@{}llrr@{}}
 \toprule
-Optimization & Kind & Phase effect (ST) & Sign test\\
+Section & Kind & Phase effect (ST) & Sign test\\
 \midrule
-\S\ref{sec:wideneon}\ deferred reduction in registers & representation &
-  round 2: $-13.4\%$ & decisive\\
-\S\ref{sec:zeroskip}\ structurally-zero $b$ rows & work removal &
-  round 1: $-2.9\%$ & $8/8$\\
-\S\ref{sec:twolane}\ two-lane drain & ILP &
-  round 1: $-4.3\%$ & $8/8$\\
-\S\ref{sec:pmull}\ unreduced accumulate, split weights & arithmetic &
-  round 1: $-9.1\%$ & $8/8$\\
-\S\ref{sec:stripe}\ C side as stripe fold & structural &
-  round 1: $-5.7\%$ & $8/8$\\
-\S\ref{sec:qres}\ register-resident round 2 & representation &
-  round 2: $-13.0\%$ & $8/8$\\
-\S\ref{sec:qres}\ fused rounds-3+ tail & representation + pass fusion &
-  rounds 3+: $-31.8\%$ & $8/8$\\
-\S\ref{sec:composedfold}\ composed fold table (PCS open) & work removal &
-  open combine: $-17\%$ & decisive\\
-\S\ref{sec:streamwit}\ streamed witness builder & work removal &
-  witness gen: $-24\%$ & $3/3$\\
-\S\ref{sec:lcfold}\ two-stripe word-load fold & work removal &
-  lincheck fold: $-32\%$ & $3/3$\\
+\S\ref{sec:wideneon} & representation & round 2: $-13.4\%$ & decisive\\
+\S\ref{sec:zeroskip} & work removal & round 1: $-2.9\%$ & $8/8$\\
+\S\ref{sec:twolane} & ILP & round 1: $-4.3\%$ & $8/8$\\
+\S\ref{sec:pmull} & arithmetic & round 1: $-9.1\%$ & $8/8$\\
+\S\ref{sec:stripe} & structural & round 1: $-5.7\%$ & $8/8$\\
+\S\ref{sec:qres} (round 2) & representation & round 2: $-13.0\%$ & $8/8$\\
+\S\ref{sec:qres} (rounds 3+) & pass fusion & rounds 3+: $-31.8\%$ & $8/8$\\
+\S\ref{sec:composedfold} & work removal & open combine: $-17\%$ & decisive\\
+\S\ref{sec:streamwit} & work removal & witness gen: $-24\%$ & $3/3$\\
+\S\ref{sec:lcfold} & work removal & lincheck fold: $-32\%$ & $3/3$\\
 \midrule
 \multicolumn{2}{@{}l}{round 1 cumulative} &
   \multicolumn{2}{r@{}}{$1477 \to 1205\,$ms\quad($-18.4\%$)}\\
