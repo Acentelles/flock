@@ -481,14 +481,63 @@ carried in this tree, making the Merkle hash choice free.
 \section{Multithreading}
 \label{sec:mt}
 
-In progress. The campaign target mirrors the single-threaded closure above:
-CPU-only multithreaded throughput within $10\%$ of the challenge tree
-(currently $1.19\times$ apart at the $2^{16}$ shape and $1.49\times$ at the
-ranked $2^{18}$ shape, where the challenge tree's shape-gated scheduling
-stack engages). The first candidate --- round~1's challenge-independent AB
-transform overlapped with the commit under \code{rayon::join} --- is
-implemented and under measurement as of this revision; subsections will be
-added as mechanisms pass their paired tests.
+The campaign target mirrors the single-threaded closure: CPU-only
+multithreaded throughput within $10\%$ of the challenge tree. Start:
+$1.19\times$ apart at the $2^{16}$ shape. Standing after the two
+subsections below: $1.146\times$ (149.3 vs 130.2\,ms, paired same-minute,
+production configuration). All numbers here are 8-thread-class production
+runs at $2^{16}$ compressions.
+
+\subsection{Round-1 AB prep under the commit, on all cores}
+\label{sec:abhoist}
+
+Round 1's dominant half --- the shift-reduce AB transform --- reads only the
+witness, so it can run before the commitment root exists. Overlapping it
+with the commit under \code{rayon::join} was measured a wash TWICE on the
+8-P-core pool: both arms time-slice a saturated pool. Two changes flip it
+decisive: (i) the transform's $2^{m-13}$\,KiB output buffer comes from the
+scratch pool \emph{uninitialized} (a fresh zeroed allocation's memset +
+page faults consumed the entire overlap gain; slots for padding-skipped
+rows stay stale-but-unread, bounded by the same padding table every
+consumer uses), and (ii) the join window runs on an all-core (P+E) pool
+while the rest of the prove stays on P-cores. The efficiency cores are the
+active ingredient: the commit's NTT is bandwidth-bound and leaves issue
+capacity, and the prep is gather/PMULL compute the E-cluster can add
+without competing for DRAM. (The converse placement --- a bandwidth-bound
+task like the lincheck stripe transpose on the E-cores during the commit
+--- measured \emph{negative}.) Paired kill-switch A/B: $3/3$ at $2^{16}$
+($149.6$--$151.3$ vs $152.5$--$156.3$\,ms), $2/2$ at the ranked shape
+(clean pair $-57$\,ms). Bit-identical: the precomputed and inline
+transforms are equality-tested on all outputs.
+
+\subsection{Witness constant-region elision via scratch provenance}
+\label{sec:elision}
+
+The full-write witness builder rewrites every byte of z/a/b each prove ---
+including $b$'s all-ones prefix and reserved-slot words and all three
+streams' zero tails, which are identical for every prove of a layout. A
+provenance tag (derived independently at the buffer's give site from the
+R1CS constants and at its take site from the encoder's own constants ---
+no plumbing carries it) marks a pooled buffer as holding exactly a previous
+prove's output of this layout; any other pool custody clears the tag. On a
+tagged hit the builder skips the constant-region writes. Idea from the
+challenge tree's scratch tokens, re-derived; paired kill-switch A/B: $4/5$
+($147.0$--$149.0$ vs $148.3$--$152.7$\,ms). Byte-identity is enforced by a
+test that drives a tagged give/take cycle against a fresh generation.
+
+\paragraph{Negative space for multithreading.}
+Seven mechanisms measured null or inverted on this machine, all paired:
+the P-pool-only join (twice); non-temporal stores in the witness writers
+(M1 ignores the hint --- third confirmation); the stripe transpose on
+E-cores during the commit ($-$, bandwidth-on-bandwidth); the all-core PCS
+combine; four-layer NTT fusion on aarch64 ($+19$--$26\%$, sixteen live
+F128s spill); a two-block scalar witness interleave ($+40\%$ ST, GPR
+blowout); and a 4-wide SIMD witness builder with scalar packing (the
+packing, not the hash math, is the cost). What separates the remaining
+$\approx$$4$--$6$\,ms: the challenge tree's compact round-2 anchor+delta
+format with symbolic round-collapsing lookaheads, and its generated
+lane-wise vectorized packing network --- each a thousand-line-class port,
+priced and declined at the current bloat bar pending an explicit call.
 
 \section*{Summary}
 
