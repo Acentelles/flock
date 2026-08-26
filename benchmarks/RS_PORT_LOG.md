@@ -1289,3 +1289,71 @@ Our zc r1/r2/r3+ split at m=32: attempted, contaminated (user interactive
 on the machine; mins r1 38.7 / r2 70.1 / r3+ 64.7 exceed the known-clean
 134ms zc total — upper bounds only). Redo in a quiet window; their
 r2 49.4 vs our clean r2 (TBD) prices the r2-complex port properly.
+
+## Fill→NTT fusion: NULL, reverted (2026-08-26)
+
+Implemented `forward_transform_interleaved_from_message`: the first fused-2
+top pass copies its four input rows straight from z into the codeword rows
+and butterflies them in place L1-hot, deleting the standalone 2GB
+replicate pass (bit-identical: garbage-start equivalence test over 5
+shapes, NTT oracle, prove/verify roundtrips ×3 circuits; kill switch
+FLOCK_NO_FILL_FUSE=1). Paired same-binary A/B, 8 pairs at m=32 (ambient
+noisy, user interactive): commit-bucket sign test 6-2 AGAINST fusion,
+totals 4-4, min-vs-min commit 308.3 fuse vs 297.9 nofuse. Reverted;
+diff preserved at scratchpad/fillfuse.patch (566 lines) and in this entry.
+
+MODEL REFINEMENT (the valuable part): the fill's 90ms under the join was
+QUEUEING, not work — a memcpy pass contributes few thread-ms, so deleting
+its DRAM traffic doesn't shorten a thread-bound critical path, and the
+per-row copies added overhead inside the butterfly tasks. The commit
+bucket is compute-limited: NTT ~124 + merkle ~54 + prep ~85 ≈ 263 of
+thread-work ≈ the measured 270-278 wall. Corollary: the planned
+NTT→merkle-leaf fusion retry is ALSO downgraded — it deletes a 2GB READ
+(bandwidth, not thread-work) and keeps all the hashing compute; the
+earlier solo null likely stands under the join too.
+
+Surviving m=32 commit levers, by the compute model: make PREP cheaper
+(unreduced-PMULL Horner arithmetic, priced ~100 lines at m=30 and
+declined at ~8-15ms; prep is 85ms at m=32 so the same idea re-prices to
+an est. −20-30 bucket) — everything else in the window is already at its
+measured floor (fused-4 top NEON: tried, register spill, +19-26%).
+
+## RETRACTION: the "prep Horner" menu item was already banked (2026-08-26)
+
+Before implementing the recommended unreduced-PMULL Horner port, archaeology
+killed it: the headline win behind that name is ALREADY MERGED as e1398be
+(Aug 24, "accumulate round-1 prep products unreduced (pmull + weight
+split)") — the −128 ms / 8-of-8 ST result, §pmull of the writeup, one of
+the seven kept changes. What the menu item actually referred to was the
+RESIDUAL after that merge, priced at round-1 closure (74802fc): ~8-15 ms
+ceiling at m=30 ST for ~100 lines through the hottest kernel — declined
+then, and the decline stands.
+
+Decisive at today's target shape: at m=32 8T under the join, OUR prep arm
+measures 85-101 ms vs THEIR prep arm's 116.9 (their own clean sample).
+Our prep is already faster than theirs in the current architecture; there
+is nothing left in their tree's prep worth porting. My "−20-30 ms"
+estimate from earlier today was an error — I re-priced the menu label
+without checking that the mechanism behind it was already in.
+
+Corrected m=32 menu (nothing cheap left in commit): zc r2 anchor+delta
+complex (−15..30, ~800 lines), open ranked pieces (−10..20), lincheck
+stripe-fold reuse (−5, unscoped). The commit bucket's remaining −40 vs
+theirs is absorption economics (their bandwidth-bound fused pass hides
+prep free); by the compute-limited model it has no sub-800-line lever.
+
+### Amendment (same day, prompted by Benedikt)
+
+"Our prep is already faster than theirs" overstated an ARM-WALL comparison
+into a kernel claim. Scope is symmetric (both arms = the full
+challenge-independent AB transform; the challenge-dependent drain is
+outside both, pinned by Fiat-Shamir), but the contexts aren't: their 116.9
+runs beside a bandwidth-bound pass (near-solo), our 85-101 beside
+compute-saturating passes (contended). Scaling the clean ST closure
+numbers (160 vs 140 at m=30, post-e1398be) to m=32 8T: theirs ~80 solo vs
+ours ~91 — their prep kernel is likely still ~12% cheaper in isolation.
+The port stays dead for the corrected reason: the reachable ~10-11 ms has
+no named mechanism left (unreduced accumulation, zero-copy rows, and
+dead-row-fill skip are all banked here; their BCAX fold vs our
+shift+x2-byte absorb is a few vector ops in a gather-dominated kernel) —
+it's the campaign's unattributed uniform-kernel-quality band.
