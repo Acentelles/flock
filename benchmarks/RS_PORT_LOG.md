@@ -1126,3 +1126,14 @@ SHA — worth +3.7% on their tree; our FS hash config at the ranked point
 is an open item. Lesson for the log: a kill-switch list is only as
 airtight as the tree's owner says it is, and GPU telemetry must bracket
 the timed region, not the process.
+
+## Repo default switched to Blake3 (merkle + Fiat–Shamir), 2026-08-26
+
+Matches the ranked worker's hardcoded config (surfaced by the peer session:
+BENCHMARK_HASH = Blake3 for both, no env). HashKind::default(),
+FsChallenger::new, and all embedded ligerito TOMLs flipped; SHA-256 remains
+selectable per component and the cross-hash tests now exercise it as the
+non-default arm. Same-binary A/B: blake-vs-sha −1% at m=30, +2.3% at m=32
+— neutral-to-positive thanks to the neon8 merkle kernel. All future
+default-config numbers are now at the scored hash point; historical log
+entries above used SHA defaults unless marked otherwise.
