@@ -19,6 +19,7 @@
 
 pub mod bits;
 pub mod challenger;
+pub mod epool;
 pub mod field;
 pub mod genus95_curve_code;
 pub mod hash;
