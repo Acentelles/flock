@@ -131,7 +131,40 @@ builder on real and padding slots, both values of the prefix carry bit).
 Measured, paired: ST $87$--$90 \to 64.8$--$68.9\,$ms ($-24\%$, $3/3$
 disjoint); 8T $-20\%$. Idea from the challenge tree; their further
 $\approx$$3$--$7\,$ms SIMD-lockstep stage was priced against its
-$\approx$400 lines and not taken.
+$\approx$400 lines and not taken --- the full network was later built
+anyway and measured null in-prove (\S\ref{sec:zpool}).
+
+\subsection{The vectorized-packing port that became an allocation fix}
+\label{sec:zpool}
+
+The challenge tree's last witness edge was believed to be its lane-wise
+vectorized packing network: each bit-packed output stream owns a
+u32-granular writer whose pending word lives in a NEON lane, every wire
+bit is pushed by a single \code{vsli} (shift-left-insert) with
+compile-time shift constants, four compression blocks proceed in
+lockstep, and finished words dump contiguously through a
+\code{vld4} de-interleave. We reproduced the full design with a
+\code{build.rs} generator ($\approx$200 committed lines emitting the
+unrolled kernel, rather than porting their $2.6$k generated lines). It
+was bit-identical on its first full test run --- and measured a
+\emph{null} in-prove at both shapes.
+
+The discrepancy exposed the real cost, which was never the builder: the
+lincheck stripe buffer --- a repacking of $z$ consumed by the lincheck
+--- was a fresh \emph{zeroed} $128$--$512$\,MB allocation on every
+prove, and its first-touch page faults dominated the bucket. Pooling
+that one buffer (an untyped byte pool alongside the field-element pool)
+took the in-prove witness bucket from $18.5$ to $8.0$\,ms at $n=2^{16}$
+and $74$ to $33$\,ms at $n=2^{18}$, both $2/2$ paired at 8 threads ---
+more than the packing port's entire predicted value, at $\approx$40
+lines. The mechanism is thread-count-agnostic (the buffer is faulted
+once per prove regardless); the 8-thread figures are simply where the
+campaign measured it. The quad kernel was reverted unmerged; its design
+survives in the commit history. This is the third time the campaign's
+largest available win sat in the allocation story rather than the
+kernel (the constant-region elision of \S\ref{sec:elision}, the pooled
+round-1 precompute, and this): audit where the buffers come from before
+porting compute.
 
 \section{Zerocheck round 1}
 
@@ -539,35 +572,6 @@ tagged hit the builder skips the constant-region writes. Idea from the
 challenge tree's scratch tokens, re-derived; paired kill-switch A/B: $4/5$
 ($147.0$--$149.0$ vs $148.3$--$152.7$\,ms). Byte-identity is enforced by a
 test that drives a tagged give/take cycle against a fresh generation.
-
-\subsection{The vectorized-packing port that became an allocation fix}
-\label{sec:zpool}
-
-The challenge tree's last witness edge was believed to be its lane-wise
-vectorized packing network: each bit-packed output stream owns a
-u32-granular writer whose pending word lives in a NEON lane, every wire
-bit is pushed by a single \code{vsli} (shift-left-insert) with
-compile-time shift constants, four compression blocks proceed in
-lockstep, and finished words dump contiguously through a
-\code{vld4} de-interleave. We reproduced the full design with a
-\code{build.rs} generator ($\approx$200 committed lines emitting the
-unrolled kernel, rather than porting their $2.6$k generated lines). It
-was bit-identical on its first full test run --- and measured a
-\emph{null} in-prove at both shapes.
-
-The discrepancy exposed the real cost: the in-prove witness bucket was
-never builder-bound. The lincheck stripe buffer --- a repacking of $z$
-consumed by the lincheck --- was a fresh \emph{zeroed} $128$--$512$\,MB
-allocation on every prove, and its first-touch page faults dominated the
-bucket. Pooling that one buffer (an untyped byte pool alongside the
-field-element pool) took the witness bucket from $18.5$ to $8.0$\,ms at
-$n=2^{16}$ and $74$ to $33$\,ms at $n=2^{18}$, both $2/2$ paired ---
-more than the packing port's entire predicted value, at $\approx$40
-lines. The quad kernel was reverted unmerged; its design survives in the
-commit history. This is the third time the campaign's largest available
-win sat in the allocation story rather than the kernel (constant-region
-elision above, the pooled round-1 precompute, and this): audit where the
-buffers come from before porting compute.
 
 \paragraph{Negative space for multithreading.}
 Seven mechanisms measured null or inverted on this machine, all paired:
