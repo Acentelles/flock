@@ -1036,3 +1036,33 @@ land ≈1.10–1.12×; anything past that is their 2.6k-line lane-wise
 vectorized packing. Measurements paused: machine degraded after ~6 h of
 continuous benching (witness bench 14.3→37.9 ms both arms) — resume
 after cooldown per the discipline.
+
+## MT campaign, morning session (2026-08-26): elision kept; the last 4–6 ms priced
+
+Post-cooldown conditions verified (witness bench back to 14.2 ms from the
+degraded 37.9). **Kept — witness constant-region elision (4dc8742):**
+scratch-pool provenance tags, derived independently at give (from BlockR1cs)
+and take (from the encoder constants), gate skipping b's MAX prefix /
+reserved words and all three zero tails on a hit; any other custody clears
+the tag. Paired kill-switch A/B, production config: 4/5, mean −2.5 ms,
+best 146.98 ms / 445.9k c/s. Byte-identity test drives a tagged give/take
+cycle vs a fresh run. (The −4.8 ms ceiling probe from last night was
+degraded-machine-inflated; −2.5 is the clean value, in line with their
+−4.6 on the larger constant share their layout elides.)
+
+**Final standing, same-minute paired:** m=30 production 149.3–150.6 vs
+their 130.2–130.9 = **1.146×** (campaign start 1.19×; best single run
+146.98). m=32: ours 572.6 (457.8k, +5.6% on the shape since yesterday) vs
+theirs 394.9 = 1.45× — the ranked-shape residual is their m=32-gated
+machinery.
+
+**The remaining ~4–6 ms at m=30, priced:** (1) compact round-2
+anchor+delta (−1.8 ms @MT measured from their r2 8.9 vs ours 10.7) — ~800
+lines in their tree, resurfaces through our three tuned r2/r3 kernels,
+worst lines-per-ms of the campaign; their newer symbolic lookahead+cascade
+(rounds 3+4 and 5+6 collapsed into earlier passes) sits on top of it,
+m=32-gated there, several hundred more lines. (2) Their generated
+lane-wise vectorized packing network (−2–3 ms; our quad-lite probe
+confirmed the packing, not the hash math, is the cost — vectorizing it is
+their 2.6k-line codegen). Both exceed the standing bloat bar; parked for
+an explicit call rather than taken unilaterally.
