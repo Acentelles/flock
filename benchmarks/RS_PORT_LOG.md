@@ -893,3 +893,25 @@ fused into the drain and never writes the 128 MB buffer at all.
 **Round-1 verdict, this time with both sides measured: closed.** The
 remaining zerocheck delta decomposes as r1 arithmetic ~8–15 (priced, not
 taken), r2 compact format ~7–10 (priced, not taken), tail parity.
+
+## Official end-state grid: clean-conditions, no-timer, both trees (2026-08-25 night)
+
+Machine quieted to just the two Claude sessions, AC power, 100% charged.
+15 runs: 3 per config, interleaved between trees, bare `blake3_proof`
+n=65536 (no instrumentation env), best-of-3 proves per run. Ours at HEAD;
+theirs the Aug 22 binary at c576e68.
+
+| config | ours (best, spread) | theirs (best, spread) | gap |
+|---|---|---|---|
+| ST CPU | 930.4 ms / 70.4k c/s (0.3%) | 843.7 ms / 77.7k c/s (0.9%) | 1.10x |
+| 8T CPU | 156.1 ms / 419.8k c/s (0.4%) | 131.3 ms / 499.3k c/s (2.0%) | 1.19x |
+| 8T GPU-on | — (no GPU path) | 131.0 ms / 500.3k c/s (2.3%) | 1.19x |
+
+Findings: (1) no-timer headlines match the instrumented runs within noise —
+instrumentation overhead confirmed ~zero, all bucket analyses stand;
+(2) run spread at 0.3–0.9 % ST confirms every prior "day-mode"/spike
+anomaly was ambient load, not code; (3) their GPU is worth nothing at 8T
+(131.0 vs 131.3) — their CPU path caught up to their own Metal offload;
+(4) the MT gap is 1.19x under clean conditions (1.23x on battery), and it
+is scheduling (helper threads / epool P+E / allocator recycling), not
+kernels — ST stands at 1.10x with every bucket at parity or priced.
