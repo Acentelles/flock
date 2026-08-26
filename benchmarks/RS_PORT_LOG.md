@@ -994,3 +994,45 @@ lines). E2E ranked config m=32 8T blake3-merkle: 410.3k → 431.5k c/s —
 the −5% blake3 penalty is erased and the ranked hash choice is now free
 for this tree. LLVM handled the 32-register pressure without measurable
 spill cost; the asm fallback (their .S) was not needed.
+
+## MT campaign, night 1 (2026-08-26): one keeper, seven nulls, a map of what's left
+
+Target (user directive): CPU-only MT within 10% of the challenge tree,
+no GPU. Start: 1.19× at m=30 8T.
+
+**Kept — AB hoist v2 (commit d963445):** prep under the commit via
+rayon::join, with the two defects that nulled v1 fixed: the ab_pre buffer
+comes from the scratch pool uninitialized (fresh vec![0u8] zero+fault cost
+was eating the entire gain) and the join window runs on the all-core (P+E)
+pool while the rest of the prove stays on P-cores. The E-cores are the
+active ingredient: prep is gather/PMULL compute they can add without
+stealing the DRAM bandwidth the NTT saturates. Paired 3/3 at m=30
+(149.6–151.3 vs 152.5–156.3), 2/2 at m=32 (best clean pair −57 ms).
+Best production number: 149.6 ms / 438.1k c/s.
+
+**Nulls/inversions, all paired, all on this M1 Max:** P-pool-only join
+(wash, third confirmation); NT stores in witness writers (~0 — M1 ignores
+the stnp hint, third confirmation of the model); lincheck-stripe transpose
+on E during commit (NEGATIVE: bandwidth task in a bandwidth-bound window,
+commit +7 ms); FLOCK_ALLCORE combine (0); NTT fused-4 on aarch64 (+19–26%,
+16 live F128s spill — the old code comment was right); two-block scalar
+witgen interleave (+40% ST, GPR blowout); quad-lite SIMD witgen (state
+math 4-wide, scalar packing — null even after removing 4.5k lane
+extractions: the packing is the cost, not the G math).
+
+**Decisive ablations on their tree (same day):** their witgen SIMD is
+worth 2× IN-PROVE (24.9→12.1 at 8T) but their SIMD-without-elision
+(16.7) ≈ our streamed scalar (16.2) — i.e. the entire remaining witness
+gap is their scratch-provenance CONSTANT-REGION ELISION (−4.6 ms their
+tree; ceiling probe on ours: −4.8 ms paired, degraded-machine caveat).
+The focused genwitness bench measures only their scalar path (the SIMD
+gate lives in their prove method), which earlier mislead this log.
+
+Standing at checkpoint: ~1.15× at m=30 (149.6–152.4 vs 130.5–130.9
+same-minute). Queued with measured ceilings: witgen constant-region
+elision via pool provenance tags (−3..5 ms, ~120 lines), zerocheck
+round-2 compact format (−2 ms, ~150 lines, previously priced). Those two
+land ≈1.10–1.12×; anything past that is their 2.6k-line lane-wise
+vectorized packing. Measurements paused: machine degraded after ~6 h of
+continuous benching (witness bench 14.3→37.9 ms both arms) — resume
+after cooldown per the discipline.
