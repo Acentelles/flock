@@ -1165,3 +1165,38 @@ worker-scored GPU-off (630.8k) — three independent methodologies within
 benefits their tree ~4% and ours ~2%.) The composition of that gap is the
 previously-logged one: their m=32-gated pipeline (phase overlap, deferred
 stripe, round-collapsing r2 complex) plus their blake-tuned kernels.
+
+## The "pipeline architecture" was an accounting mirage (2026-08-26)
+
+Stage 1 of the pipeline port (Merkle leaf hashing fused into the NTT deep
+pass's sub-group tasks, ~200 lines, bit-identical, kill-switched) measured
+3/5 pairs, mean −0.6% at m=32 — a null (the deep pass is PMULL-compute-
+bound, so hash compute doesn't ride stalls; only the codeword re-read
+saving survives). REVERTED.
+
+The null prompted re-examining the "139 ms of phase overlap" that motivated
+the pipeline theory — and it dissolves: their multi-run breakdown
+(BLAKE3_BREAKDOWN_RUNS) shows per-run buckets summing to ~471 ms against
+~400 ms headline runs, which is exactly their prove_fast_TIMED wrapper
+being ~15% slower than the untimed path (documented in week one and
+forgotten). Their buckets are self-consistent within the timed path; the
+"overlap" was timed-buckets-vs-untimed-best. WITHDRAWN.
+
+**The real m=32 (blake, CPU-only) gap, timed-vs-timed, finally solid:**
+
+| phase | ours | theirs | delta | mechanism |
+|---|---:|---:|---:|---|
+| witness | 71.2 | 29.5 | −41.7 | their witgen SIMD packing (2× in-prove) + scaling |
+| commit(+prep) | 260.3 | 231.0 | −29.3 | window packing/alloc details, NTT+merkle parity |
+| zerocheck | 131.2 | 113.6 | −17.6 | their r2 lookahead+cascade (m==32-gated) |
+| lincheck | 27.9 | 16.2 | −11.7 | their round-1 stripe-fold reuse |
+| open | 93.6 | 79.8 | −13.8 | ranked open machinery |
+
+No scheduling magic — five kernel/structure ports, all previously priced,
+with m=32 values now attached. The big mover is the witgen SIMD packing
+network: worth only ~2–3 ms at m=30 (why it was declined) but ~40 ms at
+m=32. Revised menu, m=32 value per effort: witgen packing (−40, 2.6k-line
+class), r2 complex (−18, ~800 lines), lincheck stripe-reuse (−12,
+unscoped), open ranked pieces (−14, partially GPU-adjacent), commit misc
+(−29, undecomposed). Ceiling if all land: ~600 → ~490 vs their ~400
+untimed — the last ~90 is their untimed-path leanness itself.
