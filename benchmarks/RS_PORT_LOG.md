@@ -1104,3 +1104,25 @@ worker-scored GPU-off number (630.8k), so ranked scoring overhead is
 large; cross-methodology caution applies. Conclusion unchanged in kind
 but bigger in degree: the m=32 gap is the integrated blake+m32-gated
 pipeline architecture, a deliberate port-project, not a mechanism list.
+
+**RETRACTION of the blake-arms correction above.** The 920–1036k "CPU-only"
+figures were GPU-contaminated: the challenge tree's GPU merkle paths
+(recursive merkle, L1 overlap) are BLAKE3-only — GPU shaders hash blake,
+not SHA — and sat outside the kill-switch list used here; and the GPU-
+utilization "verification" sampled only the bench's 3-minute setup window,
+killing the process before any timed prove ran (worthless both arms). The
+tree's owner reproduced with an airtight fresh-build kill: **their true
+CPU-only ceiling at m=32+blake(+blake FS, the worker's hardcoded config)
+is 638.9k c/s — consistent with their worker-scored GPU-off 630.8k**,
+which is the cross-check that settles it. Their GPU at the ranked config
+is worth +57% dev-warm / +43% scored.
+
+Corrected m=32 standing: ours 457.8k (SHA; blake costs us ~4%) vs theirs
+639k CPU-only = **1.40×** — in line with the original SHA-arms 1.45×, so
+the earlier pipeline-architecture analysis stands as written; the "2.1×"
+interlude is void. Also noted from the owner: the ranked worker hardcodes
+Blake3 for BOTH merkle and Fiat–Shamir (no env); dev-bench defaults are
+SHA — worth +3.7% on their tree; our FS hash config at the ranked point
+is an open item. Lesson for the log: a kill-switch list is only as
+airtight as the tree's owner says it is, and GPU telemetry must bracket
+the timed region, not the process.
