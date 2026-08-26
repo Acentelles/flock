@@ -1221,3 +1221,36 @@ Their in-prove witness advantage is now INVERTED at m=30 (ours 7.9 vs
 their 12.1) and mostly closed at m=32 (ours ~33 vs their timed 29.5).
 Third lesson of this genre in the campaign: measure the allocation story
 before porting a kernel (elision, ab_pre pooling, and now this).
+
+## Certification grid: MT target met at m=30 (2026-08-26)
+
+Final verification grid, both trees end-to-end untimed-best, blake3
+merkle+FS both arms, CPU-only both arms (their five GPU kill switches as a
+zsh array, verified by comp/s sanity), 8T, interleaved same-minute pairs
+with alternating order. Ours = HEAD (feb41428 build: pool fix c8d36b6,
+blake defaults fc78188); theirs = their fresh Aug-26 build (5d405d46).
+
+| pair | ours m=30 | theirs m=30 | ratio |
+|---|---:|---:|---:|
+| 1 | 141.85 | 133.89 | 1.059× |
+| 2 | 144.69 | 137.35 | 1.053× |
+| 3 | 143.28 | 132.08 | 1.085× |
+
+Best-vs-best **141.85 vs 132.08 = 1.074×**, every pair ≤1.09×: the
+"MT within 10% of yukon" target is CERTIFIED at the prod shape
+(462.0k vs 496.2k comp/s). Our best buckets: witness 7.6 / commit 64.7 /
+zc 33.7 / lincheck 8.1 / open 27.9.
+
+m=32 pairs: 542.22/397.56 = 1.364× and 541.32/405.82 = 1.334×
+(483.5k vs 659.4k comp/s best) — matches the priced-menu projection;
+the residual is the five parked ports (r2 complex, lincheck stripe-reuse,
+open ranked, commit misc, witgen tail).
+
+Conditions: AC power, ambient GUI load (WindowServer ~55%, Texifier ~30%)
+— absolute numbers mildly inflated vs quiet-window bests (their m=32 read
+384-386 in a quieter window an hour earlier; ratios are interleaved and
+robust). Two grid attempts discarded first: one ran a stale pre-pool
+binary left newest by the A/B stash build (witness bucket 18/68 ms gave
+it away), one was launched under bash where `$ARRAY` expands to its first
+element — kill switches silently dropped, their GPU came alive (1.02M
+comp/s tell). Both hazards now in the protocol notes.
