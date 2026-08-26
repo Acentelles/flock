@@ -1403,3 +1403,27 @@ already FASTER than their timed 49.4 (≈ parity with their scored ~43).
 The r2-side of the anchor+delta port is ≈0; the port's value is
 concentrated in the TAIL (ours ~50 vs their timed 29.7): the r3
 table-combine, lookahead, and cascades. Task #3 rescoped accordingly.
+
+## Cascade tail: built, verified, staged opt-in — coupled to anchor+delta (2026-08-26)
+
+Three A/B rounds at m=32 told the full story:
+1. Scalar lookahead passes (as the AG tail ships them): tail 57-59 vs
+   classic 52-54 — the historical "lookahead = 13-15% regression" verdict
+   reproduced, and diagnosed as KERNEL QUALITY (generic scalar F128 muls
+   vs the classic path's q-resident NEON kernel), not scheduling.
+2. NEON lookahead kernel + fold1 entry: tail 50.4-51.7 vs 50.5-51.4 —
+   WASH, explained by pass accounting: the fold1 entry (the largest pass)
+   saves no traffic and pays the full product bill.
+3. Integrated r2 lookahead (r2 emits the 8 sums; all tail passes 4→1):
+   tail 35.0-37.4 vs 49.6-53.1, 3/3 DISJOINT (−15) — but r2 67-80 vs
+   42.6-47.8 (+24). The surcharge is the mul-count floor (8 mul_q + 8
+   wide per group vs classic's 4+4 = 36 extra PMULL/group × 2^24); a
+   two-sweep de-spill restructure changed nothing. Net zc ≈ +9. 
+
+CONCLUSION: cascade and anchor+delta are COUPLED — their tree affords the
+surcharge only because their compact r2 pays it from a lower base
+(deferred odd-element folds + cheaper unreduced product accumulation).
+Staged opt-in (FLOCK_ZC_LOOKAHEAD=1, transcript byte-identical by test);
+anchor+delta port is the remaining piece, anatomy question out to the
+peer: where do the odd folded values for THEIR Q products come from —
+paid delta-gathers in r2, or a product formulation in anchor/delta space?
