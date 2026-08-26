@@ -125,6 +125,53 @@ pub fn give_f128(v: Vec<F128>) {
     give_f128_tagged(v, 0)
 }
 
+/// Byte-buffer pool (the lincheck stripe): same custody rules as the F128
+/// pool, without tags. Contents are UNINITIALIZED on take — callers must
+/// write every byte they later read.
+static POOL_U8: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+const MAX_POOLED_U8: usize = 4;
+
+/// Take a length-`n` byte vector, preferring a pooled buffer.
+pub fn take_u8(n: usize) -> Vec<u8> {
+    {
+        let mut pool = POOL_U8.lock().unwrap();
+        if let Some(i) = pool.iter().position(|v| v.capacity() >= n) {
+            let mut v = pool.swap_remove(i);
+            drop(pool);
+            v.clear();
+            // SAFETY: capacity checked; u8 has no Drop and no invalid bit
+            // patterns; caller upholds write-before-read.
+            unsafe { v.set_len(n) };
+            return v;
+        }
+    }
+    // SAFETY: as above — caller writes every byte before reading.
+    #[allow(clippy::uninit_vec)]
+    {
+        let mut v: Vec<u8> = Vec::with_capacity(n);
+        unsafe { v.set_len(n) };
+        v
+    }
+}
+
+/// Return a byte buffer for reuse.
+pub fn give_u8(v: Vec<u8>) {
+    if v.capacity() == 0 {
+        return;
+    }
+    let mut pool = POOL_U8.lock().unwrap();
+    pool.push(v);
+    if pool.len() > MAX_POOLED_U8 {
+        let smallest = pool
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, v)| v.capacity())
+            .map(|(i, _)| i)
+            .expect("pool non-empty");
+        pool.swap_remove(smallest);
+    }
+}
+
 /// Pre-warm the pool for proves at witness size `2^m`: allocate and
 /// first-touch the full prove-cycle buffer set once, in parallel, then park
 /// it in the pool. Called from the per-hash Setup constructors, this moves

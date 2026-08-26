@@ -289,7 +289,7 @@ where
     let (mut a, a_hit) = flock_core::scratch::take_f128_tagged(total_f128, tag_of(tags[1]));
     let (mut b, b_hit) = flock_core::scratch::take_f128_tagged(total_f128, tag_of(tags[2]));
     let hits = [z_hit, a_hit, b_hit];
-    let mut z_lincheck = vec![0u8; (n_total / 8) * k];
+    let mut z_lincheck = flock_core::scratch::take_u8((n_total / 8) * k);
 
     z.par_chunks_mut(8 * f128_per_block)
         .zip(a.par_chunks_mut(8 * f128_per_block))
@@ -304,29 +304,17 @@ where
                 } else {
                     padding
                 };
-                let z_chunk = &mut z_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
-                let a_chunk = &mut a_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
-                let b_chunk = &mut b_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
-                // SAFETY: F128 is `repr(C, align(16))` with two LE u64 fields.
-                let z_u64: &mut [u64] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        z_chunk.as_mut_ptr() as *mut u64,
-                        z_chunk.len() * 2,
-                    )
+                // SAFETY: F128 is `repr(C, align(16))` with two LE u64
+                // fields; the rows are disjoint block-sized windows.
+                let row = |grp: &mut [F128]| -> &mut [u64] {
+                    unsafe {
+                        std::slice::from_raw_parts_mut(
+                            grp.as_mut_ptr().add(k_in * f128_per_block) as *mut u64,
+                            u64_per_block,
+                        )
+                    }
                 };
-                let a_u64: &mut [u64] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        a_chunk.as_mut_ptr() as *mut u64,
-                        a_chunk.len() * 2,
-                    )
-                };
-                let b_u64: &mut [u64] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        b_chunk.as_mut_ptr() as *mut u64,
-                        b_chunk.len() * 2,
-                    )
-                };
-                per_block(init, z_u64, a_u64, b_u64, hits);
+                per_block(init, row(z_grp), row(a_grp), row(b_grp), hits);
             }
 
             // Bit-transpose 8 z chunks into the lincheck stripe.
@@ -389,7 +377,7 @@ where
     let mut z = flock_core::scratch::take_f128(total_f128);
     let mut a = flock_core::scratch::take_f128(total_f128);
     let mut b = flock_core::scratch::take_f128(total_f128);
-    let mut z_lincheck = vec![0u8; (n_total / 8) * k];
+    let mut z_lincheck = flock_core::scratch::take_u8((n_total / 8) * k);
 
     z.par_chunks_mut(8 * f128_per_block)
         .zip(a.par_chunks_mut(8 * f128_per_block))

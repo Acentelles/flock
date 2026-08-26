@@ -1485,6 +1485,7 @@ fn build_block_witness_ab_stream_into(
     }
 }
 
+
 /// **The fast path.** Produces `(z, a, b)` directly as F_{2^128}-packed
 /// vectors — no bool intermediates, no `pack_witness` step, no
 /// `apply_block_diag_packed`. Parallel across compression instances via rayon.
