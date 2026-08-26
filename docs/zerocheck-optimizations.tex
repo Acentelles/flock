@@ -104,6 +104,20 @@ walking the monomials $X^r e$ with 127 exact shift-and-folds instead of 128
 general multiplies (\S\ref{sec:composedfold} --- resting on $\gamma = X$
 being the generator rather than on \eqref{eq:friendly} itself).
 
+\paragraph{Notation.}
+A few recurring terms, used across multiple sections below:
+\begin{itemize}
+\setlength{\itemsep}{1pt}
+\item \textbf{witness builder} (``the builder''): the code that serializes
+  the R1CS witness into the packed bit-buffers $z$, $a$, $b$.
+\item \textbf{drain} (the gather drain): the loop that walks the per-row
+  lookup tables to accumulate round~1's output messages; detailed in
+  \S\ref{sec:twolane}.
+\item \textbf{lincheck stripe}: the repacking of the witness $z$, indexed
+  by inner/outer position, that the lincheck phase consumes; defined
+  fully in \S\ref{sec:stripe}.
+\end{itemize}
+
 The two directions, in math. Both evaluate contractions against the same
 geometric weight vector: with $w_K = C\,\alpha^K$ for $K < n$ and
 bit-inputs $u \in \Ftwo^n$, the quantity is
@@ -132,20 +146,6 @@ it is being constructed (subset-sum doubling \emph{is} a fold;
 \S\ref{sec:composedfold} is that observation at $n=128$). Folds at
 freshly \emph{sampled} challenges (rounds two and onward) get no such
 shortcut --- there a fold is an ordinary multiply.
-
-\paragraph{Notation.}
-A few recurring terms, used across multiple sections below:
-\begin{itemize}
-\setlength{\itemsep}{1pt}
-\item \textbf{witness builder} (``the builder''): the code that serializes
-  the R1CS witness into the packed bit-buffers $z$, $a$, $b$.
-\item \textbf{drain} (the gather drain): the loop that walks the per-row
-  lookup tables to accumulate round~1's output messages; detailed in
-  \S\ref{sec:twolane}.
-\item \textbf{lincheck stripe}: the repacking of the witness $z$, indexed
-  by inner/outer position, that the lincheck phase consumes; defined
-  fully in \S\ref{sec:stripe}.
-\end{itemize}
 
 \paragraph{Measurement protocol.}
 All numbers are single-threaded (ST) at the shape above unless marked 8T
