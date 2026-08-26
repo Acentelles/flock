@@ -1370,3 +1370,17 @@ phases" verdict holds with today's kernels. E-cores remain harvested
 selectively (join window, NTT deep pass, open combine — the phases where
 they add compute to bandwidth-bound windows) and nowhere else. Pool
 pinning is NOT part of the m=32 residual.
+
+### Epool priced by the peer's own kill-switch A/B: below bar (2026-08-26)
+
+The peer added FLOCK_NO_EPOOL to their tree (it didn't exist; I'd assumed
+it from naming) and ran 3 alternating pairs at ranked CPU config: epool
+is worth ~6.6% / ~26.5ms total THERE, 3/3 clean — but decomposed:
+commit −10.7 (their AB-prep-hetero, the analog of the all-core join we
+ALREADY have), zc −6.7, lincheck −0.6, open +3.1 (reversed, ~noise).
+Portable NEW value for us = zc+lincheck ≈ −7ms for a queue primitive +
+call-site conversions (~200 lines): below the bloat bar and priced-and-
+parked (zc-only variant listed on the menu at −6..7). The "uniform
+kernel-quality band" is NOT hidden E-core scheduling; the m=32 menu
+stands: r2 complex (−15..30, ~800 lines), open ranked (−10..20),
+lincheck stripe-reuse (−5), epool-zc (−6..7, ~200 lines).
