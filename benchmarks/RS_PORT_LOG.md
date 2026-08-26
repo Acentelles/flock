@@ -978,3 +978,19 @@ CPU-only proving on both trees — their 10T mode only pays with the GPU
 overlap (943k). Best-CPU-vs-best-CPU at the ranked shape: 443.1k vs
 645.6k = **1.46×**, all scheduling, not thread count. Ours reproduced to
 5 digits across runs (414,339 vs 414,337 c/s).
+
+## BLAKE3 merkle: the neon8 idea in 290 intrinsics lines (2026-08-25, kept)
+
+Their blake3 merkle edge is a 2.6k-line generated-asm 8-wide kernel; the
+mechanism is just ILP (the crate's 4-wide NEON state is latency-bound on
+the G chain). Re-derived as intrinsics: two transposed 4-wide states
+interleaved G-for-G, dispatched from blake3_hash_many for groups of 8,
+crate path for tails, bit-identical by equivalence test.
+
+merkle_tree ST: blake3 1.63→2.30 GB/s at 512 B leaves (+41%, now 1.08×
+faster than SHA-256), 1.71→2.42 GB/s at the ranked 1 KB leaves (+42%,
+parity with SHA silicon; their asm ≈2.58, i.e. within 6% for 9× fewer
+lines). E2E ranked config m=32 8T blake3-merkle: 410.3k → 431.5k c/s —
+the −5% blake3 penalty is erased and the ranked hash choice is now free
+for this tree. LLVM handled the 32-register pressure without measurable
+spill cost; the asm fallback (their .S) was not needed.
