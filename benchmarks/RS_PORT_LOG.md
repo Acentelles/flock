@@ -1254,3 +1254,38 @@ binary left newest by the A/B stash build (witness bucket 18/68 ms gave
 it away), one was launched under bash where `$ARRAY` expands to its first
 element — kill switches silently dropped, their GPU came alive (1.02M
 comp/s tell). Both hazards now in the protocol notes.
+
+## Commit-bucket decomposition: the gap was absorption economics (2026-08-26)
+
+FLOCK_COMMIT_TIMING splits our m=32 commit bucket (270ms): replicate-fill
+13ms solo, NTT-from-layer-2 124ms, merkle (neon8) 54ms = **191ms of commit
+work** — plus the hoisted AB prep (85ms solo) absorbed at nearly full
+cost. The join window is thread-THROUGHPUT-bound: both arms scale threads
+near-perfectly, so wall = (191+85 work)/(pool) = 276 predicted, 270-278
+measured. Sequencing the fill before the join just moved the contention
+onto the NTT (124→230 beside prep; fill 90→13): thread-work is conserved,
+order can't matter. Paired A/B 3/3 old-schedule (best 558.4 vs 584.8,
+noisy window); reverted with numbers in the commit message.
+
+Peer anatomy (clean window, verified): their commit is ONE fused pipelined
+pass — replicate+NTT+merkle-LEAVES prints as a single 223-298ms number
+(min 223, cluster 223-242) + merkle-parents 0.1ms. Their AB-prep arm
+(116.9ms) rides the join FREE because the fused pass is bandwidth-bound
+and leaves idle thread-time. Their zc bucket (120.4) contains no prep
+(r1 41.3 + r2 49.4 + r3+ 29.7 sums exactly). So: commit work ours 191 vs
+theirs 223 — WE are ahead on work; bucket ours 270 vs theirs ~231 —
+they win on absorption. The earlier "-29 commit misc" menu item is
+re-attributed: it is join-contention, not kernel deficit.
+
+Consequence: the m=32 commit lever is DELETING THREAD-WORK from the join
+window, not scheduling. Two candidates: (1) fuse the replicate-fill into
+the first computed NTT layer-block (read z directly per replica; deletes
+the 2GB fill write + its re-read, ~25-30ms thread-work); (2) retry
+NTT→merkle-leaf fusion — measured null SOLO earlier (deep pass
+compute-bound) but under a thread-bound join, thread-work cuts pay even
+when solo wall doesn't. Together ≈ bucket parity with their 223-231.
+
+Our zc r1/r2/r3+ split at m=32: attempted, contaminated (user interactive
+on the machine; mins r1 38.7 / r2 70.1 / r3+ 64.7 exceed the known-clean
+134ms zc total — upper bounds only). Redo in a quiet window; their
+r2 49.4 vs our clean r2 (TBD) prices the r2-complex port properly.
