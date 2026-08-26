@@ -484,10 +484,13 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
     let eq_lo = &eq.lo;
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
 
-    // Per-x_hi body: writes one disjoint chunk of a_folded/b_folded and
-    // returns its (sum1, sum_inf) contribution. Contributions combine by
-    // exact F128 addition (XOR), so the scheduling below cannot change bits.
-    let chunk_body = |x_hi: usize, a_chunk: &mut [F128], b_chunk: &mut [F128]| -> (F128, F128) {
+    // Parallel: each worker writes one disjoint chunk of a_folded/b_folded
+    // and returns its (sum1, sum_inf) contribution. Reduce by F128 XOR.
+    let (sum1, sum_inf) = a_folded
+        .par_chunks_mut(chunk_size)
+        .zip(b_folded.par_chunks_mut(chunk_size))
+        .enumerate()
+        .map(|(x_hi, (a_chunk, b_chunk))| {
             let mut p1_acc = F256Unreduced::ZERO;
             let mut pinf_acc = F256Unreduced::ZERO;
             let pair_idx_base = x_hi * lo_size;
@@ -692,47 +695,11 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
             let pinf = pinf_acc.reduce();
             let eq_h = eq_hi[x_hi];
             (eq_h * p1, eq_h * pinf)
-        };
-
-    // Scheduling: the bounded-tail hetero queue adds the E-cores when the
-    // pass is large enough to amortize the helper wake; otherwise (and under
-    // FLOCK_NO_EPOOL) the incumbent rayon chunk split runs unchanged.
-    let (sum1, sum_inf) = if crate::epool::hetero_enabled() && n_out >= (1 << 20) {
-        let a_ptr = crate::epool::SyncMutPtr(a_folded.as_mut_ptr());
-        let b_ptr = crate::epool::SyncMutPtr(b_folded.as_mut_ptr());
-        crate::epool::run_hetero_chunks(
-            hi_size,
-            |x_hi| {
-                // SAFETY: per-x_hi ranges are disjoint and in-bounds
-                // (hi_size · chunk_size = n_out = buffer length).
-                let (a_chunk, b_chunk) = unsafe {
-                    (
-                        core::slice::from_raw_parts_mut(
-                            a_ptr.get().add(x_hi * chunk_size),
-                            chunk_size,
-                        ),
-                        core::slice::from_raw_parts_mut(
-                            b_ptr.get().add(x_hi * chunk_size),
-                            chunk_size,
-                        ),
-                    )
-                };
-                chunk_body(x_hi, a_chunk, b_chunk)
-            },
+        })
+        .reduce(
             || (F128::ZERO, F128::ZERO),
             |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
-        )
-    } else {
-        a_folded
-            .par_chunks_mut(chunk_size)
-            .zip(b_folded.par_chunks_mut(chunk_size))
-            .enumerate()
-            .map(|(x_hi, (a_chunk, b_chunk))| chunk_body(x_hi, a_chunk, b_chunk))
-            .reduce(
-                || (F128::ZERO, F128::ZERO),
-                |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
-            )
-    };
+        );
 
     (a_folded, b_folded, mlv_challenges[0] * sum1, sum_inf)
 }
@@ -869,10 +836,11 @@ pub fn fold_and_compute_round_pair_into(
     let eq_lo = &eq.lo;
     let eq_hi = &eq.hi;
 
-    // Per-x_hi body (see the r2 fused fold above for the scheduling story:
-    // exact XOR merge, so the split below cannot change bits).
-    let chunk_body = |x_hi: usize, a_out: &mut [F128], b_out: &mut [F128]| -> (F128, F128) {
-        {
+    let (sum1, sum_inf) = a_out
+        .par_chunks_mut(chunk_out)
+        .zip(b_out.par_chunks_mut(chunk_out))
+        .enumerate()
+        .map(|(x_hi, (a_out, b_out))| {
             let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
             let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
 
@@ -1047,45 +1015,11 @@ pub fn fold_and_compute_round_pair_into(
             };
             let eq_h = eq_hi[x_hi];
             (eq_h * p1, eq_h * pinf)
-        }
-    };
-
-    let (sum1, sum_inf) = if crate::epool::hetero_enabled() && n >= (1 << 20) {
-        let a_ptr = crate::epool::SyncMutPtr(a_out.as_mut_ptr());
-        let b_ptr = crate::epool::SyncMutPtr(b_out.as_mut_ptr());
-        crate::epool::run_hetero_chunks(
-            hi_size,
-            |x_hi| {
-                // SAFETY: per-x_hi output ranges are disjoint and in-bounds
-                // (hi_size · chunk_out = half = a_out.len()).
-                let (ac, bc) = unsafe {
-                    (
-                        core::slice::from_raw_parts_mut(
-                            a_ptr.get().add(x_hi * chunk_out),
-                            chunk_out,
-                        ),
-                        core::slice::from_raw_parts_mut(
-                            b_ptr.get().add(x_hi * chunk_out),
-                            chunk_out,
-                        ),
-                    )
-                };
-                chunk_body(x_hi, ac, bc)
-            },
+        })
+        .reduce(
             || (F128::ZERO, F128::ZERO),
             |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
-        )
-    } else {
-        a_out
-            .par_chunks_mut(chunk_out)
-            .zip(b_out.par_chunks_mut(chunk_out))
-            .enumerate()
-            .map(|(x_hi, (ac, bc))| chunk_body(x_hi, ac, bc))
-            .reduce(
-                || (F128::ZERO, F128::ZERO),
-                |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
-            )
-    };
+        );
 
     (r_next[0] * sum1, sum_inf)
 }
@@ -1777,67 +1711,6 @@ mod tests {
             assert_eq!(par.2, ser.2, "msg_1 mismatch at m={m}");
             assert_eq!(par.3, ser.3, "msg_inf mismatch at m={m}");
         }
-    }
-
-    /// The bounded-tail hetero-queue scheduling (engaged when the pass has
-    /// ≥ 2^20 outputs and E-core helpers exist) is byte-identical to the
-    /// serial oracle — same assertion as `parallel_matches_serial`, at a
-    /// shape large enough to actually take the epool arm. On machines
-    /// without E-cores this degenerates to re-testing the rayon arm.
-    #[test]
-    fn hetero_queue_matches_serial_at_engaging_shape() {
-        let m = 26; // n_out = 2^20: crosses the epool engagement threshold
-        let k_skip = 6;
-        let mut rng = Rng::new(0xE9001);
-        let a = rng.bits(1 << m);
-        let b = rng.bits(1 << m);
-        let z = rng.f128();
-        let mlv_challenges = rng.f128_vec(m - k_skip);
-        let a_packed = pack_bits(&a);
-        let b_packed = pack_bits(&b);
-        let table = UniSkipFoldTable::new(k_skip, z);
-
-        let par = uni_skip_fold_and_round_pair_optimized_packed(
-            &a_packed,
-            &b_packed,
-            m,
-            k_skip,
-            &table,
-            &mlv_challenges,
-        );
-        let ser = uni_skip_fold_and_round_pair_optimized_packed_serial(
-            &a_packed,
-            &b_packed,
-            m,
-            k_skip,
-            &table,
-            &mlv_challenges,
-        );
-        assert_eq!(par.0, ser.0, "a_mlv mismatch");
-        assert_eq!(par.1, ser.1, "b_mlv mismatch");
-        assert_eq!(par.2, ser.2, "msg_1 mismatch");
-        assert_eq!(par.3, ser.3, "msg_inf mismatch");
-
-        // Tail round at an engaging size: fused fold+message vs the unfused
-        // reference (fold_in_place_pair + round_pair_naive).
-        let n = 1usize << 21;
-        let mut a_mlv = rng.f128_vec(n);
-        let mut b_mlv = rng.f128_vec(n);
-        let r_fold = rng.f128();
-        let log_n = 21;
-        let mut r_next = vec![F128::ONE; log_n - 1];
-        for v in r_next[1..].iter_mut() {
-            *v = rng.f128();
-        }
-        let (a_ref, b_ref) = (a_mlv.clone(), b_mlv.clone());
-        let (a_new, b_new, m1, mi) =
-            fold_and_compute_round_pair_optimized(&a_ref, &b_ref, r_fold, &r_next);
-        fold_in_place_pair(&mut a_mlv, &mut b_mlv, r_fold);
-        let (m1_ref, mi_ref) = round_pair_naive(&a_mlv, &b_mlv, &r_next);
-        assert_eq!(a_new, a_mlv, "tail a fold mismatch");
-        assert_eq!(b_new, b_mlv, "tail b fold mismatch");
-        assert_eq!(m1, m1_ref, "tail msg_1 mismatch");
-        assert_eq!(mi, mi_ref, "tail msg_inf mismatch");
     }
 
     /// **Padding skip is byte-identical to the dense round-2 kernel.** Builds
