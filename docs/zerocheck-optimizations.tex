@@ -12,6 +12,15 @@
 \newcommand{\eq}{\mathrm{eq}}
 \newcommand{\code}[1]{\texttt{#1}}
 
+\newenvironment{optsummary}{%
+  \begin{quote}\small
+  \begin{description}
+  \setlength{\itemsep}{1pt}\setlength{\parsep}{0pt}\setlength{\topsep}{2pt}
+}{%
+  \end{description}
+  \end{quote}
+}
+
 \title{Verified Optimizations to Flock's RS Prover\\
 {\large measurements on Apple M1 Max, single-threaded; zerocheck at $2^{18}$,
 PCS open at $2^{16}$ BLAKE3 compressions}}
@@ -143,6 +152,13 @@ first timed phase.
 \subsection{Streaming full-word publication}
 \label{sec:streamwit}
 
+\begin{optsummary}
+\item[Baseline:] OR sub-word fields into pre-zeroed storage: a $\approx$130\,MB$\times$3 memset plus a read-modify-write on every store.
+\item[Improvement:] A sequential writer that carries a partial word in a register publishes complete u64s in order and never reads the destination.
+\item[Mechanism:] Eliminates the $\approx$130\,MB$\times$3 memset and the per-store read-modify-write entirely.
+\item[Result:] ST $87$--$90\to64.8$--$68.9\,$ms ($-24\%$, $3/3$ disjoint); 8T $-20\%$.
+\end{optsummary}
+
 The BLAKE3 witness builder fills three bit-packed buffers (z, a, b; one bit
 per R1CS wire) per compression block. The incumbent wrote them by OR-ing
 sub-word fields into pre-zeroed storage: a $\approx$130\,MB\,$\times$3 memset,
@@ -164,6 +180,13 @@ anyway and measured null in-prove (\S\ref{sec:zpool}).
 
 \subsection{The vectorized-packing port that became an allocation fix}
 \label{sec:zpool}
+
+\begin{optsummary}
+\item[Baseline:] The lincheck stripe buffer was a fresh \emph{zeroed} $128$--$512$\,MB allocation on every prove; its first-touch page faults dominated the witness bucket.
+\item[Improvement:] Pool that one buffer (an untyped byte pool alongside the field-element pool) instead of reallocating and zeroing it each prove.
+\item[Mechanism:] Not an operation-count change but an allocation fix: removes the per-prove first-touch page-fault cost of a fresh $128$--$512$\,MB zeroed allocation, at $\approx$40 lines (versus the ported vectorized-packing network's $\approx$200 lines, which measured null).
+\item[Result:] In-prove witness bucket $18.5\to8.0\,$ms at $n=2^{16}$ and $74\to33\,$ms at $n=2^{18}$, both $2/2$ paired at 8 threads.
+\end{optsummary}
 
 The challenge tree's last witness edge was believed to be its lane-wise
 vectorized packing network: each bit-packed output stream owns a
@@ -201,6 +224,13 @@ from $1477$ to $1205$\,ms ($-18.4\%$) at the benchmark shape.
 
 \subsection{Unreduced accumulation with multiplicative weight splitting}
 \label{sec:pmull}
+
+\begin{optsummary}
+\item[Baseline:] Each $y_K$ computed \emph{reduced}: two \code{PMULL}s for the raw product plus a reduction costing four more, then a widening shift.
+\item[Improvement:] Split the weight $x^K$ multiplicatively so the reduction is deferred to the final fold; accumulate unreduced.
+\item[Mechanism:] $6$ \code{PMULL} $\to$ $2$ \code{PMULL} per row-block (Algorithm~1).
+\item[Result:] Round~1 $1401.4\to1273.4\,$ms ($-9.1\%$), $8/8$, every pair in $[-8.7\%,-10.1\%]$.
+\end{optsummary}
 
 The prep kernel computes, per $K$-row ($K\in\{0,\dots,7\}$) and 16-lane block,
 $y_K = a_K \odot b_K \in \Feight$ and accumulates $\sum_K x^K y_K$ in 16-bit
@@ -251,6 +281,13 @@ $100$--$140\,$ms; measured $128$.}
 \subsection{The C-side message as a fold of the lincheck stripe}
 \label{sec:stripe}
 
+\begin{optsummary}
+\item[Baseline:] The C-side banks, though a multilinear evaluation, were computed with the quadratic side's machinery: a bit transpose of every $8192$-bit window plus $32$ of the drain's $48$ gathers per lane.
+\item[Improvement:] Compute the banks as a true multilinear fold of the already-materialized lincheck stripe at the pinned challenges, undoing the over-folded eq factors with a closed-form constant.
+\item[Mechanism:] Removes the per-window bit transpose entirely; the drain's gathers per (lane, $b$) drop from three to one.
+\item[Result:] Round~1 $1277.5\to1204.7\,$ms ($-5.7\%$), $8/8$; added-fold cost $\approx180\,$ms nets against $\approx250\,$ms of removals.
+\end{optsummary}
+
 In the fast hash setups $C=I$, so $\hat c = \hat z$ and everything round~1
 emits on the C side is \emph{linear} in the witness. Concretely the two banks
 are, for parity $p\in\{0,1\}$ and lane $\lambda$,
@@ -300,6 +337,13 @@ the added fold ($\approx180\,$ms) is included; the removals
 
 \subsection{Instruction-level parallelism in the gather drain}\label{sec:twolane}
 
+\begin{optsummary}
+\item[Baseline:] One lane per iteration exposes three serial dependency chains (one per bank) to the out-of-order engine.
+\item[Improvement:] Process two lanes per iteration so twice as many independent chains are in flight, with no change in total work.
+\item[Mechanism:] 3 dependency chains in flight $\to$ 6 dependency chains in flight per iteration (same gather count and table size).
+\item[Result:] Round~1 $-63.1\,$ms ($-4.3\%$), $8/8$; combined with \S\ref{sec:zeroskip}: $1477.3\to1403.1\,$ms ($-5.0\%$).
+\end{optsummary}
+
 The drain accumulates, per output lane, three XOR chains of depth
 $n_{\mathrm{med}}=16$ (one per bank), each link a table gather feeding an XOR.
 The gathers are independent but the chains are serial, so one lane exposes
@@ -327,6 +371,13 @@ gather count and chain depth, not footprint.
 Section~\ref{sec:zeroskip}: $1477.3\to1403.1\,$ms ($-5.0\%$).}
 
 \subsection{Structurally fixed rows of the $b$ operand}\label{sec:zeroskip}
+
+\begin{optsummary}
+\item[Baseline:] Every $K$-row of $b$ is pushed through the $\Ftwo$-linear table $T$, including the $15$ of $256$ rows the circuit pins to $0^8$ regardless of input.
+\item[Improvement:] Guard each row with a single zero check; since $T(0)=0$, a zero $b$-row contributes nothing and its work can be skipped outright.
+\item[Mechanism:] Skips $64$ table loads and $4$ $\Feight$ multiplies for each of the $15$ structurally-zero $K$-rows (out of $256$).
+\item[Result:] Round~1 $-42.4\,$ms ($-2.9\%$), $8/8$.
+\end{optsummary}
 
 Round~1's dominant kernel transforms the operands $a,b$ through a table $T$
 implementing the inverse-NTT composition; $T$ is $\Ftwo$-linear, so
@@ -365,6 +416,13 @@ $433$ to $312$\,ms ($-28\%$).
 
 \subsection{Deferred reduction in vector registers}\label{sec:wideneon}
 
+\begin{optsummary}
+\item[Baseline:] The $256$-bit accumulator lived as a four-word struct in general registers: six lane extracts per product to leave the vector file, four scalar XORs per accumulate.
+\item[Improvement:] Keep the accumulator resident as two $128$-bit vector registers and form the unreduced product with Karatsuba.
+\item[Mechanism:] Karatsuba product: three \code{PMULL}s instead of the schoolbook four; accumulate: four scalar XORs $\to$ two vector XORs; the six lane extracts move from per-product to once per worker chunk.
+\item[Result:] Round-2 phase $433.1\to375.2\,$ms ($-13.4\%$).
+\end{optsummary}
+
 For $u\in\Ftwo^{256}$ (an unreduced carry-less product) let
 $R(u)\in\Fbig$ be reduction mod $X^{128}+X^7+X^2+X+1$. $R$ is
 $\Ftwo$-linear, so for any products $u_i = a_i \odot b_i$ (unreduced),
@@ -391,6 +449,13 @@ existing scalar reducer is reused unchanged.
 
 \subsection{The register-resident message loop}\label{sec:qres}
 
+\begin{optsummary}
+\item[Baseline:] The message loop crossed the vector/general register-file boundary three times per output pair (fold-accumulator extract, scalar field multiply in/out, re-entry for accumulation), at six \code{PMULL}s per pair.
+\item[Improvement:] Keep the whole chain --- fold, in-register Karatsuba multiply, and accumulate --- resident in vector registers.
+\item[Mechanism:] $6$ \code{PMULL} $\to$ $5$ \code{PMULL} per pair (three for the product, two for the fold through $X^{128}\equiv X^7{+}X^2{+}X{+}1$); all three per-pair register-file crossings removed, leaving only four stores and one eq load.
+\item[Result:] Round-2 phase $358.1\to311.6\,$ms ($-13.0\%$), $8/8$, every pair in $[-12.6\%,-13.3\%]$.
+\end{optsummary}
+
 Round~2's message loop crossed the vector/general register-file boundary three
 times per output pair: the table-driven fold extracted its vector accumulator
 into a two-word struct; the message products
@@ -413,6 +478,13 @@ session (the min-of-5 protocol absorbs interactive bursts).}
 One structural change took the tail from $455$ to $307$\,ms ($-33\%$).
 
 \subsection{Fusing away a memory pass}\label{sec:tailfuse}
+
+\begin{optsummary}
+\item[Baseline:] Two passes per worker chunk: fold and store $a,b$, then re-read the just-written multi-megabyte chunk from L2/DRAM to build the message.
+\item[Improvement:] Fold each output pair in-register, store once, and consume the pair for the message while still in registers --- no re-read.
+\item[Mechanism:] Memory traversals per worker chunk: $2\to1$; \code{PMULL} count is unchanged from the two-pass form.
+\item[Result:] Rounds-3+ phase $449.5\to306.6\,$ms ($-31.8\%$), $8/8$, every pair in $[-31.1\%,-32.6\%]$ --- the largest single win of the effort.
+\end{optsummary}
 
 The tail rounds apply the register-resident treatment of \S\ref{sec:qres}
 plus one thing round~2 had no opportunity for. The incumbent made \emph{two} passes per worker chunk:
@@ -453,6 +525,13 @@ every pair in $[-31.1\%,-32.6\%]$ --- the largest single win of the effort.}
 \subsection{One word load per stripe, two stripes per pass}
 \label{sec:lcfold}
 
+\begin{optsummary}
+\item[Baseline:] 16 loads per stripe step: 8 table entries plus 8 separate scalar byte loads for the indices.
+\item[Improvement:] Load the 8 adjacent index bytes as one u64 with GPR shift-extracts, and fold two stripes per iteration so the table-entry XOR fuses to a single \code{EOR3}.
+\item[Mechanism:] 16 loads/stripe $\to$ $\approx$9 loads/stripe.
+\item[Result:] \code{partial\_fold\_z} ST $40.7$--$40.8\to27.8$--$28.0\,$ms ($-32\%$, $3/3$ disjoint); 8T $-28\%$.
+\end{optsummary}
+
 The lincheck's dominant pass folds the 128\,MB packed witness through
 per-stripe 256-entry byte tables into eight Q-register accumulators. The
 loop is load-port bound (M1: 3 loads/cycle), and the incumbent spent 16
@@ -473,6 +552,13 @@ re-expressed in intrinsics).
 
 \subsection{Composing the block scalar into the fold table}
 \label{sec:composedfold}
+
+\begin{optsummary}
+\item[Baseline:] The combine pass spent one field multiply plus one 16-load table fold per slot per claim --- $58\%$ of open time.
+\item[Improvement:] Fold the block-constant multiply into a freshly composed per-(claim, block) table, built once from 127 shift-and-fold doublings plus subset-sum expansion, so the sweep only indexes the composed table.
+\item[Mechanism:] Removes $2L\approx16.8$M per-slot field multiplies per open, replaced by a one-time $\approx$4.3k-word-op build per block ($127$ shift-and-fold doublings plus $16\cdot255$ subset-sum additions).
+\item[Result:] Combine $94.4\to78.5\,$ms, open total $\approx160\to\approx145\,$ms ($-9\%$); at 8 threads combine is $10.9\,$ms, a near-linear transfer.
+\end{optsummary}
 
 \emph{Shape for this section: the $2^{16}$-compression open ($m=30$,
 $L=2^{23}$ packed slots, two batched claims).} The ring-switch reduction
@@ -533,6 +619,13 @@ two trees' opposite placements of the same work.
 \subsection{Two transposed four-wide states in flight}
 \label{sec:blake3neon}
 
+\begin{optsummary}
+\item[Baseline:] The crate's NEON backend runs a single 4-wide transposed state (one \code{uint32x4} per state word); BLAKE3's serial G function leaves Apple's four NEON pipes half idle.
+\item[Improvement:] Interleave a second independent transposed 4-wide state, G-for-G, to fill the idle pipe slots.
+\item[Mechanism:] 1 transposed 4-wide state (4 messages in lockstep) $\to$ 2 interleaved 4-wide states (8 messages in flight, the full 32-register NEON file); no added work per message.
+\item[Result:] ST tree build $1.63\to2.30\,$GB/s at 512\,B leaves ($+41\%$) and $1.71\to2.42\,$GB/s at 1\,KiB leaves ($+42\%$).
+\end{optsummary}
+
 The PCS Merkle tree can hash with SHA-256 (hardware silicon, $\approx$2.5\,GB/s
 per core) or BLAKE3. The blake3 crate's NEON backend processes four messages
 in lockstep --- one \code{uint32x4} per state word --- but a single 4-wide
@@ -567,6 +660,13 @@ runs at $2^{16}$ compressions.
 \subsection{Round-1 AB prep under the commit, on all cores}
 \label{sec:abhoist}
 
+\begin{optsummary}
+\item[Baseline:] Overlapping the witness-only AB transform with the commit under \code{rayon::join} measured a wash twice on the P-core-only pool; the transform's output buffer was a fresh zeroed allocation.
+\item[Improvement:] Draw the output buffer from the scratch pool uninitialized, and run the join window on the all-core (P+E) pool instead of P-cores only.
+\item[Mechanism:] Not an operation-count change but a memory-traffic and scheduling fix: removes the memset-plus-page-fault cost of a fresh zeroed allocation, and moves the overlap window onto the otherwise-idle E-core issue capacity left by the bandwidth-bound commit NTT.
+\item[Result:] Kill-switch A/B $3/3$ at $2^{16}$ ($149.6$--$151.3$ vs $152.5$--$156.3\,$ms), $2/2$ at the ranked shape (clean pair $-57\,$ms).
+\end{optsummary}
+
 Round 1's dominant half --- the shift-reduce AB transform --- reads only the
 witness, so it can run before the commitment root exists. Overlapping it
 with the commit under \code{rayon::join} was measured a wash TWICE on the
@@ -588,6 +688,13 @@ transforms are equality-tested on all outputs.
 
 \subsection{Witness constant-region elision via scratch provenance}
 \label{sec:elision}
+
+\begin{optsummary}
+\item[Baseline:] The full-write witness builder rewrites every byte of z/a/b each prove, including regions --- $b$'s all-ones prefix, reserved-slot words, all three streams' zero tails --- identical across every prove of a layout.
+\item[Improvement:] Tag a pooled buffer with its provenance (derived independently at give and take sites) and, on a tagged hit, skip the constant-region writes.
+\item[Mechanism:] No explicit byte or operation count is given in this section; this is a work-removal via provenance tracking, not a stated op-count reduction.
+\item[Result:] Paired kill-switch A/B: $4/5$ ($147.0$--$149.0$ vs $148.3$--$152.7\,$ms).
+\end{optsummary}
 
 The full-write witness builder rewrites every byte of z/a/b each prove ---
 including $b$'s all-ones prefix and reserved-slot words and all three
