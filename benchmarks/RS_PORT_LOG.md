@@ -937,3 +937,36 @@ graph "finishes with 0.00 ms host wait" (their comment), and sync overhead
 turns it slightly negative. In the threaded production configuration the
 GPU is worth nothing on either shape; the +10.7% campaign figure was the
 m=32 ST cell (reproduced tonight at +9.2%), not a general advantage.
+
+## CORRECTION + the ranked-config picture: the GPU verdict was a config artifact (2026-08-25 late)
+
+**Retraction.** The "their GPU is worth nothing threaded" section above was
+measured with the SHA-256 merkle default — which silently fails their
+ranked GPU gates (`merkle_hash == Blake3` is a hard condition on the big
+offload paths). The user's suspicion that "a flag needed to be turned on"
+was correct: with FLOCK_MERKLE_HASH=blake3 at m=32, their GPU is worth
+**+35%** at 8T on this M1 Max. The +9.2% ST figure earlier is also
+understated for the same reason.
+
+Ranked-config grid (m=32, this machine, clean, same half-hour):
+
+| m=32 8T | ours | theirs |
+|---|---:|---:|
+| SHA merkle, CPU | 433.6k c/s | 645.6k c/s |
+| Blake3 merkle, CPU | 410.3k (no fast blake3-merkle kernel here) | 663.4k |
+| Blake3 merkle, GPU 8T | — | 897.9k |
+| Blake3 merkle, GPU 10T | — | **942.7k** |
+
+Consequences:
+1. The MT gap is SHAPE-DEPENDENT: 1.19x at m=30 but **1.49x at m=32
+   CPU-vs-CPU** — their scheduling stack (seed-pipe, epool, allocator
+   recycling, AB-prep overlap) is gated on the ranked m=32 geometry and
+   never fired in the m=30 comparisons. Their throughput scales +29%
+   from m=30 to m=32; ours +3%.
+2. Full scored-config gap on this machine: 433.6k vs 942.7k = **2.17x**
+   (their reported 600k/900k reproduced here as 663k CPU / 898-943k GPU).
+3. The ST kernel campaign remains validly closed (1.10x, same-hash,
+   same-shape); what it never measured is the ranked-config stack:
+   MT scheduling at m=32, GPU offload behind the Blake3 gate, 10-thread
+   epool, and a fast BLAKE3 merkle kernel. Those are the remaining
+   campaign, in descending order of measured value.
