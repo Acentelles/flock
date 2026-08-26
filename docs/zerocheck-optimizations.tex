@@ -77,9 +77,24 @@ weights geometric:
 \end{equation}
 with $K=\sum K_i 2^i$, $C_s=\prod_i(1+r_{6+i})=\varphi(\mathtt{0x1C})$, and
 $D=\prod_i(1+\gamma^{2^{i-1}})$. The baseline kernels exploit
-\eqref{eq:friendly} through lookup tables; several optimizations below exploit
-it in the opposite direction, replacing tables by folds at the actual
-challenge values.
+\eqref{eq:friendly} through lookup tables: the geometric weights are
+enumerated once into byte-indexed convert tables and applied by gathers.
+Three optimizations below exploit it in the opposite direction, replacing
+tables by folds at the actual challenge values: the C-side banks are
+recomputed as a true multilinear fold at the pinned challenges, with the
+over-folded eq factors undone by a closed-form constant that exists only
+because of \eqref{eq:friendly} (\S\ref{sec:stripe}); the prep kernel's
+weight $x^K$ is factored so one piece stays a table image while the $x^2$
+piece is applied as a shift-and-conditional-XOR directly on the operand
+(\S\ref{sec:pmull}); and the PCS open builds its composed fold table by
+walking the monomials $X^r e$ with 127 exact shift-and-folds instead of 128
+general multiplies (\S\ref{sec:composedfold} --- resting on $\gamma = X$
+being the generator rather than on \eqref{eq:friendly} itself). The rule
+separating the directions: a table wins when one fixed map is applied to a
+stream of arbitrary inputs (the load-port-bound drains); a fold at the value
+wins when the input is a single accumulator or the map itself is being
+constructed. Folds at freshly \emph{sampled} challenges (rounds two and
+onward) get no such shortcut --- there a fold is an ordinary multiply.
 
 \paragraph{Measurement protocol.}
 All numbers are single-threaded at the shape above. Each verdict is a paired
