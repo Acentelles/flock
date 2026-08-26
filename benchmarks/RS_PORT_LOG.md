@@ -1341,3 +1341,19 @@ complex (−15..30, ~800 lines), open ranked pieces (−10..20), lincheck
 stripe-fold reuse (−5, unscoped). The commit bucket's remaining −40 vs
 theirs is absorption economics (their bandwidth-bound fused pass hides
 prep free); by the compute-limited model it has no sub-800-line lever.
+
+### Amendment (same day, prompted by Benedikt)
+
+"Our prep is already faster than theirs" overstated an ARM-WALL comparison
+into a kernel claim. Scope is symmetric (both arms = the full
+challenge-independent AB transform; the challenge-dependent drain is
+outside both, pinned by Fiat-Shamir), but the contexts aren't: their 116.9
+runs beside a bandwidth-bound pass (near-solo), our 85-101 beside
+compute-saturating passes (contended). Scaling the clean ST closure
+numbers (160 vs 140 at m=30, post-e1398be) to m=32 8T: theirs ~80 solo vs
+ours ~91 — their prep kernel is likely still ~12% cheaper in isolation.
+The port stays dead for the corrected reason: the reachable ~10-11 ms has
+no named mechanism left (unreduced accumulation, zero-copy rows, and
+dead-row-fill skip are all banked here; their BCAX fold vs our
+shift+x2-byte absorb is a few vector ops in a gather-dominated kernel) —
+it's the campaign's unattributed uniform-kernel-quality band.
