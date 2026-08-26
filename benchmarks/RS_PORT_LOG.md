@@ -970,3 +970,11 @@ Consequences:
    MT scheduling at m=32, GPU offload behind the Blake3 gate, 10-thread
    epool, and a fast BLAKE3 merkle kernel. Those are the remaining
    campaign, in descending order of measured value.
+
+**10-thread addendum (2026-08-25 late).** All-core (8P+2E) CPU-only runs:
+ours m=30 414.3k (−1.3% vs 8T) / m=32 443.1k (+2.2%); theirs m=30 502.1k
+(+0.6%) / m=32 595.3k (−7.8% vs their 8T). E-cores are ~worthless for
+CPU-only proving on both trees — their 10T mode only pays with the GPU
+overlap (943k). Best-CPU-vs-best-CPU at the ranked shape: 443.1k vs
+645.6k = **1.46×**, all scheduling, not thread count. Ours reproduced to
+5 digits across runs (414,339 vs 414,337 c/s).
