@@ -566,6 +566,16 @@ separately, and only the cross-tree anatomy exchange (their kernel
 reached the same sums with 20 fewer PMULLs per group) exposed which was
 which.
 
+\subsection{Compact variant K: rounds 2--5 in two passes}
+\label{sec:compactk}
+
+\begin{optsummary}
+\item[Baseline:] After \S\ref{sec:cascade}, round 2 ran as two sweeps (fold + store the full pairs, then an L2 re-read for the eight lookahead products), and the tail bound the challenges from materialized $64$-byte-per-pair state.
+\item[Improvement:] The challenge tree's compact architecture, ported whole. Round 2's single sweep stores $48$ bytes per pair --- the folded even-row \emph{anchor} plus the packed-byte XOR of the pair, still in the bit domain --- and emits round 2's message AND round 3's as six deferred quadratic coefficients: the products are parity-split over pair index ($\mathrm{eq}_2(2y{+}1) = r_1\,\mathrm{eq}_3(y)$), so the odd halves ARE the round-3 aggregates after one $r_1^{-1}$. The consumer then binds $\rho_1$ and $\rho_2$ in one pass through two $\lambda$-scaled byte tables ($\mathrm{bound} = \mathrm{anchor} + \mathrm{fold}_\lambda(\delta)$ by fold linearity over $\mathbb{F}_2$; $\lambda_1 = \rho_1(1{+}\rho_2)$, $\lambda_3 = \rho_1\rho_2$), emits round 4's message, defers round 5's the same way, and materializes the quarter-size level where the cascade resumes unchanged.
+\item[Mechanism:] Three stacked effects: one sweep instead of two (the parity split needs the same eight accumulators the lookahead used, but no re-read pass); $-25\%$ intermediate traffic in both directions; and challenge binding through table lookups instead of per-output multiplies. The degenerate-$b$ fast path rides along: an all-ones packed $b$ row folds to a per-table constant, so such pairs skip their 16 lookups and their provably-zero products --- value-preserving, and common in this circuit's $b$ operand.
+\item[Result:] Producer $54.3$--$55.9\to48.0$--$51.0\,$ms ($3/3$); tail $31.9\to8.5$ with the new $\approx24$ ms double fold between them; mechanism sum $85.9$--$87.9\to79.9$--$84.5$ ($3/3$ disjoint, avg $-4.9$) at $m{=}32$ 8T grind-free. Zerocheck sub-line sums reach parity with the challenge tree ($\approx117$ vs $\approx116$). Transcript-identical by three tests including a targeted $b\equiv1$ case.
+\end{optsummary}
+
 \section{Lincheck}
 
 \subsection{One word load per stripe, two stripes per pass}
@@ -959,6 +969,7 @@ Section & Kind & Phase effect (ST) & Sign test\\
 \S\ref{sec:directopen} & work removal & open ($m{=}32$): $-34\%$ 8T, $-66\%$ ST & $3/3$ disjoint\\
 \S\ref{sec:directopenrefine} & pass fusion & open ($m{=}32$): $-20\%$ 8T & $3/3$ disjoint\\
 \S\ref{sec:cascade} & pass fusion & zc tail ($m{=}32$): $-38\%$ 8T & $4/4$ disjoint\\
+\S\ref{sec:compactk} & representation, pass fusion & zc r2..5 ($m{=}32$): $-4.9\,$ms 8T & $3/3$ disjoint\\
 \S\ref{sec:inducetrunc}+\S\ref{sec:lazyood} & work removal & open ($m{=}32$): $-9\%$ 8T & $3/3$ disjoint\\
 \S\ref{sec:recursivefill} & pass fusion & open ($m{=}32$): $-1.5\,$ms 8T & sign $3/3$\\
 \S\ref{sec:boundaryjoin}+\S\ref{sec:blockedtranspose} & scheduling, pass fusion & open ($m{=}32$): $-12\%$ 8T & sign $3/3$\\
