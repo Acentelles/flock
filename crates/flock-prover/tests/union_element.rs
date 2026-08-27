@@ -825,10 +825,13 @@ fn mixed_boolean_element_roundtrip_and_tamper() {
         union.element_word_range(),
         (1 << 14)..((1 << 14) + (1 << 10))
     );
-    // Count-proportional dense area across BOTH classes.
+    // Count-proportional dense area across BOTH classes. The boolean side is
+    // USEFUL_BITS packed into words (92 as of the Option F adders — a
+    // hardcoded 93 rotted here when the encoder dieted).
+    let bool_words = flock_prover::r1cs_hashes::blake3::USEFUL_BITS.div_ceil(128);
     assert_eq!(
         union.dense_words(),
-        93 * n_bool + m.ty.k() * n_elem,
+        bool_words * n_bool + m.ty.k() * n_elem,
         "dense area is count-proportional over both classes"
     );
 
@@ -1079,9 +1082,10 @@ fn mixed_with_one_class_at_zero_count() {
     for (n_bool, n_elem) in [(0usize, 90usize), (100usize, 0usize)] {
         let union = UnionInstance::new(&m.registry, vec![n_bool, n_elem]);
         let pcs_params = union_pcs_params(&union);
+        let bool_words = flock_prover::r1cs_hashes::blake3::USEFUL_BITS.div_ceil(128);
         assert_eq!(
             union.dense_words(),
-            93 * n_bool + m.ty.k() * n_elem,
+            bool_words * n_bool + m.ty.k() * n_elem,
             "a zero count contributes no committed words"
         );
 
@@ -1303,6 +1307,12 @@ fn bundle_digest_merged(
 // Re-pinned 2026-08-13 after circuit digests began binding fixed-public
 // declarations and the retained registry. The statement transcript changes
 // by design; two deterministic print runs agreed for all seven fixtures.
+// Re-pinned 2026-08-27 for the deliberate per-level consistency-batch
+// grinding fix (700cace): each Ligerito level's alpha now grinds under its
+// OWN bits, so every fixture with live grinding moved; the empty-instance
+// fixture elem-merged-nu12-0 held. union_m6_fixtures was re-pinned with
+// that change but this file was missed (caught by the Phase 0 bloat
+// census). Two deterministic print runs agreed.
 #[test]
 #[ignore] // Heavier — run with `-- --ignored`.
 fn mixed_class_merged_proof_bytes_pinned() {
@@ -1310,12 +1320,12 @@ fn mixed_class_merged_proof_bytes_pinned() {
         (
             "elem-merged-nu12-full",
             1 << 12,
-            "05a2a5b9da04dc5adf1abfa025ee7c55b0005d71e61f519179fe29395b7e00f1",
+            "affa7c153342f4fa0a02ee2b08367a0b0dc1885c175e9f09eef9b643ce421777",
         ),
         (
             "elem-merged-nu12-2731",
             2731,
-            "df3c9f14ed1df4386f56b5914134e844fe60878760aa91414eba6de39791ace1",
+            "a66cd908ede6e07bc4d48a80187a88bec41ca821598374e017966ff85a23a996",
         ),
         (
             "elem-merged-nu12-0",
@@ -1327,22 +1337,22 @@ fn mixed_class_merged_proof_bytes_pinned() {
         (
             "mix-merged-nu7-128-128",
             [128, 128],
-            "5d19981986d55105cab76450bb551cd39f44c3826d644d45a1c522d1f5556596",
+            "f8a60a912f301b1094540cb163fb6cd547297bf869293c62fc989ff14adb1b05",
         ),
         (
             "mix-merged-nu7-100-90",
             [100, 90],
-            "d1f4d444a42bbfff86d1b0d7c84fe41baf9b6104a6bb4b20388c2a2e19670543",
+            "cbf7812593e950e3a0185e7f0881352e6619538587477f61db1fb5d227c96f0b",
         ),
         (
             "mix-merged-nu7-0-90",
             [0, 90],
-            "9bc655d8190fd16d953efc635b28268c75167b6563f63da0407d9f4dbea617de",
+            "83f53efdb502655e3b956c6384d377d57641052639159cc21e79d553c2964c39",
         ),
         (
             "mix-merged-nu7-100-0",
             [100, 0],
-            "b5e77f746c902e3c75d34764ed7006868fb936c14bf634419b77c0cd12917144",
+            "4516541821be3a8c7c29d60980e67b3c01d35f7788a70a1630b104d85c090f0b",
         ),
     ];
 

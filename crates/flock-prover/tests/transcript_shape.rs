@@ -278,7 +278,11 @@ fn element_only_transcript_shape_is_pinned() {
     // count and openings carry per-summand path lengths
     // (docs/stratified-queries.tex). The squeeze widths are UNCHANGED (one
     // F128 per query); only the cap payload sizes move the shape.
-    const EXPECTED: &str = "4982a38e4020ed04355e49a5a4d4a59d56c250a10d742bbc6aad65f101462ee0";
+    // Re-pinned 2026-08-27: the per-level consistency-batch grinding fix
+    // (700cace) moved each level's Pow bits, and the shape follows. That
+    // change's re-pin sweep missed this file (caught by the Phase 0 bloat
+    // census). Two deterministic print runs agreed.
+    const EXPECTED: &str = "e7a0b59f43903cf62f46ed0d58eeeec5ec5156cf5fc959f508a291ba2250ecd6";
 
     let (_, shape) = record_element_only(12, &[3], &[1 << 12], 0xB0DD_1E01);
 
