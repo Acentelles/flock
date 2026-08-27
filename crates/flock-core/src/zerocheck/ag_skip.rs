@@ -41,12 +41,6 @@ pub static DISABLE_FRIENDLY_HORNER: AtomicBool = AtomicBool::new(false);
 /// instead of uninit pooled `take_f128`. Lets one process time both back-to-back.
 pub static NXT_ZEROFILL: AtomicBool = AtomicBool::new(false);
 
-/// Bench-only A/B toggle: when set, round 1 uses the unfused
-/// [`crate::genus95_curve_code::round1::round1_slp_packed_banks`] instead of the
-/// fused/lazy-reduction [`round1_slp_packed_banks_fused`]. Lets one process time
-/// both back-to-back so thermal drift cancels. Output is bit-identical either way.
-pub static ROUND1_UNFUSED: AtomicBool = AtomicBool::new(false);
-
 /// A/B toggle: when set, the mlv tail runs the classic one-round-per-pass loop
 /// (friendly-Horner + general fused kernels) instead of sumcheck LOOKAHEAD
 /// ([`super::multilinear::fold2_lookahead_into`]) — one pass per TWO rounds,
@@ -1353,23 +1347,20 @@ fn prove_round1_banks(
     c_packed: &[u8],
     eq: &[F128],
 ) -> (Round1Message, Vec<F128>) {
-    let raw = if ROUND1_UNFUSED.load(Ordering::Relaxed) {
-        crate::genus95_curve_code::round1::round1_slp_packed_banks(a_packed, b_packed, c_packed, eq)
-    } else {
+    banks_to_message(
         crate::genus95_curve_code::round1::round1_slp_packed_banks_fused(
             a_packed, b_packed, c_packed, eq,
-        )
-    };
-    banks_to_message(raw)
+        ),
+    )
 }
 
-/// [`prove_round1_banks`] under a witness run-list. The hot (fused) path
-/// is [`round1_slp_packed_banks_fused_padded`] — ONE parallel pass over
+/// [`prove_round1_banks`] under a witness run-list:
+/// [`round1_slp_packed_banks_fused_padded`] — ONE parallel pass over
 /// the live-block list, Partial blocks cleansed inline, per-element parity
-/// with the dense kernel. The bench-only unfused arm keeps the
-/// segment-call driver below (correct, but it pays a rayon bridge per
-/// full-run segment — the envelope's per-column run structure has ~450 of
-/// them, which is exactly why the fused arm got its own kernel).
+/// with the dense kernel. (A per-run-segment driver over the unfused kernel
+/// was MEASURED 2-3x SLOWER than the full dense scan at the envelope's ~450
+/// per-column runs — never fan a hot kernel into per-segment par calls.
+/// Deleted with its `ROUND1_UNFUSED` toggle 2026-08-27.)
 #[cfg(target_arch = "aarch64")]
 fn prove_round1_banks_padded(
     a_packed: &[u8],
@@ -1378,60 +1369,11 @@ fn prove_round1_banks_padded(
     eq: &[F128],
     coverage: &[super::BlockCoverage],
 ) -> (Round1Message, Vec<F128>) {
-    use super::BlockCoverage;
-    if !ROUND1_UNFUSED.load(Ordering::Relaxed) {
-        return banks_to_message(
-            crate::genus95_curve_code::round1::round1_slp_packed_banks_fused_padded(
-                a_packed, b_packed, c_packed, eq, coverage,
-            ),
-        );
-    }
-    let kernel = crate::genus95_curve_code::round1::round1_slp_packed_banks;
-    let n = a_packed.len() / 1024;
-    assert_eq!(eq.len(), n, "one eq weight per block");
-    assert_eq!(coverage.len(), n, "one coverage entry per block");
-    let mut res_ab = [F128::ZERO; 160];
-    let mut bank0 = [F128::ZERO; 64];
-    let mut bank1 = [F128::ZERO; 64];
-    let mut acc = |seg: ([F128; 160], [F128; 64], [F128; 64])| {
-        for j in 0..160 {
-            res_ab[j] += seg.0[j];
-        }
-        for k in 0..64 {
-            bank0[k] += seg.1[k];
-            bank1[k] += seg.2[k];
-        }
-    };
-    let mut i = 0usize;
-    while i < n {
-        match &coverage[i] {
-            BlockCoverage::Dead => i += 1,
-            BlockCoverage::Full => {
-                let mut j = i + 1;
-                while j < n && coverage[j] == BlockCoverage::Full {
-                    j += 1;
-                }
-                acc(kernel(
-                    &a_packed[i * 1024..j * 1024],
-                    &b_packed[i * 1024..j * 1024],
-                    &c_packed[i * 1024..j * 1024],
-                    &eq[i..j],
-                ));
-                i = j;
-            }
-            BlockCoverage::Partial(ranges) => {
-                let mut a_buf = [0u8; 1024];
-                let mut b_buf = [0u8; 1024];
-                let mut c_buf = [0u8; 1024];
-                super::cleanse_block(a_packed, i * 1024, ranges, &mut a_buf);
-                super::cleanse_block(b_packed, i * 1024, ranges, &mut b_buf);
-                super::cleanse_block(c_packed, i * 1024, ranges, &mut c_buf);
-                acc(kernel(&a_buf, &b_buf, &c_buf, &eq[i..i + 1]));
-                i += 1;
-            }
-        }
-    }
-    banks_to_message((res_ab, bank0, bank1))
+    banks_to_message(
+        crate::genus95_curve_code::round1::round1_slp_packed_banks_fused_padded(
+            a_packed, b_packed, c_packed, eq, coverage,
+        ),
+    )
 }
 
 /// The shared banks → wire-message post-processing: `D⁻¹` scaling of the

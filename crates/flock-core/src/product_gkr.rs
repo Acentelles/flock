@@ -76,49 +76,9 @@ use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::zerocheck::univariate_skip::SplitEqGhash;
 
-const DOMAIN: &[u8] = b"flock-product-gkr-v0";
-
 // ---------------------------------------------------------------------------
 // Proof / claim / error types
 // ---------------------------------------------------------------------------
-
-/// One product-circuit layer reduction (`layer k → k+1`): the `k`-round sumcheck
-/// messages (Convention A `(G(1), G(∞))`) and the two boundary values
-/// `V_{k+1}(r', 0), V_{k+1}(r', 1)`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LayerProof {
-    /// Per-round `(G(1), G(∞))`, length `k` (empty for the top layer `k=0`).
-    pub rounds: Vec<(F128, F128)>,
-    pub v0: F128, // V_{k+1}(r', 0)
-    pub v1: F128, // V_{k+1}(r', 1)
-}
-
-/// Product-GKR permutation proof. Two product transcripts (LHS/RHS), their
-/// roots, and the witness evals at the two reduction points.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProductGkrProof {
-    /// `∏ lhs` and `∏ rhs`; must be equal for a valid permutation.
-    pub top_lhs: F128,
-    pub top_rhs: F128,
-    /// Layer reductions `k = 0…μ-1` for each circuit.
-    pub layers_lhs: Vec<LayerProof>,
-    pub layers_rhs: Vec<LayerProof>,
-    pub f_eval: F128,       // f(ρ_lhs)
-    pub g_eval: F128,       // g(ρ_rhs)
-    pub s_sigma_eval: F128, // s_σ(ρ_rhs)
-}
-
-/// Evaluation claims the verifier outputs, for a downstream witness PCS. The
-/// two products reduce to *different* points, so `f` and `g` are claimed at
-/// `ρ_lhs` and `ρ_rhs` respectively.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProductGkrClaim {
-    pub rho_lhs: Vec<F128>,
-    pub rho_rhs: Vec<F128>,
-    pub f_eval: F128,
-    pub g_eval: F128,
-    pub s_sigma_eval: F128,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VerifyError {
@@ -1074,282 +1034,13 @@ fn build_layer(v_next: &[F128]) -> Vec<F128> {
     }
 }
 
-/// One eq-weighted degree-2 round for the product gate, **excluding** the
-/// current variable's eq factor (Convention A). `v0 = V_{k+1}(·,0)`,
-/// `v1 = V_{k+1}(·,1)` are the (partially folded) half-slices; the per-element
-/// gate value is `v0·v1`. Returns `(G(1), G(∞))` with `eq` supplied split as
-/// `eq_lo ⊗ eq_hi`.
-fn layer_round_message(v0: &[F128], v1: &[F128], eq: &SplitEqGhash) -> (F128, F128) {
-    let lo = &eq.lo;
-    let hi = &eq.hi;
-    let block = lo.len();
-    let n_blocks = hi.len();
-    debug_assert_eq!(block * n_blocks, v0.len() / 2);
-
-    let block_fn = |x_hi: usize| -> (F128, F128) {
-        let x_base = x_hi * block;
-        let (mut s1, mut s_inf) = (F128::ZERO, F128::ZERO);
-        for x_lo in 0..block {
-            let xp = x_base + x_lo;
-            let (i0, i1) = (2 * xp, 2 * xp + 1);
-            // value at x_i = 1 (odd slice), and the degree-2 leading coeff.
-            let v_one = v0[i1] * v1[i1];
-            let v_inf = (v0[i0] + v0[i1]) * (v1[i0] + v1[i1]);
-            let el = lo[x_lo];
-            s1 += el * v_one;
-            s_inf += el * v_inf;
-        }
-        let eh = hi[x_hi];
-        (eh * s1, eh * s_inf)
-    };
-
-    match crate::sumcheck_round_min_len(block * n_blocks, n_blocks) {
-        Some(min_len) => (0..n_blocks)
-            .into_par_iter()
-            .with_min_len(min_len)
-            .map(block_fn)
-            .reduce(
-                || (F128::ZERO, F128::ZERO),
-                |(o0, i0), (o1, i1)| (o0 + o1, i0 + i1),
-            ),
-        None => {
-            let (mut g_one, mut g_inf) = (F128::ZERO, F128::ZERO);
-            for x_hi in 0..n_blocks {
-                let (o, i) = block_fn(x_hi);
-                g_one += o;
-                g_inf += i;
-            }
-            (g_one, g_inf)
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Single product-circuit GKR (prover + verifier halves)
 // ---------------------------------------------------------------------------
 
-/// Prove `∏ v_in` with a product-circuit GKR. Observes the root + per-layer
-/// transcript into `ch`, returns `(top, layers, ρ)` where `ρ ∈ F^μ` is the
-/// final reduction point (so `V_μ(ρ) = v_in`'s MLE at ρ).
-fn prove_product<C: Challenger>(v_in: &[F128], ch: &mut C) -> (F128, Vec<LayerProof>, Vec<F128>) {
-    let mu = v_in.len().trailing_zeros() as usize;
-
-    // Build all layers, v_layers[k] has 2^k entries; v_layers[mu] = v_in.
-    let mut tt = std::time::Instant::now();
-    let mut v_layers: Vec<Vec<F128>> = vec![Vec::new(); mu + 1];
-    v_layers[mu] = v_in.to_vec();
-    for k in (0..mu).rev() {
-        v_layers[k] = build_layer(&v_layers[k + 1]);
-    }
-    let top = v_layers[0][0];
-    ch.observe_f128(top);
-    tp(&mut tt, "  build-layers");
-
-    let mut r_pt: Vec<F128> = Vec::new();
-    let mut layers = Vec::with_capacity(mu);
-    for k in 0..mu {
-        let h = 1usize << k;
-        let (mut s0, mut s1) = (Vec::new(), Vec::new());
-        let mut rounds = Vec::with_capacity(k);
-        let mut r_prime = Vec::with_capacity(k + 1);
-        for i in 0..k {
-            let eq = SplitEqGhash::new(&r_pt[i + 1..k]);
-            let rho;
-            if i == 0 {
-                let (v0s, v1s) = v_layers[k + 1].split_at(h);
-                let (g1, g_inf) = layer_round_message(v0s, v1s, &eq);
-                ch.observe_f128(g1);
-                ch.observe_f128(g_inf);
-                rho = ch.sample_f128();
-                rounds.push((g1, g_inf));
-                s0 = fold_borrowed(v0s, rho);
-                s1 = fold_borrowed(v1s, rho);
-            } else {
-                let (g1, g_inf) = layer_round_message(&s0, &s1, &eq);
-                ch.observe_f128(g1);
-                ch.observe_f128(g_inf);
-                rho = ch.sample_f128();
-                rounds.push((g1, g_inf));
-                fold_in_place(&mut s0, rho);
-                fold_in_place(&mut s1, rho);
-            }
-            r_prime.push(rho);
-        }
-        let (v0, v1) = if k == 0 {
-            (v_layers[1][0], v_layers[1][1])
-        } else {
-            (s0[0], s1[0])
-        };
-        ch.observe_f128(v0);
-        ch.observe_f128(v1);
-        layers.push(LayerProof { rounds, v0, v1 });
-
-        let c_k = ch.sample_f128();
-        r_prime.push(c_k);
-        r_pt = r_prime;
-    }
-    tp(&mut tt, "  layer-sumchecks");
-    (top, layers, r_pt)
-}
-
-/// Verify a single product circuit's GKR transcript. Returns the final input
-/// claim `V_μ(ρ)` and the point `ρ` (length `μ`).
-fn verify_product<C: Challenger>(
-    mu: usize,
-    top: F128,
-    layers: &[LayerProof],
-    ch: &mut C,
-) -> Result<(F128, Vec<F128>), VerifyError> {
-    if layers.len() != mu {
-        return Err(VerifyError::MalformedProof);
-    }
-    ch.observe_f128(top);
-
-    let mut v_claim = top;
-    let mut r_pt: Vec<F128> = Vec::new();
-    for (k, layer) in layers.iter().enumerate() {
-        if layer.rounds.len() != k {
-            return Err(VerifyError::MalformedProof);
-        }
-        let mut c_run = v_claim;
-        let mut r_prime = Vec::with_capacity(k + 1);
-        for i in 0..k {
-            let (g1, g_inf) = layer.rounds[i];
-            let r_eq = r_pt[i];
-            let one_plus_r_eq = F128::ONE + r_eq;
-            let g0 = (c_run + r_eq * g1) * one_plus_r_eq.inv();
-            ch.observe_f128(g1);
-            ch.observe_f128(g_inf);
-            let rho = ch.sample_f128();
-            r_prime.push(rho);
-            let one_plus_rho = F128::ONE + rho;
-            c_run = g0 * one_plus_rho + g1 * rho + g_inf * rho * one_plus_rho;
-        }
-
-        let (v0, v1) = (layer.v0, layer.v1);
-        ch.observe_f128(v0);
-        ch.observe_f128(v1);
-        if c_run != v0 * v1 {
-            return Err(VerifyError::LayerCheckFailed);
-        }
-
-        let c_k = ch.sample_f128();
-        let one_plus_c = F128::ONE + c_k;
-        v_claim = one_plus_c * v0 + c_k * v1;
-        r_prime.push(c_k);
-        r_pt = r_prime;
-    }
-    Ok((v_claim, r_pt))
-}
-
 // ---------------------------------------------------------------------------
 // Prover / Verifier (the permutation check)
 // ---------------------------------------------------------------------------
-
-/// Prove that `f, g` are related by `σ` via the two-product GKR. `f.len() ==
-/// g.len() == σ.len() == 2^μ`; `σ` must be a permutation. The caller must have
-/// absorbed `f, g, σ` into `ch`.
-pub fn prove<C: Challenger>(
-    f: &[F128],
-    g: &[F128],
-    sigma: &[usize],
-    ch: &mut C,
-) -> (ProductGkrProof, ProductGkrClaim) {
-    let n = f.len();
-    assert_eq!(g.len(), n);
-    assert_eq!(sigma.len(), n);
-    assert!(n.is_power_of_two() && n >= 2, "need N = 2^μ ≥ 2");
-    let mu = n.trailing_zeros() as usize;
-
-    let mut t = std::time::Instant::now();
-    ch.observe_label(DOMAIN);
-    let alpha = ch.sample_f128();
-    let beta = ch.sample_f128();
-
-    let basis = s_id_basis(mu);
-    let s_id_vec = build_s_id_vec(mu, &basis);
-    let s_sig_vec: Vec<F128> = sigma.par_iter().map(|&sx| s_id_vec[sx]).collect();
-
-    // lhs_i = f_i + α·s_id(i) + β,  rhs_i = g_i + α·s_σ(i) + β.
-    let lhs: Vec<F128> = f
-        .par_iter()
-        .zip(&s_id_vec)
-        .map(|(fx, sx)| *fx + alpha * *sx + beta)
-        .collect();
-    let rhs: Vec<F128> = g
-        .par_iter()
-        .zip(&s_sig_vec)
-        .map(|(gx, sx)| *gx + alpha * *sx + beta)
-        .collect();
-
-    tp(&mut t, "witness");
-    let (top_lhs, layers_lhs, rho_lhs) = prove_product(&lhs, ch);
-    tp(&mut t, "gkr(lhs)");
-    let (top_rhs, layers_rhs, rho_rhs) = prove_product(&rhs, ch);
-    tp(&mut t, "gkr(rhs)");
-
-    let f_eval = mle_eval(f, &rho_lhs);
-    let g_eval = mle_eval(g, &rho_rhs);
-    let s_sigma_eval = mle_eval(&s_sig_vec, &rho_rhs);
-    observe_evals(ch, &[f_eval, g_eval, s_sigma_eval]);
-    tp(&mut t, "mle-evals");
-
-    let proof = ProductGkrProof {
-        top_lhs,
-        top_rhs,
-        layers_lhs,
-        layers_rhs,
-        f_eval,
-        g_eval,
-        s_sigma_eval,
-    };
-    let claim = ProductGkrClaim {
-        rho_lhs,
-        rho_rhs,
-        f_eval,
-        g_eval,
-        s_sigma_eval,
-    };
-    (proof, claim)
-}
-
-/// Verify a product-GKR permutation proof for `N = 2^mu`. The caller must have
-/// absorbed the same `f, g, σ` binding into `ch` as the prover did.
-pub fn verify<C: Challenger>(
-    mu: usize,
-    proof: &ProductGkrProof,
-    ch: &mut C,
-) -> Result<ProductGkrClaim, VerifyError> {
-    ch.observe_label(DOMAIN);
-    let alpha = ch.sample_f128();
-    let beta = ch.sample_f128();
-
-    let (v_lhs, rho_lhs) = verify_product(mu, proof.top_lhs, &proof.layers_lhs, ch)?;
-    let (v_rhs, rho_rhs) = verify_product(mu, proof.top_rhs, &proof.layers_rhs, ch)?;
-
-    // The two grand products must agree.
-    if proof.top_lhs != proof.top_rhs {
-        return Err(VerifyError::ProductMismatch);
-    }
-
-    // Input-layer checks: V_μ(ρ) must equal the affine input value.
-    let basis = s_id_basis(mu);
-    let lhs_in = proof.f_eval + alpha * s_id_eval(&basis, &rho_lhs) + beta;
-    let rhs_in = proof.g_eval + alpha * proof.s_sigma_eval + beta;
-    if v_lhs != lhs_in || v_rhs != rhs_in {
-        return Err(VerifyError::InputMismatch);
-    }
-
-    observe_evals(ch, &[proof.f_eval, proof.g_eval, proof.s_sigma_eval]);
-
-    Ok(ProductGkrClaim {
-        rho_lhs,
-        rho_rhs,
-        f_eval: proof.f_eval,
-        g_eval: proof.g_eval,
-        s_sigma_eval: proof.s_sigma_eval,
-    })
-}
 
 fn observe_evals<C: Challenger>(ch: &mut C, evals: &[F128; 3]) {
     for e in evals {
@@ -2542,48 +2233,6 @@ mod tests {
         }
     }
 
-    fn run_prove(f: &[F128], g: &[F128], sigma: &[usize]) -> (ProductGkrProof, ProductGkrClaim) {
-        let mut ch = FsChallenger::new(b"product-gkr-test");
-        bind(&mut ch, f, g, sigma);
-        prove(f, g, sigma, &mut ch)
-    }
-
-    fn run_verify(
-        mu: usize,
-        f: &[F128],
-        g: &[F128],
-        sigma: &[usize],
-        proof: &ProductGkrProof,
-    ) -> Result<ProductGkrClaim, VerifyError> {
-        let mut ch = FsChallenger::new(b"product-gkr-test");
-        bind(&mut ch, f, g, sigma);
-        verify(mu, proof, &mut ch)
-    }
-
-    #[test]
-    fn honest_roundtrip_and_claim_match() {
-        for mu in 1..=10 {
-            let (f, g, sigma) = honest_instance(mu, 0xC0FFEE ^ mu as u64);
-            let (proof, claim_p) = run_prove(&f, &g, &sigma);
-            assert_eq!(proof.top_lhs, proof.top_rhs, "μ={mu}: ∏lhs ≠ ∏rhs");
-            let claim_v = run_verify(mu, &f, &g, &sigma, &proof).expect("verify");
-            assert_eq!(claim_p, claim_v, "μ={mu}: prover/verifier claim mismatch");
-        }
-    }
-
-    #[test]
-    fn claim_matches_direct_mle() {
-        let mu = 8;
-        let (f, g, sigma) = honest_instance(mu, 0xABCD);
-        let (_proof, claim) = run_prove(&f, &g, &sigma);
-        // f at ρ_lhs, g and s_σ at ρ_rhs match direct MLE evals.
-        let basis = s_id_basis(mu);
-        let s_sig: Vec<F128> = (0..f.len()).map(|x| s_id_value(sigma[x], &basis)).collect();
-        assert_eq!(claim.f_eval, mle_eval(&f, &claim.rho_lhs));
-        assert_eq!(claim.g_eval, mle_eval(&g, &claim.rho_rhs));
-        assert_eq!(claim.s_sigma_eval, mle_eval(&s_sig, &claim.rho_rhs));
-    }
-
     /// `prove_batched` builds its `s_id` tags by widening the index instead of
     /// expanding the basis into an `O(N)` table. Pin the two against each other,
     /// including the `build_s_id_vec` table `prove` still uses.
@@ -2623,35 +2272,6 @@ mod tests {
                 "μ={mu}: s_σ"
             );
         }
-    }
-
-    #[test]
-    fn non_permutation_relation_rejected() {
-        // σ = identity but f ≠ g ⇒ the two products differ ⇒ reject.
-        let mu = 6;
-        let n = 1usize << mu;
-        let mut rng = Rng::new(0x1234);
-        let f: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
-        let mut g = f.clone();
-        g[3] += F128::ONE; // break the multiset equality
-        let sigma: Vec<usize> = (0..n).collect();
-        let (proof, _) = run_prove(&f, &g, &sigma);
-        // The grand products no longer match.
-        assert_ne!(proof.top_lhs, proof.top_rhs);
-        let res = run_verify(mu, &f, &g, &sigma, &proof);
-        assert_eq!(res, Err(VerifyError::ProductMismatch));
-    }
-
-    #[test]
-    fn mis_permuted_witness_rejected() {
-        // A valid permutation but a corrupted witness (not constant on a cycle)
-        // ⇒ products differ ⇒ reject.
-        let mu = 7;
-        let (mut f, g, sigma) = honest_instance(mu, 0x5151);
-        f[5] += F128::ONE;
-        let (proof, _) = run_prove(&f, &g, &sigma);
-        let res = run_verify(mu, &f, &g, &sigma, &proof);
-        assert!(res.is_err());
     }
 
     /// A witness constant on every σ-cycle (so the two grand products match).
@@ -2785,19 +2405,6 @@ mod tests {
         bad_rounds.layers[mu - 1].rounds.pop();
         assert_eq!(
             verify_shape(&bad_rounds, mu),
-            Err(VerifyError::MalformedProof)
-        );
-
-        // Same for the unbatched verifier.
-        let mut chp = FsChallenger::new(b"prod-gkr-shape");
-        bind(&mut chp, &f, &g, &sigma);
-        let (plain, _) = prove(&f, &g, &sigma, &mut chp);
-        let mut trimmed = plain.clone();
-        trimmed.layers_lhs.pop();
-        let mut ch = FsChallenger::new(b"prod-gkr-shape");
-        bind(&mut ch, &f, &g, &sigma);
-        assert_eq!(
-            verify(mu, &trimmed, &mut ch),
             Err(VerifyError::MalformedProof)
         );
     }

@@ -30,7 +30,6 @@ pub mod matrix_fold;
 pub mod merkle;
 pub mod ntt;
 pub mod pcs;
-pub mod permutation;
 pub mod product_gkr;
 pub mod proof;
 pub mod r1cs;

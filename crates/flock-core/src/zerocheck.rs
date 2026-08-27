@@ -28,8 +28,6 @@ use serde::{Deserialize, Serialize};
 pub mod ag_skip;
 pub mod multilinear;
 pub mod univariate_skip;
-pub mod univariate_skip_deg4;
-pub mod univariate_skip_deg4_optimized;
 pub mod univariate_skip_optimized;
 
 use multilinear::{
