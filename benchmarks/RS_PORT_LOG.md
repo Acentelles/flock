@@ -2248,3 +2248,26 @@ Consequence for future work: same-binary feature A/B is gone for these
 — use two-binary git-arm A/Bs. Post-cleanup sanity run: 472.75 ms warm
 with all certified defaults engaged; suite 353 + proof-identity +
 compact-K oracles green.
+
+### Streamed witness→prep NULL — the strongest bandwidth-on-bandwidth
+confirmation of the campaign (2026-08-27 evening)
+
+Built the streamed round-1 prep (Benedikt-directed try): witness groups
+publish completion on a channel; two utility-QoS E-threads run the
+matching prep chunks (contiguous a/b regions — prefix-friendly, unlike
+the commit's strided first pass, whose literal streaming caps at ~4ms
+and was ruled out on inspection); the commit-window prep arm finishes
+the remainder. IT WORKED MECHANICALLY: prep arm 97→18 (80% streamed),
+commit join wall 261→182-194, witness bucket flat, roundtrip+verify
+green. BUT totals 465→690-710 (+240!). Discrimination: zero consumers
+→ normal; no-op consumers (threads+channel, no work) → normal;
+prefaulter QoS raised → no change. VERDICT: the prep's memory work on
+2 E-cores during the WRITE-SATURATED witness window collapses the
+P-pool's streaming throughput — ~60 thread-ms of E work costs ~240
+wall-ms (reads of freshly-written a/b lines add coherence traffic on
+top of 512MB of competing stores). 5th bandwidth-on-bandwidth
+confirmation, and the sharpest: the same E-cores+prep pairing that WINS
+inside the commit window (AB-hoist, certified) is catastrophic inside
+the witness window. E-core value is entirely window-boundedness-
+dependent. Reverted; patch (631 lines incl. chunked prep API) in
+scratchpad/streamed_prep.patch.
