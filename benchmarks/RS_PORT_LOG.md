@@ -1730,3 +1730,24 @@ final NTT + lazy OOD eq) — parked per Benedikt for the M3/M4 revisit,
 now cleanly the next item if unparked. Loop-1 of the joint phase is
 CLOSED: mechanism identified from their honest numbers, algebra
 re-derived, ported in four verified units, certified same-day.
+
+## Open residual, loop 2 opened: our own floor first (2026-08-26, midnight)
+
+Peer's honest ST decomposition of their open (113-126 total): ring-switch
+tail 0.5 / combine 0 / initial sumcheck 38-51 / recursive commits ~58 /
+induce 11.2 / OOD 0.8. Verdict: their commits are NOT near-zero (parity
+with ours per-thread); their edge concentrates in the small stages —
+which on OUR side were self-inflicted. Three local fixes, all
+transcript-identical (identity test green each step):
+1. W-state via fold byte table (was a 128-bit scan/element): tail 8.7→6.6
+2. COMPOSED f-fold — unique to the direct path: messages never touch f,
+   so all initial_k challenges bind in one 2^k→1 pass (~2L→~1.03L
+   traffic): initial sumcheck 26.4→19.6
+3. Parallelized bank transposes + reconstruction: tail 6.6→1.4 (their
+   floor: 0.5)
+OPEN: 64.1 (certified) → 47.6 ms at m=32 8T. Remaining deltas vs their
+MT-scaled ~25: initial ~−10 (drill the 19.6), induce −4.5 (their
+truncated-final-NTT — exact, requires log_inv_rate==1, fused round-msg
+variant), OOD −2.8 (lazy split-eq + glue fused into the next fold),
+commits ≈ parity. Their two extras' full anatomy is on file (their
+message, ligerito.rs refs).
