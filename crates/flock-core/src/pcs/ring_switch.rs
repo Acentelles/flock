@@ -4102,3 +4102,221 @@ mod direct_tests {
         }
     }
 }
+
+/// One claim's direct-open state: the transposed banked statistic and the
+/// basis-side W-state, both `128 × n_banks` bit-major, both folding
+/// F128-linearly on the bank index at the L0 sumcheck's challenges. The
+/// transpose happens ONCE, before any binding — bits of the original bank
+/// values are exact F₂ data; all later operations are F128-linear, which is
+/// what makes the fold sound. This claim's `γ` is baked into `w` at
+/// construction, so message contributions and the exit generators of
+/// several claims simply add.
+#[derive(Clone, Debug)]
+pub struct DirectBasisClaim {
+    /// `a[b·n + e] = Σ_β bit_b(banks[e][β])·x^β` (per-bank tensor-algebra
+    /// transpose), folded in place as rounds bind.
+    a: Vec<F128>,
+    /// `w[b·n + e] = γ·φ(lo(e)·x^b)`, folded in lockstep with `a`.
+    w: Vec<F128>,
+    n_banks: usize,
+}
+
+impl DirectBasisClaim {
+    pub fn new(
+        banked: &BankedShatV,
+        lo_eq: &[F128],
+        eq_r_dprime: &[F128],
+        gamma: F128,
+    ) -> Self {
+        let n = banked.banks.len();
+        assert_eq!(lo_eq.len(), n);
+        let np = 1usize << LOG_PACKING;
+        let mut a = vec![F128::ZERO; np * n];
+        for (e, bank) in banked.banks.iter().enumerate() {
+            let bank_u = tensor_algebra_transpose(bank);
+            for b in 0..np {
+                a[b * n + e] = bank_u[b];
+            }
+        }
+        let mut w = direct_w_state(lo_eq, eq_r_dprime);
+        for v in w.iter_mut() {
+            *v *= gamma;
+        }
+        Self { a, w, n_banks: n }
+    }
+
+    /// This claim's `(u_0, u_2)` contribution for the current round (X = the
+    /// bank LSB): the usual quadratic evaluations, with each "product" a
+    /// 128-term inner product over the slice axis.
+    pub fn round_msg(&self) -> (F128, F128) {
+        let n = self.n_banks;
+        debug_assert!(n >= 2);
+        let np = 1usize << LOG_PACKING;
+        let half = n / 2;
+        let mut u_0 = F128::ZERO;
+        let mut u_2 = F128::ZERO;
+        for e in 0..half {
+            for b in 0..np {
+                let a0 = self.a[b * n + 2 * e];
+                let a1 = self.a[b * n + 2 * e + 1];
+                let w0 = self.w[b * n + 2 * e];
+                let w1 = self.w[b * n + 2 * e + 1];
+                u_0 += a0 * w0;
+                u_2 += (a0 + a1) * (w0 + w1);
+            }
+        }
+        (u_0, u_2)
+    }
+
+    /// Bind the current bank LSB at `rho` (both states, in place).
+    pub fn fold(&mut self, rho: F128) {
+        let n = self.n_banks;
+        debug_assert!(n >= 2);
+        let np = 1usize << LOG_PACKING;
+        let half = n / 2;
+        for b in 0..np {
+            for e in 0..half {
+                let a0 = self.a[b * n + 2 * e];
+                let a1 = self.a[b * n + 2 * e + 1];
+                self.a[b * half + e] = a0 + rho * (a1 + a0);
+            }
+        }
+        for b in 0..np {
+            for e in 0..half {
+                let w0 = self.w[b * n + 2 * e];
+                let w1 = self.w[b * n + 2 * e + 1];
+                self.w[b * half + e] = w0 + rho * (w1 + w0);
+            }
+        }
+        self.a.truncate(np * half);
+        self.w.truncate(np * half);
+        self.n_banks = half;
+    }
+
+    /// After all bank coordinates are bound: the byte-map generator vector
+    /// `G[b] = (folded w)[b]`. The claim's residual basis over the high
+    /// coords is `b¹[h] = Σ_b bit_b(hi(h))·G[b]` — `fold_b128_elems` with
+    /// `G` as the weight vector (γ already baked in).
+    pub fn exit_generators(&self) -> Vec<F128> {
+        assert_eq!(self.n_banks, 1, "exit before all bank coords bound");
+        self.w.clone()
+    }
+}
+
+#[cfg(test)]
+mod direct_state_tests {
+    use super::*;
+    use crate::pcs::pack::pack_witness;
+
+    struct Rng(u64);
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^ (z >> 31)
+        }
+        fn f128(&mut self) -> F128 {
+            F128 { lo: self.next_u64(), hi: self.next_u64() }
+        }
+        fn bits(&mut self, n: usize) -> Vec<bool> {
+            (0..n).map(|_| self.next_u64() & 1 == 1).collect()
+        }
+    }
+
+    /// THE oracle for the direct path: two γ-batched claims at m=13, run the
+    /// first `c` L0 sumcheck rounds both ways — dense (materialized
+    /// `Σ γ_k·rs_eq_ind_k`, `round_msg_lsb`-style messages, dense folds) and
+    /// direct (banked states) — asserting message equality every round, and
+    /// the materialized residual basis at exit equals the dense basis folded
+    /// `c` times.
+    #[test]
+    fn direct_states_match_dense_through_c_rounds() {
+        let mut rng = Rng::new(0xD12EC7);
+        for &(m, c) in &[(13usize, 3usize), (13, 5), (14, 4)] {
+            let l = 1usize << (m - LOG_PACKING);
+            let z = rng.bits(1 << m);
+            let f = pack_witness(&z, m);
+
+            // Two claims with independent points, r'' and γ.
+            let mut dense_b = vec![F128::ZERO; l];
+            let mut direct: Vec<DirectBasisClaim> = Vec::new();
+            let mut suffixes: Vec<Vec<F128>> = Vec::new();
+            let mut gens_weights: Vec<F128> = Vec::new();
+            let _ = &mut gens_weights;
+            for k in 0..2 {
+                let suffix: Vec<F128> =
+                    (0..(m - LOG_PACKING)).map(|_| rng.f128()).collect();
+                let r_dprime: Vec<F128> = (0..LOG_PACKING).map(|_| rng.f128()).collect();
+                let eq_r_dprime = build_eq(&r_dprime);
+                let gamma = rng.f128();
+
+                let suffix_tensor = build_eq(&suffix);
+                let rs = fold_b128_elems_naive(&suffix_tensor, &eq_r_dprime);
+                for (dst, v) in dense_b.iter_mut().zip(rs.iter()) {
+                    *dst += gamma * *v;
+                }
+
+                let banked = banked_s_hat_v_naive(&f, &suffix, c);
+                let lo_eq = build_eq(&suffix[..c]);
+                direct.push(DirectBasisClaim::new(&banked, &lo_eq, &eq_r_dprime, gamma));
+                suffixes.push(suffix);
+                let _ = k;
+            }
+
+            // Run c rounds: message equality + lockstep folds.
+            let mut f_run = f.clone();
+            let mut b_run = dense_b.clone();
+            let mut rhos = Vec::new();
+            for r in 0..c {
+                // Dense message.
+                let half = f_run.len() / 2;
+                let (mut u0_d, mut u2_d) = (F128::ZERO, F128::ZERO);
+                for j in 0..half {
+                    let (f0, f1) = (f_run[2 * j], f_run[2 * j + 1]);
+                    let (b0, b1) = (b_run[2 * j], b_run[2 * j + 1]);
+                    u0_d += f0 * b0;
+                    u2_d += (f0 + f1) * (b0 + b1);
+                }
+                // Direct message: sum of per-claim contributions.
+                let (mut u0, mut u2) = (F128::ZERO, F128::ZERO);
+                for cl in direct.iter() {
+                    let (a0, a2) = cl.round_msg();
+                    u0 += a0;
+                    u2 += a2;
+                }
+                assert_eq!((u0, u2), (u0_d, u2_d), "round {r} msg mismatch (m={m},c={c})");
+
+                let rho = rng.f128();
+                rhos.push(rho);
+                for cl in direct.iter_mut() {
+                    cl.fold(rho);
+                }
+                let mut nf = vec![F128::ZERO; half];
+                let mut nb = vec![F128::ZERO; half];
+                for j in 0..half {
+                    nf[j] = f_run[2 * j] + rho * (f_run[2 * j + 1] + f_run[2 * j]);
+                    nb[j] = b_run[2 * j] + rho * (b_run[2 * j + 1] + b_run[2 * j]);
+                }
+                f_run = nf;
+                b_run = nb;
+            }
+
+            // Exit: residual basis from generators equals the dense b folded c times.
+            let mut b1 = vec![F128::ZERO; l >> c];
+            for (cl, suffix) in direct.iter().zip(suffixes.iter()) {
+                let gens = cl.exit_generators();
+                let hi_tensor = build_eq(&suffix[c..]);
+                let part = fold_b128_elems_naive(&hi_tensor, &gens);
+                for (dst, v) in b1.iter_mut().zip(part.iter()) {
+                    *dst += *v;
+                }
+            }
+            assert_eq!(b1, b_run, "residual basis mismatch (m={m},c={c})");
+        }
+    }
+}
