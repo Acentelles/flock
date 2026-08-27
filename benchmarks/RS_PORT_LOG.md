@@ -1613,3 +1613,23 @@ Value: open 96.5→~25 MT (−72), 600→~123 ST (−477) at m=32 if the full
 mechanism transfers. Gates: shape-exact like theirs initially, widen
 after certification. Estimated size: 400-700 lines, the campaign's
 largest port; algebra to re-derive, not copy.
+
+### The algebra (for the port; doc gets it on certification)
+
+Claim k: ⟨f, B_k⟩ = t_k with B_k[i] = γ_k·Π_j eq(u_j, i_j) — RANK-1.
+Split i = (e,h) ∈ {0,1}^c × {0,1}^(ℓ−c): B_k = γ_k·lo_k(e)·hi_k(h).
+Statistic: G_k[e] = Σ_h f[(e,h)]·hi_k(h) ∈ F^{2^c} — computed free where
+f already streams (lincheck z-fold for AB, zc r1 extraction for C; our
+s_hat_v captures are the c=0 case). Target t_k = γ_k Σ_e lo_k(e)G_k[e].
+Rounds r<c fold G bank-wise (G'[e'] = G[0e'] + ρ(G[1e']+G[0e'])) and
+update lo_k's eq factor; messages are the usual quadratics over 2^(c−r)
+terms instead of L/2^(r+1). After c binds the surviving bank collapses
+into the byte-map generator (their W[b,d] = Φ(low_eq[d]·x^b)); rejoin
+incumbent. Deleted: the basis' O(L) life ≈ 4L element-ops + traffic
+(alloc + γ-sweep + c rounds of length-L folds). f's own folds remain
+(needed downstream). Same field elements throughout ⇒ transcript
+bit-identical ⇒ proof-bytes equality is the port's correctness test.
+Their fold4 H[e,d] = Σ_h f[16h+e]B_k[16h+d] = the same object with the
+basis low factor pre-multiplied. Conceptually: the table-vs-fold rule's
+endpoint — one resident rank-1 object ⇒ contract once, never
+materialize the map.
