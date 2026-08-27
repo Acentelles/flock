@@ -1751,3 +1751,13 @@ truncated-final-NTT — exact, requires log_inv_rate==1, fused round-msg
 variant), OOD −2.8 (lazy split-eq + glue fused into the next fold),
 commits ≈ parity. Their two extras' full anatomy is on file (their
 message, ligerito.rs refs).
+
+### Micro-fixes PAIRED-CERTIFIED (correcting the single-sample claim above)
+
+Benedikt asked whether 64.1→47.6 was measured or estimated — it was
+single-sample traces across different windows. Proper two-binary paired
+A/B (3 pairs, alternating, head rebuilt after): open 45.5-50.4 vs
+59.7-61.3 — 3/3 DISJOINT, −12.1 avg (−20%); totals 492.5-511.1 vs
+516.0-538.2, 3/3. The honest certified delta for the three micro-fixes
+is −12 (not −16.5: the pre-fix arm reads 60.4 in this window, not the
+earlier quiet-window 64.1). Best this window: 492.53 ms / 532.2k c/s.
