@@ -1707,3 +1707,26 @@ sample at 80.8ms — BELOW the clean dense floor (96.5), proving
 engagement with real producers and sub-incumbent cost. Certification
 A/B (target: open 96.5→~25 MT, 600→~123 ST) deferred to a quiet window;
 the gate stays opt-in (FLOCK_OPEN_DIRECT=1) until then.
+
+## DIRECT OPEN CERTIFIED, DEFAULT ON — campaign record (2026-08-26 23:09)
+
+Quiet window (the self-arming gate fired as the machine went idle).
+3 MT pairs + 1 ST pair, alternating, kill-switched same binary:
+
+| | direct | dense | verdict |
+|---|---|---|---|
+| MT open | 59.5-72.1 | 94.3-100.2 | 3/3 disjoint, −33 avg |
+| MT zc | 121.6-126.7 | 127.0-133.0 | no regression (3/3 better) |
+| MT best | 484.3-518.4 | 527.4-543.1 | 3/3, avg −32.5 |
+| ST open | 210.0 | 614.2 | −404 |
+| ST best | 3.37s | 3.74s | −370 |
+
+**Best prove 484.25 ms / 541,336 c/s — the campaign's best m=32 reading.**
+Headline vs their scored ~397: ≈1.22×, from 1.36× this morning (the
+cascade + direct open together). DEFAULT ON (FLOCK_NO_OPEN_DIRECT=1
+kills). The residual open gap (+39 MT / +87 ST vs their honest 24.9/123)
+= the unported ranked-open extras (their exact-shape-gated truncated
+final NTT + lazy OOD eq) — parked per Benedikt for the M3/M4 revisit,
+now cleanly the next item if unparked. Loop-1 of the joint phase is
+CLOSED: mechanism identified from their honest numbers, algebra
+re-derived, ported in four verified units, certified same-day.
