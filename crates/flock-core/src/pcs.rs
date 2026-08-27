@@ -161,10 +161,13 @@ pub use commit::{
     Commitment, PcsParams, ProverData, commit, commit_into, prefault_codeword_during,
 };
 
-/// Opt-in force for the direct (basis-free) opening, equivalent to
-/// `FLOCK_OPEN_DIRECT=1` — exists for paired within-process A/B and the
-/// proof-identity test. Off by default until certified.
-pub static OPEN_DIRECT_FORCE: std::sync::atomic::AtomicBool =
+/// A/B kill switch for the direct (basis-free) opening, DEFAULT ON —
+/// certified 2026-08-26: m=32 open 97.4→64.1 MT (3/3 disjoint) and
+/// 614→210 ST, end-to-end best 484.25 ms (campaign record), transcript
+/// byte-identical by test. `FLOCK_NO_OPEN_DIRECT=1` is the production
+/// kill switch; the AtomicBool exists for paired within-process A/B and
+/// the proof-identity test.
+pub static OPEN_DIRECT_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 pub use pack::{LOG_PACKING, pack_witness, unpack_witness};
 pub use ring_switch::{RingSwitchProof, SparseEqTensor};
@@ -298,8 +301,8 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v_banked<Ch: Challenger>
 
     // Direct (basis-free) opening gate: opt-in while it certifies. The
     // banked region must span exactly the lane folds, so c = initial_k.
-    let direct_on = std::env::var_os("FLOCK_OPEN_DIRECT").is_some()
-        || OPEN_DIRECT_FORCE.load(std::sync::atomic::Ordering::Relaxed);
+    let direct_on = !(std::env::var_os("FLOCK_NO_OPEN_DIRECT").is_some()
+        || OPEN_DIRECT_DISABLE.load(std::sync::atomic::Ordering::Relaxed));
     let direct_c = if direct_on && packed_direct.is_empty() {
         lig_config.initial_k
     } else {
@@ -1279,8 +1282,8 @@ mod tests {
         let z_packed = pack_witness(&z, m);
         let (commitment, prover_data) = commit(&z_packed, &params);
 
-        let open = |force: bool| -> BatchOpeningProofLigerito {
-            OPEN_DIRECT_FORCE.store(force, Ordering::Relaxed);
+        let open = |direct: bool| -> BatchOpeningProofLigerito {
+            OPEN_DIRECT_DISABLE.store(!direct, Ordering::Relaxed);
             let mut ch = FsChallenger::new(b"flock-test-lig-v0");
             let proof = open_batch_mixed_ligerito_with_precomputed_s_hat_v(
                 z_packed.clone(),
@@ -1293,7 +1296,7 @@ mod tests {
                 &lig_p_cfg,
                 &mut ch,
             );
-            OPEN_DIRECT_FORCE.store(false, Ordering::Relaxed);
+            OPEN_DIRECT_DISABLE.store(false, Ordering::Relaxed);
             proof
         };
         let proof_dense = open(false);
