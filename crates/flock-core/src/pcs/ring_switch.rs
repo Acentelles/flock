@@ -3852,3 +3852,253 @@ mod tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Direct (basis-free) opening: banked sufficient statistics.
+//
+// Idea re-derived from the challenge tree's ranked open. The ring-switch
+// basis is `B[i] = φ(S[i])` with `S` the rank-1 suffix eq-tensor and
+// `φ(u) = Σ_b bit_b(u)·E[b]` (`E = build_eq(r'')`) — F₂-linear. Retaining
+// the lowest `c` word coordinates of the `s_hat_v` contraction unfolded
+// gives per-bank slice statistics from which the Ligerito L0 sumcheck's
+// first `c` round messages — and the folded basis at the level-1 boundary —
+// derive without ever materializing the O(L) basis. All objects here are
+// `128 × 2^c` — small-data; the O(L) work this replaces is the basis'
+// entire life (rs_eq_ind fold, combine sweep, per-round folds).
+//
+// Identities (each pinned by a test below):
+//   s_hat_v[β]      = Σ_e lo(e) · banks[e][β]
+//   sumcheck_claim  = Σ_e Σ_β x^β · Σ_b bit_b(banks[e][β]) · W[b,e],
+//                     W[b,e] = φ(lo(e)·x^b)
+// ---------------------------------------------------------------------------
+
+/// Banked slice-MLE statistic: `banks[e][β] = Σ_h bit_β(f[(e,h)])·hi(h)`,
+/// where the word index splits as `i = e + 2^c·h` (bank `e` = the lowest `c`
+/// suffix coordinates, retained; `hi` = the eq tensor of `suffix[c..]`).
+/// `2^c × 128` field elements — small for every practical `c`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BankedShatV {
+    pub banks: Vec<Vec<F128>>,
+}
+
+/// `x^b` in the polynomial basis (bit `b` set).
+#[inline]
+pub(crate) fn x_pow(b: usize) -> F128 {
+    debug_assert!(b < 128);
+    if b < 64 {
+        F128 { lo: 1u64 << b, hi: 0 }
+    } else {
+        F128 { lo: 0, hi: 1u64 << (b - 64) }
+    }
+}
+
+/// `φ(u) = Σ_b bit_b(u)·eq_r_dprime[b]` — one element of `fold_b128_elems`.
+#[inline]
+pub(crate) fn phi_apply(u: F128, eq_r_dprime: &[F128]) -> F128 {
+    debug_assert_eq!(eq_r_dprime.len(), 1 << LOG_PACKING);
+    let mut acc = F128::ZERO;
+    for b in 0..64 {
+        if (u.lo >> b) & 1 == 1 {
+            acc += eq_r_dprime[b];
+        }
+        if (u.hi >> b) & 1 == 1 {
+            acc += eq_r_dprime[64 + b];
+        }
+    }
+    acc
+}
+
+/// Reference producer straight from the packed witness (test oracle and the
+/// generic fallback): one strided bit-scan of `f`, hi-tensor weighted.
+pub fn banked_s_hat_v_naive(packed_witness: &[F128], suffix: &[F128], c: usize) -> BankedShatV {
+    let l = packed_witness.len();
+    assert_eq!(l, 1usize << suffix.len());
+    assert!(c <= suffix.len());
+    let n_banks = 1usize << c;
+    let hi = build_eq(&suffix[c..]);
+    let mut banks = vec![vec![F128::ZERO; 1 << LOG_PACKING]; n_banks];
+    for (h, &w) in hi.iter().enumerate() {
+        for e in 0..n_banks {
+            let u = packed_witness[e + (h << c)];
+            let bank = &mut banks[e];
+            for b in 0..64 {
+                if (u.lo >> b) & 1 == 1 {
+                    bank[b] += w;
+                }
+                if (u.hi >> b) & 1 == 1 {
+                    bank[64 + b] += w;
+                }
+            }
+        }
+    }
+    BankedShatV { banks }
+}
+
+/// Banked variant of [`s_hat_v_from_z_vec`]: same reassociation of lincheck's
+/// pre-sumcheck partial fold, but the lowest `c` tail coordinates stay
+/// unfolded as the bank index. `Σ_e eq(tail[..c], e)·banks[e]` reproduces
+/// `s_hat_v_from_z_vec(z_vec, tail)` exactly (tested). Cost: identical scan
+/// of the (small) `z_vec`, `2^c` accumulator rows.
+pub fn banked_s_hat_v_from_z_vec(
+    z_vec: &[F128],
+    x_inner_rest_tail: &[F128],
+    c: usize,
+) -> BankedShatV {
+    let n_packed = 1usize << LOG_PACKING;
+    let n_tail = 1usize << x_inner_rest_tail.len();
+    assert_eq!(z_vec.len(), n_packed * n_tail);
+    assert!(c <= x_inner_rest_tail.len());
+    let n_banks = 1usize << c;
+    let eq_hi_tail = build_eq(&x_inner_rest_tail[c..]);
+    let mut banks = vec![vec![F128::ZERO; n_packed]; n_banks];
+    for (k, &w) in eq_hi_tail.iter().enumerate() {
+        for e in 0..n_banks {
+            let block = &z_vec[(e + (k << c)) * n_packed..(e + (k << c) + 1) * n_packed];
+            let bank = &mut banks[e];
+            for b in 0..n_packed {
+                bank[b] += w * block[b];
+            }
+        }
+    }
+    BankedShatV { banks }
+}
+
+/// The basis-side state: `w[b·2^c + e] = φ(lo_eq[e]·x^b)` — every column the
+/// image of one in-word basis vector under "multiply by the bank's low-eq
+/// factor, then ring-switch". Bit-major so a fold over the bank index is a
+/// contiguous in-place pair-fold per `b` row. Built at open time (needs
+/// `r''`); `128·2^c` elements.
+pub fn direct_w_state(lo_eq: &[F128], eq_r_dprime: &[F128]) -> Vec<F128> {
+    let n_banks = lo_eq.len();
+    let mut w = vec![F128::ZERO; (1 << LOG_PACKING) * n_banks];
+    for b in 0..(1 << LOG_PACKING) {
+        let xb = x_pow(b);
+        for (e, &lo) in lo_eq.iter().enumerate() {
+            w[b * n_banks + e] = phi_apply(lo * xb, eq_r_dprime);
+        }
+    }
+    w
+}
+
+/// The BaseFold target from the banked statistic and W-state:
+/// `Σ_e Σ_β x^β · Σ_b bit_b(banks[e][β]) · W[b,e]` — equals
+/// `⟨transpose(s_hat_v), eq(r'')⟩` (the incumbent `sumcheck_claim`) exactly.
+pub fn direct_claim_from_banks(banked: &BankedShatV, w_state: &[F128]) -> F128 {
+    let n_banks = banked.banks.len();
+    assert_eq!(w_state.len(), (1 << LOG_PACKING) * n_banks);
+    let mut acc = F128::ZERO;
+    for (e, bank) in banked.banks.iter().enumerate() {
+        for (beta, &u) in bank.iter().enumerate() {
+            let mut inner = F128::ZERO;
+            for b in 0..64 {
+                if (u.lo >> b) & 1 == 1 {
+                    inner += w_state[b * n_banks + e];
+                }
+                if (u.hi >> b) & 1 == 1 {
+                    inner += w_state[(64 + b) * n_banks + e];
+                }
+            }
+            acc += x_pow(beta) * inner;
+        }
+    }
+    acc
+}
+
+#[cfg(test)]
+mod direct_tests {
+    use super::*;
+    use crate::pcs::pack::pack_witness;
+
+    struct Rng(u64);
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^ (z >> 31)
+        }
+        fn f128(&mut self) -> F128 {
+            F128 { lo: self.next_u64(), hi: self.next_u64() }
+        }
+        fn bits(&mut self, n: usize) -> Vec<bool> {
+            (0..n).map(|_| self.next_u64() & 1 == 1).collect()
+        }
+    }
+
+    /// `Σ_e lo(e)·banks[e]` reproduces the flat `s_hat_v` (fold_1b_rows).
+    #[test]
+    fn banked_reconstructs_s_hat_v() {
+        let mut rng = Rng::new(0xD1BA);
+        for &(m, c) in &[(12usize, 3usize), (13, 5), (14, 0)] {
+            let z = rng.bits(1 << m);
+            let packed = pack_witness(&z, m);
+            let suffix: Vec<F128> = (0..(m - LOG_PACKING)).map(|_| rng.f128()).collect();
+            let suffix_tensor = build_eq(&suffix);
+            let want = fold_1b_rows_naive(&packed, &suffix_tensor);
+
+            let banked = banked_s_hat_v_naive(&packed, &suffix, c);
+            let lo_eq = build_eq(&suffix[..c]);
+            let mut got = vec![F128::ZERO; 1 << LOG_PACKING];
+            for (e, bank) in banked.banks.iter().enumerate() {
+                for (b, &v) in bank.iter().enumerate() {
+                    got[b] += lo_eq[e] * v;
+                }
+            }
+            assert_eq!(got, want, "reconstruction mismatch at m={m}, c={c}");
+        }
+    }
+
+    /// Banked-from-z_vec equals banked-from-witness (mirrors the flat
+    /// `s_hat_v_from_z_vec` identity test, bank-resolved).
+    #[test]
+    fn banked_from_z_vec_matches_naive() {
+        use crate::lincheck::{pack_z_lincheck, partial_fold_packed_z};
+        const K_SKIP: usize = 6;
+        let mut rng = Rng::new(0xBA2C);
+        for &(m, k_log, c) in &[(13usize, 10usize, 2usize), (15, 11, 3), (17, 13, 5)] {
+            let n_log = m - k_log;
+            let z = rng.bits(1 << m);
+            let packed = pack_witness(&z, m);
+            let z_packed_lincheck = pack_z_lincheck(&z, m, k_log);
+            let x_inner_rest: Vec<F128> = (0..(k_log - K_SKIP)).map(|_| rng.f128()).collect();
+            let x_outer: Vec<F128> = (0..n_log).map(|_| rng.f128()).collect();
+
+            let mut x_outer_full = Vec::with_capacity(x_inner_rest.len() + x_outer.len());
+            x_outer_full.extend_from_slice(&x_inner_rest);
+            x_outer_full.extend_from_slice(&x_outer);
+            let want = banked_s_hat_v_naive(&packed, &x_outer_full[1..], c);
+
+            let eq_x_outer = build_eq(&x_outer);
+            let z_vec = partial_fold_packed_z(&z_packed_lincheck, m, k_log, &eq_x_outer);
+            let got = banked_s_hat_v_from_z_vec(&z_vec, &x_inner_rest[1..], c);
+            assert_eq!(got, want, "banked z_vec mismatch at m={m}, k_log={k_log}, c={c}");
+        }
+    }
+
+    /// The banked target identity: `direct_claim_from_banks` equals the
+    /// incumbent `⟨transpose(s_hat_v), eq(r'')⟩` for random `r''`.
+    #[test]
+    fn banked_claim_matches_incumbent() {
+        let mut rng = Rng::new(0xC1A1);
+        for &(m, c) in &[(12usize, 3usize), (13, 5)] {
+            let z = rng.bits(1 << m);
+            let packed = pack_witness(&z, m);
+            let suffix: Vec<F128> = (0..(m - LOG_PACKING)).map(|_| rng.f128()).collect();
+            let suffix_tensor = build_eq(&suffix);
+            let s_hat_v = fold_1b_rows_naive(&packed, &suffix_tensor);
+            let r_dprime: Vec<F128> = (0..LOG_PACKING).map(|_| rng.f128()).collect();
+            let eq_r_dprime = build_eq(&r_dprime);
+            let want = inner_product(&tensor_algebra_transpose(&s_hat_v), &eq_r_dprime);
+
+            let banked = banked_s_hat_v_naive(&packed, &suffix, c);
+            let lo_eq = build_eq(&suffix[..c]);
+            let w = direct_w_state(&lo_eq, &eq_r_dprime);
+            let got = direct_claim_from_banks(&banked, &w);
+            assert_eq!(got, want, "claim mismatch at m={m}, c={c}");
+        }
+    }
+}
