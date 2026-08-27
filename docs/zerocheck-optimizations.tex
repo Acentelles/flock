@@ -857,6 +857,16 @@ task like the lincheck stripe transpose on the E-cores during the commit
 (clean pair $-57$\,ms). Bit-identical: the precomputed and inline
 transforms are equality-tested on all outputs.
 
+\subsection{The streaming commit: pipelined leaves and the fill's overlap budget}
+\label{sec:streamcommit}
+
+\begin{optsummary}
+\item[Baseline:] The commit ran as stages --- replicate-fill, NTT, Merkle --- joined with the round-1 AB prep on the all-core pool. The window was compute-additive: the prep overlapped only the short fill stage, then $\approx180\,$ms of transform and hashing ran with the prep already finished ($\approx273\,$ms wall).
+\item[Improvement:] The challenge tree's architecture, ported whole: the deep NTT pass publishes each finished sub-group as $\approx$1-MiB leaf jobs into a small bounded queue drained by utility-QoS helper threads (which the scheduler steers to the efficiency cores); each job hashes its leaves \emph{and} its aligned local parent subtree while the lines are hot; a full queue hashes inline on the publisher; the tail drains on the main pool; only the tiny shared top levels remain after ($0.03\,$ms). Crucially, the fill is fused into the first top pass (from-message), so the prep overlaps the \emph{entire} encode+leaves window.
+\item[Mechanism:] The fill fusion is the load-bearing piece, not the pipeline: without it the prep burns its overlap budget beside a standalone bandwidth stage that needs none of it (the v1 port measured \emph{worse} than staged). The staged-shape adjudication of fill fusion --- ``deletes a read, not compute'', null --- does not transfer: in the pipeline shape the deleted stage is what buys the prep its hiding window. Null verdicts are architecture-scoped.
+\item[Result:] Join wall (= commit + prep, one window) $260.5$--$262.6\to252.5$--$254.7\,$ms ($3/3$ disjoint); whole proof $479.8$--$502.8\to456.9$--$482.5\,$ms ($3/3$ disjoint, avg $-23$). Campaign record $456.95\,$ms / $573{,}681$ comp/s at $m{=}32$, grind-free. Tree and root bit-identical by test.
+\end{optsummary}
+
 \subsection{Witness constant-region elision via scratch provenance}
 \label{sec:elision}
 
@@ -921,6 +931,7 @@ Section & Kind & Phase effect (ST) & Sign test\\
 \S\ref{sec:cascade} & pass fusion & zc tail ($m{=}32$): $-38\%$ 8T & $4/4$ disjoint\\
 \S\ref{sec:inducetrunc}+\S\ref{sec:lazyood} & work removal & open ($m{=}32$): $-9\%$ 8T & $3/3$ disjoint\\
 \S\ref{sec:boundaryjoin}+\S\ref{sec:blockedtranspose} & scheduling, pass fusion & open ($m{=}32$): $-12\%$ 8T & sign $3/3$\\
+\S\ref{sec:streamcommit} & architecture & commit+prep ($m{=}32$): $-3\%$ wall, $-5\%$ total & $3/3$ disjoint\\
 \S\ref{sec:streamwit} & work removal & witness gen: $-24\%$ & $3/3$\\
 \S\ref{sec:lcfold} & work removal & lincheck fold: $-32\%$ & $3/3$\\
 \S\ref{sec:blake3neon} & ILP & BLAKE3 merkle: $+41\%$ GB/s & decisive\\
