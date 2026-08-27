@@ -209,7 +209,7 @@ pub fn commit(z_packed: &[F128], params: &PcsParams) -> (Commitment, ProverData)
 pub fn commit_into(
     z_packed: &[F128],
     params: &PcsParams,
-    mut codeword: Vec<F128>,
+    codeword: Vec<F128>,
 ) -> (Commitment, ProverData) {
     params.validate();
     assert_eq!(z_packed.len(), 1usize << params.log_msg_len());
@@ -220,6 +220,24 @@ pub fn commit_into(
         "commit_into: prebuilt codeword buffer has wrong length"
     );
 
+    if leaf_pipeline_enabled(params) {
+        return commit_into_pipelined(z_packed, params, codeword);
+    }
+    let codeword = commit_encode_into(z_packed, params, codeword);
+    commit_merkle(codeword, params)
+}
+
+/// Stage 1 of the staged commit: replicate-fill + NTT, returning the encoded
+/// codeword (Merkle via [`commit_merkle`]).
+pub fn commit_encode_into(
+    z_packed: &[F128],
+    params: &PcsParams,
+    mut codeword: Vec<F128>,
+) -> Vec<F128> {
+    params.validate();
+    assert_eq!(z_packed.len(), 1usize << params.log_msg_len());
+    let codeword_len = params.n_positions() * params.num_ntts();
+    assert_eq!(codeword.len(), codeword_len);
     // RS encoding of [z, 0, …, 0] starts with `log_inv_rate` butterfly layers
     // whose bottom inputs are all zero — each is a pure copy, so after those
     // layers the buffer holds 2^log_inv_rate replicas of z. Write that state
@@ -234,8 +252,195 @@ pub fn commit_into(
             t_fill.elapsed().as_secs_f64() * 1e3
         );
     }
+    commit_encode_finish(codeword, params)
+}
 
-    finalize_commit(codeword, params)
+/// [`commit_encode_into`] with a pool/fresh buffer.
+pub fn commit_encode(z_packed: &[F128], params: &PcsParams) -> Vec<F128> {
+    params.validate();
+    assert_eq!(z_packed.len(), 1usize << params.log_msg_len());
+    let codeword = crate::scratch::take_f128(params.n_positions() * params.num_ntts());
+    commit_encode_into(z_packed, params, codeword)
+}
+
+/// Whether the streaming (pipelined-leaf) commit applies: BLAKE3 leaves, a
+/// codeword big enough to have a deep-pass split worth pipelining, and a
+/// parallel pool. Shape-only — certified by two-binary A/B, no env switch.
+pub fn commit_leaf_pipeline_shape(params: &PcsParams) -> bool {
+    params.merkle_hash == crate::merkle::HashKind::Blake3
+        && params.n_positions() * params.num_ntts() >= (1 << 22) // >= 64 MB
+}
+
+fn leaf_pipeline_enabled(params: &PcsParams) -> bool {
+    commit_leaf_pipeline_shape(params) && rayon::current_num_threads() > 1
+}
+
+/// Streaming commit (challenge-tree architecture): the deep NTT pass
+/// publishes each finished sub-group as ~1-MiB leaf jobs into a small
+/// bounded queue drained by utility-QoS helper threads — on Apple Silicon
+/// the scheduler runs those on the efficiency cores, so leaf hashing (plus
+/// each job's aligned local parent subtree, hashed while its lines are hot)
+/// rides BESIDE the P-core transform instead of costing a serial Merkle
+/// stage after it. A full queue makes the publisher hash inline, bounding
+/// the unhashed window without ever blocking the NTT. Tree and root are
+/// bit-identical to the staged path (same leaves, same shape).
+fn commit_into_pipelined(
+    z_packed: &[F128],
+    params: &PcsParams,
+    mut codeword: Vec<F128>,
+) -> (Commitment, ProverData) {
+    use crate::merkle;
+    use std::sync::Mutex;
+    use std::sync::mpsc::{TrySendError, sync_channel};
+    let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+
+    let num_ntts = params.num_ntts();
+    let n_leaves = params.n_leaves();
+    let leaf_size = params.leaf_size_bytes();
+    debug_assert_eq!(leaf_size, num_ntts * core::mem::size_of::<F128>());
+    // ~1 MiB of leaves per job at the production 1 KB leaf: big enough to
+    // amortize dispatch, small enough that only a few MB of finished
+    // codeword ever awaits hashing.
+    let job_leaves = (1usize << 10).min(n_leaves);
+    let local_parent_levels = job_leaves.trailing_zeros() as usize;
+    let mut tree: Vec<Hash> = crate::alloc_uninit_vec(2 * n_leaves - 1);
+
+    let t_ntt = std::time::Instant::now();
+    {
+        let kind = params.merkle_hash;
+        let cw_ptr = codeword.as_mut_ptr() as usize;
+        let tree_ptr = tree.as_mut_ptr() as usize;
+        // Jobs are (leaf_start, leaf_len), aligned to `job_leaves`. SAFETY
+        // (all raw access below): the NTT publishes a job only after the
+        // corresponding codeword range is finalized and never written again;
+        // job leaf ranges are pairwise disjoint and cover the tree's leaf
+        // level exactly once, and each job's local parent subtree writes are
+        // confined to its aligned range at every level. The channel
+        // synchronizes the publisher's writes with the helper's reads.
+        let hash_job = |(leaf_start, leaf_len): (usize, usize)| unsafe {
+            let bytes = core::slice::from_raw_parts(
+                (cw_ptr as *const F128).add(leaf_start * num_ntts) as *const u8,
+                leaf_len * leaf_size,
+            );
+            let outs =
+                core::slice::from_raw_parts_mut((tree_ptr as *mut Hash).add(leaf_start), leaf_len);
+            merkle::hash_leaves_serial(bytes, leaf_size, outs, kind);
+            let mut read_level_start = 0usize;
+            let mut read_level_len = n_leaves;
+            let mut local_start = leaf_start;
+            let mut local_len = leaf_len;
+            for _ in 0..local_parent_levels {
+                let write_level_start = read_level_start + read_level_len;
+                let read = core::slice::from_raw_parts(
+                    (tree_ptr as *const Hash).add(read_level_start + local_start),
+                    local_len,
+                );
+                let write = core::slice::from_raw_parts_mut(
+                    (tree_ptr as *mut Hash).add(write_level_start + (local_start >> 1)),
+                    local_len >> 1,
+                );
+                merkle::hash_parents_serial(read, write);
+                read_level_start = write_level_start;
+                read_level_len >>= 1;
+                local_start >>= 1;
+                local_len >>= 1;
+            }
+        };
+
+        // Two helpers = this host's E-core count (M1 Max); utility QoS steers
+        // them off the P-cores the transform (and the AB-prep join partner)
+        // occupy. Queue depth 2× helpers bounds the unhashed window.
+        const N_HELPERS: usize = 2;
+        // Shallow queue: bounds the unhashed (cache-warm) window; a full
+        // queue makes the publisher hash inline on the transform worker.
+        // (A deep queue was measured WORSE: by drain time the codeword is
+        // DRAM-cold and the staged Merkle read is back, plus overhead.)
+        let queue_capacity = 2 * N_HELPERS;
+        let (sender, receiver) = sync_channel::<(usize, usize)>(queue_capacity);
+        let receiver = Mutex::new(receiver);
+        std::thread::scope(|scope| {
+            for _ in 0..N_HELPERS {
+                scope.spawn(|| {
+                    set_utility_qos();
+                    loop {
+                        let job = receiver.lock().unwrap().recv();
+                        match job {
+                            Ok(j) => hash_job(j),
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+            let on_sub = |start_elem: usize, sub: &[F128]| {
+                let base = start_elem / num_ntts;
+                let total = sub.len() / num_ntts;
+                let mut off = 0usize;
+                while off < total {
+                    let len = job_leaves.min(total - off);
+                    match sender.try_send((base + off, len)) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(j) | TrySendError::Disconnected(j)) => hash_job(j),
+                    }
+                    off += len;
+                }
+            };
+            // Fill fused into the first top pass (from-message): the prep
+            // arm overlaps the ENTIRE encode+leaves window instead of a
+            // standalone replicate stage burning the overlap budget first —
+            // this, not E-core count, is where the challenge tree's commit
+            // wall comes from.
+            let ntt = AdditiveNttF128::standard(params.k_code());
+            ntt.forward_transform_interleaved_from_message_with(
+                &mut codeword,
+                z_packed,
+                num_ntts,
+                Some(&on_sub),
+            );
+            drop(sender);
+            // No more jobs can arrive; pull the queued tail onto the main
+            // pool while already-claimed helper jobs complete concurrently.
+            let mut tail = Vec::with_capacity(queue_capacity);
+            {
+                let r = receiver.lock().unwrap();
+                while let Ok(j) = r.try_recv() {
+                    tail.push(j);
+                }
+            }
+            use rayon::prelude::*;
+            tail.into_par_iter().for_each(hash_job);
+        });
+    }
+    if timing {
+        eprintln!(
+            "[commit-timing] ntt+leaves: {:.2} ms",
+            t_ntt.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    let t_parents = std::time::Instant::now();
+    let merkle_tree = merkle::merkle_tree_from_prehashed_level(
+        tree,
+        n_leaves,
+        params.merkle_hash,
+        local_parent_levels,
+    );
+    let root = *merkle_tree.last().expect("merkle tree non-empty");
+    if timing {
+        eprintln!(
+            "[commit-timing] merkle top: {:.2} ms",
+            t_parents.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
+    (
+        Commitment {
+            root,
+            params: params.clone(),
+        },
+        ProverData {
+            codeword,
+            merkle_tree,
+        },
+    )
 }
 
 /// Fill `codeword` with `2^r` replicas of `msg` (`r = log2(codeword.len() /
@@ -266,7 +471,7 @@ pub(crate) fn replicate_message_fill(codeword: &mut [F128], msg: &[F128]) {
 
 /// Shared tail of [`commit`] / [`commit_into`]: interleaved forward additive
 /// NTT (RS-encode every lane) then the initial Merkle tree over codeword rows.
-fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
+fn commit_encode_finish(mut codeword: Vec<F128>, params: &PcsParams) -> Vec<F128> {
     let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
     let t_ntt = std::time::Instant::now();
     // ---- Interleaved forward additive NTT: 2^log_batch_size independent
@@ -285,6 +490,12 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
             t_ntt.elapsed().as_secs_f64() * 1e3
         );
     }
+    codeword
+}
+
+/// Stage 2 of the commit: Merkle tree over the encoded codeword.
+pub fn commit_merkle(codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
+    let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
     let t_merkle = std::time::Instant::now();
 
     // ---- Merkle commitment: one leaf per codeword position = num_ntts F128.
@@ -337,6 +548,23 @@ fn set_background_qos() {
 }
 #[cfg(not(target_os = "macos"))]
 fn set_background_qos() {}
+
+/// Tag the current thread as utility QoS (`QOS_CLASS_UTILITY = 0x11`). On
+/// Apple Silicon the scheduler prefers the efficiency cores for utility
+/// threads while default-QoS work holds the P-cores — the leaf pipeline's
+/// helpers want exactly that split. (Background QoS is too weak here: it can
+/// be starved entirely while the P-pool is saturated.)
+#[cfg(target_os = "macos")]
+fn set_utility_qos() {
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+    }
+    unsafe {
+        let _ = pthread_set_qos_class_self_np(0x11, 0);
+    }
+}
+#[cfg(not(target_os = "macos"))]
+fn set_utility_qos() {}
 
 /// Allocate + zero-fill (pre-fault) the codeword buffer that [`commit_into`]
 /// will consume, on a background-QoS (E-core) thread, **while** `gen` runs on
@@ -447,6 +675,30 @@ mod tests {
     /// byte-identical to the definitional encoding: zero-padded coefficients
     /// through the FULL forward NTT. Covers rate 1/2 and 1/4 and both
     /// interleaving widths.
+    /// Leaf-fused commit == staged commit, bit for bit (root, tree,
+    /// codeword) — m=22 exercises the scalar-fallback hook (one whole-buffer
+    /// callback), m=25 the deep-pass per-sub-group hooks.
+    #[test]
+    fn pipelined_commit_matches_staged() {
+        for m in [22usize, 25] {
+            let mut params = default_params(m);
+            params.merkle_hash = HashKind::Blake3;
+            params.log_batch_size = 5;
+            let mut rng = Rng::new(0xF05E ^ m as u64);
+            let bits = rng.bits(1 << m);
+            let z_packed = crate::pcs::pack::pack_witness(&bits, m);
+            let (c_a, d_a) = {
+                let cw = commit_encode(&z_packed, &params);
+                commit_merkle(cw, &params)
+            };
+            let buf = crate::scratch::take_f128(params.codeword_len_f128());
+            let (c_b, d_b) = commit_into_pipelined(&z_packed, &params, buf);
+            assert_eq!(c_a.root, c_b.root, "m={m}: root mismatch");
+            assert_eq!(d_a.merkle_tree, d_b.merkle_tree, "m={m}: tree mismatch");
+            assert_eq!(d_a.codeword, d_b.codeword, "m={m}: codeword mismatch");
+        }
+    }
+
     #[test]
     fn commit_matches_full_ntt_oracle() {
         use crate::ntt::AdditiveNttF128;

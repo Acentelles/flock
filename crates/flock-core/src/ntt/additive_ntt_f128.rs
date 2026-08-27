@@ -247,6 +247,20 @@ impl AdditiveNttF128 {
         msg: &[F128],
         num_ntts: usize,
     ) {
+        self.forward_transform_interleaved_from_message_with(data, msg, num_ntts, None)
+    }
+
+    /// [`Self::forward_transform_interleaved_from_message`] with the deep
+    /// pass's per-sub-group completion hook (see
+    /// [`Self::forward_transform_interleaved_parallel_from_layer_with`]) —
+    /// the streaming commit needs both the fill fusion and the hook.
+    pub fn forward_transform_interleaved_from_message_with(
+        &self,
+        data: &mut [F128],
+        msg: &[F128],
+        num_ntts: usize,
+        on_sub: Option<&(dyn Fn(usize, &[F128]) + Sync)>,
+    ) {
         let n_total = data.len();
         assert!(num_ntts.is_power_of_two() && num_ntts > 0);
         assert_eq!(n_total % msg.len(), 0);
@@ -277,7 +291,12 @@ impl AdditiveNttF128 {
             && std::env::var_os("FLOCK_NO_FILL_FUSE").is_none();
         if !fuse_fill {
             replicate_interleaved(data, msg);
-            self.forward_transform_interleaved_from_layer(data, num_ntts, start_layer);
+            self.forward_transform_interleaved_parallel_from_layer_with(
+                data,
+                num_ntts,
+                start_layer,
+                on_sub,
+            );
             return;
         }
 
@@ -301,7 +320,12 @@ impl AdditiveNttF128 {
                 num_ntts,
             );
         }
-        self.forward_transform_interleaved_from_layer(data, num_ntts, start_layer + 2);
+        self.forward_transform_interleaved_parallel_from_layer_with(
+            data,
+            num_ntts,
+            start_layer + 2,
+            on_sub,
+        );
     }
 
     /// Forward interleaved NTT starting at `start_layer`, assuming the first
@@ -412,6 +436,23 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         start_layer: usize,
     ) {
+        self.forward_transform_interleaved_parallel_from_layer_with(data, num_ntts, start_layer, None)
+    }
+
+    /// [`Self::forward_transform_interleaved_parallel_from_layer`] with an
+    /// optional per-sub-group completion hook: `on_sub(start_element, sub)`
+    /// runs inside the deep pass's task right after that sub-group's final
+    /// layer, while its lines are still cache-hot. Positions in a sub-group
+    /// are final once its deep loop ends (all remaining layers pair within
+    /// the sub-group), so the hook sees finished codeword data. Fallback
+    /// paths (scalar / no deep split) invoke it once over the whole buffer.
+    pub fn forward_transform_interleaved_parallel_from_layer_with(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+        on_sub: Option<&(dyn Fn(usize, &[F128]) + Sync)>,
+    ) {
         use rayon::prelude::*;
         let n_total = data.len();
         let log_d = log2_pow2(n_total / num_ntts);
@@ -419,6 +460,9 @@ impl AdditiveNttF128 {
         let n_top = self.interleaved_n_top(log_d, num_ntts);
         if n_top == 0 || log_d < 8 {
             self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
+            if let Some(cb) = on_sub {
+                cb(0, data);
+            }
             return;
         }
 
@@ -538,6 +582,7 @@ impl AdditiveNttF128 {
             data.par_chunks_mut(sub_bytes)
                 .enumerate()
                 .for_each(|(sub_idx, sub_data)| {
+                    let sub_base = sub_idx * sub_bytes;
                     let mut layer = n_top.max(start_layer);
                     while layer < log_d {
                         let layer_in_sub = layer - n_top;
@@ -575,6 +620,9 @@ impl AdditiveNttF128 {
                             }
                             layer += 1;
                         }
+                    }
+                    if let Some(cb) = on_sub {
+                        cb(sub_base, sub_data);
                     }
                 });
         };

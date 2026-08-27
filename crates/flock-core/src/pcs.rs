@@ -158,7 +158,8 @@ pub mod combine_probe {
 }
 
 pub use commit::{
-    Commitment, PcsParams, ProverData, commit, commit_into, prefault_codeword_during,
+    Commitment, PcsParams, ProverData, commit, commit_encode, commit_encode_into, commit_into,
+    commit_leaf_pipeline_shape, commit_merkle, prefault_codeword_during,
 };
 
 /// A/B kill switch for the direct (basis-free) opening, DEFAULT ON —

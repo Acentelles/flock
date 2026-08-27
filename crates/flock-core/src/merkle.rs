@@ -425,6 +425,93 @@ fn blake3_hash_many_parents(data: &[u8], out: &mut [Hash]) {
 /// SHA-256's kernel is inherently four-wide, while BLAKE3 wants the widest
 /// batch the machine offers. Both are rayon-parallel and both are
 /// byte-identical to calling [`hash_leaf`] on each leaf.
+/// Serial (no-rayon) leaf hashing over a contiguous run — the commit's
+/// leaf-fused NTT calls this INSIDE a deep-pass task (the task set is the
+/// parallelism; nested par-iters would just thrash). Batched kernels still
+/// engage per 8-leaf group.
+pub(crate) fn hash_leaves_serial(data: &[u8], leaf_size: usize, out: &mut [Hash], kind: HashKind) {
+    #[cfg(feature = "hash-count")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        hash_count::LEAF_CALLS.fetch_add(out.len() as u64, Relaxed);
+        hash_count::LEAF_COMPRESSIONS.fetch_add(
+            out.len() as u64 * hash_count::blocks(kind, leaf_size),
+            Relaxed,
+        );
+    }
+    match kind {
+        HashKind::Blake3 if blake3_leaf_size_is_batchable(leaf_size) => {
+            for (outs, leaves) in out
+                .chunks_mut(BLAKE3_GROUP)
+                .zip(data.chunks(BLAKE3_GROUP * leaf_size))
+            {
+                blake3_hash_many_leaves(leaves, leaf_size, outs);
+            }
+        }
+        HashKind::Blake3 => {
+            for (o, leaf) in out.iter_mut().zip(data.chunks(leaf_size)) {
+                *o = blake3_leaf_cv(leaf);
+            }
+        }
+        HashKind::Sha256 => {
+            for (o, leaf) in out.iter_mut().zip(data.chunks(leaf_size)) {
+                *o = Sha256::digest(leaf).into();
+            }
+        }
+    }
+}
+
+/// Serial BLAKE3 parent-chunk hashing: `read` holds `2·out.len()` child
+/// hashes (contiguous left‖right pairs); each pair hashes to one parent.
+/// No-rayon sibling of [`hash_pairs_level`]'s BLAKE3 arm, for the commit's
+/// leaf pipeline (the helper thread is the parallelism).
+pub(crate) fn hash_parents_serial(read: &[Hash], out: &mut [Hash]) {
+    debug_assert_eq!(read.len(), 2 * out.len());
+    #[cfg(feature = "hash-count")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        hash_count::PAIR_CALLS.fetch_add(out.len() as u64, Relaxed);
+    }
+    let bytes: &[u8] = unsafe {
+        core::slice::from_raw_parts(read.as_ptr() as *const u8, read.len() * 32)
+    };
+    for (outs, pairs) in out
+        .chunks_mut(BLAKE3_GROUP)
+        .zip(bytes.chunks(BLAKE3_GROUP * 64))
+    {
+        blake3_hash_many_parents(pairs, outs);
+    }
+}
+
+/// Finish a Merkle tree whose leaf level `tree[..num_leaves]` — and, when
+/// `prehashed_levels > 0`, the first that many parent levels — are already
+/// hashed: runs the remaining internal levels exactly as [`merkle_tree`]
+/// does.
+pub(crate) fn merkle_tree_from_prehashed_level(
+    mut tree: Vec<Hash>,
+    num_leaves: usize,
+    kind: HashKind,
+    prehashed_levels: usize,
+) -> Vec<Hash> {
+    debug_assert_eq!(tree.len(), 2 * num_leaves - 1);
+    let mut read_start = 0usize;
+    let mut read_len = num_leaves;
+    for _ in 0..prehashed_levels {
+        debug_assert!(read_len > 1);
+        read_start += read_len;
+        read_len >>= 1;
+    }
+    while read_len > 1 {
+        let next_len = read_len >> 1;
+        let (read, rest) = tree[read_start..].split_at_mut(read_len);
+        let write = &mut rest[..next_len];
+        hash_pairs_level(read, write, kind);
+        read_start += read_len;
+        read_len = next_len;
+    }
+    tree
+}
+
 fn hash_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash], kind: HashKind) {
     #[cfg(feature = "hash-count")]
     {

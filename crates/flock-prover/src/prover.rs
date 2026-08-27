@@ -725,6 +725,7 @@ fn ab_hoist_enabled(r1cs: &BlockR1cs) -> bool {
 /// the buffer by borrowing (see `Round1AbPre`).
 fn commit_with_ab_hoist<T>(
     commit: impl FnOnce() -> T + Send,
+    commit_pipelines_leaves: bool,
     a_packed_f128: &[F128],
     b_packed_f128: &[F128],
     r1cs: &BlockR1cs,
@@ -757,7 +758,12 @@ where
     // prove stays on the perf-core pool.
     let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
     let t_wall = std::time::Instant::now();
-    let (commit_out, ab_pre) = flock_core::all_core_pool().install(|| {
+    // Pool choice: the streaming commit hashes leaves on its own utility-QoS
+    // helper threads, which the scheduler steers to the E-cores — putting
+    // rayon E-threads in the join too would just contend with them, so that
+    // shape keeps the join on the default P pool. The staged commit keeps
+    // the certified all-core join (E-cores add prep compute there).
+    let join_body = || {
         rayon::join(
             || {
                 let t = std::time::Instant::now();
@@ -789,7 +795,12 @@ where
                 pre
             },
         )
-    });
+    };
+    let (commit_out, ab_pre) = if commit_pipelines_leaves {
+        join_body()
+    } else {
+        flock_core::all_core_pool().install(join_body)
+    };
     if timing {
         eprintln!(
             "[commit-timing] join wall: {:.2} ms",
@@ -820,6 +831,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
             Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
             None => pcs::commit(&z_packed, pcs_params),
         },
+        pcs::commit_leaf_pipeline_shape(pcs_params),
         &a_packed_f128,
         &b_packed_f128,
         r1cs,
@@ -1017,6 +1029,7 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
             Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
             None => pcs::commit(&z_packed, pcs_params),
         },
+        pcs::commit_leaf_pipeline_shape(pcs_params),
         &a_packed_f128,
         &b_packed_f128,
         r1cs,

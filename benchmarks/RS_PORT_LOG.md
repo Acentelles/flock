@@ -2004,3 +2004,29 @@ COMMIT PHASE FINAL VERDICT: closed-structural on M1 Max — kernels ST
 near-parity, all five architecture/scheduling experiments
 null-to-negative; the ~40ms MT bucket gap is E-core-count-bound, not
 code-bound.
+
+### STREAMING COMMIT CERTIFIED — the earlier verdict was wrong (2026-08-27)
+
+Benedikt challenged the "E-core-count-bound" conclusion: their 1.2x was
+measured on THIS machine. He was right — the "4-E-core host" was a
+comment in their code about the ranked contest hardware, misread as the
+measurement box. The real missing piece was visible in our own trace:
+our pipelined ntt+leaves (194-205) was FASTER than theirs (235), but
+our prep had already burned its overlap window beside a 100ms
+standalone replicate-fill that their architecture doesn't have — their
+from-message top eliminates the fill, so prep rides the ENTIRE window.
+The main-commit fill-fusion null (staged shape: "deletes a read, not
+compute") does NOT transfer to the pipeline shape, where the fill
+fusion is load-bearing: it buys the prep its hiding window.
+
+v2 = pipeline + from-message fill fusion (hook threaded through
+forward_transform_interleaved_from_message_with): join wall becomes ONE
+line (ntt+leaves, prep inside, merkle top 0.03ms). PAIRED A/B
+(two-binary, 8-min cooldown, 3 pairs): join wall 252.5/254.7/252.8 vs
+262.6/260.5/261.1 — 3/3 DISJOINT, avg −7.4; totals 482.5/463.1/456.9
+vs 502.8/479.8/489.6 — 3/3 DISJOINT, avg −23. Bit-identical
+(root/tree/codeword equality at 2 shapes; proof-identity; suite 350).
+NEW CAMPAIGN RECORD: 456.95 ms / 573,681 c/s ≈ 1.175x vs their 388.75.
+"Commit closed-structural" is RETRACTED; the architecture works on 2
+E-cores once the fill is fused. Lesson for the log: a null verdict is
+scoped to the architecture it was measured in.
