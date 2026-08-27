@@ -3532,7 +3532,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             for c in claims.iter_mut() {
                 c.claim.fold(r);
             }
-            f_run = fold_f_lsb_par(f_run, r);
             r_lane_fold.push(r);
             if j + 1 < initial_k {
                 msg = msg_of(&claims);
@@ -3541,10 +3540,18 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 direct_prefix.push(msg);
             }
         }
-        // Level-1 boundary: residual basis from the exit generators (the
-        // fully-folded W columns; γ baked in, so claims just add), then
-        // rejoin the incumbent flow — SumcheckProver::new computes the
-        // boundary round's message over the (small) folded pair.
+        // Level-1 boundary. The direct messages never touch f, so the
+        // witness is folded ONCE here, all initial_k challenges composed
+        // into a single 2^k→1 pass (out[j] = Σ_e lag(ρ)[e]·f[2^k·j + e]) —
+        // the per-round fold chain's ~2L traffic becomes ~1.03L. Exact: the
+        // composed Lagrange weights are the same product of per-round fold
+        // factors, and F128 sums are order-free.
+        let lag = crate::zerocheck::univariate_skip::build_eq(&r_lane_fold);
+        let f_run = fold_f_composed_par(f_run, &lag);
+        // Residual basis from the exit generators (the fully-folded W
+        // columns; γ baked in, so claims just add), then rejoin the
+        // incumbent flow — SumcheckProver::new computes the boundary
+        // round's message over the (small) folded pair.
         let mut it = claims.iter();
         let first = it.next().expect("nonempty");
         let mut b1 = crate::pcs::ring_switch::fold_b128_elems(
@@ -8219,18 +8226,24 @@ mod tests {
     }
 }
 
-/// Parallel f-only LSB fold for the direct L0 path:
-/// `out[j] = f[2j] + r·(f[2j+1] + f[2j])`. The outgoing buffer recycles
-/// through the scratch pool (the round-0 input is the 2^(m-7) packed
-/// witness).
-fn fold_f_lsb_par(f: Vec<F128>, r: F128) -> Vec<F128> {
+/// Parallel composed f-fold for the direct L0 path: bind all `k` lane-fold
+/// challenges in ONE pass, `out[j] = Σ_{e<2^k} lag[e]·f[2^k·j + e]` with
+/// `lag = build_eq(ρ_0..ρ_{k-1})` — the same field elements as `k`
+/// successive LSB folds, one read of `f` instead of a halving chain. The
+/// outgoing buffer recycles through the scratch pool.
+fn fold_f_composed_par(f: Vec<F128>, lag: &[F128]) -> Vec<F128> {
     use rayon::prelude::*;
-    let half = f.len() / 2;
-    let mut out = crate::scratch::take_f128(half);
+    let width = lag.len();
+    debug_assert!(width.is_power_of_two());
+    let n_out = f.len() / width;
+    let mut out = crate::scratch::take_f128(n_out);
     out.par_iter_mut().enumerate().for_each(|(j, o)| {
-        let f0 = f[2 * j];
-        let f1 = f[2 * j + 1];
-        *o = f0 + r * (f1 + f0);
+        let base = j * width;
+        let mut acc = lag[0] * f[base];
+        for e in 1..width {
+            acc += lag[e] * f[base + e];
+        }
+        *o = acc;
     });
     crate::scratch::give_f128(f);
     out

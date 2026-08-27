@@ -2583,14 +2583,17 @@ fn prove_batched_padded_impl<Ch: Challenger>(
             continue;
         }
         if let Some(banked) = direct_banked.get(dense_to_orig[d]).copied().flatten() {
+            use rayon::prelude::*;
             assert!(direct_c >= 1 && dense_suffixes[d].len() > direct_c);
             let lo_eq = build_eq(&dense_suffixes[d][..direct_c]);
             let mut sv = vec![F128::ZERO; 1 << LOG_PACKING];
-            for (e, bank) in banked.banks.iter().enumerate() {
-                for (b, &v) in bank.iter().enumerate() {
-                    sv[b] += lo_eq[e] * v;
+            sv.par_iter_mut().enumerate().for_each(|(b, out)| {
+                let mut acc = F128::ZERO;
+                for (e, bank) in banked.banks.iter().enumerate() {
+                    acc += lo_eq[e] * bank[b];
                 }
-            }
+                *out = acc;
+            });
             dense_s_hat_v[d] = sv;
         }
     }
@@ -4083,12 +4086,17 @@ pub fn banked_s_hat_v_from_z_vec(
 /// contiguous in-place pair-fold per `b` row. Built at open time (needs
 /// `r''`); `128·2^c` elements.
 pub fn direct_w_state(lo_eq: &[F128], eq_r_dprime: &[F128]) -> Vec<F128> {
+    // φ applied via the standard 16-lookup byte table (built once) instead
+    // of a 128-bit conditional scan per element — the same map either way
+    // (fold_one_slot ≡ phi_apply; both are fold_b128_elems' per-element op),
+    // ~20 ops per entry instead of ~256.
+    let table = build_fold_byte_table(eq_r_dprime);
     let n_banks = lo_eq.len();
     let mut w = vec![F128::ZERO; (1 << LOG_PACKING) * n_banks];
     for b in 0..(1 << LOG_PACKING) {
         let xb = x_pow(b);
         for (e, &lo) in lo_eq.iter().enumerate() {
-            w[b * n_banks + e] = phi_apply(lo * xb, eq_r_dprime);
+            w[b * n_banks + e] = fold_one_slot(lo * xb, &table);
         }
     }
     w
@@ -4242,12 +4250,18 @@ impl DirectBasisClaim {
         eq_r_dprime: &[F128],
         gamma: F128,
     ) -> Self {
+        use rayon::prelude::*;
         let n = banked.banks.len();
         assert_eq!(lo_eq.len(), n);
         let np = 1usize << LOG_PACKING;
+        // Per-bank 128×128 bit transposes are independent — parallelize.
+        let bank_us: Vec<Vec<F128>> = banked
+            .banks
+            .par_iter()
+            .map(|bank| tensor_algebra_transpose(bank))
+            .collect();
         let mut a = vec![F128::ZERO; np * n];
-        for (e, bank) in banked.banks.iter().enumerate() {
-            let bank_u = tensor_algebra_transpose(bank);
+        for (e, bank_u) in bank_us.iter().enumerate() {
             for b in 0..np {
                 a[b * n + e] = bank_u[b];
             }
