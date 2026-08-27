@@ -867,6 +867,16 @@ transforms are equality-tested on all outputs.
 \item[Result:] Join wall (= commit + prep, one window) $260.5$--$262.6\to252.5$--$254.7\,$ms ($3/3$ disjoint); whole proof $479.8$--$502.8\to456.9$--$482.5\,$ms ($3/3$ disjoint, avg $-23$). Campaign record $456.95\,$ms / $573{,}681$ comp/s at $m{=}32$, grind-free. Tree and root bit-identical by test.
 \end{optsummary}
 
+\subsection{The ranked radix-8 top: dual from-message pass, staged stores, hetero tiles}
+\label{sec:rankedtop}
+
+\begin{optsummary}
+\item[Baseline:] After \S\ref{sec:streamcommit}, the commit's top layers ran as a from-message fused-2 pass plus three fused-2 sweeps, all on the P pool (the E-core helpers idle until the deep pass publishes leaf jobs).
+\item[Improvement:] Layers 1--9 as \emph{three} radix-8 passes: layer 1 is a dual-destination from-message kernel (one witness read produces both replica blocks; block 0's spine twiddles are zero, so its chain is XOR-only), layers 4 and 7 are in-place sweeps with q-register-resident butterflies; every pass distributes 128-row tiles across the rayon pool AND two utility-QoS E-core threads via one shared work counter.
+\item[Mechanism:] Radix-8 was not the earlier fused-3 failure --- the kernel shape was. Fresh-destination scatter stores (sixteen 16-B streams, tens of MB apart) defeat the streaming-store detector and pay a read-for-ownership on the whole 1-GB destination; staging each row group in an 8-KB L1 tile and emitting sequential non-temporal bursts restores fill-like store behavior. In-place passes need no staging (their lines are already owned). One fewer full sweep of traffic, one witness read instead of two, and the E-cores now assist the top before switching to leaf hashing.
+\item[Result:] Commit join wall $273.1$--$275.5\to256.6$--$266.7\,$ms ($3/3$ disjoint, avg $-13.1$; commit bucket $3/3$). Bit-identical by the from-message and commit equality tests.
+\end{optsummary}
+
 \subsection{Witness constant-region elision via scratch provenance}
 \label{sec:elision}
 \benedikt{what is this title? Use plain english please}
@@ -932,6 +942,7 @@ Section & Kind & Phase effect (ST) & Sign test\\
 \S\ref{sec:inducetrunc}+\S\ref{sec:lazyood} & work removal & open ($m{=}32$): $-9\%$ 8T & $3/3$ disjoint\\
 \S\ref{sec:boundaryjoin}+\S\ref{sec:blockedtranspose} & scheduling, pass fusion & open ($m{=}32$): $-12\%$ 8T & sign $3/3$\\
 \S\ref{sec:streamcommit} & architecture & commit+prep ($m{=}32$): $-3\%$ wall, $-5\%$ total & $3/3$ disjoint\\
+\S\ref{sec:rankedtop} & kernel, scheduling & commit+prep ($m{=}32$): $-5\%$ wall & $3/3$ disjoint\\
 \S\ref{sec:streamwit} & work removal & witness gen: $-24\%$ & $3/3$\\
 \S\ref{sec:lcfold} & work removal & lincheck fold: $-32\%$ & $3/3$\\
 \S\ref{sec:blake3neon} & ILP & BLAKE3 merkle: $+41\%$ GB/s & decisive\\
