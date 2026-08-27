@@ -1561,3 +1561,21 @@ parity result, recheck), zc-sans-prep +169 ST, witness +21 ST,
 lincheck +8. Their flagged caveat: their MT witness/commit may still be
 slightly pessimistic (an MT-only from-message fast path not threaded
 through their timed fn).
+
+### Open anatomy received: sufficient-statistic combine (loop 1 target)
+
+Their m==32 open eliminates the O(L) combine sweep outright: b_combined
+(size 2^(m-7) — the quantity that 4x's m=30→32) is never allocated at the
+ranked shape; ring-switch round-0/1 messages derive from per-claim
+FIXED-SIZE sufficient statistics — DirectFold8Factors (64-bank pair),
+DirectFold4Factors (16x16 product matrix H[e,d]=Σ_h f[16h+e]·B_k[16h+d]),
+DirectFold2Factors (16 products) — none scaling with L. Statistics are
+computed where data is already resident (AB from lincheck's z_vec_pre —
+cost lands in lincheck; C from zc r1's URM extraction — lands in zc);
+we ALREADY have that relocation (our s_hat_v captures skip fold_1b_rows).
+What we lack is the elimination itself. CPU-only confirmed (no gpu_commit
+refs in their ring_switch). Their isolation switches exist
+(FLOCK_NO_OPEN_DIRECT_{FOLD8,FOLD4,AB}) for a confirming measurement.
+Port = re-derive the sufficient-statistic construction onto our combine
+(our composed-table fold path still does the O(L) sweep). This is the
+campaign's largest remaining item: open +72 MT / +477 ST at m=32.
