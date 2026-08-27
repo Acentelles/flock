@@ -1687,3 +1687,23 @@ banks with the serial reference scan — unusable at m=32. Plumb
 banked_s_hat_v_from_z_vec (exists, tested) for the AB claim from
 prover.rs's z_vec_pre, and generalize the zc r1 s_hat_v_c capture to its
 banked form for the C claim. Target: open 96.5→~25 MT / 600→~123 ST.
+
+### Direct open: producers landed, port complete; certification pending
+### a clean window (2026-08-26, late night)
+
+Unit 4 (producers) landed: AB banks from lincheck's z_vec_pre
+(banked_s_hat_v_from_z_vec, carried through ProveCore), C banks captured
+free inside the zc stripe fold (round1_c_banks_from_stripe_with_banked —
+same outer partial fold, middle fold stopped c dims early, flat banks
+bit-identical by test), plumbed via open_batch_..._banked with per-claim
+fallback to the reference scan. Full validation green (proof-bytes
+identity, banked-C equivalence, roundtrips with FLOCK_OPEN_DIRECT=1,
+348 core tests).
+
+First m=32 A/B attempts hit a heavily contaminated window (bests
+836ms-1.3s vs clean 541; Chrome bursts): magnitudes unusable. Signal
+that survives: sign 3/3 for direct on usable pairs, and one direct open
+sample at 80.8ms — BELOW the clean dense floor (96.5), proving
+engagement with real producers and sub-incumbent cost. Certification
+A/B (target: open 96.5→~25 MT, 600→~123 ST) deferred to a quiet window;
+the gate stays opt-in (FLOCK_OPEN_DIRECT=1) until then.
