@@ -206,8 +206,7 @@ pub fn prove_packed_padded<C: Challenger>(
     padding: &PaddingSpec,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim) {
-    let (proof, claim, _) =
-        prove_packed_padded_inner(
+    let (proof, claim, _, _) = prove_packed_padded_inner(
         a_packed, b_packed, c_packed, m, padding, false, challenger, None, None,
     );
     (proof, claim)
@@ -228,8 +227,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c<C: Challenger>(
     padding: &PaddingSpec,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
-    let (proof, claim, captured) =
-        prove_packed_padded_inner(
+    let (proof, claim, captured, _) = prove_packed_padded_inner(
         a_packed, b_packed, c_packed, m, padding, true, challenger, None, None,
     );
     (
@@ -253,8 +251,8 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_stripe<C: Challenger>(
     challenger: &mut C,
     stripe_c: univariate_skip_optimized::StripeC<'_>,
     ab_pre: Option<&univariate_skip_optimized::Round1AbPre>,
-) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
-    let (proof, claim, captured) = prove_packed_padded_inner(
+) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>, Option<Vec<Vec<F128>>>) {
+    let (proof, claim, captured, banked) = prove_packed_padded_inner(
         a_packed,
         b_packed,
         c_packed,
@@ -269,6 +267,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_stripe<C: Challenger>(
         proof,
         claim,
         captured.expect("capture=true must produce s_hat_v_c"),
+        banked,
     )
 }
 
@@ -283,7 +282,12 @@ fn prove_packed_padded_inner<C: Challenger>(
     challenger: &mut C,
     stripe_c: Option<univariate_skip_optimized::StripeC<'_>>,
     ab_pre: Option<&univariate_skip_optimized::Round1AbPre>,
-) -> (ZerocheckProof, ZerocheckClaim, Option<Vec<F128>>) {
+) -> (
+    ZerocheckProof,
+    ZerocheckClaim,
+    Option<Vec<F128>>,
+    Option<Vec<Vec<F128>>>,
+) {
     let k_skip = K_SKIP;
     const N_INNER: usize = 7; // 3 small + 4 medium fixed-constant eq dims
     assert!(
@@ -332,8 +336,8 @@ fn prove_packed_padded_inner<C: Challenger>(
     let ntt_s = AdditiveNttGf8::new(k_skip, F8::ZERO);
     let ntt_l = AdditiveNttGf8::new(k_skip, F8(1u8 << k_skip));
     let inv_table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
-    let (round1_ab_opt, round1_c_opt, s_hat_v_c) = if capture_s_hat_v_c {
-        let (ab, c, s) = match stripe_c {
+    let (round1_ab_opt, round1_c_opt, s_hat_v_c, banked_s_hat_v_c) = if capture_s_hat_v_c {
+        let (ab, c, s, banked) = match stripe_c {
             Some(sc) => crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_stripe_c(
                 a_packed,
                 b_packed,
@@ -346,23 +350,26 @@ fn prove_packed_padded_inner<C: Challenger>(
                 sc,
                 ab_pre,
             ),
-            None => crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
-                a_packed,
-                b_packed,
-                c_packed,
-                m,
-                k_skip,
-                &r,
-                &inv_table,
-                padding,
-            ),
+            None => {
+                let (ab, c, s) = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
+                    a_packed,
+                    b_packed,
+                    c_packed,
+                    m,
+                    k_skip,
+                    &r,
+                    &inv_table,
+                    padding,
+                );
+                (ab, c, s, None)
+            }
         };
-        (ab, c, Some(s))
+        (ab, c, Some(s), banked)
     } else {
         let (ab, c) = round1_shift_reduce_extract_c_packed_padded(
             a_packed, b_packed, c_packed, m, k_skip, &r, &inv_table, padding,
         );
-        (ab, c, None)
+        (ab, c, None, None)
     };
     let c_s = c_s_f128();
     let round1_ab: Vec<F128> = round1_ab_opt.iter().map(|x| c_s * *x).collect();
@@ -642,7 +649,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         b_eval: final_b_eval,
         c_eval: final_c_eval,
     };
-    (proof, claim, s_hat_v_c)
+    (proof, claim, s_hat_v_c, banked_s_hat_v_c)
 }
 
 /// Verify a zerocheck proof for an instance over `{0,1}^log_n`.

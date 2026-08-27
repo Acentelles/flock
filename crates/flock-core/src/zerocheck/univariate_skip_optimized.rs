@@ -999,12 +999,110 @@ pub fn round1_c_banks_from_stripe(
     (bank0, bank1)
 }
 
+/// Like [`round1_c_banks_from_stripe`], but also returns the **banked**
+/// `s_hat_v_c` for the direct (basis-free) PCS opening: the same middle fold
+/// stopped `c_banks` word dims early, so the C claim's suffix coords
+/// `r[7..7+c_banks]` stay unfolded as the bank index. Bank `e`, slice `b`:
+///
+///   banked[e][b] = w_b · v2[b + 128·e],  w_b = the same per-slice diagonal
+///   (C_2·k0 for b < 64, C_2·α⁻¹·k1 for b ≥ 64) that maps the drain banks to
+///   canonical `s_hat_v_c` — so `Σ_e eq(r[7..7+c_banks], e)·banked[e]` equals
+///   the flat `s_hat_v_c` exactly (multilinearity of the fold).
+///
+/// Zero extra O(witness) work: the outer partial fold is shared; the banked
+/// capture costs one extra `2^(7+c_banks)`-sized intermediate.
+pub fn round1_c_banks_from_stripe_with_banked(
+    z_stripe: &[u8],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    r: &[F128],
+    c_banks: usize,
+) -> ([F128; ELL], [F128; ELL], Vec<Vec<F128>>) {
+    assert_eq!(r.len(), m);
+    assert!(k_log >= K_SKIP + 1 + 2, "need the parity dim + small dims in-block");
+    assert!(m - k_log >= 3, "stripe fold needs n_outer >= 8");
+    const LOG2_PACKED: usize = 7; // in-word bit dims (F_{2^128} packing)
+    assert!(
+        LOG2_PACKED + c_banks <= k_log,
+        "banked capture needs the kept word dims in-block (7 + c ≤ k_log)"
+    );
+
+    // 1. The one O(witness) pass: fold the outer dims (shared with the
+    //    bank-only variant).
+    let eq_outer = super::univariate_skip::build_eq(&r[k_log..]);
+    let mut v = crate::lincheck::partial_fold_packed_z_best(
+        z_stripe, m, k_log, useful_bits, &eq_outer,
+    );
+
+    // 2a. Fold the middle dims down to 7 + c_banks (kept: 7 in-word dims +
+    //     the c_banks lowest suffix word dims).
+    let mut len = 1usize << k_log;
+    for dim in ((LOG2_PACKED + c_banks)..k_log).rev() {
+        let rj = r[dim];
+        len >>= 1;
+        for i in 0..len {
+            let f0 = v[i];
+            let f1 = v[i + len];
+            v[i] = f0 + rj * (f0 + f1);
+        }
+    }
+    let v2 = &v[..1 << (LOG2_PACKED + c_banks)];
+
+    // 2b. Canonical per-slice diagonal (identical to the flat derivation).
+    let r6 = r[K_SKIP];
+    let c_s = (F128::ONE + r6) * (F128::ONE + r[K_SKIP + 1]) * (F128::ONE + r[K_SKIP + 2]);
+    let c_s_inv = c_s.inv();
+    let k0 = (F128::ONE + r6) * c_s_inv;
+    let k1 = r6 * c_s_inv;
+    let _ = r; // (small-eq constants are protocol-pinned, not r-derived)
+    let c_2 = c_2_small_f128();
+    let c_2_alpha_inv = c_2 * alpha_inv_f128();
+    let w0 = c_2 * k0;
+    let w1 = c_2_alpha_inv * k1;
+    let n_banks = 1usize << c_banks;
+    let mut banked = vec![vec![F128::ZERO; 2 * ELL]; n_banks];
+    for (e, bank) in banked.iter_mut().enumerate() {
+        let base = e << LOG2_PACKED;
+        for lane in 0..ELL {
+            bank[lane] = w0 * v2[base + lane];
+            bank[ELL + lane] = w1 * v2[base + ELL + lane];
+        }
+    }
+
+    // 3. Continue the fold over the kept word dims for the flat banks
+    //    (bit-identical to the bank-only variant: same fold, same order).
+    let mut len = 1usize << (LOG2_PACKED + c_banks);
+    for dim in (LOG2_PACKED..(LOG2_PACKED + c_banks)).rev() {
+        let rj = r[dim];
+        len >>= 1;
+        for i in 0..len {
+            let f0 = v[i];
+            let f1 = v[i + len];
+            v[i] = f0 + rj * (f0 + f1);
+        }
+    }
+    debug_assert_eq!(len, 2 * ELL);
+    let mut bank0 = [F128::ZERO; ELL];
+    let mut bank1 = [F128::ZERO; ELL];
+    for lane in 0..ELL {
+        bank0[lane] = k0 * v[lane];
+        bank1[lane] = k1 * v[ELL + lane];
+    }
+    (bank0, bank1, banked)
+}
+
 /// The lincheck stripe handed to the stripe-C round-1 entry.
 #[derive(Clone, Copy)]
 pub struct StripeC<'a> {
     pub stripe: &'a [u8],
     pub k_log: usize,
     pub useful_bits: usize,
+    /// When `Some(c)`, the stripe fold also captures the BANKED `s_hat_v_c`
+    /// (the C claim's direct-open sufficient statistic, `2^c` banks) at no
+    /// extra O(witness) cost — see
+    /// [`round1_c_banks_from_stripe_with_banked`].
+    pub banked_c: Option<usize>,
 }
 
 pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
@@ -1017,9 +1115,10 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
-    round1_with_s_hat_v_impl(
+    let (ab, c, s, _banked) = round1_with_s_hat_v_impl(
         a_packed, b_packed, c_packed, m, k_skip, r, inv_table, padding, None, None,
-    )
+    );
+    (ab, c, s)
 }
 
 /// Round 1 with the C side computed by [`round1_c_banks_from_stripe`] instead
@@ -1038,7 +1137,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_stripe_c(
     padding: &PaddingSpec,
     stripe_c: StripeC<'_>,
     ab_pre: Option<&Round1AbPre>,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Option<Vec<Vec<F128>>>) {
     round1_with_s_hat_v_impl(
         a_packed, b_packed, c_packed, m, k_skip, r, inv_table, padding, Some(stripe_c), ab_pre,
     )
@@ -1056,7 +1155,7 @@ fn round1_with_s_hat_v_impl(
     padding: &PaddingSpec,
     stripe_c: Option<StripeC<'_>>,
     ab_pre: Option<&Round1AbPre>,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Option<Vec<Vec<F128>>>) {
     use rayon::prelude::*;
 
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
@@ -1124,10 +1223,25 @@ fn round1_with_s_hat_v_impl(
 
     // With a stripe, the C banks come from the multilinear fold; the workers
     // above ran AB-only and left their C accumulators zero.
+    let mut banked_s_hat_v_c: Option<Vec<Vec<F128>>> = None;
     let (res_c_s_0, res_c_s_1) = match stripe_c {
         Some(sc) => {
             let t_fold = std::time::Instant::now();
-            let banks = round1_c_banks_from_stripe(sc.stripe, m, sc.k_log, sc.useful_bits, r);
+            let banks = match sc.banked_c {
+                Some(c_banks) => {
+                    let (b0, b1, banked) = round1_c_banks_from_stripe_with_banked(
+                        sc.stripe,
+                        m,
+                        sc.k_log,
+                        sc.useful_bits,
+                        r,
+                        c_banks,
+                    );
+                    banked_s_hat_v_c = Some(banked);
+                    (b0, b1)
+                }
+                None => round1_c_banks_from_stripe(sc.stripe, m, sc.k_log, sc.useful_bits, r),
+            };
             if r1_trace {
                 eprintln!(
                     "[zc-r1] stripe fold: {:.2} ms",
@@ -1158,7 +1272,7 @@ fn round1_with_s_hat_v_impl(
         s_hat_v_c[ELL + lane] = c_2_alpha_inv * res_c_s_1[lane];
     }
 
-    (res_ab.to_vec(), res_c_lifted, s_hat_v_c)
+    (res_ab.to_vec(), res_c_lifted, s_hat_v_c, banked_s_hat_v_c)
 }
 
 /// Serial reference — same I/O as [`round1_shift_reduce_extract_c_packed`],
@@ -1483,6 +1597,7 @@ mod tests {
                     stripe: &stripe,
                     k_log,
                     useful_bits: useful,
+                    banked_c: None,
                 },
                 None,
             );
@@ -1505,6 +1620,7 @@ mod tests {
                     stripe: &stripe,
                     k_log,
                     useful_bits: useful,
+                    banked_c: None,
                 },
                 Some(&ab_pre),
             );
@@ -1518,6 +1634,57 @@ mod tests {
     /// Banks are recovered from the s_hat_v_c wire output via the module's
     /// own constants, and the lifted C message is cross-checked too.
     #[test]
+    /// The banked stripe capture: (a) its flat banks are bit-identical to
+    /// the bank-only variant's; (b) `Σ_e eq(r[7..7+c], e)·banked[e]`
+    /// reconstructs the flat canonical `s_hat_v_c` exactly.
+    #[test]
+    fn stripe_banked_s_hat_v_c_matches_flat() {
+        use crate::lincheck::pack_z_lincheck;
+        use crate::zerocheck::univariate_skip::{build_eq, pack_bits};
+
+        for &(m, c) in &[(17usize, 3usize), (18, 5), (18, 6)] {
+            let k_log = 14usize;
+            let mut rng = Rng::new(0xBA2CED + (m * 31 + c) as u64);
+            let a_bits = rng.bits(1 << m);
+            let b_bits = rng.bits(1 << m);
+            let z_bits = rng.bits(1 << m);
+            let a_p = pack_bits(&a_bits);
+            let b_p = pack_bits(&b_bits);
+            let c_p = pack_bits(&z_bits);
+            let stripe = pack_z_lincheck(&z_bits, m, k_log);
+            let outer = rng.f128_vec(m - K_SKIP - N_INNER);
+            let r = build_protocol_r(m, &outer);
+            let table = make_inv_table();
+            let padding = PaddingSpec::dense(m);
+
+            let (_ab, _c_lifted, s_hat_v_c) =
+                round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
+                    &a_p, &b_p, &c_p, m, K_SKIP, &r, &table, &padding,
+                );
+            let (b0_ref, b1_ref) =
+                round1_c_banks_from_stripe(&stripe, m, k_log, 1 << k_log, &r);
+            let (b0, b1, banked) = round1_c_banks_from_stripe_with_banked(
+                &stripe,
+                m,
+                k_log,
+                1 << k_log,
+                &r,
+                c,
+            );
+            assert_eq!(b0, b0_ref, "flat bank0 at (m={m}, c={c})");
+            assert_eq!(b1, b1_ref, "flat bank1 at (m={m}, c={c})");
+
+            let lo_eq = build_eq(&r[7..7 + c]);
+            let mut recon = vec![F128::ZERO; 2 * ELL];
+            for (e, bank) in banked.iter().enumerate() {
+                for (b, &v) in bank.iter().enumerate() {
+                    recon[b] += lo_eq[e] * v;
+                }
+            }
+            assert_eq!(recon, s_hat_v_c, "banked reconstruction at (m={m}, c={c})");
+        }
+    }
+
     fn stripe_c_banks_match_drain_banks() {
         use crate::lincheck::pack_z_lincheck;
         use crate::zerocheck::univariate_skip::pack_bits;

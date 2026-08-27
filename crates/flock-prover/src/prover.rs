@@ -58,12 +58,14 @@ pub(crate) fn quirky_x_outer_full(point: &QuirkyPoint) -> Vec<F128> {
 ///
 /// Must be called at the same transcript position as the verifier's
 /// [`flock_core::verifier::verify_claims_ligerito`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn open_claims_with_precomputed_ligerito<Ch: Challenger>(
     z_packed: Vec<F128>,
     prover_data: &pcs::ProverData,
     commitment: &Commitment,
     claims: &[ZClaim],
     precomputed_s_hat_v: &[Option<&[F128]>],
+    banked_s_hat_v: &[Option<&pcs::ring_switch::BankedShatV>],
     padding: &zerocheck::PaddingSpec,
     lig_config: &pcs::ligerito::ProverConfig,
     challenger: &mut Ch,
@@ -73,12 +75,13 @@ pub(crate) fn open_claims_with_precomputed_ligerito<Ch: Challenger>(
         .map(|c| quirky_x_outer_full(&c.point))
         .collect();
     let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
-    pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
+    pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v_banked(
         z_packed,
         prover_data,
         commitment,
         &x_refs,
         precomputed_s_hat_v,
+        banked_s_hat_v,
         &[],
         padding,
         lig_config,
@@ -139,7 +142,11 @@ pub fn prove_ligerito<Ch: Challenger>(
     let z_packed_lincheck = pack_z_lincheck_from_packed(&z_packed, r1cs.m, r1cs.k_log);
 
     let padding = r1cs.padding_spec();
-    let (zc_proof, zc_claim, s_hat_v_c) = if c_packed_f128.is_empty()
+    // Direct-open bank width: the L0 lane-fold count. The stripe capture
+    // needs the kept word dims in-block (7 + c ≤ k_log).
+    let banked_c_width = (lig_config.initial_k + pcs::LOG_PACKING <= r1cs.k_log)
+        .then_some(lig_config.initial_k);
+    let (zc_proof, zc_claim, s_hat_v_c, banked_c) = if c_packed_f128.is_empty()
         && r1cs.k_log >= 9
         && r1cs.m - r1cs.k_log >= 3
     {
@@ -155,13 +162,15 @@ pub fn prove_ligerito<Ch: Challenger>(
                 stripe: &z_packed_lincheck,
                 k_log: r1cs.k_log,
                 useful_bits: r1cs.useful_bits,
+                banked_c: banked_c_width,
             },
             None,
         )
     } else {
-        zerocheck::prove_packed_padded_capture_s_hat_v_c(
+        let (proof, claim, s) = zerocheck::prove_packed_padded_capture_s_hat_v_c(
             a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
-        )
+        );
+        (proof, claim, s, None)
     };
 
     let x_ab = r1cs.x_ab_from_mlv(SkipPoint::Phi8(zc_claim.z), &zc_claim.mlv_challenges);
@@ -196,14 +205,29 @@ pub fn prove_ligerito<Ch: Challenger>(
     } else {
         None
     };
+    // Banked AB statistic for the direct open: same reassociation, the
+    // lowest initial_k tail coords retained (free — z_vec is tiny).
+    let banked_ab = (r1cs.k_log >= pcs::LOG_PACKING
+        && lc_claim.r_inner_rest.len() >= 1 + lig_config.initial_k)
+        .then(|| {
+            pcs::ring_switch::banked_s_hat_v_from_z_vec(
+                &z_vec_pre,
+                &lc_claim.r_inner_rest[1..],
+                lig_config.initial_k,
+            )
+        });
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
+    // C banked statistic from the zerocheck stripe capture (raw banks).
+    let banked_c_stat =
+        banked_c.map(|banks| pcs::ring_switch::BankedShatV { banks });
     let pcs_open = open_claims_with_precomputed_ligerito(
         z_packed,
         &prover_data,
         &commitment,
         &[ab.clone(), c.clone()],
         &[pre_ab, pre_c],
+        &[banked_ab.as_ref(), banked_c_stat.as_ref()],
         &padding,
         &lig_config,
         challenger,
@@ -248,6 +272,8 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
         z_packed,
         s_hat_v_ab,
         s_hat_v_c,
+        banked_ab,
+        banked_c,
     } = prove_fast_core_with_codeword(
         r1cs,
         pcs_params,
@@ -263,12 +289,16 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
     let padding = r1cs.padding_spec();
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
+    // Banked statistics carried through ProveCore.
+    #[allow(clippy::let_and_return)]
+    let banked_c_stat = banked_c;
     let pcs_open = open_claims_with_precomputed_ligerito(
         z_packed,
         &prover_data,
         &commitment,
         &[ab.clone(), c.clone()],
         &[pre_ab, pre_c],
+        &[banked_ab.as_ref(), banked_c_stat.as_ref()],
         &padding,
         &lig_config,
         challenger,
@@ -422,16 +452,31 @@ pub fn prove_fast_ligerito_ag_from_witness<Ch: Challenger>(
     } else {
         None
     };
+    // Banked AB statistic for the direct open: same reassociation, the
+    // lowest initial_k tail coords retained (free — z_vec is tiny).
+    let banked_ab = (r1cs.k_log >= pcs::LOG_PACKING
+        && lc_claim.r_inner_rest.len() >= 1 + lig_config.initial_k)
+        .then(|| {
+            pcs::ring_switch::banked_s_hat_v_from_z_vec(
+                &z_vec_pre,
+                &lc_claim.r_inner_rest[1..],
+                lig_config.initial_k,
+            )
+        });
 
     let padding = r1cs.padding_spec();
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
+    // AG-skip path: no stripe banked capture — the direct open falls back
+    // to the reference scan for C if force-enabled here.
+    let banked_c_stat: Option<pcs::ring_switch::BankedShatV> = None;
     let pcs_open = open_claims_with_precomputed_ligerito(
         z_packed,
         &prover_data,
         &commitment,
         &[ab.clone(), c.clone()],
         &[pre_ab, pre_c],
+        &[banked_ab.as_ref(), banked_c_stat.as_ref()],
         &padding,
         &lig_config,
         challenger,
@@ -549,6 +594,17 @@ pub fn prove_fast_ligerito_ag_timed<Ch: Challenger>(
     } else {
         None
     };
+    // Banked AB statistic for the direct open: same reassociation, the
+    // lowest initial_k tail coords retained (free — z_vec is tiny).
+    let banked_ab = (r1cs.k_log >= pcs::LOG_PACKING
+        && lc_claim.r_inner_rest.len() >= 1 + lig_config.initial_k)
+        .then(|| {
+            pcs::ring_switch::banked_s_hat_v_from_z_vec(
+                &z_vec_pre,
+                &lc_claim.r_inner_rest[1..],
+                lig_config.initial_k,
+            )
+        });
     t.lincheck_s = t0.elapsed().as_secs_f64();
 
     // --- Ligerito recursive PCS open ---
@@ -556,12 +612,16 @@ pub fn prove_fast_ligerito_ag_timed<Ch: Challenger>(
     let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
     let padding = r1cs.padding_spec();
     let t0 = Instant::now();
+    // AG-skip path: no stripe banked capture — the direct open falls back
+    // to the reference scan for C if force-enabled here.
+    let banked_c_stat: Option<pcs::ring_switch::BankedShatV> = None;
     let pcs_open = open_claims_with_precomputed_ligerito(
         z_packed,
         &prover_data,
         &commitment,
         &[ab.clone(), c.clone()],
         &[pre_ab, pre_c],
+        &[banked_ab.as_ref(), banked_c_stat.as_ref()],
         &padding,
         &lig_config,
         challenger,
@@ -601,6 +661,12 @@ pub struct ProveCore {
     /// Real R1CS instances have `k_log >= 16` so this branch only fires in
     /// tiny test setups.
     pub s_hat_v_ab: Option<Vec<F128>>,
+    /// Banked AB statistic for the direct (basis-free) open — the same
+    /// z_vec reassociation with the lowest `initial_k` tail coords retained.
+    pub banked_ab: Option<pcs::ring_switch::BankedShatV>,
+    /// Banked C statistic, captured for free in zerocheck round 1's stripe
+    /// fold. `None` off the stripe path or when 7 + initial_k > k_log.
+    pub banked_c: Option<pcs::ring_switch::BankedShatV>,
     /// Precomputed `s_hat_v` for the C claim — produced by zerocheck round 1's
     /// two-bank fusion kernel (one extra `vld1q+veorq` per chunk-lane-b_med
     /// vs the original single-bank C-side). Skips `fold_1b_rows` for the C
@@ -746,6 +812,9 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     challenger: &mut Ch,
 ) -> ProveCore {
     let padding = r1cs.padding_spec();
+    let lig_config = pcs_params
+        .ligerito_prover_config()
+        .expect("Ligerito default config; bump m for tiny instances");
     let ((commitment, prover_data), ab_pre) = commit_with_ab_hoist(
         || match prefaulted_codeword {
             Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
@@ -758,7 +827,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     );
     bind_statement(challenger, r1cs, &commitment);
 
-    let (zc_proof, zc_claim, s_hat_v_c) = {
+    let (zc_proof, zc_claim, s_hat_v_c, banked_c) = {
         // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
         let a_packed: &[u8] = unsafe {
             std::slice::from_raw_parts(
@@ -793,13 +862,16 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
                     stripe: &z_packed_lincheck,
                     k_log: r1cs.k_log,
                     useful_bits: r1cs.useful_bits,
+                    banked_c: (lig_config.initial_k + pcs::LOG_PACKING <= r1cs.k_log)
+                        .then_some(lig_config.initial_k),
                 },
                 ab_pre.as_ref(),
             )
         } else {
-            zerocheck::prove_packed_padded_capture_s_hat_v_c(
+            let (proof, claim, s) = zerocheck::prove_packed_padded_capture_s_hat_v_c(
                 a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
-            )
+            );
+            (proof, claim, s, None)
         }
     };
     // Nothing downstream reads a/b (zerocheck consumed them in rounds 1–2);
@@ -870,6 +942,17 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     } else {
         None
     };
+    // Banked AB statistic for the direct open: same reassociation, the
+    // lowest initial_k tail coords retained (free — z_vec is tiny).
+    let banked_ab = (r1cs.k_log >= pcs::LOG_PACKING
+        && lc_claim.r_inner_rest.len() >= 1 + lig_config.initial_k)
+        .then(|| {
+            pcs::ring_switch::banked_s_hat_v_from_z_vec(
+                &z_vec_pre,
+                &lc_claim.r_inner_rest[1..],
+                lig_config.initial_k,
+            )
+        });
 
     ProveCore {
         zc_proof,
@@ -881,6 +964,8 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         z_packed,
         s_hat_v_ab,
         s_hat_v_c,
+        banked_ab,
+        banked_c: banked_c.map(|banks| pcs::ring_switch::BankedShatV { banks }),
     }
 }
 
@@ -942,7 +1027,7 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
 
     // --- zerocheck ---
     let t0 = Instant::now();
-    let (zc_proof, zc_claim, s_hat_v_c) = {
+    let (zc_proof, zc_claim, s_hat_v_c, banked_c) = {
         let a_packed: &[u8] = unsafe {
             std::slice::from_raw_parts(
                 a_packed_f128.as_ptr() as *const u8,
@@ -976,13 +1061,16 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
                     stripe: &z_packed_lincheck,
                     k_log: r1cs.k_log,
                     useful_bits: r1cs.useful_bits,
+                    banked_c: (lig_config.initial_k + pcs::LOG_PACKING <= r1cs.k_log)
+                        .then_some(lig_config.initial_k),
                 },
                 ab_pre.as_ref(),
             )
         } else {
-            zerocheck::prove_packed_padded_capture_s_hat_v_c(
+            let (proof, claim, s) = zerocheck::prove_packed_padded_capture_s_hat_v_c(
                 a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
-            )
+            );
+            (proof, claim, s, None)
         }
     };
     t.zerocheck_s = t0.elapsed().as_secs_f64();
@@ -1043,18 +1131,33 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
     } else {
         None
     };
+    // Banked AB statistic for the direct open: same reassociation, the
+    // lowest initial_k tail coords retained (free — z_vec is tiny).
+    let banked_ab = (r1cs.k_log >= pcs::LOG_PACKING
+        && lc_claim.r_inner_rest.len() >= 1 + lig_config.initial_k)
+        .then(|| {
+            pcs::ring_switch::banked_s_hat_v_from_z_vec(
+                &z_vec_pre,
+                &lc_claim.r_inner_rest[1..],
+                lig_config.initial_k,
+            )
+        });
     t.lincheck_s = t0.elapsed().as_secs_f64();
 
     // --- Ligerito recursive PCS open ---
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
     let t0 = Instant::now();
+    // C banked statistic from the zerocheck stripe capture (raw banks).
+    let banked_c_stat =
+        banked_c.map(|banks| pcs::ring_switch::BankedShatV { banks });
     let pcs_open = open_claims_with_precomputed_ligerito(
         z_packed,
         &prover_data,
         &commitment,
         &[ab.clone(), c.clone()],
         &[pre_ab, pre_c],
+        &[banked_ab.as_ref(), banked_c_stat.as_ref()],
         &padding,
         &lig_config,
         challenger,

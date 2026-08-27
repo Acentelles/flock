@@ -250,6 +250,38 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     lig_config: &ligerito::ProverConfig,
     challenger: &mut Ch,
 ) -> BatchOpeningProofLigerito {
+    open_batch_mixed_ligerito_with_precomputed_s_hat_v_banked(
+        packed_witness,
+        prover_data,
+        commitment,
+        x_outers,
+        precomputed_s_hat_v,
+        &[],
+        packed_direct,
+        padding,
+        lig_config,
+        challenger,
+    )
+}
+
+/// Like [`open_batch_mixed_ligerito_with_precomputed_s_hat_v`], additionally
+/// accepting per-claim BANKED statistics for the direct (basis-free) opening.
+/// Claims without a supplied bank fall back to the reference scan when the
+/// direct gate fires (tests / exotic callers); production provers supply
+/// banks captured for free in lincheck (AB) and zerocheck round 1 (C).
+#[allow(clippy::too_many_arguments)]
+pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v_banked<Ch: Challenger>(
+    packed_witness: Vec<F128>,
+    prover_data: &ProverData,
+    commitment: &Commitment,
+    x_outers: &[&[F128]],
+    precomputed_s_hat_v: &[Option<&[F128]>],
+    banked_s_hat_v: &[Option<&ring_switch::BankedShatV>],
+    packed_direct: &[PackedDirectClaim],
+    padding: &PaddingSpec,
+    lig_config: &ligerito::ProverConfig,
+    challenger: &mut Ch,
+) -> BatchOpeningProofLigerito {
     let trace = std::env::var("PCS_TRACE").is_ok();
     let t_total = std::time::Instant::now();
 
@@ -277,6 +309,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
         &packed_witness,
         x_outers,
         precomputed_s_hat_v,
+        banked_s_hat_v,
         packed_direct,
         direct_c,
         padding,
@@ -353,6 +386,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     packed_witness: &[F128],
     x_outers: &[&[F128]],
     precomputed_s_hat_v: &[Option<&[F128]>],
+    banked_in: &[Option<&ring_switch::BankedShatV>],
     packed_direct: &[PackedDirectClaim],
     direct_c: usize,
     padding: &PaddingSpec,
@@ -384,16 +418,37 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                 && suffix.iter().filter(|&&c| c == F128::ZERO).count()
                     < ring_switch::SPARSE_ZERO_THRESHOLD
         });
+    // Prefer caller-supplied banks (captured for free upstream); fall back
+    // to the reference scan per claim only where absent.
     let banked: Vec<Option<ring_switch::BankedShatV>> = if use_direct {
         x_outers
             .iter()
-            .map(|x| Some(ring_switch::banked_s_hat_v_naive(packed_witness, &x[1..], direct_c)))
+            .enumerate()
+            .map(|(k, x)| match banked_in.get(k).copied().flatten() {
+                Some(_) => None, // borrowed below
+                None => Some(ring_switch::banked_s_hat_v_naive(
+                    packed_witness,
+                    &x[1..],
+                    direct_c,
+                )),
+            })
             .collect()
     } else {
         Vec::new()
     };
-    let banked_refs: Vec<Option<&ring_switch::BankedShatV>> =
-        banked.iter().map(|b| b.as_ref()).collect();
+    let banked_refs: Vec<Option<&ring_switch::BankedShatV>> = if use_direct {
+        (0..x_outers.len())
+            .map(|k| {
+                banked_in
+                    .get(k)
+                    .copied()
+                    .flatten()
+                    .or_else(|| banked[k].as_ref())
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // 1. Ring-switching for all x_outers.
     let t = std::time::Instant::now();
