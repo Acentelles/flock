@@ -803,16 +803,6 @@ impl CircuitShape {
         self.registry_slot[s.0]
     }
 
-    /// How many values [`run`](Self::run) expects.
-    pub fn num_inputs(&self) -> usize {
-        self.inputs.len()
-    }
-
-    /// How many hints [`run`](Self::run) expects.
-    pub fn num_hints(&self) -> usize {
-        self.n_hints
-    }
-
     /// **The online phase.** Evaluate every gate against `inputs` and `hints`,
     /// producing this proof's witness and public segment.
     ///

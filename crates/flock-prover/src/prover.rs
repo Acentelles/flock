@@ -490,9 +490,9 @@ enum UnionProveBinding<'a> {
 /// A circuit's prover input: the circuit (whose gate counts must be the
 /// union's declared counts) and its public words, in public-segment order.
 #[derive(Clone, Copy)]
-pub struct CircuitProverInput<'a> {
-    pub circuit: &'a flock_core::circuit::Circuit,
-    pub public: &'a [F128],
+struct CircuitProverInput<'a> {
+    circuit: &'a flock_core::circuit::Circuit,
+    public: &'a [F128],
 }
 
 /// The **circuit** prove entry over the MERGED transport — the production

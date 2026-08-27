@@ -2065,31 +2065,6 @@ pub fn verify_frobenius_assist_with_grinding<C: Challenger>(
     )
 }
 
-/// [`verify_frobenius_assist`] plus the deferred export — transcript-
-/// identical, since the export only copies values the plain path already
-/// computes.
-pub fn verify_frobenius_assist_deferred<C: Challenger>(
-    params: &JaggedParams,
-    claims: &[FrobeniusClaim<'_>],
-    groups: &[(ScalarGroupClaim<'_>, F128)],
-    rho: &[F128],
-    proof: &FrobeniusAssistProof,
-    challenger: &mut C,
-) -> Option<(F128, AssistDefer)> {
-    let mut out = None;
-    let v = verify_frobenius_assist_core(
-        params,
-        claims,
-        groups,
-        rho,
-        proof,
-        0,
-        challenger,
-        Some(&mut out),
-    )?;
-    Some((v, out.expect("the deferred core fills the export")))
-}
-
 fn verify_frobenius_assist_core<C: Challenger>(
     params: &JaggedParams,
     claims: &[FrobeniusClaim<'_>],
@@ -4414,29 +4389,9 @@ pub struct MultipointDefer {
     pub group_coeffs: Vec<F128>,
 }
 
-/// [`verify_multipoint_twisted`] plus the deferred export —
+/// Deferred counterpart to [`verify_multipoint_twisted_with_grinding`] —
 /// transcript-identical, the export only copies what the plain path
 /// computes.
-pub fn verify_multipoint_twisted_deferred<C: Challenger>(
-    params: &JaggedParams,
-    claims: &[FrobeniusClaim<'_>],
-    groups: &[ScalarGroupClaim<'_>],
-    rho: &[F128],
-    proof: &MultipointTwistedProof,
-    challenger: &mut C,
-) -> Option<(F128, MultipointDefer)> {
-    verify_multipoint_twisted_deferred_with_grinding(
-        params,
-        claims,
-        groups,
-        rho,
-        proof,
-        MultipointGrinding::disabled(),
-        challenger,
-    )
-}
-
-/// Deferred counterpart to [`verify_multipoint_twisted_with_grinding`].
 pub fn verify_multipoint_twisted_deferred_with_grinding<C: Challenger>(
     params: &JaggedParams,
     claims: &[FrobeniusClaim<'_>],

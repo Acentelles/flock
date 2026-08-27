@@ -31,7 +31,7 @@ pub use commit::{
     Commitment, PcsParams, ProverData, commit, commit_into, commit_lane_major, dense_lanes,
     prefault_codeword_during,
 };
-pub use pack::{LOG_PACKING, pack_witness, unpack_witness};
+pub use pack::{LOG_PACKING, pack_witness};
 pub use ring_switch::{RingSwitchProof, SparseEqTensor};
 
 use crate::challenger::Challenger;
@@ -2359,7 +2359,7 @@ mod tests {
     /// and verify_opening_batch_ligerito_mixed. Single ring-switched claim
     /// (no PD — PD path is task #11).
     #[test]
-    #[ignore] // Heavier — ~50-100 ms; run with `cargo test pcs_ligerito_roundtrip -- --ignored --nocapture`
+    #[ignore] // Heavier — ~50-100 ms; run with `cargo test pcs_ligerito_backend_roundtrip -- --ignored --nocapture`
     fn pcs_ligerito_backend_roundtrip() {
         let m = 22usize;
         let mut rng = Rng::new(0x11_6E_2170);

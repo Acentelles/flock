@@ -141,18 +141,6 @@ impl LigeritoProfile {
             Self::Secure => "secure",
         }
     }
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "fast" => Some(Self::Fast),
-            "fast100" => Some(Self::Fast100),
-            "fast128" => Some(Self::Fast128),
-            "slim" => Some(Self::Slim),
-            "slim100" => Some(Self::Slim100),
-            "slim128" => Some(Self::Slim128),
-            "secure" => Some(Self::Secure),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -3966,6 +3954,10 @@ pub type BasisWindowFn<'a> = &'a (dyn Fn(&mut [F128], usize) + Sync);
 /// pairing used by a lane-major L0 fold.  The same task decomposition covers
 /// both cases: at `d = 1`, one task folds four adjacent input entries into
 /// two output entries and accumulates exactly one next-round message pair.
+// Test-only since the F128 `SumcheckProver::fold_blocked_jit` wrapper was
+// deleted (bloat ledger §A): the production JIT fold is the F256 one in
+// `extension`; the in-file jit-equivalence test keeps this as its oracle.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn fold_and_msg_blocked_jit(
     f: &[F128],
@@ -4322,44 +4314,6 @@ impl SumcheckProver {
         (inst, first_msg)
     }
 
-    /// Like [`Self::new_with_first_msg`] but with NO materialized basis: the
-    /// first fold sources it just-in-time ([`Self::fold_blocked_jit`]), after
-    /// which `combined_basis` holds the (half-size) folded basis and every
-    /// later round proceeds normally.
-    pub fn new_jit(f: Vec<F128>, h1: F128, first_msg: SumcheckMessage) -> (Self, SumcheckMessage) {
-        let mut inst = Self {
-            f,
-            combined_basis: Vec::new(),
-            t_r: h1,
-            transcript: Vec::new(),
-            pending_glue: None,
-            pending_fold: None,
-        };
-        inst.transcript.push(first_msg);
-        (inst, first_msg)
-    }
-
-    /// [`Self::fold_blocked`] with the basis filled on demand rather than read
-    /// from a materialized array. Only valid as the FIRST fold (the basis is
-    /// materialized from here on).
-    pub fn fold_blocked_jit(
-        &mut self,
-        r: F128,
-        d: usize,
-        live_in: usize,
-        fill: BasisWindowFn<'_>,
-    ) -> SumcheckMessage {
-        debug_assert!(
-            self.combined_basis.is_empty(),
-            "the JIT basis is only available for the first fold"
-        );
-        let (nf, nb, msg) = fold_and_msg_blocked_jit(&self.f, fill, r, d, live_in);
-        self.f = nf;
-        self.combined_basis = nb;
-        self.transcript.push(msg);
-        msg
-    }
-
     pub fn fold(&mut self, r: F128) -> SumcheckMessage {
         self.fold_blocked(r, 1, usize::MAX)
     }
@@ -4495,12 +4449,6 @@ impl SumcheckProver {
     pub fn f(&self) -> &[F128] {
         debug_assert!(self.pending_fold.is_none(), "f() with pending fold");
         &self.f
-    }
-
-    /// Current (materialized) array length; a pending lookahead fold is not
-    /// yet applied to it.
-    pub fn f_len(&self) -> usize {
-        self.f.len()
     }
 
     pub fn has_pending_fold(&self) -> bool {

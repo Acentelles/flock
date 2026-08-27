@@ -82,11 +82,6 @@ impl ZerocheckGrinding {
         Self { enabled: true }
     }
 
-    /// Whether this policy inserts PoW operations into the transcript.
-    pub const fn is_enabled(self) -> bool {
-        self.enabled
-    }
-
     /// Number of leading-zero bits which strictly turns
     /// `numerator / 2^128` into a value below `2^-128`.
     ///

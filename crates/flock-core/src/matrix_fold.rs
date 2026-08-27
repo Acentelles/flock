@@ -664,11 +664,6 @@ fn scatter_cols(
         )
 }
 
-/// `out[r] = Σ_c w[c]·M[r,c]` — free function kept for existing callers.
-pub fn row_marginal(m: &SparseBinaryMatrix, w: &[F128], n_rows: usize) -> Vec<F128> {
-    FoldMatrix::row_marginal(m, w, n_rows)
-}
-
 /// `out[c] = Σ_r w[r]·M[r,c]` — free function kept for existing callers.
 pub fn col_marginal(m: &SparseBinaryMatrix, w: &[F128], n_cols: usize) -> Vec<F128> {
     FoldMatrix::col_marginal(m, w, n_cols)

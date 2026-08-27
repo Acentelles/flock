@@ -1164,27 +1164,6 @@ pub fn min_n_blocks_log(n_compressions: usize) -> usize {
     n.next_power_of_two().trailing_zeros() as usize
 }
 
-/// Build the boolean witness across `2^n_blocks_log` blocks, one compression
-/// per block. Parallelized via rayon.
-pub fn generate_witness(compressions: &[([u32; 8], [u32; 16])], n_blocks_log: usize) -> Vec<bool> {
-    use rayon::prelude::*;
-    let n_total_blocks = 1usize << n_blocks_log;
-    assert!(compressions.len() <= n_total_blocks);
-
-    let mut z = vec![false; n_total_blocks * K];
-    z.par_chunks_mut(K)
-        .enumerate()
-        .for_each(|(block_idx, chunk)| {
-            if block_idx >= compressions.len() {
-                return; // padding k-block (all zeros)
-            }
-            let (h_in, m) = &compressions[block_idx];
-            let block_witness = build_block_witness(h_in, m);
-            chunk.copy_from_slice(&block_witness);
-        });
-    z
-}
-
 /// The monolithic SHA-256 R1CS + its single-slot union registry. Batch
 /// proving ([`Self::prove_fast`]) goes through the UNION commit (dense
 /// stack + integer lanes; `pcs_params` are the union params); the
@@ -1301,23 +1280,6 @@ impl Sha256HybridSetup {
     }
     pub fn n_block_slots(&self) -> usize {
         1usize << self.n_blocks_log()
-    }
-
-    pub fn generate_witness(&self, compressions: &[([u32; 8], [u32; 16])]) -> Vec<bool> {
-        assert_eq!(compressions.len(), self.n_compressions);
-        generate_witness(compressions, self.n_blocks_log())
-    }
-
-    /// Packed witness trace for the generic (matrix-driven) provers — the
-    /// per-circuit code they need. Implemented by reusing the fused builder
-    /// (its a/b outputs are discarded): no separate packed-trace writer to
-    /// maintain, and ~5× cheaper than the bool trace → `pack_witness` path.
-    pub fn generate_witness_packed(
-        &self,
-        compressions: &[([u32; 8], [u32; 16])],
-    ) -> Vec<flock_core::field::F128> {
-        let (z_packed, _a, _b, _stripe) = self.generate_witness_ab(compressions);
-        z_packed
     }
 
     /// Prove `n_compressions` over the single-slot UNION commit (dense

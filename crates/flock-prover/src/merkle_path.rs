@@ -309,6 +309,7 @@ fn eval_bit_mle(b_bits: &[bool], r: &[F128]) -> F128 {
 ///   `B(i_p · L) := 0` by convention; the other bits select which half of each
 ///   row's input is the within-path chain link.
 /// - `layout` — which slot indices hold Z, X_L, X_R.
+#[cfg(test)] // no-grinding wrapper; production goes through `_with_grinding`
 #[allow(clippy::too_many_arguments)]
 pub fn prove_merkle_path_shift<Ch: Challenger>(
     path_log: usize,
@@ -602,6 +603,7 @@ pub fn prove_merkle_path_shift_with_grinding<Ch: Challenger>(
 /// `leaf_{i_p}(r)` (the r-fold of path `i_p`'s leaf bit-vector); `root_r` is
 /// the single shared `root(r)` scalar. For `path_log=0`, `leaf_evals` must be
 /// length 1 (the single-path leaf).
+#[cfg(test)] // no-grinding wrapper; production goes through `_with_grinding`
 #[allow(clippy::too_many_arguments)]
 pub fn verify_merkle_path_shift<Ch: Challenger>(
     path_log: usize,

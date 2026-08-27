@@ -216,13 +216,6 @@ impl PcsParams {
     pub fn codeword_len_f128(&self) -> usize {
         self.n_positions() * self.num_ntts()
     }
-    /// `log_2` of the F_{2^128} count per **initial** Merkle leaf
-    /// (= `log_batch_size`; just the row-batch lanes per position). Meaningful
-    /// only on the power-of-two path; the integer-lane leaf width is
-    /// `num_ntts()` (see [`Self::leaf_size_bytes`]).
-    pub fn log_leaf_f128_count(&self) -> usize {
-        self.log_batch_size
-    }
     /// Number of initial-tree Merkle leaves = per-lane codeword length
     /// `2^k_code` (= `n_positions()`). UNCHANGED by the integer-lane commit —
     /// only the leaf WIDTH shrinks, not the leaf count.
@@ -265,24 +258,11 @@ impl PcsParams {
         Ok(cfg)
     }
 
-    /// The L0 query count these params imply — the exact rule every opener
-    /// uses to pick its config: the embedded security config when one exists
-    /// for `(log_msg_len, log_batch_size, profile)` (the flock-prover
-    /// paths), else `udr_queries(log_inv_rate)` (the `default_config` paths:
-    /// the standalone element proof and the permutation check, whose
-    /// `queries[0]` IS `udr_queries`). Commit-time cap sizing MUST agree
-    /// with the opener's config — this is that single source of truth.
-    pub fn l0_queries(&self) -> usize {
-        match self.ligerito_prover_config() {
-            Ok(cfg) => cfg.queries[0],
-            Err(_) => crate::pcs::ligerito::udr_queries(self.log_inv_rate),
-        }
-    }
-
     /// Cap depth of the L0 commitment tree — the opener config's own rule
     /// ([`ligerito::ProverConfig::l0_cap_depth`]): the stratified schedule's
     /// cap when the config opts in, else the legacy `min(⌈log2 q₀⌉,
-    /// k_code)`. The `udr_queries` fallback mirrors [`Self::l0_queries`].
+    /// k_code)`. The `udr_queries` fallback mirrors the opener's config
+    /// fallback, so commit-time cap sizing always agrees with the opener.
     pub fn l0_cap_depth(&self) -> usize {
         match self.ligerito_prover_config() {
             Ok(cfg) => cfg.l0_cap_depth(),

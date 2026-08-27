@@ -547,11 +547,6 @@ impl Circuit {
     pub fn registry(&self) -> &Registry {
         &self.registry
     }
-    /// Fixed-value policy in public-segment order.
-    pub fn fixed_public(&self) -> &[Option<F128>] {
-        &self.fixed_public
-    }
-
     /// Check the public segment's shape and every digest-bound constant.
     pub fn check_public(&self, public: &[F128]) -> bool {
         public.len() == self.num_public
@@ -1239,23 +1234,6 @@ fn verify_wiring_core<C: Challenger>(
             .collect(),
         assertion,
     ))
-}
-
-/// The wire classes a circuit declares, as cells — the brute-force oracle's
-/// view (and a convenience for test circuits). Cell indices back to `(slot,
-/// row)`.
-pub fn wire_cells(circuit: &Circuit) -> Vec<Vec<Cell>> {
-    let nu = circuit.cells().nu();
-    circuit
-        .wires()
-        .iter()
-        .map(|class| {
-            class
-                .iter()
-                .map(|&idx| Cell::new(idx >> nu, idx & ((1usize << nu) - 1)))
-                .collect()
-        })
-        .collect()
 }
 
 #[cfg(test)]

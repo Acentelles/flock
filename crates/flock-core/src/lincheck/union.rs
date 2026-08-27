@@ -944,27 +944,6 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
     ))
 }
 
-/// [`verify_union`] with the two halves timed separately — benchmark-only.
-/// Returns the claim plus the wall-clock seconds spent discharging the
-/// [`MatrixAssertion`], i.e. the `O(Σ_t nnz_t)` matrix work. The remainder
-/// of the caller's lincheck time is the succinct verifier — the part a
-/// recursion circuit has to replay.
-pub fn verify_union_timed<Ch: Challenger>(
-    union: &UnionInstance<'_>,
-    circuits: &[&dyn LincheckCircuit],
-    x_ab: &QuirkyPoint,
-    v_a: F128,
-    v_b: F128,
-    proof: &LincheckProof,
-    challenger: &mut Ch,
-) -> Result<(LincheckClaim, f64), VerifyError> {
-    let (claim, assertion) =
-        verify_union_deferred(union, circuits, x_ab, v_a, v_b, proof, challenger)?;
-    let t = std::time::Instant::now();
-    assertion.check(union, circuits)?;
-    Ok((claim, t.elapsed().as_secs_f64()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

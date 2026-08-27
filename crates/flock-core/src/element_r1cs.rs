@@ -142,11 +142,6 @@ impl SparseF128Matrix {
         Ok(())
     }
 
-    /// Number of stored (non-zero) entries.
-    pub fn nnz(&self) -> usize {
-        self.rows.iter().map(Vec::len).sum()
-    }
-
     /// `M[row] · v` for a length-`num_cols` slice.
     pub fn row_dot(&self, row: usize, v: &[F128]) -> F128 {
         debug_assert_eq!(v.len(), self.num_cols);

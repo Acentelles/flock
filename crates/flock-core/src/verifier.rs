@@ -43,27 +43,6 @@ pub enum VerifyError {
     NonIdentityC,
 }
 
-/// Per-phase wall-clock timings (seconds) of a verify, for benchmark cost
-/// breakdowns. Produced by [`verify_ligerito_timed`] (direct) and
-/// [`verify_ligerito_jagged_union_timed`] (union). Benchmark-only.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct VerifyPhaseTimings {
-    /// `zerocheck::verify` — the zerocheck PIOP replay.
-    pub zerocheck_s: f64,
-    /// The full lincheck verify (`lincheck::verify` / `lincheck::verify_union`)
-    /// including the per-type comb construction below.
-    pub lincheck_s: f64,
-    /// UNION only: the per-type α-batched comb construction inside the union
-    /// lincheck verify — the `O(Σ_t nnz_t)` `fold_alpha_batched` over every
-    /// slot, i.e. the multi-slot circuit replay. `0.0` on the direct path,
-    /// whose single-table lincheck folds the comb in lockstep with the
-    /// sumcheck (no separable phase).
-    pub lincheck_comb_s: f64,
-    /// The batched PCS opening verify (`verify_claims_ligerito` /
-    /// `verify_claims_jagged_ligerito`).
-    pub open_s: f64,
-}
-
 /// Dedicated single-thread rayon pool that the verifier runs inside.
 ///
 /// The verifier is intentionally single-threaded — matching the convention of
@@ -150,85 +129,6 @@ pub fn verify_ligerito<Ch: Challenger>(
     )
     .map_err(VerifyError::PcsAb)?;
     Ok(R1csClaim { ab, c })
-}
-
-/// [`verify_ligerito`] with per-phase timers — the direct-path counterpart
-/// of [`verify_ligerito_jagged_union_timed`]. Splits the verify into
-/// zerocheck-verify / lincheck-verify / opening-verify (the single-table
-/// lincheck has no separable comb phase, so `lincheck_comb_s == 0`). Kept in
-/// lockstep with `verify_ligerito`; benchmark-only, production path
-/// undisturbed.
-pub fn verify_ligerito_timed<Ch: Challenger>(
-    r1cs: &BlockR1cs,
-    commitment: &Commitment,
-    proof: &R1csProofLigerito,
-    lincheck_circuit: &dyn lincheck::LincheckCircuit,
-    pcs_params: &crate::pcs::PcsParams,
-    challenger: &mut Ch,
-) -> Result<(R1csClaim, VerifyPhaseTimings), VerifyError> {
-    use std::time::Instant;
-    // PIOP replay (bind + zerocheck + lincheck) on the 1-thread pool.
-    let (ab, c, zerocheck_s, lincheck_s) =
-        verifier_pool().install(|| -> Result<(ZClaim, ZClaim, f64, f64), VerifyError> {
-            crate::proof::bind_statement(challenger, r1cs, commitment);
-            let t0 = Instant::now();
-            let zc_claim = zerocheck::verify_with_grinding(
-                r1cs.m,
-                &proof.zerocheck,
-                pcs_params.zerocheck_grinding(),
-                challenger,
-            )
-            .map_err(VerifyError::Zerocheck)?;
-            let zerocheck_s = t0.elapsed().as_secs_f64();
-            let x_ab = r1cs.x_ab_from_mlv(SkipPoint::Phi8(zc_claim.z), &zc_claim.mlv_challenges);
-            let t0 = Instant::now();
-            let lc_claim = lincheck::verify_with_grinding(
-                r1cs.m,
-                r1cs.k_log,
-                r1cs.k_skip,
-                lincheck_circuit,
-                &x_ab,
-                zc_claim.a_eval,
-                zc_claim.b_eval,
-                &proof.lincheck,
-                pcs_params.lincheck_grinding(),
-                challenger,
-            )
-            .map_err(VerifyError::Lincheck)?;
-            let lincheck_s = t0.elapsed().as_secs_f64();
-            let ab = ZClaim {
-                point: r1cs.ab_claim_point(
-                    lc_claim.r_inner_skip,
-                    &lc_claim.r_inner_rest,
-                    &x_ab.x_outer,
-                ),
-                value: lc_claim.w,
-            };
-            let c = ZClaim {
-                point: r1cs.c_claim_point(SkipPoint::Phi8(zc_claim.z), &zc_claim.r_rest),
-                value: zc_claim.c_eval,
-            };
-            Ok((ab, c, zerocheck_s, lincheck_s))
-        })?;
-
-    let t0 = std::time::Instant::now();
-    verify_claims_ligerito(
-        commitment,
-        &[ab.clone(), c.clone()],
-        &proof.pcs_open,
-        pcs_params,
-        challenger,
-    )
-    .map_err(VerifyError::PcsAb)?;
-    let open_s = t0.elapsed().as_secs_f64();
-
-    let t = VerifyPhaseTimings {
-        zerocheck_s,
-        lincheck_s,
-        lincheck_comb_s: 0.0,
-        open_s,
-    };
-    Ok((R1csClaim { ab, c }, t))
 }
 
 /// Statement-binding selector for the union verify path. Private: the two

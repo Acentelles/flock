@@ -130,8 +130,7 @@ mod union;
 pub use union::{
     MatrixAssertion, UnionLincheckSlot, eq_prefix_sum, eq_prefix_weight, prove_union_capture_z_vec,
     prove_union_capture_z_vec_with_grinding, union_comb_partial, verify_union,
-    verify_union_deferred, verify_union_deferred_with_grinding, verify_union_timed,
-    verify_union_with_grinding,
+    verify_union_deferred, verify_union_deferred_with_grinding, verify_union_with_grinding,
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -1672,35 +1671,12 @@ pub fn prove_with_grinding<Ch: Challenger>(
     )
 }
 
-/// Padding-aware variant of [`prove`]. `useful_bits ≤ 2^k_log` declares how
-/// many rows of each block carry real witness data; rows
-/// `[useful_bits, 2^k_log)` are honest zero padding. The partial-fold over
-/// the outer dimension skips work for those padding rows — byte-identical
-/// proof on a witness with zero-padded blocks.
-pub fn prove_padded<Ch: Challenger>(
-    z_packed: &[u8],
-    m: usize,
-    k_log: usize,
-    k_skip: usize,
-    useful_bits: usize,
-    circuit: &dyn LincheckCircuit,
-    x_ab: &QuirkyPoint,
-    challenger: &mut Ch,
-) -> (LincheckProof, LincheckClaim) {
-    prove_padded_with_grinding(
-        z_packed,
-        m,
-        k_log,
-        k_skip,
-        useful_bits,
-        circuit,
-        x_ab,
-        LincheckGrinding::disabled(),
-        challenger,
-    )
-}
-
-/// [`prove_padded`] with an explicit Fiat--Shamir grinding policy.
+/// Padding-aware variant of [`prove`], with an explicit Fiat--Shamir
+/// grinding policy. `useful_bits ≤ 2^k_log` declares how many rows of each
+/// block carry real witness data; rows `[useful_bits, 2^k_log)` are honest
+/// zero padding. The partial-fold over the outer dimension skips work for
+/// those padding rows — byte-identical proof on a witness with zero-padded
+/// blocks.
 pub fn prove_padded_with_grinding<Ch: Challenger>(
     z_packed: &[u8],
     m: usize,

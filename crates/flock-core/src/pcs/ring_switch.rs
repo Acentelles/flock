@@ -173,19 +173,12 @@ pub fn build_claim_weights(z_skip: F128, x_outer_0: F128) -> Vec<F128> {
     build_claim_weights_from_skip(&lagrange_weights_naive(K_SKIP, z_skip), x_outer_0)
 }
 
-/// Batched version of [`fold_1b_rows_naive`]: compute `s_hat_v_k` for each
-/// `suffix_tensors[k]` in a single bit-scan over `packed_witness`. Halves the
-/// amortized bit-scanning cost vs calling `fold_1b_rows_naive` per suffix.
-///
-/// All suffix tensors must have the same length as `packed_witness`.
-pub fn fold_1b_rows_multi(packed_witness: &[F128], suffix_tensors: &[&[F128]]) -> Vec<Vec<F128>> {
-    let m = LOG_PACKING + (packed_witness.len().trailing_zeros() as usize);
-    fold_1b_rows_multi_padded(packed_witness, suffix_tensors, &PaddingSpec::dense(m))
-}
-
-/// Padding-aware variant of [`fold_1b_rows_multi`]. Routes the k=2 MFR fast
-/// paths through their `_padded` kernels; the scalar bit-scan fallback (k ≠ 2
-/// or non-divisible len) is untouched — those `m` are tiny anyway.
+/// Batched, padding-aware version of [`fold_1b_rows_naive`]: compute
+/// `s_hat_v_k` for each `suffix_tensors[k]` in a single bit-scan over
+/// `packed_witness` (all suffix tensors must have the same length). Routes
+/// the k=2 MFR fast paths through their `_padded` kernels; the scalar
+/// bit-scan fallback (k ≠ 2 or non-divisible len) is untouched — those `m`
+/// are tiny anyway.
 pub fn fold_1b_rows_multi_padded(
     packed_witness: &[F128],
     suffix_tensors: &[&[F128]],
@@ -2301,34 +2294,6 @@ impl RsEqInd {
         }
     }
 
-    /// Accumulate `gamma * self[j]` into `out[j]` for all `j`. Sparse variants
-    /// touch only their support; dense variants iterate `out` in lockstep.
-    pub fn add_scaled_into(&self, gamma: F128, out: &mut [F128]) {
-        debug_assert_eq!(out.len(), self.len());
-        match self {
-            Self::Dense(v) => {
-                for (o, &x) in out.iter_mut().zip(v.iter()) {
-                    *o += gamma * x;
-                }
-            }
-            Self::DeferredDense {
-                eq_lo,
-                eq_hi,
-                table,
-            } => {
-                let log_b = eq_lo.len().trailing_zeros() as usize;
-                for (j, o) in out.iter_mut().enumerate() {
-                    *o += gamma * deferred_dense_value(eq_lo, eq_hi, table, log_b, j);
-                }
-            }
-            Self::Sparse { entries, .. } => {
-                for &(idx, val) in entries {
-                    out[idx] += gamma * val;
-                }
-            }
-        }
-    }
-
     /// Materialize the dense view. O(L) regardless of variant; use sparingly.
     pub fn to_dense(&self) -> Vec<F128> {
         match self {
@@ -2347,22 +2312,6 @@ impl RsEqInd {
             Self::Sparse { len, entries } => {
                 let mut out = vec![F128::ZERO; *len];
                 for &(idx, val) in entries {
-                    out[idx] = val;
-                }
-                out
-            }
-        }
-    }
-
-    /// Consume into a dense `Vec<F128>`. Returns the inner vector directly when
-    /// already `Dense` (no copy).
-    pub fn into_dense(self) -> Vec<F128> {
-        match self {
-            Self::Dense(v) => v,
-            Self::DeferredDense { .. } => self.to_dense(),
-            Self::Sparse { len, entries } => {
-                let mut out = vec![F128::ZERO; len];
-                for (idx, val) in entries {
                     out[idx] = val;
                 }
                 out
@@ -3040,18 +2989,6 @@ pub struct RingSwitchVerifierOutput {
 /// `rs_eq_ind` vector. Pair with [`eval_rs_eq`] at the BaseFold final point to
 /// evaluate `MLE(rs_eq_ind)(challenges)` in `O((m − 7) · 128²)` field ops
 /// instead of `O(2^(m−7))`.
-pub fn verify_succinct<Ch: Challenger>(
-    claim: F128,
-    skip_weights: &[F128],
-    x_outer: &[F128],
-    proof: &RingSwitchProof,
-    challenger: &mut Ch,
-) -> Result<RingSwitchVerifierOutput, VerifyError> {
-    verify_succinct_with_grinding(claim, skip_weights, x_outer, proof, 0, challenger)
-}
-
-/// [`verify_succinct`] with the matching PoW check before the ring-switch
-/// point `r''`.
 pub fn verify_succinct_with_grinding<Ch: Challenger>(
     claim: F128,
     skip_weights: &[F128],

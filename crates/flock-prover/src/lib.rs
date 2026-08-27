@@ -14,7 +14,7 @@
 
 pub use flock_core::*;
 
-pub mod merkle_path;
+pub(crate) mod merkle_path;
 pub mod mixed;
 pub mod proof_io;
 pub mod prover;

@@ -252,13 +252,10 @@ pub const USEFUL_BITS: usize = Z_CONST_POS + 1; // 11,707
 /// Cell-slot indices into [`io_schema`] — the schema's order IS the
 /// enumeration order, so these are the `ι` a circuit wires against.
 pub const IO_CV0: usize = 0;
-pub const IO_CV1: usize = 1;
 pub const IO_M0: usize = 2;
 pub const IO_PARAMS: usize = 6;
 pub const IO_OUT_LO0: usize = 7;
-pub const IO_OUT_LO1: usize = 8;
 pub const IO_OUT_HI0: usize = 9;
-pub const IO_OUT_HI1: usize = 10;
 
 /// The wireable words of one compression, in 128-bit words of the row.
 ///
@@ -1659,17 +1656,6 @@ impl Blake3Setup {
     }
     pub fn n_block_slots(&self) -> usize {
         1usize << self.n_blocks_log()
-    }
-
-    pub fn generate_witness(&self, blocks: &[Compression]) -> Vec<bool> {
-        assert_eq!(
-            blocks.len(),
-            self.n_blocks,
-            "expected {} blocks, got {}",
-            self.n_blocks,
-            blocks.len()
-        );
-        generate_witness(blocks, self.n_blocks_log())
     }
 
     /// Prove `n_blocks` compressions over the single-slot UNION commit
