@@ -2057,3 +2057,27 @@ total was a Chrome-window outlier, its commit wall still won).
 Commit window now ~256-267 warm ≈ ~240s cool-window basis vs their
 224-236. Fused-3 verdict CORRECTED: the kernel shape (q-resident +
 staged NT stores), not the radix, was what failed before.
+
+### JOINT TABLE 2 (2026-08-27 afternoon): ratio ~1.2, UNCHANGED within noise
+
+  pair1: theirs 389.83 (672,460)   ours 467.88 (560,278)   1.200x
+  pair2: theirs 378.15 (693,226)   ours 465.22 (563,485)   1.230x
+  pair3: theirs 402.44 (651,389)   ours 485.22 (540,253)   1.206x
+  best-vs-best: 465.22 vs 378.15 = 1.230x  (morning: 1.206x)
+
+Their spread alone is 6% (378-402, commit 219-241) with NO code changes
+on their side (verified: their last commit Aug 18, same 7-file diff) —
+the per-pair ratio noise floor is ±3%. HONEST RECONCILIATION of today's
+afternoon commit work: bucket-level cross-window truth = commit 273.4
+(morning calm) → ~263 (best current samples) ≈ −11, NOT the −36 the
+stacked within-window certs implied. The streaming-commit A/B's totals
+line (−23, 3/3) overstated its bucket line (−7, 2/3) — the bucket was
+the truthful number, and part of the totals margin was window texture
+that survived alternation. Ranked top's −13 wall partially overlaps in
+the bucket view. Rule reinforced: certify on the phase/bucket the
+mechanism lives in; totals inherit too much window. Current calm-basis
+gap decomposition: commit +35-40 (ours ~263 vs theirs 219-241 — their
+remaining edge = deep pair fusion + whole-prove epool depth), zc +20
+(r2 anchor+delta priced −5..8/800 lines), open +7, lincheck +3,
+witness +1. Ours slot-3 zc bucket read 174.2 in its traced run —
+polluted sample, excluded from analysis.
