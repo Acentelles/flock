@@ -3521,10 +3521,13 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         direct_prefix.push(msg);
         let mut t_run = target;
         let mut f_run = packed_witness;
+        let mut t_grind = std::time::Duration::ZERO;
         for j in 0..initial_k {
             let bits = fold_bits(0).saturating_sub(j as u32);
             if bits > 0 {
+                let _tg = std::time::Instant::now();
                 fold_grinding_nonces.push(challenger.grind_pow(bits));
+                t_grind += _tg.elapsed();
             }
             let r = challenger.sample_f128();
             // Verifier's running target: q_j(r) = u_0 + r·(T + u_2) + r²·u_2.
@@ -3546,28 +3549,45 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         // the per-round fold chain's ~2L traffic becomes ~1.03L. Exact: the
         // composed Lagrange weights are the same product of per-round fold
         // factors, and F128 sums are order-free.
+        if trace {
+            eprintln!("    [direct-l0] fold grinds: {:6.2} ms", t_grind.as_secs_f64() * 1e3);
+        }
+        let _tf = std::time::Instant::now();
         let lag = crate::zerocheck::univariate_skip::build_eq(&r_lane_fold);
         let f_run = fold_f_composed_par(f_run, &lag);
+        if trace {
+            eprintln!("    [direct-l0] composed f-fold: {:6.2} ms", _tf.elapsed().as_secs_f64() * 1e3);
+        }
+        let _tb = std::time::Instant::now();
         // Residual basis from the exit generators (the fully-folded W
         // columns; γ baked in, so claims just add), then rejoin the
         // incumbent flow — SumcheckProver::new computes the boundary
         // round's message over the (small) folded pair.
-        let mut it = claims.iter();
-        let first = it.next().expect("nonempty");
-        let mut b1 = crate::pcs::ring_switch::fold_b128_elems(
-            &crate::zerocheck::univariate_skip::build_eq(&first.hi_suffix),
-            &first.claim.exit_generators(),
-        );
-        for bundle in it {
-            let part = crate::pcs::ring_switch::fold_b128_elems(
+        // Dense residual: build_eq + mul-free table fold. (The split-tensor
+        // variant was tried and is SLOWER here — its per-slot multiply
+        // outweighs the saved 2^(ℓ-c) tensor build at this size.)
+        let residual = |bundle: &crate::pcs::ring_switch::DirectClaimBundle| -> Vec<F128> {
+            crate::pcs::ring_switch::fold_b128_elems(
                 &crate::zerocheck::univariate_skip::build_eq(&bundle.hi_suffix),
                 &bundle.claim.exit_generators(),
-            );
+            )
+        };
+        let mut it = claims.iter();
+        let mut b1 = residual(it.next().expect("nonempty"));
+        for bundle in it {
+            let part = residual(bundle);
             use rayon::prelude::*;
             b1.par_iter_mut().zip(part.par_iter()).for_each(|(o, v)| *o += *v);
         }
         assert_eq!(b1.len(), f_run.len(), "residual basis / witness length mismatch");
+        if trace {
+            eprintln!("    [direct-l0] residual basis b1: {:6.2} ms", _tb.elapsed().as_secs_f64() * 1e3);
+        }
+        let _ts = std::time::Instant::now();
         let (sc, boundary_msg) = SumcheckProver::new(f_run, b1, t_run);
+        if trace {
+            eprintln!("    [direct-l0] boundary SC build: {:6.2} ms", _ts.elapsed().as_secs_f64() * 1e3);
+        }
         challenger.observe_f128(boundary_msg.u_0);
         challenger.observe_f128(boundary_msg.u_2);
         sc
