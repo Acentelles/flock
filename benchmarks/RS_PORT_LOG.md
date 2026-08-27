@@ -2191,3 +2191,37 @@ kernel runs in the hoisted prep). NEW RECORD pair-5: 454.70 ms /
 vs ~116" compared our cool numbers to their warm sub-line medians —
 their zc BUCKET is 100-102, so zerocheck retains +14-19 MT post
 compact-K; the parity claim is withdrawn.
+
+### FINAL CAMPAIGN TABLE (2026-08-27 evening, grind-free, strict
+alternation, no cooldowns — both sides ~1% warm, ratios paired-valid)
+
+MT (m=32 blake 8T, GPU off):
+  ours   469.66 / 464.50 / 467.86 ms   (best 564,362 c/s)
+  theirs 381.77 / 382.60 / 383.30 ms   (best 686,648 c/s)
+  pairs 1.230 / 1.214 / 1.221 — best-vs-best 464.50/381.77 = 1.217x
+  buckets ours:   witness 30.3-30.7 / commit 261.7-266.0 / zc
+  119.5-124.7 / lincheck 19.2-19.3 / open 28.3-30.1
+  buckets theirs: 28.9-29.1 / 220.9-224.0 / 99.5-100.2 / 16.2-16.5 /
+  21.1-22.2
+
+ST (1T):
+  ours 3.24 / 3.23 s (buckets repeatable ≤0.3%: witness 230.6-231.0 /
+  commit 1265.9-1269.8 / zc 1465.2-1468.3 / lincheck 124.0-124.5 /
+  open 147.1-147.6)
+  theirs 2.82 / 2.84 s (204.0-204.6 / 1660-1690 incl. their prep /
+  761.5-765.3 / 115.7-116.4 / 100.7-100.8)
+  pairs 1.149 / 1.137 — best-vs-best 3.23/2.82 = 1.145x (campaign-best
+  ST; zc 1465 = compact-K + structured-b at 1T, was 1531 this morning)
+
+MT+GPU (theirs only; we are CPU-only by campaign rule):
+  theirs 261.44 / 246.74 ms (1,002,687 / 1,062,409 c/s) — GPU absorbs
+  commit (220-224 → 124-152) and assists zc r2 (100 → 86-88); vs our
+  CPU MT best: 464.50/246.74 = 1.883x.
+
+CAMPAIGN CLOSE: baseline → final: MT 723.9 → 454.70 record / 464.50
+this table (1.56-1.59x); ST 4781 → 3230 (1.48x). Cross-tree CPU gap:
+1.49x (ranked discovery) → 1.36x → 1.217x MT / 1.145x ST certified.
+Kept optimizations: 20+ certified with paired sign tests; nulls: 20+
+measured and reverted with written verdicts; every remaining delta
+attributed (commit MT scheduling ~35-40, zc +14-19 bucket, open +7,
+kernel-generation ST margins) and adjudicated below the bloat bar.
