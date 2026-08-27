@@ -781,6 +781,16 @@ keep decision), transcript identity re-checked at each step.
 \item[Result:] Induce $6.6$--$8.5\to5.4$--$6.7\,$ms at $m{=}32$ 8T. Certified jointly with \S\ref{sec:boundaryjoin}: open bucket paired sign $3/3$ ($-2.8/-3.2/-8.0$, avg $-4.7\,$ms), grind-free protocol. Byte-equality tests cover the blocked run with and without the fused low-half tail.
 \end{optsummary}
 
+\subsection{Recursive commits from the message}
+\label{sec:recursivefill}
+
+\begin{optsummary}
+\item[Baseline:] Each recursive Ligerito level's commit replicated its folded witness into the codeword buffer (a full write plus read-for-ownership), then transformed from the rate layers: L1 alone is a 32\,MB fill ahead of the NTT.
+\item[Improvement:] The first fused top pass reads its rows straight from the compact folded witness (\code{from\_message}), so the standalone replicate pass and its RFO traffic disappear.
+\item[Mechanism:] The same fused pass had been built for the \emph{main} commit and adjudicated null there (its join window is compute-limited, so deleted traffic bought nothing); the recursive commits run standalone and bandwidth-bound, where the challenge tree's equivalent measures fill $= 0.00$. The reverted patch was resurrected for this path only.
+\item[Result:] L1 fill $0.5\to0$, all-in NTT $5.2$--$6.9\to5.0$--$5.2$; recursive commits $14.3$--$15.5\to12.9$--$13.3\,$ms at $m{=}32$ 8T. Open bucket paired sign $3/3$ ($-2.35/-1.60/-0.56$, avg $-1.5$), totals $3/3$.
+\end{optsummary}
+
 \section{Merkle hashing: BLAKE3}
 
 \subsection{Two transposed four-wide states in flight}
@@ -921,6 +931,16 @@ explicit call.
 
 \section*{Summary}
 
+\paragraph{Measurement protocol.} Results before 2026-08-27 include
+proof-of-work grinding; later entries marked \emph{grind-free} zero the
+grinding bits on both trees (\code{FLOCK\_NO\_GRIND=1}; the library
+verifiers stay honest, so such proofs fail verification by design) —
+nonce-search luck otherwise adds variance paired runs cannot cancel.
+Grind-free figures form their own baseline family. Sub-3-ms phase-local
+effects are certified by pairing the phase line itself rather than
+bucket or total times.
+
+
 \begin{table}[h]
 \centering
 \small
@@ -940,6 +960,7 @@ Section & Kind & Phase effect (ST) & Sign test\\
 \S\ref{sec:directopenrefine} & pass fusion & open ($m{=}32$): $-20\%$ 8T & $3/3$ disjoint\\
 \S\ref{sec:cascade} & pass fusion & zc tail ($m{=}32$): $-38\%$ 8T & $4/4$ disjoint\\
 \S\ref{sec:inducetrunc}+\S\ref{sec:lazyood} & work removal & open ($m{=}32$): $-9\%$ 8T & $3/3$ disjoint\\
+\S\ref{sec:recursivefill} & pass fusion & open ($m{=}32$): $-1.5\,$ms 8T & sign $3/3$\\
 \S\ref{sec:boundaryjoin}+\S\ref{sec:blockedtranspose} & scheduling, pass fusion & open ($m{=}32$): $-12\%$ 8T & sign $3/3$\\
 \S\ref{sec:streamcommit} & architecture & commit+prep ($m{=}32$): $-3\%$ wall, $-5\%$ total & $3/3$ disjoint\\
 \S\ref{sec:rankedtop} & kernel, scheduling & commit+prep ($m{=}32$): $-5\%$ wall & $3/3$ disjoint\\
@@ -958,6 +979,8 @@ Section & Kind & Phase effect (ST) & Sign test\\
   \multicolumn{2}{r@{}}{$\approx160 \to \approx145\,$ms\;/\;$614\to210\,$ms}\\
 \multicolumn{2}{@{}l}{end-to-end, all seven zerocheck changes} &
   \multicolumn{2}{r@{}}{$\approx52{,}400 \to \approx58{,}100$ comp/s\quad($\approx+11\%$, $8/8$)}\\
+\multicolumn{2}{@{}l}{whole campaign, $m{=}32$ BLAKE3 8T (grind-free basis)} &
+  \multicolumn{2}{r@{}}{$723.9 \to \approx457\,$ms\quad($\approx1.58\times$; gap to the challenge tree $1.36\times\to\approx1.17\times$)}\\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -979,6 +1002,19 @@ making the zerocheck \emph{bucket} look better (hoisting the challenge-independe
 prep under the commit; the lookahead double-round --- which first lost $7$--$15\%$ in the
 zerocheck tail and was rejected here, until the cross-tree kernel anatomy
 showed the loss belonged to the scalar accumulator, not the technique:
-re-kerneled it is now \S\ref{sec:cascade}).
+re-kerneled it is now \S\ref{sec:cascade}). The commit-phase campaign
+added measured nulls of its own: pairing the AB prep with the Merkle
+stage on the theory that BLAKE3 (integer SIMD) and PMULL use disjoint
+ports (both issue on the NEON pipes; the Merkle arm went $55\to150\,$ms
+beside the prep); hashing leaves \emph{inside} the NTT's deep tasks
+(serializes BLAKE3 behind PMULL on the same core — the win required the
+E-core \emph{pipeline} of \S\ref{sec:streamcommit}); a 16-stream NEON
+fused-4 top ($2.5\times$ worse: prefetch breakdown at huge strides) and
+a first fused-3 whose per-lane scatter stores paid read-for-ownership on
+the fresh destination — radix-8 only won as \S\ref{sec:rankedtop}'s
+staged-store kernel, a reminder that a null adjudicates one
+implementation in one architecture, not the idea. A pooled induce
+densify buffer also measured null (the right-sizing copy-out ate the
+fault savings at 32\,MB scale).
 
 \end{document}
