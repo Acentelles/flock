@@ -84,6 +84,57 @@ pub fn init_perf_thread_pool() -> Option<usize> {
 ///
 /// Built lazily on first use. Respects `RAYON_NUM_THREADS` (so single-thread
 /// parity tests and ST bench conventions stay single-threaded).
+/// Tag the current thread as utility QoS (`QOS_CLASS_UTILITY = 0x11`). On
+/// Apple Silicon the scheduler prefers the efficiency cores for utility
+/// threads while default-QoS work holds the P-cores — helper threads that
+/// should ride the E-cores (the commit's leaf pipeline, the ranked NTT top
+/// tiles) want exactly this split. (Background QoS is too weak: it can be
+/// starved entirely while the P pool is saturated.)
+#[cfg(target_os = "macos")]
+pub(crate) fn set_utility_qos() {
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+    }
+    unsafe {
+        let _ = pthread_set_qos_class_self_np(0x11, 0);
+    }
+}
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn set_utility_qos() {}
+
+/// Run `f(0..n_chunks)` with one shared work counter drained by BOTH the
+/// current rayon pool and two utility-QoS helper threads (E-cores on Apple
+/// Silicon) — heterogeneous tile distribution for passes whose chunks are
+/// independent. `f` must tolerate concurrent calls on distinct indices;
+/// which worker runs a chunk cannot change its output.
+pub(crate) fn run_hetero_chunks<F: Fn(usize) + Sync>(n_chunks: usize, f: F) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let pull = || {
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= n_chunks {
+                break;
+            }
+            f(i);
+        }
+    };
+    let pull = &pull;
+    std::thread::scope(|scope| {
+        for _ in 0..2 {
+            scope.spawn(move || {
+                set_utility_qos();
+                pull();
+            });
+        }
+        rayon::scope(|s| {
+            for _ in 0..rayon::current_num_threads() {
+                s.spawn(move |_| pull());
+            }
+        });
+    });
+}
+
 pub fn all_core_pool() -> &'static rayon::ThreadPool {
     use std::sync::OnceLock;
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();

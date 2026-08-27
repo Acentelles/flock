@@ -241,6 +241,118 @@ impl AdditiveNttF128 {
     /// fall back to an internal replicate + [`Self::forward_transform_interleaved_from_layer`],
     /// which is also the `FLOCK_NO_FILL_FUSE=1` kill-switch path (same-binary
     /// A/B). `data`'s prior contents may be arbitrary; every slot is written.
+    /// Whether the ranked radix-8 top applies: the streaming commit's
+    /// rate-1/2 shape on NEON (dual from-message first pass + hetero tiles).
+    fn ranked_top_from_message_ok(log_d: usize, num_ntts: usize, reps: usize) -> bool {
+        cfg!(all(target_arch = "aarch64", target_feature = "aes"))
+            && reps == 2
+            && log_d >= 13
+            && num_ntts >= 2
+            && num_ntts <= 64
+            && num_ntts.is_power_of_two()
+    }
+
+    /// Ranked top for the streaming commit's rate-1/2 shape: layers 1..9 as
+    /// three radix-8 passes. Layer 1 is fused with the fill — the
+    /// dual-destination from-message kernel reads the witness ONCE and
+    /// produces BOTH replica blocks (block 0 on the XOR-only zero-root
+    /// chain), staging outputs in L1 tiles and emitting sequential
+    /// non-temporal row bursts so the fresh destination lines skip their
+    /// RFO. Layers 4 and 7 are in-place fused-3 sweeps. Every pass
+    /// distributes row tiles across the current pool AND the utility-QoS
+    /// E-core helpers ([`crate::run_hetero_chunks`]). The caller continues
+    /// with the ordinary deep pass from layer 10. Bit-identical to
+    /// replicate + per-layer passes (same butterflies per element).
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    fn ranked_top_from_message(&self, msg: &[F128], data: &mut [F128], num_ntts: usize) {
+        let log_d = log2_pow2(data.len() / num_ntts);
+        let block_twiddles = |layer: usize, block: usize| -> [F128; 7] {
+            let mut tw = [F128 { lo: 0, hi: 0 }; 7];
+            tw[0] = self.twiddle(layer, block);
+            for s in 0..2 {
+                tw[1 + s] = self.twiddle(layer + 1, 2 * block + s);
+            }
+            for s in 0..4 {
+                tw[3 + s] = self.twiddle(layer + 2, 4 * block + s);
+            }
+            tw
+        };
+        const ROWS_PER_TILE: usize = 128;
+
+        // Layer-1 dual pass from the message: two blocks, identical input.
+        {
+            let block_size = 1usize << (log_d - 1);
+            let eighth = block_size >> 3;
+            debug_assert_eq!(msg.len(), block_size * num_ntts);
+            let t_zero = block_twiddles(1, 0);
+            let t_gen = block_twiddles(1, 1);
+            let tiles = eighth.div_ceil(ROWS_PER_TILE);
+            let block_elems = block_size * num_ntts;
+            let src = msg.as_ptr() as usize;
+            let dst = data.as_mut_ptr() as usize;
+            crate::run_hetero_chunks(tiles, |tile| {
+                let row_start = tile * ROWS_PER_TILE;
+                let row_end = (row_start + ROWS_PER_TILE).min(eighth);
+                // SAFETY: each tile owns a disjoint row group; the two
+                // destination blocks are the disjoint halves of `data`;
+                // `msg` is only read. Which worker runs a tile cannot
+                // change its output.
+                unsafe {
+                    let d0 = dst as *mut F128;
+                    let d1 = d0.add(block_elems);
+                    for row in row_start..row_end {
+                        kernels::butterfly_fused_3layer_dual_from_src_row(
+                            src as *const F128,
+                            d0,
+                            d1,
+                            eighth,
+                            num_ntts,
+                            row,
+                            &t_zero,
+                            &t_gen,
+                        );
+                    }
+                }
+            });
+        }
+
+        // Layers 4 and 7: in-place radix-8 hetero passes.
+        for layer in [4usize, 7] {
+            let num_blocks = 1usize << layer;
+            let block_size = 1usize << (log_d - layer);
+            let eighth = block_size >> 3;
+            let twiddles: Vec<[F128; 7]> =
+                (0..num_blocks).map(|b| block_twiddles(layer, b)).collect();
+            let tiles_per_block = eighth.div_ceil(ROWS_PER_TILE);
+            let block_elems = block_size * num_ntts;
+            let base = data.as_mut_ptr() as usize;
+            crate::run_hetero_chunks(num_blocks * tiles_per_block, |job| {
+                let block = job / tiles_per_block;
+                let tile = job % tiles_per_block;
+                let row_start = tile * ROWS_PER_TILE;
+                let row_end = (row_start + ROWS_PER_TILE).min(eighth);
+                // SAFETY: (block, tile) jobs own pairwise-disjoint row
+                // groups; twiddle slices are shared read-only.
+                unsafe {
+                    kernels::butterfly_fused_3layer_rows(
+                        (base as *mut F128).add(block * block_elems),
+                        eighth,
+                        num_ntts,
+                        row_start,
+                        row_end,
+                        &twiddles[block],
+                        block == 0,
+                    );
+                }
+            });
+        }
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    fn ranked_top_from_message(&self, _msg: &[F128], _data: &mut [F128], _num_ntts: usize) {
+        unreachable!("ranked top is NEON-gated");
+    }
+
     pub fn forward_transform_interleaved_from_message(
         &self,
         data: &mut [F128],
@@ -270,6 +382,19 @@ impl AdditiveNttF128 {
         let start_layer = log2_pow2(reps);
         let log_d = log2_pow2(n_total / num_ntts);
         assert!(log_d <= self.log_domain_size());
+
+        // Ranked radix-8 top (streaming-commit shape): fill + layers 1..9 in
+        // three hetero passes, then the ordinary deep pass from layer 10.
+        // The deep entry must not sit above the pass's own cache split, or
+        // layers 10..n_top would be skipped — huge shapes keep the fused-2
+        // path.
+        if Self::ranked_top_from_message_ok(log_d, num_ntts, reps)
+            && self.interleaved_n_top(log_d, num_ntts) <= 10
+        {
+            self.ranked_top_from_message(msg, data, num_ntts);
+            self.forward_transform_interleaved_parallel_from_layer_with(data, num_ntts, 10, on_sub);
+            return;
+        }
 
         let n_top = self.interleaved_n_top(log_d, num_ntts);
         let block_size = 1usize << (log_d - start_layer);

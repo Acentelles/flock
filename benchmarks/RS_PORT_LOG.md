@@ -2030,3 +2030,30 @@ NEW CAMPAIGN RECORD: 456.95 ms / 573,681 c/s ≈ 1.175x vs their 388.75.
 "Commit closed-structural" is RETRACTED; the architecture works on 2
 E-cores once the fill is fused. Lesson for the log: a null verdict is
 scoped to the architecture it was measured in.
+
+### Ranked radix-8 top with E-core hetero tiles CERTIFIED (2026-08-27)
+
+Second half of the streaming-commit architecture (their split-ranked
+top, read from their ntt source): layers 1..9 in THREE radix-8 passes
+replacing four fused-2 sweeps — layer 1 fused with the fill via the
+dual-destination from-message kernel (one 512MB witness read → BOTH
+replica blocks; block 0 on the XOR-only zero-root chain; outputs staged
+in 8KB L1 tiles, emitted as sequential stnp bursts — the staging is
+what my earlier fused-3 lacked: per-lane scatter stores defeat the
+streaming-store detector and pay RFO on the fresh 1GB destination,
+their note records −4% for that exact mistake); layers 4/7 in-place
+radix-8 with q-resident butterflies (field lib's mul_q, no GPR
+crossings; block 0 zero-root). All three passes distribute 128-row
+tiles over the rayon pool AND two utility-QoS E-threads
+(run_hetero_chunks, one atomic counter) — the E-cores assist the top,
+then switch to leaf hashing when the deep pass publishes. Gated to the
+rate-1/2 shape with n_top≤10 guard (huge shapes keep fused-2; skipping
+layers 10..n_top would corrupt). Bit-identical: from_message equality
+(shape (16,32,2) runs the ranked path), pipelined-commit
+root/tree/codeword test, full suite. PAIRED A/B (cooled, 3 pairs):
+commit join wall 256.6/259.4/266.7 vs 273.1/273.2/275.5 — 3/3
+DISJOINT, avg −13.1; commit bucket 3/3; totals 2/3 (pair-1 new-arm
+total was a Chrome-window outlier, its commit wall still won).
+Commit window now ~256-267 warm ≈ ~240s cool-window basis vs their
+224-236. Fused-3 verdict CORRECTED: the kernel shape (q-resident +
+staged NT stores), not the radix, was what failed before.

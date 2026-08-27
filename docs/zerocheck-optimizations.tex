@@ -869,7 +869,7 @@ transforms are equality-tested on all outputs.
 
 \subsection{Witness constant-region elision via scratch provenance}
 \label{sec:elision}
-
+\benedikt{what is this title? Use plain english please}
 \begin{optsummary}
 \item[Baseline:] The full-write witness builder rewrites every byte of z/a/b each prove, including regions --- $b$'s all-ones prefix, reserved-slot words, all three streams' zero tails --- identical across every prove of a layout.
 \item[Improvement:] Tag a pooled buffer with its provenance --- which layout's output it currently holds, derived independently at give and take sites --- and, on a tagged hit, skip the constant-region writes.

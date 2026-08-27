@@ -361,7 +361,7 @@ fn commit_into_pipelined(
         std::thread::scope(|scope| {
             for _ in 0..N_HELPERS {
                 scope.spawn(|| {
-                    set_utility_qos();
+                    crate::set_utility_qos();
                     loop {
                         let job = receiver.lock().unwrap().recv();
                         match job {
@@ -549,22 +549,7 @@ fn set_background_qos() {
 #[cfg(not(target_os = "macos"))]
 fn set_background_qos() {}
 
-/// Tag the current thread as utility QoS (`QOS_CLASS_UTILITY = 0x11`). On
-/// Apple Silicon the scheduler prefers the efficiency cores for utility
-/// threads while default-QoS work holds the P-cores — the leaf pipeline's
-/// helpers want exactly that split. (Background QoS is too weak here: it can
-/// be starved entirely while the P-pool is saturated.)
-#[cfg(target_os = "macos")]
-fn set_utility_qos() {
-    unsafe extern "C" {
-        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
-    }
-    unsafe {
-        let _ = pthread_set_qos_class_self_np(0x11, 0);
-    }
-}
-#[cfg(not(target_os = "macos"))]
-fn set_utility_qos() {}
+
 
 /// Allocate + zero-fill (pre-fault) the codeword buffer that [`commit_into`]
 /// will consume, on a background-QoS (E-core) thread, **while** `gen` runs on
