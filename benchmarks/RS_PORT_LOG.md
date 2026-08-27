@@ -2081,3 +2081,20 @@ remaining edge = deep pair fusion + whole-prove epool depth), zc +20
 (r2 anchor+delta priced −5..8/800 lines), open +7, lincheck +3,
 witness +1. Ours slot-3 zc bucket read 174.2 in its traced run —
 polluted sample, excluded from analysis.
+
+### Whole-prove epool pass: 1 keep, 2 reverts (2026-08-27 evening)
+
+Three compute-bound sites hetero-tiled (rayon pool + 2 utility-QoS
+E-threads via run_hetero_chunks[_stateful]; streaming zc r2/tail and
+lincheck excluded per the standing bandwidth-on-bandwidth null). Cooled
+paired A/B, per-site buckets:
+- KEEP zc r1 gather drain: r1 line 34.38-34.67 vs 34.98-35.14, 3/3
+  disjoint, −0.53ms. The fold/reduce became run_hetero_chunks_stateful;
+  values order-free.
+- REVERT open boundary pass + recursive-commit merkle leaves: open
+  bucket 1/3 with negative lean (+3.0/−1.1/+0.5) — per-call helper
+  spawn/QoS churn exceeds what 2 E-cores add on 3-6ms passes. The
+  epool pattern needs passes ≥ ~30ms to amortize on this host.
+Cool-window state: HEAD (old arm) 461.1-461.8; new arm best 458.64 ms
+/ 571,574 c/s — NEW RECORD. run_hetero_chunks gained the ST guard
+(inline at 1 thread, parity preserved) and a stateful variant.

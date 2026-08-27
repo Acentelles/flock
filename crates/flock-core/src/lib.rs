@@ -109,6 +109,17 @@ pub(crate) fn set_utility_qos() {}
 /// which worker runs a chunk cannot change its output.
 pub(crate) fn run_hetero_chunks<F: Fn(usize) + Sync>(n_chunks: usize, f: F) {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    if n_chunks == 0 {
+        return;
+    }
+    // A deliberately single-threaded pool (RAYON_NUM_THREADS=1, ST parity
+    // runs) stays truly single-threaded: run inline, spawn nothing.
+    if rayon::current_num_threads() <= 1 {
+        for i in 0..n_chunks {
+            f(i);
+        }
+        return;
+    }
     let next = AtomicUsize::new(0);
     let pull = || {
         loop {
@@ -133,6 +144,64 @@ pub(crate) fn run_hetero_chunks<F: Fn(usize) + Sync>(n_chunks: usize, f: F) {
             }
         });
     });
+}
+
+/// [`run_hetero_chunks`] with per-worker state: each pull-loop worker (rayon
+/// task or E-thread) builds one `S` via `init` on first use and threads it
+/// through its chunks — for drains that accumulate per-worker partials the
+/// caller merges afterwards. Collected states are returned in no particular
+/// order.
+pub(crate) fn run_hetero_chunks_stateful<S, I, F>(n_chunks: usize, init: I, f: F) -> Vec<S>
+where
+    S: Send,
+    I: Fn() -> S + Sync,
+    F: Fn(&mut S, usize) + Sync,
+{
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    if n_chunks == 0 {
+        return Vec::new();
+    }
+    if rayon::current_num_threads() <= 1 {
+        let mut s = init();
+        for i in 0..n_chunks {
+            f(&mut s, i);
+        }
+        return vec![s];
+    }
+    let next = AtomicUsize::new(0);
+    let states: Mutex<Vec<S>> = Mutex::new(Vec::new());
+    let pull = || {
+        let first = next.fetch_add(1, Ordering::Relaxed);
+        if first >= n_chunks {
+            return;
+        }
+        let mut s = init();
+        f(&mut s, first);
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= n_chunks {
+                break;
+            }
+            f(&mut s, i);
+        }
+        states.lock().unwrap().push(s);
+    };
+    let pull = &pull;
+    std::thread::scope(|scope| {
+        for _ in 0..2 {
+            scope.spawn(move || {
+                set_utility_qos();
+                pull();
+            });
+        }
+        rayon::scope(|sc| {
+            for _ in 0..rayon::current_num_threads() {
+                sc.spawn(move |_| pull());
+            }
+        });
+    });
+    states.into_inner().unwrap()
 }
 
 pub fn all_core_pool() -> &'static rayon::ThreadPool {

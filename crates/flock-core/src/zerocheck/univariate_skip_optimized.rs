@@ -1185,9 +1185,16 @@ fn round1_with_s_hat_v_impl(
 
     let r1_trace = std::env::var("FLOCK_ZC_TIMING").is_ok();
 
-    let (res_ab, res_c_s_0, res_c_s_1) = (0..hi_size)
-        .into_par_iter()
-        .fold(WorkerStateWithSHatV::new, |mut state, x_hi| {
+    // Hetero drain: the gather/PMULL-bound x_hi chunks pull from one shared
+    // queue drained by the rayon pool AND the utility-QoS E-core helpers
+    // (the whole-prove epool pattern; the E-cores hold at most the chunk
+    // they're on, so the merge never gates on them for long). Values are
+    // identical under any work distribution: per-worker partials are F128
+    // sums, order-free.
+    let (res_ab, res_c_s_0, res_c_s_1) = crate::run_hetero_chunks_stateful(
+        hi_size,
+        WorkerStateWithSHatV::new,
+        |state, x_hi| {
             let eq_hi_val = eq_hi[x_hi];
             process_one_x_hi_with_s_hat_v(
                 x_hi,
@@ -1202,24 +1209,25 @@ fn round1_with_s_hat_v_impl(
                 &eq_lo_scaled,
                 eq_hi_val,
                 convert,
-                &mut state,
+                state,
                 stripe_c.is_none(),
                 ab_pre,
             );
-            state
-        })
-        .map(|s| (s.local_res_ab, s.local_res_c_s_0, s.local_res_c_s_1))
-        .reduce(
-            || ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
-            |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
-                for i in 0..ELL {
-                    ab1[i] += ab2[i];
-                    c0_1[i] += c0_2[i];
-                    c1_1[i] += c1_2[i];
-                }
-                (ab1, c0_1, c1_1)
-            },
-        );
+        },
+    )
+    .into_iter()
+    .map(|s| (s.local_res_ab, s.local_res_c_s_0, s.local_res_c_s_1))
+    .fold(
+        ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
+        |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
+            for i in 0..ELL {
+                ab1[i] += ab2[i];
+                c0_1[i] += c0_2[i];
+                c1_1[i] += c1_2[i];
+            }
+            (ab1, c0_1, c1_1)
+        },
+    );
 
     // With a stripe, the C banks come from the multilinear fold; the workers
     // above ran AB-only and left their C accumulators zero.
