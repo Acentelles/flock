@@ -1817,3 +1817,30 @@ from hours of sustained benching; grind-free family best remains the
 first quiet run (469.39 ms / 558.5k c/s). Remaining open residual ~37
 vs their grind-adjusted ~15-20; unattributed ~20 (recursive
 commits/opens inside the bucket) is the next drill.
+
+### Open drill wave 4: boundary join + blocked transpose (2026-08-27 overnight)
+
+Peer's grind-free MT decomposition (their bench, 4 samples): open 21.46
+total = initial 5.19 / recursive commits 9.88 / induce 3.17 / rest ~2 —
+so the "15-20" carry was right, and our residual concentrates in three
+buckets. Two fixes, certified together (paired A/B: open bucket sign
+3/3, −2.8/−3.2/−8.0, avg −4.7ms; totals 2/3 — ~4ms effect in window
+noise; pair 3's window degraded mid-run, pairing absorbed it):
+1. **Boundary join**: the composed f-fold (DRAM-bound, full-witness
+   read) and the residual-b1 build (L1-gather-bound byte-table folds)
+   ran back-to-back; they're data-independent at the boundary →
+   rayon::join (compute-under-bandwidth, the AB-hoist pattern).
+   Initial sumcheck 11.3 → 8.5-9.8 (their 5.19 — asked how).
+2. **Blocked dense transpose** in the sparse induce: the dense remainder
+   ran one full 32MB sweep per layer (10 layers); layers whose blocks
+   fit 2MB now run together over L2-resident chunks (blocks nest, so a
+   chunk at the run's lowest layer contains whole blocks of every
+   higher layer): ~640MB traffic → ~130MB. Induce 6.6-8.5 → 5.4-6.7
+   (their 3.17). Equality test extended with a rate-1/4 blocked shape.
+NULL: twiddle-width census (hypothesis: fused-2 loses the 3-PMULL
+half-width path on mid layers) — only the 2 deepest layers are
+half-width at dim 18/24; the static gate is already right. No change.
+Recursive commits 14.3-15.5 vs their 9.88: our L1 NTT deep is at the
+PMULL floor and merkle at the blake3 floor per component math —
+anatomy question sent to peer (different decomposition / overlap /
+config?). Open now ~30-33 vs their 21.5.

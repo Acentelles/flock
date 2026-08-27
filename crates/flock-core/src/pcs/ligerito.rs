@@ -2339,8 +2339,42 @@ fn transpose_forward_ntt_sparse_impl(
     // Remaining steps s = k..log_d-1 = forward layers (log_d-1-k) .. 0, dense.
     // With `low_half`, the last three layers run fused, low-half-only.
     let dense_floor = if low_half && log_d - k > 3 { 3 } else { 0 };
+    // Cache-blocked run: the transpose processes high layers (small blocks)
+    // first, and blocks nest — a chunk sized to layer `lo_blocked`'s block
+    // contains complete blocks of every higher layer. So all layers whose
+    // blocks fit an L2-resident chunk run together: one parallel pass over
+    // chunks, layers applied in-cache, instead of one full-array sweep per
+    // layer (~2n traffic each). Larger-block layers keep their sweeps below.
+    const BLOCK_LOG_ELEMS: usize = 17; // 2 MB of F128 per chunk
+    let hi_end = log_d - k;
+    let lo_blocked = dense_floor.max(log_d.saturating_sub(BLOCK_LOG_ELEMS));
+    if hi_end > lo_blocked {
+        use rayon::prelude::*;
+        let chunk_len = 1usize << (log_d - lo_blocked);
+        data.par_chunks_mut(chunk_len)
+            .enumerate()
+            .for_each(|(ci, chunk)| {
+                for layer in (lo_blocked..hi_end).rev() {
+                    let blocks_in_chunk = 1usize << (layer - lo_blocked);
+                    let block_size = 1usize << (log_d - layer);
+                    let bsh = block_size >> 1;
+                    for jb in 0..blocks_in_chunk {
+                        let t = ntt.twiddle(layer, (ci << (layer - lo_blocked)) + jb);
+                        let block = &mut chunk[jb * block_size..(jb + 1) * block_size];
+                        let (top, bot) = block.split_at_mut(bsh);
+                        for (a_ref, b_ref) in top.iter_mut().zip(bot.iter_mut()) {
+                            let a = *a_ref;
+                            let b = *b_ref;
+                            let sab = a + b;
+                            *a_ref = sab;
+                            *b_ref = t * sab + b;
+                        }
+                    }
+                }
+            });
+    }
     let n_threads = rayon::current_num_threads().max(1);
-    for layer in (dense_floor..(log_d - k)).rev() {
+    for layer in (dense_floor..lo_blocked.min(hi_end)).rev() {
         let num_blocks = 1usize << layer;
         let block_size = 1usize << (log_d - layer);
         let bsh = block_size >> 1;
@@ -2457,11 +2491,18 @@ pub fn ligero_commit(
     // replicas of `poly` (same write cost as copy + zero-fill) and start the
     // transform past those layers — see `pcs::commit::replicate_message_fill`.
     let codeword_len = block_len * num_interleaved;
+    let trace = std::env::var("LIG_COMMIT_TRACE").is_ok(); // TEMP PROBE
+    let _t = std::time::Instant::now();
     let mut mat = crate::scratch::take_f128(codeword_len);
+    let t_alloc = _t.elapsed();
+    let _t = std::time::Instant::now();
     super::commit::replicate_message_fill(&mut mat, poly);
+    let t_fill = _t.elapsed();
 
     // RS-encode every lane in one call (each lane is one independent NTT).
+    let _t = std::time::Instant::now();
     ntt.forward_transform_interleaved_from_layer(&mut mat, num_interleaved, log_inv_rate);
+    let t_ntt = _t.elapsed();
 
     // Merkle over rows. One leaf = `num_interleaved` consecutive F128 = 16·num_interleaved bytes.
     let leaf_size_bytes = num_interleaved * core::mem::size_of::<F128>();
@@ -2472,7 +2513,18 @@ pub fn ligero_commit(
         )
     };
     debug_assert_eq!(data_bytes.len(), block_len * leaf_size_bytes);
+    let _t = std::time::Instant::now();
     let tree = merkle::merkle_tree(data_bytes, block_len, kind);
+    if trace {
+        // TEMP PROBE
+        eprintln!(
+            "    [lig-commit] cols=2^{log_msg_cols} lanes=2^{log_num_interleaved} rate=2^-{log_inv_rate}: alloc {:5.2} fill {:5.2} ntt {:5.2} merkle {:5.2} ms",
+            t_alloc.as_secs_f64() * 1e3,
+            t_fill.as_secs_f64() * 1e3,
+            t_ntt.as_secs_f64() * 1e3,
+            _t.elapsed().as_secs_f64() * 1e3,
+        );
+    }
 
     LigeroWitness {
         mat,
@@ -3797,11 +3849,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         }
         let _tf = std::time::Instant::now();
         let lag = crate::zerocheck::univariate_skip::build_eq(&r_lane_fold);
-        let f_run = fold_f_composed_par(f_run, &lag);
-        if trace {
-            eprintln!("    [direct-l0] composed f-fold: {:6.2} ms", _tf.elapsed().as_secs_f64() * 1e3);
-        }
-        let _tb = std::time::Instant::now();
         // Residual basis from the exit generators (the fully-folded W
         // columns; γ baked in, so claims just add), then rejoin the
         // incumbent flow — SumcheckProver::new computes the boundary
@@ -3815,16 +3862,28 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 &bundle.claim.exit_generators(),
             )
         };
-        let mut it = claims.iter();
-        let mut b1 = residual(it.next().expect("nonempty"));
-        for bundle in it {
-            let part = residual(bundle);
-            use rayon::prelude::*;
-            b1.par_iter_mut().zip(part.par_iter()).for_each(|(o, v)| *o += *v);
-        }
+        // The composed f-fold (DRAM-bandwidth-bound: one streaming pass over
+        // the full witness) and the residual build (L1-gather/compute-bound
+        // byte-table folds) are data-independent at this point and stress
+        // different resources, so they share the pool instead of running
+        // back-to-back — the same compute-under-bandwidth join as the AB
+        // hoist. Values unchanged: no challenger interaction in either arm.
+        let (f_run, b1) = rayon::join(
+            || fold_f_composed_par(f_run, &lag),
+            || {
+                let mut it = claims.iter();
+                let mut b1 = residual(it.next().expect("nonempty"));
+                for bundle in it {
+                    let part = residual(bundle);
+                    use rayon::prelude::*;
+                    b1.par_iter_mut().zip(part.par_iter()).for_each(|(o, v)| *o += *v);
+                }
+                b1
+            },
+        );
         assert_eq!(b1.len(), f_run.len(), "residual basis / witness length mismatch");
         if trace {
-            eprintln!("    [direct-l0] residual basis b1: {:6.2} ms", _tb.elapsed().as_secs_f64() * 1e3);
+            eprintln!("    [direct-l0] boundary pair (f-fold ∥ residual b1): {:6.2} ms", _tf.elapsed().as_secs_f64() * 1e3);
         }
         let _ts = std::time::Instant::now();
         let (sc, boundary_msg) = SumcheckProver::new(f_run, b1, t_run);
@@ -6797,6 +6856,9 @@ mod tests {
             // (log_block >= 12), engaging the fused low-half final-3 tail.
             (11, 1, 4, 100),
             (12, 1, 2, 300),
+            // Rate-1/4 large shape: windowed sparse path + cache-blocked
+            // dense run with dense_floor = 0 (no fused tail).
+            (12, 2, 2, 200),
         ];
         for (si, &(log_msg, log_inv_rate, log_int, n_queries)) in shapes.iter().enumerate() {
             let block_len = 1usize << (log_msg + log_inv_rate);
