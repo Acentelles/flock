@@ -309,31 +309,8 @@ fn eval_bit_mle(b_bits: &[bool], r: &[F128]) -> F128 {
 ///   `B(i_p · L) := 0` by convention; the other bits select which half of each
 ///   row's input is the within-path chain link.
 /// - `layout` — which slot indices hold Z, X_L, X_R.
-#[allow(clippy::too_many_arguments)]
-pub fn prove_merkle_path_shift<Ch: Challenger>(
-    path_log: usize,
-    x_l_vals: &[F128],
-    x_r_vals: &[F128],
-    z_vals: &[F128],
-    iv_vals: &[F128],
-    b_bits: &[bool],
-    layout: SlotLayout,
-    challenger: &mut Ch,
-) -> (MerklePathShiftProof, MerklePathClaims) {
-    prove_merkle_path_shift_with_grinding(
-        path_log,
-        x_l_vals,
-        x_r_vals,
-        z_vals,
-        iv_vals,
-        b_bits,
-        layout,
-        MerklePathGrinding::disabled(),
-        challenger,
-    )
-}
-
-/// [`prove_merkle_path_shift`] with explicit Fiat--Shamir grinding.
+/// - `grinding` — the Fiat--Shamir PoW schedule: [`MerklePathGrinding::for_profile`]
+///   in production, [`MerklePathGrinding::disabled`] for none.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_merkle_path_shift_with_grinding<Ch: Challenger>(
     path_log: usize,
@@ -602,31 +579,7 @@ pub fn prove_merkle_path_shift_with_grinding<Ch: Challenger>(
 /// `leaf_{i_p}(r)` (the r-fold of path `i_p`'s leaf bit-vector); `root_r` is
 /// the single shared `root(r)` scalar. For `path_log=0`, `leaf_evals` must be
 /// length 1 (the single-path leaf).
-#[allow(clippy::too_many_arguments)]
-pub fn verify_merkle_path_shift<Ch: Challenger>(
-    path_log: usize,
-    proof: &MerklePathShiftProof,
-    leaf_evals: &[F128],
-    root_r: F128,
-    b_bits: &[bool],
-    n: usize,
-    layout: SlotLayout,
-    challenger: &mut Ch,
-) -> Result<MerklePathClaims, MerklePathError> {
-    verify_merkle_path_shift_with_grinding(
-        path_log,
-        proof,
-        leaf_evals,
-        root_r,
-        b_bits,
-        n,
-        layout,
-        MerklePathGrinding::disabled(),
-        challenger,
-    )
-}
-
-/// [`verify_merkle_path_shift`] with explicit Fiat--Shamir grinding.
+/// `grinding` must match the prover's schedule.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_merkle_path_shift_with_grinding<Ch: Challenger>(
     path_log: usize,
@@ -776,6 +729,56 @@ pub fn verify_merkle_path_shift_with_grinding<Ch: Challenger>(
 mod tests {
     use super::*;
     use flock_core::challenger::FsChallenger;
+
+    /// No-grinding wrapper for the tests below (production always goes
+    /// through `_with_grinding`).
+    #[allow(clippy::too_many_arguments)]
+    fn prove_merkle_path_shift<Ch: Challenger>(
+        path_log: usize,
+        x_l_vals: &[F128],
+        x_r_vals: &[F128],
+        z_vals: &[F128],
+        iv_vals: &[F128],
+        b_bits: &[bool],
+        layout: SlotLayout,
+        challenger: &mut Ch,
+    ) -> (MerklePathShiftProof, MerklePathClaims) {
+        prove_merkle_path_shift_with_grinding(
+            path_log,
+            x_l_vals,
+            x_r_vals,
+            z_vals,
+            iv_vals,
+            b_bits,
+            layout,
+            MerklePathGrinding::disabled(),
+            challenger,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_merkle_path_shift<Ch: Challenger>(
+        path_log: usize,
+        proof: &MerklePathShiftProof,
+        leaf_evals: &[F128],
+        root_r: F128,
+        b_bits: &[bool],
+        n: usize,
+        layout: SlotLayout,
+        challenger: &mut Ch,
+    ) -> Result<MerklePathClaims, MerklePathError> {
+        verify_merkle_path_shift_with_grinding(
+            path_log,
+            proof,
+            leaf_evals,
+            root_r,
+            b_bits,
+            n,
+            layout,
+            MerklePathGrinding::disabled(),
+            challenger,
+        )
+    }
 
     #[test]
     fn fast_slim_and_secure_enable_merkle_path_grinding() {

@@ -5992,7 +5992,8 @@ fn emit_opening(
     (cv, position_w)
 }
 
-/// The leaf outer's artifacts, returned by [`build_leaf_outer`] so the
+/// The leaf outer's artifacts (built inside [`build_fl_node_k`] and
+/// [`build_node_outer_app`]) so the
 /// recursion swap can consume the proof as ITS inner: the circuit shape
 /// (owning registry + counts — `UnionInstance::new(&shape.registry,
 /// shape.counts.clone())` reconstructs the instance), the public segment,
@@ -11347,7 +11348,7 @@ fn first_level_node_two_chains_fold_and_adjacency() {
 /// under free counts, against the m\*28 cap (2^21 packed words). The
 /// per-type breakdown (used_cols × rows, descending) is the diet map if the
 /// gap needs closing. `CHAIN_BLOCKS` sizes the leaves (the real question is
-/// 262144 = m32); `TOWER_PROFILE=slim` for the envelope.
+/// 262144 = m32); `TOWER_CONFIG=chain128` selects the envelope config.
 #[test]
 #[ignore] // Heavy at m32 — four chain proofs, two FLs, one node.
 fn envelope_content_probe() {
@@ -20101,8 +20102,8 @@ fn chain_tower_m32_headline() {
 /// first-touch allocator costs that are warmup, not marginal cost.
 ///
 /// Knobs: `BENCH_RUNS` (default 3), `CHAIN_BLOCKS` (default 256 — set
-/// 262144 for the m32 production leaf), `TOWER_PROFILE=slim` for the
-/// envelope. BOX DISCIPLINE: run the stability probe first and reboot if it
+/// 262144 for the m32 production leaf), `TOWER_CONFIG=chain128` for the
+/// 128-bit config. BOX DISCIPLINE: run the stability probe first and reboot if it
 /// is far out of band — this box's benchmarks self-corrupt under sustained
 /// load, and nothing here can tell you that happened.
 #[test]

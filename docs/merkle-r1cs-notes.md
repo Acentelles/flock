@@ -1,8 +1,12 @@
 # Merkle-path R1CS as a multi-table type — working notes
 
-Branch `merkle-path-r1cs`, off `multitable`. Status: **working end to end at
-depth 26**, both as a standalone single-type registry and as a shipped
-`merkle26+blake3` mixed tier.
+On `main` (originally branch `merkle-path-r1cs`, off `multitable`; both since
+merged). Status: **working end to end at depth 26**, both as a standalone
+single-type registry and as a shipped `merkle26+blake3` mixed tier.
+
+> **2026-08-27**: whether the Merkle-path product stays is an open product
+> decision — see `docs/bloat-reduction-plan.md` Phase 2.2 and
+> `docs/bloat-ledger.md` §C for the gated surface (~4.1k lines).
 
 ## Where this stands (read this first)
 

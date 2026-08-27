@@ -603,23 +603,6 @@ impl MerkleTreeLayout {
     // Wiring IO schema
     // -----------------------------------------------------------------------
 
-    /// Schema position of word `w` (`< 4`) of chunk block `block`'s leaf data.
-    pub fn io_leaf(&self, block: usize, w: usize) -> usize {
-        debug_assert!(block < self.leaf_blocks && w < 4);
-        4 * block + w
-    }
-
-    /// Schema position of the index word.
-    pub fn io_index(&self) -> usize {
-        4 * self.leaf_blocks
-    }
-
-    /// Schema position of root half `h` (`0` = bits `[0,128)`).
-    pub fn io_root(&self, h: usize) -> usize {
-        debug_assert!(h < 2);
-        4 * self.leaf_blocks + 1 + h
-    }
-
     /// The wireable words of one opening — chunk-leaf layouts only.
     ///
     /// Inputs: the leaf data (`4` words per chunk block, in block order) then

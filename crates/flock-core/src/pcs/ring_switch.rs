@@ -37,7 +37,7 @@
 //!   `rs_eq_ind` densely (or sparsely) via [`fold_b128_elems`] / [`RsEqInd`].
 //!   The dense vector becomes the BaseFold target witness, so the prover does
 //!   need the full `2^(m-7)` entries.
-//! - **Verifier side** (used by [`verify_succinct`] + [`eval_rs_eq`]): never
+//! - **Verifier side** (used by [`verify_succinct_with_grinding`] + [`eval_rs_eq`]): never
 //!   materializes `rs_eq_ind`. Instead, evaluates `MLE(rs_eq_ind)(c)` at the
 //!   BaseFold final challenge point in `O((m-7) · 128²)` field ops via the
 //!   DP24 tensor-algebra iterative algorithm ([DP24] §1.3, Figure 3). This is
@@ -173,19 +173,12 @@ pub fn build_claim_weights(z_skip: F128, x_outer_0: F128) -> Vec<F128> {
     build_claim_weights_from_skip(&lagrange_weights_naive(K_SKIP, z_skip), x_outer_0)
 }
 
-/// Batched version of [`fold_1b_rows_naive`]: compute `s_hat_v_k` for each
-/// `suffix_tensors[k]` in a single bit-scan over `packed_witness`. Halves the
-/// amortized bit-scanning cost vs calling `fold_1b_rows_naive` per suffix.
-///
-/// All suffix tensors must have the same length as `packed_witness`.
-pub fn fold_1b_rows_multi(packed_witness: &[F128], suffix_tensors: &[&[F128]]) -> Vec<Vec<F128>> {
-    let m = LOG_PACKING + (packed_witness.len().trailing_zeros() as usize);
-    fold_1b_rows_multi_padded(packed_witness, suffix_tensors, &PaddingSpec::dense(m))
-}
-
-/// Padding-aware variant of [`fold_1b_rows_multi`]. Routes the k=2 MFR fast
-/// paths through their `_padded` kernels; the scalar bit-scan fallback (k ≠ 2
-/// or non-divisible len) is untouched — those `m` are tiny anyway.
+/// Batched, padding-aware version of [`fold_1b_rows_naive`]: compute
+/// `s_hat_v_k` for each `suffix_tensors[k]` in a single bit-scan over
+/// `packed_witness` (all suffix tensors must have the same length). Routes
+/// the k=2 MFR fast paths through their `_padded` kernels; the scalar
+/// bit-scan fallback (k ≠ 2 or non-divisible len) is untouched — those `m`
+/// are tiny anyway.
 pub fn fold_1b_rows_multi_padded(
     packed_witness: &[F128],
     suffix_tensors: &[&[F128]],
@@ -1943,33 +1936,7 @@ pub fn build_eq_sparse(coords: &[F128]) -> SparseEqTensor {
     }
 }
 
-/// Sparse eq tensor for a point whose coords are `prefix_bits` pinned boolean
-/// values (in scattered-index bit order given by `pinned`), with the remaining
-/// coords carrying an **already-built** tensor. Lets a caller that opens the
-/// same random point under several boolean prefixes/suffixes build `build_eq`
-/// once and reuse it, instead of one dense build per point.
-///
-/// `live_positions` must be ascending and disjoint from the pinned bits, and
-/// `live_tensor.len()` must be `2^live_positions.len()`.
-pub fn sparse_eq_from_parts(
-    live_tensor: Vec<F128>,
-    live_positions: Vec<usize>,
-    base: usize,
-) -> SparseEqTensor {
-    debug_assert_eq!(live_tensor.len(), 1usize << live_positions.len());
-    debug_assert!(live_positions.windows(2).all(|w| w[0] < w[1]));
-    debug_assert!(
-        live_positions.iter().all(|&p| base & (1 << p) == 0),
-        "pinned base bits must be disjoint from live positions"
-    );
-    SparseEqTensor {
-        live_tensor,
-        live_positions,
-        base,
-    }
-}
-
-/// Sparse counterpart of one column of [`fold_1b_rows_multi`]: scans only the
+/// Sparse counterpart of one column of [`fold_1b_rows_multi_padded`]: scans only the
 /// nonzero entries of the suffix tensor. Iterates compact (live-only) tensor
 /// indices and computes the scattered `packed_witness` index inline via
 /// [`SparseEqTensor::scatter_idx`] — avoids materializing the scattered
@@ -2301,34 +2268,6 @@ impl RsEqInd {
         }
     }
 
-    /// Accumulate `gamma * self[j]` into `out[j]` for all `j`. Sparse variants
-    /// touch only their support; dense variants iterate `out` in lockstep.
-    pub fn add_scaled_into(&self, gamma: F128, out: &mut [F128]) {
-        debug_assert_eq!(out.len(), self.len());
-        match self {
-            Self::Dense(v) => {
-                for (o, &x) in out.iter_mut().zip(v.iter()) {
-                    *o += gamma * x;
-                }
-            }
-            Self::DeferredDense {
-                eq_lo,
-                eq_hi,
-                table,
-            } => {
-                let log_b = eq_lo.len().trailing_zeros() as usize;
-                for (j, o) in out.iter_mut().enumerate() {
-                    *o += gamma * deferred_dense_value(eq_lo, eq_hi, table, log_b, j);
-                }
-            }
-            Self::Sparse { entries, .. } => {
-                for &(idx, val) in entries {
-                    out[idx] += gamma * val;
-                }
-            }
-        }
-    }
-
     /// Materialize the dense view. O(L) regardless of variant; use sparingly.
     pub fn to_dense(&self) -> Vec<F128> {
         match self {
@@ -2347,22 +2286,6 @@ impl RsEqInd {
             Self::Sparse { len, entries } => {
                 let mut out = vec![F128::ZERO; *len];
                 for &(idx, val) in entries {
-                    out[idx] = val;
-                }
-                out
-            }
-        }
-    }
-
-    /// Consume into a dense `Vec<F128>`. Returns the inner vector directly when
-    /// already `Dense` (no copy).
-    pub fn into_dense(self) -> Vec<F128> {
-        match self {
-            Self::Dense(v) => v,
-            Self::DeferredDense { .. } => self.to_dense(),
-            Self::Sparse { len, entries } => {
-                let mut out = vec![F128::ZERO; len];
-                for (idx, val) in entries {
                     out[idx] = val;
                 }
                 out
@@ -3023,7 +2946,7 @@ pub fn verify_with_grinding<Ch: Challenger>(
     })
 }
 
-/// Verifier-side output of [`verify_succinct`]: contains everything the caller
+/// Verifier-side output of [`verify_succinct_with_grinding`]: contains everything the caller
 /// needs to drive the BaseFold consistency check, *without* materializing the
 /// dense `rs_eq_ind` vector of length `2^(m-7)`.
 #[derive(Clone, Debug)]
@@ -3040,18 +2963,6 @@ pub struct RingSwitchVerifierOutput {
 /// `rs_eq_ind` vector. Pair with [`eval_rs_eq`] at the BaseFold final point to
 /// evaluate `MLE(rs_eq_ind)(challenges)` in `O((m − 7) · 128²)` field ops
 /// instead of `O(2^(m−7))`.
-pub fn verify_succinct<Ch: Challenger>(
-    claim: F128,
-    skip_weights: &[F128],
-    x_outer: &[F128],
-    proof: &RingSwitchProof,
-    challenger: &mut Ch,
-) -> Result<RingSwitchVerifierOutput, VerifyError> {
-    verify_succinct_with_grinding(claim, skip_weights, x_outer, proof, 0, challenger)
-}
-
-/// [`verify_succinct`] with the matching PoW check before the ring-switch
-/// point `r''`.
 pub fn verify_succinct_with_grinding<Ch: Challenger>(
     claim: F128,
     skip_weights: &[F128],
@@ -3107,7 +3018,7 @@ pub fn verify_succinct_with_grinding<Ch: Challenger>(
 /// ## Arguments
 ///
 /// * `z_vals` — the suffix-side coords, i.e. `x_outer[1..]` from
-///   [`verify_succinct`]. Length `ℓ' = m − 7`.
+///   [`verify_succinct_with_grinding`]. Length `ℓ' = m − 7`.
 /// * `query` — the BaseFold sumcheck final challenges, length `ℓ'`.
 /// * `eq_r_dprime` — the `eq` tensor over the sampled `r''`, length 128.
 ///
@@ -3724,9 +3635,6 @@ mod tests {
         }
     }
 
-    /// Throughput A/B of the fold_1b_rows variants at m=29 scale. `#[ignore]`d
-    /// (allocates/folds 64 MB buffers many times); run explicitly with
-    /// `cargo test --release -- --ignored --nocapture zzz_bench_fold_1b`.
     /// **Padding skip is byte-identical to the dense fold.** On a packed
     /// witness whose every block has bits `[useful_bits, 2^k_log)` honestly
     /// zero, the `_padded` kernels must produce the exact same `(a0, a1)` as
@@ -4041,43 +3949,6 @@ mod tests {
         let z_vec: Vec<F128> = (0..(1 << LOG_PACKING)).map(|_| rng.f128()).collect();
         let got = s_hat_v_from_z_vec(&z_vec, &[]);
         assert_eq!(got, z_vec);
-    }
-
-    #[test]
-    #[ignore]
-    fn zzz_bench_fold_1b() {
-        let l = 22; // m = 29
-        let pw_len = 1usize << l;
-        let mut rng = Rng::new(0x1111);
-        let pw: Vec<F128> = (0..pw_len).map(|_| rng.f128()).collect();
-        let t0 = build_eq(&(0..l).map(|_| rng.f128()).collect::<Vec<_>>());
-        let t1 = build_eq(&(0..l).map(|_| rng.f128()).collect::<Vec<_>>());
-
-        let iters = 20;
-        let bench = |f: &dyn Fn()| {
-            let t = std::time::Instant::now();
-            for _ in 0..iters {
-                f();
-            }
-            t.elapsed().as_secs_f64() * 1e3 / iters as f64
-        };
-        let t_k4 = bench(&|| {
-            std::hint::black_box(fold_1b_rows_1way_mfr(&pw, &t0));
-        });
-        let t_8 = bench(&|| {
-            std::hint::black_box(fold_1b_rows_1way_mfr_8wide_k4(&pw, &t0));
-        });
-        let t_2k4 = bench(&|| {
-            std::hint::black_box(fold_1b_rows_2way_mfr(&pw, &t0, &t1));
-        });
-        let t_28 = bench(&|| {
-            std::hint::black_box(fold_1b_rows_2way_mfr_8wide(&pw, &t0, &t1));
-        });
-        eprintln!(
-            "\n  [fold_1b @ m=29] 1-way: {t_k4:5.2}→{t_8:5.2} ms ({:.2}x) | 2-way: {t_2k4:5.2}→{t_28:5.2} ms ({:.2}x)\n",
-            t_k4 / t_8,
-            t_2k4 / t_28,
-        );
     }
 
     /// `subset_sums_4` matches the obvious specification.

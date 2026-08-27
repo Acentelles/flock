@@ -1,6 +1,8 @@
 # Bloat-reduction plan
 
-Status: **PLANNED 2026-08-26** — no phase started. Baseline: 156,524 lines of
+Status: **PHASE 1 EXECUTED 2026-08-27** on branch `bloat-phase1` (PR #37);
+the execution record and every deviation are in `docs/bloat-ledger.md`.
+Planned 2026-08-26. Baseline: 156,524 lines of
 Rust across the workspace + 13,113 CUDA/C++; `main` at the post-stack merge
 (#26/#32/#33/#10/#34 landed, PR queue empty, tower measured 672 ms/leaf
 amortised all-AG).

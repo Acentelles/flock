@@ -20,8 +20,6 @@
 //! rounds never need a 2^m basis array at all.
 use flock_core::field::F128;
 use flock_core::lincheck::build_eq_table;
-use rayon::prelude::*;
-use std::time::Instant;
 
 /// Materialized reference: W over the whole dense domain.
 fn materialize(len: usize, h: usize, eq_row: &[F128], eq_col: &[F128]) -> Vec<F128> {
@@ -119,91 +117,4 @@ fn factored_form_is_closed_under_the_blocked_fold() {
             }
         }
     }
-}
-
-#[test]
-#[ignore]
-fn factored_basis_cost() {
-    // m=30 commit shape: jagged m=23, h=2^16, 128 grid columns (121 used).
-    let (n, k) = (16usize, 7usize);
-    let h = 1usize << n;
-    let len = h * (1usize << k);
-    let mut seed = 0xBEEFu64;
-    let mut rnd = || {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        F128 {
-            lo: seed,
-            hi: seed.rotate_left(31),
-        }
-    };
-    let eq_row = build_eq_table(&(0..n).map(|_| rnd()).collect::<Vec<_>>());
-    let mut eq_col = build_eq_table(&(0..k).map(|_| rnd()).collect::<Vec<_>>());
-    for slot in eq_col[121..].iter_mut() {
-        *slot = F128::ZERO;
-    }
-    let d = 1usize << 17;
-    let r = rnd();
-
-    let mut w = vec![F128::ZERO; len];
-    let bench = |label: &str, f: &mut dyn FnMut() -> usize| {
-        let mut b = f64::INFINITY;
-        f();
-        for _ in 0..4 {
-            let t = Instant::now();
-            let v = f();
-            std::hint::black_box(v);
-            b = b.min(t.elapsed().as_secs_f64());
-        }
-        println!("  {label:<46} {:6.2} ms", b * 1e3);
-        b * 1e3
-    };
-    let t_mat = bench("materialize W (2^23)", &mut || {
-        w.par_chunks_mut(1 << 16).enumerate().for_each(|(ci, c)| {
-            let g0 = ci << 16;
-            for (kk, slot) in c.iter_mut().enumerate() {
-                let e = g0 + kk;
-                let col = e / h;
-                *slot = if col < 121 {
-                    eq_row[e % h] * eq_col[col]
-                } else {
-                    F128::ZERO
-                };
-            }
-        });
-        w.len()
-    });
-    let mut out = vec![F128::ZERO; len / 2];
-    let t_fold = bench("fold the materialized W (2^23 -> 2^22)", &mut || {
-        out.par_chunks_mut(1 << 16).enumerate().for_each(|(ci, c)| {
-            let g0 = ci << 16;
-            for (kk, slot) in c.iter_mut().enumerate() {
-                let i = g0 + kk;
-                let (b, p) = (i / d, i % d);
-                let lo = w[2 * b * d + p];
-                let hi = w[(2 * b + 1) * d + p];
-                *slot = lo + r * (hi + lo);
-            }
-        });
-        out.len()
-    });
-    let t_fac = bench("fold the FACTORED eq_col (128 entries)", &mut || {
-        let cpb = d / h;
-        let nn = eq_col.len() / 2;
-        let v: Vec<F128> = (0..nn)
-            .map(|j| {
-                let (b, s) = (j / cpb, j % cpb);
-                let lo = eq_col[2 * b * cpb + s];
-                let hi = eq_col[(2 * b + 1) * cpb + s];
-                lo + r * (hi + lo)
-            })
-            .collect();
-        v.len()
-    });
-    println!(
-        "\n  materialize + one fold = {:.2} ms  ->  factored = {:.4} ms\n",
-        t_mat + t_fold,
-        t_fac
-    );
 }

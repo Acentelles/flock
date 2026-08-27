@@ -1138,8 +1138,9 @@ map and the multi-table document.
         product sumcheck, a closed form, one untwisted anchor; soundness
         $\le (128K{-}1{+}2m)/|\mathbb{F}| + \varepsilon_{assist}$).
   \item \textbf{Merged-transport intake} for packed-direct claims +
-        \code{stream\_b} support (perf follow-up; unmerged path is the
-        correctness oracle).
+        \code{stream\_b} support. [Landed; the unmerged path was removed
+        2026-08-02 — the merged transport is the only one, and the
+        byte-pinned M6 fixtures are its oracle.]
   \item Deferred: count-proportional element prover; LogUp bus;
         capacity-tax refinement; keccak batch-major tier; an
         \emph{in-circuit} cap-node select (mux or LogUp lookup). MVP-6
@@ -1223,7 +1224,9 @@ map and the multi-table document.
         element claims ride the existing assist correctly (just 128$\times$
         wasteful on their components, negligible at few claims), and the
         first recursion can target the \emph{direct} path, where this
-        phase does not exist.
+        phase does not exist. [Superseded 2026-08: the shipped recursion
+        (the tower, \code{src/tower.rs}) verifies over the merged/union
+        transport, not the direct path.]
 \end{enumerate}
 
 \end{document}

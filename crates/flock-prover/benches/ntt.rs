@@ -7,9 +7,9 @@
 //! For PCS at m=29 with rate 1/2: log_msg_len = 22, k_code = 23. So the
 //! interesting size is k=23 (~128 MB single buffer).
 //!
-//! Note: this is a SINGLE NTT (no batching across instances). The
-//! `ntt_experiments::ParallelNttF128` numbers measure 32 batched NTTs and
-//! aren't directly comparable.
+//! Note: this is a SINGLE NTT (no batching across instances). The old
+//! `ParallelNttF128` numbers (module deleted, bloat ledger §B) measured 32
+//! batched NTTs and aren't directly comparable.
 //!
 //! Run: `cargo bench --bench ntt`
 

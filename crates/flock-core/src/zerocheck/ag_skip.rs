@@ -29,24 +29,6 @@ use crate::genus95_curve_code::{
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Bench-only A/B toggle: when set, [`prove`]'s tail uses the general
-/// `fold_and_compute_round_pair_into` for *every* round instead of the
-/// friendly-Horner kernel on rounds 1..=5. Lets one process time both paths
-/// back-to-back so thermal drift cancels (the friendly win is small vs the
-/// cross-process noise floor). Output is bit-identical either way.
-pub static DISABLE_FRIENDLY_HORNER: AtomicBool = AtomicBool::new(false);
-
-/// Bench-only A/B toggle: when set, the tail's ping-pong buffers `a_nxt`/`b_nxt`
-/// are `vec![F128::ZERO; n_in/2]` (the old serial-zero-filled, non-pooled path)
-/// instead of uninit pooled `take_f128`. Lets one process time both back-to-back.
-pub static NXT_ZEROFILL: AtomicBool = AtomicBool::new(false);
-
-/// Bench-only A/B toggle: when set, round 1 uses the unfused
-/// [`crate::genus95_curve_code::round1::round1_slp_packed_banks`] instead of the
-/// fused/lazy-reduction [`round1_slp_packed_banks_fused`]. Lets one process time
-/// both back-to-back so thermal drift cancels. Output is bit-identical either way.
-pub static ROUND1_UNFUSED: AtomicBool = AtomicBool::new(false);
-
 /// A/B toggle: when set, the mlv tail runs the classic one-round-per-pass loop
 /// (friendly-Horner + general fused kernels) instead of sumcheck LOOKAHEAD
 /// ([`super::multilinear::fold2_lookahead_into`]) — one pass per TWO rounds,
@@ -54,15 +36,6 @@ pub static ROUND1_UNFUSED: AtomicBool = AtomicBool::new(false);
 /// either way (see `lookahead_matches_classic`); lookahead cuts tail traffic
 /// by ~44%.
 pub static LOOKAHEAD_DISABLE: AtomicBool = AtomicBool::new(false);
-
-/// Opt-in toggle: when set, lookahead iterations i=1,3 use the friendly-Horner
-/// Q accumulation ([`lookahead_friendly_pass`]) instead of the general eq
-/// multiply. Bit-identical output. OFF by default: on M-series Air it measures
-/// −1.5% (the 8×256-bit Horner accumulators spill — 32 GPRs — and the wide
-/// shifts on spilled accs cost more than the 8 PMULLs they replace, which hide
-/// under memory traffic anyway). Re-evaluate on M4 Max, where higher DRAM
-/// bandwidth may expose the mult savings.
-pub static LOOKAHEAD_FRIENDLY: AtomicBool = AtomicBool::new(false);
 
 /// AG-code message-dimension exponent: `2^K_SKIP = 64` base-code coordinates.
 pub const K_SKIP: usize = 6;
@@ -635,111 +608,6 @@ fn fold_and_friendly_round_pair_into<const SHIFT: u32>(
         })
         .reduce(|| (F128::ZERO, F128::ZERO), |(x, y), (u, v)| (x + u, y + v));
     (sum1, sum_inf)
-}
-
-/// Friendly-Horner LOOKAHEAD pass — the lookahead analog of
-/// [`fold_and_friendly_round_pair_into`], for the two lookahead iterations
-/// whose eq still spans friendly dims (i=1: dims 3..6, SHIFT=8; i=3: dims
-/// 5..6, SHIFT=32). The 8 Q-sums accumulate via `shl_xor::<SHIFT>` wide-Horner
-/// (pure shifts) over the γ-geometric friendly-lo dims instead of 8 `eq_lo`
-/// PMULLs per position; the outer eq keeps the general split multiply.
-/// `PER_U` = 8 (entry, fold one pending challenge) or 16 (steady, fold two).
-/// Output identical to the general lookahead pass (exact field arithmetic).
-#[allow(clippy::too_many_arguments)]
-fn lookahead_friendly_pass<const SHIFT: u32, const PER_U: usize>(
-    a: &[F128],
-    b: &[F128],
-    a_out: &mut [F128],
-    b_out: &mut [F128],
-    rhos: (F128, F128),
-    lo_size: usize,
-    eq_outer_lo: &[F128],
-    eq_outer_hi: &[F128],
-    c_inv: F128,
-) -> crate::zerocheck::multilinear::LookaheadSums {
-    use crate::zerocheck::multilinear::{lookahead_finish, lookahead_products};
-    use rayon::prelude::*;
-    let n_u = a.len() / PER_U;
-    debug_assert_eq!(a_out.len(), 4 * n_u);
-    let n_ol = eq_outer_lo.len();
-    debug_assert_eq!(lo_size * n_ol * eq_outer_hi.len(), n_u);
-    // Wide-Horner degree bound: SHIFT·(lo_size−1) + 127 < 256.
-    debug_assert!(SHIFT as usize * (lo_size - 1) + 127 < 256);
-    let chunk_u = lo_size * n_ol; // u-positions per outer-hi chunk
-    let sums = a_out
-        .par_chunks_mut(4 * chunk_u)
-        .zip(b_out.par_chunks_mut(4 * chunk_u))
-        .enumerate()
-        .map(|(oh, (ao, bo))| {
-            let mut chunk_acc = [F256Unreduced::ZERO; 8];
-            for ol in 0..n_ol {
-                let mut horner = [F256Unreduced::ZERO; 8];
-                // Reverse, so the first-processed position carries the highest
-                // power of ω = x^SHIFT.
-                for p in (0..lo_size).rev() {
-                    let u = (oh * n_ol + ol) * lo_size + p;
-                    let mut ga = [F128::ZERO; 4];
-                    let mut gb = [F128::ZERO; 4];
-                    for v in 0..4usize {
-                        let base = u * PER_U + v * (PER_U / 4);
-                        let (fa, fb) = if PER_U == 8 {
-                            (
-                                a[base] + rhos.0 * (a[base] + a[base + 1]),
-                                b[base] + rhos.0 * (b[base] + b[base + 1]),
-                            )
-                        } else {
-                            let xa0 = a[base] + rhos.0 * (a[base] + a[base + 1]);
-                            let xa1 = a[base + 2] + rhos.0 * (a[base + 2] + a[base + 3]);
-                            let xb0 = b[base] + rhos.0 * (b[base] + b[base + 1]);
-                            let xb1 = b[base + 2] + rhos.0 * (b[base + 2] + b[base + 3]);
-                            (xa0 + rhos.1 * (xa0 + xa1), xb0 + rhos.1 * (xb0 + xb1))
-                        };
-                        ga[v] = fa;
-                        gb[v] = fb;
-                        let o = 4 * (ol * lo_size + p) + v;
-                        ao[o] = fa;
-                        bo[o] = fb;
-                    }
-                    let prods = lookahead_products(&ga, &gb);
-                    for k in 0..8 {
-                        horner[k] = shl_xor_generic::<SHIFT>(horner[k], prods[k]);
-                    }
-                }
-                let el = eq_outer_lo[ol];
-                for k in 0..8 {
-                    chunk_acc[k] ^= el.mul_unreduced(horner[k].reduce());
-                }
-            }
-            let eh = eq_outer_hi[oh] * c_inv;
-            let mut out = [F128::ZERO; 8];
-            for k in 0..8 {
-                out[k] = eh * chunk_acc[k].reduce();
-            }
-            out
-        })
-        .reduce(
-            || [F128::ZERO; 8],
-            |mut p, q| {
-                for k in 0..8 {
-                    p[k] += q[k];
-                }
-                p
-            },
-        );
-    lookahead_finish(sums)
-}
-
-/// [`shl_xor`] with the shift as a const generic (the friendly bases here are
-/// `x^8` and `x^32`; both < 64 so the plain path suffices).
-#[inline]
-fn shl_xor_generic<const S: u32>(acc: F256Unreduced, p: F128) -> F256Unreduced {
-    let inv = 64 - S;
-    F256Unreduced {
-        r0: (acc.r0 << S) ^ p.lo,
-        r1: ((acc.r1 << S) | (acc.r0 >> inv)) ^ p.hi,
-        r2: (acc.r2 << S) | (acc.r1 >> inv),
-        r3: (acc.r3 << S) | (acc.r2 >> inv),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1353,23 +1221,20 @@ fn prove_round1_banks(
     c_packed: &[u8],
     eq: &[F128],
 ) -> (Round1Message, Vec<F128>) {
-    let raw = if ROUND1_UNFUSED.load(Ordering::Relaxed) {
-        crate::genus95_curve_code::round1::round1_slp_packed_banks(a_packed, b_packed, c_packed, eq)
-    } else {
+    banks_to_message(
         crate::genus95_curve_code::round1::round1_slp_packed_banks_fused(
             a_packed, b_packed, c_packed, eq,
-        )
-    };
-    banks_to_message(raw)
+        ),
+    )
 }
 
-/// [`prove_round1_banks`] under a witness run-list. The hot (fused) path
-/// is [`round1_slp_packed_banks_fused_padded`] — ONE parallel pass over
+/// [`prove_round1_banks`] under a witness run-list:
+/// [`round1_slp_packed_banks_fused_padded`] — ONE parallel pass over
 /// the live-block list, Partial blocks cleansed inline, per-element parity
-/// with the dense kernel. The bench-only unfused arm keeps the
-/// segment-call driver below (correct, but it pays a rayon bridge per
-/// full-run segment — the envelope's per-column run structure has ~450 of
-/// them, which is exactly why the fused arm got its own kernel).
+/// with the dense kernel. (A per-run-segment driver over the unfused kernel
+/// was MEASURED 2-3x SLOWER than the full dense scan at the envelope's ~450
+/// per-column runs — never fan a hot kernel into per-segment par calls.
+/// Deleted with its `ROUND1_UNFUSED` toggle 2026-08-27.)
 #[cfg(target_arch = "aarch64")]
 fn prove_round1_banks_padded(
     a_packed: &[u8],
@@ -1378,60 +1243,11 @@ fn prove_round1_banks_padded(
     eq: &[F128],
     coverage: &[super::BlockCoverage],
 ) -> (Round1Message, Vec<F128>) {
-    use super::BlockCoverage;
-    if !ROUND1_UNFUSED.load(Ordering::Relaxed) {
-        return banks_to_message(
-            crate::genus95_curve_code::round1::round1_slp_packed_banks_fused_padded(
-                a_packed, b_packed, c_packed, eq, coverage,
-            ),
-        );
-    }
-    let kernel = crate::genus95_curve_code::round1::round1_slp_packed_banks;
-    let n = a_packed.len() / 1024;
-    assert_eq!(eq.len(), n, "one eq weight per block");
-    assert_eq!(coverage.len(), n, "one coverage entry per block");
-    let mut res_ab = [F128::ZERO; 160];
-    let mut bank0 = [F128::ZERO; 64];
-    let mut bank1 = [F128::ZERO; 64];
-    let mut acc = |seg: ([F128; 160], [F128; 64], [F128; 64])| {
-        for j in 0..160 {
-            res_ab[j] += seg.0[j];
-        }
-        for k in 0..64 {
-            bank0[k] += seg.1[k];
-            bank1[k] += seg.2[k];
-        }
-    };
-    let mut i = 0usize;
-    while i < n {
-        match &coverage[i] {
-            BlockCoverage::Dead => i += 1,
-            BlockCoverage::Full => {
-                let mut j = i + 1;
-                while j < n && coverage[j] == BlockCoverage::Full {
-                    j += 1;
-                }
-                acc(kernel(
-                    &a_packed[i * 1024..j * 1024],
-                    &b_packed[i * 1024..j * 1024],
-                    &c_packed[i * 1024..j * 1024],
-                    &eq[i..j],
-                ));
-                i = j;
-            }
-            BlockCoverage::Partial(ranges) => {
-                let mut a_buf = [0u8; 1024];
-                let mut b_buf = [0u8; 1024];
-                let mut c_buf = [0u8; 1024];
-                super::cleanse_block(a_packed, i * 1024, ranges, &mut a_buf);
-                super::cleanse_block(b_packed, i * 1024, ranges, &mut b_buf);
-                super::cleanse_block(c_packed, i * 1024, ranges, &mut c_buf);
-                acc(kernel(&a_buf, &b_buf, &c_buf, &eq[i..i + 1]));
-                i += 1;
-            }
-        }
-    }
-    banks_to_message((res_ab, bank0, bank1))
+    banks_to_message(
+        crate::genus95_curve_code::round1::round1_slp_packed_banks_fused_padded(
+            a_packed, b_packed, c_packed, eq, coverage,
+        ),
+    )
 }
 
 /// The shared banks → wire-message post-processing: `D⁻¹` scaling of the
@@ -1697,24 +1513,6 @@ pub(super) fn mlv_tail_fs_resume<C: Challenger>(
             "lookahead tail (default)"
         );
     }
-    if NXT_ZEROFILL.load(Ordering::Relaxed) {
-        crate::suboptimal_path!(
-            "zero-filled tail scratch (NXT_ZEROFILL set)",
-            "pooled uninit scratch (default)"
-        );
-    }
-    if DISABLE_FRIENDLY_HORNER.load(Ordering::Relaxed) {
-        crate::suboptimal_path!(
-            "general kernel on friendly rounds (DISABLE_FRIENDLY_HORNER set)",
-            "friendly-Horner kernel (default)"
-        );
-    }
-    if LOOKAHEAD_FRIENDLY.load(Ordering::Relaxed) {
-        crate::suboptimal_path!(
-            "friendly-Horner lookahead (LOOKAHEAD_FRIENDLY set; measured −1.5% on Air)",
-            "general lookahead (default)"
-        );
-    }
     let n_mlv = r_rest.len();
     let mut rounds = Vec::with_capacity(n_mlv);
     let mut rhos = Vec::with_capacity(n_mlv);
@@ -1735,15 +1533,10 @@ pub(super) fn mlv_tail_fs_resume<C: Challenger>(
         // every slot of a_nxt/b_nxt[..half] before reading (write-before-read),
         // so a zero-fill is wasted — and it's a *serial* 256 MB memset before the
         // parallel loop (Amdahl), the same trap `a_mlv`/`b_mlv` avoid via the pool.
-        // (`NXT_ZEROFILL` restores the old vec![ZERO] path for a within-process A/B.)
-        if NXT_ZEROFILL.load(Ordering::Relaxed) {
-            (vec![F128::ZERO; n_in / 2], vec![F128::ZERO; n_in / 2])
-        } else {
-            (
-                crate::scratch::take_f128(n_in / 2),
-                crate::scratch::take_f128(n_in / 2),
-            )
-        }
+        (
+            crate::scratch::take_f128(n_in / 2),
+            crate::scratch::take_f128(n_in / 2),
+        )
     } else {
         (Vec::new(), Vec::new())
     };
@@ -1760,38 +1553,14 @@ pub(super) fn mlv_tail_fs_resume<C: Challenger>(
         if lookahead {
             let out_len = if pending2.is_some() { len / 4 } else { len / 2 };
             let (ao, bo) = (&mut a_nxt[..out_len], &mut b_nxt[..out_len]);
-            // Friendly-Horner lookahead for the iterations whose eq still spans
-            // γ-geometric friendly dims: i=1 (dims 3..6) and i=3 (dims 5..6).
-            // Opt-in (see LOOKAHEAD_FRIENDLY): measured slower on Air.
-            let use_friendly = LOOKAHEAD_FRIENDLY.load(Ordering::Relaxed);
+            // (A friendly-Horner variant of this pass for the iterations whose eq
+            // still spans γ-geometric friendly dims — i=1, i=3 — was bit-identical
+            // but measured −1.5% on an M-series Air: the 8×256-bit Horner
+            // accumulators spill. Deleted 2026-08-27 with its `LOOKAHEAD_FRIENDLY`
+            // toggle; see git history if M4 Max-class DRAM bandwidth makes it
+            // worth re-measuring.)
             let q = if let Some(r2) = pending2 {
-                if use_friendly && i == 3 {
-                    lookahead_friendly_pass::<32, 16>(
-                        &a_mlv,
-                        &b_mlv,
-                        ao,
-                        bo,
-                        (rho_prev, r2),
-                        4,
-                        &split_outer.lo,
-                        &split_outer.hi,
-                        friendly_norm(4),
-                    )
-                } else {
-                    fold2_lookahead_into(&a_mlv, &b_mlv, ao, bo, (rho_prev, r2), &r_rest[i + 2..])
-                }
-            } else if use_friendly && i == 1 {
-                lookahead_friendly_pass::<8, 8>(
-                    &a_mlv,
-                    &b_mlv,
-                    ao,
-                    bo,
-                    (rho_prev, F128::ZERO),
-                    16,
-                    &split_outer.lo,
-                    &split_outer.hi,
-                    friendly_norm(2),
-                )
+                fold2_lookahead_into(&a_mlv, &b_mlv, ao, bo, (rho_prev, r2), &r_rest[i + 2..])
             } else {
                 fold1_lookahead_into(
                     &a_mlv,
@@ -1833,8 +1602,7 @@ pub(super) fn mlv_tail_fs_resume<C: Challenger>(
         let log_before = a_mlv.len().trailing_zeros() as usize;
         let (m1, mi) = if log_before >= 10 {
             let half = a_mlv.len() / 2;
-            let use_friendly =
-                (1..=5).contains(&i) && !DISABLE_FRIENDLY_HORNER.load(Ordering::Relaxed);
+            let use_friendly = (1..=5).contains(&i);
             let pair = if use_friendly {
                 // Friendly-Horner: lo = friendly dims i+1..6, hi = outer (split once).
                 let lo_size = 1usize << (N_INNER - 1 - i);
@@ -2471,24 +2239,12 @@ mod tests {
         let (a, b, c) = random_witness(m, 77);
         LOOKAHEAD_DISABLE.store(false, Ordering::Relaxed);
         let (p_look, c_look) = prove(&a, &b, &c, m, &mut FsChallenger::new(b"flock-ag-la-test"));
-        LOOKAHEAD_FRIENDLY.store(true, Ordering::Relaxed);
-        let (p_friend, c_friend) =
-            prove(&a, &b, &c, m, &mut FsChallenger::new(b"flock-ag-la-test"));
-        LOOKAHEAD_FRIENDLY.store(false, Ordering::Relaxed);
         LOOKAHEAD_DISABLE.store(true, Ordering::Relaxed);
         let (p_classic, c_classic) =
             prove(&a, &b, &c, m, &mut FsChallenger::new(b"flock-ag-la-test"));
         LOOKAHEAD_DISABLE.store(false, Ordering::Relaxed);
         assert_eq!(p_look, p_classic, "lookahead proof != classic proof");
         assert_eq!(c_look, c_classic, "lookahead claim != classic claim");
-        assert_eq!(
-            p_friend, p_classic,
-            "friendly-lookahead proof != classic proof"
-        );
-        assert_eq!(
-            c_friend, c_classic,
-            "friendly-lookahead claim != classic claim"
-        );
     }
 
     /// The verifier rejects a proof with a tampered round message.

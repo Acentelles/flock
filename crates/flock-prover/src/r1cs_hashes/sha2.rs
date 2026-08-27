@@ -174,7 +174,8 @@ pub const SC_MAJ1: usize = 0;
 pub const SC_MAJ2: usize = CARRIES_PER_ADD; // 31
 pub const SC_RIP: usize = 2 * CARRIES_PER_ADD; // 62
 
-// Lin-id discipline (measured 2026-08-14, `sha2_linid_drop_sim`): W is
+// Lin-id discipline (measured 2026-08-14 with the since-deleted
+// `sha2_linid_drop_sim` probe, bloat ledger §E): W is
 // never materialized (the schedule cascade stays shallow — 19.7M nnz),
 // and E_NEW/A_NEW materialize only every OTHER round (`EA_PERIOD` = 2):
 // an inlined round's state expressions are cut one round later, bounding
@@ -1164,27 +1165,6 @@ pub fn min_n_blocks_log(n_compressions: usize) -> usize {
     n.next_power_of_two().trailing_zeros() as usize
 }
 
-/// Build the boolean witness across `2^n_blocks_log` blocks, one compression
-/// per block. Parallelized via rayon.
-pub fn generate_witness(compressions: &[([u32; 8], [u32; 16])], n_blocks_log: usize) -> Vec<bool> {
-    use rayon::prelude::*;
-    let n_total_blocks = 1usize << n_blocks_log;
-    assert!(compressions.len() <= n_total_blocks);
-
-    let mut z = vec![false; n_total_blocks * K];
-    z.par_chunks_mut(K)
-        .enumerate()
-        .for_each(|(block_idx, chunk)| {
-            if block_idx >= compressions.len() {
-                return; // padding k-block (all zeros)
-            }
-            let (h_in, m) = &compressions[block_idx];
-            let block_witness = build_block_witness(h_in, m);
-            chunk.copy_from_slice(&block_witness);
-        });
-    z
-}
-
 /// The monolithic SHA-256 R1CS + its single-slot union registry. Batch
 /// proving ([`Self::prove_fast`]) goes through the UNION commit (dense
 /// stack + integer lanes; `pcs_params` are the union params); the
@@ -1301,23 +1281,6 @@ impl Sha256HybridSetup {
     }
     pub fn n_block_slots(&self) -> usize {
         1usize << self.n_blocks_log()
-    }
-
-    pub fn generate_witness(&self, compressions: &[([u32; 8], [u32; 16])]) -> Vec<bool> {
-        assert_eq!(compressions.len(), self.n_compressions);
-        generate_witness(compressions, self.n_blocks_log())
-    }
-
-    /// Packed witness trace for the generic (matrix-driven) provers — the
-    /// per-circuit code they need. Implemented by reusing the fused builder
-    /// (its a/b outputs are discarded): no separate packed-trace writer to
-    /// maintain, and ~5× cheaper than the bool trace → `pack_witness` path.
-    pub fn generate_witness_packed(
-        &self,
-        compressions: &[([u32; 8], [u32; 16])],
-    ) -> Vec<flock_core::field::F128> {
-        let (z_packed, _a, _b, _stripe) = self.generate_witness_ab(compressions);
-        z_packed
     }
 
     /// Prove `n_compressions` over the single-slot UNION commit (dense
@@ -2166,45 +2129,6 @@ mod tests {
         assert_eq!(Z_CONST_POS, 25_469);
         assert_eq!(USEFUL_BITS, 25_470);
         assert!(USEFUL_BITS <= K);
-    }
-
-    /// Variant simulator: nnz + max-row of the production lin-id set vs
-    /// the zk.golf record's full inlining. Production (W inlined, E/A at
-    /// `EA_PERIOD` = 2) measured 47.4M nnz / max row ~8.9k — the accepted
-    /// blake3-Option-E density envelope; full inlining measured 184M and
-    /// is rejected. Run with `-- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn sha2_linid_drop_sim() {
-        let report = |name: &str, mat: MatCfg, useful: usize| {
-            let t = std::time::Instant::now();
-            let mut a_rows: Vec<Sup> = vec![Sup::new(); K];
-            let mut b_rows: Vec<Sup> = vec![Sup::new(); K];
-            walk_rows_cfg(
-                &mut MatSink {
-                    a_rows: &mut a_rows,
-                    b_rows: &mut b_rows,
-                },
-                mat,
-            );
-            let nnz: usize = a_rows.iter().chain(b_rows.iter()).map(|r| r.len()).sum();
-            let max_row = (0..K)
-                .map(|s| a_rows[s].len() + b_rows[s].len())
-                .max()
-                .unwrap();
-            eprintln!(
-                "{name}: useful {useful} ({} cols), nnz {:.2}M, max A+B row {max_row}, sim {:?}",
-                useful.div_ceil(128),
-                nnz as f64 / 1e6,
-                t.elapsed()
-            );
-        };
-        report("production (E/A period 2)", MAT_PROD, USEFUL_BITS);
-        report(
-            "full inlining (zk.golf shape)",
-            MatCfg { ea: false },
-            USEFUL_BITS - 2 * N_EA_SLOTS * WORD_BITS,
-        );
     }
 
     /// Density audit: template nnz + max row width of the REAL matrices —

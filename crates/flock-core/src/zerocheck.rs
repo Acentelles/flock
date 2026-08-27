@@ -28,8 +28,6 @@ use serde::{Deserialize, Serialize};
 pub mod ag_skip;
 pub mod multilinear;
 pub mod univariate_skip;
-pub mod univariate_skip_deg4;
-pub mod univariate_skip_deg4_optimized;
 pub mod univariate_skip_optimized;
 
 use multilinear::{
@@ -80,11 +78,6 @@ impl ZerocheckGrinding {
     /// Grind every zerocheck challenge whose soundness is being used.
     pub const fn per_challenge_128() -> Self {
         Self { enabled: true }
-    }
-
-    /// Whether this policy inserts PoW operations into the transcript.
-    pub const fn is_enabled(self) -> bool {
-        self.enabled
     }
 
     /// Number of leading-zero bits which strictly turns
@@ -1370,58 +1363,6 @@ mod tests {
             verify_with_grinding(m, &missing, grinding, &mut ch_bad),
             Err(VerifyError::BadGrindingNonceCount { .. })
         ));
-    }
-
-    /// A deliberately small, opt-in overhead probe.  It isolates zerocheck's
-    /// PoW work from PCS query/profile differences; use a release build for a
-    /// meaningful number:
-    ///
-    /// `cargo test --release -p flock-core zerocheck_grinding_overhead_probe -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn zerocheck_grinding_overhead_probe() {
-        use std::time::Instant;
-
-        let m = 17;
-        let mut rng = Rng::new(0x1280_BEEF);
-        let a = rng.bits(1 << m);
-        let b = rng.bits(1 << m);
-        let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
-        let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
-        let run = |grinding: ZerocheckGrinding| {
-            let t = Instant::now();
-            let mut ch = FsChallenger::new(b"flock-zc-grinding-probe-v0");
-            let (proof, _) = prove_packed_with_grinding(&a_p, &b_p, &c_p, m, grinding, &mut ch);
-            let elapsed = t.elapsed();
-            (elapsed, proof.grinding_nonces.len())
-        };
-        const REPS: usize = 5;
-        let mut plain = Vec::with_capacity(REPS);
-        let mut grinded = Vec::with_capacity(REPS);
-        let mut plain_nonces = 0;
-        let mut grinded_nonces = 0;
-        for _ in 0..REPS {
-            let (t, n) = run(ZerocheckGrinding::disabled());
-            plain.push(t);
-            plain_nonces = n;
-            let (t, n) = run(ZerocheckGrinding::per_challenge_128());
-            grinded.push(t);
-            grinded_nonces = n;
-        }
-        plain.sort_unstable();
-        grinded.sort_unstable();
-        let plain = plain[REPS / 2];
-        let grinded = grinded[REPS / 2];
-        println!(
-            "zerocheck grinding (m={m}, median of {REPS}): plain {:.2} ms | \
-             grinded {:.2} ms | delta {:.2} ms | {} PoW nonces",
-            plain.as_secs_f64() * 1e3,
-            grinded.as_secs_f64() * 1e3,
-            grinded.saturating_sub(plain).as_secs_f64() * 1e3,
-            grinded_nonces,
-        );
-        assert_eq!(plain_nonces, 0);
-        assert_eq!(grinded_nonces, 2 + m - K_SKIP);
     }
 
     /// **Verify rejects byte-mutated proofs.** Walk each component of the

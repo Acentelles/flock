@@ -40,13 +40,13 @@ use flock_core::pcs::Commitment;
 
 /// Magic bytes prepended to every serialized proof. Lets readers reject
 /// random binary data early.
-pub const MAGIC: [u8; 5] = *b"FLOCK";
+const MAGIC: [u8; 5] = *b"FLOCK";
 
 /// Maximum accepted proof-bundle size, including the seven-byte header.
 /// Current bundles are well below this ceiling; bounding both file reads and
 /// bincode prevents malformed length prefixes or oversized files from turning
 /// verification into an unbounded allocation.
-pub const MAX_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Format version. Bumped on incompatible serialization changes.
 /// v20 enables the existing non-Ligerito algebraic grinding schedules for
@@ -132,12 +132,12 @@ pub const MAX_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
 /// to `LigeritoProof` and `profile` to `PcsParams` (Johnson+OOD profiles).
 /// v3 restructured `BaseFoldProof`: per-query Merkle paths were replaced by
 /// shared octopus multi-proofs (one per Merkle tree). v2 added `HashKind`
-/// to [`ChainProofBundle`].
+/// to the (since-deleted) chain-proof bundle.
 // v21 (2026-08-14): the R1cs flavor's payload became the MERGED union
 // proof — the standalone hash setups prove over the single-slot union
 // commit now (dense stack + integer lanes); the padded-commit
 // R1csProofLigerito payload is gone from this flavor.
-pub const VERSION: u8 = 21;
+const VERSION: u8 = 21;
 
 /// Flavor discriminator (1 byte). Lets a generic reader peek what kind of
 /// bundle a file holds without parsing the payload first (see

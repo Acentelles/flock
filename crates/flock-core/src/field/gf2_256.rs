@@ -69,11 +69,6 @@ impl F256 {
         Self { c0, c1: F128::ZERO }
     }
 
-    #[inline]
-    pub const fn is_zero(self) -> bool {
-        self.c0.is_zero() && self.c1.is_zero()
-    }
-
     /// Return the two canonical base-field coordinates `(c0, c1)`.
     #[inline]
     pub const fn coordinates(self) -> [F128; 2] {

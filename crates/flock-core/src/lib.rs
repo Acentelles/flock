@@ -30,7 +30,6 @@ pub mod matrix_fold;
 pub mod merkle;
 pub mod ntt;
 pub mod pcs;
-pub mod permutation;
 pub mod product_gkr;
 pub mod proof;
 pub mod r1cs;
@@ -185,7 +184,8 @@ pub(crate) fn sumcheck_round_min_len(pairs: usize, n_blocks: usize) -> Option<us
 /// [`fold_min_len`] caps the fan-out.
 ///
 /// Overridable via `FLOCK_FOLD_GATE` for tuning. Measured on M4 Max (10 P-core
-/// pool) with `product_gkr::tests::fold_scaling_probe`: the full-split branch
+/// pool) with the since-deleted `product_gkr::tests::fold_scaling_probe`
+/// (bloat ledger §E): the full-split branch
 /// scales well (2^17 outputs run 3.2× faster than serial), but the capped
 /// fan-out branch below the gate *loses* to serial — 1.3× slower at 2^15
 /// outputs, 3× slower at 2^13. Lowering the gate hands those widths the
@@ -226,7 +226,7 @@ pub(crate) fn fold_min_len(half: usize) -> Option<usize> {
 /// rather than running serial.
 ///
 /// Serial is the default because the cap measured *worse than serial* on this
-/// crate's only `fold_min_len` consumer, `product_gkr`: per
+/// crate's only `fold_min_len` consumer, `product_gkr`: per the since-deleted
 /// `fold_scaling_probe` on a 10-P-core M4 Max, the capped branch is 1.3× slower
 /// than serial at 2^15 outputs and 3× slower at 2^13, and switching those
 /// widths to serial cut the end-to-end fold phase from ~5.0 ms to ~4.6 ms at

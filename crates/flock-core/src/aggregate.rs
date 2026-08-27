@@ -100,41 +100,13 @@ pub struct Accumulator {
 }
 
 impl Accumulator {
-    /// Discharge through each type's tuned column-marginal kernel.
-    ///
-    /// A claim's bilinear form is `Σ_c col(c)·comb(c)` with
-    /// `comb = Σ_r row(r)·M[r,·]` — a column marginal, which is what
-    /// `fold_split` computes with the type's own walker/CSC path.
-    ///
-    /// **Measured SLOWER than [`Self::discharge`]** (17.3 ms vs 15.3 ms on
-    /// the N=4 BLAKE3 batch), and the reason is worth keeping: `fold_split`
-    /// returns both matrices' marginals, but the accumulated A and B claims
-    /// fold under separate transcripts and so carry *different* row points —
-    /// each call therefore throws half its work away. The fold's own k·nnz
-    /// pass does not have this problem, because there A and B share a row
-    /// weight and one call serves both. Kept for callers without the raw
-    /// matrices; prefer `discharge`.
-    pub fn discharge_with_circuits(
-        &self,
-        circuits: &[&dyn crate::lincheck::LincheckCircuit],
-    ) -> bool {
-        if self.per_type.len() != circuits.len() {
-            return false;
-        }
-        let dot = |a: &[F128], b: &[F128]| {
-            a.iter()
-                .zip(b)
-                .fold(F128::ZERO, |acc, (x, y)| acc + *x * *y)
-        };
-        self.per_type.iter().zip(circuits).all(|((ca, cb), circ)| {
-            // A and B accumulate under separate folds, so their row points
-            // differ; each needs its own marginal.
-            let (xa, _) = circ.fold_split(&ca.row.materialize());
-            let (_, xb) = circ.fold_split(&cb.row.materialize());
-            dot(&ca.col.materialize(), &xa) == ca.value
-                && dot(&cb.col.materialize(), &xb) == cb.value
-        })
-    }
+    // (A `discharge_with_circuits` variant, since deleted per bloat ledger
+    // §A, through each type's tuned
+    // column-marginal `fold_split` kernel was MEASURED SLOWER than the raw
+    // k·nnz pass below — 17.3 vs 15.3 ms on the N=4 BLAKE3 batch — because
+    // the accumulated A and B claims fold under separate transcripts and
+    // carry different row points, so each `fold_split` call threw half its
+    // work away. Deleted 2026-08-27; don't re-derive.)
 
     /// Discharge every accumulated claim against the raw matrices — the
     /// generic `O(Σ_t nnz_t)` root check, for callers without circuits.
@@ -726,33 +698,6 @@ fn gather_element(
         b.push(cb);
     }
     (a, b)
-}
-
-/// Fold a batch of assertions and discharge them.
-///
-/// The caller verifies each proof with a `*_deferred` entry (each proof has
-/// its own union instance, commitment and challenger, so there is nothing
-/// useful to abstract there) and passes the assertions here.
-///
-/// Use this to exercise or test the route end to end, NOT to speed up native
-/// verification — see the module docs: folding `k` claims costs `k · nnz`,
-/// so this is strictly more work than discharging each assertion directly.
-/// Its value is that the *verifier* half is matrix-free.
-pub fn fold_and_discharge(
-    registry: &Registry,
-    mats: &[TypeMatrices<'_>],
-    circuits: &[&dyn crate::lincheck::LincheckCircuit],
-    assertions: &[MatrixAssertion],
-) -> Result<(), AggregateError> {
-    let mut chp = crate::challenger::FsChallenger::new(DOMAIN);
-    let (proof, _) = prove_aggregate(registry, mats, circuits, assertions, &[], &mut chp)?;
-    let mut chv = crate::challenger::FsChallenger::new(DOMAIN);
-    let acc = verify_aggregate(registry, assertions, &[], &proof, &mut chv)?;
-    if acc.discharge(mats) {
-        Ok(())
-    } else {
-        Err(AggregateError::Discharge)
-    }
 }
 
 /// Replay an aggregation. **Reads no matrix** — this is the half a merge
