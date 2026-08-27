@@ -1633,3 +1633,33 @@ Their fold4 H[e,d] = Σ_h f[16h+e]B_k[16h+d] = the same object with the
 basis low factor pre-multiplied. Conceptually: the table-vs-fold rule's
 endpoint — one resident rank-1 object ⇒ contract once, never
 materialize the map.
+
+### Direct-open derivation, verified against our conventions (implementation basis)
+
+Our ring switch: suffix S = rank-1 eq tensor over word coords (x_outer[1..]);
+basis B[i] = φ(S[i]) with φ(u) = Σ_b bit_b(u)·E[b], E = build_eq(r''):
+φ is F2-LINEAR (fold_b128_elems). Identities the port rests on:
+1. ⟨f,B⟩ = Σ_β x^β·φ(s_hat_v[β])  (F2-linearity pulls φ out of the
+   bit_β(f)-weighted sum) — consistent with sumcheck_claim =
+   ⟨transpose(s_hat_v), E⟩.
+2. BANKED: M_e[β] = Σ_h bit_β(f[(e,h)])·hi(h) (banked s_hat_v, low c word
+   coords retained; Σ_e lo(e)·M_e = s_hat_v — the reconstruction test).
+   W[b,d] = φ(lo(d)·x^b) (basis-side state; r''-dependent, built at open).
+3. Round r<c message at eval point x₀: both states fold at the SAME
+   challenges (A on the f-side lag, W on the basis-side lag — same ρ);
+   g_r(x₀) = Σ_{e'} Σ_β x^β · Σ_b bit_b(A-partial(x₀,e')[β])·W-partial(x₀,e')[b]
+   — O(128·128·2^(c-r)) XOR-dominated, sub-ms; NO O(L) touch.
+4. Exit: after all c binds, W's sole bank = the byte-map generator vector
+   G[b] = Σ_e lag(ρ)(e)·W[b,e]; b¹[h] = ψ_G(hi(h)) materialized at
+   2^(ℓ-c) via the existing composed-byte-table machinery. f folds through
+   the same rounds with existing kernels (f-only variant of the lane fold).
+Producers are SMALL: AB banks from lincheck's z_vec (2^k_log elements —
+banked s_hat_v_from_z_vec, trivial); C banks from the zc capture
+analogously. Deleted O(L) work per claim: fold_b128_elems (rs_eq_ind),
+the b_combined build, and its c rounds of folds (~4L total).
+Implementation order: (1) ring_switch banked structs + reference
+producers + W + reconstruction/claim identity tests; (2) round-message +
+state-fold fns, oracle-tested vs the dense SumcheckProver at m=13-16;
+(3) ligerito lane-fold intake (f-only folds + direct messages + b¹ exit);
+(4) pcs gate + banked captures from z_vec/zc; kill switch
+FLOCK_NO_OPEN_DIRECT; proof-bytes identity test at every stage.
