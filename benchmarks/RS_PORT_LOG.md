@@ -1917,3 +1917,36 @@ Open ST: 145 = commits 68.1 / initial 41.9 (pair 40.2) / induce 24.4 /
 misc ~5. Campaign totals vs origin baseline: ST 4781→3312 (1.44x), 8T
 723.9→472.8 (1.53x). vs peer grind-free same morning: witness parity,
 commit +38..50, zc +18..20, open +7.5..8.6, lincheck +1.4..2.7.
+
+### Commit attack, experiment 1 NULL: prep ∥ merkle staging (2026-08-27)
+
+Hypothesis: pair the PMULL prep with the Merkle stage (BLAKE3 =
+integer-SIMD) instead of the PMULL NTT — disjoint execution ports.
+REFUTED decisively: staged join wall 306-327 vs 273 baseline; the
+merkle arm inflates 55 → 150-157 beside prep (~fully additive). On M1
+BLAKE3 and PMULL both issue on the NEON pipes — there is no disjoint
+port pool, the compute-additive window model holds. Scheduling reshuffle
+reverted (prover.rs); the commit.rs encode/merkle stage split kept
+(used by experiment 2). Also measured: NTT truly solo = 158 vs 128-145
+in-join windows — arm-wall readings continue to be context-dependent.
+
+### Commit attack, experiment 2 NULL: leaf hashing fused into the NTT deep pass
+
+Built the peer-shape fusion (per-sub-group hook in the parallel
+interleaved NTT; each 2MB sub-group's leaves hashed cache-hot in the
+task that finished its butterflies; merkle's 1GB codeword re-read
+deleted; bit-identical root/tree/codeword by test at two shapes).
+MEASURED NULL in a cooled window (kill-switch pairs, min-of-run): join
+wall fused 269.5-281.5 vs staged 266.1-276.3 (sign 1/3), commit bucket
+2/3, totals 1/3 — all inside ±6ms noise. The old "deletes a read, not
+compute" pricing is now a measured verdict; no prep absorption
+materialized either (the M1 compute-additive window model holds — their
+absorption comes with a pass that is SLOWER alone by ~13ms, and
+adopting slower-alone shapes only pays if absorption exceeds the
+slowdown, which our kernels' shape does not exhibit). Reverted; patch
+preserved in scratchpad/leaffuse.patch. COMMIT VERDICT so far: our
+kernels win solo (fill 22.9 + NTT 844.7 + merkle 413 ≈ 1280 ST — NTT
+repeatable to 0.13ms), the ~40ms MT bucket gap is their prep riding a
+stall-rich fused pass; closing it means adopting their whole commit
+architecture with uncertain net on our faster kernels. ST cross-tree
+comparison pending (peer running grind-free ST decomposition).
