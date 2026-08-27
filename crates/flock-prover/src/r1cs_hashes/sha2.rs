@@ -2130,45 +2130,6 @@ mod tests {
         assert!(USEFUL_BITS <= K);
     }
 
-    /// Variant simulator: nnz + max-row of the production lin-id set vs
-    /// the zk.golf record's full inlining. Production (W inlined, E/A at
-    /// `EA_PERIOD` = 2) measured 47.4M nnz / max row ~8.9k — the accepted
-    /// blake3-Option-E density envelope; full inlining measured 184M and
-    /// is rejected. Run with `-- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn sha2_linid_drop_sim() {
-        let report = |name: &str, mat: MatCfg, useful: usize| {
-            let t = std::time::Instant::now();
-            let mut a_rows: Vec<Sup> = vec![Sup::new(); K];
-            let mut b_rows: Vec<Sup> = vec![Sup::new(); K];
-            walk_rows_cfg(
-                &mut MatSink {
-                    a_rows: &mut a_rows,
-                    b_rows: &mut b_rows,
-                },
-                mat,
-            );
-            let nnz: usize = a_rows.iter().chain(b_rows.iter()).map(|r| r.len()).sum();
-            let max_row = (0..K)
-                .map(|s| a_rows[s].len() + b_rows[s].len())
-                .max()
-                .unwrap();
-            eprintln!(
-                "{name}: useful {useful} ({} cols), nnz {:.2}M, max A+B row {max_row}, sim {:?}",
-                useful.div_ceil(128),
-                nnz as f64 / 1e6,
-                t.elapsed()
-            );
-        };
-        report("production (E/A period 2)", MAT_PROD, USEFUL_BITS);
-        report(
-            "full inlining (zk.golf shape)",
-            MatCfg { ea: false },
-            USEFUL_BITS - 2 * N_EA_SLOTS * WORD_BITS,
-        );
-    }
-
     /// Density audit: template nnz + max row width of the REAL matrices —
     /// the price of Option F's T1 inlining is bounded row growth in T1's
     /// two consumers (run with `-- --ignored --nocapture`).

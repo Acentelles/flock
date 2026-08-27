@@ -3980,43 +3980,6 @@ mod tests {
         assert_eq!(got, z_vec);
     }
 
-    #[test]
-    #[ignore]
-    fn zzz_bench_fold_1b() {
-        let l = 22; // m = 29
-        let pw_len = 1usize << l;
-        let mut rng = Rng::new(0x1111);
-        let pw: Vec<F128> = (0..pw_len).map(|_| rng.f128()).collect();
-        let t0 = build_eq(&(0..l).map(|_| rng.f128()).collect::<Vec<_>>());
-        let t1 = build_eq(&(0..l).map(|_| rng.f128()).collect::<Vec<_>>());
-
-        let iters = 20;
-        let bench = |f: &dyn Fn()| {
-            let t = std::time::Instant::now();
-            for _ in 0..iters {
-                f();
-            }
-            t.elapsed().as_secs_f64() * 1e3 / iters as f64
-        };
-        let t_k4 = bench(&|| {
-            std::hint::black_box(fold_1b_rows_1way_mfr(&pw, &t0));
-        });
-        let t_8 = bench(&|| {
-            std::hint::black_box(fold_1b_rows_1way_mfr_8wide_k4(&pw, &t0));
-        });
-        let t_2k4 = bench(&|| {
-            std::hint::black_box(fold_1b_rows_2way_mfr(&pw, &t0, &t1));
-        });
-        let t_28 = bench(&|| {
-            std::hint::black_box(fold_1b_rows_2way_mfr_8wide(&pw, &t0, &t1));
-        });
-        eprintln!(
-            "\n  [fold_1b @ m=29] 1-way: {t_k4:5.2}→{t_8:5.2} ms ({:.2}x) | 2-way: {t_2k4:5.2}→{t_28:5.2} ms ({:.2}x)\n",
-            t_k4 / t_8,
-            t_2k4 / t_28,
-        );
-    }
-
     /// `subset_sums_4` matches the obvious specification.
     #[test]
     fn mfr_fold_16wide_2way_matches_scalar() {

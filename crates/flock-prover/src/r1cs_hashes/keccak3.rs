@@ -800,52 +800,6 @@ mod tests {
         }
     }
 
-    /// Head-to-head packing comparison vs the single-keccak encoder at
-    /// `n = 6144 = 3·2048`, a sweet spot where the single encoder rounds up to
-    /// m=29 (8192 slots) but 3-wide lands exactly on m=28 (2048 blocks) — a 2×
-    /// smaller commitment. Run with:
-    ///   cargo test --release -p flock keccak3::tests::pack_win -- --ignored --nocapture
-    #[test]
-    #[ignore = "timing comparison; run manually with --nocapture"]
-    fn pack_win() {
-        use crate::r1cs_hashes::keccak as k1;
-        use flock_core::challenger::FsChallenger;
-        use std::time::Instant;
-
-        let n = 6144usize;
-        let mut rng = Rng::new(0xC0FFEE_BEEF);
-        let inputs: Vec<State> = (0..n).map(|_| random_state(&mut rng)).collect();
-
-        let s1 = k1::KeccakSetup::new(n);
-        let s3 = KeccakSetup::new(n);
-        println!(
-            "n={n}: single m={} (2^{} bits)  |  3-wide m={} (2^{} bits)",
-            s1.m(),
-            s1.m(),
-            s3.m(),
-            s3.m()
-        );
-
-        let mut t = Instant::now();
-        let mut ch = FsChallenger::new(b"pack-bench");
-        let (p1, _, _) = s1.prove_fast(&inputs, &mut ch);
-        let single = t.elapsed().as_secs_f64();
-        std::hint::black_box(&p1);
-
-        t = Instant::now();
-        let mut ch = FsChallenger::new(b"pack-bench");
-        let (p3, _, _) = s3.prove_fast(&inputs, &mut ch);
-        let wide = t.elapsed().as_secs_f64();
-        std::hint::black_box(&p3);
-
-        println!(
-            "prove_fast: single={:.1} ms  3-wide={:.1} ms  ({:.2}x)",
-            single * 1e3,
-            wide * 1e3,
-            single / wide
-        );
-    }
-
     /// End-to-end `prove_fast` → `verify` roundtrip, with a non-multiple-of-3
     /// count to exercise the trailing-triple zero-state padding.
     /// Ligerito-backend prove_fast roundtrip.
