@@ -291,9 +291,9 @@ authoritative statement of each profile's schedule.
 and every byte-pinned fixture move from pure-query 128-bit to
 work-normalized 128-bit (112 query bits + 2^16 hash trials per level), and
 that prover cost gains the per-level grinding; the 128-bit audit rows and
-`docs/recursion-100-128-variants.md` must say the same. *Naming assumption
-(confirm before executing):* the survivor keeps the base name — `Fast128`
-is renamed to `Fast` (serde `fast`, `m*_fast.toml`), likewise `Slim128` →
+`docs/recursion-100-128-variants.md` must say the same. *Naming (Ron,
+2026-08-27, confirmed):* the survivor keeps the base name — `Fast128` is
+renamed to `Fast` (serde `fast`, `m*_fast.toml`), likewise `Slim128` →
 `Slim` — so selectors and the `Default` do not move. *Open sub-decision:*
 the `*100` twins. `Fast100`/`Slim100` are documented as "the base with only
 the query target changed" and as the fixed historical cost points the
