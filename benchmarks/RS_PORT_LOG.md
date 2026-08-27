@@ -1975,3 +1975,32 @@ option = porting their full streaming radix-8 replicate+NTT+leaf pass:
 large rewrite of the tuned NTT, uncertain net (their pass is faster ST
 by ~73 but slower MT-solo by ~13 than our staged pipeline) — priced for
 Benedikt's call.
+
+### Streaming commit port (their full architecture) — MEASURED UNSUCCESSFUL, reverted
+
+Benedikt-directed full port (no kill switch; his correct note: my
+"slower MT-solo" claim was bad accounting — their 235 was prep-contended
+too). Built faithfully from their source (commit.rs:489-830): deep-pass
+NTT publishes ~1MiB leaf jobs (leaf hashing + aligned local parent
+subtrees, hashed hot) into a bounded channel drained by utility-QoS
+helper threads (E-cores); queue-full → inline; tail drained on the main
+pool; shared top after (merkle top 0.03ms — locals worked). Join moved
+to the P-pool when the pipeline engages (E-cores reserved for helpers).
+Bit-identical (root/tree/codeword equality test at 2 shapes; suite
+350 green). MEASURED, same window as a staged baseline re-run
+(287-294): shallow queue (cap 4) 294-307 — inline fallback
+re-serializes leaves onto P mid-transform; deep queue (no inline)
+350-354 — codeword cold by drain time, staged merkle's DRAM read comes
+back plus overhead. Intra-window structure: ntt+leaves 194-239 vs
+staged ntt+merkle 183 — the pipeline never beats staged even inside
+its own window. WHY THEIRS WINS AND OURS CAN'T (this hardware): the
+architecture monetizes E-core silicon for leaf hashing; their host has
+4 E-cores, ours 2 — and our all-core join ALREADY monetizes those 2
+E-cores for prep compute (certified AB-hoist v2). Switching the same 2
+E-cores from prep-absorption to leaf-absorption is conserved-compute
+zero-sum, minus channel/QoS overhead. Patch preserved:
+scratchpad/streaming_commit.patch (542 lines incl. equality test).
+COMMIT PHASE FINAL VERDICT: closed-structural on M1 Max — kernels ST
+near-parity, all five architecture/scheduling experiments
+null-to-negative; the ~40ms MT bucket gap is E-core-count-bound, not
+code-bound.
