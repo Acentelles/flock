@@ -1860,3 +1860,19 @@ pays here). L1 fill 0.5→0.00, all-in NTT 5.2-6.9→5.0-5.2; recursive
 commits 14.3-15.5→12.9-13.3 (their 9.88; residual = their radix-8
 kernel shape, parked). PAIRED A/B: open sign 3/3 (−2.35/−1.60/−0.56,
 avg −1.5), totals 3/3. FLOCK_NO_FILL_FUSE=1 kills (same-binary A/B).
+
+### Boundary FUSION (join → single sweep) — phase-certified (2026-08-27)
+
+Read their materialize_direct_fold8 directly (Benedikt owns both trees):
+one witness sweep produces f1 AND b1 AND the round-0 message — the b1
+gathers + factored eq products run in the witness stream's stall slots,
+fold accumulates unreduced (fold_banked_slot). Ported the idea as
+fold_boundary_fused_par: replaces the rayon::join; suffix eq kept
+factored (eq_lo⊗eq_hi, never built); lag fold via mul_unreduced + one
+reduce. The standalone split-fold null INVERTS under fusion (logged
+where the null was recorded). Boundary pair 7.3-8.4 → 5.5-5.7; initial
+sumcheck 8.5-9.8 → 5.9-6.0 (their 5.19). CERTIFICATION: bucket-level
+A/B inconclusive (−0.2/+10.1 outlier/0.0 in a noisy window — a ~2ms
+effect under ±5ms noise); per-phase paired A/B (same binaries, same
+window, init_min per run) 3/3 DISJOINT: 5.85/6.04/6.59 vs
+7.52/8.40/8.13, avg −1.9. Proof-identity + full suite green.

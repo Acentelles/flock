@@ -1633,7 +1633,6 @@ mod tests {
     /// The stripe-fold C path must reproduce the drain's banks bit-for-bit.
     /// Banks are recovered from the s_hat_v_c wire output via the module's
     /// own constants, and the lifted C message is cross-checked too.
-    #[test]
     /// The banked stripe capture: (a) its flat banks are bit-identical to
     /// the bank-only variant's; (b) `Σ_e eq(r[7..7+c], e)·banked[e]`
     /// reconstructs the flat canonical `s_hat_v_c` exactly.

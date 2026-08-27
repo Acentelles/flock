@@ -3853,38 +3853,28 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         }
         let _tf = std::time::Instant::now();
         let lag = crate::zerocheck::univariate_skip::build_eq(&r_lane_fold);
-        // Residual basis from the exit generators (the fully-folded W
-        // columns; γ baked in, so claims just add), then rejoin the
-        // incumbent flow — SumcheckProver::new computes the boundary
-        // round's message over the (small) folded pair.
-        // Dense residual: build_eq + mul-free table fold. (The split-tensor
-        // variant was tried and is SLOWER here — its per-slot multiply
-        // outweighs the saved 2^(ℓ-c) tensor build at this size.)
-        let residual = |bundle: &crate::pcs::ring_switch::DirectClaimBundle| -> Vec<F128> {
-            crate::pcs::ring_switch::fold_b128_elems(
-                &crate::zerocheck::univariate_skip::build_eq(&bundle.hi_suffix),
-                &bundle.claim.exit_generators(),
-            )
-        };
-        // The composed f-fold (DRAM-bandwidth-bound: one streaming pass over
-        // the full witness) and the residual build (L1-gather/compute-bound
-        // byte-table folds) are data-independent at this point and stress
-        // different resources, so they share the pool instead of running
-        // back-to-back — the same compute-under-bandwidth join as the AB
-        // hoist. Values unchanged: no challenger interaction in either arm.
-        let (f_run, b1) = rayon::join(
-            || fold_f_composed_par(f_run, &lag),
-            || {
-                let mut it = claims.iter();
-                let mut b1 = residual(it.next().expect("nonempty"));
-                for bundle in it {
-                    let part = residual(bundle);
-                    use rayon::prelude::*;
-                    b1.par_iter_mut().zip(part.par_iter()).for_each(|(o, v)| *o += *v);
-                }
-                b1
-            },
-        );
+        // Fused with the composed f-fold: one sweep over the full witness
+        // produces BOTH the folded f and b1 (idea from the challenge tree's
+        // materialize pass). The byte-table gathers and the factored eq
+        // products execute in the witness stream's stall slots — instruction-
+        // level fusion where the previous rayon::join only shared the pool —
+        // and the suffix eq tensor is never materialized. The standalone
+        // split-tensor fold was adjudicated SLOWER (its per-slot multiply
+        // outweighed the saved tensor build as its own pass); fused under the
+        // stream that verdict inverts.
+        let prepped: Vec<(Vec<F128>, Vec<F128>, Vec<F128>)> = claims
+            .iter()
+            .map(|bundle| {
+                let hs = &bundle.hi_suffix;
+                let split = hs.len() / 2;
+                (
+                    crate::pcs::ring_switch::build_fold_byte_table(&bundle.claim.exit_generators()),
+                    crate::zerocheck::univariate_skip::build_eq(&hs[..split]),
+                    crate::zerocheck::univariate_skip::build_eq(&hs[split..]),
+                )
+            })
+            .collect();
+        let (f_run, b1) = fold_boundary_fused_par(f_run, &lag, &prepped);
         assert_eq!(b1.len(), f_run.len(), "residual basis / witness length mismatch");
         if trace {
             eprintln!("    [direct-l0] boundary pair (f-fold ∥ residual b1): {:6.2} ms", _tf.elapsed().as_secs_f64() * 1e3);
@@ -8614,20 +8604,51 @@ mod tests {
 /// `lag = build_eq(ρ_0..ρ_{k-1})` — the same field elements as `k`
 /// successive LSB folds, one read of `f` instead of a halving chain. The
 /// outgoing buffer recycles through the scratch pool.
-fn fold_f_composed_par(f: Vec<F128>, lag: &[F128]) -> Vec<F128> {
+/// Fused boundary pass for the direct open: one sweep over the full witness
+/// produces BOTH the composed-folded `f` (all `initial_k` lane challenges in
+/// one `2^k -> 1` pass, deferred-reduce accumulation) and the residual basis
+/// `b1[j] = Σ_bundles fold(eq_lo[j mod B]·eq_hi[j / B])`. Exact: deferred
+/// reduction is F2-linear over XOR, the field multiply making each eq entry
+/// is exact, and F128 sums are order-free — bit-identical to folding and
+/// building the residual separately.
+fn fold_boundary_fused_par(
+    f: Vec<F128>,
+    lag: &[F128],
+    bundles: &[(Vec<F128>, Vec<F128>, Vec<F128>)], // (byte tables, eq_lo, eq_hi)
+) -> (Vec<F128>, Vec<F128>) {
     use rayon::prelude::*;
     let width = lag.len();
     debug_assert!(width.is_power_of_two());
     let n_out = f.len() / width;
-    let mut out = crate::scratch::take_f128(n_out);
-    out.par_iter_mut().enumerate().for_each(|(j, o)| {
-        let base = j * width;
-        let mut acc = lag[0] * f[base];
-        for e in 1..width {
-            acc += lag[e] * f[base + e];
-        }
-        *o = acc;
-    });
+    debug_assert!(bundles
+        .iter()
+        .all(|(t, lo, hi)| t.len() == 16 * 256 && lo.len() * hi.len() == n_out));
+    let mut f_out = crate::scratch::take_f128(n_out);
+    let mut b_out = crate::scratch::take_f128(n_out);
+    const CHUNK: usize = 2048;
+    f_out
+        .par_chunks_mut(CHUNK)
+        .zip(b_out.par_chunks_mut(CHUNK))
+        .enumerate()
+        .for_each(|(ci, (fc, bc))| {
+            let base_j = ci * CHUNK;
+            for t in 0..fc.len() {
+                let j = base_j + t;
+                let base = j * width;
+                let mut acc = f[base].mul_unreduced(lag[0]);
+                for e in 1..width {
+                    acc ^= f[base + e].mul_unreduced(lag[e]);
+                }
+                fc[t] = acc.reduce();
+                let mut b = F128::ZERO;
+                for (tables, eq_lo, eq_hi) in bundles {
+                    let lo_len = eq_lo.len();
+                    let tval = eq_lo[j & (lo_len - 1)] * eq_hi[j >> lo_len.trailing_zeros()];
+                    b += crate::pcs::ring_switch::fold_one_slot(tval, tables);
+                }
+                bc[t] = b;
+            }
+        });
     crate::scratch::give_f128(f);
-    out
+    (f_out, b_out)
 }

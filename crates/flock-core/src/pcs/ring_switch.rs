@@ -1588,7 +1588,7 @@ const FOLD_TABLE_SIZE: usize = 256;
 /// Build the 16×256 byte-lookup table the fold indexes: `table[k·256 + v]` =
 /// `Σ_{bit b set in v} eq_r_dprime[k·8 + b]`. For the ring-switch fold,
 /// `eq_r_dprime` already has γ_k baked in, so the table carries γ too.
-fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
+pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
     assert_eq!(eq_r_dprime.len(), 1 << LOG_PACKING);
     let mut tables = vec![F128::ZERO; FOLD_N_BYTES * FOLD_TABLE_SIZE];
     for byte_idx in 0..FOLD_N_BYTES {

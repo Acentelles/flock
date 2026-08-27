@@ -761,14 +761,14 @@ keep decision), transcript identity re-checked at each step.
 \item[Result:] OOD stage $2.6$--$3.0\to0.4$--$1.0\,$ms at $m{=}32$ 8T; the draining basis glue pays $+0.1$--$0.6$. Certified jointly with \S\ref{sec:inducetrunc}.
 \end{optsummary}
 
-\subsection{The boundary join: bandwidth and gathers share the pool}
+\subsection{Fusing the boundary pass}
 \label{sec:boundaryjoin}
 
 \begin{optsummary}
-\item[Baseline:] At the direct open's level-1 boundary, the composed witness fold (one streaming pass over the full witness, DRAM-bandwidth-bound) and the residual-basis build (byte-table folds, 16 L1 gathers per element, compute-bound) ran back-to-back: $4.5 + 5.6\,$ms.
-\item[Improvement:] They are data-independent at the boundary --- \code{rayon::join} runs them concurrently on the shared pool.
-\item[Mechanism:] The same compute-under-bandwidth scheduling as the round-1 AB hoist (\S\ref{sec:abhoist}): a bandwidth-bound pass leaves core issue slots idle that a gather/compute-bound task can fill. No transcript interaction in either arm, so values and proof bytes are unchanged.
-\item[Result:] Boundary pair $10.1\to7.3$--$8.4\,$ms; the open's initial-sumcheck stage $11.3\to8.5$--$9.8\,$ms at $m{=}32$ 8T. Certified jointly with \S\ref{sec:blockedtranspose}.
+\item[Baseline:] At the direct open's level-1 boundary, the composed witness fold (one streaming pass over the full witness, DRAM-bandwidth-bound) and the residual-basis build (byte-table folds, 16 L1 gathers per element) ran back-to-back: $4.5 + 5.6\,$ms.
+\item[Improvement:] Two stages. First, \code{rayon::join} — they are data-independent and stress different resources, so they share the pool ($10.1\to7.3$--$8.4$). Then full fusion (from the challenge tree's materialize pass): one sweep over the witness produces \emph{both} arrays — the gathers and the factorized eq products execute in the witness stream's stall slots.
+\item[Mechanism:] Pool-level overlap recovers only part of the idle issue slots; instruction-level fusion recovers the rest. Per output: the $2^k{\to}1$ Lagrange fold accumulates unreduced (3 vs 6 PMULL per product, one reduction), and $b_1[j] = \sum_b \mathrm{fold}_b(\mathrm{eq}_{\mathrm{lo}}[j \bmod B]\cdot\mathrm{eq}_{\mathrm{hi}}[j/B])$ — the suffix eq tensor is never materialized. The standalone split-tensor fold was adjudicated \emph{slower} (its per-slot multiply outweighed the saved tensor build as its own pass); fused under the stream, that verdict inverts. Exact: deferred reduction is linear over XOR, field multiplies are exact, sums are order-free.
+\item[Result:] Boundary pair $10.1\to5.5$--$5.7\,$ms; the open's initial-sumcheck stage $11.3\to5.9$--$6.0\,$ms at $m{=}32$ 8T (challenge tree: $5.19$). Join stage certified with \S\ref{sec:blockedtranspose} (open sign $3/3$); fusion stage phase-paired $3/3$ disjoint ($5.85/6.04/6.59$ vs $7.52/8.40/8.13$) — the bucket-level A/B could not resolve the $\approx2\,$ms effect in that window's noise, the per-phase pairing could.
 \end{optsummary}
 
 \subsection{Cache-blocking the induce transpose}
