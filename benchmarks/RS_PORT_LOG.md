@@ -1761,3 +1761,14 @@ A/B (3 pairs, alternating, head rebuilt after): open 45.5-50.4 vs
 516.0-538.2, 3/3. The honest certified delta for the three micro-fixes
 is −12 (not −16.5: the pre-fix arm reads 60.4 in this window, not the
 earlier quiet-window 64.1). Best this window: 492.53 ms / 532.2k c/s.
+
+### Initial-sumcheck drill: half is PoW grinding at its floor (2026-08-27)
+
+Fine timers on the direct L0: fold grinds 9.3-11.8ms (block-parallel
+lowest-nonce already — protocol security work, high-variance, NOT a
+kernel target; explains both trees' initial-sumcheck noise), composed
+f-fold 4.5-4.7, b1 5.7-6.4, boundary 0.2-0.6. b1 split-fold variant
+tried: SLOWER (9.2-9.4; per-slot mul > saved tensor build at 2^20),
+reverted. Grind-adjusted kernel content of our open ≈ 36ms vs their
+grind-adjusted ~15-20: remaining targets = induce truncated-final-NTT
+(−4.5) and lazy OOD (−2.8), then commits/misc at parity.
