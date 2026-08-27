@@ -1876,3 +1876,30 @@ A/B inconclusive (−0.2/+10.1 outlier/0.0 in a noisy window — a ~2ms
 effect under ±5ms noise); per-phase paired A/B (same binaries, same
 window, init_min per run) 3/3 DISJOINT: 5.85/6.04/6.59 vs
 7.52/8.40/8.13, avg −1.9. Proof-identity + full suite green.
+
+NULL: pooled densify buffer in the induce (scratch take + parallel zero
++ right-sized copy-out vs fresh vec![ZERO; 2^21]) — induce 6.1-7.1 vs
+5.4-6.7 baseline windows, the 16MB copy-out eats the fault savings at
+32MB scale. The allocation rule pays at witness scale (128-512MB), not
+here. Reverted.
+
+### JOINT GRIND-FREE CROSS-TREE TABLE (2026-08-27 ~05:00, m=32 blake CPU-only 8T)
+
+First fully-honest table of the campaign: both trees grind-free
+(FLOCK_NO_GRIND=1), GPU off, strict slot alternation in one window
+(theirs #N then ours #N), both sides' timed paths previously fixed.
+
+  pair1: theirs 392.44 ms / 667,992 c/s   ours 477.93 / 548,497   1.218x
+  pair2: theirs 388.75 ms / 674,319 c/s   ours 469.02 / 558,920   1.207x
+  pair3: theirs 391.35 ms / 669,849 c/s   ours 475.33 / 551,497   1.215x
+  best-vs-best: 469.02 vs 388.75 = 1.206x
+
+Per-phase mins across slots — open: theirs 20.6-21.7 vs ours 29.7-31.1
+(initial ~parity 5.05-5.19 vs 5.73-5.87; recursive commits 9.5-9.9 vs
+11.8-12.5 = their radix-8 kernel shape; induce 2.5-2.6 vs 5.05-5.24 =
+their fused densify/arena/intro-msg mechanisms, each sub-ms, below our
+bloat bar — anatomy on file). Their other buckets: witness 29.1-29.9 /
+commit 223.7-235.8 / zc 101.0-103.5 / lincheck 16.1-17.4. Campaign
+arc: 1.36x (yesterday morning, with-grind) → 1.206x honest grind-free;
+whole campaign vs origin baseline ≈ 723.9 → 469.0 ms 8T (1.54x) /
+4781 → ~3370 ms ST.
