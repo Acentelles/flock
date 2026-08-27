@@ -86,7 +86,8 @@
 //!
 //! **The alignment is load-bearing**, not cosmetic. It makes the level index
 //! a set of high address bits, which is what lets the lincheck's `eq` table
-//! factor across levels — see [`MerkleWalkerCircuit`]. Padding each level up
+//! factor across levels (the retired walker circuit's lincheck relied on
+//! that; the tower's differential gate keeps the geometry). Padding each level up
 //! to `2^κ` costs ~2.7% more columns than tight packing and does not move
 //! `k_log`.
 //!
