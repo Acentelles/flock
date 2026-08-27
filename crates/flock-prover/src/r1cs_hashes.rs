@@ -14,15 +14,12 @@ pub mod common;
 /// The Fiat–Shamir chain: BLAKE3 over a transcript with a finalize forked at
 /// every squeeze — the FS chain's witness generator, over [`blake3`]'s rows.
 pub mod fs_chain;
-/// Generic Merkle-path glue ([`MerkleLayout`]-parameterized prove/verify),
-/// with a per-row bit selector.
-///
-/// [`MerkleLayout`]: merkle_path_common::MerkleLayout
+/// The recursion tower's Merkle glue gates (`SwapTable`, `BitSpreadTable`,
+/// `PowMaskTable`, `FamilyTransposeTileTable`): small R1CS tables that join
+/// the tower's in-circuit Merkle openings to the BLAKE3 compressions.
 pub mod merkle_glue;
-pub mod merkle_path_common;
-/// Merkle-path verification as ONE monolithic R1CS block per path — the
-/// multi-table-legal form (one table row = one whole path), as opposed to
-/// [`merkle_path_common`]'s shift-sumcheck composition over a batch of
-/// independent per-level compressions.
+/// Merkle-path layout and node-hash spec (`MerkleTreeLayout`, `HashSpec`,
+/// `ChunkPathInput`, `SLOT_WORDS`) that the tower's Merkle gates and
+/// [`merkle_glue`] build on.
 pub mod merkle_r1cs;
 pub mod sha2;

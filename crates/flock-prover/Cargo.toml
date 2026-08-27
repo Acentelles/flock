@@ -95,10 +95,6 @@ name = "sha2_proof"
 harness = false
 
 [[bench]]
-name = "sha2_merkle_proof"
-harness = false
-
-[[bench]]
 name = "lincheck_verify"
 harness = false
 
@@ -135,10 +131,6 @@ required-features = ["hash-count"]
 name = "verifier_mul_count"
 harness = false
 required-features = ["mul-count"]
-
-[[bench]]
-name = "merkle_vs_plain_blake3"
-harness = false
 
 [lints]
 workspace = true
