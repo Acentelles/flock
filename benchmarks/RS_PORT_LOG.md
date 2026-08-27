@@ -1950,3 +1950,28 @@ repeatable to 0.13ms), the ~40ms MT bucket gap is their prep riding a
 stall-rich fused pass; closing it means adopting their whole commit
 architecture with uncertain net on our faster kernels. ST cross-tree
 comparison pending (peer running grind-free ST decomposition).
+
+### Commit attack, experiments 3+4 NULL: NEON fused-4 and radix-8 fused-3 top
+
+The "aarch64 fused-4 top layers" menu item is now measured and DEAD,
+with the model corrected in the process:
+- NEON fused-4 (16-point rows, paired-PMULL vec2 muls): top layers
+  316-323 → 794-860 ST (2.5× WORSE) — sixteen ~32MB-strided streams per
+  row group break the M1 prefetcher.
+- Radix-8 fused-3 (8 streams, the challenge tree's choice): 586-601 ST
+  — still 1.9× worse than fused-2.
+- MODEL CORRECTION: the ST top was never at the bandwidth floor. Per
+  fused-2 pass: ~6.7e7 muls ≈ 67-98ms compute vs 79ms measured — the
+  top layers sit AT the compute≈bandwidth balance point single-threaded,
+  so wider fusion trades traffic nobody is waiting on for access
+  patterns that stall. (At 8T the top IS bandwidth-bound, but the MT
+  ceiling is ~10-15ms and both wider kernels regress compute.)
+Both reverted. COMMIT ATTACK VERDICT: kernels are near-parity ST (our
+encode+merkle 1280 vs their 1207, −6%; merkle ±6; prep ~parity); the
+~40ms MT bucket gap is their single-pass commit architecture absorbing
+prep in its stalls, and four replication attempts (prep∥merkle staging,
+leaf fusion, fused-4, fused-3) all measured null-to-negative. Remaining
+option = porting their full streaming radix-8 replicate+NTT+leaf pass:
+large rewrite of the tuned NTT, uncertain net (their pass is faster ST
+by ~73 but slower MT-solo by ~13 than our staged pipeline) — priced for
+Benedikt's call.
