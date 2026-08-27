@@ -55,6 +55,21 @@ group the work by prover phase, in pipeline order; each \emph{subsection}
 is one verified optimization, presented with its mechanism and its paired
 measurement.}
 
+\paragraph{Notation.}
+A few recurring terms, used across multiple sections below:
+\begin{itemize}
+\setlength{\itemsep}{1pt}
+\item \textbf{witness builder} (``the builder''): the code that serializes
+  the R1CS witness into the packed bit-buffers $z$, $a$, $b$.
+\item \textbf{drain} (the gather drain): the loop that walks the per-row
+  lookup tables to accumulate round~1's output messages; detailed in
+  \S\ref{sec:twolane}.
+\item \textbf{lincheck stripe}: the repacking of the witness $z$, indexed
+  by inner/outer position, that the lincheck phase consumes; defined
+  fully in \S\ref{sec:stripe}.
+\end{itemize}
+
+
 Fields. $\Feight = \Ftwo[x]/(x^8+x^4+x^3+x+1)$ and the GHASH field
 $\Fbig = \Ftwo[X]/(X^{128}+X^7+X^2+X+1)$, with the ring embedding
 $\varphi:\Feight\hookrightarrow\Fbig$. Write $\alpha := \varphi(x)$ and
@@ -72,7 +87,12 @@ univariate skip, round~1 of the zerocheck views the $m$ index bits as
 and must emit, for each of the $64$ points $\lambda$ of the skip domain, the
 quadratic message $P^{AB}(\lambda)$ and the linear message $P^{C}(\lambda)$,
 plus a pair of \emph{banks} (the ring-switch helper $\hat s_{v,C}$) that keep
-the small parity dimension unfolded.
+the small parity dimension unfolded: the first small coordinate $s_0$ is
+\emph{not} summed out of the C-side accumulation --- round 1 emits one
+accumulator per value of $s_0$ (two banks) instead of a single combined
+value, because the c-claim's PCS opening needs the two halves separately
+($\hat s_{v,C}$'s canonical form recombines them with weights $1$ and
+$\alpha$; the wire message is their plain sum).
 
 The pinned values below are protocol design, common to both trees --- not
 one of this document's optimizations. The optimization content is
@@ -103,20 +123,6 @@ piece is applied as a shift-and-conditional-XOR directly on the operand
 walking the monomials $X^r e$ with 127 exact shift-and-folds instead of 128
 general multiplies (\S\ref{sec:composedfold} --- resting on $\gamma = X$
 being the generator rather than on \eqref{eq:friendly} itself).
-
-\paragraph{Notation.}
-A few recurring terms, used across multiple sections below:
-\begin{itemize}
-\setlength{\itemsep}{1pt}
-\item \textbf{witness builder} (``the builder''): the code that serializes
-  the R1CS witness into the packed bit-buffers $z$, $a$, $b$.
-\item \textbf{drain} (the gather drain): the loop that walks the per-row
-  lookup tables to accumulate round~1's output messages; detailed in
-  \S\ref{sec:twolane}.
-\item \textbf{lincheck stripe}: the repacking of the witness $z$, indexed
-  by inner/outer position, that the lincheck phase consumes; defined
-  fully in \S\ref{sec:stripe}.
-\end{itemize}
 
 The two directions, in math. Both evaluate contractions against the same
 geometric weight vector: with $w_K = C\,\alpha^K$ for $K < n$ and
@@ -637,6 +643,63 @@ coefficients accumulated in the combine's tail are an accounting wash, not a
 speedup: tail-plus-initial-sumcheck costs $60.5$ vs.\ $60.6\,$ms across the
 two trees' opposite placements of the same work.
 
+\subsection{The direct open: sufficient statistics instead of a basis}
+\label{sec:directopen}
+
+\begin{optsummary}
+\item[Baseline:] Each claim is materialized as a length-$L$ basis vector; the combine builds $b=\sum_k \gamma_k B_k$ and the sumcheck folds it beside the witness --- the basis' whole life is $\approx4L$ element-ops plus the matching DRAM traffic, and it is what made the open scale linearly in $L$.
+\item[Improvement:] Never materialize the basis. Each claim carries a $128\times2^c$ banked statistic, captured for free where the witness already streams; the first $c$ sumcheck rounds run on the banks, and only the $L/2^c$ residual basis is ever built.
+\item[Mechanism:] $B_k$ is a rank-1 eq tensor pushed through an $\Ftwo$-linear map --- the sumcheck messages it feeds are computable from a constant-size contraction, so the $O(L)$ representation was pure convenience.
+\item[Result:] At $m=32$: open $97.4\to64.1\,$ms 8T ($3/3$ disjoint) and $614\to210\,$ms ST; whole proof $527$--$543\to484.3$--$518\,$ms, best $484.25\,$ms ($541$k c/s). Proof bytes identical; \code{FLOCK\_NO\_OPEN\_DIRECT=1} restores the basis path.
+\end{optsummary}
+
+\emph{Shape for this subsection: the ranked $2^{18}$-compression open
+($m=32$, $L=2^{25}$, two batched claims).} After ring-switching, claim $k$
+is the inner product $\langle f, B_k\rangle = t_k$ against
+$B_k[i] = \varphi_k\!\left(\gamma_k\prod_j \eq(u^{(k)}_j, i_j)\right)$ ---
+a rank-1 eq tensor at the claim point pushed elementwise through the
+$\Ftwo$-linear ring-switch map $\varphi_k(u) = \sum_b \mathrm{bit}_b(u)\,
+E_k[b]$. The incumbent evaluates this rank-1 object by writing out all
+$2^\ell$ of its entries and then folding them $c$ times.
+
+Split the word index $i = (e, h)$ into its $c$ lowest and $\ell-c$ highest
+coordinates, so the tensor factors as $\mathrm{lo}_k(e)\cdot
+\mathrm{hi}_k(h)$, and define the \emph{banked statistic}
+\[
+M_e^{(k)}[\beta] \;=\; \sum_h \mathrm{bit}_\beta\!\bigl(f[(e,h)]\bigr)\,
+\mathrm{hi}_k(h)
+\qquad (2^c \text{ banks of } 128 \text{ slices}),
+\]
+which is the ordinary $\hat s_v$ contraction with the low $c$ coordinates
+left unfolded --- and which the prover computes \emph{anyway}: the AB
+claim's banks fall out of lincheck's pre-sumcheck $z$-fold, the C claim's
+out of zerocheck round 1's stripe fold, in both cases by stopping an
+existing small fold $c$ coordinates early. Two states per claim then carry
+the open: the per-bank transpose $A[b,e]$ (bits extracted \emph{before}
+any $\Fbig$ binding --- the step that makes folding sound) and
+$W[b,e] = \varphi_k(\gamma_k\,\mathrm{lo}_k(e)\cdot x^b)$. Both fold
+bank-wise at the sumcheck challenges, each round's message is
+$\sum_{e}\langle A(x_0,e), W(x_0,e)\rangle$ over the $128$-slice axis
+--- $O(2^{c-r})$ inner products, no $O(L)$ touch --- and after the $c$
+lane folds $W$'s surviving bank \emph{is} the byte-map generator from
+which the $L/2^c$ residual basis is materialized and the incumbent
+recursion resumes. With $c$ equal to the L0 fold count, the banked region
+spans exactly the rounds where the basis was large. Every quantity is the
+same field element the incumbent computes, reassociated --- so the proof
+is byte-identical (test-pinned), and the kill switch restores the basis
+path exactly.
+
+Measured at the ranked shape (paired, alternating, same binary): open
+$94.3$--$100.2\to59.5$--$72.1\,$ms at 8 threads ($3/3$ disjoint) and
+$614\to210\,$ms single-threaded; zerocheck unregressed (the banked
+captures ride existing folds); whole-proof best $484.25\,$ms / $541$k
+compressions/s --- the campaign's best figure at this shape. This is the
+table-vs-fold rule of the Preliminaries taken to its endpoint: the claim
+is one resident rank-1 object, so contract once and never materialize the
+map. Idea from the challenge tree's ranked open (located from its honest
+per-phase numbers after an instrumentation artifact had hidden it);
+algebra re-derived, implemented as four independently tested units.
+
 \section{Merkle hashing: BLAKE3}
 
 \subsection{Two transposed four-wide states in flight}
@@ -772,6 +835,7 @@ Section & Kind & Phase effect (ST) & Sign test\\
 \S\ref{sec:qres} & representation & round 2: $-13.0\%$ & $8/8$\\
 \S\ref{sec:tailfuse} & pass fusion & rounds 3+: $-31.8\%$ & $8/8$\\
 \S\ref{sec:composedfold} & work removal & open combine: $-17\%$ & decisive\\
+\S\ref{sec:directopen} & work removal & open ($m{=}32$): $-34\%$ 8T, $-66\%$ ST & $3/3$ disjoint\\
 \S\ref{sec:streamwit} & work removal & witness gen: $-24\%$ & $3/3$\\
 \S\ref{sec:lcfold} & work removal & lincheck fold: $-32\%$ & $3/3$\\
 \S\ref{sec:blake3neon} & ILP & BLAKE3 merkle: $+41\%$ GB/s & decisive\\
@@ -783,8 +847,8 @@ Section & Kind & Phase effect (ST) & Sign test\\
   \multicolumn{2}{r@{}}{$433 \to 312\,$ms\quad($-28\%$)}\\
 \multicolumn{2}{@{}l}{rounds 3+ cumulative} &
   \multicolumn{2}{r@{}}{$455 \to 307\,$ms\quad($-33\%$)}\\
-\multicolumn{2}{@{}l}{PCS open cumulative (\S\ref{sec:composedfold})} &
-  \multicolumn{2}{r@{}}{$\approx160 \to \approx145\,$ms\quad($-9\%$)}\\
+\multicolumn{2}{@{}l}{PCS open cumulative (\S\ref{sec:composedfold}+\S\ref{sec:directopen}, $m{=}30$ ST / $m{=}32$ ST)} &
+  \multicolumn{2}{r@{}}{$\approx160 \to \approx145\,$ms\;/\;$614\to210\,$ms}\\
 \multicolumn{2}{@{}l}{end-to-end, all seven zerocheck changes} &
   \multicolumn{2}{r@{}}{$\approx52{,}400 \to \approx58{,}100$ comp/s\quad($\approx+11\%$, $8/8$)}\\
 \bottomrule
