@@ -2167,3 +2167,27 @@ ours by ~30-40ms at 8T). Compact-K visible in both axes: zc MT 115-121
 MT 723.9 → 457.6 ms = 1.58x; ST 4781 → 3250 = 1.47x; cross-tree gap
 1.49x (ranked discovery) → 1.36x (yesterday) → 1.19-1.22x MT /
 1.15-1.16x ST certified.
+
+### r1 prep structured-b shortcuts CERTIFIED (2026-08-27, no-cooldown protocol)
+
+What "the 16-bit thing" turned out to be: the shift_reduce 16-bit
+geometric-eq machinery is ALREADY OURS (identical mechanism, ported at
+r1 parity long ago) — the stale "16-bit Horner as remaining margin"
+attribution in earlier entries is hereby CORRECTED. The real adjacent
+gap was their prep kernel's structured-b runtime shortcuts, now ported
+(generic dispatch only; their ranked-census constants stay adjudicated
+as noise): (1) all-ones 8-K b-block → a-only kernel (extension of the
+constant-one row is constant one ⇒ y_K = ntt_a: no b gathers, no
+product muls; our x4-table/x2-mul weight decomposition preserved);
+(2) single-live-K0 block → one dual transform + one lane multiply
+(zero rows contribute nothing). Two integer compares per block; exact.
+Naive-oracle test with CRAFTED b (all-ones + single-K0 quarters —
+random data never hits these paths) + suite 353 + proof-identity.
+CERTIFIED under the new no-cooldown protocol (6 pairs, add-pairs-not-
+minutes): join wall 5/6 for new, avg −5.7 (new 252.5-259.7 tight vs
+old 257.5-271.4); r1-drain and zc lines flat (correct controls — the
+kernel runs in the hoisted prep). NEW RECORD pair-5: 454.70 ms /
+576,521 c/s. SECOND CORRECTION: the earlier "zc sub-line parity ~117
+vs ~116" compared our cool numbers to their warm sub-line medians —
+their zc BUCKET is 100-102, so zerocheck retains +14-19 MT post
+compact-K; the parity claim is withdrawn.

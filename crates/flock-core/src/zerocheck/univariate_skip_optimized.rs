@@ -1528,6 +1528,43 @@ mod tests {
         }
     }
 
+    /// The structured-b shortcut paths (all-ones 8-K block → a-only kernel;
+    /// single-live-K0 block → one dual transform) against the naive oracle.
+    /// Random data never exercises them, so craft b: first quarter all-ones,
+    /// second quarter zero except each block's first 64 bits, rest random.
+    #[test]
+    fn matches_naive_with_structured_b_shortcuts() {
+        let c_s = c_s_f128();
+        for &m in &[13usize, 14, 15] {
+            let mut rng = Rng::new(4200 + m as u64);
+            let a = rng.bits(1 << m);
+            let mut b = rng.bits(1 << m);
+            let n = 1usize << m;
+            for (i, slot) in b.iter_mut().enumerate() {
+                if i < n / 4 {
+                    *slot = true; // all-ones blocks
+                } else if i < n / 2 {
+                    // single-K0 blocks: only the first 64 bits of each
+                    // 512-bit (8-K-word) block survive.
+                    if i % 512 >= 64 {
+                        *slot = false;
+                    }
+                }
+            }
+            let c = rng.bits(1 << m);
+            let outer = rng.f128_vec(m - K_SKIP - N_INNER);
+            let r = build_protocol_r(m, &outer);
+            let table = make_inv_table();
+
+            let (naive_ab, naive_c) = round1_naive(&a, &b, &c, m, K_SKIP, &r);
+            let (opt_ab, opt_c) = round1_shift_reduce_extract_c(&a, &b, &c, m, K_SKIP, &r, &table);
+            for i in 0..ELL {
+                assert_eq!(naive_ab[i], c_s * opt_ab[i], "AB mismatch at m={m}, i={i}");
+                assert_eq!(naive_c[i], c_s * opt_c[i], "C mismatch at m={m}, i={i}");
+            }
+        }
+    }
+
     #[test]
     fn small_and_medium_challenges_sanity() {
         // Reach into the constants and verify their structural identities.

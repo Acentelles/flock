@@ -631,6 +631,180 @@ unsafe fn fused_apply_one_k<const K: i32>(
     }
 }
 
+/// b ≡ 1 shortcut: `y_K = ntt_a`, so each K-row is one a-transform,
+/// weight-decomposed exactly like [`fused_apply_one_k`] (x^4 via the scaled
+/// table for K ≥ 4, x^2 via the byte multiply, x^(K&1) via a u16 shift),
+/// widened and XOR-accumulated with NO product multiplies and NO b gathers.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn shift_reduce_inner_a_only_const_b(
+    a_packed: &[u8],
+    table_base: *const u8,
+    table_x4: *const u8,
+    byte_base_b: usize,
+    out: &mut [u8; 64],
+) {
+    use crate::field::gf2_8::neon::{gf8_mul_x2_vec16, gf8_reduce_vec16};
+    use core::arch::aarch64::*;
+    unsafe {
+        let mut acc0_lo = vdupq_n_u16(0);
+        let mut acc0_hi = vdupq_n_u16(0);
+        let mut acc1_lo = vdupq_n_u16(0);
+        let mut acc1_hi = vdupq_n_u16(0);
+        let mut acc2_lo = vdupq_n_u16(0);
+        let mut acc2_hi = vdupq_n_u16(0);
+        let mut acc3_lo = vdupq_n_u16(0);
+        let mut acc3_hi = vdupq_n_u16(0);
+        macro_rules! do_k {
+            ($k:literal) => {{
+                let aw = u64::from_le(core::ptr::read_unaligned(
+                    a_packed.as_ptr().add(byte_base_b + $k * 8).cast::<u64>(),
+                ));
+                if aw != 0 {
+                    let (d0, d1, d2, d3) = apply_word_into_4_regs(
+                        if $k >= 4 { table_x4 } else { table_base },
+                        aw,
+                    );
+                    let (d0, d1, d2, d3) = if ($k >> 1) & 1 == 1 {
+                        (
+                            gf8_mul_x2_vec16(d0),
+                            gf8_mul_x2_vec16(d1),
+                            gf8_mul_x2_vec16(d2),
+                            gf8_mul_x2_vec16(d3),
+                        )
+                    } else {
+                        (d0, d1, d2, d3)
+                    };
+                    macro_rules! absorb {
+                        ($acc:expr, $half:expr) => {{
+                            let widened = vshll_n_u8::<0>($half);
+                            if $k & 1 == 1 {
+                                *$acc = veorq_u16(*$acc, vshlq_n_u16::<1>(widened));
+                            } else {
+                                *$acc = veorq_u16(*$acc, widened);
+                            }
+                        }};
+                    }
+                    absorb!(&mut acc0_lo, vget_low_u8(d0));
+                    absorb!(&mut acc0_hi, vget_high_u8(d0));
+                    absorb!(&mut acc1_lo, vget_low_u8(d1));
+                    absorb!(&mut acc1_hi, vget_high_u8(d1));
+                    absorb!(&mut acc2_lo, vget_low_u8(d2));
+                    absorb!(&mut acc2_hi, vget_high_u8(d2));
+                    absorb!(&mut acc3_lo, vget_low_u8(d3));
+                    absorb!(&mut acc3_hi, vget_high_u8(d3));
+                }
+            }};
+        }
+        do_k!(0);
+        do_k!(1);
+        do_k!(2);
+        do_k!(3);
+        do_k!(4);
+        do_k!(5);
+        do_k!(6);
+        do_k!(7);
+        let r0 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc0_lo), vreinterpretq_u8_u16(acc0_hi));
+        let r1 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc1_lo), vreinterpretq_u8_u16(acc1_hi));
+        let r2 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc2_lo), vreinterpretq_u8_u16(acc2_hi));
+        let r3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc3_lo), vreinterpretq_u8_u16(acc3_hi));
+        let p = out.as_mut_ptr();
+        vst1q_u8(p, r0);
+        vst1q_u8(p.add(16), r1);
+        vst1q_u8(p.add(32), r2);
+        vst1q_u8(p.add(48), r3);
+    }
+}
+
+/// Single-live-K0 shortcut: K-rows 1..7 contribute nothing, so the block is
+/// one dual transform + one lane-wise F_8 multiply (K = 0: base table, no
+/// weight decomposition, no shift).
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn shift_reduce_inner_single_k0(table_base: *const u8, aw: u64, bw0: u64, out: &mut [u8; 64]) {
+    use crate::field::gf2_8::neon::gf8_mul_vec16;
+    use core::arch::aarch64::*;
+    unsafe {
+        let (a0, a1, a2, a3) = apply_word_into_4_regs(table_base, aw);
+        let (b0, b1, b2, b3) = apply_word_into_4_regs(table_base, bw0);
+        let y0 = gf8_mul_vec16(a0, b0);
+        let y1 = gf8_mul_vec16(a1, b1);
+        let y2 = gf8_mul_vec16(a2, b2);
+        let y3 = gf8_mul_vec16(a3, b3);
+        let p = out.as_mut_ptr();
+        vst1q_u8(p, y0);
+        vst1q_u8(p.add(16), y1);
+        vst1q_u8(p.add(32), y2);
+        vst1q_u8(p.add(48), y3);
+    }
+}
+
+/// Single-operand sibling of [`xor_apply_byte_into_8_regs`].
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn xor_apply_byte_into_4_regs<const BH: usize, const ODD: bool>(
+    table: *const u8,
+    byte: u8,
+    d0: &mut core::arch::aarch64::uint8x16_t,
+    d1: &mut core::arch::aarch64::uint8x16_t,
+    d2: &mut core::arch::aarch64::uint8x16_t,
+    d3: &mut core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let r = table.add(byte as usize * 64);
+        let v0 = vld1q_u8(r.add((0 ^ BH) * 16));
+        let v1 = vld1q_u8(r.add((1 ^ BH) * 16));
+        let v2 = vld1q_u8(r.add((2 ^ BH) * 16));
+        let v3 = vld1q_u8(r.add((3 ^ BH) * 16));
+        let (v0, v1, v2, v3) = if ODD {
+            (
+                vextq_u8::<8>(v0, v0),
+                vextq_u8::<8>(v1, v1),
+                vextq_u8::<8>(v2, v2),
+                vextq_u8::<8>(v3, v3),
+            )
+        } else {
+            (v0, v1, v2, v3)
+        };
+        *d0 = veorq_u8(*d0, v0);
+        *d1 = veorq_u8(*d1, v1);
+        *d2 = veorq_u8(*d2, v2);
+        *d3 = veorq_u8(*d3, v3);
+    }
+}
+
+/// Apply one 8-byte packed row through the inv-NTT table into four 16-lane
+/// registers (the a-side of [`fused_apply_one_k`], single operand).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn apply_word_into_4_regs(
+    table: *const u8,
+    word: u64,
+) -> (
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let r0 = table.add((word & 0xff) as usize * 64);
+        let mut d0 = vld1q_u8(r0);
+        let mut d1 = vld1q_u8(r0.add(16));
+        let mut d2 = vld1q_u8(r0.add(32));
+        let mut d3 = vld1q_u8(r0.add(48));
+        xor_apply_byte_into_4_regs::<0, true>(table, (word >> 8) as u8, &mut d0, &mut d1, &mut d2, &mut d3);
+        xor_apply_byte_into_4_regs::<1, false>(table, (word >> 16) as u8, &mut d0, &mut d1, &mut d2, &mut d3);
+        xor_apply_byte_into_4_regs::<1, true>(table, (word >> 24) as u8, &mut d0, &mut d1, &mut d2, &mut d3);
+        xor_apply_byte_into_4_regs::<2, false>(table, (word >> 32) as u8, &mut d0, &mut d1, &mut d2, &mut d3);
+        xor_apply_byte_into_4_regs::<2, true>(table, (word >> 40) as u8, &mut d0, &mut d1, &mut d2, &mut d3);
+        xor_apply_byte_into_4_regs::<3, false>(table, (word >> 48) as u8, &mut d0, &mut d1, &mut d2, &mut d3);
+        xor_apply_byte_into_4_regs::<3, true>(table, (word >> 56) as u8, &mut d0, &mut d1, &mut d2, &mut d3);
+        (d0, d1, d2, d3)
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub(crate) fn shift_reduce_inner_ab_fused_neon(
@@ -649,6 +823,33 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon(
     let table_x4 = inv_table.data_x4_ptr();
 
     unsafe {
+        // Structured-b shortcuts (idea from the challenge tree; exact
+        // dispatch on runtime row content, no circuit assumptions):
+        //  * b ≡ 1 over the whole 8-K block — the NTT-extension of the
+        //    constant-one row is constant one, so y_K = ntt_a: skip every
+        //    b gather and every product multiply, shift-accumulate the a
+        //    transforms directly.
+        //  * only the K = 0 word nonzero — K-rows 1..7 have b = 0 and
+        //    contribute nothing (row(0) = 0 by F2-linearity): compute the
+        //    single K = 0 term.
+        let bw = |k: usize| -> u64 {
+            u64::from_le(core::ptr::read_unaligned(
+                b_packed.as_ptr().add(byte_base_b + k * 8).cast::<u64>(),
+            ))
+        };
+        let and_all = bw(0) & bw(1) & bw(2) & bw(3) & bw(4) & bw(5) & bw(6) & bw(7);
+        if and_all == u64::MAX {
+            shift_reduce_inner_a_only_const_b(a_packed, table_base, table_x4, byte_base_b, out);
+            return;
+        }
+        if (bw(1) | bw(2) | bw(3) | bw(4) | bw(5) | bw(6) | bw(7)) == 0 {
+            let aw = u64::from_le(core::ptr::read_unaligned(
+                a_packed.as_ptr().add(byte_base_b).cast::<u64>(),
+            ));
+            shift_reduce_inner_single_k0(table_base, aw, bw(0), out);
+            return;
+        }
+
         let mut acc0_lo = vdupq_n_u16(0);
         let mut acc0_hi = vdupq_n_u16(0);
         let mut acc1_lo = vdupq_n_u16(0);
