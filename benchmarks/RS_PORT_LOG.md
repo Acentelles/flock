@@ -1579,3 +1579,37 @@ refs in their ring_switch). Their isolation switches exist
 Port = re-derive the sufficient-statistic construction onto our combine
 (our composed-table fold path still does the O(L) sweep). This is the
 campaign's largest remaining item: open +72 MT / +477 ST at m=32.
+
+### Loop-1 port plan: sufficient-statistic open (scoped, ready to build)
+
+Inventory: OUR combine (pcs.rs compute_combined_basis_and_target — same
+fn lineage as theirs) always materializes b_combined (O(L), composed-
+table fold) feeding ligerito::recursive_prover_with_basis, and already
+precomputes round0_prime + round1_lookahead in the combine. We have the
+128-slice s_hat_v captures (AB from lincheck z_vec_pre, C from zc r1)
+but NO banked (retained-coordinate) variant and no factor structs.
+
+Port, three stages, each behind FLOCK_NO_OPEN_DIRECT (default off until
+certified), transcript-identical by proof-bytes test at every stage:
+1. PRODUCERS: fold8-banked s_hat_v variants of our two captures — keep
+   the low 6 suffix coordinates unfolded (64 banks; their bank index =
+   little-endian 6-bit retained coordinate matching build_eq(suffix[..6])).
+   Their producer refs: ring_switch.rs:3205-3320 (factor assembly from
+   w.s_hat_v_fold8), 2545-2558 (struct semantics: A[b,e] = transpose of
+   banks, bit-major so pair-fold kernels bind coords in place; W[b,d] =
+   Φ(low_eq[d]·x^b); round0 cached at construction).
+2. FACTORS + COMBINE BYPASS: when both claims carry factors at the gate
+   shape (L == 2^25, two RS claims, no packed-direct), skip b_combined
+   entirely (their pcs.rs:1286-1307) and hand the factor pair to the
+   recursive prover. γ baked into banks at construction (their
+   RingSwitchBatchOutput comment).
+3. BANKED SUMCHECK INTAKE: a recursive_prover entry whose rounds 0..6
+   run on the A/W factor states (fold banks in place per bind; after six
+   binds W collapses to the byte-map generator vector) then rejoin the
+   incumbent path. Their consumer ref: ring_switch.rs:4399 (
+   "sixty-four-bank intake"), fold4 fallback = 16x16 H[e,d] product
+   matrix (H[e,d] = Σ_h f[16h+e]·B_k[16h+d]).
+Value: open 96.5→~25 MT (−72), 600→~123 ST (−477) at m=32 if the full
+mechanism transfers. Gates: shape-exact like theirs initially, widen
+after certification. Estimated size: 400-700 lines, the campaign's
+largest port; algebra to re-derive, not copy.
