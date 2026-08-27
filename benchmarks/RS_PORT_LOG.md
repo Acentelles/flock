@@ -1532,3 +1532,32 @@ cross-tree kernel gap at m=32 is materially smaller than today's bucket
 tables suggested; the honest scored-vs-scored per-phase decomposition
 would require them instrumenting their scored path, which they may do
 for their own tooling honesty.
+
+## FIRST HONEST CROSS-TREE PER-PHASE TABLE (2026-08-26 night)
+
+Their timed prover fixed (tail-fill hook + ranked C-reuse threaded
+through; honesty check 0.4% vs scored). Both sides m=32, blake3
+merkle+FS, CPU-only. Ours from tonight's clean window (their fresh
+3-run averages; our matched re-run was ambient-contaminated — Chrome/
+ModelCatalogAgent — so our clean-window singles stand, ±3ms):
+
+| phase    | ours MT | theirs MT | Δ    | ours ST | theirs ST | Δ (prep-aligned) |
+|----------|--------:|----------:|-----:|--------:|----------:|-----:|
+| witness  |    30.2 |      29.3 |   +1 |     227 |     205.8 |  +21 |
+| commit   |   ~274  |     223.6 |  +50 |    1277 |  1673 (incl prep 551) | +155 sans-prep |
+| zerocheck|  ~120-128 |    99.9 |  +25 |    1559 (incl prep ~620) | 770.5 | +169 sans-prep |
+| lincheck |    19.6 |      16.2 |   +4 |     126 |     117.6 |   +8 |
+| open     |    96.5 |      24.9 | +72  |     600 |     122.6 | +477 |
+| total    |   ~542  |     393.8 | +148 |    3760 |    2889.8 | +870 |
+
+THE HEADLINE: OPEN is half the gap at both thread counts, and was
+mis-priced all campaign by their broken instrumentation (their old timed
+open read 79.8-86.6 MT / 534 ST — 3-4x inflated). Their open is FLAT
+across m=30→m=32 (~132→~123 ST) while ours scales linearly (145→600):
+an algorithmic difference behind their ranked/m==32 gate, not tuning.
+Open anatomy requested — loop 1 of the joint phase. After open, the
+residuals are commit-sans-prep +155 ST (ntt+merkle — vs the old m=31
+parity result, recheck), zc-sans-prep +169 ST, witness +21 ST,
+lincheck +8. Their flagged caveat: their MT witness/commit may still be
+slightly pessimistic (an MT-only from-message fast path not threaded
+through their timed fn).
