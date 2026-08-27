@@ -189,6 +189,121 @@ impl AdditiveNttF128 {
         self.forward_transform_interleaved_from_layer(data, num_ntts, 0);
     }
 
+    /// Split point between the top (full-buffer sweep) and deep
+    /// (cache-resident sub-group) passes of the interleaved parallel NTT.
+    ///
+    /// Cache heuristic: target sub-group size = 2 MB total bytes. Each
+    /// position is `num_ntts × 16` bytes, so positions per sub-group =
+    /// 2^21 / (num_ntts · 16). With num_ntts=1: 2^17 positions. With
+    /// num_ntts=32: 2^12 positions. (Without this scaling, sub-groups at
+    /// num_ntts=32 would be 64 MB and overflow L2 cache.)
+    ///
+    /// Parallelism floor: the cache heuristic alone yields `n_top == 0` for a
+    /// mid-size transform whose whole codeword fits the 2 MB budget, running
+    /// it fully serial — e.g. the recursive Ligerito commits (~1 ms of NTT
+    /// each, previously 1.0× across threads). When the transform is big
+    /// enough to amortize rayon overhead, raise `n_top` so the deep-layer
+    /// split produces ~one sub-NTT per worker thread (capped to keep each
+    /// sub-NTT ≥ 2^MIN_SUB_LOG positions). The large initial PCS commit is
+    /// unaffected: its cache split already exceeds this floor. The floor
+    /// (log_d ≥ 12) is the measured dispatch-vs-compute crossover for
+    /// num_ntts≈8 recursive commits: at log_d=12 parallelizing cuts the NTT
+    /// ~0.22 → ~0.08 ms, but at log_d=10 the rayon dispatch costs more than
+    /// the ~0.04 ms of work, so those stay scalar.
+    fn interleaved_n_top(&self, log_d: usize, num_ntts: usize) -> usize {
+        const TARGET_SUBGROUP_LOG_BYTES: usize = 21;
+        let log_bytes_per_position = 4 + log2_pow2(num_ntts);
+        let target_log_positions = TARGET_SUBGROUP_LOG_BYTES.saturating_sub(log_bytes_per_position);
+        let cache_n_top = log_d.saturating_sub(target_log_positions);
+        const PARALLEL_FLOOR_LOG_D: usize = 12;
+        const MIN_SUB_LOG: usize = 8;
+        if log_d >= PARALLEL_FLOOR_LOG_D {
+            let want_subs_log = log2_pow2(rayon::current_num_threads().next_power_of_two());
+            let max_n_top = log_d.saturating_sub(MIN_SUB_LOG);
+            cache_n_top.max(want_subs_log.min(max_n_top))
+        } else {
+            cache_n_top
+        }
+    }
+
+    /// RS-encode a message directly: `data` receives the forward interleaved
+    /// NTT of the zero-padded coefficient vector `[msg, 0, …, 0]`, with the
+    /// blow-up `data.len() / msg.len() = 2^r` giving the inverse rate.
+    ///
+    /// The first `r` layers on `[msg, 0, …, 0]` are pure copies (butterfly
+    /// with `v = 0` gives `(u, u)`), so their post-state is `2^r` replicas of
+    /// `msg`. Rather than materializing that state (a full-buffer write pass
+    /// that the next layer immediately re-reads), the first fused top pass
+    /// here reads its four input rows straight from `msg`, copies them into
+    /// the destination rows, and butterflies them in place while the lines
+    /// are L1-hot — DRAM sees one write per line, and the standalone
+    /// replicate pass disappears. Shapes the fused-2 top pass cannot serve
+    /// fall back to an internal replicate + [`Self::forward_transform_interleaved_from_layer`],
+    /// which is also the `FLOCK_NO_FILL_FUSE=1` kill-switch path (same-binary
+    /// A/B). `data`'s prior contents may be arbitrary; every slot is written.
+    pub fn forward_transform_interleaved_from_message(
+        &self,
+        data: &mut [F128],
+        msg: &[F128],
+        num_ntts: usize,
+    ) {
+        let n_total = data.len();
+        assert!(num_ntts.is_power_of_two() && num_ntts > 0);
+        assert_eq!(n_total % msg.len(), 0);
+        let reps = n_total / msg.len();
+        assert!(reps.is_power_of_two() && reps >= 2, "need a blow-up ≥ 2");
+        assert_eq!(msg.len() % num_ntts, 0);
+        let start_layer = log2_pow2(reps);
+        let log_d = log2_pow2(n_total / num_ntts);
+        assert!(log_d <= self.log_domain_size());
+
+        let n_top = self.interleaved_n_top(log_d, num_ntts);
+        let block_size = 1usize << (log_d - start_layer);
+        // The fused first pass needs: the parallel path engaged, at least two
+        // top layers left after the copy layers, quarterable blocks, and the
+        // x86 fused-4 pass not claiming these layers (it fuses 4 at a time
+        // starting at `start_layer`, which the src-copy wrapper doesn't
+        // implement — x86 keeps the replicate path).
+        let fused4_ok = cfg!(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ));
+        let fuse_fill = !fused4_ok
+            && log_d >= 8
+            && n_top > 0
+            && start_layer + 2 <= n_top
+            && block_size >= 4
+            && std::env::var_os("FLOCK_NO_FILL_FUSE").is_none();
+        if !fuse_fill {
+            replicate_interleaved(data, msg);
+            self.forward_transform_interleaved_from_layer(data, num_ntts, start_layer);
+            return;
+        }
+
+        // First fused-2 pass (layers start_layer, start_layer+1), sourcing
+        // every block's rows from `msg`: each layer-`start_layer` block is
+        // exactly one would-be replica, so its input rows are `msg`'s rows.
+        let quarter = block_size >> 2;
+        let block_bytes = block_size * num_ntts;
+        for block in 0..reps {
+            let t_outer = self.twiddle(start_layer, block);
+            let t_inner_a = self.twiddle(start_layer + 1, 2 * block);
+            let t_inner_b = self.twiddle(start_layer + 1, 2 * block + 1);
+            let start = block * block_bytes;
+            butterfly_interleaved_fused_2layer_par_rows_from_src(
+                &mut data[start..start + block_bytes],
+                msg,
+                t_outer,
+                t_inner_a,
+                t_inner_b,
+                quarter,
+                num_ntts,
+            );
+        }
+        self.forward_transform_interleaved_from_layer(data, num_ntts, start_layer + 2);
+    }
+
     /// Forward interleaved NTT starting at `start_layer`, assuming the first
     /// `start_layer` layers have already been applied to `data`.
     ///
@@ -301,39 +416,7 @@ impl AdditiveNttF128 {
         let n_total = data.len();
         let log_d = log2_pow2(n_total / num_ntts);
 
-        // Target sub-group size = 2 MB total bytes. Each position is
-        // `num_ntts × 16` bytes, so positions per sub-group =
-        // 2^21 / (num_ntts · 16). With num_ntts=1: 2^17 positions. With
-        // num_ntts=32: 2^12 positions. (Without this scaling, sub-groups at
-        // num_ntts=32 would be 64 MB and overflow L2 cache.)
-        const TARGET_SUBGROUP_LOG_BYTES: usize = 21;
-        let log_bytes_per_position = 4 + log2_pow2(num_ntts);
-        let target_log_positions = TARGET_SUBGROUP_LOG_BYTES.saturating_sub(log_bytes_per_position);
-        let cache_n_top = log_d.saturating_sub(target_log_positions);
-
-        // Parallelism floor. The cache heuristic keeps each sub-NTT ~2 MB, but
-        // for a mid-size transform whose whole codeword already fits that
-        // budget it yields `cache_n_top == 0` and the transform runs fully
-        // serial — e.g. the recursive Ligerito commits (~1 ms of NTT each,
-        // previously 1.0× across threads). When the transform is big enough to
-        // amortize rayon overhead, raise `n_top` so the deep-layer split
-        // produces ~one sub-NTT per worker thread (capped to keep each sub-NTT
-        // ≥ 2^MIN_SUB_LOG positions). The large initial PCS commit is unaffected:
-        // its `cache_n_top` already exceeds this floor.
-        //
-        // The floor (log_d ≥ 12) is the measured dispatch-vs-compute crossover
-        // for num_ntts≈8 recursive commits: at log_d=12 parallelizing cuts the
-        // NTT ~0.22 → ~0.08 ms, but at log_d=10 the rayon dispatch costs more
-        // than the ~0.04 ms of work, so those stay scalar.
-        const PARALLEL_FLOOR_LOG_D: usize = 12;
-        const MIN_SUB_LOG: usize = 8;
-        let n_top = if log_d >= PARALLEL_FLOOR_LOG_D {
-            let want_subs_log = log2_pow2(rayon::current_num_threads().next_power_of_two());
-            let max_n_top = log_d.saturating_sub(MIN_SUB_LOG);
-            cache_n_top.max(want_subs_log.min(max_n_top))
-        } else {
-            cache_n_top
-        };
+        let n_top = self.interleaved_n_top(log_d, num_ntts);
         if n_top == 0 || log_d < 8 {
             self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
             return;
@@ -964,6 +1047,101 @@ fn butterfly_interleaved_fused_2layer_par_rows(
     }
 }
 
+/// [`butterfly_interleaved_fused_2layer_par_rows`] sourcing its input rows
+/// from `src` instead of from `block`'s prior contents (which may be
+/// arbitrary/uninit). Each task copies its four `src` rows into the
+/// destination rows and butterflies them in place while the lines are
+/// L1-hot: DRAM sees one write per line, and the standalone replicate pass
+/// this replaces disappears. `src.len() == block.len()` (one would-be
+/// replica), same quarter-row layout on both sides.
+fn butterfly_interleaved_fused_2layer_par_rows_from_src(
+    block: &mut [F128],
+    src: &[F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+    quarter: usize,
+    num_ntts: usize,
+) {
+    use rayon::prelude::*;
+    const PARALLEL_ROW_THRESHOLD: usize = 256;
+    let stride = quarter * num_ntts;
+    debug_assert_eq!(block.len(), 4 * stride);
+    debug_assert_eq!(src.len(), 4 * stride);
+
+    let zero_block = t_outer == F128::ZERO && t_inner_a == F128::ZERO;
+    let do_one = |dst: [&mut [F128]; 4], srcs: [&[F128]; 4]| {
+        let [row_a, row_b, row_c, row_d] = dst;
+        row_a.copy_from_slice(srcs[0]);
+        row_b.copy_from_slice(srcs[1]);
+        row_c.copy_from_slice(srcs[2]);
+        row_d.copy_from_slice(srcs[3]);
+        fused_2layer_row_op(
+            row_a, row_b, row_c, row_d, t_outer, t_inner_a, t_inner_b, zero_block, num_ntts,
+        );
+    };
+
+    let (top_half, bot_half) = block.split_at_mut(2 * stride);
+    let (q1, q2) = top_half.split_at_mut(stride);
+    let (q3, q4) = bot_half.split_at_mut(stride);
+    let (s12, s34) = src.split_at(2 * stride);
+    let (s1, s2) = s12.split_at(stride);
+    let (s3, s4) = s34.split_at(stride);
+
+    if quarter < PARALLEL_ROW_THRESHOLD {
+        for r in 0..quarter {
+            let off = r * num_ntts;
+            let (q1r, _) = q1[off..].split_at_mut(num_ntts);
+            let (q2r, _) = q2[off..].split_at_mut(num_ntts);
+            let (q3r, _) = q3[off..].split_at_mut(num_ntts);
+            let (q4r, _) = q4[off..].split_at_mut(num_ntts);
+            do_one(
+                [q1r, q2r, q3r, q4r],
+                [
+                    &s1[off..off + num_ntts],
+                    &s2[off..off + num_ntts],
+                    &s3[off..off + num_ntts],
+                    &s4[off..off + num_ntts],
+                ],
+            );
+        }
+    } else {
+        q1.par_chunks_mut(num_ntts)
+            .zip(q2.par_chunks_mut(num_ntts))
+            .zip(q3.par_chunks_mut(num_ntts))
+            .zip(q4.par_chunks_mut(num_ntts))
+            .zip(s1.par_chunks(num_ntts))
+            .zip(s2.par_chunks(num_ntts))
+            .zip(s3.par_chunks(num_ntts))
+            .zip(s4.par_chunks(num_ntts))
+            .for_each(|(((((((a, b), c), d), sa), sb), sc), sd)| {
+                do_one([a, b, c, d], [sa, sb, sc, sd]);
+            });
+    }
+}
+
+/// Fill `data` with `data.len() / msg.len()` replicas of `msg` — the exact
+/// post-copy-layer state of the RS encoding. Fallback for shapes the fused
+/// first pass of [`AdditiveNttF128::forward_transform_interleaved_from_message`]
+/// cannot serve. Every slot of `data` is written (prior contents arbitrary).
+fn replicate_interleaved(data: &mut [F128], msg: &[F128]) {
+    use rayon::prelude::*;
+    let msg_len = msg.len();
+    debug_assert_eq!(data.len() % msg_len, 0);
+    const COPY_CHUNK: usize = 1 << 16;
+    if msg_len >= COPY_CHUNK {
+        // Both are powers of two, so chunks never straddle a replica boundary.
+        data.par_chunks_mut(COPY_CHUNK).enumerate().for_each(|(i, dst)| {
+            let src_off = (i * COPY_CHUNK) % msg_len;
+            dst.copy_from_slice(&msg[src_off..src_off + dst.len()]);
+        });
+    } else {
+        for rep in data.chunks_mut(msg_len) {
+            rep.copy_from_slice(msg);
+        }
+    }
+}
+
 /// Butterfly one block of an interleaved (SoA) buffer with shared twiddle.
 ///
 /// `block` has length `(2 * block_size_half) * num_ntts` and is laid out as
@@ -1273,6 +1451,39 @@ mod tests {
                     "interleaved parallel mismatch at log_d={log_d}, num_ntts={num_ntts}"
                 );
             }
+        }
+    }
+
+    /// `from_message` (fused first pass reading the message directly) must
+    /// equal replicate + `from_layer` on every shape: fused-eligible large
+    /// shapes, fallback-tiny shapes, and both reps=2 and reps=4 blow-ups.
+    /// Destination starts as garbage to prove every slot is written.
+    #[test]
+    fn from_message_matches_replicate_then_from_layer() {
+        let mut rng = Rng::new(0xF1F1);
+        for (log_msg_positions, num_ntts, reps) in [
+            (16usize, 32usize, 4usize), // large: fused path (cache_n_top ≥ start+2)
+            (16, 32, 2),                // large, reps=2
+            (12, 8, 4),                 // mid: exercises the parallelism-floor regime
+            (6, 4, 4),                  // tiny: fallback replicate path
+            (10, 1, 2),                 // single-lane
+        ] {
+            let log_d = log_msg_positions + log2_pow2(reps);
+            let ntt = AdditiveNttF128::standard(log_d);
+            let msg = rand_vec(&mut rng, (1 << log_msg_positions) * num_ntts);
+            let n_total = (1 << log_d) * num_ntts;
+
+            let mut expect = rand_vec(&mut rng, n_total);
+            replicate_interleaved(&mut expect, &msg);
+            ntt.forward_transform_interleaved_from_layer(&mut expect, num_ntts, log2_pow2(reps));
+
+            let mut got = rand_vec(&mut rng, n_total); // garbage start
+            ntt.forward_transform_interleaved_from_message(&mut got, &msg, num_ntts);
+
+            assert_eq!(
+                got, expect,
+                "from_message mismatch at log_msg={log_msg_positions}, num_ntts={num_ntts}, reps={reps}"
+            );
         }
     }
 

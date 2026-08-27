@@ -761,6 +761,26 @@ keep decision), transcript identity re-checked at each step.
 \item[Result:] OOD stage $2.6$--$3.0\to0.4$--$1.0\,$ms at $m{=}32$ 8T; the draining basis glue pays $+0.1$--$0.6$. Certified jointly with \S\ref{sec:inducetrunc}.
 \end{optsummary}
 
+\subsection{The boundary join: bandwidth and gathers share the pool}
+\label{sec:boundaryjoin}
+
+\begin{optsummary}
+\item[Baseline:] At the direct open's level-1 boundary, the composed witness fold (one streaming pass over the full witness, DRAM-bandwidth-bound) and the residual-basis build (byte-table folds, 16 L1 gathers per element, compute-bound) ran back-to-back: $4.5 + 5.6\,$ms.
+\item[Improvement:] They are data-independent at the boundary --- \code{rayon::join} runs them concurrently on the shared pool.
+\item[Mechanism:] The same compute-under-bandwidth scheduling as the round-1 AB hoist (\S\ref{sec:abhoist}): a bandwidth-bound pass leaves core issue slots idle that a gather/compute-bound task can fill. No transcript interaction in either arm, so values and proof bytes are unchanged.
+\item[Result:] Boundary pair $10.1\to7.3$--$8.4\,$ms; the open's initial-sumcheck stage $11.3\to8.5$--$9.8\,$ms at $m{=}32$ 8T. Certified jointly with \S\ref{sec:blockedtranspose}.
+\end{optsummary}
+
+\subsection{Cache-blocking the induce transpose}
+\label{sec:blockedtranspose}
+
+\begin{optsummary}
+\item[Baseline:] The sparse-prefix induce's dense remainder ran one full-array parallel sweep per transpose layer --- ten sweeps over the $2^{21}$-element domain at $m{=}32$ L0, $\approx640\,$MB of traffic.
+\item[Improvement:] Run every layer whose blocks fit an L2-resident chunk in a single parallel pass over chunks, layers applied back-to-back in cache.
+\item[Mechanism:] The transpose processes high layers (small blocks) first, and blocks nest: a chunk sized to the run's lowest layer contains complete blocks of every higher layer, so a $2\,$MB chunk hosts nine consecutive layers with one read and one write of DRAM traffic ($\approx130\,$MB total) --- the same sub-group decomposition the interleaved encode NTT already uses for its deep layers, applied to the transpose direction.
+\item[Result:] Induce $6.6$--$8.5\to5.4$--$6.7\,$ms at $m{=}32$ 8T. Certified jointly with \S\ref{sec:boundaryjoin}: open bucket paired sign $3/3$ ($-2.8/-3.2/-8.0$, avg $-4.7\,$ms), grind-free protocol. Byte-equality tests cover the blocked run with and without the fused low-half tail.
+\end{optsummary}
+
 \section{Merkle hashing: BLAKE3}
 
 \subsection{Two transposed four-wide states in flight}
@@ -900,6 +920,7 @@ Section & Kind & Phase effect (ST) & Sign test\\
 \S\ref{sec:directopenrefine} & pass fusion & open ($m{=}32$): $-20\%$ 8T & $3/3$ disjoint\\
 \S\ref{sec:cascade} & pass fusion & zc tail ($m{=}32$): $-38\%$ 8T & $4/4$ disjoint\\
 \S\ref{sec:inducetrunc}+\S\ref{sec:lazyood} & work removal & open ($m{=}32$): $-9\%$ 8T & $3/3$ disjoint\\
+\S\ref{sec:boundaryjoin}+\S\ref{sec:blockedtranspose} & scheduling, pass fusion & open ($m{=}32$): $-12\%$ 8T & sign $3/3$\\
 \S\ref{sec:streamwit} & work removal & witness gen: $-24\%$ & $3/3$\\
 \S\ref{sec:lcfold} & work removal & lincheck fold: $-32\%$ & $3/3$\\
 \S\ref{sec:blake3neon} & ILP & BLAKE3 merkle: $+41\%$ GB/s & decisive\\

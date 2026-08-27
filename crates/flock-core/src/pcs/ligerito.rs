@@ -2495,13 +2495,17 @@ pub fn ligero_commit(
     let _t = std::time::Instant::now();
     let mut mat = crate::scratch::take_f128(codeword_len);
     let t_alloc = _t.elapsed();
-    let _t = std::time::Instant::now();
-    super::commit::replicate_message_fill(&mut mat, poly);
-    let t_fill = _t.elapsed();
+    let t_fill = std::time::Duration::ZERO;
 
     // RS-encode every lane in one call (each lane is one independent NTT).
+    // The first `log_inv_rate` layers on the zero-padded coefficients are
+    // pure copies; `from_message` fuses their replicate state into the first
+    // computed layer pass, so the standalone fill pass (and its RFO traffic
+    // on the codeword buffer) disappears. Null at the MAIN commit (its join
+    // window is compute-limited — measured 6-2 against, reverted); pays here
+    // because the recursive commits run standalone and bandwidth-bound.
     let _t = std::time::Instant::now();
-    ntt.forward_transform_interleaved_from_layer(&mut mat, num_interleaved, log_inv_rate);
+    ntt.forward_transform_interleaved_from_message(&mut mat, poly, num_interleaved);
     let t_ntt = _t.elapsed();
 
     // Merkle over rows. One leaf = `num_interleaved` consecutive F128 = 16·num_interleaved bytes.

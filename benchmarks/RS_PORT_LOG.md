@@ -1844,3 +1844,19 @@ Recursive commits 14.3-15.5 vs their 9.88: our L1 NTT deep is at the
 PMULL floor and merkle at the blake3 floor per component math —
 anatomy question sent to peer (different decomposition / overlap /
 config?). Open now ~30-33 vs their 21.5.
+
+### Recursive fill fusion CERTIFIED (2026-08-27 overnight)
+
+Peer per-level anatomy: their recursive commits skip the replicate fill
+— first NTT pass writes the codeword straight from the compact message
+(fill 0.00, their L1 ntt 3.1-3.4). Our tree already HAD the mechanism:
+forward_transform_interleaved_from_message, built for the main commit,
+adjudicated NULL there (compute-limited join window, 6-2 against), and
+reverted into scratchpad/fillfuse.patch. Resurrected the NTT-side
+machinery verbatim and switched ONLY ligero_commit (recursive path) to
+it — the main commit stays on replicate (null verdict stands; the
+recursive commits are standalone + bandwidth-bound, which is why it
+pays here). L1 fill 0.5→0.00, all-in NTT 5.2-6.9→5.0-5.2; recursive
+commits 14.3-15.5→12.9-13.3 (their 9.88; residual = their radix-8
+kernel shape, parked). PAIRED A/B: open sign 3/3 (−2.35/−1.60/−0.56,
+avg −1.5), totals 3/3. FLOCK_NO_FILL_FUSE=1 kills (same-binary A/B).
