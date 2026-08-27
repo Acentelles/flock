@@ -361,7 +361,9 @@ pub fn give_u8(v: Vec<u8>) {
 ///
 /// Sized for a UNIFORM buffer set, i.e. the single-table paths where the
 /// padded `m` drives every class. The merged/union path is not uniform in
-/// `m` — use [`prewarm_prover_union`].
+/// `m` (its commit/open stack is count-derived, not capacity-derived); a
+/// union-shaped prewarm would list per-class sets via `prewarm_sets`. The one
+/// that existed was deleted with the union probes that called it.
 pub fn prewarm_prover(m: usize) {
     prewarm_sets(&[(m, 5, 11)]);
 }
@@ -376,31 +378,6 @@ pub fn prewarm_prover(m: usize) {
 /// on a 36 GB box; 8 GB keeps a margin and preserves every tier that was
 /// already winning.
 const PREWARM_BUDGET_BYTES: usize = 8 << 30;
-
-/// Prewarm for a MERGED/UNION prove, whose buffer set is NOT uniform in `m`.
-///
-/// Only witgen (3 small) and zerocheck (2 large + 2 small) scale with the
-/// padded capacity; commit, compaction and the whole open work on the
-/// count-derived DENSE stack, which is the same size at every capacity. Both
-/// sets are prewarmed — the dense one first, since it is small and always
-/// pays — and the capacity set is included only while it fits
-/// [`PREWARM_BUDGET_BYTES`].
-///
-/// Sizing the WHOLE set off the padded `m` (what [`prewarm_prover`] does, and
-/// what the union probes used to call) inverts the point of prewarming at high
-/// capacity: it force-touches the padding this pipeline exists to skip. The
-/// capacity-scaled buffers are `alloc_uninit` and written under the sparse
-/// contract, so their padded pages are otherwise NEVER faulted in — at
-/// nu = 18 the prove touches ~3 GB of the ~19 GB it allocates.
-pub fn prewarm_prover_union(m_capacity: usize, m_dense: usize) {
-    // Dense classes always; capacity classes in the counts actually taken
-    // (zerocheck 2 large + 2 small, witgen 3 small) when they fit the budget.
-    if m_capacity > m_dense {
-        prewarm_sets(&[(m_dense, 5, 11), (m_capacity, 2, 5)]);
-    } else {
-        prewarm_sets(&[(m_dense, 5, 11)]);
-    }
-}
 
 /// Allocate and first-touch `(m, n_large, n_small)` buffer sets in order,
 /// stopping once the cumulative touched bytes would exceed

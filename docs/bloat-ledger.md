@@ -13,11 +13,16 @@ cleanup candidate). Deviations from the written plan, with reasons:
 - Census corrections found by the compiler: `AdditiveNttGf8::k`,
   `SparseEqTensor::len`, `BaseFunctional::len` were NOT dead (restored);
   `with_blake3_chunk_leaf` was test/bench-only, not zero-reference.
-- Kept: `LOOKAHEAD_FRIENDLY` (in-file bit-identity test + an open
-  re-evaluate-on-M4-Max question), `DISABLE_FRIENDLY_HORNER` +
-  `NXT_ZEROFILL` (A/B arms in the production AG tail, useful for Phase F),
-  the unfused `round1_slp_packed_banks` kernel (differential oracle),
+- Kept: the unfused `round1_slp_packed_banks` kernel (differential oracle),
   `is_empty` twins wherever a live `len` remains (clippy pairing).
+  (`LOOKAHEAD_FRIENDLY`, `DISABLE_FRIENDLY_HORNER`, `NXT_ZEROFILL` were kept
+  at first, then deleted 2026-08-27 on Ron's call once the PR #37 review
+  showed no bench could flip them; the −1.5% friendly-lookahead finding is
+  recorded in `ag_skip.rs` at the lookahead pass.)
+- Second-order zero-caller pub API the sweep itself created, deleted
+  2026-08-27 after the PR #37 review: `prewarm_prover_union`,
+  `sparse_eq_from_parts`; the `cfg(test) pub` `prove/verify_merkle_path_shift`
+  wrappers moved into `merkle_path.rs`'s `mod tests`.
 - blake3's AG entries (`prove_fast_ag`, `prove_fast_union_ag`, …) kept —
   guarded API and the AG future; only the `*_timed` twins died. No
   rs_vs_ag arm was salvaged: correctness guards remain in blake3.rs and
@@ -185,7 +190,7 @@ These have zero production callers and no oracle/API role — verified:
 | genus95 product-code path (`ProductFunctional`, `product_code_message`, `ProductMessage`, `evaluate_product_functional`) | ~273 | **CENSUS ERROR — LIVE, do not delete.** `product_evaluation_functional` / `ProductFunctional` are production: the AG-skip verifier's round-1 AB evaluation `eval_ab_at` (`ag_skip.rs:147`, called from the verify path at `:1929`) builds the 222-coord product functional at `r₁`. `product_code_message` / `evaluate_product_functional` have only test + bench callers, but those tests are oracles for production code: `base_evaluator_matches_product_path_at_sampled_points` (the Sage audit's `check_base_evaluator_matches_product` mirror, validating the 64-coord base evaluator that `lincheck.rs:121` uses) and `m_derived_from_evaluator_is_identity_bridge` (validating `derived_m`, the production kernel's `M`). The census verdict looked only at `lincheck.rs` and missed `ag_skip.rs`. Re-verified 2026-08-27 during the second-order sweep. |
 | blake3.rs direct/AG A/B entry cluster (`prove_fast_ag{,_timed}`, `verify_ag`, `prove_fast_union_ag`, `verify_union_ag`, `prove_fast_timed`, `direct_pcs_params`) | ~190 | sole caller `benches/blake3_rs_vs_ag.rs` (itself superseded, §F). Salvage the union+AG arm into `blake3_proof` or `ag_e2e_zerocheck` first. |
 | prover.rs bench-only `*_timed` chain (`prove_fast_ligerito_timed` :1992, `prove_fast_ligerito_ag_timed` :1674, `ProvePhaseTimings` :1973) | ~280 | reached only via the blake3/keccak3 `*_timed` wrappers → benches. **Phase 1 removed the blake3 wrapper only; `prove_fast_ligerito_timed` + `ProvePhaseTimings` survive via keccak3 and go with the §2.1 keccak decision.** |
-| A/B toggle statics + dead arms (`ROUND1_UNFUSED`, `LOOKAHEAD_DISABLE`, `NXT_ZEROFILL`, `DISABLE_FRIENDLY_HORNER` + the unfused segment driver `ag_skip.rs:1389-1439`) | ~150 | **Correction (PR #37 review): `LOOKAHEAD_DISABLE` is still flipped by the retained `benches/ag_breakdown.rs:106-116` — not dead, do not delete.** `DISABLE_FRIENDLY_HORNER`, `NXT_ZEROFILL` and `LOOKAHEAD_FRIENDLY` lost their only writers with the `blake3_rs_vs_ag` / `ag_lookahead_ab` deletions and are now unflippable in-tree (recursion-track call: delete them + their `prove_tail` arms, or add a driver bench); the answers are recorded in `ag_skip.rs:44-56` doc comments and `docs/ag-recursion-plan.md`. |
+| A/B toggle statics + dead arms (`ROUND1_UNFUSED`, `LOOKAHEAD_DISABLE`, `NXT_ZEROFILL`, `DISABLE_FRIENDLY_HORNER` + the unfused segment driver `ag_skip.rs:1389-1439`) | ~150 | **Correction (PR #37 review): `LOOKAHEAD_DISABLE` is still flipped by the retained `benches/ag_breakdown.rs:106-116` — not dead, do not delete.** `DISABLE_FRIENDLY_HORNER`, `NXT_ZEROFILL` and `LOOKAHEAD_FRIENDLY` lost their only writers with the `blake3_rs_vs_ag` / `ag_lookahead_ab` deletions and are now unflippable in-tree — deleted 2026-08-27 (Ron's call) together with `lookahead_friendly_pass`, `shl_xor_generic` and the `prove_tail` A/B arms; `LOOKAHEAD_DISABLE` stays (`ag_breakdown` + `lookahead_matches_classic` need it); the answers are recorded in `ag_skip.rs:44-56` doc comments and `docs/ag-recursion-plan.md`. |
 | `with_blake3_chunk_leaf` + chunk-leaf remnants (merkle_r1cs.rs:459 + `*_chunk` reachability) | ~42 direct | L0-table revert leftover (`4e96d23`); remaining callers are `tests/merkle_glue.rs:129`, `benches/merkle_l0_opening.rs`, `tower.rs:1047` (cfg(test)). Dies with the `merkle_l0_opening` bench; the `*_chunk` witness family (~500 lines, §G cluster 13) follows the Phase 2.2 decision. |
 
 **Test-only-but-keep** (explicitly not Phase 1 targets): `RandomChallenger`

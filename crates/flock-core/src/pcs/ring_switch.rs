@@ -1936,32 +1936,6 @@ pub fn build_eq_sparse(coords: &[F128]) -> SparseEqTensor {
     }
 }
 
-/// Sparse eq tensor for a point whose coords are `prefix_bits` pinned boolean
-/// values (in scattered-index bit order given by `pinned`), with the remaining
-/// coords carrying an **already-built** tensor. Lets a caller that opens the
-/// same random point under several boolean prefixes/suffixes build `build_eq`
-/// once and reuse it, instead of one dense build per point.
-///
-/// `live_positions` must be ascending and disjoint from the pinned bits, and
-/// `live_tensor.len()` must be `2^live_positions.len()`.
-pub fn sparse_eq_from_parts(
-    live_tensor: Vec<F128>,
-    live_positions: Vec<usize>,
-    base: usize,
-) -> SparseEqTensor {
-    debug_assert_eq!(live_tensor.len(), 1usize << live_positions.len());
-    debug_assert!(live_positions.windows(2).all(|w| w[0] < w[1]));
-    debug_assert!(
-        live_positions.iter().all(|&p| base & (1 << p) == 0),
-        "pinned base bits must be disjoint from live positions"
-    );
-    SparseEqTensor {
-        live_tensor,
-        live_positions,
-        base,
-    }
-}
-
 /// Sparse counterpart of one column of [`fold_1b_rows_multi_padded`]: scans only the
 /// nonzero entries of the suffix tensor. Iterates compact (live-only) tensor
 /// indices and computes the scattered `packed_witness` index inline via
