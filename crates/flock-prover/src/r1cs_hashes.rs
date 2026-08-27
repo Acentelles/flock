@@ -1,5 +1,5 @@
 //! Monolithic per-block R1CS encoders for cryptographic hashes (BLAKE3,
-//! SHA-2, Keccak-f[1600]). Each submodule packages: per-instance witness
+//! SHA-2). Each submodule packages: per-instance witness
 //! layout, sparse `(A_0, B_0)` matrix construction (`C_0 = I`), `prove_fast`
 //! helpers (the c-aliased fast path), and a `*Setup` convenience type
 //! wrapping R1CS + PCS params.
@@ -14,10 +14,6 @@ pub mod common;
 /// The Fiat–Shamir chain: BLAKE3 over a transcript with a finalize forked at
 /// every squeeze — the FS chain's witness generator, over [`blake3`]'s rows.
 pub mod fs_chain;
-pub mod keccak;
-/// 3-wide Keccak-f[1600] R1CS (3 independent permutations per K_LOG=17 block)
-/// for tighter PCS utilization (~97% vs the single encoder's ~65%).
-pub mod keccak3;
 /// Generic Merkle-path glue ([`MerkleLayout`]-parameterized prove/verify),
 /// with a per-row bit selector.
 ///
