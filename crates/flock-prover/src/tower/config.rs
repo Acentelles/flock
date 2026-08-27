@@ -49,12 +49,14 @@ impl TowerConfig {
 
 /// Bench/test knob: which production tower the ignored tower tests and
 /// benches exercise. `TOWER_CONFIG=chain100` selects [`TowerConfig::Chain100`];
-/// the default is the 128-bit production tower.
+/// `TOWER_CONFIG=chain128`, or unset, the 128-bit production tower. Any other
+/// value is a typo and panics instead of silently selecting the default.
 #[cfg(test)]
 pub(super) fn test_config() -> TowerConfig {
     match std::env::var("TOWER_CONFIG").as_deref() {
         Ok("chain100") => TowerConfig::Chain100,
-        _ => TowerConfig::Chain128,
+        Ok("chain128") | Err(std::env::VarError::NotPresent) => TowerConfig::Chain128,
+        other => panic!("TOWER_CONFIG must be `chain100` or `chain128`, got {other:?}"),
     }
 }
 
