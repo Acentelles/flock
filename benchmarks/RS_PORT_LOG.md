@@ -1663,3 +1663,27 @@ state-fold fns, oracle-tested vs the dense SumcheckProver at m=13-16;
 (3) ligerito lane-fold intake (f-only folds + direct messages + b¹ exit);
 (4) pcs gate + banked captures from z_vec/zc; kill switch
 FLOCK_NO_OPEN_DIRECT; proof-bytes identity test at every stage.
+
+### Direct open: wired end-to-end, proof-bytes identical (loop-1 units 1-3)
+
+The basis-free opening is complete behind FLOCK_OPEN_DIRECT=1:
+prove_batched emits banked claim bundles (RsEqInd::Direct; flat s_hat_v
+reconstructed from banks for the transcript), the combine skips
+rs_eq_ind + b_combined entirely, and recursive_prover_direct runs the L0
+lane folds with f-only array folds + banked round messages, materializes
+the residual basis from the exit generators at the level-1 boundary, and
+rejoins the incumbent flow. One wiring bug shaken out (banked messages
+reached the challenger but not the proof's sumcheck transcript;
+prefixed). Also found pre-existing rot in the ignored hand-rolled-config
+pcs roundtrip test (fails on HEAD; unrelated).
+
+Verified: proof-bytes identity through the full pcs stack at m=22
+(production config shape) + verify; production-glue bundle test; oracle
+tests at 4 shapes incl. (15,6); full prove/verify roundtrips on all
+three circuits with the direct path ON; 347 core tests green.
+
+REMAINING before the m=32 A/B (unit 4, producers): the v1 gate builds
+banks with the serial reference scan — unusable at m=32. Plumb
+banked_s_hat_v_from_z_vec (exists, tested) for the AB claim from
+prover.rs's z_vec_pre, and generalize the zc r1 s_hat_v_c capture to its
+banked form for the C claim. Target: open 96.5→~25 MT / 600→~123 ST.
