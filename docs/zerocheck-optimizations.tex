@@ -573,7 +573,17 @@ which.
 \item[Baseline:] After \S\ref{sec:cascade}, round 2 ran as two sweeps (fold + store the full pairs, then an L2 re-read for the eight lookahead products), and the tail bound the challenges from materialized $64$-byte-per-pair state.
 \item[Improvement:] The challenge tree's compact architecture, ported whole. Round 2's single sweep stores $48$ bytes per pair --- the folded even-row \emph{anchor} plus the packed-byte XOR of the pair, still in the bit domain --- and emits round 2's message AND round 3's as six deferred quadratic coefficients: the products are parity-split over pair index ($\mathrm{eq}_2(2y{+}1) = r_1\,\mathrm{eq}_3(y)$), so the odd halves ARE the round-3 aggregates after one $r_1^{-1}$. The consumer then binds $\rho_1$ and $\rho_2$ in one pass through two $\lambda$-scaled byte tables ($\mathrm{bound} = \mathrm{anchor} + \mathrm{fold}_\lambda(\delta)$ by fold linearity over $\mathbb{F}_2$; $\lambda_1 = \rho_1(1{+}\rho_2)$, $\lambda_3 = \rho_1\rho_2$), emits round 4's message, defers round 5's the same way, and materializes the quarter-size level where the cascade resumes unchanged.
 \item[Mechanism:] Three stacked effects: one sweep instead of two (the parity split needs the same eight accumulators the lookahead used, but no re-read pass); $-25\%$ intermediate traffic in both directions; and challenge binding through table lookups instead of per-output multiplies. The degenerate-$b$ fast path rides along: an all-ones packed $b$ row folds to a per-table constant, so such pairs skip their 16 lookups and their provably-zero products --- value-preserving, and common in this circuit's $b$ operand.
-\item[Result:] Producer $54.3$--$55.9\to48.0$--$51.0\,$ms ($3/3$); tail $31.9\to8.5$ with the new $\approx24$ ms double fold between them; mechanism sum $85.9$--$87.9\to79.9$--$84.5$ ($3/3$ disjoint, avg $-4.9$) at $m{=}32$ 8T grind-free. Zerocheck sub-line sums reach parity with the challenge tree ($\approx117$ vs $\approx116$). Transcript-identical by three tests including a targeted $b\equiv1$ case.
+\item[Result:] Producer $54.3$--$55.9\to48.0$--$51.0\,$ms ($3/3$); tail $31.9\to8.5$ with the new $\approx24$ ms double fold between them; mechanism sum $85.9$--$87.9\to79.9$--$84.5$ ($3/3$ disjoint, avg $-4.9$) at $m{=}32$ 8T grind-free. (An earlier parity claim compared against warm-window sub-line medians and is withdrawn: on bucket basis the zerocheck retains $+14$--$19\,$ms at 8T after this change.) Transcript-identical by three tests including a targeted $b\equiv1$ case.
+\end{optsummary}
+
+\subsection{Structured-$b$ shortcuts and the hetero round-1 drain}
+\label{sec:structuredb}
+
+\begin{optsummary}
+\item[Baseline:] The round-1 prep kernel treated every 8-row block uniformly (its 16-bit geometric-eq machinery --- shared with the challenge tree since the round-1 parity port --- already skips zero $b$ rows); the round-1 drain ran on the P pool alone.
+\item[Improvement:] Two exact runtime shortcuts dispatched on two integer compares per block: an all-ones $b$ block (the inv-NTT extension of the constant-one row is constant one, so $y_K = \mathrm{ntt}_a$) skips every $b$ gather and every product multiply; a single-live-$K_0$ block (rows with $b = 0$ contribute nothing by $\mathbb{F}_2$-linearity) collapses to one dual transform and one lane multiply. Separately, the drain's fold/reduce pulls chunks from a shared counter drained by the rayon pool and two utility-QoS E-core threads.
+\item[Mechanism:] Both shortcuts are value-preserving algebra, not approximation, and both patterns are common in this circuit's $b$ operand; the challenge tree's further constants-census paths (positions hardcoded from a scored-distribution census) were left unported --- the SHA-256 control had already adjudicated that family as noise. Random test data never exercises either path, so the oracle test crafts $b$ with all-ones and single-$K_0$ quarters.
+\item[Result:] Commit join wall (where the hoisted prep lives at 8T) $257.5$--$271.4\to252.5$--$259.7\,$ms, $5/6$ pairs, avg $-5.7$; drain hetero $-0.53\,$ms $3/3$ disjoint on its own line. Campaign-record run during certification: $454.70\,$ms / $576{,}521$ comp/s.
 \end{optsummary}
 
 \section{Lincheck}
@@ -970,6 +980,7 @@ Section & Kind & Phase effect (ST) & Sign test\\
 \S\ref{sec:directopenrefine} & pass fusion & open ($m{=}32$): $-20\%$ 8T & $3/3$ disjoint\\
 \S\ref{sec:cascade} & pass fusion & zc tail ($m{=}32$): $-38\%$ 8T & $4/4$ disjoint\\
 \S\ref{sec:compactk} & representation, pass fusion & zc r2..5 ($m{=}32$): $-4.9\,$ms 8T & $3/3$ disjoint\\
+\S\ref{sec:structuredb} & work removal, scheduling & commit join / zc r1 ($m{=}32$): $-6.2\,$ms 8T & $5/6$, $3/3$\\
 \S\ref{sec:inducetrunc}+\S\ref{sec:lazyood} & work removal & open ($m{=}32$): $-9\%$ 8T & $3/3$ disjoint\\
 \S\ref{sec:recursivefill} & pass fusion & open ($m{=}32$): $-1.5\,$ms 8T & sign $3/3$\\
 \S\ref{sec:boundaryjoin}+\S\ref{sec:blockedtranspose} & scheduling, pass fusion & open ($m{=}32$): $-12\%$ 8T & sign $3/3$\\
@@ -990,8 +1001,8 @@ Section & Kind & Phase effect (ST) & Sign test\\
   \multicolumn{2}{r@{}}{$\approx160 \to \approx145\,$ms\;/\;$614\to210\,$ms}\\
 \multicolumn{2}{@{}l}{end-to-end, all seven zerocheck changes} &
   \multicolumn{2}{r@{}}{$\approx52{,}400 \to \approx58{,}100$ comp/s\quad($\approx+11\%$, $8/8$)}\\
-\multicolumn{2}{@{}l}{whole campaign, $m{=}32$ BLAKE3 8T (grind-free basis)} &
-  \multicolumn{2}{r@{}}{$723.9 \to \approx457\,$ms\quad($\approx1.58\times$; gap to the challenge tree $1.36\times\to\approx1.17\times$)}\\
+\multicolumn{2}{@{}l}{whole campaign, $m{=}32$ BLAKE3 (grind-free, certified final table)} &
+  \multicolumn{2}{r@{}}{8T $723.9 \to 454.7\,$ms ($1.59\times$); ST $4781 \to 3230$ ($1.48\times$); gap $1.36\times\to1.217\times$ MT / $1.145\times$ ST}\\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -1026,6 +1037,10 @@ the fresh destination — radix-8 only won as \S\ref{sec:rankedtop}'s
 staged-store kernel, a reminder that a null adjudicates one
 implementation in one architecture, not the idea. A pooled induce
 densify buffer also measured null (the right-sizing copy-out ate the
-fault savings at 32\,MB scale).
+fault savings at 32\,MB scale), and the whole-prove E-core pass kept
+only one of three sites: hetero tiles on the open's boundary sweep and
+recursive-commit leaves measured negative --- on this host the pattern
+needs $\gtrsim$30\,ms compute-bound windows to amortize its helper
+threads.
 
 \end{document}
