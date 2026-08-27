@@ -3338,6 +3338,44 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
         l0_tree,
         None,
         None,
+        None,
+        challenger,
+    )
+}
+
+/// L0 inputs for the direct (basis-free) opening: the per-claim banked
+/// states (see [`crate::pcs::ring_switch::DirectBasisClaim`]) whose bank
+/// count must equal `2^initial_k`, so the banked region spans exactly the
+/// lane-fold rounds and the residual basis materializes at the level-1
+/// boundary.
+pub struct DirectL0 {
+    pub bundles: Vec<crate::pcs::ring_switch::DirectClaimBundle>,
+}
+
+/// Direct-opening recursion entry: the L0 lane folds run with `f`-only
+/// array folds and round messages from the banked states — no length-L
+/// basis exists at any point. Transcript byte-identical to
+/// [`recursive_prover_with_basis`] on the γ-combined dense basis (the
+/// direct messages are the same field elements; pinned by test).
+pub fn recursive_prover_direct<Ch: Challenger>(
+    config: &ProverConfig,
+    packed_witness: Vec<F128>,
+    direct: DirectL0,
+    target: F128,
+    l0_codeword: &[F128],
+    l0_tree: &[Hash],
+    challenger: &mut Ch,
+) -> LigeritoProof {
+    recursive_prover_with_basis_impl(
+        config,
+        packed_witness,
+        Vec::new(),
+        target,
+        l0_codeword,
+        l0_tree,
+        None,
+        None,
+        Some(direct),
         challenger,
     )
 }
@@ -3371,10 +3409,12 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
             u_2: round0_uv.1,
         }),
         round1_lookahead,
+        None,
         challenger,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn recursive_prover_with_basis_impl<Ch: Challenger>(
     config: &ProverConfig,
@@ -3385,6 +3425,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     l0_tree: &[Hash],
     first_msg: Option<SumcheckMessage>,
     round1_lookahead: Option<FoldLookahead>,
+    direct: Option<DirectL0>,
     challenger: &mut Ch,
 ) -> LigeritoProof {
     let log_n = packed_witness.len().trailing_zeros() as usize;
@@ -3392,7 +3433,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let initial_k = config.initial_k;
 
     assert_eq!(packed_witness.len(), 1usize << log_n);
-    assert_eq!(b_initial.len(), 1usize << log_n);
+    if direct.is_none() {
+        assert_eq!(b_initial.len(), 1usize << log_n);
+    }
     assert_eq!(config.recursive_ks.len(), r);
     assert_eq!(config.log_inv_rates.len(), r + 1);
     assert!(r >= 1);
@@ -3445,12 +3488,89 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let ood_count = |lvl: usize| -> usize { config.ood_samples.get(lvl).copied().unwrap_or(0) };
 
     let _t = std::time::Instant::now();
-    let (mut sc_prover, start_msg) = match first_msg {
-        Some(msg) => SumcheckProver::new_with_first_msg(packed_witness, b_initial, target, msg),
-        None => SumcheckProver::new(packed_witness, b_initial, target),
-    };
-    challenger.observe_f128(start_msg.u_0);
-    challenger.observe_f128(start_msg.u_2);
+    let mut r_lane_fold = Vec::with_capacity(initial_k);
+    // Direct L0's banked round messages are emitted outside the
+    // SumcheckProver; they prefix the proof's sumcheck transcript so the
+    // proof layout is identical to the dense path's.
+    let mut direct_prefix: Vec<SumcheckMessage> = Vec::new();
+    let mut sc_prover = if let Some(dl0) = direct {
+        // ---- Direct (basis-free) L0: round messages from the banked claim
+        // states, f-only array folds; the residual basis materializes only
+        // at the level-1 boundary. Transcript identical to the dense path.
+        let mut claims = dl0.bundles;
+        assert!(!claims.is_empty(), "direct L0 needs at least one claim");
+        for b in claims.iter() {
+            assert_eq!(
+                b.claim.n_banks(),
+                1usize << initial_k,
+                "banked region must span exactly the lane folds"
+            );
+        }
+        let msg_of = |claims: &[crate::pcs::ring_switch::DirectClaimBundle]| -> SumcheckMessage {
+            let (mut u0, mut u2) = (F128::ZERO, F128::ZERO);
+            for c in claims {
+                let (a, b) = c.claim.round_msg();
+                u0 += a;
+                u2 += b;
+            }
+            SumcheckMessage { u_0: u0, u_2: u2 }
+        };
+        let mut msg = msg_of(&claims);
+        challenger.observe_f128(msg.u_0);
+        challenger.observe_f128(msg.u_2);
+        direct_prefix.push(msg);
+        let mut t_run = target;
+        let mut f_run = packed_witness;
+        for j in 0..initial_k {
+            let bits = fold_bits(0).saturating_sub(j as u32);
+            if bits > 0 {
+                fold_grinding_nonces.push(challenger.grind_pow(bits));
+            }
+            let r = challenger.sample_f128();
+            // Verifier's running target: q_j(r) = u_0 + r·(T + u_2) + r²·u_2.
+            t_run = msg.u_0 + r * (t_run + msg.u_2) + r * r * msg.u_2;
+            for c in claims.iter_mut() {
+                c.claim.fold(r);
+            }
+            f_run = fold_f_lsb_par(f_run, r);
+            r_lane_fold.push(r);
+            if j + 1 < initial_k {
+                msg = msg_of(&claims);
+                challenger.observe_f128(msg.u_0);
+                challenger.observe_f128(msg.u_2);
+                direct_prefix.push(msg);
+            }
+        }
+        // Level-1 boundary: residual basis from the exit generators (the
+        // fully-folded W columns; γ baked in, so claims just add), then
+        // rejoin the incumbent flow — SumcheckProver::new computes the
+        // boundary round's message over the (small) folded pair.
+        let mut it = claims.iter();
+        let first = it.next().expect("nonempty");
+        let mut b1 = crate::pcs::ring_switch::fold_b128_elems(
+            &crate::zerocheck::univariate_skip::build_eq(&first.hi_suffix),
+            &first.claim.exit_generators(),
+        );
+        for bundle in it {
+            let part = crate::pcs::ring_switch::fold_b128_elems(
+                &crate::zerocheck::univariate_skip::build_eq(&bundle.hi_suffix),
+                &bundle.claim.exit_generators(),
+            );
+            use rayon::prelude::*;
+            b1.par_iter_mut().zip(part.par_iter()).for_each(|(o, v)| *o += *v);
+        }
+        assert_eq!(b1.len(), f_run.len(), "residual basis / witness length mismatch");
+        let (sc, boundary_msg) = SumcheckProver::new(f_run, b1, t_run);
+        challenger.observe_f128(boundary_msg.u_0);
+        challenger.observe_f128(boundary_msg.u_2);
+        sc
+    } else {
+        let (mut sc_prover, start_msg) = match first_msg {
+            Some(msg) => SumcheckProver::new_with_first_msg(packed_witness, b_initial, target, msg),
+            None => SumcheckProver::new(packed_witness, b_initial, target),
+        };
+        challenger.observe_f128(start_msg.u_0);
+        challenger.observe_f128(start_msg.u_2);
 
     // Lane folds with two-rounds-per-pass lookahead: pass rounds alternate
     // with O(1) "skip" rounds whose message is evaluated from quadratic
@@ -3467,7 +3587,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         // Big enough to pay, and every pass keeps `quarter` a multiple of 4.
         n >= (1 << 14) && (n >> initial_k) >= 16
     } && std::env::var("LIG_LOOKAHEAD_DISABLE").is_err();
-    let mut r_lane_fold = Vec::with_capacity(initial_k);
     // Entry coefficients from the pcs combine (computed in the same pass as
     // the round-0 prime) make round 0 itself a skip round: the full-size
     // entry pass never runs and the first real pass folds two challenges
@@ -3513,7 +3632,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         r_lane_fold.push(r);
     }
     // Even initial_k ends on a skip round — materialize the deferred fold.
-    sc_prover.drain_pending_fold();
+        sc_prover.drain_pending_fold();
+        sc_prover
+    };
     if trace {
         t_init_sumcheck += _t.elapsed();
     }
@@ -3711,7 +3832,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     opened_rows: opened_rows_last,
                     merkle_proof: merkle_proof_last,
                 },
-                sumcheck_transcript: sc_prover.transcript().to_vec(),
+                sumcheck_transcript: {
+                    let mut t = direct_prefix.clone();
+                    t.extend_from_slice(sc_prover.transcript());
+                    t
+                },
                 grinding_nonces,
                 ood_values,
                 fold_grinding_nonces,
@@ -8092,4 +8217,21 @@ mod tests {
         );
         assert_eq!(w.root(), w2.root());
     }
+}
+
+/// Parallel f-only LSB fold for the direct L0 path:
+/// `out[j] = f[2j] + r·(f[2j+1] + f[2j])`. The outgoing buffer recycles
+/// through the scratch pool (the round-0 input is the 2^(m-7) packed
+/// witness).
+fn fold_f_lsb_par(f: Vec<F128>, r: F128) -> Vec<F128> {
+    use rayon::prelude::*;
+    let half = f.len() / 2;
+    let mut out = crate::scratch::take_f128(half);
+    out.par_iter_mut().enumerate().for_each(|(j, o)| {
+        let f0 = f[2 * j];
+        let f1 = f[2 * j + 1];
+        *o = f0 + r * (f1 + f0);
+    });
+    crate::scratch::give_f128(f);
+    out
 }

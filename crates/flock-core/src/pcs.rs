@@ -160,6 +160,12 @@ pub mod combine_probe {
 pub use commit::{
     Commitment, PcsParams, ProverData, commit, commit_into, prefault_codeword_during,
 };
+
+/// Opt-in force for the direct (basis-free) opening, equivalent to
+/// `FLOCK_OPEN_DIRECT=1` — exists for paired within-process A/B and the
+/// proof-identity test. Off by default until certified.
+pub static OPEN_DIRECT_FORCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 pub use pack::{LOG_PACKING, pack_witness, unpack_witness};
 pub use ring_switch::{RingSwitchProof, SparseEqTensor};
 
@@ -258,28 +264,50 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
         lig_config.log_inv_rates[0], commitment.params.log_inv_rate,
     );
 
+    // Direct (basis-free) opening gate: opt-in while it certifies. The
+    // banked region must span exactly the lane folds, so c = initial_k.
+    let direct_on = std::env::var_os("FLOCK_OPEN_DIRECT").is_some()
+        || OPEN_DIRECT_FORCE.load(std::sync::atomic::Ordering::Relaxed);
+    let direct_c = if direct_on && packed_direct.is_empty() {
+        lig_config.initial_k
+    } else {
+        0
+    };
     let combined = compute_combined_basis_and_target(
         &packed_witness,
         x_outers,
         precomputed_s_hat_v,
         packed_direct,
+        direct_c,
         padding,
         challenger,
         trace,
     );
 
     let t = std::time::Instant::now();
-    let ligerito_proof = ligerito::recursive_prover_with_basis_precomputed_round0(
-        lig_config,
-        packed_witness,
-        combined.b_combined,
-        combined.target_combined,
-        &prover_data.codeword,
-        &prover_data.merkle_tree,
-        combined.round0_prime,
-        combined.round1_lookahead,
-        challenger,
-    );
+    let ligerito_proof = if let Some(dl0) = combined.direct {
+        ligerito::recursive_prover_direct(
+            lig_config,
+            packed_witness,
+            dl0,
+            combined.target_combined,
+            &prover_data.codeword,
+            &prover_data.merkle_tree,
+            challenger,
+        )
+    } else {
+        ligerito::recursive_prover_with_basis_precomputed_round0(
+            lig_config,
+            packed_witness,
+            combined.b_combined,
+            combined.target_combined,
+            &prover_data.codeword,
+            &prover_data.merkle_tree,
+            combined.round0_prime,
+            combined.round1_lookahead,
+            challenger,
+        )
+    };
     if trace {
         eprintln!(
             "  [open_batch] ligerito::recursive_prover_with_basis: {:6.2} ms",
@@ -310,6 +338,9 @@ struct CombinedClaim {
     /// no packed-direct claims only). Lets the recursive prover's first lane
     /// fold be an O(1) skip round — see [`ligerito::FoldLookahead`].
     round1_lookahead: Option<ligerito::FoldLookahead>,
+    /// Direct (basis-free) opening payload: when `Some`, `b_combined` is
+    /// empty and the recursion runs [`ligerito::recursive_prover_direct`].
+    direct: Option<ligerito::DirectL0>,
 }
 
 /// Runs ring_switch over RS claims, observes packed-direct claim values +
@@ -323,6 +354,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     x_outers: &[&[F128]],
     precomputed_s_hat_v: &[Option<&[F128]>],
     packed_direct: &[PackedDirectClaim],
+    direct_c: usize,
     padding: &PaddingSpec,
     challenger: &mut Ch,
     trace: bool,
@@ -338,19 +370,56 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
 
     challenger.observe_label(b"flock-pcs-open-batch-v0");
 
+    // Direct (basis-free) opening: applies when every RS claim has a dense,
+    // long-enough suffix and there are no packed-direct claims. v1 builds the
+    // banked statistics here with the reference scan (producer plumbing from
+    // lincheck/zerocheck is the follow-up optimization); the transcript is
+    // unaffected either way.
+    let use_direct = direct_c > 0
+        && n_pd == 0
+        && n_rs > 0
+        && x_outers.iter().all(|x| {
+            let suffix = &x[1..];
+            suffix.len() > direct_c
+                && suffix.iter().filter(|&&c| c == F128::ZERO).count()
+                    < ring_switch::SPARSE_ZERO_THRESHOLD
+        });
+    let banked: Vec<Option<ring_switch::BankedShatV>> = if use_direct {
+        x_outers
+            .iter()
+            .map(|x| Some(ring_switch::banked_s_hat_v_naive(packed_witness, &x[1..], direct_c)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let banked_refs: Vec<Option<&ring_switch::BankedShatV>> =
+        banked.iter().map(|b| b.as_ref()).collect();
+
     // 1. Ring-switching for all x_outers.
     let t = std::time::Instant::now();
     let (rs_results, gammas_rs): (
         Vec<(RingSwitchProof, ring_switch::RingSwitchBatchOutput)>,
         Vec<F128>,
     ) = if n_rs > 0 {
-        ring_switch::prove_batched_padded_with_precomputed(
-            packed_witness,
-            x_outers,
-            precomputed_s_hat_v,
-            padding,
-            challenger,
-        )
+        if use_direct {
+            ring_switch::prove_batched_padded_direct(
+                packed_witness,
+                x_outers,
+                precomputed_s_hat_v,
+                &banked_refs,
+                direct_c,
+                padding,
+                challenger,
+            )
+        } else {
+            ring_switch::prove_batched_padded_with_precomputed(
+                packed_witness,
+                x_outers,
+                precomputed_s_hat_v,
+                padding,
+                challenger,
+            )
+        }
     } else {
         (Vec::new(), Vec::new())
     };
@@ -389,6 +458,28 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     }
     for (pd, g) in packed_direct.iter().zip(gammas_pd.iter()) {
         target_combined += *g * pd.value;
+    }
+
+    if use_direct {
+        // No basis is ever materialized: hand the banked claim bundles to
+        // the direct recursion entry.
+        let mut ring_switches = Vec::with_capacity(rs_results.len());
+        let mut bundles = Vec::with_capacity(rs_results.len());
+        for (proof, out) in rs_results {
+            ring_switches.push(proof);
+            match out.rs_eq_ind {
+                ring_switch::RsEqInd::Direct(b) => bundles.push(*b),
+                _ => unreachable!("direct gate produced a non-direct claim"),
+            }
+        }
+        return CombinedClaim {
+            ring_switches,
+            b_combined: Vec::new(),
+            target_combined,
+            round0_prime: (F128::ZERO, F128::ZERO),
+            round1_lookahead: None,
+            direct: Some(ligerito::DirectL0 { bundles }),
+        };
     }
 
     let rs_baked: Vec<&[F128]> = rs_results
@@ -691,6 +782,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         b_combined,
         target_combined,
         round0_prime: (round0_u0, round0_u2),
+        direct: None,
         round1_lookahead,
     }
 }
@@ -1077,5 +1169,113 @@ mod tests {
             &mut ch_v,
         )
         .unwrap_or_else(|e| panic!("ligerito verify rejected honest proof: {e:?}"));
+    }
+
+    /// The direct (basis-free) opening produces a byte-identical proof to the
+    /// incumbent basis path and verifies. Production config shape (grinding
+    /// zeroed for speed); both arms in-process via [`OPEN_DIRECT_FORCE`].
+    /// (The neighboring hand-rolled-config roundtrip test has pre-existing
+    /// config rot — this one derives its configs from `prover_config_for`.)
+    #[test]
+    #[ignore] // Heavier; run with `cargo test pcs_direct_open -- --ignored`
+    fn pcs_direct_open_proof_identical() {
+        use std::sync::atomic::Ordering;
+        let m = 22usize;
+        let initial_k = 6usize;
+        let mut rng = Rng::new(0xD12EC70u64);
+        let z = rng.bits(1 << m);
+        let z_skip = rng.f128();
+        let x_outer: Vec<F128> = (0..(m - 6)).map(|_| rng.f128()).collect();
+        let rs_claim = zhat_skip_reference(&z, m, z_skip, &x_outer);
+
+        let mut lig_p_cfg = crate::pcs::ligerito::prover_config_for(
+            m - LOG_PACKING,
+            initial_k,
+            Default::default(),
+        )
+        .expect("production prover config");
+        let mut lig_v_cfg = crate::pcs::ligerito::verifier_config_for(
+            m - LOG_PACKING,
+            initial_k,
+            Default::default(),
+        )
+        .expect("production verifier config");
+        // Zero the PoW grinding on both sides (test speed; they must match).
+        for b in lig_p_cfg.grinding_bits.iter_mut() {
+            *b = 0;
+        }
+        for b in lig_p_cfg.fold_grinding_bits.iter_mut() {
+            *b = 0;
+        }
+        for b in lig_v_cfg.grinding_bits.iter_mut() {
+            *b = 0;
+        }
+        for b in lig_v_cfg.fold_grinding_bits.iter_mut() {
+            *b = 0;
+        }
+
+        let params = PcsParams {
+            m,
+            log_inv_rate: lig_p_cfg.log_inv_rates[0],
+            log_batch_size: initial_k,
+            profile: Default::default(),
+            merkle_hash: Default::default(),
+        };
+        let z_packed = pack_witness(&z, m);
+        let (commitment, prover_data) = commit(&z_packed, &params);
+
+        let open = |force: bool| -> BatchOpeningProofLigerito {
+            OPEN_DIRECT_FORCE.store(force, Ordering::Relaxed);
+            let mut ch = FsChallenger::new(b"flock-test-lig-v0");
+            let proof = open_batch_mixed_ligerito_with_precomputed_s_hat_v(
+                z_packed.clone(),
+                &prover_data,
+                &commitment,
+                &[x_outer.as_slice()],
+                &[],
+                &[],
+                &PaddingSpec::dense(m),
+                &lig_p_cfg,
+                &mut ch,
+            );
+            OPEN_DIRECT_FORCE.store(false, Ordering::Relaxed);
+            proof
+        };
+        let proof_dense = open(false);
+        let proof_direct = open(true);
+        assert_eq!(proof_direct.ring_switches, proof_dense.ring_switches, "ring_switches");
+        let (a, b) = (&proof_direct.ligerito, &proof_dense.ligerito);
+        for (i, (x, y)) in a
+            .sumcheck_transcript
+            .iter()
+            .zip(b.sumcheck_transcript.iter())
+            .enumerate()
+        {
+            assert_eq!(x, y, "sumcheck message {i} diverges");
+        }
+        assert_eq!(
+            a.sumcheck_transcript.len(),
+            b.sumcheck_transcript.len(),
+            "transcript length"
+        );
+        assert_eq!(a.initial_root, b.initial_root, "initial_root");
+        assert_eq!(a.recursive_roots, b.recursive_roots, "recursive_roots");
+        assert_eq!(
+            proof_direct, proof_dense,
+            "direct open must be byte-identical to the basis path"
+        );
+
+        let mut ch_v = FsChallenger::new(b"flock-test-lig-v0");
+        verify_opening_batch_ligerito_mixed(
+            &commitment,
+            &[rs_claim],
+            &[&lagrange_weights_naive(6, z_skip)],
+            &[x_outer.as_slice()],
+            &[],
+            &proof_direct,
+            &lig_v_cfg,
+            &mut ch_v,
+        )
+        .unwrap_or_else(|e| panic!("ligerito verify rejected direct-open proof: {e:?}"));
     }
 }

@@ -1763,7 +1763,7 @@ pub(crate) fn fold_b128_from_table(eq_lo: &[F128], eq_hi: &[F128], tables: &[F12
 
 /// Minimum number of exactly-zero suffix coords for a claim to be routed
 /// through the sparse kernels instead of the dense MFR fold.
-const SPARSE_ZERO_THRESHOLD: usize = 3;
+pub(crate) const SPARSE_ZERO_THRESHOLD: usize = 3;
 
 /// Sparse representation of `build_eq(coords)` when `coords` contains exact
 /// `F128::ZERO` entries: stores values at the compact (live) tensor positions
@@ -2147,6 +2147,21 @@ pub enum RsEqInd {
         len: usize,
         entries: Vec<(usize, F128)>,
     },
+    /// Direct (basis-free) opening: no representation of `γ_k·B_k` exists at
+    /// all — the claim is carried as banked sufficient statistics
+    /// ([`DirectBasisClaim`]) from which the L0 sumcheck's first `c` round
+    /// messages and the level-1 residual basis derive. Only the direct
+    /// recursion entry may consume this variant; the dense accessors panic.
+    Direct(Box<DirectClaimBundle>),
+}
+
+/// The direct claim payload: the banked states plus the high suffix
+/// coordinates whose eq tensor, weighted by the exit generators, is the
+/// claim's residual basis at the level-1 boundary.
+#[derive(Clone, Debug)]
+pub struct DirectClaimBundle {
+    pub claim: DirectBasisClaim,
+    pub hi_suffix: Vec<F128>,
 }
 
 impl RsEqInd {
@@ -2156,6 +2171,7 @@ impl RsEqInd {
             Self::Dense(v) => v.len(),
             Self::DeferredDense { eq_lo, eq_hi, .. } => eq_lo.len() * eq_hi.len(),
             Self::Sparse { len, .. } => *len,
+            Self::Direct(b) => b.claim.n_banks() << b.hi_suffix.len(),
         }
     }
 
@@ -2188,6 +2204,10 @@ impl RsEqInd {
                     out[idx] += gamma * val;
                 }
             }
+            Self::Direct(_) => unreachable!(
+                "RsEqInd::Direct has no dense representation; only the direct \
+                 recursion entry may consume it"
+            ),
         }
     }
 
@@ -2213,6 +2233,10 @@ impl RsEqInd {
                 }
                 out
             }
+            Self::Direct(_) => unreachable!(
+                "RsEqInd::Direct has no dense representation; only the direct \
+                 recursion entry may consume it"
+            ),
         }
     }
 
@@ -2229,6 +2253,10 @@ impl RsEqInd {
                 }
                 out
             }
+            Self::Direct(_) => unreachable!(
+                "RsEqInd::Direct has no dense representation; only the direct \
+                 recursion entry may consume it"
+            ),
         }
     }
 }
@@ -2371,6 +2399,51 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     padding: &PaddingSpec,
     challenger: &mut Ch,
 ) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>) {
+    prove_batched_padded_impl(
+        packed_witness,
+        x_outers,
+        precomputed_s_hat_v,
+        &[],
+        0,
+        padding,
+        challenger,
+    )
+}
+
+/// Direct-opening variant: claims with a supplied [`BankedShatV`] emit
+/// [`RsEqInd::Direct`] (banked states, `2^direct_c` banks) instead of any
+/// dense/deferred representation. Their `s_hat_v` transcript message is
+/// reconstructed from the banks (`Σ_e lo(e)·banks[e]` — the tested
+/// identity), so the transcript is byte-identical to the incumbent path.
+pub fn prove_batched_padded_direct<Ch: Challenger>(
+    packed_witness: &[F128],
+    x_outers: &[&[F128]],
+    precomputed_s_hat_v: &[Option<&[F128]>],
+    direct_banked: &[Option<&BankedShatV>],
+    direct_c: usize,
+    padding: &PaddingSpec,
+    challenger: &mut Ch,
+) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>) {
+    prove_batched_padded_impl(
+        packed_witness,
+        x_outers,
+        precomputed_s_hat_v,
+        direct_banked,
+        direct_c,
+        padding,
+        challenger,
+    )
+}
+
+fn prove_batched_padded_impl<Ch: Challenger>(
+    packed_witness: &[F128],
+    x_outers: &[&[F128]],
+    precomputed_s_hat_v: &[Option<&[F128]>],
+    direct_banked: &[Option<&BankedShatV>],
+    direct_c: usize,
+    padding: &PaddingSpec,
+    challenger: &mut Ch,
+) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>) {
     assert!(!x_outers.is_empty());
     let trace = std::env::var("PCS_TRACE").is_ok();
     let n = x_outers.len();
@@ -2394,9 +2467,13 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     }
 
     // Per-orig-claim "precomputed?" predicate. Empty precomputed slice → all
-    // claims need fold (matches the existing behavior bit-for-bit).
-    let has_precomputed =
-        |orig: usize| -> bool { precomputed_s_hat_v.get(orig).copied().flatten().is_some() };
+    // claims need fold (matches the existing behavior bit-for-bit). Direct
+    // claims count as precomputed: their s_hat_v is reconstructed from the
+    // banked statistic below.
+    let is_direct = |orig: usize| -> bool { direct_banked.get(orig).copied().flatten().is_some() };
+    let has_precomputed = |orig: usize| -> bool {
+        precomputed_s_hat_v.get(orig).copied().flatten().is_some() || is_direct(orig)
+    };
 
     // 1. Classify each claim. Claims whose suffix `x_outer[1..]` has at least
     //    `SPARSE_ZERO_THRESHOLD` exactly-zero coords (e.g. the hash-chain
@@ -2499,6 +2576,24 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
             sparse_s_hat_v[s] = p.to_vec();
         }
     }
+    // Direct claims: reconstruct the flat s_hat_v from the banked statistic
+    // (Σ_e lo(e)·banks[e] — exact, so the transcript matches the incumbent).
+    for d in 0..dense_suffixes.len() {
+        if !dense_s_hat_v[d].is_empty() {
+            continue;
+        }
+        if let Some(banked) = direct_banked.get(dense_to_orig[d]).copied().flatten() {
+            assert!(direct_c >= 1 && dense_suffixes[d].len() > direct_c);
+            let lo_eq = build_eq(&dense_suffixes[d][..direct_c]);
+            let mut sv = vec![F128::ZERO; 1 << LOG_PACKING];
+            for (e, bank) in banked.banks.iter().enumerate() {
+                for (b, &v) in bank.iter().enumerate() {
+                    sv[b] += lo_eq[e] * v;
+                }
+            }
+            dense_s_hat_v[d] = sv;
+        }
+    }
     // Run the kernel only on claims that genuinely need fold_1b_rows.
     if use_split {
         match dense_needs_fold.len() {
@@ -2588,6 +2683,25 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
         .enumerate()
         .map(|(i, (w, &g))| {
             let scaled_eq_r_dprime: Vec<F128> = w.eq_r_dprime.iter().map(|x| g * *x).collect();
+            if let Some(banked) = direct_banked.get(i).copied().flatten() {
+                assert!(
+                    matches!(kinds[i], Kind::Dense(_)),
+                    "direct claims must have dense suffixes"
+                );
+                let suffix = &x_outers[i][1..];
+                let lo_eq = build_eq(&suffix[..direct_c]);
+                let rs_eq_ind = RsEqInd::Direct(Box::new(DirectClaimBundle {
+                    claim: DirectBasisClaim::new(banked, &lo_eq, &w.eq_r_dprime, g),
+                    hi_suffix: suffix[direct_c..].to_vec(),
+                }));
+                return (
+                    RingSwitchProof { s_hat_v: w.s_hat_v },
+                    RingSwitchBatchOutput {
+                        rs_eq_ind,
+                        sumcheck_claim: w.sumcheck_claim,
+                    },
+                );
+            }
             let rs_eq_ind = match kinds[i] {
                 Kind::Dense(d) => {
                     if use_split {
@@ -4145,6 +4259,10 @@ impl DirectBasisClaim {
         Self { a, w, n_banks: n }
     }
 
+    pub fn n_banks(&self) -> usize {
+        self.n_banks
+    }
+
     /// This claim's `(u_0, u_2)` contribution for the current round (X = the
     /// bank LSB): the usual quadratic evaluations, with each "product" a
     /// 128-term inner product over the slice axis.
@@ -4237,7 +4355,7 @@ mod direct_state_tests {
     #[test]
     fn direct_states_match_dense_through_c_rounds() {
         let mut rng = Rng::new(0xD12EC7);
-        for &(m, c) in &[(13usize, 3usize), (13, 5), (14, 4)] {
+        for &(m, c) in &[(13usize, 3usize), (13, 5), (14, 4), (15, 6)] {
             let l = 1usize << (m - LOG_PACKING);
             let z = rng.bits(1 << m);
             let f = pack_witness(&z, m);
@@ -4318,5 +4436,88 @@ mod direct_state_tests {
             }
             assert_eq!(b1, b_run, "residual basis mismatch (m={m},c={c})");
         }
+    }
+}
+
+#[cfg(test)]
+mod direct_prod_glue_tests {
+    use super::*;
+    use crate::challenger::FsChallenger;
+    use crate::pcs::pack::pack_witness;
+
+    struct Rng(u64);
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^ (z >> 31)
+        }
+        fn f128(&mut self) -> F128 {
+            F128 { lo: self.next_u64(), hi: self.next_u64() }
+        }
+        fn bits(&mut self, n: usize) -> Vec<bool> {
+            (0..n).map(|_| self.next_u64() & 1 == 1).collect()
+        }
+    }
+
+    /// Production-glue repro: the direct bundle produced by
+    /// `prove_batched_padded_direct` must yield the same round-0 message as
+    /// the dense `rs_eq_ind` from the incumbent run (same transcript seed →
+    /// same r''/γ).
+    #[test]
+    fn direct_bundle_matches_incumbent_rs_eq_ind() {
+        let m = 15usize;
+        let c = 6usize;
+        let mut rng = Rng::new(0x610E);
+        let z = rng.bits(1 << m);
+        let f = pack_witness(&z, m);
+        let x_outer: Vec<F128> = (0..(m - 6)).map(|_| rng.f128()).collect();
+        let pad = PaddingSpec::dense(m);
+
+        let mut ch_a = FsChallenger::new(b"glue-test");
+        let (res_dense, _) = prove_batched_padded_with_precomputed(
+            &f,
+            &[x_outer.as_slice()],
+            &[],
+            &pad,
+            &mut ch_a,
+        );
+        let banked = banked_s_hat_v_naive(&f, &x_outer[1..], c);
+        let mut ch_b = FsChallenger::new(b"glue-test");
+        let (res_direct, _) = prove_batched_padded_direct(
+            &f,
+            &[x_outer.as_slice()],
+            &[],
+            &[Some(&banked)],
+            c,
+            &pad,
+            &mut ch_b,
+        );
+        assert_eq!(
+            res_dense[0].0.s_hat_v, res_direct[0].0.s_hat_v,
+            "s_hat_v transcript divergence"
+        );
+
+        let b_dense = res_dense[0].1.rs_eq_ind.to_dense();
+        // Incumbent round-0 message over (f, b_dense).
+        let half = f.len() / 2;
+        let (mut u0_d, mut u2_d) = (F128::ZERO, F128::ZERO);
+        for j in 0..half {
+            let (f0, f1) = (f[2 * j], f[2 * j + 1]);
+            let (b0, b1) = (b_dense[2 * j], b_dense[2 * j + 1]);
+            u0_d += f0 * b0;
+            u2_d += (f0 + f1) * (b0 + b1);
+        }
+        let bundle = match &res_direct[0].1.rs_eq_ind {
+            RsEqInd::Direct(b) => b,
+            _ => panic!("expected direct bundle"),
+        };
+        let (u0, u2) = bundle.claim.round_msg();
+        assert_eq!((u0, u2), (u0_d, u2_d), "round-0 message diverges");
     }
 }
