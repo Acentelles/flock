@@ -637,14 +637,6 @@ pub fn merkle_root(data: &[u8], num_leaves: usize, kind: HashKind) -> Hash {
     tree[tree.len() - 1]
 }
 
-/// A/B toggle: when set, [`merkle_tree`] stays on the caller's (P-core) pool
-/// even for large trees instead of hopping to [`crate::all_core_pool`].
-/// `MERKLE_PCORES_ONLY=1` in the environment forces the same fallback
-/// (production kill-switch); the AtomicBool exists for paired within-process
-/// A/B. Pool choice cannot change output bits — every node is written
-/// deterministically.
-pub static MERKLE_PCORES_ONLY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 
 /// Data-size threshold for the all-core hop. Below this the tree builds in
 /// well under a millisecond and the pool switch + E-core straggle risk at the
@@ -656,8 +648,6 @@ const MERKLE_ALLCORE_MIN_BYTES: usize = 8 << 20;
 
 fn merkle_use_all_cores(data_len: usize) -> bool {
     data_len >= MERKLE_ALLCORE_MIN_BYTES
-        && !MERKLE_PCORES_ONLY.load(std::sync::atomic::Ordering::Relaxed)
-        && std::env::var("MERKLE_PCORES_ONLY").is_err()
         && crate::all_core_pool().current_num_threads() > rayon::current_num_threads()
 }
 

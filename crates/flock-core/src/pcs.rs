@@ -26,137 +26,6 @@ pub mod pack;
 pub mod ring_switch;
 pub mod tensor_algebra;
 
-/// TEMP probe (open campaign): isolated variants of the combine sweep for
-/// `benches/open_combine_probe.rs`. Strip when the open campaign closes.
-#[doc(hidden)]
-pub mod combine_probe {
-    use super::ring_switch;
-    use crate::field::F128;
-    use rayon::prelude::*;
-
-    pub const FOLD_TABLE_LEN: usize = ring_switch::FOLD_TABLE_LEN;
-    type Claims = [(Vec<F128>, Vec<F128>, Vec<F128>)];
-
-    /// Production shape: per block, compose each claim's table then sweep.
-    fn composed(claims: &Claims, out: &mut [F128]) -> F128 {
-        let b = claims[0].0.len();
-        out.par_chunks_mut(b)
-            .enumerate()
-            .map_init(
-                || vec![F128::ZERO; FOLD_TABLE_LEN],
-                |ctable, (hi, out_block)| {
-                    for (ci, (eq_lo, eq_hi, table)) in claims.iter().enumerate() {
-                        ring_switch::compose_fold_byte_table_into(eq_hi[hi], table, ctable);
-                        if ci == 0 {
-                            for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                                *slot = ring_switch::fold_one_slot(lo, ctable);
-                            }
-                        } else {
-                            for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                                *slot += ring_switch::fold_one_slot(lo, ctable);
-                            }
-                        }
-                    }
-                    out_block[0]
-                },
-            )
-            .reduce(|| F128::ZERO, |a, x| a + x)
-    }
-
-    /// Compose hoisted out (stale table — wrong values, isolates build cost).
-    fn composed_no_build(claims: &Claims, out: &mut [F128]) -> F128 {
-        let b = claims[0].0.len();
-        out.par_chunks_mut(b)
-            .enumerate()
-            .map_init(
-                || {
-                    let mut ct = vec![F128::ZERO; FOLD_TABLE_LEN];
-                    ring_switch::compose_fold_byte_table_into(
-                        claims[0].1[0],
-                        &claims[0].2,
-                        &mut ct,
-                    );
-                    ct
-                },
-                |ctable, (_hi, out_block)| {
-                    for (ci, (eq_lo, _, _)) in claims.iter().enumerate() {
-                        if ci == 0 {
-                            for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                                *slot = ring_switch::fold_one_slot(lo, ctable);
-                            }
-                        } else {
-                            for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                                *slot += ring_switch::fold_one_slot(lo, ctable);
-                            }
-                        }
-                    }
-                    out_block[0]
-                },
-            )
-            .reduce(|| F128::ZERO, |a, x| a + x)
-    }
-
-    /// Pre-composed-port baseline: per-slot multiply into the base table.
-    fn slot_mul(claims: &Claims, out: &mut [F128]) -> F128 {
-        let b = claims[0].0.len();
-        out.par_chunks_mut(b)
-            .enumerate()
-            .map(|(hi, out_block)| {
-                for (ci, (eq_lo, eq_hi, table)) in claims.iter().enumerate() {
-                    let e_hi = eq_hi[hi];
-                    if ci == 0 {
-                        for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                            *slot = ring_switch::fold_one_slot(lo * e_hi, table);
-                        }
-                    } else {
-                        for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                            *slot += ring_switch::fold_one_slot(lo * e_hi, table);
-                        }
-                    }
-                }
-                out_block[0]
-            })
-            .reduce(|| F128::ZERO, |a, x| a + x)
-    }
-
-    /// Both claims fused into one sweep: two composed tables live (128 KiB),
-    /// one store per slot, no intermediate read-back.
-    fn fused_claims(claims: &Claims, out: &mut [F128]) -> F128 {
-        let b = claims[0].0.len();
-        out.par_chunks_mut(b)
-            .enumerate()
-            .map_init(
-                || {
-                    (
-                        vec![F128::ZERO; FOLD_TABLE_LEN],
-                        vec![F128::ZERO; FOLD_TABLE_LEN],
-                    )
-                },
-                |(ct0, ct1), (hi, out_block)| {
-                    ring_switch::compose_fold_byte_table_into(claims[0].1[hi], &claims[0].2, ct0);
-                    ring_switch::compose_fold_byte_table_into(claims[1].1[hi], &claims[1].2, ct1);
-                    for ((slot, &lo0), &lo1) in out_block
-                        .iter_mut()
-                        .zip(claims[0].0.iter())
-                        .zip(claims[1].0.iter())
-                    {
-                        *slot = ring_switch::fold_one_slot(lo0, ct0)
-                            + ring_switch::fold_one_slot(lo1, ct1);
-                    }
-                    out_block[0]
-                },
-            )
-            .reduce(|| F128::ZERO, |a, x| a + x)
-    }
-
-    pub const VARIANTS: &[(&str, fn(&Claims, &mut [F128]) -> F128)] = &[
-        ("composed (production)", composed),
-        ("composed, build hoisted (timing only)", composed_no_build),
-        ("slot-multiply (old baseline)", slot_mul),
-        ("fused claims, one pass", fused_claims),
-    ];
-}
-
 pub use commit::{
     Commitment, PcsParams, ProverData, commit, commit_encode, commit_encode_into, commit_into,
     commit_leaf_pipeline_shape, commit_merkle, prefault_codeword_during,
@@ -165,9 +34,8 @@ pub use commit::{
 /// A/B kill switch for the direct (basis-free) opening, DEFAULT ON —
 /// certified 2026-08-26: m=32 open 97.4→64.1 MT (3/3 disjoint) and
 /// 614→210 ST, end-to-end best 484.25 ms (campaign record), transcript
-/// byte-identical by test. `FLOCK_NO_OPEN_DIRECT=1` is the production
-/// kill switch; the AtomicBool exists for paired within-process A/B and
-/// the proof-identity test.
+/// byte-identical by test. The AtomicBool is a test-only toggle (the
+/// proof-identity test runs the dense route as its oracle arm).
 pub static OPEN_DIRECT_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 pub use pack::{LOG_PACKING, pack_witness, unpack_witness};
@@ -302,8 +170,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v_banked<Ch: Challenger>
 
     // Direct (basis-free) opening gate: opt-in while it certifies. The
     // banked region must span exactly the lane folds, so c = initial_k.
-    let direct_on = !(std::env::var_os("FLOCK_NO_OPEN_DIRECT").is_some()
-        || OPEN_DIRECT_DISABLE.load(std::sync::atomic::Ordering::Relaxed));
+    let direct_on = !OPEN_DIRECT_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
     let direct_c = if direct_on && packed_direct.is_empty() {
         lig_config.initial_k
     } else {
@@ -607,7 +474,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     // deterministically and the prime is an XOR reduction (associative +
     // commutative, exact).
     let combine_all_cores =
-        std::env::var("PCS_COMBINE_PCORES_ONLY").is_err() && crate::ecore_rich_topology();
+        crate::ecore_rich_topology();
     // With no packed-direct claims nothing is scatter-added after the fast
     // path, so the block tail can also accumulate Ligerito's round-1 message
     // coefficients (groups of 4; +1 unreduced mul per slot) — the round-0

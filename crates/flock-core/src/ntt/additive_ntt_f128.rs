@@ -45,20 +45,7 @@ use crate::field::F128;
 
 mod kernels;
 
-/// A/B toggle: when set, the deep (cache-resident) pass of the interleaved
-/// parallel NTT stays on the caller's (P-core) pool instead of hopping to
-/// [`crate::all_core_pool`] for large transforms. `NTT_DEEP_PCORES_ONLY=1`
-/// in the environment forces the same fallback (production kill-switch); the
-/// AtomicBool exists for paired within-process A/B.
-pub static NTT_DEEP_PCORES_ONLY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 
-/// A/B toggle: when set, the deep pass runs every layer as its own sweep
-/// instead of fusing general-width layer pairs. `NTT_DEEP_NOFUSE=1` env is
-/// the production kill-switch; the AtomicBool is for paired within-process
-/// A/B.
-pub static NTT_DEEP_NOFUSE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 
 /// Compute the normalized subspace-polynomial evaluation table.
 ///
@@ -239,8 +226,7 @@ impl AdditiveNttF128 {
     /// are L1-hot — DRAM sees one write per line, and the standalone
     /// replicate pass disappears. Shapes the fused-2 top pass cannot serve
     /// fall back to an internal replicate + [`Self::forward_transform_interleaved_from_layer`],
-    /// which is also the `FLOCK_NO_FILL_FUSE=1` kill-switch path (same-binary
-    /// A/B). `data`'s prior contents may be arbitrary; every slot is written.
+    /// (`data`'s prior contents may be arbitrary; every slot is written).
     /// Whether the ranked radix-8 top applies: the streaming commit's
     /// rate-1/2 shape on NEON (dual from-message first pass + hetero tiles).
     fn ranked_top_from_message_ok(log_d: usize, num_ntts: usize, reps: usize) -> bool {
@@ -412,8 +398,7 @@ impl AdditiveNttF128 {
             && log_d >= 8
             && n_top > 0
             && start_layer + 2 <= n_top
-            && block_size >= 4
-            && std::env::var_os("FLOCK_NO_FILL_FUSE").is_none();
+            && block_size >= 4;
         if !fuse_fill {
             replicate_interleaved(data, msg);
             self.forward_transform_interleaved_parallel_from_layer_with(
@@ -611,7 +596,6 @@ impl AdditiveNttF128 {
             target_feature = "avx512f",
             target_feature = "vpclmulqdq"
         ));
-        let t_top = std::time::Instant::now(); // TEMP PROBE
         let mut layer = start_layer.min(n_top);
         while layer < n_top {
             let num_blocks = 1usize << layer;
@@ -677,16 +661,6 @@ impl AdditiveNttF128 {
             }
         }
 
-        // TEMP PROBE
-        if std::env::var_os("FLOCK_NTT_SPLIT").is_some() {
-            eprintln!(
-                "[ntt-split] top layers ({} of {}): {:.2} ms",
-                n_top - start_layer.min(n_top),
-                log_d,
-                t_top.elapsed().as_secs_f64() * 1e3
-            );
-        }
-        let t_deep = std::time::Instant::now(); // TEMP PROBE
 
         // Deep layers: process each sub-NTT-group cache-resident.
         let sub_size_positions = 1usize << (log_d - n_top);
@@ -699,9 +673,7 @@ impl AdditiveNttF128 {
         // matter). The three deepest layers stay single-layer: their twiddles
         // are all half-width (see `mul_small_twiddle`) and the fast path in
         // `butterfly_interleaved_block` beats fusion's general muls.
-        // `NTT_DEEP_NOFUSE` restores per-layer sweeps (A/B).
-        let fuse = !NTT_DEEP_NOFUSE.load(std::sync::atomic::Ordering::Relaxed)
-            && std::env::var("NTT_DEEP_NOFUSE").is_err();
+        let fuse = true;
         let halfwidth_start = log_d.saturating_sub(3);
         let deep = |data: &mut [F128]| {
             data.par_chunks_mut(sub_bytes)
@@ -760,11 +732,8 @@ impl AdditiveNttF128 {
         // sub-group is written deterministically). Gate: enough sub-groups to
         // drain (≥ 4× workers) and ≥ 64 MB of data so the pool switch and
         // E-core L2 pressure can't hurt small/recursive commits.
-        // `NTT_DEEP_PCORES_ONLY` (atomic or env) restores the caller's pool.
         let n_subs = data.len() / sub_bytes;
         let use_all_cores = std::mem::size_of_val(data) >= (64 << 20)
-            && !NTT_DEEP_PCORES_ONLY.load(std::sync::atomic::Ordering::Relaxed)
-            && std::env::var("NTT_DEEP_PCORES_ONLY").is_err()
             && {
                 let pool = crate::all_core_pool();
                 pool.current_num_threads() > rayon::current_num_threads()
@@ -774,13 +743,6 @@ impl AdditiveNttF128 {
             crate::all_core_pool().install(|| deep(data));
         } else {
             deep(data);
-        }
-        if std::env::var_os("FLOCK_NTT_SPLIT").is_some() {
-            eprintln!(
-                "[ntt-split] deep layers ({}): {:.2} ms",
-                log_d - n_top,
-                t_deep.elapsed().as_secs_f64() * 1e3
-            );
         }
         #[allow(unreachable_code)]
         {

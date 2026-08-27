@@ -2491,11 +2491,7 @@ pub fn ligero_commit(
     // replicas of `poly` (same write cost as copy + zero-fill) and start the
     // transform past those layers — see `pcs::commit::replicate_message_fill`.
     let codeword_len = block_len * num_interleaved;
-    let trace = std::env::var("LIG_COMMIT_TRACE").is_ok(); // TEMP PROBE
-    let _t = std::time::Instant::now();
     let mut mat = crate::scratch::take_f128(codeword_len);
-    let t_alloc = _t.elapsed();
-    let t_fill = std::time::Duration::ZERO;
 
     // RS-encode every lane in one call (each lane is one independent NTT).
     // The first `log_inv_rate` layers on the zero-padded coefficients are
@@ -2504,9 +2500,7 @@ pub fn ligero_commit(
     // on the codeword buffer) disappears. Null at the MAIN commit (its join
     // window is compute-limited — measured 6-2 against, reverted); pays here
     // because the recursive commits run standalone and bandwidth-bound.
-    let _t = std::time::Instant::now();
     ntt.forward_transform_interleaved_from_message(&mut mat, poly, num_interleaved);
-    let t_ntt = _t.elapsed();
 
     // Merkle over rows. One leaf = `num_interleaved` consecutive F128 = 16·num_interleaved bytes.
     let leaf_size_bytes = num_interleaved * core::mem::size_of::<F128>();
@@ -2517,18 +2511,7 @@ pub fn ligero_commit(
         )
     };
     debug_assert_eq!(data_bytes.len(), block_len * leaf_size_bytes);
-    let _t = std::time::Instant::now();
     let tree = merkle::merkle_tree(data_bytes, block_len, kind);
-    if trace {
-        // TEMP PROBE
-        eprintln!(
-            "    [lig-commit] cols=2^{log_msg_cols} lanes=2^{log_num_interleaved} rate=2^-{log_inv_rate}: alloc {:5.2} fill {:5.2} ntt {:5.2} merkle {:5.2} ms",
-            t_alloc.as_secs_f64() * 1e3,
-            t_fill.as_secs_f64() * 1e3,
-            t_ntt.as_secs_f64() * 1e3,
-            _t.elapsed().as_secs_f64() * 1e3,
-        );
-    }
 
     LigeroWitness {
         mat,
@@ -3902,14 +3885,14 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     // Cuts the fold chain's memory traffic ~25% (the intermediate half-size
     // arrays between paired rounds are never materialized) while producing a
     // bit-identical transcript (exact polynomial identity — see
-    // [`FoldLookahead`]). LIG_LOOKAHEAD_DISABLE=1 restores the per-round
+    // [`FoldLookahead`]).
     // fused folds (A/B toggle). Small instances (< 2^14, where pass shapes
     // and scratch reuse don't pay) stay on the per-round path.
     let use_lookahead = {
         let n = sc_prover.f_len();
         // Big enough to pay, and every pass keeps `quarter` a multiple of 4.
         n >= (1 << 14) && (n >> initial_k) >= 16
-    } && std::env::var("LIG_LOOKAHEAD_DISABLE").is_err();
+    };
     // Entry coefficients from the pcs combine (computed in the same pass as
     // the round-0 prime) make round 0 itself a skip round: the full-size
     // entry pass never runs and the first real pass folds two challenges

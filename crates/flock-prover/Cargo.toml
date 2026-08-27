@@ -62,10 +62,6 @@ name = "pcs_commit"
 harness = false
 
 [[bench]]
-name = "open_combine_probe"
-harness = false
-
-[[bench]]
 name = "merkle"
 harness = false
 

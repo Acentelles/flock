@@ -167,7 +167,6 @@ pub static LC_PCORES_ONLY: AtomicBool = AtomicBool::new(false);
 /// win reproduces on 10P+4E, so the hop pays on every measured topology.
 fn lincheck_all_cores_enabled() -> bool {
     !LC_PCORES_ONLY.load(std::sync::atomic::Ordering::Relaxed)
-        && std::env::var("LINCHECK_PCORES_ONLY").is_err()
         && crate::all_core_pool().current_num_threads() > rayon::current_num_threads()
 }
 

@@ -2225,3 +2225,26 @@ Kept optimizations: 20+ certified with paired sign tests; nulls: 20+
 measured and reverted with written verdicts; every remaining delta
 attributed (commit MT scheduling ~35-40, zc +14-19 bucket, open +7,
 kernel-generation ST margins) and adjudicated below the bloat bar.
+
+### Repo cleanup: production flags & TEMP probes stripped (2026-08-27)
+
+Removed per Benedikt (features are certified default-on; production
+never toggles them): env kill switches FLOCK_NO_ZC_LOOKAHEAD,
+FLOCK_NO_ZC_COMPACT_K, FLOCK_NO_OPEN_DIRECT, FLOCK_NO_FILL_FUSE,
+FLOCK_NO_AB_HOIST, FLOCK_NO_WITNESS_ELIDE, FLOCK_NO_PREFAULT,
+NTT_DEEP_NOFUSE(+static), NTT_DEEP_PCORES_ONLY(+static),
+MERKLE_PCORES_ONLY(+static), PCS_COMBINE_PCORES_ONLY,
+LINCHECK_PCORES_ONLY, LIG_LOOKAHEAD_DISABLE; TEMP probes: combine_probe
+module + open_combine_probe bench + Cargo entry, FLOCK_NTT_SPLIT
+top/deep timers, LIG_COMMIT_TRACE per-level commit probe. KEPT: test
+oracles as atomics only (OPEN_DIRECT_DISABLE, RS_TAIL_LOOKAHEAD_DISABLE,
+ZC_COMPACT_K_DISABLE — the compact-K transcript tests had gone VACUOUS
+at the default-on flip [both arms ran compact]; converted FORCE→DISABLE
+so the oracle arm is real again); instrumentation used by committed
+tooling (FLOCK_PHASE_TSV, FLOCK_ZC_TIMING, FLOCK_COMMIT_TIMING,
+*_TRACE family); FLOCK_NO_GRIND (the measurement protocol itself);
+FLOCK_ALLCORE (hardware-topology escape hatch, not a feature toggle).
+Consequence for future work: same-binary feature A/B is gone for these
+— use two-binary git-arm A/Bs. Post-cleanup sanity run: 472.75 ms warm
+with all certified defaults engaged; suite 353 + proof-identity +
+compact-K oracles green.

@@ -707,7 +707,7 @@ pub fn prove_fast_core<Ch: Challenger>(
 
 /// Whether the round-1 AB hoist applies: the stripe-C zerocheck entry must be
 /// the one taken (it is the only consumer of the precompute), and
-/// `FLOCK_NO_AB_HOIST=1` is the same-binary kill switch for paired A/B runs.
+/// (certified default-on; the stripe-C entry is the only precompute consumer).
 fn ab_hoist_enabled(r1cs: &BlockR1cs) -> bool {
     r1cs.m >= 13
         && r1cs.k_log >= 9
@@ -715,7 +715,6 @@ fn ab_hoist_enabled(r1cs: &BlockR1cs) -> bool {
         // Sequential (1-thread) pools gain nothing from the overlap and pay
         // a small re-attribution overhead — keep single-threaded runs exact.
         && rayon::current_num_threads() > 1
-        && std::env::var_os("FLOCK_NO_AB_HOIST").is_none()
 }
 
 /// Run the commit closure and, when the hoist applies, round 1's

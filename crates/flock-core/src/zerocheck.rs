@@ -45,16 +45,14 @@ use multilinear::{
 /// 4→1 tail passes; see [`prove_packed_padded_inner`]), DEFAULT ON. With
 /// the one-weight-per-group product form the cascade certifies at both
 /// shapes (m=32: tail −20 with r2 +12, zc net −8..13, sign 3/4; m=30: net
-/// −1.0, 2/2). `FLOCK_NO_ZC_LOOKAHEAD=1` is the production kill switch;
+/// −1.0, 2/2). Certified default-on;
 /// the AtomicBool exists for paired within-process A/B. The transcript is
 /// identical either way — the lookahead messages are the same polynomial
 /// values, derived without the intermediate data pass (pinned by
 /// `lookahead_tail_transcript_identical_to_classic`).
-/// Opt-in force for the compact variant-K round-2..5 path (see the driver);
-/// flipped by the transcript-identity test and by FLOCK_ZC_COMPACT_K=1 at
-/// bench time. Becomes default-on when the NEON producer certifies.
-#[allow(dead_code)]
-pub static ZC_COMPACT_K_FORCE: std::sync::atomic::AtomicBool =
+/// Test-only toggle: the compact variant-K transcript tests set this to
+/// run the incumbent route as their oracle arm. Never set in production.
+pub static ZC_COMPACT_K_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 pub static RS_TAIL_LOOKAHEAD_DISABLE: std::sync::atomic::AtomicBool =
@@ -414,8 +412,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     let mut mlv_arg = vec![F128::ONE; n_mlv];
     mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
 
-    let lookahead_on = !(RS_TAIL_LOOKAHEAD_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
-        || std::env::var_os("FLOCK_NO_ZC_LOOKAHEAD").is_some());
+    let lookahead_on = !RS_TAIL_LOOKAHEAD_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
     // Integrated round-2 lookahead: round 2 emits the eight lookahead sums
     // alongside its fold, from which BOTH round 2's and round 3's messages
     // derive with zero further data passes — so the tail below starts
@@ -438,15 +435,15 @@ fn prove_packed_padded_inner<C: Challenger>(
     // gates cover the two parity unscalings (each misses w.p. 2^-128).
     // DEFAULT ON — certified 2026-08-27: mechanism sum (r2 + K fold +
     // tail) 79.9-84.5 vs 85.9-87.9 ms, 3/3 disjoint, −4.9 avg at m=32 8T
-    // grind-free. FLOCK_NO_ZC_COMPACT_K=1 restores the incumbent cascade
-    // route (same-binary A/B; the transcript tests pin value identity).
+    // grind-free. The transcript tests pin value identity against the
+    // incumbent route via ZC_COMPACT_K_DISABLE.
     let use_compact_k = lookahead_on
         && cfg!(all(target_arch = "aarch64", target_feature = "aes"))
         && n_mlv >= 7
         && (1usize << (m - k_skip)) >= 1024
         && r[k_skip + 1] != F128::ZERO
         && r[k_skip + 3] != F128::ZERO
-        && std::env::var_os("FLOCK_NO_ZC_COMPACT_K").is_none();
+        && !ZC_COMPACT_K_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
     let tail_cascade = use_r2_lookahead || use_compact_k;
 
     let mut multilinear_msgs = Vec::with_capacity(n_mlv);
@@ -1030,13 +1027,13 @@ mod tests {
             let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
             let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
 
-            ZC_COMPACT_K_FORCE.store(true, Ordering::Relaxed);
             let mut ch1 = FsChallenger::new(b"flock-test-v0");
             let (proof_k, claim_k) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch1);
-            ZC_COMPACT_K_FORCE.store(false, Ordering::Relaxed);
 
+            ZC_COMPACT_K_DISABLE.store(true, Ordering::Relaxed);
             let mut ch2 = FsChallenger::new(b"flock-test-v0");
             let (proof_cl, claim_cl) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch2);
+            ZC_COMPACT_K_DISABLE.store(false, Ordering::Relaxed);
 
             assert_eq!(
                 proof_k.multilinear_rounds, proof_cl.multilinear_rounds,
@@ -1067,13 +1064,13 @@ mod tests {
             let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
             let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
 
-            ZC_COMPACT_K_FORCE.store(true, Ordering::Relaxed);
             let mut ch1 = FsChallenger::new(b"flock-test-v0");
             let (proof_k, claim_k) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch1);
-            ZC_COMPACT_K_FORCE.store(false, Ordering::Relaxed);
 
+            ZC_COMPACT_K_DISABLE.store(true, Ordering::Relaxed);
             let mut ch2 = FsChallenger::new(b"flock-test-v0");
             let (proof_cl, claim_cl) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch2);
+            ZC_COMPACT_K_DISABLE.store(false, Ordering::Relaxed);
 
             assert_eq!(
                 proof_k.multilinear_rounds, proof_cl.multilinear_rounds,

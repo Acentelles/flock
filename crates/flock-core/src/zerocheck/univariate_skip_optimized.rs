@@ -1156,7 +1156,6 @@ fn round1_with_s_hat_v_impl(
     stripe_c: Option<StripeC<'_>>,
     ab_pre: Option<&Round1AbPre>,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Option<Vec<Vec<F128>>>) {
-    use rayon::prelude::*;
 
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
     assert!(

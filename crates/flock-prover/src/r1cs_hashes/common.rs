@@ -283,7 +283,7 @@ where
     let u64_per_block = k / 64;
 
     let total_f128 = n_total * f128_per_block;
-    let elide_off = std::env::var_os("FLOCK_NO_WITNESS_ELIDE").is_some();
+    let elide_off = false;
     let tag_of = |t: u64| if elide_off { 0 } else { t };
     let (mut z, z_hit) = flock_core::scratch::take_f128_tagged(total_f128, tag_of(tags[0]));
     let (mut a, a_hit) = flock_core::scratch::take_f128_tagged(total_f128, tag_of(tags[1]));
