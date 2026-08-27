@@ -2135,3 +2135,35 @@ bucket rule applied. DEFAULT ON; FLOCK_NO_ZC_COMPACT_K=1 kills
 (cascade precedent). zc sub-line sums now ≈117 vs their ≈116 —
 ZEROCHECK AT PARITY on like instrumentation. Their remaining r2
 number includes GPU-arm machinery we correctly skip (CPU-only rule).
+
+### FULL CROSS-CERTIFICATION, ST + MT (2026-08-27 evening, grind-free,
+GPU off, strict alternation; cooldown skipped per Benedikt — warm
+absolutes, paired-valid ratios)
+
+MT (m=32 blake 8T):
+  pair1: ours 457.58 (572,895)  theirs 385.17 (680,587)  1.188x
+  pair2: ours 460.04 (569,832)  theirs 384.91 (681,058)  1.195x
+  pair3: ours 463.93 (565,045)  theirs 380.21 (689,479)  1.220x
+  best-vs-best: 457.58 vs 380.21 = 1.203x
+  our buckets: witness 30.0-30.4 / commit 262.9-263.8 / zc 115.4-121.1
+  / lincheck 18.6-22.7 / open 29.0-30.6; theirs: 29.0-29.2 /
+  221.9-251.5 / 100.4-102.2 / 16.1-16.2 / 20.6-21.2.
+
+ST (1T):
+  pair1: ours 3.25s (80,728)  theirs 2.82s (93,005)  1.152x
+  pair2: ours 3.25s (80,621)  theirs 2.81s (93,248)  1.157x
+  our buckets (repeatable to 0.2%): witness 230-231 / commit
+  1266.5-1266.9 / zc 1486-1487 / lincheck 124.8-125.3 / open 143.6-146;
+  theirs: 204-214 / 1630-1650 (their prep inside) / 757-759 / 115.5 /
+  101.5-101.8. Bucket-boundary caveat: at 1T their r1 prep lives in
+  commit, ours in zc — only totals and like-for-like compare.
+
+READING: ST 1.15-1.16x vs MT 1.19-1.22x — the kernels are within ~15%
+single-threaded (their generated-asm/16-bit-Horner margins, adjudicated
+below bar), and the extra MT spread is the commit-window scheduling
+residual (five experiments adjudicated null; their absorption exceeds
+ours by ~30-40ms at 8T). Compact-K visible in both axes: zc MT 115-121
+(was 121-134), zc ST 1487 (was 1531). CAMPAIGN TOTALS at certification:
+MT 723.9 → 457.6 ms = 1.58x; ST 4781 → 3250 = 1.47x; cross-tree gap
+1.49x (ranked discovery) → 1.36x (yesterday) → 1.19-1.22x MT /
+1.15-1.16x ST certified.
