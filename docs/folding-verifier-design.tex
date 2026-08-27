@@ -49,7 +49,8 @@ directly is \emph{$\nnz$-preserving} --- the gadget's matrix \emph{is} the
 matrix it evaluates --- so a recursion circuit that pays it inline can never
 verify a proof of itself. Deferral plus folding is what makes the fixed
 point close. Everything here is implemented on the \code{folding\_verifier}
-branch and composed with the circuit layer on \code{recursion\_circuit},
+branch and composed with the circuit layer on \code{recursion\_circuit}
+(both merged to \code{main} 2026-08-25),
 where a native merge node verifies two circuit proofs with their matrix work
 deferred and folds both children into one accumulator.
 \end{abstract}

@@ -46,7 +46,8 @@ instead of `LIST_DECODING_QUERY_TARGET_BITS`. The Johnson query floor in
 `LigeritoSecurityConfig::validate` is keyed off `analysis_version`
 (`query128` vs `query100`), so each config family validates against its own
 target; a boundary test pins the `Fast100` floor and the schedule equality.
-Both variants live in one binary. Proof format v20 additionally makes the
+Both variants live in one binary. Proof format v20 (head is v21 as of
+2026-08-19 — the union-only batch consolidation) additionally makes the
 non-Ligerito policy distinction explicit: strict `Fast`/`Slim` enable all
 algebraic grinding families, whereas `Fast100`/`Slim100` intentionally keep
 those families disabled. Their public Ligerito query schedules also remain

@@ -976,9 +976,10 @@ a tamper matrix --- proof-field tampers and commitment-params tampers
 (the params-vs-root binding) --- on real mixed instances at all three
 commit configurations (integer lanes at full and partial utilization,
 power of two); measured results are folded into the cost paragraphs
-below. The jagged transport remains in-tree as the differential/%
-regression oracle (the M6 byte-pinned fixtures and the merged-vs-jagged
-A/B tests), not a wire mode.
+below. [Update 2026-08-27: the unmerged jagged transport was \emph{removed}
+2026-08-02; the M6 byte-pinned fixtures pin the \emph{merged} transport
+(see \code{tests/union\_m6\_fixtures.rs}), and no merged-vs-jagged A/B
+remains.]
 
 \paragraph{The padded-domain floor, measured.} Ring-switching is the one
 pipeline stage that still sees the capacity: its weight and its sumcheck
@@ -1430,9 +1431,9 @@ fewer at $\nu = 10$ low utilization. Since draft v0.4:
         peak memory by the full $134$\,MB.
   \item (v0.7) The \emph{merged jagged/ring-switch transport}
         (\S\ref{sec:merged}) shipped as the Mixed flavor's opening ---
-        wire \code{VERSION} 6; design review passed 2026-07-27. The
-        jagged transport and its byte-pinned fixtures stay in-tree as
-        the differential oracle.
+        wire \code{VERSION} 6; design review passed 2026-07-27. [The
+        unmerged jagged transport was later removed, 2026-08-02; the
+        byte-pinned fixtures follow the merged transport.]
 \end{itemize}
 
 Measured at $m = 30$ BLAKE3 on Apple silicon: the direct path proves at
@@ -1454,8 +1455,9 @@ Frobenius assist, the \code{\_merged} union prove/verify pair behind
 the Mixed flavor): end-to-end roundtrip and tamper matrix --- proof
 fields and commitment params --- on real mixed instances,
 capacity-freedom measured at the m30 load ($+14.1$ vs $+40.7$\,ms
-growth to the $4\times$ tier); the jagged transport stays in-tree as
-the differential oracle (\S\ref{sec:merged}).
+growth to the $4\times$ tier). [Update 2026-08-27: the unmerged jagged
+transport was removed 2026-08-02 — the merged transport of
+\S\ref{sec:merged} is the only one.]
 
 Open follow-ups, in the order they are likely to matter: a Keccak
 batch-major driver (the registry machinery accepts the type; only the
