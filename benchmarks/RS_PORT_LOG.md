@@ -1903,3 +1903,17 @@ commit 223.7-235.8 / zc 101.0-103.5 / lincheck 16.1-17.4. Campaign
 arc: 1.36x (yesterday morning, with-grind) → 1.206x honest grind-free;
 whole campaign vs origin baseline ≈ 723.9 → 469.0 ms 8T (1.54x) /
 4781 → ~3370 ms ST.
+
+### Full grind-free breakdown snapshot @ af90ba1 (2026-08-27 morning, m=32 blake 2^18)
+
+1T: 3312.30 total (78,269 c/s) = witness 244.1 / commit 1267.8 / zc-r1
+895.9 / zc-r2 408.0 / zc-r3+ 226.9 / lincheck 124.6 / open 145.0.
+8T: 472.76 total (553,362 c/s) = witness 30.1 / commit 273.4 / zc-r1
+35.1 / zc-r2 54.3 / zc-r3+ 31.9 / lincheck 18.8 / open 29.2.
+Open sub-phases 8T: boundary fused pair 5.5-5.6, initial SC 6.1-6.2,
+recursive commits 13.2-14.0 (L1 = ntt 5.2 + merkle 3.1-3.3, L2 ~2.3,
+tail ~1.2), induce 5.9-7.4, intro+glue 0.7, OOD(5) 0.4, opens 0.2.
+Open ST: 145 = commits 68.1 / initial 41.9 (pair 40.2) / induce 24.4 /
+misc ~5. Campaign totals vs origin baseline: ST 4781→3312 (1.44x), 8T
+723.9→472.8 (1.53x). vs peer grind-free same morning: witness parity,
+commit +38..50, zc +18..20, open +7.5..8.6, lincheck +1.4..2.7.
