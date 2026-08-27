@@ -34,8 +34,10 @@ pub mod univariate_skip_optimized;
 
 use multilinear::{
     UniSkipFoldTable, fold_and_compute_round_pair_into, fold_in_place_pair,
-    fold1_lookahead_into, fold2_lookahead_into, interpolate_at_z_combined,
+    eval_deferred_round_msg, fold1_lookahead_into, fold2_compact_round45_into,
+    fold2_lookahead_into, interpolate_at_z_combined,
     interpolate_at_z_on_lambda, lookahead_msg_first, lookahead_msg_second, round_pair_naive,
+    uni_skip_fold_round23_compact_padded,
     uni_skip_fold_and_round_pair_optimized_packed_padded,
 };
 
@@ -48,6 +50,13 @@ use multilinear::{
 /// identical either way — the lookahead messages are the same polynomial
 /// values, derived without the intermediate data pass (pinned by
 /// `lookahead_tail_transcript_identical_to_classic`).
+/// Opt-in force for the compact variant-K round-2..5 path (see the driver);
+/// flipped by the transcript-identity test and by FLOCK_ZC_COMPACT_K=1 at
+/// bench time. Becomes default-on when the NEON producer certifies.
+#[allow(dead_code)]
+pub static ZC_COMPACT_K_FORCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub static RS_TAIL_LOOKAHEAD_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 use univariate_skip_optimized::{
@@ -419,10 +428,84 @@ fn prove_packed_padded_inner<C: Challenger>(
         && n_mlv >= 4
         && (1usize << (m - k_skip)) >= 1024;
 
+    // Compact variant K (challenge-tree architecture): rounds 2..5 in TWO
+    // passes — the compact producer (48 B/pair anchors+packed-deltas, r2
+    // wire msg, r3 as a deferred quadratic in ρ₁) and the table-composed
+    // double fold (binds ρ₁,ρ₂ through λ-scaled byte tables, r4 wire msg,
+    // r5 deferred in ρ₃, quarter-size level out). The cascade tail resumes
+    // its ordinary cadence from the quarter level. Values and transcript
+    // identical (exact F128, pure reassociation; test-pinned). ρ-nonzero
+    // gates cover the two parity unscalings (each misses w.p. 2^-128).
+    // DEFAULT ON — certified 2026-08-27: mechanism sum (r2 + K fold +
+    // tail) 79.9-84.5 vs 85.9-87.9 ms, 3/3 disjoint, −4.9 avg at m=32 8T
+    // grind-free. FLOCK_NO_ZC_COMPACT_K=1 restores the incumbent cascade
+    // route (same-binary A/B; the transcript tests pin value identity).
+    let use_compact_k = lookahead_on
+        && cfg!(all(target_arch = "aarch64", target_feature = "aes"))
+        && n_mlv >= 7
+        && (1usize << (m - k_skip)) >= 1024
+        && r[k_skip + 1] != F128::ZERO
+        && r[k_skip + 3] != F128::ZERO
+        && std::env::var_os("FLOCK_NO_ZC_COMPACT_K").is_none();
+    let tail_cascade = use_r2_lookahead || use_compact_k;
+
     let mut multilinear_msgs = Vec::with_capacity(n_mlv);
     let mut mlv_rhos: Vec<F128> = Vec::with_capacity(n_mlv);
     let (mut a_mlv, mut b_mlv, mut rho_prev, mut pending2, mut i);
-    if use_r2_lookahead {
+    if use_compact_k {
+        let (compact, m1a, mia, la3) = uni_skip_fold_round23_compact_padded(
+            a_packed, b_packed, m, k_skip, &fold_table, &mlv_arg, padding,
+        );
+        multilinear_msgs.push((m1a, mia));
+        challenger.observe_f128(m1a);
+        challenger.observe_f128(mia);
+        let rho1 = challenger.sample_f128();
+        mlv_rhos.push(rho1);
+        let (m1b, mib) = eval_deferred_round_msg(&la3, rho1);
+        multilinear_msgs.push((m1b, mib));
+        challenger.observe_f128(m1b);
+        challenger.observe_f128(mib);
+        let rho2 = challenger.sample_f128();
+        mlv_rhos.push(rho2);
+        if zc_timing {
+            eprintln!(
+                "[zc-timing] round2 fused fold: {:.2} ms",
+                t_round2.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        let t_k = std::time::Instant::now();
+        let n_groups = 1usize << (m - k_skip - 2);
+        let mut a_q = crate::scratch::take_f128(n_groups);
+        let mut b_q = crate::scratch::take_f128(n_groups);
+        let mut r_next4 = vec![F128::ONE; n_mlv - 2];
+        r_next4[1..].copy_from_slice(&r[k_skip + 3..]);
+        let (m4_1, m4_inf, la5) = fold2_compact_round45_into(
+            &compact, &fold_table, rho1, rho2, &r_next4, &mut a_q, &mut b_q,
+        );
+        compact.recycle();
+        multilinear_msgs.push((m4_1, m4_inf));
+        challenger.observe_f128(m4_1);
+        challenger.observe_f128(m4_inf);
+        let rho3 = challenger.sample_f128();
+        mlv_rhos.push(rho3);
+        let (m5_1, m5_inf) = eval_deferred_round_msg(&la5, rho3);
+        multilinear_msgs.push((m5_1, m5_inf));
+        challenger.observe_f128(m5_1);
+        challenger.observe_f128(m5_inf);
+        let rho4 = challenger.sample_f128();
+        mlv_rhos.push(rho4);
+        if zc_timing {
+            eprintln!(
+                "[zc-timing] compact K double fold: {:.2} ms",
+                t_k.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        a_mlv = a_q;
+        b_mlv = b_q;
+        rho_prev = rho3;
+        pending2 = Some(rho4);
+        i = 3;
+    } else if use_r2_lookahead {
         let (a, b, q) = multilinear::uni_skip_fold_and_round_pair_lookahead_packed_padded(
             a_packed, b_packed, m, k_skip, &fold_table, &mlv_arg, padding,
         );
@@ -461,7 +544,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         pending2 = None;
         i = 0;
     }
-    if zc_timing {
+    if zc_timing && !use_compact_k {
         eprintln!(
             "[zc-timing] round2 fused fold: {:.2} ms",
             t_round2.elapsed().as_secs_f64() * 1e3
@@ -508,7 +591,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     while i < n_mlv - 1 {
         let len = a_mlv.len();
         // Lookahead needs TWO more message rounds and the fused-size floor.
-        if use_r2_lookahead && i + 2 <= n_mlv - 1 && len >= 1024 {
+        if tail_cascade && i + 2 <= n_mlv - 1 && len >= 1024 {
             let out_len = if pending2.is_some() { len / 4 } else { len / 2 };
             let (ao, bo) = (&mut a_nxt[..out_len], &mut b_nxt[..out_len]);
             let q = if let Some(r2) = pending2 {
@@ -931,6 +1014,72 @@ mod tests {
             );
             assert_eq!(proof_la.round1_ab, proof_cl.round1_ab, "m={m}");
             assert_eq!(claim_la, claim_cl, "claim diverges at m={m}");
+        }
+    }
+
+    /// Compact variant K (rounds 2..5 in two passes) must produce the exact
+    /// transcript of the incumbent route — messages, claim, everything.
+    /// m = 16/18 exercise real tail depth (n_mlv = 10/12 >= 7 gate).
+    #[test]
+    fn compact_k_transcript_identical_to_classic() {
+        use std::sync::atomic::Ordering;
+        for &m in &[16usize, 18] {
+            let mut rng = Rng::new(8800 + m as u64);
+            let a = rng.bits(1 << m);
+            let b = rng.bits(1 << m);
+            let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
+            let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+
+            ZC_COMPACT_K_FORCE.store(true, Ordering::Relaxed);
+            let mut ch1 = FsChallenger::new(b"flock-test-v0");
+            let (proof_k, claim_k) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch1);
+            ZC_COMPACT_K_FORCE.store(false, Ordering::Relaxed);
+
+            let mut ch2 = FsChallenger::new(b"flock-test-v0");
+            let (proof_cl, claim_cl) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch2);
+
+            assert_eq!(
+                proof_k.multilinear_rounds, proof_cl.multilinear_rounds,
+                "compact-K tail messages diverge at m={m}"
+            );
+            assert_eq!(proof_k.round1_ab, proof_cl.round1_ab, "m={m}");
+            assert_eq!(claim_k, claim_cl, "compact-K claim diverges at m={m}");
+        }
+    }
+
+    /// The degenerate-b fast path (all-ones b rows skip their folds and
+    /// provably-zero products) must be value-preserving: transcript identity
+    /// with b ≡ 1 on half the domain, mixed with random rows — exercises
+    /// fully-degenerate groups, half-degenerate groups, and the general arm.
+    #[test]
+    fn compact_k_degen_b_transcript_identical() {
+        use std::sync::atomic::Ordering;
+        for &m in &[16usize, 18] {
+            let mut rng = Rng::new(9900 + m as u64);
+            let a = rng.bits(1 << m);
+            let mut b = rng.bits(1 << m);
+            // First half of the rows: b ≡ 1 (row = 128 consecutive bits at
+            // the packed-row granularity used by round 2's 8-byte codes).
+            for (i, slot) in b.iter_mut().enumerate().take(1 << (m - 1)) {
+                let _ = i;
+                *slot = true;
+            }
+            let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
+            let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+
+            ZC_COMPACT_K_FORCE.store(true, Ordering::Relaxed);
+            let mut ch1 = FsChallenger::new(b"flock-test-v0");
+            let (proof_k, claim_k) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch1);
+            ZC_COMPACT_K_FORCE.store(false, Ordering::Relaxed);
+
+            let mut ch2 = FsChallenger::new(b"flock-test-v0");
+            let (proof_cl, claim_cl) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch2);
+
+            assert_eq!(
+                proof_k.multilinear_rounds, proof_cl.multilinear_rounds,
+                "degen-b compact-K messages diverge at m={m}"
+            );
+            assert_eq!(claim_k, claim_cl, "degen-b claim diverges at m={m}");
         }
     }
 

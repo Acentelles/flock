@@ -2098,3 +2098,40 @@ paired A/B, per-site buckets:
 Cool-window state: HEAD (old arm) 461.1-461.8; new arm best 458.64 ms
 / 571,574 c/s — NEW RECORD. run_hetero_chunks gained the ST guard
 (inline at 1 thread, parity preserved) and a stateful variant.
+### zc COMPACT VARIANT K ported (r2..r5 in two passes) — CERTIFIED, DEFAULT ON
+
+Full port of their compact round-2 architecture (read from source;
+~700 lines): (1) PRODUCER uni_skip_fold_round23_compact_padded — one
+sweep over the packed rows yields the 48B/pair compact state (anchor =
+fold(row0); delta = packed-byte XOR, still in the bit domain), round
+2's wire message, AND round 3's as six deferred quadratic coefficients:
+products parity-split over pair index (eq2(2y+1) = r1·eq3(y)), one
+odd-lane weight per group, κ=(1+r1)/r1 rebalance, single r1^-1 unscale.
+Replaces our two-sweep lookahead r2 (fold+store then L2 re-read) with
+ONE sweep and 25% smaller stores. (2) DEGENERATE-B fast path (theirs):
+all-ones packed b rows skip their 16 table lookups (fold(0xFF..) is a
+per-table constant), delta_b = 0, and the G(∞)/e/o products carry
+provably-zero factors — value-preserving, targeted-tested with b ≡ 1
+half-domains. (3) CONSUMER fold2_compact_round45_into — binds ρ1 AND
+ρ2 through two λ-scaled byte tables (λ1 = ρ1(1+ρ2), λ3 = ρ1ρ2; the
+anchors need only an ordinary ρ2 fold), emits round 4's message,
+materializes the quarter level, and defers round 5's message in ρ3 by
+the same parity trick — after which OUR cascade tail resumes its
+ordinary cadence (entry i=3, ρ3/ρ4 deferred; the loop invariant holds
+unchanged). NEON arms throughout (q-resident folds, 8 wide unreduced
+accumulators, u64-pair delta stores); scalar references kept as the
+non-aarch64 arm and oracle. Transcript-identical by two tests (random
++ degen-b targeted) at m=16/18; full suite green. Gates: n_mlv ≥ 7,
+n_out ≥ 1024, r[k_skip+1] ≠ 0, r[k_skip+3] ≠ 0 (parity unscalings;
+each fails w.p. 2^-128) — fallback = incumbent cascade route.
+
+CERTIFICATION (same-binary env arms, 8-min cooldown, 3 pairs): producer
+(r2 line) 47.96/50.50/50.97 vs classic 54.29/55.27/55.88 — 3/3
+disjoint; K double fold 23.7-24.6; tail 8.2-8.9 vs 31.6-32.0.
+MECHANISM SUM (r2 + K + tail): 79.9/83.2/84.5 vs 85.9/87.2/87.9 —
+3/3 DISJOINT, avg −4.9ms (on the −5..8 pricing). zc bucket 2/3 with
+one polluted K sample (141.5 vs its own min-sum ~118); totals 2/3 —
+bucket rule applied. DEFAULT ON; FLOCK_NO_ZC_COMPACT_K=1 kills
+(cascade precedent). zc sub-line sums now ≈117 vs their ≈116 —
+ZEROCHECK AT PARITY on like instrumentation. Their remaining r2
+number includes GPU-arm machinery we correctly skip (CPU-only rule).
