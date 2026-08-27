@@ -3,6 +3,31 @@
 Status: **CENSUS COMPLETE 2026-08-27**, `main` @ `86d5fd5`. Phase 0 of
 `docs/bloat-reduction-plan.md`. No code was changed to produce this document.
 
+**PHASE 1 EXECUTED 2026-08-27** on branch `bloat-phase1` (six commits,
+−10,175 net lines): fixture re-pins, doc sediment, the §A dead-pub sweep,
+the §E concluded probes, the §B/§F superseded benches + exclusive src, and
+the genus95 prototypes. Every batch verified (full suite, fmt, clippy
+`-D warnings`); x86 cross-check clean (17 pre-existing x86-only dead-fn
+warnings in the NTT experiment arms are byte-identical to main — a future
+cleanup candidate). Deviations from the written plan, with reasons:
+- Census corrections found by the compiler: `AdditiveNttGf8::k`,
+  `SparseEqTensor::len`, `BaseFunctional::len` were NOT dead (restored);
+  `with_blake3_chunk_leaf` was test/bench-only, not zero-reference.
+- Kept: `LOOKAHEAD_FRIENDLY` (in-file bit-identity test + an open
+  re-evaluate-on-M4-Max question), `DISABLE_FRIENDLY_HORNER` +
+  `NXT_ZEROFILL` (A/B arms in the production AG tail, useful for Phase F),
+  the unfused `round1_slp_packed_banks` kernel (differential oracle),
+  `is_empty` twins wherever a live `len` remains (clippy pairing).
+- blake3's AG entries (`prove_fast_ag`, `prove_fast_union_ag`, …) kept —
+  guarded API and the AG future; only the `*_timed` twins died. No
+  rs_vs_ag arm was salvaged: correctness guards remain in blake3.rs and
+  the tower benches carry AG e2e perf.
+- The two rotted area-asserts in union_element now derive the b3 width
+  from `USEFUL_BITS` instead of a hardcoded 93.
+- Deferred: the orphan `dump_transpose_induce_vectors` (needs a Makefile
+  run target validated on the Blackwell box — do it as a CUDA-CI
+  follow-up); the §B judgment tier; the §E UNCLEAR probes.
+
 Goal clarification (Ron, 2026-08-27, post-census): **flock's goal is to prove
 recursively — the tower is the key product surface.** Verdicts on
 tower-reachable code are framed accordingly (see PRODUCT-TRACK below); the
