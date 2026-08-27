@@ -700,6 +700,28 @@ map. Idea from the challenge tree's ranked open (located from its honest
 per-phase numbers after an instrumentation artifact had hidden it);
 algebra re-derived, implemented as four independently tested units.
 
+\subsection{Refinements to the direct open}
+\label{sec:directopenrefine}
+
+\begin{optsummary}
+\item[Baseline:] The freshly ported direct open spent $8.7\,$ms building its per-claim states (a 128-bit conditional scan per $W$ entry, serial per-bank transposes) and $26.4\,$ms on the L0 lane folds (one halving pass of $f$ per round, $\approx2L$ traffic).
+\item[Improvement:] Build $W$ through the standard 16-lookup fold byte table; parallelize the bank transposes; and fold $f$ ONCE --- all $k$ lane challenges composed into a single $2^k{\to}1$ pass.
+\item[Mechanism:] The composed fold is an option only the direct open has: its round messages come from the banked states and never touch $f$, so the witness is needed only at the level-1 boundary --- $\mathrm{out}[j] = \sum_{e<2^k}\mathrm{lag}[e]\,f[2^k j{+}e]$ with $\mathrm{lag} = \mathrm{build\_eq}(\rho_0..\rho_{k-1})$, the same field elements as $k$ successive folds at $\approx1.03L$ traffic instead of $\approx2L$.
+\item[Result:] Open $59.7$--$61.3\to45.5$--$50.4\,$ms at 8T ($-20\%$, $3/3$ disjoint); whole proof $516$--$538\to492.5$--$511\,$ms. State construction $8.7\to1.4\,$ms (the challenge tree's floor for the same stage is $0.5$). Proof bytes identical throughout.
+\end{optsummary}
+
+Three local costs of the port, removed without touching its algebra. The
+$W$-state entries $\varphi(\gamma\,\mathrm{lo}(e)\,x^b)$ are exactly
+\code{fold\_b128\_elems}' per-element map, so the existing byte-table
+build applies verbatim; the per-bank $128{\times}128$ bit transposes are
+independent and parallelize; and --- the structural one --- because the
+direct messages are computed from the banked states alone, nothing needs
+the partially folded witness until the residual basis is materialized, so
+the per-round fold chain collapses into one composed Lagrange pass. The
+dense path could never do this: its every round message reads the folded
+pair. Certified by a two-binary paired A/B (the three fixes share one
+keep decision), transcript identity re-checked at each step.
+
 \section{Merkle hashing: BLAKE3}
 
 \subsection{Two transposed four-wide states in flight}
@@ -836,6 +858,7 @@ Section & Kind & Phase effect (ST) & Sign test\\
 \S\ref{sec:tailfuse} & pass fusion & rounds 3+: $-31.8\%$ & $8/8$\\
 \S\ref{sec:composedfold} & work removal & open combine: $-17\%$ & decisive\\
 \S\ref{sec:directopen} & work removal & open ($m{=}32$): $-34\%$ 8T, $-66\%$ ST & $3/3$ disjoint\\
+\S\ref{sec:directopenrefine} & pass fusion & open ($m{=}32$): $-20\%$ 8T & $3/3$ disjoint\\
 \S\ref{sec:streamwit} & work removal & witness gen: $-24\%$ & $3/3$\\
 \S\ref{sec:lcfold} & work removal & lincheck fold: $-32\%$ & $3/3$\\
 \S\ref{sec:blake3neon} & ILP & BLAKE3 merkle: $+41\%$ GB/s & decisive\\
