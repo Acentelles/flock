@@ -1807,3 +1807,13 @@ tests + full lib suite + m=22 proof-identity green):
    pass (fold paths carry a flush no-op as insurance). Trace: OOD
    samples (5) 2.6-3.0 → 0.4-1.0ms MT; basis glue +0.1-0.6 (the
    drain). Net ≈ −2.
+
+**Wave 3 CERTIFIED** (paired grind-free A/B, quiet-window checked): open
+bucket 40.8-41.3 → 36.8-37.8 ms m=32 8T, **−9%, 3/3 disjoint**; totals
+2/3 (a ~4ms effect inside ±10ms window noise — bucket is the signal).
+Committed d87cb4b. Window hazard logged: three consecutive windows read
+528-556 both arms with no foreign process >50% CPU — thermal inflation
+from hours of sustained benching; grind-free family best remains the
+first quiet run (469.39 ms / 558.5k c/s). Remaining open residual ~37
+vs their grind-adjusted ~15-20; unattributed ~20 (recursive
+commits/opens inside the bucket) is the next drill.
