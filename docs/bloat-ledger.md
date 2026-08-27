@@ -258,6 +258,22 @@ direct-path surface that can retire independently of the GPU port is:
 deletions. The remaining direct-path consumer after Phase 1+2.1 would be the
 GPU roundtrip alone.
 
+**Directed (Ron, 2026-08-27): consolidate the profile matrix — merge
+`Slim128` into `Slim` and `Fast128` into `Fast`.** The `*128` twins differ
+from their bases only in the per-level rate ladder (+2/level vs +1 — see
+`derive_profile_ladder`); both sides already carry the same strict 128-bit
+Johnson accounting, so the merge means adopting the aggressive ladder as THE
+strict schedule and deleting the twin variants. Touches: the
+`LigeritoProfile` enum + its 5-arm grinding-policy matches (commit.rs ×5,
+repeated per policy), the embedded TOML set (98 configs → ~70;
+`gen_ligerito_configs` regenerates), `TowerConfig::{Chain100,Chain128}`'s
+profile selection, the 128-bit audit doc rows, and
+`docs/recursion-100-128-variants.md`. **Transcript-affecting for strict
+Fast/Slim users** (the query/rate schedule moves): needs a proof-IO version
+note, fixture re-pins, and a Blackwell CI pass. Sequencing: fine any time;
+cheapest bundled with another transcript-moving change so the re-pin cost
+is paid once.
+
 **Also gated (new finding):** the standalone (non-union) element PIOP
 (`element_r1cs::prove/verify` + `ElementProof`/`ElementClaim`/
 `ElementStatement` + standalone lincheck/zerocheck wrappers, **~660 lines** +
