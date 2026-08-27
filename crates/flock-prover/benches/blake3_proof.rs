@@ -175,12 +175,18 @@ fn bench_one(n_blocks: usize, n_runs: usize) {
         let (proof, commitment, _) = setup.prove_fast(blocks_v, &mut ch_p);
         println!("  peak memory: {:>8.2} MB", peak_mb());
 
-        let mut ch_v = fs();
-        let t = Instant::now();
-        let _ = setup
-            .verify(&commitment, &proof, &mut ch_v)
-            .expect("verify failed");
-        println!("  verify: {}", fmt_ms(t.elapsed().as_secs_f64()));
+        if std::env::var_os("FLOCK_NO_GRIND").is_some() {
+            // Grind-free proofs fail PoW verification by design; skip so the
+            // phase TSV and summary lines below still print.
+            println!("  verify: skipped (FLOCK_NO_GRIND)");
+        } else {
+            let mut ch_v = fs();
+            let t = Instant::now();
+            let _ = setup
+                .verify(&commitment, &proof, &mut ch_v)
+                .expect("verify failed");
+            println!("  verify: {}", fmt_ms(t.elapsed().as_secs_f64()));
+        }
 
         let bundle = flock_prover::proof_io::R1csProofBundleLigerito { commitment, proof };
         let proof_size = bundle.to_bytes().len();

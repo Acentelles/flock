@@ -2118,7 +2118,10 @@ pub fn induce_sumcheck_poly_via_ntt(
         c
     } else {
         let ntt = AdditiveNttF128::standard(log_block);
-        transpose_forward_ntt_sparse(&ntt, queries, &alpha_pows, log_block)
+        // Rate 1/2 keeps exactly the low half — the transpose's final three
+        // layers can then run fused, low-half-only (no-op otherwise: the
+        // fallback returns full length and `truncate` below discards the top).
+        transpose_forward_ntt_sparse_impl(&ntt, queries, &alpha_pows, log_block, log_inv_rate == 1)
     };
     coeffs.truncate(n);
     (coeffs, enforced_sum)
@@ -2179,11 +2182,98 @@ pub(crate) fn induce_sumcheck_poly_auto(
 /// contain a nonzero (a dense `2^k` transpose each), densify, then run the
 /// remaining steps as full dense sweeps. Output is identical to
 /// `transpose_forward_ntt` applied to the scattered input.
+/// Fused final-3 transpose steps (forward layers 2,1,0 — pairing distances
+/// n/8, n/4, n/2) computing ONLY the retained low half. Exact for callers
+/// that consume just `data[..n/2]` (the rate-1 induce truncation): layer 0's
+/// low output is the plain sum `a+b` — the discarded half's `t·s+b`
+/// arithmetic is never computed — and the three passes' `~6n` traffic
+/// becomes one `n`-read / `n/2`-write pass. Idea from the challenge tree's
+/// ranked induce; strided-gather re-derivation.
+fn transpose_ntt_fused_tail_low_half(ntt: &AdditiveNttF128, data: &mut Vec<F128>, log_d: usize) {
+    use rayon::prelude::*;
+    let n = 1usize << log_d;
+    debug_assert!(log_d >= 3);
+    debug_assert_eq!(data.len(), n);
+    let stride = n >> 3;
+    let half = n >> 1;
+    let t2 = [
+        ntt.twiddle(2, 0),
+        ntt.twiddle(2, 1),
+        ntt.twiddle(2, 2),
+        ntt.twiddle(2, 3),
+    ];
+    let t1 = [ntt.twiddle(1, 0), ntt.twiddle(1, 1)];
+    // In place: outputs land at i + j*stride for j<4 (the low half); the four
+    // low strides are split mutably and zipped, the high half stays read-only.
+    // Each position's eight reads complete before its four writes.
+    let (lo, hi) = data.split_at_mut(half);
+    let (l0, lr) = lo.split_at_mut(stride);
+    let (l1, lr) = lr.split_at_mut(stride);
+    let (l2, l3) = lr.split_at_mut(stride);
+    const CHUNK: usize = 1 << 12;
+    l0.par_chunks_mut(CHUNK)
+        .zip(l1.par_chunks_mut(CHUNK))
+        .zip(l2.par_chunks_mut(CHUNK))
+        .zip(l3.par_chunks_mut(CHUNK))
+        .enumerate()
+        .for_each(|(ci, (((c0, c1), c2), c3))| {
+            let base = ci * CHUNK;
+            for t in 0..c0.len() {
+                let i = base + t;
+                let x0 = c0[t];
+                let x1 = c1[t];
+                let x2 = c2[t];
+                let x3 = c3[t];
+                let x4 = hi[i];
+                let x5 = hi[i + stride];
+                let x6 = hi[i + 2 * stride];
+                let x7 = hi[i + 3 * stride];
+                // Layer 2 (distance n/8): pairs (2b, 2b+1), twiddle t2[b].
+                let s0 = x0 + x1;
+                let y1 = t2[0] * s0 + x1;
+                let s1 = x2 + x3;
+                let y3 = t2[1] * s1 + x3;
+                let s2 = x4 + x5;
+                let y5 = t2[2] * s2 + x5;
+                let s3 = x6 + x7;
+                let y7 = t2[3] * s3 + x7;
+                // Layer 1 (distance n/4): pairs (j, j+2) within 4-stride blocks.
+                let u0 = s0 + s1;
+                let u2 = t1[0] * u0 + s1;
+                let u1 = y1 + y3;
+                let u3 = t1[0] * u1 + y3;
+                let u4 = s2 + s3;
+                let u6 = t1[1] * u4 + s3;
+                let u5 = y5 + y7;
+                let u7 = t1[1] * u5 + y7;
+                // Layer 0 (distance n/2), retained outputs only: plain sums.
+                c0[t] = u0 + u4;
+                c1[t] = u1 + u5;
+                c2[t] = u2 + u6;
+                c3[t] = u3 + u7;
+            }
+        });
+    data.truncate(half);
+}
+
 fn transpose_forward_ntt_sparse(
     ntt: &AdditiveNttF128,
     positions: &[usize],
     values: &[F128],
     log_d: usize,
+) -> Vec<F128> {
+    transpose_forward_ntt_sparse_impl(ntt, positions, values, log_d, false)
+}
+
+/// `low_half = true`: the final three dense steps run as
+/// [`transpose_ntt_fused_tail_low_half`], returning only `2^(log_d-1)`
+/// coefficients — exact when the caller consumes just the low half.
+fn transpose_forward_ntt_sparse_impl(
+    ntt: &AdditiveNttF128,
+    positions: &[usize],
+    values: &[F128],
+    log_d: usize,
+    low_half: bool,
 ) -> Vec<F128> {
     use rayon::prelude::*;
     use std::collections::HashMap;
@@ -2247,8 +2337,10 @@ fn transpose_forward_ntt_sparse(
     }
 
     // Remaining steps s = k..log_d-1 = forward layers (log_d-1-k) .. 0, dense.
+    // With `low_half`, the last three layers run fused, low-half-only.
+    let dense_floor = if low_half && log_d - k > 3 { 3 } else { 0 };
     let n_threads = rayon::current_num_threads().max(1);
-    for layer in (0..(log_d - k)).rev() {
+    for layer in (dense_floor..(log_d - k)).rev() {
         let num_blocks = 1usize << layer;
         let block_size = 1usize << (log_d - layer);
         let bsh = block_size >> 1;
@@ -2282,6 +2374,9 @@ fn transpose_forward_ntt_sparse(
                     });
             }
         }
+    }
+    if dense_floor == 3 {
+        transpose_ntt_fused_tail_low_half(ntt, &mut data, log_d);
     }
     data
 }
@@ -2537,6 +2632,61 @@ fn round_msg_and_eval_lsb(f: &[F128], b: &[F128]) -> (SumcheckMessage, F128) {
             || (F128::ZERO, F128::ZERO, F128::ZERO),
             |(a0, a2, ay), (b0, b2, by)| (a0 + b0, a2 + b2, ay + by),
         );
+    (SumcheckMessage { u_0, u_2 }, y)
+}
+
+/// Factorized OOD variant of [`round_msg_and_eval_lsb`]: `b = eq_table(z)`
+/// is never materialized. `build_eq_table` is LSB-first, so a split of `z`
+/// splits the table as a tensor — `eq_z[x] = eq_lo[x & m]·eq_hi[x >> klo]` —
+/// and the hi factor is constant per `eq_lo.len()`-block: partial sums
+/// against the L1-resident lo table are scaled once per block. Same mul
+/// count per pair as the dense kernel, but the 2^n table build and its read
+/// pass disappear. Bit-identical (distributivity + order-free F128 sums).
+fn round_msg_and_eval_ood_lsb(
+    f: &[F128],
+    eq_hi: &[F128],
+    eq_lo: &[F128],
+) -> (SumcheckMessage, F128) {
+    use rayon::prelude::*;
+    let n = f.len();
+    let lo_len = eq_lo.len();
+    debug_assert!(n.is_power_of_two() && lo_len.is_power_of_two() && lo_len >= 2);
+    debug_assert_eq!(eq_hi.len() * lo_len, n);
+    let block = |h: usize| -> (F128, F128, F128) {
+        let fs = &f[h * lo_len..(h + 1) * lo_len];
+        let (mut s0, mut s2, mut sy) = (F128::ZERO, F128::ZERO, F128::ZERO);
+        for j in 0..lo_len / 2 {
+            let f0 = fs[2 * j];
+            let f1 = fs[2 * j + 1];
+            let l0 = eq_lo[2 * j];
+            let l1 = eq_lo[2 * j + 1];
+            let e0 = f0 * l0;
+            s0 += e0;
+            s2 += (f0 + f1) * (l0 + l1);
+            sy += e0 + f1 * l1;
+        }
+        let hv = eq_hi[h];
+        (hv * s0, hv * s2, hv * sy)
+    };
+    let nb = eq_hi.len();
+    const PAR_MIN_BLOCKS: usize = 8;
+    let (u_0, u_2, y) = if nb < PAR_MIN_BLOCKS {
+        let mut acc = (F128::ZERO, F128::ZERO, F128::ZERO);
+        for h in 0..nb {
+            let (a0, a2, ay) = block(h);
+            acc = (acc.0 + a0, acc.1 + a2, acc.2 + ay);
+        }
+        acc
+    } else {
+        (0..nb)
+            .into_par_iter()
+            .with_min_len(2)
+            .map(block)
+            .reduce(
+                || (F128::ZERO, F128::ZERO, F128::ZERO),
+                |(a0, a2, ay), (b0, b2, by)| (a0 + b0, a2 + b2, ay + by),
+            )
+    };
     (SumcheckMessage { u_0, u_2 }, y)
 }
 
@@ -2941,6 +3091,12 @@ pub struct SumcheckProver {
     /// by [`FoldLookahead::eval`]). Must be `None` (drained) before any
     /// non-lookahead operation touches `f`/`combined_basis`.
     pending_fold: Option<F128>,
+    /// OOD basis factors glued but not yet combined: `(α·eq_hi, eq_lo)`
+    /// tensor pairs whose O(L) add into `combined_basis` is deferred into
+    /// the next glue or fold pass (see [`Self::glue`]).
+    pending_ood: Vec<(Vec<F128>, Vec<F128>)>,
+    /// An [`Self::introduce_ood`] awaiting its glue: `(eq_hi, eq_lo, h_new)`.
+    pending_glue_ood: Option<(Vec<F128>, Vec<F128>, F128)>,
 }
 
 impl SumcheckProver {
@@ -2953,6 +3109,8 @@ impl SumcheckProver {
             transcript: Vec::new(),
             pending_glue: None,
             pending_fold: None,
+            pending_ood: Vec::new(),
+            pending_glue_ood: None,
         };
         let msg = round_msg_lsb(&inst.f, &inst.combined_basis);
         inst.transcript.push(msg);
@@ -2978,6 +3136,8 @@ impl SumcheckProver {
             transcript: Vec::new(),
             pending_glue: None,
             pending_fold: None,
+            pending_ood: Vec::new(),
+            pending_glue_ood: None,
         };
         inst.transcript.push(first_msg);
         (inst, first_msg)
@@ -2985,6 +3145,7 @@ impl SumcheckProver {
 
     pub fn fold(&mut self, r: F128) -> SumcheckMessage {
         debug_assert!(self.pending_fold.is_none(), "fold with pending lookahead");
+        self.flush_pending_ood();
         // Fused: fold f and combined_basis at r AND build the next-round
         // message in one parallel pass (was three passes). See
         // [`fold_and_msg_lsb`].
@@ -3025,6 +3186,7 @@ impl SumcheckProver {
     /// Lookahead steady state: fold the pending challenge AND `r` in one
     /// 4→1 pass, returning the post-fold message + next coefficients.
     pub fn fold2_lookahead(&mut self, r: F128) -> (SumcheckMessage, FoldLookahead) {
+        self.flush_pending_ood();
         let r_a = self
             .pending_fold
             .take()
@@ -3039,6 +3201,7 @@ impl SumcheckProver {
     /// Materialize a pending lookahead fold (message was already sent by
     /// [`Self::fold_skip`]). No-op when nothing is pending.
     pub fn drain_pending_fold(&mut self) {
+        self.flush_pending_ood();
         if let Some(r) = self.pending_fold.take() {
             let (nf, nb) = fold_pair_no_msg(&self.f, &self.combined_basis, r);
             crate::scratch::give_f128(std::mem::replace(&mut self.f, nf));
@@ -3072,17 +3235,97 @@ impl SumcheckProver {
         (msg, h_new)
     }
 
+    /// OOD-binding introduce: [`Self::introduce_new_with_eval`] with
+    /// `b_new = eq_table(z)`, but the table is never materialized — the
+    /// round message and eval read only `f` via the factorized kernel, and
+    /// the combine into `combined_basis` is deferred (see [`Self::glue`]).
+    /// Message, eval, and eventual basis state are bit-identical to the
+    /// dense path. Small `z` falls back to the dense path.
+    pub fn introduce_ood(&mut self, z: &[F128]) -> (SumcheckMessage, F128) {
+        debug_assert!(self.pending_fold.is_none(), "introduce with pending fold");
+        debug_assert!(self.pending_glue.is_none() && self.pending_glue_ood.is_none());
+        assert_eq!(1usize << z.len(), self.f.len());
+        const KLO: usize = 8;
+        if z.len() <= KLO + 1 {
+            return self.introduce_new_with_eval(build_eq_table(z));
+        }
+        let eq_lo = build_eq_table(&z[..KLO]);
+        let eq_hi = build_eq_table(&z[KLO..]);
+        let (msg, h_new) = round_msg_and_eval_ood_lsb(&self.f, &eq_hi, &eq_lo);
+        self.transcript.push(msg);
+        self.pending_glue_ood = Some((eq_hi, eq_lo, h_new));
+        (msg, h_new)
+    }
+
+    /// Materialize deferred OOD adds into `combined_basis`. No-op when
+    /// nothing is pending; fold paths call this so the deferral is
+    /// invisible outside this impl (the common flow drains fused inside
+    /// the next basis glue instead and never pays this pass).
+    fn flush_pending_ood(&mut self) {
+        use rayon::prelude::*;
+        if self.pending_ood.is_empty() {
+            return;
+        }
+        let oods = std::mem::take(&mut self.pending_ood);
+        const CHUNK: usize = 4096;
+        self.combined_basis
+            .par_chunks_mut(CHUNK)
+            .enumerate()
+            .for_each(|(ci, accs)| {
+                let base = ci * CHUNK;
+                for (t, acc) in accs.iter_mut().enumerate() {
+                    let j = base + t;
+                    let mut add = F128::ZERO;
+                    for (hi, lo) in &oods {
+                        add += hi[j >> lo.len().trailing_zeros()] * lo[j & (lo.len() - 1)];
+                    }
+                    *acc += add;
+                }
+            });
+    }
+
     /// Combine the introduced basis into `combined_basis` with separation α.
     /// `combined_basis[j] += α · b_new[j]` (pointwise), `T_r += α · h_new`.
     pub fn glue(&mut self, alpha: F128) {
         use rayon::prelude::*;
+        // Deferred-OOD glue: only the α-scale of the small hi factor happens
+        // now; the O(L) combine is postponed into the next glue or fold pass
+        // (in the prover flow, the level's basis glue immediately follows).
+        if let Some((mut eq_hi, eq_lo, h_new)) = self.pending_glue_ood.take() {
+            for v in eq_hi.iter_mut() {
+                *v = alpha * *v;
+            }
+            self.pending_ood.push((eq_hi, eq_lo));
+            self.t_r += alpha * h_new;
+            return;
+        }
         let (b_new, h_new) = self
             .pending_glue
             .take()
             .expect("glue without introduce_new");
         assert_eq!(b_new.len(), self.combined_basis.len());
+        let oods = std::mem::take(&mut self.pending_ood);
         const PAR_THRESHOLD: usize = 4096;
-        if self.combined_basis.len() < PAR_THRESHOLD {
+        if !oods.is_empty() {
+            // Drain the deferred OOD tensors fused into this pass: one
+            // read-modify-write of the basis regardless of sample count.
+            const CHUNK: usize = 1024;
+            self.combined_basis
+                .par_chunks_mut(CHUNK)
+                .zip(b_new.par_chunks(CHUNK))
+                .enumerate()
+                .for_each(|(ci, (accs, bs))| {
+                    let base = ci * CHUNK;
+                    for (t, (acc, &v)) in accs.iter_mut().zip(bs.iter()).enumerate() {
+                        let j = base + t;
+                        let mut add = alpha * v;
+                        for (hi, lo) in &oods {
+                            add += hi[j >> lo.len().trailing_zeros()] * lo[j & (lo.len() - 1)];
+                        }
+                        *acc += add;
+                    }
+                });
+        } else if self.combined_basis.len() < PAR_THRESHOLD {
             for (acc, &v) in self.combined_basis.iter_mut().zip(b_new.iter()) {
                 *acc += alpha * v;
             }
@@ -3697,11 +3940,10 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let _t = std::time::Instant::now();
         for _ in 0..ood_count(1) {
             let z = challenger.sample_f128_vec(n1);
-            // Build eq(z, ·) once and fuse the MLE eval `y = f̂1(z)` into the
-            // introduce round message (single pass over f1 + eq_z), instead of
-            // a separate `mle_eval_inline` fold.
-            let eq_z = build_eq_table(&z);
-            let (intro, y) = sc_prover.introduce_new_with_eval(eq_z);
+            // Factorized: eq(z, ·) is never materialized and the basis
+            // combine is deferred into this level's basis glue — the sample
+            // costs one read pass over f1 (see `introduce_ood`).
+            let (intro, y) = sc_prover.introduce_ood(&z);
             challenger.observe_f128(y);
             ood_values.push(y);
             challenger.observe_f128(intro.u_0);
@@ -3898,8 +4140,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let _t = std::time::Instant::now();
             for _ in 0..ood_count(i + 2) {
                 let z = challenger.sample_f128_vec(n_next);
-                let eq_z = build_eq_table(&z);
-                let (intro, y) = sc_prover.introduce_new_with_eval(eq_z);
+                let (intro, y) = sc_prover.introduce_ood(&z);
                 challenger.observe_f128(y);
                 ood_values.push(y);
                 challenger.observe_f128(intro.u_0);
@@ -5595,6 +5836,58 @@ mod tests {
         }
     }
 
+    /// Factorized OOD (introduce_ood + deferred glue) against the dense
+    /// path: identical messages, evals, t_r, and combined_basis — through
+    /// both drain routes (fused into the next basis glue, and the fold-path
+    /// flush) and the small-z dense fallback.
+    #[test]
+    fn ood_factorized_matches_dense() {
+        use crate::challenger::{Challenger, RandomChallenger};
+        for (si, log_n) in [12usize, 9].into_iter().enumerate() {
+            let mut ch = RandomChallenger::new(0x00D_FAC ^ si as u64);
+            let f = ch.sample_f128_vec(1 << log_n);
+            let b1 = ch.sample_f128_vec(1 << log_n);
+            let h1 = ch.sample_f128();
+            let (mut dense, dm) = SumcheckProver::new(f.clone(), b1.clone(), h1);
+            let (mut fact, fm) = SumcheckProver::new(f, b1, h1);
+            assert_eq!((dm.u_0, dm.u_2), (fm.u_0, fm.u_2));
+            // Several OOD samples, all combines deferred on the fact side.
+            for _ in 0..3 {
+                let z = ch.sample_f128_vec(log_n);
+                let alpha = ch.sample_f128();
+                let (ma, ya) = dense.introduce_new_with_eval(build_eq_table(&z));
+                dense.glue(alpha);
+                let (mb, yb) = fact.introduce_ood(&z);
+                fact.glue(alpha);
+                assert_eq!((ma.u_0, ma.u_2, ya), (mb.u_0, mb.u_2, yb));
+            }
+            // Basis glue drains the deferred tensors fused into its pass.
+            let b_new = ch.sample_f128_vec(1 << log_n);
+            let h_new = ch.sample_f128();
+            let beta = ch.sample_f128();
+            let ma = dense.introduce_new(b_new.clone(), h_new);
+            dense.glue(beta);
+            let mb = fact.introduce_new(b_new, h_new);
+            fact.glue(beta);
+            assert_eq!((ma.u_0, ma.u_2), (mb.u_0, mb.u_2));
+            assert_eq!(dense.combined_basis, fact.combined_basis, "glue drain");
+            assert_eq!(dense.t_r, fact.t_r);
+            // Fold-path flush: a deferred OOD followed directly by a fold.
+            let z = ch.sample_f128_vec(log_n);
+            let alpha = ch.sample_f128();
+            dense.introduce_new_with_eval(build_eq_table(&z));
+            dense.glue(alpha);
+            fact.introduce_ood(&z);
+            fact.glue(alpha);
+            let r = ch.sample_f128();
+            let ma = dense.fold(r);
+            let mb = fact.fold(r);
+            assert_eq!((ma.u_0, ma.u_2), (mb.u_0, mb.u_2));
+            assert_eq!(dense.combined_basis, fact.combined_basis, "fold flush");
+            assert_eq!(dense.f(), fact.f());
+        }
+    }
+
     /// Same-process paired A/B: 6 plain fused folds vs the lookahead
     /// schedule (P1 + skip + P2 + skip + P2 + skip + drain) at 2^23, order
     /// swapped every rep. Run with:
@@ -6500,6 +6793,10 @@ mod tests {
             (8, 3, 3, 71),
             (5, 5, 3, 43),
             (0, 2, 1, 3),
+            // Rate-1 shapes large enough for the windowed sparse path
+            // (log_block >= 12), engaging the fused low-half final-3 tail.
+            (11, 1, 4, 100),
+            (12, 1, 2, 300),
         ];
         for (si, &(log_msg, log_inv_rate, log_int, n_queries)) in shapes.iter().enumerate() {
             let block_len = 1usize << (log_msg + log_inv_rate);

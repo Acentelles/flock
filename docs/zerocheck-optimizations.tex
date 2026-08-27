@@ -547,6 +547,25 @@ where the cost actually lived.
 \emph{Measured: rounds-3+ phase $449.5\to306.6\,$ms ($-31.8\%$), $8/8$,
 every pair in $[-31.1\%,-32.6\%]$ --- the largest single win of the effort.}
 
+\subsection{The lookahead cascade: two rounds per pass}
+\label{sec:cascade}
+
+\begin{optsummary}
+\item[Baseline:] After \S\ref{sec:tailfuse}, each tail round is one fused pass (fold at $\rho$ + next message): $\approx2L$ read $+\,L$ write per round, halving $L$ each time.
+\item[Improvement:] Emit eight \emph{lookahead} partial sums per pass, answer the next round's message without touching the arrays, and materialize two folds in one $4{\to}1$ sweep --- round~2 hands the first lookahead to the tail, the exit hands the last fold to the boundary.
+\item[Mechanism:] The post-fold message is a quadratic in the not-yet-drawn challenge whose coefficients are bilinear in pre-fold group values: eight per-group sums determine it for \emph{any} $\rho$. The enabling arithmetic (from the challenge tree's kernel): all eight products of a group share its eq weight, so pre-scaling the four $a$-rows once makes each product a single unreduced widening multiply --- $52$ vs $72$ PMULL per group. Intermediate half-size arrays are never written ($\approx55\%$ of two sequential rounds' traffic).
+\item[Result:] $m{=}32$ 8T: tail $33$--$37$ vs $53$--$66\,$ms ($4/4$ disjoint); round 2 pays $+12$ (its integrated kernel also emits the sums --- the PMULL floor); zerocheck net $-8$--$13\,$ms (sign $3/4$). $m{=}30$: $-1.0$, no regression ($2/2$). Default on; \code{FLOCK\_NO\_ZC\_LOOKAHEAD=1} reverts. Transcript byte-identical by test.
+\end{optsummary}
+
+This reverses an early-campaign verdict: the same double-round idea lost
+$7$--$15\%$ when first tried, and the regression was adjudicated to the
+technique. It belonged to the kernel --- the scalar lookahead
+accumulator spilled what the NEON one-weight-per-group form keeps in
+registers. The technique and its implementation quality had to be judged
+separately, and only the cross-tree anatomy exchange (their kernel
+reached the same sums with 20 fewer PMULLs per group) exposed which was
+which.
+
 \section{Lincheck}
 
 \subsection{One word load per stripe, two stripes per pass}
@@ -722,6 +741,26 @@ dense path could never do this: its every round message reads the folded
 pair. Certified by a two-binary paired A/B (the three fixes share one
 keep decision), transcript identity re-checked at each step.
 
+\subsection{Truncating the induce transpose at rate $1/2$}
+\label{sec:inducetrunc}
+
+\begin{optsummary}
+\item[Baseline:] The sparse-prefix induce scatter-transposes the query indicator over the full $2^{n+1}$ codeword domain, then \code{truncate}s to the low $2^n$ coefficients --- the final transpose layers compute a half that is thrown away.
+\item[Improvement:] Fuse the final three transpose layers into one strided kernel that computes only the retained low half (idea from the challenge tree; exact precisely when $\log(1/\text{rate}) = 1$).
+\item[Mechanism:] The transpose runs forward layers in reverse order, so the last three pair at distances $n/8$, $n/4$, $n/2$. An in-place 8-gather kernel applies the three butterfly levels in registers and writes the four low outputs; the final layer's retained output is the plain sum $a+b$, so its multiplies vanish entirely. Three full sweeps ($\approx6n$ traffic) become one $n$-read/$\tfrac{n}{2}$-write pass.
+\item[Result:] Induce $6.8$--$7.6\to6.0$--$7.2\,$ms at $m{=}32$ 8T (trace attribution); certified jointly with \S\ref{sec:lazyood} (open bucket $40.8$--$41.3\to36.8$--$37.8\,$ms 8T, $-9\%$, grind-free protocol). Retained-half byte equality with the dense transpose by test.
+\end{optsummary}
+
+\subsection{Lazy out-of-domain binding}
+\label{sec:lazyood}
+
+\begin{optsummary}
+\item[Baseline:] Each OOD sample $z$ builds the dense $\mathrm{eq}(z,\cdot)$ table, runs the fused message+eval pass over $(f, \mathrm{eq}_z)$, and combines $\alpha\cdot\mathrm{eq}_z$ into the running basis --- $\approx7L$ traffic per sample, five samples at L0 alone.
+\item[Improvement:] Never materialize $\mathrm{eq}_z$: factorize it as $\mathrm{eq}_{\mathrm{lo}}\otimes\mathrm{eq}_{\mathrm{hi}}$, read only $f$ for the message, and defer every sample's basis combine into the level's basis glue, drained fused in its single pass (idea from the challenge tree).
+\item[Mechanism:] The eq table is LSB-first, so splitting $z$ splits the table as a tensor: $\mathrm{eq}_z[x] = \mathrm{eq}_{\mathrm{lo}}[x \bmod 2^k]\cdot\mathrm{eq}_{\mathrm{hi}}[\lfloor x/2^k\rfloor]$. The hi factor is constant per $2^k$-block, so block partials against the L1-resident lo table are scaled once per block --- the same multiply count per pair as the dense kernel with no table build or re-read. Glue stashes $(\alpha\cdot\mathrm{eq}_{\mathrm{hi}}, \mathrm{eq}_{\mathrm{lo}})$; the next basis glue adds all pending tensors alongside $\beta\cdot b_{\mathrm{new}}$ in its one read-modify-write (fold paths flush as insurance). Bit-identical by distributivity and order-free $\mathbb{F}_{2^{128}}$ sums.
+\item[Result:] OOD stage $2.6$--$3.0\to0.4$--$1.0\,$ms at $m{=}32$ 8T; the draining basis glue pays $+0.1$--$0.6$. Certified jointly with \S\ref{sec:inducetrunc}.
+\end{optsummary}
+
 \section{Merkle hashing: BLAKE3}
 
 \subsection{Two transposed four-wide states in flight}
@@ -859,6 +898,8 @@ Section & Kind & Phase effect (ST) & Sign test\\
 \S\ref{sec:composedfold} & work removal & open combine: $-17\%$ & decisive\\
 \S\ref{sec:directopen} & work removal & open ($m{=}32$): $-34\%$ 8T, $-66\%$ ST & $3/3$ disjoint\\
 \S\ref{sec:directopenrefine} & pass fusion & open ($m{=}32$): $-20\%$ 8T & $3/3$ disjoint\\
+\S\ref{sec:cascade} & pass fusion & zc tail ($m{=}32$): $-38\%$ 8T & $4/4$ disjoint\\
+\S\ref{sec:inducetrunc}+\S\ref{sec:lazyood} & work removal & open ($m{=}32$): $-9\%$ 8T & $3/3$ disjoint\\
 \S\ref{sec:streamwit} & work removal & witness gen: $-24\%$ & $3/3$\\
 \S\ref{sec:lcfold} & work removal & lincheck fold: $-32\%$ & $3/3$\\
 \S\ref{sec:blake3neon} & ILP & BLAKE3 merkle: $+41\%$ GB/s & decisive\\
@@ -892,9 +933,9 @@ inlines the latency-optimal binius kernel, and six PMULLs with no repack beat
 three with one, in situ and not only in the microbenchmark. Two further
 structural transplants measured neutral end-to-end and were reverted despite
 making the zerocheck \emph{bucket} look better (hoisting the challenge-independent
-prep under the commit; the lookahead double-round, which loses $7$--$15\%$ in
-the zerocheck tail on both this machine and the challenge tree's, while
-\emph{helping} the PCS open by $7\%$ --- the same technique, opposite signs,
-two call sites).
+prep under the commit; the lookahead double-round --- which first lost $7$--$15\%$ in the
+zerocheck tail and was rejected here, until the cross-tree kernel anatomy
+showed the loss belonged to the scalar accumulator, not the technique:
+re-kerneled it is now \S\ref{sec:cascade}).
 
 \end{document}

@@ -1772,3 +1772,38 @@ tried: SLOWER (9.2-9.4; per-slot mul > saved tensor build at 2^20),
 reverted. Grind-adjusted kernel content of our open ≈ 36ms vs their
 grind-adjusted ~15-20: remaining targets = induce truncated-final-NTT
 (−4.5) and lazy OOD (−2.8), then commits/misc at parity.
+
+### FLOCK_NO_GRIND: grinding removed from the measurement protocol (2026-08-27)
+
+Benedikt: grind time is nonce-search luck (9.3-11.8ms MT of the open at
+m=32 L0 alone) and adds variance paired A/B can't cancel. Both trees now
+carry the same knob: `FLOCK_NO_GRIND=1` coerces grinding bits to 0 in
+`grind_pow` (nonce 0, zero hashing; ~5 lines, LazyLock env check).
+Default unchanged (grind ON). Deliberately NOT mirrored in the verifier
+— grind-free proofs FAIL verification (the bench's final verify panics
+after timings print; scripts tolerate the exit). Yukon confirmed with
+Benedikt and added the identical knob. ALL grind-free numbers are a new
+baseline family — not comparable to anything certified earlier.
+
+### Port wave 3: truncated-final-NTT induce + lazy OOD (2026-08-27)
+
+Both peer-anatomy items, both transcript-identical (dense-equality unit
+tests + full lib suite + m=22 proof-identity green):
+
+1. **Fused low-half final-3 NTT tail** (their `..._fused_final_3layer_
+   low_half`): `induce_sumcheck_poly_via_ntt` computed the full 2^21
+   transpose then `truncate(n)` — at rate 1/2 the retained half never
+   needs the last three layers' full sweeps. Fused strided kernel
+   (8-gather, 3 butterfly levels in registers, 4 low writes, in place
+   via split_at_mut): last layer's kept output is a plain XOR, ~6n
+   traffic → 1.5n. Gated `log_inv_rate == 1` inside the sparse
+   transpose. Trace attribution: induce 6.8-7.6 → 6.0-7.2ms MT (~−0.8,
+   consistent with the traffic math; peer's −4.5 bundled other diffs).
+2. **Lazy OOD** (their `introduce_new_ood_factorized`/`glue_factorized_
+   ood` analog): `introduce_ood` splits eq(z,·) = eq_lo ⊗ eq_hi
+   (build_eq_table is LSB-first) — round msg + eval read only f, the
+   2^n table is never built; glue defers (α·eq_hi, eq_lo) and the next
+   basis glue drains all samples fused in its one read-modify-write
+   pass (fold paths carry a flush no-op as insurance). Trace: OOD
+   samples (5) 2.6-3.0 → 0.4-1.0ms MT; basis glue +0.1-0.6 (the
+   drain). Net ≈ −2.

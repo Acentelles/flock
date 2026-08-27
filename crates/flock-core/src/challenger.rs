@@ -393,6 +393,12 @@ impl Challenger for FsChallenger {
     }
 
     fn grind_pow(&mut self, bits: u32) -> u64 {
+        // Measurement knob: FLOCK_NO_GRIND=1 skips all PoW grinding (nonce 0,
+        // no hashing). Grind time is nonce-search luck, so it adds variance
+        // that paired A/B can't cancel; proofs made this way fail verification.
+        static NO_GRIND: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GRIND").is_some());
+        let bits = if *NO_GRIND { 0 } else { bits };
         let kind = self.hash_kind();
         let state_digest = self.state_digest();
         // Aggregate-aware parallelism: decide on the grind's *expected hash
