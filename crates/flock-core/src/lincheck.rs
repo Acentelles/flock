@@ -1703,7 +1703,7 @@ pub fn prove_padded_with_grinding<Ch: Challenger>(
     (proof, claim)
 }
 
-/// Variant of [`prove_padded`] that also returns the **pre-sumcheck** z_vec
+/// Variant of [`prove_padded_with_grinding`] that also returns the **pre-sumcheck** z_vec
 /// (`output[i_inner] = ẑ(i_inner, x_ab.x_outer)`, length `2^k_log`). The
 /// downstream PCS reuses this vector to compute the AB-claim's ring-switch
 /// `s_hat_v` via [`crate::pcs::ring_switch::s_hat_v_from_z_vec`], skipping a
@@ -1711,7 +1711,7 @@ pub fn prove_padded_with_grinding<Ch: Challenger>(
 ///
 /// Pays one extra `2^k_log` F128 clone (~2 MB at k_log=17) before the
 /// sumcheck loop; callers that don't need the reuse should keep using
-/// [`prove_padded`] to avoid that clone.
+/// [`prove_padded_with_grinding`] to avoid that clone.
 pub fn prove_padded_capture_z_vec<Ch: Challenger>(
     z_packed: &[u8],
     m: usize,

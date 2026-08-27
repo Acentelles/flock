@@ -637,8 +637,7 @@ impl ElementStatement<'_> {
 
 /// RS inverse rate (log2) and interleaving batch size (log2) for the element
 /// witness commitment. Both backends' L0 commit and Ligerito's `default_config`
-/// must agree on these, so they live in one place. Same choice as
-/// [`crate::permutation`].
+/// must agree on these, so they live in one place.
 const PCS_LOG_INV_RATE: usize = 1;
 const PCS_LOG_BATCH_SIZE: usize = 1;
 

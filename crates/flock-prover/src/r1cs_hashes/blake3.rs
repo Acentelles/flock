@@ -1563,6 +1563,9 @@ pub struct Blake3Setup {
 
 impl Blake3Setup {
     /// Fast-path witness generation dispatched on the r1cs's witness layout.
+    /// Its only caller is [`Self::prove_fast_ag`], so it carries the same
+    /// aarch64 gate (the x86_64 lint leg runs with `-D warnings`).
+    #[cfg(target_arch = "aarch64")]
     fn generate_witness_ab(
         &self,
         blocks: &[Compression],

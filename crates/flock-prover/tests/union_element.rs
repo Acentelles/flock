@@ -1313,8 +1313,9 @@ fn bundle_digest_merged(
 // fixture elem-merged-nu12-0 held. union_m6_fixtures was re-pinned with
 // that change but this file was missed (caught by the Phase 0 bloat
 // census). Two deterministic print runs agreed.
+// Runs by default since 2026-08-27: CI never passes `--ignored`, which is
+// how the 700cace sweep missed this pin. Same policy as `union_m6_fixtures`.
 #[test]
-#[ignore] // Heavier — run with `-- --ignored`.
 fn mixed_class_merged_proof_bytes_pinned() {
     const ELEMENT_ONLY: [(&str, usize, &str); 3] = [
         (
@@ -1377,6 +1378,18 @@ fn mixed_class_merged_proof_bytes_pinned() {
             })],
             &mut ch,
         );
+        // A pin is only meaningful for bytes the verifier accepts.
+        let mut ch_v = FsChallenger::new(DOMAIN);
+        let claims_v = verifier::verify_ligerito_union_mixed_class(
+            &union,
+            &[],
+            &commitment,
+            &proof,
+            &pcs_params,
+            &mut ch_v,
+        )
+        .unwrap_or_else(|e| panic!("{label}: pinned proof must verify: {e:?}"));
+        assert_eq!(claims_v, claims, "{label}: verifier claims must match");
         check(
             label,
             expected,
@@ -1408,6 +1421,18 @@ fn mixed_class_merged_proof_bytes_pinned() {
             })],
             &mut ch,
         );
+        // A pin is only meaningful for bytes the verifier accepts.
+        let mut ch_v = FsChallenger::new(DOMAIN);
+        let claims_v = verifier::verify_ligerito_union_mixed_class(
+            &union,
+            &[circuit],
+            &commitment,
+            &proof,
+            &pcs_params,
+            &mut ch_v,
+        )
+        .unwrap_or_else(|e| panic!("{label}: pinned proof must verify: {e:?}"));
+        assert_eq!(claims_v, claims, "{label}: verifier claims must match");
         check(
             label,
             expected,

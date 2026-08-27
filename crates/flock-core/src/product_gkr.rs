@@ -13,8 +13,8 @@
 //!
 //! ## The GKR circuit (difference from the siblings)
 //!
-//! [`crate::permutation`] proves one grand product by committing the product
-//! tree as a multilinear `v` and opening it. This module proves each grand
+//! The retired `permutation` PIOP proved one grand product by committing the
+//! product tree as a multilinear `v` and opening it. This module proves each grand
 //! **product** with the classic product-tree GKR: a binary tree of plain
 //! multiplication gates, with **no committed oracle and no field inversions**.
 //! For an input vector `V_μ` of `2^μ` values,
@@ -45,7 +45,8 @@
 //!
 //! ## Scope & cost
 //!
-//! PIOP for the witness side, same contract as [`crate::permutation`]: reduces
+//! PIOP for the witness side, same contract as the retired `permutation`
+//! PIOP: reduces
 //! to MLE eval claims on the witness, returned in the claim type. **No PCS
 //! commitment, no PCS opening, no inversions** — the proof is just the GKR
 //! transcript (`O(μ²)` field elements) plus the witness evals, and the prover
@@ -182,8 +183,7 @@ fn par_threshold() -> usize {
     })
 }
 
-/// Phase tracing, enabled by `GKR_TRACE=1` (mirrors `PERM_TRACE` in
-/// [`crate::permutation`]). Read once.
+/// Phase tracing, enabled by `GKR_TRACE=1`. Read once.
 fn trace_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("GKR_TRACE").is_ok())

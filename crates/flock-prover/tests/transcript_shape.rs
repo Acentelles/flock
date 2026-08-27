@@ -261,8 +261,9 @@ fn element_only_transcript_shape_is_data_independent() {
 /// Re-pinned 2026-08-02 (later): Merkle capping — commit absorbs are the
 /// cap layers (ObserveBytes 32 -> 32·2^c), octopus removed. The cap sizes
 /// are config-static, which the data-independence test enforces.
+/// Runs by default since 2026-08-27: CI never passes `--ignored`, which is
+/// how the 700cace sweep missed this pin (and it takes well under a second).
 #[test]
-#[ignore] // Heavier — run with `-- --ignored`.
 fn element_only_transcript_shape_is_pinned() {
     // Re-pinned 2026-08-02: multipoint-twisted assist (proof_io v8) — the
     // per-statement assist became 128K dual values + one product sumcheck +

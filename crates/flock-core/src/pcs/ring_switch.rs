@@ -37,7 +37,7 @@
 //!   `rs_eq_ind` densely (or sparsely) via [`fold_b128_elems`] / [`RsEqInd`].
 //!   The dense vector becomes the BaseFold target witness, so the prover does
 //!   need the full `2^(m-7)` entries.
-//! - **Verifier side** (used by [`verify_succinct`] + [`eval_rs_eq`]): never
+//! - **Verifier side** (used by [`verify_succinct_with_grinding`] + [`eval_rs_eq`]): never
 //!   materializes `rs_eq_ind`. Instead, evaluates `MLE(rs_eq_ind)(c)` at the
 //!   BaseFold final challenge point in `O((m-7) · 128²)` field ops via the
 //!   DP24 tensor-algebra iterative algorithm ([DP24] §1.3, Figure 3). This is
@@ -1962,7 +1962,7 @@ pub fn sparse_eq_from_parts(
     }
 }
 
-/// Sparse counterpart of one column of [`fold_1b_rows_multi`]: scans only the
+/// Sparse counterpart of one column of [`fold_1b_rows_multi_padded`]: scans only the
 /// nonzero entries of the suffix tensor. Iterates compact (live-only) tensor
 /// indices and computes the scattered `packed_witness` index inline via
 /// [`SparseEqTensor::scatter_idx`] — avoids materializing the scattered
@@ -2972,7 +2972,7 @@ pub fn verify_with_grinding<Ch: Challenger>(
     })
 }
 
-/// Verifier-side output of [`verify_succinct`]: contains everything the caller
+/// Verifier-side output of [`verify_succinct_with_grinding`]: contains everything the caller
 /// needs to drive the BaseFold consistency check, *without* materializing the
 /// dense `rs_eq_ind` vector of length `2^(m-7)`.
 #[derive(Clone, Debug)]
@@ -3044,7 +3044,7 @@ pub fn verify_succinct_with_grinding<Ch: Challenger>(
 /// ## Arguments
 ///
 /// * `z_vals` — the suffix-side coords, i.e. `x_outer[1..]` from
-///   [`verify_succinct`]. Length `ℓ' = m − 7`.
+///   [`verify_succinct_with_grinding`]. Length `ℓ' = m − 7`.
 /// * `query` — the BaseFold sumcheck final challenges, length `ℓ'`.
 /// * `eq_r_dprime` — the `eq` tensor over the sampled `r''`, length 128.
 ///
