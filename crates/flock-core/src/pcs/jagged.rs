@@ -4661,9 +4661,10 @@ fn fold_and_round_fused(a: &mut Vec<F128>, b: &mut Vec<F128>, r: F128) -> (F128,
 ///
 /// Iterates contiguous slice chunks with `chunks_exact(2)` rather than indexing
 /// `a[2*x]`: eliminating the per-element bounds checks lifts the reduction from
-/// ~2.6× to ~6× parallel scaling (hits the memory-bandwidth ceiling). See
-/// `scaling_diag`. No longer on the production path (round 1's message is
-/// fused into [`generate_f_and_claim`]); retained for the runtime benchmarks.
+/// ~2.6× to ~6× parallel scaling (hits the memory-bandwidth ceiling);
+/// measured with the since-deleted `scaling_diag` probe (bloat ledger §E).
+/// No longer on the production path (round 1's message is fused into
+/// [`generate_f_and_claim`]); retained for the runtime benchmarks.
 #[allow(dead_code)]
 pub(crate) fn round_msg_par(a: &[F128], b: &[F128]) -> (F128, F128) {
     use rayon::prelude::*;

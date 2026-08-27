@@ -3661,9 +3661,6 @@ mod tests {
         }
     }
 
-    /// Throughput A/B of the fold_1b_rows variants at m=29 scale. `#[ignore]`d
-    /// (allocates/folds 64 MB buffers many times); run explicitly with
-    /// `cargo test --release -- --ignored --nocapture zzz_bench_fold_1b`.
     /// **Padding skip is byte-identical to the dense fold.** On a packed
     /// witness whose every block has bits `[useful_bits, 2^k_log)` honestly
     /// zero, the `_padded` kernels must produce the exact same `(a0, a1)` as

@@ -38,7 +38,8 @@
 //!   cascade LINEAR — full drop is 48.3M nnz vs Option D's 21.0M (2.3×),
 //!   max row ~5.6k terms, while the row narrows 121 → 93 committed
 //!   word-cols (−23%). The CSC fold prices nnz at ~1 ms per 21M/prove, so
-//!   the area win dominates. See `tests/b3_width_audit.rs`.)
+//!   the area win dominates. Measured by the since-deleted
+//!   `tests/b3_width_audit.rs` probe, bloat ledger §E.)
 //!
 //! Trade-off: the matrix template is dense (48.3M nnz), so template build
 //! and any O(nnz) pass cost more — but those are per-shape/cacheable

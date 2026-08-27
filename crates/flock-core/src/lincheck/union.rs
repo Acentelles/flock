@@ -813,8 +813,9 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
     //    split of this function into "comb phase" and "everything after".
     //    Deferral removed the comb phase from here entirely, so the
     //    instrumentation had nothing left to time and is not carried over.
-    //    The measurement it existed for still lives in [`verify_union_timed`],
-    //    which builds combs inline on purpose.
+    //    The measurement it existed for lived in `verify_union_timed` (which
+    //    built combs inline on purpose) until that probe was deleted in the
+    //    bloat sweep (ledger §E).
 
     // 2b. Constant-wire pins (mirror of prove): β_t sampled after α in slot
     //     order, the comb gains +β_t at the pin, and the target gains the

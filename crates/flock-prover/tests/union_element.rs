@@ -1307,12 +1307,16 @@ fn bundle_digest_merged(
 // Re-pinned 2026-08-13 after circuit digests began binding fixed-public
 // declarations and the retained registry. The statement transcript changes
 // by design; two deterministic print runs agreed for all seven fixtures.
-// Re-pinned 2026-08-27 for the deliberate per-level consistency-batch
-// grinding fix (700cace): each Ligerito level's alpha now grinds under its
-// OWN bits, so every fixture with live grinding moved; the empty-instance
-// fixture elem-merged-nu12-0 held. union_m6_fixtures was re-pinned with
-// that change but this file was missed (caught by the Phase 0 bloat
-// census). Two deterministic print runs agreed.
+// Re-pinned 2026-08-27 after two transcript-moving changes since the 08-13
+// pin, neither of which re-pinned this file (caught by the Phase 0 bloat
+// census): the 08-14 blake3 Option-F adders (176c869) and the per-level
+// consistency-batch grinding fix (700cace: each Ligerito level's alpha now
+// grinds under its OWN bits). Measured at 700cace~1: the two element-only
+// pins that moved did so under 700cace alone; mix-100-90 and mix-100-0 had
+// already reached their new values on 08-14 and 700cace left them;
+// mix-128-128 and mix-0-90 moved under both. The empty-instance fixture
+// elem-merged-nu12-0 held throughout. union_m6_fixtures was re-pinned with
+// 700cace but this file was missed. Two deterministic print runs agreed.
 // Runs by default since 2026-08-27: CI never passes `--ignored`, which is
 // how the 700cace sweep missed this pin. Same policy as `union_m6_fixtures`.
 #[test]

@@ -174,7 +174,8 @@ pub const SC_MAJ1: usize = 0;
 pub const SC_MAJ2: usize = CARRIES_PER_ADD; // 31
 pub const SC_RIP: usize = 2 * CARRIES_PER_ADD; // 62
 
-// Lin-id discipline (measured 2026-08-14, `sha2_linid_drop_sim`): W is
+// Lin-id discipline (measured 2026-08-14 with the since-deleted
+// `sha2_linid_drop_sim` probe, bloat ledger §E): W is
 // never materialized (the schedule cascade stays shallow — 19.7M nnz),
 // and E_NEW/A_NEW materialize only every OTHER round (`EA_PERIOD` = 2):
 // an inlined round's state expressions are cut one round later, bounding

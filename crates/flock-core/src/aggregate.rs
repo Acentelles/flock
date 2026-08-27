@@ -100,7 +100,8 @@ pub struct Accumulator {
 }
 
 impl Accumulator {
-    // (A `discharge_with_circuits` variant through each type's tuned
+    // (A `discharge_with_circuits` variant, since deleted per bloat ledger
+    // §A, through each type's tuned
     // column-marginal `fold_split` kernel was MEASURED SLOWER than the raw
     // k·nnz pass below — 17.3 vs 15.3 ms on the N=4 BLAKE3 batch — because
     // the accumulated A and B claims fold under separate transcripts and

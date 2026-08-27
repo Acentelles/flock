@@ -97,11 +97,15 @@ pub enum LigeritoProfile {
     /// [`Self::derive_profile_ladder`].
     Slim128,
     /// `Fast` with the aggressive recursion ladder (rate +2/level), the
-    /// rate-1/2 twin of [`Self::Slim128`]. Same 128-bit Johnson accounting,
-    /// rate 1/2 L0 and no query PoW as `Fast` — only the per-level rate
-    /// schedule changes. Nets ~11% smaller proofs at equal 128-bit security,
-    /// near-free on prove (codewords keep shrinking since `rate_gain` < the
-    /// fold count). See [`Self::derive_profile_ladder`].
+    /// rate-1/2 twin of [`Self::Slim128`]. Same 128-bit Johnson accounting
+    /// and rate-1/2 L0 as `Fast`, but UNLIKE `Fast` it grinds 16 bits of
+    /// query PoW per level (since 2026-08-14; see the `query_grind` match in
+    /// the schedule derivation): the query term targets 112 bits and the
+    /// PoW supplies the rest, work-normalized. The deeper levels also carry
+    /// larger claim-batch / consistency-batch grinding. Nets ~11% smaller
+    /// proofs at equal 128-bit security, near-free on prove (codewords keep
+    /// shrinking since `rate_gain` < the fold count). See
+    /// [`Self::derive_profile_ladder`].
     Fast128,
     Secure,
 }
@@ -3947,8 +3951,8 @@ pub type BasisWindowFn<'a> = &'a (dyn Fn(&mut [F128], usize) + Sync);
 /// arithmetic and identical output; the only difference is that each task
 /// fills two small L1-resident windows of `b` rather than streaming them from
 /// a `2^m` array — which at `m = 30` removes both the 134 MB materialization
-/// and the 134 MB read of it, and measures FASTER than the read (see
-/// `tests/jit_fold.rs`).
+/// and the 134 MB read of it, and measures FASTER than the read (measured
+/// by the since-deleted `tests/jit_fold.rs` probe, bloat ledger §E).
 ///
 /// `d = 1` is the ordinary adjacent/LSB pairing; `d > 1` is the blocked
 /// pairing used by a lane-major L0 fold.  The same task decomposition covers

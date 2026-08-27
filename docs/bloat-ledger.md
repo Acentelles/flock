@@ -3,8 +3,8 @@
 Status: **CENSUS COMPLETE 2026-08-27**, `main` @ `86d5fd5`. Phase 0 of
 `docs/bloat-reduction-plan.md`. No code was changed to produce this document.
 
-**PHASE 1 EXECUTED 2026-08-27** on branch `bloat-phase1` (six commits,
-−10,175 net lines): fixture re-pins, doc sediment, the §A dead-pub sweep,
+**PHASE 1 EXECUTED 2026-08-27** on branch `bloat-phase1` (nine commits,
++605 / −10,175 lines, **net −9,570**; PR #37): fixture re-pins, doc sediment, the §A dead-pub sweep,
 the §E concluded probes, the §B/§F superseded benches + exclusive src, and
 the genus95 prototypes. Every batch verified (full suite, fmt, clippy
 `-D warnings`); x86 cross-check clean (17 pre-existing x86-only dead-fn
@@ -147,8 +147,9 @@ non-doc references outside its definition.
 **flock-prover**:
 - blake3.rs: `IO_CV1`, `IO_OUT_LO1`, `IO_OUT_HI1` (:255-261),
   `Blake3Setup::generate_witness` (:1664)
-- sha2.rs: the dead `generate_witness` chain (:1169, :1306, :1315 + private
-  `generate_witness_ab`)
+- sha2.rs: the dead `generate_witness` chain (:1169, :1306, :1315).
+  **Correction (PR #37 review):** the private `generate_witness_ab` is LIVE
+  (`sha2.rs:1454`, `:1539`) and was not deleted.
 - merkle_glue.rs: `SWAP_IO_*` ×4 (:230-233) — superseded by
   `SwapTable::io_schema()`
 - merkle_r1cs.rs: `io_leaf`/`io_index`/`io_root` (:607-618; `io_schema()`
@@ -162,7 +163,9 @@ non-doc references outside its definition.
   `merkle_path_common`)
 
 **Pub→private demotions with no line savings** (~95 items across all agents;
-zero risk, do in one sweep): circuit.rs accessors, union.rs internals,
+zero risk, do in one sweep — **DEFERRED, not executed in Phase 1**; only the
+`merkle_path` demotion landed, and it needed the PR #37 re-exports because
+its types appear in `merkle_path_common`'s public signatures): circuit.rs accessors, union.rs internals,
 schedule.rs `Slot`/`MAX_K_LOG`, zerocheck `SPARSE_TAIL_GATE`/`gamma_pow`/
 `Round1Message`/…, sha2's 34 layout constants, blake3's 8, merkle_glue's 7,
 `s_id_eval`, `jagged_bilinear`, `pow_has_leading_zero_bits`, `verify_core_ag`,
@@ -179,10 +182,10 @@ These have zero production callers and no oracle/API role — verified:
 | `zerocheck/univariate_skip_deg4.rs` + `_deg4_optimized.rs` + `ntt/inv_table_deg4.rs` | 1,620 | whole trio reached only from `benches/round1_deg4.rs`; `univariate_skip_deg4*` has no production caller anywhere. RS-flavored but deletable now, with its bench. |
 | `ntt/parallel_f128.rs` — whole module | 365 | only its own tests; the benches/ntt.rs mention is a doc comment about a different crate. |
 | genus95 `round1.rs` superseded kernel prototypes (`bin_abc*` family, `round1_raw`, `round1_lut_packed`, `round1_slp_packed_fused`) | ~846 | superseded by `round1_slp_packed_banks_fused`. **Caveat: the `round1_raw*` pair is the differential oracle for the SLP kernels — keep `round1_raw_packed` + its test, delete the rest.** Keep `_generate_slp_derived` (codegen). |
-| genus95 product-code path (`ProductFunctional`, `product_code_message`, `ProductMessage`, `evaluate_product_functional`) | ~273 | production uses only the 64-coord base path (`lincheck.rs:121`); trims the product arms of `benches/genus95_curve_code.rs`. |
+| genus95 product-code path (`ProductFunctional`, `product_code_message`, `ProductMessage`, `evaluate_product_functional`) | ~273 | production uses only the 64-coord base path (`lincheck.rs:121`); trims the product arms of `benches/genus95_curve_code.rs`. **Phase 1: NOT deleted (PR #37 review) — still present at `evaluator.rs:22,191` / `product.rs:7`; pending Ron's call: delete or defer.** |
 | blake3.rs direct/AG A/B entry cluster (`prove_fast_ag{,_timed}`, `verify_ag`, `prove_fast_union_ag`, `verify_union_ag`, `prove_fast_timed`, `direct_pcs_params`) | ~190 | sole caller `benches/blake3_rs_vs_ag.rs` (itself superseded, §F). Salvage the union+AG arm into `blake3_proof` or `ag_e2e_zerocheck` first. |
-| prover.rs bench-only `*_timed` chain (`prove_fast_ligerito_timed` :1992, `prove_fast_ligerito_ag_timed` :1674, `ProvePhaseTimings` :1973) | ~280 | reached only via the blake3/keccak3 `*_timed` wrappers → benches. |
-| A/B toggle statics + dead arms (`ROUND1_UNFUSED`, `LOOKAHEAD_DISABLE`, `NXT_ZEROFILL`, `DISABLE_FRIENDLY_HORNER` + the unfused segment driver `ag_skip.rs:1389-1439`) | ~150 | consumers are only `ag_round1_ab` + `ag_lookahead_ab` benches; the answers are recorded in `ag_skip.rs:44-56` doc comments and `docs/ag-recursion-plan.md`. |
+| prover.rs bench-only `*_timed` chain (`prove_fast_ligerito_timed` :1992, `prove_fast_ligerito_ag_timed` :1674, `ProvePhaseTimings` :1973) | ~280 | reached only via the blake3/keccak3 `*_timed` wrappers → benches. **Phase 1 removed the blake3 wrapper only; `prove_fast_ligerito_timed` + `ProvePhaseTimings` survive via keccak3 and go with the §2.1 keccak decision.** |
+| A/B toggle statics + dead arms (`ROUND1_UNFUSED`, `LOOKAHEAD_DISABLE`, `NXT_ZEROFILL`, `DISABLE_FRIENDLY_HORNER` + the unfused segment driver `ag_skip.rs:1389-1439`) | ~150 | **Correction (PR #37 review): `LOOKAHEAD_DISABLE` is still flipped by the retained `benches/ag_breakdown.rs:106-116` — not dead, do not delete.** `DISABLE_FRIENDLY_HORNER`, `NXT_ZEROFILL` and `LOOKAHEAD_FRIENDLY` lost their only writers with the `blake3_rs_vs_ag` / `ag_lookahead_ab` deletions and are now unflippable in-tree (recursion-track call: delete them + their `prove_tail` arms, or add a driver bench); the answers are recorded in `ag_skip.rs:44-56` doc comments and `docs/ag-recursion-plan.md`. |
 | `with_blake3_chunk_leaf` + chunk-leaf remnants (merkle_r1cs.rs:459 + `*_chunk` reachability) | ~42 direct | L0-table revert leftover (`4e96d23`); remaining callers are `tests/merkle_glue.rs:129`, `benches/merkle_l0_opening.rs`, `tower.rs:1047` (cfg(test)). Dies with the `merkle_l0_opening` bench; the `*_chunk` witness family (~500 lines, §G cluster 13) follows the Phase 2.2 decision. |
 
 **Test-only-but-keep** (explicitly not Phase 1 targets): `RandomChallenger`
@@ -258,21 +261,54 @@ direct-path surface that can retire independently of the GPU port is:
 deletions. The remaining direct-path consumer after Phase 1+2.1 would be the
 GPU roundtrip alone.
 
-**Directed (Ron, 2026-08-27): consolidate the profile matrix — merge
-`Slim128` into `Slim` and `Fast128` into `Fast`.** The `*128` twins differ
-from their bases only in the per-level rate ladder (+2/level vs +1 — see
-`derive_profile_ladder`); both sides already carry the same strict 128-bit
-Johnson accounting, so the merge means adopting the aggressive ladder as THE
-strict schedule and deleting the twin variants. Touches: the
-`LigeritoProfile` enum + its 5-arm grinding-policy matches (commit.rs ×5,
-repeated per policy), the embedded TOML set (98 configs → ~70;
-`gen_ligerito_configs` regenerates), `TowerConfig::{Chain100,Chain128}`'s
-profile selection, the 128-bit audit doc rows, and
-`docs/recursion-100-128-variants.md`. **Transcript-affecting for strict
-Fast/Slim users** (the query/rate schedule moves): needs a proof-IO version
-note, fixture re-pins, and a Blackwell CI pass. Sequencing: fine any time;
-cheapest bundled with another transcript-moving change so the re-pin cost
-is paid once.
+**Directed (Ron, 2026-08-27): consolidate the profile matrix — delete the
+grind-free `Fast` and `Slim` bases and keep the `*128` schedules as THE
+strict profiles.**
+
+*Premise correction (PR #37 review).* An earlier draft of this item said the
+`*128` twins "differ from their bases only in the per-level rate ladder".
+That is false for Fast. `Fast128` = the aggressive ladder (rate +2/level,
+`derive_profile_ladder`) **plus 16-bit per-level query PoW** (the query term
+targets 112 bits and the PoW supplies the rest, work-normalized:
+`m32_fast128.toml` has `grinding_bits = 16` / `expected_eps_query_bits =
+112.2` at every level where `m32_fast.toml` has `0` / `128.3`) **plus larger
+claim-batch / consistency-batch grinding at the deeper levels** (claim_batch
+7..11 vs 6..8). `Slim` already grinds 16 bits, so on the PoW axis
+`Slim128` vs `Slim` really is ladder-only. The wrong premise came from the
+stale `Fast128` docstring at `ligerito.rs:99` ("no query PoW as Fast"; it
+predates the 2026-08-14 change) — corrected alongside this note. The
+`query_grind` / `query_target_bits` matches at `ligerito.rs:~1795` are the
+authoritative statement of each profile's schedule.
+
+*Decision (Ron, 2026-08-27):* the `*128` schedules survive, PoW included;
+`Fast` and `Slim` go. When executing, record that the enum `Default`
+(`Fast`), the CUDA roundtrip vector dump (`dump_ligerito_f256_vectors.rs`)
+and every byte-pinned fixture move from pure-query 128-bit to
+work-normalized 128-bit (112 query bits + 2^16 hash trials per level), and
+that prover cost gains the per-level grinding; the 128-bit audit rows and
+`docs/recursion-100-128-variants.md` must say the same. *Naming assumption
+(confirm before executing):* the survivor keeps the base name — `Fast128`
+is renamed to `Fast` (serde `fast`, `m*_fast.toml`), likewise `Slim128` →
+`Slim` — so selectors and the `Default` do not move. *Open sub-decision:*
+the `*100` twins. `Fast100`/`Slim100` are documented as "the base with only
+the query target changed" and as the fixed historical cost points the
+chain100 envelope was iterated against; after the merge that invariant
+breaks in three dimensions (ladder, PoW, target). Recommendation: leave
+them at their historical schedules and retire the invariant wording rather
+than re-derive them.
+
+Touches (count corrected by the review): the `LigeritoProfile` enum + its
+grinding-policy matches (commit.rs ×6; ligerito.rs ~12 sites including the
+`query_grind` / `query_target_bits` matches; `merkle_path.rs:127
+MerklePathGrinding::for_profile`; `examples/gen_ligerito_configs.rs`), the
+embedded TOML set (98 configs → ~70; `gen_ligerito_configs` regenerates),
+`TowerConfig::{Chain100,Chain128}`'s profile selection, the 128-bit audit
+doc rows, and `docs/recursion-100-128-variants.md`. **Transcript-affecting
+for strict Fast/Slim users** (the query/rate/PoW schedule moves): needs a
+proof-IO version note, fixture re-pins (`union_m6_fixtures`,
+`union_element`, `transcript_shape` — all three run by default since PR
+#37), and a Blackwell CI pass. Sequencing: fine any time; cheapest bundled
+with another transcript-moving change so the re-pin cost is paid once.
 
 **Also gated (new finding):** the standalone (non-union) element PIOP
 (`element_r1cs::prove/verify` + `ElementProof`/`ElementClaim`/
@@ -308,10 +344,19 @@ Total: **~10,000 lines**, concentrated as follows.
 1. `tests/union_element.rs:1307` `mixed_class_merged_proof_bytes_pinned` — 7
    hex pins from `f0996e6` (08-13); `700cace` (08-19, per-level grinding
    off-by-one) re-pinned `union_m6_fixtures` but never this file. Re-pin +
-   history line.
+   history line. **Done in Phase 1. Provenance (PR #37 review, measured by
+   building `700cace~1`): the two element-only pins that moved did so under
+   `700cace` alone (`nu12-0` held throughout); `mix-100-90` / `mix-100-0`
+   had already reached their new values on 08-14 (`176c869`, blake3
+   Option F) and `700cace` left them; `mix-128-128` / `mix-0-90` moved
+   under both. Runs by default and verifies each fixture since PR #37.**
 2. `tests/transcript_shape.rs:265` `element_only_transcript_shape_is_pinned` —
    digest last re-pinned 08-05; `700cace` changed per-level `Pow{bits}`.
-   Re-pin via `TRANSCRIPT_SHAPE_PRINT=1`.
+   Re-pin via `TRANSCRIPT_SHAPE_PRINT=1`. **Done in Phase 1. Provenance
+   (PR #37 review): at `700cace~1` the digest was already a third value
+   (`c99198b9…`), so the shape moved at least twice since 08-05 — the 08-11
+   assist-transcript fork (`4787509`) and then `700cace`. Runs by default
+   since PR #37.**
 
 **Stale memory-ledger rows resolved:** the 15 `circuit_merkle` tests @
 `59525a4` — the file was *renamed* into `src/tower.rs` (`c1cdb1b`), the mvp
