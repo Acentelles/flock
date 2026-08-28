@@ -45,7 +45,7 @@ pub(super) struct Lvl {
     /// The tree's layers from the cap upward, folded natively by
     /// `level_geometry`: entry `i` is the depth-`(c − i)` layer, entry 0
     /// the cap itself — [`Self::full_path`]'s sibling sources.
-    pub(super) cap_layers: Vec<Vec<[u8; 32]>>,
+    cap_layers: Vec<Vec<[u8; 32]>>,
 }
 
 /// Map actual sumcheck-fold order back to the transcript point's natural

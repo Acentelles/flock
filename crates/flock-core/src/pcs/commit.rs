@@ -14,6 +14,8 @@
 //! The codeword is a flat sequence of `2^k_code` F_{2^128} elements. Each
 //! Merkle leaf is **one** F_{2^128} element = 16 bytes.
 
+use rayon::prelude::*;
+
 use crate::field::F128;
 use crate::merkle::{self, Hash, HashKind};
 use crate::ntt::AdditiveNttF128;
@@ -440,8 +442,6 @@ pub fn dense_lanes(dense_words: usize, log_batch_size: usize, log_dim: usize) ->
 /// words, which stays in L2), so it runs at near-memcpy speed despite the
 /// strided writes.
 pub fn lane_grid_from_lane_major(q: &[F128], log_batch_size: usize) -> Vec<F128> {
-    use rayon::prelude::*;
-
     let lanes = 1usize << log_batch_size;
     assert!(q.len().is_multiple_of(lanes), "dense stack must fill lanes");
     let d = q.len() >> log_batch_size;
@@ -514,8 +514,6 @@ pub fn commit_lane_major(q: &[F128], params: &PcsParams) -> (Commitment, ProverD
 /// q[l·D + p]`. Cache-blocked over position tiles (see
 /// [`lane_grid_from_lane_major`]).
 fn replicate_lane_major_fill(codeword: &mut [F128], q: &[F128], t: usize, d: usize) {
-    use rayon::prelude::*;
-
     let msg_len = t * d;
     debug_assert!(codeword.len().is_multiple_of(msg_len));
     const TILE: usize = 64; // positions per tile
@@ -541,7 +539,6 @@ fn replicate_lane_major_fill(codeword: &mut [F128], q: &[F128], t: usize, d: usi
 /// `forward_transform_interleaved_from_layer(…, r)`. Every slot of `codeword`
 /// is written (input contents may be stale/uninit).
 pub(crate) fn replicate_message_fill(codeword: &mut [F128], msg: &[F128]) {
-    use rayon::prelude::*;
     let msg_len = msg.len();
     debug_assert!(codeword.len().is_multiple_of(msg_len));
     const COPY_CHUNK: usize = 1 << 16;

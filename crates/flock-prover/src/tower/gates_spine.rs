@@ -1,4 +1,6 @@
 use super::*;
+use flock_core::element_r1cs::ElementTableBuilder;
+use flock_core::schedule::IoWord;
 
 /// The sumcheck-spine gate: one fold-and-eval step of the verifier's running
 /// quadratic, `RoundQuad` in circuit form (char-2, so `u1 = t + u0` is the
@@ -20,7 +22,6 @@ pub(super) const SP_K: usize = 21;
 
 impl SpineGate {
     pub(super) fn new() -> Self {
-        use flock_core::element_r1cs::ElementTableBuilder;
         let one = F128::ONE;
         let (c, b, a, tr, u0, u2, y, beta, r) = (0, 1, 2, 3, 4, 5, 6, 7, 8);
         let (pc, pb, pa, pt, co, bo, ao, tro, r2, m1, m2, to) =
@@ -52,7 +53,6 @@ impl GateType for SpineGate {
     type Hint = ();
 
     fn table(&self) -> TableType {
-        use flock_core::schedule::IoWord;
         let mut schema: Vec<IoWord> = (0..SP_IN).map(IoWord::input).collect();
         for o in [13, 14, 15, 16, 20] {
             schema.push(IoWord::output(o));
@@ -104,7 +104,6 @@ pub(super) const SP256_K: usize = 50;
 
 impl SpineGate256 {
     pub(super) fn new() -> Self {
-        use flock_core::element_r1cs::ElementTableBuilder;
         let one = F128::ONE;
         let pair = |at| [at, at + 1];
         let (c, qb, qa, tr, u0, u2, y, beta, r) = (
@@ -158,7 +157,6 @@ impl GateType for SpineGate256 {
     type Hint = ();
 
     fn table(&self) -> TableType {
-        use flock_core::schedule::IoWord;
         let mut schema: Vec<IoWord> = (0..SP256_IN).map(IoWord::input).collect();
         for o in [25, 26, 27, 28, 29, 30, 31, 32, 48, 49] {
             schema.push(IoWord::output(o));
@@ -297,7 +295,6 @@ impl ResidualWeightsGate256 {
     pub(super) const N_WEIGHTS: usize = 19;
 
     pub(super) fn new() -> Self {
-        use flock_core::element_r1cs::ElementTableBuilder;
         let o = F128::ONE;
         let sks = sk_at_vks(Self::N_WEIGHTS);
         let coeffs: Vec<F128> = (0..Self::N_WEIGHTS - 1)
@@ -327,7 +324,6 @@ impl GateType for ResidualWeightsGate256 {
     type Hint = ();
 
     fn table(&self) -> TableType {
-        use flock_core::schedule::IoWord;
         let mut schema = vec![IoWord::input(0), IoWord::input(1)];
         schema.extend((2..2 + self.coeffs.len()).map(IoWord::output));
         TableType::element(self.ty.clone()).with_io_schema(schema)
@@ -364,12 +360,11 @@ impl GateType for ResidualWeightsGate256 {
 /// `P' = P product_i (1 + R_i (1 + W_i))`, for `i=0,1,2`.
 pub(super) struct ResidualPrefix3Gate256 {
     pub(super) ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
-    pub(super) out: [usize; 2],
+    out: [usize; 2],
 }
 
 impl ResidualPrefix3Gate256 {
     pub(super) fn new() -> Self {
-        use flock_core::element_r1cs::ElementTableBuilder;
         let o = F128::ONE;
         let nr = flock_core::field::QUADRATIC_NONRESIDUE;
         // in: prefix pair, three challenge pairs, three base weights, one.
@@ -412,7 +407,6 @@ impl GateType for ResidualPrefix3Gate256 {
     type Hint = ();
 
     fn table(&self) -> TableType {
-        use flock_core::schedule::IoWord;
         let mut schema: Vec<IoWord> = (0..12).map(IoWord::input).collect();
         schema.push(IoWord::output(self.out[0]));
         schema.push(IoWord::output(self.out[1]));
@@ -459,12 +453,11 @@ impl GateType for ResidualPrefix3Gate256 {
 /// `acc_y' = acc_y + aw * prefix * product_{j:y_j=1} W_j`.
 pub(super) struct ResidualAccGate256 {
     pub(super) ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
-    pub(super) acc_out: [[usize; 2]; 8],
+    acc_out: [[usize; 2]; 8],
 }
 
 impl ResidualAccGate256 {
     pub(super) fn new() -> Self {
-        use flock_core::element_r1cs::ElementTableBuilder;
         let o = F128::ONE;
         // in: aw, prefix pair, three low weights, eight accumulator pairs.
         let (n_in, acc0) = (22usize, 6usize);
@@ -516,7 +509,6 @@ impl GateType for ResidualAccGate256 {
     type Hint = ();
 
     fn table(&self) -> TableType {
-        use flock_core::schedule::IoWord;
         let mut schema: Vec<IoWord> = (0..22).map(IoWord::input).collect();
         for out in self.acc_out {
             schema.push(IoWord::output(out[0]));
@@ -640,7 +632,6 @@ pub(super) struct PrefixGate {
 
 impl PrefixGate {
     pub(super) fn new(pl: usize) -> Self {
-        use flock_core::element_r1cs::ElementTableBuilder;
         let o = F128::ONE;
         let n_in = 2 + 2 * pl; // seed, a[pl], b[pl], one
         let one = n_in - 1;
@@ -673,7 +664,6 @@ impl GateType for PrefixGate {
     type Row = Vec<F128>;
     type Hint = ();
     fn table(&self) -> TableType {
-        use flock_core::schedule::IoWord;
         let mut schema: Vec<IoWord> = (0..self.n_in).map(IoWord::input).collect();
         schema.push(IoWord::output(self.k - 1));
         TableType::element(self.ty.clone()).with_io_schema(schema)
@@ -710,13 +700,12 @@ pub(super) struct PrefixGate256 {
     pub(super) ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
     pub(super) pl: usize,
     pub(super) n_in: usize,
-    pub(super) out: [usize; 2],
+    out: [usize; 2],
     pub(super) k: usize,
 }
 
 impl PrefixGate256 {
     pub(super) fn new(pl: usize) -> Self {
-        use flock_core::element_r1cs::ElementTableBuilder;
         let o = F128::ONE;
         let n_in = 4 + 4 * pl; // seed pair, a pairs, b pairs, one, zero
         let one = n_in - 2;
@@ -767,7 +756,6 @@ impl GateType for PrefixGate256 {
     type Hint = ();
 
     fn table(&self) -> TableType {
-        use flock_core::schedule::IoWord;
         let mut schema: Vec<IoWord> = (0..self.n_in).map(IoWord::input).collect();
         schema.push(IoWord::output(self.out[0]));
         schema.push(IoWord::output(self.out[1]));
@@ -819,7 +807,6 @@ pub(super) struct MergedRoundGate {
 
 impl MergedRoundGate {
     pub(super) fn new() -> Self {
-        use flock_core::element_r1cs::ElementTableBuilder;
         let o = F128::ONE;
         // in: t(0), g1(1), gi(2), r(3)
         let mut b = ElementTableBuilder::new(4);
@@ -840,7 +827,6 @@ impl GateType for MergedRoundGate {
     type Row = Vec<F128>;
     type Hint = ();
     fn table(&self) -> TableType {
-        use flock_core::schedule::IoWord;
         let mut schema: Vec<IoWord> = (0..4).map(IoWord::input).collect();
         schema.push(IoWord::output(7));
         TableType::element(self.ty.clone()).with_io_schema(schema)
@@ -875,7 +861,6 @@ pub(super) struct MacGate {
 
 impl MacGate {
     pub(super) fn new() -> Self {
-        use flock_core::element_r1cs::ElementTableBuilder;
         let o = F128::ONE;
         // in: acc(0), x(1), y(2)
         let mut b = ElementTableBuilder::new(3);
@@ -894,7 +879,6 @@ impl GateType for MacGate {
     type Row = Vec<F128>;
     type Hint = ();
     fn table(&self) -> TableType {
-        use flock_core::schedule::IoWord;
         let mut schema: Vec<IoWord> = (0..3).map(IoWord::input).collect();
         schema.push(IoWord::output(4));
         TableType::element(self.ty.clone()).with_io_schema(schema)
@@ -925,7 +909,6 @@ pub(super) struct MacGate256 {
 
 impl MacGate256 {
     pub(super) fn new() -> Self {
-        use flock_core::element_r1cs::ElementTableBuilder;
         let mut b = ElementTableBuilder::new(4);
         for w in 0..6 {
             b.free_wire(w);
@@ -942,7 +925,6 @@ impl GateType for MacGate256 {
     type Hint = ();
 
     fn table(&self) -> TableType {
-        use flock_core::schedule::IoWord;
         let mut schema: Vec<IoWord> = (0..6).map(IoWord::input).collect();
         schema.push(IoWord::output(9));
         schema.push(IoWord::output(10));
@@ -1000,7 +982,6 @@ pub(super) const AL_OUT0: usize = 49;
 
 impl AssistLayerGate {
     pub(super) fn new() -> Self {
-        use flock_core::element_r1cs::ElementTableBuilder;
         let one = F128::ONE;
         let sparse = flock_core::pcs::jagged::assist_sparse_transitions();
         let mut b = ElementTableBuilder::new(6);
@@ -1049,7 +1030,6 @@ impl GateType for AssistLayerGate {
     type Row = Vec<F128>;
     type Hint = ();
     fn table(&self) -> TableType {
-        use flock_core::schedule::IoWord;
         let mut schema: Vec<IoWord> = (0..AL_IN).map(IoWord::input).collect();
         for s in 0..4 {
             schema.push(IoWord::output(AL_OUT0 + s));
@@ -1115,7 +1095,6 @@ pub(super) struct ZcRoundGate {
 
 impl ZcRoundGate {
     pub(super) fn new() -> Self {
-        use flock_core::element_r1cs::ElementTableBuilder;
         let o = F128::ONE;
         // in: running(0) g1(1) gi(2) t(3) rho(4) g0(5) one(6)
         let mut b = ElementTableBuilder::new(4);
@@ -1140,7 +1119,6 @@ impl GateType for ZcRoundGate {
     type Row = Vec<F128>;
     type Hint = ();
     fn table(&self) -> TableType {
-        use flock_core::schedule::IoWord;
         let mut schema: Vec<IoWord> = (0..7).map(IoWord::input).collect();
         schema.push(IoWord::output(9));
         schema.push(IoWord::output(14));

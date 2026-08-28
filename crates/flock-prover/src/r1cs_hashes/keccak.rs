@@ -62,6 +62,8 @@
 //! the slow `prove` path will report "everything satisfied vacuously" for
 //! this encoding — only use `prove_fast`.
 
+use rayon::prelude::*;
+
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 use flock_core::lincheck::LincheckCircuit;
@@ -1235,8 +1237,6 @@ pub fn generate_witness_batch_major(
     initial_states: &[State],
     n_keccaks_log: usize,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
-    use rayon::prelude::*;
-
     let n_total = 1usize << n_keccaks_log;
     assert!(initial_states.len() <= n_total);
     assert!(n_total >= BM_V, "batch-major needs n_total >= 8");

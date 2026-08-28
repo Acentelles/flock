@@ -41,6 +41,8 @@
 //! FRI fold processes layers in **reverse** (deepest first), at which level
 //! pairs are adjacent — matching the standard `fold_pair` formula in DP24.
 
+use rayon::prelude::*;
+
 use crate::field::F128;
 
 mod kernels;
@@ -927,7 +929,6 @@ fn butterfly_interleaved_block_par_rows(
     num_ntts: usize,
     live: usize,
 ) {
-    use rayon::prelude::*;
     const PARALLEL_ROW_THRESHOLD: usize = 512;
     if block_size_half < PARALLEL_ROW_THRESHOLD {
         butterfly_interleaved_block(block, twiddle, block_size_half, num_ntts, live);
@@ -968,7 +969,6 @@ fn butterfly_interleaved_fused_3layer_par_rows(
     num_ntts: usize,
     live: usize,
 ) {
-    use rayon::prelude::*;
     const PARALLEL_ROW_THRESHOLD: usize = 256;
     let stride = eighth * num_ntts;
     debug_assert_eq!(block.len(), 8 * stride);
@@ -1125,7 +1125,6 @@ fn butterfly_interleaved_fused_2layer_par_rows(
     num_ntts: usize,
     live: usize,
 ) {
-    use rayon::prelude::*;
     const PARALLEL_ROW_THRESHOLD: usize = 256;
     let stride = quarter * num_ntts;
     debug_assert_eq!(block.len(), 4 * stride);
@@ -1270,7 +1269,6 @@ fn butterfly_interleaved_fused_4layer_par_rows(
     sixteenth: usize,
     num_ntts: usize,
 ) {
-    use rayon::prelude::*;
     const PARALLEL_ROW_THRESHOLD: usize = 256;
     debug_assert_eq!(block.len(), 16 * sixteenth * num_ntts);
     // Carry the base as `usize` (Send+Sync) so rayon's per-`r` closure can hold

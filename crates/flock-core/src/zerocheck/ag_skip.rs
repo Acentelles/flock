@@ -16,6 +16,8 @@
 //!     [`crate::challenger::FsChallenger`] is SHA-256), so no second
 //!     cryptographic primitive enters the soundness argument.
 
+use rayon::prelude::*;
+
 use super::multilinear::{
     LiveLayout, expand_to_dense, fold_and_compute_round_pair_into, fold_and_round_pair_sparse_into,
     fold_in_place_pair, fold1_lookahead_into, fold2_lookahead_into, lookahead_msg_first,
@@ -215,7 +217,6 @@ pub(super) fn byte_dot_u64(v: u64, table: &[[F128; 256]]) -> F128 {
 /// order is skip = low 6 bits, rest = high, so rest position `r`'s 64-bit message
 /// is the 8 bytes at offset `r*8`. Parallel byte-dot.
 pub fn fold_witness_at_r1(packed: &[u8], w: &[F128]) -> Vec<F128> {
-    use rayon::prelude::*;
     assert_eq!(
         packed.len() % 8,
         0,
@@ -263,7 +264,6 @@ pub fn fold_and_first_round(
     w: &[F128],
     r_rest: &[F128],
 ) -> (Vec<F128>, Vec<F128>, F128, F128) {
-    use rayon::prelude::*;
     assert_eq!(a_packed.len(), b_packed.len());
     debug_assert_eq!(
         &r_rest[1..N_INNER],
@@ -354,7 +354,6 @@ pub fn fold_and_first_round_padded(
     r_rest: &[F128],
     coverage: &[super::BlockCoverage],
 ) -> (Vec<F128>, Vec<F128>, F128, F128) {
-    use rayon::prelude::*;
     assert_eq!(a_packed.len(), b_packed.len());
     debug_assert_eq!(
         &r_rest[1..N_INNER],
@@ -425,7 +424,6 @@ pub fn fold_and_first_round_sparse(
     r_rest: &[F128],
     coverage: &[super::BlockCoverage],
 ) -> (Vec<F128>, Vec<F128>, F128, F128, LiveLayout) {
-    use rayon::prelude::*;
     assert_eq!(a_packed.len(), b_packed.len());
     debug_assert_eq!(
         &r_rest[1..N_INNER],
@@ -556,7 +554,6 @@ fn fold_and_friendly_round_pair_into<const SHIFT: u32>(
     eq_outer_hi: &[F128],
     c_inv: F128,
 ) -> (F128, F128) {
-    use rayon::prelude::*;
     let half = a.len() / 2;
     debug_assert_eq!(a_out.len(), half);
     debug_assert_eq!(b_out.len(), half);

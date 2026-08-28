@@ -13,6 +13,8 @@
 //! systematic "value" coordinates are the raw witness product; the verifier
 //! reconstructs them from the zerocheck identity, so they are not emitted here.
 
+use rayon::prelude::*;
+
 use crate::field::{F128, F256Unreduced};
 use std::arch::aarch64::*;
 use std::sync::OnceLock;
@@ -462,7 +464,6 @@ pub fn round1_slp_packed(
     eq: &[F128],
 ) -> ([F128; 160], [F128; 64]) {
     crate::suboptimal_path!("unfused SLP round-1", "round1_slp_packed_banks_fused");
-    use rayon::prelude::*;
     let n = a_packed.len() / 1024;
     assert_eq!(eq.len(), n, "one eq weight per block");
     let nthreads = rayon::current_num_threads().max(1);
@@ -683,7 +684,6 @@ pub fn round1_slp_packed_banks(
     eq: &[F128],
 ) -> ([F128; 160], [F128; 64], [F128; 64]) {
     crate::suboptimal_path!("unfused banks round-1", "round1_slp_packed_banks_fused");
-    use rayon::prelude::*;
     let n = a_packed.len() / 1024;
     assert_eq!(eq.len(), n, "one eq weight per block");
     let nthreads = rayon::current_num_threads().max(1);
@@ -844,7 +844,6 @@ pub fn round1_slp_packed_banks_fused(
     c_packed: &[u8],
     eq: &[F128],
 ) -> ([F128; 160], [F128; 64], [F128; 64]) {
-    use rayon::prelude::*;
     let n = a_packed.len() / 1024;
     assert_eq!(eq.len(), n, "one eq weight per block");
     let nthreads = rayon::current_num_threads().max(1);
@@ -962,7 +961,6 @@ pub fn round1_slp_packed_banks_fused_padded(
     coverage: &[crate::zerocheck::BlockCoverage],
 ) -> ([F128; 160], [F128; 64], [F128; 64]) {
     use crate::zerocheck::BlockCoverage;
-    use rayon::prelude::*;
     let n = a_packed.len() / 1024;
     assert_eq!(eq.len(), n, "one eq weight per block");
     assert_eq!(coverage.len(), n, "one coverage entry per block");

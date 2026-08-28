@@ -39,6 +39,8 @@
 //!   with `state_r` implicit via the φ substitution.
 //! - Padding: empty A, B.
 
+use rayon::prelude::*;
+
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 use flock_core::lincheck::LincheckCircuit;
@@ -320,7 +322,6 @@ fn accumulate_subkeccak(i: usize, alpha: F128, eq_inner: &[F128], comb: &mut [F1
     // Rounds are independent (each writes only chi_*[r]); F128 addition is
     // XOR (exactly associative/commutative), so the parallel reduction is
     // bit-identical to the serial loop.
-    use rayon::prelude::*;
     let chi: Vec<(Vec<F128>, Vec<F128>, F128)> = (0..N_T)
         .into_par_iter()
         .map(|r| {

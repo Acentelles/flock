@@ -1,4 +1,6 @@
 use super::*;
+use flock_core::element_r1cs::ElementTableBuilder;
+use flock_core::schedule::IoWord;
 
 // ---------------------------------------------------------------------------
 // MVP-3b: the leaf arithmetic
@@ -47,7 +49,7 @@ use super::*;
 /// this is the MVP.
 pub(super) struct LeafEvalGate {
     pub(super) ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
-    pub(super) lay: LeafLayout,
+    lay: LeafLayout,
 }
 
 /// The column layout of a [`LeafEvalGate`] over `lanes` leaf words.
@@ -59,7 +61,7 @@ pub(super) struct LeafEvalGate {
 #[derive(Clone, Copy)]
 pub(super) struct LeafLayout {
     pub(super) lanes: usize,
-    pub(super) vars: usize,
+    vars: usize,
     pub(super) v: usize,
     pub(super) alpha: usize,
     pub(super) prev: usize,
@@ -117,7 +119,6 @@ impl LeafLayout {
 
 impl LeafEvalGate {
     pub(super) fn new(lanes: usize) -> Self {
-        use flock_core::element_r1cs::ElementTableBuilder;
         let one = F128::ONE;
         let lay = LeafLayout::new(lanes);
         let mut b = ElementTableBuilder::new(lay.kappa);
@@ -147,7 +148,6 @@ impl GateType for LeafEvalGate {
     type Hint = ();
 
     fn table(&self) -> TableType {
-        use flock_core::schedule::IoWord;
         let mut schema: Vec<IoWord> = (0..self.lay.n_in).map(IoWord::input).collect();
         schema.push(IoWord::output(self.lay.acc));
         TableType::element(self.ty.clone()).with_io_schema(schema)
@@ -195,13 +195,13 @@ impl GateType for LeafEvalGate {
 /// already contain adjacent `(c0, c1)` words.
 pub(super) struct LeafEvalGate256 {
     pub(super) ty: std::sync::Arc<flock_core::element_r1cs::ElementTableType>,
-    pub(super) lay: LeafLayout256,
+    lay: LeafLayout256,
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct LeafLayout256 {
     pub(super) lanes: usize,
-    pub(super) vars: usize,
+    vars: usize,
     pub(super) v: usize,
     pub(super) alpha: usize,
     pub(super) prev: usize,
@@ -293,7 +293,6 @@ pub(super) fn eval_mac256(add: F256, a: F256, b: F256) -> F256 {
 
 impl LeafEvalGate256 {
     pub(super) fn new(lanes: usize) -> Self {
-        use flock_core::element_r1cs::ElementTableBuilder;
         let one = F128::ONE;
         let lay = LeafLayout256::new(lanes);
         let mut b = ElementTableBuilder::new(lay.kappa);
@@ -350,7 +349,6 @@ impl GateType for LeafEvalGate256 {
     type Hint = ();
 
     fn table(&self) -> TableType {
-        use flock_core::schedule::IoWord;
         let mut schema: Vec<IoWord> = (0..self.lay.n_in).map(IoWord::input).collect();
         schema.push(IoWord::output(self.lay.acc));
         schema.push(IoWord::output(self.lay.acc + 1));

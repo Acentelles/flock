@@ -17,6 +17,8 @@
 //! the m = 29 prove set). Call [`clear`] to release everything to the OS,
 //! e.g. after the last prove of a batch.
 
+use rayon::prelude::*;
+
 use crate::field::F128;
 use std::sync::Mutex;
 
@@ -252,7 +254,6 @@ pub fn take_zeroed_f128(n: usize) -> Vec<F128> {
 /// those, borrow-checked), and `copy_live_region` writes exactly the live
 /// spans its give-back re-zeros. Debug builds verify the invariant outright.
 pub fn give_zeroed_f128(mut v: Vec<F128>, dirty: &[core::ops::Range<usize>]) {
-    use rayon::prelude::*;
     if v.capacity() == 0 {
         return;
     }
@@ -387,7 +388,6 @@ const PREWARM_BUDGET_BYTES: usize = 8 << 30;
 /// would still be handed out by `take` and fault during the prove, which is
 /// exactly the cost this is trying to place off the prove path.
 fn prewarm_sets(sets: &[(usize, usize, usize)]) {
-    use rayon::prelude::*;
     let mut bufs: Vec<Vec<F128>> = Vec::new();
     let mut budget = PREWARM_BUDGET_BYTES;
     let w = core::mem::size_of::<F128>();

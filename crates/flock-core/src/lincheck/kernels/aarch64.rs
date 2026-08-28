@@ -1,3 +1,5 @@
+use rayon::prelude::*;
+
 use super::super::{F128, build_sum_table};
 
 const NEON_TILE_T: usize = 8;
@@ -31,7 +33,6 @@ pub fn partial_fold_packed_z_neon_single_padded(
     useful_bits: usize,
     eq_outer: &[F128],
 ) -> Vec<F128> {
-    use rayon::prelude::*;
     use std::arch::aarch64::*;
 
     const TILE_T: usize = NEON_TILE_T;
@@ -208,8 +209,6 @@ pub fn partial_fold_packed_z_neon_iblock_padded(
     useful_bits: usize,
     eq_outer: &[F128],
 ) -> Vec<F128> {
-    use rayon::prelude::*;
-
     const TILE_T: usize = NEON_TILE_T;
     const BLOCK_K: usize = 8;
 
@@ -322,8 +321,6 @@ pub fn partial_fold_packed_z_neon_oblock_padded(
     useful_bits: usize,
     eq_outer: &[F128],
 ) -> Vec<F128> {
-    use rayon::prelude::*;
-
     const TILE_T: usize = NEON_TILE_T;
     const BLOCK_K: usize = 8;
 
@@ -424,7 +421,6 @@ pub fn partial_fold_packed_z_neon_allcore_padded(
     useful_bits: usize,
     eq_outer: &[F128],
 ) -> Vec<F128> {
-    use rayon::prelude::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const TILE_T: usize = NEON_TILE_T;

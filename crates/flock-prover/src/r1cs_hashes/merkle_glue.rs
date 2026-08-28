@@ -42,6 +42,8 @@
 //! swap, whose output feeds the compression, whose output chains to the root.
 //! Same treatment the composite gives it, same reason.
 
+use rayon::prelude::*;
+
 use flock_core::field::F128;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
 use flock_core::schedule::IoWord;
@@ -104,7 +106,6 @@ fn scatter_zab(
         }
     }
 
-    use rayon::prelude::*;
     let mut stripe = vec![0u8; (n_total / 8) * k];
     stripe.par_chunks_mut(k).enumerate().for_each(|(g, chunk)| {
         for r in 0..8 {
@@ -136,7 +137,6 @@ pub(crate) fn scatter_zab_into(
     useful_bits: usize,
     dst: flock_core::union::SlotWitnessDest<'_>,
 ) -> Vec<u8> {
-    use rayon::prelude::*;
     let words_per_block = k / 128;
     let flock_core::union::SlotWitnessDest {
         z,

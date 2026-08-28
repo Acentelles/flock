@@ -33,6 +33,8 @@
 //! Verifier reconstructs `G(0)` from the running claim via
 //! `current_claim = (1+r_now)·G(0) + r_now·G(1)`.
 
+use rayon::prelude::*;
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -828,8 +830,6 @@ fn fold_and_round_pair_kernel<D>(
 where
     D: Fn(usize) -> bool + Sync,
 {
-    use rayon::prelude::*;
-
     assert_eq!(
         k_skip, 6,
         "optimized fold-and-round_pair variant is k_skip=6 only"
@@ -1189,8 +1189,6 @@ pub fn fold_and_compute_round_pair_into(
     r_fold: F128,
     r_next: &[F128],
 ) -> (F128, F128) {
-    use rayon::prelude::*;
-
     let n = a.len();
     assert_eq!(b.len(), n);
     assert!(n.is_power_of_two() && n >= 8);
@@ -1594,7 +1592,6 @@ pub fn fold_and_round_pair_sparse_into(
         }
     }
 
-    use rayon::prelude::*;
     let (sum1, sum_inf) = work
         .into_par_iter()
         .map(|(task_pieces, a_task, b_task)| {

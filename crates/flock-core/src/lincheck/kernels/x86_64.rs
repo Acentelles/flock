@@ -1,3 +1,5 @@
+use rayon::prelude::*;
+
 use super::super::{F128, build_sum_table};
 
 /// x86 single-matrix inner kernel — SSE2 mirror of
@@ -77,8 +79,6 @@ pub fn partial_fold_packed_z_x86_tiled_padded(
     useful_bits: usize,
     eq_outer: &[F128],
 ) -> Vec<F128> {
-    use rayon::prelude::*;
-
     const TILE_T: usize = 8;
     const BLOCK_K: usize = 8;
 

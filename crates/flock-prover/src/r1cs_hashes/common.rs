@@ -2,6 +2,8 @@
 //! modules (`sha2`, `blake3`, `keccak`). The shared `prove_fast`
 //! orchestration lives in [`crate::prover::prove_fast_ligerito_union`].
 
+use rayon::prelude::*;
+
 use std::sync::OnceLock;
 
 use flock_core::bits::transpose_8_u64s_to_64_bytes;
@@ -341,8 +343,6 @@ pub(crate) fn drive_witness_packed_and_lincheck<S: Sync, F>(
 where
     F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
 {
-    use rayon::prelude::*;
-
     let k = 1usize << k_log;
     let f128_per_block = k / 128;
     let u64_per_block = k / 64;
@@ -709,8 +709,6 @@ pub(crate) fn drive_witness_batch_major_into<S: Sync, F>(
 where
     F: Fn([&S; BM_V], &mut [BmRow], &mut [BmRow], &mut [BmRow]) + Sync + Send,
 {
-    use rayon::prelude::*;
-
     let n_total = 1usize << n_blocks_log;
     assert!(inputs.len() <= n_total);
     assert!(n_total >= BM_V);
@@ -848,8 +846,6 @@ pub(crate) fn drive_witness_batch_major_partial_into<S: Sync, F>(
 where
     F: Fn([&S; BM_V], &mut [BmRow], &mut [BmRow], &mut [BmRow]) + Sync + Send,
 {
-    use rayon::prelude::*;
-
     let n_total = 1usize << n_blocks_log;
     let n_declared = inputs.len();
     assert!(n_declared <= n_total);

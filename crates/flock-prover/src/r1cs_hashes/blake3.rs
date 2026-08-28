@@ -104,6 +104,8 @@
 //!   are "free" witness bits. PCS-level openings at fixed indices will
 //!   eventually pin them to claimed public inputs.
 
+use rayon::prelude::*;
+
 use super::common::{
     BitRecord, add_carry_parts, fused_add3_parts, or_bit_at, or_u32_at_bit, xor_dedup,
 };
@@ -1235,7 +1237,6 @@ pub type Compression = ([u32; 8], [u32; 16], u64, u32, u32);
 /// compressions, padded to `2^n_blocks_log` slots. Padding blocks are
 /// all-zero (trivially satisfy the R1CS). Parallel across instances via rayon.
 pub fn generate_witness(blocks: &[Compression], n_blocks_log: usize) -> Vec<bool> {
-    use rayon::prelude::*;
     let n_total = 1usize << n_blocks_log;
     let n_blocks = blocks.len();
     assert!(
@@ -1460,7 +1461,6 @@ pub fn generate_witness_with_ab_packed(
     Vec<flock_core::field::F128>,
 ) {
     use flock_core::field::F128;
-    use rayon::prelude::*;
     let n_total = 1usize << n_blocks_log;
     let n_blocks = blocks.len();
     assert!(

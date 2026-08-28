@@ -18,6 +18,8 @@
 //! [`super::univariate_skip_optimized`] drops a constant F₈ factor
 //! `C_s = φ₈(0x1C)` from the eq-on-S weights; this one keeps it.
 
+use rayon::prelude::*;
+
 use crate::field::{F8, F128, mul_by_x, phi8};
 use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 
@@ -126,7 +128,6 @@ pub fn round1_naive(
 
 /// Pack a bit vector LSB-first into bytes.
 pub fn pack_bits(bits: &[bool]) -> Vec<u8> {
-    use rayon::prelude::*;
     let n_bytes = bits.len().div_ceil(8);
     let mut out = vec![0u8; n_bytes];
     // Each output byte depends on 8 contiguous input bits — disjoint, so
