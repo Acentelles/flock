@@ -1,24 +1,16 @@
 //! Multi-table registry and slot schedule.
 //!
-//! Pure data types for the multi-table design (`docs/multi-table-design.tex`):
-//! a [`Registry`] fixes, once, an ordered list of [`TableType`]s (one per hash
-//! type) and ONE uniform row capacity `2^nu`; from those it derives the static
-//! slot layout — each type's capacity-sized slot placed in one address space
-//! of `2^M` points, aligned so every slot is a subcube selected by freezing a
-//! prefix of the top address bits (design doc, Lemma "Alignment"). An
-//! [`Instance`] adds the per-proof declared counts `n_t` and derives the
-//! run-list [`PaddingSpec`] the zerocheck kernels consume.
+//! A [`Registry`] fixes table types and a uniform row capacity `2^nu`.
+//! Each slot is an aligned subcube in one address space of `2^M` points.
+//! An [`Instance`] adds row counts and derives the zerocheck [`PaddingSpec`].
 //!
 //! Types carry a [`TableClass`]: `Boolean` (the bit-level hash relations) or
 //! `LargeField` (the element relation of [`crate::element_r1cs`]). The
 //! scheduler is class-blind — an element type presents `k_log = kappa + 7`
 //! and `useful_bits = k·128`, so all the slot arithmetic below is shared —
-//! but the LAYOUT is class-major, giving each class its own disjoint aligned
-//! subcube so each class's PIOP can run over its own region only (see
+//! The class-major layout gives each class a disjoint aligned subcube. Each
+//! class PIOP runs only over its region (see
 //! [`Registry::new`]).
-//!
-//! Phase 0 landed the types and their arithmetic; the union-instance layer
-//! that wires them into the prove/verify paths lives in [`crate::union`].
 
 use std::sync::Arc;
 
@@ -34,17 +26,12 @@ use crate::zerocheck::{PaddingRun, PaddingSpec};
 /// for an element-class suffix. See the digest's absorption order.
 pub const MAX_K_LOG: usize = 40;
 
-/// Domain label prefixed to the element-class payload inside
-/// [`Registry::digest`]. Absorbed ONLY for [`TableClass::LargeField`] types,
-/// which is what keeps a boolean-only registry's digest byte-identical to
-/// the pre-element-class one.
+/// Domain label for large-field metadata in [`Registry::digest`]. Boolean
+/// registries do not absorb this label.
 const ELEMENT_CLASS_LABEL: &[u8] = b"flock-element-class-v0";
 
-/// Domain label prefixed to a type's IO-schema payload inside
-/// [`Registry::digest`]. Absorbed ONLY for types with a NON-EMPTY schema
-/// ([`TableType::io_schema`]), the same append-only trick as
-/// [`ELEMENT_CLASS_LABEL`]: a registry built without schemas digests exactly
-/// as it did before they existed.
+/// Domain label for non-empty IO schemas in [`Registry::digest`]. Registries
+/// without schemas do not absorb this label.
 const IO_SCHEMA_LABEL: &[u8] = b"flock-io-schema-v0";
 
 /// Which side of a gate an [`IoWord`] is. **Metadata for circuit validation
@@ -75,10 +62,8 @@ impl IoDirection {
 /// The unit is a committed WORD, not a bit — the aligned IO regions
 /// (`region_log = 8` slots for SHA-256/BLAKE3,
 /// one element column for a large-field type) make a wire value exactly one
-/// committed word, which is what collapses the gather to a packed-direct
-/// claim (design doc §"The wiring argument", Remark "Where each convention is
-/// load-bearing"). A word left OUT of the schema is internal: no circuit can
-/// wire it, so the relation must pin it or it is free witness.
+/// committed word. A word outside the schema is internal. The relation must
+/// pin each internal word that cannot remain free.
 ///
 /// `word_col` indexes the type's own row: word `w` of slot `t`'s row `j` is
 /// union word `(o_t >> 7) + (w << nu) + j` — see
@@ -107,9 +92,8 @@ impl IoWord {
 }
 
 /// What a table type's witness words MEAN — and therefore which PIOP proves
-/// the slot. The scheduler itself is class-blind: both classes present a
-/// `k_log`/`useful_bits` pair and the [`Slot`] arithmetic below is shared
-/// (design doc §"Mixed-class layout"). The class only selects the prover.
+/// the slot. Both classes use the same `k_log`, `useful_bits`, and [`Slot`]
+/// arithmetic. The class selects the prover.
 #[derive(Clone, Debug, Default)]
 pub enum TableClass {
     /// GF(2) bit-level tables — the hash relations. The payload is
@@ -126,10 +110,7 @@ pub enum TableClass {
     LargeField(Arc<ElementTableType>),
 }
 
-/// One table type: the base block of a single hash relation — exactly what
-/// [`crate::r1cs::BlockR1cs`] stores per block (a one-type registry is
-/// today's struct, minus the replication count) — or, since the element
-/// class landed, a large-field block (see [`TableClass`]).
+/// Base block for one boolean or large-field relation.
 ///
 /// For a boolean type the matrices are `2^k_log × 2^k_log` sparse boolean in
 /// circuit form (`C_0 = I`); like `BlockR1cs`, walker-based encoders
@@ -137,7 +118,7 @@ pub enum TableClass {
 /// `LincheckCircuit`.
 #[derive(Clone, Debug)]
 pub struct TableType {
-    /// log2 of the base-block side `k = 2^k_log` — the design doc's `κ_t`.
+    /// log2 of the base-block side `k = 2^k_log`.
     /// For an element type this is `kappa + 7`: one row is `2^kappa` words
     /// of 128 bits, and the 7 in-word bits are the element's basis
     /// coordinates, so the slot bookkeeping below applies unchanged.
@@ -493,10 +474,8 @@ impl Registry {
         }
     }
 
-    /// BLAKE3 digest of the registry — the multi-table statement binding for
-    /// the Fiat-Shamir transcript (design doc, "Statement, transcript, wire
-    /// format"). Stable across runs; two registries agree iff they absorb
-    /// the same bytes below.
+    /// BLAKE3 statement binding for the Fiat-Shamir transcript. Two registries
+    /// agree when they absorb the same bytes below.
     ///
     /// Normative absorption order (format version 1):
     /// 1. domain label `b"flock-registry-v1"` — intentionally
@@ -684,8 +663,7 @@ impl<'r> Instance<'r> {
     }
 
     /// The count-derived run-list [`PaddingSpec`] over the union BatchMajor
-    /// buffer — the generalization of `BlockR1cs::padding_spec` to the slot
-    /// schedule (design doc §5.2).
+    /// buffer. This applies `BlockR1cs::padding_spec` to the slot schedule.
     ///
     /// Within slot `t` the BatchMajor address split is
     /// `[7 in-word | nu row | k_log_t − 7 chunk]`: the slot is `2^{k_log_t−7}`
@@ -1150,12 +1128,8 @@ mod tests {
 
     // ---- element class: digest byte-identity + class-major layout ----------
 
-    /// **THE BYTE-IDENTITY BAR.** A boolean-only registry's digest must be
-    /// exactly the pre-element-class one: the element payload appends only
-    /// when present, so no boolean type absorbs a single new byte. Pinned
-    /// against constants captured at `c87a067` (the commit before the class
-    /// tag landed) rather than recomputed here, so a future absorption tweak
-    /// cannot silently move both sides together.
+    /// A boolean-only registry does not absorb large-field metadata. The fixed
+    /// digest detects changes on both sides of the comparison.
     #[test]
     fn boolean_only_digest_is_byte_identical() {
         // Same shapes as `registry_digest_deterministic` / the layout tests.

@@ -183,10 +183,8 @@ pub(crate) fn sumcheck_round_min_len(pairs: usize, n_blocks: usize) -> Option<us
 /// At/above this fold width a fold uses the full thread pool; below it,
 /// [`fold_min_len`] caps the fan-out.
 ///
-/// Overridable via `FLOCK_FOLD_GATE` for tuning. Measured on M4 Max (10 P-core
-/// pool) with the since-deleted `product_gkr::tests::fold_scaling_probe`
-/// (bloat ledger §E): the full-split branch
-/// scales well (2^17 outputs run 3.2× faster than serial), but the capped
+/// Overridable via `FLOCK_FOLD_GATE` for tuning. On an M4 Max with ten
+/// performance cores, the full split ran 3.2× faster at 2^17 outputs. The capped
 /// fan-out branch below the gate *loses* to serial — 1.3× slower at 2^15
 /// outputs, 3× slower at 2^13. Lowering the gate hands those widths the
 /// full split instead of the cap.
@@ -225,14 +223,9 @@ pub(crate) fn fold_min_len(half: usize) -> Option<usize> {
 /// Whether sub-gate folds use the capped √-rule fan-out (`FLOCK_FOLD_RULE=sqrt`)
 /// rather than running serial.
 ///
-/// Serial is the default because the cap measured *worse than serial* on this
-/// crate's only `fold_min_len` consumer, `product_gkr`: per the since-deleted
-/// `fold_scaling_probe` on a 10-P-core M4 Max, the capped branch is 1.3× slower
-/// than serial at 2^15 outputs and 3× slower at 2^13, and switching those
-/// widths to serial cut the end-to-end fold phase from ~5.0 ms to ~4.6 ms at
-/// μ=20. The √-rule was originally tuned for `logup_gkr`'s fold on an 8-P-core
-/// part; that module is not in this tree, so the knob preserves it rather than
-/// deleting it.
+/// Serial is the default because capped work was slower for `product_gkr`.
+/// Serial execution reduced the fold phase from about 5.0 ms to 4.6 ms at
+/// μ=20 on an M4 Max. The option remains available for machine-specific tuning.
 pub(crate) fn fold_sqrt_rule() -> bool {
     static RULE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *RULE.get_or_init(|| std::env::var("FLOCK_FOLD_RULE").is_ok_and(|v| v == "sqrt"))
