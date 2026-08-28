@@ -1,0 +1,507 @@
+//! Candidate-slot R1CS for the aerie private-salt HashToPoint relation.
+//!
+//! One block proves `SLOTS = 68` rejection-sampling candidates (one SHAKE256
+//! rate block's worth): per 16-bit candidate word `x`, the accept comparison
+//! `x < 61,445`, the decomposition `x = 12,289 q + a` with `0 <= a < 12,289`
+//! and `q <= 5`, the centering flag `u = (a > 6,144)`, and the running
+//! acceptance counter. See `AERIE-ADAPTER.md` Sections 3.2 and 3.3; the
+//! scatter of accepted `(a, u)` values onto the dense `Z_H` region is a
+//! claim-level argument (the counter's monotone increments make it a stable
+//! permutation) and is NOT part of this block.
+//!
+//! ## Encoding
+//!
+//! Circuit R1CS `(A z) & (B z) = z` with `C_0 = I`. Only AND outputs and
+//! free inputs are materialized wires; all linear structure is carried
+//! symbolically into row taps (the SHA-2 encoder's discipline). Full-adder
+//! carries cost one row each via `maj(p, s, c) = (p ^ c)(s ^ c) ^ c`.
+//!
+//! Wires whose values the relation FORCES (rather than defines) live in the
+//! forced-zero set: [`forced_zero_positions`]. Their rows define them as the
+//! violated quantity, and the claim layer must check the openings of those
+//! positions are zero, exactly like the constant-wire pin
+//! (`docs/const-wire-pin.md`) but with target value 0. [`pins_are_zero`] is
+//! the satisfies-level stand-in. The forced pins are, per slot: the
+//! subtraction bits 14 and 15 of `x - M` (so `a` fits 14 bits), the final
+//! borrow (so `x >= M`), `t_4` of `3 q` (so `q <= 5`), and the range flag
+//! (so `a < 12,289`).
+//!
+//! ## Layout (K_LOG = 13, 8,192 wires per block)
+//!
+//! ```text
+//! 0   .. 10    counter input bits (free; block chaining is future work)
+//! 10           constant-one wire (const_pin)
+//! 16  .. 6,816 68 slots, stride 100 (see slot offsets in the code)
+//! rest         zero padding (empty rows)
+//! ```
+
+use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
+
+use super::common::build_block_r1cs_with_matrices;
+
+pub const K_LOG: usize = 13;
+pub const K: usize = 1 << K_LOG;
+pub const K_SKIP: usize = 6;
+
+/// Candidates per block: one SHAKE256 rate block.
+pub const SLOTS: usize = 68;
+
+pub const COUNTER_BITS: usize = 10;
+pub const CNT_IN_BASE: usize = 0;
+pub const Z_CONST_POS: usize = CNT_IN_BASE + COUNTER_BITS;
+pub const SLOT_BASE: usize = 16;
+pub const SLOT_STRIDE: usize = 100;
+pub const USEFUL_BITS: usize = SLOT_BASE + SLOTS * SLOT_STRIDE;
+
+// Per-slot wire offsets.
+const X: usize = 0; // 16 candidate word bits, free inputs
+const Q: usize = 16; // 3 quotient bits, free inputs
+const D: usize = 19; // 16 accept-chain carry products
+const ACC: usize = 35; // materialized accept flag
+const E: usize = 36; // 3 carry products of the 3q mini-adder
+const G: usize = 39; // 16 borrow products of x - M
+const U_CHAIN: usize = 55; // 14 centering-chain carry products
+const U: usize = 69; // materialized centering flag
+const R_CHAIN: usize = 70; // 14 range-chain carry products
+const PIN_RANGE: usize = 84; // forced zero: carry-out of a + 4,095
+const PIN_A14: usize = 85; // forced zero: subtraction bit 14
+const PIN_A15: usize = 86; // forced zero: subtraction bit 15
+const PIN_B16: usize = 87; // forced zero: final borrow of x - M
+const H: usize = 88; // 10 counter-increment carry products
+const PIN_T4: usize = 98; // forced zero: t_4 of 3q, so q <= 5
+const SLOT_WIRES: usize = 99;
+
+/// Falcon rejection bound: accept exactly when `x < 5 * 12,289`.
+const ACCEPT_BOUND: u32 = 61_445;
+/// `2^16 - 61,445`: carry-out of `x + 4,091` is the reject flag.
+const ACCEPT_K: u32 = 4_091;
+/// `2^14 - 12,289`: carry-out of `a + 4,095` violates `a < 12,289`.
+const RANGE_K: u32 = 4_095;
+/// `2^14 - 6,145`: carry-out of `a + 10,239` is `u = (a > 6,144)`.
+const CENTER_K: u32 = 10_239;
+const FALCON_Q: u32 = 12_289;
+
+/// Symbolic GF(2) linear form: a sorted set of wire columns whose XOR is the
+/// value. The constant 1 is a tap on [`Z_CONST_POS`].
+type Lin = Vec<usize>;
+
+fn lin_xor(a: &Lin, b: &Lin) -> Lin {
+    // Symmetric difference of two sorted column sets.
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() || j < b.len() {
+        match (a.get(i), b.get(j)) {
+            (Some(&x), Some(&y)) if x == y => {
+                i += 1;
+                j += 1;
+            }
+            (Some(&x), Some(&y)) if x < y => {
+                out.push(x);
+                i += 1;
+            }
+            (Some(_), Some(&y)) => {
+                out.push(y);
+                j += 1;
+            }
+            (Some(&x), None) => {
+                out.push(x);
+                i += 1;
+            }
+            (None, Some(&y)) => {
+                out.push(y);
+                j += 1;
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+    out
+}
+
+fn wire(col: usize) -> Lin {
+    vec![col]
+}
+
+fn constant_one() -> Lin {
+    vec![Z_CONST_POS]
+}
+
+struct Builder {
+    a: Vec<Vec<usize>>,
+    b: Vec<Vec<usize>>,
+}
+
+impl Builder {
+    fn new() -> Self {
+        Self {
+            a: vec![Vec::new(); K],
+            b: vec![Vec::new(); K],
+        }
+    }
+
+    /// Row `w`: `(a_lin)(b_lin) = z_w`.
+    fn product(&mut self, w: usize, a_lin: &Lin, b_lin: &Lin) {
+        assert!(self.a[w].is_empty() && self.b[w].is_empty(), "row reused");
+        self.a[w] = a_lin.clone();
+        self.b[w] = b_lin.clone();
+    }
+
+    /// Free input: the vacuous self-loop `(z_w)(1) = z_w`.
+    fn input(&mut self, w: usize) {
+        self.product(w, &wire(w), &constant_one());
+    }
+
+    /// Defined wire: `(lin)(1) = z_w`.
+    fn define(&mut self, w: usize, lin: &Lin) {
+        self.product(w, lin, &constant_one());
+    }
+}
+
+/// One maj-form carry step: appends the product row for
+/// `carry' = maj(p, s, c) = (p ^ c)(s ^ c) ^ c` at wire `w` and returns the
+/// new symbolic carry `{w} ^ c`.
+fn carry_step(builder: &mut Builder, w: usize, p: &Lin, s: &Lin, c: &Lin) -> Lin {
+    builder.product(w, &lin_xor(p, c), &lin_xor(s, c));
+    lin_xor(&wire(w), c)
+}
+
+/// Carry chain for `value + CONSTANT` over `bits` bits with per-bit value
+/// forms `value_bit(i)`. Returns the symbolic carry-out.
+fn constant_add_chain(
+    builder: &mut Builder,
+    products_base: usize,
+    constant: u32,
+    bits: usize,
+    value_bit: impl Fn(usize) -> Lin,
+) -> Lin {
+    let mut carry: Lin = Vec::new();
+    for i in 0..bits {
+        let k_bit = if (constant >> i) & 1 == 1 {
+            constant_one()
+        } else {
+            Vec::new()
+        };
+        carry = carry_step(builder, products_base + i, &value_bit(i), &k_bit, &carry);
+    }
+    carry
+}
+
+/// Build the shared per-block matrices plus the per-block symbolic counter
+/// outputs (used by future chaining; also returned for tests).
+fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
+    let mut builder = Builder::new();
+    for bit in 0..COUNTER_BITS {
+        builder.input(CNT_IN_BASE + bit);
+    }
+    builder.input(Z_CONST_POS);
+
+    // Running counter, symbolic across slots.
+    let mut counter: Vec<Lin> = (0..COUNTER_BITS)
+        .map(|bit| wire(CNT_IN_BASE + bit))
+        .collect();
+
+    for slot in 0..SLOTS {
+        let base = SLOT_BASE + slot * SLOT_STRIDE;
+        let x = |i: usize| wire(base + X + i);
+        for i in 0..16 {
+            builder.input(base + X + i);
+        }
+        for i in 0..3 {
+            builder.input(base + Q + i);
+        }
+        let q = |i: usize| wire(base + Q + i);
+
+        // Accept: reject flag is the carry-out of x + 4,091.
+        let reject = constant_add_chain(&mut builder, base + D, ACCEPT_K, 16, x);
+        builder.define(base + ACC, &lin_xor(&reject, &constant_one()));
+        let acc = wire(base + ACC);
+
+        // t = 3 q = q + (q << 1); bits: t_0 = q_0, t_1 = q_1 ^ q_0,
+        // t_2 = q_2 ^ q_1 ^ e_2, t_3 = q_2 ^ e_3, t_4 = e_4.
+        let e2 = carry_step(&mut builder, base + E, &q(1), &q(0), &Vec::new());
+        let e2 = lin_xor(&e2, &Vec::new());
+        let e3 = carry_step(&mut builder, base + E + 1, &q(2), &q(1), &e2);
+        let e4 = carry_step(&mut builder, base + E + 2, &Vec::new(), &q(2), &e3);
+        let t = [
+            q(0),
+            lin_xor(&q(1), &q(0)),
+            lin_xor(&lin_xor(&q(2), &q(1)), &e2),
+            lin_xor(&q(2), &e3),
+            e4.clone(),
+        ];
+        // M = 12,289 q = (3 q << 12) ^ q: disjoint bit ranges, pure wiring.
+        let m_bit = |i: usize| -> Lin {
+            if i < 3 {
+                q(i)
+            } else if (12..16).contains(&i) {
+                t[i - 12].clone()
+            } else {
+                Vec::new()
+            }
+        };
+
+        // Subtraction a = x - M via borrows: b' = maj(~x_i, M_i, b).
+        let mut borrow: Lin = Vec::new();
+        let mut a_bits: Vec<Lin> = Vec::new();
+        for i in 0..16 {
+            a_bits.push(lin_xor(&lin_xor(&x(i), &m_bit(i)), &borrow));
+            let not_x = lin_xor(&x(i), &constant_one());
+            borrow = carry_step(&mut builder, base + G + i, &not_x, &m_bit(i), &borrow);
+        }
+
+        // Centering flag: carry-out of a + 10,239 over 14 bits.
+        let center = constant_add_chain(&mut builder, base + U_CHAIN, CENTER_K, 14, |i| {
+            a_bits[i].clone()
+        });
+        builder.define(base + U, &center);
+
+        // Range flag: carry-out of a + 4,095 over 14 bits; forced zero.
+        let range = constant_add_chain(&mut builder, base + R_CHAIN, RANGE_K, 14, |i| {
+            a_bits[i].clone()
+        });
+        builder.define(base + PIN_RANGE, &range);
+        builder.define(base + PIN_A14, &a_bits[14]);
+        builder.define(base + PIN_A15, &a_bits[15]);
+        builder.define(base + PIN_B16, &borrow);
+        // t_4 is the SYMBOLIC carry e4 (product xor e3), not the raw product
+        // wire, so it needs its own materialized pin.
+        builder.define(base + PIN_T4, &e4);
+
+        // Counter increment by the accept flag: h_0 = acc,
+        // h_{i+1} = cnt_i & h_i, cnt_i' = cnt_i ^ h_i.
+        let mut increment = acc;
+        for (bit, cnt_bit) in counter.iter_mut().enumerate() {
+            builder.product(base + H + bit, cnt_bit, &increment);
+            let carried = wire(base + H + bit);
+            *cnt_bit = lin_xor(cnt_bit, &increment);
+            increment = carried;
+        }
+        // A record has at most 680 slots, so the counter cannot wrap; the
+        // final increment carry is left dangling by design.
+        let _ = increment;
+        let _ = base + SLOT_WIRES;
+    }
+
+    let to_matrix = |rows: Vec<Vec<usize>>| SparseBinaryMatrix {
+        num_rows: K,
+        num_cols: K,
+        rows,
+    };
+    (to_matrix(builder.a), to_matrix(builder.b))
+}
+
+/// Wires the claim layer must force to zero, in block-local coordinates.
+pub fn forced_zero_positions() -> Vec<usize> {
+    let mut positions = Vec::with_capacity(5 * SLOTS);
+    for slot in 0..SLOTS {
+        let base = SLOT_BASE + slot * SLOT_STRIDE;
+        positions.extend_from_slice(&[
+            base + PIN_RANGE,
+            base + PIN_A14,
+            base + PIN_A15,
+            base + PIN_B16,
+            base + PIN_T4,
+        ]);
+    }
+    positions
+}
+
+/// Satisfies-level stand-in for the claim-layer zero pins.
+pub fn pins_are_zero(block: &[bool]) -> bool {
+    forced_zero_positions()
+        .into_iter()
+        .all(|position| !block[position])
+}
+
+/// Block accessors for tests and the future scatter argument.
+pub fn accept_position(slot: usize) -> usize {
+    SLOT_BASE + slot * SLOT_STRIDE + ACC
+}
+pub fn centering_position(slot: usize) -> usize {
+    SLOT_BASE + slot * SLOT_STRIDE + U
+}
+
+pub fn build_block_r1cs(n_blocks_log: usize) -> BlockR1cs {
+    let (a_0, b_0) = build_matrices();
+    build_block_r1cs_with_matrices(
+        n_blocks_log,
+        K_LOG,
+        K_SKIP,
+        USEFUL_BITS,
+        a_0,
+        b_0,
+        Some(Z_CONST_POS),
+    )
+}
+
+/// Build one block's witness by evaluating the rows in wire order, so the
+/// witness is consistent with the matrices by construction. Free inputs are
+/// the candidate words, the quotient bits, and the counter input.
+///
+/// Returns the block bits and the counter value after the block.
+pub fn build_block_witness(words: &[u16; SLOTS], counter_in: u16) -> (Vec<bool>, u16) {
+    let (a_0, b_0) = build_matrices();
+    let mut z = vec![false; K];
+    z[Z_CONST_POS] = true;
+    for bit in 0..COUNTER_BITS {
+        z[CNT_IN_BASE + bit] = (counter_in >> bit) & 1 == 1;
+    }
+    for (slot, &word) in words.iter().enumerate() {
+        let base = SLOT_BASE + slot * SLOT_STRIDE;
+        for i in 0..16 {
+            z[base + X + i] = (word >> i) & 1 == 1;
+        }
+        // The honest quotient; for rejected words it is still the true
+        // quotient (capped by the pin only through q <= 5, x >= M, a < q).
+        let quotient = (u32::from(word) / FALCON_Q).min(5) as u16;
+        for i in 0..3 {
+            z[base + Q + i] = (quotient >> i) & 1 == 1;
+        }
+    }
+    let eval = |lin: &[usize], z: &[bool]| lin.iter().fold(false, |acc, &col| acc ^ z[col]);
+    for w in 0..K {
+        let is_input = w < CNT_IN_BASE + COUNTER_BITS
+            || w == Z_CONST_POS
+            || (w >= SLOT_BASE && {
+                let offset = (w - SLOT_BASE) % SLOT_STRIDE;
+                (w - SLOT_BASE) / SLOT_STRIDE < SLOTS && offset < Q + 3
+            });
+        if is_input {
+            continue;
+        }
+        z[w] = eval(&a_0.rows[w], &z) & eval(&b_0.rows[w], &z);
+    }
+
+    // Differential against the integer reference semantics.
+    let mut counter = counter_in;
+    for (slot, &word) in words.iter().enumerate() {
+        let accept = u32::from(word) < ACCEPT_BOUND;
+        let residue = u32::from(word) % FALCON_Q;
+        let centered = residue > (FALCON_Q - 1) / 2;
+        assert_eq!(z[accept_position(slot)], accept, "accept flag, slot {slot}");
+        assert_eq!(
+            z[centering_position(slot)],
+            centered,
+            "centering flag, slot {slot}"
+        );
+        counter += u16::from(accept);
+    }
+    (z, counter)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn word_battery() -> [u16; SLOTS] {
+        let mut words = [0_u16; SLOTS];
+        let edges = [
+            0_u16, 1, 6_144, 6_145, 12_288, 12_289, 24_577, 36_866, 49_155, 61_444, 61_445, 61_446,
+            65_535,
+        ];
+        words[..edges.len()].copy_from_slice(&edges);
+        for (index, word) in words.iter_mut().enumerate().skip(edges.len()) {
+            *word = (index as u16).wrapping_mul(9_973).wrapping_add(12_345);
+        }
+        words
+    }
+
+    fn single_block_r1cs() -> BlockR1cs {
+        // n_blocks_log = 3 is the lincheck minimum; satisfies() needs the
+        // full domain, so tile the same block eight times.
+        build_block_r1cs(3)
+    }
+
+    fn tiled(z_block: &[bool]) -> Vec<bool> {
+        let mut z = Vec::with_capacity(8 * K);
+        for _ in 0..8 {
+            z.extend_from_slice(z_block);
+        }
+        z
+    }
+
+    #[test]
+    fn honest_block_satisfies_and_pins_are_zero() {
+        let words = word_battery();
+        let (block, counter) = build_block_witness(&words, 0);
+        let expected = words
+            .iter()
+            .filter(|&&word| u32::from(word) < ACCEPT_BOUND)
+            .count() as u16;
+        assert_eq!(counter, expected);
+        assert!(pins_are_zero(&block));
+        assert!(single_block_r1cs().satisfies(&tiled(&block)));
+    }
+
+    #[test]
+    fn counter_chains_across_blocks() {
+        let words = word_battery();
+        let (_block, counter) = build_block_witness(&words, 100);
+        let accepted = words
+            .iter()
+            .filter(|&&word| u32::from(word) < ACCEPT_BOUND)
+            .count() as u16;
+        assert_eq!(counter, 100 + accepted);
+    }
+
+    #[test]
+    fn tampered_wires_fail_satisfies() {
+        let words = word_battery();
+        let (block, _counter) = build_block_witness(&words, 0);
+        let r1cs = single_block_r1cs();
+        for position in [
+            accept_position(0),
+            centering_position(3),
+            SLOT_BASE + G + 5,
+            SLOT_BASE + 2 * SLOT_STRIDE + D + 9,
+            SLOT_BASE + H + 1,
+        ] {
+            let mut tampered = block.clone();
+            tampered[position] = !tampered[position];
+            assert!(
+                !r1cs.satisfies(&tiled(&tampered)),
+                "tampered wire {position} must break a row"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wrong_quotient_satisfies_rows_but_trips_the_pins() {
+        // Every non-input wire is definitional, so a witness built from a
+        // WRONG free input still satisfies all rows; the forced-zero pins
+        // are what reject it. This is exactly why they are claim-level
+        // obligations.
+        let words = word_battery();
+        let (mut block, _counter) = build_block_witness(&words, 0);
+        assert!(pins_are_zero(&block));
+
+        // Re-derive slot 5 (an accepted word) with quotient + 1.
+        let slot = 5;
+        let base = SLOT_BASE + slot * SLOT_STRIDE;
+        let word = words[slot];
+        let wrong_quotient = (u32::from(word) / FALCON_Q + 1) as u16;
+        for i in 0..3 {
+            block[base + Q + i] = (wrong_quotient >> i) & 1 == 1;
+        }
+        let (a_0, b_0) = {
+            let r1cs = single_block_r1cs();
+            (r1cs.a_0, r1cs.b_0)
+        };
+        let eval = |lin: &[usize], z: &[bool]| lin.iter().fold(false, |acc, &col| acc ^ z[col]);
+        for w in SLOT_BASE..USEFUL_BITS {
+            let offset = (w - SLOT_BASE) % SLOT_STRIDE;
+            if offset < Q + 3 {
+                continue;
+            }
+            block[w] = eval(&a_0.rows[w], &block) & eval(&b_0.rows[w], &block);
+        }
+        let r1cs = single_block_r1cs();
+        assert!(
+            r1cs.satisfies(&tiled(&block)),
+            "definitional rows accept any free inputs"
+        );
+        assert!(
+            !pins_are_zero(&block),
+            "the wrong quotient must trip a forced-zero pin"
+        );
+    }
+}

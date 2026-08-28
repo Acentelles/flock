@@ -84,10 +84,20 @@ backend; model v0 counts Booleanity rows that GF(2) gets for free):
   (16 maj rows); ordered stable compaction as a 10-bit running counter
   (10 maj rows) plus one write-gate AND per slot.
 
-Ballpark 95 rows and wires per slot; a nine-block record has 612 slots,
-so about 58k slot rows and wires per record on top of the ten Keccak
-permutations (each 38,400 chi ANDs). Measured numbers land with work
-item 3; the aerie E0 census model v0 should be revised against them.
+Implemented in `r1cs_hashes/hash_to_point_slots.rs` at the satisfies
+level: `K_LOG = 13`, 68 slots per block (one rate block), slot stride
+100 with 99 wires (16 word bits, 3 quotient bits, 16 + 3 + 16 + 14 + 14
+chain products, materialized accept and centering flags, 10 counter
+products, 5 forced-zero pins), `USEFUL_BITS = 6,816` of 8,192 (83%
+utilization). A nine-squeeze-block record costs about 61k slot wires
+against 426k Keccak wires, so the slot layer is about 12.5% of the hash
+cost. Witness generation evaluates the rows themselves (consistent with
+the matrices by construction) and asserts the integer reference
+semantics; tests cover the boundary battery, cross-block counter
+chaining, tamper rejection, and the soundness demonstration that a
+wrong quotient satisfies every definitional row and is caught only by
+the forced-zero pins. The aerie E0 census model v0 should be revised
+against these measured counts.
 
 ### 3.3 The `Z_H` output region and copy link
 
@@ -107,10 +117,12 @@ measurement (work item 4).
    descriptors.
 2. Sponge-chain amendment: public-XOR absorption plus the witness salt
    block (Section 3.1).
-3. Slot-relation encoder (Section 3.2) with witness generation from
-   aerie's `falcon-hash-circuit::trace` and a differential test against
-   `falcon::preprocess::hash_to_point_public_raw`; report the measured
-   E0 census, replacing aerie's model v0.
+3. Slot-relation encoder (Section 3.2): DONE at the satisfies level in
+   `r1cs_hashes/hash_to_point_slots.rs`; remaining: proving-path
+   integration (lincheck/zerocheck over the materialized matrices), the
+   claim-level forced-zero pin check, counter chaining across blocks,
+   and the full-record differential against
+   `falcon::preprocess::hash_to_point_public_raw`.
 4. `Z_H` region plus copy link (Section 3.3); pick dedicated commitment
    versus sub-cube opening by measured proof bytes and verifier time.
 5. Implement aerie's `BinaryHashBackend` for the assembled system, with
@@ -127,3 +139,9 @@ measurement (work item 4).
   versus a separate jagged table family; the jagged path looks cleaner
   and keeps the Keccak walkers untouched.
 - PoW grinding policy (`grind_pow`) under the joint transcript.
+- The parallel default-stack test run is marginal: an upstream rayon
+  worker sits close to the 2 MB default, and adding tests can shift
+  co-scheduling enough to abort it (verified: base parallel passes,
+  parallel with the slot tests sometimes aborts, serial and
+  `RUST_MIN_STACK=512MB` parallel both pass). Run the suite with
+  `RUST_MIN_STACK=536870912`, as aerie already does.

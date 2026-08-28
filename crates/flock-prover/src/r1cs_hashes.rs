@@ -14,6 +14,9 @@ pub mod blake3;
 /// [`ChainLayout`]: chain_common::ChainLayout
 pub mod chain_common;
 pub mod common;
+/// Candidate-slot R1CS for the aerie private-salt HashToPoint relation; see
+/// `AERIE-ADAPTER.md`.
+pub mod hash_to_point_slots;
 pub mod keccak;
 /// 3-wide Keccak-f[1600] R1CS (3 independent permutations per K_LOG=17 block)
 /// for tighter PCS utilization (~97% vs the single encoder's ~65%).
