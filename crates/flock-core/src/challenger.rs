@@ -1054,7 +1054,9 @@ impl Challenger for FsChallenger {
 fn f128s_from_le_bytes(bytes: &[u8]) -> Vec<F128> {
     debug_assert_eq!(bytes.len() % 16, 0);
     bytes
-        .chunks_exact(16)
+        .as_chunks::<16>()
+        .0
+        .iter()
         .map(|c| F128 {
             lo: u64::from_le_bytes(c[..8].try_into().unwrap()),
             hi: u64::from_le_bytes(c[8..].try_into().unwrap()),

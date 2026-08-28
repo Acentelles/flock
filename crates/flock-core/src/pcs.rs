@@ -402,8 +402,11 @@ struct CombinedClaim {
     /// consumed by `recursive_prover_with_basis_precomputed_round0`.
     round0_prime: (F128, F128),
     /// Quadratic coefficients of Ligerito's ROUND-1 message in the round-0
-    /// fold challenge, accumulated in the same combine pass (fast path with
-    /// no packed-direct claims only). Lets the recursive prover's first lane
+    /// fold challenge, accumulated in the same combine pass. Three paths
+    /// emit them: the plain fast path (LSB-pair coefficients), the fast
+    /// path WITH sparse packed-direct claims (scatter deltas corrected by
+    /// linearity), and the seeded EqPoint path (BLOCKED coefficients, the
+    /// fold's own block pairing). Lets the recursive prover's first lane
     /// fold be an O(1) skip round — see [`ligerito::FoldLookahead`].
     round1_lookahead: Option<ligerito::FoldLookahead>,
 }
@@ -563,9 +566,14 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         let mask = (1usize << n_lo) - 1;
         let bs = |u: usize| lo[u & mask] * hi[u >> n_lo];
         let blk = eqpoint_round0_block;
-        let (round0_u0, round0_u2) = if blk == 1 {
+        if blk == 1 {
+            // The ladder statically rejects a lookahead on this shape:
+            // `fold_block == 1` comes with the factored (JIT) basis, so
+            // `kind_ok` in extension.rs never consumes it. Run the lean
+            // prime-only pass (2 muls/pair) instead of paying the doubled
+            // lookahead accumulation for coefficients nothing reads.
             const C: usize = 1 << 13;
-            packed_witness
+            let (round0_u0, round0_u2) = packed_witness
                 .par_chunks(C)
                 .enumerate()
                 .map(|(ci, qc)| {
@@ -583,35 +591,92 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                 .reduce(
                     || (F128::ZERO, F128::ZERO),
                     |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
-                )
-        } else {
-            // Lane-major round-0: the L0 fold pairs BLOCKS of `blk`
-            // elements (lane 2j with lane 2j+1), so the prime pairs
-            // element t of block 2j with element t of block 2j+1.
-            assert!(blk.is_power_of_two() && l.is_multiple_of(2 * blk));
-            (0..l / (2 * blk))
-                .into_par_iter()
-                .map(|j| {
-                    let b0 = 2 * j * blk;
-                    let b1 = b0 + blk;
-                    let mut u0 = F128::ZERO;
-                    let mut u2 = F128::ZERO;
-                    for t in 0..blk {
-                        let (q0, q1) = (packed_witness[b0 + t], packed_witness[b1 + t]);
-                        let (w0, w1) = (bs(b0 + t), bs(b1 + t));
-                        u0 += q0 * w0;
-                        u2 += (q0 + q1) * (w0 + w1);
-                    }
-                    (u0, u2)
-                })
-                .reduce(
-                    || (F128::ZERO, F128::ZERO),
-                    |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
-                )
+                );
+            if trace {
+                eprintln!(
+                    "  [open_batch] combine (seeded EqPoint, L={l}): {:6.2} ms",
+                    t.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            return CombinedClaim {
+                ring_switches: Vec::new(),
+                batching_nonces,
+                b_combined: Vec::new(),
+                eq_basis: Some((lo, hi, n_lo)),
+                eq_gamma: Some(gammas_pd[0]),
+                target_combined,
+                round0_prime: (round0_u0, round0_u2),
+                round1_lookahead: None,
+            };
+        }
+        // The same seeded pass now also accumulates the ROUND-1 message's
+        // quadratic coefficients in the round-0 fold challenge, under the
+        // fold's own pairing: quad `q` covers the four consecutive
+        // `blk`-blocks the ladder's first two folds combine, so
+        // `ligerito::lookahead_accum_group` applies verbatim with blocked
+        // gathering (+4 unreduced muls per quad on a pass that already runs;
+        // it buys the ladder a full fold-0 pass). Needs `l ≥ 4·blk`
+        // (initial_k ≥ 2), which every shipped ladder satisfies.
+        use crate::field::F256Unreduced;
+        assert!(blk.is_power_of_two() && l.is_multiple_of(4 * blk));
+        let quad = |q: usize, acc: &mut [F256Unreduced; 8]| {
+            let i0 = 4 * q * blk;
+            for k in 0..blk {
+                let i = i0 + k;
+                let fq = [
+                    packed_witness[i],
+                    packed_witness[i + blk],
+                    packed_witness[i + 2 * blk],
+                    packed_witness[i + 3 * blk],
+                ];
+                let bq = [bs(i), bs(i + blk), bs(i + 2 * blk), bs(i + 3 * blk)];
+                ligerito::lookahead_accum_group(&fq, &bq, acc);
+            }
         };
+        // Parallelize on quads; for the lane-major shape (huge blk, few
+        // quads) split each quad's inner `k` range instead.
+        let n_quads = l / (4 * blk);
+        let acc = if n_quads >= 64 {
+            // ~2^13 elements per task, whatever the block size.
+            let qc = ((1usize << 13) / (4 * blk)).max(1);
+            (0..n_quads.div_ceil(qc))
+                .into_par_iter()
+                .map(|qq| {
+                    let mut acc = [F256Unreduced::ZERO; 8];
+                    for q in (qq * qc)..((qq + 1) * qc).min(n_quads) {
+                        quad(q, &mut acc);
+                    }
+                    acc
+                })
+                .reduce(|| [F256Unreduced::ZERO; 8], ligerito::xor_acc8)
+        } else {
+            const KC: usize = 1 << 12;
+            (0..n_quads * blk.div_ceil(KC))
+                .into_par_iter()
+                .map(|item| {
+                    let chunks_per_quad = blk.div_ceil(KC);
+                    let (q, kc) = (item / chunks_per_quad, item % chunks_per_quad);
+                    let i0 = 4 * q * blk;
+                    let mut acc = [F256Unreduced::ZERO; 8];
+                    for k in (kc * KC)..((kc + 1) * KC).min(blk) {
+                        let i = i0 + k;
+                        let fq = [
+                            packed_witness[i],
+                            packed_witness[i + blk],
+                            packed_witness[i + 2 * blk],
+                            packed_witness[i + 3 * blk],
+                        ];
+                        let bq = [bs(i), bs(i + blk), bs(i + 2 * blk), bs(i + 3 * blk)];
+                        ligerito::lookahead_accum_group(&fq, &bq, &mut acc);
+                    }
+                    acc
+                })
+                .reduce(|| [F256Unreduced::ZERO; 8], ligerito::xor_acc8)
+        };
+        let (round0, la) = ligerito::lookahead_finish(acc);
         if trace {
             eprintln!(
-                "  [open_batch] combine (seeded EqPoint, L={l}): {:6.2} ms",
+                "  [open_batch] combine (seeded EqPoint + lookahead, L={l}): {:6.2} ms",
                 t.elapsed().as_secs_f64() * 1e3
             );
         }
@@ -622,8 +687,8 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             eq_basis: Some((lo, hi, n_lo)),
             eq_gamma: Some(gammas_pd[0]),
             target_combined,
-            round0_prime: (round0_u0, round0_u2),
-            round1_lookahead: None,
+            round0_prime: (round0.u_0, round0.u_2),
+            round1_lookahead: Some(la),
         };
     }
 
@@ -667,11 +732,13 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     // commutative, exact).
     let combine_all_cores =
         std::env::var("PCS_COMBINE_PCORES_ONLY").is_err() && crate::ecore_rich_topology();
-    // With no packed-direct claims nothing is scatter-added after the fast
-    // path, so the block tail can also accumulate Ligerito's round-1 message
-    // coefficients (groups of 4; +1 unreduced mul per slot) — the round-0
-    // prime falls out of the same accumulators. See `CombinedClaim`.
-    let want_lookahead = use_fast && packed_direct.is_empty();
+    // The fast path's block tail can also accumulate Ligerito's round-1
+    // message coefficients (groups of 4; +1 unreduced mul per slot) — the
+    // round-0 prime falls out of the same accumulators. Sparse post-combine
+    // scatter-adds no longer disable this: the coefficients are linear in
+    // the basis, so each scattered delta corrects them below. See
+    // `CombinedClaim`.
+    let want_lookahead = use_fast;
     let mut round1_lookahead: Option<ligerito::FoldLookahead> = None;
     let b_combined_ref = &mut b_combined;
     let la_ref = &mut round1_lookahead;
@@ -867,24 +934,38 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         }
         round0_u2 += (a0 + a1) * delta;
     };
+    // Post-combine b_combined mutations. The round-1 lookahead coefficients
+    // are LINEAR in the basis, so every scattered delta corrects them with
+    // its own quad contribution (`bq` = the delta at one slot, `fq` = the
+    // quad's witness words — 8 unreduced muls per live entry); the prime
+    // keeps its existing incremental adjustment.
+    let mut la_acc = [crate::field::F256Unreduced::ZERO; 8];
+    let la_active = round1_lookahead.is_some();
+    let la_correct = |idx: usize, delta: F128, acc: &mut [crate::field::F256Unreduced; 8]| {
+        let g = idx & !3usize;
+        let fq = [
+            packed_witness[g],
+            packed_witness[g + 1],
+            packed_witness[g + 2],
+            packed_witness[g + 3],
+        ];
+        let mut bq = [F128::ZERO; 4];
+        bq[idx & 3] = delta;
+        ligerito::lookahead_accum_group(&fq, &bq, acc);
+    };
     for (_, output) in rs_results.iter() {
         if let ring_switch::RsEqInd::Sparse { entries, .. } = &output.rs_eq_ind {
-            // Post-combine mutation of b_combined: the round-1 lookahead
-            // coefficients (if any) are now stale. Unreachable when they are
-            // emitted (fast path = no sparse RS claims), but keep the
-            // invalidation in case the emission condition ever widens.
-            if !entries.is_empty() {
-                round1_lookahead = None;
-            }
             for &(idx, val) in entries {
                 b_combined[idx] += val;
                 adjust_prime_for_delta(idx, val);
+                if la_active {
+                    la_correct(idx, val, &mut la_acc);
+                }
             }
         }
     }
     for (pd, g) in packed_direct.iter().zip(gammas_pd.iter()) {
         if let DirectEqInd::Sparse(eq) = &pd.eq_ind {
-            round1_lookahead = None; // see above — pd claims never emit coeffs
             // Scatter-add the sparse claim and fold its round-0 prime
             // contribution in the SAME pass (O(live positions)), instead of a
             // full O(L) re-pass over b_combined. The prime is linear in
@@ -893,7 +974,18 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             let (du0, du2) = sparse_scatter_add_parallel(&mut b_combined, packed_witness, eq, *g);
             round0_u0 += du0;
             round0_u2 += du2;
+            if la_active {
+                for c in 0..eq.live_tensor.len() {
+                    la_correct(eq.scatter_idx(c), *g * eq.live_tensor[c], &mut la_acc);
+                }
+            }
         }
+    }
+    if let Some(la) = round1_lookahead.as_mut() {
+        // The group kernel's message slots duplicate the prime deltas
+        // already applied above — only the coefficient half is consumed.
+        let (_, delta) = ligerito::lookahead_finish(la_acc);
+        la.add(&delta);
     }
     if trace {
         eprintln!(

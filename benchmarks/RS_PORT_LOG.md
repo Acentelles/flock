@@ -2372,3 +2372,13 @@ f256-split opening (assess — the opening changed shape); (6) direct
 path zc 1.56 s anomaly; (7) DECISION: flip default hash to blake3
 repo-wide (generator + TOMLs + tests) or keep sha256 default with env
 selection for benches.
+
+### Merge step 2: PR #32 f256-lookahead (372d323) — 2026-08-28
+
+Clean merge, ZERO conflicts (step 1 absorbed the cross-merged bulk).
++1459/-120 over 11 files, dominated by ligerito/extension.rs (f256
+tower extension fold machinery + fold-lookahead tests). Suites green
+(core 564, prover 117). m=32 grind-free blake3, 3 cold-start runs:
+1.90 / 1.17 / 1.15 s (step 1 same protocol: 1.85 / 1.34 / 1.19) —
+PARITY within session noise; proof size unchanged (567.31 KiB), peak
+8.52 GB.
