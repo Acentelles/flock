@@ -2422,3 +2422,18 @@ retires the "direct path zc 1.56 s" open item (the path no longer
 exists) and re-scopes re-graft targets to the UNION driver only.
 Suites green (core 545 — count reflects deleted legacy tests, prover
 124). Bench: 1.92 / 1.72 / 0.919 s, best 919 ms — parity.
+
+### Merge step 7: PR #38 tower-split (b310f35) — 2026-08-28
+
+Clean merge, zero conflicts (tower.rs split into
+query/real_walker/tape modules; ~20K moved lines). Suites green (core
+545, prover 124). Bench 1.58 / 1.18 / 1.73 s, best 1.18 — parity
+(session noise; the machine has been paging all afternoon).
+
+**MERGE COMPLETE: merge-base(HEAD, origin/main) == origin/main tip
+(b310f35).** All 7 mainline PRs are in. Union prove_fast at m=32
+grind-free blake3 sits at ~0.92–1.18 s best-of-3 cold-start across
+steps (vs 465 ms pre-merge) — the gap is the re-graft/re-port queue
+from step 1, now re-scoped to the union driver: zc cascade+compact-K,
+streaming lane-major commit, stripe-C/AB-hoist, streamed witness
+builder, direct-open ideas vs the f256 opening.
