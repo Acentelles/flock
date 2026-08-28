@@ -627,49 +627,44 @@ impl ElementAssertion {
     }
 }
 
-/// Closed-form `Ĉomb(r_col)` — what the verifier used to evaluate inline,
-/// now the differential oracle for the reported path
-/// (`reported_evals_match_the_inline_comb`). Reads the base matrices, which
-/// is exactly why the verifier no longer calls it.
 #[cfg(test)]
-fn region_comb_at_oracle(
-    slots: &[RegionSlot<'_>],
-    nu: usize,
-    alpha: F128,
-    r: &[F128],
-    r_col: &[F128],
-) -> F128 {
-    region_comb_at(slots, nu, alpha, r, r_col)
-}
+mod test_support {
+    use super::*;
 
-/// Closed-form `Ĉomb(r_col)` — the verifier's counterpart of
-/// [`region_comb`], without materializing anything region-sized: each slot
-/// contributes its own comb MLE at the bound point times the subcube prefix-eq
-/// factor "the bound point addresses slot `t`".
-#[cfg(test)]
-fn region_comb_at(
-    slots: &[RegionSlot<'_>],
-    nu: usize,
-    alpha: F128,
-    r: &[F128],
-    r_col: &[F128],
-) -> F128 {
-    let mut acc = F128::ZERO;
-    for s in slots {
-        let kappa = s.layout.kappa;
-        let comb = slot_comb(s.ty, alpha, &build_eq(&r[nu..nu + kappa]));
-        let w_r = eq_prefix_weight(&r[nu + kappa..], s.layout.region_prefix(nu));
-        // The bound COLUMN point must address this slot's block: its low
-        // `kappa` coords index the comb, its high coords freeze to `q_t`.
-        let w_col = eq_prefix_weight(&r_col[kappa..], s.layout.region_prefix(nu));
-        let eq_col = build_eq(&r_col[..kappa]);
-        let inner = comb
-            .iter()
-            .zip(&eq_col)
-            .fold(F128::ZERO, |a, (c, e)| a + *c * *e);
-        acc += w_r * w_col * inner;
+    /// Evaluates the region combination without materializing the region.
+    pub(super) fn region_comb_at(
+        slots: &[RegionSlot<'_>],
+        nu: usize,
+        alpha: F128,
+        r: &[F128],
+        r_col: &[F128],
+    ) -> F128 {
+        let mut acc = F128::ZERO;
+        for s in slots {
+            let kappa = s.layout.kappa;
+            let comb = slot_comb(s.ty, alpha, &build_eq(&r[nu..nu + kappa]));
+            let w_r = eq_prefix_weight(&r[nu + kappa..], s.layout.region_prefix(nu));
+            let w_col = eq_prefix_weight(&r_col[kappa..], s.layout.region_prefix(nu));
+            let eq_col = build_eq(&r_col[..kappa]);
+            let inner = comb
+                .iter()
+                .zip(&eq_col)
+                .fold(F128::ZERO, |a, (c, e)| a + *c * *e);
+            acc += w_r * w_col * inner;
+        }
+        acc
     }
-    acc
+
+    /// Evaluates the matrix-based reference for reported values.
+    pub(super) fn region_comb_at_oracle(
+        slots: &[RegionSlot<'_>],
+        nu: usize,
+        alpha: F128,
+        r: &[F128],
+        r_col: &[F128],
+    ) -> F128 {
+        region_comb_at(slots, nu, alpha, r, r_col)
+    }
 }
 
 /// The row collapse: `G[u] = Σ_j eq(r_row, j)·z[(u << ν) + j] = ẑ_region(r_row, u)`,
@@ -804,6 +799,7 @@ pub fn give_back_live_region(union: &UnionInstance<'_>, pa: Vec<F128>, pb: Vec<F
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::{region_comb_at, region_comb_at_oracle};
     use super::*;
     use crate::challenger::FsChallenger;
     use crate::element_r1cs::tests::{Rng, mixed_gate, mixed_witness, mult_gate, mult_witness};
