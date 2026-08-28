@@ -52,23 +52,42 @@ which changes its self-loop pin rows from constants to committed wires.
 
 ### 3.2 The candidate slot relation
 
-Per squeezed candidate (68 per squeeze block), in `(A z) o (B z) = z`
-form over `GF(2)`; counts per slot, from the aerie census (model v0,
-quotient one-hot of six covering the rejected class 5):
+Constraint mechanics, from `flock-core/src/r1cs.rs`: a row `j` enforces
+`(A_j z) & (B_j z) = C_j z`. Under `C = I` every row defines its wire; an
+empty row forces its wire to zero; `c_0` is a real matrix, so a
+general-`C` row expresses a pure constraint without consuming a wire; the
+constant-one wire is pinned through `const_pin`. Over `GF(2)` the witness
+is a bit vector by type, so Booleanity is free, and every full-adder
+carry is one row via `maj(a, b, c) = (a xor c)(b xor c) xor c`:
 
-- accept comparison `x < 61,445` as a carry chain over `x + 4,091`:
-  16 AND rows;
-- residue range `a < 12,289` and centering `a > 6,144`: 14 AND rows each;
-- quotient one-hot (6 wires, Booleanity plus the linear sum row) and the
-  linear reconstruction `x = 12,289 q + a`: linear except 6 Booleanity rows;
-- ordered stable compaction: a 10-bit running counter (10 carry ANDs) and
-  one write gate AND per slot;
-- committed wires per slot: 48.
+```text
+row:  (a_i xor c_i)(M_i xor c_i) = c_{i+1} xor c_i.
+```
 
-Roughly 103 constraint rows and 48 committed bits per slot; a nine-block
-record has 612 slots, so about 63k constraint rows and 30k committed bits
-per record on top of the ten Keccak permutations (each 38,400 chi ANDs).
-These become measured numbers in work item 3.
+Per-slot design (this supersedes the aerie census model v0 for this
+backend; model v0 counts Booleanity rows that GF(2) gets for free):
+
+- committed wires: word `x` (16), accept flag and its comparison chain
+  (17), residue `a` (14), quotient `q` as 3-bit binary (3), the `3q`
+  mini-adder carries (3), main adder carries (16), centering flag and
+  its chain (15), counter carries (10), write gate (1): about 95;
+- `M = 12,289 q` is linear: `12,289 = 3 * 2^12 + 1`, so
+  `M = (3q << 12) xor q` with disjoint bit ranges; only the 4-bit `3q`
+  adder costs carries;
+- `x = a + M` is enforced by defining `a_i := x_i xor M_i xor c_i` with
+  the carries as maj rows; the no-overflow condition `c_16 = 0` and the
+  range flags `[a < 12,289] = 1`, `[u = (a > 6,144)]` are claim-level
+  pins: their complement wires live in a small public region the
+  verifier checks by opening, exactly the pattern the Keccak encoder
+  uses for its public endpoints;
+- accept comparison `x < 61,445` as the carry-out of `x + 4,091`
+  (16 maj rows); ordered stable compaction as a 10-bit running counter
+  (10 maj rows) plus one write-gate AND per slot.
+
+Ballpark 95 rows and wires per slot; a nine-block record has 612 slots,
+so about 58k slot rows and wires per record on top of the ten Keccak
+permutations (each 38,400 chi ANDs). Measured numbers land with work
+item 3; the aerie E0 census model v0 should be revised against them.
 
 ### 3.3 The `Z_H` output region and copy link
 
