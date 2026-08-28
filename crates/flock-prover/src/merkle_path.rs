@@ -1,8 +1,6 @@
 //! Merkle-path shift sumcheck.
 //!
-//! Generalizes the retired hash-chain shift sumcheck (`chain.rs`, deleted
-//! 2026-08-14) with a per-row **bit
-//! selector**: each non-leaf hash has two inputs `(x_i, y_i)`, and a public
+//! Each non-leaf hash has two inputs `(x_i, y_i)`. A public bit
 //! bit `b_i` chooses which input is the previous hash's output `z_{i-1}`.
 //! The unselected input (the "sibling") is committed in the witness but
 //! protocol-unconstrained — soundness comes from preimage resistance: the

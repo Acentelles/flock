@@ -123,9 +123,8 @@ const MAX_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
 /// per-query capped paths. The symmetric bookend to v3, which introduced
 /// the octopus.
 /// v6 switched the Mixed flavor's payload to the MERGED
-/// jagged/ring-switch transport ([`MixedProofBundleLigerito`] now carries
-/// an `R1csProofMergedLigerito` — design doc §"Capacity-free
-/// ring-switching"); the R1cs/Chain flavors' payloads are unchanged, but
+/// jagged and ring-switch transport. [`MixedProofBundleLigerito`] carries
+/// an `R1csProofMergedLigerito`. The R1cs and Chain payloads are unchanged, but
 /// versioning is strict so v5 files are rejected.
 /// v5 added the Mixed flavor (registry id + counts vector +
 /// jagged-transport proof). v4 added `ood_values` + `fold_grinding_nonces`
@@ -257,10 +256,8 @@ impl R1csProofBundleLigerito {
 /// registry id — which pins the FULL registry, type list and uniform
 /// capacity `nu` included (see [`crate::mixed::MixedRegistryId`]) — the
 /// declared counts vector (one `u64` per type, **in slot order**), the
-/// commitment to the dense stack, and the MERGED-transport union proof
-/// (design doc §"Capacity-free ring-switching").
-/// The statement is well-formedness only (design doc §"Statement,
-/// transcript, wire format"): the commitment opens to tables with the
+/// commitment to the dense stack, and the merged union proof.
+/// The statement proves well-formedness. The commitment opens to tables with the
 /// declared counts, every declared row satisfying its type's hash relation
 /// — no per-invocation I/O binding.
 #[derive(Clone, Debug, Serialize, Deserialize)]

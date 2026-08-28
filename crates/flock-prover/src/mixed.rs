@@ -241,9 +241,8 @@ impl MixedSetup {
 
     /// Prove the mixed statement: `inputs.sha2.len()` SHA-256 and
     /// `inputs.blake3.len()` BLAKE3 compressions (the declared counts),
-    /// dummy rows zeroed via the partial batch-major drivers, through the
-    /// MERGED-transport union prove entry (wire v6, design doc
-    /// §"Capacity-free ring-switching") under the `flock-mixed-v1` binding.
+    /// dummy rows zeroed through the partial batch-major generators, and the
+    /// merged union proof under the `flock-mixed-v1` binding.
     pub fn prove<Ch: Challenger>(
         &self,
         sha2_inputs: &[sha2::Compression],

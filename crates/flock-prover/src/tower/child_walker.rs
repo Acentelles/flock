@@ -90,10 +90,6 @@ pub(super) struct ChildTape<'p> {
     pub(super) k_cols_i: usize,
     pub(super) m_mp2: usize,
     pub(super) bounds_i: Vec<(u64, u64, u32)>,
-    #[allow(dead_code)] // Run start columns — the run-weight era's consumer; kept as shape data.
-    pub(super) run_y0: Vec<usize>,
-    #[allow(dead_code)] // The complement run — likewise.
-    pub(super) comp_ix: usize,
     pub(super) x_ab_n: Vec<F128>,
     pub(super) x_c_n: Vec<F128>,
     pub(super) groups_ix: Vec<Vec<usize>>,
@@ -1604,8 +1600,6 @@ impl<'p> ChildTape<'p> {
             k_cols_i,
             m_mp2,
             bounds_i,
-            run_y0,
-            comp_ix,
             x_ab_n,
             x_c_n,
             groups_ix,

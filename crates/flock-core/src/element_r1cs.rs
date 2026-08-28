@@ -73,11 +73,13 @@ use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::merkle::Hash;
 use crate::pcs::ligerito::{ProverConfig, VerifierConfig};
+use crate::pcs::ring_switch::build_eq_parallel;
 use crate::pcs::{
     self, Commitment, DirectEqInd, LOG_PACKING, PackedDirectClaim, PackedDirectClaimRef, PcsParams,
     commit,
 };
 use crate::zerocheck::PaddingSpec;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// Statement-binding domain label. Absorbed before any challenge is squeezed.
@@ -448,7 +450,6 @@ fn gather_into(
     live: Option<usize>,
     out: &mut [F128],
 ) {
-    use rayon::prelude::*;
     let rows = 1usize << n_log;
     let n = live.map_or(rows, |l| l.min(rows));
     debug_assert_eq!(out.len(), m.num_rows << n_log);
@@ -956,7 +957,6 @@ fn packed_direct_claims(
     r_prime: &[F128],
     z_eval: F128,
 ) -> Vec<PackedDirectClaim> {
-    use crate::pcs::ring_switch::build_eq_parallel;
     [(r, ec), (r_prime, z_eval)]
         .into_iter()
         .map(|(point, value)| PackedDirectClaim {
@@ -970,7 +970,6 @@ fn packed_direct_claims(
 /// `v[(y << n_log) + j] += c[y]` — broadcast the row-uniform constant vector
 /// across every row.
 fn broadcast_add(v: &mut [F128], c: &[F128], n_log: usize) {
-    use rayon::prelude::*;
     let rows = 1usize << n_log;
     debug_assert_eq!(v.len(), c.len() << n_log);
     v.par_chunks_mut(rows)

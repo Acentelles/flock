@@ -107,9 +107,6 @@ pub(super) struct RealTape<'p> {
     pub(super) k_cols_i: usize,
     pub(super) m_mp2: usize,
     pub(super) bounds_i: Vec<(u64, u64, u32)>,
-    #[allow(dead_code)]
-    // The layout's run→column map — the eqc_w era's consumer; kept as shape data.
-    pub(super) run_of: Vec<usize>,
     pub(super) x_ab_n: Vec<F128>,
     pub(super) x_c_n: Vec<F128>,
     pub(super) groups_ix: Vec<Vec<usize>>,
@@ -846,14 +843,6 @@ impl<'p> RealTape<'p> {
         let comp_ix = (0..n_runs)
             .max_by_key(|&r3| bounds_i[r3].2)
             .expect("at least one run");
-        let run_of: Vec<usize> = {
-            let mut v = Vec::with_capacity(1usize << k_cols_i);
-            for (r3, &(_, _, len)) in bounds_i.iter().enumerate() {
-                v.extend(std::iter::repeat_n(r3, len as usize));
-            }
-            assert_eq!(v.len(), 1usize << k_cols_i, "runs partition the columns");
-            v
-        };
         // The boolean PIOP's round ordinals, located with fins — plus the
         // MatrixAssertion surfaces the 2→1 merge connects to (z_skip's
         // squeeze, z_partial's slice).
@@ -1448,7 +1437,6 @@ impl<'p> RealTape<'p> {
             k_cols_i,
             m_mp2,
             bounds_i,
-            run_of,
             x_ab_n,
             x_c_n,
             groups_ix,
@@ -1486,28 +1474,18 @@ pub(super) struct RealRegion {
     /// Every fresh claim in `sigma_native.claims()` as `(row, col, value)`
     /// wires, in accumulator order.
     pub(super) structure_claim_w: Vec<(Vec<Wire>, Vec<Wire>, Wire)>,
-    #[allow(dead_code)]
-    pub(super) pt_w: Vec<Wire>,
     /// element: every zc/lc round rho (round order) and the per-slot eval
     /// advice pairs (bound publics — connectable, unlike the minimal child).
-    #[allow(dead_code)]
     pub(super) el_zc_rho_w: Vec<Wire>,
-    #[allow(dead_code)]
     pub(super) el_lc_rho_w: Vec<Wire>,
-    #[allow(dead_code)]
     pub(super) el_eval_w: Vec<(Wire, Wire)>,
     /// boolean: the zc mlv / lc round rhos (round order), the absorbed
     /// z_partial words, and the per-type matrix_evals advice pairs.
-    #[allow(dead_code)]
     pub(super) b_mlv_w: Vec<Wire>,
-    #[allow(dead_code)]
     pub(super) b_lc_w: Vec<Wire>,
-    #[allow(dead_code)]
     pub(super) b_zpartial_w: Vec<Wire>,
-    #[allow(dead_code)]
     pub(super) mat_eval_w: Vec<(Wire, Wire)>,
     /// The residual close-out's prefix slot (and width).
-    #[allow(dead_code)]
     pub(super) pf: (flock_core::circuit::builder::SlotId, usize),
     /// The child's PUBLIC SEGMENT as witness wires — the app-statement
     /// plumbing (hash-chain adjacency) reads through these.
@@ -1516,7 +1494,6 @@ pub(super) struct RealRegion {
     /// (payload 3) — two public words. This is the KEY its sigma and
     /// jagged claims fold under, and the spine's match-gate compares it
     /// against the key an inherited entry was published with.
-    #[allow(dead_code)]
     pub(super) cd_w: [Wire; 2],
 }
 
@@ -2867,7 +2844,6 @@ pub(super) fn emit_real_child_region(
         },
         n_ela_pub: ela_pub.len(),
         structure_claim_w,
-        pt_w,
         el_zc_rho_w,
         el_lc_rho_w: piop_i
             .lc_rounds

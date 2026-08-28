@@ -567,11 +567,9 @@ pub fn prove_fast_ligerito_union_circuit<Ch: Challenger>(
     )
 }
 
-/// The MERGED-transport union prover (wire v6; design doc §"Capacity-free
-/// ring-switching") — the Mixed protocol's prove entry for BOOLEAN-only
-/// registries: a thin wrapper over [`prove_union_with_binding`] (the one
-/// shared body, since the two-body split died with the jagged transport),
-/// repackaging the boolean sub-proofs as the wire's
+/// Proves a Boolean-only registry with the merged opening transport.
+///
+/// This wraps [`prove_union_with_binding`] and packages the Boolean subproofs as
 /// [`flock_core::proof::R1csProofMergedLigerito`].
 ///
 /// Witness contract: rows `[n_t, 2^nu)` of each slot must be identically
@@ -895,7 +893,7 @@ fn prove_union_with_binding_zc<Ch: Challenger>(
     // every dead word and the region PIOP folds the committed words, so
     // the element `z` blocks must be honestly written in full. (`a`/`b`
     // dead rows ARE elided on the sparse-zerocheck arm — see
-    // `build_union_witness` — that part of the old follow-up is done.)
+    // `build_union_witness`.)
     // And NOT under IDENTITY compaction: there q IS the padded buffer, so
     // its padding words are committed and must be honest zeros — dirty
     // pooling would put garbage into the committed stack (a latent hazard
@@ -1025,12 +1023,8 @@ fn prove_union_with_binding_zc<Ch: Challenger>(
     // were never even written) the copy takes LIVE SPANS ONLY into
     // lazy-zeroed buffers: the sparse row rounds read live prefixes and
     // substitute dead values analytically from `RowSupport::{a,b}_dead`,
-    // so the zeros left behind are unread — byte-identical, pinned by
-    // `dummy_row_is_structurally_invisible_under_the_union`. (An earlier
-    // note here forbade compacting this copy outright, citing the jagged-
-    // era rejection posture; on the merged transport dead words are
-    // structurally invisible and the DENSE arm below keeps the faithful
-    // full copy.)
+    // so the zeros left behind are unread. The test
+    // `dummy_row_is_structurally_invisible_under_the_union` checks this.
     //
     // On the dense arm (> 50% region utilization) the zerocheck reads the
     // whole region, so the copy stays faithful — including whatever the

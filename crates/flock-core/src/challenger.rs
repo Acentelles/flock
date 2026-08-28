@@ -608,9 +608,8 @@ impl B3Chain {
 #[derive(Clone)]
 pub struct FsChallenger {
     state: FsState,
-    /// Running total of absorbed transcript bytes, for the `hash-count`
-    /// instrumentation (read only under that feature).
-    #[allow(dead_code)]
+    /// Running total of absorbed transcript bytes.
+    #[cfg(feature = "hash-count")]
     n_absorbed: u64,
 }
 
@@ -637,6 +636,7 @@ impl FsChallenger {
                 HashKind::Sha256 => FsState::Sha256(Sha256::new()),
                 HashKind::Blake3 => FsState::Blake3(Box::new(blake3::Hasher::new())),
             },
+            #[cfg(feature = "hash-count")]
             n_absorbed: 0,
         };
         c.absorb_header(OP_DOMAIN, 0, domain.len() as u64);
@@ -653,6 +653,7 @@ impl FsChallenger {
     pub fn with_chained_blake3(domain: &[u8]) -> Self {
         let mut c = Self {
             state: FsState::Blake3Chain(B3Chain::new()),
+            #[cfg(feature = "hash-count")]
             n_absorbed: 0,
         };
         c.absorb_header(OP_DOMAIN, 0, domain.len() as u64);
@@ -684,7 +685,10 @@ impl FsChallenger {
                 c.absorb(bytes);
             }
         }
-        self.n_absorbed = self.n_absorbed.wrapping_add(bytes.len() as u64);
+        #[cfg(feature = "hash-count")]
+        {
+            self.n_absorbed = self.n_absorbed.wrapping_add(bytes.len() as u64);
+        }
     }
 
     /// Absorb one op's 16-byte header: `[op][kind][0;6][len u64 LE]`.

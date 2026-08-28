@@ -35,10 +35,9 @@ pub struct R1csProofLigeritoAg {
     pub pcs_open: pcs::BatchOpeningProofLigerito,
 }
 
-/// [`R1csProofLigerito`] with the MERGED jagged/ring-switch opening
-/// (design doc §"Capacity-free ring-switching") — the PIOP sub-proofs are
-/// identical; only the transport differs. The Mixed flavor's wire payload
-/// since v6.
+/// R1CS proof with a merged jagged and ring-switch opening.
+///
+/// The PIOP subproofs match [`R1csProofLigerito`]. The opening transport differs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct R1csProofMergedLigerito {
     pub zerocheck: zerocheck::ZerocheckProof,

@@ -1,33 +1,29 @@
-//! The union instance — multi-table Phase 2 (M1 plumbing, M3 binding).
+//! Multi-table union instances.
 //!
 //! [`UnionInstance`] wraps a [`Registry`] + counts pair (the static slot
 //! layout of `schedule.rs` plus the per-proof declared counts) and derives
-//! everything the prove/verify paths need from the union address space,
-//! replacing what [`BlockR1cs`] provides for a single table today: the
+//! everything the prove and verify paths need from the union address space:
 //! count-derived run-list [`PaddingSpec`], the union jagged-grid heights
-//! (count-dependent height-`n_t` stacking since M5 — the committed size is
+//! (count-dependent height-`n_t` stacking; the committed size is
 //! count-proportional, floored at the smallest embedded Ligerito config),
-//! the layout-aware claim points, the union witness assembly, and — since
-//! M3 — the multi-table statement binding ([`Self::bind_statement`], label
+//! the layout-aware claim points, the union witness assembly, and
+//! the multi-table statement binding ([`Self::bind_statement`], label
 //! `flock-mixed-v1`).
 //!
 //! Under the uniform-capacity convention the union's BatchMajor address
 //! split is `[7 in-word | nu batch | M−7−nu chunk]` — structurally a single
-//! BatchMajor instance with `k_log = M − nu` (design doc §"The union
-//! instance"): every slot shares the row coordinates `[7, 7+nu)`, and a
+//! BatchMajor instance with `k_log = M − nu`. Every slot shares the row
+//! coordinates `[7, 7+nu)`, and a
 //! slot's chunk bits together with its frozen prefix form the union
 //! chunk-column index. The claim-point helpers below are therefore the
 //! `BlockR1cs` BatchMajor formulas evaluated over the union address space;
 //! for a one-type registry (one slot at offset 0, `M = m`) they agree with
-//! the `BlockR1cs` versions coordinate for coordinate — the union of one
-//! slot *is* today's instance.
+//! the `BlockR1cs` versions coordinate for coordinate.
 //!
 //! The prove/verify entries (`flock_prover::prover::
 //! prove_fast_ligerito_union` / [`crate::verifier::
 //! verify_ligerito_union`], and their mixed-class variants)
-//! accept any registry under the `flock-mixed-v1` binding. (The M1/M2
-//! single-type harness binding died with the jagged transport and its
-//! byte-identity differential tests.)
+//! accept any registry under the `flock-mixed-v1` binding.
 
 use crate::challenger::Challenger;
 use crate::field::F128;

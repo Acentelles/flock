@@ -1363,7 +1363,7 @@ pub fn prove_assist<C: Challenger>(
 /// (same algebra over exact field ops); retained as the correctness reference
 /// (`assist_streamed_matches_naive`) and for the `runtime_assist_m25`
 /// comparison.
-#[allow(dead_code)]
+#[cfg(test)]
 fn prove_assist_naive<C: Challenger>(
     params: &JaggedParams,
     z_row: &[F128],
@@ -4600,7 +4600,7 @@ pub(crate) fn fold_round_claim(claim: F128, g_one: F128, g_inf: F128, r: F128) -
 /// for the `runtime_m25` serial-vs-parallel benchmark. (The production path
 /// gets round 1's message fused into [`generate_f_and_claim`] and later
 /// messages from the fused fold kernels.)
-#[allow(dead_code)]
+#[cfg(test)]
 #[inline]
 fn round_msg(a: &[F128], b: &[F128]) -> (F128, F128) {
     let half = a.len() / 2;
@@ -4626,7 +4626,7 @@ fn round_msg(a: &[F128], b: &[F128]) -> (F128, F128) {
 /// muls, exposing PMULL latency that the unfused split avoids. Kept as the
 /// building block for the eventual rayon-parallel kernel, where the
 /// bandwidth saving from fewer passes should dominate. See `runtime_m25`.
-#[allow(dead_code)]
+#[cfg(test)]
 fn fold_and_round_fused(a: &mut Vec<F128>, b: &mut Vec<F128>, r: F128) -> (F128, F128) {
     let n = a.len();
     debug_assert!(n >= 4 && n.is_power_of_two());
@@ -4665,7 +4665,7 @@ fn fold_and_round_fused(a: &mut Vec<F128>, b: &mut Vec<F128>, r: F128) -> (F128,
 /// measured with the since-deleted `scaling_diag` probe (bloat ledger §E).
 /// No longer on the production path (round 1's message is fused into
 /// [`generate_f_and_claim`]); retained for the runtime benchmarks.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn round_msg_par(a: &[F128], b: &[F128]) -> (F128, F128) {
     use rayon::prelude::*;
     const C: usize = 1 << 14;

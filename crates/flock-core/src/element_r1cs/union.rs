@@ -646,7 +646,7 @@ fn region_comb_at_oracle(
 /// [`region_comb`], without materializing anything region-sized: each slot
 /// contributes its own comb MLE at the bound point times the subcube prefix-eq
 /// factor "the bound point addresses slot `t`".
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn region_comb_at(
     slots: &[RegionSlot<'_>],
     nu: usize,
